@@ -210,7 +210,7 @@ const char* const kOrder[] = {
     // terrain and carves a shell, which wants the same standing world the
     // body gates run in; before `ragdoll-joints` because it leaves the rig
     // undressed and MobSystem reset, which is what that gate expects to find.
-    "armor-wear", "item-ground", "armor-fit",
+    "armor-wear", "item-ground", "loot", "armor-fit",
     // Pure anim over its own five-part fixture — it touches no shared World and
     // so is order-independent; it sits here to keep the armour gates together.
     "armor-track", "armor-stock",

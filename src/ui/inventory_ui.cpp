@@ -86,6 +86,7 @@ std::string KindOfRef(const UIState& s, const KitRef& r) {
     case KitSpace::Bag: v = &s.bagSlots; break;
     case KitSpace::Hotbar: v = &s.hotbarSlots; break;
     case KitSpace::Equip: v = &s.equipSlots; break;
+    case KitSpace::Loot: v = &s.lootSlots; break;
     default: return std::string();
   }
   if (r.index < 0 || r.index >= (int)v->size()) return std::string();
@@ -289,8 +290,17 @@ void ItemSlot(UIState& s, const char* id, ImVec2 at,
   // mid-drag cannot fire it as well.
   if (hovered && filled && !ImGui::GetDragDropPayload() &&
       ImGui::IsMouseClicked(ImGuiMouseButton_Right)) {
-    s.equipItem.pending = true;
-    s.equipItem.from = ref;
+    if (ref.space == KitSpace::Loot) {
+      // A corpse's piece has one obvious destination - your pack - and the
+      // corpse is not a place you put things on. Same latch shape, its own
+      // intent, because main.cpp executes it against a different container.
+      s.takeLoot.pending = true;
+      s.takeLoot.index = ref.index;
+      s.takeLoot.all = false;
+    } else {
+      s.equipItem.pending = true;
+      s.equipItem.from = ref;
+    }
   }
 
   if (hovered) {
@@ -315,10 +325,13 @@ void ItemSlot(UIState& s, const char* id, ImVec2 at,
         }
         // Named for what it will actually do from HERE, which is not the same
         // sentence in both directions.
-        ImGui::TextDisabled(ref.space == KitSpace::Equip
-                                ? "right-click to take off"
-                                : "right-click to wear");
+        if (ref.space != KitSpace::Loot)
+          ImGui::TextDisabled(ref.space == KitSpace::Equip
+                                  ? "right-click to take off"
+                                  : "right-click to wear");
       }
+      if (ref.space == KitSpace::Loot)
+        ImGui::TextDisabled("right-click to take  .  drag onto a slot to wear");
     } else if (whyNot && *whyNot && !acceptsAnything) {
       ImGui::TextDisabled("empty");
       ImGui::PushStyleColor(ImGuiCol_Text, ImGui::ColorConvertU32ToFloat4(
@@ -1213,6 +1226,71 @@ void GrimoireBody(UIState& s, ImVec2 at, ImVec2 size) {
   ImGui::EndChild();
 }
 
+// ---- THE LOOT PANEL (game/corpses.h) ----------------------------------------
+//
+// A corpse's gear, drawn where the grimoire (wide) or the arsenal (narrow)
+// otherwise sits: above or beside the pack, so a piece drags into your bag
+// along one short line. Take-only - every slot here is a drag SOURCE and a
+// right-click TAKE, and a drag INTO one is refused by main.cpp with the
+// reason (a thing put on a corpse would have no body in the world).
+void LootPanel(UIState& s, ImVec2 pos, ImVec2 size, const ui::PanelStyle& st,
+               ImGuiWindowFlags flags) {
+  ImGui::SetNextWindowPos(pos);
+  ImGui::SetNextWindowSize(size);
+  ImGui::Begin("##loot", nullptr, flags);
+  {
+    ImDrawList* dl = ImGui::GetWindowDrawList();
+    const ImVec2 wp = ImGui::GetWindowPos();
+    const ImVec2 ws = ImGui::GetWindowSize();
+    const std::string title = "LOOT: " + s.lootTitle;
+    // No subtitle: the header bar's right half belongs to the two buttons.
+    float y = PanelChrome(dl, wp, ws, title.c_str(), nullptr, st);
+    // Two header-bar buttons, right-aligned, sized off their labels the way
+    // the character panel's gear/health toggle is (the pixel font is wide).
+    {
+      const ImVec2 tsClose = ImGui::CalcTextSize("close");
+      const ImVec2 tsAll = ImGui::CalcTextSize("take all");
+      const float by = wp.y + kFrame + std::floor((ui::kHeaderH - tsClose.y - 8) * 0.5f);
+      const float bwClose = std::max(96.0f, tsClose.x + 24);
+      const float bwAll = std::max(96.0f, tsAll.x + 24);
+      float bx = wp.x + ws.x - kFrame - 10 - bwClose;
+      if (ui::Button("##lootclose", ImVec2(bx, by), "close", false, bwClose))
+        s.lootClose = true;
+      if (ImGui::IsItemHovered()) Tip("Leave the rest where it lies.");
+      if (!s.lootSlots.empty()) {
+        bx -= bwAll + 8;
+        if (ui::Button("##lootall", ImVec2(bx, by), "take all", false, bwAll)) {
+          s.takeLoot.pending = true;
+          s.takeLoot.index = -1;
+          s.takeLoot.all = true;
+        }
+        if (ImGui::IsItemHovered())
+          Tip("Everything into your pack, until it is full.");
+      }
+    }
+    // The grid: as many columns as the panel is wide, one row per that many.
+    const int cols = std::max(1, (int)((ws.x - kPad * 2 + kSlotGap) / (kSlot + kSlotGap)));
+    const int n = (int)s.lootSlots.size();
+    for (int i = 0; i < n; i++) {
+      const int r = i / cols, c = i % cols;
+      const float gx = wp.x + kPad + c * (kSlot + kSlotGap);
+      const float gy = y + r * (kSlot + kSlotGap);
+      if (gy + kSlot > wp.y + ws.y - kPad) break;
+      char id[32];
+      std::snprintf(id, sizeof id, "loot%d", i);
+      ItemSlot(s, id, ImVec2(gx, gy), s.lootSlots[i], KitRef{KitSpace::Loot, i},
+               nullptr, true, nullptr, false);
+    }
+    if (n == 0) {
+      ImGui::PushFont(ui::FontSmall());
+      dl->AddText(ImVec2(wp.x + kPad, y + 4), Fade(ui::ColParchDim(), 0.8f),
+                  "Picked clean.");
+      ImGui::PopFont();
+    }
+  }
+  ImGui::End();
+}
+
 }  // namespace
 
 void DrawInventoryScreen(UIState& s) {
@@ -1465,6 +1543,18 @@ void DrawInventoryScreen(UIState& s) {
   // column the old arrangement returns: the arsenal toggles between its table
   // and the grimoire, over the pack.
   const float arsenalH = wide ? (bottom - top) : (bottom - top - packH - kColGap);
+  ui::PanelStyle stLoot;
+  stLoot.darkMix = 0.40f;
+  stLoot.sheenPeak = 0.36f;
+  stLoot.bronzeAlpha = 0.14f;
+  // While a corpse is open, its panel takes the place a drag would otherwise
+  // have to cross: the grimoire's slot above the pack when the window is wide,
+  // the arsenal's beside it when it is not. Looting is a moment, the arsenal is
+  // not going anywhere, and a fourth column would not fit on most screens.
+  const bool lootHere = s.lootOpen && !wide;
+  if (lootHere) {
+    LootPanel(s, ImVec2(midX, top), ImVec2(arsenalW, arsenalH), stLoot, kPanelFlags);
+  } else {
   ImGui::SetNextWindowPos(ImVec2(midX, top));
   ImGui::SetNextWindowSize(ImVec2(arsenalW, arsenalH));
   ImGui::Begin("##arsenal", nullptr, kPanelFlags);
@@ -1522,9 +1612,12 @@ void DrawInventoryScreen(UIState& s) {
     }
   }
   ImGui::End();
+  }
 
   // ---- THE GRIMOIRE (its own panel, wide layout only) -----------------------
-  if (wide) {
+  if (wide && s.lootOpen) {
+    LootPanel(s, ImVec2(grimX, top), ImVec2(grimW, grimH), stLoot, kPanelFlags);
+  } else if (wide) {
     ImGui::SetNextWindowPos(ImVec2(grimX, top));
     ImGui::SetNextWindowSize(ImVec2(grimW, grimH));
     ImGui::Begin("##grimoire", nullptr, kPanelFlags);
@@ -1628,7 +1721,10 @@ void DrawInventoryScreen(UIState& s) {
   // minute later reads as a persistent error state.
   {
     const bool fresh = !s.kitMessage.empty() && s.kitMessageAge < 2.5f;
-    const char* text = fresh ? s.kitMessage.c_str() : "I or Esc to close   |   drag out to drop";
+    const char* idle = s.lootOpen
+        ? "right-click to take   |   drag onto a slot to wear   |   drag out to leave it on the ground"
+        : "I or Esc to close   |   drag out to drop";
+    const char* text = fresh ? s.kitMessage.c_str() : idle;
     const float a = fresh ? std::clamp(1.6f - s.kitMessageAge * 0.7f, 0.0f, 1.0f) : 0.85f;
     const ImVec2 ts = ImGui::CalcTextSize(text);
     const ImVec2 tp(std::floor((disp.x - ts.x) * 0.5f), disp.y - ts.y - 8);

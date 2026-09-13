@@ -9510,6 +9510,43 @@ void Mob::Die() {
       at = limbs_[rl].xf.pos;
     if (sys_) sys_->PushVoice(*this, MobSystem::VoiceKind::Death, at, 1.0f);
   }
+  // WHAT IS ON THE BODY, read out while the rig still knows (CorpseReport).
+  // Built BEFORE the loop below zeroes every limb.body, delivered AFTER it so
+  // the receiver holds handles that are already debris. Not for the avatar
+  // (see the struct's note) and not when nobody is listening.
+  CorpseReport corpse;
+  const bool reportCorpse = sys_ && sys_->onCorpse_ && sys_->avatar_ != this;
+  if (reportCorpse) {
+    corpse.mobId = id_;
+    corpse.def = def_ ? def_->name : std::string();
+    for (const MobLimb& limb : limbs_)
+      if (limb.body) corpse.bodies.push_back(limb.body);
+    for (size_t pi = 0; pi < worn_.size(); pi++) {
+      const WornPiece& p = worn_[pi];
+      const int idSlot = IdentityShellOf((int)pi);
+      if (idSlot < 0 || idSlot >= (int)limbs_.size() || !limbs_[idSlot].body)
+        continue;   // the panel that IS the piece is gone: rags only
+      CorpseReport::Piece piece;
+      piece.item = p.item;
+      piece.equipSlot = p.equipSlot;
+      piece.body = limbs_[idSlot].body;
+      for (size_t k = 0; k < p.slots.size() && k < p.cover.size(); k++)
+        if (p.slots[k] == idSlot) piece.identityCover = p.cover[k];
+      for (int s : p.slots)
+        if (s != idSlot && s >= 0 && s < (int)limbs_.size() && limbs_[s].body)
+          piece.rags.push_back(limbs_[s].body);
+      CaptureWorn(p.equipSlot, piece.damage);
+      corpse.gear.push_back(std::move(piece));
+    }
+    if (heldSlot_ >= 0 && heldSlot_ < (int)limbs_.size() &&
+        limbs_[heldSlot_].body && !heldItem_.empty()) {
+      CorpseReport::Piece piece;
+      piece.item = heldItem_;
+      piece.held = true;
+      piece.body = limbs_[heldSlot_].body;
+      corpse.gear.push_back(std::move(piece));
+    }
+  }
   // whole-body ragdoll: every limb goes dynamic and becomes debris; joints
   // stay so the corpse hangs together until pieces get culled or settle
   for (size_t i = 0; i < limbs_.size(); i++) {
@@ -9546,6 +9583,7 @@ void Mob::Die() {
     if (i < anim_.partAlive.size()) anim_.partAlive[i] = 0;
   }
   MarkInstancesDirty();
+  if (reportCorpse) sys_->onCorpse_(corpse);
   // Death goes straight to ragdoll (no hold): the whole body flips at once,
   // so there is no "still-attached" pose left to sell. The husk is removed on
   // the next PreTick sweep once nothing is holding; drop the limb list but

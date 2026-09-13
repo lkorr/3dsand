@@ -9223,6 +9223,65 @@ The half of this that is still open: a piece knocked off an NPC and picked up
 by the player comes back as authored, because `WornDamage` is keyed by cover
 index and the ground registry carries only a name and a lattice.
 
+### Corpses keep what they fell with, and E says what it will do (2026-09-12)
+
+`Mob::Die` hands every limb to `DebrisSystem` and the husk is swept on the next
+tick, so a tick after a creature falls there was no Mob left to ask "what was it
+wearing" — the robe was still THERE, a debris body jointed to the torso it fell
+with, but debris carries no identity. So Die now makes a one-time
+`CorpseReport` the instant before the handover, while the rig still knows which
+appended slot is the robe: the bodies the corpse became (any of them under the
+crosshair means "this corpse"), and one entry per piece with the body that IS
+the piece (the identity shell, `IdentityShellOf`; the borrowed slot for a held
+sword), its other shells as rags, and its damage from `CaptureWorn`. Delivered
+through `MobSystem::SetOnCorpse` to `Corpses` (`game/corpses.h`), which is
+`WorldItems`' shape over the same bodies and hangs off the same
+`SetOnBodyGone` hook: a piece whose body burns off the corpse leaves the list,
+a corpse with no bodies left is forgotten, and the list is capped at 64 oldest-
+first. Not fired for the avatar (its kit lives in `PlayerKit` and the wear loop
+re-dresses the respawn from it). Not saved: a loaded world has heaps, not
+corpses, the same call the `'ITMS'` re-drop made.
+
+**The reach ray runs every frame, not on the press.** The prompt is the
+feature: `E  pick up robe` / `E  loot goblin` under the crosshair is what tells
+the player the thing on the floor is a thing at all, and the ground registry is
+asked first so a shed robe lying in its heap reads as the robe. Reach went from
+5 to 24 voxels: the ray starts at the EYE and the avatar is 17 voxels tall, so a
+thing at your feet was a body height out of reach. Two things the ray must NOT
+do, both measured with a walking rig on 2026-09-12 (a fly-mode harness has no
+rig and shows neither): hit the player's OWN HEAD — the eye is inside the head
+collider and Jolt reports a convex shape the ray starts in at fraction 0, so
+every cast answered "your head" and E was dead — and miss the crosshair in
+third person, where the camera is on a boom metres behind the head and a ray
+from the head along the camera's forward runs parallel to the crosshair line
+but metres off it (16 of 16 corpse bodies missed). So the cast skips the
+avatar's live limb bodies (`Physics::CastRayBody` with an ignore list) and
+starts at the RENDER eye, with a hit counting only if the point it lands on is
+within reach of the head. It is the one ray that reads the camera: a UI query
+against Jolt bodies, not a sim input, so the "picking rays use `player.EyePos`
+so the camera cannot change what the sim sees" contract does not apply to it.
+E over a corpse opens the
+character screen with a LOOT panel where the grimoire sits (wide) or the
+arsenal (narrow), one `KitSlotUI` per piece through the same mirror, and
+`KitSpace::Loot` is one more address the same drag can name. `TakeCorpseLoot`
+executes it beside `PlayerKit::Move` rather than inside it — a corpse is not
+one of the player's containers and has no `ItemStack` to swap — with Move's
+discipline: `EquipSlotAccepts` on an equip destination, a sentence per refusal,
+an occupied destination sends its stack to the pack rather than overwriting,
+a full pack refuses with the piece still on the corpse. On success the
+identity body and rags are destroyed (the robe visibly leaves the heap), and
+the damage is filed by name with the identity shell's lattice re-read off the
+body as it is NOW, so a robe that went on burning after its wearer died comes
+off burnt. Right-click takes into the pack; a drag onto an equip slot wears it;
+a drag OUT of the panel is `ShedCorpseLoot` — the piece comes off the corpse
+and its body is registered as a ground item, nothing created. A drag INTO the
+panel is refused: a thing put on a corpse would be data with no body. The panel
+closes with the screen, on its button, when the corpse is gone, or past 40
+voxels from any of its bodies. The HUD now also draws a fresh `kitMessage`
+under the prompt, so "picked up" is seen in play rather than only on the
+character screen. `--gate loot` (42 checks, no window); `--shot-inventory`'s
+fourth frame is a dressed human killed and opened.
+
 ### Cross-limb heat respects the coat
 
 `BuildCrossLimbHeat` lets a burning limb warm its siblings through faces where

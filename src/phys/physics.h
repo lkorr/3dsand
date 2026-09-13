@@ -290,6 +290,13 @@ class Physics {
   // hit position along the ray (0..1 of maxDistVoxels). Laser body cuts.
   uint64_t CastRayBody(Vec3 fromVoxel, Vec3 dirNormalized, float maxDistVoxels,
                        float& fraction) const;
+  // Same, skipping `ignore`. For a ray that STARTS INSIDE a body: Jolt reports
+  // a convex shape the origin is in as a hit at fraction 0, so a look ray cast
+  // from the player's eye sees the avatar's own head before anything else
+  // unless the rig's limbs are excluded (the E look-at prompt).
+  uint64_t CastRayBody(Vec3 fromVoxel, Vec3 dirNormalized, float maxDistVoxels,
+                       float& fraction,
+                       const std::vector<uint64_t>& ignore) const;
 
   // Static terrain collision patch (triangles in voxel units, world space).
   uint64_t CreateTerrainMesh(const std::vector<float>& vertsXYZ,

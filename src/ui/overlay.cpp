@@ -1,5 +1,6 @@
 #include "ui/overlay.h"
 
+#include <algorithm>
 #include <cmath>
 #include <cstdio>
 
@@ -218,6 +219,30 @@ void Overlay::DrawHUD(const UIState& s) {
     const ImVec2 tp(x, yTop - ts.y - 6);
     d->AddText(ImVec2(tp.x + 1, tp.y + 1), IM_COL32(0, 0, 0, 190), dead);
     d->AddText(tp, IM_COL32(255, 70, 60, 255), dead);
+  }
+
+  // ---- the look prompt, and what the last E did ----------------------------
+  // Under the crosshair, on a dark tab, the way the character screen's footer
+  // does it: "E  pick up robe". The kit message rides beneath it while fresh
+  // so "picked up" / "you have no room for that" is SEEN in play rather than
+  // only on the character screen, which is where it used to be drawn alone.
+  auto tab = [&](const char* text, float y, ImU32 rim, ImU32 ink, float alpha) {
+    const ImVec2 ts = ImGui::CalcTextSize(text);
+    const ImVec2 tp(std::floor((disp.x - ts.x) * 0.5f), y);
+    d->AddRectFilled(ImVec2(tp.x - 10, tp.y - 3), ImVec2(tp.x + ts.x + 10, tp.y + ts.y + 3),
+                     IM_COL32(0, 0, 0, (int)(150 * alpha)));
+    d->AddRectFilled(ImVec2(tp.x - 10, tp.y - 3), ImVec2(tp.x + ts.x + 10, tp.y - 1),
+                     ui::Fade(rim, 0.55f * alpha));
+    d->AddText(ImVec2(tp.x + 1, tp.y + 1), IM_COL32(0, 0, 0, (int)(190 * alpha)), text);
+    d->AddText(tp, ui::Fade(ink, alpha), text);
+    return ts.y + 8;
+  };
+  float py = std::floor(disp.y * 0.5f) + 28.0f;
+  if (!s.lookPrompt.empty())
+    py += tab(s.lookPrompt.c_str(), py, ui::ColGoldDim(), ui::ColParch(), 0.95f);
+  if (!s.kitMessage.empty() && s.kitMessageAge < 2.5f) {
+    const float a = std::clamp(1.6f - s.kitMessageAge * 0.7f, 0.0f, 1.0f);
+    tab(s.kitMessage.c_str(), py, ui::ColEmber(), ui::ColEmber(), a);
   }
   ImGui::PopFont();
 }

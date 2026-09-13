@@ -794,6 +794,44 @@ struct ItemCover;
 // through the BrushOp/CellOp/ParticleSpawn streams like every other mutation,
 // and every RNG draw that reaches those streams is counter-based (id, tick,
 // index), never keyed on a Jolt float.
+// ---- WHAT A CORPSE STILL HAS ON IT --------------------------------------------
+//
+// Die() hands every limb to DebrisSystem and the husk is swept out of mobs_ on
+// the next PreTick, so one tick after a creature falls there is no Mob left to
+// ask "what was it wearing". The shells are still THERE — a robe on a corpse is
+// a debris body jointed to the torso it fell with — but debris carries no
+// identity (game/worlditems.h's argument), so without this a corpse is a heap
+// you can carve and burn but not loot.
+//
+// This is the one-time report Die() makes the instant before the handover,
+// while the rig still knows which appended slot was the robe: the bodies the
+// corpse became (any of them under the crosshair means "this corpse"), and one
+// entry per piece of gear with the body that IS the piece — the identity shell
+// for a worn piece (the same panel ItemGroundVoxels drops, IdentityShellOf),
+// the borrowed slot for a held item — plus the piece's other shells, which are
+// rags that leave with it, and its damage captured one call before the shells
+// forget it (CaptureWorn). Delivered through MobSystem::SetOnCorpse to whoever
+// keeps the registry (game/corpses.h); the Mob keeps nothing.
+//
+// NOT fired for the avatar: the player's kit lives in PlayerKit and the wear
+// loop re-dresses the respawned rig from it, so their own corpse holding a
+// second copy would be a duplication machine.
+struct CorpseReport {
+  uint64_t mobId = 0;
+  std::string def;                  // MobDef::name, for the prompt
+  std::vector<uint64_t> bodies;     // every limb body, shells included
+  struct Piece {
+    std::string item;               // by NAME (item.h's index hazard)
+    int equipSlot = -1;             // -1 for the held item
+    bool held = false;
+    uint64_t body = 0;              // the body that IS the piece
+    int identityCover = -1;         // that body's ItemCover index (worn only)
+    std::vector<uint64_t> rags;     // the piece's other shells
+    WornDamage damage;              // as it was at death
+  };
+  std::vector<Piece> gear;
+};
+
 class Mob {
  public:
   Mob() = default;
@@ -1999,6 +2037,12 @@ class MobSystem {
   void SetOnItemShed(std::function<void(uint64_t, const std::string&)> cb) {
     onItemShed_ = std::move(cb);
   }
+  // A CREATURE FELL WITH THINGS ON IT. Called once from Mob::Die with the
+  // report above, after the limbs have become debris, so the handles in it
+  // are already bodies the receiver can destroy or look up. See CorpseReport.
+  void SetOnCorpse(std::function<void(const CorpseReport&)> cb) {
+    onCorpse_ = std::move(cb);
+  }
 
   // ---- the attack seam (Phase C consumes this) ----------------------------
   // Requests issued this tick. The AI decides WHEN and WHERE; it never swings,
@@ -2731,6 +2775,7 @@ class MobSystem {
   StyleLibrary styles_;
   const ItemLibrary* items_ = nullptr;
   std::function<void(uint64_t, const std::string&)> onItemShed_;
+  std::function<void(const CorpseReport&)> onCorpse_;
   std::vector<BlockEvent> blocks_;
   // The player's body, registered by main.cpp so the handle-keyed lookups can
   // find it. NOT owned and NOT in `mobs_` — see SetAvatar.

@@ -30,6 +30,7 @@
 #include "game/caster.h"
 #include "game/equipment.h"
 #include "game/worlditems.h"
+#include "game/corpses.h"
 #include "game/item.h"
 #include "game/melee.h"
 #include "game/mob.h"
@@ -75,8 +76,8 @@
 #include "gpu/passtimer.h"
 #include "measure/renderstats.h"
 #include "test/support.h"
-#include "ui/overlay.h"
 #include "test/treefixture.h"
+#include "ui/overlay.h"
 #include "crash.h"
 
 // The sim/render plumbing these once defined in place now lives in
@@ -154,7 +155,10 @@ constexpr uint64_t kShotInvOpenFrame = 150;    // let the avatar spawn and settl
 constexpr uint64_t kShotInvDamageFrame = 170;
 constexpr uint64_t kShotInvGearFrame = 220;    // -> screenshot_inventory.bmp
 constexpr uint64_t kShotInvCaptureFrame = 240;  // -> ..._health.bmp
-constexpr uint64_t kShotInvGrimoireFrame = 260; // -> ..._grimoire.bmp; last frame
+constexpr uint64_t kShotInvGrimoireFrame = 260; // -> ..._grimoire.bmp
+// Fourth: a dressed human killed in front of the player and its corpse opened
+// — the loot panel where the grimoire was (game/corpses.h). Last frame.
+constexpr uint64_t kShotInvLootFrame = 280;     // -> ..._loot.bmp; last frame
 
 
 // --frames N (phase 4b D3): windowed verification harness. 0 = play normally.
@@ -309,10 +313,6 @@ bool g_autoflyPark = false;
 // there. The manual half of the melee gates — `swing` and `swing-plane` assert
 // the trajectory and the wound, and this is where a person judges the FEEL.
 bool g_duelDummy = false;
-// SANDVOX_PARK_AT="x,y,z": park at a NAMED PLACE instead of wherever the
-// procedural surface route happens to stop.
-//
-// The route is dt-integrated, so where it ends is not a choice anybody made —
 // --fell-tree: the tree-fell gate's fixture, planted 48 voxels ahead of the
 // player once the world has settled, cut 120 ticks later, and the 300-tick
 // fall profiled exactly as the gate profiles it. The gate is headless, so the
@@ -329,6 +329,10 @@ int g_fellTreeAt = 240;  // the plant tick; the cut is 120 ticks later
 // trees by construction; --fell-tree 240 200,200 plants there.
 bool g_fellSiteSet = false;
 int g_fellSiteX = 0, g_fellSiteZ = 0;
+// SANDVOX_PARK_AT="x,y,z": park at a NAMED PLACE instead of wherever the
+// procedural surface route happens to stop.
+//
+// The route is dt-integrated, so where it ends is not a choice anybody made —
 // the 2026-08-24 answer below came back "97% of the survivors contain LAVA"
 // because that is what the flight passed over, and a re-run on 2026-09-08
 // landed in open desert and settled to 0 active chunks. Neither run says
@@ -3131,7 +3135,7 @@ int main(int argc, char** argv) {
     // g_shotInventory.
     else if (a == "--shot-inventory") {
       g_shotInventory = true;
-      g_harnessFrames = kShotInvGrimoireFrame;
+      g_harnessFrames = kShotInvLootFrame;
     }
     // `--duel-dummy` is the melee FEEL harness: a sword-armed human standing
     // three metres in front of the spawn, with nothing driving it. Mobs have no
@@ -3140,10 +3144,6 @@ int main(int argc, char** argv) {
     // stroke can be judged against a body rather than against the sky. Phase B's
     // AI/spawn panel supersedes it; keep the footprint here at one bool.
     else if (a == "--duel-dummy") g_duelDummy = true;
-    // `--short-range` is the headless handle on the dev panel's short-range
-    // row: no offscreen path can press a radio button, and the whole point of
-    // the mode is a LOOK and a frame time to compare, both of which are
-    // captured by --shot / --render-budget. Equivalent to
     else if (a == "--fell-tree") {
       g_fellTree = true;
       if (i + 1 < argc && argv[i + 1][0] != '-') g_fellTreeAt = std::atoi(argv[++i]);
@@ -3153,6 +3153,10 @@ int main(int argc, char** argv) {
         i++;
       }
     }
+    // `--short-range` is the headless handle on the dev panel's short-range
+    // row: no offscreen path can press a radio button, and the whole point of
+    // the mode is a LOOK and a frame time to compare, both of which are
+    // captured by --shot / --render-budget. Equivalent to
     // SANDVOX_SHORT_RANGE=1. `--short-range-near` picks the tighter arm
     // (render.shortRangeNearDist, 50 m by default) and implies the mode, so
     // the near arm is one flag rather than two that must be given together.
@@ -3887,9 +3891,15 @@ int main(int argc, char** argv) {
   // Ordering makes that unrepresentable; a teardown call would only make it
   // unlikely.
   WorldItems ground;
+  // ...and the corpses you can loot (game/corpses.h): the same registry shape
+  // over the same bodies, declared before `debris` for the same reason.
+  Corpses corpses;
   DebrisSystem debris;
   debris.Init(&phys, &world, mats, reactions);
-  debris.SetOnBodyGone([&ground](uint64_t h) { ground.OnBodyGone(h); });
+  debris.SetOnBodyGone([&ground, &corpses](uint64_t h) {
+    ground.OnBodyGone(h);
+    corpses.OnBodyGone(h);
+  });
   MobSystem mobs;
   mobs.Init(&phys, &world, &debris, mats, reactions);
   // Micro-body bricks (PLAN §C) are packed at mob-def load and uploaded
@@ -3951,6 +3961,11 @@ int main(int argc, char** argv) {
   // release hook above already forgets it when the body goes.
   mobs.SetOnItemShed(
       [&ground](uint64_t h, const std::string& name) { ground.Add(h, name); });
+  // A CREATURE THAT FELL WITH THINGS ON IT. Die() reports the bodies it became
+  // and the gear still on them the instant before the rig forgets; from here
+  // on the heap is a corpse the crosshair can name and the character screen
+  // can open (Mob::CorpseReport, game/corpses.h).
+  mobs.SetOnCorpse([&corpses](const CorpseReport& r) { corpses.Add(r); });
   Stream stream;
   stream.Init(&ctx, &world, &sim, kDefaultSeed);
   stream.OnMaterialsReloaded(mats);
@@ -4395,6 +4410,15 @@ int main(int argc, char** argv) {
   // A body part clicked in the inspector with a sentence on the stack, latched
   // the same way: the slot, or -1.
   int castAtPartQueued = -1;
+  // ---- looking at things, and looting them (game/corpses.h) ----------------
+  // What the reach ray found this frame (a debris body handle or 0), the
+  // corpse the loot panel is open on, and whether E opened the character
+  // screen to show it — so closing the loot closes the screen it opened and
+  // leaves alone one the player opened themselves.
+  uint64_t lookBody = 0;
+  uint64_t lootCorpse = 0;
+  bool lootOpenedScreen = false;
+  std::vector<uint64_t> lookIgnore;   // the avatar's own limbs, per frame
   // RMB held (a beam stays lit while it is), and Delete pressed in magic mode
   // (drop the newest status), both read on the frame and consumed by the tick.
   bool beamHeld = false;
@@ -4839,6 +4863,55 @@ int main(int argc, char** argv) {
             if (const GlyphDef* d = glyphs.At(gi)) ui.grimoireEditWords.push_back(d->id);
         }
       }
+      // Fourth picture: a corpse with its gear on, opened. A human is spawned
+      // a few paces ahead, dressed in every worn piece the library has and
+      // handed a sword, and killed — the same CorpseReport path a fight
+      // produces — and the panel is opened on it as E would.
+      if (frameCounter == kShotInvGrimoireFrame + 1) {
+        ui.grimoireMode = false;
+        int humanDef = -1;
+        for (size_t i = 0; i < mobs.Defs().size(); i++)
+          if (mobs.Defs()[i].name == "human") humanDef = (int)i;
+        if (humanDef >= 0) {
+          const MobDef& d = mobs.Defs()[humanDef];
+          const Vec3 fwd = cam.Forward();
+          const float dist = MetresToCells(2.0f);
+          const int sx = ifloor(player.pos.x + fwd.x * dist) - d.prefab.size.x / 2;
+          const int sz = ifloor(player.pos.z + fwd.z * dist) - d.prefab.size.z / 2;
+          const int sy = World::TerrainHeight(sx + d.prefab.size.x / 2,
+                                              sz + d.prefab.size.z / 2,
+                                              kDefaultSeed) + 1;
+          const uint64_t id = mobs.Spawn(humanDef, {sx, sy, sz});
+          int dressed = 0;
+          if (id) {
+            Equipment worn;
+            for (const ItemDef& it : items.items) {
+              if (!ItemKindIsWorn(it.kind)) continue;
+              const int slot = EquipSlotFor(it.kind, worn);
+              if (slot < 0 || !worn.At(slot).Empty()) continue;
+              if (mobs.WearItem(id, &it, slot)) {
+                worn.slots[slot] = {items.Find(it.name), 1};
+                dressed++;
+              }
+            }
+            if (const ItemDef* sword = items.At(items.Find("sword")))
+              mobs.EquipItem(id, sword);
+            if (Mob* m = mobs.FindMobById(id)) m->Die();
+          }
+          const CorpseReport* c = corpses.Find(id);
+          if (c) {
+            lootCorpse = id;
+            ui.lootOpen = true;
+            ui.lootTitle = c->def;
+          }
+          std::printf("--shot-inventory: corpse of a human in %d worn pieces, "
+                      "%zu lootable%s\n",
+                      dressed, c ? c->gear.size() : (size_t)0,
+                      c ? "" : " (NO CORPSE REPORTED)");
+        } else {
+          std::fprintf(stderr, "--shot-inventory: no \"human\" mob def\n");
+        }
+      }
     }
     glfwPollEvents();
     double now = NowSeconds();
@@ -5192,17 +5265,87 @@ int main(int argc, char** argv) {
     // the laser uses), and the registry answers "is that a thing, and which
     // thing". A body the registry does not know is scenery — a rock, a corpse,
     // a chunk of somebody's wall — and is left alone.
-    if (captured && eE.Pressed(key(GLFW_KEY_E))) {
-      // Arm's length, in world voxels. A literal rather than a tuning knob
-      // because it is a HUMAN dimension, not a feel dial: the avatar is 17
-      // voxels tall (gen_human's height contract), so 5 is about how far a
-      // person can reach without walking.
-      constexpr float kPickupReach = 5.0f;
+    //
+    // THE RAY RUNS EVERY FRAME, NOT ONLY ON THE PRESS, because the prompt is
+    // the feature: "E  pick up robe" under the crosshair is what tells the
+    // player the thing on the floor is a thing at all. One Jolt ray cast per
+    // frame against the moving layer is nothing next to the laser's.
+    //
+    // Reach, in world voxels. A literal rather than a tuning knob because it
+    // is a HUMAN dimension, not a feel dial: the avatar is 17 voxels tall
+    // (gen_human's height contract) and the ray starts at the EYE, so a thing
+    // lying at your feet is a full body height away before you have bent
+    // down — 24 is the floor a pace ahead, and not the far side of the room.
+    constexpr float kPickupReach = 24.0f;
+    // How far you may wander from a corpse with its panel open before it
+    // closes: a few paces, the same "still standing over it" a pickup means.
+    constexpr float kLootRange = 40.0f;
+    lookBody = 0;
+    ui.lookPrompt.clear();
+    if (captured && !ui.inventoryOpen) {
+      // TWO THINGS THIS RAY MUST NOT DO, both measured 2026-09-12 with a
+      // walking avatar (a fly-mode harness has no rig and showed neither):
+      //
+      //  1. HIT THE PLAYER'S OWN HEAD. The eye sits inside the avatar's head
+      //     collider, and Jolt reports a convex shape the ray starts in as a
+      //     hit at fraction 0 — so from the player's eye EVERY cast answered
+      //     "your own head", the prompt never appeared and E did nothing.
+      //     The rig's live limb bodies (shells and the held item included)
+      //     are excluded from the cast.
+      //  2. MISS WHAT THE CROSSHAIR IS ON IN THIRD PERSON. The camera is on a
+      //     boom metres behind the body; a ray from the head along the
+      //     camera's forward runs parallel to the crosshair line but metres
+      //     off it (16 of 16 corpse bodies missed). So the ray starts at the
+      //     RENDER eye — the boom in Third / OverShoulder, the head in First
+      //     — and a hit only counts if the point it lands on is within reach
+      //     of the HEAD, so arm's length stays arm's length from the body.
+      //
+      // This is the one ray that reads the camera: it is a UI query against
+      // Jolt bodies, not a sim input, so the "picking rays use player.EyePos
+      // so the camera cannot change what the sim sees" contract in the camera
+      // block below is not what it is protecting. `tpRig.EyePos()` is last
+      // frame's boom, which is where the picture the player is aiming with
+      // was drawn from.
+      lookIgnore.clear();
+      avatar.AppendLiveLimbBodies(lookIgnore);
+      const Vec3 hand = player.EyePos();
+      const Vec3 from = camMode == CameraMode::First ? hand : tpRig.EyePos();
+      const Vec3 fwd = cam.Forward();
+      const float castLen = kPickupReach + (from - hand).len();
       float frac = 1.0f;
-      const uint64_t hit = phys.CastRayBody(player.EyePos(), cam.Forward(),
-                                            kPickupReach, frac);
+      const uint64_t hit =
+          phys.CastRayBody(from, fwd, castLen, frac, lookIgnore);
+      if (hit && (from + fwd * (frac * castLen) - hand).len() <= kPickupReach)
+        lookBody = hit;
+      // The ground registry FIRST: a shed robe still lying in the heap it
+      // came off reads as the robe, not as the corpse (ShedCorpseLoot).
+      if (const WorldItem* w = lookBody ? ground.Find(lookBody) : nullptr) {
+        ui.lookPrompt = "E  pick up " + w->item;
+      } else if (const CorpseReport* c = corpses.FindByBody(lookBody)) {
+        ui.lookPrompt = c->gear.empty() ? c->def + "  -  nothing left on it"
+                                        : "E  loot " + c->def;
+      }
+    }
+    if (captured && eE.Pressed(key(GLFW_KEY_E))) {
+      const uint64_t hit = lookBody;
       const WorldItem* w = hit ? ground.Find(hit) : nullptr;
-      if (w) {
+      const CorpseReport* corpse = w ? nullptr : corpses.FindByBody(hit);
+      if (corpse && !corpse->gear.empty()) {
+        // OPEN THE CORPSE: the character screen with its loot panel up. The
+        // cursor dance is the I key's, and `lootOpenedScreen` remembers that
+        // it was E who opened the screen so closing the loot closes it again.
+        lootCorpse = corpse->mobId;
+        ui.lootOpen = true;
+        ui.lootTitle = corpse->def;
+        if (!ui.inventoryOpen) {
+          lootOpenedScreen = true;
+          ui.inventoryOpen = true;
+          captureBeforeUi = captured;
+          captured = false;
+          glfwSetInputMode(window, GLFW_CURSOR, GLFW_CURSOR_NORMAL);
+          glfwGetCursorPos(window, &mx0, &my0);
+        }
+      } else if (w) {
         const int di = items.Find(w->item);
         // Bag first, hotbar as the overflow. A full pack REFUSES rather than
         // silently swallowing or silently dropping: the item stays exactly
@@ -7956,7 +8099,9 @@ int main(int argc, char** argv) {
       // The rig only decides where the RENDER eye sits. Picking rays, the
       // brush, the laser and the grenade all keep using player.EyePos(), so
       // switching to third person cannot change anything the sim sees — the
-      // same guarantee the view-smoothing offset already relies on.
+      // same guarantee the view-smoothing offset already relies on. (The E
+      // look-at ray is the one deliberate exception: a UI query that has to
+      // agree with the crosshair, reach-limited from the head; see its note.)
       {
         const AvatarLocomotion loco = avatar.Locomotion();
         // ORBIT THE PLAYER, NOT THE ART. The obvious-looking choice — the head
@@ -8662,6 +8807,102 @@ int main(int argc, char** argv) {
       // never authoritative and never even one frame stale in a way that could
       // be acted on twice — the latch is cleared here, by its consumer, the
       // same shape every other one-shot in this loop uses.
+      // ---- LOOT: the corpse the screen is open on ---------------------------
+      //
+      // Consumed here, beside the kit latches, because a loot slot is one more
+      // address the same drag can name (KitSpace::Loot). The corpse is
+      // re-found BY ID on every use — a registry pointer does not survive
+      // TakeCorpseLoot destroying the piece's body (game/corpses.h).
+      {
+        auto say = [&](const std::string& m) {
+          ui.kitMessage = m;
+          ui.kitMessageAge = 0.0f;
+        };
+        auto closeLoot = [&]() {
+          ui.lootOpen = false;
+          ui.lootClose = false;
+          lootCorpse = 0;
+          if (lootOpenedScreen && ui.inventoryOpen) {
+            ui.inventoryOpen = false;
+            captured = captureBeforeUi;
+            glfwSetInputMode(window, GLFW_CURSOR,
+                             captured ? GLFW_CURSOR_DISABLED
+                                      : GLFW_CURSOR_NORMAL);
+            glfwGetCursorPos(window, &mx0, &my0);
+          }
+          lootOpenedScreen = false;
+        };
+        // The screen closed under the panel (I / Esc): the loot goes with it.
+        if (ui.lootOpen && !ui.inventoryOpen) {
+          ui.lootOpen = false;
+          lootCorpse = 0;
+          lootOpenedScreen = false;
+        }
+        if (ui.lootClose) closeLoot();
+        // Walked away, or the heap is gone / picked clean: close by itself.
+        if (ui.lootOpen) {
+          const CorpseReport* c = corpses.Find(lootCorpse);
+          if (!c || !CorpseWithin(*c, phys, player.pos, kLootRange))
+            closeLoot();
+        }
+        auto takeOne = [&](int index, KitRef dest) -> bool {
+          CorpseReport* c = corpses.Find(lootCorpse);
+          if (!c) return false;
+          std::string name;
+          const LootResult r = TakeCorpseLoot(*c, index, dest, kit, hotbar,
+                                              items, debris, &name);
+          if (r == LootResult::Ok) {
+            say("took " + name);
+            return true;
+          }
+          say(LootResultText(r, dest));
+          return false;
+        };
+        if (ui.moveItem.pending && ui.lootOpen &&
+            ui.moveItem.to.space == KitSpace::Loot) {
+          ui.moveItem.pending = false;
+          if (ui.moveItem.from.space != KitSpace::Loot)
+            say("drag it out of the screen to put it on the ground");
+        }
+        if (ui.moveItem.pending && ui.moveItem.from.space == KitSpace::Loot) {
+          ui.moveItem.pending = false;
+          if (ui.lootOpen) takeOne(ui.moveItem.from.index, ui.moveItem.to);
+        }
+        if (ui.equipItem.pending && ui.equipItem.from.space == KitSpace::Loot) {
+          ui.equipItem.pending = false;   // the panel routes these to takeLoot
+          if (ui.lootOpen) takeOne(ui.equipItem.from.index, KitRef{});
+        }
+        if (ui.takeLoot.pending) {
+          ui.takeLoot.pending = false;
+          if (ui.lootOpen) {
+            if (ui.takeLoot.all) {
+              // Front to back until one refuses: a full pack stops the sweep
+              // with everything else still on the corpse, which is the only
+              // outcome under which nothing is lost.
+              int took = 0;
+              for (;;) {
+                const CorpseReport* c = corpses.Find(lootCorpse);
+                if (!c || c->gear.empty()) break;
+                if (!takeOne(0, KitRef{})) break;
+                took++;
+              }
+              if (took > 0) say(took == 1 ? "took one thing" : "took everything that fit");
+            } else {
+              takeOne(ui.takeLoot.index, KitRef{});
+            }
+          }
+        }
+        if (ui.dropItem.pending && ui.dropItem.from.space == KitSpace::Loot) {
+          ui.dropItem.pending = false;
+          // Dragged OUT of the loot panel: the piece comes off the corpse and
+          // stays on the floor as a thing you can pick up (ShedCorpseLoot).
+          CorpseReport* c = ui.lootOpen ? corpses.Find(lootCorpse) : nullptr;
+          std::string name;
+          if (c && ShedCorpseLoot(*c, ui.dropItem.from.index, debris, ground,
+                                  &name))
+            say("left the " + name + " on the ground");
+        }
+      }
       if (ui.moveItem.pending) {
         ui.moveItem.pending = false;
         const MoveResult r =
@@ -8932,6 +9173,26 @@ int main(int argc, char** argv) {
         ui.equipSlots.clear();
         for (int i = 0; i < kEquipSlotCount; i++)
           ui.equipSlots.push_back(mirror(kit.equip.slots[i]));
+        // The corpse's gear, through the same mirror so a robe on a corpse is
+        // drawn and tipped exactly as one in the pack — with its condition
+        // read off the death-time capture, the only record there is for a
+        // piece nobody is wearing.
+        ui.lootSlots.clear();
+        if (ui.lootOpen) {
+          if (const CorpseReport* c = corpses.Find(lootCorpse)) {
+            ui.lootTitle = c->def;
+            for (const CorpseReport::Piece& pc : c->gear) {
+              const int di = items.Find(pc.item);
+              UIState::KitSlotUI u = mirror(ItemStack{di, di >= 0 ? 1 : 0});
+              if (u.name.empty()) u.name = pc.item;   // gone from the library
+              if (u.wearable) {
+                u.condition = pc.damage.Condition();
+                u.ruined = GearRuined(u.condition, ruinedAt);
+              }
+              ui.lootSlots.push_back(std::move(u));
+            }
+          }
+        }
 
         ui.glyphsOwned.clear();
         for (int gi = 0; gi < (int)glyphs.glyphs.size(); gi++) {
@@ -9687,7 +9948,8 @@ int main(int argc, char** argv) {
         // third: a 9-slice frame whose middle slice was opaque.)
         if (g_shotInventory && (frameCounter == kShotInvGearFrame ||
                                 frameCounter == kShotInvCaptureFrame ||
-                                frameCounter == kShotInvGrimoireFrame))
+                                frameCounter == kShotInvGrimoireFrame ||
+                                frameCounter == kShotInvLootFrame))
           std::printf("--shot-inventory: portrait cube=%zu micro=%u "
                       "eye=(%.1f %.1f %.1f) target=(%.1f %.1f %.1f)\n",
                       pInst.size(), pMicro, portraitCam.eye.x, portraitCam.eye.y,
@@ -9903,12 +10165,15 @@ int main(int argc, char** argv) {
       // of a harness run, not the frame path of a game.
       if (g_shotInventory && (frameCounter == kShotInvGearFrame ||
                               frameCounter == kShotInvCaptureFrame ||
-                              frameCounter == kShotInvGrimoireFrame)) {
+                              frameCounter == kShotInvGrimoireFrame ||
+                              frameCounter == kShotInvLootFrame)) {
         const char* shotPath = frameCounter == kShotInvGearFrame
                                    ? "screenshot_inventory.bmp"
                                : frameCounter == kShotInvCaptureFrame
                                    ? "screenshot_inventory_health.bmp"
-                                   : "screenshot_inventory_grimoire.bmp";
+                               : frameCounter == kShotInvGrimoireFrame
+                                   ? "screenshot_inventory_grimoire.bmp"
+                                   : "screenshot_inventory_loot.bmp";
         const uint32_t W = ctx.width, H = ctx.height;
         rhi::Texture shotTex = ctx.device.CreateTexture(
             {W, H, 1}, ctx.surfaceFormat,

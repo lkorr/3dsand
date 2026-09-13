@@ -1230,6 +1230,28 @@ uint64_t Physics::CastRayBody(Vec3 fromVoxel, Vec3 dirNormalized,
   return FromBodyID(hit.mBodyID);
 }
 
+uint64_t Physics::CastRayBody(Vec3 fromVoxel, Vec3 dirNormalized,
+                              float maxDistVoxels, float& fraction,
+                              const std::vector<uint64_t>& ignore) const {
+  fraction = 1.0f;
+  if (!system_) return 0;
+  JPH::RRayCast ray(JPH::RVec3(VoxToM(fromVoxel.x), VoxToM(fromVoxel.y),
+                               VoxToM(fromVoxel.z)),
+                    JPH::Vec3(dirNormalized.x, dirNormalized.y,
+                              dirNormalized.z) *
+                        VoxToM(maxDistVoxels));
+  JPH::RayCastResult hit;
+  DynamicLayerFilter dynamicOnly;
+  JPH::IgnoreMultipleBodiesFilter skip;
+  skip.Reserve((JPH::uint)ignore.size());
+  for (uint64_t h : ignore)
+    if (h) skip.IgnoreBody(ToBodyID(h));
+  if (!system_->GetNarrowPhaseQuery().CastRay(ray, hit, {}, dynamicOnly, skip))
+    return 0;
+  fraction = hit.mFraction;
+  return FromBodyID(hit.mBodyID);
+}
+
 void Physics::RemoveBody(uint64_t handle) {
   if (!system_ || handle == 0) return;
   // joints attached to this body die with it (Jolt asserts otherwise)

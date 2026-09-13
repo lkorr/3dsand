@@ -645,6 +645,28 @@ struct UIState {
     bool pending = false;
     KitRef from;
   } dropItem;
+  // ---- LOOT (game/corpses.h) -----------------------------------------------
+  // The corpse the screen is open ON, mirrored like the bag: one row per piece
+  // still on it. main.cpp knows WHICH corpse; the panel only sees the list, and
+  // a KitRef in KitSpace::Loot indexes it. Opened by E over a corpse (which
+  // opens the screen too) and closed by the panel's button, by the screen
+  // closing, by the corpse being emptied or destroyed, or by walking away.
+  bool lootOpen = false;
+  std::string lootTitle;               // what fell (the mob def's name)
+  std::vector<KitSlotUI> lootSlots;
+  // Right-click on a loot slot, or the panel's "take all". Take-only: putting a
+  // thing ONTO a corpse would be data with no body in the world, so a drag
+  // into the loot panel is refused (main.cpp answers with the sentence).
+  struct TakeIntent {
+    bool pending = false;
+    int index = -1;
+    bool all = false;
+  } takeLoot;
+  bool lootClose = false;              // the panel's close button
+  // ---- the look prompt ------------------------------------------------------
+  // What E would do to the thing under the crosshair, or empty. Written by
+  // main.cpp's reach ray every frame, drawn by DrawHUD under the crosshair.
+  std::string lookPrompt;
   // RIGHT-CLICK: "put this where it belongs, I do not want to aim." The panel
   // deliberately does NOT pick the destination slot — it has the accepted-kinds
   // mirror and could, but choosing where a piece goes is the equipment system's
