@@ -3671,8 +3671,11 @@ marks it), written by `WriteBrick` on every re-skin and poked per voxel by
 `MicroBodyPokeStain`. The shader (`microbody.wgsl bodyStainTint`) reads one
 byte at the hit and applies exactly `applyStain`'s multiply-then-lerp with the
 same `TUNE_STAIN_*` knobs, mottled at world pitch, so blood that ran off an
-arm onto the floor is the same colour on both. Never hashed, never saved;
-travels with a severed limb (the voxel lists move) and into every fragment
+arm onto the floor is the same colour on both. Never hashed (the body is not
+in the grid); SAVED, because it rides the limb's own voxel list and the MOBS /
+DBRS sections write those lists raw (this sentence said "never saved" until
+2026-09-13 and was wrong); travels with a severed limb (the voxel lists move)
+and into every fragment
 (`DownsampleSkin` carries the heaviest stain of a block; `MicroBodyPack`
 grows the lattice for a stained gobbet). Rule 2: the pool pays +50% only for
 bodies that have actually been bloodied.
@@ -3783,6 +3786,70 @@ stains the limb and at least half of the bone it exposed; a 6 m/s burst aimed
 at the hips lands; the wound's own spray queues bursts; a box of blood round
 the hips over 30 ticks stains them and the same box of water over 60 ticks
 takes at least half of it off again.
+
+### A coat is a substance, not a look (2026-09-13; `docs/PLAN_body_coat.md`, `Mob::RecountCoat`, `Mob::ShedCoat`, `Mob::Footfall`)
+
+The byte above named a palette SLOT, which is the right identity on the ground
+(the substance is the liquid cell; the stain is what it left) and the wrong one
+on a body, where there is no cell and the stain IS the substance. Seven looks
+are not seven substances: a future nullifier and blood may share a ground
+colour and must still be told apart on a hand. So the body stain is now a
+`uint16_t` -- 12-bit MATERIAL id, 4-bit amount (`voxload.h` `BodyStain*`) --
+and the ground's slot is DERIVED from it where a look is needed: the micro
+brick's render lattice stays one byte and `microbody.cpp` converts through
+`MicroBodySet::stainSlotOfMat`, refilled at every materials load, so
+`microbody.wgsl` did not change. A dry floor stain rubbing onto a foot goes the
+other way through `matOfStainType_` (the first material registered with that
+slot). The width change bumped the MOBS and DBRS save versions once.
+
+**`coat` block** on a material (`ParseCoat`, requires a `stain` block so the
+substance has a look): `decay` seconds per amount level lost while on a body
+(0 = washing only; blood 20, water 4 so wet dries), `shed` per-mille chance
+per footfall that a coated foot deposits (blood 400), `effects` raw string tags
+that nothing consumes yet. Behaviour is data (guideline 4): the first effect is
+a tag in JSON plus one read of the ledger.
+
+**The ledger** (`Mob::RecountCoat`): per limb, amount-weighted sums by material
+over the live voxels, body totals over the base rig only; fraction
+`sumAmt / (15 * voxels)`, so one splash cannot flip a threshold. Recounted
+every `coat.recountTicks` and ONLY when a stain byte changed (`coatDirty_`),
+so a clean crowd pays nothing (rule 2). `MobSystem::LimbCoatOf / BodyCoat /
+CoatTagFraction(mob, tag, limbTag)` resolve the avatar by id like the stain
+counts do.
+
+**Decay** lives in `Mob::StainTick` AFTER the contact pass, because
+`StainOneLimb` returns at the first empty AABB walk and a coat must fade in
+clean air; per-voxel roll on `Hash3(limbKey ^ cell, tick, salt)` so it thins
+unevenly, start rotated by tick under the same lattice budget, brick poked per
+change. Ground stains do NOT decay: the world rule is monotone so a stained
+chunk can sleep, and a drying rule would keep every stained chunk awake.
+
+**Shedding.** NPCs never had a footfall; `Footfall` moved from `PlayerAvatar`
+down to `Mob` and the NPC plant emits it (the avatar's per-frame audio drain is
+untouched). `Mob::ShedCoat` at the plant, tick-side: a foot whose ledger names a
+`shed` material rolls once, then emits ONE micro droplet per distinct ground
+cell of the sole -- the particle kernel's `atomicMax` claim takes one deposit
+per cell per tick, so N droplets on one cell waste N-1 -- born INSIDE the solid
+cell under the foot with life 1, where `sim_particle.wgsl` claims and resolves
+it that tick with the material's own `stain` block. Zero shader changes; the
+foot loses what it shed; liquid ground is skipped (the droplet would park on
+the water and vanish); charged against `coat.shedPerTick` and the spawn ring
+before emission, one tick latent through `pendingSpawns_`.
+
+**UI.** `UIState::BodyPartUI::stainFrac / stainMat / stainColor`: the HUD's
+"stained NN%" line beside the health bar (hidden under `coat.hudMinFrac`), the
+stick figure's limbs blended toward the substance's stain colour, and on the
+character screen a `BLOOD 42%` chip beside CHARRED and a stain-coloured callout
+for a stained but otherwise healthy limb.
+
+Gate `body-coat` (one monotonic tick counter on purpose: the drying rule fires
+on `tick % period`, so stepping the clock back between phases would mis-time
+the control arm): after a deep cut the ledger's heaviest material on the limb
+is blood (684 of 1330 voxels, fraction 0.24); at the authored 20 s a level the
+count holds through 150 ticks (684 -> 684) and at `coat.decayScale` 300 --
+two ticks a level, a value an author can set -- it falls to 62 in 47 ticks; a
+direct deposit on a stone cell of the room reads blood's slot at amount 5 and
+the cell is still stone.
 
 ### What is under the skin (2026-09-02; `assets/editor/anatomy.js`, sidecar `anatomy`, `scripts/anatomize_mob.mjs`)
 
