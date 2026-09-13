@@ -548,6 +548,17 @@ bool LoadTuning(const std::string& path, Tuning& out) {
     ReadF(*g, "fallFlailRamp", a.fallFlailRamp, out, at);
     a.fallFlailRamp = std::max(a.fallFlailRamp, 0.0f);
     ReadF(*g, "fallMinDrop", a.fallMinDrop, out, at);
+    ReadB(*g, "airPose", a.airPose, out, at);
+    ReadF(*g, "airPoseRiseSpeed", a.airPoseRiseSpeed, out, at);
+    // Floored rather than clamped to a range: these are DIVISORS of vel.y, so a
+    // zero would make the pose phase infinite on the first airborne tick.
+    a.airPoseRiseSpeed = std::max(a.airPoseRiseSpeed, 0.1f);
+    ReadF(*g, "airPoseFallSpeed", a.airPoseFallSpeed, out, at);
+    a.airPoseFallSpeed = std::max(a.airPoseFallSpeed, 0.1f);
+    ReadF(*g, "airPoseLandHeight", a.airPoseLandHeight, out, at);
+    a.airPoseLandHeight = std::max(a.airPoseLandHeight, 0.0f);
+    ReadF(*g, "airPoseLean", a.airPoseLean, out, at);
+    a.airPoseLean = std::clamp(a.airPoseLean, 0.0f, 60.0f);
     ReadB(*g, "firstPersonArms", a.firstPersonArms, out, at);
     ReadF(*g, "footTrim", a.footTrim, out, at);
     ReadF(*g, "severImpulse", a.severImpulse, out, at);

@@ -1648,6 +1648,150 @@ bool mobOk = false;
         // angle means a tucked knee (jump) and a straight leg (fall) are both
         // fine, and only a genuine fold-through fails.
         float worstLegUp = -1e9f;
+        // ---- ...AND THE AIRBORNE POSE MUST BE A FUNCTION OF vel.y ----------
+        //
+        // `legsNotInverted` above is a SAFETY bound: it says the legs did not
+        // fold through the pelvis. It passes just as happily on a body that
+        // does nothing at all in the air, which is what the old pose was —
+        // a 900 ms looping clip swaying the arms ten degrees over the rest
+        // hang the leg IK had faded out of ("just wobbles left and right
+        // slightly"). Nothing in it knew which way the body was going.
+        //
+        // So assert the DIFFERENCE, which is the whole claim of avatar.airPose:
+        // rising and falling are different shapes, in the right direction, by
+        // an amount you could see. Two arms of one fixture, ~20 ticks apart —
+        // the cheapest possible form of "it responds to the phase", and the
+        // one thing no amount of extra clip authoring could fake.
+        //
+        //   rising  -> knees TUCKED (foot close under the hip), arms driven UP
+        //   falling -> legs REACHING down, arms out WIDE to brace
+        //
+        // Measured in model space off each limb's own joint, so the body's
+        // world position and the fixture's teleporting have no vote.
+        float tuckDrop = 0, reachDrop = 0;    // hip.y - foot.y, mean of 2 legs
+        float tuckHandUp = 0, reachHandUp = 0;   // hand.y - shoulder.y, mean
+        // THE COUNTER-SWING, as the fore/aft GAP between the two hands. This
+        // is the one number that says the arms are doing opposite things:
+        // averages cannot see it (they cancel), and a per-arm height cannot
+        // either. It is also the assertion that would fail if `armSwing` ever
+        // stopped being signed per arm, which is the way this regresses.
+        float tuckHandSplit = 0, reachHandSplit = 0;  // |hand.z(L) - hand.z(R)|
+        float restDrop = 0;                   // the same drop, standing
+        {
+          const int hipParts[2] = {avatar.PartIndex("legU.L"),
+                                   avatar.PartIndex("legU.R")};
+          const int feet[2] = {avatar.PartIndex("foot.L"),
+                               avatar.PartIndex("foot.R")};
+          const int shoulders[2] = {avatar.PartIndex("armU.L"),
+                                    avatar.PartIndex("armU.R")};
+          const int hands[2] = {avatar.PartIndex("hand.L"),
+                                avatar.PartIndex("hand.R")};
+          auto sampleLegs = [&](float& drop) {
+            drop = 0;
+            int n = 0;
+            for (int s = 0; s < 2; s++) {
+              Vec3 hp, fp;
+              Quat hq, fq;
+              if (hipParts[s] < 0 || feet[s] < 0) continue;
+              if (!avatar.PartModelTransform(hipParts[s], hp, hq)) continue;
+              if (!avatar.PartModelTransform(feet[s], fp, fq)) continue;
+              drop += hp.y - fp.y;
+              n++;
+            }
+            if (n) drop /= (float)n;
+          };
+          auto sampleArms = [&](float& up, float& split) {
+            up = split = 0;
+            int n = 0;
+            float z[2] = {0, 0};
+            for (int s = 0; s < 2; s++) {
+              Vec3 sp, hp;
+              Quat sq, hq;
+              if (shoulders[s] < 0 || hands[s] < 0) continue;
+              if (!avatar.PartModelTransform(shoulders[s], sp, sq)) continue;
+              if (!avatar.PartModelTransform(hands[s], hp, hq)) continue;
+              up += hp.y - sp.y;
+              z[s] = hp.z;
+              n++;
+            }
+            if (n == 2) split = std::fabs(z[0] - z[1]);
+            if (n) up /= (float)n;
+          };
+          // The standing reference, taken BEFORE anything leaves the ground:
+          // every bound below is a fraction of this rig's own hanging leg, so
+          // the thresholds follow the art the way the gait's do.
+          sampleLegs(restDrop);
+
+          // ---- arm 1: RISING ----
+          // A real launch, not a teleport: the player's own jumpSpeed, applied
+          // as both the velocity the pose reads and the travel it implies, so
+          // the body is genuinely going up while it claims to be. The pose is
+          // driven by vel.y alone, but a fixture whose position disagreed with
+          // its velocity would be lying to every OTHER rule in the avatar (the
+          // gait's coyote distance, the landing probe) and the failure would
+          // land somewhere unrelated.
+          pl.grounded = false;
+          pl.vel.x = 0;
+          pl.vel.z = 0;
+          // Put the body back where the rise started before handing over. Every
+          // fixture after this one inherits pl.pos, and a jump at this rig's
+          // real jumpSpeed covers ~77 voxels in 22 ticks — enough to leave the
+          // fall below, the ramp and the bumpy-incline pass all measuring a
+          // body suspended somewhere new. Restoring it keeps this arm additive.
+          const float yBeforeRise = pl.pos.y;
+          const float kRise =
+              CurrentTuning().player.jumpSpeed / kVoxelMeters;
+          for (int i = 0; i < 22; i++) {
+            pl.vel.y = kRise;
+            pl.pos.y += kRise * kTickDt;
+            avTick();
+          }
+          sampleLegs(tuckDrop);
+          sampleArms(tuckHandUp, tuckHandSplit);
+
+          // ---- arm 2: FALLING, AND FAR ENOUGH UP TO STILL BE FALLING ------
+          //
+          // MEASURED FROM THE TOP OF THE JUMP, not from the drop below. The
+          // first version of this sampled 12 ticks into the existing fall loop,
+          // which starts AT the shelf the body walked off — and avatar.cpp's
+          // landing probe folds in the PREPARE shape over the last
+          // airPoseLandHeight (1.6 m, so 32 voxels at 5 cm) before contact. The
+          // body was inside that the whole way down, so the arm labelled
+          // "falling" was in fact the landing pose: it reported hands 0.6
+          // voxels above the shoulder against the reach shape's authored 0.40
+          // of an arm, and the lateral spread came out NARROWER than the tuck's
+          // instead of much wider. The fixture was wrong, not the pose — but a
+          // fixture that cannot tell "falling" from "about to land" is not
+          // evidence for either, and it would have failed the arm assertion
+          // while the thing under test was working.
+          //
+          // Up here the ground is ~70 voxels down, well past the probe's reach,
+          // so this is the reach shape and nothing else.
+          // At the tuning's OWN full fall speed, so this is the reach shape at
+          // full commitment rather than some fraction of it — the phase is
+          // `vel.y / airPoseFallSpeed`, so naming the same knob the pose reads
+          // is what keeps the arm at 1.0 if that knob is ever retuned.
+          const float kFall =
+              CurrentTuning().avatar.airPoseFallSpeed / kVoxelMeters;
+          for (int i = 0; i < 14; i++) {
+            pl.vel.y = -kFall;
+            pl.pos.y -= kFall * kTickDt * 0.1f;  // stay high; vel.y is the pose
+            avTick();
+          }
+          sampleLegs(reachDrop);
+          sampleArms(reachHandUp, reachHandSplit);
+
+          pl.pos.y = yBeforeRise;
+          // Land for a beat before handing over to the fall fixture below. Not
+          // cosmetic: the air CLOCK is what sends a body limp
+          // (ragdoll.fallSeconds, 3 s), and 36 ticks of jump plus the 45 the
+          // next loop spends falling would put this fixture within a few ticks
+          // of a ragdoll it is not trying to test.
+          pl.grounded = true;
+          pl.vel.y = 0;
+          for (int i = 0; i < 5; i++) avTick();
+          avatar.ClearFootfalls();   // the landing is not one of the gait's
+        }
         {
           pl.grounded = false;
           // Straight down, so drop the forward velocity the walk loops left
@@ -1692,6 +1836,48 @@ bool mobOk = false;
         // plenty of slack for a jump tuck; only a real fold-through goes
         // positive.
         bool legsNotInverted = worstLegUp < -0.5f;
+
+        // THE TWO SHAPES MUST DIFFER, AND IN THE RIGHT DIRECTION.
+        //
+        // Bounds are fractions of THIS rig's own standing leg (restDrop), never
+        // voxel literals: the pose table is authored in leg lengths for exactly
+        // that reason, and a hardcoded voxel bound would silently mean a
+        // different pose at a different kVoxelMeters or on a different rig.
+        //
+        // The margins are wide on purpose. The claim is "the body answers the
+        // phase", not "the tuck is 0.46 of a leg" — pinning the authored value
+        // here would make every future tweak of the shapes a test edit, which
+        // is the closed-ended-system failure DESIGN.md warns about. What it
+        // catches is the thing that actually regresses: the drive coming
+        // unhooked (both arms identical), or its sign inverting.
+        const bool haveAirRef = restDrop > 1e-3f;
+        const bool tucks = haveAirRef && tuckDrop < restDrop * 0.80f;
+        const bool reaches = haveAirRef && reachDrop > tuckDrop * 1.25f;
+        // The arms: driven UP at the launch, out WIDE on the way down. Measured
+        // against each other rather than against a standing pose, because the
+        // idle arms sit at whatever the rig authored and that is not a fact
+        // this test should own.
+        //
+        // TWO AXES OF THE SAME DRIVE, and each catches a failure the other
+        // cannot: the arms COUNTER-SWING widest at the launch (that is the
+        // instant they were actually driving) and are carried HIGHER on the way
+        // down (the brace). A swing that stopped being signed per arm collapses
+        // the split without touching the mean height; an arm pose that stopped
+        // reading the phase at all holds both.
+        const bool armsDrive =
+            tuckHandSplit > reachHandSplit + restDrop * 0.05f &&
+            reachHandUp > tuckHandUp + restDrop * 0.05f;
+        // With avatar.airPose OFF the shapes are the clip's, and the clip has
+        // no idea which way the body is moving — so this whole block is the
+        // air pose's own gate and is skipped rather than failed when it is off.
+        const bool airPoseOn = CurrentTuning().avatar.airPose;
+        const bool airPoseOk = !airPoseOn || (tucks && reaches && armsDrive);
+        std::printf(
+            "avatar air pose: %s (rest leg %.2f vox | tuck drop %.2f, reach "
+            "drop %.2f | hand up %.2f -> %.2f, counter-swing %.2f -> %.2f)\n",
+            !airPoseOn ? "off" : (airPoseOk ? "PASS" : "FAIL"), restDrop,
+            tuckDrop, reachDrop, tuckHandUp, reachHandUp, tuckHandSplit,
+            reachHandSplit);
 
         // ---- BUMPY INCLINE: the pose must not TELEPORT between frames ----
         //
@@ -1935,8 +2121,16 @@ bool mobOk = false;
             // start `fall`. Both are now gated on real events (a launch, and a
             // real drop below the last supported height), so walking a hill
             // must show neither.
+            //
+            // WITH avatar.airPose ON THERE ARE NO AIR CLIPS TO COUNT. The pose
+            // is driven from vel.y through the IK chains and neither clip is
+            // ever started, so a check phrased against them is green by
+            // construction — the coverage has to move to the thing that poses
+            // the body now. `AirPoseWeight` is the same claim about the same
+            // event: cresting a step must not convince the rig it is airborne.
             if (avatar.ClipActive("jump")) rampJumpTicks++;
             if (avatar.ClipWeight("fall") > 0.05f) rampFallTicks++;
+            if (avatar.AirPoseWeight() > 0.05f) rampFallTicks++;
             for (int s = 0; s < 2; s++) {
               rampHipLo = std::min(rampHipLo, jointTwistX(watch[2 + s], hips));
               rampHipHi = std::max(rampHipHi, jointTwistX(watch[2 + s], hips));
@@ -2018,7 +2212,7 @@ bool mobOk = false;
                     legsUpright && legsAlternate && legsNotSplayed &&
                     legsNotInverted && armsHang && armsSwing && poseContinuous &&
                     kneeBends && jointsInRange && strideCoherent &&
-                    rampWalks && rampNoAirClips;
+                    rampWalks && rampNoAirClips && airPoseOk;
         std::printf(
             "avatar: %s (%d parts, spawned=%d bodies=%d, followed %.1f vox, "
             "y-drift %.2f vox, self-push %.3f vox, states seen=%d (last %d) "
