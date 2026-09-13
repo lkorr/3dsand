@@ -394,6 +394,11 @@ struct BodyBurnState {
   // cost on the front instead of on the volume. Fire lives on a SURFACE, so
   // this is a 2D front over a 3D body.
   std::vector<uint32_t> front;
+  // The EXPOSED voxels (an empty 6-neighbour), as cells of the index box: the
+  // contact stain pass sweeps this list, so a limb standing in a pool costs
+  // its surface and not its volume. Built by the first contact after an index
+  // (re)build, dropped with the index.
+  std::vector<uint32_t> surface;
   // Voxels burnt away since the last collider rebuild. That rebuild is the most
   // expensive single operation in the feature, so it is batched hard.
   uint32_t removed = 0;
@@ -556,6 +561,44 @@ struct BurnLimbView {
       (*coll)[i].color = 0;
     }
   }
+  // The body stain byte (voxload.h BodyStain*), read and written on the same
+  // authoritative lattice the burn does.
+  uint8_t Stain(size_t i) const {
+    return skin ? (*skin)[i].stain : (*coll)[i].stain;
+  }
+  void SetStain(size_t i, uint8_t st) const {
+    if (skin) (*skin)[i].stain = st; else (*coll)[i].stain = st;
+  }
+};
+
+// ---- A SPLASH OF BLOOD LOOKING FOR SOMETHING TO LAND ON ---------------------
+//
+// One tick's worth of a gout or a drip's spray, as the OTHER bodies see it.
+// The droplets themselves are GPU particles that know nothing about limbs;
+// this is the CPU's account of the same burst -- origin, axis, cone, speed
+// and count -- queued by Mob::BleedTick and replayed by MobSystem::StainLimbs
+// against every limb of every creature within `reach` (and by
+// PlayerAvatar::PreTick against the player's own). The replay flies the SAME
+// ARC the particle kernel does (speed, then sim.partGravity per tick), so a
+// body is marked where the droplets are seen to land and nowhere else: a
+// spray too slow to reach a face never marks it, however close. Never saved;
+// lives for two ticks at most.
+struct SplatterEvent {
+  Vec3 origin{};
+  Vec3 axis{0, 1, 0};   // unit-ish direction the burst is thrown along
+  float cone = 0.5f;    // lateral spread as a fraction of the axis (gore.*Cone)
+  float reach = 0.0f;   // world voxels a droplet is followed for (a cap)
+  float speed = 0.0f;   // nominal launch speed, world voxels per SECOND
+  int life = 0;         // ticks a droplet flies for (gore.microLifeTicks)
+  int count = 0;        // droplets this tick
+  uint32_t type = 0;    // stain palette slot of the blood
+  uint32_t amount = 0;  // amount per landed droplet
+  uint64_t sourceMob = 0;  // the bleeder; its own bleeding limb is skipped
+  int sourceLimb = -1;
+  uint32_t tick = 0;
+  uint32_t seed = 0;
+  bool doneMobs = false;    // applied to MobSystem's creatures
+  bool doneAvatar = false;  // applied to the player's avatar
 };
 
 // Loads assets/mobs/*.vox + matching .json sidecars. Appends problems to log;
@@ -1417,6 +1460,16 @@ class Mob {
   // it — see IsWornSlot).
   uint32_t StainWound(int limbIndex, Vec3 centreLocal, float radiusWorld,
                       uint32_t seed);
+  // ---- BLOOD ON A BODY, from the world and from other bodies -------------
+  // Contact: every limb reads the world cells around it once per tick (the
+  // same walk the burn pass makes) and takes the stain of any staining
+  // liquid, dry stain or drip it is touching on its exposed voxels -- or has
+  // it rinsed off by a washing liquid. Sleeps at the cost of the walk when
+  // nothing is near. `budget` is lattice cells this call may visit.
+  void StainTick(uint32_t tick, World& world, uint32_t& budget);
+  // Replay one queued burst against this creature's limbs: each droplet that
+  // would land on a limb marks the voxel where it lands.
+  void ApplySplatter(const SplatterEvent& e);
   // Does hp reaching zero take this limb OFF, or merely kill the creature?
   // See the note at the call sites: geometry dismembers, damage kills.
   bool HpZeroSevers(int limbIndex) const;
@@ -2343,6 +2396,36 @@ class MobSystem {
   // "cooked, then burnt" is visible as counts moving between slots rather than
   // as a state nobody can see.
   uint32_t LimbMaterialCount(uint64_t mobId, int limbIndex, uint32_t mat) const;
+  // How many of this limb's voxels carry a body stain of at least `minAmt`
+  // (any type), and how many of THOSE are of material `mat` -- the second is
+  // what "the bone is bloodied" is measured as.
+  uint32_t LimbStainCount(uint64_t mobId, int limbIndex, uint32_t minAmt) const;
+  uint32_t LimbStainedMatCount(uint64_t mobId, int limbIndex, uint32_t mat,
+                               uint32_t minAmt) const;
+  // The highest WORLD y (voxels) of any voxel of this limb carrying a stain
+  // of at least `minAmt`, through the limb's live pose; -1e30 when none. What
+  // "a shallow pool stains the ankles and not the thigh" is measured as.
+  float LimbStainMaxWorldY(uint64_t mobId, int limbIndex, uint32_t minAmt) const;
+  // The world-y span [lo, hi] of this limb's voxels carrying at least
+  // `minAmt` (0 = every voxel). False when there are none.
+  bool LimbStainWorldYRange(uint64_t mobId, int limbIndex, uint32_t minAmt,
+                            float& lo, float& hi) const;
+  // The stain palette slot a material leaves (materials.json `stain.type`),
+  // 0 when it does not stain. Read off the material table this system already
+  // mirrors for the burn pass.
+  uint32_t StainTypeOf(uint32_t mat) const;
+  // Queue one tick of a gout / spray for every OTHER body to be splashed by
+  // (see SplatterEvent). Bounded: past kSplatterMaxEvents the burst is not
+  // remembered, which only loses cosmetics.
+  void QueueSplatter(const SplatterEvent& e);
+  size_t SplatterEventsQueued() const { return splatters_.size(); }
+  // Apply every queued burst not yet applied to the avatar to `avatar`, and
+  // mark them so. Called by PlayerAvatar::PreTick.
+  void SplatterOnto(Mob& avatar);
+  // The NPC driver for StainTick + splatter replay, under the shared budget.
+  void StainLimbs(uint32_t tick, World& world);
+  bool StainOneLimb(BurnLimbView& v, uint32_t tick, uint32_t rngKey,
+                    World& world, uint32_t& budget);
   // The limb's AUTHORITATIVE lattice (the skin when it is finer, else the
   // collider re-expressed as PrefabVoxels), copied out for a gate that has
   // to ask WHICH voxels changed rather than how many (corpse-bleed asks where
@@ -2668,6 +2751,7 @@ class MobSystem {
   float worstSeverFrac_ = -1.0f;
   std::string worstSeverLimb_;
   std::vector<BleedSource> bleeds_;
+  std::vector<SplatterEvent> splatters_;
   std::vector<VoiceEvent> voices_;
   // Push a creature voice, de-duplicating Hurt per mob per drain window (see
   // VoiceEvent). Silently drops a mob with nothing bound is NOT this layer's
@@ -2707,6 +2791,20 @@ class MobSystem {
   // Ticks a cold limb keeps its dense index before releasing it, so a limb
   // walking through a campfire does not rebuild the index every other tick.
   static constexpr uint32_t kBurnIndexGrace = 30;
+  // ---- the stain pass (StainLimbs / StainOneLimb) ---------------------------
+  // World cells one limb's walk may read per tick (its AABB, dilated by one)
+  // before it decides nothing is against it.
+  static constexpr uint32_t kStainScanCells = 2048;
+  // Surface voxels one limb may sweep per tick, and all creatures together.
+  // A human limb's surface at skinScale 8 is a few thousand, so a limb in a
+  // pool is swept whole every tick or two.
+  static constexpr uint32_t kStainLatticePerLimb = 6144;
+  static constexpr uint32_t kStainLatticePerTick = 32768;
+  static constexpr size_t kSplatterMaxEvents = 64;
+  // Lattice steps one droplet's arc may take inside a limb's index box, and
+  // the widest splat (lattice voxels) one landing may paint.
+  static constexpr int kSplatterMarchSteps = 256;
+  static constexpr int kSplatterSplatMaxL = 5;
 
   // Mob's shared mechanics reach this system's services (burn tables, micro
   // pool, event sinks, material tables) through this friendship — the same

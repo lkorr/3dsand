@@ -16,6 +16,15 @@ namespace {
 // sizes: every .vox in assets/ together occupies ~49k of the 1 MiW pool at
 // 4 bpw, so ~98k at 2 bpw — under 10% either way.
 inline size_t WordsFor(size_t cellCount) { return (cellCount + 1) / 2; }
+// Word count for a brick's STAIN lattice: one byte per micro voxel, 4 per word.
+inline size_t StainWordsFor(size_t cellCount) { return (cellCount + 3) / 4; }
+inline size_t CellsOf(uint32_t dimsWord) {
+  return (size_t)(dimsWord & 1023) * ((dimsWord >> 10) & 1023) *
+         ((dimsWord >> 20) & 1023);
+}
+inline bool HasStain(uint32_t dimsWord) {
+  return (dimsWord & kMicroBodyDimsStainBit) != 0u;
+}
 
 // Pack/unpack the 16-bit micro voxel.
 inline uint16_t MicroVox(uint8_t mat, uint8_t color) {
@@ -62,11 +71,19 @@ void PoolFree(MicroBodySet& set, uint32_t base, size_t words) {
 // us skinVoxels straight out of a limb, and those carry a cosmetic palette
 // variant in bits 12-13 (mob.cpp) — testing the raw uint16 against 255 made
 // every variant>=1 voxel silently vanish from the re-skinned body.
+//
+// `withStain`: the block is payload + stain lattice (see
+// MicroBodyModelGpu::dims bit 30) and every voxel's stain byte is written after
+// its material. The lattice is cleared with the payload, so a voxel that has
+// been washed clean or carved away reads 0 without a separate erase.
 void WriteBrick(MicroBodySet& set, uint32_t base, IVec3 dims,
-                const std::vector<PrefabVoxel>& voxels, IVec3 origin) {
+                const std::vector<PrefabVoxel>& voxels, IVec3 origin,
+                bool withStain) {
   const size_t cellCount = (size_t)dims.x * dims.y * dims.z;
   const size_t words = WordsFor(cellCount);
-  std::fill(set.pool.begin() + base, set.pool.begin() + base + words, 0u);
+  const size_t total = words + (withStain ? StainWordsFor(cellCount) : 0);
+  std::fill(set.pool.begin() + base, set.pool.begin() + base + total, 0u);
+  const uint32_t sbase = base + (uint32_t)words;
   for (const PrefabVoxel& v : voxels) {
     int x = v.x - origin.x, y = v.y - origin.y, z = v.z - origin.z;
     if (x < 0 || y < 0 || z < 0 || x >= dims.x || y >= dims.y || z >= dims.z)
@@ -76,8 +93,10 @@ void WriteBrick(MicroBodySet& set, uint32_t base, IVec3 dims,
     size_t idx = ((size_t)z * dims.y + y) * dims.x + x;
     set.pool[base + idx / 2] |=
         (uint32_t)MicroVox((uint8_t)mat, v.color) << ((idx % 2) * 16);
+    if (withStain && v.stain)
+      set.pool[sbase + idx / 4] |= (uint32_t)v.stain << ((idx % 4) * 8);
   }
-  set.MarkPool(base, base + (uint32_t)words);
+  set.MarkPool(base, base + (uint32_t)total);
 }
 
 }  // namespace
@@ -260,7 +279,15 @@ int MicroBodyPack(MicroBodySet& set, const std::vector<PrefabVoxel>& voxels,
   }
 
   const size_t cellCount = (size_t)dims.x * dims.y * dims.z;
-  const size_t words = WordsFor(cellCount);
+  // A model packed from stained voxels -- a gobbet split off a bloodied limb,
+  // a corpse reloaded -- keeps its stain: the block grows the lattice and the
+  // dims word says so. A def's shared model never has one (nothing authored
+  // is stained), which is what keeps the load-time pool cost unchanged.
+  bool withStain = false;
+  for (const PrefabVoxel& v : voxels)
+    if (v.stain) { withStain = true; break; }
+  const size_t words =
+      WordsFor(cellCount) + (withStain ? StainWordsFor(cellCount) : 0);
   if (set.pool.size() + words > kMicroBodyPoolWordsWorld) {
     log += label + ": micro body brick pool full (" +
            std::to_string(kMicroBodyPoolWordsWorld) + " words)\n";
@@ -268,6 +295,7 @@ int MicroBodyPack(MicroBodySet& set, const std::vector<PrefabVoxel>& voxels,
   }
 
   std::vector<uint16_t> cells(cellCount, 0);
+  std::vector<uint8_t> stains(withStain ? cellCount : 0, 0);
   for (const PrefabVoxel& v : voxels) {
     if (v.x < 0 || v.y < 0 || v.z < 0 || v.x >= dims.x || v.y >= dims.y ||
         v.z >= dims.z)
@@ -283,10 +311,12 @@ int MicroBodyPack(MicroBodySet& set, const std::vector<PrefabVoxel>& voxels,
     }
     cells[((size_t)v.z * dims.y + v.y) * dims.x + v.x] =
         MicroVox((uint8_t)mat, v.color);
+    if (withStain) stains[((size_t)v.z * dims.y + v.y) * dims.x + v.x] = v.stain;
   }
 
   const uint32_t base = (uint32_t)set.pool.size();
-  for (size_t w = 0; w < words; w++) {
+  const size_t payloadWords = WordsFor(cellCount);
+  for (size_t w = 0; w < payloadWords; w++) {
     uint32_t word = 0;
     for (size_t b = 0; b < 2; b++) {
       size_t idx = w * 2 + b;
@@ -294,10 +324,19 @@ int MicroBodyPack(MicroBodySet& set, const std::vector<PrefabVoxel>& voxels,
     }
     set.pool.push_back(word);
   }
+  for (size_t w = payloadWords; w < words; w++) {
+    uint32_t word = 0;
+    for (size_t b = 0; b < 4; b++) {
+      size_t idx = (w - payloadWords) * 4 + b;
+      if (idx < cellCount) word |= (uint32_t)stains[idx] << (b * 8);
+    }
+    set.pool.push_back(word);
+  }
 
   MicroBodyModelGpu m{};
   m.base = base;
-  m.dims = (uint32_t)dims.x | ((uint32_t)dims.y << 10) | ((uint32_t)dims.z << 20);
+  m.dims = (uint32_t)dims.x | ((uint32_t)dims.y << 10) | ((uint32_t)dims.z << 20) |
+           (withStain ? kMicroBodyDimsStainBit : 0u);
   m.scale = scale;
   m.cutFaces = cutFaces & 0x3Fu;
   set.models.push_back(m);
@@ -316,12 +355,15 @@ int MicroBodyOwn(MicroBodySet& set, uint32_t model) {
   set.blockWords.resize(set.models.size(), 0);
   if (set.owned[model]) return (int)model;  // already private to one body
 
-  // Clone only the words the payload actually occupies: a shared model is
-  // always exactly its dims, so this is the same as its block size.
-  IVec3 dims{(int)(set.models[model].dims & 1023),
-             (int)((set.models[model].dims >> 10) & 1023),
-             (int)((set.models[model].dims >> 20) & 1023)};
-  const size_t words = WordsFor((size_t)dims.x * dims.y * dims.z);
+  // Clone the payload, and give the clone a STAIN LATTICE whether or not the
+  // source had one: an owned model is one something is about to mark (carve,
+  // burn, bloody), and allocating the lattice here rather than on the first
+  // stain poke means the block is never reallocated underneath a body that
+  // is being edited in place. Words = payload + stain, from the dims.
+  const size_t cells = CellsOf(set.models[model].dims);
+  const size_t payloadWords = WordsFor(cells);
+  const size_t words = payloadWords + StainWordsFor(cells);
+  const bool srcStain = HasStain(set.models[model].dims);
 
   uint32_t slot;
   if (!set.freeModels.empty()) {
@@ -342,12 +384,17 @@ int MicroBodyOwn(MicroBodySet& set, uint32_t model) {
   }
   // Re-read: the push_back above may have reallocated `models`.
   const MicroBodyModelGpu s = set.models[model];
-  std::copy(set.pool.begin() + s.base, set.pool.begin() + s.base + words,
+  const size_t copyWords = srcStain ? words : payloadWords;
+  std::copy(set.pool.begin() + s.base, set.pool.begin() + s.base + copyWords,
             set.pool.begin() + base);
+  if (!srcStain)
+    std::fill(set.pool.begin() + base + payloadWords,
+              set.pool.begin() + base + words, 0u);
 
   MicroBodyModelGpu& dst = set.models[slot];
   dst = s;
   dst.base = base;
+  dst.dims |= kMicroBodyDimsStainBit;
   set.owned[slot] = 1;
   set.blockWords[slot] = (uint32_t)words;
   set.MarkPool(base, base + (uint32_t)words);
@@ -374,7 +421,11 @@ bool MicroBodyEdit(MicroBodySet& set, uint32_t model,
 
   MicroBodyModelGpu& m = set.models[model];
   const size_t haveWords = set.blockWords[model];
-  const size_t words = WordsFor((size_t)dims.x * dims.y * dims.z);
+  // Owned blocks always carry the stain lattice after the payload (see
+  // MicroBodyOwn); a model MicroBodyPack made and the caller marked owned may
+  // not yet, and grows one here through the same "does not fit" path.
+  const size_t cells = (size_t)dims.x * dims.y * dims.z;
+  const size_t words = WordsFor(cells) + StainWordsFor(cells);
 
   if (words > haveWords) {
     // Grew past the reserved block (a split half re-based into a wider box):
@@ -388,8 +439,9 @@ bool MicroBodyEdit(MicroBodySet& set, uint32_t model,
   // Fitting in the existing block reuses it in place and KEEPS the surplus
   // attached (blockWords is unchanged), so repeated carving of one body never
   // touches the allocator and the free at teardown returns the whole block.
-  m.dims = (uint32_t)dims.x | ((uint32_t)dims.y << 10) | ((uint32_t)dims.z << 20);
-  WriteBrick(set, m.base, dims, voxels, mn);  // marks the block dirty
+  m.dims = (uint32_t)dims.x | ((uint32_t)dims.y << 10) | ((uint32_t)dims.z << 20) |
+           kMicroBodyDimsStainBit;
+  WriteBrick(set, m.base, dims, voxels, mn, true);  // marks the block dirty
   originShift = mn;
   set.dirty = true;
   return true;
@@ -416,6 +468,46 @@ bool MicroBodyPoke(MicroBodySet& set, uint32_t model, int x, int y, int z,
   word &= ~(0xFFFFu << shift);
   word |= (uint32_t)MicroVox(mat, art) << shift;
   if (word == set.pool[w]) return true;  // already that value: no upload debt
+  set.pool[w] = word;
+  set.MarkPool(w, w + 1);
+  return true;
+}
+
+bool MicroBodyPokeStain(MicroBodySet& set, uint32_t model, int x, int y, int z,
+                        uint8_t stain) {
+  if (model >= set.models.size()) return false;
+  if (model >= set.owned.size() || !set.owned[model]) return false;  // shared
+  MicroBodyModelGpu& m = set.models[model];
+  const int dx = (int)(m.dims & 1023), dy = (int)((m.dims >> 10) & 1023),
+            dz = (int)((m.dims >> 20) & 1023);
+  if (x < 0 || y < 0 || z < 0 || x >= dx || y >= dy || z >= dz) return false;
+  const size_t cells = (size_t)dx * dy * dz;
+  const size_t payloadWords = WordsFor(cells);
+  if (!HasStain(m.dims)) {
+    // A Pack-made owned model (a fragment, a reloaded corpse) without a stain
+    // lattice: move it to a block that has room for one. Same free-at-
+    // reserved-size discipline MicroBodyEdit follows.
+    const size_t words = payloadWords + StainWordsFor(cells);
+    const uint32_t base = PoolAlloc(set, words);
+    if (base == UINT32_MAX) return false;
+    std::copy(set.pool.begin() + m.base, set.pool.begin() + m.base + payloadWords,
+              set.pool.begin() + base);
+    std::fill(set.pool.begin() + base + payloadWords,
+              set.pool.begin() + base + words, 0u);
+    PoolFree(set, m.base, set.blockWords[model]);
+    m.base = base;
+    m.dims |= kMicroBodyDimsStainBit;
+    set.blockWords[model] = (uint32_t)words;
+    set.MarkPool(base, base + (uint32_t)words);
+  }
+  const size_t idx = ((size_t)z * dy + y) * dx + x;
+  const uint32_t w = m.base + (uint32_t)payloadWords + (uint32_t)(idx / 4);
+  if (w >= set.pool.size()) return false;
+  const uint32_t shift = (uint32_t)(idx % 4) * 8u;
+  uint32_t word = set.pool[w];
+  word &= ~(0xFFu << shift);
+  word |= (uint32_t)stain << shift;
+  if (word == set.pool[w]) return true;
   set.pool[w] = word;
   set.MarkPool(w, w + 1);
   return true;

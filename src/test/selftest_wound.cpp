@@ -47,6 +47,7 @@
 #include <algorithm>
 #include <cmath>
 #include <cstdio>
+#include <functional>
 #include <string>
 #include <unordered_map>
 #include <unordered_set>
@@ -57,6 +58,7 @@
 #include "sim/microbody.h"
 #include "sim/tuning.h"
 #include "test/selftest.h"
+#include "sim/scale.h"
 #include "test/support.h"
 
 using namespace sandvox;
@@ -1793,6 +1795,397 @@ Status GateCorpseBurn(Ctx& c, std::string& detail) {
 
 }  // namespace
 
+// ---------------------------------------------------------------------------
+// body-stain: blood on a body (owner report 2026-09-13)
+// ---------------------------------------------------------------------------
+//
+// Four claims, one fixture:
+//   * A CUT BLOODIES WHAT IT EXPOSES, bone included. Before this, the soak was
+//     a material rewrite that skipped bone on purpose, so a cut through bone
+//     showed clean bone, and the blast/corpse paths did not soak at all.
+//   * A BURST LANDS ON A BODY: a SplatterEvent replayed against a limb marks
+//     the voxels its droplets reach (this is how killing something covers
+//     you in it), and a bleeding wound queues such events by itself.
+//   * A BLOOD POOL RUBS OFF: a limb standing in blood takes its stain from the
+//     world through the CPU mirror, at the liquid's own authored rate.
+//   * WATER WASHES IT: the same limb in water loses it again.
+//   * ...AND ONLY WHERE IT TOUCHES (owner report 2026-09-13: "standing two
+//     voxels deep in blood stains all the way up the legs"): an ankle-deep
+//     pool marks nothing above its top plus the one-voxel contact dilation.
+//   * A BURST THAT CANNOT ARRIVE MARKS NOTHING: the replay flies the visible
+//     droplets' own gravity arc, so a drip's spray (3.5 vox/s) queued a metre
+//     away leaves the body clean. Before this the replay marched a straight
+//     line for speed x life and painted legs 80 cm above a wound.
+// The pool phases submit real ticks (the mirror is fetched through the tick
+// path) and regenerate the world on the way out, like wound-bleed.
+Status GateBodyStain(Ctx& c, std::string& detail) {
+  MobSystem& mobs = c.mobs;
+  IdCounterScope idScope(mobs);
+  PrepareWorld(c);
+  const Target t = ChooseTarget(mobs, FixtureSite(c.world, 330));
+  if (!t.valid()) {
+    detail = "no loaded mob def has a severable non-vital limb that bleeds";
+    return Status::Fail;
+  }
+  uint32_t mStone = 0;
+  for (size_t i = 0; i < c.mats.size(); i++)
+    if (c.mats[i].name == "stone") mStone = (uint32_t)i;
+  // THE ROOM. A sealed stone box round the spawn site -- floor three deep
+  // under it, walls and ceiling 2.4 m up, air inside -- written before the
+  // creature exists, so every claim below stands on a flat floor at a known
+  // height with nothing that can flow, sink or fall into it. The site is
+  // FixtureSite's TerrainHeight+1, and TerrainHeight is NOT the surface: at
+  // this inset the real ground was 2 voxels higher standalone and 13 higher in
+  // the full suite (the window origin walked by `streaming` lands the site
+  // under a hill), where the human climbed its 1.2 m escape cap and stayed
+  // entombed with nothing round its feet but rock. Two earlier fixtures on
+  // the open ground measured sand flowing into the pool and the body climbing
+  // the mound it made.
+  //
+  // Written a few ticks AFTER PrepareWorld, not on the tick right after it:
+  // SubmitWorldgen queues the authored edit layer and the paged fill in
+  // batches that land over the next ticks, and a room written on the first
+  // tick was generated straight over (the feet then stood at 215.5 on sand
+  // over a floor meant to be at 207).
+  const IVec3 site0 = FixtureSite(c.world, 330);
+  const IVec3 roomChunk{site0.x >> 4, site0.y >> 4, site0.z >> 4};
+  constexpr int kRoomHalf = 9, kRoomUp = 24;
+  auto bareTick = [&](uint32_t tick, std::vector<CellOp>& cellOps) {
+    std::vector<BrushOp> ops;
+    std::vector<ParticleSpawn> spawns;
+    SubmitTick(c.ctx, c.world, c.sim, tick, kDefaultSeed, ops, {}, cellOps, false,
+               roomChunk, true, false, spawns);
+    c.ctx.WaitIdle();
+    c.ctx.ProcessEvents();
+  };
+  if (mStone) {
+    {
+      std::vector<CellOp> none;
+      for (uint32_t k = 0; k < 6; k++) bareTick(28990u + k, none);
+    }
+    std::vector<CellOp> cellOps;
+    for (int dz = -kRoomHalf; dz <= kRoomHalf; dz++)
+      for (int dx = -kRoomHalf; dx <= kRoomHalf; dx++)
+        for (int dy = -3; dy <= kRoomUp + 1; dy++) {
+          const IVec3 cc{site0.x + dx, site0.y + dy, site0.z + dz};
+          if (!c.world.CellInWindow(cc)) continue;
+          if (cellOps.size() >= kMaxCellOpsPerTick) break;
+          const bool shell = dy < 0 || dy > kRoomUp ||
+                             std::max(std::abs(dx), std::abs(dz)) == kRoomHalf;
+          cellOps.push_back({World::SlotCellIndex(cc),
+                             shell ? PackVoxNew(mStone, 0u) : 0u});
+        }
+    bareTick(28997u, cellOps);
+    std::vector<CellOp> none;
+    bareTick(28998u, none);
+  }
+  IVec3 pchunk{};
+  const uint64_t id = SpawnTarget(c, t, 330, pchunk);
+  if (!id) {
+    detail = "spawn refused";
+    return Status::Fail;
+  }
+  // Pinned (the authored `dummy` profile, mobile: false): every claim below is
+  // about blood on a body standing where the fixture put it, and the human's
+  // default profile wanders -- the first shallow-pool fixture watched it walk
+  // up the dune beside the pool and reported the climb as a stain.
+  const bool pinned = mobs.SetMobBehavior(id, "dummy");
+  uint32_t mBone = 0, mBlood = 0, mWater = 0;
+  for (size_t i = 0; i < c.mats.size(); i++) {
+    if (c.mats[i].name == "bone") mBone = (uint32_t)i;
+    if (c.mats[i].name == "blood") mBlood = (uint32_t)i;
+    if (c.mats[i].name == "water") mWater = (uint32_t)i;
+  }
+  const MobDef& def = mobs.Defs()[t.defIndex];
+  const int root = def.rootLimb;
+  const uint32_t bloodType = mobs.StainTypeOf(mBlood);
+
+  // One real tick with liquid written round the creature: PreTick, the box,
+  // the sim, the physics. Shared by the shallow pool and the two floods. The
+  // CPU mirror (what the contact pass reads) is the 3x3x3 chunks round the
+  // "player" chunk handed to SubmitTick: that is the CREATURE's chunk here,
+  // not the spawn's -- the spawn site is TerrainHeight+1 and the body climbs
+  // out to the real surface, which in the full suite (window origin walked
+  // by `streaming`) was a chunk and a half higher, so a mirror centred on
+  // the spawn never held the cells round the feet and the pass saw nothing.
+  uint32_t simTick = 29000;
+  auto liquidTick = [&](const std::function<void(std::vector<CellOp>&)>& fill) {
+    std::vector<BrushOp> ops;
+    std::vector<ParticleSpawn> spawns;
+    std::vector<CellOp> cellOps;
+    mobs.PreTick(simTick + 1, c.world, ops, cellOps, spawns);
+    fill(cellOps);
+    c.debris.QueueSupportEvents(c.world.Snap());
+    c.debris.PreTick(simTick + 1, c.world, cellOps, spawns);
+    ++simTick;
+    IVec3 centre = pchunk;
+    if (root >= 0 && mobs.LimbBody(id, root)) {
+      const Vec3 at = mobs.LimbVoxelPos(id, root, 0);
+      centre = IVec3{ifloor(at.x) >> 4, ifloor(at.y) >> 4, ifloor(at.z) >> 4};
+    }
+    SubmitTick(c.ctx, c.world, c.sim, simTick, kDefaultSeed, ops, {}, cellOps,
+               false, centre, true, false, spawns);
+    c.ctx.WaitIdle();
+    c.ctx.ProcessEvents();
+    c.phys.Step(kTickDt);
+    c.debris.PostStep();
+    mobs.PostStep();
+  };
+
+  // ---- 0. the shallow pool, on a body that is not yet bleeding ------------
+  // Two voxels of blood in the two cells the creature's FEET occupy, for 30
+  // ticks. The claim is the CEILING: no stained voxel of any limb above the
+  // pool's top plus the contact pass's one-voxel dilation. Measured through
+  // the live pose (LimbStainWorldYRange), so it does not care which limb the
+  // rig calls a foot. Before the cut so nothing sprays during it.
+  //
+  // The pool is placed off the BODY (the lowest limb voxel through the live
+  // pose), on the room's floor, and only into cells the CPU mirror shows as
+  // air or blood.
+  float shallowRise = -1e30f;
+  uint32_t shallowCount = 0, unmirrored = 0;
+  std::string shallowLimb = "-";
+  int poolTop = INT32_MIN;
+  // Let the creature find the floor and stop before the pool is placed.
+  auto lowestFoot = [&]() -> float {
+    float best = 1e30f;
+    for (size_t li = 0; li < def.limbs.size(); li++) {
+      float lo = 0.0f, hi = 0.0f;
+      if (mobs.LimbBody(id, (int)li) && mobs.LimbStainWorldYRange(id, (int)li, 0, lo, hi))
+        best = std::min(best, lo);
+    }
+    return best;
+  };
+  for (int i = 0; i < 20; i++) liquidTick([](std::vector<CellOp>&) {});
+  const float feetBefore = lowestFoot();
+  float feetAfter = feetBefore;
+  const int footY = feetBefore < 1e29f ? ifloor(feetBefore) : INT32_MAX;
+  auto mirrorMat = [&](IVec3 cc) -> int {
+    const CachedChunk* k = c.world.Cached(IVec3{cc.x >> 4, cc.y >> 4, cc.z >> 4});
+    if (!k || k->voxels.size() != kChunkVol) return -1;  // not mirrored yet
+    return (int)(k->voxels[(((uint32_t)cc.z & 15u) * kChunk + ((uint32_t)cc.y & 15u)) * kChunk +
+                           ((uint32_t)cc.x & 15u)] & 0xFFFu);
+  };
+  const int floorMat = mirrorMat({site0.x, site0.y - 1, site0.z});
+  const std::string floorName =
+      floorMat < 0 ? "unmirrored" : floorMat == 0 ? "AIR" : c.mats[(size_t)floorMat].name;
+  if (root >= 0 && mBlood && footY != INT32_MAX && mobs.LimbBody(id, root)) {
+    const Vec3 at = mobs.LimbVoxelPos(id, root, 0);
+    const int gx = ifloor(at.x), gz = ifloor(at.z);
+    poolTop = footY + 2;  // cells footY and footY+1; top face at +2
+    for (int i = 0; i < 30; i++) {
+      liquidTick([&](std::vector<CellOp>& cellOps) {
+        for (int dz = -5; dz <= 5; dz++)
+          for (int dx = -5; dx <= 5; dx++)
+            for (int dy = 0; dy <= 1; dy++) {
+              const IVec3 cc{gx + dx, footY + dy, gz + dz};
+              if (!c.world.CellInWindow(cc)) continue;
+              if (cellOps.size() >= kMaxCellOpsPerTick) return;
+              const int m = mirrorMat(cc);
+              if (m < 0) unmirrored++;
+              if (m != 0 && m != (int)mBlood) continue;  // ground, or not yet seen
+              cellOps.push_back({World::SlotCellIndex(cc), PackVoxNew(mBlood, 8u)});
+            }
+      });
+    }
+    feetAfter = lowestFoot();
+    for (size_t li = 0; li < def.limbs.size(); li++) {
+      if (!mobs.LimbBody(id, (int)li)) continue;
+      shallowCount += mobs.LimbStainCount(id, (int)li, 1);
+      const float top = mobs.LimbStainMaxWorldY(id, (int)li, 1);
+      if (top > -1e29f && top - (float)poolTop > shallowRise) {
+        shallowRise = top - (float)poolTop;
+        shallowLimb = def.limbs[li].name;
+      }
+    }
+  }
+  const double shallowMaxRise = BaselineNumber("bodyStainShallowMaxRise", 1.5);
+  // A body that moved while the pool was written makes the ceiling meaningless
+  // (the first fixture had the creature climbing out of the ground under it).
+  const bool feetStill = std::fabs(feetAfter - feetBefore) <= 0.5f;
+  const bool shallowOk = shallowCount > 0 && feetStill && shallowRise <= (float)shallowMaxRise;
+
+  // ---- 0b. a burst that cannot arrive -------------------------------------
+  // A drip's spray -- 3.5 vox/s, thrown upward -- queued a metre in front of
+  // the root limb. Nothing that slow gets there (it rises a tenth of a voxel),
+  // so the root must stay exactly as the pool left it.
+  uint32_t unreachableMarks = 0;
+  if (root >= 0 && mobs.LimbBody(id, root)) {
+    const uint32_t before = mobs.LimbStainCount(id, root, 1);
+    const Vec3 at = mobs.LimbVoxelPos(id, root, 0);
+    SplatterEvent ev;
+    ev.origin = at + Vec3{MetresToCells(1.0f), 0.0f, 0.0f};
+    ev.axis = Vec3{0.0f, 1.0f, 0.0f};
+    ev.cone = 0.55f;
+    ev.reach = MetresToCells(4.0f);
+    ev.speed = 3.5f;
+    ev.life = 70;
+    ev.count = 24;
+    ev.type = bloodType;
+    ev.amount = 6;
+    ev.tick = 29900u;
+    ev.seed = 0xD1E7u;
+    mobs.QueueSplatter(ev);
+    for (int i = 0; i < 2; i++) {
+      std::vector<BrushOp> ops;
+      std::vector<ParticleSpawn> spawns;
+      std::vector<CellOp> cellOps;
+      mobs.PreTick(29901u + (uint32_t)i, c.world, ops, cellOps, spawns);
+      c.phys.Step(kTickDt);
+      mobs.PostStep();
+    }
+    const uint32_t after = mobs.LimbStainCount(id, root, 1);
+    unreachableMarks = after > before ? after - before : 0u;
+  }
+  const bool unreachableOk = unreachableMarks == 0;
+
+  // ---- 1. the cut ---------------------------------------------------------
+  const LimbAxis ax = MeasureLimb(mobs, id, t.limb);
+  const uint32_t stainBefore = mobs.LimbStainCount(id, t.limb, 1);
+  bool hit = false;
+  {
+    std::vector<ParticleSpawn> spawns;
+    // Deep (power 0.9, wound-bleed's), so the kerf reaches the bone core and
+    // the bone claim below is measured against something.
+    hit = CutOnce(mobs, c.world, id, t.limb, ax, ax.reach * 0.5f, 0.9f, 1.0f,
+                  0x57A1u, spawns);
+  }
+  const bool attached = mobs.LimbBody(id, t.limb) != 0;
+  const uint32_t stainCut = attached ? mobs.LimbStainCount(id, t.limb, 1) : 0;
+  const uint32_t boneStained =
+      attached ? mobs.LimbStainedMatCount(id, t.limb, mBone, 1) : 0;
+  // How much bone the cut EXPOSED: bone voxels of the lattice with an empty
+  // 6-neighbour. The claim is "every exposed bone is bloodied to some
+  // degree", asserted as a fraction so a single rim voxel cannot fail it.
+  uint32_t boneExposed = 0;
+  if (attached) {
+    const std::vector<PrefabVoxel> lat = mobs.LimbLattice(id, t.limb);
+    std::unordered_set<uint64_t> occ;
+    auto key = [](int x, int y, int z) {
+      return ((uint64_t)(uint32_t)(x + 32768) << 34) |
+             ((uint64_t)(uint32_t)(y + 32768) << 17) | (uint64_t)(uint32_t)(z + 32768);
+    };
+    for (const PrefabVoxel& v : lat)
+      if ((v.material & 0xFFFu) != 0) occ.insert(key(v.x, v.y, v.z));
+    for (const PrefabVoxel& v : lat) {
+      if ((v.material & 0xFFFu) != mBone) continue;
+      if (!occ.count(key(v.x - 1, v.y, v.z)) || !occ.count(key(v.x + 1, v.y, v.z)) ||
+          !occ.count(key(v.x, v.y - 1, v.z)) || !occ.count(key(v.x, v.y + 1, v.z)) ||
+          !occ.count(key(v.x, v.y, v.z - 1)) || !occ.count(key(v.x, v.y, v.z + 1)))
+        boneExposed++;
+    }
+  }
+  const double boneMinFrac = BaselineNumber("bodyStainBoneMinFraction", 0.5);
+  const bool cutOk = hit && attached && stainCut > stainBefore;
+  const bool boneOk =
+      boneExposed == 0 || (double)boneStained >= boneMinFrac * (double)boneExposed;
+
+  // ---- 2. the burst -------------------------------------------------------
+  // A splash aimed at the root limb from a metre in front of it, replayed by
+  // the next PreTick. Deterministic on purpose: the wound's own gout points
+  // wherever the joint does, and the claim here is the landing, not the aim.
+  // Thrown at 6 m/s: the replay flies the real arc, and over a metre that
+  // drops 11 cm, inside the root's bounding sphere. (3 m/s drops 43 cm and
+  // would hit the thighs, which is the point of the arc.)
+  uint32_t rootBefore = 0, rootSplashed = 0;
+  size_t queuedByWound = 0;
+  if (root >= 0 && mobs.LimbBody(id, root)) {
+    rootBefore = mobs.LimbStainCount(id, root, 1);
+    const Vec3 at = mobs.LimbVoxelPos(id, root, 0);
+    SplatterEvent ev;
+    ev.origin = at + Vec3{MetresToCells(1.0f), 0.0f, 0.0f};
+    ev.axis = Vec3{-1.0f, 0.0f, 0.0f};
+    ev.cone = 0.35f;
+    ev.reach = MetresToCells(2.0f);
+    ev.speed = MetresToCells(6.0f);
+    ev.life = 70;
+    ev.count = 24;
+    ev.type = bloodType;
+    ev.amount = 6;
+    ev.tick = 30000u;
+    ev.seed = 0x5B1A7u;
+    mobs.QueueSplatter(ev);
+    for (int i = 0; i < 6; i++) {
+      std::vector<BrushOp> ops;
+      std::vector<ParticleSpawn> spawns;
+      std::vector<CellOp> cellOps;
+      mobs.PreTick(30001u + (uint32_t)i, c.world, ops, cellOps, spawns);
+      // The chip above left a bleeding wound; its drip spray must queue
+      // bursts of its own (counted before the age-out at the next PreTick).
+      queuedByWound = std::max(queuedByWound, mobs.SplatterEventsQueued());
+      c.phys.Step(kTickDt);
+      mobs.PostStep();
+    }
+    rootSplashed = mobs.LimbBody(id, root) ? mobs.LimbStainCount(id, root, 1) : 0;
+  }
+  const bool splashOk = rootSplashed > rootBefore;
+  const bool woundQueues = queuedByWound > 0;
+
+  // ---- 3. the pool, then the river -----------------------------------------
+  // Real ticks: a box of blood is written round the root limb every tick and
+  // the mirror is fetched through the tick path; then the same box as water.
+  uint32_t pooled = 0, washed = 0;
+  simTick = 31000;
+  auto soakPhase = [&](uint32_t mat, uint32_t state, int ticks) -> uint32_t {
+    for (int i = 0; i < ticks; i++) {
+      liquidTick([&](std::vector<CellOp>& cellOps) {
+        if (!mobs.LimbBody(id, root)) return;
+        const Vec3 at = mobs.LimbVoxelPos(id, root, 0);
+        const IVec3 b{ifloor(at.x), ifloor(at.y), ifloor(at.z)};
+        for (int dy = -3; dy <= 3; dy++)
+          for (int dz = -3; dz <= 3; dz++)
+            for (int dx = -3; dx <= 3; dx++) {
+              const IVec3 cc{b.x + dx, b.y + dy, b.z + dz};
+              if (!c.world.CellInWindow(cc)) continue;
+              if (cellOps.size() >= kMaxCellOpsPerTick) return;
+              if (cc.y <= World::TerrainHeight(cc.x, cc.z, kDefaultSeed)) continue;
+              cellOps.push_back({World::SlotCellIndex(cc), PackVoxNew(mat, state)});
+            }
+      });
+    }
+    return mobs.LimbBody(id, root) ? mobs.LimbStainCount(id, root, 1) : 0;
+  };
+  if (root >= 0 && mBlood && mWater && mobs.LimbBody(id, root)) {
+    pooled = soakPhase(mBlood, 8u, 30);
+    washed = soakPhase(mWater, 8u, 60);
+  }
+  const bool poolOk = pooled > rootSplashed;
+  const double washFrac = BaselineNumber("bodyStainWashMaxFraction", 0.5);
+  const bool washOk = pooled > 0 && (double)washed <= washFrac * (double)pooled;
+
+  RecordObserved("bodyStainCut", (double)stainCut);
+  RecordObserved("bodyStainBoneExposed", (double)boneExposed);
+  RecordObserved("bodyStainBoneStained", (double)boneStained);
+  RecordObserved("bodyStainSplashed", (double)(rootSplashed - rootBefore));
+  RecordObserved("bodyStainPooled", (double)pooled);
+  RecordObserved("bodyStainWashed", (double)washed);
+  RecordObserved("bodyStainShallowRise", (double)shallowRise);
+  RecordObserved("bodyStainShallowCount", (double)shallowCount);
+  RecordObserved("bodyStainUnreachable", (double)unreachableMarks);
+
+  mobs.Reset();
+  c.debris.Reset();
+  SubmitWorldgen(c.ctx, c.world, c.sim, kDefaultSeed);
+  c.ctx.WaitIdle();
+
+  const bool ok = cutOk && boneOk && splashOk && woundQueues && poolOk && washOk &&
+                  shallowOk && unreachableOk;
+  detail = Format(
+      "%s/%s%s: shallow pool stained %u voxels, highest %.2f vox above the pool "
+      "(%s, cap %.1f; feet %.2f -> %.2f, spawn y %d, room floor %s, %u pool cells "
+      "unmirrored); "
+      "slow burst marked %u (need 0); cut "
+      "stained %u -> %u (bone %u of %u exposed, need %.0f%%); burst on %s %u -> "
+      "%u, wound queued %zu bursts; pool %u -> water %u (cap %.0f%%)",
+      t.defName.c_str(), t.limbName.c_str(), pinned ? "" : " (NOT pinned)",
+      shallowCount, shallowRise, shallowLimb.c_str(), shallowMaxRise, feetBefore,
+      feetAfter, site0.y, floorName.c_str(), unmirrored, unreachableMarks,
+      stainBefore, stainCut,
+      boneStained, boneExposed, boneMinFrac * 100.0, root >= 0 ? "root" : "-",
+      rootBefore, rootSplashed, queuedByWound, pooled, washed, washFrac * 100.0);
+  return ok ? Status::Pass : Status::Fail;
+}
+
 const std::vector<Gate>& WoundGates() {
   static const std::vector<Gate> g = {
       {"wound-chip", "mob", {}, false, GateWoundChip, /*needsRender=*/false},
@@ -1804,6 +2197,7 @@ const std::vector<Gate>& WoundGates() {
       {"one-hit", "mob", {}, false, GateOneHit, false},
       {"corpse-intact", "mob", {}, false, GateCorpseIntact, false},
       {"corpse-bleed", "mob", {}, false, GateCorpseBleed, false},
+      {"body-stain", "mob", {}, false, GateBodyStain, false},
       {"corpse-burn", "mob", {}, false, GateCorpseBurn, false},
   };
   return g;

@@ -35,7 +35,33 @@ struct PrefabVoxel {
   int16_t x, y, z;
   uint16_t material;  // 12-bit material ID (== .vox palette index)
   uint8_t color = 0;  // art palette slot, 0 = use the material's own colour
+  // BODY STAIN (DESIGN.md section 7, "blood on a body"): bits 0..3 amount 0..15,
+  // bits 4..6 stain TYPE -- the same palette slot the voxel word's bits 28..30
+  // carry (world.h kStainType*), so a stain moves between the ground and a
+  // creature without translation and shades through the same palette entry.
+  // 0 = clean. Rides the padding byte the struct already had (9 -> 10 bytes
+  // either way). Render + gameplay state, never hashed; a limb's stain goes
+  // with it when it is severed and into every fragment it splits into, and is
+  // rewritten into the micro brick's stain lattice by WriteBrick.
+  uint8_t stain = 0;
 };
+
+// ---- the body stain byte ----------------------------------------------------
+constexpr uint32_t kBodyStainAmtMask = 0xFu;
+constexpr uint32_t kBodyStainTypeShift = 4u, kBodyStainTypeMask = 0x7u;
+constexpr uint32_t kBodyStainAmtMax = 15u;
+inline uint32_t BodyStainAmt(uint8_t s) { return s & kBodyStainAmtMask; }
+inline uint32_t BodyStainType(uint8_t s) {
+  return (s >> kBodyStainTypeShift) & kBodyStainTypeMask;
+}
+// amount 0 packs to 0 whatever the type: "no stain" has one spelling, so a
+// washed-out voxel compares equal to a never-stained one.
+inline uint8_t PackBodyStain(uint32_t type, uint32_t amt) {
+  if (amt == 0) return 0;
+  if (amt > kBodyStainAmtMax) amt = kBodyStainAmtMax;
+  return (uint8_t)((amt & kBodyStainAmtMask) |
+                   ((type & kBodyStainTypeMask) << kBodyStainTypeShift));
+}
 
 struct PrefabModel {
   std::string name;   // scene-graph node name, or "modelN"

@@ -60,6 +60,16 @@ struct MicroBodyModelGpu {
   // bits 0..9 dims.x, bits 10..19 dims.y, bits 20..29 dims.z (micro voxels).
   // 10 bits each is 1023 per axis, far past the +-127 DebrisVoxel bound that
   // limits a limb anyway; packing them keeps the record at 16 bytes.
+  //
+  // bit 30 (kMicroBodyDimsStainBit): THIS BLOCK CARRIES A STAIN LATTICE. One
+  // byte per micro voxel, 4 per word, laid out after the payload at
+  // `base + WordsFor(cells)` in the same idx order, holding the body stain
+  // byte (voxload.h BodyStain*: amount low nibble, type above). Only OWNED
+  // blocks have one -- a shared def model is clean by definition, and a body
+  // becomes owned the first time anything marks it -- so the pool pays the
+  // extra 50% only for bodies that have actually been bloodied. The shader
+  // reads the flag off this word and derives the lattice offset from dims;
+  // nothing else in the record changes, which is what keeps it 16 bytes.
   uint32_t dims;
   uint32_t scale;  // micro voxels per world voxel: 2 or 4
   // ---- THE CUT-FACE MASK (2026-09-11) --------------------------------------
@@ -314,8 +324,21 @@ bool MicroBodyEdit(MicroBodySet& set, uint32_t model,
 bool MicroBodyPoke(MicroBodySet& set, uint32_t model, int x, int y, int z,
                    uint8_t mat, uint8_t art);
 
+// Rewrites ONE micro voxel's STAIN BYTE in an OWNED model, brick-local
+// coordinates exactly as MicroBodyPoke. The stain lattice is allocated the
+// first time an owned model is asked for one (the block is reallocated at
+// payload + stain size, so a model that MicroBodyPack made owned without a
+// stain grows one here). Returns false if the model is not owned, the
+// coordinate is outside dims, or the pool cannot grow the block.
+bool MicroBodyPokeStain(MicroBodySet& set, uint32_t model, int x, int y, int z,
+                        uint8_t stain);
+
 // A model's brick dimensions in micro voxels; {0,0,0} for an invalid index.
 IVec3 MicroBodyDims(const MicroBodySet& set, uint32_t model);
+
+// dims-word flag: the block holds a stain lattice after its payload.
+constexpr uint32_t kMicroBodyDimsStainBit = 1u << 30;
+constexpr uint32_t kMicroBodyDimsMask = 0x3FFFFFFFu;
 
 // Returns an owned model's words to the free list and retires its record.
 // Safe (no-op) on shared models and on kMicroBodyNoModel, so body teardown can

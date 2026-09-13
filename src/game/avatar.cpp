@@ -2190,6 +2190,12 @@ void PlayerAvatar::BurnParts(uint32_t tick, World& world,
   uint32_t frontBudget = 16384;
   uint32_t opsBudget = 48;
   BurnTick(tick, world, cellOps, spawns, frontBudget, opsBudget);
+  // Blood on the player: from the world it is standing in, and from every
+  // burst this tick queued (Mob::StainTick / MobSystem::SplatterOnto). Its
+  // own budget, for the reason the burn budget above is its own.
+  uint32_t stainBudget = 8192;
+  StainTick(tick, world, stainBudget);
+  if (sys_) sys_->SplatterOnto(*this);
 }
 
 void PlayerAvatar::Revive(const Player& player, float heading) {

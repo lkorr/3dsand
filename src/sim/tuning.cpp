@@ -766,6 +766,18 @@ bool LoadTuning(const std::string& path, Tuning& out) {
     ReadF(*g, "woundStainRadius", e.woundStainRadius, out, at);
     ReadF(*g, "woundStainSurface", e.woundStainSurface, out, at);
     ReadF(*g, "woundStainDensity", e.woundStainDensity, out, at);
+    ReadF(*g, "stainCutRadius", e.stainCutRadius, out, at);
+    ReadI(*g, "stainCutAmount", e.stainCutAmount, out, at);
+    ReadI(*g, "stainCutBuried", e.stainCutBuried, out, at);
+    ReadF(*g, "stainCutBuriedChance", e.stainCutBuriedChance, out, at);
+    ReadI(*g, "stainBoneMin", e.stainBoneMin, out, at);
+    ReadF(*g, "stainContactScale", e.stainContactScale, out, at);
+    ReadF(*g, "stainFloorTransfer", e.stainFloorTransfer, out, at);
+    ReadI(*g, "stainWashPerContact", e.stainWashPerContact, out, at);
+    ReadF(*g, "splatterReach", e.splatterReach, out, at);
+    ReadI(*g, "splatterAmount", e.splatterAmount, out, at);
+    ReadI(*g, "splatterPerLimb", e.splatterPerLimb, out, at);
+    ReadF(*g, "splatterSplatRadius", e.splatterSplatRadius, out, at);
     ReadF(*g, "woundSeverFraction", e.woundSeverFraction, out, at);
     ReadF(*g, "woundNeckRadius", e.woundNeckRadius, out, at);
     ReadF(*g, "woundNeckFraction", e.woundNeckFraction, out, at);
@@ -799,6 +811,18 @@ bool LoadTuning(const std::string& path, Tuning& out) {
     e.woundStainRadius = std::clamp(e.woundStainRadius, 0.0f, 16.0f);
     e.woundStainSurface = std::clamp(e.woundStainSurface, 0.0f, 1.0f);
     e.woundStainDensity = std::clamp(e.woundStainDensity, 0.0f, 1.0f);
+    e.stainCutRadius = std::clamp(e.stainCutRadius, 0.0f, 16.0f);
+    e.stainCutAmount = std::clamp(e.stainCutAmount, 0, 15);
+    e.stainCutBuried = std::clamp(e.stainCutBuried, 0, 15);
+    e.stainCutBuriedChance = std::clamp(e.stainCutBuriedChance, 0.0f, 1.0f);
+    e.stainBoneMin = std::clamp(e.stainBoneMin, 0, 15);
+    e.stainContactScale = std::clamp(e.stainContactScale, 0.0f, 8.0f);
+    e.stainFloorTransfer = std::clamp(e.stainFloorTransfer, 0.0f, 1.0f);
+    e.stainWashPerContact = std::clamp(e.stainWashPerContact, 0, 15);
+    e.splatterReach = std::clamp(e.splatterReach, 0.0f, 256.0f);
+    e.splatterAmount = std::clamp(e.splatterAmount, 0, 15);
+    e.splatterPerLimb = std::clamp(e.splatterPerLimb, 0, 256);
+    e.splatterSplatRadius = std::clamp(e.splatterSplatRadius, 0.0f, 2.0f);
     // A sever fraction of 0 severs on the first disconnected speck — that is
     // the straggler bug in Mob::CarveLimb wearing a slider — and 1 can never
     // fire at all. Both ends are excluded rather than merely discouraged.

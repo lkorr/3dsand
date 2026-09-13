@@ -517,6 +517,7 @@ add_library(sandvox_core OBJECT
   src/audio/xyzpan/src/LFO.cpp
   src/audio/xyzpan/src/SwarmMode.cpp
   src/phys/physics.cpp
+  src/phys/bodystain.cpp
   src/phys/debris.cpp
   src/phys/marching_cubes.cpp
   src/ui/overlay.cpp

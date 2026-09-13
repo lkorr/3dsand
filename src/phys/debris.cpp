@@ -8,6 +8,7 @@
 #include <cstdlib>
 #include <unordered_set>
 
+#include "phys/bodystain.h"
 #include "phys/lattice.h"
 #include "phys/marching_cubes.h"
 #include "measure/perfscope.h"
@@ -3391,7 +3392,7 @@ bool DebrisSystem::ReskinMicro(Body& b) {
     mv.reserve(b.voxels.size());
     for (const DebrisVoxel& v : b.voxels)
       mv.push_back({(int16_t)v.x, (int16_t)v.y, (int16_t)v.z,
-                    (uint16_t)(v.payload & 0xFFF)});
+                    (uint16_t)(v.payload & 0xFFF), 0, v.stain});
   }
   IVec3 shift{};
   if (!MicroBodyEdit(*microSet_, b.micro.model, mv, shift)) return false;
@@ -3495,6 +3496,45 @@ bool DebrisSystem::DamageBody(size_t bi, World& world,
         b.voxels.end());
   }
   instancesDirty_ = true;
+
+  // THE SMEAR on a corpse's cut (bodystain.h SoakCut): the same rule the live
+  // limb's kerf and crater get, so a limb cut off and cut again is bloodied
+  // both times. Applied to the authoritative lattice AFTER the carve (so the
+  // hole's walls count as exposed) and BEFORE the shatter (so every fragment
+  // carries its share); the re-skin below writes it into the brick. Until
+  // 2026-09-13 a corpse cut showed clean flesh and clean bone.
+  if (b.bleedMat != 0 && !removed.empty() && b.bleedMat < matGpu_.size()) {
+    const uint32_t stainType = matGpu_[b.bleedMat].stainPack & kStainPackTypeMask;
+    const auto& gt = CurrentTuning().gore;
+    if (stainType != 0 && gt.stainCutRadius > 0.0f) {
+      // Tissue = what crumbles to this body's blood (MobDef::tissue's rule);
+      // everything else (bone) takes the floor and nothing more.
+      std::vector<uint8_t> tissue(rubbleOf_.size(), 0);
+      bool any = false;
+      for (size_t m = 0; m < rubbleOf_.size(); m++)
+        if (rubbleOf_[m] == b.bleedMat || m == b.bleedMat) { tissue[m] = 1; any = true; }
+      if (!any) tissue.clear();
+      const float ps = (float)std::max(1u, b.physScale);
+      const float sk = (float)std::max(1u, fine ? b.micro.skinScale : b.physScale);
+      Vec3 centroid{};
+      for (const DebrisVoxel& v : removed)
+        centroid += Vec3{(float)v.x + 0.5f, (float)v.y + 0.5f, (float)v.z + 0.5f};
+      centroid = centroid * (sk / (ps * (float)removed.size()));
+      CutSoak soak;
+      soak.type = stainType;
+      soak.radius = gt.stainCutRadius * sk;
+      soak.amountExposed = gt.stainCutAmount;
+      soak.amountBuried = gt.stainCutBuried;
+      soak.buriedChance = gt.stainCutBuriedChance;
+      soak.boneMin = gt.stainBoneMin;
+      soak.tissue = &tissue;
+      StainLattice L;
+      if (fine) L.skin = &b.skinVoxels; else L.coll = &b.voxels;
+      SoakCut(L, centroid, soak, (uint32_t)b.serial * 2654435761u ^ 0xC0125Eu,
+              nullptr, -1);
+      if (fine) DeriveColliderFromSkin(b);  // the coarse lattice carries it too
+    }
+  }
 
   // Wholly destroyed, or blown under the body-worthiness floor: the remainder
   // rejoins the world as loose voxels, exactly like the burn dissolve path.
@@ -4975,12 +5015,12 @@ bool DebrisSystem::LoadState(const uint8_t* data, size_t len, uint32_t version) 
       if (src) {
         mv.reserve(src->size());
         for (const PrefabVoxel& v : *src)
-          mv.push_back({v.x, v.y, v.z, (uint16_t)(v.material & 0xFFu)});
+          mv.push_back({v.x, v.y, v.z, (uint16_t)(v.material & 0xFFu), 0, v.stain});
       } else {
         mv.reserve(voxels.size());
         for (const DebrisVoxel& v : voxels)
           mv.push_back({(int16_t)v.x, (int16_t)v.y, (int16_t)v.z,
-                        (uint16_t)(v.payload & 0xFFu)});
+                        (uint16_t)(v.payload & 0xFFu), 0, v.stain});
       }
       IVec3 mx{0, 0, 0};
       for (const PrefabVoxel& v : mv) {

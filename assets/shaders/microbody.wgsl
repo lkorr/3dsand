@@ -120,6 +120,11 @@ struct VSOut {
   // the same reason `base`/`dims` are: refetching insts -> models per fragment
   // is two dependent storage loads for a value constant across the instance.
   @location(8) @interpolate(flat) cut : u32,
+  // Pool word where this model's STAIN LATTICE starts (one byte per micro
+  // voxel, 4 per word, same idx order as the payload), or 0 when the block
+  // carries none -- bit 30 of the dims word (sim/microbody.h). A shared def
+  // model never has one; a body grows one the first time it is bloodied.
+  @location(9) @interpolate(flat) stainBase : u32,
 };
 
 // vi in 0..35 -> a corner of the unit box. Every face must wind the SAME way
@@ -192,7 +197,64 @@ fn vs(@builtin(vertex_index) vi : u32,
   out.slot = slot;
   out.flash = bitcast<f32>(insts[inst].flash_bits);
   out.cut = microBodyCutFaces(m);
+  // Payload is 2 voxels per word; the stain lattice sits right after it.
+  let cells = u32(dims.x * dims.y * dims.z);
+  out.stainBase = select(0u, m.base + (cells + 1u) / 2u,
+                         (m.dims & MB_DIMS_STAIN_BIT) != 0u);
   return out;
+}
+
+// sim/microbody.h kMicroBodyDimsStainBit. Declared HERE, not in common.wgsl:
+// this is the only shader that reads it, and a common.wgsl edit misses the
+// SPIR-V cache for every shader (CLAUDE.md, "What needs a rebuild").
+const MB_DIMS_STAIN_BIT : u32 = 0x40000000u;
+
+// ---- BLOOD ON A BODY (DESIGN.md section 7) ----------------------------------
+//
+// The stain byte of a hit voxel: amount in the low nibble, stain TYPE (the
+// same palette slot the voxel word's bits 28..30 carry) above it. Read once,
+// at the hit only, from the lattice after the payload. 0 when the model has
+// no lattice or the voxel is clean.
+fn poolStainAt(stainBase : u32, dims : vec3<i32>, p : vec3<i32>) -> u32 {
+  if (stainBase == 0u) { return 0u; }
+  let idx = u32((p.z * dims.y + p.y) * dims.x + p.x);
+  let w = stainBase + (idx >> 2u);
+  if (w >= MICRO_BODY_POOL_WORDS) { return 0u; }
+  return (pool[w] >> ((idx & 3u) * 8u)) & 0xFFu;
+}
+
+// The same look as the ground's stain (raymarch.wgsl applyStain), on purpose:
+// blood that ran off an arm onto the floor must not change colour on the way
+// down. Same palette entry, same mottle threshold, same multiply-then-lerp,
+// same render.stain* knobs. Only the noise domain differs: the mottle is
+// sampled in MICRO cells scaled back to world pitch, so a stain on a scale-8
+// limb breaks up at the same physical size as one on the ground beside it.
+fn bodyVnHash(c : vec3<i32>) -> f32 {
+  return f32(pcg(u32(c.x * 374761393 + c.y * 668265263 + c.z * 1274126177)) &
+             0xFFFFu) * (1.0 / 65535.0);
+}
+fn bodyValueNoise(p : vec3f, scale : f32) -> f32 {
+  let q = p / scale;
+  let i = vec3<i32>(floor(q));
+  var f = fract(q);
+  f = f * f * (3.0 - 2.0 * f);
+  let x00 = mix(bodyVnHash(i + vec3<i32>(0,0,0)), bodyVnHash(i + vec3<i32>(1,0,0)), f.x);
+  let x10 = mix(bodyVnHash(i + vec3<i32>(0,1,0)), bodyVnHash(i + vec3<i32>(1,1,0)), f.x);
+  let x01 = mix(bodyVnHash(i + vec3<i32>(0,0,1)), bodyVnHash(i + vec3<i32>(1,0,1)), f.x);
+  let x11 = mix(bodyVnHash(i + vec3<i32>(0,1,1)), bodyVnHash(i + vec3<i32>(1,1,1)), f.x);
+  return mix(mix(x00, x10, f.y), mix(x01, x11, f.y), f.z);
+}
+fn bodyStainTint(albedo : vec3f, stain : u32, cell : vec3<i32>, scale : f32) -> vec3f {
+  let amtI = stain & 0xFu;
+  if (amtI == 0u) { return albedo; }
+  let amt = f32(amtI) / f32(STAIN_AMT_MAX);
+  let stainCol = unpackColor(materials[STAIN_PALETTE_BASE + ((stain >> 4u) & 0x7u)].stainColor);
+  let mottle = bodyValueNoise(vec3f(cell), TUNE_STAIN_MOTTLE_SCALE * scale);
+  let cover = clamp((amt * (1.0 + TUNE_STAIN_MOTTLE) - mottle * TUNE_STAIN_MOTTLE) *
+                    TUNE_STAIN_COVERAGE, 0.0, 1.0);
+  if (cover <= 0.0) { return albedo; }
+  let soaked = albedo * mix(vec3f(1.0), stainCol * TUNE_STAIN_DARKEN, cover);
+  return mix(soaked, stainCol, cover * TUNE_STAIN_OPACITY);
 }
 
 // One micro voxel: bits 0..7 material id, bits 8..15 art colour slot (0 = use
@@ -471,6 +533,11 @@ fn fs(in : VSOut) -> FSOut {
   } else {
     albedo = paletteJitter(mat, u32(c.x * 7 + c.y * 13 + c.z * 29));
   }
+  // Blood (or whatever else soaked in) OVER the art, before lighting, exactly
+  // where the ground applies its own stain: a stain is a change to what the
+  // surface is, and it has to take the scene's light like the skin under it.
+  // One pool load, and only for models that carry a lattice at all.
+  albedo = bodyStainTint(albedo, poolStainAt(in.stainBase, dims, c), c, scale);
 
   // `tCur` is already the parameter along the UNNORMALIZED camera-to-fragment
   // vector, and that is the whole point of never normalizing anything: `ro/rd`

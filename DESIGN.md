@@ -3570,6 +3570,105 @@ back into the grid takes it with it. Rule 2: `bleedOpsPerTick` bounds the
 corpses' drips as it does the creatures', the gout shares
 `kMaxParticleSpawnsPerTick`, and an idle body costs two field reads.
 
+### Blood on a body (2026-09-13; `phys/bodystain.h`, `MobSystem::StainLimbs`, `Mob::ApplySplatter`, `MicroBodyPokeStain`)
+
+The soak above REWRITES flesh to blood, skips bone on purpose, and ran only on
+the blade's kerf, so a cut through bone showed clean bone, and a blast
+crater, a corpse cut or an outright sever showed clean everything. And a body
+could not take blood from anywhere: a voxel had a material byte and an art
+byte and nothing else. The owner's report: cuts "cleanly show the underneath
+voxels without any blood", and killing something should get blood ON YOU.
+
+**The stain byte.** `PrefabVoxel::stain` / `DebrisVoxel::stain` (voxload.h
+`BodyStain*`): amount 0..15 in the low nibble, stain TYPE above it -- the same
+palette slot the voxel word's bits 28..30 carry, so a stain moves between the
+ground and a creature without translation and shades through the same
+`STAIN_PALETTE_BASE` entry. Rendering is a side lattice in the micro brick
+(`MicroBodyModelGpu::dims` bit 30, `kMicroBodyDimsStainBit`): one byte per
+micro voxel after the payload, allocated only for OWNED blocks (a def's shared
+model is clean by definition; a body becomes owned the first time anything
+marks it), written by `WriteBrick` on every re-skin and poked per voxel by
+`MicroBodyPokeStain`. The shader (`microbody.wgsl bodyStainTint`) reads one
+byte at the hit and applies exactly `applyStain`'s multiply-then-lerp with the
+same `TUNE_STAIN_*` knobs, mottled at world pitch, so blood that ran off an
+arm onto the floor is the same colour on both. Never hashed, never saved;
+travels with a severed limb (the voxel lists move) and into every fragment
+(`DownsampleSkin` carries the heaviest stain of a block; `MicroBodyPack`
+grows the lattice for a stained gobbet). Rule 2: the pool pays +50% only for
+bodies that have actually been bloodied.
+
+**Four sources, one rule each:**
+
+- **The cut** (`SoakCut`, bodystain.h; called from `Mob::StainWound`, so the
+  kerf, the crater in `CarveLimbRadial`, and BOTH faces of a `Sever` get it,
+  and from `DebrisSystem::DamageBody` for a corpse). Every voxel within
+  `gore.stainCutRadius` takes a stain: EXPOSED ones (an empty 6-neighbour in
+  the limb's own lattice -- the hole's walls, the skin round its mouth)
+  `stainCutAmount` tapering with the square of the distance and jittered per
+  voxel; buried ones `stainCutBuried` at `stainCutBuriedChance`. Bone (not
+  `MobDef::tissue`) is never REWRITTEN but always STAINED: `stainBoneMin`
+  floors any exposed bone in range, so bone reads as blood-smeared bone.
+- **Splatter** (`SplatterEvent`; `Mob::BleedTick` queues one per gout tick
+  and per drip spray, `MobSystem::StainLimbs` replays it against every
+  creature's limbs, `PlayerAvatar::PreTick` against the player's). The GPU
+  droplets cannot see a limb, so this is the CPU's record of the burst --
+  origin, axis, cone, launch SPEED and count -- and the replay FLIES THE
+  KERNEL'S OWN ARC (speed, then `sim.partGravity` per tick), so a body is
+  marked where the droplets are seen to land and nowhere else: a drip's spray
+  at 3.5 vox/s rises a tenth of a voxel and marks nothing it is not dribbling
+  onto, and a gout at 17 vox/s drops 1.3 m over the metre to an attacker, so
+  it reaches their shins, not their face (raise `severSpraySpeed` for that).
+  SAMPLED IN PROPORTION: for each limb, the arc families (low / high) that
+  pass its bounding sphere inside the burst's cone are solved in closed form,
+  the sphere's solid angle over the cone's times the droplets thrown this
+  tick is how many arcs are aimed across it, and each arc is marched through
+  the limb's burn index (the dense box `BuildBurnIndex` already keeps) tick
+  by tick, one slab test per tick until it enters the box. The first solid
+  voxel it meets takes a SPLAT of `splatterSplatRadius` world voxels at
+  `splatterAmount` (rim thinning and breaking up), not a single lattice
+  voxel. That is how killing something covers you in it, and how a neck stump
+  paints its own torso. `splatterPerLimb` caps the arcs per limb per event
+  (past it one arc stands for several droplets and paints wider); `reach` is
+  capped by `splatterReach` and by speed x life. Before 2026-09-13 the replay
+  was a straight march of a fixed 24 droplets per limb regardless of the
+  burst: a face got two or three 1.25 cm dots from a 1,190-droplet gout, and
+  a standing body next to a bleeding one was painted 80 cm up the leg by
+  sprays nothing visible had thrown there.
+- **Contact** (`MobSystem::StainOneLimb`, from `Mob::StainTick`). The same
+  world-AABB walk `BurnOneLimb` makes -- and the same exit at the cost of the
+  walk when nothing is there -- for a STAINING LIQUID (blood: its authored
+  `stain` type/amount/chance), a DRY STAIN on a solid (the voxel word's stain
+  bits: half the amount, `stainFloorTransfer` of a nominal rate), and a
+  WASHING LIQUID (water: `washes`). The walk stops at the first such cell;
+  then the limb's SURFACE (`BodyBurnState::surface`: the exposed voxels of
+  the burn index, listed once per index build) is swept, each surface voxel
+  reading the world cell it sits in -- the body is not in the grid, so a
+  pool occupies the very cells the feet do -- or else the cell one step out
+  along its open face, and rolling the liquid's own per-mille chance on what
+  it finds. So a creature standing in a pool bloodies its feet at the rate
+  the pool stains the ground, washes them in the river at the rate the river
+  rinses stone (`stainWashPerContact` off per successful roll), and a limb
+  wholly under blood is bloodied all over. The first version kept the first
+  24 contact cells of the walk and mapped each, dilated by one voxel, into
+  the lattice: for a submerged hips those were one edge of the bottom row
+  every tick, so its underside never saw a contact (2026-09-13, pinned
+  fixture: 16 -> 16 through a 30-tick flood).
+- **The corpse** carries whatever it died with; `DamageBody` soaks a fresh
+  cut on the corpse the same way. (A lying corpse does not yet take contact
+  stain from the pool under it -- the debris side has no contact pass.)
+
+Budgets in `mob.h` (`kStain*`): 2,048 world cells per limb walk, 6,144
+surface voxels per limb and 32,768 per tick for all creatures, start rotated
+by tick; 64 queued bursts; `splatterPerLimb` arcs per limb per burst. Gate
+`body-stain` (the human pinned with the `dummy` profile, standing in a stone
+basin written round it so the sand cannot flow): an ankle-deep pool over 30
+ticks stains the feet and nothing higher than `bodyStainShallowMaxRise` above
+its top; a drip-speed burst from a metre away marks nothing; a deep cut
+stains the limb and at least half of the bone it exposed; a 6 m/s burst aimed
+at the hips lands; the wound's own spray queues bursts; a box of blood round
+the hips over 30 ticks stains them and the same box of water over 60 ticks
+takes at least half of it off again.
+
 ### What is under the skin (2026-09-02; `assets/editor/anatomy.js`, sidecar `anatomy`, `scripts/anatomize_mob.mjs`)
 
 Every limb was skin all the way through. A cut face showed skin, a burn-through

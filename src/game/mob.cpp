@@ -13,6 +13,7 @@
 
 #include "game/item.h"
 #include "game/rigrender.h"
+#include "phys/bodystain.h"
 #include "phys/lattice.h"
 #include "sim/bytestream.h"
 #include "sim/reactcpu.h"
@@ -3602,6 +3603,15 @@ void MobSystem::PreTick(uint32_t tick, World& world, std::vector<BrushOp>& ops,
   // pass writes fire into the hashed grid, so running it off the render clock
   // would make the world a function of frame rate.
   BurnLimbs(tick, world, cellOps, spawns);
+  // Bursts from before last tick have been seen by everyone who is going to
+  // see them (StainLimbs this tick, the avatar's own PreTick whichever side
+  // of this it runs on). A harness with no avatar never marks doneAvatar, so
+  // age is the retirement rule, not the flags.
+  splatters_.erase(std::remove_if(splatters_.begin(), splatters_.end(),
+                                  [&](const SplatterEvent& e) {
+                                    return e.tick + 1 < tick;
+                                  }),
+                   splatters_.end());
   // The hit flash ages on the TICK, with everything else that ages. See
   // DecayHitFlash for why it is not on the frame clock — the short version is
   // that a gate damages limbs and never runs a frame.
@@ -3753,6 +3763,10 @@ void MobSystem::PreTick(uint32_t tick, World& world, std::vector<BrushOp>& ops,
     mob.BleedTick(tick, world, ops, spawns, bleedOps);
     mi++;
   }
+  // Blood landing on bodies: from the world (contact) and from this tick's
+  // bursts (splatter). After every wound has bled, so a gout reaches the
+  // creature beside it on the tick it happens.
+  StainLimbs(tick, world);
 }
 
 void Mob::DrainPendingSpawns(World& world, std::vector<ParticleSpawn>& spawns) {
@@ -4672,6 +4686,27 @@ void Mob::BleedTick(uint32_t tick, World& world, std::vector<BrushOp>& ops,
                                      life, gore.microScale));
         gushed++;
       }
+      // The same burst, for whoever is standing in it (SplatterEvent). The
+      // droplets are GPU particles that cannot see a limb; this is the CPU's
+      // record of them, replayed against every body in reach by StainLimbs.
+      if (gushed > 0 && sys_) {
+        SplatterEvent ev;
+        ev.origin = gOrigin;
+        ev.axis = axis;
+        ev.cone = std::max(0.0f, gore_.severSprayCone);
+        ev.reach = std::min(gore.splatterReach,
+                            gore_.severSpraySpeed * (float)gore_.microLifeTicks / 30.0f);
+        ev.speed = std::max(0.0f, gore_.severSpraySpeed);
+        ev.life = std::clamp(gore_.microLifeTicks, 1, 255);
+        ev.count = gushed;
+        ev.type = sys_->StainTypeOf(def.bleedMat);
+        ev.amount = (uint32_t)std::max(0, gore.splatterAmount);
+        ev.sourceMob = id_;
+        ev.sourceLimb = (int)li;
+        ev.tick = tick;
+        ev.seed = Hash3((uint32_t)id_ * 2654435761u + (uint32_t)li, tick, 0x5B1A7u);
+        sys_->QueueSplatter(ev);
+      }
       limb.gushTicks--;
       // The gout is blood, so it is hp. Charged per droplet actually spawned
       // (not per `want`): a droplet the spawn budget refused never left the
@@ -4783,6 +4818,26 @@ void Mob::BleedTick(uint32_t tick, World& world, std::vector<BrushOp>& ops,
       life = life < 1 ? 1 : (life > 255 ? 255 : life);
       spawns.push_back(MakeDroplet(w, dir * sp, def.bleedMat, true, life,
                                    gore.microScale));
+    }
+    // ...and the spray as a splatter event, so a wound dripping against
+    // another creature (or the player's own arm) marks it.
+    if (sprayed > 0 && sys_) {
+      SplatterEvent ev;
+      ev.origin = w;
+      ev.axis = Vec3{0, 1, 0};
+      ev.cone = std::max(0.0f, gore_.bleedSprayCone);
+      ev.reach = std::min(gore.splatterReach,
+                          gore_.bleedSpraySpeed * (float)gore_.microLifeTicks / 30.0f);
+      ev.speed = std::max(0.0f, gore_.bleedSpraySpeed);
+      ev.life = std::clamp(gore_.microLifeTicks, 1, 255);
+      ev.count = sprayed;
+      ev.type = sys_->StainTypeOf(def.bleedMat);
+      ev.amount = (uint32_t)std::max(0, gore.splatterAmount);
+      ev.sourceMob = id_;
+      ev.sourceLimb = (int)li;
+      ev.tick = tick;
+      ev.seed = Hash3((uint32_t)id_ * 40503u + (uint32_t)li, tick ^ 0xB1005u, 0x5B1A7u);
+      sys_->QueueSplatter(ev);
     }
     // The drip and its spray, as hp. Last thing in the iteration for the
     // reason given at the gout: a kill here invalidates `limb`.
@@ -5480,6 +5535,33 @@ uint32_t Mob::StainWound(int limbIndex, Vec3 centreLocal, float radiusWorld,
                                  v.z, (uint8_t)(stain & 0xFFu), 0);
                });
   }
+  // ---- THE SMEAR (2026-09-13) ---------------------------------------------
+  // The rewrite above turns some flesh INTO blood. This lays blood OVER
+  // everything the cut exposed -- bone included, which the rewrite refuses on
+  // purpose -- as a stain the renderer tints the art with (bodystain.h). The
+  // owner's report was cuts that "cleanly show the underneath voxels without
+  // any blood": the rewrite is a fraction of the tissue in a small radius and
+  // never bone, so a cut through bone showed clean bone. Now the whole cut
+  // surface is bloodied to a degree that falls off from the blade.
+  //
+  // Wider than the rewrite radius, and on the same lattice the rewrite ran
+  // on, poked into the brick the rewrite just owned. Counted separately so a
+  // caller that asks "did the soak land" still gets the rewrite's answer.
+  {
+    const uint32_t stainType = sys_ ? sys_->StainTypeOf(def_->woundMat) : 0u;
+    CutSoak soak;
+    soak.type = stainType ? stainType : (sys_ ? sys_->StainTypeOf(def_->bleedMat) : 0u);
+    soak.radius = gt.stainCutRadius * scale;
+    soak.amountExposed = gt.stainCutAmount;
+    soak.amountBuried = gt.stainCutBuried;
+    soak.buriedChance = gt.stainCutBuriedChance;
+    soak.boneMin = gt.stainBoneMin;
+    soak.tissue = &tissue;
+    StainLattice L;
+    if (fine) L.skin = &limb.skinVoxels; else L.coll = &limb.voxels;
+    if (SoakCut(L, c, soak, seed ^ 0x5741Bu, micro, poke ? limb.microModel : -1))
+      stained++;
+  }
   if (!stained) return 0;
   // The COLLIDER is derived from the skin by a (material, colour) majority
   // vote, so a skin-only stain would be invisible to everything that reads the
@@ -5912,6 +5994,7 @@ const IVec3 kBurnDirs[6] = {{0, 1, 0}, {0, -1, 0}, {1, 0, 0},
 void Mob::DropBurnIndex(BodyBurnState& st) {
   std::vector<uint32_t>().swap(st.idx);
   std::vector<uint32_t>().swap(st.front);
+  std::vector<uint32_t>().swap(st.surface);
   st.dims = IVec3{0, 0, 0};
   st.quiet = 0;
   // `st.alight` deliberately SURVIVES. Everything above is an index INTO a
@@ -6087,6 +6170,7 @@ void MobSystem::BuildBurnIndex(BurnLimbView& v) {
   const size_t n = v.Size();
   st.idx.clear();
   st.front.clear();
+  st.surface.clear();
   st.dims = IVec3{0, 0, 0};
   if (n == 0) return;
 
@@ -6159,7 +6243,7 @@ bool Mob::ReskinLimbMicro(MobLimb& limb, uint32_t skinScale,
     mv.reserve(limb.voxels.size());
     for (const DebrisVoxel& v : limb.voxels)
       mv.push_back({(int16_t)v.x, (int16_t)v.y, (int16_t)v.z,
-                    (uint16_t)(v.payload & 0xFFF)});
+                    (uint16_t)(v.payload & 0xFFF), 0, v.stain});
   }
   IVec3 shift{};
   if (!MicroBodyEdit(*MicroSet(), (uint32_t)limb.microModel, mv, shift))
@@ -6559,7 +6643,7 @@ void Mob::EmitCarvedFragment(const MobLimb& src, uint32_t physScale,
     mv.reserve(part.size());
     for (const DebrisVoxel& v : part)
       mv.push_back({(int16_t)v.x, (int16_t)v.y, (int16_t)v.z,
-                    (uint16_t)(v.payload & 0xFFF)});
+                    (uint16_t)(v.payload & 0xFFF), 0, v.stain});
     IVec3 dims{1, 1, 1};
     for (const PrefabVoxel& v : mv) {
       dims.x = std::max<int>(dims.x, v.x + 1);
@@ -8240,6 +8324,607 @@ void Mob::BurnTick(uint32_t tick, World& world, std::vector<CellOp>& cellOps,
   RecountBurn(tick);
 }
 
+// ============================================================================
+// BLOOD ON A BODY -- the world's stain reaching a creature (2026-09-13)
+//
+// Two doors, both presentation-and-gameplay state that never touches the grid:
+//
+//   CONTACT   StainOneLimb. Walks the world cells round a limb -- the SAME
+//             walk BurnOneLimb makes, and it exits at the same cost when
+//             nothing is there -- until it meets one of three kinds of cell: a
+//             STAINING LIQUID (blood: materials.json `stain`), a DRY STAIN on
+//             a solid (a bloodied floor: the voxel word's stain bits), or a
+//             WASHING LIQUID (water: `washes`). Something is there, so it
+//             sweeps the limb's SURFACE (BodyBurnState::surface: the exposed
+//             voxels of the burn index, built once per index): each surface
+//             voxel reads the world cell it sits in and, failing that, the
+//             cell one step out along its open face, and whatever it finds
+//             there rolls the liquid's own authored per-mille chance: stain
+//             up, or rinse down. So a creature standing in a pool bloodies its
+//             feet at the rate the pool stains the ground, and washes them in
+//             the river at the rate the river rinses stone; a limb wholly
+//             under blood is bloodied all over, not along one edge. (The
+//             first version kept the first 24 contact cells of the walk and
+//             mapped each, dilated, into the lattice: for a submerged hips
+//             those 24 were one edge of the bottom row, every tick, and its
+//             underside never saw a contact at all -- gate body-stain, the
+//             pinned fixture, 16 -> 16.)
+//
+//   SPLATTER  Mob::ApplySplatter. A gout or a spray is queued by BleedTick as
+//             a SplatterEvent and replayed here against every limb in reach.
+//             The replay FLIES THE SAME ARC the particle kernel does -- launch
+//             speed, then sim.partGravity per tick -- so a limb is marked
+//             where the droplets are seen to land and nowhere else, and it is
+//             SAMPLED IN PROPORTION: the share of the burst's cone the limb's
+//             bounding sphere covers, times the droplets thrown this tick, is
+//             how many arcs are aimed across that sphere (each standing for
+//             one droplet, or for several past the per-limb cap). The first
+//             solid voxel an arc meets takes a small splat, not a single
+//             lattice voxel. That is how killing something covers you in it,
+//             and how a neck stump paints its own torso; it is also why a
+//             drip's spray at a third of a metre a second marks nothing but
+//             what it is dribbling onto.
+//
+// Bounded per limb and per tick (kStain*), rotated by tick so a crowd shares
+// the budget fairly, and asleep -- one AABB walk per limb -- whenever nothing
+// is near. Keyed on tick + lattice position, never on a float, for the same
+// reason BurnTick is: these are CPU-side and unhashed, but the discipline is
+// free and a replay should look the same.
+// ============================================================================
+
+void MobSystem::StainLimbs(uint32_t tick, World& world) {
+  if (matGpu_.empty()) return;
+  // Contact, under the shared lattice budget, start creature rotated by tick.
+  if (!mobs_.empty()) {
+    uint32_t budget = kStainLatticePerTick;
+    const size_t nm = mobs_.size();
+    const size_t start = (size_t)(tick % (uint32_t)nm);
+    for (size_t k = 0; k < nm && budget; k++)
+      mobs_[(start + k) % nm].StainTick(tick, world, budget);
+  }
+  // This tick's bursts, against every creature (the bleeder included: its
+  // own gout lands on its own other limbs; only the bleeding limb is skipped).
+  for (SplatterEvent& e : splatters_) {
+    if (e.doneMobs) continue;
+    e.doneMobs = true;
+    for (Mob& mob : mobs_) mob.ApplySplatter(e);
+  }
+}
+
+void Mob::StainTick(uint32_t tick, World& world, uint32_t& budget) {
+  if (!sys_ || sys_->matGpu_.empty() || budget == 0) return;
+  const uint32_t mobKey = (uint32_t)id_ * 0x9E3779B9u ^ 0x57A1Eu;
+  const int nl = (int)limbs_.size();
+  const int start = nl > 0 ? (int)(tick % (uint32_t)nl) : 0;
+  for (int k = 0; k < nl && budget; k++) {
+    const int li = (start + k) % nl;
+    if (!limbs_[li].body) continue;
+    BurnLimbView v = ViewOf(limbs_[li]);
+    const uint32_t key = mobKey + (uint32_t)li * 2654435761u;
+    sys_->StainOneLimb(v, tick, key, world, budget);
+  }
+}
+
+namespace {
+// Own the brick before the first stain poke lands on it (COW, exactly as the
+// burn and carve paths do). Returns false if the pool refused, in which case
+// the lattice is still marked and the skin simply does not keep up.
+bool OwnForStain(BurnLimbView& v, MicroBodySet* micro) {
+  if (!v.microModel || *v.microModel < 0 || !micro) return false;
+  const int own = MicroBodyOwn(*micro, (uint32_t)*v.microModel);
+  if (own < 0) return false;
+  *v.microModel = own;
+  if (v.carved) *v.carved = true;
+  if (v.flipbook) *v.flipbook = -1;
+  return true;
+}
+}  // namespace
+
+bool MobSystem::StainOneLimb(BurnLimbView& v, uint32_t tick, uint32_t rngKey,
+                             World& world, uint32_t& budget) {
+  if (matGpu_.empty() || v.Size() == 0 || budget == 0) return false;
+  const auto& gt = CurrentTuning().gore;
+  if (gt.stainContactScale <= 0.0f && gt.stainWashPerContact <= 0) return false;
+
+  // The world side of the walk: full WORDS this time, because a dry stain
+  // lives in the word's stain bits and a material id cannot see it.
+  IVec3 memoChunk{INT_MIN, INT_MIN, INT_MIN};
+  const CachedChunk* memoCC = nullptr;
+  auto worldWordAt = [&](IVec3 c) -> uint32_t {
+    if (!world.CellInWindow(c)) return 0u;
+    const IVec3 wc = ChunkOfCell(c.x, c.y, c.z);
+    if (wc.x != memoChunk.x || wc.y != memoChunk.y || wc.z != memoChunk.z) {
+      memoChunk = wc;
+      memoCC = world.Cached(wc);
+    }
+    if (!memoCC || memoCC->voxels.size() != kChunkVol) {
+      world.RequestChunkFetch(wc);  // best-effort, one tick latent (BurnOneLimb)
+      return 0u;
+    }
+    const uint32_t lx = (uint32_t)(c.x & 15), ly = (uint32_t)(c.y & 15),
+                   lz = (uint32_t)(c.z & 15);
+    return memoCC->voxels[(lz * kChunk + ly) * kChunk + lx];
+  };
+
+  // What a world word means to a limb pressed against it: nothing, a stain
+  // to take (type / amount per roll / per-mille chance), or a rinse.
+  struct Contact {
+    uint32_t type = 0;    // stain palette slot (0 for a rinse)
+    uint32_t amount = 0;  // amount added per landed roll
+    uint32_t chance = 0;  // per mille per exposed voxel per tick
+    bool wash = false;
+  };
+  auto classify = [&](uint32_t w, Contact& c) -> bool {
+    const uint32_t m = w & 0xFFFu;
+    if (m == 0 || m >= matGpu_.size()) return false;
+    const uint32_t pack = matGpu_[m].stainPack;
+    c = Contact{};
+    if (pack & kStainPackWashesBit) {
+      if (gt.stainWashPerContact <= 0) return false;
+      c.wash = true;
+      c.chance = (pack >> kStainPackChanceShift) & kStainPackChanceMask;
+    } else if (pack & kStainPackTypeMask) {
+      // A staining liquid against the limb: its authored stain, at its
+      // authored rate, scaled by the one contact knob.
+      if (gt.stainContactScale <= 0.0f) return false;
+      c.type = pack & kStainPackTypeMask;
+      c.amount = (pack >> kStainPackAmtShift) & kStainPackAmtMask;
+      c.chance = (uint32_t)std::lround(
+          (float)((pack >> kStainPackChanceShift) & kStainPackChanceMask) *
+          gt.stainContactScale);
+    } else if (VoxStainType(w) != 0 && VoxStainAmt(w) != 0) {
+      // A dry stain on a solid: rubs off at half its amount, at a fraction of
+      // a nominal rate scaled by how heavy it is.
+      if (gt.stainContactScale <= 0.0f || gt.stainFloorTransfer <= 0.0f) return false;
+      c.type = VoxStainType(w);
+      c.amount = std::max(1u, VoxStainAmt(w) / 2u);
+      c.chance = (uint32_t)std::lround(200.0f * gt.stainFloorTransfer *
+                                       gt.stainContactScale * (float)VoxStainAmt(w) /
+                                       (float)kStainAmtMax);
+    } else {
+      return false;
+    }
+    return c.chance != 0 && (c.wash || c.amount != 0);
+  };
+
+  const Quat q{v.xf->quat[0], v.xf->quat[1], v.xf->quat[2], v.xf->quat[3]};
+  const float inv = 1.0f / (float)std::max(1u, v.scale);
+
+  // IS ANYTHING THERE? The limb's world AABB dilated by one, walked until the
+  // first cell that means something. A limb in clean air pays this walk and
+  // nothing else, exactly as the burn pass does.
+  {
+    const float sinv = 1.0f / (float)std::max(1u, v.physScale);
+    Vec3 mn{1e30f, 1e30f, 1e30f}, mx{-1e30f, -1e30f, -1e30f};
+    for (int k = 0; k < 8; k++) {
+      const Vec3 c{(k & 1) ? (float)v.size.x * sinv : 0.0f,
+                   (k & 2) ? (float)v.size.y * sinv : 0.0f,
+                   (k & 4) ? (float)v.size.z * sinv : 0.0f};
+      const Vec3 w = v.xf->pos + Rotate(q, c);
+      mn.x = std::min(mn.x, w.x); mn.y = std::min(mn.y, w.y); mn.z = std::min(mn.z, w.z);
+      mx.x = std::max(mx.x, w.x); mx.y = std::max(mx.y, w.y); mx.z = std::max(mx.z, w.z);
+    }
+    const IVec3 lo{ifloor(mn.x) - 1, ifloor(mn.y) - 1, ifloor(mn.z) - 1};
+    const IVec3 hi{ifloor(mx.x) + 1, ifloor(mx.y) + 1, ifloor(mx.z) + 1};
+    bool any = false;
+    uint32_t seen = 0;
+    Contact probe;
+    for (int y = lo.y; y <= hi.y && !any && seen < kStainScanCells; y++)
+      for (int z = lo.z; z <= hi.z && !any && seen < kStainScanCells; z++)
+        for (int x = lo.x; x <= hi.x && !any && seen < kStainScanCells; x++) {
+          seen++;
+          any = classify(worldWordAt({x, y, z}), probe);
+        }
+    if (!any) return false;  // the walk was the whole cost
+  }
+
+  // Something is against this limb: its index, and the SURFACE of that index
+  // -- every voxel with an empty 6-neighbour -- built once and kept with it
+  // (touching `quiet` keeps the burn pass from dropping it mid-soak).
+  BodyBurnState& st = *v.burn;
+  if (st.idx.empty()) BuildBurnIndex(v);
+  if (st.idx.empty()) return false;
+  st.quiet = 0;
+  const IVec3 bd = st.dims, bm = st.min;
+  auto idxAt = [&](int lx, int ly, int lz) -> uint32_t {
+    if (lx < 0 || ly < 0 || lz < 0 || lx >= bd.x || ly >= bd.y || lz >= bd.z)
+      return 0u;
+    return st.idx[((size_t)lz * bd.y + ly) * bd.x + lx] & ~kBurnQueued;
+  };
+  if (st.surface.empty()) {
+    for (int lz = 0; lz < bd.z; lz++)
+      for (int ly = 0; ly < bd.y; ly++)
+        for (int lx = 0; lx < bd.x; lx++) {
+          if (!idxAt(lx, ly, lz)) continue;
+          if (!idxAt(lx - 1, ly, lz) || !idxAt(lx + 1, ly, lz) ||
+              !idxAt(lx, ly - 1, lz) || !idxAt(lx, ly + 1, lz) ||
+              !idxAt(lx, ly, lz - 1) || !idxAt(lx, ly, lz + 1))
+            st.surface.push_back((uint32_t)(((size_t)lz * bd.y + ly) * bd.x + lx));
+        }
+  }
+  const size_t ns = st.surface.size();
+  if (ns == 0) return false;
+
+  // THE SWEEP. Each surface voxel asks the world cell it sits in -- the body
+  // is not in the grid, so a pool's liquid occupies the very cells the feet
+  // do -- and, if that is nothing, the cell one step out along its open
+  // face(s): a liquid lapping a wall of skin is in the NEXT cell over, and a
+  // stained floor is under a sole that hovers a fraction above it. Rotated by
+  // a tick-keyed start so a limb larger than its budget is covered over a few
+  // ticks rather than the same patch every tick.
+  const uint32_t washAmt = (uint32_t)std::max(0, gt.stainWashPerContact);
+  uint32_t limbBudget = std::min(budget, kStainLatticePerLimb);
+  bool changed = false, owned = false;
+  const size_t start = (size_t)(Hash3(rngKey, tick, 0x5F4CEu) % (uint32_t)ns);
+  for (size_t k = 0; k < ns && limbBudget; k++) {
+    limbBudget--;
+    const uint32_t cell = st.surface[(start + k) % ns];
+    const uint32_t e = st.idx[cell] & ~kBurnQueued;
+    if (!e) continue;  // carved away since the surface was listed
+    const int lx = (int)(cell % (uint32_t)bd.x);
+    const int ly = (int)((cell / (uint32_t)bd.x) % (uint32_t)bd.y);
+    const int lz = (int)(cell / ((uint32_t)bd.x * (uint32_t)bd.y));
+    const Vec3 wp = v.xf->pos + Rotate(q, Vec3{((float)(lx + bm.x) + 0.5f) * inv,
+                                               ((float)(ly + bm.y) + 0.5f) * inv,
+                                               ((float)(lz + bm.z) + 0.5f) * inv});
+    IVec3 cw{ifloor(wp.x), ifloor(wp.y), ifloor(wp.z)};
+    Contact c;
+    if (!classify(worldWordAt(cw), c)) {
+      // Outward: the sum of the open faces, in world, stepped one cell along
+      // its dominant axis.
+      Vec3 nL{0, 0, 0};
+      if (!idxAt(lx - 1, ly, lz)) nL.x -= 1.0f;
+      if (!idxAt(lx + 1, ly, lz)) nL.x += 1.0f;
+      if (!idxAt(lx, ly - 1, lz)) nL.y -= 1.0f;
+      if (!idxAt(lx, ly + 1, lz)) nL.y += 1.0f;
+      if (!idxAt(lx, ly, lz - 1)) nL.z -= 1.0f;
+      if (!idxAt(lx, ly, lz + 1)) nL.z += 1.0f;
+      const Vec3 nW = Rotate(q, nL);
+      const float ax = std::fabs(nW.x), ay = std::fabs(nW.y), az = std::fabs(nW.z);
+      if (ax + ay + az < 1e-4f) continue;
+      if (ax >= ay && ax >= az) cw.x += nW.x > 0.0f ? 1 : -1;
+      else if (ay >= az) cw.y += nW.y > 0.0f ? 1 : -1;
+      else cw.z += nW.z > 0.0f ? 1 : -1;
+      if (!classify(worldWordAt(cw), c)) continue;
+    }
+    const uint32_t chance1024 = std::min(1024u, c.chance * 1024u / 1000u);
+    const uint32_t h = Hash3(rngKey ^ (uint32_t)(((cw.x * 73856093) ^ (cw.y * 19349663) ^
+                                                  (cw.z * 83492791))),
+                             tick, e);
+    if ((h & 1023u) >= chance1024) continue;
+    const size_t vi = e - 1;
+    const uint8_t cur = v.Stain(vi);
+    uint8_t next = cur;
+    if (c.wash) {
+      const uint32_t a = BodyStainAmt(cur);
+      if (a == 0) continue;
+      next = PackBodyStain(BodyStainType(cur), a > washAmt ? a - washAmt : 0u);
+    } else {
+      // Accumulates when the type matches: three splashes of blood saturate;
+      // a different stain replaces only if heavier.
+      const uint32_t a = BodyStainAmt(cur);
+      const uint32_t want = BodyStainType(cur) == c.type || a == 0
+                                ? std::min(kBodyStainAmtMax, a + c.amount)
+                                : c.amount;
+      next = RaiseBodyStain(cur, c.type, want);
+    }
+    if (next == cur) continue;
+    v.SetStain(vi, next);
+    changed = true;
+    if (!owned) owned = OwnForStain(v, microSet_);
+    if (owned) {
+      const IVec3 p = v.At(vi);
+      MicroBodyPokeStain(*microSet_, (uint32_t)*v.microModel, p.x, p.y, p.z, next);
+    }
+  }
+  budget -= std::min(budget, kStainLatticePerLimb - limbBudget);
+  return changed;
+}
+
+void Mob::ApplySplatter(const SplatterEvent& e) {
+  if (!sys_ || e.count <= 0 || e.amount == 0 || e.type == 0) return;
+  const Tuning& tune = CurrentTuning();
+  const auto& gt = tune.gore;
+  const int trialCap = std::max(0, gt.splatterPerLimb);
+  if (trialCap <= 0 || e.reach <= 0.0f || e.speed <= 0.0f || e.life <= 0) return;
+  const float axisLen = e.axis.len();
+  if (axisLen < 1e-4f) return;
+  const Vec3 axisN = e.axis * (1.0f / axisLen);
+  const float coneTan = std::max(0.0f, e.cone);
+  constexpr float kPi = 3.14159265f;
+
+  // GRAVITY AS THE KERNEL APPLIES IT (sim_particle.wgsl): sim.partGravity is
+  // 24.8 fixed voxels/tick^2, taken off vy each tick before the move. The
+  // replay integrates the same way, so a droplet the kernel drops at the
+  // attacker's shins is not credited to their face here.
+  const float gTick = (float)std::max(0, tune.sim.partGravity) / 256.0f;
+  const float gSec = gTick * 900.0f;  // voxels/s^2 at the 30 Hz sim
+
+  // THE BURST'S SOLID ANGLE. BleedTick throws along axis + a jitter cube of
+  // half-side `cone`, which from the wound spans about 2*atan(cone/|axis|)
+  // each way. Flat-map estimate, capped at the sphere; this only sets how the
+  // droplets are shared between limbs, not where any one of them goes.
+  const float halfAng = std::atan(coneTan / axisLen);
+  const float omegaBurst =
+      std::min(4.0f * kPi, std::max(1e-3f, 4.0f * halfAng * halfAng));
+  const float splatW = std::max(0.0f, gt.splatterSplatRadius);
+
+  // The launch elevation that puts a droplet of speed `sp` through a point
+  // `dh` across and `dv` up from the wound, both arcs; false when no speed
+  // this low arrives. The vertical case (straight below or above) is the
+  // one the closed form divides by zero on and the one a drip lives in.
+  auto solveArc = [&](float dh, float dv, float sp, float outTan[2]) -> int {
+    if (sp <= 1e-4f) return 0;
+    if (dh < 1e-3f) {
+      // Straight up: reachable to the apex. Straight down: always.
+      if (dv > 0.0f && gSec > 0.0f && dv > sp * sp / (2.0f * gSec)) return 0;
+      if (dv > 0.0f) {
+        outTan[0] = 1e6f;  // up, to the apex
+        return 1;
+      }
+      outTan[0] = -1e6f;  // down ("low")
+      outTan[1] = 1e6f;   // up, falling back through the point ("high")
+      return 2;
+    }
+    if (gSec <= 0.0f) {
+      outTan[0] = dv / dh;
+      return 1;
+    }
+    const float s2 = sp * sp;
+    const float disc = s2 * s2 - gSec * (gSec * dh * dh + 2.0f * dv * s2);
+    if (disc < 0.0f) return 0;
+    const float rt = std::sqrt(disc);
+    outTan[0] = (s2 - rt) / (gSec * dh);  // low arc
+    outTan[1] = (s2 + rt) / (gSec * dh);  // high arc
+    return 2;
+  };
+  // Is a unit direction one the burst throws? The ray from the wound against
+  // the jitter cube round the axis, widened by `extra` (the limb's angular
+  // size) so a limb at the cone's edge is still partly in it.
+  auto inBurst = [&](const Vec3& d, float extra) -> bool {
+    const float w = coneTan + extra;
+    float t0 = 0.0f, t1 = 1e30f;
+    for (int ax = 0; ax < 3; ax++) {
+      const float dd = ax == 0 ? d.x : ax == 1 ? d.y : d.z;
+      const float c0 = (ax == 0 ? e.axis.x : ax == 1 ? e.axis.y : e.axis.z) - w;
+      const float c1 = c0 + 2.0f * w;
+      if (std::fabs(dd) < 1e-6f) {
+        if (0.0f < c0 || 0.0f > c1) return false;
+        continue;
+      }
+      float a = c0 / dd, b = c1 / dd;
+      if (a > b) std::swap(a, b);
+      t0 = std::max(t0, a);
+      t1 = std::min(t1, b);
+      if (t0 > t1) return false;
+    }
+    return true;
+  };
+
+  bool owned = false;
+  for (size_t li = 0; li < limbs_.size(); li++) {
+    MobLimb& limb = limbs_[li];
+    if (!limb.body) continue;
+    if (e.sourceMob == id_ && e.sourceLimb == (int)li) continue;
+    BurnLimbView v = ViewOf(limb);
+    if (v.Size() == 0) continue;
+    const Quat q{limb.xf.quat[0], limb.xf.quat[1], limb.xf.quat[2], limb.xf.quat[3]};
+    const float sinv = 1.0f / (float)std::max(1u, v.physScale);
+    const Vec3 half{0.5f * (float)v.size.x * sinv, 0.5f * (float)v.size.y * sinv,
+                    0.5f * (float)v.size.z * sinv};
+    const float limbR = half.len();
+    const Vec3 centre = limb.xf.pos + Rotate(q, half);
+    const Vec3 toC = centre - e.origin;
+    const float dist = toC.len();
+    if (dist - limbR > e.reach) continue;
+
+    // WHICH ARCS REACH THIS LIMB, AND WHAT SHARE OF THE BURST THEY ARE. The
+    // limb's bounding sphere is a disc as seen from the wound; each arc
+    // family (low, high) that passes its centre inside the burst's cone is
+    // one way the burst can hit it, and the sphere's solid angle over the
+    // burst's is the fraction of the droplets that do. Inside the sphere
+    // (a neck stump's own torso) every droplet is a candidate.
+    const bool inside = dist <= limbR;
+    float tanBranch[2] = {0.0f, 0.0f};
+    bool branchHigh[2] = {false, false};
+    int branches = 0;
+    float frac = 1.0f;
+    const float dh = std::sqrt(toC.x * toC.x + toC.z * toC.z);
+    const Vec3 hdir = dh > 1e-3f ? Vec3{toC.x / dh, 0.0f, toC.z / dh} : Vec3{0, 0, 0};
+    if (!inside) {
+      float cand[2];
+      const int n = solveArc(dh, toC.y, e.speed, cand);
+      const float extra = axisLen * std::min(1.0f, limbR / dist);
+      for (int b = 0; b < n; b++) {
+        const float el = std::atan(cand[b]);
+        const Vec3 d{hdir.x * std::cos(el), std::sin(el), hdir.z * std::cos(el)};
+        if (inBurst(d, extra)) {
+          tanBranch[branches] = cand[b];
+          branchHigh[branches] = n == 2 && b == 1;
+          branches++;
+        }
+      }
+      if (branches == 0) continue;  // the burst cannot get there
+      const float sinL = std::min(1.0f, limbR / dist);
+      const float omegaLimb =
+          2.0f * kPi * (1.0f - std::sqrt(std::max(0.0f, 1.0f - sinL * sinL)));
+      frac = std::min(1.0f, (float)branches * omegaLimb / omegaBurst);
+    }
+    const float expect = (float)e.count * frac;
+    const uint32_t hl = Hash3(e.seed, (uint32_t)li * 0x9E3779B9u, 0xA1Fu);
+    int trials = (int)expect;
+    if ((float)(hl & 0xFFFFu) / 65536.0f < expect - (float)trials) trials++;
+    if (trials <= 0) continue;
+    float weight = 1.0f;
+    if (trials > trialCap) {
+      weight = (float)trials / (float)trialCap;
+      trials = trialCap;
+    }
+
+    // Something will be thrown at it: the index, then one arc per trial.
+    BodyBurnState& st = limb.burn;
+    if (st.idx.empty()) sys_->BuildBurnIndex(v);
+    if (st.idx.empty()) continue;
+    st.quiet = 0;
+    const IVec3 bd = st.dims, bm = st.min;
+    const float scale = (float)std::max(1u, v.scale);
+    const Vec3 boxLo{(float)bm.x, (float)bm.y, (float)bm.z};
+    const Vec3 boxHi{(float)(bm.x + bd.x), (float)(bm.y + bd.y), (float)(bm.z + bd.z)};
+    // The splat one landing paints, in lattice voxels: gore.splatterSplatRadius
+    // world voxels, wider for a trial that stands for several droplets.
+    const float splatR = splatW * scale * std::min(2.0f, std::sqrt(weight));
+    const int splatL = std::min(MobSystem::kSplatterSplatMaxL, (int)std::ceil(splatR));
+    // Below this and falling, the droplet is on the ground, not on the limb.
+    const float floorY = centre.y - limbR - 1.0f;
+    // A frame across the limb's disc, for aiming.
+    const Vec3 n = dist > 1e-4f ? toC * (1.0f / dist) : Vec3{0, 1, 0};
+    const Vec3 up = std::fabs(n.y) < 0.9f ? Vec3{0, 1, 0} : Vec3{1, 0, 0};
+    const Vec3 e1 = n.cross(up).normalized();
+    const Vec3 e2 = n.cross(e1);
+
+    auto idxAt = [&](int lx, int ly, int lz) -> uint32_t {
+      if (lx < 0 || ly < 0 || lz < 0 || lx >= bd.x || ly >= bd.y || lz >= bd.z)
+        return 0u;
+      return st.idx[((size_t)lz * bd.y + ly) * bd.x + lx] & ~kBurnQueued;
+    };
+    auto exposed = [&](int lx, int ly, int lz) -> bool {
+      return !idxAt(lx - 1, ly, lz) || !idxAt(lx + 1, ly, lz) ||
+             !idxAt(lx, ly - 1, lz) || !idxAt(lx, ly + 1, lz) ||
+             !idxAt(lx, ly, lz - 1) || !idxAt(lx, ly, lz + 1);
+    };
+    auto mark = [&](size_t vi, uint32_t amt) {
+      const uint8_t cur = v.Stain(vi);
+      const uint32_t a = BodyStainAmt(cur);
+      // Accumulates when the type matches: three splashes saturate; a
+      // different stain replaces only if heavier.
+      const uint32_t want = BodyStainType(cur) == e.type || a == 0
+                                ? std::min(kBodyStainAmtMax, a + amt)
+                                : amt;
+      const uint8_t next = RaiseBodyStain(cur, e.type, want);
+      if (next == cur) return;
+      v.SetStain(vi, next);
+      if (!owned) owned = OwnForStain(v, sys_->microSet_);
+      if (owned) {
+        const IVec3 pp = v.At(vi);
+        MicroBodyPokeStain(*sys_->microSet_, (uint32_t)*v.microModel, pp.x, pp.y,
+                           pp.z, next);
+      }
+    };
+    // THE SPLAT. The voxel hit takes the full amount; exposed voxels round it
+    // take less with distance and are dropped with rising chance toward the
+    // rim, so a landing is a spot with a ragged edge and not a stamped disc.
+    auto splat = [&](int hx, int hy, int hz, uint32_t h) {
+      const float r2 = std::max(0.25f, splatR * splatR);
+      for (int dz = -splatL; dz <= splatL; dz++)
+        for (int dy = -splatL; dy <= splatL; dy++)
+          for (int dx = -splatL; dx <= splatL; dx++) {
+            const int lx = hx + dx, ly = hy + dy, lz = hz + dz;
+            const uint32_t ent = idxAt(lx, ly, lz);
+            if (!ent) continue;
+            const float d2 = (float)(dx * dx + dy * dy + dz * dz);
+            const bool centreVox = dx == 0 && dy == 0 && dz == 0;
+            if (!centreVox && (d2 > r2 || !exposed(lx, ly, lz))) continue;
+            const float t = std::sqrt(d2 / r2);
+            const uint32_t hv = Hash3(h, (uint32_t)(lx * 73856093),
+                                      (uint32_t)(ly * 19349663) ^
+                                          (uint32_t)(lz * 83492791));
+            if (!centreVox && (float)(hv & 0xFFFFu) / 65536.0f < t * t) continue;
+            const float jitter = 0.6f + 0.4f * (float)((hv >> 16) & 0xFFu) / 255.0f;
+            int amt = (int)std::lround((float)e.amount * (1.0f - 0.5f * t * t) * jitter);
+            if (centreVox) amt = std::max(amt, 1);
+            if (amt <= 0) continue;
+            mark((size_t)ent - 1, (uint32_t)amt);
+          }
+    };
+
+    for (int k = 0; k < trials; k++) {
+      const uint32_t h = Hash3(e.seed, (uint32_t)li * 0x9E3779B9u, (uint32_t)k);
+      // Launch speed +-25%, as the gout's own droplets vary.
+      const float sp = e.speed * (0.75f + 0.5f * (float)(Pcg(h ^ 0x1234u) & 0xFFFFu) / 65535.0f);
+      Vec3 dirW;
+      if (!inside) {
+        // Aim at a point of the disc, on one of the arc families that reach
+        // it, re-solved for this droplet's own speed (a slower one on the
+        // low arc simply falls short, as it would).
+        const float r = limbR * std::sqrt((float)(h & 0xFFFFu) / 65536.0f);
+        const float ang = 2.0f * kPi * (float)((h >> 16) & 0xFFFFu) / 65536.0f;
+        const Vec3 target = centre + e1 * (r * std::cos(ang)) + e2 * (r * std::sin(ang));
+        const Vec3 to = target - e.origin;
+        const float tdh = std::sqrt(to.x * to.x + to.z * to.z);
+        float cand[2];
+        const int nc = solveArc(tdh, to.y, sp, cand);
+        const int want = branches == 2 ? (int)((Pcg(h ^ 0x77u) >> 8) & 1u) : 0;
+        // Fly the same family (low/high) as the branch chosen for this limb.
+        const bool highFamily = branchHigh[want];
+        float tanEl;
+        if (nc == 0) {
+          tanEl = tanBranch[want];  // this speed cannot arrive; fly the nominal aim and miss
+        } else if (nc == 1) {
+          tanEl = cand[0];
+        } else {
+          tanEl = highFamily ? cand[1] : cand[0];
+        }
+        const float el = std::atan(tanEl);
+        const Vec3 hd = tdh > 1e-3f ? Vec3{to.x / tdh, 0.0f, to.z / tdh} : hdir;
+        dirW = Vec3{hd.x * std::cos(el), std::sin(el), hd.z * std::cos(el)};
+      } else {
+        dirW = Vec3{axisN.x + SignedUnit(h) * coneTan,
+                    axisN.y + SignedUnit(Pcg(h ^ 0x51A17u)) * coneTan,
+                    axisN.z + SignedUnit(Pcg(h ^ 0xB0011u)) * coneTan};
+      }
+      const float dl = dirW.len();
+      if (dl < 1e-4f) continue;
+      Vec3 vel = dirW * (sp / (dl * 30.0f));  // voxels per tick
+      Vec3 pos = e.origin;
+      bool landed = false;
+      for (int tk = 0; tk < e.life && !landed; tk++) {
+        vel.y -= gTick;
+        const Vec3 nxt = pos + vel;
+        // This tick's segment against the index box, in the lattice frame,
+        // and a unit-step march through whatever of it is inside. A limb the
+        // droplet never enters costs one slab test per tick of flight.
+        const Vec3 a = RotateInv(q, pos - limb.xf.pos) * scale;
+        const Vec3 b = RotateInv(q, nxt - limb.xf.pos) * scale;
+        const Vec3 d = b - a;
+        float t0 = 0.0f, t1 = 1.0f;
+        bool miss = false;
+        for (int ax = 0; ax < 3 && !miss; ax++) {
+          const float o = ax == 0 ? a.x : ax == 1 ? a.y : a.z;
+          const float dd = ax == 0 ? d.x : ax == 1 ? d.y : d.z;
+          const float l0 = ax == 0 ? boxLo.x : ax == 1 ? boxLo.y : boxLo.z;
+          const float l1 = ax == 0 ? boxHi.x : ax == 1 ? boxHi.y : boxHi.z;
+          if (std::fabs(dd) < 1e-6f) {
+            if (o < l0 || o >= l1) miss = true;
+            continue;
+          }
+          float ta = (l0 - o) / dd, tb = (l1 - o) / dd;
+          if (ta > tb) std::swap(ta, tb);
+          t0 = std::max(t0, ta);
+          t1 = std::min(t1, tb);
+          if (t0 > t1) miss = true;
+        }
+        if (!miss) {
+          const float segLen = d.len();
+          const int steps =
+              std::min(MobSystem::kSplatterMarchSteps, (int)std::ceil(segLen * (t1 - t0)) + 1);
+          const Vec3 step = segLen > 1e-6f ? d * (1.0f / segLen) : Vec3{0, 0, 0};
+          Vec3 p = a + d * t0;
+          for (int sidx = 0; sidx <= steps && !landed; sidx++, p += step) {
+            const int lx = ifloor(p.x) - bm.x, ly = ifloor(p.y) - bm.y,
+                      lz = ifloor(p.z) - bm.z;
+            if (!idxAt(lx, ly, lz)) continue;
+            splat(lx, ly, lz, h);
+            landed = true;
+          }
+        }
+        pos = nxt;
+        if ((pos - e.origin).len() > e.reach) break;
+        if (vel.y < 0.0f && pos.y < floorY) break;
+      }
+    }
+  }
+}
+
 bool MobSystem::CarveLimbRadial(uint64_t bodyHandle, Vec3 centerWorldVoxel,
                                 float radiusVoxels, bool ragged, bool eject,
                                 World& world,
@@ -8330,7 +9015,7 @@ bool Mob::CarveLimbRadial(uint64_t bodyHandle, Vec3 centerWorldVoxel,
     }
     const Mob::CarveSpall* spallPtr = wantSpall ? &spallData : nullptr;
 
-    CarveLimb(
+    const bool alive = CarveLimb(
         (int)i, world, spawns, eject,
         [&, cBody, seed, jitterScale, chunk, falloffExp,
          blob](float scale) -> LimbCarveKeep {
@@ -8390,6 +9075,12 @@ bool Mob::CarveLimbRadial(uint64_t bodyHandle, Vec3 centerWorldVoxel,
           };
         },
         spallPtr);
+    // SEVERED OR DEAD: nothing below may touch `limbs_` (CutLimb's contract).
+    if (!alive) return true;
+    // A crater is a wound. The blast path never soaked its rim until
+    // 2026-09-13, so a bullet hole or a blast crater showed clean flesh and
+    // clean bone; same soak the blade's kerf gets, sized to the crater.
+    StainWound((int)i, cBody, radiusVoxels + 0.5f, seed ^ 0xC7A7E7u);
     return true;
   }
   return false;
@@ -8561,6 +9252,13 @@ void Mob::Sever(int limbIndex) {
                                                     : Vec3{0, 1, 0});
         piece.gushTicks = std::max(piece.gushTicks, gore_.severDecayTicks);
         piece.bleedBudget = AddBleedBudget(piece.bleedBudget, gt.severStumpBudget);
+        // THE CUT FACE IS BLOODIED, on the piece, before it leaves: the kerf
+        // soak in CutLimb runs only when the limb SURVIVES the carve, so a
+        // limb that came off (and one severed outright, by hp or by
+        // --shot-mob) showed a clean cross-section of bone and muscle. Same
+        // soak, centred on the joint; the stump gets its own below.
+        StainWound(limbIndex, piece.anchorLimb, gt.woundStainRadius,
+                   Hash3((uint32_t)id_, (uint32_t)limbIndex, 0x5EAFu));
       }
       DetachLimb(limbIndex, adopt);
       if (!adopt) {
@@ -8584,6 +9282,9 @@ void Mob::Sever(int limbIndex) {
                  parent.xf.quat[3]};
           const auto& gore = CurrentTuning().gore;
           parent.woundLocal = RotateInv(q, anchorW - parent.xf.pos);
+          // The stump's face is bloodied too (see the piece above).
+          StainWound((int)k, parent.woundLocal, gore.woundStainRadius,
+                     Hash3((uint32_t)id_, (uint32_t)k, 0x57B4Fu));
           // The stump's own drip budget, on top of the thrown voxels below:
           // this is the puddle that keeps forming under a fresh amputation.
           parent.bleedBudget =
@@ -9248,6 +9949,93 @@ uint32_t MobSystem::LimbMaterialCount(uint64_t mobId, int limbIndex,
     return n;
   }
   return 0;
+}
+
+uint32_t MobSystem::LimbStainCount(uint64_t mobId, int limbIndex,
+                                   uint32_t minAmt) const {
+  return LimbStainedMatCount(mobId, limbIndex, 0xFFFFFFFFu, minAmt);
+}
+
+uint32_t MobSystem::LimbStainedMatCount(uint64_t mobId, int limbIndex,
+                                        uint32_t mat, uint32_t minAmt) const {
+  const Mob* mob = nullptr;
+  for (const Mob& m : mobs_)
+    if (m.id_ == mobId) { mob = &m; break; }
+  if (!mob && avatar_ && avatar_->id_ == mobId) mob = avatar_;
+  if (!mob || limbIndex < 0 || limbIndex >= (int)mob->limbs_.size()) return 0;
+  const MobLimb& l = mob->limbs_[limbIndex];
+  const bool any = mat == 0xFFFFFFFFu;
+  uint32_t n = 0;
+  if (l.HasFineSkin()) {
+    for (const PrefabVoxel& v : l.skinVoxels)
+      if ((any || (v.material & 0xFFFu) == (mat & 0xFFFu)) &&
+          BodyStainAmt(v.stain) >= minAmt && BodyStainAmt(v.stain) > 0)
+        n++;
+  } else {
+    for (const DebrisVoxel& v : l.voxels)
+      if ((any || (v.payload & 0xFFFu) == (mat & 0xFFFu)) &&
+          BodyStainAmt(v.stain) >= minAmt && BodyStainAmt(v.stain) > 0)
+        n++;
+  }
+  return n;
+}
+
+uint32_t MobSystem::StainTypeOf(uint32_t mat) const {
+  if (mat == 0 || mat >= matGpu_.size()) return 0;
+  return matGpu_[mat].stainPack & kStainPackTypeMask;
+}
+
+void MobSystem::QueueSplatter(const SplatterEvent& e) {
+  if (e.count <= 0 || e.type == 0 || e.amount == 0 || e.reach <= 0.0f) return;
+  if (splatters_.size() >= kSplatterMaxEvents) return;
+  splatters_.push_back(e);
+}
+
+void MobSystem::SplatterOnto(Mob& avatar) {
+  for (SplatterEvent& e : splatters_) {
+    if (e.doneAvatar) continue;
+    e.doneAvatar = true;
+    avatar.ApplySplatter(e);
+  }
+}
+
+float MobSystem::LimbStainMaxWorldY(uint64_t mobId, int limbIndex,
+                                    uint32_t minAmt) const {
+  float lo = 0.0f, hi = 0.0f;
+  return LimbStainWorldYRange(mobId, limbIndex, minAmt, lo, hi) ? hi : -1e30f;
+}
+
+bool MobSystem::LimbStainWorldYRange(uint64_t mobId, int limbIndex,
+                                     uint32_t minAmt, float& lo, float& hi) const {
+  const Mob* mob = nullptr;
+  for (const Mob& m : mobs_)
+    if (m.id_ == mobId) { mob = &m; break; }
+  if (!mob && avatar_ && avatar_->id_ == mobId) mob = avatar_;
+  if (!mob || limbIndex < 0 || limbIndex >= (int)mob->limbs_.size()) return false;
+  const MobLimb& l = mob->limbs_[limbIndex];
+  const Quat q{l.xf.quat[0], l.xf.quat[1], l.xf.quat[2], l.xf.quat[3]};
+  float best = -1e30f, least = 1e30f;
+  auto consider = [&](int x, int y, int z, uint8_t stain, float inv) {
+    if (BodyStainAmt(stain) < minAmt) return;
+    const Vec3 w = l.xf.pos + Rotate(q, Vec3{((float)x + 0.5f) * inv,
+                                             ((float)y + 0.5f) * inv,
+                                             ((float)z + 0.5f) * inv});
+    best = std::max(best, w.y);
+    least = std::min(least, w.y);
+  };
+  if (l.HasFineSkin()) {
+    const float inv = 1.0f / (float)std::max(1u, mob->SkinScaleOf(l));
+    for (const PrefabVoxel& v : l.skinVoxels)
+      if ((v.material & 0xFFFu) != 0) consider(v.x, v.y, v.z, v.stain, inv);
+  } else {
+    const float inv = 1.0f / (float)std::max(1u, mob->PhysScaleOf(l));
+    for (const DebrisVoxel& v : l.voxels)
+      if ((v.payload & 0xFFFu) != 0) consider(v.x, v.y, v.z, v.stain, inv);
+  }
+  if (best < -1e29f) return false;
+  lo = least;
+  hi = best;
+  return true;
 }
 
 std::vector<PrefabVoxel> MobSystem::LimbLattice(uint64_t mobId,

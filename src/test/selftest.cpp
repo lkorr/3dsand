@@ -343,6 +343,11 @@ const char* const kOrder[] = {
     // Ticks the world (the corpse needs ground to lie on) and regenerates it
     // on the way out, like wound-bleed.
     "corpse-bleed",
+    // ...and blood is SEEN on a body: a cut bloodies what it exposes (bone
+    // included), a burst lands on the creature in its way, a pool rubs off
+    // on contact and water rinses it (owner report 2026-09-13). Ticks the
+    // world for the last two and regenerates it on the way out.
+    "body-stain",
     // ...and a corpse that died alight keeps burning: every piece advances
     // its embers, keeps emitting fire, and its brick agrees with its lattice
     // (owner report 2026-09-02: the corpse pulsed at its death colour for

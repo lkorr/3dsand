@@ -3009,7 +3009,17 @@ class World {
   // read as "fresh" against the new scene's early ticks — the paged mirror
   // then skips its tightening (encodeTick <= snapTick) and, had the ranges
   // lined up, would have tightened against ANOTHER world's dirty flags.
-  void InvalidateSnapshot() { snap_.valid = false; }
+  // A regenerated window makes EVERY cached chunk stale, so the chunk cache
+  // goes with the snapshot. It did not, and the fetch path's version guard
+  // (`cc.version <= sl.tick`, KickReadback) then kept the old contents for
+  // any later reader whose tick numbers were LOWER than the gate that filled
+  // the entry: the body-stain gate (ticks 29000+) after corpse-bleed (61000+)
+  // wrote stone and blood the GPU held and the CPU mirror never showed, and
+  // reported a contact pass that "saw nothing" (2026-09-13).
+  void InvalidateSnapshot() {
+    snap_.valid = false;
+    cache_.clear();
+  }
 
   // ---- MPM fluid render bounds (RenderParams::fluidLo/fluidHi) ------------
   // Record this tick's CPU-known spawn cells so a fresh pour is visible on the

@@ -935,6 +935,51 @@ struct Tuning {
     float woundStainSurface = 0.90f;
     float woundStainDensity = 0.30f;
 
+    // ---- E3b. BLOOD ON A BODY: the stain lattice (2026-09-13) --------------
+    // The soak above REWRITES flesh to blood. This is the other half, and it
+    // is what the owner asked for in as many words: every voxel a cut
+    // exposes -- bone included -- carries a STAIN, a tint the renderer lays
+    // over the art the way the ground's stain layer does (same palette entry,
+    // same look), to a degree that falls off from the cut. A stain never
+    // changes what a voxel IS, so bone stays bone and reads as blood-smeared
+    // bone; it goes with a severed limb, into every fragment, and comes off
+    // again under a washing liquid (water's `washes`).
+    //
+    // Radius in WORLD voxels round the cut; amounts are the 0..15 scale the
+    // world's stain uses. `stainCutAmount` at the centre of an exposed voxel
+    // tapering toward the rim; buried voxels take `stainCutBuried` with
+    // `stainCutBuriedChance`, low so a later cut finds meat that bled a
+    // little rather than a red interior. `stainBoneMin` is the FLOOR for any
+    // exposed bone in range: bone is always shown bloodied to some degree.
+    float stainCutRadius = 1.6f;
+    int stainCutAmount = 15;
+    int stainCutBuried = 6;
+    float stainCutBuriedChance = 0.35f;
+    int stainBoneMin = 5;
+    // CONTACT. A limb in a blood pool, on a bloodied floor or under a drip
+    // takes the liquid's authored stain (materials.json `stain`: type, amount,
+    // per-mille chance per tick) on its exposed voxels, scaled by this. A dry
+    // stain on the ground transfers at half its amount and this fraction of
+    // its chance, so walking through old blood lightly bloodies the boots.
+    float stainContactScale = 1.0f;
+    float stainFloorTransfer = 0.35f;
+    // WASHING. A liquid whose stain `washes` (water) rinses this much amount
+    // off an exposed voxel per successful roll at the liquid's own chance.
+    int stainWashPerContact = 3;
+    // SPLATTER. A gout or a drip's spray is checked against every body within
+    // this many voxels of the wound. The replay flies the particle kernel's
+    // own arc (launch speed, then sim.partGravity), aimed across each limb in
+    // proportion to the share of the burst's cone the limb covers, so a body
+    // is marked where the droplets are seen to land: each arc that meets a
+    // limb paints a splat of `splatterSplatRadius` world voxels at
+    // `splatterAmount`, at most `splatterPerLimb` arcs per limb per event
+    // (past that, one arc stands for several droplets and paints wider).
+    // This is how killing something covers YOU in it.
+    float splatterReach = 48.0f;
+    int splatterAmount = 6;
+    int splatterPerLimb = 64;
+    float splatterSplatRadius = 0.3f;
+
     // ---- E4. when a cut becomes a dismemberment -----------------------------
     // Both rules are STRUCTURAL and both fire only on a blade cut (a burn's
     // charring behaviour is deliberately untouched — see Mob::CarveLimb).
