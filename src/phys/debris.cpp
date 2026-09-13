@@ -898,11 +898,11 @@ void DebrisSystem::RunIslandDetection(const Event& e, uint32_t tick, World& worl
     bool powderAnchor = false;    // resting on powder: genuinely supported
     bool complete = true;         // `cells` is the whole component
     bool touchedUnfetched = false;  // reached a chunk the mirror lacks: not judged
-  };
     // The first cell that anchored this component (trace only): the answer to
     // "anchored by WHAT" is a place, not a flag.
     IVec3 anchorAt{};
     bool anchorSet = false;
+  };
   std::vector<Comp> comps;
   std::unordered_map<uint64_t, int32_t>& label = scanLabel_;
   label.clear();

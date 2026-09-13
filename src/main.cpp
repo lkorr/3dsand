@@ -954,8 +954,12 @@ void ProjectBodyUI(const PlayerAvatar& av, Physics& phys, const PortraitCam& pc,
 IVec3 SpawnWindowOrigin() {
   const worldmap::WorldMapData& m = worldmap::CurrentWorldMap();
   const int half = (int)kNChunk / 2;
-  return IVec3{(m.spawnX >> 4) - half, 0, (m.spawnZ >> 4) - half};
-}
+  int sx = m.spawnX, sz = m.spawnZ;
+  // --fell-tree x,z starts the game at its site: without this the boot window
+  // sat at the map's spawn and the stream WALKED it to the pad one plane per
+  // frame (205-234 shifts, 10 ms each, plus a worldgen plane per shift) --
+  // over before the cut, but it owned the whole-run stream and worldgen rows.
+  if (g_fellSiteSet) { sx = g_fellSiteX - 48; sz = g_fellSiteZ; }
 Vec3 SpawnPos() {
   const worldmap::WorldMapData& m = worldmap::CurrentWorldMap();
   const int h = World::TerrainHeight(m.spawnX, m.spawnZ, kDefaultSeed);
@@ -4333,6 +4337,16 @@ int main(int argc, char** argv) {
   std::printf("spawn: (%d, %d) on the map's spawn site, ground y%d\n",
               worldmap::CurrentWorldMap().spawnX, worldmap::CurrentWorldMap().spawnZ,
               (int)player.pos.y - 10);
+  if (g_fellSiteSet) {
+    const int px = g_fellSiteX - 48;
+    player.pos = Vec3{(float)px,
+                      (float)(World::TerrainHeight(px, g_fellSiteZ, kDefaultSeed) + 10),
+                      (float)g_fellSiteZ};
+    cam.yaw = 0.0f;    // Forward() = +X: the tree is planted 48 voxels that way
+    cam.pitch = 0.0f;
+    std::printf("--fell-tree: spawn moved to (%d, %d) so the tree stands at (%d, %d)\n",
+                px, g_fellSiteZ, g_fellSiteX, g_fellSiteZ);
+  }
   // Lab: fixed per-scene pose, flying, aimed at the scene — the same pose the
   // bench renders from, so what is judged live and what is measured headless
   // are the same framing.
@@ -4348,16 +4362,6 @@ int main(int argc, char** argv) {
   }
   // seed the far-field cascades around spawn (coarsest first; the queue
   // drains at kFarListCap level-chunks per tick through SubmitTick)
-  if (g_fellSiteSet) {
-    const int px = g_fellSiteX - 48;
-    player.pos = Vec3{(float)px,
-                      (float)(World::TerrainHeight(px, g_fellSiteZ, kDefaultSeed) + 10),
-                      (float)g_fellSiteZ};
-    cam.yaw = 0.0f;    // Forward() = +X: the tree is planted 48 voxels that way
-    cam.pitch = 0.0f;
-    std::printf("--fell-tree: spawn moved to (%d, %d) so the tree stands at (%d, %d)\n",
-                px, g_fellSiteZ, g_fellSiteX, g_fellSiteZ);
-  }
   far.FullRefill({ifloor(player.pos.x) >> 4, ifloor(player.pos.y) >> 4,
                   ifloor(player.pos.z) >> 4});
   StartupMark("far-field refill queued");
@@ -7390,6 +7394,130 @@ int main(int argc, char** argv) {
         }
       }
 
+      // ---- --fell-tree: the tree-fell gate's cut, in the live frame loop ----
+      // Same fixture (selftest::BuildTree), same cut (a 9x9x3 slab of air ten
+      // cells up plus the destruction event the brush would raise), same
+      // 300-tick profile window. What differs is that this loop RENDERS.
+      if (g_fellTree) {
+        static int fellPhase = 0;  // 0 waiting, 1 planted, 2 cut, 3 reported
+        static uint32_t fellPlantTick = 0, fellCutTick = 0;
+        static int fellGroundY = 0;
+        static size_t fellFrame0 = 0;
+        static bool fellBodySeen = false;
+        static bool fellTreeSeen = false;
+        static selftest::TreeFixture fellTree;
+        auto matByName = [&](const char* n) -> uint32_t {
+          for (size_t i = 0; i < mats.size(); i++)
+            if (mats[i].name == n) return (uint32_t)i;
+          return 0u;
+        };
+        if ((tick % 60u) == 0u)
+          std::printf("--fell-tree: tick %u player (%.1f,%.1f,%.1f) yaw %.2f fly %d\n",
+                      tick, player.pos.x, player.pos.y, player.pos.z, cam.yaw,
+                      player.fly ? 1 : 0);
+        if (fellPhase == 0 && tick >= (uint32_t)g_fellTreeAt) {
+          const Vec3 fwd = cam.Forward();
+          const int bx = ifloor(player.pos.x + fwd.x * 48.0f);
+          const int bz = ifloor(player.pos.z + fwd.z * 48.0f);
+          fellGroundY = World::TerrainHeight(bx, bz, kDefaultSeed);
+          fellTree = selftest::BuildTree(world, {bx, fellGroundY + 1, bz},
+                                         matByName("wood"),
+                                         matByName("leaves"), cellOps);
+          fellPlantTick = tick;
+          fellPhase = 1;
+          // A crown that touches a hillside is anchored, and the cut then
+          // frees nothing: say what the ground does under the box.
+          int hillMax = fellGroundY;
+          for (int z = fellTree.lo.z; z <= fellTree.hi.z; z++)
+            for (int x = fellTree.lo.x; x <= fellTree.hi.x; x++)
+              hillMax = std::max(hillMax, World::TerrainHeight(x, z, kDefaultSeed));
+          std::printf("--fell-tree: ground under the box rises to y%d (trunk foot "
+                      "y%d, crown from y%d)\n", hillMax, fellGroundY + 1,
+                      fellGroundY + 1 + fellTree.height - 6 - fellTree.crownR / 2);
+          std::printf("--fell-tree: planted at (%d,%d,%d) tick %u: %u wood + %u "
+                      "leaves, box (%d,%d,%d)..(%d,%d,%d)\n",
+                      bx, fellGroundY + 1, bz, tick, fellTree.woodCells,
+                      fellTree.leafCells, fellTree.lo.x, fellTree.lo.y,
+                      fellTree.lo.z, fellTree.hi.x, fellTree.hi.y, fellTree.hi.z);
+          std::fflush(stdout);
+        } else if (fellPhase == 1 && tick >= fellPlantTick + 120) {
+          const int fx = fellTree.base.x, fz = fellTree.base.z;
+          const int cutY = fellGroundY + 11;
+          for (int y = cutY; y < cutY + 3; y++)
+            for (int dz = -4; dz <= 4; dz++)
+              for (int dx = -4; dx <= 4; dx++) {
+                const IVec3 cc{fx + dx, y, fz + dz};
+                if (!world.CellInWindow(cc)) continue;
+                if (cellOps.size() < kMaxCellOpsPerTick)
+                  cellOps.push_back({World::SlotCellIndex(cc), 0u});
+              }
+          debris.AddDestructionEvent(tick, {fx - 5, fellGroundY + 10, fz - 5},
+                                     {fx + 5, fellGroundY + 15, fz + 5});
+          debris.SetProfiling(true);
+          debris.ResetProfile();
+          debris.ResetFloaterProbe();
+          fellCutTick = tick;
+          fellFrame0 = g_frameMs.size();
+          fellPhase = 2;
+          std::printf("--fell-tree: cut at tick %u (frame %zu)\n", tick,
+                      fellFrame0);
+          std::fflush(stdout);
+        } else if (fellPhase == 2 && !fellTreeSeen && [&] {
+                     for (uint32_t b = 0; b < debris.BodyCount(); b++)
+                       if (debris.BodyVoxelCount(b) >= 1000u) return true;
+                     return false;
+                   }()) {
+          fellTreeSeen = true;
+          uint32_t big = 0;
+          for (uint32_t b = 0; b < debris.BodyCount(); b++)
+            big = std::max(big, debris.BodyVoxelCount(b));
+          std::printf("--fell-tree: the TREE is a body at tick %u (+%u after the cut), "
+                      "%u vox\n", tick, tick - fellCutTick, big);
+          std::fflush(stdout);
+        } else if (fellPhase == 2 && debris.BodyCount() > 0 && !fellBodySeen) {
+          fellBodySeen = true;
+          std::printf("--fell-tree: first body at tick %u (+%u after the cut), "
+                      "%u vox\n", tick, tick - fellCutTick,
+                      debris.BodyVoxelCount(0));
+          std::fflush(stdout);
+        } else if (fellPhase == 2 && tick >= fellCutTick + 300) {
+          fellPhase = 3;
+          const DebrisSystem::FloaterProbe& fp = debris.Floaters();
+          std::printf("--fell-tree: probe: scans %u, oversize-bbox %u, "
+                      "deferred-oversize %u, defer-gave-up %u (fetch %u), "
+                      "deferred-unfetched %u, fetch-wait no-cache %u no-vox %u, "
+                      "anchored boundary %u unknown %u oversize-flood %u, "
+                      "stuck-dropped %u, queue-full-dropped %u | last give-up: chunk "
+                      "(%d,%d,%d) inWin %u cached %u, seed (%d,%d,%d)..(%d,%d,%d)\n",
+                      fp.scans, fp.oversizeBboxSkipped, fp.deferredOversize,
+                      fp.deferGaveUp, fp.deferGaveUpFetch, fp.deferredUnfetched,
+                      fp.fetchWaitNoCache, fp.fetchWaitNoVoxels,
+                      fp.anchoredByRegionBoundary, fp.anchoredByUnknownChunk,
+                      fp.anchoredByOversizeFlood, fp.stuckEventDropped,
+                      fp.eventQueueFullDropped, fp.gaveUpChunk.x, fp.gaveUpChunk.y,
+                      fp.gaveUpChunk.z, fp.gaveUpChunkInWindow, fp.gaveUpChunkCached,
+                      fp.gaveUpSeedLo.x, fp.gaveUpSeedLo.y, fp.gaveUpSeedLo.z,
+                      fp.gaveUpSeedHi.x, fp.gaveUpSeedHi.y, fp.gaveUpSeedHi.z);
+          uint32_t bodies = debris.BodyCount(), vox = 0;
+          for (uint32_t b = 0; b < bodies; b++) vox += debris.BodyVoxelCount(b);
+          std::vector<double> win(g_frameMs.begin() + (ptrdiff_t)fellFrame0,
+                                  g_frameMs.end());
+          std::sort(win.begin(), win.end());
+          auto pct = [&](double p) {
+            return win.empty() ? 0.0 : win[(size_t)(p * (win.size() - 1))];
+          };
+          size_t over33 = 0;
+          for (double m : win) if (m > 33.0) over33++;
+          std::printf("--fell-tree: FALL over 300 ticks / %zu frames: whole-frame "
+                      "ms p50 %.1f p95 %.1f p99 %.1f max %.1f, >33ms %zu; bodies "
+                      "%u holding %u vox; COST %s\n",
+                      win.size(), pct(0.5), pct(0.95), pct(0.99),
+                      win.empty() ? 0.0 : win.back(), over33, bodies, vox,
+                      debris.ProfileReport().c_str());
+          std::fflush(stdout);
+          if (!std::getenv("SANDVOX_DEBRIS_PROFILE")) debris.SetProfiling(false);
+        }
+      }
       // support-loss flags from the sim (burnt stems, undermined slabs) feed
       // the same island-check pipeline as explosions and brush erases
       debris.QueueSupportEvents(world.Snap());
@@ -7533,117 +7661,6 @@ int main(int argc, char** argv) {
               else
                 hitStop.Request(fx.hitStopChipScale, fx.hitStopChipMs);
               // The impact cue, latched for the same reason and peak-held on
-      // ---- --fell-tree: the tree-fell gate's cut, in the live frame loop ----
-      // Same fixture (selftest::BuildTree), same cut (a 9x9x3 slab of air ten
-      // cells up plus the destruction event the brush would raise), same
-      // 300-tick profile window. What differs is that this loop RENDERS.
-      if (g_fellTree) {
-        static int fellPhase = 0;  // 0 waiting, 1 planted, 2 cut, 3 reported
-        static uint32_t fellPlantTick = 0, fellCutTick = 0;
-        static int fellGroundY = 0;
-        static size_t fellFrame0 = 0;
-        static bool fellBodySeen = false;
-        static selftest::TreeFixture fellTree;
-        auto matByName = [&](const char* n) -> uint32_t {
-          for (size_t i = 0; i < mats.size(); i++)
-            if (mats[i].name == n) return (uint32_t)i;
-          return 0u;
-        };
-        if ((tick % 60u) == 0u)
-          std::printf("--fell-tree: tick %u player (%.1f,%.1f,%.1f) yaw %.2f fly %d\n",
-                      tick, player.pos.x, player.pos.y, player.pos.z, cam.yaw,
-                      player.fly ? 1 : 0);
-        if (fellPhase == 0 && tick >= (uint32_t)g_fellTreeAt) {
-          const Vec3 fwd = cam.Forward();
-          const int bx = ifloor(player.pos.x + fwd.x * 48.0f);
-          const int bz = ifloor(player.pos.z + fwd.z * 48.0f);
-          fellGroundY = World::TerrainHeight(bx, bz, kDefaultSeed);
-          fellTree = selftest::BuildTree(world, {bx, fellGroundY + 1, bz},
-                                         matByName("wood"),
-                                         matByName("leaves"), cellOps);
-          fellPlantTick = tick;
-          fellPhase = 1;
-          // A crown that touches a hillside is anchored, and the cut then
-          // frees nothing: say what the ground does under the box.
-          int hillMax = fellGroundY;
-          for (int z = fellTree.lo.z; z <= fellTree.hi.z; z++)
-            for (int x = fellTree.lo.x; x <= fellTree.hi.x; x++)
-              hillMax = std::max(hillMax, World::TerrainHeight(x, z, kDefaultSeed));
-          std::printf("--fell-tree: ground under the box rises to y%d (trunk foot "
-                      "y%d, crown from y%d)\n", hillMax, fellGroundY + 1,
-                      fellGroundY + 1 + fellTree.height - 6 - fellTree.crownR / 2);
-          std::printf("--fell-tree: planted at (%d,%d,%d) tick %u: %u wood + %u "
-                      "leaves, box (%d,%d,%d)..(%d,%d,%d)\n",
-                      bx, fellGroundY + 1, bz, tick, fellTree.woodCells,
-                      fellTree.leafCells, fellTree.lo.x, fellTree.lo.y,
-                      fellTree.lo.z, fellTree.hi.x, fellTree.hi.y, fellTree.hi.z);
-          std::fflush(stdout);
-        } else if (fellPhase == 1 && tick >= fellPlantTick + 120) {
-          const int fx = fellTree.base.x, fz = fellTree.base.z;
-          const int cutY = fellGroundY + 11;
-          for (int y = cutY; y < cutY + 3; y++)
-            for (int dz = -4; dz <= 4; dz++)
-              for (int dx = -4; dx <= 4; dx++) {
-                const IVec3 cc{fx + dx, y, fz + dz};
-                if (!world.CellInWindow(cc)) continue;
-                if (cellOps.size() < kMaxCellOpsPerTick)
-                  cellOps.push_back({World::SlotCellIndex(cc), 0u});
-              }
-          debris.AddDestructionEvent(tick, {fx - 5, fellGroundY + 10, fz - 5},
-                                     {fx + 5, fellGroundY + 15, fz + 5});
-          debris.SetProfiling(true);
-          debris.ResetProfile();
-          debris.ResetFloaterProbe();
-          fellCutTick = tick;
-          fellFrame0 = g_frameMs.size();
-          fellPhase = 2;
-          std::printf("--fell-tree: cut at tick %u (frame %zu)\n", tick,
-                      fellFrame0);
-          std::fflush(stdout);
-        } else if (fellPhase == 2 && debris.BodyCount() > 0 && !fellBodySeen) {
-          fellBodySeen = true;
-          std::printf("--fell-tree: first body at tick %u (+%u after the cut), "
-                      "%u vox\n", tick, tick - fellCutTick,
-                      debris.BodyVoxelCount(0));
-          std::fflush(stdout);
-        } else if (fellPhase == 2 && tick >= fellCutTick + 300) {
-          fellPhase = 3;
-          const DebrisSystem::FloaterProbe& fp = debris.Floaters();
-          std::printf("--fell-tree: probe: scans %u, oversize-bbox %u, "
-                      "deferred-oversize %u, defer-gave-up %u (fetch %u), "
-                      "deferred-unfetched %u, fetch-wait no-cache %u no-vox %u, "
-                      "anchored boundary %u unknown %u oversize-flood %u, "
-                      "stuck-dropped %u, queue-full-dropped %u | last give-up: chunk "
-                      "(%d,%d,%d) inWin %u cached %u, seed (%d,%d,%d)..(%d,%d,%d)\n",
-                      fp.scans, fp.oversizeBboxSkipped, fp.deferredOversize,
-                      fp.deferGaveUp, fp.deferGaveUpFetch, fp.deferredUnfetched,
-                      fp.fetchWaitNoCache, fp.fetchWaitNoVoxels,
-                      fp.anchoredByRegionBoundary, fp.anchoredByUnknownChunk,
-                      fp.anchoredByOversizeFlood, fp.stuckEventDropped,
-                      fp.eventQueueFullDropped, fp.gaveUpChunk.x, fp.gaveUpChunk.y,
-                      fp.gaveUpChunk.z, fp.gaveUpChunkInWindow, fp.gaveUpChunkCached,
-                      fp.gaveUpSeedLo.x, fp.gaveUpSeedLo.y, fp.gaveUpSeedLo.z,
-                      fp.gaveUpSeedHi.x, fp.gaveUpSeedHi.y, fp.gaveUpSeedHi.z);
-          uint32_t bodies = debris.BodyCount(), vox = 0;
-          for (uint32_t b = 0; b < bodies; b++) vox += debris.BodyVoxelCount(b);
-          std::vector<double> win(g_frameMs.begin() + (ptrdiff_t)fellFrame0,
-                                  g_frameMs.end());
-          std::sort(win.begin(), win.end());
-          auto pct = [&](double p) {
-            return win.empty() ? 0.0 : win[(size_t)(p * (win.size() - 1))];
-          };
-          size_t over33 = 0;
-          for (double m : win) if (m > 33.0) over33++;
-          std::printf("--fell-tree: FALL over 300 ticks / %zu frames: whole-frame "
-                      "ms p50 %.1f p95 %.1f p99 %.1f max %.1f, >33ms %zu; bodies "
-                      "%u holding %u vox; COST %s\n",
-                      win.size(), pct(0.5), pct(0.95), pct(0.99),
-                      win.empty() ? 0.0 : win.back(), over33, bodies, vox,
-                      debris.ProfileReport().c_str());
-          std::fflush(stdout);
-          if (!std::getenv("SANDVOX_DEBRIS_PROFILE")) debris.SetProfiling(false);
-        }
-      }
               // power so one frame carrying four tick-hits plays the hardest
               // of them once rather than four overlapping copies of nearly the
               // same sound.
