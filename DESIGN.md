@@ -3005,6 +3005,140 @@ neighbors, so this needs an explicit connectivity pass:
   tick), ticks over 8 ms 22 → 1, gathers 26,232 → 7,176, worst-tick fetch
   requests 454 → 24. The remaining 30 ms spike is the birth tick's flood plus
   28k exact-cell ops, which is one frame and is what that work costs.
+- **THE GATE SAID TREES FALL; THE GAME SAID THEY DID NOT. BOTH WERE RIGHT
+  (2026-09-12).** The debris gates run `runTick(ops, fetch=true)`, which
+  requests every chunk of the fixture box every tick, so their floods never
+  wait on a readback. The live flood does: an event deferred because the flood
+  reached an unfetched chunk kept its SEED box cached (only the crown was
+  missing), so PreTick's drain loop found it ready again in the SAME tick and
+  ran it again — all 32 `fetchRetries` in two ticks, long before the
+  one-tick-latent readback could land. Every scan that left the 3×3×3 player
+  mirror gave up on the spot: 99 scans, 3 give-ups, 0 bodies, 165k cells read
+  from unfetched chunks, for an oak cut 48 voxels from the player. Now
+  `Event::waiting`/`waitChunk` record the first chunk the flood stopped at and
+  `EventReady` holds the event until that chunk's copy has landed (a chunk that
+  streamed out is not waited for; `SANDVOX_NO_FETCH_WAIT=1` is the old arm).
+  The same tree is a body 15-22 ticks after the cut, in rounds of
+  `kIslandFetchPerScan` chunks. What made it findable in one run instead of a
+  bisect: `SANDVOX_ISLAND_TRACE=1` prints one line per scan — seed, retries,
+  components, the largest one's box and the cell that ANCHORED it, the chunk
+  it waits for and whether that chunk is cached — and the first live attempt
+  needed exactly that: planted at the SPAWN site the flood walked 54 voxels
+  west and 40 down through a neighbour's crown to the ground and correctly
+  refused, which `anchorAt` named and a counter never could. Fixtures for the
+  live path go on the map's `harness` pad (no trees by construction).
+- **The render half of the handoff has a number now (2026-09-12).** The gate is
+  headless, so `--fell-tree <tick> [x,z]` (main.cpp) plants
+  `selftest::BuildTree`'s oak ahead of the player under `--frames`, cuts it 120
+  ticks later exactly as the gate does, and prints the gate's COST line plus
+  whole-frame percentiles over the 300 ticks of the fall; the `--frames`
+  summary's `drawBodies` / `terrainMesh` / `physics` rows are the rest.
+  Measured on one 28.4k-voxel oak: `buildInstances` ran ONCE (0.4 ms — the
+  instance list is body-local, so "28k cubes rebuilt while it moves" is
+  retired); `drawBodies` is a STANDING 1.0 ms mean / 3.9 p99 / 5.1 ms max GPU
+  per frame for the resting body (`fsBody`'s per-fragment shadow ray and/or
+  the interior cubes nobody can see); and the live flood cost 4-6× the gate's
+  because THREE events (the cut's CPU event and the two GPU support flags it
+  raised) re-flood the same tree on every fetch round, ~10 rounds of 32
+  chunks, at 1-2.5 µs a cell through a hash-keyed visited map: islandScan
+  428-702 ms over ~32 scans, worst tick 77-204 ms. Those are the next
+  packages' numbers, and the harness is how they are read back.
+- **The compound build was the merge, not Jolt (2026-09-12).** With
+  `SANDVOX_PHYS_PROFILE=1` splitting `CreateDebrisBodyXf` per body, the oak's
+  8.6 ms was 8.3 ms of greedy box merge through two `unordered_map`s (the
+  probe lambda inserted a default `used` entry per lookup) and 0.3 ms of
+  `StaticCompoundShape::Create`. The merge now walks a dense byte lattice over
+  the body's bounding box — a body is an int8 lattice, the oak is 51×90×51 =
+  232 KB — in the same order, so the box set, collider and resting pose are
+  unchanged (fuzzed against a port of the old walk, and the debris /
+  settle-back / audio-impact / body-fastfall detail lines are byte-identical):
+  **10.4 ms → 0.5 ms** on the birth tick. Still open: the 1,024-box cap covers
+  only 5,474 of the oak's 28,478 voxels (19%) in flood order, so a canopy's
+  collider is whichever fifth the island scan reached first; raising the cap
+  moves resting positions and is its own gate-measured change.
+- **The body draw was overdraw × a shadow ray (2026-09-12).** Under
+  `--fell-tree`, `BuildInstances` ran twice for the whole fall (0.3 ms), and
+  the draw cost 1.14 ms a frame while the oak was a body: every voxel was an
+  instance, every fragment cast `fsBody`'s sun ray. Now `BuildInstances`
+  emits only voxels with an exposed face (28,400 → 24,027 for the oak;
+  `SANDVOX_BODY_DRAW_ALL=1` restores the full list), `vsBody` collapses the
+  faces the camera cannot see before they are rasterised, `fsBody` casts no
+  ray where the lambert it would multiply is zero, and `Simulation::DrawBodies`
+  draws a depth pre-pass (`vsBodyDepth`/`fsBodyDepth`) first so the ray runs
+  once per pixel: **1.14 → 0.52 ms** a frame, pixel-identical (the debris
+  gate frame differs by ≤5/255, TAA noise; `body-shade` still 0.434 in
+  shadow). Removing 15% of instances cut 48% of the time, which is what
+  "per overdrawn fragment" means. `BODY_SHADOW_RAY` / `BODY_VIEW_CULL` /
+  `BODY_SUN_SKIP` at the top of `debris.wgsl` are the one-binary arms. Bodies
+  still cannot use the shadow cache: its patches are grid cells, and a moving
+  body would re-register every frame. The floor without a look change is one
+  ray per covered light-facing pixel (0.52 mean / 1.6 p99).
+- **...and what it asks for is its MATTER (2026-09-12).** The rotated AABB was
+  the fix for a bounding sphere, but the AABB of a tumbling 81-voxel trunk
+  with a crown at one end is mostly empty: in the live harness one oak sat AT
+  `kTerrainNeedCeiling` (505 of 512 chunks a tick) for as long as it turned.
+  `Body::needBlocks` dices the lattice box into 8³ blocks with one bit each
+  (cached with `lmin/lmax`), and `ManageTerrain` transforms only the set
+  blocks — centre through the body basis, extent the rotated cube's per-axis
+  half-width, plus the skirt — into a dense per-body chunk grid of least
+  distance to any block box, so a chunk holding matter is still at 0 and the
+  nearest-first budgets are unchanged (`SANDVOX_TERRAIN_NEED_AABB=1` is the
+  old arm). Live: 96,056 → 47,439 chunk visits over the fall (max 512 → 185 a
+  tick), Jolt meshes 251 → 68; the wall-clock win is modest (~110 ms either
+  way) because the AABB list was already cheap per entry, and `terrainNeed`
+  itself rose 6 → 17 ms for the 192 block transforms a tick. A creature's
+  planning horizon (`navRadius + 4`) is handed over apart from its body
+  radius (`AddTerrainAnchor`'s `horizonVoxels`) and listed on one tick in
+  `kTerrainHorizonStride` (4), hash-phased, the body itself every tick
+  (`SANDVOX_TERRAIN_HORIZON_STRIDE=1` is the old arm; unmeasured live, no
+  targeting mob in the harness — the COST line's `anchor chunks` is its
+  denominator). And the shared chunk-fetch FIFO is finally visible:
+  `World::FetchSource` tags every request (IslandScan / Terrain / Mob / Settle
+  / Other — the player's 3×3×3 mirror rides every slot unconditionally and
+  never queues), `World::FetchProbe` counts per source (accepted / coalesced /
+  refused non-resident / carried / dropped streamed-out, age in ticks to the
+  carrying slot, queue depth, full drains, backlog), and `FetchReport()` is
+  one line in `--frames` and on the FALL line. Measured: the collider sweep
+  starves nobody (age 1.00, max 1, 0 full drains during a fall); standing
+  still, the island scans are the queue's only real customer (~19 a tick, 35
+  full drains, backlog to 34). Any tuning of `kFetchPerTick` or a consumer cap
+  is justified by that line or not at all.
+- **One flood per tree per round, and two or three rounds (2026-09-12).** The
+  island flood's visited map is a dense int32 page per chunk it touches
+  (`labelPages_`, allocated on first touch, recycled, capped at
+  `kMaxLabelPages` past which a component is anchored as oversize), shared by
+  every scan of one tick and cleared once in PreTick (`BeginTickLabels`): the
+  three events a cut raises (the brush's event plus a GPU support flag per
+  chunk it touched) cost ONE flood, because a seed an earlier scan labelled
+  inherits that component's verdict (`tickComps_`: anchored / waiting on chunk
+  W / held / made) and a flood that runs into such a component adopts it.
+  Nothing is requested during the flood any more; the chunks a component could
+  not read are requested after the verdicts, only for components a fetch could
+  still change, with the face ring, the column to the drop floor and the
+  26-ring speculated under one cap (`kIslandFetchPerScan` =
+  `World::kFetchPerTick`, counted per chunk — the old cap charged every
+  re-entry, so a scan's real reach was a handful of chunks), so a crown lands
+  in two or three rounds instead of ten. The one exception is the dive
+  frontier under the seed, requested whatever the verdict: the verdict is
+  monotone but the cost is not, and a terrain flood that cannot dive 48 cells
+  spreads 200k sideways (11.7 M cells over one burn without it). The shard
+  dice and the weld pass read neighbours through the same pages (`index`)
+  instead of two more hash maps, so a 28k-voxel oak is one 18 ms scan at
+  0.65 µs a cell. Live, the same cut: islandScan 428-702 ms over ~32 scans →
+  **61 ms over 5**, worst tick 73-204 → 32 ms, debris CPU over the fall
+  611-1097 → 166 ms, the tree a body at +6 ticks (was +15..22); gate cut
+  pass 259 → 173 ms with the worst tick 48 → 19.5 ms; the burn pass (the
+  forest-fire proxy) visits 1.28 M cells instead of 2.43 M. Still open: the
+  first support flag under a cut floods the terrain slab once (60k cells,
+  the drop anchor needs the column below to land), and the burn pass's one
+  stray leaf voxel is INTERMITTENT and not the wait's doing — the burn pass
+  is not run-to-run reproducible on one binary (5.0 M vs 11.7 M cells
+  visited; the traces diverge the tick the first burning bodies appear,
+  because the terrain-collider budget is wall-clock and feeds Jolt), the
+  survivors sit at ground+2 outside the gate's own forced-rescan tiling
+  (which starts at `treeA.lo` while the sweep box reaches 2 cells beyond),
+  and `SANDVOX_ISLAND_WATCH=x,y,z` / `ovHid`/`ovShow` are in place for the
+  next failing run.
 - Sleeping: settled bodies deactivate entirely until another body or force
   intersects their AABB (Jolt does this natively).
 - **NOTHING PASSES THROUGH THE GROUND (2026-09-12):** a collision patch is a
