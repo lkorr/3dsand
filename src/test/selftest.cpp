@@ -352,6 +352,12 @@ const char* const kOrder[] = {
     // on contact and water rinses it (owner report 2026-09-13). Ticks the
     // world for the last two and regenerates it on the way out.
     "body-stain",
+    // ...and what landed there is a SUBSTANCE, not a colour: the per-limb coat
+    // ledger names the material, it dries at that material's own authored rate
+    // (and does not at the default one), and a coat can be tracked back onto
+    // the ground through the ordinary particle path. Same room fixture as
+    // body-stain, same world regeneration on the way out.
+    "body-coat",
     // ...and a blast bloodies the HOLE IT MADE and nothing else: a limb the
     // crater took no voxel from stays clean, and the limb it did hit gets a
     // chip's worth of blood rather than a repainted surface (owner report

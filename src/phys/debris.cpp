@@ -3521,7 +3521,11 @@ bool DebrisSystem::DamageBody(size_t bi, World& world,
         centroid += Vec3{(float)v.x + 0.5f, (float)v.y + 0.5f, (float)v.z + 0.5f};
       centroid = centroid * (sk / (ps * (float)removed.size()));
       CutSoak soak;
-      soak.type = stainType;
+      // The coat names the SUBSTANCE, not its palette slot: a corpse's cut is
+      // smeared with whatever that body bled. `stainType` above is still what
+      // decides the cut smears at all -- a bleed material with no stain block
+      // has nothing to draw.
+      soak.mat = b.bleedMat;
       soak.radius = gt.stainCutRadius * sk;
       soak.amountExposed = gt.stainCutAmount;
       soak.amountBuried = gt.stainCutBuried;

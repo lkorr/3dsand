@@ -31,6 +31,21 @@ inline uint16_t MicroVox(uint8_t mat, uint8_t color) {
   return (uint16_t)mat | ((uint16_t)color << 8);
 }
 
+// THE ONE NARROWING. A body coat word names a material (voxload.h); the stain
+// lattice the shader reads holds `slot << 4 | amt`. A material the set has no
+// slot for yields 0 -- clean -- rather than an arbitrary slot, because the
+// slots are a shared visual vocabulary and picking the wrong one paints a
+// creature the colour of somebody else's substance.
+inline uint8_t StainByteOf(const MicroBodySet& set, uint16_t coat) {
+  const uint32_t amt = BodyStainAmt(coat);
+  if (amt == 0) return 0;
+  const uint32_t mat = BodyStainMat(coat);
+  if (mat >= set.stainSlotOfMat.size()) return 0;
+  const uint32_t slot = set.stainSlotOfMat[mat] & 7u;
+  if (slot == 0) return 0;
+  return (uint8_t)((slot << 4) | (amt & 0xFu));
+}
+
 // Take `words` from the free list if an exact-size block is waiting, else bump
 // the pool's high-water mark. Returns UINT32_MAX when the ceiling is hit.
 //
@@ -93,8 +108,10 @@ void WriteBrick(MicroBodySet& set, uint32_t base, IVec3 dims,
     size_t idx = ((size_t)z * dims.y + y) * dims.x + x;
     set.pool[base + idx / 2] |=
         (uint32_t)MicroVox((uint8_t)mat, v.color) << ((idx % 2) * 16);
-    if (withStain && v.stain)
-      set.pool[sbase + idx / 4] |= (uint32_t)v.stain << ((idx % 4) * 8);
+    if (withStain) {
+      const uint8_t sb = StainByteOf(set, v.stain);
+      if (sb) set.pool[sbase + idx / 4] |= (uint32_t)sb << ((idx % 4) * 8);
+    }
   }
   set.MarkPool(base, base + (uint32_t)total);
 }
@@ -123,6 +140,10 @@ void MicroBodySet::MarkPool(uint32_t lo, uint32_t hi) {
     return;
   }
   dirtyRanges.push_back({lo, hi});
+}
+
+void MicroBodySetStainSlots(MicroBodySet& set, std::vector<uint8_t> slotOfMat) {
+  set.stainSlotOfMat = std::move(slotOfMat);
 }
 
 void MicroBodySet::ClearDirty() {
@@ -283,9 +304,12 @@ int MicroBodyPack(MicroBodySet& set, const std::vector<PrefabVoxel>& voxels,
   // a corpse reloaded -- keeps its stain: the block grows the lattice and the
   // dims word says so. A def's shared model never has one (nothing authored
   // is stained), which is what keeps the load-time pool cost unchanged.
+  // Asked of the NARROWED byte, not of the coat word: a coat of something the
+  // renderer has no palette slot for would otherwise buy the block a lattice
+  // of zeroes.
   bool withStain = false;
   for (const PrefabVoxel& v : voxels)
-    if (v.stain) { withStain = true; break; }
+    if (StainByteOf(set, v.stain)) { withStain = true; break; }
   const size_t words =
       WordsFor(cellCount) + (withStain ? StainWordsFor(cellCount) : 0);
   if (set.pool.size() + words > kMicroBodyPoolWordsWorld) {
@@ -311,7 +335,9 @@ int MicroBodyPack(MicroBodySet& set, const std::vector<PrefabVoxel>& voxels,
     }
     cells[((size_t)v.z * dims.y + v.y) * dims.x + v.x] =
         MicroVox((uint8_t)mat, v.color);
-    if (withStain) stains[((size_t)v.z * dims.y + v.y) * dims.x + v.x] = v.stain;
+    if (withStain)
+      stains[((size_t)v.z * dims.y + v.y) * dims.x + v.x] =
+          StainByteOf(set, v.stain);
   }
 
   const uint32_t base = (uint32_t)set.pool.size();
@@ -474,7 +500,7 @@ bool MicroBodyPoke(MicroBodySet& set, uint32_t model, int x, int y, int z,
 }
 
 bool MicroBodyPokeStain(MicroBodySet& set, uint32_t model, int x, int y, int z,
-                        uint8_t stain) {
+                        uint16_t coat) {
   if (model >= set.models.size()) return false;
   if (model >= set.owned.size() || !set.owned[model]) return false;  // shared
   MicroBodyModelGpu& m = set.models[model];
@@ -506,7 +532,7 @@ bool MicroBodyPokeStain(MicroBodySet& set, uint32_t model, int x, int y, int z,
   const uint32_t shift = (uint32_t)(idx % 4) * 8u;
   uint32_t word = set.pool[w];
   word &= ~(0xFFu << shift);
-  word |= (uint32_t)stain << shift;
+  word |= (uint32_t)StainByteOf(set, coat) << shift;
   if (word == set.pool[w]) return true;
   set.pool[w] = word;
   set.MarkPool(w, w + 1);

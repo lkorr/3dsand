@@ -902,6 +902,22 @@ const TUNING_SCHEMA = [
   },
 
   {
+    id: 'coat',
+    title: 'Coats',
+    icon: '\u{1FAE7}',
+    apply: 'cpu',
+    blurb: 'A SUBSTANCE ON A BODY, as opposed to a stain in the ground. Every voxel of a creature carries a coat &mdash; WHICH material is on it and how much, 0 to 15 &mdash; so blood, water and anything else authored to stain can be worn rather than merely drawn. The per-SUBSTANCE half of this lives in materials.json under each material\'s "coat" block: how many seconds a level of it takes to dry off a body (blood 20, water 4), the per-mille chance a coated foot tracks it onto the ground, and free-form effect tags for whoever cares. The rows here are the ENGINE\'s side of the same machinery &mdash; how often the per-limb ledger is retaken, one global dial over every authored dry time, and the budgets that keep tracking bounded. Nothing here reaches a shader or the sim: a coat is CPU state and can never move the world hash.',
+    params: [
+      {k:'recountTicks', n:'ledger cadence', sec:{t:'Coats · a substance on a body', d:'What is on a creature is asked per LIMB and per BODY, and answering that means walking the limb\'s lattice &mdash; 25,000 voxels for a torso. So it is walked once at this cadence and only when something actually changed a coat since the last walk. A clean or settled body pays nothing whatever these say.'}, d:'Ticks between recounts of the per-limb coat ledger. 30 ticks = 1 second. Only ever paid by a body something is actively coating or drying; raise it if a crowd is being drenched, lower it for a more responsive readout.', min:1, max:240, step:1, int:true, u:'ticks'},
+      {k:'decayScale', n:'drying speed', d:'Global multiplier on how fast every coat dries. It DIVIDES the seconds-per-level each material authors (materials.json coat.decay), so 2 dries everything twice as fast and 0.1 makes it ten times as persistent. Materials authored with decay 0 &mdash; blood is not one of them &mdash; never dry at all and are unaffected. Washing is a separate, subtractive rule and this does not touch it.', min:0.01, max:300, step:0.05},
+      {k:'shedCells', n:'footprint size', sec:{t:'Coats · tracking it onto the ground', d:'A bloodied foot leaves prints. Each footfall rolls the material\'s authored per-mille shed chance, and a success deposits a droplet of the substance into the ground cell under the foot, which stains it through the ordinary particle path &mdash; so a print is a real stain that dries and washes like any other. The foot loses what left it.'}, d:'Ground cells one footfall may deposit onto. A footprint is a patch, not a point.', min:0, max:32, step:1, int:true, u:'cells'},
+      {k:'shedPerTick', n:'deposits / tick', d:'Cap on deposits from ALL creatures together in one tick. The bound on how much tracking a crowd can push into the world; a foot refused here simply leaves no print that tick.', min:0, max:1024, step:8, int:true},
+      {k:'shedAmount', n:'coat lost per print', d:'How much coat one deposit takes off the foot, in the same 0..15 scale everything else uses. This is what makes a bloodied boot walk itself clean over a few strides instead of printing forever.', min:0, max:15, step:1},
+      {k:'hudMinFrac', n:'HUD threshold', d:'Coated fraction below which the character screen says nothing about a body part. A single splashed voxel is not "covered in blood".', min:0, max:1, step:0.01},
+    ],
+  },
+
+  {
     id: 'melee',
     title: 'Melee',
     icon: '\u{1F5E1}',

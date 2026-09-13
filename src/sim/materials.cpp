@@ -168,6 +168,47 @@ static void ParseStain(const json& m, const std::string& path,
                     ((uint32_t)consume << kStainPackConsumeShift);
 }
 
+// Parses "coat": { decay, shed, effects } — what this substance does while it
+// is ON A BODY, as opposed to what it does to the ground (that is "stain").
+// Absent = it sits there until something washes it off, which is every
+// material that predates the feature.
+//
+// REQUIRES a "stain" block, and says so rather than defaulting: the coat and
+// the stain are two readings of one substance (the coat word carries the
+// material id, the stain block is how that material is DRAWN), so a coat with
+// no stain is invisible on a body and a load-time error is the only way the
+// author finds out. Must therefore be parsed AFTER ParseStain.
+static void ParseCoat(const json& m, const std::string& path, MaterialDef& d,
+                      std::string& errors) {
+  if (!m.contains("coat")) return;
+  const json& co = m["coat"];
+  if (!co.is_object()) {
+    errors += path + ": material \"" + d.name + "\": \"coat\" must be an object\n";
+    return;
+  }
+  if (d.stain.empty()) {
+    errors += path + ": material \"" + d.name +
+              "\": coat requires stain (a coat is drawn through the stain "
+              "palette; author a \"stain\" block first)\n";
+    return;
+  }
+  float decay = co.value("decay", 0.0f);
+  int shed = co.value("shed", 0);
+  if (decay < 0.0f) {
+    errors += path + ": material \"" + d.name +
+              "\": coat decay must be >= 0 seconds per level (0 = never)\n";
+    decay = 0.0f;
+  }
+  if (shed < 0 || shed > (int)kStainChanceMax) {
+    errors += path + ": material \"" + d.name +
+              "\": coat shed must be 0..1000 per-mille\n";
+    shed = 0;
+  }
+  d.coatDecay = decay;
+  d.coatShed = (uint32_t)shed;
+  d.coatEffects = co.value("effects", std::vector<std::string>{});
+}
+
 // Parses "absorb": { capacity } into the top nibble of stainPack. Authored on
 // the SUBSTRATE (grass, sand, dirt) rather than on the liquid — see the absorb
 // note in materials.h for why the ceiling and the per-contact step are separate
@@ -417,6 +458,7 @@ static bool LoadMaterialsJson(const std::string& path, std::vector<MaterialDef>&
         if (name.is_string() && !name.get<std::string>().empty())
           d.sounds[slot] = name.get<std::string>();
     ParseStain(m, path, stainReg, d, errors);
+    ParseCoat(m, path, d, errors);  // after ParseStain: it checks d.stain
     ParseAbsorb(m, path, d, errors);
     d.tags = m.value("tags", std::vector<std::string>{});
     for (auto& t : d.tags) {

@@ -923,6 +923,43 @@ bool LoadTuning(const std::string& path, Tuning& out) {
     }
   }
 
+  // ---- coats: a substance on a body (Tuning::Coat) --------------------------
+  // CPU-only, like `gore` above. The per-SUBSTANCE half of this feature is in
+  // materials.json ("coat": { decay, shed, effects }); these are the engine's
+  // cadences and budgets over it.
+  if (const json* g = Find(j, "coat")) {
+    auto& e = out.coat;
+    const std::string at = "coat";
+    ReadI(*g, "recountTicks", e.recountTicks, out, at);
+    ReadF(*g, "decayScale", e.decayScale, out, at);
+    ReadI(*g, "shedCells", e.shedCells, out, at);
+    ReadI(*g, "shedPerTick", e.shedPerTick, out, at);
+    ReadI(*g, "shedAmount", e.shedAmount, out, at);
+    ReadF(*g, "hudMinFrac", e.hudMinFrac, out, at);
+    // A recount period of 0 would retake the ledger every tick a body is
+    // dirty, which is one full lattice pass per creature per tick — the rule 2
+    // trap this cadence exists to close.
+    if (e.recountTicks < 1) {
+      out.warnings.push_back(at + ".recountTicks < 1; clamped to 1");
+      e.recountTicks = 1;
+    }
+    e.recountTicks = std::min(e.recountTicks, 240);
+    // decayScale DIVIDES the authored seconds, so 0 is a division by zero
+    // dressed up as "nothing ever dries" — say that with a small number.
+    if (e.decayScale < 0.01f) {
+      out.warnings.push_back(at + ".decayScale <= 0; clamped to 0.01");
+      e.decayScale = 0.01f;
+    }
+    // 300 is not arbitrary: it is what turns blood's authored 20 s per level
+    // into a two-tick period, which is the `body-coat` gate's fast arm and the
+    // fastest anything here is meant to be dialled.
+    e.decayScale = std::min(e.decayScale, 300.0f);
+    e.shedCells = std::clamp(e.shedCells, 0, 32);
+    e.shedPerTick = std::clamp(e.shedPerTick, 0, 1024);
+    e.shedAmount = std::clamp(e.shedAmount, 0, 15);
+    e.hudMinFrac = std::clamp(e.hudMinFrac, 0.0f, 1.0f);
+  }
+
   // ---- melee: the stroke driver's feel (game/melee.h MeleeTuning) -----------
   // Read straight into Tuning::Melee; game/melee.cpp ApplyMeleeTuning is what
   // turns this into a MeleeTuning (and what does the metres -> world voxel

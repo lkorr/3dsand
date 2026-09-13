@@ -58,12 +58,14 @@ struct DebrisVoxel {
   int8_t x, y, z;
   uint8_t color = 0;
   uint16_t payload;  // material | state<<12
-  // Body stain byte, same encoding as PrefabVoxel::stain (sim/voxload.h
-  // BodyStain*): amount in the low nibble, stain type above it. The one field
-  // that grew the struct (6 -> 8 bytes with alignment), and it is here rather
-  // than folded into `payload`'s state nibble because that nibble is what a
-  // carved voxel takes into the grid as a liquid's fullness.
-  uint8_t stain = 0;
+  // Body coat word, same encoding as PrefabVoxel::stain (sim/voxload.h
+  // BodyStain*): the MATERIAL on this voxel in bits 0..11, how much of it in
+  // bits 12..15. The one field that grew the struct (6 -> 8 bytes with
+  // alignment; widening it from a byte to the coat word costs nothing, since
+  // the byte was followed by a byte of padding), and it is here rather than
+  // folded into `payload`'s state nibble because that nibble is what a carved
+  // voxel takes into the grid as a liquid's fullness.
+  uint16_t stain = 0;
 };
 
 // One sub-shape of a compound collider, in body-local VOXEL coordinates.

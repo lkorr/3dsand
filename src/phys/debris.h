@@ -667,7 +667,12 @@ class DebrisSystem {
   // NOT serialized: it is derived render state, re-packed on load from the
   // authoritative lattice the same way ReskinMicro derives it after a carve
   // (CLAUDE.md architecture guideline 3: derived data is reconstructible).
-  static constexpr uint32_t kSaveVersion = 1;
+  //
+  // 2 (2026-09-13): DebrisVoxel::stain went from a byte holding a palette slot
+  // to the 16-bit coat word holding a MATERIAL. The lattices are written as
+  // PODs, so the stride moved and a version-1 section would load garbage
+  // coordinates — old sections are refused, as they already are.
+  static constexpr uint32_t kSaveVersion = 2;
   void SaveState(std::vector<uint8_t>& out) const;
   // Contract (worldio LoadEntities): Reset() has already run.
   bool LoadState(const uint8_t* data, size_t len, uint32_t version);

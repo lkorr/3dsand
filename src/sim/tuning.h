@@ -1090,6 +1090,43 @@ struct Tuning {
     float burnDeathFraction = 0.70f;
   } gore;
 
+  // ---- coats: a substance ON a body, as opposed to in the ground -------------
+  //
+  // A body voxel carries a COAT — a material and how much of it (sim/voxload.h
+  // PrefabVoxel::stain) — and materials.json says per substance how fast it
+  // dries off and whether a foot tracks it (MaterialDef::coatDecay/coatShed).
+  // These are the ENGINE-side numbers that govern the same machinery: how
+  // often the per-limb ledger is retaken, how the authored dry times are
+  // scaled globally, and the budgets that keep tracking bounded (rule 2).
+  //
+  // CPU-ONLY, like `gore` and `melee` above: no tuning_params.def row, no WGSL
+  // constant. A coat never reaches the sim.
+  struct Coat {
+    // Ticks between recounts of the per-limb coat ledger (game/mob.h
+    // LimbCoat). Only ever taken when something changed a coat byte since the
+    // last one, so this bounds the cost of a body that is ACTIVELY being
+    // bloodied — a clean or settled one pays nothing whatever this says.
+    int recountTicks = 8;
+    // Global multiplier on how fast every authored coat dries: the material's
+    // `coat.decay` seconds per amount level are DIVIDED by this, so 2 dries
+    // everything twice as fast and small values make blood permanent. A dial
+    // on the whole look rather than a per-material edit.
+    float decayScale = 1.0f;
+    // Ground cells one footfall may track a coat onto. A footprint is a patch,
+    // not a point, and this is how big the patch may get.
+    int shedCells = 3;
+    // Deposits every creature together may make in one tick. The bound on how
+    // much tracking a crowd can push into the world; a foot refused here
+    // simply leaves no print that tick.
+    int shedPerTick = 64;
+    // Amount of coat one deposit takes off the foot, in the 0..15 scale — how
+    // fast a bloodied boot walks itself clean.
+    int shedAmount = 2;
+    // Below this coated fraction of a body part, the HUD says nothing about
+    // it: a single splashed voxel is not "covered in blood".
+    float hudMinFrac = 0.02f;
+  } coat;
+
   // ---- melee: the stroke driver's feel ---------------------------------------
   //
   // THE VALUES BEHIND MeleeTuning (game/melee.h), AND NOTHING ELSE. That struct

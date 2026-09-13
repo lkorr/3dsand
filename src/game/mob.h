@@ -561,13 +561,44 @@ struct BurnLimbView {
       (*coll)[i].color = 0;
     }
   }
-  // The body stain byte (voxload.h BodyStain*), read and written on the same
-  // authoritative lattice the burn does.
-  uint8_t Stain(size_t i) const {
+  // The body COAT word (voxload.h BodyStain*: material + amount), read and
+  // written on the same authoritative lattice the burn does.
+  uint16_t Stain(size_t i) const {
     return skin ? (*skin)[i].stain : (*coll)[i].stain;
   }
-  void SetStain(size_t i, uint8_t st) const {
+  void SetStain(size_t i, uint16_t st) const {
     if (skin) (*skin)[i].stain = st; else (*coll)[i].stain = st;
+  }
+};
+
+// ---- WHAT IS ON A BODY, AS A LEDGER -----------------------------------------
+//
+// The coat word is per VOXEL, and every question anyone actually asks about it
+// is per LIMB or per BODY: is this creature covered in blood, is it soaked,
+// how much of it is wet. Walking a 25k-voxel torso to answer that is a pass
+// per question per tick, so it is walked ONCE at a bounded cadence
+// (Mob::RecountCoat, tune.coat.recountTicks) and only when something actually
+// changed a coat byte since the last walk. A clean body pays nothing (rule 2).
+//
+// The two HEAVIEST materials are kept and the rest is folded into the totals.
+// Two rather than all of them because the ledger rides on every limb of every
+// creature and a map per limb is not worth the allocation: a body is realistically
+// bloody, or wet, or bloody and wet. Anything reading a specific substance off
+// this reads it off `top`; anything reading "how coated is this" reads Frac().
+struct CoatEntry {
+  uint32_t mat = 0;      // the substance (a material id, not a palette slot)
+  uint32_t sumAmt = 0;   // total amount of it over the limb, 0..15 per voxel
+  uint32_t voxels = 0;   // voxels carrying it
+};
+
+struct LimbCoat {
+  uint32_t voxels = 0;   // occupied lattice voxels — the denominator
+  uint32_t stained = 0;  // of those, how many carry any coat at all
+  uint32_t sumAmt = 0;   // total amount over EVERY material, `top` or not
+  CoatEntry top[2]{};    // the two heaviest, by sumAmt, descending
+  // 0 = clean, 1 = every voxel saturated with something.
+  float Frac() const {
+    return voxels ? (float)sumAmt / (float)(kBodyStainAmtMax * voxels) : 0.0f;
   }
 };
 
@@ -591,7 +622,9 @@ struct SplatterEvent {
   float speed = 0.0f;   // nominal launch speed, world voxels per SECOND
   int life = 0;         // ticks a droplet flies for (gore.microLifeTicks)
   int count = 0;        // droplets this tick
-  uint32_t type = 0;    // stain palette slot of the blood
+  // The MATERIAL being thrown (the bleeder's blood), not its palette slot: a
+  // landed droplet writes a coat word, and a coat names a substance.
+  uint32_t mat = 0;
   uint32_t amount = 0;  // amount per landed droplet
   uint64_t sourceMob = 0;  // the bleeder; its own bleeding limb is skipped
   int sourceLimb = -1;
@@ -735,6 +768,10 @@ struct MobLimb {
   uint32_t surfaceAtSpawn = 0;
   // Per-voxel burning / dissolution (see BodyBurnState above).
   BodyBurnState burn;
+  // What is ON this limb, recounted at a bounded cadence (see LimbCoat).
+  // Index-parallel by construction because it rides the limb itself, which is
+  // what RemoveAppendedSlots moves wholesale.
+  LimbCoat coat;
 };
 
 // ---- ONE BLADE HIT, AS GEOMETRY --------------------------------------------
@@ -1652,6 +1689,28 @@ class Mob {
   // ApplyBurnCap. `force` ignores the cadence (a sever or a gate wants the
   // answer now).
   void RecountBurn(uint32_t tick, bool force = false);
+
+  // ---- the coat ledger (see LimbCoat) --------------------------------------
+  // A coat byte changed since the ledger was taken. Set by every writer —
+  // contact, splatter, the cut soak, decay, a deposit — and consumed by
+  // RecountCoat at tune.coat.recountTicks. Exactly the burnFracDirty_ pattern
+  // and for exactly its reason: a body nothing is happening to costs nothing.
+  bool coatDirty_ = false;
+  uint32_t coatRecountTick_ = 0;
+  bool coatCounted_ = false;   // has the ledger ever been computed?
+  LimbCoat bodyCoat_;          // over the BASE limbs only (no worn, no held)
+  // One pass over every live limb's authoritative lattice -> MobLimb::coat and
+  // bodyCoat_. Called at the tail of StainTick, exactly as RecountBurn is
+  // called at the tail of BurnTick. `force` ignores the cadence.
+  void RecountCoat(uint32_t tick, bool force = false);
+  // Track one footfall's worth of a coat onto the ground: ONE micro droplet of
+  // `mat`, born inside `groundCell`, which the particle kernel resolves into
+  // that cell's stain bits on the tick it drains. Refuses when the material
+  // has no stain palette slot, when the system's per-tick shed budget is
+  // spent, or when this creature's spawn queue is full. Returns whether it
+  // queued. Does NOT touch the foot's own lattice — the caller subtracts what
+  // left, because only the caller knows which voxels those were.
+  bool DepositCoat(uint32_t mat, IVec3 groundCell, uint32_t tick);
   // Burnable voxels of a limb with at least one open face, on its
   // authoritative lattice. One hash pass; taken once per limb (surfaceAtSpawn).
   uint32_t SurfaceCount(const MobLimb& limb) const;
@@ -2187,7 +2246,12 @@ class MobSystem {
   // a fresh mob's does, then overlays the saved damage. DEAD mobs are not
   // saved: their limbs were adopted into DebrisSystem at death and travel in
   // the 'DBRS' section as the debris they already are.
-  static constexpr uint32_t kSaveVersion = 1;
+  //
+  // 2 (2026-09-13): the coat word. PrefabVoxel::stain and DebrisVoxel::stain
+  // went from a byte holding a palette slot to 16 bits holding a MATERIAL, and
+  // both lattices are written as PODs — the stride moved, so a version-1
+  // section cannot be read and is refused as it already is.
+  static constexpr uint32_t kSaveVersion = 2;
   void SaveState(std::vector<uint8_t>& out) const;
   // Contract (worldio LoadEntities): Reset() has already run.
   bool LoadState(const uint8_t* data, size_t len, uint32_t version);
@@ -2488,6 +2552,38 @@ class MobSystem {
   // 0 when it does not stain. Read off the material table this system already
   // mirrors for the burn pass.
   uint32_t StainTypeOf(uint32_t mat) const;
+  // ...and the other direction: the first material registered against a
+  // palette slot. The world's voxel word only carries the SLOT, so this is
+  // what turns "there is dried blood on this floor" into a substance a body
+  // can be coated in. Ambiguous by construction when two materials share a
+  // stain name, which is what sharing one means: they look the same and the
+  // ground cannot tell them apart either. 0 for an unused slot.
+  uint32_t StainMaterialOfType(uint32_t slot) const {
+    return slot < 8u ? matOfStainType_[slot] : 0u;
+  }
+  // ---- what is on a creature (see LimbCoat) --------------------------------
+  // The limb's ledger, or nullptr for an unknown creature/limb. Valid until
+  // the next recount; do not hold it across a tick.
+  const LimbCoat* LimbCoatOf(uint64_t mobId, int limb) const;
+  // The same over the creature's BASE limbs only — a robe soaked in blood is
+  // not the wearer being covered in it (Mob::IsWornSlot, the rule StainWound
+  // already applies).
+  LimbCoat BodyCoat(uint64_t mobId) const;
+  // The amount-weighted fraction of a creature carrying a coat whose material
+  // declares `tag` in its materials.json `coat.effects`. `limbTag` restricts
+  // the numerator AND the denominator to limbs with that MobLimbDef::tag
+  // ("foot", "hand", ...); nullptr means the whole body. 0 for an unknown
+  // creature, an unknown tag, or a clean one.
+  //
+  // Reads the two heaviest materials per limb, which is what the ledger keeps.
+  // A tag carried only by a body's THIRD substance reads 0 — correct enough
+  // for "is this hand bloody", and the alternative is a per-limb map.
+  float CoatTagFraction(uint64_t mobId, const char* tag,
+                        const char* limbTag) const;
+  // Mob::DepositCoat by id, so a caller holding only the system can track a
+  // coat onto the ground (the footfall wiring is P2's).
+  bool DepositCoatOn(uint64_t mobId, uint32_t mat, IVec3 groundCell,
+                     uint32_t tick);
   // Queue one tick of a gout / spray for every OTHER body to be splashed by
   // (see SplatterEvent). Bounded: past kSplatterMaxEvents the burst is not
   // remembered, which only loses cosmetics.
@@ -2738,6 +2834,11 @@ class MobSystem {
   // definition for why the bound is the load-bearing half.
   static void EaseBodyY(Mob& mob, float targetY, float dt);
 
+  // A creature by id, THE AVATAR INCLUDED. The player's body is a Mob that
+  // does not live in `mobs_` (see SetAvatar), so every by-id query has to try
+  // both lists; this is that lookup, factored out of the ones that grew it.
+  const Mob* FindMob(uint64_t mobId) const;
+
   Physics* phys_ = nullptr;
   World* world_ = nullptr;
   DebrisSystem* debris_ = nullptr;
@@ -2783,6 +2884,26 @@ class MobSystem {
   // if its neighbour predicate can match something dissolvable. tag:soil cannot;
   // tag:dissolvable can.
   std::vector<uint8_t> matAttacksBody_;
+  // ---- the stain palette, both ways round ----------------------------------
+  // mat -> its stain palette slot (1..7, 0 = does not stain), and slot -> the
+  // FIRST material registered against it. The second exists because the voxel
+  // word can only afford the slot: a dry stain on the floor says "blood" and
+  // the body that rubs it off has to write a coat, which names a material.
+  std::vector<uint8_t> stainSlotOfMat_;
+  uint32_t matOfStainType_[8]{};
+  // ---- what a substance does while it is on a body (materials.json "coat") -
+  // Mirrors of MaterialDef::coat*, indexed by material id, rebuilt with the
+  // rest of the tables. `coatEffects_` is the raw tag lists; nothing here
+  // interprets them (rule 4).
+  std::vector<float> coatDecay_;
+  std::vector<uint32_t> coatShed_;
+  std::vector<std::vector<std::string>> coatEffects_;
+  // Deposits every creature together may track onto the ground this tick
+  // (tune.coat.shedPerTick), charged BEFORE the droplet is queued and reset at
+  // the top of PreTick. A budget and not a rate, for the reason every other
+  // gore budget is one: the number of feet in a crowd is not bounded by
+  // anything this layer controls.
+  uint32_t coatShedSpent_ = 0;
   // mat -> what it becomes when it catches (see IgnitedForm).
   std::vector<uint32_t> ignitedForm_;
   uint32_t dayPhase_ = 0;
