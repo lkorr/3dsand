@@ -216,7 +216,14 @@ constexpr uint8_t kMaxFetchRetries = 32;
 // in one scan -- the `audio-impact` slab's refresh then queued behind them and
 // the block fell through it. Chunks past the cap are still marked as waited
 // on (the event re-queues), just not requested until the next round.
-constexpr uint32_t kIslandFetchPerScan = 32;
+//
+// Was 32, and counted every RE-ENTRY into an unfetched chunk against itself
+// (the flood zigzags across a chunk face hundreds of times), so a scan's real
+// reach was a handful of chunks a round. Now the whole tick budget: a scan
+// requests only for components a fetch could still change (an anchored
+// terrain flood asks for none of its rock frontier), so the number of chunks
+// actually put on the FIFO per tick is smaller than before at twice the cap.
+constexpr uint32_t kIslandFetchPerScan = World::kFetchPerTick;
 // Ceiling on the spill queue. pendingSupport_ never drops entries by design
 // (a missed final flag is a floating island forever), which is exactly why it
 // needs a ceiling somewhere: without one, a caller looping on destruction
@@ -561,7 +568,8 @@ void DebrisSystem::Reset() {
   nextAssembly_ = 1;
   chunkWriteTick_.clear();
   pendingVacate_.clear();
-  scanLabel_.clear();
+  BeginTickLabels();
+  labelPages_.clear();
 }
 
 // Every world chunk the SEED box covers, onto the queue that never
@@ -823,6 +831,24 @@ inline uint64_t PackCell(int x, int y, int z) {
 // in two or three such rounds. Components that touched nothing unknown are
 // judged and converted immediately — the stump below a cut never holds the
 // tree above it hostage to a fetch.
+DebrisSystem::LabelPageData* DebrisSystem::LabelPage(IVec3 wc) {
+  const uint64_t key = World::PackChunkKey(wc);
+  auto it = labelPageOf_.find(key);
+  if (it != labelPageOf_.end()) return labelPages_[it->second].get();
+  if (labelPagesUsed_ >= kMaxLabelPages) return nullptr;
+  if (labelPagesUsed_ == labelPages_.size())
+    labelPages_.push_back(std::make_unique<LabelPageData>());
+  labelPages_[labelPagesUsed_]->label.fill(-1);  // `index` is written before it is read
+  labelPageOf_[key] = labelPagesUsed_;
+  return labelPages_[labelPagesUsed_++].get();
+}
+
+void DebrisSystem::BeginTickLabels() {
+  labelPageOf_.clear();
+  labelPagesUsed_ = 0;
+  tickComps_.clear();
+}
+
 void DebrisSystem::RunIslandDetection(const Event& e, uint32_t tick, World& world,
                                       std::vector<CellOp>& cellOps,
                                       std::vector<ParticleSpawn>& spawns) {
@@ -833,12 +859,30 @@ void DebrisSystem::RunIslandDetection(const Event& e, uint32_t tick, World& worl
     const CachedChunk* cc = nullptr;
     bool usable = false;
     const std::unordered_map<uint16_t, uint32_t>* overlay = nullptr;
+    // The chunk's page of this tick's label map, looked up on first use only
+    // (a chunk read for a boundary probe never needs one). nullptr after a
+    // lookup means the page cap is spent -- see kMaxLabelPages.
+    LabelPageData* labels = nullptr;
+    bool labelTried = false;
   };
   ChunkRef last;
   bool needFetch = false;
-  uint32_t fetchesIssued = 0;
-  IVec3 firstWait{};  // the first chunk this scan had to ask for
-  auto chunkOf = [&](int x, int y, int z) -> const ChunkRef& {
+  IVec3 firstWait{};  // the first chunk this scan met that the mirror lacks
+  // Chunks the flood met and could not read, WITH the component that met
+  // them. NOTHING IS REQUESTED DURING THE FLOOD. A component that ends up
+  // anchored is anchored whatever those chunks hold (the verdict is monotone),
+  // and requesting its frontier anyway -- three chunks of never-fetched rock
+  // under every terrain flood -- was fetch bandwidth the tree's crown then
+  // queued behind. The requests go out after the verdicts, for the components
+  // a fetch could still change, and the same pass speculates around them.
+  struct Want {
+    IVec3 wc;
+    int32_t comp;  // -1: met while seeding
+  };
+  std::vector<Want> wanted;
+  std::unordered_map<uint64_t, uint8_t> wantedSet;
+  int32_t curComp = -1;
+  auto chunkOf = [&](int x, int y, int z) -> ChunkRef& {
     const IVec3 wc{x >> 4, y >> 4, z >> 4};
     if (wc.x == last.wc.x && wc.y == last.wc.y && wc.z == last.wc.z) return last;
     last.wc = wc;
@@ -854,6 +898,8 @@ void DebrisSystem::RunIslandDetection(const Event& e, uint32_t tick, World& worl
     // 380 M cells visited and 244 abandoned scans over one burning oak.
     last.usable = last.cc && last.cc->voxels.size() == kChunkVol;
     last.overlay = nullptr;
+    last.labels = nullptr;
+    last.labelTried = false;
     if (last.usable) {
       auto ov = pendingVacate_.find(World::PackChunkKey(wc));
       if (ov != pendingVacate_.end()) {
@@ -862,27 +908,84 @@ void DebrisSystem::RunIslandDetection(const Event& e, uint32_t tick, World& worl
       }
     }
     if (!last.usable && world.ChunkInWindow(wc)) {
-      if (fetchesIssued < kIslandFetchPerScan) {
-        world.RequestChunkFetch(wc, World::FetchSource::IslandScan);
-        fetchesIssued++;
+      const uint64_t key = World::PackChunkKey(wc);
+      if (!wantedSet.count(key)) {  // once per chunk, not once per re-entry
+        wantedSet[key] = 1;
+        wanted.push_back({wc, curComp});
+        if (!needFetch) firstWait = wc;
+        needFetch = true;
+        if (!last.cc) floaters_.fetchWaitNoCache++;
+        else floaters_.fetchWaitNoVoxels++;
       }
-      if (!needFetch) firstWait = wc;
-      needFetch = true;
-      if (!last.cc) floaters_.fetchWaitNoCache++;
-      else floaters_.fetchWaitNoVoxels++;
     }
     return last;
+  };
+  auto labelsOf = [&](ChunkRef& cr) -> LabelPageData* {
+    if (!cr.labelTried) {
+      cr.labelTried = true;
+      cr.labels = LabelPage(cr.wc);
+    }
+    return cr.labels;
+  };
+  auto localIdx = [](int x, int y, int z) -> uint32_t {
+    return ((uint32_t)(z & 15) * kChunk + (uint32_t)(y & 15)) * kChunk +
+           (uint32_t)(x & 15);
+  };
+  // SANDVOX_ISLAND_WATCH=x,y,z (trace only): one world cell whose every read,
+  // label and conversion this scan reports, for a floater the sweep names
+  // and the counters cannot explain. `overlayHid` / `overlayShow` count seed
+  // cells whose CLASS the pendingVacate_ overlay changed, whichever cell they
+  // are: the overlay is the one thing that can make a scan disagree with the
+  // mirror the sweep reads.
+  static const IVec3 watch = [] {
+    IVec3 w{INT32_MIN, INT32_MIN, INT32_MIN};
+    if (const char* v = std::getenv("SANDVOX_ISLAND_WATCH"))
+      std::sscanf(v, "%d,%d,%d", &w.x, &w.y, &w.z);
+    return w;
+  }();
+  uint32_t overlayHid = 0, overlayShow = 0;
+  bool watchSeen = false;
+  // SANDVOX_ISLAND_WATCH_Y=<y> (trace only): every solid seed cell read at
+  // that height, with the fate of its component, so a floater the sweep
+  // names at the END of a run can be looked up afterwards.
+  static const int watchY = [] {
+    const char* v = std::getenv("SANDVOX_ISLAND_WATCH_Y");
+    return v ? std::atoi(v) : INT32_MIN;
+  }();
+  struct BandSeed {
+    IVec3 c;
+    uint32_t word;
+    int32_t label;  // -1 fresh, else the label found (< labelBase: inherited)
+    int32_t comp;   // this scan's component, or -1
+  };
+  std::vector<BandSeed> band;
+  auto classOfWord = [&](uint32_t w) -> int {
+    const uint32_t mat = w & 0xFFFu;
+    if (mat == 0 || mat >= classOf_.size()) return CELL_AIR;
+    if (classOf_[mat] == CLASS_SOLID) return CELL_SOLID;
+    if (classOf_[mat] == CLASS_POWDER) return CELL_POWDER;
+    return CELL_AIR;
   };
   auto wordAt = [&](int x, int y, int z, uint32_t& w) -> int {
     if (!world.CellInWindow({x, y, z})) return CELL_UNKNOWN;
     const ChunkRef& cr = chunkOf(x, y, z);
     if (!cr.usable) return CELL_UNKNOWN;
-    const uint32_t li = ((uint32_t)(z & 15) * kChunk + (uint32_t)(y & 15)) * kChunk +
-                        (uint32_t)(x & 15);
+    const uint32_t li = localIdx(x, y, z);
     w = cr.cc->voxels[li];
     if (cr.overlay) {
       auto ov = cr.overlay->find((uint16_t)li);
       if (ov != cr.overlay->end()) w = ov->second;  // our own write, not yet mirrored
+    }
+    if (x == watch.x && y == watch.y && z == watch.z && !watchSeen) {
+      watchSeen = true;
+      const uint32_t raw = cr.cc->voxels[li];
+      auto pv = pendingVacate_.find(World::PackChunkKey(cr.wc));
+      std::printf("island-watch: tick %u cell (%d,%d,%d) mirror 0x%08x ver %u class %d"
+                  " | overlay %s word 0x%08x class %d pvTick %u pvCells %zu\n",
+                  tick, x, y, z, raw, cr.cc->version, classOfWord(raw),
+                  cr.overlay ? "yes" : "no", w, classOfWord(w),
+                  pv != pendingVacate_.end() ? pv->second.tick : 0u,
+                  pv != pendingVacate_.end() ? pv->second.cells.size() : (size_t)0);
     }
     const uint32_t mat = w & 0xFFFu;
     if (mat == 0 || mat >= classOf_.size()) return CELL_AIR;
@@ -905,16 +1008,37 @@ void DebrisSystem::RunIslandDetection(const Event& e, uint32_t tick, World& worl
     bool powderAnchor = false;    // resting on powder: genuinely supported
     bool complete = true;         // `cells` is the whole component
     bool touchedUnfetched = false;  // reached a chunk the mirror lacks: not judged
+    // Touches a component an earlier scan of this tick left in the grid for
+    // want of budget: the same matter, judged already, converted later.
+    bool heldByEarlier = false;
+    IVec3 waitChunk{};   // the first unfetched chunk it touched...
+    bool waitSet = false;
+    bool viaNeighbor = false;  // anchored by touching an anchored component
+    IVec3 viaCell{};           // ...that component's cell it touched
+    bool made = false;   // every cell left the grid this scan
     // The first cell that anchored this component (trace only): the answer to
     // "anchored by WHAT" is a place, not a flag.
     IVec3 anchorAt{};
     bool anchorSet = false;
   };
   std::vector<Comp> comps;
-  std::unordered_map<uint64_t, int32_t>& label = scanLabel_;
-  label.clear();
+  // Labels are TICK-global: this scan's component i is label labelBase + i,
+  // anything below labelBase belongs to an earlier scan of the same tick and
+  // is looked up in tickComps_.
+  const int32_t labelBase = (int32_t)tickComps_.size();
   std::vector<IVec3> stack;
   int32_t next = 0;
+  bool labelOverflow = false;  // the page cap refused a seed: retry next tick
+  // What a seed already labelled by an earlier scan this tick hands over.
+  bool inheritedWait = false, inheritedHeld = false;
+  IVec3 inheritedWaitChunk{};
+  auto anchorHere = [](Comp& comp, const IVec3& c) {
+    comp.anchored = true;
+    if (!comp.anchorSet) {
+      comp.anchorSet = true;
+      comp.anchorAt = c;
+    }
+  };
   floaters_.scans++;
   floaters_.scanCellsCovered +=
       (uint64_t)(e.seedHi.x - e.seedLo.x + 1) * (e.seedHi.y - e.seedLo.y + 1) *
@@ -938,22 +1062,70 @@ void DebrisSystem::RunIslandDetection(const Event& e, uint32_t tick, World& worl
   for (int sy = sLo.y; sy <= sHi.y; sy++)
   for (int sx = sLo.x; sx <= sHi.x; sx++) {
     uint32_t sw = 0;
-    if (wordAt(sx, sy, sz, sw) != CELL_SOLID) continue;
-    const uint64_t sk = PackCell(sx, sy, sz);
-    if (label.count(sk)) continue;
+    const int sk = wordAt(sx, sy, sz, sw);
+    if (last.overlay && last.usable) {
+      const uint32_t raw = last.cc->voxels[localIdx(sx, sy, sz)];
+      if (raw != sw) {
+        const int rk = classOfWord(raw);
+        if (rk == CELL_SOLID && sk != CELL_SOLID) overlayHid++;
+        if (rk != CELL_SOLID && sk == CELL_SOLID) overlayShow++;
+      }
+    }
+    const bool isWatch = sx == watch.x && sy == watch.y && sz == watch.z;
+    if (sk != CELL_SOLID) {
+      if (isWatch) std::printf("island-watch: tick %u seed reads class %d, not flooded\n", tick, sk);
+      continue;
+    }
+    LabelPageData* spage = labelsOf(last);  // `last` is the seed's chunk: wordAt just read it
+    int32_t* slab = spage ? spage->label.data() : nullptr;
+    if (isWatch)
+      std::printf("island-watch: tick %u seed solid, label %d (labelBase %d, next %d)\n",
+                  tick, slab ? slab[localIdx(sx, sy, sz)] : -2, labelBase, next);
+    if (sy == watchY && slab) {
+      const int32_t L0 = slab[localIdx(sx, sy, sz)];
+      band.push_back({IVec3{sx, sy, sz}, sw, L0, L0 < 0 ? next : (L0 >= labelBase ? L0 - labelBase : -1)});
+    }
+    if (!slab) {
+      labelOverflow = true;
+      continue;
+    }
+    const uint32_t sli = localIdx(sx, sy, sz);
+    if (slab[sli] >= 0) {
+      const int32_t L = slab[sli];
+      if (L < labelBase) {
+        // Labelled by an earlier scan this tick: its verdict is this seed's.
+        // An anchored or converted component needs nothing more from us; one
+        // waiting on a fetch makes this event wait on the same chunk, so both
+        // run in the tick it lands and only the first of them floods.
+        const TickComp& tc = tickComps_[(size_t)L];
+        floaters_.sharedSeedCells++;
+        if (tc.verdict == TICK_WAIT && !inheritedWait) {
+          inheritedWait = true;
+          inheritedWaitChunk = tc.waitChunk;
+        } else if (tc.verdict == TICK_HELD) {
+          inheritedHeld = true;
+        }
+      }
+      continue;
+    }
     Comp comp;
+    curComp = next;
     stack.assign(1, IVec3{sx, sy, sz});
-    label[sk] = next;
+    slab[sli] = labelBase + next;
     while (!stack.empty()) {
       const IVec3 c = stack.back();
       stack.pop_back();
       uint32_t w = 0;
       wordAt(c.x, c.y, c.z, w);
+      // `last` is c's chunk (wordAt just read it) and its page exists (c was
+      // labelled when it was pushed) -- but `last` is a ONE-chunk cache, so
+      // the page pointer must be re-looked-up, not read off the struct.
+      labelsOf(last)->index[localIdx(c.x, c.y, c.z)] = (int32_t)comp.cells.size();
       comp.cells.push_back(c);
       comp.words.push_back(w);
       floaters_.scanCellsVisited++;
       if (comp.cells.size() > kMaxIslandVoxels) {  // abort: too big to judge
-        comp.anchored = true; if (!comp.anchorSet) { comp.anchorSet = true; comp.anchorAt = c; }
+        anchorHere(comp, c);
         comp.oversizeAnchor = true;
       }
       if (c.y < e.seedLo.y - kAnchorDropBelowSeed ||  // this is the ground
@@ -962,7 +1134,7 @@ void DebrisSystem::RunIslandDetection(const Event& e, uint32_t tick, World& worl
             c.x > e.seedHi.x + kAnchorReachBesideSeed ||
             c.z < e.seedLo.z - kAnchorReachBesideSeed ||
             c.z > e.seedHi.z + kAnchorReachBesideSeed))) {
-        comp.anchored = true; if (!comp.anchorSet) { comp.anchorSet = true; comp.anchorAt = c; }
+        anchorHere(comp, c);
         comp.boundaryAnchor = true;
       }
       // Leaving the region only anchors when the structure actually CONTINUES
@@ -975,7 +1147,7 @@ void DebrisSystem::RunIslandDetection(const Event& e, uint32_t tick, World& worl
         uint32_t ow = 0;
         const int k = wordAt(nx, ny, nz, ow);
         if (k == CELL_AIR) continue;
-        comp.anchored = true; if (!comp.anchorSet) { comp.anchorSet = true; comp.anchorAt = c; }
+        anchorHere(comp, c);
         if (k == CELL_UNKNOWN) comp.unknownAnchor = true;
         else comp.boundaryAnchor = true;
       }
@@ -985,7 +1157,7 @@ void DebrisSystem::RunIslandDetection(const Event& e, uint32_t tick, World& worl
         uint32_t bw = 0;
         if (inRegion(c.x, c.y - 1, c.z) &&
             wordAt(c.x, c.y - 1, c.z, bw) == CELL_POWDER) {
-          comp.anchored = true; if (!comp.anchorSet) { comp.anchorSet = true; comp.anchorAt = c; }
+          anchorHere(comp, c);
           comp.powderAnchor = true;
         }
       }
@@ -995,24 +1167,68 @@ void DebrisSystem::RunIslandDetection(const Event& e, uint32_t tick, World& worl
         uint32_t nw = 0;
         const int k = wordAt(nx, ny, nz, nw);
         if (k == CELL_UNKNOWN) {
-          if (world.CellInWindow({nx, ny, nz})) comp.touchedUnfetched = true;
-          else { comp.anchored = true; if (!comp.anchorSet) { comp.anchorSet = true; comp.anchorAt = c; } comp.unknownAnchor = true; }
+          if (world.CellInWindow({nx, ny, nz})) {
+            comp.touchedUnfetched = true;
+            if (!comp.waitSet) {
+              comp.waitSet = true;
+              comp.waitChunk = {nx >> 4, ny >> 4, nz >> 4};
+            }
+          } else {
+            anchorHere(comp, c);
+            comp.unknownAnchor = true;
+          }
           continue;
         }
         if (k != CELL_SOLID) continue;
-        const uint64_t nk = PackCell(nx, ny, nz);
-        auto it = label.find(nk);
-        if (it == label.end()) {
-          label[nk] = next;
+        // `last` is the neighbour's chunk (wordAt read it, and SOLID means it
+        // was usable), so the label is one array index away.
+        LabelPageData* npage = labelsOf(last);
+        int32_t* nl = npage ? npage->label.data() : nullptr;
+        if (!nl) {  // the page cap: too big to judge, exactly as kMaxIslandVoxels
+          anchorHere(comp, c);
+          comp.oversizeAnchor = true;
+          continue;
+        }
+        const uint32_t nli = localIdx(nx, ny, nz);
+        const int32_t L = nl[nli];
+        if (L < 0) {
+          nl[nli] = labelBase + next;
           stack.push_back({nx, ny, nz});
-        } else if (it->second != next && comps[(size_t)it->second].anchored) {
-          // touching a component already judged anchored: so is this one
-          const Comp& other = comps[(size_t)it->second];
-          comp.anchored = true; if (!comp.anchorSet) { comp.anchorSet = true; comp.anchorAt = c; }
-          comp.boundaryAnchor = comp.boundaryAnchor || other.boundaryAnchor;
-          comp.unknownAnchor = comp.unknownAnchor || other.unknownAnchor;
-          comp.oversizeAnchor = comp.oversizeAnchor || other.oversizeAnchor;
-          comp.powderAnchor = comp.powderAnchor || other.powderAnchor;
+          continue;
+        }
+        if (L >= labelBase) {
+          if (L != labelBase + next && comps[(size_t)(L - labelBase)].anchored) {
+            // touching a component already judged anchored: so is this one
+            const Comp& other = comps[(size_t)(L - labelBase)];
+            anchorHere(comp, c);
+            if (!comp.viaNeighbor) { comp.viaNeighbor = true; comp.viaCell = {nx, ny, nz}; }
+            comp.boundaryAnchor = comp.boundaryAnchor || other.boundaryAnchor;
+            comp.unknownAnchor = comp.unknownAnchor || other.unknownAnchor;
+            comp.oversizeAnchor = comp.oversizeAnchor || other.oversizeAnchor;
+            comp.powderAnchor = comp.powderAnchor || other.powderAnchor;
+          }
+          continue;
+        }
+        // A component an earlier scan of this tick labelled. Anchored: so is
+        // this one. Waiting on a fetch: this one waits on the same chunk.
+        // Held for budget: judged already, not ours to convert. Made: its
+        // cells read as air through the overlay and never get here.
+        const TickComp& tc = tickComps_[(size_t)L];
+        if (tc.verdict == TICK_ANCHORED) {
+          anchorHere(comp, c);
+          if (!comp.viaNeighbor) { comp.viaNeighbor = true; comp.viaCell = {nx, ny, nz}; }
+          comp.boundaryAnchor = comp.boundaryAnchor || (tc.anchorFlags & 1u);
+          comp.unknownAnchor = comp.unknownAnchor || (tc.anchorFlags & 2u);
+          comp.oversizeAnchor = comp.oversizeAnchor || (tc.anchorFlags & 4u);
+          comp.powderAnchor = comp.powderAnchor || (tc.anchorFlags & 8u);
+        } else if (tc.verdict == TICK_WAIT) {
+          comp.touchedUnfetched = true;
+          if (!comp.waitSet) {
+            comp.waitSet = true;
+            comp.waitChunk = tc.waitChunk;
+          }
+        } else if (tc.verdict == TICK_HELD) {
+          comp.heldByEarlier = true;
         }
       }
       if (comp.anchored && !fullFlood) {  // nothing more to learn: see above
@@ -1024,11 +1240,13 @@ void DebrisSystem::RunIslandDetection(const Event& e, uint32_t tick, World& worl
     comps.push_back(std::move(comp));
     next++;
   }
+  curComp = -1;
 
   for (const Comp& cm : comps) {
     const bool small = cm.complete && cm.cells.size() < kMinBodyVoxels;
     if (!cm.anchored) {
       if (cm.touchedUnfetched) floaters_.deferredUnfetched++;
+      else if (cm.heldByEarlier) {}
       else if (small) floaters_.smallUnanchored++;
       continue;
     }
@@ -1047,16 +1265,134 @@ void DebrisSystem::RunIslandDetection(const Event& e, uint32_t tick, World& worl
   // what a scan under a burning tree meets is exactly that: terrain, judged
   // by the drop anchor, with a frontier of never-fetched rock beyond it.
   // Waiting on those held terrain-only events for 32 rounds each.
-  bool fetchMatters = false;
-  for (const Comp& cm : comps)
-    if (cm.touchedUnfetched && !cm.anchored) fetchMatters = true;
-  needFetch = needFetch && fetchMatters;
-  bool deferEvent = needFetch;
+  //
+  // `waitOn` is the chunk the event will wait for: the first unfetched chunk
+  // of the first component a fetch could change, or the one inherited from an
+  // earlier scan this tick. NOT the first chunk the scan met -- that was
+  // usually an anchored terrain flood's rock, and the event then waited on a
+  // chunk that could not change its answer.
+  bool fetchMatters = inheritedWait;
+  IVec3 waitOn = inheritedWaitChunk;
+  bool waitOnSet = inheritedWait;
+  bool heldMatters = inheritedHeld;
+  std::vector<uint8_t> matters(comps.size(), 0);
+  for (size_t i = 0; i < comps.size(); i++) {
+    const Comp& cm = comps[i];
+    if (cm.anchored) continue;
+    if (cm.heldByEarlier) heldMatters = true;
+    if (!cm.touchedUnfetched) continue;
+    matters[i] = 1;
+    fetchMatters = true;
+    if (!waitOnSet && cm.waitSet) {
+      waitOn = cm.waitChunk;
+      waitOnSet = true;
+    }
+  }
+  if (!waitOnSet) waitOn = firstWait;
+  needFetch = fetchMatters;
+  bool deferEvent = needFetch || heldMatters || labelOverflow;
+
+  // ---- THE REQUESTS, after the verdicts -----------------------------------
+  //
+  // First the frontier the components that matter actually stopped at, in
+  // the order the flood met it. Then SPECULATION around that frontier, under
+  // the same cap, so a structure lands in two or three rounds instead of one
+  // chunk layer per round: a round used to fetch exactly the chunks the
+  // flood could see the far side of, and a 6-chunk-tall trunk under a
+  // 2-chunk-wide crown took ~10 rounds of re-flooding the whole tree. The
+  // face ring of each frontier chunk first (the flood's next step), then its
+  // COLUMN down to the drop-anchor floor and up to the region top (the
+  // ground verdict wants the column below the seed all at once, a trunk is a
+  // column above it), then the rest of the 26-ring. Every one of these is a
+  // chunk the flood may never reach; the cost is bounded fetch bandwidth,
+  // and a chunk already cached costs nothing.
+  //
+  // AND THE DIVE FRONTIER, VERDICT OR NOT. The verdict is monotone; the COST
+  // is not. A terrain flood whose first dive stops at an unfetched chunk two
+  // layers under the seed spreads sideways instead, through every chunk of
+  // rock the mirror happens to hold, until a powder patch or the 96-cell
+  // reach anchors it -- 8k, then 33k, then 200k cells a scan as the fire's
+  // other events fetched more of the slab -- and being anchored it would
+  // never ask for the chunks below, so it paid that on every support flag
+  // for the rest of the burn (11.7 M cells over one oak, 5x the old code,
+  // which requested whatever it met). With the column under the seed
+  // fetched, the dive hits kAnchorDropBelowSeed in ~48 cells and each
+  // neighbouring seed column inherits that anchored component after one.
+  uint32_t fetchesIssued = 0, speculative = 0;
+  if (!wanted.empty()) {
+    const int cx0 = e.lo.x >> 4, cx1 = e.hi.x >> 4;
+    const int cy0 = e.lo.y >> 4, cy1 = e.hi.y >> 4;
+    const int cz0 = e.lo.z >> 4, cz1 = e.hi.z >> 4;
+    std::unordered_map<uint64_t, uint8_t> issued;
+    auto request = [&](IVec3 wc, bool spec) {
+      if (fetchesIssued >= kIslandFetchPerScan) return;
+      if (wc.x < cx0 || wc.x > cx1 || wc.y < cy0 || wc.y > cy1 || wc.z < cz0 ||
+          wc.z > cz1)
+        return;  // outside the region: the flood never goes there
+      if (!world.ChunkInWindow(wc)) return;
+      const uint64_t key = World::PackChunkKey(wc);
+      if (issued.count(key)) return;
+      issued[key] = 1;
+      if (spec) {
+        const CachedChunk* cc = world.Cached(wc);
+        if (cc && cc->voxels.size() == kChunkVol) return;  // already readable
+      }
+      world.RequestChunkFetch(wc, World::FetchSource::IslandScan);  // the world dedupes against its own FIFO
+      fetchesIssued++;
+      if (spec) {
+        speculative++;
+        floaters_.speculativeFetches++;
+      }
+    };
+    auto counts = [&](const Want& w) { return w.comp < 0 || matters[(size_t)w.comp]; };
+    for (const Want& w : wanted)
+      if (counts(w)) request(w.wc, false);
+    if (inheritedWait) request(inheritedWaitChunk, false);
+    const int floorCy = (e.seedLo.y - kAnchorDropBelowSeed) >> 4;
+    {
+      // the dive frontier of the components already judged: what lies under
+      // the seed box, nearest the seed's column first, each with the column
+      // under it down to the drop floor
+      std::vector<const Want*> below;
+      for (const Want& w : wanted)
+        if (!counts(w) && w.wc.y * (int)kChunk + (int)kChunk - 1 < e.seedLo.y)
+          below.push_back(&w);
+      const int scx = (e.seedLo.x + e.seedHi.x) >> 5, scz = (e.seedLo.z + e.seedHi.z) >> 5;
+      std::sort(below.begin(), below.end(), [&](const Want* a, const Want* b) {
+        const int da = std::abs(a->wc.x - scx) + std::abs(a->wc.z - scz);
+        const int db = std::abs(b->wc.x - scx) + std::abs(b->wc.z - scz);
+        return da != db ? da < db : a->wc.y > b->wc.y;
+      });
+      for (const Want* w : below) {
+        request(w->wc, false);
+        for (int cy = w->wc.y - 1; cy >= floorCy; cy--) request({w->wc.x, cy, w->wc.z}, true);
+      }
+    }
+    if (needFetch) {  // speculation, only for what a fetch could change
+    for (const Want& w : wanted) {
+      if (!counts(w)) continue;
+      for (auto& d : nb) request({w.wc.x + d[0], w.wc.y + d[1], w.wc.z + d[2]}, true);
+    }
+    for (const Want& w : wanted) {
+      if (!counts(w)) continue;
+      for (int cy = w.wc.y - 1; cy >= floorCy; cy--) request({w.wc.x, cy, w.wc.z}, true);
+      for (int cy = w.wc.y + 1; cy <= cy1; cy++) request({w.wc.x, cy, w.wc.z}, true);
+    }
+    for (const Want& w : wanted) {
+      if (!counts(w)) continue;
+      for (int dz = -1; dz <= 1; dz++)
+        for (int dy = -1; dy <= 1; dy++)
+          for (int dx = -1; dx <= 1; dx++)
+            if (dx | dy | dz) request({w.wc.x + dx, w.wc.y + dy, w.wc.z + dz}, true);
+    }
+    }
+  }
 
   std::vector<uint32_t> order;
   order.reserve(comps.size());
   for (uint32_t c = 0; c < (uint32_t)comps.size(); c++)
-    if (!comps[c].anchored && !comps[c].touchedUnfetched) order.push_back(c);
+    if (!comps[c].anchored && !comps[c].touchedUnfetched && !comps[c].heldByEarlier)
+      order.push_back(c);
   std::sort(order.begin(), order.end(), [&](uint32_t a, uint32_t b) {
     return comps[a].cells.size() > comps[b].cells.size();
   });
@@ -1066,12 +1402,29 @@ void DebrisSystem::RunIslandDetection(const Event& e, uint32_t tick, World& worl
   // collider must not keep a body's own former cells as ground — see
   // NoteVacated).
   auto noteWrite = [&](const IVec3& c, uint32_t word) {
+    if (c.x == watch.x && c.y == watch.y && c.z == watch.z)
+      std::printf("island-watch: tick %u WRITE 0x%08x (ops %zu spawns %zu)\n", tick, word,
+                  cellOps.size(), spawns.size());
     NoteGridWrite(c, tick, word);
   };
+  if (watch.x != INT32_MIN)
+    for (size_t ci = 0; ci < comps.size(); ci++)
+      for (const IVec3& c : comps[ci].cells)
+        if (c.x == watch.x && c.y == watch.y && c.z == watch.z) {
+          const Comp& cm = comps[ci];
+          bool inOrder = false;
+          for (uint32_t o : order) inOrder = inOrder || o == (uint32_t)ci;
+          std::printf("island-watch: tick %u in comp %zu of %zu cells anchored %d (bnd %d unk %d"
+                      " big %d pwd %d) at (%d,%d,%d) complete %d unf %d held %d inOrder %d\n",
+                      tick, ci, cm.cells.size(), cm.anchored ? 1 : 0, cm.boundaryAnchor ? 1 : 0,
+                      cm.unknownAnchor ? 1 : 0, cm.oversizeAnchor ? 1 : 0, cm.powderAnchor ? 1 : 0,
+                      cm.anchorAt.x, cm.anchorAt.y, cm.anchorAt.z, cm.complete ? 1 : 0,
+                      cm.touchedUnfetched ? 1 : 0, cm.heldByEarlier ? 1 : 0, inOrder ? 1 : 0);
+        }
 
   uint32_t madeThisScan = 0;
   for (uint32_t ci : order) {
-    const Comp& comp = comps[ci];
+    Comp& comp = comps[ci];
     if (cellOps.size() + kMinBodyVoxels > kMaxCellOpsPerTick) {
       // The op budget is spent: the region is genuinely re-queued (the event
       // was popped by the caller), and a re-scan re-derives what is left.
@@ -1094,6 +1447,33 @@ void DebrisSystem::RunIslandDetection(const Event& e, uint32_t tick, World& worl
         floaters_.deferredCellOpBudget++;
         deferEvent = true;
         break;
+      }
+      comp.made = true;  // ...unless the spawn ring refuses a cell below
+      // Trace only: a single freed TWICE is a conversion that had no effect
+      // (or a cell something re-filled), which is the one shape of floater
+      // the sweep can name and no counter here could -- see island-watch.
+      {
+        static const bool traceFreed = std::getenv("SANDVOX_ISLAND_TRACE") != nullptr;
+        static std::unordered_map<uint64_t, uint32_t> freedAt;
+        if (traceFreed && comp.cells.size() <= 2) {
+          if (freedAt.size() > 200000) freedAt.clear();
+          for (size_t i = 0; i < comp.cells.size(); i++) {
+            const IVec3 c = comp.cells[i];
+            const uint64_t key = PackCell(c.x, c.y, c.z);
+            auto it = freedAt.find(key);
+            if (it != freedAt.end()) {
+              uint32_t raw = 0;
+              const ChunkRef& cr = chunkOf(c.x, c.y, c.z);
+              if (cr.usable) raw = cr.cc->voxels[localIdx(c.x, c.y, c.z)];
+              std::printf("island-watch: tick %u RE-FREED (%d,%d,%d) first freed tick %u | now word "
+                          "0x%08x mirror 0x%08x ver %u overlay %s | seed (%d,%d,%d)..(%d,%d,%d)\n",
+                          tick, c.x, c.y, c.z, it->second, comp.words[i], raw,
+                          cr.usable ? cr.cc->version : 0u, cr.overlay ? "yes" : "no",
+                          e.seedLo.x, e.seedLo.y, e.seedLo.z, e.seedHi.x, e.seedHi.y, e.seedHi.z);
+            }
+            freedAt[key] = tick;
+          }
+        }
       }
       for (size_t i = 0; i < comp.cells.size(); i++) {
         const IVec3 c = comp.cells[i];
@@ -1118,6 +1498,7 @@ void DebrisSystem::RunIslandDetection(const Event& e, uint32_t tick, World& worl
         if (frozen && spawns.size() >= kMaxParticleSpawnsPerTick) {
           floaters_.deferredSpawnRing++;
           deferEvent = true;
+          comp.made = false;
           continue;
         }
         if (frozen) {
@@ -1164,9 +1545,21 @@ void DebrisSystem::RunIslandDetection(const Event& e, uint32_t tick, World& worl
       return ((c.z - mn.z) / size[2] * n[1] + (c.y - mn.y) / size[1]) * n[0] +
              (c.x - mn.x) / size[0];
     };
-    // shard id per cell: connected pieces within one lattice cell
-    std::unordered_map<uint64_t, int32_t> shardOf;
-    shardOf.reserve(comp.cells.size() * 2);
+    // shard id per cell (by index into comp.cells): connected pieces within
+    // one lattice cell. Neighbours are found through the label pages -- a
+    // cell is this component's iff its label is, and `index` then says
+    // which -- instead of two hash maps rebuilt over the whole component.
+    const int32_t myLabel = labelBase + (int32_t)ci;
+    auto indexOf = [&](const IVec3& q) -> int32_t {
+      if (!world.CellInWindow(q)) return -1;
+      ChunkRef& cr = chunkOf(q.x, q.y, q.z);
+      if (!cr.usable) return -1;
+      LabelPageData* pg = labelsOf(cr);
+      if (!pg) return -1;
+      const uint32_t li = localIdx(q.x, q.y, q.z);
+      return pg->label[li] == myLabel ? pg->index[li] : -1;
+    };
+    std::vector<int32_t> shardOfIdx(comp.cells.size(), -1);
     struct Shard {
       std::vector<uint32_t> idx;  // indices into comp.cells
       IVec3 mn{INT32_MAX, INT32_MAX, INT32_MAX}, mx{INT32_MIN, INT32_MIN, INT32_MIN};
@@ -1176,18 +1569,14 @@ void DebrisSystem::RunIslandDetection(const Event& e, uint32_t tick, World& worl
       bool made = false;
     };
     std::vector<Shard> shards;
-    std::unordered_map<uint64_t, uint32_t> cellIndex;
-    cellIndex.reserve(comp.cells.size() * 2);
-    for (uint32_t i = 0; i < (uint32_t)comp.cells.size(); i++)
-      cellIndex[PackCell(comp.cells[i].x, comp.cells[i].y, comp.cells[i].z)] = i;
     std::vector<uint32_t> sstack;
     for (uint32_t i = 0; i < (uint32_t)comp.cells.size(); i++) {
       const IVec3 c0 = comp.cells[i];
-      if (shardOf.count(PackCell(c0.x, c0.y, c0.z))) continue;
+      if (shardOfIdx[i] >= 0) continue;
       const int lat = latticeOf(c0);
       const int32_t sid = (int32_t)shards.size();
       shards.push_back(Shard{});
-      shardOf[PackCell(c0.x, c0.y, c0.z)] = sid;
+      shardOfIdx[i] = sid;
       sstack.assign(1, i);
       while (!sstack.empty()) {
         const uint32_t j = sstack.back();
@@ -1201,13 +1590,12 @@ void DebrisSystem::RunIslandDetection(const Event& e, uint32_t tick, World& worl
         sh.mass += mat < densityOf_.size() ? densityOf_[mat] : 1000.0f;
         for (auto& d : nb) {
           const IVec3 q{c.x + d[0], c.y + d[1], c.z + d[2]};
-          auto it = cellIndex.find(PackCell(q.x, q.y, q.z));
-          if (it == cellIndex.end()) continue;
+          const int32_t qi = indexOf(q);
+          if (qi < 0) continue;
           if (latticeOf(q) != lat) continue;
-          const uint64_t qk = PackCell(q.x, q.y, q.z);
-          if (shardOf.count(qk)) continue;
-          shardOf[qk] = sid;
-          sstack.push_back(it->second);
+          if (shardOfIdx[(size_t)qi] >= 0) continue;
+          shardOfIdx[(size_t)qi] = sid;
+          sstack.push_back((uint32_t)qi);
         }
       }
     }
@@ -1321,6 +1709,7 @@ void DebrisSystem::RunIslandDetection(const Event& e, uint32_t tick, World& worl
       floaters_.shardsMade++;
     }
     if (anyDeferred) deferEvent = true;
+    comp.made = !anyDeferred;
 
     // ---- WELDS: a spanning tree over face-adjacent shards ------------------
     if (bodyShards > 1) {
@@ -1333,14 +1722,14 @@ void DebrisSystem::RunIslandDetection(const Event& e, uint32_t tick, World& worl
       std::unordered_map<uint64_t, size_t> edgeIndex;
       for (uint32_t i = 0; i < (uint32_t)comp.cells.size(); i++) {
         const IVec3 c = comp.cells[i];
-        const int32_t sa = shardOf[PackCell(c.x, c.y, c.z)];
+        const int32_t sa = shardOfIdx[i];
         if (!shards[(size_t)sa].made) continue;
         static const int plus[3][3] = {{1, 0, 0}, {0, 1, 0}, {0, 0, 1}};
         for (int d = 0; d < 3; d++) {  // +x, +y, +z only: each pair once
           const IVec3 q{c.x + plus[d][0], c.y + plus[d][1], c.z + plus[d][2]};
-          auto it = shardOf.find(PackCell(q.x, q.y, q.z));
-          if (it == shardOf.end()) continue;
-          const int32_t sb = it->second;
+          const int32_t qi = indexOf(q);
+          if (qi < 0) continue;
+          const int32_t sb = shardOfIdx[(size_t)qi];
           if (sb == sa || !shards[(size_t)sb].made) continue;
           const uint32_t lo = (uint32_t)std::min(sa, sb), hi = (uint32_t)std::max(sa, sb);
           const uint64_t ek = ((uint64_t)lo << 32) | hi;
@@ -1390,7 +1779,49 @@ void DebrisSystem::RunIslandDetection(const Event& e, uint32_t tick, World& worl
                 bodies_.size());
   }
 
-  if (deferEvent) {
+  for (const BandSeed& b : band) {
+    if (b.comp < 0) {
+      const TickComp& tc = tickComps_[(size_t)b.label];
+      std::printf("island-band: tick %u (%d,%d,%d) mat %u INHERITED label %d verdict %u flags %u\n",
+                  tick, b.c.x, b.c.y, b.c.z, b.word & 0xFFFu, b.label, tc.verdict, tc.anchorFlags);
+      continue;
+    }
+    const Comp& cm = comps[(size_t)b.comp];
+    std::printf("island-band: tick %u (%d,%d,%d) mat %u comp %d of %zu cells anch %d bnd %d unk %d "
+                "big %d pwd %d via %d at (%d,%d,%d) viaCell (%d,%d,%d) complete %d unf %d held %d "
+                "made %d | seed (%d,%d,%d)..(%d,%d,%d)\n",
+                tick, b.c.x, b.c.y, b.c.z, b.word & 0xFFFu, b.comp, cm.cells.size(),
+                cm.anchored ? 1 : 0, cm.boundaryAnchor ? 1 : 0, cm.unknownAnchor ? 1 : 0,
+                cm.oversizeAnchor ? 1 : 0, cm.powderAnchor ? 1 : 0, cm.viaNeighbor ? 1 : 0,
+                cm.anchorAt.x, cm.anchorAt.y, cm.anchorAt.z, cm.viaCell.x, cm.viaCell.y,
+                cm.viaCell.z, cm.complete ? 1 : 0, cm.touchedUnfetched ? 1 : 0,
+                cm.heldByEarlier ? 1 : 0, cm.made ? 1 : 0, e.seedLo.x, e.seedLo.y, e.seedLo.z,
+                e.seedHi.x, e.seedHi.y, e.seedHi.z);
+  }
+
+  // The tick's verdict table: one entry per component, in label order, so a
+  // later scan this tick that meets these cells inherits instead of
+  // re-flooding (see the seed loop). Must stay exactly comps.size() long --
+  // labels index it.
+  for (const Comp& cm : comps) {
+    TickComp tc;
+    if (cm.anchored) {
+      tc.verdict = TICK_ANCHORED;
+      tc.anchorFlags = (uint8_t)((cm.boundaryAnchor ? 1u : 0u) |
+                                 (cm.unknownAnchor ? 2u : 0u) |
+                                 (cm.oversizeAnchor ? 4u : 0u) |
+                                 (cm.powderAnchor ? 8u : 0u));
+    } else if (cm.touchedUnfetched) {
+      tc.verdict = TICK_WAIT;
+      tc.waitChunk = cm.waitSet ? cm.waitChunk : waitOn;
+    } else if (cm.made) {
+      tc.verdict = TICK_MADE;
+    } else {
+      tc.verdict = TICK_HELD;
+    }
+    tickComps_.push_back(tc);
+  }
+
   // SANDVOX_ISLAND_TRACE=1: one line per scan, naming what the scan saw and
   // what it is waiting for. The live --fell-tree harness found a cut tree
   // that never became a body (99 scans, 3 fetch give-ups, 165k cells read
@@ -1418,29 +1849,32 @@ void DebrisSystem::RunIslandDetection(const Event& e, uint32_t tick, World& worl
         }
       }
     }
-    const CachedChunk* fw = needFetch ? world.Cached(firstWait) : nullptr;
+    const CachedChunk* fw = needFetch ? world.Cached(waitOn) : nullptr;
     std::printf("island-trace: tick %u ev (%d,%d,%d)..(%d,%d,%d) seed (%d,%d,%d).."
                 "(%d,%d,%d) retry %u fetchRetry %u | comps %zu cells %zu largest "
                 "%zu flags %d (1 anch 2 bnd 4 unk 8 big 16 pwd 32 unf 64 done) box "
                 "(%d,%d,%d)..(%d,%d,%d) anchorAt (%d,%d,%d) | "
-                "fetches %u needFetch %d firstWait (%d,%d,%d) inWin %d cached %d "
-                "ver %u words %zu | defer %d made %u\n",
+                "wanted %zu fetches %u spec %u needFetch %d waitOn (%d,%d,%d) inWin %d "
+                "cached %d ver %u words %zu | shared %d held %d ovHid %u ovShow %u | defer %d made %u\n",
                 tick, e.lo.x, e.lo.y, e.lo.z, e.hi.x, e.hi.y, e.hi.z, e.seedLo.x,
                 e.seedLo.y, e.seedLo.z, e.seedHi.x, e.seedHi.y, e.seedHi.z,
                 (unsigned)e.retries, (unsigned)e.fetchRetries, comps.size(),
                 cellsAll, largest, lFlags, lLo.x, lLo.y, lLo.z, lHi.x, lHi.y,
-                lHi.z, lAnchor.x, lAnchor.y, lAnchor.z, fetchesIssued, needFetch ? 1 : 0,
-                firstWait.x, firstWait.y, firstWait.z,
-                world.ChunkInWindow(firstWait) ? 1 : 0, fw ? 1 : 0,
+                lHi.z, lAnchor.x, lAnchor.y, lAnchor.z, wanted.size(),
+                fetchesIssued, speculative, needFetch ? 1 : 0,
+                waitOn.x, waitOn.y, waitOn.z,
+                world.ChunkInWindow(waitOn) ? 1 : 0, fw ? 1 : 0,
                 fw ? fw->version : 0u, fw ? fw->voxels.size() : (size_t)0,
+                inheritedWait ? 1 : 0, heldMatters ? 1 : 0, overlayHid, overlayShow,
                 deferEvent ? 1 : 0, madeThisScan);
   }
+  if (deferEvent) {
     if (needFetch ? e.fetchRetries < kMaxFetchRetries : e.retries < kMaxEventRetries) {
       Event again = e;
       if (needFetch) {
         again.fetchRetries = (uint8_t)(e.fetchRetries + 1);
         again.waiting = true;
-        again.waitChunk = firstWait;
+        again.waitChunk = waitOn;
       } else {
         again.retries = (uint8_t)(e.retries + 1);
         again.waiting = false;
@@ -1457,7 +1891,7 @@ void DebrisSystem::RunIslandDetection(const Event& e, uint32_t tick, World& worl
       floaters_.deferGaveUp++;
       if (needFetch) {
         floaters_.deferGaveUpFetch++;
-        floaters_.gaveUpChunk = firstWait;
+        floaters_.gaveUpChunk = waitOn;
         floaters_.gaveUpSeedLo = e.seedLo;
         floaters_.gaveUpSeedHi = e.seedHi;
         floaters_.gaveUpChunkInWindow = world.ChunkInWindow(last.wc) ? 1 : 0;
@@ -1523,6 +1957,10 @@ void DebrisSystem::PreTick(uint32_t tick, World& world, std::vector<CellOp>& cel
   }
 
   // ---- drain the event queue -----------------------------------------------
+  //
+  // The flood's label map and verdict table are shared by every scan of this
+  // tick and forgotten here (debris.h, labelPages_).
+  BeginTickLabels();
   //
   // THE HEAD OF THIS QUEUE USED TO BLOCK ALL OF IT. Only `events_.front()` was
   // ever examined: if the head's chunks had not arrived, the tick did nothing

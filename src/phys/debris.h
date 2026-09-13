@@ -1,7 +1,9 @@
 #pragma once
+#include <array>
 #include <chrono>
 #include <cstdint>
 #include <deque>
+#include <memory>
 #include <functional>
 #include <string>
 #include <unordered_map>
@@ -646,6 +648,8 @@ class DebrisSystem {
     uint32_t fetchWaitNoCache = 0;     // a flood met a chunk never fetched
     uint32_t fetchWaitNoVoxels = 0;    // ...or cached without a voxel copy
     uint32_t fetchWaitStale = 0;       // ...or cached older than the event
+    uint32_t sharedSeedCells = 0;      // seed cells an earlier scan this tick had labelled
+    uint32_t speculativeFetches = 0;   // ring / column chunks asked for ahead of the flood
     IVec3 gaveUpChunk{}, gaveUpSeedLo{}, gaveUpSeedHi{};  // the last fetch give-up
     uint32_t gaveUpChunkInWindow = 0, gaveUpChunkCached = 0;
     uint32_t deferredBodyCap = 0;      // an assembly did not fit kMaxBodies
@@ -1023,9 +1027,53 @@ class DebrisSystem {
   // zeroing stays and the allocator leaves the hot path.
   std::vector<std::pair<IVec3, float>> terrainNeed_;  // ManageTerrain scratch
   std::vector<float> terrainNeedGrid_;  // per-body chunk grid, min distance
-  // The flood's visited map, keyed by world cell (PLAN §4: sparse, so a scan
-  // costs what it walks, not the 256^3 region it may walk in).
-  std::unordered_map<uint64_t, int32_t> scanLabel_;
+  // ---- THE FLOOD'S LABEL MAP: dense per chunk, shared across one tick -----
+  //
+  // Was an unordered_map keyed by packed world cell: a hash probe per cell
+  // visited and per neighbour examined, 1-2.5 us a cell over a 28k-voxel oak.
+  // Now a 4,096-entry int32 page per chunk the flood touches, allocated on
+  // first touch (16 KiB), recycled across ticks, and addressed through the
+  // chunk lookup the flood already caches (RunIslandDetection's `chunkOf`).
+  // Sparse in CHUNKS rather than in cells, which is the granularity the
+  // mirror has anyway: a scan still costs what it walks, not the 256^3 region.
+  //
+  // Cleared once per PreTick, NOT per scan, and that is the other half of the
+  // point. Three events flood the same felled tree every round (the brush's
+  // destruction event plus a GPU support flag for each chunk the cut touched)
+  // and each used to walk all of it from its own seed. A seed cell an earlier
+  // scan of this tick already labelled INHERITS that component's verdict from
+  // tickComps_ instead of re-flooding it; a flood that runs into such a
+  // component adopts its verdict the same way.
+  //
+  // Bounded by pages as the old map was bounded by kMaxIslandVoxels: past
+  // kMaxLabelPages a component is anchored as oversize (unjudgeable), exactly
+  // what the cell cap does. 2,048 pages is 32 MiB at a peak nothing real
+  // reaches -- one oak is ~112 chunks -- and the pages persist only at the
+  // high-water mark, not at the cap.
+  //
+  // `index` rides beside the label: the cell's position in its component's
+  // cell list, valid only where `label` is that component's. The shard dice
+  // and the weld pass used to rebuild two hash maps over a 28k-voxel tree to
+  // answer "which cell is my neighbour" -- more than the flood itself cost.
+  static constexpr uint32_t kMaxLabelPages = 2048;
+  struct LabelPageData {
+    std::array<int32_t, kChunkVol> label;  // -1 = unlabelled this tick
+    std::array<int32_t, kChunkVol> index;  // meaningful only under a live label
+  };
+  std::unordered_map<uint64_t, uint32_t> labelPageOf_;  // chunk key -> page
+  std::vector<std::unique_ptr<LabelPageData>> labelPages_;
+  uint32_t labelPagesUsed_ = 0;
+  LabelPageData* LabelPage(IVec3 wc);  // this tick's page for a chunk; nullptr past the cap
+  // One verdict per component labelled this tick, indexed by label, for a
+  // later scan of the same tick that meets the component's cells.
+  enum : uint8_t { TICK_ANCHORED = 1, TICK_WAIT, TICK_HELD, TICK_MADE };
+  struct TickComp {
+    uint8_t verdict = 0;
+    uint8_t anchorFlags = 0;  // 1 boundary, 2 unknown, 4 oversize, 8 powder
+    IVec3 waitChunk{};        // TICK_WAIT: the chunk its event waits for
+  };
+  std::vector<TickComp> tickComps_;
+  void BeginTickLabels();  // PreTick: forget the last tick's labels + verdicts
   struct Anchor {
     Vec3 pos;
     float radius = 0.0f;
