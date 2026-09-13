@@ -1384,6 +1384,37 @@ class Mob {
   // open, everywhere, always (ai_nav.h rule 1).
   bool CellSupportsWeight(World& world, IVec3 cell) const;
 
+  // ---- footfall events (presentation only) --------------------------------
+  // A foot touching down, produced by the gait's own plant moment rather than
+  // by a distance accumulator. These QUEUE because PreTick runs inside the
+  // fixed-tick loop (up to 4 ticks per frame): the consumer drains them once
+  // per frame. Presentation only — nothing here may feed back into the sim.
+  //
+  // The TICK-SIDE consumer of a plant is not this queue: ShedCoat is called at
+  // the plant itself, inside the tick, so what a bloody foot tracks onto the
+  // floor is keyed on the tick and not on how many frames the renderer got.
+  // The queue stays exactly what it was — sound and dust.
+  //
+  // On the AVATAR main.cpp drains and clears this every frame. On an NPC
+  // nothing drains it yet, so PreTick clears it and it is capped at
+  // kMaxFootfalls (oldest dropped) — an undrained queue may not grow (rule 2).
+  struct Footfall {
+    Vec3 posVox{};      // where the foot landed
+    uint32_t mat = 0;   // material id of the supporting voxel (0 = unknown)
+    float speed = 0;    // walker speed at touchdown, voxels/sec
+    int foot = 0;       // chain index, so left/right can be pitched apart
+    bool landing = false;  // true when this is a touchdown from a fall
+    float fallSpeed = 0;   // downward speed on a landing, voxels/sec
+  };
+  static constexpr size_t kMaxFootfalls = 8;
+  const std::vector<Footfall>& Footfalls() const { return footfalls_; }
+  void ClearFootfalls() { footfalls_.clear(); }
+  // Queue one, dropping the oldest past the cap.
+  void PushFootfall(const Footfall& ff) {
+    if (footfalls_.size() >= kMaxFootfalls) footfalls_.erase(footfalls_.begin());
+    footfalls_.push_back(ff);
+  }
+
   // Release a body's burn index and front (lattice compacted / rig torn down).
   static void DropBurnIndex(BodyBurnState& st);
   // Draw the entity-scoped gore variance for one creature id.
@@ -1711,6 +1742,19 @@ class Mob {
   // queued. Does NOT touch the foot's own lattice — the caller subtracts what
   // left, because only the caller knows which voxels those were.
   bool DepositCoat(uint32_t mat, IVec3 groundCell, uint32_t tick);
+  // ---- A BLOODY FOOT LEAVES A PRINT ----------------------------------------
+  // Called AT THE PLANT — both gait drivers, and the avatar's fall landing —
+  // with the chain's effector limb and the world position the foot came down
+  // on. Rolls the coat material's own authored `coat.shed` (per mille), and on
+  // a hit tracks one droplet into each distinct ground cell of the sole's
+  // footprint (tune.coat.shedCells), then takes the same amount back OFF the
+  // sole so the substance is moved rather than copied.
+  //
+  // A CLEAN FOOT PAYS NOTHING: the limb's ledger is read first, and a limb
+  // carrying nothing that declares a shed rate returns before any probe.
+  // Returns how many droplets it actually put down (0 = a clean foot, a
+  // failed roll, no ground, or a refused budget).
+  uint32_t ShedCoat(int footLimb, Vec3 footPosVox, uint32_t tick, World& world);
   // Burnable voxels of a limb with at least one open face, on its
   // authoritative lattice. One hash pass; taken once per limb (surfaceAtSpawn).
   uint32_t SurfaceCount(const MobLimb& limb) const;
@@ -1810,6 +1854,9 @@ class Mob {
   // consumed the entire reach reserve and the IK sat on its clamp.
   float restFootAhead_ = 0;
   bool footInit_ = false;
+  // Touchdowns since the consumer last drained (see Footfall). Capped, so an
+  // NPC nobody listens to costs eight entries and never more.
+  std::vector<Footfall> footfalls_;
 
   // The rig this instance actually animates: a COPY of def_->skel/limbs,
   // owned per creature, because a held ITEM borrows a real rig slot by
@@ -2584,6 +2631,21 @@ class MobSystem {
   // coat onto the ground (the footfall wiring is P2's).
   bool DepositCoatOn(uint64_t mobId, uint32_t mat, IVec3 groundCell,
                      uint32_t tick);
+  // Mob::ShedCoat by id — the footfall path the gait drivers take, reachable
+  // from a gate that wants to plant one foot without walking a creature.
+  uint32_t ShedCoatOn(uint64_t mobId, int footLimb, Vec3 footPosVox,
+                      uint32_t tick, World& world);
+  // Put `amount` of `mat` on every occupied voxel of one limb and recount. The
+  // direct door onto the coat that the world's own paths -- contact, splatter,
+  // the cut soak -- all reach the long way round: a caller (a gate, an
+  // authoring tool) that wants a bloody FOOT and no other consequence has no
+  // other way to ask for one. Returns the voxels marked.
+  uint32_t SoakLimb(uint64_t mobId, int limb, uint32_t mat, uint32_t amount,
+                    uint32_t tick);
+  // Force the ledger's cadence (Mob::RecountCoat) for one creature, so a
+  // caller that has just changed a coat can read the answer this instant
+  // instead of waiting out tune.coat.recountTicks.
+  void RecountCoatOn(uint64_t mobId, uint32_t tick);
   // Queue one tick of a gout / spray for every OTHER body to be splashed by
   // (see SplatterEvent). Bounded: past kSplatterMaxEvents the burst is not
   // remembered, which only loses cosmetics.
@@ -2827,8 +2889,13 @@ class MobSystem {
 
   // Animation pipeline stages 1-5 plus the procedural gait layer; leaves the
   // model-space pose in mob.anim.model. Pure float, no grid contact.
-  void UpdateAnimation(Mob& mob, const MobDef& def, World& world, float dt);
-  void UpdateGait(Mob& mob, const MobDef& def, World& world, float dt);
+  // `tick` reaches these only so the gait's PLANT can run Mob::ShedCoat, which
+  // is tick-keyed like every other RNG in this engine. The pose itself is
+  // still a pure function of dt.
+  void UpdateAnimation(Mob& mob, const MobDef& def, World& world, float dt,
+                       uint32_t tick);
+  void UpdateGait(Mob& mob, const MobDef& def, World& world, float dt,
+                  uint32_t tick);
   // Ease the DRAWN body height (Mob::bodyY_) toward `targetY`: a rate in
   // metres per second AND a hard bound on the lag. See the long note at the
   // definition for why the bound is the load-bearing half.

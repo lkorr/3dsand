@@ -155,20 +155,11 @@ class PlayerAvatar : public Mob {
   void SetLook(float yawRel, float pitch);
 
   // ---- footfall events (presentation only) --------------------------------
-  // A foot touching down, produced by the gait's own plant moment rather than
-  // by a distance accumulator. These QUEUE because PreTick runs inside the
-  // fixed-tick loop (up to 4 ticks per frame): the consumer drains them once
-  // per frame. Presentation only — nothing here may feed back into the sim.
-  struct Footfall {
-    Vec3 posVox{};      // where the foot landed
-    uint32_t mat = 0;   // material id of the supporting voxel (0 = unknown)
-    float speed = 0;    // walker speed at touchdown, voxels/sec
-    int foot = 0;       // chain index, so left/right can be pitched apart
-    bool landing = false;  // true when this is a touchdown from a fall
-    float fallSpeed = 0;   // downward speed on a landing, voxels/sec
-  };
-  const std::vector<Footfall>& Footfalls() const { return footfalls_; }
-  void ClearFootfalls() { footfalls_.clear(); }
+  // `Footfall`, `Footfalls()` and `ClearFootfalls()` are inherited from Mob:
+  // every creature plants feet, and P2's coat shedding runs off the same
+  // moment, so the event could not stay player-only. main.cpp still drains
+  // and clears the avatar's queue once per frame — that is the avatar's half
+  // of the contract and it is unchanged.
 
   // (EquipItem / HeldItem / HeldSlot / WeaponEdge / WeaponArmPose / OwnsBody /
   // SetWeaponPose are inherited from Mob — item holding is base-class
@@ -418,9 +409,12 @@ class PlayerAvatar : public Mob {
   // the player's true velocity and grounded state, ledge-hang arm IK, head
   // look and the weapon arm. The MECHANICS underneath (clips, IK solver,
   // springs, dismemberment states) are the shared anim runtime.
+  // `tick` reaches these for one reason only: the gait's PLANT runs
+  // Mob::ShedCoat, whose roll is tick-keyed like every other RNG here. The
+  // pose is still a pure function of dt.
   void UpdateAnimation(float dt, World& world, bool grounded,
-                       const Vec3& playerVel);
-  void UpdateGait(float dt, World& world);
+                       const Vec3& playerVel, uint32_t tick);
+  void UpdateGait(float dt, World& world, uint32_t tick);
   // Airborne leg pose: relaxes the legs toward their rest hang instead of
   // leaving IK chasing a stale world-space foot plant.
   void UpdateAirPose(float dt);
@@ -440,7 +434,6 @@ class PlayerAvatar : public Mob {
   AvatarLocoClips locoClips_;
   bool spawned_ = false;
   bool instancesDirty_ = false;
-  std::vector<Footfall> footfalls_;  // drained once per frame by the caller
 
   bool footfallInit_ = false;
   // How strongly the leg IK is applied, 0..1. Eased rather than switched: on

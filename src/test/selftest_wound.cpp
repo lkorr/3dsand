@@ -2648,8 +2648,12 @@ Status GateBodyStain(Ctx& c, std::string& detail) {
 //   * A COAT CAN GO BACK ON THE GROUND. Mob::DepositCoat puts one micro
 //     droplet of the substance inside a floor cell; the ordinary particle
 //     kernel resolves it into that cell's stain bits, so a tracked footprint
-//     is a real world stain and not a second mechanism. (P2 wires the
-//     footfall; this proves the deposit.)
+//     is a real world stain and not a second mechanism.
+//   * ...AND A FOOTFALL IS WHAT SPENDS IT. Mob::ShedCoat, at the plant, puts
+//     that deposit under the sole and takes the same amount OFF the foot: the
+//     floor gains blood it did not have and the limb's ledger falls. Both
+//     halves, because a print that only adds is a duplicator (rule 2) and one
+//     that only subtracts is a leak.
 Status GateBodyCoat(Ctx& c, std::string& detail) {
   MobSystem& mobs = c.mobs;
   IdCounterScope idScope(mobs);
@@ -2832,6 +2836,137 @@ Status GateBodyCoat(Ctx& c, std::string& detail) {
                          VoxStainType(depAfter) == mobs.StainTypeOf(mBlood) &&
                          VoxStainAmt(depAfter) > 0;
 
+  // ---- 3b. A BLOODY FOOT LEAVES A PRINT WHERE IT LANDS (P2) ----------------
+  // The claim above proves the DEPOSIT. This proves the FOOTFALL: the plant
+  // itself moves the substance off the sole and onto the cells the sole
+  // covers. Two halves, because either alone is satisfiable by a bug —
+  //   * the floor under the foot gains blood it did NOT have before the plant
+  //     (measured as a delta, because the cut limb has been dripping onto this
+  //     floor for 150 ticks and a bare "is there blood here" reads yes), and
+  //   * the foot's own ledger sums to LESS afterwards. A print that only adds
+  //     is a duplicator, and an infinite one — a creature would paint the
+  //     whole map from one wound (rule 2).
+  //
+  // BEFORE the drying arm, for claim 3's reason: that arm runs hundreds of
+  // ticks with an open wound and may end with a corpse.
+  //
+  // The foot is bloodied through MobSystem::SoakLimb rather than by cutting
+  // it, so this phase has NO other consequence: no wound, no bleed, no
+  // splatter onto the limb claims 2 and 4 are measured on.
+  int footLimb = -1;
+  for (size_t li = 0; li < def.limbs.size() && footLimb < 0; li++)
+    if (def.limbs[li].tag == "foot" && mobs.LimbBody(id, (int)li))
+      footLimb = (int)li;
+  for (size_t li = 0; li < def.limbs.size() && footLimb < 0; li++)
+    if (def.limbs[li].tag == "leg" && mobs.LimbBody(id, (int)li))
+      footLimb = (int)li;
+  if (footLimb < 0) {  // untagged rig: the limb whose live pose sits lowest
+    float best = 1e30f;
+    for (size_t li = 0; li < def.limbs.size(); li++) {
+      float lo = 0.0f, hi = 0.0f;
+      if (mobs.LimbBody(id, (int)li) &&
+          mobs.LimbStainWorldYRange(id, (int)li, 0, lo, hi) && lo < best) {
+        best = lo;
+        footLimb = (int)li;
+      }
+    }
+  }
+  std::string footName = footLimb >= 0 ? def.limbs[footLimb].name : "-";
+  uint32_t footPainted = 0, shedDroplets = 0, shedTries = 0;
+  uint32_t footSumPainted = 0, footSumBefore = 0, footSumAfter = 0;
+  uint32_t printCells = 0, printAmt = 0;
+  int printY = 0;
+  if (footLimb >= 0 && mBlood) {
+    footPainted = mobs.SoakLimb(id, footLimb, mBlood, kBodyStainAmtMax, simTick);
+    if (const LimbCoat* lc = mobs.LimbCoatOf(id, footLimb))
+      footSumPainted = lc->sumAmt;
+    const Vec3 footAt = mobs.LimbVoxelPos(id, footLimb, 0);
+    // The cells the print can land in: the sole's 3x3 column footprint on the
+    // topmost SOLID cell under the foot. Found through the CPU mirror because
+    // that is the same picture Mob::GroundHeightAt reads inside ShedCoat, so
+    // this is the set of cells the shed could have chosen and not a guess.
+    auto mirrorWord = [&](IVec3 cc) -> uint32_t {
+      const CachedChunk* k =
+          c.world.Cached(IVec3{cc.x >> 4, cc.y >> 4, cc.z >> 4});
+      if (!k || k->voxels.size() != kChunkVol) return 0u;
+      return k->voxels[(((uint32_t)cc.z & 15u) * kChunk +
+                        ((uint32_t)cc.y & 15u)) * kChunk +
+                       ((uint32_t)cc.x & 15u)];
+    };
+    const int fx = ifloor(footAt.x), fz = ifloor(footAt.z);
+    printY = INT32_MIN;
+    for (int dy = 2; dy >= -4; dy--) {
+      const IVec3 cc{fx, ifloor(footAt.y) + dy, fz};
+      if (!c.world.CellInWindow(cc)) continue;
+      if ((mirrorWord(cc) & 0xFFFu) != 0u) { printY = cc.y; break; }
+    }
+    std::vector<IVec3> cells;
+    if (printY != INT32_MIN)
+      for (int dz = -1; dz <= 1; dz++)
+        for (int dx = -1; dx <= 1; dx++) {
+          const IVec3 cc{fx + dx, printY, fz + dz};
+          if (c.world.CellInWindow(cc)) cells.push_back(cc);
+        }
+    // Authoritative words for those cells, one readback per distinct chunk
+    // (a 3x3 column straddles at most four).
+    std::vector<uint32_t> chunk(kChunkVol, 0);
+    auto readCells = [&](std::vector<uint32_t>& out) {
+      out.assign(cells.size(), 0u);
+      std::vector<IVec3> done;
+      for (size_t i = 0; i < cells.size(); i++) {
+        const IVec3 ch{cells[i].x >> 4, cells[i].y >> 4, cells[i].z >> 4};
+        bool have = !done.empty() && done.back().x == ch.x &&
+                    done.back().y == ch.y && done.back().z == ch.z;
+        if (!have) {
+          ReadVoxelsSync(c.ctx, c.world, World::SlotChunkIndex(ch), 1,
+                         chunk.data(), "coatPrint");
+          done.assign(1, ch);
+        }
+        out[i] = chunk[(((uint32_t)cells[i].z & 15u) * kChunk +
+                        ((uint32_t)cells[i].y & 15u)) * kChunk +
+                       ((uint32_t)cells[i].x & 15u)];
+      }
+    };
+    std::vector<uint32_t> before, after;
+    readCells(before);
+    // THE ROLL IS PER MILLE AND PER TICK, so a single plant can legitimately
+    // print nothing (blood sheds at 400). Up to eight plants, one per tick,
+    // and the gate stops at the first that puts something down — the same
+    // thing a walk does, at a pace no faster than a real one.
+    for (; shedTries < 8 && shedDroplets == 0; shedTries++) {
+      // The ledger is re-read on EVERY attempt, so the before/after pair
+      // brackets the successful plant alone: the drying sweep also takes
+      // levels off, and a delta measured across the whole loop would credit
+      // the footfall with whatever evaporated while it was rolling.
+      mobs.RecountCoatOn(id, simTick);
+      if (const LimbCoat* lc = mobs.LimbCoatOf(id, footLimb))
+        footSumBefore = lc->sumAmt;
+      shedDroplets = mobs.ShedCoatOn(id, footLimb, footAt, simTick, c.world);
+      if (shedDroplets == 0) worldTick();
+    }
+    // Read the ledger back BEFORE any further tick: the drying sweep also
+    // takes levels off, and this half of the claim is about the plant.
+    mobs.RecountCoatOn(id, simTick);
+    if (const LimbCoat* lc = mobs.LimbCoatOf(id, footLimb))
+      footSumAfter = lc->sumAmt;
+    // Three ticks, for claim 3's reason: drain, append, integrate + resolve.
+    for (int i = 0; i < 3; i++) worldTick();
+    readCells(after);
+    const uint32_t bloodType = mobs.StainTypeOf(mBlood);
+    for (size_t i = 0; i < cells.size(); i++) {
+      const bool wasBlood =
+          VoxStainType(before[i]) == bloodType && VoxStainAmt(before[i]) > 0;
+      const bool isBlood =
+          VoxStainType(after[i]) == bloodType && VoxStainAmt(after[i]) > 0;
+      if (isBlood && (!wasBlood || VoxStainAmt(after[i]) > VoxStainAmt(before[i]))) {
+        printCells++;
+        printAmt += VoxStainAmt(after[i]);
+      }
+    }
+  }
+  const bool printOk = footLimb >= 0 && footPainted > 0 && shedDroplets > 0 &&
+                       printCells > 0 && footSumAfter < footSumBefore;
+
   // ---- 4. ...and at a scale that makes the period two ticks, it DOES dry ---
   // decayScale DIVIDES the authored seconds, so 300 turns blood's 20 s per
   // level into 2 ticks. Restored below whatever happens: tuning is global.
@@ -2865,20 +3000,29 @@ Status GateBodyCoat(Ctx& c, std::string& detail) {
   RecordObserved("bodyCoatDecayedStained", (double)decayedStain);
   RecordObserved("bodyCoatDecayTicks", (double)ranTicks);
   RecordObserved("bodyCoatDepositAmount", (double)VoxStainAmt(depAfter));
+  RecordObserved("bodyCoatFootPainted", (double)footPainted);
+  RecordObserved("bodyCoatShedTries", (double)shedTries);
+  RecordObserved("bodyCoatShedDroplets", (double)shedDroplets);
+  RecordObserved("bodyCoatPrintCells", (double)printCells);
+  RecordObserved("bodyCoatPrintAmount", (double)printAmt);
+  RecordObserved("bodyCoatFootSumBefore", (double)footSumBefore);
+  RecordObserved("bodyCoatFootSumAfter", (double)footSumAfter);
 
   mobs.Reset();
   c.debris.Reset();
   SubmitWorldgen(c.ctx, c.world, c.sim, kDefaultSeed);
   c.ctx.WaitIdle();
 
-  const bool ok = ledgerOk && holdOk && decayOk && depositOk;
+  const bool ok = ledgerOk && holdOk && decayOk && depositOk && printOk;
   detail = Format(
       "%s/%s%s: ledger top = mat %u (want %u, blood %u) over %u voxels, "
       "frac %.4f, body sum %u >= limb sum %u, unknown tag %.2f; "
       "stained %u -> %u over %u ticks at the authored 20 s/level%s "
       "(floor %.0f%%), then -> %u over %u ticks at 2 ticks/level "
       "(cap %.0f%%); deposit %s on stone at (%d,%d,%d): word %08x -> %08x, "
-      "stain type %u amount %u",
+      "stain type %u amount %u; footfall on %s: %u voxels soaked (ledger %u), "
+      "%u droplet(s) down after %u plant(s), %u floor cell(s) at y%d newly "
+      "bloodied (amount %u), sole ledger %u -> %u",
       t.defName.c_str(), t.limbName.c_str(), pinned ? "" : " (NOT pinned)",
       limbLedger.top[0].mat, coatMat, mBlood, limbLedger.voxels,
       (double)limbLedger.Frac(), bodyLedger.sumAmt, limbLedger.sumAmt,
@@ -2886,7 +3030,9 @@ Status GateBodyCoat(Ctx& c, std::string& detail) {
       holdWindowClean ? "" : " (WINDOW CROSSED A DECAY PERIOD)", holdMin * 100.0,
       decayedStain, ranTicks, decayMax * 100.0, queued ? "queued" : "REFUSED",
       floorCell.x, floorCell.y, floorCell.z, depBefore, depAfter,
-      VoxStainType(depAfter), VoxStainAmt(depAfter));
+      VoxStainType(depAfter), VoxStainAmt(depAfter), footName.c_str(),
+      footPainted, footSumPainted, shedDroplets, shedTries, printCells, printY,
+      printAmt, footSumBefore, footSumAfter);
   return ok ? Status::Pass : Status::Fail;
 }
 

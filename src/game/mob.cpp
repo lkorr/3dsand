@@ -3043,7 +3043,8 @@ void MobSystem::EaseBodyY(Mob& mob, float targetY, float dt) {
 // Procedural gait layer. Writes foot targets into mob.anim_.feet and derives
 // the body height/tilt from the resulting foot plane; the IK pass in
 // UpdateAnimation then places the legs.
-void MobSystem::UpdateGait(Mob& mob, const MobDef& def, World& world, float dt) {
+void MobSystem::UpdateGait(Mob& mob, const MobDef& def, World& world, float dt,
+                           uint32_t tick) {
   const AnimSkeleton& sk = mob.skel_;
   const GaitDef& g = sk.gait;
   if (sk.chains.empty()) return;
@@ -3110,6 +3111,11 @@ void MobSystem::UpdateGait(Mob& mob, const MobDef& def, World& world, float dt) 
     int group = -1;
     float drift = 0;
     Vec3 to{};
+    // The surface under `to`, taken by the probe that chose it. Carried on the
+    // bid rather than re-read at touchdown for the avatar's reason (anim.h
+    // FootState::swingMat): the sound and the print should name the ground the
+    // foot was AIMED at, even if the world changed underneath mid-swing.
+    uint32_t mat = 0;
   };
   std::vector<StepBid> bids;
 
@@ -3151,8 +3157,10 @@ void MobSystem::UpdateGait(Mob& mob, const MobDef& def, World& world, float dt) 
     Vec3 ideal = hipWorld + fwd * (g.strideBias * f.legLength * speedFactor) +
                  mob.anim_.velocity * g.leadTime;
     int groundY = 0;
+    uint32_t groundMat = 0;
     if (mob.GroundHeightAt(world, ifloor(ideal.x), ifloor(ideal.z),
-                       ifloor(mob.origin_.y) + kMobProbeLiftCells, groundY))
+                       ifloor(mob.origin_.y) + kMobProbeLiftCells, groundY,
+                       &groundMat))
       ideal.y = (float)groundY;
     else
       ideal.y = mob.origin_.y;
@@ -3169,6 +3177,19 @@ void MobSystem::UpdateGait(Mob& mob, const MobDef& def, World& world, float dt) 
         f.swingT = 0;
         f.swinging = false;
         f.planted = f.swingTo;
+        // THE FOOTFALL, on the same terms the avatar's is (Mob::Footfall):
+        // the gait's own touchdown moment, so a step is heard exactly when the
+        // art shows the foot land and a severed leg stops producing steps for
+        // free. Nothing drains an NPC's queue yet — PushFootfall caps it.
+        Mob::Footfall ff;
+        ff.posVox = f.swingTo;
+        ff.mat = f.swingMat;
+        ff.speed = mob.speedNow_;
+        ff.foot = (int)c;
+        if (ff.mat != 0) mob.PushFootfall(ff);
+        // ...and what is on the foot comes off on the floor. Tick-side, at the
+        // plant, for the reason spelled out at the avatar's copy of this line.
+        mob.ShedCoat(ch.effector, f.planted, tick, world);
       } else {
         Vec3 flat = f.swingFrom + (f.swingTo - f.swingFrom) * f.swingT;
         // sin(t*pi) arc: zero lift at both ends, peak at mid-swing
@@ -3187,7 +3208,7 @@ void MobSystem::UpdateGait(Mob& mob, const MobDef& def, World& world, float dt) 
           if (p == ch.effector || p == ch.parts[0]) myGroup = (int)gi;
       if (driftLen > g.stepThreshold * f.legLength)
         bids.push_back(StepBid{c, myGroup >= 0 ? myGroup : (int)c, driftLen,
-                               ideal});
+                               ideal, groundMat});
       sumY += f.planted.y;
       nFeet++;
     }
@@ -3233,6 +3254,7 @@ void MobSystem::UpdateGait(Mob& mob, const MobDef& def, World& world, float dt) 
       f.swingT = 0;
       f.swingFrom = f.planted;
       f.swingTo = b.to;
+      f.swingMat = b.mat;
     }
   }
 
@@ -3403,7 +3425,7 @@ void MobSystem::UpdateGait(Mob& mob, const MobDef& def, World& world, float dt) 
 }
 
 void MobSystem::UpdateAnimation(Mob& mob, const MobDef& def, World& world,
-                                float dt) {
+                                float dt, uint32_t tick) {
   const AnimSkeleton& sk = mob.skel_;
   AnimState& st = mob.anim_;
   if (sk.parts.empty()) return;
@@ -3558,7 +3580,7 @@ void MobSystem::UpdateAnimation(Mob& mob, const MobDef& def, World& world,
   // height follow origin_.y down instead.
   const bool gaitActive = g.present && !clipOwnsPose && !mob.airborne_;
   if (gaitActive) {
-    UpdateGait(mob, def, world, dt);
+    UpdateGait(mob, def, world, dt, tick);
   } else {
     // No foot plane is being maintained (legacy rig, or a loco clip owns the
     // pose): the animated body height follows the walk drive's ground contact
@@ -3701,6 +3723,12 @@ void MobSystem::PreTick(uint32_t tick, World& world, std::vector<BrushOp>& ops,
     // a piece left kinematic and unowned would never sleep (rule #2).
     mob.DrainPendingSpawns(world, spawns);
     mob.TickSeveredHolds(dt);
+    // NOBODY DRAINS AN NPC'S FOOTFALLS YET, so this tick's plants are cleared
+    // here at the top of the tick that will produce them. The avatar's queue
+    // is main.cpp's — cleared per FRAME, because that is who reads it — and
+    // this loop never sees the avatar. Without this the cap (Mob::PushFootfall)
+    // would be the only thing bounding a walking crowd's queues.
+    mob.ClearFootfalls();
 
     // corpses hand their bodies to DebrisSystem in Die(); drop the husk once
     // no limb is still holding a pose
@@ -3748,7 +3776,7 @@ void MobSystem::PreTick(uint32_t tick, World& world, std::vector<BrushOp>& ops,
       // pose (the crouch-then-rise curve). No intent and no drive, so it
       // cannot walk off before its feet are under it.
       mob.TickGetUp(dt);
-      UpdateAnimation(mob, def, world, dt);
+      UpdateAnimation(mob, def, world, dt, tick);
       mob.SubmitPose(dt, /*writeXf=*/false);
     } else if (mob.alive_) {
       // ---- locomotion: sense -> intent -> steer -> drive ----
@@ -3791,7 +3819,7 @@ void MobSystem::PreTick(uint32_t tick, World& world, std::vector<BrushOp>& ops,
       StepStroke(mob, tick, world, spawns);
 
       // ---- stages 1-5: pose the rig (float presentation state) ----
-      UpdateAnimation(mob, def, world, dt);
+      UpdateAnimation(mob, def, world, dt, tick);
 
       // ---- stages 6-7: model space -> world, submit to Jolt ----
       // writeXf=false: the NPC path keeps limb.xf as PostStep left it, so its
@@ -8740,6 +8768,162 @@ bool Mob::DepositCoat(uint32_t mat, IVec3 groundCell, uint32_t tick) {
   return true;
 }
 
+// ---- A BLOODY FOOT LEAVES A PRINT ------------------------------------------
+//
+// The whole of "tracking": at the plant, roll the substance's own authored
+// chance, put one droplet into each ground cell the sole covers, and take the
+// same amount back OFF the sole. Nothing here is a new mechanism — the mark on
+// the floor is DepositCoat's ordinary micro droplet resolved by the particle
+// kernel, and the mark coming off the foot is the same lattice write the wash
+// branch of StainOneLimb makes.
+//
+// Why one droplet PER CELL and never two: sim_particle's resolve claims a cell
+// with an atomicMax, so a second droplet in the same cell this tick is simply
+// the loser of a max — a wasted spawn slot out of the shared per-tick budget
+// (tune.coat.shedPerTick). Distinct cells are the only thing worth spending on.
+//
+// Why the deposit is ONE TICK LATENT: DepositCoat queues into pendingSpawns_,
+// drained at the top of the next PreTick, which runs before the gait. See the
+// note there; nobody can see the difference and it keeps this callable from
+// wherever the plant happens to be.
+//
+// Why LIQUIDS ARE SKIPPED: the droplet is born at rest inside the cell it is
+// meant to stain. A water surface is not a solid, so the particle would fall
+// through it and the stain would land on the bed a dozen voxels down (or
+// nowhere). A creature wading is being WASHED anyway — StainOneLimb's wash
+// branch is the rule that applies there, and it already runs every tick.
+uint32_t Mob::ShedCoat(int footLimb, Vec3 footPosVox, uint32_t tick,
+                       World& world) {
+  if (!sys_ || sys_->matGpu_.empty() || !def_) return 0;
+  if (footLimb < 0 || footLimb >= (int)limbs_.size()) return 0;
+  // A GARMENT IS NOT ANATOMY — the exclusion RecountCoat and StainWound both
+  // apply. A boot shell printing its own soaked cloth is a later feature; a
+  // held item's borrowed rig slot is not one at all.
+  if (footLimb >= baseLimbs_ || IsWornSlot(footLimb)) return 0;
+  MobLimb& limb = limbs_[footLimb];
+  if (!limb.body) return 0;
+
+  // ---- IS THERE ANYTHING ON THIS FOOT THAT TRACKS? -------------------------
+  // Read off the LEDGER, which is most of why P1 built one: the alternative is
+  // a pass over the sole on every step of every creature, and the answer is
+  // almost always no (rule 2). `top` is heaviest-first, so the first entry
+  // with an authored shed rate is the substance that prints. Water authors
+  // coat.shed 0 and therefore never leaves one — wet feet are not a mark.
+  uint32_t mat = 0;
+  for (const CoatEntry& en : limb.coat.top) {
+    if (en.mat == 0 || en.sumAmt == 0) continue;
+    if (en.mat >= sys_->coatShed_.size() || sys_->coatShed_[en.mat] == 0)
+      continue;
+    mat = en.mat;
+    break;
+  }
+  if (mat == 0) return 0;
+
+  // The material's own per-mille chance that a step prints at all: blood is
+  // 400, so roughly two steps in five. Keyed on tick + creature + limb, so a
+  // replay tracks the same floor and the two feet roll independently.
+  if (Hash3((uint32_t)id_, tick, 0x5EED0u + (uint32_t)footLimb) % 1000u >=
+      sys_->coatShed_[mat])
+    return 0;
+
+  const auto& ct = CurrentTuning().coat;
+  const int wantCells = std::max(1, ct.shedCells);
+
+  // ---- WHICH CELLS THE SOLE COVERS -----------------------------------------
+  // A sole is wider than one column and a step onto a stair has cells at two
+  // heights, so each candidate column is probed with its OWN GroundHeightAt
+  // rather than the foot's height being reused. Distinct cells only (see the
+  // atomicMax note above); the neighbours are drawn from the 8 XZ neighbours
+  // by a tick-keyed hash, so a print is a scatter under the foot rather than a
+  // fixed rosette stamped identically every step.
+  static const int kNx[8] = {-1, 0, 1, -1, 1, -1, 0, 1};
+  static const int kNz[8] = {-1, -1, -1, 0, 0, 1, 1, 1};
+  IVec3 chosen[8];
+  int nChosen = 0;
+  const int yFrom = ifloor(footPosVox.y) + 2;
+  auto probe = [&](int x, int z) {
+    if (nChosen >= (int)(sizeof(chosen) / sizeof(chosen[0]))) return;
+    int gy = 0;
+    uint32_t gmat = 0;
+    if (!GroundHeightAt(world, x, z, yFrom, gy, &gmat)) return;
+    if (gmat == 0 || gmat >= sys_->matGpu_.size()) return;
+    if (sys_->matGpu_[gmat].klass == CLASS_LIQUID) return;
+    // GroundHeightAt answers with the SURFACE (the open cell above the solid);
+    // the cell that can hold a stain is the solid one under it.
+    const IVec3 cell{x, gy - 1, z};
+    for (int i = 0; i < nChosen; i++)
+      if (chosen[i].x == cell.x && chosen[i].y == cell.y &&
+          chosen[i].z == cell.z)
+        return;
+    chosen[nChosen++] = cell;
+  };
+  const int fx = ifloor(footPosVox.x), fz = ifloor(footPosVox.z);
+  probe(fx, fz);
+  for (int k = 0; k + 1 < wantCells && nChosen < wantCells; k++) {
+    const uint32_t h = Hash3((uint32_t)id_, tick, 0x50E1Eu + (uint32_t)k);
+    probe(fx + kNx[h % 8u], fz + kNz[h % 8u]);
+  }
+
+  uint32_t placed = 0;
+  for (int i = 0; i < nChosen; i++)
+    if (DepositCoat(mat, chosen[i], tick)) placed++;
+  // Refused by the shared budget or by a full spawn ring: NOTHING comes off
+  // the foot. The substance is moved, never destroyed, and a step that could
+  // not print has to be a step that did not lose anything either.
+  if (placed == 0) return 0;
+
+  // ---- ...AND THE SAME AMOUNT COMES OFF THE SOLE ---------------------------
+  // ONE level from each of `placed * shedAmount` voxels rather than the whole
+  // amount from one: a foot fades over its contact patch the way a real print
+  // sequence does, instead of punching a clean voxel into the middle of a
+  // bloody sole.
+  //
+  // THE SOLE BAND, not the whole foot. What leaves is what touched the floor,
+  // so the candidates are the stained voxels within one WORLD voxel of the
+  // limb lattice's lowest stained row. The pass is two scans of a foot's
+  // lattice — a few hundred cells — and only ever runs on a step that has
+  // already rolled and already deposited.
+  BurnLimbView v = ViewOf(limb);
+  const size_t n = v.Size();
+  if (n == 0) return placed;
+  int minY = INT_MAX;
+  for (size_t i = 0; i < n; i++) {
+    if (v.Mat(i) == 0) continue;  // tombstone
+    const uint16_t s = v.Stain(i);
+    if (BodyStainAmt(s) == 0 || BodyStainMat(s) != mat) continue;
+    minY = std::min(minY, (int)v.At(i).y);
+  }
+  if (minY == INT_MAX) return placed;  // ledger a tick stale; nothing to take
+  const int band = (int)std::max(1u, v.scale);
+  uint32_t want = placed * (uint32_t)std::max(0, ct.shedAmount);
+  if (want == 0) return placed;
+  // Tick-keyed start, exactly as the drying sweep uses: a sole wider than the
+  // handful of voxels being taken must not lose the same ones every step.
+  const uint32_t key = (uint32_t)id_ * 0x9E3779B9u ^ 0x57A1Eu ^
+                       ((uint32_t)footLimb * 2654435761u);
+  const size_t from = (size_t)(Hash3(key, tick, 0x5011Eu) % (uint32_t)n);
+  bool owned = false;
+  for (size_t j = 0; j < n && want; j++) {
+    const size_t vi = (from + j) % n;
+    if (v.Mat(vi) == 0) continue;
+    const uint16_t cur = v.Stain(vi);
+    const uint32_t amt = BodyStainAmt(cur);
+    if (amt == 0 || BodyStainMat(cur) != mat) continue;
+    if ((int)v.At(vi).y > minY + band) continue;
+    const uint16_t next = PackBodyStain(mat, amt - 1u);
+    v.SetStain(vi, next);
+    coatDirty_ = true;
+    want--;
+    if (!owned) owned = OwnForStain(v, sys_->microSet_);
+    if (owned) {
+      const IVec3 p = v.At(vi);
+      MicroBodyPokeStain(*sys_->microSet_, (uint32_t)*v.microModel, p.x, p.y,
+                         p.z, next);
+    }
+  }
+  return placed;
+}
+
 bool MobSystem::StainOneLimb(BurnLimbView& v, uint32_t tick, uint32_t rngKey,
                              World& world, uint32_t& budget) {
   if (matGpu_.empty() || v.Size() == 0 || budget == 0) return false;
@@ -10443,6 +10627,58 @@ bool MobSystem::DepositCoatOn(uint64_t mobId, uint32_t mat, IVec3 groundCell,
   if (avatar_ && avatar_->id_ == mobId)
     return avatar_->DepositCoat(mat, groundCell, tick);
   return false;
+}
+
+uint32_t MobSystem::ShedCoatOn(uint64_t mobId, int footLimb, Vec3 footPosVox,
+                               uint32_t tick, World& world) {
+  for (Mob& m : mobs_)
+    if (m.id_ == mobId) return m.ShedCoat(footLimb, footPosVox, tick, world);
+  if (avatar_ && avatar_->id_ == mobId)
+    return avatar_->ShedCoat(footLimb, footPosVox, tick, world);
+  return 0;
+}
+
+uint32_t MobSystem::SoakLimb(uint64_t mobId, int limb, uint32_t mat,
+                             uint32_t amount, uint32_t tick) {
+  Mob* mob = nullptr;
+  for (Mob& m : mobs_)
+    if (m.id_ == mobId) mob = &m;
+  if (!mob && avatar_ && avatar_->id_ == mobId) mob = avatar_;
+  if (!mob || !mob->def_ || mat == 0) return 0;
+  if (limb < 0 || limb >= (int)mob->limbs_.size()) return 0;
+  MobLimb& l = mob->limbs_[limb];
+  if (!l.body) return 0;
+  BurnLimbView v = mob->ViewOf(l);
+  const size_t n = v.Size();
+  uint32_t marked = 0;
+  bool owned = false;
+  for (size_t i = 0; i < n; i++) {
+    if (v.Mat(i) == 0) continue;  // tombstone
+    const uint16_t cur = v.Stain(i);
+    const uint16_t next = RaiseBodyStain(cur, mat, amount);
+    if (next == cur) continue;
+    v.SetStain(i, next);
+    marked++;
+    mob->coatDirty_ = true;
+    if (!owned) owned = OwnForStain(v, microSet_);
+    if (owned) {
+      const IVec3 p = v.At(i);
+      MicroBodyPokeStain(*microSet_, (uint32_t)*v.microModel, p.x, p.y, p.z,
+                         next);
+    }
+  }
+  mob->RecountCoat(tick, /*force=*/true);
+  return marked;
+}
+
+void MobSystem::RecountCoatOn(uint64_t mobId, uint32_t tick) {
+  for (Mob& m : mobs_)
+    if (m.id_ == mobId) {
+      m.RecountCoat(tick, /*force=*/true);
+      return;
+    }
+  if (avatar_ && avatar_->id_ == mobId)
+    avatar_->RecountCoat(tick, /*force=*/true);
 }
 
 void MobSystem::QueueSplatter(const SplatterEvent& e) {

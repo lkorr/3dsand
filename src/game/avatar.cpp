@@ -422,7 +422,7 @@ AvatarLocomotion PlayerAvatar::Locomotion() const {
 
 // ---- animation --------------------------------------------------------------
 
-void PlayerAvatar::UpdateGait(float dt, World& world) {
+void PlayerAvatar::UpdateGait(float dt, World& world, uint32_t tick) {
   const AnimSkeleton& sk = skel_;
   const GaitDef& g = sk.gait;
   if (sk.chains.empty()) return;
@@ -662,7 +662,12 @@ void PlayerAvatar::UpdateGait(float dt, World& world) {
         ff.mat = f.swingMat;
         ff.speed = speedNow_;
         ff.foot = (int)c;
-        if (ff.mat != 0) footfalls_.push_back(ff);
+        if (ff.mat != 0) PushFootfall(ff);
+        // ...AND WHAT IS ON THE FOOT COMES OFF ON THE FLOOR. Tick-side, at the
+        // plant itself rather than off the footfall queue, because the queue is
+        // drained per FRAME and a print is world state: keying it on the tick
+        // is what keeps a bloody walk the same at 30 fps and at 200.
+        ShedCoat(ch.effector, f.planted, tick, world);
         // ...and the stride clock's only input. See SyncStrideClock.
         SyncStrideClock((int)c);
       } else {
@@ -934,7 +939,7 @@ void PlayerAvatar::UpdateAirPose(float dt) {
 }
 
 void PlayerAvatar::UpdateAnimation(float dt, World& world, bool grounded,
-                                   const Vec3& playerVel) {
+                                   const Vec3& playerVel, uint32_t tick) {
   const AnimSkeleton& sk = skel_;
   AnimState& st = anim_;
   if (sk.parts.empty()) return;
@@ -1240,7 +1245,7 @@ void PlayerAvatar::UpdateAnimation(float dt, World& world, bool grounded,
   if (!grounded && !clipOwnsPose) {
     UpdateAirPose(dt);
   } else if (gaitActive) {
-    UpdateGait(dt, world);
+    UpdateGait(dt, world, tick);
   } else {
     // An authored clip owns the pose (crawl, etc.): it keys the same pelvis the
     // crouch moves, so unwind the crouch rather than composing the two.
@@ -1571,7 +1576,7 @@ void PlayerAvatar::PreTick(uint32_t tick, const Player& player, float heading,
     TickGetUp(dt);
     hangActive_ = false;
     crouchWant_ = false;
-    UpdateAnimation(dt, world, /*grounded=*/true, Vec3{});
+    UpdateAnimation(dt, world, /*grounded=*/true, Vec3{}, tick);
     SubmitPose(dt, /*writeXf=*/true);
   } else if (alive_) {
     // The body follows the PLAYER, which is the whole difference from a mob.
@@ -1625,7 +1630,7 @@ void PlayerAvatar::PreTick(uint32_t tick, const Player& player, float heading,
          std::fabs(origin_.y - supportY_) <
              kGaitCoyoteLegLengths * gaitLegLength);
 
-    UpdateAnimation(dt, world, gaitGrounded, player.vel);
+    UpdateAnimation(dt, world, gaitGrounded, player.vel, tick);
 
     // ---- air state clips ----
     // Grounded transitions drive jump/land; sustained air drives fall. Kept
@@ -1681,7 +1686,18 @@ void PlayerAvatar::PreTick(uint32_t tick, const Player& player, float heading,
         if (GroundHeightAt(world, ifloor(player.pos.x), ifloor(player.pos.z),
                            ifloor(origin_.y) + 2, gy, &gmat))
           ff.mat = gmat;
-        if (ff.mat != 0) footfalls_.push_back(ff);
+        if (ff.mat != 0) PushFootfall(ff);
+        // BOTH feet arrive on a landing, so both print. Per chain rather than
+        // once at the body centre: the two soles are a stride apart and a
+        // landing that stamped one cell twice would be a smaller mark than a
+        // walk's, which is backwards.
+        for (size_t c = 0; c < skel_.chains.size() && c < anim_.feet.size();
+             c++) {
+          const IkChain& ch = skel_.chains[c];
+          if (ch.tag != "leg") continue;  // arm chains never land
+          if (!anim_.feet[c].valid) continue;
+          ShedCoat(ch.effector, anim_.feet[c].planted, tick, world);
+        }
       }
       airTime_ = 0;
     } else if (player.inLiquid) {
