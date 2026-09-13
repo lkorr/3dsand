@@ -26,6 +26,7 @@
 // the world the first two left behind and asserts nothing is hanging in it.
 
 #include <algorithm>
+#include <chrono>
 #include <cmath>
 #include <cstdio>
 #include <string>
@@ -822,6 +823,8 @@ Status GateTreeFell(Ctx& c, std::string& detail) {
   // sweep reads that mirror, so without this it would confidently report a
   // clean world it never looked at (World::kFetchPerTick caps it at 64/tick,
   // which is why the loops below run for a few ticks before measuring).
+  double joltMsTotal = 0, joltWorstMs = 0;
+  uint32_t joltTicks = 0;
   IVec3 fetchLo{}, fetchHi{};
   auto runTick = [&](const std::vector<CellOp>& extra, bool fetch) {
     std::vector<CellOp> cellOps;
@@ -840,7 +843,18 @@ Status GateTreeFell(Ctx& c, std::string& detail) {
                fixtureChunk, true, false, spawns);
     c.ctx.WaitIdle();
     c.ctx.ProcessEvents();
-    c.phys.Step(kTickDt);
+    {
+      // Jolt's own step, timed here because it is the one phase of the hitch
+      // DebrisSystem cannot see from the inside (hypothesis 3: a compound of
+      // thousands of boxes resting on triangle-mesh patches).
+      const auto t0 = std::chrono::steady_clock::now();
+      c.phys.Step(kTickDt);
+      const double ms = std::chrono::duration<double, std::milli>(
+                            std::chrono::steady_clock::now() - t0).count();
+      joltMsTotal += ms;
+      joltTicks++;
+      if (ms > joltWorstMs) joltWorstMs = ms;
+    }
     debris.PostStep();
   };
 
@@ -1225,6 +1239,17 @@ Status GateTreeFell(Ctx& c, std::string& detail) {
   const TreeFixture treeB = plant();
   const uint32_t woodBeforeB = countMat(mWood, treeB.lo, treeB.hi);
   debris.ResetFloaterProbe();
+  // ---- THE HITCH, MEASURED ------------------------------------------------
+  //
+  // The owner's report is "2 fps for five seconds when a tree enters the
+  // rigidbody system", and this is the cheapest reproduction of it in the
+  // repo: one 28k-voxel body, born in one tick, falling for 300. The phase
+  // clock goes on HERE rather than around the whole gate so the numbers are
+  // about the cut and not about the 100-tick terraform that precedes it.
+  debris.SetProfiling(true);
+  debris.ResetProfile();
+  joltMsTotal = joltWorstMs = 0;
+  joltTicks = 0;
   {
     std::vector<CellOp> cut;
     const int cutY = groundY + 11;
@@ -1255,6 +1280,8 @@ Status GateTreeFell(Ctx& c, std::string& detail) {
     }
     sumBodyVox = std::max(sumBodyVox, sum);
   }
+  const std::string cutProfile = debris.ProfileReport();
+  debris.SetProfiling(false);
   const uint32_t woodAfterB = countMat(mWood, treeB.lo, treeB.hi);
   // The mirror's own answer to "is the tree still up there", independent of the
   // sweep's connectivity reasoning. Two numbers derived different ways: if the
@@ -1291,6 +1318,14 @@ Status GateTreeFell(Ctx& c, std::string& detail) {
   RecordObserved("treeFell.burnFloatVoxels", (double)swA.voxels);
   RecordObserved("treeFell.felledBodyVoxels", (double)sumBodyVox);
   RecordObserved("treeFell.standingVoxels", (double)swB.bigVoxels);
+  // The hitch, as three numbers in build/last_run.json: observed only, never
+  // asserted -- a wall-clock threshold in a gate would be a machine test.
+  RecordObserved("treeFell.cutDebrisMsTotal",
+                 debris.Profile().tickUsTotal / 1000.0);
+  RecordObserved("treeFell.cutDebrisWorstMs",
+                 debris.Profile().worstTickUs / 1000.0);
+  RecordObserved("treeFell.cutChunksNeededMax",
+                 (double)debris.Profile().maxNeededOneTick);
 
   std::string worst;
   for (const FloatComp& f : swA.worst)
@@ -1321,7 +1356,9 @@ Status GateTreeFell(Ctx& c, std::string& detail) {
       "vox (floor %u), unsupported %u/%u/%u of %u comps over %u cells "
       "(%u absent) = %u vox; biggest comp %zu vox (%d,%d,%d)..(%d,%d,%d) "
       "rests %d why %d at (%d,%d,%d); probe stuck-event %u, requeued %u, "
-      "anchors boundary %u, unknown %u, oversize-flood %u%s%s",
+      "anchors boundary %u, unknown %u, oversize-flood %u | "
+      "COST over the 300 cut ticks: %s; jolt step %.1f ms over %u ticks "
+      "(%.2f/tick, worst %.1f)%s%s",
       fx, fz, groundY, terrainMin, terrainMax, siteInWindow ? 1 : 0,
       swPre.singles, swPre.smallComps,
       swPre.bigComps, woodBeforeA, woodAfterA, leafBeforeA,
@@ -1361,6 +1398,8 @@ Status GateTreeFell(Ctx& c, std::string& detail) {
       fpB.stuckEventDropped, fpB.stuckEventRequeued,
       fpB.anchoredByRegionBoundary,
       fpB.anchoredByUnknownChunk, fpB.anchoredByOversizeFlood,
+      cutProfile.c_str(), joltMsTotal, joltTicks,
+      joltMsTotal / (joltTicks ? joltTicks : 1), joltWorstMs,
       failed.empty() ? "" : "; FAILED: ", failed.c_str());
   std::printf("tree-fell: %s (%s)\n", ok ? "PASS" : "FAIL", detail.c_str());
 
@@ -1587,7 +1626,8 @@ Status GateCactusFell(Ctx& c, std::string& detail) {
     float dropAfterFetch = 0;  // ...and after 60 more ticks with the mirror forced fresh
     uint32_t vacateTick = 0;   // sim tick the body left the grid
     uint32_t colliderBuilt = 0, cacheVersion = 0;  // for the chunk holding the body
-    uint32_t terrainBuilds = 0, terrainSame = 0, terrainDeferred = 0;
+    uint32_t terrainBuilds = 0, terrainSame = 0, terrainDeferred = 0,
+            terrainGatherDeferred = 0;
     SweepResult sweep;
     DebrisSystem::FloaterProbe probe;
     bool felled = false, cleared = false;
@@ -1648,6 +1688,7 @@ Status GateCactusFell(Ctx& c, std::string& detail) {
     r.terrainBuilds = debris.Settle().terrainBuilds;
     r.terrainSame = debris.Settle().terrainSame;
     r.terrainDeferred = debris.Settle().terrainDeferred;
+    r.terrainGatherDeferred = debris.Settle().terrainGatherDeferred;
     {
       const float y1 = (r.maxBody && bestIdx < debris.BodyCount())
                            ? debris.BodyPosition(bestIdx).y
@@ -1704,7 +1745,8 @@ Status GateCactusFell(Ctx& c, std::string& detail) {
         "freed %u, stuck dropped %u requeued %u, cooldown held %u rearmed %u, "
         "spilled %u, defer cellop %u ring %u oversize %u, in-place %u; "
         "COLLIDER for the body chunk built from mirror v%u vs cache v%u, "
-        "cells vacated at tick %u; terrain builds %u same %u deferred %u; "
+        "cells vacated at tick %u; terrain builds %u same %u deferred %u "
+        "(gather-deferred %u); "
         "after 70 ticks of forced fetches the body fell a further %.1f cells]",
         r.name, r.before, r.aboveBefore, r.aboveAfter, r.afterTotal, r.bodies,
         r.maxBody, r.firstBodyTick, r.bodyDrop, r.sweep.singles,
@@ -1718,7 +1760,8 @@ Status GateCactusFell(Ctx& c, std::string& detail) {
         p.supportLateRearmed, p.eventQueueFullSpilled, p.deferredCellOpBudget,
         p.deferredSpawnRing, p.deferredOversize, p.solidRubbleInPlace,
         r.colliderBuilt, r.cacheVersion, r.vacateTick, r.terrainBuilds,
-        r.terrainSame, r.terrainDeferred, r.dropAfterFetch);
+        r.terrainSame, r.terrainDeferred, r.terrainGatherDeferred,
+        r.dropAfterFetch);
   };
   const bool ok = failed.empty();
   detail = Format("at (%d,%d) ground %d inWindow %d %s %s %s%s%s", fx, fz,

@@ -2,6 +2,7 @@
 
 #include <algorithm>
 #include <cmath>
+#include <cstdarg>
 #include <cstdio>
 #include <cstring>
 #include <cstdlib>
@@ -16,6 +17,17 @@
 #include "sim/tuning.h"
 
 namespace {
+
+// Local printf-to-string, for ProfileReport. selftest.h has one but this file
+// is engine code and must not include the harness.
+std::string Fmt(const char* fmt, ...) {
+  char buf[1024];
+  va_list ap;
+  va_start(ap, fmt);
+  std::vsnprintf(buf, sizeof(buf), fmt, ap);
+  va_end(ap);
+  return std::string(buf);
+}
 
 // One ballistic blood particle, world voxels in, the particle system's fixed
 // 24.8 voxels/tick out at the sim's 30 Hz (the twin of Mob's MakeDroplet).
@@ -66,6 +78,34 @@ constexpr int kAnchorDropBelowSeed = 48;
 constexpr int kAnchorReachBesideSeed = 96;
 constexpr uint32_t kTerrainEvictTicks = 300;
 constexpr uint32_t kTerrainRefreshTicks = 8;
+// ---- WHAT ONE BODY MAY ASK THE TERRAIN SYSTEM FOR (CLAUDE.md rule 2) ------
+//
+// Measured 2026-09-12 on `tree-fell`'s cut pass, one 28,478-voxel oak: 220,896
+// chunk visits over 301 ticks -- 734 a tick, 900 in the worst one -- 26,232
+// occupancy gathers and up to 454 chunk fetch requests in a SINGLE tick
+// against World::kFetchPerTick = 64. For ONE body, to build six patches.
+//
+// The cause was a BOUNDING SPHERE: `radiusVoxels` for a 59 x 81 x 59 crown is
+// 60, needAround reached radius + 6, and 133 voxels a side is ~900 chunks of
+// which the body can touch about 150. So bodies ask around their AABB (see
+// needBox) with this skirt, which is one voxel more than the largest step
+// LinearCast resolves plus a cell of slop.
+constexpr float kTerrainSkirtVox = 4.0f;
+// ...and three budgets, so no scene can make this sweep unbounded whatever the
+// anchors ask for. All three are NEAREST-FIRST over the same sorted list, and
+// none of them DROPS anything: a chunk that misses its slot this tick is at
+// the head of the next tick's sweep, exactly the contract kTerrainBuildsPerTick
+// has always had. That is what keeps a body from falling through ground it was
+// about to be given -- the patch is late, never absent.
+//   - the list itself, so the per-chunk staleness scan is O(1) in scene size;
+//   - fetch REQUESTS, so this system can never flood a readback queue that
+//     drains 64 a tick (that starves the player's own mirror, the island
+//     scans' own fetches, and every other consumer, for as long as it lasts);
+//   - occupancy GATHERS, since an 18^3 sample of the mirror is ~17 us and a
+//     version-churn storm used to run 87 of them a tick.
+constexpr uint32_t kTerrainNeedCeiling = 512;
+constexpr uint32_t kTerrainFetchPerTick = 24;
+constexpr uint32_t kTerrainGatherPerTick = 24;
 // Real marching-cubes + Jolt rebuilds per tick (ManageTerrain). Six covers a
 // chunk-boundary crossing's new face of anchor chunks in two ticks; the
 // unbudgeted version did 64 in one and that was the walking hitch.
@@ -337,6 +377,12 @@ void DebrisSystem::Init(Physics* phys, World* world, const std::vector<MaterialD
                         const std::vector<ReactionGpu>& reactions) {
   phys_ = phys;
   world_ = world;
+  // SANDVOX_DEBRIS_PROFILE=1 turns the per-phase clock on for a live session,
+  // so the Performance tab's `debrisSys` bar can be split without a rebuild.
+  if (const char* e = std::getenv("SANDVOX_DEBRIS_PROFILE")) {
+    prof_.on = e[0] != '0';
+    prof_.autoReport = prof_.on;
+  }
   OnMaterialsReloaded(mats, reactions);
 }
 
@@ -1218,7 +1264,14 @@ void DebrisSystem::RunIslandDetection(const Event& e, uint32_t tick, World& worl
         noteWrite(c, 0u);
       }
       const IVec3 origin = sh.mn;
-      body.handle = phys_->CreateDebrisBody(body.voxels, origin, densityOf_);
+      {
+        PhaseTimer pt(prof_, Phase::BodyCreate);
+        body.handle = phys_->CreateDebrisBody(body.voxels, origin, densityOf_);
+      }
+      if (prof_.on) {
+        prof_.bodiesCreated++;
+        prof_.bodyVoxCreated += body.voxels.size();
+      }
       if (body.handle == 0) continue;
       body.xf.pos = Vec3{(float)origin.x, (float)origin.y, (float)origin.z};
       body.xf.quat[0] = body.xf.quat[1] = body.xf.quat[2] = 0;
@@ -1367,6 +1420,11 @@ void DebrisSystem::PreTick(uint32_t tick, World& world, std::vector<CellOp>& cel
   // Billed as `debris` on the Performance tab, debited from the game-logic
   // span this runs inside; ManageTerrain at the bottom debits THIS one.
   sandvox::PerfSpan span(sandvox::PerfScope::Debris, sandvox::PerfScope::GameLogic);
+  // Per-phase attribution for this tick (off unless something asked). See the
+  // PhaseProfile comment in debris.h for why this exists rather than an A/B.
+  const auto profT0 = prof_.on ? std::chrono::steady_clock::now()
+                               : std::chrono::steady_clock::time_point{};
+  for (int i = 0; i < kPhaseCount; i++) prof_.curUs[i] = 0.0;
   // Cheap and idempotent: an unchanged art palette early-outs on a stamp
   // compare. Here rather than at a load-time call site because the palette is
   // rebuilt by the mob loader, the item loader and every R hot-reload, and the
@@ -1419,7 +1477,12 @@ void DebrisSystem::PreTick(uint32_t tick, World& world, std::vector<CellOp>& cel
       // into a fetch queue that drains 64 a tick and is what the events in
       // front of it are waiting on.
       const bool mayFetch = probed <= kEventFetchProbes;
-      if (EventReady(e, world, mayFetch)) {
+      bool ready;
+      {
+        PhaseTimer pt(prof_, Phase::EventDrain);
+        ready = EventReady(e, world, mayFetch);
+      }
+      if (ready) {
         // The budget is spent by the scan that overruns it, not refused: a
         // wide scan must still be able to run on a tick whose budget is
         // mostly gone, or a stream of cheap scans could starve it forever.
@@ -1434,7 +1497,10 @@ void DebrisSystem::PreTick(uint32_t tick, World& world, std::vector<CellOp>& cel
         // The mask build over the region is charged too, since it is real
         // work: a scan costs its region once plus whatever the flood walked.
         const uint64_t visitedBefore = floaters_.scanCellsVisited;
-        RunIslandDetection(e, tick, world, cellOps, spawns);
+        {
+          PhaseTimer pt(prof_, Phase::IslandScan);
+          RunIslandDetection(e, tick, world, cellOps, spawns);
+        }
         const uint64_t cost = (floaters_.scanCellsVisited - visitedBefore) +
                               (uint64_t)(e.seedHi.x - e.seedLo.x + 1) *
                                   (uint64_t)(e.seedHi.y - e.seedLo.y + 1) *
@@ -1490,10 +1556,85 @@ void DebrisSystem::PreTick(uint32_t tick, World& world, std::vector<CellOp>& cel
     for (auto it = pendingVacate_.begin(); it != pendingVacate_.end();)
       it = it->second.tick + 600 < tick ? pendingVacate_.erase(it) : std::next(it);
   }
-  BurnBodies(tick, world, cellOps, spawns);
-  BleedBodies(tick, world, spawns);
-  SettleBodies(tick, world, cellOps);
+  { PhaseTimer pt(prof_, Phase::Burn); BurnBodies(tick, world, cellOps, spawns); }
+  { PhaseTimer pt(prof_, Phase::Bleed); BleedBodies(tick, world, spawns); }
+  { PhaseTimer pt(prof_, Phase::Settle); SettleBodies(tick, world, cellOps); }
   ManageTerrain(tick, world);
+  if (prof_.on) {
+    const double tickUs = std::chrono::duration<double, std::micro>(
+                              std::chrono::steady_clock::now() - profT0).count();
+    for (int i = 0; i < kPhaseCount; i++) prof_.totalUs[i] += prof_.curUs[i];
+    prof_.ticks++;
+    prof_.tickUsTotal += tickUs;
+    if (tickUs > 8000.0) prof_.ticksOver8ms++;
+    if (tickUs > 16000.0) prof_.ticksOver16ms++;
+    if (tickUs > 33000.0) prof_.ticksOver33ms++;
+    if (tickUs > prof_.worstTickUs) {
+      prof_.worstTickUs = tickUs;
+      prof_.worstTick = tick;
+      for (int i = 0; i < kPhaseCount; i++) prof_.worstUs[i] = prof_.curUs[i];
+    }
+    // A LIVE SESSION GETS THE SAME LINE THE GATE PRINTS. Ten seconds of sim at
+    // a time, and only when something happened -- a settled world with no
+    // bodies has nothing to say and should not say it every ten seconds.
+    if (prof_.autoReport && prof_.ticks >= 300) {
+      if (prof_.worstTickUs > 1000.0 || prof_.bodiesCreated)
+        std::printf("[debris-prof] %s\n", ProfileReport().c_str());
+      ResetProfile();
+    }
+  }
+}
+
+const char* DebrisSystem::PhaseName(Phase p) {
+  switch (p) {
+    case Phase::EventDrain: return "eventProbe";
+    case Phase::IslandScan: return "islandScan";
+    case Phase::BodyCreate: return "  bodyCreate(of scan)";
+    case Phase::Burn: return "burnBodies";
+    case Phase::Bleed: return "bleedBodies";
+    case Phase::Settle: return "settleBodies";
+    case Phase::TerrainNeed: return "terrainNeed";
+    case Phase::TerrainScan: return "terrainScan";
+    case Phase::TerrainGather: return "terrainGather";
+    case Phase::TerrainPoly: return "terrainPoly";
+    case Phase::TerrainJolt: return "terrainJolt";
+    case Phase::TerrainEvict: return "terrainEvict";
+    case Phase::Instances: return "buildInstances";
+    default: return "?";
+  }
+}
+
+std::string DebrisSystem::ProfileReport() const {
+  const PhaseProfile& p = prof_;
+  const double ticks = p.ticks ? (double)p.ticks : 1.0;
+  std::string s = Fmt(
+      "%u ticks, %.1f ms total (%.2f ms/tick avg), worst tick %u at %.1f ms; "
+      "over 8/16/33 ms: %u/%u/%u",
+      p.ticks, p.tickUsTotal / 1000.0, p.tickUsTotal / 1000.0 / ticks,
+      p.worstTick, p.worstTickUs / 1000.0, p.ticksOver8ms, p.ticksOver16ms,
+      p.ticksOver33ms);
+  double named = 0;
+  for (int i = 0; i < kPhaseCount; i++)
+    if (i != (int)Phase::BodyCreate && i != (int)Phase::Instances)
+      named += p.totalUs[i];
+  for (int i = 0; i < kPhaseCount; i++) {
+    if (p.totalUs[i] < 1.0 && p.worstUs[i] < 1.0) continue;
+    s += Fmt(" | %s %.1f ms tot (%.2f/tick, worst %.1f) x%llu",
+                PhaseName((Phase)i), p.totalUs[i] / 1000.0,
+                p.totalUs[i] / 1000.0 / ticks, p.worstUs[i] / 1000.0,
+                (unsigned long long)p.calls[i]);
+  }
+  s += Fmt(
+      " | unattributed %.1f ms | chunks needed %llu (max %u in one tick), "
+      "fetches asked %llu (max %u), gathers %llu, polygonizes %llu, jolt "
+      "meshes %llu, bodies %llu (%llu vox)",
+      (p.tickUsTotal - named) / 1000.0,
+      (unsigned long long)p.chunksNeeded, p.maxNeededOneTick,
+      (unsigned long long)p.fetchesAsked, p.maxFetchOneTick,
+      (unsigned long long)p.gathers, (unsigned long long)p.polys,
+      (unsigned long long)p.joltMeshes, (unsigned long long)p.bodiesCreated,
+      (unsigned long long)p.bodyVoxCreated);
+  return s;
 }
 
 namespace {
@@ -3263,6 +3404,28 @@ bool DebrisSystem::BodyLatticeOf(uint64_t handle, std::vector<PrefabVoxel>& out,
   return false;
 }
 
+void DebrisSystem::RefreshLocalBounds(Body& b) {
+  if (b.boundsCount == (uint32_t)b.voxels.size()) return;
+  b.boundsCount = (uint32_t)b.voxels.size();
+  if (b.voxels.empty()) {
+    b.lmin[0] = b.lmin[1] = b.lmin[2] = 0;
+    b.lmax[0] = b.lmax[1] = b.lmax[2] = 0;
+    return;
+  }
+  int mn[3] = {127, 127, 127}, mx[3] = {-128, -128, -128};
+  for (const DebrisVoxel& v : b.voxels) {
+    const int c[3] = {v.x, v.y, v.z};
+    for (int a = 0; a < 3; a++) {
+      if (c[a] < mn[a]) mn[a] = c[a];
+      if (c[a] > mx[a]) mx[a] = c[a];
+    }
+  }
+  for (int a = 0; a < 3; a++) {
+    b.lmin[a] = (int8_t)mn[a];
+    b.lmax[a] = (int8_t)mx[a];
+  }
+}
+
 void DebrisSystem::ManageTerrain(uint32_t tick, World& world) {
   // Its own row on the Performance tab, debited from the game-logic span it
   // runs inside. This function was the "Game Systems spiked to 50-100 ms while
@@ -3284,21 +3447,61 @@ void DebrisSystem::ManageTerrain(uint32_t tick, World& world) {
   // (which only the A* planner reads, through the fetch) is the last.
   std::vector<std::pair<IVec3, float>>& needed = terrainNeed_;
   needed.clear();
-  auto needAround = [&](Vec3 pos, float radius) {
-    float r = radius + 6.0f;
-    int lo[3] = {ifloor(pos.x - r) >> 4, ifloor(pos.y - r) >> 4,
-                 ifloor(pos.z - r) >> 4};
-    int hi[3] = {ifloor(pos.x + r) >> 4, ifloor(pos.y + r) >> 4,
-                 ifloor(pos.z + r) >> 4};
+  {
+  PhaseTimer ptNeed(prof_, Phase::TerrainNeed);
+  // THE BOX A THING CAN ACTUALLY TOUCH, and the distance is measured to that
+  // box rather than to a point: a chunk the body is INSIDE sorts at 0, which
+  // is what makes the nearest-first budgets below serve the ground under a
+  // falling tree before the sky beside its crown. (A point metric measured
+  // from `xf.pos` -- the lattice's min corner, not its centre -- ordered a
+  // 59 x 81 x 59 crown's chunks by distance from one bottom corner.)
+  auto needBoxWorld = [&](Vec3 blo, Vec3 bhi) {
+    int lo[3] = {ifloor(blo.x) >> 4, ifloor(blo.y) >> 4, ifloor(blo.z) >> 4};
+    int hi[3] = {ifloor(bhi.x) >> 4, ifloor(bhi.y) >> 4, ifloor(bhi.z) >> 4};
     for (int cz = lo[2]; cz <= hi[2]; cz++)
       for (int cy = lo[1]; cy <= hi[1]; cy++)
         for (int cx = lo[0]; cx <= hi[0]; cx++) {
           if (!world.ChunkInWindow({cx, cy, cz})) continue;
-          const float dx = (float)(cx * (int)kChunk + (int)kChunk / 2) - pos.x;
-          const float dy = (float)(cy * (int)kChunk + (int)kChunk / 2) - pos.y;
-          const float dz = (float)(cz * (int)kChunk + (int)kChunk / 2) - pos.z;
-          needed.push_back({{cx, cy, cz}, dx * dx + dy * dy + dz * dz});
+          const float c[3] = {(float)(cx * (int)kChunk + (int)kChunk / 2),
+                              (float)(cy * (int)kChunk + (int)kChunk / 2),
+                              (float)(cz * (int)kChunk + (int)kChunk / 2)};
+          const float l[3] = {blo.x, blo.y, blo.z}, h[3] = {bhi.x, bhi.y, bhi.z};
+          float d2 = 0;
+          for (int a = 0; a < 3; a++) {
+            const float e = c[a] < l[a] ? l[a] - c[a]
+                                        : (c[a] > h[a] ? c[a] - h[a] : 0.0f);
+            d2 += e * e;
+          }
+          needed.push_back({{cx, cy, cz}, d2});
         }
+  };
+  // The sphere form, kept for mob-limb anchors: those are human-scale radii
+  // whose AABB and bounding sphere are the same handful of chunks, and the
+  // caller hands over a radius rather than a lattice.
+  auto needAround = [&](Vec3 pos, float radius) {
+    const float r = radius + 6.0f;
+    needBoxWorld(Vec3{pos.x - r, pos.y - r, pos.z - r},
+                 Vec3{pos.x + r, pos.y + r, pos.z + r});
+  };
+  // A BODY asks around its rotated lattice AABB. `physScale` is collider
+  // voxels per world voxel, so the lattice is divided by it exactly as every
+  // other body-local -> world conversion in this file does.
+  auto needBody = [&](Body& b) {
+    RefreshLocalBounds(b);
+    const float inv = 1.0f / (float)std::max(1u, b.physScale);
+    Vec3 wlo{1e30f, 1e30f, 1e30f}, whi{-1e30f, -1e30f, -1e30f};
+    for (int corner = 0; corner < 8; corner++) {
+      const Vec3 lc{((corner & 1) ? (float)b.lmax[0] + 1.0f : (float)b.lmin[0]) * inv,
+                    ((corner & 2) ? (float)b.lmax[1] + 1.0f : (float)b.lmin[1]) * inv,
+                    ((corner & 4) ? (float)b.lmax[2] + 1.0f : (float)b.lmin[2]) * inv};
+      const Vec3 w = b.xf.pos + QuatRot(b.xf.quat, lc);
+      wlo.x = std::min(wlo.x, w.x); whi.x = std::max(whi.x, w.x);
+      wlo.y = std::min(wlo.y, w.y); whi.y = std::max(whi.y, w.y);
+      wlo.z = std::min(wlo.z, w.z); whi.z = std::max(whi.z, w.z);
+    }
+    const float k = kTerrainSkirtVox;
+    needBoxWorld(Vec3{wlo.x - k, wlo.y - k, wlo.z - k},
+                 Vec3{whi.x + k, whi.y + k, whi.z + k});
   };
   // A FALLING BODY NEEDS THE GROUND IT IS ABOUT TO REACH.
   //
@@ -3313,8 +3516,7 @@ void DebrisSystem::ManageTerrain(uint32_t tick, World& world) {
   // from the SAMPLE, not from the body, so the build order below puts the
   // ground a body is falling onto ahead of the ground it has already left.
   const bool lookahead = !AntiTunnelOff(AntiTunnel::Lookahead);
-  auto needAhead = [&](Vec3 pos, float radius, Vec3 vel) {
-    needAround(pos, radius);
+  auto sweepAhead = [&](Vec3 pos, Vec3 vel) {
     const float speed = vel.len();
     if (!lookahead || speed < 1e-3f) return;
     const float reach =
@@ -3331,14 +3533,18 @@ void DebrisSystem::ManageTerrain(uint32_t tick, World& world) {
       needed.push_back({wc, dx * dx + dy * dy + dz * dz});
     }
   };
-  for (const Body& b : bodies_) {
+  for (Body& b : bodies_) {
     // A sleeping body is not going anywhere and is not worth a Jolt lookup;
     // GetBodyVelocities already answers in VOXELS per second.
     Vec3 lin{}, ang{};
     if (phys_->IsActive(b.handle)) phys_->GetBodyVelocities(b.handle, lin, ang);
-    needAhead(b.xf.pos, b.radiusVoxels, lin);
+    needBody(b);
+    sweepAhead(b.xf.pos, lin);
   }
-  for (const Anchor& a : extraAnchors_) needAhead(a.pos, a.radius, a.vel);
+  for (const Anchor& a : extraAnchors_) {
+    needAround(a.pos, a.radius);
+    sweepAhead(a.pos, a.vel);
+  }
   extraAnchors_.clear();
   // Dedupe by chunk, keeping the NEAREST distance any anchor gave it, then
   // order nearest-first. Sorted by (key, d2) so unique's survivor is the
@@ -3364,16 +3570,41 @@ void DebrisSystem::ManageTerrain(uint32_t tick, World& world) {
                       const std::pair<IVec3, float>& b) {
                      return a.second < b.second;
                    });
+  // THE LIST CEILING. Sorted nearest-first above, so the tail is the chunks
+  // furthest from anything that asked -- a distant mob's navigation horizon,
+  // the sky beside a crown. Cutting it here bounds the per-chunk staleness
+  // scan below at O(kTerrainNeedCeiling) whatever the scene holds, and costs
+  // only latency: nothing is forgotten, because a chunk still needed next tick
+  // is listed again and its patch (if it has one) survives kTerrainEvictTicks.
+  if (needed.size() > kTerrainNeedCeiling) needed.resize(kTerrainNeedCeiling);
+  }  // end Phase::TerrainNeed
 
   uint32_t builds = 0;
+  uint32_t fetchesThisTick = 0;
+  uint32_t gathers = 0;
+  if (prof_.on) {
+    prof_.chunksNeeded += needed.size();
+    if (needed.size() > prof_.maxNeededOneTick)
+      prof_.maxNeededOneTick = (uint32_t)needed.size();
+  }
   for (const auto& need : needed) {
     const IVec3 wc = need.first;
+    PhaseSwitch pst(prof_, Phase::TerrainScan);
     TerrainEntry& t = terrain_[World::PackChunkKey(wc)];
     t.wc = wc;
     t.lastNeeded = tick;
     const CachedChunk* cc = world.Cached(wc);
     if (!cc) {
-      world.RequestChunkFetch(wc);
+      // THE FETCH BUDGET. World::kFetchPerTick is 64 for the whole engine and
+      // a felled tree used to ask for 454 in one tick; everything else that
+      // needs the mirror -- the player's own 3x3x3, an island scan's
+      // EventReady, another body's ground -- then waited behind it. Asking for
+      // fewer than arrive costs nothing: the queue is deduped and the chunks
+      // this tick declined are the head of the next sweep.
+      if (fetchesThisTick < kTerrainFetchPerTick) {
+        world.RequestChunkFetch(wc);
+        fetchesThisTick++;
+      }
       continue;
     }
     // A chunk this system wrote into is re-fetched until the mirror reflects
@@ -3384,8 +3615,14 @@ void DebrisSystem::ManageTerrain(uint32_t tick, World& world) {
     {
       auto wt = chunkWriteTick_.find(World::PackChunkKey(wc));
       if (wt != chunkWriteTick_.end()) {
-        if (cc->version < wt->second) world.RequestChunkFetch(wc);
-        else chunkWriteTick_.erase(wt);
+        if (cc->version < wt->second) {
+          if (fetchesThisTick < kTerrainFetchPerTick) {
+            world.RequestChunkFetch(wc);
+            fetchesThisTick++;
+          }
+        } else {
+          chunkWriteTick_.erase(wt);
+        }
       }
     }
     // The pending-vacate lists this mesh will be built against: this chunk's
@@ -3414,8 +3651,11 @@ void DebrisSystem::ManageTerrain(uint32_t tick, World& world) {
     uint32_t slot = World::SlotChunkIndex(wc);
     if (slot < snap.dirtyFlags.size() && snap.dirtyFlags[slot] &&
         tick > t.lastRefreshReq + kTerrainRefreshTicks) {
-      t.lastRefreshReq = tick;
-      world.RequestChunkFetch(wc);
+      if (fetchesThisTick < kTerrainFetchPerTick) {
+        t.lastRefreshReq = tick;
+        world.RequestChunkFetch(wc);
+        fetchesThisTick++;
+      }
     }
     if (!vacateChanged && t.builtVersion >= cc->version && t.handle != 0) continue;
     if (!vacateChanged && t.builtVersion >= cc->version && t.handle == 0 &&
@@ -3443,7 +3683,21 @@ void DebrisSystem::ManageTerrain(uint32_t tick, World& world) {
     // time: the 5832 samples touch at most 27 chunks, so the chunk-cache hash
     // lookup happens 27 times instead of once per sample (and the polygonizer
     // then reads bits, not a std::function).
+    // THE GATHER BUDGET. The 18^3 occupancy read below is ~17 us and the
+    // surface-identity hash cannot be computed without it, so a tick in which
+    // 87 chunks all went stale at once paid 1.5 ms before deciding that 80 of
+    // them had not moved. Deferring costs the same as deferring a build: the
+    // entry keeps its old builtVersion and is re-examined, nearest-first, next
+    // tick. Charged ahead of the build budget because a gather that ends in
+    // "identical surface" or "sky" never reaches that one.
+    if (gathers >= kTerrainGatherPerTick) {
+      settle_.terrainGatherDeferred++;
+      continue;
+    }
+    gathers++;
     IVec3 origin{wc.x * (int)kChunk, wc.y * (int)kChunk, wc.z * (int)kChunk};
+    pst.To(Phase::TerrainGather);
+    if (prof_.on) prof_.gathers++;
     uint32_t occ[kMcOccWords] = {};
     for (int ncz = -1; ncz <= 1; ncz++)
       for (int ncy = -1; ncy <= 1; ncy++)
@@ -3537,10 +3791,14 @@ void DebrisSystem::ManageTerrain(uint32_t tick, World& world) {
     builds++;
     settle_.terrainBuilds++;
 
+    pst.To(Phase::TerrainPoly);
+    if (prof_.on) prof_.polys++;
     std::vector<float> verts;
     std::vector<uint32_t> indices;
     PolygonizeChunk(origin, occ, verts, indices);
 
+    pst.To(Phase::TerrainJolt);
+    if (prof_.on) prof_.joltMeshes++;
     if (t.handle) phys_->RemoveBody(t.handle);
     t.handle = indices.empty() ? 0 : phys_->CreateTerrainMesh(verts, indices);
     t.builtVersion = cc->version;
@@ -3555,7 +3813,13 @@ void DebrisSystem::ManageTerrain(uint32_t tick, World& world) {
                     24.0f);
   }
 
+  if (prof_.on) {
+    prof_.fetchesAsked += fetchesThisTick;
+    if (fetchesThisTick > prof_.maxFetchOneTick)
+      prof_.maxFetchOneTick = fetchesThisTick;
+  }
   // evict patches nothing has needed for a while
+  PhaseTimer ptEvict(prof_, Phase::TerrainEvict);
   for (auto it = terrain_.begin(); it != terrain_.end();) {
     if (it->second.lastNeeded + kTerrainEvictTicks < tick) {
       if (it->second.handle) phys_->RemoveBody(it->second.handle);
@@ -3795,6 +4059,13 @@ void DebrisSystem::PostStep() {
 }
 
 void DebrisSystem::BuildInstances(std::vector<BodyVoxInst>& out) {
+  // Charged straight into totalUs rather than through curUs: this runs on the
+  // RENDER side, after PreTick has already rolled its tick up, so it belongs
+  // to no tick's breakdown. It is here because "28k instanced boxes rebuilt
+  // every tick while the body moves" was one of the five hypotheses and the
+  // only way to retire it is a number.
+  const auto t0 = prof_.on ? std::chrono::steady_clock::now()
+                           : std::chrono::steady_clock::time_point{};
   out.clear();
   for (size_t bi = 0; bi < bodies_.size() && bi < kMaxBodies; bi++) {
     // Micro bodies draw through the OBB/brick-march pass instead. They still
@@ -3809,6 +4080,12 @@ void DebrisSystem::BuildInstances(std::vector<BodyVoxInst>& out) {
   }
   instanceCount_ = (uint32_t)out.size();
   instancesDirty_ = false;
+  if (prof_.on) {
+    prof_.totalUs[(int)Phase::Instances] +=
+        std::chrono::duration<double, std::micro>(
+            std::chrono::steady_clock::now() - t0).count();
+    prof_.calls[(int)Phase::Instances]++;
+  }
 }
 
 void DebrisSystem::BuildXforms(std::vector<BodyXformGpu>& out) const {

@@ -2971,6 +2971,40 @@ neighbors, so this needs an explicit connectivity pass:
   on a slower machine would settle somewhere else. `terrainMesh` is its own
   row on the Performance tab, debited from `gameLogic`;
   `SANDVOX_TERRAIN_BUILDS_PER_TICK` is the one-binary A/B arm.
+- **...and what one body may ASK for is budgeted too (2026-09-12):** the report
+  was "2 fps for five seconds when a tree enters the rigidbody system", and the
+  `tree-fell` gate's cut pass now prints where the time went in one run
+  (`DebrisSystem::PhaseProfile`, thirteen phases, off unless a gate or
+  `SANDVOX_DEBRIS_PROFILE=1` asks). For ONE 28,478-voxel oak over the 300 ticks
+  of its fall: **220,896 chunk visits (734 a tick, 900 in the worst one),
+  26,232 occupancy gathers, and up to 454 chunk fetch requests in a SINGLE tick
+  against `World::kFetchPerTick` = 64** — to build six patches. Nothing else in
+  the profile was close: Jolt's own step was 0.56 ms a tick, the compound-shape
+  build 8.7 ms ONCE, the island scan 43.8 ms on the birth tick and nothing
+  after. STILL OPEN, and the profile says so rather than implying otherwise:
+  the render-side rebuild of 28k box instances is timed (`Phase::Instances`)
+  but a headless gate never calls `BuildInstances`, so that hypothesis is
+  instrumented and unmeasured until someone runs a live session under
+  `SANDVOX_DEBRIS_PROFILE=1`.
+  The cause was a **bounding sphere**. `needAround` reached `radiusVoxels + 6`,
+  and `radiusVoxels` for a 59 × 81 × 59 crown is 60 — a 133-voxel box, ~900
+  chunks, of which the body can touch about 150. So a body now asks around its
+  **rotated lattice AABB** (`Body::lmin/lmax`, cached on the voxel count, which
+  every geometry edit here changes and burning does not) plus a 4-voxel skirt,
+  and each chunk carries its distance to that BOX rather than to `xf.pos` —
+  which is the lattice's min corner, so the old metric ordered a crown's chunks
+  by distance from one bottom corner. Three nearest-first budgets then bound the
+  sweep whatever the scene asks: `kTerrainNeedCeiling` (512) on the list itself,
+  `kTerrainFetchPerTick` (24) on fetch REQUESTS so this system can never flood a
+  readback queue that drains 64 a tick, and `kTerrainGatherPerTick` (24) on the
+  18³ occupancy reads. None of the three DROPS anything — a chunk that misses
+  its slot is at the head of the next tick's sweep, the same contract
+  `kTerrainBuildsPerTick` has always had, so a patch is late and never absent
+  and nothing falls through ground it was about to be given. Measured on the
+  same gate: **814 ms → 172 ms** of debris CPU over the fall (2.70 → 0.57 ms a
+  tick), ticks over 8 ms 22 → 1, gathers 26,232 → 7,176, worst-tick fetch
+  requests 454 → 24. The remaining 30 ms spike is the birth tick's flood plus
+  28k exact-cell ops, which is one frame and is what that work costs.
 - Sleeping: settled bodies deactivate entirely until another body or force
   intersects their AABB (Jolt does this natively).
 - **NOTHING PASSES THROUGH THE GROUND (2026-09-12):** a collision patch is a

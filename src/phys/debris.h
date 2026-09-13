@@ -1,7 +1,9 @@
 #pragma once
+#include <chrono>
 #include <cstdint>
 #include <deque>
 #include <functional>
+#include <string>
 #include <unordered_map>
 #include <vector>
 
@@ -461,6 +463,11 @@ class DebrisSystem {
     uint32_t terrainBuilds = 0;
     uint32_t terrainDeferred = 0;
     uint32_t terrainSame = 0;
+    // ...and stale entries that did not even get their occupancy read, held by
+    // kTerrainGatherPerTick. Counted APART from terrainDeferred because the
+    // two mean different things: a build deferral is a mesh that is late, a
+    // gather deferral is a chunk whose surface has not been LOOKED at yet.
+    uint32_t terrainGatherDeferred = 0;
   };
   const SettleProbe& Settle() const { return settle_; }
   // Diagnostic: the mirror version the terrain collider for `wc` was last
@@ -471,6 +478,76 @@ class DebrisSystem {
     return it == terrain_.end() ? 0u : it->second.builtVersion;
   }
   void ResetSettleProbe() { settle_ = SettleProbe{}; }
+
+  // ---- WHERE THE TICK WENT (CLAUDE.md rule 6, applied to TIME) ------------
+  //
+  // "2 fps for five seconds when a tree enters the rigidbody system" is a bare
+  // number of exactly the kind rule 6 says not to bisect, and this system has
+  // eight plausible suspects inside one PreTick: the event drain, the flood,
+  // the Jolt body build, the burn/bleed/settle sweeps, and four separable
+  // halves of ManageTerrain (the need sweep, the per-chunk staleness scan, the
+  // 18^3 occupancy gather, the marching cubes, the Jolt mesh tree). Turning
+  // them off one at a time buys one hypothesis per run. Timing them where they
+  // happen buys all of them in ONE run, with denominators attached — which is
+  // what turns "a tick cost 90 ms" into "728 chunks needed, 722 gathers, 6
+  // polygonizes".
+  //
+  // OFF by default and gated on a bool, so the clock reads (two per phase per
+  // tick, plus two per chunk in the terrain loop) cost nothing in the game.
+  // Turn on with SANDVOX_DEBRIS_PROFILE=1 or SetProfiling(true); the
+  // `tree-fell` gate does the latter around its cut.
+  enum class Phase : uint8_t {
+    EventDrain,     // queue probe + EventReady, minus the scans themselves
+    IslandScan,     // RunIslandDetection: the flood, the shard dice, the ops
+    BodyCreate,     // Physics::CreateDebrisBody* + welds, inside a scan
+    Burn,
+    Bleed,
+    Settle,
+    TerrainNeed,    // ManageTerrain: needAhead sweep + sort/unique
+    TerrainScan,    // ...per-chunk cache lookup, refresh logic, vacate key
+    TerrainGather,  // ...the 18^3 occupancy gather + its hash
+    TerrainPoly,    // ...marching cubes
+    TerrainJolt,    // ...RemoveBody + CreateTerrainMesh + WakeNear
+    TerrainEvict,
+    Instances,      // BuildInstances (render-side, billed apart)
+    Count
+  };
+  static constexpr int kPhaseCount = (int)Phase::Count;
+  static const char* PhaseName(Phase p);
+  struct PhaseProfile {
+    bool on = false;
+    // Print + reset every 300 ticks. Set ONLY by SANDVOX_DEBRIS_PROFILE, never
+    // by SetProfiling: a gate drives its own window and would find the numbers
+    // it came for wiped on the last tick of it.
+    bool autoReport = false;
+    double totalUs[kPhaseCount] = {};
+    uint64_t calls[kPhaseCount] = {};
+    double curUs[kPhaseCount] = {};   // this tick, rolled up by PreTick's tail
+    // The single most expensive PreTick seen since the last reset, with its
+    // whole breakdown: the hitch IS the worst tick, and an average over 300
+    // ticks hides it completely.
+    double worstTickUs = 0;
+    uint32_t worstTick = 0;
+    double worstUs[kPhaseCount] = {};
+    uint32_t ticks = 0;
+    double tickUsTotal = 0;
+    uint32_t ticksOver8ms = 0, ticksOver16ms = 0, ticksOver33ms = 0;
+    // Denominators (rule 6 again: a duration with no count beside it is as
+    // bare as a count with no duration).
+    uint64_t chunksNeeded = 0, fetchesAsked = 0, gathers = 0, polys = 0,
+             joltMeshes = 0, bodiesCreated = 0, bodyVoxCreated = 0;
+    uint32_t maxNeededOneTick = 0, maxFetchOneTick = 0;
+  };
+  const PhaseProfile& Profile() const { return prof_; }
+  void SetProfiling(bool on) { prof_.on = on; }
+  void ResetProfile() {
+    const bool on = prof_.on, auto_ = prof_.autoReport;
+    prof_ = PhaseProfile{};
+    prof_.on = on;
+    prof_.autoReport = auto_;
+  }
+  // One line per phase that cost anything, worst tick first. Never empty.
+  std::string ProfileReport() const;
 
   // ---- floater attribution (the grid <-> body handoff's leak sites) -------
   //
@@ -702,6 +779,22 @@ class DebrisSystem {
     uint32_t burnCursor = 0;      // rotating scan window into voxels
     uint32_t burnedSinceRebuild = 0;  // batched collider refresh threshold
     uint32_t burnedSinceShatter = 0;  // batched connectivity re-check
+    // ---- THE COLLIDER FOOTPRINT (ManageTerrain) --------------------------
+    // The local lattice's own AABB, in `voxels` units. ManageTerrain asks for
+    // terrain patches around THIS rather than around `radiusVoxels`, and the
+    // difference is the whole reason a felled tree used to cost 900 chunks a
+    // tick: a bounding sphere of a 59 x 81 x 59 crown has radius 60, its
+    // radius+6 box is 133 voxels a side (~900 chunks), and the box the body
+    // can actually touch is 150.
+    //
+    // CACHED ON THE VOXEL COUNT, which is what every geometry edit in this
+    // file changes: adoption, carve, shatter, split and settle all add or
+    // remove voxels. Burning rewrites PAYLOADS in place and moves nothing, so
+    // it correctly does not invalidate this. Recomputed lazily by
+    // RefreshLocalBounds, so no creation site has to remember to call it.
+    int8_t lmin[3] = {0, 0, 0};
+    int8_t lmax[3] = {0, 0, 0};
+    uint32_t boundsCount = 0xFFFFFFFFu;  // != voxels.size() => recompute
   };
   struct TerrainEntry {
     uint64_t handle = 0;
@@ -749,6 +842,8 @@ class DebrisSystem {
                           std::vector<CellOp>& cellOps,
                           std::vector<ParticleSpawn>& spawns);
   void ManageTerrain(uint32_t tick, World& world);
+  // Refresh Body::lmin/lmax if the voxel count moved. See the note there.
+  static void RefreshLocalBounds(Body& b);
   // Body burn: a CPU mirror of the reaction table over body voxel payloads,
   // so detached matter keeps burning (embers advance to ash, emit real fire
   // into the grid via fill-air-only ops, and grid fire ignites cold bodies
@@ -924,6 +1019,56 @@ class DebrisSystem {
   std::unordered_map<uint64_t, PendingVacate> pendingVacate_;
   uint32_t nextVacateStamp_ = 1;
   uint32_t nextAssembly_ = 1;
+  PhaseProfile prof_{};
+  // Scoped accumulator for PhaseProfile. Two clock reads when profiling is on,
+  // one predictable branch when it is not.
+  struct PhaseTimer {
+    PhaseProfile* p;
+    Phase ph;
+    std::chrono::steady_clock::time_point t0;
+    PhaseTimer(PhaseProfile& prof, Phase phase) : p(&prof), ph(phase) {
+      if (p->on) t0 = std::chrono::steady_clock::now();
+    }
+    ~PhaseTimer() {
+      if (!p->on) return;
+      const double us =
+          std::chrono::duration<double, std::micro>(
+              std::chrono::steady_clock::now() - t0).count();
+      p->curUs[(int)ph] += us;
+      p->calls[(int)ph]++;
+    }
+    PhaseTimer(const PhaseTimer&) = delete;
+    PhaseTimer& operator=(const PhaseTimer&) = delete;
+  };
+  // A timer that changes WHICH phase it is charging partway through. The
+  // terrain loop's four stages (staleness scan, occupancy gather, marching
+  // cubes, Jolt) are separated by `continue`s, so nested scopes cannot express
+  // them without hoisting half the loop's locals; this charges what has
+  // elapsed to the current phase and starts the next, and its destructor
+  // charges the remainder however the iteration ended.
+  struct PhaseSwitch {
+    PhaseProfile* p;
+    Phase ph;
+    std::chrono::steady_clock::time_point t0;
+    PhaseSwitch(PhaseProfile& prof, Phase phase) : p(&prof), ph(phase) {
+      if (p->on) t0 = std::chrono::steady_clock::now();
+    }
+    void To(Phase next) {
+      if (!p->on) { ph = next; return; }
+      Charge();
+      ph = next;
+    }
+    ~PhaseSwitch() { if (p->on) Charge(); }
+    void Charge() {
+      const auto now = std::chrono::steady_clock::now();
+      p->curUs[(int)ph] +=
+          std::chrono::duration<double, std::micro>(now - t0).count();
+      p->calls[(int)ph]++;
+      t0 = now;
+    }
+    PhaseSwitch(const PhaseSwitch&) = delete;
+    PhaseSwitch& operator=(const PhaseSwitch&) = delete;
+  };
   bool instancesDirty_ = false;
   uint32_t instanceCount_ = 0;
   uint32_t settledBack_ = 0;
