@@ -16,6 +16,8 @@
 
 #include "game/avatar.h"
 #include "game/bodyreg.h"
+#include "game/equipment.h"
+#include "game/item.h"
 #include "game/thirdperson.h"
 #include "game/brush.h"
 #include "game/camera.h"
@@ -5944,6 +5946,321 @@ Status GateRagdoll(Ctx& c, std::string& detail) {
   return ok ? Status::Pass : Status::Fail;
 }
 
+// ---- ragdoll-dress ---------------------------------------------------------
+//
+// A DRESSED BODY GOING LIMP STAYS ONE OBJECT.
+//
+// Owner report, 2026-09-13: "when the human mob is falling, and is wearing
+// clothes, when they go into the ragdoll state the clothes will decouple from
+// the body when moving at high speeds... all of the clothes separate from limbs
+// and it just becomes a crazy tangled mess ball of limbs and clothes that
+// aren't actually connected properly. Seems like when falling the limbs will be
+// moving at slightly different velocities/resistances/move to different noisily
+// placed locations on different frames."
+//
+// TWO MECHANISMS, BOTH ABOUT A RIG BEING TREATED AS N INDEPENDENT BODIES, and
+// this gate measures one number for each:
+//
+//   * A worn shell used to be a DYNAMIC body on a Fixed constraint to the limb
+//     it covers, geometrically inside it and an order of magnitude heavier or
+//     lighter. That is the textbook energy source for a sequential-impulse
+//     solver, and even when it behaves it LAGS under acceleration. It is now a
+//     kinematic follower with no constraint at all (MobLimb::wornHost,
+//     Mob::DriveWornShells), so its offset from its host is not solved for, it
+//     is derived — and therefore CONSTANT. That is what `shell drift` and
+//     `shell twist` assert, and constant is a far stronger claim than small.
+//
+//   * DebrisSystem::UntunnelBody clamped each body of the rig SEPARATELY
+//     against the collision patches, teleporting whichever ones had outrun the
+//     streaming back to their own last vouched sample while their neighbours
+//     kept travelling — a fresh multi-voxel violation at every joint, every
+//     tick of the starvation window, which the solver then closes by force.
+//     UntunnelRig clamps the rig on one common fraction of the step instead.
+//     `limb stretch` is what sees this: a joint held open by 30 voxels is not a
+//     pose, it is a tear.
+//
+// THE TWO ARMS ARE THE TWO REGIMES:
+//
+//   A. THE FALL. A dressed human made limp `fallLift` voxels up (as high as the
+//      residency window allows, capped at 200 ≈ 50 m) and dropped under Jolt's
+//      own gravity, so it arrives at ~30 m/s having covered ground no collision
+//      patch existed over. This is the arm that outruns the streaming, and the
+//      untunnel counters are reported beside it so a number that moves has its
+//      cause attached (CLAUDE.md rule 6) rather than needing a bisection.
+//   B. THE SLAM. The same rig limp on the spot and handed 30 m/s straight down.
+//      No streaming starvation, so it isolates the constraint: whatever drift
+//      shows here is the garment lagging its limb under pure acceleration and
+//      impact.
+//
+// WHY BOTH ARMS START LIMP RATHER THAN FALLING INTO IT. An NPC's kinematic fall
+// (MobSystem::UpdateFall) cannot get anywhere near these speeds and by design
+// never will: gravity WAITS on a column the CPU mirror has not delivered
+// (GroundSense::groundUnknown), and the mirror is 3x3x3 chunks, so a creature
+// with 50 m of air under it does not fall at all — it hovers. A long fall in the
+// game is therefore always the same two beats: a short kinematic drop while the
+// ground is still in probe range, then ragdoll.fallSeconds fires and JOLT owns
+// the rest of the descent. The second beat is the whole of what the report is
+// about and it is the only beat that reaches 30 m/s, so the fixture starts
+// there. A first version of this gate spawned the creature 200 voxels up and
+// waited for its air clock: 400 ticks, limp never fired, peak limb speed 0.0
+// m/s, and every number below it a clean zero measured on a body standing still
+// in the sky — a fixture measuring itself.
+//
+// Bounds are in tests/baseline.json, so retuning what counts as "attached" is a
+// JSON edit and not a rebuild. Measured with SANDVOX_NO_RIGWELD=1 (the A/B arm
+// that restores the old jointed-shell + per-body-clamp behaviour) the same
+// fixture is what says the thresholds mean anything at all.
+Status GateRagdollDress(Ctx& c, std::string& detail) {
+  GpuContext& ctx = c.ctx;
+  World& world = c.world;
+  Simulation& sim = c.sim;
+  DebrisSystem& debris = c.debris;
+  MobSystem& mobs = c.mobs;
+  Physics& phys = c.phys;
+
+  int wizDef = -1;
+  for (size_t i = 0; i < mobs.Defs().size(); i++)
+    if (mobs.Defs()[i].name == kAvatarDefName) wizDef = (int)i;
+  if (wizDef < 0) {
+    detail = "no avatar mob def to dress";
+    return Status::Fail;
+  }
+  const int baseLimbs = (int)mobs.Defs()[wizDef].limbs.size();
+
+  int relief = 0;
+  const IVec3 anchor = AiFixtureCentre(world);
+  const IVec3 spot = AiFlatSpot(anchor.x, anchor.z, 96, 16, kDefaultSeed, relief);
+  const int h = spot.y;
+  // HOW HIGH THE FALL MAY START: inside the residency window with the margin
+  // MobSystem::PreTick despawns past, never an absolute coordinate (the trap
+  // AiFixtureCentre exists for — an earlier gate leaves the window elsewhere).
+  const IVec3 wlo = world.WindowOrigin();
+  const float fallLift =
+      std::min(200.0f, std::max(0.0f, (float)(wlo.y + kWorldN - 24 - (h + 1))));
+
+  // One shell's rigid relationship to the limb it is strapped to, captured
+  // while the creature is intact and upright.
+  struct Strap {
+    int shell = -1, host = -1;
+    Vec3 relPos{};   // shell origin in the host's frame
+    Quat relRot{};   // shell rotation relative to the host's
+  };
+  // ...and one JOINT's, for the same reason. `anchorInParent` is the child's own
+  // joint anchor expressed in the PARENT's frame, which is precisely the point a
+  // ball or hinge constraint welds and therefore the one number that is
+  // invariant under any pose the rig can legally take. (The obvious measure —
+  // how far the two body origins sit apart — is not: a thigh pivoting about a
+  // held hip moves its own origin, and the first version of this gate duly
+  // reported 2.40 voxels of "stretch" on an upper arm that was simply rotating.)
+  struct Link {
+    int child = -1, parent = -1;
+    Vec3 anchorInParent{};
+  };
+
+  struct Arm {
+    int shells = 0, links = 0, ticks = 0;
+    float drift = 0.0f, twist = 0.0f, stretch = 0.0f;
+    float peakSpeed = 0.0f;   // fastest limb seen, m/s
+    int driftTick = -1;
+    std::string driftName, stretchName;
+    int limpAt = -1;
+    float lowest = 1.0e30f;
+    bool spawned = false;
+    uint32_t holds = 0, rigHolds = 0, released = 0;
+  };
+
+  auto run = [&](float liftVox, float hitVox, int ticks) -> Arm {
+    Arm a;
+    mobs.Reset();
+    debris.Reset();
+    SubmitWorldgen(ctx, world, sim, kDefaultSeed);
+    ctx.WaitIdle();
+    AiTicker ticker{c, 21000, {spot.x >> 4, spot.y >> 4, spot.z >> 4}};
+    const uint64_t id =
+        mobs.Spawn(wizDef, {spot.x, h + 1 + (int)liftVox, spot.z});
+    if (id == 0) return a;
+    Mob* mob = mobs.FindMobById(id);
+    if (mob == nullptr) return a;
+    a.spawned = true;
+    // DRESS IT IN EVERYTHING THE LIBRARY SHIPS, counted and never named — the
+    // same construction `corpse-armor` uses, and for the same reason: a tree
+    // with no armour content still runs this gate, it simply runs it on a naked
+    // body and the detail line says so.
+    for (const ItemDef& it : c.items.items) {
+      if (!ItemKindIsWorn(it.kind)) continue;
+      int home = -1;
+      for (int s = 0; s < kEquipSlotCount; s++)
+        if (EquipSlotAccepts(s, it.kind)) { home = s; break; }
+      if (home >= 0) mob->WearItem(&it, home);
+    }
+    // ONE TICK BEFORE THE REFERENCE IS TAKEN: WearItem places each shell itself,
+    // so the pair is already rigid, but a reference read off the placement would
+    // be measuring the placement. One full tick means the pose pipeline and
+    // PostStep have both run and the number below is what the ENGINE maintains.
+    ticker();
+    auto xfOf = [&](int limb, BodyTransform& out) {
+      const uint64_t b = mobs.LimbBody(id, limb);
+      return b != 0 && phys.GetTransform(b, out);
+    };
+    std::vector<Strap> straps;
+    for (int s = baseLimbs; s < mob->LimbCount(); s++) {
+      // By DEF PARENT NAME rather than through MobLimb::wornHost: the A/B arm
+      // (SANDVOX_NO_RIGWELD) does not set that field, and an arm that could not
+      // find the shells would report a clean zero for the behaviour it exists
+      // to demonstrate — a fixture measuring itself.
+      if (mob->LimbDefAt(s).tag != "worn") continue;
+      const std::string& parent = mob->LimbDefAt(s).parent;
+      int host = -1;
+      for (int p = 0; p < baseLimbs; p++)
+        if (mob->LimbDefAt(p).name == parent) { host = p; break; }
+      BodyTransform hs{}, ss{};
+      if (host < 0 || !xfOf(host, hs) || !xfOf(s, ss)) continue;
+      const Quat hq{hs.quat[0], hs.quat[1], hs.quat[2], hs.quat[3]};
+      const Quat sq{ss.quat[0], ss.quat[1], ss.quat[2], ss.quat[3]};
+      Strap st;
+      st.shell = s;
+      st.host = host;
+      st.relPos = QuatRotateInv(hq, ss.pos - hs.pos);
+      st.relRot = QuatMul(QuatConj(hq), sq);
+      straps.push_back(st);
+    }
+    std::vector<Link> links;
+    for (int i = 0; i < baseLimbs && i < mob->LimbCount(); i++) {
+      const std::string& parent = mob->LimbDefAt(i).parent;
+      if (parent.empty()) continue;
+      int pi = -1;
+      for (int p = 0; p < baseLimbs; p++)
+        if (mob->LimbDefAt(p).name == parent) { pi = p; break; }
+      BodyTransform pp{};
+      if (pi < 0 || mobs.LimbBody(id, i) == 0 || !xfOf(pi, pp)) continue;
+      const Quat pq{pp.quat[0], pp.quat[1], pp.quat[2], pp.quat[3]};
+      Link l;
+      l.child = i;
+      l.parent = pi;
+      l.anchorInParent =
+          QuatRotateInv(pq, mobs.LimbAnchorPos(id, i) - pp.pos);
+      links.push_back(l);
+    }
+    a.shells = (int)straps.size();
+    a.links = (int)links.size();
+    debris.ResetUntunnelProbe();
+    // Limp from here, with whatever head start this arm asked for. minSeconds is
+    // long enough to cover the whole descent: a get-up part-way down would put
+    // the rig back on the pose pipeline and end the measurement early.
+    mob->StartRagdoll(12.0f, "gate");
+    mob->SetLimbVelocities(Vec3{0.0f, -hitVox, 0.0f});
+    for (int t = 0; t < ticks; t++) {
+      ticker();
+      a.ticks = t + 1;
+      if (!mobs.IsAlive(id)) break;        // splatted on landing: measured to here
+      if (mobs.RagdollPhaseOf(id) == 1 && a.limpAt < 0) a.limpAt = t;
+      // Only while LIMP: the claim is about the phase Jolt owns. A kinematic rig
+      // is posed by the animation and its shells by DriveWornShells off the same
+      // transforms, which is the case every other mob gate already covers.
+      if (mobs.RagdollPhaseOf(id) != 1) continue;
+      for (const Strap& st : straps) {
+        BodyTransform hs{}, ss{};
+        if (!xfOf(st.host, hs) || !xfOf(st.shell, ss)) continue;
+        const Quat hq{hs.quat[0], hs.quat[1], hs.quat[2], hs.quat[3]};
+        const Quat sq{ss.quat[0], ss.quat[1], ss.quat[2], ss.quat[3]};
+        const float d = (QuatRotateInv(hq, ss.pos - hs.pos) - st.relPos).len();
+        const Quat rel = QuatMul(QuatConj(hq), sq);
+        const Quat err = QuatMul(QuatConj(st.relRot), rel);
+        const float twist =
+            2.0f * std::acos(std::min(1.0f, std::fabs(err.w))) * 57.29578f;
+        if (d > a.drift) {
+          a.drift = d;
+          a.driftTick = t;
+          a.driftName = mob->LimbDefAt(st.shell).name;
+        }
+        a.twist = std::max(a.twist, twist);
+      }
+      for (const Link& l : links) {
+        BodyTransform pp{};
+        if (mobs.LimbBody(id, l.child) == 0 || !xfOf(l.parent, pp)) continue;
+        const Quat pq{pp.quat[0], pp.quat[1], pp.quat[2], pp.quat[3]};
+        const float gap =
+            (QuatRotateInv(pq, mobs.LimbAnchorPos(id, l.child) - pp.pos) -
+             l.anchorInParent).len();
+        if (gap > a.stretch) {
+          a.stretch = gap;
+          a.stretchName = mob->LimbDefAt(l.child).name;
+        }
+      }
+      for (int i = 0; i < baseLimbs; i++) {
+        const uint64_t b = mobs.LimbBody(id, i);
+        Vec3 lin{}, ang{};
+        if (b && phys.GetBodyVelocities(b, lin, ang))
+          a.peakSpeed = std::max(a.peakSpeed, lin.len() * kVoxelMeters);
+      }
+      a.lowest = std::min(a.lowest, mobs.MobRootPos(id).y);
+    }
+    const DebrisSystem::UntunnelProbe& up = debris.Untunnel();
+    a.holds = up.holds;
+    a.rigHolds = up.rigHolds;
+    a.released = up.released;
+    return a;
+  };
+
+  const double maxDrift = BaselineNumber("ragdollDressMaxShellDriftVox", 0.05);
+  const double maxTwist = BaselineNumber("ragdollDressMaxShellTwistDeg", 0.5);
+  const double maxStretch = BaselineNumber("ragdollDressMaxLimbStretchVox", 2.0);
+
+  // 200 voxels under gravity is ~3.2 s = 195 ticks; 300 leaves room for the
+  // landing and for a shorter drop if the window is tight.
+  const Arm fall = run(fallLift, 0.0f, 300);
+  const Arm slam = run(0.0f, 30.0f / kVoxelMeters, 90);
+
+  bool ok = true;
+  auto judge = [&](const char* what, const Arm& a, bool needLimp) {
+    const bool armOk = a.spawned && (!needLimp || a.limpAt >= 0) &&
+                       a.drift <= (float)maxDrift &&
+                       a.twist <= (float)maxTwist &&
+                       a.stretch <= (float)maxStretch;
+    std::printf(
+        "  ragdoll dress %s: %s (%d shells on %d links, limp at tick %d, %d "
+        "ticks, peak limb %.1f m/s; shell drift %.3f vox (cap %.2f, worst "
+        "\"%s\" at tick %d), twist %.2f deg (cap %.2f), limb stretch %.2f vox "
+        "(cap %.2f, worst \"%s\"); untunnel %u body-holds / %u rig-holds / %u "
+        "released)\n",
+        what, armOk ? "PASS" : "FAIL", a.shells, a.links, a.limpAt, a.ticks,
+        a.peakSpeed, a.drift, maxDrift, a.driftName.c_str(), a.driftTick,
+        a.twist, maxTwist, a.stretch, maxStretch, a.stretchName.c_str(),
+        a.holds, a.rigHolds, a.released);
+    ok = ok && armOk;
+  };
+  judge("fall", fall, /*needLimp=*/true);
+  judge("slam", slam, /*needLimp=*/true);
+
+  // A NAKED SUBJECT IS NOT A PASS. Every number above is a maximum over the
+  // shells, so with no worn content in the tree they are all zero and the gate
+  // would be green having measured nothing. `armor-wear` is what asserts the
+  // content exists; this says out loud that it did not find any.
+  if (fall.shells == 0 && slam.shells == 0) {
+    detail = "no worn item in the library fits " + std::string(kAvatarDefName) +
+             ": nothing was measured";
+    mobs.Reset();
+    debris.Reset();
+    SubmitWorldgen(ctx, world, sim, kDefaultSeed);
+    ctx.WaitIdle();
+    return Status::Skip;
+  }
+
+  detail = Format(
+      "fall %.0f vox: %d shells, drift %.3f / twist %.2f deg / stretch %.2f "
+      "vox at up to %.0f m/s (%u rig-holds); slam 30 m/s: drift %.3f / twist "
+      "%.2f / stretch %.2f; caps %.2f / %.2f / %.2f; fixture (%d,%d,%d) relief %d",
+      fallLift, fall.shells, fall.drift, fall.twist, fall.stretch,
+      fall.peakSpeed, fall.rigHolds, slam.drift, slam.twist, slam.stretch,
+      maxDrift, maxTwist, maxStretch, spot.x, h, spot.z, relief);
+  mobs.Reset();
+  debris.Reset();
+  SubmitWorldgen(ctx, world, sim, kDefaultSeed);
+  ctx.WaitIdle();
+  std::printf("ragdoll dress: %s\n", ok ? "PASS" : "FAIL");
+  return ok ? Status::Pass : Status::Fail;
+}
+
 // ---- ragdoll-falldamage -------------------------------------------------
 //
 // A LIMP BODY STILL HITS THE GROUND — AND A LIMP BODY IN FLIGHT DOES NOT.
@@ -6130,6 +6447,11 @@ const std::vector<Gate>& MobGates() {
       // ...and what a limp landing COSTS. Its own gate rather than another
       // `ragdoll` arm: that gate's arms inherit each other's tick phase.
       {"ragdoll-falldamage", "mob", {}, false, GateRagdollFallDamage,
+       /*needsRender=*/false},
+      // ...and whether the thing that landed is still ONE body. Dressed, limp,
+      // 50 m of fall: the clothes may not leave the limbs and the joints may not
+      // be torn open by the anti-tunnel clamp.
+      {"ragdoll-dress", "mob", {}, false, GateRagdollDress,
        /*needsRender=*/false},
   };
   return g;

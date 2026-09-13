@@ -3169,6 +3169,20 @@ neighbors, so this needs an explicit connectivity pass:
      deadlock at exactly the speed the fix exists for is what the player's
      first blind-fall attempt hit. This is the "park a body whose chunks are
      not cached yet" the `debris` gate's buried-ejecta finding asked for.
+  4. **...and a jointed rig is ONE body for that purpose**
+     (`DebrisSystem::UntunnelRig`, 2026-09-13). Clamping each body of a ragdoll
+     separately tore it apart: a human rig spans two or three chunks, so falling
+     fast its LEADING bodies — the feet — enter the unvouched chunk several ticks
+     before the head, and each was teleported back to its own last vouched
+     sample *with its velocity intact* while its neighbours kept travelling. That
+     is a fresh multi-voxel violation at every joint, every tick of the
+     starvation window, which the solver then closes by force in a different
+     direction per limb. `Mob::PostStep` now hands the whole limp rig over at
+     once and one common vouched fraction of the step is applied to every member
+     along its own displacement: `f = 1` moves nothing, `f = 0` puts the rig back
+     exactly as it was, still rigid and still at speed. Both escape hatches keep
+     their meaning at rig scope (any member that STARTED outside lets the whole
+     rig through; the hold counter is keyed on the rig's first live body).
 
 ### A corpse in armour is not allowed to be a motor (2026-09-13; `Physics::SweepRunawayRigs`, gate `corpse-armor`)
 
@@ -3187,14 +3201,20 @@ failure; it would only move an arbitrary line.
 
 **The bug is the persistence, not the value.** A limb thrown by a sword blow may
 touch the clamp for a tick. A limb that *sits* on it is being driven — and a
-dressed corpse has an obvious motor. A worn shell is its own Jolt body, `Fixed`
-to the limb it wraps (`Mob::AppendWornShell`) and geometrically *inside* it, so
-armour doubles the bodies, doubles the constraints, and puts an iron-against-
-flesh mass ratio across every new one. A stiff constraint between deeply
-overlapping bodies is the textbook way to make a sequential-impulse solver gain
-energy, and the joints `Mob::Die` deliberately leaves on the corpse (see
-`corpse-intact`) spread it from one limb to all of them. That is precisely what
-"flying everywhere while still technically being attached" describes.
+dressed corpse has an obvious motor. A worn shell on a CORPSE is its own Jolt
+body, `Fixed` to the limb it wraps and geometrically *inside* it, so armour
+doubles the bodies, doubles the constraints, and puts an iron-against-flesh mass
+ratio across every new one. A stiff constraint between deeply overlapping bodies
+is the textbook way to make a sequential-impulse solver gain energy, and the
+joints `Mob::Die` deliberately leaves on the corpse (see `corpse-intact`) spread
+it from one limb to all of them. That is precisely what "flying everywhere while
+still technically being attached" describes.
+
+> Since 2026-09-13 that is true of a **corpse only**: on a LIVE creature — limp
+> included — a shell has no constraint at all and cannot drive anything (next
+> section). `Mob::Die` creates the strap joints at the moment of death, because
+> that is the one transition where a garment really does become a body of its
+> own, and the nets below are what keeps that case honest.
 
 **Why it costs minutes rather than merely looking silly.** Two multipliers that
 this document already records elsewhere. Every dynamic body is
@@ -3245,10 +3265,53 @@ spheres at the ceiling on purpose and asserts damped > 0, cut > 0, joints 1 → 
 and a final spin of zero. `SANDVOX_NO_RUNAWAY_NET=1` is the A/B arm in one
 binary, for the same reason `SANDVOX_NO_ANTITUNNEL` exists.
 
-**What this does not do.** It bounds the symptom; it does not remove the energy
-source. The armour constraint chain is still the thing that gains energy, and
-the honest next step is to stop a `Fixed` joint between a shell and the limb it
-overlaps from pumping in the first place — the gate is in place to measure it.
+**What this does not do.** It bounds the symptom; on a corpse it does not remove
+the energy source. The next section removes it everywhere a creature is still
+alive, which is where the reported *visual* failure was; a corpse still carries
+the constraint chain and still relies on these nets.
+
+### A garment is not a separate object (2026-09-13; `MobLimb::wornHost`, `Mob::DriveWornShells`, gate `ragdoll-dress`)
+
+Owner report: "when the human mob is falling, and is wearing clothes, when they go
+into the ragdoll state the clothes will decouple from the body when moving at
+high speeds... it becomes a crazy tangled mess ball of limbs and clothes that
+aren't actually connected properly."
+
+**Measured, on a dressed human made limp 200 voxels up: a greave 3.3 voxels off
+the leg wearing it and rotated 151 degrees away from it.** That is what a `Fixed`
+constraint between deeply interpenetrating bodies of very different mass does
+under acceleration — it lags, and it pumps (previous section). Even solved
+perfectly it would be the wrong model, because a garment on a limb has no pose of
+its own to solve for.
+
+So a worn shell is now a **follower**: `MobLimb::wornHost` names the limb it is
+strapped to, it stays KINEMATIC in every phase a live creature has, it has **no
+constraint at all**, and `Mob::DriveWornShells` teleports it onto the host's exact
+rigid offset — position, rotation and the rigid-body velocity `v + ω × r` — once
+per tick from `Mob::PostStep`, after the read-back. The offset is therefore
+*derived* rather than solved, which is a constancy claim rather than a smallness
+one: the same fixture now measures 0.000 voxels and 0.06°.
+
+- **One place poses a shell.** `SubmitPose` skips them. It used to pose them too
+  (an `AnimPart` whose rest transform is the identity gets the host's pose for
+  free), and the two agreed only while both bodies were kinematic — a limp host
+  is placed by Jolt and a get-up host by a per-limb blend, and either is a
+  garment floating off a shoulder.
+- **Death is the one transition where a garment becomes a body.** `Mob::Die`
+  creates the `Fixed` strap joints just before the limbs go to `DebrisSystem`,
+  anchored where the pair actually is, so a corpse still wears its armour. That
+  is the case the runaway nets above still cover.
+- **A shell that LEAVES stops being a follower** (`DetachLimb` clears
+  `wornHost`), and is ordinary debris from the end of its sever hold.
+- **What it costs:** a kinematic body has no mass in the solver, so an armoured
+  ragdoll tumbles with flesh inertia rather than with 489 kg of iron. Weight
+  still tells where it is authored to (`BodyMassKg` sums the shells, so a blast
+  launches a plated body far slower). Folding each shell's mass into its host's
+  mass properties is a separate change with its own gate.
+- **`SANDVOX_NO_RIGWELD=1`** is the A/B arm in one binary — jointed dynamic
+  shells and the per-body anti-tunnel clamp — for the same reason
+  `SANDVOX_NO_ANTITUNNEL` and `SANDVOX_NO_RUNAWAY_NET` exist. `ragdoll-dress`
+  reports both regimes' numbers side by side in `tests/baseline.json`.
 
 ### Carving living bodies (2026-08-20; `game/mob.cpp`, `MobSystem::CarveLimb*`)
 

@@ -634,6 +634,40 @@ struct GoreProfile {
 struct MobLimb {
   uint64_t body = 0;         // 0 = severed or never spawned
   uint64_t joint = 0;        // to parent
+  // ---- A GARMENT IS NOT A SEPARATE OBJECT ----------------------------------
+  //
+  // >= 0 on an appended WORN SHELL: the index of the body limb it is strapped
+  // to. A shell with a host is a FOLLOWER — kinematic in every phase, no joint
+  // to its host, teleported onto the host's exact rigid offset by
+  // Mob::DriveWornShells once per PostStep. It keeps its own slot, lattice, hp
+  // and Jolt body (that is what a sword ray hits and what carries its damage),
+  // it simply has no dynamics of its own while it is being worn.
+  //
+  // WHY, measured: as a dynamic body on a Fixed constraint it drifted off the
+  // limb whenever the rig went limp at speed — a stiff constraint between two
+  // deeply interpenetrating bodies of very different mass is the textbook way
+  // to make a sequential-impulse solver both lag and gain energy, and the owner
+  // report it comes from is "all of the clothes separate from limbs and it
+  // becomes a crazy tangled mess ball". A follower cannot separate: its pose is
+  // not solved for, it is derived.
+  //
+  // WHAT THIS COSTS, stated because it is a real behaviour change and not an
+  // oversight: a kinematic body has no mass as far as the solver is concerned,
+  // so an armoured ragdoll now tumbles with its FLESH inertia rather than with
+  // 489 kg of iron. Weight still tells everywhere it is authored to — BodyMassKg
+  // sums the shells, so a blast launches a plated body far slower — and the
+  // alternative (folding each shell's mass into its host's mass properties) is a
+  // separate change with its own gate. What was lost is a mass ratio across a
+  // stiff constraint, which is the thing that was breaking.
+  //
+  // -1 on every body limb, on a held item (which is a foreign object aligned
+  // hilt-to-socket, not a shell — see AppendHeldItem), and on a shell that has
+  // left the creature. Also -1 with SANDVOX_NO_RIGWELD=1, the A/B arm, which
+  // restores the jointed dynamic shell: "is a follower" and "has a host" are
+  // deliberately the same question, so one env read switches every test of it.
+  // Stable across RemoveAppendedSlots: a host is always a BASE limb, and the
+  // shift only renumbers appended slots.
+  int wornHost = -1;
   float hp = 0;
   std::vector<DebrisVoxel> voxels;
   IVec3 size{};
@@ -888,6 +922,28 @@ class Mob {
   bool BlastRadial(Vec3 centerWorldVoxel, float radiusVoxels, float impulseKgMs);
   // Sum of the live limbs' Jolt masses, kg.
   float BodyMassKg() const;
+  // ---- WORN SHELLS RIDE THEIR LIMBS, IN EVERY PHASE -----------------------
+  //
+  // Put every attached shell exactly on its host limb (MobLimb::wornHost), by
+  // the same two steps AppendWornShell placed it with: reach the host's anchor
+  // through the host's live transform, then back off to this shell's own
+  // corner. A teleport, not a kinematic drive, and it carries the host's
+  // velocities so the garment's contacts and its ray proxy agree with the limb
+  // inside it mid-step as well as at the end of one.
+  //
+  // Called once per tick from PostStep, AFTER the read-back, so the host
+  // transform it derives from is the one that will be rendered this frame —
+  // whether Jolt placed it (limp) or the pose pipeline did (everything else).
+  // This is the ONLY thing that poses a shell; SubmitPose skips them.
+  void DriveWornShells();
+  // The limb this slot is strapped to, or -1 if it is not a follower at all —
+  // MobLimb::wornHost, for a caller outside the class. NOT a synonym for
+  // IsWornSlot: that asks "is this wardrobe rather than anatomy" (by tag, true
+  // of a shed rag mid-hold too), this asks "is this slot's pose derived from
+  // another slot's, and from which".
+  int WornHostOf(int slot) const {
+    return slot >= 0 && slot < (int)limbs_.size() ? limbs_[slot].wornHost : -1;
+  }
   // Where the creature IS: the root limb's live body origin, or origin_ when
   // the rig has no root body. Mob::origin_ is the walk driver's anchor and
   // stops meaning anything while the body is limp.
@@ -1713,6 +1769,12 @@ class Mob {
   // GetUp: each limb's world pose the moment it was made kinematic again —
   // the "from" side of the get-up blend, parallel to limbs_.
   std::vector<BodyTransform> getUpFrom_;
+  // PostStep scratch for DebrisSystem::UntunnelRig: the limp rig's dynamic
+  // bodies and where each of them was before the step. Members rather than
+  // locals so a limp creature does not allocate twice a tick; cleared and
+  // refilled each use, meaningless between calls.
+  std::vector<uint64_t> rigHandles_;
+  std::vector<Vec3> rigPrevPos_;
   // ---- NPC freefall (MobSystem::UpdateFall) ----
   // The walk driver snaps origin_.y to the probed ground; when the ground is
   // further below than a step, the creature falls under physics.gravity

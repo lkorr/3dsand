@@ -1639,6 +1639,29 @@ bool Physics::SetBodyPosition(uint64_t handle, Vec3 posVoxel) {
   return true;
 }
 
+bool Physics::SetBodyTransform(uint64_t handle, Vec3 posVoxel,
+                               const float quat[4]) {
+  if (!system_ || handle == 0) return false;
+  JPH::BodyInterface& bi = system_->GetBodyInterface();
+  JPH::BodyID id = ToBodyID(handle);
+  if (!bi.IsAdded(id)) return false;
+  JPH::Quat q(quat[0], quat[1], quat[2], quat[3]);
+  // A DERIVED POSE MUST NOT BE ABLE TO POISON THE SOLVER. The quaternion here
+  // came out of another body's read-back and was composed with an authored
+  // offset, so it is normally fine — but the whole point of the FP-trap note
+  // above Physics::Step is that "normally fine" is what gets handed to Jolt
+  // right before a step dies on it, and SetRotation asserts on a non-unit
+  // quat in a Debug build and silently scales the shape in Release.
+  const float len2 = q.LengthSq();
+  if (!std::isfinite(len2) || len2 < 1.0e-6f) return false;
+  q = q.Normalized();
+  bi.SetPositionAndRotation(id,
+                            JPH::RVec3(VoxToM(posVoxel.x), VoxToM(posVoxel.y),
+                                       VoxToM(posVoxel.z)),
+                            q, JPH::EActivation::Activate);
+  return true;
+}
+
 // A velocity written from game code is the one input to the solver this engine
 // controls, so it is also the one place a non-number can be kept out of Jolt
 // for free. A value that fails here is DROPPED, not clamped: it is not a fast

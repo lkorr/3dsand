@@ -291,6 +291,12 @@ const char* const kOrder[] = {
     // regenerates the world on both the way in and the way out, so it is
     // order-independent past that.
     "ragdoll-falldamage",
+    // ...and the dressed one, last in the group for the reason the AI gates
+    // give. Same self-contained shape again — resets mobs + debris and
+    // regenerates worldgen on the way in and the way out — but it also WEARS
+    // every item in the library, and a gate that equips things perturbs the
+    // id-keyed draws of anything after it, so it goes after the two that do not.
+    "ragdoll-dress",
     // ---- THE WOUND MODEL ---------------------------------------------------
     // LAST of the mob gates, and the position is a lesson rather than a
     // preference.
