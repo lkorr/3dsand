@@ -4126,6 +4126,73 @@ void DebrisSystem::PostStep() {
   }
 }
 
+// ---- THE EXPOSED-VOXEL CULL (BuildInstances) --------------------------------
+// A body voxel with all six neighbours occupied by the SAME body can never
+// produce a visible fragment: every one of its faces is coincident with a
+// neighbour's face pointing the other way, and both are opaque. Emitting it as
+// an instance still costs 36 vertex-shader invocations (two buffer reads, four
+// quaternion rotations, a palette lookup, a burn tint and a six-read openness
+// probe each) and 12 triangles the rasteriser has to set up and depth-reject.
+// The felled oak (--fell-tree) is 28.4k voxels of which a solid trunk and a
+// 35-92% dense crown make most interior — see the numbers on the commit.
+//
+// Occupancy is a padded byte lattice over the body's local AABB, rebuilt per
+// body per call: BuildInstances runs only when a body's geometry changed
+// (instancesDirty_), so this is O(voxels) per geometry edit, not per frame.
+// The one-cell pad means a voxel on the AABB hull is always exposed without a
+// bounds test in the neighbour probe.
+//
+// What it must NOT do: cull by anything the GPU changes later. Burn tints are
+// payload rewrites and go through the instance list unchanged (a fully
+// enclosed ember is invisible anyway); carving removes voxels and marks the
+// list dirty, which rebuilds the cull. Another body's voxels never count as
+// cover — two bodies are never in the same lattice.
+//
+// SANDVOX_BODY_DRAW_ALL=1 emits every voxel (the pre-2026-09-12 list): the
+// one-binary A/B arm for the drawBodies span, kept so the cull's share of that
+// span can be re-measured without a build.
+namespace {
+bool BodyDrawAllVoxels() {
+  static const bool all = [] {
+    const char* e = std::getenv("SANDVOX_BODY_DRAW_ALL");
+    return e && e[0] != '0';
+  }();
+  return all;
+}
+
+// Emits the instances for one body into `out`, culling enclosed voxels.
+// `scratch` is the occupancy lattice, reused across bodies and calls.
+void EmitExposedBodyVoxels(const std::vector<DebrisVoxel>& voxels,
+                           int8_t lmin[3], int8_t lmax[3], uint32_t slot,
+                           std::vector<uint8_t>& scratch,
+                           std::vector<BodyVoxInst>& out,
+                           uint32_t& exposed) {
+  const int dx = (int)lmax[0] - (int)lmin[0] + 3;  // +1 pad each side
+  const int dy = (int)lmax[1] - (int)lmin[1] + 3;
+  const int dz = (int)lmax[2] - (int)lmin[2] + 3;
+  const size_t vol = (size_t)dx * (size_t)dy * (size_t)dz;
+  scratch.assign(vol, 0);
+  auto idx = [&](const DebrisVoxel& v) -> size_t {
+    return (size_t)(v.x - lmin[0] + 1) +
+           (size_t)dx * ((size_t)(v.y - lmin[1] + 1) +
+                         (size_t)dy * (size_t)(v.z - lmin[2] + 1));
+  };
+  for (const DebrisVoxel& v : voxels) scratch[idx(v)] = 1;
+  const size_t sx = 1, sy = (size_t)dx, sz = (size_t)dx * (size_t)dy;
+  for (const DebrisVoxel& v : voxels) {
+    if (out.size() >= kMaxBodyVoxInstances) break;
+    const size_t i = idx(v);
+    const bool enclosed = scratch[i - sx] && scratch[i + sx] &&
+                          scratch[i - sy] && scratch[i + sy] &&
+                          scratch[i - sz] && scratch[i + sz];
+    if (enclosed) continue;
+    exposed++;
+    out.push_back({(float)v.x, (float)v.y, (float)v.z,
+                   (uint32_t)v.payload | (slot << 16)});
+  }
+}
+}  // namespace
+
 void DebrisSystem::BuildInstances(std::vector<BodyVoxInst>& out) {
   // Charged straight into totalUs rather than through curUs: this runs on the
   // RENDER side, after PreTick has already rolled its tick up, so it belongs
@@ -4135,16 +4202,39 @@ void DebrisSystem::BuildInstances(std::vector<BodyVoxInst>& out) {
   const auto t0 = prof_.on ? std::chrono::steady_clock::now()
                            : std::chrono::steady_clock::time_point{};
   out.clear();
+  static std::vector<uint8_t> occScratch;
+  uint32_t sourceVoxels = 0, exposed = 0;
   for (size_t bi = 0; bi < bodies_.size() && bi < kMaxBodies; bi++) {
     // Micro bodies draw through the OBB/brick-march pass instead. They still
     // OWN their slot (the two passes share bodyXforms), they just contribute
     // no cube instances — emitting both would double-draw at the wrong size.
     if (bodies_[bi].micro.Valid()) continue;
-    for (const DebrisVoxel& v : bodies_[bi].voxels) {
-      if (out.size() >= kMaxBodyVoxInstances) break;
-      out.push_back({(float)v.x, (float)v.y, (float)v.z,
-                     (uint32_t)v.payload | ((uint32_t)bi << 16)});
+    Body& b = bodies_[bi];
+    sourceVoxels += (uint32_t)b.voxels.size();
+    if (BodyDrawAllVoxels()) {
+      for (const DebrisVoxel& v : b.voxels) {
+        if (out.size() >= kMaxBodyVoxInstances) break;
+        out.push_back({(float)v.x, (float)v.y, (float)v.z,
+                       (uint32_t)v.payload | ((uint32_t)bi << 16)});
+      }
+      continue;
     }
+    RefreshLocalBounds(b);
+    EmitExposedBodyVoxels(b.voxels, b.lmin, b.lmax, (uint32_t)bi, occScratch,
+                          out, exposed);
+  }
+  // One line per DISTINCT population, so the --frames harness can quote the
+  // cull's ratio: burning rewrites payloads and leaves both counts alone, so a
+  // burning body does not print every tick.
+  static uint32_t lastPrintedSrc = 0xFFFFFFFFu, lastPrintedOut = 0xFFFFFFFFu;
+  if (sourceVoxels >= 1024 &&
+      (sourceVoxels != lastPrintedSrc || (uint32_t)out.size() != lastPrintedOut)) {
+    lastPrintedSrc = sourceVoxels;
+    lastPrintedOut = (uint32_t)out.size();
+    std::printf("debris: BuildInstances %u cube instances from %u voxels "
+                "(%u exposed, %s)\n",
+                (uint32_t)out.size(), sourceVoxels, exposed,
+                BodyDrawAllVoxels() ? "SANDVOX_BODY_DRAW_ALL" : "enclosed culled");
   }
   instanceCount_ = (uint32_t)out.size();
   instancesDirty_ = false;
