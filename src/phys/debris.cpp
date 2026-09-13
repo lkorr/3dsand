@@ -106,6 +106,13 @@ constexpr float kTerrainSkirtVox = 4.0f;
 constexpr uint32_t kTerrainNeedCeiling = 512;
 constexpr uint32_t kTerrainFetchPerTick = 24;
 constexpr uint32_t kTerrainGatherPerTick = 24;
+// A mob's planning horizon is listed on one tick in this many (see
+// needHorizon in ManageTerrain); its own body is listed every tick.
+constexpr uint32_t kTerrainHorizonStride = 4;
+// The per-body chunk grid needBody marks into: an int8 lattice rotated is at
+// most ~430 world voxels a side, 28 chunks, 22k cells. Past this it falls back
+// to the AABB sweep rather than allocate.
+constexpr size_t kTerrainNeedGridCells = 65536;
 // Real marching-cubes + Jolt rebuilds per tick (ManageTerrain). Six covers a
 // chunk-boundary crossing's new face of anchor chunks in two ticks; the
 // unbudgeted version did 64 in one and that was the walking hitch.
@@ -760,7 +767,7 @@ bool DebrisSystem::EventReady(const Event& e, World& world, bool requestFetch) c
   if (!noWait && e.waiting && world.ChunkInWindow(e.waitChunk)) {
     const CachedChunk* cc = world.Cached(e.waitChunk);
     if (!cc || cc->voxels.size() != kChunkVol) {
-      if (requestFetch) world.RequestChunkFetch(e.waitChunk);
+      if (requestFetch) world.RequestChunkFetch(e.waitChunk, World::FetchSource::IslandScan);
       return false;
     }
   }
@@ -776,7 +783,7 @@ bool DebrisSystem::EventReady(const Event& e, World& world, bool requestFetch) c
         if (!world.ChunkInWindow(wc)) continue;  // streamed out: skip
         const CachedChunk* cc = world.Cached(wc);
         if (!cc || cc->version < RequiredVersion(wc, e.tick)) {
-          if (requestFetch) world.RequestChunkFetch(wc);
+          if (requestFetch) world.RequestChunkFetch(wc, World::FetchSource::IslandScan);
           ready = false;
         }
       }
@@ -856,7 +863,7 @@ void DebrisSystem::RunIslandDetection(const Event& e, uint32_t tick, World& worl
     }
     if (!last.usable && world.ChunkInWindow(wc)) {
       if (fetchesIssued < kIslandFetchPerScan) {
-        world.RequestChunkFetch(wc);
+        world.RequestChunkFetch(wc, World::FetchSource::IslandScan);
         fetchesIssued++;
       }
       if (!needFetch) firstWait = wc;
@@ -1695,13 +1702,15 @@ std::string DebrisSystem::ProfileReport() const {
   s += Fmt(
       " | unattributed %.1f ms | chunks needed %llu (max %u in one tick), "
       "fetches asked %llu (max %u), gathers %llu, polygonizes %llu, jolt "
-      "meshes %llu, bodies %llu (%llu vox)",
+      "meshes %llu, bodies %llu (%llu vox), need blocks %llu, anchor chunks "
+      "%llu",
       (p.tickUsTotal - named) / 1000.0,
       (unsigned long long)p.chunksNeeded, p.maxNeededOneTick,
       (unsigned long long)p.fetchesAsked, p.maxFetchOneTick,
       (unsigned long long)p.gathers, (unsigned long long)p.polys,
       (unsigned long long)p.joltMeshes, (unsigned long long)p.bodiesCreated,
-      (unsigned long long)p.bodyVoxCreated);
+      (unsigned long long)p.bodyVoxCreated, (unsigned long long)p.needBlocks,
+      (unsigned long long)p.anchorChunks);
   return s;
 }
 
@@ -1846,7 +1855,7 @@ bool DebrisSystem::SettleFootprintSupported(const std::vector<DebrisVoxel>& src,
     IVec3 wc = ChunkOfCell(below.x, below.y, below.z);
     const CachedChunk* cc = world.Cached(wc);
     if (!cc || cc->voxels.size() != kChunkVol) {
-      world.RequestChunkFetch(wc);
+      world.RequestChunkFetch(wc, World::FetchSource::Settle);
       sawUnknown = true;  // abstain: cannot prove this body is over a void
       continue;
     }
@@ -2786,8 +2795,8 @@ bool DebrisSystem::AnyDirtyNear(const Body& b, const WorldSnapshot& snap,
 }
 
 void DebrisSystem::AddTerrainAnchor(Vec3 posVoxel, float radiusVoxels,
-                                    Vec3 velVoxPerSec) {
-  extraAnchors_.push_back({posVoxel, radiusVoxels, velVoxPerSec});
+                                    Vec3 velVoxPerSec, float horizonVoxels) {
+  extraAnchors_.push_back({posVoxel, radiusVoxels, velVoxPerSec, horizonVoxels});
 }
 
 void DebrisSystem::AdoptBody(uint64_t handle, std::vector<DebrisVoxel> voxels,
@@ -3478,6 +3487,8 @@ void DebrisSystem::RefreshLocalBounds(Body& b) {
   if (b.voxels.empty()) {
     b.lmin[0] = b.lmin[1] = b.lmin[2] = 0;
     b.lmax[0] = b.lmax[1] = b.lmax[2] = 0;
+    b.needBlocks.clear();
+    b.needDim[0] = b.needDim[1] = b.needDim[2] = 0;
     return;
   }
   int mn[3] = {127, 127, 127}, mx[3] = {-128, -128, -128};
@@ -3491,6 +3502,23 @@ void DebrisSystem::RefreshLocalBounds(Body& b) {
   for (int a = 0; a < 3; a++) {
     b.lmin[a] = (int8_t)mn[a];
     b.lmax[a] = (int8_t)mx[a];
+  }
+  // The coarse occupancy (Body::needBlocks). An int8 lattice is at most 256
+  // a side, 32 blocks, 32^3 bits = 4 KiB worst case; an oak's 59 x 81 x 59
+  // is 8 x 11 x 8 = 704 bits.
+  int dim[3];
+  for (int a = 0; a < 3; a++) {
+    dim[a] = (mx[a] - mn[a]) / kNeedBlock + 1;
+    b.needDim[a] = (uint8_t)dim[a];
+  }
+  const size_t nbits = (size_t)dim[0] * (size_t)dim[1] * (size_t)dim[2];
+  b.needBlocks.assign((nbits + 63) / 64, 0ull);
+  for (const DebrisVoxel& v : b.voxels) {
+    const int bx = (v.x - mn[0]) / kNeedBlock, by = (v.y - mn[1]) / kNeedBlock,
+              bz = (v.z - mn[2]) / kNeedBlock;
+    const size_t i = ((size_t)bz * (size_t)dim[1] + (size_t)by) * (size_t)dim[0] +
+                     (size_t)bx;
+    b.needBlocks[i >> 6] |= 1ull << (i & 63);
   }
 }
 
@@ -3551,25 +3579,185 @@ void DebrisSystem::ManageTerrain(uint32_t tick, World& world) {
     needBoxWorld(Vec3{pos.x - r, pos.y - r, pos.z - r},
                  Vec3{pos.x + r, pos.y + r, pos.z + r});
   };
-  // A BODY asks around its rotated lattice AABB. `physScale` is collider
-  // voxels per world voxel, so the lattice is divided by it exactly as every
-  // other body-local -> world conversion in this file does.
+  // A BODY asks around the chunks ITS MATTER lands in, not around its rotated
+  // AABB. The AABB was already the fix for a bounding sphere (see the note at
+  // kTerrainSkirtVox), but the AABB of a tumbling 81-voxel trunk with a crown
+  // at one end is mostly empty: measured 2026-09-12 in the live --fell-tree
+  // harness, one oak sat AT kTerrainNeedCeiling (505 of 512 chunks a tick)
+  // for as long as it turned, 111k chunk visits over the fall. So the lattice
+  // box is diced into kNeedBlock^3 blocks with one bit each (Body::needBlocks,
+  // cached with lmin/lmax), and only the SET blocks are transformed: each
+  // block's centre goes through the body transform, its rotated extent is the
+  // fixed half-diagonal of a cube of that size, and the chunks that box plus
+  // the skirt covers are marked in a dense per-body grid holding the least
+  // distance from any chunk centre to any block box. A chunk holding matter
+  // is therefore still at 0 and the nearest-first budgets below still serve
+  // the ground under the body first; what changes is that the sky between a
+  // rotated trunk and the corner of its AABB is never listed.
+  //
+  // `physScale` is collider voxels per world voxel, so the lattice is divided
+  // by it exactly as every other body-local -> world conversion in this file.
+  // SANDVOX_TERRAIN_NEED_AABB=1 is the 66567da behaviour in the same binary.
+  static const bool needAabb =
+      std::getenv("SANDVOX_TERRAIN_NEED_AABB") != nullptr;
+  std::vector<float>& grid = terrainNeedGrid_;
   auto needBody = [&](Body& b) {
     RefreshLocalBounds(b);
+    if (b.voxels.empty()) return;
     const float inv = 1.0f / (float)std::max(1u, b.physScale);
+    const float k = kTerrainSkirtVox;
+    const Vec3 ex = QuatRot(b.xf.quat, Vec3{1.0f, 0.0f, 0.0f});
+    const Vec3 ey = QuatRot(b.xf.quat, Vec3{0.0f, 1.0f, 0.0f});
+    const Vec3 ez = QuatRot(b.xf.quat, Vec3{0.0f, 0.0f, 1.0f});
+    auto toWorld = [&](float lx, float ly, float lz) {
+      return b.xf.pos + ex * lx + ey * ly + ez * lz;
+    };
+    if (needAabb) {
+      Vec3 wlo{1e30f, 1e30f, 1e30f}, whi{-1e30f, -1e30f, -1e30f};
+      for (int corner = 0; corner < 8; corner++) {
+        const Vec3 w = toWorld(
+            ((corner & 1) ? (float)b.lmax[0] + 1.0f : (float)b.lmin[0]) * inv,
+            ((corner & 2) ? (float)b.lmax[1] + 1.0f : (float)b.lmin[1]) * inv,
+            ((corner & 4) ? (float)b.lmax[2] + 1.0f : (float)b.lmin[2]) * inv);
+        wlo.x = std::min(wlo.x, w.x); whi.x = std::max(whi.x, w.x);
+        wlo.y = std::min(wlo.y, w.y); whi.y = std::max(whi.y, w.y);
+        wlo.z = std::min(wlo.z, w.z); whi.z = std::max(whi.z, w.z);
+      }
+      needBoxWorld(Vec3{wlo.x - k, wlo.y - k, wlo.z - k},
+                   Vec3{whi.x + k, whi.y + k, whi.z + k});
+      return;
+    }
+    // The grid this body may mark: the AABB of the BLOCK grid (whose far
+    // corner is past lmax when an edge block is partly empty), plus skirt.
+    const int dim[3] = {b.needDim[0], b.needDim[1], b.needDim[2]};
     Vec3 wlo{1e30f, 1e30f, 1e30f}, whi{-1e30f, -1e30f, -1e30f};
     for (int corner = 0; corner < 8; corner++) {
-      const Vec3 lc{((corner & 1) ? (float)b.lmax[0] + 1.0f : (float)b.lmin[0]) * inv,
-                    ((corner & 2) ? (float)b.lmax[1] + 1.0f : (float)b.lmin[1]) * inv,
-                    ((corner & 4) ? (float)b.lmax[2] + 1.0f : (float)b.lmin[2]) * inv};
-      const Vec3 w = b.xf.pos + QuatRot(b.xf.quat, lc);
+      float lc[3];
+      for (int a = 0; a < 3; a++)
+        lc[a] = ((float)b.lmin[a] +
+                 ((corner >> a) & 1 ? (float)(dim[a] * kNeedBlock) : 0.0f)) *
+                inv;
+      const Vec3 w = toWorld(lc[0], lc[1], lc[2]);
       wlo.x = std::min(wlo.x, w.x); whi.x = std::max(whi.x, w.x);
       wlo.y = std::min(wlo.y, w.y); whi.y = std::max(whi.y, w.y);
       wlo.z = std::min(wlo.z, w.z); whi.z = std::max(whi.z, w.z);
     }
-    const float k = kTerrainSkirtVox;
-    needBoxWorld(Vec3{wlo.x - k, wlo.y - k, wlo.z - k},
-                 Vec3{whi.x + k, whi.y + k, whi.z + k});
+    const int glo[3] = {ifloor(wlo.x - k) >> 4, ifloor(wlo.y - k) >> 4,
+                        ifloor(wlo.z - k) >> 4};
+    const int ghi[3] = {ifloor(whi.x + k) >> 4, ifloor(whi.y + k) >> 4,
+                        ifloor(whi.z + k) >> 4};
+    const int gn[3] = {ghi[0] - glo[0] + 1, ghi[1] - glo[1] + 1,
+                       ghi[2] - glo[2] + 1};
+    const size_t cells = (size_t)gn[0] * (size_t)gn[1] * (size_t)gn[2];
+    if (cells > kTerrainNeedGridCells) {  // cannot happen for an int8 lattice
+      needBoxWorld(Vec3{wlo.x - k, wlo.y - k, wlo.z - k},
+                   Vec3{whi.x + k, whi.y + k, whi.z + k});
+      return;
+    }
+    grid.assign(cells, 1e30f);
+    // A rotated cube's AABB half-extent per world axis is the half-side times
+    // the sum of that row's absolute basis components; every block is the
+    // same cube, so this is three numbers per body, not per block.
+    const float hb = 0.5f * (float)kNeedBlock * inv;
+    const float h[3] = {
+        hb * (std::fabs(ex.x) + std::fabs(ey.x) + std::fabs(ez.x)),
+        hb * (std::fabs(ex.y) + std::fabs(ey.y) + std::fabs(ez.y)),
+        hb * (std::fabs(ex.z) + std::fabs(ey.z) + std::fabs(ez.z))};
+    for (int bz = 0; bz < dim[2]; bz++)
+      for (int by = 0; by < dim[1]; by++)
+        for (int bx = 0; bx < dim[0]; bx++) {
+          const size_t i = ((size_t)bz * (size_t)dim[1] + (size_t)by) *
+                               (size_t)dim[0] + (size_t)bx;
+          if (((b.needBlocks[i >> 6] >> (i & 63)) & 1ull) == 0ull) continue;
+          if (prof_.on) prof_.needBlocks++;
+          const Vec3 c = toWorld(
+              ((float)b.lmin[0] + ((float)bx + 0.5f) * (float)kNeedBlock) * inv,
+              ((float)b.lmin[1] + ((float)by + 0.5f) * (float)kNeedBlock) * inv,
+              ((float)b.lmin[2] + ((float)bz + 0.5f) * (float)kNeedBlock) * inv);
+          const float blo[3] = {c.x - h[0], c.y - h[1], c.z - h[2]};
+          const float bhi[3] = {c.x + h[0], c.y + h[1], c.z + h[2]};
+          int clo[3], chi[3];
+          for (int a = 0; a < 3; a++) {
+            clo[a] = std::max(glo[a], ifloor(blo[a] - k) >> 4);
+            chi[a] = std::min(ghi[a], ifloor(bhi[a] + k) >> 4);
+          }
+          for (int cz = clo[2]; cz <= chi[2]; cz++)
+            for (int cy = clo[1]; cy <= chi[1]; cy++)
+              for (int cx = clo[0]; cx <= chi[0]; cx++) {
+                const float cc[3] = {
+                    (float)(cx * (int)kChunk + (int)kChunk / 2),
+                    (float)(cy * (int)kChunk + (int)kChunk / 2),
+                    (float)(cz * (int)kChunk + (int)kChunk / 2)};
+                float d2 = 0;
+                for (int a = 0; a < 3; a++) {
+                  const float e = cc[a] < blo[a] ? blo[a] - cc[a]
+                                  : (cc[a] > bhi[a] ? cc[a] - bhi[a] : 0.0f);
+                  d2 += e * e;
+                }
+                float& g = grid[((size_t)(cz - glo[2]) * (size_t)gn[1] +
+                                 (size_t)(cy - glo[1])) * (size_t)gn[0] +
+                                (size_t)(cx - glo[0])];
+                if (d2 < g) g = d2;
+              }
+        }
+    for (int cz = 0; cz < gn[2]; cz++)
+      for (int cy = 0; cy < gn[1]; cy++)
+        for (int cx = 0; cx < gn[0]; cx++) {
+          const float g = grid[((size_t)cz * (size_t)gn[1] + (size_t)cy) *
+                                   (size_t)gn[0] + (size_t)cx];
+          if (g >= 1e30f) continue;
+          const IVec3 wc{glo[0] + cx, glo[1] + cy, glo[2] + cz};
+          if (!world.ChunkInWindow(wc)) continue;
+          needed.push_back({wc, g});
+        }
+  };
+  // A MOB'S PLANNING HORIZON IS LISTED ON A STRIDE. The core anchor (the
+  // creature's own body, radius + 6) is collision and goes through needAround
+  // every tick as it always did. The horizon (navRadius + 4, ~216 chunks for
+  // a 30-voxel planner) exists so the A* search reads fetched chunks instead
+  // of UNKNOWN, and a chunk 30 voxels from a standing creature does not need
+  // its staleness re-examined 30 times a second: each horizon chunk is listed
+  // on one tick in kTerrainHorizonStride, phased by a hash of its coordinate
+  // so the work is spread evenly rather than bursting. Nothing is dropped
+  // (an entry that missed a tick is listed on its next one, and patches
+  // survive kTerrainEvictTicks), a fresh horizon still arrives at the fetch
+  // budget's pace, and the ceiling's tail -- the horizon, by distance -- is
+  // that much shorter, so a big body's own chunks are never behind it.
+  // SANDVOX_TERRAIN_HORIZON_STRIDE=1 is the every-tick behaviour.
+  static const uint32_t horizonStride = [] {
+    if (const char* e = std::getenv("SANDVOX_TERRAIN_HORIZON_STRIDE")) {
+      const long n = std::strtol(e, nullptr, 10);
+      if (n >= 1) return (uint32_t)n;
+    }
+    return kTerrainHorizonStride;
+  }();
+  auto needHorizon = [&](Vec3 pos, float coreRadius, float horizon) {
+    const float rc = coreRadius + 6.0f;  // needAround's box, already listed
+    if (horizon <= rc) return;
+    const int clo[3] = {ifloor(pos.x - rc) >> 4, ifloor(pos.y - rc) >> 4,
+                        ifloor(pos.z - rc) >> 4};
+    const int chi[3] = {ifloor(pos.x + rc) >> 4, ifloor(pos.y + rc) >> 4,
+                        ifloor(pos.z + rc) >> 4};
+    const int lo[3] = {ifloor(pos.x - horizon) >> 4, ifloor(pos.y - horizon) >> 4,
+                       ifloor(pos.z - horizon) >> 4};
+    const int hi[3] = {ifloor(pos.x + horizon) >> 4, ifloor(pos.y + horizon) >> 4,
+                       ifloor(pos.z + horizon) >> 4};
+    for (int cz = lo[2]; cz <= hi[2]; cz++)
+      for (int cy = lo[1]; cy <= hi[1]; cy++)
+        for (int cx = lo[0]; cx <= hi[0]; cx++) {
+          if (cx >= clo[0] && cx <= chi[0] && cy >= clo[1] && cy <= chi[1] &&
+              cz >= clo[2] && cz <= chi[2])
+            continue;  // the core box
+          const IVec3 wc{cx, cy, cz};
+          if (!world.ChunkInWindow(wc)) continue;
+          const uint64_t key = World::PackChunkKey(wc) * 0x9E3779B97F4A7C15ull;
+          if ((((uint32_t)(key >> 58) + tick) % horizonStride) != 0u) continue;
+          const float dx = (float)(cx * (int)kChunk + (int)kChunk / 2) - pos.x;
+          const float dy = (float)(cy * (int)kChunk + (int)kChunk / 2) - pos.y;
+          const float dz = (float)(cz * (int)kChunk + (int)kChunk / 2) - pos.z;
+          needed.push_back({wc, dx * dx + dy * dy + dz * dz});
+          if (prof_.on) prof_.anchorChunks++;
+        }
   };
   // A FALLING BODY NEEDS THE GROUND IT IS ABOUT TO REACH.
   //
@@ -3610,7 +3798,10 @@ void DebrisSystem::ManageTerrain(uint32_t tick, World& world) {
     sweepAhead(b.xf.pos, lin);
   }
   for (const Anchor& a : extraAnchors_) {
+    const size_t before = needed.size();
     needAround(a.pos, a.radius);
+    if (prof_.on) prof_.anchorChunks += needed.size() - before;
+    needHorizon(a.pos, a.radius, a.horizon);
     sweepAhead(a.pos, a.vel);
   }
   extraAnchors_.clear();
@@ -3670,7 +3861,7 @@ void DebrisSystem::ManageTerrain(uint32_t tick, World& world) {
       // fewer than arrive costs nothing: the queue is deduped and the chunks
       // this tick declined are the head of the next sweep.
       if (fetchesThisTick < kTerrainFetchPerTick) {
-        world.RequestChunkFetch(wc);
+        world.RequestChunkFetch(wc, World::FetchSource::Terrain);
         fetchesThisTick++;
       }
       continue;
@@ -3685,7 +3876,7 @@ void DebrisSystem::ManageTerrain(uint32_t tick, World& world) {
       if (wt != chunkWriteTick_.end()) {
         if (cc->version < wt->second) {
           if (fetchesThisTick < kTerrainFetchPerTick) {
-            world.RequestChunkFetch(wc);
+            world.RequestChunkFetch(wc, World::FetchSource::Terrain);
             fetchesThisTick++;
           }
         } else {
@@ -3697,7 +3888,15 @@ void DebrisSystem::ManageTerrain(uint32_t tick, World& world) {
     // and its 26 neighbours' (the border ring of the occupancy). Lists the
     // mirror has caught up with are dropped here; the rest form an identity
     // that forces a rebuild when it changes.
+    // The 27 lookups are skipped outright while no write is pending, which is
+    // every tick but the few after a cut. Measured headless on tree-fell's
+    // cut pass (2026-09-12): 0.28 us a visit with the loop, 0.19-0.22 without
+    // -- a fifth of a visit that is mostly two other hash lookups, not the
+    // bulk of it. SANDVOX_TERRAIN_VACATE_SCAN=1 is the old unconditional loop.
+    static const bool vacateScanAlways =
+        std::getenv("SANDVOX_TERRAIN_VACATE_SCAN") != nullptr;
     uint64_t vacateKey = 0;
+    if (vacateScanAlways || !pendingVacate_.empty())
     for (int ncz = -1; ncz <= 1; ncz++)
       for (int ncy = -1; ncy <= 1; ncy++)
         for (int ncx = -1; ncx <= 1; ncx++) {
@@ -3721,7 +3920,7 @@ void DebrisSystem::ManageTerrain(uint32_t tick, World& world) {
         tick > t.lastRefreshReq + kTerrainRefreshTicks) {
       if (fetchesThisTick < kTerrainFetchPerTick) {
         t.lastRefreshReq = tick;
-        world.RequestChunkFetch(wc);
+        world.RequestChunkFetch(wc, World::FetchSource::Terrain);
         fetchesThisTick++;
       }
     }

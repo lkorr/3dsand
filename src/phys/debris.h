@@ -100,8 +100,15 @@ class DebrisSystem {
   // in the per-tick build budget to appear, so a body moving fast has to ask
   // for the ground it is ABOUT to reach, not the ground it is standing on.
   // See the lookahead sweep in ManageTerrain.
+  //
+  // `horizonVoxels` is the creature's PLANNING horizon (navRadius + 4 while it
+  // has a target), kept apart from the body radius on purpose: the body's own
+  // chunks are collision and are listed every tick, the horizon is what the
+  // A* planner reads through the mirror and is listed on a stride (a mob
+  // with a 30-voxel horizon is ~216 chunks, and re-scanning all of them every
+  // tick when nothing moved was most of a standing creature's terrain cost).
   void AddTerrainAnchor(Vec3 posVoxel, float radiusVoxels,
-                        Vec3 velVoxPerSec = Vec3{});
+                        Vec3 velVoxPerSec = Vec3{}, float horizonVoxels = 0.0f);
 
   // Take ownership of an existing physics body (severed limb, ragdoll piece):
   // it becomes ordinary debris — culling, despawn, terrain upkeep. Any joints
@@ -537,6 +544,10 @@ class DebrisSystem {
     uint64_t chunksNeeded = 0, fetchesAsked = 0, gathers = 0, polys = 0,
              joltMeshes = 0, bodiesCreated = 0, bodyVoxCreated = 0;
     uint32_t maxNeededOneTick = 0, maxFetchOneTick = 0;
+    // The need sweep's own denominators: occupied lattice blocks transformed
+    // (bodies) and chunks the mob anchors listed (core every tick, horizon on
+    // its stride) -- so "chunks needed" can be split between the two.
+    uint64_t needBlocks = 0, anchorChunks = 0;
   };
   const PhaseProfile& Profile() const { return prof_; }
   void SetProfiling(bool on) { prof_.on = on; }
@@ -807,7 +818,18 @@ class DebrisSystem {
     int8_t lmin[3] = {0, 0, 0};
     int8_t lmax[3] = {0, 0, 0};
     uint32_t boundsCount = 0xFFFFFFFFu;  // != voxels.size() => recompute
+    // ...AND WHICH PARTS OF THAT BOX HOLD ANYTHING. The AABB of a rotated
+    // 81-voxel trunk with a crown at one end is mostly empty, and the sweep
+    // sat at kTerrainNeedCeiling (505 of 512 chunks a tick) for as long as
+    // the oak tumbled. So the lattice box is diced into kNeedBlock^3 blocks
+    // and one bit per block says whether any voxel lands in it; ManageTerrain
+    // transforms only the set blocks and asks for the chunks THEY cover.
+    // Same cache key as lmin/lmax (refreshed in the same call). `needDim` is
+    // the block-grid size per axis, blocks indexed (z * dimY + y) * dimX + x.
+    std::vector<uint64_t> needBlocks;
+    uint8_t needDim[3] = {0, 0, 0};
   };
+  static constexpr int kNeedBlock = 8;  // collider voxels per block side
   struct TerrainEntry {
     uint64_t handle = 0;
     IVec3 wc{};          // world chunk (streaming recycles slots, not chunks)
@@ -1000,6 +1022,7 @@ class DebrisSystem {
   // cost that capped the scan rate. Kept between calls and `assign`ed, so the
   // zeroing stays and the allocator leaves the hot path.
   std::vector<std::pair<IVec3, float>> terrainNeed_;  // ManageTerrain scratch
+  std::vector<float> terrainNeedGrid_;  // per-body chunk grid, min distance
   // The flood's visited map, keyed by world cell (PLAN §4: sparse, so a scan
   // costs what it walks, not the 256^3 region it may walk in).
   std::unordered_map<uint64_t, int32_t> scanLabel_;
@@ -1007,6 +1030,10 @@ class DebrisSystem {
     Vec3 pos;
     float radius = 0.0f;
     Vec3 vel{};  // voxels/s, for the lookahead sweep (may be zero)
+    // The planning horizon (navRadius + 4 for a creature with a target), 0
+    // when there is none. Listed on a stride, not every tick: see
+    // kTerrainHorizonStride in ManageTerrain.
+    float horizon = 0.0f;
   };
   std::vector<Anchor> extraAnchors_;                    // mob limbs, this tick
   std::unordered_map<uint64_t, TerrainEntry> terrain_;  // packed world chunk key

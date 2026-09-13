@@ -332,12 +332,75 @@ void World::Init(const rhi::Device& device) {
   if (getenv("SANDVOX_GPUMEM")) DumpGpuBufferBudget("after World::Init");
 }
 
-void World::RequestChunkFetch(IVec3 worldChunk) {
-  if (!ChunkInWindow(worldChunk)) return;  // not resident: nothing to read
+const char* World::FetchSourceName(FetchSource s) {
+  switch (s) {
+    case FetchSource::IslandScan: return "island";
+    case FetchSource::Terrain: return "terrain";
+    case FetchSource::Mob: return "mob";
+    case FetchSource::Settle: return "settle";
+    default: return "other";
+  }
+}
+
+void World::RequestChunkFetch(IVec3 worldChunk, FetchSource src) {
+  const int si = (int)src < FetchProbe::kSources ? (int)src : 0;
+  if (!ChunkInWindow(worldChunk)) {  // not resident: nothing to read
+    fetchProbe_.refused[si]++;
+    return;
+  }
   uint64_t key = PackChunkKey(worldChunk);
-  if (fetchQueued_.count(key)) return;
+  if (fetchQueued_.count(key)) {
+    fetchProbe_.coalesced[si]++;
+    return;
+  }
   fetchQueued_[key] = 1;
-  fetchQueue_.push_back(worldChunk);
+  fetchQueue_.push_back(FetchReq{worldChunk, fetchTick_, (uint8_t)si});
+  fetchProbe_.requests[si]++;
+  if (fetchQueue_.size() > fetchProbe_.depthMax)
+    fetchProbe_.depthMax = (uint32_t)fetchQueue_.size();
+}
+
+std::string World::FetchReport() const {
+  const FetchProbe& p = fetchProbe_;
+  uint64_t req = 0, coal = 0, ref = 0, car = 0, drop = 0, age = 0;
+  uint32_t ageMax = 0;
+  for (int i = 0; i < FetchProbe::kSources; i++) {
+    req += p.requests[i];
+    coal += p.coalesced[i];
+    ref += p.refused[i];
+    car += p.carried[i];
+    drop += p.dropped[i];
+    age += p.ageSum[i];
+    ageMax = std::max(ageMax, p.ageMax[i]);
+  }
+  char buf[640];
+  int n = std::snprintf(
+      buf, sizeof buf,
+      "fetch fifo since tick %u: %llu queued (%llu coalesced, %llu refused "
+      "non-resident), %llu carried in %u slots, %llu dropped streamed-out; age "
+      "ticks mean %.2f max %u; depth max %u, %u slots drained full, left "
+      "waiting mean %.1f max %u; by source",
+      p.sinceTick, (unsigned long long)req, (unsigned long long)coal,
+      (unsigned long long)ref, (unsigned long long)car, p.drains,
+      (unsigned long long)drop, car ? (double)age / (double)car : 0.0, ageMax,
+      p.depthMax, p.drainsFull,
+      p.drains ? (double)p.leftSum / (double)p.drains : 0.0, p.leftMax);
+  std::string s(buf, n > 0 ? (size_t)std::min(n, (int)sizeof buf - 1) : 0);
+  for (int i = 0; i < FetchProbe::kSources; i++) {
+    if (p.requests[i] == 0 && p.coalesced[i] == 0 && p.refused[i] == 0)
+      continue;
+    n = std::snprintf(buf, sizeof buf,
+                      " %s %llu (+%llu coalesced, %llu refused) age %.2f/%u",
+                      FetchSourceName((FetchSource)i),
+                      (unsigned long long)p.requests[i],
+                      (unsigned long long)p.coalesced[i],
+                      (unsigned long long)p.refused[i],
+                      p.carried[i] ? (double)p.ageSum[i] / (double)p.carried[i]
+                                   : 0.0,
+                      p.ageMax[i]);
+    if (n > 0) s.append(buf, (size_t)std::min(n, (int)sizeof buf - 1));
+  }
+  return s;
 }
 
 const CachedChunk* World::Cached(IVec3 worldChunk) const {
@@ -388,12 +451,29 @@ bool World::EncodeReadbacks(const rhi::Device&, const rhi::CommandEncoder& enc,
   // that streamed out since it was queued just drops
   s.fetchIds.clear();
   while (!fetchQueue_.empty() && s.fetchIds.size() < kFetchPerTick) {
-    IVec3 wc = fetchQueue_.front();
-    fetchQueue_.erase(fetchQueue_.begin());
-    fetchQueued_.erase(PackChunkKey(wc));
-    if (!ChunkInWindow(wc)) continue;
-    s.fetchIds.push_back(wc);
+    const FetchReq r = fetchQueue_.front();
+    fetchQueue_.pop_front();
+    fetchQueued_.erase(PackChunkKey(r.wc));
+    const int si = r.src < FetchProbe::kSources ? r.src : 0;
+    if (!ChunkInWindow(r.wc)) {
+      fetchProbe_.dropped[si]++;
+      continue;
+    }
+    const uint32_t age = tick >= r.tick ? tick - r.tick : 0u;
+    fetchProbe_.carried[si]++;
+    fetchProbe_.ageSum[si] += age;
+    if (age > fetchProbe_.ageMax[si]) fetchProbe_.ageMax[si] = age;
+    s.fetchIds.push_back(r.wc);
   }
+  // The stamp every request made from here until the next slot carries; a
+  // request that rides the very next slot therefore ages exactly 1.
+  fetchTick_ = tick;
+  fetchProbe_.drains++;
+  if (s.fetchIds.size() >= kFetchPerTick && !fetchQueue_.empty())
+    fetchProbe_.drainsFull++;
+  fetchProbe_.leftSum += fetchQueue_.size();
+  if (fetchQueue_.size() > fetchProbe_.leftMax)
+    fetchProbe_.leftMax = (uint32_t)fetchQueue_.size();
   // Every copy below is TRACKED (rhi::CommandEncoder::CopyTracked): the sources
   // are pass-table buffers written by the tick rows earlier in this SAME
   // command buffer, so each copy must declare its read to the generated-barrier

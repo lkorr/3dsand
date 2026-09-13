@@ -960,6 +960,8 @@ IVec3 SpawnWindowOrigin() {
   // frame (205-234 shifts, 10 ms each, plus a worldgen plane per shift) --
   // over before the cut, but it owned the whole-run stream and worldgen rows.
   if (g_fellSiteSet) { sx = g_fellSiteX - 48; sz = g_fellSiteZ; }
+  return IVec3{(sx >> 4) - half, 0, (sz >> 4) - half};
+}
 Vec3 SpawnPos() {
   const worldmap::WorldMapData& m = worldmap::CurrentWorldMap();
   const int h = World::TerrainHeight(m.spawnX, m.spawnZ, kDefaultSeed);
@@ -7461,6 +7463,7 @@ int main(int argc, char** argv) {
           debris.SetProfiling(true);
           debris.ResetProfile();
           debris.ResetFloaterProbe();
+          world.ResetFetchProbe();
           fellCutTick = tick;
           fellFrame0 = g_frameMs.size();
           fellPhase = 2;
@@ -7515,14 +7518,16 @@ int main(int argc, char** argv) {
           for (double m : win) if (m > 33.0) over33++;
           std::printf("--fell-tree: FALL over 300 ticks / %zu frames: whole-frame "
                       "ms p50 %.1f p95 %.1f p99 %.1f max %.1f, >33ms %zu; bodies "
-                      "%u holding %u vox; COST %s\n",
+                      "%u holding %u vox; COST %s | %s\n",
                       win.size(), pct(0.5), pct(0.95), pct(0.99),
                       win.empty() ? 0.0 : win.back(), over33, bodies, vox,
-                      debris.ProfileReport().c_str());
+                      debris.ProfileReport().c_str(),
+                      world.FetchReport().c_str());
           std::fflush(stdout);
           if (!std::getenv("SANDVOX_DEBRIS_PROFILE")) debris.SetProfiling(false);
         }
       }
+
       // support-loss flags from the sim (burnt stems, undermined slabs) feed
       // the same island-check pipeline as explosions and brush erases
       debris.QueueSupportEvents(world.Snap());
@@ -10370,6 +10375,9 @@ int main(int argc, char** argv) {
           std::printf("    terrain patches: %u rebuilt, %u deferred by the per-tick "
                       "budget, %u refreshed with an identical occupancy box\n",
                       sp.terrainBuilds, sp.terrainDeferred, sp.terrainSame);
+          // The shared readback FIFO, whole run: who asked, how long they
+          // waited, what was dropped. See World::FetchProbe.
+          std::printf("    %s\n", world.FetchReport().c_str());
         }
         std::printf("    gpu-lag throttle: %llu ticks deferred to a later frame "
                     "(the GPU owed >= 2 snapshots when a second tick was due)\n",

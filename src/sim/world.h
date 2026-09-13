@@ -1,7 +1,9 @@
 #pragma once
 #include <array>
 #include <cstdint>
+#include <deque>
 #include <functional>
+#include <string>
 #include <unordered_map>
 #include <vector>
 
@@ -2935,7 +2937,58 @@ class World {
   // chunks don't. Queue a chunk for CPU readback; duplicates are coalesced;
   // non-resident requests are ignored. Up to kFetchPerTick chunks ride each
   // tick's readback slot (bounded traffic).
-  void RequestChunkFetch(IVec3 worldChunk);
+  //
+  // WHO ASKED. One FIFO serves every consumer of the CPU mirror -- the island
+  // scans (32 a scan), the terrain colliders (24 a tick), a mob's ground and
+  // burn probes, settle-back's support test, spells, audio occlusion -- and
+  // drains kFetchPerTick per readback slot, so a flood from one of them is
+  // starvation for all the rest. Until 2026-09-12 that was invisible: the
+  // gates force-fetch, and nothing reported the queue's depth, how old a
+  // request was when it finally rode a slot, or how many were dropped because
+  // the chunk streamed out first. `FetchProbe` counts all of that PER SOURCE;
+  // the --frames summary and --fell-tree's FALL line print `FetchReport()`.
+  // Tuning kFetchPerTick or any consumer's cap is justified by that line or
+  // not at all. A tag is a hint about attribution, never about priority: the
+  // queue is still strictly first-come.
+  enum class FetchSource : uint8_t {
+    Other = 0,   // untagged callers (spells, audio, harnesses, gates)
+    IslandScan,  // EventReady / RunIslandDetection (phys/debris.cpp)
+    Terrain,     // ManageTerrain's collider sweep (phys/debris.cpp)
+    Mob,         // a creature's ground / burn probe (game/mob.cpp)
+    Settle,      // SettleFootprintSupported (phys/debris.cpp)
+    Count
+  };
+  static const char* FetchSourceName(FetchSource s);
+  void RequestChunkFetch(IVec3 worldChunk,
+                         FetchSource src = FetchSource::Other);
+  struct FetchProbe {
+    static constexpr int kSources = (int)FetchSource::Count;
+    uint64_t requests[kSources] = {};   // accepted into the queue
+    uint64_t coalesced[kSources] = {};  // already queued: no second entry
+    uint64_t refused[kSources] = {};    // not resident when asked
+    uint64_t carried[kSources] = {};    // rode a readback slot
+    uint64_t dropped[kSources] = {};    // streamed out between ask and drain
+    // Age = ticks from the request to the slot that carried it, where the
+    // stamp is the tick of the most recent EncodeReadbacks: 1 means "the very
+    // next slot", the documented one-tick latency. Anything above that is
+    // time spent queued behind other consumers (or behind a tick with no free
+    // readback slot, which drains nothing).
+    uint64_t ageSum[kSources] = {};
+    uint32_t ageMax[kSources] = {};
+    uint32_t depthMax = 0;     // longest the queue ever got (after a push)
+    uint32_t drains = 0;       // readback slots encoded
+    uint32_t drainsFull = 0;   // ...that took kFetchPerTick and left some waiting
+    uint32_t leftMax = 0;      // most left waiting after one drain
+    uint64_t leftSum = 0;      // ...summed over drains (mean backlog)
+    uint32_t sinceTick = 0;    // the window starts here (ResetFetchProbe)
+  };
+  const FetchProbe& Fetches() const { return fetchProbe_; }
+  void ResetFetchProbe() {
+    fetchProbe_ = FetchProbe{};
+    fetchProbe_.sinceTick = fetchTick_;
+  }
+  // One line: totals, per-source counts, ages, depth. Never empty.
+  std::string FetchReport() const;
   // Cached copy of a world chunk, or nullptr if never fetched. version is the
   // tick whose post-sim state the data reflects.
   const CachedChunk* Cached(IVec3 worldChunk) const;
@@ -3410,8 +3463,15 @@ class World {
   IVec3 spawnBoxHi_{-1, -1, -1};
   uint32_t spawnBoxTick_ = 0;
 
-  std::vector<IVec3> fetchQueue_;
+  struct FetchReq {
+    IVec3 wc;
+    uint32_t tick;  // fetchTick_ when asked (see FetchProbe's age note)
+    uint8_t src;    // FetchSource
+  };
+  std::deque<FetchReq> fetchQueue_;
   std::unordered_map<uint64_t, uint8_t> fetchQueued_;   // dedup (packed key)
+  uint32_t fetchTick_ = 0;  // tick of the last EncodeReadbacks: request stamp
+  FetchProbe fetchProbe_{};
   std::unordered_map<uint64_t, CachedChunk> cache_;     // packed world key
 
   // CPU mirror of the page table — the authority for every C++ translation.

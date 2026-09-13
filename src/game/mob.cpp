@@ -1898,7 +1898,7 @@ bool Mob::GroundHeightAt(World& world, int wx, int wz, int yFrom,
       cc = world.Cached({wx >> 4, cy, wz >> 4});
       if (cc != nullptr && cc->voxels.size() != kChunkVol) cc = nullptr;
       if (cc == nullptr) {
-        world.RequestChunkFetch({wx >> 4, cy, wz >> 4});
+        world.RequestChunkFetch({wx >> 4, cy, wz >> 4}, World::FetchSource::Mob);
         unknown = true;
         return false;
       }
@@ -3914,10 +3914,13 @@ void Mob::RegisterTerrainAnchor() {
   //
   // Widened only while the creature actually has a target (rule 2: cost scales
   // with activity). An idle or unaware mob pays exactly what it always did.
+  // Handed over as the HORIZON, apart from the body radius: ManageTerrain
+  // lists the body every tick and the horizon on a stride (needHorizon).
+  float horizon = 0.0f;
   if (ai_.profile >= 0 && ai_.hasTarget && sys_ != nullptr) {
     const ai::Profile* pr = sys_->Behaviors().At(ai_.profile);
     if (pr != nullptr && pr->movement.mobile)
-      r = std::max(r, pr->movement.navRadius + 4.0f);
+      horizon = std::max(horizon, pr->movement.navRadius + 4.0f);
   }
   // A BODY IN FLIGHT ASKS FOR THE GROUND AHEAD OF IT. The anchor's box reaches
   // about one chunk past a human, and a patch costs a chunk fetch plus a slot
@@ -3935,7 +3938,7 @@ void Mob::RegisterTerrainAnchor() {
     phys_->GetBodyVelocities(limbs_[rl].body, vel, ang);
   }
   debris_->AddTerrainAnchor(
-      origin_ + Vec3{ws.x * 0.5f, ws.y * 0.5f, ws.z * 0.5f}, r, vel);
+      origin_ + Vec3{ws.x * 0.5f, ws.y * 0.5f, ws.z * 0.5f}, r, vel, horizon);
 }
 
 void Mob::SubmitPose(float dt, bool writeXf) {
@@ -7375,7 +7378,7 @@ bool MobSystem::BurnOneLimb(BurnLimbView& v, uint32_t tick, uint32_t rngKey,
     // asked for — so a burning bonfire read as empty air forever. Bounded
     // (kFetchPerTick), coalesced, and one tick latent.
     if (!memoCC || memoCC->voxels.size() != kChunkVol) {
-      world.RequestChunkFetch(wc);
+      world.RequestChunkFetch(wc, World::FetchSource::Mob);
       return 0u;
     }
     const uint32_t lx = (uint32_t)(c.x & 15), ly = (uint32_t)(c.y & 15),
