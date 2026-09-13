@@ -448,6 +448,28 @@ struct UIState {
     float voxelFrac = 1.0f;      // live voxels / voxels at spawn
     float charredFrac = 0.0f;    // share of the limb cooked/charred through
     uint32_t burningVoxels = 0;  // voxels alight RIGHT NOW
+    // ---- WHAT IS ON THE OUTSIDE OF IT (docs/PLAN_body_coat.md) -----------
+    // The coat ledger's verdict for this limb (game/mob.h LimbCoat): how
+    // soaked it is, and by what. A different question again from hpFrac /
+    // voxelFrac / charredFrac — those are all about damage to the limb's OWN
+    // matter, and a limb can be drenched in somebody else's blood at full
+    // health, which is exactly the case the figure had no way to show.
+    //
+    // stainFrac is AMOUNT-WEIGHTED (LimbCoat::Frac), so 1.0 means every voxel
+    // is saturated rather than "every voxel has a speck on it".
+    float stainFrac = 0.0f;
+    uint32_t stainMat = 0;    // dominant material id; 0 = clean
+    // Its authored stain colour, opaque. Stored in the GPU's 0xAABBGGRR,
+    // which is byte-for-byte ImGui's default IM_COL32 packing — so this is an
+    // ImU32 that needs no swizzle. Carried as uint32_t rather than ImU32
+    // because this header deliberately does not include imgui.h.
+    // 0 = nothing to draw.
+    uint32_t stainColor = 0;
+    // COPIED, not pointed at. Every other string in this struct is either a
+    // std::string or a pointer into a static table; a material NAME lives in
+    // main.cpp's `mats` vector, which R (reload materials) replaces wholesale
+    // mid-frame, and one dangling frame is not worth the four bytes saved.
+    char stainLabel[24] = {0};
     float hp = 0, hpMax = 0;     // absolute, for the numeric readout
     // WHERE THE LIMB IS ON THE PORTRAIT, so the inspector can outline it.
     // Normalized to the portrait frame: (0,0) top-left, (1,1) bottom-right,
@@ -470,6 +492,19 @@ struct UIState {
   };
   BodyPartUI body[kSlotCount];
   bool bodyValid = false;   // false until the avatar has spawned
+  // The same three over the WHOLE body (MobSystem::BodyCoat, which counts the
+  // base limbs only — a robe soaked through is not the wearer being covered).
+  // Drawn as one line above the health bar, so "I am covered in blood" is
+  // legible without opening anything.
+  float stainFrac = 0.0f;
+  uint32_t stainMat = 0;
+  uint32_t stainColor = 0;
+  char stainLabel[24] = {0};
+  // tune.coat.hudMinFrac, MIRRORED IN rather than read: ui/ includes no sim
+  // header, and a threshold the overlay reached for itself would be a second
+  // place the number lives. Below it the HUD line, the figure's chip and the
+  // injury row all say nothing — a single splashed voxel is not "bloodied".
+  float stainHudMin = 0.02f;
   int32_t spellCost = 0;          // running cost of the spoken sequence
   // The price SPLIT (plan §9): word costs, the tariff on what the cast does
   // to the world, and the delivery premium on that tariff. "Why is this 900

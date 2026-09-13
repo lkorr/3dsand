@@ -1,6 +1,7 @@
 #include "ui/inventory_ui.h"
 
 #include <algorithm>
+#include <cctype>
 #include <cmath>
 #include <cstdarg>
 #include <cstdio>
@@ -510,12 +511,24 @@ void InspectOverlay(const UIState& s, ImVec2 at, ImVec2 size) {
     // Outline only what is actually wrong. Ringing every limb would make the
     // portrait unreadable and would say nothing.
     const float worst = std::min(b.hpFrac, b.voxelFrac);
-    if (worst > 0.98f && b.burningVoxels == 0 && !b.bleeding) continue;
+    // A limb can be perfectly healthy and covered in something, which is a
+    // thing worth pointing at on a portrait — so a coat above the threshold
+    // is now its own reason not to skip the limb.
+    const bool coated = b.stainFrac >= s.stainHudMin && b.stainColor != 0;
+    if (worst > 0.98f && b.burningVoxels == 0 && !b.bleeding && !coated)
+      continue;
     ImU32 col = ui::ColEmber();
     if (b.burningVoxels > 0)
       col = Fade(ui::ColEmber(), 0.5f + 0.5f * flash);
     else if (b.bleeding)
       col = Fade(ui::ColBloodHi(), 0.45f + 0.55f * flash);
+    else if (worst > 0.98f && coated)
+      // Nothing is WRONG with this one — it is covered in something. Called
+      // out in the substance's OWN colour and never in the wound palette, so
+      // a bloodied but unhurt arm cannot be misread as a bleeding one, and
+      // steady rather than flashing, because a coat is not an alarm.
+      col = Fade(ui::Mix(b.stainColor, IM_COL32_WHITE, 0.35f),
+                 0.35f + 0.45f * b.stainFrac);
     else
       col = Fade(ui::ColBloodHi(), 0.35f + 0.45f * (1.0f - worst));
     const ImVec2 p0(at.x + b.projMin[0] * size.x, at.y + b.projMin[1] * size.y);
@@ -585,7 +598,10 @@ void InspectCastPicks(UIState& s, ImVec2 at, ImVec2 size) {
 // captions and the limb's own name on top of each other the moment any of them
 // was wider than guessed — a whole column of "9% i34/60ct". ImGui already
 // knows how tall a line is; asking it is both shorter and correct at any font.
-void InjuryRow(const UIState::BodyPartUI& b) {
+// `stainMin` is UIState::stainHudMin, threaded in rather than reached for:
+// this file has no sim header and the row must use the SAME cut-off the HUD
+// and the portrait callout use, or a limb would be listed with no chip on it.
+void InjuryRow(const UIState::BodyPartUI& b, float stainMin) {
   ImDrawList* dl = ImGui::GetWindowDrawList();
   // Where the bars start. Fixed, so every row's bars line up into a column
   // that can be read down rather than per-row.
@@ -632,19 +648,38 @@ void InjuryRow(const UIState::BodyPartUI& b) {
   bar(b.voxelFrac, ui::ColSteel(), cap);
 
   // State chips, in the order they matter to somebody deciding what to do next.
+  //
+  // WRAPPED, not run out in one line. ImGui::SameLine() will happily lay the
+  // next chip past the panel's right edge, where the injury child's clip rect
+  // eats it — which is exactly what a coat chip did the day it was added, on a
+  // limb that was already BLEEDING and BURNING 134 ("BLOOD 2" with the % and
+  // the panel border sliced off). The running x is tracked here rather than
+  // read back off the cursor because the trailing Dummy has already moved the
+  // cursor down a line, so GetCursorPosX() would answer for the wrong row.
   bool any = false;
+  const float chipL = 12.0f;                                 // the indent
+  const float chipR = ImGui::GetContentRegionMax().x - 4.0f;  // the clip edge
+  float chipX = chipL;
   auto chip = [&](ImU32 col, const char* fmt, ...) {
     char buf[64];
     va_list ap;
     va_start(ap, fmt);
     std::vsnprintf(buf, sizeof buf, fmt, ap);
     va_end(ap);
-    if (any) ImGui::SameLine();
-    else ImGui::Indent(12.0f);
+    const ImVec2 ts = ImGui::CalcTextSize(buf);
+    const float need = ts.x + 12.0f;  // 4 px of tab either side + a 4 px gap
+    if (!any) {
+      ImGui::Indent(chipL);
+    } else if (chipX + need <= chipR) {
+      ImGui::SameLine();
+    } else {
+      // Fall through onto the fresh line the previous chip's Dummy began.
+      chipX = chipL;
+    }
     any = true;
+    chipX += need;
     // A chip: the word in its colour on a dark tab with a coloured underline.
     const ImVec2 p = ImGui::GetCursorScreenPos();
-    const ImVec2 ts = ImGui::CalcTextSize(buf);
     dl->AddRectFilled(ImVec2(p.x - 4, p.y), ImVec2(p.x + ts.x + 4, p.y + ts.y),
                       Fade(ui::ColInk(), 0.7f));
     dl->AddRectFilled(ImVec2(p.x - 4, p.y + ts.y - 2),
@@ -659,6 +694,22 @@ void InjuryRow(const UIState::BodyPartUI& b) {
   if (b.burningVoxels > 0) chip(ui::ColEmber(), "BURNING %u", b.burningVoxels);
   if (b.charredFrac > 0.02f)
     chip(ui::ColEmber(), "CHARRED %.0f%%", b.charredFrac * 100.0f);
+  // Last, because it is the only chip here that is not damage: BLEEDING and
+  // BURNING are things to act on, a coat is a thing to notice.
+  if (b.stainFrac >= stainMin && b.stainColor != 0) {
+    // Uppercased into a stack buffer to match the other chips' voice. The
+    // label is a material name ("blood", "water"), so 24 bytes is generous.
+    char up[sizeof b.stainLabel];
+    size_t k = 0;
+    for (; k + 1 < sizeof up && b.stainLabel[k]; k++)
+      up[k] = (char)std::toupper((unsigned char)b.stainLabel[k]);
+    up[k] = '\0';
+    // The substance's own colour, lightened the way the portrait callout
+    // lightens it, so a dark dried red still reads as a chip rather than as
+    // a hole punched in the row.
+    chip(ui::Mix(b.stainColor, IM_COL32_WHITE, 0.35f), "%s %.0f%%",
+         k ? up : "COATED", b.stainFrac * 100.0f);
+  }
   if (any) {
     ImGui::NewLine();
     ImGui::Unindent(12.0f);
@@ -1453,11 +1504,15 @@ void DrawInventoryScreen(UIState& s) {
       bool anyHurt = false;
       for (int i = 0; i < n; i++) {
         const UIState::BodyPartUI& b = s.body[order[i]];
+        // A coat is a CONDITION, not an injury, but the health view is the
+        // only place that reports per-limb condition at all — so a limb whose
+        // only news is that it is drenched is listed here rather than nowhere.
         const bool hurt = b.severed || b.bleeding || b.burningVoxels > 0 ||
-                          b.hpFrac < 0.999f || b.voxelFrac < 0.999f;
+                          b.hpFrac < 0.999f || b.voxelFrac < 0.999f ||
+                          (b.stainFrac >= s.stainHudMin && b.stainColor != 0);
         if (!hurt) continue;
         anyHurt = true;
-        InjuryRow(b);
+        InjuryRow(b, s.stainHudMin);
       }
       if (!anyHurt) {
         ImGui::TextDisabled(s.bodyValid ? "Not a scratch."

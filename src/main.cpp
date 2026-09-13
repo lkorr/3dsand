@@ -721,14 +721,79 @@ BurnMats ResolveBurnMats(const std::vector<MaterialDef>& mats) {
   return bm;
 }
 
+// ---- WHAT IS ON A BODY, AS THE HUD HAS TO DRAW IT ---------------------------
+//
+// The dominant coat material's colour: its authored `stain.color`, or its
+// darkest palette entry when it declares none — which is the very fallback
+// ParseStain itself applies, so the HUD and the world agree on what dried
+// blood looks like without either of them naming a hue.
+//
+// NO SWIZZLE, deliberately. materials.cpp's ParseColor stores 0xAABBGGRR so
+// the shader can unpack R out of the low byte, and that is byte-for-byte
+// ImGui's default IM_COL32 packing. The only thing that has to be forced is
+// ALPHA: a palette entry's is whatever the author wrote, and a stain drawn at
+// the liquid's own alpha would vanish. 0 means "nothing to draw".
+uint32_t CoatColorOf(const std::vector<MaterialDef>& mats, uint32_t mat) {
+  if (mat == 0 || mat >= mats.size()) return 0;
+  uint32_t c = mats[mat].gpu.stainColor;
+  if ((c & 0x00FFFFFFu) == 0) c = mats[mat].gpu.color1;
+  if ((c & 0x00FFFFFFu) == 0) return 0;
+  return (c & 0x00FFFFFFu) | 0xFF000000u;
+}
+
+// The material's authored NAME, copied into the UI's own buffer. Copied and
+// not pointed at because R replaces `mats` wholesale (see BodyPartUI).
+void CopyCoatLabel(const std::vector<MaterialDef>& mats, uint32_t mat,
+                   char* out, size_t n) {
+  out[0] = '\0';
+  if (mat == 0 || mat >= mats.size()) return;
+  std::snprintf(out, n, "%s", mats[mat].name.c_str());
+}
+
+// One figure slot's coat, folded from the limbs drawn as that segment.
+//
+// ACCUMULATED PER SLOT rather than assigned per limb, because BodySlotFor is
+// many-to-one: every non-hip spine part lands on the torso. Reading the coat
+// off whichever limb happened to be last would make a two-part torso report
+// half the blood that is on it.
+struct SlotCoat {
+  uint32_t voxels = 0, sumAmt = 0;
+  // Four candidate substances, folded from each contributing limb's own two.
+  // One more level of the approximation LimbCoat already documents: a body is
+  // realistically bloody, or wet, or bloody and wet, and a fifth distinct
+  // substance on one segment contributes to the totals but is not named.
+  uint32_t mat[4] = {}, amt[4] = {};
+  void Add(uint32_t m, uint32_t a) {
+    if (!m || !a) return;
+    for (int k = 0; k < 4; k++) {
+      if (mat[k] == m) { amt[k] += a; return; }
+      if (mat[k] == 0) { mat[k] = m; amt[k] = a; return; }
+    }
+  }
+  uint32_t Top() const {
+    uint32_t best = 0, bestAmt = 0;
+    for (int k = 0; k < 4; k++)
+      if (mat[k] && amt[k] > bestAmt) { best = mat[k]; bestAmt = amt[k]; }
+    return best;
+  }
+};
+
 void FillBodyUI(const PlayerAvatar& avatar, const BurnMats& burnMats,
+                const MobSystem& mobs, const std::vector<MaterialDef>& mats,
                 UIState& ui) {
   for (int i = 0; i < UIState::kSlotCount; i++) ui.body[i] = {};
   for (int i = 0; i < UIState::kSlotCount; i++)
     ui.body[i].label = BodySlotLabel(i);
+  ui.stainFrac = 0.0f;
+  ui.stainMat = 0;
+  ui.stainColor = 0;
+  ui.stainLabel[0] = '\0';
+  ui.stainHudMin = CurrentTuning().coat.hudMinFrac;
   const MobDef* def = avatar.Def();
   ui.bodyValid = def != nullptr;
   if (!def) return;
+  const uint64_t mobId = avatar.Id();
+  SlotCoat slotCoat[UIState::kSlotCount];
   // Walk the DEF's limbs, not PartCount() — the latter includes the borrowed
   // held-item slot, which is not part of the body.
   const int limbCount = (int)def->limbs.size();
@@ -771,7 +836,40 @@ void FillBodyUI(const PlayerAvatar& avatar, const BurnMats& burnMats,
           std::clamp((float)(cooked + charred * 2) / (float)(now * 2), 0.0f,
                      1.0f);
     }
+
+    // What is ON the limb. The ledger is recounted by the creature itself at
+    // its own bounded cadence (Mob::RecountCoat), so this is a read of three
+    // words per limb per frame and a clean body costs nothing.
+    if (const LimbCoat* lc = mobs.LimbCoatOf(mobId, i)) {
+      SlotCoat& sc = slotCoat[slot];
+      sc.voxels += lc->voxels;
+      sc.sumAmt += lc->sumAmt;
+      for (const CoatEntry& e : lc->top) sc.Add(e.mat, e.sumAmt);
+    }
   }
+
+  for (int i = 0; i < UIState::kSlotCount; i++) {
+    const SlotCoat& sc = slotCoat[i];
+    if (sc.voxels == 0) continue;
+    UIState::BodyPartUI& b = ui.body[i];
+    // The same amount-weighted fraction LimbCoat::Frac computes, over the
+    // union of the limbs this segment draws.
+    b.stainFrac = std::clamp(
+        (float)sc.sumAmt / (float)(kBodyStainAmtMax * sc.voxels), 0.0f, 1.0f);
+    b.stainMat = sc.Top();
+    b.stainColor = CoatColorOf(mats, b.stainMat);
+    CopyCoatLabel(mats, b.stainMat, b.stainLabel, sizeof b.stainLabel);
+  }
+
+  // Body-level, from the creature's own ledger rather than by averaging the
+  // slots: BodyCoat is over the BASE limbs, so a blood-soaked robe does not
+  // report the wearer as covered, and re-deriving it here would be a second
+  // answer to a question that already has one.
+  const LimbCoat whole = mobs.BodyCoat(mobId);
+  ui.stainFrac = std::clamp(whole.Frac(), 0.0f, 1.0f);
+  ui.stainMat = whole.top[0].mat;
+  ui.stainColor = CoatColorOf(mats, ui.stainMat);
+  CopyCoatLabel(mats, ui.stainMat, ui.stainLabel, sizeof ui.stainLabel);
 }
 
 // ---- the character panel's live avatar portrait -----------------------------
@@ -8681,7 +8779,7 @@ int main(int argc, char** argv) {
       // authored TAG and side suffix rather than by part name, so any humanoid
       // rig fills the same figure. A limb the rig does not have stays absent
       // and simply is not drawn.
-      FillBodyUI(avatar, burnMats, ui);
+      FillBodyUI(avatar, burnMats, mobs, mats, ui);
       ui.locoState = avatar.Spawned() ? avatar.Locomotion().stateName : "";
       ui.spellCost = caster.compiled.manaCost;
       ui.spellWord = caster.compiled.wordCost;
