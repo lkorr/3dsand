@@ -2936,6 +2936,27 @@ void Simulation::EnsureRenderPipelines(rhi::TextureFormat format) {
     d.fragmentEntry = "fsBody";
     d.label = "bodyDraw";
     pool.Add([this, d] { bodyDraw_ = device_.CreateRenderPipeline(d); });
+    // Its depth pre-pass (debris.wgsl vsBodyDepth): same layout, same depth
+    // state (write, GreaterEqual), and a (Zero, One) blend so the colour target
+    // is untouched — the RHI has no colour write mask, and a fragment stage is
+    // required. DrawBodies draws through this first so fsBody's shadow ray
+    // runs once per pixel instead of once per overdrawn fragment.
+    {
+      rhi::RenderPipelineDesc dz = d;
+      dz.vertexEntry = "vsBodyDepth";
+      dz.fragmentEntry = "fsBodyDepth";
+      dz.label = "bodyDepth";
+      static const rhi::BlendState keepColor = [] {
+        rhi::BlendState b{};
+        b.color.srcFactor = rhi::BlendFactor::Zero;
+        b.color.dstFactor = rhi::BlendFactor::One;
+        b.alpha.srcFactor = rhi::BlendFactor::Zero;
+        b.alpha.dstFactor = rhi::BlendFactor::One;
+        return b;
+      }();
+      dz.blend = &keepColor;
+      pool.Add([this, dz] { bodyDepth_ = device_.CreateRenderPipeline(dz); });
+    }
     d.fragmentEntry = "fs";  // restore for the pipelines that follow
 
     // MLS-MPM fluid prototype: same module, same layout, own entry point.
@@ -3298,9 +3319,14 @@ void Simulation::DrawCurrentField(const rhi::RenderPass& pass,
 
 void Simulation::DrawBodies(const rhi::RenderPass& pass, uint32_t voxInstances) {
   if (voxInstances == 0) return;
-  pass.SetPipeline(bodyDraw_);
   pass.SetBindGroup(0, renderBG_);
   pass.SetBindGroup(1, renderPartBG_[page_]);
+  // Depth first, then colour: the second draw's fragments pass GreaterEqual
+  // only where they are the nearest body surface, so fsBody's per-fragment
+  // shadow ray is cast once per pixel (debris.wgsl, THE DEPTH PRE-PASS).
+  pass.SetPipeline(bodyDepth_);
+  pass.Draw(36, voxInstances);
+  pass.SetPipeline(bodyDraw_);
   pass.Draw(36, voxInstances);
 }
 

@@ -87,6 +87,7 @@ const PipelineSpec kRenderShaders[] = {
     {"raymarch.wgsl", "fs", "raymarch.fs"},
     {"debris.wgsl", "vsParticle", "debris.vsParticle"},
     {"debris.wgsl", "vsBody", "debris.vsBody"},
+    {"debris.wgsl", "vsBodyDepth", "debris.vsBodyDepth"},
     {"debris.wgsl", "vsSprite", "debris.vsSprite"},
     {"debris.wgsl", "vsFluid", "debris.vsFluid"},
     {"debris.wgsl", "fs", "debris.fs"},
