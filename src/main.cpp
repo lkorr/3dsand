@@ -5035,7 +5035,12 @@ int main(int argc, char** argv) {
       const float k = hl > 1e-4f ? 1.0f - std::pow(0.5f, dt / hl) : 1.0f;
       lookSensNow += (want - lookSensNow) * k;
     }
-    if (captured)
+    // --fell-tree with a site OWNS the camera: the first frame's cursor delta
+    // (wherever the mouse happened to be when the window opened) turned the
+    // view 88 degrees and planted the oak in the wrong place with 0 cells,
+    // and a hand on the mouse mid-run would move the very view the drawBodies
+    // number is measured through.
+    if (captured && !g_fellSiteSet)
       cam.ApplyMouse((float)(mx - mx0) * lookSensNow,
                      (float)(my - my0) * lookSensNow);
     // The swing gets the RAW delta — deliberately not scaled with the view
