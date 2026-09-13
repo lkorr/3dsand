@@ -424,6 +424,39 @@ struct Tuning {
     // to reach full once it does.
     float fallFlailDelay = 0.35f;
     float fallFlailRamp = 0.9f;
+    // ---- THE AIRBORNE POSE IS DRIVEN BY VERTICAL VELOCITY, NOT BY A CLOCK ----
+    //
+    // `fall` is a 900 ms LOOPING clip whose two keyframes are ten degrees apart,
+    // so the whole of being in the air was a slow sway of the arms over a rest
+    // hang that the leg IK had just faded out of — "the character just wobbles
+    // left and right slightly". A looping clip is the wrong shape for this: a
+    // jump has no period to loop, it has a PHASE, and the phase is exactly
+    // `vel.y`. Launch, apex, descent and the reach for the ground are four
+    // readings of one number, so the pose is interpolated from it directly and
+    // driven onto the rig through the same leg/arm IK chains the gait uses.
+    //
+    // Off restores the clip-driven air pose (`jump` + `fall` + the flail ramp
+    // above), which is the A/B arm for judging this.
+    bool airPose = true;
+    // The upward speed that reads as a full-power launch and the downward speed
+    // that reads as a committed fall, m/s. These NORMALIZE `vel.y` into the
+    // pose's phase: at +riseSpeed the body is fully in the tuck, at 0 it is at
+    // the apex, at -fallSpeed it is fully in the reach. Default rise is the
+    // player's own jumpSpeed, so a jump starts exactly at the tuck; fall is
+    // higher than any jump because a drop keeps accelerating past it.
+    float airPoseRiseSpeed = 5.25f;
+    float airPoseFallSpeed = 9.0f;
+    // Height above the ground, in metres, at which the legs start reaching for
+    // the landing. This is the part that makes a fall read as a fall rather
+    // than as a floating pose: the feet come down and the body tips into the
+    // landing BEFORE contact. Probed against the CPU mirror, so a fall the
+    // mirror cannot see yet simply keeps the reach pose. 0 disables it.
+    float airPoseLandHeight = 1.1f;
+    // How far the body leans into its own horizontal travel while airborne,
+    // degrees at the def's top speed. A running jump tips forward; a standing
+    // one does not. Half of it is taken by the pelvis and half by the spine
+    // above it, so the back curves rather than tilting as a plank.
+    float airPoseLean = 16.0f;
     // Meters the body must have DROPPED below the height it last had support at
     // before the fall clip may play at all. Air time alone is not a fall: a
     // step-down clears any debounce, and so does cresting a bump at speed.
