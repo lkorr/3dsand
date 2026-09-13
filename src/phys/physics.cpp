@@ -2,10 +2,12 @@
 
 #include <algorithm>
 #include <chrono>
+#include <cmath>
 #include <cstdarg>
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
+#include <limits>
 #include <mutex>
 #include <unordered_map>
 
@@ -308,8 +310,244 @@ void Physics::SetContactReportSpeed(float voxPerSec) {
   if (contacts_) contacts_->minSpeedVox = std::max(0.0f, voxPerSec);
 }
 
+// ---- THE FP TRAP INSIDE JOLT'S OWN CLAMP (crash.log, 2026-09-12 + 09-13) ---
+//
+// Jolt's worker threads run with the SSE invalid / divide-by-zero / OVERFLOW
+// exceptions UNMASKED -- JobSystemThreadPool::ThreadMain opens with
+// `FPExceptionsEnable`, and Jolt.cmake turns JPH_FLOATING_POINT_EXCEPTIONS_-
+// ENABLED on for Release as well as Debug -- so the first float op that
+// overflows on a job thread kills the process with 0xC0000091 and no message.
+// Twice, three minutes and nine hours after felled trees first became single
+// rigid bodies, that op was
+//
+//   JPH::PhysicsSystem::JobIntegrateVelocity +0x1C8  (PhysicsSystem.cpp:1535)
+//
+// which disassembles to `mulss %xmm2,%xmm2` on `0x10(mp)` -- the x component
+// of MotionProperties::mAngularVelocity, squared inside ClampAngularVelocity.
+// THE CLAMP THAT EXISTS TO STOP EXACTLY THIS IS WHAT DIED: `LengthSq()`
+// overflows before the comparison it feeds. The LINEAR clamp four
+// instructions earlier had already passed, so linear velocity was fine;
+// angular-only garbage is the signature of `omega += invI * (r x J)`, not of a
+// body that was merely thrown hard.
+//
+// WHERE IT CANNOT HAVE COME FROM, measured rather than reasoned. Every
+// BodyInterface velocity write in Jolt goes through SetLinearVelocityClamped /
+// SetAngularVelocityClamped (BodyInterface.cpp:561-665), so nothing this class
+// hands Jolt can be the source. SANDVOX_PHYS_FAULT below writes 1e30 rad/s
+// straight at a live body to prove it: the value never survives to the next
+// line, because the clamp runs on the GAME thread, where the overflow is
+// MASKED -- len_sq becomes +inf, `max / sqrt(inf)` becomes 0, and the spin is
+// zeroed. Jolt's clamp handles the overflow correctly. It is only lethal on a
+// job thread, and only because the exception is unmasked there.
+//
+// So the fix is in three parts, and the first is the one that matters:
+//
+//  1. CMakeLists turns FLOATING_POINT_EXCEPTIONS_ENABLED OFF. The identical
+//     numeric situation then resolves the way the main-thread injection above
+//     demonstrates: the body's spin is zeroed and the frame continues.
+//  2. GuardBodyInertia, at birth, closes the one mechanism that can multiply a
+//     bounded spin by 4e17 inside a SINGLE step -- a principal moment that
+//     came back at (or below) zero from an ill-conditioned eigendecomposition.
+//     MotionProperties::SetMassProperties takes `diagonal.Reciprocal()`
+//     whenever the diagonal as a VECTOR is not near zero, so one bad component
+//     becomes an inverse inertia of 1e20 and the next contact impulse is the
+//     end of the body. Nothing this engine builds can legitimately exceed
+//     kMaxInvInertia: the smallest is a single micro voxel at physScale 8,
+//     floored to the 0.05 kg minimum mass, at ~7.7e5.
+//  3. SweepInsaneVelocities + VelocityIsSane catch the case Jolt's clamp
+//     silently PASSES: a NaN. `NaN > Square(max)` is false, so a NaN velocity
+//     goes through SetAngularVelocityClamped untouched, never traps (squaring
+//     a quiet NaN raises nothing), and quietly moves the body to a NaN
+//     position forever. That one has no self-healing path at all, so it is
+//     caught here and named.
+//
+// Every check below is written to be overflow-safe itself: components are
+// compared, never squared. Reading a float and calling isfinite on it is not
+// an FP operation and cannot trap.
+namespace {
+// 1/(kg m^2). See (2) above for where the three orders of margin come from.
+constexpr float kMaxInvInertia = 1.0e9f;
+// rad/s and m/s. Jolt clamps to 47.1 and 500 respectively on every integrate,
+// so a body an order of magnitude past either is not physics, it is a bug.
+constexpr float kInsaneSpin = 1.0e4f;
+constexpr float kInsaneSpeed = 1.0e5f;
+
+// True when every component is finite and under `limit`. No multiplies, so
+// this is safe to call on the garbage it is looking for.
+bool ComponentsUnder(JPH::Vec3Arg v, float limit) {
+  for (uint32_t i = 0; i < 3; i++) {
+    const float c = v[i];
+    if (!std::isfinite(c) || c > limit || c < -limit) return false;
+  }
+  return true;
+}
+}  // namespace
+
+void Physics::GuardBodyInertia(uint32_t bodyIndexAndSeq, const char* what) {
+  if (!system_) return;
+  JPH::BodyLockWrite lock(system_->GetBodyLockInterface(),
+                          JPH::BodyID(bodyIndexAndSeq));
+  if (!lock.Succeeded()) return;
+  JPH::Body& body = lock.GetBody();
+  if (!body.IsDynamic()) return;
+  JPH::MotionProperties* mp = body.GetMotionPropertiesUnchecked();
+  if (!mp) return;
+  const JPH::Vec3 d = mp->GetInverseInertiaDiagonal();
+  if (ComponentsUnder(d, kMaxInvInertia)) return;  // the normal path
+  // A zero component is Jolt's own "this axis does not rotate" and is fine;
+  // only a component that is negative, non-finite or absurdly large is the
+  // artefact, and each is floored independently so a merely thin body keeps
+  // the two good axes it decomposed correctly.
+  float f[3];
+  for (uint32_t i = 0; i < 3; i++) {
+    const float c = d[i];
+    f[i] = (!std::isfinite(c) || c < 0.0f || c > kMaxInvInertia)
+               ? kMaxInvInertia
+               : c;
+  }
+  mp->SetInverseInertia(JPH::Vec3(f[0], f[1], f[2]), mp->GetInertiaRotation());
+  if (insaneReports_ < 8) {
+    insaneReports_++;
+    std::fprintf(stderr,
+                 "[phys] %s body %u: inverse inertia (%g, %g, %g) is not "
+                 "physical (invMass %g) -> floored to (%g, %g, %g). See the "
+                 "FP-trap note in phys/physics.cpp.\n",
+                 what, (unsigned)JPH::BodyID(bodyIndexAndSeq).GetIndex(),
+                 (double)d.GetX(), (double)d.GetY(), (double)d.GetZ(),
+                 (double)mp->GetInverseMassUnchecked(), (double)f[0],
+                 (double)f[1], (double)f[2]);
+  }
+}
+
+void Physics::InjectPhysFault() {
+  if (!system_) return;
+  // A SAFETY NET NOBODY HAS SEEN WORK IS NOT A SAFETY NET. Every gate this
+  // engine has runs the checks below and none has ever tripped one (correctly
+  // -- they are looking for garbage), so the ACTION half would ship
+  // unexercised. SANDVOX_PHYS_FAULT=<n> writes a NaN spin straight at the
+  // n-th step's first active body through Jolt's own clamped setter, and the
+  // sweep immediately below has to name it and zero it.
+  //
+  // It is a NaN and not a huge number ON PURPOSE, and the first version of
+  // this injector is why the note above says what it says: 1e30 rad/s was
+  // eaten by SetAngularVelocityClamped before the sweep ever saw it, which is
+  // how we learned that no value this class writes can reach Jolt's
+  // integrator un-clamped. A NaN is the one thing that clamp lets through.
+  // Unset (the normal case) reads one cached int.
+  //
+  // `SANDVOX_PHYS_FAULT=spin:<n>` is the other half: it writes 1e30 rad/s
+  // STRAIGHT INTO MotionProperties, under the body lock and past every clamp,
+  // which is the state both crashes died in.
+  //
+  // AND MASKING THE EXCEPTION IS NOT, BY ITSELF, ENOUGH -- that arm is how we
+  // know. Run past the sweep (InjectPhysFault called AFTER it) on the masked
+  // build, a `corpse-intact` gate that takes 5 s did not crash and did not
+  // finish either: killed at 8 minutes, crash.log untouched. Jolt's clamp
+  // lives in JobIntegrateVelocity, which is the LAST job of the step, so
+  // collision detection, constraint setup and the velocity solve all run
+  // first with omega = 1e30 in hand -- `v + omega x r` is astronomical at
+  // every contact and the step never comes back. Masking turns the kill into
+  // a hang; the sweep below is what turns it into a log line. Both halves are
+  // the fix, which is why this injector runs BEFORE the sweep: the arm that
+  // matters is the one the net is allowed to see.
+  static const char* kFaultEnv = std::getenv("SANDVOX_PHYS_FAULT");
+  static const bool kFaultRaw =
+      kFaultEnv && std::strncmp(kFaultEnv, "spin:", 5) == 0;
+  static const int kFaultAt =
+      kFaultEnv ? std::atoi(kFaultRaw ? kFaultEnv + 5 : kFaultEnv) : 0;
+  if (kFaultAt > 0 && ++faultStep_ == kFaultAt) {
+    const uint32_t na = system_->GetNumActiveBodies(JPH::EBodyType::RigidBody);
+    const JPH::BodyID* ab =
+        system_->GetActiveBodiesUnsafe(JPH::EBodyType::RigidBody);
+    if (na > 0 && ab) {
+      std::fprintf(stderr,
+                   "[phys] SANDVOX_PHYS_FAULT: injecting %s into body %u on "
+                   "step %d\n",
+                   kFaultRaw ? "1e30 rad/s past every clamp" : "a NaN spin",
+                   (unsigned)ab[0].GetIndex(), kFaultAt);
+      if (kFaultRaw) {
+        JPH::BodyLockWrite lock(system_->GetBodyLockInterface(), ab[0]);
+        if (lock.Succeeded())
+          if (JPH::MotionProperties* mp =
+                  lock.GetBody().GetMotionPropertiesUnchecked())
+            mp->SetAngularVelocity(JPH::Vec3(1.0e30f, 0.0f, 0.0f));
+      } else {
+        system_->GetBodyInterfaceNoLock().SetAngularVelocity(
+            ab[0],
+            JPH::Vec3(std::numeric_limits<float>::quiet_NaN(), 0.0f, 0.0f));
+      }
+    } else {
+      std::fprintf(stderr,
+                   "[phys] SANDVOX_PHYS_FAULT: no active body on step %d\n",
+                   kFaultAt);
+      faultStep_--;  // try again next step
+    }
+  }
+}
+
+void Physics::SweepInsaneVelocities() {
+  if (!system_) return;
+  // Safe unlocked: this runs on the game thread, outside Update, so no job is
+  // touching the active list (the same reason WakeNear may walk bodies here).
+  const uint32_t n = system_->GetNumActiveBodies(JPH::EBodyType::RigidBody);
+  if (n == 0) return;
+  const JPH::BodyID* active =
+      system_->GetActiveBodiesUnsafe(JPH::EBodyType::RigidBody);
+  if (!active) return;
+  JPH::BodyInterface& bi = system_->GetBodyInterfaceNoLock();
+  for (uint32_t i = 0; i < n; i++) {
+    const JPH::BodyID id = active[i];
+    const JPH::Vec3 w = bi.GetAngularVelocity(id);
+    const JPH::Vec3 v = bi.GetLinearVelocity(id);
+    const bool badW = !ComponentsUnder(w, kInsaneSpin);
+    const bool badV = !ComponentsUnder(v, kInsaneSpeed);
+    const JPH::RVec3 p = bi.GetPosition(id);
+    // A NaN TRANSFORM IS THE END OF THE BODY AND THERE IS NO PUTTING IT BACK:
+    // the quadtree gets a NaN AABB, every overlap test against it answers
+    // neither yes nor no, and the step stops coming back (SANDVOX_PHYS_FAULT=
+    // spin:1 past the sweep: an 8-minute `corpse-intact` that normally takes
+    // 5 s). Zeroing the velocity cannot undo it -- the position is already
+    // gone. It is reported rather than repaired because the repair is to stop
+    // the velocity that causes it from entering Update at all, which is what
+    // the zeroing below is for; if this line ever appears, the thing to find
+    // is what got past the checks ABOVE it, not what to do about the NaN.
+    const bool badP = !ComponentsUnder(JPH::Vec3(p), 1.0e9f);
+    if (badP && insaneReports_ < 8) {
+      insaneReports_++;
+      std::fprintf(stderr,
+                   "[phys] body %u has an unusable TRANSFORM (%g, %g, %g) m -- "
+                   "it cannot be put back and the broadphase will stall on "
+                   "it. See the FP-trap note in phys/physics.cpp.\n",
+                   (unsigned)id.GetIndex(), (double)p.GetX(), (double)p.GetY(),
+                   (double)p.GetZ());
+    }
+    if (!badW && !badV) continue;
+    if (insaneReports_ < 8) {
+      insaneReports_++;
+      std::fprintf(stderr,
+                   "[phys] body %u at (%.1f, %.1f, %.1f) vox carried %s "
+                   "velocity into the step: lin (%g, %g, %g) m/s, ang "
+                   "(%g, %g, %g) rad/s -> zeroed. See the FP-trap note in "
+                   "phys/physics.cpp.\n",
+                   (unsigned)id.GetIndex(), (double)p.GetX() / kVoxelMeters,
+                   (double)p.GetY() / kVoxelMeters,
+                   (double)p.GetZ() / kVoxelMeters,
+                   badW ? (badV ? "an unusable" : "an unusable angular")
+                        : "an unusable linear",
+                   (double)v.GetX(), (double)v.GetY(), (double)v.GetZ(),
+                   (double)w.GetX(), (double)w.GetY(), (double)w.GetZ());
+    }
+    bi.SetLinearAndAngularVelocity(id, badV ? JPH::Vec3::sZero() : v,
+                                   badW ? JPH::Vec3::sZero() : w);
+  }
+}
+
 void Physics::Step(float dt) {
   if (!system_) return;
+  // Before Update, so a body that was handed garbage while asleep never
+  // reaches Jolt's own clamp — which overflows rather than clamping.
+  InjectPhysFault();
+  SweepInsaneVelocities();
   // Gravity is re-applied here rather than only at Init so a tuning reload
   // takes effect without restarting the world.
   system_->SetGravity(JPH::Vec3(0, -CurrentTuning().physics.gravity, 0));
@@ -516,6 +754,7 @@ uint64_t Physics::CreateDebrisBodyXf(const std::vector<DebrisVoxel>& voxels,
         us(t2, t3), us(t0, t3));
   }
   if (id.IsInvalid()) return 0;
+  GuardBodyInertia(id.GetIndexAndSequenceNumber(), "debris");
   uint64_t h = FromBodyID(id);
   dynamicBodies_.push_back(h);
   return h;
@@ -563,6 +802,7 @@ uint64_t Physics::CreateSphereBody(Vec3 centerVoxel, float radiusVoxels,
   JPH::BodyInterface& bi = system_->GetBodyInterface();
   JPH::BodyID id = bi.CreateAndAddBody(bcs, JPH::EActivation::Activate);
   if (id.IsInvalid()) return 0;
+  GuardBodyInertia(id.GetIndexAndSequenceNumber(), "sphere");
   uint64_t h = FromBodyID(id);
   dynamicBodies_.push_back(h);
   return h;
@@ -1046,11 +1286,34 @@ bool Physics::SetBodyPosition(uint64_t handle, Vec3 posVoxel) {
   return true;
 }
 
+// A velocity written from game code is the one input to the solver this engine
+// controls, so it is also the one place a non-number can be kept out of Jolt
+// for free. A value that fails here is DROPPED, not clamped: it is not a fast
+// body, it is a bug upstream, and the report names it. See the FP-trap note
+// above Physics::Step for what happens to a body that carries one.
+bool Physics::VelocityIsSane(Vec3 linVox, Vec3 angRad, const char* what) {
+  const JPH::Vec3 l(linVox.x, linVox.y, linVox.z);
+  const JPH::Vec3 a(angRad.x, angRad.y, angRad.z);
+  if (ComponentsUnder(l, kInsaneSpeed) && ComponentsUnder(a, kInsaneSpin))
+    return true;
+  if (insaneReports_ < 8) {
+    insaneReports_++;
+    std::fprintf(stderr,
+                 "[phys] %s refused: lin (%g, %g, %g) vox/s, ang (%g, %g, %g) "
+                 "rad/s is not a velocity. See the FP-trap note in "
+                 "phys/physics.cpp.\n",
+                 what, (double)linVox.x, (double)linVox.y, (double)linVox.z,
+                 (double)angRad.x, (double)angRad.y, (double)angRad.z);
+  }
+  return false;
+}
+
 void Physics::SetBodyVelocity(uint64_t handle, Vec3 velVoxelsPerSec) {
   if (!system_ || handle == 0) return;
   JPH::BodyInterface& bi = system_->GetBodyInterface();
   JPH::BodyID id = ToBodyID(handle);
   if (!bi.IsAdded(id)) return;
+  if (!VelocityIsSane(velVoxelsPerSec, Vec3{}, "SetBodyVelocity")) return;
   bi.SetLinearVelocity(id, JPH::Vec3(VoxToM(velVoxelsPerSec.x),
                                      VoxToM(velVoxelsPerSec.y),
                                      VoxToM(velVoxelsPerSec.z)));
@@ -1107,6 +1370,7 @@ void Physics::SetBodyVelocities(uint64_t handle, Vec3 lin, Vec3 angRadPerSec) {
   JPH::BodyInterface& bi = system_->GetBodyInterface();
   JPH::BodyID id = ToBodyID(handle);
   if (!bi.IsAdded(id)) return;
+  if (!VelocityIsSane(lin, angRadPerSec, "SetBodyVelocities")) return;
   bi.SetLinearVelocity(id, JPH::Vec3(VoxToM(lin.x), VoxToM(lin.y), VoxToM(lin.z)));
   bi.SetAngularVelocity(id, JPH::Vec3(angRadPerSec.x, angRadPerSec.y, angRadPerSec.z));
 }

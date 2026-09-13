@@ -436,6 +436,25 @@ class Physics {
   // World-space AABB of a live body, metres. False for a dead handle.
   bool WorldBounds(uint64_t handle, float outMin[3], float outMax[3]) const;
   void TickPendingReleases();
+  // ---- the FP-overflow net (see the long note in physics.cpp) ----
+  // Called on every DYNAMIC body the moment it is added: floors a principal
+  // moment of inertia that a decomposition left at (or below) zero, which is
+  // the only way omega can reach 1e19 rad/s in a single solver step.
+  // `what` names the creator for the report. No-op in the normal case.
+  void GuardBodyInertia(uint32_t bodyIndexAndSeq, const char* what);
+  // True when both vectors are finite and small enough that squaring them
+  // cannot overflow. False reports once (rate-limited) and the caller drops
+  // the write.
+  bool VelocityIsSane(Vec3 linVox, Vec3 angRad, const char* what);
+  // Called from Step() before Update(): walks the ACTIVE rigid bodies and
+  // neutralises (and names) any whose stored velocity is already past what
+  // Jolt's own clamp could have produced. Zero cost when nothing is wrong.
+  void SweepInsaneVelocities();
+  // SANDVOX_PHYS_FAULT: the deliberate blow-up that proves the two above
+  // (and the Jolt FP-exception setting) actually do something. No-op unset.
+  void InjectPhysFault();
+  int insaneReports_ = 0;  // rate limit on the two reporters above
+  int faultStep_ = 0;      // SANDVOX_PHYS_FAULT step counter
   // ReplaceBody's per-joint step: rebuild `joint` with `newBody` standing in
   // for `oldBody` on whichever side it was. False if nothing was rebuilt.
   bool RetargetJoint(uint64_t joint, uint64_t oldBody, uint64_t newBody);

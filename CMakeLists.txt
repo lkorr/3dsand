@@ -327,6 +327,21 @@ set(ENABLE_ALL_WARNINGS OFF CACHE BOOL "" FORCE)
 set(CROSS_PLATFORM_DETERMINISTIC ON CACHE BOOL "" FORCE)
 # match the rest of the project (/MD); Jolt defaults to /MT and the link fails
 set(USE_STATIC_MSVC_RUNTIME_LIBRARY OFF CACHE BOOL "" FORCE)
+# A FLOAT OVERFLOW IN A JOLT JOB MUST NOT KILL THE GAME (2026-09-13).
+# Jolt.cmake defines JPH_FLOATING_POINT_EXCEPTIONS_ENABLED for Debug AND
+# Release, which makes JobSystemThreadPool::ThreadMain unmask the SSE
+# invalid / div-zero / overflow exceptions on every worker thread. crash.log
+# has two kills from it (2026-09-12 16:05, 2026-09-13 00:51), both the same
+# instruction: the `mulss` inside MotionProperties::ClampAngularVelocity, i.e.
+# the clamp that exists to bound a runaway spin dying on the spin it was
+# called to bound. That clamp is CORRECT under the default masked mode --
+# len_sq goes to +inf, `max / sqrt(inf)` goes to 0, the spin is zeroed -- and
+# SANDVOX_PHYS_FAULT in phys/physics.cpp demonstrates exactly that on the game
+# thread, which never unmasked anything. Unmasking turns a self-healing
+# numeric edge into a process kill for a player, and the diagnostic it buys is
+# replaced by GuardBodyInertia + SweepInsaneVelocities, which report from the
+# engine side and also catch the NaN that Jolt's clamp passes through.
+set(FLOATING_POINT_EXCEPTIONS_ENABLED OFF CACHE BOOL "" FORCE)
 
 FetchContent_Declare(
   JoltPhysics
