@@ -338,6 +338,10 @@ const char* const kOrder[] = {
     // ...and the corpse stays in one piece when the stroke keeps going
     // through it (same report, the half one-hit could not see; CPU only).
     "corpse-intact",
+    // Right after it, and for the same reason it exists: `corpse-armor` is
+    // `corpse-intact` with a wardrobe on and the head off first. It needs the
+    // same pristine ground and leaves the same nothing behind.
+    "corpse-armor",
     // ...and every piece of it bleeds from its own end of the cut, the soak
     // lands on what is exposed, and bone stays bone (owner report 2026-09-02).
     // Ticks the world (the corpse needs ground to lie on) and regenerates it
@@ -348,6 +352,11 @@ const char* const kOrder[] = {
     // on contact and water rinses it (owner report 2026-09-13). Ticks the
     // world for the last two and regenerates it on the way out.
     "body-stain",
+    // ...and a blast bloodies the HOLE IT MADE and nothing else: a limb the
+    // crater took no voxel from stays clean, and the limb it did hit gets a
+    // chip's worth of blood rather than a repainted surface (owner report
+    // 2026-09-13, the second half of the same one body-stain answers).
+    "blast-stain",
     // ...and a corpse that died alight keeps burning: every piece advances
     // its embers, keeps emitting fire, and its brick agrees with its lattice
     // (owner report 2026-09-02: the corpse pulsed at its death colour for

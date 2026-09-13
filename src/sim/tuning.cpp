@@ -766,6 +766,9 @@ bool LoadTuning(const std::string& path, Tuning& out) {
     ReadF(*g, "woundStainRadius", e.woundStainRadius, out, at);
     ReadF(*g, "woundStainSurface", e.woundStainSurface, out, at);
     ReadF(*g, "woundStainDensity", e.woundStainDensity, out, at);
+    ReadF(*g, "woundStainBlob", e.woundStainBlob, out, at);
+    ReadF(*g, "woundStainCoherence", e.woundStainCoherence, out, at);
+    ReadF(*g, "craterStainRim", e.craterStainRim, out, at);
     ReadF(*g, "stainCutRadius", e.stainCutRadius, out, at);
     ReadI(*g, "stainCutAmount", e.stainCutAmount, out, at);
     ReadI(*g, "stainCutBuried", e.stainCutBuried, out, at);
@@ -811,6 +814,9 @@ bool LoadTuning(const std::string& path, Tuning& out) {
     e.woundStainRadius = std::clamp(e.woundStainRadius, 0.0f, 16.0f);
     e.woundStainSurface = std::clamp(e.woundStainSurface, 0.0f, 1.0f);
     e.woundStainDensity = std::clamp(e.woundStainDensity, 0.0f, 1.0f);
+    e.woundStainBlob = std::clamp(e.woundStainBlob, 0.25f, 16.0f);
+    e.woundStainCoherence = std::clamp(e.woundStainCoherence, 0.0f, 1.0f);
+    e.craterStainRim = std::clamp(e.craterStainRim, 0.0f, 16.0f);
     e.stainCutRadius = std::clamp(e.stainCutRadius, 0.0f, 16.0f);
     e.stainCutAmount = std::clamp(e.stainCutAmount, 0, 15);
     e.stainCutBuried = std::clamp(e.stainCutBuried, 0, 15);
@@ -2745,6 +2751,9 @@ bool SaveCombatTuning(const std::string& path, const Tuning& t,
     put("woundStainRadius", g.woundStainRadius);
     put("woundStainSurface", g.woundStainSurface);
     put("woundStainDensity", g.woundStainDensity);
+    put("woundStainBlob", g.woundStainBlob);
+    put("woundStainCoherence", g.woundStainCoherence);
+    put("craterStainRim", g.craterStainRim);
     put("corpseBleedPerVoxel", g.corpseBleedPerVoxel);
     put("bleedGain", g.bleedGain);
     put("bleedHpPerVoxel", g.bleedHpPerVoxel);

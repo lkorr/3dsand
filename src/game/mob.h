@@ -1455,10 +1455,31 @@ class Mob {
     int rounds = 0;       // passes; each can only remove
     uint32_t seed = 0;    // same (mob, limb) key the crater noise uses
   };
+  // ---- WHERE THE CARVE ACTUALLY LANDED -------------------------------------
+  // A predicate-driven carve knows the volume it SEARCHED; only CarveLimb
+  // knows which voxels were really in it, because it owns the limb's voxel
+  // list and it is what runs the spall rounds. The blast path needs that to
+  // bloody the CRATER rather than the sphere it searched — the two differ by
+  // everything once a blast is bigger than the arm it grazed. Centroid and
+  // radius are in limb-local WORLD voxels, the frame `woundLocal` is read in;
+  // the radius is an RMS spread (outlier-proof, and ~0.78 R for a full sphere
+  // of radius R) rather than a max, so one stray spalled voxel cannot inflate
+  // it. `count == 0` means the carve found nothing on this limb.
+  struct CarveReport {
+    uint32_t count = 0;
+    Vec3 centreLocal{};
+    float radiusLocal = 0.0f;
+    // The removed cells themselves, in the AUTHORITATIVE lattice's coords —
+    // the set a crater's blood is measured from (phys/bodystain.h CellDist).
+    // Collected only when a report is asked for, so the burn flush (which
+    // carves dozens of times a second and wants none of this) pays nothing.
+    std::vector<IVec3> cells;
+  };
   bool CarveLimb(int limbIndex, World& world,
                  std::vector<ParticleSpawn>& spawns, bool eject,
                  const LimbCarveFactory& carveAt,
-                 const CarveSpall* spall = nullptr);
+                 const CarveSpall* spall = nullptr,
+                 CarveReport* report = nullptr);
   bool ReskinLimbMicro(MobLimb& limb, uint32_t skinScale, uint32_t physScale);
   bool RebuildLimbBody(int limbIndex);
 
@@ -1496,8 +1517,17 @@ class Mob {
   // question is about occupancy, so only the owner of the voxel list can ask
   // it. Refuses worn slots and item slots outright (a garment has no blood in
   // it — see IsWornSlot).
+  //
+  // `crater`: the cells this carve actually REMOVED, in the limb's
+  // authoritative lattice. When given, the taper is measured to the nearest of
+  // them instead of to `centreLocal`, and `rimCells` (lattice cells) replaces
+  // `radiusWorld` as how far past the hole the blood reaches. A kerf is one
+  // shape and a ball round it is a fair description of it; a crater is not —
+  // see the note on CellDist in phys/bodystain.h.
   uint32_t StainWound(int limbIndex, Vec3 centreLocal, float radiusWorld,
-                      uint32_t seed);
+                      uint32_t seed,
+                      const std::vector<IVec3>* crater = nullptr,
+                      float rimCells = 0.0f);
   // ---- BLOOD ON A BODY, from the world and from other bodies -------------
   // Contact: every limb reads the world cells around it once per tick (the
   // same walk the burn pass makes) and takes the stain of any staining

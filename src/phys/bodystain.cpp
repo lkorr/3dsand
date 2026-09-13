@@ -2,6 +2,7 @@
 
 #include <algorithm>
 #include <cmath>
+#include <cstdlib>
 
 #include "sim/microbody.h"
 #include "sim/rng.h"
@@ -11,6 +12,68 @@ uint8_t RaiseBodyStain(uint8_t cur, uint32_t type, uint32_t amt) {
   const uint32_t curAmt = BodyStainAmt(cur), curType = BodyStainType(cur);
   if (curAmt == 0 || curType == type) return PackBodyStain(type, std::max(curAmt, amt));
   return amt > curAmt ? PackBodyStain(type, amt) : cur;
+}
+
+CellDist BuildCellDist(const std::vector<IVec3>& seeds, int pad) {
+  CellDist f;
+  if (seeds.empty() || pad < 0) return f;
+  IVec3 lo{INT32_MAX, INT32_MAX, INT32_MAX}, hi{INT32_MIN, INT32_MIN, INT32_MIN};
+  for (const IVec3& v : seeds) {
+    lo.x = std::min(lo.x, v.x); hi.x = std::max(hi.x, v.x);
+    lo.y = std::min(lo.y, v.y); hi.y = std::max(hi.y, v.y);
+    lo.z = std::min(lo.z, v.z); hi.z = std::max(hi.z, v.z);
+  }
+  f.lo = IVec3{lo.x - pad, lo.y - pad, lo.z - pad};
+  f.dim = IVec3{hi.x - lo.x + 1 + 2 * pad, hi.y - lo.y + 1 + 2 * pad,
+                hi.z - lo.z + 1 + 2 * pad};
+  const int dx = f.dim.x, dy = f.dim.y, dz = f.dim.z;
+  if (dx <= 0 || dy <= 0 || dz <= 0) return CellDist{};
+  if ((uint64_t)dx * dy * dz > (1u << 22)) return CellDist{};  // absurd box
+  // kFar must survive `+5` without wrapping the u16 and must stay far larger
+  // than any rim a caller asks about.
+  constexpr uint16_t kFar = 60000;
+  f.d.assign((size_t)dx * dy * dz, kFar);
+  auto idx = [&](int x, int y, int z) -> size_t {
+    return ((size_t)z * dy + y) * dx + x;
+  };
+  for (const IVec3& v : seeds)
+    f.d[idx(v.x - f.lo.x, v.y - f.lo.y, v.z - f.lo.z)] = 0;
+  // The 13 neighbours that precede (z,y,x) in the forward sweep; the backward
+  // sweep uses their negations. Weight 3 across a face, 4 an edge, 5 a corner.
+  static const int kPred[13][3] = {
+      {-1, -1, -1}, {-1, -1, 0}, {-1, -1, 1}, {-1, 0, -1}, {-1, 0, 0},
+      {-1, 0, 1},   {-1, 1, -1}, {-1, 1, 0},  {-1, 1, 1},  {0, -1, -1},
+      {0, -1, 0},   {0, -1, 1},  {0, 0, -1}};
+  auto weight = [](const int o[3]) -> int {
+    const int m = std::abs(o[0]) + std::abs(o[1]) + std::abs(o[2]);
+    return m == 1 ? 3 : m == 2 ? 4 : 5;
+  };
+  auto sweep = [&](bool forward) {
+    for (int zi = 0; zi < dz; zi++) {
+      const int z = forward ? zi : dz - 1 - zi;
+      for (int yi = 0; yi < dy; yi++) {
+        const int y = forward ? yi : dy - 1 - yi;
+        for (int xi = 0; xi < dx; xi++) {
+          const int x = forward ? xi : dx - 1 - xi;
+          uint16_t best = f.d[idx(x, y, z)];
+          if (best == 0) continue;
+          for (const auto& o : kPred) {
+            const int s = forward ? 1 : -1;
+            const int nz = z + s * o[0], ny = y + s * o[1], nx = x + s * o[2];
+            if (nx < 0 || ny < 0 || nz < 0 || nx >= dx || ny >= dy || nz >= dz)
+              continue;
+            const uint16_t cand =
+                (uint16_t)std::min<int>(kFar, f.d[idx(nx, ny, nz)] + weight(o));
+            if (cand < best) best = cand;
+          }
+          f.d[idx(x, y, z)] = best;
+        }
+      }
+    }
+  };
+  sweep(true);
+  sweep(false);
+  return f;
 }
 
 uint32_t SoakCut(const StainLattice& L, Vec3 centre, const CutSoak& p,
@@ -68,11 +131,20 @@ uint32_t SoakCut(const StainLattice& L, Vec3 centre, const CutSoak& p,
     const uint32_t mat = L.Mat(i);
     if (mat == 0) continue;
     const IVec3 v = L.At(i);
-    const Vec3 d{(float)v.x + 0.5f - centre.x, (float)v.y + 0.5f - centre.y,
-                 (float)v.z + 0.5f - centre.z};
-    const float d2 = d.dot(d);
-    if (d2 >= r2) continue;
-    const float t = std::sqrt(d2 / r2);  // 0 at the cut, 1 at the rim
+    // 0 at the cut, 1 at the rim. Measured to the nearest cell the carve
+    // REMOVED when the caller has that set (see CellDist), else to `centre`.
+    float t;
+    if (p.from && !p.from->Empty()) {
+      const float dc = p.from->At(v.x, v.y, v.z);
+      if (dc >= p.radius) continue;
+      t = dc / p.radius;
+    } else {
+      const Vec3 d{(float)v.x + 0.5f - centre.x, (float)v.y + 0.5f - centre.y,
+                   (float)v.z + 0.5f - centre.z};
+      const float d2 = d.dot(d);
+      if (d2 >= r2) continue;
+      t = std::sqrt(d2 / r2);
+    }
     const uint32_t h = rng::Hash3(seed, (uint32_t)v.x * 73856093u,
                                   (uint32_t)v.y * 19349663u ^
                                       (uint32_t)v.z * 83492791u);

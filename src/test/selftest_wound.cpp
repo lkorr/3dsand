@@ -46,6 +46,7 @@
 
 #include <algorithm>
 #include <cmath>
+#include <chrono>
 #include <cstdio>
 #include <functional>
 #include <string>
@@ -54,6 +55,8 @@
 #include <vector>
 
 #include "game/item.h"
+#include "game/equipment.h"
+#include "game/player.h"
 #include "game/mob.h"
 #include "sim/microbody.h"
 #include "sim/tuning.h"
@@ -1196,6 +1199,309 @@ Status GateCorpseIntact(Ctx& c, std::string& detail) {
   return ok ? Status::Pass : Status::Fail;
 }
 
+// ---- corpse-armor ----------------------------------------------------------
+//
+// A CORPSE IN ARMOUR MUST NOT BECOME A MOTOR.
+//
+// Owner report, 2026-09-13: "I killed a player character with a suit of armour
+// on; his head had been separated. The body spasmed out and flew in a billion
+// directions, all of his limbs moving dramatically and flying everywhere while
+// still technically being attached. The framerate plummeted and the whole game
+// froze for several minutes; closing it took a minute or two."
+//
+// No crash.log, so this is NOT the FP-overflow kill 46e3848 closed: that one
+// dies in JobIntegrateVelocity with 0xC0000091. "Still technically attached"
+// says the joints held, which means the energy came from the SOLVER, not from
+// a blast — a jointed rig that gains energy every step until every limb sits
+// at Jolt's own clamp (47.1 rad/s, 500 m/s). That state is entirely inside
+// what the FP net calls sane (kInsaneSpin 1e4, kInsaneSpeed 1e5), which is
+// exactly why nothing reported it: the net is looking for garbage, and this is
+// not garbage — it is a physically-typed number that is absurd for a severed
+// arm.
+//
+// Armour is the ingredient that makes a corpse different from every corpse
+// `corpse-intact` has ever tested. A worn shell is its own Jolt body, FIXED to
+// the limb it wraps (Mob::AppendWornShell) and geometrically INSIDE it, so a
+// dressed corpse has twice the bodies, twice the joints, mass ratios of iron
+// against flesh across a stiff constraint, and a dozen deep overlaps held
+// apart only by the mob's collision group. Every one of those is an energy
+// source the undressed fixture does not have. The severed limb is the second:
+// a limb cut off a LIVE creature takes its shells with it (DetachLimb's
+// parent-name recursion), goes through the kinematic hold, and comes out of
+// the mob's collision group on the far side (TickSeveredHolds) — so the pile
+// the corpse lands in contains pieces that CAN hit it.
+//
+// THE PROPERTY, stated so it cannot pass by accident: after the corpse of a
+// creature that was wearing everything the library ships has been dismembered
+// and killed, no piece of it may move faster than `corpseArmorMaxSpeedVox`
+// voxels/s or spin faster than `corpseArmorMaxSpinRad` rad/s on ANY tick of
+// the three seconds that follow, and the remains may not spread further than
+// `corpseArmorMaxSpreadVox`. Bounds live in tests/baseline.json so they cost
+// no rebuild to tune (CLAUDE.md, "authoring cheap-to-verify work").
+//
+// EVERY PEAK CARRIES ITS ATTRIBUTION (rule 6). "204 vox/s" is a bare number
+// and bisecting it costs a run per hypothesis; the same measurement also
+// reports WHEN it peaked, WHICH body, where that body was, how far under the
+// ground it was, and whether the velocity was straight down. A peak on tick 1
+// is the kill's own impulse, a peak that grows smoothly at 98 vox/s^2 is a
+// piece in free fall through terrain nobody built a collider for, and a peak
+// that climbs while the body is ON the ground is the solver pumping. Those are
+// three different bugs and the detail line names which one it saw.
+//
+// The worst single physics step is RECORDED, not asserted: it is the number
+// the report was actually about, but wall-clock in a gate is a flake and the
+// speed bound above is the deterministic statement of the same fact.
+Status GateCorpseArmor(Ctx& c, std::string& detail) {
+  MobSystem& mobs = c.mobs;
+  IdCounterScope idScope(mobs);
+  PrepareWorld(c);
+  const Target t = ChooseTarget(mobs, FixtureSite(c.world, 380));
+  if (!t.valid()) {
+    detail = "no loaded mob def has a severable non-vital limb that bleeds";
+    return Status::Fail;
+  }
+  IVec3 pchunk{};
+  const uint64_t id = SpawnTarget(c, t, 380, pchunk);
+  if (!id) {
+    detail = "spawn refused";
+    return Status::Fail;
+  }
+  const MobDef& def = mobs.Defs()[t.defIndex];
+  const int root = def.rootLimb;
+  const uint64_t torso = root >= 0 ? mobs.LimbBody(id, root) : 0;
+  Mob* mob = mobs.FindMobById(id);
+  if (!torso || !mob) {
+    detail = "fixture has no root limb body";
+    return Status::Fail;
+  }
+  const int bareLimbs = mob->LimbCount();
+
+  // THE KILLER IS STANDING OVER THE BODY, because that is where the report
+  // happened and because it is the one thing this fixture cannot get for free:
+  // a corpse that falls inside the player's capsule is the case
+  // ReleaseToWorldWhenClear exists for, and a gate with no proxy in the world
+  // takes the other branch of that function and tests nothing.
+  const Vec3 stand = mobs.LimbAnchorPos(id, root) + Vec3{2.0f, 0.0f, 0.0f};
+  const uint64_t proxy = c.phys.CreatePlayerBody(Player::kHalfXZ,
+                                                 Player::kHalfY);
+  uint32_t tick = 53000;
+  // THE WHOLE TICK, not the physics half of it. A corpse needs GROUND, and
+  // the ground under a rigidbody is a collider DebrisSystem::ManageTerrain
+  // meshes out of the CPU mirror — which only exists if the world is actually
+  // submitted. The first version of this gate ran mobs.PreTick + phys.Step
+  // the way `corpse-intact` does (it only counts joints, so it does not care)
+  // and measured a corpse in free fall 210 voxels UNDER the terrain: no
+  // mirror, no collider, nothing to land on, and therefore none of the ground
+  // contact that the report is about. That is the trap recorded as
+  // "a CPU-only fixture has no ground", and it costs a GPU submit per tick.
+  auto step = [&](double* outMs) {
+    std::vector<BrushOp> ops;
+    std::vector<ParticleSpawn> sp;
+    std::vector<CellOp> cellOps;
+    mobs.PreTick(tick + 1, c.world, ops, cellOps, sp);
+    c.debris.QueueSupportEvents(c.world.Snap());
+    c.debris.PreTick(tick + 1, c.world, cellOps, sp);
+    ++tick;
+    SubmitTick(c.ctx, c.world, c.sim, tick, kDefaultSeed, ops, {}, cellOps,
+               false, pchunk, true, false, sp);
+    c.ctx.WaitIdle();
+    c.ctx.ProcessEvents();
+    // Pinned, the way selftest_phys's release test pins it: MovePlayerBody
+    // hands the proxy the velocity the move implies and the game re-teleports
+    // it every tick, so a proxy left alone sails off at 30 m/s and every
+    // overlap test after that reads a capsule that has left.
+    if (proxy) {
+      c.phys.MovePlayerBody(proxy, stand, kTickDt);
+      c.phys.SetBodyVelocity(proxy, Vec3{});
+    }
+    const auto t0 = std::chrono::steady_clock::now();
+    c.phys.Step(kTickDt);
+    if (outMs)
+      *outMs = std::chrono::duration<double, std::milli>(
+                   std::chrono::steady_clock::now() - t0)
+                   .count();
+    c.debris.PostStep();
+    mobs.PostStep();
+  };
+
+  // DRESS IT IN EVERYTHING THE LIBRARY SHIPS. Counted, never named: a tree
+  // with no armour content in it still runs this gate, it simply runs it on a
+  // naked corpse and says so in the detail line (which is the honest outcome,
+  // not a silent pass — `armor-wear` is what asserts the content exists).
+  int wornPieces = 0;
+  for (const ItemDef& it : c.items.items) {
+    if (!ItemKindIsWorn(it.kind)) continue;
+    int home = -1;
+    for (int s = 0; s < kEquipSlotCount; s++)
+      if (EquipSlotAccepts(s, it.kind)) { home = s; break; }
+    if (home < 0) continue;
+    if (mob->WearItem(&it, home)) wornPieces++;
+  }
+  const int shells = mob->LimbCount() - bareLimbs;
+  // Let the shells reach their hosts before anything is cut: a piece worn this
+  // tick is placed by WearItem itself, but the drive loop is what proves the
+  // two agree, and a gate that cut on the wear frame would be measuring the
+  // placement rather than the corpse.
+  for (int i = 0; i < 8; i++) step(nullptr);
+  const uint32_t jointsDressed = c.phys.JointCount();
+
+  // WHICH LIMB COMES OFF: the severable, non-vital one carrying the MOST
+  // armour, chosen rather than named (the cast trap this file opens with). On
+  // the shipped human that is a limb under a helm or a pauldron; on a rig with
+  // no armour on any severable part it falls back to the biggest one, and the
+  // gate still means something — it is then the undressed claim.
+  int cutLimb = t.limb;
+  {
+    int bestShells = -1;
+    for (int li = 0; li < bareLimbs && li < (int)def.limbs.size(); li++) {
+      if (li == root || !def.limbs[li].severable || def.limbs[li].vital)
+        continue;
+      if (!mobs.LimbBody(id, li)) continue;
+      int n = 0;
+      for (int s = bareLimbs; s < mob->LimbCount(); s++)
+        if (mob->LimbDefAt(s).parent == def.limbs[li].name) n++;
+      if (n > bestShells) { bestShells = n; cutLimb = li; }
+    }
+  }
+  const std::string cutName = mob->LimbDefAt(cutLimb).name;
+  // WHICH OF THE CORPSE'S BODIES ARE ARMOUR. Captured here, while the rig
+  // still knows: after Die() the handles are DebrisSystem's and nothing
+  // downstream remembers that one of them used to be a pauldron. Handles
+  // survive the adoption (Mob::Die hands the same body over), so membership in
+  // this set is what lets the peak below say "it was a shell" instead of "it
+  // was body 67108874" -- the difference between a finding and a number.
+  std::unordered_set<uint64_t> shellBodies;
+  for (int sIdx = bareLimbs; sIdx < mob->LimbCount(); sIdx++)
+    if (const uint64_t h = mobs.LimbBody(id, sIdx)) shellBodies.insert(h);
+
+  // TAKE IT OFF THE LIVE CREATURE, through the geometry (hp <= 0 no longer
+  // dismembers — see the three-instant-severs note in Mob::Damage), which
+  // means cutting the armour off it first. Bounded, and the count is reported:
+  // a fixture that cannot be cut through in 120 strokes is a content change
+  // worth seeing, not a hang.
+  const LimbAxis hax = MeasureLimb(mobs, id, cutLimb);
+  int strokes = 0;
+  std::vector<ParticleSpawn> spawns;
+  while (strokes < 120 && mobs.LimbBody(id, cutLimb) && mobs.IsAlive(id)) {
+    CutOnce(mobs, c.world, id, cutLimb, hax, hax.reach * 0.5f, 1.0f, 1.6f,
+            0xC0DEu + (uint32_t)strokes, spawns);
+    spawns.clear();
+    strokes++;
+    if ((strokes & 3) == 0) step(nullptr);
+  }
+  const bool severed = mobs.LimbBody(id, cutLimb) == 0;
+  // Through the hold, so the piece is dynamic and out of its collision group
+  // before the kill (MobSystem::TickSeveredHolds) — the state the corpse has
+  // to coexist with.
+  for (int i = 0; i < 30 && mobs.IsAlive(id); i++) step(nullptr);
+
+  // Then the kill, the way the sword delivers it: the root limb at zero hp is
+  // a death, not an amputation (Mob::HpZeroSevers), and the corpse keeps every
+  // joint (Mob::Die).
+  if (mobs.IsAlive(id)) {
+    const LimbAxis ax = MeasureLimb(mobs, id, root);
+    MobSystem::BladeCutScope blade(mobs, 1.0f);
+    mobs.Damage(torso, 1.0e6f, ax.anchor + ax.along * (ax.reach * 0.5f), 45.0f);
+  }
+  const bool died = !mobs.IsAlive(id);
+  const uint32_t jointsDead = c.phys.JointCount();
+
+  // Three seconds of corpse, measured every tick over every piece.
+  float maxSpeed = 0.0f, maxSpin = 0.0f, maxSpread = 0.0f;
+  int speedTick = -1, spinTick = -1;
+  bool spinIsShell = false;
+  // 90% of Jolt's default max angular velocity (15*pi rad/s). See the note at
+  // the sample below for why the threshold is expressed against the CLAMP.
+  const float kPegged = 0.9f * 47.1238898f;
+  uint32_t peggedSamples = 0;
+  int lastHotTick = -1;
+  std::unordered_set<uint64_t> peggedBodies, peggedShells;
+  Vec3 peakPos{}, peakVel{};
+  float peakUnderGround = 0.0f;
+  double worstStepMs = 0.0;
+  int worstStepTick = -1;
+  const int kTicks = 180;
+  for (int i = 0; i < kTicks; i++) {
+    double ms = 0.0;
+    step(&ms);
+    if (ms > worstStepMs) { worstStepMs = ms; worstStepTick = i; }
+    Vec3 anchor{};
+    bool haveAnchor = false;
+    for (uint32_t b = 0; b < c.debris.BodyCount(); b++) {
+      const uint64_t h = c.debris.BodyHandle(b);
+      const Vec3 p = c.debris.BodyPosition(b);
+      Vec3 lin{}, ang{};
+      if (c.phys.GetBodyVelocities(h, lin, ang)) {
+        const float sp = lin.len(), sq = ang.len();
+        if (sp > maxSpeed) {
+          maxSpeed = sp;
+          speedTick = i;
+          peakPos = p;
+          peakVel = lin;
+          const float ground = (float)World::TerrainHeight(
+              (int)std::floor(p.x), (int)std::floor(p.z), kDefaultSeed);
+          peakUnderGround = ground - p.y;
+        }
+        if (sq > maxSpin) {
+          maxSpin = sq;
+          spinTick = i;
+          spinIsShell = shellBodies.count(h) != 0;
+        }
+        // IS IT A TRANSIENT OR A MOTOR? One peak says nothing; these three
+        // numbers say which of the two this is. `kPegged` is 90% of Jolt's
+        // own angular clamp (47.124 rad/s), because a body AT the clamp is by
+        // definition a body whose spin the solver would have made larger.
+        if (sq >= kPegged) {
+          peggedSamples++;
+          peggedBodies.insert(h);
+          lastHotTick = i;
+          if (shellBodies.count(h)) peggedShells.insert(h);
+        }
+      }
+      if (!haveAnchor) { anchor = p; haveAnchor = true; }
+      maxSpread = std::max(maxSpread, (p - anchor).len());
+    }
+  }
+  // Is the fastest thing simply FALLING? Gravity is the null hypothesis and it
+  // is one dot product, not a run: a piece in free fall points straight down.
+  const float fallFrac =
+      maxSpeed > 1e-3f ? (-peakVel.y / maxSpeed) : 0.0f;
+  if (proxy) c.phys.RemoveBody(proxy);
+
+  const double speedCap = BaselineNumber("corpseArmorMaxSpeedVox", 120.0);
+  const double spinCap = BaselineNumber("corpseArmorMaxSpinRad", 40.0);
+  const double spreadCap = BaselineNumber("corpseArmorMaxSpreadVox", 60.0);
+  RecordObserved("corpseArmorMaxSpeedVox", (double)maxSpeed);
+  RecordObserved("corpseArmorMaxSpinRad", (double)maxSpin);
+  RecordObserved("corpseArmorMaxSpreadVox", (double)maxSpread);
+  RecordObserved("corpseArmorWorstStepMs", worstStepMs);
+  RecordObserved("corpseArmorPeggedBodyTicks", (double)peggedSamples);
+
+  const bool ok = died && maxSpeed <= (float)speedCap &&
+                  maxSpin <= (float)spinCap && maxSpread <= (float)spreadCap;
+  detail = Format(
+      "%s: %d base limbs + %d shells from %d worn pieces, %u joints dressed; "
+      "%s cut off in %d strokes (severed=%d), died=%d with %u joints, %u "
+      "debris bodies; over %d corpse ticks the fastest piece hit %.1f vox/s on "
+      "tick %d (cap %.0f) at (%.1f, %.1f, %.1f), %.1f vox under ground, %.0f%% "
+      "straight down; fastest spin %.2f rad/s on tick %d (%s, cap %.0f); spread "
+      "%.1f vox (cap %.0f); %u body-ticks pegged at Jolt's own clamp across %u "
+      "bodies (%u of them armour), last on tick %d; worst physics step %.1f ms "
+      "on tick %d",
+      t.defName.c_str(), bareLimbs, shells, wornPieces, jointsDressed,
+      cutName.c_str(), strokes, severed ? 1 : 0, died ? 1 : 0, jointsDead,
+      c.debris.BodyCount(), kTicks, (double)maxSpeed, speedTick, speedCap,
+      (double)peakPos.x, (double)peakPos.y, (double)peakPos.z,
+      (double)peakUnderGround, (double)(fallFrac * 100.0f), (double)maxSpin,
+      spinTick, spinIsShell ? "armour" : "flesh", spinCap, (double)maxSpread,
+      spreadCap, peggedSamples,
+      (unsigned)peggedBodies.size(), (unsigned)peggedShells.size(), lastHotTick,
+      worstStepMs, worstStepTick);
+  mobs.Reset();
+  c.debris.Reset();
+  return ok ? Status::Pass : Status::Fail;
+}
+
 // ---- corpse-bleed ----------------------------------------------------------
 //
 // The owner's second look at the anatomy (2026-09-02), as claims:
@@ -2186,6 +2492,189 @@ Status GateBodyStain(Ctx& c, std::string& detail) {
   return ok ? Status::Pass : Status::Fail;
 }
 
+// ---------------------------------------------------------------------------
+// blast-stain: a crater bloodies the crater (owner report 2026-09-13)
+// ---------------------------------------------------------------------------
+//
+// "Explosions that cause minor damage to the player cause way too much random
+// noisily spread blood spatter on the character. It should be more
+// concentrated ... and concentrated at areas where actual voxels are removed."
+//
+// The cause was the blast path asking StainWound to soak the BLAST SPHERE:
+// `StainWound(cBody, radiusVoxels + 0.5)`. Two things follow from that and
+// both are wrong. CarveRadialAll calls the carve for EVERY limb whose
+// bounding sphere is within `radius + r + 2`, so a limb the blast never took a
+// voxel from was still soaked; and the sphere is the volume the crater
+// predicate SEARCHED, not the hole it made, so a graze that chipped a dozen
+// voxels off an arm repainted every exposed voxel within the whole blast
+// radius -- and the outer skin is exposed BY DEFINITION, so at
+// woundStainSurface 0.9 that is most of the limb's visible surface.
+//
+// Two claims, one graze:
+//   * NO BLOOD ON A LIMB THE BLAST DID NOT TOUCH. A limb that lost no voxels
+//     gains no soak and no stain. This is the half that put blood on the far
+//     arm of a figure clipped on the near one.
+//   * THE SOAK IS THE SIZE OF THE HOLE. On the limb that WAS hit, the
+//     rewritten fraction of the lattice is bounded -- a chip's worth of
+//     blood for a chip's worth of damage, not a red limb.
+// The blast is deliberately a graze, placed OUTSIDE the body and clipping one
+// limb, because that is the case the report is about: a direct hit makes a big
+// crater and should make a big mess.
+Status GateBlastStain(Ctx& c, std::string& detail) {
+  MobSystem& mobs = c.mobs;
+  IdCounterScope idScope(mobs);
+  PrepareWorld(c);
+  const Target t = ChooseTarget(mobs, FixtureSite(c.world, 360));
+  if (!t.valid()) {
+    detail = "no loaded mob def has a severable non-vital limb that bleeds";
+    return Status::Fail;
+  }
+  IVec3 pchunk{};
+  const uint64_t id = SpawnTarget(c, t, 360, pchunk);
+  if (!id) {
+    detail = "spawn refused";
+    return Status::Fail;
+  }
+  const MobDef& def = mobs.Defs()[t.defIndex];
+  const uint32_t woundMat = def.woundMat;
+  const int root = def.rootLimb;
+  const int nl = (int)def.limbs.size();
+
+  // Outward from the body, so the blast CLIPS the target limb instead of
+  // engulfing it. `LimbVoxelPos` names a surviving voxel, not the centroid,
+  // which is what makes "a voxel of this limb" a point that is actually flesh.
+  const Vec3 limbAt = mobs.LimbVoxelPos(id, t.limb, 0);
+  Vec3 out = root >= 0 && mobs.LimbBody(id, root)
+                 ? limbAt - mobs.LimbVoxelPos(id, root, 0)
+                 : Vec3{1, 0, 0};
+  out.y = 0.0f;
+  const float outLen = out.len();
+  out = outLen > 1e-3f ? out * (1.0f / outLen) : Vec3{1, 0, 0};
+  const float radius = 5.0f;  // world voxels; a grenade beside a shoulder
+  const Vec3 blastAt = limbAt + out * (radius * 0.85f);
+
+  std::vector<uint32_t> artBefore(nl, 0), stainBefore(nl, 0), soakBefore(nl, 0);
+  for (int li = 0; li < nl; li++) {
+    if (!mobs.LimbBody(id, li)) continue;
+    artBefore[li] = mobs.LimbArtVoxelCount(id, li);
+    stainBefore[li] = mobs.LimbStainCount(id, li, 1);
+    soakBefore[li] = woundMat ? mobs.LimbMaterialCount(id, li, woundMat) : 0u;
+  }
+
+  {
+    std::vector<ParticleSpawn> spawns;
+    mobs.CarveMobsRadial(blastAt, radius, c.world, spawns);
+  }
+
+  // A limb that is GONE is not evidence either way (it lost everything), and
+  // one that lost voxels is allowed its blood. The bug is the third case.
+  uint32_t carved = 0, ghostSoaked = 0, ghostStained = 0, searched = 0;
+  std::string ghostName = "-";
+  uint32_t hitLost = 0, hitSoaked = 0, hitStained = 0, hitArt = 0;
+  std::string hitName = "-";
+  for (int li = 0; li < nl; li++) {
+    if (!artBefore[li]) continue;
+    searched++;
+    if (!mobs.LimbBody(id, li)) {  // severed by the blast
+      carved++;
+      continue;
+    }
+    const uint32_t art = mobs.LimbArtVoxelCount(id, li);
+    const uint32_t soak = woundMat ? mobs.LimbMaterialCount(id, li, woundMat) : 0u;
+    const uint32_t stain = mobs.LimbStainCount(id, li, 1);
+    const uint32_t lost = artBefore[li] > art ? artBefore[li] - art : 0u;
+    if (lost) {
+      carved++;
+      if (lost > hitLost) {
+        hitLost = lost;
+        hitArt = artBefore[li];
+        hitName = def.limbs[li].name;
+        hitSoaked = soak > soakBefore[li] ? soak - soakBefore[li] : 0u;
+        hitStained = stain > stainBefore[li] ? stain - stainBefore[li] : 0u;
+      }
+      continue;
+    }
+    if (soak > soakBefore[li] || stain > stainBefore[li]) {
+      if (soak > soakBefore[li]) ghostSoaked++;
+      if (stain > stainBefore[li]) ghostStained++;
+      if (ghostName == "-") ghostName = def.limbs[li].name;
+    }
+  }
+
+  // THE SOAK ON THE LIMB THAT WAS HIT, AS A FRACTION OF THE LIMB. The blast
+  // took `hitLost` of `hitArt` voxels off it — a graze, a percent or two — and
+  // the blood it left has to be of that order and not of the order of the
+  // limb. The old behaviour soaked a ball the size of the BLAST, so a scratch
+  // came back with most of the limb's visible surface rewritten to blood;
+  // that is the number this bounds. Stated as a MULTIPLE of the damage
+  // fraction, not an absolute, so it reads the same on any rig: blood may
+  // cover several times what the blast removed (a wound is bigger than its
+  // hole) but not tens of times.
+  const double lostFrac = hitArt ? (double)hitLost / (double)hitArt : 0.0;
+  const double soakFrac = hitArt ? (double)hitSoaked / (double)hitArt : 0.0;
+  const double spreadRatio = lostFrac > 0.0 ? soakFrac / lostFrac : 0.0;
+  const double spreadMax = BaselineNumber("blastStainSpreadMax", 8.0);
+
+  RecordObserved("blastStainCarved", (double)carved);
+  RecordObserved("blastStainGhostSoaked", (double)ghostSoaked);
+  RecordObserved("blastStainGhostStained", (double)ghostStained);
+  RecordObserved("blastStainLostFraction", lostFrac);
+  RecordObserved("blastStainSoakFraction", soakFrac);
+  RecordObserved("blastStainSpread", spreadRatio);
+
+  // ---- and the other direction: A BITE STILL BLEEDS -----------------------
+  // The rule above is a CAP, and a cap alone is satisfied by making craters
+  // bloodless — which is what the first attempt at the rim did (`0 rewritten`
+  // at a blotch size larger than the wound). So: a second blast, centred ON
+  // the body this time, has to come back with blood of the order of the hole
+  // it made. Measured against what it REMOVED, not against the limb, because
+  // a bite takes a tenth of a leg and should read as a bloody bite.
+  uint32_t biteLost = 0, biteSoaked = 0, biteStained = 0;
+  if (root >= 0 && mobs.LimbBody(id, root)) {
+    const uint32_t artWas = mobs.LimbArtVoxelCount(id, root);
+    const uint32_t soakWas = woundMat ? mobs.LimbMaterialCount(id, root, woundMat) : 0u;
+    const uint32_t stainWas = mobs.LimbStainCount(id, root, 1);
+    const Vec3 on = mobs.LimbVoxelPos(id, root, 11u);
+    {
+      std::vector<ParticleSpawn> spawns;
+      mobs.CarveMobsRadial(on, 2.5f, c.world, spawns);
+    }
+    if (mobs.LimbBody(id, root)) {
+      const uint32_t art = mobs.LimbArtVoxelCount(id, root);
+      biteLost = artWas > art ? artWas - art : 0u;
+      const uint32_t soak = woundMat ? mobs.LimbMaterialCount(id, root, woundMat) : 0u;
+      const uint32_t stain = mobs.LimbStainCount(id, root, 1);
+      biteSoaked = soak > soakWas ? soak - soakWas : 0u;
+      biteStained = stain > stainWas ? stain - stainWas : 0u;
+    }
+  }
+  const double biteFloor = BaselineNumber("blastStainBiteStainMin", 0.5);
+  const bool biteOk =
+      biteLost == 0 ||
+      (double)(biteSoaked + biteStained) >= biteFloor * (double)biteLost;
+  RecordObserved("blastStainBiteLost", (double)biteLost);
+  RecordObserved("blastStainBiteBlood", (double)(biteSoaked + biteStained));
+
+  const bool hitOk = carved > 0 && hitLost > 0 && hitArt > 0;
+  const bool bloodOk = hitSoaked > 0 || hitStained > 0;
+  const bool ghostOk = ghostSoaked == 0 && ghostStained == 0;
+  const bool sizedOk = spreadRatio <= spreadMax;
+  const bool ok = hitOk && bloodOk && ghostOk && sizedOk && biteOk;
+  detail = Format(
+      "%s: graze r=%.1f beside %s hit %u of %u limbs; %s lost %u of %u voxels "
+      "(%.1f%%) and came back %u rewritten + %u stained (%.1f%% of the limb "
+      "soaked, %.1fx the damage, cap %.1fx); %u limbs soaked / %u stained with "
+      "NOTHING removed (first %s, need 0); a bite of %u took %u rewritten + %u "
+      "stained (floor %.1f per voxel lost)",
+      t.defName.c_str(), radius, t.limbName.c_str(), carved, searched,
+      hitName.c_str(), hitLost, hitArt, lostFrac * 100.0, hitSoaked, hitStained,
+      soakFrac * 100.0, spreadRatio, spreadMax, ghostSoaked, ghostStained,
+      ghostName.c_str(), biteLost, biteSoaked, biteStained, biteFloor);
+  mobs.Reset();
+  c.debris.Reset();
+  return ok ? Status::Pass : Status::Fail;
+}
+
 const std::vector<Gate>& WoundGates() {
   static const std::vector<Gate> g = {
       {"wound-chip", "mob", {}, false, GateWoundChip, /*needsRender=*/false},
@@ -2196,8 +2685,10 @@ const std::vector<Gate>& WoundGates() {
       {"burn-cap", "mob", {}, false, GateBurnCap, false},
       {"one-hit", "mob", {}, false, GateOneHit, false},
       {"corpse-intact", "mob", {}, false, GateCorpseIntact, false},
+      {"corpse-armor", "mob", {}, false, GateCorpseArmor, false},
       {"corpse-bleed", "mob", {}, false, GateCorpseBleed, false},
       {"body-stain", "mob", {}, false, GateBodyStain, false},
+      {"blast-stain", "mob", {}, false, GateBlastStain, false},
       {"corpse-burn", "mob", {}, false, GateCorpseBurn, false},
   };
   return g;

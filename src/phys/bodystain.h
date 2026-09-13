@@ -50,6 +50,38 @@ struct StainLattice {
 // not repaint it (washing is a separate, subtractive rule). Returns the byte.
 uint8_t RaiseBodyStain(uint8_t cur, uint32_t type, uint32_t amt);
 
+// ---- DISTANCE TO WHAT THE CARVE ACTUALLY TOOK -------------------------------
+//
+// A BALL ROUND A CENTROID IS NOT A CRATER. The blast crater's predicate removes
+// with a chance that falls off to zero at the rim, so a GRAZE takes a scatter
+// of voxels across the whole sphere rather than a clean bite out of one side.
+// Its centroid is then somewhere in the middle of the limb and its RMS spread
+// is most of the blast radius, so "soak a ball of that size" bloodies a quarter
+// of the limb for eight lost voxels -- measured, `blast-stain`, 305 of 1344.
+//
+// What the owner asked for instead is blood "concentrated at areas where actual
+// voxels are removed", and that is a distance to a SET, not to a point. This is
+// that distance: a 3-4-5 chamfer over a box round the removed cells, two sweeps,
+// O(cells), accurate to a few percent of true Euclidean at the two or three
+// cells a wound rim actually uses. Distances are in LATTICE CELLS.
+struct CellDist {
+  IVec3 lo{}, dim{};
+  std::vector<uint16_t> d;  // chamfer units, 3 per face step
+  bool Empty() const { return d.empty(); }
+  float At(int x, int y, int z) const {
+    x -= lo.x;
+    y -= lo.y;
+    z -= lo.z;
+    if (x < 0 || y < 0 || z < 0 || x >= dim.x || y >= dim.y || z >= dim.z)
+      return 1e9f;
+    return (float)d[((size_t)z * dim.y + y) * dim.x + x] * (1.0f / 3.0f);
+  }
+};
+// `pad` cells of margin round the seeds' own bounds -- the field only has to
+// cover the rim the caller means to stain, so it does not pay for the limb.
+// Empty (and Empty() true) for no seeds or an absurd box.
+CellDist BuildCellDist(const std::vector<IVec3>& seeds, int pad);
+
 // The soak round a cut. `centre` and `radius` are in the LATTICE's own units.
 //
 // Every voxel in range takes a stain, bone included: an EXPOSED voxel (one
@@ -77,6 +109,10 @@ struct CutSoak {
   float buriedChance = 0.35f;
   int boneMin = 5;
   const std::vector<uint8_t>* tissue = nullptr;
+  // When set, the taper is measured from the nearest cell of `from` instead of
+  // from `centre`, and `radius` is how far past it the smear reaches. See the
+  // note on CellDist: a crater is a set, not a point.
+  const CellDist* from = nullptr;
 };
 uint32_t SoakCut(const StainLattice& L, Vec3 centre, const CutSoak& p,
                  uint32_t seed, MicroBodySet* micro, int model);

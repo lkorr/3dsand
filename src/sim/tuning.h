@@ -934,6 +934,32 @@ struct Tuning {
     float woundStainRadius = 0.90f;
     float woundStainSurface = 0.90f;
     float woundStainDensity = 0.30f;
+    // WHITE NOISE CANNOT MAKE A SMEAR, for the same reason it cannot make a
+    // chunk (see carveChunkiness). An independent draw per voxel has no
+    // feature size, so a soak thresholded against it is a fine red speckle
+    // sprinkled evenly over everything in range -- which is what a blast on a
+    // body looked like until 2026-09-13. Correlating the draws over a few
+    // voxels is what turns the speckle into blotches, and the correlation
+    // length IS the size of a blotch. `woundStainCoherence` blends from the
+    // old independent draw (0) to fully correlated (1); `woundStainBlob` is
+    // the feature size in WORLD voxels, like every other radius here, so a
+    // fine skin gets a finer-grained field of the same physical size instead
+    // of blotches eight times too big.
+    float woundStainBlob = 0.5f;
+    float woundStainCoherence = 0.8f;
+    // A CRATER IS NOT A KERF. The blade's soak is a ball of `woundStainRadius`
+    // round the slot it cut, which describes a kerf fairly. A blast crater's
+    // predicate removes with a chance that falls to zero at the rim, so a
+    // GRAZE takes a scatter of voxels across the whole blast sphere: its
+    // centroid is inside the limb and its spread is most of the blast radius,
+    // and a ball of that size bloodies a quarter of the limb for eight lost
+    // voxels. So the blast path measures its soak from the cells it actually
+    // REMOVED (phys/bodystain.h CellDist), and this is how far past them the
+    // blood reaches, in the LIMB'S OWN LATTICE CELLS -- the art's resolution
+    // is the right unit for "a cell of rim", and it is what keeps a scratch a
+    // scratch on a rig authored at any scale. The tint rides at the same
+    // stainCutRadius : woundStainRadius ratio the kerf uses.
+    float craterStainRim = 1.5f;
 
     // ---- E3b. BLOOD ON A BODY: the stain lattice (2026-09-13) --------------
     // The soak above REWRITES flesh to blood. This is the other half, and it

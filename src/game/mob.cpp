@@ -5387,7 +5387,8 @@ uint32_t Mob::NeckCount(const MobLimb& limb, float radiusWorld) const {
 }
 
 uint32_t Mob::StainWound(int limbIndex, Vec3 centreLocal, float radiusWorld,
-                         uint32_t seed) {
+                         uint32_t seed, const std::vector<IVec3>* crater,
+                         float rimCells) {
   if (!def_ || limbIndex < 0 || limbIndex >= (int)limbs_.size()) return 0;
   // A GARMENT HAS NO BLOOD IN IT, and neither has a sword. Both are borrowed
   // rig slots (DESIGN.md §8c) and both reach every path a limb reaches, which
@@ -5396,11 +5397,13 @@ uint32_t Mob::StainWound(int limbIndex, Vec3 centreLocal, float radiusWorld,
   // appended slot that is not part of the authored rig is luggage.
   if (IsWornSlot(limbIndex) || limbIndex >= baseLimbs_) return 0;
   const uint32_t stain = def_->woundMat;
-  if (!stain || radiusWorld <= 0.0f) return 0;
+  const bool fromCrater = crater && !crater->empty() && rimCells > 0.0f;
+  if (!stain || (!fromCrater && radiusWorld <= 0.0f)) return 0;
   const auto& gt = CurrentTuning().gore;
   const float density = std::clamp(gt.woundStainDensity, 0.0f, 1.0f);
   const float surface = std::clamp(gt.woundStainSurface, 0.0f, 1.0f);
   if (density <= 0.0f && surface <= 0.0f) return 0;
+  const float coherence = std::clamp(gt.woundStainCoherence, 0.0f, 1.0f);
 
   MobLimb& limb = limbs_[limbIndex];
   const bool fine = limb.HasFineSkin();
@@ -5409,6 +5412,21 @@ uint32_t Mob::StainWound(int limbIndex, Vec3 centreLocal, float radiusWorld,
   const Vec3 c = centreLocal * scale;
   const float r = radiusWorld * scale;
   const float r2 = r * r;
+  // Blotch size in this lattice's own units. Authored in WORLD voxels like
+  // every other radius here, so a fine skin gets a finer-grained field of the
+  // same physical size rather than blotches eight times too big.
+  const float blobL = std::max(0.25f, gt.woundStainBlob) * scale;
+  // DISTANCE TO THE HOLE, when the caller knows where the hole is. Built once
+  // and shared with the smear below, padded by the wider of the two reaches
+  // so neither runs off the end of the field into `1e9`.
+  const float tintRatio = gt.stainCutRadius / std::max(0.05f, gt.woundStainRadius);
+  const float rimL = fromCrater ? rimCells : 0.0f;
+  const float tintL =
+      fromCrater ? rimCells * tintRatio : gt.stainCutRadius * scale;
+  const CellDist craterDist =
+      fromCrater ? BuildCellDist(*crater, (int)std::ceil(std::max(rimL, tintL)) + 1)
+                 : CellDist{};
+  const bool useCrater = fromCrater && !craterDist.Empty();
 
   // WHAT IS EXPOSED. A wound is what you can see of it: the walls of the hole
   // the blade opened and the skin around its mouth take the blood, and a voxel
@@ -5483,9 +5501,21 @@ uint32_t Mob::StainWound(int limbIndex, Vec3 centreLocal, float radiusWorld,
     // Bone stays bone (MobDef::tissue): the hole shows it, the blood is
     // around it.
     if (!tissue.empty() && (mat >= tissue.size() || !tissue[mat])) return;
-    const Vec3 d{lx + 0.5f - c.x, ly + 0.5f - c.y, lz + 0.5f - c.z};
-    const float d2 = d.dot(d);
-    if (d2 >= r2) return;
+    // 0 at the cut, 1 at the rim. A KERF is a ball round a point; a CRATER is
+    // a distance to the cells the carve actually took (phys/bodystain.h
+    // CellDist), which is the difference between blood on the hole and blood
+    // over everything the blast searched.
+    float tt;
+    if (useCrater) {
+      const float dc = craterDist.At((int)lx, (int)ly, (int)lz);
+      if (dc >= rimL) return;
+      tt = dc / rimL;
+    } else {
+      const Vec3 d{lx + 0.5f - c.x, ly + 0.5f - c.y, lz + 0.5f - c.z};
+      const float d2 = d.dot(d);
+      if (d2 >= r2) return;
+      tt = std::sqrt(d2 / r2);
+    }
     // Mottled, not repainted. A uniform swap over the sphere reads as a red
     // limb; a hash-selected fraction weighted toward the cut reads as meat
     // that has bled over itself. Weighted by 1 - t so the rim is only
@@ -5497,13 +5527,27 @@ uint32_t Mob::StainWound(int limbIndex, Vec3 centreLocal, float radiusWorld,
     // reads as a splash of blood with the anatomy showing through it; the
     // buried cells take `woundStainDensity`, low, so what a later cut exposes
     // is meat that has bled a little, not a red interior.
-    const float t = std::sqrt(d2 / r2);
+    const float t = tt;
     const bool onSurface = exposed((int)lx, (int)ly, (int)lz);
     const float chance = (onSurface ? surface : density) * (1.0f - t * t);
     const uint32_t h = Hash3(seed, (uint32_t)((int)lx * 73856093),
                              (uint32_t)((int)ly * 19349663) ^
                                  (uint32_t)((int)lz * 83492791));
-    if ((float)(h & 0xFFFFu) / 65535.0f >= chance) return;
+    // CORRELATED, NOT SPECKLED. An independent draw per voxel has no feature
+    // size, so whatever falloff it is thresholded against, what it paints is
+    // a fine even sprinkle — the same mistake, and the same fix, as the
+    // crater's own carveChunkiness (see ValueNoise3 at the top of this file).
+    // Blending the white draw toward a value-noise field of `woundStainBlob`
+    // makes neighbours take the stain together, and the correlation length IS
+    // the size of a blotch. coherence 0 is the old draw, voxel for voxel.
+    const float white = (float)(h & 0xFFFFu) / 65535.0f;
+    float draw = white;
+    if (coherence > 0.0f) {
+      const float smooth = ValueNoise3(seed ^ 0xB100Du, lx / blobL, ly / blobL,
+                                       lz / blobL);
+      draw = white + (smooth - white) * coherence;
+    }
+    if (draw >= chance) return;
     apply();
     stained++;
   };
@@ -5551,7 +5595,12 @@ uint32_t Mob::StainWound(int limbIndex, Vec3 centreLocal, float radiusWorld,
     const uint32_t stainType = sys_ ? sys_->StainTypeOf(def_->woundMat) : 0u;
     CutSoak soak;
     soak.type = stainType ? stainType : (sys_ ? sys_->StainTypeOf(def_->bleedMat) : 0u);
-    soak.radius = gt.stainCutRadius * scale;
+    // THE TINT REACHES PAST THE REWRITE IN THE RATIO THE TWO ARE AUTHORED IN
+    // (stainCutRadius 1.6 : woundStainRadius 0.9). For a kerf that is exactly
+    // stainCutRadius * scale and nothing moves; for a crater it is that ratio
+    // of the rim, measured off the same distance field.
+    soak.radius = tintL;
+    if (useCrater) soak.from = &craterDist;
     soak.amountExposed = gt.stainCutAmount;
     soak.amountBuried = gt.stainCutBuried;
     soak.buriedChance = gt.stainCutBuriedChance;
@@ -6700,7 +6749,8 @@ void Mob::EmitCarvedFragment(const MobLimb& src, uint32_t physScale,
 bool Mob::CarveLimb(int limbIndex, World& world,
                           std::vector<ParticleSpawn>& spawns, bool eject,
                           const LimbCarveFactory& carveAt,
-                          const CarveSpall* spall) {
+                          const CarveSpall* spall, CarveReport* report) {
+  if (report) *report = CarveReport{};
   // Burning leaves material-0 TOMBSTONES in the lattice between its batched
   // flushes, and every reader of the lattice has to see past them: counting
   // them as present would over-report the limb's volume (so a limb burnt to a
@@ -6742,9 +6792,16 @@ bool Mob::CarveLimb(int limbIndex, World& world,
   // to serve, so the skin gets its own say.
   bool skinRemoved = false;
   // Accumulated DURING the erase: once a voxel is gone the predicate can no
-  // longer be asked where it was.
+  // longer be asked where it was. The sum of squares rides along so the
+  // spread of the loss (CarveReport::radiusLocal) costs one more accumulator
+  // instead of keeping every lost skin position -- rms^2 = E[|v|^2] - |E[v]|^2.
   Vec3 skinLostSum{};
+  float skinLostSq = 0.0f;
   size_t skinLostN = 0;
+  // The cells themselves, for a caller that wants to measure FROM the hole.
+  // Only when asked: a burning limb carves itself dozens of times a second
+  // and has no use for the list.
+  std::vector<IVec3> skinLostCells;
   if (fine) {
     const auto keepSkin = carveAt((float)std::max(1u, SkinScaleOf(limb)));
     const size_t before = limb.skinVoxels.size();
@@ -6752,9 +6809,11 @@ bool Mob::CarveLimb(int limbIndex, World& world,
         std::remove_if(limb.skinVoxels.begin(), limb.skinVoxels.end(),
                        [&](const PrefabVoxel& v) {
                          if (keepSkin(v.x, v.y, v.z)) return false;
-                         skinLostSum +=
-                             Vec3{(float)v.x, (float)v.y, (float)v.z};
+                         const Vec3 p{(float)v.x, (float)v.y, (float)v.z};
+                         skinLostSum += p;
+                         skinLostSq += p.dot(p);
                          skinLostN++;
+                         if (report) skinLostCells.push_back({v.x, v.y, v.z});
                          return true;
                        }),
         limb.skinVoxels.end());
@@ -6839,9 +6898,11 @@ bool Mob::CarveLimb(int limbIndex, World& world,
             std::remove_if(limb.skinVoxels.begin(), limb.skinVoxels.end(),
                            [&](const PrefabVoxel& v) {
                              if (!doomed(v.x, v.y, v.z)) return false;
-                             skinLostSum +=
-                                 Vec3{(float)v.x, (float)v.y, (float)v.z};
+                             const Vec3 p{(float)v.x, (float)v.y, (float)v.z};
+                             skinLostSum += p;
+                             skinLostSq += p.dot(p);
                              skinLostN++;
+                             if (report) skinLostCells.push_back({v.x, v.y, v.z});
                              return true;
                            }),
             limb.skinVoxels.end());
@@ -6971,27 +7032,60 @@ bool Mob::CarveLimb(int limbIndex, World& world,
   // The HP CHARGE above is deliberately outside both: fire still kills you, and
   // a burnt shell still loses its own durability. Only the blood is refused.
   const bool bleeds = !inBurnFlush_ && !IsWornSlot(limbIndex);
-  if (def.bleedMat && bleeds) {
-    // Centroid of what was removed, in limb-local WORLD voxels — the frame
-    // woundLocal is read in (PreTick rotates it by the limb's live quat).
-    // Taken on whichever lattice actually registered the carve, then divided
-    // by THAT lattice's scale.
-    Vec3 c{};
-    size_t n = 0;
-    if (!removed.empty()) {
-      for (const DebrisVoxel& v : removed)
-        c += Vec3{(float)v.x, (float)v.y, (float)v.z};
-      n = removed.size();
-      c = c * (1.0f / (float)n / (float)std::max(1u, PhysScaleOf(limb)));
-    } else if (skinLostN) {
-      // Collider too coarse to notice, skin was not: fall back to the skin's
-      // own account of where the damage landed rather than leaving the wound
-      // at wherever the last one happened to be.
-      n = skinLostN;
-      c = skinLostSum *
-          (1.0f / (float)n / (float)std::max(1u, SkinScaleOf(limb)));
+  // ---- WHERE THE MATTER ACTUALLY LEFT ---------------------------------------
+  // Centroid and spread of what was removed, in limb-local WORLD voxels — the
+  // frame woundLocal is read in (PreTick rotates it by the limb's live quat).
+  // Taken on whichever lattice actually registered the carve, then divided by
+  // THAT lattice's scale. Computed unconditionally (not inside the bleed
+  // branch it was born in) because the caller's CarveReport wants the same
+  // answer whether or not this creature has blood in it.
+  Vec3 carveC{};
+  size_t carveN = 0;
+  float carveSpread = 0.0f;
+  if (!removed.empty()) {
+    float sq = 0.0f;
+    for (const DebrisVoxel& v : removed) {
+      const Vec3 p{(float)v.x, (float)v.y, (float)v.z};
+      carveC += p;
+      sq += p.dot(p);
     }
-    if (n) limb.woundLocal = c;
+    carveN = removed.size();
+    const float inv = 1.0f / (float)std::max(1u, PhysScaleOf(limb));
+    carveC = carveC * (1.0f / (float)carveN);
+    carveSpread =
+        std::sqrt(std::max(0.0f, sq / (float)carveN - carveC.dot(carveC))) * inv;
+    carveC = carveC * inv;
+  } else if (skinLostN) {
+    // Collider too coarse to notice, skin was not: fall back to the skin's
+    // own account of where the damage landed rather than leaving the wound
+    // at wherever the last one happened to be.
+    carveN = skinLostN;
+    const float inv = 1.0f / (float)std::max(1u, SkinScaleOf(limb));
+    carveC = skinLostSum * (1.0f / (float)carveN);
+    carveSpread =
+        std::sqrt(std::max(0.0f,
+                           skinLostSq / (float)carveN - carveC.dot(carveC))) *
+        inv;
+    carveC = carveC * inv;
+  }
+  if (report && carveN) {
+    report->count = (uint32_t)carveN;
+    report->centreLocal = carveC;
+    report->radiusLocal = carveSpread;
+    // On the AUTHORITATIVE lattice, which is the one StainWound walks: the
+    // skin's own list when there is a skin, else the collider's `removed`
+    // (which on a fine skin is the collider DELTA and describes a different
+    // lattice altogether).
+    if (fine) {
+      report->cells = std::move(skinLostCells);
+    } else {
+      report->cells.reserve(removed.size());
+      for (const DebrisVoxel& v : removed)
+        report->cells.push_back({v.x, v.y, v.z});
+    }
+  }
+  if (def.bleedMat && bleeds) {
+    if (carveN) limb.woundLocal = carveC;
     limb.bleedBudget = AddBleedBudget(limb.bleedBudget,
                                       lost * (float)at0 * def.bleedPerDamage);
   }
@@ -9015,6 +9109,7 @@ bool Mob::CarveLimbRadial(uint64_t bodyHandle, Vec3 centerWorldVoxel,
     }
     const Mob::CarveSpall* spallPtr = wantSpall ? &spallData : nullptr;
 
+    Mob::CarveReport rep{};
     const bool alive = CarveLimb(
         (int)i, world, spawns, eject,
         [&, cBody, seed, jitterScale, chunk, falloffExp,
@@ -9074,13 +9169,40 @@ bool Mob::CarveLimbRadial(uint64_t bodyHandle, Vec3 centerWorldVoxel,
             return draw >= chance;
           };
         },
-        spallPtr);
+        spallPtr, &rep);
     // SEVERED OR DEAD: nothing below may touch `limbs_` (CutLimb's contract).
     if (!alive) return true;
-    // A crater is a wound. The blast path never soaked its rim until
-    // 2026-09-13, so a bullet hole or a blast crater showed clean flesh and
-    // clean bone; same soak the blade's kerf gets, sized to the crater.
-    StainWound((int)i, cBody, radiusVoxels + 0.5f, seed ^ 0xC7A7E7u);
+    // ---- A CRATER IS A WOUND, AND THE WOUND IS THE CRATER -------------------
+    // The blast path never soaked its rim until 2026-09-13, so a bullet hole
+    // or a blast crater showed clean flesh and clean bone. The first fix
+    // soaked the BLAST SPHERE -- `StainWound(cBody, radiusVoxels + 0.5)` --
+    // which is a different volume entirely: CarveRadialAll calls this for
+    // every limb whose bounding sphere is within `radius + r + 2`, and the
+    // sphere is the region the crater predicate SEARCHED, not the hole it
+    // made. A small explosion beside a standing figure therefore speckled
+    // every limb it could reach, at 0.9 chance on exposed flesh at the
+    // centre, whether or not a single voxel had come off that limb -- the
+    // owner's report, in one line: "explosions that cause minor damage cause
+    // way too much random noisily spread blood spatter".
+    //
+    // So: the soak goes exactly where matter actually left, and nowhere else.
+    // No voxels removed from this limb, no blood on it. Its extent is the
+    // crater's own RMS spread (CarveReport) plus the kerf soak radius the
+    // blade path uses, which for a solid hemispherical bite lands at about
+    // the crater's mouth without a fudge factor, and is a blood SPOT for a
+    // graze that took three voxels. Never wider than the blast that made it.
+    //
+    // ...and IT IS MEASURED FROM THE CELLS, NOT FROM THEIR CENTROID. The first
+    // attempt at this soaked a ball at the crater's centroid sized to its RMS
+    // spread, which is still the wrong shape: the crater predicate removes
+    // with a chance that falls to zero at the rim, so a graze is a SCATTER
+    // across the whole sphere whose centroid is inside the limb. The
+    // `blast-stain` gate measured it — 8 of 1344 voxels lost, 305 rewritten.
+    // `gore.craterStainRim` cells past the removed cells themselves is the
+    // rule that actually says "where voxels were removed".
+    if (rep.count == 0 || rep.cells.empty()) return true;
+    StainWound((int)i, rep.centreLocal, 0.0f, seed ^ 0xC7A7E7u, &rep.cells,
+               gt.craterStainRim);
     return true;
   }
   return false;

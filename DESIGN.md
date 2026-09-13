@@ -3608,6 +3608,41 @@ bodies that have actually been bloodied.
   voxel; buried ones `stainCutBuried` at `stainCutBuriedChance`. Bone (not
   `MobDef::tissue`) is never REWRITTEN but always STAINED: `stainBoneMin`
   floors any exposed bone in range, so bone reads as blood-smeared bone.
+- **...and A CRATER IS NOT A KERF** (2026-09-13, owner report: "explosions
+  that cause minor damage cause way too much random noisily spread blood
+  spatter"; gate `blast-stain`). The blast path first asked for the BLAST
+  SPHERE -- `StainWound(cBody, radiusVoxels + 0.5)` -- and that is two wrong
+  volumes at once. `CarveRadialAll` calls the carve for every limb within
+  `radius + r + 2`, so a limb the blast took nothing from was soaked anyway;
+  and the sphere is what the crater predicate SEARCHED, not the hole it made,
+  while the outer skin is "exposed" by definition, so at `woundStainSurface`
+  0.9 a graze repainted most of the limb's visible surface. Measured on the
+  human's upper leg: **8 of 1344 voxels lost, 305 rewritten and 907 stained**
+  (23% and 67% of the limb).
+  Three rules replace it, and the middle one is the whole idea.
+  (a) `Mob::CarveLimb` reports what it actually removed (`CarveReport`:
+  count, centroid, RMS spread, and the CELLS), and a limb with `count == 0`
+  is not soaked at all. (b) The taper is a distance to **the removed cells**,
+  not to their centroid -- `BuildCellDist` / `CellDist` in bodystain.h, a
+  3-4-5 chamfer over a box round them, shared by the rewrite and the tint.
+  A centroid ball is still the wrong shape, because the crater predicate's
+  falloff means a graze is a SCATTER across the whole sphere whose centroid
+  is inside the limb. (c) `gore.craterStainRim` LATTICE CELLS past those
+  cells is the whole reach (the tint rides at the authored
+  `stainCutRadius : woundStainRadius` ratio of it), so the blood is the size
+  of the hole whether that is a scratch or a bite. Same fixture after:
+  **8 lost, 7 rewritten, 111 stained**. The kerf path is untouched -- every
+  blade caller still passes a centre and `woundStainRadius`, and with no
+  crater the ball and the old `stainCutRadius * scale` tint are what run.
+- **...and white noise cannot make a smear.** The soak's per-voxel chances
+  were independent draws, which have no feature size, so what they painted
+  was an even red sprinkle -- the same mistake `carveChunkiness` exists to
+  fix for the crater itself. `woundStainCoherence` blends the draw toward a
+  `ValueNoise3` field of `woundStainBlob` world voxels (0 = the old draw
+  voxel for voxel). The blob must be SMALLER than the wound it mottles: at
+  the first default of 1.6 world voxels the field was constant across a
+  3-cell nick and the coherence went all-or-nothing (7 rewritten or 0,
+  depending on the seed), hence 0.5.
 - **Splatter** (`SplatterEvent`; `Mob::BleedTick` queues one per gout tick
   and per drip spray, `MobSystem::StainLimbs` replays it against every
   creature's limbs, `PlayerAvatar::PreTick` against the player's). The GPU
