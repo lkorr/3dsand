@@ -1,6 +1,7 @@
 #include "phys/physics.h"
 
 #include <algorithm>
+#include <chrono>
 #include <cstdarg>
 #include <cstdio>
 #include <cstdlib>
@@ -364,27 +365,58 @@ uint64_t Physics::CreateDebrisBodyXf(const std::vector<DebrisVoxel>& voxels,
   if (!system_ || voxels.empty()) return 0;
   if (!(voxelPitch > 0.0f)) voxelPitch = 1.0f;
 
+  // SANDVOX_PHYS_PROFILE=1 prints one line per body splitting the birth cost
+  // into the greedy merge, Jolt's compound build (a BVH over the boxes) and
+  // CreateAndAddBody, so a slow birth tick names its term without a rebuild.
+  static const bool kProfile = [] {
+    const char* e = std::getenv("SANDVOX_PHYS_PROFILE");
+    return e && e[0] != '0';
+  }();
+  using Clock = std::chrono::steady_clock;
+  const Clock::time_point t0 = kProfile ? Clock::now() : Clock::time_point{};
+
   // greedy box merge over the local voxel set (runs in +x, extended in +y,
-  // then +z) — keeps compound shapes small for compact islands
-  std::unordered_map<uint64_t, uint16_t> cell;  // packed local -> voxel index
-  auto key = [](int x, int y, int z) {
-    return ((uint64_t)(uint8_t)x << 16) | ((uint64_t)(uint8_t)y << 8) | (uint8_t)z;
-  };
-  int maxc[3] = {0, 0, 0};
-  for (size_t i = 0; i < voxels.size(); i++) {
-    const DebrisVoxel& v = voxels[i];
-    cell[key(v.x, v.y, v.z)] = (uint16_t)i;
+  // then +z) — keeps compound shapes small for compact islands.
+  //
+  // The occupancy is a DENSE byte lattice over the body's bounding box, not a
+  // hash map: a body is an int8 lattice (<= 128 a side; the tree-fell oak is
+  // 51x90x51 = 232 KB), and the merge probes it once per voxel per axis of
+  // extension. With two unordered_maps the merge was 8.3 ms of the 8.6 ms
+  // birth of that 28,478-voxel tree (Jolt's compound build was 0.3 ms); the
+  // byte lattice is the same walk in the same order — identical box set, so
+  // identical collider and resting pose — at memory speed. 0 = absent,
+  // 1 = present, 2 = already inside a merged box.
+  int minc[3] = {127, 127, 127}, maxc[3] = {-128, -128, -128};
+  for (const DebrisVoxel& v : voxels) {
+    minc[0] = std::min(minc[0], (int)v.x);
+    minc[1] = std::min(minc[1], (int)v.y);
+    minc[2] = std::min(minc[2], (int)v.z);
     maxc[0] = std::max(maxc[0], (int)v.x);
     maxc[1] = std::max(maxc[1], (int)v.y);
     maxc[2] = std::max(maxc[2], (int)v.z);
   }
-  std::unordered_map<uint64_t, bool> used;
+  const int ex = maxc[0] - minc[0] + 1, ey = maxc[1] - minc[1] + 1,
+            ez = maxc[2] - minc[2] + 1;
+  // A box never extends into negative local coordinates (the original rule,
+  // kept), so the low probe bound is max(0, min) per axis.
+  const int lo[3] = {std::max(0, minc[0]), std::max(0, minc[1]),
+                     std::max(0, minc[2])};
+  std::vector<uint8_t> occ((size_t)ex * ey * ez, 0);
+  auto idx = [&](int x, int y, int z) {
+    return ((size_t)(z - minc[2]) * ey + (size_t)(y - minc[1])) * ex +
+           (size_t)(x - minc[0]);
+  };
+  for (const DebrisVoxel& v : voxels) occ[idx(v.x, v.y, v.z)] = 1;
   auto has = [&](int x, int y, int z) {
-    return x >= 0 && y >= 0 && z >= 0 &&
-           cell.count(key(x, y, z)) && !used[key(x, y, z)];
+    return x >= lo[0] && y >= lo[1] && z >= lo[2] && x <= maxc[0] &&
+           y <= maxc[1] && z <= maxc[2] && occ[idx(x, y, z)] == 1;
   };
 
   JPH::StaticCompoundShapeSettings compound;
+  // The box cap below bounds the sub-shape list, so this reserve is exact for
+  // a capped body and an upper bound (n voxels = n boxes at worst) otherwise;
+  // it keeps Jolt's Array from regrowing under 1024 pushes.
+  compound.mSubShapes.reserve(std::min<size_t>(voxels.size(), 1024));
   float totalMass = 0;
   // One supplied voxel is `voxelPitch` world voxels on a side, so its physical
   // volume is (pitch * kVoxelMeters)^3. A scale-2 limb has 8x the voxels at 1/8
@@ -400,8 +432,9 @@ uint64_t Physics::CreateDebrisBodyXf(const std::vector<DebrisVoxel>& voxels,
   }
 
   int boxes = 0;
+  size_t covered = 0;  // voxels inside a box: below voxels.size() once the cap bites
   for (const DebrisVoxel& v : voxels) {
-    if (used[key(v.x, v.y, v.z)]) continue;
+    if (occ[idx(v.x, v.y, v.z)] == 2) continue;
     // extend +x
     int sx = 1;
     while (has(v.x + sx, v.y, v.z)) sx++;
@@ -422,7 +455,7 @@ uint64_t Physics::CreateDebrisBodyXf(const std::vector<DebrisVoxel>& voxels,
     }
     for (int k = 0; k < sz; k++)
       for (int j = 0; j < sy; j++)
-        for (int i = 0; i < sx; i++) used[key(v.x + i, v.y + j, v.z + k)] = true;
+        for (int i = 0; i < sx; i++) occ[idx(v.x + i, v.y + j, v.z + k)] = 2;
 
     JPH::Vec3 half(VoxToM(sx * 0.5f * voxelPitch), VoxToM(sy * 0.5f * voxelPitch),
                    VoxToM(sz * 0.5f * voxelPitch));
@@ -435,15 +468,18 @@ uint64_t Physics::CreateDebrisBodyXf(const std::vector<DebrisVoxel>& voxels,
     compound.AddShape(center, JPH::Quat::sIdentity(),
                       new JPH::BoxShape(half, 0.01f * voxelPitch));
     boxes++;
+    covered += (size_t)sx * sy * sz;
     if (boxes >= 1024) break;  // pathological shapes get a truncated collider
   }
 
+  const Clock::time_point t1 = kProfile ? Clock::now() : Clock::time_point{};
   auto shapeResult = compound.Create();
   if (shapeResult.HasError()) {
     std::fprintf(stderr, "debris shape error: %s\n",
                  shapeResult.GetError().c_str());
     return 0;
   }
+  const Clock::time_point t2 = kProfile ? Clock::now() : Clock::time_point{};
 
   JPH::Quat q(xf.quat[0], xf.quat[1], xf.quat[2], xf.quat[3]);
   if (q.LengthSq() < 1e-6f) q = JPH::Quat::sIdentity();
@@ -467,6 +503,18 @@ uint64_t Physics::CreateDebrisBodyXf(const std::vector<DebrisVoxel>& voxels,
 
   JPH::BodyInterface& bi = system_->GetBodyInterface();
   JPH::BodyID id = bi.CreateAndAddBody(bcs, JPH::EActivation::Activate);
+  if (kProfile) {
+    const Clock::time_point t3 = Clock::now();
+    auto us = [](Clock::time_point a, Clock::time_point b) {
+      return std::chrono::duration<double, std::micro>(b - a).count();
+    };
+    std::printf(
+        "[phys-prof] body %zu vox extent %dx%dx%d -> %d boxes covering %zu: "
+        "merge %.0f us, compound.Create %.0f us, CreateAndAddBody %.0f us "
+        "(total %.0f us)\n",
+        voxels.size(), ex, ey, ez, boxes, covered, us(t0, t1), us(t1, t2),
+        us(t2, t3), us(t0, t3));
+  }
   if (id.IsInvalid()) return 0;
   uint64_t h = FromBodyID(id);
   dynamicBodies_.push_back(h);
