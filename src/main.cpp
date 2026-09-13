@@ -10322,6 +10322,25 @@ int main(int argc, char** argv) {
                           sandvox::kPerfNodes[n].node, gsum[n] / (double)v.size(),
                           v[(size_t)(0.50 * (v.size() - 1))],
                           v[(size_t)(0.99 * (v.size() - 1))], v.back());
+              // A node that only runs for PART of the run (drawBodies while a
+              // felled tree is a body, before settle-back returns it to the
+              // grid) has a whole-run mean and p50 that say how long it ran,
+              // not what it cost: the same 28k-voxel oak read p50 0.000 with a
+              // 300-tick body life and p50 1.1 with a standing one. The row
+              // that answers "what does a frame WITH it cost" is the one over
+              // the frames it was measurably in.
+              size_t firstOn = 0;
+              while (firstOn < v.size() && v[firstOn] < 0.05) firstOn++;
+              const size_t on = v.size() - firstOn;
+              if (on > 0 && on < v.size() * 9 / 10) {
+                double onSum = 0;
+                for (size_t i = firstOn; i < v.size(); i++) onSum += v[i];
+                std::printf("    %-16s %8.3f %8.3f %8.3f %8.3f  (%zu of %zu frames)\n",
+                            "  ^ frames >0.05", onSum / (double)on,
+                            v[firstOn + (size_t)(0.50 * (on - 1))],
+                            v[firstOn + (size_t)(0.99 * (on - 1))], v.back(), on,
+                            v.size());
+              }
             }
           }
         }
