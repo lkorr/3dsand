@@ -610,6 +610,12 @@ struct Tuning {
     int collisionSteps = 1;
     float debrisFriction = 0.75f, debrisRestitution = 0.05f;
     float debrisLinearDamping = 0.05f, debrisAngularDamping = 0.15f;
+    // Drag a rigidbody feels from the LIQUID it is in, as opposed to the air
+    // damping above (docs/PLAN_debris_buoyancy.md phase 3). Jolt's own
+    // buoyancy coefficients: linear is a quadratic drag against the submerged
+    // frontal area, angular damps the tumble. The pair is what makes a floating
+    // log stop wallowing and go to sleep instead of bobbing forever.
+    float waterLinearDrag = 0.8f, waterAngularDrag = 0.25f;
     float terrainFriction = 0.85f, playerProxyFriction = 0.3f;
     float explosionImpulseScale = 0.15f;
     float explosionImpulseRadiusScale = 3.0f;
@@ -1444,6 +1450,12 @@ struct Tuning {
   struct Sim {
     int partGravity = 22;        // 24.8 fixed voxels/tick^2
     int partMaxVel = 1536;       // 24.8 fixed voxels/tick
+    // ---- a voxel in flight, inside a liquid (materials.json "fluid") ----
+    // Buoyancy itself is per material (density vs the liquid's); these three are
+    // the parts that are a property of the SYSTEM rather than of a substance.
+    int partBuoyMax = 88;        // ceiling on the buoyant term, 24.8/tick^2 (4 g)
+    int partSettleSpeed = 24;    // below this speed a floater looks for a berth
+    int partFloatPatience = 180; // ticks it may hunt before it takes any cell
     int airDensity = 10;         // density below which things rise
     int falloffPerCell = 6;      // explosion power lost per cell
     int ejectSolid = 250;        // per-mille of destroyed voxels that fly

@@ -2072,6 +2072,9 @@ void DebrisSystem::PreTick(uint32_t tick, World& world, std::vector<CellOp>& cel
   }
   { PhaseTimer pt(prof_, Phase::Burn); BurnBodies(tick, world, cellOps, spawns); }
   { PhaseTimer pt(prof_, Phase::Bleed); BleedBodies(tick, world, spawns); }
+  // Before the settle test, not after: buoyancy is what decides whether a body
+  // is still moving this tick, and SettleBodies counts inactive ticks.
+  FloatBodies(tick, world);
   { PhaseTimer pt(prof_, Phase::Settle); SettleBodies(tick, world, cellOps); }
   ManageTerrain(tick, world);
   if (prof_.on) {
@@ -2315,6 +2318,115 @@ bool DebrisSystem::SettleFootprintSupported(const std::vector<DebrisVoxel>& src,
   // a body and is re-tested in 30 ticks, by which time the chunk is here.
   (void)sawUnknown;
   return false;
+}
+
+// ---- Archimedes for rigid bodies (PLAN_debris_buoyancy.md phase 3) ---------
+//
+// A tree blown apart produces both populations: the chips that fly are
+// particles and sink or float by sim_particle.wgsl's own rules, and the
+// severed remainder is a Jolt body. Liquids are not in the collider — a body
+// falls through water as though it were air — so before this a floating log
+// was not slow, it was on the lake BED.
+//
+// The work is one plane and one impulse. Jolt computes the submerged volume
+// from the collider exactly, per sub-shape, and applies the lift at the centre
+// of the submerged part rather than at the centre of mass; that is what makes a
+// half-beached log right itself and a raft bob instead of sliding down like a
+// lift. Nothing here integrates anything.
+//
+// THE COST ARGUMENT, since this runs over every body every tick: the dry case
+// is TWO mirror reads (the cell under the body, then the body's own cell) and a
+// return. Only a body that is actually touching liquid walks a column, and that
+// walk is capped. Bodies asleep are skipped before any of it, which is also
+// what lets a raft that has come to rest stay asleep (rule 2) — buoyancy is not
+// applied to a sleeping body and therefore cannot be the reason one never
+// sleeps.
+void DebrisSystem::FloatBodies(uint32_t tick, World& world) {
+  (void)tick;
+  if (!phys_ || bodies_.empty()) return;
+  const float dt = 1.0f / kSimTicksPerSecond;
+  const float linDrag = CurrentTuning().physics.waterLinearDrag;
+  const float angDrag = CurrentTuning().physics.waterAngularDrag;
+
+  // One-chunk memo: a column walk hits the same chunk 16 times running, and
+  // World::Cached is a hash lookup. Nothing is cached ACROSS bodies — a stale
+  // pointer there would outlive a streaming eviction.
+  IVec3 memoWc{INT32_MIN, INT32_MIN, INT32_MIN};
+  const CachedChunk* memoCc = nullptr;
+  // Material id at a world cell, or 0xFFFF for "cannot see" — distinct from 0
+  // (air), because "no water here" and "no idea" must not be the same answer.
+  auto matAt = [&](int x, int y, int z) -> uint32_t {
+    if (!world.CellInWindow({x, y, z})) return 0xFFFFu;
+    IVec3 wc = ChunkOfCell(x, y, z);
+    if (wc.x != memoWc.x || wc.y != memoWc.y || wc.z != memoWc.z) {
+      memoWc = wc;
+      memoCc = world.Cached(wc);
+    }
+    if (!memoCc || memoCc->voxels.size() != kChunkVol) return 0xFFFFu;
+    return memoCc->voxels[((uint32_t)(z & 15) * kChunk + (uint32_t)(y & 15)) *
+                              kChunk + (uint32_t)(x & 15)] & 0xFFFu;
+  };
+  auto isLiquid = [&](uint32_t mat) {
+    return mat != 0 && mat != 0xFFFFu && mat < matGpu_.size() &&
+           matGpu_[mat].klass == CLASS_LIQUID;
+  };
+
+  for (Body& b : bodies_) {
+    // No follower test: a driven body (a garment strapped to the limb it
+    // covers) is KINEMATIC, and ApplyBuoyancy refuses anything that is not
+    // dynamic. One guard, in the place that knows why.
+    if (b.handle == 0) continue;
+    if (b.domMat == 0 || b.domMat >= matGpu_.size()) continue;
+    const MaterialGpu& mg = matGpu_[b.domMat];
+    const uint32_t lift =
+        (mg.fluidPack >> kFluidPackLiftShift) & kFluidPackLiftMask;
+    if (lift == 0) continue;  // this stuff does not interact with liquids
+    if (!phys_->IsActive(b.handle)) continue;  // asleep: let it lie
+    Vec3 com;
+    if (!phys_->BodyCenterOfMass(b.handle, com)) continue;
+
+    // Is any of it wet? Under-side first: a floating body's centre is in the
+    // air and only its keel is in the water, which is the case that matters and
+    // also the cheapest to ask about.
+    floaters_.floatProbes++;
+    const int cx = ifloor(com.x), cz = ifloor(com.z);
+    const int comY = ifloor(com.y);
+    const int keelY = ifloor(com.y - b.radiusVoxels);
+    uint32_t mat = matAt(cx, keelY, cz);
+    int seedY = keelY;
+    if (!isLiquid(mat)) {
+      mat = matAt(cx, comY, cz);
+      seedY = comY;
+      if (!isLiquid(mat)) continue;  // dry: two reads and out
+    }
+    floaters_.floatProbesWet++;
+
+    // Walk up to the waterline. Capped: a body at the bottom of an ocean
+    // trench must not walk the whole column, and being wrong about the surface
+    // height by the cap only means a deeply submerged body is pushed up with a
+    // slightly smaller plane above it — it is going up either way.
+    constexpr int kMaxColumnWalk = 96;
+    int surfY = seedY + 1;
+    for (int i = 0; i < kMaxColumnWalk; i++) {
+      const uint32_t m = matAt(cx, surfY, cz);
+      if (!isLiquid(m)) break;
+      surfY++;
+    }
+
+    // Jolt's parameter IS rhoFluid/rhoBody (1 = neutral, >1 floats), which is
+    // the same ratio sim_particle.wgsl uses for a voxel in flight, off the same
+    // `density` field. `lift` scales it toward neutral rather than toward zero:
+    // a half-lift material should be half as buoyant, not weightless.
+    const float rhoF = (float)matGpu_[mat].density;
+    const float rhoB = (float)std::max(1, matGpu_[b.domMat].density);
+    const float full = rhoF / rhoB;
+    const float buoy = 1.0f + (full - 1.0f) * ((float)lift / (float)kFluidMax);
+    if (phys_->ApplyBuoyancy(b.handle, (float)surfY, buoy, linDrag, angDrag,
+                             dt)) {
+      floaters_.floatedBodies++;
+      floaters_.floatLastSurfaceY = (float)surfY;
+    }
+  }
 }
 
 void DebrisSystem::SettleBodies(uint32_t tick, World& world,

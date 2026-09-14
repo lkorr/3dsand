@@ -702,6 +702,19 @@ class DebrisSystem {
     uint32_t deferredBodyCap = 0;      // an assembly did not fit kMaxBodies
     uint32_t shardsMade = 0;           // bodies cut from islands
     uint32_t weldsMade = 0;            // fixed joints between shards
+    // ---- buoyancy (FloatBodies) -------------------------------------------
+    // `floatedBodies` is impulses applied, not bodies afloat: one body being
+    // pushed for 40 ticks counts 40, which is what a rate question wants.
+    // `floatProbesWet` against `floatProbes` is the cost claim — the dry case
+    // is meant to be two mirror reads and out, so a ratio near 1 means the
+    // early-out is not working and every body in the world is scanning a
+    // column it will never be in.
+    uint32_t floatedBodies = 0;
+    uint32_t floatProbes = 0;
+    uint32_t floatProbesWet = 0;
+    // The last waterline FloatBodies acted on, so a gate can say WHERE a body
+    // is floating rather than only that something was pushed.
+    float floatLastSurfaceY = 0;
   };
   const FloaterProbe& Floaters() const { return floaters_; }
   void ResetFloaterProbe() { floaters_ = FloaterProbe{}; }
@@ -1017,6 +1030,13 @@ class DebrisSystem {
   // its voxels to CellOps (fill-air-only: grid content wins deterministically
   // on the GPU) and frees its body. At most one body per tick.
   void SettleBodies(uint32_t tick, World& world, std::vector<CellOp>& cellOps);
+  // Archimedes for bodies (docs/PLAN_debris_buoyancy.md phase 3). A felled
+  // trunk is not particles — it is one Jolt body, and liquids are not in the
+  // collider, so before this it sank through a lake like a stone. Reads the
+  // waterline out of the CPU mirror and hands Jolt a surface plane; the
+  // buoyancy factor is rhoLiquid/rhoBody off the same materials.json density
+  // the particle kernel uses, so a chip blown off a log and the log agree.
+  void FloatBodies(uint32_t tick, World& world);
 
   Physics* phys_ = nullptr;
   World* world_ = nullptr;

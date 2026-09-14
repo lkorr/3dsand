@@ -1020,6 +1020,26 @@ Noita's "Bloody Zombies" technique, on GPU:
 - Particles integrate ballistically each tick, DDA-stepping through the grid;
   on hitting a non-empty voxel they **reinsert into the grid** at the last empty
   cell (waking that chunk).
+- **A LIQUID IS NOT A WALL** (2026-09-13, `docs/PLAN_debris_buoyancy.md`). It was
+  one until then — "splash = plop onto the surface" — and that is what built
+  rafts of exploded tree hanging over a pond: the first chip stopped on the
+  film, the next was blocked by the first, and no CA rule moves a solid touching
+  another solid. A particle whose material authors `fluid.lift > 0` now flies
+  THROUGH a liquid under buoyancy (`g · ρfluid/ρself`, capped) and viscous
+  damping, so which way it goes is `density` and not a knob, and the damping is
+  what makes the rise/overshoot/fall converge to a bob rather than oscillate.
+  Three consequences for reinsertion, all of them load-bearing: a particle may
+  take a cell holding a liquid it is **denser than** (a sinking rock's resting
+  cell is water, and the displaced eighths are dropped exactly as
+  `sim_mutate.wgsl` drops them — displacement raises the level of a whole body
+  of water, which is not a write this pass can reach); it may only settle where
+  something **supports** it, or neutrally buoyant matter converts to a voxel
+  hanging mid-water; and a floater that finds its berth taken **drifts** instead
+  of reinserting on top of it. `sim.partFloatPatience` wet ticks bound the hunt,
+  so a pond too small for the debris thrown into it jams into a pile rather than
+  keeping particles alive forever (rule 2). `lift == 0` is the opt-out and keeps
+  every older behaviour: micro spray, and liquid/gas ejecta, whose landing in
+  its own liquid is a MERGE and a different rule than this one.
 - This is what makes liquids splash instead of blob, and it's the standard
   mechanism whenever the grid must yield space (rigidbody pushes through water →
   water voxels eject as particles).

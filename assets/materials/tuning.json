@@ -163,6 +163,8 @@
     "debrisRestitution": 0.05,
     "debrisLinearDamping": 0.05,
     "debrisAngularDamping": 0.15,
+    "waterLinearDrag": 0.8,
+    "waterAngularDrag": 0.25,
     "terrainFriction": 0.85,
     "playerProxyFriction": 0.3,
     "explosionImpulseScale": 0.15,
@@ -384,6 +386,9 @@
   "sim": {
     "partGravity": 22,
     "partMaxVel": 1536,
+    "partBuoyMax": 88,
+    "partSettleSpeed": 24,
+    "partFloatPatience": 180,
     "airDensity": 10,
     "falloffPerCell": 6,
     "ejectSolid": 250,

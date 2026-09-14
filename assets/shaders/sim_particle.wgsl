@@ -13,6 +13,7 @@
 @group(0) @binding(2) var<storage, read_write> dirtyOut : array<atomic<u32>>;
 @group(0) @binding(3) var<storage, read>       materials : array<Material>;
 @group(0) @binding(4) var<uniform> T : TickParams;
+@group(0) @binding(15) var<storage, read_write> supportOut : array<atomic<u32>>;
 @group(0) @binding(17) var<storage, read>       pageTable : array<u32>;
 @group(0) @binding(18) var<storage, read_write> pageFaults : array<atomic<u32>>;
 // This module's page-fault identity (common.wgsl's PT_K_* block). Every
@@ -43,12 +44,111 @@ const PART_WIND_SCALE : i32 = 7680;
 const PART_WIND_DRAG : i32 =
     i32(round(clamp(TUNE_WIND_DRAG, 0.0, 30.0) * 65536.0 / 30.0));
 
-// Blocks flight: solids, powders and liquids (splash = plop onto the surface).
-fn blocksParticle(c : vec3<i32>) -> bool {
+// ---- liquids (materials.json "fluid", kFluidPack* in src/sim/materials.h) ---
+// A voxel in flight used to stop dead at a water surface — "splash = plop onto
+// the surface" — and that single line is what built rafts of exploded tree in
+// mid-air over a pond: the first chip landed on the film, the next was blocked
+// by the first, and the CA has no rule that moves a solid touching another
+// solid, so the tower stood there forever.
+//
+// A liquid is now something a particle flies THROUGH, with two forces acting on
+// it while it is in there, and the shape of both comes out of `density` rather
+// than out of a knob: an upward push of g * rhoFluid / rhoSelf (gravity is
+// already subtracted, so the net is g * (rhoFluid - rhoSelf) / rhoSelf, which is
+// downward for stone and upward for wood with nothing to author either way), and
+// a per-tick viscous damping. Damping is what makes the water read as water and
+// not as thin air, and it is also the thing that ENDS the motion: a buoyant chip
+// rises, overshoots into the air, falls back, and each cycle is smaller, so it
+// converges to a bob at the waterline instead of oscillating forever.
+//
+// `lift == 0` is the opt-out and keeps every older behaviour exactly: micro
+// spray (a droplet dying on a surface is right — it has no voxel to sink) and
+// liquid/gas ejecta (a water voxel landing in water is a MERGE, whose fullness
+// has to go somewhere, and that is a different rule than this one).
+const PART_BUOY_MAX      : i32 = TUNE_PART_BUOY_MAX;
+const PART_SETTLE_SPEED  : i32 = TUNE_PART_SETTLE_SPEED;
+const PART_FLOAT_PATIENCE : u32 = TUNE_PART_FLOAT_PATIENCE;
+
+// FLOAT PATIENCE lives in the micro LIFE bits. They are spare here by
+// construction: `isMicro` and the float path are mutually exclusive (a micro
+// particle never has lift, see above), so the two never read the same bits in
+// the same particle. Same trick as the micro fields themselves — spare room in
+// `flags`, no growth of the 32-byte Particle.
+fn floatTicksOf(flags : u32) -> u32 {
+  return (flags >> PMICRO_LIFE_SHIFT) & PMICRO_LIFE_MASK;
+}
+fn withFloatTicks(flags : u32, t : u32) -> u32 {
+  return (flags & ~(PMICRO_LIFE_MASK << PMICRO_LIFE_SHIFT)) |
+         ((min(t, PMICRO_LIFE_MASK)) << PMICRO_LIFE_SHIFT);
+}
+
+// Blocks flight: solids and powders always; liquids only for a particle that
+// does not interact with them (lift 0 — see above).
+fn blocksParticle(c : vec3<i32>, passLiquid : bool) -> bool {
   let w = voxWordAt(c);
   let mat = voxMat(w);
   if (mat == MAT_AIR) { return false; }
-  return materials[mat].klass != CLASS_GAS;
+  let k = materials[mat].klass;
+  if (k == CLASS_GAS) { return false; }
+  if (passLiquid && k == CLASS_LIQUID) { return false; }
+  return true;
+}
+
+// May a particle rejoin the grid in the cell holding word `w`?
+//
+// Air always. A LIQUID only if the particle is denser than it — which is the
+// same statement the brush makes when it paints a stone into a pond (a cell
+// written over a liquid keeps no memory of the liquid, sim_mutate.wgsl), and
+// the reason the rule has to exist at all is that a sinking rock comes to rest
+// at the BED, where the cell it stops in is water, not air. Without it a rock
+// that made it to the bottom of a pond would propose a cell it could never be
+// given and retry forever.
+//
+// The density test is what stops the opposite abuse: a plank must not "settle"
+// by overwriting the water it is floating on, which would look exactly like
+// sinking. `patient` is the escape hatch at the end of PART_FLOAT_PATIENCE —
+// see the settle block in integrate.
+fn canOccupy(w : u32, myDensity : i32, patient : bool) -> bool {
+  let m = voxMat(w);
+  if (m == MAT_AIR) { return true; }
+  let mm = materials[m];
+  if (mm.klass != CLASS_LIQUID) { return false; }
+  return patient || myDensity > mm.density;
+}
+
+// Is there something under this cell worth coming to rest ON?
+//
+// Solid or powder is ordinary ground. A LIQUID counts only when the particle
+// floats in it, and that is the whole definition of a waterline: the cell above
+// the topmost liquid is where a floater belongs. A liquid it would SINK through
+// is not support, so a rock passing the surface keeps going, and neutrally
+// buoyant matter mid-column never converts to a voxel hanging in the water —
+// which would be the old bug wearing new clothes.
+// Sideways drift for something already floating (materials.json "fluid":
+// {"wander": n}, in 1/256 voxel per tick). A leaf skitters, a log barely moves.
+//
+// Keyed on the particle's POSITION and the tick, never on its ring slot — the
+// rule every other random decision in this file follows (DESIGN.md §4). Two
+// particles cannot occupy one position, so position is a usable identity for a
+// population that has no stable id of its own.
+fn fluidWander(p : ptr<function, Particle>, m : Material) {
+  let wand = i32(matFluidWander(m));
+  if (wand == 0) { return; }
+  let h = hash3(T.seed ^ 0xF10A7u, T.tick,
+                u32((*p).px) ^ pcg(u32((*p).pz) ^ pcg(u32((*p).py))));
+  (*p).vx += ((i32(h & 0xFFu) - 128) * wand) / 128;
+  (*p).vz += ((i32((h >> 8u) & 0xFFu) - 128) * wand) / 128;
+}
+
+fn settleSupported(c : vec3<i32>, myDensity : i32) -> bool {
+  let b = c + vec3<i32>(0, -1, 0);
+  if (!inBounds(b)) { return false; }
+  let bm = voxMat(voxWordAt(b));
+  if (bm == MAT_AIR) { return false; }
+  let m = materials[bm];
+  if (m.klass == CLASS_SOLID || m.klass == CLASS_POWDER) { return true; }
+  if (m.klass == CLASS_LIQUID) { return m.density > myDensity; }
+  return false;
 }
 
 // Next-tick dirty mark incl. boundary neighbors (particles run post-CA, so
@@ -71,6 +171,42 @@ fn markDirtyNext(c : vec3<i32>) {
           atomicOr(&dirtyOut[ns], DIRTY_R_PARTICLE);
         }
       }
+    }
+  }
+}
+
+// ---- debris that lands with nothing under it --------------------------------
+// A particle backed off from a blocked flight comes to rest in the last cell it
+// could be in, and when the thing that blocked it was a WALL rather than the
+// ground, that cell has air underneath. One such voxel is a one-voxel island and
+// the CA drops it for free (`soloSolid`, sim_step.wgsl). TWO of them side by
+// side are not: a solid touching another solid never moves in the CA, so they
+// hang on the wall until something else disturbs them, and nothing ever flags
+// them because they did not TAKE support from anything — they arrived without
+// any. That is the one hole in flagSupportLoss's coverage, and it is on the
+// landing side rather than the vacating side.
+//
+// So: air below, and a solid on some other face (the case the cheap CA rule
+// cannot decide), raises the same flag a collapse does and island detection
+// judges it. Deliberately NOT raised when the cell below is LIQUID — a raft
+// floating at the waterline IS supported, and flagging it would hand it to
+// island detection, which counts liquid as empty, converts the raft to a
+// rigidbody, settles it back to the grid, and flags it again forever.
+fn flagLandedUnsupported(c : vec3<i32>, mat : u32) {
+  if (materials[mat].klass != CLASS_SOLID) { return; }
+  let b = c + vec3<i32>(0, -1, 0);
+  if (!inBounds(b)) { return; }
+  if (voxMat(voxWordAt(b)) != MAT_AIR) { return; }  // ground, powder or water
+  var off = array<vec3<i32>, 5>(
+      vec3<i32>(1, 0, 0), vec3<i32>(-1, 0, 0), vec3<i32>(0, 0, 1),
+      vec3<i32>(0, 0, -1), vec3<i32>(0, 1, 0));
+  for (var i = 0u; i < 5u; i = i + 1u) {
+    let n = c + off[i];
+    if (!inBounds(n)) { continue; }
+    let nm = voxMat(voxWordAt(n));
+    if (nm != MAT_AIR && materials[nm].klass == CLASS_SOLID) {
+      atomicStore(&supportOut[chunkIndexW(c)], 1u);
+      return;
     }
   }
 }
@@ -120,9 +256,19 @@ fn spawn(@builtin(global_invocation_id) gid : vec3<u32>) {
   // liveness/pending state, so a malformed op cannot inject a particle that is
   // already claiming a cell. Masking to the fields the CPU is allowed to
   // author is what keeps this an input stream rather than raw state injection.
-  p.flags = PFLAG_ALIVE | (p.flags & (PFLAG_MICRO |
-            (PMICRO_SCALE_MASK << PMICRO_SCALE_SHIFT) |
-            (PMICRO_LIFE_MASK << PMICRO_LIFE_SHIFT)));
+  //
+  // The LIFE field is admitted only for a micro particle. Bits 5..12 mean two
+  // things now — a droplet's remaining life, and a floater's patience — and
+  // they are safe to share only because `isMicro` separates the two
+  // populations completely. That argument holds inside the shader by
+  // construction; here it is a CPU value arriving, so it is enforced rather
+  // than assumed, and a whole-voxel spawn starts its patience at zero whatever
+  // the producer put in the word.
+  var keep = p.flags & (PFLAG_MICRO | (PMICRO_SCALE_MASK << PMICRO_SCALE_SHIFT));
+  if ((p.flags & PFLAG_MICRO) != 0u) {
+    keep |= p.flags & (PMICRO_LIFE_MASK << PMICRO_LIFE_SHIFT);
+  }
+  p.flags = PFLAG_ALIVE | keep;
   pRead[slot] = p;
 }
 
@@ -135,6 +281,16 @@ fn integrate(@builtin(global_invocation_id) gid : vec3<u32>) {
   let startCell = vec3<i32>(p.px >> 8u, p.py >> 8u, p.pz >> 8u);
   if (!inBounds(startCell)) { return; }  // fell out of the world: gone
 
+  // This particle's own material, read once: every fluid decision below is a
+  // property of the stuff in flight, and re-indexing the table per test is the
+  // kind of thing that turns one branch into five loads.
+  let myMat = p.payload & 0xFFFu;
+  let myDensity = materials[myMat].density;
+  let myLift = matFluidLift(materials[myMat]);
+  // Micro spray is excluded by construction rather than by authoring — see the
+  // note on blocksParticle. Everything below is gated on this one bool.
+  let inFluid = !isMicro(p) && myLift > 0u;
+
   // ---- micro particles: age out ----
   // Spray is an effect with a finite budget, not conserved matter. Expiring in
   // mid-air is the common exit for a droplet that never hits anything, and it
@@ -145,8 +301,18 @@ fn integrate(@builtin(global_invocation_id) gid : vec3<u32>) {
     p.flags = withMicroLife(p.flags, life - 1u);
   }
 
-  // buried (CA moved material onto us): rise one voxel per tick until free
-  if (blocksParticle(startCell)) {
+  // The cell the particle is standing in, read ONCE: the burial test below and
+  // the buoyancy term after it both want it, and a second voxWordAt here is a
+  // second page-table translation per particle per tick.
+  let startWord = voxWordAt(startCell);
+  let startMat = voxMat(startWord);
+  let startKlass = materials[startMat].klass;  // air is a gas in the table
+
+  // buried (CA moved material onto us): rise one voxel per tick until free.
+  // Water flowing over a sinking rock is not burial, which is why a liquid
+  // counts as blocking only for something that does not interact with liquids.
+  if (startMat != MAT_AIR && startKlass != CLASS_GAS &&
+      !(inFluid && startKlass == CLASS_LIQUID)) {
     // A micro particle has no voxel to dig out to. Being buried means the CA
     // flowed over it, so it is inside something now — stain that something and
     // be gone, rather than tunnelling upward through solid rock.
@@ -164,6 +330,31 @@ fn integrate(@builtin(global_invocation_id) gid : vec3<u32>) {
 
   // gravity + clamp
   p.vy -= PART_GRAVITY;
+
+  // ---- submerged: Archimedes, then viscosity ------------------------------
+  // Evaluated on the cell the particle STARTED the tick in, once, for the same
+  // reason gravity is: the substep loop below samples the path for BLOCKAGE,
+  // and a force re-evaluated per sample would make the acceleration a function
+  // of how fast the particle happened to be going.
+  let submerged = inFluid && startMat != MAT_AIR && startKlass == CLASS_LIQUID;
+  if (submerged) {
+      // g * rhoFluid / rhoSelf, capped. The cap is not cosmetic: a leaf
+      // (density 200) in water is a five-gravity rocket and would be fired out
+      // of the pond, and a future material at density 20 would overflow the
+      // velocity clamp in one tick. Scaled by lift last so that the ceiling is
+      // on the FORCE, not on the authored fraction of it.
+    let ds = max(myDensity, 1);
+    let buoy = min(PART_GRAVITY * materials[startMat].density / ds, PART_BUOY_MAX);
+    p.vy += buoy * i32(myLift) / 15;
+    // Viscous damping, k/16 of the velocity per tick. Integer division
+    // truncates toward zero, which is symmetric — an arithmetic shift would
+    // bias every negative component and read as a permanent downward drift
+    // (the same trap the wind drag note below describes).
+    let k = i32(matFluidDrag(materials[myMat]));
+    p.vx -= p.vx * k / 16;
+    p.vy -= p.vy * k / 16;
+    p.vz -= p.vz * k / 16;
+  }
 
   // ---- wind (research doc §4.6) -------------------------------------------
   // The one force site in this kernel besides gravity, which is the point: a
@@ -224,6 +415,23 @@ fn integrate(@builtin(global_invocation_id) gid : vec3<u32>) {
   p.vy = clamp(p.vy, -PART_MAX_VEL, PART_MAX_VEL);
   p.vz = clamp(p.vz, -PART_MAX_VEL, PART_MAX_VEL);
 
+  // ---- how patient is this floater? ---------------------------------------
+  // Counted in ticks SPENT WET, not in ticks alive: a chip that bobs about
+  // looking for free waterline is the case this bounds, and a chip still in
+  // mid-air on its way there has not started spending anything. At expiry the
+  // particle stops being fussy — it takes the first cell it can have, liquid or
+  // not, supported or not — which is what guarantees the ring drains even when
+  // a pond is far too small for the debris thrown into it (rule 2). The
+  // overflow then piles up, which is what a real jam of driftwood does.
+  var patient = false;
+  if (inFluid) {
+    let ft = floatTicksOf(p.flags);
+    patient = ft >= PART_FLOAT_PATIENCE;
+    if (submerged && !patient) { p.flags = withFloatTicks(p.flags, ft + 1u); }
+  }
+  // Slow enough to be looking for somewhere to rest rather than still flying.
+  let slow = max(max(abs(p.vx), abs(p.vy)), abs(p.vz)) <= PART_SETTLE_SPEED;
+
   // sample the flight path every <= half voxel
   let maxc = max(max(abs(p.vx), abs(p.vy)), abs(p.vz));
   let n = max(1, (maxc + 127) / 128);
@@ -234,7 +442,7 @@ fn integrate(@builtin(global_invocation_id) gid : vec3<u32>) {
     let sz = p.pz + p.vz * k / n;
     let cell = vec3<i32>(sx >> 8u, sy >> 8u, sz >> 8u);
     if (!inBounds(cell)) { return; }  // left the world: particle dies
-    if (blocksParticle(cell)) {
+    if (blocksParticle(cell, inFluid)) {
       // ---- micro: land ON the surface, stain it, and stop existing ----
       // The droplet is parked at the CONTACT point (first blocked sample), not
       // backed off to the last air cell the way a reinserting particle is. The
@@ -251,10 +459,24 @@ fn integrate(@builtin(global_invocation_id) gid : vec3<u32>) {
         append(p);
         return;
       }
-      // propose reinsertion at the last empty position
+      // propose reinsertion at the last position it could legally be in
       p.px = lastAir.x; p.py = lastAir.y; p.pz = lastAir.z;
-      p.flags |= PFLAG_PENDING;
       let tgt = vec3<i32>(p.px >> 8u, p.py >> 8u, p.pz >> 8u);
+      // ---- A FLOATER THAT BUMPED INTO A BERTH ALREADY TAKEN ---------------
+      // Reinserting here is what used to build the tower: a chip blocked by the
+      // chip that landed a tick earlier proposed the cell ABOVE it, and the
+      // next one proposed the cell above that. So a slow floater that cannot
+      // have the cell it backed off into does not propose at all — it loses its
+      // vertical motion and drifts, and the surface of a pond is very wide.
+      // Anything still moving fast is genuinely being thrown at the raft and
+      // lands on it, which is what a thrown log does.
+      if (inFluid && slow && !canOccupy(voxWordAt(tgt), myDensity, patient)) {
+        p.vy = 0;
+        fluidWander(&p, materials[myMat]);
+        append(p);
+        return;
+      }
+      p.flags |= PFLAG_PENDING;
       atomicMax(&claim[claimSlot(cellIndexW(tgt))], particlePriority(p));
       append(p);
       return;
@@ -264,6 +486,38 @@ fn integrate(@builtin(global_invocation_id) gid : vec3<u32>) {
   p.px += p.vx;
   p.py += p.vy;
   p.pz += p.vz;
+
+  // ---- a floater looks for a berth ----------------------------------------
+  // Nothing blocked the flight, so a buoyant particle is either still rising
+  // through the liquid or already bobbing at the top of it. This is the ONLY
+  // exit it has: a blocked flight is what reinserts everything else, and a chip
+  // floating on open water is never blocked by anything.
+  //
+  // Both halves of "a berth" are load-bearing. The cell must be one it can HAVE
+  // (canOccupy) and it must have something under it worth resting ON
+  // (settleSupported) — the waterline for something that floats, the bed for
+  // something that sank. Drop the support half and neutrally buoyant matter
+  // converts to a voxel hanging in mid-water; drop the occupancy half and a
+  // plank settles by overwriting the water it floats on.
+  if (inFluid && slow) {
+    let here = vec3<i32>(p.px >> 8u, p.py >> 8u, p.pz >> 8u);
+    if (inBounds(here)) {
+      if (canOccupy(voxWordAt(here), myDensity, patient) &&
+          (patient || settleSupported(here, myDensity))) {
+        p.flags |= PFLAG_PENDING;
+        atomicMax(&claim[claimSlot(cellIndexW(here))], particlePriority(p));
+        append(p);
+        return;
+      }
+      // No berth: mill about. This is both the look (debris drifting on a pond
+      // rather than frozen to it) and the mechanism that spreads a raft out
+      // into one layer instead of stacking it — a particle with nowhere to go
+      // keeps moving until it finds somewhere that does.
+      if (submerged || settleSupported(here, myDensity)) {
+        fluidWander(&p, materials[myMat]);
+      }
+    }
+  }
   append(p);
 }
 
@@ -329,7 +583,20 @@ fn resolve(@builtin(global_invocation_id) gid : vec3<u32>) {
 
   let won = atomicLoad(&claim[claimSlot(tgtSlot)]) == particlePriority(p);
 
-  if (won && voxMat(voxWordAt(cell)) == MAT_AIR) {
+  // The cell must still be one this particle may have — re-read, because the CA
+  // ran between integrate and resolve. `canOccupy` is where "or a liquid I am
+  // denser than" enters: a rock that sank to the bed of a pond comes to rest in
+  // a cell full of water, and the water it displaces is dropped exactly as the
+  // brush drops it when it paints into a pond (sim_mutate.wgsl). Conserving it
+  // is not locally possible — displacement raises the level of the whole body
+  // of water, which is a write this pass cannot reach — and the alternative is
+  // that nothing may ever sink.
+  let hereWord = voxWordAt(cell);
+  let myDensity = materials[p.payload & 0xFFFu].density;
+  let patient = floatTicksOf(p.flags) >= PART_FLOAT_PATIENCE &&
+                matFluidLift(materials[p.payload & 0xFFFu]) > 0u;
+
+  if (won && canOccupy(hereWord, myDensity, patient)) {
     // rejoin the grid; stamp 0xFF = "hasn't acted", falls next tick
     let mat = p.payload & 0xFFFu;
     var state = (p.payload >> 12u) & 0xFu;
@@ -347,10 +614,13 @@ fn resolve(@builtin(global_invocation_id) gid : vec3<u32>) {
     // it is free to move on the tick it lands.
     voxStore(tgt, packVox(mat, state, STAMP_NEVER));
     markDirtyNext(cell);
+    flagLandedUnsupported(cell, mat);
     p.flags = 0u;  // dead
   } else {
-    // lost the claim (or the cell got taken): rest, retry next tick
-    p.flags = PFLAG_ALIVE;
+    // Lost the claim (or the cell got taken): rest, retry next tick. The float
+    // ticks survive — patience is a budget for finding a berth, and having a
+    // berth taken from you is precisely the thing it is counting.
+    p.flags = PFLAG_ALIVE | (p.flags & (PMICRO_LIFE_MASK << PMICRO_LIFE_SHIFT));
     p.vx = 0; p.vy = 0; p.vz = 0;
   }
   pWrite[gid.x] = p;
