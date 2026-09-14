@@ -56,6 +56,30 @@ struct BodyXform {
 @group(1) @binding(2) var<storage, read> bodyInst : array<BodyVoxInst>;
 @group(1) @binding(3) var<storage, read> bodyXf : array<BodyXform>;
 
+// ---- THE BODY PATH'S COST SWITCHES (2026-09-12, drawBodies attribution) ----
+// One resting 28.4k-voxel oak 48 voxels from the camera cost the drawBodies
+// span 1.0 ms mean / 3.3-3.9 ms p99 per frame, a quarter of the whole-world
+// raymarch, and it was a STANDING cost (a body that does not rest grid-aligned
+// never settles back). Two suspects, and both were real; the numbers are on
+// the commit that added this block.
+//
+// BODY_SHADOW_RAY: false skips fsBody's sun-shadow march entirely. It is the
+// attribution arm, not a quality setting — a body with no shadow term is the
+// 3.2x-too-bright bug BodyVSOut exists to fix. Leave it true.
+const BODY_SHADOW_RAY : bool = true;
+// BODY_VIEW_CULL: bodyVertex collapses a cube face whose normal points away
+// from the camera before it is rasterised (the pipeline's cullMode is None
+// because cubeOffset's winding flips between the +/- faces of an axis). An
+// opaque cube's back faces can never win the depth test against its own front
+// faces, so this only removes work: half of every cube's triangles from both
+// the depth pre-pass and the shaded pass.
+const BODY_VIEW_CULL : bool = true;
+// BODY_SUN_SKIP: fsBody casts no ray for a face the key light cannot reach
+// (wrapDiffuse is exactly zero there, so the answer would be multiplied by 0).
+// Pixel-identical with it on or off; it exists as a switch only so the
+// attribution arms can be re-run one at a time.
+const BODY_SUN_SKIP : bool = true;
+
 struct VSOut {
   @builtin(position) pos : vec4f,
   @location(0) color : vec3f,
@@ -184,7 +208,7 @@ fn vsParticle(@builtin(vertex_index) vi : u32,
   let bt = burnTint(m, albedo, f32(m.emission) / 255.0,
                     burnTintWeightH(pcg(inst * 2917u), R.time));
   out.color = litColorO(bt.albedo, n, world, bt.emis, R,
-                        opennessScaleAtBody(world, &occupancy, &openness, &opennessGen));
+                        opennessAtBody(world, &occupancy, &openness, &opennessGen));
   // Emitter light from the glow field. A spark shower thrown out of a forge or
   // a burning leaf tumbling past a lava pit is lit by it; before this the only
   // light on a loose particle was the sky and its own emission. `ao` 1.0 —
@@ -196,17 +220,75 @@ fn vsParticle(@builtin(vertex_index) vi : u32,
   return out;
 }
 
+// The body cube's vertex, ONCE, for both body entry points. The depth
+// pre-pass (vsBodyDepth) and the shaded pass (vsBody) must land every vertex
+// on the identical clip position or the second pass fails its own depth test
+// in a speckle of holes, and the only way to make two entry points agree to
+// the last ulp is to have them run the same instructions. Returns false for a
+// face the camera cannot see (BODY_VIEW_CULL).
+fn bodyVertex(vi : u32, inst : u32, out_world : ptr<function, vec3f>,
+              out_wn : ptr<function, vec3f>, out_n : ptr<function, vec3f>) -> bool {
+  let b = bodyInst[inst];
+  let xf = bodyXf[b.packed >> 16u];
+  var n : vec3f;
+  let off = cubeOffset(vi, &n);
+  let local = vec3f(b.lx, b.ly, b.lz) + vec3f(0.5) + off;
+  let world = xf.pos + quatRotate(xf.quat, local);
+  let wn = quatRotate(xf.quat, n);
+  *out_world = world;
+  *out_wn = wn;
+  *out_n = n;
+  // The view-facing test is a PLANE test: dot(wn, p) is the same for every
+  // point p of the face, so all six vertices of a back face take this branch
+  // together and the collapsed triangles are degenerate rather than torn.
+  return !(BODY_VIEW_CULL && dot(wn, world - R.camPos) > 0.0);
+}
+
+// ---- THE DEPTH PRE-PASS (2026-09-12) ----------------------------------------
+// Simulation::DrawBodies draws every body cube TWICE: first through this pair,
+// which writes depth and (by a Zero/One blend) no colour, then through
+// vsBody/fsBody, whose fragments now pass the depth test only where they are
+// the nearest thing — so each pixel casts fsBody's shadow ray ONCE. Without it
+// the instance order decided who got shaded: a cube drawn before the cube in
+// front of it paid the full fragment stage and was then overwritten, and on a
+// 28k-voxel crown with a perforated canopy that was most of the drawBodies
+// span (culling the 15% of instances that were fully enclosed removed 48% of
+// the time, which is the signature of overdraw, not of vertex work).
+struct BodyDepthOut {
+  @builtin(position) pos : vec4f,
+};
+
+@vertex
+fn vsBodyDepth(@builtin(vertex_index) vi : u32,
+               @builtin(instance_index) inst : u32) -> BodyDepthOut {
+  var world : vec3f;
+  var wn : vec3f;
+  var n : vec3f;
+  var out : BodyDepthOut;
+  if (!bodyVertex(vi, inst, &world, &wn, &n)) {
+    out.pos = vec4f(0.0, 0.0, -2.0, 1.0);
+    return out;
+  }
+  out.pos = projectView(world - R.camPos, R);
+  return out;
+}
+
+@fragment
+fn fsBodyDepth() -> @location(0) vec4f {
+  // The pipeline's blend is (Zero, One): this value never reaches the target.
+  return vec4f(0.0);
+}
+
 @vertex
 fn vsBody(@builtin(vertex_index) vi : u32,
           @builtin(instance_index) inst : u32) -> BodyVSOut {
   let b = bodyInst[inst];
   let xf = bodyXf[b.packed >> 16u];
 
+  var world : vec3f;
+  var wn : vec3f;
   var n : vec3f;
-  let off = cubeOffset(vi, &n);
-  let local = vec3f(b.lx, b.ly, b.lz) + vec3f(0.5) + off;
-  let world = xf.pos + quatRotate(xf.quat, local);
-  let wn = quatRotate(xf.quat, n);
+  let visible = bodyVertex(vi, inst, &world, &wn, &n);
 
   let mat = b.packed & 0xFFFu;
   let m = materials[mat];
@@ -222,6 +304,12 @@ fn vsBody(@builtin(vertex_index) vi : u32,
   }
 
   var out : BodyVSOut;
+  // z = -2 is outside reversed-Z's [0, 1] and is clipped, the same drop vsFluid
+  // uses for a dead particle.
+  if (!visible) {
+    out.pos = vec4f(0.0, 0.0, -2.0, 1.0);
+    return out;
+  }
   out.pos = projectView(world - R.camPos, R);
   // emissive body voxels (embers on burning debris) flicker like their grid
   // counterparts in raymarch.wgsl — same rate, per-voxel phase
@@ -253,7 +341,16 @@ fn vsBody(@builtin(vertex_index) vi : u32,
 // renderBGL_) from a per-pixel world position.
 @fragment
 fn fsBody(in : BodyVSOut) -> @location(0) vec4f {
-  let sh = bodySunShadow(in.world, in.wn, R, &occupancy, &materials);
+  // The shadow ray only ever MULTIPLIES the key-light lambert (litColorS), and
+  // wrapDiffuse is exactly zero once the face turns past -TUNE_DIFFUSE_WRAP
+  // from the light. A face the sun cannot reach gets no ray: same pixel, no
+  // march. On a cube that is at least three of six faces, and after the view
+  // cull it is roughly half of what is left.
+  var sh = 1.0;
+  if (BODY_SHADOW_RAY &&
+      (!BODY_SUN_SKIP || dot(in.wn, keyLightDirP(R)) > -TUNE_DIFFUSE_WRAP)) {
+    sh = bodySunShadow(in.world, in.wn, R, &occupancy, &materials);
+  }
   var col = litColorS(in.albedo, in.wn, in.world, in.misc.x, R,
                       in.misc.y, in.misc.z, sh);
   // Emitter light from the glow field (common.wgsl THE GLOW FIELD), and this
@@ -327,7 +424,7 @@ fn vsFluid(@builtin(vertex_index) vi : u32,
   var out : VSOut;
   out.pos = projectView(world - R.camPos, R);
   out.color = litColorO(albedo, n, world, 0.0, R,
-                        opennessScaleAtBody(world, &occupancy, &openness, &opennessGen));
+                        opennessAtBody(world, &occupancy, &openness, &opennessGen));
   return out;
 }
 
@@ -341,7 +438,7 @@ fn vsSprite(@builtin(vertex_index) vi : u32,
   var out : VSOut;
   out.pos = projectView(world - R.camPos, R);
   out.color = litColorO(unpackColor(s.color), n, world, s.emission, R,
-                        opennessScaleAtBody(world, &occupancy, &openness, &opennessGen));
+                        opennessAtBody(world, &occupancy, &openness, &opennessGen));
   return out;
 }
 

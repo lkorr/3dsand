@@ -21,15 +21,20 @@ namespace vk {
 // it, and the failure would have been a write past the array inside the
 // recorder rather than a compile error. Lives in this .cpp rather than in
 // either header because a hub header costs the whole tree a recompile and this
-// assertion needs to hold in exactly one place to hold everywhere. Raise BOTH
-// literals together if it ever fires.
+// assertion needs to hold in exactly one place to hold everywhere.
 //
-// It fired, exactly as designed, when W1's `wbRelevel`/`wbSurface` took the
-// count to 66 — a compile error naming the two arrays instead of a write past
-// them inside the recorder. Both are 96 now.
-static_assert((int)pass::Pipe::ShadowResolve < 96,
-              "pass::Pipe has outgrown the 64-entry pipeline tables in "
-              "rhi_record.h and vk_record.h -- raise BOTH");
+// THE LITERALS ARE GONE (2026-09-09, the gas package). The enum stood at 63
+// and gas added five, so the two mirror arrays would have been written past —
+// which is exactly the failure this assert was added to catch, except that
+// raising "BOTH literals together" is a manual step and the arrays were the
+// thing that had to change. They size themselves off `Pipe::kPipeCount` now,
+// so the bound cannot go stale; what is left here is the check that the LAST
+// REAL pipeline is still the one RecordTable's copy loop stops at.
+static_assert((int)pass::Pipe::ShadowResolve + 1 == (int)pass::Pipe::kPipeCount,
+              "ShadowResolve must stay the last real Pipe enumerator: "
+              "Simulation::RecordTable's copy loop is bounded by it, and a "
+              "pipeline added past it is silently never handed to the recorder "
+              "(a skipped row, not a crash)");
 
 namespace {
 
@@ -122,6 +127,8 @@ bool Recorder::CondHolds(pass::Cond c, const RecordCtx& cx) {
     case pass::Cond::WaterSweep: return cx.waterSweepSlot < kWaterBodyCap;
     case pass::Cond::Openness:   return cx.opennessChunks > 0;
     case pass::Cond::Glow:       return cx.glowChunks > 0;
+    case pass::Cond::Gas:        return cx.gasActive;
+    case pass::Cond::ReposeActive: return cx.reposeActive;
   }
   return false;
 }
@@ -134,8 +141,8 @@ uint32_t Recorder::Extent(uint32_t v, const RecordCtx& cx) {
     case pass::DispatchSel::Exp:      return kExplosionWg * cx.expCount;
     case pass::DispatchSel::ExpWg:    return kExplosionWg;
     case pass::DispatchSel::Spawn:    return (cx.spawnCount + 63) / 64;
-    case pass::DispatchSel::Chunks:   return kNumChunks;
-    case pass::DispatchSel::Chunks64: return kNumChunks / 64;
+    case pass::DispatchSel::Chunks:   return kNumSlots;
+    case pass::DispatchSel::Chunks64: return kNumSlots / 64;
     case pass::DispatchSel::GenCount: return cx.genCount;
     case pass::DispatchSel::FarCount: return cx.farCount;
     case pass::DispatchSel::WindWakeSel: return (cx.windWakeCount + 63) / 64;
@@ -148,6 +155,11 @@ uint32_t Recorder::Extent(uint32_t v, const RecordCtx& cx) {
     case pass::DispatchSel::WaterChunks64: return (cx.waterChunkCount + 63) / 64;
     case pass::DispatchSel::WaterDrainSel:
       return (cx.waterDrainBodies * kWaterDrainOpsPerBody + 63) / 64;
+    // One thread per slot of BOTH gas spawn lists. A compile-time extent, not
+    // a count: nothing on the CPU knows how many voxels left the window this
+    // tick, and asking would mean a readback in the tick path.
+    case pass::DispatchSel::GasSpawnSel:
+      return (kGasSpawnPerTick + kGasCpuSpawnPerTick + 63) / 64;
     default:                          return v;
   }
 }
@@ -518,6 +530,12 @@ void Recorder::RecordTable(pass::Table which, const RecordCtx& cx) {
         sets[1] = bind_.fluidSeamSet;
         setCount = 2;
         break;
+      case pass::Groups::SlimGas:
+        layout = bind_.slimGasLayout;
+        sets[0] = bind_.slimSet;
+        sets[1] = bind_.gasSet;
+        setCount = 2;
+        break;
       case pass::Groups::Shadow:
         // One set, not a slim pair: the shadow resolve reads the world through
         // its own bind group and shares nothing with the sim's.
@@ -596,6 +614,9 @@ void Recorder::RecordTable(pass::Table which, const RecordCtx& cx) {
             break;
           case pass::DispatchSel::IndShadowArgs:
             args = bind_.buffers[(int)pass::Buf::ShadowArgs];
+            break;
+          case pass::DispatchSel::IndGasDispatchArgs:
+            args = bind_.buffers[(int)pass::Buf::GasDispatchArgs];
             break;
           default:
             args = bind_.buffers[(int)pass::Buf::DispatchArgs];

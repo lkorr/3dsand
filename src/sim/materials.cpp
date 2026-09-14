@@ -168,6 +168,47 @@ static void ParseStain(const json& m, const std::string& path,
                     ((uint32_t)consume << kStainPackConsumeShift);
 }
 
+// Parses "coat": { decay, shed, effects } — what this substance does while it
+// is ON A BODY, as opposed to what it does to the ground (that is "stain").
+// Absent = it sits there until something washes it off, which is every
+// material that predates the feature.
+//
+// REQUIRES a "stain" block, and says so rather than defaulting: the coat and
+// the stain are two readings of one substance (the coat word carries the
+// material id, the stain block is how that material is DRAWN), so a coat with
+// no stain is invisible on a body and a load-time error is the only way the
+// author finds out. Must therefore be parsed AFTER ParseStain.
+static void ParseCoat(const json& m, const std::string& path, MaterialDef& d,
+                      std::string& errors) {
+  if (!m.contains("coat")) return;
+  const json& co = m["coat"];
+  if (!co.is_object()) {
+    errors += path + ": material \"" + d.name + "\": \"coat\" must be an object\n";
+    return;
+  }
+  if (d.stain.empty()) {
+    errors += path + ": material \"" + d.name +
+              "\": coat requires stain (a coat is drawn through the stain "
+              "palette; author a \"stain\" block first)\n";
+    return;
+  }
+  float decay = co.value("decay", 0.0f);
+  int shed = co.value("shed", 0);
+  if (decay < 0.0f) {
+    errors += path + ": material \"" + d.name +
+              "\": coat decay must be >= 0 seconds per level (0 = never)\n";
+    decay = 0.0f;
+  }
+  if (shed < 0 || shed > (int)kStainChanceMax) {
+    errors += path + ": material \"" + d.name +
+              "\": coat shed must be 0..1000 per-mille\n";
+    shed = 0;
+  }
+  d.coatDecay = decay;
+  d.coatShed = (uint32_t)shed;
+  d.coatEffects = co.value("effects", std::vector<std::string>{});
+}
+
 // Parses "absorb": { capacity } into the top nibble of stainPack. Authored on
 // the SUBSTRATE (grass, sand, dirt) rather than on the liquid — see the absorb
 // note in materials.h for why the ceiling and the per-contact step are separate
@@ -269,6 +310,57 @@ static bool LoadMaterialsJson(const std::string& path, std::vector<MaterialDef>&
     if (d.gpu.hardness > 255)
       errors += path + ": material \"" + d.name + "\": hardness > 255\n";
 
+    // ---- angle of repose: the slope a PILE of this powder rests at ----
+    //
+    //   "repose": 34          // degrees, kReposeDegMin..kReposeDegMax
+    //
+    // POWDERS ONLY, and refused rather than ignored on anything else: it is the
+    // one field whose meaning is a property of the powder movement chain, and
+    // authoring it on a liquid or a solid can only be a mistake about what the
+    // field does. Absent compiles to the word 0, which sim_step.wgsl reads as
+    // "one down, one across" — the rule every powder had before the field
+    // existed, so a material that says nothing is bit-identical to the old sim.
+    //
+    // The reposeDeg mirror is set for EVERY material, powder or not, so the
+    // tuner and the wiki can read the value back without knowing the packing
+    // (the same reason absorbCapacity and the wind nibbles are mirrored).
+    d.reposeDeg = kReposeDegDefault;
+    if (m.contains("repose")) {
+      if (!m["repose"].is_number_integer()) {
+        errors += path + ": material \"" + d.name +
+                  "\": \"repose\" must be an integer number of degrees\n";
+      } else if (d.gpu.klass != CLASS_POWDER) {
+        errors += path + ": material \"" + d.name +
+                  "\": \"repose\" is powders only (this one is a " + cls +
+                  ") — it is the slope a PILE rests at\n";
+      } else {
+        const int32_t deg = m["repose"].get<int32_t>();
+        // The two ends get DIFFERENT diagnostics, because they are different
+        // facts and a shared message sent an author looking at the wrong one:
+        // below the floor the lattice cannot express a flatter face at all,
+        // above the ceiling a powder is a wall and should be a solid. Refused
+        // rather than clamped either way — a clamp reads as the feature not
+        // working.
+        if (deg < kReposeDegMin) {
+          errors += path + ": material \"" + d.name + "\": repose " +
+                    std::to_string(deg) + " is below the floor of " +
+                    std::to_string(kReposeDegMin) +
+                    " degrees — 3:1 (18.43) is the flattest run:rise a cell "
+                    "lattice can hold, and anything flatter would be a silent "
+                    "clamp to it (see materials.h kReposeTiers)\n";
+        } else if (deg > kReposeDegMax) {
+          errors += path + ": material \"" + d.name + "\": repose " +
+                    std::to_string(deg) + " is above the ceiling of " +
+                    std::to_string(kReposeDegMax) +
+                    " degrees — 1:3 (71.57) is the steepest run:rise, and a "
+                    "powder that stands steeper than that is a solid\n";
+        } else {
+          d.reposeDeg = deg;
+          d.gpu.repose = PackRepose(deg);
+        }
+      }
+    }
+
     if (m.value("wanders", false)) d.gpu.flags |= kMatFlagWander;
     if (m.value("opaque", false)) d.gpu.flags |= kMatFlagOpaque;
     // Soft vegetation: bodies move through it. Collision only — the cell stays
@@ -282,6 +374,14 @@ static bool LoadMaterialsJson(const std::string& path, std::vector<MaterialDef>&
                   "\": burnTint needs emission > 0 (it is the pulse's glow)\n";
       d.gpu.flags |= kMatFlagBurnTint;
     }
+
+    // ---- far-field look-alike (sim/materials.h kMatFarPalShift) ------------
+    //
+    //   "far": "stone"        at cascade distance I am stone
+    //
+    // Resolved to a slot in a POST-PASS below, for the reason the tint runs
+    // give: it names another material, which may not have been read yet.
+    d.farAlias = m.value("far", std::string{});
 
     // ---- tints: GRID colour, per material (sim/materials.h kMatFlagTinted) --
     //
@@ -367,6 +467,49 @@ static bool LoadMaterialsJson(const std::string& path, std::vector<MaterialDef>&
       d.gpu.flags |= (d.windFriction & kMatWindFricMask) << kMatWindFricShift;
     }
 
+    // ---- fluid coupling (kFluidPack* in materials.h) ----
+    // What a voxel of this does while it is inside a liquid. Same shape as the
+    // wind block above and for the same reasons: authored by name, absent means
+    // derived, out of range is an error rather than a wrap.
+    //
+    //   "fluid": { "lift": 0..15, "drag": 0..15, "wander": 0..15 }
+    //
+    // The one that carries meaning on its own is lift 0 — "liquids do not touch
+    // this" — which is how a material opts OUT of buoyancy entirely and keeps
+    // the older behaviour of stopping dead at the surface. Everything else is a
+    // strength, and which way a material MOVES is decided by `density` against
+    // the liquid's, never by a knob here.
+    {
+      const json* fj =
+          m.contains("fluid") && m["fluid"].is_object() ? &m["fluid"] : nullptr;
+      const int dLift = (int)DeriveFluidLift(d.gpu.klass);
+      const int dDrag = (int)DeriveFluidDrag(d.gpu.density);
+      const int dWander = (int)DeriveFluidWander(d.gpu.density);
+      int lift = fj ? fj->value("lift", dLift) : dLift;
+      int drag = fj ? fj->value("drag", dDrag) : dDrag;
+      int wander = fj ? fj->value("wander", dWander) : dWander;
+      if (lift < 0 || lift > (int)kFluidMax || drag < 0 ||
+          drag > (int)kFluidMax || wander < 0 || wander > (int)kFluidMax) {
+        errors += path + ": material \"" + d.name +
+                  "\": fluid lift/drag/wander must be 0..15\n";
+        auto cl = [](int v) {
+          return v < 0 ? 0 : (v > (int)kFluidMax ? (int)kFluidMax : v);
+        };
+        lift = cl(lift);
+        drag = cl(drag);
+        wander = cl(wander);
+      }
+      d.fluidLift = (uint32_t)lift;
+      d.fluidDrag = (uint32_t)drag;
+      d.fluidWander = (uint32_t)wander;
+      d.gpu.fluidPack = ((uint32_t)lift & kFluidPackLiftMask)
+                            << kFluidPackLiftShift |
+                        ((uint32_t)drag & kFluidPackDragMask)
+                            << kFluidPackDragShift |
+                        ((uint32_t)wander & kFluidPackWanderMask)
+                            << kFluidPackWanderShift;
+    }
+
     auto colors = m.value("colors", std::vector<std::string>{});
     if (colors.size() != 3) {
       errors += path + ": material \"" + d.name + "\": need exactly 3 colors\n";
@@ -409,6 +552,7 @@ static bool LoadMaterialsJson(const std::string& path, std::vector<MaterialDef>&
         if (name.is_string() && !name.get<std::string>().empty())
           d.sounds[slot] = name.get<std::string>();
     ParseStain(m, path, stainReg, d, errors);
+    ParseCoat(m, path, d, errors);  // after ParseStain: it checks d.stain
     ParseAbsorb(m, path, d, errors);
     d.tags = m.value("tags", std::vector<std::string>{});
     for (auto& t : d.tags) {
@@ -458,25 +602,105 @@ static bool LoadMaterialsJson(const std::string& path, std::vector<MaterialDef>&
   }
 
   if (mats.size() > 4096) errors += path + ": more than 4095 materials (12-bit ID limit)\n";
-  // ---- THE FAR-FIELD CASCADE OWNS BIT 7 OF ITS MATERIAL BYTE --------------
-  // A far cell is ONE byte: seven bits of material id and one conservative
-  // "something is here" flag (common.wgsl FAR_BLOCKER_BIT, 13.2.2). That split
-  // is only legal while every id fits in seven bits, and nothing else in the
-  // engine would notice if it stopped: the 118th material would simply start
-  // painting the wrong colour at distance and claiming a blocker wherever bit
-  // 7 landed, with no crash and no failing gate to name it. So the loader
-  // refuses, here, where the table is built and the number is known.
+
+  // ---- assign FAR PALETTE SLOTS (sim/materials.h kMatFarPalShift) ----------
+  // A far cascade cell is ONE byte: seven bits and one conservative "something
+  // is here" flag (common.wgsl FAR_PAL_MASK / FAR_BLOCKER_BIT, 13.2.2). Those
+  // seven bits USED to be a material id, and that is the only reason this
+  // loader ever refused a 129th material: the voxel word had room for 4096 and
+  // this byte had room for 128, and nothing in the engine would have noticed the
+  // difference -- the 129th material would simply have started painting the
+  // wrong colour at distance and claiming a blocker wherever bit 7 landed, with
+  // no crash and no failing gate to name it.
   //
-  // `mats` includes the implicit air at index 0, so 128 entries is ids 0..127
-  // and exactly fills the field. scripts/check_invariants.py refuses a
-  // materials.json that would cross the same line without a build.
-  if (mats.size() > 128)
-    errors += path + ": " + std::to_string(mats.size()) +
-              " materials (including the implicit air at id 0), but the far-field"
-              " cascade packs a material id into SEVEN bits of its per-cell byte"
-              " and bit 7 is the conservative blocker flag -- the maximum id is"
-              " 127, i.e. 128 materials. Widen the far cell (farVox is already"
-              " 1 GiB) or drop a material; do NOT raise this limit alone.\n";
+  // They are now an index into the FAR PALETTE (world.h kFarPaletteBaseGpu), so
+  // the 128 bounds how many things may look DIFFERENT FROM EACH OTHER at
+  // cascade scale -- a far-field question -- instead of how many materials may
+  // exist, which is not one. Two materials that are indistinguishable at 50 m
+  // share a slot by authoring `"far": "<material>"`.
+  //
+  // IDENTITY FIRST, and that is load-bearing rather than tidy: while every
+  // material's id fits in seven bits, slot == id, so every far byte the
+  // worldgen writes is bit-for-bit the byte it wrote before the palette
+  // existed. Aliases only ever FREE slots, and pass 2 hands the freed ones to
+  // the ids that no longer fit.
+  {
+    std::vector<int> aliasOf(mats.size(), -1);
+    for (size_t i = 0; i < mats.size(); i++) {
+      if (mats[i].farAlias.empty()) continue;
+      int t = FindMaterial(mats, mats[i].farAlias);
+      if (t < 0) {
+        errors += path + ": material \"" + mats[i].name + "\": far alias \"" +
+                  mats[i].farAlias + "\" is not a material\n";
+      } else if ((size_t)t == i) {
+        errors += path + ": material \"" + mats[i].name +
+                  "\": far alias points at itself\n";
+      } else if (t == 0) {
+        // Slot 0 is how every reader spells "nothing here" -- farOcc counts a
+        // zero byte as an empty cell. A material that aliased to air would not
+        // be "drawn as air at distance", it would delete the cell from the
+        // cascade's occupancy, which is not what anyone means by it.
+        errors += path + ": material \"" + mats[i].name +
+                  "\": far alias \"air\" -- slot 0 means an EMPTY far "
+                  "cell, not a transparent one\n";
+      } else {
+        aliasOf[i] = t;
+      }
+    }
+    // ONE HOP ONLY, checked against the snapshot so the diagnosis does not
+    // depend on file order: the slot a far byte names must always belong to a
+    // material that paints itself, or a reader would have to chase a chain it
+    // has no table for.
+    const std::vector<int> alias0 = aliasOf;
+    for (size_t i = 0; i < mats.size(); i++) {
+      if (alias0[i] < 0 || alias0[alias0[i]] < 0) continue;
+      errors += path + ": material \"" + mats[i].name + "\": far alias \"" +
+                mats[i].farAlias + "\" is itself an alias (of \"" +
+                mats[alias0[i]].farAlias + "\") -- name the material that owns "
+                "the slot\n";
+      aliasOf[i] = -1;
+    }
+
+    size_t owned = 0;
+    for (size_t i = 0; i < mats.size(); i++)
+      if (aliasOf[i] < 0) owned++;
+    if (owned > kMatFarPalSlots)
+      errors += path + ": " + std::to_string(owned) +
+                " materials (including the implicit air at id 0) each want their"
+                " own colour in the far-field cascade, which has only " +
+                std::to_string(kMatFarPalSlots) +
+                " palette slots -- seven bits of a per-cell byte, whose eighth"
+                " bit is the conservative blocker flag. Give the ones that look"
+                " alike at cascade distance a `\"far\": \"<existing material>\"`"
+                " in materials.json so they share a slot, or widen the far cell"
+                " (farVox is already 1 GiB).\n";
+
+    std::vector<int> ownerOf(kMatFarPalSlots, -1);   // slot -> material
+    std::vector<int> slotOf(mats.size(), -1);
+    for (size_t i = 0; i < mats.size() && i < kMatFarPalSlots; i++) {
+      if (aliasOf[i] >= 0) continue;
+      ownerOf[i] = (int)i;
+      slotOf[i] = (int)i;
+    }
+    uint32_t probe = 0;
+    for (size_t i = 0; i < mats.size(); i++) {
+      if (aliasOf[i] >= 0 || slotOf[i] >= 0) continue;
+      while (probe < kMatFarPalSlots && ownerOf[probe] >= 0) probe++;
+      if (probe >= kMatFarPalSlots) break;   // already reported above
+      ownerOf[probe] = (int)i;
+      slotOf[i] = (int)probe;
+    }
+    for (size_t i = 0; i < mats.size(); i++)
+      if (aliasOf[i] >= 0) slotOf[i] = slotOf[aliasOf[i]];
+    for (size_t i = 0; i < mats.size(); i++) {
+      // A material with no slot only exists on a table that already errored;
+      // 0 keeps it out of the cascade rather than aliasing it onto someone.
+      uint32_t slot = slotOf[i] < 0 ? 0u : (uint32_t)slotOf[i];
+      mats[i].farPalSlot = slot;
+      mats[i].farPalOwner = slotOf[i] >= 0 && ownerOf[slot] == (int)i;
+      mats[i].gpu.flags |= (slot & kMatFarPalMask) << kMatFarPalShift;
+    }
+  }
   return true;
 }
 

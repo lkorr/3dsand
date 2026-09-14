@@ -67,6 +67,11 @@ struct UIState {
   // the mode — ceiling, fog start fraction, fog density — is tuning, because
   // that is authored data; whether it is on is session state.
   bool shortRange = false;
+  // WHICH ceiling, once the mode is on: false = render.shortRangeDist (the
+  // 100 m arm), true = render.shortRangeNearDist (the 50 m one). The panel
+  // draws the two as one off / 50 m / 100 m radio row, but the state stays two
+  // bools so the chosen ARM survives toggling the mode off and back on.
+  bool shortRangeNear = false;
   // Effective draw distance in METRES, written by main each frame for the
   // panel readout: the cascade's filled radius normally, the short-range
   // ceiling while the mode is on. Read-only in the UI — it is evidence that
@@ -152,6 +157,7 @@ struct UIState {
   bool reloadMaterials = false;
   bool regenWorld = false;
   bool pendingDetonate = false;  // X key / UI button: explode at crosshair
+  bool ragdollMe = false;        // one-shot: the player goes limp for ragdoll.devSeconds
   bool saveWorld = false;        // F9
   bool loadWorld = false;        // F10
 
@@ -321,6 +327,7 @@ struct UIState {
   bool aiSpawnStatic = false;
   bool aiSpawnDuelist = false;
   bool aiKillSpawned = false;     // one-shot: despawn everything this panel made
+  bool aiRagdollSpawned = false;  // one-shot: knock everything this panel made flat
   bool aiSaveBehaviors = false;   // one-shot: write assets/mobs/behaviors.json
   bool aiApplyBehavior = false;   // one-shot: aiBehaviorPick -> the selected mob
   bool showAiDebug = false;       // in-world path / target / band viz
@@ -441,6 +448,28 @@ struct UIState {
     float voxelFrac = 1.0f;      // live voxels / voxels at spawn
     float charredFrac = 0.0f;    // share of the limb cooked/charred through
     uint32_t burningVoxels = 0;  // voxels alight RIGHT NOW
+    // ---- WHAT IS ON THE OUTSIDE OF IT (docs/PLAN_body_coat.md) -----------
+    // The coat ledger's verdict for this limb (game/mob.h LimbCoat): how
+    // soaked it is, and by what. A different question again from hpFrac /
+    // voxelFrac / charredFrac — those are all about damage to the limb's OWN
+    // matter, and a limb can be drenched in somebody else's blood at full
+    // health, which is exactly the case the figure had no way to show.
+    //
+    // stainFrac is AMOUNT-WEIGHTED (LimbCoat::Frac), so 1.0 means every voxel
+    // is saturated rather than "every voxel has a speck on it".
+    float stainFrac = 0.0f;
+    uint32_t stainMat = 0;    // dominant material id; 0 = clean
+    // Its authored stain colour, opaque. Stored in the GPU's 0xAABBGGRR,
+    // which is byte-for-byte ImGui's default IM_COL32 packing — so this is an
+    // ImU32 that needs no swizzle. Carried as uint32_t rather than ImU32
+    // because this header deliberately does not include imgui.h.
+    // 0 = nothing to draw.
+    uint32_t stainColor = 0;
+    // COPIED, not pointed at. Every other string in this struct is either a
+    // std::string or a pointer into a static table; a material NAME lives in
+    // main.cpp's `mats` vector, which R (reload materials) replaces wholesale
+    // mid-frame, and one dangling frame is not worth the four bytes saved.
+    char stainLabel[24] = {0};
     float hp = 0, hpMax = 0;     // absolute, for the numeric readout
     // WHERE THE LIMB IS ON THE PORTRAIT, so the inspector can outline it.
     // Normalized to the portrait frame: (0,0) top-left, (1,1) bottom-right,
@@ -463,6 +492,19 @@ struct UIState {
   };
   BodyPartUI body[kSlotCount];
   bool bodyValid = false;   // false until the avatar has spawned
+  // The same three over the WHOLE body (MobSystem::BodyCoat, which counts the
+  // base limbs only — a robe soaked through is not the wearer being covered).
+  // Drawn as one line above the health bar, so "I am covered in blood" is
+  // legible without opening anything.
+  float stainFrac = 0.0f;
+  uint32_t stainMat = 0;
+  uint32_t stainColor = 0;
+  char stainLabel[24] = {0};
+  // tune.coat.hudMinFrac, MIRRORED IN rather than read: ui/ includes no sim
+  // header, and a threshold the overlay reached for itself would be a second
+  // place the number lives. Below it the HUD line, the figure's chip and the
+  // injury row all say nothing — a single splashed voxel is not "bloodied".
+  float stainHudMin = 0.02f;
   int32_t spellCost = 0;          // running cost of the spoken sequence
   // The price SPLIT (plan §9): word costs, the tariff on what the cast does
   // to the world, and the delivery premium on that tariff. "Why is this 900
@@ -638,6 +680,28 @@ struct UIState {
     bool pending = false;
     KitRef from;
   } dropItem;
+  // ---- LOOT (game/corpses.h) -----------------------------------------------
+  // The corpse the screen is open ON, mirrored like the bag: one row per piece
+  // still on it. main.cpp knows WHICH corpse; the panel only sees the list, and
+  // a KitRef in KitSpace::Loot indexes it. Opened by E over a corpse (which
+  // opens the screen too) and closed by the panel's button, by the screen
+  // closing, by the corpse being emptied or destroyed, or by walking away.
+  bool lootOpen = false;
+  std::string lootTitle;               // what fell (the mob def's name)
+  std::vector<KitSlotUI> lootSlots;
+  // Right-click on a loot slot, or the panel's "take all". Take-only: putting a
+  // thing ONTO a corpse would be data with no body in the world, so a drag
+  // into the loot panel is refused (main.cpp answers with the sentence).
+  struct TakeIntent {
+    bool pending = false;
+    int index = -1;
+    bool all = false;
+  } takeLoot;
+  bool lootClose = false;              // the panel's close button
+  // ---- the look prompt ------------------------------------------------------
+  // What E would do to the thing under the crosshair, or empty. Written by
+  // main.cpp's reach ray every frame, drawn by DrawHUD under the crosshair.
+  std::string lookPrompt;
   // RIGHT-CLICK: "put this where it belongs, I do not want to aim." The panel
   // deliberately does NOT pick the destination slot — it has the accepted-kinds
   // mirror and could, but choosing where a piece goes is the equipment system's

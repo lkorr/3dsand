@@ -30,6 +30,7 @@
 #include "game/caster.h"
 #include "game/equipment.h"
 #include "game/worlditems.h"
+#include "game/corpses.h"
 #include "game/item.h"
 #include "game/melee.h"
 #include "game/mob.h"
@@ -75,6 +76,7 @@
 #include "gpu/passtimer.h"
 #include "measure/renderstats.h"
 #include "test/support.h"
+#include "test/treefixture.h"
 #include "ui/overlay.h"
 #include "crash.h"
 
@@ -153,8 +155,35 @@ constexpr uint64_t kShotInvOpenFrame = 150;    // let the avatar spawn and settl
 constexpr uint64_t kShotInvDamageFrame = 170;
 constexpr uint64_t kShotInvGearFrame = 220;    // -> screenshot_inventory.bmp
 constexpr uint64_t kShotInvCaptureFrame = 240;  // -> ..._health.bmp
-constexpr uint64_t kShotInvGrimoireFrame = 260; // -> ..._grimoire.bmp; last frame
+constexpr uint64_t kShotInvGrimoireFrame = 260; // -> ..._grimoire.bmp
+// Fourth: a dressed human killed in front of the player and its corpse opened
+// — the loot panel where the grimoire was (game/corpses.h). Last frame.
+constexpr uint64_t kShotInvLootFrame = 280;     // -> ..._loot.bmp; last frame
 
+// ---- --shot-jump: the AIRBORNE POSE's look-iteration harness ---------------
+//
+// The avatar's air pose is driven by `vel.y` (avatar.airPose, tuning.h), and
+// the only honest test of "does it look good" is a picture of each phase. This
+// runs the windowed game in third person, walks the body forward, jumps it, and
+// writes one BMP per phase.
+//
+// CAPTURED ON THE POSE'S OWN PHASE, NOT ON A FRAME NUMBER. Ticks and frames are
+// not 1:1 here (the fixed-step loop fires 0..4 ticks a frame), so a frame
+// schedule would photograph a different part of the arc on every machine and on
+// every frame rate — which is exactly what a look-iteration harness must not
+// do. The trigger is `PlayerAvatar::AirPoseVy()` crossing the thresholds the
+// pose itself blends on, so each picture is the shape it is named after.
+bool g_shotJump = false;
+// Frames of walking before the jump: enough for the world to stream, the gait
+// to reach steady state and the third-person boom to settle behind the body.
+constexpr uint64_t kShotJumpAtFrame = 220;
+// Hard stop, in case the body lands somewhere it cannot jump from again.
+constexpr uint64_t kShotJumpLastFrame = 420;
+// Which pictures are still owed, in the order the arc reaches them.
+enum class JumpShot { Rise, Apex, Fall, Land, Done };
+JumpShot g_shotJumpWant = JumpShot::Rise;
+const char* g_shotJumpPath = nullptr;  // set for exactly one frame, then taken
+float g_shotJumpVy = 0.0f;             // the vy that picture was taken at, m/s
 
 // --frames N (phase 4b D3): windowed verification harness. 0 = play normally.
 uint64_t g_harnessFrames = 0;
@@ -191,6 +220,14 @@ bool g_autoflyHard = false;  // --autofly-hard: adversarial traversal for pool s
 // surface case is where the frame cost lives (docs/PLAN_surface_flight_perf.md
 // Part A), and it is exactly the case the descent cannot reach.
 bool g_autoflySurface = false;
+// --autowalk: the WALKING harness. Forward held on foot (no fly), a hop every
+// 45 ticks to clear low obstacles, and a quarter turn every 240 ticks so a
+// wall does not end the walk. Exists because the two CPU spikes reported
+// from live play (terrain-collider rebuilds on a chunk-boundary crossing,
+// the GPU-lag catch-up loop) never fire under fly mode: a flying player has
+// no ground to collide with and crosses chunk boundaries too fast to walk
+// into a mob's nav horizon. Pair with --duel-dummy for a hostile follower.
+bool g_autoWalk = false;
 // Which of the two --autofly-surface regimes the current frame is in, set from
 // the tick phase in the input block and consumed by the altitude pin after
 // player.Update. Two sites because the phase is known where every other autofly
@@ -235,6 +272,32 @@ std::vector<double> g_frameScopeSeries[sandvox::kPerfScopeCount];
 uint64_t g_frameSnapStalls = 0;      // total paged-staleness WaitIdle stalls
 uint64_t g_frameSnapStallFrames = 0; // frames that paid at least one
 uint64_t g_frameRbDeclines = 0;      // readback requests the ring refused
+// Ticks the GPU-lag throttle (the tick loop) pushed to a later frame because
+// the GPU still owed two or more snapshot readbacks. Sim time dilates by that
+// many ticks instead of the frame stalling on a fence.
+uint64_t g_ticksThrottled = 0;
+// ---- THE CASCADE REFILL, AS ENTRIES AND NOT AS A MEAN (CLAUDE.md rule 6) ---
+// `farField` on the GPU table is one mean over the whole run and it cannot
+// distinguish 'the refill finished cheaply' from 'the refill never finished'.
+// Diagnosing the horizon's arrival needed exactly that distinction — a
+// 256-entry slice measured 4.4x the TOTAL far GPU time of a 4096-entry one
+// for what should have been the same 262,144 entries — and there was no way
+// to read the entry count off a run. These three say how much sieve actually
+// ran, in how many ticks, and how much was still queued at exit.
+uint64_t g_farEntries = 0;    // sieve entries dispatched over the run
+uint64_t g_farTicks = 0;      // ticks that dispatched at least one
+uint64_t g_farBiggest = 0;    // the largest single tick's count
+// --frames: the GPU side of the same picture. The live telemetry path already
+// bills every timestamped pass to its Engine-map node per frame; the harness
+// keeps the per-frame series so the summary can say WHICH GPU row spiked,
+// which is the question every stall on the CPU side ends in.
+std::vector<double> g_frameGpuSeries[sandvox::kPerfNodeCount];
+// ...and per PASS, because a node is a sum: `farField` is farDown (the
+// dirty-list downsample) + farFill (the sieve) + farPatchFill, and they
+// scale with different things. Keyed by pass name; a frame in which a pass
+// did not run is a zero for it, padded at print time.
+std::map<std::string, std::vector<double>> g_frameGpuPassSeries;
+size_t g_frameGpuFrames = 0;
 // P2-D: WHICH cause and WHICH arm (support.h SnapshotStallStats). Accumulated
 // over the harness frames only, like the three counters above.
 sandvox::SnapshotStallStats g_frameStallStats{};
@@ -274,6 +337,22 @@ bool g_autoflyPark = false;
 // there. The manual half of the melee gates — `swing` and `swing-plane` assert
 // the trajectory and the wound, and this is where a person judges the FEEL.
 bool g_duelDummy = false;
+// --fell-tree: the tree-fell gate's fixture, planted 48 voxels ahead of the
+// player once the world has settled, cut 120 ticks later, and the 300-tick
+// fall profiled exactly as the gate profiles it. The gate is headless, so the
+// render half of the handoff (BuildInstances, the drawBodies span, the
+// whole-frame time) only exists as a number HERE, under --frames.
+bool g_fellTree = false;
+int g_fellTreeAt = 240;  // the plant tick; the cut is 120 ticks later
+// An optional site ("x,z"): the game then STARTS 48 voxels west of it looking
+// +X, so the tree stands there. Default is 48 voxels ahead of wherever the
+// player spawned -- which at the map's spawn site is inside a forest, and a
+// crown that touches a neighbour's is anchored through it (2026-09-12: the
+// flood walked 54 voxels west and 40 down through another tree and correctly
+// refused). The harness pad (map.json site `harness`, x/z -128..640) has no
+// trees by construction; --fell-tree 240 200,200 plants there.
+bool g_fellSiteSet = false;
+int g_fellSiteX = 0, g_fellSiteZ = 0;
 // SANDVOX_PARK_AT="x,y,z": park at a NAMED PLACE instead of wherever the
 // procedural surface route happens to stop.
 //
@@ -339,7 +418,7 @@ void ParkSampleRequest(World& world, const char* label) {
   g_parkIdleIds.clear();
   std::map<int, uint32_t> yhist;
   uint32_t emptyActive = 0, totalActive = 0;
-  for (uint32_t i = 0; i < kNumChunks; i++) {
+  for (uint32_t i = 0; i < kNumSlots; i++) {
     if (!s.dirtyFlags[i]) continue;
     totalActive++;
     if (s.occupancy[i] == 0) emptyActive++;
@@ -355,7 +434,7 @@ void ParkSampleRequest(World& world, const char* label) {
   // nothing else.
   auto sample = [&](bool wantActive, std::vector<IVec3>& arm) {
     uint32_t pool = 0;
-    for (uint32_t i = 0; i < kNumChunks; i++) {
+    for (uint32_t i = 0; i < kNumSlots; i++) {
       const bool act = s.dirtyFlags[i] != 0;
       if (act != wantActive) continue;
       // Control arm is non-empty chunks only - comparing against sky would
@@ -365,7 +444,7 @@ void ParkSampleRequest(World& world, const char* label) {
     }
     const uint32_t stride = pool > kArm ? pool / kArm : 1u;
     uint32_t seenN = 0;
-    for (uint32_t i = 0; i < kNumChunks && arm.size() < kArm; i++) {
+    for (uint32_t i = 0; i < kNumSlots && arm.size() < kArm; i++) {
       const bool act = s.dirtyFlags[i] != 0;
       if (act != wantActive) continue;
       if (!act && s.occupancy[i] == 0) continue;
@@ -666,14 +745,79 @@ BurnMats ResolveBurnMats(const std::vector<MaterialDef>& mats) {
   return bm;
 }
 
+// ---- WHAT IS ON A BODY, AS THE HUD HAS TO DRAW IT ---------------------------
+//
+// The dominant coat material's colour: its authored `stain.color`, or its
+// darkest palette entry when it declares none — which is the very fallback
+// ParseStain itself applies, so the HUD and the world agree on what dried
+// blood looks like without either of them naming a hue.
+//
+// NO SWIZZLE, deliberately. materials.cpp's ParseColor stores 0xAABBGGRR so
+// the shader can unpack R out of the low byte, and that is byte-for-byte
+// ImGui's default IM_COL32 packing. The only thing that has to be forced is
+// ALPHA: a palette entry's is whatever the author wrote, and a stain drawn at
+// the liquid's own alpha would vanish. 0 means "nothing to draw".
+uint32_t CoatColorOf(const std::vector<MaterialDef>& mats, uint32_t mat) {
+  if (mat == 0 || mat >= mats.size()) return 0;
+  uint32_t c = mats[mat].gpu.stainColor;
+  if ((c & 0x00FFFFFFu) == 0) c = mats[mat].gpu.color1;
+  if ((c & 0x00FFFFFFu) == 0) return 0;
+  return (c & 0x00FFFFFFu) | 0xFF000000u;
+}
+
+// The material's authored NAME, copied into the UI's own buffer. Copied and
+// not pointed at because R replaces `mats` wholesale (see BodyPartUI).
+void CopyCoatLabel(const std::vector<MaterialDef>& mats, uint32_t mat,
+                   char* out, size_t n) {
+  out[0] = '\0';
+  if (mat == 0 || mat >= mats.size()) return;
+  std::snprintf(out, n, "%s", mats[mat].name.c_str());
+}
+
+// One figure slot's coat, folded from the limbs drawn as that segment.
+//
+// ACCUMULATED PER SLOT rather than assigned per limb, because BodySlotFor is
+// many-to-one: every non-hip spine part lands on the torso. Reading the coat
+// off whichever limb happened to be last would make a two-part torso report
+// half the blood that is on it.
+struct SlotCoat {
+  uint32_t voxels = 0, sumAmt = 0;
+  // Four candidate substances, folded from each contributing limb's own two.
+  // One more level of the approximation LimbCoat already documents: a body is
+  // realistically bloody, or wet, or bloody and wet, and a fifth distinct
+  // substance on one segment contributes to the totals but is not named.
+  uint32_t mat[4] = {}, amt[4] = {};
+  void Add(uint32_t m, uint32_t a) {
+    if (!m || !a) return;
+    for (int k = 0; k < 4; k++) {
+      if (mat[k] == m) { amt[k] += a; return; }
+      if (mat[k] == 0) { mat[k] = m; amt[k] = a; return; }
+    }
+  }
+  uint32_t Top() const {
+    uint32_t best = 0, bestAmt = 0;
+    for (int k = 0; k < 4; k++)
+      if (mat[k] && amt[k] > bestAmt) { best = mat[k]; bestAmt = amt[k]; }
+    return best;
+  }
+};
+
 void FillBodyUI(const PlayerAvatar& avatar, const BurnMats& burnMats,
+                const MobSystem& mobs, const std::vector<MaterialDef>& mats,
                 UIState& ui) {
   for (int i = 0; i < UIState::kSlotCount; i++) ui.body[i] = {};
   for (int i = 0; i < UIState::kSlotCount; i++)
     ui.body[i].label = BodySlotLabel(i);
+  ui.stainFrac = 0.0f;
+  ui.stainMat = 0;
+  ui.stainColor = 0;
+  ui.stainLabel[0] = '\0';
+  ui.stainHudMin = CurrentTuning().coat.hudMinFrac;
   const MobDef* def = avatar.Def();
   ui.bodyValid = def != nullptr;
   if (!def) return;
+  const uint64_t mobId = avatar.Id();
+  SlotCoat slotCoat[UIState::kSlotCount];
   // Walk the DEF's limbs, not PartCount() — the latter includes the borrowed
   // held-item slot, which is not part of the body.
   const int limbCount = (int)def->limbs.size();
@@ -716,7 +860,40 @@ void FillBodyUI(const PlayerAvatar& avatar, const BurnMats& burnMats,
           std::clamp((float)(cooked + charred * 2) / (float)(now * 2), 0.0f,
                      1.0f);
     }
+
+    // What is ON the limb. The ledger is recounted by the creature itself at
+    // its own bounded cadence (Mob::RecountCoat), so this is a read of three
+    // words per limb per frame and a clean body costs nothing.
+    if (const LimbCoat* lc = mobs.LimbCoatOf(mobId, i)) {
+      SlotCoat& sc = slotCoat[slot];
+      sc.voxels += lc->voxels;
+      sc.sumAmt += lc->sumAmt;
+      for (const CoatEntry& e : lc->top) sc.Add(e.mat, e.sumAmt);
+    }
   }
+
+  for (int i = 0; i < UIState::kSlotCount; i++) {
+    const SlotCoat& sc = slotCoat[i];
+    if (sc.voxels == 0) continue;
+    UIState::BodyPartUI& b = ui.body[i];
+    // The same amount-weighted fraction LimbCoat::Frac computes, over the
+    // union of the limbs this segment draws.
+    b.stainFrac = std::clamp(
+        (float)sc.sumAmt / (float)(kBodyStainAmtMax * sc.voxels), 0.0f, 1.0f);
+    b.stainMat = sc.Top();
+    b.stainColor = CoatColorOf(mats, b.stainMat);
+    CopyCoatLabel(mats, b.stainMat, b.stainLabel, sizeof b.stainLabel);
+  }
+
+  // Body-level, from the creature's own ledger rather than by averaging the
+  // slots: BodyCoat is over the BASE limbs, so a blood-soaked robe does not
+  // report the wearer as covered, and re-deriving it here would be a second
+  // answer to a question that already has one.
+  const LimbCoat whole = mobs.BodyCoat(mobId);
+  ui.stainFrac = std::clamp(whole.Frac(), 0.0f, 1.0f);
+  ui.stainMat = whole.top[0].mat;
+  ui.stainColor = CoatColorOf(mats, ui.stainMat);
+  CopyCoatLabel(mats, ui.stainMat, ui.stainLabel, sizeof ui.stainLabel);
 }
 
 // ---- the character panel's live avatar portrait -----------------------------
@@ -903,7 +1080,13 @@ void ProjectBodyUI(const PlayerAvatar& av, Physics& phys, const PortraitCam& pc,
 IVec3 SpawnWindowOrigin() {
   const worldmap::WorldMapData& m = worldmap::CurrentWorldMap();
   const int half = (int)kNChunk / 2;
-  return IVec3{(m.spawnX >> 4) - half, 0, (m.spawnZ >> 4) - half};
+  int sx = m.spawnX, sz = m.spawnZ;
+  // --fell-tree x,z starts the game at its site: without this the boot window
+  // sat at the map's spawn and the stream WALKED it to the pad one plane per
+  // frame (205-234 shifts, 10 ms each, plus a worldgen plane per shift) --
+  // over before the cut, but it owned the whole-run stream and worldgen rows.
+  if (g_fellSiteSet) { sx = g_fellSiteX - 48; sz = g_fellSiteZ; }
+  return IVec3{(sx >> 4) - half, 0, (sz >> 4) - half};
 }
 Vec3 SpawnPos() {
   const worldmap::WorldMapData& m = worldmap::CurrentWorldMap();
@@ -1002,11 +1185,19 @@ int RunShots(GpuContext& ctx, World& world, Simulation& sim) {
   uint32_t shotTicksPerDay = TicksPerDay(shotTun);
   uint32_t shotTick =
       (uint32_t)((double)g_shotTimeOfDay * (double)shotTicksPerDay) % shotTicksPerDay;
-  auto render = [&](Vec3 eye, float yaw, float pitch, const char* path) {
+  // `tickOverride` is for the ONE frame that has to pin its own time of day
+  // (the night sky, below): every other frame honours `--time` and passes -1.
+  // A negative sentinel rather than a second lambda, because the four-frame
+  // warm-up and the readback below are the part nobody should have a second
+  // copy of.
+  auto renderAt = [&](Vec3 eye, float yaw, float pitch, const char* path,
+                      int64_t tickOverride) {
     // --shot-frames: the scene setup around a frame (a pour, a spawn, a
     // window relocation) still runs — it is what the NEXT frames stand on —
     // but the render and the readback, which are the expensive part, do not.
     if (!ShotWanted(path)) return;
+    const uint32_t frameTick =
+        tickOverride < 0 ? shotTick : (uint32_t)tickOverride;
     Camera c;
     c.yaw = yaw;
     c.pitch = pitch;
@@ -1018,9 +1209,20 @@ int RunShots(GpuContext& ctx, World& world, Simulation& sim) {
     // ~10 ms each cost nothing against the readback. Fresh RenderParams per
     // frame: the frame counter inside them is what the cache's stamps advance
     // on.
+    // The shading-LOD filter (render.denoise) runs in the shots exactly as it
+    // does in play, in place over `offscreen` after the world pass — a look
+    // pass that the look harness did not show would be untunable. Its params
+    // are uploaded before the pass opens, like everything else here.
+    const bool shotDenoise = CurrentTuning().render.denoise != 0;
     for (int f = 0; f < 4; f++) {
       WriteRenderParams(ctx.queue, world, eye, c, (float)W / H, true, kShotTime,
-                        kFarFogDensity, 1080.0f, shotTick);
+                        kFarFogDensity, 1080.0f, frameTick);
+      if (shotDenoise) {
+        sim.EnsureDenoise(W, H);
+        sim.WriteDenoiseParams(ctx.queue, W, H,
+                               std::tan(CurrentTuning().camera.fovY * 0.5f),
+                               /*bgraSource=*/false);
+      }
       rhi::CommandEncoder enc = ctx.device.CreateCommandEncoder();
       sim.EncodeShadowResolve(enc);
       rhi::RenderPass rp =
@@ -1039,10 +1241,19 @@ int RunShots(GpuContext& ctx, World& world, Simulation& sim) {
                                    ? CurrentDebugArrowCount()
                                    : 0u);
       rp.End();
+      // A no-op until the first draw has built the pipeline (frame 0), so the
+      // grabbed fourth frame is always filtered.
+      if (shotDenoise)
+        sim.EncodeDenoise(enc, offscreen, view, rhi::TextureFormat::RGBA8Unorm,
+                          W, H);
       ctx.queue.Submit(enc.Finish());
     }
     ctx.WaitIdle();
     grab(path);
+  };
+  // The ordinary frame: honours `--time` like everything else always has.
+  auto render = [&](Vec3 eye, float yaw, float pitch, const char* path) {
+    renderAt(eye, yaw, pitch, path, -1);
   };
   int h108 = World::TerrainHeight(108, 108, kDefaultSeed);
   // Sky shot: aimed along the sun's azimuth and tilted up, so the frame holds
@@ -1059,6 +1270,34 @@ int RunShots(GpuContext& ctx, World& world, Simulation& sim) {
     // entirely and the whole sun path goes unreviewed.
     float sunPitch = std::asin(std::clamp(ss.sunDir[1], -1.0f, 1.0f));
     render({108, (float)(h108 + 40), 108}, sunYaw, sunPitch, "screenshot_sky.bmp");
+  }
+  // NIGHT SKY shot: the only frame that reviews the dome's night half — the
+  // galactic band, the nebulae, the aurora curtains, the moons and the
+  // starfield's DEPTH ORDER against all of them (raymarch.wgsl SkyLayer.veil).
+  // Every other capture here is a daylight frame, so before this one the whole
+  // night path was unreviewed and the stars sat visibly on top of the aurora
+  // for as long as the aurora has existed.
+  //
+  // It PINS ITS OWN TICK rather than honouring `--time`, and that is the point:
+  // a night frame that goes blue whenever someone runs `--shot --time 0.5`
+  // reviews nothing.
+  //
+  // PITCH +0.35, and the number is load-bearing. nightGlow fades the aurora in
+  // above rd.y = 0.02 and back out from 0.35, so its density peaks in a band
+  // just above the horizon and is already down by a third at the zenith. An
+  // earlier +0.55 framing looked like more sky and reviewed a THINNER aurora:
+  // the densest block in that frame averaged 16/255 of purple, which is too
+  // faint for any occlusion change to read. This aims at the band.
+  {
+    // 0.02 of a cycle past midnight: fully dark, and OFF the exact midnight
+    // phase so a bug that only shows at dayT == 0 has no special case to hide
+    // in. Both moons are wherever their own orbits put them, which is the
+    // honest test of the disc/star occlusion — pinning them full would only
+    // test the easy case.
+    uint32_t nightTick =
+        (uint32_t)(0.02 * (double)shotTicksPerDay) % shotTicksPerDay;
+    renderAt({108, (float)(h108 + 60), 108}, 0.785f, 0.35f,
+             "screenshot_night_sky.bmp", (int64_t)nightTick);
   }
   render({108, (float)(h108 + 120), 108}, 0.785f, -0.35f, "screenshot.bmp");
   render({140, 220, 140}, 0.785f, -0.20f, "screenshot_far.bmp");
@@ -2004,6 +2243,220 @@ int RunWaterfallShot(GpuContext& ctx, World& world, Simulation& sim) {
   return ctx.ReportVkValidation("--shot-waterfall") > 0 ? 1 : 0;
 }
 
+// --shot-debris-pond: the owner's own report, photographed
+// (docs/PLAN_debris_buoyancy.md). "I explode a tree and its voxels all fall on
+// top of the water and form a structure on top of the water."
+//
+// The `debris-float` gate measures this numerically in a sealed basin, which is
+// the right instrument for "did the iron reach the bed" and the wrong one for
+// the thing that was actually reported: a LOOK. So this is the real path end to
+// end — a generated pond, a wooden mass over it, and the blast's own ejecta
+// raining down — with the frame taken twice: once while the chips are still in
+// the air, and once after they have settled.
+//
+// The census printed beside the frames is what makes it more than a picture: it
+// counts wood ABOVE the waterline (the reported bug: a raft in the air) against
+// wood AT it, on the same voxels the camera is looking at.
+int RunDebrisPondShot(GpuContext& ctx, World& world, Simulation& sim,
+                      const std::vector<MaterialDef>& mats) {
+  // THE LAKE IS ASKED FOR BY NAME, not written down. `--shot`'s pond block and
+  // `--shot-fluid-pond` both carry the literal (258,-235) of a tile-hashed
+  // pond, and that site has already moved once — the first cut of this fixture
+  // probed there and found no water at all. The map knows where its water is:
+  // `World::WaterSiteDisc` is the authored lake (map.json's `home_lake`, the
+  // same disc the shader fills), and a map with no water site says so instead
+  // of photographing dry ground.
+  if (World::WaterSiteCount() <= 0) {
+    std::printf("--shot-debris-pond: the loaded map authors no water site\n");
+    return 1;
+  }
+  const World::PondDisc lake = World::WaterSiteDisc(0, kDefaultSeed);
+  const int kPx = lake.cx, kPz = lake.cz;
+  // WHY THE WINDOW HAS TO MOVE (the reason --shot's pond block gives): outside
+  // the residency window a lake shades through the far-field cascade as flat
+  // colour with no surface and no bed, so debris floating on it would be
+  // invisible by construction. Floor division, not truncation — the authored
+  // lake can sit at a negative coordinate, and -235/16 is -14 in C++ where the
+  // chunk that holds it is -15.
+  const IVec3 here{(int)std::floor(kPx / (float)kChunk), 3,
+                   (int)std::floor(kPz / (float)kChunk)};
+  world.SetWindowOrigin({here.x - 8, 0, here.z - 8});
+  SubmitWorldgen(ctx, world, sim, kDefaultSeed);
+  ctx.WaitIdle();
+  FarField far;
+  far.Init(&world);
+  far.FullRefill(here);
+  uint32_t nfar;
+  while ((nfar = far.PrepareTick(ctx.queue)) > 0) {
+    TickParams tp{0, kDefaultSeed, 0, 0};
+    tp.farCount = nfar;
+    ctx.queue.WriteBuffer(world.tickUBO, 0, &tp, sizeof(tp));
+    rhi::CommandEncoder enc = ctx.device.CreateCommandEncoder();
+    sim.EncodeFarFill(enc, nfar);
+    ctx.queue.Submit(enc.Finish());
+  }
+
+  uint32_t waterId = 0, woodId = 0;
+  for (size_t i = 0; i < mats.size(); i++) {
+    if (mats[i].name == "water") waterId = (uint32_t)i;
+    else if (mats[i].name == "wood") woodId = (uint32_t)i;
+  }
+
+  uint32_t t = 0;
+  auto tick = [&](const std::vector<ExplosionOp>& exps,
+                  const std::vector<CellOp>& cells) {
+    SubmitTick(ctx, world, sim, ++t, kDefaultSeed, {}, exps, cells, false,
+               here, false, true);
+    ctx.WaitIdle();
+    ctx.ProcessEvents();
+  };
+  for (int i = 0; i < 30; i++) tick({}, {});
+
+  // WHERE THE WATER ACTUALLY IS, read off the grid rather than derived from
+  // TerrainHeight — which reports the carved floor in the middle of a bowl, and
+  // every literal height in this file that predated a worldgen change was
+  // rendering from inside rock.
+  int waterY = INT32_MIN;
+  {
+    std::vector<uint32_t> cbuf((size_t)kChunkVol);
+    const IVec3 wo = world.WindowOrigin();
+    for (int cy = wo.y; cy < wo.y + (int)kNChunk; cy++) {
+      ReadVoxelsSync(ctx, world,
+                     World::SlotChunkIndex({here.x, cy, here.z}), 1,
+                     cbuf.data(), "debrisPondProbe");
+      for (uint32_t j = 0; j < kChunkVol; j++)
+        if ((cbuf[j] & 0xFFFu) == waterId)
+          waterY = std::max(waterY, cy * (int)kChunk + (int)((j / kChunk) % kChunk));
+    }
+  }
+  if (waterY == INT32_MIN) {
+    std::printf("--shot-debris-pond: the map's water site is at (%d,%d) r%d "
+                "surf %d, but its centre chunk column holds no water voxel\n",
+                kPx, kPz, lake.r, lake.surf);
+    return 1;
+  }
+
+  // The subject: a wooden mass hanging over open water, blown apart in place.
+  // Not a real tree — a tree is rooted on land and the interesting half of the
+  // report is what the CHIPS do — but the same material, the same blast and the
+  // same ejecta path the owner was looking at.
+  // LOW, and it is a FRAMING number. At +26 the trunk was above the top of
+  // every frame a camera looking across the water could take, the blast was
+  // out of shot, and the chips arrived from nowhere. A mass 12 voxels up
+  // scatters into a tight patch the eye can hold in one view.
+  const int trunkY = waterY + 12;
+  std::vector<CellOp> build;
+  for (int y = 0; y < 14; y++)
+    for (int z = -3; z <= 3; z++)
+      for (int x = -3; x <= 3; x++)
+        build.push_back({World::SlotCellIndex({kPx + x, trunkY + y, kPz + z}),
+                         PackVoxNew(woodId, 0u)});
+  tick({}, build);
+  for (int i = 0; i < 4; i++) tick({}, {});
+
+  const uint32_t W = 1920, H = 1080;
+  rhi::Texture offscreen = ctx.device.CreateTexture(
+      {W, H, 1}, rhi::TextureFormat::RGBA8Unorm,
+      rhi::TextureUsage::RenderAttachment | rhi::TextureUsage::CopySrc,
+      "offscreen");
+  rhi::TextureView view = offscreen.CreateView();
+  const Tuning& shotTun = CurrentTuning();
+  const uint32_t ticksPerDay = TicksPerDay(shotTun);
+  const uint32_t shotTick =
+      (uint32_t)((double)g_shotTimeOfDay * (double)ticksPerDay) % ticksPerDay;
+  auto render = [&](Vec3 eye, Vec3 at, const char* path) {
+    const float dx = at.x - eye.x, dy = at.y - eye.y, dz = at.z - eye.z;
+    const float hd = std::sqrt(dx * dx + dz * dz);
+    Camera c;
+    c.yaw = std::atan2(dz, dx);
+    c.pitch = std::atan2(dy, hd);
+    WriteRenderParams(ctx.queue, world, eye, c, (float)W / H, true, 11.7f,
+                      kFarFogDensity, 1080.0f, shotTick);
+    rhi::CommandEncoder enc = ctx.device.CreateCommandEncoder();
+    sim.EncodeShadowResolve(enc);
+    rhi::RenderPass rp =
+        sim.BeginRenderPass(enc, view, rhi::TextureFormat::RGBA8Unorm, W, H);
+    sim.DrawWorld(rp);
+    rp.End();
+    ctx.queue.Submit(enc.Finish());
+    ctx.WaitIdle();
+    rhi::Buffer shotBuf = CreateBuffer(
+        ctx.device, (uint64_t)W * H * 4,
+        rhi::BufferUsage::MapRead | rhi::BufferUsage::CopyDst, "screenshot");
+    rhi::CommandEncoder enc2 = ctx.device.CreateCommandEncoder();
+    rhi::TexelCopyTexture srcT{};
+    srcT.texture = offscreen;
+    rhi::TexelCopyBuffer dstB{};
+    dstB.buffer = shotBuf;
+    dstB.bytesPerRow = W * 4;
+    dstB.rowsPerImage = H;
+    enc2.CopyTextureToBuffer(srcT, dstB, {W, H, 1});
+    ctx.queue.Submit(enc2.Finish());
+    std::vector<uint8_t> pixels((size_t)W * H * 4);
+    if (rhi::ReadBufferBlocking(ctx.device, shotBuf, 0, pixels.data(),
+                                pixels.size()) &&
+        WriteBmpFile(path, pixels, W, H))
+      std::printf("wrote %s\n", path);
+  };
+  // CLOSE. The authored lake is 100+ voxels across and the subject is a patch
+  // of chips a few voxels wide; from the bank it is a speck among the lilypads
+  // worldgen scatters over the same surface.
+  const Vec3 eye{(float)(kPx + 20), (float)(waterY + 7), (float)(kPz + 20)};
+  const Vec3 at{(float)kPx, (float)(waterY + 2), (float)kPz};
+
+  // The blast, then the frame WHILE IT IS IN THE AIR — the one that shows the
+  // chips on their way down rather than where they ended up.
+  tick({{kPx, trunkY + 6, kPz, 9, 900, 0, 0, 0}}, {});
+  for (int i = 0; i < 6; i++) tick({}, {});
+  render(eye, at, "screenshot_debris_pond_blast.bmp");
+
+  // ...and then after it has settled. 400 ticks is well past the point where a
+  // floater's bob has damped out (the gate measures ~40) and past
+  // sim.partFloatPatience, so anything still in flight here is a bug and shows
+  // up in the live count below.
+  for (int i = 0; i < 400; i++) tick({}, {});
+  render(eye, at, "screenshot_debris_pond.bmp");
+  // Straight down over the same patch: the framing-independent frame. A raft
+  // spread flat over the water and a tower standing on it look identical from
+  // the bank and nothing alike from above, which is the whole reported defect.
+  render({(float)kPx, (float)(waterY + 34), (float)(kPz + 1)},
+         {(float)kPx, (float)waterY, (float)kPz},
+         "screenshot_debris_pond_top.bmp");
+
+  // The census, over the column of chunks the blast could have reached: wood
+  // sitting ABOVE the waterline is the reported bug, wood AT it is the fix, and
+  // wood below it is a chip that sank (wood should not, so this is the third
+  // number rather than a lumped "not above").
+  int above = 0, atLine = 0, below = 0, lo = 1 << 30, hi = -(1 << 30);
+  {
+    std::vector<uint32_t> cbuf((size_t)kChunkVol);
+    const IVec3 wo = world.WindowOrigin();
+    for (int cy = wo.y; cy < wo.y + (int)kNChunk; cy++)
+      for (int cz = here.z - 3; cz <= here.z + 3; cz++)
+        for (int cx = here.x - 3; cx <= here.x + 3; cx++) {
+          ReadVoxelsSync(ctx, world, World::SlotChunkIndex({cx, cy, cz}), 1,
+                         cbuf.data(), "debrisPondCensus");
+          for (uint32_t j = 0; j < kChunkVol; j++) {
+            if ((cbuf[j] & 0xFFFu) != woodId) continue;
+            const int y = cy * (int)kChunk + (int)((j / kChunk) % kChunk);
+            lo = std::min(lo, y);
+            hi = std::max(hi, y);
+            if (y > waterY + 1) above++;
+            else if (y >= waterY) atLine++;
+            else below++;
+          }
+        }
+  }
+  uint32_t counts[2] = {};
+  ReadCountsSync(ctx, world, counts);
+  std::printf("--shot-debris-pond: waterline y%d, trunk y%d | wood %d above / "
+              "%d at the waterline / %d under, y%d..%d | %u particles still in "
+              "flight\n",
+              waterY + 1, trunkY, above, atLine, below, lo, hi,
+              std::min(counts[sim.Page()], kParticleCap));
+  return ctx.ReportVkValidation("--shot-debris-pond") > 0 ? 1 : 0;
+}
+
 // --shot-fluid: the MPM water counterpart of --shot. Worldgen, pour a pool of
 // MLS-MPM fluid onto open terrain with the same spawn-op shape the game's mpm
 // tool emits, let it slosh, then keep a narrow stream falling and write
@@ -2787,6 +3240,10 @@ int RunVerify(GpuContext& ctx, World& world, Simulation& sim,
 int main(int argc, char** argv) {
   InstallCrashHandler();
   StartupMark("main");
+  // The last mark a run prints: after every local in main() is gone and
+  // before static destructors. The gap from the previous mark is the cost of
+  // tearing the engine down.
+  std::atexit([] { StartupMark("atexit: all of main()'s locals destroyed"); });
 
   // --crash-test: fault on purpose, so the crash REPORTER is verifiable.
   // The handler is the one piece of code whose correctness cannot be observed
@@ -2875,6 +3332,11 @@ int main(int argc, char** argv) {
   // spout and a plunge basin) and pours for 300 ticks, and paying that on
   // every look-iteration run of the other forty frames is the wrong trade.
   bool shotWaterfall = false;
+  // --shot-debris-pond: the buoyancy fixture (docs/PLAN_debris_buoyancy.md).
+  // Its own flag for the same reason the waterfall has one: it moves the
+  // residency window onto a generated pond, regenerates the world and runs
+  // 450 ticks, which is not a cost the other forty look frames should pay.
+  bool shotDebrisPond = false;
   // --shot-fluid-pond: the same harness aimed into a generated pond, so the
   // MPM isosurface has to share the frame with deep SETTLED water. Separate
   // process rather than an extra block in --shot-fluid because the scene moves
@@ -2921,11 +3383,16 @@ int main(int argc, char** argv) {
           "  --shot                Screenshot-only look iteration\n"
           "  --shot-fluid          MPM fluid screenshot mode\n"
           "  --shot-waterfall      Waterfall mist/spray fixture (CA liquid)\n"
+          "  --shot-debris-pond    Blow a wooden mass apart over a generated\n"
+          "                        pond: does the debris sink, float or hang?\n"
           "  --shot-fluid-pond     MPM fluid poured into a generated pond\n"
           "                        (the MPM/settled-water seam)\n"
           "  --shot-mob <def>      Mob pose look iteration (def[:limb,...])\n"
           "  --shot-inventory      Character screen (I) with a damaged avatar,\n"
           "                        one frame to screenshot_inventory.bmp\n"
+          "  --shot-jump           Airborne pose look iteration: third person,\n"
+          "                        one BMP per phase of a jump (rise/apex/\n"
+          "                        fall/land), triggered on the pose's own vy\n"
           "  --time <0..1>         Time of day for --shot (0=midnight, 0.5=noon)\n\n"
           "Fluid lab:\n"
           "  --lab [scene]         Windowed fluid lab (basin|hill|faucet|pool|slosh|pond|worldlake)\n"
@@ -2936,6 +3403,7 @@ int main(int argc, char** argv) {
           "  --autofly             Enable autofly camera\n"
           "  --autofly-hard        Adversarial autofly (diagonal + descent)\n"
           "  --autofly-surface     Surface-following autofly\n"
+          "  --autowalk            Walk on foot: forward held, hop /45 ticks, quarter turn /240\n"
           "  --autofly-park        Surface autofly that stops (sleep discriminator)\n"
           "  --measure             Vulkan sizing harness (occupancy + GPU timings)\n"
           "  --perf                Performance suite -> build/perf.json (tuner Performance tab)\n"
@@ -2990,6 +3458,7 @@ int main(int argc, char** argv) {
     else if (a == "--shot") shot = true;
     else if (a == "--shot-fluid") shotFluid = true;
     else if (a == "--shot-waterfall") shotWaterfall = true;
+    else if (a == "--shot-debris-pond") shotDebrisPond = true;
     else if (a == "--shot-fluid-pond") shotFluidPond = true;
     // Fluid lab modes. The scene argument is optional (it must not start
     // with '-' or it is the next flag).
@@ -3013,7 +3482,15 @@ int main(int argc, char** argv) {
     // g_shotInventory.
     else if (a == "--shot-inventory") {
       g_shotInventory = true;
-      g_harnessFrames = kShotInvGrimoireFrame;
+      g_harnessFrames = kShotInvLootFrame;
+    }
+    // `--shot-jump` is the AIRBORNE POSE's look-iteration harness: walk the
+    // avatar in third person, jump it, and write one picture per phase of the
+    // arc. See the note at g_shotJump for why the captures are triggered by
+    // the pose's own vel.y rather than by a frame number.
+    else if (a == "--shot-jump") {
+      g_shotJump = true;
+      g_harnessFrames = kShotJumpLastFrame;
     }
     // `--duel-dummy` is the melee FEEL harness: a sword-armed human standing
     // three metres in front of the spawn, with nothing driving it. Mobs have no
@@ -3022,14 +3499,28 @@ int main(int argc, char** argv) {
     // stroke can be judged against a body rather than against the sky. Phase B's
     // AI/spawn panel supersedes it; keep the footprint here at one bool.
     else if (a == "--duel-dummy") g_duelDummy = true;
-    // `--short-range` is the headless handle on the dev panel's "short range
-    // (100 m + fog)" checkbox: no offscreen path can press a checkbox, and the
-    // whole point of the mode is a LOOK and a frame time to compare, both of
-    // which are captured by --shot / --render-budget. Equivalent to
-    // SANDVOX_SHORT_RANGE=1. In the windowed game it only sets the checkbox's
-    // starting position — the panel stays the live authority from frame 1.
+    else if (a == "--fell-tree") {
+      g_fellTree = true;
+      if (i + 1 < argc && argv[i + 1][0] != '-') g_fellTreeAt = std::atoi(argv[++i]);
+      if (i + 1 < argc && argv[i + 1][0] != '-' &&
+          std::sscanf(argv[i + 1], "%d,%d", &g_fellSiteX, &g_fellSiteZ) == 2) {
+        g_fellSiteSet = true;
+        i++;
+      }
+    }
+    // `--short-range` is the headless handle on the dev panel's short-range
+    // row: no offscreen path can press a radio button, and the whole point of
+    // the mode is a LOOK and a frame time to compare, both of which are
+    // captured by --shot / --render-budget. Equivalent to
+    // SANDVOX_SHORT_RANGE=1. `--short-range-near` picks the tighter arm
+    // (render.shortRangeNearDist, 50 m by default) and implies the mode, so
+    // the near arm is one flag rather than two that must be given together.
+    // In the windowed game both only set the row's starting position — the
+    // panel stays the live authority from frame 1.
     else if (a == "--short-range") SetShortRange(true);
+    else if (a == "--short-range-near") { SetShortRange(true); SetShortRangeNear(true); }
     else if (a == "--autofly") g_autofly = true;
+    else if (a == "--autowalk") g_autoWalk = true;
     else if (a == "--autofly-hard") { g_autofly = true; g_autoflyHard = true; }
     else if (a == "--autofly-surface") { g_autofly = true; g_autoflySurface = true; }
     // `--autofly-park` is --autofly-surface that STOPS (see ParkProbe): the
@@ -3480,6 +3971,16 @@ int main(int argc, char** argv) {
     // edit — tuning.json keeps the shipped default. --fluid-bench sets it
     // per scene itself.
     if (labScene >= 0) tune.sim.fluidExciteMode = 1;
+    // --shot-jump photographs a POSE, and the default world drops the spawn in
+    // a forest: a third-person boom inside a pine is a picture of bark. Trees
+    // and cover off gives bare terrain to jump on and a clear line to the
+    // body. Forced here rather than in tuning.json because it feeds the shader
+    // constant prelude and therefore worldgen — it has to be true before the
+    // first chunk is generated, not toggled later.
+    if (g_shotJump) {
+      tune.debug.vegetation = 0;
+      tune.debug.groundCover = 0;
+    }
     SetCurrentTuning(tune);
   }
   // The authored edit layer named by worldgen.editLayer. Read here, before any
@@ -3601,7 +4102,7 @@ int main(int argc, char** argv) {
   };
 
   GLFWwindow* window = nullptr;
-  if (!selftest && !shot && !shotWaterfall && !measure && !perf &&
+  if (!selftest && !shot && !shotWaterfall && !shotDebrisPond && !measure && !perf &&
       !fluidBench && !shaderStats &&
       shotMob.empty() && voxdumpArgs.empty() && !voxserve) {
     if (!glfwInit()) return 1;
@@ -3624,7 +4125,7 @@ int main(int argc, char** argv) {
   // the TimestampQuery device feature (per-pass GPU timings).
   if (!ctx.Init(window, 1600, 900, lowPowerAdapter,
                 /*wantTimestamps=*/measure || perf || renderBudget || fluidBench ||
-                    budgetArms || telemetryEnabled,
+                    budgetArms || telemetryEnabled || g_harnessFrames > 0,
                 backend, vkValidation,
                 sledgehammer))
     return 1;
@@ -3646,6 +4147,36 @@ int main(int argc, char** argv) {
   world.Init(ctx.device);
   StartupMark("world buffers (page pool, far cascades)");
   Simulation sim;
+  // WHETHER THE FAR CASCADES COMPILE AT ALL (Simulation::FarBuild). Decided
+  // before Init because BuildPipelines is what would start them. Eager for
+  // anything that will render a horizon — the game and --frames, every --shot
+  // family, --measure / --perf / --render-budget, --shader-stats (which must
+  // see every pipeline), and the FULL selftest suite, which contains the far
+  // gates. Lazy for the iteration tools: --voxdump / --voxserve, a filtered
+  // `--gate` / `--verify` run, --sweep, the fluid bench. Lazy is not "never":
+  // a far gate under `--gate far-fog` still gets its pipelines, it just pays
+  // for them when it asks (Simulation::EnsureFarPipelines) instead of the
+  // whole run paying at exit for a horizon nobody looked at.
+  {
+    const bool voxelTool = voxserve || !voxdumpArgs.empty();
+    const bool checkedOutput =
+        selftest || verify || measure || perf || renderBudget || budgetArms ||
+        shot || shotFrames || shotWaterfall || shotDebrisPond || shotFluid ||
+        shotFluidPond ||
+        fluidBench || shaderStats || !shotMob.empty() || !sweepParam.empty();
+    const bool rendersHorizon =
+        shot || shotFrames || shotWaterfall || shotDebrisPond || shotFluid ||
+        shotFluidPond ||
+        !shotMob.empty() || measure || perf || renderBudget || budgetArms ||
+        shaderStats || suiteAcceptance ||
+        (selftest && stOpt.only.empty() && !stOpt.list && sweepParam.empty());
+    const bool eager = (!checkedOutput && !voxelTool) || rendersHorizon;
+    sim.SetFarBuild(eager ? Simulation::FarBuild::Eager
+                          : Simulation::FarBuild::Lazy);
+    if (!eager)
+      std::printf("far-cascade pipelines: lazy (compiled only if this run asks "
+                  "for cascade content)\n");
+  }
   if (!sim.Init(ctx.device, world, mats, reactions, micro, treeAtlas, worldMapWords,
                 assetDir + "/shaders"))
     return 1;
@@ -3682,7 +4213,9 @@ int main(int argc, char** argv) {
   // only if the RENDER_STATS const actually compiled in (fragment atomics).
   sandvox::RenderStatsRing liveStats;
   bool liveStatsOn = false;
-  if (telemetryEnabled) {
+  // The `--frames` harness takes the timers too (not the port): its summary
+  // prints the per-node GPU rows beside the CPU scopes, from the same samples.
+  if (telemetryEnabled || g_harnessFrames > 0) {
     if (liveTimer.Init(ctx, 192)) {
       liveTimer.SetRowGranularity(true);
       sim.SetPassTimer(&liveTimer);
@@ -3691,10 +4224,11 @@ int main(int argc, char** argv) {
     }
     liveStatsOn = RenderStatsEnabled() && FragmentStoresAvailable() &&
                   liveStats.Init(ctx);
-    std::printf("telemetry: live on port %u, GPU pass timings %s, raymarch "
-                "step counters %s\n",
-                telemetryPort, liveTimed ? "ON" : "unavailable (no timestamps)",
-                liveStatsOn ? "ON" : "off");
+    if (telemetryEnabled)
+      std::printf("telemetry: live on port %u, GPU pass timings %s, raymarch "
+                  "step counters %s\n",
+                  telemetryPort, liveTimed ? "ON" : "unavailable (no timestamps)",
+                  liveStatsOn ? "ON" : "off");
   }
   // The frame being accumulated, and the map from a frame number to the sample
   // still waiting for its GPU numbers. Three deep: a deferred timestamp map
@@ -3702,7 +4236,11 @@ int main(int argc, char** argv) {
   // been sent cannot be corrected.
   sandvox::PerfSample liveSample;
   uint32_t liveFrameNo = 0;
-  struct LivePending { uint32_t frame; sandvox::PerfSample s; };
+  struct LivePending {
+    uint32_t frame;
+    sandvox::PerfSample s;
+    std::vector<std::pair<const char*, double>> passes;  // harness only
+  };
   std::vector<LivePending> livePending;
 
   Physics phys;
@@ -3720,9 +4258,15 @@ int main(int argc, char** argv) {
   // Ordering makes that unrepresentable; a teardown call would only make it
   // unlikely.
   WorldItems ground;
+  // ...and the corpses you can loot (game/corpses.h): the same registry shape
+  // over the same bodies, declared before `debris` for the same reason.
+  Corpses corpses;
   DebrisSystem debris;
   debris.Init(&phys, &world, mats, reactions);
-  debris.SetOnBodyGone([&ground](uint64_t h) { ground.OnBodyGone(h); });
+  debris.SetOnBodyGone([&ground, &corpses](uint64_t h) {
+    ground.OnBodyGone(h);
+    corpses.OnBodyGone(h);
+  });
   MobSystem mobs;
   mobs.Init(&phys, &world, &debris, mats, reactions);
   // Micro-body bricks (PLAN §C) are packed at mob-def load and uploaded
@@ -3784,6 +4328,11 @@ int main(int argc, char** argv) {
   // release hook above already forgets it when the body goes.
   mobs.SetOnItemShed(
       [&ground](uint64_t h, const std::string& name) { ground.Add(h, name); });
+  // A CREATURE THAT FELL WITH THINGS ON IT. Die() reports the bodies it became
+  // and the gear still on them the instant before the rig forgets; from here
+  // on the heap is a corpse the crosshair can name and the character screen
+  // can open (Mob::CorpseReport, game/corpses.h).
+  mobs.SetOnCorpse([&corpses](const CorpseReport& r) { corpses.Add(r); });
   Stream stream;
   stream.Init(&ctx, &world, &sim, kDefaultSeed);
   stream.OnMaterialsReloaded(mats);
@@ -3807,7 +4356,8 @@ int main(int argc, char** argv) {
   {
     const bool checkedOutput =
         selftest || verify || measure || perf || renderBudget || budgetArms ||
-        shot || shotFrames || shotWaterfall || shotFluid || shotFluidPond ||
+        shot || shotFrames || shotWaterfall || shotDebrisPond || shotFluid ||
+        shotFluidPond ||
         fluidBench || shaderStats || !shotMob.empty() || !sweepParam.empty();
     const bool voxelTool = voxserve || !voxdumpArgs.empty();
     sim.AllowDeferredFar(!checkedOutput || voxelTool);
@@ -3853,6 +4403,7 @@ int main(int argc, char** argv) {
   if (voxserve) return RunVoxServe(ctx, world, sim, mats);
   if (shot) return RunShots(ctx, world, sim);
   if (shotWaterfall) return RunWaterfallShot(ctx, world, sim);
+  if (shotDebrisPond) return RunDebrisPondShot(ctx, world, sim, mats);
   if (shotFluid || shotFluidPond)
     return RunFluidShot(ctx, world, sim, mats, shotFluidPond);
   if (fluidBench)
@@ -3945,7 +4496,13 @@ int main(int argc, char** argv) {
     if (stOpt.list) return selftest::List();
     selftest::Ctx sc{ctx,   world,  sim,    mats,  reactions,
                      phys,  debris, mobs,   stream, items};
-    return selftest::Run(sc, stOpt);
+    const int rc = selftest::Run(sc, stOpt);
+    // The gate has printed its verdict; everything after this line is
+    // destructors. Marked because a headless run was measured sitting 45 s
+    // between its last line and process exit (2026-09-09), and without a
+    // clock on it that time is invisible.
+    StartupMark("selftest returned; teardown begins");
+    return rc;
   }
 
   // BEFORE Overlay::Init — ImGui's own scroll callback chains to whatever was
@@ -3976,6 +4533,7 @@ int main(int argc, char** argv) {
   // this seed the flag would be latched in support.cpp and the panel would
   // show the box unticked while the frame rendered at 100 m.
   ui.shortRange = ShortRangeMode();
+  ui.shortRangeNear = ShortRangeNear();
   {
     const auto& fs = CurrentTuning().sim;
     ui.fGravity     = fs.fluidGravity;
@@ -4165,6 +4723,16 @@ int main(int argc, char** argv) {
   std::printf("spawn: (%d, %d) on the map's spawn site, ground y%d\n",
               worldmap::CurrentWorldMap().spawnX, worldmap::CurrentWorldMap().spawnZ,
               (int)player.pos.y - 10);
+  if (g_fellSiteSet) {
+    const int px = g_fellSiteX - 48;
+    player.pos = Vec3{(float)px,
+                      (float)(World::TerrainHeight(px, g_fellSiteZ, kDefaultSeed) + 10),
+                      (float)g_fellSiteZ};
+    cam.yaw = 0.0f;    // Forward() = +X: the tree is planted 48 voxels that way
+    cam.pitch = 0.0f;
+    std::printf("--fell-tree: spawn moved to (%d, %d) so the tree stands at (%d, %d)\n",
+                px, g_fellSiteZ, g_fellSiteX, g_fellSiteZ);
+  }
   // Lab: fixed per-scene pose, flying, aimed at the scene — the same pose the
   // bench renders from, so what is judged live and what is measured headless
   // are the same framing.
@@ -4211,6 +4779,15 @@ int main(int argc, char** argv) {
   // A body part clicked in the inspector with a sentence on the stack, latched
   // the same way: the slot, or -1.
   int castAtPartQueued = -1;
+  // ---- looking at things, and looting them (game/corpses.h) ----------------
+  // What the reach ray found this frame (a debris body handle or 0), the
+  // corpse the loot panel is open on, and whether E opened the character
+  // screen to show it — so closing the loot closes the screen it opened and
+  // leaves alone one the player opened themselves.
+  uint64_t lookBody = 0;
+  uint64_t lootCorpse = 0;
+  bool lootOpenedScreen = false;
+  std::vector<uint64_t> lookIgnore;   // the avatar's own limbs, per frame
   // RMB held (a beam stays lit while it is), and Delete pressed in magic mode
   // (drop the newest status), both read on the frame and consumed by the tick.
   bool beamHeld = false;
@@ -4559,7 +5136,14 @@ int main(int argc, char** argv) {
   while (!glfwWindowShouldClose(window)) {
     if (g_harnessFrames > 0) {
       frameCounter++;
-      if (frameCounter == g_harnessFrames / 2) {
+      // The mid-run reload verifies the F5 path, but it also recompiles every
+      // pipeline in the foreground and the far set on three background
+      // threads for the next ~40 s, which is half the run — so the frame-time
+      // tail of a default `--frames` run is the compiler, not the game.
+      // SANDVOX_FRAMES_NO_RELOAD=1 is the measurement arm.
+      static const bool noReload =
+          std::getenv("SANDVOX_FRAMES_NO_RELOAD") != nullptr;
+      if (frameCounter == g_harnessFrames / 2 && !noReload) {
         std::printf("--frames harness: triggering shader reload (F5 path)\n");
         ui.reloadShaders = true;
       }
@@ -4568,6 +5152,91 @@ int main(int argc, char** argv) {
     // The park probe is tick-scheduled, so it decides its own end: --frames
     // only has to be generous enough to reach it.
     if (g_parkDone) glfwSetWindowShouldClose(window, 1);
+
+    // --shot-jump: decide whether THIS frame is one of the four pictures.
+    //
+    // Run here, before the render, so the capture block downstream only has to
+    // check a pointer. The thresholds are read off the same tuning rows the
+    // pose blends on, so a picture called "rise" is the shape the tuck is
+    // authored at rather than "whatever 6 frames after the jump happened to
+    // be" — see the note at g_shotJump.
+    g_shotJumpPath = nullptr;
+    // A GROUNDED FRAME OF THE SAME BODY, FIRST. Judging an airborne pose in
+    // isolation is judging it against a memory: half of "does this look right"
+    // is whether the arms, the lean and the knee bend read as the SAME
+    // character who was walking a moment ago. This is the reference the other
+    // four are compared with, and it costs one frame.
+    if (g_shotJump && frameCounter == kShotJumpAtFrame - 20)
+      g_shotJumpPath = "screenshot_jump_walk.bmp";
+    if (g_shotJump && frameCounter > kShotJumpAtFrame &&
+        g_shotJumpWant != JumpShot::Done && avatar.Spawned()) {
+      const auto& av = CurrentTuning().avatar;
+      // OFF THE PLAYER, NOT OFF THE POSE. `AirPoseVy` is zero whenever
+      // avatar.airPose is off, so triggering on it would make this harness
+      // unable to photograph the thing it is supposed to be compared against —
+      // and an A/B whose control arm writes no files is not an A/B. The
+      // controller's own velocity is the same signal the pose reads anyway.
+      const float vy = player.vel.y * kVoxelMeters;   // voxels/s -> m/s
+      const bool air = !player.grounded;
+      // A FEW FRAMES OF AIR BEFORE THE FIRST PICTURE. The launch velocity is
+      // whole on the very first airborne frame while the pose is still blending
+      // in over ikBlendHalflife, so a bare `vy > threshold` photographs the
+      // standing pose with a jump's velocity attached — measured, 0.25 of the
+      // way in. This is not a fudge for the blend: no animation system snaps,
+      // and "what does the rig look like a tenth of a second into a jump" is
+      // the honest question.
+      static int airFrames = 0;
+      airFrames = air ? airFrames + 1 : 0;
+      switch (g_shotJumpWant) {
+        case JumpShot::Rise:
+          // Most of the way up the launch, so the tuck is nearly whole.
+          if (air && airFrames >= 5 && vy > av.airPoseRiseSpeed * 0.45f) {
+            g_shotJumpPath = "screenshot_jump_rise.bmp";
+            g_shotJumpWant = JumpShot::Apex;
+          }
+          break;
+        case JumpShot::Apex:
+          // The float shape is the vy == 0 end of the blend, by construction.
+          if (air && std::fabs(vy) < av.airPoseRiseSpeed * 0.15f) {
+            g_shotJumpPath = "screenshot_jump_apex.bmp";
+            g_shotJumpWant = JumpShot::Fall;
+          }
+          break;
+        case JumpShot::Fall:
+          // Committed descent. A jump off flat ground never reaches the full
+          // airPoseFallSpeed (it only regains its launch speed), so this asks
+          // for a fraction of the launch speed downward instead — the picture
+          // is of the reach shape coming in, which is what a jump shows.
+          if (air && vy < -av.airPoseRiseSpeed * 0.45f) {
+            g_shotJumpPath = "screenshot_jump_fall.bmp";
+            g_shotJumpWant = JumpShot::Land;
+          }
+          break;
+        case JumpShot::Land: {
+          // The landing PREPARE, taken off the ground probe's own weight
+          // rather than off "the last airborne frame". Those are not the same
+          // picture: the pose fades out over the IK half-life once the feet
+          // are down, so by the time the rig reads grounded the prepare has
+          // already begun unwinding and the photograph is of the `land`
+          // squash instead — a different system's work.
+          //
+          // ...OR the last airborne frame, whichever comes first. The probe's
+          // weight is squared against airPoseLandHeight, so a body that jumps
+          // off a lip and lands lower than it left never reaches the high end
+          // of it — and a harness that silently writes three files instead of
+          // four is worse than one that writes a slightly early fourth.
+          const bool deep = avatar.AirPoseLand() > 0.5f;
+          if ((deep && air) || player.grounded) {
+            g_shotJumpPath = "screenshot_jump_land.bmp";
+            g_shotJumpWant = JumpShot::Done;
+          }
+          break;
+        }
+        default:
+          break;
+      }
+      if (g_shotJumpPath) g_shotJumpVy = vy;
+    }
 
     // --shot-inventory's scripted schedule. Frame-counted rather than
     // wall-clocked so the same picture comes out on any machine.
@@ -4646,6 +5315,55 @@ int main(int argc, char** argv) {
           ui.grimoireEditWords.clear();
           for (int gi : cg.glyphs)
             if (const GlyphDef* d = glyphs.At(gi)) ui.grimoireEditWords.push_back(d->id);
+        }
+      }
+      // Fourth picture: a corpse with its gear on, opened. A human is spawned
+      // a few paces ahead, dressed in every worn piece the library has and
+      // handed a sword, and killed — the same CorpseReport path a fight
+      // produces — and the panel is opened on it as E would.
+      if (frameCounter == kShotInvGrimoireFrame + 1) {
+        ui.grimoireMode = false;
+        int humanDef = -1;
+        for (size_t i = 0; i < mobs.Defs().size(); i++)
+          if (mobs.Defs()[i].name == "human") humanDef = (int)i;
+        if (humanDef >= 0) {
+          const MobDef& d = mobs.Defs()[humanDef];
+          const Vec3 fwd = cam.Forward();
+          const float dist = MetresToCells(2.0f);
+          const int sx = ifloor(player.pos.x + fwd.x * dist) - d.prefab.size.x / 2;
+          const int sz = ifloor(player.pos.z + fwd.z * dist) - d.prefab.size.z / 2;
+          const int sy = World::TerrainHeight(sx + d.prefab.size.x / 2,
+                                              sz + d.prefab.size.z / 2,
+                                              kDefaultSeed) + 1;
+          const uint64_t id = mobs.Spawn(humanDef, {sx, sy, sz});
+          int dressed = 0;
+          if (id) {
+            Equipment worn;
+            for (const ItemDef& it : items.items) {
+              if (!ItemKindIsWorn(it.kind)) continue;
+              const int slot = EquipSlotFor(it.kind, worn);
+              if (slot < 0 || !worn.At(slot).Empty()) continue;
+              if (mobs.WearItem(id, &it, slot)) {
+                worn.slots[slot] = {items.Find(it.name), 1};
+                dressed++;
+              }
+            }
+            if (const ItemDef* sword = items.At(items.Find("sword")))
+              mobs.EquipItem(id, sword);
+            if (Mob* m = mobs.FindMobById(id)) m->Die();
+          }
+          const CorpseReport* c = corpses.Find(id);
+          if (c) {
+            lootCorpse = id;
+            ui.lootOpen = true;
+            ui.lootTitle = c->def;
+          }
+          std::printf("--shot-inventory: corpse of a human in %d worn pieces, "
+                      "%zu lootable%s\n",
+                      dressed, c ? c->gear.size() : (size_t)0,
+                      c ? "" : " (NO CORPSE REPORTED)");
+        } else {
+          std::fprintf(stderr, "--shot-inventory: no \"human\" mob def\n");
         }
       }
     }
@@ -4846,7 +5564,12 @@ int main(int argc, char** argv) {
       const float k = hl > 1e-4f ? 1.0f - std::pow(0.5f, dt / hl) : 1.0f;
       lookSensNow += (want - lookSensNow) * k;
     }
-    if (captured)
+    // --fell-tree with a site OWNS the camera: the first frame's cursor delta
+    // (wherever the mouse happened to be when the window opened) turned the
+    // view 88 degrees and planted the oak in the wrong place with 0 cells,
+    // and a hand on the mouse mid-run would move the very view the drawBodies
+    // number is measured through.
+    if (captured && !g_fellSiteSet)
       cam.ApplyMouse((float)(mx - mx0) * lookSensNow,
                      (float)(my - my0) * lookSensNow);
     // The swing gets the RAW delta — deliberately not scaled with the view
@@ -4996,17 +5719,87 @@ int main(int argc, char** argv) {
     // the laser uses), and the registry answers "is that a thing, and which
     // thing". A body the registry does not know is scenery — a rock, a corpse,
     // a chunk of somebody's wall — and is left alone.
-    if (captured && eE.Pressed(key(GLFW_KEY_E))) {
-      // Arm's length, in world voxels. A literal rather than a tuning knob
-      // because it is a HUMAN dimension, not a feel dial: the avatar is 17
-      // voxels tall (gen_human's height contract), so 5 is about how far a
-      // person can reach without walking.
-      constexpr float kPickupReach = 5.0f;
+    //
+    // THE RAY RUNS EVERY FRAME, NOT ONLY ON THE PRESS, because the prompt is
+    // the feature: "E  pick up robe" under the crosshair is what tells the
+    // player the thing on the floor is a thing at all. One Jolt ray cast per
+    // frame against the moving layer is nothing next to the laser's.
+    //
+    // Reach, in world voxels. A literal rather than a tuning knob because it
+    // is a HUMAN dimension, not a feel dial: the avatar is 17 voxels tall
+    // (gen_human's height contract) and the ray starts at the EYE, so a thing
+    // lying at your feet is a full body height away before you have bent
+    // down — 24 is the floor a pace ahead, and not the far side of the room.
+    constexpr float kPickupReach = 24.0f;
+    // How far you may wander from a corpse with its panel open before it
+    // closes: a few paces, the same "still standing over it" a pickup means.
+    constexpr float kLootRange = 40.0f;
+    lookBody = 0;
+    ui.lookPrompt.clear();
+    if (captured && !ui.inventoryOpen) {
+      // TWO THINGS THIS RAY MUST NOT DO, both measured 2026-09-12 with a
+      // walking avatar (a fly-mode harness has no rig and showed neither):
+      //
+      //  1. HIT THE PLAYER'S OWN HEAD. The eye sits inside the avatar's head
+      //     collider, and Jolt reports a convex shape the ray starts in as a
+      //     hit at fraction 0 — so from the player's eye EVERY cast answered
+      //     "your own head", the prompt never appeared and E did nothing.
+      //     The rig's live limb bodies (shells and the held item included)
+      //     are excluded from the cast.
+      //  2. MISS WHAT THE CROSSHAIR IS ON IN THIRD PERSON. The camera is on a
+      //     boom metres behind the body; a ray from the head along the
+      //     camera's forward runs parallel to the crosshair line but metres
+      //     off it (16 of 16 corpse bodies missed). So the ray starts at the
+      //     RENDER eye — the boom in Third / OverShoulder, the head in First
+      //     — and a hit only counts if the point it lands on is within reach
+      //     of the HEAD, so arm's length stays arm's length from the body.
+      //
+      // This is the one ray that reads the camera: it is a UI query against
+      // Jolt bodies, not a sim input, so the "picking rays use player.EyePos
+      // so the camera cannot change what the sim sees" contract in the camera
+      // block below is not what it is protecting. `tpRig.EyePos()` is last
+      // frame's boom, which is where the picture the player is aiming with
+      // was drawn from.
+      lookIgnore.clear();
+      avatar.AppendLiveLimbBodies(lookIgnore);
+      const Vec3 hand = player.EyePos();
+      const Vec3 from = camMode == CameraMode::First ? hand : tpRig.EyePos();
+      const Vec3 fwd = cam.Forward();
+      const float castLen = kPickupReach + (from - hand).len();
       float frac = 1.0f;
-      const uint64_t hit = phys.CastRayBody(player.EyePos(), cam.Forward(),
-                                            kPickupReach, frac);
+      const uint64_t hit =
+          phys.CastRayBody(from, fwd, castLen, frac, lookIgnore);
+      if (hit && (from + fwd * (frac * castLen) - hand).len() <= kPickupReach)
+        lookBody = hit;
+      // The ground registry FIRST: a shed robe still lying in the heap it
+      // came off reads as the robe, not as the corpse (ShedCorpseLoot).
+      if (const WorldItem* w = lookBody ? ground.Find(lookBody) : nullptr) {
+        ui.lookPrompt = "E  pick up " + w->item;
+      } else if (const CorpseReport* c = corpses.FindByBody(lookBody)) {
+        ui.lookPrompt = c->gear.empty() ? c->def + "  -  nothing left on it"
+                                        : "E  loot " + c->def;
+      }
+    }
+    if (captured && eE.Pressed(key(GLFW_KEY_E))) {
+      const uint64_t hit = lookBody;
       const WorldItem* w = hit ? ground.Find(hit) : nullptr;
-      if (w) {
+      const CorpseReport* corpse = w ? nullptr : corpses.FindByBody(hit);
+      if (corpse && !corpse->gear.empty()) {
+        // OPEN THE CORPSE: the character screen with its loot panel up. The
+        // cursor dance is the I key's, and `lootOpenedScreen` remembers that
+        // it was E who opened the screen so closing the loot closes it again.
+        lootCorpse = corpse->mobId;
+        ui.lootOpen = true;
+        ui.lootTitle = corpse->def;
+        if (!ui.inventoryOpen) {
+          lootOpenedScreen = true;
+          ui.inventoryOpen = true;
+          captureBeforeUi = captured;
+          captured = false;
+          glfwSetInputMode(window, GLFW_CURSOR, GLFW_CURSOR_NORMAL);
+          glfwGetCursorPos(window, &mx0, &my0);
+        }
+      } else if (w) {
         const int di = items.Find(w->item);
         // Bag first, hotbar as the overflow. A full pack REFUSES rather than
         // silently swallowing or silently dropping: the item stays exactly
@@ -5089,9 +5882,73 @@ int main(int argc, char** argv) {
       // does not read as a fresh press the instant it closes.
       eJump.Pressed(false);
     }
+    // --shot-jump: walk forward and jump once, with nobody at the keyboard.
+    //
+    // A WALKING jump, not a standing one, because the travel lean is part of
+    // the pose (avatar.airPoseLean) and a standing jump shows none of it — the
+    // picture would be of half the feature. Sprint is off: a sprint jump is the
+    // loudest version of the lean and therefore the least useful one to judge
+    // the neutral shape from.
+    if (g_shotJump) {
+      if (frameCounter == 1) {
+        // The dev panel covers the half of the frame the body walks through,
+        // and it is the same reason --shot-inventory hides it: a harness whose
+        // whole output is a picture must not photograph the debug overlay.
+        ui.visible = false;
+        // MID-MORNING, NOT MIDNIGHT. A new world starts just after midnight,
+        // so the default picture is an unlit silhouette — which is useless for
+        // judging a POSE, the one thing this harness exists to show. The
+        // celestial clock is the game's own way to move the sun (the dev
+        // panel's time slider drives it); engage it with a scale change and
+        // then place it, rather than fast-forwarding thousands of ticks.
+        CelestialClock& sky = Celestial();
+        sky.SetScale(2.0f, tick);   // any value but 1.0 engages the clock
+        sky.SetScale(1.0f, tick);   // ...then back to real time, sun placed
+        const int64_t tpd = (int64_t)TicksPerDay(CurrentTuning());
+        sky.ticks = tpd * 42 / 100;   // ~10 a.m.: raking light, clear shapes
+        sky.prevTicks = sky.ticks;
+        sky.rem = 0;
+      }
+      player.fly = false;
+      ui.fly = false;
+      // Third person, or there is nothing to photograph: first person hides
+      // the body and keeps only the arms.
+      camMode = CameraMode::Third;
+      // RUN DIAGONALLY, so the camera gets a THREE-QUARTER view for free.
+      //
+      // In third person the body faces where it RUNS, not where the camera
+      // looks (avatar body facing, thirdperson.h), and the boom stays behind
+      // the CAMERA. So a forward+strafe input turns the body ~40 degrees out of
+      // the view and the picture shows the fore/aft leg scissor and the arms'
+      // depth — both of which a dead-astern shot flattens away entirely, and
+      // the scissor is most of what tells the four shapes apart.
+      // Nearly side-on (~70 degrees out of the view): a jump is read off its
+      // PROFILE — knee tuck, hip angle, the arms' fore/aft — and every one of
+      // those is a depth the camera flattens from behind.
+      pin.forward = 0.4f;
+      pin.strafe = 1.f;
+      pin.sprint = false;
+      cam.yaw = 0.6f;
+      cam.pitch = -0.12f;
+      pin.jumpPressed = (frameCounter == kShotJumpAtFrame);
+    }
     // --autofly: hold W+sprint in fly mode, no human at the keyboard. Exists to
     // reproduce the streaming-shift stutter, which only appears when the window
     // origin moves several chunks per second.
+    if (g_autoWalk) {
+      player.fly = false;
+      ui.fly = false;
+      pin.forward = 1.f;
+      pin.strafe = 0.f;
+      pin.sprint = false;
+      static uint32_t lastHopTick = ~0u;
+      if (tick % 45u == 0u && lastHopTick != tick) {
+        pin.jumpPressed = true;
+        lastHopTick = tick;
+      }
+      // A fixed tick schedule, like the autofly phases: reproducible run to run.
+      cam.yaw = 2.35f + (float)((tick / 240u) % 4u) * 1.5707963f;
+    }
     if (g_autofly) {
       player.fly = true;
       ui.fly = true;
@@ -5570,8 +6427,15 @@ int main(int argc, char** argv) {
     {
       static bool wasInLiquid = false;
       const float enterSpeed = -player.vel.y;
-      player.Update(dt, pin, cam.FlatForward(), cam.Right(), cam.Forward(),
-                    kindAt);
+      // A limp or rising body owns the player, not the controller: no
+      // input, no gravity, no sweeps. The capsule is moved onto the body
+      // after each physics step (PlayerAvatar::RagdollFollow, below).
+      if (avatar.Spawned() && avatar.Ragdolled()) {
+        player.vel = {};
+      } else {
+        player.Update(dt, pin, cam.FlatForward(), cam.Right(), cam.Forward(),
+                      kindAt);
+      }
       if (player.inLiquid && !wasInLiquid && enterSpeed > 2.0f) {
         // Crest height in metres, from the entry speed, capped: a splash from
         // a great fall is bigger, but not without limit — an unbounded
@@ -5842,7 +6706,49 @@ int main(int argc, char** argv) {
     // Stream::Update is a per-TICK call and the clamp below runs up to four of
     // them, so a slow frame used to shift two or three times and get slower.
     stream.BeginFrame();
+    // ...and one cascade-refill slice per frame, for the same reason
+    // (farfield.h BeginFrame).
+    far.BeginFrame();
     while (accumulator >= kTickDt && ticksThisFrame < kMaxTicksPerFrame) {
+      // ---- THE GPU-LAG THROTTLE: a second tick only if the GPU can take it.
+      //
+      // The 4-tick catch-up above is Gaffer's clamp and it is right for a CPU
+      // hitch: the CPU owes the world some ticks and pays them. It is WRONG
+      // when the long frame was the GPU's: every tick submits a plane of
+      // worldgen, a CA pass and a snapshot copy, so paying three of them into
+      // a queue that is already a frame behind makes the next frame longer,
+      // which owes more ticks, which is the loop that ends in the two blocking
+      // waits on this path — SubmitTick's snapshot-staleness fence (Snapshot
+      // Stall) and Stream's T+kWakeLatency wake fence (billed to World
+      // Storage). Measured `--frames 900 --autofly-surface` before this:
+      // stalls on 14.8% of frames, 215 fences for 7.95 s, whole-frame p99
+      // 539 ms.
+      //
+      // The lag is READ, not guessed: each submitted tick kicks one snapshot
+      // readback (KickReadback) and its map ticket stays pending until that
+      // submit's fence signals, so PendingMapCount after a pump is exactly
+      // how many ticks the GPU has not finished. The first tick of a frame
+      // always runs; each further one runs only while the GPU owes fewer than
+      // two. When it owes more, the surplus debt is DROPPED (sim time dilates
+      // by those ticks) rather than banked, or the frame the GPU catches up
+      // on would fire a four-tick burst and put it straight back behind.
+      //
+      // Pure pacing: which ticks run and what they compute is unchanged, so
+      // no hashed state moves and the headless harnesses never see this
+      // branch (they have no frame loop). Read the `ticksThisFrame` counter
+      // on the Performance tab, or the harness's `gpu-lag throttle` line.
+      // SANDVOX_NO_GPU_THROTTLE=1 is the A/B arm in one binary: the pre-throttle
+      // loop, for measuring what the throttle buys on a given scene.
+      static const bool noThrottle = std::getenv("SANDVOX_NO_GPU_THROTTLE") != nullptr;
+      if (ticksThisFrame > 0 && !noThrottle) {
+        ctx.ProcessEvents();  // retire what the GPU finished during the tick above
+        constexpr int kGpuLagThrottleTicks = 2;
+        if (ctx.PendingMapCount() >= kGpuLagThrottleTicks) {
+          g_ticksThrottled++;
+          accumulator = std::min(accumulator, (double)kTickDt);
+          break;
+        }
+      }
       accumulator -= kTickDt;
       if (ui.paused && !ui.stepOnce) break;
       ui.stepOnce = false;
@@ -5899,14 +6805,41 @@ int main(int argc, char** argv) {
         stream.Update(playerChunkNow, tick);
         // THE HORIZON ARRIVING. `far`/`fardown` compile on a background thread
         // (docs/PLAN_shader_compile.md package A) and this is the one place
-        // that notices they landed. Every fill queued before then was popped
-        // by PrepareTick below and dropped on the floor — EncodeFarFill had no
-        // pipeline to record — so nothing short of a wholesale refill puts
-        // terrain back past the residency window. Fires exactly once.
+        // that notices they landed. Nothing was recorded for the cascades
+        // before that, so a wholesale refill is what puts terrain back past
+        // the residency window. Fires exactly once.
         if (sim.PollFarPipelines()) far.FullRefill(playerChunkNow);
+        // ...and until it does, FarField MUST NOT DRAIN (2026-09-10). It used
+        // to: PrepareTick popped, EncodeFarFill found no pipeline and dropped
+        // the entries, and pending_ emptied — so for the whole compile (2.5 s
+        // warm, 20.6 s on a cold shader cache, measured) the fog reported the
+        // full 6.5 km horizon and the valid box reported every level marchable
+        // over cascade buffers that were still zeros. Rays escaped through the
+        // ground into the sky and the clouds were drawn UNDER the terrain,
+        // then the refill landed and slammed the fog onto the window. Holding
+        // the queue keeps both readings honest for those seconds — closed fog,
+        // empty valid box — and costs nothing else, since the entries were
+        // being thrown away anyway. Update() is held with it: recentring while
+        // blind would pile incoming planes onto a queue the FullRefill above
+        // is about to clear.
+        const bool farBlind = sim.FarFillsDeferred();
+        // The refill's per-tick slice, live from tuning so F5 moves it (see
+        // Tuning::Render::farRefillRate — this is the knob that turned the
+        // horizon's arrival from a 16 s 2 fps stall into a fog that opens).
+        far.SetBulkCap((uint32_t)CurrentTuning().render.farRefillRate);
+        // And ORDINARY TRAVEL's slice, the one a moving player actually feels
+        // (Tuning::Render::farPlaneFillRate). Live from tuning for the same
+        // reason: what it trades against is the sieve's per-entry GPU cost,
+        // which a shader edit can move by more than 2x without a rebuild.
+        far.SetPlaneCap((uint32_t)CurrentTuning().render.farPlaneFillRate);
         // far-field cascades track the player the same way (render-only)
-        far.Update(playerChunkNow);
-        farCount = far.PrepareTick(ctx.queue);
+        if (!farBlind) far.Update(playerChunkNow);
+        farCount = far.PrepareTick(ctx.queue, !farBlind);
+        if (farCount) {
+          g_farEntries += farCount;
+          g_farTicks++;
+          g_farBiggest = std::max<uint64_t>(g_farBiggest, farCount);
+        }
       }
       // ---- GAME LOGIC: the rest of the tick body up to the submit ---------
       // Brush, laser, melee, spells, mob/avatar/debris PreTick, explosions.
@@ -6118,6 +7051,22 @@ int main(int argc, char** argv) {
         for (uint64_t mid : aiSpawnedMobs)
           if (Mob* m = mobs.FindMobById(mid)) m->Die();
         aiSpawnedMobs.clear();
+      }
+      if (ui.aiRagdollSpawned) {
+        ui.aiRagdollSpawned = false;
+        for (uint64_t mid : aiSpawnedMobs)
+          mobs.RagdollMob(mid, CurrentTuning().ragdoll.devSeconds);
+      }
+      if (ui.ragdollMe) {
+        ui.ragdollMe = false;
+        if (avatar.Spawned() && avatar.IsAlive()) {
+          avatar.StartRagdoll(CurrentTuning().ragdoll.devSeconds, "dev button");
+          // A nudge backwards and up so the body keels over instead of
+          // folding straight down onto its own feet.
+          const Vec3 back{-std::sin(avatarHeading), 0.35f,
+                          -std::cos(avatarHeading)};
+          avatar.SetLimbVelocities(back.normalized() * MetresToCells(1.5f));
+        }
       }
       if (ui.aiApplyBehavior) {
         ui.aiApplyBehavior = false;
@@ -7099,6 +8048,133 @@ int main(int argc, char** argv) {
         }
       }
 
+      // ---- --fell-tree: the tree-fell gate's cut, in the live frame loop ----
+      // Same fixture (selftest::BuildTree), same cut (a 9x9x3 slab of air ten
+      // cells up plus the destruction event the brush would raise), same
+      // 300-tick profile window. What differs is that this loop RENDERS.
+      if (g_fellTree) {
+        static int fellPhase = 0;  // 0 waiting, 1 planted, 2 cut, 3 reported
+        static uint32_t fellPlantTick = 0, fellCutTick = 0;
+        static int fellGroundY = 0;
+        static size_t fellFrame0 = 0;
+        static bool fellBodySeen = false;
+        static bool fellTreeSeen = false;
+        static selftest::TreeFixture fellTree;
+        auto matByName = [&](const char* n) -> uint32_t {
+          for (size_t i = 0; i < mats.size(); i++)
+            if (mats[i].name == n) return (uint32_t)i;
+          return 0u;
+        };
+        if ((tick % 60u) == 0u)
+          std::printf("--fell-tree: tick %u player (%.1f,%.1f,%.1f) yaw %.2f fly %d\n",
+                      tick, player.pos.x, player.pos.y, player.pos.z, cam.yaw,
+                      player.fly ? 1 : 0);
+        if (fellPhase == 0 && tick >= (uint32_t)g_fellTreeAt) {
+          const Vec3 fwd = cam.Forward();
+          const int bx = ifloor(player.pos.x + fwd.x * 48.0f);
+          const int bz = ifloor(player.pos.z + fwd.z * 48.0f);
+          fellGroundY = World::TerrainHeight(bx, bz, kDefaultSeed);
+          fellTree = selftest::BuildTree(world, {bx, fellGroundY + 1, bz},
+                                         matByName("wood"),
+                                         matByName("leaves"), cellOps);
+          fellPlantTick = tick;
+          fellPhase = 1;
+          // A crown that touches a hillside is anchored, and the cut then
+          // frees nothing: say what the ground does under the box.
+          int hillMax = fellGroundY;
+          for (int z = fellTree.lo.z; z <= fellTree.hi.z; z++)
+            for (int x = fellTree.lo.x; x <= fellTree.hi.x; x++)
+              hillMax = std::max(hillMax, World::TerrainHeight(x, z, kDefaultSeed));
+          std::printf("--fell-tree: ground under the box rises to y%d (trunk foot "
+                      "y%d, crown from y%d)\n", hillMax, fellGroundY + 1,
+                      fellGroundY + 1 + fellTree.height - 6 - fellTree.crownR / 2);
+          std::printf("--fell-tree: planted at (%d,%d,%d) tick %u: %u wood + %u "
+                      "leaves, box (%d,%d,%d)..(%d,%d,%d)\n",
+                      bx, fellGroundY + 1, bz, tick, fellTree.woodCells,
+                      fellTree.leafCells, fellTree.lo.x, fellTree.lo.y,
+                      fellTree.lo.z, fellTree.hi.x, fellTree.hi.y, fellTree.hi.z);
+          std::fflush(stdout);
+        } else if (fellPhase == 1 && tick >= fellPlantTick + 120) {
+          const int fx = fellTree.base.x, fz = fellTree.base.z;
+          const int cutY = fellGroundY + 11;
+          for (int y = cutY; y < cutY + 3; y++)
+            for (int dz = -4; dz <= 4; dz++)
+              for (int dx = -4; dx <= 4; dx++) {
+                const IVec3 cc{fx + dx, y, fz + dz};
+                if (!world.CellInWindow(cc)) continue;
+                if (cellOps.size() < kMaxCellOpsPerTick)
+                  cellOps.push_back({World::SlotCellIndex(cc), 0u});
+              }
+          debris.AddDestructionEvent(tick, {fx - 5, fellGroundY + 10, fz - 5},
+                                     {fx + 5, fellGroundY + 15, fz + 5});
+          debris.SetProfiling(true);
+          debris.ResetProfile();
+          debris.ResetFloaterProbe();
+          world.ResetFetchProbe();
+          fellCutTick = tick;
+          fellFrame0 = g_frameMs.size();
+          fellPhase = 2;
+          std::printf("--fell-tree: cut at tick %u (frame %zu)\n", tick,
+                      fellFrame0);
+          std::fflush(stdout);
+        } else if (fellPhase == 2 && !fellTreeSeen && [&] {
+                     for (uint32_t b = 0; b < debris.BodyCount(); b++)
+                       if (debris.BodyVoxelCount(b) >= 1000u) return true;
+                     return false;
+                   }()) {
+          fellTreeSeen = true;
+          uint32_t big = 0;
+          for (uint32_t b = 0; b < debris.BodyCount(); b++)
+            big = std::max(big, debris.BodyVoxelCount(b));
+          std::printf("--fell-tree: the TREE is a body at tick %u (+%u after the cut), "
+                      "%u vox\n", tick, tick - fellCutTick, big);
+          std::fflush(stdout);
+        } else if (fellPhase == 2 && debris.BodyCount() > 0 && !fellBodySeen) {
+          fellBodySeen = true;
+          std::printf("--fell-tree: first body at tick %u (+%u after the cut), "
+                      "%u vox\n", tick, tick - fellCutTick,
+                      debris.BodyVoxelCount(0));
+          std::fflush(stdout);
+        } else if (fellPhase == 2 && tick >= fellCutTick + 300) {
+          fellPhase = 3;
+          const DebrisSystem::FloaterProbe& fp = debris.Floaters();
+          std::printf("--fell-tree: probe: scans %u, oversize-bbox %u, "
+                      "deferred-oversize %u, defer-gave-up %u (fetch %u), "
+                      "deferred-unfetched %u, fetch-wait no-cache %u no-vox %u, "
+                      "anchored boundary %u unknown %u oversize-flood %u, "
+                      "stuck-dropped %u, queue-full-dropped %u | last give-up: chunk "
+                      "(%d,%d,%d) inWin %u cached %u, seed (%d,%d,%d)..(%d,%d,%d)\n",
+                      fp.scans, fp.oversizeBboxSkipped, fp.deferredOversize,
+                      fp.deferGaveUp, fp.deferGaveUpFetch, fp.deferredUnfetched,
+                      fp.fetchWaitNoCache, fp.fetchWaitNoVoxels,
+                      fp.anchoredByRegionBoundary, fp.anchoredByUnknownChunk,
+                      fp.anchoredByOversizeFlood, fp.stuckEventDropped,
+                      fp.eventQueueFullDropped, fp.gaveUpChunk.x, fp.gaveUpChunk.y,
+                      fp.gaveUpChunk.z, fp.gaveUpChunkInWindow, fp.gaveUpChunkCached,
+                      fp.gaveUpSeedLo.x, fp.gaveUpSeedLo.y, fp.gaveUpSeedLo.z,
+                      fp.gaveUpSeedHi.x, fp.gaveUpSeedHi.y, fp.gaveUpSeedHi.z);
+          uint32_t bodies = debris.BodyCount(), vox = 0;
+          for (uint32_t b = 0; b < bodies; b++) vox += debris.BodyVoxelCount(b);
+          std::vector<double> win(g_frameMs.begin() + (ptrdiff_t)fellFrame0,
+                                  g_frameMs.end());
+          std::sort(win.begin(), win.end());
+          auto pct = [&](double p) {
+            return win.empty() ? 0.0 : win[(size_t)(p * (win.size() - 1))];
+          };
+          size_t over33 = 0;
+          for (double m : win) if (m > 33.0) over33++;
+          std::printf("--fell-tree: FALL over 300 ticks / %zu frames: whole-frame "
+                      "ms p50 %.1f p95 %.1f p99 %.1f max %.1f, >33ms %zu; bodies "
+                      "%u holding %u vox; COST %s | %s\n",
+                      win.size(), pct(0.5), pct(0.95), pct(0.99),
+                      win.empty() ? 0.0 : win.back(), over33, bodies, vox,
+                      debris.ProfileReport().c_str(),
+                      world.FetchReport().c_str());
+          std::fflush(stdout);
+          if (!std::getenv("SANDVOX_DEBRIS_PROFILE")) debris.SetProfiling(false);
+        }
+      }
+
       // support-loss flags from the sim (burnt stems, undermined slabs) feed
       // the same island-check pipeline as explosions and brush erases
       debris.QueueSupportEvents(world.Snap());
@@ -7318,10 +8394,32 @@ int main(int argc, char** argv) {
           // point (game/mob.h).
           mobs.CarveMobsRadial(ec, edr, world, spawns);
           avatar.CarveRadial(ec, edr, world, spawns);
+          // The per-body impulse is for DEBRIS. A living creature's limbs are
+          // skipped whether kinematic (standing) or dynamic (already limp
+          // from an earlier blast): impulse / limb mass on a 0.3 kg hand is
+          // 170 m/s and the joints drag the rest of the rig after it —
+          // "bodies zoom across the map". The rig takes ONE launch below.
+          std::vector<uint64_t> rigBodies;
+          mobs.AppendLiveLimbBodies(rigBodies);
+          if (avatar.Spawned()) avatar.AppendLiveLimbBodies(rigBodies);
+          std::sort(rigBodies.begin(), rigBodies.end());
           phys.ApplyRadialImpulse(
               Vec3{(float)e.x, (float)e.y, (float)e.z},
               (float)e.radius * CurrentTuning().physics.explosionImpulseRadiusScale,
-              (float)e.power * CurrentTuning().physics.explosionImpulseScale);
+              (float)e.power * CurrentTuning().physics.explosionImpulseScale,
+              &rigBodies);
+          // ...and the LIVING are knocked flying. A standing creature's limbs
+          // are kinematic, so the impulse above never touched them; this is
+          // the blast's other half (Mob::BlastRadial): go limp, take a launch
+          // velocity of impulse / body mass toward away-from-the-blast,
+          // capped at ragdoll.maxLaunchSpeed, and get back up once landed.
+          {
+            const auto& rg = CurrentTuning().ragdoll;
+            const float reach = (float)e.radius * rg.blastRadiusScale;
+            const float impulse = (float)e.power * rg.blastImpulseScale;
+            mobs.BlastMobsRadial(ec, reach, impulse);
+            if (avatar.Spawned()) avatar.BlastRadial(ec, reach, impulse);
+          }
           stream.MarkModifiedBox({e.x - e.radius, e.y - e.radius, e.z - e.radius},
                                  {e.x + e.radius, e.y + e.radius, e.z + e.radius});
         }
@@ -7418,9 +8516,26 @@ int main(int argc, char** argv) {
       debris.PostStep();
       mobs.PostStep();
       avatar.PostStep();
+      // ---- the player follows a ragdolled body ----
+      // Limp: the capsule rides the pelvis wherever Jolt threw it, so the
+      // camera goes with the body. Getting up: it sits on the standing spot
+      // the get-up chose, so the controller resumes exactly there. The body
+      // facing is copied back into the heading policy so the first driven
+      // tick after the get-up does not snap the rig round to the camera.
+      bool avatarRagdolled = false;
+      {
+        Vec3 follow;
+        if (avatar.RagdollFollow(follow)) {
+          player.pos = follow;
+          player.vel = {};
+          avatarHeading = avatar.Heading();
+          avatarRagdolled = true;
+        }
+      }
       // debris that ended the step overlapping the player pushes the player
-      // out (fly mode ignores collision entirely, matching the voxel rules)
-      if (!player.fly)
+      // out (fly mode ignores collision entirely, matching the voxel rules;
+      // a ragdolled player is being placed by the body, not the solver)
+      if (!player.fly && !avatarRagdolled)
         player.ApplyPush(phys.PlayerPushOut(playerBody, player.pos), kindAt);
       double tEnd = NowSeconds();
       tickMsSmooth += ((float)((tEnd - t0) * 1000.0) - tickMsSmooth) * 0.1f;
@@ -7488,7 +8603,9 @@ int main(int argc, char** argv) {
       // The rig only decides where the RENDER eye sits. Picking rays, the
       // brush, the laser and the grenade all keep using player.EyePos(), so
       // switching to third person cannot change anything the sim sees — the
-      // same guarantee the view-smoothing offset already relies on.
+      // same guarantee the view-smoothing offset already relies on. (The E
+      // look-at ray is the one deliberate exception: a UI query that has to
+      // agree with the crosshair, reach-limited from the head; see its note.)
       {
         const AvatarLocomotion loco = avatar.Locomotion();
         // ORBIT THE PLAYER, NOT THE ART. The obvious-looking choice — the head
@@ -7789,15 +8906,18 @@ int main(int argc, char** argv) {
       // pass, the lab and --shot all write RenderParams through the same
       // function and would otherwise each need their own copy of this.
       SetShortRange(ui.shortRange);
+      SetShortRangeNear(ui.shortRangeNear);
       // The panel's draw-distance readout, and the evidence that ticking the
       // box did something. Normally the cascade's FILLED radius (the same
       // number the adaptive fog is pinned to just above, so the two cannot
       // disagree about how far the world is trusted); the ceiling when the
       // mode is on. render.shortRangeDist is read live so the tuner's slider
       // moves this the moment F5 lands.
-      ui.renderRangeM = ui.shortRange
-                            ? CurrentTuning().render.shortRangeDist
-                            : far.SafeRadiusMeters();
+      ui.renderRangeM =
+          ui.shortRange ? (ui.shortRangeNear
+                               ? CurrentTuning().render.shortRangeNearDist
+                               : CurrentTuning().render.shortRangeDist)
+                        : far.SafeRadiusMeters();
       // HOISTED INTO A LAMBDA because it may have to run TWICE. world.renderUBO
       // is one buffer, so the avatar portrait's camera necessarily clobbers
       // the main camera; the portrait pass writes its own params, submits, and
@@ -7820,7 +8940,13 @@ int main(int argc, char** argv) {
       // swapchain image is not that.
       const bool taaOn = CurrentTuning().render.taa != 0 && sim.TaaAvailable() &&
                          ctx.SwapchainBlittable();
-      const bool offscreen = scaled || taaOn;
+      // ---- the shading-LOD filter (denoise.wgsl) ----------------------------
+      // Runs IN PLACE over the offscreen world frame between the world pass
+      // and whatever consumes it (TAA or the blit), so like TAA it forces the
+      // offscreen path at scale 1: the swapchain image cannot be copied out of.
+      const bool denoiseOn = CurrentTuning().render.denoise != 0 &&
+                             sim.DenoiseAvailable() && ctx.SwapchainBlittable();
+      const bool offscreen = scaled || taaOn || denoiseOn;
       //
       // THE JITTER IS A YAW/PITCH NUDGE, not a shear of the basis, and that is
       // the whole reason it is safe. Every path that draws this frame — the
@@ -7891,7 +9017,7 @@ int main(int argc, char** argv) {
       ui.tickCpuMs = tickMsSmooth;
       ui.tick = tick;
       ui.activeChunks = world.Snap().activeChunks;
-      ui.totalChunks = kNumChunks;
+      ui.totalChunks = kNumSlots;
       ui.voxelTotal = world.Snap().voxelTotal;
       ui.worldHash = world.Snap().worldHash;
       ui.mirrorValid = world.Snap().valid;
@@ -8059,7 +9185,7 @@ int main(int argc, char** argv) {
       // authored TAG and side suffix rather than by part name, so any humanoid
       // rig fills the same figure. A limb the rig does not have stays absent
       // and simply is not drawn.
-      FillBodyUI(avatar, burnMats, ui);
+      FillBodyUI(avatar, burnMats, mobs, mats, ui);
       ui.locoState = avatar.Spawned() ? avatar.Locomotion().stateName : "";
       ui.spellCost = caster.compiled.manaCost;
       ui.spellWord = caster.compiled.wordCost;
@@ -8185,6 +9311,102 @@ int main(int argc, char** argv) {
       // never authoritative and never even one frame stale in a way that could
       // be acted on twice — the latch is cleared here, by its consumer, the
       // same shape every other one-shot in this loop uses.
+      // ---- LOOT: the corpse the screen is open on ---------------------------
+      //
+      // Consumed here, beside the kit latches, because a loot slot is one more
+      // address the same drag can name (KitSpace::Loot). The corpse is
+      // re-found BY ID on every use — a registry pointer does not survive
+      // TakeCorpseLoot destroying the piece's body (game/corpses.h).
+      {
+        auto say = [&](const std::string& m) {
+          ui.kitMessage = m;
+          ui.kitMessageAge = 0.0f;
+        };
+        auto closeLoot = [&]() {
+          ui.lootOpen = false;
+          ui.lootClose = false;
+          lootCorpse = 0;
+          if (lootOpenedScreen && ui.inventoryOpen) {
+            ui.inventoryOpen = false;
+            captured = captureBeforeUi;
+            glfwSetInputMode(window, GLFW_CURSOR,
+                             captured ? GLFW_CURSOR_DISABLED
+                                      : GLFW_CURSOR_NORMAL);
+            glfwGetCursorPos(window, &mx0, &my0);
+          }
+          lootOpenedScreen = false;
+        };
+        // The screen closed under the panel (I / Esc): the loot goes with it.
+        if (ui.lootOpen && !ui.inventoryOpen) {
+          ui.lootOpen = false;
+          lootCorpse = 0;
+          lootOpenedScreen = false;
+        }
+        if (ui.lootClose) closeLoot();
+        // Walked away, or the heap is gone / picked clean: close by itself.
+        if (ui.lootOpen) {
+          const CorpseReport* c = corpses.Find(lootCorpse);
+          if (!c || !CorpseWithin(*c, phys, player.pos, kLootRange))
+            closeLoot();
+        }
+        auto takeOne = [&](int index, KitRef dest) -> bool {
+          CorpseReport* c = corpses.Find(lootCorpse);
+          if (!c) return false;
+          std::string name;
+          const LootResult r = TakeCorpseLoot(*c, index, dest, kit, hotbar,
+                                              items, debris, &name);
+          if (r == LootResult::Ok) {
+            say("took " + name);
+            return true;
+          }
+          say(LootResultText(r, dest));
+          return false;
+        };
+        if (ui.moveItem.pending && ui.lootOpen &&
+            ui.moveItem.to.space == KitSpace::Loot) {
+          ui.moveItem.pending = false;
+          if (ui.moveItem.from.space != KitSpace::Loot)
+            say("drag it out of the screen to put it on the ground");
+        }
+        if (ui.moveItem.pending && ui.moveItem.from.space == KitSpace::Loot) {
+          ui.moveItem.pending = false;
+          if (ui.lootOpen) takeOne(ui.moveItem.from.index, ui.moveItem.to);
+        }
+        if (ui.equipItem.pending && ui.equipItem.from.space == KitSpace::Loot) {
+          ui.equipItem.pending = false;   // the panel routes these to takeLoot
+          if (ui.lootOpen) takeOne(ui.equipItem.from.index, KitRef{});
+        }
+        if (ui.takeLoot.pending) {
+          ui.takeLoot.pending = false;
+          if (ui.lootOpen) {
+            if (ui.takeLoot.all) {
+              // Front to back until one refuses: a full pack stops the sweep
+              // with everything else still on the corpse, which is the only
+              // outcome under which nothing is lost.
+              int took = 0;
+              for (;;) {
+                const CorpseReport* c = corpses.Find(lootCorpse);
+                if (!c || c->gear.empty()) break;
+                if (!takeOne(0, KitRef{})) break;
+                took++;
+              }
+              if (took > 0) say(took == 1 ? "took one thing" : "took everything that fit");
+            } else {
+              takeOne(ui.takeLoot.index, KitRef{});
+            }
+          }
+        }
+        if (ui.dropItem.pending && ui.dropItem.from.space == KitSpace::Loot) {
+          ui.dropItem.pending = false;
+          // Dragged OUT of the loot panel: the piece comes off the corpse and
+          // stays on the floor as a thing you can pick up (ShedCorpseLoot).
+          CorpseReport* c = ui.lootOpen ? corpses.Find(lootCorpse) : nullptr;
+          std::string name;
+          if (c && ShedCorpseLoot(*c, ui.dropItem.from.index, debris, ground,
+                                  &name))
+            say("left the " + name + " on the ground");
+        }
+      }
       if (ui.moveItem.pending) {
         ui.moveItem.pending = false;
         const MoveResult r =
@@ -8455,6 +9677,26 @@ int main(int argc, char** argv) {
         ui.equipSlots.clear();
         for (int i = 0; i < kEquipSlotCount; i++)
           ui.equipSlots.push_back(mirror(kit.equip.slots[i]));
+        // The corpse's gear, through the same mirror so a robe on a corpse is
+        // drawn and tipped exactly as one in the pack — with its condition
+        // read off the death-time capture, the only record there is for a
+        // piece nobody is wearing.
+        ui.lootSlots.clear();
+        if (ui.lootOpen) {
+          if (const CorpseReport* c = corpses.Find(lootCorpse)) {
+            ui.lootTitle = c->def;
+            for (const CorpseReport::Piece& pc : c->gear) {
+              const int di = items.Find(pc.item);
+              UIState::KitSlotUI u = mirror(ItemStack{di, di >= 0 ? 1 : 0});
+              if (u.name.empty()) u.name = pc.item;   // gone from the library
+              if (u.wearable) {
+                u.condition = pc.damage.Condition();
+                u.ruined = GearRuined(u.condition, ruinedAt);
+              }
+              ui.lootSlots.push_back(std::move(u));
+            }
+          }
+        }
 
         ui.glyphsOwned.clear();
         for (int gi = 0; gi < (int)glyphs.glyphs.size(); gi++) {
@@ -9014,9 +10256,9 @@ int main(int argc, char** argv) {
       }
       if (ui.showDirtyChunks) {
         const WorldSnapshot& dsnap = world.Snap();
-        if (dsnap.valid && dsnap.dirtyFlags.size() == kNumChunks) {
+        if (dsnap.valid && dsnap.dirtyFlags.size() == kNumSlots) {
           constexpr float h = (float)kChunk * 0.5f;
-          for (uint32_t i = 0; i < kNumChunks && dbg.size() < kMaxDebugBoxes; i++) {
+          for (uint32_t i = 0; i < kNumSlots && dbg.size() < kMaxDebugBoxes; i++) {
             if (!dsnap.dirtyFlags[i]) continue;
             IVec3 wc = world.SlotToWorldChunk(i);
             DebugBox b{};
@@ -9210,7 +10452,8 @@ int main(int argc, char** argv) {
         // third: a 9-slice frame whose middle slice was opaque.)
         if (g_shotInventory && (frameCounter == kShotInvGearFrame ||
                                 frameCounter == kShotInvCaptureFrame ||
-                                frameCounter == kShotInvGrimoireFrame))
+                                frameCounter == kShotInvGrimoireFrame ||
+                                frameCounter == kShotInvLootFrame))
           std::printf("--shot-inventory: portrait cube=%zu micro=%u "
                       "eye=(%.1f %.1f %.1f) target=(%.1f %.1f %.1f)\n",
                       pInst.size(), pMicro, portraitCam.eye.x, portraitCam.eye.y,
@@ -9257,7 +10500,8 @@ int main(int argc, char** argv) {
       // The shadow-cache resolve runs BEFORE the pass and is timed by the pass
       // table (its `shadowCache` row); it is no longer inside the raymarch
       // number, so the two rows no longer double-count it.
-      const bool liveRenderTimed = liveTimed && telemetry.HasClient();
+      const bool liveRenderTimed =
+          liveTimed && (telemetry.HasClient() || g_harnessFrames > 0);
       struct LiveSpan { uint32_t b = 0, e = 0; bool on = false; };
       auto spanBegin = [&](const char* name) {
         LiveSpan sp;
@@ -9299,6 +10543,14 @@ int main(int argc, char** argv) {
         sim.WriteTaaParams(ctx.queue, taaCam, CurrentTuning().render.taaMaxHist,
                            CurrentTuning().render.taaClamp, /*reset=*/false,
                            ctx.surfaceFormat == rhi::TextureFormat::BGRA8Unorm);
+      }
+      if (denoiseOn) {
+        // Same rule as WriteTaaParams above: uploaded before any render pass
+        // opens. The projection is the one WriteRenderParams uses.
+        sim.EnsureDenoise(renderW, renderH);
+        sim.WriteDenoiseParams(ctx.queue, renderW, renderH,
+                               std::tan(CurrentTuning().camera.fovY * 0.5f),
+                               ctx.surfaceFormat == rhi::TextureFormat::BGRA8Unorm);
       }
       taaWasOn = taaOn;
       taaScaleWas = renderScale;
@@ -9357,6 +10609,15 @@ int main(int argc, char** argv) {
         // square), then open a native-size pass for the UI so text and panels
         // are never scaled.
         rp.End();
+        if (denoiseOn) {
+          // The filter's copies and passes, all derived-barrier: see
+          // Simulation::EncodeDenoise. The result lands back in scaledTex, so
+          // TAA and the blit below read the filtered frame without knowing.
+          const LiveSpan spd = spanBegin("rm_denoise");
+          sim.EncodeDenoise(enc, scaledTex, scaledView, ctx.surfaceFormat,
+                            renderW, renderH);
+          spanEnd(spd);
+        }
         if (taaOn) {
           // The copies MUST be outside a rendering scope — the recorder drops a
           // transfer recorded inside one, silently. `rp.End()` above is what
@@ -9406,14 +10667,19 @@ int main(int argc, char** argv) {
       // cache, so nothing thrashes) and read back. The blocking readback is
       // legal here for the same reason it is in --shot: this is the last frame
       // of a harness run, not the frame path of a game.
-      if (g_shotInventory && (frameCounter == kShotInvGearFrame ||
-                              frameCounter == kShotInvCaptureFrame ||
-                              frameCounter == kShotInvGrimoireFrame)) {
-        const char* shotPath = frameCounter == kShotInvGearFrame
-                                   ? "screenshot_inventory.bmp"
-                               : frameCounter == kShotInvCaptureFrame
-                                   ? "screenshot_inventory_health.bmp"
-                                   : "screenshot_inventory_grimoire.bmp";
+      if ((g_shotInventory && (frameCounter == kShotInvGearFrame ||
+                               frameCounter == kShotInvCaptureFrame ||
+                               frameCounter == kShotInvGrimoireFrame ||
+                               frameCounter == kShotInvLootFrame)) ||
+          g_shotJumpPath) {
+        const char* shotPath =
+            g_shotJumpPath                       ? g_shotJumpPath
+            : frameCounter == kShotInvGearFrame  ? "screenshot_inventory.bmp"
+            : frameCounter == kShotInvCaptureFrame
+                ? "screenshot_inventory_health.bmp"
+            : frameCounter == kShotInvGrimoireFrame
+                ? "screenshot_inventory_grimoire.bmp"
+                : "screenshot_inventory_loot.bmp";
         const uint32_t W = ctx.width, H = ctx.height;
         rhi::Texture shotTex = ctx.device.CreateTexture(
             {W, H, 1}, ctx.surfaceFormat,
@@ -9463,10 +10729,20 @@ int main(int argc, char** argv) {
           // to say so out loud rather than print "wrote".
           uint64_t sum = 0;
           for (uint8_t b : px) sum += b;
-          if (WriteBmpFile(shotPath, px, W, H))
-            std::printf("wrote %s (%ux%u, pixel sum %llu%s)\n", shotPath, W, H,
+          if (WriteBmpFile(shotPath, px, W, H)) {
+            std::printf("wrote %s (%ux%u, pixel sum %llu%s)", shotPath, W, H,
                         (unsigned long long)sum,
                         sum == 0 ? " *** ALL BLACK ***" : "");
+            // THE PICTURE SAYS WHICH POSE IT IS. A file called "fall" proves
+            // nothing on its own — the whole claim of the air pose is that the
+            // shape is a function of vel.y, so the vy the shutter fired at
+            // belongs next to the filename or the harness is only asserting
+            // that four BMPs exist.
+            if (g_shotJumpPath)
+              std::printf(" | vy %+.2f m/s, air %.2f, land %.2f", g_shotJumpVy,
+                          avatar.AirPoseWeight(), avatar.AirPoseLand());
+            std::printf("\n");
+          }
         }
       }
 
@@ -9611,7 +10887,7 @@ int main(int argc, char** argv) {
     // frame early and "correcting" it later is not an option — the page has
     // already drawn it, and a bar that retroactively grows is worse than one
     // that is honestly marked as having no GPU data.
-    if (telemetry.HasClient()) {
+    if (telemetry.HasClient() || g_harnessFrames > 0) {
       using sandvox::PerfScope;
       liveSample.frame = liveFrameNo;
       liveSample.wallMs = frameWallMs;
@@ -9669,6 +10945,7 @@ int main(int argc, char** argv) {
             if (node < 0) continue;
             lp.s.gpuMs[node] += (double)ps.ns / 1e6;
             lp.s.gpuValid = true;
+            if (g_harnessFrames > 0) lp.passes.push_back({ps.name, (double)ps.ns / 1e6});
           }
           break;
         }
@@ -9700,7 +10977,28 @@ int main(int argc, char** argv) {
       while (!livePending.empty() &&
              (livePending.front().s.gpuValid ||
               liveFrameNo - livePending.front().frame >= 3)) {
-        telemetry.BroadcastSample(livePending.front().s);
+        if (telemetry.HasClient()) telemetry.BroadcastSample(livePending.front().s);
+        // The harness keeps the GPU rows of every frame that got them; a
+        // frame whose queries never resolved is left out rather than logged
+        // as zero (same rule as the page's gpuValid).
+        // Same warm-up exclusion as the CPU table (frame > 60): the first
+        // frames hold the startup horizon refill (262k far entries at
+        // kFarListCap per tick) and would own every GPU p99 otherwise.
+        if (g_harnessFrames > 0 && livePending.front().s.gpuValid &&
+            livePending.front().frame > 60) {
+          for (int n = 0; n < sandvox::kPerfNodeCount; n++)
+            g_frameGpuSeries[n].push_back(livePending.front().s.gpuMs[n]);
+          // Per pass: sum this frame's spans by name, then append one
+          // value per pass (padding to the frame count happens at print).
+          std::map<std::string, double> perPass;
+          for (const auto& pr : livePending.front().passes) perPass[pr.first] += pr.second;
+          for (const auto& pr : perPass) {
+            std::vector<double>& v = g_frameGpuPassSeries[pr.first];
+            v.resize(g_frameGpuFrames, 0.0);
+            v.push_back(pr.second);
+          }
+          g_frameGpuFrames++;
+        }
         livePending.erase(livePending.begin());
       }
       liveSample = sandvox::PerfSample{};
@@ -9783,6 +11081,113 @@ int main(int argc, char** argv) {
         }
         // The bug counter, printed whether or not it fired — "0 stalls" is a
         // result and a missing line is not.
+        // ---- THE GPU ROWS, same shape, same reason -------------------------
+        {
+          size_t gn = 0;
+          for (int n = 0; n < sandvox::kPerfNodeCount; n++)
+            gn = std::max(gn, g_frameGpuSeries[n].size());
+          if (gn > 0) {
+            std::printf("--frames harness: GPU node attribution over %zu timed frames "
+                        "(ms/frame; rows under 0.05 mean omitted)\n", gn);
+            std::printf("    %-16s %8s %8s %8s %8s\n", "node", "mean", "p50", "p99", "max");
+            int gorder[sandvox::kPerfNodeCount];
+            double gsum[sandvox::kPerfNodeCount];
+            for (int n = 0; n < sandvox::kPerfNodeCount; n++) {
+              gorder[n] = n;
+              gsum[n] = 0;
+              for (double v : g_frameGpuSeries[n]) gsum[n] += v;
+            }
+            std::sort(gorder, gorder + sandvox::kPerfNodeCount,
+                      [&](int a, int b) { return gsum[a] > gsum[b]; });
+            for (int oi = 0; oi < sandvox::kPerfNodeCount; oi++) {
+              const int n = gorder[oi];
+              std::vector<double>& v = g_frameGpuSeries[n];
+              if (v.empty() || gsum[n] / (double)v.size() < 0.05) continue;
+              std::sort(v.begin(), v.end());
+              std::printf("    %-16s %8.3f %8.3f %8.3f %8.3f\n",
+                          sandvox::kPerfNodes[n].node, gsum[n] / (double)v.size(),
+                          v[(size_t)(0.50 * (v.size() - 1))],
+                          v[(size_t)(0.99 * (v.size() - 1))], v.back());
+              // A node that only runs for PART of the run (drawBodies while a
+              // felled tree is a body, before settle-back returns it to the
+              // grid) has a whole-run mean and p50 that say how long it ran,
+              // not what it cost: the same 28k-voxel oak read p50 0.000 with a
+              // 300-tick body life and p50 1.1 with a standing one. The row
+              // that answers "what does a frame WITH it cost" is the one over
+              // the frames it was measurably in.
+              size_t firstOn = 0;
+              while (firstOn < v.size() && v[firstOn] < 0.05) firstOn++;
+              const size_t on = v.size() - firstOn;
+              if (on > 0 && on < v.size() * 9 / 10) {
+                double onSum = 0;
+                for (size_t i = firstOn; i < v.size(); i++) onSum += v[i];
+                std::printf("    %-16s %8.3f %8.3f %8.3f %8.3f  (%zu of %zu frames)\n",
+                            "  ^ frames >0.05", onSum / (double)on,
+                            v[firstOn + (size_t)(0.50 * (on - 1))],
+                            v[firstOn + (size_t)(0.99 * (on - 1))], v.back(), on,
+                            v.size());
+              }
+            }
+          }
+        }
+        if (g_frameGpuFrames > 0) {
+          std::printf("--frames harness: GPU PASS attribution (ms/frame; rows under 0.05 mean omitted)\n");
+          std::printf("    %-22s %8s %8s %8s %8s\n", "pass", "mean", "p50", "p99", "max");
+          std::vector<std::pair<double, std::string>> order;
+          for (auto& kv : g_frameGpuPassSeries) {
+            kv.second.resize(g_frameGpuFrames, 0.0);
+            double sum = 0;
+            for (double v : kv.second) sum += v;
+            order.push_back({sum / (double)g_frameGpuFrames, kv.first});
+          }
+          std::sort(order.begin(), order.end(),
+                    [](const auto& a, const auto& b) { return a.first > b.first; });
+          for (const auto& o : order) {
+            if (o.first < 0.05) continue;
+            std::vector<double>& v = g_frameGpuPassSeries[o.second];
+            std::sort(v.begin(), v.end());
+            std::printf("    %-22s %8.3f %8.3f %8.3f %8.3f\n", o.second.c_str(), o.first,
+                        v[(size_t)(0.50 * (v.size() - 1))],
+                        v[(size_t)(0.99 * (v.size() - 1))], v.back());
+          }
+        }
+        {
+          const DebrisSystem::SettleProbe& sp = debris.Settle();
+          std::printf("    terrain patches: %u rebuilt, %u deferred by the per-tick "
+                      "budget, %u refreshed with an identical occupancy box\n",
+                      sp.terrainBuilds, sp.terrainDeferred, sp.terrainSame);
+          // The shared readback FIFO, whole run: who asked, how long they
+          // waited, what was dropped. See World::FetchProbe.
+          std::printf("    %s\n", world.FetchReport().c_str());
+        }
+        std::printf("    gpu-lag throttle: %llu ticks deferred to a later frame "
+                    "(the GPU owed >= 2 snapshots when a second tick was due)\n",
+                    (unsigned long long)g_ticksThrottled);
+        // A full refill is kFarLevels * kFarNumChunks entries; anything less
+        // than that here means the horizon was still arriving at exit.
+        std::printf("    far-cascade sieve: %llu entries over %llu ticks "
+                    "(biggest tick %llu, cap %d) | %zu still queued at exit "
+                    "(a full refill is %u)\n",
+                    (unsigned long long)g_farEntries,
+                    (unsigned long long)g_farTicks,
+                    (unsigned long long)g_farBiggest,
+                    CurrentTuning().render.farRefillRate, far.PendingFills(),
+                    kFarLevels * kFarNumChunks);
+    // WHAT PUT IT THERE (farfield.h's counters). A queue depth on its own does
+    // not say whether the fix is a bigger plane cap, a cheaper sieve entry, or
+    // an origin that keeps falling a whole box behind — and those want
+    // opposite changes.
+    std::printf("      produced by: %llu wholesale refills, %llu resets "
+                "(%llu an origin gap, %llu a coalesced backlog) "
+                "x %u entries + %llu planes x %u entries | worst origin gap "
+                "%u level chunks on level %u (reset at %u)\n",
+                (unsigned long long)far.RefillsIssued(),
+                (unsigned long long)far.ResetsIssued(),
+                (unsigned long long)far.GapResetsIssued(),
+                (unsigned long long)far.CoalescedResets(), kFarNumChunks,
+                (unsigned long long)far.PlanesIssued(),
+                kFarNChunk * kFarNChunk, far.WorstGap(),
+                far.WorstGapLevel(), kFarNChunk);
         std::printf("    snapshot stalls (blocking WaitIdle on the frame path):"
                     " %llu over %llu frames (%.1f%% of frames) | readback "
                     "requests the ring refused: %llu\n",

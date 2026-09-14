@@ -148,6 +148,45 @@ if [ "$GEN" = "$GEN_NINJA" ]; then
     | grep -E '^(Compile requests executed|Cache hits|Cache misses|Non-cacheable compilations)\s' \
     | sed 's/  */ /g' | tr '\n' ';' | sed 's/^/build.sh: sccache /; s/;$/\n/' || true
 fi
+
+# -- Phase 1b: refuse to link objects from a SIBLING WORKTREE ---------------
+# sccache is keyed on preprocessed source, so two worktrees whose headers agree
+# share objects -- correct, and most of why a cold worktree build is fast. The
+# trap is the /showIncludes reply it replays alongside a cached object: it names
+# the ORIGINATING tree's headers, so ninja records this object as depending on a
+# sibling's world.h/tuning.h and never rebuilds it when YOURS change. The linker
+# then happily combines two layouts of the same struct.
+#
+# The symptom is an access violation at startup in code nobody touched, and the
+# give-away is that crash.log's frames name another worktree's source paths.
+# Three times now: 2026-09-04 (MaterialDef stride, in LoadMicroVox), 2026-09-08
+# (pass::Pipe entries, in PageTable::ResetIdentity), 2026-09-09 (Tuning gained
+# render.gasBlendStart, so main.cpp read tune.warnings 4 bytes short and died on
+# the first std::string). Each one cost a diagnosis from scratch, so the build
+# now does the diagnosis instead: scan, purge, recompile ONCE, and abort rather
+# than hand over an exe that is a coin flip.
+#
+# Affordable on every build because of --newer-than: only objects written since
+# the last clean check are read, which in the steady state is only what this
+# build just compiled.
+POISON_STAMP="$ROOT/build/.poison_check_stamp"
+if [ "$BUILD_EXIT" -eq 0 ] && [ "$GEN" = "$GEN_NINJA" ]; then
+  if ! python "$SCRIPT_DIR/find_poisoned_objs.py"        --config "$CONFIG" --newer-than "$POISON_STAMP" --exit-code --delete; then
+    echo "build.sh: ^^ those objects came from another worktree; recompiling them" >&2
+    SCCACHE_RECACHE=1 cmake --build "$ROOT/build" --config "$CONFIG"       --target "$COMPILE_TARGET" "${EXTRA_ARGS[@]+"${EXTRA_ARGS[@]}"}" || BUILD_EXIT=$?
+    # One repair attempt. A second round of foreign objects means the cache is
+    # serving them back even under SCCACHE_RECACHE, and linking would produce
+    # exactly the mixed-layout exe this check exists to prevent.
+    if [ "$BUILD_EXIT" -eq 0 ] &&        ! python "$SCRIPT_DIR/find_poisoned_objs.py"          --config "$CONFIG" --newer-than "$POISON_STAMP" --exit-code; then
+      svlock_release "$SVLOCK_COMPILE"
+      echo "build.sh: POISONED OBJECTS SURVIVED A RECACHE -- refusing to link." >&2
+      echo "build.sh: try 'bash scripts/build.sh --fresh', or clear C:/sv-deps/sccache." >&2
+      exit 1
+    fi
+  fi
+  [ "$BUILD_EXIT" -eq 0 ] && : > "$POISON_STAMP"
+fi
+
 svlock_release "$SVLOCK_COMPILE"
 T_COMPILE=$(date +%s)
 
@@ -169,12 +208,50 @@ svlock_acquire_gpu "link:$(basename "$ROOT")"
 # lock was taken, which made it useless under the load it exists to handle:
 # agent A killed the exe, then waited minutes behind the mutex, and by the time
 # it linked, agent B had launched a fresh sandvox.exe — LNK1104 anyway.
-taskkill //F //IM sandvox.exe 2>/dev/null || true
+#
+# ...and WAIT for it to be gone. `taskkill //F` returns when the terminate
+# request is QUEUED, not when the process has released its image: a game with
+# a Vulkan device and half a gigabyte of buffers takes hundreds of ms to tear
+# down, and link.exe opening the output 20 ms after the kill found the old
+# image still mapped -- LNK1104 "cannot open file 'Release\sandvox.exe'",
+# with every object freshly compiled (2026-09-10, a tuner Build with the
+# game open). The tuner's /api/heightmap also launches the exe OUTSIDE this
+# lock (a ~150 ms GPU-free run per map redraw), so an instance can appear
+# mid-link; the link therefore retries ONCE after a second kill+wait.
+kill_sandvox_and_wait() {
+  taskkill //F //IM sandvox.exe 2>/dev/null || true
+  local waited=0
+  while tasklist //FI "IMAGENAME eq sandvox.exe" 2>/dev/null | grep -q -i 'sandvox\.exe'; do
+    if [ "$waited" -ge 100 ]; then   # 10 s: something is not dying; link anyway
+      echo "build.sh: a sandvox.exe is still alive 10 s after taskkill; linking anyway" >&2
+      break
+    fi
+    sleep 0.1; waited=$(( waited + 1 ))
+  done
+  [ "$waited" -gt 0 ] && echo "build.sh: waited $(( waited * 100 )) ms for the old sandvox.exe to exit"
+  return 0
+}
+kill_sandvox_and_wait
 
 echo "build.sh: linking sandvox ($CONFIG)..."
+LINK_LOG="$ROOT/build/link.log"
 LINK_EXIT=0
-cmake --build "$ROOT/build" --config "$CONFIG" --target sandvox \
-  "${EXTRA_ARGS[@]+"${EXTRA_ARGS[@]}"}" || LINK_EXIT=$?
+for attempt in 1 2; do
+  LINK_EXIT=0
+  cmake --build "$ROOT/build" --config "$CONFIG" --target sandvox \
+    "${EXTRA_ARGS[@]+"${EXTRA_ARGS[@]}"}" > "$LINK_LOG" 2>&1 || LINK_EXIT=$?
+  cat "$LINK_LOG"
+  [ "$LINK_EXIT" -eq 0 ] && break
+  # Only the "output file is open" failure is worth a second try; a real link
+  # error (unresolved external, bad object) fails the same way twice.
+  if [ "$attempt" -eq 1 ] && grep -q 'LNK1104' "$LINK_LOG"; then
+    echo "build.sh: LNK1104 -- sandvox.exe was held open during the link; killing it again and retrying once" >&2
+    sleep 1
+    kill_sandvox_and_wait
+    continue
+  fi
+  break
+done
 T_LINK=$(date +%s)
 if [ "$LINK_EXIT" -ne 0 ]; then
   svlock_release_gpu

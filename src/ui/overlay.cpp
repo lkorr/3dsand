@@ -1,5 +1,6 @@
 #include "ui/overlay.h"
 
+#include <algorithm>
 #include <cmath>
 #include <cstdio>
 
@@ -208,9 +209,31 @@ void Overlay::DrawHUD(const UIState& s) {
       IM_COL32(70, 120, 230, 235), IM_COL32(150, 200, 255, 245), "mp",
       s.manaReserved > 0 ? s.manaMax : -1);
 
+  // ---- what is ON you, one line, only when there is enough of it -----------
+  //
+  // The bars say how you ARE; the figure's tint says which parts are coated;
+  // this NAMES the substance, which a colour cannot. Below s.stainHudMin
+  // (tune.coat.hudMinFrac, mirrored into UIState so this file needs no sim
+  // header) the line is not drawn AT ALL — no reserved gap, no faded caption
+  // — so a clean player's HUD is exactly the HUD that was here before.
+  float yStack = yHealth - gap;
+  if (s.bodyValid && s.stainFrac >= s.stainHudMin && s.stainColor != 0) {
+    char buf[80];
+    snprintf(buf, sizeof buf, "stained %.0f%% \xc2\xb7 %s",
+             s.stainFrac * 100.0f,
+             s.stainLabel[0] ? s.stainLabel : "something");
+    const ImVec2 ts = ImGui::CalcTextSize(buf);
+    const ImVec2 tp(x, std::floor(yStack - ts.y - 2.0f));
+    // Lightened toward white: an authored stain colour is picked to read as
+    // DRIED matter on a lit surface, and the same value set as 13 px of text
+    // over the figure's dark scrim is barely a shape.
+    ui::ShadowText(d, tp, ui::Mix(s.stainColor, IM_COL32_WHITE, 0.45f), buf);
+    yStack = tp.y - 2.0f;
+  }
+
   // ---- body condition, sitting directly above the hp bar -------------------
-  const float figureH = DrawBodyFigure(s, x, yHealth - gap);
-  const float yTop = yHealth - gap - figureH;
+  const float figureH = DrawBodyFigure(s, x, yStack);
+  const float yTop = yStack - figureH;
 
   if (!s.playerAlive) {
     const char* dead = "DEAD";
@@ -218,6 +241,30 @@ void Overlay::DrawHUD(const UIState& s) {
     const ImVec2 tp(x, yTop - ts.y - 6);
     d->AddText(ImVec2(tp.x + 1, tp.y + 1), IM_COL32(0, 0, 0, 190), dead);
     d->AddText(tp, IM_COL32(255, 70, 60, 255), dead);
+  }
+
+  // ---- the look prompt, and what the last E did ----------------------------
+  // Under the crosshair, on a dark tab, the way the character screen's footer
+  // does it: "E  pick up robe". The kit message rides beneath it while fresh
+  // so "picked up" / "you have no room for that" is SEEN in play rather than
+  // only on the character screen, which is where it used to be drawn alone.
+  auto tab = [&](const char* text, float y, ImU32 rim, ImU32 ink, float alpha) {
+    const ImVec2 ts = ImGui::CalcTextSize(text);
+    const ImVec2 tp(std::floor((disp.x - ts.x) * 0.5f), y);
+    d->AddRectFilled(ImVec2(tp.x - 10, tp.y - 3), ImVec2(tp.x + ts.x + 10, tp.y + ts.y + 3),
+                     IM_COL32(0, 0, 0, (int)(150 * alpha)));
+    d->AddRectFilled(ImVec2(tp.x - 10, tp.y - 3), ImVec2(tp.x + ts.x + 10, tp.y - 1),
+                     ui::Fade(rim, 0.55f * alpha));
+    d->AddText(ImVec2(tp.x + 1, tp.y + 1), IM_COL32(0, 0, 0, (int)(190 * alpha)), text);
+    d->AddText(tp, ui::Fade(ink, alpha), text);
+    return ts.y + 8;
+  };
+  float py = std::floor(disp.y * 0.5f) + 28.0f;
+  if (!s.lookPrompt.empty())
+    py += tab(s.lookPrompt.c_str(), py, ui::ColGoldDim(), ui::ColParch(), 0.95f);
+  if (!s.kitMessage.empty() && s.kitMessageAge < 2.5f) {
+    const float a = std::clamp(1.6f - s.kitMessageAge * 0.7f, 0.0f, 1.0f);
+    tab(s.kitMessage.c_str(), py, ui::ColEmber(), ui::ColEmber(), a);
   }
   ImGui::PopFont();
 }
@@ -268,6 +315,25 @@ float Overlay::DrawBodyFigure(const UIState& s, float x, float yBottom) {
     int r = (int)(215 + (200 - 215) * (1.0f - f));
     int g = (int)(220 * f * f + 30 * f);
     int bl = (int)(225 * f * f + 30 * f);
+    // WHAT IS ON THE LIMB, over what has happened TO it — mixed in AFTER the
+    // damage lerp and BEFORE the bleeding flash, and the order is the whole
+    // point: a coat is a layer on the outside, so it sits over the damage
+    // colour; an active haemorrhage is an ALARM and has to stay the loudest
+    // thing on the figure even on a limb already drenched in something.
+    //
+    // 1.5x with a 0.85 ceiling: a light splash is visible without repainting
+    // the limb, a soaked one reads as the substance, and the ceiling keeps a
+    // sliver of the damage tint so a drenched limb that is ALSO half dead is
+    // still distinguishable from a drenched healthy one.
+    if (b.stainFrac > 0.0f && b.stainColor != 0) {
+      const float k = std::min(0.85f, b.stainFrac * 1.5f);
+      const int sr = (int)((b.stainColor >> IM_COL32_R_SHIFT) & 0xFFu);
+      const int sg = (int)((b.stainColor >> IM_COL32_G_SHIFT) & 0xFFu);
+      const int sb = (int)((b.stainColor >> IM_COL32_B_SHIFT) & 0xFFu);
+      r = (int)(r + (sr - r) * k);
+      g = (int)(g + (sg - g) * k);
+      bl = (int)(bl + (sb - bl) * k);
+    }
     if (b.bleeding) {
       r = (int)(r + (255 - r) * flash);
       g = (int)(g * (1.0f - 0.85f * flash));
@@ -610,18 +676,41 @@ void Overlay::Draw(UIState& s) {
   ImGui::SameLine();
   ImGui::Checkbox("shadows", &s.shadows);
 
-  // ---- short range: the 100 m + fog comparison arm -------------------------
+  // ---- short range: the two ceiling + fog comparison arms -------------------
   // Next to `shadows` because it is the same kind of switch: session state
   // that reaches the shader as a RenderParams flag, not a tuning value (see
   // State::shortRange for why that distinction is load-bearing here).
   //
-  // The metres readout beside it is the whole reason the row is two widgets:
-  // "short range" is a claim, and the effective draw distance dropping from
-  // four digits to 100 the instant it is ticked is the evidence for it. It
-  // also shows the cascade REFILLING after a teleport, since the normal value
-  // is the filled radius rather than the theoretical horizon.
-  ImGui::Checkbox("short range (100 m + fog)", &s.shortRange);
+  // THREE radios rather than two checkboxes: the arms are mutually exclusive
+  // and "short range + near" as two independent ticks would let the user set a
+  // near arm that does nothing. The metres come from tuning and not from
+  // literals, so the labels track the sliders the moment F5 lands — a button
+  // that says "50 m" while the shader ceilings at 80 is worse than no label.
+  {
+    const auto& rt = CurrentTuning().render;
+    char nearLbl[24], farLbl[24];
+    std::snprintf(nearLbl, sizeof nearLbl, "%.0f m", rt.shortRangeNearDist);
+    std::snprintf(farLbl, sizeof farLbl, "%.0f m", rt.shortRangeDist);
+    ImGui::TextUnformatted("short range");
+    ImGui::SameLine();
+    if (ImGui::RadioButton("off", !s.shortRange)) s.shortRange = false;
+    ImGui::SameLine();
+    if (ImGui::RadioButton(nearLbl, s.shortRange && s.shortRangeNear)) {
+      s.shortRange = true;
+      s.shortRangeNear = true;
+    }
+    ImGui::SameLine();
+    if (ImGui::RadioButton(farLbl, s.shortRange && !s.shortRangeNear)) {
+      s.shortRange = true;
+      s.shortRangeNear = false;
+    }
+  }
   ImGui::SameLine();
+  // The metres readout is the whole reason the row carries one more widget:
+  // "short range" is a claim, and the effective draw distance dropping from
+  // four digits to the ceiling the instant it is picked is the evidence for
+  // it. It also shows the cascade REFILLING after a teleport, since the normal
+  // value is the filled radius rather than the theoretical horizon.
   ImGui::TextDisabled("draw %.0f m", s.renderRangeM);
   if (ImGui::IsItemHovered())
     ImGui::SetTooltip(
@@ -629,12 +718,15 @@ void Overlay::Draw(UIState& s) {
         "Normally this is the far cascade's FILLED radius, so it dips while\n"
         "the cascade refills after a teleport or a fast sprint and climbs\n"
         "back to the full horizon when every level has landed.\n\n"
-        "With 'short range' ticked it is render.shortRangeDist, and that is a\n"
+        "On either short-range arm it is that arm's ceiling, and that is a\n"
         "hard ceiling on every ray: the fine march and all eight cascade\n"
         "levels stop there. This is a PERF mode - the frame stops paying for\n"
         "the horizon - not a fog filter over a full-range image.\n\n"
-        "Shape it under Rendering: shortRangeDist, shortRangeFogStart,\n"
-        "shortRangeFogDensity. The toggle itself is not saved to tuning.json.");
+        "Shape it under Rendering: shortRangeDist (the far arm),\n"
+        "shortRangeNearDist (the near one), shortRangeFogStart,\n"
+        "shortRangeFogDensity. Both arms share the fog ramp's shape, so only\n"
+        "the wall moves between them. The choice itself is session state and\n"
+        "is not saved to tuning.json.");
 
   // ---- celestial time -------------------------------------------------
   // Scales the clock the SKY and the daylight-gated reactions both run on
@@ -962,6 +1054,10 @@ void Overlay::Draw(UIState& s) {
   ImGui::SameLine();
 
   if (ImGui::Button("detonate at crosshair (X)")) s.pendingDetonate = true;
+  ImGui::SameLine();
+  // The player's body goes limp for ragdoll.devSeconds, then gets back up:
+  // the whole live-ragdoll path (Mob::StartRagdoll -> BeginGetUp) on demand.
+  if (ImGui::Button("ragdoll me")) s.ragdollMe = true;
 
   // rolling sphere: rigidbody ball of the current brush material, so its
   // mass — and how far the player can shove it — comes from the material
@@ -1126,6 +1222,8 @@ void Overlay::Draw(UIState& s) {
           ImGui::TextDisabled("paths in, holds range, circles");
           ImGui::Separator();
           if (ImGui::Button("kill all spawned##ai")) s.aiKillSpawned = true;
+          ImGui::SameLine();
+          if (ImGui::Button("ragdoll all spawned##ai")) s.aiRagdollSpawned = true;
           ImGui::Separator();
           ImGui::Checkbox("debug viz (path / target / band)", &s.showAiDebug);
           ImGui::Checkbox("...include the range-band ring", &s.showAiRing);

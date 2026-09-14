@@ -120,9 +120,7 @@ var<workgroup> gCount : array<u32, GLOW_THREADS>;
 // accessor is invisible to check_pass_table.py's rooted walk, so a row that
 // correctly declares U(TickUBO) for it gets reported as a spurious barrier.
 fn glowWorldChunk(slot : u32, origin : vec3<i32>) -> vec3<i32> {
-  let sc = vec3<i32>(i32(slot % NCHUNK), i32((slot / NCHUNK) % NCHUNK),
-                     i32(slot / (NCHUNK * NCHUNK)));
-  return slotToWorldChunk(sc, origin);
+  return slotWorldChunk(slot, origin);
 }
 
 // One 4^3 block's contribution: the radiance its emitting cells leave, summed,
@@ -202,7 +200,8 @@ fn glowStoreSrc(slot : u32, stamp : u32, sum : vec3f, count : u32) -> bool {
 // stamp seriously here is what stops a lava pit lighting a wall 51.2 m away
 // through the wrap.
 fn glowSrcOf(wc : vec3<i32>) -> vec3f {
-  let slot = chunkSlotIndex(wc);
+  let slot = chunkSlotOf(wc, T.origin);
+  if (slot == SLOT_NONE) { return vec3f(0.0); }
   let base = glowSrcIndex(slot);
   if (glow[base + 1u] != opennessStamp(wc)) { return vec3f(0.0); }
   return unpackRgb9e5(glow[base]);
@@ -260,7 +259,8 @@ fn glowFieldAt(wc : vec3<i32>, block : u32) -> vec3f {
 // light we computed. `glowSrcOf` already refuses to READ across that seam;
 // this is the same refusal on the WRITE side, which is the half that corrupts.
 fn glowWriteField(wc : vec3<i32>, block : u32) {
-  let slot = chunkSlotIndex(wc);
+  let slot = chunkSlotOf(wc, T.origin);
+  if (slot == SLOT_NONE) { return; }
   if (glow[glowSrcIndex(slot) + 1u] != opennessStamp(wc)) { return; }
   glow[glowFieldIndex(slot, block)] = packRgb9e5(glowFieldAt(wc, block));
 }

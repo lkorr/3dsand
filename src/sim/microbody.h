@@ -60,9 +60,45 @@ struct MicroBodyModelGpu {
   // bits 0..9 dims.x, bits 10..19 dims.y, bits 20..29 dims.z (micro voxels).
   // 10 bits each is 1023 per axis, far past the +-127 DebrisVoxel bound that
   // limits a limb anyway; packing them keeps the record at 16 bytes.
+  //
+  // bit 30 (kMicroBodyDimsStainBit): THIS BLOCK CARRIES A STAIN LATTICE. One
+  // byte per micro voxel, 4 per word, laid out after the payload at
+  // `base + WordsFor(cells)` in the same idx order, holding `slot << 4 | amt`
+  // -- the world's 3-bit stain PALETTE SLOT and the 0..15 amount. This is the
+  // one place the 16-bit body coat word (voxload.h BodyStain*, which names a
+  // MATERIAL) is narrowed to what the shader needs, through
+  // MicroBodySet::stainSlotOfMat; the shader is unchanged by that. Only OWNED
+  // blocks have one -- a shared def model is clean by definition, and a body
+  // becomes owned the first time anything marks it -- so the pool pays the
+  // extra 50% only for bodies that have actually been bloodied. The shader
+  // reads the flag off this word and derives the lattice offset from dims;
+  // nothing else in the record changes, which is what keeps it 16 bytes.
   uint32_t dims;
   uint32_t scale;  // micro voxels per world voxel: 2 or 4
-  uint32_t _pad;   // padding to 16 bytes; no flag bits are defined
+  // ---- THE CUT-FACE MASK (2026-09-11) --------------------------------------
+  // Six bits, `axis * 2 + positive` — the same face encoding shadowFaceOf uses
+  // — saying which of the brick's six boundary planes is a JOINT rather than
+  // the end of the model. Consumed only by microbody.wgsl's smooth-normal
+  // gradient (BODY_SMOOTH_N), which differentiates the occupancy field and
+  // needs to know what lies past the brick.
+  //
+  // WHY IT CANNOT BE DECIDED IN THE SHADER. A limb is its own brick, tightly
+  // bounded, and the shader can see no other limb. Past the SIDE of an arm is
+  // air, so treating outside-the-brick as empty is what rounds the silhouette;
+  // past the END of an upper arm is the FOREARM, and treating that as empty
+  // rounds the cap too — which put a hard light/dark ring at every shoulder,
+  // elbow, hip and knee, swinging with the joint as it animated (owner report:
+  // "the conjoining seams of limb nodes pulse and flash"). The two cases are
+  // locally identical: in both, the boundary cell is solid and the cell outside
+  // is unknown. What tells them apart is GLOBAL — a cut plane is a whole
+  // cross-section of the limb, a tangent row on a cylinder is a line — so it is
+  // measured once here at pack time and carried on the model.
+  //
+  // It rides the word that was padding. MicroBodyModelGpu must stay 16 bytes
+  // (the static_assert below, and the hand-written mirror in common.wgsl that
+  // nothing checks), so a new field is not available; this one was already
+  // there, uploaded, and documented as carrying nothing.
+  uint32_t cutFaces;
 };
 static_assert(sizeof(MicroBodyModelGpu) == 16,
               "must match common.wgsl MicroBodyModel");
@@ -183,7 +219,30 @@ struct MicroBodySet {
   // read back by the shaders as materials[ART_PALETTE_BASE + i]. Bounded by
   // kArtPaletteSlotsGpu (world.h) = 255, the 1-based ceiling of that byte.
   std::vector<uint32_t> artColors;
+
+  // ---- material id -> stain PALETTE SLOT (1..7, 0 = does not stain) --------
+  //
+  // The body coat word names a MATERIAL (sim/voxload.h) because everything
+  // except the renderer needs to know WHICH substance is on a voxel. The
+  // renderer needs three bits. This table is the conversion, and it lives here
+  // rather than at the call sites so that WriteBrick / MicroBodyPack /
+  // MicroBodyPokeStain all narrow the same way and no caller has to hold a
+  // material table to poke a stain.
+  //
+  // Deliberately a bare vector of bytes and not a `const std::vector<
+  // MaterialDef>*`: this header is included by the render path and must not
+  // grow a dependency on sim/materials.h. Filled through
+  // MicroBodySetStainSlots at every materials load; an empty table (or a
+  // material past its end) means "no slot", i.e. amount 0, i.e. nothing drawn
+  // -- which is the right failure for a set that was never told.
+  std::vector<uint8_t> stainSlotOfMat;
 };
+
+// Publish material id -> stain palette slot into `set`. Called wherever the
+// material table is (re)built: LoadMobDefs, which already clears the set, and
+// MobSystem::OnMaterialsReloaded, because an R reload can renumber the slots
+// under bricks that are already packed.
+void MicroBodySetStainSlots(MicroBodySet& set, std::vector<uint8_t> slotOfMat);
 
 // Merge one prefab's art palette into `set`, remapping its slots if needed.
 // Returns a 256-entry table mapping the prefab's .vox palette SLOT (128..255)
@@ -207,9 +266,40 @@ std::vector<uint8_t> MicroBodyMergeArt(MicroBodySet& set,
 // drawn that way would be twice its real size — it simply does not render,
 // which the loader says out loud. A broken limb must not stop the mob from
 // loading (DESIGN.md §6).
+//
+// `cutFaces` is the 6-bit joint mask described on MicroBodyModelGpu::cutFaces.
+// It defaults to 0 — "every boundary plane of this brick is the edge of the
+// model" — which is the right answer for a prefab that is ONE model: an item's
+// blade, a debris chunk, a carved COW clone. Anything packed out of a
+// MULTI-model prefab — a mob's limbs, a garment's panels — should pass
+// MicroBodyCutFaces below.
 int MicroBodyPack(MicroBodySet& set, const std::vector<PrefabVoxel>& voxels,
                   IVec3 dims, uint32_t scale, const std::string& label,
-                  std::string& log);
+                  std::string& log, uint32_t cutFaces = 0);
+
+// ---- WHICH OF A BRICK'S SIX FACES IS A JOINT --------------------------------
+//
+// The `cutFaces` value for model `self` of `pf`: the 6-bit mask, `axis * 2 +
+// positive`, of the boundary planes that ANOTHER model of the same prefab is
+// pressed against. See MicroBodyModelGpu::cutFaces for what the shader does
+// with it and why the shader cannot work it out for itself.
+//
+// A FRACTION, NOT A PREDICATE, because parts meet imperfectly: art with a
+// one-voxel taper at the shoulder leaves part of the cap uncovered, and a held
+// prop can graze a face it is not jointed to. Half the solid boundary cells
+// covered is the line, which no single stray voxel can cross and no ordinary
+// joint fails.
+//
+// Returns 0 for a single-model prefab, which is the pre-2026-09-11 behaviour.
+//
+// NOT MOB-SPECIFIC, and it lived in mob.cpp for one day before that cost
+// something: a WORN ITEM is shaped exactly like a mob — one named model per
+// covered limb, in one shared frame — so a robe packed with cutFaces = 0 grew
+// a rounded end cap on every sleeve, yoke and hem, and the caps' shading swung
+// with the joint they straddled (owner report 2026-09-12: "the overlapping
+// parts are pulsing like crazy"). The rule is about MULTI-MODEL PREFABS, so it
+// belongs beside the packer every multi-model prefab goes through.
+uint32_t MicroBodyCutFaces(const Prefab& pf, int self);
 
 // ---- copy-on-write: destructible micro bodies -------------------------------
 //
@@ -260,8 +350,25 @@ bool MicroBodyEdit(MicroBodySet& set, uint32_t model,
 bool MicroBodyPoke(MicroBodySet& set, uint32_t model, int x, int y, int z,
                    uint8_t mat, uint8_t art);
 
+// Rewrites ONE micro voxel's STAIN BYTE in an OWNED model, brick-local
+// coordinates exactly as MicroBodyPoke. Takes the 16-bit BODY COAT word
+// (voxload.h BodyStain*) and narrows it here through `stainSlotOfMat` -- a
+// material with no palette slot writes amount 0, i.e. clean, so a coat the
+// renderer has no colour for is invisible rather than mis-coloured. The stain
+// lattice is allocated the first time an owned model is asked for one (the
+// block is reallocated at payload + stain size, so a model that MicroBodyPack
+// made owned without a stain grows one here). Returns false if the model is
+// not owned, the coordinate is outside dims, or the pool cannot grow the
+// block.
+bool MicroBodyPokeStain(MicroBodySet& set, uint32_t model, int x, int y, int z,
+                        uint16_t stain);
+
 // A model's brick dimensions in micro voxels; {0,0,0} for an invalid index.
 IVec3 MicroBodyDims(const MicroBodySet& set, uint32_t model);
+
+// dims-word flag: the block holds a stain lattice after its payload.
+constexpr uint32_t kMicroBodyDimsStainBit = 1u << 30;
+constexpr uint32_t kMicroBodyDimsMask = 0x3FFFFFFFu;
 
 // Returns an owned model's words to the free list and retires its record.
 // Safe (no-op) on shared models and on kMicroBodyNoModel, so body teardown can

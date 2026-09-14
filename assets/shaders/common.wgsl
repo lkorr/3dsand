@@ -58,9 +58,11 @@ const MATF_TINT_BASE_MASK  : u32 = 0xFFu;
 // `flags` bits 0..7 are the MATF_* booleans above (6 used, 2 spare); bits 8..15
 // are two 4-bit AUTHORED numbers, and 16..31 are still free.
 //
-// They live here rather than in two new fields because `MaterialGpu` is exactly
-// 64 bytes with no spare word, and growing a struct every sim thread reads to
-// buy eight bits is the worse trade — the same call `stainPack` made. Packing
+// They live here rather than in two new fields because growing a struct every
+// sim thread reads to buy eight bits is the worse trade — the same call
+// `stainPack` made. (The struct is 80 bytes now, not the 64 this used to cite:
+// it grew for `repose`, which could not be packed into any word that already
+// existed. The trade stands without the "no spare word" half of it.) Packing
 // into `flags` specifically is safe because every existing reader of it, on both
 // sides of the language boundary, tests it with a MASK (`(m.flags & MATF_x) !=
 // 0`); not one compares it whole, so a nibble in the high half is invisible to
@@ -68,6 +70,25 @@ const MATF_TINT_BASE_MASK  : u32 = 0xFFu;
 const MATF_WIND_RESP_SHIFT : u32 = 8u;
 const MATF_WIND_FRIC_SHIFT : u32 = 12u;
 const MATF_WIND_NIBBLE     : u32 = 0xFu;
+// ---- FAR PALETTE SLOT, bits 24..30 of the same word ------------------------
+// Which of the far cascade's 128 palette slots this material paints at
+// distance (world.h kFarPaletteBaseGpu, FAR_PAL_MASK below). Assigned at load
+// by `LoadMaterials` — identity while the id fits, then whatever the `"far"`
+// aliases free up — and mirrored by kMatFarPalShift / kMatFarPalMask in
+// sim/materials.h.
+//
+// Only worldgen.wgsl reads it (the three sites that write a far cell byte), so
+// by the letter of the "declare a constant next to its consumer" rule it could
+// live there. It is here because this is where the `flags` word's BIT BUDGET is
+// written down, and a field whose extent is documented somewhere else is how
+// two fields end up overlapping — the exact failure the voxel word's own bit
+// table exists to prevent. Bit 31 is the last free bit in this word.
+const MATF_FAR_PAL_SHIFT : u32 = 24u;
+const MATF_FAR_PAL_MASK  : u32 = 0x7Fu;
+// This material's far palette slot. `mat` must be a real material id.
+fn matFarPal(mats : ptr<storage, array<Material>, read>, mat : u32) -> u32 {
+  return ((*mats)[mat].flags >> MATF_FAR_PAL_SHIFT) & MATF_FAR_PAL_MASK;
+}
 
 struct Material {
   klass       : u32,
@@ -100,6 +121,41 @@ struct Material {
   // Both are authored in materials.json under "stain" (see materials.h).
   stainPack   : u32,
   stainColor  : u32,
+  // ---- angle of repose: what slope a PILE of this powder rests at ----
+  // Packed (codeA, codeB, blend): two of the FIVE run:rise tier codes, and the
+  // 0..255 share of grains that use the second one. ZERO means 45 degrees,
+  // which is the one-down-one-across rule every powder had before the field
+  // existed, so a material that authors nothing is bit-identical to the old
+  // sim. Authored in materials.json as `"repose": 34`; see materials.h
+  // kRepose* / kMatRepose* for the codes, the packing and the tier ladder.
+  //
+  // READ BY sim_step.wgsl ONLY. The REPOSE_* codes and the shift/mask
+  // constants are EMITTED by ShaderConstantPrelude() from those same C++
+  // definitions rather than restated in either file -- two places that must
+  // agree is the bug this repo has checkers for, and scripts/check_shaders.sh
+  // scrapes materials.h so a shader edit still validates with no build.
+  repose      : u32,
+  // ---- fluid coupling ----
+  // What a voxel of this material does while it is INSIDE a liquid — the word
+  // behind "a rock sinks in a pond and a plank washes about on top of it".
+  //   bits 0..3  : LIFT   0..15, how much of Archimedes it feels. 0 = liquids
+  //                do not touch this material at all (a flight stops dead at
+  //                the surface, which is what everything did before this word
+  //                existed). Which way it MOVES comes from `density`, not from
+  //                here.
+  //   bits 4..7  : DRAG   0..15, per-tick viscous damping, k/16 of velocity.
+  //   bits 8..11 : WANDER 0..15, lateral drift of something already floating,
+  //                in 1/256 voxel per tick.
+  //   bits 12..31: free — the next fluid rule goes here rather than into the
+  //                spare half of some unrelated field.
+  // Authored as `"fluid": {...}` in materials.json; see kFluidPack* in
+  // src/sim/materials.h, which is the side that packs it.
+  fluidPack   : u32,
+  // Reserved. The struct is read by every sim thread and grew 64 -> 80 bytes
+  // for `repose`; `fluidPack` below took the first of the three, which is
+  // exactly what they were reserved for, and two are left.
+  _r2         : u32,
+  _r3         : u32,
 };
 
 // stainPack accessors — must match kStainPack* in src/sim/materials.h.
@@ -116,6 +172,14 @@ fn matWashes(m : Material) -> bool { return (m.stainPack & 0x80000000u) != 0u; }
 // Does this material stain what it touches at all? One comparison, so the sim
 // can reject the overwhelmingly common "no" before doing any other work.
 fn matStains(m : Material) -> bool { return (m.stainPack & 0x7u) != 0u; }
+
+// fluidPack accessors — must match kFluidPack* in src/sim/materials.h.
+// LIFT first and on its own line because it is the early-out: a material that
+// does not interact with liquids costs one comparison and nothing else, exactly
+// as matWindResponse == 0 does for the wind field.
+fn matFluidLift(m : Material)   -> u32 { return m.fluidPack & 0xFu; }
+fn matFluidDrag(m : Material)   -> u32 { return (m.fluidPack >> 4u) & 0xFu; }
+fn matFluidWander(m : Material) -> u32 { return (m.fluidPack >> 8u) & 0xFu; }
 
 // ---- wind coupling, authored per material (invariant 7) --------------------
 // Both are 0..15 and both are AUTHORED in materials.json ("wind": {"response":
@@ -239,10 +303,11 @@ fn isViscousLiquid(m : Material) -> bool {
 // authored `"opacity": 40` on a solid is unambiguous and every existing solid
 // keeps rendering exactly as before.
 //
-// This is why translucency did NOT need a new Material field: the struct is a
-// hard 64 bytes (static_assert in materials.h) and is read by every sim thread,
-// so re-using a byte that already means "how much does this absorb" beats
-// growing it. The value is absorption per unit depth, not an alpha: it feeds
+// This is why translucency did NOT need a new Material field: the struct is
+// size-pinned by a static_assert in materials.h (80 bytes now; it was 64 when
+// this was written and grew for `repose`) and is read by every sim thread, so
+// re-using a byte that already means "how much does this absorb" beats growing
+// it. The value is absorption per unit depth, not an alpha: it feeds
 // Beer-Lambert in shadeTranslucent, so thin ice is nearly clear and a thick
 // block is deep cyan from the SAME number.
 fn isTranslucentSolid(m : Material) -> bool {
@@ -650,8 +715,22 @@ struct TickParams {
   // Same shape as windMode and waterBodyMode.
   currentMode      : u32,
   currentPrimCount : u32,
-  padCp0 : u32,
-  padCp1 : u32,
+  // ---- sim.gasMode (docs/PLAN_gas_particles.md) ----
+  // 0 = the residency edge is a WALL, which is what it was before stage 1:
+  // gasLeave never fires, no gas row is recorded at all (the CPU reads this
+  // same value for C_GAS), and the pinned world hash cannot move. 1 = the edge
+  // is a SINK. Same shape as windMode / waterBodyMode / fluidExciteMode, and
+  // it rides the tick input stream for their reason: a replay reproduces the
+  // stream and the twice-run determinism gate compares it, so anything the
+  // world hash can see has to arrive this way.
+  //
+  // It was the padCp0 pad word, so the struct layout is unchanged.
+  gasMode : u32,
+  // The repose snapshot's per-slot validity epoch: MONOTONIC and never reset,
+  // because the tick is not (F7 regen rewinds it, and so does every selftest
+  // arm that replays a fixed window). See TickParams::snapEpoch in world.h.
+  // Was padCp1, so the struct size is unchanged.
+  snapEpoch : u32,
   currentPrimLo : vec3<i32>,   // union AABB, inclusive world cells; lo > hi
   padCp2 : i32,                // means "no primitives"
   currentPrimHi : vec3<i32>,
@@ -798,6 +877,15 @@ const WBS_RVCAPPED  : u32 = 37u;
 // this tick, so a re-derived base would read every bucket eight slots out on
 // exactly the ticks a lake is draining and relevelling at once.
 const WBS_RVBASE    : u32 = 38u;
+// CUMULATIVE totals, never cleared. RVGIVEN/RVTAKEN are a per-TICK report and
+// the ledger zeroes them as it banks them, so a gate reading the ledger at the
+// end of a window sees whatever the last tick happened to move — which is
+// almost always nothing, and reads exactly like a relevel that never ran. That
+// cost a run: "given 0 / taken 0, credit -1" over ninety ticks was the whole of
+// the evidence, and it could not tell "the cutoffs asked for nothing" from "the
+// apply refused". CLAUDE.md rule 6 — record at the point of the fact.
+const WBS_RVGIVENT  : u32 = 39u;
+const WBS_RVTAKENT  : u32 = 40u;
 // "Nothing on this side." Deliberately outside any legal eighth height, and on
 // the side that makes the apply's comparison false for every column: no take
 // below a cutoff of -0x40000000, no give above a cutoff of +0x40000000.
@@ -1139,7 +1227,11 @@ struct RenderParams {
   camRight   : vec3f,  aspect     : f32,
   camUp      : vec3f,  time       : f32,
   // flags: bit0 = sun shadows, bit1 = active-voxel debug highlight,
-  //        bit2 = short-range mode (ray ceiling + fog ramp, raymarch.wgsl).
+  //        bit2 = short-range mode (ray ceiling + fog ramp, raymarch.wgsl),
+  //        bit3 = gas may be present (the smoke crossfade),
+  //        bit4 = short-range NEAR arm: read ONLY where bit2 is already set,
+  //               and it swaps TUNE_SHORT_RANGE_DIST for
+  //               TUNE_SHORT_RANGE_NEAR_DIST (raymarch.wgsl shortRangeCeilM).
   // Written in ONE place: WriteRenderParams (src/test/support.cpp).
   camFwd     : vec3f,  flags      : u32,
   sunDir     : vec3f,  fogDensity : f32,   // per meter (pinned to far extent)
@@ -1512,8 +1604,8 @@ fn tonemapHdr(colorIn : vec3f) -> vec3f {
 // from the raymarched look in both directions.
 // litColor with the openness (sky-visibility) multiplier applied to the AMBIENT
 // term only — never to the key light, which has its own occlusion, exactly as
-// the raymarcher's `ambientAt(n) * ao + sun` split does. `openScale` comes from
-// opennessScaleAtBody() at the call site, because only the caller has the
+// the raymarcher's `ambientAt(n) * ao + sun` split does. `openScale`/`openRaw`
+// come from opennessAtBody() at the call site, because only the caller has the
 // `openness`/`opennessGen` bindings in scope (see the pointer note above).
 //
 // A SEPARATE ENTRY POINT rather than a widened litColor: debug_lines.wgsl and
@@ -1543,9 +1635,79 @@ fn tonemapHdr(colorIn : vec3f) -> vec3f {
 // pass's P1 deposit, and the openness walk's own sun sample. Not to the
 // PUBLISHED cache value, which stays the pure ray answer the shadow-cache
 // gate compares against the fragment-stage ray.
+// A FULLY LIT READING IS NOT EXEMPT WHEN THERE IS NO SKY (2026-09-11). The
+// `mix(o, 1, ...)` above passes v = 1 through untouched, on the argument that a
+// ray which hit NOTHING saw the whole solar disc and sky visibility has no
+// say. That argument has a hole: in a cell whose hemisphere is entirely
+// blocked, "the ray hit nothing" is a contradiction, and of the two statements
+// the openness byte is the trustworthy one — it is a five-ray measurement over
+// a 12 m reach, while v = 1 is what several paths return when they have not
+// MEASURED anything yet. The shadow cache returns exactly 1.0 for a patch
+// nobody has requested, so every surface a camera saw for the first time
+// inside a cave shaded with full daylight for a frame, and the P2 write-back
+// then recorded that into the irradiance grid where it stuck: measured
+// 2026-09-11, ALL of a sealed stone box's 2.7x noon/midnight swing, with every
+// openness byte and every injected word reading 0.
+//
+// So the exemption is itself gated on the face seeing SOME sky. Below ~5%
+// openness a full-sun reading is refused outright; above it nothing changes,
+// which is every outdoor pixel in the game. Continuous (a smoothstep, not a
+// step) because the openness byte is bilinear and a hard edge here would draw
+// a line across a cave mouth.
+//
+// Fixing it HERE rather than at the write-back is what keeps it free: the
+// alternative was to return "did the cache answer?" alongside the value and
+// carry that flag to the end of the shade, which cost 40 registers in an fs
+// already at the occupancy cliff (128 -> 168, measured with --shader-stats,
+// and it slowed cameras with no GI in them at all). This is one extra
+// smoothstep on a value that is already in a register, and it covers every
+// consumer — the raymarch, the resolve pass's deposit, the openness walk's sun
+// sample and the raster body path — instead of one of them.
 fn shadowLiftCap(v : f32, o : f32) -> f32 {
   if (o < 0.0) { return v; }
-  return v * mix(o, 1.0, smoothstep(min(TUNE_SHADOW_LIFT, 0.99), 1.0, v));
+  let full = smoothstep(min(TUNE_SHADOW_LIFT, 0.99), 1.0, v) *
+             smoothstep(0.0, 0.05, o);
+  return v * mix(o, 1.0, full);
+}
+
+// The whole ambient at a surface: the SKY term, scaled by how much sky the
+// face can see, PLUS the ENCLOSED term, weighted by how much it cannot.
+// `openScale` is opennessScale()'s output and `raw` the same probe's unscaled
+// 0..1 byte (-1 = no measurement) — both come out of one opennessAt /
+// opennessAtBody call, which is why those return a pair.
+//
+// WHY AN ADD AND NOT A FLOOR ON THE MULTIPLIER (2026-09-11). These are two
+// different lights. The sky term carries the time of day, the hemisphere
+// split that gives voxel terrain its shape, and the whole day/night palette;
+// the enclosed term is the light bouncing around inside a closed space, which
+// in a real cave is a property of the cave and not of the sky above it.
+// `max(o, floor)` multiplies the second by the first, so the second inherits
+// all of the first's behaviour — and that is exactly the bug: a sealed cave
+// lit at a constant fraction of the SUN, swinging 8.6x between noon and
+// midnight. See the long form on opennessScale; the bounce reach that lets
+// this enclosed constant be so small is render.giGatherBlocks.
+//
+// The canonical injection form in the literature has the same shape:
+// L = L_local + V_sky · L_sky, sky visibility multiplying the sky term with
+// nothing under it.
+//
+//   `raw` < 0  "no measurement" (a slot never walked, or streamed out from
+//              under us). No enclosed term either — the honest answer is the
+//              pre-P0 look, and the fallback is never a guess.
+//   `raw` = 1  open sky. The weight is exactly 0, so open ground is
+//              BIT-IDENTICAL to what it was. Every phase of the openness grid
+//              has been judged by that property and this keeps it.
+//
+// Scaled by TUNE_OPENNESS_STRENGTH with everything else, so the `noopenness`
+// --render-budget arm still folds the entire feature away.
+//
+// AO IS THE CALLER'S JOB and must multiply BOTH terms. Bounce light does not
+// reach into a crease either — the same argument the sky term's `ao` rests on
+// — so callers write `ambientOpen(...) * ao`, never `ambientOpen(amb * ao, ..)`.
+fn ambientOpen(amb : vec3f, openScale : f32, raw : f32) -> vec3f {
+  if (raw < 0.0) { return amb * openScale; }
+  return amb * openScale +
+         TUNE_ENCLOSED_AMBIENT * (TUNE_OPENNESS_STRENGTH * (1.0 - raw));
 }
 
 // ---- diffuse response ----
@@ -1618,7 +1780,8 @@ fn litColorS(albedo : vec3f, n : vec3f, worldPos : vec3f, emission : f32,
   if ((R.flags & 1u) != 0u) { lambert *= shadowLiftCap(sh, openRaw); }
 
   var c = albedo * face *
-          (ambientAtP(n, R) * openScale + keyLightColorP(R) * lambert);
+          (ambientOpen(ambientAtP(n, R), openScale, openRaw) +
+           keyLightColorP(R) * lambert);
   c += albedo * emission * 1.7;
   let dist = length(worldPos - R.camPos);
   // R.fogDensity, not a hardcoded 0.0128. They agreed at the shipped default
@@ -1637,22 +1800,33 @@ fn litColorS(albedo : vec3f, n : vec3f, worldPos : vec3f, emission : f32,
   return mix(c, fogTint, fog);
 }
 
-// The shadowless form. Every caller that has no voxel bindings to cast a ray
-// with keeps this: -1 openRaw ("no measurement", shadowLiftCap passes it
-// through untouched) and sh = 1.0, which the `R.flags` branch above then
-// multiplies in as a no-op. Face tint and wrapped diffuse DO reach these paths,
-// and that is intended — a particle cube is the same axis-aligned geometry the
-// terrain is and should bank the same way.
+// The shadowless form. Every caller that has no shadow ray to cast keeps this:
+// sh = 1.0, which the `R.flags` branch above multiplies in as a no-op (and
+// shadowLiftCap(1.0, o) is the identity for any o, so passing a real openness
+// here cannot darken the key light).
+//
+// IT TAKES THE PAIR, NOT THE SCALE (2026-09-11). It used to take the scalar
+// alone and hardcode openRaw = -1, which was harmless while the enclosed
+// ambient lived inside the scale as a floor — and became a real bug the moment
+// it did not: a particle or a debris cube deep in a cave would get the
+// floorless sky term (near zero, correctly) and NO enclosed term (because -1
+// means "no measurement"), i.e. black, while the terrain around it was lit.
+// `opennessAtBody` already returns both halves of the one probe; callers pass
+// it straight through.
+//
+// Face tint and wrapped diffuse DO reach these paths, and that is intended — a
+// particle cube is the same axis-aligned geometry the terrain is and should
+// bank the same way.
 fn litColorO(albedo : vec3f, n : vec3f, worldPos : vec3f, emission : f32,
-             R : RenderParams, openScale : f32) -> vec3f {
-  return litColorS(albedo, n, worldPos, emission, R, openScale, -1.0, 1.0);
+             R : RenderParams, open : vec2f) -> vec3f {
+  return litColorS(albedo, n, worldPos, emission, R, open.x, open.y, 1.0);
 }
 
 // The plain form: no spatial term, bit-identical to what every raster path had
 // before the openness grid landed.
 fn litColor(albedo : vec3f, n : vec3f, worldPos : vec3f, emission : f32,
             R : RenderParams) -> vec3f {
-  return litColorO(albedo, n, worldPos, emission, R, 1.0);
+  return litColorO(albedo, n, worldPos, emission, R, vec2f(1.0, -1.0));
 }
 
 // Emissive voxels (embers on burning debris, lava) pulse rather than sitting at
@@ -2790,6 +2964,15 @@ const PFLAG_PENDING : u32 = 2u;        // proposed a reinsertion this tick
 // in and storing it from every droplet that landed would be a read-modify-write
 // race and would break the world hash.
 const PFLAG_MICRO   : u32 = 4u;
+// ---- GAS parcels (docs/PLAN_gas_particles.md) ------------------------------
+// Set on every particle in the GAS pool (sim_gas.wgsl), which has its own
+// buffers, its own claim hash and its own count words — so nothing depends on
+// this bit to tell the populations apart. It is here so that a parcel handed
+// to the wrong kernel through a mis-bound buffer is LOUD rather than silently
+// simulated as ballistic debris, and because bits 0..12 are spoken for
+// (ALIVE / PENDING / MICRO plus the micro scale and life fields) and the next
+// author needs to know 13 is taken.
+const PFLAG_GAS     : u32 = 8192u;
 const PMICRO_SCALE_SHIFT : u32 = 3u;
 const PMICRO_SCALE_MASK  : u32 = 3u;
 const PMICRO_LIFE_SHIFT  : u32 = 5u;
@@ -2911,7 +3094,7 @@ const FLUID_ONE       : i32 = 65536;    // 1.0 in Q16.16
 const FLUID_GW        : u32 = 8u;
 
 // ---- fluid block map: the Y-OCCUPANCY half (world.h fluidBlockMap) ---------
-// The buffer is 2 * NUM_CHUNKS words. The first half is the chunk -> block
+// The buffer is 2 * NUM_SLOTS words. The first half is the chunk -> block
 // index map the solver builds. The second half is one 16-bit mask per chunk:
 // bit L set means "local y level L of this chunk can carry fluid density".
 //
@@ -2927,7 +3110,7 @@ const FLUID_GW        : u32 = 8u;
 // contributes virtual mass to the isosurface), cleared by the same whole-buffer
 // Fill that clears the index half. Render-only DERIVED data: no solver kernel
 // reads it, so it is not hashed and cannot move the sim.
-fn fbmYMaskIndex(slot : u32) -> u32 { return NUM_CHUNKS + slot; }
+fn fbmYMaskIndex(slot : u32) -> u32 { return NUM_SLOTS + slot; }
 // The bits a source at local y level L lights up. The B-spline support is 1.5
 // cells and the trilinear tap cube adds another half, so a source at L can
 // raise the field at L-2 .. L+2.
@@ -3183,6 +3366,73 @@ fn slotToWorldChunk(sc : vec3<i32>, o : vec3<i32>) -> vec3<i32> {
   return o + ((sc - o) & vec3<i32>(NCHUNK_MASK));
 }
 
+// ---- TICKET SLOTS: residency the window's arithmetic cannot express --------
+// docs/PLAN_chunk_tickets.md §2.2. THIS BLOCK IS THE DEFINITION EVERY SHADER
+// AGREES ON, which is why it is here and not next to any one consumer.
+//
+// Slots [0, NUM_CHUNKS) are the window and `chunkSlotIndex` is a total function
+// onto them: mask, done. Slots [NUM_CHUNKS, NUM_SLOTS) are TICKETS — chunks far
+// outside the window that are resident anyway — and no arithmetic reaches them,
+// only a CPU-built lookup. So a world chunk now has three possible answers to
+// "where do you live?": a window slot, a ticket slot, or nowhere; and the four
+// functions below are the only sanctioned way to ask.
+//
+//   chunkSlotOf(wc, o)   the storage slot, or SLOT_NONE. Replaces every
+//                        chunkSlotIndex() call whose caller had to prove
+//                        residency first — the SLOT_NONE test IS that proof
+//                        now, so those sites lose a redundant compare.
+//   chunkResident(wc,o)  / cellResident(c, o)   replace chunkInWindow /
+//                        inWindow wherever the question was "may I touch this",
+//                        NOT where it was "is this inside the window box"
+//                        (the raymarch's clip, streaming planes: those stay).
+//   slotWorldChunk(s,o)  the inverse. Replaces the four-line
+//                        `sc = (s % NCHUNK, ...)` + slotToWorldChunk decode
+//                        that ten kernels had copy-pasted, because that decode
+//                        is simply WRONG for a slot >= NUM_CHUNKS.
+//
+// P0 SHIPS kTicketMax = 0. `TICKET_SLOTS != 0u` is a const-expression, so every
+// ticket branch below is dead code the compiler removes, chunkSlotOf collapses
+// to chunkSlotIndex, cellResident collapses to inWindow, and the emitted SPIR-V
+// is what it was before this block existed. That is deliberate: it is what lets
+// P0's acceptance be bit-identity AND keeps the raymarch DDA's register count
+// off the cliff in gotcha-raymarch-register-cliff. P1 fills in the two stubs.
+const SLOT_NONE : u32 = 0xFFFFFFFFu;
+
+// P0 STUB. P1 replaces this with the open-addressed probe of `ticketMap`
+// (2 * TICKET_SLOTS entries of (packed wc, slot), CPU-built, uploaded between
+// ticks, GPU read-only) and binds that map into every sim shader. Keeping the
+// binding out of P0 is why P0 touches no bind-group layout and no pass table.
+fn ticketSlotOf(wc : vec3<i32>) -> u32 {
+  return SLOT_NONE;
+}
+// P0 STUB. P1 reads `ticketSlotWc[slot - NUM_CHUNKS]`, written beside the map.
+fn ticketSlotWorldChunk(slot : u32) -> vec3<i32> {
+  return vec3<i32>(0);
+}
+
+fn chunkSlotOf(wc : vec3<i32>, o : vec3<i32>) -> u32 {
+  if (chunkInWindow(wc, o)) { return chunkSlotIndex(wc); }
+  if (TICKET_SLOTS != 0u) { return ticketSlotOf(wc); }
+  return SLOT_NONE;
+}
+fn chunkResident(wc : vec3<i32>, o : vec3<i32>) -> bool {
+  if (chunkInWindow(wc, o)) { return true; }
+  return TICKET_SLOTS != 0u && ticketSlotOf(wc) != SLOT_NONE;
+}
+fn cellResident(c : vec3<i32>, o : vec3<i32>) -> bool {
+  if (inWindow(c, o)) { return true; }
+  return TICKET_SLOTS != 0u && ticketSlotOf(worldChunkOf(c)) != SLOT_NONE;
+}
+// The inverse of chunkSlotOf: which world chunk lives in this LINEAR slot.
+fn slotWorldChunk(slot : u32, o : vec3<i32>) -> vec3<i32> {
+  if (TICKET_SLOTS != 0u && slot >= NUM_CHUNKS) {
+    return ticketSlotWorldChunk(slot);
+  }
+  let sc = vec3<i32>(vec3<u32>(slot % NCHUNK, (slot / NCHUNK) % NCHUNK,
+                               slot / (NCHUNK * NCHUNK)));
+  return slotToWorldChunk(sc, o);
+}
+
 // ---- far-field cascades (render-only LOD — DESIGN.md §9) ----
 // FAR_LEVELS nested toroidal FAR_N^3 volumes around the residency window, on
 // their OWN grid (decoupled from WORLD_N so growing the window doesn't
@@ -3254,17 +3504,30 @@ fn farOccPack(count : u32, topRowPlusOne : u32) -> u32 {
 }
 fn farOccTop(occ : u32) -> u32 { return occ >> FAR_OCC_TOP_SHIFT; }
 
-// ---- THE FAR CELL BYTE: 7 bits of material + 1 CONSERVATIVE BLOCKER BIT ----
+// ---- THE FAR CELL BYTE: 7 bits of PALETTE SLOT + 1 CONSERVATIVE BLOCKER BIT -
 // (13.2.2, docs/PLAN_lin_followups.md W2-D)
 //
 // A far cell used to be a whole byte of raw material id, clamped to 255. It is
-// now SEVEN bits of material and one flag, because the byte is the only spare
-// storage the cascade has and the material id never needed all eight: there
-// are 117 materials, `LoadMaterials` REFUSES a table that would put an id past
-// 127, and `check_invariants.py` refuses a materials.json that would grow one.
-// Both of those exist solely to keep this split legal — if either is deleted
-// the far field silently starts painting the wrong material AND claiming a
-// blocker wherever an id has bit 7 set.
+// now SEVEN bits and one flag, because the byte is the only spare storage the
+// cascade has.
+//
+// THOSE SEVEN BITS ARE NOT A MATERIAL ID. They are an index into the FAR
+// PALETTE — the fourth reserved run of the material table (world.h
+// kFarPaletteBaseGpu) — and `farPalMat` in raymarch.wgsl translates back.
+// While they WERE a material id, `LoadMaterials` had to refuse a 129th
+// material outright: the 12-bit voxel word had room for 4096 but this byte had
+// room for 128, and crossing the line would have silently painted the wrong
+// colour at distance AND claimed a blocker wherever bit 7 landed. The
+// indirection makes 128 a budget on how many things can look DIFFERENT from
+// each other at cascade scale, which is a far-field question, instead of a cap
+// on the material table, which is not. Materials that are indistinguishable at
+// 50 m share a slot by authoring `"far": "<material>"` in materials.json.
+//
+// Slots are assigned identity-first (material i takes slot i while i < 128), so
+// an unaliased table writes byte-for-byte what it wrote before the palette
+// existed. WRITERS map material -> slot through `matFarPal` (the material's own
+// `flags` word, MATF_FAR_PAL_SHIFT); READERS map slot -> material through
+// `farPalMat`. Slot 0 is air in both directions and never aliases.
 //
 // The flag means: "somewhere inside this cell's fine-voxel footprint, pristine
 // worldgen puts something a ray would stop on." It is CONSERVATIVE — it may be
@@ -3280,8 +3543,21 @@ fn farOccTop(occ : u32) -> u32 { return occ >> FAR_OCC_TOP_SHIFT; }
 // The corollary is that the flag knows nothing about EDITS: a player-built
 // wall in mid-air gets no blocker bit, only the material byte the downsample
 // writes for it.
-const FAR_MAT_MASK    : u32 = 0x7Fu;   // material id, 0 = air
+// Named FAR_PAL_ and not FAR_SLOT_ because FAR_SLOT_MASK is already the far
+// field's LEVEL-CHUNK slot in the fill queue (see worldgen.wgsl `far`), and two
+// unrelated "far slots" one grep apart is how the wrong one gets used.
+const FAR_PAL_MASK    : u32 = 0x7Fu;   // far palette slot, 0 = air
 const FAR_BLOCKER_BIT : u32 = 0x80u;
+// Slot -> material id, the READ half of the indirection (the write half is
+// matFarPal, up with the `flags` bit layout). The far palette run holds no
+// materials: only each entry's `flags` word is written, and it holds the id
+// whole. Lives here rather than beside its callers because the raymarcher and
+// the gas parcel kernel BOTH translate far bytes and must agree about what a
+// slot means; `mats` is threaded in for the same reason paletteColor() does
+// it — common.wgsl is prepended before either shader declares `materials`.
+fn farPalMat(mats : ptr<storage, array<Material>, read>, slot : u32) -> u32 {
+  return (*mats)[FAR_PALETTE_BASE + slot].flags;
+}
 
 // ---- per-chunk occupancy packing ----
 // Low 16 bits: total non-air voxels (chunk-skip for media-aware rays, CPU
@@ -3540,18 +3816,34 @@ fn opennessAt(cell : vec3<i32>, p : vec3f, n : vec3f,
 // identically and lose the sky/ground split that gives voxel terrain its shape.
 // Multiplying keeps the hue and the shape and makes enclosure actually darken,
 // which is the sentence the phase is judged by.
-// THE FLOOR. A measured 0 is "no sky visible", and multiplying the ambient by
-// 0 is pitch black -- which a dug tunnel two metres from its mouth and a step
-// face on a meadow (whose horizontal rays hit a one-voxel rise within reach)
-// both became on 2026-09-02. Real enclosed surfaces keep light from the
-// surfaces around them; until the bounce grid carries all of that, the
-// multiplier never drops below render.opennessFloor. The lift cap
-// (shadowLiftCap) deliberately reads the RAW openness, not this: direct sun
-// still cannot enter a cave.
+// THE FLOOR IS NOT HERE ANY MORE, AND THAT IS THE WHOLE OF THE 2026-09-11 FIX.
+// It used to be `max(o, TUNE_OPENNESS_FLOOR)` -- an enclosed face kept 30% of
+// the hemisphere ambient. The bug is not the 30%, it is WHAT it was 30% OF:
+// `ambientAt` is the day/night signal and nothing else, swinging ~20x between
+// noon and a moonless midnight, so a sealed cave was lit at a constant
+// FRACTION OF THE SUN through solid rock. Measured in the `--shot` stone room
+// (mean linear luminance of the interior, noon vs midnight): the back wall
+// swung 8.6x and the deep floor 7.7x, against 14.6x for the open meadow
+// outside, and killing the floor alone dropped the noon wall from 0.0568 to
+// 0.00136 -- 97.6% of it was this term.
+//
+// What the floor was really standing in for ("real enclosed surfaces keep
+// light from the surfaces around them") is now two things that do not move
+// with the sun: `ambientOpen`'s enclosed term below, and the bounce gather,
+// whose reach went 1.2 m -> ~12 m in the same change.
+// render.opennessFloor survives at 0 as the A/B arm for the old look.
+//
+// The lift cap (shadowLiftCap) still reads the RAW openness, not this: direct
+// sun cannot enter a cave regardless.
 fn opennessScale(o : f32) -> f32 {
   return select(1.0, mix(1.0, max(o, TUNE_OPENNESS_FLOOR), TUNE_OPENNESS_STRENGTH),
                 o >= 0.0);
 }
+
+// `ambientOpen`, which turns this scale plus the raw byte into the whole
+// ambient, lives UP beside shadowLiftCap and litColorS: WGSL wants the
+// definition before the use and the raster body path is the earlier caller.
+// The reasoning for its shape is written there.
 
 // shadowLiftCap MOVED UP, next to litColorS (2026-09-04): the raster body
 // path needs it and WGSL wants the definition first. Its documentation went
@@ -3592,14 +3884,14 @@ fn opennessAtBody(worldPos : vec3f,
   return vec2f(1.0, -1.0);
 }
 
-// The scale alone, for the paths that cast no shadow ray and so have no use for
-// the raw byte (particles, sprites, fluid).
-fn opennessScaleAtBody(worldPos : vec3f,
-                       occ : ptr<storage, array<u32>, read>,
-                       op : ptr<storage, array<u32>, read>,
-                       og : ptr<storage, array<u32>, read>) -> f32 {
-  return opennessAtBody(worldPos, occ, op, og).x;
-}
+// `opennessScaleAtBody` — the scale alone, for the paths that cast no shadow
+// ray — IS GONE (2026-09-11). Since the enclosed ambient left the multiplier
+// (ambientOpen), the scale on its own is no longer a complete answer: a body
+// deep in a cave needs the RAW byte to pick up the enclosed term, and a path
+// that only had the scale would render it black. Every one of those call sites
+// (debris.wgsl's three) now takes the pair from opennessAtBody and hands it to
+// litColorO. Keeping a lossy shortcut beside the honest one is how the bug
+// would come back.
 
 // ---- IRRADIANCE GRID (src/sim/world.h kIrradianceBytes, PLAN_gi.md §3) -----
 // Phase P1 of indirect light. One RGB9E5 word per (slot, 4^3 block, face) at
@@ -3652,7 +3944,16 @@ fn irrIndexOfCell(c : vec3<i32>, face : u32) -> u32 {
 // and on every FULL walk (the geometry may have moved, so the next frame
 // re-gathers what it can see). Read under the openness stamp like everything
 // else in the two grids.
-const GI_CACHE_BASE : u32 = NUM_CHUNKS * OPEN_BLOCKS * OPEN_FACES;
+const GI_CACHE_BASE : u32 = NUM_SLOTS * OPEN_BLOCKS * OPEN_FACES;
+
+// THERE IS NO MIP PYRAMID OVER PLANE 0, and that was a decision rather than an
+// omission. One was built on 2026-09-11 (three chunk-local levels, six faces
+// each, so a long gather ray could read a prefiltered cell instead of point-
+// sampling a 40 cm block-face) and removed the same day: reading it cost the
+// raymarch fragment shader 128 -> 168 registers, which is the wrong side of
+// its occupancy cliff, and slowed --render-budget cameras that contain no
+// indirect light at all. raymarch.wgsl's giGatherRays carries the full
+// argument and the one condition under which it is worth retrying.
 
 // ---- the second and third planes of `opennessGen` ---------------------------
 // (world.h kOpennessGenWords, PLAN_frame_perf.md §3 item 4.) Plane 0 is the
@@ -3666,8 +3967,8 @@ const GI_CACHE_BASE : u32 = NUM_CHUNKS * OPEN_BLOCKS * OPEN_FACES;
 // full walk, and keeps only the irradiance maintenance. Slot-space columns
 // are toroidal like the slots; a column renamed by a window shift keeps its
 // old touch, which can only cost one extra walk, never a missed one.
-const OPEN_WALKED_BASE : u32 = NUM_CHUNKS;
-const OPEN_TOUCH_BASE : u32 = 2u * NUM_CHUNKS;
+const OPEN_WALKED_BASE : u32 = NUM_SLOTS;
+const OPEN_TOUCH_BASE : u32 = 2u * NUM_SLOTS;
 fn openColumnOfSlot(slot : u32) -> u32 {
   return (slot / (NCHUNK * NCHUNK)) * NCHUNK + (slot % NCHUNK);
 }
@@ -3736,8 +4037,9 @@ fn irrSample(albedo : vec3f, n : vec3f, L : vec3f, sunCol : vec3f, lit : f32,
 // is at this POINT", in ONE buffer read, from nothing but a world position.
 // `giGather` answers a strictly better question (it is directional, occluded
 // and carries sun bounce) but it needs nine coarse DDA rays and `occupancy` +
-// `voxels` + `pageTable` in the fragment stage, and it reaches
-// TUNE_GI_GATHER_BLOCKS blocks — 1.2 m at the shipped 3. The raster body paths
+// `voxels` + `pageTable` in the fragment stage, and it runs a bounded STEP
+// budget (TUNE_GI_GATHER_BLOCKS, ~12 m of open interior at the shipped 24 —
+// it was 1.2 m until 2026-09-11). The raster body paths
 // (debris.wgsl's rigid-body and particle cubes, microbody.wgsl's mob limbs)
 // have neither the bindings nor the budget, which is why a mob in a lava pit
 // and a burning crown falling off a tree are lit by the sky alone today.
@@ -3756,12 +4058,12 @@ fn irrSample(albedo : vec3f, n : vec3f, L : vec3f, sunCol : vec3f, lit : f32,
 // common.wgsl is prepended before any shader declares a binding.
 
 // The FIELD region starts after the SRC region, which is kGlowSrcWordsPerSlot
-// (4) words per slot. Derived from NUM_CHUNKS, which the prelude already emits,
+// (4) words per slot. Derived from NUM_SLOTS, which the prelude already emits,
 // so the glow field costs no new prelude constant and no
 // ShaderConstantPrelude / check_shaders.sh edit. MUST MATCH
 // sandvox::kGlowFieldBaseWord (src/sim/world.h).
 const GLOW_SRC_WORDS_PER_SLOT : u32 = 4u;
-const GLOW_FIELD_BASE : u32 = NUM_CHUNKS * GLOW_SRC_WORDS_PER_SLOT;
+const GLOW_FIELD_BASE : u32 = NUM_SLOTS * GLOW_SRC_WORDS_PER_SLOT;
 
 fn glowSrcIndex(slot : u32) -> u32 { return slot * GLOW_SRC_WORDS_PER_SLOT; }
 fn glowFieldIndex(slot : u32, block : u32) -> u32 {
@@ -4113,6 +4415,293 @@ fn lateralDir(i : u32) -> vec2<i32> {
   }
 }
 
+// ======================= THE GAS MOTION MODEL ==============================
+// docs/PLAN_gas_particles.md §2.2. HERE, and not next to either consumer,
+// because "two shaders must AGREE" is the whole criterion for this file: the
+// CA (sim_step.wgsl) moves a gas VOXEL and sim_gas.wgsl moves a gas PARCEL
+// that has left the residency window, and the plan's requirement is that the
+// parcel takes THE MOVES A VOXEL WOULD — not a plausible approximation of
+// them. Two hand-kept copies of a fourteen-step fallback ladder is exactly the
+// pair that drifts, and it drifted within one afternoon of being written: this
+// block spent phase A duplicated under a TEMP-DUP banner with a
+// check_invariants rule comparing the two bodies, which is the cost of NOT
+// being here.
+//
+// EVERYTHING TAKES `T` AS A POINTER. Nothing at module scope in common.wgsl
+// can name the TickParams uniform — each shader declares its own binding — so
+// the whole family threads it, exactly as windAtQ above does.
+//
+// AND EVERYTHING TAKES THE KEY AND THE SUBSTEP. The CA rolls once per gravity
+// SUBSTEP and keys on its cell's slot index; a parcel rolls once per TICK and
+// keys on a hash of its cell and payload. Both are position-derived and
+// neither is a buffer slot (rule 1), but they are not the same value, so the
+// functions take what they need instead of reading a kernel-local global.
+
+// The wind speed at which the drift bias saturates, in the Q16.16 world-cells
+// -per-second windAtQ speaks. Human numbers in, integers out, at shader compile
+// time — the sim_fluid.wgsl discipline, IEEE-exact const folding so the kernel
+// stays integer and deterministic.
+//
+// `/ VOXEL_METERS` IS LOAD-BEARING and it is the reason this constant is here
+// rather than copied: the knob is authored in METRES per second and windAtQ
+// answers in VOXELS, so dropping the conversion makes the reference ten times
+// too small and every gas saturates the bias almost immediately. That is
+// exactly what happened while this block was briefly duplicated — the copy in
+// the gas particle kernel was retyped rather than moved, and a parcel leaned
+// downwind on a scale no voxel ever used. The check that would have caught it
+// compared FUNCTION BODIES and not constants; the check that catches it now is
+// that there is only one definition.
+const WIND_DRIFT_REF : i32 = i32(round(
+    clamp(TUNE_WIND_DRIFT_SPEED, 0.5, 200.0) * 65536.0 / VOXEL_METERS));
+// That cap, in 1024ths. Below 1024 by construction (LoadTuning clamps to 0.95):
+// at certainty the RNG order is gone entirely and a gas stops looking like a
+// gas and starts looking like a conveyor belt.
+const WIND_DRIFT_CAP : i32 = i32(round(clamp(TUNE_WIND_DRIFT_MAX, 0.0, 0.95) * 1024.0));
+
+// Distinct salt for the wind RNG stream. NOT a bit-slice of `rnd`: the movement
+// tail already spends bits 10.., 14.. and 18.. of that word on the direction
+// rotations these decisions sit next to, and correlating "does it go downwind"
+// with "which way did it pick" is exactly the kind of hidden coupling the
+// worldgen salt rule exists to forbid. One extra hash3, drawn only when a
+// material actually responds to wind.
+const WIND_RNG_SALT : u32 = 0x5719u;
+
+fn gasRndK(key : u32, stream : u32, substep : u32,
+           T : ptr<uniform, TickParams>) -> u32 {
+  return hash3((*T).seed ^ WIND_RNG_SALT ^ (stream * 0x9E37u),
+               (*T).tick * 2u + substep, key);
+}
+
+// Which of lateralDir's four codes points most nearly downwind. lateralDir is
+// 0:+x 1:+z 2:-x 3:-z, so this is the dominant horizontal axis and its sign.
+fn windLateralCode(w : vec3<i32>) -> u32 {
+  if (abs(w.x) >= abs(w.z)) { return select(2u, 0u, w.x > 0); }
+  return select(3u, 1u, w.z > 0);
+}
+
+// The starting index for a 4-direction lateral rotation, biased downwind.
+//
+// Returns `base` (the RNG's own offset) unchanged in every case where wind
+// should not apply, so the two call sites read as "the same rotation, sometimes
+// started somewhere else". That framing is the safety argument: no branch here
+// can add a move candidate, only reorder the four that were already going to be
+// tried, so tryMove's write reach and the stamp discipline are untouched.
+fn windLateralStartK(c : vec3<i32>, base : u32, m : Material,
+                     key : u32, substep : u32,
+                     T : ptr<uniform, TickParams>) -> u32 {
+  if ((*T).windMode == WIND_MODE_OFF) { return base; }
+  let resp = i32(matWindResponse(m));
+  if (resp == 0) { return base; }          // most materials: one compare
+  let w = windAtQ(c, T);
+  let mag = max(abs(w.x), abs(w.z));
+  if (mag == 0) { return base; }
+  // Ramp to the cap over [0, WIND_DRIFT_REF], then scale by the authored
+  // response. Both operands are pre-scaled by 1024 before multiplying: a
+  // storm-force Q16.16 speed times 1024 leaves i32, and this runs per moving
+  // voxel per substep.
+  let frac = (min(mag, WIND_DRIFT_REF) >> 10u) * 1024 /
+             max(WIND_DRIFT_REF >> 10u, 1);            // 0..1024
+  var p = ((frac * WIND_DRIFT_CAP) / 1024) * resp / 15;
+  // The dev force multiplier, applied to the PROBABILITY and AFTER the cap —
+  // not to the field, and the difference is the whole reason this tier scales
+  // a different quantity from the particle tier (windAtScaledQ says so at
+  // length). `frac` above saturates once the wind passes windDriftSpeed, which
+  // the default weather already nearly does, so a velocity multiplier here
+  // would move the slider for the first ~2x and then do nothing. Scaling `p`
+  // instead runs all the way to CERTAINTY: at the top of the range every moving
+  // gas voxel tries downwind first and smoke stops looking like smoke and
+  // starts looking like a conveyor belt, which is exactly the thing a "what
+  // does drastic look like" control exists to show.
+  //
+  // The == is an exact-identity guard, not an optimisation: at the shipping 1x
+  // this is arithmetically untouched, so "the slider is at 1x" and "the pinned
+  // hash holds" are one statement.
+  if ((*T).windGasScaleQ != WINDQ_SCALE_ONE) {
+    p = min((p * (*T).windGasScaleQ) / WINDQ_SCALE_ONE, 1024);
+  }
+  if (i32(gasRndK(key, 0u, substep, T) & 1023u) < p) { return windLateralCode(w); }
+  return base;
+}
+
+// ---- THE GAS VERTICAL MODEL (buoyancy vs wind) ----------------------------
+// A gas used to rise UNCONDITIONALLY — step 1 of the movement tail is a bare
+// tryMove straight up, and it returns on success. So for a plume with open sky
+// above it the wind code below never executed at all, and no amount of drift
+// bias could make smoke lean: the bias only ever reordered the FALLBACK
+// candidates, which a freely-rising column never reaches. That, and not a
+// tuning value, is why smoke went straight up in a gale.
+//
+// THE MODEL. Buoyancy is a PROBABILITY, and wind redistributes it. Everything
+// is in 1024ths of a move attempt:
+//
+//     rise = 1024 - down          the move carries +1 Y
+//     sink = (down - 1024) / 2    the move carries -1 Y
+//     flat = the remainder        the move is horizontal only
+//     lean = fh - up              a rising move ALSO carries a downwind step
+//
+// where `down`/`up` are the vertical wind as a fraction of the CA saturation
+// speed (sim.windDriftSpeed) and `fh` is the horizontal one, both scaled by the
+// material's authored response and the dev multiplier. Read off the ladder:
+//
+//     calm              1024 rise, 0 lean   -> straight up, every time
+//     slight crosswind  1024 rise, 102 lean -> 90% straight up, 10% up-diagonal
+//     half downdraft     512 rise, 512 flat -> half the rises become sideways
+//     full downdraft        0 rise, 1024 flat -> buoyancy cancelled, spreads flat
+//     2x downdraft          0 rise, 512 sink -> half its moves are DOWNWARD
+//
+// WHY THE LEAN IS A DIAGONAL and not a flat sideways step. Both spend the same
+// one move, but the diagonal spends it on +1 up AND +1 downwind, so a plume
+// leans without slowing its climb. Paying for drift out of the rise rate would
+// make a 45-degree plume climb at half speed, which is not what a gas in a
+// crosswind does — and the up-diagonals are candidates this kernel already
+// tries, so nothing about write reach changes.
+//
+// AN UPDRAFT straightens rather than accelerates: `rise` is already at
+// certainty in calm air and there is nothing above 1024, so the only way for
+// lift to read as MORE vertical is for it to cancel the lean. That is what
+// `fh - up` says, and it is the correct reading of "goes up relative to the
+// rest" once you notice that "up" was never the scarce thing.
+//
+// HONESTY ABOUT THE SAFETY ARGUMENT. The drift bias could claim it "only
+// reorders candidates the voxel was already going to try". This CANNOT: the
+// sink tier is a genuinely new move, downward, that no gas could make before.
+// So the bound is argued directly instead — every candidate is reach 1, every
+// one goes through the ordinary tryMove (so the stamp discipline, the density
+// test and markDirty are untouched), and a gas can only ever enter a cell
+// LIGHTER-than-air rejects, which is the same test that gated its lateral
+// spread. `canDisplace` is a density comparison, not a direction one, so
+// downward motion needed no change there.
+
+// Signed wind on one axis as a fraction of the CA saturation speed, in 1024ths,
+// scaled by the material's response and the dev multiplier. Clamped to +-3072
+// because 3x saturation is where the sink ramp reaches certainty.
+//
+// abs-then-shift-then-resign, NOT a bare arithmetic shift: >> on a negative i32
+// rounds toward -inf, and an asymmetric round here reads as a permanent drift
+// down-axis. That is the mq() lesson, and it is exactly the kind of bug a world
+// hash cannot tell you about.
+fn windAxisFrac(v : i32, resp : i32, T : ptr<uniform, TickParams>) -> i32 {
+  let lim = 3 * WIND_DRIFT_REF;
+  let a = min(abs(v), lim);
+  var f = ((a >> 10u) * 1024) / max(WIND_DRIFT_REF >> 10u, 1);   // 0..3072
+  f = (f * resp) / 15;
+  if ((*T).windGasScaleQ != WINDQ_SCALE_ONE) {
+    f = (f * (*T).windGasScaleQ) / WINDQ_SCALE_ONE;
+  }
+  f = min(f, 3072);
+  return select(f, -f, v < 0);
+}
+
+// Which lateral the horizontal share takes: downwind with probability `fh`,
+// uniform otherwise.
+//
+// NOT windLateralStartK's ramp, and the difference matters. That cap
+// (sim.windDriftMax) exists because there the bias is the ONLY thing limiting
+// how much a voxel moves downwind, so letting it reach certainty turns smoke
+// into a conveyor belt. Here the AMOUNT is already metered by `lean` and
+// `flat` — capping the DIRECTION too would scatter a share the model has
+// already decided should go downwind, and a 10% southward lean would come out
+// only 6% southward. The uniform fallback is load-bearing at the other end: a
+// pure downdraft has no horizontal wind, `windLateralCode` would hand back a
+// fixed axis for a zero vector, and every gas in the world would spread the
+// same way. fh = 0 must mean "no opinion", which is what "equal chance in any
+// horizontal direction" asks for.
+fn gasLateralRot(w : vec3<i32>, fh : i32, base : u32, r : u32) -> u32 {
+  if (i32(r & 1023u) < fh) { return windLateralCode(w); }
+  return base;
+}
+
+struct GasIntent {
+  dir  : vec3<i32>,   // the primary candidate, relative to the cell
+  rise : bool,        // did the roll choose to go UP (see the fallback note)
+  rot  : u32,         // lateral rotation for the flat/sink fallback scan
+};
+
+// The one roll. Returns straight up — bit for bit what step 1 would have tried
+// — whenever wind is off, the material does not respond, or the air is calm,
+// so a windless world moves exactly as it did before this existed.
+fn gasIntentK(c : vec3<i32>, m : Material, key : u32, base : u32,
+              substep : u32, T : ptr<uniform, TickParams>) -> GasIntent {
+  var g : GasIntent;
+  g.dir = vec3<i32>(0, 1, 0);
+  g.rise = true;
+  g.rot = base;
+  if ((*T).windMode == WIND_MODE_OFF) { return g; }
+  let resp = i32(matWindResponse(m));
+  if (resp == 0) { return g; }              // most materials: one compare
+  let w = windAtQ(c, T);
+  let fy = windAxisFrac(w.y, resp, T);
+  let fh = min(1024, max(abs(windAxisFrac(w.x, resp, T)),
+                         abs(windAxisFrac(w.z, resp, T))));
+  let down = max(0, -fy);
+  let up   = max(0,  fy);
+  let rise = clamp(1024 - down, 0, 1024);
+  let sink = clamp((down - 1024) / 2, 0, 1024);
+  let lean = clamp(fh - up, 0, 1024);
+  // Dead calm is rise=1024, lean=0 — the identity path, and it is checked
+  // rather than computed through so "there is no wind here" and "this cell
+  // moves as it always did" are one statement.
+  if (rise == 1024 && lean == 0) { return g; }
+  let r = gasRndK(key, 1u, substep, T);
+  let tier = i32(r & 1023u);
+  let leanRoll = i32((r >> 10u) & 1023u);
+  g.rot = gasLateralRot(w, fh, base, r >> 20u);
+  let d = lateralDir(g.rot);
+  if (tier < rise) {
+    // It rises. Straight up, or up AND downwind in the same move.
+    if (leanRoll < lean) { g.dir = vec3<i32>(d.x, 1, d.y); }
+    return g;
+  }
+  g.rise = false;
+  if (tier < 1024 - sink) {
+    g.dir = vec3<i32>(d.x, 0, d.y);         // buoyancy cancelled: spread flat
+    return g;
+  }
+  // Driven down, leaning downwind if there is also a crosswind.
+  g.dir = select(vec3<i32>(0, -1, 0), vec3<i32>(d.x, -1, d.y), leanRoll < lean);
+  return g;
+}
+
+// ---- THE GAS FALLBACK LADDER, as a pure index -> candidate function --------
+//
+// The fourteen candidates a gas tries, in the exact order the CA has always
+// tried them:
+//
+//   0        the gasIntent primary — where the buoyancy/wind roll wants to go
+//   1..4     its flat ring, tried ONLY when the roll did not choose to rise
+//            (a downdraft-pinned parcel exhausts the horizontal ring before it
+//            is allowed to fall back on rising; see the call site's note)
+//   5        straight up
+//   6..9     the four up-diagonals, rotation started at rUp
+//   10..13   the four flat laterals, rotation started at rLat
+//
+// `w` is 0 for a candidate that does not exist in this configuration, which is
+// how the conditional ring stays inside a fixed index space.
+//
+// THE TWO ROTATIONS ARE PARAMETERS because they are computed LAZILY at the
+// call site: `windLateralStartK` evaluates the wind field, and a freely rising
+// plume returns at index 0 without ever reaching a ring. Folding them in here
+// would make every rising gas voxel in the world pay for two field samples it
+// never uses.
+const GAS_LADDER_N    : u32 = 14u;
+const GAS_LADDER_RING : u32 = 6u;   // first index that needs rUp / rLat
+
+fn gasLadderStep(g : GasIntent, rUp : u32, rLat : u32, i : u32) -> vec4<i32> {
+  if (i == 0u) { return vec4<i32>(g.dir, 1); }
+  if (i < 5u) {
+    if (g.rise) { return vec4<i32>(0, 0, 0, 0); }
+    let d = lateralDir((i - 1u) + g.rot);
+    return vec4<i32>(d.x, 0, d.y, 1);
+  }
+  if (i == 5u) { return vec4<i32>(0, 1, 0, 1); }
+  if (i < 10u) {
+    let d = lateralDir((i - 6u) + rUp);
+    return vec4<i32>(d.x, 1, d.y, 1);
+  }
+  let d = lateralDir((i - 10u) + rLat);
+  return vec4<i32>(d.x, 0, d.y, 1);
+}
+
 // ============================ PAGE TABLE ACCESSORS ==========================
 // docs/PLAN_page_table.md §2. THE SEAM: every world-coordinate voxel access in
 // every kernel routes through these, so no sim kernel's own code has to know
@@ -4212,11 +4801,23 @@ fn pageEntryOf(chunkSlot : u32) -> u32 { return pageTable[chunkSlot]; }
 // `T` in a sim kernel and `R` in the renderer, and common.wgsl is prepended
 // before either is declared. Generating the accessor keeps all 46 voxWordAt
 // call sites unchanged and keeps the seed out of every signature.
+// THE slot resolver for a world CELL, and the one place the window mask and
+// the ticket probe meet. The mask is the fast path and stays FIRST and
+// branch-free; the probe is a cold tail behind a const-expression, so at
+// kTicketMax = 0 this is exactly `chunkIndexOf(c & WORLD_MASK)` and the DDA
+// that calls it thousands of times a ray gains nothing to spill
+// (gotcha-raymarch-register-cliff).
+fn voxSlotOfCell(c : vec3<i32>) -> u32 {
+  if (TICKET_SLOTS != 0u) {
+    let wc = worldChunkOf(c);
+    if (!chunkInWindow(wc, ptOrigin())) { return ticketSlotOf(wc); }
+  }
+  return chunkIndexOf(vec3<u32>(c & vec3<i32>(WORLD_MASK)));
+}
 fn voxWordAt(c : vec3<i32>) -> u32 {
-  let s = vec3<u32>(c & vec3<i32>(WORLD_MASK));
-  let e = pageTable[chunkIndexOf(s)];
+  let e = pageTable[voxSlotOfCell(c)];
   if ((e & PT_SENTINEL_BIT) != 0u) { return synthWordAt(e, c, ptSeed()); }
-  let lo = s % CHUNK;
+  let lo = vec3<u32>(c & vec3<i32>(CHUNK_MASK));
   return voxels[e * CHUNK_VOL + (lo.z * CHUNK + lo.y) * CHUNK + lo.x];
 }
 
@@ -4583,10 +5184,7 @@ fn shadowCoarseFromT() -> f32 {
 // chunk in the window the variant pattern of whichever world chunk last
 // occupied that slot.
 fn worldCellOfSlotLocal(chunkSlot : u32, localIdx : u32) -> vec3<i32> {
-  let sc = vec3<i32>(i32(chunkSlot % NCHUNK),
-                     i32((chunkSlot / NCHUNK) % NCHUNK),
-                     i32(chunkSlot / (NCHUNK * NCHUNK)));
-  let wc = slotToWorldChunk(sc, ptOrigin());
+  let wc = slotWorldChunk(chunkSlot, ptOrigin());
   let lo = vec3<i32>(i32(localIdx % CHUNK),
                      i32((localIdx / CHUNK) % CHUNK),
                      i32(localIdx / (CHUNK * CHUNK)));
@@ -4739,15 +5337,15 @@ const PT_K_WATERBODY : u32 = 8u;
 const PT_K_WORLDGEN  : u32 = 9u;   // worldgen.wgsl `main` — the whole world
 const PT_K_GENLIST   : u32 = 10u;  // worldgen.wgsl `list` — a streamed plane
 const PT_K_PAGEFILL  : u32 = 11u;  // worldgen.wgsl `pagefill` — JITTER realize
-const PT_K_COUNT     : u32 = 12u;  // per-kernel tally bank width in pageFaults
+const PT_K_GAS       : u32 = 12u;  // sim_gas.wgsl `gasResolve` — re-entry landing
+const PT_K_COUNT     : u32 = 13u;  // per-kernel tally bank width in pageFaults
 const PT_FAULT_KBASE : u32 = 20u;  // where that bank starts (world.h mirrors it)
 var<private> gPtKernel : u32 = PT_KERNEL;
 
 fn voxWordIndex(c : vec3<i32>) -> u32 {
-  let s = vec3<u32>(c & vec3<i32>(WORLD_MASK));
-  let slot = chunkIndexOf(s);
+  let slot = voxSlotOfCell(c);
   let e = pageTable[slot];
-  let lo = s % CHUNK;
+  let lo = vec3<u32>(c & vec3<i32>(CHUNK_MASK));
   if ((e & PT_SENTINEL_BIT) != 0u) {
     gPtSlot = slot;
     gPtEntry = e;
@@ -4814,10 +5412,7 @@ fn voxStore(idx : u32, w : u32) {
     if (gPtKernel < PT_K_COUNT) {
       atomicAdd(&pageFaults[PT_FAULT_KBASE + gPtKernel], 1u);
     }
-    let sc = vec3<i32>(i32(gPtSlot % NCHUNK),
-                       i32((gPtSlot / NCHUNK) % NCHUNK),
-                       i32(gPtSlot / (NCHUNK * NCHUNK)));
-    let wc = slotToWorldChunk(sc, ptOrigin());
+    let wc = slotWorldChunk(gPtSlot, ptOrigin());
     // FIRST fault (prev == 0 is exactly one invocation, whichever wins the
     // atomic) and LAST fault (a plain store, so it races and reports SOME late
     // fault rather than provably the last one — enough to say whether the

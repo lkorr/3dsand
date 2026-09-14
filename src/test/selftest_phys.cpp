@@ -18,6 +18,7 @@
 #include "game/camera.h"
 #include "game/player.h"
 #include "gpu/resources.h"
+#include "phys/marching_cubes.h"
 #include "test/selftest.h"
 #include "test/support.h"
 
@@ -46,6 +47,7 @@ bool debrisOk = false;
   uint32_t t = 2000;
   uint32_t bodiesSeen = 0;
   debris.ResetSettleProbe();
+  debris.ResetUntunnelProbe();
 
   for (int i = 0; i < 420; i++) {
     std::vector<BrushOp> ops;
@@ -135,16 +137,28 @@ bool debrisOk = false;
   const uint32_t buriedMax = (uint32_t)BaselineNumber("debris.buriedMax", 1);
   debrisOk = bodiesSeen >= 1 && awakeAboveGround == 0 && buried <= buriedMax;
   RecordObserved("debris.buriedObserved", (double)buried);
+  // ...and WHY there are none (or why there still are). The buried body was
+  // ejecta that outran the chunk fetch, and DebrisSystem::UntunnelBody is the
+  // fix: `holds` is the clamp catching a body about to enter a chunk with no
+  // patch in it, `released` is that clamp giving up because the patch never
+  // arrived. "0 buried, 0 holds" and "0 buried, 41 holds" are different
+  // worlds — the first means the blast stopped producing the case, the second
+  // means the case is being caught.
+  const DebrisSystem::UntunnelProbe& ut = debris.Untunnel();
   detail = Format(
       "%u bodies spawned, %u awake after settling (%u of them above ground — "
       "that is the assertion), %u buried below local terrain (allow %u), %u "
       "events pending; %u terrain wakes + %u blast wakes, last at tick %u "
       "(chunk %d,%d,%d) of %u, longest quiet run %u ticks of the 60 a settle "
-      "needs; awake bodies: [%s], fixture ground at y=%d",
+      "needs; untunnel held %u steps over %u bodies (%u released, longest step "
+      "caught %.1f vox, last unvouched chunk %d,%d,%d); awake bodies: [%s], "
+      "fixture ground at y=%d",
       bodiesSeen, awake, awakeAboveGround, buried, buriedMax,
       debris.PendingEvents(), sp.terrainWakes, sp.blastWakes, sp.lastWakeTick,
       sp.lastWakeChunk.x, sp.lastWakeChunk.y, sp.lastWakeChunk.z, t,
-      sp.maxInactiveTicks, who.empty() ? "none" : who.c_str(), h);
+      sp.maxInactiveTicks, ut.holds, ut.bodiesHeld, ut.released, ut.maxStepVox,
+      ut.lastChunk.x, ut.lastChunk.y, ut.lastChunk.z,
+      who.empty() ? "none" : who.c_str(), h);
   std::printf("debris: %s (%s)\n", debrisOk ? "PASS" : "FAIL", detail.c_str());
 
   // visual proof: render the settled debris field to screenshot_debris.bmp
@@ -877,6 +891,111 @@ Status GateRagdollJoints(Ctx& c, std::string& detail) {
   return ok ? Status::Pass : Status::Fail;
 }
 
+// ---- body-fastfall ------------------------------------------------------
+//
+// A FULL-SPEED BODY MUST NOT PASS THROUGH A COLLISION PATCH. The rigid-body
+// twin of `player-fastfall`, and a pin on exactly one mechanism: Jolt's motion
+// quality (see the note above Physics::CreateDebrisBody). Every dynamic world
+// body is LinearCast because the DEFAULT, Discrete, advances a body by v*dt and
+// only then asks what it overlaps — and the thing it must not miss is a
+// marching-cubes terrain patch, which is a sheet of triangles with no thickness
+// at all. The margin is the thinnest box in the collider and nothing else.
+//
+// The arithmetic, written down because it is what makes the fixture honest: at
+// kTickDt = 1/30 s and player.maxFall = 53.5 m/s a falling body covers 17.8
+// VOXELS in one step. A ragdoll limb is 2-3 voxels through. The ground was not
+// being missed by a little, and the fixture deliberately drops a 2-voxel cube
+// so the step is ~9x the body — delete the motion-quality line and `lowest`
+// comes out hundreds of voxels under the patch instead of a fraction of one.
+//
+// The collision surface is built by PolygonizeChunk, the SAME polygonizer
+// DebrisSystem::ManageTerrain runs, rather than by a hand-wound quad: a quad
+// whose winding disagrees with Jolt's convention would make this arm pass for
+// the wrong reason, and a patch from the real producer cannot.
+//
+// NO GPU, NO WORLD, NO STREAMING. The other half of the guarantee — a body may
+// not enter a chunk that has no patch AT ALL — cannot be measured here because
+// it is a property of the chunk cache; it is the `debris` gate's buried count
+// and DebrisSystem::UntunnelBody's probe.
+Status GateBodyFastFall(Ctx& c, std::string& detail) {
+  Physics& phys = c.phys;
+  std::vector<float> dens;
+  for (const auto& m : c.mats) dens.push_back((float)m.gpu.density);
+
+  // One real patch, its bottom six occupancy rows solid. Well clear of
+  // anything the other body gates leave behind.
+  const IVec3 org{640, 400, 640};
+  uint32_t occ[kMcOccWords] = {};
+  for (int z = 0; z < kMcOccDim; z++)
+    for (int y = 0; y <= 5; y++)
+      for (int x = 0; x < kMcOccDim; x++) McOccSet(occ, x, y, z);
+  std::vector<float> verts;
+  std::vector<uint32_t> idx;
+  PolygonizeChunk(org, occ, verts, idx);
+  uint64_t patch = idx.empty() ? 0 : phys.CreateTerrainMesh(verts, idx);
+  // The surface, read off the mesh that was actually built rather than derived
+  // from the occupancy rows: a change to the polygonizer's cell ownership must
+  // not quietly move the number this arm measures against.
+  float surf = -1e30f;
+  for (size_t i = 1; i + 1 < verts.size(); i += 3) surf = std::max(surf, verts[i]);
+
+  auto cube = [](int n) {
+    std::vector<DebrisVoxel> v;
+    for (int z = 0; z < n; z++)
+      for (int y = 0; y < n; y++)
+        for (int x = 0; x < n; x++)
+          v.push_back({(int8_t)x, (int8_t)y, (int8_t)z, 0, kMatStone});
+    return v;
+  };
+  const float terminal = CurrentTuning().player.maxFall / kVoxelMeters;
+  const float stepVox = terminal * kTickDt;
+
+  BodyTransform xf{};
+  // Centred over the patch (cells are owned by the chunk holding their min
+  // corner, so the 16 columns are org.x .. org.x+15), three voxels clear of the
+  // surface: ONE step at terminal velocity then has to cross it.
+  xf.pos = Vec3{(float)org.x + 7.0f, surf + 3.0f, (float)org.z + 7.0f};
+  xf.quat[3] = 1;
+  uint64_t body = phys.CreateDebrisBodyXf(cube(2), xf, dens, false);
+  phys.SetBodyVelocity(body, Vec3{0, -terminal, 0});
+
+  float lowest = 1e30f;
+  int restAt = -1;
+  BodyTransform now{};
+  for (int i = 0; i < 60; i++) {
+    phys.Step(kTickDt);
+    if (!phys.GetTransform(body, now)) break;
+    lowest = std::min(lowest, now.pos.y);
+    Vec3 lin{}, ang{};
+    phys.GetBodyVelocities(body, lin, ang);
+    if (restAt < 0 && lin.len() < 1.0f && i > 0) restAt = i + 1;
+  }
+
+  // The fixture must be the fast case it claims to be: a step shorter than the
+  // body would make this a short drop wearing a long one's name, and it would
+  // pass with no motion quality at all.
+  const bool fastEnough = stepVox > 2.0f * 2.0f;
+  // Jolt resolves a cast to within mPenetrationSlop, and the patch's top row is
+  // sloped where marching cubes rounds the corners, so this is a bound on
+  // PASSING THROUGH, not a contact tolerance: one body-height of give against
+  // the hundreds of voxels a tunnelled body falls before anything stops it.
+  const bool held = patch != 0 && lowest > surf - 2.0f;
+  const bool rested = restAt > 0 && now.pos.y < surf + 3.0f;
+  const bool ok = fastEnough && held && rested;
+
+  phys.RemoveBody(body);
+  if (patch) phys.RemoveBody(patch);
+
+  detail = Format(
+      "patch surface y=%.2f from %zu tris; 2-vox cube at terminal %.0f vox/s "
+      "= %.1f vox/step (%.1fx the body); lowest y reached %.2f (floor %.2f), "
+      "came to rest at tick %d at y=%.2f",
+      surf, idx.size() / 3, terminal, stepVox, stepVox * 0.5f, lowest,
+      surf - 2.0f, restAt, now.pos.y);
+  std::printf("body fastfall: %s (%s)\n", ok ? "PASS" : "FAIL", detail.c_str());
+  return ok ? Status::Pass : Status::Fail;
+}
+
 }  // namespace
 
 const std::vector<Gate>& BodyGates() {
@@ -885,6 +1004,7 @@ const std::vector<Gate>& BodyGates() {
       {"settle-back", "phys", {}, false, GateSettleBack},
       {"player-body", "phys", {}, false, GatePlayerBody},
       {"ragdoll-joints", "phys", {}, false, GateRagdollJoints},
+      {"body-fastfall", "phys", {}, false, GateBodyFastFall},
   };
   return g;
 }

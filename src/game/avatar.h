@@ -66,6 +66,34 @@ struct AvatarLocoClips {
   int idle = -1, walk = -1, run = -1, fall = -1, hang = -1;
 };
 
+// ONE SHAPE OF THE AIRBORNE POSE (avatar.cpp's kAirTuck / kAirFloat / kAirReach
+// / kAirPrepare, and the blend of them the current `vel.y` asks for).
+//
+// Authored in LEG LENGTHS and ARM REACHES, never in voxels or metres, so one
+// table poses any rig — the same argument the gait's leg-length thresholds are
+// written down under in sim/scale.h. Foot offsets are relative to that leg's own
+// hip, hand offsets to that arm's own shoulder, in prefab space tilted by the
+// body's lean: +Y up, +Z forward, `Out` away from the midline on that limb's
+// side. See the table in avatar.cpp for what each shape is and why.
+struct AvatarAirKey {
+  float footDown = 0.95f;  // below the hip
+  float footFwd = 0;       // fore/aft; SIGNED per leg by the scissor split
+  float footLead = 0;      // ...and the part BOTH feet share (a landing)
+  float footOut = 0;       // lateral splay, outward
+  // ---- THE ARMS ARE JOINT ANGLES, NOT A HAND TARGET ----------------------
+  // Radians, applied at the joints the rig already authors limits for:
+  // `armPitch` +/- `armSwing` swings the whole arm fore and aft at the
+  // shoulder (positive = forward), `armOut` abducts it away from the midline,
+  // `armFlex` bends the elbow. Unlike the legs these are NOT solved as IK —
+  // see the note at the key table in avatar.cpp for why an off-plane hand
+  // target leaves a hinged elbow pointing somewhere nobody asked for.
+  float armPitch = 0;
+  float armSwing = 0;  // signed OPPOSITE this arm's own leg
+  float armOut = 0;
+  float armFlex = 0;
+  float lean = 0;  // radians of forward torso pitch this shape carries
+};
+
 // What the avatar wants the rest of the game to do about its current state.
 // Movement and camera read this instead of querying part liveness themselves,
 // so "what does losing a leg do" is answered in exactly one place.
@@ -155,20 +183,11 @@ class PlayerAvatar : public Mob {
   void SetLook(float yawRel, float pitch);
 
   // ---- footfall events (presentation only) --------------------------------
-  // A foot touching down, produced by the gait's own plant moment rather than
-  // by a distance accumulator. These QUEUE because PreTick runs inside the
-  // fixed-tick loop (up to 4 ticks per frame): the consumer drains them once
-  // per frame. Presentation only — nothing here may feed back into the sim.
-  struct Footfall {
-    Vec3 posVox{};      // where the foot landed
-    uint32_t mat = 0;   // material id of the supporting voxel (0 = unknown)
-    float speed = 0;    // walker speed at touchdown, voxels/sec
-    int foot = 0;       // chain index, so left/right can be pitched apart
-    bool landing = false;  // true when this is a touchdown from a fall
-    float fallSpeed = 0;   // downward speed on a landing, voxels/sec
-  };
-  const std::vector<Footfall>& Footfalls() const { return footfalls_; }
-  void ClearFootfalls() { footfalls_.clear(); }
+  // `Footfall`, `Footfalls()` and `ClearFootfalls()` are inherited from Mob:
+  // every creature plants feet, and P2's coat shedding runs off the same
+  // moment, so the event could not stay player-only. main.cpp still drains
+  // and clears the avatar's queue once per frame — that is the avatar's half
+  // of the contract and it is unchanged.
 
   // (EquipItem / HeldItem / HeldSlot / WeaponEdge / WeaponArmPose / OwnsBody /
   // SetWeaponPose are inherited from Mob — item holding is base-class
@@ -209,6 +228,18 @@ class PlayerAvatar : public Mob {
   // real per-voxel carving via Mob::CarveRadialAll, not an hp approximation.
   void CarveRadial(Vec3 centerWorldVoxel, float radiusVoxels, World& world,
                    std::vector<ParticleSpawn>& spawns);
+
+  // ---- live ragdoll (Mob::StartRagdoll), the player's side ----------------
+  // While the body is limp or getting up THE PLAYER FOLLOWS THE BODY, not the
+  // other way round: main.cpp skips Player::Update and moves the capsule to
+  // wherever this says every tick. Limp: the pelvis, wherever Jolt has flung
+  // it. Getting up: the standing spot BeginGetUp chose, so the controller
+  // resumes exactly where the animation ends. False when not ragdolled.
+  //
+  // The capsule itself is inert meanwhile — no gravity, no sweeps, no
+  // impact latch — which is also why a body knocked flying by a blast does
+  // not take fall damage on landing: the controller never saw the fall.
+  bool RagdollFollow(Vec3& outPlayerPos) const;
 
   // Impact damage, driven by Player::impactDeltaV — the velocity a collision
   // sweep refused. Covers falls and horizontal wall slams with one path.
@@ -353,6 +384,18 @@ class PlayerAvatar : public Mob {
   float StanceCrouch() const { return stanceCrouch_; }
   // The held (Ctrl) crouch's pelvis drop, world voxels; 0 when standing.
   float CrouchHold() const { return crouchHold_; }
+  // How far the velocity-driven airborne pose is driving the body, 0..1 — the
+  // successor to "is the fall clip active" for every question about whether the
+  // rig thinks it is in the air. The mob gate's bumpy-climb pass asserts on it
+  // for that reason: with avatar.airPose on, the jump/fall CLIPS never start at
+  // all, so a check phrased against them would be green by construction.
+  float AirPoseWeight() const { return airFrac_; }
+  // Signed vertical speed the air pose is posing from, world voxels/s.
+  float AirPoseVy() const { return airVy_; }
+  // How far into the LANDING REACH the ground probe says the body is, 0..1.
+  // Separate from the weight above because they answer different questions:
+  // one is "is the rig in the air", this is "is it about to stop being".
+  float AirPoseLand() const { return airLandW_; }
   // Requested weight of the named clip's live instance, or 0 if not running.
   // The fall flail is a RAMP now, so "is the fall clip active" is no longer the
   // question — "how far in is it" is.
@@ -406,12 +449,26 @@ class PlayerAvatar : public Mob {
   // the player's true velocity and grounded state, ledge-hang arm IK, head
   // look and the weapon arm. The MECHANICS underneath (clips, IK solver,
   // springs, dismemberment states) are the shared anim runtime.
+  // `tick` reaches these for one reason only: the gait's PLANT runs
+  // Mob::ShedCoat, whose roll is tick-keyed like every other RNG here. The
+  // pose is still a pure function of dt.
   void UpdateAnimation(float dt, World& world, bool grounded,
-                       const Vec3& playerVel);
-  void UpdateGait(float dt, World& world);
+                       const Vec3& playerVel, uint32_t tick);
+  void UpdateGait(float dt, World& world, uint32_t tick);
   // Airborne leg pose: relaxes the legs toward their rest hang instead of
   // leaving IK chasing a stale world-space foot plant.
   void UpdateAirPose(float dt);
+  // ---- the airborne pose, as a function of vel.y (avatar.airPose) ----------
+  // Advance airFrac_/airVy_/airLandW_ and resolve the shape the current phase
+  // asks for. Runs BEFORE the flatten (the lean is a spine rotation and the
+  // children have to inherit it); the IK pass after the flatten then reads
+  // airKey_ back. `world` is only touched for the landing probe.
+  void UpdateAirDrive(float dt, World& world, bool grounded, bool clipOwnsPose,
+                      const Vec3& playerVel);
+  // Swing the arms into airKey_. Composed onto the LOCAL pose before the
+  // flatten, at the shoulder and elbow, because those are the joints the rig
+  // states its limits about — see the key table's note on the hinged elbow.
+  void ApplyAirArms(const AnimSkeleton& sk, AnimState& st);
   // Lock the pelvis/arm clock onto a foot touchdown on leg chain `chain`.
   // The ONLY writer of strideRate_ and of anim_.gaitPhase's correction term.
   void SyncStrideClock(int chain);
@@ -428,15 +485,47 @@ class PlayerAvatar : public Mob {
   AvatarLocoClips locoClips_;
   bool spawned_ = false;
   bool instancesDirty_ = false;
-  std::vector<Footfall> footfalls_;  // drained once per frame by the caller
 
   bool footfallInit_ = false;
   // How strongly the leg IK is applied, 0..1. Eased rather than switched: on
   // bumpy ground `grounded` is genuinely ragged, and gating the IK on it as a
   // bool made the legs and arms snap between the IK pose and the rest hang on
   // every bump. See the note in UpdateAnimation.
+  // ...and since the AIR POSE drives the same chains, this is now "the legs are
+  // IK-driven", not "the gait is running": it stays at 1 straight through a
+  // take-off, and it is the TARGET that crossfades from the last foot plant to
+  // the air pose (airFrac_ below). Fading the two solves against each other
+  // instead would leave a window mid-jump where neither owned the legs and the
+  // rest hang showed through — the exact snap this weight exists to remove.
   float gaitWeight_ = 0.0f;
   bool wasGrounded_ = true;
+  // ---- the velocity-driven airborne pose (avatar.airPose) -----------------
+  // How much of the pose the air shapes own: 1 while airborne, faded on
+  // ikBlendHalflife. For the LEGS it blends the IK target away from the stale
+  // foot plant; for the ARMS, which nothing else IKs, it is the solve weight.
+  float airFrac_ = 0.0f;
+  // Vertical velocity, world voxels/s, lightly smoothed — THE phase of the air
+  // pose. Smoothed for the same reason the planar velocity is (UpdateAnimation
+  // runs 0..4 times a frame off a once-per-frame controller), but only just:
+  // the launch spike is the most expressive part of a jump and must survive.
+  float airVy_ = 0.0f;
+  // How far into the landing reach the ground probe says we are, 0..1, eased.
+  // Eased because the probe can lose the ground outright (a chunk the CPU
+  // mirror has not streamed) and the legs must not snap back when it does.
+  float airLandW_ = 0.0f;
+  // The lean, radians, recomputed per tick and consumed twice: once as a spine
+  // rotation before the flatten, once as the frame the IK offsets are taken in
+  // so the limbs lean WITH the body rather than about a fixed vertical.
+  float airLeanPitch_ = 0.0f, airLeanRoll_ = 0.0f;
+  // The blended shape the current phase asks for, resolved once per tick by
+  // UpdateAirDrive and consumed by ApplyAirPose after the flatten.
+  AvatarAirKey airKey_;
+  // Mirrored out of Player: the states that are airborne by the gait's reckoning
+  // but must NOT play a jump/fall pose — a hang and a mantle are held by the
+  // hands, a swimmer is carried by the water, and fly mode is not falling at
+  // all. UpdateAnimation's signature stays player-free, so this comes across
+  // the same way hangActive_ does.
+  bool airPoseEligible_ = false;
   // Was the support a LEDGE HANG last tick? Losing that support must not fire
   // the "jump" clip — the arms are already up in the hang pose.
   bool wasHanging_ = false;

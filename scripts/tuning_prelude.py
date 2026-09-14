@@ -129,6 +129,7 @@ SPEC = [
     ("render", "shadowFarLift", "TUNE_SHADOW_FAR_LIFT", "f", 0.3),
     ("render", "shadowCache", "TUNE_SHADOW_CACHE", "i", 1),
     ("render", "shadowCacheSubdiv", "TUNE_SHADOW_CACHE_SUBDIV", "i", 4),
+    ("render", "shadowSunAngle", "TUNE_SHADOW_SUN_ANGLE", "f", 1.0),
 
     # grain
     ("render", "grainBroadScale", "TUNE_GRAIN_BROAD_SCALE", "f", 11.0),
@@ -223,15 +224,16 @@ SPEC = [
     ("render", "opennessReach", "TUNE_OPENNESS_REACH", "f", 12.0),
     ("render", "opennessChunksPerFrame", "TUNE_OPENNESS_CHUNKS", "i", 256),
     ("render", "opennessStrength", "TUNE_OPENNESS_STRENGTH", "f", 1.0),
-    ("render", "opennessFloor", "TUNE_OPENNESS_FLOOR", "f", 0.3),
+    ("render", "opennessFloor", "TUNE_OPENNESS_FLOOR", "f", 0.0),
+    ("render", "enclosedAmbient", "TUNE_ENCLOSED_AMBIENT", "v3", [0.012, 0.013, 0.016]),
     ("render", "opennessBilinear", "TUNE_OPENNESS_BILINEAR", "i", 1),
 
     # one-bounce indirect light (docs/PLAN_gi.md §3, W3 P1)
     ("render", "giStrength", "TUNE_GI_STRENGTH", "f", 2.0),
     ("render", "giDecay", "TUNE_GI_DECAY", "f", 0.25),
     ("render", "giFeedback", "TUNE_GI_FEEDBACK", "f", 0.2),
-    ("render", "giGatherBlocks", "TUNE_GI_GATHER_BLOCKS", "i", 3),
-    ("render", "giCachePeriod", "TUNE_GI_CACHE_PERIOD", "i", 8),
+    ("render", "giGatherBlocks", "TUNE_GI_GATHER_BLOCKS", "i", 12),
+    ("render", "giCachePeriod", "TUNE_GI_CACHE_PERIOD", "i", 16),
     ("render", "glowStrength", "TUNE_GLOW_STRENGTH", "f", 1.0),
     ("render", "glowReach", "TUNE_GLOW_REACH", "f", 2.4),
     ("render", "glowFill", "TUNE_GLOW_FILL", "f", 32.0),
@@ -327,12 +329,16 @@ SPEC = [
     ("render", "farShadowReach", "TUNE_FAR_SHADOW_REACH", "f", 60.0),
     ("render", "farBlockerHitLevel", "TUNE_FAR_BLOCKER_HIT_LEVEL", "i", 0),
 
+    # gas voxel -> parcel crossfade (PLAN_gas_particles.md stage 1b)
+    ("render", "gasBlendStart", "TUNE_GAS_BLEND_START", "f", 0.5),
+
     # in-window LOD handoff (PLAN_surface_flight_perf.md A1)
     ("render", "lodHandoffDist", "TUNE_LOD_HANDOFF_DIST", "f", 24.0),
     ("render", "shadowMaxDist", "TUNE_SHADOW_MAX_DIST", "f", 999.0),
 
     # SHORT-RANGE MODE (dev panel checkbox, RenderParams flag bit 2)
     ("render", "shortRangeDist", "TUNE_SHORT_RANGE_DIST", "f", 100.0),
+    ("render", "shortRangeNearDist", "TUNE_SHORT_RANGE_NEAR_DIST", "f", 50.0),
     ("render", "shortRangeFogStart", "TUNE_SHORT_RANGE_FOG_START", "f", 0.65),
     ("render", "shortRangeFogDensity", "TUNE_SHORT_RANGE_FOG_DENSITY", "f", 5.0),
 
@@ -347,6 +353,9 @@ SPEC = [
     # sim: DETERMINISM-CRITICAL, integer only (CLAUDE.md rule 1)
     ("sim", "partGravity", "TUNE_PART_GRAVITY", "i", 22),
     ("sim", "partMaxVel", "TUNE_PART_MAX_VEL", "i", 1536),
+    ("sim", "partBuoyMax", "TUNE_PART_BUOY_MAX", "i", 88),
+    ("sim", "partSettleSpeed", "TUNE_PART_SETTLE_SPEED", "i", 24),
+    ("sim", "partFloatPatience", "TUNE_PART_FLOAT_PATIENCE", "u", 180),
     ("sim", "airDensity", "TUNE_AIR_DENSITY", "i", 10),
     ("sim", "falloffPerCell", "TUNE_FALLOFF_PER_CELL", "i", 6),
     ("sim", "ejectSolid", "TUNE_EJECT_SOLID", "u", 250),
@@ -402,10 +411,14 @@ SPEC = [
     ("sim", "fluidExcitePerch", "TUNE_FLUID_EXCITE_PERCH", "i", 0),
     ("sim", "fluidExciteStep", "TUNE_FLUID_EXCITE_STEP", "i", 2),
     ("sim", "fluidSettledMass", "TUNE_FLUID_SETTLED_MASS", "f", 1.0),
+    ("sim", "fluidSubmergedSolid", "TUNE_FLUID_SUBMERGED_SOLID", "i", 1),
     ("sim", "fluidSettleEps", "TUNE_FLUID_SETTLE_EPS", "f", 6.0),
     ("sim", "fluidWakeSpeed", "TUNE_FLUID_WAKE_SPEED", "f", 24.0),
     ("sim", "fluidSettleTicks", "TUNE_FLUID_SETTLE_TICKS", "i", 24),
     ("sim", "fluidStainRate", "TUNE_FLUID_STAIN_RATE", "f", 8.0),
+    ("sim", "fluidStuckTicks", "TUNE_FLUID_STUCK_TICKS", "i", 96),
+    ("sim", "fluidForceBlocks", "TUNE_FLUID_FORCE_BLOCKS", "i", 4),
+    ("sim", "fluidForceReach", "TUNE_FLUID_FORCE_REACH", "i", 64),
 
     # WATER BODIES (docs/PLAN_water_master.md, M1)
     ("sim", "waterBodyMode", "TUNE_WATER_BODY_MODE", "i", 0),
@@ -428,6 +441,9 @@ SPEC = [
     ("sim", "waterRelevelGain", "TUNE_WATER_RELEVEL_GAIN", "i", 8),
     ("sim", "waterRelevelDepth", "TUNE_WATER_RELEVEL_DEPTH", "i", 32),
     ("sim", "windMode", "TUNE_WIND_MODE", "i", 1),
+
+    # gas particles (docs/PLAN_gas_particles.md)
+    ("sim", "gasMode", "TUNE_GAS_MODE", "i", 1),
     ("sim", "windDrag", "TUNE_WIND_DRAG", "f", 3.0),
     ("sim", "windFluidGain", "TUNE_WIND_FLUID_GAIN", "f", 0.35),
     ("sim", "windFluidMass", "TUNE_WIND_FLUID_MASS", "f", 0.5),
@@ -441,6 +457,7 @@ SPEC = [
 
     # debug
     ("debug", "vegetation", "TUNE_VEGETATION", "u", 1),
+    ("debug", "groundCover", "TUNE_GROUND_COVER", "u", 1),
 
     # oil / petroleum-like viscous liquids (shadeViscous)
     ("render", "oilSatLow", "TUNE_OIL_SAT_LOW", "f", 0.5),

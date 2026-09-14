@@ -48,6 +48,26 @@ bash scripts/build.sh --configure       # force cmake reconfigure
 
 **Always use `scripts/build.sh`**, never raw cmake — it holds the machine-global mutexes (`scripts/svlock.sh`): **`C:/sv-compile-lock`** while cl.exe runs, **`C:/sv-gpu-lock`** while it links and while any `sandvox.exe` runs. Compile is the long part and nothing but another compile waits on it. It also picks the generator: with `sccache` on PATH (`scoop install sccache`) the build dir is Ninja Multi-Config with the launcher and a shared object cache at `C:/sv-deps/sccache`; the exe is `build/Release/sandvox.exe` either way, and a build dir made by the other generator is re-configured in place with a message. Kill stale instances: `taskkill //F //IM sandvox.exe`. Set `export SANDVOX_NO_CRASH_DIALOG=1` in every shell. Read `crash.log` after crashes. Verify exe mtime before trusting results. `bash scripts/svlock.sh` prints who holds what.
 
+**A sibling worktree's objects can end up in YOUR exe, and the build now
+refuses to link them.** sccache is keyed on preprocessed source, so worktrees
+whose headers agree share objects — correct, and most of why a cold worktree
+build is fast. The trap is the `/showIncludes` reply replayed with a cached
+object: it names the ORIGINATING tree's headers, so ninja records the object as
+depending on a *sibling's* `world.h`/`tuning.h` and never rebuilds it when
+yours change. The linker happily combines two layouts of the same struct, and
+the program dies at startup in code nobody touched. **The give-away is that
+`crash.log`'s frames name another worktree's source paths — read them before
+diagnosing anything else.** Three occurrences: 2026-09-04 (`MaterialDef` stride,
+in `LoadMicroVox`), 2026-09-08 (`pass::Pipe` entries, in
+`PageTable::ResetIdentity`), 2026-09-09 (`Tuning` gained `render.gasBlendStart`,
+so `main.cpp` read `tune.warnings` four bytes short and died on the first
+`std::string`; 80 of 156 objects were foreign and ninja rebuilt only 4). Phase
+1b of `build.sh` now scans, purges, recompiles once under `SCCACHE_RECACHE=1`,
+and aborts instead of linking if foreign objects survive that. It is free in the
+steady state — `--newer-than build/.poison_check_stamp` reads only objects
+written since the last clean check. Run it by hand with
+`python scripts/find_poisoned_objs.py [--delete]`.
+
 **Never launch `sandvox.exe` directly — wrap EVERY run in `bash scripts/run.sh <cmd>`** (e.g. `bash scripts/run.sh ./build/Release/sandvox.exe --selftest --gate determinism`). It takes the GPU lock, so runs and links serialize across all sessions/worktrees — but NOT the compile lock, so a `--gate` check no longer queues behind somebody's five-minute compile. `SANDVOX_RUN_EXCLUSIVE=1` takes both, for a `--perf`/`--render-budget` number you intend to quote. Concurrent exe runs saturate the GPU, throttle the machine, and make every measured number garbage. Worktree agents: call it by absolute path from the main checkout if your worktree predates it. (`build.sh --selftest` already runs under the lock and stays sanctioned.)
 
 ```bash

@@ -39,6 +39,7 @@ namespace {
 #define PIPE_COMPACT         Pipe::Compact
 #define PIPE_COMPACT_NEXT    Pipe::CompactNext
 #define PIPE_STEP            Pipe::Step
+#define PIPE_REPOSE_SNAP     Pipe::ReposeSnap
 #define PIPE_OCCUPANCY       Pipe::Occupancy
 #define PIPE_OCCUPANCY_DIRTY Pipe::OccupancyDirty
 #define PIPE_PICK            Pipe::Pick
@@ -95,6 +96,11 @@ namespace {
 #define PIPE_WATER_SPLIT     Pipe::WaterSplit
 #define PIPE_WATER_RELEVEL   Pipe::WaterRelevel
 #define PIPE_WATER_SURFACE   Pipe::WaterSurface
+#define PIPE_GAS_ARGS1       Pipe::GasArgs1
+#define PIPE_GAS_SPAWN       Pipe::GasSpawnP
+#define PIPE_GAS_INTEGRATE   Pipe::GasIntegrate
+#define PIPE_GAS_ARGS2       Pipe::GasArgs2
+#define PIPE_GAS_RESOLVE     Pipe::GasResolve
 
 #define K_COMPUTE  Kind::Compute
 #define K_INDIRECT Kind::ComputeIndirect
@@ -108,6 +114,7 @@ namespace {
 #define GRP_SLIM_FLUID Groups::SlimFluid
 #define GRP_SLIM_FLUIDSEAM Groups::SlimFluidSeam
 #define GRP_SHADOW     Groups::Shadow
+#define GRP_SLIM_GAS   Groups::SlimGas
 
 #define DYN_NONE Dyn::None
 #define DYN_ZERO Dyn::Zero
@@ -133,6 +140,8 @@ namespace {
 #define C_WATERSWEEP Cond::WaterSweep
 #define C_OPENNESS  Cond::Openness
 #define C_GLOW      Cond::Glow
+#define C_GAS       Cond::Gas
+#define C_REPOSE    Cond::ReposeActive
 
 #define D_WINDWAKE  (uint32_t)DispatchSel::WindWakeSel
 #define D_OPS       (uint32_t)DispatchSel::Ops
@@ -155,6 +164,8 @@ namespace {
 #define D_WATERCHUNKS64   (uint32_t)DispatchSel::WaterChunks64
 #define D_WATERDRAIN      (uint32_t)DispatchSel::WaterDrainSel
 #define IND_SHADOWARGS    (uint32_t)DispatchSel::IndShadowArgs
+#define D_GASSPAWN        (uint32_t)DispatchSel::GasSpawnSel
+#define IND_GASARGS       (uint32_t)DispatchSel::IndGasDispatchArgs
 
 // ---- expansion 1: the rows -----------------------------------------------
 #define R(b)  Use{Buf::b, Acc::StorageRead},

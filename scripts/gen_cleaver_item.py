@@ -238,6 +238,18 @@ def main():
             "from": CLEAVER_GRIP + CLEAVER_SHOULDER,
             "to": CLEAVER_LEN,
             "axis": [1, 0, 0],
+            # WHICH WAY THE FLAT FACES, and it was missing until 2026-09-14.
+            # cleaver_vox builds the blade deep in y and THIN IN Z
+            # (CLEAVER_HALF_T is a half-thickness on z), so +z is the face —
+            # the same constant the mesh is cut from, exactly as the sword
+            # emits it. With no `flat` the loader falls back to an arbitrary
+            # perpendicular, so MeleeEdgeAlign scored every cleaver blow at a
+            # meaningless roll: rolling the blade into the cut bought nothing,
+            # and the difference between a true chop and a flat-on slap was a
+            # coin flip. Nothing can derive this from the art at load time —
+            # "which of the two axes across the blade is the thin one" is a
+            # fact only this generator holds.
+            "flat": [0, 0, 1],
             "halfWidth": CLEAVER_HALF_W,
         },
         # Heavier and slower to settle than the sword's flick.

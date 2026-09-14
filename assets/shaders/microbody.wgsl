@@ -116,6 +116,15 @@ struct VSOut {
   // insts[] per fragment is a dependent storage load on every pixel a limb
   // covers, for a value that is constant across the whole instance.
   @location(7) @interpolate(flat) flash : f32,
+  // The model's 6-bit joint mask (microBodyCutFaces). Flat and carried here for
+  // the same reason `base`/`dims` are: refetching insts -> models per fragment
+  // is two dependent storage loads for a value constant across the instance.
+  @location(8) @interpolate(flat) cut : u32,
+  // Pool word where this model's STAIN LATTICE starts (one byte per micro
+  // voxel, 4 per word, same idx order as the payload), or 0 when the block
+  // carries none -- bit 30 of the dims word (sim/microbody.h). A shared def
+  // model never has one; a body grows one the first time it is bloodied.
+  @location(9) @interpolate(flat) stainBase : u32,
 };
 
 // vi in 0..35 -> a corner of the unit box. Every face must wind the SAME way
@@ -187,7 +196,65 @@ fn vs(@builtin(vertex_index) vi : u32,
   out.scale = scale;
   out.slot = slot;
   out.flash = bitcast<f32>(insts[inst].flash_bits);
+  out.cut = microBodyCutFaces(m);
+  // Payload is 2 voxels per word; the stain lattice sits right after it.
+  let cells = u32(dims.x * dims.y * dims.z);
+  out.stainBase = select(0u, m.base + (cells + 1u) / 2u,
+                         (m.dims & MB_DIMS_STAIN_BIT) != 0u);
   return out;
+}
+
+// sim/microbody.h kMicroBodyDimsStainBit. Declared HERE, not in common.wgsl:
+// this is the only shader that reads it, and a common.wgsl edit misses the
+// SPIR-V cache for every shader (CLAUDE.md, "What needs a rebuild").
+const MB_DIMS_STAIN_BIT : u32 = 0x40000000u;
+
+// ---- BLOOD ON A BODY (DESIGN.md section 7) ----------------------------------
+//
+// The stain byte of a hit voxel: amount in the low nibble, stain TYPE (the
+// same palette slot the voxel word's bits 28..30 carry) above it. Read once,
+// at the hit only, from the lattice after the payload. 0 when the model has
+// no lattice or the voxel is clean.
+fn poolStainAt(stainBase : u32, dims : vec3<i32>, p : vec3<i32>) -> u32 {
+  if (stainBase == 0u) { return 0u; }
+  let idx = u32((p.z * dims.y + p.y) * dims.x + p.x);
+  let w = stainBase + (idx >> 2u);
+  if (w >= MICRO_BODY_POOL_WORDS) { return 0u; }
+  return (pool[w] >> ((idx & 3u) * 8u)) & 0xFFu;
+}
+
+// The same look as the ground's stain (raymarch.wgsl applyStain), on purpose:
+// blood that ran off an arm onto the floor must not change colour on the way
+// down. Same palette entry, same mottle threshold, same multiply-then-lerp,
+// same render.stain* knobs. Only the noise domain differs: the mottle is
+// sampled in MICRO cells scaled back to world pitch, so a stain on a scale-8
+// limb breaks up at the same physical size as one on the ground beside it.
+fn bodyVnHash(c : vec3<i32>) -> f32 {
+  return f32(pcg(u32(c.x * 374761393 + c.y * 668265263 + c.z * 1274126177)) &
+             0xFFFFu) * (1.0 / 65535.0);
+}
+fn bodyValueNoise(p : vec3f, scale : f32) -> f32 {
+  let q = p / scale;
+  let i = vec3<i32>(floor(q));
+  var f = fract(q);
+  f = f * f * (3.0 - 2.0 * f);
+  let x00 = mix(bodyVnHash(i + vec3<i32>(0,0,0)), bodyVnHash(i + vec3<i32>(1,0,0)), f.x);
+  let x10 = mix(bodyVnHash(i + vec3<i32>(0,1,0)), bodyVnHash(i + vec3<i32>(1,1,0)), f.x);
+  let x01 = mix(bodyVnHash(i + vec3<i32>(0,0,1)), bodyVnHash(i + vec3<i32>(1,0,1)), f.x);
+  let x11 = mix(bodyVnHash(i + vec3<i32>(0,1,1)), bodyVnHash(i + vec3<i32>(1,1,1)), f.x);
+  return mix(mix(x00, x10, f.y), mix(x01, x11, f.y), f.z);
+}
+fn bodyStainTint(albedo : vec3f, stain : u32, cell : vec3<i32>, scale : f32) -> vec3f {
+  let amtI = stain & 0xFu;
+  if (amtI == 0u) { return albedo; }
+  let amt = f32(amtI) / f32(STAIN_AMT_MAX);
+  let stainCol = unpackColor(materials[STAIN_PALETTE_BASE + ((stain >> 4u) & 0x7u)].stainColor);
+  let mottle = bodyValueNoise(vec3f(cell), TUNE_STAIN_MOTTLE_SCALE * scale);
+  let cover = clamp((amt * (1.0 + TUNE_STAIN_MOTTLE) - mottle * TUNE_STAIN_MOTTLE) *
+                    TUNE_STAIN_COVERAGE, 0.0, 1.0);
+  if (cover <= 0.0) { return albedo; }
+  let soaked = albedo * mix(vec3f(1.0), stainCol * TUNE_STAIN_DARKEN, cover);
+  return mix(soaked, stainCol, cover * TUNE_STAIN_OPACITY);
 }
 
 // One micro voxel: bits 0..7 material id, bits 8..15 art colour slot (0 = use
@@ -197,6 +264,143 @@ fn poolVoxAt(base : u32, dims : vec3<i32>, p : vec3<i32>) -> u32 {
   let w = base + (idx >> 1u);
   if (w >= MICRO_BODY_POOL_WORDS) { return 0u; }  // defensive
   return (pool[w] >> ((idx & 1u) * 16u)) & 0xFFFFu;
+}
+
+// ---- the smooth body normal (2026-09-11) ------------------------------------
+//
+// A limb's face normal comes from the DDA's last-stepped axis, so a rounded arm
+// made of 8 mm skin voxels shades as a staircase of six flat tones — the same
+// defect `shadeViscous` fixes for blood in raymarch.wgsl, and the same one the
+// Grimorium renderer's slime shader addresses by treating the body as a density
+// field. The cure is the same one: differentiate the OCCUPANCY field the brick
+// already stores and shade against its gradient, so neighbouring micro voxels
+// agree on their normal and the cube structure dissolves.
+//
+// 26 taps (the 3^3 neighbourhood less the centre) weighted by 1/|d|, NOT a
+// 6-tap central difference: on a binary field a 6-tap gradient can only take
+// values in {-1, 0, 1} per axis, which quantises the normal to the same 26
+// directions the staircase already had. The diagonal taps are what make it
+// continuous.
+//
+// A BLEND, not a replacement. At 1.0 a one-voxel spur reads as a sphere and a
+// deliberately square limb (a shield, an iron pauldron) loses its edges; the
+// face normal carries the silhouette's intent and the gradient carries the
+// curvature. BODY_SMOOTH_N is the mix.
+//
+// Declared here rather than as a TUNE_ row for CLAUDE.md's reason: a constant
+// only one shader reads is declared in that shader. It is NOT in common.wgsl,
+// where it would cost every other shader a SPIR-V cache miss.
+//
+// COST: 26 pool reads on the primary body fragment only — this shader has no
+// secondary rays. Set to 0.0 and the whole block const-folds away, leaving the
+// face normal bit-identical to what shipped before.
+const BODY_SMOOTH_N : f32 = 0.55;
+
+// ---- TWO BRICKS THAT OWN THE SAME CELL (2026-09-12) ------------------------
+//
+// WHAT THIS FIXES. A garment's panels deliberately OVERLAP. A robe's sleeve is
+// a tube around the arm and its body panel is a tube around the torso; the two
+// meet in the armpit and, where the torso tapers at the waist, along a whole
+// column, and scripts/gen_stock_armor.py gives those cells to BOTH on purpose —
+// whichever side cedes them shows a stripe of bare skin through half the gait,
+// because the sleeve's inner wall is exactly what you see when the arm swings
+// forward and the torso's side column is exactly what you see when it swings
+// back.
+//
+// That was free while both bricks shaded a shared cell identically: the note
+// in the generator says as much — "z-fighting is only a defect between things
+// that look different". BODY_SMOOTH_N made them look different. Each brick
+// differentiates its OWN occupancy field and can see no other, so the sleeve's
+// copy of an armpit cell gets a normal pointing away from the arm and the
+// torso's copy gets one pointing away from the chest. Now the depth tie decides
+// which of two visibly different shadings you see.
+//
+// AND THE TIE IS NOISE. The two panels ride different limbs, so the same world
+// plane is reached through two different quaternions and two different brick
+// origins; `tCur` for the shared cell agrees only to float rounding, the
+// GreaterEqual test therefore picks a winner per PIXEL, and every idle-sway
+// frame re-rolls it. That is the owner report of 2026-09-12: the overlapping
+// parts of a robe pulsing, flashing and swapping with each other.
+//
+// SO THE ORDER IS MADE EXPLICIT. Each body is pulled toward the camera by a
+// relative slice of its view depth keyed on its render SLOT, which is stable
+// frame to frame (mob.cpp AppendMicroInsts walks limbs in a fixed order). Any
+// consistent winner removes the flicker — both panels still cover the body, so
+// the choice only decides which one's shading you see at the seam, and a seam
+// that holds still reads as a seam instead of as a rendering fault.
+//
+// RELATIVE, NOT ABSOLUTE, so it is a fixed number of depth-buffer steps at any
+// distance. The largest bias is 63 * this = 1.9e-3 of view depth — four
+// thousand times the ~1e-6 rounding it has to beat, and still under a
+// hundredth of a voxel at arm's length, so nothing sinks into or floats off the
+// terrain it is composited against. 64 distinct priorities cover every slot of
+// a dressed humanoid (about 15 limbs plus 6 robe panels), which is all that is
+// asked of it: two bodies far enough apart in slot index to alias are two
+// bodies that are not sharing a cell.
+const BODY_Z_PRIORITY : f32 = 3.0e-5;
+
+// ---- WHAT LIES OUTSIDE THE BRICK (the cut-face mask, 2026-09-11) -----------
+//
+// The word common.wgsl's MicroBodyModel mirror still calls `_pad` is NOT
+// padding: src/sim/microbody.h names it `cutFaces` and the mob loader fills it
+// in (mob.cpp LimbCutFaces). Six bits, `axis * 2 + positive`, one per boundary
+// plane of the brick, set when ANOTHER limb of the same prefab is pressed
+// against that plane — i.e. when the plane is a JOINT rather than the end of
+// the model.
+//
+// The mirror's name is stale and the rename is owed. It is held back only
+// because editing common.wgsl misses the SPIR-V cache for every shader in the
+// engine (CLAUDE.md: measured at 536 s), and this is the only reader.
+fn microBodyCutFaces(m : MicroBodyModel) -> u32 { return m._pad; }
+
+// Sample the brick's occupancy field, deciding what a sample OUTSIDE the brick
+// means.
+//
+// Past a face that is NOT a joint, the answer is EMPTY, deliberately: that is
+// what makes a silhouette voxel's gradient point outward and round the edge,
+// instead of the brick's bounding box reading as a solid wall.
+//
+// Past a JOINT face the answer is the boundary cell itself — the field
+// CONTINUES. Treating a joint as air instead was the "limb seams pulse and
+// flash" defect (owner report 2026-09-11): the last ring of voxels on an upper
+// arm got a gradient pointing straight out along the limb, i.e. a rounded end
+// CAP, while the forearm's first ring rounded the opposite way. That put a hard
+// bright/dark band across every shoulder, elbow, hip and knee, and because each
+// cap's normal swings with its own limb, the band's shading swung with the
+// animation while the two overlapping bricks traded depth ties under the TAA
+// jitter. The model has no cap there; nothing should be shaded as if it did.
+//
+// Clamping across a joint is exact for the axis that crosses it and costs
+// nothing for the others: a corner tap that leaves the brick through a joint
+// AND through an open face is still air, because the open face decides.
+fn bodySolidAt(base : u32, dims : vec3<i32>, p : vec3<i32>, cut : u32) -> f32 {
+  let lo = p < vec3<i32>(0);
+  let hi = p >= dims;
+  let cutLo = vec3<bool>((cut & 1u) != 0u, (cut & 4u) != 0u, (cut & 16u) != 0u);
+  let cutHi = vec3<bool>((cut & 2u) != 0u, (cut & 8u) != 0u, (cut & 32u) != 0u);
+  if (any(lo & !cutLo) || any(hi & !cutHi)) { return 0.0; }
+  let q = clamp(p, vec3<i32>(0), dims - vec3<i32>(1));
+  return select(0.0, 1.0, (poolVoxAt(base, dims, q) & 0xFFu) != 0u);
+}
+
+// Object-space outward normal from the occupancy gradient, or the zero vector
+// when the neighbourhood is uniform (a fully buried voxel, or an isolated one)
+// — the caller keeps its face normal in that case rather than normalizing 0.
+fn bodyFieldNormal(base : u32, dims : vec3<i32>, c : vec3<i32>,
+                   cut : u32) -> vec3f {
+  var g = vec3f(0.0);
+  for (var dz = -1; dz <= 1; dz++) {
+    for (var dy = -1; dy <= 1; dy++) {
+      for (var dx = -1; dx <= 1; dx++) {
+        if (dx == 0 && dy == 0 && dz == 0) { continue; }
+        let d = vec3f(f32(dx), f32(dy), f32(dz));
+        let s = bodySolidAt(base, dims, c + vec3<i32>(dx, dy, dz), cut);
+        // Density rises INTO the body, so the outward direction is -grad.
+        g -= d * (s / length(d));
+      }
+    }
+  }
+  return g;
 }
 
 struct FSOut {
@@ -290,8 +494,19 @@ fn fs(in : VSOut) -> FSOut {
   if (hitMat == 0u) { discard; }
 
   // ---- shading ----
-  // Object-space face normal from the last-stepped axis, back to world space.
-  let nLocal = axisVec(axis, -f32(axisPickI(stepv, axis)));
+  // Object-space face normal from the last-stepped axis, back to world space,
+  // rounded toward the occupancy field's gradient (see BODY_SMOOTH_N).
+  let nFace = axisVec(axis, -f32(axisPickI(stepv, axis)));
+  var nLocal = nFace;
+  if (BODY_SMOOTH_N > 0.0) {
+    let g = bodyFieldNormal(in.base, dims, c, in.cut);
+    let gl = length(g);
+    // A uniform neighbourhood gives g == 0 and no opinion; keep the face
+    // normal rather than normalizing a zero vector.
+    if (gl > 1e-4) {
+      nLocal = normalize(mix(nFace, g / gl, BODY_SMOOTH_N));
+    }
+  }
   let n = quatRotate(in.quat, nLocal);
 
   let mat = materials[hitMat];
@@ -318,6 +533,11 @@ fn fs(in : VSOut) -> FSOut {
   } else {
     albedo = paletteJitter(mat, u32(c.x * 7 + c.y * 13 + c.z * 29));
   }
+  // Blood (or whatever else soaked in) OVER the art, before lighting, exactly
+  // where the ground applies its own stain: a stain is a change to what the
+  // surface is, and it has to take the scene's light like the skin under it.
+  // One pool load, and only for models that carry a lattice at all.
+  albedo = bodyStainTint(albedo, poolStainAt(in.stainBase, dims, c), c, scale);
 
   // `tCur` is already the parameter along the UNNORMALIZED camera-to-fragment
   // vector, and that is the whole point of never normalizing anything: `ro/rd`
@@ -386,7 +606,12 @@ fn fs(in : VSOut) -> FSOut {
   // the raymarcher writes, just with an unnormalized rd on both sides. Any
   // deviation here (a normalized direction, a different near constant) shows up
   // as micro bodies punching through terrain or sinking into it.
-  let viewZ = tCur * dot(rdWorld, R.camFwd);
+  // The slot priority (BODY_Z_PRIORITY) is folded in here and nowhere else:
+  // shrinking the view depth is what "nearer" means under reversed-Z, and
+  // doing it to viewZ rather than to the packed depth keeps the one conversion
+  // this file shares with raymarch.wgsl byte for byte.
+  let viewZ = tCur * dot(rdWorld, R.camFwd) *
+              (1.0 - f32(in.slot & 63u) * BODY_Z_PRIORITY);
   var out : FSOut;
   // litColor is linear HDR; same tonemap as terrain + the cube path, or a
   // live limb and the severed one beside it would shade differently.

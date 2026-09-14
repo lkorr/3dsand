@@ -19,6 +19,13 @@ enum class KitSpace : uint8_t {
   Bag,      // general storage grid (game/equipment.h Bag)
   Hotbar,   // the 10 number-row slots (game/item.h Inventory)
   Equip,    // worn/sheathed/quick slots (game/equipment.h Equipment)
+  // A corpse's gear (game/corpses.h). Not one of the player's containers:
+  // an index here names a position in the loot list of the corpse the
+  // character screen is currently open ON, and main.cpp is the only thing
+  // that knows which corpse that is. Take-only in practice — a drag INTO a
+  // loot slot is refused, because a thing put on a corpse would be data with
+  // no body in the world (see the DropIntent note in ui/overlay.h).
+  Loot,
 };
 
 struct KitRef {

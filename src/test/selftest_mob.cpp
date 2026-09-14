@@ -16,6 +16,8 @@
 
 #include "game/avatar.h"
 #include "game/bodyreg.h"
+#include "game/equipment.h"
+#include "game/item.h"
 #include "game/thirdperson.h"
 #include "game/brush.h"
 #include "game/camera.h"
@@ -1648,6 +1650,150 @@ bool mobOk = false;
         // angle means a tucked knee (jump) and a straight leg (fall) are both
         // fine, and only a genuine fold-through fails.
         float worstLegUp = -1e9f;
+        // ---- ...AND THE AIRBORNE POSE MUST BE A FUNCTION OF vel.y ----------
+        //
+        // `legsNotInverted` above is a SAFETY bound: it says the legs did not
+        // fold through the pelvis. It passes just as happily on a body that
+        // does nothing at all in the air, which is what the old pose was —
+        // a 900 ms looping clip swaying the arms ten degrees over the rest
+        // hang the leg IK had faded out of ("just wobbles left and right
+        // slightly"). Nothing in it knew which way the body was going.
+        //
+        // So assert the DIFFERENCE, which is the whole claim of avatar.airPose:
+        // rising and falling are different shapes, in the right direction, by
+        // an amount you could see. Two arms of one fixture, ~20 ticks apart —
+        // the cheapest possible form of "it responds to the phase", and the
+        // one thing no amount of extra clip authoring could fake.
+        //
+        //   rising  -> knees TUCKED (foot close under the hip), arms driven UP
+        //   falling -> legs REACHING down, arms out WIDE to brace
+        //
+        // Measured in model space off each limb's own joint, so the body's
+        // world position and the fixture's teleporting have no vote.
+        float tuckDrop = 0, reachDrop = 0;    // hip.y - foot.y, mean of 2 legs
+        float tuckHandUp = 0, reachHandUp = 0;   // hand.y - shoulder.y, mean
+        // THE COUNTER-SWING, as the fore/aft GAP between the two hands. This
+        // is the one number that says the arms are doing opposite things:
+        // averages cannot see it (they cancel), and a per-arm height cannot
+        // either. It is also the assertion that would fail if `armSwing` ever
+        // stopped being signed per arm, which is the way this regresses.
+        float tuckHandSplit = 0, reachHandSplit = 0;  // |hand.z(L) - hand.z(R)|
+        float restDrop = 0;                   // the same drop, standing
+        {
+          const int hipParts[2] = {avatar.PartIndex("legU.L"),
+                                   avatar.PartIndex("legU.R")};
+          const int feet[2] = {avatar.PartIndex("foot.L"),
+                               avatar.PartIndex("foot.R")};
+          const int shoulders[2] = {avatar.PartIndex("armU.L"),
+                                    avatar.PartIndex("armU.R")};
+          const int hands[2] = {avatar.PartIndex("hand.L"),
+                                avatar.PartIndex("hand.R")};
+          auto sampleLegs = [&](float& drop) {
+            drop = 0;
+            int n = 0;
+            for (int s = 0; s < 2; s++) {
+              Vec3 hp, fp;
+              Quat hq, fq;
+              if (hipParts[s] < 0 || feet[s] < 0) continue;
+              if (!avatar.PartModelTransform(hipParts[s], hp, hq)) continue;
+              if (!avatar.PartModelTransform(feet[s], fp, fq)) continue;
+              drop += hp.y - fp.y;
+              n++;
+            }
+            if (n) drop /= (float)n;
+          };
+          auto sampleArms = [&](float& up, float& split) {
+            up = split = 0;
+            int n = 0;
+            float z[2] = {0, 0};
+            for (int s = 0; s < 2; s++) {
+              Vec3 sp, hp;
+              Quat sq, hq;
+              if (shoulders[s] < 0 || hands[s] < 0) continue;
+              if (!avatar.PartModelTransform(shoulders[s], sp, sq)) continue;
+              if (!avatar.PartModelTransform(hands[s], hp, hq)) continue;
+              up += hp.y - sp.y;
+              z[s] = hp.z;
+              n++;
+            }
+            if (n == 2) split = std::fabs(z[0] - z[1]);
+            if (n) up /= (float)n;
+          };
+          // The standing reference, taken BEFORE anything leaves the ground:
+          // every bound below is a fraction of this rig's own hanging leg, so
+          // the thresholds follow the art the way the gait's do.
+          sampleLegs(restDrop);
+
+          // ---- arm 1: RISING ----
+          // A real launch, not a teleport: the player's own jumpSpeed, applied
+          // as both the velocity the pose reads and the travel it implies, so
+          // the body is genuinely going up while it claims to be. The pose is
+          // driven by vel.y alone, but a fixture whose position disagreed with
+          // its velocity would be lying to every OTHER rule in the avatar (the
+          // gait's coyote distance, the landing probe) and the failure would
+          // land somewhere unrelated.
+          pl.grounded = false;
+          pl.vel.x = 0;
+          pl.vel.z = 0;
+          // Put the body back where the rise started before handing over. Every
+          // fixture after this one inherits pl.pos, and a jump at this rig's
+          // real jumpSpeed covers ~77 voxels in 22 ticks — enough to leave the
+          // fall below, the ramp and the bumpy-incline pass all measuring a
+          // body suspended somewhere new. Restoring it keeps this arm additive.
+          const float yBeforeRise = pl.pos.y;
+          const float kRise =
+              CurrentTuning().player.jumpSpeed / kVoxelMeters;
+          for (int i = 0; i < 22; i++) {
+            pl.vel.y = kRise;
+            pl.pos.y += kRise * kTickDt;
+            avTick();
+          }
+          sampleLegs(tuckDrop);
+          sampleArms(tuckHandUp, tuckHandSplit);
+
+          // ---- arm 2: FALLING, AND FAR ENOUGH UP TO STILL BE FALLING ------
+          //
+          // MEASURED FROM THE TOP OF THE JUMP, not from the drop below. The
+          // first version of this sampled 12 ticks into the existing fall loop,
+          // which starts AT the shelf the body walked off — and avatar.cpp's
+          // landing probe folds in the PREPARE shape over the last
+          // airPoseLandHeight (1.6 m, so 32 voxels at 5 cm) before contact. The
+          // body was inside that the whole way down, so the arm labelled
+          // "falling" was in fact the landing pose: it reported hands 0.6
+          // voxels above the shoulder against the reach shape's authored 0.40
+          // of an arm, and the lateral spread came out NARROWER than the tuck's
+          // instead of much wider. The fixture was wrong, not the pose — but a
+          // fixture that cannot tell "falling" from "about to land" is not
+          // evidence for either, and it would have failed the arm assertion
+          // while the thing under test was working.
+          //
+          // Up here the ground is ~70 voxels down, well past the probe's reach,
+          // so this is the reach shape and nothing else.
+          // At the tuning's OWN full fall speed, so this is the reach shape at
+          // full commitment rather than some fraction of it — the phase is
+          // `vel.y / airPoseFallSpeed`, so naming the same knob the pose reads
+          // is what keeps the arm at 1.0 if that knob is ever retuned.
+          const float kFall =
+              CurrentTuning().avatar.airPoseFallSpeed / kVoxelMeters;
+          for (int i = 0; i < 14; i++) {
+            pl.vel.y = -kFall;
+            pl.pos.y -= kFall * kTickDt * 0.1f;  // stay high; vel.y is the pose
+            avTick();
+          }
+          sampleLegs(reachDrop);
+          sampleArms(reachHandUp, reachHandSplit);
+
+          pl.pos.y = yBeforeRise;
+          // Land for a beat before handing over to the fall fixture below. Not
+          // cosmetic: the air CLOCK is what sends a body limp
+          // (ragdoll.fallSeconds, 3 s), and 36 ticks of jump plus the 45 the
+          // next loop spends falling would put this fixture within a few ticks
+          // of a ragdoll it is not trying to test.
+          pl.grounded = true;
+          pl.vel.y = 0;
+          for (int i = 0; i < 5; i++) avTick();
+          avatar.ClearFootfalls();   // the landing is not one of the gait's
+        }
         {
           pl.grounded = false;
           // Straight down, so drop the forward velocity the walk loops left
@@ -1692,6 +1838,48 @@ bool mobOk = false;
         // plenty of slack for a jump tuck; only a real fold-through goes
         // positive.
         bool legsNotInverted = worstLegUp < -0.5f;
+
+        // THE TWO SHAPES MUST DIFFER, AND IN THE RIGHT DIRECTION.
+        //
+        // Bounds are fractions of THIS rig's own standing leg (restDrop), never
+        // voxel literals: the pose table is authored in leg lengths for exactly
+        // that reason, and a hardcoded voxel bound would silently mean a
+        // different pose at a different kVoxelMeters or on a different rig.
+        //
+        // The margins are wide on purpose. The claim is "the body answers the
+        // phase", not "the tuck is 0.46 of a leg" — pinning the authored value
+        // here would make every future tweak of the shapes a test edit, which
+        // is the closed-ended-system failure DESIGN.md warns about. What it
+        // catches is the thing that actually regresses: the drive coming
+        // unhooked (both arms identical), or its sign inverting.
+        const bool haveAirRef = restDrop > 1e-3f;
+        const bool tucks = haveAirRef && tuckDrop < restDrop * 0.80f;
+        const bool reaches = haveAirRef && reachDrop > tuckDrop * 1.25f;
+        // The arms: driven UP at the launch, out WIDE on the way down. Measured
+        // against each other rather than against a standing pose, because the
+        // idle arms sit at whatever the rig authored and that is not a fact
+        // this test should own.
+        //
+        // TWO AXES OF THE SAME DRIVE, and each catches a failure the other
+        // cannot: the arms COUNTER-SWING widest at the launch (that is the
+        // instant they were actually driving) and are carried HIGHER on the way
+        // down (the brace). A swing that stopped being signed per arm collapses
+        // the split without touching the mean height; an arm pose that stopped
+        // reading the phase at all holds both.
+        const bool armsDrive =
+            tuckHandSplit > reachHandSplit + restDrop * 0.05f &&
+            reachHandUp > tuckHandUp + restDrop * 0.05f;
+        // With avatar.airPose OFF the shapes are the clip's, and the clip has
+        // no idea which way the body is moving — so this whole block is the
+        // air pose's own gate and is skipped rather than failed when it is off.
+        const bool airPoseOn = CurrentTuning().avatar.airPose;
+        const bool airPoseOk = !airPoseOn || (tucks && reaches && armsDrive);
+        std::printf(
+            "avatar air pose: %s (rest leg %.2f vox | tuck drop %.2f, reach "
+            "drop %.2f | hand up %.2f -> %.2f, counter-swing %.2f -> %.2f)\n",
+            !airPoseOn ? "off" : (airPoseOk ? "PASS" : "FAIL"), restDrop,
+            tuckDrop, reachDrop, tuckHandUp, reachHandUp, tuckHandSplit,
+            reachHandSplit);
 
         // ---- BUMPY INCLINE: the pose must not TELEPORT between frames ----
         //
@@ -1935,8 +2123,16 @@ bool mobOk = false;
             // start `fall`. Both are now gated on real events (a launch, and a
             // real drop below the last supported height), so walking a hill
             // must show neither.
+            //
+            // WITH avatar.airPose ON THERE ARE NO AIR CLIPS TO COUNT. The pose
+            // is driven from vel.y through the IK chains and neither clip is
+            // ever started, so a check phrased against them is green by
+            // construction — the coverage has to move to the thing that poses
+            // the body now. `AirPoseWeight` is the same claim about the same
+            // event: cresting a step must not convince the rig it is airborne.
             if (avatar.ClipActive("jump")) rampJumpTicks++;
             if (avatar.ClipWeight("fall") > 0.05f) rampFallTicks++;
+            if (avatar.AirPoseWeight() > 0.05f) rampFallTicks++;
             for (int s = 0; s < 2; s++) {
               rampHipLo = std::min(rampHipLo, jointTwistX(watch[2 + s], hips));
               rampHipHi = std::max(rampHipHi, jointTwistX(watch[2 + s], hips));
@@ -2018,7 +2214,7 @@ bool mobOk = false;
                     legsUpright && legsAlternate && legsNotSplayed &&
                     legsNotInverted && armsHang && armsSwing && poseContinuous &&
                     kneeBends && jointsInRange && strideCoherent &&
-                    rampWalks && rampNoAirClips;
+                    rampWalks && rampNoAirClips && airPoseOk;
         std::printf(
             "avatar: %s (%d parts, spawned=%d bodies=%d, followed %.1f vox, "
             "y-drift %.2f vox, self-push %.3f vox, states seen=%d (last %d) "
@@ -4122,15 +4318,23 @@ Status GateMobBurn(Ctx& c, std::string& detail) {
 // live in tests/baseline.json, not here.
 // ============================================================================
 
-// The humanoid rig the AI gates drive. Chosen by CAPABILITY rather than by
-// name: it has to publish a `held_right` socket or the sword cannot be
-// equipped, and the whole fixture would silently be testing an unarmed mob.
-// The stock player model wins the tie when several qualify.
+// The humanoid rig the AI gates drive. Chosen by CAPABILITY first — it has to
+// publish a `held_right` socket or the sword cannot be equipped and the whole
+// fixture is silently testing an unarmed mob — and the tie goes to `human`.
+//
+// IT USED TO GO TO `mina`, AND THAT QUIETLY MADE EVERY AI GATE A TEST OF A
+// CREATURE NOBODY FIGHTS. It is not a cosmetic difference: mina walks 60
+// voxels a second against the human's 31.5, which is two columns a tick
+// instead of one, and the locomotion failures that matter are all about whether
+// the body can keep up with the ground it is crossing. Measured on the slope
+// fixture, the two rigs disagreed about the SIZE of every number this file
+// asserts. A gate should drive what is in play; when that changes, this
+// function is the one line to change.
 int AiHumanoidDef(const MobSystem& mobs) {
   int best = -1;
   for (size_t i = 0; i < mobs.Defs().size(); i++) {
     if (mobs.Defs()[i].FindSocket("held_right") < 0) continue;
-    if (best < 0 || mobs.Defs()[i].name == "mina") best = (int)i;
+    if (best < 0 || mobs.Defs()[i].name == "human") best = (int)i;
   }
   return best;
 }
@@ -4479,22 +4683,95 @@ Status GateAiApproach(Ctx& c, std::string& detail) {
       if (c.mats[i].name == "stone") return (uint32_t)i;
     return 1u;
   }();
-  const int kWallHalfX = 16, kWallHeight = 8;
+
+  // ---- THE CREATURE FIRST, AND PINNED ------------------------------------
+  //
+  // Two reasons, both learned the hard way, and both about the fixture rather
+  // than about the AI.
+  //
+  //   * The wall's height has to be measured against THIS BODY'S STRIDE, and
+  //     the only honest source for that is the body (Mob::StepUpCells, resolved
+  //     from the rig). A literal was fine while every mob stepped 0.20 m and
+  //     became a test of nothing the day they got the player's 0.58 m.
+  //   * A mob with no profile WANDERS. Every tick spent writing the wall and
+  //     pulling it into the mirror was a tick the subject spent walking, and it
+  //     arrived at the measured loop wherever it happened to get to — once
+  //     already past the barrier. `dummy` is the authored profile whose whole
+  //     content is `mobile: false`, so the creature stands still until the
+  //     fixture is built and the duel is switched on below.
+  //
+  // Spawn so the mob's CENTRE lands on the flat spot: Spawn takes the prefab's
+  // min corner, and a humanoid's box is wide enough that ignoring that puts the
+  // creature half a body off the line the wall is built across.
+  std::string why;
+  const uint64_t id =
+      AiSpawn(c, defIndex,
+              {spot.x - (int)(def.worldSize.x * 0.5f), spot.y + 1,
+               spot.z - (int)(def.worldSize.z * 0.5f)},
+              "dummy", why);
+  if (id == 0) {
+    detail = why;
+    SubmitWorldgen(c.ctx, c.world, c.sim, kDefaultSeed);
+    c.ctx.WaitIdle();
+    return Status::Fail;
+  }
+  const int stepUp = c.mobs.MobStepUpCells(id);
+  const float mobStand = (float)(spot.y + 1);
+  // THE WALL'S HEIGHT IS RELATIVE TO THE CREATURE, NOT A LITERAL 8.
+  //
+  // It was eight voxels above EACH COLUMN'S OWN TERRAIN, which is two
+  // assumptions that both went stale the moment mobs were given the player's
+  // stride (0.58 m, five cells) instead of their old 0.20 m:
+  //
+  //   * eight is only a wall to a body that cannot step five, and
+  //   * "above its own column" is not "above the approach" on undulating
+  //     ground — with three voxels of relief the mob walked up to a barrier
+  //     whose top was four voxels above ITS feet and stepped onto it, exactly
+  //     as it would a kerb.
+  //
+  // The gate then reported "crossed the wall plane, 0.2 voxels from centre",
+  // which reads like walking through solid rock and was in fact a legal climb
+  // over a fixture that had quietly stopped being a wall. So: one ABSOLUTE top,
+  // derived from the tallest ground anywhere near the approach plus twice any
+  // sane step budget, and every column filled up to it. A fixture that measures
+  // itself against the thing under test cannot rot when that thing is retuned.
+  const int kWallHalfX = 16;
+  int wallTop = 0, wallRise = 0;
   {
-    std::vector<CellOp> wall;
     const int wz = spot.z + gapVox / 2;
+    int highest = th;
+    for (int wx = spot.x - kWallHalfX; wx <= spot.x + kWallHalfX; wx++)
+      for (int dz = -2; dz <= 3; dz++)
+        highest = std::max(highest,
+                           World::TerrainHeight(wx, wz + dz, kDefaultSeed));
+    highest = std::max(highest, World::TerrainHeight(spot.x, spot.z, kDefaultSeed));
+    // TWO CELLS PAST WHAT THIS BODY CAN STEP, measured from where it STANDS —
+    // and no taller, because the gate also needs the duelist to SEE its target
+    // over the barrier the whole time (a wall that breaks line of sight makes a
+    // perception failure look like a navigation failure, which is the one
+    // confusion this fixture exists to avoid). Also never below the local
+    // terrain, or undulation punches a hole in it.
+    wallTop = std::max(highest + 1, (int)mobStand + stepUp + 2);
+    wallRise = wallTop - (int)mobStand;
+    std::vector<CellOp> wall;
     for (int wx = spot.x - kWallHalfX; wx <= spot.x + kWallHalfX; wx++) {
       const int wh = World::TerrainHeight(wx, wz, kDefaultSeed);
       // Two voxels thick: the ground probe samples columns, and a one-voxel
       // sheet can be stepped across diagonally between two column centres.
       for (int dz = 0; dz < 2; dz++)
-        for (int k = 0; k < kWallHeight; k++) {
-          const IVec3 cell{wx, wh + 1 + k, wz + dz};
+        for (int y = wh + 1; y <= wallTop; y++) {
+          const IVec3 cell{wx, y, wz + dz};
           if (!c.world.CellInWindow(cell)) continue;
           wall.push_back(CellOp{World::SlotCellIndex(cell), stone});
         }
     }
-    tick({}, wall);
+    // Several thousand cells now; feed the queue in slices rather than assuming
+    // one submission swallows them all.
+    const size_t kSlice = 4000;
+    for (size_t i = 0; i < wall.size(); i += kSlice)
+      tick({}, std::vector<CellOp>(
+                   wall.begin() + (ptrdiff_t)i,
+                   wall.begin() + (ptrdiff_t)std::min(i + kSlice, wall.size())));
   }
   // ---- get the wall into the mirror the NAVIGATOR reads --------------------
   //
@@ -4525,8 +4802,7 @@ Status GateAiApproach(Ctx& c, std::string& detail) {
     for (int i = 0; i < 60; i++) {
       bool all = true;
       for (int wx = spot.x - kWallHalfX; wx <= spot.x + kWallHalfX; wx += 4) {
-        const int wh = World::TerrainHeight(wx, wz, kDefaultSeed);
-        const IVec3 cell{wx, wh + 2, wz};
+        const IVec3 cell{wx, wallTop, wz};
         if (cachedSolid(cell)) continue;
         all = false;
         c.world.RequestChunkFetch({cell.x >> 4, cell.y >> 4, cell.z >> 4});
@@ -4537,26 +4813,58 @@ Status GateAiApproach(Ctx& c, std::string& detail) {
     }
   }
 
-  // Spawn so the mob's CENTRE lands on the flat spot: Spawn takes the prefab's
-  // min corner, and a humanoid's box is wide enough that ignoring that puts the
-  // creature half a body off the line the wall was built across — which showed
-  // up as a start distance of 11 voxels on a 20-voxel fixture, already inside
-  // the band the gate was about to test.
-  std::string why;
-  const uint64_t id =
-      AiSpawn(c, defIndex,
-              {spot.x - (int)(def.worldSize.x * 0.5f), spot.y + 1,
-               spot.z - (int)(def.worldSize.z * 0.5f)},
-              "duelist", why);
-  if (id == 0) {
-    detail = why;
+  // ---- THE SIGHT LINE RISES WITH THE WALL --------------------------------
+  // The target used to sit a flat eight voxels over its own ground, which
+  // cleared a seven-voxel barrier and nothing taller. Solve for it instead:
+  // the ray from the mob's chest to the target's passes over the wall plane at
+  // the midpoint of the gap, so putting the target where that midpoint clears
+  // `wallTop` by three keeps the duelist's eyes on it for ANY wall this gate
+  // decides it needs — which is the property the fixture actually wants, rather
+  // than a number that happened to work once.
+  const float mobChest = mobStand + def.worldSize.y * 0.5f;
+  const float targetY =
+      std::max((float)th + 8.0f, 2.0f * ((float)wallTop + 3.0f) - mobChest);
+  c.mobs.SetPlayerActor(Vec3{(float)tx, targetY, (float)tz}, 3.0f, 17.0f, true);
+  // ...and NOW it is a duelist. Everything above ran with the creature pinned.
+  if (!c.mobs.SetMobBehavior(id, "duelist")) {
+    detail = "no behaviour profile \"duelist\"";
     SubmitWorldgen(c.ctx, c.world, c.sim, kDefaultSeed);
     c.ctx.WaitIdle();
     return Status::Fail;
   }
-  c.mobs.SetPlayerActor(Vec3{(float)tx, (float)th + 8.0f, (float)tz}, 3.0f,
-                        17.0f, true);
-  for (int i = 0; i < 20; i++) tick();   // anchors fetch the chunks around the mob
+  // THE CROSSING DETECTOR HAS TO WATCH THE WARM-UP TICKS TOO.
+  //
+  // It did not, and the failure that taught this is the exact one `ai-slope`
+  // hit from the other direction: these twenty ticks are a creature walking
+  // with nobody looking, and the fastest rig in the pack covers a voxel a tick.
+  // When it happened to be past the wall by the first measured sample, the gate
+  // recorded "crossed at tick 0, 0.2 voxels from the wall's centre" — which
+  // reads exactly like walking THROUGH the barrier and was in fact a detour
+  // completed off-camera. Two runs went into telling those apart, and the same
+  // fixture ran GREEN standalone and RED in-suite purely because the residency
+  // window put it on different terrain and changed how far it got.
+  //
+  // So the crossing is recorded from the tick the creature exists, and a
+  // crossing during the warm-up is reported with a NEGATIVE tick rather than
+  // being silently attributed to the first observed frame.
+  const float wallZ = (float)(spot.z + gapVox / 2);
+  const float wallHalfX = (float)kWallHalfX;
+  float crossX = 0, crossY = 0;
+  int crossTick = INT32_MIN;
+  int stepNo = -20;
+  auto noteCross = [&]() {
+    if (crossTick != INT32_MIN) return;
+    const Vec3 ctr = AiMobCentre(c.mobs, id, def);
+    if (ctr.z <= wallZ) return;
+    crossTick = stepNo;
+    crossX = std::abs(ctr.x - (float)spot.x);
+    crossY = c.mobs.MobOrigin(id).y;   // OVER the wall and AROUND it differ
+  };
+  for (int i = 0; i < 20; i++) {   // anchors fetch the chunks around the mob
+    tick();
+    noteCross();
+    stepNo++;
+  }
 
   // Does the CHUNK CACHE have the wall, and is it CONTINUOUS? Every column, at
   // the ground+2 the step-up limit cares about, read out of the same mirror the
@@ -4566,9 +4874,12 @@ Status GateAiApproach(Ctx& c, std::string& detail) {
   {
     const int wz = spot.z + gapVox / 2;
     for (int wx = spot.x - kWallHalfX; wx <= spot.x + kWallHalfX; wx++) {
-      const int wh = World::TerrainHeight(wx, wz, kDefaultSeed);
       wallCols++;
-      if (cachedSolid(IVec3{wx, wh + 2, wz})) wallSeen++;
+      // AT THE TOP, not at ground+2. The claim that matters is "the barrier is
+      // as tall as this gate built it, everywhere" — a mirror that has the
+      // bottom of the wall and not the top is precisely the state in which a
+      // creature steps over it.
+      if (cachedSolid(IVec3{wx, wallTop, wz})) wallSeen++;
     }
   }
 
@@ -4578,7 +4889,7 @@ Status GateAiApproach(Ctx& c, std::string& detail) {
   const float bandTol = (float)BaselineNumber("aiApproachBandTolVox", 2.5);
   const float minClear = (float)BaselineNumber("aiApproachMinClearVox", 3.0);
 
-  const Vec3 targetC{(float)tx, (float)th + 8.0f, (float)tz};
+  const Vec3 targetC{(float)tx, targetY, (float)tz};
   const float startDist = AiPlanar(AiMobCentre(c.mobs, id, def), targetC);
   int arriveTick = -1;
   float minDist = 1e9f;
@@ -4595,22 +4906,13 @@ Status GateAiApproach(Ctx& c, std::string& detail) {
   // WHERE it crossed the wall's plane, not merely that it got past. A detour is
   // a crossing at |x| beyond the wall's end; walking THROUGH one is a crossing
   // at x ~ 0, and the two are indistinguishable from "arrived at tick N".
-  const float wallZ = (float)(spot.z + gapVox / 2);
-  const float wallHalfX = (float)kWallHalfX;
-  float crossX = 0;
-  int crossTick = -1;
-  int stepNo = 0;
   Vec3 prevPos = c.mobs.MobOrigin(id);
   auto step = [&]() {
     tick();
     const Vec3 now = c.mobs.MobOrigin(id);
     travelled += AiPlanar(now, prevPos);
     prevPos = now;
-    const Vec3 ctr = AiMobCentre(c.mobs, id, def);
-    if (crossTick < 0 && ctr.z > wallZ) {
-      crossTick = stepNo;
-      crossX = std::abs(ctr.x - (float)spot.x);
-    }
+    noteCross();
     stepNo++;
     const ai::Brain* br = c.mobs.MobBrain(id);
     if (br != nullptr) {
@@ -4628,6 +4930,7 @@ Status GateAiApproach(Ctx& c, std::string& detail) {
     // it" and "it oscillated". Cheap and off by default in spirit — 12 lines
     // over a 600-tick run.
     if (br != nullptr && (stepNo % 50) == 0) {
+      const Vec3 ctr = AiMobCentre(c.mobs, id, def);
       const bool haveWp = !br->path.Done();
       const Vec3 wp = haveWp ? br->path.Current() : Vec3{};
       std::printf(
@@ -4668,6 +4971,10 @@ Status GateAiApproach(Ctx& c, std::string& detail) {
   }
 
   const int outAllowed = (int)BaselineNumber("aiApproachOutOfBandTicks", 12);
+  // The fixture has to be a wall FOR THIS CREATURE. Asserted rather than
+  // assumed: a rig re-authored with a longer stride would otherwise turn this
+  // gate into a test of nothing, silently and in the passing direction.
+  const bool wallIsAWall = wallRise > stepUp;
   // A duel with no swings in it is not a duel. This is the one assertion that
   // ties the whole chain — perceive, path, hold range, aim — to the seam Phase
   // C consumes: the arbiter can score perfectly and still never fire if the
@@ -4678,22 +4985,25 @@ Status GateAiApproach(Ctx& c, std::string& detail) {
   // Without this the gate is satisfied by a mob that walks straight over a
   // 6-voxel step the locomotion is supposed to refuse, which would make it a
   // test of nothing.
-  const bool detoured = crossTick >= 0 && crossX > wallHalfX * 0.6f;
-  const bool ok = wallSeen == wallCols && arriveTick >= 0 && everPathed &&
-                  detoured &&
+  const bool detoured =
+      crossTick != INT32_MIN && crossX > wallHalfX * 0.6f;
+  const bool ok = wallSeen == wallCols && wallIsAWall && arriveTick >= 0 &&
+                  everPathed && detoured &&
                   minDist >= minClear && outOfBand <= outAllowed &&
                   attacks >= minAttacks;
   RecordObserved("aiApproachArriveTick", (double)arriveTick);
   RecordObserved("aiApproachAttacks", (double)attacks);
   detail = Format(
-      "wall %d/%d columns in mirror (half-width %.0f), start %.1f vox, crossed "
-      "the wall "
-      "plane at tick %d, |x| %.1f from centre (detour %d), arrived tick %d/%d "
+      "wall %d/%d columns in mirror (half-width %.0f, rises %d vox over the "
+      "approach vs a %d-cell stride: wall %d), start %.1f vox, crossed the wall "
+      "plane at tick %d, |x| %.1f from centre at y %+.1f (detour %d), arrived "
+      "tick %d/%d "
       "(%.0f vox walked), pathed %d, band [%.1f,%.1f]+-%.1f: %d/%d ticks out "
       "(worst %.2f), closest %.2f (>= %.1f), %d attacks (>= %d), %u replans, "
       "intents idle/face/appr/hold/circ/atk %d/%d/%d/%d/%d/%d, relief %d",
-      wallSeen, wallCols, wallHalfX, startDist, crossTick, crossX,
-      detoured ? 1 : 0,
+      wallSeen, wallCols, wallHalfX, wallRise, stepUp, wallIsAWall ? 1 : 0,
+      startDist, crossTick, crossX,
+      crossY - (float)spot.y, detoured ? 1 : 0,
       arriveTick, budget, travelled, everPathed ? 1 : 0, dp.movement.rangeMin,
       dp.movement.rangeMax, bandTol, outOfBand, holdTicks, worstOut, minDist,
       minClear, attacks, minAttacks,
@@ -4709,6 +5019,1399 @@ Status GateAiApproach(Ctx& c, std::string& detail) {
   // absolute coordinate (CLAUDE.md rule 7).
   SubmitWorldgen(c.ctx, c.world, c.sim, kDefaultSeed);
   c.ctx.WaitIdle();
+  return ok ? Status::Pass : Status::Fail;
+}
+
+// ---- ai-slope ---------------------------------------------------------------
+//
+// THE TWO WAYS AN NPC MOVES WRONG ON A HILL, AS TWO NUMBERS.
+//
+// Everything above this gate tests navigation on FLAT ground: `ai-approach`
+// builds a vertical wall precisely so the creature has to go AROUND it, and a
+// vertical wall is the one obstacle whose failure mode is visible in a planar
+// distance. That left the whole sloped-terrain regime — which is most of the
+// world — asserted by nothing at all, and both bugs this gate pins lived there
+// for as long as the AI has existed:
+//
+//   depthVox  How far the body's own min corner ever got BELOW the surface it
+//             was standing on. The walk drive settled the origin toward the
+//             probed ground at 3 cm a tick while a humanoid walks 3.15 m/s, so
+//             on anything steeper than about thirty degrees the body outran its
+//             own settle and sank. Once it was under the surface the ground
+//             probe — which only ever scanned DOWNWARD — reported the rock
+//             beneath the buried body as the floor, every one of the eight
+//             sense probes read flat against that fiction, and the creature
+//             walked the rest of the way through the hill. Must stay at zero:
+//             this is not a tolerance, it is "the body is not inside the
+//             ground".
+//   tiltDeg   How far the body ever leaned off vertical. The lean came from a
+//             plane fitted through the "planted feet", except that the gait
+//             counted every IK chain as a foot and a humanoid publishes two
+//             legs AND TWO ARMS — so the plane was fitted through two feet and
+//             two hands, which on a slope are nowhere near coplanar with the
+//             ground. Bounded only by "the normal's y is above 0.6", i.e. 53
+//             degrees, in any direction including pure roll. That is the
+//             "standing on a ramp and rotated 45 degrees for no reason"
+//             complaint, and it is why it only ever showed up on slopes.
+//
+// A THIRD CLAIM, and the reason the fixture is a ramp rather than a cliff:
+// the creature must actually GET UP IT. A body that refuses every slope passes
+// both numbers above trivially by standing still, and that was very nearly the
+// old behaviour — the mob's step-up budget was a flat 0.20 m against the
+// player's 0.58 m, so a kerb the player strides over read as a wall, the
+// forward probe went blocked, and the steering deflected sideways. `climbedVox`
+// is what separates "does not sink" from "does not move".
+//
+// THE FIXTURE IS A STAIRCASE, NOT A SMOOTH WEDGE. Each column is one voxel
+// higher than the one behind it, so every individual step is comfortably inside
+// any sane budget and the gate is testing the SETTLE RATE rather than the step
+// rule. A smooth 45-degree wedge would confound the two.
+Status GateAiSlope(Ctx& c, std::string& detail) {
+  c.debris.Reset();
+  c.mobs.Reset();
+  SubmitWorldgen(c.ctx, c.world, c.sim, kDefaultSeed);
+  c.ctx.WaitIdle();
+
+  const int defIndex = AiHumanoidDef(c.mobs);
+  if (defIndex < 0) {
+    detail = "no mob def publishes a held_right socket";
+    return Status::Fail;
+  }
+  const MobDef& def = c.mobs.Defs()[defIndex];
+  if (c.mobs.Behaviors().Find("duelist") < 0) {
+    detail = "no \"duelist\" profile in assets/mobs/behaviors.json";
+    return Status::Fail;
+  }
+
+  int relief = 0;
+  const IVec3 anchor = AiFixtureCentre(c.world);
+  const IVec3 spot = AiFlatSpot(anchor.x, anchor.z, 96, 26, kDefaultSeed, relief);
+  const int h0 = World::TerrainHeight(spot.x, spot.z, kDefaultSeed);
+
+  AiTicker tick{c, 7600, {spot.x >> 4, spot.y >> 4, spot.z >> 4}};
+
+  const uint32_t stone = [&] {
+    for (size_t i = 0; i < c.mats.size(); i++)
+      if (c.mats[i].name == "stone") return (uint32_t)i;
+    return 1u;
+  }();
+
+  // ---- the ramp ----------------------------------------------------------
+  // Rises from `rampZ0` toward +Z at one voxel per column, then a flat crest to
+  // stand the target on. Wide enough (+-kHalfX) that walking round it is not a
+  // shortcut inside the planner's radius, so the creature is genuinely being
+  // asked to climb.
+  // THE RAMP STARTS WELL CLEAR OF THE SPAWN, and that gap is load-bearing
+  // rather than tidy. The first version put it four voxels away, and the
+  // fastest rig in the pack walks a voxel a tick: the creature had climbed the
+  // entire thing during the warm-up ticks, before the measuring loop began, and
+  // the gate reported "climbed 0.0" about a mob standing serenely on the crest.
+  // A fixture whose subject finishes the test before the test starts is the
+  // worst kind of green.
+  // The whole fixture has to fit inside the duelist's 46-voxel sight range,
+  // measured PLANAR from the spawn — a ramp long enough to be interesting and a
+  // crest deep enough to hold on adds up fast, and a creature that never
+  // perceives its target reports the same "climbed 0.0" as one that refused the
+  // slope. The gate says which (`targeted`) rather than leaving the next reader
+  // to guess.
+  const int kHalfX = 20, kRampLen = 16, kCrestLen = 18;
+  const int rampZ0 = spot.z + 8;
+  // ONE VOXEL OF RISE PER VOXEL OF RUN: a 45-degree hill, which is steep and
+  // walkable. Tried at 3 first, on the reasoning that `terrain` reports this
+  // world at "slope max 3" — and 3 per voxel of run is a 71-degree cliff, which
+  // the drive correctly REFUSES after a few columns and the player could not
+  // walk either. That is a fixture measuring the step rule, not the thing this
+  // gate is for; the rise-per-column number in a terrain report is a maximum
+  // over a whole window and includes its cliff faces.
+  const int kRampRise = 1;
+  const int crestY = h0 + kRampLen * kRampRise;
+  {
+    std::vector<CellOp> ops;
+    for (int dz = 0; dz < kRampLen + kCrestLen; dz++) {
+      const int wz = rampZ0 + dz;
+      const int topY = h0 + std::min(dz, kRampLen) * kRampRise;
+      for (int wx = spot.x - kHalfX; wx <= spot.x + kHalfX; wx++) {
+        // From each column's OWN terrain height, so undulation cannot leave the
+        // ramp floating over a dip or buried in a rise.
+        const int base = World::TerrainHeight(wx, wz, kDefaultSeed);
+        // A column whose own terrain already stands above the ramp profile is
+        // filled to the terrain, not skipped: `for (y = base; y <= topY)` with
+        // base > topY writes nothing at all, and a hole in the middle of the
+        // ramp turns this into a test of something else entirely.
+        for (int y = base; y <= std::max(topY, base); y++) {
+          const IVec3 cell{wx, y, wz};
+          if (!c.world.CellInWindow(cell)) continue;
+          ops.push_back(CellOp{World::SlotCellIndex(cell), stone});
+        }
+      }
+    }
+    // The queue is bounded per tick; feed it in slices rather than assuming one
+    // submission swallows a few thousand cells.
+    const size_t kSlice = 4000;
+    for (size_t i = 0; i < ops.size(); i += kSlice) {
+      std::vector<CellOp> slice(ops.begin() + (ptrdiff_t)i,
+                                ops.begin() + (ptrdiff_t)std::min(i + kSlice,
+                                                                 ops.size()));
+      tick({}, slice);
+    }
+  }
+
+  // ---- get the ramp into the mirror the LOCOMOTION reads -----------------
+  // Same trap `ai-approach` documents at length: two CPU mirrors exist and the
+  // ground probe reads the CHUNK CACHE, which holds whatever version was last
+  // fetched. A chunk an earlier gate pulled in before the ramp existed stays
+  // that way until something asks again, and the creature then walks through a
+  // ramp its own probe cannot see — which would make this gate pass for the
+  // wrong reason.
+  auto cachedSolid = [&](IVec3 cell) {
+    const CachedChunk* cc =
+        c.world.Cached({cell.x >> 4, cell.y >> 4, cell.z >> 4});
+    if (cc == nullptr || cc->voxels.size() != kChunkVol) return false;
+    const uint32_t m =
+        cc->voxels[(((uint32_t)cell.z & 15u) * kChunk +
+                    ((uint32_t)cell.y & 15u)) *
+                       kChunk +
+                   ((uint32_t)cell.x & 15u)] &
+        0xFFFu;
+    return m != 0;
+  };
+  // The topmost solid at or below `from` in this column, +1 — the surface a
+  // body would stand on, read out of the same mirror the mob reads.
+  auto surfaceAt = [&](int wx, int wz, int from) {
+    for (int y = from; y > from - 64; y--)
+      if (cachedSolid(IVec3{wx, y, wz})) return y + 1;
+    return INT32_MIN;
+  };
+  // EVERY COLUMN, not every third. The loop sampled a stride of three and the
+  // census below checked all of them, so it broke out as soon as its OWN
+  // samples were cached while columns in between — in chunks nothing had asked
+  // for — were still missing. That reported "ramp 8/16 columns in mirror" in
+  // one suite run and 16/16 in the next, from identical code: a check whose
+  // exit condition is weaker than its assertion is a flaky check, not a
+  // tolerant one.
+  for (int i = 0; i < 120; i++) {
+    bool all = true;
+    for (int dz = 0; dz < kRampLen; dz++) {
+      const IVec3 cell{spot.x, h0 + dz * kRampRise, rampZ0 + dz};
+      if (cachedSolid(cell)) continue;
+      all = false;
+      c.world.RequestChunkFetch({cell.x >> 4, cell.y >> 4, cell.z >> 4});
+    }
+    if (all) break;
+    tick();
+  }
+  int rampSeen = 0, rampCols = 0;
+  for (int dz = 0; dz < kRampLen; dz++) {
+    rampCols++;
+    if (cachedSolid(IVec3{spot.x, h0 + dz * kRampRise, rampZ0 + dz})) rampSeen++;
+  }
+
+  // ---- the run -----------------------------------------------------------
+  // Target on the crest, so "walk to the thing" IS "climb the ramp". The mob
+  // starts on the flat below it.
+  // FOURTEEN VOXELS ONTO THE CREST, not at its lip. The duelist's stand-off
+  // band is 7..11 voxels and it is measured PLANAR — the intent layer has no
+  // opinion about height at all — so a target parked at the top of the slope is
+  // satisfied by a creature standing part-way up it, and "climbed 16 of 22"
+  // would have been a pass for a body that never reached the top. Putting the
+  // target deep enough onto the flat means the band can only be met from the
+  // crest itself.
+  const int targetZ = rampZ0 + kRampLen + 12;
+  // ---- THE TARGET HAS TO BE VISIBLE FROM THE BOTTOM OF THE RAMP ----------
+  // A creature standing below a plateau cannot see anything standing ON it:
+  // the sight ray grazes the crest lip, which is solid, and `requireLos` then
+  // reports no target at all. The gate duly said "climbed 0.0" about a mob that
+  // was idle because it had nothing to walk towards — a PERCEPTION failure
+  // wearing a locomotion failure's clothes, which is the exact confusion
+  // ai-approach documents at length about its wall.
+  //
+  // So the target is lifted until the ray clears the lip. It floats, and that
+  // is fine: everything the duelist decides with it -- the stand-off band, the
+  // attack reach -- is measured PLANAR, so the height changes nothing except
+  // whether the creature can see the carrot it is being asked to climb towards.
+  // `targeted` is reported, so if this ever stops working it names itself.
+  const float mobChest = (float)(h0 + 1) + def.worldSize.y * 0.5f;
+  const float lipT = (float)(rampZ0 + kRampLen - spot.z) /
+                     std::max(1.0f, (float)(targetZ - spot.z));
+  const float targetY =
+      std::max((float)crestY + 8.0f,
+               mobChest + ((float)crestY + 3.0f - mobChest) / std::max(lipT, 0.1f));
+  c.mobs.SetPlayerActor(Vec3{(float)spot.x, targetY, (float)targetZ}, 3.0f,
+                        17.0f, true);
+
+  std::string why;
+  const uint64_t id =
+      AiSpawn(c, defIndex,
+              {spot.x - (int)(def.worldSize.x * 0.5f), h0 + 1,
+               spot.z - (int)(def.worldSize.z * 0.5f)},
+              "duelist", why);
+  if (id == 0) {
+    detail = why;
+    SubmitWorldgen(c.ctx, c.world, c.sim, kDefaultSeed);
+    c.ctx.WaitIdle();
+    return Status::Fail;
+  }
+  // NO WARM-UP TICKS, and that is the second half of the fixture lesson above.
+  // A warm-up is ground the creature covers with nobody watching, and on a rig
+  // that walks a voxel a tick it was enough to climb most of the ramp before
+  // the first depth sample was taken — so the one measurement this gate exists
+  // for was being skipped over exactly where it mattered. The ramp chunks are
+  // already in the mirror (the fetch loop above proved it column by column) and
+  // the mob's own anchors fetch what it stands on within a tick or two; until
+  // they do the drive simply declines to walk, which costs a few ticks of the
+  // budget and nothing else.
+  const int budget = (int)BaselineNumber("aiSlopeTicks", 700);
+  // The SPAWN height, so `climbed` is the whole climb rather than whatever was
+  // left of it when the measuring started.
+  const float startY = (float)(h0 + 1);
+  float maxDepth = 0, maxDrawnDepth = 0, maxTiltDeg = 0, topY = startY;
+  int buriedTicks = 0, deepestTick = -1;
+  int drawnBuriedTicks = 0, drawnDeepestTick = -1;
+  Vec3 worstAt{};
+  int ranTicks = 0;
+  int intentTicks[(int)ai::Intent::Count] = {};
+  bool everTargeted = false, everPathed = false;
+  float nearestZ = 1e9f;
+  for (int i = 0; i < budget; i++) {
+    tick();
+    ranTicks = i + 1;
+    const Vec3 o = c.mobs.MobOrigin(id);
+    if (o.x == 0 && o.y == 0 && o.z == 0) break;   // despawned
+    topY = std::max(topY, o.y);
+    const float drawnY = c.mobs.MobBodyY(id);
+    // ATTRIBUTION, not a bare "climbed 0". A creature that never saw its
+    // target, one that saw it and refused the slope, and one that climbed and
+    // slid back down all report the same zero, and only the first is not a
+    // locomotion bug at all.
+    const ai::Brain* br = c.mobs.MobBrain(id);
+    if (br != nullptr) {
+      intentTicks[(int)br->intent]++;
+      if (br->hasTarget) everTargeted = true;
+      if (br->path.valid) everPathed = true;
+    }
+    nearestZ = std::min(nearestZ, (float)targetZ - o.z);
+    // Dense over the first ticks and sparse after: the climb IS the first
+    // twenty ticks on a rig that walks two columns a tick, and an every-100
+    // sample steps straight over the only part of the run under test.
+    if ((i < 20 || (i % 100) == 0) && br != nullptr)
+      std::printf(
+          "    ai-slope t%3d: at (%+6.1f,%+6.1f,%+6.1f) drawn%+7.2f dz %5.1f  "
+          "%-9s tgt %d "
+          " path %2zu/%2zu  cols %u probed / %u unknown / %u blocked / %u "
+          "steep\n",
+          i, o.x - (float)spot.x, o.y - startY, o.z - (float)spot.z,
+          drawnY - o.y, (float)targetZ - o.z, ai::IntentName(br->intent),
+          br->hasTarget ? 1 : 0, br->path.cursor, br->path.pts.size(),
+          br->path.colsProbed, br->path.colsUnknown, br->path.colsBlocked,
+          br->path.colsSteep);
+
+    // HOW DEEP, not merely "is it inside". A bare "buried" boolean tells the
+    // next reader nothing about whether this was a float-epsilon graze on a
+    // step-up or a body ten voxels into a hillside, and those are different
+    // bugs. Measured at the footprint's own columns, from the SAME mirror the
+    // locomotion reads (see the note on cachedSolid above).
+    //
+    // AND MEASURED TWICE, AT BOTH HEIGHTS THE CREATURE HAS. `MobOrigin` is the
+    // COLLIDER; `MobBodyY` is where the body is DRAWN, and every limb transform
+    // is built from the second one. The first version of this gate asserted
+    // only on the collider, reported a clean 0.00, and was reported from the
+    // game as having changed nothing — because it had not: the collision origin
+    // rode the slope correctly while the visible creature stayed buried in it,
+    // held back by a body-height ease fifteen times too slow to follow the
+    // ground. A gate that measures the half of a fix that is easy to measure is
+    // worse than no gate, because it certifies the bug.
+    const float hx = std::max(0.0f, def.worldSize.x * 0.5f - 0.5f);
+    const float hz = std::max(0.0f, def.worldSize.z * 0.5f - 0.5f);
+    const float cx = o.x + def.worldSize.x * 0.5f;
+    const float cz = o.z + def.worldSize.z * 0.5f;
+    float depth = 0, drawnDepth = 0;
+    for (int iz = -1; iz <= 1; iz++)
+      for (int ix = -1; ix <= 1; ix++) {
+        const int wx = ifloor(cx + hx * (float)ix);
+        const int wz = ifloor(cz + hz * (float)iz);
+        const int s = surfaceAt(wx, wz, ifloor(o.y) + 4);
+        if (s == INT32_MIN) continue;
+        depth = std::max(depth, (float)s - o.y);
+        drawnDepth = std::max(drawnDepth, (float)s - drawnY);
+      }
+    if (depth > maxDepth) {
+      maxDepth = depth;
+      deepestTick = i;
+      worstAt = o;
+    }
+    if (drawnDepth > maxDrawnDepth) {
+      maxDrawnDepth = drawnDepth;
+      drawnDeepestTick = i;
+    }
+    if (depth > 0.01f) buriedTicks++;
+    if (drawnDepth > 0.01f) drawnBuriedTicks++;
+
+    const Vec3 up = c.mobs.MobBodyUp(id);
+    const float dot = std::clamp(up.y / std::max(up.len(), 1e-4f), -1.0f, 1.0f);
+    maxTiltDeg = std::max(maxTiltDeg, std::acos(dot) * 57.2957795f);
+  }
+
+  const float climbed = topY - startY;
+  const float minClimb = (float)BaselineNumber("aiSlopeMinClimbVox", 16.0);
+  const float maxDepthAllowed = (float)BaselineNumber("aiSlopeMaxDepthVox", 0.5);
+  // THE RIG'S OWN CEILING PLUS A SLACK, not an independent number. The claim is
+  // "the lean is clamped to what the rig authored" (anim.h
+  // LocomotionDef::tiltMaxDeg); pinning a literal here would assert something
+  // else, and would go quietly stale the day somebody re-authors the cap.
+  // The clamp is on the TOTAL lean (one angle off vertical, not one per axis),
+  // so this is tight on purpose: a slack wide enough to absorb a corner would
+  // also absorb the 53-degree roll this gate exists to refuse. Measured, the
+  // pre-fix code reached 17.7 degrees on this exact ramp.
+  const float tiltCap = c.mobs.MobTiltMaxDeg(id);
+  const float maxTiltAllowed =
+      tiltCap + (float)BaselineNumber("aiSlopeTiltSlackDeg", 1.0);
+  const int stepUp = c.mobs.MobStepUpCells(id);
+  const int minStepUp = (int)BaselineNumber("aiSlopeMinStepUpCells", 4);
+
+  // TWO ALLOWANCES, because the two heights are making different promises.
+  // The COLLIDER must be exactly on the surface — "do not be inside the ground"
+  // is not a preference, and it measures 0.00. The DRAWN body may dip a little
+  // as a foot plants on lower ground, which is what a stride looks like; what
+  // it may not do is follow feet that have gone stale down into a hillside.
+  // A tenth of a metre on a 1.7 m figure is the sole grazing, not a creature
+  // walking through a hill.
+  const float maxDrawnAllowed =
+      (float)BaselineNumber("aiSlopeMaxDrawnDepthVox", 1.2);
+  const bool ok = rampSeen == rampCols && climbed >= minClimb &&
+                  maxDepth <= maxDepthAllowed &&
+                  maxDrawnDepth <= maxDrawnAllowed &&
+                  maxTiltDeg <= maxTiltAllowed && stepUp >= minStepUp;
+  RecordObserved("aiSlopeClimbedVox", (double)climbed);
+  RecordObserved("aiSlopeMaxDepthObservedVox", (double)maxDepth);
+  RecordObserved("aiSlopeMaxDrawnDepthObservedVox", (double)maxDrawnDepth);
+  RecordObserved("aiSlopeMaxTiltObservedDeg", (double)maxTiltDeg);
+  detail = Format(
+      "ramp %d/%d columns in mirror (%d vox/col over %d, crest +%d), climbed "
+      "%.1f vox of %d (>= %.1f), collider deepest below surface %.2f vox "
+      "(<= %.2f) at tick %d (%d/%d ticks in the ground), DRAWN body deepest "
+      "%.2f vox (<= %.2f) at tick %d (%d/%d ticks in the ground), max body tilt "
+      "%.1f deg (<= %.1f), step budget %d cells (>= %d), relief %d, %d ticks "
+      "run, targeted %d, pathed %d, closed to dz %.1f, intents "
+      "idle/face/appr/hold/circ/atk %d/%d/%d/%d/%d/%d",
+      rampSeen, rampCols, kRampRise, kRampLen, kRampLen * kRampRise, climbed,
+      kRampLen * kRampRise, minClimb,
+      maxDepth, maxDepthAllowed, deepestTick, buriedTicks, budget,
+      maxDrawnDepth, maxDrawnAllowed, drawnDeepestTick, drawnBuriedTicks,
+      budget, maxTiltDeg,
+      maxTiltAllowed, stepUp, minStepUp, relief, ranTicks,
+      everTargeted ? 1 : 0, everPathed ? 1 : 0, nearestZ, intentTicks[0],
+      intentTicks[1], intentTicks[2], intentTicks[3], intentTicks[4],
+      intentTicks[5]);
+  if (!ok && maxDepth > maxDepthAllowed)
+    detail += Format("; deepest at (%.1f,%.1f,%.1f)", worstAt.x, worstAt.y,
+                     worstAt.z);
+
+  // LEAVE THE SUITE EXACTLY AS `ai-approach` DOES. A gate in a shared-World run
+  // owns its teardown, and the omission here was not the voxels — it was the
+  // PLAYER ACTOR. Leaving one registered hands every later mob gate a phantom
+  // enemy standing on this gate's crest, and `corpse-burn` (fifteen gates
+  // downstream) duly reported its corpse evaporating instead of burning.
+  c.mobs.ClearPlayerActor();
+  c.mobs.ClearAttackRequests();
+  c.debris.Reset();
+  c.mobs.Reset();
+  SubmitWorldgen(c.ctx, c.world, c.sim, kDefaultSeed);
+  c.ctx.WaitIdle();
+  return ok ? Status::Pass : Status::Fail;
+}
+
+// ---- LIVE RAGDOLL (DESIGN.md "A creature knocked down gets back up") --------
+//
+// Six claims, each a number this gate prints, so `--gate ragdoll` alone is
+// the whole iteration loop:
+//   A. a blast beside a standing creature knocks it LIMP (phase 1) and moves
+//      its pelvis at least ragdollBlastMinTravel voxels — and no more than
+//      ragdollBlastMaxTravel ("across the room, not across the map");
+//   B. it gets back UP: phase returns to 0 within ragdollGetUpMaxTicks, still
+//      alive, every limb still its own (LimbBodyCount unchanged, no body
+//      adopted by DebrisSystem), standing on the ground where it landed and
+//      still standing 60 ticks later;
+//   C. dropped from a height it FALLS under gravity (origin_.y descends, the
+//      old code hung it in the air), goes limp once the fall has lasted
+//      ragdoll.fallSeconds — shortened for the fixture, the harness mirror is
+//      only 2.4 m deep — and gets back up on the ground.
+//   D. through main.cpp's WHOLE explosion block (crater, debris damage, the
+//      carve, the per-body debris impulse, then the rig launch) a standing
+//      wizard and then the SAME wizard already limp never have a limb faster
+//      than ragdollRepeatBlastMaxSpeed. The per-body impulse used to reach a
+//      limp rig's limbs one at a time — impulse / 0.3 kg on a hand — and the
+//      launch stacked on top of it: "bodies zoom across the map".
+//   E. the PLAYER on fire, wearing cloth, with the capsule proxy in the world:
+//      what burns off the body (gobbets, shed cloth) may not shove the player
+//      through PlayerPushOut by more than ragdollBurnMaxPushVox in a tick, nor
+//      move them more than ragdollBurnMaxTravel over the burn. Measured before
+//      the fix: 62 voxels in one tick, 432 voxels before death.
+//   F. the TUMBLE: the same charge at the same distance, once at the ankles
+//      and once over the head, spins the rig in OPPOSITE directions (|w.z| at
+//      least ragdollBlastMinSpin either way) and tips it opposite ways 12
+//      ticks later (the up axis leans by at least ragdollBlastMinTiltGap
+//      between the two arms). The differential stays modest — no limb leaves
+//      the blast more than ragdollBlastMaxLimbSpeedRatio times faster than
+//      the slowest, and the spin is under ragdoll.blastMaxSpin. Before this,
+//      every limb took the same velocity and a body floated away from an
+//      explosion still standing to attention.
+// Thresholds are in tests/baseline.json (BaselineNumber), so retuning what
+// counts as "across the room" is a JSON edit, not a rebuild.
+Status GateRagdoll(Ctx& c, std::string& detail) {
+  GpuContext& ctx = c.ctx;
+  World& world = c.world;
+  Simulation& sim = c.sim;
+  DebrisSystem& debris = c.debris;
+  MobSystem& mobs = c.mobs;
+  Physics& phys = c.phys;
+  debris.Reset();
+  mobs.Reset();
+  SubmitWorldgen(ctx, world, sim, kDefaultSeed);
+  ctx.WaitIdle();
+  int dummyDef = -1, wizDef = -1;
+  for (size_t i = 0; i < mobs.Defs().size(); i++) {
+    if (mobs.Defs()[i].name == "dummy") dummyDef = (int)i;
+    if (mobs.Defs()[i].name == kAvatarDefName) wizDef = (int)i;
+  }
+  if (dummyDef < 0 || wizDef < 0) {
+    detail = "no dummy / avatar mob def";
+    return Status::Fail;
+  }
+  const int nLimbs = (int)mobs.Defs()[dummyDef].limbs.size();
+  // The AI gates' fixture: a flat spot at the CENTRE OF THE RESIDENCY
+  // WINDOW, never an absolute coordinate — an earlier gate leaves the window
+  // elsewhere and a mob spawned outside it is despawned on its first tick
+  // (AiFixtureCentre's note; this gate relearned it in-suite).
+  int relief = 0;
+  const IVec3 anchor = AiFixtureCentre(world);
+  const IVec3 spot = AiFlatSpot(anchor.x, anchor.z, 96, 16, kDefaultSeed, relief);
+  const int h = spot.y;
+  AiTicker ticker{c, 9000, {spot.x >> 4, spot.y >> 4, spot.z >> 4}};
+  auto tickOnce = [&]() { ticker(); };
+  const double minTravel = BaselineNumber("ragdollBlastMinTravel", 6.0);
+  const double maxTravel = BaselineNumber("ragdollBlastMaxTravel", 120.0);
+  const int getUpMaxTicks = (int)BaselineNumber("ragdollGetUpMaxTicks", 400.0);
+  bool ok = true;
+
+  // ---- A. the blast --------------------------------------------------------
+  uint64_t id = mobs.Spawn(dummyDef, {spot.x, h + 1, spot.z});
+  if (id == 0) {
+    detail = "spawn failed";
+    return Status::Fail;
+  }
+  std::printf("  ragdoll fixture: spot (%d, %d, %d), relief %d\n", spot.x, h,
+              spot.z, relief);
+  for (int i = 0; i < 45; i++) tickOnce();  // stand, settle the feet
+  const uint32_t debrisBefore = debris.BodyCount();
+  const Vec3 p0 = mobs.MobRootPos(id);
+  const int phaseBefore = mobs.RagdollPhaseOf(id);
+  // The X-detonate charge (tools.detonateRadius/Power) 6 voxels to the side,
+  // at pelvis height, through the same scale main.cpp's explosion loop uses.
+  const auto& tune = CurrentTuning();
+  const Vec3 ec{p0.x - 6.0f, p0.y + 2.0f, p0.z};
+  const float reach = (float)tune.tools.detonateRadius * tune.ragdoll.blastRadiusScale;
+  const float impulse = (float)tune.tools.detonatePower * tune.ragdoll.blastImpulseScale;
+  const int knocked = mobs.BlastMobsRadial(ec, reach, impulse);
+  const int phaseAfter = mobs.RagdollPhaseOf(id);
+  for (int i = 0; i < 45; i++) tickOnce();  // 1.5 s of flight
+  const Vec3 p1 = mobs.MobRootPos(id);
+  const float travel = Vec3{p1.x - p0.x, 0, p1.z - p0.z}.len();
+  const bool blastOk = knocked == 1 && phaseBefore == 0 && phaseAfter == 1 &&
+                       mobs.IsAlive(id) && travel >= (float)minTravel &&
+                       travel <= (float)maxTravel;
+  std::printf("  ragdoll blast: %s (knocked %d, phase %d->%d, pelvis travelled "
+              "%.1f vox in 1.5 s, band %.0f..%.0f, alive %d)\n",
+              blastOk ? "PASS" : "FAIL", knocked, phaseBefore, phaseAfter, travel,
+              minTravel, maxTravel, (int)mobs.IsAlive(id));
+  ok = ok && blastOk;
+
+  // ---- B. the get-up -------------------------------------------------------
+  int upAt = -1;
+  for (int i = 0; i < getUpMaxTicks; i++) {
+    tickOnce();
+    if (mobs.RagdollPhaseOf(id) == 0) {
+      upAt = i + 1;
+      break;
+    }
+  }
+  const Vec3 up = mobs.MobOrigin(id);
+  const int gh = World::TerrainHeight(ifloor(up.x + 1.5f), ifloor(up.z + 1.5f),
+                                      kDefaultSeed);
+  for (int i = 0; i < 60; i++) tickOnce();  // ...and stays up, walking
+  const Vec3 later = mobs.MobOrigin(id);
+  const bool upOk = upAt > 0 && mobs.IsAlive(id) &&
+                    mobs.LimbBodyCount() == (uint32_t)nLimbs &&
+                    debris.BodyCount() == debrisBefore &&
+                    std::fabs(up.y - (float)(gh + 1)) < 16.0f &&
+                    mobs.RagdollPhaseOf(id) == 0 &&
+                    std::fabs(later.y - (float)(gh + 1)) < 16.0f;
+  std::printf("  ragdoll get-up: %s (up after %d ticks, alive %d, limbs %u/%d, "
+              "debris +%d, stood at y %.1f vs ground %d, 60 ticks later y %.1f "
+              "phase %d)\n",
+              upOk ? "PASS" : "FAIL", upAt, (int)mobs.IsAlive(id),
+              mobs.LimbBodyCount(), nLimbs, (int)(debris.BodyCount() - debrisBefore),
+              up.y, gh + 1, later.y, mobs.RagdollPhaseOf(id));
+  ok = ok && upOk;
+
+  // ---- C. the fall ---------------------------------------------------------
+  // 2.2 m up, inside the harness mirror's 2.4 m ground scan, and a
+  // fixture-short fallSeconds so the limp fires before the landing.
+  mobs.Reset();
+  debris.Reset();
+  const Tuning saved = CurrentTuning();
+  {
+    Tuning tt = saved;
+    tt.ragdoll.fallSeconds = 0.3f;
+    SetCurrentTuning(tt);
+  }
+  uint64_t fid =
+      mobs.Spawn(dummyDef, {spot.x, h + 1 + MetresToCellsI(2.2f), spot.z});
+  const Vec3 f0 = mobs.MobOrigin(fid);
+  for (int i = 0; i < 5; i++) tickOnce();
+  const Vec3 f1 = mobs.MobOrigin(fid);
+  int limpAt = -1;
+  for (int i = 0; i < 30; i++) {
+    tickOnce();
+    if (mobs.RagdollPhaseOf(fid) == 1) {
+      limpAt = i + 6;
+      break;
+    }
+  }
+  int fUpAt = -1;
+  for (int i = 0; i < getUpMaxTicks; i++) {
+    tickOnce();
+    if (mobs.RagdollPhaseOf(fid) == 0) {
+      fUpAt = i + 1;
+      break;
+    }
+  }
+  const Vec3 f2 = mobs.MobOrigin(fid);
+  const bool fallOk = fid != 0 && f1.y < f0.y - 0.5f && limpAt > 0 &&
+                      fUpAt > 0 && mobs.IsAlive(fid) &&
+                      std::fabs(f2.y - (float)(h + 1)) < 16.0f;
+  std::printf("  ragdoll fall: %s (spawned %.0f up, dropped %.2f vox in 5 ticks, "
+              "limp at tick %d, up after %d more, final y %.1f vs ground %d, "
+              "alive %d)\n",
+              fallOk ? "PASS" : "FAIL", f0.y - (float)(h + 1), f0.y - f1.y,
+              limpAt, fUpAt, f2.y, h + 1, (int)mobs.IsAlive(fid));
+  ok = ok && fallOk;
+  SetCurrentTuning(saved);
+
+  // ---- D. the second blast ---------------------------------------------------
+  // main.cpp's explosion block, verbatim in shape: destruction event, debris
+  // damage, the mob carve, the per-body debris impulse WITH the rig skip
+  // list, then the rig launch. A gate that calls BlastMobsRadial alone (A
+  // above) never saw the per-body impulse reach a limp rig.
+  {
+    mobs.Reset();
+    debris.Reset();
+    SubmitWorldgen(ctx, world, sim, kDefaultSeed);
+    ctx.WaitIdle();
+    uint32_t tick = ticker.tick;
+    const IVec3 pchunk{spot.x >> 4, spot.y >> 4, spot.z >> 4};
+    auto explodeTick = [&](const ExplosionOp* e) {
+      std::vector<BrushOp> ops;
+      std::vector<CellOp> cellOps;
+      std::vector<ParticleSpawn> spawns;
+      std::vector<ExplosionOp> exps;
+      mobs.PreTick(tick + 1, world, ops, cellOps, spawns);
+      debris.QueueSupportEvents(world.Snap());
+      debris.PreTick(tick + 1, world, cellOps, spawns);
+      if (e) {
+        exps.push_back(*e);
+        debris.AddDestructionEvent(tick + 1,
+                                   {e->x - e->radius, e->y - e->radius, e->z - e->radius},
+                                   {e->x + e->radius, e->y + e->radius, e->z + e->radius});
+        const Vec3 ec{(float)e->x + 0.5f, (float)e->y + 0.5f, (float)e->z + 0.5f};
+        const float edr = (float)e->radius * tune.physics.explosionBodyDamageScale;
+        debris.DamageBodiesRadial(ec, edr, world, spawns);
+        mobs.CarveMobsRadial(ec, edr, world, spawns);
+        std::vector<uint64_t> rig;
+        mobs.AppendLiveLimbBodies(rig);
+        std::sort(rig.begin(), rig.end());
+        phys.ApplyRadialImpulse(Vec3{(float)e->x, (float)e->y, (float)e->z},
+                                (float)e->radius * tune.physics.explosionImpulseRadiusScale,
+                                (float)e->power * tune.physics.explosionImpulseScale, &rig);
+        mobs.BlastMobsRadial(ec, (float)e->radius * tune.ragdoll.blastRadiusScale,
+                             (float)e->power * tune.ragdoll.blastImpulseScale);
+      }
+      ++tick;
+      SubmitTick(ctx, world, sim, tick, kDefaultSeed, ops, exps, cellOps, false,
+                 pchunk, true, true, spawns);
+      ctx.WaitIdle();
+      ctx.ProcessEvents();
+      phys.Step(kTickDt);
+      debris.PostStep();
+      mobs.PostStep();
+    };
+    const int nWiz = (int)mobs.Defs()[wizDef].limbs.size();
+    // The fastest limb of the rig this tick, m/s. Every limb, not the pelvis:
+    // the per-body impulse hit the LIGHT limbs hardest.
+    auto fastestLimb = [&](uint64_t id) {
+      float best = 0.0f;
+      for (int l = 0; l < nWiz; l++) {
+        const uint64_t hb = mobs.LimbBody(id, l);
+        Vec3 lin{}, ang{};
+        if (hb && phys.GetBodyVelocities(hb, lin, ang))
+          best = std::max(best, lin.len() * kVoxelMeters);
+      }
+      return best;
+    };
+    // The LAST POSITION THE CREATURE WAS ALIVE AT, because a dead mob's
+    // position probe is not a position: the husk leaves mobs_ on the next
+    // PreTick sweep and MobRootPos then answers from nothing, which is how
+    // "the pelvis moved 583 voxels in 1.3 s" (56 m/s, twice the speed cap
+    // that exists to prevent exactly that) got reported for a body that had
+    // in fact stopped. Travel measured to here is a real distance either way.
+    Vec3 lastAlive{};
+    int diedAt = -1;
+    auto flight = [&](uint64_t id, int ticks, const ExplosionOp& e) {
+      float peak = 0.0f;
+      for (int i = 0; i < ticks; i++) {
+        explodeTick(i == 0 ? &e : nullptr);
+        peak = std::max(peak, fastestLimb(id));
+        if (mobs.IsAlive(id)) lastAlive = mobs.MobRootPos(id);
+        else if (diedAt < 0) diedAt = i;
+      }
+      return peak;
+    };
+    const double maxSpeed = BaselineNumber("ragdollRepeatBlastMaxSpeed", 21.0);
+    const uint64_t wid = mobs.Spawn(wizDef, {spot.x, h + 1, spot.z});
+    for (int i = 0; i < 45; i++) explodeTick(nullptr);
+    // HOW MUCH WIZARD IS LEFT BEFORE THE FIRST CHARGE, because this arm's
+    // subject does not always arrive intact and that was invisible: it
+    // settles for 45 ticks in whatever world the gates before it left, and
+    // reaches the blast at 15 of 15 limbs under `--gate ragdoll` but only 12
+    // of 15 inside a full `--selftest` (44.9 kg against 52.4). A charge 6
+    // voxels away is close to lethal for the smaller one, which makes "it
+    // survived to take a second blast" a knife-edge claim rather than a
+    // property of the launch — read this number first when the arm moves.
+    const uint32_t limbsAtBlast = mobs.LimbBodyCount();
+    const Vec3 w0 = mobs.MobRootPos(wid);
+    const ExplosionOp e1{ifloor(w0.x) - 6, ifloor(w0.y) + 2, ifloor(w0.z),
+                         tune.tools.detonateRadius, tune.tools.detonatePower, 0, 0, 0};
+    const float peak1 = flight(wid, 20, e1);
+    const int phase1 = mobs.RagdollPhaseOf(wid);
+    const Vec3 w1 = mobs.MobRootPos(wid);
+    const ExplosionOp e2{ifloor(w1.x) - 6, ifloor(w1.y) + 2, ifloor(w1.z),
+                         tune.tools.detonateRadius, tune.tools.detonatePower, 0, 0, 0};
+    const float peak2 = flight(wid, 40, e2);
+    const float travel2 = (lastAlive - w1).len();
+    const bool repeatOk = wid != 0 && phase1 == 1 && mobs.IsAlive(wid) &&
+                          peak1 <= (float)maxSpeed && peak2 <= (float)maxSpeed &&
+                          travel2 <= (float)maxTravel;
+    std::printf("  ragdoll repeat blast: %s (fastest limb %.1f m/s standing, %.1f m/s "
+                "already limp, ceiling %.0f; second blast moved the pelvis %.1f vox "
+                "in 1.3 s, band ..%.0f; phase after first %d, alive %d, died at flight "
+                "tick %d of \"%s\"; subject had %u of %d limbs before the first "
+                "charge)\n",
+                repeatOk ? "PASS" : "FAIL", peak1, peak2, maxSpeed, travel2, maxTravel,
+                phase1, (int)mobs.IsAlive(wid), diedAt, mobs.DeathCause(wid),
+                limbsAtBlast, nWiz);
+    ok = ok && repeatOk;
+    ticker.tick = tick;
+  }
+
+  // ---- E. the player on fire -------------------------------------------------
+  // The avatar with the capsule proxy in the world (PlayerPushOut needs one),
+  // wearing the stock cloth, every part alight. What comes off — burn
+  // gobbets, a robe burnt through — is born beside or on top of the capsule,
+  // gets swept into it by the avatar's own kinematic limbs, and used to be
+  // read by PlayerPushOut as one hit per voxel box, summed.
+  {
+    mobs.Reset();
+    debris.Reset();
+    SubmitWorldgen(ctx, world, sim, kDefaultSeed);
+    ctx.WaitIdle();
+    uint32_t tick = ticker.tick;
+    const IVec3 pchunk{spot.x >> 4, spot.y >> 4, spot.z >> 4};
+    PlayerAvatar avatar;
+    avatar.Init(&phys, &world, &debris, c.mats, &mobs);
+    avatar.SetDefs(&mobs.Defs(), kAvatarDefName);
+    Player pl;
+    pl.fly = false;
+    pl.grounded = true;
+    pl.pos = Vec3{(float)spot.x + 0.5f, (float)(h + 2) + Player::kHalfY, (float)spot.z + 0.5f};
+    const bool spawned = avatar.Spawn(pl, 0.0f);
+    const uint64_t proxy = phys.CreatePlayerBody(Player::kHalfXZ, Player::kHalfY);
+    const char* wear[3] = {"hood", "robe", "boots"};
+    const int slots[3] = {0, 1, 3};  // EquipSlotId Head, Chest, Boots
+    int worn = 0;
+    for (int k = 0; k < 3; k++) {
+      const ItemDef* d = c.items.At(c.items.Find(wear[k]));
+      if (d && avatar.WearItem(d, slots[k])) worn++;
+    }
+    auto avTick = [&]() {
+      std::vector<BrushOp> ops;
+      std::vector<ParticleSpawn> spawns;
+      std::vector<CellOp> cellOps;
+      phys.MovePlayerBody(proxy, pl.pos, kTickDt);
+      avatar.PreTick(tick + 1, pl, 0.0f, kTickDt, world, ops, cellOps, spawns);
+      debris.QueueSupportEvents(world.Snap());
+      debris.PreTick(tick + 1, world, cellOps, spawns);
+      ++tick;
+      SubmitTick(ctx, world, sim, tick, kDefaultSeed, ops, {}, cellOps, false,
+                 pchunk, true, true, spawns);
+      ctx.WaitIdle();
+      ctx.ProcessEvents();
+      phys.Step(kTickDt);
+      debris.PostStep();
+      avatar.PostStep();
+    };
+    for (int i = 0; i < 30; i++) avTick();
+    for (int l = 0; l < avatar.PartCount(); l++) avatar.IgnitePart(l, 200);
+    const double maxPush = BaselineNumber("ragdollBurnMaxPushVox", 0.5);
+    const double maxMoved = BaselineNumber("ragdollBurnMaxTravel", 6.0);
+    const Vec3 start = pl.pos;
+    float peakPush = 0.0f;
+    int pushTicks = 0;
+    uint32_t gobbets = 0;
+    // WHAT pushed hardest, not just how hard: mass, depth, the tick it
+    // happened on, and whether that body is one of the avatar's OWN limbs
+    // (a corpse's arm handed to the world inside the capsule is a different
+    // bug from a gobbet swept into it, and a bare "6.25 vox" cannot tell
+    // them apart — CLAUDE.md rule 6).
+    Physics::PushSource worst{};
+    int worstTick = -1, worstAlive = -1, worstOwn = -1, worstLayer = -1;
+    uint32_t worstBodies = 0;
+    size_t worstPending = 0;
+    // The handles the avatar's parts hold while ALIVE. Die() hands each one to
+    // DebrisSystem and then zeroes `limb.body`, so asking the avatar "is this
+    // yours" AFTER the death tick always answers no — the probe has to
+    // remember. (A fixture that measures itself: the first version of this
+    // line read PartBody() at the time of the push and could not have
+    // reported 1 whatever happened.)
+    std::vector<uint64_t> ownBodies;
+    for (int l = 0; l < avatar.PartCount(); l++)
+      if (avatar.PartBody(l)) ownBodies.push_back(avatar.PartBody(l));
+    // THE CLAIM IS ABOUT A LIVING PLAYER, so the sample window ends at death.
+    // The loop tests IsAlive() before the tick, so the last push it collected
+    // was always taken AFTER the avatar died in that very tick — a corpse's
+    // own limbs going to the world under the capsule, which is a different
+    // event from "what burns off me shoves me" and has its own failure mode
+    // (see the post-mortem line below; it is reported, never asserted on).
+    float deathPush = 0.0f;
+    Physics::PushSource deathSrc{};
+    Vec3 livingPos = pl.pos;
+    for (int i = 0; i < 400 && avatar.IsAlive(); i++) {
+      avTick();
+      Physics::PushSource src{};
+      Vec3 push = phys.PlayerPushOut(proxy, pl.pos, &src);
+      // Player::ApplyPush's clamp, without its terrain sweeps.
+      const float len = push.len();
+      const float kMaxPush = 2.0f * Player::kHalfXZ;
+      if (len > kMaxPush) push = push * (kMaxPush / len);
+      Vec3 follow;
+      if (avatar.RagdollFollow(follow)) pl.pos = follow;
+      else pl.pos += push;
+      gobbets = std::max(gobbets, debris.BodyCount());
+      if (!avatar.IsAlive()) {  // died during this tick: post-mortem, not ours
+        deathPush = len;
+        deathSrc = src;
+        break;
+      }
+      livingPos = pl.pos;
+      if (len > peakPush) {
+        peakPush = len;
+        worst = src;
+        worstTick = i;
+        worstAlive = 1;
+        worstBodies = debris.BodyCount();
+        worstLayer = phys.BodyObjectLayer(src.body);
+        worstPending = phys.PendingReleaseCount();
+        worstOwn = 0;
+        for (uint64_t b : ownBodies)
+          if (b == src.body) worstOwn = 1;
+      }
+      if (len > 0.05f) pushTicks++;
+    }
+    const float moved = (livingPos - start).len();
+    const bool burnOk = spawned && worn == 3 && peakPush <= (float)maxPush &&
+                        moved <= (float)maxMoved;
+    std::printf("  ragdoll player on fire: %s (peak push %.2f vox/tick, ceiling %.2f; "
+                "%d ticks pushed; moved %.1f vox, ceiling %.0f; up to %u pieces off; "
+                "worn %d/3, alive %d)\n",
+                burnOk ? "PASS" : "FAIL", peakPush, maxPush, pushTicks, moved, maxMoved,
+                gobbets, worn, (int)avatar.IsAlive());
+    std::printf("    worst pusher: body %llu, %.2f kg, %.2f vox deep, layer %d "
+                "(1=MOVING, 3=AVATAR), at burn tick %d (avatar alive %d, was its "
+                "own limb %d, %u debris bodies, %zu still pending release)\n",
+                (unsigned long long)worst.body, worst.massKg, worst.depthVox,
+                worstLayer, worstTick, worstAlive, worstOwn, worstBodies,
+                worstPending);
+    // OPEN FINDING, reported every run and asserted on by nothing (2026-09-11).
+    // On the tick the avatar dies, Die() hands its limbs to DebrisSystem and
+    // queues them through ReleaseToWorldWhenClear — and at some poses one of
+    // them is on Layers::MOVING, deep inside the capsule, on that same tick.
+    // Caught here at a blast-launch retune that shifted this arm's tick phase:
+    // a 12.83 kg limb 3.25 voxels in, one shove of 6.25 voxels, while five
+    // other limbs were still correctly pending. It is phase-dependent (three
+    // neighbouring phases push 0.00), it is NOT the burn, and it is above the
+    // 5%-of-player-mass filter by design — a corpse's torso is meant to be
+    // able to shove you, just not by a third of a metre in one tick.
+    int deathOwn = 0;
+    for (uint64_t b : ownBodies)
+      if (b == deathSrc.body) deathOwn = 1;
+    std::printf("    post-mortem (not asserted): death-tick push %.2f vox from "
+                "body %llu, %.2f kg, %.2f vox deep, layer %d, own limb %d\n",
+                deathPush, (unsigned long long)deathSrc.body, deathSrc.massKg,
+                deathSrc.depthVox, phys.BodyObjectLayer(deathSrc.body), deathOwn);
+    ok = ok && burnOk;
+    avatar.Despawn();
+    phys.RemoveBody(proxy);
+    ticker.tick = tick;
+  }
+
+  // ---- F. the tumble ---------------------------------------------------------
+  // BOTH ARMS INSIDE ONE GATE, and the only thing that differs between them is
+  // the HEIGHT of the charge: same rig, same spot, same reach, same distance
+  // from the pelvis (the charge is placed symmetrically about the point
+  // BlastRadial measures the knockdown at, so the launch speed is the same and
+  // only the geometry moves). A blast at the ankles must roll the body one way
+  // and a blast over the head the other; a comparison against a number from a
+  // different fixture could not tell "the spin works" from "this rig happens
+  // to fall over".
+  {
+    const double minSpin = BaselineNumber("ragdollBlastMinSpin", 0.4);
+    const double maxRatio = BaselineNumber("ragdollBlastMaxLimbSpeedRatio", 3.0);
+    const double minTiltGap = BaselineNumber("ragdollBlastMinTiltGap", 0.25);
+    const auto& rgt = CurrentTuning().ragdoll;
+    const int nWiz = (int)mobs.Defs()[wizDef].limbs.size();
+    const int rootLimb = mobs.Defs()[wizDef].rootLimb;
+    float spinZ[2] = {0, 0}, spinLen[2] = {0, 0}, ratio[2] = {0, 0}, upX[2] = {0, 0};
+    int knockedF[2] = {0, 0};
+    for (int arm = 0; arm < 2; arm++) {
+      mobs.Reset();
+      debris.Reset();
+      SubmitWorldgen(ctx, world, sim, kDefaultSeed);
+      ctx.WaitIdle();
+      const uint64_t wid = mobs.Spawn(wizDef, {spot.x, h + 1, spot.z});
+      if (wid == 0) break;
+      for (int i = 0; i < 45; i++) tickOnce();  // stand, settle the feet
+      // BlastRadial measures the knockdown 0.4 m above the pelvis body's
+      // origin; put the charge 8 voxels below that for the ankle arm and 8
+      // above it for the overhead one, 6 to the side either way.
+      const Vec3 w0 = mobs.MobRootPos(wid);
+      const float probeY = w0.y + 0.4f / kVoxelMeters;
+      const Vec3 ec2{w0.x - 6.0f, probeY + (arm == 0 ? -8.0f : 8.0f), w0.z};
+      knockedF[arm] = mobs.BlastMobsRadial(ec2, reach, impulse);
+      // Read the rig's motion the instant the launch is set: every limb was
+      // given the same spin (one rigid motion), and the linear speeds differ
+      // only by omega x r.
+      float fast = 0.0f, slow = 1e9f;
+      for (int l = 0; l < nWiz; l++) {
+        const uint64_t hb = mobs.LimbBody(wid, l);
+        Vec3 lin{}, ang{};
+        if (!hb || !phys.GetBodyVelocities(hb, lin, ang)) continue;
+        fast = std::max(fast, lin.len());
+        slow = std::min(slow, lin.len());
+        if (l == rootLimb) {
+          spinZ[arm] = ang.z;
+          spinLen[arm] = ang.len();
+        }
+      }
+      ratio[arm] = slow > 1e-3f ? fast / slow : 0.0f;
+      // ...and the EFFECT, a third of a second later: a spin Jolt cancelled
+      // against the joints on the first step would set the numbers above and
+      // change nothing about the body. Rotation about +z tips the pelvis's up
+      // axis toward -x, so the two arms must straddle.
+      for (int i = 0; i < 12; i++) tickOnce();
+      BodyTransform xf{};
+      if (rootLimb >= 0 && phys.GetTransform(mobs.LimbBody(wid, rootLimb), xf)) {
+        const Quat q{xf.quat[0], xf.quat[1], xf.quat[2], xf.quat[3]};
+        upX[arm] = QuatRotate(q, Vec3{0, 1, 0}).x;
+      }
+    }
+    const bool spinOk =
+        knockedF[0] == 1 && knockedF[1] == 1 && spinZ[0] >= (float)minSpin &&
+        spinZ[1] <= -(float)minSpin &&
+        spinLen[0] <= rgt.blastMaxSpin + 1e-3f &&
+        spinLen[1] <= rgt.blastMaxSpin + 1e-3f && ratio[0] <= (float)maxRatio &&
+        ratio[1] <= (float)maxRatio && (upX[1] - upX[0]) >= (float)minTiltGap;
+    std::printf("  ragdoll blast spin: %s (ankle charge %.2f rad/s about z, "
+                "overhead %.2f, floor %.2f, cap %.1f; limb speed spread %.2fx / "
+                "%.2fx, ceiling %.1fx; pelvis up.x %.2f vs %.2f, gap %.2f needs "
+                "%.2f; knocked %d/%d)\n",
+                spinOk ? "PASS" : "FAIL", spinZ[0], spinZ[1], minSpin,
+                rgt.blastMaxSpin, ratio[0], ratio[1], maxRatio, upX[0], upX[1],
+                upX[1] - upX[0], minTiltGap, knockedF[0], knockedF[1]);
+    ok = ok && spinOk;
+  }
+
+  mobs.Reset();
+  debris.Reset();
+  SubmitWorldgen(ctx, world, sim, kDefaultSeed);
+  ctx.WaitIdle();
+  if (!ok) detail = "see the ragdoll lines above";
+  return ok ? Status::Pass : Status::Fail;
+}
+
+// ---- ragdoll-dress ---------------------------------------------------------
+//
+// A DRESSED BODY GOING LIMP STAYS ONE OBJECT.
+//
+// Owner report, 2026-09-13: "when the human mob is falling, and is wearing
+// clothes, when they go into the ragdoll state the clothes will decouple from
+// the body when moving at high speeds... all of the clothes separate from limbs
+// and it just becomes a crazy tangled mess ball of limbs and clothes that
+// aren't actually connected properly. Seems like when falling the limbs will be
+// moving at slightly different velocities/resistances/move to different noisily
+// placed locations on different frames."
+//
+// TWO MECHANISMS, BOTH ABOUT A RIG BEING TREATED AS N INDEPENDENT BODIES, and
+// this gate measures one number for each:
+//
+//   * A worn shell used to be a DYNAMIC body on a Fixed constraint to the limb
+//     it covers, geometrically inside it and an order of magnitude heavier or
+//     lighter. That is the textbook energy source for a sequential-impulse
+//     solver, and even when it behaves it LAGS under acceleration. It is now a
+//     kinematic follower with no constraint at all (MobLimb::wornHost,
+//     Mob::DriveWornShells), so its offset from its host is not solved for, it
+//     is derived — and therefore CONSTANT. That is what `shell drift` and
+//     `shell twist` assert, and constant is a far stronger claim than small.
+//
+//   * DebrisSystem::UntunnelBody clamped each body of the rig SEPARATELY
+//     against the collision patches, teleporting whichever ones had outrun the
+//     streaming back to their own last vouched sample while their neighbours
+//     kept travelling — a fresh multi-voxel violation at every joint, every
+//     tick of the starvation window, which the solver then closes by force.
+//     UntunnelRig clamps the rig on one common fraction of the step instead.
+//     `limb stretch` is what sees this: a joint held open by 30 voxels is not a
+//     pose, it is a tear.
+//
+// THE TWO ARMS ARE THE TWO REGIMES:
+//
+//   A. THE FALL. A dressed human made limp `fallLift` voxels up (as high as the
+//      residency window allows, capped at 200 ≈ 50 m) and dropped under Jolt's
+//      own gravity, so it arrives at ~30 m/s having covered ground no collision
+//      patch existed over. This is the arm that outruns the streaming, and the
+//      untunnel counters are reported beside it so a number that moves has its
+//      cause attached (CLAUDE.md rule 6) rather than needing a bisection.
+//   B. THE SLAM. The same rig limp on the spot and handed 30 m/s straight down.
+//      No streaming starvation, so it isolates the constraint: whatever drift
+//      shows here is the garment lagging its limb under pure acceleration and
+//      impact.
+//
+// WHY BOTH ARMS START LIMP RATHER THAN FALLING INTO IT. An NPC's kinematic fall
+// (MobSystem::UpdateFall) cannot get anywhere near these speeds and by design
+// never will: gravity WAITS on a column the CPU mirror has not delivered
+// (GroundSense::groundUnknown), and the mirror is 3x3x3 chunks, so a creature
+// with 50 m of air under it does not fall at all — it hovers. A long fall in the
+// game is therefore always the same two beats: a short kinematic drop while the
+// ground is still in probe range, then ragdoll.fallSeconds fires and JOLT owns
+// the rest of the descent. The second beat is the whole of what the report is
+// about and it is the only beat that reaches 30 m/s, so the fixture starts
+// there. A first version of this gate spawned the creature 200 voxels up and
+// waited for its air clock: 400 ticks, limp never fired, peak limb speed 0.0
+// m/s, and every number below it a clean zero measured on a body standing still
+// in the sky — a fixture measuring itself.
+//
+// Bounds are in tests/baseline.json, so retuning what counts as "attached" is a
+// JSON edit and not a rebuild. Measured with SANDVOX_NO_RIGWELD=1 (the A/B arm
+// that restores the old jointed-shell + per-body-clamp behaviour) the same
+// fixture is what says the thresholds mean anything at all.
+Status GateRagdollDress(Ctx& c, std::string& detail) {
+  GpuContext& ctx = c.ctx;
+  World& world = c.world;
+  Simulation& sim = c.sim;
+  DebrisSystem& debris = c.debris;
+  MobSystem& mobs = c.mobs;
+  Physics& phys = c.phys;
+
+  int wizDef = -1;
+  for (size_t i = 0; i < mobs.Defs().size(); i++)
+    if (mobs.Defs()[i].name == kAvatarDefName) wizDef = (int)i;
+  if (wizDef < 0) {
+    detail = "no avatar mob def to dress";
+    return Status::Fail;
+  }
+  const int baseLimbs = (int)mobs.Defs()[wizDef].limbs.size();
+
+  int relief = 0;
+  const IVec3 anchor = AiFixtureCentre(world);
+  const IVec3 spot = AiFlatSpot(anchor.x, anchor.z, 96, 16, kDefaultSeed, relief);
+  const int h = spot.y;
+  // HOW HIGH THE FALL MAY START: inside the residency window with the margin
+  // MobSystem::PreTick despawns past, never an absolute coordinate (the trap
+  // AiFixtureCentre exists for — an earlier gate leaves the window elsewhere).
+  const IVec3 wlo = world.WindowOrigin();
+  const float fallLift =
+      std::min(200.0f, std::max(0.0f, (float)(wlo.y + kWorldN - 24 - (h + 1))));
+
+  // One shell's rigid relationship to the limb it is strapped to, captured
+  // while the creature is intact and upright.
+  struct Strap {
+    int shell = -1, host = -1;
+    Vec3 relPos{};   // shell origin in the host's frame
+    Quat relRot{};   // shell rotation relative to the host's
+  };
+  // ...and one JOINT's, for the same reason. `anchorInParent` is the child's own
+  // joint anchor expressed in the PARENT's frame, which is precisely the point a
+  // ball or hinge constraint welds and therefore the one number that is
+  // invariant under any pose the rig can legally take. (The obvious measure —
+  // how far the two body origins sit apart — is not: a thigh pivoting about a
+  // held hip moves its own origin, and the first version of this gate duly
+  // reported 2.40 voxels of "stretch" on an upper arm that was simply rotating.)
+  struct Link {
+    int child = -1, parent = -1;
+    Vec3 anchorInParent{};
+  };
+
+  struct Arm {
+    int shells = 0, links = 0, ticks = 0;
+    float drift = 0.0f, twist = 0.0f, stretch = 0.0f;
+    float peakSpeed = 0.0f;   // fastest limb seen, m/s
+    int driftTick = -1;
+    std::string driftName, stretchName;
+    int limpAt = -1;
+    float lowest = 1.0e30f;
+    bool spawned = false;
+    uint32_t holds = 0, rigHolds = 0, released = 0;
+  };
+
+  auto run = [&](float liftVox, float hitVox, int ticks) -> Arm {
+    Arm a;
+    mobs.Reset();
+    debris.Reset();
+    SubmitWorldgen(ctx, world, sim, kDefaultSeed);
+    ctx.WaitIdle();
+    AiTicker ticker{c, 21000, {spot.x >> 4, spot.y >> 4, spot.z >> 4}};
+    const uint64_t id =
+        mobs.Spawn(wizDef, {spot.x, h + 1 + (int)liftVox, spot.z});
+    if (id == 0) return a;
+    Mob* mob = mobs.FindMobById(id);
+    if (mob == nullptr) return a;
+    a.spawned = true;
+    // DRESS IT IN EVERYTHING THE LIBRARY SHIPS, counted and never named — the
+    // same construction `corpse-armor` uses, and for the same reason: a tree
+    // with no armour content still runs this gate, it simply runs it on a naked
+    // body and the detail line says so.
+    for (const ItemDef& it : c.items.items) {
+      if (!ItemKindIsWorn(it.kind)) continue;
+      int home = -1;
+      for (int s = 0; s < kEquipSlotCount; s++)
+        if (EquipSlotAccepts(s, it.kind)) { home = s; break; }
+      if (home >= 0) mob->WearItem(&it, home);
+    }
+    // ONE TICK BEFORE THE REFERENCE IS TAKEN: WearItem places each shell itself,
+    // so the pair is already rigid, but a reference read off the placement would
+    // be measuring the placement. One full tick means the pose pipeline and
+    // PostStep have both run and the number below is what the ENGINE maintains.
+    ticker();
+    auto xfOf = [&](int limb, BodyTransform& out) {
+      const uint64_t b = mobs.LimbBody(id, limb);
+      return b != 0 && phys.GetTransform(b, out);
+    };
+    std::vector<Strap> straps;
+    for (int s = baseLimbs; s < mob->LimbCount(); s++) {
+      // By DEF PARENT NAME rather than through MobLimb::wornHost: the A/B arm
+      // (SANDVOX_NO_RIGWELD) does not set that field, and an arm that could not
+      // find the shells would report a clean zero for the behaviour it exists
+      // to demonstrate — a fixture measuring itself.
+      if (mob->LimbDefAt(s).tag != "worn") continue;
+      const std::string& parent = mob->LimbDefAt(s).parent;
+      int host = -1;
+      for (int p = 0; p < baseLimbs; p++)
+        if (mob->LimbDefAt(p).name == parent) { host = p; break; }
+      BodyTransform hs{}, ss{};
+      if (host < 0 || !xfOf(host, hs) || !xfOf(s, ss)) continue;
+      const Quat hq{hs.quat[0], hs.quat[1], hs.quat[2], hs.quat[3]};
+      const Quat sq{ss.quat[0], ss.quat[1], ss.quat[2], ss.quat[3]};
+      Strap st;
+      st.shell = s;
+      st.host = host;
+      st.relPos = QuatRotateInv(hq, ss.pos - hs.pos);
+      st.relRot = QuatMul(QuatConj(hq), sq);
+      straps.push_back(st);
+    }
+    std::vector<Link> links;
+    for (int i = 0; i < baseLimbs && i < mob->LimbCount(); i++) {
+      const std::string& parent = mob->LimbDefAt(i).parent;
+      if (parent.empty()) continue;
+      int pi = -1;
+      for (int p = 0; p < baseLimbs; p++)
+        if (mob->LimbDefAt(p).name == parent) { pi = p; break; }
+      BodyTransform pp{};
+      if (pi < 0 || mobs.LimbBody(id, i) == 0 || !xfOf(pi, pp)) continue;
+      const Quat pq{pp.quat[0], pp.quat[1], pp.quat[2], pp.quat[3]};
+      Link l;
+      l.child = i;
+      l.parent = pi;
+      l.anchorInParent =
+          QuatRotateInv(pq, mobs.LimbAnchorPos(id, i) - pp.pos);
+      links.push_back(l);
+    }
+    a.shells = (int)straps.size();
+    a.links = (int)links.size();
+    debris.ResetUntunnelProbe();
+    // Limp from here, with whatever head start this arm asked for. minSeconds is
+    // long enough to cover the whole descent: a get-up part-way down would put
+    // the rig back on the pose pipeline and end the measurement early.
+    mob->StartRagdoll(12.0f, "gate");
+    mob->SetLimbVelocities(Vec3{0.0f, -hitVox, 0.0f});
+    for (int t = 0; t < ticks; t++) {
+      ticker();
+      a.ticks = t + 1;
+      if (!mobs.IsAlive(id)) break;        // splatted on landing: measured to here
+      if (mobs.RagdollPhaseOf(id) == 1 && a.limpAt < 0) a.limpAt = t;
+      // Only while LIMP: the claim is about the phase Jolt owns. A kinematic rig
+      // is posed by the animation and its shells by DriveWornShells off the same
+      // transforms, which is the case every other mob gate already covers.
+      if (mobs.RagdollPhaseOf(id) != 1) continue;
+      for (const Strap& st : straps) {
+        BodyTransform hs{}, ss{};
+        if (!xfOf(st.host, hs) || !xfOf(st.shell, ss)) continue;
+        const Quat hq{hs.quat[0], hs.quat[1], hs.quat[2], hs.quat[3]};
+        const Quat sq{ss.quat[0], ss.quat[1], ss.quat[2], ss.quat[3]};
+        const float d = (QuatRotateInv(hq, ss.pos - hs.pos) - st.relPos).len();
+        const Quat rel = QuatMul(QuatConj(hq), sq);
+        const Quat err = QuatMul(QuatConj(st.relRot), rel);
+        const float twist =
+            2.0f * std::acos(std::min(1.0f, std::fabs(err.w))) * 57.29578f;
+        if (d > a.drift) {
+          a.drift = d;
+          a.driftTick = t;
+          a.driftName = mob->LimbDefAt(st.shell).name;
+        }
+        a.twist = std::max(a.twist, twist);
+      }
+      for (const Link& l : links) {
+        BodyTransform pp{};
+        if (mobs.LimbBody(id, l.child) == 0 || !xfOf(l.parent, pp)) continue;
+        const Quat pq{pp.quat[0], pp.quat[1], pp.quat[2], pp.quat[3]};
+        const float gap =
+            (QuatRotateInv(pq, mobs.LimbAnchorPos(id, l.child) - pp.pos) -
+             l.anchorInParent).len();
+        if (gap > a.stretch) {
+          a.stretch = gap;
+          a.stretchName = mob->LimbDefAt(l.child).name;
+        }
+      }
+      for (int i = 0; i < baseLimbs; i++) {
+        const uint64_t b = mobs.LimbBody(id, i);
+        Vec3 lin{}, ang{};
+        if (b && phys.GetBodyVelocities(b, lin, ang))
+          a.peakSpeed = std::max(a.peakSpeed, lin.len() * kVoxelMeters);
+      }
+      a.lowest = std::min(a.lowest, mobs.MobRootPos(id).y);
+    }
+    const DebrisSystem::UntunnelProbe& up = debris.Untunnel();
+    a.holds = up.holds;
+    a.rigHolds = up.rigHolds;
+    a.released = up.released;
+    return a;
+  };
+
+  const double maxDrift = BaselineNumber("ragdollDressMaxShellDriftVox", 0.05);
+  const double maxTwist = BaselineNumber("ragdollDressMaxShellTwistDeg", 0.5);
+  const double maxStretch = BaselineNumber("ragdollDressMaxLimbStretchVox", 2.0);
+
+  // 200 voxels under gravity is ~3.2 s = 195 ticks; 300 leaves room for the
+  // landing and for a shorter drop if the window is tight.
+  const Arm fall = run(fallLift, 0.0f, 300);
+  const Arm slam = run(0.0f, 30.0f / kVoxelMeters, 90);
+
+  bool ok = true;
+  auto judge = [&](const char* what, const Arm& a, bool needLimp) {
+    const bool armOk = a.spawned && (!needLimp || a.limpAt >= 0) &&
+                       a.drift <= (float)maxDrift &&
+                       a.twist <= (float)maxTwist &&
+                       a.stretch <= (float)maxStretch;
+    std::printf(
+        "  ragdoll dress %s: %s (%d shells on %d links, limp at tick %d, %d "
+        "ticks, peak limb %.1f m/s; shell drift %.3f vox (cap %.2f, worst "
+        "\"%s\" at tick %d), twist %.2f deg (cap %.2f), limb stretch %.2f vox "
+        "(cap %.2f, worst \"%s\"); untunnel %u body-holds / %u rig-holds / %u "
+        "released)\n",
+        what, armOk ? "PASS" : "FAIL", a.shells, a.links, a.limpAt, a.ticks,
+        a.peakSpeed, a.drift, maxDrift, a.driftName.c_str(), a.driftTick,
+        a.twist, maxTwist, a.stretch, maxStretch, a.stretchName.c_str(),
+        a.holds, a.rigHolds, a.released);
+    ok = ok && armOk;
+  };
+  judge("fall", fall, /*needLimp=*/true);
+  judge("slam", slam, /*needLimp=*/true);
+
+  // A NAKED SUBJECT IS NOT A PASS. Every number above is a maximum over the
+  // shells, so with no worn content in the tree they are all zero and the gate
+  // would be green having measured nothing. `armor-wear` is what asserts the
+  // content exists; this says out loud that it did not find any.
+  if (fall.shells == 0 && slam.shells == 0) {
+    detail = "no worn item in the library fits " + std::string(kAvatarDefName) +
+             ": nothing was measured";
+    mobs.Reset();
+    debris.Reset();
+    SubmitWorldgen(ctx, world, sim, kDefaultSeed);
+    ctx.WaitIdle();
+    return Status::Skip;
+  }
+
+  detail = Format(
+      "fall %.0f vox: %d shells, drift %.3f / twist %.2f deg / stretch %.2f "
+      "vox at up to %.0f m/s (%u rig-holds); slam 30 m/s: drift %.3f / twist "
+      "%.2f / stretch %.2f; caps %.2f / %.2f / %.2f; fixture (%d,%d,%d) relief %d",
+      fallLift, fall.shells, fall.drift, fall.twist, fall.stretch,
+      fall.peakSpeed, fall.rigHolds, slam.drift, slam.twist, slam.stretch,
+      maxDrift, maxTwist, maxStretch, spot.x, h, spot.z, relief);
+  mobs.Reset();
+  debris.Reset();
+  SubmitWorldgen(ctx, world, sim, kDefaultSeed);
+  ctx.WaitIdle();
+  std::printf("ragdoll dress: %s\n", ok ? "PASS" : "FAIL");
+  return ok ? Status::Pass : Status::Fail;
+}
+
+// ---- ragdoll-falldamage -------------------------------------------------
+//
+// A LIMP BODY STILL HITS THE GROUND — AND A LIMP BODY IN FLIGHT DOES NOT.
+//
+// Three arms over one fixture, and the SET is the claim. Impact damage is
+// billed off Player::impactDeltaV, which is velocity the CONTROLLER'S SWEEP
+// refused; a ragdoll has no controller (main.cpp teleports the capsule onto the
+// pelvis with its velocity zeroed every tick), so the sweep never refuses
+// anything and a limp landing used to be free. That made a long fall SAFER than
+// a short one: fall 2.9 s and the sweep splatters you, fall 3.1 s and
+// ragdoll.fallSeconds flips you limp first and you land for nothing.
+// Mob::TakeRagdollImpact is the same measurement taken off the solver instead.
+//
+// The other two arms are the ones that stop the fix being worse than the bug.
+// The signal is a velocity DIFFERENCE, and two things change a limp body's
+// velocity without anything hitting it: gravity, every tick, forever; and a
+// blast, which SETS it outright. Either read as an impact would kill the player
+// for being in the air. Deceleration-only + peak-hold + the reseed on
+// SetLimbVelocities are what prevent it, and arms (b) and (c) are what say so.
+//
+// A gate, not a `ragdoll` arm: that gate's arms inherit each other's tick phase
+// and two of them are knife-edge on it.
+Status GateRagdollFallDamage(Ctx& c, std::string& detail) {
+  GpuContext& ctx = c.ctx;
+  World& world = c.world;
+  Simulation& sim = c.sim;
+  DebrisSystem& debris = c.debris;
+  MobSystem& mobs = c.mobs;
+  Physics& phys = c.phys;
+  const auto& pt = CurrentTuning().player;
+
+  int relief = 0;
+  const IVec3 anchor = AiFixtureCentre(world);
+  const IVec3 spot = AiFlatSpot(anchor.x, anchor.z, 96, 16, kDefaultSeed, relief);
+  const int h = spot.y;
+  const IVec3 pchunk{spot.x >> 4, spot.y >> 4, spot.z >> 4};
+
+  // One run of the fixture: spawn the avatar `liftVox` above the flat spot,
+  // settle it, flip it limp, hand the whole rig `hitVox` of downward velocity
+  // and tick. Returns the health it lost and whether it survived.
+  struct Run {
+    int32_t before = 0, after = 0;
+    bool alive = false, landed = false;
+    float lowest = 0.0f;
+  };
+  auto run = [&](float liftVox, float hitVox, int ticks) {
+    mobs.Reset();
+    debris.Reset();
+    SubmitWorldgen(ctx, world, sim, kDefaultSeed);
+    ctx.WaitIdle();
+    uint32_t tick = 12000;
+    PlayerAvatar avatar;
+    avatar.Init(&phys, &world, &debris, c.mats, &mobs);
+    avatar.SetDefs(&mobs.Defs(), kAvatarDefName);
+    Player pl;
+    pl.fly = false;
+    pl.grounded = true;
+    pl.pos = Vec3{(float)spot.x + 0.5f, (float)(h + 2) + Player::kHalfY + liftVox,
+                  (float)spot.z + 0.5f};
+    Run r;
+    if (!avatar.Spawn(pl, 0.0f)) return r;
+    const uint64_t proxy = phys.CreatePlayerBody(Player::kHalfXZ, Player::kHalfY);
+    auto avTick = [&]() {
+      std::vector<BrushOp> ops;
+      std::vector<ParticleSpawn> spawns;
+      std::vector<CellOp> cellOps;
+      phys.MovePlayerBody(proxy, pl.pos, kTickDt);
+      avatar.PreTick(tick + 1, pl, 0.0f, kTickDt, world, ops, cellOps, spawns);
+      debris.QueueSupportEvents(world.Snap());
+      debris.PreTick(tick + 1, world, cellOps, spawns);
+      ++tick;
+      SubmitTick(ctx, world, sim, tick, kDefaultSeed, ops, {}, cellOps, false,
+                 pchunk, true, true, spawns);
+      ctx.WaitIdle();
+      ctx.ProcessEvents();
+      phys.Step(kTickDt);
+      debris.PostStep();
+      avatar.PostStep();
+      Vec3 follow;
+      if (avatar.RagdollFollow(follow)) pl.pos = follow;
+    };
+    // Standing still long enough for the feet to plant and, at lift > 0, for
+    // the collision patches around the body to exist: an arm about what a
+    // LANDING costs must not be measuring a streaming stutter.
+    for (int i = 0; i < 40; i++) avTick();
+    r.before = avatar.TotalHealth();
+    avatar.StartRagdoll(2.0f, "gate");
+    avatar.SetLimbVelocities(Vec3{0, -hitVox, 0});
+    r.lowest = 1e30f;
+    for (int i = 0; i < ticks && avatar.IsAlive(); i++) {
+      avTick();
+      r.lowest = std::min(r.lowest, avatar.RootWorldPos().y);
+    }
+    r.after = avatar.TotalHealth();
+    r.alive = avatar.IsAlive();
+    // The body is ON the ground, not through it. Generous: the pelvis sits
+    // about a metre up a standing rig and this is about tunnelling, not pose.
+    r.landed = r.lowest > (float)h - 8.0f;
+    avatar.Despawn();
+    phys.RemoveBody(proxy);
+    return r;
+  };
+
+  // (a) A SUB-LETHAL LANDING COSTS HEALTH. 15 m/s is comfortably over
+  //     fallDamageSpeed (8) and under fallSplatSpeed (25), so the assertion is
+  //     "hurt, not killed" — a threshold that moved either way would show.
+  const float subVox = 15.0f / kVoxelMeters;
+  const Run sub = run(0.0f, subVox, 40);
+  const bool subOk = sub.before > 0 && sub.after < sub.before && sub.alive &&
+                     sub.landed;
+  std::printf("  ragdoll fall damage: %s (limp landing at 15.0 m/s cost %d of "
+              "%d hp, alive %d, pelvis never below y=%.1f vs ground %d)\n",
+              subOk ? "PASS" : "FAIL", sub.before - sub.after, sub.before,
+              (int)sub.alive, sub.lowest, h);
+
+  // (b) A LETHAL ONE KILLS. Above fallSplatSpeed, which is the branch that
+  //     carves the body apart rather than spending health.
+  const float lethalVox = (pt.fallSplatSpeed + 8.0f) / kVoxelMeters;
+  const Run lethal = run(0.0f, lethalVox, 40);
+  const bool lethalOk = !lethal.alive && lethal.landed;
+  std::printf("  ragdoll splat: %s (limp landing at %.1f m/s vs splat speed "
+              "%.1f: alive %d, pelvis never below y=%.1f vs ground %d)\n",
+              lethalOk ? "PASS" : "FAIL", lethalVox * kVoxelMeters,
+              pt.fallSplatSpeed, (int)lethal.alive, lethal.lowest, h);
+
+  // (c) FLIGHT IS FREE. The same lethal velocity, but aimed UP from 24 voxels
+  //     off the ground and sampled only while the body is still rising: no
+  //     contact, so gravity is the only thing changing the velocity and the
+  //     arrest must read nothing. This is the arm that fails if the
+  //     deceleration test, the peak-hold or the SetLimbVelocities reseed goes.
+  //     12 ticks is 0.4 s — the body is still above where it started.
+  const Run flight = run(24.0f, -lethalVox, 12);
+  const bool flightOk = flight.before > 0 && flight.after == flight.before &&
+                        flight.alive;
+  std::printf("  ragdoll flight free: %s (launched UP at %.1f m/s, 12 ticks "
+              "with nothing touched: %d of %d hp left, alive %d)\n",
+              flightOk ? "PASS" : "FAIL", lethalVox * kVoxelMeters,
+              flight.after, flight.before, (int)flight.alive);
+
+  const bool ok = subOk && lethalOk && flightOk;
+  detail = Format(
+      "sub-lethal 15 m/s: -%d of %d hp alive %d; splat %.0f m/s: alive %d; "
+      "0.4 s of upward flight at %.0f m/s: -%d hp; fixture (%d,%d,%d) relief %d",
+      sub.before - sub.after, sub.before, (int)sub.alive,
+      lethalVox * kVoxelMeters, (int)lethal.alive, lethalVox * kVoxelMeters,
+      flight.before - flight.after, spot.x, h, spot.z, relief);
+  mobs.Reset();
+  debris.Reset();
+  SubmitWorldgen(ctx, world, sim, kDefaultSeed);
+  ctx.WaitIdle();
+  std::printf("ragdoll falldamage: %s\n", ok ? "PASS" : "FAIL");
   return ok ? Status::Pass : Status::Fail;
 }
 
@@ -4735,6 +6438,21 @@ const std::vector<Gate>& MobGates() {
       {"ai-dummy", "mob", {}, false, GateAiDummy, /*needsRender=*/false},
       {"ai-face", "mob", {}, false, GateAiFace, /*needsRender=*/false},
       {"ai-approach", "mob", {}, false, GateAiApproach, /*needsRender=*/false},
+      // The sloped-terrain regime the three above never touch: a real ramp,
+      // asserting the body stays ON it (never inside it) and does not lean
+      // like furniture while climbing.
+      {"ai-slope", "mob", {}, false, GateAiSlope, /*needsRender=*/false},
+      // Live ragdoll: blast knockdown, get-up, NPC gravity. Counts only.
+      {"ragdoll", "mob", {}, false, GateRagdoll, /*needsRender=*/false},
+      // ...and what a limp landing COSTS. Its own gate rather than another
+      // `ragdoll` arm: that gate's arms inherit each other's tick phase.
+      {"ragdoll-falldamage", "mob", {}, false, GateRagdollFallDamage,
+       /*needsRender=*/false},
+      // ...and whether the thing that landed is still ONE body. Dressed, limp,
+      // 50 m of fall: the clothes may not leave the limbs and the joints may not
+      // be torn open by the anti-tunnel clamp.
+      {"ragdoll-dress", "mob", {}, false, GateRagdollDress,
+       /*needsRender=*/false},
   };
   return g;
 }

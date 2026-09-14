@@ -68,8 +68,8 @@
       "id": "spawn",
       "kind": "spawn",
       "at": [
-        -3879,
-        2522
+        27439,
+        8063
       ],
       "about": "Where the game starts, and the centre of the calm home area (worldgen.spawnPlain*). Outside the harness pad by more than the widest crown reach (115 vox past x/z 640), on forced forest, on land: the spawn-site gate checks all of that."
     },
@@ -88,13 +88,13 @@
       "kind": "landform",
       "shape": "ridge",
       "at": [
-        45000,
-        0
+        24791,
+        10808
       ],
       "radius": 8000,
       "heightVox": 600,
-      "rotation": 90,
-      "about": "The mountain to the east (P-G): a ridge overlaid onto the landform plane at load, the same on every seed. radius is the crest's half-length in voxels (its width is a third of that), heightVox how far the plane is lifted at the crest, rotation the crest's heading in degrees."
+      "about": "The mountain to the east (P-G): a ridge overlaid onto the landform plane at load, the same on every seed. radius is the crest's half-length in voxels (its width is a third of that), heightVox how far the plane is lifted at the crest, rotation the crest's heading in degrees.",
+      "rotation": 0
     }
   ],
   "rules": []

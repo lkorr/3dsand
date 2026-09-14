@@ -27,6 +27,7 @@
     "skin": "sand",
     "skinDepth": 4,
     "subsoil": "sand",
+    "firmSkin": "sandstone",
     "patch": {
       "threshold": 128,
       "cellLog2": 5

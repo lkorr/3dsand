@@ -33,6 +33,11 @@ const std::vector<Gate>& EnvTruthGates();
 const std::vector<Gate>& ScaleGates();
 const std::vector<Gate>& SimGates();
 const std::vector<Gate>& CaGates();
+// The two gas-particle gates (docs/PLAN_gas_particles.md §4). Their own TU
+// because they are their own domain — the window edge as a SINK — and because
+// both build a 50k-op mutation fixture that has nothing to do with the CA
+// gates' chambers.
+const std::vector<Gate>& GasGates();
 const std::vector<Gate>& WindGates();
 const std::vector<Gate>& WaterGates();
 const std::vector<Gate>& RenderGates();
@@ -159,23 +164,37 @@ const char* const kOrder[] = {
     // arms - which makes it a poor neighbour for anything that wanted the
     // world left alone. It restores pristine worldgen on the way out.
     "current",
-    "determinism", "sleep",       "ca-skip",     "ca-slope",
+    "determinism", "sleep",       "ca-skip",
+    // Per-material angle of repose. It runs its own worldgen per arm, builds a
+    // sealed stone room and pours into it, and it PATCHES ONE MATERIAL'S GPU
+    // TABLE ENTRY for each arm — restoring the authored table before it
+    // returns, which is why it sits with the other self-contained CA gates and
+    // not next to anything that reads a material by hand.
+    "repose",      "ca-slope",
     "ca-slope-hybrid", "ca-level-one", "ca-level", "ca-level-pond",
+    // Right after the other liquid-shape gates: same fixture neighbourhood,
+    // same dim-dawn pinning, and it is the negative of `ca-slope` — the
+    // 2-wide geometry the thin-film riser step CANNOT resolve, asserted to go
+    // to sleep rather than to drain.
+    "ca-gutter",
     "evaporation", "wind",      "wind-gas",   "wind-prim",
     "blood-stain", "flung-liquid", "fluid-det",     "fluid-settle",
-    "fluid-excite", "fluid-onwater", "fluid-stain", "fluid-react", "far-fog",  "far-downsample",
+    "fluid-excite", "fluid-onwater", "debris-float", "fluid-stain", "fluid-react", "far-fog",  "far-downsample",
     "far-persist",
     // `shadow-cache` recompiles raymarch.wgsl three times (its three arms are
     // const-folded, so they do not exist without a reload) and restores the
     // baseline tuning before returning. It leaves no world state behind, so
     // it sits with the other rendering gates rather than at either end.
-    "screenshots", "fire-depth", "shadow-cache", "openness", "gi-bounce", "gi-nightfall", "glow", "plants",
+    "screenshots", "fire-depth", "shadow-cache", "openness", "gi-bounce", "gi-nightfall", "cave-time", "glow", "plants",
     // `taa` runs its own worldgen and leaves no world state behind — it only
     // draws the same view four ways and compares the images. It sits AFTER
     // `shadow-cache` because that gate reloads the shaders three times and
     // restores the baseline tuning; running before it would put a shader
     // rebuild in the middle of a 16-frame accumulation.
     "taa",
+    // `denoise` is the same shape as `taa` (own worldgen, draws one view two
+    // ways, leaves nothing behind) and sits beside it for the same reason.
+    "denoise",
     // With the other render gates: `body-shade` runs its own worldgen and is
     // the one gate that draws a RIGIDBODY. It writes the body instance buffer
     // directly (like `fire-depth`) rather than going through the DebrisSystem,
@@ -184,6 +203,7 @@ const char* const kOrder[] = {
     // assert over BodyCount().
     "body-shade",
     "player-walk", "player-waterjump", "player-ledgegrab", "player-crouch",
+    "player-fastfall",
     "player-plants", "debris",
     "audio-impact", "audio-mob-voice", "audio-ambience",
     // "mob" restored to its original slot (it sat between prefab and
@@ -196,11 +216,16 @@ const char* const kOrder[] = {
     // terrain and carves a shell, which wants the same standing world the
     // body gates run in; before `ragdoll-joints` because it leaves the rig
     // undressed and MobSystem reset, which is what that gate expects to find.
-    "armor-wear", "item-ground", "armor-fit",
+    "armor-wear", "item-ground", "loot", "armor-fit",
     // Pure anim over its own five-part fixture — it touches no shared World and
     // so is order-independent; it sits here to keep the armour gates together.
     "armor-track", "armor-stock",
     "ragdoll-joints",
+    // Beside `ragdoll-joints` and for the same reason: both are pure Jolt over
+    // their own fixture, 640 voxels from anything, and both remove every body
+    // and patch they make. Neither reads the shared World, so the slot is free
+    // — but it has to be AFTER the gates that assert over BodyCount().
+    "body-fastfall",
     "save-load",   "save-entities", "region-store", "streaming",     "spells",
     "page-roundtrip", "daylight-boundary",
     // Support-loss flagging from the MUTATION path. Cheap and
@@ -223,6 +248,21 @@ const char* const kOrder[] = {
     // 900 ticks, and it regenerates the world on the way out so the gates
     // after it still find pristine terrain (rule 7).
     "fire-down",
+    // ---- THE WINDOW EDGE AS A SINK (docs/PLAN_gas_particles.md §4) --------
+    // Straight after `fire-down`, and for exactly the reasons the three gates
+    // above it give. Both of these light no fire, but they do the same KIND of
+    // damage to the shared world: a 55k-cell air shaft and a 4,096-voxel smoke
+    // puff at absolute coordinates, 800 ticks of CA, and a wind field turned up
+    // to 20 m/s and put back. Each regenerates worldgen on the way out, so the
+    // gates after them still find pristine terrain (CLAUDE.md rule 7), and
+    // neither declares a dependency — both build their own world, so neither
+    // can be silently SKIPPED behind a known-failing gate.
+    //
+    // They sit here rather than beside `sleep` because the property they assert
+    // is about smoke leaving the CEILING, which is the same subject as the fire
+    // gates and the same class of perturbation; `sleep` wants a world nobody
+    // has thrown 4,096 gas voxels into.
+    "gas-leave", "gas-reenter",
     // The swing's OTHER half. `swing` up top is MeleeState alone and costs
     // milliseconds; this one stands an avatar on real terrain with the blade
     // drawn, spawns a dummy to cut, and measures the sword's world trajectory
@@ -245,6 +285,24 @@ const char* const kOrder[] = {
     // its group, so it inherits state instead of changing what everything
     // after it inherits.
     "ai-dummy", "ai-face", "ai-approach",
+    // ...and the same group's sloped-terrain half, appended last in it for the
+    // reason above: `ai-slope` writes a real stone ramp and regenerates on the
+    // way out, exactly as `ai-approach` does with its wall.
+    "ai-slope",
+    // Live ragdoll: a blast knocks a creature flying and it gets back up; a
+    // long fall does the same. Appended last in the group for the reason
+    // above; it restores the world on its way out.
+    "ragdoll",
+    // Right after it: same fixture shape, and it resets mobs + debris and
+    // regenerates the world on both the way in and the way out, so it is
+    // order-independent past that.
+    "ragdoll-falldamage",
+    // ...and the dressed one, last in the group for the reason the AI gates
+    // give. Same self-contained shape again — resets mobs + debris and
+    // regenerates worldgen on the way in and the way out — but it also WEARS
+    // every item in the library, and a gate that equips things perturbs the
+    // id-keyed draws of anything after it, so it goes after the two that do not.
+    "ragdoll-dress",
     // ---- THE WOUND MODEL ---------------------------------------------------
     // LAST of the mob gates, and the position is a lesson rather than a
     // preference.
@@ -292,11 +350,31 @@ const char* const kOrder[] = {
     // ...and the corpse stays in one piece when the stroke keeps going
     // through it (same report, the half one-hit could not see; CPU only).
     "corpse-intact",
+    // Right after it, and for the same reason it exists: `corpse-armor` is
+    // `corpse-intact` with a wardrobe on and the head off first. It needs the
+    // same pristine ground and leaves the same nothing behind.
+    "corpse-armor",
     // ...and every piece of it bleeds from its own end of the cut, the soak
     // lands on what is exposed, and bone stays bone (owner report 2026-09-02).
     // Ticks the world (the corpse needs ground to lie on) and regenerates it
     // on the way out, like wound-bleed.
     "corpse-bleed",
+    // ...and blood is SEEN on a body: a cut bloodies what it exposes (bone
+    // included), a burst lands on the creature in its way, a pool rubs off
+    // on contact and water rinses it (owner report 2026-09-13). Ticks the
+    // world for the last two and regenerates it on the way out.
+    "body-stain",
+    // ...and what landed there is a SUBSTANCE, not a colour: the per-limb coat
+    // ledger names the material, it dries at that material's own authored rate
+    // (and does not at the default one), and a coat can be tracked back onto
+    // the ground through the ordinary particle path. Same room fixture as
+    // body-stain, same world regeneration on the way out.
+    "body-coat",
+    // ...and a blast bloodies the HOLE IT MADE and nothing else: a limb the
+    // crater took no voxel from stays clean, and the limb it did hit gets a
+    // chip's worth of blood rather than a repainted surface (owner report
+    // 2026-09-13, the second half of the same one body-stain answers).
+    "blast-stain",
     // ...and a corpse that died alight keeps burning: every piece advances
     // its embers, keeps emitting fire, and its brick agrees with its lattice
     // (owner report 2026-09-02: the corpse pulsed at its death colour for
@@ -328,6 +406,9 @@ const char* const kOrder[] = {
     // it burns a fixture, advances the tick stream hard, and regenerates
     // worldgen on the way out.
     "tree-fell",
+    // A saguaro-sized fixture that fits every cap tree-fell crosses: if THIS
+    // stays standing the handoff chain itself is at fault, not a limit.
+    "cactus-fell",
     // LAST of the world-touching gates, and it must be: BuildVoxRegion moves
     // the residency window and resets the page table, which is the state every
     // other gate's fixture placement assumes. It restores both before it
@@ -341,7 +422,7 @@ const std::vector<Gate>& Registry() {
   static std::vector<Gate> all = [] {
     std::vector<Gate> pool;
     for (const auto* g : {&TerrainGates(), &TreeGates(), &BiomeGates(), &EnvTruthGates(), &ScaleGates(),
-                          &SimGates(), &CaGates(), &WindGates(), &WaterGates(),
+                          &SimGates(), &CaGates(), &GasGates(), &WindGates(), &WaterGates(),
                           &RenderGates(),
                           &PlayerGates(),
                           &MobGates(), &BodyGates(), &FloaterGates(),
@@ -750,6 +831,17 @@ int Run(Ctx& c, const Options& opt) {
   }
   auto known = LoadBaseline(bpath);
 
+  // UNBUFFERED STDOUT FOR THE REST OF THE RUN, and it is a diagnostic decision
+  // rather than a style one. A redirected stdout is FULLY buffered under MSVC
+  // (4 KiB, and _IOLBF is treated as _IOFBF on Windows), so a gate that dies
+  // hard takes the last four kilobytes of the log with it — the log then ends
+  // at the engine's startup banner whatever gate actually crashed, which makes
+  // the one question worth asking ("where did it die") unanswerable from the
+  // artefact. Measured: a W1 crash inside `waterbody` produced a 14-line log
+  // whose last line was "physics, debris, mobs, far-field init", and the full
+  // suite's log ended mid-word inside the PREVIOUS gate's output. The cost is
+  // a write syscall per printf in a harness that spends its time on the GPU.
+  std::setvbuf(stdout, nullptr, _IONBF, 0);
   std::printf("=== selftest === (%zu gate%s, backend vulkan)\n", plan.size(),
               plan.size() == 1 ? "" : "s");
 
@@ -885,7 +977,7 @@ int Run(Ctx& c, const Options& opt) {
     static const char* const kKernelName[] = {
         "?", "sim_step", "sim_mutate", "sim_explode", "sim_particle",
         "sim_occupancy", "sim_pick", "sim_fluid_seam", "sim_waterbody",
-        "worldgen:main", "worldgen:list", "worldgen:pagefill"};
+        "worldgen:main", "worldgen:list", "worldgen:pagefill", "sim_gas"};
     auto kname = [&](uint32_t idPlus1) {
       const uint32_t id = idPlus1 - 1;
       return id < (uint32_t)(sizeof kKernelName / sizeof *kKernelName)

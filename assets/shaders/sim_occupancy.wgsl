@@ -6,7 +6,7 @@
 // The hash is a wrapping sum of per-cell hashes: commutative, so the atomic
 // accumulation order cannot affect the result — deterministic by construction.
 //
-// Dispatch: (NUM_CHUNKS, 1, 1) workgroups; each workgroup reduces one chunk.
+// Dispatch: (NUM_SLOTS, 1, 1) workgroups; each workgroup reduces one chunk.
 
 @group(0) @binding(0) var<storage, read_write> voxels    : array<u32>;
 @group(0) @binding(3) var<storage, read>       materials : array<Material>;

@@ -165,5 +165,6 @@ void GpuContext::Present() {
 void GpuContext::ProcessEvents() { device.ProcessEvents(); }
 
 bool GpuContext::WaitOldestPendingMap() { return device.WaitOldestPendingMap(); }
+int GpuContext::PendingMapCount() const { return device.PendingMapCount(); }
 
 void GpuContext::WaitIdle() { device.WaitIdle(); }

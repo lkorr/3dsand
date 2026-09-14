@@ -231,6 +231,9 @@ bool SetSimField(Tuning& t, const std::string& name, float value) {
   static const IntEntry iFields[] = {
     {"partGravity", &Tuning::Sim::partGravity},
     {"partMaxVel", &Tuning::Sim::partMaxVel},
+    {"partBuoyMax", &Tuning::Sim::partBuoyMax},
+    {"partSettleSpeed", &Tuning::Sim::partSettleSpeed},
+    {"partFloatPatience", &Tuning::Sim::partFloatPatience},
     {"airDensity", &Tuning::Sim::airDensity},
     {"falloffPerCell", &Tuning::Sim::falloffPerCell},
     {"ejectSolid", &Tuning::Sim::ejectSolid},
@@ -250,6 +253,10 @@ bool SetSimField(Tuning& t, const std::string& name, float value) {
     {"fluidExcitePerch", &Tuning::Sim::fluidExcitePerch},
     {"fluidExciteStep", &Tuning::Sim::fluidExciteStep},
     {"fluidSettleTicks", &Tuning::Sim::fluidSettleTicks},
+    {"fluidSubmergedSolid", &Tuning::Sim::fluidSubmergedSolid},
+    {"fluidStuckTicks", &Tuning::Sim::fluidStuckTicks},
+    {"fluidForceBlocks", &Tuning::Sim::fluidForceBlocks},
+    {"fluidForceReach", &Tuning::Sim::fluidForceReach},
     {"fluidSplashScaleIdx", &Tuning::Sim::fluidSplashScaleIdx},
     {"fluidFoamScaleIdx", &Tuning::Sim::fluidFoamScaleIdx},
     {"waterBodyMode", &Tuning::Sim::waterBodyMode},
@@ -266,6 +273,7 @@ bool SetSimField(Tuning& t, const std::string& name, float value) {
     {"waterRelevelGain", &Tuning::Sim::waterRelevelGain},
     {"waterRelevelDepth", &Tuning::Sim::waterRelevelDepth},
     {"windMode", &Tuning::Sim::windMode},
+    {"gasMode", &Tuning::Sim::gasMode},
     {"currentMode", &Tuning::Sim::currentMode},
     {"currentVortexRadius", &Tuning::Sim::currentVortexRadius},
     {"currentStreamMinSlope", &Tuning::Sim::currentStreamMinSlope},
@@ -546,6 +554,17 @@ bool LoadTuning(const std::string& path, Tuning& out) {
     ReadF(*g, "fallFlailRamp", a.fallFlailRamp, out, at);
     a.fallFlailRamp = std::max(a.fallFlailRamp, 0.0f);
     ReadF(*g, "fallMinDrop", a.fallMinDrop, out, at);
+    ReadB(*g, "airPose", a.airPose, out, at);
+    ReadF(*g, "airPoseRiseSpeed", a.airPoseRiseSpeed, out, at);
+    // Floored rather than clamped to a range: these are DIVISORS of vel.y, so a
+    // zero would make the pose phase infinite on the first airborne tick.
+    a.airPoseRiseSpeed = std::max(a.airPoseRiseSpeed, 0.1f);
+    ReadF(*g, "airPoseFallSpeed", a.airPoseFallSpeed, out, at);
+    a.airPoseFallSpeed = std::max(a.airPoseFallSpeed, 0.1f);
+    ReadF(*g, "airPoseLandHeight", a.airPoseLandHeight, out, at);
+    a.airPoseLandHeight = std::max(a.airPoseLandHeight, 0.0f);
+    ReadF(*g, "airPoseLean", a.airPoseLean, out, at);
+    a.airPoseLean = std::clamp(a.airPoseLean, 0.0f, 60.0f);
     ReadB(*g, "firstPersonArms", a.firstPersonArms, out, at);
     ReadF(*g, "footTrim", a.footTrim, out, at);
     ReadF(*g, "severImpulse", a.severImpulse, out, at);
@@ -638,10 +657,13 @@ bool LoadTuning(const std::string& path, Tuning& out) {
     ReadF(*g, "debrisRestitution", p.debrisRestitution, out, at);
     ReadF(*g, "debrisLinearDamping", p.debrisLinearDamping, out, at);
     ReadF(*g, "debrisAngularDamping", p.debrisAngularDamping, out, at);
+    ReadF(*g, "waterLinearDrag", p.waterLinearDrag, out, at);
+    ReadF(*g, "waterAngularDrag", p.waterAngularDrag, out, at);
     ReadF(*g, "terrainFriction", p.terrainFriction, out, at);
     ReadF(*g, "playerProxyFriction", p.playerProxyFriction, out, at);
     ReadF(*g, "explosionImpulseScale", p.explosionImpulseScale, out, at);
     ReadF(*g, "explosionImpulseRadiusScale", p.explosionImpulseRadiusScale, out, at);
+    ReadF(*g, "explosionMaxSpeed", p.explosionMaxSpeed, out, at);
     ReadF(*g, "explosionBodyDamageScale", p.explosionBodyDamageScale, out, at);
     ReadF(*g, "playerMassKg", p.playerMassKg, out, at);
     ReadF(*g, "sphereFriction", p.sphereFriction, out, at);
@@ -666,6 +688,31 @@ bool LoadTuning(const std::string& path, Tuning& out) {
     if (d.minBodyVoxels < 1) {
       out.warnings.push_back("debris.minBodyVoxels < 1; clamped to 1");
       d.minBodyVoxels = 1;
+    }
+  }
+  if (const json* g = Find(j, "ragdoll")) {
+    auto& r = out.ragdoll;
+    const std::string at = "ragdoll";
+    ReadF(*g, "fallSeconds", r.fallSeconds, out, at);
+    ReadF(*g, "blastRadiusScale", r.blastRadiusScale, out, at);
+    ReadF(*g, "blastImpulseScale", r.blastImpulseScale, out, at);
+    ReadF(*g, "blastMinSpeed", r.blastMinSpeed, out, at);
+    ReadF(*g, "maxLaunchSpeed", r.maxLaunchSpeed, out, at);
+    ReadF(*g, "blastUpBias", r.blastUpBias, out, at);
+    ReadF(*g, "blastLimbBias", r.blastLimbBias, out, at);
+    ReadF(*g, "blastSpinGain", r.blastSpinGain, out, at);
+    ReadF(*g, "blastMaxSpin", r.blastMaxSpin, out, at);
+    ReadF(*g, "minSeconds", r.minSeconds, out, at);
+    ReadF(*g, "settleSpeed", r.settleSpeed, out, at);
+    ReadF(*g, "settleSeconds", r.settleSeconds, out, at);
+    ReadF(*g, "maxSeconds", r.maxSeconds, out, at);
+    ReadF(*g, "getUpSeconds", r.getUpSeconds, out, at);
+    ReadF(*g, "getUpPitchDeg", r.getUpPitchDeg, out, at);
+    ReadF(*g, "getUpDropFrac", r.getUpDropFrac, out, at);
+    ReadF(*g, "devSeconds", r.devSeconds, out, at);
+    if (r.getUpSeconds < 0.1f) {
+      out.warnings.push_back("ragdoll.getUpSeconds < 0.1; clamped to 0.1");
+      r.getUpSeconds = 0.1f;
     }
   }
 
@@ -738,6 +785,21 @@ bool LoadTuning(const std::string& path, Tuning& out) {
     ReadF(*g, "woundStainRadius", e.woundStainRadius, out, at);
     ReadF(*g, "woundStainSurface", e.woundStainSurface, out, at);
     ReadF(*g, "woundStainDensity", e.woundStainDensity, out, at);
+    ReadF(*g, "woundStainBlob", e.woundStainBlob, out, at);
+    ReadF(*g, "woundStainCoherence", e.woundStainCoherence, out, at);
+    ReadF(*g, "craterStainRim", e.craterStainRim, out, at);
+    ReadF(*g, "stainCutRadius", e.stainCutRadius, out, at);
+    ReadI(*g, "stainCutAmount", e.stainCutAmount, out, at);
+    ReadI(*g, "stainCutBuried", e.stainCutBuried, out, at);
+    ReadF(*g, "stainCutBuriedChance", e.stainCutBuriedChance, out, at);
+    ReadI(*g, "stainBoneMin", e.stainBoneMin, out, at);
+    ReadF(*g, "stainContactScale", e.stainContactScale, out, at);
+    ReadF(*g, "stainFloorTransfer", e.stainFloorTransfer, out, at);
+    ReadI(*g, "stainWashPerContact", e.stainWashPerContact, out, at);
+    ReadF(*g, "splatterReach", e.splatterReach, out, at);
+    ReadI(*g, "splatterAmount", e.splatterAmount, out, at);
+    ReadI(*g, "splatterPerLimb", e.splatterPerLimb, out, at);
+    ReadF(*g, "splatterSplatRadius", e.splatterSplatRadius, out, at);
     ReadF(*g, "woundSeverFraction", e.woundSeverFraction, out, at);
     ReadF(*g, "woundNeckRadius", e.woundNeckRadius, out, at);
     ReadF(*g, "woundNeckFraction", e.woundNeckFraction, out, at);
@@ -771,6 +833,21 @@ bool LoadTuning(const std::string& path, Tuning& out) {
     e.woundStainRadius = std::clamp(e.woundStainRadius, 0.0f, 16.0f);
     e.woundStainSurface = std::clamp(e.woundStainSurface, 0.0f, 1.0f);
     e.woundStainDensity = std::clamp(e.woundStainDensity, 0.0f, 1.0f);
+    e.woundStainBlob = std::clamp(e.woundStainBlob, 0.25f, 16.0f);
+    e.woundStainCoherence = std::clamp(e.woundStainCoherence, 0.0f, 1.0f);
+    e.craterStainRim = std::clamp(e.craterStainRim, 0.0f, 16.0f);
+    e.stainCutRadius = std::clamp(e.stainCutRadius, 0.0f, 16.0f);
+    e.stainCutAmount = std::clamp(e.stainCutAmount, 0, 15);
+    e.stainCutBuried = std::clamp(e.stainCutBuried, 0, 15);
+    e.stainCutBuriedChance = std::clamp(e.stainCutBuriedChance, 0.0f, 1.0f);
+    e.stainBoneMin = std::clamp(e.stainBoneMin, 0, 15);
+    e.stainContactScale = std::clamp(e.stainContactScale, 0.0f, 8.0f);
+    e.stainFloorTransfer = std::clamp(e.stainFloorTransfer, 0.0f, 1.0f);
+    e.stainWashPerContact = std::clamp(e.stainWashPerContact, 0, 15);
+    e.splatterReach = std::clamp(e.splatterReach, 0.0f, 256.0f);
+    e.splatterAmount = std::clamp(e.splatterAmount, 0, 15);
+    e.splatterPerLimb = std::clamp(e.splatterPerLimb, 0, 256);
+    e.splatterSplatRadius = std::clamp(e.splatterSplatRadius, 0.0f, 2.0f);
     // A sever fraction of 0 severs on the first disconnected speck — that is
     // the straggler bug in Mob::CarveLimb wearing a slider — and 1 can never
     // fire at all. Both ends are excluded rather than merely discouraged.
@@ -863,6 +940,43 @@ bool LoadTuning(const std::string& path, Tuning& out) {
       out.warnings.push_back(at + ".severGobbetSpread < 0; clamped to 0");
       e.severGobbetSpread = 0.0f;
     }
+  }
+
+  // ---- coats: a substance on a body (Tuning::Coat) --------------------------
+  // CPU-only, like `gore` above. The per-SUBSTANCE half of this feature is in
+  // materials.json ("coat": { decay, shed, effects }); these are the engine's
+  // cadences and budgets over it.
+  if (const json* g = Find(j, "coat")) {
+    auto& e = out.coat;
+    const std::string at = "coat";
+    ReadI(*g, "recountTicks", e.recountTicks, out, at);
+    ReadF(*g, "decayScale", e.decayScale, out, at);
+    ReadI(*g, "shedCells", e.shedCells, out, at);
+    ReadI(*g, "shedPerTick", e.shedPerTick, out, at);
+    ReadI(*g, "shedAmount", e.shedAmount, out, at);
+    ReadF(*g, "hudMinFrac", e.hudMinFrac, out, at);
+    // A recount period of 0 would retake the ledger every tick a body is
+    // dirty, which is one full lattice pass per creature per tick — the rule 2
+    // trap this cadence exists to close.
+    if (e.recountTicks < 1) {
+      out.warnings.push_back(at + ".recountTicks < 1; clamped to 1");
+      e.recountTicks = 1;
+    }
+    e.recountTicks = std::min(e.recountTicks, 240);
+    // decayScale DIVIDES the authored seconds, so 0 is a division by zero
+    // dressed up as "nothing ever dries" — say that with a small number.
+    if (e.decayScale < 0.01f) {
+      out.warnings.push_back(at + ".decayScale <= 0; clamped to 0.01");
+      e.decayScale = 0.01f;
+    }
+    // 300 is not arbitrary: it is what turns blood's authored 20 s per level
+    // into a two-tick period, which is the `body-coat` gate's fast arm and the
+    // fastest anything here is meant to be dialled.
+    e.decayScale = std::min(e.decayScale, 300.0f);
+    e.shedCells = std::clamp(e.shedCells, 0, 32);
+    e.shedPerTick = std::clamp(e.shedPerTick, 0, 1024);
+    e.shedAmount = std::clamp(e.shedAmount, 0, 15);
+    e.hudMinFrac = std::clamp(e.hudMinFrac, 0.0f, 1.0f);
   }
 
   // ---- melee: the stroke driver's feel (game/melee.h MeleeTuning) -----------
@@ -1139,6 +1253,9 @@ bool LoadTuning(const std::string& path, Tuning& out) {
     const std::string at = "sim";
     ReadI(*g, "partGravity", s.partGravity, out, at);
     ReadI(*g, "partMaxVel", s.partMaxVel, out, at);
+    ReadI(*g, "partBuoyMax", s.partBuoyMax, out, at);
+    ReadI(*g, "partSettleSpeed", s.partSettleSpeed, out, at);
+    ReadI(*g, "partFloatPatience", s.partFloatPatience, out, at);
     ReadI(*g, "airDensity", s.airDensity, out, at);
     ReadI(*g, "falloffPerCell", s.falloffPerCell, out, at);
     ReadI(*g, "ejectSolid", s.ejectSolid, out, at);
@@ -1188,9 +1305,13 @@ bool LoadTuning(const std::string& path, Tuning& out) {
     ReadI(*g, "fluidExcitePerch", s.fluidExcitePerch, out, at);
     ReadI(*g, "fluidExciteStep", s.fluidExciteStep, out, at);
     ReadF(*g, "fluidSettledMass", s.fluidSettledMass, out, at);
+    ReadI(*g, "fluidSubmergedSolid", s.fluidSubmergedSolid, out, at);
     ReadF(*g, "fluidSettleEps", s.fluidSettleEps, out, at);
     ReadF(*g, "fluidWakeSpeed", s.fluidWakeSpeed, out, at);
     ReadI(*g, "fluidSettleTicks", s.fluidSettleTicks, out, at);
+    ReadI(*g, "fluidStuckTicks", s.fluidStuckTicks, out, at);
+    ReadI(*g, "fluidForceBlocks", s.fluidForceBlocks, out, at);
+    ReadI(*g, "fluidForceReach", s.fluidForceReach, out, at);
     ReadF(*g, "fluidStainRate", s.fluidStainRate, out, at);
     ReadI(*g, "waterBodyMode", s.waterBodyMode, out, at);
     ReadI(*g, "waterBodyMinVolume", s.waterBodyMinVolume, out, at);
@@ -1208,6 +1329,7 @@ bool LoadTuning(const std::string& path, Tuning& out) {
     ReadI(*g, "waterRelevelGain", s.waterRelevelGain, out, at);
     ReadI(*g, "waterRelevelDepth", s.waterRelevelDepth, out, at);
     ReadI(*g, "windMode", s.windMode, out, at);
+    ReadI(*g, "gasMode", s.gasMode, out, at);
     ReadF(*g, "windDrag", s.windDrag, out, at);
     ReadF(*g, "windFluidGain", s.windFluidGain, out, at);
     ReadF(*g, "windFluidMass", s.windFluidMass, out, at);
@@ -1422,6 +1544,10 @@ bool LoadTuning(const std::string& path, Tuning& out) {
     // FLUID_SETTLED_Q8); past ~2 the static boundary out-pressures the fluid
     // and fires particles off a still pool.
     clampWarnF(s.fluidSettledMass, 0.0f, 2.0f, "fluidSettledMass");
+    if (s.fluidSubmergedSolid < 0 || s.fluidSubmergedSolid > 1) {
+      out.warnings.push_back("sim.fluidSubmergedSolid is 0 or 1; clamped");
+      s.fluidSubmergedSolid = s.fluidSubmergedSolid < 0 ? 0 : 1;
+    }
     clampWarnF(s.fluidSettleEps, 0.05f, 20.0f, "fluidSettleEps");
     clampWarnF(s.fluidWakeSpeed, 0.1f, 50.0f, "fluidWakeSpeed");
     if (s.fluidSettleTicks < 8 || s.fluidSettleTicks > 600) {
@@ -1429,6 +1555,24 @@ bool LoadTuning(const std::string& path, Tuning& out) {
       s.fluidSettleTicks = s.fluidSettleTicks < 8 ? 8 : 600;
     }
     clampWarnF(s.fluidStainRate, 0.0f, 30.0f, "fluidStainRate");
+    // The force-settle backstop. 0 is a legal value for stuckTicks — it is the
+    // off switch — so the floor is 0, not the 8 fluidSettleTicks needs. The
+    // ceiling on reach is what bounds the forced walk's write set, and the
+    // block budget is capped at kFluidSettleMax because the forced picks share
+    // settleScan's list with the calm ones.
+    if (s.fluidStuckTicks < 0 || s.fluidStuckTicks > 6000) {
+      out.warnings.push_back("sim.fluidStuckTicks out of 0..6000; clamped");
+      s.fluidStuckTicks = s.fluidStuckTicks < 0 ? 0 : 6000;
+    }
+    if (s.fluidForceBlocks < 0 || s.fluidForceBlocks > (int)kFluidSettleMax) {
+      out.warnings.push_back("sim.fluidForceBlocks out of 0..kFluidSettleMax; clamped");
+      s.fluidForceBlocks =
+          s.fluidForceBlocks < 0 ? 0 : (int)kFluidSettleMax;
+    }
+    if (s.fluidForceReach < 0 || s.fluidForceReach > 512) {
+      out.warnings.push_back("sim.fluidForceReach out of 0..512; clamped");
+      s.fluidForceReach = s.fluidForceReach < 0 ? 0 : 512;
+    }
     // ---- the discharge law (component 6) -------------------------------
     // The rate cap is the rule-2 bound on the jet AND the size of the spawn-op
     // block the CPU reserves, so it is clamped to kWaterDrainOpsPerBody here
@@ -1481,6 +1625,13 @@ bool LoadTuning(const std::string& path, Tuning& out) {
     // Wind coupling. The gate first: an unknown mode must not fall through to
     // "some wind", because the whole hash argument for shipping this is that
     // mode 0 means literally no kernel reads the field.
+    // The gas edge is a two-state gate; anything else is a typo, and silently
+    // treating a 2 as "on" would hide the day someone means to add a mode.
+    if (s.gasMode < (int)kGasModeWall || s.gasMode > (int)kGasModeSink) {
+      out.warnings.push_back("sim.gasMode out of 0..1; clamped");
+      s.gasMode = s.gasMode < (int)kGasModeWall ? (int)kGasModeWall
+                                                : (int)kGasModeSink;
+    }
     if (s.windMode < (int)kWindModeOff || s.windMode > (int)kWindModeEntrain) {
       out.warnings.push_back("sim.windMode out of 0..2; clamped");
       s.windMode = s.windMode < (int)kWindModeOff ? (int)kWindModeOff
@@ -1893,6 +2044,7 @@ bool LoadTuning(const std::string& path, Tuning& out) {
     ReadF(*g, "shadowFarLift", r.shadowFarLift, out, at);
     ReadI(*g, "shadowCache", r.shadowCache, out, at);
     ReadI(*g, "shadowCacheSubdiv", r.shadowCacheSubdiv, out, at);
+    ReadF(*g, "shadowSunAngle", r.shadowSunAngle, out, at);
     ReadF(*g, "grainBroadScale", r.grainBroadScale, out, at);
     ReadF(*g, "grainFineScale", r.grainFineScale, out, at);
     ReadF(*g, "grainMix", r.grainMix, out, at);
@@ -2137,8 +2289,11 @@ bool LoadTuning(const std::string& path, Tuning& out) {
     ReadF(*g, "trampleRadius", r.trampleRadius, out, at);
     ReadI(*g, "primarySteps", r.primarySteps, out, at);
     ReadI(*g, "farSteps", r.farSteps, out, at);
+    ReadI(*g, "farRefillRate", r.farRefillRate, out, at);
+    ReadI(*g, "farPlaneFillRate", r.farPlaneFillRate, out, at);
     ReadF(*g, "farShadowReach", r.farShadowReach, out, at);
     ReadI(*g, "farBlockerHitLevel", r.farBlockerHitLevel, out, at);
+    ReadF(*g, "gasBlendStart", r.gasBlendStart, out, at);
     ReadF(*g, "lodHandoffDist", r.lodHandoffDist, out, at);
     ReadF(*g, "renderScale", r.renderScale, out, at);
     ReadI(*g, "taa", r.taa, out, at);
@@ -2147,6 +2302,13 @@ bool LoadTuning(const std::string& path, Tuning& out) {
     ReadF(*g, "taaJitter", r.taaJitter, out, at);
     ReadI(*g, "taaSharpLod", r.taaSharpLod, out, at);
     ReadF(*g, "taaSharpness", r.taaSharpness, out, at);
+    ReadI(*g, "denoise", r.denoise, out, at);
+    ReadI(*g, "denoiseIters", r.denoiseIters, out, at);
+    ReadF(*g, "denoisePxFull", r.denoisePxFull, out, at);
+    ReadF(*g, "denoisePxStart", r.denoisePxStart, out, at);
+    ReadF(*g, "denoiseDepthTol", r.denoiseDepthTol, out, at);
+    ReadF(*g, "denoiseChromaTol", r.denoiseChromaTol, out, at);
+    ReadF(*g, "denoiseStrength", r.denoiseStrength, out, at);
     ReadI(*g, "presentMode", r.presentMode, out, at);
     ReadF(*g, "fpsCap", r.fpsCap, out, at);
     ReadF(*g, "shadowMaxDist", r.shadowMaxDist, out, at);
@@ -2156,6 +2318,7 @@ bool LoadTuning(const std::string& path, Tuning& out) {
     ReadI(*g, "opennessChunksPerFrame", r.opennessChunksPerFrame, out, at);
     ReadF(*g, "opennessStrength", r.opennessStrength, out, at);
     ReadF(*g, "opennessFloor", r.opennessFloor, out, at);
+    ReadV3(*g, "enclosedAmbient", r.enclosedAmbient, out, at);
     ReadI(*g, "opennessBilinear", r.opennessBilinear, out, at);
     ReadF(*g, "giStrength", r.giStrength, out, at);
     ReadF(*g, "giDecay", r.giDecay, out, at);
@@ -2169,6 +2332,7 @@ bool LoadTuning(const std::string& path, Tuning& out) {
     ReadI(*g, "glowRingBudget", r.glowRingBudget, out, at);
     ReadI(*g, "glowTerrain", r.glowTerrain, out, at);
     ReadF(*g, "shortRangeDist", r.shortRangeDist, out, at);
+    ReadF(*g, "shortRangeNearDist", r.shortRangeNearDist, out, at);
     ReadF(*g, "shortRangeFogStart", r.shortRangeFogStart, out, at);
     ReadF(*g, "shortRangeFogDensity", r.shortRangeFogDensity, out, at);
     // Zero step budgets compile fine and render nothing; a zero white point or
@@ -2270,8 +2434,24 @@ bool LoadTuning(const std::string& path, Tuning& out) {
     // clamp exists so the tuner slider cannot silently alias two patches onto
     // one key, not as the load-bearing guard.
     if (r.shadowCacheSubdiv > 8) { r.shadowCacheSubdiv = 8; }
+    // The penumbra cone's half-angle in degrees. 0 is legal and means "point
+    // sun", i.e. the hard single-ray shadow this replaced. The ceiling is
+    // where tan() stops being a small angle and the jittered ray would start
+    // missing the blocker it is supposed to be sampling the edge of.
+    if (r.shadowSunAngle < 0.0f) { r.shadowSunAngle = 0.0f; }
+    if (r.shadowSunAngle > 15.0f) { r.shadowSunAngle = 15.0f; }
     if (r.reflectionSteps < 0) { r.reflectionSteps = 0; }
     if (r.farSteps < 1) { r.farSteps = 1; }
+    // 0 would stall a refill forever (the horizon would never come back) and
+    // the top is the whole farList buffer, which is the dispatch's own limit.
+    if (r.farRefillRate < 1) { r.farRefillRate = 1; }
+    if (r.farRefillRate > (int)kFarListCap) { r.farRefillRate = (int)kFarListCap; }
+    // Same two bounds, same reasons: 0 would freeze the horizon wherever the
+    // player left it, and farList is the dispatch's own ceiling.
+    if (r.farPlaneFillRate < 1) { r.farPlaneFillRate = 1; }
+    if (r.farPlaneFillRate > (int)kFarListCap) {
+      r.farPlaneFillRate = (int)kFarListCap;
+    }
     // A zero/negative reach would clamp to the 8-step floor everywhere and
     // silently drop far shadows; keep it positive.
     if (r.farShadowReach < 1.0f) { r.farShadowReach = 1.0f; }
@@ -2289,6 +2469,11 @@ bool LoadTuning(const std::string& path, Tuning& out) {
     // absurdly near but is a knob setting rather than a broken frame. There is
     // deliberately no ceiling — >= 25.6 m disables the handoff, which is the
     // documented way to A/B it.
+    // A fraction of the window half-extent. Below 0 the band would start
+    // outside the box on the far side; above 1 it would never reach 1 at the
+    // face and the seam would come back with a step in it.
+    if (r.gasBlendStart < 0.0f) { r.gasBlendStart = 0.0f; }
+    if (r.gasBlendStart > 1.0f) { r.gasBlendStart = 1.0f; }
     if (r.lodHandoffDist < 2.0f) { r.lodHandoffDist = 2.0f; }
     // A scale above 1 would be supersampling the most expensive shader in the
     // engine; below a quarter the frame is 400x225 and the UI text on top is
@@ -2308,6 +2493,19 @@ bool LoadTuning(const std::string& path, Tuning& out) {
     // whole 3x3 and no reconstruction at all.
     if (r.taaSharpness < 0.05f) { r.taaSharpness = 0.05f; }
     if (r.taaSharpness > 64.0f) { r.taaSharpness = 64.0f; }
+    // The shading-LOD filter: iterations are bounded by the bind groups
+    // Simulation allocates (kDenoiseMaxIters); the ramp edges must be ordered
+    // (smoothstep) and positive; the tolerances are widths, so > 0.
+    if (r.denoiseIters < 0) { r.denoiseIters = 0; }
+    if (r.denoiseIters > 4) { r.denoiseIters = 4; }
+    if (r.denoisePxFull < 0.1f) { r.denoisePxFull = 0.1f; }
+    if (r.denoisePxStart < r.denoisePxFull + 0.01f) {
+      r.denoisePxStart = r.denoisePxFull + 0.01f;
+    }
+    if (r.denoiseDepthTol < 0.001f) { r.denoiseDepthTol = 0.001f; }
+    if (r.denoiseChromaTol < 0.01f) { r.denoiseChromaTol = 0.01f; }
+    if (r.denoiseStrength < 0.0f) { r.denoiseStrength = 0.0f; }
+    if (r.denoiseStrength > 1.0f) { r.denoiseStrength = 1.0f; }
     if (r.presentMode < 0 || r.presentMode > 2) { r.presentMode = 1; }
     if (r.fpsCap < 0.0f) { r.fpsCap = 0.0f; }
     // 0 is meaningful here (all shadows go through the cascade), so only
@@ -2343,7 +2541,11 @@ bool LoadTuning(const std::string& path, Tuning& out) {
           "brighten without bound); clamped");
       r.giFeedback = std::max(0.0f, r.giDecay * 0.5f);
     }
-    r.giGatherBlocks = std::clamp(r.giGatherBlocks, 0, 8);
+    // A STEP budget, not a distance (tuning_params.def says why). The ceiling
+    // is what bounds the gather's cost: nine rays x this many iterations on a
+    // re-gather frame, amortised over giCachePeriod. 64 is already ~30 m of
+    // open interior, which is past the residency window's useful half.
+    r.giGatherBlocks = std::clamp(r.giGatherBlocks, 0, 64);
     // Beyond 64 the bounce visibly lags the sun; 0 is the uncached path.
     r.giCachePeriod = std::clamp(r.giCachePeriod, 0, 64);
     // Multi-bounce gain (P2): each bounce is albedo x the gather's 0.28 form
@@ -2389,6 +2591,7 @@ bool LoadTuning(const std::string& path, Tuning& out) {
     // is under the near field's own reach and is already an absurd setting,
     // but it is a setting rather than a NaN frame.
     if (r.shortRangeDist < 4.0f) { r.shortRangeDist = 4.0f; }
+    if (r.shortRangeNearDist < 4.0f) { r.shortRangeNearDist = 4.0f; }
     // The start fraction is a fraction. 0.95 rather than 1.0 at the top so the
     // ramp always has a span to run over.
     if (r.shortRangeFogStart < 0.0f) { r.shortRangeFogStart = 0.0f; }
@@ -2421,6 +2624,8 @@ bool LoadTuning(const std::string& path, Tuning& out) {
     const std::string at = "debug";
     ReadI(*g, "vegetation", d.vegetation, out, at);
     d.vegetation = (d.vegetation != 0) ? 1 : 0;   // a flag: anything nonzero is on
+    ReadI(*g, "groundCover", d.groundCover, out, at);
+    d.groundCover = (d.groundCover != 0) ? 1 : 0;
   }
 
   return true;
@@ -2631,6 +2836,9 @@ bool SaveCombatTuning(const std::string& path, const Tuning& t,
     put("woundStainRadius", g.woundStainRadius);
     put("woundStainSurface", g.woundStainSurface);
     put("woundStainDensity", g.woundStainDensity);
+    put("woundStainBlob", g.woundStainBlob);
+    put("woundStainCoherence", g.woundStainCoherence);
+    put("craterStainRim", g.craterStainRim);
     put("corpseBleedPerVoxel", g.corpseBleedPerVoxel);
     put("bleedGain", g.bleedGain);
     put("bleedHpPerVoxel", g.bleedHpPerVoxel);

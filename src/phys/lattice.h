@@ -54,6 +54,13 @@ inline std::vector<DebrisVoxel> DownsampleSkin(
     int n = 0;
     uint32_t pair[kMaxDistinct]{};  // material | color << 16
     uint32_t hits[kMaxDistinct]{};
+    // The heaviest body coat among the block's skin voxels (voxload.h
+    // BodyStain*), carried WHOLE -- material and amount together, so the
+    // coarse lattice can still say what is on it and not merely how much. A
+    // max, not a vote: the coarse lattice is what a fragment split off a fine
+    // limb draws its own brick from, and a gobbet of a bloodied arm should
+    // look bloodied.
+    uint16_t stain = 0;
   };
   std::unordered_map<uint64_t, Blk> blocks;
   bool over = false;
@@ -75,6 +82,7 @@ inline std::vector<DebrisVoxel> DownsampleSkin(
       if (blk.pair[k] == pair) break;
     if (k == blk.n && blk.n < kMaxDistinct) blk.pair[blk.n++] = pair;
     if (k < kMaxDistinct) blk.hits[k]++;
+    if (BodyStainAmt(v.stain) > BodyStainAmt(blk.stain)) blk.stain = v.stain;
   }
   if (overflow) *overflow = over;
 
@@ -87,7 +95,7 @@ inline std::vector<DebrisVoxel> DownsampleSkin(
       if (blk.hits[k] > blk.hits[best]) best = k;
     out.push_back({(int8_t)((key >> 42) & 0x1FF), (int8_t)((key >> 21) & 0x1FF),
                    (int8_t)(key & 0x1FF), (uint8_t)(blk.pair[best] >> 16),
-                   (uint16_t)(blk.pair[best] & 0xFFFFu)});
+                   (uint16_t)(blk.pair[best] & 0xFFFFu), blk.stain});
   }
   return out;
 }

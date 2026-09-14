@@ -79,6 +79,9 @@ uint32_t CountLines(const std::string& s);
 // otherwise keys on WGSL source alone and an optimized blob written by one run
 // would be served to a run that asked for the unoptimized one (and vice versa),
 // which would silently corrupt any A/B of the two.
-uint32_t OptimizerCacheTag();
+// Per shader: worldgen.wgsl defaults to the (much cheaper to run)
+// legalization recipe, everything else to the performance one; an explicit
+// SANDVOX_SPIRV_OPT overrides both. See RecipeFor() in vk_spirv.cpp.
+uint32_t OptimizerCacheTag(const std::string& label);
 
 }  // namespace vkspv

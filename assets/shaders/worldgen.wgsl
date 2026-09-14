@@ -6,7 +6,7 @@
 // floor-division fixes for negative coordinates.
 //
 // Two entries, both one workgroup (64 threads) per chunk:
-//   main — full residency window (NUM_CHUNKS workgroups), startup / regen
+//   main — the whole slot space (NUM_SLOTS workgroups), startup / regen
 //   list — T.genCount slot indices from genList, streamed-in chunks
 // Each workgroup fills its chunk, computes its occupancy count in-kernel (the
 // renderer skips occ==0 chunks, so a late count would flicker the horizon),
@@ -468,14 +468,32 @@ const HSCALE : i32 = 1;
 // stands. map.json `terrain.treeline` (P-G), read from the worldMap header so
 // the C++ side (worldmap::CurrentTerrain().treeline) sees the same number.
 fn treeline() -> i32 { return wmTerrain(WM_H_TERRAIN_TREELINE); }
-// worldgen.vegetation: the kill-switch for every plant this file places. Gated
-// at the SOURCE of each feature (the *Info / *At functions and the table-driven
-// blocks in genCellIn), not by a material test at the end, so the tree
-// candidate scan, the undergrowth canopy scan and the far cascade's crown
-// proxy all see the same treeless, coverless world -- and none of them pays
-// for plants that will not be placed. A frame-rate A/B lever; terrain, water,
-// caves and ruins are untouched.
+// worldgen.vegetation: the kill-switch for every plant this file places,
+// TREES AND CACTI INCLUDED. Gated at the SOURCE of each feature (the *Info /
+// *At functions and the table-driven blocks in genCellIn), not by a material
+// test at the end, so the tree candidate scan, the undergrowth canopy scan and
+// the far cascade's crown proxy all see the same treeless, coverless world --
+// and none of them pays for plants that will not be placed. A frame-rate A/B
+// lever; terrain, water, caves and ruins are untouched.
+//
+// THE PAIR. This is the EXTREME end of the axis, not the everyday one: it also
+// takes the wood away, and a world with no trees in it is a different world
+// rather than the same world with less clutter. `groundCover` below is the
+// half that removes only what a body walks through. Anything that reads as a
+// LANDMARK -- a tree, a saguaro -- answers to this flag alone.
 const VEGETATION : bool = TUNE_VEGETATION != 0u;
+// worldgen.groundCover: the SMALL half of the switch above. Off leaves the
+// trees and the cacti standing and removes everything a body walks THROUGH --
+// the biome cover rows (tall grass, wildflowers, undergrowth, scrub, alpine
+// cushion), the tile plants (ferns, big toadstools), the shore rows, the pond
+// life, the wet moss skin and the cave flora. ANDed with VEGETATION, so the
+// master switch is still the extreme end of the same axis and a reader never
+// has to check two flags to know whether anything grows.
+//
+// Gated at each feature's SOURCE for the same reason the master is: the
+// undergrowth canopy scan and the tile-plant site scan are the expensive part,
+// and a material test at the end would still pay for them.
+const GROUND_COVER : bool = VEGETATION && TUNE_GROUND_COVER != 0u;
 
 // ---- PER-BIOME RELIEF (P-G): the curve and the multipliers, FROM THE MAP ----
 //
@@ -1040,6 +1058,14 @@ fn isqrtLe(v : i32, hi0 : i32) -> i32 {
 // powder bed (genCellIn), so a steep authored tarn stays settled (rule 2)
 // instead of avalanching its sand forever -- which is why the preset's depth
 // no longer has to be bounded by its radius.
+//
+// KNOWN GAP (2026-09-09, measured): the ring comparison under-reads the step
+// where the profile crosses 2 voxels between integer radius rings -- 168 bed
+// grains on one marsh bowl face sat submerged at a >=2 step this test called
+// 1, and slid on tick 0. The exact fix (test the four axis neighbours' own
+// bowlDepth) exists and works, but it changes the harness pool's bed enough
+// to need the waterbody-gate ledger reconciled with it, so it ships with
+// that reconciliation, not here.
 fn bowlSteep(p : Pond, x : i32, z : i32) -> bool {
   let dx = x - p.cx;
   let dz = z - p.cz;
@@ -1543,6 +1569,10 @@ const WM_B_CURVE_KNOT0   : u32 = 22u;   // ..30u
 const WM_B_HILL_MUL      : u32 = 31u;
 const WM_B_DETAIL_MUL    : u32 = 32u;
 const WM_B_GRAIN_MUL     : u32 = 33u;
+// The SOLID this biome's loose cover becomes where the ground is too steep to
+// hold a powder (worldmap.h kB_FirmCover, biomes/<name>.json cover.firmSkin).
+// 0 = unauthored; coverFirmMat below falls back to the subsoil or to stone.
+const WM_B_FIRM_COVER    : u32 = 34u;
 const WM_C_WORDS         : u32 = 12u;
 const WM_C_MAT           : u32 = 0u;
 const WM_C_HEAD          : u32 = 1u;
@@ -2101,6 +2131,7 @@ fn treeInfoAt(s : TreeSite, land : Land, seed : u32, ponds : ptr<function, PondS
 
   let ns = taSpeciesCount();
   if (ns <= 0) { return t; }            // no atlas: a legal, treeless world
+  // The master switch only: a tree is a landmark, so `groundCover` leaves it.
   if (!VEGETATION) { return t; }        // worldgen.vegetation = 0: no trees
 
   let hsh = s.hsh;
@@ -2567,6 +2598,11 @@ fn cactusInfo(tx : i32, tz : i32, seed : u32, ponds : ptr<function, PondSet>) ->
   // Only where the biome says so (cover.cacti), and never on the keep-out
   // ground every other feature avoids: the spawn clearing, the selftest
   // fixture pads, or a pond.
+  //
+  // A saguaro is metre-scale and reads as a landmark the way a tree does, so
+  // it answers to the MASTER switch only -- `groundCover` off leaves the cacti
+  // standing and takes the scrub-and-tussock floor out from under them (that
+  // floor is a biome cover row, gated with the rest of the stack below).
   if (!VEGETATION) { return c; }
   let cb = biomeAt(c.wx, c.wz, seed);
   if (!wmFlag(cb, WM_BF_CACTI)) { return c; }
@@ -3009,7 +3045,7 @@ fn caveAt(x : i32, y : i32, z : i32, h : i32, biome : u32, seed : u32) -> i32 {
 //
 // Returns MAT_AIR for "leave the cave open".
 fn caveFloraAt(b : CaveBands, biome : u32, x : i32, y : i32, z : i32, seed : u32) -> u32 {
-  if (!VEGETATION) { return MAT_AIR; }
+  if (!GROUND_COVER) { return MAT_AIR; }
   // Never in the flooded band, and never within reach of it.
   if (y <= LAVA_LEVEL + CAVE_LAVA_MARGIN) { return MAT_AIR; }
 
@@ -3080,6 +3116,15 @@ struct Col {
   inPoolFloor : bool,
   inRim       : bool,
   shore       : Shore,
+  // The shore band WITHOUT the bluff cut `shore` applies. `shore.onShore` asks
+  // "does a wet fringe belong here", and answers NO on a column standing well
+  // above the waterline -- a bluff is dry bank, not marsh, and that test is the
+  // most load-bearing one in the shore feature. But "is the ground here shaped
+  // by a water body rather than by the noise" is a DIFFERENT question with the
+  // opposite answer on exactly that column: a bluff over a lake is a cut wall
+  // 17 voxels tall that the analytic gradient reads as level plateau. So the
+  // cover gate (looseCoverDepth) reads this flag and the marsh reads the other.
+  nearWater   : bool,
   wp          : u32,         // the water preset this column's pond or shore wears; 0 = none (P-F)
   bedSolid    : bool,        // inside a disc: the bowl face here is steeper than a powder bed can hold
   plant       : PlantCol,    // the tile plant whose footprint covers this column
@@ -3134,7 +3179,7 @@ fn plantColumnAt(x : i32, z : i32, seed : u32, biome : u32) -> PlantCol {
   pc.mat = MAT_AIR;
   pc.base = 0;
   pc.top = -1;
-  if (!VEGETATION) { return pc; }
+  if (!GROUND_COVER) { return pc; }
   // The tile plants belong to biomes with the ground-flora layer (the
   // world map's flag), not to two hard-coded ids.
   if (!wmFlag(biome, WM_BF_GROUND_FLORA)) { return pc; }
@@ -3489,6 +3534,7 @@ fn genColumn(x : i32, z : i32, seed : u32) -> Col {
     lab.shore.past = 0;
     lab.shore.surf = -1;
     lab.shore.wp = 0u;
+    lab.nearWater = false;
     lab.wp = 0u;
     lab.bedSolid = false;
     lab.plant.mat = MAT_AIR;
@@ -3541,6 +3587,11 @@ fn genColumn(x : i32, z : i32, seed : u32) -> Col {
       shore.onShore = false;
     }
   }
+  // Deliberately NOT gated on the bluff cut above, nor on the treeline: this is
+  // the geometric question ("is this column's ground the wall of a bowl someone
+  // dug"), not the ecological one. See Col.nearWater.
+  let nearWater = L.near.onShore &&
+                  L.near.past < wmWaterI(L.near.wp, WM_W_SHORE_BAND);
 
   var col : Col;
   col.h = h;
@@ -3554,10 +3605,92 @@ fn genColumn(x : i32, z : i32, seed : u32) -> Col {
   col.inPoolFloor = L.inPoolFloor;
   col.inRim = L.inRim;
   col.shore = shore;
+  col.nearWater = nearWater;
   col.wp = L.wp;
   col.bedSolid = L.bedSolid;
   col.plant = plantColumnAt(x, z, seed, biome);
   return col;
+}
+
+// ---- A LOOSE COVER HAS TO BE BORN AT REST ---------------------------------
+//
+// Worldgen's contract (the magma-table note below) is that generated matter is
+// generated AT REST: a cell the CA would move on tick 0 is a chunk that never
+// sleeps, and rule 2 of CLAUDE.md is that cost scales with activity. Every
+// other loose layer already honours it -- the sediment wedge is slope-gated in
+// landAt, and the mud ring and the grass skin are deliberately SOLID because
+// "a powder shell on a slope avalanches out from under itself".
+//
+// The sand cap and a POWDER ground skin were the two that did not. Measured on
+// raw worldgen output (--voxdump, no CA): 1,249 of 10,539 sand cells in a
+// 128x96x128 box at the authored lake had a legal down-move on tick 0 and 418
+// of those went straight into the water, which is why freshly streamed lake
+// terrain stayed awake for seconds. The water itself is born perfectly at rest;
+// it only churned because the bank fell into it.
+//
+// The fix is not to delete the cap -- a desert wants loose sand where loose
+// sand can lie -- but to split it in two, exactly the way the sediment wedge is
+// split: `looseCoverDepth` ramps the powder part to zero on the SAME gate
+// (`(sedSlope - slope) / sedSlope`, slope in Q8 where 256 = 1 voxel/column ==
+// the CA's angle of repose, knob worldgen.sedSlope), and whatever the ramp
+// takes away becomes the biome's firm cover instead. On flat ground the ramp
+// returns the full authored depth and NOTHING changes.
+//
+// `Col.nearWater` is the second half and it is not an approximation. A water
+// body's bank is CUT, not eroded: bermLift forces h up to surf + bermHeight
+// inside the shore band, and the bowl is excavated out from under the band's
+// inner edge. Neither wall is in the noise field at all, so `slope` reads a
+// 17-voxel cliff as the level plateau it was cut from. The analytic gradient
+// can never see it; the shore band can, so inside the band loose depth is 0.
+//
+// It reads `nearWater` and NOT `shore.onShore` because the latter carries the
+// shore feature's BLUFF CUT, which turns itself off on a column standing well
+// above the waterline -- correct for a marsh fringe, and exactly backwards
+// here, since a bluff over a lake is the tallest cut wall in the world. Using
+// the filtered flag left 76 sand cells poised over a 17-voxel drop into the
+// authored lake: the same bug, one tick later.
+// The CA's angle of repose in landform-gradient units: sim_step slides a
+// powder into any free down-diagonal, so the steepest pile it holds is one
+// voxel per column = 256 in the Q8 slope Land carries. Declared here and not
+// in common.wgsl: only this kernel reads it (the common.wgsl compile cliff).
+const CAP_REPOSE_Q8 : i32 = 256;
+
+fn looseCoverDepth(col : ptr<function, Col>, depth : i32) -> i32 {
+  // Every AUTHORED discontinuity, none of which is in the noise field:
+  //   nearWater -- a water body's bermed / excavated bank (see above)
+  //   inRim     -- the annulus of an authored pool, a forced cylinder wall.
+  //                Measured: 76 of the 164 grains left on the first cut of
+  //                this gate stood on the lip of the (420,420) pool's rim
+  //                over a 41-voxel drop into its water. `inRim` is already
+  //                what the snow cap, the caves and the sediment wedge use
+  //                to mean "this ground was placed, not grown".
+  if ((*col).nearWater || (*col).inRim) { return 0; }
+  // A CLAMPED taper, not a straight line from slope 0. Full authored depth up
+  // to worldgen.sedSlope (the ground the sediment wedge already calls flat),
+  // then tapering to zero at the CA's OWN angle of repose -- 256 Q8 = 1
+  // voxel/column, the constant sim_step's diagonal slide defines. Both ends
+  // were measured and both are wrong alone: a straight ramp to sedSlope (96)
+  // stripped 87% of the dune field's loose cells for ground that holds sand
+  // fine, and a straight ramp to repose kept one thin loose voxel on rough
+  // near-repose faces where the detail octaves' +-2 steps shed it anyway.
+  // The taper's start is the wedge's knob on purpose (one definition of
+  // "flat"); its END is not a knob, because repose is the CA's constant, not
+  // an aesthetic.
+  let flat = wmTerrain(WM_H_TERRAIN_SED_SLOPE);
+  let span = max(CAP_REPOSE_Q8 - flat, 1);
+  return clamp((depth * (CAP_REPOSE_Q8 - (*col).slope)) / span, 0, depth);
+}
+
+// The material the ramp above hands the rest of the cap to: the biome's
+// authored cover.firmSkin (WM_B_FIRM_COVER; desert and ocean say `sandstone`).
+// A biome that authored none keeps its subsoil where that is already a solid,
+// and otherwise gets stone -- either way a SOLID, which is the whole point.
+fn coverFirmMat(biome : u32) -> u32 {
+  let firm = wmBiome(biome, WM_B_FIRM_COVER);
+  if (firm != MAT_AIR) { return firm; }
+  let sub = wmBiome(biome, WM_B_SUBSOIL);
+  if (sub != MAT_AIR && materials[sub].klass == CLASS_SOLID) { return sub; }
+  return M_STONE;
 }
 
 // ---- THE CELL HALF: everything that actually depends on y -----------------
@@ -3644,7 +3777,15 @@ fn genCellIn(col : ptr<function, Col>,
       if (bedSolid) { bed = wmWater(wp, WM_W_BED_SUBSTRATE); }
       mat = select(bed, select(M_SAND, M_STONE, bedSolid), bed == 0u);
     } else if (wmFlag(biome, WM_BF_SAND_CAP) && y > h - 4) {
-      mat = M_SAND;                        // loose cap — avalanches into repose piles
+      // The loose cap, but only as deep as this column's ground can HOLD loose
+      // matter (looseCoverDepth above). Flat desert: loose == 4 and every cell
+      // here is sand, unchanged. At or past the angle of repose, or anywhere on
+      // a pond's berm wall: loose == 0 and the whole cap is the firm material,
+      // so a cut bank reads as sandstone rock instead of as sand that has not
+      // fallen yet. In between the two split at the ramp, which is what a real
+      // dune face looks like anyway.
+      let loose = looseCoverDepth(col, 4);
+      mat = select(coverFirmMat(biome), M_SAND, y > h - loose);
     } else if (shore.onShore && shore.past < wmWaterI(wp, WM_W_MUD_WIDTH) &&
                y > h - 2) {
       // WET MUD, in the inner ring only. This is the transition the whole
@@ -3668,9 +3809,25 @@ fn genCellIn(col : ptr<function, Col>,
     } else if (y > h - i32(wmBiome(biome, WM_B_SKIN_DEPTH))) {
       // The biome's ground skin (assets/biomes/<name>.json cover.skin /
       // skinDepth): grass on the forest floor, snow on the tundra, mud in the
-      // marsh. A SOLID, for the reason the sediment note below gives -- a
-      // powder skin on a slope avalanches out from under itself.
-      mat = wmBiome(biome, WM_B_SKIN);
+      // marsh. USUALLY a solid, for the reason the sediment note below gives --
+      // a powder skin on a slope avalanches out from under itself.
+      //
+      // But desert and ocean author `sand`, a POWDER, and nothing stopped that
+      // one from being laid down a cliff. So the skin gets the same split the
+      // cap above gets -- gated on the AUTHORED CLASS, and ONLY where the
+      // biome has authored a cover.firmSkin. The opt-in is the author's veto:
+      // tundra's skin is snow, also a powder, and firming a tenth of the
+      // tundra to subsoil broke its own authored claim ("99% of columns wear
+      // snow at y == h", the env-truth gate) for a settle transient tundra
+      // has always accepted. A biome that WANTS its powder skin held at rest
+      // authors the firm material; one that does not is bit-identical to
+      // before, exactly like a solid skin.
+      let skin = wmBiome(biome, WM_B_SKIN);
+      let depth = i32(wmBiome(biome, WM_B_SKIN_DEPTH));
+      let loose = select(depth, looseCoverDepth(col, depth),
+                         skin != MAT_AIR && materials[skin].klass == CLASS_POWDER &&
+                         wmBiome(biome, WM_B_FIRM_COVER) != MAT_AIR);
+      mat = select(coverFirmMat(biome), skin, y > h - loose);
     } else if (y > h - sed) {
       // NOT ON A FIXTURE PAD. The pad keeps its authored loose SAND cap on
       // purpose ("avalanches into repose piles"), but the four voxels under it
@@ -3737,7 +3894,7 @@ fn genCellIn(col : ptr<function, Col>,
     // pond-life block below and is what once turned scattered planting into a
     // solid wall. Chance and material are the water preset's (shore.mossChance
     // / mossMaterial); a biome with no water rows reads 0 and grows none.
-    if (VEGETATION && mat == M_STONE && y == h && shore.onShore) {
+    if (GROUND_COVER && mat == M_STONE && y == h && shore.onShore) {
         let mossMat = wmWater(wp, WM_W_MOSS_MAT);
       if (mossMat != 0u &&
           rollChance(hash3(seed ^ 0x4D05u, bitcast<u32>(x), bitcast<u32>(z)),
@@ -3777,7 +3934,7 @@ fn genCellIn(col : ptr<function, Col>,
   // rolled it or the site that placed it; P-F). Depths are voxels of water
   // over the bed, heights cells above the bed. A band with chance 0 rolls
   // nothing (rollChance).
-  if (VEGETATION && mat == M_WATER && pond >= 0) {
+  if (GROUND_COVER && mat == M_WATER && pond >= 0) {
     let bed = min(h, pw.x);          // the carved bowl floor at this column
     let depth = pond - bed;          // water column height in voxels
     let above = pond - y;            // how far under the surface this cell is
@@ -3820,7 +3977,7 @@ fn genCellIn(col : ptr<function, Col>,
   // so they are the same features as the water-cell block above continued
   // upward — same hashes, same column tests, so a reed is one continuous stalk
   // through the surface rather than two unrelated halves.
-  if (VEGETATION && mat == MAT_AIR && pond >= 0 && y > pond) {
+  if (GROUND_COVER && mat == MAT_AIR && pond >= 0 && y > pond) {
     let bed = min(h, pw.x);
     let depth = pond - bed;
     let hLily = hash3(seed ^ 0x71A9u, bitcast<u32>(x), bitcast<u32>(z));
@@ -3890,7 +4047,7 @@ fn genCellIn(col : ptr<function, Col>,
   // on the SAME hash is what keeps a head from floating over no stalk.
   // worldmap.cpp's MaxPlantH includes the jitter, so the sky-skip and far
   // blocker ceilings cover the tallest column a row can produce.
-  if (VEGETATION && mat == MAT_AIR && shore.onShore && y > h) {
+  if (GROUND_COVER && mat == MAT_AIR && shore.onShore && y > h) {
     let up = y - h;                  // voxels above this column's ground
     let nRows = wmWater(wp, WM_W_SHORE_COUNT);
     for (var i = 0u; i < nRows; i++) {
@@ -3981,7 +4138,7 @@ fn genCellIn(col : ptr<function, Col>,
   // a biome that authors such a row (WM_BF_CANOPY_ROWS): genChunk hands the
   // column's answer in as `canopyMemo` (the far cascade's single-cell callers
   // pass -1 and pay the scan here, once, for the surface cell they ask for).
-  if (VEGETATION && mat == MAT_AIR && y > h && !inRim && pond < 0 &&
+  if (GROUND_COVER && mat == MAT_AIR && y > h && !inRim && pond < 0 &&
       !siteKeepOut(x, z)) {
     let up = y - h;
     let nRows = wmBiome(biome, WM_B_COVER_COUNT);
@@ -4377,9 +4534,7 @@ fn genChunk(slot : u32, li : u32, actIdx : u32) {
   }
   workgroupBarrier();
 
-  let sc = vec3<i32>(vec3<u32>(slot % NCHUNK, (slot / NCHUNK) % NCHUNK,
-                               slot / (NCHUNK * NCHUNK)));
-  let base = slotToWorldChunk(sc, T.origin) * i32(CHUNK);
+  let base = slotWorldChunk(slot, T.origin) * i32(CHUNK);
   var count = 0u;
   var block = 0u;
   var act = 0u;
@@ -4627,7 +4782,7 @@ fn genChunk(slot : u32, li : u32, actIdx : u32) {
   }
 }
 
-// Full residency window: NUM_CHUNKS workgroups.
+// The whole slot space: NUM_SLOTS workgroups.
 @compute @workgroup_size(64)
 fn main(@builtin(workgroup_id) wg : vec3<u32>,
         @builtin(local_invocation_index) li : u32) {
@@ -4691,9 +4846,7 @@ fn pagefill(@builtin(workgroup_id) wg : vec3<u32>,
   gPtKernel = PT_K_PAGEFILL;
   let slot  = pageFillList[wg.x * 2u];
   let entry = pageFillList[wg.x * 2u + 1u];
-  let sc = vec3<i32>(vec3<u32>(slot % NCHUNK, (slot / NCHUNK) % NCHUNK,
-                               slot / (NCHUNK * NCHUNK)));
-  let base = slotToWorldChunk(sc, T.origin) * i32(CHUNK);
+  let base = slotWorldChunk(slot, T.origin) * i32(CHUNK);
   for (var i = li; i < CHUNK_VOL; i += 64u) {
     let l = vec3<i32>(vec3<u32>(i % CHUNK, (i / CHUNK) % CHUNK,
                                 i / (CHUNK * CHUNK)));
@@ -4835,36 +4988,80 @@ fn far(@builtin(workgroup_id) wg : vec3<u32>,
       btops[b] = t;
     }
   }
+  // ---- THE SKY CEILING: the row above which this thread has nothing to do ----
+  //
+  // genChunk has had a sky-skip since it existed (the `trees.top` block below
+  // it); the sieve never did, so a level-8 chunk 3 km above the ground still
+  // ran 64 full genCellCol evaluations per thread to conclude "air". A level
+  // box is FAR_N cells tall — 13 km at level 8 — and the terrain occupies a few
+  // hundred metres of it, so MOST of a coarse level's fill was generating sky.
+  // That per-entry cost is what forces farfield.h's kPlayFillCap down, and the
+  // cap is what makes the horizon lag a moving player.
+  //
+  // THE BOUND, and why each term is needed. A row is skippable when its floor
+  // y0 is above everything a cell in it could report:
+  //   tops[b] + step   the column's own conservative top (ground, standing
+  //                    fluid, the cover stack, an authored stamp) plus one
+  //                    cell, because farBlockerBitAt's MIDDLE band fires for
+  //                    y0 in (tops, tops + step) and must not be skipped.
+  //   btops[b]         that band's corner max, which can exceed tops[b].
+  //   treeMaxTop()     trees are NOT in farColTopFrom (see its note) and a tree
+  //                    rooted on a neighbouring, higher column can lean over
+  //                    this one — so the tree term has to be the GLOBAL
+  //                    ceiling, which is exactly what treeAt's own first line
+  //                    tests. A trunk only stands below the treeline.
+  // Everything else genCellIn can put above ground is a gas, and
+  // farCellIsSolid drops those already.
+  //
+  // Conservative on the only axis that matters: it can only skip rows whose
+  // cells were all going to be zero, so the bytes, the count, the top row and
+  // farOcc are bit-identical to the full sweep. `fardown` and `farpatch` keep
+  // the full form — they visit single scattered cells with no row to amortize
+  // over — and still agree byte for byte (the `far-downsample` gate).
+  var skyCeil = treeMaxTop();
+  for (var b = unrollFenceU(); b < 4u; b++) {
+    skyCeil = max(skyCeil, max(tops[b] + step, btops[b]));
+  }
   let planeBase = ((level - 1u) * FAR_VOX + slot * CHUNK_VOL) / 4u;
   var top = 0u;   // one plus the highest row with a non-empty cell, this thread
   for (var yi = unrollFenceU(); yi < CHUNK; yi++) {
+    // The row's floor, shared by all four of its cells (cc.y is the same).
+    let yRow = (base.y + i32(yi)) << shift;
     var word = 0u;
-    for (var b = unrollFenceU(); b < 4u; b++) {
-      let cc = base + vec3<i32>(i32(x0 + b), i32(yi), i32(zi));
-      // the sieve: fine-voxel center of the 2^shift-wide region this cell covers
-      let fine = (cc << vec3<u32>(shift)) + vec3<i32>(1 << (shift - 1u));
-      var col = cols[b];
-      let mat = genCellCol(&col, fine, T.seed) & 0xFFFu;
-      // The conservative flag first: it is what a cell keeps when the centre
-      // sample found nothing (common.wgsl FAR_BLOCKER_BIT). This is
-      // farBlockerBitAt flattened onto the hoisted `tops`/`btops` — see the
-      // comment above the b loop; the three bands are byte-identical.
-      let y0 = cc.y << shift;
-      var byteV = 0u;
-      if (y0 <= tops[b]) {
-        byteV = FAR_BLOCKER_BIT;
-      } else if (y0 - tops[b] < step) {
-        byteV = select(0u, FAR_BLOCKER_BIT, y0 <= btops[b]);
+    // The store below stays UNCONDITIONAL: this slot may hold the bytes of the
+    // level chunk that used to live in it, and a skipped row still has to be
+    // cleared to the air it now is.
+    if (yRow <= skyCeil) {
+      for (var b = unrollFenceU(); b < 4u; b++) {
+        let cc = base + vec3<i32>(i32(x0 + b), i32(yi), i32(zi));
+        // the sieve: fine-voxel center of the 2^shift-wide region this cell covers
+        let fine = (cc << vec3<u32>(shift)) + vec3<i32>(1 << (shift - 1u));
+        var col = cols[b];
+        let mat = genCellCol(&col, fine, T.seed) & 0xFFFu;
+        // The conservative flag first: it is what a cell keeps when the centre
+        // sample found nothing (common.wgsl FAR_BLOCKER_BIT). This is
+        // farBlockerBitAt flattened onto the hoisted `tops`/`btops` — see the
+        // comment above the b loop; the three bands are byte-identical.
+        var byteV = 0u;
+        if (yRow <= tops[b]) {
+          byteV = FAR_BLOCKER_BIT;
+        } else if (yRow - tops[b] < step) {
+          byteV = select(0u, FAR_BLOCKER_BIT, yRow <= btops[b]);
+        }
+        if (farCellIsSolid(mat)) {
+          // shape from the center sample, color from the surface skin (phase 4).
+          // What lands in the byte is the skin material's FAR PALETTE SLOT, not
+          // its id (common.wgsl FAR_PAL_MASK); slots are identity while the id
+          // fits in seven bits, so an unaliased material table writes exactly
+          // the byte this line wrote before the palette existed.
+          byteV |= matFarPal(&materials, farSurfaceMat(&col, mat, fine, shift, T.seed));
+        }
+        // farOcc counts NON-EMPTY cells, which now includes blocker-only ones —
+        // it gates empty-space skipping for every far reader, and a reader that
+        // hits on the flag must not have its chunk skipped out from under it.
+        if (byteV != 0u) { count += 1u; top = yi + 1u; }
+        word |= byteV << (b * 8u);
       }
-      if (farCellIsSolid(mat)) {
-        // shape from the center sample, color from the surface skin (phase 4)
-        byteV |= min(farSurfaceMat(&col, mat, fine, shift, T.seed), FAR_MAT_MASK);
-      }
-      // farOcc counts NON-EMPTY cells, which now includes blocker-only ones —
-      // it gates empty-space skipping for every far reader, and a reader that
-      // hits on the flag must not have its chunk skipped out from under it.
-      if (byteV != 0u) { count += 1u; top = yi + 1u; }
-      word |= byteV << (b * 8u);
     }
     // The cell index in this level chunk is x + y*CHUNK + z*CHUNK*CHUNK (see the
     // `farpatch` entry's unpack), so in words of four x-consecutive cells that
@@ -4972,7 +5169,7 @@ fn farpatch(@builtin(workgroup_id) wg : vec3<u32>,
         farColTopFrom(pcol.h, pcol.fluidTop, pfine.x, pfine.z, T.seed),
         pcc, shift, T.seed);
     if (farCellIsSolid(pmat)) {
-      byteV |= min(farSurfaceMat(&pcol, pmat, pfine, shift, T.seed), FAR_MAT_MASK);
+      byteV |= matFarPal(&materials, farSurfaceMat(&pcol, pmat, pfine, shift, T.seed));
     }
     if (byteV != 0u) { pnz += 1u; atomicMax(&wgFarTop, u32(pl.y) + 1u); }
     let bi = (level - 1u) * FAR_VOX + slot * CHUNK_VOL + ci;
@@ -5042,9 +5239,7 @@ fn fardown(@builtin(workgroup_id) wg : vec3<u32>,
            @builtin(local_invocation_index) li : u32) {
   // world fine-voxel base of the dirty chunk this workgroup owns
   let slot = farDirty[wg.x];
-  let sc = vec3<i32>(vec3<u32>(slot % NCHUNK, (slot / NCHUNK) % NCHUNK,
-                               slot / (NCHUNK * NCHUNK)));
-  let base = slotToWorldChunk(sc, T.origin) * i32(CHUNK);
+  let base = slotWorldChunk(slot, T.origin) * i32(CHUNK);
   // Constant over the whole dispatch, like in `far` above (see Poi).
 
   for (var level = 1u; level <= FAR_LEVELS; level++) {
@@ -5103,7 +5298,7 @@ fn fardown(@builtin(workgroup_id) wg : vec3<u32>,
         // a downsampled chunk byte-identical to a refilled one at their shared
         // boundary, and it is why farSurfaceMat takes the column rather than
         // deriving a height of its own (surfHeightAt used to, and drifted).
-        byteV |= min(farSurfaceMat(&pcol, mat, fine, shift, T.seed), FAR_MAT_MASK);
+        byteV |= matFarPal(&materials, farSurfaceMat(&pcol, mat, fine, shift, T.seed));
       }
       let bi = farVoxByteIndex(level, cc);
       let bsh = (bi & 3u) * 8u;

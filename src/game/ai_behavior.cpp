@@ -146,7 +146,10 @@ Intent IntentFromName(const std::string& s) {
 //       "rangeMin": 7, "rangeMax": 11, "bandSlack": 1.4,
 //       "approachSpeed": 1, "strafeSpeed": 0.55, "retreatSpeed": 0.8,
 //       "circleTendency": 0.7, "circleHoldTicks": 30,
-//       "repathTicks": 12, "navRadius": 22, "maxStepUp": 2, "maxStepDown": 5
+//       "repathTicks": 12, "navRadius": 22
+//       // maxStepUp / maxStepDown / headroom are OPTIONAL OVERRIDES. Omitted
+//       // (or 0) the planner uses the creature's own rig budgets, which are
+//       // what its legs actually do — see Movement in ai_behavior.h.
 //     },
 //     "attack": {
 //       "style": "slash", "reach": 9.5, "aimTolerance": 0.45,
@@ -233,8 +236,10 @@ bool LoadBehaviors(const std::string& path, Library& out, std::string& log) {
       pr.movement.circleHoldTicks = q.value("circleHoldTicks", 24u);
       pr.movement.repathTicks = q.value("repathTicks", 12u);
       pr.movement.navRadius = q.value("navRadius", 22.0f);
-      pr.movement.maxStepUp = q.value("maxStepUp", 2);
-      pr.movement.maxStepDown = q.value("maxStepDown", 5);
+      // Absent, or 0, means "ask the body" -- see Movement in ai_behavior.h.
+      pr.movement.maxStepUp = q.value("maxStepUp", 0);
+      pr.movement.maxStepDown = q.value("maxStepDown", 0);
+      pr.movement.headroom = q.value("headroom", 0);
     }
     if (p.contains("attack")) {
       const auto& q = p["attack"];
@@ -325,7 +330,8 @@ bool SaveBehaviors(const std::string& path, const Library& lib,
       << ", \"repathTicks\": " << p.movement.repathTicks
       << ", \"navRadius\": " << num(p.movement.navRadius)
       << ", \"maxStepUp\": " << p.movement.maxStepUp
-      << ", \"maxStepDown\": " << p.movement.maxStepDown << " },\n";
+      << ", \"maxStepDown\": " << p.movement.maxStepDown
+      << ", \"headroom\": " << p.movement.headroom << " },\n";
     o << "      \"attack\": { \"styles\": [";
   for (size_t i = 0; i < p.attack.styles.size(); i++)
     o << (i ? ", " : "") << "\"" << p.attack.styles[i] << "\"";
@@ -477,8 +483,16 @@ void UpdatePath(Brain& b, const Profile& pr, const SelfView& self,
                 const WorldView& v, uint32_t tick) {
   NavParams np;
   np.radius = (int)std::lround(pr.movement.navRadius);
-  np.maxStepUp = pr.movement.maxStepUp;
-  np.maxStepDown = pr.movement.maxStepDown;
+  // THE BODY'S BUDGET UNLESS THE PROFILE OVERRODE IT. A planner that refuses
+  // what the drive would happily climb makes a creature stand at the foot of a
+  // slope; a planner that permits what the drive refuses makes it grind against
+  // one. Both are the same bug -- two copies of one number -- and the fix is to
+  // stop having two (SelfView::stepUpCells, resolved from the rig in
+  // Mob::BuildRig).
+  np.maxStepUp =
+      pr.movement.maxStepUp > 0 ? pr.movement.maxStepUp : self.stepUpCells;
+  np.maxStepDown =
+      pr.movement.maxStepDown > 0 ? pr.movement.maxStepDown : self.stepDownCells;
   // HEADROOM MUST NOT BE STRICTER THAN THE LOCOMOTION IT STEERS. The obvious
   // value is the creature's own height, and it is wrong: the walk drive checks
   // ground rise and nothing else, so a planner that demands 13 clear voxels
@@ -488,7 +502,8 @@ void UpdatePath(Brain& b, const Profile& pr, const SelfView& self,
   // Three voxels is enough to reject a crawlspace and nothing else, and being
   // LOOSER than the drive is the safe direction to be wrong in: the drive's own
   // probe still refuses what it cannot walk.
-  np.headroom = 3;
+  np.headroom =
+      pr.movement.headroom > 0 ? pr.movement.headroom : self.headroomCells;
 
   // Retire waypoints we have arrived at BEFORE deciding whether to replan, so
   // "the path is finished" and "the path is stale" are different answers.

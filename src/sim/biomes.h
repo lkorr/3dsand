@@ -100,6 +100,11 @@ struct BiomeDef {
   float temperature = 0.5f, moisture = 0.5f;
   std::string skin, subsoil;
   uint32_t skinId = 0, subsoilId = 0;
+  // The SOLID the loose part of this biome's cover becomes where the ground is
+  // steeper than a powder can hold (worldmap.h kB_FirmCover). Empty / unresolved
+  // packs 0, and worldgen falls back to the subsoil if that is solid, else stone.
+  std::string firmSkin;
+  uint32_t firmSkinId = 0;
   int skinDepth = 1;
   int patchThreshold = 0, patchCellLog2 = 5;
   // Which of worldgen's fixed-function ground layers this biome gets. These

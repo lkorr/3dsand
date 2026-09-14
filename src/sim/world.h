@@ -1,7 +1,10 @@
 #pragma once
 #include <array>
+#include <atomic>
 #include <cstdint>
+#include <deque>
 #include <functional>
+#include <string>
 #include <unordered_map>
 #include <vector>
 
@@ -49,6 +52,50 @@ constexpr uint32_t kNChunk = kWorldN / kChunk;          // 32
 constexpr uint32_t kNumChunks = kNChunk * kNChunk * kNChunk;  // 32768
 constexpr uint32_t kChunkVol = kChunk * kChunk * kChunk;      // 4096
 constexpr uint64_t kVoxelCount = (uint64_t)kWorldN * kWorldN * kWorldN;
+
+// ---- TICKET SLOTS: storage that is resident but not in the window ----------
+// docs/PLAN_chunk_tickets.md §2.1. THE SLOT SPACE IS NO LONGER THE WINDOW.
+//
+// A chunk's slot used to be its world coordinate modulo the window
+// (`chunkSlotIndex`, common.wgsl), so there were exactly kNumChunks slots and
+// arithmetic assigned every one of them. That is why "simulate a chunk 40
+// chunks away" could not be done by allocating a page: page space was never the
+// constraint, slot IDENTITY was. Tickets add slots that no window coordinate
+// maps to, so a distant chunk can be resident without evicting a near one.
+//
+//   slots [0, kNumChunks)           the window, addressed by the toroidal mask.
+//                                   UNCHANGED, and still the only slots the
+//                                   mask can produce.
+//   slots [kNumChunks, kNumSlots)   ticket slots, addressed only through the
+//                                   ticket map (a CPU-built wc -> slot table).
+//
+// THE DISTINCTION THAT MATTERS EVERYWHERE BELOW: kNumChunks is a statement
+// about the WINDOW's geometry (how many chunks fit in the box, what the mask
+// wraps at); kNumSlots is a statement about STORAGE (how many per-slot records
+// exist). Anything that sizes a buffer, bounds a dispatch over slots, or is a
+// plane stride inside a per-slot buffer is kNumSlots. Anything that describes
+// the window box — the wrap, `chunkInWindow`, the raymarch's clip — stays
+// kNumChunks. Conflating them is how a ticket slot ends up reading a window
+// chunk's memory, which is the failure docs/PLAN_chunk_tickets.md §5 names as
+// the risk of this phase.
+//
+// P0 SHIPS kTicketMax = 0, so kTicketSlots is 0 and kNumSlots == kNumChunks
+// exactly. Every buffer is byte-identical, every dispatch is the same size, and
+// the acceptance for this phase is that the world hash and the smoke probes do
+// not move. What P0 buys is that the ~160 addressing sites are CLASSIFIED and
+// routed through named functions, so P1 turns tickets on by changing this one
+// constant plus the ticket map's contents, not by re-auditing 15 shaders.
+constexpr uint32_t kTicketMax = 0;          // concurrent tickets; P1 raises it
+constexpr uint32_t kTicketBoxN = 5;         // 5^3 chunk box, inner 3^3 active
+constexpr uint32_t kTicketChunks = kTicketBoxN * kTicketBoxN * kTicketBoxN;  // 125
+// Rounded up to a multiple of 64 because sim_compact dispatches 64 slots per
+// workgroup over the whole slot space and kNumChunks is already a multiple of
+// 64; a ragged tail would need a second bound in the shader.
+constexpr uint32_t kTicketSlots =
+    ((kTicketMax * kTicketChunks + 63u) / 64u) * 64u;          // 0 at kTicketMax=0
+constexpr uint32_t kNumSlots = kNumChunks + kTicketSlots;      // 32768 at P0
+static_assert(kNumSlots % 64 == 0,
+              "sim_compact dispatches kNumSlots/64 workgroups of 64");
 
 // ---- the fluid lab's flat-slab worldgen mode (docs/PLAN_fluid_overhaul.md §4)
 // The `--lab` / `--fluid-bench` test world: solid stone for y <= kLabSlabY,
@@ -312,9 +359,182 @@ constexpr uint32_t kMaxExplosionsPerTick = 8;
 constexpr int32_t kMaxExplosionRadius = 20;  // EXP_R_MAX in common.wgsl
 constexpr uint32_t kExplosionWg = 11;        // EXP_WG in common.wgsl
 
+// ---- THE DIRTY-REASON NAMES, in ONE place ---------------------------------
+// Bit b of a chunk's dirty word is the rule that asked for it: bits 0..11 are
+// common.wgsl's DIRTY_R_*, bits 12.. are sim_step.wgsl's DIRTY_M_*. This table
+// used to exist twice — once in World's snapshot fold and once in the `sleep`
+// gate — with a comment on each saying it must match the other. It did not
+// survive the first bit added after that comment was written, which is the
+// standing argument against two lists (tuning_params.def, pass_table.def).
+//
+// Order is bit order. Adding a bit means adding a row HERE and nowhere else.
+constexpr int kDirtyReasonBits = 26;
+inline constexpr const char* kDirtyReasonName[kDirtyReasonBits] = {
+    "write",      "react-idle", "stain-idle", "flow",
+    "viscous",    "seam",       "part",       "wbody",
+    "mutate",     "MOVE",       "STAIN-WROTE","REACT-FIRED",
+    // sim_step's DIRTY_M_* liquid-stage split
+    "down",       "diag",       "equalize",   "split",
+    "film",       "displace",   "bridge",     "SUBMERGED",
+    "film-press", "powder",     "gas",        "solo",
+    // docs/PLAN_gas_particles.md P0: gas moving FLAT (the top-plane sheet) and
+    // gas whose intent pointed out of the residency window (the sink).
+    "gas-lat",    "gas-edge"};
+
+// The bit for a reason NAME, resolved from the one table above rather than
+// written down as a number a second time -- 22/24/25 in a header is exactly
+// the drift the single-list rule exists to stop. Returns 0 for an unknown
+// name, which the static_assert below turns into a build error.
+constexpr uint32_t DirtyReasonBit(const char* name) {
+  for (int i = 0; i < kDirtyReasonBits; i++) {
+    const char* a = kDirtyReasonName[i];
+    const char* b = name;
+    while (*a != '\0' && *a == *b) { a++; b++; }
+    if (*a == '\0' && *b == '\0') return 1u << i;
+  }
+  return 0u;
+}
+
+// Every mark a MOVING GAS VOXEL leaves on its chunk. The renderer's "gas may
+// be present this frame" flag (RenderParams bit 3, PLAN_gas_particles stage
+// 1b) is armed from this OR'd over the whole dirty array plus the live parcel
+// count: parcels alone are not enough, because in-window smoke is a voxel and
+// leaves no parcel behind until it reaches a face.
+constexpr uint32_t kDirtyGasMask = DirtyReasonBit("gas") |
+                                   DirtyReasonBit("gas-lat") |
+                                   DirtyReasonBit("gas-edge");
+static_assert(kDirtyGasMask == (DirtyReasonBit("gas") |
+                                DirtyReasonBit("gas-lat") |
+                                DirtyReasonBit("gas-edge")) &&
+                  DirtyReasonBit("gas") != 0 &&
+                  DirtyReasonBit("gas-lat") != 0 &&
+                  DirtyReasonBit("gas-edge") != 0,
+              "a gas dirty-reason name was renamed in kDirtyReasonName without "
+              "updating kDirtyGasMask");
+
 // Particle system sizes — must match common.wgsl.
 constexpr uint32_t kParticleCap = 262144;
 constexpr uint32_t kClaimSize = 262144;
+
+// ---- GAS PARTICLES (docs/PLAN_gas_particles.md stage 1) --------------------
+// Gas that has left the residency window. Its OWN pool, not a share of
+// kParticleCap, and the plan's §2.9 recommendation for two reasons that both
+// turned out to matter: the density splat wants to walk gas and only gas, and
+// the two populations must not be able to starve each other — a fight full of
+// ballistic debris must not thin a plume, and a forest fire must not stop a
+// sword from shattering.
+//
+// EVERY ONE OF THESE IS A BOUND (rule 2). At the caps the system degrades:
+// gasLeave is refused and the voxel behaves exactly as it does today, which is
+// the old behaviour, not a failure.
+//
+// Must match the GAS_* block in assets/shaders/sim_gas.wgsl (and GAS_SPAWN_CAP
+// in sim_step.wgsl); scripts/check_invariants.py compares them.
+// sim.gasMode. Two states, and the names say what each PROMISES rather than
+// what it switches: at Wall the edge behaves as it did before stage 1 and no
+// gas pass is recorded, so the feature cannot be seen at all.
+constexpr uint32_t kGasModeWall = 0;
+constexpr uint32_t kGasModeSink = 1;
+
+constexpr uint32_t kGasParticleCap = 262144;   // 8 MiB per page, 16 MiB paired
+// 65,536 and not the 8,192 this shipped with for one afternoon, and the reason
+// is RULE 1 rather than throughput. `gasLeave` charges a shared atomicAdd
+// cursor, so WHICH voxels are refused when the list fills is decided by which
+// workgroup arrived first — and a refused voxel STAYS IN THE GRID, so that
+// choice is visible in the world hash. (The same shape as sim_particle's
+// `append` at kParticleCap, which the engine has always had; the difference is
+// that a vaporized particle writes no voxel on the tick it is dropped.)
+//
+// Two ways out, and this is the cheap one: make the cap unreachable so the
+// binding constraint is the POOL instead, whose overflow drops a parcel that
+// is already outside the window and therefore cannot move a voxel. 65,536 is a
+// quarter of the window's top face in ONE tick, and four such ticks exhaust
+// kGasParticleCap anyway. The `gas-leave` gate asserts refusals == 0, so the
+// day this is not enough it is a printed number and not a silent divergence.
+//
+// The real fix, if that day comes, is mark+apply: the CA flags cells that want
+// to leave and a second pass converts them in a deterministic order, which is
+// the pattern sim_explode already uses for exactly this reason.
+constexpr uint32_t kGasSpawnPerTick = 65536;   // window-edge conversions per tick
+constexpr uint32_t kGasCpuSpawnPerTick = 1024; // CPU-authored gas spawns per tick
+constexpr uint32_t kGasClaimSize = kClaimSize; // re-entry claim hash
+constexpr int32_t  kGasCeilingVox = 192;       // die this far above the window top
+
+// The outer density box: one 16-BIT COUNT per cell, two to a word, GAS_OUTER_N
+// cells per axis at 2^kGasOuterShift fine voxels each. The edge is 2x the window's
+// and the box is centred on the window, which is what makes the mapping the
+// renderer reproduces a single expression with no per-frame state:
+//
+//     originVox = windowOriginChunks * kChunkSize - kWorldN/2
+//     cell      = (worldVoxel - originVox) >> kGasOuterShift
+//
+// DEVIATION from the plan, which asked for 0.4 m cells AND a 2x-window span
+// AND 2 MiB. 128^3 bytes IS 2 MiB and 128 x 0.4 m is 51.2 m, half the stated
+// span — the three numbers never agreed. Span and memory are kept; the cell is
+// 8 voxels = 0.8 m.
+constexpr uint32_t kGasOuterN = 128;
+constexpr uint32_t kGasOuterShift = 3;
+constexpr uint32_t kGasOuterCells = kGasOuterN * kGasOuterN * kGasOuterN;
+// WIDENED FROM A BYTE (stage 1b). A byte capped a 0.8 m cell at the 192 the
+// splat guard allowed, i.e. 192/512 = 37.5% full, which was fine while the box
+// only ever held PARCELS — everything in it had already left the window and was
+// tens of metres away. Stage 1b splats every in-window gas voxel into the same
+// box so the two representations can be crossfaded, and an in-window smoke
+// column is routinely denser than that: a cell can legitimately be all 512 of
+// its fine voxels, and several parcels may share one on top. Fading a crisp
+// voxel plume INTO a representation that saturates at 37.5% would visibly thin
+// the plume exactly where the crossfade is supposed to be invisible. 4 MiB.
+constexpr uint32_t kGasOuterWords = kGasOuterCells / 2;   // 1 Mi u32 = 4 MiB
+static_assert(kGasOuterN << kGasOuterShift == 2 * kWorldN,
+              "the gas outer box must span exactly two window edges — the "
+              "renderer derives its origin from that identity");
+
+// gasSpawn / gasSpawnOps header words. The buffer is an 8-word header followed
+// by Particle-shaped records; the header doubles as this tick's gas counters,
+// which is free because the whole buffer is cleared before the CA runs.
+// Must match GAS_SP_* in sim_gas.wgsl and sim_step.wgsl.
+enum : uint32_t {
+  kGasSpCount = 0,     // gasLeave append cursor (may exceed kGasSpawnPerTick)
+  kGasSpRefused = 1,   // gasLeave refused: the per-tick list was full
+  kGasSpEdge = 2,      // gas voxels whose intent pointed out of the window
+  kGasSpPoolFull = 3,  // spawn refused: the particle pool was full
+  kGasSpReenter = 4,   // particles that became voxels this tick
+  kGasSpDied = 5,      // decay / outer box / ceiling
+  kGasSpAbove = 6,     // live particles above the window's top face
+  kGasSpLive = 7,      // live particles after integrate
+  // The gas population's DETERMINISM DIGEST: the sum of every surviving
+  // parcel's particlePriority. A sum because it must be ORDER-INDEPENDENT —
+  // append order in the pool is scheduling-dependent by construction, so a
+  // digest that depended on it would report a false divergence every run. It
+  // covers position and payload, which is the whole of a gas parcel's state
+  // (velocity is always zero). Outside the window a parcel touches no voxel,
+  // so the world hash cannot see it and this is the only thing that can.
+  kGasSpDigest = 8,
+  kGasSpHdr = 16,      // first record word
+  kGasSpStride = 8,    // u32 per record (a 32-byte Particle)
+  kGasSpHdrBytes = kGasSpHdr * 4,
+};
+
+// One CPU-authored gas spawn. Same 32-byte record the GPU list holds, so the
+// two streams are drained by one kernel: position is 24.8 with a ZERO fraction
+// (a gas parcel lives ON a cell), velocity is zero, and the flags are forced
+// GPU-side. `WorldVoxel` builds one from a cell.
+struct GasSpawnOp {
+  int32_t px = 0, py = 0, pz = 0;   // 24.8 fixed voxels
+  int32_t vx = 0, vy = 0, vz = 0;   // always zero for gas
+  uint32_t payload = 0;             // bits 0..11 material, 12..15 state
+  uint32_t flags = 0;               // forced to PFLAG_ALIVE|PFLAG_GAS on the GPU
+};
+static_assert(sizeof(GasSpawnOp) == 32, "GasSpawnOp is a Particle record");
+inline GasSpawnOp MakeGasSpawn(int32_t cx, int32_t cy, int32_t cz,
+                               uint32_t mat, uint32_t state = 0) {
+  GasSpawnOp o{};
+  o.px = cx << 8;
+  o.py = cy << 8;
+  o.pz = cz << 8;
+  o.payload = (mat & 0xFFFu) | ((state & 0xFu) << 12);
+  return o;
+}
 
 // ---- MLS-MPM fluid (docs/PLAN_mpm_fluids.md; excite/settle seam Phase 2) ----
 // The EXCITED state of liquid: GPU particles simulated by the fixed-point
@@ -558,7 +778,7 @@ static_assert(kOpenBytesPerChunk % 4 == 0,
               "openness bytes per chunk must be a whole number of words");
 constexpr uint32_t kOpenWordsPerChunk = kOpenBytesPerChunk / 4;
 constexpr uint64_t kOpennessBytes =
-    (uint64_t)kNumChunks * kOpenWordsPerChunk * 4;          // 12 MiB at 512^3
+    (uint64_t)kNumSlots * kOpenWordsPerChunk * 4;           // 12 MiB at 512^3
 // THREE PLANES, not one (2026-09-05, PLAN_frame_perf.md §3 item 4):
 //   [0, kNumChunks)              the world-chunk STAMP per slot (below)
 //   [kNumChunks, 2 kNumChunks)   the tick of the slot's last FULL walk
@@ -572,7 +792,11 @@ constexpr uint64_t kOpennessBytes =
 // DESIGN.md note that "dilating the dirty list is not available" still holds:
 // this is 17x17 column STAMPS per dirty chunk, not 15^3 chunk WALKS. WGSL
 // mirrors the layout as OPEN_WALKED_BASE / OPEN_TOUCH_BASE (common.wgsl).
-constexpr uint32_t kOpennessGenWords = 2 * kNumChunks + kNChunk * kNChunk;
+// The first two planes are PER SLOT (kNumSlots, so ticket slots get a stamp and
+// a walk tick like any other). The third is per window COLUMN and stays
+// kNChunk^2: a ticket has no place in the window's (x, z) column grid, and the
+// refresh cursor that reads it only ever walks window slots.
+constexpr uint32_t kOpennessGenWords = 2 * kNumSlots + kNChunk * kNChunk;
 constexpr uint64_t kOpennessGenBytes = (uint64_t)kOpennessGenWords * 4;   // 260 KiB
 
 // ---- the IRRADIANCE grid (docs/PLAN_gi.md §3, W3 P1) -----------------------
@@ -603,8 +827,19 @@ constexpr uint64_t kOpennessGenBytes = (uint64_t)kOpennessGenWords * 4;   // 260
 // zero is stored with its low bit set). Same stamp, same writers' standing:
 // the walk zeroes it for a slot the window reused, the raymarch fills it.
 constexpr uint32_t kIrradiancePlanes = 2;
+
+// NO MIP PYRAMID OVER PLANE 0 (tried and removed, 2026-09-11). A gather ray
+// that reaches ~12 m wants a prefiltered cell at the far end rather than a
+// point sample of one 40 cm block-face, and three chunk-local levels were
+// built for exactly that -- then deleted, because READING them cost the
+// raymarch fragment shader 128 -> 168 registers (--shader-stats), which is the
+// wrong side of its occupancy cliff, and slowed --render-budget cameras with
+// no indirect light in them at all. The gather's reach came from its STEP
+// BUDGET instead, which is free in registers. assets/shaders/raymarch.wgsl's
+// giGatherRays carries the full measurement and says what would have to change
+// (move the gather to a compute pass) before trying again.
 constexpr uint64_t kIrradianceBytes =
-    (uint64_t)kNumChunks * kOpenBlocksPerChunk * kOpenFaces * 4 *
+    (uint64_t)kNumSlots * kOpenBlocksPerChunk * kOpenFaces * 4 *
     kIrradiancePlanes;   // 96 MiB at 512^3
 
 // ---- the GLOW field (docs/PLAN_glow.md; assets/shaders/sim_glow.wgsl) ------
@@ -657,15 +892,80 @@ constexpr uint64_t kIrradianceBytes =
 // around by testing the emitter's Y coordinate.
 constexpr uint32_t kGlowSrcWordsPerSlot = 4;
 constexpr uint64_t kGlowSrcWords =
-    (uint64_t)kNumChunks * kGlowSrcWordsPerSlot;                   // 512 KiB
+    (uint64_t)kNumSlots * kGlowSrcWordsPerSlot;                    // 512 KiB
 constexpr uint64_t kGlowFieldWords =
-    (uint64_t)kNumChunks * kOpenBlocksPerChunk;                    // 8 MiB
+    (uint64_t)kNumSlots * kOpenBlocksPerChunk;                     // 8 MiB
 constexpr uint64_t kGlowBytes = (kGlowSrcWords + kGlowFieldWords) * 4;
 // The WGSL side derives this as `NUM_CHUNKS * 4u` from constants the prelude
 // already emits, so the field needs no new prelude constant and no
 // ShaderConstantPrelude / check_shaders.sh edit. This mirror exists for the
 // gate's readback arithmetic only.
 constexpr uint64_t kGlowFieldBaseWord = kGlowSrcWords;
+
+// ---- THE REPOSE OCCUPANCY SNAPSHOT (assets/shaders/sim_step.wgsl) ---------
+//
+// One bit per voxel: "a powder could drop into this cell", i.e. the cell holds
+// neither a solid nor a powder. Written by `reposesnap`, a prepass recorded
+// BEFORE the CA's 54 substep dispatches over the SAME compacted dirty list the
+// CA uses, and read by the angle-of-repose stage in sim_step.wgsl.
+//
+// WHY IT HAS TO EXIST, in one paragraph, because it is the only licence in this
+// engine for a CA read past distance 1. The 3x3x3 colour lattice keeps acting
+// cells >=3 apart and bounds writes to <=1 cell, so the 3x3x3 write boxes of
+// same-colour cells TILE SPACE: every cell in the world is inside exactly one
+// acting cell's box. A read at distance <=1 is inside mine and only I can write
+// it; a read at distance >=2 is inside somebody else's box, and whether it
+// shows the pre-pass word or their write is decided by GPU scheduling. Per-
+// material repose needs to see 2 and 3 cells out (a 2:1 face and a 1:1 face are
+// locally IDENTICAL — the difference is at distance 2, which is a fact about
+// the lattice, not about the rule). So the answer is read from a snapshot of
+// the world at TICK START, which is the same in every run of the same tick,
+// instead of from live voxels.
+//
+// DELIBERATELY STALE. A drop that fills in mid-tick still reads open, the grain
+// slides toward it, the ordinary tryMove refuses, and next tick's snapshot says
+// so. Staleness is bounded by one tick and is identical in every run, which is
+// the only property rule 1 asks for.
+//
+// THE SET IT COVERS is each dirty chunk plus the NINE neighbours a probe can
+// reach -- not the 3x3x3 block's 26 -- on two one-line facts about the probe
+// offsets in sim_step.wgsl: every probe has dy <= -1 (nothing looks up), and no
+// probe offsets both lateral axes. See reposeRingOffset there, which owns the
+// table and the obligation that comes with it.
+//
+// A SIDE TABLE, per design guideline 2: the voxel word is full, and this is
+// derived data — not hashed, not saved, rebuilt every tick for exactly the
+// chunks that could be read.
+//
+// IT IS NOT A SPARSE ONE, and calling it sparse would be the wrong word for the
+// price. The ALLOCATION is DENSE: one bit for every cell in the window, all
+// 16.125 MiB resident from World::Init, about +36% on the page pool's own
+// resident bytes, paid by any world whose materials.json carries a `repose`
+// line. What is sparse is the WRITING — only the chunks a probe can reach are
+// refilled, so a settled world touches none of it. A genuinely sparse form
+// (bits only for chunks holding a repose material) would trade that flat cost
+// for an indirection in the CA's hottest read; at one bit per voxel the dense
+// form is small enough that the trade is not worth making, but it IS a trade. Indexed by the SLOT cell index (cellIndexW), so
+// word = idx >> 5 and bit = idx & 31, which is why the bitfield is exactly
+// kVoxelCount/32 words with no per-chunk arithmetic anywhere.
+//
+// PER-SLOT VALIDITY, and it is required rather than belt-and-braces: the
+// residency window is toroidal, so a slot is reused by a new world chunk as the
+// window walks, and a probe that read the previous occupant's bits would be
+// reading another place in the world. Each slot carries `tick + 1` in the tick
+// region (0 is therefore never a valid stamp, which is what makes the zeroed
+// allocation cold-start correctly) and a probe into a slot whose stamp is not
+// this tick's REFUSES. Nothing finer is needed: the window origin is constant
+// for the whole of one command buffer, so a slot cannot change occupant between
+// the prepass and the CA rows of the same tick.
+constexpr uint64_t kReposeSnapBitWords = kVoxelCount / 32;       // 16 MiB at 512^3
+constexpr uint64_t kReposeSnapTickBase = kReposeSnapBitWords;    // + kNumChunks stamps
+constexpr uint64_t kReposeSnapWords = kReposeSnapBitWords + kNumChunks;
+constexpr uint64_t kReposeSnapBytes = kReposeSnapWords * 4;      // 16.125 MiB
+// The WGSL side derives both from constants the prelude already emits
+// (NUM_CHUNKS * CHUNK_VOL / 32u), so this needs no new prelude constant; the
+// mirrors exist for the allocation and for the gate's arithmetic.
+static_assert(kVoxelCount % 32 == 0, "repose snapshot is 1 bit per voxel");
 
 // The residency window is toroidal, so a slot is reused by a new chunk as the
 // window walks. Its 384 openness bytes then describe geometry that is no longer
@@ -765,6 +1065,37 @@ constexpr uint64_t kShadowCacheBytes =
 // Load factor at the ~200k patches an overlook frame resolves is under 20%,
 // and with the bilinear taps' neighbour ring somewhat above; the Poisson tail
 // past 8 live patches in one set is ~1e-5 of patches at 20% load.
+// ---- THE PENUMBRA WINDOW (shadow_resolve.wgsl, 2026-09-11) -----------------
+// One word per bucket, PARALLEL to the cache and never read by the fragment
+// shader: a 16-frame sliding window of the patch's sun-visibility samples, plus
+// the lift byte, packed as
+//
+//   bits 0..15  one bit per sample slot, set when that sample saw the sun
+//   bits 16..20 how many slots have been filled since the slot was claimed
+//   bits 21..28 the softening lift (0..255) from the last CENTRE ray
+//
+// WHAT IT BUYS. The cache used to publish ONE ray's verdict, so a patch was
+// either lit or shadowed and a shadow edge was a hard step from full sun to
+// TUNE_SHADOW_LIFT, one patch wide however far away the blocker was. The sun is
+// not a point: with the ray jittered inside a cone each frame and the last 16
+// verdicts averaged, a patch's published value is the FRACTION of the disc it
+// can see, so the edge becomes a real penumbra that widens with blocker
+// distance (owner report: "shadows expand pixels at a time; it should be a
+// gradient").
+//
+// WHY A WINDOW AND NOT AN EXPONENTIAL BLEND. An EMA of a cycling sample set
+// never settles — it oscillates with the sequence's period forever, which is a
+// pulsing shadow, which is the defect next door. A sliding window over a fixed
+// 16-sample sequence is EXACT after 16 frames and then stops moving entirely
+// while the scene and the sun hold still: the same slot is rewritten with the
+// same bit. --gate shadow-cache's flicker arm asserts that.
+//
+// WHY IT IS ITS OWN BUFFER rather than two more words on the cache slot: the
+// reader probes a whole 8-way set on every lit pixel and that set is exactly
+// one 64-byte cache line (see kShadowCacheWords). Widening the slot would put
+// the hot path on two lines to carry state only the resolve pass ever touches.
+constexpr uint64_t kShadowHistBytes = (uint64_t)kShadowCacheBuckets * 4;  // 4 MiB
+constexpr uint32_t kShadowSamples = 16;   // window length; 16 bits of the word
 constexpr uint32_t kShadowReqHeaderWords = 4;   // [0] atomic count, [1] saved count, [2..3] stats
 constexpr uint32_t kShadowReqWords = 4;         // key, bucket, packed cell, packed face+sub
 // 2^20 records (16 MiB), not the 2^18 (4 MiB) it shipped with: a frame's
@@ -933,7 +1264,7 @@ constexpr uint32_t kPtNoWord = 0xFFFFFFFFu;
 //   [17]     first fault: the in-chunk local index
 //   [18]     LAST fault: the page-table entry (racy store)
 //   [19]     reserved
-//   [20..31] per-kernel fault tally, indexed by PT_K_*
+//   [20..32] per-kernel fault tally, indexed by PT_K_*
 //
 // [16]/[18] are what separate a FREED page (PT_EMPTY) from a DEMOTED one
 // (UNIFORM / JITTER): the first is the hysteresis free path, the second is
@@ -945,8 +1276,34 @@ constexpr uint32_t kPtNoWord = 0xFFFFFFFFu;
 // origin names a chunk that has nothing to do with the fault. That decode cost
 // an hour of chasing chunks nothing had touched (RESEARCH_streaming_hitch.md
 // §6). A slot is an identity only within one origin.
-constexpr uint32_t kPageFaultWords = 32;
+// 40, not 32: the per-kernel tally starts at word 20 and is PT_K_COUNT wide,
+// and PT_K_COUNT went 12 -> 13 when sim_gas.wgsl got its own bank. At 32 the
+// gas kernel's counter would have been word 32 — one past the end — which the
+// GPU would have written into whatever followed the buffer without a word of
+// complaint. Sized with headroom for the same reason kMaxUses is.
+constexpr uint32_t kPageFaultWords = 40;
 constexpr uint32_t kPageFaultBytes = kPageFaultWords * 4;
+
+// ---- fluidArgsStage: the FA_* word map -------------------------------------
+// The seam's counter block (common.wgsl's FA_* names, plus the two refusal-site
+// counters and the two force-settle counters declared in sim_fluid_seam.wgsl
+// itself — a const only one shader reads belongs next to its consumer, and
+// adding it to common.wgsl re-keys every shader in the engine).
+//
+// A NAMED SIZE because it USED to be the literal 128 in four places (the
+// allocation, the snapshot copy, the snapshot decode and ReadFluidArgsSync's
+// read) and the member comment still claimed "16 u32" long after the map had
+// grown to 32. Four literals and a stale comment is exactly the "two places
+// must agree" shape that goes wrong silently: a shader writing past the end
+// scribbles on whatever the allocator put next.
+constexpr uint32_t kFluidArgsWords = 40;
+constexpr uint32_t kFluidArgsBytes = kFluidArgsWords * 4;
+// The snapshot ring gives this block a fixed 256-byte slot (kFluidArgsOff ..
+// kFluidBlocksOff in world.cpp). Growing the map past that would silently
+// overwrite the block list that follows it.
+static_assert(kFluidArgsBytes <= 256,
+              "fluidArgs no longer fits its snapshot-ring slot; widen the "
+              "gap between kFluidArgsOff and kFluidBlocksOff first");
 // Where the per-kernel tally starts inside the record. Mirrored in
 // common.wgsl's voxStore as PT_FAULT_KBASE — the one place a WGSL constant for
 // it would have to be threaded through the prelude for no other reader.
@@ -1016,13 +1373,20 @@ constexpr uint32_t kPageRetireCeiling = kPageFreeProbesPerTick * kPageRetireTick
 // unlikely, and the proof is three lines:
 //
 //   - Alloc() is only ever reached for a SENTINEL slot, so at the moment of a
-//     request at most kNumChunks - 1 slots hold a page.
+//     request at most kNumSlots - 1 slots hold a page.
 //   - The retire queue holds at most kPageRetireCeiling.
 //   - freePages = kPoolPages - resident - retired >= 1. Always.
 //
 // It is not "headroom for an unbounded demand" — it is a pool that exceeds a
 // demand with a hard geometric ceiling. There cannot be a request for page
-// kNumChunks + 1 because there is no chunk slot to hand it to.
+// kNumSlots + 1 because there is no chunk slot to hand it to.
+//
+// TICKETS KEEP THE PROOF (docs/PLAN_chunk_tickets.md §2.1) because the first
+// line of it counts SLOTS, not window chunks: a ticket slot can hold a page
+// exactly as a window slot can, so the demand ceiling moves from kNumChunks to
+// kNumSlots and the pool follows it. This is the same "derived, never a
+// literal" rule kWorldN already gets — raise kTicketMax and the pool grows with
+// it, at 2 MiB per ticket's 125 chunks.
 //
 // CHANGE kWorldN AND THIS FOLLOWS, which is the point: the pool tracks the
 // window instead of being re-measured and re-guessed every time the window
@@ -1081,7 +1445,7 @@ constexpr uint32_t kPageRetireCeiling = kPageFreeProbesPerTick * kPageRetireTick
 // for the 5 cm / extended-radius target, where volume grows 8x and bulk
 // terrain gets MORE internally uniform, not less — sentinel compression
 // improves at finer resolution while sky compression stays flat.
-constexpr uint32_t kPoolPages = kNumChunks + kPageRetireCeiling;
+constexpr uint32_t kPoolPages = kNumSlots + kPageRetireCeiling;
 
 // THE WINDOW-SIZE GUARD RAIL. `voxels` is ONE storage buffer of kPoolPages
 // pages, and Vulkan's maxStorageBufferRange is a uint32_t — so 4 GiB - 1 is
@@ -1286,7 +1650,30 @@ constexpr uint32_t kArtPaletteBaseGpu = kStainPaletteBase - kArtPaletteSlotsGpu;
 // (ids are assigned from the bottom up).
 constexpr uint32_t kTintPaletteSlotsGpu = 256;
 constexpr uint32_t kTintPaletteBaseGpu = kArtPaletteBaseGpu - kTintPaletteSlotsGpu;
-static_assert(kTintPaletteBaseGpu > 1024,
+
+// ---- the FAR SLOT palette (far-field cascade — sim/materials.h) ------------
+// Fourth reserved run, same trick as the three above and for the same reason:
+// the renderer needs index -> material for something that is not a material id.
+//
+// A far cascade cell is ONE byte: seven bits and a conservative blocker flag
+// (common.wgsl FAR_SLOT_MASK / FAR_BLOCKER_BIT). Those seven bits used to BE a
+// material id, which is why `LoadMaterials` refused a 129th material — the far
+// field would have started painting the wrong colour at distance and claiming
+// a blocker wherever bit 7 landed, with nothing to say so. They are now a FAR
+// SLOT: an index into this run, where entry `kFarPaletteBaseGpu + slot` holds
+// (in its `flags` word) the material id that slot paints. Materials that look
+// alike at cascade distance share a slot by authoring `"far": "<material>"` in
+// materials.json, so the 128 is now a budget on DISTINGUISHABLE FAR COLOURS
+// rather than on the material table.
+//
+// Slots are assigned identity-first (material i takes slot i while i < 128), so
+// a table with no aliases writes byte-for-byte what it wrote before this run
+// existed. See LoadMaterials' slot assignment for the aliasing rules.
+//
+// 128 entries exactly fills the 7-bit field; a bigger run would be unreachable.
+constexpr uint32_t kFarPaletteSlotsGpu = 128;
+constexpr uint32_t kFarPaletteBaseGpu = kTintPaletteBaseGpu - kFarPaletteSlotsGpu;
+static_assert(kFarPaletteBaseGpu > 1024,
               "reserved palette runs have grown down into the material id "
               "space — raise kMaterialSlots or shrink a run");
 
@@ -1413,8 +1800,8 @@ constexpr uint32_t kWaterChunkCap = 1024;
 // arm, its attribution tick, and the RESOLVED sweep level (WBS_REAUDIT /
 // WBS_AUDITTICK / WBS_SWEEPY in common.wgsl).
 //
-// W1 widened it to 39: the RELEVEL block (docs/PLAN_water_relevel.md §3.2/§3.3
-// — WBS_RV* in common.wgsl). Twelve words, and every one of them is `RV`
+// W1 widened it to 41: the RELEVEL block (docs/PLAN_water_relevel.md §3.2/§3.3
+// — WBS_RV* in common.wgsl). Fourteen words, and every one of them is `RV`
 // rather than `R`: WBS_RSUM (word 12) is ALREADY the adoption/re-audit
 // reduce's running sum, and a re-audit can run while a body is hot and
 // relevelling, so aliasing the two sets would have one pass zeroing the
@@ -1422,7 +1809,7 @@ constexpr uint32_t kWaterChunkCap = 1024;
 // which the plan's word list did not have and the implementation needs: the
 // ledger consumes LAST tick's histogram and may lower the level THIS tick, so
 // the bucket origin has to be published by the pass that filled the buckets.
-constexpr uint32_t kWaterBodyStateWords = 39;
+constexpr uint32_t kWaterBodyStateWords = 41;
 // DRAIN OP SLOTS PER BODY (component 6). The discharge is emitted through the
 // existing spawnAppend seam, which reads a CPU-sized op stream — so the CPU
 // RESERVES a contiguous block per body it proposes and the GPU fills it. This
@@ -1634,6 +2021,15 @@ constexpr uint32_t kWaveImpactCap = 16;
 constexpr uint32_t kTrampleCap = 48;
 
 // Must match TickParams in common.wgsl.
+// The repose snapshot's epoch source -- see TickParams::snapEpoch below for
+// why it is a counter and not the tick. A function-local static so there is one
+// across every TU, and atomic because worldgen and the tick path can build a
+// TickParams from different threads.
+inline uint32_t NextSnapEpoch() {
+  static std::atomic<uint32_t> n{0};
+  return ++n;
+}
+
 struct TickParams {
   uint32_t tick;
   uint32_t seed;
@@ -1875,7 +2271,42 @@ struct TickParams {
   // the hash. See DESIGN.md §9c.
   uint32_t currentMode = 0;
   uint32_t currentPrimCount = 0;
-  uint32_t padCp0 = 0, padCp1 = 0;
+  // sim.gasMode (docs/PLAN_gas_particles.md). 0 = the residency edge is a
+  // WALL, 1 = a SINK. Read CPU-side per tick like windMode and dayPhase, so it
+  // is part of the tick input stream a replay reproduces and the twice-run
+  // determinism gate compares. It was the padCp0 pad word, so the struct
+  // layout — which check_invariants.py compares against common.wgsl on TOTAL
+  // SIZE — is unchanged.
+  uint32_t gasMode = 1;
+  // ---- THE REPOSE SNAPSHOT EPOCH (kReposeSnap* above) --------------------
+  //
+  // A MONOTONIC, NEVER-RESET counter, and every word of that is load-bearing.
+  // The snapshot's per-slot validity stamp cannot be the TICK, because the tick
+  // is not monotonic: F7 regen (src/main.cpp, `tick = 0`) rewinds it with the
+  // stamp region untouched, and every selftest arm that replays a fixed tick
+  // window does the same. A slot still carrying stamp k from before the rewind
+  // would then SKIP its refill at tick k and hand the CA the PREVIOUS WORLD's
+  // occupancy bits -- same seed, same tick, same inputs, different pile,
+  // depending only on how long the session had run. This counter cannot alias
+  // that way: it only ever increases, so a stale stamp is always strictly less
+  // than the current one.
+  //
+  // INCREMENTED BY TickParams' OWN DEFAULT INITIALIZER, once per construction,
+  // which is once per recorded tick at every one of the ten call sites that
+  // build one -- no site can forget it, and a site that builds a TickParams it
+  // never submits only burns a value, which costs nothing. Starts at 1, so 0
+  // stays "no snapshot" and the zero-initialized buffer cold-starts correctly.
+  //
+  // NOT hashed state and not an input: two runs of the same seed and tick may
+  // legitimately sit at different epochs (the determinism gate's second run
+  // does, in the same process). The sim is invariant to the VALUE because the
+  // prepass writes the same epoch the CA then compares against; what it is not
+  // invariant to is a stamp from another tick reading as current, which
+  // monotonicity is exactly what rules out. It was the padCp1 pad word, so the
+  // struct layout -- which check_invariants.py compares against common.wgsl on
+  // TOTAL SIZE -- is unchanged. Wraps after 2^32 ticks, i.e. 4.5 years of
+  // continuous simulation at 30 Hz.
+  uint32_t snapEpoch = NextSnapEpoch();
   int32_t currentPrimLo[3] = {1, 1, 1};   // union AABB, inclusive world cells
   int32_t padCp2 = 0;                     // (lo > hi = no primitives)
   int32_t currentPrimHi[3] = {0, 0, 0};
@@ -2342,6 +2773,33 @@ constexpr float kFarHalfExtentMeters(uint32_t k) {  // level-k half-extent, m
 // radius before any level has filled.
 constexpr float kWindowHalfExtentMeters = (float)(kWorldN >> 1) * kVoxelMeters;
 
+// ---- THE PENDING-FACE WORD: FarParams.origins[k].w -------------------------
+// Six counts of level-CHUNK layers still waiting on the sieve, one per box
+// face in the order (-x, +x, -y, +y, -z, +z), packed low field first, plus a
+// flag for "this whole level is a reset in flight". Written by
+// FarField::FaceWord (src/sim/farfield.cpp), read by raymarch.wgsl's farBox.
+// scripts/check_invariants.py pins the two together.
+//
+// THE FIELD IS SIZED BY kFarNChunk, not by convenience. It was four bits and
+// saturated at 15 while a level is 32 chunks across, so a deeper backlog left
+// stale toroidal slabs inside the box the renderer was told it could march
+// (farfield.h's FaceWord note has the failure). Five bits holds every layer a
+// box has; a count past that is not expressible and escalates to the flag.
+// kFarNChunk - 1 layers is the most an exclusion can usefully name: at
+// kFarNChunk the box is empty, which the flag already says.
+constexpr uint32_t kFarFaceBits = [] {
+  uint32_t b = 1;
+  while ((1u << b) < kFarNChunk) b++;
+  return b;
+}();
+constexpr uint32_t kFarFaceMax = (1u << kFarFaceBits) - 1u;
+static_assert(kFarFaceMax >= kFarNChunk - 1, "a face field must hold a whole box");
+// Kept clear of the sign bit: the word travels as int32_t in FarParams and the
+// WGSL side reads it with u32(), which is a value conversion, not a bitcast.
+constexpr uint32_t kFarFaceFlagBit = 30;
+static_assert(kFarFaceBits * 6 <= kFarFaceFlagBit, "face fields overlap the flag");
+constexpr uint32_t kFarFaceAllPending = 1u << kFarFaceFlagBit;
+
 // Fog reaches ~full opacity (exp(-4.5) ~= 1%) at whatever radius it is pinned
 // to; kFogOpticalDepths is that budget, shared by the static pin below and by
 // the adaptive term in WriteRenderParams.
@@ -2381,10 +2839,30 @@ struct WorldSnapshot {
   IVec3 mirrorBase{};                 // WORLD chunk coord of the 3x3x3 mirror corner
   std::vector<uint32_t> mirror;       // 27 chunks of voxel words
   uint32_t activeChunks = 0;
+  // Every dirty-reason bit set by ANY chunk this snapshot, OR'd in the fold
+  // that already walks the array for `activeChunks`. One `|=` per chunk, so it
+  // is free where the diagnostic histogram (SANDVOX_DIRTY_REASONS) is not, and
+  // it answers the one always-on question the histogram was too expensive for:
+  // WHICH KINDS of rule are running at all. Read by the gas render flag.
+  uint32_t dirtyReasonOr = 0;
   uint64_t voxelTotal = 0;
   uint32_t worldHash = 0;
   uint32_t pick[8] = {};
   uint32_t particleCount = 0;         // live particles (post-resolve that tick)
+  // ---- gas particles (docs/PLAN_gas_particles.md) ----
+  // Async, one tick latent, exactly like everything else on this ring. The
+  // per-tick counters come from gasSpawn's header, which is cleared before the
+  // CA runs, so each is "this tick" and not a running total. `gasCount` is the
+  // live population; the rest are the attributions CLAUDE.md rule 6 asks for,
+  // so "the plume is thin" is answered by a number that names WHICH bound bit.
+  uint32_t gasCount = 0;         // live gas particles (post-resolve that tick)
+  uint32_t gasLeaveAccepted = 0; // voxels converted at the window edge
+  uint32_t gasLeaveRefused = 0;  // conversions refused: the spawn list was full
+  uint32_t gasEdgeHits = 0;      // gas voxels whose intent left the window
+  uint32_t gasPoolRefused = 0;   // spawns dropped: the gas pool was full
+  uint32_t gasReentered = 0;     // particles that became voxels again
+  uint32_t gasDied = 0;          // decay / outer box / ceiling
+  uint32_t gasAboveWindow = 0;   // live parcels above the window's top face
   uint32_t tick = 0;                  // sim tick this snapshot was captured at
   std::vector<uint8_t> dirtyFlags;    // per-chunk next-tick dirty (kNumChunks)
   // Per-chunk support-loss flags (kNumChunks): the sim saw a supporting voxel
@@ -2517,13 +2995,30 @@ class World {
     return SlotChunkIndex({c.x >> 4, c.y >> 4, c.z >> 4}) * kChunkVol +
            (lz * kChunk + ly) * kChunk + lx;
   }
+  // The C++ twin of common.wgsl's `slotWorldChunk`. A ticket slot is NOT
+  // window-coordinate arithmetic (docs/PLAN_chunk_tickets.md §2.2), so it reads
+  // its world chunk from the CPU-side ticket table instead. At kTicketMax = 0
+  // there are no such slots and the branch is dead.
   IVec3 SlotToWorldChunk(uint32_t slotIdx) const {
+    if (kTicketSlots != 0 && slotIdx >= kNumChunks) {
+      return TicketSlotWorldChunk(slotIdx);
+    }
     IVec3 s{(int)(slotIdx % kNChunk), (int)((slotIdx / kNChunk) % kNChunk),
             (int)(slotIdx / (kNChunk * kNChunk))};
     int m = (int)kNChunk - 1;
     return {origin_.x + ((s.x - origin_.x) & m), origin_.y + ((s.y - origin_.y) & m),
             origin_.z + ((s.z - origin_.z) & m)};
   }
+  // P0 STUB, the C++ half of common.wgsl's ticketSlotWorldChunk. P1 gives
+  // `Tickets` a slot -> wc vector and returns from it; until then no slot can
+  // reach here (kTicketSlots == 0) and the compiler drops the caller's branch.
+  IVec3 TicketSlotWorldChunk(uint32_t slotIdx) const {
+    (void)slotIdx;
+    return {0, 0, 0};
+  }
+  // Is this slot one the window's arithmetic can produce? Everything that
+  // decomposes a slot into (x, y, z) window-chunk coords must ask first.
+  static bool IsWindowSlot(uint32_t slotIdx) { return slotIdx < kNumChunks; }
   static uint64_t PackChunkKey(IVec3 wc) {
     auto u = [](int v) { return (uint64_t)(uint32_t)(v + (1 << 20)) & 0x1FFFFF; };
     return u(wc.x) | (u(wc.y) << 21) | (u(wc.z) << 42);
@@ -2574,8 +3069,12 @@ class World {
   // selected automatically, always available.
   enum class Residency { Dense, Paged };
   Residency residency = Residency::Dense;
+  // Dense is the IDENTITY map — page i for slot i — so it needs one page per
+  // slot, ticket slots included (docs/PLAN_chunk_tickets.md §2.8: dense with
+  // tickets active must produce the same hash as paged, which it cannot do if
+  // a ticket slot has no page to be the identity of).
   uint32_t PoolPages() const {
-    return residency == Residency::Dense ? kNumChunks : kPoolPages;
+    return residency == Residency::Dense ? kNumSlots : kPoolPages;
   }
 
   // The CPU table itself. Read freely; the MUTABLE accessor is for PageTable
@@ -2597,7 +3096,58 @@ class World {
   // chunks don't. Queue a chunk for CPU readback; duplicates are coalesced;
   // non-resident requests are ignored. Up to kFetchPerTick chunks ride each
   // tick's readback slot (bounded traffic).
-  void RequestChunkFetch(IVec3 worldChunk);
+  //
+  // WHO ASKED. One FIFO serves every consumer of the CPU mirror -- the island
+  // scans (32 a scan), the terrain colliders (24 a tick), a mob's ground and
+  // burn probes, settle-back's support test, spells, audio occlusion -- and
+  // drains kFetchPerTick per readback slot, so a flood from one of them is
+  // starvation for all the rest. Until 2026-09-12 that was invisible: the
+  // gates force-fetch, and nothing reported the queue's depth, how old a
+  // request was when it finally rode a slot, or how many were dropped because
+  // the chunk streamed out first. `FetchProbe` counts all of that PER SOURCE;
+  // the --frames summary and --fell-tree's FALL line print `FetchReport()`.
+  // Tuning kFetchPerTick or any consumer's cap is justified by that line or
+  // not at all. A tag is a hint about attribution, never about priority: the
+  // queue is still strictly first-come.
+  enum class FetchSource : uint8_t {
+    Other = 0,   // untagged callers (spells, audio, harnesses, gates)
+    IslandScan,  // EventReady / RunIslandDetection (phys/debris.cpp)
+    Terrain,     // ManageTerrain's collider sweep (phys/debris.cpp)
+    Mob,         // a creature's ground / burn probe (game/mob.cpp)
+    Settle,      // SettleFootprintSupported (phys/debris.cpp)
+    Count
+  };
+  static const char* FetchSourceName(FetchSource s);
+  void RequestChunkFetch(IVec3 worldChunk,
+                         FetchSource src = FetchSource::Other);
+  struct FetchProbe {
+    static constexpr int kSources = (int)FetchSource::Count;
+    uint64_t requests[kSources] = {};   // accepted into the queue
+    uint64_t coalesced[kSources] = {};  // already queued: no second entry
+    uint64_t refused[kSources] = {};    // not resident when asked
+    uint64_t carried[kSources] = {};    // rode a readback slot
+    uint64_t dropped[kSources] = {};    // streamed out between ask and drain
+    // Age = ticks from the request to the slot that carried it, where the
+    // stamp is the tick of the most recent EncodeReadbacks: 1 means "the very
+    // next slot", the documented one-tick latency. Anything above that is
+    // time spent queued behind other consumers (or behind a tick with no free
+    // readback slot, which drains nothing).
+    uint64_t ageSum[kSources] = {};
+    uint32_t ageMax[kSources] = {};
+    uint32_t depthMax = 0;     // longest the queue ever got (after a push)
+    uint32_t drains = 0;       // readback slots encoded
+    uint32_t drainsFull = 0;   // ...that took kFetchPerTick and left some waiting
+    uint32_t leftMax = 0;      // most left waiting after one drain
+    uint64_t leftSum = 0;      // ...summed over drains (mean backlog)
+    uint32_t sinceTick = 0;    // the window starts here (ResetFetchProbe)
+  };
+  const FetchProbe& Fetches() const { return fetchProbe_; }
+  void ResetFetchProbe() {
+    fetchProbe_ = FetchProbe{};
+    fetchProbe_.sinceTick = fetchTick_;
+  }
+  // One line: totals, per-source counts, ages, depth. Never empty.
+  std::string FetchReport() const;
   // Cached copy of a world chunk, or nullptr if never fetched. version is the
   // tick whose post-sim state the data reflects.
   const CachedChunk* Cached(IVec3 worldChunk) const;
@@ -2618,12 +3168,41 @@ class World {
   // read as "fresh" against the new scene's early ticks — the paged mirror
   // then skips its tightening (encodeTick <= snapTick) and, had the ranges
   // lined up, would have tightened against ANOTHER world's dirty flags.
-  void InvalidateSnapshot() { snap_.valid = false; }
+  // A regenerated window makes EVERY cached chunk stale, so the chunk cache
+  // goes with the snapshot. It did not, and the fetch path's version guard
+  // (`cc.version <= sl.tick`, KickReadback) then kept the old contents for
+  // any later reader whose tick numbers were LOWER than the gate that filled
+  // the entry: the body-stain gate (ticks 29000+) after corpse-bleed (61000+)
+  // wrote stone and blood the GPU held and the CPU mirror never showed, and
+  // reported a contact pass that "saw nothing" (2026-09-13).
+  void InvalidateSnapshot() {
+    snap_.valid = false;
+    cache_.clear();
+  }
 
   // ---- MPM fluid render bounds (RenderParams::fluidLo/fluidHi) ------------
   // Record this tick's CPU-known spawn cells so a fresh pour is visible on the
   // frame it lands, rather than when the block list gets back from the GPU a
   // few ticks later. Render-only, and NOT an input to any sim decision.
+  // ---- CPU-authored gas spawns (docs/PLAN_gas_particles.md) --------------
+  //
+  // RULE 3, and it is why this is a queue rather than a buffer write: a gas
+  // parcel created from the CPU is an INPUT OP, on the same footing as a
+  // BrushOp or a ParticleSpawn. It rides the per-tick stream, the GPU forces
+  // its liveness bits, and a replay of the stream reproduces it. Nothing here
+  // touches a voxel or a particle buffer directly.
+  //
+  // Queue before the tick; SubmitTick drains the list into `gasSpawnOps` and
+  // tells Simulation how many there were (the C_GAS latch has to know, or the
+  // pass that consumes them may not be recorded). Over kGasCpuSpawnPerTick in
+  // one tick is REFUSED, not silently truncated at the far end: the budget is
+  // charged where the caller can see it.
+  //
+  // Returns how many were accepted.
+  uint32_t QueueGasSpawns(const GasSpawnOp* ops, uint32_t n);
+  void TakeGasSpawns(std::vector<GasSpawnOp>& out);
+  uint32_t PendingGasSpawns() const { return (uint32_t)pendingGasSpawns_.size(); }
+
   void NoteFluidSpawnBounds(const FluidSpawnOp* ops, uint32_t n, uint32_t tick);
   // Inclusive world-voxel AABB of everything the fluid surface march can hit,
   // already dilated by kFluidRenderPadVox. Returns false when there is no
@@ -2812,6 +3391,10 @@ class World {
   // costs one frame of stale shadows, which is the same thing a teleport costs.
   rhi::Buffer shadowCache;    // kShadowCacheBuckets * 2 u32 (8 MiB)
   rhi::Buffer shadowReq;      // header + kShadowReqCap * 4 u32 request records
+  // The penumbra window (the kShadowHistBytes block above), one word per
+  // bucket. Written and read by the resolve pass alone; the fragment shader
+  // never touches it, which is the point of it being a separate buffer.
+  rhi::Buffer shadowHist;     // kShadowCacheBuckets u32 (4 MiB)
   // ---- openness grid (the kOpenFaces block above) ----
   // Same standing as the shadow cache: render-only, derived, disposable, never
   // hashed or saved. CopySrc so `--gate openness` can read a block-face back;
@@ -2831,6 +3414,8 @@ class World {
   // an unzeroed stamp would read as valid for whatever the driver left, which
   // is the failure mode the openness grid's own comment names.
   rhi::Buffer glow;           // kGlowSrcWords + kGlowFieldWords u32 (8.5 MiB)
+  // 1 bit per voxel + one per-slot tick stamp; see the kReposeSnap* block.
+  rhi::Buffer reposeSnap;     // kReposeSnapWords u32 (16.125 MiB)
   // The second buffer a fragment shader writes, and the same argument applies:
   // measurement-only counters (kRenderStat* above), read back by the telemetry
   // path through rhi::CommandEncoder::CopyRenderWritten. 4 KiB.
@@ -2873,6 +3458,25 @@ class World {
   rhi::Buffer spawnOps;        // kMaxParticleSpawnsPerTick ParticleSpawn
   rhi::Buffer sprites;         // kMaxSprites Sprite (CPU-written, render-only)
 
+  // ---- gas particles (docs/PLAN_gas_particles.md stage 1) ----
+  // Their OWN pool, paged with the same parity convention as `particles`:
+  // gasParticles[Page()] is the buffer this tick READS, [1-Page()] the one it
+  // writes, and after FlipPage the roles swap. The two populations never share
+  // a buffer, a count word or a claim slot — see kGasParticleCap.
+  rhi::Buffer gasParticles[2];  // kGasParticleCap Particle (32 B)
+  rhi::Buffer gasCounts;        // 4 u32: [0]/[1] = live count per page
+  rhi::Buffer gasClaim;         // kGasClaimSize u32 — re-entry claim hash
+  // The CA's outbox AND this tick's gas counters (the 8-word header). Cleared
+  // whole before the CA runs, appended to by sim_step's gasLeave, drained by
+  // sim_gas's spawn pass later in the same tick.
+  rhi::Buffer gasSpawn;         // kGasSpHdr + kGasSpawnPerTick*8 u32
+  rhi::Buffer gasSpawnOps;      // same shape, CPU-authored (kGasCpuSpawnPerTick)
+  rhi::Buffer gasArgs;          // 8 u32: [4..6] dispatch args
+  rhi::Buffer gasDispatchArgs;  // 3 u32, indirect-only (see dispatchArgs note)
+  // The outer density box: RENDER-ONLY derived data. Not hashed, not saved,
+  // rebuilt from scratch every tick. CopySrc so a gate can read it back.
+  rhi::Buffer gasOuter;         // kGasOuterWords u32 (two u16 counts each)
+
   // ---- MLS-MPM fluid (see the fluid block above kFluidCap) ----
   // fluidGrid, fluidBlockMap and fluidBlockList are per-substep scratch,
   // cleared and rebuilt inside the tick. fluidParticles[2] is the carried
@@ -2893,7 +3497,7 @@ class World {
   rhi::Buffer fluidBlockList;    // kFluidBlocks u32: blockIdx -> chunk slot
   rhi::Buffer fluidGrid;         // kFluidBlocks * 4096 nodes * 8 i32 (mass,
                                  // mom xyz, species mass x3, foam — FLUID_GW)
-  rhi::Buffer fluidArgsStage;    // 16 u32 — the FA_* word map in common.wgsl:
+  rhi::Buffer fluidArgsStage;    // kFluidArgsWords u32 — the FA_* word map:
                                  // node args + live count + event counters
   rhi::Buffer fluidDispatchArgs; // 3 u32, indirect-only (see dispatchArgs note)
   rhi::Buffer fluidPDispatchArgs; // 3 u32, indirect-only: per-particle passes
@@ -3018,6 +3622,8 @@ class World {
   int lastSlot_ = -1;
   WorldSnapshot snap_;
   IVec3 origin_{0, 0, 0};
+  // Drained into gasSpawnOps by SubmitTick, once, at the head of the tick.
+  std::vector<GasSpawnOp> pendingGasSpawns_;
 
   // Recent CPU-side fluid spawn box (render bounds only — see
   // NoteFluidSpawnBounds). Held for kFluidSpawnBoundsTicks so a pour is
@@ -3028,8 +3634,15 @@ class World {
   IVec3 spawnBoxHi_{-1, -1, -1};
   uint32_t spawnBoxTick_ = 0;
 
-  std::vector<IVec3> fetchQueue_;
+  struct FetchReq {
+    IVec3 wc;
+    uint32_t tick;  // fetchTick_ when asked (see FetchProbe's age note)
+    uint8_t src;    // FetchSource
+  };
+  std::deque<FetchReq> fetchQueue_;
   std::unordered_map<uint64_t, uint8_t> fetchQueued_;   // dedup (packed key)
+  uint32_t fetchTick_ = 0;  // tick of the last EncodeReadbacks: request stamp
+  FetchProbe fetchProbe_{};
   std::unordered_map<uint64_t, CachedChunk> cache_;     // packed world key
 
   // CPU mirror of the page table — the authority for every C++ translation.

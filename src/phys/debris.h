@@ -1,7 +1,11 @@
 #pragma once
+#include <array>
+#include <chrono>
 #include <cstdint>
 #include <deque>
+#include <memory>
 #include <functional>
+#include <string>
 #include <unordered_map>
 #include <vector>
 
@@ -92,7 +96,21 @@ class DebrisSystem {
 
   // Mob limbs need marching-cubes terrain too: register extra positions for
   // this tick's ManageTerrain sweep (call before PreTick; cleared after).
-  void AddTerrainAnchor(Vec3 posVoxel, float radiusVoxels);
+  //
+  // `velVoxPerSec` is optional and is the difference between a creature
+  // standing and a creature falling: a patch takes a chunk fetch plus a slot
+  // in the per-tick build budget to appear, so a body moving fast has to ask
+  // for the ground it is ABOUT to reach, not the ground it is standing on.
+  // See the lookahead sweep in ManageTerrain.
+  //
+  // `horizonVoxels` is the creature's PLANNING horizon (navRadius + 4 while it
+  // has a target), kept apart from the body radius on purpose: the body's own
+  // chunks are collision and are listed every tick, the horizon is what the
+  // A* planner reads through the mirror and is listed on a stride (a mob
+  // with a 30-voxel horizon is ~216 chunks, and re-scanning all of them every
+  // tick when nothing moved was most of a standing creature's terrain cost).
+  void AddTerrainAnchor(Vec3 posVoxel, float radiusVoxels,
+                        Vec3 velVoxPerSec = Vec3{}, float horizonVoxels = 0.0f);
 
   // Take ownership of an existing physics body (severed limb, ragdoll piece):
   // it becomes ordinary debris — culling, despawn, terrain upkeep. Any joints
@@ -135,6 +153,56 @@ class DebrisSystem {
   // owing `budget` blood voxels, with `gushTicks` of dismemberment gout.
   // False when no such body, or it has no blood.
   bool WoundBody(uint64_t handle, Vec3 woundW, float budget, int gushTicks);
+
+  // ---- A GARMENT ON A CORPSE IS A FOLLOWER, NOT A JOINTED BODY -------------
+  //
+  // `shell` stops being simulated and is teleported onto `host` at the rigid
+  // offset the two hold RIGHT NOW, every PostStep, for as long as both exist.
+  // Kinematic, so it has no mass, no gravity and no contact response of its
+  // own: the pair's dynamics are the HOST's dynamics, entire.
+  //
+  // WHY THIS EXISTS, stated where it is used rather than in a plan doc. A worn
+  // shell is geometrically INSIDE the limb it wraps, at an iron-against-flesh
+  // mass ratio. There are exactly three things two such bodies can be, and two
+  // of them are motors:
+  //   - roped together by a Fixed joint: a stiff constraint across a deep
+  //     overlap between very unequal masses is the textbook way to make a
+  //     sequential-impulse solver GAIN energy every step. This is what
+  //     Mob::Die used to build, and it is the armoured-corpse blow-up the
+  //     owner reported on 2026-09-13 (`corpse-armor`): every limb pinned at
+  //     Jolt's own 47.12 rad/s clamp, the rig flying apart while still
+  //     attached, then slowly hauled back together by the same joints.
+  //   - two free dynamic bodies sharing the same space: the solver resolves
+  //     the penetration by firing them apart.
+  //   - one body's pose DERIVED from the other's, which is this. The shell
+  //     contributes nothing to the solver at all, so an armoured corpse has
+  //     the same body count, the same constraint graph and the same mass as
+  //     the naked one — which is the property the gate asserts.
+  //
+  // It is the same relationship Mob::DriveWornShells maintains on a living
+  // creature (MobLimb::wornHost); death hands it over rather than trading it
+  // for a constraint, so a garment is a follower in EVERY phase and there is
+  // no transition at which the pair can gain energy. False when either handle
+  // is not an adopted body of this system.
+  bool StrapBody(uint64_t shell, uint64_t host);
+  // Cut one strap by handle: the body becomes ordinary dynamic debris, keeping
+  // the velocity it was being driven at. For the drag-out-of-the-loot-panel
+  // path (ShedCorpseLoot) — a plate pulled off a corpse has to fall off it, and
+  // "the body is already lying there" stops being true the moment the body is
+  // glued to the limb. False when there was no strap to cut.
+  bool UnstrapBody(uint64_t handle);
+  // The host a strapped body follows, or 0. For callers and for the gate: a
+  // shell body with a host is one the solver never sees.
+  uint64_t WornHostOf(uint64_t handle) const;
+  // APPENDS every follower of `host` to `out`. For the one caller that has to
+  // treat a piece and its gear as one set — the collision-group re-tie when a
+  // severed limb leaves its sever hold (Mob::TickSeveredHolds). Appends rather
+  // than assigns so the caller can seed the list with the host itself, which is
+  // the shape DisableCollisionsAmong wants.
+  void FollowersOf(uint64_t host, std::vector<uint64_t>& out) const;
+  // Followers currently being driven. A cheap standing assertion that the
+  // count matches what was dressed, and a probe for the corpse gates.
+  uint32_t StrappedCount() const;
 
   // TAKE A BODY OUT OF THE WORLD. Not damage and not a cull: the thing has
   // been picked up, and it stops existing as matter. Goes through the same
@@ -371,6 +439,108 @@ class DebrisSystem {
       else empty++;
     }
   }
+
+  // ---- A BODY MAY NOT ENTER SPACE NO COLLIDER DESCRIBES -------------------
+  //
+  // The Jolt twin of Player::KnownDrop (game/player.cpp), and the other half
+  // of the anti-tunnelling guarantee that Physics' LinearCast motion quality
+  // starts (see the note above Physics::CreateDebrisBody). A shape cast can
+  // only hit a triangle that EXISTS, and the patch under a body is built by
+  // ManageTerrain some ticks after something asks for it: a chunk fetch has to
+  // land first, then a slot in kTerrainBuildsPerTick. A body that outruns that
+  // arrives in a chunk with no mesh in it at all, passes clean through
+  // whatever the voxels say is there, and ends the step further ahead of the
+  // patches than it started -- the fall feeds itself, exactly the way the
+  // player's blind fall did before 378972e.
+  //
+  // `prevPosVoxel` is where the body was BEFORE Physics::Step, which both
+  // callers already hold (Body::xf and MobLimb::xf are overwritten only after
+  // this has run). If the step ENDED in an unvouched chunk the body is put
+  // back at the last point along the segment that was vouched, keeping both
+  // velocities so it resumes at its real speed the moment the patch lands.
+  // The position tested is the body ORIGIN, so the test carries up to a
+  // body's-worth of slop -- which is the right scale, because this exists for
+  // errors measured in chunks and LinearCast owns the ones measured in voxels.
+  //
+  // IT IS A CLAMP, NOT A VETO, in two ways, and both matter:
+  //   - a body ALREADY in unvouched space is let through, or anything that
+  //     spawned out there (or whose patch was evicted under it) would be
+  //     pinned where it stands forever;
+  //   - a body held for kUntunnelHoldTicks consecutive steps is released with
+  //     a report, so no amount of streaming starvation can leave something
+  //     hovering in mid-air indefinitely.
+  //
+  // Returns true if the body was moved.
+  bool UntunnelBody(uint64_t handle, const Vec3& prevPosVoxel);
+
+  // ---- ...AND A JOINTED RIG IS ONE BODY FOR THAT PURPOSE ------------------
+  //
+  // WHY THE PER-BODY CLAMP ABOVE IS WRONG FOR A RAGDOLL. Owner report,
+  // 2026-09-13: a clothed human knocked limp by a long fall "becomes a crazy
+  // tangled mess ball of limbs and clothes that aren't actually connected
+  // properly... the limbs move to different noisily placed locations on
+  // different frames". That is this clamp, seen from the outside.
+  //
+  // A human rig is ~15 limb bodies (~35 dressed) spanning two or three chunks,
+  // and the clamp's decision is per body and per chunk: falling fast, the
+  // LEADING bodies -- the feet -- enter the unvouched chunk several ticks
+  // before the head does. Each one is teleported back to its own last vouched
+  // sample WITH ITS VELOCITY INTACT while its neighbours keep travelling, so
+  // every tick of the starvation window opens a fresh multi-voxel violation at
+  // every joint across the rig. The solver then does what a sequential-impulse
+  // solver does with a constraint stretched 30 voxels in one step: it closes it
+  // by force, in a different direction for every limb, for up to
+  // kUntunnelHoldTicks ticks. The clamp is not lying about the terrain; it is
+  // answering a question that only makes sense for ONE rigid body.
+  //
+  // So a rig is clamped as a unit: ONE vouched fraction of the step, the
+  // smallest any member can honestly claim, applied to every member along its
+  // own displacement. f = 1 is "the whole rig landed in vouched space" and
+  // nothing moves; f = 0 puts the rig back exactly as it was, still rigid,
+  // still at speed, and it resumes the tick the patch lands. Every
+  // intermediate value is a lerp between two poses the solver itself produced
+  // one step apart, which is the strongest statement available here that does
+  // not need the joint graph.
+  //
+  // The escape hatches stay, at RIG scope for the same reasons they exist at
+  // body scope: if ANY member started the step in unvouched space the whole rig
+  // is let through (clamping the half of a rig that is still over a patch is
+  // itself a tear), and the hold counter is keyed on `handles[0]` so the rig is
+  // held and released together.
+  //
+  // `handles` and `prevPosVoxel` are parallel and must stay so. Returns true if
+  // the rig was moved.
+  bool UntunnelRig(const std::vector<uint64_t>& handles,
+                   const std::vector<Vec3>& prevPosVoxel);
+
+  // Does this world chunk have a collision representation right now? A built
+  // patch vouches for it whether or not it produced triangles (a chunk of
+  // nothing but air, or nothing but solid, polygonizes EMPTY and is still a
+  // complete answer). So does being outside the residency window: there is no
+  // sim and no body out there, and a body that reaches it despawns.
+  bool ColliderVouched(IVec3 worldChunk) const;
+
+  // ---- why a body stopped in mid-air, or did not (CLAUDE.md rule 6) -------
+  // A clamp that fires is not a bug and a clamp that releases IS one, so the
+  // two are counted apart; `lastChunk` names the chunk with no patch in it,
+  // which is the only thing that turns "a body hung in the air" into a cause.
+  struct UntunnelProbe {
+    uint32_t holds = 0;        // steps a body was put back at the boundary
+    uint32_t bodiesHeld = 0;   // distinct bodies that have ever been held
+    uint32_t released = 0;     // held past kUntunnelHoldTicks and let through
+    float maxStepVox = 0.0f;   // longest single step this ever caught, voxels
+    IVec3 lastChunk{};         // ...and the unvouched chunk it was entering
+    // UntunnelRig only: rig-steps clamped as a unit, and the smallest fraction
+    // of a step any of them was cut back to. `rigHolds` is counted apart from
+    // `holds` because one rig-step moves a dozen bodies and adding it to the
+    // per-body total would make the two incomparable across a change like the
+    // one that introduced it.
+    uint32_t rigHolds = 0;
+    float minRigFrac = 1.0f;
+  };
+  const UntunnelProbe& Untunnel() const { return untunnel_; }
+  void ResetUntunnelProbe() { untunnel_ = UntunnelProbe{}; }
+
   bool BodyActive(uint32_t i) const;
   uint32_t PendingEvents() const { return (uint32_t)events_.size(); }
   uint32_t SettledBack() const { return settledBack_; }
@@ -393,9 +563,101 @@ class DebrisSystem {
     uint32_t lastWakeTick = 0;      // the most recent of either
     IVec3 lastWakeChunk{};          // ...and the chunk whose mesh changed
     uint32_t maxInactiveTicks = 0;  // longest quiet run ANY body managed
+    // ManageTerrain's budget, observed: real rebuilds, rebuilds pushed to a
+    // later tick by kTerrainBuildsPerTick, and stale entries whose occupancy
+    // box hashed identical (no mesh, no Jolt, no wake).
+    uint32_t terrainBuilds = 0;
+    uint32_t terrainDeferred = 0;
+    uint32_t terrainSame = 0;
+    // ...and stale entries that did not even get their occupancy read, held by
+    // kTerrainGatherPerTick. Counted APART from terrainDeferred because the
+    // two mean different things: a build deferral is a mesh that is late, a
+    // gather deferral is a chunk whose surface has not been LOOKED at yet.
+    uint32_t terrainGatherDeferred = 0;
   };
   const SettleProbe& Settle() const { return settle_; }
+  // Diagnostic: the mirror version the terrain collider for `wc` was last
+  // built from (0 = no entry). A body whose chunk reads older than the tick
+  // its cells were vacated is standing inside a collider of its own shape.
+  uint32_t TerrainBuiltVersion(IVec3 wc) const {
+    auto it = terrain_.find(World::PackChunkKey(wc));
+    return it == terrain_.end() ? 0u : it->second.builtVersion;
+  }
   void ResetSettleProbe() { settle_ = SettleProbe{}; }
+
+  // ---- WHERE THE TICK WENT (CLAUDE.md rule 6, applied to TIME) ------------
+  //
+  // "2 fps for five seconds when a tree enters the rigidbody system" is a bare
+  // number of exactly the kind rule 6 says not to bisect, and this system has
+  // eight plausible suspects inside one PreTick: the event drain, the flood,
+  // the Jolt body build, the burn/bleed/settle sweeps, and four separable
+  // halves of ManageTerrain (the need sweep, the per-chunk staleness scan, the
+  // 18^3 occupancy gather, the marching cubes, the Jolt mesh tree). Turning
+  // them off one at a time buys one hypothesis per run. Timing them where they
+  // happen buys all of them in ONE run, with denominators attached — which is
+  // what turns "a tick cost 90 ms" into "728 chunks needed, 722 gathers, 6
+  // polygonizes".
+  //
+  // OFF by default and gated on a bool, so the clock reads (two per phase per
+  // tick, plus two per chunk in the terrain loop) cost nothing in the game.
+  // Turn on with SANDVOX_DEBRIS_PROFILE=1 or SetProfiling(true); the
+  // `tree-fell` gate does the latter around its cut.
+  enum class Phase : uint8_t {
+    EventDrain,     // queue probe + EventReady, minus the scans themselves
+    IslandScan,     // RunIslandDetection: the flood, the shard dice, the ops
+    BodyCreate,     // Physics::CreateDebrisBody* + welds, inside a scan
+    Burn,
+    Bleed,
+    Settle,
+    TerrainNeed,    // ManageTerrain: needAhead sweep + sort/unique
+    TerrainScan,    // ...per-chunk cache lookup, refresh logic, vacate key
+    TerrainGather,  // ...the 18^3 occupancy gather + its hash
+    TerrainPoly,    // ...marching cubes
+    TerrainJolt,    // ...RemoveBody + CreateTerrainMesh + WakeNear
+    TerrainEvict,
+    Instances,      // BuildInstances (render-side, billed apart)
+    Count
+  };
+  static constexpr int kPhaseCount = (int)Phase::Count;
+  static const char* PhaseName(Phase p);
+  struct PhaseProfile {
+    bool on = false;
+    // Print + reset every 300 ticks. Set ONLY by SANDVOX_DEBRIS_PROFILE, never
+    // by SetProfiling: a gate drives its own window and would find the numbers
+    // it came for wiped on the last tick of it.
+    bool autoReport = false;
+    double totalUs[kPhaseCount] = {};
+    uint64_t calls[kPhaseCount] = {};
+    double curUs[kPhaseCount] = {};   // this tick, rolled up by PreTick's tail
+    // The single most expensive PreTick seen since the last reset, with its
+    // whole breakdown: the hitch IS the worst tick, and an average over 300
+    // ticks hides it completely.
+    double worstTickUs = 0;
+    uint32_t worstTick = 0;
+    double worstUs[kPhaseCount] = {};
+    uint32_t ticks = 0;
+    double tickUsTotal = 0;
+    uint32_t ticksOver8ms = 0, ticksOver16ms = 0, ticksOver33ms = 0;
+    // Denominators (rule 6 again: a duration with no count beside it is as
+    // bare as a count with no duration).
+    uint64_t chunksNeeded = 0, fetchesAsked = 0, gathers = 0, polys = 0,
+             joltMeshes = 0, bodiesCreated = 0, bodyVoxCreated = 0;
+    uint32_t maxNeededOneTick = 0, maxFetchOneTick = 0;
+    // The need sweep's own denominators: occupied lattice blocks transformed
+    // (bodies) and chunks the mob anchors listed (core every tick, horizon on
+    // its stride) -- so "chunks needed" can be split between the two.
+    uint64_t needBlocks = 0, anchorChunks = 0;
+  };
+  const PhaseProfile& Profile() const { return prof_; }
+  void SetProfiling(bool on) { prof_.on = on; }
+  void ResetProfile() {
+    const bool on = prof_.on, auto_ = prof_.autoReport;
+    prof_ = PhaseProfile{};
+    prof_.on = on;
+    prof_.autoReport = auto_;
+  }
+  // One line per phase that cost anything, worst tick first. Never empty.
+  std::string ProfileReport() const;
 
   // ---- floater attribution (the grid <-> body handoff's leak sites) -------
   //
@@ -478,6 +740,31 @@ class DebrisSystem {
     uint32_t smallAnchoredUnknown = 0;
     uint32_t smallAnchoredPowder = 0;  // resting on powder: a legitimate anchor
     uint32_t smallUnanchored = 0;      // ...and how many were freed, for scale
+    uint32_t deferredUnfetched = 0;    // components held for a chunk fetch
+    uint32_t deferGaveUpFetch = 0;     // ...of deferGaveUp, those waiting on one
+    uint32_t fetchWaitNoCache = 0;     // a flood met a chunk never fetched
+    uint32_t fetchWaitNoVoxels = 0;    // ...or cached without a voxel copy
+    uint32_t fetchWaitStale = 0;       // ...or cached older than the event
+    uint32_t sharedSeedCells = 0;      // seed cells an earlier scan this tick had labelled
+    uint32_t speculativeFetches = 0;   // ring / column chunks asked for ahead of the flood
+    IVec3 gaveUpChunk{}, gaveUpSeedLo{}, gaveUpSeedHi{};  // the last fetch give-up
+    uint32_t gaveUpChunkInWindow = 0, gaveUpChunkCached = 0;
+    uint32_t deferredBodyCap = 0;      // an assembly did not fit kMaxBodies
+    uint32_t shardsMade = 0;           // bodies cut from islands
+    uint32_t weldsMade = 0;            // fixed joints between shards
+    // ---- buoyancy (FloatBodies) -------------------------------------------
+    // `floatedBodies` is impulses applied, not bodies afloat: one body being
+    // pushed for 40 ticks counts 40, which is what a rate question wants.
+    // `floatProbesWet` against `floatProbes` is the cost claim — the dry case
+    // is meant to be two mirror reads and out, so a ratio near 1 means the
+    // early-out is not working and every body in the world is scanning a
+    // column it will never be in.
+    uint32_t floatedBodies = 0;
+    uint32_t floatProbes = 0;
+    uint32_t floatProbesWet = 0;
+    // The last waterline FloatBodies acted on, so a gate can say WHERE a body
+    // is floating rather than only that something was pushed.
+    float floatLastSurfaceY = 0;
   };
   const FloaterProbe& Floaters() const { return floaters_; }
   void ResetFloaterProbe() { floaters_ = FloaterProbe{}; }
@@ -490,7 +777,17 @@ class DebrisSystem {
   // NOT serialized: it is derived render state, re-packed on load from the
   // authoritative lattice the same way ReskinMicro derives it after a carve
   // (CLAUDE.md architecture guideline 3: derived data is reconstructible).
-  static constexpr uint32_t kSaveVersion = 1;
+  //
+  // 2 (2026-09-13): DebrisVoxel::stain went from a byte holding a palette slot
+  // to the 16-bit coat word holding a MATERIAL. The lattices are written as
+  // PODs, so the stride moved and a version-1 section would load garbage
+  // coordinates — old sections are refused, as they already are.
+  //
+  // 3 (2026-09-13): the STRAP (StrapBody) — host index + rigid offset per body.
+  // A worn shell on a corpse is a follower of the limb it covers, and a section
+  // that did not carry the relationship reloaded an armoured corpse as a pile
+  // of free bodies sharing the same space, which is the motor by another route.
+  static constexpr uint32_t kSaveVersion = 3;
   void SaveState(std::vector<uint8_t>& out) const;
   // Contract (worldio LoadEntities): Reset() has already run.
   bool LoadState(const uint8_t* data, size_t len, uint32_t version);
@@ -543,6 +840,11 @@ class DebrisSystem {
     // exhaustion the give-up is COUNTED rather than silent, which is the whole
     // point of the floater probe below.
     uint8_t retries = 0;
+    // Deferred because the flood reached a chunk the mirror does not hold yet
+    // (requested; the scan runs again when it lands). Its own counter, with a
+    // higher ceiling, because a tree crown is fetched in rounds and none of
+    // those rounds is a budget failure.
+    uint8_t fetchRetries = 0;
     // The box the caller actually named, BEFORE the margin was added: the
     // erased cells, the flagged chunk. The flood seeds only from solids in
     // (and one cell around) this box -- see RunIslandDetection -- because a
@@ -550,6 +852,18 @@ class DebrisSystem {
     // here, and labelling the whole terrain slab in a 64^3 region for every
     // scan was most of what a scan cost.
     IVec3 seedLo{}, seedHi{};
+    // Deferred for a FETCH: the first chunk the flood reached that the mirror
+    // did not hold. EventReady holds the event until that chunk's copy has
+    // landed, and only then does the re-scan (and the next fetchRetries
+    // increment) happen. Without this the re-queued event was ready again
+    // the same tick -- its SEED box was cached, only the crown was not -- and
+    // the drain loop ran it 32 times in two ticks, long before any readback
+    // could land: in the live game every scan that left the 3x3x3 mirror gave
+    // up on the spot, and a cut tree 48 voxels from the player never fell.
+    // The gates never saw it because they force-fetch their whole fixture box
+    // every tick (--fell-tree, 2026-09-12: 99 scans, 3 give-ups, 0 bodies).
+    bool waiting = false;
+    IVec3 waitChunk{};
   };
   struct Body {
     uint64_t handle = 0;
@@ -587,7 +901,20 @@ class DebrisSystem {
     }
     uint32_t bleedMat = 0;       // nonzero => body bleeds when carved
     BodyWound wound;             // where, and how much (see BodyWound)
+    // ---- THE STRAP (StrapBody) ------------------------------------------
+    // Nonzero = this body is a FOLLOWER of that one: kinematic, pose derived
+    // every PostStep, invisible to the solver. `wornRel*` is its own frame
+    // expressed in the host's, captured once when the strap was tied, so the
+    // pair is rigid rather than re-fitted per tick.
+    uint64_t wornHost = 0;
+    Vec3 wornRelPos{};
+    float wornRelQuat[4] = {0, 0, 0, 1};
+    bool Follower() const { return wornHost != 0; }
     uint32_t inactiveTicks = 0;  // settle-back countdown (PLAN §B6)
+    // Nonzero = one shard of a welded island (PLAN_rigidbody_islands.md §5):
+    // every body sharing the id was cut from the same component and is joined
+    // to its neighbours by fixed joints. Settle-back treats the set as a unit.
+    uint32_t assembly = 0;
     // Impact cue bookkeeping. `domMat` is this body's most common material,
     // cached because it is the fallback the impact cue reaches for when the
     // struck side is another body rather than the grid, and recounting a
@@ -608,15 +935,47 @@ class DebrisSystem {
     uint32_t burnCursor = 0;      // rotating scan window into voxels
     uint32_t burnedSinceRebuild = 0;  // batched collider refresh threshold
     uint32_t burnedSinceShatter = 0;  // batched connectivity re-check
+    // ---- THE COLLIDER FOOTPRINT (ManageTerrain) --------------------------
+    // The local lattice's own AABB, in `voxels` units. ManageTerrain asks for
+    // terrain patches around THIS rather than around `radiusVoxels`, and the
+    // difference is the whole reason a felled tree used to cost 900 chunks a
+    // tick: a bounding sphere of a 59 x 81 x 59 crown has radius 60, its
+    // radius+6 box is 133 voxels a side (~900 chunks), and the box the body
+    // can actually touch is 150.
+    //
+    // CACHED ON THE VOXEL COUNT, which is what every geometry edit in this
+    // file changes: adoption, carve, shatter, split and settle all add or
+    // remove voxels. Burning rewrites PAYLOADS in place and moves nothing, so
+    // it correctly does not invalidate this. Recomputed lazily by
+    // RefreshLocalBounds, so no creation site has to remember to call it.
+    int8_t lmin[3] = {0, 0, 0};
+    int8_t lmax[3] = {0, 0, 0};
+    uint32_t boundsCount = 0xFFFFFFFFu;  // != voxels.size() => recompute
+    // ...AND WHICH PARTS OF THAT BOX HOLD ANYTHING. The AABB of a rotated
+    // 81-voxel trunk with a crown at one end is mostly empty, and the sweep
+    // sat at kTerrainNeedCeiling (505 of 512 chunks a tick) for as long as
+    // the oak tumbled. So the lattice box is diced into kNeedBlock^3 blocks
+    // and one bit per block says whether any voxel lands in it; ManageTerrain
+    // transforms only the set blocks and asks for the chunks THEY cover.
+    // Same cache key as lmin/lmax (refreshed in the same call). `needDim` is
+    // the block-grid size per axis, blocks indexed (z * dimY + y) * dimX + x.
+    std::vector<uint64_t> needBlocks;
+    uint8_t needDim[3] = {0, 0, 0};
   };
+  static constexpr int kNeedBlock = 8;  // collider voxels per block side
   struct TerrainEntry {
     uint64_t handle = 0;
     IVec3 wc{};          // world chunk (streaming recycles slots, not chunks)
     uint32_t builtVersion = 0;
     uint32_t lastNeeded = 0;
     uint32_t lastRefreshReq = 0;
-    uint64_t meshHash = 0;  // collision-surface identity: liquids flowing
-                            // through a chunk must not rebuild-and-wake
+    // Identity of the pending-vacate lists (this chunk and its 26 neighbours)
+    // the collider was last meshed against; a change forces a rebuild.
+    uint64_t vacateKey = 0;
+    uint64_t occHash = 0;   // collision-surface identity: the hash of the 18^3
+                            // occupancy box the mesh is a pure function of, so
+                            // liquids flowing through a chunk neither rebuild
+                            // nor wake, and the compare runs BEFORE the mesh
   };
 
   // Are every one of this region's chunks cached at or past `required`? When
@@ -624,8 +983,9 @@ class DebrisSystem {
   // the region, which `solidOutside` reads and which nothing used to fetch, so
   // a component touching a scan-box face was anchored on a guess. The ring is
   // requested but never waited for; see the comment at the call site.
-  bool EventReady(const Event& e, World& world, uint32_t required,
-                  bool requestFetch = true) const;
+  bool EventReady(const Event& e, World& world, bool requestFetch = true) const;
+  uint32_t RequiredVersion(IVec3 wc, uint32_t eventTick) const;
+  void NoteGridWrite(const IVec3& c, uint32_t tick, uint32_t word);
   // Push every world chunk the (already clamped) region covers onto
   // pendingSupport_. The overflow path for a full event queue; deduped by
   // supportPending_ exactly like a GPU support flag, so a region spilled twice
@@ -649,6 +1009,8 @@ class DebrisSystem {
                           std::vector<CellOp>& cellOps,
                           std::vector<ParticleSpawn>& spawns);
   void ManageTerrain(uint32_t tick, World& world);
+  // Refresh Body::lmin/lmax if the voxel count moved. See the note there.
+  static void RefreshLocalBounds(Body& b);
   // Body burn: a CPU mirror of the reaction table over body voxel payloads,
   // so detached matter keeps burning (embers advance to ash, emit real fire
   // into the grid via fill-air-only ops, and grid fire ignites cold bodies
@@ -727,11 +1089,33 @@ class DebrisSystem {
   // culled, settled, dissolved or split without freeing its brick leaks pool
   // words that nothing will ever reclaim, and the pool is a hard ceiling.
   void ReleaseBody(Body& b);
+  // Put every follower back on its host, LAST in PostStep — after the cull, so
+  // a host that left the window this tick is already gone and its garment
+  // unstraps instead of being driven off a dead handle, and after the readback,
+  // so the host transform it derives from is this tick's final one.
+  void DriveStraps();
+  // Cut one strap: the body becomes ordinary dynamic debris carrying the
+  // velocity it had as a follower (the rigid-body velocity at its own origin,
+  // so a pauldron whose shoulder was spinning leaves along the tangent). Called
+  // when the host stops existing — culled, settled back, burned away, looted.
+  void UnstrapBody(Body& b);
+  // A collider rebuild mints a new handle; the strap is keyed on handles. Call
+  // beside every `b.handle = nh` the way ReplaceBody is called beside it for
+  // joints — followers of `oldHandle` re-point, and a follower that was ITSELF
+  // rebuilt goes back to kinematic (ReplaceBody does not carry motion type).
+  void CarryStrap(uint64_t oldHandle, uint64_t newHandle);
   std::function<void(uint64_t)> onBodyGone_;
   // Settle-back (PLAN §B6): a long-asleep, near-axis-aligned body converts
   // its voxels to CellOps (fill-air-only: grid content wins deterministically
   // on the GPU) and frees its body. At most one body per tick.
   void SettleBodies(uint32_t tick, World& world, std::vector<CellOp>& cellOps);
+  // Archimedes for bodies (docs/PLAN_debris_buoyancy.md phase 3). A felled
+  // trunk is not particles — it is one Jolt body, and liquids are not in the
+  // collider, so before this it sank through a lake like a stone. Reads the
+  // waterline out of the CPU mirror and hands Jolt a surface plane; the
+  // buoyancy factor is rhoLiquid/rhoBody off the same materials.json density
+  // the particle kernel uses, so a chip blown off a log and the log agree.
+  void FloatBodies(uint32_t tick, World& world);
 
   Physics* phys_ = nullptr;
   World* world_ = nullptr;
@@ -792,18 +1176,147 @@ class DebrisSystem {
   // MB allocated, zeroed and freed for every support-loss chunk, which is the
   // cost that capped the scan rate. Kept between calls and `assign`ed, so the
   // zeroing stays and the allocator leaves the hot path.
-  std::vector<uint32_t> scanWords_;
-  std::vector<uint8_t> scanSolid_;
-  std::vector<int32_t> scanLabel_;
-  std::vector<std::pair<Vec3, float>> extraAnchors_;    // mob limbs, this tick
+  std::vector<std::pair<IVec3, float>> terrainNeed_;  // ManageTerrain scratch
+  std::vector<float> terrainNeedGrid_;  // per-body chunk grid, min distance
+  // ---- THE FLOOD'S LABEL MAP: dense per chunk, shared across one tick -----
+  //
+  // Was an unordered_map keyed by packed world cell: a hash probe per cell
+  // visited and per neighbour examined, 1-2.5 us a cell over a 28k-voxel oak.
+  // Now a 4,096-entry int32 page per chunk the flood touches, allocated on
+  // first touch (16 KiB), recycled across ticks, and addressed through the
+  // chunk lookup the flood already caches (RunIslandDetection's `chunkOf`).
+  // Sparse in CHUNKS rather than in cells, which is the granularity the
+  // mirror has anyway: a scan still costs what it walks, not the 256^3 region.
+  //
+  // Cleared once per PreTick, NOT per scan, and that is the other half of the
+  // point. Three events flood the same felled tree every round (the brush's
+  // destruction event plus a GPU support flag for each chunk the cut touched)
+  // and each used to walk all of it from its own seed. A seed cell an earlier
+  // scan of this tick already labelled INHERITS that component's verdict from
+  // tickComps_ instead of re-flooding it; a flood that runs into such a
+  // component adopts its verdict the same way.
+  //
+  // Bounded by pages as the old map was bounded by kMaxIslandVoxels: past
+  // kMaxLabelPages a component is anchored as oversize (unjudgeable), exactly
+  // what the cell cap does. 2,048 pages is 32 MiB at a peak nothing real
+  // reaches -- one oak is ~112 chunks -- and the pages persist only at the
+  // high-water mark, not at the cap.
+  //
+  // `index` rides beside the label: the cell's position in its component's
+  // cell list, valid only where `label` is that component's. The shard dice
+  // and the weld pass used to rebuild two hash maps over a 28k-voxel tree to
+  // answer "which cell is my neighbour" -- more than the flood itself cost.
+  static constexpr uint32_t kMaxLabelPages = 2048;
+  struct LabelPageData {
+    std::array<int32_t, kChunkVol> label;  // -1 = unlabelled this tick
+    std::array<int32_t, kChunkVol> index;  // meaningful only under a live label
+  };
+  std::unordered_map<uint64_t, uint32_t> labelPageOf_;  // chunk key -> page
+  std::vector<std::unique_ptr<LabelPageData>> labelPages_;
+  uint32_t labelPagesUsed_ = 0;
+  LabelPageData* LabelPage(IVec3 wc);  // this tick's page for a chunk; nullptr past the cap
+  // One verdict per component labelled this tick, indexed by label, for a
+  // later scan of the same tick that meets the component's cells.
+  enum : uint8_t { TICK_ANCHORED = 1, TICK_WAIT, TICK_HELD, TICK_MADE };
+  struct TickComp {
+    uint8_t verdict = 0;
+    uint8_t anchorFlags = 0;  // 1 boundary, 2 unknown, 4 oversize, 8 powder
+    IVec3 waitChunk{};        // TICK_WAIT: the chunk its event waits for
+  };
+  std::vector<TickComp> tickComps_;
+  void BeginTickLabels();  // PreTick: forget the last tick's labels + verdicts
+  struct Anchor {
+    Vec3 pos;
+    float radius = 0.0f;
+    Vec3 vel{};  // voxels/s, for the lookahead sweep (may be zero)
+    // The planning horizon (navRadius + 4 for a creature with a target), 0
+    // when there is none. Listed on a stride, not every tick: see
+    // kTerrainHorizonStride in ManageTerrain.
+    float horizon = 0.0f;
+  };
+  std::vector<Anchor> extraAnchors_;                    // mob limbs, this tick
   std::unordered_map<uint64_t, TerrainEntry> terrain_;  // packed world chunk key
   uint32_t lastTerrainTick_ = 0;  // the sweep TerrainCensus reports on
-  uint32_t lastCellWriteTick_ = 0;
+  // Per chunk, the tick of the last grid write this system made into it
+  // (island removal, rubble, settle-back). A scan may not read the chunk from
+  // a mirror copy older than that, and ManageTerrain re-fetches it until the
+  // copy catches up, whatever the dirty flags say. Pruned once satisfied.
+  std::unordered_map<uint64_t, uint32_t> chunkWriteTick_;
+  // THE OVERLAY: per chunk, every cell this system wrote since the mirror
+  // last caught up, with the word it wrote. The flood and the collider read
+  // the mirror THROUGH it, so neither ever sees a body's former cells as
+  // matter (a second body from the same cells, or a mesh the body is born
+  // inside -- gate `cactus-fell`), and neither has to wait for a fresh copy of
+  // a chunk a fire is rewriting every tick. Dropped once the mirror's copy is
+  // at or past `tick`.
+  struct PendingVacate {
+    uint32_t tick = 0;
+    uint32_t stamp = 0;
+    std::unordered_map<uint16_t, uint32_t> cells;  // local cell -> word
+  };
+  std::unordered_map<uint64_t, PendingVacate> pendingVacate_;
+  uint32_t nextVacateStamp_ = 1;
+  uint32_t nextAssembly_ = 1;
+  PhaseProfile prof_{};
+  // Scoped accumulator for PhaseProfile. Two clock reads when profiling is on,
+  // one predictable branch when it is not.
+  struct PhaseTimer {
+    PhaseProfile* p;
+    Phase ph;
+    std::chrono::steady_clock::time_point t0;
+    PhaseTimer(PhaseProfile& prof, Phase phase) : p(&prof), ph(phase) {
+      if (p->on) t0 = std::chrono::steady_clock::now();
+    }
+    ~PhaseTimer() {
+      if (!p->on) return;
+      const double us =
+          std::chrono::duration<double, std::micro>(
+              std::chrono::steady_clock::now() - t0).count();
+      p->curUs[(int)ph] += us;
+      p->calls[(int)ph]++;
+    }
+    PhaseTimer(const PhaseTimer&) = delete;
+    PhaseTimer& operator=(const PhaseTimer&) = delete;
+  };
+  // A timer that changes WHICH phase it is charging partway through. The
+  // terrain loop's four stages (staleness scan, occupancy gather, marching
+  // cubes, Jolt) are separated by `continue`s, so nested scopes cannot express
+  // them without hoisting half the loop's locals; this charges what has
+  // elapsed to the current phase and starts the next, and its destructor
+  // charges the remainder however the iteration ended.
+  struct PhaseSwitch {
+    PhaseProfile* p;
+    Phase ph;
+    std::chrono::steady_clock::time_point t0;
+    PhaseSwitch(PhaseProfile& prof, Phase phase) : p(&prof), ph(phase) {
+      if (p->on) t0 = std::chrono::steady_clock::now();
+    }
+    void To(Phase next) {
+      if (!p->on) { ph = next; return; }
+      Charge();
+      ph = next;
+    }
+    ~PhaseSwitch() { if (p->on) Charge(); }
+    void Charge() {
+      const auto now = std::chrono::steady_clock::now();
+      p->curUs[(int)ph] +=
+          std::chrono::duration<double, std::micro>(now - t0).count();
+      p->calls[(int)ph]++;
+      t0 = now;
+    }
+    PhaseSwitch(const PhaseSwitch&) = delete;
+    PhaseSwitch& operator=(const PhaseSwitch&) = delete;
+  };
   bool instancesDirty_ = false;
   uint32_t instanceCount_ = 0;
   uint32_t settledBack_ = 0;
   SettleProbe settle_{};
   FloaterProbe floaters_{};
+  UntunnelProbe untunnel_{};
+  // Consecutive steps each body has been held at a collider boundary. Only
+  // bodies actually being held have an entry (erased the step they stop being
+  // held), so this is empty in every ordinary frame.
+  std::unordered_map<uint64_t, uint8_t> untunnelHold_;
   // Drained by main.cpp each frame; bounded by the same per-tick body budget
   // that bounds island creation, so this cannot grow without limit.
   std::vector<BreakEvent> breaks_;

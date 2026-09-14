@@ -137,6 +137,50 @@ Three properties this rests on, all load-bearing:
   claim lattice all key on the slot. Feeding a page index into any of them
   would make the simulation a function of allocation history.
 
+#### Ticket slots: the slot space is no longer the window
+
+**The slot space and the window are two different things as of
+`docs/PLAN_chunk_tickets.md` P0.** They used to be the same thing by
+construction: a chunk's slot WAS its world coordinate modulo the window
+(`chunkSlotIndex` = a bitmask), so there were exactly `kNumChunks` slots and
+arithmetic assigned every one of them. That is why "simulate a chunk 40 chunks
+away" could not be done by allocating a page — page space was never the
+constraint, **slot identity** was, and a distant chunk wants the slot a near
+chunk already holds.
+
+So storage now runs `[0, kNumSlots)` where `kNumSlots = kNumChunks +
+kTicketSlots`. Slots below `kNumChunks` are the window, addressed by the same
+mask as ever. Slots above it are TICKETS — chunks far outside the window, held
+resident so matter that leaves can finish falling, burning or settling instead
+of freezing — and **no arithmetic reaches them**, only a CPU-built map. The
+resulting rule, which every buffer and every kernel now follows:
+
+> `kNumChunks` / `NUM_CHUNKS` is a statement about the WINDOW's geometry: what
+> the toroidal mask wraps at, what `chunkInWindow` measures, what the raymarch
+> clips to. `kNumSlots` / `NUM_SLOTS` is a statement about STORAGE: buffer
+> extents, dispatch bounds over the slot space, and the plane strides inside
+> multi-plane per-slot buffers. Conflating them is how a ticket slot ends up
+> reading a window chunk's memory.
+
+`kPoolPages` follows `kNumSlots` rather than `kNumChunks`, and the exhaustion
+proof above is unchanged because its first line already counted slots.
+
+Four functions in `common.wgsl` are the only sanctioned way to cross between
+world coordinates and slots — `chunkSlotOf(wc, o)` (the slot, or `SLOT_NONE`),
+`chunkResident` / `cellResident` (replacing `chunkInWindow` / `inWindow`
+wherever the question was "may I touch this", never where it was "where is the
+box"), and `slotWorldChunk(slot, o)` (the inverse, which replaced ten
+copy-pasted decodes that could not express a ticket slot). `voxWordAt`,
+`voxWordIndex` and `voxStore` resolve through one shared `voxSlotOfCell`.
+
+**P0 ships `kTicketMax = 0`**, so `kNumSlots == kNumChunks`, every ticket branch
+is a dead const-expression, and the world hash and both smoke probe tables are
+bit-identical — which is the whole acceptance criterion for a commit that
+touched 15 shaders and every per-slot buffer. The lifecycle (activation as a
+MutationQueue op, the cap, dedupe, timeout, release to `ChunkStore`) is P1; the
+per-site classification, and the three site classes the plan did not anticipate,
+are recorded in `docs/tickets_p0_audit.md`.
+
 A GPU kernel cannot allocate, so every page a kernel might write is
 materialized from the CPU BEFORE the command buffer is submitted, driven by a
 conservative CPU mirror of the dirty set. Writes are structurally incapable of
@@ -334,8 +378,18 @@ are deduplicated across mob defs, so 128 slots cover a whole cast.
   22,652 (65%) → 25,831 (74%) of 34,816. K is one `constexpr` and the whole
   trade-off curve was measured — K=2 gives back the residency but leaves the
   fence in place on 76% of shifts.
-- **Unloaded space is treated as solid and inert** so liquids can't drain off the
-  edge of the loaded world (Burkelbear's solution; adopt it verbatim).
+- **Unloaded space is treated as solid, inert, and a SINK FOR GAS** so liquids
+  can't drain off the edge of the loaded world (Burkelbear's solution; adopted
+  verbatim) — with one deliberate exception since 2026-09-09. Solid and inert is
+  the right answer for anything that would FALL out of the world and for
+  everything that would react out there. It is the wrong answer for a gas, whose
+  whole behaviour is to leave: a smoke voxel refused at the window's top face
+  could not tell that refusal from a stone wall, fell through to the lateral
+  ring, and sheeted across the entire top chunk plane until it decayed. So the
+  edge is one-way for `CLASS_GAS`: a gas voxel whose intent points out of the
+  window deletes itself and becomes a gas PARTICLE (§5), which keeps moving
+  outside under the same model and reconverts to a voxel if it drifts back in.
+  Nothing else crosses, and nothing reacts out there.
 - Overworld draw distance beyond the window is handled by the render-only
   far-field cascades (§9) — the streaming horizon is no longer visible from
   the surface. Underground, darkness still hides it.
@@ -443,6 +497,218 @@ SSBO lists of chunk indices.
   adjacent cells *of the below cell* in random order (RNG replaces 2D's left/right
   alternation and breaks the symmetry that would create perfect square pyramids).
   Else stay and clear the moving bit. This alone produces angle-of-repose piles.
+- **PER-MATERIAL ANGLE OF REPOSE (2026-09-13).** One down, one across is 45°,
+  and for years that was the angle of *every* powder in the engine — dry sand,
+  angular gravel, snow, ash and dust all built the same cone. One optional
+  authored integer changes it:
+
+  ```json
+  "repose": 34          // degrees, POWDERS ONLY, 18..72
+  ```
+
+  Absent (or 45) compiles to the word **zero**, which the kernel reads as the
+  bare down-diagonal, so a material that says nothing is bit-identical to the
+  old sim rather than merely close to it. Loader:
+  `PackRepose`/`MaterialGpu.repose` (`src/sim/materials.h`), kernel: the ANGLE
+  OF REPOSE block in `sim_step.wgsl`, gate: `repose`.
+
+  - **The angle is a RUN:RISE RATIO, because a lattice CA cannot hold anything
+    else.** Movement is whole cells, so the expressible angles are those whose
+    tangent is a ratio of small integers. Five tiers, in two families either
+    side of the old rule: `3:1` (18.43°) and `2:1` (26.57°) flatten a pile;
+    `1:1` (45°, the word 0) is unchanged; `1:2` (63.43°) and `1:3` (71.57°)
+    steepen one.
+  - **FLOWY: a 2:1 face was ALWAYS stable under the old rules; nothing ever
+    built one.** On a 2:1 staircase the cell one down and one across from a
+    surface grain is the top of the next run, i.e. filled, so stage 2 refuses
+    and the grain rests. Flatter faces do not collapse — grains simply *stop as
+    soon as they cannot descend*, which is one cell too early. So the flowy half
+    is one extra stage rather than a new force: a grain that has already failed
+    the straight fall AND all four down-diagonals takes **one lateral step**
+    toward a drop it can see within its tier's run (`(2d,-1)` for 2:1,
+    `(3d,-1)` for 3:1). It cannot fire for a grain that could have descended,
+    because descent is tried first and returns.
+  - **STEEP: the mirror image.** A 1:2 grain takes the down-diagonal only if
+    `(d,-2)` is open too — i.e. only if it would fall at least 2 — so a
+    one-voxel step never spreads and the face grows one run per two drops. The
+    cohesive look that falls out of it (a small bump on a drift simply stays) is
+    the intent, not a defect.
+  - **Between tiers is a per-grain MIXTURE, not a rounding.** The word carries
+    two tier codes and a blend; `blend/256` of the grains use the second. Sand
+    at 34° would be ~60% of grains on 2:1 and ~40% on 1:1, and the pile rests
+    between the two. The choice is a hash keyed on **WORLD POSITION with NO TICK
+    in it**, and both halves are load-bearing. No tick: a grain that has not
+    moved decides the same way on every tick of its life, so it fails the same
+    stage, writes nothing, marks nothing dirty, and the pile SLEEPS (rule 2);
+    keyed on the tick, a settled dune would re-roll a share of its grains every
+    tick, a few would find a move, and those chunks would never sleep again.
+    World position rather than the slot index (the first cut used the slot, and
+    it was wrong): a slot index is WINDOW-RELATIVE and renames on a streaming
+    shift, so a settled pile would silently re-roll its whole mixture the moment
+    the player walked far enough. Same mixing as `synthJitterState`.
+    **The blend must be gated on the GRAIN'S CODE, not on the material.** Gating
+    the slide on `repose != 0` made every angle from 27 to 44 behave as pure
+    2:1 and the blend inert — a bug no pure-tier test arm can see, which is why
+    the gate has two arms driven by real `PackRepose` output.
+  - **A per-tick move CHANCE is not an angle**, which is why `moveEvery` was not
+    reused for this. A chance changes how *fast* a slump runs and leaves the
+    resting state exactly where it was; repose is a property of the *fixpoint*.
+    Both exist, and `moveEvery` is now documented for powders as the speed knob.
+  - **WRITE reach is still 1** — the lateral step is an ordinary `tryMove`, the
+    same single-cell write the mite wander stage already makes, so
+    `flagSupportLoss` still runs for the cell the grain vacates.
+  - **READ REACH: THE OCCUPANCY SNAPSHOT IS THE ONLY LICENCE IN THE CA FOR A
+    READ AT DISTANCE ≥ 2, and the sharp form of the lattice argument was not
+    previously written down anywhere.** The 3×3×3 write boxes of same-colour
+    acting cells, spaced 3 apart, **tile space**: every cell in the world lies
+    inside exactly one acting cell's box. So a read at distance ≤1 is inside
+    *my* box and only I can write it — exactly the licence `soloSolid` spends on
+    its six face probes — and a read at distance ≥2 is inside *somebody else's*,
+    where pre-write versus post-write is decided by GPU scheduling. There is no
+    "probably fine" band in between. And repose cannot be done at reach 1 at
+    all: a 2:1 face and a 1:1 face are *locally identical* at a surface grain
+    (uphill lateral filled, downhill lateral air, downhill diagonal filled, cell
+    below filled) — the difference IS at distance 2. That is a fact about the
+    lattice, not about this rule.
+
+    So every probe reads `reposeSnap` (`world.h`'s `kReposeSnap*` block): **one
+    bit per voxel, "a powder could drop into this cell", taken at TICK START**
+    by the `reposesnap` prepass and read by the CA behind a barrier the pass
+    table generates. A snapshot bit is the same in every run of the same tick by
+    construction. It is a side table per design guideline 2 — derived, not
+    hashed, not saved — and it is deliberately **stale**: a drop that fills in mid-tick still
+    reads open, the grain slides toward it, the ordinary `tryMove` refuses
+    (the destination is a powder), and next tick's snapshot says so. The error
+    is bounded by one tick and identical in every run, which is the only
+    property rule 1 asks for.
+
+    **Validity is per SLOT, and required.** The window is toroidal, so a slot is
+    reused by a new world chunk as the window walks; each slot carries `tick+1`
+    and a probe into a slot whose stamp is not this tick's REFUSES. Zero is
+    therefore never a valid stamp, which makes the zeroed allocation the correct
+    cold start with no reset path. Nothing finer is needed: the window origin is
+    constant for the whole of one command buffer, so a slot cannot change
+    occupant between the prepass and the CA rows of the same tick. In practice
+    the refusal path is unreachable for an acting cell — a cell only acts if its
+    own chunk is on the dirty list, and every probe target is within that
+    chunk's probe ring, which the prepass covers by construction.
+
+    **The ALLOCATION is dense; only the WRITING is sparse.** One bit per
+    cell in the window is 16.125 MiB resident from `World::Init`, roughly +36%
+    on the page pool's own resident bytes, and that is a flat cost paid by any
+    world whose materials.json carries a `repose` line. What scales with
+    activity is which chunks get refilled. A genuinely sparse form would trade
+    the flat cost for an indirection in the CA's hottest read; at one bit per
+    voxel that trade is not worth making, but it is a trade.
+
+    **MEASURED, per row, with `--measure`'s row-granular timestamps** (RTX
+    3060 Ti, `SANDVOX_RUN_EXCLUSIVE=1`). The row has its own pass group, so
+    this is the prepass's own GPU time and not a difference of two totals:
+
+    | scenario | active chunks/tick | `reposeSnap` | % of sim | `ca(54)` |
+    |---|---|---|---|---|
+    | (c) settled | 0.0 | **not recorded** | — | — |
+    | (e) minimal | 0.7 | 0.089 ms | 3.5% | 0.93 ms |
+    | (b) active | 4.5 | 0.123 ms | 3.5% | 1.33 ms |
+    | (a) settling | 37.1 | 0.151 ms | 2.7% | 2.73 ms |
+    | (d) heavy | 152.2 | 0.556 ms | 5.9% | 4.65 ms |
+
+    So it costs 9–12% of the CA loop it feeds, and 0.56 ms/tick at the heaviest
+    activity the suite produces. The settled row is the important one: it is
+    absent from the table entirely, not zero-valued, because `Cond::ReposeActive`
+    did not record it.
+
+    **A whole-sim A/B is NOT the instrument for this, and trying it first was a
+    wasted pair of runs.** `--gate far-fog`'s "active scene" ms/tick read 10.07,
+    15.28, 10.43 and 37.88 across four runs of near-identical trees — it swings
+    by 3.6x on its own, so the arm WITHOUT the prepass came out slower than the
+    arm with it. A row with its own pass-group label can be timed directly;
+    differencing two noisy totals to find a 3% term cannot.
+
+    **The prepass costs nothing at rest**: it is one indirect dispatch over the
+    same compacted dirty list the CA is about to use, so a settled world
+    dispatches zero workgroups. Each workgroup fills its dirty chunk *and the
+    nine neighbours a probe can reach*, because a resting grain's probes reach
+    3 cells and cross into a neighbour chunk that may be asleep, and a boundary
+    artifact every 16 cells is not acceptable. Nine rather than the 3x3x3
+    block's 26, on two one-line facts about the probe offsets: **every probe has
+    `dy <= -1`** (nothing here looks up), and **no probe offsets both lateral
+    axes** (so each layer's corners are unreachable). That is 2.7x off the
+    prepass, and it is measured INERT — the same world hash and the same six
+    pile hashes as the 27-chunk version. The price is a table coupled to those
+    offsets: a probe that looked up, or stepped diagonally, must grow it in the
+    same commit or it silently reads an unsnapshotted slot and REFUSES, which
+    corrupts nothing (a refusal leaves a grain where it is) but would quietly
+    steepen piles near one chunk boundary in sixteen. Ring members are re-filled by every dirty chunk that
+    touches them — redundant, never divergent, since the bits are a pure
+    function of voxel state nothing in the pass writes — and a per-slot stamp
+    skip removes most of that. A sentinel chunk (`EMPTY`/`UNIFORM`/`JITTER`)
+    costs 128 stores and **no voxel reads at all**: its material is uniform, so
+    the whole bitfield is all zeros or all ones and `synthWordAt`'s two PCG
+    rounds per cell are never paid.
+
+    **A REJECTED DESIGN, recorded because the failure is invisible.** The first
+    cut read the TICK STAMP of an air cell to prove no acting cell owned the
+    probe's write box. The ownership argument was sound; the *bit* was not. The
+    stamp is explicitly not representation-invariant (`sim_occupancy.wgsl`: it
+    "legitimately differs between two runs that reached the same world"),
+    `world.h` strips it on save, and `pagetable.cpp`'s `kAirDemoteMask` demotes
+    an all-air chunk to `PT_EMPTY` ignoring stamps — after which every cell
+    reads `STAMP_NEVER`. With a 7-long cycle a stale stamp on vacated air
+    aliases the current substep one time in seven, so the guard would allow in
+    one run and refuse in another; a refused slide marks nothing dirty, so if it
+    landed on a grain's last attempt the chunk slept and the pile stayed one
+    cell steeper — invisible to both the world hash and the twice-run
+    comparison. **No CA path reads a tick stamp on an air cell**; `main`'s own
+    gate reads it only after returning on `MAT_AIR`.
+  - **Termination is the nearest-drop-first ordering, not an assumption.** A
+    slide is the one move in the powder chain that does not lower a grain, so an
+    unbounded run of them would keep a chunk awake forever. It cannot happen: a
+    slide toward a drop *k* cells out leaves the grain with that same drop *k-1*
+    out; at *k-1 == 1* stage 2 takes it and the grain falls, and at *k-1 == 2*
+    the near pass fires again and cannot instead go BACK, because the cell two
+    out backwards is this grain's old down-diagonal, which was filled. Searching
+    3-out before 2-out would break exactly that, so the stage is two passes.
+  - **Storage: `MaterialGpu` grew 64 → 80 bytes** (`repose` plus three reserved
+    words) rather than squatting in `hardness`'s spare 24 bits. Every blast and
+    dig path compares `hardness` as a whole word, and a masked reader in nine
+    places to save 16 bytes in a 4096-entry table — 256 KiB → 320 KiB, once, in
+    one buffer — is the worse trade. Nothing else had to change: every reader
+    addresses the table by index through `sizeof(MaterialGpu)`, so the stride is
+    written down nowhere else. The five tier codes and the `(codeA, codeB,
+    blend)` shifts/masks are emitted by `ShaderConstantPrelude()` from the C++
+    definitions, so neither `common.wgsl` nor `sim_step.wgsl` restates them, and
+    `scripts/check_shaders.sh` scrapes `materials.h` so a shader edit still
+    validates with no build.
+  - **THE FLATTER TIERS CANNOT BE GIVEN TO THE BULK TERRAIN POWDERS YET, and
+    that is measured rather than cautious.** `Land.slope` is documented as
+    "256 == 1 voxel/voxel == repose" (`src/sim/worldmap.h`), and every place
+    worldgen decides whether ground is "too steep for a powder bed" — the biome
+    skin in `genCellIn`, the sediment wedge's `sedSlope`, the pond bed's
+    steepness test and `bed.substrate` — is sized against that one number. Give
+    sand 34° and the desert's own sand cap is suddenly over its angle of repose
+    on every slope steeper than 2:1, so the whole window starts creeping
+    downhill the moment it generates. Measured as a full-`--selftest` A/B whose
+    only difference was those authored lines: sand 34 / gravel 40 / dirt 40 /
+    snow 38 turned **`sleep`** red (the world never reached the <32-active-chunk
+    bar inside the gate's 3000-tick cap) and **`worldmap`** red (`voxel air but
+    twin says biome desert (skin sand)` at (144,426) — the cap had slid off
+    before the comparison), and took `corpse-burn` with them. The control arm
+    reproduced the base `determinismHash` exactly, so the attribution is not a
+    judgement call.
+
+    **A STEEPER value is safe on worldgen ground, and the argument is one line:
+    a steep tier only ever REFUSES a move the old rule allowed**, so it cannot
+    wake anything 45° did not. That is why `snow` ships at 63° (a packed drift
+    holds a steep face) while `sand`, `gravel` and `dirt` keep 45.
+    **Follow-up:** make those worldgen slope gates read the placed material's
+    own repose instead of the constant 45, then author sand 34 in the same
+    commit. That is a worldgen change with its own hash move and its own gates
+    (`terrain`, `waterbody`, `worldmap`, `settle-back`) and it is deliberately
+    not bundled here.
+  - **Authored:** `snow` 63 (steep), `ash` 40, `dust` 30, `seed` 30 (flowy);
+    `sand`, `gravel`, `dirt` keep the 45° default for the reason above. `mite`
+    keeps it too: it wanders, and its movement is not a pile.
 - **Liquid**: powder rule + try the four laterally adjacent cells on its own level.
   Plus **fullness equalization**: liquid voxels carry fullness in eighths (the state
   nibble); a cell flows into a lateral neighbor holding ≥ 2 eighths less, RNG on
@@ -477,6 +743,30 @@ SSBO lists of chunk indices.
     in `SUM(f*f)`, so the gate is chosen to make it terminate: the cell it
     vacates is a face neighbour of the cell that justified the move, which can
     therefore split into the hole, and splitting strictly decreases `SUM(f*f)`.
+- **A NEUTRAL RULE MAY NOT LICENSE ITSELF — `FILM_LICENCE`** (2026-09-08). The
+  argument above quantifies over an OPPORTUNITY (*"which CAN therefore split"*),
+  and on an open water surface the opportunity is taken by somebody else: films
+  surround every hole, one of them advances into it before the pressing cell
+  splits, nothing splits, `SUM(f*f)` does not move and the configuration has
+  merely rotated. Measured at the authored `home_lake`: 14 chunks awake forever,
+  reasons `MOVE 14 film-press 14`, 37 of 47 changed words back where they
+  started over 20 ticks, not one split — a shuffle at a third of a voxel per
+  tick, invisible in the game and a permanent breach of rule 2. The riser branch
+  (`filmStepAllowed`) has the same shape of hole, admitted in its own block:
+  two one-voxel risers facing each other 3 apart is a 2-cycle, and no reach-1
+  predicate can break it because a terrace tread's inner cell and a 2-wide
+  rimmed gutter's cell have byte-identical 3×3×3 neighbourhoods (the one read
+  that separates them, `c + 2d`, is racy — acting cells are ≥3 apart and each
+  writes within 1, so a cell exactly 2 away is the one another thread may be
+  writing). **Both film branches now require a licence**: they may only fire in
+  a chunk where something that DID strictly decrease a Lyapunov function — a
+  descent, an equalize, a split, a bridge, a powder or gas move — or an external
+  input (mutation, seam, particle, reaction) marked the chunk last tick. The CA
+  reads its own previous verdict, `dirtyIn[chunk]`, one scalar per workgroup
+  (`R(DirtyIn)` on the `ca` row, the same read `waterQuiet` already makes). Cost,
+  measured: `ca-slope` unchanged to the digit (96.9% into the basin, 0 eighths
+  left on the ramp), `ca-level-one` and `ca-level` unchanged; `sleep` goes from
+  14 chunks awake forever to **0, fully quiet**. Pinned by `ca-gutter`.
   - **`bridgeLevel`** — a cell may equalize between TWO OF ITS OWN lateral
     neighbours. Write reach is unchanged (both are one cell away — the same
     licence `tryMove` spends on self and one neighbour), but the pair straddles
@@ -497,7 +787,9 @@ SSBO lists of chunk indices.
   - Gates: `ca-level-one` (one placed voxel → 8 cells of one eighth, no slack),
     `ca-level` (216 eighths → 135 wetted columns, one cell deep, ≤4 eighths
     anywhere; was 57 columns and 6 eighths), `ca-level-pond` (the reported case:
-    the same blob on standing water).
+    the same blob on standing water), `ca-gutter` (the negative of `ca-slope`:
+    a 2-wide slot cut into a plateau, the geometry the riser step cannot
+    resolve, asserted to SLEEP rather than to drain).
 - **Gas**: inverse powder (up, then up-diagonals, then lateral), plus decay chance.
 - **Solid**: doesn't move; participates in reactions and structural checks only.
 - **Density displacement**: a mover entering a cell occupied by a less-dense
@@ -728,6 +1020,26 @@ Noita's "Bloody Zombies" technique, on GPU:
 - Particles integrate ballistically each tick, DDA-stepping through the grid;
   on hitting a non-empty voxel they **reinsert into the grid** at the last empty
   cell (waking that chunk).
+- **A LIQUID IS NOT A WALL** (2026-09-13, `docs/PLAN_debris_buoyancy.md`). It was
+  one until then — "splash = plop onto the surface" — and that is what built
+  rafts of exploded tree hanging over a pond: the first chip stopped on the
+  film, the next was blocked by the first, and no CA rule moves a solid touching
+  another solid. A particle whose material authors `fluid.lift > 0` now flies
+  THROUGH a liquid under buoyancy (`g · ρfluid/ρself`, capped) and viscous
+  damping, so which way it goes is `density` and not a knob, and the damping is
+  what makes the rise/overshoot/fall converge to a bob rather than oscillate.
+  Three consequences for reinsertion, all of them load-bearing: a particle may
+  take a cell holding a liquid it is **denser than** (a sinking rock's resting
+  cell is water, and the displaced eighths are dropped exactly as
+  `sim_mutate.wgsl` drops them — displacement raises the level of a whole body
+  of water, which is not a write this pass can reach); it may only settle where
+  something **supports** it, or neutrally buoyant matter converts to a voxel
+  hanging mid-water; and a floater that finds its berth taken **drifts** instead
+  of reinserting on top of it. `sim.partFloatPatience` wet ticks bound the hunt,
+  so a pond too small for the debris thrown into it jams into a pile rather than
+  keeping particles alive forever (rule 2). `lift == 0` is the opt-out and keeps
+  every older behaviour: micro spray, and liquid/gas ejecta, whose landing in
+  its own liquid is a MERGE and a different rule than this one.
 - This is what makes liquids splash instead of blob, and it's the standard
   mechanism whenever the grid must yield space (rigidbody pushes through water →
   water voxels eject as particles).
@@ -745,9 +1057,202 @@ Noita's "Bloody Zombies" technique, on GPU:
   `resolve` in the same tick — a landing is never invisible to the snapshot of
   its own tick, and a particle that lands is still counted on the tick it lands.
   **A new GPU-side particle source must land inside that count**, or both
-  mechanisms will reason a world settled while matter is still moving.
+  mechanisms will reason a world settled while matter is still moving. Gas
+  parcels (below) are the second source and are inside it: `NoteSnapshot`
+  disqualifies on `gasLive_` beside `particleCount`. That obligation was
+  discharged only after the `gas-leave` gate went looking for it, which is the
+  argument for the gate measuring it rather than the design doc asserting it.
 
 **Gameplay projectiles are a separate CPU system** (§8) — they carry game logic.
+
+### Gas particles: the window edge is a sink (2026-09-09; `sim_gas.wgsl`, docs/PLAN_gas_particles.md stage 1)
+
+A SECOND particle population, with its own buffers, for the one kind of matter
+whose whole behaviour is to leave the world: gas.
+
+**The defect.** `tryMove` returns false out of the residency window, and a gas
+voxel could not tell that refusal from a stone wall. It fell through to the gas
+ladder's lateral ring and SHEETED across the entire top chunk plane — up to
+1,024 chunks plus the dilated layer under them — until its decay rule fired
+(smoke is 9/1000, so ~111 ticks of it). That sheet is the chunk outline visible
+in the sky over a big fire, and at 27 colour phases × 2 substeps × 4,096 cells
+per awake chunk it was most of the fire's CA cost. §3's "unloaded space is solid
+and inert" is right for everything that would fall out of the world and wrong
+for a gas.
+
+- **Representation.** The same 32-byte `Particle`: `payload` bits 0..11 material
+  and 12..15 state, plus `PFLAG_GAS`. Position is 24.8 fixed with a **zero
+  fraction** — a parcel lives ON a cell and moves in whole cells — and velocity
+  is always zero, which keeps `particlePriority` a pure function of the visible
+  state. No age field: death is rolled from the material's own bucket.
+- **Edge conversion.** In `sim_step.wgsl`'s gas tail, a `tryMove` that fails
+  because the target is out of the window (as opposed to failing on
+  `canDisplace`) calls `gasLeave`: the cell becomes air, the chunk is marked,
+  and a record is appended to `gasSpawn`. Reach 0 — it writes only its own cell,
+  and the target was never writable. Any face, not only +Y.
+- **Motion outside is the grid model verbatim.** The same `gasIntent` roll,
+  `windLateralStart` order and fourteen-candidate fallback ladder the CA uses,
+  refactored to take the identity key and the substep as arguments so both
+  kernels call one definition. Not a reduced-fidelity puff.
+- **Blocking outside is `farVox`**, the far cascade's level-1 byte — the same
+  test the far march uses. Dense toroidal array, direct index, **not the page
+  table**: the page table does not extend past the window and has no business
+  being asked about smoke 60 m away. Outside the cascade reads as OPEN, not as
+  blocked, or every plume would pin against an invisible wall.
+- **Bounds (rule 2), all three stateless tests on the parcel's own position:**
+  the outer box, `origin.y + WORLD_N + kGasCeilingVox`, and the authored decay.
+  `gasDecayProduct` walks the material's `RK_DECAY` entries exactly as
+  `doReactions` does, so the chance an author tunes for the voxel is the one the
+  parcel obeys; a gas product morphs, `air` dies, a grid product proposes a
+  landing. Neighbour-COUNT scaled rules are skipped — out there a parcel has no
+  neighbours and `scaledChance`'s answer would be a fabrication.
+- **Re-entry = RECONVERT.** A parcel whose next cell is inside the window
+  proposes itself as a voxel through the ordinary `atomicMax` claim path, one
+  claim per parcel per tick, deterministic winner, losers retry. That is the ONE
+  place a gas parcel meets the page system, and it is why gas that leaves is not
+  gas that is lost: it rejoins the reaction system on landing.
+- **Rendering** is `gasOuter`, a coarse density box: one 16-bit COUNT per cell,
+  two to a `u32`, 128³ cells over exactly two window edges, centred on the
+  window, 4 MiB, at `renderBGL_` binding 21 / GAS group 6 / `simBGL_` 34.
+  Cleared and re-splatted every tick (`atomicAdd` of a half-word lane, so the
+  result is scheduling-independent), sampled once per pixel by `gasOuterFill`.
+  Render-only derived data: the sim never reads it, the world hash never covers
+  it, it is never stale. Saturating at 60,000/cell rather than carrying into the
+  neighbouring cell's half of the word.
+  **Deviation from the plan:** the cell is 0.8 m, not 0.4 m. The plan asked for
+  0.4 m cells AND a 2x-window span AND 2 MiB; 128³ bytes IS 2 MiB and 128 ×
+  0.4 m is half the stated span, so the three never agreed. Span is kept.
+  **Second deviation:** the parcel splat is folded into `gasResolve` rather than
+  given its own dispatch, because resolve already walks every live parcel once.
+
+#### Stage 1b: the two representations CROSSFADE, they do not abut
+
+Stage 1 left an explicit seam. Inside the window gas is a 0.1 m voxel; outside
+it is a parcel drawn from 0.8 m cells; the two met at the window face with no
+overlap, so there was a visible line 25.6 m from the window centre where crisp
+voxel smoke became 64x-larger soft cells. The fix is entirely on the render
+side — **the sim is untouched and the determinism hash does not move (9bfed213
+before and after)**, because sim behaviour that depended on camera distance
+would be a rule-1 violation and in-window gas must stay a voxel to keep the
+reaction system.
+
+- **The CA splats too.** `sim_step.wgsl`'s `gasOuterSplat` adds every in-window
+  gas voxel to the same box, ONCE per tick (substep 0, after the stamp gate,
+  before the move), gated on `sim.gasMode` so a world with the gas rows
+  unrecorded cannot accumulate into an uncleared box. The box therefore holds
+  BOTH populations, which is what makes a crossfade possible at all: a voxel
+  can only fade out into a coarse cell that has something in it. `gasOuter`
+  joins the CA at `simBGL_` binding 34 and the `ca` row's R/W set as
+  `A(GasOuter)`.
+- **The byte became a u16** for this: 192/512 = 37.5% full was a ceiling nobody
+  saw while the box only held distant parcels, and a crossfade INTO it would
+  have thinned every dense plume exactly at the seam. Measured by `gas-leave`: the in-window splat reaches **204 in a single 0.8 m cell** twenty ticks after a 4,096-voxel puff, so the byte's 192 guard was not a theoretical ceiling -- it clips this fixture.
+- **The weight is the max-norm distance from the WINDOW CENTRE**, smoothstepped
+  from `render.gasBlendStart` × 25.6 m to 25.6 m. The centre and not the camera:
+  the max-norm distance is exactly the half-extent at every point of all six
+  faces, so the weight is 1 at every face regardless of where the camera stands.
+  A camera-relative ramp would have to be re-tuned per view and would still
+  leave a seam on the faces it was not tuned for.
+- **Voxels fade out** by `1 - b` in `trace()`'s media branch (gases only; a
+  liquid has no coarse representation), and **only into a non-empty coarse
+  cell** — the CA visits awake chunks only, so a settled plume in a sleeping
+  chunk is in no coarse cell and keeps its full opacity instead of fading into
+  nothing. That one extra fetch is what makes the sleeping-chunk hole a
+  non-event rather than a disappearing plume.
+- **The coarse fill fades in** over the same shell: `gasOuterFill` grew a second
+  segment, from the inner box out to the window face, weighted by the same
+  ramp and with its own step budget so widening the band cannot thin the
+  distant plume. It now runs for rays that HIT inside the window too, bounded by
+  the near hit rather than by "did the ray leave".
+- **RenderParams bit 3 (`RFLAG_GAS`)** is what keeps all of it free in a world
+  with no smoke. `Simulation::EncodeTick` publishes it through
+  `SetGasRenderActive` (renderspec.h) from a latch armed by live parcels OR the
+  gas dirty-reason bits in the snapshot, held one second past the last sighting.
+  It is a correctness gate as well as a budget: `gasOuter` is only cleared on
+  ticks the sim records the gas rows, so with the flag off the box is stale and
+  must not be sampled. NOT a `SPEC_` constant — it flips whenever a fire starts
+  or goes out.
+- **Measured cost:** raymarch fragment register count 168 → 168, no spills,
+  binary +0.18%; the CA's `step` kernel 56 → 56 registers, binary +0.11%.
+- **Both live wires are ASSERTED, not argued.** `gas-leave` now fails if the
+  render flag never arms over a 400-tick run with a live plume (it is on for
+  320 of them) and if `gasOuter` is empty INSIDE the window at t20 with the
+  whole plume still in it (sum 3,437, max 204). Either zero leaves every other
+  number in that gate untouched and simply turns the crossfade off, which is
+  the definition of a thing that needs its own assertion. The in-window probe
+  is deliberately EARLY: at the main t200 probe this fixture's plume has
+  entirely left through the ceiling, and the first version read 0 there and
+  reported a dead splat on a run where it had worked for a hundred ticks.
+- **Known and not repaired:** the coarse contribution still does not feed
+  `gasHalfT` or `fireGlow`. Stage 1's argument for that was geometric (every
+  coarse voxel-length was beyond the window exit); stage 1b's band is inside the
+  window, so a raster body can stand behind coarse gas the depth raster does not
+  know about. Bounded by the crossfade weight — zero at the inner edge, and only
+  fully coarse at the face, 25 m away.
+- **Own buffers, not a share of `kParticleCap`.** `gasParticles[2]` at
+  `kGasParticleCap` = 262,144, plus `gasCounts` / `gasClaim` / `gasSpawn` (the
+  CA's outbox, whose 8-word header is this tick's counters) / `gasSpawnOps` (the
+  CPU op stream, rule 3) / `gasArgs` / `gasOuter`. The two populations must not
+  be able to starve each other: a fight full of ballistic debris must not thin a
+  plume, and a forest fire must not stop a sword from shattering.
+- **Determinism, and the hole it had to close.** A parcel outside the window
+  touches no voxel, so the world hash **cannot see it** — a scheduling-dependent
+  step out there would reproduce a matching hash sequence for a whole run and
+  only surface a hundred ticks later when the parcel landed. The population
+  therefore carries its own digest (`kGasSpDigest`: the SUM of every surviving
+  parcel's `particlePriority`, a sum because the pool's append order is
+  scheduling-dependent by construction), which the `determinism` gate compares
+  across its two runs alongside the hash series.
+
+**The open problem, recorded because sizing a cap is not the same as fixing
+it.** `gasLeave` charges a shared `atomicAdd` cursor, so WHICH voxels are
+refused when the per-tick list fills is decided by which workgroup arrived
+first — and a refused voxel STAYS IN THE GRID, where the world hash can see it.
+That is scheduling-dependent output, i.e. a rule-1 hazard. It is held off by
+sizing `kGasSpawnPerTick` (65,536, a quarter of the window's top face in ONE
+tick) out of reach, which makes the POOL the binding constraint instead — and a
+dropped parcel is already outside the window and cannot move a voxel. The
+`gas-leave` gate asserts refusals == 0, so the day that is not enough it is a
+printed number rather than a silent divergence. **The real fix is mark+apply**:
+the CA flags cells that want to leave and a second pass converts them in a
+deterministic order, which is the pattern `sim_explode` already uses for exactly
+this reason.
+
+**The settled-tick skip vs parcels in flight — FOUND BY THE GATE, FIXED IN
+`simulation.cpp`.** This section's own paragraph above states the obligation:
+"a new GPU-side particle source must land inside that count, or both mechanisms
+will reason a world settled while matter is still moving". Gas parcels did not.
+`Simulation::NoteSnapshot` licensed the settled-tick skip on
+`activeChunks == 0 && particleCount == 0`, `particleCount` is the BALLISTIC
+population only, and `inputsThisTick` in `EncodeTick` had no gas term. The
+C_GAS latch was never the answer to this and was briefly reported as though it
+were: it decides whether the gas ROWS are recorded, so parcels kept flying — but
+a re-entry landing is a voxel write at a cell the CPU did not choose, and if it
+happened on a tick the CA rows were skipped for, that chunk would be simulated
+one or two ticks late, "how late" depending on when the readback ring got round
+to reporting it. Late is not lost; scheduling-dependent is a rule-1 break.
+
+Both halves are closed now. `NoteSnapshot` disqualifies on `gasLive_ != 0`
+alongside `particleCount`, `NoteGasLive` additionally clears `settledProven_`
+directly so the fix does not depend on call order, and `gasSpawnsThisTick_` is
+in `inputsThisTick` for the reason `windWakeCount` is — a CPU-queued parcel can
+re-enter and land, so it is a chunk-dirtying input. `gasLeave` conversions are
+deliberately not in that disjunction and do not need to be: a voxel can only
+reach the residency edge on a tick the CA ran, and the CA running already means
+the world was not proved idle.
+
+The `gas-leave` gate keeps counting ticks that fall in the window and printing
+the number on its own line. It measured **0 of 400 before the fix** — that
+fixture's own plume keeps the window busy for the whole run, so it never
+entered the hazard — and it should now be provably zero rather than
+incidentally zero. It stays because the assertion is cheap and because the next
+GPU-side source to arrive will need exactly this measurement made for it.
+
+**Gates:** `gas-leave` (4,096 smoke six chunks under the window's top face,
+open shaft above, 400 ticks twice) and `gas-reenter` (256 CPU-queued parcels two
+cells outside an X face into an inward wind). The first never asserts the quiet
+top plane alone — the same run must show that smoke reached the face and left
+through it, or a broken fixture passes too.
 
 ### MLS-MPM liquid (2026-08-22..23; `sim_fluid.wgsl` + `sim_fluid_seam.wgsl`, docs/PLAN_mpm_fluids.md)
 
@@ -1726,6 +2231,58 @@ rather than a tuning row now, so `--sweep` cannot reach it; the `terrain`
 gate's C1 (the CPU twin against the GPU per voxel) is the proof the words the
 map carries are the words the kernel reads.
 
+##### A loose cover is born at rest too (2026-09-09)
+
+The sediment wedge's slope gate was the only one. The desert / ocean **sand
+cap** was four voxels of POWDER laid on ground of any steepness, and those two
+biomes also author their *skin* as `sand`, where the skin branch had always
+assumed a solid ("a powder shell on a slope avalanches out from under itself").
+
+Measured on raw worldgen output (`--voxdump`, no CA), in a 128x96x128 box at the
+authored lake: **1,249 of 10,539 sand cells had a legal CA down-move on tick 0,
+and 418 of them went straight into the water.** The water itself is born
+perfectly at rest -- every cell full, flat top, solid floor, zero violations --
+so the reported bug (freshly streamed lake terrain stays awake for seconds) was
+never the water. It was the bank falling into it.
+
+`looseCoverDepth` splits a cover the way the wedge is split: the LOOSE part
+keeps its authored depth on ground the wedge already calls flat
+(`terrain.sedSlope`), tapers to zero at the CA's own angle of repose
+(`CAP_REPOSE_Q8 = 256`, one voxel per column -- not a knob, it is the constant
+`sim_step`'s diagonal slide defines), and whatever the taper takes away becomes
+the biome's `cover.firmSkin` (`WM_B_FIRM_COVER`; desert and ocean say
+`sandstone`, a material that far-aliases `sand` so it costs no palette slot).
+On flat ground the loose depth is the full authored 4 and nothing changes.
+
+Two authored discontinuities force it to zero outright, because **neither is in
+the noise field and the analytic gradient reads both as level plateau**: a water
+body's bermed / excavated bank (`Col.nearWater`) and an authored pool's rim
+annulus (`inRim`). `nearWater` is deliberately *not* `shore.onShore` -- that
+flag carries the shore feature's bluff cut, which turns itself off on exactly
+the tallest cut walls in the world.
+
+The skin half is gated on the authored class AND on the biome having authored a
+`firmSkin`. The opt-in is the author's veto: tundra's skin is snow, also a
+powder, and firming a tenth of the tundra broke its own authored claim ("99% of
+columns wear snow at `y == h`", the `env-truth` gate) for a settle transient
+tundra has always accepted.
+
+**Known gap, not fixed here.** This gate reads `Land.slope`, the *landform*
+gradient, which by design excludes the detail and grain octaves (see the note
+above -- gating on the full gradient turns the wedge into a cliff). So the
++-2-voxel steps fine noise puts on an otherwise gentle dune face are invisible
+to it: the open dune field still measured **645 movers before and after**. The
+lake case is fixed; the dune case needs a different instrument (a local step
+test, not a gradient), and the tuning that did catch it by brute force also
+stripped 87% of the desert's loose sand.
+
+`bowlSteep` carries a second known gap of the same shape, documented at its
+definition: it compares against the next integer radius *ring* rather than the
+four axis neighbour columns, and under-reads the step where the profile crosses
+two voxels between rings (168 bed grains on one marsh bowl face). The exact fix
+is written and works, but it moves the harness pool's bed enough to need the
+`waterbody` gate's conservation ledger reconciled with it.
+
 ##### Per-biome height curves (2026-09-01, Lin 13.3.3)
 
 "This biome is flat plains, that one is jagged mountains", authored as nine
@@ -1840,8 +2397,13 @@ y32..y86 world and sitting on the 20 m home area) are lifted and the atlas
 re-baked.
 
 **What is left in tuning.json:** `world.mapLayer` / `world.editLayer` (which
-files the game loads; the map page's selectors) and `debug.vegetation` (the
-dev A/B switch, Tuning → Dev switches). The Worldgen tab is gone (P-I):
+files the game loads; the map page's selectors) and the two plant dev
+switches, `debug.vegetation` and `debug.groundCover` (Tuning → Dev switches).
+They are one axis, not two features: `groundCover` off removes every plant a
+body walks through (biome cover rows, tile plants, shore rows, pond life, wet
+moss, cave flora) and leaves the trees and cacti standing; `vegetation` off is
+the extreme end and takes those too. The shader ANDs them (`GROUND_COVER` in
+worldgen.wgsl), so there is no fourth state. The Worldgen tab is gone (P-I):
 Environment → World map is the one front door — map + edit layer, the
 Terrain section, the Sites panel (pad, spawn, water, landform, stamp:
 select / rename / delete), the heightmap backdrop, and the heightmap + voxel
@@ -2363,22 +2925,56 @@ neighbors, so this needs an explicit connectivity pass:
   things: matter still smouldering (a burnt crown keeps making floaters for
   thousands of ticks), and the queue above dropping or starving the scans that
   would have cleared them.
-- Remaining accepted flaw, and it is now a **plan rather than an admission**
-  (`docs/PLAN_rigidbody_islands.md`): the scan is still local and conservative,
-  so a large floating section survives when it extends past the 80-cell region
-  (`kMaxRegionCells`), exceeds `kMaxIslandVoxels`, or touches an unfetched chunk
-  that reads as solid. Measured rather than assumed — cut an oak-sized tree
-  through the trunk and **28,573 voxels stay standing** while the scan makes a
-  25-voxel body, and the `anchoredBy*` counters name which cap did it. For that
-  tree only the first binds (28,573 is under 32,000 and every axis is under the
-  `int8` 120), but a `great_oak` at 159 × 230 fails all three. The chosen fix is
-  a sparse chunk-tiled flood that can span 256 cells, plus **sharding an
-  oversize component into ≤96-voxel sub-bodies welded with the cone-limited
-  joints ragdolls already use** — which also makes a felled trunk flex and snap
-  instead of falling as a rigid telephone pole. A global "connected to the
-  floor" sweep is no longer the presumed answer: the single-voxel case that
-  motivated it is handled locally and for free by the rule above. Gate:
-  `tree-fell`, assertion `cut-trunk-fells-the-tree`, red on purpose.
+- **The scan is sparse and the region is 256 cells (2026-09-12,
+  `docs/PLAN_rigidbody_islands.md` §4-§6, built).** `RunIslandDetection` no
+  longer builds a dense mask over its region; it floods a visited map keyed by
+  world cell, so a scan costs what it walks and the region can be 256 a side
+  (`kMaxRegionCells`), enough to judge a redwood whole. Chunks are read from
+  the mirror as the flood reaches them; one that is not cached is requested
+  and the event re-queues itself (`Event::fetchRetries`, its own ceiling)
+  **only if an unanchored component touched it** — anchoring is monotone, so a
+  component that is already anchored needs nothing behind an unfetched chunk.
+  Readiness (`EventReady`) is held to the event's tick for the SEED box only;
+  any cached copy serves elsewhere. Terrain is bounded by two anchors the old
+  box supplied by accident: a component reaching `kAnchorDropBelowSeed` (48)
+  under the changed box, or `kAnchorReachBesideSeed` (96) beside it while no
+  higher than its top, is the ground. The flood descends FIRST (the -y
+  neighbour is what the stack pops first), so it reaches that ground in about
+  as many steps as the structure is tall instead of wandering a crown. Measured
+  on the `tree-fell` fixture: the cut oak is now **one 28,478-voxel body**;
+  the burn pass went from 0.59 M cells visited (with the crown wrongly pinned
+  at the 80-cell wall) through 41 M (whole-tree re-walks) to 3.4 M with the
+  descent-first order and the terrain anchors.
+- **Oversize islands are SHARDED, not rejected (§5).** A component is diced on
+  a lattice of at most `kShardCells` (96) per axis; each lattice cell's
+  6-connected pieces become one rigid body each (an oak is one shard, a
+  redwood three), welded along a spanning tree rooted at the heaviest shard
+  with `JointType::Fixed` joints, collisions among them disabled, sharing a
+  `Body::assembly` id. Slivers under `kMinBodyVoxels` crumble as rubble.
+  Shards that fit the tick's op budget are made largest-first; the rest stay
+  in the grid and are re-derived by the re-queued event. `SettleBodies`
+  settles an assembly **as a unit or not at all**: every shard asleep,
+  aligned and unwounded, ground under ANY shard counts for all, one tick's
+  ops for the whole set.
+- **The debris system reads its own writes through an OVERLAY (2026-09-12,
+  gate `cactus-fell`).** A severed saguaro became a body within three ticks
+  and then stood in the air for as long as it liked: `ManageTerrain` had
+  meshed the collider around it from a mirror copy that still held the
+  severed top, and a cached chunk was only re-fetched while the snapshot
+  showed it dirty and never inside 8 ticks of the last request — the vacated
+  chunk was asleep again before that window opened. The mirror
+  (`World::cache_`) is fed only by explicit fetches, not by the player's 3x3x3
+  copy, so this held next to the player too. Now every cell this system
+  writes (island removal, rubble, settle-back) is recorded per chunk with the
+  word written (`NoteGridWrite`, `pendingVacate_`) until the mirror's copy is
+  at or past that tick; the flood and the collider occupancy both read the
+  mirror through it, and `ManageTerrain` re-fetches such a chunk whatever the
+  dirty flags say (`chunkWriteTick_`). A body is therefore never born inside a
+  mesh of its own former cells, a re-scan never converts cells a body already
+  took, and no event has to wait for a fresh copy of a chunk a fire rewrites
+  every tick. Empty (sky) collider builds no longer charge
+  `kTerrainBuildsPerTick`. Gates: `cactus-fell` (three arms: the game's own
+  fetch path, the brush's CPU door, a stone control), `tree-fell`.
 
 ### Rigidbodies
 - Detected islands are **removed from the grid** and become rigidbodies:
@@ -2589,8 +3185,395 @@ neighbors, so this needs an explicit connectivity pass:
   at edge midpoints, i.e. on a half-integer lattice, so identical positions
   dedupe exactly by integer key with no epsilon compare, and ~4× fewer vertices
   reach Jolt's `MeshShape` build (the dominant cost of a rebuild).
+- **Rebuilds are BUDGETED (2026-09-09):** `ManageTerrain` used to rebuild every
+  stale patch it wanted in the tick it wanted it, and a chunk-boundary crossing
+  stales a whole face of anchor chunks at once — a mob that has just acquired a
+  target widens its anchor to `navRadius + 4` (~216 chunks), arriving at
+  `World::kFetchPerTick` = 64 per snapshot and all polygonized, tree-built and
+  broadphase-added on the tick they landed. That was the 50-100 ms "Game
+  Systems" spike while walking. Now `kTerrainBuildsPerTick` (6) real rebuilds
+  per tick, nearest anchor first (the ground under a body is always the first
+  patch made; the far edge of a planner's horizon, which only the fetch
+  serves, is the last), and the surface's identity is the hash of the 18³
+  occupancy box taken BEFORE marching cubes — the mesh is a pure function of
+  it, so a re-fetched chunk whose solids did not move (the 8-tick dirty-flag
+  refresh, liquids flowing, blood drying) costs one sample and no mesh, no
+  Jolt body and no wake. A COUNT budget, not a time budget: the debris gates
+  run this under the selftest, and a body landing on a patch one tick later
+  on a slower machine would settle somewhere else. `terrainMesh` is its own
+  row on the Performance tab, debited from `gameLogic`;
+  `SANDVOX_TERRAIN_BUILDS_PER_TICK` is the one-binary A/B arm.
+- **...and what one body may ASK for is budgeted too (2026-09-12):** the report
+  was "2 fps for five seconds when a tree enters the rigidbody system", and the
+  `tree-fell` gate's cut pass now prints where the time went in one run
+  (`DebrisSystem::PhaseProfile`, thirteen phases, off unless a gate or
+  `SANDVOX_DEBRIS_PROFILE=1` asks). For ONE 28,478-voxel oak over the 300 ticks
+  of its fall: **220,896 chunk visits (734 a tick, 900 in the worst one),
+  26,232 occupancy gathers, and up to 454 chunk fetch requests in a SINGLE tick
+  against `World::kFetchPerTick` = 64** — to build six patches. Nothing else in
+  the profile was close: Jolt's own step was 0.56 ms a tick, the compound-shape
+  build 8.7 ms ONCE, the island scan 43.8 ms on the birth tick and nothing
+  after. STILL OPEN, and the profile says so rather than implying otherwise:
+  the render-side rebuild of 28k box instances is timed (`Phase::Instances`)
+  but a headless gate never calls `BuildInstances`, so that hypothesis is
+  instrumented and unmeasured until someone runs a live session under
+  `SANDVOX_DEBRIS_PROFILE=1`.
+  The cause was a **bounding sphere**. `needAround` reached `radiusVoxels + 6`,
+  and `radiusVoxels` for a 59 × 81 × 59 crown is 60 — a 133-voxel box, ~900
+  chunks, of which the body can touch about 150. So a body now asks around its
+  **rotated lattice AABB** (`Body::lmin/lmax`, cached on the voxel count, which
+  every geometry edit here changes and burning does not) plus a 4-voxel skirt,
+  and each chunk carries its distance to that BOX rather than to `xf.pos` —
+  which is the lattice's min corner, so the old metric ordered a crown's chunks
+  by distance from one bottom corner. Three nearest-first budgets then bound the
+  sweep whatever the scene asks: `kTerrainNeedCeiling` (512) on the list itself,
+  `kTerrainFetchPerTick` (24) on fetch REQUESTS so this system can never flood a
+  readback queue that drains 64 a tick, and `kTerrainGatherPerTick` (24) on the
+  18³ occupancy reads. None of the three DROPS anything — a chunk that misses
+  its slot is at the head of the next tick's sweep, the same contract
+  `kTerrainBuildsPerTick` has always had, so a patch is late and never absent
+  and nothing falls through ground it was about to be given. Measured on the
+  same gate: **814 ms → 172 ms** of debris CPU over the fall (2.70 → 0.57 ms a
+  tick), ticks over 8 ms 22 → 1, gathers 26,232 → 7,176, worst-tick fetch
+  requests 454 → 24. The remaining 30 ms spike is the birth tick's flood plus
+  28k exact-cell ops, which is one frame and is what that work costs.
+- **THE GATE SAID TREES FALL; THE GAME SAID THEY DID NOT. BOTH WERE RIGHT
+  (2026-09-12).** The debris gates run `runTick(ops, fetch=true)`, which
+  requests every chunk of the fixture box every tick, so their floods never
+  wait on a readback. The live flood does: an event deferred because the flood
+  reached an unfetched chunk kept its SEED box cached (only the crown was
+  missing), so PreTick's drain loop found it ready again in the SAME tick and
+  ran it again — all 32 `fetchRetries` in two ticks, long before the
+  one-tick-latent readback could land. Every scan that left the 3×3×3 player
+  mirror gave up on the spot: 99 scans, 3 give-ups, 0 bodies, 165k cells read
+  from unfetched chunks, for an oak cut 48 voxels from the player. Now
+  `Event::waiting`/`waitChunk` record the first chunk the flood stopped at and
+  `EventReady` holds the event until that chunk's copy has landed (a chunk that
+  streamed out is not waited for; `SANDVOX_NO_FETCH_WAIT=1` is the old arm).
+  The same tree is a body 15-22 ticks after the cut, in rounds of
+  `kIslandFetchPerScan` chunks. What made it findable in one run instead of a
+  bisect: `SANDVOX_ISLAND_TRACE=1` prints one line per scan — seed, retries,
+  components, the largest one's box and the cell that ANCHORED it, the chunk
+  it waits for and whether that chunk is cached — and the first live attempt
+  needed exactly that: planted at the SPAWN site the flood walked 54 voxels
+  west and 40 down through a neighbour's crown to the ground and correctly
+  refused, which `anchorAt` named and a counter never could. Fixtures for the
+  live path go on the map's `harness` pad (no trees by construction).
+- **The render half of the handoff has a number now (2026-09-12).** The gate is
+  headless, so `--fell-tree <tick> [x,z]` (main.cpp) plants
+  `selftest::BuildTree`'s oak ahead of the player under `--frames`, cuts it 120
+  ticks later exactly as the gate does, and prints the gate's COST line plus
+  whole-frame percentiles over the 300 ticks of the fall; the `--frames`
+  summary's `drawBodies` / `terrainMesh` / `physics` rows are the rest.
+  Measured on one 28.4k-voxel oak: `buildInstances` ran ONCE (0.4 ms — the
+  instance list is body-local, so "28k cubes rebuilt while it moves" is
+  retired); `drawBodies` is a STANDING 1.0 ms mean / 3.9 p99 / 5.1 ms max GPU
+  per frame for the resting body (`fsBody`'s per-fragment shadow ray and/or
+  the interior cubes nobody can see); and the live flood cost 4-6× the gate's
+  because THREE events (the cut's CPU event and the two GPU support flags it
+  raised) re-flood the same tree on every fetch round, ~10 rounds of 32
+  chunks, at 1-2.5 µs a cell through a hash-keyed visited map: islandScan
+  428-702 ms over ~32 scans, worst tick 77-204 ms. Those are the next
+  packages' numbers, and the harness is how they are read back.
+- **The compound build was the merge, not Jolt (2026-09-12).** With
+  `SANDVOX_PHYS_PROFILE=1` splitting `CreateDebrisBodyXf` per body, the oak's
+  8.6 ms was 8.3 ms of greedy box merge through two `unordered_map`s (the
+  probe lambda inserted a default `used` entry per lookup) and 0.3 ms of
+  `StaticCompoundShape::Create`. The merge now walks a dense byte lattice over
+  the body's bounding box — a body is an int8 lattice, the oak is 51×90×51 =
+  232 KB — in the same order, so the box set, collider and resting pose are
+  unchanged (fuzzed against a port of the old walk, and the debris /
+  settle-back / audio-impact / body-fastfall detail lines are byte-identical):
+  **10.4 ms → 0.5 ms** on the birth tick. Still open: the 1,024-box cap covers
+  only 5,474 of the oak's 28,478 voxels (19%) in flood order, so a canopy's
+  collider is whichever fifth the island scan reached first; raising the cap
+  moves resting positions and is its own gate-measured change.
+- **The body draw was overdraw × a shadow ray (2026-09-12).** Under
+  `--fell-tree`, `BuildInstances` ran twice for the whole fall (0.3 ms), and
+  the draw cost 1.14 ms a frame while the oak was a body: every voxel was an
+  instance, every fragment cast `fsBody`'s sun ray. Now `BuildInstances`
+  emits only voxels with an exposed face (28,400 → 24,027 for the oak;
+  `SANDVOX_BODY_DRAW_ALL=1` restores the full list), `vsBody` collapses the
+  faces the camera cannot see before they are rasterised, `fsBody` casts no
+  ray where the lambert it would multiply is zero, and `Simulation::DrawBodies`
+  draws a depth pre-pass (`vsBodyDepth`/`fsBodyDepth`) first so the ray runs
+  once per pixel: **1.14 → 0.52 ms** a frame, pixel-identical (the debris
+  gate frame differs by ≤5/255, TAA noise; `body-shade` still 0.434 in
+  shadow). Removing 15% of instances cut 48% of the time, which is what
+  "per overdrawn fragment" means. `BODY_SHADOW_RAY` / `BODY_VIEW_CULL` /
+  `BODY_SUN_SKIP` at the top of `debris.wgsl` are the one-binary arms. Bodies
+  still cannot use the shadow cache: its patches are grid cells, and a moving
+  body would re-register every frame. The floor without a look change is one
+  ray per covered light-facing pixel (0.52 mean / 1.6 p99).
+- **...and what it asks for is its MATTER (2026-09-12).** The rotated AABB was
+  the fix for a bounding sphere, but the AABB of a tumbling 81-voxel trunk
+  with a crown at one end is mostly empty: in the live harness one oak sat AT
+  `kTerrainNeedCeiling` (505 of 512 chunks a tick) for as long as it turned.
+  `Body::needBlocks` dices the lattice box into 8³ blocks with one bit each
+  (cached with `lmin/lmax`), and `ManageTerrain` transforms only the set
+  blocks — centre through the body basis, extent the rotated cube's per-axis
+  half-width, plus the skirt — into a dense per-body chunk grid of least
+  distance to any block box, so a chunk holding matter is still at 0 and the
+  nearest-first budgets are unchanged (`SANDVOX_TERRAIN_NEED_AABB=1` is the
+  old arm). Live: 96,056 → 47,439 chunk visits over the fall (max 512 → 185 a
+  tick), Jolt meshes 251 → 68; the wall-clock win is modest (~110 ms either
+  way) because the AABB list was already cheap per entry, and `terrainNeed`
+  itself rose 6 → 17 ms for the 192 block transforms a tick. A creature's
+  planning horizon (`navRadius + 4`) is handed over apart from its body
+  radius (`AddTerrainAnchor`'s `horizonVoxels`) and listed on one tick in
+  `kTerrainHorizonStride` (4), hash-phased, the body itself every tick
+  (`SANDVOX_TERRAIN_HORIZON_STRIDE=1` is the old arm; unmeasured live, no
+  targeting mob in the harness — the COST line's `anchor chunks` is its
+  denominator). And the shared chunk-fetch FIFO is finally visible:
+  `World::FetchSource` tags every request (IslandScan / Terrain / Mob / Settle
+  / Other — the player's 3×3×3 mirror rides every slot unconditionally and
+  never queues), `World::FetchProbe` counts per source (accepted / coalesced /
+  refused non-resident / carried / dropped streamed-out, age in ticks to the
+  carrying slot, queue depth, full drains, backlog), and `FetchReport()` is
+  one line in `--frames` and on the FALL line. Measured: the collider sweep
+  starves nobody (age 1.00, max 1, 0 full drains during a fall); standing
+  still, the island scans are the queue's only real customer (~19 a tick, 35
+  full drains, backlog to 34). Any tuning of `kFetchPerTick` or a consumer cap
+  is justified by that line or not at all.
+- **One flood per tree per round, and two or three rounds (2026-09-12).** The
+  island flood's visited map is a dense int32 page per chunk it touches
+  (`labelPages_`, allocated on first touch, recycled, capped at
+  `kMaxLabelPages` past which a component is anchored as oversize), shared by
+  every scan of one tick and cleared once in PreTick (`BeginTickLabels`): the
+  three events a cut raises (the brush's event plus a GPU support flag per
+  chunk it touched) cost ONE flood, because a seed an earlier scan labelled
+  inherits that component's verdict (`tickComps_`: anchored / waiting on chunk
+  W / held / made) and a flood that runs into such a component adopts it.
+  Nothing is requested during the flood any more; the chunks a component could
+  not read are requested after the verdicts, only for components a fetch could
+  still change, with the face ring, the column to the drop floor and the
+  26-ring speculated under one cap (`kIslandFetchPerScan` =
+  `World::kFetchPerTick`, counted per chunk — the old cap charged every
+  re-entry, so a scan's real reach was a handful of chunks), so a crown lands
+  in two or three rounds instead of ten. The one exception is the dive
+  frontier under the seed, requested whatever the verdict: the verdict is
+  monotone but the cost is not, and a terrain flood that cannot dive 48 cells
+  spreads 200k sideways (11.7 M cells over one burn without it). The shard
+  dice and the weld pass read neighbours through the same pages (`index`)
+  instead of two more hash maps, so a 28k-voxel oak is one 18 ms scan at
+  0.65 µs a cell. Live, the same cut: islandScan 428-702 ms over ~32 scans →
+  **61 ms over 5**, worst tick 73-204 → 32 ms, debris CPU over the fall
+  611-1097 → 166 ms, the tree a body at +6 ticks (was +15..22); gate cut
+  pass 259 → 173 ms with the worst tick 48 → 19.5 ms; the burn pass (the
+  forest-fire proxy) visits 1.28 M cells instead of 2.43 M. Still open: the
+  first support flag under a cut floods the terrain slab once (60k cells,
+  the drop anchor needs the column below to land), and the burn pass's one
+  stray leaf voxel is INTERMITTENT and not the wait's doing — the burn pass
+  is not run-to-run reproducible on one binary (5.0 M vs 11.7 M cells
+  visited; the traces diverge the tick the first burning bodies appear,
+  because the terrain-collider budget is wall-clock and feeds Jolt), the
+  survivors sit at ground+2 outside the gate's own forced-rescan tiling
+  (which starts at `treeA.lo` while the sweep box reaches 2 cells beyond),
+  and `SANDVOX_ISLAND_WATCH=x,y,z` / `ovHid`/`ovShow` are in place for the
+  next failing run.
 - Sleeping: settled bodies deactivate entirely until another body or force
   intersects their AABB (Jolt does this natively).
+- **NOTHING PASSES THROUGH THE GROUND (2026-09-12):** a collision patch is a
+  sheet of triangles with no thickness, so the only margin a body has is the
+  thinnest box in its own collider — 2-3 voxels for a ragdoll limb, against
+  17.8 voxels of travel in one 30 Hz tick at `player.maxFall`. Debris and limp
+  rigs were going through the floor, and the guarantee needs THREE things,
+  because each one covers a case the others cannot:
+  1. **Jolt CCD.** Every dynamic world body is created `LinearCast`, not the
+     default `Discrete` (which advances by v·dt and only then asks what it
+     overlaps). Jolt pays for the shape cast only when a step exceeds 0.75 ×
+     the collider's inner radius, so a settled or walking body costs what it
+     always did. `Physics::CreateDebrisBody`'s note has the arithmetic; the
+     `body-fastfall` gate pins it against a real `PolygonizeChunk` patch.
+  2. **Patches requested ALONG the velocity.** A cast can only hit a triangle
+     that exists, and the anchor box reaches about one chunk past a
+     human-sized body while a patch costs a chunk fetch plus a slot in
+     `kTerrainBuildsPerTick`. `ManageTerrain` now also asks for the chunks the
+     swept segment passes through, 0.35 s ahead and capped at four chunks,
+     each carrying its distance from the SAMPLE so the build order puts the
+     ground a body is falling onto ahead of the ground it has left.
+  3. **A body may not enter space no collider describes.** The Jolt twin of
+     `Player::KnownDrop`: `DebrisSystem::UntunnelBody` puts a body that ended
+     its step in a chunk with no built patch back at the last vouched point on
+     the segment, keeping both velocities so it resumes the moment the patch
+     lands. A CLAMP, NOT A VETO — a body already out there is let through, and
+     one held for `kUntunnelHoldTicks` is released with a report, because the
+     deadlock at exactly the speed the fix exists for is what the player's
+     first blind-fall attempt hit. This is the "park a body whose chunks are
+     not cached yet" the `debris` gate's buried-ejecta finding asked for.
+  4. **...and a jointed rig is ONE body for that purpose**
+     (`DebrisSystem::UntunnelRig`, 2026-09-13). Clamping each body of a ragdoll
+     separately tore it apart: a human rig spans two or three chunks, so falling
+     fast its LEADING bodies — the feet — enter the unvouched chunk several ticks
+     before the head, and each was teleported back to its own last vouched
+     sample *with its velocity intact* while its neighbours kept travelling. That
+     is a fresh multi-voxel violation at every joint, every tick of the
+     starvation window, which the solver then closes by force in a different
+     direction per limb. `Mob::PostStep` now hands the whole limp rig over at
+     once and one common vouched fraction of the step is applied to every member
+     along its own displacement: `f = 1` moves nothing, `f = 0` puts the rig back
+     exactly as it was, still rigid and still at speed. Both escape hatches keep
+     their meaning at rig scope (any member that STARTED outside lets the whole
+     rig through; the hold counter is keyed on the rig's first live body).
+
+### A corpse in armour is not allowed to be a motor (2026-09-13; `Physics::SweepRunawayRigs`, gate `corpse-armor`)
+
+Owner report: an armoured NPC, killed after its head had been cut off, spasmed
+and flew apart **while still jointed**; the framerate collapsed and the game
+froze for minutes. No `crash.log`, so this is not the FP-overflow kill 46e3848
+closed — that one dies in `JobIntegrateVelocity` with `0xC0000091`.
+
+**Every net that existed before this one is looking for garbage, and this is not
+garbage.** `corpse-armor` reproduces it and measures the peak spin at
+**47.12 rad/s, which is Jolt's own `mMaxAngularVelocity` to five figures**: the
+solver asked for more and the clamp handed back exactly the ceiling. Every net
+above it (`kInsaneSpin` = 1e4, `GuardBodyInertia`, `VelocityIsSane`) is three
+orders away and correctly so. Lowering those thresholds would not describe this
+failure; it would only move an arbitrary line.
+
+**The bug is the persistence, not the value.** A limb thrown by a sword blow may
+touch the clamp for a tick. A limb that *sits* on it is being driven — and a
+dressed corpse has an obvious motor. A worn shell on a CORPSE is its own Jolt
+body, `Fixed` to the limb it wraps and geometrically *inside* it, so armour
+doubles the bodies, doubles the constraints, and puts an iron-against-flesh mass
+ratio across every new one. A stiff constraint between deeply overlapping bodies
+is the textbook way to make a sequential-impulse solver gain energy, and the
+joints `Mob::Die` deliberately leaves on the corpse (see `corpse-intact`) spread
+it from one limb to all of them. That is precisely what "flying everywhere while
+still technically being attached" describes.
+
+> **That motor no longer exists, in any phase.** It was cut later the same day:
+> `Mob::Die` hands the follower strap to `DebrisSystem::StrapBody` instead of
+> trading it for a `Fixed` joint, so a worn shell is a kinematic follower on a
+> corpse exactly as it is on a living creature (next section). A dressed corpse
+> now has the same bodies in the solver as a naked one, the same constraint
+> graph and the same mass, and `corpse-armor` asserts that directly — no shell
+> that is still a body may carry a joint — instead of only bounding what the
+> corpse did afterwards.
+>
+> **The nets below stay, and are still the reason the report was survivable.**
+> They are not made redundant by removing one motor: a rig can be fed by any
+> constraint, and "a body that SITS at its own clamp is being driven" is a true
+> statement about all of them. What changed is that the commonest source of one
+> is gone.
+
+**Why it costs minutes rather than merely looking silly.** Two multipliers that
+this document already records elsewhere. Every dynamic body is
+`EMotionQuality::LinearCast`, so once the linear velocity is large each step is
+a swept compound-shape cast against marching-cubes terrain, per body, per step.
+And the contact solve sees `v + ω × r` at every contact point — the same term
+that turned a 5-second gate into an eight-minute hang when 1e30 rad/s was
+injected past the sweep.
+
+**Three nets, in `phys/physics.cpp`:**
+
+1. **The linear ceiling comes down from Jolt's 500 m/s to 80 m/s.** 500 m/s is
+   8.3 m — 83 voxels — of `LinearCast` sweep in one 60 Hz step. Nothing in this
+   world legitimately exceeds 32 m/s (terminal velocity for a fall the height of
+   the whole residency window); `physics.explosionMaxSpeed` is 30 and
+   `ragdoll.maxLaunchSpeed` is 14. **The angular ceiling deliberately stays at
+   Jolt's value**, because ω = v/r makes a one-voxel ball rolling at 5 m/s
+   legitimately 100 rad/s, and a lower cap would make every pebble skid.
+2. **`SweepRunawayRigs`**, before every `Update`, straight after
+   `SweepInsaneVelocities` (which has already removed anything that cannot
+   safely be squared). A per-body counter rises one per step spent at 90% of
+   that body's own ceiling and falls one per quiet step, so a piece merely
+   thrown hard decays out and is never touched. Past 12 the body is damped to
+   20%; past 45 the **joints are cut** and the body is zeroed and deactivated —
+   the motor is the constraint graph, and damping a body a constraint is feeding
+   just means it is fed again next step. A corpse that comes apart is a far
+   better outcome than a game that stops. **Jointed bodies only:** a body with
+   nothing attached has nobody to feed it, and damping every rolling pebble
+   would be a more visible bug than the one being fixed.
+3. **An unusable transform is repaired, not narrated.** It used to be a
+   `fprintf` on the argument that the position is already gone and the real fix
+   is upstream. Both halves are true and it is still the wrong call, because the
+   failures are not the same size: a wrong body is one dropped limb, a NaN AABB
+   is the whole process wedged with a window that will not close. The body is
+   put back inside a finite world, zeroed and slept, and the ordinary debris
+   cull collects it. A NaN *quaternion* does the same damage by the same route
+   and is now checked too.
+
+A `Physics::Step` over 100 ms reports itself on stderr with the active-body
+count and the fastest body attached — report-only, because wall clock may not
+decide what the simulation does, but it may say what it saw.
+
+**Neither stage ships unexercised.** `SANDVOX_PHYS_FAULT=pos:<n>` writes a NaN
+position straight into a live body past every clamp (the two existing arms
+cannot produce one — the velocity checks catch their garbage before it
+integrates, which is what they are for), and `corpse-armor` drives two jointed
+spheres at the ceiling on purpose and asserts damped > 0, cut > 0, joints 1 → 0
+and a final spin of zero. `SANDVOX_NO_RUNAWAY_NET=1` is the A/B arm in one
+binary, for the same reason `SANDVOX_NO_ANTITUNNEL` exists.
+
+**What this does not do.** It bounds the symptom; on a corpse it does not remove
+the energy source. The next section removes it everywhere a creature is still
+alive, which is where the reported *visual* failure was; a corpse still carries
+the constraint chain and still relies on these nets.
+
+### A garment is not a separate object (2026-09-13; `MobLimb::wornHost`, `Mob::DriveWornShells`, gate `ragdoll-dress`)
+
+Owner report: "when the human mob is falling, and is wearing clothes, when they go
+into the ragdoll state the clothes will decouple from the body when moving at
+high speeds... it becomes a crazy tangled mess ball of limbs and clothes that
+aren't actually connected properly."
+
+**Measured, on a dressed human made limp 200 voxels up: a greave 3.3 voxels off
+the leg wearing it and rotated 151 degrees away from it.** That is what a `Fixed`
+constraint between deeply interpenetrating bodies of very different mass does
+under acceleration — it lags, and it pumps (previous section). Even solved
+perfectly it would be the wrong model, because a garment on a limb has no pose of
+its own to solve for.
+
+So a worn shell is now a **follower**: `MobLimb::wornHost` names the limb it is
+strapped to, it stays KINEMATIC in every phase a live creature has, it has **no
+constraint at all**, and `Mob::DriveWornShells` teleports it onto the host's exact
+rigid offset — position, rotation and the rigid-body velocity `v + ω × r` — once
+per tick from `Mob::PostStep`, after the read-back. The offset is therefore
+*derived* rather than solved, which is a constancy claim rather than a smallness
+one: the same fixture now measures 0.000 voxels and 0.06°.
+
+- **One place poses a shell.** `SubmitPose` skips them. It used to pose them too
+  (an `AnimPart` whose rest transform is the identity gets the host's pose for
+  free), and the two agreed only while both bodies were kinematic — a limp host
+  is placed by Jolt and a get-up host by a per-limb blend, and either is a
+  garment floating off a shoulder.
+- **Death hands the strap over; it does not trade it for a constraint.**
+  `Mob::Die` records the shell/host pairs, and once both are `DebrisSystem`'s it
+  re-ties them there (`DebrisSystem::StrapBody`): the shell stays kinematic and
+  its pose is derived from its host's every `PostStep`, by the same rigid
+  offset, on the far side of the same read-back. **A garment is a follower in
+  every phase there is**, which is what makes "a corpse in armour behaves like a
+  corpse" a structural fact rather than a tuning result — the armour is not in
+  the solver, so it cannot change what the corpse does.
+  - A follower is not anti-tunnel-clamped and is not read back from Jolt (it
+    has no trajectory of its own), and it never settles back into the grid on
+    its own — a breastplate stamped into the world while the body inside it
+    went on tumbling is the failure that rule prevents.
+  - **When the host stops existing, the strap is cut** (`UnstrapBody`) and the
+    garment becomes ordinary dynamic debris carrying the velocity it was being
+    driven at — culled, looted, burned away, settled back, or dragged out of the
+    loot panel (`ShedCorpseLoot`, which cuts it explicitly: off the corpse has
+    to mean off it).
+  - A collider rebuild mints a new handle and the strap is keyed on handles, so
+    `CarryStrap` sits beside every `ReplaceBody` the way the joint re-target
+    does. Without it a plate came off the first time the limb under it lost
+    voxels to a sword or to fire.
+  - The strap is **saved** (`DBRS` version 3: host index + rigid offset). A
+    section that did not carry it reloaded an armoured corpse as a pile of free
+    bodies sharing the same space, which is the same motor by the other route.
+- **A shell that leaves ON ITS OWN stops being a follower** — knocked off, or
+  its piece shed — and is ordinary debris from the end of its sever hold. A
+  shell whose HOST leaves is a different case and follows it (above).
+- **What it costs:** a kinematic body has no mass in the solver, so an armoured
+  ragdoll tumbles with flesh inertia rather than with 489 kg of iron. Weight
+  still tells where it is authored to (`BodyMassKg` sums the shells, so a blast
+  launches a plated body far slower). Folding each shell's mass into its host's
+  mass properties is a separate change with its own gate.
+- **`SANDVOX_NO_RIGWELD=1`** is the A/B arm in one binary — jointed dynamic
+  shells and the per-body anti-tunnel clamp — for the same reason
+  `SANDVOX_NO_ANTITUNNEL` and `SANDVOX_NO_RUNAWAY_NET` exist. `ragdoll-dress`
+  reports both regimes' numbers side by side in `tests/baseline.json`.
 
 ### Carving living bodies (2026-08-20; `game/mob.cpp`, `MobSystem::CarveLimb*`)
 
@@ -2992,6 +3975,207 @@ back into the grid takes it with it. Rule 2: `bleedOpsPerTick` bounds the
 corpses' drips as it does the creatures', the gout shares
 `kMaxParticleSpawnsPerTick`, and an idle body costs two field reads.
 
+### Blood on a body (2026-09-13; `phys/bodystain.h`, `MobSystem::StainLimbs`, `Mob::ApplySplatter`, `MicroBodyPokeStain`)
+
+The soak above REWRITES flesh to blood, skips bone on purpose, and ran only on
+the blade's kerf, so a cut through bone showed clean bone, and a blast
+crater, a corpse cut or an outright sever showed clean everything. And a body
+could not take blood from anywhere: a voxel had a material byte and an art
+byte and nothing else. The owner's report: cuts "cleanly show the underneath
+voxels without any blood", and killing something should get blood ON YOU.
+
+**The stain byte.** `PrefabVoxel::stain` / `DebrisVoxel::stain` (voxload.h
+`BodyStain*`): amount 0..15 in the low nibble, stain TYPE above it -- the same
+palette slot the voxel word's bits 28..30 carry, so a stain moves between the
+ground and a creature without translation and shades through the same
+`STAIN_PALETTE_BASE` entry. Rendering is a side lattice in the micro brick
+(`MicroBodyModelGpu::dims` bit 30, `kMicroBodyDimsStainBit`): one byte per
+micro voxel after the payload, allocated only for OWNED blocks (a def's shared
+model is clean by definition; a body becomes owned the first time anything
+marks it), written by `WriteBrick` on every re-skin and poked per voxel by
+`MicroBodyPokeStain`. The shader (`microbody.wgsl bodyStainTint`) reads one
+byte at the hit and applies exactly `applyStain`'s multiply-then-lerp with the
+same `TUNE_STAIN_*` knobs, mottled at world pitch, so blood that ran off an
+arm onto the floor is the same colour on both. Never hashed (the body is not
+in the grid); SAVED, because it rides the limb's own voxel list and the MOBS /
+DBRS sections write those lists raw (this sentence said "never saved" until
+2026-09-13 and was wrong); travels with a severed limb (the voxel lists move)
+and into every fragment
+(`DownsampleSkin` carries the heaviest stain of a block; `MicroBodyPack`
+grows the lattice for a stained gobbet). Rule 2: the pool pays +50% only for
+bodies that have actually been bloodied.
+
+**Four sources, one rule each:**
+
+- **The cut** (`SoakCut`, bodystain.h; called from `Mob::StainWound`, so the
+  kerf, the crater in `CarveLimbRadial`, and BOTH faces of a `Sever` get it,
+  and from `DebrisSystem::DamageBody` for a corpse). Every voxel within
+  `gore.stainCutRadius` takes a stain: EXPOSED ones (an empty 6-neighbour in
+  the limb's own lattice -- the hole's walls, the skin round its mouth)
+  `stainCutAmount` tapering with the square of the distance and jittered per
+  voxel; buried ones `stainCutBuried` at `stainCutBuriedChance`. Bone (not
+  `MobDef::tissue`) is never REWRITTEN but always STAINED: `stainBoneMin`
+  floors any exposed bone in range, so bone reads as blood-smeared bone.
+- **...and A CRATER IS NOT A KERF** (2026-09-13, owner report: "explosions
+  that cause minor damage cause way too much random noisily spread blood
+  spatter"; gate `blast-stain`). The blast path first asked for the BLAST
+  SPHERE -- `StainWound(cBody, radiusVoxels + 0.5)` -- and that is two wrong
+  volumes at once. `CarveRadialAll` calls the carve for every limb within
+  `radius + r + 2`, so a limb the blast took nothing from was soaked anyway;
+  and the sphere is what the crater predicate SEARCHED, not the hole it made,
+  while the outer skin is "exposed" by definition, so at `woundStainSurface`
+  0.9 a graze repainted most of the limb's visible surface. Measured on the
+  human's upper leg: **8 of 1344 voxels lost, 305 rewritten and 907 stained**
+  (23% and 67% of the limb).
+  Three rules replace it, and the middle one is the whole idea.
+  (a) `Mob::CarveLimb` reports what it actually removed (`CarveReport`:
+  count, centroid, RMS spread, and the CELLS), and a limb with `count == 0`
+  is not soaked at all. (b) The taper is a distance to **the removed cells**,
+  not to their centroid -- `BuildCellDist` / `CellDist` in bodystain.h, a
+  3-4-5 chamfer over a box round them, shared by the rewrite and the tint.
+  A centroid ball is still the wrong shape, because the crater predicate's
+  falloff means a graze is a SCATTER across the whole sphere whose centroid
+  is inside the limb. (c) `gore.craterStainRim` LATTICE CELLS past those
+  cells is the whole reach (the tint rides at the authored
+  `stainCutRadius : woundStainRadius` ratio of it), so the blood is the size
+  of the hole whether that is a scratch or a bite. Same fixture after:
+  **8 lost, 7 rewritten, 111 stained**. The kerf path is untouched -- every
+  blade caller still passes a centre and `woundStainRadius`, and with no
+  crater the ball and the old `stainCutRadius * scale` tint are what run.
+- **...and white noise cannot make a smear.** The soak's per-voxel chances
+  were independent draws, which have no feature size, so what they painted
+  was an even red sprinkle -- the same mistake `carveChunkiness` exists to
+  fix for the crater itself. `woundStainCoherence` blends the draw toward a
+  `ValueNoise3` field of `woundStainBlob` world voxels (0 = the old draw
+  voxel for voxel). The blob must be SMALLER than the wound it mottles: at
+  the first default of 1.6 world voxels the field was constant across a
+  3-cell nick and the coherence went all-or-nothing (7 rewritten or 0,
+  depending on the seed), hence 0.5.
+- **Splatter** (`SplatterEvent`; `Mob::BleedTick` queues one per gout tick
+  and per drip spray, `MobSystem::StainLimbs` replays it against every
+  creature's limbs, `PlayerAvatar::PreTick` against the player's). The GPU
+  droplets cannot see a limb, so this is the CPU's record of the burst --
+  origin, axis, cone, launch SPEED and count -- and the replay FLIES THE
+  KERNEL'S OWN ARC (speed, then `sim.partGravity` per tick), so a body is
+  marked where the droplets are seen to land and nowhere else: a drip's spray
+  at 3.5 vox/s rises a tenth of a voxel and marks nothing it is not dribbling
+  onto, and a gout at 17 vox/s drops 1.3 m over the metre to an attacker, so
+  it reaches their shins, not their face (raise `severSpraySpeed` for that).
+  SAMPLED IN PROPORTION: for each limb, the arc families (low / high) that
+  pass its bounding sphere inside the burst's cone are solved in closed form,
+  the sphere's solid angle over the cone's times the droplets thrown this
+  tick is how many arcs are aimed across it, and each arc is marched through
+  the limb's burn index (the dense box `BuildBurnIndex` already keeps) tick
+  by tick, one slab test per tick until it enters the box. The first solid
+  voxel it meets takes a SPLAT of `splatterSplatRadius` world voxels at
+  `splatterAmount` (rim thinning and breaking up), not a single lattice
+  voxel. That is how killing something covers you in it, and how a neck stump
+  paints its own torso. `splatterPerLimb` caps the arcs per limb per event
+  (past it one arc stands for several droplets and paints wider); `reach` is
+  capped by `splatterReach` and by speed x life. Before 2026-09-13 the replay
+  was a straight march of a fixed 24 droplets per limb regardless of the
+  burst: a face got two or three 1.25 cm dots from a 1,190-droplet gout, and
+  a standing body next to a bleeding one was painted 80 cm up the leg by
+  sprays nothing visible had thrown there.
+- **Contact** (`MobSystem::StainOneLimb`, from `Mob::StainTick`). The same
+  world-AABB walk `BurnOneLimb` makes -- and the same exit at the cost of the
+  walk when nothing is there -- for a STAINING LIQUID (blood: its authored
+  `stain` type/amount/chance), a DRY STAIN on a solid (the voxel word's stain
+  bits: half the amount, `stainFloorTransfer` of a nominal rate), and a
+  WASHING LIQUID (water: `washes`). The walk stops at the first such cell;
+  then the limb's SURFACE (`BodyBurnState::surface`: the exposed voxels of
+  the burn index, listed once per index build) is swept, each surface voxel
+  reading the world cell it sits in -- the body is not in the grid, so a
+  pool occupies the very cells the feet do -- or else the cell one step out
+  along its open face, and rolling the liquid's own per-mille chance on what
+  it finds. So a creature standing in a pool bloodies its feet at the rate
+  the pool stains the ground, washes them in the river at the rate the river
+  rinses stone (`stainWashPerContact` off per successful roll), and a limb
+  wholly under blood is bloodied all over. The first version kept the first
+  24 contact cells of the walk and mapped each, dilated by one voxel, into
+  the lattice: for a submerged hips those were one edge of the bottom row
+  every tick, so its underside never saw a contact (2026-09-13, pinned
+  fixture: 16 -> 16 through a 30-tick flood).
+- **The corpse** carries whatever it died with; `DamageBody` soaks a fresh
+  cut on the corpse the same way. (A lying corpse does not yet take contact
+  stain from the pool under it -- the debris side has no contact pass.)
+
+Budgets in `mob.h` (`kStain*`): 2,048 world cells per limb walk, 6,144
+surface voxels per limb and 32,768 per tick for all creatures, start rotated
+by tick; 64 queued bursts; `splatterPerLimb` arcs per limb per burst. Gate
+`body-stain` (the human pinned with the `dummy` profile, standing in a stone
+basin written round it so the sand cannot flow): an ankle-deep pool over 30
+ticks stains the feet and nothing higher than `bodyStainShallowMaxRise` above
+its top; a drip-speed burst from a metre away marks nothing; a deep cut
+stains the limb and at least half of the bone it exposed; a 6 m/s burst aimed
+at the hips lands; the wound's own spray queues bursts; a box of blood round
+the hips over 30 ticks stains them and the same box of water over 60 ticks
+takes at least half of it off again.
+
+### A coat is a substance, not a look (2026-09-13; `docs/PLAN_body_coat.md`, `Mob::RecountCoat`, `Mob::ShedCoat`, `Mob::Footfall`)
+
+The byte above named a palette SLOT, which is the right identity on the ground
+(the substance is the liquid cell; the stain is what it left) and the wrong one
+on a body, where there is no cell and the stain IS the substance. Seven looks
+are not seven substances: a future nullifier and blood may share a ground
+colour and must still be told apart on a hand. So the body stain is now a
+`uint16_t` -- 12-bit MATERIAL id, 4-bit amount (`voxload.h` `BodyStain*`) --
+and the ground's slot is DERIVED from it where a look is needed: the micro
+brick's render lattice stays one byte and `microbody.cpp` converts through
+`MicroBodySet::stainSlotOfMat`, refilled at every materials load, so
+`microbody.wgsl` did not change. A dry floor stain rubbing onto a foot goes the
+other way through `matOfStainType_` (the first material registered with that
+slot). The width change bumped the MOBS and DBRS save versions once.
+
+**`coat` block** on a material (`ParseCoat`, requires a `stain` block so the
+substance has a look): `decay` seconds per amount level lost while on a body
+(0 = washing only; blood 20, water 4 so wet dries), `shed` per-mille chance
+per footfall that a coated foot deposits (blood 400), `effects` raw string tags
+that nothing consumes yet. Behaviour is data (guideline 4): the first effect is
+a tag in JSON plus one read of the ledger.
+
+**The ledger** (`Mob::RecountCoat`): per limb, amount-weighted sums by material
+over the live voxels, body totals over the base rig only; fraction
+`sumAmt / (15 * voxels)`, so one splash cannot flip a threshold. Recounted
+every `coat.recountTicks` and ONLY when a stain byte changed (`coatDirty_`),
+so a clean crowd pays nothing (rule 2). `MobSystem::LimbCoatOf / BodyCoat /
+CoatTagFraction(mob, tag, limbTag)` resolve the avatar by id like the stain
+counts do.
+
+**Decay** lives in `Mob::StainTick` AFTER the contact pass, because
+`StainOneLimb` returns at the first empty AABB walk and a coat must fade in
+clean air; per-voxel roll on `Hash3(limbKey ^ cell, tick, salt)` so it thins
+unevenly, start rotated by tick under the same lattice budget, brick poked per
+change. Ground stains do NOT decay: the world rule is monotone so a stained
+chunk can sleep, and a drying rule would keep every stained chunk awake.
+
+**Shedding.** NPCs never had a footfall; `Footfall` moved from `PlayerAvatar`
+down to `Mob` and the NPC plant emits it (the avatar's per-frame audio drain is
+untouched). `Mob::ShedCoat` at the plant, tick-side: a foot whose ledger names a
+`shed` material rolls once, then emits ONE micro droplet per distinct ground
+cell of the sole -- the particle kernel's `atomicMax` claim takes one deposit
+per cell per tick, so N droplets on one cell waste N-1 -- born INSIDE the solid
+cell under the foot with life 1, where `sim_particle.wgsl` claims and resolves
+it that tick with the material's own `stain` block. Zero shader changes; the
+foot loses what it shed; liquid ground is skipped (the droplet would park on
+the water and vanish); charged against `coat.shedPerTick` and the spawn ring
+before emission, one tick latent through `pendingSpawns_`.
+
+**UI.** `UIState::BodyPartUI::stainFrac / stainMat / stainColor`: the HUD's
+"stained NN%" line beside the health bar (hidden under `coat.hudMinFrac`), the
+stick figure's limbs blended toward the substance's stain colour, and on the
+character screen a `BLOOD 42%` chip beside CHARRED and a stain-coloured callout
+for a stained but otherwise healthy limb.
+
+Gate `body-coat` (one monotonic tick counter on purpose: the drying rule fires
+on `tick % period`, so stepping the clock back between phases would mis-time
+the control arm): after a deep cut the ledger's heaviest material on the limb
+is blood (684 of 1330 voxels, fraction 0.24); at the authored 20 s a level the
+count holds through 150 ticks (684 -> 684) and at `coat.decayScale` 300 --
+two ticks a level, a value an author can set -- it falls to 62 in 47 ticks; a
+direct deposit on a stone cell of the room reads blood's slot at amount 5 and
+the cell is still stone.
+
 ### What is under the skin (2026-09-02; `assets/editor/anatomy.js`, sidecar `anatomy`, `scripts/anatomize_mob.mjs`)
 
 Every limb was skin all the way through. A cut face showed skin, a burn-through
@@ -3169,7 +4353,7 @@ and the projectile dies when it is spent; lifetimes, live projectile counts,
 multiplicity, fan count and generation are capped in `glyphs.json` and clamped
 against engine ceilings at load.
 
-#### The grammar (docs/PLAN_magic_grammar.md §1–§3; `ParseSpell`, `LowerSpell`)
+#### The grammar (three rules; `ParseSpell`, `LowerBox`, `LowerSpell`)
 
 Hundreds of glyphs, uncountably many sequences, every one does the predictable
 literal thing, and nobody ever writes a rule for a specific combination. The
@@ -3178,83 +4362,175 @@ way to get that is the way programming languages get it: a handful of
 effect lowers to, and a **tariff** that prices what the spell does to the
 world rather than the words it used.
 
-Five sorts, declared per glyph in `glyphs.json` (`sort`): **Matter** (a
+Six sorts, declared per glyph in `glyphs.json` (`sort`): **Matter** (a
 material by name; `air` is the void, `anything` the wildcard), **Effect**
 (something that happens at a point: a `verb` plus parameters), **Delivery**
 (how an Effect reaches a point: `mech` instant | flight | continuous plus the
 record fields), **Mod** (a field edit on the delivery record: `field`, `op`,
 `amount`), **Operator** (a verb with argument slots — `left`/`right` list the
 sorts each accepts, `result` the sort produced; every unary operator takes the
-word BEFORE it, only `transmute` is infix). Nothing in C++ knows which words
-exist. The C++ vocabulary is the sort names, the verb names (`spray`, `place`,
-`convert`, `explode`, `wind`, `mend`, `trail`, `sustain`, `filter`, `repeat`)
-and the record field names — each verb maps to ONE op type or ONE engine seam,
-and `ApplySpellEffect` switches on the verb and nothing else.
+one item BEFORE it, only `transmute` is infix), and
+**Separator** (`also`, which ends one sentence and starts the next). Nothing
+in C++ knows which words exist. The C++ vocabulary is the sort names, the verb
+names (`spray`, `place`, `convert`, `explode`, `wind`, `mend`, `trail`,
+`sustain`, `filter`, `repeat`, `launch`) and the record field names — each verb
+maps to ONE op type or ONE engine seam, and `ApplySpellEffect` switches on the
+verb and nothing else.
 
-Six parse rules, and they are the whole grammar:
+**Three rules, and they are the whole grammar** (rewritten 2026-09-10; the
+2026-09-04 six-rule version is superseded, and `docs/PLAN_magic_grammar.md` §2
+R4/R6 and §11.4 are marked as such):
 
-- **R1 runs merge.** `shotgun shotgun shotgun` is `shotgun×3`; capped
-  (`budgets.maxMultiplicity`). Matter and Effects ADD (×N of the verb's declared
-  axis: spray voxels, explode power); Mods COMPOSE (applied again: shotgun
-  3/9/27, swift ×2/×4, float −1g/−2g).
-- **R2 operators bind their neighbours, greedily, on their declared side,**
-  left to right. A bound group is one item of the operator's result sort, and
-  the HUD's brackets are *derived from the binding*, so what you see is what
-  bound.
-- **R3 an operator with an empty required slot is INCOMPLETE:** charged its
-  word, does nothing, drawn as `_`. There are no defaults — `anything` and
-  `air` are words — so "unmake whatever is there" is spelled `anything
-  transmute air`.
-- **R4 a Delivery closes the clause.** `explosive projectile fire bomb` is two
-  casts. A second Delivery starts a new clause rather than replacing the first,
-  because that is the only total reading that never discards a spoken word.
-- **R5 a clause without a Delivery is delivered by `hand`,** at reach in front
-  of the caster. A bare `explosive` goes off there, and yes, it hurts.
-- **R6 order inside a bag does not matter.** Only operators (R2) and clause
-  boundaries (R4) are order-sensitive. The lowering rebuilds each clause from
-  its bag in a CANONICAL order (by key), because mods compose through integer
-  arithmetic that does not commute under clamping (49 halved then doubled is
-  48) — without that `swift slow` and `slow swift` would be two different
-  records and R6 would be a lie.
+- **1. A NOUN GOES INTO THE PILE.** A Matter word, an Effect word, or an
+  operator group whose result sort is Effect is pushed onto the PILE. Order
+  inside the pile does not matter: runs merge (`shotgun shotgun` is
+  `shotgun×2`, capped by `budgets.maxMultiplicity`), identical non-adjacent
+  items merge too, and the lowering rebuilds the pile in a CANONICAL order (by
+  key) because mods compose through integer arithmetic that does not commute
+  under clamping — 49 halved then doubled is 48. Matter and Effects ADD (×N of
+  the verb's declared axis); Mods COMPOSE.
+- **2. A DELIVERY BOXES THE PILE, AND SPEAKING CONTINUES.** The Delivery word
+  takes the WHOLE pile and wraps it into ONE Effect value of verb `launch`:
+  that delivery's `DeliveryRec`, the pile's Effects as its payload, the pile's
+  pending Mods stuck to its record. The pile becomes exactly that one value —
+  so a box is a noun again and can be boxed once more, taken by an operator, or
+  spoken beside other nouns. **Deliveries NEST, and word order is what decides
+  what is inside what.** `explosive projectile projectile` is a bolt that, when
+  it hits, fires a bolt that explodes. Deliveries are the one sort that does
+  NOT merge on repeat, precisely because each one boxes what is in front of it.
+- **3. A MOD STICKS TO THE BOX THAT CLOSES THE PILE.** A Mod word — or an
+  operator group of result sort Mod, which is `trail` — goes into the pile as
+  PENDING and is applied to the record of the NEXT delivery spoken. So
+  `explosive shotgun projectile` and `shotgun explosive projectile` are the
+  same three fanned exploding bolts, while `explosive projectile shotgun` is
+  one bolt fired from three fanned points and `explosive projectile shotgun
+  projectile` is three bolts that each fire one. With no delivery to close the
+  pile a mod sticks to `hand`, the implicit outermost delivery, where `shotgun`
+  is three fanned resolve points and `float` is the hop — and **every other mod
+  on the hand is a charged no-op**, named in the describe line ("`swift` is
+  wasted: it landed on your hand, which has no speed") rather than quietly
+  editing a field nobody reads.
 
-`ParseSpell` (R1–R4, R6) produces a `SpellTree`; `LowerSpell` turns each clause
-into a `SpellCast` — a `DeliveryRec` (the record Mods edit), a payload of
-`EffectInst`s, an instance count, the four rule-2 budgets and the price split
-into word / tariff / carry; `CastList` is what `Cast()` runs, what a projectile
-carries and what backfire runs. Every sequence lowers to a definite cast list;
-there is no misfire state, and the imprecision penalty lives entirely in the
-mana/health crossover.
+The outermost box is ALWAYS `hand`, so the whole utterance lowers to ONE cast —
+unless **`also`** is spoken. `also` is a new sort (`separator`, word cost 0):
+it closes the current pile as a finished cast, hand-delivered if no delivery
+closed it, and starts a new one. **Law L4 (cost additivity, union of emissions)
+attaches to `also`**, not to a delivery, because a delivery no longer ends
+anything.
+
+Unary operators (`trail`, `aura`, `echo`, `null`, `mend`) take the ONE item
+immediately before them, which may now be a launch box: `explosive projectile
+echo` is a turret and `explosive projectile aura self` a sustained status that
+fires a bolt every tick. `transmute` is still the one infix word. An operator
+with an empty required slot is still INCOMPLETE — charged, does nothing, drawn
+as `_`. `trail` still yields a Mod, so it is pending and sticks to the closing
+delivery, and its inner effect may itself be a launch; on any record that does
+not travel it is charged and does nothing.
+
+An **empty box** — a delivery spoken with nothing in front of it — is a carrier
+with an empty payload, which is today's kinetic hit (`impactRadius`). It is
+legal, total and priced.
+
+**`split` is gone.** `explosive projectile shotgun projectile` subsumes it and
+says what it does; the `children` field, `ModField::Children` and the resolve
+lambda's children branch went with it. `SpellFan` stayed.
+
+**A nested launch, at runtime.** `SpellVerb::Launch` is an `EffectInst` that
+carries a `DeliveryRec` and its payload in `inner`. `ApplySpellEffect` stays
+op-stream-only (thesis 1): a Launch appends a `SpellLaunchReq` to
+`SpellEmission::launches`, and `SpellSystem` adopts those at the end of `Cast()`
+and inside `Tick()` exactly the way it adopts statuses, echoes and filters
+(`AdoptLaunches`, then `Adopt`). Flights go through `Launch()`, bombs through
+`RequestBody()`, a nested `beam` runs ANCHORED — from the point along its
+direction for its tick cap, unheld, because that is the only bounded reading —
+and a nested `self` resolves its payload at the caster's body when the owner's
+`SpellBodyProbe::bodyPos` can say where that is, otherwise where the parent
+resolved. The drain loops (bounded by `maxGeneration + 2` passes) because an
+instant nested box resolves in place and may ask for carriers of its own.
+
+**Where a child launches from, and which way.** From the parent's LAST FREE
+position (the `from` in the resolve lambda — a child born inside the wall its
+parent hit would impact on its own first sub-step and chain), with direction =
+the parent's incoming direction REFLECTED off the surface it hit, per axis,
+using the same probe `bounce` uses. With no surface — a bomb at rest, a fuse
+resolve, an orb expiring, a `self` — it goes straight up. `shotgun` fans around
+that direction with the existing `SpellFan`.
+
+**Two bounds on a nest (rule 2).** Each nested launch is generation + 1 and
+nothing past `budgets.maxGeneration` launches — the existing check in
+`Launch()`, plus the same check in `AdoptLaunches`. And the LEAF instance count
+(the product of the fans down each path, summed over paths) is capped at
+`budgets.maxInstances`: a box whose fan would overrun it is clamped at lowering
+and the describe line says so. `SpellCast` carries `depth`, `leaves` and
+`instancesClamped` beside the four old numbers.
+
+**Price is recursive, and carry composes multiplicatively.** A launch effect's
+tariff is (payload tariff + trail tariff) × instances × the carry of its
+delivery, so a bolt that fires a bolt pays 3.0 × 3.0 on whatever the inner one
+finally does — which is exactly the "you are paying to move it twice" reading
+carry exists to give. Word costs sum over the whole tree. `priceUnknown`
+propagates. `CastList` still exposes wordCost / tariff / carryCost / manaCost;
+the tariff is the tree's base and the carry line is every premium in it.
+
+**Fatal casts FLATTEN.** `ApplySpellEffect` takes a `flatten` flag, and a Fatal
+outcome runs the payload at the caster with it set: every Launch resolves its
+own payload IN PLACE, recursively, and no carrier is created. So an overcast
+`explosive projectile projectile bomb` goes off in the chest with everything it
+was ever going to do. Law L11 asserts a Fatal cast emits no launches at all. A
+misfire (live-projectile cap, generation cap) flattens for the same reason.
+
+`ParseSpell` (the three rules, in one left-to-right pass — operator binding has
+to happen there, because the item to an operator's left may be a box a delivery
+just made) produces a `SpellTree` of `SpellNode`s that are now raw words,
+operator groups, or BOXES; `LowerSpell` calls `LowerBox` on each clause's root
+and recurses, turning each box into a `SpellCast` — a `DeliveryRec` (the record
+Mods edit), a payload of `EffectInst`s whose Launch entries are the nested
+boxes, an instance count, the rule-2 budgets and the price split into word /
+tariff / carry. Every sequence lowers to a definite cast list; there is no
+misfire state, and the imprecision penalty lives entirely in the mana/health
+crossover. The HUD's brackets are derived from the tree, so a box draws as
+`[ … DELIVERY]` and what you see is what nested.
 
 **The reference interpreter is the oracle.** `scripts/magic_grammar.py`
-implements R1–R6 over the same glyph table and generates
-`docs/MAGIC_PERMUTATIONS.md` (every word, every brief sentence, every pair over
-a 19-word alphabet, every triple over a 10-word core). `--oracle` writes
+implements the same three rules over the same glyph table and generates
+`docs/MAGIC_PERMUTATIONS.md` (the worked sets, every word, every brief
+sentence, every pair over a 19-word alphabet, every triple over a 10-word
+core), with a header metric per alphabet: orderings vs distinct spells vs
+distinct spells that do anything at all. `--oracle` writes
 `assets/spells/grammar_oracle.json`, and the `spells-oracle` gate parses every
 entry with the C++ and compares the bracket string and the clause structure.
 A row of the permutation table that reads wrong is a rule that is wrong; fix
-the rule in both places and regenerate.
+the rule in both places and regenerate. Never hand-edit the generated files.
 
 **The laws are the gate, not a pinned list.** The `spells` gate asserts
 algebraic properties over every sequence of length ≤ 3 drawn from that
 alphabet, generated in the test: L1 totality (non-empty cast list, finite
-cost, non-empty description), L2 bag commutativity (a permutation with the
-same canonical form lowers to an IDENTICAL cast list, compared field by
-field), L3 multiplicity (`g g` ≡ `g×2` exactly until the cap: spray voxels ×N,
-explode power ×N, a mod's field edited once more per word, cost monotone),
-L6 local binding (an operator's bound arguments do not change when a word is
-inserted anywhere that does not land inside or adjacent to ANY operator
-group's spoken span — "any", because greedy binding means a word dropped into
-another operator's slot region can steal its argument and free a word for this
-one; locality is about where the word lands relative to every binding), L4
-clause independence (`cost(A ‖ B) = cost(A) + cost(B)` and the casts are the
-union whenever the parse of A+B is the parses side by side), L7 tariff
-monotonicity (`A transmute B` non-decreasing in `arcane(B) − arcane(A)` and in
-volume; a spray in its voxel count), L5 delivery invariance (the payload of
-`E… projectile`, `E… bomb` and `E… self` is identical; only the record
-differs), L8 budgets (every lowered cast declares finite ticks, voxels,
-instances and generation). A change that breaks a law breaks a *class* of
-spells, which is what the line says; a change that moves one spell's numbers
-is a rebaseline.
+cost, non-empty description), L2 pile commutativity (permuting nouns and
+pending mods within one pile lowers to an IDENTICAL cast list, compared field
+by field), L3 multiplicity (`g g` ≡ `g×2` exactly until the cap — except a
+delivery, which nests N deep, and `also`, which is N+1 sentences), L4 `also`
+additivity (`cost(A also B) = cost(A) + cost(B)` and the casts are the union),
+L5 delivery invariance (the payload INSIDE the box of `E… D` is identical for
+every flight D; only the record differs), L6 locality (a unary operator's
+operand is exactly the item to its left, and inserting a word anywhere outside
+that item's span does not change it), L7 tariff monotonicity, L8 budgets (finite
+ticks, voxels, instances, generation, plus leaves ≤ `maxInstances` and a finite
+depth — what stops a deep nest from FIRING is the generation cap, asserted at
+runtime, since a sentence may legally SAY more than the engine will do),
+**L9 nesting** (for any E and flight deliveries D1, D2, the payload of the
+`E D1 D2` box is exactly one Launch whose payload is bit-for-bit the lowering
+of `E D1`), **L10 mod placement** (`E μ D` ≡ `μ E D`, and in `E D μ` the mod is
+on the hand record and never reaches inside the box), **L11 flattening** (a
+Fatal cast of any sequence emits no launches). A change that breaks a law
+breaks a *class* of spells, which is what the line says; a change that moves one
+spell's numbers is a rebaseline.
+
+Gate `spells` check (8), the nest at runtime: `explosive projectile projectile`
+launches exactly one child and it is the child that explodes; `explosive
+projectile fuse projectile` rests on impact and launches the child exactly
+`fuse` ticks later; `explosive projectile shotgun projectile` launches three
+children over three blasts; and five nested deliveries never reach past
+`budgets.maxGeneration`.
 
 **Sustained things are the `aura` operator, one word for wards and curses
 alike (plan §7; `SpellStatus`, `SpellSystem::Adopt`).** `X aura` produces an
@@ -3345,23 +4621,25 @@ at tick 811 of 1500 on the human.
 **Deliveries are three mechanisms, and Mods are field edits on their record
 (plan §5; `DeliveryRec`, `ApplyMod`).** `hand`/`self` are *instant* at a
 point; `projectile`/`bolt`/`lob`/`orb`/`bomb` are *flight* (speed, gravity,
-lifetime, bounces, pierce, seek, fuse, count, children, resolve radius, a
-trail with its budget); `beam` is *continuous*. A Mod names ONE field and
-how to edit it (`field`/`op`/`amount` in `glyphs.json`) and repeating it
-applies the edit again — `shotgun` ×count, `float` −1 g, `swift` ×speed,
-`long` ×lifetime (and ×fuse, and ×reach when anchored), `wide` ×radius,
-`bounce`/`pierce`/`seek` +1, `fuse` +30 ticks, `split` ×children. Adding a
-Mod is one JSON entry naming a field. The runtime reads the record and
-nothing else: a bounce reflects the axis that entered the solid (each axis
-probed alone) and loses a fifth of the speed; a pierce passes through one
-wall and resolves on the next; a fused bolt rests where it landed and counts
-down; a seeking bolt turns toward the nearest target the owner names
-(`SpellBodyProbe::nearestTarget`, integer steering after one float→fixed
-conversion at the query boundary); `split` launches children with the same
-payload from the last free position, one generation down, and nothing past
-`budgets.maxGeneration` launches (rule 2). A gravity Mod on an anchored
-delivery is reported as `casterImpulseVps` for the owner to apply to the
-body — `float self` hops.
+lifetime, bounces, pierce, seek, fuse, count, resolve radius, a trail with
+its budget); `beam` is *continuous*. A Mod names ONE field and how to edit it
+(`field`/`op`/`amount` in `glyphs.json`), sticks to the box that closes the
+pile (rule 3), and repeating it applies the edit again — `shotgun` ×count,
+`float` −1 g, `swift` ×speed, `long` ×lifetime (and ×fuse, and ×reach when
+anchored), `wide` ×radius, `bounce`/`pierce`/`seek` +1, `fuse` +30 ticks.
+Adding a Mod is one JSON entry naming a field. A record only HAS the fields
+its mechanism means (`ModMeansAnything`): a mod that lands on one without the
+field is charged and named in the readout rather than editing something nobody
+reads, which is what makes rule 3's "every other mod on the hand is a no-op"
+honest. The runtime reads the record and nothing else: a bounce reflects the
+axis that entered the solid (each axis probed alone) and loses a fifth of the
+speed; a pierce passes through one wall and resolves on the next; a fused bolt
+rests where it landed and counts down; a seeking bolt turns toward the nearest
+target the owner names (`SpellBodyProbe::nearestTarget`, integer steering
+after one float→fixed conversion at the query boundary). A gravity Mod on an
+anchored delivery is reported as `casterImpulseVps` for the owner to apply to
+the body — `float self` hops. `split` is GONE: `explosive projectile shotgun
+projectile` says what it did and says it better.
 
 **A bomb is a rigid body through the existing debris path.** The VM cannot
 create a body (that is physics, the owner's business), so `bomb` reports a
@@ -3828,6 +5106,228 @@ handmade art becomes matter the existing destruction pipeline already breaks.
   Jolt `GroupFilterTable` — adjacent limb boxes otherwise fight their joints
   and the ragdoll never sleeps. Mob limbs render as extra body slots appended
   after the debris bodies (shared 12-bit slot space, `kMaxBodySlots`).
+### A creature knocked down gets back up: the live ragdoll (2026-09-09; `Mob::StartRagdoll`, `sim/tuning.h` Ragdoll)
+
+Until now the only ragdoll was death. `Mob::Die` flips every limb dynamic and
+hands it to `DebrisSystem::AdoptBody`, and there is no path back from that —
+so an explosion beside a living creature could carve it (`CarveMobsRadial`)
+but never MOVE it, because `Physics::ApplyRadialImpulse` walks the dynamic
+body list and a living limb is kinematic. Blasts tore chunks off people who
+stood there and took it.
+
+**The live ragdoll is the same flip with the limbs kept.** `Mob::StartRagdoll`
+makes every owned limb dynamic in place — joints stay, the intra-mob collision
+group stays, `limb.body` stays the mob's — and sets `RagdollPhase::Limp`. The
+NPC loop (`MobSystem::PreTick`) and the avatar driver (`PlayerAvatar::PreTick`)
+then run nothing: no sense/intent/steer/drive, no animation, no submit.
+`PostStep`'s read-back already places a dynamic body, so rendering, bleeding,
+burning and carving all keep working on a limp creature because none of them
+ever asked whether a limb was kinematic (`RebuildLimbBody` gained the one
+exception: a carve mid-ragdoll rebuilds a DYNAMIC limb). Three things reach it
+and nothing else: a blast (`Mob::BlastRadial`), freefall past
+`ragdoll.fallSeconds` (NPC: `MobSystem::UpdateFall`; avatar: its own air
+clock), and the dev panel ("ragdoll me"; "ragdoll all spawned" in the NPC AI
+window). An NPC's limbs go through `ReleaseToWorldWhenClear` on the flip, for
+the reason `Die()` documents — a body that goes dynamic inside the player's
+capsule otherwise fires out of it.
+
+**The launch is a velocity, not an impulse, and it is capped.** A blast's
+other half runs beside the debris impulse in the explosion loop:
+`MobSystem::BlastMobsRadial(ec, radius × blastRadiusScale, power ×
+blastImpulseScale)`. Per creature: impulse at the pelvis by linear falloff,
+divided by the rig's Jolt mass (`Physics::BodyMass`, readable on a kinematic
+body), gives a speed in m/s; below `blastMinSpeed` nothing happens (a distant
+boom rattles, it does not floor you), above `maxLaunchSpeed` it is clamped —
+that clamp is the "across the room, not across the map" rule, so a massive
+charge still tops out at 14 m/s (~20 m at 45°). The direction is
+away-from-the-blast with `blastUpBias` of straight-up mixed in so a floor
+blast arcs the body rather than skidding it. A grenade (power 380) sends a
+~70 kg human about 5 m/s; mass comes from material density, so a heavier
+creature flies less far from the same charge with no per-creature number.
+
+**...and it TUMBLES, without any limb being launched on its own
+(2026-09-11).** That whole-body speed used to be set UNIFORMLY on every limb,
+because Jolt's per-body `AddImpulse` gives a hand ten times the velocity of
+the torso and then the joints do the launching, badly — so a body floated away
+from an explosion still standing to attention, whatever the charge was
+standing next to. Both halves are now true at once. Each limb is measured at
+its own CENTRE OF MASS (`Physics::BodyCenterOfMass`, not `GetTransform`'s pos,
+which is the lattice's origin corner and on a thigh sits up at the knee) and
+gets its own falloff and its own away-from-the-charge line, blended toward the
+whole-body ones by `blastLimbBias`. The falloff enters as a RATIO against the
+rig's mass-weighted mean, so the bias redistributes the launch instead of
+adding to it — the mass-weighted mean scale is exactly 1 whatever the geometry.
+
+Those per-limb velocities are never set. They are collapsed into the one
+motion a jointed body can actually perform: the linear momentum they add up to
+(`vCom = Σ m v / M`) and the spin their angular momentum implies about the
+centre of mass (`ω = L / I`, with `blastSpinGain` correcting for a point-mass
+`I` that leaves out each limb's own inertia, capped at `blastMaxSpin`). Every
+limb is then set to `vCom + ω × r` and to the same `ω`. No constraint is
+violated, so the tumble survives the first solver step intact instead of being
+resolved away — and a charge at the ankles rolls the body one way while one
+over the head rolls it the other. Measured at the stock 0.35 / 0.65: ±0.6
+rad/s from the X-detonate charge, limb speeds spread 1.12x from slowest to
+fastest. The gate arm is `ragdoll blast spin`, which runs both heights inside
+one fixture so the claim is a reversal and not a number from another world.
+
+**The tumble redistributes the launch; it never adds speed.** An outflung limb
+carries `|ω × r|` on top of the centre's, so the whole rigid motion is scaled
+(both halves together — it stays rigid) until no limb exceeds what the uniform
+launch would have given it: ~0.94 at the stock gain, invisible on screen. The
+launch ceiling is a statement about the creature, not about its centre of mass.
+
+**Known, in-suite only: `ragdoll repeat blast` fails inside a full
+`--selftest` and passes under `--gate ragdoll`.** That arm's subject settles
+for 45 ticks in whatever world the gates before it left and reaches the first
+charge at 15 of 15 limbs standalone but **12 of 15 (44.9 kg vs 52.4) in
+suite** — and a charge 6 voxels away is close to lethal for the smaller one.
+The flat launch left it alive by a hair (travel 109.4 against a 120 ceiling,
+91% of the band); with the tumble it loses a vital limb on the launch tick and
+dies, so the second-blast claim has nothing left to measure. The spin adding
+speed is NOT the mechanism — capping the fastest limb at the uniform launch
+speed (above) leaves the death exactly where it was. The arm now prints the
+limb count it started with, the death tick and the death cause, and the pelvis
+travel is measured to the last position the creature was ALIVE at, because a
+dead mob's position probe answers from an empty list (that is where "the
+pelvis moved 583 voxels in 1.3 s" — 56 m/s against a 30 m/s cap — came from).
+
+**NPCs fall now.** The walk drive snapped `origin_.y` toward the probed ground
+at 3 cm a tick and, with none within the 2.4 m scan, returned early — a
+creature over a drop HUNG. `UpdateFall` runs before the drive: supported
+(ground within a step) means the snap owns the height as before; further than
+a step, or with nothing in reach, the creature falls under `physics.gravity`
+(the number Jolt applies to its limbs, so a body that goes limp mid-fall keeps
+its speed) and lands on the surface the probe reports. "I cannot see the
+ground" is a third state (`GroundSense::groundUnknown`, from a new out-param
+on `GroundHeightAt`): gravity waits on an unfetched column rather than
+dropping the creature through terrain the mirror has not delivered — the
+projectile trap in CLAUDE.md, mob edition. The gait is off while airborne
+(it would IK the legs to the floor being fallen toward). Vertical only: an
+NPC has no planar velocity state, and a body that needs to fly is a ragdoll.
+
+**The get-up is procedural and nothing is authored.** `TickRagdollLimp`
+watches the pelvis: past `minSeconds`, once it has moved slower than
+`settleSpeed` for `settleSeconds` (or `maxSeconds` have passed and it is at
+least not flying), `BeginGetUp` re-derives the creature from where it lies —
+heading from the way the chest faces, or the way the head points if the chest
+faces floor or sky; `origin_` from "where would the standing pelvis be for a
+min corner here" solved through the same `LimbTargetFor` arithmetic
+`SubmitPose` uses; height from the ground probe under that footprint — makes
+every limb kinematic again exactly where it is, records that pose
+(`getUpFrom_`), and re-plants the feet. `SubmitPose` then blends each limb
+from the recorded pose toward its animated target with a modifier on the
+body frame: the target starts as a CROUCH (pitched `getUpPitchDeg` forward
+about the feet, hips down `getUpDropFrac` of the standing hip height) and
+straightens over the back three quarters of `getUpSeconds`, while the
+per-limb blend completes by 55%. So the limbs gather under the body into an
+on-hands-and-knees shape, then the shape rises — a get-up rather than a corpse
+levitating upright. The player's capsule is a passenger throughout
+(`PlayerAvatar::RagdollFollow`): `main.cpp` skips `Player::Update`, rides the
+pelvis while limp, and sits on the get-up's standing spot so the controller
+resumes exactly where the animation ends. That is also why a body thrown by a
+blast takes no fall damage on landing from the CONTROLLER — the controller
+never saw the fall.
+
+**A limp body still hits the ground (2026-09-12).** That last sentence used to
+be the whole story, and it made a long fall SAFER than a short one: fall 2.9 s
+and the sweep splatters you, fall 3.1 s and `ragdoll.fallSeconds` flips you limp
+first and you land for nothing. The missing measurement is the same one
+`Player::impactDeltaV` is — A SUDDEN DECELERATION — taken where it still exists,
+off the solver rather than off a sweep: `Mob::TickRagdollArrest` differences the
+rig's mass-weighted centre-of-mass velocity tick over tick, subtracts the gravity
+step so free flight reads as zero, and keeps only change that OPPOSES the travel,
+so neither gravity nor a blast (which SETS the velocity) can be read as a
+landing. `PlayerAvatar::PreTick`'s limp branch hands it to the same
+`ApplyFallDamage` and the same `player.fallDamageSpeed` / `fallSplatSpeed`
+thresholds the driven branch uses. Three things about it are not obvious and all
+three were found by measurement, not design:
+- **A rig does not stop in one tick.** The player's AABB sweep refuses the whole
+  velocity in the frame it meets the floor; a ragdoll meets it with its feet and
+  the deceleration reaches the other fourteen bodies through the joints. A
+  33 m/s landing showed 11 m/s in its worst single tick and the avatar walked
+  away from what should have been a splat. So the arrest is summed over a RUN of
+  consecutive braking ticks (≤ `kArrestRunTicks`, each above a floor that
+  `debrisLinearDamping` cannot reach) rather than peak-held per tick.
+- **A body cannot lose more than it arrived with.** Unbounded, the run goes on
+  billing while the rig FOLDS — gravity presses it into the floor for as long as
+  the joints take to collapse and the floor goes on refusing it, so a 15.0 m/s
+  landing summed to 21.2 m/s. The run is clamped to the speed the rig had on the
+  last tick nothing was touching it, which is exact and has no tuning in it.
+- **One landing, one bill.** A rig hits the floor twice (legs, then torso): two
+  events of 14.8 and 15.0 m/s were billed separately for three times what the
+  same speed costs a walking player. The peak is HELD until the rig has stopped
+  braking for `kArrestSettleTicks` and handed over once.
+NPCs are deliberately unchanged — they have no fall-damage path of their own.
+
+Every number is CPU-only float in the `ragdoll` tuning group (F5, no shader,
+no rebaseline). Gate `ragdoll`: the X-detonate charge 6 voxels from a dummy
+knocks it limp and moves its pelvis within a `tests/baseline.json` band in
+1.5 s; it is back on its feet within `ragdollGetUpMaxTicks` with every limb
+still its own and no body adopted by `DebrisSystem`; and a dummy spawned 2.2 m
+up descends under gravity, goes limp past a fixture-short `fallSeconds`, and
+stands up on the ground. Gate `ragdoll-falldamage` is the avatar half and is
+THREE arms on purpose: a 15 m/s limp landing costs health and is survived, one
+above `fallSplatSpeed` kills, and 0.4 s of upward flight at the same speed costs
+nothing — the last is what fails if the deceleration test, the cap, the
+settle-hold or the `SetLimbVelocities` reseed goes, and a fix that killed the
+player for being in the air would be worse than the bug.
+
+**One open finding the gate prints and asserts nothing on (2026-09-11).** On
+the tick the burning avatar DIES, one of its own limbs can be on
+`Layers::MOVING` deep inside the capsule while its siblings are still
+correctly queued in `ReleaseToWorldWhenClear` — measured at 12.83 kg and 3.25
+voxels in, one shove of 6.25 voxels, with five limbs still pending. It is not
+the burn (the 265 living ticks before it push 0.00), it is phase-dependent
+(three neighbouring tick phases never see it), and it clears the 5%-of-player
+mass filter by design: a corpse's torso is meant to be able to shove you, just
+not by a third of a metre in one tick. The avatar-on-fire arm's sample window
+now ends at death, where its claim always was, and the death-tick shove is
+printed on its own `post-mortem` line every run. Found by a blast-launch
+retune that moved this arm's tick phase, not by anything that changed it.
+
+**"Bodies zoom across the map" and "burning clothes launch me" (2026-09-10).**
+Both reports arrived together after the ragdoll landed, and neither was the
+launch clamp. The gate above called `BlastMobsRadial` on its own and so never
+saw the rest of the explosion block; it now runs the block verbatim (`ragdoll
+repeat blast`) and puts the player avatar on fire with the capsule proxy in
+the world (`ragdoll player on fire`). What it found, in order of damage:
+
+- *The carve's gobbets rammed the rig.* A blast big enough to carve
+  (`explosionBodyDamageScale`) makes `EmitCarvedFragment` bodies of 0.05 kg,
+  born inside the limb they came off. The per-body debris impulse then gave
+  each one `impulse / mass` = 1000 m/s (Jolt caps at 500), and the same tick's
+  launch had just flipped the rig dynamic, so they hit it. Measured: a carved
+  upper leg at 41.8 m/s on the blast tick, 449 voxels of travel. Three
+  elimination arms inside the gate (no carve / no impulse / no crater) named
+  it in one run. `physics.explosionMaxSpeed` (30 m/s) bounds the SPEED the
+  impulse may give any one body — a 2.5 kg stone voxel takes 20 m/s from the
+  X-detonate charge and is untouched; only the confetti is.
+- *A limp rig took the per-body impulse limb by limb.* Live limbs are in
+  `dynamicBodies_` whether kinematic or not; standing they were skipped by
+  Jolt's `IsDynamic` check, limp they were not, and the launch stacked on top.
+  `Physics::ApplyRadialImpulse` takes a skip list (`Mob::AppendLiveLimbBodies`,
+  every body a living creature still owns) and `BlastRadial` holds the stacked
+  velocity under `max(maxLaunchSpeed, what it already had)`.
+- *A carve while limp rebuilt the limb wrong twice.* `RebuildLimbBody`
+  re-read Jolt's transform, discarding the rebase shift `ReskinLimbMicro` had
+  just applied to `xf.pos`/`anchorLimb` (harmless on a kinematic limb, which
+  is re-posed next tick; a dynamic one had its joint anchor one shift off and
+  Jolt closed the gap by force), and the new body started at rest with no
+  layer. It now keeps the carve's frame when limp, carries the old velocity,
+  and `Physics::CarryLayer` carries the object layer plus the
+  `ReleaseToWorldWhenClear` entry — the same helper `ReplaceBody` and the
+  debris split now use, because a burning gobbet that shrank was rebuilt on
+  the plain MOVING layer inside the player every time.
+- *`PlayerPushOut` summed one hit per voxel box and took orders from
+  confetti.* A gobbet born beside or above the capsule is released to MOVING
+  at once (it does not overlap the proxy's AABB), the avatar's own kinematic
+  arm sweeps it INTO the capsule, and `CollideShape` reported it as eight hits
+  of the same depth, summed: 62 voxels in one tick, 432 before the player
+  burned to death. The push is now the deepest hit per body, and a body under
+  5% of `playerMassKg` cannot push the player at all (the 80 kg proxy pushes
+  it instead). Standing on a log or being shoved by a corpse is unchanged.
+
 ### Mob steering: intent vs actuation (2026-08-21; `game/mob.cpp`)
 
 Locomotion was one block that read the ground, snapped `heading += 90°` when
@@ -3844,7 +5344,75 @@ responsibility:
 | sense | `SenseGround` | — | One terrain probe per tick, an 8-way fan in the *mob's own frame*. Intent and drive can no longer disagree about the ground (they each ran their own probe before), and a future sensor — vision cone, sound event, nav query — has one obvious place to join. |
 | intent | `DecideIntent` | `desiredHeading`, `driveScale`, `driveStrafe` | **The AI seam.** The only stage allowed an opinion. A mob with an authored `behavior` is driven by the utility arbiter in `game/ai_behavior.cpp` (next section); one without falls through to the original wander-and-avoid, unchanged. |
 | steer | `Steer` | `heading`, `turnVel` | The only writer of body facing, and it moves it at a bounded, ramped rate. |
-| drive | `DriveLocomotion` | `origin`, `phase` | Translates a **local 2D velocity** — forward along the actual facing, plus a lateral term — with the alignment scale applied to the forward component only. |
+| drive | `DriveLocomotion` | `origin`, `phase` | Translates a **local 2D velocity** — forward along the actual facing, plus a lateral term — with the alignment scale applied to the forward component only, then **resolves that step against the body's own footprint** (below). |
+
+### A walking body is a box, and it has a budget (2026-09-10)
+
+The drive used to be one line — `origin += vel * dt` — with the only restraint
+an eight-way fan of single-column probes taken *before* the move. Reported as
+"NPCs run into a hill and keep going underneath the voxels, and standing on a
+ramp they're rotated 45 degrees". It was four independent faults that only
+compose on sloped ground, which is why flat fixtures never saw any of them:
+
+1. **The ground settle was symmetric and had no floor.** `clamp(groundY − y,
+   −snap, +snap)` at 3 cm a tick against a humanoid walking 3.15 m/s: past
+   roughly thirty degrees the body outruns its own settle and sinks.
+2. **`Mob::GroundHeightAt` only ever scanned DOWNWARD.** A body one voxel under
+   the surface asked "what is the first solid below me?" and was told "the one I
+   am standing in", so the reported ground was *inside the hill*. The fan then
+   measured its eight rises against that fiction, read flat in every direction,
+   and the creature walked the rest of the way through. **This is what made the
+   sinking self-sustaining rather than a one-tick glitch.**
+3. **The mob step-up budget was 0.20 m against the player's 0.58 m.** A kerb the
+   player strides over was a wall to an NPC: the forward probe went blocked, the
+   steering deflected to the nearest clear bearing, and the creature crabbed
+   sideways across ground it should have walked straight up.
+4. **The gait counted every IK chain as a foot.** Every humanoid publishes two
+   legs *and two arms*; the hands were given ground contact points, folded into
+   the body-height average, and fitted into the plane the body's **tilt** came
+   from. On flat ground all four sit at the same height and nothing shows; on a
+   slope a quad of two feet and two hands has a normal nothing like the
+   ground's, bounded only by "the normal's y is above 0.6" — 53 degrees, in any
+   direction including pure roll. That is the "rotated 45 degrees" report, and
+   `PlayerAvatar::UpdateGait` has filtered on the `leg` tag since it was written.
+
+What replaced them:
+
+- **`Mob::FootprintFooting` is the one place a walking body meets the terrain.**
+  Nine columns over the body box, reporting the height it would *rest* at, a
+  `wall` flag for any column standing more than a step above it, and headroom.
+  `SenseGround`, the drive and the freefall test all read it.
+- **The settle is asymmetric.** Downward is still eased (that is what a settle
+  is *for*); upward is a hard clamp, because "do not be inside the ground" is
+  not a preference. The rendered height `bodyY_` is eased separately, so nothing
+  pops.
+- **The move is resolved like the player's:** try the whole step, and if the box
+  does not fit, try each axis alone. Wall *sliding* falls out of that, and so
+  does climbing — "fits" includes a legal step up onto the destination.
+- **The terrain budgets are authored per rig in metres** (`LocomotionDef::
+  stepUpM` / `stepDownM` / `headroomM` / `tiltMaxDeg`, defaulting to the
+  player's own numbers and clamped to the rig's leg span) and resolved once in
+  `BuildRig`. The A* planner reads the same numbers through
+  `ai::SelfView::stepUpCells`, so it and the drive cannot come to disagree about
+  what a wall is — they used to be a literal in `mob.h` and a different literal
+  in `behaviors.json`.
+- **The gait owns leg-tagged chains only**, and the tilt is taken from the
+  *ground* rather than from the contact points: two grades fore/aft and
+  left/right of the footprint, clamped as a single total lean off vertical.
+  Bipeds and quadrupeds now use one path (the old `>= 3 planted points` gate
+  meant a biped never leaned at all), it does not jitter with the swing phase,
+  and the bound is stated in degrees instead of falling out of a dot product.
+
+**`GroundHeightAt` has three outcomes, not two.** A probe that starts inside
+weight-bearing matter and cannot climb out of it has not failed to see
+anything — it has seen rock and merely cannot measure it. Reporting that as
+"unknown", which every caller correctly reads as *open*, let a duelist walk
+through the middle of a stone wall whenever the chunk above the wall was not yet
+cached. `outBlocked` is that third answer.
+
+Gate: **`ai-slope`** — a real stone ramp, asserting the body climbs it, never
+gets below the surface (0.00 voxels; the pre-fix code reached 2.70 for 53 of 700
+ticks), and never leans past its rig's authored ceiling.
 
 The drive stage takes a signed forward term and a lateral one rather than a
 single forward scalar, and that is a *combat* requirement rather than a
@@ -3971,8 +5539,10 @@ the steering layer already lives by); an unknown column inherits the height of
 whoever reached it. *The probe is injected, not reimplemented* — `NavProbe` is a
 pair of function pointers and the caller binds `Mob::GroundHeightAt`, so the
 planner cannot come to disagree with the locomotion it is steering; the step-up
-limit likewise has to match what `SenseGround` will climb, or the planner hands
-the drive a path it refuses to walk. *The straight line is tried first*, which
+limit likewise has to match what the drive will climb, or the planner hands it a
+path it refuses to walk — so since 2026-09-10 there is only ONE number, the
+creature's own (`ai::SelfView::stepUpCells`, resolved from its rig), and a
+profile's `maxStepUp` is an optional override rather than a second copy. *The straight line is tried first*, which
 is both the cheap case and the graceful-degradation case: with no plan and a
 clear line, "walk at them" is exactly right, and a failed search falls back to
 direct steering plus the existing fan avoidance rather than to standing still.
@@ -4331,9 +5901,14 @@ contact is `hip + fwd·strideBias + vel·leadTime`, snapped down through
 one constraint *is* the gait state machine: singleton groups give a walk,
 diagonal pairs give a trot, and losing a leg just means the survivors take
 their turns sooner. Stride and lift scale by speed so an idle mob's feet are
-genuinely still. **Body height and tilt are derived from the foot average and
-the foot-plane normal (Newell's method)** — which is why walking up voxel
-stairs works with zero slope-handling code. Pelvis bob runs at 2× step
+genuinely still. **The gait owns `leg`-tagged chains only** — it walked
+`sk.chains` whole until 2026-09-10, which meant a humanoid's hands were being
+planted on the ground (see "A walking body is a box" above). **Body height is
+derived from the foot average**, which is why walking up voxel stairs works with
+zero slope-handling code; **body tilt is derived from the GROUND** — two grades
+fore/aft and left/right of the footprint, clamped as one total lean — rather
+than from a plane fitted through the contact points, which jittered with the
+swing phase and never fired at all on a two-legged rig. Pelvis bob runs at 2× step
 frequency (one rise per footfall), sway/roll at 1×, plus spine
 counter-rotation and a progressive phase lag per hierarchy level.
 
@@ -4645,7 +6220,7 @@ where you hear from either (§12b, "The ears are on the character").
 - **Far-field cascades (implemented 2026-08-19; docs/PLAN_far_field_cascades.md):**
   view distance beyond the residency window comes from kFarLevels nested
   toroidal kFarN³ (512³ since 2026-08-29; was 256³) volumes centered on the player, one byte per
-  cell (7 bits of material id + 1 conservative blocker flag; see below). The far grid is DECOUPLED from the window size (phase 5, when the
+  cell (7 bits of FAR PALETTE SLOT + 1 conservative blocker flag; see below). The far grid is DECOUPLED from the window size (phase 5, when the
   window went 512³): level k cells span 2^(k + kFarShiftBase) fine voxels with
   the shift base chosen so level k's box edge is always 2^k WINDOW edges —
   cascade distances scale with the window at constant memory (1024 MiB total at
@@ -4658,8 +6233,95 @@ where you hear from either (§12b, "The ears are on the character").
   worst case and the one player-built content lands in.
   Levels are filled on the GPU by sampling `genCell()` at stride
   (worldgen.wgsl `far` — the "sieve"), recentered with hysteresis like the
-  streaming window, and refilled a plane at a time (≤ kFarListCap
-  level-chunks/tick, managed by `sim/farfield`). **Edits reach the far field
+  streaming window, and refilled a plane at a time (managed by
+  `sim/farfield`; planes drain at `render.farPlaneFillRate` (256) in play, a
+  wholesale reset at `render.farRefillRate` in the game and at `kFarListCap`
+  in the headless drain loops).
+  **The sieve skips the sky (2026-09-12).** `far` ran a full `genCellCol` for
+  all 4,096 cells of a level chunk whatever its altitude, and a level box is
+  `kFarN` cells tall — 13 km at level 8 against a few hundred metres of
+  terrain — so most of a coarse level's fill was generating air. It now takes
+  the ceiling `genChunk` has always had: above `max(farColTopFrom over the
+  thread's columns, treeMaxTop())` a row stores the zero word it was going to
+  store and skips the sample. Bit-identical output (the bound is exactly the
+  three arms `farBlockerBitAt` and `farCellIsSolid` can answer above), and
+  measured on one exe against two asset trees, `--frames 900
+  --autofly-surface`, the same 265k entries over the same 306 ticks:
+  `farField` GPU mean **15.90 → 6.65 ms/frame**, p99 65.5 → 37.3, max 150 →
+  47 — 44.5 µs to 18.6 µs per sieve entry. That per-entry cost is what the
+  fill caps trade against, which is why they moved with it.
+  **The plane backlog is BOUNDED (2026-09-12).** Sustained travel queues
+  planes faster than any per-tick cap drains them (measured in surface flight:
+  ~1,065 entries/tick of demand), and nothing capped the queue — a flight left
+  437,248 entries, 3.8 minutes of drain, still queued. `FarField::Update` now
+  coalesces: a face `kFarNChunk` planes deep has turned over the whole box, so
+  the level is reset instead, which costs the same entries, prunes the
+  superseded ones (`PruneLevel`), drains on the bulk cap and leaves the level
+  CORRECT rather than partly stale. Per-level backlog is then bounded by one
+  level, and "the horizon is minutes behind" becomes the state a load leaves.
+  **A wholesale refill is FINEST level first and is BUDGETED (2026-09-10).**
+  A `FullRefill` — startup, `LoadWorld`, regen, a teleport past a level's
+  window — is `kFarLevels × kFarNumChunks` = 262,144 sieve entries. Drained at
+  `kFarListCap` that is 64 ticks of 267 ms, i.e. 2 fps for the ~16 s after the
+  deferred `far` pipelines land mid-play, which was the largest stall in the
+  frame and was reported as such. It now takes `render.farRefillRate` (1024)
+  entries per tick and at most one slice per FRAME (`FarField::BeginFrame`,
+  the rule `Stream::BeginFrame` already applies to window shifts, because a
+  catch-up frame runs up to four ticks). Finest first, because the valid box
+  makes coarsest-first actively wrong: with only level 8 filled every ray
+  leaving the window marches 25.6 m cells, so the first thing outside the
+  window is a field of house-sized blocks. Finest first, each landed level
+  doubles the trusted radius (51.2 m, 102, 205, …) and the fog opens a band at
+  a time. The trade is real in both directions — a smaller slice costs more
+  total GPU, because a far dispatch has a large fixed cost — and the measured
+  table lives on the knob (`Tuning::Render::farRefillRate`).
+  **And the queue is HELD while those pipelines compile.** `EncodeFarFill`
+  records nothing until `far`/`farpatch` land, but `PrepareTick` used to pop
+  and drop the entries anyway, which emptied `pending_` — so for the whole
+  compile (2.5 s warm, 20.6 s on a cold SPIR-V cache) the fog reported the
+  full 6.5 km horizon and `FaceWord` reported every level marchable, over
+  cascade buffers that were still zeros. Rays escaped through the ground and
+  the sky, clouds included, was drawn UNDER the terrain. `Simulation::
+  FarFillsDeferred` is true exactly when the fills would be dropped and the
+  caller has opted into deferral (the game and the voxel tools; never a gate
+  or a `--shot`, which block instead), and the frame loop then skips both
+  `FarField::Update` and the drain, publishing only the UBO. The `far-fog`
+  gate asserts it: nothing pops, every level reads "reset in flight", radius
+  = the residency window. `SANDVOX_FAR_DELAY_S=<n>` holds the compile so the
+  transient is reachable without a cold cache. **The renderer marches
+  a VALID box, not the level box (2026-09-10).** A level is toroidal, so when
+  its origin steps one level chunk the incoming face's SLOTS are the outgoing
+  face's and hold the outgoing face's bytes until the sieve refills them —
+  ~16 ticks per plane under the play cap, deeper under sprint flight. Marched
+  from the full box the tick the origin moved, those bytes were the hillside
+  BEHIND the player drawn ahead of them, and the underground of the bottom
+  face drawn in the sky when the box stepped up. `FarField` now keeps one
+  record per queued plane (FIFO beside the entry queue) and a count of planes
+  outstanding on each of a level's six faces, released when a plane's LAST
+  entry is dispatched; `FarField::FaceWord` packs the six counts (5 bits each)
+  plus a whole-level-pending bit (30) into `FarParams.origins[k].w`, the word
+  no other reader used. **The field must hold the whole box (2026-09-12):** it
+  was four bits, saturating at 15 against a box `kFarNChunk` = 32 chunks
+  across, so a face more than 15 planes behind published 15 and the renderer
+  marched the other stale layers AS TERRAIN — the ground from behind a moving
+  player, drawn in front of them until the sieve caught up, reached in about a
+  second of flight. `world.h`'s `kFarFace*` block now derives the width from
+  `kFarNChunk`, a count that will not fit escalates to the pending bit rather
+  than clamping, and `scripts/check_invariants.py` pins the WGSL literals.
+  raymarch.wgsl `farBox` unpacks it and every far reader (`traceFar`,
+  `farShadowDist`, the far AO taps) marches the full box less those faces —
+  empty during a reset — so a ray in an excluded slab leaves the level at the
+  shrunken face and the next coarser level, which is filled, picks it up at
+  the same t by the seam contract `traceFar` already keeps for a ray out of
+  `farSteps`. Always conservative: a landed face is published a tick late, a
+  reversed face is excluded on both sides until both records drain, and a
+  reset voids the level's older records via an epoch. `SafeRadiusMeters`
+  subtracts one level chunk PER QUEUED PLANE, not one: the excluded slab is
+  that deep, and subtracting one fogged open over exactly the band the
+  renderer was refusing to march. The `far-fog` gate steps the player one
+  level-1 hysteresis in +x and asserts the +x field holds through the drain
+  and clears after, then queues `kFarNChunk + 2` planes on one face and
+  asserts the word is exact to `kFarFaceMax` and escalates past it. **Edits reach the far field
   (phase 2):** each tick, `worldgen.wgsl fardown` runs one workgroup per entry
   of the compacted dirty list — the same `DispatchWorkgroupsIndirect` args the
   occupancy update uses, so a settled world dispatches nothing — and re-derives
@@ -4842,16 +6504,58 @@ where you hear from either (§12b, "The ears are on the character").
   a dense cascade level costs volume — see `docs/PLAN_far_field_cascades.md`
   §5.6 for why `kFarN` is the only knob and what a sparse near level would
   take.
+  **Those seven bits are a PALETTE SLOT, not a material id (2026-09-09):**
+  a far cell byte names one of 128 entries in the FAR PALETTE — the fourth
+  reserved run of the GPU material table (`kFarPaletteBaseGpu`, world.h,
+  under the stain / art / tint runs and costing no new binding). Entry
+  `FAR_PALETTE_BASE + slot` holds, in its `flags` word, the material id that
+  slot paints. Two directions, two homes, neither of them a new buffer:
+
+  - **material → slot** rides in every real material's own `flags` word at
+    `MATF_FAR_PAL_SHIFT` (bits 24..30; `kMatFarPalShift` in materials.h is the
+    C++ mirror). The three sites in `worldgen.wgsl` that write a far cell —
+    the sieve `far`, the edit patch `farpatch` and the downsample `fardown` —
+    read it through `matFarPal()`, so a writer pays one field of a material it
+    was already fetching and no table lookup at all.
+  - **slot → material** is `farPalMat()` (common.wgsl), used by
+    `raymarch.wgsl`'s `farMatAt` and by `sim_gas.wgsl`'s `gasFarBlocked`. The
+    "is anything here" tests do NOT translate: slot 0 is air, nothing else
+    maps to material 0, so `farPalAt(..) != 0` is the same answer without the
+    read, which is what AO, `farShadowBlocked` and the occupancy count use.
+
+  WHY. Before this, the byte WAS the id, so `LoadMaterials` had to refuse a
+  129th material outright — the voxel word had room for 4096 and this byte had
+  room for 128 — and nothing else in the engine would have noticed if the
+  refusal were deleted: the 129th material would simply have painted the wrong
+  colour at distance and claimed a blocker wherever bit 7 landed. The
+  indirection turns 128 into a budget on how many things may look DIFFERENT
+  FROM EACH OTHER at cascade scale, which is a far-field question, instead of a
+  cap on the material table, which is not one. Two materials that are
+  indistinguishable at 50 m share a slot:
+
+  ```json
+  { "id": "sandstone", "class": "solid", "far": "sand" }
+  ```
+
+  resolved by name at load. An alias may not point at another alias (one hop,
+  so the slot a byte names always belongs to a material that paints itself) and
+  may not point at air (slot 0 means an EMPTY far cell, not a transparent one).
+  The loader now errors only when the number of materials WITHOUT an alias
+  exceeds 128, and says which knob fixes it; `check_invariants.py` counts the
+  same thing off materials.json, since adding a material is a data edit that
+  needs no build.
+
+  Slots are handed out IDENTITY-FIRST — material `i` takes slot `i` while `i <
+  128`, and only the ids pushed past seven bits take whatever the aliases
+  freed. That is deliberate and load-bearing rather than tidy: on an unaliased
+  table every far byte is bit-for-bit the byte the same worldgen wrote before
+  the palette existed, which is why introducing the whole indirection moved
+  neither the world hash nor a single smoke probe.
   **The far cell byte is 7 + 1, not 8 (13.2.2, 2026-09-01):** bit 7 of every
   far cell is a CONSERVATIVE BLOCKER FLAG — "pristine worldgen puts something a
-  ray would stop on somewhere inside this cell's fine footprint" — and the
-  material id lives in the low seven (`FAR_MAT_MASK` / `FAR_BLOCKER_BIT`,
-  common.wgsl; every reader masks). The id fits because there are 117
-  materials, and it KEEPS fitting because `LoadMaterials` refuses a table past
-  128 entries and `check_invariants.py` refuses a materials.json that would
-  grow one; nothing else in the engine would notice, since a 129th material
-  would merely paint the wrong colour at distance and claim a blocker wherever
-  bit 7 landed. The flag is a pure function of (coords, seed)
+  ray would stop on somewhere inside this cell's fine footprint" — and the low
+  seven are a FAR PALETTE SLOT (`FAR_PAL_MASK` / `FAR_BLOCKER_BIT`,
+  common.wgsl; every reader masks). The flag is a pure function of (coords, seed)
   (`farBlockerBitAt` in worldgen.wgsl) for the same reason `farSurfaceMat` is:
   the sieve has no live grid, so a flag derived from real voxels in the
   downsample would disagree with it at their shared boundary. Its cost is one
@@ -4882,11 +6586,19 @@ where you hear from either (§12b, "The ears are on the character").
   temporal key crawls, a world-space key re-aligns into arcs as the boxes
   recenter. Fog density is a uniform tracking the cascade radius that is
   actually FILLED: `FarField` counts pending fills per level and reports the
-  half-extent of the level below the innermost incomplete one, so a cold start
-  or teleport fogs out the bands still in the queue instead of showing sky
-  through them, clamped between the full-horizon pin (`kFarFogDensity`) and a
-  ceiling at level 2's half-extent (`kFarFogDensityMax`, so the residency
-  window is never fogged away) and eased over a few frames. Determinism is
+  half-extent of the FARTHEST COMPLETE one, so a cold start or teleport fogs
+  out the bands still in the queue instead of showing sky through them,
+  clamped between the full-horizon pin (`kFarFogDensity`) and a ceiling at
+  level 2's half-extent (`kFarFogDensityMax`, so the residency window is never
+  fogged away) and eased over a few frames. *Farthest complete*, not "the one
+  below the innermost incomplete", which is what it read until 2026-09-10: the
+  levels are nested boxes all centred on the player and `traceFar` tests each
+  independently, so a level `farBox` has collapsed is skipped and the next one
+  picks the ray up at the same `t` — a complete level covers everything inside
+  its half-extent as well as at it. Reading it the pessimistic way pinned the
+  fog on the residency window for the whole of a refill and then snapped it to
+  6.5 km, which is the "everything suddenly goes extremely foggy" half of the
+  report that also produced the two paragraphs below. Determinism is
   untouched by construction: cascades are derived render-only data — never
   read by the sim, never hashed, no MutationQueue involvement (the selftest's
   `far-downsample` gate proves the propagation works, `far-persist` proves it
@@ -5158,9 +6870,13 @@ packs all frames of all such materials into one brick pool (`array<u32>`, four
 voxel shades through the existing material table with no new colour path.
 
 **Where it hooks.** In `trace()` (`raymarch.wgsl`), when the world DDA lands on a
-solid cell whose material carries `MATF_MICRO`, a nested Amanatides–Woo DDA runs
-over the `subdiv³` brick in cell-local space. A hit reports the sub-voxel's
-material and the face it was entered through; a **miss lets the ray continue past
+solid cell whose material carries `MATF_MICRO`, the cell is RECORDED and the
+march continues; after the march resolves, a nested Amanatides–Woo DDA runs over
+the `subdiv³` brick in cell-local space for each record (see "The detail model
+is resolved in a SECOND PASS" under analytic plants below — the same two-phase
+machinery carries bricks, analytic plants and anything later that spans more
+than one cell). A hit reports the sub-voxel's material and the face it was
+entered through; a **miss lets the ray continue past
 the cell**, which is the load-bearing half — a grass cell is mostly air, and a
 micro cell that blocked on a miss would draw every tuft as a solid 6 cm cube.
 Per-cell variety is a quarter-turn yaw swizzle plus an optional whole-sub-voxel
@@ -5250,12 +6966,79 @@ transcribed to `sim/plants.h` for the `--shot` harness, and restated per
 species in `materials.json` for the loader — `check_invariants.py plants` holds
 the three equal.
 
-**One evaluation per tile per ray.** `trace()` memoises the last tile plant it
-intersected (`pKey`/`pHit`/`pT`): the first cell of a tile evaluates the plant
-UNCLIPPED and every later cell of that tile only asks whether the remembered hit
-lies inside it. A hit that falls in a cell worldgen never painted — dug out, cut
-by a trunk — is never reported, which is exactly the clipping a partial plant
-must have. Only evaluations charge `microBudget`; carried cells are free. Past
+**One evaluation per TILE plant per ray — and NOT per column.** A fern or a big
+toadstool is one organism across a 3×3×H footprint and `tracePlant` intersects
+all of it in one call, so phase 1 records it once (`plantTileKey`, compared
+against the last record) and every later cell of the same tile is free. A
+COLUMN plant may NOT be collapsed this way, and one attempt to was reverted on
+2026-09-11: `tracePlant`'s column branch intersects only the segment of the
+plant **inside the cell it was called for** (`yTop = min(1, sH - rise0)`, Y
+half-planes in cell-local coordinates), so a remembered hit can only lie in the
+cell it was computed in and every later cell of the column resolves to a miss —
+the blades above the first cell a ray enters are simply never drawn, visible in
+the `plants` gate picture as horizontal bands of missing blade at every cell
+boundary (37,097 px over 24 SAD). Collapsing a column needs `tracePlant` to
+intersect the whole column in one call first. The clip bound for a column is
+therefore the ray's exit from the CELL, NOT 1e9: `tracePlant`'s per-blade
+footprint cull derives `segLo`/`segHi` from it, and 1e9 would silently disable
+the cull that makes the blade loop cheap. A tile plant's bound IS 1e9, because
+`plantTileAt`'s non-overlapping footprints already bound it.
+
+**The detail model is resolved in a SECOND PASS, after the march (2026-09-11).**
+`trace()` used to call `tracePlant`/`traceMicro` from inside its DDA loop, and
+that placement — not the kernel — was most of the frame. The march carries ~25
+loop-live values plus `out : Hit` (26 fields), all live across the call; the
+allocator capped the fragment at 168 registers and spilled, so the loop's own
+state moved to scratch and **every pixel in the frame paid the fill traffic,
+sky included**. The `meadow` `--render-budget` camera measured `microMaxPerRay`
+→ 0 at **8.95 ms of a 19.73 ms frame (45%)**, on a frame whose counters read
+`rmMicroEnters = rmPlantEvals = 0.0` — nothing was evaluated; removing the code
+was what saved the time.
+
+So the fix is not to make evaluations cheaper or rarer. It is to get the kernel
+out of the loop. **Phase 1**, inside the DDA: a primary ray entering a
+`MATF_MICRO` cell within the LOD records `(cell, tEnter)` into one of
+`DETAIL_SLOTS` fixed scalar pairs — window-local cell packed 10 bits per axis —
+and keeps marching, treating the cell as air, which is what a MISS already did
+and a miss is the common outcome. **Phase 2**, at the function's tail: walk the
+records in `t` order, evaluate each, take the first hit nearer than the opaque
+hit the march resolved. Records are scalars and never an array, because WGSL
+puts a dynamically indexed array in local memory — the exact thing being
+removed. The three in-loop `return out` became `break` so the tail has a single
+exit to run in.
+
+| | Register Count | local memory | meadow | noon |
+|---|---|---|---|---|
+| in-march | 168 | +160 B/thread | 19.73 ms | 16.54 ms |
+| **two-phase** | **128** | +160 B/thread | **9.35 / 8.69 ms** | **9.54 / 9.49 ms** |
+
+**The mechanism is OCCUPANCY, not spill.** The spill did not move by one byte;
+the register count fell 168 → 128, which is 16 warps per SM instead of 12 —
+and `trace()`'s own `sgn3` note already measured that trade in the other
+direction (hoisting a dynamic index bought 128 → 168 regs and zero spill, and
+cost 3.5 ms). What moving the call bought was the allocator's freedom to take
+the low-register plan, plus the fact that whatever spill traffic remains is now
+executed only by the pixels that recorded a detail cell. Image parity on the
+`plants` gate fixture (grass, fern, toadstool): 678 px over 24 SAD against a
+same-shader re-run control of 617 — measured at the SAME gate scope on both
+arms, which matters: the same frame taken inside a four-gate `--verify` instead
+of alone differs from itself by 162k px.
+
+Two things phase 2 must do that the in-march form did not. It must **unwind the
+volumetrics accumulated behind a winning surface** — the march walked through
+the cell, so a water interface, a glacier or a plume past it was recorded for a
+backdrop the detail hit now covers, and `fs()` shades `liqT` with no ordering
+test against `h.t`; latched crossings at or beyond the hit are cleared with
+their path, and the media accumulators restore to a snapshot taken at the first
+record. And it must keep **clipping the model to the cells that exist**: a hit
+that falls in a cell worldgen never painted — dug out, cut by a trunk — is not
+reported, which is exactly the clipping a partial plant must have.
+
+Only records charge `microBudget`; cells collapsed onto an existing record are
+free, and `render.microMaxPerRay` is clamped to `DETAIL_SLOTS` (4). The
+traversal cost of a REAL meadow remains unmeasured — the harness world holds
+756 plant cells and no leaves at all, so everything above is a PRESENCE cost.
+Full arm tables in `docs/PLAN_frame_perf.md`. Past
 `TUNE_MICRO_LOD_DIST` only the centre column of a tile plant stands in as the
 solid proxy; the outer eight pass as air, or a distant fern is a 30 cm cube.
 Column plants take the SHORTER of that and `render.plantLodDist` (16 m): an
@@ -5432,6 +7215,66 @@ rays still never iterate MODELS, so no body shadows itself or another body and
 the per-fragment cost does not scale with the number of micro bodies. A coarse
 render-side occupancy proxy remains the stretch goal for body-on-body.
 
+**The smooth normal, and what a brick boundary means** (added 2026-09-11;
+`BODY_SMOOTH_N` in `microbody.wgsl`, `MicroBodyModelGpu::cutFaces`). The DDA's
+face normal is the last-stepped axis, so a rounded arm made of 8 mm skin voxels
+shaded as a staircase of six flat tones. The cure is `shadeViscous`'s: 26 taps
+of the occupancy field the brick already stores, weighted 1/|d|, mixed with the
+face normal at `BODY_SMOOTH_N` so a deliberately square limb keeps its edges.
+26 taps and not a 6-tap central difference, because on a binary field the latter
+can only quantise the normal to the 26 directions the staircase already had.
+
+That gradient has to decide what lies one cell OUTSIDE the brick, and there are
+two right answers. Past the SIDE of an arm is air, and assuming so is what
+rounds the silhouette. Past its END is the FOREARM, and assuming air there
+rounds the cap too — which put a hard light/dark ring at every shoulder, elbow,
+hip and knee, swinging with the joint as it animated while the two overlapping
+OBBs traded depth ties under the TAA jitter (owner report: "the conjoining seams
+of limb nodes pulse and flash"). The cases are locally identical — a solid
+boundary plane with unknown beyond — and shape does not separate them either:
+on chunky voxel art the flat side of an arm is as solid a boundary plane as its
+cap. What knows is the ART: every limb of a mob is one model of ONE prefab in
+one shared frame, so a joint is exactly a face another model is pressed against.
+`MicroBodyCutFaces` (`sim/microbody.cpp`) measures that once at load (half the
+solid boundary cells covered is the line, so no stray voxel crosses it and no
+ordinary joint fails) and packs six bits onto the model record's spare word. The
+shader clamps the field across a cut face and treats every other face as air. A
+single-model prefab — an item, a debris chunk, a carved COW clone — gets 0 and
+the pre-2026-09-11 behaviour exactly. (`return 0u` from
+`microBodyCutFaces()` in the shader is the oracle: one WGSL line, no rebuild.)
+
+**The rule is about MULTI-MODEL PREFABS, not about creatures** (2026-09-12).
+It lived in `mob.cpp` for one day and that cost something: a WORN ITEM has
+exactly the same shape — one named model per covered limb, in one shared frame
+(`game/item.h ItemCover`) — so every garment packed with `cutFaces = 0` and grew
+a rounded end cap on each sleeve, yoke, cuff and hem, with the caps at a seam
+shading away from each other as the joint they straddle swings. It is now
+measured for item covers too, carried on `ItemCover::cutFaces` so the FIT
+resample (`Mob::AppendWornShell`) hands the same mask to the re-packed brick —
+a resample moves cells, never the question of which plane is a seam.
+
+**Two bricks that own the same cell.** A garment's panels deliberately OVERLAP:
+`scripts/gen_stock_armor.py` gives the armpit cells to BOTH the sleeve and the
+body panel, because whichever side cedes them shows a stripe of bare skin
+through half the gait (the sleeve's inner wall is what you see when the arm
+swings forward, the torso's side column when it swings back). That was free
+while both bricks shaded a shared cell identically — the generator says as much,
+"z-fighting is only a defect between things that look different" — and
+`BODY_SMOOTH_N` made them look different, because each brick differentiates its
+OWN field and cannot see the other. The tie that now decides which shading you
+see is float noise: the two panels ride different limbs, so the same world plane
+is reached through two different quaternions, `tCur` agrees only to rounding,
+`GreaterEqual` picks per PIXEL, and every idle-sway frame re-rolls it (owner
+report 2026-09-12: the overlapping parts of a robe pulsing and swapping). So the
+order is made explicit — `BODY_Z_PRIORITY` in `microbody.wgsl` pulls each body
+toward the camera by a relative slice of its view depth keyed on its render
+slot. Any consistent winner removes the flicker; both panels still cover the
+body, so the choice only decides which one's shading shows at the seam, and a
+seam that holds still reads as a seam. Relative and not absolute, so it is a
+fixed number of depth steps at any distance: the largest bias is 1.9e-3 of view
+depth, four thousand times the rounding it must beat and under a hundredth of a
+voxel at arm's length.
+
 **Bounds and cost.** The per-fragment DDA is hard-capped at `3·maxDim + 4` steps
 (worst-case diagonal of the brick) with no data-dependent loop bound anywhere.
 The draw list is CPU-compacted, so the instance count IS the number of micro
@@ -5557,10 +7400,56 @@ floor, a room floor and the ground under an overhang all have AIR in the block
 in front of them, so they march. **The conservative direction for a lighting
 grid is the one that never darkens something wrongly.**
 
+**THE AMBIENT IS A SUM, NOT A FLOORED PRODUCT** (2026-09-11). The reader used
+to be `ambientAt(n) * ao * max(openness, render.opennessFloor)`, with the floor
+at 0.3 standing in for the bounce light P1 could not yet carry. The bug was not
+the 0.3, it was WHAT it was 0.3 OF: `ambientAt` is the day/night signal and
+nothing else, so a sealed cave was lit at a fixed fraction of the SUN and got
+brighter at noon through solid rock. Measured in the `--shot` stone room, mean
+linear luminance noon vs midnight: back wall **8.6x**, deep floor **7.7x**,
+against 14.6x for the open meadow outside — and removing the floor alone took
+the noon wall from 0.0568 to 0.00136, so **97.6% of it was that one term**.
+
+`ambientOpen()` (`common.wgsl`) is the fix and it is two lights instead of one:
+
+    ambientAt(n) * openScale  +  render.enclosedAmbient * (1 - openness)
+
+The sky term keeps the visibility multiplier with nothing under it; the second
+is a small constant that does not move with the sun, the moons or the sky, and
+it is what decides how bright a cave is. At full sky its weight is exactly 0, so
+open ground is bit-identical; `opennessStrength` scales both, so the
+`noopenness` arm still folds the whole feature away. This is the shape the
+literature uses for sky injection (`L = L_local + V_sky · L_sky`), and the
+failure it fixes is the one CRYENGINE's SVOGI documents for its own constant
+"diffuse bias" leaking into interiors.
+
+**A full-sun reading is no longer exempt from `shadowLiftCap`.** The cap passed
+`v = 1` through untouched, on the argument that a ray which hit nothing saw the
+whole solar disc. In a cell whose hemisphere is entirely blocked that is a
+contradiction, and several paths return 1.0 when they have not MEASURED
+anything — the shadow cache returns exactly 1.0 for a patch nobody has
+requested yet. So every surface a camera saw for the FIRST time inside a cave
+shaded with full daylight for a frame, and the P2 write-back recorded it into
+the irradiance grid where it stuck. That was the whole of a sealed box's
+remaining 2.7x swing, with every openness byte and every injected word reading
+0. The exemption is now gated on the face seeing some sky (a smoothstep over
+the bottom 5% of openness), which covers every consumer at once — the raymarch,
+the resolve pass's deposit, the walk's sun sample and the raster body path.
+
 **Knobs** (`render.*`): `opennessReach` (12 m), `opennessChunksPerFrame` (256
 slots/tick), `opennessStrength` (1.0 — and 0 is an EXACT off switch on both
 halves: it const-folds the reader and makes `C_OPENNESS` false so neither row is
-recorded), `opennessBilinear` (1).
+recorded), `enclosedAmbient` (0.012, 0.013, 0.016 — roughly what a moonless
+night gives open sky), `opennessFloor` (**0**; the pre-2026-09-11 leak, kept
+only as the A/B arm for the old look), `opennessBilinear` (1).
+
+**Gate:** `--selftest --gate cave-time` stamps a sealed 24-voxel stone box,
+puts the camera inside it and renders the same view at the sun's highest and
+lowest tick. Four arms, because "the cave does not change" is satisfiable by
+rendering black: the noon frame must clear a floor, the noon/midnight ratio must
+be ≤ 1.25x (it measures 1.1–1.2x), the box must stay under 15% of the open
+meadow outside, and the probed faces must hold no irradiance an earlier gate
+left behind — that last one reports as a FIXTURE failure, not a lighting one.
 
 **Cost**, RTX 3060 Ti, 1080p, 2026-09-02. The compute pass, from `--perf`'s
 `openness` node: p50 0.015 ms idle, 0.008 ms flying (streaming does not light it
@@ -5583,6 +7472,105 @@ position, with `occupancy`/`openness`/`opennessGen` widened to the vertex stage
 in `renderBGL_` — a burning ember in a cave no longer glows at full sky ambient.
 Particles, sprites and fluid still take that walk per VERTEX; the BODY path
 takes it once per cube (at the centre) and shades per FRAGMENT — see §9.z.
+
+### 9.s The penumbra window — the sun is not a point (added 2026-09-11; `shadow_resolve.wgsl`, `src/sim/world.h` `kShadowHistBytes`)
+
+**The defect.** One ray per patch answers a yes/no question, so the shadow cache
+could only publish "lit" or "shadowed at this blocker's lift". A shadow edge was
+therefore a hard step one patch wide however far away the blocker was, and
+walking the sun across the sky advanced that step one patch at a time — a shadow
+that visibly expands in jumps (owner report 2026-09-11). Subdivision does not
+fix it: a finer grid makes the step smaller, not softer.
+
+**The fix costs no extra rays.** The resolve pass jitters its ray inside a cone
+of half-angle `render.shadowSunAngle` and averages the last `kShadowSamples`
+= 16 verdicts, so a patch publishes the FRACTION of the solar disc it can see.
+The penumbra width then falls out of the geometry — a blocker `d` away spreads
+the cone over `2·d·tan(angle)`, so a kerb stays crisp and a canopy 10 m up
+softens over most of a metre.
+
+**`render.shadowSunAngle` is the ARTISTIC size of the sun, not the real one.**
+`dayNight.sunAngularRadius` (0.3°) is the star, and it drives the drawn disc and
+eclipse geometry; at 0.3° a canopy 10 m up softens over one voxel, which is
+physically right and reads as the hard edge this replaced. It ships at **1.0°**.
+0 restores the single-ray hard shadow exactly — the same value, the same code
+path, verified by the `shadow-cache` gate's agreement with the per-pixel
+reference tightening from 0.67 to 0.50 mean |dL| when the cone is switched off.
+
+**A sliding WINDOW, not an exponential blend, and that is the whole design.** An
+EMA over a cycling sample set never settles — it oscillates with the sequence's
+period forever, i.e. a shadow that pulses, which is the defect next door. A
+window over a FIXED 16-point sunflower sequence is exact after 16 frames and
+then stops moving entirely while the scene and the sun hold still, because the
+same slot is rewritten with the same bit. `--gate shadow-cache` measures
+**0 pixels moved** between two warmed frames, and its warm-up is 20 frames
+rather than 4 for exactly this reason: anything under 17 measures the fill.
+
+**Storage is one word per bucket in its own buffer** (`world.h kShadowHistBytes`,
+4 MiB): 16 sample bits, a 5-bit fill count, and the 8-bit lift. Its own buffer
+and not two more words on the cache slot, because the fragment shader probes a
+whole 8-way set on every lit pixel and that set is exactly one 64-byte cache
+line; widening the slot would put the hot path on two lines to carry state only
+the resolve pass touches. The reader is unchanged — it still reads one byte.
+
+**The lift is refreshed from ONE deterministic ray**, the undeflected one, on
+the frame a patch's window wraps (plus immediately on a fresh slot, so a newly
+visible patch never spends a frame at the reset value of contact black). There
+are no spare bits for a second 16-sample window, and a fixed ray is what keeps
+the byte — and therefore the published value — bit-stable in a static scene.
+The two compose as `open + (1 − open)·lift`, which degenerates to the pre-cone
+value exactly when every sample agrees.
+
+**A window belongs to a PATCH, not to a slot.** The slot's `valid` bit is the
+only signal that distinguishes "my samples" from "the samples of whatever patch
+held this slot before me"; nothing but the resolve pass sets it, so `!valid` is
+exactly "claimed since the last publish" and the window resets. The write-back
+is unguarded (unlike the value publish) because a slot that changed hands
+self-corrects on the next frame's verifier mismatch.
+
+**The window has seventeen levels; the sun has none** (added 2026-09-12,
+`SHADOW_GLIDE` in `shadow_resolve.wgsl`). The cone made the shadow a gradient in
+SPACE and left it a staircase in TIME: 16 binary verdicts estimate coverage at
+1/16, so a patch holds a value and then steps ~9 of 255 when a blocker's edge
+crosses one of the sixteen sample directions. `dayNight.cycleMinutes` is 6, so
+the sun crosses a degree of sky per SECOND and sweeps the whole 2° cone in two —
+sixteen levels in two seconds is a visible step every seven or eight frames, for
+as long as the shadow moves (owner report 2026-09-12, "the pixels still
+discretely jump in a bunch of small steps"). More samples cannot fix it and
+there is no room for them: 29 of the word's 32 bits are already spoken for, and
+64 levels would still step.
+
+So the published byte GLIDES: each frame it moves `SHADOW_GLIDE` of the way to
+the window's answer, which turns each 1/16 jump into a short ramp, and the ramps
+of a moving shadow run into each other. **This is not the EMA the paragraph
+above refuses** — that one would average the raw SAMPLES, a cycling sequence
+whose EMA oscillates forever; this averages the WINDOW'S OUTPUT, which in a
+static scene is one number, bit-identical every frame, and a low-pass fed a
+constant converges and stops. It is computed in integer units of the stored byte
+with a minimum step of one unit, so the fixed point is exact and a settled patch
+publishes a delta of exactly zero (a float blend landing 0.4 units short rounds
+back and forth forever — a 1/255 flicker, and "0 pixels moved" is a claim about
+zero). Past `SHADOW_GLIDE_SNAP` = 64/255 the new answer is taken whole, so a
+mined block or an opened door is instant and only the sun creeps. Below
+`|d·rate| = 1` the step floors at one unit per frame, so a steadily moving shadow
+settles into a constant-VELOCITY slide with a standing error of ~1/rate units —
+a couple of centimetres of shadow position, and the smoothest thing this can be.
+
+`--gate shadow-cache` gained a **creep arm** for it: a pinned camera, one TICK
+of sun per frame (the real rate — the walk arm's 1.4°/frame changes the answer
+so much that the glide correctly snaps and measures nothing), 32 frames, and the
+cache buffer read back each frame so every slot that is still the same patch
+contributes its per-frame delta. Measured: **0.8%** of slot-frame moves step by
+more than 5/255, against a bound of 25%. With `SHADOW_GLIDE = 0` — the oracle,
+one WGSL const and no rebuild — it is **99.2%**, largest step exactly 16/255,
+and the number of slot-frames that move at all falls from 43,928 to 7,146.
+Moving a little every frame rather than a lot occasionally IS the fix.
+
+**What is NOT here.** Soft shadows on the raster body paths. `bodySunShadow`
+casts one ray per FRAGMENT with nowhere to accumulate, so a limb still takes a
+hard edge; the terrain under it does not. Per-fragment cone jitter would dither
+it at the cost of noise on a moving body, which is the artifact this pass exists
+to avoid — the honest fix is a body-side cache, and it is not written.
 
 ### 9.z Raster body shading parity (added 2026-09-04)
 
@@ -5695,8 +7683,34 @@ not change to the eye, and the quadrature's 0.28 against a form factor of 0.5 is
 reason; 0 is an exact off switch — gather,
 resolve deposit and walk sample all const-fold, the `nogi` `--render-budget`
 arm), `giDecay` (0.25), `giFeedback` (0, P2; `LoadTuning` keeps it strictly
-below `giDecay`), `giGatherBlocks` (3), `giCachePeriod` (8; 0 is the uncached
-per-pixel gather, the `nogicache` `--render-budget` arm).
+below `giDecay`), `giGatherBlocks` (**12**), `giCachePeriod` (**16**; 0 is the
+uncached per-pixel gather, the `nogicache` `--render-budget` arm).
+
+**The gather reached 1.2 m, which is less than a room** (2026-09-11).
+`giGatherBlocks` is a STEP budget rather than a distance — `traceOpaque` jumps a
+whole chunk wherever that chunk holds no blocker, so open air costs a quarter of
+the steps a wall does — and at the shipped 3 the bounce could not cross a 10 m
+room: a wall ten metres from a sunlit doorway measured 0.00136 with GI on and
+0.00133 with it off. That shortfall is *why* the openness floor above existed.
+At 12 it crosses a room, and it is free: the cost is (rays × steps) /
+`giCachePeriod`, so doubling the period 8 → 16 absorbed the entire increase —
+0.78 ms on the noon overlook, against 0.79 ms before. What buys the reach is
+LATENCY: the bounce now trails the sun by up to 16 frames rather than 8.
+
+**Two obvious improvements were built and both removed the same day, for the
+same reason: this fragment shader has no register headroom.** (1) A three-level
+chunk-local mip pyramid over plane 0, so a distant hit reads a prefiltered cell
+instead of point-sampling one 40 cm block-face. (2) Scaling the step budget by
+the receiver's own sky visibility, so reach is not spent outdoors where
+`ambientAt` already answers analytically. Each measured **128 → 168 registers**
+on the `raymarch` fragment stage (`--shader-stats`), past its occupancy cliff,
+and slowed `--render-budget` cameras containing no indirect light at all; a
+branchless level select measured 168 too, and a CONSTANT budget of the same size
+measured 128, so it is the live state and the dynamism rather than the branches
+or the count. **The step budget must stay a value the shader can const-fold.**
+The thing to change, if this is revisited, is WHERE the gather runs — a compute
+pass over block-faces, which the per-block-face cache below already makes
+natural — not what it reads or how far it goes.
 
 **The gather is cached per block-face** (2026-09-05, `docs/PLAN_frame_perf.md`
 §3 item 1). The nine rays are a function of the block-face and the geometry
@@ -5750,8 +7764,8 @@ one. Terrain receives emitter light through the irradiance grid.
 **The problem is that three consumers are outside that path, for structural
 reasons rather than for want of wiring.** `giGather` is nine coarse DDA rays
 over `occupancy`; it needs `voxels`, `occupancy` and `pageTable` bound in the
-FRAGMENT stage, and it reaches `render.giGatherBlocks` blocks — 1.2 m at the
-shipped 3.
+FRAGMENT stage, and its reach is `render.giGatherBlocks` march STEPS — about a
+room at the shipped 12, and 1.2 m before 2026-09-11.
 
 * `debris.wgsl`'s rigid-body and particle cubes shade in the **vertex** stage,
   where `renderBGL_` marks `voxels` (0) and `pageTable` (9) Fragment-only. They
@@ -5983,6 +7997,136 @@ fetches, no ray — and one-bounce indirect is `giGather` over the world-space
 irradiance grid (§9.y). A screen-space denoiser needs screen-space noise, and
 this renderer's noise is in the QUANTISATION of those world-space caches, which
 is what the temporal accumulator above softens as a side effect.
+
+### 9.u The shading-LOD filter — the "denoiser" that is not one (added 2026-09-12; `assets/shaders/denoise.wgsl`, `raymarch.wgsl` `lodShadeFade`)
+
+Reported as "a ton of noise overlaying everything in the first far-field /
+medium-field ring, especially in daylight". Measured on `screenshot_ground`
+and `screenshot`: the noise is **not stochastic**. Every lighting term the
+raymarch evaluates is deterministic and evaluated once per pixel at one point
+on one voxel face — the sun through the shadow cache, AO from three fetches,
+the far shadow from one any-hit march. What the eye reads as noise is
+GEOMETRY: past ~20 m a hillside is a staircase of 10 cm voxels (40–160 cm
+cascade cells) whose treads are contact-shadowed by the riser above them,
+whose creases carry full AO and whose ±X/±Z faces take different lamberts,
+each face 2–6 px on screen. Point-sampling that staircase once per pixel is
+aliasing of the lighting, and it is the same picture every frame. The
+`denoise` gate puts a number on it: mean absolute luminance residual against
+the 4-neighbour mean over the 30–400 m band, **16.5** (0..255) at mid-morning
+against 3.0 at midnight — it is a sunlit artefact.
+
+**Why none of the five candidate denoisers was used.** OptiX (every mode,
+AOV-guided and temporal included) is CUDA and NVIDIA-only and would need
+CUDA↔Vulkan interop; DLSS Ray Reconstruction is RTX-only behind the NGX SDK;
+NRD/REBLUR is cross-vendor but wants a G-buffer this renderer does not have
+(normals, roughness, motion vectors, split diffuse/specular with hit
+distance), sampled images and samplers the rhi does not have, and HLSL
+through a toolchain the build does not have. None of that is the real
+objection. The real one is the MODEL: all five treat the input as a noisy
+estimate of a smooth signal and accumulate it over time, and a deterministic
+staircase has no variance to average away — the temporal stage would see the
+same value every frame and change nothing, and their spatial stages are
+guided by NORMALS, which would preserve exactly the riser-vs-tread contrast
+that is the defect. A denoiser needs noise; this is LOD.
+
+**What was built instead is the prefilter a texture mip chain gives a
+rasteriser for free, in two halves that share one law.** The law is
+projected size: `fpx / viewZ` (pixels one fine voxel covers at this pixel's
+depth, `fpx = renderH / 2·tanHalfFov`), ramped from 8 px per voxel (off) to
+2 px (full) — at 1080p / 70° that is 10 m to 39 m — and written in PIXELS so
+the band follows resolution and fov. Because the far cascade keeps a constant
+~6 px per CELL (§9's resolution law: 1.5 px per fine voxel at level 1, less
+beyond), everything past the window edge is at full strength. And because
+the law is a function of hit distance alone, it is continuous across the
+window edge — a far cell one voxel past the seam gets the fade the near voxel
+one voxel inside it got, which is what keeps this from being a new LOD ring.
+
+1. **In the raymarch (`lodShadeFade`, applied in both the near and the far
+   shade): the CONTACT terms fade.** A contact shadow lifts toward
+   `LOD_SHADE_SHADOW_LIFT` (0.7) via `max()`, so a real cast shadow — a ridge
+   over a valley, whose blocker is distant and which the near law already
+   holds at `TUNE_SHADOW_LIFT` — is untouched and only the contact-dark
+   artefacts move; the crease AO fades to 1. The direct lambert of the cube
+   normal is deliberately NOT touched: its average over the footprint IS the
+   smooth surface's lambert, which the second half reconstructs. Measured:
+   raw band residual 16.5 → 13.5 from this half alone. Three WGSL consts in
+   `raymarch.wgsl`, not `TUNE_` rows: only that kernel reads them, and
+   `common.wgsl` is the nine-minute file. `--shader-stats`: the raymarch
+   fragment stage stays at 128 registers.
+
+2. **A screen-space pass (`denoise.wgsl`): a depth-guided à-trous kernel over
+   the finished world frame, IN PLACE, at render resolution, between the
+   world pass and TAA / the upscale blit.** 5×5 B3-spline taps dilated
+   2^i per iteration (Dammertz 2010 — the SVGF spatial stage), with weights
+   from three things: the projected-size STRENGTH above; a DEPTH stop that is
+   relative and per pixel of offset (`|Δz| < denoiseDepthTol · z · dist`,
+   because a grazing ground plane changes depth ~1 %/px at 100 m and a fixed
+   tolerance stops on every tread or on nothing — this is what keeps a crest
+   from bleeding into the hill behind it, a mob from bleeding into the ground,
+   and the sky, depth 0, out of everything); and a CHROMA stop, deliberately
+   not a luminance one — the speckle is luminance (lit vs shadowed faces of
+   one material), a material boundary is mostly hue (sand/water, grass/rock).
+   No history: nothing ghosts, nothing resets, a still frame is bit-stable.
+
+**The plumbing is TAA's, reused.** No sampled images: the world colour and
+depth attachments are copied into two storage buffers, the pass reads them
+and renders into the world texture, and between iterations the texture is
+copied back into the colour buffer. Every barrier in that chain is DERIVED —
+`CopyImageToBuffer` routes its destination through the extras tracker (so
+the second copy WARs against the previous pass's fragment read, which
+`FlushForRenderDomain` recorded) and `TransitionImage` carries the
+attachment-write → transfer-read → attachment-write on the texture. There is
+no hand-written barrier and `--vk-validation` is clean. Like TAA it forces
+the offscreen path at render scale 1. It runs in `--shot` too, in place over
+the shot texture, because a look pass the look harness did not show would be
+untunable.
+
+**Shipped values, and what the alternatives looked like** (all from
+`--gate denoise`, which writes `build/denoise_before.bmp` / `_after.bmp`
+every run so a tuning.json edit plus one gate is the whole loop):
+
+| arm | band residual | verdict |
+|---|---|---|
+| raw, no fade | 16.5 | the report |
+| fade only | 13.5 | contact stipple mostly gone; the ±X/±Z face mosaic remains |
+| fade + 1 iteration, strength 1 | 2.3 | in focus, but the 6 px mosaic is still a mosaic |
+| **fade + 2 iterations, strength 0.7** | **0.7** | **shipped: mosaic averaged, terrace bands and relief survive** |
+| fade + 2 iterations, strength 1 | 0.6 | softer than it needs to be |
+| 3 iterations, strength 1 | 0.14 | every hillside reads out of focus |
+
+**The owner's verdict on the pass, 2026-09-12: it ships OFF** (`render.denoise`
+0). Even at two iterations the filtered hills read as out of focus. The
+in-raymarch fade (half 1) is what ships; the pass stays as the A/B arm and the
+gate keeps it working. The next lever for the remaining ±X/±Z face mosaic is a
+smoothed normal for the lighting at distance, in the raymarch, not a blur.
+
+The 15–31 m ramp of the first cut measured as a visible line where crisp
+voxels met filtered ones — the LOD-ring defect the cascade seam dither exists
+to break — hence the 10–39 m ramp. Cost, same gate, 1080p: **+1.2 ms** for two
+iterations (copies included); at `render.renderScale` 0.7 it is half that.
+`render.denoise` 0 is the A/B arm.
+
+**Gated by `--gate denoise`**, which draws one mid-morning valley view, copies
+the frame out BEFORE and AFTER the pass (one frame, so the irradiance EMA
+cannot differ between the two — the first cut compared two arms and found a
+3/255 lighting drift in the near band), reads the depth the world pass
+wrote, and asserts by distance band: pixels nearer than 10 m and the sky are
+**bit-identical** (`denoise.nearMaxDiff` 0 — the ramp is exactly zero there
+and the shader returns the source texel), the 30–400 m band's residual falls
+to at most `denoise.midHfMaxRatio` (0.6) of the raw frame's, and that band's
+mean luminance moves by at most `denoise.midMeanMaxDelta` (3). Every threshold
+is baseline.json; the observed ratio, raw residual and per-frame cost are
+recorded for `--rebaseline`.
+
+**What is NOT here.** An albedo guide: the pass reads colour and depth only,
+so a distant structure of a similar hue to its ground (the ruins at 100 m in
+`screenshot`) is softened along with the ground — the fix is a second
+attachment or a fragment store of albedo from the raymarch, which the chroma
+stop is standing in for. Soft shadows on the raster body paths (§9.s's open
+item) are unaffected either way — a body's pixels are nearer than the ramp.
+And nothing temporal: `render.taa`'s accumulator would integrate the same
+staircase over the jitter sequence and is the right next lever if the
+residual 0.7 still reads as texture at some resolution.
 
 ## 9b. Wind (added 2026-08-25)
 
@@ -6821,6 +8965,110 @@ M5's own, and the first is the one worth knowing before building on this:
 * **The container curve is not persisted and not saved**, like every other
   derived structure in this design. A window rebuild re-derives it.
 
+### 5b.8 W1: relevel — a body finds its level (added 2026-09-14)
+
+`docs/PLAN_water_relevel.md` §3. The surface shave of §5b.4 only ever moves a
+lake DOWN, uniformly, because a drain is a global potential with one number
+behind it. Relevel is its mirror image: every column of a disturbed body relaxes
+toward the body's own MEAN surface.
+
+**Why it cannot be a CA rule, and this is proven rather than tuned.** The
+equalize branch in `sim_step.wgsl` fires only at a 2-eighth difference between
+neighbours, and `bridgeLevel` extends its reach to a distance-2 pair. **A ramp of
+1 eighth per 2 cells is therefore a stable fixed point** — over an 80-cell radius
+that is 40 eighths, so a 5-voxel cone is PERMANENT. Above that slope it flattens
+by diffusion at order r² ticks per eighth, which at r ≈ 80 and 30 Hz is minutes
+per eighth. Lowering the threshold to 1 was refused with proof (the (k, k+1) pair
+is the integer diffusion equilibrium and every reach-1 tie-break ratchets or
+oscillates). Flatter than reach 1 allows needs a global operation, and the body
+system already is one.
+
+**Three passes, in the existing row block**, ordered `wbShave → wbRelevel →
+wbSurface`:
+
+| pass | shape | what it does |
+|---|---|---|
+| `wbSurface` | one thread per column of a listed chunk | finds the column's free surface in the band and adds its height to the body's histogram |
+| `wbLedger` (extended) | one thread per body | turns LAST tick's histogram into THIS tick's give/take cutoffs, and banks the credit |
+| `wbRelevel` | one thread per column of a listed chunk | gives or takes eighths in its own column per the cutoffs, and REPORTS what it moved |
+
+The measure runs after every writer in the block so next tick's ledger sees the
+surface this tick settled on; the ledger consumes it one tick later — §5b.4's
+"never read a tally in the pass that writes it", at pass granularity, exactly as
+the shave report works. `wbRelevel` runs after `wbShave` so a draining body's two
+writers can never reach the same cell: the shave owns `level` and `level-1`, and
+the relevel skips a column whose surface is in that band while
+`WBS_STEPS | WBS_FRAC` is nonzero.
+
+**One chunk layer owns each column.** The band is up to
+`sim.waterRelevelDepth` (32) voxels deep and straddles two or three of a body's
+listed chunk layers, so unlike the shave's two-Y band a naive dispatch would
+measure one column several times. The layer holding the body's `level` owns it
+and walks DOWN through the page table; every other listed chunk returns after
+three scalar loads. The walk stops at `floorY + 1`, which is both physically
+right (a pocket under the basin floor is the MPM's and the CA's) and a page-table
+argument: the body's chunk list covers its water AABB and a write below it would
+be a lost eighth reported as a page fault.
+
+**The arithmetic, all integer.** `m = RVSUM / RVCOUNT` is the mean surface in
+eighths; `k(s) = clamp(|s − m| / gain, 1, max)` is what a column at height `s`
+may move this tick; supply and demand are summed over the histogram with
+`min(k, |s − m|)` so no column can overshoot the mean. The ledger then walks the
+buckets from the bottom for takes and from the top for gives and publishes a
+cutoff plus a dither for the partial bucket, exactly as it publishes
+`WBS_STEPS`/`WBS_FRAC` — the dither key is the WORLD column, never a chunk-list
+index, because a list reorders and an index used as an identity must be the
+stable one.
+
+**The credit is a stored field, for the reason the debit is.** The histogram is
+one tick stale, so a take can outrun its gives by a bounded amount; `credit +=
+GIVEN − TAKEN` records it, and while `credit < 0` the ledger publishes NO take
+cutoff and the gives repay it first. That is the `WB_RELEASING` argument — a
+released body keeps shaving until the ledger is square — applied in the other
+direction. `--gate waterbody` pass R's identity carries the term, and closed at exactly
++0 on both arms of the landing measurement:
+
+    voxelEighths(t) + drained(t) − debit(t) + credit(t)  ==  voxelEighths(0)
+
+**Where it lives.** The eleven `WBS_RV*` words plus `WBS_RVBASE` extend the
+ledger (`kWaterBodyStateWords` 27 → 39; they are `RV` and not `R` because
+`WBS_RSUM` is already the adoption reduce's running sum and a re-audit can run
+while a body relevels). The histogram is 272 words per body appended past the
+sweep scratch in the SAME buffer — no new binding, and deliberately not at
+`kWaterCurveBase + cap·kWaterCurveWords`, which is the shared openness bitmap's
+address.
+
+**Idle cost is zero, not small.** The CPU's hot latch (`kWaterDrainHotTicks`,
+900) is what declares the footprint to the page table, and the relevel rides it
+through one uniform word: `TickParams::waterRelevelMax` is
+`sim.waterRelevelMax` on a tick the footprint is declared and **0** on every
+other, so the arm and the rate are one number with one owner. The latch itself
+now fires on `drainMax > 0 || relevelMax > 0` rather than on the drain knob
+alone — a knob about jets must not switch off a rule about surfaces. At
+`sim.waterRelevelMax = 0` both kernels return on their first comparison and W1
+is an exact identity.
+
+**Pass R, and why its fixture has the MPM off.** A 17x17x6 crater is bored into
+the lake's own floor and goes nowhere — sealed stone, no discharge, and
+`sim.fluidExciteMode` 0. That last one is §5b.5's H1 discipline reused: this is
+a rule that moves SETTLED water between columns, so the fixture must contain
+nothing else that moves settled water. Measured with the seam live and a 33x33x8
+pit, the solver and the evaporation rule took 54,091 eighths out of the lake
+WITH THE RELEVEL DISARMED and left 64 chunks awake — every number the pass
+reported was then a statement about the solver. Seam off: the CA alone leaves 15
+eighths of spread after 150 ticks, the relevel leaves 1 (budget 2) and is flat
+at 45, 12,855 eighths given equals 12,855 taken, credit 0, capped 0, 0 chunks
+awake, identity +0. The pass runs BOTH arms and fails if the control also meets
+the budget — a fixture the CA would have closed anyway proves nothing.
+
+**A cost stated rather than discovered.** Because gives are dithered across every
+above-mean column, any disturbance that opens real demand scatters single-eighth
+writes over the body's whole surface and wakes most of its surface chunks for the
+active ticks. Bounded and brief — at rate 4 a 10-voxel cone is flat in ~20 ticks
+against a 900-tick window — and correct for a crater. If a measured case ever
+makes it matter the knob is a demand floor in the ledger, not a change to the
+apply.
+
 ## 9d. The current field, and surface waves (added 2026-08-29)
 
 `docs/PLAN_water_master.md` components 8 and 9 (milestone M4, "it looks alive").
@@ -7586,6 +9834,65 @@ The half of this that is still open: a piece knocked off an NPC and picked up
 by the player comes back as authored, because `WornDamage` is keyed by cover
 index and the ground registry carries only a name and a lattice.
 
+### Corpses keep what they fell with, and E says what it will do (2026-09-12)
+
+`Mob::Die` hands every limb to `DebrisSystem` and the husk is swept on the next
+tick, so a tick after a creature falls there was no Mob left to ask "what was it
+wearing" — the robe was still THERE, a debris body jointed to the torso it fell
+with, but debris carries no identity. So Die now makes a one-time
+`CorpseReport` the instant before the handover, while the rig still knows which
+appended slot is the robe: the bodies the corpse became (any of them under the
+crosshair means "this corpse"), and one entry per piece with the body that IS
+the piece (the identity shell, `IdentityShellOf`; the borrowed slot for a held
+sword), its other shells as rags, and its damage from `CaptureWorn`. Delivered
+through `MobSystem::SetOnCorpse` to `Corpses` (`game/corpses.h`), which is
+`WorldItems`' shape over the same bodies and hangs off the same
+`SetOnBodyGone` hook: a piece whose body burns off the corpse leaves the list,
+a corpse with no bodies left is forgotten, and the list is capped at 64 oldest-
+first. Not fired for the avatar (its kit lives in `PlayerKit` and the wear loop
+re-dresses the respawn from it). Not saved: a loaded world has heaps, not
+corpses, the same call the `'ITMS'` re-drop made.
+
+**The reach ray runs every frame, not on the press.** The prompt is the
+feature: `E  pick up robe` / `E  loot goblin` under the crosshair is what tells
+the player the thing on the floor is a thing at all, and the ground registry is
+asked first so a shed robe lying in its heap reads as the robe. Reach went from
+5 to 24 voxels: the ray starts at the EYE and the avatar is 17 voxels tall, so a
+thing at your feet was a body height out of reach. Two things the ray must NOT
+do, both measured with a walking rig on 2026-09-12 (a fly-mode harness has no
+rig and shows neither): hit the player's OWN HEAD — the eye is inside the head
+collider and Jolt reports a convex shape the ray starts in at fraction 0, so
+every cast answered "your head" and E was dead — and miss the crosshair in
+third person, where the camera is on a boom metres behind the head and a ray
+from the head along the camera's forward runs parallel to the crosshair line
+but metres off it (16 of 16 corpse bodies missed). So the cast skips the
+avatar's live limb bodies (`Physics::CastRayBody` with an ignore list) and
+starts at the RENDER eye, with a hit counting only if the point it lands on is
+within reach of the head. It is the one ray that reads the camera: a UI query
+against Jolt bodies, not a sim input, so the "picking rays use `player.EyePos`
+so the camera cannot change what the sim sees" contract does not apply to it.
+E over a corpse opens the
+character screen with a LOOT panel where the grimoire sits (wide) or the
+arsenal (narrow), one `KitSlotUI` per piece through the same mirror, and
+`KitSpace::Loot` is one more address the same drag can name. `TakeCorpseLoot`
+executes it beside `PlayerKit::Move` rather than inside it — a corpse is not
+one of the player's containers and has no `ItemStack` to swap — with Move's
+discipline: `EquipSlotAccepts` on an equip destination, a sentence per refusal,
+an occupied destination sends its stack to the pack rather than overwriting,
+a full pack refuses with the piece still on the corpse. On success the
+identity body and rags are destroyed (the robe visibly leaves the heap), and
+the damage is filed by name with the identity shell's lattice re-read off the
+body as it is NOW, so a robe that went on burning after its wearer died comes
+off burnt. Right-click takes into the pack; a drag onto an equip slot wears it;
+a drag OUT of the panel is `ShedCorpseLoot` — the piece comes off the corpse
+and its body is registered as a ground item, nothing created. A drag INTO the
+panel is refused: a thing put on a corpse would be data with no body. The panel
+closes with the screen, on its button, when the corpse is gone, or past 40
+voxels from any of its bodies. The HUD now also draws a fresh `kitMessage`
+under the prompt, so "picked up" is seen in play rather than only on the
+character screen. `--gate loot` (42 checks, no window); `--shot-inventory`'s
+fourth frame is a dressed human killed and opened.
+
 ### Cross-limb heat respects the coat
 
 `BuildCrossLimbHeat` lets a burning limb warm its siblings through faces where
@@ -8120,6 +10427,21 @@ is a relabelled GPU wait — the CPU would have spent the same time in `present`
 so it now has its own row and its own two counters: `snapshotStalls` (the waits)
 and `readbackDeclined` (readback requests the ring refused). Declines
 without stalls mean the ring is the limit; stalls with declines mean the GPU is.
+
+**The GPU-lag throttle (2026-09-09).** The 4-tick catch-up is right for a CPU
+hitch and wrong for a GPU one: every tick submits a plane of worldgen, a CA
+pass and a snapshot copy, so paying three of them into a queue already a frame
+behind lengthens the next frame, which owes more ticks — the loop that ends in
+the two blocking waits on the frame path (the staleness fence above, and
+`Stream`'s T+`kWakeLatency` wake fence, billed to World Storage). The tick loop
+now reads the lag instead of guessing it — `rhi::Device::PendingMapCount()`,
+the snapshot readbacks whose fence has not signalled, is exactly the ticks the
+GPU has not finished — and runs a second tick in a frame only while the GPU
+owes fewer than two, dropping the surplus debt (sim time dilates by those
+ticks) rather than banking it into a burst. Pure pacing: which ticks run and
+what they compute is unchanged, nothing hashed moves, and the headless
+harnesses never reach the branch. `--frames` prints the count as `gpu-lag
+throttle`; the live page shows it as `ticksThisFrame` sticking at 1.
 
 **Verify the page, not just the numbers.** `scripts/check_perfview.sh` drives the
 real tab in real headless Chrome and asserts both content (charts built from the

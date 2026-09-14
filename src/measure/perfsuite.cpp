@@ -318,9 +318,9 @@ struct Trunk {
 // caller must force one (HashWorldNow) before calling — a stale read here is a
 // tree that was found where there is now a crater.
 std::vector<uint32_t> ReadOccupancy(GpuContext& ctx, World& world) {
-  std::vector<uint32_t> occ(kNumChunks, 0);
+  std::vector<uint32_t> occ(kNumSlots, 0);
   rhi::ReadbackBlocking(ctx.device, ctx.queue, world.occupancy, 0, occ.data(),
-                        (size_t)kNumChunks * 4, "perfOcc");
+                        (size_t)kNumSlots * 4, "perfOcc");
   return occ;
 }
 
@@ -2405,8 +2405,8 @@ bool CamMeadow(Scene& s, uint32_t& tick, std::string& why) {
   uint32_t score = 0;
   const int ci = f.Best(f.plantSat, kMeadowRadius, score);
   if (ci < 0 || score == 0) {
-    why = "no plant cells in the residency window (debug.vegetation off, "
-          "or no cover in this biome)";
+    why = "no plant cells in the residency window (debug.groundCover or "
+          "debug.vegetation off, or no cover in this biome)";
     return false;
   }
   const int ix = ci % f.span, iz = ci / f.span;

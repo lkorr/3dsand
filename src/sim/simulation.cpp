@@ -254,6 +254,31 @@ bool Simulation::Init(const rhi::Device& device, World& world,
         // above only binds layouts a shader declaring `glow` is recorded
         // against, and no slim-group pipeline names it.
         entry(32, T::Storage),         // glow (sources + field)
+        // The window-edge gas outbox (docs/PLAN_gas_particles.md §2.3).
+        // sim_step's gasLeave appends to it; sim_gas drains it later in the
+        // same tick through the GAS group, where it is binding 3. The two
+        // numbers differ on purpose and legally: `gasSpawn` is declared in two
+        // modules that do NOT share the declaration through common.wgsl, which
+        // is the condition the one-identifier-one-binding-number rule above is
+        // about. 33 is the first free slot in this dense 0..32 layout.
+        entry(33, T::Storage),         // gasSpawn (header + records)
+        // The outer gas density box (docs/PLAN_gas_particles.md §2.5). Bound
+        // to the CA since stage 1b, which splats every in-window gas VOXEL
+        // into it once per tick so the renderer can crossfade a voxel plume
+        // into the coarse one instead of cutting between them at the face.
+        // Binding 6 in the GAS group and 21 in renderBGL_; the numbers differ
+        // for gasSpawn's reason -- `gasOuter` is declared in three modules
+        // that do NOT share the declaration through common.wgsl, which is the
+        // condition the one-identifier-one-binding-number rule is about.
+        // 34 is the first free slot in this dense 0..33 layout.
+        entry(34, T::Storage),         // gasOuter (render-only density box)
+        // The repose occupancy snapshot (world.h kReposeSnap*). Storage, not
+        // ReadOnlyStorage: the `reposesnap` prepass writes it and `main` reads
+        // it, both entry points of sim_step.wgsl, which WGSL cannot give two
+        // access modes for one binding. 35 is the first free slot in this dense
+        // 0..34 layout, and it is NOT mirrored in simSlimBGL_ -- no slim-group
+        // pipeline names it.
+        entry(35, T::Storage),         // reposeSnap (bits + per-slot stamps)
     };
     simBGL_ = device.CreateBindGroupLayout(entries, std::size(entries));
 
@@ -303,6 +328,29 @@ bool Simulation::Init(const rhi::Device& device, World& world,
         entry(7, T::ReadOnlyStorage),  // CPU particle spawns (debris shatter)
     };
     particleBGL_ = device.CreateBindGroupLayout(pentries, std::size(pentries));
+
+    // group 1: gas particles (sim_gas.wgsl, docs/PLAN_gas_particles.md).
+    //
+    // Its OWN group rather than an extension of particleBGL_, and the reason is
+    // farVox: gas needs the far cascade to know what it is drifting into
+    // outside the window, and that lives in farBGL_. A layout carrying both
+    // would have to be bound by every ballistic row for no hazard, and the
+    // fluid pair already established that a system with its own buffers gets
+    // its own group-1.
+    rhi::BindGroupLayoutEntry gentries[] = {
+        entry(0, T::Storage),          // gasRead  (gasParticles[page])
+        entry(1, T::Storage),          // gasWrite (gasParticles[1-page])
+        entry(2, T::Storage),          // gasCounts (atomic)
+        entry(3, T::Storage),          // gasSpawn: the CA's outbox + counters
+        entry(4, T::Storage),          // gasClaim (re-entry claim hash)
+        entry(5, T::Storage),          // gasArgs staging
+        entry(6, T::Storage),          // gasOuter (render-only density box)
+        entry(7, T::ReadOnlyStorage),  // farVox: blocking outside the window
+        entry(8, T::Uniform),          // FarParams (the cascade origins)
+        entry(9, T::ReadOnlyStorage),  // reactions: the RK_DECAY bucket
+        entry(10, T::ReadOnlyStorage), // gasSpawnOps (CPU-authored spawns)
+    };
+    gasBGL_ = device.CreateBindGroupLayout(gentries, std::size(gentries));
 
     // group 1: MLS-MPM fluid prototype (sim_fluid.wgsl). Same slim-group-0
     // pairing as the particle pipelines. fluidDispatchArgs is deliberately
@@ -434,6 +482,18 @@ bool Simulation::Init(const rhi::Device& device, World& world,
         // is a shape it CAN consume, which is what lets the crown that falls
         // off a burning tree be lit by the fire it fell out of.
         entry(20, T::ReadOnlyStorage, S::Fragment | S::Vertex),   // glow
+        // The outer gas density box (docs/PLAN_gas_particles.md 2.5). Declared
+        // HERE, on the SIM side, so the far-march sampling that consumes it is
+        // a WGSL-only change: a binding a shader names must exist in the layout
+        // or the pipeline will not build, and that is the one thing a renderer
+        // edit cannot add for itself.
+        //
+        // READ-ONLY and fragment-only. sim_gas's resolve is the sole writer,
+        // on the TICK command buffer, and the raymarcher reads it in the
+        // FRAGMENT stage of the same frame -- the compute->fragment hop that
+        // has no other source of synchronisation in this engine, which is why
+        // GasOuter is on the pass table at all.
+        entry(21, T::ReadOnlyStorage, S::Fragment),               // gasOuter
     };
     renderBGL_ = device.CreateBindGroupLayout(entries, std::size(entries));
 
@@ -508,6 +568,9 @@ bool Simulation::Init(const rhi::Device& device, World& world,
 
     rhi::BindGroupLayout fluidSeamGroups[] = {simSlimBGL_, fluidSeamBGL_};
     fluidSeamPL_ = device.CreatePipelineLayout(fluidSeamGroups, 2);
+
+    rhi::BindGroupLayout gasGroups[] = {simSlimBGL_, gasBGL_};
+    gasPL_ = device.CreatePipelineLayout(gasGroups, 2);
   }
 
   // ---- bind groups ----
@@ -532,6 +595,24 @@ bool Simulation::Init(const rhi::Device& device, World& world,
     };
     particleBG_[page] =
         device.CreateBindGroup(particleBGL_, pentries, std::size(pentries), "particleBG");
+
+    // Gas: same parity convention as particleBG_ — gasParticles[page] is what
+    // this tick READS and [1-page] is what it writes, and FlipPage swaps them.
+    rhi::BindGroupEntry gentries[] = {
+        b(0, world_->gasParticles[page]),
+        b(1, world_->gasParticles[1 - page]),
+        b(2, world_->gasCounts),
+        b(3, world_->gasSpawn),
+        b(4, world_->gasClaim),
+        b(5, world_->gasArgs),
+        b(6, world_->gasOuter),
+        b(7, world_->farVox),
+        b(8, world_->farUBO),
+        b(9, reactionBuf_),
+        b(10, world_->gasSpawnOps),
+    };
+    gasBG_[page] =
+        device.CreateBindGroup(gasBGL_, gentries, std::size(gentries), "gasBG");
 
     rhi::BindGroupEntry rpentries[] = {
         b(0, world_->particles[page]),
@@ -569,6 +650,7 @@ bool Simulation::Init(const rhi::Device& device, World& world,
         b(18, world_->opennessGen),
         b(19, world_->irradiance),
         b(20, world_->glow),
+        b(21, world_->gasOuter),
     };
     renderBG_ = device.CreateBindGroup(renderBGL_, entries, std::size(entries), "renderBG");
   }
@@ -605,6 +687,11 @@ bool Simulation::Init(const rhi::Device& device, World& world,
         // The openness bytes, so the deposit can cap the shadow lift by sky
         // visibility (shadowLiftCap in common.wgsl; see shadow_resolve.wgsl).
         entry(10, T::ReadOnlyStorage), // openness
+        // The penumbra window (world.h kShadowHistBytes): the 16-frame
+        // sliding window of sun-visibility samples per patch. Read-modify-
+        // written here and bound nowhere else — the fragment shader reads the
+        // published 8-bit value out of shadowCache and never this.
+        entry(11, T::Storage),         // shadowHist
     };
     shadowBGL_ = device.CreateBindGroupLayout(entries, std::size(entries));
 
@@ -620,6 +707,7 @@ bool Simulation::Init(const rhi::Device& device, World& world,
         b(8, world_->irradiance),
         b(9, world_->opennessGen),
         b(10, world_->openness),
+        b(11, world_->shadowHist),
     };
     shadowBG_ = device.CreateBindGroup(shadowBGL_, bges, std::size(bges), "shadowBG");
     rhi::BindGroupLayout shadowGroups[] = {shadowBGL_};
@@ -655,6 +743,26 @@ bool Simulation::Init(const rhi::Device& device, World& world,
     taaBGL_ = device.CreateBindGroupLayout(entries, std::size(entries));
     rhi::BindGroupLayout taaGroups[] = {taaBGL_};
     taaPL_ = device.CreatePipelineLayout(taaGroups, 1);
+  }
+  // The shading-LOD filter (denoise.wgsl): same arrangement as TAA — the
+  // LAYOUT here, the bind groups in EnsureDenoise where the buffers exist.
+  {
+    auto e = [](uint32_t binding, rhi::BufferBindingType type) {
+      rhi::BindGroupLayoutEntry x{};
+      x.binding = binding;
+      x.visibility = rhi::ShaderStage::Fragment;
+      x.type = type;
+      return x;
+    };
+    using T = rhi::BufferBindingType;
+    rhi::BindGroupLayoutEntry entries[] = {
+        e(0, T::Uniform),            // DenoiseParams (one per iteration)
+        e(1, T::ReadOnlyStorage),    // srcColor  (render res)
+        e(2, T::ReadOnlyStorage),    // srcDepth  (render res)
+    };
+    dnBGL_ = device.CreateBindGroupLayout(entries, std::size(entries));
+    rhi::BindGroupLayout dnGroups[] = {dnBGL_};
+    dnPL_ = device.CreatePipelineLayout(dnGroups, 1);
   }
   {
     rhi::BindGroupEntry entries[] = {
@@ -799,6 +907,9 @@ void Simulation::BuildSimBindGroups(const rhi::Device& device) {
         b(30, world_->genAct),
         b(31, worldMapBuf_),
         b(32, world_->glow),
+        b(33, world_->gasSpawn),
+        b(34, world_->gasOuter),
+        b(35, world_->reposeSnap),
     };
     simBG_[page] = device.CreateBindGroup(simBGL_, entries, std::size(entries), "simBG");
 
@@ -893,7 +1004,15 @@ void Simulation::UploadTables(const rhi::Queue& queue,
                               const std::vector<MaterialDef>& mats,
                               const std::vector<ReactionGpu>& reactions) {
   std::vector<MaterialGpu> table(4096, MaterialGpu{});
-  for (size_t i = 0; i < mats.size() && i < 4096; i++) table[i] = mats[i].gpu;
+  anyRepose_ = false;
+  for (size_t i = 0; i < mats.size() && i < 4096; i++) {
+    table[i] = mats[i].gpu;
+    // Cond::ReposeActive. Latched HERE rather than tested per tick: it is a
+    // property of the authored table, it changes only on a materials reload
+    // (which comes back through this function), and a per-tick scan of 4096
+    // entries to answer a constant would be the thing rule 2 is about.
+    if (mats[i].gpu.repose != 0) anyRepose_ = true;
+  }
 
   // Mirror the stain palette into the reserved top entries (kStainPaletteBase,
   // materials.h): the renderer maps a voxel's 3-bit stain TYPE to a colour by
@@ -923,6 +1042,21 @@ void Simulation::UploadTables(const rhi::Queue& queue,
     const uint32_t base = (d.gpu.flags >> kMatTintBaseShift) & kMatTintBaseMask;
     for (size_t i = 0; i < d.tints.size() && i < kMatTintsMax; i++)
       table[kTintPaletteBaseGpu + base + i].color0 = ArtRgbToGpu(d.tints[i]);
+  }
+
+  // Far slot palette, a fourth reserved run (world.h kFarPaletteBaseGpu) and
+  // the REVERSE of the slot every material carries in its own flags word. A
+  // far cascade cell's byte is seven bits of palette slot; raymarch.wgsl's
+  // farPalMat() reads the material id back out of `flags` here, and sim_gas
+  // does the same to ask whether a plume is drifting into a solid.
+  //
+  // `flags` and not a colour field, because what a slot maps to is a MATERIAL
+  // -- the far field wants its palette jitter, its opacity and its class, not
+  // just an RGB. Only the owner writes: an alias shares the slot precisely so
+  // that the byte resolves to the material it named.
+  for (size_t i = 0; i < mats.size() && i < 4096; i++) {
+    if (!mats[i].farPalOwner) continue;
+    table[kFarPaletteBaseGpu + mats[i].farPalSlot].flags = (uint32_t)i;
   }
 
   // Art palette, same trick one range lower (world.h). Re-applied here because
@@ -1220,12 +1354,13 @@ bool Simulation::BuildPipelines(const rhi::Device& device, std::string* err) {
   // because BuildPipelines is the single place F5 recompiles, and the cache's
   // enable flag has to be recomputed in lockstep with raymarch.wgsl's const.
   rhi::ShaderModule mShadow;
-  rhi::ShaderModule mExplode, mParticle, mFluid, mFluidSeam, mWaterBody;
+  rhi::ShaderModule mExplode, mParticle, mFluid, mFluidSeam, mWaterBody, mGas;
   rhi::ShaderModule mRay, mDebris, mMicroBody, mDebugLines, mDebugWind, mDebugCur;
   // The TAA resolve (taa.wgsl). Its own tiny module on purpose: the render
   // pipeline it feeds must stay a fast driver compile, and growing raymarch's
   // entry to hold it would put it behind the one shader on the critical path.
   rhi::ShaderModule mTaa;
+  rhi::ShaderModule mDenoise;
   {
     PipelineBuildPool loads;
     auto mod = [&](rhi::ShaderModule* into, const char* name) {
@@ -1244,6 +1379,7 @@ bool Simulation::BuildPipelines(const rhi::Device& device, std::string* err) {
     mod(&mShadow, "shadow_resolve.wgsl");
     mod(&mExplode, "sim_explode.wgsl");
     mod(&mParticle, "sim_particle.wgsl");
+    mod(&mGas, "sim_gas.wgsl");
     mod(&mFluid, "sim_fluid.wgsl");
     mod(&mFluidSeam, "sim_fluid_seam.wgsl");
     mod(&mWaterBody, "sim_waterbody.wgsl");
@@ -1254,11 +1390,12 @@ bool Simulation::BuildPipelines(const rhi::Device& device, std::string* err) {
     mod(&mDebugWind, "debug_wind.wgsl");
     mod(&mDebugCur, "debug_current.wgsl");
     mod(&mTaa, "taa.wgsl");
+    mod(&mDenoise, "denoise.wgsl");
     loads.Run(buildThreads);
   }
   if (!mWorldgen || !mMutate || !mCompact || !mStep || !mOcc || !mPick ||
       !mOpenness || !mGlow ||
-      !mExplode || !mParticle || !mFluid || !mFluidSeam || !mWaterBody ||
+      !mExplode || !mParticle || !mGas || !mFluid || !mFluidSeam || !mWaterBody ||
       !mRay || !mDebris ||
       !mMicroBody || !mDebugLines || !mDebugWind || !mDebugCur) {
     if (err) *err = "shader file read failure";
@@ -1311,6 +1448,12 @@ bool Simulation::BuildPipelines(const rhi::Device& device, std::string* err) {
   pool.Add([&] { compact_ = MakeComputePipeline(device, simPL_, mCompact, "main", "compact"); });
   pool.Add([&] { compactNext_ = MakeComputePipeline(device, simPL_, mCompact, "mainNext", "compactNext"); });
   pool.Add([&] { step_ = MakeComputePipeline(device, simPL_, mStep, "main", "step"); });
+  // Same module as the CA: the snapshot has to agree with the kernel that
+  // reads it about the bit layout, and one module is how that is enforced.
+  pool.Add([&] {
+    reposeSnap_ =
+        MakeComputePipeline(device, simPL_, mStep, "reposesnap", "reposeSnap");
+  });
   pool.Add([&] { occupancy_ = MakeComputePipeline(device, simPL_, mOcc, "main", "occupancy"); });
   pool.Add([&] { occupancyDirty_ = MakeComputePipeline(device, simPL_, mOcc, "mainDirty", "occupancyDirty"); });
   pool.Add([&] { opennessDirty_ = MakeComputePipeline(device, simPL_, mOpenness, "dirty", "opennessDirty"); });
@@ -1327,6 +1470,11 @@ bool Simulation::BuildPipelines(const rhi::Device& device, std::string* err) {
   pool.Add([&] { pIntegrate_ = MakeComputePipeline(device, simPL2_, mParticle, "integrate", "pIntegrate"); });
   pool.Add([&] { pArgs2_ = MakeComputePipeline(device, simPL2_, mParticle, "args2", "pArgs2"); });
   pool.Add([&] { pResolve_ = MakeComputePipeline(device, simPL2_, mParticle, "resolve", "pResolve"); });
+  pool.Add([&] { gArgs1_ = MakeComputePipeline(device, gasPL_, mGas, "gasArgs1", "gasArgs1"); });
+  pool.Add([&] { gSpawn_ = MakeComputePipeline(device, gasPL_, mGas, "gasSpawnStep", "gasSpawn"); });
+  pool.Add([&] { gIntegrate_ = MakeComputePipeline(device, gasPL_, mGas, "gasIntegrate", "gasIntegrate"); });
+  pool.Add([&] { gArgs2_ = MakeComputePipeline(device, gasPL_, mGas, "gasArgs2", "gasArgs2"); });
+  pool.Add([&] { gResolve_ = MakeComputePipeline(device, gasPL_, mGas, "gasResolve", "gasResolve"); });
 
   pool.Add([&] { fluidMark_ = MakeComputePipeline(device, fluidPL_, mFluid, "mark", "fluidMark"); });
   pool.Add([&] { fluidAlloc_ = MakeComputePipeline(device, fluidPL_, mFluid, "alloc", "fluidAlloc"); });
@@ -1395,65 +1543,25 @@ bool Simulation::BuildPipelines(const rhi::Device& device, std::string* err) {
   // DESIGN.md §9 both say the cascades are RENDER-ONLY DERIVED DATA with no
   // determinism attached, so the world can tick, hash and save without them;
   // all that is missing is the horizon. So they are built off the critical
-  // path and this function returns while they are still compiling.
+  // path (StartFarBuild) and this function returns while they are still
+  // compiling — or, under FarBuild::Lazy, before they have started: a run that
+  // never asks for cascade content never compiles them at all.
   //
-  // Everything the deferred thread touches is captured BY VALUE (the device,
-  // the layout, the module — all seam handles, all shared_ptr) so it names no
-  // Simulation member and cannot race this object. The result is published on
-  // the main thread by PollFarPipelines / WaitForFarPipelines.
-  //
+  // The previous build's far set is dropped here whichever policy applies.
+  // WaitForFarPipelines at the top of this function joined its thread, so
+  // nothing is compiling from the module these handles came from.
+  farFill_ = {};
+  farPatchFill_ = {};
+  farDown_ = {};
+  farPublished_ = false;
+  farStarted_ = false;
+  farReady_.store(false, std::memory_order_release);
+  farModule_ = mWorldgen;
+  farBuildThreads_ = buildThreads;
   // Serial under `--shader-stats` for the same reason the pool is: that mode
-  // exists to interrogate every pipeline the driver compiled this run.
-  {
-    const rhi::Device dev = device;
-    const rhi::PipelineLayout layout = farPL_;
-    const rhi::ShaderModule module = mWorldgen;
-    auto build = [dev, layout, module]() {
-      FarPipelines r;
-      // One thread per entry point: sequentially these are the sum, in
-      // parallel they are max(), which is the wall clock this whole package is
-      // bounded by. `farpatch` joined the set with package C's split of `far`
-      // into sweep + edit-patch — the split only pays if the halves compile
-      // CONCURRENTLY, so it gets a thread of its own like `fardown` did.
-      std::thread down([&] {
-        r.down = MakeComputePipeline(dev, layout, module, "fardown", "farDown");
-      });
-      std::thread patch([&] {
-        r.patch = MakeComputePipeline(dev, layout, module, "farpatch",
-                                      "farPatchFill");
-      });
-      r.fill = MakeComputePipeline(dev, layout, module, "far", "farFill");
-      patch.join();
-      down.join();
-      MarkFarReady();
-      // THE HORIZON'S ARRIVAL TIME, printed unconditionally. It is the number
-      // this whole package is measured by and there is no other record of it
-      // in a windowed run (build/last_run.json is a headless-mode artifact),
-      // so it must not be behind SANDVOX_SHADER_TIMING.
-      std::printf("far-cascade pipelines ready %.1f s after the first pipeline "
-                  "create (the game has been running since %.1f s)\n",
-                  FarReadyMs() / 1000.0, InteractiveReadyMs() / 1000.0);
-      std::fflush(stdout);
-      // The horizon's ISA is the single most expensive thing on this disk.
-      // Saved from this thread the moment it exists, for the same reason the
-      // two saves above exist: the next launch must not pay it again because
-      // this one was killed.
-      rhi::vkr::SavePipelineCache(dev);
-      return r;
-    };
-    if (buildThreads <= 1) {
-      FarPipelines r = build();
-      farFill_ = std::move(r.fill);
-      farPatchFill_ = std::move(r.patch);
-      farDown_ = std::move(r.down);
-      farPublished_ = true;
-      farReady_.store(true, std::memory_order_release);
-    } else {
-      farFuture_ = std::async(std::launch::async, build);
-      farPublished_ = false;
-      farReady_.store(false, std::memory_order_release);
-    }
-  }
+  // exists to interrogate every pipeline the driver compiled this run — so it
+  // is also never lazy.
+  if (farBuild_ == FarBuild::Eager || buildThreads <= 1) StartFarBuild(buildThreads);
   MarkInteractiveReady();
 
   // A backend that fails pipeline creation returns an INVALID handle (Vulkan:
@@ -1468,7 +1576,9 @@ bool Simulation::BuildPipelines(const rhi::Device& device, std::string* err) {
   if (!worldgen_ || !worldgenList_ || !pageFill_ || !mutate_ ||
       !mutateCells_ || !windWake_ || !compact_ || !compactNext_ || !step_ || !occupancy_ ||
       !occupancyDirty_ || !pick_ || !explodeMark_ || !explodeApply_ || !pArgs1_ ||
-      !pSpawn_ || !pIntegrate_ || !pArgs2_ || !pResolve_ || !fluidSpawn_ ||
+      !pSpawn_ || !pIntegrate_ || !pArgs2_ || !pResolve_ ||
+      !gArgs1_ || !gSpawn_ || !gIntegrate_ || !gArgs2_ || !gResolve_ ||
+      !fluidSpawn_ ||
       !fluidMark_ || !fluidAlloc_ || !fluidClear_ || !fluidP2g_ ||
       !fluidP2g2_ || !fluidGridUp_ || !fluidG2p_ || !fluidCompactCount_ ||
       !fluidCompactScan_ || !fluidCompactScatter_ || !fluidExciteDetect_ ||
@@ -1491,6 +1601,7 @@ bool Simulation::BuildPipelines(const rhi::Device& device, std::string* err) {
   // until that pool has joined.
   BuildRaymarchVariant(device, mRay);
   taaModule_ = mTaa;
+  dnModule_ = mDenoise;
   debrisModule_ = mDebris;
   microBodyModule_ = mMicroBody;
   debugLineModule_ = mDebugLines;
@@ -1507,6 +1618,78 @@ bool Simulation::BuildPipelines(const rhi::Device& device, std::string* err) {
 // need no synchronization: a row either sees the pre-publish INVALID handle
 // and is skipped, or sees the published one. `farReady_` is the release/
 // acquire edge that makes the second case's handle fully constructed.
+
+void Simulation::StartFarBuild(unsigned threads) {
+  if (farStarted_ || !farModule_) return;
+  farStarted_ = true;
+  // Everything the compile thread touches is captured BY VALUE (the device,
+  // the layout, the module — all seam handles, all shared_ptr) so it names no
+  // Simulation member and cannot race this object. The result is published on
+  // the main thread by PollFarPipelines / WaitForFarPipelines.
+  const rhi::Device dev = device_;
+  const rhi::PipelineLayout layout = farPL_;
+  const rhi::ShaderModule module = farModule_;
+  auto build = [dev, layout, module]() {
+    FarPipelines r;
+    // One thread per entry point: sequentially these are the sum, in
+    // parallel they are max(), which is the wall clock this whole package is
+    // bounded by. `farpatch` joined the set with package C's split of `far`
+    // into sweep + edit-patch — the split only pays if the halves compile
+    // CONCURRENTLY, so it gets a thread of its own like `fardown` did.
+    std::thread down([&] {
+      r.down = MakeComputePipeline(dev, layout, module, "fardown", "farDown");
+    });
+    std::thread patch([&] {
+      r.patch = MakeComputePipeline(dev, layout, module, "farpatch",
+                                    "farPatchFill");
+    });
+    r.fill = MakeComputePipeline(dev, layout, module, "far", "farFill");
+    patch.join();
+    down.join();
+    // SANDVOX_FAR_DELAY_S: hold the horizon back by N seconds. The cascades'
+    // arrival is a several-second transient the game has to survive — the
+    // frame loop holds FarField's queue for the whole of it
+    // (Simulation::FarFillsDeferred) so the fog and the valid box do not
+    // claim a horizon that does not exist yet — and the only way to reach
+    // that state honestly was a cold SPIR-V cache, i.e. a ~12 minute driver
+    // compile of `far`. One env var makes it a normal run, which is the
+    // difference between a path that is tested and one that is argued about.
+    if (const char* d = std::getenv("SANDVOX_FAR_DELAY_S")) {
+      const double secs = std::atof(d);
+      if (secs > 0.0) {
+        std::printf("far-cascade pipelines: holding %.1f s "
+                    "(SANDVOX_FAR_DELAY_S)\n", secs);
+        std::fflush(stdout);
+        std::this_thread::sleep_for(std::chrono::duration<double>(secs));
+      }
+    }
+    MarkFarReady();
+    // THE HORIZON'S ARRIVAL TIME, printed unconditionally. It is the number
+    // this whole package is measured by and there is no other record of it
+    // in a windowed run (build/last_run.json is a headless-mode artifact),
+    // so it must not be behind SANDVOX_SHADER_TIMING.
+    std::printf("far-cascade pipelines ready %.1f s after the first pipeline "
+                "create (the game has been running since %.1f s)\n",
+                FarReadyMs() / 1000.0, InteractiveReadyMs() / 1000.0);
+    std::fflush(stdout);
+    // The horizon's ISA is the single most expensive thing on this disk.
+    // Saved from this thread the moment it exists, for the same reason the
+    // two saves in BuildPipelines exist: the next launch must not pay it
+    // again because this one was killed.
+    rhi::vkr::SavePipelineCache(dev);
+    return r;
+  };
+  if (threads <= 1) {
+    FarPipelines r = build();
+    farFill_ = std::move(r.fill);
+    farPatchFill_ = std::move(r.patch);
+    farDown_ = std::move(r.down);
+    farPublished_ = true;
+    farReady_.store(true, std::memory_order_release);
+  } else {
+    farFuture_ = std::async(std::launch::async, build);
+  }
+}
 
 void Simulation::PublishFarPipelines() {
   FarPipelines r = farFuture_.get();  // blocks if the thread is still running
@@ -1615,6 +1798,10 @@ struct RecordCtx {
   // vk_record.h's field; defaults TRUE so the CA records unless proven idle.
   bool caActive = true;
   bool vizActive = false;
+  // Gas particles (docs/PLAN_gas_particles.md). See the latch in EncodeTick.
+  bool gasActive = false;
+  // Angle of repose (world.h kReposeSnap*). See the latch in EncodeTick.
+  bool reposeActive = false;
 };
 
 // NOTE: the condition and dispatch-extent resolvers that used to live here
@@ -1691,6 +1878,7 @@ const rhi::Buffer& Simulation::PassBuffer(pass::Buf b) const {
     case B::ActVoxViz:           return world_->actVoxViz;
     case B::ShadowCache:         return world_->shadowCache;
     case B::ShadowReq:           return world_->shadowReq;
+    case B::ShadowHist:          return world_->shadowHist;
     case B::ShadowArgsStage:     return world_->shadowArgsStage;
     case B::ShadowArgs:          return world_->shadowArgs;
     case B::Openness:            return world_->openness;
@@ -1701,6 +1889,16 @@ const rhi::Buffer& Simulation::PassBuffer(pass::Buf b) const {
     case B::WaterBodyState:      return world_->waterBodyState;
     case B::TreeAtlas:           return treeAtlasBuf_;
     case B::WorldMap:            return worldMapBuf_;
+    case B::GasParticlesRead:    return world_->gasParticles[page_];
+    case B::GasParticlesWrite:   return world_->gasParticles[1 - page_];
+    case B::GasCounts:           return world_->gasCounts;
+    case B::GasClaim:            return world_->gasClaim;
+    case B::GasSpawn:            return world_->gasSpawn;
+    case B::GasSpawnOps:         return world_->gasSpawnOps;
+    case B::GasArgsStage:        return world_->gasArgs;
+    case B::GasDispatchArgs:     return world_->gasDispatchArgs;
+    case B::GasOuter:            return world_->gasOuter;
+    case B::ReposeSnap:          return world_->reposeSnap;
     default:                return world_->voxels;
   }
 }
@@ -1717,11 +1915,17 @@ const rhi::ComputePipeline& Simulation::PassPipeline(pass::Pipe p) const {
     case P::Compact:        return compact_;
     case P::CompactNext:    return compactNext_;
     case P::Step:           return step_;
+    case P::ReposeSnap:     return reposeSnap_;
     case P::Occupancy:      return occupancy_;
     case P::OccupancyDirty: return occupancyDirty_;
     case P::Pick:           return pick_;
     case P::ExplodeMark:    return explodeMark_;
     case P::ExplodeApply:   return explodeApply_;
+    case P::GasArgs1:       return gArgs1_;
+    case P::GasSpawnP:      return gSpawn_;
+    case P::GasIntegrate:   return gIntegrate_;
+    case P::GasArgs2:       return gArgs2_;
+    case P::GasResolve:     return gResolve_;
     case P::PArgs1:         return pArgs1_;
     case P::PSpawn:         return pSpawn_;
     case P::PIntegrate:     return pIntegrate_;
@@ -1816,6 +2020,8 @@ void Simulation::RecordTable(const rhi::CommandEncoder& enc, pass::Table which,
   tc.denseWorldgen = cx.denseWorldgen;
   tc.caActive = cx.caActive;
   tc.vizActive = cx.vizActive;
+  tc.gasActive = cx.gasActive;
+  tc.reposeActive = cx.reposeActive;
 
   rhi::TableBindings tb{};
   for (int i = 0; i < (int)pass::Buf::kCount; i++)
@@ -1830,6 +2036,7 @@ void Simulation::RecordTable(const rhi::CommandEncoder& enc, pass::Table which,
   tb.slimFarLayout = farPL_;
   tb.slimFluidLayout = fluidPL_;
   tb.slimFluidSeamLayout = fluidSeamPL_;
+  tb.slimGasLayout = gasPL_;
   tb.shadowLayout = shadowPL_;
   tb.simSet = simBG_[page_];
   tb.slimSet = simSlimBG_[page_];
@@ -1837,6 +2044,7 @@ void Simulation::RecordTable(const rhi::CommandEncoder& enc, pass::Table which,
   tb.farSet = farBG_;
   tb.fluidSet = fluidBG_[page_];
   tb.fluidSeamSet = fluidSeamBG_[page_];
+  tb.gasSet = gasBG_[page_];
   tb.shadowSet = shadowBG_;
 
   rhi::RecordTableVulkan(enc, which, tc, tb,
@@ -1926,7 +2134,7 @@ void Simulation::EncodeWakeAll(const rhi::Queue& queue) {
   // dirty[page_] is the buffer the NEXT compact pass reads (dirtyIn). One u32
   // flag per chunk; 32768 chunks = 128 KB, far inside the ~1 MB/tick CPU->GPU
   // budget, and only written on a phase boundary.
-  static const std::vector<uint32_t> ones(kNumChunks, 1u);
+  static const std::vector<uint32_t> ones(kNumSlots, 1u);
   queue.WriteBuffer(world_->dirty[page_], 0, ones.data(),
                     ones.size() * sizeof(uint32_t));
 
@@ -2079,7 +2287,22 @@ void Simulation::NoteSnapshot(uint32_t snapTick, uint32_t activeChunks,
   // the safe direction, and it is bounded in practice: the counts are zeroed
   // per tick while the particle pipeline runs, so the population genuinely
   // reaches 0 a couple of ticks after the last particle dies and stays there.
-  if (activeChunks != 0 || particleCount != 0) {
+  //
+  // GAS PARCELS COUNT HERE TOO, and the omission was a real hole rather than a
+  // tidiness point. A parcel outside the residency window is a GPU-side dirty
+  // writer with no CPU-known target in exactly the sense fact (3) describes:
+  // `gasResolve` can land it as a voxel through the claim path and dirty that
+  // chunk, on a tick the CPU had proved settled. The landing is not LOST — the
+  // gas rows are recorded under their own condition and the mark reaches
+  // dirtyOut — but the chunk would then be simulated a tick or two late,
+  // whenever the snapshot ring got around to reporting it, and "how late"
+  // depends on readback scheduling. That is a scheduling-dependent outcome
+  // (rule 1), and it is the same argument that put `particleCount` in this
+  // conjunct in the first place.
+  //
+  // `gasLive_` is the snapshot's parcel count, so it is stale in the same
+  // bounded way `particleCount` is, and staleness can only COST a skip.
+  if (activeChunks != 0 || particleCount != 0 || gasLive_ != 0) {
     settledProven_ = false;
     return;
   }
@@ -2176,9 +2399,15 @@ void Simulation::EncodeTick(const rhi::CommandEncoder& enc, uint32_t opsCount,
   // settled world with a fan pointed at a dune would otherwise prove itself
   // idle and skip the CA rows the wake had just made necessary — the fan would
   // mark chunks nothing then simulated.
+  // gasSpawnsThisTick_ is in the disjunction for windWakeCount's reason: a
+  // CPU-authored gas parcel IS a chunk-dirtying input, because it can re-enter
+  // the window and land as a voxel. gasLeave conversions are deliberately NOT
+  // here and do not need to be — a voxel can only reach the edge on a tick the
+  // CA ran, and the CA running already means this world was not proved idle.
   const bool inputsThisTick = opsCount > 0 || expCount > 0 || cellCount > 0 ||
                               spawnCount > 0 || windWakeCount > 0 ||
-                              fluidCount > 0 || fluidSpawnCount > 0;
+                              fluidCount > 0 || fluidSpawnCount > 0 ||
+                              gasSpawnsThisTick_ > 0;
   if (inputsThisTick) {
     lastDirtyTick_ = curTick_;
     settledProven_ = false;
@@ -2198,6 +2427,61 @@ void Simulation::EncodeTick(const rhi::CommandEncoder& enc, uint32_t opsCount,
   }
   caSkipped_ = !cx.caActive;
   if (caSkipped_) caSkipCount_++;
+
+  // ---- C_GAS: a LATCH, not a live count ----------------------------------
+  // A gas parcel can only be CREATED on a tick the CA runs (sim_step's
+  // gasLeave) or one the CPU queued spawns on, so those two are the arming
+  // conditions. The disarming one cannot be either of them: parcels persist
+  // for ~111 ticks after the fire that made them goes out, and the only count
+  // of them is `gasLive_`, which arrives on the snapshot ring several ticks
+  // late. Turning the rows off on a stale zero would freeze a plume in the sky
+  // permanently — and it would stay frozen, because the pass that would have
+  // stepped it is the one that is not recorded.
+  //
+  // So: arm on either creator, hold for kGasIdleTicks past the last one (long
+  // enough for the ring to speak), and let a snapshot that says parcels are
+  // alive keep it armed indefinitely. When the plume really is gone the count
+  // reaches zero, the latch runs out, and not one gas row is recorded — which
+  // is the rule-2 claim this whole condition exists to make.
+  if (cx.caActive || gasSpawnsThisTick_ > 0) {
+    gasIdleTicks_ = 0;
+  } else if (gasIdleTicks_ < kGasIdleTicks) {
+    gasIdleTicks_++;
+  }
+  // sim.gasMode 0 is an EXACT off switch, not a cheap path: no gas row is
+  // recorded at all, so the buffers are never cleared, the passes never
+  // dispatch, and the only remaining gas code in the build is a branch in the
+  // CA that tests this same value. Read from CurrentTuning() here rather than
+  // passed in, for the openness/glow budgets' reason — it is a KNOB, not a
+  // count of this tick's work, and every caller of EncodeTick would otherwise
+  // have to forward a value none of them owns.
+  const bool gasOn = CurrentTuning().sim.gasMode != (int)kGasModeWall;
+  cx.gasActive = gasOn && (cx.caActive || gasSpawnsThisTick_ > 0 ||
+                           gasLive_ > 0 || gasIdleTicks_ < kGasIdleTicks);
+  gasSpawnsThisTick_ = 0;
+
+  // ---- the repose snapshot prepass ----------------------------------------
+  // `anyRepose_` is a property of the MATERIAL TABLE, latched in UploadTables,
+  // so a world whose materials.json carries no `repose` line never records the
+  // row and never touches the 16 MiB snapshot. Folded with caActive because the
+  // snapshot exists only to be read by the CA rows behind it: on a tick the CA
+  // skips there is nothing to serve.
+  cx.reposeActive = anyRepose_ && cx.caActive;
+
+  // ---- THE RENDER FLAG, which is a DIFFERENT question ---------------------
+  // cx.gasActive above answers "must the gas PASSES run", and it is true
+  // whenever the CA is, because a gas parcel can be created on any tick a
+  // voxel reaches a face. That is the right answer for the sim and the wrong
+  // one for the renderer: it would put the crossfade's band sampling on every
+  // terrain pixel of every frame in any world with a running CA, including
+  // every world that has never had a fire in it.
+  //
+  // So this one asks "is there gas ANYWHERE" -- parcels or in-window voxels --
+  // and holds for kGasSeenTicks past the last snapshot that saw either. When
+  // the plume is really gone the flag drops and raymarch.wgsl skips the fade,
+  // the band and the fold entirely. See renderspec.h.
+  if (gasSeenHold_ > 0) gasSeenHold_--;
+  sandvox::SetGasRenderActive(gasOn && gasSeenHold_ > 0);
 
   RecordTable(enc, pass::Table::Tick, &cx);
 
@@ -2300,6 +2584,17 @@ struct TaaParamsGpu {
 static_assert(sizeof(TaaParamsGpu) == 160,
               "TaaParamsGpu must match TaaParams in taa.wgsl");
 static_assert(sizeof(TaaParamsGpu) % 16 == 0, "uniform must be 16-byte sized");
+
+// Mirrored by hand against `struct DenoiseParams` in denoise.wgsl, same rules.
+struct DenoiseParamsGpu {
+  uint32_t width, height, pitch, flags;
+  int32_t step;
+  uint32_t iter, iters, pad0;
+  float fpx, pxFull, pxStart, depthTol;
+  float chromaTol, strength, pad1, pad2;
+};
+static_assert(sizeof(DenoiseParamsGpu) == 64,
+              "DenoiseParamsGpu must match DenoiseParams in denoise.wgsl");
 }  // namespace
 
 // The R2 sequence (Roberts 2018): the 2D generalisation of the golden ratio,
@@ -2470,6 +2765,134 @@ void Simulation::DrawTaa(const rhi::RenderPass& pass) {
   pass.Draw(3);
 }
 
+// ===========================================================================
+// The shading-LOD filter (assets/shaders/denoise.wgsl)
+// ===========================================================================
+//
+// The chain, per frame, recorded after the world pass has ended and before
+// anything consumes the world texture:
+//
+//   copy   world depth   -> dnDepth_        (transfer write, once)
+//   copy   world colour  -> dnColor_        (transfer write)
+//   pass 0 reads dnColor_/dnDepth_, renders into the world texture (Clear)
+//   copy   world colour  -> dnColor_        (WAR against pass 0's read)
+//   pass 1 ... and so on, up to dnIters_.
+//
+// EVERY barrier in it is derived by the recorder from state it already tracks:
+// CopyImageToBuffer routes its destination through TouchExtra (so the second
+// copy WARs against the previous pass's fragment read, which
+// FlushForRenderDomain recorded), and TransitionImage carries the texture
+// attachment-write -> transfer-read -> attachment-write. There is no
+// hand-written barrier here and there must not be. The IN-PLACE render is the
+// case the TAA gate's 1:1 arm already relies on: the pass reads only the
+// buffer the copy landed, never the image it draws into.
+void Simulation::EnsureDenoise(uint32_t width, uint32_t height) {
+  if (width == 0 || height == 0 || !dnBGL_) return;
+  if (dnW_ == width && dnH_ == height && dnBG_[0]) return;
+  using U = rhi::BufferUsage;
+  dnW_ = width;
+  dnH_ = height;
+  // 4 bytes per texel each: one 8:8:8:8 unorm word of colour, one f32 of
+  // depth. No row padding (Vulkan's bufferRowLength is in texels).
+  const uint64_t bytes = (uint64_t)width * height * 4;
+  dnColor_ = CreateBuffer(device_, bytes, U::Storage | U::CopyDst, "denoiseColor");
+  dnDepth_ = CreateBuffer(device_, bytes, U::Storage | U::CopyDst, "denoiseDepth");
+  for (uint32_t i = 0; i < kDenoiseMaxIters; i++) {
+    if (!dnUBO_[i])
+      dnUBO_[i] = CreateBuffer(device_, sizeof(DenoiseParamsGpu),
+                               U::Uniform | U::CopyDst, "denoiseUBO");
+  }
+  dnDepthTex_ = device_.CreateTexture({width, height, 1}, kDepthFormat,
+                                      rhi::TextureUsage::RenderAttachment,
+                                      "depthDenoise");
+  dnDepthView_ = dnDepthTex_.CreateView();
+  auto b = [](uint32_t binding, const rhi::Buffer& buf) {
+    rhi::BindGroupEntry e{};
+    e.binding = binding;
+    e.buffer = buf;
+    return e;
+  };
+  for (uint32_t i = 0; i < kDenoiseMaxIters; i++) {
+    rhi::BindGroupEntry entries[] = {b(0, dnUBO_[i]), b(1, dnColor_),
+                                     b(2, dnDepth_)};
+    dnBG_[i] = device_.CreateBindGroup(dnBGL_, entries, std::size(entries),
+                                       "denoiseBG");
+  }
+}
+
+void Simulation::WriteDenoiseParams(const rhi::Queue& queue, uint32_t width,
+                                    uint32_t height, float tanHalfFov,
+                                    bool bgraSource) {
+  const Tuning::Render& r = CurrentTuning().render;
+  dnIters_ = 0;
+  if (r.denoise == 0 || !dnUBO_[0] || width == 0 || height == 0) return;
+  dnIters_ = (uint32_t)std::clamp(r.denoiseIters, 0, (int)kDenoiseMaxIters);
+  for (uint32_t i = 0; i < dnIters_; i++) {
+    DenoiseParamsGpu p{};
+    p.width = width;
+    p.height = height;
+    p.pitch = width;
+    p.flags = bgraSource ? 1u : 0u;
+    p.step = 1 << i;   // a-trous: 1, 2, 4, 8
+    p.iter = i;
+    p.iters = dnIters_;
+    // Pixels per unit of depth at unit distance: a fine voxel at viewZ z
+    // (voxels) covers fpx / z pixels.
+    p.fpx = (float)height * 0.5f / std::max(tanHalfFov, 1e-4f);
+    p.pxFull = r.denoisePxFull;
+    // smoothstep's edges must be ordered; LoadTuning clamps but a hot reload
+    // can hand over anything.
+    p.pxStart = std::max(r.denoisePxStart, r.denoisePxFull + 0.01f);
+    p.depthTol = r.denoiseDepthTol;
+    p.chromaTol = r.denoiseChromaTol;
+    p.strength = r.denoiseStrength;
+    queue.WriteBuffer(dnUBO_[i], 0, &p, sizeof p);
+  }
+}
+
+void Simulation::EncodeDenoise(const rhi::CommandEncoder& enc,
+                               const rhi::Texture& tex,
+                               const rhi::TextureView& view,
+                               rhi::TextureFormat format, uint32_t width,
+                               uint32_t height) {
+  (void)format;
+  if (!denoiseAvailable_ || !dnPipe_ || dnIters_ == 0) return;
+  if (!tex || !view || !depthTex_ || !dnBG_[0]) return;
+  // The world depth is the one the world pass just wrote; a size mismatch
+  // means the caller sized the filter for a different frame.
+  if (dnW_ != width || dnH_ != height || depthW_ != width || depthH_ != height)
+    return;
+  rhi::TexelCopyTexture src{};
+  rhi::TexelCopyBuffer dst{};
+  rhi::Extent3D ext{width, height, 1};
+  dst.bytesPerRow = width * 4;
+  dst.rowsPerImage = height;
+  src.texture = depthTex_;
+  dst.buffer = dnDepth_;
+  enc.CopyTextureToBuffer(src, dst, ext);
+  for (uint32_t i = 0; i < dnIters_; i++) {
+    src.texture = tex;
+    dst.buffer = dnColor_;
+    enc.CopyTextureToBuffer(src, dst, ext);
+    rhi::RenderPassDesc d{};
+    d.label = "denoise";
+    d.color.view = view;
+    // CLEAR, not Load: the pass writes every pixel from the buffer copy.
+    d.color.loadOp = rhi::LoadOp::Clear;
+    d.color.storeOp = rhi::StoreOp::Store;
+    d.hasDepth = true;
+    d.depth.view = dnDepthView_;
+    d.depth.loadOp = rhi::LoadOp::Clear;
+    d.depth.storeOp = rhi::StoreOp::Discard;
+    d.depth.clearValue = 0.0f;
+    rhi::RenderPass rp = enc.BeginRenderPass(d);
+    rp.SetPipeline(dnPipe_);
+    rp.SetBindGroup(0, dnBG_[i]);
+    rp.Draw(3);
+    rp.End();
+  }
+}
+
 // STILL SERIAL, deliberately (docs/PLAN_shader_compile.md package A audited
 // it). The compute build fans out because its 50 calls are independent
 // one-liners; this function builds nine pipelines by MUTATING one shared
@@ -2554,6 +2977,27 @@ void Simulation::EnsureRenderPipelines(rhi::TextureFormat format) {
     d.fragmentEntry = "fsBody";
     d.label = "bodyDraw";
     pool.Add([this, d] { bodyDraw_ = device_.CreateRenderPipeline(d); });
+    // Its depth pre-pass (debris.wgsl vsBodyDepth): same layout, same depth
+    // state (write, GreaterEqual), and a (Zero, One) blend so the colour target
+    // is untouched — the RHI has no colour write mask, and a fragment stage is
+    // required. DrawBodies draws through this first so fsBody's shadow ray
+    // runs once per pixel instead of once per overdrawn fragment.
+    {
+      rhi::RenderPipelineDesc dz = d;
+      dz.vertexEntry = "vsBodyDepth";
+      dz.fragmentEntry = "fsBodyDepth";
+      dz.label = "bodyDepth";
+      static const rhi::BlendState keepColor = [] {
+        rhi::BlendState b{};
+        b.color.srcFactor = rhi::BlendFactor::Zero;
+        b.color.dstFactor = rhi::BlendFactor::One;
+        b.alpha.srcFactor = rhi::BlendFactor::Zero;
+        b.alpha.dstFactor = rhi::BlendFactor::One;
+        return b;
+      }();
+      dz.blend = &keepColor;
+      pool.Add([this, dz] { bodyDepth_ = device_.CreateRenderPipeline(dz); });
+    }
     d.fragmentEntry = "fs";  // restore for the pipelines that follow
 
     // MLS-MPM fluid prototype: same module, same layout, own entry point.
@@ -2682,6 +3126,29 @@ void Simulation::EnsureRenderPipelines(rhi::TextureFormat format) {
     d.depth = dsIgnore;
     pool.Add([this, d] { taaResolve_ = device_.CreateRenderPipeline(d); });
   }
+  // The shading-LOD filter: a fullscreen pass at RENDER resolution, in place
+  // over the world frame. Its depth attachment is its own (EnsureDenoise) —
+  // the pass runs at render size, which is neither the world depth (still
+  // holding the depth the filter reads) nor the overlay's native size.
+  if (dnModule_) {
+    rhi::DepthState dsIgnore{};
+    dsIgnore.format = kDepthFormat;
+    dsIgnore.depthWriteEnabled = false;
+    dsIgnore.depthCompare = rhi::CompareFunction::Always;
+
+    rhi::RenderPipelineDesc d{};
+    d.label = "denoise";
+    d.layout = dnPL_;
+    d.vertexModule = dnModule_;
+    d.vertexEntry = "vs";
+    d.fragmentModule = dnModule_;
+    d.fragmentEntry = "fs";
+    d.colorFormat = format;
+    d.topology = rhi::PrimitiveTopology::TriangleList;
+    d.cullMode = rhi::CullMode::None;
+    d.depth = dsIgnore;
+    pool.Add([this, d] { dnPipe_ = device_.CreateRenderPipeline(d); });
+  }
   pool.Run(buildThreads);
 
   // ---- deferred: the SPECIALIZED raymarch (W2-A) --------------------------
@@ -2733,6 +3200,9 @@ void Simulation::EnsureRenderPipelines(rhi::TextureFormat format) {
   // fragment-stage write), and the pipeline must actually have compiled. A
   // machine that fails either renders the plain NEAREST blit and says nothing.
   taaAvailable_ = FragmentStoresAvailable() && (bool)taaResolve_;
+  // No fragment-store requirement: the filter only reads storage and writes
+  // its attachment. A shader that failed to compile leaves it off.
+  denoiseAvailable_ = (bool)dnPipe_;
   std::fprintf(stderr, "[startup] render pipelines built in %.2f s\n",
                std::chrono::duration<double>(std::chrono::steady_clock::now() -
                                              tRp0).count());
@@ -2890,9 +3360,14 @@ void Simulation::DrawCurrentField(const rhi::RenderPass& pass,
 
 void Simulation::DrawBodies(const rhi::RenderPass& pass, uint32_t voxInstances) {
   if (voxInstances == 0) return;
-  pass.SetPipeline(bodyDraw_);
   pass.SetBindGroup(0, renderBG_);
   pass.SetBindGroup(1, renderPartBG_[page_]);
+  // Depth first, then colour: the second draw's fragments pass GreaterEqual
+  // only where they are the nearest body surface, so fsBody's per-fragment
+  // shadow ray is cast once per pixel (debris.wgsl, THE DEPTH PRE-PASS).
+  pass.SetPipeline(bodyDepth_);
+  pass.Draw(36, voxInstances);
+  pass.SetPipeline(bodyDraw_);
   pass.Draw(36, voxInstances);
 }
 

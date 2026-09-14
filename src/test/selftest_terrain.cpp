@@ -489,7 +489,7 @@ PassAOut PassA(World& world, uint32_t seed, std::string* log) {
 // reports 73 false divergences on stock HEAD.
 int PassB(World& world, uint32_t seed, int slackAbove, std::string* worst) {
   const WorldSnapshot& snap = world.Snap();
-  if (!snap.valid || snap.occupancy.size() < kNumChunks) {
+  if (!snap.valid || snap.occupancy.size() < kNumSlots) {
     if (worst) *worst = "no snapshot";
     return -1;
   }
@@ -839,16 +839,16 @@ Status GateTerrain(Ctx& c, std::string& detail) {
     // there name the feature in one line. `ca-skip` needs this number to be
     // ZERO (its skip latch waits for an empty dirty set), so a "small" residue
     // here is a gate failure sixty lines of output away.
-    std::vector<uint32_t> flags(kNumChunks, 0);
+    std::vector<uint32_t> flags(kNumSlots, 0);
     rhi::ReadbackBlocking(ctx.device, ctx.queue, sim.DirtyActive(), 0,
-                          flags.data(), kNumChunks * 4, "terrainActive");
+                          flags.data(), kNumSlots * 4, "terrainActive");
     const IVec3 org = world.WindowOrigin();
     // Report the SHALLOWEST awake chunks, not the first six in slot order.
     // Slot order is lz-major, so "the first six" is a scan line through the
     // window and says nothing; the chunks worth naming are the ones nearest the
     // surface, because that is where every worldgen fill rule puts matter.
     std::vector<std::pair<int, uint32_t>> awakeByDepth;
-    for (uint32_t i = 0; i < kNumChunks; i++) {
+    for (uint32_t i = 0; i < kNumSlots; i++) {
       if (flags[i] == 0) continue;
       const IVec3 wc = world.SlotToWorldChunk(i);
       const int gh = World::TerrainHeight(wc.x * (int)kChunk + 8,
@@ -856,7 +856,7 @@ Status GateTerrain(Ctx& c, std::string& detail) {
       awakeByDepth.push_back({std::abs((gh >> 4) - wc.y), i});
     }
     std::sort(awakeByDepth.begin(), awakeByDepth.end());
-    std::vector<uint8_t> pick(kNumChunks, 0);
+    std::vector<uint8_t> pick(kNumSlots, 0);
     for (size_t k = 0; k < awakeByDepth.size() && k < 6; k++)
       pick[awakeByDepth[k].second] = 1;
     int deepest = awakeByDepth.empty() ? 0 : awakeByDepth.back().first;
@@ -867,7 +867,7 @@ Status GateTerrain(Ctx& c, std::string& detail) {
     // wastes the most time when it is not visible. Buckets are relative to the
     // ground: at or above it, the first chunk under it, and deeper.
     int atSurface = 0, justUnder = 0, buried = 0, aloft = 0;
-    for (uint32_t i = 0; i < kNumChunks; i++) {
+    for (uint32_t i = 0; i < kNumSlots; i++) {
       if (flags[i] == 0) continue;
       awake++;
       const int lx = (int)(i % kNChunk);

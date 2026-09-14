@@ -42,7 +42,7 @@ const PT_KERNEL : u32 = PT_K_EXPLODE;
 
 const FALLOFF_PER_CELL : i32 = TUNE_FALLOFF_PER_CELL;   // power lost per cell of distance (in air)
 
-fn inBounds(c : vec3<i32>) -> bool { return inWindow(c, T.origin); }
+fn inBounds(c : vec3<i32>) -> bool { return cellResident(c, T.origin); }
 
 fn hardnessAt(c : vec3<i32>) -> i32 {
   if (!inBounds(c)) { return 100000; }  // residency edge absorbs everything

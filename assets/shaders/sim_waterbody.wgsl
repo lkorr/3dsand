@@ -263,10 +263,7 @@ fn wbComp(flags : i32) -> u32 {
 // as many words, and the reason a body's chunk list is slots while every test
 // below is in world cells.
 fn wbSlotWorldChunk(slot : u32) -> vec3<i32> {
-  let sc = vec3<i32>(i32(slot % NCHUNK),
-                     i32((slot / NCHUNK) % NCHUNK),
-                     i32(slot / (NCHUNK * NCHUNK)));
-  return slotToWorldChunk(sc, T.origin);
+  return slotWorldChunk(slot, T.origin);
 }
 
 // Next-tick dirty mark including boundary neighbours — the seam's convention,
@@ -291,8 +288,9 @@ fn wbMarkDirty(c : vec3<i32>) {
     for (var j = 0; j < 2; j++) {
       for (var k = 0; k < 2; k++) {
         let n = ch + vec3<i32>(xs[i], ys[j], zs[k]);
-        if (chunkInWindow(n, T.origin)) {
-          atomicOr(&dirtyOut[chunkSlotIndex(n)], DIRTY_R_WATERBODY);
+        let ns = chunkSlotOf(n, T.origin);
+        if (ns != SLOT_NONE) {
+          atomicOr(&dirtyOut[ns], DIRTY_R_WATERBODY);
         }
       }
     }
@@ -548,6 +546,8 @@ fn wbLedger(@builtin(global_invocation_id) gid : vec3<u32>) {
     wbSet(b, WBS_RVTAKEN, 0);
     wbSet(b, WBS_RVCREDIT, 0);
     wbSet(b, WBS_RVCAPPED, 0);
+    wbSet(b, WBS_RVGIVENT, 0);
+    wbSet(b, WBS_RVTAKENT, 0);
     // The measure runs LATER THIS TICK and needs a base; the ledger will not
     // run again before it does. Same single evaluation as the tail below.
     wbSet(b, WBS_RVBASE,
@@ -783,10 +783,21 @@ fn wbLedger(@builtin(global_invocation_id) gid : vec3<u32>) {
   // moved surface cells under it, so a take can outrun its gives by a bounded
   // amount on one tick. `credit` is the record of that, and it may go negative:
   // water borrowed from the body against next tick's gives, not water invented.
-  var credit = wbGet(b, WBS_RVCREDIT) + wbGet(b, WBS_RVGIVEN) -
-               wbGet(b, WBS_RVTAKEN);
+  let rvGaveLast = wbGet(b, WBS_RVGIVEN);
+  let rvTookLast = wbGet(b, WBS_RVTAKEN);
+  var credit = wbGet(b, WBS_RVCREDIT) + rvGaveLast - rvTookLast;
   wbSet(b, WBS_RVGIVEN, 0);
   wbSet(b, WBS_RVTAKEN, 0);
+  // The CUMULATIVE half of the same report, for the gate and for nothing else.
+  // Written here because this is the one pass that reads the per-tick words
+  // before clearing them; a reader that only ever sees the per-tick pair cannot
+  // tell a relevel that did nothing from a relevel that finished.
+  if (rvGaveLast != 0) {
+    wbSet(b, WBS_RVGIVENT, wbGet(b, WBS_RVGIVENT) + rvGaveLast);
+  }
+  if (rvTookLast != 0) {
+    wbSet(b, WBS_RVTAKENT, wbGet(b, WBS_RVTAKENT) + rvTookLast);
+  }
 
   let rvCount = wbGet(b, WBS_RVCOUNT);
   let rvSum = wbGet(b, WBS_RVSUM);
@@ -1200,10 +1211,6 @@ fn wbSurface(@builtin(workgroup_id) wg : vec3<u32>,
   let level = wbGet(b, WBS_LEVEL);
   let wc = wbSlotWorldChunk(slot);
   if (!wbColumnLayer(wc.y, level)) { return; }
-  // A chunk the solver has a block in is not a chunk with a free surface: its
-  // cells are mid-transfer and reading their fullness as a lake height would
-  // freeze a transient into the mean (plan §3.8's MPM row).
-  if (fluidBlockMapS[slot] != 0u) { return; }
 
   let g = wbGeom(b);
   let seed = wbSeed(b);
@@ -1220,6 +1227,19 @@ fn wbSurface(@builtin(workgroup_id) wg : vec3<u32>,
   let s = wbColumnSurface(x, z, g.w, level + 1, wbBandFloor(level, seed.x),
                           &sy, &sfull, &sw);
   if (s == WB_RV_NOTAKE) { return; }
+  // A chunk the solver has a block in is not a chunk with a free surface: its
+  // cells are mid-transfer and reading their fullness as a lake height would
+  // freeze a transient into the mean (plan §3.8's MPM row).
+  //
+  // ASKED OF THE SURFACE CELL'S CHUNK, NOT THE DISPATCHING ONE. One chunk
+  // layer owns every column of the body (wbColumnLayer), so a block anywhere in
+  // that layer would gate off a whole 16x16 tile of columns whose surfaces are
+  // three chunks lower and nowhere near the solver. Measured on the first pass
+  // R: a crater's excite put blocks in the level layer and the relevel moved
+  // ONE eighth in ninety ticks.
+  let sc = worldChunkOf(vec3<i32>(x, sy, z));
+  if (!chunkInWindow(sc, T.origin)) { return; }
+  if (fluidBlockMapS[chunkSlotIndex(sc)] != 0u) { return; }
 
   atomicAdd(&waterBodyState[wbBase(b) + WBS_RVCOUNT], 1);
   // Sigma s over 20k columns at s ~ 2,500 is 50 M — safe in i32 with three
@@ -1269,7 +1289,6 @@ fn wbRelevel(@builtin(workgroup_id) wg : vec3<u32>,
   let level = wbGet(b, WBS_LEVEL);
   let wc = wbSlotWorldChunk(slot);
   if (!wbColumnLayer(wc.y, level)) { return; }
-  if (fluidBlockMapS[slot] != 0u) { return; }
 
   let g = wbGeom(b);
   let seed = wbSeed(b);
@@ -1296,8 +1315,9 @@ fn wbRelevel(@builtin(workgroup_id) wg : vec3<u32>,
   let steps = wbGet(b, WBS_STEPS);
   let frac = wbGet(b, WBS_FRAC);
   if ((steps != 0 || frac != 0) && sy >= level - 1 && sy <= level) { return; }
-  // The surface may sit in a chunk layer BELOW the dispatching one (a crater
-  // the MPM is still working). Ask that chunk too.
+  // A CHUNK THE SOLVER HOLDS IS THE SOLVER'S, and the question is asked of the
+  // chunk the SURFACE CELL is in rather than of the dispatching one — see the
+  // same note in wbSurface for what the coarser test measured.
   let sc = worldChunkOf(vec3<i32>(x, sy, z));
   if (!chunkInWindow(sc, T.origin)) { return; }
   if (fluidBlockMapS[chunkSlotIndex(sc)] != 0u) { return; }

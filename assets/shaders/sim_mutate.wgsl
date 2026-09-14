@@ -32,7 +32,7 @@ struct CellOp {
 // a fault that reports as "unknown".
 const PT_KERNEL : u32 = PT_K_MUTATE;
 
-fn inBounds(c : vec3<i32>) -> bool { return inWindow(c, T.origin); }
+fn inBounds(c : vec3<i32>) -> bool { return cellResident(c, T.origin); }
 
 fn markBoth(c : vec3<i32>) {
   let lo = c & vec3<i32>(CHUNK_MASK);
@@ -47,8 +47,8 @@ fn markBoth(c : vec3<i32>) {
     for (var j = 0; j < 2; j++) {
       for (var k = 0; k < 2; k++) {
         let n = ch + vec3<i32>(xs[i], ys[j], zs[k]);
-        if (chunkInWindow(n, T.origin)) {
-          let ci = chunkSlotIndex(n);
+        let ci = chunkSlotOf(n, T.origin);
+        if (ci != SLOT_NONE) {
           atomicOr(&dirtyIn[ci], DIRTY_R_MUTATE);   // simulate this tick
           atomicOr(&dirtyOut[ci], DIRTY_R_MUTATE);  // and re-check next tick
         }
@@ -145,10 +145,8 @@ fn cells(@builtin(global_invocation_id) gid : vec3<u32>) {
   }
   voxStore(wordIdx, word);
 
-  let sc = vec3<i32>(vec3<u32>(ci % NCHUNK, (ci / NCHUNK) % NCHUNK,
-                               ci / (NCHUNK * NCHUNK)));
   let l = vec3<i32>(vec3<u32>(lo % CHUNK, (lo / CHUNK) % CHUNK, lo / (CHUNK * CHUNK)));
-  let wc = slotToWorldChunk(sc, T.origin) * i32(CHUNK) + l;
+  let wc = slotWorldChunk(ci, T.origin) * i32(CHUNK) + l;
   markBoth(wc);
   // Island removal and the rubble handoff write air here; settle-back writes a
   // SOLID, which flagSupportLoss rejects on its second line (a solid still
@@ -200,7 +198,7 @@ fn windWake(@builtin(global_invocation_id) gid : vec3<u32>) {
   if (gid.x >= T.windWakeCount) { return; }
   // The list is four slots to a std140 row (world.h TickParams).
   let slot = T.windWake[gid.x / 4u][gid.x % 4u];
-  if (slot >= NCHUNK * NCHUNK * NCHUNK) { return; }
+  if (slot >= NUM_SLOTS) { return; }
   atomicOr(&dirtyIn[slot], DIRTY_R_MUTATE);
   atomicOr(&dirtyOut[slot], DIRTY_R_MUTATE);
 }

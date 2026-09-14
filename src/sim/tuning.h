@@ -424,6 +424,39 @@ struct Tuning {
     // to reach full once it does.
     float fallFlailDelay = 0.35f;
     float fallFlailRamp = 0.9f;
+    // ---- THE AIRBORNE POSE IS DRIVEN BY VERTICAL VELOCITY, NOT BY A CLOCK ----
+    //
+    // `fall` is a 900 ms LOOPING clip whose two keyframes are ten degrees apart,
+    // so the whole of being in the air was a slow sway of the arms over a rest
+    // hang that the leg IK had just faded out of — "the character just wobbles
+    // left and right slightly". A looping clip is the wrong shape for this: a
+    // jump has no period to loop, it has a PHASE, and the phase is exactly
+    // `vel.y`. Launch, apex, descent and the reach for the ground are four
+    // readings of one number, so the pose is interpolated from it directly and
+    // driven onto the rig through the same leg/arm IK chains the gait uses.
+    //
+    // Off restores the clip-driven air pose (`jump` + `fall` + the flail ramp
+    // above), which is the A/B arm for judging this.
+    bool airPose = true;
+    // The upward speed that reads as a full-power launch and the downward speed
+    // that reads as a committed fall, m/s. These NORMALIZE `vel.y` into the
+    // pose's phase: at +riseSpeed the body is fully in the tuck, at 0 it is at
+    // the apex, at -fallSpeed it is fully in the reach. Default rise is the
+    // player's own jumpSpeed, so a jump starts exactly at the tuck; fall is
+    // higher than any jump because a drop keeps accelerating past it.
+    float airPoseRiseSpeed = 5.25f;
+    float airPoseFallSpeed = 9.0f;
+    // Height above the ground, in metres, at which the legs start reaching for
+    // the landing. This is the part that makes a fall read as a fall rather
+    // than as a floating pose: the feet come down and the body tips into the
+    // landing BEFORE contact. Probed against the CPU mirror, so a fall the
+    // mirror cannot see yet simply keeps the reach pose. 0 disables it.
+    float airPoseLandHeight = 1.1f;
+    // How far the body leans into its own horizontal travel while airborne,
+    // degrees at the def's top speed. A running jump tips forward; a standing
+    // one does not. Half of it is taken by the pelvis and half by the spine
+    // above it, so the back curves rather than tilting as a plank.
+    float airPoseLean = 16.0f;
     // Meters the body must have DROPPED below the height it last had support at
     // before the fall clip may play at all. Air time alone is not a fall: a
     // step-down clears any debounce, and so does cresting a bump at speed.
@@ -577,9 +610,23 @@ struct Tuning {
     int collisionSteps = 1;
     float debrisFriction = 0.75f, debrisRestitution = 0.05f;
     float debrisLinearDamping = 0.05f, debrisAngularDamping = 0.15f;
+    // Drag a rigidbody feels from the LIQUID it is in, as opposed to the air
+    // damping above (docs/PLAN_debris_buoyancy.md phase 3). Jolt's own
+    // buoyancy coefficients: linear is a quadratic drag against the submerged
+    // frontal area, angular damps the tumble. The pair is what makes a floating
+    // log stop wallowing and go to sleep instead of bobbing forever.
+    float waterLinearDrag = 0.8f, waterAngularDrag = 0.25f;
     float terrainFriction = 0.85f, playerProxyFriction = 0.3f;
     float explosionImpulseScale = 0.15f;
     float explosionImpulseRadiusScale = 3.0f;
+    // The fastest the per-body blast impulse may make any ONE body go, m/s.
+    // impulse / mass is unbounded from below in mass: a 0.05 kg gobbet carved
+    // off a creature by the same explosion took 1000 m/s (Jolt's own ceiling
+    // is 500) and, born inside the limb it came from, rammed the rig it had
+    // just left — "bodies zoom across the map" when a blast was big enough to
+    // carve. Ordinary debris (a 2.5 kg stone voxel takes 20 m/s from the
+    // X-detonate charge) never reaches this.
+    float explosionMaxSpeed = 30.0f;
     // How far an explosion actually BLOWS VOXELS OFF bodies, as a multiple of
     // the destruction radius. Kept separate from the impulse reach on purpose:
     // the blast should push objects from further away than it dismembers them,
@@ -593,6 +640,66 @@ struct Tuning {
     float sphereFriction = 0.5f, sphereRestitution = 0.3f;
     float sphereAngularDamping = 0.05f;
   } physics;
+
+  // ---- live ragdoll: a creature goes limp and gets back up (game/mob.h) ----
+  // CPU-only floats, never in a shader: a ragdoll is Jolt presentation state
+  // and re-enters the grid only through the ordinary body paths. Metres and
+  // seconds, converted at the point of use.
+  struct Ragdoll {
+    // Continuous freefall before a creature goes limp mid-air. NPCs fall under
+    // the same gravity as the player since this landed (they used to hang).
+    float fallSeconds = 3.0f;
+    // A blast within radius * blastRadiusScale of a body launches it. The
+    // impulse at the centre is power * blastImpulseScale (kg*m/s), falling
+    // off linearly to zero at that reach; launch speed is impulse / body mass,
+    // so a heavy creature flies less far than a light one from the same
+    // charge, and a grenade (power 380) sends ~70 kg about 5 m/s.
+    float blastRadiusScale = 3.0f;
+    float blastImpulseScale = 1.0f;
+    // Below this launch speed (m/s) a blast does not knock the creature down
+    // at all; above maxLaunchSpeed it is clamped, which is what keeps a large
+    // charge from putting a body into orbit. "Across the room, not across
+    // the map" — a massive explosion still tops out here.
+    float blastMinSpeed = 1.5f;
+    float maxLaunchSpeed = 14.0f;
+    // Fraction of straight-up mixed into the launch direction, so a body on
+    // the floor beside a blast arcs rather than skidding along the ground.
+    float blastUpBias = 0.45f;
+    // ---- THE TUMBLE (Mob::BlastRadial) -------------------------------------
+    // How much a limb's OWN distance to the charge varies the shove it takes,
+    // as a fraction: 0 is the flat launch every limb used to get (a body that
+    // floats away from the blast facing the same way it stood), 1 would scale
+    // each limb by its own falloff over the rig's mean. The differential is
+    // deliberately small — enough that a blast at the ankles clearly lifts the
+    // legs before the head, not enough to tear a rig apart.
+    float blastLimbBias = 0.35f;
+    // The per-limb differential is reduced to ONE rigid motion — a launch
+    // velocity at the rig's centre of mass plus a spin about it — so no
+    // constraint is violated and the joints do no launching (see
+    // Mob::BlastRadial). The spin comes from the angular impulse over a
+    // POINT-MASS inertia (each limb's own spin inertia is ignored, which
+    // overstates it), so this gain corrects for that and is the dial for how
+    // hard a body tumbles. The cap is the "not a helicopter" rule.
+    float blastSpinGain = 0.65f;
+    float blastMaxSpin = 8.0f;  // rad/s
+    // Shortest time a creature stays limp before it may start getting up,
+    // and the stillness test that then lets it: the pelvis has moved slower
+    // than settleSpeed (m/s) for settleSeconds. maxSeconds is the ceiling
+    // for a body that never settles (wedged, twitching on a slope).
+    float minSeconds = 1.0f;
+    float settleSpeed = 0.35f;
+    float settleSeconds = 0.5f;
+    float maxSeconds = 8.0f;
+    // The procedural get-up: every limb blends from where it landed into a
+    // crouched pose (torso pitched getUpPitchDeg forward about the feet, hips
+    // dropped getUpDropFrac of the standing hip height), which then rises to
+    // the ordinary standing pose over getUpSeconds in total.
+    float getUpSeconds = 1.5f;
+    float getUpPitchDeg = 60.0f;
+    float getUpDropFrac = 0.45f;
+    // How long the dev panel's "ragdoll me" keeps the player down.
+    float devSeconds = 3.0f;
+  } ragdoll;
 
   // ---- debris / island -> rigidbody conversion ----
   struct Debris {
@@ -866,6 +973,77 @@ struct Tuning {
     float woundStainRadius = 0.90f;
     float woundStainSurface = 0.90f;
     float woundStainDensity = 0.30f;
+    // WHITE NOISE CANNOT MAKE A SMEAR, for the same reason it cannot make a
+    // chunk (see carveChunkiness). An independent draw per voxel has no
+    // feature size, so a soak thresholded against it is a fine red speckle
+    // sprinkled evenly over everything in range -- which is what a blast on a
+    // body looked like until 2026-09-13. Correlating the draws over a few
+    // voxels is what turns the speckle into blotches, and the correlation
+    // length IS the size of a blotch. `woundStainCoherence` blends from the
+    // old independent draw (0) to fully correlated (1); `woundStainBlob` is
+    // the feature size in WORLD voxels, like every other radius here, so a
+    // fine skin gets a finer-grained field of the same physical size instead
+    // of blotches eight times too big.
+    float woundStainBlob = 0.5f;
+    float woundStainCoherence = 0.8f;
+    // A CRATER IS NOT A KERF. The blade's soak is a ball of `woundStainRadius`
+    // round the slot it cut, which describes a kerf fairly. A blast crater's
+    // predicate removes with a chance that falls to zero at the rim, so a
+    // GRAZE takes a scatter of voxels across the whole blast sphere: its
+    // centroid is inside the limb and its spread is most of the blast radius,
+    // and a ball of that size bloodies a quarter of the limb for eight lost
+    // voxels. So the blast path measures its soak from the cells it actually
+    // REMOVED (phys/bodystain.h CellDist), and this is how far past them the
+    // blood reaches, in the LIMB'S OWN LATTICE CELLS -- the art's resolution
+    // is the right unit for "a cell of rim", and it is what keeps a scratch a
+    // scratch on a rig authored at any scale. The tint rides at the same
+    // stainCutRadius : woundStainRadius ratio the kerf uses.
+    float craterStainRim = 1.5f;
+
+    // ---- E3b. BLOOD ON A BODY: the stain lattice (2026-09-13) --------------
+    // The soak above REWRITES flesh to blood. This is the other half, and it
+    // is what the owner asked for in as many words: every voxel a cut
+    // exposes -- bone included -- carries a STAIN, a tint the renderer lays
+    // over the art the way the ground's stain layer does (same palette entry,
+    // same look), to a degree that falls off from the cut. A stain never
+    // changes what a voxel IS, so bone stays bone and reads as blood-smeared
+    // bone; it goes with a severed limb, into every fragment, and comes off
+    // again under a washing liquid (water's `washes`).
+    //
+    // Radius in WORLD voxels round the cut; amounts are the 0..15 scale the
+    // world's stain uses. `stainCutAmount` at the centre of an exposed voxel
+    // tapering toward the rim; buried voxels take `stainCutBuried` with
+    // `stainCutBuriedChance`, low so a later cut finds meat that bled a
+    // little rather than a red interior. `stainBoneMin` is the FLOOR for any
+    // exposed bone in range: bone is always shown bloodied to some degree.
+    float stainCutRadius = 1.6f;
+    int stainCutAmount = 15;
+    int stainCutBuried = 6;
+    float stainCutBuriedChance = 0.35f;
+    int stainBoneMin = 5;
+    // CONTACT. A limb in a blood pool, on a bloodied floor or under a drip
+    // takes the liquid's authored stain (materials.json `stain`: type, amount,
+    // per-mille chance per tick) on its exposed voxels, scaled by this. A dry
+    // stain on the ground transfers at half its amount and this fraction of
+    // its chance, so walking through old blood lightly bloodies the boots.
+    float stainContactScale = 1.0f;
+    float stainFloorTransfer = 0.35f;
+    // WASHING. A liquid whose stain `washes` (water) rinses this much amount
+    // off an exposed voxel per successful roll at the liquid's own chance.
+    int stainWashPerContact = 3;
+    // SPLATTER. A gout or a drip's spray is checked against every body within
+    // this many voxels of the wound. The replay flies the particle kernel's
+    // own arc (launch speed, then sim.partGravity), aimed across each limb in
+    // proportion to the share of the burst's cone the limb covers, so a body
+    // is marked where the droplets are seen to land: each arc that meets a
+    // limb paints a splat of `splatterSplatRadius` world voxels at
+    // `splatterAmount`, at most `splatterPerLimb` arcs per limb per event
+    // (past that, one arc stands for several droplets and paints wider).
+    // This is how killing something covers YOU in it.
+    float splatterReach = 48.0f;
+    int splatterAmount = 6;
+    int splatterPerLimb = 64;
+    float splatterSplatRadius = 0.3f;
 
     // ---- E4. when a cut becomes a dismemberment -----------------------------
     // Both rules are STRUCTURAL and both fire only on a blade cut (a burn's
@@ -950,6 +1128,43 @@ struct Tuning {
     float burnCapMidHealth = 0.333f;
     float burnDeathFraction = 0.70f;
   } gore;
+
+  // ---- coats: a substance ON a body, as opposed to in the ground -------------
+  //
+  // A body voxel carries a COAT — a material and how much of it (sim/voxload.h
+  // PrefabVoxel::stain) — and materials.json says per substance how fast it
+  // dries off and whether a foot tracks it (MaterialDef::coatDecay/coatShed).
+  // These are the ENGINE-side numbers that govern the same machinery: how
+  // often the per-limb ledger is retaken, how the authored dry times are
+  // scaled globally, and the budgets that keep tracking bounded (rule 2).
+  //
+  // CPU-ONLY, like `gore` and `melee` above: no tuning_params.def row, no WGSL
+  // constant. A coat never reaches the sim.
+  struct Coat {
+    // Ticks between recounts of the per-limb coat ledger (game/mob.h
+    // LimbCoat). Only ever taken when something changed a coat byte since the
+    // last one, so this bounds the cost of a body that is ACTIVELY being
+    // bloodied — a clean or settled one pays nothing whatever this says.
+    int recountTicks = 8;
+    // Global multiplier on how fast every authored coat dries: the material's
+    // `coat.decay` seconds per amount level are DIVIDED by this, so 2 dries
+    // everything twice as fast and small values make blood permanent. A dial
+    // on the whole look rather than a per-material edit.
+    float decayScale = 1.0f;
+    // Ground cells one footfall may track a coat onto. A footprint is a patch,
+    // not a point, and this is how big the patch may get.
+    int shedCells = 3;
+    // Deposits every creature together may make in one tick. The bound on how
+    // much tracking a crowd can push into the world; a foot refused here
+    // simply leaves no print that tick.
+    int shedPerTick = 64;
+    // Amount of coat one deposit takes off the foot, in the 0..15 scale — how
+    // fast a bloodied boot walks itself clean.
+    int shedAmount = 2;
+    // Below this coated fraction of a body part, the HUD says nothing about
+    // it: a single splashed voxel is not "covered in blood".
+    float hudMinFrac = 0.02f;
+  } coat;
 
   // ---- melee: the stroke driver's feel ---------------------------------------
   //
@@ -1235,6 +1450,12 @@ struct Tuning {
   struct Sim {
     int partGravity = 22;        // 24.8 fixed voxels/tick^2
     int partMaxVel = 1536;       // 24.8 fixed voxels/tick
+    // ---- a voxel in flight, inside a liquid (materials.json "fluid") ----
+    // Buoyancy itself is per material (density vs the liquid's); these three are
+    // the parts that are a property of the SYSTEM rather than of a substance.
+    int partBuoyMax = 88;        // ceiling on the buoyant term, 24.8/tick^2 (4 g)
+    int partSettleSpeed = 24;    // below this speed a floater looks for a berth
+    int partFloatPatience = 180; // ticks it may hunt before it takes any cell
     int airDensity = 10;         // density below which things rise
     int falloffPerCell = 6;      // explosion power lost per cell
     int ejectSolid = 250;        // per-mille of destroyed voxels that fly
@@ -1538,6 +1759,13 @@ struct Tuning {
     // is the live A/B oracle for anything this changed. Above ~1 the boundary
     // over-pressurises and ejects particles off the surface.
     float fluidSettledMass = 1.0f;
+    int fluidSubmergedSolid = 1;  // SUBMERGED settled liquid is a boundary, so
+                                  // particles ride the free surface instead of
+                                  // sinking into water that has no depth
+                                  // profile to push them back out. A buried
+                                  // particle can never settle (its column has
+                                  // no room), so this is what makes settle able
+                                  // to terminate. 0 = the pass-through control
     float fluidSettleEps = 6.0f;  // vox/s: a fluid block whose FASTEST
                                   // particle stays below this for
                                   // settleTicks in a row counts as calm and
@@ -1589,6 +1817,21 @@ struct Tuning {
     float fluidStainRate = 8.0f;  // chances/s that an excited-fluid contact
                                   // stains an adjacent solid cell — the MPM
                                   // counterpart of CA liquid staining
+    int fluidStuckTicks = 96;     // ticks a chunk slot may hold particles
+                                  // before its blocks are force-settled
+                                  // regardless of calm. 0 disables the
+                                  // backstop entirely. Keyed on EXISTENCE, not
+                                  // on refusal: a submerged block is never
+                                  // calm, so it is never picked, so a
+                                  // refusal-triggered age would never fire
+    int fluidForceBlocks = 4;     // forced blocks per tick; bounds the drain
+                                  // rate, and forced picks take a stricter
+                                  // (x,z)-column exclusion because their write
+                                  // set reaches past SETTLE_SPILL
+    int fluidForceReach = 64;     // cells past the spill ceiling a forced walk
+                                  // may climb looking for room. Exhausting it
+                                  // means a sealed column — counted, not
+                                  // silently retried
 
     // ---- water bodies (docs/PLAN_water_master.md; src/sim/waterbody.h) ----
     //
@@ -1730,6 +1973,18 @@ struct Tuning {
     // promises about rule 2 — 2 is deliberately NOT rule-2 clean yet and is
     // there to be looked at, not shipped.
     int windMode = 1;
+    // ---- gas particles (docs/PLAN_gas_particles.md stage 1) ----
+    // THE EDGE. 0 = wall: `gasLeave` never fires and a gas voxel pressed
+    // against the residency boundary spreads along it, which is the top-plane
+    // sheet that used to hold up to 1,024 chunks awake over a big fire. 1 =
+    // sink: it becomes a parcel that keeps rising and drifting outside the
+    // window under the same buoyancy/wind model, bounded by its authored decay
+    // and an outer box, and reconverts to a voxel if it drifts back in.
+    //
+    // At 0 the CPU records NO gas pass (Cond::Gas is false) and the kernel
+    // branch is never reached, so this is an exact identity in the windMode /
+    // waterBodyMode sense rather than merely a cheap path.
+    int gasMode = 1;
     // Ballistic debris and spray: fraction of the gap between a particle's
     // velocity and the local wind that closes per SECOND, at a material's full
     // windResponse of 15. A drag law rather than a push, because drag is
@@ -2406,6 +2661,18 @@ struct Tuning {
     // QUALITY knob, since the ray saving saturates well before it gets coarse.
     int shadowCache = 1;
     int shadowCacheSubdiv = 4;
+    // THE SUN'S APPARENT RADIUS AS THE SHADOW RAY SEES IT, in DEGREES, and the
+    // one knob that sets how wide a penumbra is (shadow_resolve.wgsl, world.h
+    // kShadowHistBytes). The resolve pass jitters its ray inside this cone and
+    // averages the last kShadowSamples verdicts, so a blocker `d` away casts an
+    // edge about 2*d*tan(angle) wide: crisp under a kerb, soft under a canopy.
+    //
+    // NOT dayNight.sunAngularRadius, which is the star's TRUE size (0.3 deg,
+    // and what the disc is drawn at and what eclipse geometry uses). At 0.3 deg
+    // a canopy 10 m up softens over 10 cm — one voxel — which is physically
+    // right and reads as the hard edge this replaced. This is the artistic one.
+    // 0 turns the cone off and restores the single-ray hard shadow exactly.
+    float shadowSunAngle = 1.0f;
 
     // grain
     float grainBroadScale = 11.0f, grainFineScale = 2.5f;
@@ -2577,7 +2844,10 @@ struct Tuning {
     float opennessReach = 12.0f;        // metres a hemisphere ray looks
     int opennessChunksPerFrame = 256;   // slots the rolling refresh walks/tick
     float opennessStrength = 1.0f;      // 0 = old lerp AND the pass unrecorded
-    float opennessFloor = 0.3f;         // least ambient multiplier an enclosed face keeps
+    float opennessFloor = 0.0f;         // the pre-2026-09-11 daylight leak, kept as its A/B arm
+    // The enclosed face's own ambient, ADDED at (1 - openness) and independent
+    // of the sun/moons: a cave must not know what time it is.
+    float enclosedAmbient[3] = {0.012f, 0.013f, 0.016f};
     int opennessBilinear = 1;           // blend the 4 blocks in the face plane
 
     // ---- one-bounce indirect light (docs/PLAN_gi.md §3) ----
@@ -2586,8 +2856,8 @@ struct Tuning {
     float giStrength = 2.0f;            // 0 = everything const-folded away
     float giDecay = 0.25f;              // per-visit fade of unmeasurable faces
     float giFeedback = 0.2f;            // P2 write-back weight, < giDecay
-    int giGatherBlocks = 3;             // blocks per gather ray
-    int giCachePeriod = 8;              // frames between a slot's re-gathers; 0 = uncached
+    int giGatherBlocks = 12;            // STEP budget per gather ray (a clear chunk = 1 step)
+    int giCachePeriod = 16;             // frames between a slot's re-gathers; 0 = uncached
 
     // ---- the glow field (src/sim/world.h kGlowBytes) ----
     // A coarse position-keyed field of emitter light, written by sim_glow.wgsl
@@ -2800,6 +3070,52 @@ struct Tuning {
     // specifically want foliage running off the shared clock.
     float microSwaySpeed = 1.0f;
 
+    // ---- how fast the cascade REBUILDS, in sieve entries per tick --------
+    // CPU-ONLY (never reaches a shader): FarField::SetBulkCap. Applies to a
+    // wholesale refill — the startup horizon, a load, a teleport — not to the
+    // incoming planes of ordinary travel, which have their own cap inside
+    // FarField (kPlayFillCap).
+    //
+    // A refill is kFarLevels x kFarNumChunks = 262,144 sieve entries; this
+    // number is how many of them a tick may take. It used to be kFarListCap
+    // = 4,096 with no knob, i.e. 267 ms of GPU in ONE tick and 2 fps until
+    // the queue drained — the horizon's arrival was the largest stall in the
+    // walking frame, reported from live play as "everything goes foggy and
+    // the fps dies for ten seconds".
+    //
+    // THE SLICE IS NOT FREE TO SHRINK, which is the non-obvious half.
+    // Measured `--frames 2500 --autowalk`, same binary, same walk, one full
+    // refill each (the entry count is printed by that harness):
+    //
+    //   cap   frame p50/p95/p99/max   >33ms  >100ms   far GPU total  far ticks
+    //   4096   17.2  42.0  57.2  374   11.8%    10       5.7 s          456
+    //   1024   21.3  63.7  79.9  287   22.7%     3      15.3 s          847
+    //    256   23.5  56.8  69.7  151   34.3%     1      20.6 s         1506
+    //
+    // Same ~290k entries in all three, but the TOTAL GPU cost is 3.6x higher
+    // at 256 than at 4096: a far dispatch has a large fixed cost (its two
+    // rows barrier against farDown's writes to a 1 GiB farVox), and the whole
+    // machine runs hotter for longer, which shows up on the raymarch row too.
+    // So this trades peak hitch against total work, not against nothing.
+    //
+    // 1024 is the knee: it turns 63 frames over 100 ms into 3 and keeps the
+    // median within 4 ms of the cheapest arm. Raise it toward 4096 to get the
+    // horizon back sooner and accept the hitches; lower it toward 256 if a
+    // dropped frame matters more than a busy minute. Hot-reloads on F5.
+    int farRefillRate = 1024;
+
+    // ---- THE ORDINARY-TRAVEL CAP (farfield.h kPlayFillCap) -----------------
+    // Entries an INCOMING PLANE may drain per tick: the horizon keeping up
+    // with a player who is walking, sprinting or flying, as opposed to the
+    // wholesale refill above. It was a hard-coded 64 until 2026-09-12, sized
+    // when a sieve entry cost ~45 us of GPU; the `far` kernel's sky early-out
+    // took that to ~19 us, and 64 was by then the reason the queue backlogged
+    // at all — 437k entries (3.8 minutes of drain) after 22 s of flight, deep
+    // enough that the valid-box face counts overflowed and the renderer fell
+    // through to house-sized cells at 40 m. 256 is ~4.8 ms/tick of sieve,
+    // still under what 64 was sized to spend. Hot-reloads on F5.
+    int farPlaneFillRate = 256;
+
     // budgets
     int primarySteps = 4096;
     int farSteps = 384;
@@ -2855,6 +3171,21 @@ struct Tuning {
     // Set >= WINDOW_HALF_EXTENT_METERS (25.6 m) to disable the handoff
     // entirely and get the old "switch only at window exit" behaviour — which
     // is exactly how to A/B it without a rebuild (F5 reloads it).
+    // ---- the gas crossfade (docs/PLAN_gas_particles.md stage 1b) --------
+    // Where the voxel representation of gas starts handing over to the coarse
+    // one, as a FRACTION of the residency window's half-extent measured from
+    // the window CENTRE in the max norm. 0.5 = the fade runs over the outer
+    // half, from 12.8 m to the face at 25.6 m.
+    //
+    // The window CENTRE and not the camera, which is the whole trick: the
+    // weight is then exactly 1 at every one of the six faces regardless of
+    // where the camera is, so the seam the fade exists to remove disappears on
+    // all of them at once rather than on the one the camera happens to face.
+    //
+    // 1.0 disables the crossfade (voxels at full opacity right up to the face,
+    // coarse gas starting at the face) and gets stage 1's hard edge back --
+    // which is how to A/B it without a rebuild, since F5 reloads this.
+    float gasBlendStart = 0.5f;
     float lodHandoffDist = 24.0f;
     // ---- frame pacing and internal resolution (CPU-only: no .def row, no
     // TUNE_* constant — nothing here reaches a shader) ----------------------
@@ -2931,6 +3262,58 @@ struct Tuning {
     // jittered sample landed nearly on the pixel speak for it — sharper, at the
     // cost of starving pixels the jitter sequence keeps missing.
     float taaSharpness = 2.29f;
+    // ---- the shading-LOD filter (assets/shaders/denoise.wgsl) --------------
+    // CPU-ONLY, all seven: they reach denoise.wgsl through its own uniform
+    // (Simulation::WriteDenoiseParams), never the TUNE_ prelude, so a change
+    // is one tuning.json edit and no shader recompile.
+    //
+    // denoise: 1 runs a depth-guided a-trous filter over the world frame, at
+    // render resolution, before TAA or the upscale blit. It averages the
+    // lighting of terrain whose FINE voxels project smaller than denoisePx*
+    // pixels — the mid-distance staircase speckle of lit and shadowed cube
+    // faces — and leaves near geometry, the sky and depth edges alone. 0 is
+    // the A/B arm. Nothing here has a history: no ghosting, nothing to reset.
+    // SHIPS OFF (owner's call, 2026-09-12): with the filter on, distant
+    // terrain read as out of focus; the in-raymarch contact-term fade
+    // (raymarch.wgsl lodShadeFade) stays on and is the part that ships.
+    int denoise = 0;
+    // denoiseIters: a-trous iterations, each a 5x5 tap at dilation 2^i. 1 =
+    // a 5-px support (takes the 1-2 px stipple and leaves the 6 px cascade
+    // mosaic), 2 = 13 px (shipped: the mosaic averages, terrace bands and
+    // relief survive), 3 = 25 px (measured 2026-09-12: every hillside reads
+    // out of focus), 4 = 49 px. Cost is linear in it.
+    int denoiseIters = 2;
+    // denoisePxFull / denoisePxStart: the strength ramp, in PROJECTED PIXELS
+    // PER FINE VOXEL at the pixel's depth. Full strength at or below pxFull,
+    // off at or above pxStart. At 1080p / 70 deg a 10 cm voxel is 2 px at
+    // ~39 m and 8 px at ~10 m, so the shipped pair means "off inside 10 m,
+    // ramping in to 39 m, full beyond" — and the far cascade, at a constant
+    // ~6 px per CELL (= 1.5 px per fine voxel at level 1, less beyond), is
+    // always full. Written in pixels so the band follows resolution and fov.
+    // The ramp is this WIDE on purpose: a 15-31 m ramp measured as a visible
+    // line where crisp voxels met filtered ones, the same defect as the LOD
+    // ring the cascade seam dither exists to break.
+    float denoisePxFull = 2.0f;
+    float denoisePxStart = 8.0f;
+    // denoiseDepthTol: the depth edge stop, as a fraction of view depth per
+    // pixel of tap offset. A tap whose depth differs from the centre by more
+    // than about this is a different surface (a crest against the hill
+    // behind, a mob against the ground) and stops the filter. A grazing
+    // ground plane at 100 m changes depth by ~1% per pixel, which this must
+    // exceed or every tread becomes an edge.
+    float denoiseDepthTol = 0.03f;
+    // denoiseChromaTol: the chroma edge stop, the width of a Gaussian on the
+    // distance between two taps' luminance-normalised colours. The speckle is
+    // LUMINANCE (lit vs shadowed faces of one material); a material boundary
+    // is mostly hue. Smaller preserves more material edges and less of the
+    // lit/shadow averaging (shadow is slightly bluer than sun); larger blurs
+    // across everything.
+    float denoiseChromaTol = 0.25f;
+    // denoiseStrength: overall ceiling on the filter (0..1). 1 is the full
+    // average; 0.5 keeps half the original speckle under it. Shipped 0.7 with
+    // two iterations: the residual is what keeps the picture reading as
+    // in-focus terrain rather than a soft gradient.
+    float denoiseStrength = 0.7f;
     // presentMode: 0 fifo (vsync, quantises a 22 ms frame to 33), 1 mailbox
     // (newest frame at each vblank, no tearing, no quantisation), 2 immediate
     // (tears). Applied when it CHANGES (a swapchain recreate). Use fifo or an
@@ -2970,6 +3353,14 @@ struct Tuning {
     //
     // Ray ceiling in METERS. Nothing past this is marched at all.
     float shortRangeDist = 100.0f;
+    // The NEAR arm's ceiling, in metres: the same mode with a tighter wall, so
+    // the panel can compare two cutoffs without the tuner (dev panel radio
+    // "50 m" vs "100 m"). A SECOND DISTANCE rather than a fraction of the
+    // first, because the two are independent comparison points — halving
+    // shortRangeDist would silently move this one too the moment the far arm
+    // is retuned. Which arm is live is flag bit 4, not a tuning value, for the
+    // same reason the mode's on/off is not one.
+    float shortRangeNearDist = 50.0f;
     // Where the fog ramp starts, as a FRACTION of shortRangeDist. Below it the
     // image is unfogged; the mode's whole point is that the near field looks
     // untouched and only the wall dissolves. 0.65 = fog begins at 65 m of 100.
@@ -3006,6 +3397,11 @@ struct Tuning {
     // undergrowth, cover rows, shore/pond/cave flora, alpine cushion, wet moss
     // all off). A frame-rate A/B lever; see tuning_params.def.
     int vegetation = 1;
+    // 1 = the small plants generate, 0 = trees and cacti stand on bare ground
+    // (cover rows, tile plants, shore rows, pond life, wet moss and cave flora
+    // all off). The half of `vegetation` you usually want; ANDed with it, so
+    // vegetation = 0 is still the bare world. See tuning_params.def.
+    int groundCover = 1;
   } debug;
 
   // Values that failed validation, for the overlay / console. Empty on success.

@@ -1,6 +1,7 @@
 #pragma once
 #include <cstdint>
 #include <memory>
+#include <unordered_map>
 #include <vector>
 
 #include "math3d.h"
@@ -21,6 +22,26 @@ class JobSystemThreadPool;
 class BodyInterface;
 }  // namespace JPH
 
+// ---- THE ANTI-TUNNEL A/B ARM, IN ONE BINARY --------------------------------
+//
+// "Nothing passes through the ground" is three mechanisms that landed together
+// (DESIGN.md, and the notes above Physics::CreateDebrisBody and
+// DebrisSystem::UntunnelBody), and all three change where a rigid body ends up
+// — so the next unexplained body-settling number is going to want to ask
+// "was it this?". A differential measured across two BUILDS measures the
+// builds too (CLAUDE.md), so it is an environment variable, exactly as
+// SANDVOX_TERRAIN_BUILDS_PER_TICK is for the patch budget:
+//
+//   SANDVOX_NO_ANTITUNNEL=1          all three off (Jolt's Discrete default,
+//                                    no lookahead, no clamp) = pre-2026-09-12
+//   SANDVOX_NO_ANTITUNNEL=ccd        Discrete motion quality only
+//   SANDVOX_NO_ANTITUNNEL=lookahead  ManageTerrain stops asking ahead
+//   SANDVOX_NO_ANTITUNNEL=clamp      UntunnelBody becomes a no-op
+//
+// Read once and cached; unset (the normal case) costs one predictable branch.
+enum class AntiTunnel { Ccd, Lookahead, Clamp };
+bool AntiTunnelOff(AntiTunnel part);
+
 struct BodyTransform {
   Vec3 pos;        // voxel units (body center of mass)
   float quat[4];   // x, y, z, w
@@ -37,6 +58,14 @@ struct DebrisVoxel {
   int8_t x, y, z;
   uint8_t color = 0;
   uint16_t payload;  // material | state<<12
+  // Body coat word, same encoding as PrefabVoxel::stain (sim/voxload.h
+  // BodyStain*): the MATERIAL on this voxel in bits 0..11, how much of it in
+  // bits 12..15. The one field that grew the struct (6 -> 8 bytes with
+  // alignment; widening it from a byte to the coat word costs nothing, since
+  // the byte was followed by a byte of padding), and it is here rather than
+  // folded into `payload`'s state nibble because that nibble is what a carved
+  // voxel takes into the grid as a liquid's fullness.
+  uint16_t stain = 0;
 };
 
 // One sub-shape of a compound collider, in body-local VOXEL coordinates.
@@ -88,9 +117,38 @@ class Physics {
   // where the origin sits — microbody.wgsl).
   uint64_t CreateSphereBody(Vec3 centerVoxel, float radiusVoxels,
                             float densityKgM3, Vec3 originOffsetVox = Vec3{});
+  // Mass in kg, 0 for a dead handle. Read off the motion properties, which a
+  // kinematic body also carries (mob limbs are kinematic while animated), so
+  // a rig's total mass is known BEFORE it goes dynamic — which is when the
+  // blast launch needs it (Mob::BlastRadial).
+  float BodyMass(uint64_t handle) const;
+  // Where the body's MASS is, in world voxels — not `GetTransform`'s pos,
+  // which is the voxel lattice's origin corner. A blast that must know how
+  // far each limb of a rig is from the charge has to measure from the mass
+  // (Mob::BlastRadial): a min corner puts a thigh's "position" at its knee.
+  bool BodyCenterOfMass(uint64_t handle, Vec3& outVoxel) const;
   // Linear/angular velocity in voxel units (split halves keep momentum).
   bool GetBodyVelocities(uint64_t handle, Vec3& lin, Vec3& angRadPerSec) const;
   void SetBodyVelocities(uint64_t handle, Vec3 lin, Vec3 angRadPerSec);
+
+  // ---- buoyancy (docs/PLAN_debris_buoyancy.md phase 3) ----
+  // One tick of Archimedes for a body crossing a flat liquid surface at
+  // `surfaceYVoxel`. Jolt computes the submerged volume from the COLLIDER —
+  // exactly, per sub-shape — which is what buys the tilt and the bob: the
+  // upward impulse lands at the centre of the submerged part, not at the centre
+  // of mass, so a log with one end out of the water rights itself.
+  //
+  // `buoyancy` is rhoFluid / rhoBody, the ratio Jolt's own parameter means (1 =
+  // neutral, >1 floats, <1 sinks). It is the SAME ratio sim_particle.wgsl
+  // computes for a voxel in flight, off the same materials.json `density`, so a
+  // chip blown off a log and the log itself agree about which way is up.
+  //
+  // Does NOT wake a sleeping body, which is why it takes the Body rather than
+  // the BodyInterface overload: a raft that has come to rest is meant to stay
+  // asleep, and re-impulsing it every tick would mean nothing on water ever
+  // sleeps again (CLAUDE.md rule 2).
+  bool ApplyBuoyancy(uint64_t handle, float surfaceYVoxel, float buoyancy,
+                     float linearDrag, float angularDrag, float dt);
 
   // ---- joints (PLAN §B1) ----
   enum class JointType { Fixed, Hinge, Ball };
@@ -166,6 +224,15 @@ class Physics {
   // shoulders and both hips in the same call (gate `corpse-intact`). A body
   // comes apart only where something cuts it apart.
   void ReplaceBody(uint64_t oldHandle, uint64_t newHandle);
+  // The layer half of ReplaceBody on its own, for a rebuild that re-makes its
+  // joints itself (Mob::RebuildLimbBody) and for a SPLIT, where the parent
+  // stays. `to` takes `from`'s object layer, and if `from` was waiting in
+  // ReleaseToWorldWhenClear's list, `to` is added to it (never in place of
+  // `from`: a dead parent is forgotten by the next Step, a live one keeps its
+  // own entry). Without this a body rebuilt or split INSIDE the player came
+  // back on the plain MOVING layer and shoved them — a burning gobbet that
+  // shrinks (DebrisSystem's burn rebuild) did exactly that, every rebuild.
+  void CarryLayer(uint64_t from, uint64_t to);
   // Joints currently attached to one body / alive in the whole system.
   uint32_t JointCount(uint64_t handle) const;
   uint32_t JointCount() const;
@@ -182,6 +249,22 @@ class Physics {
   void MoveKinematicBody(uint64_t handle, Vec3 posVoxel, const float quat[4],
                          float dt);
   void SetBodyVelocity(uint64_t handle, Vec3 velVoxelsPerSec);
+
+  // Teleport a body, keeping its rotation and both velocities. A TELEPORT
+  // SKIPS COLLISION, so this is not a way to move anything: the one caller is
+  // DebrisSystem::UntunnelBody, which is undoing a step that ended somewhere
+  // no collider could have stopped it. Returns false if the handle is dead.
+  bool SetBodyPosition(uint64_t handle, Vec3 posVoxel);
+
+  // Teleport a body's POSITION AND ROTATION, keeping both velocities. Same
+  // "skips collision" caveat as SetBodyPosition, and the same reason to exist:
+  // a body whose pose is DERIVED from another body's has no pose of its own to
+  // solve for. Mob::DriveWornShells uses it to put a garment exactly on the
+  // limb it is strapped to, every tick — MoveKinematicBody could not, because
+  // it aims a body at a pose it reaches at the END of the next step, and one
+  // tick of lag on a limb falling at 40 m/s is four voxels of daylight between
+  // a hood and the head inside it.
+  bool SetBodyTransform(uint64_t handle, Vec3 posVoxel, const float quat[4]);
 
   // Move a body onto (or off) the PLAYER-AVATAR collision layer. Bodies there
   // behave exactly like normal dynamic bodies except that they never generate
@@ -239,6 +322,13 @@ class Physics {
   // hit position along the ray (0..1 of maxDistVoxels). Laser body cuts.
   uint64_t CastRayBody(Vec3 fromVoxel, Vec3 dirNormalized, float maxDistVoxels,
                        float& fraction) const;
+  // Same, skipping `ignore`. For a ray that STARTS INSIDE a body: Jolt reports
+  // a convex shape the origin is in as a hit at fraction 0, so a look ray cast
+  // from the player's eye sees the avatar's own head before anything else
+  // unless the rig's limbs are excluded (the E look-at prompt).
+  uint64_t CastRayBody(Vec3 fromVoxel, Vec3 dirNormalized, float maxDistVoxels,
+                       float& fraction,
+                       const std::vector<uint64_t>& ignore) const;
 
   // Static terrain collision patch (triangles in voxel units, world space).
   uint64_t CreateTerrainMesh(const std::vector<float>& vertsXYZ,
@@ -267,7 +357,23 @@ class Physics {
   // Depenetration vector (voxel units) to move the player out of any debris
   // bodies overlapping the proxy shape at centerVoxel. Zero when clear.
   // The caller applies it through its own terrain sweeps.
-  Vec3 PlayerPushOut(uint64_t handle, Vec3 centerVoxel) const;
+  //
+  // `outWorst` names WHAT pushed hardest, because a bare push length is not a
+  // measurement (CLAUDE.md rule 6): the `ragdoll` gate's avatar-on-fire arm
+  // reports a number, and telling "a 0.06 kg gobbet summed eight times" from
+  // "one 9 kg corpse limb released inside the capsule" by turning features off
+  // costs a run per hypothesis. Optional and free when null.
+  struct PushSource {
+    uint64_t body = 0;
+    float massKg = 0;
+    float depthVox = 0;
+  };
+  // Which object layer a body is on: 0 STATIC, 1 MOVING, 2 PLAYER, 3 AVATAR,
+  // -1 dead. The layer is the whole of whether a body can shove the player,
+  // so a push that should have been impossible is answered by this.
+  int BodyObjectLayer(uint64_t handle) const;
+  Vec3 PlayerPushOut(uint64_t handle, Vec3 centerVoxel,
+                     PushSource* outWorst = nullptr) const;
 
   // ---- contact reporting (audio; DESIGN.md §12b) --------------------------
   //
@@ -329,12 +435,45 @@ class Physics {
                           size_t limit) const;
   // Radial impulse (explosions). center/radius in voxels, impulse in kg*m/s
   // at the center, falling off linearly to zero at radius.
-  void ApplyRadialImpulse(Vec3 centerVoxel, float radiusVoxels, float impulse);
+  // `skipSorted` (ascending handles, optional) names bodies the impulse must
+  // NOT touch: the limbs a living creature still owns. Those are launched as
+  // ONE rig by Mob::BlastRadial — a per-body impulse/mass on a 0.3 kg hand is
+  // 170 m/s, and the joints drag the rest of the body after it.
+  void ApplyRadialImpulse(Vec3 centerVoxel, float radiusVoxels, float impulse,
+                          const std::vector<uint64_t>* skipSorted = nullptr);
   // Wake dynamic bodies whose AABB intersects the given voxel-space sphere
   // (terrain changed under them).
   void WakeNear(Vec3 centerVoxel, float radiusVoxels);
 
   uint32_t NumActiveBodies() const;
+
+  // ---- THE RUNAWAY-RIG NET (the long note is in physics.cpp) ---------------
+  //
+  // 46e3848 closed the case where a body's velocity became GARBAGE. This is
+  // the case where it stays entirely legal and is still a bug: a jointed rig
+  // whose solver gains energy every step until every piece sits AT Jolt's own
+  // clamp, spinning at 47.1 rad/s and never stopping. Nothing reports it,
+  // because 47.1 rad/s is a number physics is allowed to produce.
+  //
+  // What the caller gets is the account, so "the corpse exploded" can be
+  // answered with numbers instead of a bisect: how many bodies were at their
+  // ceiling on the last step, how many the net had to slow down, how many it
+  // had to cut free, and the worst single Update in wall clock.
+  struct RunawayProbe {
+    uint32_t hot = 0;       // bodies AT their own clamp on the last step
+    uint32_t damped = 0;    // ...that stayed there long enough to be slowed
+    uint32_t cut = 0;       // ...and then long enough to have their joints cut
+    uint32_t repaired = 0;  // transforms put back inside a finite world
+    float peakSpeedVox = 0.0f;  // fastest and fastest-spinning body seen since
+    float peakSpinRad = 0.0f;   // the probe was last reset
+    double worstStepMs = 0.0;   // longest single Update, wall clock
+  };
+  const RunawayProbe& Runaway() const { return runaway_; }
+  void ResetRunawayProbe() { runaway_ = RunawayProbe{}; }
+  // The ceilings every dynamic body this class creates is born with, so a test
+  // can assert against the engine's number rather than a copy of it.
+  static float MaxBodySpeedVox();
+  static float MaxBodySpinRad();
 
  private:
   std::unique_ptr<JPH::TempAllocatorImpl> tempAlloc_;
@@ -357,6 +496,37 @@ class Physics {
   // World-space AABB of a live body, metres. False for a dead handle.
   bool WorldBounds(uint64_t handle, float outMin[3], float outMax[3]) const;
   void TickPendingReleases();
+  // ---- the FP-overflow net (see the long note in physics.cpp) ----
+  // Called on every DYNAMIC body the moment it is added: floors a principal
+  // moment of inertia that a decomposition left at (or below) zero, which is
+  // the only way omega can reach 1e19 rad/s in a single solver step.
+  // `what` names the creator for the report. No-op in the normal case.
+  void GuardBodyInertia(uint32_t bodyIndexAndSeq, const char* what);
+  // True when both vectors are finite and small enough that squaring them
+  // cannot overflow. False reports once (rate-limited) and the caller drops
+  // the write.
+  bool VelocityIsSane(Vec3 linVox, Vec3 angRad, const char* what);
+  // Called from Step() before Update(): walks the ACTIVE rigid bodies and
+  // neutralises (and names) any whose stored velocity is already past what
+  // Jolt's own clamp could have produced. Zero cost when nothing is wrong.
+  void SweepInsaneVelocities();
+  // Called from Step() straight after the sweep above: finds the bodies that
+  // are sitting AT their velocity ceiling rather than passing through it,
+  // slows them, and — if they are still there a moment later — cuts the joints
+  // that are driving them and puts them to sleep. See the note in physics.cpp.
+  void SweepRunawayRigs();
+  RunawayProbe runaway_{};
+  // Jolt body INDEX -> consecutive-ish steps spent at the ceiling. Climbs by
+  // one per hot step and falls by one per quiet one, so a body that is being
+  // DRIVEN escalates while a body that was merely thrown hard decays back to
+  // nothing. Bounded by the active list; entries are dropped at zero.
+  std::unordered_map<uint32_t, uint16_t> hotSteps_;
+  int runawayReports_ = 0;  // rate limit on the three reporters above
+  // SANDVOX_PHYS_FAULT: the deliberate blow-up that proves the two above
+  // (and the Jolt FP-exception setting) actually do something. No-op unset.
+  void InjectPhysFault();
+  int insaneReports_ = 0;  // rate limit on the two reporters above
+  int faultStep_ = 0;      // SANDVOX_PHYS_FAULT step counter
   // ReplaceBody's per-joint step: rebuild `joint` with `newBody` standing in
   // for `oldBody` on whichever side it was. False if nothing was rebuilt.
   bool RetargetJoint(uint64_t joint, uint64_t oldBody, uint64_t newBody);

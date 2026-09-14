@@ -30,12 +30,50 @@
 // reaches the world grid, so it can never affect the hash (rule 1).
 //
 // Free: the struct was already 8 bytes with `material`'s top nibble and two
-// bytes of tail padding unused, so `color` costs nothing.
+// bytes of tail padding unused, so `color` costs nothing. `stain` is what grew
+// it — 10 bytes as a byte, 12 as the 16-bit coat word below, and the two bytes
+// buy a MATERIAL id where a 3-bit palette slot was. Prefabs are not the tight
+// lattice (DebrisVoxel is, and it stays 8 bytes), so that is the right side to
+// spend on.
 struct PrefabVoxel {
   int16_t x, y, z;
   uint16_t material;  // 12-bit material ID (== .vox palette index)
   uint8_t color = 0;  // art palette slot, 0 = use the material's own colour
+  // BODY COAT (DESIGN.md section 7, "blood on a body"): bits 0..11 the MATERIAL
+  // that is on this voxel, bits 12..15 how much of it, 0..15. 0 = clean.
+  //
+  // A MATERIAL ID, NOT A PALETTE SLOT. It carried the world's 3-bit stain slot
+  // until 2026-09-13, which is all the RENDERER needs and strictly less than
+  // anything else does: seven slots are shared by name across materials, so a
+  // coat could say "blood" but never WHICH blood, and nothing downstream could
+  // look the substance up to ask how fast it dries, whether a footfall tracks
+  // it, or what it does to whoever is wearing it. The renderer's byte is
+  // DERIVED from this on the way into the micro brick (sim/microbody.h), which
+  // is the one place that still speaks in slots.
+  //
+  // Render + gameplay state, never hashed; a limb's coat goes with it when the
+  // limb is severed and into every fragment it splits into, is saved with the
+  // lattice (both body savers write these arrays as PODs), and is rewritten
+  // into the micro brick's stain lattice by WriteBrick.
+  uint16_t stain = 0;
 };
+
+// ---- the body stain word ----------------------------------------------------
+constexpr uint32_t kBodyStainMatMask = 0xFFFu;
+constexpr uint32_t kBodyStainAmtShift = 12u, kBodyStainAmtMask = 0xFu;
+constexpr uint32_t kBodyStainAmtMax = 15u;
+inline uint32_t BodyStainAmt(uint16_t s) {
+  return (s >> kBodyStainAmtShift) & kBodyStainAmtMask;
+}
+inline uint32_t BodyStainMat(uint16_t s) { return s & kBodyStainMatMask; }
+// amount 0 packs to 0 whatever the material: "no coat" has one spelling, so a
+// washed-out voxel compares equal to a never-stained one.
+inline uint16_t PackBodyStain(uint32_t mat, uint32_t amt) {
+  if (amt == 0) return 0;
+  if (amt > kBodyStainAmtMax) amt = kBodyStainAmtMax;
+  return (uint16_t)((mat & kBodyStainMatMask) |
+                    ((amt & kBodyStainAmtMask) << kBodyStainAmtShift));
+}
 
 struct PrefabModel {
   std::string name;   // scene-graph node name, or "modelN"

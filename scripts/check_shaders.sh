@@ -16,6 +16,9 @@ ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 SHADER_DIR="$ROOT/assets/shaders"
 COMMON="$SHADER_DIR/common.wgsl"
 WORLD_H="$ROOT/src/sim/world.h"
+# The angle-of-repose tier codes and packing live in materials.h, not world.h:
+# they are MATERIAL layout, and ShaderConstantPrelude() emits them from there.
+MATERIALS_H="$ROOT/src/sim/materials.h"
 
 # Locate the tint CLI. Built by the `tint_cmd_tint_cmd` target once
 # TINT_BUILD_CMD_TOOLS is ON; may land in a few places depending on generator.
@@ -59,6 +62,10 @@ EOF
 cpp_const() {  # cpp_const <name> -> literal, minus any type suffix
   sed -n "s/.*constexpr[a-z0-9_ ]* $1 = \([0-9.]*\)f\?;.*/\1/p" "$WORLD_H" | head -1
 }
+mat_const() {  # mat_const <name> -> decimal or hex literal from materials.h
+  sed -n "s/.*constexpr[a-z0-9_ ]* $1 = \(0x[0-9A-Fa-f]*\|[0-9]*\)u\?;.*/\1/p" \
+    "$MATERIALS_H" | head -1
+}
 cpp_const_hex() {  # cpp_const_hex <name> -> hex literal, minus the u suffix
   sed -n "s/.*constexpr[a-z0-9_ ]* $1 = \(0x[0-9A-Fa-f]*\)u\?;.*/\1/p" "$WORLD_H" | head -1
 }
@@ -73,6 +80,19 @@ if [ -z "$W_N" ] || [ -z "$W_CHUNK" ] || [ -z "$W_VOX" ] || [ -z "$W_IFAIR" ] \
   exit 1
 fi
 W_NCHUNK=$((W_N / W_CHUNK))
+
+# TICKET SLOTS (world.h kTicketMax block, docs/PLAN_chunk_tickets.md 2.1).
+# kTicketSlots and kNumSlots are expressions in world.h, so scrape the two
+# literals and redo the arithmetic exactly as world.h does. NUM_CHUNKS stays
+# the window cube; NUM_SLOTS is the allocated slot space.
+W_TICKETMAX="$(cpp_const kTicketMax)"
+W_TICKETBOXN="$(cpp_const kTicketBoxN)"
+: "${W_TICKETMAX:=0}"
+: "${W_TICKETBOXN:=5}"
+W_TICKETCHUNKS=$((W_TICKETBOXN * W_TICKETBOXN * W_TICKETBOXN))
+W_TICKETSLOTS=$(( ((W_TICKETMAX * W_TICKETCHUNKS + 63) / 64) * 64 ))
+W_NUMCHUNKS=$((W_NCHUNK * W_NCHUNK * W_NCHUNK))
+W_NUMSLOTS=$((W_NUMCHUNKS + W_TICKETSLOTS))
 
 # Sub-chunk occupancy bitmask (world.h kSubOccShift block). kSubOccDim and
 # kSubOccStride are expressions there, so scrape the two literals and redo the
@@ -153,6 +173,31 @@ W_MATSLOTS="$(cpp_const kMaterialSlots)"
   echo "check_shaders: cannot parse kMaterialSlots from $WORLD_H" >&2; exit 1; }
 W_STAINBASE=$((W_MATSLOTS - 8))
 
+# Angle of repose (src/sim/materials.h kRepose* / kMatRepose*). Same rule as
+# every world constant: the header is the source and this script scrapes it, so
+# a shader edit can be validated with no build and still see the real values.
+M_R11="$(mat_const kRepose1To1)"
+M_R21="$(mat_const kRepose2To1)"
+M_R31="$(mat_const kRepose3To1)"
+M_R12="$(mat_const kRepose1To2)"
+M_R13="$(mat_const kRepose1To3)"
+M_RASH="$(mat_const kMatReposeCodeAShift)"
+M_RAMASK="$(mat_const kMatReposeCodeAMask)"
+M_RBSH="$(mat_const kMatReposeCodeBShift)"
+M_RBMASK="$(mat_const kMatReposeCodeBMask)"
+M_RBLSH="$(mat_const kMatReposeBlendShift)"
+M_RBLMASK="$(mat_const kMatReposeBlendMask)"
+# kRepose1To1 and kMatReposeCodeAShift are legitimately "0", so test for EMPTY
+# rather than for falsy -- a `-z` on a value that is allowed to be zero is the
+# kind of check that passes until somebody reorders the enum.
+for _v in M_R11 M_R21 M_R31 M_R12 M_R13 M_RASH M_RAMASK M_RBSH M_RBMASK \
+          M_RBLSH M_RBLMASK; do
+  eval "_x=\${$_v}"
+  [ -n "$_x" ] || {
+    echo "check_shaders: cannot parse the kRepose*/kMatRepose* constants from $MATERIALS_H" >&2
+    exit 1; }
+done
+
 # Art palette — same shape as the stain palette: a run of reserved material
 # slots holding per-voxel mob SKIN colours (world.h kArtPaletteBaseGpu).
 #
@@ -171,6 +216,13 @@ W_TINTSLOTS="$(cpp_const kTintPaletteSlotsGpu)"
 [ -n "$W_TINTSLOTS" ] || {
   echo "check_shaders: cannot parse kTintPaletteSlotsGpu from $WORLD_H" >&2; exit 1; }
 W_TINTBASE=$((W_ARTBASE - W_TINTSLOTS))
+
+# Far slot palette - the fourth reserved run (world.h kFarPaletteBaseGpu),
+# mapping a far cascade cell's 7-bit FAR SLOT back to the material it paints.
+W_FARSLOTS="$(cpp_const kFarPaletteSlotsGpu)"
+[ -n "$W_FARSLOTS" ] || {
+  echo "check_shaders: cannot parse kFarPaletteSlotsGpu from $WORLD_H" >&2; exit 1; }
+W_FARBASE=$((W_TINTBASE - W_FARSLOTS))
 
 # Static micro-detail brick pool (render-only). kMicroPoolWordsWorld is written
 # as a shift expression in world.h, so scrape the shift and redo the arithmetic
@@ -251,7 +303,9 @@ PRELUDE_TEXT="$(printf '%s\n' \
   "const WORLD_N : u32 = ${W_N}u;" \
   "const CHUNK : u32 = ${W_CHUNK}u;" \
   "const NCHUNK : u32 = ${W_NCHUNK}u;" \
-  "const NUM_CHUNKS : u32 = $((W_NCHUNK * W_NCHUNK * W_NCHUNK))u;" \
+  "const NUM_CHUNKS : u32 = ${W_NUMCHUNKS}u;" \
+  "const TICKET_SLOTS : u32 = ${W_TICKETSLOTS}u;" \
+  "const NUM_SLOTS : u32 = ${W_NUMSLOTS}u;" \
   "const CHUNK_VOL : u32 = $((W_CHUNK * W_CHUNK * W_CHUNK))u;" \
   "const CHUNK_SHIFT : u32 = ${W_SHIFT}u;" \
   "const CHUNK_MASK : i32 = $((W_CHUNK - 1));" \
@@ -262,7 +316,7 @@ PRELUDE_TEXT="$(printf '%s\n' \
   "const SUBOCC_DIM : u32 = ${W_SUBDIM}u;" \
   "const SUBOCC_WORDS : u32 = ${W_SUBWORDS}u;" \
   "const SUBOCC_STRIDE : u32 = ${W_SUBSTRIDE}u;" \
-  "const SUBOCC_BASE : u32 = $((W_NCHUNK * W_NCHUNK * W_NCHUNK))u;" \
+  "const SUBOCC_BASE : u32 = ${W_NUMSLOTS}u;" \
   "const OPEN_FACES : u32 = ${W_OPENFACES}u;" \
   "const OPEN_WORDS_PER_CHUNK : u32 = ${W_OPENWORDS}u;" \
   "const WORLD_SHIFT : u32 = ${W_WORLDSHIFT}u;" \
@@ -286,9 +340,21 @@ PRELUDE_TEXT="$(printf '%s\n' \
   "const STAIN_PALETTE_BASE : u32 = ${W_STAINBASE}u;" \
   "const ART_PALETTE_BASE : u32 = ${W_ARTBASE}u;" \
   "const TINT_PALETTE_BASE : u32 = ${W_TINTBASE}u;" \
+  "const FAR_PALETTE_BASE : u32 = ${W_FARBASE}u;" \
   "const MICRO_POOL_WORDS : u32 = ${W_MICROPOOL}u;" \
   "const MICRO_BODY_POOL_WORDS : u32 = ${W_MBPOOL}u;" \
   "const MATERIAL_SLOTS : u32 = ${W_MATSLOTS}u;" \
+  "const REPOSE_1_1 : u32 = ${M_R11}u;" \
+  "const REPOSE_2_1 : u32 = ${M_R21}u;" \
+  "const REPOSE_3_1 : u32 = ${M_R31}u;" \
+  "const REPOSE_1_2 : u32 = ${M_R12}u;" \
+  "const REPOSE_1_3 : u32 = ${M_R13}u;" \
+  "const MAT_REPOSE_A_SHIFT : u32 = ${M_RASH}u;" \
+  "const MAT_REPOSE_A_MASK : u32 = ${M_RAMASK}u;" \
+  "const MAT_REPOSE_B_SHIFT : u32 = ${M_RBSH}u;" \
+  "const MAT_REPOSE_B_MASK : u32 = ${M_RBMASK}u;" \
+  "const MAT_REPOSE_BLEND_SHIFT : u32 = ${M_RBLSH}u;" \
+  "const MAT_REPOSE_BLEND_MASK : u32 = ${M_RBLMASK}u;" \
   "const WATERBODY_CAP : u32 = ${W_WBCAP}u;" \
   "const WATERBODY_WORDS : u32 = ${W_WBWORDS}u;" \
   "const WATERBODY_STATE_WORDS : u32 = ${W_WBSTATE}u;" \

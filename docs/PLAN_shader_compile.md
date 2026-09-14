@@ -303,3 +303,147 @@ produce. What to read out of `build/last_run.json` and the log:
 Not verified, therefore not merged. Pre-existing and NOT from this package:
 `check_invariants.py` fails on a stale `tests/env_predictions.json`
 (`biomesHash c1481fcd` vs `73dc273a`), inherited from main's env-pg-pi merge.
+
+## Lazy far, the exit tax, and the recipe — MEASURED AND LANDED 2026-09-09
+
+**The question was "why does one worldgen edit still cost an agent ten minutes
+before the next look at the terrain", and the answer was three unrelated
+things stacked, only one of which was shader compilation.** Measured on the
+same machine (RTX 3060 Ti), one `--voxdump 0,1008,0,64,64,64,1` after a one-line
+edit to `genCellIn`, `SANDVOX_SHADER_TIMING=1`, everything else warm, wrapper
+and exe both timestamped:
+
+| | before (7a688b1 exe) | after |
+|---|---:|---:|
+| launch to voxdump written | **8 min 00 s** | **58 s** |
+| launch to process gone | **12 min 01 s** | **58.5 s** |
+
+Where the twelve minutes went, per entry point (Tint / spirv-opt / driver):
+
+| entry | before: pipeline total | of which spirv-opt | after: pipeline total | of which spirv-opt | Tint |
+|---|---:|---:|---:|---:|---:|
+| worldgen `main` | 139.0 s | 108.8 s | **44.3 s** | 9.8 s | 0.15 s |
+| worldgen `list` | 144.1 s | 116.4 s | **44.4 s** | 10.0 s | 0.15 s |
+| worldgen `pagefill` | 0.2 s | 0.03 s | 0.15 s | 0.01 s | 0.1 s |
+| worldgen `fardown` | 477.8 s | 334.1 s | not compiled | — | — |
+| worldgen `farpatch` | 490.9 s | 408.2 s | not compiled | — | — |
+| worldgen `far` | 571.1 s | 527.0 s | not compiled | — | — |
+
+(The `before` far numbers are three spirv-opt threads contending with each
+other and with a 62 s C++ compile; package B measured `far` at 170 s
+standalone. The `main`/`list` before-arm overlapped the owner's own game
+launch for its first minutes. Both inflate `before`; neither touches `after`.)
+
+### 1. The far set was compiled by runs that never looked at it, and they could not exit until it finished
+
+Package A deferred `far`/`farpatch`/`fardown` to a background `std::async`
+so the game is playable before they land. It also started that compile in
+EVERY mode. Only two call sites in the whole selftest ever pass a nonzero far
+fill count (`selftest_render.cpp`, the three `far-*` gates); `--voxdump`,
+`--voxserve`, `--sweep` and every other `--gate` never do. Those runs paid
+twice: three optimizer threads (100-500 s of CPU each) ran beside the real
+work and slowed it, and then **the process could not exit**: a `std::future`
+from `std::async` joins its thread in its destructor, so the before-arm's
+voxdump was written at 8:00 and the process was gone at 12:01. A 5 s gate
+printed its verdict and then sat silent for minutes; nothing in
+`build/last_run.json` records that time because the file is written before it.
+
+Now `Simulation::FarBuild` is `Eager` or `Lazy`, set by `main.cpp` before
+`Init`. Eager: the game and `--frames`, every `--shot` family, `--measure`,
+`--perf`, `--render-budget`, `--shader-stats`, `--suite acceptance`, and a
+FULL `--selftest` (it contains the far gates). Lazy: `--voxdump`,
+`--voxserve`, `--sweep`, the fluid bench, and any filtered `--gate` /
+`--verify` without shot frames or budget arms. Lazy is not never:
+`EnsureFarPipelines` (the one place cascade CONTENT is demanded) starts the
+build and blocks, so `--gate far-fog` still gets its horizon and every
+checked output is still independent of driver timing. The build moved into
+`StartFarBuild` (from `farModule_`, the worldgen module BuildPipelines last
+loaded); `check_pass_table.py` learned the one extra alias so the far rows
+still resolve.
+
+Hash-neutral by construction and by measurement: the 7a688b1 exe and the new
+exe both produce `eb284643` on the same tree. (The pin `9bfed213` is stale
+from 7a688b1's own worldgen change, which shipped without a rebaseline; not
+this package's to move, and the owner's uncommitted map/tuning edits are in
+the tree too.)
+
+### 2. Every run.sh and build.sh paid 0-60 s per lock at RELEASE, in svlock.sh, not the engine
+
+Instrumenting the exit path (`selftest returned` / `atexit` marks, a timed
+`Backend::Shutdown`) showed main()'s teardown at 0 ms and the process gone
+within a second, yet the wrapper printed `END` 28, 44, 48 and 50 s after the
+exe's last line on four consecutive runs, and `bash scripts/run.sh true` took
+**60.2 s**. `svlock_release` kills the heartbeat subshell and `wait`s for it
+(148aa81, to stop bash printing "Terminated"), but a bash blocked in a
+foreground `sleep 60` does not act on the TERM until the sleep returns, so
+every release cost the remainder of the current minute. The GPU lock is two
+locks (legacy + gpu), each with a heartbeat. The heartbeat now backgrounds
+its sleep and `wait`s on it with a TERM trap that kills the sleep; `run.sh
+true` is **0.29 s**. This tax was on every build phase and every exe run in
+every session since 148aa81.
+
+### 3. spirv-opt's performance recipe was 69% of a worldgen entry's compile; the legalization recipe does the driver's work for a sixth of the price
+
+With far lazy and the exit fixed, `main`/`list` were 89 s each: Tint 0.13 s,
+spirv-opt **60.9 s**, driver 27.7 s. The `legal` recipe (already wired,
+unmeasured since package B) on the same edit: spirv-opt **9.8 s**, driver
+34.3 s, total **44.3 s**. The optimizer output is BIGGER (1,100k vs 671k
+words: no loop unrolling, no CCP, one SSA round) and the driver charges 6.6 s
+more for it, against 51 s saved. Worldgen kernels run once per generated
+chunk; their ISA quality is worth far less than their compile time. So
+`RecipeFor(label)` in `vk_spirv.cpp` gives `worldgen.wgsl` the legalization
+recipe by default and everything else the performance one (the other 58 entry
+points spend ~12 s of CPU in the optimizer between them, and raymarch's ISA
+quality is what frames are made of). An explicit `SANDVOX_SPIRV_OPT` still
+applies to every shader, and the recipe id is per-label in the SPIR-V cache
+key.
+
+Far under the legalization recipe, measured by `--gate determinism --gate
+far-fog` on the main tree (the far gate is what DEMANDS the cascades, so this
+run is also the proof that a lazy start works end to end: "waiting for the
+deferred far-cascade pipelines" printed at the gate, all three compiled
+concurrently, the gate ran, the run exited on its own):
+
+| entry | spirv-opt (legal) | pipeline total | before (perf, package B standalone / this session contended) |
+|---|---:|---:|---:|
+| `fardown` | 12.9 s | 53.4 s | 54.7 s / 477.8 s |
+| `farpatch` | 15.2 s | 62.5 s | (not split then) / 490.9 s |
+| `far` | 16.6 s | **72.2 s** | 170.7 s / 571.1 s |
+
+The far set is ready **71 s after it is asked for**, and the game after a
+worldgen edit gets its horizon in about that instead of 5-12 minutes.
+`determinism` on the switched worldgen: `eb284643`, unchanged.
+
+### 4. Both caches are shared across worktrees now
+
+`run.sh` exports `SANDVOX_SHADER_CACHE=C:/sv-deps/shader_cache` and
+`SANDVOX_PIPELINE_CACHE=C:/sv-deps/sandvox_pipeline_cache.bin` unless the
+caller set them, seeding the pipeline cache from the CWD's on first use. The
+SPIR-V cache is keyed on (assembled source, entry point, recipe) and the
+driver keys its blob on the SPIR-V it is handed, so sharing is exact: a
+worktree hits when its shaders are byte-identical to something already
+compiled and misses when they are not. Confirmed in passing: a cold SPIR-V
+cache with a warm driver cache re-ran spirv-opt for `main` (112 s) and the
+driver then returned the pipeline in 0.4 s. The driver cache DOES key on
+SPIR-V bytes, not on the WGSL, so an edit that leaves an entry point's SPIR-V
+unchanged costs only Tint + spirv-opt for it. Also seen: the main checkout's
+`shader_cache/` held 33,847 files / 1.8 GB and `sandvox_pipeline_cache.bin`
+220 MB, both append-only; neither is pruned yet.
+
+### What is still on the table
+
+- **Per-entry-point SPIR-V modules are already the design**: Tint is asked
+  for one entry point per module (`entry_point_name`), and the cache key
+  carries the entry. Tint itself is 0.13 s per worldgen entry. There is no
+  "linker" change to make; the remaining per-edit cost is spirv-opt (10 s) and
+  the driver (~30 s) for `main` and `list` concurrently, so ~45 s is the
+  floor for a worldgen logic edit until one of those two moves.
+- `main` and `list` are the same kernel behind one indirection (package C
+  item 3, still skipped): merging them halves the CPU the optimizer burns but
+  not the wall clock, which is max() of the two.
+- The interactive game still cannot EXIT while an eager far compile is
+  running (same future destructor). Killing it loses only the horizon's cache.
+- `Backend::Shutdown` never runs in headless modes (main()'s locals tear down
+  in 0 ms and the `[shutdown]` line never prints), so the exit-time
+  `SavePipelineCache` is dead there; the mid-build saves are what persist.
+

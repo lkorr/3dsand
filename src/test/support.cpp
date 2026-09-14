@@ -105,6 +105,28 @@ void SetShortRange(bool on) {
   g_shortRange = on;
 }
 
+// Which ceiling the mode uses (support.h ShortRangeNear). Same latch shape as
+// above so `--short-range-near` / SANDVOX_SHORT_RANGE_NEAR reach every headless
+// drawing path, and the panel's radio re-asserts it every frame in the game.
+namespace {
+bool g_shortRangeNear = false;
+bool g_shortRangeNearEnvRead = false;
+}
+
+bool ShortRangeNear() {
+  if (!g_shortRangeNearEnvRead) {
+    g_shortRangeNearEnvRead = true;
+    const char* e = std::getenv("SANDVOX_SHORT_RANGE_NEAR");
+    if (e && e[0] && e[0] != '0') g_shortRangeNear = true;
+  }
+  return g_shortRangeNear;
+}
+
+void SetShortRangeNear(bool on) {
+  ShortRangeNear();   // consume the env default first, then override it
+  g_shortRangeNear = on;
+}
+
 // Time of day used by --shot, as a 0..1 fraction of the cycle (0 = midnight,
 // 0.5 = noon). Set by `--time`; see RunShots.
 float g_shotTimeOfDay = 0.34f;
@@ -234,8 +256,15 @@ void ApplyTaaJitter(const Camera& cam, const Vec3& eye, float aspect,
 // below, read only by Simulation::DrawWorld.
 namespace {
 RenderSpec gRenderSpec;
+// The sim's gas latch, published by Simulation::EncodeTick and read by
+// WriteRenderParams below (renderspec.h). A file-local flag for the reason
+// gRenderSpec above is one: the value crosses from simulation.cpp to the one
+// author of the flag word, and neither TU may include the other's header.
+bool gGasRenderActive = false;
 }
 const RenderSpec& LastRenderSpec() { return gRenderSpec; }
+void SetGasRenderActive(bool active) { gGasRenderActive = active; }
+bool GasRenderActive() { return gGasRenderActive; }
 
 void WriteRenderParams(const rhi::Queue& queue, const World& world,
                        const Vec3& eye, const Camera& cam, float aspect,
@@ -254,9 +283,17 @@ void WriteRenderParams(const rhi::Queue& queue, const World& world,
   rp.aspect = aspect;
   rp.time = time;
   // bit 0 = sun shadows, bit 1 = active-voxel debug highlight (extraFlags),
-  // bit 2 = short-range mode. Bit 2 is OR'd in here rather than passed by the
-  // caller so that every drawing path gets it — see ShortRangeMode above.
-  rp.flags = (shadows ? 1u : 0u) | extraFlags | (ShortRangeMode() ? 4u : 0u);
+  // bit 2 = short-range mode, bit 3 = gas may be present (the crossfade;
+  // docs/PLAN_gas_particles.md stage 1b), bit 4 = short-range NEAR arm (the
+  // 50 m ceiling instead of the 100 m one). Bits 2, 3 and 4 are OR'd in here
+  // rather than passed by the caller so that every drawing path gets them —
+  // see ShortRangeMode above and SetGasRenderActive in renderspec.h.
+  //
+  // Bit 4 is deliberately NOT reflected into RenderSpec: it picks a distance
+  // inside a branch bit 2 already guards, so it changes no shader's shape and
+  // must not double the pipeline variants.
+  rp.flags = (shadows ? 1u : 0u) | extraFlags | (ShortRangeMode() ? 4u : 0u) |
+             (GasRenderActive() ? 8u : 0u) | (ShortRangeNear() ? 16u : 0u);
   // Publish the SPEC_* predicates for this frame (support.h RenderSpec). Read
   // off `rp` rather than off the arguments, so the record is the WORD THAT WAS
   // UPLOADED and not a second derivation of it.
@@ -492,6 +529,10 @@ void SubmitTick(GpuContext& ctx, World& world, Simulation& sim, uint32_t tick,
     tp.windSpeedQ = wq.speed;
     tp.windGustQ = wq.gust;
     tp.windMode = (uint32_t)wtun.sim.windMode;
+    // The gas edge (docs/PLAN_gas_particles.md). Read here, from the same
+    // tuning snapshot windMode comes from, so the value the kernel branches on
+    // and the value Simulation gates Cond::Gas on are one read.
+    tp.gasMode = (uint32_t)wtun.sim.gasMode;
     // The two dev force multipliers, Q8. Rounded half-away-from-zero by hand
     // for the WindQuantize reason — the rounding mode is part of what the sim
     // sees, so it is written here rather than left to a compiler flag. At the
@@ -602,14 +643,14 @@ void SubmitTick(GpuContext& ctx, World& world, Simulation& sim, uint32_t tick,
       const std::vector<uint32_t>& lbl = wb.ChunkBody();
       auto touch = [&](IVec3 wc, IVec3 cell) {
         if (worldEdited || !world.ChunkInWindow(wc)) return;
-        if (lbl.size() == kNumChunks && lbl[World::SlotChunkIndex(wc)] != 0) {
+        if (lbl.size() == kNumSlots && lbl[World::SlotChunkIndex(wc)] != 0) {
           worldEdited = true;
           editCell = cell;
         }
       };
       for (uint32_t i = 0; i < cellCount && !worldEdited; i++) {
         const uint32_t slot = cells[i].cellIdx / kChunkVol;
-        if (slot < kNumChunks && lbl.size() == kNumChunks && lbl[slot] != 0) {
+        if (slot < kNumSlots && lbl.size() == kNumSlots && lbl[slot] != 0) {
           worldEdited = true;
           // The op carries a SLOT-linear index, so the world position comes
           // back through the window (SlotToWorldChunk) plus the in-chunk
@@ -789,6 +830,24 @@ void SubmitTick(GpuContext& ctx, World& world, Simulation& sim, uint32_t tick,
     // the write page starts each tick empty; survivors + emissions repopulate
     uint32_t zero = 0;
     ctx.queue.WriteBuffer(world.particleCounts, (1 - sim.Page()) * 4, &zero, 4);
+  }
+
+  // ---- CPU-authored gas spawns (docs/PLAN_gas_particles.md) --------------
+  // Uploaded EVERY tick, header included, even when the list is empty: the
+  // count lives in word 0 of the buffer itself, so a tick that skipped the
+  // write would re-spawn the previous tick's ops. 32 bytes when idle.
+  //
+  // Simulation is told the count BEFORE EncodeTick because the C_GAS latch
+  // decides there whether the pass that drains this list is recorded at all.
+  {
+    std::vector<GasSpawnOp> gas;
+    world.TakeGasSpawns(gas);
+    std::vector<uint32_t> hdr(kGasSpHdr + gas.size() * kGasSpStride, 0u);
+    hdr[kGasSpCount] = (uint32_t)gas.size();
+    if (!gas.empty())
+      std::memcpy(hdr.data() + kGasSpHdr, gas.data(), gas.size() * sizeof(GasSpawnOp));
+    ctx.queue.WriteBuffer(world.gasSpawnOps, 0, hdr.data(), hdr.size() * 4);
+    sim.NoteGasSpawns((uint32_t)gas.size());
   }
 
   // Day/night sleep handshake. The daylight-gated reactions deliberately do
@@ -1076,7 +1135,17 @@ void SubmitTick(GpuContext& ctx, World& world, Simulation& sim, uint32_t tick,
     // and shows nothing in flight — `resolve` is a dirty-writer whose target
     // the CPU never chose, so activeChunks alone does not mean settled.
     const WorldSnapshot& sn = world.Snap();
-    if (sn.valid) sim.NoteSnapshot(sn.tick, sn.activeChunks, sn.particleCount);
+    if (sn.valid) {
+      sim.NoteSnapshot(sn.tick, sn.activeChunks, sn.particleCount);
+      // The C_GAS latch's disarming input. Latent by design — see the block in
+      // Simulation::EncodeTick for why a stale zero cannot turn gas off.
+      sim.NoteGasLive(sn.gasCount);
+      // The RENDER flag's arming input (RenderParams bit 3). Parcels OR gas
+      // voxels: a plume that never leaves the window has no parcels and still
+      // has to crossfade at the faces. See Simulation::NoteGasSeen.
+      sim.NoteGasSeen(sn.gasCount > 0 ||
+                      (sn.dirtyReasonOr & kDirtyGasMask) != 0);
+    }
   }
 
   // THE genList UPLOAD MUST HAPPEN BEFORE THE ENCODER EXISTS, and this is a
@@ -1562,8 +1631,8 @@ void SubmitWorldgen(GpuContext& ctx, World& world, Simulation& sim, uint32_t see
     std::vector<uint32_t> batch;
     std::vector<uint32_t> vox((size_t)kGenBatch * kChunkVol);
     batch.reserve(kGenBatch);
-    for (uint32_t base = 0; base < kNumChunks; base += kGenBatch) {
-      const uint32_t n = std::min(kGenBatch, kNumChunks - base);
+    for (uint32_t base = 0; base < kNumSlots; base += kGenBatch) {
+      const uint32_t n = std::min(kGenBatch, kNumSlots - base);
       batch.clear();
       for (uint32_t k = 0; k < n; k++) {
         batch.push_back(base + k);
@@ -1639,10 +1708,10 @@ void SubmitWorldgen(GpuContext& ctx, World& world, Simulation& sim, uint32_t see
     // nothing wider.
     uint32_t woken = 0;
     {
-      std::vector<uint32_t> woke((size_t)kNumChunks, 0u);
+      std::vector<uint32_t> woke((size_t)kNumSlots, 0u);
       rhi::ReadbackBlocking(ctx.device, ctx.queue, world.dirty[0], 0,
-                            woke.data(), (size_t)kNumChunks * 4, "wgWake");
-      for (uint32_t s = 0; s < kNumChunks; s++) {
+                            woke.data(), (size_t)kNumSlots * 4, "wgWake");
+      for (uint32_t s = 0; s < kNumSlots; s++) {
         if (woke[s] == 0u) continue;
         world.pages->RefilledSlot(s);
         woken++;
@@ -1833,9 +1902,93 @@ void ReadWaterLedgerSync(GpuContext& ctx, World& world, int32_t* out) {
                         "waterLedgerRead");
 }
 
+// `out32` must have room for kFluidArgsWords (world.h), which is what every
+// caller declares. The size used to be a literal 32 here and a literal 128 in
+// three places in world.cpp; they are one constant now.
 void ReadFluidArgsSync(GpuContext& ctx, World& world, uint32_t* out32) {
   rhi::ReadbackBlocking(ctx.device, ctx.queue, world.fluidArgsStage, 0, out32,
-                        32 * 4, "fluidArgsRead");
+                        kFluidArgsBytes, "fluidArgsRead");
+}
+
+// ---- gas particles: the gates' readback surface ---------------------------
+// SYNCHRONOUS, and only ever called from a gate. The frame path reads gas
+// through the snapshot ring (WorldSnapshot::gas*), exactly like everything
+// else; nothing here is on it.
+
+// Live gas parcels per PAGE. `GasAliveSync` picks the one the tick just wrote.
+void ReadGasCountsSync(GpuContext& ctx, World& world, uint32_t out[2]) {
+  rhi::ReadbackBlocking(ctx.device, ctx.queue, world.gasCounts, 0, out, 8,
+                        "gasCountsRead");
+}
+
+// This tick's gas counters: gasSpawn's 8-word header, cleared before the CA
+// runs, so every word is per-tick and not a running total. Index with the
+// kGasSp* enum in world.h.
+void ReadGasStatsSync(GpuContext& ctx, World& world, uint32_t* out16) {
+  rhi::ReadbackBlocking(ctx.device, ctx.queue, world.gasSpawn, 0, out16,
+                        kGasSpHdrBytes, "gasStatsRead");
+}
+
+uint32_t GasAliveSync(GpuContext& ctx, World& world, Simulation& sim) {
+  uint32_t c[2] = {};
+  ReadGasCountsSync(ctx, world, c);
+  // Same parity as the ballistic count: after SubmitTick's FlipPage, Page() is
+  // the buffer the tick just wrote.
+  return std::min(c[sim.Page() & 1], kGasParticleCap);
+}
+
+// Reads the live gas page back and counts the parcels at or above `worldY`.
+// The whole page, because there is no ordering to exploit — a parcel's slot
+// says nothing about where it is (rule 1: behaviour is derived from state,
+// never from a buffer slot, and that cuts both ways).
+uint32_t GasAboveYSync(GpuContext& ctx, World& world, Simulation& sim,
+                       int32_t worldY, uint32_t* outTotal) {
+  const uint32_t n = GasAliveSync(ctx, world, sim);
+  if (outTotal) *outTotal = n;
+  if (n == 0) return 0;
+  std::vector<uint32_t> p((size_t)n * 8, 0u);
+  rhi::ReadbackBlocking(ctx.device, ctx.queue, world.gasParticles[sim.Page() & 1], 0,
+                        p.data(), (size_t)n * 32, "gasParticlesRead");
+  uint32_t above = 0;
+  for (uint32_t i = 0; i < n; i++) {
+    const uint32_t* r = p.data() + (size_t)i * 8;
+    if ((r[7] & kPFlagAlive) == 0) continue;   // flags
+    const int32_t py = (int32_t)r[1] >> 8;     // 24.8 -> cell
+    if (py >= worldY) above++;
+  }
+  return above;
+}
+
+// The outer density box, folded over the cells at or above `worldY`. `outMax`
+// is the densest cell and `outSum` the total, which is what a gate asserting
+// "there is a plume up there" wants — a max alone cannot tell one stray parcel
+// from a column, and a sum alone cannot tell a column from a haze.
+//
+// The mapping is world.h's, restated nowhere: originVox = windowOrigin -
+// kWorldN/2, cell = (voxel - originVox) >> kGasOuterShift.
+void ReadGasOuterAboveSync(GpuContext& ctx, World& world, int32_t worldY,
+                           uint32_t* outMax, uint64_t* outSum) {
+  std::vector<uint32_t> g(kGasOuterWords, 0u);
+  rhi::ReadbackBlocking(ctx.device, ctx.queue, world.gasOuter, 0, g.data(),
+                        (size_t)kGasOuterWords * 4, "gasOuterRead");
+  const IVec3 wo = world.WindowOrigin();   // CHUNK units
+  const int32_t oy = wo.y * (int32_t)kChunk - (int32_t)(kWorldN / 2);
+  uint32_t mx = 0;
+  uint64_t sum = 0;
+  // Two 16-bit counts per word since stage 1b (world.h kGasOuterWords), so the
+  // linear cell index indexes a u16 array and not a byte one.
+  const uint16_t* b = (const uint16_t*)g.data();
+  for (uint32_t cy = 0; cy < kGasOuterN; cy++) {
+    if (oy + (int32_t)(cy << kGasOuterShift) < worldY) continue;
+    for (uint32_t cz = 0; cz < kGasOuterN; cz++)
+      for (uint32_t cx = 0; cx < kGasOuterN; cx++) {
+        const uint32_t v = b[(cz * kGasOuterN + cy) * kGasOuterN + cx];
+        if (v > mx) mx = v;
+        sum += v;
+      }
+  }
+  if (outMax) *outMax = mx;
+  if (outSum) *outSum = sum;
 }
 
 void ReadPageFaultsSync(GpuContext& ctx, World& world, uint32_t out[4]) {
@@ -1844,11 +1997,11 @@ void ReadPageFaultsSync(GpuContext& ctx, World& world, uint32_t out[4]) {
 }
 
 uint32_t ReadActiveChunksSync(GpuContext& ctx, World& world, Simulation& sim) {
-  std::vector<uint32_t> flags(kNumChunks, 0);
+  std::vector<uint32_t> flags(kNumSlots, 0);
   rhi::ReadbackBlocking(ctx.device, ctx.queue, sim.DirtyActive(), 0, flags.data(),
-                        kNumChunks * 4, "activeRead");
+                        kNumSlots * 4, "activeRead");
   uint32_t n = 0;
-  for (uint32_t i = 0; i < kNumChunks; i++)
+  for (uint32_t i = 0; i < kNumSlots; i++)
     if (flags[i] != 0) n++;
   return n;
 }

@@ -190,6 +190,13 @@ struct ItemCover {
   IVec3 modelOffset{};             // model min corner within the .vox, MICRO
   int microModel = -1;             // index into the shared micro-body pool
   std::vector<PrefabVoxel> voxels;
+  // Which of this panel's six boundary planes another panel of the SAME
+  // garment is pressed against (sim/microbody.h MicroBodyCutFaces). Measured
+  // once at load off the item's own prefab and kept here because the FIT
+  // resample re-packs the brick on the wearer (mob.cpp AppendWornShell) and
+  // must hand the same mask back: a resample moves cells, never the question
+  // of which plane is a seam.
+  uint32_t cutFaces = 0;
 };
 
 // PER-AXIS NEAREST-NEIGHBOUR RESAMPLE — how one authored helmet fits heads it

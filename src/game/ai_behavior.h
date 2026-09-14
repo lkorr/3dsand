@@ -179,8 +179,17 @@ struct Movement {
   // Navigator shape. `navRadius` bounds the search; it is pointless past the
   // CPU mirror's reach and expensive below it.
   float navRadius = 22.0f;
-  int maxStepUp = 2;      // must agree with what DriveLocomotion will climb
-  int maxStepDown = 5;
+  // 0 = ASK THE BODY (SelfView::stepUpCells). These were a hard 2 and 5 in
+  // behaviors.json, authored back when the drive used a fixed constant of its
+  // own — two independent copies of "how big a ledge is a wall", in a JSON file
+  // and in a C++ header, with nothing keeping them equal. Raising the drive's
+  // budget without noticing this would have made the planner the new bottleneck
+  // and looked exactly like the bug it was supposed to fix. A profile that
+  // wants a timid climber still says so; a profile that says nothing inherits
+  // whatever its rig can physically do.
+  int maxStepUp = 0;
+  int maxStepDown = 0;
+  int headroom = 0;
   // Can this creature move its feet at ALL? A statue is data, not a code path:
   // `false` forces driveScale to 0 no matter which intent wins, so a profile
   // author cannot accidentally give a training dummy a shuffle.
@@ -315,6 +324,20 @@ struct SelfView {
   // against a 2.8 rad/s cap and issued ZERO attacks in 240 ticks of holding.
   float turnRate = 3.6f;
   uint32_t faction = 0;
+  // ---- THE BODY'S OWN TERRAIN BUDGETS, in world voxels -------------------
+  // The planner and the walk drive must refuse the SAME wall. When they do
+  // not, the failure is the one ai_nav.h's `climbPenalty` note describes: A*
+  // routes over a rise the drive then declines to walk, and the creature
+  // stands at the foot of it forever insisting the way is clear. These are
+  // resolved once per rig from its authored metres (anim.h LocomotionDef) and
+  // handed across so there is exactly one number, not two that agree today.
+  //
+  // A profile MAY override them (Movement::maxStepUp and friends, > 0), which
+  // is how a cautious creature is authored — but the default is silence, and
+  // silence means "ask the body".
+  int stepUpCells = 2;
+  int stepDownCells = 5;
+  int headroomCells = 3;
   Vec3 Centre() const {
     return Vec3{origin.x + size.x * 0.5f, origin.y + size.y * 0.5f,
                 origin.z + size.z * 0.5f};

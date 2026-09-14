@@ -67,6 +67,19 @@ uint32_t DayPhaseNow(uint32_t tick);
 bool ShortRangeMode();
 void SetShortRange(bool on);
 
+// WHICH ceiling the mode uses: false = render.shortRangeDist (100 m by
+// default), true = render.shortRangeNearDist (50 m). RenderParams flag bit 4,
+// a SEPARATE bit from the mode's own bit 2 on purpose — bit 2 is what
+// SPEC_SHORT_RANGE specializes the pipeline on, and the arm is chosen far too
+// casually (it is a radio button in the dev panel) to be worth a second
+// pipeline variant. The shader reads bit 4 only inside code bit 2 already
+// guards, so the lean variant still pays nothing for either.
+//
+// Meaningless while ShortRangeMode() is false, and stays latched across a
+// toggle so flipping the mode off and on returns to the arm you last used.
+bool ShortRangeNear();
+void SetShortRangeNear(bool on);
+
 // fluidCount: live MLS-MPM particle count — nonzero enables the fluid surface
 // march in raymarch.wgsl; zero costs the renderer nothing.
 void WriteRenderParams(const rhi::Queue& queue, const World& world,
@@ -326,6 +339,24 @@ void ReadPageFaultsSync(GpuContext& ctx, World& world, uint32_t out[4]);
 // and component 7 excites a shell, and a gate that cannot see it reports a
 // leak that is sitting in the particle pool.
 void ReadFluidArgsSync(GpuContext& ctx, World& world, uint32_t* out32);
+// ---- gas particles (docs/PLAN_gas_particles.md stage 1) -------------------
+// Gate-only synchronous reads. The frame path uses WorldSnapshot::gas* on the
+// async ring instead; nothing below is on it.
+//   ReadGasCountsSync      live parcels per page (index with sim.Page())
+//   ReadGasStatsSync       this tick's counters — index with the kGasSp* enum
+//                          in world.h (leave/refuse/edge/pool/reenter/died/
+//                          above/live). Cleared before the CA, so per-tick.
+//   GasAliveSync           live parcels on the page the tick just wrote
+//   GasAboveYSync          how many of them sit at or above a world Y
+//                          (`outTotal`, optional, gets the live count)
+//   ReadGasOuterAboveSync  the outer density box folded above a world Y
+void ReadGasCountsSync(GpuContext& ctx, World& world, uint32_t out[2]);
+void ReadGasStatsSync(GpuContext& ctx, World& world, uint32_t* out16);
+uint32_t GasAliveSync(GpuContext& ctx, World& world, Simulation& sim);
+uint32_t GasAboveYSync(GpuContext& ctx, World& world, Simulation& sim,
+                       int32_t worldY, uint32_t* outTotal = nullptr);
+void ReadGasOuterAboveSync(GpuContext& ctx, World& world, int32_t worldY,
+                           uint32_t* outMax, uint64_t* outSum);
 uint32_t ReadActiveChunksSync(GpuContext& ctx, World& world, Simulation& sim);
 
 // THE CPU SEAM for gate voxel dumps (PLAN_page_table.md §2.1a, fifth site).

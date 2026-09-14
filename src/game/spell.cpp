@@ -105,8 +105,8 @@ constexpr int32_t kGravityFxPerTick2 =
     (int32_t)((int64_t)981 * kVoxelsPerMetre * kSpellFxOne /
               (100 * kTicksPerSecond * kTicksPerSecond));
 
-const char* kSortNames[kGlyphSortCount] = {"matter", "effect", "delivery", "mod",
-                                          "operator"};
+const char* kSortNames[kGlyphSortCount] = {"matter", "effect",   "delivery",
+                                          "mod",    "operator", "separator"};
 
 struct VerbName {
   const char* name;
@@ -118,13 +118,13 @@ const VerbName kVerbNames[] = {
     {"explode", SpellVerb::Explode}, {"wind", SpellVerb::Wind},
     {"mend", SpellVerb::Mend},       {"trail", SpellVerb::Trail},
     {"sustain", SpellVerb::Sustain}, {"filter", SpellVerb::Filter},
-    {"repeat", SpellVerb::Repeat},
+    {"repeat", SpellVerb::Repeat},   {"launch", SpellVerb::Launch},
 };
 
 bool ParseModField(const std::string& s, ModField& out) {
   static const std::pair<const char*, ModField> k[] = {
-      {"count", ModField::Count},       {"children", ModField::Children},
-      {"gravity", ModField::Gravity},   {"speed", ModField::Speed},
+      {"count", ModField::Count},       {"gravity", ModField::Gravity},
+      {"speed", ModField::Speed},
       {"lifetime", ModField::Lifetime}, {"radius", ModField::Radius},
       {"bounces", ModField::Bounces},   {"pierce", ModField::Pierce},
       {"seek", ModField::Seek},         {"fuse", ModField::Fuse},
@@ -214,7 +214,6 @@ std::string Times(int32_t n, BracketStyle style) {
 const char* ModFieldName(ModField f) {
   switch (f) {
     case ModField::Count: return "count";
-    case ModField::Children: return "children";
     case ModField::Gravity: return "gravity";
     case ModField::Speed: return "speed";
     case ModField::Lifetime: return "lifetime";
@@ -354,6 +353,7 @@ bool LoadGlyphs(const std::string& path, const std::vector<MaterialDef>& mats,
   out.hand.carryMille = 1000;
   out.hand.reach = 3;
   out.hand.impactRadius = 1;
+  out.hand.noun = "hand";
   out.hand.desc = "Implicit. At reach: a few voxels in front of the caster along the aim.";
   if (j.contains("hand") && j["hand"].is_object()) {
     const json& h = j["hand"];
@@ -537,8 +537,15 @@ bool LoadGlyphs(const std::string& path, const std::vector<MaterialDef>& mats,
             return false;
           }
         }
+        // What the describe line calls one of these. Content: a modder's
+        // `comet` reads as "a comet" without a line of C++.
+        d.noun = g.value("noun", d.id);
         break;
       }
+      case GlyphSort::Separator:
+        // `also`: no fields at all. It ends one sentence and starts the next,
+        // which is the whole of its behaviour (law L4 attaches here).
+        break;
       case GlyphSort::Mod: {
         const std::string fld = g.value("field", std::string());
         if (!ParseModField(fld, d.field)) {
@@ -596,11 +603,15 @@ bool LoadGlyphs(const std::string& path, const std::vector<MaterialDef>& mats,
   return true;
 }
 
-// ---- parse (R1–R4, R6) --------------------------------------------------------
+// ---- parse (the three rules) ---------------------------------------------------
 
 GlyphSort NodeSort(const GlyphLibrary& lib, const SpellTree& t, int node) {
   if (node < 0 || node >= (int)t.nodes.size()) return GlyphSort::Effect;
   const SpellNode& n = t.nodes[node];
+  // A BOX is an Effect value (rule 2), whatever its delivery's own sort is.
+  // That is the whole trick: `explosive projectile` is a noun again, so it can
+  // go back in the pile, be boxed again, or be taken by `echo`.
+  if (n.box) return GlyphSort::Effect;
   const GlyphDef* g = lib.At(n.glyph);
   if (!g) return GlyphSort::Effect;
   return n.group ? g->result : g->sort;
@@ -615,16 +626,73 @@ bool SlotAccepts(const GlyphLibrary& lib, const SpellTree& t, uint8_t mask, int 
 
 }  // namespace
 
+namespace {
+
+// The PILE, merged: identical items collapse (sum n, capped) in first-seen
+// order. Rule 1's "order inside the pile does not matter" is only true if this
+// merge is order-insensitive, and it is: the multiset is the same however the
+// words arrived.
+std::vector<int> MergePile(const GlyphLibrary& lib, SpellTree& t,
+                           const std::vector<int>& pile) {
+  const int32_t cap = lib.budgets.maxMultiplicity;
+  std::vector<int> outItems;
+  std::vector<std::string> keys;
+  for (int ni : pile) {
+    const std::string k = NodeKey(lib, t, ni);
+    bool merged = false;
+    for (size_t j = 0; j < keys.size(); j++) {
+      if (keys[j] != k) continue;
+      SpellNode& first = t.nodes[outItems[j]];
+      first.n = std::min(first.n + t.nodes[ni].n, cap);
+      first.last = std::max(first.last, t.nodes[ni].last);
+      merged = true;
+      break;
+    }
+    if (merged) continue;
+    keys.push_back(k);
+    outItems.push_back(ni);
+  }
+  return outItems;
+}
+
+// RULE 2: box the whole pile under `deliveryGlyph` (-1 = the implicit hand).
+// Returns the new node index. `at` is the delivery word's spoken position, -1
+// for the hand.
+int CloseBox(const GlyphLibrary& lib, SpellTree& t, const std::vector<int>& pile,
+             int deliveryGlyph, int at, int spokenEnd) {
+  SpellNode b;
+  b.box = true;
+  b.glyph = deliveryGlyph;
+  b.n = 1;
+  b.at = at;
+  b.items = MergePile(lib, t, pile);
+  b.first = at >= 0 ? at : spokenEnd;
+  b.last = at >= 0 ? at : spokenEnd;
+  for (int ni : b.items) {
+    b.first = std::min(b.first, t.nodes[ni].first);
+    b.last = std::max(b.last, t.nodes[ni].last);
+  }
+  t.nodes.push_back(std::move(b));
+  return (int)t.nodes.size() - 1;
+}
+
+}  // namespace
+
 SpellTree ParseSpell(const GlyphLibrary& lib, const SpellStack& stack) {
   SpellTree t;
   const int32_t cap = lib.budgets.maxMultiplicity;
 
-  // R1: runs merge. N consecutive utterances of one glyph are ONE item ×N.
+  // RUNS MERGE first, and NOT for deliveries: `shotgun shotgun` is one item
+  // ×2, but `projectile projectile` is two boxes, because each delivery boxes
+  // what is in front of it and a merged pair would silently drop a nesting.
   std::vector<int> items;
   for (size_t i = 0; i < stack.spoken.size(); i++) {
     const int gi = stack.spoken[i];
-    if (!lib.At(gi)) continue;
-    if (!items.empty() && !t.nodes[items.back()].group &&
+    const GlyphDef* gd = lib.At(gi);
+    if (!gd) continue;
+    const bool mergeable =
+        gd->sort != GlyphSort::Delivery && gd->sort != GlyphSort::Separator;
+    if (mergeable && !items.empty() && !t.nodes[items.back()].group &&
         t.nodes[items.back()].glyph == gi) {
       SpellNode& prev = t.nodes[items.back()];
       prev.n = std::min(prev.n + 1, cap);
@@ -639,87 +707,87 @@ SpellTree ParseSpell(const GlyphLibrary& lib, const SpellStack& stack) {
     items.push_back((int)t.nodes.size() - 1);
   }
 
-  // R2/R3: operators bind greedily on their declared side, left to right. An
-  // operator whose required slot is empty is INCOMPLETE: it stays as a
-  // charged fizzle of its result sort.
-  std::vector<int> out;
+  // ONE left-to-right pass over the merged words. Operators bind (they must
+  // run here, not in a separate pass, because the item to an operator's left
+  // may be a BOX a delivery just made); deliveries box; `also` finishes a
+  // sentence; everything else falls into the pile.
+  std::vector<int> pile;
+  const int spokenEnd = (int)stack.spoken.size();
+  auto finishClause = [&](int at) {
+    SpellClause c;
+    c.root = CloseBox(lib, t, pile, -1, -1, at);
+    c.delivery = -1;
+    c.weight = 1;
+    c.bag = t.nodes[c.root].items;
+    t.clauses.push_back(std::move(c));
+    pile.clear();
+  };
+
   for (size_t i = 0; i < items.size(); i++) {
     const int ni = items[i];
     const GlyphDef& g = lib.glyphs[t.nodes[ni].glyph];
-    if (t.nodes[ni].group || g.sort != GlyphSort::Operator) {
-      out.push_back(ni);
-      continue;
-    }
-    SpellNode grp;
-    grp.glyph = t.nodes[ni].glyph;
-    grp.n = t.nodes[ni].n;
-    grp.group = true;
-    grp.first = t.nodes[ni].first;
-    grp.last = t.nodes[ni].last;
-    grp.at = t.nodes[ni].first;
-    if (g.hasLeft && !out.empty() && SlotAccepts(lib, t, g.leftMask, out.back())) {
-      grp.left = out.back();
-      out.pop_back();
-      grp.first = std::min(grp.first, t.nodes[grp.left].first);
-    }
-    if (g.hasRight && i + 1 < items.size() &&
-        SlotAccepts(lib, t, g.rightMask, items[i + 1])) {
-      grp.right = items[i + 1];
-      grp.last = std::max(grp.last, t.nodes[grp.right].last);
-      i++;
-    }
-    grp.complete = (!g.hasLeft || grp.left >= 0) && (!g.hasRight || grp.right >= 0);
-    t.nodes.push_back(grp);
-    out.push_back((int)t.nodes.size() - 1);
-  }
-
-  // R4: a Delivery closes the clause. A trailing headless clause is `hand`.
-  std::vector<std::vector<int>> clauses;
-  std::vector<int> cur;
-  for (int ni : out) {
-    cur.push_back(ni);
-    const SpellNode& n = t.nodes[ni];
-    if (!n.group && lib.glyphs[n.glyph].sort == GlyphSort::Delivery) {
-      clauses.push_back(cur);
-      cur.clear();
-    }
-  }
-  if (!cur.empty()) clauses.push_back(cur);
-
-  // R6: the bag is a set. Identical items merge (sum n, capped).
-  for (const std::vector<int>& cl : clauses) {
-    SpellClause c;
-    std::vector<int> bag = cl;
-    const SpellNode& tail = t.nodes[cl.back()];
-    if (!tail.group && lib.glyphs[tail.glyph].sort == GlyphSort::Delivery) {
-      c.delivery = tail.glyph;
-      c.weight = tail.n;
-      bag.pop_back();
-    }
-    std::vector<std::string> keys;
-    for (int ni : bag) {
-      const std::string k = NodeKey(lib, t, ni);
-      bool merged = false;
-      for (size_t j = 0; j < keys.size(); j++) {
-        if (keys[j] == k) {
-          SpellNode& first = t.nodes[c.bag[j]];
-          first.n = std::min(first.n + t.nodes[ni].n, cap);
-          merged = true;
-          break;
+    switch (g.sort) {
+      case GlyphSort::Operator: {
+        SpellNode grp;
+        grp.glyph = t.nodes[ni].glyph;
+        grp.n = t.nodes[ni].n;
+        grp.group = true;
+        grp.first = t.nodes[ni].first;
+        grp.last = t.nodes[ni].last;
+        grp.at = t.nodes[ni].first;
+        // THE ONE ITEM TO ITS LEFT — which is the top of the pile, and may be
+        // a box (`explosive projectile echo` is a turret).
+        if (g.hasLeft && !pile.empty() && SlotAccepts(lib, t, g.leftMask, pile.back())) {
+          grp.left = pile.back();
+          pile.pop_back();
+          grp.first = std::min(grp.first, t.nodes[grp.left].first);
         }
+        if (g.hasRight && i + 1 < items.size() &&
+            SlotAccepts(lib, t, g.rightMask, items[i + 1])) {
+          grp.right = items[i + 1];
+          grp.last = std::max(grp.last, t.nodes[grp.right].last);
+          i++;
+        }
+        grp.complete = (!g.hasLeft || grp.left >= 0) && (!g.hasRight || grp.right >= 0);
+        t.nodes.push_back(std::move(grp));
+        pile.push_back((int)t.nodes.size() - 1);
+        break;
       }
-      if (merged) continue;
-      keys.push_back(k);
-      c.bag.push_back(ni);
+      case GlyphSort::Delivery: {
+        // RULE 2. The pile becomes exactly one value: this box.
+        const int b = CloseBox(lib, t, pile, t.nodes[ni].glyph, t.nodes[ni].first, spokenEnd);
+        pile.clear();
+        pile.push_back(b);
+        break;
+      }
+      case GlyphSort::Separator:
+        finishClause(t.nodes[ni].first);
+        break;
+      default:
+        pile.push_back(ni);
+        break;
     }
-    t.clauses.push_back(std::move(c));
   }
+  // Silence is the one thing that is not a spell: an empty stack lowers to no
+  // clauses at all, not to an empty hand cast.
+  if (!stack.spoken.empty()) finishClause(spokenEnd);
   return t;
 }
 
 std::string NodeKey(const GlyphLibrary& lib, const SpellTree& t, int node) {
   if (node < 0 || node >= (int)t.nodes.size()) return "";
   const SpellNode& n = t.nodes[node];
+  if (n.box) {
+    // A box's identity is its pile AND its delivery, multiplicities included:
+    // two boxes are the same item only if they would fire the same thing the
+    // same way.
+    std::string s = "[";
+    for (size_t i = 0; i < n.items.size(); i++) {
+      if (i) s += ",";
+      s += NodeKey(lib, t, n.items[i]) + "#" + std::to_string(t.nodes[n.items[i]].n);
+    }
+    return s + "|" + lib.Delivery(n.glyph).id + "]";
+  }
   const GlyphDef* g = lib.At(n.glyph);
   if (!g) return "?";
   if (!n.group) return g->id;
@@ -731,6 +799,25 @@ std::string ShowNode(const GlyphLibrary& lib, const SpellTree& t, int node,
                      BracketStyle style) {
   if (node < 0 || node >= (int)t.nodes.size()) return "";
   const SpellNode& n = t.nodes[node];
+  if (n.box) {
+    // `[ ... DELIVERY]`: the brackets ARE the nesting, so the HUD shows the
+    // fold the way the sentence built it.
+    std::string s;
+    for (int ii : n.items) {
+      if (!s.empty()) s += " ";
+      s += ShowNode(lib, t, ii, style);
+    }
+    const std::string id = lib.Delivery(n.glyph).id;
+    if (!s.empty()) s += " ";
+    if (style == BracketStyle::Oracle) {
+      s += "**" + id + Times(n.n, style) + "**";
+    } else {
+      std::string up = id;
+      for (char& ch : up) ch = (char)toupper((unsigned char)ch);
+      s += up + Times(n.n, style);
+    }
+    return "[" + s + "]";
+  }
   const GlyphDef* g = lib.At(n.glyph);
   if (!g) return "?";
   if (!n.group) return g->id + Times(n.n, style);
@@ -760,21 +847,12 @@ std::string BracketSpell(const GlyphLibrary& lib, const SpellTree& t,
   std::string out;
   for (size_t ci = 0; ci < t.clauses.size(); ci++) {
     const SpellClause& c = t.clauses[ci];
+    // The outermost box is always the hand (rule 3), so it is drawn bare —
+    // the brackets are reserved for the deliveries you actually spoke.
     std::string s;
     for (int ni : c.bag) {
       if (!s.empty()) s += " ";
       s += ShowNode(lib, t, ni, style);
-    }
-    if (c.delivery >= 0) {
-      const std::string id = lib.glyphs[c.delivery].id;
-      if (!s.empty()) s += " ";
-      if (style == BracketStyle::Oracle) {
-        s += "**" + id + Times(c.weight, style) + "**";
-      } else {
-        std::string up = id;
-        for (char& ch : up) ch = (char)toupper((unsigned char)ch);
-        s += up + Times(c.weight, style);
-      }
     }
     if (s.empty()) s = "(empty)";
     if (!out.empty()) out += style == BracketStyle::Oracle ? " \xE2\x80\x96 " : " | ";
@@ -793,6 +871,10 @@ int32_t WordCostOf(const GlyphLibrary& lib, const SpellTree& t, int node) {
   const GlyphDef* g = lib.At(n.glyph);
   int32_t c = g ? SatMul(g->word, n.n) : 0;
   if (n.group) c = SatAdd(c, SatAdd(WordCostOf(lib, t, n.left), WordCostOf(lib, t, n.right)));
+  // A box owns every word inside it: word costs SUM over the whole tree,
+  // whatever the tariff does.
+  if (n.box)
+    for (int ii : n.items) c = SatAdd(c, WordCostOf(lib, t, ii));
   return c;
 }
 
@@ -818,6 +900,27 @@ DeliveryRec RecordFor(const GlyphLibrary& lib, int deliveryGlyph, int32_t weight
   return r;
 }
 
+// DOES THIS MOD MEAN ANYTHING ON THIS RECORD? (rule 3.) A mod sticks to the
+// box that closes the pile, and the outermost box is the hand — which has no
+// speed, no lifetime, nothing to bounce off. `shotgun` there is three fanned
+// resolve points and `float` is the hop; everything else is charged and does
+// nothing, and the describe line says which word was wasted rather than
+// letting it edit a field nobody reads.
+bool ModMeansAnything(ModField f, DeliveryMech mech, bool isHand) {
+  if (isHand) return f == ModField::Count || f == ModField::Gravity;
+  switch (mech) {
+    case DeliveryMech::Flight:
+      return f != ModField::None;
+    case DeliveryMech::Instant:   // `self`: a point on a body
+      return f == ModField::Count || f == ModField::Gravity ||
+             f == ModField::Radius || f == ModField::Lifetime;
+    case DeliveryMech::Continuous:   // `beam`: a ray with a tick cap
+      return f == ModField::Count || f == ModField::Radius ||
+             f == ModField::Lifetime;
+  }
+  return false;
+}
+
 // A Mod applied N times: compose, not add.
 void ApplyMod(DeliveryRec& r, const GlyphDef& g, int32_t n, const SpellBudgets& b) {
   auto edit = [&](int32_t v) -> int32_t {
@@ -831,7 +934,6 @@ void ApplyMod(DeliveryRec& r, const GlyphDef& g, int32_t n, const SpellBudgets& 
   for (int32_t k = 0; k < n; k++) {
     switch (g.field) {
       case ModField::Count: r.count = ClampI(edit(r.count), 1, b.maxInstances); break;
-      case ModField::Children: r.children = ClampI(edit(r.children < 1 ? 1 : r.children), 1, 16); break;
       case ModField::Gravity: r.gravityMille = ClampI(edit(r.gravityMille), -8000, 8000); break;
       case ModField::Speed: r.speedFx = ClampI(edit(r.speedFx), 1, kMaxSpeedFx); break;
       case ModField::Lifetime:
@@ -852,6 +954,23 @@ void ApplyMod(DeliveryRec& r, const GlyphDef& g, int32_t n, const SpellBudgets& 
 
 EffectInst LowerEffect(const GlyphLibrary& lib, const SpellTree& t, int node,
                        bool coerceMatterToPlace);
+// The whole fold, in mutual recursion with LowerEffect: a box's payload may
+// hold operators whose operand is another box (`explosive projectile echo`).
+SpellCast LowerBox(const GlyphLibrary& lib, const SpellTree& t, int node);
+
+// A BOX as one Effect value (rule 2): verb `launch`, the record it carries,
+// its payload in `inner`.
+EffectInst LaunchEffectOf(const GlyphLibrary& lib, const SpellTree& t, int node) {
+  SpellCast c = LowerBox(lib, t, node);
+  EffectInst e;
+  e.verb = SpellVerb::Launch;
+  e.glyph = t.nodes[node].glyph;
+  e.n = t.nodes[node].n;
+  e.node = node;
+  e.inner = c.payload;
+  e.launch.push_back(c.delivery);
+  return e;
+}
 
 // A Matter word standing alone in a bag, or under an operator that wants an
 // Effect, is coerced: spray(M) — or place(M) as a trail mark.
@@ -874,6 +993,7 @@ EffectInst LowerMatter(const GlyphLibrary& lib, const SpellTree& t, int node,
 EffectInst LowerEffect(const GlyphLibrary& lib, const SpellTree& t, int node,
                        bool coerceMatterToPlace) {
   const SpellNode& n = t.nodes[node];
+  if (n.box) return LaunchEffectOf(lib, t, node);
   const GlyphDef& g = lib.glyphs[n.glyph];
   if (!n.group) {
     if (g.sort == GlyphSort::Matter) return LowerMatter(lib, t, node, coerceMatterToPlace);
@@ -910,7 +1030,7 @@ EffectInst LowerEffect(const GlyphLibrary& lib, const SpellTree& t, int node,
   auto matterOf = [&](int child, uint32_t& mat, bool& any, int& gl) {
     if (child < 0) return;
     const SpellNode& c = t.nodes[child];
-    if (c.group) return;
+    if (c.group || c.box) return;
     const GlyphDef& cg = lib.glyphs[c.glyph];
     if (cg.sort != GlyphSort::Matter) return;
     mat = cg.material;
@@ -969,6 +1089,10 @@ EffectInst LowerEffect(const GlyphLibrary& lib, const SpellTree& t, int node,
 
 void ScaleEffectRadius(EffectInst& e, int32_t radiusMille) {
   if (radiusMille == 1000) return;
+  // A `wide` sticks to ONE box and widens what THAT box resolves. It does not
+  // reach through a nested carrier — the inner box has its own record and its
+  // own `wide`, and compounding the two would price one word twice.
+  if (e.verb == SpellVerb::Launch) return;
   const int32_t cap = e.verb == SpellVerb::Explode ? kMaxExplosionRadius : 8;
   e.radius = ClampI((int32_t)(((int64_t)e.radius * radiusMille + 500) / 1000), 0, cap);
   for (EffectInst& i : e.inner) ScaleEffectRadius(i, radiusMille);
@@ -982,10 +1106,17 @@ int32_t EffectTicks(const GlyphLibrary& lib, const EffectInst& e) {
     case SpellVerb::Sustain: ticks = g ? g->ticks : 1; break;
     case SpellVerb::Repeat: ticks = g ? SatMul(g->repeats, g->everyTicks) : 1; break;
     case SpellVerb::Filter: ticks = 1; break;
+    case SpellVerb::Launch:
+      // A carrier's own clock, THEN whatever its payload keeps running: the
+      // rule-2 bound on a nested spell is the whole chain, not one link.
+      if (!e.launch.empty())
+        ticks = SatAdd(e.launch[0].lifetimeTicks, e.launch[0].fuseTicks);
+      break;
     default: break;
   }
-  for (const EffectInst& i : e.inner) ticks = std::max(ticks, EffectTicks(lib, i));
-  return ticks;
+  int32_t inner = 0;
+  for (const EffectInst& i : e.inner) inner = std::max(inner, EffectTicks(lib, i));
+  return e.verb == SpellVerb::Launch ? SatAdd(ticks, inner) : std::max(ticks, inner);
 }
 
 }  // namespace
@@ -1023,11 +1154,31 @@ int32_t EffectVolume(const GlyphLibrary& lib, const EffectInst& e) {
       for (const EffectInst& i : e.inner) v = SatAdd(v, EffectVolume(lib, i));
       return SatMul(v, g ? g->repeats : 1);
     }
+    case SpellVerb::Launch: {
+      // A box's footprint is what it carries, plus what it lays on the way,
+      // times how many of it fly.
+      if (e.launch.empty()) return 0;
+      int32_t v = 0;
+      for (const EffectInst& i : e.inner) v = SatAdd(v, EffectVolume(lib, i));
+      v = SatAdd(v, e.launch[0].trailBudget);
+      return SatMul(v, ClampI(e.launch[0].count, 1, b.maxInstances));
+    }
     default: return 0;
   }
 }
 
-int32_t EffectTariff(const GlyphLibrary& lib, const EffectInst& e) {
+namespace {
+
+// The trail's share of a record's tariff: marks x the per-mark tariff of what
+// it lays. The budget is a voxel COUNT, so the number of marks is
+// budget / mark volume.
+int32_t TrailTariffOf(const GlyphLibrary& lib, const DeliveryRec& d, bool withCarry);
+
+// THE TARIFF, with or without the carry premiums nested inside it. Two arms of
+// one function rather than two functions, because only the Launch case
+// differs and the HUD wants the split (`word + tariff + carry`) after the
+// premiums have composed all the way down the tree.
+int32_t EffectTariffIn(const GlyphLibrary& lib, const EffectInst& e, bool withCarry) {
   const SpellBudgets& b = lib.budgets;
   const GlyphDef* g = lib.At(e.glyph);
   if (!e.complete) return 0;
@@ -1075,7 +1226,7 @@ int32_t EffectTariff(const GlyphLibrary& lib, const EffectInst& e) {
     case SpellVerb::Filter: return std::max(1, vol / 1000);
     case SpellVerb::Trail: {
       int32_t t = 0;
-      for (const EffectInst& i : e.inner) t = SatAdd(t, EffectTariff(lib, i));
+      for (const EffectInst& i : e.inner) t = SatAdd(t, EffectTariffIn(lib, i, withCarry));
       return t;
     }
     case SpellVerb::Sustain:
@@ -1083,33 +1234,64 @@ int32_t EffectTariff(const GlyphLibrary& lib, const EffectInst& e) {
       return 0;
     case SpellVerb::Repeat: {
       int32_t t = 0;
-      for (const EffectInst& i : e.inner) t = SatAdd(t, EffectTariff(lib, i));
+      for (const EffectInst& i : e.inner) t = SatAdd(t, EffectTariffIn(lib, i, withCarry));
       return SatMul(t, g ? g->repeats : 1);
+    }
+    case SpellVerb::Launch: {
+      // THE PRICE IS RECURSIVE, and carry composes MULTIPLICATIVELY down the
+      // tree: a bolt that fires a bolt pays 3.0 x 3.0 on what the inner one
+      // finally does, which is exactly the "you are paying to move it twice"
+      // reading the carry premium exists to give.
+      if (e.launch.empty()) return 0;
+      const DeliveryRec& d = e.launch[0];
+      int32_t t = 0;
+      for (const EffectInst& i : e.inner) t = SatAdd(t, EffectTariffIn(lib, i, withCarry));
+      t = SatAdd(t, TrailTariffOf(lib, d, withCarry));
+      t = SatMul(t, ClampI(d.count, 1, b.maxInstances));
+      if (withCarry) {
+        const int64_t v = (int64_t)t * d.carryMille / 1000;
+        t = v > 0x3FFFFFFF ? 0x3FFFFFFF : (int32_t)v;
+      }
+      return t;
     }
     default: return 0;
   }
 }
 
-void PriceCast(const GlyphLibrary& lib, SpellCast& cast) {
-  int32_t t = 0;
-  for (const EffectInst& e : cast.payload) t = SatAdd(t, EffectTariff(lib, e));
-  // A trail is priced as marks x the per-mark tariff of what it lays: the
-  // budget is a voxel count, so the number of marks is budget / mark volume.
-  if (!cast.delivery.trail.empty()) {
-    int32_t markVol = 0, markTariff = 0;
-    for (const EffectInst& e : cast.delivery.trail) {
-      markVol = SatAdd(markVol, EffectVolume(lib, e));
-      markTariff = SatAdd(markTariff, EffectTariff(lib, e));
-    }
-    const int32_t marks = cast.delivery.trailBudget / std::max(1, markVol);
-    t = SatAdd(t, SatMul(marks, markTariff));
+int32_t TrailTariffOf(const GlyphLibrary& lib, const DeliveryRec& d, bool withCarry) {
+  if (d.trail.empty()) return 0;
+  int32_t markVol = 0, markTariff = 0;
+  for (const EffectInst& e : d.trail) {
+    markVol = SatAdd(markVol, EffectVolume(lib, e));
+    markTariff = SatAdd(markTariff, EffectTariffIn(lib, e, withCarry));
   }
+  const int32_t marks = d.trailBudget / std::max(1, markVol);
+  return SatMul(marks, markTariff);
+}
+
+}  // namespace
+
+int32_t EffectTariff(const GlyphLibrary& lib, const EffectInst& e) {
+  return EffectTariffIn(lib, e, true);
+}
+
+void PriceCast(const GlyphLibrary& lib, SpellCast& cast) {
+  int32_t base = 0, total = 0;
+  for (const EffectInst& e : cast.payload) {
+    base = SatAdd(base, EffectTariffIn(lib, e, false));
+    total = SatAdd(total, EffectTariffIn(lib, e, true));
+  }
+  base = SatAdd(base, TrailTariffOf(lib, cast.delivery, false));
+  total = SatAdd(total, TrailTariffOf(lib, cast.delivery, true));
   // A held beam pays the tariff every tick it is held (P3 bills it as it
   // emits); the up-front price is one resolve.
-  cast.tariff = SatMul(t, cast.instances);
+  cast.tariff = SatMul(base, cast.instances);
   // The delivery premium: carry is per-mille on the payload tariff, and the
-  // part above x1 is what the HUD shows as "carry".
-  const int64_t premium = (int64_t)cast.tariff * (cast.delivery.carryMille - 1000) / 1000;
+  // part above x1 is what the HUD shows as "carry" — including every nested
+  // carrier's premium, which is where the cost of a nested spell lives.
+  const int64_t withCarry =
+      (int64_t)SatMul(total, cast.instances) * cast.delivery.carryMille / 1000;
+  const int64_t premium = withCarry - (int64_t)cast.tariff;
   cast.carryCost = premium <= 0 ? 0 : (premium > 0x3FFFFFFF ? 0x3FFFFFFF : (int32_t)premium);
 }
 
@@ -1130,86 +1312,144 @@ uint32_t CastTintMaterial(const SpellCast& cast) {
   return p != 0 ? p : TintOf(cast.delivery.trail);
 }
 
+namespace {
+
+// LOWER ONE BOX (rule 2), recursively. A box is a delivery record, the mods
+// that stuck to it, and a payload whose items may themselves be boxes — so
+// this is the whole fold, and the `hand` box at the root is just the outermost
+// call.
+SpellCast LowerBox(const GlyphLibrary& lib, const SpellTree& tree, int node) {
+  const SpellBudgets& b = lib.budgets;
+  const SpellNode& bn = tree.nodes[node];
+  const bool isHand = bn.glyph < 0;
+  SpellCast cast;
+  cast.delivery = RecordFor(lib, bn.glyph, bn.n);
+  cast.wordCost = SatMul(lib.Delivery(bn.glyph).word, bn.n);
+
+  // RULE 1 IN THE LOWERING: the pile is a set, so the record is built from it
+  // in a CANONICAL order (by key), not the spoken one. Mods compose and
+  // integer arithmetic does not commute under clamping (49 halved then doubled
+  // is 48), so without this `swift slow` and `slow swift` would lower to two
+  // different records and law L2 would be false.
+  std::vector<int> bag = bn.items;
+  std::stable_sort(bag.begin(), bag.end(), [&](int a, int bb) {
+    return NodeKey(lib, tree, a) < NodeKey(lib, tree, bb);
+  });
+
+  // Mods first (they edit the record the effects then read), effects second.
+  for (int ni : bag) {
+    const SpellNode& n = tree.nodes[ni];
+    cast.wordCost = SatAdd(cast.wordCost, WordCostOf(lib, tree, ni));
+    if (NodeSort(lib, tree, ni) != GlyphSort::Mod) continue;
+    const GlyphDef& g = lib.glyphs[n.glyph];
+    if (!n.group) {
+      if (ModMeansAnything(g.field, cast.delivery.mech, isHand))
+        ApplyMod(cast.delivery, g, n.n, b);
+      else
+        cast.wastedMods.push_back(n.glyph);
+      continue;
+    }
+    // A trail group: E ◂ trail -> a Mod. Runs its Effect at every marked
+    // voxel of the flight path, under a hard voxel budget (rule 2). Only a
+    // FLIGHT travels, so on any other record it is a charged no-op.
+    if (g.verb == SpellVerb::Trail && n.complete) {
+      if (cast.delivery.mech != DeliveryMech::Flight) {
+        cast.wastedMods.push_back(n.glyph);
+        continue;
+      }
+      EffectInst tr = LowerEffect(lib, tree, ni, true);
+      for (EffectInst& i : tr.inner) cast.delivery.trail.push_back(i);
+      cast.delivery.trailBudget =
+          std::min(SatAdd(cast.delivery.trailBudget, SatMul(g.voxelBudget, n.n)),
+                   b.maxTrailVoxels);
+      cast.delivery.trailEvery = g.everyTicks;
+    }
+  }
+
+  int32_t childLeaves = 0, childDepth = 0;
+  for (int ni : bag) {
+    const GlyphSort s = NodeSort(lib, tree, ni);
+    if (s != GlyphSort::Effect && s != GlyphSort::Matter) continue;
+    if (tree.nodes[ni].box) {
+      // A NESTED BOX becomes one Launch value carrying its own record and
+      // payload. It was priced and clamped by its own call; this one only
+      // adds its leaves and its depth to the totals.
+      SpellCast child = LowerBox(lib, tree, ni);
+      EffectInst e;
+      e.verb = SpellVerb::Launch;
+      e.glyph = tree.nodes[ni].glyph;
+      e.n = tree.nodes[ni].n;
+      e.node = ni;
+      e.inner = child.payload;
+      e.launch.push_back(child.delivery);
+      childLeaves = SatAdd(childLeaves, child.leaves);
+      childDepth = std::max(childDepth, child.depth);
+      cast.priceUnknown = cast.priceUnknown || child.priceUnknown;
+      cast.instancesClamped = cast.instancesClamped || child.instancesClamped;
+      cast.payload.push_back(std::move(e));
+      continue;
+    }
+    EffectInst e = LowerEffect(lib, tree, ni, false);
+    ScaleEffectRadius(e, cast.delivery.radiusMille);
+    if (e.anyA || e.anyB) cast.priceUnknown = true;
+    for (const EffectInst& i : e.inner)
+      if (i.anyA || i.anyB) cast.priceUnknown = true;
+    cast.payload.push_back(std::move(e));
+  }
+  for (EffectInst& tr : cast.delivery.trail) {
+    ScaleEffectRadius(tr, cast.delivery.radiusMille);
+    if (tr.anyA) cast.priceUnknown = true;
+  }
+
+  // THE LEAF CAP (rule 2). Instances multiply down the tree — three bolts
+  // each firing three is nine — so the bound that matters is the number of
+  // LEAF instances the whole tree can produce, not the fan at one level. Clamp
+  // this box's own fan so the product still fits, and say so in the readout
+  // rather than quietly firing fewer than the sentence asked for.
+  if (childLeaves < 1) childLeaves = 1;
+  cast.instances = ClampI(cast.delivery.count, 1, b.maxInstances);
+  const int32_t maxOwn = std::max(1, b.maxInstances / childLeaves);
+  if (cast.instances > maxOwn) {
+    cast.instances = maxOwn;
+    cast.delivery.count = maxOwn;
+    cast.instancesClamped = true;
+  }
+  cast.leaves = ClampI(SatMul(cast.instances, childLeaves), 1, b.maxInstances);
+  cast.depth = childDepth + (isHand ? 0 : 1);
+  cast.generation = 0;
+  PriceCast(lib, cast);
+
+  // Rule 2 budgets, all finite.
+  int32_t ticks = 1;
+  switch (cast.delivery.mech) {
+    case DeliveryMech::Instant: ticks = 1; break;
+    case DeliveryMech::Flight:
+      ticks = SatAdd(cast.delivery.lifetimeTicks, cast.delivery.fuseTicks);
+      break;
+    case DeliveryMech::Continuous: ticks = cast.delivery.lifetimeTicks; break;
+  }
+  int32_t voxels = 0;
+  for (const EffectInst& e : cast.payload) {
+    voxels = SatAdd(voxels, EffectVolume(lib, e));
+    ticks = std::max(ticks, EffectTicks(lib, e));
+  }
+  voxels = SatAdd(voxels, cast.delivery.trailBudget);
+  if (cast.delivery.mech == DeliveryMech::Continuous)
+    voxels = SatMul(voxels, cast.delivery.lifetimeTicks);
+  cast.voxels = SatMul(voxels, cast.instances);
+  cast.ticks = ticks;
+  return cast;
+}
+
+}  // namespace
+
 CastList LowerSpell(const GlyphLibrary& lib, const SpellTree& tree) {
   CastList list;
   list.tree = tree;
-  const SpellBudgets& b = lib.budgets;
   for (size_t ci = 0; ci < tree.clauses.size(); ci++) {
-    const SpellClause& c = tree.clauses[ci];
-    SpellCast cast;
+    if (tree.clauses[ci].root < 0) continue;
+    SpellCast cast = LowerBox(lib, tree, tree.clauses[ci].root);
     cast.clause = (int)ci;
-    cast.delivery = RecordFor(lib, c.delivery, c.weight);
-    cast.wordCost = SatMul(lib.Delivery(c.delivery).word, c.weight);
-
-    // R6 IN THE LOWERING: the bag is a set, so the record is built from it in
-    // a CANONICAL order (by key), not the spoken one. Mods compose and integer
-    // arithmetic does not commute under clamping (49 halved then doubled is
-    // 48), so without this `swift slow` and `slow swift` would lower to two
-    // different records and law L2 would be false.
-    std::vector<int> bag = c.bag;
-    std::stable_sort(bag.begin(), bag.end(), [&](int a, int bb) {
-      return NodeKey(lib, tree, a) < NodeKey(lib, tree, bb);
-    });
-
-    // Mods first (they edit the record the effects then read), effects second.
-    for (int ni : bag) {
-      const SpellNode& n = tree.nodes[ni];
-      cast.wordCost = SatAdd(cast.wordCost, WordCostOf(lib, tree, ni));
-      if (NodeSort(lib, tree, ni) != GlyphSort::Mod) continue;
-      const GlyphDef& g = lib.glyphs[n.glyph];
-      if (!n.group) {
-        ApplyMod(cast.delivery, g, n.n, b);
-        continue;
-      }
-      // A trail group: E ◂ trail -> Δ. Runs its Effect at every marked voxel
-      // of the flight path, under a hard voxel budget (rule 2).
-      if (g.verb == SpellVerb::Trail && n.complete) {
-        EffectInst tr = LowerEffect(lib, tree, ni, true);
-        for (EffectInst& i : tr.inner) cast.delivery.trail.push_back(i);
-        cast.delivery.trailBudget =
-            std::min(SatAdd(cast.delivery.trailBudget, SatMul(g.voxelBudget, n.n)),
-                     b.maxTrailVoxels);
-        cast.delivery.trailEvery = g.everyTicks;
-      }
-    }
-    for (int ni : bag) {
-      const GlyphSort s = NodeSort(lib, tree, ni);
-      if (s != GlyphSort::Effect && s != GlyphSort::Matter) continue;
-      EffectInst e = LowerEffect(lib, tree, ni, false);
-      ScaleEffectRadius(e, cast.delivery.radiusMille);
-      if (e.anyA || e.anyB) cast.priceUnknown = true;
-      for (const EffectInst& i : e.inner)
-        if (i.anyA || i.anyB) cast.priceUnknown = true;
-      cast.payload.push_back(std::move(e));
-    }
-    for (EffectInst& tr : cast.delivery.trail) {
-      ScaleEffectRadius(tr, cast.delivery.radiusMille);
-      if (tr.anyA) cast.priceUnknown = true;
-    }
-
-    cast.instances = ClampI(cast.delivery.count, 1, b.maxInstances);
-    cast.generation = 0;
-    PriceCast(lib, cast);
-    // Rule 2 budgets, all finite.
-    int32_t ticks = 1;
-    switch (cast.delivery.mech) {
-      case DeliveryMech::Instant: ticks = 1; break;
-      case DeliveryMech::Flight:
-        ticks = SatAdd(cast.delivery.lifetimeTicks, cast.delivery.fuseTicks);
-        break;
-      case DeliveryMech::Continuous: ticks = cast.delivery.lifetimeTicks; break;
-    }
-    int32_t voxels = 0;
-    for (const EffectInst& e : cast.payload) {
-      voxels = SatAdd(voxels, EffectVolume(lib, e));
-      ticks = std::max(ticks, EffectTicks(lib, e));
-    }
-    voxels = SatAdd(voxels, cast.delivery.trailBudget);
-    if (cast.delivery.mech == DeliveryMech::Continuous)
-      voxels = SatMul(voxels, cast.delivery.lifetimeTicks);
-    cast.voxels = SatMul(voxels, cast.instances);
-    cast.ticks = ticks;
-
     list.wordCost = SatAdd(list.wordCost, cast.wordCost);
     list.tariff = SatAdd(list.tariff, cast.tariff);
     list.carryCost = SatAdd(list.carryCost, cast.carryCost);
@@ -1225,6 +1465,12 @@ CastList CompileSpell(const GlyphLibrary& lib, const SpellStack& stack) {
 }
 
 // ---- describe ----------------------------------------------------------------
+//
+// One recursive sentence per cast, in the shape the fold has: "You fire a
+// bomb; when its fuse runs down, it fires a bolt; when that hits, it explodes
+// and sprays fire." Nothing here knows a glyph by name -- the carrier's noun,
+// the material names and the verbs all come out of glyphs.json, so a modder's
+// new word reads as itself.
 
 namespace {
 
@@ -1236,54 +1482,160 @@ std::string MatName(const GlyphLibrary& lib, int glyph, uint32_t mat, bool any) 
   return "material " + std::to_string(mat);
 }
 
-std::string DescribeEffect(const GlyphLibrary& lib, const EffectInst& e,
-                           const std::string& at) {
+std::string Capitalize(const std::string& s) {
+  if (s.empty()) return s;
+  std::string o = s;
+  o[0] = (char)toupper((unsigned char)o[0]);
+  return o;
+}
+
+std::string LaunchSentence(const GlyphLibrary& lib, const EffectInst& e,
+                           const std::string& that);
+
+// A short third-person verb phrase for one payload item: what it DOES where it
+// lands. Derived from the verb, never from the glyph id.
+std::string EffectPhrase(const GlyphLibrary& lib, const EffectInst& e) {
   const GlyphDef* g = lib.At(e.glyph);
   const std::string id = g ? g->id : "?";
-  auto xn = [&](const char* axis) {
-    return e.n > 1 ? std::string(", ") + axis + " x" + std::to_string(e.n) : std::string();
-  };
-  if (!e.complete) return id + " with a missing word: fizzles, the word is charged";
+  if (!e.complete) return "wastes `" + id + "` (a word it needed was missing)";
+  const std::string times = e.n > 1 ? " x" + std::to_string(e.n) : std::string();
   switch (e.verb) {
+    case SpellVerb::Launch: return "fires " + LaunchSentence(lib, e, "that");
     case SpellVerb::Spray:
-      if (e.anyA) return "scoops whatever is at " + at + " and throws it (priced when it lands)";
-      if (e.matA == 0) return "throws nothing (charged the word)";
-      return "throws " + std::to_string(EffectVolume(lib, e)) + " voxels of " +
-             MatName(lib, e.glyphA, e.matA, false);
+      if (e.anyA) return "scoops up whatever is there and throws it";
+      if (e.matA == 0) return "throws nothing";
+      return "sprays " + MatName(lib, e.glyphA, e.matA, false) + times;
     case SpellVerb::Place:
-      return "lays " + MatName(lib, e.glyphA, e.matA, e.anyA) + xn("volume");
+      return "lays " + MatName(lib, e.glyphA, e.matA, e.anyA) + times;
     case SpellVerb::Convert: {
       const std::string a = MatName(lib, e.glyphA, e.matA, e.anyA);
       const std::string bb = MatName(lib, e.glyphB, e.matB, e.anyB);
-      if (!e.anyA && !e.anyB && e.matA == e.matB) return "converts " + a + " to itself: no change, charged";
-      if (!e.anyA && e.matA == 0) return "conjures " + bb + " into empty space" + xn("volume");
-      if (!e.anyB && e.matB == 0) return "unmakes " + a + xn("volume");
-      return "converts " + a + " into " + bb + xn("volume");
+      if (!e.anyA && !e.anyB && e.matA == e.matB) return "converts " + a + " to itself: nothing";
+      if (!e.anyA && e.matA == 0) return "conjures " + bb + " into empty space" + times;
+      if (!e.anyB && e.matB == 0) return "unmakes " + a + times;
+      return "turns " + a + " into " + bb + times;
     }
-    case SpellVerb::Explode: return "explosion at " + at + ", power x" + std::to_string(e.n);
-    case SpellVerb::Wind: return "wind from " + at + " along the aim, speed x" + std::to_string(e.n);
+    case SpellVerb::Explode: return e.n > 1 ? "explodes x" + std::to_string(e.n) : "explodes";
+    case SpellVerb::Wind: return "blows a wind jet along the aim" + times;
     case SpellVerb::Mend:
-      return "draws " + MatName(lib, e.glyphA, e.matA, e.anyA) + " at " + at +
-             " into the caster's missing anatomy, " +
-             std::to_string(g ? SatMul(g->perTick, e.n) : e.n) + " voxel(s)/tick";
+      return "draws " + MatName(lib, e.glyphA, e.matA, e.anyA) +
+             " into the caster's missing anatomy";
     case SpellVerb::Sustain: {
       std::string what;
       if (e.modField != ModField::None)
-        what = std::string("the mod ") + ModFieldName(e.modField) +
-               (e.modN > 1 ? " x" + std::to_string(e.modN) : "");
+        what = std::string("the mod ") + ModFieldName(e.modField);
       else if (!e.inner.empty())
-        what = DescribeEffect(lib, e.inner[0], "the body");
-      return "sustains on the body at " + at + ", every tick, billed per tick: " + what;
+        what = EffectPhrase(lib, e.inner[0]);
+      else
+        what = "nothing";
+      return "sustains [" + what + "] on whatever it lands on, every tick, billed per tick";
     }
     case SpellVerb::Filter: {
       const GlyphDef* w = e.inner.empty() ? nullptr : lib.At(e.inner[0].glyph);
-      return "an anti-" + (w ? w->id : std::string("?")) + " field at " + at +
-             ": incoming " + (w ? w->id : std::string("?")) + " ops are refused";
+      return "refuses incoming " + (w ? w->id : std::string("?")) + " for a moment";
     }
     case SpellVerb::Repeat:
-      return "repeats at " + at + " every few ticks, bounded: " +
-             (e.inner.empty() ? std::string("nothing") : DescribeEffect(lib, e.inner[0], at));
+      return "repeats [" +
+             (e.inner.empty() ? std::string("nothing") : EffectPhrase(lib, e.inner[0])) +
+             "] every few ticks, a bounded number of times";
+    case SpellVerb::Trail:
+      return "lays " +
+             (e.inner.empty() ? std::string("nothing") : EffectPhrase(lib, e.inner[0])) +
+             " along a path it does not have";
     default: return id;
+  }
+}
+
+// What the mods on a record did to it, as adjectives before the noun and a
+// clause after the trigger. Read off the RECORD against the glyph's own
+// defaults, so a modder's new mod on an old field describes itself.
+void RecordWords(const GlyphLibrary& lib, const DeliveryRec& d, std::string& adj,
+                 std::string& post, bool& fan) {
+  const GlyphDef& g = lib.Delivery(d.glyph);
+  fan = d.count > 1;
+  auto add = [&](const char* w) {
+    if (!adj.empty()) adj += " ";
+    adj += w;
+  };
+  if (d.speedFx > g.speedFx) add("fast");
+  else if (d.speedFx < g.speedFx) add("slow");
+  if (d.gravityMille < g.gravityMille) add("floating");
+  else if (d.gravityMille > g.gravityMille) add("heavy");
+  if (d.lifetimeTicks > g.lifetimeTicks) add("long-lived");
+  if (d.radiusMille > 1000) add("wide");
+  if (d.pierce > 0) add("piercing");
+  if (d.seek > 0) add("seeking");
+  if (d.bounces > 0) post = "bounce";
+}
+
+// THE RECURSIVE SENTENCE for one launch box.
+std::string LaunchSentence(const GlyphLibrary& lib, const EffectInst& e,
+                           const std::string& that) {
+  if (e.launch.empty()) return "nothing";
+  const DeliveryRec& d = e.launch[0];
+  const GlyphDef& g = lib.Delivery(d.glyph);
+  std::string adj, post;
+  bool fan = false;
+  RecordWords(lib, d, adj, post, fan);
+  const std::string noun = g.noun.empty() ? g.id : g.noun;
+
+  std::string head;
+  if (fan) {
+    head = std::to_string(d.count) + " fanned " + (adj.empty() ? "" : adj + " ") + noun + "s";
+  } else {
+    head = std::string("a ") + (adj.empty() ? "" : adj + " ") + noun;
+  }
+  const std::string it = fan ? "each" : that;
+
+  // The trail is what it does ON THE WAY, so it rides the noun phrase.
+  for (const EffectInst& tr : d.trail)
+    head += " that " + EffectPhrase(lib, tr) + " along its whole path";
+
+  std::string trig, join = ", ";
+  switch (d.mech) {
+    case DeliveryMech::Instant:
+      trig = d.glyph < 0 ? "at reach in front of you" : "at once, on the caster";
+      break;
+    case DeliveryMech::Continuous: trig = "every tick at the ray hit"; break;
+    case DeliveryMech::Flight:
+      if (d.body) trig = "when its fuse runs down";
+      else if (d.resolveOnExpiry) trig = "when it hits or its life runs out";
+      else if (!post.empty()) trig = "it bounces once, then when it hits again";
+      else trig = "when " + it + " hits";
+      if (d.fuseTicks > g.fuseTicks) {
+        trig += " it waits " + std::to_string(d.fuseTicks) + " ticks, then";
+        join = " ";
+      }
+      break;
+  }
+
+  std::vector<std::string> parts;
+  for (const EffectInst& p : e.inner) parts.push_back(EffectPhrase(lib, p));
+  if (parts.empty())
+    parts.push_back(d.mech == DeliveryMech::Flight ? "does nothing but knock what it hit"
+                                                   : "does nothing");
+  std::string body;
+  for (size_t i = 0; i < parts.size(); i++) {
+    if (i) body += " and ";
+    body += parts[i];
+  }
+  return head + "; " + trig + join + (fan ? "each " : "it ") + body;
+}
+
+// What a Mod word had no field to edit, for the wasted line: the record's own
+// vocabulary, never the glyph's name.
+const char* MissingOn(ModField f) {
+  switch (f) {
+    case ModField::Count: return "count";
+    case ModField::Gravity: return "weight";
+    case ModField::Speed: return "speed";
+    case ModField::Lifetime: return "lifetime";
+    case ModField::Radius: return "radius";
+    case ModField::Bounces: return "surface to bounce off";
+    case ModField::Pierce: return "wall to pierce";
+    case ModField::Seek: return "target to steer for";
+    case ModField::Fuse: return "fuse";
+    default: return "field for it";
   }
 }
 
@@ -1292,69 +1644,56 @@ std::string DescribeEffect(const GlyphLibrary& lib, const EffectInst& e,
 std::string DescribeCast(const GlyphLibrary& lib, const SpellCast& cast) {
   const DeliveryRec& d = cast.delivery;
   const GlyphDef& g = lib.Delivery(d.glyph);
-  std::string head, at;
-  switch (d.mech) {
-    case DeliveryMech::Instant:
-      if (d.glyph < 0) {
-        head = "from the hand, at reach";
-        at = "reach";
+  const bool isHand = d.glyph < 0;
+  std::string adj, post;
+  bool fan = false;
+  RecordWords(lib, d, adj, post, fan);
+
+  std::vector<std::string> sentences;
+  // Nouns first, then the carriers they were spoken beside: the sentence reads
+  // outward from the caster, the way the spell happens.
+  for (int pass = 0; pass < 2; pass++) {
+    for (const EffectInst& e : cast.payload) {
+      const bool isLaunch = e.verb == SpellVerb::Launch;
+      if ((pass == 0) == isLaunch) continue;
+      if (isLaunch) {
+        sentences.push_back((fan ? "From " + std::to_string(d.count) +
+                                       " fanned points in front of you, "
+                                 : std::string("You fire ")) +
+                            LaunchSentence(lib, e, "it") + ".");
       } else {
-        head = "on the caster (" + g.id + ")";
-        at = "the caster";
+        sentences.push_back(Capitalize(EffectPhrase(lib, e)) +
+                            (isHand ? " right in front of you" : " on the caster") +
+                            (fan ? " at " + std::to_string(d.count) + " fanned points" : "") +
+                            ".");
       }
-      break;
-    case DeliveryMech::Flight:
-      head = g.id + ": " + (d.body ? "a dropped body" : "a bolt") +
-             (d.fuseTicks > 0 ? ", resolves when the fuse runs out" : ", resolves on impact");
-      at = "the impact point";
-      break;
-    case DeliveryMech::Continuous:
-      head = g.id + ": held, resolves at the ray hit every tick";
-      at = "the beam hit";
-      break;
-  }
-  if (d.weight > 1) head += ", weight x" + std::to_string(d.weight);
-  std::string pay;
-  for (const EffectInst& e : cast.payload) {
-    if (!pay.empty()) pay += "; ";
-    pay += DescribeEffect(lib, e, at);
-  }
-  if (pay.empty())
-    pay = d.mech == DeliveryMech::Flight ? "empty payload: kinetic impact only"
-                                          : "empty payload: nothing, the word is charged";
-  std::string mods;
-  auto add = [&](const std::string& s) {
-    if (!mods.empty()) mods += "; ";
-    mods += s;
-  };
-  if (d.count > 1) add(std::to_string(d.count) + " fanned instances (everything paid " + std::to_string(d.count) + "x)");
-  if (d.children > 1) add("on resolve " + std::to_string(d.children) + " children, generation-capped");
-  if (d.gravityMille != g.gravityMille)
-    add("gravity " + std::to_string(d.gravityMille) + "/1000 g" +
-        (d.mech == DeliveryMech::Instant ? " on the caster's body" : ""));
-  if (d.speedFx != ClampI(SatMul(g.speedFx, d.weight), 1, kMaxSpeedFx)) {
-    // Fixed voxels/tick -> m/s, one decimal, for the reader.
-    const double ms = (double)d.speedFx / (double)kSpellFxOne * (double)kTicksPerSecond /
-                      (double)kVoxelsPerMetre;
-    char buf[48];
-    std::snprintf(buf, sizeof buf, "speed %.1f m/s", ms);
-    add(buf);
-  }
-  if (d.radiusMille != 1000) add("resolve radius x" + std::to_string(d.radiusMille) + "/1000");
-  if (d.bounces > 0) add(std::to_string(d.bounces) + " bounce(s)");
-  if (d.pierce > 0) add("passes through " + std::to_string(d.pierce));
-  if (d.seek > 0) add("homing x" + std::to_string(d.seek));
-  if (d.fuseTicks != g.fuseTicks) add("fuse " + std::to_string(d.fuseTicks) + " ticks");
-  if (!d.trail.empty()) {
-    std::string tr;
-    for (const EffectInst& e : d.trail) {
-      if (!tr.empty()) tr += "; ";
-      tr += DescribeEffect(lib, e, "each marked voxel");
     }
-    add("lays along the path (" + std::to_string(d.trailBudget) + " voxels): " + tr);
   }
-  std::string out = head + " - " + pay;
-  if (!mods.empty()) out += " - mods: " + mods;
+  if (cast.payload.empty())
+    sentences.push_back(isHand ? "Nothing happens; the words are charged."
+                               : "Nothing happens.");
+  // A gravity mod on an anchored delivery acts on the caster's body.
+  if (d.gravityMille != g.gravityMille && d.mech == DeliveryMech::Instant)
+    sentences.push_back(d.gravityMille < g.gravityMille ? "You hop." : "You are shoved down.");
+  for (int gi : cast.wastedMods) {
+    const GlyphDef* w = lib.At(gi);
+    if (!w) continue;
+    if (w->sort == GlyphSort::Operator)
+      sentences.push_back("The trail is wasted: your hand does not travel anywhere.");
+    else
+      sentences.push_back("`" + w->id + "` is wasted: it landed on your hand, which has no " +
+                          MissingOn(w->field) + ".");
+  }
+  if (cast.instancesClamped)
+    sentences.push_back("The fan was cut back to " + std::to_string(cast.leaves) +
+                        " in all: past that the instance cap refuses it.");
+  if (cast.priceUnknown)
+    sentences.push_back("The price is not known until it lands.");
+  std::string out;
+  for (size_t i = 0; i < sentences.size(); i++) {
+    if (i) out += " ";
+    out += sentences[i];
+  }
   return out;
 }
 
@@ -1508,7 +1847,7 @@ SpellProbe WorldSpellProbe(const World& world) {
 void ApplySpellEffect(const GlyphLibrary& lib, const std::vector<EffectInst>& payload,
                       SpellFxVec atFx, SpellFxVec dirFx, int32_t strengthMille,
                       SpellEmission& out, const SpellProbe* probe,
-                      int32_t instabilityMille, uint32_t salt) {
+                      int32_t instabilityMille, uint32_t salt, bool flatten) {
   strengthMille = ClampI(strengthMille, 0, 1000);
   if (strengthMille == 0) return;
   const SpellBudgets& b = lib.budgets;
@@ -1690,12 +2029,37 @@ void ApplySpellEffect(const GlyphLibrary& lib, const std::vector<EffectInst>& pa
         out.winds.push_back(p);
         break;
       }
+      case SpellVerb::Launch: {
+        // RULE 2 AT RUNTIME. A box does not reach into the system — it asks,
+        // and the system adopts the request at the end of the call. The only
+        // channel out of ApplySpellEffect is still `out`.
+        if (e.launch.empty()) break;
+        if (flatten) {
+          // A FATAL CAST FLATTENS: every carrier resolves its own payload
+          // where the caster stands, recursively, and nothing leaves the body.
+          ApplySpellEffect(lib, e.inner, atFx, dirFx, strengthMille, out, probe,
+                           instabilityMille, salt ^ 0xF1A7u, true);
+          if (!e.launch[0].trail.empty())
+            ApplySpellEffect(lib, e.launch[0].trail, atFx, dirFx, strengthMille, out, probe,
+                             instabilityMille, salt ^ 0x7A11u, true);
+          break;
+        }
+        SpellLaunchReq rq;
+        rq.delivery = e.launch[0];
+        rq.payload = e.inner;
+        rq.at = atFx;
+        rq.dir = dirFx;
+        rq.instability = instabilityMille;
+        rq.salt = salt;
+        out.launches.push_back(std::move(rq));
+        break;
+      }
       case SpellVerb::Repeat: {
         // The inner effect, now, and again every `everyTicks` for `repeats`
         // in all: the lowering charged repeats × the effect up front. The
         // rest is scheduled as an echo the system ticks.
         ApplySpellEffect(lib, e.inner, atFx, dirFx, strengthMille, out, probe,
-                         instabilityMille, salt ^ 0x5EC0u);
+                         instabilityMille, salt ^ 0x5EC0u, flatten);
         if (g && g->repeats > 1) {
           SpellEcho ec;
           ec.inner = e.inner;
@@ -1806,7 +2170,10 @@ void SpellSystem::Launch(const SpellCast& cast, SpellFxVec originFx, SpellFxVec 
   // nothing — a spell that sometimes doesn't fire is miserable to diagnose.
   if ((int)live_.size() >= lib_->budgets.maxLiveProjectiles ||
       cast.generation > lib_->budgets.maxGeneration) {
-    ApplySpellEffect(*lib_, cast.payload, originFx, aim, 400, out, probe);
+    // FLATTENED, for the same reason a Fatal cast is: a misfire must be a
+    // bounded event. Letting the refused carrier's payload ask for carriers of
+    // its own would put the budget it just failed straight back on the queue.
+    ApplySpellEffect(*lib_, cast.payload, originFx, aim, 400, out, probe, 0, 0, true);
     return;
   }
   SpellProjectile p;
@@ -1850,13 +2217,18 @@ CastResult SpellSystem::Cast(const CastList& list, CasterState& caster,
   if (r.outcome == CastOutcome::Fatal) {
     int32_t carve = 2;
     for (const SpellCast& c : list.casts) {
-      ApplySpellEffect(*lib_, c.payload, originFx, dirFx, 1000, out, probe, 1000);
+      // FLATTENED (law L11): every nested carrier resolves in place, so an
+      // overcast `explosive projectile projectile bomb` goes off in the chest
+      // with everything it was ever going to do and nothing leaves the body.
+      ApplySpellEffect(*lib_, c.payload, originFx, dirFx, 1000, out, probe, 1000, 0, true);
       // The trail too: a fatal trail bolt lays its wake in the caster.
       if (!c.delivery.trail.empty())
-        ApplySpellEffect(*lib_, c.delivery.trail, originFx, dirFx, 1000, out, probe, 1000);
+        ApplySpellEffect(*lib_, c.delivery.trail, originFx, dirFx, 1000, out, probe, 1000, 0,
+                         true);
       carve = std::max(carve, c.delivery.impactRadius);
       for (const EffectInst& e : c.payload) carve = std::max(carve, e.radius);
     }
+    out.launches.clear();
     out.carveCaster = true;
     out.carveAt = Vec3{SpellFxToFloat(originFx.x), SpellFxToFloat(originFx.y),
                        SpellFxToFloat(originFx.z)};
@@ -1867,70 +2239,41 @@ CastResult SpellSystem::Cast(const CastList& list, CasterState& caster,
   // Instability makes the spell IMPRECISE, not merely costly.
   const SpellFxVec aim = SpellWobble(dirFx, r.instability, tick, casterId);
 
+  // EVERY cast is now the implicit `hand` box (rule 3), so there is one path
+  // here: resolve the hand's payload at reach, along the aim, once per fanned
+  // instance. Whatever carriers the payload asks for leave as launch requests
+  // and the adopt loop below gives birth to them.
+  selfAt_ = selfAt ? *selfAt : SpellFxVec{};
+  selfAtValid_ = selfAt != nullptr;
   for (size_t ci = 0; ci < list.casts.size(); ci++) {
     const SpellCast& c = list.casts[ci];
     const int32_t inst = ClampI(c.instances, 1, lib_->budgets.maxInstances);
     for (int32_t i = 0; i < inst; i++) {
       const SpellFxVec d = SpellFan(aim, i, inst, tick + (uint32_t)ci * 131u, casterId);
-      switch (c.delivery.mech) {
-        case DeliveryMech::Instant: {
-          SpellFxVec at = originFx;
-          const std::vector<EffectInst>* payload = &c.payload;
-          std::vector<EffectInst> clamped;
-          if (c.delivery.glyph < 0) {
-            // hand: at reach, along the aim.
-            const SpellFxVec u = Unit(d, (int64_t)c.delivery.reach * kSpellFxOne);
-            at = {originFx.x + u.x, originFx.y + u.y, originFx.z + u.z};
-          } else if (selfAt) {
-            // The character screen's clicked part: resolve THERE, with the
-            // effect radii clamped to the part so `fire self` on a stump
-            // chars the stump and not the torso beside it.
-            at = *selfAt;
-            clamped = c.payload;
-            for (EffectInst& e : clamped)
-              if (e.radius > c.delivery.impactRadius) e.radius = c.delivery.impactRadius;
-            payload = &clamped;
-          }
-          // Fanned resolve points around the anchor for a shotgun on a
-          // body-anchored delivery: instance i lands a voxel or two off.
-          if (i > 0) {
-            const SpellFxVec u = Unit(SpellFan({kSpellFxOne, 0, 0}, i, inst, tick, casterId),
-                                      2 * kSpellFxOne);
-            at = {at.x + u.x, at.y + u.y, at.z + u.z};
-          }
-          ApplySpellEffect(*lib_, *payload, at, d, 1000, out, probe, r.instability,
-                           (uint32_t)i);
-          // A gravity Mod on an anchored delivery acts on the caster's body:
-          // `float self` hops, `float float self` more so, `heavy` shoves
-          // down. Once, as an impulse; `aura` is what makes it a status.
-          if (i == 0 && c.delivery.gravityMille != 0)
-            out.casterImpulseVps.y += -(float)c.delivery.gravityMille * 0.012f;
-          break;
-        }
-        case DeliveryMech::Flight:
-          if (c.delivery.body)
-            RequestBody(c, originFx, d, casterId, r.instability, out);
-          else
-            Launch(c, originFx, d, casterId, tick, i, r.instability, out, probe);
-          break;
-        case DeliveryMech::Continuous: {
-          // A HELD BEAM: resolves at the ray hit every tick the owner keeps
-          // it held (HoldBeam), billed per tick. The first tick is what the
-          // cast paid for; the rest are bills.
-          if (i > 0) break;   // one beam; shotgun fans its resolve, not its ray
-          SpellBeam bm;
-          bm.cast = c;
-          bm.casterId = casterId;
-          bm.origin = originFx;
-          bm.dir = d;
-          bm.ticksLeft = ClampI(c.delivery.lifetimeTicks, 1, lib_->budgets.maxStatusTicks);
-          bm.perTick = SatAdd(c.tariff, c.carryCost);
-          bm.instability = r.instability;
-          bm.held = true;
-          beams_.push_back(std::move(bm));
-          break;
-        }
+      SpellFxVec at = originFx;
+      const SpellFxVec u = Unit(d, (int64_t)c.delivery.reach * kSpellFxOne);
+      at = {originFx.x + u.x, originFx.y + u.y, originFx.z + u.z};
+      // Fanned resolve points around the anchor: instance i lands a voxel or
+      // two off (`shotgun` on the hand, rule 3).
+      if (i > 0) {
+        const SpellFxVec o = Unit(SpellFan({kSpellFxOne, 0, 0}, i, inst, tick, casterId),
+                                  2 * kSpellFxOne);
+        at = {at.x + o.x, at.y + o.y, at.z + o.z};
       }
+      const size_t before = out.launches.size();
+      ApplySpellEffect(*lib_, c.payload, at, d, 1000, out, probe, r.instability, (uint32_t)i);
+      // A carrier the hand spoke starts AT THE CASTER, not at reach: the
+      // muzzle is where a bolt leaves from and where `self` resolves.
+      for (size_t k = before; k < out.launches.size(); k++) {
+        out.launches[k].at = originFx;
+        out.launches[k].dir = d;
+        out.launches[k].generation = 0;
+        out.launches[k].casterId = casterId;
+      }
+      // A gravity Mod on the hand acts on the caster's body: `float` hops,
+      // `heavy` shoves down. Once, as an impulse; `aura` makes it a status.
+      if (i == 0 && c.delivery.gravityMille != 0)
+        out.casterImpulseVps.y += -(float)c.delivery.gravityMille * 0.012f;
     }
   }
   // Statuses, echoes and filters the payload asked for become system state;
@@ -1940,12 +2283,122 @@ CastResult SpellSystem::Cast(const CastList& list, CasterState& caster,
   for (SpellFilter& f : out.filters) f.casterId = casterId;
   for (SpellRestore& rs : out.restores)
     if (rs.casterId == 0) rs.casterId = casterId;
-  Adopt(out, bodies);
+  Adopt(out, bodies, tick, probe);
+  selfAtValid_ = false;
   return r;
 }
 
-void SpellSystem::Adopt(SpellEmission& out, const SpellBodyProbe* bodies) {
+// THE NESTED LAUNCHES A RESOLVE ASKED FOR (rule 2). Each one becomes exactly
+// what the spoken delivery would have become at the top level: a flight, a
+// body, a bounded beam, or an instant resolve — one generation down, fanned by
+// its own `count`.
+//
+// The drain LOOPS, because an instant nested box (`... self`) resolves its
+// payload right here and that payload may ask for carriers of its own. It is
+// bounded twice over: nothing past `maxGeneration` launches, and the loop
+// itself stops after that many passes.
+void SpellSystem::AdoptLaunches(SpellEmission& out, const SpellBodyProbe* bodies,
+                                uint32_t tick, const SpellProbe* probe) {
   const SpellBudgets& b = lib_->budgets;
+  std::vector<SpellLaunchReq> batch;
+  for (int pass = 0; pass <= b.maxGeneration + 1 && !out.launches.empty(); pass++) {
+    batch.clear();
+    batch.swap(out.launches);
+    for (SpellLaunchReq& rq : batch) {
+      const int32_t gen = rq.generation < 0 ? 0 : rq.generation;
+      if (gen > b.maxGeneration) continue;   // the subcriticality guarantee
+      SpellCast c;
+      c.delivery = rq.delivery;
+      c.payload = rq.payload;
+      c.instances = ClampI(rq.delivery.count, 1, b.maxInstances);
+      c.generation = gen;
+      PriceCast(*lib_, c);
+      const int32_t inst = c.instances;
+      for (int32_t i = 0; i < inst; i++) {
+        const SpellFxVec d = SpellFan(rq.dir, i, inst, tick ^ rq.salt, rq.casterId);
+        switch (c.delivery.mech) {
+          case DeliveryMech::Flight:
+            if (c.delivery.body)
+              RequestBody(c, rq.at, d, rq.casterId, rq.instability, out);
+            else
+              Launch(c, rq.at, d, rq.casterId, tick, i, rq.instability, out, probe);
+            break;
+          case DeliveryMech::Continuous: {
+            // A beam the HAND spoke (generation 0) is the caster's own: they
+            // hold it and releasing ends it. A beam a carrier spoke is
+            // ANCHORED — it burns from where its parent resolved for its tick
+            // cap, and nobody is holding anything, which is the only reading
+            // of a nested beam that is bounded.
+            if (i > 0) break;   // one beam; a fan fans its resolve, not its ray
+            SpellBeam bm;
+            bm.cast = c;
+            bm.casterId = rq.casterId;
+            bm.origin = rq.at;
+            bm.dir = d;
+            bm.ticksLeft = ClampI(c.delivery.lifetimeTicks, 1, b.maxStatusTicks);
+            bm.perTick = SatAdd(c.tariff, c.carryCost);
+            bm.instability = rq.instability;
+            bm.held = true;
+            bm.anchored = gen > 0;
+            beams_.push_back(std::move(bm));
+            break;
+          }
+          case DeliveryMech::Instant: {
+            // `self`: at the caster's body when the owner can say where that
+            // is, otherwise where the parent resolved. Position-parameterised
+            // either way (thesis 2) — the same call, different arguments.
+            SpellFxVec at = rq.at;
+            const std::vector<EffectInst>* payload = &c.payload;
+            std::vector<EffectInst> clamped;
+            if (selfAtValid_) {
+              at = selfAt_;
+              clamped = c.payload;
+              for (EffectInst& e : clamped)
+                if (e.radius > c.delivery.impactRadius) e.radius = c.delivery.impactRadius;
+              payload = &clamped;
+            } else if (bodies && bodies->bodyPos) {
+              Vec3 cc;
+              if (bodies->bodyPos(bodies->ctx, rq.casterId, cc))
+                at = {SpellFxFromFloat(cc.x), SpellFxFromFloat(cc.y), SpellFxFromFloat(cc.z)};
+            }
+            if (i > 0) {
+              const SpellFxVec o = Unit(SpellFan({kSpellFxOne, 0, 0}, i, inst, tick,
+                                                 rq.casterId),
+                                        2 * kSpellFxOne);
+              at = {at.x + o.x, at.y + o.y, at.z + o.z};
+            }
+            const size_t before = out.launches.size();
+            ApplySpellEffect(*lib_, *payload, at, d, 1000, out, probe, rq.instability,
+                             rq.salt ^ (uint32_t)i);
+            for (size_t k = before; k < out.launches.size(); k++) {
+              out.launches[k].at = at;
+              out.launches[k].dir = {0, kSpellFxOne, 0};
+              out.launches[k].generation = gen + 1;
+              out.launches[k].casterId = rq.casterId;
+            }
+            if (i == 0 && c.delivery.gravityMille != 0)
+              out.casterImpulseVps.y += -(float)c.delivery.gravityMille * 0.012f;
+            break;
+          }
+        }
+      }
+      for (SpellStatus& st : out.statuses)
+        if (st.casterId == 0) st.casterId = rq.casterId;
+      for (SpellEcho& ec : out.echoes)
+        if (ec.casterId == 0) ec.casterId = rq.casterId;
+      for (SpellFilter& f : out.filters)
+        if (f.casterId == 0) f.casterId = rq.casterId;
+      for (SpellRestore& rs : out.restores)
+        if (rs.casterId == 0) rs.casterId = rq.casterId;
+    }
+  }
+  out.launches.clear();
+}
+
+void SpellSystem::Adopt(SpellEmission& out, const SpellBodyProbe* bodies, uint32_t tick,
+                        const SpellProbe* probe) {
+  const SpellBudgets& b = lib_->budgets;
+  AdoptLaunches(out, bodies, tick, probe);
   for (SpellStatus& st : out.statuses) {
     // Rule 2: a hard cap on live statuses per caster. Over it the aura is
     // charged (it was) and attaches nothing.
@@ -1981,7 +2434,10 @@ void SpellSystem::Adopt(SpellEmission& out, const SpellBodyProbe* bodies) {
 void SpellSystem::HoldBeam(uint64_t casterId, SpellFxVec originFx, SpellFxVec dirFx,
                            bool held) {
   for (SpellBeam& bm : beams_) {
-    if (bm.casterId != casterId) continue;
+    // An anchored beam is a nested one: it burns where its parent resolved,
+    // on its own clock. The caster's aim is not its aim and releasing the key
+    // does not end it.
+    if (bm.casterId != casterId || bm.anchored) continue;
     bm.origin = originFx;
     bm.dir = dirFx;
     bm.held = bm.held && held;
@@ -2108,7 +2564,8 @@ void SpellSystem::RequestBody(const SpellCast& cast, SpellFxVec originFx,
   // in the hand like an over-budget bolt would.
   if ((int)(live_.size() + bombs_.size()) >= b.maxLiveProjectiles ||
       cast.generation > b.maxGeneration) {
-    ApplySpellEffect(*lib_, cast.payload, originFx, aim, 400, out, nullptr, instability);
+    ApplySpellEffect(*lib_, cast.payload, originFx, aim, 400, out, nullptr, instability, 0,
+                     true);
     return;
   }
   SpellBomb bm;
@@ -2156,7 +2613,6 @@ void SpellSystem::Tick(uint32_t tick, World& world,
   if (!lib_) return;
   int opsUsed = 0;
   const SpellProbe probe = WorldSpellProbe(world);
-  const SpellBudgets& b = lib_->budgets;
   const uint32_t seed = world.WorldSeed();
 
   // WHAT A FLIGHT CAN HIT, in three tiers of knowledge. The CPU mirror is only
@@ -2251,12 +2707,34 @@ void SpellSystem::Tick(uint32_t tick, World& world,
       if (rs.casterId == 0) rs.casterId = casterId;
   };
 
+  // WHICH WAY A CHILD LEAVES. The parent's direction reflected off the surface
+  // it hit, per axis, exactly the way `bounce` reflects — so a nested bolt
+  // comes off the wall rather than launching into it and detonating on its own
+  // first sub-step. With no surface (a bomb at rest, a fuse, an orb expiring,
+  // a `self`) there is nothing to reflect off and it goes straight up.
+  auto launchDir = [&](SpellFxVec at, SpellFxVec from, SpellFxVec dir, bool surface) {
+    const SpellFxVec up{0, kSpellFxOne, 0};
+    if (!surface) return up;
+    const int32_t cx = SpellFxFloor(at.x), cy = SpellFxFloor(at.y), cz = SpellFxFloor(at.z);
+    const int32_t px = SpellFxFloor(from.x), py = SpellFxFloor(from.y),
+                  pz = SpellFxFloor(from.z);
+    bool fx = solidAt(cx, py, pz), fy = solidAt(px, cy, pz), fz = solidAt(px, py, cz);
+    if (!fx && !fy && !fz) fx = fy = fz = true;
+    SpellFxVec d = dir;
+    if (fx) d.x = -d.x;
+    if (fy) d.y = -d.y;
+    if (fz) d.z = -d.z;
+    if (d.x == 0 && d.y == 0 && d.z == 0) return up;
+    return d;
+  };
+
   // Resolve a cast at a point through the SAME function backfire uses
-  // (thesis 2), then its children. `from` is the last free position, which is
-  // where children launch from — a child launched inside the wall it hit would
-  // impact on its first sub-step and chain.
+  // (thesis 2), then the carriers its payload asked for. `from` is the last
+  // free position, which is where a child launches from — a child born inside
+  // the wall its parent hit would impact on its first sub-step and chain.
   auto resolve = [&](const SpellCast& cast, SpellFxVec at, SpellFxVec from, SpellFxVec dir,
-                     int32_t instability, int32_t gen, uint64_t casterId, uint32_t salt) {
+                     int32_t instability, int32_t gen, uint64_t casterId, uint32_t salt,
+                     bool surface) {
     {
       SpellImpactFx fx;
       fx.at = at;
@@ -2268,25 +2746,23 @@ void SpellSystem::Tick(uint32_t tick, World& world,
     }
     if (opsUsed < kSpellOpsPerTick) {
       const size_t before = out.ops.size();
+      const size_t lbefore = out.launches.size();
       ApplySpellEffect(*lib_, cast.payload, at, dir, 1000, out, &probe, instability, salt);
       opsUsed += (int)(out.ops.size() - before);
+      // NESTING (rule 2): a child leaves from the last free position, one
+      // generation down. The generation counter is the subcriticality
+      // guarantee — nothing past budgets.maxGeneration launches.
+      const SpellFxVec ld = launchDir(at, from, dir, surface);
+      for (size_t k = lbefore; k < out.launches.size(); k++) {
+        out.launches[k].at = from;
+        out.launches[k].dir = ld;
+        out.launches[k].generation = gen + 1;
+        out.launches[k].casterId = casterId;
+      }
       stamp(casterId);
     } else {
       opsDropped_++;
-    }
-    // SPLIT: children with the same payload, one generation down, fanned back
-    // off the surface. The generation counter is the subcriticality guarantee
-    // (rule 2): nothing past budgets.maxGeneration launches.
-    if (cast.delivery.children > 1 && cast.delivery.mech == DeliveryMech::Flight &&
-        !cast.delivery.body && gen + 1 <= b.maxGeneration) {
-      SpellCast child = cast;
-      child.generation = gen + 1;
-      const SpellFxVec back{-dir.x, -dir.y, -dir.z};
-      for (int32_t k = 0; k < cast.delivery.children; k++) {
-        const SpellFxVec d =
-            SpellFan(back, k + 1, cast.delivery.children + 1, tick ^ salt, casterId);
-        Launch(child, from, d, casterId, tick, k, instability, out, &probe);
-      }
+      out.launches.clear();
     }
   };
 
@@ -2316,11 +2792,12 @@ void SpellSystem::Tick(uint32_t tick, World& world,
     bool impact = false;
     SpellFxVec impactAt = p.pos;
 
+    bool impactSurface = false;
     if (p.resting) {
       // A fused bolt sits where it landed until the fuse runs out.
       if (--p.fuseLeft <= 0) {
         resolve(p.cast, p.pos, p.pos, {0, kSpellFxOne, 0}, p.instability, p.gen, p.casterId,
-                (uint32_t)tick);
+                (uint32_t)tick, false);
         p.alive = false;
       }
     } else if (--p.ticksLeft <= 0) {
@@ -2392,6 +2869,7 @@ void SpellSystem::Tick(uint32_t tick, World& world,
             break;
           }
           impact = true;
+          impactSurface = true;
           impactAt = next;
           break;
         }
@@ -2417,6 +2895,7 @@ void SpellSystem::Tick(uint32_t tick, World& world,
         Vec3 hit;
         if (bodies->bodyHit(bodies->ctx, a, bEnd, p.casterId, hit)) {
           impact = true;
+          impactSurface = true;
           impactAt = {SpellFxFromFloat(hit.x), SpellFxFromFloat(hit.y), SpellFxFromFloat(hit.z)};
           p.pos = impactAt;
           p.resting = false;
@@ -2425,7 +2904,8 @@ void SpellSystem::Tick(uint32_t tick, World& world,
     }
 
     if (impact) {
-      resolve(p.cast, impactAt, p.pos, p.vel, p.instability, p.gen, p.casterId, (uint32_t)tick);
+      resolve(p.cast, impactAt, p.pos, p.vel, p.instability, p.gen, p.casterId, (uint32_t)tick,
+              impactSurface);
       p.alive = false;
     }
 
@@ -2493,7 +2973,7 @@ void SpellSystem::Tick(uint32_t tick, World& world,
     }
     if (fused || gone || expired) {
       resolve(bm.cast, bm.lastPos, bm.lastPos, {0, kSpellFxOne, 0}, bm.instability, bm.gen,
-              bm.casterId, (uint32_t)tick ^ bm.token);
+              bm.casterId, (uint32_t)tick ^ bm.token, false);
       if (bm.body != 0 && !gone) out.bodyDone.push_back(bm.body);
       bombs_[i] = bombs_.back();
       bombs_.pop_back();
@@ -2618,7 +3098,8 @@ void SpellSystem::Tick(uint32_t tick, World& world,
     }
   }
 
-  // Whatever this tick's resolves asked to sustain: attach to the bodies at
-  // their points (the owner's probe), price per tick, cap per caster.
-  Adopt(out, bodies);
+  // Whatever this tick's resolves asked for: the carriers they launched, then
+  // the statuses, echoes and filters they sustained — attached to the bodies at
+  // their points (the owner's probe), priced per tick, capped per caster.
+  Adopt(out, bodies, tick, &probe);
 }

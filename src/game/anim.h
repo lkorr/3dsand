@@ -138,6 +138,46 @@ struct LocomotionDef {
   // Turn rate multiplier while at full forward speed. Real bodies turn tighter
   // when slow; 1.0 disables the coupling.
   float turnRateMoving = 0.55f;
+
+  // ---- THE BODY'S OWN TERRAIN BUDGETS ------------------------------------
+  // Everything downstream — the walk drive's footprint collider, the 8-way
+  // sense fan, the freefall test, AND the A* planner's step rule — resolves
+  // these once per rig and shares the answer. They are here rather than as
+  // constants because "how big a ledge is a wall" is a property of the
+  // CREATURE, and because two systems that each hold their own copy of it
+  // disagree the first time one is edited (ai_nav.h's opening note says so in
+  // as many words; the planner's `maxStepUp` used to be a separate number in
+  // behaviors.json and drifted from the drive's).
+
+  // How high a ledge this body walks over without a jump, in METRES.
+  //
+  // The default is THE PLAYER'S OWN BUDGET (Player::kStepUpM = 0.58 m). It was
+  // a bare 0.20 m, and that gap is most of why NPCs read as worse at moving
+  // than the player on the same ground: a 3-voxel kerb the player strides over
+  // is a WALL to a mob, so its forward probe reads blocked, the steering
+  // deflects to the nearest clear direction, and the creature crabs sideways
+  // across a slope it should simply have walked up. Author it DOWN for
+  // something short-legged; the rig clamps it to its own leg span so a critter
+  // cannot inherit a human's stride.
+  float stepUpM = 0.58f;
+  // The drop the walk drive will step DOWN in one go. Past this the creature is
+  // in freefall and MobSystem::UpdateFall owns it, which is the honest model —
+  // a body does not glide off a ledge.
+  float stepDownM = 0.50f;
+  // Clear space a body needs above the ground to stand in a column, in metres.
+  // DELIBERATELY MUCH SHORTER THAN THE CREATURE: the note in ai_behavior.cpp's
+  // UpdatePath explains why (demanding a body's full height over every column
+  // refuses everything under a canopy, a ledge or an arch that the mob would in
+  // fact walk straight through). 0.3 m rejects a crawlspace and nothing else.
+  float headroomM = 0.30f;
+  // Ceiling on the slope tilt the body takes from the ground under it, DEGREES,
+  // applied separately to pitch and to roll. The old tilt was bounded only by
+  // "the plane normal's y is above 0.6", which admits 53 degrees in any
+  // direction including pure roll — a body rolled that far about its own
+  // forward axis is exactly the "standing on a ramp and rotated 45 degrees"
+  // complaint. A real walker's torso stays near vertical; this is a lean, not
+  // a surface alignment.
+  float tiltMaxDeg = 14.0f;
 };
 
 // Locomotion state selected by DISMEMBERMENT: each rule pairs a predicate over

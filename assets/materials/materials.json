@@ -1,5 +1,5 @@
 {
-  "comment": "Order defines the 12-bit GPU material ID; id 0 is always air (implicit). class: solid|powder|liquid|gas. density drives displacement (air=10). emission: 0-255 glow. moveEvery: viscosity (move only every Nth tick). wanders: critter scuttle. opaque: liquid renders as a surface, not translucent media. passable: bodies (player, mobs, spell projectiles) move straight through this solid - soft vegetation like reeds and kelp; it stays a normal solid for the CA, fire, the brush and the renderer, so it is still destructible. colors: 3 palette variants picked by the voxel state nibble. Tags feed reactions.json (tag:xxx matchers). Worldgen (worldgen.wgsl + world.cpp) and world.h assume the ID order of everything listed here — append new materials at the end, never reorder. hardness: 0-255 blast/dig resistance (class defaults: solid 60, powder 12, liquid 4, gas 0; 255 on sources/void = practically indestructible). molten: what the laser/heat melt brush (mode 2) converts this material into; absent = vaporized to air; 255-hardness matter is immune.",
+  "comment": "Order defines the 12-bit GPU material ID; id 0 is always air (implicit). class: solid|powder|liquid|gas. density drives displacement (air=10). emission: 0-255 glow. moveEvery: viscosity (move only every Nth tick). wanders: critter scuttle. opaque: liquid renders as a surface, not translucent media. passable: bodies (player, mobs, spell projectiles) move straight through this solid - soft vegetation like reeds and kelp; it stays a normal solid for the CA, fire, the brush and the renderer, so it is still destructible. colors: 3 palette variants picked by the voxel state nibble. Tags feed reactions.json (tag:xxx matchers). Worldgen (worldgen.wgsl + world.cpp) and world.h assume the ID order of everything listed here — append new materials at the end, never reorder. hardness: 0-255 blast/dig resistance (class defaults: solid 60, powder 12, liquid 4, gas 0; 255 on sources/void = practically indestructible). molten: what the laser/heat melt brush (mode 2) converts this material into; absent = vaporized to air; 255-hardness matter is immune. fluid: what a voxel of this does INSIDE a liquid - {lift, drag, wander}, each 0-15, absent means derived from class and density. Buoyancy is exact from density (a rock sinks in a pond, a plank washes about on top of it), so lift is a STRENGTH and never a direction; lift 0 is the way out - liquids do not touch this material and a voxel in flight stops dead at the surface, which is what everything did before the block existed. drag is per-tick damping in sixteenths of speed; wander is the sideways drift of something already floating, in 1/256 voxel per tick.",
   "materials": [
     {
       "id": "stone",
@@ -102,7 +102,7 @@
         "extinguisher",
         "conductive"
       ],
-      "comment": "Water darkens what it soaks rather than tinting it, so the stain colour is a desaturated near-grey: a wet patch should read as the same ground, wetter. amount 15 is the CEILING water would apply on its own; how deep any given ground actually gets is that ground's absorb capacity, which is always the smaller of the two. washes lets running water rinse blood out instead of relabelling it as wet.",
+      "comment": "Water darkens what it soaks rather than tinting it, so the stain colour is a desaturated near-grey: a wet patch should read as the same ground, wetter. amount 15 is the CEILING water would apply on its own; how deep any given ground actually gets is that ground's absorb capacity, which is always the smaller of the two. washes lets running water rinse blood out instead of relabelling it as wet. The `coat` block is the body side of the same substance: wet DRIES, a level every 4 seconds, and a wet foot tracks nothing (shed 0) — a puddle is not a footprint.",
       "stain": {
         "type": "wet",
         "color": "#6d6f73",
@@ -110,6 +110,11 @@
         "chance": 260,
         "consume": 0,
         "washes": true
+      },
+      "coat": {
+        "decay": 4,
+        "shed": 0,
+        "effects": []
       },
       "molten": "steam"
     },
@@ -193,6 +198,7 @@
       "id": "ash",
       "footstep": "path",
       "class": "powder",
+      "repose": 40,
       "absorb": {
         "capacity": 14
       },
@@ -267,6 +273,7 @@
       "id": "snow",
       "footstep": "path",
       "class": "powder",
+      "repose": 63,
       "density": 300,
       "hardness": 6,
       "colors": [
@@ -323,6 +330,7 @@
       "comment": "Wind, authored. This and the mite override the density-derived default (kMatWind* in sim/materials.h) in the direction the formula cannot know, because real wind susceptibility is area-over-mass — SIZE — and a uniform voxel grid has erased size. A seed at density 500 would derive a response of 9; dandelion dispersal is the whole point of a seed, so it gets 14 and a friction of 1 and a breeze carries it. A mite at density 600 would derive 8, which has the wind blowing a living creature around like ash; it gets response 1 and the maximum friction, so it holds its ground and walks where it means to.",
       "id": "seed",
       "class": "powder",
+      "repose": 30,
       "density": 500,
       "hardness": 8,
       "wind": {
@@ -433,6 +441,7 @@
     {
       "id": "dust",
       "class": "powder",
+      "repose": 30,
       "density": 400,
       "hardness": 6,
       "colors": [
@@ -552,7 +561,7 @@
       ]
     },
     {
-      "comment": "Blood. The `stain` block is what marks what it touches: at 90 per-mille a splash grabs the surfaces around it within a second or so, and `consume` 6 means roughly one stained voxel in 160 is eaten away per stain event, so blood slowly pits what it soaks without ever running away with itself (CLAUDE.md rule 2 — see DESIGN.md §6). The renderer picks blood's viscous shading (no ripple bands, a wet sheen, a smooth field normal so it does not read as gelatin cubes) off the authored moveEvery + opacity pair, not off a material ID — see isViscousLiquid in common.wgsl. The palette is LINEAR light like every material (the frame is tonemapped and gamma-encoded at the end), so these hexes look near-black in a colour picker and render as a dark blood red once lit; anything paler reads as pink paint next to the stain it leaves.",
+      "comment": "Blood. The `stain` block is what marks what it touches: at 90 per-mille a splash grabs the surfaces around it within a second or so, and `consume` 6 means roughly one stained voxel in 160 is eaten away per stain event, so blood slowly pits what it soaks without ever running away with itself (CLAUDE.md rule 2 — see DESIGN.md §6). The renderer picks blood's viscous shading (no ripple bands, a wet sheen, a smooth field normal so it does not read as gelatin cubes) off the authored moveEvery + opacity pair, not off a material ID — see isViscousLiquid in common.wgsl. The palette is LINEAR light like every material (the frame is tonemapped and gamma-encoded at the end), so these hexes look near-black in a colour picker and render as a dark blood red once lit; anything paler reads as pink paint next to the stain it leaves. The `coat` block is what blood does once it is ON A BODY rather than on the ground: a level of it dries off a voxel every 20 seconds (it never comes off entirely on its own — that takes water), and a bloodied foot tracks prints on 400 per-mille of its footfalls.",
       "id": "blood",
       "arcane": 3,
       "class": "liquid",
@@ -572,6 +581,11 @@
         "amount": 5,
         "chance": 90,
         "consume": 6
+      },
+      "coat": {
+        "decay": 20,
+        "shed": 400,
+        "effects": []
       },
       "tags": [
         "organic",
@@ -3100,6 +3114,28 @@
       ],
       "tags": [
         "mineral"
-      ]    }
+      ]    },
+    {
+      "comment": "The firm half of a sand cover. A powder cap laid on ground at or past the angle of repose avalanches out from under itself on the tick it is generated -- worldgen's job is to make matter AT REST -- so genCellIn lays SANDSTONE wherever the slope gate takes the loose depth to zero, and over the whole cap on a lake's berm wall, which the analytic noise slope cannot see at all. Sand's own colours a shade darker and greyer, so a cut bank reads as rock rather than as loose sand that forgot to fall. `far` aliases sand: at cascade distance a dune and the cliff behind it are one thing, and the 128 far palette slots were already full.",
+      "id": "sandstone",
+      "arcane": 1,
+      "footstep": "path",
+      "class": "solid",
+      "density": 2200,
+      "hardness": 14,
+      "rubble": "sand",
+      "far": "sand",
+      "colors": [
+        "#c2ae79",
+        "#b9a671",
+        "#cbb785"
+      ],
+      "tags": [
+        "mineral",
+        "meltable",
+        "dissolvable"
+      ],
+      "molten": "molten_glass"
+    }
   ]
 }

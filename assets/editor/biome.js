@@ -508,6 +508,8 @@ function buildPanel() {
                          d: 'WM_BF_GROUND_FLORA: the world-wide flower / tall-grass / undergrowth blocks run in this biome (off for desert, ocean, alpine).'}, 'cover');
   UI.boolRow(C, s.body, {k: 'cacti', n: 'cactus block', d: 'WM_BF_CACTI: the cactus site scan runs in this biome.'}, 'cover');
   UI.boolRow(C, s.body, {k: 'sandCap', n: 'sand cap', d: 'WM_BF_SAND_CAP: four cells of sand under the skin, above the subsoil.'}, 'cover');
+  UI.matRow(C, s.body, {k: 'firmSkin', n: 'firm cover',
+                        d: 'WM_B_FIRM_COVER: the SOLID the loose part of this cover becomes where the ground is steeper than a powder can hold — full depth on ground the sediment wedge calls flat, tapering to zero at the CA’s angle of repose, plus every column on a water body’s berm wall, which the noise gradient cannot see. Generated matter has to be generated at rest; a sand cap laid down a cliff avalanches on tick 0 and the chunk never sleeps. Blank = the subsoil where that is solid, else stone.'}, 'cover', mats, {filter: isSolid, allowNone: true});
   UI.row(C, s.body, {k: 'cactusChance', n: 'cactus 1-in-N', min: 0, max: 400, step: 1, int: true,
                      d: 'One in this many cactus tiles grows a cactus; 0 = never. Today the global worldgen.cactusChance (a percent) decides; P-E reads this instead.'}, 'cover');
   UI.row(C, s.body, {k: 'saguaroFraction', n: 'saguaro %', min: 0, max: 100, step: 1, int: true, u: '%',

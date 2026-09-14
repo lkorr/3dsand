@@ -162,6 +162,7 @@ TP_F(render, shadowLift, TUNE_SHADOW_LIFT, 0.45f)
 TP_F(render, shadowFarLift, TUNE_SHADOW_FAR_LIFT, 0.3f)
 TP_I(render, shadowCache, TUNE_SHADOW_CACHE, 1)
 TP_I(render, shadowCacheSubdiv, TUNE_SHADOW_CACHE_SUBDIV, 4)
+TP_F(render, shadowSunAngle, TUNE_SHADOW_SUN_ANGLE, 1.0f)
 
 // ---- grain ----
 TP_F(render, grainBroadScale, TUNE_GRAIN_BROAD_SCALE, 11.0f)
@@ -312,7 +313,24 @@ TP_I(render, opennessChunksPerFrame, TUNE_OPENNESS_CHUNKS, 256)
 // not recorded at all -- which is what the `noopenness` --render-budget arm
 // measures. 1 = full spatial attenuation.
 TP_F(render, opennessStrength, TUNE_OPENNESS_STRENGTH, 1.0f)
-TP_F(render, opennessFloor, TUNE_OPENNESS_FLOOR, 0.3f)
+// THE OLD LEAK, KEPT AS ITS OWN A/B ARM AND DEFAULTED OFF (2026-09-11). This
+// was the least the openness grid could scale the SKY ambient to, and because
+// the sky ambient is the entire day/night signal a sealed cave got a flat 30%
+// of the time of day through solid rock: measured in the `--shot` stone room,
+// 97.6% of a sealed wall's noon brightness was this term and the room's
+// noon/midnight ratio was 8.6x. What it was standing in for -- "real enclosed
+// surfaces keep light from the surfaces around them" -- is enclosedAmbient
+// below plus the bounce gather, neither of which moves with the sun.
+TP_F(render, opennessFloor, TUNE_OPENNESS_FLOOR, 0.0f)
+// The ambient an ENCLOSED face keeps, ADDED rather than multiplied in, and
+// deliberately NOT a function of the sun, the moons or the sky: this is the
+// term that decides how bright a cave is, and a cave must not know what time
+// it is. Scaled by (1 - openness), so open ground never sees it at all and the
+// meadow stays bit-identical; scaled by opennessStrength too, so the
+// `noopenness` arm still folds the whole feature away. Sits at about the
+// brightness a moonless night gives the open sky, which is the look the
+// measurement was aiming at: dim, navigable, and the same at noon.
+TP_V3(render, enclosedAmbient, TUNE_ENCLOSED_AMBIENT, 0.012f, 0.013f, 0.016f)
 // Bilinear over the four neighbouring blocks in the face plane. Nearest-only
 // tiles visibly on a flat wall at 40 cm blocks; this costs three more byte
 // reads on a hit that has already paid for a chunk lookup.
@@ -334,15 +352,30 @@ TP_F(render, giDecay, TUNE_GI_DECAY, 0.25f)
 // LoadTuning keeps it strictly below giDecay or the grid brightens without
 // bound.
 TP_F(render, giFeedback, TUNE_GI_FEEDBACK, 0.2f)
-// 4^3 blocks each of the five gather rays steps through (3 = 1.2 m).
-TP_I(render, giGatherBlocks, TUNE_GI_GATHER_BLOCKS, 3)
+// The STEP BUDGET of each of the nine gather rays, not a distance: traceOpaque
+// jumps a whole CHUNK (1.6 m) per step wherever the chunk holds no blocker and
+// a 4^3 block otherwise, so open air is crossed four times faster than the
+// name suggests. At the old 3 the gather reached 1.2 m and light could not
+// cross a room, and render.opennessFloor was leaking daylight into sealed rock
+// to stand in for the transport that was missing; 12 crosses a room.
+// MUST STAY A CONSTANT the shader can fold -- see giGatherRays in
+// raymarch.wgsl for the 128 -> 168 register cliff a per-pixel budget costs.
+// Paid for by doubling giCachePeriod below: measured 2026-09-11, 12 steps at
+// period 16 costs the same 0.78 ms as 3 steps at period 8.
+TP_I(render, giGatherBlocks, TUNE_GI_GATHER_BLOCKS, 12)
 // The gather CACHE (PLAN_frame_perf.md s3 item 1): frames between re-gathers
 // of one chunk slot's block-faces. The nine rays run only on a slot's scheduled
 // frame (slots are staggered, so 1/N of the visible ones re-gather per frame)
 // and for a face never gathered; every other hit reads one cached word,
 // bilinear over the face plane. 0 = the old per-pixel gather every frame,
 // const-folded, which is the `nogicache` --render-budget arm.
-TP_I(render, giCachePeriod, TUNE_GI_CACHE_PERIOD, 8)
+// 8 -> 16 on 2026-09-11, to pay for giGatherBlocks 3 -> 12: the gather's cost
+// is (rays x steps) / period, so doubling this absorbed the whole of the
+// reach increase (0.78 ms on the noon overlook, before and after). What it
+// buys the reach with is LATENCY -- the bounce now trails the sun and the
+// shadow cache by up to 16 frames instead of 8, about a quarter-second, which
+// is well under what the eye reads as a lag on a term this diffuse.
+TP_I(render, giCachePeriod, TUNE_GI_CACHE_PERIOD, 16)
 
 // ---- the glow field (src/sim/world.h kGlowBytes, assets/shaders/sim_glow.wgsl)
 // Weight of the sampled emitter light added at a consumer. 0 is an EXACT off
@@ -492,6 +525,9 @@ TP_I(render, farSteps, TUNE_FAR_STEPS, 384)
 TP_F(render, farShadowReach, TUNE_FAR_SHADOW_REACH, 60.0f)
 TP_I(render, farBlockerHitLevel, TUNE_FAR_BLOCKER_HIT_LEVEL, 0)
 
+// ---- gas voxel -> parcel crossfade (PLAN_gas_particles.md stage 1b) ----
+TP_F(render, gasBlendStart, TUNE_GAS_BLEND_START, 0.5f)
+
 // ---- in-window LOD handoff (PLAN_surface_flight_perf.md A1) ----
 TP_F(render, lodHandoffDist, TUNE_LOD_HANDOFF_DIST, 24.0f)
 TP_F(render, shadowMaxDist, TUNE_SHADOW_MAX_DIST, 999.0f)
@@ -502,6 +538,7 @@ TP_F(render, shadowMaxDist, TUNE_SHADOW_MAX_DIST, 999.0f)
 // the mode; whether it is ON is NOT a tuning value (it is overlay state, so
 // toggling it cannot rewrite the user's tuning.json).
 TP_F(render, shortRangeDist, TUNE_SHORT_RANGE_DIST, 100.0f)
+TP_F(render, shortRangeNearDist, TUNE_SHORT_RANGE_NEAR_DIST, 50.0f)
 TP_F(render, shortRangeFogStart, TUNE_SHORT_RANGE_FOG_START, 0.65f)
 TP_F(render, shortRangeFogDensity, TUNE_SHORT_RANGE_FOG_DENSITY, 5.0f)
 
@@ -524,6 +561,9 @@ TP_F(wind, dbgWindRadius, TUNE_WIND_DBG_RADIUS, 48.0f)
 // ---- sim: DETERMINISM-CRITICAL, integer only (CLAUDE.md rule 1) ----
 TP_I(sim, partGravity, TUNE_PART_GRAVITY, 22)
 TP_I(sim, partMaxVel, TUNE_PART_MAX_VEL, 1536)
+TP_I(sim, partBuoyMax, TUNE_PART_BUOY_MAX, 88)
+TP_I(sim, partSettleSpeed, TUNE_PART_SETTLE_SPEED, 24)
+TP_U(sim, partFloatPatience, TUNE_PART_FLOAT_PATIENCE, 180)
 TP_I(sim, airDensity, TUNE_AIR_DENSITY, 10)
 TP_I(sim, falloffPerCell, TUNE_FALLOFF_PER_CELL, 6)
 TP_U(sim, ejectSolid, TUNE_EJECT_SOLID, 250)
@@ -620,10 +660,41 @@ TP_I(sim, fluidExciteStep, TUNE_FLUID_EXCITE_STEP, 2)
 // 0 restores the WP4 behaviour where the two representations pass through each
 // other. See the seeding block in sim_fluid.wgsl clearGrid.
 TP_F(sim, fluidSettledMass, TUNE_FLUID_SETTLED_MASS, 1.0f)
+// Does SUBMERGED settled liquid act as a boundary for MPM particles? The
+// static mass above puts a density STEP at the interface, which stops a slow
+// particle, but the field below it is flat rest with no depth profile — so a
+// particle with downward momentum punches through and free-falls through water
+// the solver cannot see. A buried particle can never settle back (a submerged
+// column has no room by construction), so this is the termination fix, not a
+// cosmetic one. 0 is the control arm for `--sweep sim.fluidSubmergedSolid=0,1`.
+TP_I(sim, fluidSubmergedSolid, TUNE_FLUID_SUBMERGED_SOLID, 1)
 TP_F(sim, fluidSettleEps, TUNE_FLUID_SETTLE_EPS, 6.0f)
 TP_F(sim, fluidWakeSpeed, TUNE_FLUID_WAKE_SPEED, 24.0f)
 TP_I(sim, fluidSettleTicks, TUNE_FLUID_SETTLE_TICKS, 24)
 TP_F(sim, fluidStainRate, TUNE_FLUID_STAIN_RATE, 8.0f)
+
+// ---- THE FORCE-SETTLE BACKSTOP (rule 2's termination guarantee) ------------
+// settleColumn walks its own 16 cells plus SETTLE_SPILL more, so a SUBMERGED
+// column has no room by construction and refuses forever. Measured at the
+// authored home_lake 2026-09-08: 7,610 particles alive and flat in a world with
+// 0 awake chunks, 40 of 40 picked blocks refused, 2,060 columns per 20 ticks
+// hitting the spill ceiling and 0 for any other reason, 0 eighths converted —
+// 3.7 ms/frame of solver that can never finish. These three knobs are the
+// escape hatch, and turning stuckTicks to 0 disables the whole path.
+//
+// The age must key on particle EXISTENCE, not on refusal: once submerged cells
+// can no longer excite, the stuck blocks are never CALM either, so they are
+// never picked and a refusal-triggered counter would never fire.
+TP_I(sim, fluidStuckTicks, TUNE_FLUID_STUCK_TICKS, 96)
+// Forced blocks per tick. Small on purpose: a forced walk's write set reaches
+// past SETTLE_SPILL, so forced picks take a stricter exclusion (no two may
+// share an (x,z) chunk column) and the budget bounds the drain rate.
+TP_I(sim, fluidForceBlocks, TUNE_FLUID_FORCE_BLOCKS, 4)
+// How many cells past the spill ceiling a forced walk may climb looking for
+// room. Buried mass belongs at the column's free surface; this bounds the
+// search. Exhausting it means a genuinely sealed column, which is counted
+// rather than silently retried.
+TP_I(sim, fluidForceReach, TUNE_FLUID_FORCE_REACH, 64)
 
 // ---- WATER BODIES (docs/PLAN_water_master.md, M1) ----
 // A still lake gets a NAME and a small record of aggregates, so that from M2
@@ -685,6 +756,13 @@ TP_I(sim, waterRelevelDepth, TUNE_WATER_RELEVEL_DEPTH, 32)
 // 0 off, 1 drift bias, 2 also settled-powder entrainment (kWindMode* in
 // world.h says what each promises about rule 2).
 TP_I(sim, windMode, TUNE_WIND_MODE, 1)
+// ---- gas particles (docs/PLAN_gas_particles.md) ----
+// The residency edge: 0 = WALL (what it was before stage 1 — a gas voxel that
+// wants out sheets along the top plane instead), 1 = SINK (it converts to a
+// parcel that keeps drifting outside the window). The gate, and the only thing
+// in this block that can move the world hash; at 0 no gas pass is recorded at
+// all, so it is an exact off switch and not a cheap path.
+TP_I(sim, gasMode, TUNE_GAS_MODE, 1)
 TP_F(sim, windDrag, TUNE_WIND_DRAG, 3.0f)
 TP_F(sim, windFluidGain, TUNE_WIND_FLUID_GAIN, 0.35f)
 TP_F(sim, windFluidMass, TUNE_WIND_FLUID_MASS, 0.5f)
@@ -721,6 +799,27 @@ TP_F(sim, currentDrag, TUNE_CURRENT_DRAG, 6.0f)
 // this is the one switch that removes every one of them. Terrain, water,
 // caves and ruins are untouched. MOVES THE WORLD HASH at 0.
 TP_U(debug, vegetation, TUNE_VEGETATION, 1)
+
+// THE GROUND-COVER SWITCH -- the SMALL half of the one above. 0 removes every
+// plant a body walks through and nothing else: the biome cover rows (tall
+// grass, wildflowers, undergrowth, scrub, the alpine cushion), the tile plants
+// (ferns, big toadstools), the shore rows, the pond life (reeds, lilypads,
+// kelp), the wet moss skin and the cave flora. TREES AND CACTI STAY -- they
+// are the landmark half of the flora and removing them changes what the world
+// IS, not how much small stuff is in front of the camera.
+//
+// Why two switches and not one: `vegetation` was the only lever, so the one
+// click that cleared the grass also cleared the wood, and there was no way to
+// look at bare terrain under a canopy. This is the lever you want almost
+// always; `vegetation` above is the extreme end of the same axis and stays
+// because the tree candidate scan and the crown proxy are their own cost.
+//
+// Gated at the SOURCE like the master (plantColumnAt, caveFloraAt and the
+// table-driven blocks in genCellIn), so the undergrowth canopy scan is not
+// paid for either. IMPLIED OFF when vegetation is 0 -- GROUND_COVER in
+// worldgen.wgsl is the AND of the two, so the master stays the extreme end.
+// MOVES THE WORLD HASH at 0.
+TP_U(debug, groundCover, TUNE_GROUND_COVER, 1)
 
 // ---- oil / petroleum-like viscous liquids (shadeViscous) ----
 // Oil and blood share the viscous SURFACE path but look nothing alike, and the

@@ -186,7 +186,7 @@ void WaterBodySystem::Reset() {
   bodies_.clear();
   children_.clear();
   curveDirtyUntil_.clear();
-  chunkBody_.assign(kNumChunks, 0u);
+  chunkBody_.assign(kNumSlots, 0u);
   builtOrigin_ = IVec3{1 << 30, 1 << 30, 1 << 30};
   builtSeed_ = 0;
   straddles_ = 0;
@@ -295,7 +295,7 @@ void WaterBodySystem::RebuildBasins(const World& world, uint32_t seed) {
 }
 
 void WaterBodySystem::Relabel(const World& world) {
-  chunkBody_.assign(kNumChunks, 0u);
+  chunkBody_.assign(kNumSlots, 0u);
   straddles_ = 0;
   bodies_.assign(basins_.size(), WaterBodyDesc{});
   children_.clear();
@@ -723,12 +723,12 @@ void WaterBodySystem::Tick(const World& world, uint32_t seed, uint32_t tick,
                          return tick >= h.tick + kWaterDrainHotTicks;
                        }),
         holeHints_.end());
-    if (worldEdited && chunkBody_.size() == kNumChunks &&
+    if (worldEdited && chunkBody_.size() == kNumSlots &&
         world.ChunkInWindow({editCell.x >> 4, editCell.y >> 4,
                              editCell.z >> 4})) {
       const uint32_t slot = World::SlotChunkIndex(
           {editCell.x >> 4, editCell.y >> 4, editCell.z >> 4});
-      const uint32_t bi = slot < kNumChunks ? chunkBody_[slot] : 0u;
+      const uint32_t bi = slot < kNumSlots ? chunkBody_[slot] : 0u;
       if (bi != 0 && bi - 1 < bodies_.size()) {
         // ---- M5: COMPONENT 10's CHEAP DETECTION ------------------------
         //
@@ -788,7 +788,7 @@ void WaterBodySystem::Tick(const World& world, uint32_t seed, uint32_t tick,
     gpu_.drainArmed = false;
     return;
   }
-  if (chunkBody_.size() != kNumChunks) chunkBody_.assign(kNumChunks, 0u);
+  if (chunkBody_.size() != kNumSlots) chunkBody_.assign(kNumSlots, 0u);
 
   // Rebuild + relabel only when the WINDOW or the SEED moved. Labelling is
   // O(basins x footprint chunks) — a few hundred chunk slots for a default pond
