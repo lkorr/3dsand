@@ -1959,6 +1959,49 @@ struct Tuning {
     // bucket and is treated as deep.
     int waterRelevelDepth = 32;
 
+    // ---- W2: surface momentum (docs/PLAN_water_relevel.md §4) ----
+    //
+    // The relevel RELAXES: every column moves toward the body's mean and stops.
+    // A real pond OVERSHOOTS — the water beside a crater accelerates into it,
+    // arrives with momentum, piles past level and rings back. That needs one
+    // extra integer per column FACE and nothing else new: four non-negative
+    // outflow pipes per column (the Mei/O'Brien virtual-pipe layout), living in
+    // `world.waterFlux`.
+    //
+    // 0 = OFF and it is an EXACT IDENTITY, stronger than a cheap kernel: the
+    // `waterFlux` pass row is not recorded at all (Cond::WaterWave), so the
+    // pinned world hash cannot see the feature. 1 = the pipe layer is live.
+    int waveMode = 0;
+    // Gravity for the pipe acceleration, in VOXELS/s^2 — the sanctioned
+    // human-unit float lane, exactly like `drainGravity`, and converted to Q8
+    // cells/tick^2 by WGSL const-eval at the top of sim_waterbody.wgsl so the
+    // kernel itself stays integer and bit-deterministic (rule 1).
+    //
+    // 98 is real gravity at kVoxelsPerMetre = 10. The wave speed is
+    // sqrt(g * depth); at the shipped depth cap of 10 voxels that is ~1.04
+    // cells/tick, which is the CFL limit for a reach-1 scheme — raise either
+    // and the ring outruns the grid instead of travelling on it.
+    float waveGravity = 98.0f;
+    // VOXELS of depth the wave speed may see. A deep lake's waves would
+    // otherwise travel faster than one cell per tick, which a reach-1 update
+    // cannot represent; capping the depth caps the speed and reads fine,
+    // because what the eye follows is the ring, not its absolute celerity.
+    int waveDepthCap = 10;
+    // How fast the ring dies, per SECOND. A pipe keeps (1 - damping/30) of its
+    // flux each tick, so 0.8 is an e-folding time of ~1.25 s: a crater rings
+    // three or four times and is gone. 0 never settles and is what the sleep
+    // epsilon exists to make safe anyway; above ~8 the overshoot is invisible
+    // and this is just a slower relevel.
+    float waveDamping = 0.8f;
+    // The Q8 pipe magnitude a body must be STRICTLY UNDER to count as still.
+    // The shipped 256 is not a tolerance: a pipe transfers `q >> 8` whole
+    // eighths, so under 256 it moves literally nothing. A body that is still
+    // AND flat for `fluidSettleTicks` consecutive ticks publishes flux-asleep,
+    // and both W2 passes then return after three loads — which is what keeps a
+    // settled lake inside its hot window at zero cost (rule 2). Measured on the
+    // harness lake: asleep 112 ticks after a 17x17x6 crater.
+    int waveSleepEps = 256;
+
     // ---- W-D: discovery (docs/PLAN_water_relevel.md §8) ----
     //
     // A body the PLAYER creates — a basin dug and filled by hand, a pool a

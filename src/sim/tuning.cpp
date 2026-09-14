@@ -272,6 +272,9 @@ bool SetSimField(Tuning& t, const std::string& name, float value) {
     {"waterRelevelMax", &Tuning::Sim::waterRelevelMax},
     {"waterRelevelGain", &Tuning::Sim::waterRelevelGain},
     {"waterRelevelDepth", &Tuning::Sim::waterRelevelDepth},
+    {"waveMode", &Tuning::Sim::waveMode},
+    {"waveDepthCap", &Tuning::Sim::waveDepthCap},
+    {"waveSleepEps", &Tuning::Sim::waveSleepEps},
     {"waterDiscoverMinEighths", &Tuning::Sim::waterDiscoverMinEighths},
     {"waterAdoptMinArea", &Tuning::Sim::waterAdoptMinArea},
     {"windMode", &Tuning::Sim::windMode},
@@ -305,6 +308,8 @@ bool SetSimField(Tuning& t, const std::string& name, float value) {
     {"fluidStainRate", &Tuning::Sim::fluidStainRate},
     {"drainCd", &Tuning::Sim::drainCd},
     {"drainGravity", &Tuning::Sim::drainGravity},
+    {"waveGravity", &Tuning::Sim::waveGravity},
+    {"waveDamping", &Tuning::Sim::waveDamping},
     {"windDrag", &Tuning::Sim::windDrag},
     {"windFluidGain", &Tuning::Sim::windFluidGain},
     {"windFluidMass", &Tuning::Sim::windFluidMass},
@@ -1330,6 +1335,11 @@ bool LoadTuning(const std::string& path, Tuning& out) {
     ReadI(*g, "waterRelevelMax", s.waterRelevelMax, out, at);
     ReadI(*g, "waterRelevelGain", s.waterRelevelGain, out, at);
     ReadI(*g, "waterRelevelDepth", s.waterRelevelDepth, out, at);
+    ReadI(*g, "waveMode", s.waveMode, out, at);
+    ReadF(*g, "waveGravity", s.waveGravity, out, at);
+    ReadI(*g, "waveDepthCap", s.waveDepthCap, out, at);
+    ReadF(*g, "waveDamping", s.waveDamping, out, at);
+    ReadI(*g, "waveSleepEps", s.waveSleepEps, out, at);
     ReadI(*g, "waterDiscoverMinEighths", s.waterDiscoverMinEighths, out, at);
     ReadI(*g, "waterAdoptMinArea", s.waterAdoptMinArea, out, at);
     ReadI(*g, "windMode", s.windMode, out, at);
@@ -1625,6 +1635,33 @@ bool LoadTuning(const std::string& path, Tuning& out) {
       out.warnings.push_back("sim.waterRelevelDepth out of 0..32; clamped");
       s.waterRelevelDepth =
           s.waterRelevelDepth < 0 ? 0 : (int)kWaterRelevelDepthMax;
+    }
+    // ---- W2: surface momentum (docs/PLAN_water_relevel.md §4.2) ---------
+    // The mode gate FIRST, and for windMode's reason: an unknown value must
+    // not fall through to "some wave", because the whole identity argument is
+    // that 0 means the pass row is never recorded.
+    if (s.waveMode < 0 || s.waveMode > 1) {
+      out.warnings.push_back("sim.waveMode not 0 or 1; clamped to 0 (off)");
+      s.waveMode = 0;
+    }
+    // A SANITY bound rather than the stability argument. The wave speed is
+    // sqrt(g * depth) cells/tick and a reach-1 update cannot carry a ring
+    // faster than one cell per tick; what actually holds that is the kernel's
+    // own outflow clamp (a column may never give more than its top cell), so
+    // these two only catch a typo rather than a physics error.
+    clampWarnF(s.waveGravity, 0.0f, 4000.0f, "waveGravity");
+    if (s.waveDepthCap < 1 || s.waveDepthCap > 64) {
+      out.warnings.push_back("sim.waveDepthCap out of 1..64; clamped");
+      s.waveDepthCap = s.waveDepthCap < 1 ? 1 : 64;
+    }
+    // Per SECOND, and 30 is one whole tick: a pipe that lost more than all of
+    // its flux in a tick is "no momentum at all" written confusingly.
+    clampWarnF(s.waveDamping, 0.0f, 30.0f, "waveDamping");
+    // 0 is legal and means "never counts as still by itself", so the body
+    // sleeps only once the relevel reports it flat. Negative is a typo.
+    if (s.waveSleepEps < 0) {
+      out.warnings.push_back("sim.waveSleepEps negative; clamped to 0");
+      s.waveSleepEps = 0;
     }
     // W-D. A negative threshold would read as "off" by accident rather than on
     // purpose; 0 is the deliberate off switch and is left alone.

@@ -693,7 +693,12 @@ struct TickParams {
   // refuses a DISCOVERED probe (WBF_DISCOVER) and parks it in WB_REFUSED.
   // Never applied to an authored basin — see world.h.
   waterAdoptMinArea : i32,
-  padWb4 : u32,
+  // W2: the surface-momentum ARM. 0 = OFF and the `waterFlux` row is not even
+  // recorded; the CPU zeroes it on any tick the footprint is not declared, for
+  // waterRelevelMax's reason — the wave apply is folded into wbRelevel, i.e.
+  // into the same voxel writer. It was the padWb4 pad word, so the struct size
+  // check_invariants.py compares is unchanged.
+  waveMode : i32,
   // WATERBODY_CAP bodies x 2 rows. The literal 128 is deliberate, exactly like
   // windPrims' 96: this file and world.h are compared on TOTAL SIZE by
   // scripts/check_invariants.py, so a cap changed on one side and not the other
@@ -906,6 +911,27 @@ const WBS_RVTAKENT  : u32 = 40u;
 // on the way costs one extra read per COLUMN (the walk goes downward, so the
 // previously read word IS the cell above) and nothing per cell.
 const WBS_RAREA     : u32 = 41u;
+// ============================================================================
+// W2 — THE SURFACE-MOMENTUM SLEEP (docs/PLAN_water_relevel.md §4.3).
+//
+// The PIPES are not here: they are per COLUMN and live in `waterFlux`, a
+// binding of its own (world.h kWaterFluxWords). What is here is the four words
+// the per-body SLEEP needs, because sleep is a statement about a BODY and the
+// ledger is the one thread per body this subsystem has.
+//
+// THE CADENCE IS THE SHAVE'S AGAIN. `wbFlux` reports into WVMAX/WVSUM in the
+// middle of the row block; `wbLedger` reads them at the START of the next one
+// and clears them. Never read a tally in the pass that writes it.
+const WBS_WVMAX     : u32 = 42u;  // this tick's max |q| over the body, Q8
+const WBS_WVSUM     : u32 = 43u;  // this tick's sum |q| over the body, Q8
+// Consecutive ticks the body has been BOTH still (WVMAX under waveSleepEps) and
+// FLAT (the measured surface inside one eighth). Both halves are needed: still
+// alone would sleep a crater that has not started moving yet, and flat alone
+// would sleep a ring passing through its own mean.
+const WBS_WVCALM    : u32 = 44u;
+// PUBLISHED: 1 = flux asleep. One load, and both W2 passes return on it — which
+// is what makes a settled lake inside its hot window cost nothing at all.
+const WBS_WVASLEEP  : u32 = 45u;
 // "Nothing on this side." Deliberately outside any legal eighth height, and on
 // the side that makes the apply's comparison false for every column: no take
 // below a cutoff of -0x40000000, no give above a cutoff of +0x40000000.

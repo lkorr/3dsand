@@ -51,6 +51,10 @@ struct TableCtx {
   // kWaterBodyCap for "none". A pure function of the tick (plan
   // section 3.4) and the whole condition on both sweep rows.
   uint32_t waterSweepSlot = 0xFFFFFFFFu;
+  // W2: sim.waveMode, ANDed with "a body is listed this tick"
+  // (docs/PLAN_water_relevel.md §4.2). 0 = the surface-momentum row is not
+  // recorded at all, which is what makes waveMode 0 an exact identity.
+  uint32_t waveMode = 0;
   // Openness refresh budget this tick (docs/PLAN_gi.md §2). 0 = the grid
   // is off and neither openness row is recorded.
   uint32_t opennessChunks = 0;

@@ -9069,6 +9069,104 @@ against a 900-tick window — and correct for a crater. If a measured case ever
 makes it matter the knob is a demand floor in the ledger, not a change to the
 apply.
 
+### 5b.9 W2: surface momentum — the pond overshoots (added 2026-09-14)
+
+`docs/PLAN_water_relevel.md` §4. W1 RELAXES: every column drifts toward the
+body's mean and stops, which is water finding its level and is not what water
+looks like. A real pond OVERSHOOTS — the water beside a fresh crater accelerates
+into it, arrives carrying momentum, piles past the level and rings back out. W2
+is that momentum, and it is one extra integer per column FACE and nothing else
+new.
+
+**Four owned outflow pipes per column, never two shared signed faces.** Each
+column owns `q[+x], q[-x], q[+z], q[-z]`, all non-negative (the Mei/O'Brien
+virtual-pipes layout); the reverse of a pipe is the NEIGHBOUR's own pipe, not a
+sign on one shared word. That is not a packing preference, it is the whole
+write-hazard argument: the outflow clamp has to scale a column's outflows
+against what that column may give, and with shared faces half of them run
+through a face the neighbour owns — so "write the scaled flux back" would be two
+writers per word, the exact mark/apply hazard everything else in this subsystem
+avoids. With owned outflows **every transfer amount lives in exactly one word,
+written by its owner and gathered by its receiver**, and conservation between two
+columns is exact by construction rather than by agreement between two copies.
+
+**The store** (`world.waterFlux`, `world.h` `kWaterFluxWords`). A dense XZ grid
+over the residency window, six u32 per column — four pipes, the free-surface
+height in eighths, and a validity stamp — indexed `(z & WORLD_MASK) * kWorldN +
+(x & WORLD_MASK)` like every other window-relative buffer. 6 MiB at 512², one
+binding (36 in `simBGL_`), one pass-table resource. Derived data in guideline
+#3's sense: not hashed, not saved, dropped on a window shift.
+
+**The stamp is the window-shift answer, and it is one word.** The residency
+window is toroidal, so a slot is silently reused by the column `kWorldN` voxels
+away as the window walks. `(tick + 1) << 4 | pageX << 2 | pageZ`: the tick half
+is freshness, the page bits are identity. The tick half alone would ALMOST do —
+but a shift moves the origin by one CHUNK, so the departed column's stamp can be
+exactly one tick old on the tick its slot is re-read, and two columns sharing a
+slot differ by a multiple of `kWorldN`, which is what those two bits separate.
+Same shape as `opennessStamp` (a hash of the world chunk coord) and `reposeSnap`
+(a per-slot tick). **A column ENTERING the valid set has its pipes zeroed by
+`wbSurface`**, which is what also makes the store safe across a world reload, a
+`--sweep` arm and the determinism gate's second pass — all three put a record
+from another world in the slot, and a stale pipe read as fresh would let session
+history decide a voxel write.
+
+**Three passes, and the apply is FOLDED IN.** `wbSurface` (W1's measure) writes
+the height and the stamp on the same walk that fills the histogram. `wbFlux`
+runs between the shave and the apply: per owned column it gathers five heights,
+accumulates `q += G·depth·Δs` in Q8, clamps at 0, damps, and applies the outflow
+clamp against `min(relevelMax, topFullness, s - floorS)`. `wbRelevel` then
+carries BOTH contributions — the relevel's give/take plus pipe inflow minus pipe
+outflow — so a column is written **once per tick by one pass**. A second apply
+pass would be two writers of one word one tick apart, each having read a fullness
+the other was about to change.
+
+**The physics, and the one discretisation guard.** `G` is the sanctioned
+human-unit lane (`sim.waveGravity`, vox/s², const-eval'd to Q8 cells/tick² at
+30 Hz exactly as `DRAIN_TWO_G` is). The wave speed is `sqrt(G·depth)`; at real
+gravity and the shipped `sim.waveDepthCap` of 10 voxels that is 1.04 cells/tick,
+the CFL limit — so the DEPTH is capped rather than the speed clamped afterwards,
+which keeps the pipes consistent with the transfer they are allowed to make.
+`WAVE_HEAD_EPS` (2 eighths, `sim_waterbody.wgsl`) is the guard and it is not
+optional: **measured on the first run of pass S, without it Σ|q| rose to 9.1 M Q8
+and STAYED there for 150 ticks** — every pipe in 14,493 columns pinned at the
+clamp, the surface 8 eighths from flat instead of 1, 85 chunks awake, the body
+never asleep. The physics was right and the discretisation was not: real gravity
+over a one-eighth head accelerates at 1.09 eighths/tick², a two-cell checkerboard
+cycles in two ticks, and the CA's own equalize rule leaves exactly that
+checkerboard everywhere by design. Two eighths is `TUNE_LIQUID_EQUALIZE`'s own
+threshold, so the wave stops where the CA stops and the two cannot fight.
+
+**Sleep, and how it wakes.** `wbFlux` reports `atomicMax(|q|)` and `Σ|q|` into
+the ledger; a body that is STILL (max under `sim.waveSleepEps`, shipped 256 —
+which is not a tolerance, since a pipe moves `q >> 8` whole eighths and under 256
+moves nothing) **and** FLAT (the measure's own histogram spread ≤ 2 eighths) for
+`sim.fluidSettleTicks` consecutive ticks publishes flux-asleep, and both W2
+passes then return after three loads. Both halves are needed: stillness alone
+sleeps a ring at the instant it passes through its own mean, flatness alone
+sleeps a lake with a fast shallow ring crossing it. Waking is the FLATNESS going
+false, which is why the spread is measured in the ledger rather than inferred
+from the pipes — an asleep body records no pipes, so nothing derived from them
+could ever wake it.
+
+**`sim.waveMode = 0` is an exact identity in the strong sense**: `Cond::WaterWave`
+leaves the `waterFlux` row unrecorded entirely, so the pinned hash cannot see a
+pass that was never dispatched. The wave rides the relevel's arm
+(`TickParams::waveMode` is zeroed with `waterRelevelMax`), because the apply it
+folds into is the relevel's and may only run on a tick whose chunks were declared
+to the page table.
+
+**Pass S**, on pass R's fixture exactly — same lake, same 17×17×6 crater, no
+drain, no test tap, MPM seam off — so the only difference between the two passes
+is the pipe layer. Measured at the W2 landing: Σ|q| peaks at 842,799 Q8 in bin 3
+of 12, decays monotonically to 61,038 and then to 0, the body publishes
+flux-asleep at **112 ticks** (budget 150), the surface ends **1 eighth** from flat
+(budget 2), **the mass identity closes at +0** with 36,764 given / 36,524 taken
+and a credit of 240, 0 chunks awake, 0 page faults. The dissipation test is
+BINNED rather than a per-tick monotone: Σ|q| is an integer sum over dithered
+columns and a ring reflects off the bank and focuses at the centre, which can
+lift the sum for a tick or two without creating anything.
+
 ### 5b.10 W-D: discovery — a body the PLAYER made (added 2026-09-14)
 
 `docs/PLAN_water_relevel.md` §8. §5b.7's third M5 gap — "a basin the player digs

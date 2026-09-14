@@ -441,6 +441,13 @@ SPEC = [
     ("sim", "waterRelevelGain", "TUNE_WATER_RELEVEL_GAIN", "i", 8),
     ("sim", "waterRelevelDepth", "TUNE_WATER_RELEVEL_DEPTH", "i", 32),
 
+    # SURFACE MOMENTUM (docs/PLAN_water_relevel.md W2)
+    ("sim", "waveMode", "TUNE_WAVE_MODE", "i", 0),
+    ("sim", "waveGravity", "TUNE_WAVE_GRAVITY", "f", 98.0),
+    ("sim", "waveDepthCap", "TUNE_WAVE_DEPTH_CAP", "i", 10),
+    ("sim", "waveDamping", "TUNE_WAVE_DAMPING", "f", 0.8),
+    ("sim", "waveSleepEps", "TUNE_WAVE_SLEEP_EPS", "i", 256),
+
     # DISCOVERY (docs/PLAN_water_relevel.md W-D)
     ("sim", "waterDiscoverMinEighths", "TUNE_WATER_DISCOVER_MIN_EIGHTHS", "i", 4096),
     ("sim", "waterAdoptMinArea", "TUNE_WATER_ADOPT_MIN_AREA", "i", 64),

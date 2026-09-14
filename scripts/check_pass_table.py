@@ -143,6 +143,7 @@ PIPE_TO_MEMBER = {
     "PIPE_WATER_SHAVE": "waterShave_",
     "PIPE_WATER_RELEVEL": "waterRelevel_",
     "PIPE_WATER_SURFACE": "waterSurface_",
+    "PIPE_WATER_FLUX": "waterFlux_",
     "PIPE_FLUID_COMPACT_COUNT": "fluidCompactCount_",
     "PIPE_FLUID_COMPACT_SCAN": "fluidCompactScan_",
     "PIPE_FLUID_COMPACT_SCATTER": "fluidCompactScatter_",
@@ -266,6 +267,9 @@ BUF_TO_WGSL = {
     "ActVoxViz": {"actVoxViz"},
     # The water-body drain ledger, GPU-owned (sim_waterbody.wgsl).
     "WaterBodyState": {"waterBodyState"},
+    # W2: the per-column surface-momentum store (docs/PLAN_water_relevel.md
+    # §4.1). Binding 36 of simBGL_ only -- no slim-group pipeline names it.
+    "WaterFlux": {"waterFlux"},
     # The baked tree atlas, binding 26 of BOTH simBGL_ and simSlimBGL_ (the
     # far-cascade pipelines call genCell, so they sample it too).
     "TreeAtlas": {"treeAtlas"},
@@ -330,6 +334,8 @@ _SIM_GROUP0 = {
     "gasOuter",
     # The angle-of-repose occupancy snapshot, binding 35.
     "reposeSnap",
+    # W2's per-column surface-momentum store, binding 36.
+    "waterFlux",
 }
 # The slim group is 0..4 PLUS the two page buffers at 17/18 — not a dense
 # prefix any more. One WGSL identifier cannot carry two binding numbers

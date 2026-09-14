@@ -755,6 +755,19 @@ void SubmitTick(GpuContext& ctx, World& world, Simulation& sim, uint32_t tick,
     // At sim.waterRelevelMax 0 this is 0 on every tick, both kernels return on
     // their first comparison, and W1 is an exact identity.
     tp.waterRelevelMax = g.writesThisTick ? wt.sim.waterRelevelMax : 0;
+    // ---- W2: THE SURFACE-MOMENTUM ARM (PLAN_water_relevel.md §4.2) -------
+    //
+    // Same word, same owner, same reason. The wave APPLY is folded into
+    // `wbRelevel` — one pass writes a column once per tick (§4.3) — so it is
+    // the same voxel writer and inherits the same permission: it may only run
+    // on a tick whose chunks were handed to the page table. Zeroed with the
+    // relevel's arm rather than separately, because a wave with no apply to
+    // fold into would spend momentum into a column nobody writes.
+    //
+    // At sim.waveMode 0 this is 0 on every tick AND the `waterFlux` row is not
+    // recorded at all (Cond::WaterWave), so W2 is an exact identity.
+    tp.waveMode =
+        (g.writesThisTick && wt.sim.waterRelevelMax > 0) ? wt.sim.waveMode : 0;
     // The total the seam dispatches over: real pours, then the reserved block.
     // Written AFTER tp.fluidSpawnCount's own assignment above on purpose — the
     // WriteBuffer below still uploads only the CPU half, because the GPU owns

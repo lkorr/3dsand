@@ -268,6 +268,7 @@ W_WSCRATCHBASE=$((W_WCURVEBASE + W_WBCAP * W_WCURVEWORDS))
 W_WRVDEPTHMAX="$(cpp_const kWaterRelevelDepthMax)"
 W_WRVBUCKETS="$(cpp_const kWaterRelevelBuckets)"
 W_WRVHISTBASE=$((W_WSCRATCHBASE + W_WSCRATCHWORDS))
+W_WFLUXWORDS="$(cpp_const kWaterFluxWords)"
 if [ -z "$W_WBCAP" ] || [ -z "$W_WBWORDS" ] || [ -z "$W_WBSTATE" ] \
    || [ -z "$W_WCHUNKCAP" ]; then
   echo "check_shaders: cannot parse kWaterBody*/kWaterChunkCap from $WORLD_H" >&2
@@ -371,6 +372,7 @@ PRELUDE_TEXT="$(printf '%s\n' \
   "const WATER_RELEVEL_DEPTH_MAX : i32 = ${W_WRVDEPTHMAX};" \
   "const WATER_RELEVEL_BUCKETS : u32 = ${W_WRVBUCKETS}u;" \
   "const WATER_RELEVEL_HIST_BASE : u32 = ${W_WRVHISTBASE}u;" \
+  "const WATER_FLUX_WORDS : u32 = ${W_WFLUXWORDS}u;" \
   "const FAR_LEVELS : u32 = ${W_FAR}u;" \
   "const FAR_N : u32 = ${W_FARN}u;" \
   "const FAR_NCHUNK : u32 = ${W_FARNCHUNK}u;" \

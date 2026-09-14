@@ -274,6 +274,11 @@ enum : uint32_t {
   // and gating adoption on it would be the candidate's own guess deciding
   // whether the candidate is real.
   WBS_RAREA_W,
+  // W2 (§4.3): the surface-momentum SLEEP. The pipes themselves are per COLUMN
+  // and live in `world.waterFlux`; these four are the per-body half — this
+  // tick's max and sum of |q| (Q8), the consecutive-calm counter, and the
+  // published flux-asleep flag pass S asserts on.
+  WBS_WVMAX_W, WBS_WVSUM_W, WBS_WVCALM_W, WBS_WVASLEEP_W,
 };
 // M5 — the SWEEP block's word map, which lives past the end of the ledger in
 // the same buffer (world.h's kWaterCurveBase). Must match the SW_* block in
@@ -1649,7 +1654,13 @@ Status GateWaterBody(Ctx& c, std::string& detail) {
         (int)BaselineNumber("waterbodyDiscoverCraterDepth", 4.0);
     const double nVolTol =
         BaselineNumber("waterbodyDiscoverVolTolPct", 25.0);
-    const double nSpreadMax = BaselineNumber("waterbodyRelevelSpread", 2.0);
+    // ITS OWN KEY, and that is the whole point of the line. Arm 2 used to read
+    // pass R's `waterbodyRelevelSpread` and landed exactly on it (2 == 2), so
+    // the two arms were one budget apart from failing together: tightening R's
+    // bound, or a change that cost the created pool one eighth, would have
+    // failed a pass about discovery for a reason about the harness lake. Same
+    // value, separate knob — this is not extra margin.
+    const double nSpreadMax = BaselineNumber("waterbodyDiscoverSpread", 2.0);
     const uint32_t nRelevelTicks =
         (uint32_t)std::max(1.0, BaselineNumber("waterbodyDiscoverRelevelTicks",
                                                120.0));
@@ -2030,7 +2041,10 @@ Status GateWaterBody(Ctx& c, std::string& detail) {
     RecordObserved("waterbodyDiscoverPoured", (double)nPoured);
     RecordObserved("waterbodyDiscoverArea", (double)nRArea);
     RecordObserved("waterbodyDiscoverAdoptTick", (double)nAdoptTick);
-    RecordObserved("waterbodyDiscoverSpread", (double)nSpread);
+    // `...SpreadOn`, not `...Spread`: the THRESHOLD now owns that name, and a
+    // recorded value sharing a key with a budget is a --rebaseline that quietly
+    // overwrites the budget with whatever the last run measured.
+    RecordObserved("waterbodyDiscoverSpreadOn", (double)nSpread);
     // ONE LINE, and it names every term §8.5 asks for plus the ones a failure
     // needs to tell itself apart (CLAUDE.md rule 6): "no body appeared" is a
     // different bug from "a body appeared and measured the wrong pool" and from
@@ -2064,6 +2078,314 @@ Status GateWaterBody(Ctx& c, std::string& detail) {
     // The probe MUST go: pass D compares a mode-0 script against a mode-1 one
     // and a surviving discovered body would make the mode-1 arm describe a
     // different world.
+    SetCurrentTuning(t);
+    WaterBodies().Reset();
+    SubmitWorldgen(c.ctx, world, c.sim, kDefaultSeed);
+    tick = RunQuietTicks(c, tick, 60);
+  }
+
+  mark("pass S");
+  // ========================================================== pass S (W2)
+  //
+  // SLOSH. docs/PLAN_water_relevel.md §4.5. W1 taught a disturbed pond to find
+  // its level; this is the acceptance that it finds it the way water does —
+  // the columns beside a fresh crater accelerate into it, arrive carrying
+  // momentum, overshoot, and ring out until the damping eats them.
+  //
+  // THE FIXTURE IS PASS R'S, DELIBERATELY. Same lake, same crater, same
+  // no-drain / no-MPM discipline, so the only difference between the two passes
+  // is `sim.waveMode` — which means every number here is comparable to a number
+  // pass R already printed, and a regression in the shared half shows up in
+  // both rather than in neither.
+  //
+  // WHAT IS ASSERTED, and each fails differently:
+  //
+  //   * THE MASS IDENTITY of §3.5, with the credit term, exactly as pass R
+  //     states it. This is the one that matters most: a pipe layer is a
+  //     transfer between two columns, and the entire argument for owned
+  //     outflows over shared signed faces is that each transfer lives in ONE
+  //     word both ends read. If that argument is wrong, water is created or
+  //     destroyed at the seam and this line is what says so.
+  //   * DISSIPATION. Sigma|q| over the body must RISE (the crater accelerates
+  //     the rim) and then FALL and stay fallen. Not created, ever.
+  //   * SLEEP. The body must publish flux-asleep inside the window, or the
+  //     feature has no idle cost story and rule 2 is broken.
+  //   * FLATNESS at the end, on pass R's own budget: a ring that never settles
+  //     level is not water.
+  //
+  // WHY THE DISSIPATION TEST IS BINNED rather than a raw per-tick
+  // non-increase. Sigma|q| is an integer sum over ~14,000 dithered columns and
+  // a ring REFLECTS off the bank: it focuses at the centre, which concentrates
+  // the same momentum into fewer columns and can lift the sum for a tick or
+  // two. A strict per-tick monotone assertion would be a knife edge measuring
+  // the bank's shape, not the physics. Binned maxima with a stated tolerance
+  // say the thing that is actually true — "after its peak it goes down and
+  // stays down" — and the decay floor at the end is what makes it a claim
+  // rather than a shrug.
+  //
+  // NOT GUARDED ON `ok`, for pass R's and pass N's reason: it rebuilds the
+  // world itself, and pass H1 carries an inherited conservation failure on this
+  // branch that would otherwise turn this into a silent skip.
+  std::string sloshNote;
+  {
+    const uint32_t swTicks =
+        (uint32_t)std::max(1.0, BaselineNumber("waterbodyWaveTicks", 120.0));
+    const uint32_t swSettle = (uint32_t)std::max(
+        1.0, BaselineNumber("waterbodyWaveSettleTicks", 60.0));
+    const uint32_t swSleepMax = (uint32_t)std::max(
+        1.0, BaselineNumber("waterbodyWaveSleepTicks", 150.0));
+    const uint32_t swBin =
+        (uint32_t)std::max(1.0, BaselineNumber("waterbodyWaveBinTicks", 10.0));
+    const double swSpreadMax = BaselineNumber("waterbodyWaveSpread", 2.0);
+    const double swRiseTolPct = BaselineNumber("waterbodyWaveRiseTolPct", 10.0);
+    const double swDecayFrac = BaselineNumber("waterbodyWaveDecayFrac", 0.25);
+    const int64_t swSlack =
+        (int64_t)BaselineNumber("waterbodyWaveSlackEighths", 64.0);
+
+    WaterBodies().Reset();
+    SubmitWorldgen(c.ctx, world, c.sim, kDefaultSeed);
+    Tuning st2 = t;
+    st2.sim.waterBodyTestDrain = 0;      // the CRATER is the disturbance
+    st2.sim.drainMaxEighthsPerTick = 0;  // ...and it is NOT a drain
+    st2.sim.fluidExciteMode = 0;         // pass R's discipline, same reason
+    st2.sim.drainExciteRadius = 0;
+    st2.sim.fluidSplashRate = 0.0f;
+    // ARMED EXPLICITLY, both of them. `sim.waterBodyMode` is 0 in the shipped
+    // tuning and `sim.waveMode` is 0 as W2 ships; a pass that inherited either
+    // would be a green light about a feature that never ran.
+    st2.sim.waterBodyMode = 1;
+    st2.sim.waterRelevelMax =
+        t.sim.waterRelevelMax > 0 ? t.sim.waterRelevelMax : 4;
+    st2.sim.waveMode = 1;
+    SetCurrentTuning(st2);
+    tick = RunQuietTicks(c, tick, 130);
+
+    const int swBoxLo = lakeGeo.floorY - kCraterDepth;
+    const int swBoxHi = lakeGeo.surfY;
+    int64_t swSpread = -1, swErr = 0, swCredit = 0, swGiven = 0, swTaken = 0;
+    int64_t swCapped = 0, swPeak = 0, swLast = 0, swInFlight = 0;
+    int swPeakBin = -1, swSleepTick = -1, swBadBin = -1;
+    uint32_t swAwake = 0, swPf = 0;
+    std::vector<int64_t> swBins;
+
+    const WaterBodyDesc* sd = WaterBodies().Find(1);
+    if (!sd || sd->gpuSlot >= kWaterBodyCap) {
+      fail("pass S: the authored lake is not proposed");
+    } else {
+      const uint32_t sSlot = sd->gpuSlot;
+      const LedgerView lv0 = ReadLedger(c);
+      if (lv0.At(sSlot, WBS_STATE) != WB_ADOPTED) {
+        fail(Format("pass S: the lake is %s, not adopted, before the crater",
+                    LedgerStateName(lv0.At(sSlot, WBS_STATE))));
+      } else {
+        const VoxelTruth s0 =
+            SweepBasin(c, lakeGeo, lakeDesc, matId, swBoxLo, swBoxHi);
+        uint32_t sPf0[4] = {0, 0, 0, 0};
+        ReadPageFaultsSync(c.ctx, world, sPf0);
+
+        std::vector<CellOp> crater;
+        for (int y = lakeGeo.floorY - kCraterDepth + 1; y <= lakeGeo.floorY; y++)
+          for (int z = lakeGeo.cz - kCraterHalf; z <= lakeGeo.cz + kCraterHalf;
+               z++)
+            for (int x = lakeGeo.cx - kCraterHalf; x <= lakeGeo.cx + kCraterHalf;
+                 x++)
+              crater.push_back({World::SlotCellIndex({x, y, z}), 0u});
+        SubmitTick(c.ctx, c.world, c.sim, tick, kDefaultSeed, {}, {}, crater,
+                   false, c.world.WindowOrigin(), true, false);
+        c.ctx.ProcessEvents();
+        tick++;
+
+        // ---- THE CURVE. One tick, one ledger read, one sample. -----------
+        //
+        // A per-tick readback is expensive and this is the one place that
+        // earns it: the claim is about the SHAPE of Sigma|q| over time, and a
+        // shape sampled every fifteen ticks (pass R's cadence) cannot tell a
+        // ring that rose and fell from one that rose and stayed up. The window
+        // is bounded by the sleep budget, and the loop STOPS the moment the
+        // body reports asleep — which on a working build is most of it.
+        int64_t binMax = 0;
+        uint32_t inBin = 0;
+        for (uint32_t i = 0; i < swSleepMax; i++) {
+          tick = RunQuietTicks(c, tick, 1);
+          const LedgerView lvi = ReadLedger(c);
+          const int64_t qs = lvi.At(sSlot, WBS_WVSUM_W);
+          swLast = qs;
+          if (qs > swPeak) swPeak = qs;
+          binMax = std::max(binMax, qs);
+          if (++inBin >= swBin) {
+            swBins.push_back(binMax);
+            binMax = 0;
+            inBin = 0;
+          }
+          if (swSleepTick < 0 && lvi.At(sSlot, WBS_WVASLEEP_W) != 0)
+            swSleepTick = (int)i + 1;
+          if (swSleepTick >= 0 && i + 1 >= swTicks) break;
+        }
+        if (inBin > 0) swBins.push_back(binMax);
+
+        tick = RunQuietTicks(c, tick, swSettle);
+        const VoxelTruth s1 =
+            SweepBasin(c, lakeGeo, lakeDesc, matId, swBoxLo, swBoxHi);
+        const LedgerView lv1 = ReadLedger(c);
+        uint32_t sFa[kFluidArgsWords] = {};
+        ReadFluidArgsSync(c.ctx, world, sFa);
+        uint32_t sPf1[4] = {0, 0, 0, 0};
+        ReadPageFaultsSync(c.ctx, world, sPf1);
+        swAwake = ReadActiveChunksSync(c.ctx, world, c.sim);
+        swPf = sPf1[0] - sPf0[0];
+        swCredit = lv1.At(sSlot, WBS_RVCREDIT_W);
+        swGiven = lv1.At(sSlot, WBS_RVGIVENT_W);
+        swTaken = lv1.At(sSlot, WBS_RVTAKENT_W);
+        swCapped = lv1.At(sSlot, WBS_RVCAPPED_W);
+        swInFlight = (int64_t)sFa[7] - (int64_t)std::min(sFa[29], sFa[7]);
+
+        if (!s1.read || s1.topCells == 0) {
+          fail("pass S: the final sweep found no free surface at all");
+        } else {
+          swSpread = (int64_t)s1.topMaxE - (int64_t)s1.topMinE;
+          // ---- (a) THE MASS IDENTITY, with the credit term ---------------
+          swErr = (int64_t)s1.eighths + swInFlight +
+                  lv1.At(sSlot, WBS_DRAINED) - lv1.At(sSlot, WBS_DEBIT) +
+                  (swCredit + lv1.At(sSlot, WBS_RVGIVEN_W) -
+                   lv1.At(sSlot, WBS_RVTAKEN_W)) -
+                  (int64_t)s0.eighths;
+          if (swErr < -swSlack || swErr > swSlack) {
+            fail(Format(
+                "CONSERVATION (pass S): the sloshing lake is off by %+lld "
+                "eighths. box %llu -> %llu (%+lld), in flight %lld, credit "
+                "%lld (%lld given / %lld taken cumulative), capped %lld. A "
+                "pipe transfer lives in ONE word both ends read, so a non-zero "
+                "number here means the giver and the receiver disagreed about "
+                "whether a pipe existed (plan §4.2)",
+                (long long)swErr, (unsigned long long)s0.eighths,
+                (unsigned long long)s1.eighths,
+                (long long)((int64_t)s1.eighths - (int64_t)s0.eighths),
+                (long long)swInFlight, (long long)swCredit, (long long)swGiven,
+                (long long)swTaken, (long long)swCapped));
+          }
+          if (swPf != 0) {
+            fail(Format("pass S: %u page faults (lost word 0x%08x) — the wave "
+                        "apply wrote into a sentinel chunk",
+                        swPf, sPf1[2]));
+          }
+          // ---- (b) DISSIPATIVE: rises, then falls and stays down ---------
+          for (size_t i = 0; i < swBins.size(); i++)
+            if (swPeakBin < 0 || swBins[i] > swBins[(size_t)swPeakBin])
+              swPeakBin = (int)i;
+          if (swPeak <= 0) {
+            fail("pass S proves nothing: Sigma|q| was 0 for the whole window, "
+                 "so no pipe ever carried anything and sim.waveMode reached no "
+                 "kernel. Check the arm (TickParams::waveMode) and the "
+                 "Cond::WaterWave row before believing any other number here");
+          } else {
+            for (size_t i = (size_t)swPeakBin + 1; i < swBins.size(); i++) {
+              const double cap =
+                  (double)swBins[i - 1] * (1.0 + swRiseTolPct / 100.0);
+              if ((double)swBins[i] > cap) { swBadBin = (int)i; break; }
+            }
+            if (swBadBin >= 0) {
+              fail(Format(
+                  "pass S: Sigma|q| ROSE after its peak — bin %d is %lld "
+                  "against bin %d's %lld (tolerance %.0f%%), peak %lld at bin "
+                  "%d of %llu. A heightfield that gains momentum after the "
+                  "disturbance stopped is creating energy, which is the "
+                  "seam's 'settle and wake must be strictly dissipative' "
+                  "lesson applied to pipes",
+                  swBadBin, (long long)swBins[(size_t)swBadBin], swBadBin - 1,
+                  (long long)swBins[(size_t)swBadBin - 1], swRiseTolPct,
+                  (long long)swPeak, swPeakBin,
+                  (unsigned long long)swBins.size()));
+            }
+            if (!swBins.empty() &&
+                (double)swBins.back() > swDecayFrac * (double)swPeak) {
+              fail(Format(
+                  "pass S: the ring did not die — the last bin is still %lld "
+                  "against a peak of %lld (budget %.2f of peak) after %u "
+                  "ticks. sim.waveDamping is %.2f/s, which should e-fold in "
+                  "%.1f ticks",
+                  (long long)swBins.back(), (long long)swPeak, swDecayFrac,
+                  swSleepMax, (double)st2.sim.waveDamping,
+                  st2.sim.waveDamping > 0.0f
+                      ? 30.0 / (double)st2.sim.waveDamping
+                      : 0.0));
+            }
+            // `swPeakBin == 0` is NOT asserted. A crater this size accelerates
+            // the rim inside the first bin, so "the peak is in bin 0" is the
+            // normal shape here rather than evidence of a wave that never
+            // rose — and the thing that WOULD catch that is the `swPeak <= 0`
+            // branch above, which is exact. The bin index is on the printed
+            // line so a change in the shape is visible without being a budget.
+          }
+          // ---- (c) SLEEP -------------------------------------------------
+          if (swSleepTick < 0) {
+            fail(Format(
+                "pass S: the body never published flux-asleep in %u ticks "
+                "(Sigma|q| ended at %lld against a peak of %lld, sleep "
+                "epsilon %d Q8, settle window %d ticks). A wave layer that "
+                "cannot sleep has no idle-cost story at all (rule 2)",
+                swSleepMax, (long long)swLast, (long long)swPeak,
+                st2.sim.waveSleepEps, st2.sim.fluidSettleTicks));
+          }
+          // ---- (d) FLAT AT THE END ---------------------------------------
+          if ((double)swSpread > swSpreadMax) {
+            fail(Format(
+                "pass S: the sloshing surface is still %lld eighths from flat "
+                "after %u ticks + %u settling, over the budget of %.0f. The "
+                "ledger moved %lld given / %lld taken with %lld capped and a "
+                "credit of %lld",
+                (long long)swSpread, swSleepMax, swSettle, swSpreadMax,
+                (long long)swGiven, (long long)swTaken, (long long)swCapped,
+                (long long)swCredit));
+          }
+          if ((double)swAwake > awakeMax) {
+            fail(Format("pass S: %u chunks still awake %u ticks after the "
+                        "ring died, over the budget of %.0f",
+                        swAwake, swSettle, awakeMax));
+          }
+        }
+      }
+    }
+
+    RecordObserved("waterbodyWavePeak", (double)swPeak);
+    RecordObserved("waterbodyWavePeakBin", (double)swPeakBin);
+    RecordObserved("waterbodyWaveSleepAt", (double)swSleepTick);
+    RecordObserved("waterbodyWaveSpreadOn", (double)swSpread);
+    RecordObserved("waterbodyWaveCredit", (double)swCredit);
+    RecordObserved("waterbodyWaveGiven", (double)swGiven);
+    RecordObserved("waterbodyWaveTaken", (double)swTaken);
+    RecordObserved("waterbodyWaveCapped", (double)swCapped);
+    RecordObserved("waterbodyWaveConsErr", (double)swErr);
+    RecordObserved("waterbodyWaveAwake", (double)swAwake);
+    // ONE LINE, EVERY TERM (CLAUDE.md rule 6). "The pond did not slosh" is at
+    // least five different bugs — the arm never reached the kernel (peak 0),
+    // the pipes saturated and behaved as a relevel (peak high, bins flat), the
+    // ring never died (last bin high), the body never slept (asleep -1), or
+    // the transfer leaked (identity non-zero) — and only these numbers
+    // together tell them apart.
+    std::string binStr;
+    for (size_t i = 0; i < swBins.size() && i < 16; i++) {
+      if (i) binStr += ",";
+      binStr += std::to_string((long long)swBins[i]);
+    }
+    sloshNote = Format(
+        "SLOSH(crater %dx%dx%d, waveMode 1, g %.0f vox/s² cap %d vox, damp "
+        "%.2f/s, eps %d) Sigma|q| peak %lld Q8 at bin %d of %llu (%u ticks "
+        "each) -> last %lld | bins [%s] | asleep at %s (budget %u) | spread "
+        "%lld eighths (budget %.0f) | identity %+lld (in flight %lld, credit "
+        "%lld, %lld given / %lld taken cumulative, capped %lld) | %u awake, "
+        "%u page faults",
+        kCraterHalf * 2 + 1, kCraterHalf * 2 + 1, kCraterDepth,
+        (double)st2.sim.waveGravity, st2.sim.waveDepthCap,
+        (double)st2.sim.waveDamping, st2.sim.waveSleepEps, (long long)swPeak,
+        swPeakBin, (unsigned long long)swBins.size(), swBin, (long long)swLast,
+        binStr.c_str(),
+        swSleepTick < 0 ? std::string("never")
+                        : std::to_string(swSleepTick) + " ticks",
+        swSleepMax, (long long)swSpread, swSpreadMax, (long long)swErr,
+        (long long)swInFlight, (long long)swCredit, (long long)swGiven,
+        (long long)swTaken, (long long)swCapped, swAwake, swPf);
+
+    // Leave the world settled and pristine for the passes that hash it.
     SetCurrentTuning(t);
     WaterBodies().Reset();
     SubmitWorldgen(c.ctx, world, c.sim, kDefaultSeed);
@@ -2515,6 +2837,7 @@ Status GateWaterBody(Ctx& c, std::string& detail) {
   detail += " | " + holeNote;
   detail += " | " + relevelNote;
   detail += " | " + discoverNote;
+  detail += " | " + sloshNote;
   detail += " | " + splitNote;
   detail += Format(
       " | DETERMINISM mid-drain %08x/%08x, end %08x/%08x",

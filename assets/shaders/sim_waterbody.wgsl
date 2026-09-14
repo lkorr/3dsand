@@ -108,6 +108,17 @@ const PT_KERNEL : u32 = PT_K_WATERBODY;
 // rule 2's "charge the budget BEFORE emission" is still charged on the CPU and
 // still charged before anything is written.
 @group(0) @binding(25) var<storage, read_write> waterSpawnOps : array<FluidSpawnOp>;
+// W2 — THE SURFACE-MOMENTUM STORE (docs/PLAN_water_relevel.md §4.1, world.h
+// kWaterFluxWords). Its own binding rather than more words on `waterBodyState`
+// because it is per COLUMN and there are WORLD_N^2 of them; the ledger is a
+// 64-entry table and the relevel histogram already sits past the end of it.
+//
+// Plain i32 and not atomic, and that is the design rather than an omission: a
+// thread writes ONLY its own column's six words, so there is exactly one writer
+// per word and no ordering to establish. The reads are gathers of neighbours
+// written by the PREVIOUS pass, which the pass table's RW(WaterFlux) rows put a
+// barrier between.
+@group(0) @binding(36) var<storage, read_write> waterFlux : array<i32>;
 
 // ---- human-unit tuning -> per-tick fixed point (the sim.fluid* lane) -------
 //
@@ -140,6 +151,56 @@ const DRAIN_VMAX_C : f32 = f32(FLUID_VMAX) / 65536.0;      // cells/tick
 const DRAIN_G_C : f32 = TUNE_DRAIN_GRAVITY / 900.0;        // cells/tick^2
 const DRAIN_H_MAX : i32 =
     max(1, i32(floor(DRAIN_VMAX_C * DRAIN_VMAX_C / (2.0 * max(DRAIN_G_C, 1e-6)))));
+
+// ---- W2: the wave knobs, same lane, same folding ---------------------------
+//
+// `sim.waveGravity` is vox/s^2 and `sim.waveDamping` is per second; both are
+// human-unit floats in the sanctioned sim.fluid*/wind* lane and both are folded
+// to fixed point HERE, once, by Tint under IEEE rules. Nothing below this block
+// is an f32.
+//
+// WAVE_G_Q8: gravity in Q8 cells/tick^2 (30 Hz, so /900). The pipe update is
+// `q += WAVE_G_Q8 * depth * (s_i - s_j)` with q in Q8 EIGHTHS PER TICK and s in
+// eighths, which makes the linearised system the discrete wave equation with
+// c^2 = g*depth — i.e. c = sqrt(g*depth) cells/tick, the §4.2 formula, and the
+// reason the depth is capped rather than the speed clamped afterwards.
+const WAVE_G_Q8 : i32 = max(0, i32(round(TUNE_WAVE_GRAVITY * 256.0 / 900.0)));
+// What a pipe KEEPS each tick, Q8. `1 - damping/30`, floored at 0 (a damping
+// past one whole tick is "no momentum at all", written confusingly) and capped
+// at 256 (keep everything).
+const WAVE_KEEP_Q8 : i32 =
+    clamp(i32(round((1.0 - TUNE_WAVE_DAMPING / 30.0) * 256.0)), 0, 256);
+// THE FLATNESS HALF OF THE SLEEP (§4.3). A body sleeps when it is STILL (max
+// |q| under sim.waveSleepEps) AND FLAT — and flat has to be its own test,
+// because a ring passing through its own mean is momentarily still by the first
+// test alone and would sleep mid-swing. Two eighths is the same residue the
+// relevel's own gate budgets for and the same one the CA's equalize rule
+// leaves; a lake inside it is flat in every sense this engine has.
+//
+// Declared HERE and not in common.wgsl, deliberately: one shader reads it, and
+// CLAUDE.md prices a common.wgsl constant at nine minutes of pipeline compile.
+const WAVE_FLAT_EIGHTHS : i32 = 2;
+// THE HEAD DEAD-BAND, and it is the difference between a pond that rings and a
+// pond that buzzes. MEASURED, first run of pass S: without it Sigma|q| over the
+// harness lake rose to 9.1 M Q8 and STAYED there for 150 ticks — every pipe in
+// 14,493 columns pinned at the outflow clamp, the surface eight eighths from
+// flat instead of one, 85 chunks awake at the end, and the body never asleep.
+//
+// The physics was right and the DISCRETISATION was not. Real gravity over a
+// one-eighth head is an acceleration of 1.09 eighths/tick^2 — a two-cell
+// checkerboard completes a cycle in two ticks — and the CA's own equalize rule
+// leaves exactly that checkerboard everywhere, permanently, by design (its
+// threshold is two eighths, so a ramp of one eighth per two cells is its fixed
+// point). So the pipes spent the whole run chasing noise the layer under them
+// re-creates every tick.
+//
+// A head at or under this many eighths therefore drives NOTHING, and a bigger
+// one drives what is left after subtracting it. Two eighths, the same number
+// TUNE_LIQUID_EQUALIZE uses, so the wave stops exactly where the CA stops and
+// the two cannot fight; it is a quarter of a voxel, which is under the eye's
+// resolution at this scale anyway. It is a const and not a knob because it is
+// not a taste — it is the width of the representation.
+const WAVE_HEAD_EPS : i32 = 2;
 
 // Integer square root, Newton, exact over u32 and bit-identical everywhere.
 // No sqrt(): this feeds a jet VELOCITY and a flow RATE that a mass ledger is
@@ -186,6 +247,85 @@ fn wbClearHist(b : u32) {
   for (var i = 0u; i < WATER_RELEVEL_BUCKETS; i++) {
     atomicStore(&waterBodyState[base + i], 0);
   }
+}
+
+// ============================================================================
+// W2 — THE FLUX STORE'S WORD MAP (docs/PLAN_water_relevel.md §4.1).
+//
+// Six words per column, and the first four are the whole design decision:
+// FOUR NON-NEGATIVE OUTFLOW PIPES, all owned by this column. The reverse of
+// pipe `+x` is the +x NEIGHBOUR's own `-x` pipe, not a sign on one shared word.
+// That is what makes the outflow clamp legal — a column scales its four
+// outflows against what it may give, and all four are its own words, so there
+// is one writer per word. Shared signed faces would have put two writers on
+// every face the clamp touched.
+const WV_PX : u32 = 0u;   // outflow toward +x
+const WV_NX : u32 = 1u;   // outflow toward -x
+const WV_PZ : u32 = 2u;   // outflow toward +z
+const WV_NZ : u32 = 3u;   // outflow toward -z
+const WV_S  : u32 = 4u;   // free-surface height in EIGHTHS (8y + fullness)
+const WV_STAMP : u32 = 5u;
+// The opposite pipe, so a gather can name "the pipe that points AT me".
+fn wvOpposite(d : u32) -> u32 { return d ^ 1u; }
+
+fn wvBase(x : i32, z : i32) -> u32 {
+  let cx = bitcast<u32>(x & WORLD_MASK);
+  let cz = bitcast<u32>(z & WORLD_MASK);
+  return (cz * WORLD_N + cx) * WATER_FLUX_WORDS;
+}
+
+// THE VALIDITY STAMP, and it is the entire answer to "what happens on a window
+// shift". The residency window is toroidal: a slot is silently reused by the
+// column WORLD_N voxels away as the window walks, and the departed column's
+// momentum would otherwise read as the new occupant's.
+//
+// `(tick + 1) << 4 | pageX << 2 | pageZ`. The TICK half is freshness — a record
+// is trusted only on the tick after the measure wrote it, which also makes
+// "this column had no free surface last tick" and "this column left the window"
+// the same cheap answer. The PAGE bits are identity: a shift moves the origin
+// by one CHUNK, so the departed column's stamp can be exactly one tick old on
+// the tick its slot is re-read, and two columns sharing a slot differ by a
+// multiple of WORLD_N — which is exactly what these two bits separate.
+//
+// Same idea as `opennessStamp` (a hash of the world chunk coord) and
+// `reposeSnap` (a per-slot tick); one word rather than two because one pass
+// writes all six of a column's words together.
+fn wvStampAt(x : i32, z : i32, tick : u32) -> i32 {
+  let px = bitcast<u32>((x - (x & WORLD_MASK)) >> WORLD_SHIFT) & 3u;
+  let pz = bitcast<u32>((z - (z & WORLD_MASK)) >> WORLD_SHIFT) & 3u;
+  // `tick + 1` so that 0 — the zero-initialised buffer, and every word
+  // EncodeLoadReset clears — stays "never written" rather than "valid at tick
+  // 0". Same reliance opennessGen's stamp has on its own zero.
+  return bitcast<i32>(((tick + 1u) << 4u) | (px << 2u) | pz);
+}
+// The measure runs at the END of a tick and stamps for the NEXT one; every
+// reader runs during that next tick. Two named functions rather than one with
+// an off-by-one at each call site, because there are five call sites and the
+// bug they would carry is silent (a stale height that reads as fresh).
+fn wvStampWrite(x : i32, z : i32) -> i32 { return wvStampAt(x, z, T.tick + 1u); }
+fn wvStampRead(x : i32, z : i32) -> i32 { return wvStampAt(x, z, T.tick); }
+
+// The column's measured height, or WB_RV_NOTAKE for "nothing trustworthy here".
+// THIS IS THE ONE GATE both W2 passes use, and the contract it carries is:
+// a column whose stamp is fresh had a free surface at the end of last tick AND
+// had its four pipes written by `wbFlux` this tick. So a pipe is either a real
+// transfer both ends agree on, or it is not read at all.
+fn wvHeight(x : i32, z : i32) -> i32 {
+  let base = wvBase(x, z);
+  if (waterFlux[base + WV_STAMP] != wvStampRead(x, z)) { return WB_RV_NOTAKE; }
+  return waterFlux[base + WV_S];
+}
+// The pipe `d` of the column at (x, z), or 0 if that column is not in this
+// tick's valid set. ZERO AND NOT "the stored value": a stale record is a
+// previous occupant's momentum (or a previous RUN's — `--sweep` and the
+// determinism gate's second pass both replay tick 0 in the same process), and
+// reading one would make the outcome depend on session history, which is rule 1
+// through the back door. wbSurface zeroes the pipes of a column ENTERING the
+// set, so a record is either this tick's or it is not read.
+fn wvPipe(x : i32, z : i32, d : u32) -> i32 {
+  let base = wvBase(x, z);
+  if (waterFlux[base + WV_STAMP] != wvStampRead(x, z)) { return 0; }
+  return max(waterFlux[base + d], 0);
 }
 
 // The two CPU-sent rows. Read straight off the module-scope uniform rather than
@@ -626,6 +766,12 @@ fn wbLedger(@builtin(global_invocation_id) gid : vec3<u32>) {
     wbSet(b, WBS_RVCAPPED, 0);
     wbSet(b, WBS_RVGIVENT, 0);
     wbSet(b, WBS_RVTAKENT, 0);
+    // W2: and so does the wave's sleep. A freshly adopted body starts AWAKE
+    // (calm 0) rather than asleep, so the first tick's measure decides.
+    wbSet(b, WBS_WVMAX, 0);
+    wbSet(b, WBS_WVSUM, 0);
+    wbSet(b, WBS_WVCALM, 0);
+    wbSet(b, WBS_WVASLEEP, 0);
     // The measure runs LATER THIS TICK and needs a base; the ledger will not
     // run again before it does. Same single evaluation as the tail below.
     wbSet(b, WBS_RVBASE,
@@ -891,6 +1037,12 @@ fn wbLedger(@builtin(global_invocation_id) gid : vec3<u32>) {
   var takeFrac = 0;
   var giveCut = WB_RV_NOGIVE;
   var giveFrac = 0;
+  // W2: the SURFACE SPREAD, in eighths, taken from the same histogram walk
+  // below. It is the FLATNESS half of the wave's sleep (§4.3) — see the block
+  // after the cutoffs for why stillness alone is not enough. -1 = "nothing
+  // measured", which never counts as flat.
+  var rvLo = -1;
+  var rvHi = -1;
 
   if (st == WB_ADOPTED && rvCount > 0 && T.waterRelevelMax > 0) {
     rvMean = rvSum / rvCount;         // floor; the mean surface, in eighths
@@ -908,6 +1060,10 @@ fn wbLedger(@builtin(global_invocation_id) gid : vec3<u32>) {
       let hb = atomicLoad(&waterBodyState[rvHistBase + i]);
       if (hb <= 0) { continue; }
       let sv = rvBase + i32(i);
+      // W2's flatness, free: this loop already visits every occupied bucket in
+      // ascending order, so the first and last of them ARE the spread.
+      if (rvLo < 0) { rvLo = sv; }
+      rvHi = sv;
       let d = sv - rvMean;
       if (d > 0) {
         supplyE = supplyE + min(clamp(d / rvGain, 1, rvMax), d) * hb;
@@ -1014,6 +1170,47 @@ fn wbLedger(@builtin(global_invocation_id) gid : vec3<u32>) {
   wbSet(b, WBS_RVBASE,
         8 * (level - clamp(TUNE_WATER_RELEVEL_DEPTH, 0,
                            WATER_RELEVEL_DEPTH_MAX)));
+
+  // ==========================================================================
+  // W2 — THE FLUX SLEEP (docs/PLAN_water_relevel.md §4.3).
+  //
+  // Same cadence as everything else here: `wbFlux` reports into WVMAX/WVSUM in
+  // the middle of LAST tick's row block and this pass consumes and clears them
+  // at the start of THIS one. Never read a tally in the pass that writes it.
+  //
+  // TWO CONDITIONS, AND BOTH ARE NECESSARY. `still` alone would sleep a ring at
+  // the instant it passes through its own mean — the surface is momentarily
+  // level and every pipe momentarily near zero, which is the middle of a swing
+  // and not the end of one. `flat` alone would sleep a lake whose columns are
+  // all within an eighth while a fast, shallow ring crosses it. A body that is
+  // both, for `sim.fluidSettleTicks` consecutive ticks, is done — and the same
+  // window the MPM settles a block over, for the same reason.
+  //
+  // WAKING IS THE FLATNESS GOING FALSE, and that is why the spread is measured
+  // here rather than inferred from the pipes: an asleep body records no pipes
+  // at all, so nothing derived from them could ever wake it. The histogram is
+  // filled by `wbSurface`, which sleeps with the relevel and not with the wave.
+  {
+    let wvMax = wbGet(b, WBS_WVMAX);
+    wbSet(b, WBS_WVMAX, 0);
+    // Cleared here and refilled by wbFlux later in the tick, so a gate reading
+    // between ticks sees THIS tick's total rather than a cumulative one.
+    wbSet(b, WBS_WVSUM, 0);
+    var calm = 0;
+    var asleep = 0;
+    if (T.waveMode > 0 && st == WB_ADOPTED) {
+      // STRICTLY UNDER, and the shipped epsilon is 256 — one whole eighth per
+      // tick in Q8. `moved = q >> 8`, so a pipe under 256 transfers ZERO whole
+      // eighths: the default is not a tolerance, it is literally "no pipe in
+      // this body moves anything".
+      let still = wvMax < max(TUNE_WAVE_SLEEP_EPS, 1);
+      let flat = rvLo >= 0 && (rvHi - rvLo) <= WAVE_FLAT_EIGHTHS;
+      if (still && flat) { calm = wbGet(b, WBS_WVCALM) + 1; }
+      asleep = select(0, 1, calm >= max(TUNE_FLUID_SETTLE_TICKS, 1));
+    }
+    wbSet(b, WBS_WVCALM, calm);
+    wbSet(b, WBS_WVASLEEP, asleep);
+  }
 
   // ---- the exit, and why it is not immediate -----------------------------
   // Release must be MASS-EXACT in both directions (plan §5). An outstanding
@@ -1356,6 +1553,219 @@ fn wbSurface(@builtin(workgroup_id) wg : vec3<u32>,
   let bi = u32(clamp(s - wbGet(b, WBS_RVBASE), 0,
                      i32(WATER_RELEVEL_BUCKETS) - 1));
   atomicAdd(&waterBodyState[wbHistBase(b) + bi], 1);
+
+  // ---- W2: THE SAME WALK, ONE MORE STORE (plan §4.3) --------------------
+  //
+  // The height this column just measured, into the flux store, stamped for
+  // NEXT tick. W2's flux pass then gathers five of these instead of walking
+  // five columns of voxels, which is what makes it a pure gather (§4.2's
+  // table) — and W1 writes it whether or not the wave is on, because it is
+  // the same walk and the alternative is a second measure that could disagree
+  // with this one.
+  //
+  // ONE WRITER, and it is this pass: only the thread that owns the column
+  // reaches these words, and it writes them after every voxel writer in the
+  // block has finished (wbSurface is the last measure). Stamping here is also
+  // what makes the pipes safe — see wvStamp for the window-shift argument.
+  let fb = wvBase(x, z);
+  // A column ENTERING the valid set starts with NO momentum, and this is the
+  // one line that makes the store safe across a window shift, a world reload,
+  // a `--sweep` arm and the determinism gate's second pass: all four of those
+  // put a record in this slot that was written by a world that is not this one,
+  // and a fresh-looking stale pipe would let session history decide a voxel
+  // write. In the steady state it is one compare and no store.
+  if (waterFlux[fb + WV_STAMP] != wvStampRead(x, z)) {
+    waterFlux[fb + WV_PX] = 0;
+    waterFlux[fb + WV_NX] = 0;
+    waterFlux[fb + WV_PZ] = 0;
+    waterFlux[fb + WV_NZ] = 0;
+  }
+  waterFlux[fb + WV_S] = s;
+  waterFlux[fb + WV_STAMP] = wvStampWrite(x, z);
+}
+
+// ============================================================================
+// W2 — THE ELIGIBILITY GATE (docs/PLAN_water_relevel.md §4.2).
+//
+// THE SAME PREDICATE IN THREE PLACES, WRITTEN ONCE, and that is not tidiness:
+// conservation across a pipe depends on the giver and the receiver agreeing
+// about whether the pipe exists. `wbFlux` asks it of itself and of each
+// neighbour before it opens a pipe; `wbRelevel` asks it of each neighbour
+// before it accepts one. If those three answers could differ, a column would
+// subtract an outflow nobody collected (water lost) or collect an inflow nobody
+// gave (water invented).
+//
+// It is asked of the STORED height and not of a fresh voxel walk, because that
+// is the height the pipe was computed from — §4.3's "the flux pass is a pure
+// gather". `sy` comes out of `s` by arithmetic (s = 8y + fullness, fullness in
+// 1..8, so y = (s-1) >> 3), which is what lets the MPM and shave-band tests be
+// asked without re-reading a voxel.
+fn wvEligible(x : i32, z : i32, level : i32, shaveBusy : bool) -> i32 {
+  let s = wvHeight(x, z);
+  if (s == WB_RV_NOTAKE) { return WB_RV_NOTAKE; }
+  let sy = (s - 1) >> 3u;
+  // The shave owns [level-1, level] on any tick it has an instruction. Same
+  // exclusion the relevel apply takes, asked here so the pipe is never opened
+  // rather than opened and then refused.
+  if (shaveBusy && sy >= level - 1 && sy <= level) { return WB_RV_NOTAKE; }
+  let sc = worldChunkOf(vec3<i32>(x, sy, z));
+  if (!chunkInWindow(sc, T.origin)) { return WB_RV_NOTAKE; }
+  if (fluidBlockMapS[chunkSlotIndex(sc)] != 0u) { return WB_RV_NOTAKE; }
+  return s;
+}
+// The same question about a NEIGHBOUR, which needs the ownership test as well:
+// a column in ANOTHER body is a wall, not a partner. Without this a pipe could
+// move water between two bodies and each ledger would account only its own end,
+// which is a drift in both credits for water that never left the world.
+fn wvNeighbour(x : i32, z : i32, owner : u32, comp : u32, g : vec4<i32>,
+               rad : i32, level : i32, shaveBusy : bool) -> i32 {
+  if (!wbOwns(owner, comp, x, z, g, rad)) { return WB_RV_NOTAKE; }
+  return wvEligible(x, z, level, shaveBusy);
+}
+
+// ============================================================================
+// W2 — THE PIPES (`wbFlux`, plan §4.2). One workgroup per listed chunk, one
+// thread per column, and a thread writes ONLY its own column's four outflow
+// words. No atomics except the two sleep reports, no CAS, no scheduling
+// dependence, reach 1 in XZ.
+//
+// BETWEEN THE SHAVE AND THE APPLY. It reads the heights `wbSurface` stored at
+// the END of last tick's block and turns the head differences into THIS tick's
+// pipes; `wbRelevel`, later in this same tick, gathers them and is the one pass
+// that writes the column (§4.3 — one column, one write, one tick).
+//
+// THE PHYSICS, all integer:
+//
+//     q += G * depth * (s_i - s_j)      Q8 eighths/tick
+//     q  = max(q, 0)                    an opposing head drains the pipe first,
+//                                       so momentum reverses THROUGH zero
+//     q  = (q * KEEP) >> 8              damping
+//     moved = q >> 8                    whole eighths; the remainder stays in q
+//
+// and then the outflow clamp: if the four together ask for more than the column
+// may give, scale all four. All four are ITS OWN words, so the clamp has one
+// writer — which is the whole reason §4.1 rejected shared signed faces.
+// ============================================================================
+@compute @workgroup_size(16, 1, 16)
+fn wbFlux(@builtin(workgroup_id) wg : vec3<u32>,
+          @builtin(local_invocation_id) li : vec3<u32>) {
+  if (wg.x >= T.waterChunkCount) { return; }
+  let e = wbChunkEntry(wg.x);
+  let b = e >> 16u;
+  let slot = e & 0xFFFFu;
+  if (b >= T.waterBodyCount) { return; }
+  // THREE LOADS AND OUT is the resting cost, and these are them. `waveMode` is
+  // the CPU's arm (zeroed on any tick the footprint is not declared, and 0 at
+  // sim.waveMode 0 — at which point this row is not even recorded);
+  // `waterRelevelMax` is the relevel's arm, which the wave rides because the
+  // apply it folds into is the relevel's; WBS_WVASLEEP is the per-body sleep.
+  if (T.waveMode <= 0) { return; }
+  if (T.waterRelevelMax <= 0) { return; }
+  let st = wbGet(b, WBS_STATE);
+  if (st != WB_ADOPTED) { return; }
+  if (wbGet(b, WBS_WVASLEEP) != 0) { return; }
+  let level = wbGet(b, WBS_LEVEL);
+  let wc = wbSlotWorldChunk(slot);
+  if (!wbColumnLayer(wc.y, level)) { return; }
+
+  let g = wbGeom(b);
+  let seed = wbSeed(b);
+  let rad = i32(wbIsqrt(u32(max(g.z, 0))));
+  let owner = wbMapOwner(b, seed.w);
+  let comp = wbComp(seed.w);
+  let shaveBusy = wbGet(b, WBS_STEPS) != 0 || wbGet(b, WBS_FRAC) != 0;
+  let x = wc.x * i32(CHUNK) + i32(li.x);
+  let z = wc.z * i32(CHUNK) + i32(li.z);
+  // NOT OURS: never touched, because another body may own this column and two
+  // writers per word is the one thing this layout exists to avoid.
+  if (!wbOwns(owner, comp, x, z, g, rad)) { return; }
+
+  let fb = wvBase(x, z);
+  let s = wvEligible(x, z, level, shaveBusy);
+  if (s == WB_RV_NOTAKE) {
+    // OURS, but not eligible this tick (no measured surface, the shave's band,
+    // or the solver holds the chunk). Its momentum is VOID rather than merely
+    // unused: leaving it would hand an arbitrarily old flux back as this
+    // column's velocity the next time it becomes eligible.
+    waterFlux[fb + WV_PX] = 0;
+    waterFlux[fb + WV_NX] = 0;
+    waterFlux[fb + WV_PZ] = 0;
+    waterFlux[fb + WV_NZ] = 0;
+    return;
+  }
+
+  // DEPTH, CAPPED, and no voxel read for it: `s - 8*floorY` is how much water
+  // stands over the basin floor in this column, and the cap is what keeps the
+  // wave speed sqrt(g*depth) at or under one cell per tick (§4.2's CFL note).
+  let floorS = 8 * seed.x;
+  let depth = clamp((s - floorS) / 8, 1, max(TUNE_WAVE_DEPTH_CAP, 1));
+
+  var ns : array<i32, 4>;
+  ns[WV_PX] = wvNeighbour(x + 1, z, owner, comp, g, rad, level, shaveBusy);
+  ns[WV_NX] = wvNeighbour(x - 1, z, owner, comp, g, rad, level, shaveBusy);
+  ns[WV_PZ] = wvNeighbour(x, z + 1, owner, comp, g, rad, level, shaveBusy);
+  ns[WV_NZ] = wvNeighbour(x, z - 1, owner, comp, g, rad, level, shaveBusy);
+
+  var q : array<i32, 4>;
+  var total = 0;
+  for (var d = 0u; d < 4u; d++) {
+    if (ns[d] == WB_RV_NOTAKE) {
+      // A WALL. No head, no flow, and the stored flux goes with it — a pipe
+      // that cannot deliver must not be subtracted from this column either.
+      q[d] = 0;
+      continue;
+    }
+    // THE DEAD-BAND (see WAVE_HEAD_EPS). A head inside it is the CA's own
+    // permanent one-eighth residue, not a slope, and driving on it pins every
+    // pipe at the clamp forever.
+    let dh = s - ns[d];
+    var drive = 0;
+    if (dh > WAVE_HEAD_EPS) {
+      drive = dh - WAVE_HEAD_EPS;
+    } else if (dh < -WAVE_HEAD_EPS) {
+      // Negative drains this pipe toward zero, which is how an opposing head
+      // reverses the flow: through zero and out of the NEIGHBOUR's pipe.
+      drive = dh + WAVE_HEAD_EPS;
+    }
+    var v = max(waterFlux[fb + d], 0) + WAVE_G_Q8 * depth * drive;
+    // NEGATIVE FLUX IS THE NEIGHBOUR'S PIPE, not this one going backwards. An
+    // opposing head drains this pipe to zero first and then pushes the reverse
+    // pipe, which is how momentum reverses through zero without either word
+    // ever carrying a sign.
+    v = max(v, 0);
+    q[d] = (v * WAVE_KEEP_Q8) >> 8u;
+    total = total + (q[d] >> 8u);
+  }
+
+  // THE OUTFLOW CLAMP. What this column may give is the least of the relevel's
+  // own per-tick rate, the water standing over the basin floor, and what the
+  // TOP CELL holds — `fullness = ((s - 1) & 7) + 1`, again without a voxel
+  // read. Scaling rather than truncating keeps the DIRECTION of the flow when
+  // a column is drained from two sides at once.
+  let topFull = ((s - 1) & 7) + 1;
+  let rate = clamp(T.waterRelevelMax, 1, WB_MAX_STEPS);
+  let avail = max(min(min(rate, topFull), s - floorS), 0);
+  if (total > avail) {
+    let den = max(total, 1);
+    for (var d = 0u; d < 4u; d++) { q[d] = (q[d] * avail) / den; }
+  }
+
+  var qmax = 0;
+  var qsum = 0;
+  for (var d = 0u; d < 4u; d++) {
+    waterFlux[fb + d] = q[d];
+    qmax = max(qmax, q[d]);
+    qsum = qsum + q[d];
+  }
+  // THE SLEEP REPORT (§4.3), and it is skipped entirely on a still column so a
+  // flat lake costs no atomic traffic at all. Two atomics per column, not eight:
+  // one max over the column's four pipes and one add of their sum. Both are
+  // order-free. Sigma over 20k columns at the clamp's ceiling is ~160 M, three
+  // orders inside i32.
+  if (qsum > 0) {
+    atomicMax(&waterBodyState[wbBase(b) + WBS_WVMAX], qmax);
+    atomicAdd(&waterBodyState[wbBase(b) + WBS_WVSUM], qsum);
+  }
 }
 
 // ============================================================================
@@ -1370,6 +1780,22 @@ fn wbSurface(@builtin(workgroup_id) wg : vec3<u32>,
 // column whose surface sits in that band is SKIPPED while
 // `WBS_STEPS | WBS_FRAC` is nonzero, and on every other tick the shave is not
 // running at all and the whole surface is this pass's.
+//
+// W2 FOLDS ITS APPLY IN HERE (plan §4.3) RATHER THAN ADDING A SECOND PASS, and
+// that is a correctness decision, not a saving. A column's net change this tick
+// is the relevel's give/take PLUS the pipe inflow MINUS the pipe outflow, and
+// all three land on the same top cell. Two passes would be two writers of one
+// word one tick apart, each having read a fullness the other was about to
+// change — the exact read-your-own-write shape the row order in
+// `pass_table.def` exists to prevent. One pass, one column, one write, one
+// tick.
+//
+// THE TWO CONTRIBUTIONS ARE COMPUTED FROM DIFFERENT HEIGHTS ON PURPOSE. The
+// relevel re-derives `s` from the voxels NOW, because its cutoffs are a tick
+// stale and acting on a stale height would move water that is not there. The
+// wave uses the STORED height, because that is the height its pipes were
+// computed from and both ends of a pipe must agree about it. The drift between
+// them is absorbed by the credit, which is what the credit has always been for.
 // ============================================================================
 @compute @workgroup_size(16, 1, 16)
 fn wbRelevel(@builtin(workgroup_id) wg : vec3<u32>,
@@ -1385,22 +1811,30 @@ fn wbRelevel(@builtin(workgroup_id) wg : vec3<u32>,
   if (st != WB_ADOPTED) { return; }
   let takeCut = wbGet(b, WBS_RVTAKECUT);
   let giveCut = wbGet(b, WBS_RVGIVECUT);
+  // W2: whether the wave half has anything to deliver. The SAME three loads
+  // wbFlux gated on, so the two passes agree about whether pipes exist at all.
+  let waveOn = T.waveMode > 0 && wbGet(b, WBS_WVASLEEP) == 0;
   // The ledger published nothing: the surface is inside {m, m+1} and there is
-  // no credit outstanding. Five loads and out — this is the resting cost of
-  // the whole feature on a flat lake inside its hot window.
-  if (takeCut == WB_RV_NOTAKE && giveCut == WB_RV_NOGIVE) { return; }
+  // no credit outstanding. Six loads and out — this is the resting cost of
+  // the whole feature on a flat lake inside its hot window. `waveOn` joins the
+  // test rather than replacing it: a body can be flat to the relevel's cutoffs
+  // and still be carrying a ring.
+  if (takeCut == WB_RV_NOTAKE && giveCut == WB_RV_NOGIVE && !waveOn) { return; }
   let level = wbGet(b, WBS_LEVEL);
   let wc = wbSlotWorldChunk(slot);
   if (!wbColumnLayer(wc.y, level)) { return; }
 
   let g = wbGeom(b);
   let seed = wbSeed(b);
+  // Hoisted rather than inlined into the wbOwns call: W2 asks the same question
+  // of four NEIGHBOURS below, and recomputing the isqrt of the disc radius five
+  // times per column would be five Newton loops for one number.
+  let rad = i32(wbIsqrt(u32(max(g.z, 0))));
+  let owner = wbMapOwner(b, seed.w);
+  let comp = wbComp(seed.w);
   let x = wc.x * i32(CHUNK) + i32(li.x);
   let z = wc.z * i32(CHUNK) + i32(li.z);
-  if (!wbOwns(wbMapOwner(b, seed.w), wbComp(seed.w), x, z, g,
-              i32(wbIsqrt(u32(max(g.z, 0)))))) {
-    return;
-  }
+  if (!wbOwns(owner, comp, x, z, g, rad)) { return; }
 
   // RE-DERIVED THIS TICK, not read from the histogram. The cutoffs are a tick
   // stale and the CA may have moved this very cell under them; acting on the
@@ -1417,7 +1851,8 @@ fn wbRelevel(@builtin(workgroup_id) wg : vec3<u32>,
   // The shave's band, while the shave has something to do.
   let steps = wbGet(b, WBS_STEPS);
   let frac = wbGet(b, WBS_FRAC);
-  if ((steps != 0 || frac != 0) && sy >= level - 1 && sy <= level) { return; }
+  let shaveBusy = steps != 0 || frac != 0;
+  if (shaveBusy && sy >= level - 1 && sy <= level) { return; }
   // A CHUNK THE SOLVER HOLDS IS THE SOLVER'S, and the question is asked of the
   // chunk the SURFACE CELL is in rather than of the dispatching one — see the
   // same note in wbSurface for what the coarser test measured.
@@ -1463,12 +1898,63 @@ fn wbRelevel(@builtin(workgroup_id) wg : vec3<u32>,
     }
   }
 
-  let c = vec3<i32>(x, sy, z);
+  // ---- W1's contribution, as a SIGNED delta in eighths ------------------
+  // Negative takes eighths OFF the top cell, positive puts them ON. Expressed
+  // this way so the wave below is an addition and ONE apply carries the sum;
+  // with the wave off it is arithmetically the old two-branch form, which is
+  // what makes `sim.waveMode = 0` bit-identical to W1.
+  var want = 0;
   if (give) {
-    // NEVER PAST THE MEAN, and never more than the top cell holds.
+    // NEVER PAST THE MEAN.
     let d = s - mean;
-    let want = min(clamp(d / gain, 1, rate), d);
-    let n = min(want, sfull);
+    want = -min(clamp(d / gain, 1, rate), d);
+  } else if (take) {
+    let d = mean - s;
+    want = min(clamp(d / gain, 1, rate), d);
+  }
+
+  // ---- W2's contribution: inflow gathered, outflow subtracted (§4.3) -----
+  //
+  // EXACT BETWEEN TWO COLUMNS BY CONSTRUCTION. Every transfer lives in ONE
+  // word — the giver's post-clamp pipe — and both ends read that word through
+  // the same eligibility gate, so what this column subtracts is precisely what
+  // its neighbour adds. There is no second copy of the number to disagree with
+  // the first, which is why the pipes are owned outflows and not shared signed
+  // faces (§4.1).
+  //
+  // `wvEligible` on THIS column is the gate wbFlux used to decide whether to
+  // write these four words at all. Failing it means wbFlux zeroed them, so the
+  // branch is skipped rather than adding zero the long way.
+  if (waveOn && wvEligible(x, z, level, shaveBusy) != WB_RV_NOTAKE) {
+    let fb = wvBase(x, z);
+    var net = 0;
+    for (var d = 0u; d < 4u; d++) {
+      net = net - (max(waterFlux[fb + d], 0) >> 8u);
+    }
+    if (wvNeighbour(x + 1, z, owner, comp, g, rad, level, shaveBusy) !=
+        WB_RV_NOTAKE) {
+      net = net + (max(waterFlux[wvBase(x + 1, z) + WV_NX], 0) >> 8u);
+    }
+    if (wvNeighbour(x - 1, z, owner, comp, g, rad, level, shaveBusy) !=
+        WB_RV_NOTAKE) {
+      net = net + (max(waterFlux[wvBase(x - 1, z) + WV_PX], 0) >> 8u);
+    }
+    if (wvNeighbour(x, z + 1, owner, comp, g, rad, level, shaveBusy) !=
+        WB_RV_NOTAKE) {
+      net = net + (max(waterFlux[wvBase(x, z + 1) + WV_NZ], 0) >> 8u);
+    }
+    if (wvNeighbour(x, z - 1, owner, comp, g, rad, level, shaveBusy) !=
+        WB_RV_NOTAKE) {
+      net = net + (max(waterFlux[wvBase(x, z - 1) + WV_PZ], 0) >> 8u);
+    }
+    want = want + net;
+  }
+
+  let c = vec3<i32>(x, sy, z);
+  if (want < 0) {
+    // ...and never more than the top cell holds.
+    let ask = -want;
+    let n = min(ask, sfull);
     if (n > 0) {
       let left = sfull - n;
       // An emptied cell is AIR, written as a clean zero word — the stain and
@@ -1479,24 +1965,22 @@ fn wbRelevel(@builtin(workgroup_id) wg : vec3<u32>,
       atomicAdd(&waterBodyState[wbBase(b) + WBS_RVGIVEN], n);
       wbMarkDirty(c);
     }
-    if (want > n) {
-      atomicAdd(&waterBodyState[wbBase(b) + WBS_RVCAPPED], want - n);
+    if (ask > n) {
+      atomicAdd(&waterBodyState[wbBase(b) + WBS_RVCAPPED], ask - n);
     }
-  } else if (take) {
-    let d = mean - s;
-    var want = min(clamp(d / gain, 1, rate), d);
+  } else if (want > 0) {
     // NEVER ABOVE THE BODY'S OWN LEVEL. `level + 1` may be outside the water
     // AABB the chunk list was built from, so this is the other half of
     // wbBandFloor's page-table argument: with this clamp the overflow cell is
     // provably at `sy + 1 <= level`, i.e. inside the declared footprint.
-    want = max(min(want, 8 * level + 8 - s), 0);
+    let put = max(min(want, 8 * level + 8 - s), 0);
     let room = 8 - sfull;
     var got = 0;
-    if (want <= room) {
-      if (want > 0) {
+    if (put <= room) {
+      if (put > 0) {
         voxStore(voxWordIndex(c),
-                 (sw & 0xFFFF0FFFu) | (u32(sfull + want - 1) << 12u));
-        got = want;
+                 (sw & 0xFFFF0FFFu) | (u32(sfull + put - 1) << 12u));
+        got = put;
         wbMarkDirty(c);
       }
     } else {
@@ -1508,8 +1992,8 @@ fn wbRelevel(@builtin(workgroup_id) wg : vec3<u32>,
         // The new cell: the body's material, a CLEAN stain, STAMP_NEVER (0),
         // and the state nibble r-1. Nothing else in the word.
         voxStore(voxWordIndex(up),
-                 u32(g.w) | (u32(want - room - 1) << 12u));
-        got = want;
+                 u32(g.w) | (u32(put - room - 1) << 12u));
+        got = put;
         wbMarkDirty(c);
         wbMarkDirty(up);
       } else if (room > 0) {
@@ -1523,8 +2007,8 @@ fn wbRelevel(@builtin(workgroup_id) wg : vec3<u32>,
     if (got > 0) {
       atomicAdd(&waterBodyState[wbBase(b) + WBS_RVTAKEN], got);
     }
-    if (want > got) {
-      atomicAdd(&waterBodyState[wbBase(b) + WBS_RVCAPPED], want - got);
+    if (put > got) {
+      atomicAdd(&waterBodyState[wbBase(b) + WBS_RVCAPPED], put - got);
     }
   }
 }

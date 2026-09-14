@@ -746,6 +746,29 @@ TP_I(sim, waterRelevelMax, TUNE_WATER_RELEVEL_MAX, 4)
 TP_I(sim, waterRelevelGain, TUNE_WATER_RELEVEL_GAIN, 8)
 TP_I(sim, waterRelevelDepth, TUNE_WATER_RELEVEL_DEPTH, 32)
 
+// ---- SURFACE MOMENTUM (docs/PLAN_water_relevel.md W2) ----
+// The relevel relaxes and never overshoots. This is the overshoot: four
+// non-negative outflow pipes per column (Mei/O'Brien), so the columns beside a
+// crater accelerate into it, arrive with momentum and ring.
+// waveMode is the off switch: at 0 the `waterFlux` pass row is not recorded at
+// all and the apply's wave term is not evaluated, so the world is bit-identical
+// to a build without W2 -- which is what `--sweep sim.waveMode=0,1` states.
+// waveGravity is the sanctioned human-unit lane (VOXELS/s^2, like
+// drainGravity): const-eval'd to Q8 cells/tick^2 at the top of
+// sim_waterbody.wgsl under IEEE-exact folding, so the kernel stays integer.
+// 98 vox/s^2 is real gravity at kVoxelsPerMetre = 10; with waveDepthCap 10 the
+// wave speed sqrt(g*d) is ~1.04 cells/tick, i.e. the CFL limit, which is why
+// the depth term is capped rather than taken from a deep lake.
+// waveDamping is per SECOND and sets how long the ring lasts; waveSleepEps is
+// the Q8 pipe magnitude a body must be strictly under to count as still, and
+// 256 is not a tolerance -- a pipe moves `q >> 8` whole eighths, so under 256
+// it moves nothing. A body sleeps after sim.fluidSettleTicks such ticks.
+TP_I(sim, waveMode, TUNE_WAVE_MODE, 0)
+TP_F(sim, waveGravity, TUNE_WAVE_GRAVITY, 98.0f)
+TP_I(sim, waveDepthCap, TUNE_WAVE_DEPTH_CAP, 10)
+TP_F(sim, waveDamping, TUNE_WAVE_DAMPING, 0.8f)
+TP_I(sim, waveSleepEps, TUNE_WAVE_SLEEP_EPS, 256)
+
 // ---- DISCOVERY (docs/PLAN_water_relevel.md W-D) ----
 // A body the PLAYER created gets adopted; puddles stay CA at no cost. Both are
 // integer (rule 1). Neither is read by a kernel as a TUNE_ const:

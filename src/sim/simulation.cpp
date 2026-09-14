@@ -279,6 +279,15 @@ bool Simulation::Init(const rhi::Device& device, World& world,
         // 0..34 layout, and it is NOT mirrored in simSlimBGL_ -- no slim-group
         // pipeline names it.
         entry(35, T::Storage),         // reposeSnap (bits + per-slot stamps)
+        // The surface-momentum store (docs/PLAN_water_relevel.md §4.1,
+        // world.h kWaterFluxWords). Storage and not ReadOnlyStorage:
+        // `wbFlux` writes the pipes, `wbSurface` writes the height and
+        // the stamp, and `wbRelevel` reads both -- three entry points of
+        // one module, which WGSL cannot give two access modes for one
+        // binding. 36 is the first free slot in this dense 0..35 layout,
+        // and it is NOT mirrored in simSlimBGL_: only sim_waterbody.wgsl
+        // names it, and no slim-group pipeline does.
+        entry(36, T::Storage),         // waterFlux (4 pipes + s + stamp)
     };
     simBGL_ = device.CreateBindGroupLayout(entries, std::size(entries));
 
@@ -910,6 +919,7 @@ void Simulation::BuildSimBindGroups(const rhi::Device& device) {
         b(33, world_->gasSpawn),
         b(34, world_->gasOuter),
         b(35, world_->reposeSnap),
+        b(36, world_->waterFlux),
     };
     simBG_[page] = device.CreateBindGroup(simBGL_, entries, std::size(entries), "simBG");
 
@@ -1518,6 +1528,7 @@ bool Simulation::BuildPipelines(const rhi::Device& device, std::string* err) {
   // W1: the relevel apply and the free-surface measure (PLAN_water_relevel.md).
   pool.Add([&] { waterRelevel_ = MakeComputePipeline(device, simPL_, mWaterBody, "wbRelevel", "waterRelevel"); });
   pool.Add([&] { waterSurface_ = MakeComputePipeline(device, simPL_, mWaterBody, "wbSurface", "waterSurface"); });
+  pool.Add([&] { waterFlux_ = MakeComputePipeline(device, simPL_, mWaterBody, "wbFlux", "waterFlux"); });
   // M5: the scheduled container sweep (components 2 case 2 + 10).
   pool.Add([&] { waterSweep_ = MakeComputePipeline(device, simPL_, mWaterBody, "wbSweep", "waterSweep"); });
   pool.Add([&] { waterSplit_ = MakeComputePipeline(device, simPL_, mWaterBody, "wbSplit", "waterSplit"); });
@@ -1589,7 +1600,7 @@ bool Simulation::BuildPipelines(const rhi::Device& device, std::string* err) {
       !fluidCellClear_ || !waterDrain_ || !waterHole_ ||
       !waterQuiet_ || !waterLedger_ || !waterReduce_ ||
       !waterShave_ || !waterSweep_ || !waterSplit_ ||
-      !waterRelevel_ || !waterSurface_) {
+      !waterRelevel_ || !waterSurface_ || !waterFlux_) {
     if (err) *err = "compute pipeline creation failed (see stderr for the shader)";
     return false;
   }
@@ -1780,6 +1791,10 @@ struct RecordCtx {
   // for "none" — which is every tick of a basin nobody has dug into, and is
   // what leaves both sweep rows unrecorded (C_WATERSWEEP).
   uint32_t waterSweepSlot = kWaterBodyCap;
+  // W2: sim.waveMode ANDed with "a body is listed this tick"
+  // (docs/PLAN_water_relevel.md §4.2). Zero leaves the surface-momentum row
+  // unrecorded (C_WATERWAVE), which is the exact-identity arm.
+  uint32_t waveMode = 0;
   // Chunks the openness refresh walks this tick (docs/PLAN_gi.md §2). Derived
   // from render.opennessChunksPerFrame and gated on render.opennessStrength, so
   // a zero here is C_OPENNESS false and NOTHING recorded -- which is what makes
@@ -1887,6 +1902,7 @@ const rhi::Buffer& Simulation::PassBuffer(pass::Buf b) const {
     case B::Glow:                return world_->glow;
     case B::GenAct:              return world_->genAct;
     case B::WaterBodyState:      return world_->waterBodyState;
+    case B::WaterFlux:           return world_->waterFlux;
     case B::TreeAtlas:           return treeAtlasBuf_;
     case B::WorldMap:            return worldMapBuf_;
     case B::GasParticlesRead:    return world_->gasParticles[page_];
@@ -1970,6 +1986,7 @@ const rhi::ComputePipeline& Simulation::PassPipeline(pass::Pipe p) const {
     case P::WaterSplit:     return waterSplit_;
     case P::WaterRelevel:   return waterRelevel_;
     case P::WaterSurface:   return waterSurface_;
+    case P::WaterFluxPipe:  return waterFlux_;
     case P::FluidSettleCommit:   return fluidSettleCommit_;
     case P::FluidSettleKill:     return fluidSettleKill_;
     case P::FluidConsumeApply:   return fluidConsumeApply_;
@@ -2013,6 +2030,7 @@ void Simulation::RecordTable(const rhi::CommandEncoder& enc, pass::Table which,
   tc.waterChunkCount = cx.waterChunkCount;
   tc.waterDrainBodies = cx.waterDrainBodies;
   tc.waterSweepSlot = cx.waterSweepSlot;
+  tc.waveMode = cx.waveMode;
   tc.opennessChunks = cx.opennessChunks;
   tc.glowChunks = cx.glowChunks;
   tc.hashEnable = cx.hashEnable;
@@ -2345,6 +2363,15 @@ void Simulation::EncodeTick(const rhi::CommandEncoder& enc, uint32_t opsCount,
   // M5: the scheduled re-derive. C_WATERSWEEP, and kWaterBodyCap ("none")
   // on every tick of a basin nobody has dug into.
   cx.waterSweepSlot = waterSweepSlot;
+  // W2: the surface-momentum row's condition (docs/PLAN_water_relevel.md §4.2).
+  // Read from tuning HERE rather than passed in, for opennessChunks' reason: it
+  // is a KNOB and not a count of this tick's work, so every caller of
+  // EncodeTick would otherwise have to forward a value none of them owns. It is
+  // ANDed with "a body is listed", because a wave row with no water in it is a
+  // dispatch over nothing.
+  cx.waveMode = (waterChunkCount > 0 && CurrentTuning().sim.waveMode > 0)
+                    ? (uint32_t)CurrentTuning().sim.waveMode
+                    : 0u;
   cx.hashEnable = hashEnable;
   cx.particlesActive = particlesActive;
   cx.vizActive = vizActive;

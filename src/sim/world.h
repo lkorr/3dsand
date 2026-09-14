@@ -1819,7 +1819,17 @@ constexpr uint32_t kWaterChunkCap = 1024;
 // measurement of anything. A gate that read the seed would be the circular
 // probe assertion — the candidate's own guess deciding whether the candidate is
 // real.
-constexpr uint32_t kWaterBodyStateWords = 42;
+//
+// W2 widened it to 46 for the SLEEP of the surface-momentum layer
+// (docs/PLAN_water_relevel.md §4.3, WBS_WV* in common.wgsl). Four words, and
+// they are `WV` rather than `W` for the reason the relevel block is `RV`: every
+// short prefix in this map is already taken, and two accumulators sharing a
+// word is one pass zeroing the other's tally on the tick it mattered.
+//
+// The pipes themselves are NOT here. They are per COLUMN, not per body, and
+// kWorldN^2 columns will not fit in a 64-entry ledger — see kWaterFluxWords
+// below for the buffer they live in and why it is a binding of its own.
+constexpr uint32_t kWaterBodyStateWords = 46;
 // DRAIN OP SLOTS PER BODY (component 6). The discharge is emitted through the
 // existing spawnAppend seam, which reads a CPU-sized op stream — so the CPU
 // RESERVES a contiguous block per body it proposes and the GPU fills it. This
@@ -1916,6 +1926,57 @@ constexpr uint32_t kWaterRelevelHistBase =
     kWaterSweepScratchBase + kWaterSweepScratchWords;
 constexpr uint32_t kWaterBodyStateTotalWords =
     kWaterRelevelHistBase + kWaterBodyCap * kWaterRelevelBuckets;
+
+// ---- W2: THE SURFACE-MOMENTUM STORE (docs/PLAN_water_relevel.md §4.1) ------
+//
+// A dense XZ grid over the residency window, one record per COLUMN, indexed
+// `(z & WORLD_MASK) * kWorldN + (x & WORLD_MASK)` exactly like every other
+// window-relative buffer. It gets its own binding because it is per column and
+// there are 262,144 of them: `waterBodyState` is a 64-entry ledger and the
+// relevel histogram already sits past the end of it.
+//
+// FOUR NON-NEGATIVE OUTFLOW PIPES PER COLUMN, all owned by that column — the
+// Mei/O'Brien virtual-pipes layout, and the reason it is outflows rather than
+// two signed shared faces is a WRITE HAZARD and not taste. The outflow clamp
+// has to scale a column's own outflows against what that column may give; with
+// shared faces half of a column's outflows run through a face the NEIGHBOUR
+// owns, so "write the scaled flux back" means two writers per word, which is
+// exactly the mark/apply hazard this subsystem avoids everywhere else. With
+// owned outflows every transfer amount lives in ONE word, written by its owner
+// and gathered by its receiver, so conservation between two columns is exact
+// by construction.
+//
+// THE FIFTH AND SIXTH WORDS ARE WHAT MAKE IT SAFE TO READ:
+//   [4] `s` — the column's free-surface height in EIGHTHS, written by
+//       `wbSurface` at the END of a tick. W2's flux pass gathers five of these
+//       instead of re-walking five columns of voxels (§4.3).
+//   [5] the STAMP. `((tick + 1) << 4) | pageX << 2 | pageZ`, where pageX/pageZ
+//       are the low two bits of the column's WINDOW PAGE (`x / kWorldN`). It is
+//       the whole answer to "what happens on a window shift": the residency
+//       window is toroidal, so a slot is silently reused by a column kWorldN
+//       voxels away, and momentum from the old occupant would otherwise read as
+//       the new one's. The tick half alone would ALMOST do it — but a shift
+//       moves the origin by one CHUNK, so the departed column's stamp can be
+//       exactly one tick old on the tick its slot is re-read, and the page bits
+//       are what separate two columns exactly kWorldN apart. Same idea as
+//       `opennessStamp` (a hash of the world chunk coord) and `reposeSnap` (a
+//       per-slot tick), in one word because one pass writes all six together.
+//
+// THE CONTRACT THE STAMP BUYS, and both passes depend on it: a record whose
+// stamp is not exactly this tick's reads as ZERO, and `wbFlux` writes all four
+// pipes of every column whose stamp IS this tick's. So "fresh stamp" means
+// "wbFlux wrote these four pipes this tick", and a neighbour's pipe is either
+// a real transfer both ends agree on or is not there at all.
+//
+// DERIVED DATA in guideline #3's sense: not hashed, not saved, dropped on a
+// window shift (§6) — the same call the MPM makes for its particles. It IS
+// state that decides voxel writes, so it is integer, tick-ordered, gather-only
+// and one-writer-per-word, and the twice-run comparison covers it by
+// construction.
+constexpr uint32_t kWaterFluxWords = 6;
+constexpr uint32_t kWaterFluxColumns = (uint32_t)kWorldN * (uint32_t)kWorldN;
+constexpr uint64_t kWaterFluxBytes =
+    (uint64_t)kWaterFluxColumns * kWaterFluxWords * 4;   // 6 MiB at 512^2
 // THE SCHEDULE PERIOD (plan §3.4). A basin re-derives on ticks where
 // `slot % kWaterSweepPeriod == tick % kWaterSweepPeriod`, and one LEVEL of its
 // column AABB per scheduled tick. So a full re-derive of a 26-deep bowl costs
@@ -2333,7 +2394,26 @@ struct TickParams {
   // identity §8.6 promises — a small authored pool would start being refused by
   // a knob that is supposed to be about discovery.
   int32_t waterAdoptMinArea = 0;
-  uint32_t padWb4 = 0;
+  // ---- W2: THE SURFACE-MOMENTUM ARM (PLAN_water_relevel.md §4.2) ---------
+  //
+  // `sim.waveMode` — 0 OFF, 1 the virtual-pipe layer — and, like
+  // `waterRelevelMax` above, ZEROED BY THE CPU on any tick
+  // `WaterBodyGpu::writesThisTick` is false. The wave apply is folded into
+  // `wbRelevel`, i.e. into the same voxel writer, so it inherits the same rule:
+  // it may only run on a tick whose chunks were declared to the page table.
+  //
+  // It is an ARM and not a rate, so it rides `waterRelevelMax`'s arm rather
+  // than replacing it: at `sim.waterRelevelMax = 0` nothing in this block
+  // writes a voxel at all and the wave has no apply to fold into. The wave's
+  // own knobs (gravity, depth cap, damping, sleep epsilon) stay TUNE_* consts
+  // const-eval'd in the kernel — they shape the rule, not whether it may write.
+  //
+  // At `sim.waveMode` 0 the `waterFlux` pass row is not recorded, no pipe is
+  // written and the wave term in the apply is not evaluated, so the pinned
+  // world hash cannot see W2. It was the padWb4 pad word, so the struct
+  // layout — which check_invariants.py compares against common.wgsl on TOTAL
+  // SIZE — is unchanged.
+  int32_t waveMode = 0;
   // kWaterBodyCap bodies x kWaterBodyWords i32 words, declared WGSL-side as
   // array<vec4<i32>, 128> — the same bytes, since std140 strides a uniform
   // array to 16 B. sim_waterbody.wgsl's wbGeom/wbSeed are the only decoders.
@@ -3530,6 +3610,13 @@ class World {
   // voxels by the adoption reduce. CopySrc for `--gate waterbody`'s conservation
   // audit; CopyDst so a reset can zero it.
   rhi::Buffer waterBodyState;
+  // ---- W2: the surface-momentum store (kWaterFluxWords above) ----
+  // kWaterFluxColumns * kWaterFluxWords u32 (6 MiB at 512^2). Its own binding
+  // because it is per COLUMN and the ledger is per BODY. Derived data like the
+  // page table: not hashed, not saved, and safe across a window shift through
+  // the per-column stamp rather than through an invalidation pass. CopySrc for
+  // `--gate waterbody` pass S; CopyDst so a load/reset can zero it.
+  rhi::Buffer waterFlux;
 
   // ---- particles + explosions (M5, DESIGN.md §5/§7) ----
   rhi::Buffer particles[2];    // kParticleCap Particle (32 B), double-buffered

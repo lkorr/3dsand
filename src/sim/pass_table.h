@@ -129,6 +129,13 @@ enum class Buf : uint8_t {
   // the four sim_waterbody.wgsl entry points and read by nothing else on the
   // tick path, which is what lets it be one buffer with one barrier class.
   WaterBodyState,
+  // The surface-momentum store (docs/PLAN_water_relevel.md §4.1, world.h
+  // kWaterFluxWords). Per COLUMN rather than per body, which is why it is a
+  // resource of its own and not more words on WaterBodyState. Written by
+  // `waterFlux` and `waterSurface`, read by `waterRelevel` — three rows in one
+  // command buffer, so the compute->compute barrier between them is exactly
+  // what this table exists to derive.
+  WaterFlux,
   // The baked tree atlas (src/sim/treeatlas.h). READ-ONLY, dispatch-invariant
   // asset data uploaded once at load, exactly like Materials -- worldgen samples
   // it instead of evaluating implicit tree shapes per cell. It never appears on
@@ -266,7 +273,7 @@ enum class Pipe : uint8_t {
   WaterSweep, WaterSplit,
   // W1: the relevel apply and the free-surface measure that feeds next tick's
   // ledger (docs/PLAN_water_relevel.md §3.1).
-  WaterRelevel, WaterSurface,
+  WaterRelevel, WaterSurface, WaterFluxPipe,
   // The far-fill sieve and the edit-patch half it was split into
   // (docs/PLAN_shader_compile.md package C item 1: worldgen.wgsl `far` and
   // `farpatch`). Two pipelines, two rows on PT_FARFILL, recorded back to back
@@ -381,6 +388,11 @@ enum class Cond : uint8_t {
   // so on every tick of every world where nobody has touched the water,
   // neither sweep row is recorded and the cost is exactly zero (rule 2).
   WaterSweep,
+  // W2: sim.waveMode > 0 AND a body is listed. The surface-momentum row is the
+  // only row this gates, and leaving it unrecorded at 0 is what makes
+  // `--sweep sim.waveMode=0,1` an identity claim about the ROW as well as about
+  // the kernel -- the pinned hash cannot see a pass that was never recorded.
+  WaterWave,
   // opennessChunks > 0: the openness grid is on (render.opennessStrength > 0)
   // AND its per-tick chunk budget is nonzero. Both rows carry it, so
   // `opennessStrength = 0` records NOTHING — which is what makes the
