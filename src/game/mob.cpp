@@ -11761,6 +11761,16 @@ int Mob::AppendWornShell(const ItemDef& item, const ItemCover& cover,
       p.microModel = own;
       ld.microModel = own;
       p.carved = true;   // "this slot owns its brick" -- the flag's real sense
+      // ...and the POOL has to be told the same thing. MicroBodyPack hands back
+      // a SHARED record by default (a def's model backs every instance of its
+      // def and must outlive any one of them), and MicroBodyFree refuses to
+      // reclaim a shared block — so `carved` alone made ReleaseLimbMicro a
+      // no-op and every equip/unwear cycle of a resampled shell leaked its
+      // words out of the 1 MiW pool permanently. The two other places that
+      // pack a single-holder brick (Mob::EmitCarvedFragment,
+      // DebrisSystem::LoadState) mark it here too; this one did not, and the
+      // comment above has claimed since the day it landed that it did.
+      if (own < (int)MicroSet()->owned.size()) MicroSet()->owned[own] = 1;
     } else if (!log.empty()) {
       std::printf("%s", log.c_str());
     }

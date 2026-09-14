@@ -3221,6 +3221,10 @@ void DebrisSystem::ShatterBody(Body& b, World& world, std::vector<Body>& fragmen
       // be drawn at all — the cube path would render it at scale-1 size,
       // twice too big — so it falls through to particles instead, which is
       // the same handoff every under-floor piece already takes.
+      //
+      // This is a model INDEX, not a brick: it is CLONED below, before the
+      // re-skin, and see the note there for why the re-skin cannot be trusted
+      // to do it.
       nb.micro = b.micro;
       nb.physScale = b.physScale;  // MUST precede the pitch below
       nb.bleedMat = b.bleedMat;
@@ -3251,7 +3255,41 @@ void DebrisSystem::ShatterBody(Body& b, World& world, std::vector<Body>& fragmen
           r = std::max(r, Vec3{(float)v.x, (float)v.y, (float)v.z}.len());
         nb.radiusVoxels = r / (float)std::max(1u, nb.physScale) + 2.0f;
         nb.serial = nextSerial_++;
-        if (!nb.micro.Valid() || ReskinMicro(nb)) {
+        // ---- ITS OWN BRICK, CLONED EXPLICITLY -------------------------------
+        //
+        // ReskinMicro reaches "a brick I may edit" through MicroBodyOwn, which
+        // is a NO-OP on a model that is ALREADY OWNED — correct for the damage
+        // path (the second hit on a body must not clone again) and wrong here,
+        // because `nb.micro` was copied off the parent a moment ago and the
+        // question for a NEW body is not "may I edit this?" but "is this mine?"
+        //
+        // A parent reaching this point is usually already owned: DamageBody
+        // re-skins after its carve, and BurnBodies takes ownership on its first
+        // per-voxel poke — which is the very case this split exists to serve.
+        // Measured 2026-09-14 with a counter on this branch: ONE full
+        // --selftest pass took it 29 times.
+        // So the fragment kept the PARENT's record, its re-skin below rewrote
+        // the parent's payload to the fragment's shape, and whichever of the
+        // two was released first zeroed the dims of the brick the other was
+        // still being drawn from. MicroBodyClone carries the rest of the story:
+        // the freed record goes back on the free list while a live body still
+        // points at it, so the damage eventually lands on an unrelated
+        // creature — a living mob's torso going invisible when something else
+        // on the field came apart.
+        //
+        // A failed clone is a failed re-skin: fall through to the undo below
+        // and become particles. Drawing it through the cube path instead would
+        // put a scale-2 fragment on screen at twice its size.
+        bool brick = !nb.micro.Valid();
+        if (!brick && microSet_) {
+          const int mc = MicroBodyClone(*microSet_, nb.micro.model);
+          if (mc >= 0) {
+            nb.micro.model = (uint32_t)mc;
+            brick = ReskinMicro(nb);
+            if (!brick) MicroBodyFree(*microSet_, nb.micro.model);
+          }
+        }
+        if (brick) {
           RecountBurn(nb);
           fragments.push_back(std::move(nb));
           madeBody = true;

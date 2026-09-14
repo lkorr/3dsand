@@ -3158,6 +3158,36 @@ neighbors, so this needs an explicit connectivity pass:
   dissolved or split body cannot strand pool words. Under pool exhaustion a
   fragment falls through to particles rather than to the cube path, which would
   draw it at scale-1 size — twice too big.
+  - **ONE RECORD, ONE HOLDER — and `MicroBodyOwn` is not how a NEW holder gets
+    one (2026-09-14).** Own answers "may THIS body edit its brick?", so it is a
+    no-op on an already-owned model; that is right for the second hit on a body
+    and wrong for a body that INHERITED a model index from another one.
+    `ShatterBody` did exactly that (`nb.micro = b.micro`) and reached its "own
+    brick" through `ReskinMicro` → `MicroBodyOwn`, so whenever the parent was
+    already owned — which is the normal case, since `DamageBody` re-skins after
+    its carve and `BurnBodies` takes ownership on its first per-voxel poke —
+    every fragment kept the PARENT's record. One `--selftest` pass took that
+    branch 29 times. The consequences compound: the fragment's re-skin rewrote
+    the parent's payload to the fragment's shape; both teardowns called
+    `MicroBodyFree` on one block, and the first zeroed the dims of a brick the
+    other was still drawn from (an invisible body); and the freed record went
+    back on `freeModels` while live bodies still pointed at it, so the next
+    `MicroBodyOwn` ANYWHERE — a different creature's first carve — was handed a
+    record with stale holders whose eventual free then took the newcomer's
+    brick. That is how a shattering corpse made a living mob's torso vanish
+    (owner report 2026-09-14). `MicroBodyClone` is the always-clone sibling and
+    is what a new holder calls; `MicroBodyOwn` is now `if (owned) return model;
+    else Clone`. The `corpse-burn` gate counts bodies sharing a record and
+    fails on any.
+  - **`MicroBodyPack` recycles too (2026-09-14).** Pack is not only the loader —
+    every carved gobbet and every re-fitted garment shell packs one — and it
+    read neither `freeModels` nor `freeList`, so both the 256-entry record table
+    and the pool's high-water mark were one-way ratchets. It now takes a retired
+    record and allocates through `PoolAlloc` like everything else. Relatedly,
+    `Mob::AddWornShell` set `carved = true` on a resampled shell's brick without
+    setting `owned`, and `MicroBodyFree` refuses to reclaim a shared block — so
+    every equip/unwear cycle leaked its words, despite the comment there
+    claiming otherwise since the day it landed.
   - This also fixed two latent scale bugs that only bit once micro bodies could
     be damaged: `ShatterBody` built fragment colliders at pitch 1 (inflating a
     scale-2 fragment to 8× its mass) and `VoxelsToParticles` emitted one

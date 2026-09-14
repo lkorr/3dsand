@@ -316,6 +316,28 @@ uint32_t MicroBodyCutFaces(const Prefab& pf, int self);
 // memory pressure beats refusing to be destructible.
 int MicroBodyOwn(MicroBodySet& set, uint32_t model);
 
+// ALWAYS produces a fresh private clone, even of a model that is already owned.
+//
+// THE DIFFERENCE FROM MicroBodyOwn, AND WHY BOTH EXIST. Own answers "may THIS
+// body edit its brick?", so its no-op on an already-owned model is exactly
+// right for the damage path: the second hit on a body must not clone again.
+// It is exactly WRONG for a NEW body that INHERITED a model index from an old
+// one — a shatter fragment taking `nb.micro = b.micro` — because there the
+// question is "does this body have a brick OF ITS OWN?" and the honest answer
+// for an owned parent is no.
+//
+// Getting that wrong is not a leak, it is aliasing: the fragment's re-skin
+// rewrites the PARENT's payload, both records' teardowns call MicroBodyFree on
+// one block, and the survivor is left drawing a model whose dims the first free
+// zeroed — an invisible limb. Worse, the freed record goes back on `freeModels`
+// while a live body still points at it, so the NEXT MicroBodyOwn anywhere in
+// the world (a different creature's first carve) hands that record out again
+// and the stale holder's eventual free takes the newcomer's brick with it.
+// That is how a fragment of a burning corpse makes a living mob's torso vanish.
+//
+// Returns -1 on a full pool or model table, exactly like MicroBodyOwn.
+int MicroBodyClone(MicroBodySet& set, uint32_t model);
+
 // Rewrites an OWNED model's payload from `voxels` (micro units, coordinates
 // relative to the body origin, i.e. the same frame DebrisSystem stores). The
 // model's dims/base are re-derived: a body that lost its top half gets a

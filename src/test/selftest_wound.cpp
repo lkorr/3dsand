@@ -2233,12 +2233,24 @@ Status GateCorpseBurn(Ctx& c, std::string& detail) {
   // Per surviving body: count the alight materials in the brick it is drawn
   // from and compare with the same count on its lattice. A body on the cube
   // path (no brick) has nothing to disagree with.
-  uint32_t bricks = 0, disagree = 0;
+  //
+  // ...and NO TWO BODIES ARE DRAWN FROM ONE RECORD. A brick record has exactly
+  // one holder, and the whole lifecycle assumes it: an edit rewrites the block
+  // in place and a release zeroes the record's dims and puts it back on the
+  // free list. Two holders therefore means one of them is about to go INVISIBLE
+  // (the other's release zeroed its dims) and the record is about to be handed
+  // to a third body that is still very much alive, which is how a shattering
+  // corpse used to take a living creature's torso with it. This is the shape
+  // the count check below cannot see: two bodies sharing a record whose payload
+  // happens to match one of their lattices disagree zero times.
+  uint32_t bricks = 0, disagree = 0, sharedBricks = 0;
   std::string disagreeDetail;
+  std::unordered_map<uint32_t, uint32_t> holdersOf;
   if (const MicroBodySet* set = c.debris.MicroSet()) {
     for (uint32_t bi = 0; bi < c.debris.BodyCount(); bi++) {
       const uint32_t model = c.debris.BodyMicroModel(bi);
       if (model == kMicroBodyNoModel || model >= set->models.size()) continue;
+      if (++holdersOf[model] == 2) sharedBricks++;
       const MicroBodyModelGpu& m = set->models[model];
       const uint32_t dx = m.dims & 1023u, dy = (m.dims >> 10) & 1023u,
                      dz = (m.dims >> 20) & 1023u;
@@ -2265,8 +2277,9 @@ Status GateCorpseBurn(Ctx& c, std::string& detail) {
       }
     }
   }
-  const bool drawn = disagree == 0;
+  const bool drawn = disagree == 0 && sharedBricks == 0;
 
+  RecordObserved("corpseBurnSharedBricks", (double)sharedBricks);
   RecordObserved("corpseBurnDeathTick", (double)deathTick);
   RecordObserved("corpseBurnAlightAtDeath", (double)alight0);
   RecordObserved("corpseBurnAlightAtEnd", (double)alight1);
@@ -2284,13 +2297,13 @@ Status GateCorpseBurn(Ctx& c, std::string& detail) {
       "%s: died at tick %d of '%s' with %u alight / %u spent across %u bodies; "
       "after %d ticks alone: %u alight / %u spent across %u bodies, %u of %u "
       "lit pieces stalled%s; debris emitted %u fire + %u smoke/ash ops; %u "
-      "bricks, %u disagree with their lattice%s; %u settled back into the "
+      "bricks, %u disagree with their lattice%s, %u shared by two bodies; %u settled back into the "
       "grid, %u bodies at t+%d, last body seen at t+%d with lowest y %.1f "
       "(ground %.0f); fall:%s",
       t.defName.c_str(), deathTick, cause.c_str(), alight0, spent0, bodies0,
       window, alight1, spent1, bodies1, stalledCount, litPieces,
       stalled.c_str(), debrisFireOps, debrisResidueOps, bricks, disagree,
-      disagreeDetail.c_str(), settled, bodiesMid, window / 2, lastBodyTick,
+      disagreeDetail.c_str(), sharedBricks, settled, bodiesMid, window / 2, lastBodyTick,
       lastY, groundY, fall.c_str());
   std::printf("corpse-burn: %s\n", detail.c_str());
   std::fflush(stdout);

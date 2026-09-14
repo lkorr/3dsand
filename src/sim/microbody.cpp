@@ -293,7 +293,16 @@ int MicroBodyPack(MicroBodySet& set, const std::vector<PrefabVoxel>& voxels,
            ", max 1023 per axis\n";
     return -1;
   }
-  if (set.models.size() >= kMaxMicroBodyModels) {
+  // A RETIRED RECORD COUNTS AS A FREE ONE. Pack is not only the loader: every
+  // carved gobbet (Mob::EmitCarvedFragment) and every re-fitted garment shell
+  // packs one, and their frees put the record on `freeModels` and the words on
+  // `freeList`. Reading neither made both a one-way ratchet against a table of
+  // only kMaxMicroBodyModels entries — a long fight walked it to the ceiling
+  // and from there every gobbet fell through to particles and every resampled
+  // shell drew at the mannequin's size, with the pool's high-water mark still
+  // climbing past blocks nothing was using. MicroBodyOwn has recycled both
+  // since it was written; this is the same recycling, in the other allocator.
+  if (set.freeModels.empty() && set.models.size() >= kMaxMicroBodyModels) {
     log += label + ": micro body model table full (" +
            std::to_string(kMaxMicroBodyModels) + ")\n";
     return -1;
@@ -312,11 +321,6 @@ int MicroBodyPack(MicroBodySet& set, const std::vector<PrefabVoxel>& voxels,
     if (StainByteOf(set, v.stain)) { withStain = true; break; }
   const size_t words =
       WordsFor(cellCount) + (withStain ? StainWordsFor(cellCount) : 0);
-  if (set.pool.size() + words > kMicroBodyPoolWordsWorld) {
-    log += label + ": micro body brick pool full (" +
-           std::to_string(kMicroBodyPoolWordsWorld) + " words)\n";
-    return -1;
-  }
 
   std::vector<uint16_t> cells(cellCount, 0);
   std::vector<uint8_t> stains(withStain ? cellCount : 0, 0);
@@ -340,7 +344,15 @@ int MicroBodyPack(MicroBodySet& set, const std::vector<PrefabVoxel>& voxels,
           StainByteOf(set, v.stain);
   }
 
-  const uint32_t base = (uint32_t)set.pool.size();
+  // Allocated only now that the payload is known good: the material-range check
+  // above returns -1 from the middle of the loop, and a block taken before it
+  // would be leaked on that exit.
+  const uint32_t base = PoolAlloc(set, words);
+  if (base == UINT32_MAX) {
+    log += label + ": micro body brick pool full (" +
+           std::to_string(kMicroBodyPoolWordsWorld) + " words)\n";
+    return -1;
+  }
   const size_t payloadWords = WordsFor(cellCount);
   for (size_t w = 0; w < payloadWords; w++) {
     uint32_t word = 0;
@@ -348,7 +360,7 @@ int MicroBodyPack(MicroBodySet& set, const std::vector<PrefabVoxel>& voxels,
       size_t idx = w * 2 + b;
       if (idx < cellCount) word |= (uint32_t)cells[idx] << (b * 16);
     }
-    set.pool.push_back(word);
+    set.pool[base + w] = word;
   }
   for (size_t w = payloadWords; w < words; w++) {
     uint32_t word = 0;
@@ -356,7 +368,7 @@ int MicroBodyPack(MicroBodySet& set, const std::vector<PrefabVoxel>& voxels,
       size_t idx = (w - payloadWords) * 4 + b;
       if (idx < cellCount) word |= (uint32_t)stains[idx] << (b * 8);
     }
-    set.pool.push_back(word);
+    set.pool[base + w] = word;
   }
 
   MicroBodyModelGpu m{};
@@ -365,14 +377,27 @@ int MicroBodyPack(MicroBodySet& set, const std::vector<PrefabVoxel>& voxels,
            (withStain ? kMicroBodyDimsStainBit : 0u);
   m.scale = scale;
   m.cutFaces = cutFaces & 0x3Fu;
-  set.models.push_back(m);
+  // A recycled record is reused verbatim, exactly as MicroBodyOwn reuses one.
+  uint32_t slot;
+  if (!set.freeModels.empty()) {
+    slot = set.freeModels.back();
+    set.freeModels.pop_back();
+    set.models[slot] = m;
+  } else {
+    slot = (uint32_t)set.models.size();
+    set.models.push_back(m);
+  }
   // Shared, not owned: load-time models back every instance of their def and
-  // must survive any one instance being destroyed.
+  // must survive any one instance being destroyed. A caller that packs a brick
+  // for a SINGLE holder (a gobbet, a fitted shell, a loaded body) sets
+  // `owned[slot]` itself — the record may be a recycled one, so this writes 0
+  // rather than relying on a fresh vector's default.
   set.owned.resize(set.models.size(), 0);
   set.blockWords.resize(set.models.size(), 0);
-  set.blockWords.back() = (uint32_t)words;
+  set.owned[slot] = 0;
+  set.blockWords[slot] = (uint32_t)words;
   set.MarkPool(base, base + (uint32_t)words);
-  return (int)set.models.size() - 1;
+  return (int)slot;
 }
 
 int MicroBodyOwn(MicroBodySet& set, uint32_t model) {
@@ -380,6 +405,13 @@ int MicroBodyOwn(MicroBodySet& set, uint32_t model) {
   set.owned.resize(set.models.size(), 0);
   set.blockWords.resize(set.models.size(), 0);
   if (set.owned[model]) return (int)model;  // already private to one body
+  return MicroBodyClone(set, model);
+}
+
+int MicroBodyClone(MicroBodySet& set, uint32_t model) {
+  if (model >= set.models.size()) return -1;
+  set.owned.resize(set.models.size(), 0);
+  set.blockWords.resize(set.models.size(), 0);
 
   // Clone the payload, and give the clone a STAIN LATTICE whether or not the
   // source had one: an owned model is one something is about to mark (carve,
