@@ -104,7 +104,7 @@
       "name": "head",
       "parent": "torso",
       "joint": "ball",
-      "hp": 22,
+      "hp": 45,
       "severable": true,
       "vital": true,
       "tag": "head",
