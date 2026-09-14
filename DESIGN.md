@@ -4296,7 +4296,12 @@ running over the baked model.
 
 - **Player**: capsule controller (Jolt character), colliding against on-demand
   localized marching-cubes terrain patches. Voxel-type queries drive traversal:
-  liquids slow movement and swap jump→swim; standing in gas/liquid can apply
+  liquids slow movement and, **once the body is three-quarters under**
+  (`kSwimSubmersion`), swap jump→swim. Shallower than that is WADING, which is
+  a walking state: footing, jump, step-up and the ground snap all survive, and
+  only the submersion-scaled drag/buoyancy/wade-speed apply. `Player::swimming`
+  is that distinction; `inLiquid` means only "some part of the body is wet" and
+  is the wrong flag to gate a movement rule on. Standing in gas/liquid can apply
   status effects; some materials are absorbed on contact (Noita stain system —
   and remember its lesson: players will invent rules for anything you surface
   in the UI, so communicate statuses deliberately).

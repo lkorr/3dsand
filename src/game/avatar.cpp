@@ -2092,10 +2092,14 @@ void PlayerAvatar::PreTick(uint32_t tick, const Player& player, float heading,
     } else if (player.inLiquid) {
       // WATER IS NOT AIR.
       //
-      // `grounded` is false for the whole time a body is in liquid by
-      // construction (Player::Update sets `onGround = drop >= 0 && !inLiquid`),
-      // so nothing above this made a swimmer anything but airborne and the air
-      // clock ran the entire swim. Every airborne rule fired off it: the fall
+      // `grounded` is false for a body the water is carrying (Player::Update
+      // sets `onGround = drop >= 0 && !swimming`, and a swimmer has no floor
+      // under it in any case), so nothing above this made a swimmer anything
+      // but airborne and the air clock ran the entire swim. A WADER is a
+      // different thing and never reaches here — it is grounded, and takes the
+      // branch above with the rest of the walking bodies, which is right: it
+      // is standing on the ground with its feet wet. Every airborne rule fired
+      // off the air clock: the fall
       // flail opened the arms out underwater, and at ragdoll.fallSeconds — 3 s,
       // which is a short swim — the swimmer went limp in the water.
       //

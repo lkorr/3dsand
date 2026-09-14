@@ -174,8 +174,10 @@ bool walkOk = false;
 // world position is fragile. A lambda states the fixture exactly and the code
 // under test cannot tell the difference.
 //
-// Three assertions, and the negative ones carry the weight: an unconditional
-// "jump works in water" would pass the first alone.
+// Four assertions, and the negative ones carry the weight: an unconditional
+// "jump works in water" would pass the first alone. The fourth is the other
+// side of the same coin — WADING is not swimming, and a body standing in
+// ankle-deep water still jumps like any other body standing on the ground.
 Status GatePlayerWaterJump(Ctx&, std::string& detail) {
   // Pool: solid floor at y < 100, water in 100..129 for x < 140, and a solid
   // bank from x >= 140 rising to y = 134. So the water surface is y=130 and the
@@ -305,13 +307,60 @@ Status GatePlayerWaterJump(Ctx&, std::string& detail) {
     openFired = open.waterJumped;
   }
 
-  bool ok = wasSwimming && fired && climbedOut && !cliffFired && !openFired;
-  char buf[256];
+  // (d) SHALLOW WATER: ankle-deep over a solid floor is WADING, not swimming.
+  // A body there is standing on the ground and must keep everything a grounded
+  // body has — above all the jump.
+  //
+  // This is the arm the mechanic lost for a long time and nothing noticed:
+  // `inLiquid` was a bare "any of the five body samples is wet", it zeroed
+  // `onGround`, and the jump lived in the `else` of it, so ONE voxel of water
+  // underfoot took jumping away entirely. The swim thrust that remained is
+  // scaled by submersion — 0.2 here — and cannot lift anybody. Every arm above
+  // floats in 30 voxels of water, so all three passed throughout.
+  //
+  // The floor is at y=100 and the water is two voxels deep (100..101), which
+  // wets the feet sample and nothing else: submersion 0.2, the shallowest
+  // state that is still liquid, and therefore the hardest case for the rule.
+  const float kFloor = 100.0f, kShallowTop = 102.0f;
+  Player::KindFn wadeFn = [&](IVec3 c) {
+    if (c.y < (int)kFloor) return CellKind::Solid;
+    return c.y < (int)kShallowTop ? CellKind::Liquid : CellKind::Air;
+  };
+  Player wade;
+  wade.fly = false;
+  wade.pos = Vec3{128.0f, kFloor + Player::kHalfY, 140.5f};
+  for (int i = 0; i < 60; i++)
+    wade.Update(dt, PlayerInput{}, fwd, right, fwd, wadeFn);
+  // Preconditions, asserted not assumed: actually in the water, and actually
+  // read as standing in it rather than swimming in it. Without the first, the
+  // jump below would prove nothing; without the second, it would be testing
+  // the dry path.
+  bool wadeWet = wade.inLiquid && !wade.swimming && wade.grounded;
+  float wadeFeet0 = wade.pos.y - Player::kHalfY;
+  {
+    PlayerInput jump;
+    jump.jumpPressed = true;
+    wade.Update(dt, jump, fwd, right, fwd, wadeFn);
+  }
+  float wadePeak = wadeFeet0;
+  for (int i = 0; i < 90; i++) {
+    wade.Update(dt, PlayerInput{}, fwd, right, fwd, wadeFn);
+    wadePeak = std::max(wadePeak, wade.pos.y - Player::kHalfY);
+  }
+  // A real jump clears ~14 voxels from a dry floor; ankle-deep drag trims that
+  // a little. 5 voxels is far above anything buoyancy or a bob can produce and
+  // far below the true arc, so the assertion survives a jumpSpeed retune.
+  bool wadeJumped = wadePeak >= wadeFeet0 + 5.0f;
+
+  bool ok = wasSwimming && fired && climbedOut && !cliffFired && !openFired &&
+            wadeWet && wadeJumped;
+  char buf[320];
   std::snprintf(buf, sizeof(buf),
                 "floated feet y=%.1f -> out y=%.1f x=%.1f (rim %.0f), "
-                "fired=%d cliff=%d open=%d",
+                "fired=%d cliff=%d open=%d | wade wet=%d feet %.1f -> peak %.1f",
                 floatFeet, outFeet, pool.pos.x, kRim, fired ? 1 : 0,
-                cliffFired ? 1 : 0, openFired ? 1 : 0);
+                cliffFired ? 1 : 0, openFired ? 1 : 0, wadeWet ? 1 : 0,
+                wadeFeet0, wadePeak);
   detail = buf;
   std::printf("player waterjump: %s (%s)\n", ok ? "PASS" : "FAIL", buf);
   return ok ? Status::Pass : Status::Fail;

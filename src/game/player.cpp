@@ -201,6 +201,30 @@ inline const Tuning::Player& T() { return CurrentTuning().player; }
 // used to fail. Expressed in m/s so it is voxel-size independent.
 // -> tuning.json player.nonJumpSpeed
 
+// WADING IS NOT SWIMMING. Fraction of the body that must be under before the
+// water takes over from the ground: at or above this the body swims (no
+// footing, no jump, thrust and the water-edge mantle instead), below it the
+// body is a body standing in water and every ground rule still applies.
+//
+// There used to be no such line — `inLiquid` was a bare "any sample wet", and
+// it disabled BOTH the ground state and the jump. One voxel of water over the
+// terrain (a puddle, a stream, the shallow rim of any pond) was therefore
+// enough to take away jumping, step-up and the ground snap entirely, and the
+// only thing left was swim thrust scaled by a submersion of 0.2, which cannot
+// lift anyone. That is the "can't jump while standing in water" bug.
+//
+// 0.75 is a ROW of the liquid sample ladder, not a feel knob: with
+// kLiquidSamples = 5 the reachable values are 0, .2, .4, .6, .8, 1, so this
+// means "the 3/4-height sample is under" — water at the shoulders. Knee-,
+// waist- and chest-deep all stay walkable, which is the whole point; only a
+// body that is nearly covered while still standing on something gives up its
+// footing, and it gives it up to the swim thrust, which can lift it.
+//
+// It does NOT decide who may swim — the thrust is available to anything wet.
+// So a treading swimmer, whose equilibrium submersion is an emergent number
+// nobody controls, is never at the mercy of where this line sits.
+constexpr float kSwimSubmersion = 0.75f;
+
 // Grace windows, seconds. Coyote time keeps a jump legal just after walking off
 // an edge; the buffer honours a jump pressed just before landing. Both exist
 // because on noisy ground the true airborne/grounded boundary is genuinely
@@ -506,6 +530,9 @@ void Player::Update(float dt, const PlayerInput& in, const Vec3& flatFwd,
                     const Vec3& right, const Vec3& lookFwd, const KindFn& kindAt) {
   dt = std::min(dt, 0.05f);
   blindFall = false;  // set again below if the walk path holds a descent
+  swimming = false;   // decided in the walk path; fly and the scripted climbs
+                      // are never swimming, and a stale true would take the
+                      // jump away after stepping out of a pool in fly mode
   ledgeGrabbed = false;  // one-frame flag; set again below if a grab latches
   ledgeInReach = false;  // recomputed below (hang block or the walk probe)
 
@@ -619,8 +646,11 @@ void Player::Update(float dt, const PlayerInput& in, const Vec3& flatFwd,
   // the correct answer for wading, for a swimmer's head breaking the surface,
   // and for standing in shallow water — all of which previously read as "fully
   // in the sea".
-  const float submersion =
-      (float)liquidCells / (float)kLiquidSamples;
+  //
+  // The MEMBER, not a local: player.h has advertised `submersion` since this
+  // landed and a local of the same name shadowed it, so every outside reader
+  // (HUD, cues, avatar) saw a permanent 0.
+  submersion = (float)liquidCells / (float)kLiquidSamples;
 
   // WATERLINE: the first non-liquid cell above the deepest liquid we are in.
   // The water-edge jump is measured against this rather than against the body
@@ -871,7 +901,22 @@ void Player::Update(float dt, const PlayerInput& in, const Vec3& flatFwd,
     bool rising = vel.y > nonJumpSpeed;
     float reach = grounded ? 0.1f + (float)kMaxStepUpVoxels : 0.1f;
     float drop = rising ? -1.0f : GroundProbe(pos, reach, b, kindAt);
-    bool onGround = drop >= 0.0f && !inLiquid;
+
+    // ---- wading vs swimming (see kSwimSubmersion) -------------------------
+    // DEPTH ALONE decides this, deliberately. The obvious other half — "and
+    // there is no floor under the feet" — reads `drop`, which is suppressed to
+    // -1 while rising, so every frame of a jump OUT of a puddle would report
+    // the body as suddenly swimming with its ankles wet. Depth is a property
+    // of the situation; footing is a property of the frame.
+    //
+    // Nothing a swimmer needs is lost by leaving footing out, because none of
+    // it is gated on this flag: a treading body has no floor within the 0.1
+    // probe, so `onGround` is false for it either way, and the swim thrust
+    // below is gated on being in liquid at all rather than on `swimming`.
+    // That is what keeps the surface float safe — it does not matter which
+    // side of the threshold a floating body's submersion happens to land on.
+    swimming = inLiquid && submersion >= kSwimSubmersion;
+    bool onGround = drop >= 0.0f && !swimming;
     if (onGround) coyoteTimer = T().coyoteTime;
 
     // ---- the blind fall: the drop waits on a mirror it has outrun ---------
@@ -968,9 +1013,16 @@ void Player::Update(float dt, const PlayerInput& in, const Vec3& flatFwd,
       // look direction instead would fire whenever you glanced at a nearby wall
       // while swimming past it. With no horizontal input there is nothing to
       // climb toward and the branch simply does not apply.
+      //
+      // NOT WHILE STANDING ON SOMETHING. A body with footing has a real jump
+      // and the step-up, which between them clear any bank it can reach; the
+      // mantle is for the case those cannot serve, which is a body hanging in
+      // the water with nothing under it. Gated on `onGround` rather than on
+      // `swimming` so it stays available at every depth a float can reach —
+      // the gate below asserts the treading-at-the-rim case exactly.
       Vec3 dir = wish;
       dir.y = 0;
-      if (mantleTimer <= 0.0f && jumpBuffer > 0.0f && canJump &&
+      if (!onGround && mantleTimer <= 0.0f && jumpBuffer > 0.0f && canJump &&
           jumpScale > 0.0f && haveSurface && dir.len() > 1e-3f) {
         dir = dir.normalized();
         Vec3 target;
@@ -984,6 +1036,10 @@ void Player::Update(float dt, const PlayerInput& in, const Vec3& flatFwd,
         }
       }
 
+      // Thrust is NOT gated on `swimming`: paddling is available to anything
+      // with water around it, and the submersion scale already makes it
+      // nothing at ankle depth. Gating it would put the surface float on the
+      // wrong side of a threshold — see the note at `swimming` above.
       if (!waterJumped && mantleTimer <= 0.0f) {
         // Swim thrust scales with submersion for the same reason drag does:
         // you can only push against water you are actually in. This is not a
@@ -996,8 +1052,17 @@ void Player::Update(float dt, const PlayerInput& in, const Vec3& flatFwd,
         if (in.up) vel.y += (T().swimUp / kVoxelMeters) * submersion * dt;
         if (in.down) vel.y -= (T().swimDown / kVoxelMeters) * submersion * dt;
       }
-    } else if (jumpBuffer > 0.0f && coyoteTimer > 0.0f && canJump &&
-               jumpScale > 0.0f) {
+    }
+
+    // The ordinary jump. Gated on `swimming`, NOT on `inLiquid`: a body wading
+    // in a stream is standing on the ground and jumps off it like any other
+    // grounded body. The water is still charged for — the drag above already
+    // ran this frame, and the arc that follows is trimmed by the same
+    // submersion-scaled drag until the legs clear the surface — it just no
+    // longer forbids the move. The coyote window this reads is refreshed by
+    // `onGround`, which is the other half of the same fix.
+    if (!swimming && jumpBuffer > 0.0f && coyoteTimer > 0.0f && canJump &&
+        jumpScale > 0.0f) {
       vel.y = (T().jumpSpeed / kVoxelMeters) * jumpScale;
       jumpBuffer = 0.0f;
       coyoteTimer = 0.0f;  // consume both, or one press pogos every frame
@@ -1072,8 +1137,12 @@ void Player::Update(float dt, const PlayerInput& in, const Vec3& flatFwd,
     if (lost.len() > impactDeltaV.len()) impactDeltaV = lost;
 
     // Re-probe after the move so `grounded` reported to the rest of the frame
-    // reflects where we ended up, not where we started.
-    grounded = !rising && !inLiquid &&
+    // reflects where we ended up, not where we started. `!swimming`, matching
+    // the pre-move decision: a wader is grounded, and everything downstream
+    // that reads this flag (the avatar's gait and air clock, footstep cues,
+    // the next frame's step-up reach) should see a walking body, not a
+    // floating one.
+    grounded = !rising && !swimming &&
                GroundProbe(pos, 0.1f, b, kindAt) >= 0.0f;
     if (grounded) coyoteTimer = T().coyoteTime;
 

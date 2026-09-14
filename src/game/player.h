@@ -94,6 +94,14 @@ class Player {
   // avatar reads it for the knee bend. Fly mode clears it (Ctrl is descend).
   bool crouching = false;
   bool inLiquid = false;
+  // Any part of the body wet is `inLiquid`; SWIMMING is the state where the
+  // water has actually taken over — the body three-quarters under
+  // (kSwimSubmersion in player.cpp; depth alone, and that note says why the
+  // tempting "and no floor underfoot" half is wrong). It is the flag the
+  // movement rules want: `inLiquid` used to stand in for it and cost a wader
+  // their jump, their step-up and their ground snap for one voxel of puddle.
+  // Never true in fly or during a scripted climb.
+  bool swimming = false;
   // THE DROP IS RATE-LIMITED BY THE MIRROR: the body is descending faster than
   // the CPU mirror can answer for the cells beneath it, so this frame's fall is
   // clamped to the distance the mirror does vouch for and gravity is not added
