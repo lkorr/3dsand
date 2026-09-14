@@ -723,6 +723,29 @@ def check_water_ledger():
                 f"gate is reading the wrong field of the right body and saying "
                 f"so with a plausible number")
 
+    # W-D: the per-body FLAG BITS are a protocol between waterbody.cpp (which
+    # ORs them into TickParams row 1, word 3) and sim_waterbody.wgsl (which
+    # decodes them). Bits 0..4 predate this check and are still literals on the
+    # C++ side; the two W-D bits are named in world.h so this can compare them.
+    # A mismatch is silent in the worst way -- every probe would be treated as
+    # an authored basin, so the size gate and the sticky refusal would simply
+    # never fire and discovery would look like it worked.
+    flags_h = {n.upper(): int(v) for n, v in re.findall(
+        r"constexpr\s+int32_t\s+kWbf(\w+)\s*=\s*(\d+)", wh)}
+    flags_w = {n: int(v) for n, v in re.findall(
+        r"\bconst\s+WBF_(\w+)\s*:\s*i32\s*=\s*(\d+)\s*;", cw)}
+    for name, val in flags_h.items():
+        if name not in flags_w:
+            problems.append(
+                f"world.h declares kWbf{name.capitalize()} = {val} but "
+                f"common.wgsl has no WBF_{name} -- the CPU sets a bit no shader "
+                f"reads")
+        elif flags_w[name] != val:
+            problems.append(
+                f"world.h kWbf{name.capitalize()} = {val} but common.wgsl "
+                f"WBF_{name} = {flags_w[name]} -- the CPU and the ledger "
+                f"disagree about which bit means what")
+
     # The relevel histogram: sized from one constant, indexed from another.
     dm = re.search(r"constexpr\s+uint32_t\s+kWaterRelevelDepthMax\s*=\s*(\d+)", wh)
     bk = re.search(r"constexpr\s+uint32_t\s+kWaterRelevelBuckets\s*=\s*(\d+)", wh)

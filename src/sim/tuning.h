@@ -1959,6 +1959,29 @@ struct Tuning {
     // bucket and is treated as deep.
     int waterRelevelDepth = 32;
 
+    // ---- W-D: discovery (docs/PLAN_water_relevel.md §8) ----
+    //
+    // A body the PLAYER creates — a basin dug and filled by hand, a pool a
+    // drain leaves behind — is adopted and gets the W1 relevel; a puddle stays
+    // CA and costs nothing. The CPU accounts placed-liquid EVIDENCE off the
+    // mutation stream and proposes a probe disc; the GPU measures the real
+    // water and adopts or refuses it (the M2 authority split, verbatim).
+
+    // EIGHTHS of liquid placed in one cluster of the coarse evidence grid
+    // before a probe disc is raised. 4096 is ~512 full voxels of water — a
+    // small real pond, and three orders more than anything a bucket or a
+    // burst pipe leaves behind. 0 is an EXACT IDENTITY: no evidence is
+    // accumulated, no probe exists, no descriptor carries WBF_DISCOVER, and
+    // the pinned world hash is the pre-W-D one.
+    int waterDiscoverMinEighths = 4096;
+    // MEASURED free-surface CELLS below which the GPU refuses a discovered
+    // probe and parks it in WB_REFUSED (four ledger loads a tick, no footprint
+    // work). This is the backstop behind the CPU filter above, for evidence
+    // that evaporated, soaked away or ran off before the reduce ever looked:
+    // the eighths were genuinely placed, and there is still no body there.
+    // Never applied to an AUTHORED basin — see TickParams::waterAdoptMinArea.
+    int waterAdoptMinArea = 64;
+
     // ---- wind coupling (docs/RESEARCH_wind.md §4.5/§4.6) ----
     // The SHAPE of the field is the `wind` group below; these are what the
     // three SIM consumers do with what they sample. Human-unit floats, the

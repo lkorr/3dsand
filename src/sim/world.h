@@ -1809,7 +1809,17 @@ constexpr uint32_t kWaterChunkCap = 1024;
 // which the plan's word list did not have and the implementation needs: the
 // ledger consumes LAST tick's histogram and may lower the level THIS tick, so
 // the bucket origin has to be published by the pass that filled the buckets.
-constexpr uint32_t kWaterBodyStateWords = 41;
+//
+// W-D widened it to 42 for ONE word, WBS_RAREA — the free-surface CELL COUNT
+// the adoption reduce measured. Discovery's size gate (§8.4) is "adopt iff the
+// measured surface area is at least sim.waterAdoptMinArea", and before this
+// word there was nowhere for that number to come from: `wbReduce` measured the
+// volume and the level and nothing else, and WBS_AREA at adoption is the CPU's
+// ANALYTIC seed, which for a discovered disc is a fabricated cylinder and not a
+// measurement of anything. A gate that read the seed would be the circular
+// probe assertion — the candidate's own guess deciding whether the candidate is
+// real.
+constexpr uint32_t kWaterBodyStateWords = 42;
 // DRAIN OP SLOTS PER BODY (component 6). The discharge is emitted through the
 // existing spawnAppend seam, which reads a CPU-sized op stream — so the CPU
 // RESERVES a contiguous block per body it proposes and the GPU fills it. This
@@ -1931,6 +1941,69 @@ constexpr uint32_t kWaterBodyChildren = 1;
 // re-resolved it for itself it would disagree with the clear the ledger
 // already did, on any tick the shave moved the level in between.
 constexpr int32_t kWaterSweepLive = -0x7FFFFFFF;
+
+// ---- W-D: DISCOVERY, the created body (PLAN_water_relevel.md §8) -----------
+//
+// A body the PLAYER makes — a basin dug and filled by hand, a pool a drain
+// leaves behind — has no analytic container, so nothing in M1's registry can
+// name it. §8's answer reuses M2's authority split verbatim: the CPU accounts
+// EVIDENCE (eighths of liquid placed, where) off the tick input stream and
+// PROPOSES a probe disc; the GPU measures the real water and adopts or refuses.
+// The CPU never learns the verdict, so no fence ever reaches a voxel write.
+//
+// Live probe discs. Sixteen inside kWaterBodyCap, so discovery can never crowd
+// the authored basins out of the ledger. Each costs one descriptor, and a
+// REFUSED one costs three ledger loads a tick and no footprint work at all —
+// which is "puddles can be ignored easily" implemented literally.
+constexpr uint32_t kWaterDiscoveredCap = 16;
+// The reserved basin-id range. Authored pools take 1..3, authored lakes
+// 0x4xxxxxxx, tarns 0x8xxxxxxx; discovery takes 0xC0000000 | slot. A basin id
+// is an IDENTITY (the hole hints, the curve-dirty latch and the carried ledger
+// slot are all keyed by it), so it is derived from the probe's SLOT — which a
+// deleted neighbour never renumbers — and never from its index in a vector.
+constexpr uint32_t kWaterDiscoverIdBase = 0xC0000000u;
+// Ticks an EVICTED probe keeps its descriptor, proposed with WBF_RELEASE, before
+// the entry is dropped. Never drop a descriptor cold: the slot would be reused
+// against a ledger still carrying the old body's debit, which is the
+// carried-descriptor bug class the drain pass documents. 600 = 20 s, two orders
+// more than a probe's debit (normally zero) needs to square.
+constexpr uint32_t kWaterDiscoverReleaseTicks = 600;
+// The EVIDENCE GRID: coarse XZ cells, world voxels on a side. 32 is four chunk
+// columns and is chosen so a pond-sized pour lands in a handful of cells while a
+// single bucket lands in one. Evidence is accumulated per (cell, liquid
+// material) and is a pure function of the tick's op list.
+constexpr int kWaterEvidenceGrid = 32;
+// Live evidence cells tracked. Bounded by rule 2 rather than by hoping the
+// player stops pouring: at the cap the LOWEST-evidence cell is evicted (ties by
+// oldest tick, then by position), which is deterministic and costs at worst the
+// forgetting of a puddle nobody was going to get a body out of.
+constexpr uint32_t kWaterEvidenceCap = 192;
+// Chunk-list entries every discovered body TOGETHER may claim, out of
+// kWaterChunkCap. Rule 2 charges the budget before emission, and without a
+// share of its own a probe disc — whose ANALYTIC volume is an over-predicting
+// cylinder, so it sorts EARLY in Classify's biggest-first order — could take
+// the list out from under the authored lake. A quarter of the cap leaves the
+// lake's ~140 entries untouched in every fixture measured.
+constexpr uint32_t kWaterDiscoverChunkShare = 256;
+// Voxels of pad around the bounding circle of the contributing evidence (§8.3),
+// and voxels of floor below the lowest evidence cell. The disc is only a BOUND
+// — the sweep's component map trims ownership to the connected water exactly as
+// it does for an authored basin — so the pad is generosity, not accuracy.
+constexpr int kWaterDiscoverPad = 8;
+constexpr int kWaterDiscoverFloorPad = 4;
+// Largest probe disc. A probe is a proposal, and an unbounded one would list a
+// chunk footprint the share above then refuses in full — better to bound the
+// geometry than to discover a body the budget can never carry.
+constexpr int kWaterDiscoverMaxRadius = 48;
+// THE TWO NEW PER-BODY FLAG BITS, named here rather than written as literals in
+// BuildGpu. They are a PROTOCOL between waterbody.cpp and sim_waterbody.wgsl —
+// TickParams row 1, word 3 — and a protocol restated as a bare `| 32` in one
+// place and a `const WBF_DISCOVER : i32 = 32` in the other is a two-places-
+// must-agree bug with nothing behind it. `check_invariants.py`'s water-ledger
+// check compares these against common.wgsl's WBF_* block; bits 0..4 predate it
+// and are still literals, which is exactly why this pair is not.
+constexpr int32_t kWbfDiscover = 32;   // this body is a discovered PROBE
+constexpr int32_t kWbfReprobe = 64;    // one-tick pulse: new evidence landed
 
 // Largest radius / axial reach a primitive may declare, world cells (51 m).
 // Load-bearing twice: it bounds the footprint the wake budget is spent on, and
@@ -2246,7 +2319,20 @@ struct TickParams {
   // stay TUNE_* consts: they shape the rule, not whether it may write, and
   // const-eval keeps the divide and the loop bound out of the uniform.)
   int32_t waterRelevelMax = 0;
-  uint32_t padWb3 = 0;
+  // ---- W-D: THE SIZE GATE (PLAN_water_relevel.md §8.4) -------------------
+  //
+  // `sim.waterAdoptMinArea` — the measured free-surface CELL count below which
+  // the ledger refuses a DISCOVERED probe and parks it in WB_REFUSED. Forwarded
+  // through the uniform rather than read as a TUNE_* const for the reason
+  // waterQuietTicks and waterMinVolume are: a gate that wants a different
+  // threshold sets it with SetCurrentTuning and pays no pipeline rebuild.
+  //
+  // It applies ONLY to a body carrying WBF_DISCOVER. An authored basin is a
+  // closed form the registry vouches for, and putting a size gate in front of
+  // it would make `sim.waterDiscoverMinEighths = 0` stop being the exact
+  // identity §8.6 promises — a small authored pool would start being refused by
+  // a knob that is supposed to be about discovery.
+  int32_t waterAdoptMinArea = 0;
   uint32_t padWb4 = 0;
   // kWaterBodyCap bodies x kWaterBodyWords i32 words, declared WGSL-side as
   // array<vec4<i32>, 128> — the same bytes, since std140 strides a uniform

@@ -272,6 +272,8 @@ bool SetSimField(Tuning& t, const std::string& name, float value) {
     {"waterRelevelMax", &Tuning::Sim::waterRelevelMax},
     {"waterRelevelGain", &Tuning::Sim::waterRelevelGain},
     {"waterRelevelDepth", &Tuning::Sim::waterRelevelDepth},
+    {"waterDiscoverMinEighths", &Tuning::Sim::waterDiscoverMinEighths},
+    {"waterAdoptMinArea", &Tuning::Sim::waterAdoptMinArea},
     {"windMode", &Tuning::Sim::windMode},
     {"gasMode", &Tuning::Sim::gasMode},
     {"currentMode", &Tuning::Sim::currentMode},
@@ -1328,6 +1330,8 @@ bool LoadTuning(const std::string& path, Tuning& out) {
     ReadI(*g, "waterRelevelMax", s.waterRelevelMax, out, at);
     ReadI(*g, "waterRelevelGain", s.waterRelevelGain, out, at);
     ReadI(*g, "waterRelevelDepth", s.waterRelevelDepth, out, at);
+    ReadI(*g, "waterDiscoverMinEighths", s.waterDiscoverMinEighths, out, at);
+    ReadI(*g, "waterAdoptMinArea", s.waterAdoptMinArea, out, at);
     ReadI(*g, "windMode", s.windMode, out, at);
     ReadI(*g, "gasMode", s.gasMode, out, at);
     ReadF(*g, "windDrag", s.windDrag, out, at);
@@ -1621,6 +1625,19 @@ bool LoadTuning(const std::string& path, Tuning& out) {
       out.warnings.push_back("sim.waterRelevelDepth out of 0..32; clamped");
       s.waterRelevelDepth =
           s.waterRelevelDepth < 0 ? 0 : (int)kWaterRelevelDepthMax;
+    }
+    // W-D. A negative threshold would read as "off" by accident rather than on
+    // purpose; 0 is the deliberate off switch and is left alone.
+    if (s.waterDiscoverMinEighths < 0) {
+      out.warnings.push_back(
+          "sim.waterDiscoverMinEighths negative; clamped to 0 (discovery off)");
+      s.waterDiscoverMinEighths = 0;
+    }
+    // A size gate of 0 adopts anything the volume threshold already let through,
+    // which is a legal (if pointless) configuration; a negative one is a typo.
+    if (s.waterAdoptMinArea < 0) {
+      out.warnings.push_back("sim.waterAdoptMinArea negative; clamped to 0");
+      s.waterAdoptMinArea = 0;
     }
     // Wind coupling. The gate first: an unknown mode must not fall through to
     // "some wind", because the whole hash argument for shipping this is that

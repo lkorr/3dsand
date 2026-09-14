@@ -440,6 +440,10 @@ SPEC = [
     ("sim", "waterRelevelMax", "TUNE_WATER_RELEVEL_MAX", "i", 4),
     ("sim", "waterRelevelGain", "TUNE_WATER_RELEVEL_GAIN", "i", 8),
     ("sim", "waterRelevelDepth", "TUNE_WATER_RELEVEL_DEPTH", "i", 32),
+
+    # DISCOVERY (docs/PLAN_water_relevel.md W-D)
+    ("sim", "waterDiscoverMinEighths", "TUNE_WATER_DISCOVER_MIN_EIGHTHS", "i", 4096),
+    ("sim", "waterAdoptMinArea", "TUNE_WATER_ADOPT_MIN_AREA", "i", 64),
     ("sim", "windMode", "TUNE_WIND_MODE", "i", 1),
 
     # gas particles (docs/PLAN_gas_particles.md)

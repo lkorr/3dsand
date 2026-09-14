@@ -372,6 +372,44 @@ fn wbLedger(@builtin(global_invocation_id) gid : vec3<u32>) {
   wbSet(b, WBS_RDIRTY, 0);
 
   // ==========================================================================
+  // W-D — THE STICKY REFUSAL (docs/PLAN_water_relevel.md §8.4).
+  //
+  // FIRST, ahead of the sweep arming and everything below it, because the whole
+  // point of the state is that a refused probe does no work: four loads and a
+  // return, no footprint pass, no chunk wake, no histogram. Sixteen refused
+  // puddle-probes therefore cost nothing, which is the owner's "puddles can be
+  // ignored easily" implemented literally.
+  //
+  // It is safe to jump the queue. `wbQuiet` writes WBS_RDIRTY only for a body in
+  // WB_CANDIDATE or WB_MEASURING, so a refused body accumulates none; the sweep
+  // block below only acts when `b == T.waterSweepSlot`, and the CPU schedules
+  // sweeps over CURVE-DIRTY parents, which a refused probe is not.
+  //
+  // Leaving the state is the CPU's call and it is on the TICK STREAM: new
+  // evidence in this probe's disc sets WBF_REPROBE for exactly one tick (see
+  // common.wgsl), so the tick a re-measure starts on is a pure function of the
+  // op history and the twice-run gate compares it by construction. Nothing here
+  // reads back a verdict; the CPU never learns this body was refused at all.
+  if (st == WB_REFUSED) {
+    if ((flags & WBF_PROPOSE) == 0 || (flags & WBF_RELEASE) != 0) {
+      // The CPU withdrew or is evicting the probe. A refused body holds no
+      // debit — it never adopted — so there is nothing to pay off and the exit
+      // is the immediate clear rather than WB_RELEASING.
+      for (var w = 0u; w < WATERBODY_STATE_WORDS; w++) { wbSet(b, w, 0); }
+      wbClearHist(b);
+      return;
+    }
+    if ((flags & WBF_REPROBE) != 0) {
+      wbSet(b, WBS_STATE, WB_CANDIDATE);
+      wbSet(b, WBS_QUIET, 0);
+      wbSet(b, WBS_LEVEL, 0);
+      wbSet(b, WBS_RSUM, 0);
+      wbSet(b, WBS_RAREA, 0);
+    }
+    return;
+  }
+
+  // ==========================================================================
   // M5 — ARM THIS TICK'S SWEEP, AND THE CYCLE BOUNDARY (components 2 + 10).
   //
   // The sweep ACCUMULATES — atomicAdd per container cell, atomicOr per open
@@ -480,6 +518,7 @@ fn wbLedger(@builtin(global_invocation_id) gid : vec3<u32>) {
       // (which runs after us) fill them. We read them next tick. One
       // whole-footprint pass per adoption, ever.
       wbSet(b, WBS_RSUM, 0);
+      wbSet(b, WBS_RAREA, 0);             // W-D: the size gate's tally
       wbSet(b, WBS_LEVEL, -0x40000000);   // atomicMax target for the reduce
       wbSet(b, WBS_STATE, WB_MEASURING);
     }
@@ -493,10 +532,41 @@ fn wbLedger(@builtin(global_invocation_id) gid : vec3<u32>) {
     // cache of aggregates over them.
     let vol = wbGet(b, WBS_RSUM);
     let lvl = wbGet(b, WBS_LEVEL);
-    if (rdirty != 0 || vol < max(T.waterMinVolume, 1) || lvl <= floorY) {
+    // W-D: the measured free surface, and the size gate it feeds (§8.4).
+    let rarea = wbGet(b, WBS_RAREA);
+    let discovered = (flags & WBF_DISCOVER) != 0;
+    // A DISTURBED measurement is not a verdict. The footprint was being written
+    // while the reduce ran, so the sum describes no particular instant — retry
+    // from WB_CANDIDATE whoever proposed the body. Only a measurement taken over
+    // a quiet world is allowed to refuse anything.
+    if (rdirty != 0) {
       wbSet(b, WBS_STATE, WB_CANDIDATE);
       wbSet(b, WBS_QUIET, 0);
       wbSet(b, WBS_LEVEL, 0);
+      return;
+    }
+    if (vol < max(T.waterMinVolume, 1) || lvl <= floorY ||
+        (discovered && rarea < max(T.waterAdoptMinArea, 0))) {
+      // AN AUTHORED BASIN GOES BACK TO CANDIDATE, because the container is a
+      // closed form the registry vouches for: the water is coming (a pond
+      // filling from a stream, a lake the player is still pouring into) and the
+      // ladder should keep watching. A DISCOVERED PROBE goes to WB_REFUSED,
+      // because there is no such promise — the CPU drew a disc around some
+      // evidence and the voxels say there is no body there. Sending it back to
+      // CANDIDATE would re-run the ONE whole-footprint pass every
+      // `sim.waterBodyQuietTicks` forever, which is the cost §8.4 exists to
+      // delete.
+      wbSet(b, WBS_STATE, select(WB_CANDIDATE, WB_REFUSED, discovered));
+      wbSet(b, WBS_QUIET, 0);
+      // THE MEASUREMENT SURVIVES A REFUSAL, and only for a discovered probe.
+      // WB_REFUSED is sticky, so whatever a gate or the overlay reads later is
+      // all the evidence there will ever be about WHY — and "refused" with the
+      // three numbers zeroed is the bare count CLAUDE.md rule 6 is about: it
+      // cannot tell "the reduce found nothing at all" (level stays at the
+      // atomicMax identity) from "it found a pool too small" from "it found a
+      // wide film with no volume". An authored basin clears LEVEL as before,
+      // because it returns to WB_CANDIDATE and the next arming overwrites it.
+      if (!discovered) { wbSet(b, WBS_LEVEL, 0); }
       return;
     }
     wbSet(b, WBS_VOLUME, vol);
@@ -506,7 +576,15 @@ fn wbLedger(@builtin(global_invocation_id) gid : vec3<u32>) {
     // what was granted — so an inaccurate seed costs one tick of slightly
     // off-pace descent and can never cost a single eighth. That is plan §3.2's
     // "a schedule, not an authority", in one line.
-    wbSet(b, WBS_AREA, max(seedArea, 1));
+    //
+    // W-D: a DISCOVERED probe seeds the pace from the MEASURED surface instead.
+    // `seedArea` is the area of the cylinder the CPU drew around some evidence
+    // — a bound, not a prediction of anything — and it over-reports a dug pool
+    // by whatever the pad and the bounding circle added. Still only a seed
+    // either way: the very next shave measures the real count and overwrites it.
+    // Exactly `max(seedArea, 1)` for every authored basin, so this line is an
+    // identity everywhere it was before.
+    wbSet(b, WBS_AREA, select(max(seedArea, 1), max(rarea, 1), discovered));
     wbSet(b, WBS_DEBIT, 0);
     wbSet(b, WBS_DRAINED, 0);
     wbSet(b, WBS_SHAVED, 0);
@@ -998,15 +1076,40 @@ fn wbReduce(@builtin(workgroup_id) wg : vec3<u32>,
 
   var sum = 0;
   var top = -0x40000000;
-  for (var ly = 0; ly < i32(CHUNK); ly++) {
-    let y = wc.y * i32(CHUNK) + ly;
-    if (y <= seed.x || y > seed.y) { continue; }   // (floorY, seedLevel]
+  // W-D: the FREE-SURFACE CELL COUNT, discovery's size gate (§8.4). See
+  // WBS_RAREA in common.wgsl for why a measurement is needed here and the CPU's
+  // analytic seed will not do.
+  var surf = 0;
+  // THE WALK GOES DOWNWARD, and that is what makes the surface count free. A
+  // cell is a free surface iff the cell ABOVE it is not ours; descending, the
+  // word we read on the previous step IS that cell. One read per cell, exactly
+  // as before, plus ONE read per column to seed the test at the band's top —
+  // without which a column whose water reaches the top of this chunk would be
+  // judged against nothing and counted as a surface it is not.
+  let yTop = min(wc.y * i32(CHUNK) + i32(CHUNK) - 1, seed.y);
+  let yBot = max(wc.y * i32(CHUNK), seed.x + 1);   // (floorY, seedLevel]
+  var aboveMine = false;
+  if (yTop >= yBot) {
+    aboveMine = i32(voxMat(voxWordAt(vec3<i32>(x, yTop + 1, z)))) == g.w;
+  }
+  for (var y = yTop; y >= yBot; y--) {
     let w = voxWordAt(vec3<i32>(x, y, z));
-    if (i32(voxMat(w)) != g.w) { continue; }
-    sum = sum + i32(((w >> 12u) & 0xFu) + 1u);     // fullness, 1..8 eighths
-    top = max(top, y);
+    let isMine = i32(voxMat(w)) == g.w;
+    if (isMine) {
+      sum = sum + i32(((w >> 12u) & 0xFu) + 1u);   // fullness, 1..8 eighths
+      top = max(top, y);
+      if (!aboveMine) { surf = surf + 1; }
+    }
+    aboveMine = isMine;
   }
   if (sum > 0) { atomicAdd(&waterBodyState[wbBase(b) + WBS_RSUM], sum); }
+  // ADOPTION ONLY, like the level below it and for the same reason: a re-audit
+  // runs over an ADOPTED body and must not touch a word the adoption verdict was
+  // taken from. The ledger zeroes WBS_RAREA when it arms the reduce, so this
+  // always accumulates into a clean tally.
+  if (rState == WB_MEASURING && surf > 0) {
+    atomicAdd(&waterBodyState[wbBase(b) + WBS_RAREA], surf);
+  }
   // THE LEVEL IS AN ADOPTION-ONLY OUTPUT. A re-audit must not touch it: an
   // adopted body's level is the ledger's, moved down by the shave as layers
   // empty, and an atomicMax against a straggler cell left standing above the

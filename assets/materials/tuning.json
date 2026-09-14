@@ -461,6 +461,8 @@
     "waterRelevelMax": 4,
     "waterRelevelGain": 8,
     "waterRelevelDepth": 32,
+    "waterDiscoverMinEighths": 4096,
+    "waterAdoptMinArea": 64,
     "currentMode": 0,
     "currentVortexGamma": 22,
     "currentVortexDecay": 3,

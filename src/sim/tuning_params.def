@@ -746,6 +746,18 @@ TP_I(sim, waterRelevelMax, TUNE_WATER_RELEVEL_MAX, 4)
 TP_I(sim, waterRelevelGain, TUNE_WATER_RELEVEL_GAIN, 8)
 TP_I(sim, waterRelevelDepth, TUNE_WATER_RELEVEL_DEPTH, 32)
 
+// ---- DISCOVERY (docs/PLAN_water_relevel.md W-D) ----
+// A body the PLAYER created gets adopted; puddles stay CA at no cost. Both are
+// integer (rule 1). Neither is read by a kernel as a TUNE_ const:
+// waterDiscoverMinEighths lives entirely on the CPU (it decides whether a probe
+// disc is proposed at all) and waterAdoptMinArea rides TickParams, so a gate can
+// move either with SetCurrentTuning and pay no pipeline rebuild.
+// waterDiscoverMinEighths is the off switch: at 0 no evidence is accumulated, no
+// probe is ever raised, no descriptor carries WBF_DISCOVER and the world is
+// bit-identical to a build without W-D.
+TP_I(sim, waterDiscoverMinEighths, TUNE_WATER_DISCOVER_MIN_EIGHTHS, 4096)
+TP_I(sim, waterAdoptMinArea, TUNE_WATER_ADOPT_MIN_AREA, 64)
+
 // ---- wind COUPLING: how hard the field pushes the sim (research doc §4.5/4.6)
 // The SHAPE of the field is the wind.* group far above; this is what the three
 // sim consumers do with it. Human-unit floats for the sim.fluid* reason and by

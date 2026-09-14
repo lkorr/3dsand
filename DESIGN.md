@@ -9069,6 +9069,124 @@ against a 900-tick window — and correct for a crater. If a measured case ever
 makes it matter the knob is a demand floor in the ledger, not a change to the
 apply.
 
+### 5b.10 W-D: discovery — a body the PLAYER made (added 2026-09-14)
+
+`docs/PLAN_water_relevel.md` §8. §5b.7's third M5 gap — "a basin the player digs
+from NOTHING is still not a basin" — is closed. A pit dug and filled by hand, or
+a pool a drain leaves behind, becomes a real body with a ledger, a level and
+W1's relevel; a puddle stays CA and costs nothing to ignore.
+
+**The constraint that shapes all of it.** The CPU may not look at voxels. The
+mirror is 3×3×3 and a readback on the frame path puts fence retirement in a
+voxel write's control path, which is §5b.4's whole argument. So discovery takes
+the M2 authority split verbatim:
+
+* **The CPU proposes, from the tick stream only.** Every liquid-placing edit
+  rides the MutationQueue, so "how many eighths of which liquid were placed,
+  where" is exact arithmetic on the tick's op list. A replay reproduces it and
+  the twice-run gate compares it by construction.
+* **The GPU disposes.** The existing WB_MEASURING reduce measures the real
+  water; the ledger adopts it or parks it in a new sticky `WB_REFUSED`. The CPU
+  never learns the verdict and does not need to.
+
+**Where the accounting hooks, and why there.** `WaterBodySystem::NoteMutations`,
+called from `SubmitTick` immediately before `WaterBodySystem::Tick` — the one
+function the game frame loop, every gate and both smoke harnesses hand their op
+lists to. The player's brush arrives as `ops`; mobs, debris, prefabs, tree
+felling, the world edit layer, spells and every gate's hand-built list arrive as
+`cells`. There is no other door into the MutationQueue, which is what makes a
+gate's CellOp pour a statement about what a player would do.
+
+**Evidence is a heuristic and is allowed to be wrong in both directions.** It
+over-counts (a `kCellOpIfAir` op the grid then refuses still counts — the CPU
+cannot know without the readback that is banned) and it under-counts (water that
+ran laterally out of every probe disc is missed, a stated v1 limit; that water
+stays CA, which is the old behaviour and not a regression). Neither can cost an
+eighth: evidence decides only whether a DISC IS PROPOSED.
+
+**The shape.** Placed eighths accumulate per coarse XZ cell
+(`kWaterEvidenceGrid` = 32 voxels) per liquid material, capped at
+`kWaterEvidenceCap` with lowest-evidence eviction. A promotion scan — run only on
+ticks where the evidence or the registry moved — flood-fills the grid into
+clusters of one material, bounds each with a circle padded by
+`kWaterDiscoverPad`, and either GROWS the probe already covering it (re-dirtying
+the entry, which is the same latch shape as `curveDirtyUntil_`) or, past
+`sim.waterDiscoverMinEighths`, raises a new one. A probe enters `basins_` as a
+flat-disc cylinder whose curve is a PREDICTION in §5b.4's sense, so an
+inaccurate container costs pace and never mass; the sweep re-derives the real
+`area(y)` if the player keeps digging in it.
+
+**Refusal is a state, not a retry.** A discovered probe whose measurement fails
+the volume floor or the new `sim.waterAdoptMinArea` size gate goes to
+`WB_REFUSED` and stays there: four ledger loads a tick, no footprint pass, no
+chunk wake. Sending it back to WB_CANDIDATE — which is right for an authored
+basin, whose container is a closed form the registry vouches for and whose water
+may still be on its way — would re-run the ONE whole-footprint pass every
+`sim.waterBodyQuietTicks` forever for a puddle. It leaves the state only on
+`WBF_REPROBE`, a ONE-TICK pulse the CPU sends when new evidence lands in the
+disc, so the tick it re-measures on is tick-deterministic too. A latch held over
+several ticks would reset it to candidate on every one of them and it could
+never accumulate the quiet ticks adoption needs.
+
+**The size gate needed a measurement that did not exist.** §8.4 asks the ledger
+to adopt iff the measured surface area clears a floor, and `wbReduce` measured
+only the volume and the level. `WBS_RAREA` (`kWaterBodyStateWords` 41 → 42) is
+that count, filled by the reduce on the single tick a body spends in
+WB_MEASURING. The walk was inverted to run DOWNWARD so the previously read word
+IS the cell above — one read per cell as before, plus one per column. `WBS_AREA`
+at adoption is the CPU's ANALYTIC seed, and for a probe that is the area of a
+cylinder the CPU drew around some evidence: gating adoption on it would be the
+candidate's own guess deciding whether the candidate is real.
+
+**The registry is the one thing here that is SAVED.** Everything else in
+`waterbody.h` is derived — reconstructible from (seed, window, voxels),
+disposable, never saved. A probe disc is the residue of what the player did, so
+it is authored-equivalent truth (guideline #3) and rides the world save as the
+`'WTRB'` entity section: a few ints an entry, no ledger, no level, no curve, no
+verdict. On load the entries are re-proposed and the GPU re-adopts each one by
+re-measuring the restored water, which is the same path it took the first time.
+
+**Rule 2, charged before emission.** `kWaterDiscoveredCap` = 16 probes inside
+`kWaterBodyCap`, and `kWaterDiscoverChunkShare` = a quarter of `kWaterChunkCap`
+across all of them — a probe's analytic cylinder over-predicts, so it sorts
+early in Classify's biggest-first order and would otherwise be entitled to take
+the chunk list out from under the lake beside it. An evicted probe is proposed
+with `WBF_RELEASE` for `kWaterDiscoverReleaseTicks` before being dropped: never
+drop a descriptor cold, or the slot is reused against a ledger still carrying
+the old body's state.
+
+**Two asymmetries a probe gets that an authored basin does not**, both because a
+proposal's safe degradation is to not exist:
+
+* A straddle between two WORLDGEN basins refuses both — neither is more entitled
+  and the CA simulates both correctly. A straddle involving a probe refuses only
+  the probe. Refusing the harness lake because somebody made a puddle on its
+  bank would be a regression bought with a feature.
+* The size gate and the sticky refusal apply only to `WBF_DISCOVER` bodies, so
+  `sim.waterDiscoverMinEighths = 0` is an exact identity: no probe exists, no
+  descriptor carries the flag, and no branch behind it is reachable.
+
+**Gate `waterbody` pass N**, four arms. A 33×33×13 pit dug and filled with
+CellOps 150 voxels west of the harness lake raises one probe, which adopts at
+109,016 eighths against 113,256 poured (−3.7%) over 1,107 measured surface
+cells. A second pit filled to 1,936 eighths — under half the 4,096 threshold —
+raises nothing and puts nothing in the ledger. The `'WTRB'` block round-trips and
+the GPU re-adopts by re-measuring, at exactly the same 109,016 eighths. And pass
+R's crater, bored into the CREATED body, leaves it flat to 2 eighths with 0 page
+faults — W1 reaching a body the player made, which is the owner's actual ask.
+
+**One interaction found and not fixed here.** The crater makes the probe's basin
+curve-dirty, which arms M5's sweep; this pool's disc holds a second open region
+(its water reached 1,107 columns against the 1,089 dug, so it found a way out
+sideways), the sweep names two components, and the child adopts the water while
+the parent keeps component 0. That is M5 working as designed for an ADOPTED
+body — but a body that has to RE-ADOPT from scratch under a live split map can
+end up with the empty component and refuse. A real load does not reproduce it
+(the ledger buffer comes back zeroed with the world, so no stale map survives),
+so pass N runs its round trip before the crater rather than after. Whether M5's
+ladder restart under a live map deserves its own fix is a question for the split
+machinery, not for discovery.
+
 ## 9d. The current field, and surface waves (added 2026-08-29)
 
 `docs/PLAN_water_master.md` components 8 and 9 (milestone M4, "it looks alive").

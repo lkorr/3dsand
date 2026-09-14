@@ -267,6 +267,13 @@ enum : uint32_t {
   // nothing about the window — measured once as "given 0 / taken 0" over
   // ninety ticks in which the relevel had genuinely been working.
   WBS_RVGIVENT_W, WBS_RVTAKENT_W,
+  // W-D (§8.4): the free-surface CELL COUNT the adoption reduce measured, and
+  // the only thing discovery's size gate is allowed to read. Distinct from
+  // WBS_AREA, which at adoption is the CPU's ANALYTIC seed — for a probe disc
+  // that number is the area of a cylinder the CPU drew around some evidence,
+  // and gating adoption on it would be the candidate's own guess deciding
+  // whether the candidate is real.
+  WBS_RAREA_W,
 };
 // M5 — the SWEEP block's word map, which lives past the end of the ledger in
 // the same buffer (world.h's kWaterCurveBase). Must match the SW_* block in
@@ -313,6 +320,9 @@ constexpr int kCraterHalf = 8;    // half-extent, so 17x17
 constexpr int kCraterDepth = 6;   // voxels of floor removed
 enum : int32_t {
   WB_CANDIDATE = 0, WB_MEASURING = 1, WB_ADOPTED = 2, WB_RELEASING = 3,
+  // W-D: the sticky refusal. A discovered probe the GPU measured and did not
+  // believe in — four ledger loads a tick until new evidence arrives.
+  WB_REFUSED = 4,
 };
 
 struct LedgerView {
@@ -353,6 +363,7 @@ const char* LedgerStateName(int32_t st) {
     case WB_MEASURING: return "measuring";
     case WB_ADOPTED: return "adopted";
     case WB_RELEASING: return "releasing";
+    case WB_REFUSED: return "refused";
     default: return "?";
   }
 }
@@ -1588,6 +1599,477 @@ Status GateWaterBody(Ctx& c, std::string& detail) {
     tick = RunQuietTicks(c, tick, 60);
   }
 
+  mark("pass N");
+  // ========================================================== pass N (W-D)
+  //
+  // DISCOVERY. docs/PLAN_water_relevel.md §8.5, and it is the acceptance of the
+  // owner decision that lifted §6's old first exclusion: a body of water the
+  // PLAYER made must become a real body and get W1's relevel, while a puddle
+  // stays CA and costs nothing.
+  //
+  // FOUR ARMS, and each fails differently:
+  //
+  //   1. THE POSITIVE. A pit dug OUTSIDE the harness lake's disc with CellOps
+  //      and filled past `sim.waterDiscoverMinEighths`, also with CellOps. A
+  //      probe must appear in the registry, take a GPU slot, and the ledger must
+  //      read WB_ADOPTED with a measured volume close to what was poured. This
+  //      is the whole feature in one assertion.
+  //   2. W1 ON THE CREATED BODY, which is the owner's ACTUAL ask rather than
+  //      discovery for its own sake. Pass R's crater, bored into the DISCOVERED
+  //      pool, and pass R's spread bound asserted on the surface it leaves.
+  //   3. THE NEGATIVE, and without it arm 1 is a green light about nothing: a
+  //      second pit filled to HALF the threshold must raise NO probe and put
+  //      nothing in the ledger. That is the half of §8 that says puddles cost
+  //      nothing, and it is also the reachability proof `--sweep` cannot give —
+  //      the sweep script places no liquid at all, so every arm of it reports
+  //      one hash whatever this knob is set to (W1 learned the same lesson).
+  //   4. THE ROUND-TRIP. The registry is the one thing in the water system that
+  //      is NOT derivable from (seed, window, voxels), so it is saved with the
+  //      world. Save the block, clear the registry, watch the descriptor go,
+  //      reload, and require the GPU to re-adopt by RE-MEASURING the same water.
+  //
+  // NOT GUARDED ON `ok`, for pass R's reason: this pass rebuilds the world
+  // itself and shares nothing with the passes before it, and pass H1 carries an
+  // inherited conservation failure on this branch — a guarded pass N would ship
+  // never having run once.
+  //
+  // THE FIXTURE IS NOT A DRAIN and the MPM is off, both exactly as pass R has
+  // them. This measures a rule about which columns a body OWNS and then a rule
+  // that moves settled water between them; anything else in the fixture that
+  // moves settled water makes every number a statement about the solver.
+  std::string discoverNote;
+  {
+    const uint32_t nSettle =
+        (uint32_t)std::max(1.0, BaselineNumber("waterbodyDiscoverTicks", 200.0));
+    const int nHalf = (int)BaselineNumber("waterbodyDiscoverPitHalf", 16.0);
+    const int nDepth = (int)BaselineNumber("waterbodyDiscoverPitDepth", 14.0);
+    const int nCraterHalf =
+        (int)BaselineNumber("waterbodyDiscoverCraterHalf", 4.0);
+    const int nCraterDepth =
+        (int)BaselineNumber("waterbodyDiscoverCraterDepth", 4.0);
+    const double nVolTol =
+        BaselineNumber("waterbodyDiscoverVolTolPct", 25.0);
+    const double nSpreadMax = BaselineNumber("waterbodyRelevelSpread", 2.0);
+    const uint32_t nRelevelTicks =
+        (uint32_t)std::max(1.0, BaselineNumber("waterbodyDiscoverRelevelTicks",
+                                               120.0));
+
+    // ---- the world, and the tuning the whole pass runs under -------------
+    WaterBodies().Reset();
+    SubmitWorldgen(c.ctx, world, c.sim, kDefaultSeed);
+    Tuning nt = t;
+    nt.sim.waterBodyTestDrain = 0;
+    nt.sim.drainMaxEighthsPerTick = 0;   // a pit is not a drain
+    nt.sim.fluidExciteMode = 0;          // pass R's discipline, same reason
+    nt.sim.drainExciteRadius = 0;
+    nt.sim.fluidSplashRate = 0.0f;
+    nt.sim.waterRelevelMax = t.sim.waterRelevelMax;
+    SetCurrentTuning(nt);
+    tick = RunQuietTicks(c, tick, 130);
+
+    // ---- WHERE. Outside the lake's disc, inside the window ---------------
+    // Far enough west that the probe's padded disc cannot share a CHUNK with
+    // the lake's footprint — a straddle refuses the newcomer (waterbody.cpp's
+    // Relabel), so a pit on the bank would test the refusal rather than the
+    // feature. Derived from the lake's own geometry rather than written as a
+    // literal, because the harness pool has moved once already and a fixture
+    // that hardcodes a site is the gotcha this repo has a memory note about.
+    const int nx = lakeGeo.cx - lakeGeo.radius - 150;
+    const int nz = lakeGeo.cz;
+    bool nPlaced = true;
+    int gyMin = 1 << 30, gyMax = -(1 << 30);
+    for (int z = nz - nHalf; z <= nz + nHalf && nPlaced; z++) {
+      for (int x = nx - nHalf; x <= nx + nHalf; x++) {
+        const int h = World::TerrainHeight(x, z, kDefaultSeed);
+        gyMin = std::min(gyMin, h);
+        gyMax = std::max(gyMax, h);
+      }
+    }
+    if (!world.ChunkInWindow({(nx - nHalf - 40) >> 4,
+                              (gyMin - nDepth - 8) >> 4,
+                              (nz - nHalf - 40) >> 4}) ||
+        !world.ChunkInWindow({(nx + nHalf + 40) >> 4, (gyMax + 2) >> 4,
+                              (nz + nHalf + 40) >> 4})) {
+      fail(Format("pass N: the pit site (%d,%d) y%d..%d is not resident — the "
+                  "window moved under the fixture",
+                  nx, nz, gyMin - nDepth, gyMax));
+      nPlaced = false;
+    }
+
+    // ---- ARM 1: dig, fill, and require a body -----------------------------
+    // TWO TICKS, not one. The carve writes AIR over cells the fill then writes
+    // WATER into, and two ops aimed at one cell in one tick is a mutation
+    // ordering question this fixture has no business asking.
+    //
+    // The fill stops one voxel BELOW the lowest rim in the footprint, so the
+    // pool is contained by terrain on every column whatever the ground does —
+    // a fixture that filled to the highest rim would be testing a spill.
+    uint32_t nSlot = kNoGpuSlot;
+    uint32_t nProbeBasin = 0;
+    int64_t nPoured = 0;
+    int32_t nState = -1, nVolume = 0, nRArea = 0, nLevel = 0;
+    int32_t nAdoptTick = -1;
+    size_t nRegistry = 0;
+    const int nWaterTop = gyMin - 2;
+    const int nWaterBot = gyMin - nDepth;
+    if (nPlaced) {
+      std::vector<CellOp> carve, fill;
+      for (int y = nWaterBot; y <= gyMax; y++)
+        for (int z = nz - nHalf; z <= nz + nHalf; z++)
+          for (int x = nx - nHalf; x <= nx + nHalf; x++)
+            carve.push_back({World::SlotCellIndex({x, y, z}), 0u});
+      for (int y = nWaterBot; y <= nWaterTop; y++)
+        for (int z = nz - nHalf; z <= nz + nHalf; z++)
+          for (int x = nx - nHalf; x <= nx + nHalf; x++) {
+            fill.push_back({World::SlotCellIndex({x, y, z}),
+                            PackVoxNew(matId, 7u)});
+            nPoured += 8;
+          }
+      if (carve.size() > kMaxCellOpsPerTick ||
+          fill.size() > kMaxCellOpsPerTick) {
+        fail(Format("pass N: the pit needs %llu carve / %llu fill ops, over the "
+                    "%u-op per-tick budget — shrink "
+                    "waterbodyDiscoverPitHalf/Depth",
+                    (unsigned long long)carve.size(),
+                    (unsigned long long)fill.size(), kMaxCellOpsPerTick));
+        nPlaced = false;
+      } else {
+        SubmitTick(c.ctx, c.world, c.sim, tick, kDefaultSeed, {}, {}, carve,
+                   false, c.world.WindowOrigin(), true, false);
+        c.ctx.ProcessEvents();
+        tick++;
+        SubmitTick(c.ctx, c.world, c.sim, tick, kDefaultSeed, {}, {}, fill,
+                   false, c.world.WindowOrigin(), true, false);
+        c.ctx.ProcessEvents();
+        tick++;
+        tick = RunQuietTicks(c, tick, nSettle);
+
+        nRegistry = WaterBodies().Discovered().size();
+        if (nRegistry != 1) {
+          fail(Format(
+              "pass N arm 1: %llu probes in the registry, expected 1, after "
+              "pouring %lld eighths at (%d,%d) against a threshold of %d — the "
+              "evidence never reached the promotion scan, or the site clashed "
+              "with the lake",
+              (unsigned long long)nRegistry, (long long)nPoured, nx, nz,
+              nt.sim.waterDiscoverMinEighths));
+        } else {
+          nProbeBasin = WaterBodies().Discovered()[0].basinId;
+          const WaterBodyDesc* nd = WaterBodies().Find(nProbeBasin);
+          if (!nd || nd->gpuSlot >= kWaterBodyCap) {
+            fail(Format("pass N arm 1: the probe (basin %08x) took no GPU slot "
+                        "— the CPU ladder refused it (%d)",
+                        nProbeBasin, nd ? (int)nd->refusal : -1));
+          } else {
+            nSlot = nd->gpuSlot;
+            const LedgerView lv = ReadLedger(c);
+            nState = lv.At(nSlot, WBS_STATE);
+            nVolume = lv.At(nSlot, WBS_VOLUME);
+            nRArea = lv.At(nSlot, WBS_RAREA_W);
+            nLevel = lv.At(nSlot, WBS_LEVEL);
+            nAdoptTick = lv.At(nSlot, WBS_ADOPTTICK);
+            if (nState != WB_ADOPTED) {
+              fail(Format(
+                  "pass N arm 1: the created body is %s, not adopted, %u ticks "
+                  "after %lld eighths were poured into it (measured volume %d, "
+                  "measured surface %d cells against a floor of %d, level %d)",
+                  LedgerStateName(nState), nSettle, (long long)nPoured, nVolume,
+                  nRArea, nt.sim.waterAdoptMinArea, nLevel));
+            } else {
+              // WITHIN TOLERANCE, not exact, and the tolerance is the honest
+              // part: the CA settles the pour, the top layer levels out and the
+              // evaporation rule acts on a freshly exposed 33x33 surface. What
+              // would be a BUG is a body measuring a different pool — half the
+              // water, or the lake next door.
+              const double err =
+                  nPoured == 0 ? 100.0
+                               : 100.0 * ((double)nVolume - (double)nPoured) /
+                                     (double)nPoured;
+              if (std::abs(err) > nVolTol)
+                fail(Format("pass N arm 1: the created body measures %d eighths "
+                            "against %lld poured (%+.2f%%, tolerance %.2f%%) — "
+                            "the probe disc is not over the water that was made",
+                            nVolume, (long long)nPoured, err, nVolTol));
+            }
+          }
+        }
+      }
+    }
+
+    // ---- ARM 3: the negative. Half the threshold raises nothing ----------
+    // The pit is real and the water is real; only the QUANTITY is below the
+    // bar. That is the distinction the feature is supposed to make, and the
+    // alternative arm — pouring nothing — would pass against a build where
+    // discovery had been deleted.
+    size_t nRegistry2 = nRegistry;
+    int64_t nPoured2 = 0;
+    bool nGhost = false;
+    if (nPlaced) {
+      // A pit of `half` giving just under half the threshold in eighths, so the
+      // count is derived from the knob rather than hoped to be under it.
+      const int64_t wantVox = std::max<int64_t>(
+          1, (int64_t)nt.sim.waterDiscoverMinEighths / 16);   // half, /8 per vox
+      int side = 1;
+      while ((int64_t)(side + 1) * (side + 1) * 2 <= wantVox) side++;
+      const int px = nx, pz2 = nz - nHalf - 120;
+      int pgy = 1 << 30;
+      for (int z = pz2; z < pz2 + side; z++)
+        for (int x = px; x < px + side; x++)
+          pgy = std::min(pgy, World::TerrainHeight(x, z, kDefaultSeed));
+      if (world.ChunkInWindow({(px - 8) >> 4, (pgy - 8) >> 4, (pz2 - 8) >> 4}) &&
+          world.ChunkInWindow({(px + side + 8) >> 4, (pgy + 2) >> 4,
+                               (pz2 + side + 8) >> 4})) {
+        std::vector<CellOp> carve2, fill2;
+        for (int y = pgy - 3; y <= pgy; y++)
+          for (int z = pz2; z < pz2 + side; z++)
+            for (int x = px; x < px + side; x++)
+              carve2.push_back({World::SlotCellIndex({x, y, z}), 0u});
+        for (int y = pgy - 3; y <= pgy - 2; y++)
+          for (int z = pz2; z < pz2 + side; z++)
+            for (int x = px; x < px + side; x++) {
+              fill2.push_back({World::SlotCellIndex({x, y, z}),
+                               PackVoxNew(matId, 7u)});
+              nPoured2 += 8;
+            }
+        SubmitTick(c.ctx, c.world, c.sim, tick, kDefaultSeed, {}, {}, carve2,
+                   false, c.world.WindowOrigin(), true, false);
+        c.ctx.ProcessEvents();
+        tick++;
+        SubmitTick(c.ctx, c.world, c.sim, tick, kDefaultSeed, {}, {}, fill2,
+                   false, c.world.WindowOrigin(), true, false);
+        c.ctx.ProcessEvents();
+        tick++;
+        tick = RunQuietTicks(c, tick, 60);
+        nRegistry2 = WaterBodies().Discovered().size();
+        if (nPoured2 >= nt.sim.waterDiscoverMinEighths) {
+          fail(Format("pass N arm 3 proves nothing: the 'half' pit poured %lld "
+                      "eighths against a threshold of %d — it is over the bar",
+                      (long long)nPoured2, nt.sim.waterDiscoverMinEighths));
+        } else if (nRegistry2 != nRegistry) {
+          fail(Format(
+              "pass N arm 3: %llu probes in the registry after a puddle of %lld "
+              "eighths (threshold %d), was %llu — a puddle raised a body",
+              (unsigned long long)nRegistry2, (long long)nPoured2,
+              nt.sim.waterDiscoverMinEighths,
+              (unsigned long long)nRegistry));
+        }
+        // AND NO LEDGER SLOT WENT LIVE. The registry count alone would miss a
+        // probe that was raised and then dropped inside the window; every slot
+        // past the ones we know about must be untouched.
+        const LedgerView lv2 = ReadLedger(c);
+        for (uint32_t s = 0; s < kWaterBodyCap; s++) {
+          if (s == nSlot) continue;
+          const int32_t st2 = lv2.At(s, WBS_STATE);
+          const WaterBodyDesc* own = nullptr;
+          for (const WaterBodyDesc& bd : WaterBodies().Bodies())
+            if (bd.gpuSlot == s) own = &bd;
+          // CHILDREN TOO. `Bodies()` is parallel to `basins_` and the M5 split
+          // children are deliberately kept out of it (waterbody.h says why), so
+          // a check that walked only `Bodies()` calls every split child a ghost
+          // — and a body someone has dug a crater into always has one. Measured
+          // as a false accusation on the first run of this pass.
+          for (const WaterBodyDesc& bd : WaterBodies().Children())
+            if (bd.gpuSlot == s) own = &bd;
+          if (st2 != WB_CANDIDATE && own == nullptr) {
+            nGhost = true;
+            fail(Format("pass N arm 3: ledger slot %u is %s with no descriptor "
+                        "behind it — a puddle took a slot",
+                        s, LedgerStateName(st2)));
+            break;
+          }
+        }
+      }
+    }
+
+    // ---- ARM 4: the save/reload round-trip --------------------------------
+    int32_t nStateAfter = -1;
+    int32_t nVolAfter = 0;
+    size_t nRegistry3 = 0;
+    bool nCleared = false;
+    if (nSlot < kWaterBodyCap && nState == WB_ADOPTED) {
+      std::vector<uint8_t> blob;
+      WaterBodies().SaveState(blob);
+      const size_t want = WaterBodies().Discovered().size();
+      WaterBodies().ClearDiscovered();
+      // Four ticks so the CPU withdraws the descriptor and the ledger clears
+      // the slot it held (wbLedger's `(flags & WBF_PROPOSE) == 0` branch).
+      tick = RunQuietTicks(c, tick, 4);
+      nCleared = WaterBodies().Discovered().empty();
+      if (!nCleared)
+        fail("pass N arm 4: ClearDiscovered left entries behind, so the reload "
+             "would be testing nothing");
+      if (!WaterBodies().LoadState(blob.data(), blob.size(),
+                                   WaterBodySystem::kSaveVersion)) {
+        fail("pass N arm 4: the 'WTRB' block did not load back");
+      } else {
+        // LONG ENOUGH TO RE-ADOPT BY MEASURING, which is the point: nothing
+        // about the body's state was saved, so the GPU has to run the whole
+        // Candidate -> Measuring -> Adopted ladder again over the restored
+        // water. A round trip that restored a LEDGER would pass this in one
+        // tick and would be the carried-descriptor bug.
+        tick = RunQuietTicks(c, tick, 90);
+        nRegistry3 = WaterBodies().Discovered().size();
+        const WaterBodyDesc* rd2 =
+            nRegistry3 > 0
+                ? WaterBodies().Find(WaterBodies().Discovered()[0].basinId)
+                : nullptr;
+        if (nRegistry3 != want || !rd2 || rd2->gpuSlot >= kWaterBodyCap) {
+          fail(Format("pass N arm 4: %llu probes restored (wanted %llu), slot "
+                      "%u",
+                      (unsigned long long)nRegistry3,
+                      (unsigned long long)want,
+                      rd2 ? rd2->gpuSlot : kNoGpuSlot));
+        } else {
+          const LedgerView lv3 = ReadLedger(c);
+          nStateAfter = lv3.At(rd2->gpuSlot, WBS_STATE);
+          nVolAfter = lv3.At(rd2->gpuSlot, WBS_VOLUME);
+          // ATTRIBUTION, NOT A COUNT (CLAUDE.md rule 6). "Not adopted" is four
+          // different bugs — the reduce found nothing, it found a pool under
+          // the volume floor, it found a film under the area floor, or a live
+          // SPLIT MAP handed this component to somebody else — and only these
+          // numbers tell them apart. The refusal path deliberately keeps
+          // RSUM/RAREA/LEVEL for exactly this read.
+          if (nStateAfter != WB_ADOPTED)
+            fail(Format(
+                "pass N arm 4: the restored probe is %s, not adopted — the "
+                "registry round-tripped but the GPU did not re-measure the "
+                "water behind it. slot %u: reduce sum %d (volume floor %d), "
+                "measured surface %d cells (floor %d), level %d (basin floor "
+                "%d, seed %d), quiet %d, %llu listed chunks | sweep: %d "
+                "components mapped at y=%d, spill %d, split %d",
+                LedgerStateName(nStateAfter), rd2->gpuSlot,
+                lv3.At(rd2->gpuSlot, WBS_RSUM), nt.sim.waterBodyMinVolume,
+                lv3.At(rd2->gpuSlot, WBS_RAREA_W), nt.sim.waterAdoptMinArea,
+                lv3.At(rd2->gpuSlot, WBS_LEVEL),
+                WaterBodies().Basin(rd2->basinId)
+                    ? WaterBodies().Basin(rd2->basinId)->floorY
+                    : 0,
+                WaterBodies().Basin(rd2->basinId)
+                    ? WaterBodies().Basin(rd2->basinId)->surfY
+                    : 0,
+                lv3.At(rd2->gpuSlot, WBS_QUIET),
+                (unsigned long long)rd2->chunks.size(),
+                lv3.Sw(rd2->gpuSlot, SW_COMPS), lv3.Sw(rd2->gpuSlot, SW_MAPY),
+                lv3.Sw(rd2->gpuSlot, SW_SPILLY),
+                lv3.Sw(rd2->gpuSlot, SW_SPLITY)));
+        }
+      }
+    }
+
+    // ---- ARM 2: pass R's crater, in the DISCOVERED body ------------------
+    //
+    // LAST, not second as §8.5 lists it, and the reordering is a finding rather
+    // than a convenience. Boring the crater lands a mutation in a chunk the
+    // probe LABELLED, which sets the basin's curve-dirty latch for 900 ticks —
+    // and a curve-dirty basin is what arms M5's sweep. The sweep then publishes
+    // a split map at the body's live level, this pool's disc holds a second
+    // open region (the pit's water reached 1,107 columns against the 1,089 that
+    // were dug, so it found a way out sideways), and the parent is handed
+    // component 0 while the child adopts the water.
+    //
+    // That is M5 behaving as designed for an ADOPTED body, and it made arm 4 —
+    // run in between — report a refusal with `reduce sum 0, 2 components mapped
+    // at y=198`. But arm 4 is a statement about the REGISTRY round-tripping,
+    // and a real load does not reproduce that situation at all: LoadWorld
+    // restores the grid and the ledger buffer comes back zeroed, so no stale
+    // split map survives for a re-adopting body to lose to. Running the round
+    // trip on a body nobody has dug into tests what §8.5 asks; running it after
+    // the crater tested M5's split under a ladder restart, which is a real
+    // question and not this package's.
+    int64_t nSpread = -1;
+    uint32_t nPf = 0;
+    if (nSlot < kWaterBodyCap && nState == WB_ADOPTED) {
+      const WaterBasin* pb = WaterBodies().Basin(nProbeBasin);
+      const WaterBodyDesc* pd = WaterBodies().Find(nProbeBasin);
+      if (!pb || !pd) {
+        fail("pass N arm 2: the probe left the registry between the arms");
+      } else {
+        const WaterBasin pbCopy = *pb;
+        const WaterBodyDesc pdCopy = *pd;
+        uint32_t pf0[4] = {0, 0, 0, 0};
+        ReadPageFaultsSync(c.ctx, world, pf0);
+        std::vector<CellOp> crater;
+        for (int y = nWaterBot - nCraterDepth; y < nWaterBot; y++)
+          for (int z = nz - nCraterHalf; z <= nz + nCraterHalf; z++)
+            for (int x = nx - nCraterHalf; x <= nx + nCraterHalf; x++)
+              crater.push_back({World::SlotCellIndex({x, y, z}), 0u});
+        SubmitTick(c.ctx, c.world, c.sim, tick, kDefaultSeed, {}, {}, crater,
+                   false, c.world.WindowOrigin(), true, false);
+        c.ctx.ProcessEvents();
+        tick++;
+        tick = RunQuietTicks(c, tick, nRelevelTicks);
+        const VoxelTruth nv = SweepBasin(c, pbCopy, pdCopy, matId,
+                                         nWaterBot - nCraterDepth, gyMax);
+        uint32_t pf1[4] = {0, 0, 0, 0};
+        ReadPageFaultsSync(c.ctx, world, pf1);
+        nPf = pf1[0] - pf0[0];
+        if (!nv.read || nv.topCells == 0) {
+          fail("pass N arm 2: the sweep found no free surface in the created "
+               "body after the crater");
+        } else {
+          nSpread = (int64_t)nv.topMaxE - (int64_t)nv.topMinE;
+          if ((double)nSpread > nSpreadMax)
+            fail(Format(
+                "pass N arm 2: the CREATED body's surface is still %lld eighths "
+                "from flat %u ticks after a %dx%dx%d crater, over pass R's "
+                "budget of %.0f — W1 does not reach a discovered body, which is "
+                "the owner's actual ask",
+                (long long)nSpread, nRelevelTicks, nCraterHalf * 2 + 1,
+                nCraterHalf * 2 + 1, nCraterDepth, nSpreadMax));
+        }
+        if (nPf != 0)
+          fail(Format("pass N arm 2: %u page faults (lost word 0x%08x) — a "
+                      "relevel wrote into a sentinel chunk, so a DISCOVERED "
+                      "body's footprint is not being declared to the page table",
+                      nPf, pf1[2]));
+      }
+    }
+
+    RecordObserved("waterbodyDiscoverProbes", (double)nRegistry);
+    RecordObserved("waterbodyDiscoverVolume", (double)nVolume);
+    RecordObserved("waterbodyDiscoverPoured", (double)nPoured);
+    RecordObserved("waterbodyDiscoverArea", (double)nRArea);
+    RecordObserved("waterbodyDiscoverAdoptTick", (double)nAdoptTick);
+    RecordObserved("waterbodyDiscoverSpread", (double)nSpread);
+    // ONE LINE, and it names every term §8.5 asks for plus the ones a failure
+    // needs to tell itself apart (CLAUDE.md rule 6): "no body appeared" is a
+    // different bug from "a body appeared and measured the wrong pool" and from
+    // "a body appeared and the relevel did not reach it".
+    int nRefused = 0;
+    {
+      const LedgerView lvF = ReadLedger(c);
+      for (uint32_t s = 0; s < kWaterBodyCap; s++)
+        if (lvF.At(s, WBS_STATE) == WB_REFUSED) nRefused++;
+    }
+    discoverNote = Format(
+        "DISCOVERY(pit %dx%dx%d at %d,%d y%d..%d) bodies %llu / adopted-tick %d "
+        "/ refused %d | poured %lld -> measured %d eighths, surface %d cells "
+        "(floor %d), level %d, state %s, slot %u | crater %dx%dx%d spread %lld "
+        "eighths (budget %.0f), %u page faults | NEGATIVE arm: %lld eighths "
+        "(half of %d) left %llu probes%s | ROUND TRIP: cleared %s, %llu "
+        "restored, %s, volume %d -> %d | %u evictions, %llu evidence cells",
+        nHalf * 2 + 1, nHalf * 2 + 1, nDepth - 1, nx, nz, nWaterBot, nWaterTop,
+        (unsigned long long)nRegistry, nAdoptTick, nRefused, (long long)nPoured,
+        nVolume, nRArea, nt.sim.waterAdoptMinArea, nLevel,
+        LedgerStateName(nState), nSlot, nCraterHalf * 2 + 1,
+        nCraterHalf * 2 + 1, nCraterDepth, (long long)nSpread, nSpreadMax, nPf,
+        (long long)nPoured2, nt.sim.waterDiscoverMinEighths,
+        (unsigned long long)nRegistry2, nGhost ? " + a ghost slot" : "",
+        nCleared ? "yes" : "no", (unsigned long long)nRegistry3,
+        LedgerStateName(nStateAfter), nVolume, nVolAfter,
+        WaterBodies().DiscoverEvictions(),
+        (unsigned long long)WaterBodies().Evidence().size());
+
+    // Leave the world and the registry pristine for the passes that hash it.
+    // The probe MUST go: pass D compares a mode-0 script against a mode-1 one
+    // and a surviving discovered body would make the mode-1 arm describe a
+    // different world.
+    SetCurrentTuning(t);
+    WaterBodies().Reset();
+    SubmitWorldgen(c.ctx, world, c.sim, kDefaultSeed);
+    tick = RunQuietTicks(c, tick, 60);
+  }
+
   mark("pass B");
   // ========================================================== pass B (M5)
   //
@@ -2032,6 +2514,7 @@ Status GateWaterBody(Ctx& c, std::string& detail) {
   detail += Format(" (mode 0 again %08x)", hashOff2);
   detail += " | " + holeNote;
   detail += " | " + relevelNote;
+  detail += " | " + discoverNote;
   detail += " | " + splitNote;
   detail += Format(
       " | DETERMINISM mid-drain %08x/%08x, end %08x/%08x",

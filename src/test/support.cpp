@@ -672,6 +672,26 @@ void SubmitTick(GpuContext& ctx, World& world, Simulation& sim, uint32_t tick,
     spanHead.Close();
     {
       sandvox::PerfSpan spanWb(PerfScope::WaterBody);
+      // ---- W-D: EVIDENCE, BEFORE THE TICK (PLAN_water_relevel.md §8.2) ----
+      //
+      // THE CHOKEPOINT, and it is the reason this call is here and not in the
+      // brush or in a gate. Everything that places a voxel in this engine
+      // arrives at SubmitTick as one of these two lists: the player's brush (and
+      // the spell streams that share it) as `ops`, and every system that writes
+      // exact cells — mobs, debris, prefabs, tree felling, the world edit layer
+      // — plus every gate's hand-built op list as `cells`. There is no other
+      // door into the MutationQueue, so accounting here sees the player and the
+      // harness by the same path, which is what makes gate pass N's positive arm
+      // a statement about the thing a player would do.
+      //
+      // BEFORE wb.Tick, so a threshold crossed by THIS tick's ops raises its
+      // probe on THIS tick rather than one later — the promotion scan runs
+      // inside Tick and reads what this deposited. Nothing it reads is anything
+      // but the op lists and the tick number: no snapshot, no readback, no
+      // clock. Both knobs at their off values make it an immediate return.
+      wb.NoteMutations(world, tick, wt.sim.waterBodyMode,
+                       wt.sim.waterDiscoverMinEighths, cells.data(), cellCount,
+                       ops.data(), (uint32_t)ops.size());
       wb.Tick(world, seed, tick, wt.sim.waterBodyMode, wt.sim.waterBodyTestDrain,
               wt.sim.drainMaxEighthsPerTick, wt.sim.waterRelevelMax,
               worldEdited, editCell);
@@ -684,6 +704,10 @@ void SubmitTick(GpuContext& ctx, World& world, Simulation& sim, uint32_t tick,
     tp.waterTestDrain = wt.sim.waterBodyTestDrain;
     tp.waterQuietTicks = wt.sim.waterBodyQuietTicks;
     tp.waterMinVolume = wt.sim.waterBodyMinVolume;
+    // W-D: discovery's size gate. Read by the ledger's adoption branch and ONLY
+    // for a body carrying WBF_DISCOVER, so with no probe in the registry this
+    // word reaches no branch at all.
+    tp.waterAdoptMinArea = wt.sim.waterAdoptMinArea;
     // M5: the scheduled container re-derive (components 2 case 2 + 10). Both
     // fields are pure functions of the tick — see WaterBodySystem::BuildGpu —
     // and `kWaterBodyCap` here means "nothing sweeps", which is the state of

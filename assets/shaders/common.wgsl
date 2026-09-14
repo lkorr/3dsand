@@ -689,7 +689,10 @@ struct TickParams {
   // (WaterBodyGpu::writesThisTick), because relevel WRITES voxels — see the
   // note on waterRelevelMax in world.h.
   waterRelevelMax : i32,
-  padWb3 : u32,            // see the alignment arithmetic in world.h
+  // W-D: the size gate. Measured free-surface CELLS below which the ledger
+  // refuses a DISCOVERED probe (WBF_DISCOVER) and parks it in WB_REFUSED.
+  // Never applied to an authored basin — see world.h.
+  waterAdoptMinArea : i32,
   padWb4 : u32,
   // WATERBODY_CAP bodies x 2 rows. The literal 128 is deliberate, exactly like
   // windPrims' 96: this file and world.h are compared on TOTAL SIZE by
@@ -886,6 +889,23 @@ const WBS_RVBASE    : u32 = 38u;
 // apply refused". CLAUDE.md rule 6 — record at the point of the fact.
 const WBS_RVGIVENT  : u32 = 39u;
 const WBS_RVTAKENT  : u32 = 40u;
+// ============================================================================
+// W-D — THE MEASURED SURFACE AREA (docs/PLAN_water_relevel.md §8.4).
+//
+// Filled by `wbReduce` on the single tick a body spends in WB_MEASURING: the
+// number of FREE-SURFACE cells of the body's own material it found (a cell of
+// ours with something that is not ours directly above). Read once, by the
+// ledger's adoption branch, as discovery's size gate.
+//
+// It is a MEASUREMENT and WBS_AREA is not, which is the whole reason it exists
+// as its own word. WBS_AREA at adoption is `seedArea` — the CPU's ANALYTIC
+// prediction — and for a discovered probe that number is the area of a
+// fabricated cylinder the CPU drew around some evidence. Gating adoption on it
+// would be the candidate's own guess deciding whether the candidate is real.
+// The reduce already visits every cell of the footprint; counting free surfaces
+// on the way costs one extra read per COLUMN (the walk goes downward, so the
+// previously read word IS the cell above) and nothing per cell.
+const WBS_RAREA     : u32 = 41u;
 // "Nothing on this side." Deliberately outside any legal eighth height, and on
 // the side that makes the apply's comparison false for every column: no take
 // below a cutoff of -0x40000000, no give above a cutoff of +0x40000000.
@@ -907,6 +927,15 @@ const WB_CANDIDATE : i32 = 0;
 const WB_MEASURING : i32 = 1;
 const WB_ADOPTED   : i32 = 2;
 const WB_RELEASING : i32 = 3;
+// W-D: THE STICKY REFUSAL (§8.4). A discovered probe the GPU measured and did
+// not believe in. It is a STATE rather than a return to WB_CANDIDATE, and the
+// difference is the whole idle-cost argument: a candidate counts quiet ticks,
+// re-arms the reduce and runs ONE WHOLE-FOOTPRINT PASS over its disc every
+// `sim.waterBodyQuietTicks`, forever, for a puddle. A refused body reads three
+// words and returns. It leaves this state only when the CPU marks the entry
+// dirty with NEW EVIDENCE (WBF_REPROBE) — which is on the tick input stream, so
+// the tick it re-measures on is deterministic too.
+const WB_REFUSED   : i32 = 4;
 
 // CPU-sent per-body flags (TickParams.waterBodies row 1, word 3).
 const WBF_PROPOSE : i32 = 1;   // the CPU's deterministic tests all passed
@@ -932,6 +961,20 @@ const WBF_CHILD : i32 = 16;
 // tell that apart from a leak.
 const WBF_PARENT_SHIFT : u32 = 8u;
 const WBF_PARENT_MASK  : i32 = 255;
+// W-D: this body is a DISCOVERED PROBE, not an authored basin. Two things hang
+// off it and nothing else does: the size gate (§8.4) applies, and a failed
+// measurement parks the body in WB_REFUSED instead of returning it to
+// WB_CANDIDATE. Zero for every body M1-W1 ever proposed, which is what makes
+// `sim.waterDiscoverMinEighths = 0` an exact identity — no discovered entry
+// exists, so no descriptor carries this bit and no branch below it is reachable.
+const WBF_DISCOVER : i32 = 32;
+// W-D: NEW EVIDENCE LANDED IN THIS PROBE THIS TICK. Sent on exactly ONE tick —
+// the tick the CPU's evidence accounting grew or re-dirtied the entry — and it
+// is what lifts WB_REFUSED. A latch held for several ticks would return the
+// body to WB_CANDIDATE on every one of them and it could never accumulate the
+// quiet ticks adoption needs, so the one-tick pulse is load-bearing rather than
+// tidy.
+const WBF_REPROBE : i32 = 64;
 // "No split found." atomicMax's identity, and deliberately far below any legal
 // world Y so the first disconnected level found always wins.
 const WB_SPLIT_NONE : i32 = -0x40000000;
