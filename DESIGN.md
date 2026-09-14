@@ -3350,6 +3350,18 @@ one: the same fixture now measures 0.000 voxels and 0.06°.
   - The strap is **saved** (`DBRS` version 3: host index + rigid offset). A
     section that did not carry it reloaded an armoured corpse as a pile of free
     bodies sharing the same space, which is the same motor by the other route.
+- **A shell that leaves ON ITS OWN stops being a follower** — knocked off, or
+  its piece shed — and is ordinary debris from the end of its sever hold. A
+  shell whose HOST leaves is a different case and follows it (above).
+- **What it costs:** a kinematic body has no mass in the solver, so an armoured
+  ragdoll tumbles with flesh inertia rather than with 489 kg of iron. Weight
+  still tells where it is authored to (`BodyMassKg` sums the shells, so a blast
+  launches a plated body far slower). Folding each shell's mass into its host's
+  mass properties is a separate change with its own gate.
+- **`SANDVOX_NO_RIGWELD=1`** is the A/B arm in one binary — jointed dynamic
+  shells and the per-body anti-tunnel clamp — for the same reason
+  `SANDVOX_NO_ANTITUNNEL` and `SANDVOX_NO_RUNAWAY_NET` exist. `ragdoll-dress`
+  reports both regimes' numbers side by side in `tests/baseline.json`.
 
 ### Carving living bodies (2026-08-20; `game/mob.cpp`, `MobSystem::CarveLimb*`)
 
