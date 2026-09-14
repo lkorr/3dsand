@@ -280,6 +280,36 @@ PASS(waterReduce, "waterBody", PT_TICK, PIPE_WATER_REDUCE, K_COMPUTE, D_WATERCHU
 PASS(waterShave, "waterBody", PT_TICK, PIPE_WATER_SHAVE, K_COMPUTE, D_WATERCHUNKS,1,1, GRP_SIM, DYN_ZERO, C_WATERBODY, 1,
      USES(U(TickUBO) RW(Voxels) A(DirtyOut) R(PageTable) A(PageFaults)
           A(WaterBodyState)))
+// ---- W1: RELEVEL (docs/PLAN_water_relevel.md §3.1) ----------------------
+// AFTER THE SHAVE, and that is the whole reason these two rows are here and
+// not next to the ledger. The shave owns the band [level-1, level] on any tick
+// it has an instruction; the relevel skips a column whose surface is in that
+// band while WBS_STEPS|WBS_FRAC is nonzero, so a draining body's two writers
+// can never reach the same cell in one tick. Reorder these and that argument
+// is gone with no compile error and no gate failure until a lake is both
+// draining and disturbed.
+//
+// The apply is the SECOND voxel writer in this subsystem, so it carries the
+// shave's exact write set — RW(Voxels), A(DirtyOut), R(PageTable),
+// A(PageFaults) — and for the shave's reason: voxStore is the one write seam
+// and the probe that names a dropped word and the chunk that refused it.
+// R(FluidBlockMap) is not incidental either: a chunk the MPM has a block in is
+// the solver's, and its cells are mid-transfer rather than a free surface.
+PASS(waterRelevel, "waterBody", PT_TICK, PIPE_WATER_RELEVEL, K_COMPUTE, D_WATERCHUNKS,1,1, GRP_SIM, DYN_ZERO, C_WATERBODY, 1,
+     USES(U(TickUBO) RW(Voxels) A(DirtyOut) R(PageTable) A(PageFaults)
+          R(FluidBlockMap) A(WaterBodyState)))
+// THE MEASURE, and it runs after EVERY writer in the block on purpose: the
+// surface it reports is the one this tick actually settled on, and the ledger
+// consumes it NEXT tick (plan §3.3 — never read a tally in the pass that
+// writes it). It stores no voxel, so it declares no DirtyOut and no PageFaults
+// and R(Voxels) rather than RW.
+// read-only in practice: `voxels` is read_write for the module because wbShave
+// and wbRelevel write it; wbSurface only asks what material a cell holds and
+// how full it is. Declaring it a read is what keeps the CA loop from taking 54
+// extra WAW barriers for a pass that writes nothing.
+PASS(waterSurface, "waterBody", PT_TICK, PIPE_WATER_SURFACE, K_COMPUTE, D_WATERCHUNKS,1,1, GRP_SIM, DYN_ZERO, C_WATERBODY, 1,
+     USES(U(TickUBO) R(Voxels) R(PageTable) R(FluidBlockMap)
+          A(WaterBodyState)))
 // ---- M3: HOLE DETECTION (component 6's trigger) -------------------------
 // LAST, and after the shave on purpose: it reports into the *N half of the
 // hole record and the ledger promotes that NEXT tick (plan §3.3 — never read a

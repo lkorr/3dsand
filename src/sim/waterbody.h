@@ -436,7 +436,7 @@ class WaterBodySystem {
   // 8's drain seeder reads — see WaterBodyHole above. Defaulted so a caller
   // that has no cell to offer still compiles into the M3 behaviour exactly.
   void Tick(const World& world, uint32_t seed, uint32_t tick, int mode,
-            int testDrain, int drainMax, bool worldEdited,
+            int testDrain, int drainMax, int relevelMax, bool worldEdited,
             IVec3 editCell = IVec3{0, 0, 0});
 
   // The live hole hint for a basin, or an invalid record. Expires with the same
@@ -493,7 +493,7 @@ class WaterBodySystem {
  private:
   void Relabel(const World& world);
   void Classify(const World& world, uint32_t tick);
-  void BuildGpu(uint32_t tick, int testDrain, int drainMax);
+  void BuildGpu(uint32_t tick, int testDrain, int drainMax, int relevelMax);
 
   std::vector<WaterBasin> basins_;
   std::vector<WaterBasinCurve> curves_;   // parallel to basins_

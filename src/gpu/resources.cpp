@@ -230,6 +230,15 @@ std::string ShaderConstantPrelude() {
   o << "const WATER_CURVE_WORDS : u32 = " << kWaterCurveWords << "u;\n";
   o << "const WATER_CURVE_BASE : u32 = " << kWaterCurveBase << "u;\n";
   o << "const WATER_SCRATCH_BASE : u32 = " << kWaterSweepScratchBase << "u;\n";
+  // W1: the relevel histogram, past the sweep scratch in the same buffer
+  // (docs/PLAN_water_relevel.md §3.2). WATER_RELEVEL_HIST_BASE is arithmetic
+  // over four other caps, which is exactly why it is generated and never
+  // restated in WGSL.
+  o << "const WATER_RELEVEL_DEPTH_MAX : i32 = " << kWaterRelevelDepthMax
+    << ";\n";
+  o << "const WATER_RELEVEL_BUCKETS : u32 = " << kWaterRelevelBuckets << "u;\n";
+  o << "const WATER_RELEVEL_HIST_BASE : u32 = " << kWaterRelevelHistBase
+    << "u;\n";
   // Far-field cascades (render-only LOD, DESIGN.md §9). The far field lives on
   // its own kFarN^3 grid, decoupled from the window; level k (1-based) cells
   // span 2^(k + FAR_SHIFT_BASE) fine voxels (see world.h).

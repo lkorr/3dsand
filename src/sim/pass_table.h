@@ -220,6 +220,9 @@ enum class Pipe : uint8_t {
   WaterQuiet, WaterLedger, WaterReduce, WaterShave, WaterDrain, WaterHole,
   // M5: the scheduled container sweep and its split labelling.
   WaterSweep, WaterSplit,
+  // W1: the relevel apply and the free-surface measure that feeds next tick's
+  // ledger (docs/PLAN_water_relevel.md §3.1).
+  WaterRelevel, WaterSurface,
   // The far-fill sieve and the edit-patch half it was split into
   // (docs/PLAN_shader_compile.md package C item 1: worldgen.wgsl `far` and
   // `farpatch`). Two pipelines, two rows on PT_FARFILL, recorded back to back

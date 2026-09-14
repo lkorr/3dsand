@@ -73,7 +73,8 @@ struct TableCtx {
 // place in the flow (record time) it always has.
 struct TableBindings {
   Buffer buffers[(int)pass::Buf::kCount];
-  ComputePipeline pipelines[64];  // indexed by (int)pass::Pipe
+  ComputePipeline pipelines[96];  // indexed by (int)pass::Pipe (see the
+                                  // static_assert in gpu/vk_record.cpp)
   PipelineLayout simLayout;       // GRP_SIM (simPL_)
   PipelineLayout slimPartLayout;  // GRP_SLIM_PART (simPL2_)
   PipelineLayout slimFarLayout;   // GRP_SLIM_FAR (farPL_)

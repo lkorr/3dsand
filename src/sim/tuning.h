@@ -1688,6 +1688,34 @@ struct Tuning {
     float drainCd = 0.6f;        // orifice discharge coefficient
     float drainGravity = 900.0f; // vox/s^2; should match sim.fluidGravity
 
+    // ---- RELEVEL (docs/PLAN_water_relevel.md W1) --------------------------
+    //
+    // Why this exists at all, in one line: the CA's equalize branch fires at a
+    // 2-eighth difference between neighbours, so a ramp of 1 eighth per 2 cells
+    // is a STABLE FIXED POINT — a 5-voxel cone over an 80-cell radius never
+    // goes away, and above that slope it flattens by diffusion at r^2 ticks per
+    // eighth, which is minutes. Flatter than reach 1 allows needs a global
+    // operation, and the body system already is one.
+    //
+    // Eighths a column may move per tick. 0 is an EXACT IDENTITY: the two new
+    // passes return after their first comparison, no voxel is written, and the
+    // pinned world hash is the pre-W1 one. 4 flattens a 10-voxel cone in ~20
+    // ticks (0.7 s); 8 does it in 10 and starts to read as an edit rather than
+    // as water finding its level.
+    int waterRelevelMax = 4;
+    // Eighths of deficit per EXTRA eighth of rate: k = clamp(|s - m| / gain, 1,
+    // max). A column one voxel down moves at 1 eighth/tick, a column four
+    // voxels down at 4 — so a crater closes fast and a one-eighth ripple does
+    // not get bulldozed.
+    int waterRelevelGain = 8;
+    // How far below the body's level the measure looks, in VOXELS. This sizes
+    // nothing at runtime — the histogram block is sized from world.h's
+    // kWaterRelevelDepthMax and this is clamped to it — but it does decide how
+    // deep a hole still counts as "a low column of this lake" rather than as a
+    // void the MPM owns. A column further down than this clamps into the end
+    // bucket and is treated as deep.
+    int waterRelevelDepth = 32;
+
     // ---- wind coupling (docs/RESEARCH_wind.md §4.5/§4.6) ----
     // The SHAPE of the field is the `wind` group below; these are what the
     // three SIM consumers do with what they sample. Human-unit floats, the

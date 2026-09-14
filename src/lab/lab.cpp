@@ -73,6 +73,22 @@ constexpr int kPondSurf = G - 1;                         // 127
 constexpr int kPondChamberTop = kPondSurf - kPondDepth - 12;   // 89
 constexpr int kPondChamberLo = kPondChamberTop - kChamberH + 1;
 
+// ---- W1: THE CRATER VARIANT (docs/PLAN_water_relevel.md §3.10) ------------
+//
+// The DRAIN above asks "can a lake empty through a hole". The crater asks the
+// other question, which is the one W1 exists for: a body is DISTURBED and
+// loses nothing. A 9x9x6 box of the bowl's floor is removed, the water above
+// it falls in, and what is left is a surface DEPRESSION with water — not air —
+// under every cell of it. No excite trigger fires again and the reach-1 CA
+// cannot flatten it, so before W1 this scene is a lake with a permanent dent
+// in it and after W1 it is flat in about twenty ticks.
+//
+// Sealed by construction: the box is carved into stone and does not reach the
+// drain chamber, so the mass audit closes with no drained term at all.
+constexpr int kCraterHalf = 4;    // 9x9 in plan
+constexpr int kCraterDepth = 6;   // voxels of floor removed
+bool sPondCrater = false;
+
 // `worldlake` uses the authored lake in worldgen.wgsl genColumn: a disc at
 // (420,420) of radius vlen(68) whose terrain is flattened to poolY and filled
 // to poolY + vlen(24). ~348,600 water voxels (a cylinder, not a bowl — bigger
@@ -312,8 +328,18 @@ double Pct(std::vector<double> v, double p) {
 }  // namespace
 
 int LabSceneFromName(const std::string& name) {
+  // W1: `pondcrater` / `worldlakecrater` are the SAME scenes with a different
+  // plug (see LabScenePlugOps). A variant rather than a sixth enumerator
+  // because every one of the twenty `scene == kLabPond` tests in this file
+  // would otherwise need widening, and every one of them would be right about
+  // the geometry — the geometry is identical, only the disturbance differs.
+  if (name == "pondcrater") { LabSetPondCrater(true); return kLabPond; }
+  if (name == "worldlakecrater") {
+    LabSetPondCrater(true);
+    return kLabWorldLake;
+  }
   for (int i = 0; i < kLabSceneCount; i++)
-    if (name == kSceneNames[i]) return i;
+    if (name == kSceneNames[i]) { LabSetPondCrater(false); return i; }
   return -1;
 }
 
@@ -465,6 +491,20 @@ uint32_t LabScenePlugTick(int scene) {
 void LabScenePlugOps(int scene, std::vector<CellOp>& out) {
   if (scene != kLabPond && scene != kLabWorldLake) return;
   const bool pond = scene == kLabPond;
+  // W1: the crater variant. Same scene, same settle, a different disturbance —
+  // a hole in the FLOOR that does not go anywhere, so the lake keeps every
+  // eighth and only its surface is wrong.
+  if (sPondCrater) {
+    const LakeGeom LC = Lake();
+    const int ccx = pond ? CX : LC.cx;
+    const int ccz = pond ? CZ : LC.cz;
+    const int top = pond ? kPondSurf - kPondDepth : LC.floorY;
+    for (int y = top - kCraterDepth + 1; y <= top; y++)
+      for (int z = ccz - kCraterHalf; z <= ccz + kCraterHalf; z++)
+        for (int x = ccx - kCraterHalf; x <= ccx + kCraterHalf; x++)
+          out.push_back({World::SlotCellIndex({x, y, z}), kMatAir});
+    return;
+  }
   const LakeGeom L = Lake();
   const int cx = pond ? CX : L.cx;
   const int cz = pond ? CZ : L.cz;
@@ -584,6 +624,8 @@ void LabSceneBounds(int scene, IVec3& lo, IVec3& hi) {
 }
 
 void LabSetPondRadius(int r) { sPondRadius = std::max(4, std::min(127, r)); }
+void LabSetPondCrater(bool on) { sPondCrater = on; }
+bool LabPondCrater() { return sPondCrater; }
 int LabPondRadius() { return sPondRadius; }
 
 bool LabSceneUsesLabWorld(int scene) { return scene != kLabWorldLake; }

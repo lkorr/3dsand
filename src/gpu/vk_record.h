@@ -124,7 +124,7 @@ struct RecordCtx {
 // resolve to the same buffer, which Bind() asserts.
 struct Bindings {
   Buffer* buffers[(int)pass::Buf::kCount] = {};
-  VkPipeline pipelines[64] = {};        // indexed by (int)pass::Pipe
+  VkPipeline pipelines[96] = {};        // indexed by (int)pass::Pipe
   VkPipelineLayout simLayout = VK_NULL_HANDLE;      // GRP_SIM: one set
   VkPipelineLayout slimPartLayout = VK_NULL_HANDLE; // GRP_SLIM_PART: slim + particle
   VkPipelineLayout slimFarLayout = VK_NULL_HANDLE;  // GRP_SLIM_FAR: slim + far

@@ -632,7 +632,8 @@ void SubmitTick(GpuContext& ctx, World& world, Simulation& sim, uint32_t tick,
     {
       sandvox::PerfSpan spanWb(PerfScope::WaterBody);
       wb.Tick(world, seed, tick, wt.sim.waterBodyMode, wt.sim.waterBodyTestDrain,
-              wt.sim.drainMaxEighthsPerTick, worldEdited, editCell);
+              wt.sim.drainMaxEighthsPerTick, wt.sim.waterRelevelMax,
+              worldEdited, editCell);
     }
     const WaterBodyGpu& g = wb.Gpu();
     waterGpu = &g;
@@ -676,6 +677,19 @@ void SubmitTick(GpuContext& ctx, World& world, Simulation& sim, uint32_t tick,
     tp.waterDrainBodies = drainBodies;
     tp.waterDrainMax = wt.sim.drainMaxEighthsPerTick;
     tp.waterExciteRadius = wt.sim.drainExciteRadius;
+    // ---- W1: THE RELEVEL RATE, AND ITS ARM, IN ONE WORD ------------------
+    //
+    // ZEROED unless the footprint is declared this tick. `wbRelevel` is the
+    // second voxel WRITER in this subsystem and `writesThisTick` is the CPU's
+    // own answer to "were its chunks handed to the page table"; it does not
+    // otherwise reach the GPU, and a kernel that read TUNE_WATER_RELEVEL_MAX
+    // directly would go on relevelling into JITTER sentinels the first tick the
+    // hot window closed. One number, one owner — the same shape as the drain's
+    // `b < T.waterDrainBodies` refusal.
+    //
+    // At sim.waterRelevelMax 0 this is 0 on every tick, both kernels return on
+    // their first comparison, and W1 is an exact identity.
+    tp.waterRelevelMax = g.writesThisTick ? wt.sim.waterRelevelMax : 0;
     // The total the seam dispatches over: real pours, then the reserved block.
     // Written AFTER tp.fluidSpawnCount's own assignment above on purpose — the
     // WriteBuffer below still uploads only the CPU half, because the GPU owns

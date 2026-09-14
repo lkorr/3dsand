@@ -1367,6 +1367,9 @@ bool Simulation::BuildPipelines(const rhi::Device& device, std::string* err) {
   pool.Add([&] { waterShave_ = MakeComputePipeline(device, simPL_, mWaterBody, "wbShave", "waterShave"); });
   pool.Add([&] { waterDrain_ = MakeComputePipeline(device, simPL_, mWaterBody, "wbDrain", "waterDrain"); });
   pool.Add([&] { waterHole_ = MakeComputePipeline(device, simPL_, mWaterBody, "wbHole", "waterHole"); });
+  // W1: the relevel apply and the free-surface measure (PLAN_water_relevel.md).
+  pool.Add([&] { waterRelevel_ = MakeComputePipeline(device, simPL_, mWaterBody, "wbRelevel", "waterRelevel"); });
+  pool.Add([&] { waterSurface_ = MakeComputePipeline(device, simPL_, mWaterBody, "wbSurface", "waterSurface"); });
   // M5: the scheduled container sweep (components 2 case 2 + 10).
   pool.Add([&] { waterSweep_ = MakeComputePipeline(device, simPL_, mWaterBody, "wbSweep", "waterSweep"); });
   pool.Add([&] { waterSplit_ = MakeComputePipeline(device, simPL_, mWaterBody, "wbSplit", "waterSplit"); });
@@ -1475,7 +1478,8 @@ bool Simulation::BuildPipelines(const rhi::Device& device, std::string* err) {
       !fluidConsumeApply_ || !fluidStainApply_ || !fluidMirrorFold_ ||
       !fluidCellClear_ || !waterDrain_ || !waterHole_ ||
       !waterQuiet_ || !waterLedger_ || !waterReduce_ ||
-      !waterShave_ || !waterSweep_ || !waterSplit_) {
+      !waterShave_ || !waterSweep_ || !waterSplit_ ||
+      !waterRelevel_ || !waterSurface_) {
     if (err) *err = "compute pipeline creation failed (see stderr for the shader)";
     return false;
   }
@@ -1760,6 +1764,8 @@ const rhi::ComputePipeline& Simulation::PassPipeline(pass::Pipe p) const {
     case P::WaterHole:      return waterHole_;
     case P::WaterSweep:     return waterSweep_;
     case P::WaterSplit:     return waterSplit_;
+    case P::WaterRelevel:   return waterRelevel_;
+    case P::WaterSurface:   return waterSurface_;
     case P::FluidSettleCommit:   return fluidSettleCommit_;
     case P::FluidSettleKill:     return fluidSettleKill_;
     case P::FluidConsumeApply:   return fluidConsumeApply_;

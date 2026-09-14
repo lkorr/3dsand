@@ -543,7 +543,8 @@ void WaterBodySystem::Classify(const World& world, uint32_t tick) {
 // PageTable::UpdateSpawnRing is: a carried set is a set that can be stale, and
 // a stale entry here is a shave aimed at a chunk the page table was never told
 // about. Everything it reads is a pure function of the tick.
-void WaterBodySystem::BuildGpu(uint32_t tick, int testDrain, int drainMax) {
+void WaterBodySystem::BuildGpu(uint32_t tick, int testDrain, int drainMax,
+                               int relevelMax) {
   gpu_.bodies.assign(kWaterBodyScalars, 0);
   gpu_.chunks.clear();
   gpu_.bodyCount = 0;
@@ -623,10 +624,18 @@ void WaterBodySystem::BuildGpu(uint32_t tick, int testDrain, int drainMax) {
   // no longer declared writes into a JITTER sentinel, which is a lost eighth
   // reported as a page fault. 64 ticks is two orders more than a <=512-eighth
   // debit needs against a 14,493-cell surface.
+  //
+  // W1 (plan §3.6): RELEVEL RIDES THE SAME WINDOW BUT NOT THE SAME KNOB. The
+  // relevel is the second voxel writer here, so its chunks need declaring on
+  // exactly the ticks it can write — but it is not a drain and must not be
+  // switched off by `sim.drainMaxEighthsPerTick = 0`. Hence the OR: either
+  // writer being live arms the footprint, and `sim.waterRelevelMax = 0` is what
+  // switches the relevel half off (and is then an exact identity, because the
+  // CPU also sends 0 in TickParams::waterRelevelMax and both kernels return).
   gpu_.writesThisTick =
       (testDrain > 0 && !gpu_.chunks.empty()) || gpu_.drainArmed ||
-      (drainMax > 0 && tick < drainHotUntil_ + kWaterDrainSettleTicks &&
-       !gpu_.chunks.empty());
+      ((drainMax > 0 || relevelMax > 0) &&
+       tick < drainHotUntil_ + kWaterDrainSettleTicks && !gpu_.chunks.empty());
 
   // ---- M5: THE SWEEP SCHEDULE (plan section 3.4) -------------------------
   //
@@ -679,11 +688,17 @@ void WaterBodySystem::BuildGpu(uint32_t tick, int testDrain, int drainMax) {
 
 void WaterBodySystem::Tick(const World& world, uint32_t seed, uint32_t tick,
                            int mode, int testDrain, int drainMax,
-                           bool worldEdited, IVec3 editCell) {
+                           int relevelMax, bool worldEdited, IVec3 editCell) {
   mode_ = mode;
   // The hot latch (see waterbody.h). Set from the tick input stream only, so a
   // replay reproduces it and the twice-run determinism gate compares it.
-  if (mode != 0 && drainMax > 0 && worldEdited)
+  //
+  // W1 (plan §3.6): `|| relevelMax > 0`, and the audit found this one BEFORE it
+  // shipped. The latch decides whether the footprint is declared at all, so a
+  // relevel riding the DRAIN knob would mean `sim.drainMaxEighthsPerTick = 0`
+  // silently disables levelling too — a knob about jets switching off a rule
+  // about surfaces, with no error and no gate on it.
+  if (mode != 0 && (drainMax > 0 || relevelMax > 0) && worldEdited)
     drainHotUntil_ = tick + kWaterDrainHotTicks;
   // THE HOLE HINT (component 8's drain seeder). Recorded from the same tick-
   // stream signal on the same tick, against LAST tick's labelling — which is
@@ -809,7 +824,7 @@ void WaterBodySystem::Tick(const World& world, uint32_t seed, uint32_t tick,
     }
   }
   Classify(world, tick);
-  BuildGpu(tick, testDrain, drainMax);
+  BuildGpu(tick, testDrain, drainMax, relevelMax);
 }
 
 uint32_t WaterBodySystem::ProposedCount() const {

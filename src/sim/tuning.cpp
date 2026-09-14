@@ -262,6 +262,9 @@ bool SetSimField(Tuning& t, const std::string& name, float value) {
     {"waterBodyTestDrain", &Tuning::Sim::waterBodyTestDrain},
     {"drainMaxEighthsPerTick", &Tuning::Sim::drainMaxEighthsPerTick},
     {"drainExciteRadius", &Tuning::Sim::drainExciteRadius},
+    {"waterRelevelMax", &Tuning::Sim::waterRelevelMax},
+    {"waterRelevelGain", &Tuning::Sim::waterRelevelGain},
+    {"waterRelevelDepth", &Tuning::Sim::waterRelevelDepth},
     {"windMode", &Tuning::Sim::windMode},
     {"currentMode", &Tuning::Sim::currentMode},
     {"currentVortexRadius", &Tuning::Sim::currentVortexRadius},
@@ -1201,6 +1204,9 @@ bool LoadTuning(const std::string& path, Tuning& out) {
     ReadI(*g, "drainExciteRadius", s.drainExciteRadius, out, at);
     ReadF(*g, "drainCd", s.drainCd, out, at);
     ReadF(*g, "drainGravity", s.drainGravity, out, at);
+    ReadI(*g, "waterRelevelMax", s.waterRelevelMax, out, at);
+    ReadI(*g, "waterRelevelGain", s.waterRelevelGain, out, at);
+    ReadI(*g, "waterRelevelDepth", s.waterRelevelDepth, out, at);
     ReadI(*g, "windMode", s.windMode, out, at);
     ReadF(*g, "windDrag", s.windDrag, out, at);
     ReadF(*g, "windFluidGain", s.windFluidGain, out, at);
@@ -1449,6 +1455,29 @@ bool LoadTuning(const std::string& path, Tuning& out) {
     // gravity bound is the fluid lane's, for the same fixed-point reason.
     clampWarnF(s.drainCd, 0.0f, 1.0f, "drainCd");
     clampWarnF(s.drainGravity, 0.0f, 4000.0f, "drainGravity");
+    // ---- relevel (docs/PLAN_water_relevel.md W1) ------------------------
+    // The rate cap is a WHOLE VOXEL, for the shave's own reason (WB_MAX_STEPS):
+    // a column that moves more than 8 eighths in a tick is not water finding
+    // its level, it is a bulldozer, and the give branch cannot honour it
+    // without emptying a second cell anyway. 0 is the identity arm.
+    if (s.waterRelevelMax < 0 || s.waterRelevelMax > 8) {
+      out.warnings.push_back("sim.waterRelevelMax out of 0..8; clamped");
+      s.waterRelevelMax = s.waterRelevelMax < 0 ? 0 : 8;
+    }
+    // A gain of 0 is a divide by zero in the kernel's k(s).
+    if (s.waterRelevelGain < 1 || s.waterRelevelGain > 256) {
+      out.warnings.push_back("sim.waterRelevelGain out of 1..256; clamped");
+      s.waterRelevelGain = s.waterRelevelGain < 1 ? 1 : 256;
+    }
+    // Clamped to the ceiling the HISTOGRAM BLOCK is sized from (world.h's
+    // kWaterRelevelDepthMax). Asking for more buckets than the buffer holds is
+    // not an approximation, it is another body's block.
+    if (s.waterRelevelDepth < 0 ||
+        s.waterRelevelDepth > (int)kWaterRelevelDepthMax) {
+      out.warnings.push_back("sim.waterRelevelDepth out of 0..32; clamped");
+      s.waterRelevelDepth =
+          s.waterRelevelDepth < 0 ? 0 : (int)kWaterRelevelDepthMax;
+    }
     // Wind coupling. The gate first: an unknown mode must not fall through to
     // "some wind", because the whole hash argument for shipping this is that
     // mode 0 means literally no kernel reads the field.

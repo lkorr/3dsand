@@ -660,6 +660,80 @@ def check_wind_prims():
             f"stride past the primitive it is decoding")
 
 
+def check_water_ledger():
+    """The water-body ledger's word map lives in THREE places, positionally.
+
+    world.h's kWaterBodyStateWords is the STRIDE -- every read of the buffer is
+    `slot * stride + field`. common.wgsl's WBS_* block is the field map the
+    shaders index with. selftest_water.cpp re-declares the same map as a bare
+    `enum : uint32_t` with ONE initialiser, so every name after the first takes
+    its index from its POSITION IN THE LIST.
+
+    Nothing about that is checked by a compiler. A word added to two of the
+    three is a gate that reads the wrong field of the right body (silent: it
+    prints a plausible number), or a shader that writes one body's word into
+    the next body's block (silent until a conservation sum drifts). W1 added
+    twelve words at once, which is exactly the size of change that gets two of
+    three right.
+
+    Also checked: the relevel histogram's own arithmetic, because it is sized
+    from one constant and indexed from another.
+    """
+    wh = read("src/sim/world.h")
+    cw = read("assets/shaders/common.wgsl")
+    st = read("src/test/selftest_water.cpp")
+    if not wh or not cw or not st:
+        return
+    m = re.search(r"constexpr\s+uint32_t\s+kWaterBodyStateWords\s*=\s*(\d+)", wh)
+    if not m:
+        return
+    stride = int(m.group(1))
+    checked.append("water ledger words")
+
+    # common.wgsl: WBS_<NAME> : u32 = <n>u
+    wgsl = {}
+    for name, idx in re.findall(r"\bconst\s+WBS_(\w+)\s*:\s*u32\s*=\s*(\d+)u", cw):
+        wgsl[name] = int(idx)
+    if wgsl:
+        seen = sorted(wgsl.values())
+        if seen != list(range(len(seen))):
+            problems.append(
+                f"common.wgsl's WBS_* indices are not 0..{len(seen) - 1} with "
+                f"no gaps or duplicates: {seen} -- the ledger is addressed as "
+                f"slot * stride + field, so a gap wastes a word and a duplicate "
+                f"makes two fields the same word")
+        if len(seen) != stride:
+            problems.append(
+                f"world.h kWaterBodyStateWords = {stride} but common.wgsl "
+                f"declares {len(seen)} WBS_* words -- the stride and the field "
+                f"map must be the same number or every body but slot 0 reads "
+                f"its neighbour's ledger")
+
+    # selftest_water.cpp: the positional decoder.
+    blk = re.search(r"enum\s*:\s*uint32_t\s*\{\s*WBS_STATE\s*=\s*0\s*,(.*?)\n\};",
+                    st, re.S)
+    if blk:
+        body = re.sub(r"//[^\n]*", "", blk.group(1))
+        names = [n for n in re.findall(r"\b(WBS_\w+)\b", body)]
+        if len(names) + 1 != stride:
+            problems.append(
+                f"src/test/selftest_water.cpp's WBS_* enum declares "
+                f"{len(names) + 1} words but world.h kWaterBodyStateWords = "
+                f"{stride} -- the enum is POSITIONAL (one initialiser), so the "
+                f"gate is reading the wrong field of the right body and saying "
+                f"so with a plausible number")
+
+    # The relevel histogram: sized from one constant, indexed from another.
+    dm = re.search(r"constexpr\s+uint32_t\s+kWaterRelevelDepthMax\s*=\s*(\d+)", wh)
+    bk = re.search(r"constexpr\s+uint32_t\s+kWaterRelevelBuckets\s*=\s*(\d+)", wh)
+    if dm and bk and int(bk.group(1)) != 8 * (int(dm.group(1)) + 2):
+        problems.append(
+            f"world.h kWaterRelevelBuckets = {bk.group(1)} but 8 * "
+            f"(kWaterRelevelDepthMax + 2) = {8 * (int(dm.group(1)) + 2)} -- "
+            f"wbSurface clamps into the end bucket, so a short block silently "
+            f"piles every deep column into one bucket instead of overflowing")
+
+
 def check_current_prims():
     """world.h's current-primitive ceilings must match common.wgsl's constants.
 
@@ -1553,6 +1627,7 @@ ALL = {
     "params": check_gpu_structs,
     "windprim": check_wind_prims,
     "curprim": check_current_prims,
+    "waterledger": check_water_ledger,
     "counts": check_tick_counts,
     "farbits": check_far_material_bits,
     "ringdepth": check_readback_ring,
@@ -1577,7 +1652,8 @@ RELEVANT = {
     "src/gpu/resources.cpp": ["world"],
     "src/test/selftest.cpp": ["arch"],
     "src/sim/world.h": ["world", "params", "substeps", "windprim",
-                        "curprim"],
+                        "curprim", "waterledger"],
+    "src/test/selftest_water.cpp": ["waterledger"],
     "src/sim/world.cpp": ["worldgen"],
     "assets/shaders/worldgen.wgsl": ["worldgen", "treeatlas"],
     "src/sim/treeatlas.h": ["treeatlas"],
@@ -1608,7 +1684,7 @@ if __name__ == "__main__":
                     run += checks
             if norm.endswith(".wgsl"):
                 run += ["tuning", "world", "params", "windprim",
-                        "curprim", "burntint", "plants"]
+                        "curprim", "waterledger", "burntint", "plants"]
         run = list(dict.fromkeys(run))
         if not run:
             sys.exit(0)  # edited file cannot break any pair

@@ -660,6 +660,21 @@ TP_I(sim, drainExciteRadius, TUNE_DRAIN_EXCITE_RADIUS, 6)
 TP_F(sim, drainCd, TUNE_DRAIN_CD, 0.6f)
 TP_F(sim, drainGravity, TUNE_DRAIN_GRAVITY, 900.0f)
 
+// ---- RELEVEL (docs/PLAN_water_relevel.md W1) ----
+// The shave's mirror image: a disturbed body's columns relax toward the body's
+// own mean surface instead of waiting on a reach-1 CA that provably cannot
+// flatten a ramp of 1 eighth per 2 cells. All three are integer (rule 1) and
+// they are const-eval'd where they are read, so nothing here reaches a kernel
+// as an f32.
+// waterRelevelMax is the off switch AND the rate: at 0 both new passes return
+// after their first comparison and the world is bit-identical to a build
+// without W1, which is what `--sweep sim.waterRelevelMax=0,4` states.
+// waterRelevelDepth is clamped in the shader to world.h's
+// kWaterRelevelDepthMax, which is what the histogram block is sized from.
+TP_I(sim, waterRelevelMax, TUNE_WATER_RELEVEL_MAX, 4)
+TP_I(sim, waterRelevelGain, TUNE_WATER_RELEVEL_GAIN, 8)
+TP_I(sim, waterRelevelDepth, TUNE_WATER_RELEVEL_DEPTH, 32)
+
 // ---- wind COUPLING: how hard the field pushes the sim (research doc §4.5/4.6)
 // The SHAPE of the field is the wind.* group far above; this is what the three
 // sim consumers do with it. Human-unit floats for the sim.fluid* reason and by

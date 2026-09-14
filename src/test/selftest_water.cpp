@@ -49,6 +49,16 @@
 //       both above and through the wall. That last pair is what separates "the
 //       sweep ran" from "the sweep saw the terrain the player shaped", and it
 //       is also pass G extended to a RE-DERIVED basin.
+//   R — RELEVEL (W1, docs/PLAN_water_relevel.md §3.10). A 9x9x6 crater bored
+//       into the lake's own floor that goes NOWHERE: nothing drains, the water
+//       above falls in, and what is left is a surface DEPRESSION with water
+//       under every cell of it — the one state §1 proves the reach-1 CA cannot
+//       undo, because its equalize branch fires at 2 eighths and a ramp of 1
+//       eighth per 2 cells is a stable fixed point. Asserts the free-surface
+//       spread IN EIGHTHS (whole voxels would read flat while a forty-eighth
+//       cone stands), the §3.5 identity with the credit term, that the body
+//       goes back to sleep, and that the relevel does not feed the excite
+//       detector.
 //   F — DETERMINISM, MID-DRAIN (M5). The same script twice from the same fresh
 //       worldgen at the same tick numbers, hashed mid-drain and again after.
 //       This is the gate on M5's schedule: the container re-derive is the first
@@ -87,6 +97,14 @@ struct VoxelTruth {
   uint32_t surfaceCells = 0; // free-surface cells (nothing of ours above)
   int surfaceMinY = 0;       // spread = max - min over the free surface
   int surfaceMaxY = 0;
+  // W1: the same spread in EIGHTHS (8*y + fullness), which is the unit the
+  // relevel works in and the only one that can see the thing it fixes. A cone
+  // the CA has flattened to its own fixed point — one eighth per two cells —
+  // is ZERO voxels deep over any two adjacent columns and forty eighths deep
+  // across the lake, so a spread measured in whole Y says "flat" about exactly
+  // the surface this whole package exists to flatten.
+  int surfaceMinE = 0;
+  int surfaceMaxE = 0;
   uint32_t chunks = 0;       // chunks actually read
 };
 
@@ -107,6 +125,8 @@ VoxelTruth SweepBasin(Ctx& c, const WaterBasin& b, const WaterBodyDesc& d,
   std::vector<uint32_t> chunk(kChunkVol);
   t.surfaceMinY = 1 << 30;
   t.surfaceMaxY = -(1 << 30);
+  t.surfaceMinE = 1 << 30;
+  t.surfaceMaxE = -(1 << 30);
 
   // One cell of headroom above the fill level, because "is this cell the free
   // surface" is a question about the cell ABOVE it. Without the extra layer the
@@ -166,11 +186,17 @@ VoxelTruth SweepBasin(Ctx& c, const WaterBasin& b, const WaterBodyDesc& d,
           t.surfaceCells++;
           t.surfaceMinY = std::min(t.surfaceMinY, y);
           t.surfaceMaxY = std::max(t.surfaceMaxY, y);
+          const int e8 = y * 8 + (int)e;
+          t.surfaceMinE = std::min(t.surfaceMinE, e8);
+          t.surfaceMaxE = std::max(t.surfaceMaxE, e8);
         }
       }
     }
   }
-  if (t.surfaceCells == 0) { t.surfaceMinY = 0; t.surfaceMaxY = 0; }
+  if (t.surfaceCells == 0) {
+    t.surfaceMinY = 0; t.surfaceMaxY = 0;
+    t.surfaceMinE = 0; t.surfaceMaxE = 0;
+  }
   t.read = true;
   return t;
 }
@@ -196,6 +222,12 @@ enum : uint32_t {
   // M5, component 10: the re-audit arm, its attribution tick, and the level the
   // ledger resolved for this tick's sweep.
   WBS_REAUDIT_W, WBS_AUDITTICK_W, WBS_SWEEPY_W,
+  // W1 (docs/PLAN_water_relevel.md §3.2/§3.3): the relevel block. POSITIONAL,
+  // like everything above it — a name dropped here shifts every one after it,
+  // which `check_invariants.py`'s `waterledger` check is what catches.
+  WBS_RVCOUNT_W, WBS_RVSUM_W, WBS_RVMEAN_W, WBS_RVTAKECUT_W, WBS_RVTAKEFRAC_W,
+  WBS_RVGIVECUT_W, WBS_RVGIVEFRAC_W, WBS_RVGIVEN_W, WBS_RVTAKEN_W,
+  WBS_RVCREDIT_W, WBS_RVCAPPED_W, WBS_RVBASE_W,
 };
 // M5 — the SWEEP block's word map, which lives past the end of the ledger in
 // the same buffer (world.h's kWaterCurveBase). Must match the SW_* block in
@@ -218,6 +250,13 @@ constexpr int kShaftR = 3;         // half-extent, so a 7x7 orifice
 // section 6 trap 2 is about what happens when that bound binds, and a fixture
 // that never reaches it would not test the thing.
 constexpr uint32_t kDrainWindow = 90;
+// THE PASS-R FIXTURE (W1). A 9x9x6 box of the lake's own floor, removed and
+// going NOWHERE — stone on every side, so nothing drains and the only thing
+// that changes is the shape of the surface. That is the disturbance the
+// relevel exists for and the one the CA provably cannot undo; a shaft into a
+// chamber would measure the drain again, which pass H already does.
+constexpr int kCraterHalf = 4;    // half-extent, so 9x9 in plan
+constexpr int kCraterDepth = 6;   // voxels of floor removed
 enum : int32_t {
   WB_CANDIDATE = 0, WB_MEASURING = 1, WB_ADOPTED = 2, WB_RELEASING = 3,
 };
@@ -1124,6 +1163,273 @@ Status GateWaterBody(Ctx& c, std::string& detail) {
   }
 
 
+  // ========================================================== pass R (W1)
+  //
+  // RELEVEL. docs/PLAN_water_relevel.md §3.10, and it is the acceptance of the
+  // owner complaint the whole package exists for: blow a hole under a pond and
+  // the dent it leaves takes ten minutes to go away.
+  //
+  // THE FIXTURE IS DELIBERATELY NOT A DRAIN. A 9x9x6 crater is bored into the
+  // lake's floor and it goes NOWHERE — sealed stone on every side. So `drained`
+  // is 0, no discharge runs, and the only thing that happens is that the water
+  // over the crater falls in and leaves a surface DEPRESSION with water, not
+  // air, under every cell of it. That is exactly the state §1 proves no CA rule
+  // can fix: the equalize branch fires at a 2-eighth difference, so a ramp of 1
+  // eighth per 2 cells is a stable fixed point, and above that slope diffusion
+  // costs r^2 ticks per eighth.
+  //
+  // WHAT IS ASSERTED, and each fails differently:
+  //
+  //   * SPREAD, IN EIGHTHS. max(s) - min(s) over the body's free surface,
+  //     against `waterbodyRelevelSpread`. In WHOLE VOXELS this fixture would
+  //     read flat while still holding a forty-eighth cone, which is the exact
+  //     failure the plan is about — so the measure is eighths and the tolerance
+  //     is 2, which is the residue the CA's own equalize rule leaves.
+  //   * THE IDENTITY, with the credit term. voxels + drained - debit + credit
+  //     (+ the in-flight MPM mass) == voxels(0). `credit` is a STORED ledger
+  //     field for the reason `debit` is: a conservation sum that has to infer
+  //     one of its terms cannot attribute a failure. The unbanked half of this
+  //     tick's report is added explicitly, because the ledger banks it NEXT
+  //     tick and a sum taken in between is short by one tick of moves.
+  //   * AWAKE AT REST. The relevel scatters single-eighth writes across the
+  //     whole surface while it is working, which is stated in the plan rather
+  //     than discovered; what must not happen is that the body fails to go back
+  //     to sleep afterwards.
+  //   * EXCITE CANDIDATES. Plan §3.8: a relevel write cannot MANUFACTURE the
+  //     seam's 2-cell step (a column moves <= RELEVEL_MAX eighths, half a cell,
+  //     and every column moves toward the same mean), but the crater wall is a
+  //     real one and firing there is correct. Bounded against the drain's own
+  //     budget so the paragraph stays honest.
+  //
+  // `RVCAPPED` is RECORDED AND NOT ASSERTED, which is CLAUDE.md rule 6 built in
+  // before it is needed: "the surface did not flatten" is two different bugs —
+  // the cutoffs asked for nothing, or the cells could not honour them — and
+  // only this number tells them apart.
+  std::string relevelNote = "pass R did not run (an earlier pass failed)";
+  int64_t rvSpread0 = 0, rvSpread1 = 0, rvErr = 0, rvCredit = 0;
+  int64_t rvGiven = 0, rvTaken = 0, rvCapped = 0, rvDrained = 0;
+  int rvFlatTick = -1;
+  uint32_t rvAwake = 0;
+  if (ok) {
+    // A FRESH WORLD. Pass H carved a chamber into this lake's floor twice and
+    // left the last one restored, but the pass that perturbs the world owes the
+    // cleanup and this one starts from worldgen for the same reason H's arms
+    // do: a crater bored into a floor somebody else already holed is a
+    // different experiment.
+    WaterBodies().Reset();
+    SubmitWorldgen(c.ctx, world, c.sim, kDefaultSeed);
+    Tuning rt = t;
+    rt.sim.waterBodyTestDrain = 0;   // the CRATER is the disturbance, not a tap
+    SetCurrentTuning(rt);
+    tick = RunQuietTicks(c, tick, 130);
+
+    const WaterBodyDesc* rd = WaterBodies().Find(1);
+    if (!rd || rd->gpuSlot >= kWaterBodyCap) {
+      fail("pass R: the authored lake is not proposed");
+    } else if (rt.sim.waterRelevelMax <= 0) {
+      relevelNote = "RELEVEL off (sim.waterRelevelMax = 0): pass R skipped";
+    } else {
+      const uint32_t rSlot = rd->gpuSlot;
+      const LedgerView lv0 = ReadLedger(c);
+      if (lv0.At(rSlot, WBS_STATE) != WB_ADOPTED) {
+        fail(Format("pass R: the lake is %s, not adopted, before the crater",
+                    LedgerStateName(lv0.At(rSlot, WBS_STATE))));
+      } else {
+        // The box every number below is measured over: the lake AND the pocket
+        // under its floor, so water that fell into the crater is still inside
+        // the sum rather than reading as a leak.
+        const int rBoxLo = lakeGeo.floorY - kCraterDepth;
+        const int rBoxHi = lakeGeo.surfY;
+        // A NARROW box for the per-sample "is it flat yet" curve. The dent is
+        // local; sweeping 243 chunks six times to watch it close would cost
+        // more gate seconds than the whole drain does, and it would answer the
+        // same question. The FINAL assertion is over the whole lake.
+        WaterBodyDesc nearDesc = lakeDesc;
+        nearDesc.lo.x = std::max(lakeDesc.lo.x, lakeGeo.cx - 32);
+        nearDesc.hi.x = std::min(lakeDesc.hi.x, lakeGeo.cx + 32);
+        nearDesc.lo.z = std::max(lakeDesc.lo.z, lakeGeo.cz - 32);
+        nearDesc.hi.z = std::min(lakeDesc.hi.z, lakeGeo.cz + 32);
+
+        const VoxelTruth r0 =
+            SweepBasin(c, lakeGeo, lakeDesc, matId, rBoxLo, rBoxHi);
+        rvSpread0 = (int64_t)r0.surfaceMaxE - (int64_t)r0.surfaceMinE;
+        uint32_t rPf0[4] = {0, 0, 0, 0};
+        ReadPageFaultsSync(c.ctx, world, rPf0);
+
+        std::vector<CellOp> crater;
+        for (int y = lakeGeo.floorY - kCraterDepth + 1; y <= lakeGeo.floorY; y++)
+          for (int z = lakeGeo.cz - kCraterHalf; z <= lakeGeo.cz + kCraterHalf;
+               z++)
+            for (int x = lakeGeo.cx - kCraterHalf;
+                 x <= lakeGeo.cx + kCraterHalf; x++)
+              crater.push_back({World::SlotCellIndex({x, y, z}), 0u});
+        SubmitTick(c.ctx, c.world, c.sim, tick, kDefaultSeed, {}, {}, crater,
+                   false, c.world.WindowOrigin(), true, false);
+        c.ctx.ProcessEvents();
+        tick++;
+
+        const uint32_t rvTicks =
+            (uint32_t)BaselineNumber("waterbodyRelevelTicks", 90.0);
+        const double spreadMax = BaselineNumber("waterbodyRelevelSpread", 2.0);
+        const uint32_t rvStep =
+            (uint32_t)std::max(1.0, BaselineNumber("waterbodyRelevelStep", 15.0));
+        uint64_t rSeen = 0, rCand = 0;
+        uint32_t rSamples = 0;
+        for (uint32_t done = 0; done < rvTicks; done += rvStep) {
+          const uint32_t n = std::min(rvStep, rvTicks - done);
+          tick = RunQuietTicks(c, tick, n, &rSeen, &rCand, &rSamples);
+          const VoxelTruth s =
+              SweepBasin(c, lakeGeo, nearDesc, matId, rBoxLo, rBoxHi);
+          const int64_t sp =
+              (int64_t)s.surfaceMaxE - (int64_t)s.surfaceMinE;
+          if (rvFlatTick < 0 && s.read && s.surfaceCells > 0 &&
+              (double)sp <= spreadMax) {
+            rvFlatTick = (int)(done + n);
+          }
+        }
+        // ONE SETTLING TICK with nothing happening, so the ledger has consumed
+        // the last apply's report. Pass A takes the same tick for the same
+        // reason: measured in between, `credit` is short by one tick of moves
+        // and the identity reads as a leak.
+        tick = RunQuietTicks(c, tick, 1);
+
+        const VoxelTruth r1 =
+            SweepBasin(c, lakeGeo, lakeDesc, matId, rBoxLo, rBoxHi);
+        rvSpread1 = (int64_t)r1.surfaceMaxE - (int64_t)r1.surfaceMinE;
+        const LedgerView lv = ReadLedger(c);
+        uint32_t rFa[32] = {};
+        ReadFluidArgsSync(c.ctx, world, rFa);
+        const int64_t rInFlight =
+            (int64_t)rFa[7] - (int64_t)std::min(rFa[29], rFa[7]);
+        rvCredit = lv.At(rSlot, WBS_RVCREDIT_W);
+        rvGiven = lv.At(rSlot, WBS_RVGIVEN_W);
+        rvTaken = lv.At(rSlot, WBS_RVTAKEN_W);
+        rvCapped = lv.At(rSlot, WBS_RVCAPPED_W);
+        rvDrained = lv.At(rSlot, WBS_DRAINED);
+        const int64_t rDebit = lv.At(rSlot, WBS_DEBIT);
+        // THE IDENTITY OF §3.5, with every term measured and none inferred.
+        // `credit + given - taken` is what the ledger WOULD bank next tick, so
+        // the sum does not depend on which side of a tick boundary it is taken.
+        rvErr = (int64_t)r1.eighths + rInFlight + rvDrained - rDebit +
+                (rvCredit + rvGiven - rvTaken) - (int64_t)r0.eighths;
+
+        uint32_t rPf1[4] = {0, 0, 0, 0};
+        ReadPageFaultsSync(c.ctx, world, rPf1);
+
+        const int64_t rSlack = (int64_t)BaselineNumber(
+            "waterbodyRelevelSlackEighths", 4096.0);
+        if (rvErr < -rSlack || rvErr > rSlack) {
+          fail(Format(
+              "CONSERVATION (pass R): basin %u slot %u is off by %+lld eighths "
+              "over %u relevel ticks. box %llu -> %llu (%+lld), in flight "
+              "%lld, drained %lld, debit %lld, credit %lld (+%lld given, "
+              "-%lld taken), capped %lld, %u page faults",
+              lakeDesc.basinId, rSlot, (long long)rvErr, rvTicks,
+              (unsigned long long)r0.eighths, (unsigned long long)r1.eighths,
+              (long long)((int64_t)r1.eighths - (int64_t)r0.eighths),
+              (long long)rInFlight, (long long)rvDrained, (long long)rDebit,
+              (long long)rvCredit, (long long)rvGiven, (long long)rvTaken,
+              (long long)rvCapped, rPf1[0] - rPf0[0]));
+        }
+        // THE THING THE PACKAGE IS FOR. Reported against the spread the crater
+        // opened, so a failure says whether the relevel did nothing or merely
+        // did not finish.
+        if (!r1.read || r1.surfaceCells == 0) {
+          fail("pass R: the final sweep found no free surface at all");
+        } else if ((double)rvSpread1 > spreadMax) {
+          fail(Format(
+              "RELEVEL (pass R): the surface is still %lld eighths from flat "
+              "after %u ticks, over the budget of %.0f. The crater opened it "
+              "to %lld eighths from %lld at rest; ledger moved %lld given / "
+              "%lld taken with %lld capped and a credit of %lld, mean %d, "
+              "level %d, %u surface cells",
+              (long long)rvSpread1, rvTicks, spreadMax,
+              (long long)rvSpread0, (long long)rvSpread0, (long long)rvGiven,
+              (long long)rvTaken, (long long)rvCapped, (long long)rvCredit,
+              lv.At(rSlot, WBS_RVMEAN_W), lv.At(rSlot, WBS_LEVEL),
+              r1.surfaceCells));
+        }
+        // A relevel that moved nothing flattens nothing, and a crater that
+        // never opened is a green light meaning nothing. Both guards, as pass
+        // A and pass H carry theirs.
+        if (rvGiven + rvTaken + rvCredit == 0 && rvSpread1 == rvSpread0) {
+          fail("pass R: the relevel moved 0 eighths and the surface never "
+               "changed — the crater never reached the ledger");
+        }
+        if (rPf1[0] != rPf0[0]) {
+          fail(Format("pass R: %u page faults during the relevel (lost word "
+                      "0x%08x, refusing chunks %u..%u) — a relevel wrote into "
+                      "a sentinel chunk",
+                      rPf1[0] - rPf0[0], rPf1[2],
+                      rPf1[1] ? rPf1[1] - 1u : 0u,
+                      rPf1[3] ? 0xFFFFFFFFu - rPf1[3] : 0u));
+        }
+        // BACK TO SLEEP. The relevel wakes most of the body's surface chunks
+        // while it works (plan §3.6 states this rather than discovering it);
+        // what is not allowed is for it to keep them awake afterwards.
+        const uint32_t rvSettle = (uint32_t)std::max(
+            1.0, BaselineNumber("waterbodyRelevelSettleTicks", 20.0));
+        tick = RunQuietTicks(c, tick, rvSettle);
+        rvAwake = ReadActiveChunksSync(c.ctx, world, c.sim);
+        if ((double)rvAwake > awakeMax) {
+          fail(Format("pass R: %u chunks still awake %u ticks after the "
+                      "relevel window, over the budget of %.0f — a relevelled "
+                      "lake does not settle",
+                      rvAwake, rvSettle, awakeMax));
+        }
+        const double rPerTick =
+            rvTicks > 0 ? (double)rCand / (double)rvTicks : 0.0;
+        const double rCandMax =
+            BaselineNumber("waterbodyDrainExciteCandPerTickMax", 3000.0);
+        if (rPerTick > rCandMax) {
+          fail(Format(
+              "the relevel feeds the excite detector: %llu candidates over %u "
+              "ticks (%.1f/tick) against %llu cells seen, budget %.0f/tick — "
+              "plan §3.8 says a relevel cannot MANUFACTURE the seam's two-cell "
+              "step, so this is either the crater wall (correct) or that "
+              "paragraph is wrong",
+              (unsigned long long)rCand, rvTicks, rPerTick,
+              (unsigned long long)rSeen, rCandMax));
+        }
+
+        RecordObserved("waterbodyRelevelSpreadBefore", (double)rvSpread0);
+        RecordObserved("waterbodyRelevelSpreadAfter", (double)rvSpread1);
+        RecordObserved("waterbodyRelevelGiven", (double)rvGiven);
+        RecordObserved("waterbodyRelevelTaken", (double)rvTaken);
+        RecordObserved("waterbodyRelevelCredit", (double)rvCredit);
+        RecordObserved("waterbodyRelevelCapped", (double)rvCapped);
+        RecordObserved("waterbodyRelevelConsErr", (double)rvErr);
+        RecordObserved("waterbodyRelevelAwake", (double)rvAwake);
+        RecordObserved("waterbodyRelevelCandPerTick", rPerTick);
+        RecordObserved("waterbodyRelevelFlatTick",
+                       (double)(rvFlatTick < 0 ? -1 : rvFlatTick));
+        // ONE LINE, and it names every term (CLAUDE.md rule 6): a failure has
+        // to say WHICH of "the cutoffs asked for nothing", "the cells refused",
+        // "the credit ran away" and "it simply needs longer" it is.
+        const std::string flatStr =
+            rvFlatTick < 0 ? std::string("never")
+                           : std::to_string(rvFlatTick) + " ticks";
+        relevelNote = Format(
+            "RELEVEL(crater %dx%dx%d, %u ticks) spread %lld -> %lld eighths "
+            "(budget %.0f), flat at %s, credit %lld, given %lld / taken %lld, "
+            "capped %lld, mean %d, level %d, %u surface cells, identity %+lld "
+            "eighths, %u awake, %.1f excite cand/tick",
+            kCraterHalf * 2 + 1, kCraterHalf * 2 + 1, kCraterDepth, rvTicks,
+            (long long)rvSpread0, (long long)rvSpread1, spreadMax,
+            flatStr.c_str(),
+            (long long)rvCredit, (long long)rvGiven, (long long)rvTaken,
+            (long long)rvCapped, lv.At(rSlot, WBS_RVMEAN_W),
+            lv.At(rSlot, WBS_LEVEL), r1.surfaceCells, (long long)rvErr,
+            rvAwake, rPerTick);
+      }
+    }
+    // Leave the world settled and pristine for the passes that hash it.
+    SetCurrentTuning(t);
+    WaterBodies().Reset();
+    SubmitWorldgen(c.ctx, world, c.sim, kDefaultSeed);
+    tick = RunQuietTicks(c, tick, 60);
+  }
+
   // ========================================================== pass B (M5)
   //
   // SPLIT SCHEDULING, and with it the whole of component 2's case-2 sweep and
@@ -1564,6 +1870,7 @@ Status GateWaterBody(Ctx& c, std::string& detail) {
       truth.chunks + bowlTruth.chunks, awake, flips, hashOff, hashOn);
   detail += Format(" (mode 0 again %08x)", hashOff2);
   detail += " | " + holeNote;
+  detail += " | " + relevelNote;
   detail += " | " + splitNote;
   detail += Format(
       " | DETERMINISM mid-drain %08x/%08x, end %08x/%08x",

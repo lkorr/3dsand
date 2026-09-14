@@ -93,6 +93,8 @@ namespace {
 #define PIPE_WATER_HOLE      Pipe::WaterHole
 #define PIPE_WATER_SWEEP     Pipe::WaterSweep
 #define PIPE_WATER_SPLIT     Pipe::WaterSplit
+#define PIPE_WATER_RELEVEL   Pipe::WaterRelevel
+#define PIPE_WATER_SURFACE   Pipe::WaterSurface
 
 #define K_COMPUTE  Kind::Compute
 #define K_INDIRECT Kind::ComputeIndirect

@@ -1412,7 +1412,17 @@ constexpr uint32_t kWaterChunkCap = 1024;
 // still there and are still spare. M5 widened it again, to 27: the re-audit
 // arm, its attribution tick, and the RESOLVED sweep level (WBS_REAUDIT /
 // WBS_AUDITTICK / WBS_SWEEPY in common.wgsl).
-constexpr uint32_t kWaterBodyStateWords = 27;
+//
+// W1 widened it to 39: the RELEVEL block (docs/PLAN_water_relevel.md §3.2/§3.3
+// — WBS_RV* in common.wgsl). Twelve words, and every one of them is `RV`
+// rather than `R`: WBS_RSUM (word 12) is ALREADY the adoption/re-audit
+// reduce's running sum, and a re-audit can run while a body is hot and
+// relevelling, so aliasing the two sets would have one pass zeroing the
+// other's accumulator on the tick it mattered most. The twelfth is WBS_RVBASE,
+// which the plan's word list did not have and the implementation needs: the
+// ledger consumes LAST tick's histogram and may lower the level THIS tick, so
+// the bucket origin has to be published by the pass that filled the buckets.
+constexpr uint32_t kWaterBodyStateWords = 39;
 // DRAIN OP SLOTS PER BODY (component 6). The discharge is emitted through the
 // existing spawnAppend seam, which reads a CPU-sized op stream — so the CPU
 // RESERVES a contiguous block per body it proposes and the GPU fills it. This
@@ -1441,6 +1451,7 @@ constexpr uint32_t kWaterDrainOpsPerBody = 512;
 //   [0, kWaterBodyCap * kWaterBodyStateWords)                the ledger
 //   [kWaterCurveBase, + kWaterBodyCap * kWaterCurveWords)    per-body sweep
 //   [kWaterSweepScratchBase, + kWaterSweepScratchWords)      shared scratch
+//   [kWaterRelevelHistBase, + kWaterBodyCap * kWaterRelevelBuckets)  W1 hist
 //
 // THE SPLIT GRID IS A DOWNSAMPLE, and that is the one approximation in M5.
 // Connectivity is computed on a `kWaterSplitGrid`^2 grid laid over the basin's
@@ -1474,11 +1485,40 @@ static_assert(kWaterCurveWords == kWaterSweepHeaderWords + kWaterCurveMaxY +
 // schedule is `basinId % N == tick % N`, plan §3.4), so the openness bitmap the
 // label propagation reads has one writer and one reader per tick.
 constexpr uint32_t kWaterSweepScratchWords = 128;
-constexpr uint32_t kWaterCurveBase = kWaterBodyCap * kWaterBodyStateWords;  // 1664
+constexpr uint32_t kWaterCurveBase = kWaterBodyCap * kWaterBodyStateWords;
 constexpr uint32_t kWaterSweepScratchBase =
     kWaterCurveBase + kWaterBodyCap * kWaterCurveWords;
-constexpr uint32_t kWaterBodyStateTotalWords =
+
+// ---- W1: the RELEVEL HISTOGRAM (docs/PLAN_water_relevel.md §3.2) ----------
+//
+// One bucket per EIGHTH of free-surface height in the band the measure looks
+// at, per body. `wbSurface` accumulates into it; `wbLedger` walks it next tick
+// to publish the give/take cutoffs and ZEROES the block as it consumes it.
+//
+// WHY IT LIVES PAST THE SWEEP SCRATCH AND NOT AT `kWaterCurveBase +
+// kWaterBodyCap * kWaterCurveWords`. That expression IS
+// `kWaterSweepScratchBase` — the shared openness bitmap the split's label
+// propagation reads — so the first draft of the plan would have laid 68 KiB of
+// histogram straight over it, and the symptom would have been a basin that
+// split wrongly only while some other basin was relevelling. Appended AFTER
+// the scratch, which is what "past the END of the existing layout
+// (kWaterBodyStateTotalWords)" has to mean. Still no new binding.
+//
+// THE DEPTH IS A KNOB BUT THE BLOCK IS NOT. `sim.waterRelevelDepth` decides
+// how far below `level` the measure looks; the BUFFER has to be sized at
+// compile time, so the knob is clamped to this ceiling in the shader and the
+// block is sized from the ceiling. A column further down than this clamps into
+// the end bucket and is treated as "deep" — bounded, and a column 32 voxels
+// below the surface is a hole the MPM owns anyway.
+constexpr uint32_t kWaterRelevelDepthMax = 32;
+// 8 eighths per voxel, over [level - DEPTH, level + 1]: DEPTH + 2 voxels.
+constexpr uint32_t kWaterRelevelBuckets = 272;
+static_assert(kWaterRelevelBuckets == 8 * (kWaterRelevelDepthMax + 2),
+              "kWaterRelevelBuckets must cover 8*(depth+2) eighths");
+constexpr uint32_t kWaterRelevelHistBase =
     kWaterSweepScratchBase + kWaterSweepScratchWords;
+constexpr uint32_t kWaterBodyStateTotalWords =
+    kWaterRelevelHistBase + kWaterBodyCap * kWaterRelevelBuckets;
 // THE SCHEDULE PERIOD (plan §3.4). A basin re-derives on ticks where
 // `slot % kWaterSweepPeriod == tick % kWaterSweepPeriod`, and one LEVEL of its
 // column AABB per scheduled tick. So a full re-derive of a 26-deep bowl costs
@@ -1793,7 +1833,23 @@ struct TickParams {
   // thing that catches it; see vizActive's own note above for the last time.
   // M5 spent two of the five on the sweep schedule above; the total is
   // unchanged, which is why widening TickParams here moved nothing.
-  uint32_t padWb2 = 0;
+  // ---- W1: RELEVEL, THE RATE AND THE ARM IN ONE WORD ---------------------
+  //
+  // `sim.waterRelevelMax` — eighths a column may move per tick — but ZEROED BY
+  // THE CPU on any tick `WaterBodyGpu::writesThisTick` is false, and that is
+  // the load-bearing half. The relevel is the second voxel WRITER in this
+  // subsystem, so it may only run on a tick whose chunks were declared to the
+  // page table; `writesThisTick` is the CPU's own answer to that and it does
+  // not otherwise reach the GPU. Sending the knob through this word rather than
+  // reading TUNE_WATER_RELEVEL_MAX in the kernel makes the arm and the rate ONE
+  // number with one owner — a kernel that read the tuning const directly would
+  // relevel into a JITTER sentinel the first tick the hot window closed, and
+  // the symptom would be page faults, not a wrong lake.
+  //
+  // (The other two knobs, `sim.waterRelevelGain` and `sim.waterRelevelDepth`,
+  // stay TUNE_* consts: they shape the rule, not whether it may write, and
+  // const-eval keeps the divide and the loop bound out of the uniform.)
+  int32_t waterRelevelMax = 0;
   uint32_t padWb3 = 0;
   uint32_t padWb4 = 0;
   // kWaterBodyCap bodies x kWaterBodyWords i32 words, declared WGSL-side as

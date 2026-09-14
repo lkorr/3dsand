@@ -619,8 +619,12 @@ struct TickParams {
   // scheduled", which is every tick of a lake nobody has dug into.
   waterSweepSlot  : u32,
   waterSweepLevel : i32,
-  padWb2 : u32,            // see the alignment arithmetic in world.h
-  padWb3 : u32,
+  // W1: the relevel rate AND its arm, in one word. The CPU zeroes it on any
+  // tick the body's footprint is not declared to the page table
+  // (WaterBodyGpu::writesThisTick), because relevel WRITES voxels — see the
+  // note on waterRelevelMax in world.h.
+  waterRelevelMax : i32,
+  padWb3 : u32,            // see the alignment arithmetic in world.h
   padWb4 : u32,
   // WATERBODY_CAP bodies x 2 rows. The literal 128 is deliberate, exactly like
   // windPrims' 96: this file and world.h are compared on TOTAL SIZE by
@@ -735,6 +739,76 @@ const WBS_AUDITTICK : u32 = 25u;  // attribution: the last re-audit's tick
 const WBS_SWEEPY    : u32 = 26u;
 const WB_SWEEP_LIVE : i32 = -0x7FFFFFFF;
 const WB_SWEEP_NONE : i32 = -0x40000001;
+
+// ============================================================================
+// W1 — THE RELEVEL BLOCK (docs/PLAN_water_relevel.md §3).
+//
+// The shave's mirror image. The shave only ever moves a body's surface DOWN,
+// uniformly, because a drain is a global potential with one number behind it.
+// Relevel moves individual COLUMNS toward the body's own mean surface, which
+// is the operation the reach-1 CA provably cannot perform: its equalize branch
+// fires at a 2-eighth difference, so a ramp of 1 eighth per 2 cells is a stable
+// fixed point and a 5-voxel cone over an 80-cell radius is PERMANENT.
+//
+// `RV`, NOT `R`. WBS_RSUM (word 12) is the adoption/re-audit reduce's running
+// eighth sum and it is live whenever a dug basin re-measures — which is exactly
+// when a body is also relevelling. Two accumulators sharing a word is one pass
+// zeroing the other's tally on the tick it mattered.
+//
+// THE CADENCE IS THE SHAVE'S, one pass further out (plan §3.3, "never read a
+// tally in the pass that writes it"): `wbSurface` fills RVCOUNT/RVSUM and the
+// histogram at the END of this tick's row block, `wbLedger` turns them into
+// cutoffs at the START of the next one, `wbRelevel` spends the cutoffs and
+// reports what it actually moved, and the ledger banks that difference.
+const WBS_RVCOUNT   : u32 = 27u;  // columns the measure found a free surface in
+const WBS_RVSUM     : u32 = 28u;  // sum of their heights, in eighths (8y + full)
+// Published by the ledger from LAST tick's measure, read by the apply.
+const WBS_RVMEAN    : u32 = 29u;  // floor(RVSUM / RVCOUNT), eighths
+// The give/take cutoffs, published exactly as the shave publishes STEPS/FRAC:
+// a whole-bucket threshold plus a dither numerator for the partial bucket at
+// the boundary. A column at the cutoff acts iff
+// `hash3(seed, tick, worldColumnKey) % h[cut] < frac` — the key is the WORLD
+// column, never a chunk-list index, because a list reorders and an index used
+// as an IDENTITY must be the stable one.
+const WBS_RVTAKECUT : u32 = 30u;  // s <  cut takes; s == cut takes on the dither
+const WBS_RVTAKEFRAC : u32 = 31u;
+const WBS_RVGIVECUT : u32 = 32u;  // s >  cut gives; s == cut gives on the dither
+const WBS_RVGIVEFRAC : u32 = 33u;
+// THIS tick's apply report, cleared by the ledger that reads it. Debit what was
+// GRANTED, never what was demanded — the master plan's §3.2, and the reason
+// these are atomics the apply increments rather than the ledger's prediction.
+const WBS_RVGIVEN   : u32 = 34u;
+const WBS_RVTAKEN   : u32 = 35u;
+// THE CREDIT, and it is a STORED field for the reason WBS_DEBIT is: a
+// conservation gate that has to infer a term cannot attribute a failure.
+// `credit += GIVEN - TAKEN` each tick. It may go NEGATIVE — the histogram the
+// cutoffs came from is one tick old, so a take can outrun its gives by a
+// bounded amount. That is water borrowed from the body against next tick's
+// gives, not water invented: while `credit < 0` the ledger publishes NO take
+// cutoff and the gives pay it back first.
+const WBS_RVCREDIT  : u32 = 36u;
+// Attribution: eighths the cutoffs asked for that no cell could hold (a give
+// column whose top cell was thinner than k, a take column whose cell above was
+// not air). Recorded, never asserted — CLAUDE.md rule 6's "a bare count is not
+// a measurement", built in before it is needed.
+const WBS_RVCAPPED  : u32 = 37u;
+// THE HISTOGRAM'S OWN ORIGIN, in eighths, published by the measure that filled
+// it. Not re-derived by the ledger from WBS_LEVEL, and that is not caution: the
+// ledger consumes a histogram written LAST tick and may itself lower the level
+// this tick, so a re-derived base would read every bucket eight slots out on
+// exactly the ticks a lake is draining and relevelling at once.
+const WBS_RVBASE    : u32 = 38u;
+// "Nothing on this side." Deliberately outside any legal eighth height, and on
+// the side that makes the apply's comparison false for every column: no take
+// below a cutoff of -0x40000000, no give above a cutoff of +0x40000000.
+const WB_RV_NOTAKE  : i32 = -0x40000000;
+const WB_RV_NOGIVE  : i32 = 0x40000000;
+// The histogram block's base for body `b`. WATER_RELEVEL_HIST_BASE and
+// WATER_RELEVEL_BUCKETS are GENERATED from world.h (kWaterRelevelHistBase),
+// like every other layout constant in this file.
+fn wbHistBase(b : u32) -> u32 {
+  return WATER_RELEVEL_HIST_BASE + b * WATER_RELEVEL_BUCKETS;
+}
 
 // The ladder, GPU side. Candidate -> Measuring -> Adopted, and Releasing is the
 // way out. Measuring is its own state rather than a flag because the reduce is

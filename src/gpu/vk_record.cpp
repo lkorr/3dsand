@@ -23,7 +23,11 @@ namespace vk {
 // either header because a hub header costs the whole tree a recompile and this
 // assertion needs to hold in exactly one place to hold everywhere. Raise BOTH
 // literals together if it ever fires.
-static_assert((int)pass::Pipe::ShadowResolve < 64,
+//
+// It fired, exactly as designed, when W1's `wbRelevel`/`wbSurface` took the
+// count to 66 — a compile error naming the two arrays instead of a write past
+// them inside the recorder. Both are 96 now.
+static_assert((int)pass::Pipe::ShadowResolve < 96,
               "pass::Pipe has outgrown the 64-entry pipeline tables in "
               "rhi_record.h and vk_record.h -- raise BOTH");
 

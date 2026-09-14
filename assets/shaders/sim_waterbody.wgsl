@@ -176,6 +176,18 @@ fn swSet(b : u32, w : u32, v : i32) {
   atomicStore(&waterBodyState[wbCurveBase(b) + w], v);
 }
 
+// ---- W1: the relevel histogram, past the sweep scratch in the same buffer --
+// Cleared at every point a descriptor's LEDGER is cleared, and for the same
+// reason: a slot is reused, and a histogram carried across a re-adoption is a
+// description of a lake that is no longer there. The ledger's own per-tick
+// consume-and-zero is separate and is the hot path; this is the cold one.
+fn wbClearHist(b : u32) {
+  let base = wbHistBase(b);
+  for (var i = 0u; i < WATER_RELEVEL_BUCKETS; i++) {
+    atomicStore(&waterBodyState[base + i], 0);
+  }
+}
+
 // The two CPU-sent rows. Read straight off the module-scope uniform rather than
 // through a helper that takes TickParams BY VALUE: common.wgsl:522 records what
 // the by-value form costs when a function dynamically indexes a uniform array —
@@ -347,6 +359,7 @@ fn wbLedger(@builtin(global_invocation_id) gid : vec3<u32>) {
   if (b >= T.waterBodyCount) {
     if (wbGet(b, WBS_STATE) != WB_CANDIDATE) {
       for (var w = 0u; w < WATERBODY_STATE_WORDS; w++) { wbSet(b, w, 0); }
+      wbClearHist(b);
     }
     return;
   }
@@ -455,6 +468,7 @@ fn wbLedger(@builtin(global_invocation_id) gid : vec3<u32>) {
     // outstanding debit can be paid off first.
     if (st == WB_CANDIDATE || st == WB_MEASURING) {
       for (var w = 0u; w < WATERBODY_STATE_WORDS; w++) { wbSet(b, w, 0); }
+      wbClearHist(b);
       return;
     }
   }
@@ -517,6 +531,29 @@ fn wbLedger(@builtin(global_invocation_id) gid : vec3<u32>) {
     wbSet(b, WBS_EMIT, 0);
     wbSet(b, WBS_JETV, 0);
     wbSet(b, WBS_EXSHELL, 0);
+    // W1: the relevel block starts EMPTY, for the reason the hole record does.
+    // A body re-adopted after a release must rediscover its surface from the
+    // voxels — the descriptor is a cache of aggregates over the world, and a
+    // carried histogram is a description of a lake that is no longer there.
+    // `credit` goes with it: it is a statement about eighths this body moved
+    // between its own columns, and this is not that body any more.
+    wbSet(b, WBS_RVCOUNT, 0);
+    wbSet(b, WBS_RVSUM, 0);
+    wbSet(b, WBS_RVMEAN, 0);
+    wbSet(b, WBS_RVTAKECUT, WB_RV_NOTAKE);
+    wbSet(b, WBS_RVTAKEFRAC, 0);
+    wbSet(b, WBS_RVGIVECUT, WB_RV_NOGIVE);
+    wbSet(b, WBS_RVGIVEFRAC, 0);
+    wbSet(b, WBS_RVGIVEN, 0);
+    wbSet(b, WBS_RVTAKEN, 0);
+    wbSet(b, WBS_RVCREDIT, 0);
+    wbSet(b, WBS_RVCAPPED, 0);
+    // The measure runs LATER THIS TICK and needs a base; the ledger will not
+    // run again before it does. Same single evaluation as the tail below.
+    wbSet(b, WBS_RVBASE,
+          8 * (lvl - clamp(TUNE_WATER_RELEVEL_DEPTH, 0,
+                           WATER_RELEVEL_DEPTH_MAX)));
+    wbClearHist(b);
     wbSet(b, WBS_STATE, WB_ADOPTED);
     return;
   }
@@ -723,6 +760,172 @@ fn wbLedger(@builtin(global_invocation_id) gid : vec3<u32>) {
   wbSet(b, WBS_SEEN, 0);
   wbSet(b, WBS_ATLEVEL, 0);
 
+  // ==========================================================================
+  // W1 — THE RELEVEL DECISION (docs/PLAN_water_relevel.md §3.3).
+  //
+  // The shave above moves the WHOLE surface down by one number. This moves
+  // individual COLUMNS toward the body's own mean, and it exists because the
+  // reach-1 CA provably cannot: its equalize branch fires only at a 2-eighth
+  // difference, so a ramp of 1 eighth per 2 cells is a stable fixed point and a
+  // 5-voxel cone over an 80-cell radius is PERMANENT. Flatter than reach 1
+  // allows needs a global operation, and this ledger already is one.
+  //
+  // Same cadence, one pass further out: `wbSurface` filled the histogram at the
+  // END of last tick's row block, this consumes it, and `wbRelevel` spends the
+  // cutoffs later in THIS tick and reports what it actually moved. Never read a
+  // tally in the pass that writes it (plan §3.3), at pass granularity.
+  // ==========================================================================
+  //
+  // (R1) BANK WHAT THE APPLY ACTUALLY MOVED. Debit what was GRANTED, never what
+  // was demanded — the master plan's §3.2, and the whole reason RVGIVEN/RVTAKEN
+  // are atomics the apply increments rather than this pass's own prediction.
+  // The histogram the cutoffs came from is one tick stale and the CA may have
+  // moved surface cells under it, so a take can outrun its gives by a bounded
+  // amount on one tick. `credit` is the record of that, and it may go negative:
+  // water borrowed from the body against next tick's gives, not water invented.
+  var credit = wbGet(b, WBS_RVCREDIT) + wbGet(b, WBS_RVGIVEN) -
+               wbGet(b, WBS_RVTAKEN);
+  wbSet(b, WBS_RVGIVEN, 0);
+  wbSet(b, WBS_RVTAKEN, 0);
+
+  let rvCount = wbGet(b, WBS_RVCOUNT);
+  let rvSum = wbGet(b, WBS_RVSUM);
+  let rvHistBase = wbHistBase(b);
+  let rvBase = wbGet(b, WBS_RVBASE);
+  wbSet(b, WBS_RVCOUNT, 0);
+  wbSet(b, WBS_RVSUM, 0);
+
+  // The identities. An apply that reads these returns after five loads: no
+  // column is below WB_RV_NOTAKE and none is above WB_RV_NOGIVE.
+  var rvMean = 0;
+  var takeCut = WB_RV_NOTAKE;
+  var takeFrac = 0;
+  var giveCut = WB_RV_NOGIVE;
+  var giveFrac = 0;
+
+  if (st == WB_ADOPTED && rvCount > 0 && T.waterRelevelMax > 0) {
+    rvMean = rvSum / rvCount;         // floor; the mean surface, in eighths
+    let rvGain = max(TUNE_WATER_RELEVEL_GAIN, 1);
+    let rvMax = clamp(T.waterRelevelMax, 1, WB_MAX_STEPS);
+
+    // ---- what the surface can give, and what it wants ---------------------
+    // `min(k, |s - m|)` on both sides is the NEVER PAST THE MEAN clamp: a
+    // column may not give itself below m or take itself above it, so the
+    // relaxation cannot overshoot and cannot oscillate. Bounds: 8 eighths x
+    // 20k columns is 160,000, three orders inside i32.
+    var supplyE = 0;
+    var demandE = 0;
+    for (var i = 0u; i < WATER_RELEVEL_BUCKETS; i++) {
+      let hb = atomicLoad(&waterBodyState[rvHistBase + i]);
+      if (hb <= 0) { continue; }
+      let sv = rvBase + i32(i);
+      let d = sv - rvMean;
+      if (d > 0) {
+        supplyE = supplyE + min(clamp(d / rvGain, 1, rvMax), d) * hb;
+      } else if (d < 0) {
+        demandE = demandE + min(clamp((-d) / rvGain, 1, rvMax), -d) * hb;
+      }
+    }
+
+    // ---- the credit clamp, and it IS §3.5 written once --------------------
+    // While the body owes (credit < 0) it takes NOTHING and its gives repay the
+    // debt first. That is the WB_RELEASING argument — a released body keeps
+    // shaving until the ledger is square — applied in the other direction, and
+    // it cannot stall: credit < 0 means the voxels hold more than the record,
+    // so the mean is above what it was and some column is above the mean.
+    var takeE = 0;
+    var giveE = 0;
+    if (credit >= 0) {
+      takeE = min(supplyE + credit, demandE);
+      giveE = max(takeE - credit, 0);     // <= supplyE by construction
+    } else {
+      takeE = 0;
+      giveE = min(-credit, supplyE);
+    }
+
+    // ---- the cutoffs ------------------------------------------------------
+    // Walk the histogram from the LOWEST bucket up until takeE is spent and
+    // from the HIGHEST down until giveE is spent. The last bucket on each side
+    // is PARTIAL and is published as a cutoff plus a dither, exactly as the
+    // shave publishes WBS_STEPS/WBS_FRAC — except the denominator is that one
+    // bucket's population rather than the whole surface, so the frac word
+    // carries BOTH: `(h[cut] << 16) | columnsThatAct`. It has to, because this
+    // pass zeroes the histogram before the apply could read h[cut] itself
+    // (one pass, one owner). Both halves are clamped to 16 bits; a body with
+    // more than 65,535 columns at one eighth-height loses dither PRECISION and
+    // never an eighth, since the apply reports what it moved.
+    var rem = takeE;
+    if (takeE > 0) {
+      for (var i = 0u; i < WATER_RELEVEL_BUCKETS; i++) {
+        let sv = rvBase + i32(i);
+        if (sv >= rvMean) { break; }
+        let hb = atomicLoad(&waterBodyState[rvHistBase + i]);
+        if (hb <= 0) { continue; }
+        let per = min(clamp((rvMean - sv) / rvGain, 1, rvMax), rvMean - sv);
+        let cost = per * hb;
+        if (rem >= cost) {
+          rem = rem - cost;
+          takeCut = sv + 1;      // this whole bucket takes; the cut clears it
+          takeFrac = 0;
+        } else {
+          takeCut = sv;
+          takeFrac = (min(hb, 65535) << 16) |
+                     min(rem / max(per, 1), min(hb, 65535));
+          break;
+        }
+      }
+    }
+    var remG = giveE;
+    if (giveE > 0) {
+      for (var j = 0u; j < WATER_RELEVEL_BUCKETS; j++) {
+        let i = WATER_RELEVEL_BUCKETS - 1u - j;
+        let sv = rvBase + i32(i);
+        if (sv <= rvMean) { break; }
+        let hb = atomicLoad(&waterBodyState[rvHistBase + i]);
+        if (hb <= 0) { continue; }
+        let per = min(clamp((sv - rvMean) / rvGain, 1, rvMax), sv - rvMean);
+        let cost = per * hb;
+        if (remG >= cost) {
+          remG = remG - cost;
+          giveCut = sv - 1;
+          giveFrac = 0;
+        } else {
+          giveCut = sv;
+          giveFrac = (min(hb, 65535) << 16) |
+                     min(remG / max(per, 1), min(hb, 65535));
+          break;
+        }
+      }
+    }
+  }
+
+  // ZERO THE BLOCK THIS PASS JUST CONSUMED. The ledger is the only reader and
+  // the only clearer, so `wbSurface` always accumulates into a clean histogram
+  // and a sighting can never be counted twice — the same discipline WBS_SHAVED
+  // and WBS_HOLEKEYN are cleared under, and the reason nobody else may touch
+  // these words. Skipped entirely when nothing was measured, which is every
+  // tick of a still lake: 272 stores per body per tick would not be a large
+  // cost, but it would not be ZERO, and zero at rest is the property.
+  if (rvCount > 0) {
+    for (var i = 0u; i < WATER_RELEVEL_BUCKETS; i++) {
+      atomicStore(&waterBodyState[rvHistBase + i], 0);
+    }
+  }
+  wbSet(b, WBS_RVMEAN, rvMean);
+  wbSet(b, WBS_RVTAKECUT, takeCut);
+  wbSet(b, WBS_RVTAKEFRAC, takeFrac);
+  wbSet(b, WBS_RVGIVECUT, giveCut);
+  wbSet(b, WBS_RVGIVEFRAC, giveFrac);
+  wbSet(b, WBS_RVCREDIT, credit);
+  // THE HISTOGRAM'S ORIGIN FOR THIS TICK'S MEASURE, published from the level
+  // this pass just settled on. Single evaluation, exactly as WBS_SWEEPY is:
+  // `wbSurface` must not recompute it, because the level it would read is the
+  // one this pass wrote and the ledger NEXT tick would read a base derived
+  // from a level that had since moved.
+  wbSet(b, WBS_RVBASE,
+        8 * (level - clamp(TUNE_WATER_RELEVEL_DEPTH, 0,
+                           WATER_RELEVEL_DEPTH_MAX)));
+
   // ---- the exit, and why it is not immediate -----------------------------
   // Release must be MASS-EXACT in both directions (plan §5). An outstanding
   // debit is water this system has already accounted as gone that is still
@@ -733,6 +936,7 @@ fn wbLedger(@builtin(global_invocation_id) gid : vec3<u32>) {
   if (st == WB_ADOPTED && (flags & WBF_RELEASE) != 0) { st = WB_RELEASING; }
   if (st == WB_RELEASING && debit == 0) {
     for (var w = 0u; w < WATERBODY_STATE_WORDS; w++) { wbSet(b, w, 0); }
+    wbClearHist(b);
     return;
   }
   wbSet(b, WBS_STATE, st);
@@ -901,6 +1105,304 @@ fn wbShave(@builtin(workgroup_id) wg : vec3<u32>,
       atomicAdd(&waterBodyState[wbBase(b) + WBS_CAPPED], want - take);
     }
     break;   // one surface cell per column per tick — see the header
+  }
+}
+
+// ============================================================================
+// W1 — THE COLUMN OWNERSHIP RULE, and it is shared by both new passes.
+//
+// `wbSurface` and `wbRelevel` are one thread per (x,z) COLUMN, and a column
+// must be visited EXACTLY ONCE per tick: the measure would otherwise count one
+// surface twice and the apply would move one cell twice. The shave does not
+// have this problem because its band is two Y values and its predicate admits
+// one cell in a contiguous column; these two look DOWN a band up to
+// TUNE_WATER_RELEVEL_DEPTH voxels deep, which straddles two or three of a
+// body's listed chunk layers.
+//
+// So ONE chunk layer owns the column: the one holding the body's `level`. That
+// layer is always listed (it is where the shave works), it is the same layer
+// for every column of the body, and the walk below simply reads DOWNWARD
+// through the page table — `voxWordAt` resolves a cross-chunk read, and a
+// sentinel synthesizes rather than faulting.
+//
+// It is also the chunk-level early-out the shave has: a listed chunk in the
+// wrong Y layer returns after three scalar loads, so a body's whole footprint
+// can be listed and the dispatch still only works where the surface is.
+fn wbColumnLayer(wcy : i32, level : i32) -> bool {
+  return wcy == (level >> CHUNK_SHIFT);
+}
+// The band's floor. NEVER BELOW THE BASIN FLOOR, and that is a page-table
+// argument rather than a physical one: the body's chunk list covers its water
+// AABB, which starts at floorY. A column whose water sits under the floor (the
+// bottom of a fresh crater) is outside the declared footprint, and a relevel
+// write there would be a lost eighth reported as a page fault. It is also the
+// right answer physically — that pocket is the MPM's and the CA's, and both
+// fill it fast (plan §3.8).
+fn wbBandFloor(level : i32, floorY : i32) -> i32 {
+  return max(level - clamp(TUNE_WATER_RELEVEL_DEPTH, 0,
+                           WATER_RELEVEL_DEPTH_MAX),
+             floorY + 1);
+}
+// The free surface of this column inside the band, as an absolute height in
+// EIGHTHS (8*y + fullness), or WB_RV_NOTAKE for "this column has none".
+//
+// THE PREDICATE IS THE SHAVE'S, PLUS ONE THING: the cell above must be AIR.
+// The shave only needs "nothing of ours above" because it is taking water off
+// a surface it already owns. A relevel is deciding whether a column is part of
+// the body's FREE SURFACE at all, and a roofed pocket — water under a ledge,
+// water in a flooded tunnel below the bank — is not a free surface. Requiring
+// air is what keeps this rule out of the caves that open under a bank.
+fn wbColumnSurface(x : i32, z : i32, mat : i32, yTop : i32, yBot : i32,
+                   outY : ptr<function, i32>, outFull : ptr<function, i32>,
+                   outWord : ptr<function, u32>) -> i32 {
+  for (var y = yTop; y >= yBot; y--) {
+    let c = vec3<i32>(x, y, z);
+    let w = voxWordAt(c);
+    if (i32(voxMat(w)) != mat) { continue; }
+    // Not air above: either our own liquid continues above the band (this
+    // column's surface is somewhere else) or something roofs it. Either way
+    // this column does not report, and the cost is bounded by the walk.
+    if (voxMat(voxWordAt(c + vec3<i32>(0, 1, 0))) != MAT_AIR) { break; }
+    *outY = y;
+    *outFull = i32(voxState(w)) + 1;         // 1..8 eighths
+    *outWord = w;
+    return 8 * y + i32(voxState(w)) + 1;
+  }
+  return WB_RV_NOTAKE;
+}
+
+// ============================================================================
+// W1 — THE MEASURE (`wbSurface`, plan §3.2). One workgroup per listed chunk,
+// one thread per column.
+//
+// LAST WRITER IN THE BLOCK READS LAST. This runs after the shave and after the
+// relevel so next tick's ledger sees the surface this tick actually settled on,
+// and the ledger consumes it ONE TICK LATER — the shave report's own cadence,
+// which is plan §3.3 at pass granularity.
+//
+// Order-free atomics only, and all three of them are adds: a count, a sum and
+// one histogram bucket. No CAS, no ordering, no scheduling dependence.
+// ============================================================================
+@compute @workgroup_size(16, 1, 16)
+fn wbSurface(@builtin(workgroup_id) wg : vec3<u32>,
+             @builtin(local_invocation_id) li : vec3<u32>) {
+  if (wg.x >= T.waterChunkCount) { return; }
+  let e = wbChunkEntry(wg.x);
+  let b = e >> 16u;
+  let slot = e & 0xFFFFu;
+  if (b >= T.waterBodyCount) { return; }
+  // THE ARM AND THE RATE IN ONE WORD. The CPU zeroes `waterRelevelMax` on any
+  // tick this body's footprint is not declared to the page table, so at rest —
+  // and at `sim.waterRelevelMax` 0 — this pass costs one uniform load.
+  if (T.waterRelevelMax <= 0) { return; }
+  let st = wbGet(b, WBS_STATE);
+  if (st != WB_ADOPTED) { return; }
+  let level = wbGet(b, WBS_LEVEL);
+  let wc = wbSlotWorldChunk(slot);
+  if (!wbColumnLayer(wc.y, level)) { return; }
+  // A chunk the solver has a block in is not a chunk with a free surface: its
+  // cells are mid-transfer and reading their fullness as a lake height would
+  // freeze a transient into the mean (plan §3.8's MPM row).
+  if (fluidBlockMapS[slot] != 0u) { return; }
+
+  let g = wbGeom(b);
+  let seed = wbSeed(b);
+  let x = wc.x * i32(CHUNK) + i32(li.x);
+  let z = wc.z * i32(CHUNK) + i32(li.z);
+  if (!wbOwns(wbMapOwner(b, seed.w), wbComp(seed.w), x, z, g,
+              i32(wbIsqrt(u32(max(g.z, 0)))))) {
+    return;
+  }
+
+  var sy = 0;
+  var sfull = 0;
+  var sw = 0u;
+  let s = wbColumnSurface(x, z, g.w, level + 1, wbBandFloor(level, seed.x),
+                          &sy, &sfull, &sw);
+  if (s == WB_RV_NOTAKE) { return; }
+
+  atomicAdd(&waterBodyState[wbBase(b) + WBS_RVCOUNT], 1);
+  // Sigma s over 20k columns at s ~ 2,500 is 50 M — safe in i32 with three
+  // orders to spare, which is the whole reason the measure is a SUM and a
+  // COUNT rather than a running average nobody can audit.
+  atomicAdd(&waterBodyState[wbBase(b) + WBS_RVSUM], s);
+  // The bucket, against the origin the LEDGER published (WBS_RVBASE). Anything
+  // outside the band clamps into an end bucket and is treated as "deep" or
+  // "high" — bounded, and a column 32 voxels below the level is a hole the MPM
+  // owns anyway.
+  let bi = u32(clamp(s - wbGet(b, WBS_RVBASE), 0,
+                     i32(WATER_RELEVEL_BUCKETS) - 1));
+  atomicAdd(&waterBodyState[wbHistBase(b) + bi], 1);
+}
+
+// ============================================================================
+// W1 — THE APPLY (`wbRelevel`, plan §3.4). One workgroup per listed chunk, one
+// thread per column, and the write reach is ZERO in XZ: a thread writes only
+// in its own column, so this pass is lattice-safe by construction with no
+// mark/apply, exactly as the shave is.
+//
+// AFTER THE SHAVE, AND THAT ORDERING IS LOAD-BEARING. The shave owns the band
+// [level-1, level] on any tick it has an instruction to carry out; a relevel
+// that also touched a cell there would be two rules writing one word. So a
+// column whose surface sits in that band is SKIPPED while
+// `WBS_STEPS | WBS_FRAC` is nonzero, and on every other tick the shave is not
+// running at all and the whole surface is this pass's.
+// ============================================================================
+@compute @workgroup_size(16, 1, 16)
+fn wbRelevel(@builtin(workgroup_id) wg : vec3<u32>,
+             @builtin(local_invocation_id) li : vec3<u32>) {
+  if (wg.x >= T.waterChunkCount) { return; }
+  let e = wbChunkEntry(wg.x);
+  let b = e >> 16u;
+  let slot = e & 0xFFFFu;
+  if (b >= T.waterBodyCount) { return; }
+  let rvMax = T.waterRelevelMax;
+  if (rvMax <= 0) { return; }
+  let st = wbGet(b, WBS_STATE);
+  if (st != WB_ADOPTED) { return; }
+  let takeCut = wbGet(b, WBS_RVTAKECUT);
+  let giveCut = wbGet(b, WBS_RVGIVECUT);
+  // The ledger published nothing: the surface is inside {m, m+1} and there is
+  // no credit outstanding. Five loads and out — this is the resting cost of
+  // the whole feature on a flat lake inside its hot window.
+  if (takeCut == WB_RV_NOTAKE && giveCut == WB_RV_NOGIVE) { return; }
+  let level = wbGet(b, WBS_LEVEL);
+  let wc = wbSlotWorldChunk(slot);
+  if (!wbColumnLayer(wc.y, level)) { return; }
+  if (fluidBlockMapS[slot] != 0u) { return; }
+
+  let g = wbGeom(b);
+  let seed = wbSeed(b);
+  let x = wc.x * i32(CHUNK) + i32(li.x);
+  let z = wc.z * i32(CHUNK) + i32(li.z);
+  if (!wbOwns(wbMapOwner(b, seed.w), wbComp(seed.w), x, z, g,
+              i32(wbIsqrt(u32(max(g.z, 0)))))) {
+    return;
+  }
+
+  // RE-DERIVED THIS TICK, not read from the histogram. The cutoffs are a tick
+  // stale and the CA may have moved this very cell under them; acting on the
+  // stale height would move water that is not there. The drift is absorbed by
+  // the credit (plan §3.5) — which is the same "debit what was granted"
+  // discipline the shave's `capped` serves.
+  var sy = 0;
+  var sfull = 0;
+  var sw = 0u;
+  let s = wbColumnSurface(x, z, g.w, level + 1, wbBandFloor(level, seed.x),
+                          &sy, &sfull, &sw);
+  if (s == WB_RV_NOTAKE) { return; }
+
+  // The shave's band, while the shave has something to do.
+  let steps = wbGet(b, WBS_STEPS);
+  let frac = wbGet(b, WBS_FRAC);
+  if ((steps != 0 || frac != 0) && sy >= level - 1 && sy <= level) { return; }
+  // The surface may sit in a chunk layer BELOW the dispatching one (a crater
+  // the MPM is still working). Ask that chunk too.
+  let sc = worldChunkOf(vec3<i32>(x, sy, z));
+  if (!chunkInWindow(sc, T.origin)) { return; }
+  if (fluidBlockMapS[chunkSlotIndex(sc)] != 0u) { return; }
+
+  let mean = wbGet(b, WBS_RVMEAN);
+  let gain = max(TUNE_WATER_RELEVEL_GAIN, 1);
+  let rate = clamp(rvMax, 1, WB_MAX_STEPS);
+  // ONE hash for both branches. A column can never be on both sides — the take
+  // cutoff is at or below the mean and the give cutoff at or above it — so
+  // there is nothing here for a shared draw to correlate.
+  //
+  // THE KEY IS THE WORLD COLUMN. `cellIndexW` of (x, 0, z) is a pure function
+  // of where the column IS, which is what rule 1 requires of anything used as
+  // an identity: the chunk list reorders every tick, so a list index would
+  // make which columns move depend on the order the CPU happened to build it
+  // in. Same reason the shave keys on `cellIndexW(c)`.
+  let draw = hash3(T.seed, T.tick, cellIndexW(vec3<i32>(x, 0, z)));
+
+  var give = false;
+  if (s > giveCut) {
+    give = true;
+  } else if (s == giveCut) {
+    // The partial bucket, unpacked. u32 and not i32: `h << 16` sets the sign
+    // bit for any bucket over 32,767 columns and an arithmetic shift would
+    // hand back a negative population.
+    let packed = u32(wbGet(b, WBS_RVGIVEFRAC));
+    let hc = packed >> 16u;
+    let nc = packed & 0xFFFFu;
+    give = nc > 0u && (draw % max(hc, 1u)) < nc;
+  }
+  var take = false;
+  if (!give) {
+    if (s < takeCut) {
+      take = true;
+    } else if (s == takeCut) {
+      let packed = u32(wbGet(b, WBS_RVTAKEFRAC));
+      let hc = packed >> 16u;
+      let nc = packed & 0xFFFFu;
+      take = nc > 0u && (draw % max(hc, 1u)) < nc;
+    }
+  }
+
+  let c = vec3<i32>(x, sy, z);
+  if (give) {
+    // NEVER PAST THE MEAN, and never more than the top cell holds.
+    let d = s - mean;
+    let want = min(clamp(d / gain, 1, rate), d);
+    let n = min(want, sfull);
+    if (n > 0) {
+      let left = sfull - n;
+      // An emptied cell is AIR, written as a clean zero word — the stain and
+      // the stamp go with it, exactly as the shave writes it.
+      var nw = 0u;
+      if (left > 0) { nw = (sw & 0xFFFF0FFFu) | (u32(left - 1) << 12u); }
+      voxStore(voxWordIndex(c), nw);
+      atomicAdd(&waterBodyState[wbBase(b) + WBS_RVGIVEN], n);
+      wbMarkDirty(c);
+    }
+    if (want > n) {
+      atomicAdd(&waterBodyState[wbBase(b) + WBS_RVCAPPED], want - n);
+    }
+  } else if (take) {
+    let d = mean - s;
+    var want = min(clamp(d / gain, 1, rate), d);
+    // NEVER ABOVE THE BODY'S OWN LEVEL. `level + 1` may be outside the water
+    // AABB the chunk list was built from, so this is the other half of
+    // wbBandFloor's page-table argument: with this clamp the overflow cell is
+    // provably at `sy + 1 <= level`, i.e. inside the declared footprint.
+    want = max(min(want, 8 * level + 8 - s), 0);
+    let room = 8 - sfull;
+    var got = 0;
+    if (want <= room) {
+      if (want > 0) {
+        voxStore(voxWordIndex(c),
+                 (sw & 0xFFFF0FFFu) | (u32(sfull + want - 1) << 12u));
+        got = want;
+        wbMarkDirty(c);
+      }
+    } else {
+      let up = vec3<i32>(x, sy + 1, z);
+      if (voxMat(voxWordAt(up)) == MAT_AIR) {
+        if (room > 0) {
+          voxStore(voxWordIndex(c), (sw & 0xFFFF0FFFu) | (7u << 12u));
+        }
+        // The new cell: the body's material, a CLEAN stain, STAMP_NEVER (0),
+        // and the state nibble r-1. Nothing else in the word.
+        voxStore(voxWordIndex(up),
+                 u32(g.w) | (u32(want - room - 1) << 12u));
+        got = want;
+        wbMarkDirty(c);
+        wbMarkDirty(up);
+      } else if (room > 0) {
+        // Something is standing on this column. Take what fits and record the
+        // rest — refused water is still water.
+        voxStore(voxWordIndex(c), (sw & 0xFFFF0FFFu) | (7u << 12u));
+        got = room;
+        wbMarkDirty(c);
+      }
+    }
+    if (got > 0) {
+      atomicAdd(&waterBodyState[wbBase(b) + WBS_RVTAKEN], got);
+    }
+    if (want > got) {
+      atomicAdd(&waterBodyState[wbBase(b) + WBS_RVCAPPED], want - got);
+    }
   }
 }
 

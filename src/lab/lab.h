@@ -63,6 +63,17 @@ const char* LabSceneName(int scene);
 void LabSetPondRadius(int r);
 int LabPondRadius();
 
+// W1 (docs/PLAN_water_relevel.md §3.10): the CRATER variant of the two pond
+// scenes. Same bowl, same settle, a different plug — instead of a shaft into a
+// sealed chamber, a 9x9x6 box of the floor is removed and nothing drains. The
+// lake keeps every eighth and ends up with a surface DEPRESSION over the hole,
+// which is the disturbance the relevel exists to close and the one no CA rule
+// can (its equalize fires at 2 eighths, so a 1-eighth-per-2-cells ramp is a
+// fixed point). Selected as `--lab pondcrater` / `--fluid-bench pondcrater`;
+// LabSceneFromName sets it and clears it, so a plain `pond` is unchanged.
+void LabSetPondCrater(bool on);
+bool LabPondCrater();
+
 // Does this scene run on the flat lab slab (true) or on the real worldgen
 // (false)? Only kLabWorldLake answers false — it is the main-world arm of the
 // pond measurement, and it must see actual terrain, caves and the authored

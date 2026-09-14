@@ -135,6 +135,8 @@ PIPE_TO_MEMBER = {
     "PIPE_WATER_LEDGER": "waterLedger_",
     "PIPE_WATER_REDUCE": "waterReduce_",
     "PIPE_WATER_SHAVE": "waterShave_",
+    "PIPE_WATER_RELEVEL": "waterRelevel_",
+    "PIPE_WATER_SURFACE": "waterSurface_",
     "PIPE_FLUID_COMPACT_COUNT": "fluidCompactCount_",
     "PIPE_FLUID_COMPACT_SCAN": "fluidCompactScan_",
     "PIPE_FLUID_COMPACT_SCATTER": "fluidCompactScatter_",

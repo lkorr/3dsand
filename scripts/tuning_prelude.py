@@ -422,6 +422,11 @@ SPEC = [
     ("sim", "drainExciteRadius", "TUNE_DRAIN_EXCITE_RADIUS", "i", 6),
     ("sim", "drainCd", "TUNE_DRAIN_CD", "f", 0.6),
     ("sim", "drainGravity", "TUNE_DRAIN_GRAVITY", "f", 900.0),
+
+    # RELEVEL (docs/PLAN_water_relevel.md W1)
+    ("sim", "waterRelevelMax", "TUNE_WATER_RELEVEL_MAX", "i", 4),
+    ("sim", "waterRelevelGain", "TUNE_WATER_RELEVEL_GAIN", "i", 8),
+    ("sim", "waterRelevelDepth", "TUNE_WATER_RELEVEL_DEPTH", "i", 32),
     ("sim", "windMode", "TUNE_WIND_MODE", "i", 1),
     ("sim", "windDrag", "TUNE_WIND_DRAG", "f", 3.0),
     ("sim", "windFluidGain", "TUNE_WIND_FLUID_GAIN", "f", 0.35),
