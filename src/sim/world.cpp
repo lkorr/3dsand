@@ -153,6 +153,13 @@ void World::Init(const rhi::Device& device) {
   // initial value — no reader reaches a field word whose slot stamp mismatches.
   glow = CreateBuffer(device, kGlowBytes,
                       U::Storage | U::CopySrc | U::CopyDst, "glow");
+  // The repose occupancy snapshot (world.h kReposeSnap* block). The zeroed
+  // allocation is the correct cold start and needs no reset path anywhere: a
+  // slot's stamp is `tick + 1`, so 0 reads as "no snapshot for this slot" and
+  // every probe into it refuses until the prepass has written it. That is also
+  // what makes a window shift safe without a stamp invalidation pass.
+  reposeSnap = CreateBuffer(device, kReposeSnapBytes,
+                            U::Storage | U::CopySrc | U::CopyDst, "reposeSnap");
   shadowArgsStage = CreateBuffer(device, 16, U::Storage | U::CopySrc | U::CopyDst,
                                  "shadowArgsStage");
   // Indirect ONLY, and out of every bind group — same rule as dispatchArgs.

@@ -834,6 +834,7 @@ void RecordTableVulkan(const CommandEncoder& enc, pass::Table which, const Table
   cxv.waterSweepSlot = cx.waterSweepSlot;
   cxv.opennessChunks = cx.opennessChunks;
   cxv.gasActive = cx.gasActive;
+  cxv.reposeActive = cx.reposeActive;
   cxv.glowChunks = cx.glowChunks;
   cxv.hashEnable = cx.hashEnable;
   cxv.particlesActive = cx.particlesActive;

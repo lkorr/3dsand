@@ -1,5 +1,6 @@
 #pragma once
 #include <array>
+#include <atomic>
 #include <cstdint>
 #include <deque>
 #include <functional>
@@ -900,6 +901,71 @@ constexpr uint64_t kGlowBytes = (kGlowSrcWords + kGlowFieldWords) * 4;
 // ShaderConstantPrelude / check_shaders.sh edit. This mirror exists for the
 // gate's readback arithmetic only.
 constexpr uint64_t kGlowFieldBaseWord = kGlowSrcWords;
+
+// ---- THE REPOSE OCCUPANCY SNAPSHOT (assets/shaders/sim_step.wgsl) ---------
+//
+// One bit per voxel: "a powder could drop into this cell", i.e. the cell holds
+// neither a solid nor a powder. Written by `reposesnap`, a prepass recorded
+// BEFORE the CA's 54 substep dispatches over the SAME compacted dirty list the
+// CA uses, and read by the angle-of-repose stage in sim_step.wgsl.
+//
+// WHY IT HAS TO EXIST, in one paragraph, because it is the only licence in this
+// engine for a CA read past distance 1. The 3x3x3 colour lattice keeps acting
+// cells >=3 apart and bounds writes to <=1 cell, so the 3x3x3 write boxes of
+// same-colour cells TILE SPACE: every cell in the world is inside exactly one
+// acting cell's box. A read at distance <=1 is inside mine and only I can write
+// it; a read at distance >=2 is inside somebody else's box, and whether it
+// shows the pre-pass word or their write is decided by GPU scheduling. Per-
+// material repose needs to see 2 and 3 cells out (a 2:1 face and a 1:1 face are
+// locally IDENTICAL — the difference is at distance 2, which is a fact about
+// the lattice, not about the rule). So the answer is read from a snapshot of
+// the world at TICK START, which is the same in every run of the same tick,
+// instead of from live voxels.
+//
+// DELIBERATELY STALE. A drop that fills in mid-tick still reads open, the grain
+// slides toward it, the ordinary tryMove refuses, and next tick's snapshot says
+// so. Staleness is bounded by one tick and is identical in every run, which is
+// the only property rule 1 asks for.
+//
+// THE SET IT COVERS is each dirty chunk plus the NINE neighbours a probe can
+// reach -- not the 3x3x3 block's 26 -- on two one-line facts about the probe
+// offsets in sim_step.wgsl: every probe has dy <= -1 (nothing looks up), and no
+// probe offsets both lateral axes. See reposeRingOffset there, which owns the
+// table and the obligation that comes with it.
+//
+// A SIDE TABLE, per design guideline 2: the voxel word is full, and this is
+// derived data — not hashed, not saved, rebuilt every tick for exactly the
+// chunks that could be read.
+//
+// IT IS NOT A SPARSE ONE, and calling it sparse would be the wrong word for the
+// price. The ALLOCATION is DENSE: one bit for every cell in the window, all
+// 16.125 MiB resident from World::Init, about +36% on the page pool's own
+// resident bytes, paid by any world whose materials.json carries a `repose`
+// line. What is sparse is the WRITING — only the chunks a probe can reach are
+// refilled, so a settled world touches none of it. A genuinely sparse form
+// (bits only for chunks holding a repose material) would trade that flat cost
+// for an indirection in the CA's hottest read; at one bit per voxel the dense
+// form is small enough that the trade is not worth making, but it IS a trade. Indexed by the SLOT cell index (cellIndexW), so
+// word = idx >> 5 and bit = idx & 31, which is why the bitfield is exactly
+// kVoxelCount/32 words with no per-chunk arithmetic anywhere.
+//
+// PER-SLOT VALIDITY, and it is required rather than belt-and-braces: the
+// residency window is toroidal, so a slot is reused by a new world chunk as the
+// window walks, and a probe that read the previous occupant's bits would be
+// reading another place in the world. Each slot carries `tick + 1` in the tick
+// region (0 is therefore never a valid stamp, which is what makes the zeroed
+// allocation cold-start correctly) and a probe into a slot whose stamp is not
+// this tick's REFUSES. Nothing finer is needed: the window origin is constant
+// for the whole of one command buffer, so a slot cannot change occupant between
+// the prepass and the CA rows of the same tick.
+constexpr uint64_t kReposeSnapBitWords = kVoxelCount / 32;       // 16 MiB at 512^3
+constexpr uint64_t kReposeSnapTickBase = kReposeSnapBitWords;    // + kNumChunks stamps
+constexpr uint64_t kReposeSnapWords = kReposeSnapBitWords + kNumChunks;
+constexpr uint64_t kReposeSnapBytes = kReposeSnapWords * 4;      // 16.125 MiB
+// The WGSL side derives both from constants the prelude already emits
+// (NUM_CHUNKS * CHUNK_VOL / 32u), so this needs no new prelude constant; the
+// mirrors exist for the allocation and for the gate's arithmetic.
+static_assert(kVoxelCount % 32 == 0, "repose snapshot is 1 bit per voxel");
 
 // The residency window is toroidal, so a slot is reused by a new chunk as the
 // window walks. Its 384 openness bytes then describe geometry that is no longer
@@ -1915,6 +1981,15 @@ constexpr uint32_t kWaveImpactCap = 16;
 constexpr uint32_t kTrampleCap = 48;
 
 // Must match TickParams in common.wgsl.
+// The repose snapshot's epoch source -- see TickParams::snapEpoch below for
+// why it is a counter and not the tick. A function-local static so there is one
+// across every TU, and atomic because worldgen and the tick path can build a
+// TickParams from different threads.
+inline uint32_t NextSnapEpoch() {
+  static std::atomic<uint32_t> n{0};
+  return ++n;
+}
+
 struct TickParams {
   uint32_t tick;
   uint32_t seed;
@@ -2147,7 +2222,35 @@ struct TickParams {
   // layout — which check_invariants.py compares against common.wgsl on TOTAL
   // SIZE — is unchanged.
   uint32_t gasMode = 1;
-  uint32_t padCp1 = 0;
+  // ---- THE REPOSE SNAPSHOT EPOCH (kReposeSnap* above) --------------------
+  //
+  // A MONOTONIC, NEVER-RESET counter, and every word of that is load-bearing.
+  // The snapshot's per-slot validity stamp cannot be the TICK, because the tick
+  // is not monotonic: F7 regen (src/main.cpp, `tick = 0`) rewinds it with the
+  // stamp region untouched, and every selftest arm that replays a fixed tick
+  // window does the same. A slot still carrying stamp k from before the rewind
+  // would then SKIP its refill at tick k and hand the CA the PREVIOUS WORLD's
+  // occupancy bits -- same seed, same tick, same inputs, different pile,
+  // depending only on how long the session had run. This counter cannot alias
+  // that way: it only ever increases, so a stale stamp is always strictly less
+  // than the current one.
+  //
+  // INCREMENTED BY TickParams' OWN DEFAULT INITIALIZER, once per construction,
+  // which is once per recorded tick at every one of the ten call sites that
+  // build one -- no site can forget it, and a site that builds a TickParams it
+  // never submits only burns a value, which costs nothing. Starts at 1, so 0
+  // stays "no snapshot" and the zero-initialized buffer cold-starts correctly.
+  //
+  // NOT hashed state and not an input: two runs of the same seed and tick may
+  // legitimately sit at different epochs (the determinism gate's second run
+  // does, in the same process). The sim is invariant to the VALUE because the
+  // prepass writes the same epoch the CA then compares against; what it is not
+  // invariant to is a stamp from another tick reading as current, which
+  // monotonicity is exactly what rules out. It was the padCp1 pad word, so the
+  // struct layout -- which check_invariants.py compares against common.wgsl on
+  // TOTAL SIZE -- is unchanged. Wraps after 2^32 ticks, i.e. 4.5 years of
+  // continuous simulation at 30 Hz.
+  uint32_t snapEpoch = NextSnapEpoch();
   int32_t currentPrimLo[3] = {1, 1, 1};   // union AABB, inclusive world cells
   int32_t padCp2 = 0;                     // (lo > hi = no primitives)
   int32_t currentPrimHi[3] = {0, 0, 0};
@@ -3255,6 +3358,8 @@ class World {
   // an unzeroed stamp would read as valid for whatever the driver left, which
   // is the failure mode the openness grid's own comment names.
   rhi::Buffer glow;           // kGlowSrcWords + kGlowFieldWords u32 (8.5 MiB)
+  // 1 bit per voxel + one per-slot tick stamp; see the kReposeSnap* block.
+  rhi::Buffer reposeSnap;     // kReposeSnapWords u32 (16.125 MiB)
   // The second buffer a fragment shader writes, and the same argument applies:
   // measurement-only counters (kRenderStat* above), read back by the telemetry
   // path through rhi::CommandEncoder::CopyRenderWritten. 4 KiB.

@@ -39,6 +39,7 @@ namespace {
 #define PIPE_COMPACT         Pipe::Compact
 #define PIPE_COMPACT_NEXT    Pipe::CompactNext
 #define PIPE_STEP            Pipe::Step
+#define PIPE_REPOSE_SNAP     Pipe::ReposeSnap
 #define PIPE_OCCUPANCY       Pipe::Occupancy
 #define PIPE_OCCUPANCY_DIRTY Pipe::OccupancyDirty
 #define PIPE_PICK            Pipe::Pick
@@ -138,6 +139,7 @@ namespace {
 #define C_OPENNESS  Cond::Openness
 #define C_GLOW      Cond::Glow
 #define C_GAS       Cond::Gas
+#define C_REPOSE    Cond::ReposeActive
 
 #define D_WINDWAKE  (uint32_t)DispatchSel::WindWakeSel
 #define D_OPS       (uint32_t)DispatchSel::Ops

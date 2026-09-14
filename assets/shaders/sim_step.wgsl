@@ -418,6 +418,344 @@ fn tryMove(src : vec3<i32>, dst : vec3<i32>, myWord : u32, myDensity : i32, risi
   return true;
 }
 
+// ======================= ANGLE OF REPOSE (POWDERS) =========================
+//
+// WHY EVERY POWDER USED TO PILE AT EXACTLY 45 DEGREES. The chain in main() is
+// "straight down, else one of the four cells one step down and one step
+// across". One down, one across -- so a pile grows until its face drops one
+// voxel per voxel of run, and then every grain on the face fails both stages
+// and stops. That is 45 degrees, for sand, for gravel, for snow, for dust,
+// with no authored say in it. Real powders rest anywhere from about 18 degrees
+// (fine dry dust) to 70 and past it (damp cohesive snow, clay), and the
+// difference between a dune and a drift is most of what a pile LOOKS like.
+//
+// THE ANGLE IS A RUN:RISE RATIO, because a lattice CA has no other way to hold
+// one: movement is whole cells, so the expressible angles are the ones whose
+// tangent is a ratio of small integers. Five TIERS, in two families either side
+// of the rule that was already here:
+//
+//   REPOSE_3_1  3:1  18.43 deg  FLOWY  a resting grain SLIDES toward a drop 3 out
+//   REPOSE_2_1  2:1  26.57 deg  FLOWY  ... a drop 2 out
+//   REPOSE_1_1  1:1  45.00 deg         the bare down-diagonal: unchanged, and free
+//   REPOSE_1_2  1:2  63.43 deg  STEEP  the down-diagonal must drop >= 2
+//   REPOSE_1_3  1:3  71.57 deg  STEEP  ... >= 3
+//
+// The codes are the kRepose* values in src/sim/materials.h, emitted into the
+// prelude by ShaderConstantPrelude() so the two sides cannot drift; THEIR ORDER
+// IS LOAD-BEARING, because `code < REPOSE_1_2` is how the diagonal gate below
+// says "not a steep tier" in one compare, and REPOSE_1_1 is 0 so a material
+// which authors no `repose` -- and every zeroed slot in the 4096-entry table --
+// reads as the old rule.
+//
+// FLOWY: A 2:1 FACE IS ALREADY STABLE UNDER THE OLD RULES; nothing ever BUILT
+// one. Check it: on a 2:1 staircase the cell one down and one across from a
+// surface grain is the top of the next run, i.e. FILLED, so stage 2 refuses and
+// the grain rests. The reason piles came out at 45 is not that flatter faces
+// collapse -- it is that grains STOP as soon as they cannot descend, which is
+// one cell too early. So the flowy half is one extra stage: let a grain that
+// has already failed the straight fall AND all four down-diagonals take ONE
+// LATERAL STEP toward a drop it can see within its tier's run. It cannot fire
+// for a grain that could have descended, because descent is tried first and
+// returns.
+//
+// STEEP: the mirror image. A 1:2 grain takes the down-diagonal only if the
+// target has another open cell under it -- i.e. only if it would fall at least
+// 2 -- so a one-voxel step never spreads and the face grows one run per two
+// drops. The cohesive look that falls out of it (a small bump on a snow drift
+// simply stays) is the intent, not a defect.
+//
+// ---- THE READ REACH, AND WHY THERE IS A SNAPSHOT ------------------------
+//
+// This is the part that had to be got right rather than assumed.
+//
+// The 3x3x3 colour lattice (see the header of this file, and pass_table.def)
+// guarantees that within one dispatch any two acting cells are >=3 apart on
+// every axis, and that writes reach <=1 cell. That makes WRITES provably
+// disjoint. It says nothing about READS -- and the two facts together have a
+// sharp consequence that is easy to miss: the 3x3x3 write boxes of same-colour
+// cells, spaced 3 apart, TILE SPACE EXACTLY. Every cell in the world is inside
+// exactly one acting cell's write box. So:
+//
+//   * a read at distance <=1 is inside MY OWN box and only I can write it --
+//     which is precisely the argument soloSolid() makes for its six probes;
+//   * a read at distance >=2 is inside SOMEBODY ELSE'S box, and whether I see
+//     the pre-pass word or their write is a function of GPU scheduling. That is
+//     a determinism break (rule 1), not merely a race. There is no
+//     probably-fine band between the two.
+//
+// And repose cannot be done at reach 1: a 2:1 face and a 1:1 face are LOCALLY
+// IDENTICAL at a surface grain (uphill lateral filled, downhill lateral air,
+// downhill diagonal filled, cell below filled) -- the difference is at distance
+// 2. That is a fact about the lattice, not about this rule.
+//
+// So every probe here reads the REPOSE OCCUPANCY SNAPSHOT (world.h's
+// kReposeSnap* block): one bit per voxel, "a powder could drop into this cell",
+// taken by the `reposesnap` prepass at TICK START, before any CA substep of
+// this tick has written anything. A snapshot bit is the same in every run of
+// the same tick by construction, so the probe is deterministic however the
+// workgroups are scheduled.
+//
+// IT IS DELIBERATELY STALE, and the staleness is the cheap half of the design:
+// a drop that fills in mid-tick still reads open, the grain slides toward it,
+// the ordinary tryMove refuses (the destination is a powder, canDisplace says
+// no), and next tick's snapshot says so. Nothing is created or destroyed, the
+// error is bounded by one tick, and -- the only property rule 1 asks for -- it
+// is identical in every run.
+//
+// AN EARLIER DESIGN READ THE TICK STAMP OF AN AIR CELL to prove no acting cell
+// owned the probe's write box. The ownership argument was sound; the BIT was
+// not. The stamp is explicitly not representation-invariant (sim_occupancy.wgsl
+// says it "legitimately differs between two runs that reached the same world"),
+// world.h strips it on save, and pagetable.cpp's kAirDemoteMask demotes an
+// all-air chunk to PT_EMPTY ignoring stamps -- after which every cell reads
+// STAMP_NEVER. With a 7-long stamp cycle a stale stamp on vacated air aliases
+// the current substep one time in seven, so the guard would allow in one run
+// and refuse in another, and a refused slide marks nothing dirty: if it landed
+// on a grain's last attempt the chunk slept and the pile stayed one cell
+// steeper, invisibly to both the hash and the twice-run comparison. NO CA PATH
+// READS A TICK STAMP ON AN AIR CELL. main()'s own gate reads it only after
+// returning on MAT_AIR.
+
+// One bit per voxel, indexed by the SLOT cell index, plus one tick stamp per
+// slot past the end. Both halves derive from constants the prelude already
+// emits, so this needs no new world constant.
+@group(0) @binding(35) var<storage, read_write> reposeSnap : array<u32>;
+const REPOSE_SNAP_TICK_BASE : u32 = NUM_CHUNKS * CHUNK_VOL / 32u;
+
+// Would a powder be able to drop into a cell holding this word? The snapshot's
+// predicate, in one place so the prepass and the assert in the gate agree.
+//
+// AN OVER-APPROXIMATION OF canDisplace ON PURPOSE: it asks only "not solid,
+// not powder" and ignores density, so ONE bit serves every powder instead of a
+// bitfield per density class. Two consequences, both intended and both worth
+// stating because they are visible in the world:
+//
+//   * A LIQUID READS AS OPEN. A flowy grain therefore slides sideways THROUGH
+//     water toward a drop on the far side of it, rather than treating the pond
+//     as a wall -- which is right (a sinking grain does drift toward a hole)
+//     and is bounded by the fact that only the PROBE is liberal: the move
+//     itself still goes through tryMove, and canDisplace refuses any target
+//     denser than the grain. Sand slides through water; it does not slide
+//     through lava.
+//   * A cell too dense to enter reads as open, so the grain slides one cell
+//     toward a drop it then cannot take and re-evaluates next tick. That is
+//     the same harmless idling the one-tick staleness already produces.
+fn reposeSnapOpenMat(m : u32) -> bool {
+  if (m == MAT_AIR) { return true; }
+  let k = materials[m].klass;
+  return k != CLASS_SOLID && k != CLASS_POWDER;
+}
+fn reposeSnapOpenWord(w : u32) -> bool { return reposeSnapOpenMat(voxMat(w)); }
+
+// Is the snapshot for this cell's SLOT valid this tick?
+//
+// Per-slot, and required rather than belt-and-braces: the residency window is
+// toroidal, so a slot is reused by a new world chunk as the window walks, and a
+// probe that read the previous occupant's bits would be reading another place
+// in the world entirely. The stamp is the SNAP EPOCH (world.h), a monotonic
+// never-reset counter rather than the tick -- the tick rewinds on an F7 regen
+// and on every selftest arm that replays a fixed window, and a slot still
+// carrying stamp k would then skip its refill at tick k and hand this kernel
+// the PREVIOUS WORLD's bits. The epoch starts at 1, so the zeroed allocation
+// cold-starts as "no snapshot anywhere" and every probe refuses until the
+// prepass has run -- which is also what makes a window shift need no
+// invalidation pass.
+fn reposeSnapStamp() -> u32 { return T.snapEpoch; }
+
+// The probe. REFUSES (returns false, "no drop here") when the slot has no
+// snapshot for this tick, which is the conservative direction: refusing only
+// ever leaves a grain where it is, and where it is, is a settled state.
+fn reposeSnapOpen(c : vec3<i32>) -> bool {
+  if (!inBounds(c)) { return false; }
+  let idx = cellIndexW(c);
+  let slot = idx / CHUNK_VOL;
+  if (reposeSnap[REPOSE_SNAP_TICK_BASE + slot] != reposeSnapStamp()) { return false; }
+  return (reposeSnap[idx >> 5u] & (1u << (idx & 31u))) != 0u;
+}
+
+// ---- the prepass ---------------------------------------------------------
+//
+// One workgroup per chunk on the SAME compacted dirty list the CA is about to
+// dispatch over, so a settled world dispatches nothing here and pays nothing
+// (rule 2). Each workgroup fills its own chunk AND THE NINE NEIGHBOURS A PROBE
+// CAN REACH (reposeRingOffset above): a resting grain's probes reach 3 cells
+// and cross into a neighbour chunk that may be asleep, and a boundary artifact
+// every 16 cells is not acceptable.
+//
+// Ring members are re-filled by every dirty chunk that touches them. That is
+// redundant, never divergent -- the bits are a pure function of voxel state
+// that nothing in this pass writes -- and the stamp test below skips most of
+// it. The skip READS state this pass writes, so which workgroup does the work
+// depends on scheduling; WHAT IT WRITES does not, which is the only thing rule
+// 1 is about.
+//
+// A SENTINEL CHUNK COSTS 128 STORES AND NO VOXEL READS. Its material is
+// uniform, so its occupancy bit is uniform, so the whole 4096-cell bitfield is
+// either all zeros or all ones. That matters: about half a typical window is
+// PT_EMPTY sky and much of the rest is JITTER stone, and a per-cell
+// synthWordAt() on a JITTER chunk pays two PCG rounds per cell for an answer
+// that cannot vary.
+// THE RING, and it is TEN chunks rather than the 3x3x3 block of 27.
+//
+// A grain acts only if its own chunk is on the dirty list, and its probes reach
+// at most 3 cells, so the chunks a probe can land in are its own plus the
+// neighbours those 3 cells can cross into. Two facts about the probe OFFSETS --
+// (+-2,-1,0) (+-3,-1,0) (0,-1,+-2) (0,-1,+-3) for the flowy tiers and
+// (+-1,-2,0) (+-1,-3,0) (0,-2,+-1) (0,-3,+-1) for the steep ones -- cut that
+// from 27 to 10, and both are one line:
+//
+//   * EVERY PROBE HAS dy <= -1. Nothing here looks up, so the +y layer of the
+//     block (9 chunks) can never be read. Falling and sliding are downhill
+//     questions; that is not going to change by accident.
+//   * NO PROBE OFFSETS BOTH LATERAL AXES. Every offset above has x or z zero,
+//     so the four (+-1, .., +-1) corners of each layer cannot be reached.
+//
+// 27 -> 10 is 2.7x off the prepass, which is the whole of its cost. THE PRICE
+// IS THAT THIS TABLE IS COUPLED TO THOSE OFFSETS: add a probe that looks up, or
+// one that steps diagonally, and it must grow in the same commit or the new
+// probe silently reads an unsnapshotted slot and REFUSES -- which does not
+// corrupt anything (a refusal only ever leaves a grain where it is) but would
+// quietly make piles steeper near one chunk boundary in sixteen.
+const REPOSE_RING : u32 = 10u;
+fn reposeRingOffset(k : u32) -> vec3<i32> {
+  // Layer y = 0 (five), then layer y = -1 (five). Own chunk first, so the
+  // common case is the first iteration.
+  switch (k) {
+    case 0u:  { return vec3<i32>( 0,  0,  0); }
+    case 1u:  { return vec3<i32>( 1,  0,  0); }
+    case 2u:  { return vec3<i32>(-1,  0,  0); }
+    case 3u:  { return vec3<i32>( 0,  0,  1); }
+    case 4u:  { return vec3<i32>( 0,  0, -1); }
+    case 5u:  { return vec3<i32>( 0, -1,  0); }
+    case 6u:  { return vec3<i32>( 1, -1,  0); }
+    case 7u:  { return vec3<i32>(-1, -1,  0); }
+    case 8u:  { return vec3<i32>( 0, -1,  1); }
+    default:  { return vec3<i32>( 0, -1, -1); }
+  }
+}
+// The ring member's slot, toroidally: the window wraps, so a member off one
+// face is the slot on the opposite one -- the same modulo chunkIndexOf does,
+// in chunk units.
+fn reposeRingSlot(cx : u32, cy : u32, cz : u32, k : u32) -> u32 {
+  let o = reposeRingOffset(k);
+  let nx = u32((i32(cx) + o.x + i32(NCHUNK)) % i32(NCHUNK));
+  let ny = u32((i32(cy) + o.y + i32(NCHUNK)) % i32(NCHUNK));
+  let nz = u32((i32(cz) + o.z + i32(NCHUNK)) % i32(NCHUNK));
+  return (nz * NCHUNK + ny) * NCHUNK + nx;
+}
+
+@compute @workgroup_size(64)
+fn reposesnap(@builtin(workgroup_id) wg : vec3<u32>,
+              @builtin(local_invocation_index) li : u32) {
+  let centre = dirtyList[wg.x];
+  let stamp = reposeSnapStamp();
+  let cz = centre / (NCHUNK * NCHUNK);
+  let cy = (centre / NCHUNK) % NCHUNK;
+  let cx = centre % NCHUNK;
+  let wpc = CHUNK_VOL / 32u;   // 128 bitfield words per chunk
+
+  // PASS 1: the bits. Work items are FLATTENED over (ring member, word) so the
+  // per-item skip below sits in non-uniform control flow with no barrier in it
+  // -- WGSL forbids a workgroupBarrier() under a non-uniform branch, and this
+  // shape sidesteps the question instead of arguing about it.
+  for (var t = li; t < REPOSE_RING * wpc; t += 64u) {
+    let k = t / wpc;
+    let i = t % wpc;
+    let slot = reposeRingSlot(cx, cy, cz, k);
+    // A stamp already at this tick's value means SOME workgroup has already
+    // written every word of this chunk -- see pass 2 for why that is safe to
+    // rely on. Skipping is then free of consequence: the bits are a pure
+    // function of voxel state that nothing in this pass writes, so whoever did
+    // the work wrote exactly what this thread would have.
+    if (reposeSnap[REPOSE_SNAP_TICK_BASE + slot] == stamp) { continue; }
+    let wordBase = slot * wpc;
+    let e = pageTable[slot];
+    if ((e & PT_SENTINEL_BIT) != 0u) {
+      // Uniform by definition: EMPTY, UNIFORM(mat) and JITTER(mat) all hold ONE
+      // material, and JITTER varies only the palette nibble -- which this
+      // predicate does not look at. So the whole 4096-cell bitfield is all
+      // zeros or all ones and synthWordAt() is never called, which matters:
+      // about half a window is PT_EMPTY sky, much of the rest is JITTER stone,
+      // and a per-cell synth pays two PCG rounds for an answer that cannot vary.
+      var bits = 0u;
+      if (reposeSnapOpenMat(e & PT_MAT_MASK)) { bits = 0xFFFFFFFFu; }
+      reposeSnap[wordBase + i] = bits;
+    } else {
+      let pageBase = e * CHUNK_VOL;
+      var bits = 0u;
+      for (var b = 0u; b < 32u; b++) {
+        if (reposeSnapOpenWord(voxels[pageBase + i * 32u + b])) {
+          bits |= 1u << b;
+        }
+      }
+      reposeSnap[wordBase + i] = bits;
+    }
+  }
+
+  // ONE BARRIER, at a uniform point, and it is what makes pass 1's skip sound:
+  // a stamp must mean "every word of this chunk is final", so no thread may
+  // publish a stamp while a sibling is still filling the same chunk.
+  //
+  // storageBarrier(), not workgroupBarrier(): the thing being ordered is a
+  // STORAGE write (the bit region) against a storage write another WORKGROUP
+  // may read (the stamp). workgroupBarrier only fences workgroup-address-space
+  // memory, so with it the sentence above would be true of this workgroup's
+  // execution and not of what anyone else can see -- which is exactly the
+  // distinction the skip leans on.
+  storageBarrier();
+
+  // PASS 2: publish. Cheap (10 stores per workgroup), and re-publishing a stamp
+  // another workgroup already set is a write of the same value.
+  for (var k = li; k < REPOSE_RING; k += 64u) {
+    reposeSnap[REPOSE_SNAP_TICK_BASE + reposeRingSlot(cx, cy, cz, k)] = stamp;
+  }
+}
+
+// Which tier THIS GRAIN uses, for a material whose authored angle sits between
+// two tiers.
+//
+// POSITION-KEYED, AND THE MISSING TICK IS THE POINT. Keying on the world
+// position and not on the tick means a grain that has not moved makes the same
+// decision on every tick of its life: it fails the same stage it failed last
+// tick, nothing is written, nothing marks the chunk dirty, and the pile SLEEPS
+// (CLAUDE.md rule 2). Key it on the tick instead and a settled dune re-rolls a
+// share of its grains every tick, a few of them find a move, and those chunks
+// never sleep again. A grain re-rolls when it changes cells, which is intended:
+// it makes the mixture a property of the PILE rather than a permanent label on
+// one grain.
+//
+// WORLD POSITION, NOT THE SLOT INDEX, and the same mixing synthJitterState
+// uses. A slot index is WINDOW-RELATIVE and renames on a streaming shift, so a
+// settled pile would re-roll its whole mixture the moment the player walked far
+// enough -- a pile silently changing shape with nothing touching it.
+fn matReposeCode(m : Material, c : vec3<i32>) -> u32 {
+  let a = (m.repose >> MAT_REPOSE_A_SHIFT) & MAT_REPOSE_A_MASK;
+  let blend = (m.repose >> MAT_REPOSE_BLEND_SHIFT) & MAT_REPOSE_BLEND_MASK;
+  // Pure tier -- which includes every 45-degree material, whose whole word is 0.
+  if (blend == 0u) { return a; }
+  let b = (m.repose >> MAT_REPOSE_B_SHIFT) & MAT_REPOSE_B_MASK;
+  let h = hash3(T.seed ^ REPOSE_BLEND_SALT,
+                bitcast<u32>(c.x) ^ (bitcast<u32>(c.z) << 12u),
+                bitcast<u32>(c.y));
+  if ((h & 0xFFu) < blend) { return b; }
+  return a;
+}
+// Salt for the blend hash. Any constant works; a distinct one keeps the blend
+// stream from correlating with the movement RNG, whose key is
+// (seed, tick*2+substep, slot), and with synthJitterState's 0xC0FFEE.
+const REPOSE_BLEND_SALT : u32 = 0x9E3779B9u;
+
+// STEEP TIERS: may this grain take the down-diagonal in direction d?
+//
+// Returns true on the first compare for every non-steep material, which is what
+// keeps 45 degrees free.
+fn reposeDiagAllowed(c : vec3<i32>, d : vec2<i32>, code : u32) -> bool {
+  if (code < REPOSE_1_2) { return true; }
+  if (!reposeSnapOpen(c + vec3<i32>(d.x, -2, d.y))) { return false; }
+  if (code != REPOSE_1_3) { return true; }
+  return reposeSnapOpen(c + vec3<i32>(d.x, -3, d.y));
+}
+
 // Move t eighths of liquid `mat` from src (fullness sf) onto dst (fullness df,
 // 0 = air). Mass-conserving: src empties to air when it gives everything.
 fn transferLiquid(src : vec3<i32>, dst : vec3<i32>, mat : u32,
@@ -2077,19 +2415,96 @@ fn main(@builtin(workgroup_id) wg : vec3<u32>,
     return;
   }
 
+  // ANGLE OF REPOSE: which run:rise tier THIS grain uses (see the block above
+  // tryMove). REPOSE_1_1 for every powder that authors no `repose`, and that
+  // value makes BOTH the diagonal gate in stage 2 and the slide stage 2b
+  // no-ops, on their first compare, with no hash and no extra load. That is
+  // what makes "absent repose == the old sim, bit for bit" structural rather
+  // than a claim. No class test: only powders reach here now that gases have
+  // their own ladder in stepGas.
+  var reposeCode = REPOSE_1_1;
+  if (m.repose != 0u) { reposeCode = matReposeCode(m, c); }
+
   // 2) the four diagonal cells one step down, RNG order — started
   //    DOWNWIND with a probability set by the wind and the material's authored
   //    response (windLateralStart; no-op when the gate is off). The rotation
   //    itself is unchanged: this only decides where it begins.
+  //
+  //    A STEEP tier (1:2, 1:3) gates this stage: the diagonal is taken only if
+  //    the grain would drop at least M, read from the tick-start snapshot. Every
+  //    other material's gate returns true on one compare.
   let r = windLateralStart(c, rnd >> 10u, m, slotIdx);
   for (var i = 0u; i < 4u; i++) {
     let d = lateralDir(i + r);
+    if (!reposeDiagAllowed(c, d, reposeCode)) { continue; }
     if (tryMove(c, c + vec3<i32>(d.x, -1, d.y), w, m.density, false)) {
       markDirtyR(c, cls);
       return;
     }
   }
 
+  // 2b) FLOWY TIERS ONLY: a resting grain takes one lateral step toward a drop
+  //     within its tier's run. See the block above tryMove for the tier table,
+  //     the position-keyed blend and the snapshot; this is only the wiring.
+  //
+  //     GATED ON THE GRAIN'S OWN CODE, not merely on `repose != 0`: a material
+  //     authored between 27 and 44 degrees mixes 2:1 and 1:1 per grain, and a
+  //     grain whose roll came up 1:1 must behave like a 45-degree grain -- which
+  //     is the entire content of the blend. Gating on the material instead made
+  //     every blended powder behave as pure 2:1 and the blend inert.
+  //
+  //     CANNOT FIRE FOR A GRAIN THAT COULD HAVE DESCENDED: stages 1 and 2
+  //     return on success, so reaching here means straight-down and all four
+  //     down-diagonals were refused. The lateral move goes through tryMove, so
+  //     write reach stays 1 and flagSupportLoss still runs for the cell this
+  //     grain vacates, exactly as it does for a diagonal.
+  //
+  //     NEAREST DROP FIRST, in two passes, and that ordering is the TERMINATION
+  //     argument rather than a preference. A slide is the one move in the chain
+  //     that does not lower the grain, so an unbounded run of slides would keep
+  //     a chunk awake forever (rule 2). It cannot happen: a slide toward a drop
+  //     k cells out leaves the grain with that same drop k-1 out, and
+  //       k-1 == 1  -> stage 2 takes it next tick and the grain FALLS;
+  //       k-1 == 2  -> pass 1 fires again, and it cannot instead slide BACK,
+  //                    because the cell 2 out backwards is this grain's old
+  //                    down-diagonal, which was filled (that is why it is here).
+  //     So every slide is followed by another slide strictly closer to the drop,
+  //     or by a fall, within at most two steps. Searching 3-out before 2-out
+  //     would break exactly this: a grain between two drops at 3 and 2 could
+  //     take the far one and then come back.
+  if (reposeCode == REPOSE_2_1 || reposeCode == REPOSE_3_1) {
+    // Same RNG-rotated direction order the diagonal loop just used, so a slide
+    // does not get its own symmetry-breaking and downwind still leads.
+    for (var i = 0u; i < 4u; i++) {
+      let d = lateralDir(i + r);
+      // Cheapest rejection first, and a LIVE read on purpose: the lateral cell
+      // is at distance 1, inside my own write box, so reading it live is legal
+      // and it must agree with the tryMove that follows. In a packed pile three
+      // of four laterals are filled and those directions never pay a probe.
+      let lat = c + vec3<i32>(d.x, 0, d.y);
+      if (!inBounds(lat) || !canDisplace(m.density, false, voxWordAt(lat))) { continue; }
+      if (!reposeSnapOpen(c + vec3<i32>(d.x * 2, -1, d.y * 2))) { continue; }
+      if (tryMove(c, lat, w, m.density, false)) {
+        markDirtyR(c, cls);
+        return;
+      }
+    }
+    // 3:1 only: a drop three out. Reaching this loop means pass 1 found no drop
+    // two out in ANY direction, which is what makes this the far search and not
+    // a competing one.
+    if (reposeCode == REPOSE_3_1) {
+      for (var i = 0u; i < 4u; i++) {
+        let d = lateralDir(i + r);
+        let lat = c + vec3<i32>(d.x, 0, d.y);
+        if (!inBounds(lat) || !canDisplace(m.density, false, voxWordAt(lat))) { continue; }
+        if (!reposeSnapOpen(c + vec3<i32>(d.x * 3, -1, d.y * 3))) { continue; }
+        if (tryMove(c, lat, w, m.density, false)) {
+          markDirtyR(c, cls);
+          return;
+        }
+      }
+    }
+  }
   // 4) wandering powders (mites): scuttle laterally, occasionally hop up.
   if (m.klass == CLASS_POWDER && (m.flags & MATF_WANDER) != 0u) {
     let r3 = rnd >> 18u;

@@ -269,6 +269,57 @@ static bool LoadMaterialsJson(const std::string& path, std::vector<MaterialDef>&
     if (d.gpu.hardness > 255)
       errors += path + ": material \"" + d.name + "\": hardness > 255\n";
 
+    // ---- angle of repose: the slope a PILE of this powder rests at ----
+    //
+    //   "repose": 34          // degrees, kReposeDegMin..kReposeDegMax
+    //
+    // POWDERS ONLY, and refused rather than ignored on anything else: it is the
+    // one field whose meaning is a property of the powder movement chain, and
+    // authoring it on a liquid or a solid can only be a mistake about what the
+    // field does. Absent compiles to the word 0, which sim_step.wgsl reads as
+    // "one down, one across" — the rule every powder had before the field
+    // existed, so a material that says nothing is bit-identical to the old sim.
+    //
+    // The reposeDeg mirror is set for EVERY material, powder or not, so the
+    // tuner and the wiki can read the value back without knowing the packing
+    // (the same reason absorbCapacity and the wind nibbles are mirrored).
+    d.reposeDeg = kReposeDegDefault;
+    if (m.contains("repose")) {
+      if (!m["repose"].is_number_integer()) {
+        errors += path + ": material \"" + d.name +
+                  "\": \"repose\" must be an integer number of degrees\n";
+      } else if (d.gpu.klass != CLASS_POWDER) {
+        errors += path + ": material \"" + d.name +
+                  "\": \"repose\" is powders only (this one is a " + cls +
+                  ") — it is the slope a PILE rests at\n";
+      } else {
+        const int32_t deg = m["repose"].get<int32_t>();
+        // The two ends get DIFFERENT diagnostics, because they are different
+        // facts and a shared message sent an author looking at the wrong one:
+        // below the floor the lattice cannot express a flatter face at all,
+        // above the ceiling a powder is a wall and should be a solid. Refused
+        // rather than clamped either way — a clamp reads as the feature not
+        // working.
+        if (deg < kReposeDegMin) {
+          errors += path + ": material \"" + d.name + "\": repose " +
+                    std::to_string(deg) + " is below the floor of " +
+                    std::to_string(kReposeDegMin) +
+                    " degrees — 3:1 (18.43) is the flattest run:rise a cell "
+                    "lattice can hold, and anything flatter would be a silent "
+                    "clamp to it (see materials.h kReposeTiers)\n";
+        } else if (deg > kReposeDegMax) {
+          errors += path + ": material \"" + d.name + "\": repose " +
+                    std::to_string(deg) + " is above the ceiling of " +
+                    std::to_string(kReposeDegMax) +
+                    " degrees — 1:3 (71.57) is the steepest run:rise, and a "
+                    "powder that stands steeper than that is a solid\n";
+        } else {
+          d.reposeDeg = deg;
+          d.gpu.repose = PackRepose(deg);
+        }
+      }
+    }
+
     if (m.value("wanders", false)) d.gpu.flags |= kMatFlagWander;
     if (m.value("opaque", false)) d.gpu.flags |= kMatFlagOpaque;
     // Soft vegetation: bodies move through it. Collision only — the cell stays

@@ -128,6 +128,7 @@ bool Recorder::CondHolds(pass::Cond c, const RecordCtx& cx) {
     case pass::Cond::Openness:   return cx.opennessChunks > 0;
     case pass::Cond::Glow:       return cx.glowChunks > 0;
     case pass::Cond::Gas:        return cx.gasActive;
+    case pass::Cond::ReposeActive: return cx.reposeActive;
   }
   return false;
 }

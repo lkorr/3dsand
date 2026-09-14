@@ -143,6 +143,14 @@ enum class Buf : uint8_t {
   // because a read the table does not know about is exactly the failure mode
   // this file exists to make impossible.
   WorldMap,
+  // ---- the repose occupancy snapshot (world.h kReposeSnap* block) ----
+  // 1 bit per voxel, "a powder could drop into this cell", plus one tick stamp
+  // per slot. WRITTEN by the `reposesnap` prepass and READ by the CA's own
+  // rows, both on PT_TICK, which is exactly the compute->compute hop the table
+  // exists to synchronize: a missing barrier there would let the CA read the
+  // snapshot while the prepass is still writing it, which is the determinism
+  // hole the snapshot was introduced to close.
+  ReposeSnap,
   // ---- the voxel-keyed shadow cache (world.h kShadowCacheBuckets) ----
   // RENDER-side buffers, on the table for the same reason TreeAtlas is: a
   // hazard the table does not know about generates no barrier. The resolve
@@ -230,6 +238,10 @@ enum class Pipe : uint8_t {
   // reasons; GasArgs1 additionally zeroes the write page's cursor, which is
   // why the gas pool needs no per-tick fill.
   GasArgs1, GasSpawnP, GasIntegrate, GasArgs2, GasResolve,
+  // The angle-of-repose occupancy snapshot: a second entry point of
+  // sim_step.wgsl, not a new module, so it costs no bind-group layout and
+  // cannot drift from the kernel that reads it.
+  ReposeSnap,
   // MLS-MPM fluid. Inserted BEFORE FarDown deliberately: the
   // pipeline-copy loop in Simulation::RecordTable is bounded by
   // `(int)Pipe::FarDown + 1`, so FarDown must stay the last enumerator or a
@@ -385,6 +397,16 @@ enum class Cond : uint8_t {
   // are false and every gas row records NOTHING — which is what makes the
   // system free when it is not being used (rule 2).
   Gas,
+  // Any LOADED material authors a non-default `repose` AND the CA has work.
+  // The first half is a property of materials.json, latched once at
+  // UploadTables rather than recomputed per tick; the second is CaActive,
+  // folded in so the prepass never records on a tick the CA itself skips.
+  //
+  // It exists so the feature is provably free when nothing uses it: strip every
+  // `repose` line and not one reposeSnap row is recorded, no 16 MiB buffer is
+  // touched, and the pinned hash cannot move. The same shape as Cond::Gas and
+  // Cond::WaterBody -- "off" means NO ROW, not a cheap row.
+  ReposeActive,
 };
 
 // Which command buffer a row belongs to — one per Encode* entry point.

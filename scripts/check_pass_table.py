@@ -94,6 +94,7 @@ PIPE_TO_MEMBER = {
     "PIPE_COMPACT": "compact_",
     "PIPE_COMPACT_NEXT": "compactNext_",
     "PIPE_STEP": "step_",
+    "PIPE_REPOSE_SNAP": "reposeSnap_",
     "PIPE_OCCUPANCY": "occupancy_",
     "PIPE_OCCUPANCY_DIRTY": "occupancyDirty_",
     "PIPE_PICK": "pick_",
@@ -229,6 +230,12 @@ BUF_TO_WGSL = {
     # The glow field, binding 32 of simBGL_ / 20 of renderBGL_. ONE Buf id for
     # both regions of one buffer -- see the pass_table.h note.
     "Glow": {"glow"},
+    # The angle-of-repose occupancy snapshot, binding 35 of simBGL_. ONE Buf id
+    # for both regions of one buffer (the per-voxel bits and the per-slot tick
+    # stamps), for the glow field's reason: they live in one allocation so the
+    # snapshot costs one binding, and the recorder wants exactly this
+    # granularity anyway -- the prepass writes both and the CA reads both.
+    "ReposeSnap": {"reposeSnap"},
     # The deferred streaming wake's act verdict, binding 30.
     "GenAct": {"genAct"},
     "PageFaults": {"pageFaults"},
@@ -319,6 +326,8 @@ _SIM_GROUP0 = {
     # same buffer through the GAS group, where it is binding 6, and raymarch
     # samples it at 21. Three independent declarations, three legal numbers.
     "gasOuter",
+    # The angle-of-repose occupancy snapshot, binding 35.
+    "reposeSnap",
 }
 # The slim group is 0..4 PLUS the two page buffers at 17/18 — not a dense
 # prefix any more. One WGSL identifier cannot carry two binding numbers

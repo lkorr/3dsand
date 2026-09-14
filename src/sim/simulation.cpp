@@ -272,6 +272,13 @@ bool Simulation::Init(const rhi::Device& device, World& world,
         // condition the one-identifier-one-binding-number rule is about.
         // 34 is the first free slot in this dense 0..33 layout.
         entry(34, T::Storage),         // gasOuter (render-only density box)
+        // The repose occupancy snapshot (world.h kReposeSnap*). Storage, not
+        // ReadOnlyStorage: the `reposesnap` prepass writes it and `main` reads
+        // it, both entry points of sim_step.wgsl, which WGSL cannot give two
+        // access modes for one binding. 35 is the first free slot in this dense
+        // 0..34 layout, and it is NOT mirrored in simSlimBGL_ -- no slim-group
+        // pipeline names it.
+        entry(35, T::Storage),         // reposeSnap (bits + per-slot stamps)
     };
     simBGL_ = device.CreateBindGroupLayout(entries, std::size(entries));
 
@@ -902,6 +909,7 @@ void Simulation::BuildSimBindGroups(const rhi::Device& device) {
         b(32, world_->glow),
         b(33, world_->gasSpawn),
         b(34, world_->gasOuter),
+        b(35, world_->reposeSnap),
     };
     simBG_[page] = device.CreateBindGroup(simBGL_, entries, std::size(entries), "simBG");
 
@@ -996,7 +1004,15 @@ void Simulation::UploadTables(const rhi::Queue& queue,
                               const std::vector<MaterialDef>& mats,
                               const std::vector<ReactionGpu>& reactions) {
   std::vector<MaterialGpu> table(4096, MaterialGpu{});
-  for (size_t i = 0; i < mats.size() && i < 4096; i++) table[i] = mats[i].gpu;
+  anyRepose_ = false;
+  for (size_t i = 0; i < mats.size() && i < 4096; i++) {
+    table[i] = mats[i].gpu;
+    // Cond::ReposeActive. Latched HERE rather than tested per tick: it is a
+    // property of the authored table, it changes only on a materials reload
+    // (which comes back through this function), and a per-tick scan of 4096
+    // entries to answer a constant would be the thing rule 2 is about.
+    if (mats[i].gpu.repose != 0) anyRepose_ = true;
+  }
 
   // Mirror the stain palette into the reserved top entries (kStainPaletteBase,
   // materials.h): the renderer maps a voxel's 3-bit stain TYPE to a colour by
@@ -1432,6 +1448,12 @@ bool Simulation::BuildPipelines(const rhi::Device& device, std::string* err) {
   pool.Add([&] { compact_ = MakeComputePipeline(device, simPL_, mCompact, "main", "compact"); });
   pool.Add([&] { compactNext_ = MakeComputePipeline(device, simPL_, mCompact, "mainNext", "compactNext"); });
   pool.Add([&] { step_ = MakeComputePipeline(device, simPL_, mStep, "main", "step"); });
+  // Same module as the CA: the snapshot has to agree with the kernel that
+  // reads it about the bit layout, and one module is how that is enforced.
+  pool.Add([&] {
+    reposeSnap_ =
+        MakeComputePipeline(device, simPL_, mStep, "reposesnap", "reposeSnap");
+  });
   pool.Add([&] { occupancy_ = MakeComputePipeline(device, simPL_, mOcc, "main", "occupancy"); });
   pool.Add([&] { occupancyDirty_ = MakeComputePipeline(device, simPL_, mOcc, "mainDirty", "occupancyDirty"); });
   pool.Add([&] { opennessDirty_ = MakeComputePipeline(device, simPL_, mOpenness, "dirty", "opennessDirty"); });
@@ -1774,6 +1796,8 @@ struct RecordCtx {
   bool vizActive = false;
   // Gas particles (docs/PLAN_gas_particles.md). See the latch in EncodeTick.
   bool gasActive = false;
+  // Angle of repose (world.h kReposeSnap*). See the latch in EncodeTick.
+  bool reposeActive = false;
 };
 
 // NOTE: the condition and dispatch-extent resolvers that used to live here
@@ -1870,6 +1894,7 @@ const rhi::Buffer& Simulation::PassBuffer(pass::Buf b) const {
     case B::GasArgsStage:        return world_->gasArgs;
     case B::GasDispatchArgs:     return world_->gasDispatchArgs;
     case B::GasOuter:            return world_->gasOuter;
+    case B::ReposeSnap:          return world_->reposeSnap;
     default:                return world_->voxels;
   }
 }
@@ -1886,6 +1911,7 @@ const rhi::ComputePipeline& Simulation::PassPipeline(pass::Pipe p) const {
     case P::Compact:        return compact_;
     case P::CompactNext:    return compactNext_;
     case P::Step:           return step_;
+    case P::ReposeSnap:     return reposeSnap_;
     case P::Occupancy:      return occupancy_;
     case P::OccupancyDirty: return occupancyDirty_;
     case P::Pick:           return pick_;
@@ -1989,6 +2015,7 @@ void Simulation::RecordTable(const rhi::CommandEncoder& enc, pass::Table which,
   tc.caActive = cx.caActive;
   tc.vizActive = cx.vizActive;
   tc.gasActive = cx.gasActive;
+  tc.reposeActive = cx.reposeActive;
 
   rhi::TableBindings tb{};
   for (int i = 0; i < (int)pass::Buf::kCount; i++)
@@ -2426,6 +2453,14 @@ void Simulation::EncodeTick(const rhi::CommandEncoder& enc, uint32_t opsCount,
   cx.gasActive = gasOn && (cx.caActive || gasSpawnsThisTick_ > 0 ||
                            gasLive_ > 0 || gasIdleTicks_ < kGasIdleTicks);
   gasSpawnsThisTick_ = 0;
+
+  // ---- the repose snapshot prepass ----------------------------------------
+  // `anyRepose_` is a property of the MATERIAL TABLE, latched in UploadTables,
+  // so a world whose materials.json carries no `repose` line never records the
+  // row and never touches the 16 MiB snapshot. Folded with caActive because the
+  // snapshot exists only to be read by the CA rows behind it: on a tick the CA
+  // skips there is nothing to serve.
+  cx.reposeActive = anyRepose_ && cx.caActive;
 
   // ---- THE RENDER FLAG, which is a DIFFERENT question ---------------------
   // cx.gasActive above answers "must the gas PASSES run", and it is true

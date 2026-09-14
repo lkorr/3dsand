@@ -164,7 +164,13 @@ const char* const kOrder[] = {
     // arms - which makes it a poor neighbour for anything that wanted the
     // world left alone. It restores pristine worldgen on the way out.
     "current",
-    "determinism", "sleep",       "ca-skip",     "ca-slope",
+    "determinism", "sleep",       "ca-skip",
+    // Per-material angle of repose. It runs its own worldgen per arm, builds a
+    // sealed stone room and pours into it, and it PATCHES ONE MATERIAL'S GPU
+    // TABLE ENTRY for each arm — restoring the authored table before it
+    // returns, which is why it sits with the other self-contained CA gates and
+    // not next to anything that reads a material by hand.
+    "repose",      "ca-slope",
     "ca-slope-hybrid", "ca-level-one", "ca-level", "ca-level-pond",
     // Right after the other liquid-shape gates: same fixture neighbourhood,
     // same dim-dawn pinning, and it is the negative of `ca-slope` — the

@@ -497,6 +497,218 @@ SSBO lists of chunk indices.
   adjacent cells *of the below cell* in random order (RNG replaces 2D's left/right
   alternation and breaks the symmetry that would create perfect square pyramids).
   Else stay and clear the moving bit. This alone produces angle-of-repose piles.
+- **PER-MATERIAL ANGLE OF REPOSE (2026-09-13).** One down, one across is 45°,
+  and for years that was the angle of *every* powder in the engine — dry sand,
+  angular gravel, snow, ash and dust all built the same cone. One optional
+  authored integer changes it:
+
+  ```json
+  "repose": 34          // degrees, POWDERS ONLY, 18..72
+  ```
+
+  Absent (or 45) compiles to the word **zero**, which the kernel reads as the
+  bare down-diagonal, so a material that says nothing is bit-identical to the
+  old sim rather than merely close to it. Loader:
+  `PackRepose`/`MaterialGpu.repose` (`src/sim/materials.h`), kernel: the ANGLE
+  OF REPOSE block in `sim_step.wgsl`, gate: `repose`.
+
+  - **The angle is a RUN:RISE RATIO, because a lattice CA cannot hold anything
+    else.** Movement is whole cells, so the expressible angles are those whose
+    tangent is a ratio of small integers. Five tiers, in two families either
+    side of the old rule: `3:1` (18.43°) and `2:1` (26.57°) flatten a pile;
+    `1:1` (45°, the word 0) is unchanged; `1:2` (63.43°) and `1:3` (71.57°)
+    steepen one.
+  - **FLOWY: a 2:1 face was ALWAYS stable under the old rules; nothing ever
+    built one.** On a 2:1 staircase the cell one down and one across from a
+    surface grain is the top of the next run, i.e. filled, so stage 2 refuses
+    and the grain rests. Flatter faces do not collapse — grains simply *stop as
+    soon as they cannot descend*, which is one cell too early. So the flowy half
+    is one extra stage rather than a new force: a grain that has already failed
+    the straight fall AND all four down-diagonals takes **one lateral step**
+    toward a drop it can see within its tier's run (`(2d,-1)` for 2:1,
+    `(3d,-1)` for 3:1). It cannot fire for a grain that could have descended,
+    because descent is tried first and returns.
+  - **STEEP: the mirror image.** A 1:2 grain takes the down-diagonal only if
+    `(d,-2)` is open too — i.e. only if it would fall at least 2 — so a
+    one-voxel step never spreads and the face grows one run per two drops. The
+    cohesive look that falls out of it (a small bump on a drift simply stays) is
+    the intent, not a defect.
+  - **Between tiers is a per-grain MIXTURE, not a rounding.** The word carries
+    two tier codes and a blend; `blend/256` of the grains use the second. Sand
+    at 34° would be ~60% of grains on 2:1 and ~40% on 1:1, and the pile rests
+    between the two. The choice is a hash keyed on **WORLD POSITION with NO TICK
+    in it**, and both halves are load-bearing. No tick: a grain that has not
+    moved decides the same way on every tick of its life, so it fails the same
+    stage, writes nothing, marks nothing dirty, and the pile SLEEPS (rule 2);
+    keyed on the tick, a settled dune would re-roll a share of its grains every
+    tick, a few would find a move, and those chunks would never sleep again.
+    World position rather than the slot index (the first cut used the slot, and
+    it was wrong): a slot index is WINDOW-RELATIVE and renames on a streaming
+    shift, so a settled pile would silently re-roll its whole mixture the moment
+    the player walked far enough. Same mixing as `synthJitterState`.
+    **The blend must be gated on the GRAIN'S CODE, not on the material.** Gating
+    the slide on `repose != 0` made every angle from 27 to 44 behave as pure
+    2:1 and the blend inert — a bug no pure-tier test arm can see, which is why
+    the gate has two arms driven by real `PackRepose` output.
+  - **A per-tick move CHANCE is not an angle**, which is why `moveEvery` was not
+    reused for this. A chance changes how *fast* a slump runs and leaves the
+    resting state exactly where it was; repose is a property of the *fixpoint*.
+    Both exist, and `moveEvery` is now documented for powders as the speed knob.
+  - **WRITE reach is still 1** — the lateral step is an ordinary `tryMove`, the
+    same single-cell write the mite wander stage already makes, so
+    `flagSupportLoss` still runs for the cell the grain vacates.
+  - **READ REACH: THE OCCUPANCY SNAPSHOT IS THE ONLY LICENCE IN THE CA FOR A
+    READ AT DISTANCE ≥ 2, and the sharp form of the lattice argument was not
+    previously written down anywhere.** The 3×3×3 write boxes of same-colour
+    acting cells, spaced 3 apart, **tile space**: every cell in the world lies
+    inside exactly one acting cell's box. So a read at distance ≤1 is inside
+    *my* box and only I can write it — exactly the licence `soloSolid` spends on
+    its six face probes — and a read at distance ≥2 is inside *somebody else's*,
+    where pre-write versus post-write is decided by GPU scheduling. There is no
+    "probably fine" band in between. And repose cannot be done at reach 1 at
+    all: a 2:1 face and a 1:1 face are *locally identical* at a surface grain
+    (uphill lateral filled, downhill lateral air, downhill diagonal filled, cell
+    below filled) — the difference IS at distance 2. That is a fact about the
+    lattice, not about this rule.
+
+    So every probe reads `reposeSnap` (`world.h`'s `kReposeSnap*` block): **one
+    bit per voxel, "a powder could drop into this cell", taken at TICK START**
+    by the `reposesnap` prepass and read by the CA behind a barrier the pass
+    table generates. A snapshot bit is the same in every run of the same tick by
+    construction. It is a side table per design guideline 2 — derived, not
+    hashed, not saved — and it is deliberately **stale**: a drop that fills in mid-tick still
+    reads open, the grain slides toward it, the ordinary `tryMove` refuses
+    (the destination is a powder), and next tick's snapshot says so. The error
+    is bounded by one tick and identical in every run, which is the only
+    property rule 1 asks for.
+
+    **Validity is per SLOT, and required.** The window is toroidal, so a slot is
+    reused by a new world chunk as the window walks; each slot carries `tick+1`
+    and a probe into a slot whose stamp is not this tick's REFUSES. Zero is
+    therefore never a valid stamp, which makes the zeroed allocation the correct
+    cold start with no reset path. Nothing finer is needed: the window origin is
+    constant for the whole of one command buffer, so a slot cannot change
+    occupant between the prepass and the CA rows of the same tick. In practice
+    the refusal path is unreachable for an acting cell — a cell only acts if its
+    own chunk is on the dirty list, and every probe target is within that
+    chunk's probe ring, which the prepass covers by construction.
+
+    **The ALLOCATION is dense; only the WRITING is sparse.** One bit per
+    cell in the window is 16.125 MiB resident from `World::Init`, roughly +36%
+    on the page pool's own resident bytes, and that is a flat cost paid by any
+    world whose materials.json carries a `repose` line. What scales with
+    activity is which chunks get refilled. A genuinely sparse form would trade
+    the flat cost for an indirection in the CA's hottest read; at one bit per
+    voxel that trade is not worth making, but it is a trade.
+
+    **MEASURED, per row, with `--measure`'s row-granular timestamps** (RTX
+    3060 Ti, `SANDVOX_RUN_EXCLUSIVE=1`). The row has its own pass group, so
+    this is the prepass's own GPU time and not a difference of two totals:
+
+    | scenario | active chunks/tick | `reposeSnap` | % of sim | `ca(54)` |
+    |---|---|---|---|---|
+    | (c) settled | 0.0 | **not recorded** | — | — |
+    | (e) minimal | 0.7 | 0.089 ms | 3.5% | 0.93 ms |
+    | (b) active | 4.5 | 0.123 ms | 3.5% | 1.33 ms |
+    | (a) settling | 37.1 | 0.151 ms | 2.7% | 2.73 ms |
+    | (d) heavy | 152.2 | 0.556 ms | 5.9% | 4.65 ms |
+
+    So it costs 9–12% of the CA loop it feeds, and 0.56 ms/tick at the heaviest
+    activity the suite produces. The settled row is the important one: it is
+    absent from the table entirely, not zero-valued, because `Cond::ReposeActive`
+    did not record it.
+
+    **A whole-sim A/B is NOT the instrument for this, and trying it first was a
+    wasted pair of runs.** `--gate far-fog`'s "active scene" ms/tick read 10.07,
+    15.28, 10.43 and 37.88 across four runs of near-identical trees — it swings
+    by 3.6x on its own, so the arm WITHOUT the prepass came out slower than the
+    arm with it. A row with its own pass-group label can be timed directly;
+    differencing two noisy totals to find a 3% term cannot.
+
+    **The prepass costs nothing at rest**: it is one indirect dispatch over the
+    same compacted dirty list the CA is about to use, so a settled world
+    dispatches zero workgroups. Each workgroup fills its dirty chunk *and the
+    nine neighbours a probe can reach*, because a resting grain's probes reach
+    3 cells and cross into a neighbour chunk that may be asleep, and a boundary
+    artifact every 16 cells is not acceptable. Nine rather than the 3x3x3
+    block's 26, on two one-line facts about the probe offsets: **every probe has
+    `dy <= -1`** (nothing here looks up), and **no probe offsets both lateral
+    axes** (so each layer's corners are unreachable). That is 2.7x off the
+    prepass, and it is measured INERT — the same world hash and the same six
+    pile hashes as the 27-chunk version. The price is a table coupled to those
+    offsets: a probe that looked up, or stepped diagonally, must grow it in the
+    same commit or it silently reads an unsnapshotted slot and REFUSES, which
+    corrupts nothing (a refusal leaves a grain where it is) but would quietly
+    steepen piles near one chunk boundary in sixteen. Ring members are re-filled by every dirty chunk that
+    touches them — redundant, never divergent, since the bits are a pure
+    function of voxel state nothing in the pass writes — and a per-slot stamp
+    skip removes most of that. A sentinel chunk (`EMPTY`/`UNIFORM`/`JITTER`)
+    costs 128 stores and **no voxel reads at all**: its material is uniform, so
+    the whole bitfield is all zeros or all ones and `synthWordAt`'s two PCG
+    rounds per cell are never paid.
+
+    **A REJECTED DESIGN, recorded because the failure is invisible.** The first
+    cut read the TICK STAMP of an air cell to prove no acting cell owned the
+    probe's write box. The ownership argument was sound; the *bit* was not. The
+    stamp is explicitly not representation-invariant (`sim_occupancy.wgsl`: it
+    "legitimately differs between two runs that reached the same world"),
+    `world.h` strips it on save, and `pagetable.cpp`'s `kAirDemoteMask` demotes
+    an all-air chunk to `PT_EMPTY` ignoring stamps — after which every cell
+    reads `STAMP_NEVER`. With a 7-long cycle a stale stamp on vacated air
+    aliases the current substep one time in seven, so the guard would allow in
+    one run and refuse in another; a refused slide marks nothing dirty, so if it
+    landed on a grain's last attempt the chunk slept and the pile stayed one
+    cell steeper — invisible to both the world hash and the twice-run
+    comparison. **No CA path reads a tick stamp on an air cell**; `main`'s own
+    gate reads it only after returning on `MAT_AIR`.
+  - **Termination is the nearest-drop-first ordering, not an assumption.** A
+    slide is the one move in the powder chain that does not lower a grain, so an
+    unbounded run of them would keep a chunk awake forever. It cannot happen: a
+    slide toward a drop *k* cells out leaves the grain with that same drop *k-1*
+    out; at *k-1 == 1* stage 2 takes it and the grain falls, and at *k-1 == 2*
+    the near pass fires again and cannot instead go BACK, because the cell two
+    out backwards is this grain's old down-diagonal, which was filled. Searching
+    3-out before 2-out would break exactly that, so the stage is two passes.
+  - **Storage: `MaterialGpu` grew 64 → 80 bytes** (`repose` plus three reserved
+    words) rather than squatting in `hardness`'s spare 24 bits. Every blast and
+    dig path compares `hardness` as a whole word, and a masked reader in nine
+    places to save 16 bytes in a 4096-entry table — 256 KiB → 320 KiB, once, in
+    one buffer — is the worse trade. Nothing else had to change: every reader
+    addresses the table by index through `sizeof(MaterialGpu)`, so the stride is
+    written down nowhere else. The five tier codes and the `(codeA, codeB,
+    blend)` shifts/masks are emitted by `ShaderConstantPrelude()` from the C++
+    definitions, so neither `common.wgsl` nor `sim_step.wgsl` restates them, and
+    `scripts/check_shaders.sh` scrapes `materials.h` so a shader edit still
+    validates with no build.
+  - **THE FLATTER TIERS CANNOT BE GIVEN TO THE BULK TERRAIN POWDERS YET, and
+    that is measured rather than cautious.** `Land.slope` is documented as
+    "256 == 1 voxel/voxel == repose" (`src/sim/worldmap.h`), and every place
+    worldgen decides whether ground is "too steep for a powder bed" — the biome
+    skin in `genCellIn`, the sediment wedge's `sedSlope`, the pond bed's
+    steepness test and `bed.substrate` — is sized against that one number. Give
+    sand 34° and the desert's own sand cap is suddenly over its angle of repose
+    on every slope steeper than 2:1, so the whole window starts creeping
+    downhill the moment it generates. Measured as a full-`--selftest` A/B whose
+    only difference was those authored lines: sand 34 / gravel 40 / dirt 40 /
+    snow 38 turned **`sleep`** red (the world never reached the <32-active-chunk
+    bar inside the gate's 3000-tick cap) and **`worldmap`** red (`voxel air but
+    twin says biome desert (skin sand)` at (144,426) — the cap had slid off
+    before the comparison), and took `corpse-burn` with them. The control arm
+    reproduced the base `determinismHash` exactly, so the attribution is not a
+    judgement call.
+
+    **A STEEPER value is safe on worldgen ground, and the argument is one line:
+    a steep tier only ever REFUSES a move the old rule allowed**, so it cannot
+    wake anything 45° did not. That is why `snow` ships at 63° (a packed drift
+    holds a steep face) while `sand`, `gravel` and `dirt` keep 45.
+    **Follow-up:** make those worldgen slope gates read the placed material's
+    own repose instead of the constant 45, then author sand 34 in the same
+    commit. That is a worldgen change with its own hash move and its own gates
+    (`terrain`, `waterbody`, `worldmap`, `settle-back`) and it is deliberately
+    not bundled here.
+  - **Authored:** `snow` 63 (steep), `ash` 40, `dust` 30, `seed` 30 (flowy);
+    `sand`, `gravel`, `dirt` keep the 45° default for the reason above. `mite`
+    keeps it too: it wanders, and its movement is not a pile.
 - **Liquid**: powder rule + try the four laterally adjacent cells on its own level.
   Plus **fullness equalization**: liquid voxels carry fullness in eighths (the state
   nibble); a cell flows into a lateral neighbor holding ≥ 2 eighths less, RNG on

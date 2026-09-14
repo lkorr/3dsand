@@ -16,6 +16,9 @@ ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 SHADER_DIR="$ROOT/assets/shaders"
 COMMON="$SHADER_DIR/common.wgsl"
 WORLD_H="$ROOT/src/sim/world.h"
+# The angle-of-repose tier codes and packing live in materials.h, not world.h:
+# they are MATERIAL layout, and ShaderConstantPrelude() emits them from there.
+MATERIALS_H="$ROOT/src/sim/materials.h"
 
 # Locate the tint CLI. Built by the `tint_cmd_tint_cmd` target once
 # TINT_BUILD_CMD_TOOLS is ON; may land in a few places depending on generator.
@@ -58,6 +61,10 @@ EOF
 # engine the way common.wgsl used to drift from world.h.
 cpp_const() {  # cpp_const <name> -> literal, minus any type suffix
   sed -n "s/.*constexpr[a-z0-9_ ]* $1 = \([0-9.]*\)f\?;.*/\1/p" "$WORLD_H" | head -1
+}
+mat_const() {  # mat_const <name> -> decimal or hex literal from materials.h
+  sed -n "s/.*constexpr[a-z0-9_ ]* $1 = \(0x[0-9A-Fa-f]*\|[0-9]*\)u\?;.*/\1/p" \
+    "$MATERIALS_H" | head -1
 }
 cpp_const_hex() {  # cpp_const_hex <name> -> hex literal, minus the u suffix
   sed -n "s/.*constexpr[a-z0-9_ ]* $1 = \(0x[0-9A-Fa-f]*\)u\?;.*/\1/p" "$WORLD_H" | head -1
@@ -165,6 +172,31 @@ W_MATSLOTS="$(cpp_const kMaterialSlots)"
 [ -n "$W_MATSLOTS" ] || {
   echo "check_shaders: cannot parse kMaterialSlots from $WORLD_H" >&2; exit 1; }
 W_STAINBASE=$((W_MATSLOTS - 8))
+
+# Angle of repose (src/sim/materials.h kRepose* / kMatRepose*). Same rule as
+# every world constant: the header is the source and this script scrapes it, so
+# a shader edit can be validated with no build and still see the real values.
+M_R11="$(mat_const kRepose1To1)"
+M_R21="$(mat_const kRepose2To1)"
+M_R31="$(mat_const kRepose3To1)"
+M_R12="$(mat_const kRepose1To2)"
+M_R13="$(mat_const kRepose1To3)"
+M_RASH="$(mat_const kMatReposeCodeAShift)"
+M_RAMASK="$(mat_const kMatReposeCodeAMask)"
+M_RBSH="$(mat_const kMatReposeCodeBShift)"
+M_RBMASK="$(mat_const kMatReposeCodeBMask)"
+M_RBLSH="$(mat_const kMatReposeBlendShift)"
+M_RBLMASK="$(mat_const kMatReposeBlendMask)"
+# kRepose1To1 and kMatReposeCodeAShift are legitimately "0", so test for EMPTY
+# rather than for falsy -- a `-z` on a value that is allowed to be zero is the
+# kind of check that passes until somebody reorders the enum.
+for _v in M_R11 M_R21 M_R31 M_R12 M_R13 M_RASH M_RAMASK M_RBSH M_RBMASK \
+          M_RBLSH M_RBLMASK; do
+  eval "_x=\${$_v}"
+  [ -n "$_x" ] || {
+    echo "check_shaders: cannot parse the kRepose*/kMatRepose* constants from $MATERIALS_H" >&2
+    exit 1; }
+done
 
 # Art palette — same shape as the stain palette: a run of reserved material
 # slots holding per-voxel mob SKIN colours (world.h kArtPaletteBaseGpu).
@@ -308,6 +340,17 @@ PRELUDE_TEXT="$(printf '%s\n' \
   "const MICRO_POOL_WORDS : u32 = ${W_MICROPOOL}u;" \
   "const MICRO_BODY_POOL_WORDS : u32 = ${W_MBPOOL}u;" \
   "const MATERIAL_SLOTS : u32 = ${W_MATSLOTS}u;" \
+  "const REPOSE_1_1 : u32 = ${M_R11}u;" \
+  "const REPOSE_2_1 : u32 = ${M_R21}u;" \
+  "const REPOSE_3_1 : u32 = ${M_R31}u;" \
+  "const REPOSE_1_2 : u32 = ${M_R12}u;" \
+  "const REPOSE_1_3 : u32 = ${M_R13}u;" \
+  "const MAT_REPOSE_A_SHIFT : u32 = ${M_RASH}u;" \
+  "const MAT_REPOSE_A_MASK : u32 = ${M_RAMASK}u;" \
+  "const MAT_REPOSE_B_SHIFT : u32 = ${M_RBSH}u;" \
+  "const MAT_REPOSE_B_MASK : u32 = ${M_RBMASK}u;" \
+  "const MAT_REPOSE_BLEND_SHIFT : u32 = ${M_RBLSH}u;" \
+  "const MAT_REPOSE_BLEND_MASK : u32 = ${M_RBLMASK}u;" \
   "const WATERBODY_CAP : u32 = ${W_WBCAP}u;" \
   "const WATERBODY_WORDS : u32 = ${W_WBWORDS}u;" \
   "const WATERBODY_STATE_WORDS : u32 = ${W_WBSTATE}u;" \

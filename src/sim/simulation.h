@@ -615,6 +615,9 @@ class Simulation {
   World* world_ = nullptr;
   rhi::Device device_;
   std::string shaderDir_;
+  // Cond::ReposeActive: does ANY loaded material author a non-default
+  // `repose`? Latched in UploadTables, so a reload updates it.
+  bool anyRepose_ = false;
   rhi::Buffer materialBuf_;
   rhi::Buffer reactionBuf_;
   // The baked tree atlas (src/sim/treeatlas.h): asset data, bound read-only
@@ -644,7 +647,7 @@ class Simulation {
   rhi::PipelineLayout simPL_, simPL2_, renderPL_, farPL_, microBodyPL_, fluidPL_,
       fluidSeamPL_, shadowPL_, gasPL_;
   rhi::ComputePipeline worldgen_, worldgenList_, mutate_, mutateCells_, compact_,
-      compactNext_, step_, occupancy_, occupancyDirty_, pick_;
+      compactNext_, step_, reposeSnap_, occupancy_, occupancyDirty_, pick_;
   // Wind primitive footprint wake (sim_mutate.wgsl `windWake`) — see
   // docs/RESEARCH_wind.md §4.3.
   rhi::ComputePipeline windWake_;

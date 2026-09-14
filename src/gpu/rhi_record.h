@@ -69,6 +69,10 @@ struct TableCtx {
   // .md). False on every tick of a settled world with no plume, and then not
   // one gas row is recorded.
   bool gasActive = false;
+  // Any loaded material authors a `repose` AND the CA has work this tick
+  // (world.h kReposeSnap*). False for a materials.json with no repose line, and
+  // then the snapshot prepass is not recorded at all.
+  bool reposeActive = false;
 };
 
 // The live resources a table row resolves against, as SEAM handles. The

@@ -94,8 +94,8 @@ constexpr uint32_t kMatTintsMax = 16;
 constexpr uint32_t kMatFlagBurnTint = 32;
 // Where this material's tint run starts inside the shared tint palette, packed
 // into the free high half of `flags` (bits 16..23) rather than added as a
-// field, for the reason the wind nibbles give below: MaterialGpu is exactly 64
-// bytes and every reader tests `flags` with a mask.
+// field, for the reason the wind nibbles give below: every reader tests `flags`
+// with a mask, so eight more bits in it cost nothing.
 constexpr uint32_t kMatTintBaseShift = 16, kMatTintBaseMask = 0xFF;
 
 // ---- wind coupling, packed into the SAME flags word ------------------------
@@ -103,9 +103,10 @@ constexpr uint32_t kMatTintBaseShift = 16, kMatTintBaseMask = 0xFF;
 // above (6 used, 2 spare); bits 8..11 and 12..15 are two authored 4-bit
 // numbers; 16..31 are free.
 //
-// Packed rather than added as fields because MaterialGpu is exactly 64 bytes
-// with no spare word, and growing a struct every sim thread reads to buy eight
-// bits is the worse trade — the call stainPack already made. `flags`
+// Packed rather than added as fields because growing a struct every sim thread
+// reads to buy eight bits is the worse trade — the call stainPack already made.
+// (MaterialGpu is 80 bytes now, not the 64 this used to cite; it grew for
+// `repose`. The trade stands without the "no spare word" half.) `flags`
 // specifically is safe because every reader on both sides of the language
 // boundary tests it with a MASK; not one compares the word whole.
 //
@@ -172,7 +173,147 @@ inline uint32_t DeriveWindFriction(int32_t density) {
   return (uint32_t)(f > (int32_t)kMatWindMax ? (int32_t)kMatWindMax : f);
 }
 
-// GPU-side layout, 64 bytes — must match struct Material in common.wgsl.
+// ---- ANGLE OF REPOSE (MaterialGpu.repose) ----------------------------------
+// The slope a PILE of this powder rests at, authored in materials.json as one
+// optional integer:
+//
+//   "repose": 34            // degrees, 18..72, POWDERS ONLY
+//
+// Absent (or 45) compiles to the word ZERO, which the kernel reads as "one down
+// one across" — the single rule every powder had before this existed. That is
+// what makes the default bit-identical to the old sim rather than merely close
+// to it, and it is why the encoding is biased so that a zeroed MaterialGpu (air,
+// the stain palette run, the art palette run, an unfilled slot) reads as 45°
+// instead of as the flowiest tier.
+//
+// THE ANGLE IS A RUN:RISE RATIO, because a lattice CA has no other way to hold
+// one. sim_step.wgsl's powder chain moves a grain one cell per tick, so the only
+// angles it can express exactly are the ones whose tangent is a ratio of small
+// integers. Five TIERS, in two families either side of the rule that was
+// already there:
+//
+//   code            run:rise   angle    what it does in the kernel
+//   kRepose3To1     3 : 1      18.43°   lateral slide toward a drop 3 out
+//   kRepose2To1     2 : 1      26.57°   lateral slide toward a drop 2 out
+//   kRepose1To1     1 : 1      45°      the bare down-diagonal (the old rule)
+//   kRepose1To2     1 : 2      63.43°   down-diagonal only if it drops >= 2
+//   kRepose1To3     1 : 3      71.57°   down-diagonal only if it drops >= 3
+//
+// BOTH FAMILIES READ CELLS 2 AND 3 AWAY, which the 3x3x3 colour lattice cannot
+// make race-free on LIVE voxels: same-colour write boxes tile space, so a read
+// at distance >= 2 lands in another acting cell's box and its value depends on
+// GPU scheduling. They read the REPOSE OCCUPANCY SNAPSHOT instead (world.h
+// kReposeSnap*) — one bit per voxel, taken at tick start by a prepass over the
+// dirty list plus the nine neighbours a probe can reach, identical in every
+// run of the same tick. That
+// snapshot is the ONLY licence in the CA for a read past distance 1.
+//
+// ANGLES BETWEEN TIERS ARE A MIXTURE, not a rounding. The word carries TWO
+// codes and a blend: blend/256 of the grains use code B and the rest use code
+// A, chosen by a POSITION-KEYED hash with no tick in it, so a grain that has
+// not moved makes the same choice every tick and a settled pile still sleeps
+// (CLAUDE.md rule 2). Sand at 34° is 60% of grains at 2:1 and 40% at 1:1, and
+// the pile it builds rests between the two — which is the whole reason the
+// authored surface can be a plain number of degrees rather than a tier name.
+//
+// Two codes and an explicit blend rather than "tier + fraction of the next one
+// up" because that spelling needs the codes to be ORDERED BY ANGLE, and
+// then the code that must be zero (45°, the middle of the ladder) cannot be.
+// A (codeA, codeB, blend) triple is ordering-free, so the default falls out as
+// an all-zero word for free.
+// One constant per `constexpr` statement, deliberately: ShaderConstantPrelude()
+// emits these and scripts/check_shaders.sh scrapes them to assemble the same
+// prelude without a build, and its scraper reads one name per statement.
+constexpr uint32_t kMatReposeCodeAShift = 0;
+constexpr uint32_t kMatReposeCodeAMask = 0x7;
+constexpr uint32_t kMatReposeCodeBShift = 3;
+constexpr uint32_t kMatReposeCodeBMask = 0x7;
+// 0..255; the fraction of grains using code B is blend/256, so 255 is 99.6%
+// and NOT "all of them" — the loader normalizes a saturated blend to a pure
+// code rather than leaving one grain in 256 on the wrong tier.
+constexpr uint32_t kMatReposeBlendShift = 6;
+constexpr uint32_t kMatReposeBlendMask = 0xFF;
+
+// The tier codes. ShaderConstantPrelude() emits these as the REPOSE_* consts
+// sim_step.wgsl reads, so there is ONE definition rather than two that must
+// agree. THE ORDER OF THE VALUES IS LOAD-BEARING there: the kernel tests
+// `code < REPOSE_1_2` to mean "not a steep tier", so the two steep codes have
+// to be the two largest.
+constexpr uint32_t kRepose1To1 = 0;  // 45 degrees: the word 0, the old rule
+constexpr uint32_t kRepose2To1 = 1;
+constexpr uint32_t kRepose3To1 = 2;
+constexpr uint32_t kRepose1To2 = 3;
+constexpr uint32_t kRepose1To3 = 4;
+
+// The authorable range, both ends REFUSED at load rather than clamped — a clamp
+// looks like the feature not working, and the first cut of this DID silently
+// clamp 10..18 to 18.43 while claiming three lines up that it refused. 18 is
+// the flattest face the lattice can hold (3:1) and 72 the steepest (1:3), and
+// the loader diagnostic names which end was crossed.
+constexpr int32_t kReposeDegMin = 18;
+constexpr int32_t kReposeDegMax = 72;
+constexpr int32_t kReposeDegDefault = 45;
+
+// The tier ladder in HUNDREDTHS OF A DEGREE, ascending. Integer so the compile
+// from degrees to (codeA, codeB, blend) needs no floating point anywhere: the
+// authored value is a whole number of degrees, so deg*100 is exact and the
+// blend is one integer divide.
+//   1843 = atan(1/3), 2657 = atan(1/2), 4500 = 45, 6343 = atan(2),
+//   7157 = atan(3)
+struct ReposeTier {
+  int32_t centideg;
+  uint32_t code;
+};
+constexpr int kReposeTierCount = 5;
+constexpr ReposeTier kReposeTiers[kReposeTierCount] = {
+    {1843, kRepose3To1}, {2657, kRepose2To1}, {4500, kRepose1To1},
+    {6343, kRepose1To2}, {7157, kRepose1To3},
+};
+
+// Compiles authored degrees to the packed word. Out-of-range input is the
+// caller's problem (LoadMaterialsJson refuses it); this clamps so a bad value
+// cannot produce a nonsense code.
+inline uint32_t PackRepose(int32_t deg) {
+  int32_t cd = deg * 100;
+  if (cd <= kReposeTiers[0].centideg) cd = kReposeTiers[0].centideg;
+  if (cd >= kReposeTiers[kReposeTierCount - 1].centideg)
+    cd = kReposeTiers[kReposeTierCount - 1].centideg;
+  uint32_t a = kReposeTiers[kReposeTierCount - 1].code, b = a;
+  uint32_t blend = 0;
+  for (int i = 0; i < kReposeTierCount - 1; i++) {
+    const int32_t lo = kReposeTiers[i].centideg, hi = kReposeTiers[i + 1].centideg;
+    if (cd < lo || cd >= hi) continue;
+    a = kReposeTiers[i].code;
+    b = kReposeTiers[i + 1].code;
+    // Rounded, and deliberately to 0..255 rather than 1..255: cd == lo is the
+    // tier exactly and must compile to the pure tier.
+    blend = (uint32_t)(((cd - lo) * 255 + (hi - lo) / 2) / (hi - lo));
+    break;
+  }
+  // Normalize the two degenerate mixtures to a pure code, so that (a) 45
+  // degrees authored explicitly is the same all-zero word as 45 degrees left
+  // out, and (b) no material ever pays the blend hash for a decision that is
+  // already made.
+  if (blend == 0) b = a;
+  if (blend >= 255) { a = b; blend = 0; }
+  if (a == b) blend = 0;
+  if (a == kRepose1To1 && b == kRepose1To1) return 0;
+  return ((a & kMatReposeCodeAMask) << kMatReposeCodeAShift) |
+         ((b & kMatReposeCodeBMask) << kMatReposeCodeBShift) |
+         ((blend & kMatReposeBlendMask) << kMatReposeBlendShift);
+}
+
+// GPU-side layout, 80 bytes — must match struct Material in common.wgsl.
+//
+// GREW FROM 64 TO 80 for `repose`, which is the first field added here that
+// could not be packed into a word that already existed. `flags` is full in the
+// low half and its high half is the tint-run base; `stainPack` is full;
+// `hardness` is 0..255 and its upper 24 bits were the obvious squat, but every
+// blast and dig path compares hardness as a WHOLE WORD, and a masked reader in
+// nine places to save 16 bytes in a 4096-entry table (256 KiB -> 320 KiB, once,
+// in one buffer) is the worse trade. Three reserved words come with it so the
+// NEXT field costs nothing: everything that addresses this table does so by
+// index through sizeof(MaterialGpu), so the stride is written down nowhere else.
 struct MaterialGpu {
   uint32_t klass;
   int32_t density;
@@ -187,8 +328,10 @@ struct MaterialGpu {
   uint32_t molten;                  // laser/heat product ID (0 = vaporize to air)
   uint32_t stainPack;               // packed staining behaviour (see below)
   uint32_t stainColor;              // RGBA8 the renderer paints for this stain
+  uint32_t repose = 0;              // powder pile slope, packed (see above); 0 = 45 degrees
+  uint32_t _r1 = 0, _r2 = 0, _r3 = 0;  // reserved: the next field costs no struct grow
 };
-static_assert(sizeof(MaterialGpu) == 64, "must match common.wgsl Material");
+static_assert(sizeof(MaterialGpu) == 80, "must match common.wgsl Material");
 
 // ---- staining (MaterialGpu.stainPack) --------------------------------------
 // A staining liquid marks the voxels it touches with a stain type + amount in
@@ -199,8 +342,12 @@ static_assert(sizeof(MaterialGpu) == 64, "must match common.wgsl Material");
 //              "chance": 60, "consume": 8 }
 //
 // Packed into ONE u32 rather than four, because MaterialGpu had exactly two
-// spare words and growing a 64-byte struct that is read by every sim thread is
-// a worse trade than four bit-shifts. Layout:
+// spare words at the time and growing a struct every sim thread reads is a
+// worse trade than four bit-shifts. (It DID later grow, 64 -> 80 bytes, for
+// `repose`, which could not be packed into any word that already existed. That
+// does not make this packing wrong — it makes "there is no room" the weak half
+// of the argument and "every reader masks anyway" the load-bearing half.)
+// Layout:
 //   bits 0..2   : stain type 1..7 (0 = does not stain) — a palette slot, NOT a
 //                 material id; slots are assigned at load in file order so the
 //                 renderer can hold a small stain table.
@@ -392,6 +539,11 @@ struct MaterialDef {
   // and it is what UploadTables walks: an alias must not overwrite the entry
   // for the slot it borrowed.
   bool farPalOwner = false;
+  // The AUTHORED angle of repose in degrees, mirrored unpacked for the tuner
+  // and the wiki exactly as absorbCapacity and the wind nibbles are. Always
+  // populated: a powder that authors nothing reads 45, and a non-powder reads
+  // 45 too (the field means nothing for it, and 0 would read as a legal angle).
+  int32_t reposeDeg = kReposeDegDefault;
   // Sound sets for this surface, keyed by SLOT ("footstep", "impact",
   // "break", ...). Each value names a set relative to the slot's namespace, so
   // "footstep": "leaf" resolves to the set "footsteps/leaf" — one FOLDER under

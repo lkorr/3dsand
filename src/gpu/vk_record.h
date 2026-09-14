@@ -117,6 +117,10 @@ struct RecordCtx {
   // be stepped whether or not any chunk is awake. False on every tick of a
   // settled world with no plume, and then no gas row is recorded at all.
   bool gasActive = false;
+  // Any loaded material authors a `repose` AND the CA has work this tick
+  // (world.h kReposeSnap*). False for a materials.json with no repose line,
+  // and then the snapshot prepass is not recorded at all.
+  bool reposeActive = false;
 };
 
 // The live GPU objects a table row resolves against. The recorder is handed one

@@ -180,9 +180,29 @@ for obj in objs:
             blob = fh.read()
     except OSError:
         continue
+    # A name that is a PREFIX of MINE, in an object that also carries MINE in
+    # full, is a TRUNCATED COPY OF MY OWN and not a sibling.
+    #
+    # Measured 2026-09-13, and it stopped a build dead: a worktree named
+    # `agent-a3832c33843b3f141` produced 109 of 109 objects "foreign" to
+    # `agent-a3832c33843b3f14` -- immediately after a purge plus
+    # SCCACHE_RECACHE=1, i.e. every object had just been compiled locally.
+    # cues.cpp.obj held the full name 101 times and the short one once: MSVC
+    # writes the path into a record that ends mid-string exactly once per
+    # object, and the character class stops there. Without this the check is
+    # unusable for any worktree whose name happens to be cut that way, and
+    # "refusing to link" then has no way out but disabling the check -- which
+    # is the outcome this file exists to prevent.
+    #
+    # Narrow on purpose: the full name must ALSO be present, so a genuinely
+    # foreign tree cannot hide behind a prefix unless it is BOTH a prefix of
+    # mine AND accompanied by mine, which is what a truncation is and a sibling
+    # is not.
+    _whole = MINE in blob
     foreign = sorted({m.group(1).decode('latin-1')
                       for m in WORKTREE.finditer(blob)
-                      if m.group(1) != MINE})
+                      if m.group(1) != MINE
+                      and not (_whole and MINE.startswith(m.group(1)))})
     if not foreign:
         # Only worth the second, more expensive probe when the cheap one is
         # quiet: an object already tagged with a sibling worktree is condemned.

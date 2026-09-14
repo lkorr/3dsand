@@ -12,6 +12,7 @@
 #include <unordered_map>
 #include <unordered_set>
 
+#include "sim/materials.h"  // kRepose*/kMatRepose*: the REPOSE_* prelude consts
 #include "sim/treeatlas.h"   // CurrentTreeLattice: the TREE_* prelude consts
 #include "sim/tuning.h"
 #include "sim/world.h"
@@ -227,6 +228,23 @@ std::string ShaderConstantPrelude() {
   // microbody fragment march bounds-checks its brick fetches against.
   o << "const MICRO_BODY_POOL_WORDS : u32 = " << kMicroBodyPoolWordsWorld << "u;\n";
   o << "const MATERIAL_SLOTS : u32 = " << kMaterialSlots << "u;\n";
+  // ---- angle of repose (src/sim/materials.h kRepose* / kMatRepose*) -------
+  // The five run:rise TIER CODES and the (codeA, codeB, blend) packing of
+  // MaterialGpu.repose, emitted rather than restated in sim_step.wgsl for the
+  // reason every other layout constant is: two places that must agree is a
+  // silent bug. The ORDER of the codes is load-bearing on the shader side --
+  // `code < REPOSE_1_2` is how the diagonal gate says "not a steep tier".
+  o << "const REPOSE_1_1 : u32 = " << kRepose1To1 << "u;\n";
+  o << "const REPOSE_2_1 : u32 = " << kRepose2To1 << "u;\n";
+  o << "const REPOSE_3_1 : u32 = " << kRepose3To1 << "u;\n";
+  o << "const REPOSE_1_2 : u32 = " << kRepose1To2 << "u;\n";
+  o << "const REPOSE_1_3 : u32 = " << kRepose1To3 << "u;\n";
+  o << "const MAT_REPOSE_A_SHIFT : u32 = " << kMatReposeCodeAShift << "u;\n";
+  o << "const MAT_REPOSE_A_MASK : u32 = " << kMatReposeCodeAMask << "u;\n";
+  o << "const MAT_REPOSE_B_SHIFT : u32 = " << kMatReposeCodeBShift << "u;\n";
+  o << "const MAT_REPOSE_B_MASK : u32 = " << kMatReposeCodeBMask << "u;\n";
+  o << "const MAT_REPOSE_BLEND_SHIFT : u32 = " << kMatReposeBlendShift << "u;\n";
+  o << "const MAT_REPOSE_BLEND_MASK : u32 = " << kMatReposeBlendMask << "u;\n";
   // Water bodies (docs/PLAN_water_master.md; sim_waterbody.wgsl). The caps that
   // size the TickParams arrays and the GPU ledger buffer, generated here for
   // the same reason every other layout constant is: a shader that redeclared

@@ -984,11 +984,296 @@ Status GateCaGutter(Ctx& c, std::string& detail) {
   return ok ? Status::Pass : Status::Fail;
 }
 
+// ---- repose ---------------------------------------------------------------
+//
+// PER-MATERIAL ANGLE OF REPOSE. Until the `repose` field existed, every powder
+// in the engine piled at exactly 45 degrees, because the movement chain is "one
+// down, else one down and one across" and nothing else. The field adds two
+// FLATTER tiers (2:1 and 3:1 run:rise, ~27 and ~18 degrees) as one extra
+// lateral step toward a drop, and two STEEPER ones (1:2 and 1:3, ~63 and ~72)
+// as a gate on the down-diagonal. Both read the tick-start occupancy snapshot;
+// see the ANGLE OF REPOSE block in sim_step.wgsl.
+//
+// WHAT THIS GATE ASSERTS, and why each part is here rather than assumed:
+//
+//   1. THE SLOPES ORDER. Four piles of the SAME material, from the SAME column,
+//      on the SAME floor, differing only in the packed `repose` word: 3:1, 2:1,
+//      the 1:1 default, and 1:2. run:rise must come out strictly decreasing.
+//      Bands per arm live in tests/baseline.json so retuning what counts as "a
+//      2:1 pile" costs a JSON edit, not a rebuild.
+//   2. THE BLEND IS NOT INERT. Two more arms use REAL LOADER OUTPUT --
+//      PackRepose(30) and PackRepose(40), the words `dust` and `ash` actually
+//      ship with -- and must produce DIFFERENT piles from each other. Those are
+//      the only arms that execute the per-grain blend hash at all: the four pure
+//      tiers have blend 0 and return before it. That matters because the first
+//      cut of this feature gated the slide on the MATERIAL rather than on the
+//      GRAIN'S OWN CODE, which made every angle between 27 and 44 behave as pure
+//      2:1 -- a bug no pure-tier arm can see.
+//   3. THE ROOM IS ASLEEP AT THE END of every arm. A lateral slide is the only
+//      move in the powder chain that does not lower a grain, so an unbounded run
+//      of them would keep chunks awake forever (CLAUDE.md rule 2). The
+//      termination argument is written down in the shader; this is its test.
+//   4. MASS IS EXACT. 400 grains poured, 400 grains standing, on every arm.
+//
+// IT USES `dust`, and the choice is load-bearing rather than arbitrary:
+// worldgen never places dust (it is a rubble/decay product), and its only
+// authored reactions need a `tag:hot` neighbour or a mite. So patching dust's
+// repose word disturbs nothing outside this room, which is what makes the
+// arm-to-arm differences attributable to the pile.
+//
+// ONE WORLDGEN FOR ALL SIX ARMS, and the room rebuilt between them. The arms are
+// comparable because each replays the SAME tick window over a room reset to a
+// clean sealed box; paying six fresh worldgens (1,746 woken chunks each) to
+// establish the same thing would roughly quadruple the gate's runtime.
+struct ReposeArm {
+  const char* name;
+  uint32_t word;      // the packed MaterialGpu.repose to patch in
+  const char* minKey;
+  const char* maxKey;
+  double minFallback;
+  double maxFallback;
+};
+
+Status GateRepose(Ctx& c, std::string& detail) {
+  GpuContext& ctx = c.ctx;
+  World& world = c.world;
+  Simulation& sim = c.sim;
+
+  uint32_t dustId = 0;
+  for (size_t i = 0; i < c.mats.size(); i++)
+    if (c.mats[i].name == "dust") { dustId = (uint32_t)i; break; }
+  if (dustId == 0) { detail = "no 'dust' material"; return Status::Fail; }
+
+  constexpr int kR = 15;           // interior half-width; the walls are at kR+1
+  constexpr int kFloorTop = 120;   // topmost solid floor cell (floor is 3 deep)
+  constexpr int kCeil = 143;       // the lid
+  constexpr int kColHalf = 2;      // 5x5 column cross-section
+  constexpr int kColTop = 136;     // column fills kFloorTop+1 .. kColTop
+  constexpr int kSettleTicks = 120;  // let the fresh world quieten, once
+  constexpr int kMaxTicks = 300;     // per-arm cap
+  constexpr int kMinTicks = 80;      // before the quiet poll starts
+  constexpr int kPoll = 20;
+  constexpr int kBuildAt = 3, kPourAt = 8;
+  const int cx = 160, cz = 160;    // SLOT coords, like the other CA gates
+  const int x0 = cx - kR - 1, x1 = cx + kR + 1;
+  const int z0 = cz - kR - 1, z1 = cz + kR + 1;
+  const int y0 = kFloorTop - 2, y1 = kCeil;
+  const int span = 2 * kR + 1;
+
+  // Stone where the shell is, AIR everywhere else in the box, so the chamber is
+  // clean whatever worldgen (or the previous arm) left in it.
+  std::vector<CellOp> build;
+  for (int y = y0; y <= y1; y++)
+    for (int z = z0; z <= z1; z++)
+      for (int x = x0; x <= x1; x++) {
+        const bool solid = y <= kFloorTop || y >= kCeil || x == x0 ||
+                           x == x1 || z == z0 || z == z1;
+        build.push_back({World::SlotCellIndex({x, y, z}),
+                         solid ? (uint32_t)kMatStone : 0u});
+      }
+  std::vector<CellOp> pour;
+  for (int y = kFloorTop + 1; y <= kColTop; y++)
+    for (int z = cz - kColHalf; z <= cz + kColHalf; z++)
+      for (int x = cx - kColHalf; x <= cx + kColHalf; x++)
+        pour.push_back({World::SlotCellIndex({x, y, z}), dustId & 0xFFFu});
+  const uint32_t poured = (uint32_t)pour.size();
+
+  // The idle check is LOCAL: the rest of the generated world may still be
+  // settling at these tick counts and would swamp a global count.
+  std::vector<uint32_t> boxChunks;
+  for (int qz = z0 >> 4; qz <= (z1 >> 4); qz++)
+    for (int qy = y0 >> 4; qy <= (y1 >> 4); qy++)
+      for (int qx = x0 >> 4; qx <= (x1 >> 4); qx++)
+        boxChunks.push_back(World::SlotChunkIndex({qx, qy, qz}));
+
+  auto pure = [](uint32_t code) {
+    return (code & kMatReposeCodeAMask) << kMatReposeCodeAShift;
+  };
+  // The four PURE tiers first, in order of decreasing run:rise, then the two
+  // BLENDED arms straight out of the loader. Order matters only for the report.
+  const ReposeArm arms[6] = {
+      {"3:1 pure  (18deg)", pure(kRepose3To1), "repose.runRiseMin_flowy3",
+       "repose.runRiseMax_flowy3", 1.9, 5.0},
+      {"2:1 pure  (27deg)", pure(kRepose2To1), "repose.runRiseMin_flowy2",
+       "repose.runRiseMax_flowy2", 1.3, 3.2},
+      {"1:1 default (45deg)", 0u, "repose.runRiseMin_default",
+       "repose.runRiseMax_default", 0.55, 1.6},
+      {"1:2 pure  (63deg)", pure(kRepose1To2), "repose.runRiseMin_steep",
+       "repose.runRiseMax_steep", 0.05, 0.95},
+      {"blend 30deg (loader)", PackRepose(30), "repose.runRiseMin_blend30",
+       "repose.runRiseMax_blend30", 0.9, 3.4},
+      {"blend 40deg (loader)", PackRepose(40), "repose.runRiseMin_blend40",
+       "repose.runRiseMax_blend40", 0.5, 2.2},
+  };
+  constexpr int kArms = 6;
+  double runRise[kArms] = {};
+  int hPeak[kArms] = {}, rEdge[kArms] = {}, quietAt[kArms] = {};
+  uint32_t mass[kArms] = {}, roomHash[kArms] = {}, awake[kArms] = {};
+
+  // ONE worldgen, then let it quieten before the first arm so the awake-chunk
+  // check below is measuring the PILE and not the terrain.
+  SubmitWorldgen(ctx, world, sim, kDefaultSeed);
+  ctx.WaitIdle();
+  {
+    uint32_t t = 39000;
+    for (int i = 0; i < kSettleTicks; i++)
+      SubmitTick(ctx, world, sim, ++t, kDefaultSeed, {}, {}, {}, false,
+                 {10, 7, 10}, false, false);
+    ctx.WaitIdle();
+  }
+
+  std::vector<MaterialDef> patched = c.mats;
+  std::vector<uint32_t> flags(kNumChunks, 0);
+  std::vector<uint32_t> cbuf((size_t)kChunkVol);
+  for (int a = 0; a < kArms; a++) {
+    patched[dustId].gpu.repose = arms[a].word;
+    sim.UploadTables(ctx.queue, patched, c.reactions);
+    ctx.WaitIdle();
+
+    uint32_t t = 40000;   // the SAME tick window for every arm
+    quietAt[a] = -1;
+    for (int i = 0; i < kMaxTicks; i++) {
+      SubmitTick(ctx, world, sim, ++t, kDefaultSeed, {}, {},
+                 i == kBuildAt ? build
+                 : i == kPourAt ? pour
+                                : std::vector<CellOp>{},
+                 false, {10, 7, 10}, false, false);
+      // Stop as soon as the room is quiet -- the arms settle at very different
+      // rates and a fixed tick count would be sized for the slowest of six.
+      if (i >= kMinTicks && (i % kPoll) == 0) {
+        ctx.WaitIdle();
+        rhi::ReadbackBlocking(ctx.device, ctx.queue, sim.DirtyActive(), 0,
+                              flags.data(), kNumChunks * 4, "reposeActive");
+        uint32_t live = 0;
+        for (uint32_t ci : boxChunks)
+          if (flags[ci] != 0) live++;
+        if (live == 0) { quietAt[a] = i; break; }
+      }
+    }
+    ctx.WaitIdle();
+    rhi::ReadbackBlocking(ctx.device, ctx.queue, sim.DirtyActive(), 0,
+                          flags.data(), kNumChunks * 4, "reposeActive");
+    for (uint32_t ci : boxChunks)
+      if (flags[ci] != 0) awake[a]++;
+
+    // ---- the pile's shape, as a height map over the interior floor --------
+    std::vector<int> hmap((size_t)span * span, 0);
+    uint32_t fnv = 2166136261u;
+    for (int qz = z0 >> 4; qz <= (z1 >> 4); qz++)
+      for (int qy = y0 >> 4; qy <= (y1 >> 4); qy++)
+        for (int qx = x0 >> 4; qx <= (x1 >> 4); qx++) {
+          ReadVoxelsSync(ctx, world, World::SlotChunkIndex({qx, qy, qz}), 1,
+                         cbuf.data(), "reposeVox");
+          for (uint32_t k = 0; k < kChunkVol; k++) {
+            if ((cbuf[k] & 0xFFFu) != dustId) continue;
+            const int x = (int)(k % 16) + qx * 16;
+            const int y = (int)((k / 16) % 16) + qy * 16;
+            const int z = (int)(k / 256) + qz * 16;
+            const int dx = x - cx, dz = z - cz;
+            if (dx < -kR || dx > kR || dz < -kR || dz > kR) continue;
+            if (y <= kFloorTop || y >= kCeil) continue;
+            mass[a]++;
+            // A hash of WHERE the grains ended up, not of the whole world: it
+            // isolates the pile, so "this arm built a different pile" is a
+            // claim about repose and not about anything else the tick did.
+            const uint32_t key = World::SlotCellIndex({x, y, z});
+            fnv = (fnv ^ (key & 0xFFu)) * 16777619u;
+            fnv = (fnv ^ ((key >> 8) & 0xFFu)) * 16777619u;
+            fnv = (fnv ^ ((key >> 16) & 0xFFu)) * 16777619u;
+            fnv = (fnv ^ ((key >> 24) & 0xFFu)) * 16777619u;
+            const int h = y - kFloorTop;   // 1 = one layer on the floor
+            int& cell = hmap[(size_t)(dz + kR) * span + (dx + kR)];
+            if (h > cell) cell = h;
+          }
+        }
+    roomHash[a] = fnv;
+    // The footprint is a DIAMOND, not a square: the spreading moves are the
+    // four axis down-diagonals and the four axis slides, so the natural radius
+    // is Manhattan. maxH at each radius is the pile's profile, and the slope is
+    // the radius the pile reaches over the height it stands at.
+    std::vector<int> profile((size_t)(2 * kR + 1), 0);
+    for (int dz = -kR; dz <= kR; dz++)
+      for (int dx = -kR; dx <= kR; dx++) {
+        const int h = hmap[(size_t)(dz + kR) * span + (dx + kR)];
+        if (h <= 0) continue;
+        const int r = (dx < 0 ? -dx : dx) + (dz < 0 ? -dz : dz);
+        if (h > hPeak[a]) hPeak[a] = h;
+        if (r > rEdge[a]) rEdge[a] = r;
+        if (h > profile[(size_t)r]) profile[(size_t)r] = h;
+      }
+    runRise[a] = hPeak[a] > 0 ? (double)rEdge[a] / (double)hPeak[a] : 0.0;
+
+    // ONE LINE PER ARM, with the whole profile, so a failure names itself
+    // instead of leaving a bare ratio with no cause attached.
+    std::string prof;
+    for (int r = 0; r <= rEdge[a] && r < 2 * kR + 1; r++)
+      prof += (r ? "," : "") + std::to_string(profile[(size_t)r]);
+    std::printf(
+        "repose: %-21s word %08x  run:rise %.2f (reach %d over peak %d), "
+        "%u/%u grains, %u/%zu room chunks awake (quiet at tick %d), pile "
+        "%08x, profile h@r=0.. [%s]\n",
+        arms[a].name, arms[a].word, runRise[a], rEdge[a], hPeak[a], mass[a],
+        poured, awake[a], boxChunks.size(), quietAt[a], roomHash[a],
+        prof.c_str());
+  }
+  // Put the authored table back before anything else runs on it (rule 7: gates
+  // share one World and the next one must not inherit a patched material).
+  sim.UploadTables(ctx.queue, c.mats, c.reactions);
+  ctx.WaitIdle();
+
+  static const char* kObs[kArms] = {"flowy3", "flowy2", "default", "steep",
+                                    "blend30", "blend40"};
+  const uint32_t awakeMax = (uint32_t)BaselineNumber("repose.awakeChunksMax", 0);
+  bool bandsOk = true, massOk = true, sleepOk = true;
+  for (int a = 0; a < kArms; a++) {
+    const double lo = BaselineNumber(arms[a].minKey, arms[a].minFallback);
+    const double hi = BaselineNumber(arms[a].maxKey, arms[a].maxFallback);
+    if (runRise[a] < lo || runRise[a] > hi) bandsOk = false;
+    if (mass[a] != poured) massOk = false;
+    if (awake[a] > awakeMax) sleepOk = false;
+    RecordObserved((std::string("repose.runRiseObserved_") + kObs[a]).c_str(),
+                   runRise[a]);
+  }
+  // The four PURE tiers, strictly decreasing: flatter tier => wider, lower pile.
+  const bool orderOk = runRise[0] > runRise[1] && runRise[1] > runRise[2] &&
+                       runRise[2] > runRise[3];
+  // THE BLEND ARMS. 30 degrees mixes more 2:1 grains than 40 does, so it must
+  // build the flatter pile -- and the two must not be the same pile, which is
+  // what fails if the slide is gated on the material instead of the grain.
+  const bool blendOk = runRise[4] > runRise[5] && roomHash[4] != roomHash[5];
+  // ... and each must land strictly INSIDE the pure tiers it mixes, or the
+  // "blend" is really just one of the two tiers wearing a mixed word.
+  const bool blendBracketOk = runRise[4] <= runRise[1] && runRise[4] >= runRise[2] &&
+                              runRise[5] <= runRise[1] && runRise[5] >= runRise[2];
+  const bool ok =
+      bandsOk && orderOk && massOk && sleepOk && blendOk && blendBracketOk;
+
+  detail = Format(
+      "PURE run:rise %.2f (3:1) > %.2f (2:1) > %.2f (1:1) > %.2f (1:2) %s; "
+      "BLEND %.2f (30deg) > %.2f (40deg) piles %08x/%08x %s, bracketed by the "
+      "pure tiers %s; bands %s; peaks %d/%d/%d/%d/%d/%d over reaches "
+      "%d/%d/%d/%d/%d/%d; mass %s (%u/%u/%u/%u/%u/%u of %u); room chunks awake "
+      "%u/%u/%u/%u/%u/%u (max %u) %s",
+      runRise[0], runRise[1], runRise[2], runRise[3],
+      orderOk ? "ORDERED" : "OUT OF ORDER", runRise[4], runRise[5], roomHash[4],
+      roomHash[5],
+      blendOk ? "differ" : "IDENTICAL (the blend does not reach the kernel)",
+      blendBracketOk ? "ok" : "OUTSIDE", bandsOk ? "ok" : "OUT OF BAND",
+      hPeak[0], hPeak[1], hPeak[2], hPeak[3], hPeak[4], hPeak[5], rEdge[0],
+      rEdge[1], rEdge[2], rEdge[3], rEdge[4], rEdge[5],
+      massOk ? "EXACT" : "LOST GRAINS", mass[0], mass[1], mass[2], mass[3],
+      mass[4], mass[5], poured, awake[0], awake[1], awake[2], awake[3],
+      awake[4], awake[5], awakeMax, sleepOk ? "asleep" : "STILL AWAKE");
+  std::printf("repose: %s (%s)\n", ok ? "PASS" : "FAIL", detail.c_str());
+  return ok ? Status::Pass : Status::Fail;
+}
+
 }  // namespace
 
 const std::vector<Gate>& CaGates() {
   static const std::vector<Gate> g = {
       {"ca-skip", "sim", {}, false, GateCaSkip},
+      {"repose", "sim", {}, false, GateRepose},
       {"ca-slope", "sim", {}, false, GateCaSlope},
       {"ca-slope-hybrid", "sim", {}, false, GateCaSlopeHybrid},
       {"ca-level-one", "sim", {}, false, GateCaLevelOne},

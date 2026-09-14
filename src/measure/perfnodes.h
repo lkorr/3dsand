@@ -124,9 +124,14 @@ inline constexpr PerfNodeDef kPerfNodes[] = {
      "Flat per-tick cost over kNumChunks. This is the pass that makes every "
      "row below it scale with activity."},
     {"caLoop", "CA (54 passes)", "simTick", PerfSide::Gpu, PerfScope::Count,
-     "ca",
+     "ca;reposeSnap",
      "27 colours x 2 substeps over the dirty list. Divide by active chunks for "
-     "the per-chunk number the compute budget is denominated in."},
+     "the per-chunk number the compute budget is denominated in. `reposeSnap` "
+     "is the prepass that takes the angle-of-repose occupancy snapshot for the "
+     "same list plus the nine neighbours a probe can reach: it is charged HERE "
+     "rather than to a node of "
+     "its own because it exists only to serve the CA row behind it, and a "
+     "reader comparing them separately would have to add them up anyway."},
     {"particleSys", "Particles", "simTick", PerfSide::Gpu, PerfScope::Count,
      "particleSpawn;particleArgs1;particleIntegrate;particleArgs2;particleResolve",
      "Scales with the live particle count, not the world. Integrate is the "

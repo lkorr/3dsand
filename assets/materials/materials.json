@@ -193,6 +193,7 @@
       "id": "ash",
       "footstep": "path",
       "class": "powder",
+      "repose": 40,
       "absorb": {
         "capacity": 14
       },
@@ -267,6 +268,7 @@
       "id": "snow",
       "footstep": "path",
       "class": "powder",
+      "repose": 63,
       "density": 300,
       "hardness": 6,
       "colors": [
@@ -323,6 +325,7 @@
       "comment": "Wind, authored. This and the mite override the density-derived default (kMatWind* in sim/materials.h) in the direction the formula cannot know, because real wind susceptibility is area-over-mass — SIZE — and a uniform voxel grid has erased size. A seed at density 500 would derive a response of 9; dandelion dispersal is the whole point of a seed, so it gets 14 and a friction of 1 and a breeze carries it. A mite at density 600 would derive 8, which has the wind blowing a living creature around like ash; it gets response 1 and the maximum friction, so it holds its ground and walks where it means to.",
       "id": "seed",
       "class": "powder",
+      "repose": 30,
       "density": 500,
       "hardness": 8,
       "wind": {
@@ -433,6 +436,7 @@
     {
       "id": "dust",
       "class": "powder",
+      "repose": 30,
       "density": 400,
       "hardness": 6,
       "colors": [

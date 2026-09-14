@@ -214,6 +214,41 @@ PASS(compact, "prep(mutate+explode+compact)", PT_TICK, PIPE_COMPACT,      K_COMP
 PASS(copy_argsStage_dispatchArgs, nullptr, PT_TICK, PIPE_NONE, K_COPY, 0,0,12, GRP_NONE, DYN_NONE, C_CAACTIVE, 1,
      USES(TR(ArgsStage) TW(DispatchArgs)))
 
+// ---- phase 2b: the ANGLE-OF-REPOSE OCCUPANCY SNAPSHOT --------------------
+//
+// The ONE licence in this engine for a CA read past distance 1, and it has to
+// be a separate pass for a reason the table can state precisely: the 3x3x3
+// colour lattice makes same-colour write boxes TILE space, so a read at
+// distance >= 2 lands in another acting cell's box and its value depends on GPU
+// scheduling. Per-material repose has to see 2 and 3 cells out (a 2:1 face and
+// a 1:1 face are locally identical; the difference IS at distance 2), so it
+// reads a snapshot of the world at TICK START instead of live voxels. See
+// world.h's kReposeSnap* block and sim_step.wgsl's ANGLE OF REPOSE header.
+//
+// BEFORE the `ca` row and AFTER the staging copy, so it runs on the same
+// compacted dirty list the CA is about to dispatch over -- which is what makes
+// it activity-scaled: a settled world compacts nothing, dispatches zero
+// workgroups here, and pays nothing (rule 2). The W(ReposeSnap) here against
+// the CA's R(ReposeSnap) is the whole point of the row; a missing barrier on
+// that edge would reintroduce exactly the race the snapshot removes.
+//
+// Each workgroup fills its dirty chunk AND the nine neighbours a probe can
+// reach (reposeRingOffset in the shader owns that table): a resting grain's
+// probes reach 3 cells and cross into a neighbour chunk that may be asleep, and
+// a boundary artifact every 16 cells is not acceptable. Ring members are
+// re-filled by every dirty chunk that touches them; the bits written are a pure
+// function of pre-CA voxel state, so duplicated work is redundant, never
+// divergent.
+//
+// read-only in practice: `voxels` is read_write for the module because `main`
+// writes it; `reposesnap` only asks what material a cell holds. No A(DirtyOut),
+// no A(PageFaults), no A(Support) -- it stores no voxel, which is what keeps
+// this row from adding a WAW edge to the 54 CA iterations behind it.
+PASS(reposeSnap, "reposeSnap", PT_TICK, PIPE_REPOSE_SNAP, K_INDIRECT, IND_DISPATCHARGS,0,0,
+     GRP_SIM, DYN_ZERO, C_REPOSE, 1,
+     USES(U(TickUBO) R(Voxels) R(Materials) R(DirtyList) I(DispatchArgs)
+          R(PageTable) W(ReposeSnap)))
+
 // ---- phase 3: the CA loop -------------------------------------------------
 // 27 colors x 2 gravity substeps, one workgroup per dirty chunk. A settled
 // world dispatches zero workgroups here (DESIGN.md §11). DYN_CA feeds iteration
@@ -255,7 +290,7 @@ PASS(ca, "ca(54 color x substep)", PT_TICK, PIPE_STEP, K_INDIRECT, IND_DISPATCHA
      USES(R(Materials) U(TickUBO) U(PassUBO) R(Reactions) R(DirtyIn) R(DirtyList) I(DispatchArgs)
           RW(Voxels) A(DirtyOut) A(Support) R(PageTable) A(PageFaults)
           R(FluidBlockMap) R(FluidGrid) A(FluidCellScratch) A(ActVoxViz)
-          A(GasSpawn) A(GasOuter)))
+          A(GasSpawn) A(GasOuter) R(ReposeSnap)))
 
 // ---- phase 3b: water bodies (docs/PLAN_water_master.md M2) ----------------
 //

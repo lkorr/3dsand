@@ -58,9 +58,11 @@ const MATF_TINT_BASE_MASK  : u32 = 0xFFu;
 // `flags` bits 0..7 are the MATF_* booleans above (6 used, 2 spare); bits 8..15
 // are two 4-bit AUTHORED numbers, and 16..31 are still free.
 //
-// They live here rather than in two new fields because `MaterialGpu` is exactly
-// 64 bytes with no spare word, and growing a struct every sim thread reads to
-// buy eight bits is the worse trade — the same call `stainPack` made. Packing
+// They live here rather than in two new fields because growing a struct every
+// sim thread reads to buy eight bits is the worse trade — the same call
+// `stainPack` made. (The struct is 80 bytes now, not the 64 this used to cite:
+// it grew for `repose`, which could not be packed into any word that already
+// existed. The trade stands without the "no spare word" half of it.) Packing
 // into `flags` specifically is safe because every existing reader of it, on both
 // sides of the language boundary, tests it with a MASK (`(m.flags & MATF_x) !=
 // 0`); not one compares it whole, so a nibble in the high half is invisible to
@@ -119,6 +121,25 @@ struct Material {
   // Both are authored in materials.json under "stain" (see materials.h).
   stainPack   : u32,
   stainColor  : u32,
+  // ---- angle of repose: what slope a PILE of this powder rests at ----
+  // Packed (codeA, codeB, blend): two of the FIVE run:rise tier codes, and the
+  // 0..255 share of grains that use the second one. ZERO means 45 degrees,
+  // which is the one-down-one-across rule every powder had before the field
+  // existed, so a material that authors nothing is bit-identical to the old
+  // sim. Authored in materials.json as `"repose": 34`; see materials.h
+  // kRepose* / kMatRepose* for the codes, the packing and the tier ladder.
+  //
+  // READ BY sim_step.wgsl ONLY. The REPOSE_* codes and the shift/mask
+  // constants are EMITTED by ShaderConstantPrelude() from those same C++
+  // definitions rather than restated in either file -- two places that must
+  // agree is the bug this repo has checkers for, and scripts/check_shaders.sh
+  // scrapes materials.h so a shader edit still validates with no build.
+  repose      : u32,
+  // Reserved. The struct is read by every sim thread and grew 64 -> 80 bytes
+  // for `repose`; these three are so the next field does not grow it again.
+  _r1         : u32,
+  _r2         : u32,
+  _r3         : u32,
 };
 
 // stainPack accessors — must match kStainPack* in src/sim/materials.h.
@@ -258,10 +279,11 @@ fn isViscousLiquid(m : Material) -> bool {
 // authored `"opacity": 40` on a solid is unambiguous and every existing solid
 // keeps rendering exactly as before.
 //
-// This is why translucency did NOT need a new Material field: the struct is a
-// hard 64 bytes (static_assert in materials.h) and is read by every sim thread,
-// so re-using a byte that already means "how much does this absorb" beats
-// growing it. The value is absorption per unit depth, not an alpha: it feeds
+// This is why translucency did NOT need a new Material field: the struct is
+// size-pinned by a static_assert in materials.h (80 bytes now; it was 64 when
+// this was written and grew for `repose`) and is read by every sim thread, so
+// re-using a byte that already means "how much does this absorb" beats growing
+// it. The value is absorption per unit depth, not an alpha: it feeds
 // Beer-Lambert in shadeTranslucent, so thin ice is nearly clear and a thick
 // block is deep cyan from the SAME number.
 fn isTranslucentSolid(m : Material) -> bool {
@@ -676,7 +698,11 @@ struct TickParams {
   //
   // It was the padCp0 pad word, so the struct layout is unchanged.
   gasMode : u32,
-  padCp1 : u32,
+  // The repose snapshot's per-slot validity epoch: MONOTONIC and never reset,
+  // because the tick is not (F7 regen rewinds it, and so does every selftest
+  // arm that replays a fixed window). See TickParams::snapEpoch in world.h.
+  // Was padCp1, so the struct size is unchanged.
+  snapEpoch : u32,
   currentPrimLo : vec3<i32>,   // union AABB, inclusive world cells; lo > hi
   padCp2 : i32,                // means "no primitives"
   currentPrimHi : vec3<i32>,
