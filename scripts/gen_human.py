@@ -1399,22 +1399,29 @@ def main():
     # AND-ed and an empty predicate never matches. These name LEG PARTS rather
     # than using minChainsLost because AnimSelectState counts EVERY IK chain and
     # this rig has arm chains too — `minChainsLost: 2` would fire "crawl" when
-    # both ARMS came off and the legs were fine. bodyYOffset is in WORLD VOXELS
-    # and this figure is 17 of them, same as mina, so hers carry over.
+    # both ARMS came off and the legs were fine.
+    #
+    # The prone states carry `groundAlign` and NO bodyYOffset. They used to
+    # carry a hand-tuned drop in world voxels that was really this figure's hip
+    # height in disguise — which is why it had to be re-derived for every rig
+    # and was wrong the moment the art changed. The engine now fits a plane
+    # through the ground under the body's own length and lowers the posed body
+    # onto it (anim.h, AnimStateRule::groundAlign), so there is nothing here to
+    # scale between figures.
     states = [
         {"name": "squirm",
          "missing": ["legU.L", "legU.R"],
          "missingAny": ["armU.L", "armU.R"],
          "clip": "squirm", "speedScale": 0.12,
-         "disableGait": True, "bodyYOffset": -0.35},
+         "disableGait": True, "groundAlign": 1.0},
         {"name": "crawl",
          "missing": ["legU.L", "legU.R"],
          "clip": "crawl", "speedScale": 0.3,
-         "disableGait": True, "bodyYOffset": -0.32},
+         "disableGait": True, "groundAlign": 1.0},
         {"name": "crawl.shins",
          "missing": ["legL.L", "legL.R"],
          "clip": "crawl", "speedScale": 0.3,
-         "disableGait": True, "bodyYOffset": -0.32},
+         "disableGait": True, "groundAlign": 1.0},
         {"name": "hop",
          "missing": ["foot.L", "foot.R"],
          "clip": "hop", "speedScale": 0.45,

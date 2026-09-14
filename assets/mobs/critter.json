@@ -288,7 +288,9 @@
       "minChainsLost": 2,
       "clip": "crawl",
       "speedScale": 0.35,
-      "disableGait": true
+      "disableGait": true,
+      "bodyYOffset": 0.0,
+      "groundAlign": 1.0
     }
   ],
   "clips": {

@@ -371,7 +371,7 @@ def main():
         # making sense: drop to the belly and scrabble.
         "states": [
             {"name": "crawl", "minChainsLost": 2, "clip": "crawl",
-             "speedScale": 0.35, "disableGait": True},
+             "speedScale": 0.35, "disableGait": True, "groundAlign": 1.0},
         ],
         # Two-key override clip, masked to the head, wired to the non-fatal
         # damage flinch. Quaternions are (x, y, z, w).

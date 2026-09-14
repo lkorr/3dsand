@@ -289,6 +289,12 @@ const char* const kOrder[] = {
     // reason above: `ai-slope` writes a real stone ramp and regenerates on the
     // way out, exactly as `ai-approach` does with its wall.
     "ai-slope",
+    // ...and the same ramp trick for a body that has no legs left to walk it
+    // with. Beside `ai-slope` because it shares the fixture shape and the same
+    // teardown discipline (it writes stone and regenerates on the way out), and
+    // because the two measure the two halves of "a creature on a hill": the
+    // walker must not sink into it, the crawler must not float over it.
+    "crawl-slope",
     // Live ragdoll: a blast knocks a creature flying and it gets back up; a
     // long fall does the same. Appended last in the group for the reason
     // above; it restores the world on its way out.

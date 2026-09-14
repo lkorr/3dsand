@@ -198,9 +198,40 @@ struct AnimStateRule {
   // swing and the pelvis bob while this state is active. A crawl keyed on the
   // torso fights all four otherwise.
   bool disableGait = false;
-  // Animated body height relative to the walk drive's ground (world voxels)
-  // while the gait's foot-derived height is suppressed.
+  // Animated body height while the gait's foot-derived height is suppressed,
+  // in world voxels. What it is measured FROM depends on `groundAlign`: at 0
+  // it is an offset from the walk drive's ground contact (the historical
+  // meaning, and what a hop wants); above 0 it is a sink (negative) or lift
+  // into the fitted surface the prone body is laid on, so it is a small
+  // number rather than a hand-guessed stand-in for the hip height.
   float bodyYOffset = 0.0f;
+  // ---- A PRONE BODY LIES ON THE GROUND, IT DOES NOT HOVER OVER A COLUMN ----
+  //
+  // 0 = the body stays upright and is placed off the walk drive's single ground
+  // column, which is right for a hop or a limp. Above 0 the state is treated as
+  // PRONE: a plane is least-squares fitted through the ground under the body's
+  // own footprint-when-lying-down, the body is tilted toward that plane's normal
+  // by this weight, and it is dropped until the lowest voxel of its POSED core
+  // rests on the plane (Mob::FitGroundPlane / Mob::PosedCoreLowY).
+  //
+  // Both halves of that matter and neither is optional:
+  //
+  //   * WITHOUT THE FIT, the tilt comes from a two-point difference and the
+  //     height from one column, so a body crawling over ground that alternates
+  //     between two grades snaps between the two instead of averaging them —
+  //     the whole creature re-orients every voxel it covers, which reads as a
+  //     glitch rather than as terrain.
+  //   * WITHOUT THE GROUNDING, the clip's own keyframes decide how high the
+  //     body floats: a crawl pitches the ROOT, and a root rotation happens
+  //     about the hip joint, so the whole torso swings out horizontally at hip
+  //     height and stays there. That is the "crawling mobs float far above the
+  //     voxels" report, and no bodyYOffset can fix it for more than one rig,
+  //     because the number it needs IS that rig's hip height.
+  //
+  // It is a WEIGHT rather than a bool so a body can lie at a fraction of the
+  // grade (a soldier dragging itself keeps a little of its own vertical) and
+  // because the caller blends it over a state change for free.
+  float groundAlign = 0.0f;
 };
 
 enum class IkSolver : uint8_t { TwoBone };

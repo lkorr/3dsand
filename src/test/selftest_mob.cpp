@@ -5420,6 +5420,393 @@ Status GateAiSlope(Ctx& c, std::string& detail) {
   return ok ? Status::Pass : Status::Fail;
 }
 
+// ---- crawl-slope ------------------------------------------------------------
+//
+// A CREATURE WITH NO LEGS LIES ON THE GROUND, AND IT DOES NOT TWITCH BETWEEN
+// TWO SLOPES WHILE IT DOES IT.
+//
+// THE FIXTURE IS A RAMP OF TWO GRADES, MIXED. Every second column rises, by one
+// voxel or by two on a fixed hash, so the local grade under any short baseline
+// is either 1:2 or 1:1 and the average over a body length is neither. That is
+// the shape the complaint is about: real ground is a mix of grades, and an
+// estimator with no redundancy reports whichever one it happened to land on. A
+// smooth wedge could not tell the two estimators apart, because on a plane they
+// agree exactly.
+//
+// Four numbers, because four different things can be wrong:
+//
+//   floatVox   How far the lowest point the creature actually DRAWS ever got
+//              above the ground UNDER THAT POINT, over the ramp's interior. A crawl clip pitches the
+//              ROOT, and a root rotation happens about the hip joint, so the
+//              torso swings out horizontally AT HIP HEIGHT and stays there — a
+//              legless humanoid slid along nine voxels in the air. The old
+//              answer was a hand-authored `bodyYOffset` per state per rig,
+//              which is that rig's hip height written down by a person, and it
+//              was a third of the way there on the human and half on the
+//              wizard. Measured against the ramp profile THIS GATE WROTE and
+//              at the CONTACT POINT's own column — the engine's ground fit is
+//              the thing under test, so a probe that asked the subject where
+//              the floor is would prove nothing, and a reference taken under
+//              the body's MIDDLE is metres away from its nose on a slope.
+//   tiltDeg    The angle the body is drawn at, against atan(the ramp's true
+//              mean grade). This is the "crawl along the normal of roughly the
+//              slope" claim stated directly: avg within `TiltErr` of the mean
+//              grade, and — the part that is actually about jitter — a RANGE
+//              (max minus min) under `TiltRange`. A body snapping between the
+//              fixture's two component grades would swing about 18 degrees.
+//   sdFit      Standard deviation of the fitted forward grade over the run,
+//              against `sdFoot` from THE ESTIMATOR THIS REPLACED — UpdateGait's
+//              two probes over the footprint span, which is what a crawl would
+//              have inherited had the walker's slope lean simply been switched
+//              on for it. The body-length two-probe is reported alongside but
+//              not asserted on, because it separates the two halves of the fix:
+//              most of the win is measuring over the body's own LENGTH at all,
+//              and the plane fit takes the rest. EXCURSION, not total
+//              variation: fifteen columns
+//              crossing a voxel boundary at fifteen different moments make
+//              more, smaller steps than two columns do, so per-tick change
+//              punishes the smoother signal. What the eye reads as "jumping
+//              between two slopes" is how far the estimate swings, which is
+//              what a standard deviation is.
+//
+// Plus two guards that stop any of them being satisfied by doing nothing:
+// `crawled` (it has to travel up the ramp) and a floor under `sdTwo` (the
+// fixture has to actually present a mixed grade, or the comparison is vacuous).
+// Thresholds are in tests/baseline.json, so retuning them costs no rebuild.
+Status GateCrawlSlope(Ctx& c, std::string& detail) {
+  c.debris.Reset();
+  c.mobs.Reset();
+  SubmitWorldgen(c.ctx, c.world, c.sim, kDefaultSeed);
+  c.ctx.WaitIdle();
+
+  const int defIndex = AiHumanoidDef(c.mobs);
+  if (defIndex < 0) {
+    detail = "no mob def publishes a held_right socket";
+    return Status::Fail;
+  }
+  const MobDef& def = c.mobs.Defs()[defIndex];
+  if (c.mobs.Behaviors().Find("duelist") < 0) {
+    detail = "no \"duelist\" profile in assets/mobs/behaviors.json";
+    return Status::Fail;
+  }
+  // The rig has to HAVE legs to lose, or this gate is measuring a walker.
+  auto partIndex = [&](const char* nm) {
+    for (size_t i = 0; i < def.limbs.size(); i++)
+      if (def.limbs[i].name == nm) return (int)i;
+    return -1;
+  };
+  const int legL = partIndex("legU.L"), legR = partIndex("legU.R");
+  if (legL < 0 || legR < 0) {
+    detail = Format("%s has no legU.L/legU.R to sever", def.name.c_str());
+    return Status::Fail;
+  }
+
+  int relief = 0;
+  const IVec3 anchor = AiFixtureCentre(c.world);
+  const IVec3 spot = AiFlatSpot(anchor.x, anchor.z, 96, 30, kDefaultSeed, relief);
+  const int h0 = World::TerrainHeight(spot.x, spot.z, kDefaultSeed);
+  AiTicker tick{c, 7600, {spot.x >> 4, spot.y >> 4, spot.z >> 4}};
+
+  const uint32_t stone = [&] {
+    for (size_t i = 0; i < c.mats.size(); i++)
+      if (c.mats[i].name == "stone") return (uint32_t)i;
+    return 1u;
+  }();
+
+  // ---- the mixed ramp ----------------------------------------------------
+  // Rises on EVERY SECOND column, by one voxel or by two. Half a voxel per
+  // column of run against one per column: 27 degrees against 45, averaging
+  // near 37 — steep enough to be a slope, shallow enough that the walk drive
+  // will carry a body up it (a 1:1-and-2:1 mix averages 56 degrees, and the
+  // drive correctly refuses most of that, so the creature never moved).
+  // THE WHOLE FIXTURE HAS TO FIT INSIDE THE DUELIST'S 46-VOXEL SIGHT RANGE,
+  // measured PLANAR from the spawn — ramp start + length + the stand-off the
+  // target needs past the crest. `ai-slope` documents this at length and this
+  // gate relearned it: a 40-column ramp put the target 54 voxels out, the
+  // creature perceived nothing, and "crawled 0.0" was a PERCEPTION failure
+  // wearing a locomotion failure's clothes. `targeted` below says which.
+  const int kHalfX = 22, kRampLen = 28, kCrestLen = 10;
+  const int rampZ0 = spot.z + 6;
+  auto riseAt = [](int dz) {
+    if ((dz & 1) != 0) return 0;         // the flat half of each pair
+    // Cheap fixed hash on the PAIR index, so the fixture is identical every
+    // run and the pattern is not a period-2 alternation a symmetric two-point
+    // probe would average out by construction.
+    uint32_t h = (uint32_t)(dz >> 1) * 2654435761u;
+    h ^= h >> 13;
+    return ((h >> 5) & 1u) ? 2 : 1;
+  };
+  std::vector<int> top(kRampLen + kCrestLen + 1, h0);
+  int totalRise = 0;
+  for (int dz = 1; dz < (int)top.size(); dz++) {
+    const int r = dz <= kRampLen ? riseAt(dz) : 0;
+    totalRise += r;
+    top[dz] = top[dz - 1] + r;
+  }
+  const float meanGrade = (float)totalRise / (float)kRampLen;
+  {
+    std::vector<CellOp> ops;
+    for (int dz = 0; dz < (int)top.size(); dz++) {
+      const int wz = rampZ0 + dz;
+      for (int wx = spot.x - kHalfX; wx <= spot.x + kHalfX; wx++) {
+        const int base = World::TerrainHeight(wx, wz, kDefaultSeed);
+        for (int y = base; y <= std::max(top[dz], base); y++) {
+          const IVec3 cell{wx, y, wz};
+          if (!c.world.CellInWindow(cell)) continue;
+          ops.push_back(CellOp{World::SlotCellIndex(cell), stone});
+        }
+      }
+    }
+    const size_t kSlice = 4000;
+    for (size_t i = 0; i < ops.size(); i += kSlice) {
+      std::vector<CellOp> slice(
+          ops.begin() + (ptrdiff_t)i,
+          ops.begin() + (ptrdiff_t)std::min(i + kSlice, ops.size()));
+      tick({}, slice);
+    }
+  }
+  // The surface THIS GATE wrote, from its own table — the independent truth the
+  // float is measured against (see the header note). Valid at every column,
+  // on the ramp and off it.
+  auto fixtureSurface = [&](int wx, int wz) {
+    const int dz = wz - rampZ0;
+    const int base = World::TerrainHeight(wx, wz, kDefaultSeed);
+    const bool onRamp = dz >= 0 && dz < (int)top.size() &&
+                        wx >= spot.x - kHalfX && wx <= spot.x + kHalfX;
+    return (float)((onRamp ? std::max(top[dz], base) : base) + 1);
+  };
+
+  // Get the ramp into the chunk cache the LOCOMOTION reads — the same trap
+  // ai-approach and ai-slope both document at length.
+  auto cachedSolid = [&](IVec3 cell) {
+    const CachedChunk* cc =
+        c.world.Cached({cell.x >> 4, cell.y >> 4, cell.z >> 4});
+    if (cc == nullptr || cc->voxels.size() != kChunkVol) return false;
+    return (cc->voxels[(((uint32_t)cell.z & 15u) * kChunk +
+                        ((uint32_t)cell.y & 15u)) *
+                           kChunk +
+                       ((uint32_t)cell.x & 15u)] &
+            0xFFFu) != 0u;
+  };
+  for (int i = 0; i < 160; i++) {
+    bool all = true;
+    for (int dz = 0; dz < kRampLen; dz++) {
+      const IVec3 cell{spot.x, top[dz], rampZ0 + dz};
+      if (cachedSolid(cell)) continue;
+      all = false;
+      c.world.RequestChunkFetch({cell.x >> 4, cell.y >> 4, cell.z >> 4});
+    }
+    if (all) break;
+    tick();
+  }
+  int rampSeen = 0;
+  for (int dz = 0; dz < kRampLen; dz++)
+    if (cachedSolid(IVec3{spot.x, top[dz], rampZ0 + dz})) rampSeen++;
+
+  // ---- the crawler -------------------------------------------------------
+  // BLEEDING OFF, for `mob dismember states`' reason: an amputation opens a
+  // stump that drains hp until death, and a creature that bleeds out mid-run
+  // turns into a ragdoll and stops being a crawl at all. The claim here is
+  // where a crawling body is DRAWN, not whether it survives its wounds.
+  const Tuning savedGore = CurrentTuning();
+  {
+    Tuning tt = savedGore;
+    tt.gore.bleedHpPerVoxel = 0.0f;
+    SetCurrentTuning(tt);
+  }
+  const int targetZ = rampZ0 + kRampLen + 8;
+  const float mobChest = (float)(h0 + 1) + def.worldSize.y * 0.5f;
+  const float lipT = (float)(rampZ0 + kRampLen - spot.z) /
+                     std::max(1.0f, (float)(targetZ - spot.z));
+  const float targetY = std::max(
+      (float)top[kRampLen] + 8.0f,
+      mobChest + ((float)top[kRampLen] + 3.0f - mobChest) / std::max(lipT, 0.1f));
+  c.mobs.SetPlayerActor(Vec3{(float)spot.x, targetY, (float)targetZ}, 3.0f,
+                        17.0f, true);
+
+  std::string why;
+  auto bail = [&](const std::string& d) {
+    detail = d;
+    SetCurrentTuning(savedGore);
+    c.mobs.ClearPlayerActor();
+    c.mobs.ClearAttackRequests();
+    c.debris.Reset();
+    c.mobs.Reset();
+    SubmitWorldgen(c.ctx, c.world, c.sim, kDefaultSeed);
+    c.ctx.WaitIdle();
+    return Status::Fail;
+  };
+  const uint64_t id =
+      AiSpawn(c, defIndex,
+              {spot.x - (int)(def.worldSize.x * 0.5f), h0 + 1,
+               spot.z - (int)(def.worldSize.z * 0.5f)},
+              "duelist", why);
+  if (id == 0) return bail(why);
+  for (int i = 0; i < 8; i++) tick();     // stand up, find the target
+  c.mobs.Sever(id, legL);
+  c.mobs.Sever(id, legR);
+  for (int i = 0; i < 12; i++) tick();    // the crawl clip blends in
+  const int stateNow = c.mobs.LocoState(id);
+  const float startZ = c.mobs.MobOrigin(id).z;
+
+  const int budget = (int)BaselineNumber("crawlSlopeTicks", 1200.0);
+  const float spanFwd = std::max(2.0f, def.worldSize.y);
+  const float spanSide =
+      std::max(1.0f, std::max(def.worldSize.x, def.worldSize.z));
+  const float half = spanFwd * 0.5f;
+  float floatMax = 0, floatAny = 0, sinkMax = 0, worstFloatAt = 0;
+  float tiltMin = 1e9f, tiltMax = -1e9f;
+  double tiltSum = 0, fitSum = 0, fitSq = 0, twoSum = 0, twoSq = 0;
+  double footSum = 0, footSq = 0, roughSum = 0;
+  int onRamp = 0, graded = 0, placed = 0;
+  float prevTwo = 0, prevFoot = 0;
+  bool everTargeted = false;
+  for (int i = 0; i < budget; i++) {
+    tick();
+    const Vec3 o = c.mobs.MobOrigin(id);
+    if (o.x == 0 && o.y == 0 && o.z == 0) break;             // despawned
+    Mob* m = c.mobs.FindMobById(id);
+    if (m == nullptr) break;
+    // ATTRIBUTION, not a bare "crawled 0". A creature that never SAW its
+    // target and one that saw it and could not climb report the same zero, and
+    // only the second is a locomotion bug (ai-slope's note).
+    const ai::Brain* br = c.mobs.MobBrain(id);
+    if (br != nullptr && br->hasTarget) everTargeted = true;
+    const float cx = o.x + def.worldSize.x * 0.5f;
+    const float cz = o.z + def.worldSize.z * 0.5f;
+    // Past the foot of the ramp: before that the creature is on the flat and
+    // there is no slope claim to make about it.
+    if (cz < (float)(rampZ0 + 2)) continue;
+    onRamp++;
+
+    // THE RAMP'S INTERIOR, clear of its foot and its crest by half a body.
+    // Those are genuine CONVEX AND CONCAVE BREAKS in the grade, and a rigid
+    // body as long as the creature is tall cannot touch on both sides of one —
+    // it bridges, exactly as a plank does. Asserting a contact there would be
+    // asserting that a rigid body is not rigid. Everything outside the window
+    // is still measured and reported (`floatAny`), it is simply not a claim.
+    const bool interior = cz >= (float)rampZ0 + half &&
+                          cz <= (float)(rampZ0 + kRampLen) - half;
+
+    // ---- is it ON the ground? ----
+    // At the CONTACT POINT's own column, against the fixture's own profile.
+    float lowY = 0;
+    Vec3 at{};
+    if (m->DrawnLowY(lowY, &at)) {
+      const float surf = fixtureSurface(ifloor(at.x), ifloor(at.z));
+      placed++;
+      floatAny = std::max(floatAny, lowY - surf);
+      if (interior) {
+        if (lowY - surf > floatMax) {
+          floatMax = lowY - surf;
+          worstFloatAt = cz - (float)rampZ0;
+        }
+        sinkMax = std::max(sinkMax, surf - lowY);
+      }
+    }
+
+    // ---- is it lying at the RIGHT angle, and does that angle hold still? ----
+    if (!interior) continue;
+    const Vec3 up = c.mobs.MobBodyUp(id);
+    const float tilt =
+        std::acos(std::clamp(up.y, -1.0f, 1.0f)) * 57.29577951f;
+    tiltSum += tilt;
+    tiltMin = std::min(tiltMin, tilt);
+    tiltMax = std::max(tiltMax, tilt);
+
+    // ---- three estimators, same tick, same heading -----------------------
+    // `foot` IS THE ESTIMATOR THIS REPLACED, not a strawman: UpdateGait's
+    // slope lean is two probes over `max(1.5, max(worldSize.x, z) * 0.5)`,
+    // which is the right instrument for a walker standing on two small feet
+    // and is what a crawl would have inherited. `two` is the same two-probe
+    // shape over the PRONE baseline, and it is reported rather than asserted
+    // on because it separates the two halves of the fix: how much of the win
+    // is measuring over the body's length at all, and how much is fitting a
+    // plane instead of differencing two columns.
+    const Mob::GroundPlane gp =
+        m->FitGroundPlane(c.world, cx, cz, o.y, spanFwd, spanSide, 5, 3);
+    const Vec3 face = c.mobs.MobFacing(id);
+    const int yFrom = ifloor(o.y) + 3;
+    auto twoProbe = [&](float reach, float fallback) {
+      int hi = 0, lo = 0;
+      const bool okHi = m->GroundHeightAt(c.world, ifloor(cx + face.x * reach),
+                                          ifloor(cz + face.z * reach), yFrom, hi);
+      const bool okLo = m->GroundHeightAt(c.world, ifloor(cx - face.x * reach),
+                                          ifloor(cz - face.z * reach), yFrom, lo);
+      return (okHi && okLo) ? (float)(hi - lo) / (2.0f * reach) : fallback;
+    };
+    const float footSpan =
+        std::max(1.5f, std::max(def.worldSize.x, def.worldSize.z) * 0.5f);
+    const float two = twoProbe(half, prevTwo);
+    const float foot = twoProbe(footSpan, prevFoot);
+    prevTwo = two;
+    prevFoot = foot;
+    if (!gp.valid) continue;
+    fitSum += gp.gradeFwd;
+    fitSq += (double)gp.gradeFwd * gp.gradeFwd;
+    twoSum += two;
+    twoSq += (double)two * two;
+    footSum += foot;
+    footSq += (double)foot * foot;
+    roughSum += gp.roughness;
+    graded++;
+  }
+  const float crawled = c.mobs.MobOrigin(id).z - startZ;
+  auto sd = [](double sum, double sq, int n) {
+    if (n < 2) return 0.0f;
+    const double mean = sum / n;
+    return (float)std::sqrt(std::max(0.0, sq / n - mean * mean));
+  };
+  const float sdFit = sd(fitSum, fitSq, graded);
+  const float sdTwo = sd(twoSum, twoSq, graded);
+  const float sdFoot = sd(footSum, footSq, graded);
+  const float rough = graded > 0 ? (float)(roughSum / graded) : 0.0f;
+  const float tiltAvg = graded > 0 ? (float)(tiltSum / graded) : 0.0f;
+  const float tiltRange = graded > 0 ? tiltMax - tiltMin : 0.0f;
+  const float wantTilt = std::atan(meanGrade) * 57.29577951f;
+
+  const float floatAllowed = (float)BaselineNumber("crawlSlopeFloatVox", 2.5);
+  const float sinkAllowed = (float)BaselineNumber("crawlSlopeSinkVox", 2.5);
+  const float tiltErr = (float)BaselineNumber("crawlSlopeTiltErrDeg", 8.0);
+  const float tiltSpan = (float)BaselineNumber("crawlSlopeTiltRangeDeg", 12.0);
+  const float sdRatio = (float)BaselineNumber("crawlSlopeSdRatio", 0.7);
+  const float minCrawl = (float)BaselineNumber("crawlSlopeMinCrawlVox", 10.0);
+  const int minSamples = (int)BaselineNumber("crawlSlopeMinSamples", 25.0);
+
+  const bool moved = crawled >= minCrawl && graded >= minSamples && placed > 0;
+  const bool grounded = floatMax <= floatAllowed && sinkMax <= sinkAllowed;
+  const bool lying =
+      std::fabs(tiltAvg - wantTilt) <= tiltErr && tiltRange <= tiltSpan;
+  // `sdFoot` near zero would mean the fixture never presented a mixed grade to
+  // the estimator under comparison, so that is a failure OF THE FIXTURE and is
+  // reported as one rather than passing trivially.
+  const bool steady = sdFoot > 0.03f && sdFit <= sdFoot * sdRatio;
+  const bool ok = moved && grounded && lying && steady && stateNow >= 0;
+
+  detail = Format(
+      "ramp %d/%d cols in mirror, rises 0/1/2 per col, true mean grade %.3f "
+      "(%.1f deg); state %d, targeted %d, crawled %.1f vox (min %.1f) over %d ramp ticks, "
+      "%d graded; float %.2f vox (max %.2f) at dz %.0f, sink %.2f (max %.2f), "
+      "float anywhere incl. crest %.2f; "
+      "tilt avg %.1f vs %.1f deg (err max %.1f), range %.1f (max %.1f); grade "
+      "sd fit %.4f vs footprint-probe %.4f = %.2fx (max %.2f), body-length "
+      "two-probe %.4f; fit residual %.2f vox",
+      rampSeen, kRampLen, meanGrade, wantTilt, stateNow, everTargeted ? 1 : 0,
+      crawled, minCrawl,
+      onRamp, graded, floatMax, floatAllowed, worstFloatAt, sinkMax,
+      sinkAllowed, floatAny, tiltAvg, wantTilt, tiltErr, tiltRange, tiltSpan, sdFit,
+      sdFoot, sdFoot > 0 ? sdFit / sdFoot : 0.0f, sdRatio, sdTwo, rough);
+
+  SetCurrentTuning(savedGore);
+  c.mobs.ClearPlayerActor();
+  c.mobs.ClearAttackRequests();
+  c.debris.Reset();
+  c.mobs.Reset();
+  SubmitWorldgen(c.ctx, c.world, c.sim, kDefaultSeed);
+  c.ctx.WaitIdle();
+  return ok ? Status::Pass : Status::Fail;
+}
+
 // ---- LIVE RAGDOLL (DESIGN.md "A creature knocked down gets back up") --------
 //
 // Six claims, each a number this gate prints, so `--gate ragdoll` alone is
@@ -6442,6 +6829,8 @@ const std::vector<Gate>& MobGates() {
       // asserting the body stays ON it (never inside it) and does not lean
       // like furniture while climbing.
       {"ai-slope", "mob", {}, false, GateAiSlope, /*needsRender=*/false},
+      // A body with no legs lies ON the slope and stops re-aiming every voxel.
+      {"crawl-slope", "mob", {}, false, GateCrawlSlope, /*needsRender=*/false},
       // Live ragdoll: blast knockdown, get-up, NPC gravity. Counts only.
       {"ragdoll", "mob", {}, false, GateRagdoll, /*needsRender=*/false},
       // ...and what a limp landing COSTS. Its own gate rather than another

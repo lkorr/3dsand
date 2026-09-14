@@ -461,7 +461,8 @@ different divisors — using one for both collapses an upsampled rig toward its
 own origin while the art still looks correct.
 
 World-space sidecar rows (`speed`, `severImpactSpeed`, `gait.rideHeight`,
-`states[].bodyYOffset`, clip position keys) are neither art units nor metres:
+`states[].bodyYOffset` — now only meaningful on states that are *not*
+`groundAlign`ed, §8 — clip position keys) are neither art units nor metres:
 they are world voxels, declared by `sidecarVoxelsPerMetre` (default 10) and
 rescaled at load. `bleed.perDamage` is deliberately NOT rescaled — it is a
 volume budget, which goes as the cube, and it is gore rate rather than size.
@@ -6197,6 +6198,48 @@ IK chain, and this rig has arm chains as well as leg chains. `minChainsLost: 2`
 would therefore have fired "crawl" when both *arms* came off. The wizard's
 rules name leg parts directly; the two formulations are only equivalent on an
 all-legs rig like the critter.
+
+**A prone state is placed by the ground, not by an authored number.** A state
+may set `groundAlign` (0..1); above 0 it is treated as *lying down*, and
+`Mob::SettleClipOwnedBody` — one function, shared by the NPC loop and the
+avatar — owns both halves of what that means.
+
+*The fit.* A least-squares plane through a 5×3 grid of ground probes spanning
+the creature's own **standing height**, which is how much ground a body covers
+when it lies on it. The walker's slope lean is two probes over its footprint,
+and that is the right instrument for a torso held near vertical over two small
+feet; it is the wrong one for a body lying on the terrain, because two samples
+have no redundancy. Real ground is a *mix* of grades, so a two-point estimate
+crawling over ground that alternates between, say, 1:2 and 1:1 reports first one
+and then the other and re-aims the whole creature every voxel it covers. The
+temporal ease on `bodyUp_` sits on top of the fit and cannot substitute for it:
+smoothing in time can only lag a spatially wrong estimate, never remove it.
+
+*The grounding.* The body is then lowered until the lowest point of its **posed
+core** touches that plane — core meaning parts no IK chain owns, because a
+crawl's arms swing through a large arc and grounding on whichever hand is lowest
+would lift and drop the whole body once per stroke, letting the pose drive the
+terrain instead of the terrain driving the pose. The clearance is measured
+**along the plane normal**, not in world Y: a prone body is as long as the
+creature is tall, and laid along a grade its lowest *vertical* point is its
+downhill end, so placing that end at the ground height under the body's middle
+hangs the creature half a body length in the air. A single probe under the
+contact point then floors the result, because real ground is not the plane
+fitted to it and the residual is largest exactly where a prone body touches.
+
+This replaces a per-state, per-rig `bodyYOffset`, which was that rig's hip
+height written down by a person and was a third of the way there on the human
+and half on the wizard: a crawl clip pitches the **root**, a root rotation
+happens about the hip joint, so the torso swings out horizontally at hip height
+and stays there. `bodyYOffset` survives as a small sink/lift for states that
+are not prone (a hop), where it still means an offset from the walk drive's
+ground column. `--gate crawl-slope` crawls a legless humanoid up a ramp mixing
+1:2 and 1:1 grades and asserts all of it: the body holds 35.7° against the
+fixture's true mean of 36.9° with 5.5° of wander, floats 1.52 voxels and sinks
+0.71 over the ramp's interior, and the fitted grade's standard deviation is
+0.29× the footprint-span two-probe it replaced. (Its interior window is not
+slack — a *rigid* body bridging the ramp's crest must have a gap, so contact is
+only claimed where contact is possible; the crest clearance is reported.)
 
 **Camera.** `Camera` stays orientation-only and is shared by both modes, so
 mouse look, the picking ray and the walk basis are identical in first and third

@@ -486,14 +486,18 @@ AvatarLocomotion PlayerAvatar::Locomotion() const {
     out.stateIndex = anim_.locoState;
     out.stateName = rule.name.c_str();
     out.speedScale = rule.speedScale;
-    // The pose and the camera must agree about how low the body is, and the
-    // authored bodyYOffset is already that number (in world voxels, negative
-    // = lower). Deriving the eye scale from it means a tuning change to the
-    // crawl pose moves the camera with it instead of needing a second edit.
+    // The pose and the camera must agree about how low the body is, so the
+    // camera reads the DRAWN body rather than the authored number that used to
+    // determine it. `bodyY_ - origin_.y` is exactly the drop the pose pipeline
+    // settled on this tick, which for a prone state is now the fitted ground
+    // and this rig's own hip height rather than a hand-guessed offset (see
+    // AnimStateRule::groundAlign). For an upright clip-owned state the two are
+    // identical — bodyY_ eases to origin_.y + bodyYOffset — so nothing about a
+    // hop changes, and a tuning edit still moves the camera with the pose.
     if (rule.disableGait) {
       const float standing = std::max(def_->worldSize.y, 0.01f);
       out.eyeHeightScale =
-          std::clamp(1.0f + rule.bodyYOffset / standing, 0.15f, 1.0f);
+          std::clamp(1.0f + (bodyY_ - origin_.y) / standing, 0.15f, 1.0f);
     }
   }
   // Jumping is derived from LEG LIVENESS rather than authored per state: it is
@@ -1575,11 +1579,17 @@ void PlayerAvatar::UpdateAnimation(float dt, World& world, bool grounded,
     // An authored clip owns the pose (crawl, etc.): it keys the same pelvis the
     // crouch moves, so unwind the crouch rather than composing the two.
     stanceCrouch_ *= std::pow(0.5f, dt / 0.12f);
-    float targetY = origin_.y + (loco ? loco->bodyYOffset : 0.0f);
+    // THE SAME PLACEMENT THE NPC LOOP USES (Mob::SettleClipOwnedBody): a prone
+    // state is laid on a plane fitted through the ground under the body's own
+    // length and dropped until its posed core rests on it, an upright one keeps
+    // the historical offset-from-the-ground-column. Shared so "what a crawl is"
+    // is answered once — and it owns the TILT ease for the reason its note
+    // gives. What stays per-driver is the HEIGHT ease below, deliberately
+    // faster here than the mob's.
+    float targetY = origin_.y;
+    SettleClipOwnedBody(world, loco, targetY);
     bodyY_ += std::clamp(targetY - bodyY_, -0.4f, 0.4f);
     footInit_ = true;
-    bodyUp_ = (bodyUp_ * 0.85f + Vec3{0, 1, 0} * 0.15f).normalized();
-    if (bodyUp_.len() < 0.5f) bodyUp_ = {0, 1, 0};
   }
 
   // IK is a POST-PROCESS on the flattened pose, never a blended layer:

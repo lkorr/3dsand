@@ -186,14 +186,18 @@ def main():
         "states": [
             {"name": "prone",
              "missing": ["arm.L", "arm.R", "leg.L", "leg.R"],
-             "clip": "prone", "speedScale": 0.0, "disableGait": True},
+             "clip": "prone", "speedScale": 0.0,
+             "disableGait": True, "groundAlign": 1.0},
             {"name": "crawl.oneArm", "missing": ["leg.L", "leg.R"],
              "missingAny": ["arm.L", "arm.R"],
-             "clip": "crawl.low", "speedScale": 0.12, "disableGait": True},
+             "clip": "crawl.low", "speedScale": 0.12,
+             "disableGait": True, "groundAlign": 1.0},
             {"name": "crawl.legless", "missing": ["leg.L", "leg.R"],
-             "clip": "crawl.low", "speedScale": 0.25, "disableGait": True},
+             "clip": "crawl.low", "speedScale": 0.25,
+             "disableGait": True, "groundAlign": 1.0},
             {"name": "crawl.oneLeg", "missingAny": ["leg.L", "leg.R"],
-             "clip": "crawl", "speedScale": 0.4, "disableGait": True},
+             "clip": "crawl", "speedScale": 0.4,
+             "disableGait": True, "groundAlign": 1.0},
         ],
         "clips": {
             # One leg lost: half-raised drag — torso leaned 35 deg from

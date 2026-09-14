@@ -96,7 +96,9 @@
       ],
       "clip": "prone",
       "speedScale": 0,
-      "disableGait": true
+      "disableGait": true,
+      "bodyYOffset": 0.0,
+      "groundAlign": 1.0
     },
     {
       "name": "crawl.oneArm",
@@ -110,7 +112,9 @@
       ],
       "clip": "crawl.low",
       "speedScale": 0.12,
-      "disableGait": true
+      "disableGait": true,
+      "bodyYOffset": 0.0,
+      "groundAlign": 1.0
     },
     {
       "name": "crawl.legless",
@@ -120,7 +124,9 @@
       ],
       "clip": "crawl.low",
       "speedScale": 0.25,
-      "disableGait": true
+      "disableGait": true,
+      "bodyYOffset": 0.0,
+      "groundAlign": 1.0
     },
     {
       "name": "crawl.oneLeg",
@@ -130,7 +136,9 @@
       ],
       "clip": "crawl",
       "speedScale": 0.4,
-      "disableGait": true
+      "disableGait": true,
+      "bodyYOffset": 0.0,
+      "groundAlign": 1.0
     }
   ],
   "clips": {

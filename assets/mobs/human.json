@@ -537,7 +537,8 @@
       "clip": "squirm",
       "speedScale": 0.12,
       "disableGait": true,
-      "bodyYOffset": -0.35
+      "bodyYOffset": 0.0,
+      "groundAlign": 1.0
     },
     {
       "name": "crawl",
@@ -548,7 +549,8 @@
       "clip": "crawl",
       "speedScale": 0.3,
       "disableGait": true,
-      "bodyYOffset": -0.32
+      "bodyYOffset": 0.0,
+      "groundAlign": 1.0
     },
     {
       "name": "crawl.shins",
@@ -559,7 +561,8 @@
       "clip": "crawl",
       "speedScale": 0.3,
       "disableGait": true,
-      "bodyYOffset": -0.32
+      "bodyYOffset": 0.0,
+      "groundAlign": 1.0
     },
     {
       "name": "hop",

@@ -1433,6 +1433,116 @@ class Mob {
   Footing FootprintFooting(World& world, const MobDef& def, float cx, float cz,
                            float fromY) const;
 
+  // ---- THE GROUND UNDER A BODY THAT IS LYING ON IT ------------------------
+  //
+  // A LEAST-SQUARES PLANE, NOT A DIFFERENCE OF TWO PROBES. `UpdateGait`'s slope
+  // lean takes one forward probe and one back probe and divides; that is the
+  // right instrument for a WALKER, whose torso only leans a few degrees into a
+  // grade and whose contact with the ground is two small feet. It is the wrong
+  // one for a body LYING on the terrain, for a reason that is about noise
+  // rather than about accuracy: two samples have no redundancy, so every voxel
+  // either endpoint steps onto moves the answer by a full voxel over the
+  // baseline. Real ground is not a plane — it is a mix of grades — and a
+  // two-point estimate crawling over ground that alternates between, say, 1:1
+  // and 2:1 reports first one and then the other and re-orients the WHOLE
+  // CREATURE each time. The eye reads that as the character glitching, not as
+  // the terrain being rough.
+  //
+  // Fitting a plane through a grid of samples answers it properly: the fit IS
+  // the average grade over the body's own length, it degrades one sample at a
+  // time instead of one endpoint at a time, and its residual is a free measure
+  // of how rough the ground is under there. The temporal ease on `bodyUp_`
+  // stays on top of it — smoothing in time cannot fix a spatially wrong
+  // estimate, it can only lag it.
+  //
+  // `spanFwd`/`spanSide` are the FULL extents of the sample grid in voxels,
+  // measured in the body's own frame about (cx, cz). For a prone body the
+  // right forward span is the creature's STANDING HEIGHT: that is how much
+  // ground it covers when it lies down, and it is what the user sees the
+  // character's angle being "roughly the slope over".
+  struct GroundPlane {
+    bool valid = false;     // false = fewer than 3 columns could be answered
+    float height = 0;       // fitted ground Y at (cx, cz), world voxels
+    Vec3 up{0, 1, 0};       // unit normal of the fit
+    float gradeFwd = 0;     // rise per voxel of run, along the body's facing
+    float gradeSide = 0;    // ... and along its right
+    float roughness = 0;    // RMS residual in voxels: how un-plane-like it is
+    int samples = 0;
+  };
+  GroundPlane FitGroundPlane(World& world, float cx, float cz, float fromY,
+                             float spanFwd, float spanSide, int nFwd,
+                             int nSide) const;
+
+  // The lowest point of the POSED body, in the frame `bodyY_` is measured in:
+  // add `bodyY_` and you have the world Y of the lowest voxel the creature is
+  // currently drawing. Built from exactly the transforms SubmitPose will use
+  // (`LimbTargetFor`, same `bodyRot`), so "put the body on the ground" is one
+  // subtraction rather than a per-rig guess at where its hips are.
+  //
+  // THE CORE, NOT EVERY LIMB. Parts belonging to an IK chain (arms and legs)
+  // are skipped: a crawl's arms swing through a large arc, and grounding on
+  // whichever hand is lowest would lift and drop the entire body once per
+  // stroke — the pose would drive the terrain instead of the terrain driving
+  // the pose. The core (pelvis, torso, head) moves smoothly under any sane
+  // clip, which is exactly what a contact height has to do. A rig with no
+  // chains at all (dummy.json) falls back to every alive limb, since there
+  // every limb IS core.
+  //
+  // `planeDir` is the direction "up off the ground" is measured along, and it
+  // is what makes this work on a slope. Pass {0,1,0} and you get the lowest
+  // point in plain world Y, which is what "how high is it drawn" means on the
+  // flat. Pass the ground plane's own (unnormalized) normal
+  // `{0,1,0} - fwd*gradeFwd - rgt*gradeSide` and you get the CONTACT
+  // clearance: how far the body's nearest point is off the tilted surface.
+  //
+  // The two are not the same and the difference is not small. A prone body is
+  // as long as the creature is tall; laid along a 1:1 grade, its lowest
+  // VERTICAL point is its downhill end, and placing that end at the ground
+  // height under the body's MIDDLE hangs the whole creature half a body length
+  // in the air — which is the same "floats above the voxels" bug in a new
+  // costume. Measured along the plane normal, every point of a body lying flat
+  // on the slope reports the same clearance, which is what "lying on it" means.
+  //
+  // `outPoint`, when given, is WHERE that nearest point is — offsets from the
+  // body's own centre column in world axes, y relative to bodyY_. A clearance
+  // is only meaningful against the ground under the point it was measured at,
+  // and a prone body is long enough that the ground under its nose and under
+  // its hips are metres apart.
+  //
+  // Returns false when nothing is poseable yet (no limbs, no flattened pose).
+  bool PosedCoreLowY(Quat bodyRot, Vec3 planeDir, float& outLowY,
+                     Vec3* outPoint = nullptr) const;
+
+  // WORLD Y OF THE LOWEST POINT THIS CREATURE IS DRAWING, through its own
+  // current tilt and heading. `MobOrigin` is the collider and `MobBodyY` is the
+  // frame the pose is built in; neither of them is where the creature LOOKS
+  // like it is touching, which is the only number a "does it float" assertion
+  // can be made against. `outPoint`, when given, is that point in WORLD voxels
+  // — the column a "does it float" check has to look up the surface in.
+  // Returns false when there is no pose yet.
+  bool DrawnLowY(float& outY, Vec3* outPoint = nullptr) const;
+
+  // WHERE A BODY WHOSE POSE AN AUTHORED CLIP OWNS GOES THIS TICK. The whole of
+  // "lying on the ground" in one call, so the NPC loop and the avatar cannot
+  // drift apart about what a crawl is. Handles the upright clip-owned states
+  // (a hop) too — they are the `false` return, and the outputs are then the
+  // historical behaviour, so a caller needs no branch of its own.
+  //
+  // IT WRITES `bodyUp_` AND ONLY RETURNS THE HEIGHT, and the asymmetry is load
+  // bearing rather than sloppy. The tilt has to be eased BEFORE the clearance
+  // is measured, because the clearance is a statement about the rotation the
+  // body will actually be DRAWN at — measure it against the target tilt, draw
+  // it at the eased one, and the difference goes straight into the hillside
+  // (a few degrees across a body as long as the creature is tall is most of a
+  // voxel at each end). The height, by contrast, is genuinely eased at
+  // different rates by the two drivers (MobSystem::EaseBodyY vs the avatar's
+  // own clamp), so unifying that would change behaviour nobody asked about.
+  //
+  // `rule` may be null (a legacy rig with no states at all): the body settles
+  // to the walk drive's ground and the tilt eases flat.
+  bool SettleClipOwnedBody(World& world, const AnimStateRule* rule,
+                           float& outTargetY);
+
   // Does this cell carry a body's weight? THE definition of "solid" for
   // locomotion, shared by the ground probe, the footprint collider and the
   // navigator's `blocked` adapter, so "walkable" means one thing in this

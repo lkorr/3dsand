@@ -963,6 +963,12 @@ export function buildSkeleton(sidecar, models) {
       speedScale: s.speedScale ?? 1.0,
       disableGait: !!s.disableGait,
       bodyYOffset: +s.bodyYOffset || 0,
+      // >0 = PRONE: the engine fits a plane through the ground under the
+      // body's own length, tilts to it and lowers the posed body onto it, so
+      // bodyYOffset is a sink into that surface rather than a drop from the
+      // ground column (anim.h, AnimStateRule::groundAlign). The preview here
+      // has no terrain, so it carries the value without acting on it.
+      groundAlign: Math.min(1, Math.max(0, +s.groundAlign || 0)),
     });
   }
 

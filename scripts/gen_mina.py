@@ -1268,23 +1268,27 @@ def main():
     # Naming the leg parts directly keeps each rule about the thing it is
     # actually describing.
     #
-    # bodyYOffset is in WORLD VOXELS, and this figure is 17 of them rather than
-    # the wizard's 28 — the drops below are scaled down to match, or a crawling
-    # Mina would sink through the floor.
+    # The prone states carry `groundAlign` and NO bodyYOffset. They used to
+    # carry a drop in world voxels scaled to this figure's 17-voxel height
+    # against the wizard's 28 — which is to say the number was that rig's hip
+    # height written out by hand, and a re-proportioned figure invalidated it
+    # silently. The engine now fits a plane through the ground under the body's
+    # own length and lowers the POSED body onto it (anim.h,
+    # AnimStateRule::groundAlign), so nothing here scales between figures.
     states = [
         {"name": "squirm",
          "missing": ["legU.L", "legU.R"],
          "missingAny": ["armU.L", "armU.R"],
          "clip": "squirm", "speedScale": 0.12,
-         "disableGait": True, "bodyYOffset": -0.35},
+         "disableGait": True, "groundAlign": 1.0},
         {"name": "crawl",
          "missing": ["legU.L", "legU.R"],
          "clip": "crawl", "speedScale": 0.3,
-         "disableGait": True, "bodyYOffset": -0.32},
+         "disableGait": True, "groundAlign": 1.0},
         {"name": "crawl.shins",
          "missing": ["legL.L", "legL.R"],
          "clip": "crawl", "speedScale": 0.3,
-         "disableGait": True, "bodyYOffset": -0.32},
+         "disableGait": True, "groundAlign": 1.0},
         {"name": "hop",
          "missing": ["foot.L", "foot.R"],
          "clip": "hop", "speedScale": 0.45,

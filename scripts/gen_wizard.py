@@ -1084,18 +1084,18 @@ def main():
          "missing": ["legU.L", "legU.R"],
          "missingAny": ["armU.L", "armU.R"],
          "clip": "squirm", "speedScale": 0.12,
-         "disableGait": True, "bodyYOffset": -0.55},
+         "disableGait": True, "groundAlign": 1.0},
         # both legs unusable: any part of the left chain AND any of the right.
         # Expressed as "both thighs gone" plus the shin/foot cases handled by
         # the hop rule below, so the common amputations all land somewhere.
         {"name": "crawl",
          "missing": ["legU.L", "legU.R"],
          "clip": "crawl", "speedScale": 0.3,
-         "disableGait": True, "bodyYOffset": -0.5},
+         "disableGait": True, "groundAlign": 1.0},
         {"name": "crawl.shins",
          "missing": ["legL.L", "legL.R"],
          "clip": "crawl", "speedScale": 0.3,
-         "disableGait": True, "bodyYOffset": -0.5},
+         "disableGait": True, "groundAlign": 1.0},
         {"name": "hop",
          "missing": ["foot.L", "foot.R"],
          "clip": "hop", "speedScale": 0.45,

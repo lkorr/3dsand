@@ -1138,6 +1138,15 @@ bool LoadMobDefs(const std::string& dir, const std::vector<MaterialDef>& mats,
         rule.speedScale = s.value("speedScale", 1.0f);
         rule.disableGait = s.value("disableGait", false);
         rule.bodyYOffset = s.value("bodyYOffset", 0.0f) * worldLen;
+        rule.groundAlign =
+            std::clamp(s.value("groundAlign", 0.0f), 0.0f, 1.0f);
+        // A prone state that still lets the gait run would have the foot plane
+        // and the ground plane both claiming the body height. Say so rather
+        // than letting whichever ran last win.
+        if (rule.groundAlign > 0.0f && !rule.disableGait)
+          log += jp + ": state \"" + rule.name +
+                 "\" sets groundAlign without disableGait; the gait's foot "
+                 "plane will fight the ground fit\n";
         if (rule.missingAll.empty() && rule.missingAnyOf.empty() &&
             rule.minChainsLost <= 0)
           log += jp + ": state \"" + rule.name +
@@ -2133,6 +2142,316 @@ Mob::Footing Mob::FootprintFooting(World& world, const MobDef& def, float cx,
     }
   }
   return out;
+}
+
+Mob::GroundPlane Mob::FitGroundPlane(World& world, float cx, float cz,
+                                     float fromY, float spanFwd, float spanSide,
+                                     int nFwd, int nSide) const {
+  GroundPlane out;
+  nFwd = std::clamp(nFwd, 2, 9);
+  nSide = std::clamp(nSide, 1, 5);
+  const Vec3 fwd{std::sin(heading_), 0, std::cos(heading_)};
+  const Vec3 rgt{std::cos(heading_), 0, -std::sin(heading_)};
+  // From ABOVE the body, like every other probe here: a scan begun at the
+  // body's own height cannot see the lip of the step in front of it, and a
+  // prone body's nose is a whole body length from its hips.
+  const int yFrom = ifloor(fromY) + kMobProbeLiftCells;
+
+  // The samples are accumulated in the body's own (u = forward, v = right)
+  // frame. Sums are CENTERED on the sample means afterwards rather than on the
+  // grid's nominal centre, because columns drop out (outside the window, chunk
+  // not cached) and a grid with holes is no longer symmetric — assuming it is
+  // tilts the fit toward whichever side answered.
+  double su = 0, sv = 0, sy = 0;
+  double suu = 0, svv = 0, suv = 0, suy = 0, svy = 0;
+  int n = 0;
+  // Up to 45 columns; each is a short scan sharing one chunk pointer
+  // (GroundHeightAt), and only a body in a prone loco state ever asks.
+  float us[9 * 5], vs[9 * 5], ys[9 * 5];
+  for (int i = 0; i < nFwd; i++) {
+    const float u = nFwd == 1 ? 0.0f
+                              : (((float)i / (float)(nFwd - 1)) - 0.5f) * spanFwd;
+    for (int k = 0; k < nSide; k++) {
+      const float v =
+          nSide == 1 ? 0.0f
+                     : (((float)k / (float)(nSide - 1)) - 0.5f) * spanSide;
+      const float px = cx + fwd.x * u + rgt.x * v;
+      const float pz = cz + fwd.z * u + rgt.z * v;
+      int gy = 0;
+      if (!GroundHeightAt(world, ifloor(px), ifloor(pz), yFrom, gy)) continue;
+      // GroundHeightAt answers with the SURFACE — the open cell above the
+      // solid — which is where a body's min corner rests.
+      const float y = (float)gy;
+      us[n] = u; vs[n] = v; ys[n] = y;
+      su += u; sv += v; sy += y;
+      suu += (double)u * u; svv += (double)v * v; suv += (double)u * v;
+      suy += (double)u * y; svy += (double)v * y;
+      n++;
+    }
+  }
+  out.samples = n;
+  // Three columns is the minimum that determines a plane, and fewer than that
+  // is not a degraded answer but no answer — the caller keeps whatever it had.
+  if (n < 3) return out;
+  const double dn = (double)n;
+  const double mu = su / dn, mv = sv / dn, my = sy / dn;
+  const double cuu = suu - dn * mu * mu;
+  const double cvv = svv - dn * mv * mv;
+  const double cuv = suv - dn * mu * mv;
+  const double cuy = suy - dn * mu * my;
+  const double cvy = svy - dn * mv * my;
+  const double det = cuu * cvv - cuv * cuv;
+  double b = 0, c = 0;
+  if (std::fabs(det) > 1e-6) {
+    b = (cuy * cvv - cvy * cuv) / det;
+    c = (cvy * cuu - cuy * cuv) / det;
+  } else if (cuu > 1e-6) {
+    // A single file of columns (nSide == 1, or every lateral sample lost):
+    // the forward grade is still determined, the lateral one is not. Zero is
+    // the honest answer for the axis nothing was measured along.
+    b = cuy / cuu;
+  }
+  out.gradeFwd = (float)b;
+  out.gradeSide = (float)c;
+  out.height = (float)(my - b * mu - c * mv);
+  // Residual RMS: how badly a plane describes what is actually under there.
+  // Reported rather than acted on — a caller that wants to lie flatter on
+  // rubble than on a slab has the number to do it with, and a gate has
+  // something to assert about the fixture it built.
+  double ss = 0;
+  for (int i = 0; i < n; i++) {
+    const double r = (double)ys[i] - (my + b * ((double)us[i] - mu) +
+                                      c * ((double)vs[i] - mv));
+    ss += r * r;
+  }
+  out.roughness = (float)std::sqrt(ss / dn);
+  // n = Y - gradeFwd*fwd - gradeSide*rgt, for an orthonormal right-handed
+  // (fwd, rgt, Y) — the same identity UpdateGait's lean uses, derived rather
+  // than trigonometric so no angle is ever formed.
+  Vec3 up = (Vec3{0, 1, 0} - fwd * out.gradeFwd - rgt * out.gradeSide);
+  const float l = up.len();
+  out.up = l > 1e-4f ? up * (1.0f / l) : Vec3{0, 1, 0};
+  out.valid = true;
+  return out;
+}
+
+bool Mob::PosedCoreLowY(Quat bodyRot, Vec3 planeDir, float& outLowY,
+                        Vec3* outPoint) const {
+  if (def_ == nullptr || limbs_.empty() || anim_.model.empty()) return false;
+  const size_t n = std::min(limbs_.size(), anim_.model.size());
+  const Vec3 yawPivot{def_->worldSize.x * 0.5f, 0, def_->worldSize.z * 0.5f};
+  // Chain membership, once: parts an IK chain owns are the swinging
+  // appendages this height must not follow (see the note in mob.h).
+  std::vector<uint8_t> inChain(n, 0);
+  bool anyChain = false;
+  for (const IkChain& ch : skel_.chains)
+    for (int p : ch.parts)
+      if (p >= 0 && (size_t)p < n) { inChain[p] = 1; anyChain = true; }
+
+  float low = 0;
+  Vec3 lowAt{};
+  bool have = false;
+  for (size_t i = 0; i < n; i++) {
+    const MobLimb& limb = limbs_[i];
+    if (!limb.body) continue;                  // severed or never spawned
+    if (limb.holdSeconds > 0) continue;        // a piece coming off, not us
+    if (limb.wornHost >= 0) continue;          // a garment follows its host
+    if ((int)i == heldSlot_) continue;         // a dangling sword is not ground
+    if (i < anim_.partAlive.size() && !anim_.partAlive[i]) continue;
+    if (anyChain && inChain[i]) continue;
+    if (limb.size.x <= 0 || limb.size.y <= 0 || limb.size.z <= 0) continue;
+    // Exactly SubmitPose's arithmetic, with bodyOrigin.y taken as zero so the
+    // result is relative to bodyY_. Measured from the YAW PIVOT, which is the
+    // body's own centre column — the column `planeDir`'s gradient is stated
+    // about, so a point's horizontal offset already carries its sign.
+    const Quat rot = QuatNormalize(Mul(bodyRot, anim_.model[i].rot));
+    const Vec3 anchorRel =
+        yawPivot + Rotate(bodyRot, anim_.model[i].pos - yawPivot);
+    const Vec3 corner = anchorRel - Rotate(rot, limb.anchorLimb) - yawPivot;
+    // The nearest corner of the rotated box along `planeDir`, without
+    // enumerating eight of them: the box spans [0, size] along its own axes,
+    // so the minimum of a linear functional over it is the corner's value plus
+    // each axis' NEGATIVE contribution. (With planeDir = {0,1,0} this is the
+    // plain lowest-Y corner; with the plane normal it is the contact
+    // clearance — see mob.h.)
+    const float ax = Rotate(rot, Vec3{1, 0, 0}).dot(planeDir);
+    const float ay = Rotate(rot, Vec3{0, 1, 0}).dot(planeDir);
+    const float az = Rotate(rot, Vec3{0, 0, 1}).dot(planeDir);
+    const float d = corner.dot(planeDir) +
+                    std::min(0.0f, ax) * (float)limb.size.x +
+                    std::min(0.0f, ay) * (float)limb.size.y +
+                    std::min(0.0f, az) * (float)limb.size.z;
+    if (!have || d < low) {
+      low = d;
+      have = true;
+      // The same three min() choices, as a POINT: whichever corner of the box
+      // the functional picked. Built only when asked for — the placement path
+      // wants the number, only a diagnostic wants the location.
+      if (outPoint != nullptr)
+        lowAt = corner + Rotate(rot, Vec3{ax < 0.0f ? (float)limb.size.x : 0.0f,
+                                          ay < 0.0f ? (float)limb.size.y : 0.0f,
+                                          az < 0.0f ? (float)limb.size.z
+                                                    : 0.0f});
+    }
+  }
+  if (!have) return false;
+  outLowY = low;
+  if (outPoint != nullptr) *outPoint = lowAt;
+  return true;
+}
+
+bool Mob::DrawnLowY(float& outY, Vec3* outPoint) const {
+  // Exactly SubmitPose's body rotation: tilt to the body normal, then yaw.
+  const Quat bodyRot = Mul(QuatFromTo(Vec3{0, 1, 0}, bodyUp_),
+                           AxisAngle(Vec3{0, 1, 0}, heading_));
+  float low = 0;
+  Vec3 at{};
+  if (!PosedCoreLowY(bodyRot, Vec3{0, 1, 0}, low, &at)) return false;
+  outY = bodyY_ + low;
+  if (outPoint != nullptr) {
+    // `at` is relative to the body's centre COLUMN (the yaw pivot) and to
+    // bodyY_; SubmitPose adds exactly these back.
+    const Vec3 pivot{def_->worldSize.x * 0.5f, 0, def_->worldSize.z * 0.5f};
+    *outPoint = Vec3{origin_.x + pivot.x + at.x, bodyY_ + at.y,
+                     origin_.z + pivot.z + at.z};
+  }
+  return true;
+}
+
+// How far off vertical a PRONE body may be laid. Not a feel knob and not
+// per-rig: `groundAlign` is the feel knob (how much of the grade the body
+// takes), and this is the geometric backstop that keeps a fit through three
+// columns of rubble from standing a crawling creature on its head. A body
+// lying on ground steeper than this is past the angle the walk drive will
+// carry it onto in the first place.
+static constexpr float kProneTiltMaxDeg = 55.0f;
+
+// How much of the body the tilt may catch up in one tick, and how far a
+// contact point may end up UNDER the real ground. Both are shared by every
+// driver on purpose: they are what "a crawl" is, and the two callers already
+// differ in the one place they are entitled to (the body-height ease rate).
+static constexpr float kProneUpEase = 0.15f;
+static constexpr float kProneSinkVox = 0.75f;
+
+bool Mob::SettleClipOwnedBody(World& world, const AnimStateRule* rule,
+                              float& outTargetY) {
+  // The historical answer first, so every early-out below is a fallback rather
+  // than a hole: offset from the walk drive's single ground column, upright.
+  // This is also the whole of what an UPRIGHT clip-owned state (a hop) wants.
+  auto easeUp = [&](Vec3 target) {
+    bodyUp_ = (bodyUp_ * (1.0f - kProneUpEase) + target * kProneUpEase)
+                  .normalized();
+    if (bodyUp_.len() < 0.5f) bodyUp_ = Vec3{0, 1, 0};
+  };
+  const float offset = rule != nullptr ? rule->bodyYOffset : 0.0f;
+  outTargetY = origin_.y + offset;
+  if (def_ == nullptr || rule == nullptr || rule->groundAlign <= 0.0f) {
+    easeUp(Vec3{0, 1, 0});
+    return false;
+  }
+  const float w = std::clamp(rule->groundAlign, 0.0f, 1.0f);
+
+  const float cx = origin_.x + def_->worldSize.x * 0.5f;
+  const float cz = origin_.z + def_->worldSize.z * 0.5f;
+  // THE BASELINE IS THE CREATURE'S OWN LENGTH. A body that lies down covers
+  // its standing height of ground, so that is the run the grade under it is
+  // measured over — shorter and it re-aims to bumps it is merely passing,
+  // longer and it aims at terrain no part of it is touching.
+  const float spanFwd = std::max(2.0f, def_->worldSize.y);
+  const float spanSide =
+      std::max(1.0f, std::max(def_->worldSize.x, def_->worldSize.z));
+  // 5 x 3. The forward axis is the one that matters (a prone body is long and
+  // narrow) and three lateral files are the fewest that can tell a side grade
+  // from a single stray column.
+  const GroundPlane gp =
+      FitGroundPlane(world, cx, cz, origin_.y, spanFwd, spanSide, 5, 3);
+  if (!gp.valid) {
+    easeUp(Vec3{0, 1, 0});
+    return false;
+  }
+
+  const Vec3 fwd{std::sin(heading_), 0, std::cos(heading_)};
+  const Vec3 rgt{std::cos(heading_), 0, -std::sin(heading_)};
+  // The lean as a gradient, scaled by how much of the grade this state takes,
+  // then bounded by its LENGTH — one ceiling on the total angle off vertical,
+  // not one per axis, for the reason UpdateGait spells out: clamping pitch and
+  // roll separately lets a corner combine both into sqrt(2) times the number
+  // anyone authored.
+  Vec3 lean = (fwd * -gp.gradeFwd + rgt * -gp.gradeSide) * w;
+  const float leanMax = std::tan(kProneTiltMaxDeg * 0.0174532925f);
+  const float leanLen = lean.len();
+  if (leanLen > leanMax) lean = lean * (leanMax / std::max(leanLen, 1e-6f));
+  Vec3 up = (Vec3{0, 1, 0} + lean).normalized();
+  if (up.y < 0.4f || up.len() < 0.5f) up = Vec3{0, 1, 0};
+
+  // ---- EASE THE TILT FIRST, THEN MEASURE THROUGH IT ----------------------
+  // The ease is smoothing in time on top of a fit that is already smooth in
+  // space (mob.h, FitGroundPlane), so it lags by a few degrees whenever the
+  // grade changes — and a few degrees across a body as long as the creature is
+  // tall is most of a voxel at each end. Measuring the clearance against the
+  // TARGET tilt and then drawing the body at the EASED one put that difference
+  // straight into the ground. `bodyRot` below is byte-for-byte the rotation
+  // SubmitPose will build, which is the only rotation the clearance means
+  // anything about.
+  easeUp(up);
+  const Quat bodyRot = Mul(QuatFromTo(Vec3{0, 1, 0}, bodyUp_),
+                           AxisAngle(Vec3{0, 1, 0}, heading_));
+
+  // The fitted surface, but never far from the column the COLLIDER is standing
+  // on: the plane is an average over a body length, and on a crest or in a
+  // gully the average and the contact point legitimately differ — by more than
+  // that, something is wrong with the fit and the collider is the truth.
+  const float band = std::max(1.0f, spanFwd * 0.5f);
+  const float planeY =
+      std::clamp(gp.height, origin_.y - band, origin_.y + band);
+
+  // ...and the body is DROPPED onto it until its posed core touches. This is
+  // the half no offset can do for you: a crawl pitches the ROOT, a root
+  // rotation happens about the hip joint, so the torso swings out horizontally
+  // AT HIP HEIGHT and stays there. `clear` is that height, measured off this
+  // rig's own art in this frame's own pose — and measured ALONG THE PLANE
+  // NORMAL, because the contact point of a body lying on a slope is its
+  // downhill end and not the point of it that is lowest in world Y (mob.h).
+  //
+  // The gradient used here is the UNWEIGHTED fit, not `lean`: the clearance
+  // must be stated about the real surface even when the body is only taking
+  // part of the grade, or a partly-aligned body is grounded against a plane
+  // that does not exist. Bounded only so a pathological fit cannot launch the
+  // body — the probe can see 2.4 m down, so over a short rig a grade of 2 is
+  // already past anything real, and past it the clearance grows without limit.
+  const float gF = std::clamp(gp.gradeFwd, -2.0f, 2.0f);
+  const float gS = std::clamp(gp.gradeSide, -2.0f, 2.0f);
+  const Vec3 planeDir = Vec3{0, 1, 0} - fwd * gF - rgt * gS;
+  float clear = 0;
+  Vec3 at{};
+  if (!PosedCoreLowY(bodyRot, planeDir, clear, &at)) {
+    outTargetY = planeY + offset;
+    return true;
+  }
+  outTargetY = planeY - clear + offset;
+
+  // ---- ...AND THE PLANE IS AN AVERAGE, SO IT IS ONLY A TARGET ------------
+  // Real ground is not the plane fitted to it, and the residual is largest at
+  // the ENDS of the fit — which is exactly where a prone body touches. A
+  // staircase that runs a voxel above its own best-fit line under the
+  // creature's nose buries the nose by a voxel, and "the body is inside the
+  // ground" is the one thing about a hill this engine has already decided is
+  // never a pose (ai-slope). So the plane places the body and a single probe
+  // UNDER THE CONTACT POINT floors it.
+  //
+  // A FLOOR, NOT A SNAP, and the bound is what keeps it from undoing the fit:
+  // it binds only on the columns the plane got wrong by more than
+  // kProneSinkVox, so the smooth placement survives everywhere else. Raising
+  // the body is also the safe direction to be wrong in — a creature a
+  // centimetre proud of a bump reads as lying on it; one a hand's breadth
+  // inside reads as broken.
+  const Vec3 pivot{def_->worldSize.x * 0.5f, 0, def_->worldSize.z * 0.5f};
+  int gy = 0;
+  if (GroundHeightAt(world, ifloor(origin_.x + pivot.x + at.x),
+                     ifloor(origin_.z + pivot.z + at.z),
+                     ifloor(origin_.y) + kMobProbeLiftCells, gy))
+    outTargetY = std::max(outTargetY, (float)gy - at.y - kProneSinkVox);
+  return true;
 }
 
 void Mob::PlayClip(const std::string& name) {
@@ -3608,14 +3927,18 @@ void MobSystem::UpdateAnimation(Mob& mob, const MobDef& def, World& world,
     UpdateGait(mob, def, world, dt, tick);
   } else {
     // No foot plane is being maintained (legacy rig, or a loco clip owns the
-    // pose): the animated body height follows the walk drive's ground contact
-    // plus the state's authored offset, and the slope tilt eases back flat.
-    // This is the same settle UpdateGait applies when every foot is lost.
-    float targetY = mob.origin_.y + (loco ? loco->bodyYOffset : 0.0f);
+    // pose). An UPRIGHT clip-owned state (a hop) keeps the historical settle:
+    // the body height follows the walk drive's ground contact plus the state's
+    // authored offset, and the slope tilt eases back flat — the same settle
+    // UpdateGait applies when every foot is lost. A PRONE one (groundAlign > 0)
+    // is laid on a plane fitted through the ground under its own length
+    // instead. Mob::SettleClipOwnedBody is the whole of both, including the
+    // tilt ease — which it owns because the clearance it measures is only
+    // meaningful through the tilt the body is actually drawn at (mob.h).
+    float targetY = mob.origin_.y;
+    mob.SettleClipOwnedBody(world, loco, targetY);
     EaseBodyY(mob, targetY, dt);
     mob.footInit_ = true;
-    mob.bodyUp_ = (mob.bodyUp_ * 0.85f + Vec3{0, 1, 0} * 0.15f).normalized();
-    if (mob.bodyUp_.len() < 0.5f) mob.bodyUp_ = {0, 1, 0};
   }
   if (!sk.chains.empty() && gaitActive) {
     Quat yaw = AxisAngle({0, 1, 0}, mob.heading_);
