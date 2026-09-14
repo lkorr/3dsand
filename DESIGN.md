@@ -6227,6 +6227,26 @@ hangs the creature half a body length in the air. A single probe under the
 contact point then floors the result, because real ground is not the plane
 fitted to it and the residual is largest exactly where a prone body touches.
 
+*The settling* (2026-09-14, the follow-up). A body grounded exactly on that
+contact still reads as hovering, and it bobs. Both are the same two facts about
+what is being measured. First, contact is the lowest **corner** of the lowest
+core collider box, and a box corner touches before the art wrapped around it
+does — so a prone body is laid `kProneEmbedVox` (1.5 voxels) *into* the surface
+and the parts an IK chain owns are allowed to pass through it, which is also
+what a body lying on grass, rubble and its own weight looks like. Second, the
+two inputs are not smooth in time the way the fit is smooth in space: the posed
+clearance moves with the stroke, and the contact probe is a single column
+snapped to whole voxels that is *re-chosen wherever the pose is touching*, so it
+walks to a new column whenever an arm moves and hands the difference between two
+columns to the body height as a step. That step is the chaotic half of a crawl's
+bob, and it reads as the arms shoving the body about, because the arms are what
+moved the contact point. The clearance is therefore low-passed over a stroke
+(0.6 s half-life, so the body is placed on the stroke's *average* rather than
+its extreme — which is most of the remaining float, a minimum over a rocking
+body being an extreme) and the probe's lift over 0.1 s, which is inside what
+`EaseBodyY` can carry the body anyway. `SANDVOX_PRONE_RAW=1` restores the
+unfiltered, unembedded placement as a control arm.
+
 This replaces a per-state, per-rig `bodyYOffset`, which was that rig's hip
 height written down by a person and was a third of the way there on the human
 and half on the wizard: a crawl clip pitches the **root**, a root rotation
@@ -6235,8 +6255,10 @@ and stays there. `bodyYOffset` survives as a small sink/lift for states that
 are not prone (a hop), where it still means an offset from the walk drive's
 ground column. `--gate crawl-slope` crawls a legless humanoid up a ramp mixing
 1:2 and 1:1 grades and asserts all of it: the body holds 35.7° against the
-fixture's true mean of 36.9° with 5.5° of wander, floats 1.52 voxels and sinks
-0.71 over the ramp's interior, and the fitted grade's standard deviation is
+fixture's true mean of 36.9° with 5.5° of wander, floats 0.48 voxels and sinks
+1.21 over the ramp's interior (1.52 / 0.71 before the settling above — the
+contact now straddles the surface instead of sitting over it), and the fitted
+grade's standard deviation is
 0.29× the footprint-span two-probe it replaced. (Its interior window is not
 slack — a *rigid* body bridging the ramp's crest must have a gap, so contact is
 only claimed where contact is possible; the crest clearance is reported.)

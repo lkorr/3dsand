@@ -1587,7 +1587,7 @@ void PlayerAvatar::UpdateAnimation(float dt, World& world, bool grounded,
     // gives. What stays per-driver is the HEIGHT ease below, deliberately
     // faster here than the mob's.
     float targetY = origin_.y;
-    SettleClipOwnedBody(world, loco, targetY);
+    SettleClipOwnedBody(world, loco, dt, targetY);
     bodyY_ += std::clamp(targetY - bodyY_, -0.4f, 0.4f);
     footInit_ = true;
   }

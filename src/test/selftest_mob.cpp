@@ -5658,6 +5658,18 @@ Status GateCrawlSlope(Ctx& c, std::string& detail) {
   float tiltMin = 1e9f, tiltMax = -1e9f;
   double tiltSum = 0, fitSum = 0, fitSq = 0, twoSum = 0, twoSq = 0;
   double footSum = 0, footSq = 0, roughSum = 0;
+  // ---- the HEAVE: how still does the body hold while it crawls? ----------
+  // REPORTED, NOT ASSERTED, and the reason is the fixture. `heave` is the body
+  // height above the fixture's own surface under its centre column, so its
+  // spread carries that surface's per-column quantisation (this ramp rises 0,
+  // 1 or 2 whole voxels per column) as well as any motion of the body — a
+  // threshold on it would be a threshold on the fixture. `pose` is the posed
+  // low point's offset from the body frame, which is the stroke as it enters
+  // the placement and is clean of terrain. Together they say WHERE a heave
+  // came from: a large `pose` is the clip rocking the body, a large `heave`
+  // with a small `pose` is the ground read under it stepping.
+  double heaveSum = 0, heaveSq = 0, poseSum = 0, poseSq = 0;
+  int heaved = 0;
   int onRamp = 0, graded = 0, placed = 0;
   float prevTwo = 0, prevFoot = 0;
   bool everTargeted = false;
@@ -5697,6 +5709,14 @@ Status GateCrawlSlope(Ctx& c, std::string& detail) {
       placed++;
       floatAny = std::max(floatAny, lowY - surf);
       if (interior) {
+        const float heave =
+            m->BodyY() - fixtureSurface(ifloor(cx), ifloor(cz));
+        const float pose = lowY - m->BodyY();
+        heaveSum += heave;
+        heaveSq += (double)heave * heave;
+        poseSum += pose;
+        poseSq += (double)pose * pose;
+        heaved++;
         if (lowY - surf > floatMax) {
           floatMax = lowY - surf;
           worstFloatAt = cz - (float)rampZ0;
@@ -5757,6 +5777,8 @@ Status GateCrawlSlope(Ctx& c, std::string& detail) {
     const double mean = sum / n;
     return (float)std::sqrt(std::max(0.0, sq / n - mean * mean));
   };
+  const float sdHeave = sd(heaveSum, heaveSq, heaved);
+  const float sdPose = sd(poseSum, poseSq, heaved);
   const float sdFit = sd(fitSum, fitSq, graded);
   const float sdTwo = sd(twoSum, twoSq, graded);
   const float sdFoot = sd(footSum, footSq, graded);
@@ -5790,12 +5812,14 @@ Status GateCrawlSlope(Ctx& c, std::string& detail) {
       "float anywhere incl. crest %.2f; "
       "tilt avg %.1f vs %.1f deg (err max %.1f), range %.1f (max %.1f); grade "
       "sd fit %.4f vs footprint-probe %.4f = %.2fx (max %.2f), body-length "
-      "two-probe %.4f; fit residual %.2f vox",
+      "two-probe %.4f; fit residual %.2f vox; body-height sd %.2f vox about "
+      "its own column, posed-clearance sd %.2f",
       rampSeen, kRampLen, meanGrade, wantTilt, stateNow, everTargeted ? 1 : 0,
       crawled, minCrawl,
       onRamp, graded, floatMax, floatAllowed, worstFloatAt, sinkMax,
       sinkAllowed, floatAny, tiltAvg, wantTilt, tiltErr, tiltRange, tiltSpan, sdFit,
-      sdFoot, sdFoot > 0 ? sdFit / sdFoot : 0.0f, sdRatio, sdTwo, rough);
+      sdFoot, sdFoot > 0 ? sdFit / sdFoot : 0.0f, sdRatio, sdTwo, rough,
+      sdHeave, sdPose);
 
   SetCurrentTuning(savedGore);
   c.mobs.ClearPlayerActor();

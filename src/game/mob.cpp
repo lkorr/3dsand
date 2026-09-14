@@ -2333,7 +2333,44 @@ static constexpr float kProneTiltMaxDeg = 55.0f;
 static constexpr float kProneUpEase = 0.15f;
 static constexpr float kProneSinkVox = 0.75f;
 
-bool Mob::SettleClipOwnedBody(World& world, const AnimStateRule* rule,
+// HOW LONG THE CLEARANCE IS AVERAGED OVER, in seconds of half-life. It has to
+// be long against a stroke — the crawl clips run a 1.2 s cycle, and a
+// first-order filter at this half-life leaves under a fifth of a 1.2 s
+// oscillation — and it costs nothing when the terrain genuinely changes,
+// because what the terrain moves is the fitted PLANE (unfiltered) and not this
+// number. The floor probe below is the backstop for the ticks where the lag is
+// in the wrong direction.
+static constexpr float kProneClearHalfLife = 0.6f;
+
+// ...and the same for the contact probe's lift, shorter because that one is a
+// claim about the body being INSIDE the ground and is the direction it is not
+// safe to lag. A tenth of a second is under the time EaseBodyY needs to carry
+// the body a voxel, so the ease costs nothing in response and removes the step
+// a one-column probe hands over when the contact point walks.
+static constexpr float kProneLiftHalfLife = 0.10f;
+
+// HOW DEEP A PRONE BODY IS LAID INTO THE SURFACE. Contact is measured from the
+// lowest corner of the lowest CORE collider box, and a box corner touches
+// before the art wrapped around it does: a body grounded corner-exactly reads
+// as hovering, which is what it was reported as. Bodies lying on ground also
+// settle into it — grass, rubble, their own weight — so the honest placement is
+// slightly under the fitted surface and the parts an IK chain owns (the arms a
+// crawl swings) are allowed to pass through it. Not per-rig: a corner is a
+// corner on every rig. THE FEEL KNOB for "the crawl sits too high / too deep":
+// it is one number in world voxels, and the averaging above is worth roughly
+// another half of one on top of it.
+static constexpr float kProneEmbedVox = 1.5f;
+
+// SANDVOX_PRONE_RAW=1 — the control arm: no embed, no filtering, the corner
+// grounded exactly on the plane. This is what the placement did before the
+// heave work, and it exists because the alternative way to answer "is the body
+// lower than it used to be, or is that just the dune it is lying on" is a
+// second build of a second tree. Read once; a prone body's drawn pose feeds
+// hashed state (blood, coat), so this is a diagnostic switch like
+// SANDVOX_GAIT_DEBUG and not something to leave set.
+static const bool kProneRaw = std::getenv("SANDVOX_PRONE_RAW") != nullptr;
+
+bool Mob::SettleClipOwnedBody(World& world, const AnimStateRule* rule, float dt,
                               float& outTargetY) {
   // The historical answer first, so every early-out below is a fallback rather
   // than a hole: offset from the walk drive's single ground column, upright.
@@ -2347,6 +2384,11 @@ bool Mob::SettleClipOwnedBody(World& world, const AnimStateRule* rule,
   outTargetY = origin_.y + offset;
   if (def_ == nullptr || rule == nullptr || rule->groundAlign <= 0.0f) {
     easeUp(Vec3{0, 1, 0});
+    // Not prone: the averaged clearance and the eased lift mean nothing about
+    // the next state, and easing out of a stale one would sink or launch the
+    // body on the tick it lies back down.
+    proneClearInit_ = false;
+    proneLift_ = 0;
     return false;
   }
   const float w = std::clamp(rule->groundAlign, 0.0f, 1.0f);
@@ -2428,7 +2470,30 @@ bool Mob::SettleClipOwnedBody(World& world, const AnimStateRule* rule,
     outTargetY = planeY + offset;
     return true;
   }
-  outTargetY = planeY - clear + offset;
+
+  // ---- ...AVERAGED OVER THE STROKE, NOT SAMPLED AT ITS EXTREME -----------
+  // `clear` is a minimum over the core, and a crawl clip rocks the ROOT by a
+  // few degrees every cycle — which about the hip is over a voxel at the end
+  // of a body as long as the creature is tall. Handing the instantaneous
+  // minimum to the body height does two visible things: the creature HEAVES
+  // once per arm stroke, and since a minimum over a rocking body is an
+  // extreme, it spends most of the cycle held at the top of that rock. Both
+  // are the same number, so both go away by grounding on the clearance
+  // AVERAGED over the stroke: the rocking stays in the pose, where it was
+  // authored, and the body it is drawn on stays put. Filtering here rather
+  // than on the final height is deliberate — this term is pose-driven and
+  // ought to be steady, while the plane under it is terrain-driven and must
+  // not be lagged at all. (`proneClear_`, mob.h.)
+  if (!proneClearInit_ || kProneRaw) {
+    proneClear_ = clear;
+    proneClearInit_ = true;
+  } else {
+    const float k = 1.0f - std::pow(0.5f, std::max(dt, 0.0f) /
+                                              kProneClearHalfLife);
+    proneClear_ += (clear - proneClear_) * std::clamp(k, 0.0f, 1.0f);
+  }
+  const float embed = kProneRaw ? 0.0f : kProneEmbedVox;
+  outTargetY = planeY - proneClear_ - embed + offset;
 
   // ---- ...AND THE PLANE IS AN AVERAGE, SO IT IS ONLY A TARGET ------------
   // Real ground is not the plane fitted to it, and the residual is largest at
@@ -2445,12 +2510,37 @@ bool Mob::SettleClipOwnedBody(World& world, const AnimStateRule* rule,
   // the body is also the safe direction to be wrong in — a creature a
   // centimetre proud of a bump reads as lying on it; one a hand's breadth
   // inside reads as broken.
+  //
+  // ...AND IT HAS TO CARRY THE EMBED, or it is not a bound on the fit's error
+  // any more — it is a second opinion about the placement, and it would simply
+  // lift the body back out of the surface it was deliberately laid into on
+  // every tick. What this floors is the RESIDUAL, so the allowance is the depth
+  // the body is aimed at plus the depth a bad column may add to it.
+  //
+  // AND THE LIFT IT ASKS FOR IS EASED, because this probe is the one part of
+  // the placement that is neither smooth in space nor smooth in time: it is a
+  // single column, snapped to whole voxels, chosen by WHERE THE POSE IS
+  // TOUCHING — so it walks to a new column whenever the stroke moves the
+  // contact point, and hands the difference between two columns to the body
+  // height as a step. That is the chaotic component of the bob (the smooth one
+  // is `proneClear_` above), and it reads as the arms shoving the body about,
+  // because the arms are what moved the contact point. Eased, a real step up
+  // still arrives inside a couple of hundred milliseconds — faster than
+  // EaseBodyY can carry the body there anyway — and a one-column blip does not
+  // arrive at all.
   const Vec3 pivot{def_->worldSize.x * 0.5f, 0, def_->worldSize.z * 0.5f};
   int gy = 0;
+  float wantLift = 0;
   if (GroundHeightAt(world, ifloor(origin_.x + pivot.x + at.x),
                      ifloor(origin_.z + pivot.z + at.z),
                      ifloor(origin_.y) + kMobProbeLiftCells, gy))
-    outTargetY = std::max(outTargetY, (float)gy - at.y - kProneSinkVox);
+    wantLift =
+        std::max(0.0f, ((float)gy - at.y - kProneSinkVox - embed) - outTargetY);
+  const float kl =
+      1.0f - std::pow(0.5f, std::max(dt, 0.0f) / kProneLiftHalfLife);
+  proneLift_ += kProneRaw ? (wantLift - proneLift_)
+                          : (wantLift - proneLift_) * std::clamp(kl, 0.0f, 1.0f);
+  outTargetY += proneLift_;
   return true;
 }
 
@@ -3936,7 +4026,7 @@ void MobSystem::UpdateAnimation(Mob& mob, const MobDef& def, World& world,
     // tilt ease — which it owns because the clearance it measures is only
     // meaningful through the tilt the body is actually drawn at (mob.h).
     float targetY = mob.origin_.y;
-    mob.SettleClipOwnedBody(world, loco, targetY);
+    mob.SettleClipOwnedBody(world, loco, dt, targetY);
     EaseBodyY(mob, targetY, dt);
     mob.footInit_ = true;
   }

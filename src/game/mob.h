@@ -1540,7 +1540,10 @@ class Mob {
   //
   // `rule` may be null (a legacy rig with no states at all): the body settles
   // to the walk drive's ground and the tilt eases flat.
-  bool SettleClipOwnedBody(World& world, const AnimStateRule* rule,
+  //
+  // `dt` is only used to low-pass the posed clearance over a stroke cycle
+  // (`proneClear_`); the placement is otherwise stateless in time.
+  bool SettleClipOwnedBody(World& world, const AnimStateRule* rule, float dt,
                            float& outTargetY);
 
   // Does this cell carry a body's weight? THE definition of "solid" for
@@ -1962,6 +1965,24 @@ class Mob {
   float speedNow_ = 0;         // measured planar speed, voxels/sec
   Vec3 bodyUp_{0, 1, 0};       // foot-plane normal (slope tilt)
   float bodyY_ = 0;            // prefab MIN CORNER height (same frame as origin_.y)
+  // LOW-PASSED CONTACT CLEARANCE for a prone body (SettleClipOwnedBody). The
+  // posed core's clearance is not constant over a crawl stroke: the clip
+  // pitches the ROOT a few degrees each cycle, and a few degrees about the hip
+  // is over a voxel at the far end of a body as long as the creature is tall.
+  // Grounding on the instantaneous minimum hands that straight to the body
+  // height — the creature heaves once per arm stroke, and because the minimum
+  // is an extreme it also sits high for most of the cycle. Averaged over the
+  // stroke instead, the body holds still and the rocking stays where it was
+  // authored: in the pose. Presentation only, reset whenever the body is not
+  // prone so a state change never eases out of a stale clearance.
+  float proneClear_ = 0;
+  bool proneClearInit_ = false;
+  // The eased half of the contact-probe floor beside it: how far the single
+  // column under the body's contact point is currently asking the body to be
+  // lifted out of the ground. Stepped by construction (one column, whole
+  // voxels, re-chosen wherever the pose is touching), so it is the chaotic
+  // component of a crawl's bob and the one the eye blames on the arms.
+  float proneLift_ = 0;
   // ---- live ragdoll state (see RagdollPhase above) ----
   RagdollPhase ragdoll_ = RagdollPhase::None;
   float ragdollT_ = 0;         // seconds in the current phase
