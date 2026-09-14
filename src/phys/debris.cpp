@@ -2459,6 +2459,16 @@ void DebrisSystem::SettleBodies(uint32_t tick, World& world,
 
   for (size_t bi = 0; bi < bodies_.size(); bi++) {
     Body& b = bodies_[bi];
+    // A FOLLOWER NEVER SETTLES BACK ON ITS OWN. It is not asleep in any sense
+    // the grid cares about — it is being driven — and stamping a breastplate
+    // into the world while the corpse inside it went on lying there would leave
+    // a plate of iron in the air with a body still tumbling through it. When
+    // its HOST settles back the host's body is released, DriveStraps finds no
+    // host next tick, and the garment falls and settles on its own terms.
+    if (b.Follower()) {
+      b.inactiveTicks = 0;
+      continue;
+    }
     if (phys_->IsActive(b.handle)) {
       b.inactiveTicks = 0;
       continue;
@@ -3078,13 +3088,15 @@ void DebrisSystem::BurnBodies(uint32_t tick, World& world,
       // size, and building at pitch 1 would give it 64x its real volume and
       // mass (RebuildCollider says the same thing at the other call site).
       uint64_t nh = phys_->CreateDebrisBodyXf(
-          b.voxels, b.xf, densityOf_, false,
+          b.voxels, b.xf, densityOf_, /*allowKinematic=*/b.Follower(),
           1.0f / (float)std::max(1u, b.physScale));
       if (nh != 0) {
         // ReplaceBody, never RemoveBody: a corpse's joints ride to the new
         // handle (see RebuildCollider).
+        const uint64_t oh = b.handle;
         phys_->ReplaceBody(b.handle, nh);
         b.handle = nh;
+        CarryStrap(oh, nh);
         phys_->SetBodyVelocities(nh, lin, ang);
         b.burnedSinceRebuild = 0;
         rebuiltOne = true;
@@ -3272,11 +3284,13 @@ void DebrisSystem::ShatterBody(Body& b, World& world, std::vector<Body>& fragmen
     // to physScale times its real size until the next RebuildCollider. The
     // fragment path two branches up (and RebuildCollider) always passed it.
     const float pitch = 1.0f / (float)std::max(1u, b.physScale);
-    uint64_t nh = phys_->CreateDebrisBodyXf(b.voxels, b.xf, densityOf_,
-                                            /*allowKinematic=*/false, pitch);
+    uint64_t nh = phys_->CreateDebrisBodyXf(
+        b.voxels, b.xf, densityOf_, /*allowKinematic=*/b.Follower(), pitch);
     if (nh != 0) {
+      const uint64_t oh = b.handle;
       phys_->ReplaceBody(b.handle, nh);  // joints ride along (RebuildCollider)
       b.handle = nh;
+      CarryStrap(oh, nh);  // ...and so does the strap (CarryStrap)
       phys_->SetBodyVelocities(nh, lin, ang);
       b.burnedSinceRebuild = 0;
     }
@@ -3413,6 +3427,160 @@ void DebrisSystem::ReleaseBody(Body& b) {
   b.handle = 0;
 }
 
+// ---- THE STRAP: a garment follows the limb it is on -------------------------
+//
+// The whole of the quaternion algebra this needs, local to the two functions
+// below rather than pulled in from game/anim.h: phys/ knows nothing about the
+// animation runtime and should not start now for eight lines of maths.
+namespace {
+struct StrapQ {
+  float x = 0, y = 0, z = 0, w = 1;
+};
+StrapQ StrapQOf(const float q[4]) { return StrapQ{q[0], q[1], q[2], q[3]}; }
+StrapQ StrapQMul(const StrapQ& a, const StrapQ& b) {
+  return StrapQ{a.w * b.x + a.x * b.w + a.y * b.z - a.z * b.y,
+                a.w * b.y - a.x * b.z + a.y * b.w + a.z * b.x,
+                a.w * b.z + a.x * b.y - a.y * b.x + a.z * b.w,
+                a.w * b.w - a.x * b.x - a.y * b.y - a.z * b.z};
+}
+StrapQ StrapQConj(const StrapQ& q) { return StrapQ{-q.x, -q.y, -q.z, q.w}; }
+Vec3 StrapRotate(const StrapQ& q, Vec3 v) {
+  const Vec3 u{q.x, q.y, q.z};
+  const Vec3 t = u.cross(v) * 2.0f;
+  return v + t * q.w + u.cross(t);
+}
+}  // namespace
+
+bool DebrisSystem::StrapBody(uint64_t shell, uint64_t host) {
+  if (shell == 0 || host == 0 || shell == host) return false;
+  Body* s = nullptr;
+  Body* h = nullptr;
+  for (Body& b : bodies_) {
+    if (b.handle == shell) s = &b;
+    if (b.handle == host) h = &b;
+  }
+  if (!s || !h) return false;
+  // A follower may not itself be followed, and a chain would need an ordering
+  // pass this deliberately does not have: one hop, always. (Nothing builds one
+  // today — a shell's host is always a base limb — so this is the assertion
+  // that keeps it that way rather than a case being handled.)
+  if (h->Follower()) return false;
+  // Whatever pose the pair holds RIGHT NOW is the rest offset. Not the wear
+  // pose: by the time a creature dies its rig has been through a fall, a fight
+  // and a dismemberment, and re-deriving from the authored anchors would snap
+  // every plate back to a T-pose at the moment of death.
+  const StrapQ hq = StrapQOf(h->xf.quat);
+  const StrapQ rel = StrapQMul(StrapQConj(hq), StrapQOf(s->xf.quat));
+  const Vec3 relPos = StrapRotate(StrapQConj(hq), s->xf.pos - h->xf.pos);
+  s->wornHost = host;
+  s->wornRelPos = relPos;
+  s->wornRelQuat[0] = rel.x;
+  s->wornRelQuat[1] = rel.y;
+  s->wornRelQuat[2] = rel.z;
+  s->wornRelQuat[3] = rel.w;
+  // KINEMATIC IS THE WHOLE POINT. A dynamic follower would be teleported by
+  // DriveStraps and integrated by Jolt in the same tick, and the two would
+  // fight; a kinematic one has no gravity, no mass in any contact and no
+  // depenetration response, so the host's dynamics are the pair's dynamics.
+  phys_->SetBodyKinematic(shell, true);
+  return true;
+}
+
+uint64_t DebrisSystem::WornHostOf(uint64_t handle) const {
+  for (const Body& b : bodies_)
+    if (b.handle == handle) return b.wornHost;
+  return 0;
+}
+
+void DebrisSystem::FollowersOf(uint64_t host, std::vector<uint64_t>& out) const {
+  if (host == 0) return;
+  for (const Body& b : bodies_)
+    if (b.wornHost == host && b.handle) out.push_back(b.handle);
+}
+
+uint32_t DebrisSystem::StrappedCount() const {
+  uint32_t n = 0;
+  for (const Body& b : bodies_)
+    if (b.Follower()) n++;
+  return n;
+}
+
+void DebrisSystem::CarryStrap(uint64_t oldHandle, uint64_t newHandle) {
+  if (oldHandle == 0 || newHandle == 0 || oldHandle == newHandle) return;
+  // The strap is keyed on handles and a collider rebuild mints a new one, so
+  // without this a breastplate came off its corpse the first time the torso
+  // under it lost voxels to a sword or to fire — the same class of bug
+  // ReplaceBody exists for on the joint side.
+  for (Body& b : bodies_)
+    if (b.wornHost == oldHandle) b.wornHost = newHandle;
+  // ...and if the REBUILT body is itself a follower, it has to come back
+  // kinematic: ReplaceBody carries the collision group and the object layer,
+  // not the motion type. A burnt-through sleeve would otherwise start falling
+  // out of the arm it is strapped to while DriveStraps kept teleporting it
+  // back, which is the pair fighting each other one tick at a time.
+  for (const Body& b : bodies_)
+    if (b.handle == newHandle && b.Follower()) {
+      phys_->SetBodyKinematic(newHandle, true);
+      break;
+    }
+}
+
+bool DebrisSystem::UnstrapBody(uint64_t handle) {
+  for (Body& b : bodies_)
+    if (b.handle == handle && b.Follower()) {
+      UnstrapBody(b);
+      return true;
+    }
+  return false;
+}
+
+void DebrisSystem::UnstrapBody(Body& b) {
+  if (!b.Follower()) return;
+  b.wornHost = 0;
+  if (!b.handle) return;
+  // It keeps the velocity it was being driven at (DriveStraps wrote the
+  // rigid-body velocity at this body's own origin), so a plate whose limb was
+  // culled mid-tumble carries on rather than dropping out of the air.
+  phys_->SetBodyKinematic(b.handle, false);
+}
+
+void DebrisSystem::DriveStraps() {
+  for (Body& b : bodies_) {
+    if (!b.Follower()) continue;
+    const Body* host = nullptr;
+    for (const Body& h : bodies_)
+      if (h.handle == b.wornHost) { host = &h; break; }
+    if (host == nullptr) {
+      // The limb this was on has stopped existing. A garment is not a ghost:
+      // it becomes debris of its own, here, rather than hanging in the air
+      // waiting for a handle that will never come back.
+      UnstrapBody(b);
+      continue;
+    }
+    const StrapQ hq = StrapQOf(host->xf.quat);
+    const StrapQ q = StrapQMul(hq, StrapQOf(b.wornRelQuat));
+    const Vec3 pos = host->xf.pos + StrapRotate(hq, b.wornRelPos);
+    const float quat[4] = {q.x, q.y, q.z, q.w};
+    if (!phys_->SetBodyTransform(b.handle, pos, quat)) {
+      UnstrapBody(b);
+      continue;
+    }
+    // The host's RIGID-BODY velocity at this body's origin (omega x r included).
+    // A kinematic body with a stale velocity integrates away from where it was
+    // just put, one with none reports every contact as a standing hit, and the
+    // instant the strap is cut this is the velocity the garment leaves with.
+    Vec3 lin{}, ang{};
+    if (phys_->GetBodyVelocities(host->handle, lin, ang))
+      phys_->SetBodyVelocities(b.handle, lin + ang.cross(pos - host->xf.pos),
+                               ang);
+    b.xf.pos = pos;
+    b.xf.quat[0] = q.x;
+    b.xf.quat[1] = q.y;
+    b.xf.quat[2] = q.z;
+    b.xf.quat[3] = q.w;
+  }
+}
+
 void DebrisSystem::RebaseVoxels(std::vector<DebrisVoxel>& voxels,
                                 BodyTransform& xf) {
   if (voxels.empty()) return;
@@ -3440,7 +3608,8 @@ bool DebrisSystem::RebuildCollider(Body& b) {
   // A micro body's voxels are 1/scale world voxels on a side. Building at
   // pitch 1 would inflate a scale-2 body to twice its size and 8x its mass.
   const float pitch = 1.0f / (float)std::max(1u, b.physScale);
-  uint64_t nh = phys_->CreateDebrisBodyXf(b.voxels, b.xf, densityOf_, false, pitch);
+  uint64_t nh = phys_->CreateDebrisBodyXf(
+      b.voxels, b.xf, densityOf_, /*allowKinematic=*/b.Follower(), pitch);
   if (nh == 0) return false;
   // REPLACE, NOT REMOVE. A corpse is a set of debris bodies that Die() left
   // JOINTED (game/mob.cpp: "joints stay so the corpse hangs together"), and
@@ -3454,8 +3623,10 @@ bool DebrisSystem::RebuildCollider(Body& b) {
   // handle and carries the collision group over, so a body comes apart only
   // where the carve actually disconnects it (ShatterBody). Gate:
   // corpse-intact.
+  const uint64_t oh = b.handle;
   phys_->ReplaceBody(b.handle, nh);
   b.handle = nh;
+  CarryStrap(oh, nh);  // followers of this body, and this body's own strap
   phys_->SetBodyVelocities(nh, lin, ang);
   b.burnedSinceRebuild = 0;
   // A damaged sphere is no longer a sphere: the analytic collider it spawned
@@ -4998,8 +5169,16 @@ void DebrisSystem::PostStep() {
     Body& b = bodies_[i];
     // BEFORE the read-back, because b.xf is still where the body was when the
     // step began and that is the segment this has to test (UntunnelBody).
-    UntunnelBody(b.handle, b.xf.pos);
-    phys_->GetTransform(b.handle, b.xf);
+    //
+    // A FOLLOWER IS NOT UNTUNNELLED AND IS NOT READ BACK. It has no trajectory
+    // of its own to clamp — it went wherever DriveStraps put it — and reading
+    // Jolt here would hand it back the pose it is about to be re-derived from,
+    // one tick stale. Its host is clamped and read like anything else, which is
+    // the same rule Mob's limp-rig path applies to a worn shell.
+    if (!b.Follower()) {
+      UntunnelBody(b.handle, b.xf.pos);
+      phys_->GetTransform(b.handle, b.xf);
+    }
     // bodies that leave the residency window despawn: there is no terrain to
     // collide with out there (Noita despawns offscreen bodies the same way)
     const float kPad = 32.0f;
@@ -5023,6 +5202,9 @@ void DebrisSystem::PostStep() {
     bodies_.erase(bodies_.begin());
     instancesDirty_ = true;
   }
+  // LAST: the cull above is what decides whether a host still exists, and the
+  // read-back above is what makes its transform final for this tick.
+  DriveStraps();
 }
 
 // ---- THE EXPOSED-VOXEL CULL (BuildInstances) --------------------------------
@@ -5189,6 +5371,19 @@ void DebrisSystem::SaveState(std::vector<uint8_t>& out) const {
     // lattice below.
     w.U32(b.micro.Valid() ? 1u : 0u);
     w.U32(b.bleedMat);
+    // THE STRAP, BY INDEX INTO THIS LIST. Jolt handles do not survive a
+    // session, and load recreates the bodies in exactly this order, so the
+    // index is the only thing that can name a host across the boundary.
+    // 0xFFFFFFFF = not a follower. Without this an armoured corpse reloaded as
+    // a pile of free bodies sharing the same space, which is the OTHER way to
+    // build the motor StrapBody exists to avoid.
+    uint32_t hostIdx = 0xFFFFFFFFu;
+    if (b.Follower())
+      for (size_t j = 0; j < bodies_.size(); j++)
+        if (bodies_[j].handle == b.wornHost) { hostIdx = (uint32_t)j; break; }
+    w.U32(hostIdx);
+    w.Pod(b.wornRelPos);
+    for (float q : b.wornRelQuat) w.F32(q);
     w.PodVec(b.voxels);
     w.PodVec(b.skinVoxels);
   }
@@ -5202,9 +5397,24 @@ bool DebrisSystem::LoadState(const uint8_t* data, size_t len, uint32_t version) 
   ByteReader r{data, len};
   uint32_t count = 0;
   r.U32(count);
+  // The straps are tied in a SECOND PASS: a follower may be written before its
+  // host, and a host that was skipped (empty lattice, Jolt refusal, the body
+  // ceiling) has no handle to strap to. `handleOfSaved` is the map from the
+  // saved index the section names to the handle that index actually became,
+  // 0 for one that did not survive the load.
+  std::vector<uint64_t> handleOfSaved(count, 0);
+  struct PendingStrap {
+    uint32_t self = 0, host = 0;
+    Vec3 relPos{};
+    float relQuat[4] = {0, 0, 0, 1};
+  };
+  std::vector<PendingStrap> straps;
   for (uint32_t i = 0; i < count && r.ok; i++) {
     BodyTransform xf{};
     uint32_t physScale = 1, skinScale = 1, hadMicro = 0, bleedMat = 0;
+    uint32_t hostIdx = 0xFFFFFFFFu;
+    Vec3 relPos{};
+    float relQuat[4] = {0, 0, 0, 1};
     std::vector<DebrisVoxel> voxels;
     std::vector<PrefabVoxel> skinVoxels;
     r.Pod(xf);
@@ -5212,6 +5422,9 @@ bool DebrisSystem::LoadState(const uint8_t* data, size_t len, uint32_t version) 
     r.U32(skinScale);
     r.U32(hadMicro);
     r.U32(bleedMat);
+    r.U32(hostIdx);
+    r.Pod(relPos);
+    for (float& q : relQuat) r.F32(q);
     r.PodVec(voxels);
     r.PodVec(skinVoxels);
     if (!r.ok || voxels.empty()) continue;
@@ -5219,7 +5432,11 @@ bool DebrisSystem::LoadState(const uint8_t* data, size_t len, uint32_t version) 
 
     physScale = std::max(1u, physScale);
     const float pitch = 1.0f / (float)physScale;
-    uint64_t h = phys_->CreateDebrisBodyXf(voxels, xf, densityOf_, false, pitch);
+    // A saved follower has to come back able to BE kinematic — the strap pass
+    // below switches it, and Jolt refuses the switch on a body that was not
+    // created with the allowance.
+    uint64_t h = phys_->CreateDebrisBodyXf(
+        voxels, xf, densityOf_, /*allowKinematic=*/hostIdx < count, pitch);
     if (h == 0) {
       std::fprintf(stderr, "debris: Jolt refused a loaded body (skipped)\n");
       continue;
@@ -5263,9 +5480,34 @@ bool DebrisSystem::LoadState(const uint8_t* data, size_t len, uint32_t version) 
 
     AdoptBody(h, std::move(voxels), xf, micro, physScale, std::move(skinVoxels),
               bleedMat);
+    handleOfSaved[i] = h;
+    if (hostIdx < count) {
+      PendingStrap ps;
+      ps.self = i;
+      ps.host = hostIdx;
+      ps.relPos = relPos;
+      for (int q = 0; q < 4; q++) ps.relQuat[q] = relQuat[q];
+      straps.push_back(ps);
+    }
     // Reload ASLEEP with zero velocity (worldio.h's rigidbody rule): a settled
     // pile reloads settled, and rule 2's sleep invariant holds from tick one.
     phys_->DeactivateBody(h);
+  }
+  // ---- second pass: tie the straps ----------------------------------------
+  // The SAVED offset is restored, not re-derived from the loaded poses, for
+  // the same reason StrapBody captures the live one: the pair's offset is a
+  // fact about where they were, and a garment whose host was skipped simply
+  // stays loose debris.
+  for (const PendingStrap& ps : straps) {
+    const uint64_t sh = handleOfSaved[ps.self], ho = handleOfSaved[ps.host];
+    if (!sh || !ho) continue;
+    if (!StrapBody(sh, ho)) continue;   // takes the kinematic switch with it
+    for (Body& b : bodies_)
+      if (b.handle == sh) {
+        b.wornRelPos = ps.relPos;
+        for (int q = 0; q < 4; q++) b.wornRelQuat[q] = ps.relQuat[q];
+        break;
+      }
   }
   return r.ok;
 }

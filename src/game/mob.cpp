@@ -3881,10 +3881,34 @@ void Mob::TickSeveredHolds(float dt) {
     limb.holdSeconds -= dt;
     if (limb.holdSeconds > 0) continue;
     limb.holdSeconds = 0;
+    // A GARMENT DOES NOT COME OUT OF THE HOLD AS A BODY OF ITS OWN, because it
+    // never was one. It is strapped to the piece it came off with (DetachLimb),
+    // so it stays kinematic and keeps the group its host is about to re-tie;
+    // everything below would undo exactly that. The slot is still released so
+    // the husk sweep can take it.
+    if (debris_ && debris_->WornHostOf(limb.holdBody) != 0) {
+      limb.holdBody = 0;
+      continue;
+    }
     phys_->SetBodyKinematic(limb.holdBody, false);
     // A severed part must collide with the body it came off again: the
     // rig's GroupFilterTable suppressed those contacts forever otherwise.
     phys_->ClearCollisionGroup(limb.holdBody);
+    // ...but NOT with the gear riding it. Clearing the group is what lets a cut
+    // arm hit the corpse, and it would also let the vambrace strapped to that
+    // arm start shoving it — a kinematic follower against a dynamic limb they
+    // share space with, which resolves by firing the limb out. So the piece and
+    // its followers get a fresh exclusion table of their own, containing
+    // nothing else in the world.
+    if (debris_) {
+      std::vector<uint64_t> piece{limb.holdBody};
+      debris_->FollowersOf(limb.holdBody, piece);
+      if (piece.size() > 1) {
+        for (size_t k = 1; k < piece.size(); k++)
+          phys_->ClearCollisionGroup(piece[k]);
+        phys_->DisableCollisionsAmong(piece);
+      }
+    }
     // It also stops being part of ANY creature — but it may not touch the
     // player until it has fallen clear of them (see DetachLimb).
     phys_->ReleaseToWorldWhenClear(limb.holdBody);
@@ -10076,6 +10100,17 @@ void Mob::DetachLimb(int limbIndex, bool adopt) {
     phys_->DestroyJoint(limb.joint);
     limb.joint = 0;
   }
+  // WHAT THIS LIMB IS WEARING, noted before the recursion takes it away. A
+  // shell whose host comes off comes off with it (the parent-name recursion
+  // below reaches it), and on the far side of that it is a body sharing a limb's
+  // exact space — which is the same overlap a corpse's armour is, and must be
+  // the same relationship: a follower, not a free body (see Mob::Die and
+  // DebrisSystem::StrapBody). The slots are captured here because
+  // `wornHost` is cleared inside each child's own DetachLimb.
+  std::vector<int> gearSlots;
+  for (size_t k = 0; k < limbDefs_.size(); k++)
+    if (limbs_[k].wornHost == limbIndex && limbs_[k].body)
+      gearSlots.push_back((int)k);
   // children of this limb are orphaned too: their joints attach to it and
   // die with the body chain when severed recursively
   const MobDef& def = *def_;
@@ -10111,6 +10146,16 @@ void Mob::DetachLimb(int limbIndex, bool adopt) {
     limb.carved = false;
     limb.holdBody = limb.body;
     limb.holdSeconds = kSeverHoldSeconds;
+    // ...AND IT KEEPS ITS GEAR ON. The shells noted above were adopted by the
+    // recursion a moment ago and are lying in this limb's exact space; strapped,
+    // they ride it, and the pair is one object to the solver exactly as it is on
+    // a corpse. Free, they would be a garment and the flesh inside it resolving
+    // a deep mutual penetration the instant TickSeveredHolds takes them both
+    // dynamic — the same motor by the other route, on the one piece of a fight
+    // that is guaranteed to be armoured.
+    for (int s : gearSlots)
+      if (limbs_[(size_t)s].holdBody)
+        debris_->StrapBody(limbs_[(size_t)s].holdBody, limb.body);
     // OFF THE PLAYER'S CONTACT LAYER FOR THE HOLD, whoever it came off. The
     // piece is KINEMATIC for kSeverHoldSeconds, frozen in the pose it was cut
     // in — and an NPC's arm cut off mid-swing is frozen INSIDE the player who
@@ -10232,31 +10277,42 @@ void Mob::Die() {
       corpse.gear.push_back(std::move(piece));
     }
   }
-  // ---- A GARMENT STOPS BEING A FOLLOWER AT THE MOMENT OF DEATH -------------
+  // ---- A GARMENT IS A FOLLOWER ON A CORPSE TOO ------------------------------
   //
-  // Death is the one transition where a worn shell really does become a body of
-  // its own: the limbs leave this system for DebrisSystem, nothing derives a
-  // pose for them any more (DriveWornShells needs a live Mob), and a corpse must
-  // still be wearing its armour. So each follower gets the Fixed constraint it
-  // did without while it was being worn, anchored where the pair actually IS —
-  // which after a whole ragdoll's worth of falling is nowhere near the rest
-  // pose. Built before the adoption loop below because the handles it needs are
-  // the ones that loop is about to hand away (they do not change; ownership
-  // does).
+  // Death hands the strap over; it does not trade it for a constraint.
   //
-  // This is also the constraint the runaway note in phys/physics.cpp names as
-  // the armoured-corpse motor. It is kept because a corpse whose plate falls
-  // through it is a worse bug than a corpse the runaway net has to damp, and
-  // because the net exists; if it is ever cut, cut it here, deliberately, with
-  // the `corpse-armor` gate in front of you.
+  // The shells and their hosts are about to leave this system for
+  // DebrisSystem, and nothing here can derive a pose for them afterwards
+  // (DriveWornShells needs a live Mob) — but a corpse must still be wearing its
+  // armour. Until 2026-09-13 that was bought with the Fixed joint
+  // AppendWornShell deliberately does without: a stiff constraint between a
+  // plate of iron and the flesh INSIDE it, across a deep overlap, at a mass
+  // ratio a sequential-impulse solver gains energy on. That is the armoured-
+  // corpse blow-up the owner reported — every limb pinned at Jolt's own 47.12
+  // rad/s clamp, the rig flying apart while still attached, then hauled slowly
+  // back together by the joints that flung it. The runaway net in
+  // phys/physics.cpp was written to survive it; this is the motor itself.
+  //
+  // So the pairs are recorded here, while the rig still knows which shell is on
+  // which limb, and re-tied on the far side of the adoption loop as
+  // DebrisSystem straps (DebrisSystem::StrapBody). A dressed corpse then has
+  // the SAME bodies in the solver as a naked one, the same constraint graph,
+  // and the same mass — the armour contributes nothing but its pose, which is
+  // exactly the property `corpse-armor` asserts.
+  //
+  // The A/B arm keeps the old shape whole: with SANDVOX_NO_RIGWELD=1 a shell
+  // was jointed from the moment it was worn, so it is jointed here too.
+  struct DyingStrap {
+    uint64_t shell = 0, host = 0;
+  };
+  std::vector<DyingStrap> dyingStraps;
   for (size_t i = 0; i < limbs_.size(); i++) {
     MobLimb& shell = limbs_[i];
     const int hi = shell.wornHost;
-    shell.wornHost = -1;   // no longer derived, whatever happens below
+    shell.wornHost = -1;   // this system derives nothing after Die()
     if (hi < 0 || !shell.body || shell.joint != 0) continue;
     if (hi >= (int)limbs_.size() || !limbs_[(size_t)hi].body) continue;
-    shell.joint = phys_->CreateJoint(limbs_[(size_t)hi].body, shell.body,
-                                     JointDescFor(limbDefs_[i], shell.xf.pos));
+    dyingStraps.push_back(DyingStrap{shell.body, limbs_[(size_t)hi].body});
   }
   // whole-body ragdoll: every limb goes dynamic and becomes debris; joints
   // stay so the corpse hangs together until pieces get culled or settle
@@ -10293,6 +10349,18 @@ void Mob::Die() {
     if (limb.joint) limb.joint = 0;  // ownership follows the bodies now
     if (i < anim_.partAlive.size()) anim_.partAlive[i] = 0;
   }
+  // ...and the straps are re-tied on the other side of the adoption, now that
+  // both bodies are DebrisSystem's. Handles do not change across AdoptBody
+  // (ownership does), so these are the same pairs recorded above. StrapBody
+  // puts the shell back to kinematic, undoing the blanket SetBodyKinematic
+  // above for exactly the bodies that are not their own object.
+  //
+  // A strap that will not tie — no DebrisSystem (a CPU-only fixture), or a host
+  // that never reached the adoption — leaves the garment as loose debris.
+  // Jointing it instead would be reaching for the motor as a fallback.
+  if (debris_)
+    for (const DyingStrap& ds : dyingStraps)
+      debris_->StrapBody(ds.shell, ds.host);
   MarkInstancesDirty();
   if (reportCorpse) sys_->onCorpse_(corpse);
   // Death goes straight to ragdoll (no hold): the whole body flips at once,

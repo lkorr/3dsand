@@ -259,6 +259,11 @@ inline bool ShedCorpseLoot(CorpseReport& corpse, int index,
   CorpseReport::Piece piece = std::move(corpse.gear[index]);
   corpse.gear.erase(corpse.gear.begin() + index);
   if (outItem) *outItem = piece.item;
+  // OFF THE CORPSE MEANS OFF IT. A worn shell on a corpse is strapped to the
+  // limb it covers (DebrisSystem::StrapBody), so "the body is already lying
+  // there" is only true once the strap is cut — otherwise a breastplate dragged
+  // out of the loot panel went on riding the chest it was dragged off.
+  debris.UnstrapBody(piece.body);
   // The body stays in the corpse's hover set on purpose: the crosshair asks
   // the ground registry FIRST, so the shed robe reads as a robe, and when it
   // is picked up its release fires OnBodyGone, which is what takes it out of

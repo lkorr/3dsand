@@ -1409,6 +1409,38 @@ Status GateCorpseArmor(Ctx& c, std::string& detail) {
   // to coexist with.
   for (int i = 0; i < 30 && mobs.IsAlive(id); i++) step(nullptr);
 
+  // THE CORPSE, NAMED BY ITS OWN HANDLES, ON THE LAST FRAME IT IS STILL A RIG.
+  // Every limb that is about to become debris, plus the shells captured above
+  // (the ones on the limb that already came off are not on the rig any more).
+  // `Mob::Die` hands these exact handles to DebrisSystem, so membership in this
+  // set IS "part of this corpse".
+  //
+  // Gathered HERE rather than after the kill, and that is the whole point: the
+  // previous version took "every debris body that is not one I saw at gate
+  // start", which is a set defined by exclusion and therefore grows. In a full
+  // --selftest an earlier gate's creature dies during this fixture's 120
+  // carving strokes, 400 voxels away, and its limbs land in that set: measured
+  // spread 418.1 voxels against a cap of 60 while every piece of THIS corpse
+  // was inside 29. Naming the subject cannot do that, however dirty the suite
+  // around it is -- the trap this file already records once as "a fixture that
+  // measures the suite rather than the subject".
+  //
+  // A handle changes if a collider is rebuilt, and such a piece drops out of
+  // the measurement. Nothing carves during the settle below, so that does not
+  // happen today; if it starts to, the symptom is the surviving count falling
+  // over the run rather than a wrong number.
+  // The shell set is refreshed here as well as captured before the strokes,
+  // and needs both halves: carving a limb REBUILDS its collider under a new
+  // handle, so the pre-stroke capture goes stale for anything the sword
+  // touched -- and the shells that left on the severed limb are no longer on
+  // the rig to be re-read. Union, so "was that peak armour?" stays right for
+  // both.
+  for (int sIdx = bareLimbs; sIdx < mob->LimbCount(); sIdx++)
+    if (const uint64_t h = mobs.LimbBody(id, sIdx)) shellBodies.insert(h);
+  std::unordered_set<uint64_t> mine = shellBodies;
+  for (int li = 0; li < mob->LimbCount(); li++)
+    if (const uint64_t h = mobs.LimbBody(id, li)) mine.insert(h);
+
   // Then the kill, the way the sword delivers it: the root limb at zero hp is
   // a death, not an amputation (Mob::HpZeroSevers), and the corpse keeps every
   // joint (Mob::Die).
@@ -1419,25 +1451,10 @@ Status GateCorpseArmor(Ctx& c, std::string& detail) {
   }
   const bool died = !mobs.IsAlive(id);
   const uint32_t jointsDead = c.phys.JointCount();
-  // THE CORPSE, BY HANDLE, CAPTURED ONCE. Excluding the bodies that existed
-  // before the fixture ran is NOT enough, and the second version of this gate
-  // is how we know: in a full --selftest an earlier gate's creature is still
-  // standing when this one starts (43 joints in the world where this rig
-  // accounts for 28), and when it dies DURING the 180 ticks below its limbs
-  // enter DebrisSystem too -- 400 voxels away, which is exactly where "spread
-  // 398.8 vox, cap 60" came from while every piece of THIS corpse was inside
-  // 35. A snapshot taken before the fixture cannot see a body that arrives
-  // after it; a snapshot of the corpse itself can.
-  //
-  // A handle changes if DamageBody rebuilds a collider, and such a piece drops
-  // out of the measurement. Nothing carves during the settle below, so that
-  // does not happen today; if it starts to, the symptom is the surviving count
-  // falling over the run rather than a wrong number.
-  std::unordered_set<uint64_t> mine;
-  for (uint32_t b = 0; b < c.debris.BodyCount(); b++) {
-    const uint64_t h = c.debris.BodyHandle(b);
-    if (!foreignBodies.count(h)) mine.insert(h);
-  }
+  // `foreignBodies` is now only ever reported (`foreignCount`), which is the
+  // honest use for it: how dirty the suite was when this gate started is worth
+  // seeing in the detail line, and is not something to define the subject by.
+  (void)foreignBodies;
 
   // Three seconds of corpse, measured every tick over every piece.
   c.phys.ResetRunawayProbe();
@@ -1465,8 +1482,17 @@ Status GateCorpseArmor(Ctx& c, std::string& detail) {
       const uint64_t h = c.debris.BodyHandle(b);
       if (!mine.count(h)) continue;   // not this corpse: see above
       const Vec3 p = c.debris.BodyPosition(b);
+      // A FOLLOWER IS NOT A SECOND BODY, SO IT IS NOT A SECOND SAMPLE. Its
+      // velocity is not a measurement of anything: DriveStraps WRITES its
+      // host's rigid-body velocity into it every tick, so a shell on a limb
+      // spinning at the clamp reads the clamp too, and counting both says "2
+      // bodies pegged" about one. The suite run that caught this reported 5
+      // pegged body-ticks across 3 bodies, "2 of them armour" -- and those two
+      // were the same tumble as the flesh they are strapped to. Its POSITION
+      // still counts toward `spread`, because "did the armour stay on the
+      // corpse" is a real question about a real body.
       Vec3 lin{}, ang{};
-      if (c.phys.GetBodyVelocities(h, lin, ang)) {
+      if (!c.debris.WornHostOf(h) && c.phys.GetBodyVelocities(h, lin, ang)) {
         const float sp = lin.len(), sq = ang.len();
         if (sp > maxSpeed) {
           maxSpeed = sp;
@@ -1507,6 +1533,40 @@ Status GateCorpseArmor(Ctx& c, std::string& detail) {
   uint32_t ours = 0;
   for (uint32_t b = 0; b < c.debris.BodyCount(); b++)
     if (mine.count(c.debris.BodyHandle(b))) ours++;
+
+  // ---- THE MOTOR ITSELF, NOT ITS SYMPTOM ----------------------------------
+  //
+  // Everything above measures what the corpse DID. This measures what it IS,
+  // which is the claim that survives a tuning change: a dressed corpse must be
+  // the same object to the solver as a naked one. A worn shell is strapped to
+  // the limb it covers (DebrisSystem::StrapBody) — kinematic, pose derived —
+  // so it may carry NO joint. One that did would be the Fixed constraint
+  // Mob::Die built until 2026-09-13, across an iron-against-flesh mass ratio
+  // and a deep overlap, which is the energy source the whole runaway net
+  // downstream of it exists to survive.
+  //
+  // Stated over the shells that are still bodies, because a piece that was
+  // culled or looted is not evidence either way. The A/B arm
+  // (SANDVOX_NO_RIGWELD=1) restores the jointed shape deliberately, and is
+  // recognised by there being no straps at all rather than by a second env
+  // read: with the arm on, `strapped` is 0 and the joint claim is not made.
+  uint32_t shellsLeft = 0, shellJoints = 0, shellsStrapped = 0;
+  for (uint32_t b = 0; b < c.debris.BodyCount(); b++) {
+    const uint64_t h = c.debris.BodyHandle(b);
+    if (!shellBodies.count(h)) continue;
+    shellsLeft++;
+    shellJoints += c.phys.JointCount(h);
+    if (c.debris.WornHostOf(h)) shellsStrapped++;
+  }
+  // A strapped shell must ALSO still be on its corpse: a follower whose host
+  // was culled unstraps and falls, and one that never moved would pass the
+  // joint claim while hanging in the air. `maxSpread` above is what bounds
+  // that, over every piece including these.
+  const bool strapsHold =
+      shellsStrapped == 0 ||
+      (shellJoints == 0 && shellsStrapped == shellsLeft);
+  RecordObserved("corpseArmorShellJoints", (double)shellJoints);
+  RecordObserved("corpseArmorShellsStrapped", (double)shellsStrapped);
 
   // ---- B. THE NET ITSELF, DRIVEN ON PURPOSE -------------------------------
   //
@@ -1606,11 +1666,13 @@ Status GateCorpseArmor(Ctx& c, std::string& detail) {
   const bool ok = died && maxSpeed <= (float)speedCap &&
                   maxSpread <= (float)spreadCap &&
                   (double)peggedSamples <= peggedCap && net.cut == 0 &&
-                  net.repaired == 0 && netHeld;
+                  net.repaired == 0 && netHeld && strapsHold;
   detail = Format(
       "%s: %d base limbs + %d shells from %d worn pieces, %u joints dressed; "
       "%s cut off in %d strokes (severed=%d), died=%d with %u joints, %u of "
-      "its %u debris bodies left (%u were in the world before it); over %d "
+      "its %u debris bodies left (%u were in the world before it); "
+      "%u shells still bodies, %u strapped to their limb, %u joints on them "
+      "(%s); over %d "
       "corpse ticks the fastest piece hit %.1f vox/s on "
       "tick %d (cap %.0f) at (%.1f, %.1f, %.1f), %.1f vox under ground, %.0f%% "
       "straight down; fastest spin %.2f rad/s on tick %d (%s, recorded not capped: %.2f); spread "
@@ -1621,7 +1683,9 @@ Status GateCorpseArmor(Ctx& c, std::string& detail) {
       "%u, ended at %.1f rad/s (%s)",
       t.defName.c_str(), bareLimbs, shells, wornPieces, jointsDressed,
       cutName.c_str(), strokes, severed ? 1 : 0, died ? 1 : 0, jointsDead,
-      ours, (unsigned)mine.size(), foreignCount, kTicks, (double)maxSpeed,
+      ours, (unsigned)mine.size(), foreignCount, shellsLeft, shellsStrapped,
+      shellJoints, strapsHold ? "followers" : "ROPED TO THE CORPSE",
+      kTicks, (double)maxSpeed,
       speedTick, speedCap,
       (double)peakPos.x, (double)peakPos.y, (double)peakPos.z,
       (double)peakUnderGround, (double)(fallFrac * 100.0f), (double)maxSpin,

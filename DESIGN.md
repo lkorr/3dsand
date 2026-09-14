@@ -3230,11 +3230,20 @@ joints `Mob::Die` deliberately leaves on the corpse (see `corpse-intact`) spread
 it from one limb to all of them. That is precisely what "flying everywhere while
 still technically being attached" describes.
 
-> Since 2026-09-13 that is true of a **corpse only**: on a LIVE creature — limp
-> included — a shell has no constraint at all and cannot drive anything (next
-> section). `Mob::Die` creates the strap joints at the moment of death, because
-> that is the one transition where a garment really does become a body of its
-> own, and the nets below are what keeps that case honest.
+> **That motor no longer exists, in any phase.** It was cut later the same day:
+> `Mob::Die` hands the follower strap to `DebrisSystem::StrapBody` instead of
+> trading it for a `Fixed` joint, so a worn shell is a kinematic follower on a
+> corpse exactly as it is on a living creature (next section). A dressed corpse
+> now has the same bodies in the solver as a naked one, the same constraint
+> graph and the same mass, and `corpse-armor` asserts that directly — no shell
+> that is still a body may carry a joint — instead of only bounding what the
+> corpse did afterwards.
+>
+> **The nets below stay, and are still the reason the report was survivable.**
+> They are not made redundant by removing one motor: a rig can be fed by any
+> constraint, and "a body that SITS at its own clamp is being driven" is a true
+> statement about all of them. What changed is that the commonest source of one
+> is gone.
 
 **Why it costs minutes rather than merely looking silly.** Two multipliers that
 this document already records elsewhere. Every dynamic body is
@@ -3317,21 +3326,30 @@ one: the same fixture now measures 0.000 voxels and 0.06°.
   free), and the two agreed only while both bodies were kinematic — a limp host
   is placed by Jolt and a get-up host by a per-limb blend, and either is a
   garment floating off a shoulder.
-- **Death is the one transition where a garment becomes a body.** `Mob::Die`
-  creates the `Fixed` strap joints just before the limbs go to `DebrisSystem`,
-  anchored where the pair actually is, so a corpse still wears its armour. That
-  is the case the runaway nets above still cover.
-- **A shell that LEAVES stops being a follower** (`DetachLimb` clears
-  `wornHost`), and is ordinary debris from the end of its sever hold.
-- **What it costs:** a kinematic body has no mass in the solver, so an armoured
-  ragdoll tumbles with flesh inertia rather than with 489 kg of iron. Weight
-  still tells where it is authored to (`BodyMassKg` sums the shells, so a blast
-  launches a plated body far slower). Folding each shell's mass into its host's
-  mass properties is a separate change with its own gate.
-- **`SANDVOX_NO_RIGWELD=1`** is the A/B arm in one binary — jointed dynamic
-  shells and the per-body anti-tunnel clamp — for the same reason
-  `SANDVOX_NO_ANTITUNNEL` and `SANDVOX_NO_RUNAWAY_NET` exist. `ragdoll-dress`
-  reports both regimes' numbers side by side in `tests/baseline.json`.
+- **Death hands the strap over; it does not trade it for a constraint.**
+  `Mob::Die` records the shell/host pairs, and once both are `DebrisSystem`'s it
+  re-ties them there (`DebrisSystem::StrapBody`): the shell stays kinematic and
+  its pose is derived from its host's every `PostStep`, by the same rigid
+  offset, on the far side of the same read-back. **A garment is a follower in
+  every phase there is**, which is what makes "a corpse in armour behaves like a
+  corpse" a structural fact rather than a tuning result — the armour is not in
+  the solver, so it cannot change what the corpse does.
+  - A follower is not anti-tunnel-clamped and is not read back from Jolt (it
+    has no trajectory of its own), and it never settles back into the grid on
+    its own — a breastplate stamped into the world while the body inside it
+    went on tumbling is the failure that rule prevents.
+  - **When the host stops existing, the strap is cut** (`UnstrapBody`) and the
+    garment becomes ordinary dynamic debris carrying the velocity it was being
+    driven at — culled, looted, burned away, settled back, or dragged out of the
+    loot panel (`ShedCorpseLoot`, which cuts it explicitly: off the corpse has
+    to mean off it).
+  - A collider rebuild mints a new handle and the strap is keyed on handles, so
+    `CarryStrap` sits beside every `ReplaceBody` the way the joint re-target
+    does. Without it a plate came off the first time the limb under it lost
+    voxels to a sword or to fire.
+  - The strap is **saved** (`DBRS` version 3: host index + rigid offset). A
+    section that did not carry it reloaded an armoured corpse as a pile of free
+    bodies sharing the same space, which is the same motor by the other route.
 
 ### Carving living bodies (2026-08-20; `game/mob.cpp`, `MobSystem::CarveLimb*`)
 
