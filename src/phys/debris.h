@@ -154,6 +154,56 @@ class DebrisSystem {
   // False when no such body, or it has no blood.
   bool WoundBody(uint64_t handle, Vec3 woundW, float budget, int gushTicks);
 
+  // ---- A GARMENT ON A CORPSE IS A FOLLOWER, NOT A JOINTED BODY -------------
+  //
+  // `shell` stops being simulated and is teleported onto `host` at the rigid
+  // offset the two hold RIGHT NOW, every PostStep, for as long as both exist.
+  // Kinematic, so it has no mass, no gravity and no contact response of its
+  // own: the pair's dynamics are the HOST's dynamics, entire.
+  //
+  // WHY THIS EXISTS, stated where it is used rather than in a plan doc. A worn
+  // shell is geometrically INSIDE the limb it wraps, at an iron-against-flesh
+  // mass ratio. There are exactly three things two such bodies can be, and two
+  // of them are motors:
+  //   - roped together by a Fixed joint: a stiff constraint across a deep
+  //     overlap between very unequal masses is the textbook way to make a
+  //     sequential-impulse solver GAIN energy every step. This is what
+  //     Mob::Die used to build, and it is the armoured-corpse blow-up the
+  //     owner reported on 2026-09-13 (`corpse-armor`): every limb pinned at
+  //     Jolt's own 47.12 rad/s clamp, the rig flying apart while still
+  //     attached, then slowly hauled back together by the same joints.
+  //   - two free dynamic bodies sharing the same space: the solver resolves
+  //     the penetration by firing them apart.
+  //   - one body's pose DERIVED from the other's, which is this. The shell
+  //     contributes nothing to the solver at all, so an armoured corpse has
+  //     the same body count, the same constraint graph and the same mass as
+  //     the naked one — which is the property the gate asserts.
+  //
+  // It is the same relationship Mob::DriveWornShells maintains on a living
+  // creature (MobLimb::wornHost); death hands it over rather than trading it
+  // for a constraint, so a garment is a follower in EVERY phase and there is
+  // no transition at which the pair can gain energy. False when either handle
+  // is not an adopted body of this system.
+  bool StrapBody(uint64_t shell, uint64_t host);
+  // Cut one strap by handle: the body becomes ordinary dynamic debris, keeping
+  // the velocity it was being driven at. For the drag-out-of-the-loot-panel
+  // path (ShedCorpseLoot) — a plate pulled off a corpse has to fall off it, and
+  // "the body is already lying there" stops being true the moment the body is
+  // glued to the limb. False when there was no strap to cut.
+  bool UnstrapBody(uint64_t handle);
+  // The host a strapped body follows, or 0. For callers and for the gate: a
+  // shell body with a host is one the solver never sees.
+  uint64_t WornHostOf(uint64_t handle) const;
+  // APPENDS every follower of `host` to `out`. For the one caller that has to
+  // treat a piece and its gear as one set — the collision-group re-tie when a
+  // severed limb leaves its sever hold (Mob::TickSeveredHolds). Appends rather
+  // than assigns so the caller can seed the list with the host itself, which is
+  // the shape DisableCollisionsAmong wants.
+  void FollowersOf(uint64_t host, std::vector<uint64_t>& out) const;
+  // Followers currently being driven. A cheap standing assertion that the
+  // count matches what was dressed, and a probe for the corpse gates.
+  uint32_t StrappedCount() const;
+
   // TAKE A BODY OUT OF THE WORLD. Not damage and not a cull: the thing has
   // been picked up, and it stops existing as matter. Goes through the same
   // ReleaseBody every other disposal does, so the brick is freed and the
@@ -719,7 +769,12 @@ class DebrisSystem {
   // to the 16-bit coat word holding a MATERIAL. The lattices are written as
   // PODs, so the stride moved and a version-1 section would load garbage
   // coordinates — old sections are refused, as they already are.
-  static constexpr uint32_t kSaveVersion = 2;
+  //
+  // 3 (2026-09-13): the STRAP (StrapBody) — host index + rigid offset per body.
+  // A worn shell on a corpse is a follower of the limb it covers, and a section
+  // that did not carry the relationship reloaded an armoured corpse as a pile
+  // of free bodies sharing the same space, which is the motor by another route.
+  static constexpr uint32_t kSaveVersion = 3;
   void SaveState(std::vector<uint8_t>& out) const;
   // Contract (worldio LoadEntities): Reset() has already run.
   bool LoadState(const uint8_t* data, size_t len, uint32_t version);
@@ -833,6 +888,15 @@ class DebrisSystem {
     }
     uint32_t bleedMat = 0;       // nonzero => body bleeds when carved
     BodyWound wound;             // where, and how much (see BodyWound)
+    // ---- THE STRAP (StrapBody) ------------------------------------------
+    // Nonzero = this body is a FOLLOWER of that one: kinematic, pose derived
+    // every PostStep, invisible to the solver. `wornRel*` is its own frame
+    // expressed in the host's, captured once when the strap was tied, so the
+    // pair is rigid rather than re-fitted per tick.
+    uint64_t wornHost = 0;
+    Vec3 wornRelPos{};
+    float wornRelQuat[4] = {0, 0, 0, 1};
+    bool Follower() const { return wornHost != 0; }
     uint32_t inactiveTicks = 0;  // settle-back countdown (PLAN §B6)
     // Nonzero = one shard of a welded island (PLAN_rigidbody_islands.md §5):
     // every body sharing the id was cut from the same component and is joined
@@ -1012,6 +1076,21 @@ class DebrisSystem {
   // culled, settled, dissolved or split without freeing its brick leaks pool
   // words that nothing will ever reclaim, and the pool is a hard ceiling.
   void ReleaseBody(Body& b);
+  // Put every follower back on its host, LAST in PostStep — after the cull, so
+  // a host that left the window this tick is already gone and its garment
+  // unstraps instead of being driven off a dead handle, and after the readback,
+  // so the host transform it derives from is this tick's final one.
+  void DriveStraps();
+  // Cut one strap: the body becomes ordinary dynamic debris carrying the
+  // velocity it had as a follower (the rigid-body velocity at its own origin,
+  // so a pauldron whose shoulder was spinning leaves along the tangent). Called
+  // when the host stops existing — culled, settled back, burned away, looted.
+  void UnstrapBody(Body& b);
+  // A collider rebuild mints a new handle; the strap is keyed on handles. Call
+  // beside every `b.handle = nh` the way ReplaceBody is called beside it for
+  // joints — followers of `oldHandle` re-point, and a follower that was ITSELF
+  // rebuilt goes back to kinematic (ReplaceBody does not carry motion type).
+  void CarryStrap(uint64_t oldHandle, uint64_t newHandle);
   std::function<void(uint64_t)> onBodyGone_;
   // Settle-back (PLAN §B6): a long-asleep, near-axis-aligned body converts
   // its voxels to CellOps (fill-air-only: grid content wins deterministically
