@@ -806,18 +806,54 @@ void Overlay::Draw(UIState& s) {
         "Red wireframe on every voxel the CA wrote this tick. Filled\n"
         "GPU-side so there is no snapshot lag or stamp aliasing.\n"
         "Combine with F6 (dirty chunks) to see cause and effect.");
-  ImGui::Checkbox("wind field (F4)", &s.showWindField);
-  if (ImGui::IsItemHovered())
-    ImGui::SetTooltip(
-        "The ambient wind, drawn as an arrow per lattice point around you.\n"
-        "Colour is speed, cool to hot. It samples the SAME windAt() the grass\n"
-        "sway does, so what the arrows show is what the foliage is standing\n"
-        "in - turn the Wind tab's direction knob and both must swing together.\n"
-        "Arrows pointing at or away from you fade out: one aimed down the view\n"
-        "ray cannot show its direction anyway, so the hole is honest.\n"
-        "Spacing and radius are on the Wind tab (F5 to apply).\n"
-        "NOTE: F5 re-seeds this from wind.dbgWindField, so a reload turns it\n"
-        "back off unless the tuning file asks for it.");
+  // One radio row rather than two checkboxes, because the underlying state is
+  // one integer: F4 cycles off -> wind -> current and the panel is the same
+  // control by another route, so a pair of boxes would have to forbid the
+  // both-on combination that its own shape advertises.
+  //
+  // The tooltip describes all three states, so it hangs off EVERY widget in the
+  // row rather than off the last one — the reason to hover "off" is usually to
+  // find out what the other two would show.
+  static constexpr const char* kFieldVizTip =
+      "An arrow per lattice point around you, coloured by speed, cool to\n"
+      "hot. F4 cycles off -> wind -> current; only one is ever drawn,\n"
+      "because two overlapping lattices in one frame read as noise.\n"
+      "\n"
+      "WIND samples the SAME windAt() the grass sway does, so the arrows\n"
+      "show what the foliage is standing in - turn the Wind tab's direction\n"
+      "knob and both must swing together. Full scale is 24 m/s.\n"
+      "CURRENT samples the SAME currentAt() the waves advect with and\n"
+      "floating debris is dragged by, so the arrows show what is pushing a\n"
+      "raft. Full scale is 4 m/s - at a wind scale every current in the\n"
+      "world is one shade of blue.\n"
+      "\n"
+      "The current arrows do NOT need sim.currentMode: the render arm of the\n"
+      "field is always live (a renderer cannot write a voxel), so they show\n"
+      "the resolved primitives whether or not the sim is being pushed by\n"
+      "them. What they cannot show is a field with nothing in it - streams\n"
+      "and drains are seeded every tick, so a river has arrows and still\n"
+      "water is honestly empty.\n"
+      "\n"
+      "Arrows pointing at or away from you fade out: one aimed down the view\n"
+      "ray cannot show its direction anyway, so the hole is honest.\n"
+      "Spacing and radius are per field - Wind tab and render.dbgCurrent*\n"
+      "(F5 to apply).\n"
+      "NOTE: F5 re-seeds this from wind.dbgWindField / render.dbgCurrentField,\n"
+      "so a reload turns it back off unless the tuning file asks for it.";
+  const auto fieldVizTip = [&] {
+    if (ImGui::IsItemHovered()) ImGui::SetTooltip("%s", kFieldVizTip);
+  };
+  ImGui::TextUnformatted("vector field (F4)");
+  fieldVizTip();
+  ImGui::SameLine();
+  ImGui::RadioButton("off##fieldviz", &s.fieldViz, UIState::kFieldVizOff);
+  fieldVizTip();
+  ImGui::SameLine();
+  ImGui::RadioButton("wind##fieldviz", &s.fieldViz, UIState::kFieldVizWind);
+  fieldVizTip();
+  ImGui::SameLine();
+  ImGui::RadioButton("current##fieldviz", &s.fieldViz, UIState::kFieldVizCurrent);
+  fieldVizTip();
 
   // ---- wind force multipliers, one per tier -------------------------------
   // Live: these ride TickParams, so a drag lands on the next tick with no

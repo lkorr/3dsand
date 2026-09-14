@@ -8272,8 +8272,10 @@ capture belong on the tick input stream).
   wind instead of as one rocking object.
 - **The debug slope-field overlay** (`assets/shaders/debug_wind.wgsl`,
   `Simulation::DrawWindField`): an arrow per lattice point around the camera,
-  oriented and coloured by magnitude. **F4** in-game, `wind.dbgWindField` in the
-  tuner. Nothing is uploaded for it — the vertex shader derives each lattice
+  oriented and coloured by magnitude. **F4 cycles off → wind → current → off**
+  (`UIState::fieldViz`; the current arm is §9d.8), seeded from
+  `wind.dbgWindField` / `render.dbgCurrentField` at startup and on every F5.
+  Nothing is uploaded for it — the vertex shader derives each lattice
   point from its instance index and `R.camPos` — and it is skipped entirely when
   off rather than drawn transparent. It is a render draw, so it has no
   `pass_table.def` row: that table describes the sim's *compute* recording.
@@ -9227,6 +9229,22 @@ It is only EVIDENCE because it is the identical function. A visualiser with its
 own copy of the field would be a picture of a different current, agreeing with the
 world only until someone edited one of the two, and it would be exactly as
 convincing while wrong.
+
+**Reached in-game by F4**, which cycles off → wind → current → off rather than
+giving each field its own key. One cycle because the two fields are read by
+COMPARING them -- does the raft answer the air or the water? -- and because two
+arrow lattices composited into one frame read as noise, so only one is ever
+live. `UIState::fieldViz` holds the state; the headless draw path in `main.cpp`
+still reads `wind.dbgWindField` and `render.dbgCurrentField` directly, since it
+has no UIState and cannot press a key, and `FieldVizFromTuning` collapses that
+pair into the cycle's starting position (current wins a file asking for both).
+
+The current arm draws **regardless of `sim.currentMode`**, because
+`currentRenderOn` is its own always-on gate (§9c) -- so the overlay shows the
+resolved primitives whether or not the sim is being pushed by them. What it
+cannot show is a field with no primitives in it: `SeedStreams` and `SeedDrains`
+run every tick, so a world with rivers or draining bodies has arrows and a world
+with still water is honestly empty.
 
 ### 9d.9 What is NOT here
 

@@ -101,14 +101,23 @@ struct UIState {
   bool showCollisionBoxes = false;
   bool showDirtyChunks = false;
   bool showDirtyVoxels = false;
-  // Wind slope-field overlay (F4). An arrow per lattice point around the
-  // camera, oriented and coloured by the SAME windAt() the grass sway samples
-  // (docs/RESEARCH_wind.md §4.8) — which is what makes it evidence rather than
-  // decoration. Seeded from wind.dbgWindField on startup and on every tuning
-  // reload, so it is reachable from a saved tuning.json and from headless
-  // screenshot runs, neither of which can press a key. Free when off: the draw
-  // is skipped outright.
-  bool showWindField = false;
+  // Vector-field overlay (F4), a THREE-state cycle: off -> wind -> current.
+  // One key rather than two because the two fields answer the same question in
+  // the same picture and you almost always want to compare them, not composite
+  // them — two overlapping arrow lattices in one frame read as noise.
+  //
+  // Each state is an arrow per lattice point around the camera, oriented and
+  // coloured by the SAME field function the world itself samples — windAt() for
+  // the grass sway (docs/RESEARCH_wind.md §4.8), currentAt() for the wave
+  // advection and floating debris (DESIGN.md §9d.8). That identity is what
+  // makes either one evidence rather than decoration.
+  //
+  // Seeded from wind.dbgWindField / render.dbgCurrentField on startup and on
+  // every tuning reload, so both are reachable from a saved tuning.json and
+  // from headless screenshot runs, neither of which can press a key. Free when
+  // off: the draw is skipped outright.
+  enum FieldViz : int { kFieldVizOff = 0, kFieldVizWind = 1, kFieldVizCurrent = 2, kFieldVizCount = 3 };
+  int fieldViz = kFieldVizOff;
   // ---- dev wind force multipliers, one per TIER ----
   // Mirrors sim.windGasScale / sim.windPartScale. They ride TickParams as Q8
   // integers rather than being const-folded into the shaders, which is what

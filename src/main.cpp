@@ -91,6 +91,19 @@ namespace {
 // expires on its own TTL; the panel has no business reaching into gameplay.
 constexpr uint64_t kDevFanOwner = 0xDEFA11Au;
 
+// ---- F4's authored starting point -------------------------------------------
+// The overlay cycle is one integer but the tuning file has two independent
+// bools, one per field, because each is also read on its own by the HEADLESS
+// draw path (which has no UIState and cannot press a key). This collapses the
+// pair into the cycle's state, and the current field wins a file that asks for
+// both — a frame holding two arrow lattices at once is the thing the cycle
+// exists to avoid.
+int FieldVizFromTuning(const Tuning& t) {
+  if (t.render.dbgCurrentField) return UIState::kFieldVizCurrent;
+  if (t.wind.dbgWindField) return UIState::kFieldVizWind;
+  return UIState::kFieldVizOff;
+}
+
 // ---- the scroll wheel -------------------------------------------------------
 // GLFW callbacks are C function pointers, so the accumulator is file-scope.
 // ACCUMULATED rather than sampled, because scroll arrives as discrete events
@@ -4522,11 +4535,11 @@ int main(int argc, char** argv) {
   StartupMark("imgui overlay + audio");
 
   UIState ui;
-  // The wind overlay's authored initial state (F4 toggles from here). Seeded
+  // The field overlay's authored initial state (F4 cycles from here). Seeded
   // rather than defaulted so a tuning.json that asks for the arrows gets them
   // without a keypress — which is what makes the overlay reachable from a
   // headless run.
-  ui.showWindField = CurrentTuning().wind.dbgWindField;
+  ui.fieldViz = FieldVizFromTuning(CurrentTuning());
   // Same idea for short range: `--short-range` / SANDVOX_SHORT_RANGE set the
   // checkbox's starting position, and from here the checkbox is the authority
   // (the frame loop re-asserts it into SetShortRange every frame). Without
@@ -5625,11 +5638,16 @@ int main(int argc, char** argv) {
     if (devKeys && eF1.Pressed(key(GLFW_KEY_F1))) ui.visible = !ui.visible;
     if (devKeys && eF3.Pressed(key(GLFW_KEY_F3)))
       ui.showCollisionBoxes = !ui.showCollisionBoxes;
-    // F4: the wind slope-field arrows (docs/RESEARCH_wind.md §4.8). Beside F3
-    // because the two are the same kind of thing — a debug view of something
-    // the world is doing invisibly — and free when off either way.
+    // F4 CYCLES the vector-field arrows: off -> wind (RESEARCH_wind.md §4.8)
+    // -> water current (DESIGN.md §9d.8) -> off. Beside F3 because all of them
+    // are the same kind of thing — a debug view of something the world is doing
+    // invisibly — and free when off, since each draw is skipped at zero arrows.
+    //
+    // A cycle rather than two keys: the two fields are read by comparing them
+    // (does the raft answer the wind or the water?), and drawing both lattices
+    // into one frame is unreadable, so only one is ever live.
     if (devKeys && eF4.Pressed(key(GLFW_KEY_F4)))
-      ui.showWindField = !ui.showWindField;
+      ui.fieldViz = (ui.fieldViz + 1) % UIState::kFieldVizCount;
     if (devKeys && eF5.Pressed(key(GLFW_KEY_F5))) ui.reloadShaders = true;
     if (devKeys && eF6.Pressed(key(GLFW_KEY_F6)))
       ui.showDirtyChunks = !ui.showDirtyChunks;
@@ -6091,11 +6109,11 @@ int main(int argc, char** argv) {
           ui.fDensityShade = fr.fluidDensityShade;
         }
         avatarDefName = CurrentTuning().player.model;
-        // The wind overlay is reachable two ways and F5 is where they meet:
-        // the tuning bool is the authored state and F4 toggles from there, so
-        // reloading re-seeds the toggle rather than leaving the key and the
-        // file quietly disagreeing about whether the arrows are on.
-        ui.showWindField = CurrentTuning().wind.dbgWindField;
+        // The field overlay is reachable two ways and F5 is where they meet:
+        // the tuning bools are the authored state and F4 cycles from there, so
+        // reloading re-seeds the cycle rather than leaving the key and the
+        // file quietly disagreeing about which arrows are on.
+        ui.fieldViz = FieldVizFromTuning(CurrentTuning());
         // Gore variance is drawn per mob at spawn, so mobs already standing in
         // the world hold profiles from the OLD tuning. Re-draw them here or an
         // edit to the randomness controls appears to do nothing until the next
@@ -10590,15 +10608,15 @@ int main(int argc, char** argv) {
       {
         const LiveSpan sp = spanBegin("rm_debug");
         sim.DrawDebugBoxes(rp, debugBoxCount);
-        // Wind arrows LAST of the world draws so they composite over
+        // Field arrows LAST of the world draws so they composite over
         // everything they annotate. Nothing is uploaded for them — the count
         // is the only CPU work, and at zero the draw is skipped outright
         // (rule 2's shape, applied to a debug view: off is not "cheap", it is
-        // nothing).
-        sim.DrawWindField(rp, ui.showWindField
+        // nothing). F4's cycle means at most ONE of these two is ever nonzero.
+        sim.DrawWindField(rp, ui.fieldViz == UIState::kFieldVizWind
                                   ? WindDebugArrowCount(CurrentTuning())
                                   : 0u);
-        sim.DrawCurrentField(rp, CurrentTuning().render.dbgCurrentField
+        sim.DrawCurrentField(rp, ui.fieldViz == UIState::kFieldVizCurrent
                                      ? CurrentDebugArrowCount()
                                      : 0u);
         spanEnd(sp);
