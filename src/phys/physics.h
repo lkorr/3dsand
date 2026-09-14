@@ -58,12 +58,14 @@ struct DebrisVoxel {
   int8_t x, y, z;
   uint8_t color = 0;
   uint16_t payload;  // material | state<<12
-  // Body stain byte, same encoding as PrefabVoxel::stain (sim/voxload.h
-  // BodyStain*): amount in the low nibble, stain type above it. The one field
-  // that grew the struct (6 -> 8 bytes with alignment), and it is here rather
-  // than folded into `payload`'s state nibble because that nibble is what a
-  // carved voxel takes into the grid as a liquid's fullness.
-  uint8_t stain = 0;
+  // Body coat word, same encoding as PrefabVoxel::stain (sim/voxload.h
+  // BodyStain*): the MATERIAL on this voxel in bits 0..11, how much of it in
+  // bits 12..15. The one field that grew the struct (6 -> 8 bytes with
+  // alignment; widening it from a byte to the coat word costs nothing, since
+  // the byte was followed by a byte of padding), and it is here rather than
+  // folded into `payload`'s state nibble because that nibble is what a carved
+  // voxel takes into the grid as a liquid's fullness.
+  uint16_t stain = 0;
 };
 
 // One sub-shape of a compound collider, in body-local VOXEL coordinates.
@@ -234,6 +236,16 @@ class Physics {
   // DebrisSystem::UntunnelBody, which is undoing a step that ended somewhere
   // no collider could have stopped it. Returns false if the handle is dead.
   bool SetBodyPosition(uint64_t handle, Vec3 posVoxel);
+
+  // Teleport a body's POSITION AND ROTATION, keeping both velocities. Same
+  // "skips collision" caveat as SetBodyPosition, and the same reason to exist:
+  // a body whose pose is DERIVED from another body's has no pose of its own to
+  // solve for. Mob::DriveWornShells uses it to put a garment exactly on the
+  // limb it is strapped to, every tick — MoveKinematicBody could not, because
+  // it aims a body at a pose it reaches at the END of the next step, and one
+  // tick of lag on a limb falling at 40 m/s is four voxels of daylight between
+  // a hood and the head inside it.
+  bool SetBodyTransform(uint64_t handle, Vec3 posVoxel, const float quat[4]);
 
   // Move a body onto (or off) the PLAYER-AVATAR collision layer. Bodies there
   // behave exactly like normal dynamic bodies except that they never generate

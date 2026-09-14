@@ -297,6 +297,12 @@ const char* const kOrder[] = {
     // regenerates the world on both the way in and the way out, so it is
     // order-independent past that.
     "ragdoll-falldamage",
+    // ...and the dressed one, last in the group for the reason the AI gates
+    // give. Same self-contained shape again — resets mobs + debris and
+    // regenerates worldgen on the way in and the way out — but it also WEARS
+    // every item in the library, and a gate that equips things perturbs the
+    // id-keyed draws of anything after it, so it goes after the two that do not.
+    "ragdoll-dress",
     // ---- THE WOUND MODEL ---------------------------------------------------
     // LAST of the mob gates, and the position is a lesson rather than a
     // preference.
@@ -358,6 +364,12 @@ const char* const kOrder[] = {
     // on contact and water rinses it (owner report 2026-09-13). Ticks the
     // world for the last two and regenerates it on the way out.
     "body-stain",
+    // ...and what landed there is a SUBSTANCE, not a colour: the per-limb coat
+    // ledger names the material, it dries at that material's own authored rate
+    // (and does not at the default one), and a coat can be tracked back onto
+    // the ground through the ordinary particle path. Same room fixture as
+    // body-stain, same world regeneration on the way out.
+    "body-coat",
     // ...and a blast bloodies the HOLE IT MADE and nothing else: a limb the
     // crater took no voxel from stays clean, and the limb it did hit gets a
     // chip's worth of blood rather than a repainted surface (owner report

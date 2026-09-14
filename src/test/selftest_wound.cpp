@@ -2338,7 +2338,6 @@ Status GateBodyStain(Ctx& c, std::string& detail) {
   }
   const MobDef& def = mobs.Defs()[t.defIndex];
   const int root = def.rootLimb;
-  const uint32_t bloodType = mobs.StainTypeOf(mBlood);
 
   // One real tick with liquid written round the creature: PreTick, the box,
   // the sim, the physics. Shared by the shallow pool and the two floods. The
@@ -2461,7 +2460,7 @@ Status GateBodyStain(Ctx& c, std::string& detail) {
     ev.speed = 3.5f;
     ev.life = 70;
     ev.count = 24;
-    ev.type = bloodType;
+    ev.mat = mBlood;
     ev.amount = 6;
     ev.tick = 29900u;
     ev.seed = 0xD1E7u;
@@ -2540,7 +2539,7 @@ Status GateBodyStain(Ctx& c, std::string& detail) {
     ev.speed = MetresToCells(6.0f);
     ev.life = 70;
     ev.count = 24;
-    ev.type = bloodType;
+    ev.mat = mBlood;
     ev.amount = 6;
     ev.tick = 30000u;
     ev.seed = 0x5B1A7u;
@@ -2623,6 +2622,417 @@ Status GateBodyStain(Ctx& c, std::string& detail) {
       stainBefore, stainCut,
       boneStained, boneExposed, boneMinFrac * 100.0, root >= 0 ? "root" : "-",
       rootBefore, rootSplashed, queuedByWound, pooled, washed, washFrac * 100.0);
+  return ok ? Status::Pass : Status::Fail;
+}
+
+// ---------------------------------------------------------------------------
+// body-coat: what is ON a body is a SUBSTANCE, and it behaves like one
+// ---------------------------------------------------------------------------
+//
+// `body-stain` proves blood ARRIVES on a creature. This proves it is a
+// material once it is there, which is the whole of what the coat word bought
+// (a 3-bit palette slot could say "blood" but never WHICH blood, so nothing
+// could look the substance up).
+//
+// Three claims, one fixture — the sealed stone room body-stain uses, for the
+// same reason: a flat known floor with nothing that can flow, sink or fall.
+//   * THE LEDGER NAMES THE SUBSTANCE. After a deep cut, the limb's coat ledger
+//     (mob.h LimbCoat) names the creature's own blood as its heaviest coat,
+//     the body's ledger sums to at least that limb's, and a tag no material
+//     declares reads exactly zero.
+//   * IT DRIES AT THE MATERIAL'S OWN RATE. Blood authors coat.decay 20 s per
+//     level, so at the default scale a cut is still bloody a hundred ticks
+//     later; at a scale that makes the period two ticks it walks itself clean.
+//     Both arms run on the SAME cut, decay-off first, so the second is
+//     measured against a number the first proved is stable.
+//   * A COAT CAN GO BACK ON THE GROUND. Mob::DepositCoat puts one micro
+//     droplet of the substance inside a floor cell; the ordinary particle
+//     kernel resolves it into that cell's stain bits, so a tracked footprint
+//     is a real world stain and not a second mechanism.
+//   * ...AND A FOOTFALL IS WHAT SPENDS IT. Mob::ShedCoat, at the plant, puts
+//     that deposit under the sole and takes the same amount OFF the foot: the
+//     floor gains blood it did not have and the limb's ledger falls. Both
+//     halves, because a print that only adds is a duplicator (rule 2) and one
+//     that only subtracts is a leak.
+Status GateBodyCoat(Ctx& c, std::string& detail) {
+  MobSystem& mobs = c.mobs;
+  IdCounterScope idScope(mobs);
+  PrepareWorld(c);
+  constexpr int kInset = 300;
+  const Target t = ChooseTarget(mobs, FixtureSite(c.world, kInset));
+  if (!t.valid()) {
+    detail = "no loaded mob def has a severable non-vital limb that bleeds";
+    return Status::Fail;
+  }
+  uint32_t mStone = 0, mBlood = 0;
+  for (size_t i = 0; i < c.mats.size(); i++) {
+    if (c.mats[i].name == "stone") mStone = (uint32_t)i;
+    if (c.mats[i].name == "blood") mBlood = (uint32_t)i;
+  }
+
+  // THE ROOM, exactly as body-stain builds it (and the long note there is the
+  // argument for every part of it, including why it is written a few ticks
+  // after PrepareWorld rather than on the tick right after).
+  const IVec3 site0 = FixtureSite(c.world, kInset);
+  const IVec3 roomChunk{site0.x >> 4, site0.y >> 4, site0.z >> 4};
+  constexpr int kRoomHalf = 9, kRoomUp = 24;
+  auto bareTick = [&](uint32_t tick, std::vector<CellOp>& cellOps) {
+    std::vector<BrushOp> ops;
+    std::vector<ParticleSpawn> spawns;
+    SubmitTick(c.ctx, c.world, c.sim, tick, kDefaultSeed, ops, {}, cellOps, false,
+               roomChunk, true, false, spawns);
+    c.ctx.WaitIdle();
+    c.ctx.ProcessEvents();
+  };
+  if (mStone) {
+    {
+      std::vector<CellOp> none;
+      for (uint32_t k = 0; k < 6; k++) bareTick(33990u + k, none);
+    }
+    std::vector<CellOp> cellOps;
+    for (int dz = -kRoomHalf; dz <= kRoomHalf; dz++)
+      for (int dx = -kRoomHalf; dx <= kRoomHalf; dx++)
+        for (int dy = -3; dy <= kRoomUp + 1; dy++) {
+          const IVec3 cc{site0.x + dx, site0.y + dy, site0.z + dz};
+          if (!c.world.CellInWindow(cc)) continue;
+          if (cellOps.size() >= kMaxCellOpsPerTick) break;
+          const bool shell = dy < 0 || dy > kRoomUp ||
+                             std::max(std::abs(dx), std::abs(dz)) == kRoomHalf;
+          cellOps.push_back({World::SlotCellIndex(cc),
+                             shell ? PackVoxNew(mStone, 0u) : 0u});
+        }
+    bareTick(33997u, cellOps);
+    std::vector<CellOp> none;
+    bareTick(33998u, none);
+  }
+
+  IVec3 pchunk{};
+  const uint64_t id = SpawnTarget(c, t, kInset, pchunk);
+  if (!id) {
+    detail = "spawn refused";
+    return Status::Fail;
+  }
+  // Pinned, for body-stain's reason: every claim is about a creature standing
+  // where the fixture put it.
+  const bool pinned = mobs.SetMobBehavior(id, "dummy");
+  const MobDef& def = mobs.Defs()[t.defIndex];
+  const int root = def.rootLimb;
+  // The substance the cut smear is MADE of, resolved the way Mob::StainWound
+  // resolves it, so the ledger claim is about the rule and not about a name.
+  const uint32_t coatMat =
+      mobs.StainTypeOf(def.woundMat) ? def.woundMat : def.bleedMat;
+
+  // ONE MONOTONIC TICK COUNTER for the whole gate, and it is load-bearing
+  // rather than tidy: the drying rule fires on `tick % period == 0` and the
+  // splatter queue retires on `e.tick + 1 < tick`, so a phase that stepped the
+  // clock backwards (which several gates here do, harmlessly, because nothing
+  // they test reads the tick) would both mis-time the control arm and strand
+  // spent bursts in a 64-entry queue.
+  uint32_t simTick = 34000;
+  // A tick with no world submit: the pose, the bleed, the stain pass and — at
+  // its tail — the coat ledger and the drying sweep. Everything below except
+  // the deposit is measured through this.
+  auto poseTick = [&]() {
+    ++simTick;
+    std::vector<BrushOp> ops;
+    std::vector<ParticleSpawn> spawns;
+    std::vector<CellOp> cellOps;
+    mobs.PreTick(simTick, c.world, ops, cellOps, spawns);
+    c.phys.Step(kTickDt);
+    mobs.PostStep();
+  };
+  // A tick that DOES submit, for the deposit (the particle kernel has to run).
+  auto worldTick = [&]() {
+    std::vector<BrushOp> ops;
+    std::vector<ParticleSpawn> spawns;
+    std::vector<CellOp> cellOps;
+    mobs.PreTick(simTick + 1, c.world, ops, cellOps, spawns);
+    c.debris.QueueSupportEvents(c.world.Snap());
+    c.debris.PreTick(simTick + 1, c.world, cellOps, spawns);
+    ++simTick;
+    IVec3 centre = pchunk;
+    if (root >= 0 && mobs.LimbBody(id, root)) {
+      const Vec3 at = mobs.LimbVoxelPos(id, root, 0);
+      centre = IVec3{ifloor(at.x) >> 4, ifloor(at.y) >> 4, ifloor(at.z) >> 4};
+    }
+    SubmitTick(c.ctx, c.world, c.sim, simTick, kDefaultSeed, ops, {}, cellOps,
+               false, centre, true, false, spawns);
+    c.ctx.WaitIdle();
+    c.ctx.ProcessEvents();
+    c.phys.Step(kTickDt);
+    c.debris.PostStep();
+    mobs.PostStep();
+  };
+  for (int i = 0; i < 20; i++) worldTick();  // let it find the floor
+
+  // ---- 1. the cut, and the ledger it leaves --------------------------------
+  const LimbAxis ax = MeasureLimb(mobs, id, t.limb);
+  bool hit = false;
+  {
+    std::vector<ParticleSpawn> spawns;
+    hit = CutOnce(mobs, c.world, id, t.limb, ax, ax.reach * 0.5f, 0.9f, 1.0f,
+                  0x5C0A7u, spawns);
+  }
+  poseTick();  // the first recount runs the moment anything is dirty
+  const bool attached = mobs.LimbBody(id, t.limb) != 0;
+  LimbCoat limbLedger{}, bodyLedger{};
+  if (const LimbCoat* lc = mobs.LimbCoatOf(id, t.limb)) limbLedger = *lc;
+  bodyLedger = mobs.BodyCoat(id);
+  const float noSuchTag = mobs.CoatTagFraction(id, "nonexistent", nullptr);
+  const bool ledgerOk = hit && attached && coatMat != 0 &&
+                        limbLedger.top[0].mat == coatMat &&
+                        limbLedger.Frac() > 0.0f &&
+                        bodyLedger.sumAmt >= limbLedger.sumAmt &&
+                        noSuchTag == 0.0f;
+
+  // ---- 2. it does NOT dry at the authored rate over a hundred ticks --------
+  // Blood is 20 s per level, i.e. a 600-tick period at the shipped scale, and
+  // the window below must not CONTAIN a multiple of 600 — a legitimate decay
+  // sweep landing inside the control arm would be the rule working and the arm
+  // still has to be flat. The counter is at 34021 here and 34200 is the next
+  // multiple, so 150 ticks clear it; the assertion after it is what would
+  // catch this drifting.
+  const uint32_t cutStain = mobs.LimbStainCount(id, t.limb, 1);
+  const uint32_t holdFrom = simTick;
+  constexpr uint32_t kHoldTicks = 150;
+  for (uint32_t i = 0; i < kHoldTicks && mobs.LimbBody(id, t.limb); i++)
+    poseTick();
+  const bool holdWindowClean = (holdFrom / 600u) == (simTick / 600u);
+  const uint32_t heldStain =
+      mobs.LimbBody(id, t.limb) ? mobs.LimbStainCount(id, t.limb, 1) : 0u;
+  const double holdMin = BaselineNumber("bodyCoatHoldMinFraction", 0.9);
+  const bool holdOk = cutStain > 0 && holdWindowClean &&
+                      (double)heldStain >= holdMin * (double)cutStain;
+
+  // ---- 3. and a coat can be put back on the ground -------------------------
+  // BEFORE the drying arm, not after: that arm runs hundreds of ticks with an
+  // open wound, and a creature that bled out in the middle of it would take
+  // the deposit claim down with it for no reason of its own.
+  //
+  // The floor of the room is stone three deep, so this cell is a solid the
+  // fixture itself wrote and its material is known without a survey.
+  const IVec3 floorCell{site0.x + 3, site0.y - 1, site0.z + 3};
+  uint32_t depBefore = 0, depAfter = 0;
+  bool queued = false;
+  if (mStone && mBlood && c.world.CellInWindow(floorCell)) {
+    const IVec3 cc{floorCell.x >> 4, floorCell.y >> 4, floorCell.z >> 4};
+    const uint32_t at =
+        ((uint32_t)(floorCell.z & 15) * kChunk + (uint32_t)(floorCell.y & 15)) *
+            kChunk + (uint32_t)(floorCell.x & 15);
+    std::vector<uint32_t> chunk(kChunkVol, 0);
+    ReadVoxelsSync(c.ctx, c.world, World::SlotChunkIndex(cc), 1, chunk.data(),
+                   "coatFloorPre");
+    depBefore = chunk[at];
+    queued = mobs.DepositCoatOn(id, mBlood, floorCell, simTick);
+    // Three: the spawn is drained by the NEXT PreTick, the kernel appends it,
+    // and integrate/resolve get their turn. Slack rather than a fence.
+    for (int i = 0; i < 3; i++) worldTick();
+    ReadVoxelsSync(c.ctx, c.world, World::SlotChunkIndex(cc), 1, chunk.data(),
+                   "coatFloorPost");
+    depAfter = chunk[at];
+  }
+  const bool depositOk = queued && (depBefore & 0xFFFu) == mStone &&
+                         (depAfter & 0xFFFu) == mStone &&
+                         VoxStainType(depAfter) == mobs.StainTypeOf(mBlood) &&
+                         VoxStainAmt(depAfter) > 0;
+
+  // ---- 3b. A BLOODY FOOT LEAVES A PRINT WHERE IT LANDS (P2) ----------------
+  // The claim above proves the DEPOSIT. This proves the FOOTFALL: the plant
+  // itself moves the substance off the sole and onto the cells the sole
+  // covers. Two halves, because either alone is satisfiable by a bug —
+  //   * the floor under the foot gains blood it did NOT have before the plant
+  //     (measured as a delta, because the cut limb has been dripping onto this
+  //     floor for 150 ticks and a bare "is there blood here" reads yes), and
+  //   * the foot's own ledger sums to LESS afterwards. A print that only adds
+  //     is a duplicator, and an infinite one — a creature would paint the
+  //     whole map from one wound (rule 2).
+  //
+  // BEFORE the drying arm, for claim 3's reason: that arm runs hundreds of
+  // ticks with an open wound and may end with a corpse.
+  //
+  // The foot is bloodied through MobSystem::SoakLimb rather than by cutting
+  // it, so this phase has NO other consequence: no wound, no bleed, no
+  // splatter onto the limb claims 2 and 4 are measured on.
+  int footLimb = -1;
+  for (size_t li = 0; li < def.limbs.size() && footLimb < 0; li++)
+    if (def.limbs[li].tag == "foot" && mobs.LimbBody(id, (int)li))
+      footLimb = (int)li;
+  for (size_t li = 0; li < def.limbs.size() && footLimb < 0; li++)
+    if (def.limbs[li].tag == "leg" && mobs.LimbBody(id, (int)li))
+      footLimb = (int)li;
+  if (footLimb < 0) {  // untagged rig: the limb whose live pose sits lowest
+    float best = 1e30f;
+    for (size_t li = 0; li < def.limbs.size(); li++) {
+      float lo = 0.0f, hi = 0.0f;
+      if (mobs.LimbBody(id, (int)li) &&
+          mobs.LimbStainWorldYRange(id, (int)li, 0, lo, hi) && lo < best) {
+        best = lo;
+        footLimb = (int)li;
+      }
+    }
+  }
+  std::string footName = footLimb >= 0 ? def.limbs[footLimb].name : "-";
+  uint32_t footPainted = 0, shedDroplets = 0, shedTries = 0;
+  uint32_t footSumPainted = 0, footSumBefore = 0, footSumAfter = 0;
+  uint32_t printCells = 0, printAmt = 0;
+  int printY = 0;
+  if (footLimb >= 0 && mBlood) {
+    footPainted = mobs.SoakLimb(id, footLimb, mBlood, kBodyStainAmtMax, simTick);
+    if (const LimbCoat* lc = mobs.LimbCoatOf(id, footLimb))
+      footSumPainted = lc->sumAmt;
+    const Vec3 footAt = mobs.LimbVoxelPos(id, footLimb, 0);
+    // The cells the print can land in: the sole's 3x3 column footprint on the
+    // topmost SOLID cell under the foot. Found through the CPU mirror because
+    // that is the same picture Mob::GroundHeightAt reads inside ShedCoat, so
+    // this is the set of cells the shed could have chosen and not a guess.
+    auto mirrorWord = [&](IVec3 cc) -> uint32_t {
+      const CachedChunk* k =
+          c.world.Cached(IVec3{cc.x >> 4, cc.y >> 4, cc.z >> 4});
+      if (!k || k->voxels.size() != kChunkVol) return 0u;
+      return k->voxels[(((uint32_t)cc.z & 15u) * kChunk +
+                        ((uint32_t)cc.y & 15u)) * kChunk +
+                       ((uint32_t)cc.x & 15u)];
+    };
+    const int fx = ifloor(footAt.x), fz = ifloor(footAt.z);
+    printY = INT32_MIN;
+    for (int dy = 2; dy >= -4; dy--) {
+      const IVec3 cc{fx, ifloor(footAt.y) + dy, fz};
+      if (!c.world.CellInWindow(cc)) continue;
+      if ((mirrorWord(cc) & 0xFFFu) != 0u) { printY = cc.y; break; }
+    }
+    std::vector<IVec3> cells;
+    if (printY != INT32_MIN)
+      for (int dz = -1; dz <= 1; dz++)
+        for (int dx = -1; dx <= 1; dx++) {
+          const IVec3 cc{fx + dx, printY, fz + dz};
+          if (c.world.CellInWindow(cc)) cells.push_back(cc);
+        }
+    // Authoritative words for those cells, one readback per distinct chunk
+    // (a 3x3 column straddles at most four).
+    std::vector<uint32_t> chunk(kChunkVol, 0);
+    auto readCells = [&](std::vector<uint32_t>& out) {
+      out.assign(cells.size(), 0u);
+      std::vector<IVec3> done;
+      for (size_t i = 0; i < cells.size(); i++) {
+        const IVec3 ch{cells[i].x >> 4, cells[i].y >> 4, cells[i].z >> 4};
+        bool have = !done.empty() && done.back().x == ch.x &&
+                    done.back().y == ch.y && done.back().z == ch.z;
+        if (!have) {
+          ReadVoxelsSync(c.ctx, c.world, World::SlotChunkIndex(ch), 1,
+                         chunk.data(), "coatPrint");
+          done.assign(1, ch);
+        }
+        out[i] = chunk[(((uint32_t)cells[i].z & 15u) * kChunk +
+                        ((uint32_t)cells[i].y & 15u)) * kChunk +
+                       ((uint32_t)cells[i].x & 15u)];
+      }
+    };
+    std::vector<uint32_t> before, after;
+    readCells(before);
+    // THE ROLL IS PER MILLE AND PER TICK, so a single plant can legitimately
+    // print nothing (blood sheds at 400). Up to eight plants, one per tick,
+    // and the gate stops at the first that puts something down — the same
+    // thing a walk does, at a pace no faster than a real one.
+    for (; shedTries < 8 && shedDroplets == 0; shedTries++) {
+      // The ledger is re-read on EVERY attempt, so the before/after pair
+      // brackets the successful plant alone: the drying sweep also takes
+      // levels off, and a delta measured across the whole loop would credit
+      // the footfall with whatever evaporated while it was rolling.
+      mobs.RecountCoatOn(id, simTick);
+      if (const LimbCoat* lc = mobs.LimbCoatOf(id, footLimb))
+        footSumBefore = lc->sumAmt;
+      shedDroplets = mobs.ShedCoatOn(id, footLimb, footAt, simTick, c.world);
+      if (shedDroplets == 0) worldTick();
+    }
+    // Read the ledger back BEFORE any further tick: the drying sweep also
+    // takes levels off, and this half of the claim is about the plant.
+    mobs.RecountCoatOn(id, simTick);
+    if (const LimbCoat* lc = mobs.LimbCoatOf(id, footLimb))
+      footSumAfter = lc->sumAmt;
+    // Three ticks, for claim 3's reason: drain, append, integrate + resolve.
+    for (int i = 0; i < 3; i++) worldTick();
+    readCells(after);
+    const uint32_t bloodType = mobs.StainTypeOf(mBlood);
+    for (size_t i = 0; i < cells.size(); i++) {
+      const bool wasBlood =
+          VoxStainType(before[i]) == bloodType && VoxStainAmt(before[i]) > 0;
+      const bool isBlood =
+          VoxStainType(after[i]) == bloodType && VoxStainAmt(after[i]) > 0;
+      if (isBlood && (!wasBlood || VoxStainAmt(after[i]) > VoxStainAmt(before[i]))) {
+        printCells++;
+        printAmt += VoxStainAmt(after[i]);
+      }
+    }
+  }
+  const bool printOk = footLimb >= 0 && footPainted > 0 && shedDroplets > 0 &&
+                       printCells > 0 && footSumAfter < footSumBefore;
+
+  // ---- 4. ...and at a scale that makes the period two ticks, it DOES dry ---
+  // decayScale DIVIDES the authored seconds, so 300 turns blood's 20 s per
+  // level into 2 ticks. Restored below whatever happens: tuning is global.
+  // Measured against `heldStain` — the number the control arm above just
+  // proved is stable — so the two arms share one denominator.
+  const Tuning savedTune = CurrentTuning();
+  {
+    Tuning fast = savedTune;
+    fast.coat.decayScale = 300.0f;  // 20 s / 300 = 2 ticks per amount level
+    SetCurrentTuning(fast);
+  }
+  constexpr uint32_t kDecayCap = 400;
+  const double decayMax = BaselineNumber("bodyCoatDecayMaxFraction", 0.1);
+  uint32_t decayedStain = mobs.LimbBody(id, t.limb)
+                              ? mobs.LimbStainCount(id, t.limb, 1) : 0u;
+  uint32_t ranTicks = 0;
+  for (; ranTicks < kDecayCap && mobs.LimbBody(id, t.limb); ranTicks++) {
+    poseTick();
+    decayedStain = mobs.LimbStainCount(id, t.limb, 1);
+    if ((double)decayedStain <= decayMax * (double)heldStain) break;
+  }
+  SetCurrentTuning(savedTune);
+  const bool decayOk =
+      heldStain > 0 && (double)decayedStain <= decayMax * (double)heldStain;
+
+  RecordObserved("bodyCoatLimbFrac", (double)limbLedger.Frac());
+  RecordObserved("bodyCoatLimbSum", (double)limbLedger.sumAmt);
+  RecordObserved("bodyCoatBodySum", (double)bodyLedger.sumAmt);
+  RecordObserved("bodyCoatCutStained", (double)cutStain);
+  RecordObserved("bodyCoatHeldStained", (double)heldStain);
+  RecordObserved("bodyCoatDecayedStained", (double)decayedStain);
+  RecordObserved("bodyCoatDecayTicks", (double)ranTicks);
+  RecordObserved("bodyCoatDepositAmount", (double)VoxStainAmt(depAfter));
+  RecordObserved("bodyCoatFootPainted", (double)footPainted);
+  RecordObserved("bodyCoatShedTries", (double)shedTries);
+  RecordObserved("bodyCoatShedDroplets", (double)shedDroplets);
+  RecordObserved("bodyCoatPrintCells", (double)printCells);
+  RecordObserved("bodyCoatPrintAmount", (double)printAmt);
+  RecordObserved("bodyCoatFootSumBefore", (double)footSumBefore);
+  RecordObserved("bodyCoatFootSumAfter", (double)footSumAfter);
+
+  mobs.Reset();
+  c.debris.Reset();
+  SubmitWorldgen(c.ctx, c.world, c.sim, kDefaultSeed);
+  c.ctx.WaitIdle();
+
+  const bool ok = ledgerOk && holdOk && decayOk && depositOk && printOk;
+  detail = Format(
+      "%s/%s%s: ledger top = mat %u (want %u, blood %u) over %u voxels, "
+      "frac %.4f, body sum %u >= limb sum %u, unknown tag %.2f; "
+      "stained %u -> %u over %u ticks at the authored 20 s/level%s "
+      "(floor %.0f%%), then -> %u over %u ticks at 2 ticks/level "
+      "(cap %.0f%%); deposit %s on stone at (%d,%d,%d): word %08x -> %08x, "
+      "stain type %u amount %u; footfall on %s: %u voxels soaked (ledger %u), "
+      "%u droplet(s) down after %u plant(s), %u floor cell(s) at y%d newly "
+      "bloodied (amount %u), sole ledger %u -> %u",
+      t.defName.c_str(), t.limbName.c_str(), pinned ? "" : " (NOT pinned)",
+      limbLedger.top[0].mat, coatMat, mBlood, limbLedger.voxels,
+      (double)limbLedger.Frac(), bodyLedger.sumAmt, limbLedger.sumAmt,
+      (double)noSuchTag, cutStain, heldStain, kHoldTicks,
+      holdWindowClean ? "" : " (WINDOW CROSSED A DECAY PERIOD)", holdMin * 100.0,
+      decayedStain, ranTicks, decayMax * 100.0, queued ? "queued" : "REFUSED",
+      floorCell.x, floorCell.y, floorCell.z, depBefore, depAfter,
+      VoxStainType(depAfter), VoxStainAmt(depAfter), footName.c_str(),
+      footPainted, footSumPainted, shedDroplets, shedTries, printCells, printY,
+      printAmt, footSumBefore, footSumAfter);
   return ok ? Status::Pass : Status::Fail;
 }
 
@@ -2822,6 +3232,7 @@ const std::vector<Gate>& WoundGates() {
       {"corpse-armor", "mob", {}, false, GateCorpseArmor, false},
       {"corpse-bleed", "mob", {}, false, GateCorpseBleed, false},
       {"body-stain", "mob", {}, false, GateBodyStain, false},
+      {"body-coat", "mob", {}, false, GateBodyCoat, false},
       {"blast-stain", "mob", {}, false, GateBlastStain, false},
       {"corpse-burn", "mob", {}, false, GateCorpseBurn, false},
   };

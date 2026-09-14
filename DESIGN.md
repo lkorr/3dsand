@@ -3381,6 +3381,20 @@ neighbors, so this needs an explicit connectivity pass:
      deadlock at exactly the speed the fix exists for is what the player's
      first blind-fall attempt hit. This is the "park a body whose chunks are
      not cached yet" the `debris` gate's buried-ejecta finding asked for.
+  4. **...and a jointed rig is ONE body for that purpose**
+     (`DebrisSystem::UntunnelRig`, 2026-09-13). Clamping each body of a ragdoll
+     separately tore it apart: a human rig spans two or three chunks, so falling
+     fast its LEADING bodies — the feet — enter the unvouched chunk several ticks
+     before the head, and each was teleported back to its own last vouched
+     sample *with its velocity intact* while its neighbours kept travelling. That
+     is a fresh multi-voxel violation at every joint, every tick of the
+     starvation window, which the solver then closes by force in a different
+     direction per limb. `Mob::PostStep` now hands the whole limp rig over at
+     once and one common vouched fraction of the step is applied to every member
+     along its own displacement: `f = 1` moves nothing, `f = 0` puts the rig back
+     exactly as it was, still rigid and still at speed. Both escape hatches keep
+     their meaning at rig scope (any member that STARTED outside lets the whole
+     rig through; the hold counter is keyed on the rig's first live body).
 
 ### A corpse in armour is not allowed to be a motor (2026-09-13; `Physics::SweepRunawayRigs`, gate `corpse-armor`)
 
@@ -3399,14 +3413,20 @@ failure; it would only move an arbitrary line.
 
 **The bug is the persistence, not the value.** A limb thrown by a sword blow may
 touch the clamp for a tick. A limb that *sits* on it is being driven — and a
-dressed corpse has an obvious motor. A worn shell is its own Jolt body, `Fixed`
-to the limb it wraps (`Mob::AppendWornShell`) and geometrically *inside* it, so
-armour doubles the bodies, doubles the constraints, and puts an iron-against-
-flesh mass ratio across every new one. A stiff constraint between deeply
-overlapping bodies is the textbook way to make a sequential-impulse solver gain
-energy, and the joints `Mob::Die` deliberately leaves on the corpse (see
-`corpse-intact`) spread it from one limb to all of them. That is precisely what
-"flying everywhere while still technically being attached" describes.
+dressed corpse has an obvious motor. A worn shell on a CORPSE is its own Jolt
+body, `Fixed` to the limb it wraps and geometrically *inside* it, so armour
+doubles the bodies, doubles the constraints, and puts an iron-against-flesh mass
+ratio across every new one. A stiff constraint between deeply overlapping bodies
+is the textbook way to make a sequential-impulse solver gain energy, and the
+joints `Mob::Die` deliberately leaves on the corpse (see `corpse-intact`) spread
+it from one limb to all of them. That is precisely what "flying everywhere while
+still technically being attached" describes.
+
+> Since 2026-09-13 that is true of a **corpse only**: on a LIVE creature — limp
+> included — a shell has no constraint at all and cannot drive anything (next
+> section). `Mob::Die` creates the strap joints at the moment of death, because
+> that is the one transition where a garment really does become a body of its
+> own, and the nets below are what keeps that case honest.
 
 **Why it costs minutes rather than merely looking silly.** Two multipliers that
 this document already records elsewhere. Every dynamic body is
@@ -3457,10 +3477,53 @@ spheres at the ceiling on purpose and asserts damped > 0, cut > 0, joints 1 → 
 and a final spin of zero. `SANDVOX_NO_RUNAWAY_NET=1` is the A/B arm in one
 binary, for the same reason `SANDVOX_NO_ANTITUNNEL` exists.
 
-**What this does not do.** It bounds the symptom; it does not remove the energy
-source. The armour constraint chain is still the thing that gains energy, and
-the honest next step is to stop a `Fixed` joint between a shell and the limb it
-overlaps from pumping in the first place — the gate is in place to measure it.
+**What this does not do.** It bounds the symptom; on a corpse it does not remove
+the energy source. The next section removes it everywhere a creature is still
+alive, which is where the reported *visual* failure was; a corpse still carries
+the constraint chain and still relies on these nets.
+
+### A garment is not a separate object (2026-09-13; `MobLimb::wornHost`, `Mob::DriveWornShells`, gate `ragdoll-dress`)
+
+Owner report: "when the human mob is falling, and is wearing clothes, when they go
+into the ragdoll state the clothes will decouple from the body when moving at
+high speeds... it becomes a crazy tangled mess ball of limbs and clothes that
+aren't actually connected properly."
+
+**Measured, on a dressed human made limp 200 voxels up: a greave 3.3 voxels off
+the leg wearing it and rotated 151 degrees away from it.** That is what a `Fixed`
+constraint between deeply interpenetrating bodies of very different mass does
+under acceleration — it lags, and it pumps (previous section). Even solved
+perfectly it would be the wrong model, because a garment on a limb has no pose of
+its own to solve for.
+
+So a worn shell is now a **follower**: `MobLimb::wornHost` names the limb it is
+strapped to, it stays KINEMATIC in every phase a live creature has, it has **no
+constraint at all**, and `Mob::DriveWornShells` teleports it onto the host's exact
+rigid offset — position, rotation and the rigid-body velocity `v + ω × r` — once
+per tick from `Mob::PostStep`, after the read-back. The offset is therefore
+*derived* rather than solved, which is a constancy claim rather than a smallness
+one: the same fixture now measures 0.000 voxels and 0.06°.
+
+- **One place poses a shell.** `SubmitPose` skips them. It used to pose them too
+  (an `AnimPart` whose rest transform is the identity gets the host's pose for
+  free), and the two agreed only while both bodies were kinematic — a limp host
+  is placed by Jolt and a get-up host by a per-limb blend, and either is a
+  garment floating off a shoulder.
+- **Death is the one transition where a garment becomes a body.** `Mob::Die`
+  creates the `Fixed` strap joints just before the limbs go to `DebrisSystem`,
+  anchored where the pair actually is, so a corpse still wears its armour. That
+  is the case the runaway nets above still cover.
+- **A shell that LEAVES stops being a follower** (`DetachLimb` clears
+  `wornHost`), and is ordinary debris from the end of its sever hold.
+- **What it costs:** a kinematic body has no mass in the solver, so an armoured
+  ragdoll tumbles with flesh inertia rather than with 489 kg of iron. Weight
+  still tells where it is authored to (`BodyMassKg` sums the shells, so a blast
+  launches a plated body far slower). Folding each shell's mass into its host's
+  mass properties is a separate change with its own gate.
+- **`SANDVOX_NO_RIGWELD=1`** is the A/B arm in one binary — jointed dynamic
+  shells and the per-body anti-tunnel clamp — for the same reason
+  `SANDVOX_NO_ANTITUNNEL` and `SANDVOX_NO_RUNAWAY_NET` exist. `ragdoll-dress`
+  reports both regimes' numbers side by side in `tests/baseline.json`.
 
 ### Carving living bodies (2026-08-20; `game/mob.cpp`, `MobSystem::CarveLimb*`)
 
@@ -3883,8 +3946,11 @@ marks it), written by `WriteBrick` on every re-skin and poked per voxel by
 `MicroBodyPokeStain`. The shader (`microbody.wgsl bodyStainTint`) reads one
 byte at the hit and applies exactly `applyStain`'s multiply-then-lerp with the
 same `TUNE_STAIN_*` knobs, mottled at world pitch, so blood that ran off an
-arm onto the floor is the same colour on both. Never hashed, never saved;
-travels with a severed limb (the voxel lists move) and into every fragment
+arm onto the floor is the same colour on both. Never hashed (the body is not
+in the grid); SAVED, because it rides the limb's own voxel list and the MOBS /
+DBRS sections write those lists raw (this sentence said "never saved" until
+2026-09-13 and was wrong); travels with a severed limb (the voxel lists move)
+and into every fragment
 (`DownsampleSkin` carries the heaviest stain of a block; `MicroBodyPack`
 grows the lattice for a stained gobbet). Rule 2: the pool pays +50% only for
 bodies that have actually been bloodied.
@@ -3995,6 +4061,70 @@ stains the limb and at least half of the bone it exposed; a 6 m/s burst aimed
 at the hips lands; the wound's own spray queues bursts; a box of blood round
 the hips over 30 ticks stains them and the same box of water over 60 ticks
 takes at least half of it off again.
+
+### A coat is a substance, not a look (2026-09-13; `docs/PLAN_body_coat.md`, `Mob::RecountCoat`, `Mob::ShedCoat`, `Mob::Footfall`)
+
+The byte above named a palette SLOT, which is the right identity on the ground
+(the substance is the liquid cell; the stain is what it left) and the wrong one
+on a body, where there is no cell and the stain IS the substance. Seven looks
+are not seven substances: a future nullifier and blood may share a ground
+colour and must still be told apart on a hand. So the body stain is now a
+`uint16_t` -- 12-bit MATERIAL id, 4-bit amount (`voxload.h` `BodyStain*`) --
+and the ground's slot is DERIVED from it where a look is needed: the micro
+brick's render lattice stays one byte and `microbody.cpp` converts through
+`MicroBodySet::stainSlotOfMat`, refilled at every materials load, so
+`microbody.wgsl` did not change. A dry floor stain rubbing onto a foot goes the
+other way through `matOfStainType_` (the first material registered with that
+slot). The width change bumped the MOBS and DBRS save versions once.
+
+**`coat` block** on a material (`ParseCoat`, requires a `stain` block so the
+substance has a look): `decay` seconds per amount level lost while on a body
+(0 = washing only; blood 20, water 4 so wet dries), `shed` per-mille chance
+per footfall that a coated foot deposits (blood 400), `effects` raw string tags
+that nothing consumes yet. Behaviour is data (guideline 4): the first effect is
+a tag in JSON plus one read of the ledger.
+
+**The ledger** (`Mob::RecountCoat`): per limb, amount-weighted sums by material
+over the live voxels, body totals over the base rig only; fraction
+`sumAmt / (15 * voxels)`, so one splash cannot flip a threshold. Recounted
+every `coat.recountTicks` and ONLY when a stain byte changed (`coatDirty_`),
+so a clean crowd pays nothing (rule 2). `MobSystem::LimbCoatOf / BodyCoat /
+CoatTagFraction(mob, tag, limbTag)` resolve the avatar by id like the stain
+counts do.
+
+**Decay** lives in `Mob::StainTick` AFTER the contact pass, because
+`StainOneLimb` returns at the first empty AABB walk and a coat must fade in
+clean air; per-voxel roll on `Hash3(limbKey ^ cell, tick, salt)` so it thins
+unevenly, start rotated by tick under the same lattice budget, brick poked per
+change. Ground stains do NOT decay: the world rule is monotone so a stained
+chunk can sleep, and a drying rule would keep every stained chunk awake.
+
+**Shedding.** NPCs never had a footfall; `Footfall` moved from `PlayerAvatar`
+down to `Mob` and the NPC plant emits it (the avatar's per-frame audio drain is
+untouched). `Mob::ShedCoat` at the plant, tick-side: a foot whose ledger names a
+`shed` material rolls once, then emits ONE micro droplet per distinct ground
+cell of the sole -- the particle kernel's `atomicMax` claim takes one deposit
+per cell per tick, so N droplets on one cell waste N-1 -- born INSIDE the solid
+cell under the foot with life 1, where `sim_particle.wgsl` claims and resolves
+it that tick with the material's own `stain` block. Zero shader changes; the
+foot loses what it shed; liquid ground is skipped (the droplet would park on
+the water and vanish); charged against `coat.shedPerTick` and the spawn ring
+before emission, one tick latent through `pendingSpawns_`.
+
+**UI.** `UIState::BodyPartUI::stainFrac / stainMat / stainColor`: the HUD's
+"stained NN%" line beside the health bar (hidden under `coat.hudMinFrac`), the
+stick figure's limbs blended toward the substance's stain colour, and on the
+character screen a `BLOOD 42%` chip beside CHARRED and a stain-coloured callout
+for a stained but otherwise healthy limb.
+
+Gate `body-coat` (one monotonic tick counter on purpose: the drying rule fires
+on `tick % period`, so stepping the clock back between phases would mis-time
+the control arm): after a deep cut the ledger's heaviest material on the limb
+is blood (684 of 1330 voxels, fraction 0.24); at the authored 20 s a level the
+count holds through 150 ticks (684 -> 684) and at `coat.decayScale` 300 --
+two ticks a level, a value an author can set -- it falls to 62 in 47 ticks; a
+direct deposit on a stone cell of the room reads blood's slot at amount 5 and
+the cell is still stone.
 
 ### What is under the skin (2026-09-02; `assets/editor/anatomy.js`, sidecar `anatomy`, `scripts/anatomize_mob.mjs`)
 

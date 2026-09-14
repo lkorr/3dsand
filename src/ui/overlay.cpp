@@ -209,9 +209,31 @@ void Overlay::DrawHUD(const UIState& s) {
       IM_COL32(70, 120, 230, 235), IM_COL32(150, 200, 255, 245), "mp",
       s.manaReserved > 0 ? s.manaMax : -1);
 
+  // ---- what is ON you, one line, only when there is enough of it -----------
+  //
+  // The bars say how you ARE; the figure's tint says which parts are coated;
+  // this NAMES the substance, which a colour cannot. Below s.stainHudMin
+  // (tune.coat.hudMinFrac, mirrored into UIState so this file needs no sim
+  // header) the line is not drawn AT ALL — no reserved gap, no faded caption
+  // — so a clean player's HUD is exactly the HUD that was here before.
+  float yStack = yHealth - gap;
+  if (s.bodyValid && s.stainFrac >= s.stainHudMin && s.stainColor != 0) {
+    char buf[80];
+    snprintf(buf, sizeof buf, "stained %.0f%% \xc2\xb7 %s",
+             s.stainFrac * 100.0f,
+             s.stainLabel[0] ? s.stainLabel : "something");
+    const ImVec2 ts = ImGui::CalcTextSize(buf);
+    const ImVec2 tp(x, std::floor(yStack - ts.y - 2.0f));
+    // Lightened toward white: an authored stain colour is picked to read as
+    // DRIED matter on a lit surface, and the same value set as 13 px of text
+    // over the figure's dark scrim is barely a shape.
+    ui::ShadowText(d, tp, ui::Mix(s.stainColor, IM_COL32_WHITE, 0.45f), buf);
+    yStack = tp.y - 2.0f;
+  }
+
   // ---- body condition, sitting directly above the hp bar -------------------
-  const float figureH = DrawBodyFigure(s, x, yHealth - gap);
-  const float yTop = yHealth - gap - figureH;
+  const float figureH = DrawBodyFigure(s, x, yStack);
+  const float yTop = yStack - figureH;
 
   if (!s.playerAlive) {
     const char* dead = "DEAD";
@@ -293,6 +315,25 @@ float Overlay::DrawBodyFigure(const UIState& s, float x, float yBottom) {
     int r = (int)(215 + (200 - 215) * (1.0f - f));
     int g = (int)(220 * f * f + 30 * f);
     int bl = (int)(225 * f * f + 30 * f);
+    // WHAT IS ON THE LIMB, over what has happened TO it — mixed in AFTER the
+    // damage lerp and BEFORE the bleeding flash, and the order is the whole
+    // point: a coat is a layer on the outside, so it sits over the damage
+    // colour; an active haemorrhage is an ALARM and has to stay the loudest
+    // thing on the figure even on a limb already drenched in something.
+    //
+    // 1.5x with a 0.85 ceiling: a light splash is visible without repainting
+    // the limb, a soaked one reads as the substance, and the ceiling keeps a
+    // sliver of the damage tint so a drenched limb that is ALSO half dead is
+    // still distinguishable from a drenched healthy one.
+    if (b.stainFrac > 0.0f && b.stainColor != 0) {
+      const float k = std::min(0.85f, b.stainFrac * 1.5f);
+      const int sr = (int)((b.stainColor >> IM_COL32_R_SHIFT) & 0xFFu);
+      const int sg = (int)((b.stainColor >> IM_COL32_G_SHIFT) & 0xFFu);
+      const int sb = (int)((b.stainColor >> IM_COL32_B_SHIFT) & 0xFFu);
+      r = (int)(r + (sr - r) * k);
+      g = (int)(g + (sg - g) * k);
+      bl = (int)(bl + (sb - bl) * k);
+    }
     if (b.bleeding) {
       r = (int)(r + (255 - r) * flash);
       g = (int)(g * (1.0f - 0.85f * flash));

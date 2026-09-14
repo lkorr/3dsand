@@ -423,6 +423,46 @@ class DebrisSystem {
   // Returns true if the body was moved.
   bool UntunnelBody(uint64_t handle, const Vec3& prevPosVoxel);
 
+  // ---- ...AND A JOINTED RIG IS ONE BODY FOR THAT PURPOSE ------------------
+  //
+  // WHY THE PER-BODY CLAMP ABOVE IS WRONG FOR A RAGDOLL. Owner report,
+  // 2026-09-13: a clothed human knocked limp by a long fall "becomes a crazy
+  // tangled mess ball of limbs and clothes that aren't actually connected
+  // properly... the limbs move to different noisily placed locations on
+  // different frames". That is this clamp, seen from the outside.
+  //
+  // A human rig is ~15 limb bodies (~35 dressed) spanning two or three chunks,
+  // and the clamp's decision is per body and per chunk: falling fast, the
+  // LEADING bodies -- the feet -- enter the unvouched chunk several ticks
+  // before the head does. Each one is teleported back to its own last vouched
+  // sample WITH ITS VELOCITY INTACT while its neighbours keep travelling, so
+  // every tick of the starvation window opens a fresh multi-voxel violation at
+  // every joint across the rig. The solver then does what a sequential-impulse
+  // solver does with a constraint stretched 30 voxels in one step: it closes it
+  // by force, in a different direction for every limb, for up to
+  // kUntunnelHoldTicks ticks. The clamp is not lying about the terrain; it is
+  // answering a question that only makes sense for ONE rigid body.
+  //
+  // So a rig is clamped as a unit: ONE vouched fraction of the step, the
+  // smallest any member can honestly claim, applied to every member along its
+  // own displacement. f = 1 is "the whole rig landed in vouched space" and
+  // nothing moves; f = 0 puts the rig back exactly as it was, still rigid,
+  // still at speed, and it resumes the tick the patch lands. Every
+  // intermediate value is a lerp between two poses the solver itself produced
+  // one step apart, which is the strongest statement available here that does
+  // not need the joint graph.
+  //
+  // The escape hatches stay, at RIG scope for the same reasons they exist at
+  // body scope: if ANY member started the step in unvouched space the whole rig
+  // is let through (clamping the half of a rig that is still over a patch is
+  // itself a tear), and the hold counter is keyed on `handles[0]` so the rig is
+  // held and released together.
+  //
+  // `handles` and `prevPosVoxel` are parallel and must stay so. Returns true if
+  // the rig was moved.
+  bool UntunnelRig(const std::vector<uint64_t>& handles,
+                   const std::vector<Vec3>& prevPosVoxel);
+
   // Does this world chunk have a collision representation right now? A built
   // patch vouches for it whether or not it produced triangles (a chunk of
   // nothing but air, or nothing but solid, polygonizes EMPTY and is still a
@@ -440,6 +480,13 @@ class DebrisSystem {
     uint32_t released = 0;     // held past kUntunnelHoldTicks and let through
     float maxStepVox = 0.0f;   // longest single step this ever caught, voxels
     IVec3 lastChunk{};         // ...and the unvouched chunk it was entering
+    // UntunnelRig only: rig-steps clamped as a unit, and the smallest fraction
+    // of a step any of them was cut back to. `rigHolds` is counted apart from
+    // `holds` because one rig-step moves a dozen bodies and adding it to the
+    // per-body total would make the two incomparable across a change like the
+    // one that introduced it.
+    uint32_t rigHolds = 0;
+    float minRigFrac = 1.0f;
   };
   const UntunnelProbe& Untunnel() const { return untunnel_; }
   void ResetUntunnelProbe() { untunnel_ = UntunnelProbe{}; }
@@ -667,7 +714,12 @@ class DebrisSystem {
   // NOT serialized: it is derived render state, re-packed on load from the
   // authoritative lattice the same way ReskinMicro derives it after a carve
   // (CLAUDE.md architecture guideline 3: derived data is reconstructible).
-  static constexpr uint32_t kSaveVersion = 1;
+  //
+  // 2 (2026-09-13): DebrisVoxel::stain went from a byte holding a palette slot
+  // to the 16-bit coat word holding a MATERIAL. The lattices are written as
+  // PODs, so the stride moved and a version-1 section would load garbage
+  // coordinates — old sections are refused, as they already are.
+  static constexpr uint32_t kSaveVersion = 2;
   void SaveState(std::vector<uint8_t>& out) const;
   // Contract (worldio LoadEntities): Reset() has already run.
   bool LoadState(const uint8_t* data, size_t len, uint32_t version);

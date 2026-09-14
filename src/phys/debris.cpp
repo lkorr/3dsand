@@ -3521,7 +3521,11 @@ bool DebrisSystem::DamageBody(size_t bi, World& world,
         centroid += Vec3{(float)v.x + 0.5f, (float)v.y + 0.5f, (float)v.z + 0.5f};
       centroid = centroid * (sk / (ps * (float)removed.size()));
       CutSoak soak;
-      soak.type = stainType;
+      // The coat names the SUBSTANCE, not its palette slot: a corpse's cut is
+      // smeared with whatever that body bled. `stainType` above is still what
+      // decides the cut smears at all -- a bleed material with no stain block
+      // has nothing to draw.
+      soak.mat = b.bleedMat;
       soak.radius = gt.stainCutRadius * sk;
       soak.amountExposed = gt.stainCutAmount;
       soak.amountBuried = gt.stainCutBuried;
@@ -4640,6 +4644,112 @@ bool DebrisSystem::UntunnelBody(uint64_t handle, const Vec3& prevPosVoxel) {
   untunnel_.holds++;
   untunnel_.maxStepVox = std::max(untunnel_.maxStepVox, len);
   untunnel_.lastChunk = endChunk;
+  return true;
+}
+
+bool DebrisSystem::UntunnelRig(const std::vector<uint64_t>& handles,
+                               const std::vector<Vec3>& prevPosVoxel) {
+  if (phys_ == nullptr || world_ == nullptr) return false;
+  if (AntiTunnelOff(AntiTunnel::Clamp)) return false;
+  const size_t n = std::min(handles.size(), prevPosVoxel.size());
+  if (n == 0) return false;
+  auto chunkOf = [](const Vec3& p) {
+    return IVec3{ifloor(p.x) >> 4, ifloor(p.y) >> 4, ifloor(p.z) >> 4};
+  };
+  // ONE CHUNK LOOKUP MEMO for the whole call. The samples below are walked per
+  // body along a segment, so consecutive tests hit the same chunk over and
+  // over; without this a 35-body rig at speed costs 35 * 64 hash finds in the
+  // starvation window. One entry is enough because the coherence is WITHIN a
+  // body's walk, which is where all the repetition is.
+  uint64_t memoKey = ~0ull;
+  bool memoVouched = false;
+  auto vouched = [&](const Vec3& p) {
+    const IVec3 wc = chunkOf(p);
+    const uint64_t key = World::PackChunkKey(wc);
+    if (key == memoKey) return memoVouched;
+    memoKey = key;
+    memoVouched = ColliderVouched(wc);
+    return memoVouched;
+  };
+
+  // Read every member's end-of-step position first: the decision needs all of
+  // them, and a handle that died mid-tick drops out of the rig rather than
+  // failing the whole clamp.
+  std::vector<Vec3> now(n);
+  std::vector<bool> live(n, false);
+  float maxLen = 0.0f;
+  bool anyStartedOut = false, anyEndedOut = false;
+  for (size_t i = 0; i < n; i++) {
+    if (handles[i] == 0) continue;
+    BodyTransform xf{};
+    if (!phys_->GetTransform(handles[i], xf)) continue;
+    live[i] = true;
+    now[i] = xf.pos;
+    maxLen = std::max(maxLen, (xf.pos - prevPosVoxel[i]).len());
+    if (!vouched(prevPosVoxel[i])) anyStartedOut = true;
+    if (!vouched(xf.pos)) anyEndedOut = true;
+  }
+  // THE HOLD IS KEYED ON THE FIRST LIVE MEMBER, not on handles[0]: a rig that
+  // loses its root limb mid-fall would otherwise key on handle 0 and share one
+  // counter with every other rig in that state.
+  uint64_t key = 0;
+  for (size_t i = 0; i < n; i++)
+    if (live[i]) { key = handles[i]; break; }
+  if (key == 0) return false;
+  // Nothing left the patches: the common case, and it must cost no more than
+  // the reads above.
+  if (!anyEndedOut) {
+    untunnelHold_.erase(key);
+    return false;
+  }
+  // Already out there before the step — see the rig-scope note in debris.h.
+  if (anyStartedOut) {
+    untunnelHold_.erase(key);
+    return false;
+  }
+  uint8_t& held = untunnelHold_[key];
+  if (held == 0) untunnel_.bodiesHeld++;
+  if (held >= kUntunnelHoldTicks) {
+    untunnel_.released++;
+    untunnelHold_.erase(key);
+    std::printf("untunnel: released rig (%zu bodies, lead %llu) into unvouched "
+                "space after %u steps held\n",
+                n, (unsigned long long)key, (unsigned)kUntunnelHoldTicks);
+    return false;
+  }
+  held++;
+
+  // The fraction of this step every member can still vouch for. Walked on a
+  // COMMON sample grid sized by the longest displacement in the rig, so the
+  // fractions are directly comparable and the resolution is set by the body
+  // that moved furthest.
+  const int samples = std::clamp((int)std::ceil(maxLen), 1, kUntunnelSamples);
+  float frac = 1.0f;
+  for (size_t i = 0; i < n && frac > 0.0f; i++) {
+    if (!live[i]) continue;
+    const Vec3 delta = now[i] - prevPosVoxel[i];
+    float mine = 1.0f;
+    for (int s = 1; s <= samples; s++) {
+      const float f = (float)s / (float)samples;
+      if (f > frac) break;   // a stricter member has already cut it back here
+      if (!vouched(prevPosVoxel[i] + delta * f)) {
+        mine = (float)(s - 1) / (float)samples;
+        break;
+      }
+    }
+    frac = std::min(frac, mine);
+  }
+
+  for (size_t i = 0; i < n; i++) {
+    if (!live[i]) continue;
+    phys_->SetBodyPosition(handles[i],
+                           prevPosVoxel[i] + (now[i] - prevPosVoxel[i]) * frac);
+  }
+  untunnel_.rigHolds++;
+  untunnel_.minRigFrac = std::min(untunnel_.minRigFrac, frac);
+  untunnel_.maxStepVox = std::max(untunnel_.maxStepVox, maxLen);
+  for (size_t i = 0; i < n; i++)
+    if (live[i] && !vouched(now[i])) { untunnel_.lastChunk = chunkOf(now[i]); break; }
   return true;
 }
 

@@ -7,11 +7,11 @@
 #include "sim/microbody.h"
 #include "sim/rng.h"
 
-uint8_t RaiseBodyStain(uint8_t cur, uint32_t type, uint32_t amt) {
-  if (amt == 0 || type == 0) return cur;
-  const uint32_t curAmt = BodyStainAmt(cur), curType = BodyStainType(cur);
-  if (curAmt == 0 || curType == type) return PackBodyStain(type, std::max(curAmt, amt));
-  return amt > curAmt ? PackBodyStain(type, amt) : cur;
+uint16_t RaiseBodyStain(uint16_t cur, uint32_t mat, uint32_t amt) {
+  if (amt == 0 || mat == 0) return cur;
+  const uint32_t curAmt = BodyStainAmt(cur), curMat = BodyStainMat(cur);
+  if (curAmt == 0 || curMat == mat) return PackBodyStain(mat, std::max(curAmt, amt));
+  return amt > curAmt ? PackBodyStain(mat, amt) : cur;
 }
 
 CellDist BuildCellDist(const std::vector<IVec3>& seeds, int pad) {
@@ -78,7 +78,7 @@ CellDist BuildCellDist(const std::vector<IVec3>& seeds, int pad) {
 
 uint32_t SoakCut(const StainLattice& L, Vec3 centre, const CutSoak& p,
                  uint32_t seed, MicroBodySet* micro, int model) {
-  if (p.type == 0 || p.radius <= 0.0f) return 0;
+  if (p.mat == 0 || p.radius <= 0.0f) return 0;
   if (p.amountExposed <= 0 && p.amountBuried <= 0 && p.boneMin <= 0) return 0;
   const size_t n = L.Size();
   if (n == 0) return 0;
@@ -170,8 +170,8 @@ uint32_t SoakCut(const StainLattice& L, Vec3 centre, const CutSoak& p,
       amt = (int)std::lround((float)p.amountBuried * jitter);
     }
     if (amt <= 0) continue;
-    const uint8_t cur = L.Stain(i);
-    const uint8_t next = RaiseBodyStain(cur, p.type, (uint32_t)amt);
+    const uint16_t cur = L.Stain(i);
+    const uint16_t next = RaiseBodyStain(cur, p.mat, (uint32_t)amt);
     if (next == cur) continue;
     L.SetStain(i, next);
     changed++;

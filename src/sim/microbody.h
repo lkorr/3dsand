@@ -63,8 +63,11 @@ struct MicroBodyModelGpu {
   //
   // bit 30 (kMicroBodyDimsStainBit): THIS BLOCK CARRIES A STAIN LATTICE. One
   // byte per micro voxel, 4 per word, laid out after the payload at
-  // `base + WordsFor(cells)` in the same idx order, holding the body stain
-  // byte (voxload.h BodyStain*: amount low nibble, type above). Only OWNED
+  // `base + WordsFor(cells)` in the same idx order, holding `slot << 4 | amt`
+  // -- the world's 3-bit stain PALETTE SLOT and the 0..15 amount. This is the
+  // one place the 16-bit body coat word (voxload.h BodyStain*, which names a
+  // MATERIAL) is narrowed to what the shader needs, through
+  // MicroBodySet::stainSlotOfMat; the shader is unchanged by that. Only OWNED
   // blocks have one -- a shared def model is clean by definition, and a body
   // becomes owned the first time anything marks it -- so the pool pays the
   // extra 50% only for bodies that have actually been bloodied. The shader
@@ -216,7 +219,30 @@ struct MicroBodySet {
   // read back by the shaders as materials[ART_PALETTE_BASE + i]. Bounded by
   // kArtPaletteSlotsGpu (world.h) = 255, the 1-based ceiling of that byte.
   std::vector<uint32_t> artColors;
+
+  // ---- material id -> stain PALETTE SLOT (1..7, 0 = does not stain) --------
+  //
+  // The body coat word names a MATERIAL (sim/voxload.h) because everything
+  // except the renderer needs to know WHICH substance is on a voxel. The
+  // renderer needs three bits. This table is the conversion, and it lives here
+  // rather than at the call sites so that WriteBrick / MicroBodyPack /
+  // MicroBodyPokeStain all narrow the same way and no caller has to hold a
+  // material table to poke a stain.
+  //
+  // Deliberately a bare vector of bytes and not a `const std::vector<
+  // MaterialDef>*`: this header is included by the render path and must not
+  // grow a dependency on sim/materials.h. Filled through
+  // MicroBodySetStainSlots at every materials load; an empty table (or a
+  // material past its end) means "no slot", i.e. amount 0, i.e. nothing drawn
+  // -- which is the right failure for a set that was never told.
+  std::vector<uint8_t> stainSlotOfMat;
 };
+
+// Publish material id -> stain palette slot into `set`. Called wherever the
+// material table is (re)built: LoadMobDefs, which already clears the set, and
+// MobSystem::OnMaterialsReloaded, because an R reload can renumber the slots
+// under bricks that are already packed.
+void MicroBodySetStainSlots(MicroBodySet& set, std::vector<uint8_t> slotOfMat);
 
 // Merge one prefab's art palette into `set`, remapping its slots if needed.
 // Returns a 256-entry table mapping the prefab's .vox palette SLOT (128..255)
@@ -325,13 +351,17 @@ bool MicroBodyPoke(MicroBodySet& set, uint32_t model, int x, int y, int z,
                    uint8_t mat, uint8_t art);
 
 // Rewrites ONE micro voxel's STAIN BYTE in an OWNED model, brick-local
-// coordinates exactly as MicroBodyPoke. The stain lattice is allocated the
-// first time an owned model is asked for one (the block is reallocated at
-// payload + stain size, so a model that MicroBodyPack made owned without a
-// stain grows one here). Returns false if the model is not owned, the
-// coordinate is outside dims, or the pool cannot grow the block.
+// coordinates exactly as MicroBodyPoke. Takes the 16-bit BODY COAT word
+// (voxload.h BodyStain*) and narrows it here through `stainSlotOfMat` -- a
+// material with no palette slot writes amount 0, i.e. clean, so a coat the
+// renderer has no colour for is invisible rather than mis-coloured. The stain
+// lattice is allocated the first time an owned model is asked for one (the
+// block is reallocated at payload + stain size, so a model that MicroBodyPack
+// made owned without a stain grows one here). Returns false if the model is
+// not owned, the coordinate is outside dims, or the pool cannot grow the
+// block.
 bool MicroBodyPokeStain(MicroBodySet& set, uint32_t model, int x, int y, int z,
-                        uint8_t stain);
+                        uint16_t stain);
 
 // A model's brick dimensions in micro voxels; {0,0,0} for an invalid index.
 IVec3 MicroBodyDims(const MicroBodySet& set, uint32_t model);

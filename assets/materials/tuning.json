@@ -98,6 +98,11 @@
     "fallFlailDelay": 0.35,
     "fallFlailRamp": 0.9,
     "fallMinDrop": 1.2,
+    "airPose": true,
+    "airPoseRiseSpeed": 5.25,
+    "airPoseFallSpeed": 9.0,
+    "airPoseLandHeight": 1.1,
+    "airPoseLean": 16,
     "firstPersonArms": true,
     "footTrim": 0,
     "severImpulse": 6,
@@ -280,6 +285,14 @@
       "scope": "event",
       "amount": 1.5
     }
+  },
+  "coat": {
+    "recountTicks": 8,
+    "decayScale": 1.0,
+    "shedCells": 3,
+    "shedPerTick": 64,
+    "shedAmount": 2,
+    "hudMinFrac": 0.02
   },
   "melee": {
     "commitSpeed": 900,

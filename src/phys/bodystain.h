@@ -15,12 +15,16 @@ struct MicroBodySet;
 // (Mob::CarveLimbRadial) and the corpse cut (DebrisSystem::DamageBody), so a
 // limb cut off and cut again is bloodied by the same rule both times.
 //
-// A body stain is the byte on PrefabVoxel::stain / DebrisVoxel::stain (amount
-// 0..15, type = the world's stain palette slot), mirrored into the micro
-// brick's stain lattice (sim/microbody.h) for rendering. It is PRESENTATION
-// AND GAMEPLAY STATE that never touches the hashed grid (rule 1): it decides
-// what a creature looks like, travels with its voxels into every fragment,
-// and is never saved.
+// A body stain is the 16-bit COAT word on PrefabVoxel::stain /
+// DebrisVoxel::stain (the MATERIAL on the voxel in bits 0..11, amount 0..15 in
+// bits 12..15), mirrored into the micro brick's stain lattice
+// (sim/microbody.h) for rendering -- which is the only consumer that narrows
+// it back to the world's 3-bit palette slot. It is PRESENTATION AND GAMEPLAY
+// STATE that never touches the hashed grid (rule 1): it decides what a
+// creature looks like, travels with its voxels into every fragment, and IS
+// SAVED -- both body savers write the lattices as PODs, so the coat rides
+// along (this comment claimed the opposite until 2026-09-13, and the code
+// never agreed with it).
 
 // Whichever of a body's two lattices is authoritative: the skin when it is a
 // separate, finer lattice, else the collider. Same rule BurnLimbView applies.
@@ -36,19 +40,20 @@ struct StainLattice {
     return skin ? (uint32_t)((*skin)[i].material & 0xFFFu)
                 : (uint32_t)((*coll)[i].payload & 0xFFFu);
   }
-  uint8_t Stain(size_t i) const {
+  uint16_t Stain(size_t i) const {
     return skin ? (*skin)[i].stain : (*coll)[i].stain;
   }
-  void SetStain(size_t i, uint8_t s) const {
+  void SetStain(size_t i, uint16_t s) const {
     if (skin) (*skin)[i].stain = s; else (*coll)[i].stain = s;
   }
 };
 
-// Raise a voxel's stain toward `amt` of `type`: same type (or clean) keeps the
-// larger amount; a different type is overwritten only by a stronger one, so a
-// splash of blood over a wet patch wins and a splash of water over blood does
-// not repaint it (washing is a separate, subtractive rule). Returns the byte.
-uint8_t RaiseBodyStain(uint8_t cur, uint32_t type, uint32_t amt);
+// Raise a voxel's coat toward `amt` of `mat`: the same material (or a clean
+// voxel) keeps the larger amount; a DIFFERENT material overwrites only with a
+// strictly larger amount, so a splash of blood over a wet patch wins and a
+// splash of water over blood does not repaint it (washing is a separate,
+// subtractive rule). Returns the coat word.
+uint16_t RaiseBodyStain(uint16_t cur, uint32_t mat, uint32_t amt);
 
 // ---- DISTANCE TO WHAT THE CARVE ACTUALLY TOOK -------------------------------
 //
@@ -91,7 +96,7 @@ CellDist BuildCellDist(const std::vector<IVec3>& seeds, int pad);
 // `buriedChance`. `boneMin` floors the exposed amount on any voxel that is
 // NOT tissue (`tissue[mat]` false; an empty table means everything is
 // tissue), so bone is always shown bloodied to some degree. Amounts are the
-// 0..15 world scale, `type` the stain palette slot.
+// 0..15 world scale, `mat` the MATERIAL doing the staining (this body's blood).
 //
 // `micro`/`model`: when the model is OWNED, every stained voxel is also poked
 // into the brick's stain lattice, brick-local coordinates being the lattice's
@@ -102,7 +107,7 @@ CellDist BuildCellDist(const std::vector<IVec3>& seeds, int pad);
 // Keyed on `seed` and the lattice position, so a replay stains the same
 // voxels. Returns the number of voxels whose stain changed.
 struct CutSoak {
-  uint32_t type = 0;
+  uint32_t mat = 0;  // the staining material (this body's blood), 0 = no soak
   float radius = 0.0f;
   int amountExposed = 15;
   int amountBuried = 6;

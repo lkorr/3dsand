@@ -508,6 +508,30 @@ struct MaterialDef {
   // as a voxel's stain amount. 0 = never absorbs. Mirrors the top nibble of
   // gpu.stainPack; kept unpacked here for the tuner and the wiki.
   uint32_t absorbCapacity = 0;
+  // ---- WHAT THIS SUBSTANCE DOES WHILE IT IS ON A BODY ("coat") -------------
+  //
+  // A body voxel's coat names a MATERIAL (sim/voxload.h PrefabVoxel::stain),
+  // so for the first time the gore layer can ask a substance about itself
+  // instead of about its palette slot. These are those answers. Authored as
+  // `"coat": { "decay": <sec/level>, "shed": <per-mille>, "effects": [...] }`
+  // and only on a material that already authors a `stain` block -- a coat is
+  // the body-side reading of the same substance, so one without the other is
+  // a content error, not a default.
+  //
+  // CPU-side, unhashed, exactly like `stain`'s unpacked mirrors above: nothing
+  // here reaches a shader or the sim.
+  //
+  // Seconds a body voxel takes to lose ONE amount level of this coat. 0 =
+  // never dries on its own; only washing takes it off (blood).
+  float coatDecay = 0.0f;
+  // Per-mille chance that a coated foot deposits some of it on the ground at a
+  // footfall -- how a bloodied boot leaves prints. 0 = tracks nothing.
+  uint32_t coatShed = 0;
+  // RAW TAGS, resolved by whoever cares and by nobody here. No validation
+  // table on purpose (rule 4, no closed-ended systems): the set of things a
+  // coat can mean is content, so a new one is a JSON edit plus a consumer, not
+  // an enum plus a JSON edit plus a consumer.
+  std::vector<std::string> coatEffects;
   // GRID colours for a MATF_TINTED material (materials.json "tints"), packed
   // 0x00RRGGBB, at most kMatTintsMax. Entry i is what a voxel of this material
   // with state nibble i renders as; entry 0 is the natural colour by

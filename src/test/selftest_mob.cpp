@@ -16,6 +16,8 @@
 
 #include "game/avatar.h"
 #include "game/bodyreg.h"
+#include "game/equipment.h"
+#include "game/item.h"
 #include "game/thirdperson.h"
 #include "game/brush.h"
 #include "game/camera.h"
@@ -1648,6 +1650,150 @@ bool mobOk = false;
         // angle means a tucked knee (jump) and a straight leg (fall) are both
         // fine, and only a genuine fold-through fails.
         float worstLegUp = -1e9f;
+        // ---- ...AND THE AIRBORNE POSE MUST BE A FUNCTION OF vel.y ----------
+        //
+        // `legsNotInverted` above is a SAFETY bound: it says the legs did not
+        // fold through the pelvis. It passes just as happily on a body that
+        // does nothing at all in the air, which is what the old pose was —
+        // a 900 ms looping clip swaying the arms ten degrees over the rest
+        // hang the leg IK had faded out of ("just wobbles left and right
+        // slightly"). Nothing in it knew which way the body was going.
+        //
+        // So assert the DIFFERENCE, which is the whole claim of avatar.airPose:
+        // rising and falling are different shapes, in the right direction, by
+        // an amount you could see. Two arms of one fixture, ~20 ticks apart —
+        // the cheapest possible form of "it responds to the phase", and the
+        // one thing no amount of extra clip authoring could fake.
+        //
+        //   rising  -> knees TUCKED (foot close under the hip), arms driven UP
+        //   falling -> legs REACHING down, arms out WIDE to brace
+        //
+        // Measured in model space off each limb's own joint, so the body's
+        // world position and the fixture's teleporting have no vote.
+        float tuckDrop = 0, reachDrop = 0;    // hip.y - foot.y, mean of 2 legs
+        float tuckHandUp = 0, reachHandUp = 0;   // hand.y - shoulder.y, mean
+        // THE COUNTER-SWING, as the fore/aft GAP between the two hands. This
+        // is the one number that says the arms are doing opposite things:
+        // averages cannot see it (they cancel), and a per-arm height cannot
+        // either. It is also the assertion that would fail if `armSwing` ever
+        // stopped being signed per arm, which is the way this regresses.
+        float tuckHandSplit = 0, reachHandSplit = 0;  // |hand.z(L) - hand.z(R)|
+        float restDrop = 0;                   // the same drop, standing
+        {
+          const int hipParts[2] = {avatar.PartIndex("legU.L"),
+                                   avatar.PartIndex("legU.R")};
+          const int feet[2] = {avatar.PartIndex("foot.L"),
+                               avatar.PartIndex("foot.R")};
+          const int shoulders[2] = {avatar.PartIndex("armU.L"),
+                                    avatar.PartIndex("armU.R")};
+          const int hands[2] = {avatar.PartIndex("hand.L"),
+                                avatar.PartIndex("hand.R")};
+          auto sampleLegs = [&](float& drop) {
+            drop = 0;
+            int n = 0;
+            for (int s = 0; s < 2; s++) {
+              Vec3 hp, fp;
+              Quat hq, fq;
+              if (hipParts[s] < 0 || feet[s] < 0) continue;
+              if (!avatar.PartModelTransform(hipParts[s], hp, hq)) continue;
+              if (!avatar.PartModelTransform(feet[s], fp, fq)) continue;
+              drop += hp.y - fp.y;
+              n++;
+            }
+            if (n) drop /= (float)n;
+          };
+          auto sampleArms = [&](float& up, float& split) {
+            up = split = 0;
+            int n = 0;
+            float z[2] = {0, 0};
+            for (int s = 0; s < 2; s++) {
+              Vec3 sp, hp;
+              Quat sq, hq;
+              if (shoulders[s] < 0 || hands[s] < 0) continue;
+              if (!avatar.PartModelTransform(shoulders[s], sp, sq)) continue;
+              if (!avatar.PartModelTransform(hands[s], hp, hq)) continue;
+              up += hp.y - sp.y;
+              z[s] = hp.z;
+              n++;
+            }
+            if (n == 2) split = std::fabs(z[0] - z[1]);
+            if (n) up /= (float)n;
+          };
+          // The standing reference, taken BEFORE anything leaves the ground:
+          // every bound below is a fraction of this rig's own hanging leg, so
+          // the thresholds follow the art the way the gait's do.
+          sampleLegs(restDrop);
+
+          // ---- arm 1: RISING ----
+          // A real launch, not a teleport: the player's own jumpSpeed, applied
+          // as both the velocity the pose reads and the travel it implies, so
+          // the body is genuinely going up while it claims to be. The pose is
+          // driven by vel.y alone, but a fixture whose position disagreed with
+          // its velocity would be lying to every OTHER rule in the avatar (the
+          // gait's coyote distance, the landing probe) and the failure would
+          // land somewhere unrelated.
+          pl.grounded = false;
+          pl.vel.x = 0;
+          pl.vel.z = 0;
+          // Put the body back where the rise started before handing over. Every
+          // fixture after this one inherits pl.pos, and a jump at this rig's
+          // real jumpSpeed covers ~77 voxels in 22 ticks — enough to leave the
+          // fall below, the ramp and the bumpy-incline pass all measuring a
+          // body suspended somewhere new. Restoring it keeps this arm additive.
+          const float yBeforeRise = pl.pos.y;
+          const float kRise =
+              CurrentTuning().player.jumpSpeed / kVoxelMeters;
+          for (int i = 0; i < 22; i++) {
+            pl.vel.y = kRise;
+            pl.pos.y += kRise * kTickDt;
+            avTick();
+          }
+          sampleLegs(tuckDrop);
+          sampleArms(tuckHandUp, tuckHandSplit);
+
+          // ---- arm 2: FALLING, AND FAR ENOUGH UP TO STILL BE FALLING ------
+          //
+          // MEASURED FROM THE TOP OF THE JUMP, not from the drop below. The
+          // first version of this sampled 12 ticks into the existing fall loop,
+          // which starts AT the shelf the body walked off — and avatar.cpp's
+          // landing probe folds in the PREPARE shape over the last
+          // airPoseLandHeight (1.6 m, so 32 voxels at 5 cm) before contact. The
+          // body was inside that the whole way down, so the arm labelled
+          // "falling" was in fact the landing pose: it reported hands 0.6
+          // voxels above the shoulder against the reach shape's authored 0.40
+          // of an arm, and the lateral spread came out NARROWER than the tuck's
+          // instead of much wider. The fixture was wrong, not the pose — but a
+          // fixture that cannot tell "falling" from "about to land" is not
+          // evidence for either, and it would have failed the arm assertion
+          // while the thing under test was working.
+          //
+          // Up here the ground is ~70 voxels down, well past the probe's reach,
+          // so this is the reach shape and nothing else.
+          // At the tuning's OWN full fall speed, so this is the reach shape at
+          // full commitment rather than some fraction of it — the phase is
+          // `vel.y / airPoseFallSpeed`, so naming the same knob the pose reads
+          // is what keeps the arm at 1.0 if that knob is ever retuned.
+          const float kFall =
+              CurrentTuning().avatar.airPoseFallSpeed / kVoxelMeters;
+          for (int i = 0; i < 14; i++) {
+            pl.vel.y = -kFall;
+            pl.pos.y -= kFall * kTickDt * 0.1f;  // stay high; vel.y is the pose
+            avTick();
+          }
+          sampleLegs(reachDrop);
+          sampleArms(reachHandUp, reachHandSplit);
+
+          pl.pos.y = yBeforeRise;
+          // Land for a beat before handing over to the fall fixture below. Not
+          // cosmetic: the air CLOCK is what sends a body limp
+          // (ragdoll.fallSeconds, 3 s), and 36 ticks of jump plus the 45 the
+          // next loop spends falling would put this fixture within a few ticks
+          // of a ragdoll it is not trying to test.
+          pl.grounded = true;
+          pl.vel.y = 0;
+          for (int i = 0; i < 5; i++) avTick();
+          avatar.ClearFootfalls();   // the landing is not one of the gait's
+        }
         {
           pl.grounded = false;
           // Straight down, so drop the forward velocity the walk loops left
@@ -1692,6 +1838,48 @@ bool mobOk = false;
         // plenty of slack for a jump tuck; only a real fold-through goes
         // positive.
         bool legsNotInverted = worstLegUp < -0.5f;
+
+        // THE TWO SHAPES MUST DIFFER, AND IN THE RIGHT DIRECTION.
+        //
+        // Bounds are fractions of THIS rig's own standing leg (restDrop), never
+        // voxel literals: the pose table is authored in leg lengths for exactly
+        // that reason, and a hardcoded voxel bound would silently mean a
+        // different pose at a different kVoxelMeters or on a different rig.
+        //
+        // The margins are wide on purpose. The claim is "the body answers the
+        // phase", not "the tuck is 0.46 of a leg" — pinning the authored value
+        // here would make every future tweak of the shapes a test edit, which
+        // is the closed-ended-system failure DESIGN.md warns about. What it
+        // catches is the thing that actually regresses: the drive coming
+        // unhooked (both arms identical), or its sign inverting.
+        const bool haveAirRef = restDrop > 1e-3f;
+        const bool tucks = haveAirRef && tuckDrop < restDrop * 0.80f;
+        const bool reaches = haveAirRef && reachDrop > tuckDrop * 1.25f;
+        // The arms: driven UP at the launch, out WIDE on the way down. Measured
+        // against each other rather than against a standing pose, because the
+        // idle arms sit at whatever the rig authored and that is not a fact
+        // this test should own.
+        //
+        // TWO AXES OF THE SAME DRIVE, and each catches a failure the other
+        // cannot: the arms COUNTER-SWING widest at the launch (that is the
+        // instant they were actually driving) and are carried HIGHER on the way
+        // down (the brace). A swing that stopped being signed per arm collapses
+        // the split without touching the mean height; an arm pose that stopped
+        // reading the phase at all holds both.
+        const bool armsDrive =
+            tuckHandSplit > reachHandSplit + restDrop * 0.05f &&
+            reachHandUp > tuckHandUp + restDrop * 0.05f;
+        // With avatar.airPose OFF the shapes are the clip's, and the clip has
+        // no idea which way the body is moving — so this whole block is the
+        // air pose's own gate and is skipped rather than failed when it is off.
+        const bool airPoseOn = CurrentTuning().avatar.airPose;
+        const bool airPoseOk = !airPoseOn || (tucks && reaches && armsDrive);
+        std::printf(
+            "avatar air pose: %s (rest leg %.2f vox | tuck drop %.2f, reach "
+            "drop %.2f | hand up %.2f -> %.2f, counter-swing %.2f -> %.2f)\n",
+            !airPoseOn ? "off" : (airPoseOk ? "PASS" : "FAIL"), restDrop,
+            tuckDrop, reachDrop, tuckHandUp, reachHandUp, tuckHandSplit,
+            reachHandSplit);
 
         // ---- BUMPY INCLINE: the pose must not TELEPORT between frames ----
         //
@@ -1935,8 +2123,16 @@ bool mobOk = false;
             // start `fall`. Both are now gated on real events (a launch, and a
             // real drop below the last supported height), so walking a hill
             // must show neither.
+            //
+            // WITH avatar.airPose ON THERE ARE NO AIR CLIPS TO COUNT. The pose
+            // is driven from vel.y through the IK chains and neither clip is
+            // ever started, so a check phrased against them is green by
+            // construction — the coverage has to move to the thing that poses
+            // the body now. `AirPoseWeight` is the same claim about the same
+            // event: cresting a step must not convince the rig it is airborne.
             if (avatar.ClipActive("jump")) rampJumpTicks++;
             if (avatar.ClipWeight("fall") > 0.05f) rampFallTicks++;
+            if (avatar.AirPoseWeight() > 0.05f) rampFallTicks++;
             for (int s = 0; s < 2; s++) {
               rampHipLo = std::min(rampHipLo, jointTwistX(watch[2 + s], hips));
               rampHipHi = std::max(rampHipHi, jointTwistX(watch[2 + s], hips));
@@ -2018,7 +2214,7 @@ bool mobOk = false;
                     legsUpright && legsAlternate && legsNotSplayed &&
                     legsNotInverted && armsHang && armsSwing && poseContinuous &&
                     kneeBends && jointsInRange && strideCoherent &&
-                    rampWalks && rampNoAirClips;
+                    rampWalks && rampNoAirClips && airPoseOk;
         std::printf(
             "avatar: %s (%d parts, spawned=%d bodies=%d, followed %.1f vox, "
             "y-drift %.2f vox, self-push %.3f vox, states seen=%d (last %d) "
@@ -5750,6 +5946,321 @@ Status GateRagdoll(Ctx& c, std::string& detail) {
   return ok ? Status::Pass : Status::Fail;
 }
 
+// ---- ragdoll-dress ---------------------------------------------------------
+//
+// A DRESSED BODY GOING LIMP STAYS ONE OBJECT.
+//
+// Owner report, 2026-09-13: "when the human mob is falling, and is wearing
+// clothes, when they go into the ragdoll state the clothes will decouple from
+// the body when moving at high speeds... all of the clothes separate from limbs
+// and it just becomes a crazy tangled mess ball of limbs and clothes that
+// aren't actually connected properly. Seems like when falling the limbs will be
+// moving at slightly different velocities/resistances/move to different noisily
+// placed locations on different frames."
+//
+// TWO MECHANISMS, BOTH ABOUT A RIG BEING TREATED AS N INDEPENDENT BODIES, and
+// this gate measures one number for each:
+//
+//   * A worn shell used to be a DYNAMIC body on a Fixed constraint to the limb
+//     it covers, geometrically inside it and an order of magnitude heavier or
+//     lighter. That is the textbook energy source for a sequential-impulse
+//     solver, and even when it behaves it LAGS under acceleration. It is now a
+//     kinematic follower with no constraint at all (MobLimb::wornHost,
+//     Mob::DriveWornShells), so its offset from its host is not solved for, it
+//     is derived — and therefore CONSTANT. That is what `shell drift` and
+//     `shell twist` assert, and constant is a far stronger claim than small.
+//
+//   * DebrisSystem::UntunnelBody clamped each body of the rig SEPARATELY
+//     against the collision patches, teleporting whichever ones had outrun the
+//     streaming back to their own last vouched sample while their neighbours
+//     kept travelling — a fresh multi-voxel violation at every joint, every
+//     tick of the starvation window, which the solver then closes by force.
+//     UntunnelRig clamps the rig on one common fraction of the step instead.
+//     `limb stretch` is what sees this: a joint held open by 30 voxels is not a
+//     pose, it is a tear.
+//
+// THE TWO ARMS ARE THE TWO REGIMES:
+//
+//   A. THE FALL. A dressed human made limp `fallLift` voxels up (as high as the
+//      residency window allows, capped at 200 ≈ 50 m) and dropped under Jolt's
+//      own gravity, so it arrives at ~30 m/s having covered ground no collision
+//      patch existed over. This is the arm that outruns the streaming, and the
+//      untunnel counters are reported beside it so a number that moves has its
+//      cause attached (CLAUDE.md rule 6) rather than needing a bisection.
+//   B. THE SLAM. The same rig limp on the spot and handed 30 m/s straight down.
+//      No streaming starvation, so it isolates the constraint: whatever drift
+//      shows here is the garment lagging its limb under pure acceleration and
+//      impact.
+//
+// WHY BOTH ARMS START LIMP RATHER THAN FALLING INTO IT. An NPC's kinematic fall
+// (MobSystem::UpdateFall) cannot get anywhere near these speeds and by design
+// never will: gravity WAITS on a column the CPU mirror has not delivered
+// (GroundSense::groundUnknown), and the mirror is 3x3x3 chunks, so a creature
+// with 50 m of air under it does not fall at all — it hovers. A long fall in the
+// game is therefore always the same two beats: a short kinematic drop while the
+// ground is still in probe range, then ragdoll.fallSeconds fires and JOLT owns
+// the rest of the descent. The second beat is the whole of what the report is
+// about and it is the only beat that reaches 30 m/s, so the fixture starts
+// there. A first version of this gate spawned the creature 200 voxels up and
+// waited for its air clock: 400 ticks, limp never fired, peak limb speed 0.0
+// m/s, and every number below it a clean zero measured on a body standing still
+// in the sky — a fixture measuring itself.
+//
+// Bounds are in tests/baseline.json, so retuning what counts as "attached" is a
+// JSON edit and not a rebuild. Measured with SANDVOX_NO_RIGWELD=1 (the A/B arm
+// that restores the old jointed-shell + per-body-clamp behaviour) the same
+// fixture is what says the thresholds mean anything at all.
+Status GateRagdollDress(Ctx& c, std::string& detail) {
+  GpuContext& ctx = c.ctx;
+  World& world = c.world;
+  Simulation& sim = c.sim;
+  DebrisSystem& debris = c.debris;
+  MobSystem& mobs = c.mobs;
+  Physics& phys = c.phys;
+
+  int wizDef = -1;
+  for (size_t i = 0; i < mobs.Defs().size(); i++)
+    if (mobs.Defs()[i].name == kAvatarDefName) wizDef = (int)i;
+  if (wizDef < 0) {
+    detail = "no avatar mob def to dress";
+    return Status::Fail;
+  }
+  const int baseLimbs = (int)mobs.Defs()[wizDef].limbs.size();
+
+  int relief = 0;
+  const IVec3 anchor = AiFixtureCentre(world);
+  const IVec3 spot = AiFlatSpot(anchor.x, anchor.z, 96, 16, kDefaultSeed, relief);
+  const int h = spot.y;
+  // HOW HIGH THE FALL MAY START: inside the residency window with the margin
+  // MobSystem::PreTick despawns past, never an absolute coordinate (the trap
+  // AiFixtureCentre exists for — an earlier gate leaves the window elsewhere).
+  const IVec3 wlo = world.WindowOrigin();
+  const float fallLift =
+      std::min(200.0f, std::max(0.0f, (float)(wlo.y + kWorldN - 24 - (h + 1))));
+
+  // One shell's rigid relationship to the limb it is strapped to, captured
+  // while the creature is intact and upright.
+  struct Strap {
+    int shell = -1, host = -1;
+    Vec3 relPos{};   // shell origin in the host's frame
+    Quat relRot{};   // shell rotation relative to the host's
+  };
+  // ...and one JOINT's, for the same reason. `anchorInParent` is the child's own
+  // joint anchor expressed in the PARENT's frame, which is precisely the point a
+  // ball or hinge constraint welds and therefore the one number that is
+  // invariant under any pose the rig can legally take. (The obvious measure —
+  // how far the two body origins sit apart — is not: a thigh pivoting about a
+  // held hip moves its own origin, and the first version of this gate duly
+  // reported 2.40 voxels of "stretch" on an upper arm that was simply rotating.)
+  struct Link {
+    int child = -1, parent = -1;
+    Vec3 anchorInParent{};
+  };
+
+  struct Arm {
+    int shells = 0, links = 0, ticks = 0;
+    float drift = 0.0f, twist = 0.0f, stretch = 0.0f;
+    float peakSpeed = 0.0f;   // fastest limb seen, m/s
+    int driftTick = -1;
+    std::string driftName, stretchName;
+    int limpAt = -1;
+    float lowest = 1.0e30f;
+    bool spawned = false;
+    uint32_t holds = 0, rigHolds = 0, released = 0;
+  };
+
+  auto run = [&](float liftVox, float hitVox, int ticks) -> Arm {
+    Arm a;
+    mobs.Reset();
+    debris.Reset();
+    SubmitWorldgen(ctx, world, sim, kDefaultSeed);
+    ctx.WaitIdle();
+    AiTicker ticker{c, 21000, {spot.x >> 4, spot.y >> 4, spot.z >> 4}};
+    const uint64_t id =
+        mobs.Spawn(wizDef, {spot.x, h + 1 + (int)liftVox, spot.z});
+    if (id == 0) return a;
+    Mob* mob = mobs.FindMobById(id);
+    if (mob == nullptr) return a;
+    a.spawned = true;
+    // DRESS IT IN EVERYTHING THE LIBRARY SHIPS, counted and never named — the
+    // same construction `corpse-armor` uses, and for the same reason: a tree
+    // with no armour content still runs this gate, it simply runs it on a naked
+    // body and the detail line says so.
+    for (const ItemDef& it : c.items.items) {
+      if (!ItemKindIsWorn(it.kind)) continue;
+      int home = -1;
+      for (int s = 0; s < kEquipSlotCount; s++)
+        if (EquipSlotAccepts(s, it.kind)) { home = s; break; }
+      if (home >= 0) mob->WearItem(&it, home);
+    }
+    // ONE TICK BEFORE THE REFERENCE IS TAKEN: WearItem places each shell itself,
+    // so the pair is already rigid, but a reference read off the placement would
+    // be measuring the placement. One full tick means the pose pipeline and
+    // PostStep have both run and the number below is what the ENGINE maintains.
+    ticker();
+    auto xfOf = [&](int limb, BodyTransform& out) {
+      const uint64_t b = mobs.LimbBody(id, limb);
+      return b != 0 && phys.GetTransform(b, out);
+    };
+    std::vector<Strap> straps;
+    for (int s = baseLimbs; s < mob->LimbCount(); s++) {
+      // By DEF PARENT NAME rather than through MobLimb::wornHost: the A/B arm
+      // (SANDVOX_NO_RIGWELD) does not set that field, and an arm that could not
+      // find the shells would report a clean zero for the behaviour it exists
+      // to demonstrate — a fixture measuring itself.
+      if (mob->LimbDefAt(s).tag != "worn") continue;
+      const std::string& parent = mob->LimbDefAt(s).parent;
+      int host = -1;
+      for (int p = 0; p < baseLimbs; p++)
+        if (mob->LimbDefAt(p).name == parent) { host = p; break; }
+      BodyTransform hs{}, ss{};
+      if (host < 0 || !xfOf(host, hs) || !xfOf(s, ss)) continue;
+      const Quat hq{hs.quat[0], hs.quat[1], hs.quat[2], hs.quat[3]};
+      const Quat sq{ss.quat[0], ss.quat[1], ss.quat[2], ss.quat[3]};
+      Strap st;
+      st.shell = s;
+      st.host = host;
+      st.relPos = QuatRotateInv(hq, ss.pos - hs.pos);
+      st.relRot = QuatMul(QuatConj(hq), sq);
+      straps.push_back(st);
+    }
+    std::vector<Link> links;
+    for (int i = 0; i < baseLimbs && i < mob->LimbCount(); i++) {
+      const std::string& parent = mob->LimbDefAt(i).parent;
+      if (parent.empty()) continue;
+      int pi = -1;
+      for (int p = 0; p < baseLimbs; p++)
+        if (mob->LimbDefAt(p).name == parent) { pi = p; break; }
+      BodyTransform pp{};
+      if (pi < 0 || mobs.LimbBody(id, i) == 0 || !xfOf(pi, pp)) continue;
+      const Quat pq{pp.quat[0], pp.quat[1], pp.quat[2], pp.quat[3]};
+      Link l;
+      l.child = i;
+      l.parent = pi;
+      l.anchorInParent =
+          QuatRotateInv(pq, mobs.LimbAnchorPos(id, i) - pp.pos);
+      links.push_back(l);
+    }
+    a.shells = (int)straps.size();
+    a.links = (int)links.size();
+    debris.ResetUntunnelProbe();
+    // Limp from here, with whatever head start this arm asked for. minSeconds is
+    // long enough to cover the whole descent: a get-up part-way down would put
+    // the rig back on the pose pipeline and end the measurement early.
+    mob->StartRagdoll(12.0f, "gate");
+    mob->SetLimbVelocities(Vec3{0.0f, -hitVox, 0.0f});
+    for (int t = 0; t < ticks; t++) {
+      ticker();
+      a.ticks = t + 1;
+      if (!mobs.IsAlive(id)) break;        // splatted on landing: measured to here
+      if (mobs.RagdollPhaseOf(id) == 1 && a.limpAt < 0) a.limpAt = t;
+      // Only while LIMP: the claim is about the phase Jolt owns. A kinematic rig
+      // is posed by the animation and its shells by DriveWornShells off the same
+      // transforms, which is the case every other mob gate already covers.
+      if (mobs.RagdollPhaseOf(id) != 1) continue;
+      for (const Strap& st : straps) {
+        BodyTransform hs{}, ss{};
+        if (!xfOf(st.host, hs) || !xfOf(st.shell, ss)) continue;
+        const Quat hq{hs.quat[0], hs.quat[1], hs.quat[2], hs.quat[3]};
+        const Quat sq{ss.quat[0], ss.quat[1], ss.quat[2], ss.quat[3]};
+        const float d = (QuatRotateInv(hq, ss.pos - hs.pos) - st.relPos).len();
+        const Quat rel = QuatMul(QuatConj(hq), sq);
+        const Quat err = QuatMul(QuatConj(st.relRot), rel);
+        const float twist =
+            2.0f * std::acos(std::min(1.0f, std::fabs(err.w))) * 57.29578f;
+        if (d > a.drift) {
+          a.drift = d;
+          a.driftTick = t;
+          a.driftName = mob->LimbDefAt(st.shell).name;
+        }
+        a.twist = std::max(a.twist, twist);
+      }
+      for (const Link& l : links) {
+        BodyTransform pp{};
+        if (mobs.LimbBody(id, l.child) == 0 || !xfOf(l.parent, pp)) continue;
+        const Quat pq{pp.quat[0], pp.quat[1], pp.quat[2], pp.quat[3]};
+        const float gap =
+            (QuatRotateInv(pq, mobs.LimbAnchorPos(id, l.child) - pp.pos) -
+             l.anchorInParent).len();
+        if (gap > a.stretch) {
+          a.stretch = gap;
+          a.stretchName = mob->LimbDefAt(l.child).name;
+        }
+      }
+      for (int i = 0; i < baseLimbs; i++) {
+        const uint64_t b = mobs.LimbBody(id, i);
+        Vec3 lin{}, ang{};
+        if (b && phys.GetBodyVelocities(b, lin, ang))
+          a.peakSpeed = std::max(a.peakSpeed, lin.len() * kVoxelMeters);
+      }
+      a.lowest = std::min(a.lowest, mobs.MobRootPos(id).y);
+    }
+    const DebrisSystem::UntunnelProbe& up = debris.Untunnel();
+    a.holds = up.holds;
+    a.rigHolds = up.rigHolds;
+    a.released = up.released;
+    return a;
+  };
+
+  const double maxDrift = BaselineNumber("ragdollDressMaxShellDriftVox", 0.05);
+  const double maxTwist = BaselineNumber("ragdollDressMaxShellTwistDeg", 0.5);
+  const double maxStretch = BaselineNumber("ragdollDressMaxLimbStretchVox", 2.0);
+
+  // 200 voxels under gravity is ~3.2 s = 195 ticks; 300 leaves room for the
+  // landing and for a shorter drop if the window is tight.
+  const Arm fall = run(fallLift, 0.0f, 300);
+  const Arm slam = run(0.0f, 30.0f / kVoxelMeters, 90);
+
+  bool ok = true;
+  auto judge = [&](const char* what, const Arm& a, bool needLimp) {
+    const bool armOk = a.spawned && (!needLimp || a.limpAt >= 0) &&
+                       a.drift <= (float)maxDrift &&
+                       a.twist <= (float)maxTwist &&
+                       a.stretch <= (float)maxStretch;
+    std::printf(
+        "  ragdoll dress %s: %s (%d shells on %d links, limp at tick %d, %d "
+        "ticks, peak limb %.1f m/s; shell drift %.3f vox (cap %.2f, worst "
+        "\"%s\" at tick %d), twist %.2f deg (cap %.2f), limb stretch %.2f vox "
+        "(cap %.2f, worst \"%s\"); untunnel %u body-holds / %u rig-holds / %u "
+        "released)\n",
+        what, armOk ? "PASS" : "FAIL", a.shells, a.links, a.limpAt, a.ticks,
+        a.peakSpeed, a.drift, maxDrift, a.driftName.c_str(), a.driftTick,
+        a.twist, maxTwist, a.stretch, maxStretch, a.stretchName.c_str(),
+        a.holds, a.rigHolds, a.released);
+    ok = ok && armOk;
+  };
+  judge("fall", fall, /*needLimp=*/true);
+  judge("slam", slam, /*needLimp=*/true);
+
+  // A NAKED SUBJECT IS NOT A PASS. Every number above is a maximum over the
+  // shells, so with no worn content in the tree they are all zero and the gate
+  // would be green having measured nothing. `armor-wear` is what asserts the
+  // content exists; this says out loud that it did not find any.
+  if (fall.shells == 0 && slam.shells == 0) {
+    detail = "no worn item in the library fits " + std::string(kAvatarDefName) +
+             ": nothing was measured";
+    mobs.Reset();
+    debris.Reset();
+    SubmitWorldgen(ctx, world, sim, kDefaultSeed);
+    ctx.WaitIdle();
+    return Status::Skip;
+  }
+
+  detail = Format(
+      "fall %.0f vox: %d shells, drift %.3f / twist %.2f deg / stretch %.2f "
+      "vox at up to %.0f m/s (%u rig-holds); slam 30 m/s: drift %.3f / twist "
+      "%.2f / stretch %.2f; caps %.2f / %.2f / %.2f; fixture (%d,%d,%d) relief %d",
+      fallLift, fall.shells, fall.drift, fall.twist, fall.stretch,
+      fall.peakSpeed, fall.rigHolds, slam.drift, slam.twist, slam.stretch,
+      maxDrift, maxTwist, maxStretch, spot.x, h, spot.z, relief);
+  mobs.Reset();
+  debris.Reset();
+  SubmitWorldgen(ctx, world, sim, kDefaultSeed);
+  ctx.WaitIdle();
+  std::printf("ragdoll dress: %s\n", ok ? "PASS" : "FAIL");
+  return ok ? Status::Pass : Status::Fail;
+}
+
 // ---- ragdoll-falldamage -------------------------------------------------
 //
 // A LIMP BODY STILL HITS THE GROUND — AND A LIMP BODY IN FLIGHT DOES NOT.
@@ -5936,6 +6447,11 @@ const std::vector<Gate>& MobGates() {
       // ...and what a limp landing COSTS. Its own gate rather than another
       // `ragdoll` arm: that gate's arms inherit each other's tick phase.
       {"ragdoll-falldamage", "mob", {}, false, GateRagdollFallDamage,
+       /*needsRender=*/false},
+      // ...and whether the thing that landed is still ONE body. Dressed, limp,
+      // 50 m of fall: the clothes may not leave the limbs and the joints may not
+      // be torn open by the anti-tunnel clamp.
+      {"ragdoll-dress", "mob", {}, false, GateRagdollDress,
        /*needsRender=*/false},
   };
   return g;

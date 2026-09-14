@@ -160,6 +160,30 @@ constexpr uint64_t kShotInvGrimoireFrame = 260; // -> ..._grimoire.bmp
 // — the loot panel where the grimoire was (game/corpses.h). Last frame.
 constexpr uint64_t kShotInvLootFrame = 280;     // -> ..._loot.bmp; last frame
 
+// ---- --shot-jump: the AIRBORNE POSE's look-iteration harness ---------------
+//
+// The avatar's air pose is driven by `vel.y` (avatar.airPose, tuning.h), and
+// the only honest test of "does it look good" is a picture of each phase. This
+// runs the windowed game in third person, walks the body forward, jumps it, and
+// writes one BMP per phase.
+//
+// CAPTURED ON THE POSE'S OWN PHASE, NOT ON A FRAME NUMBER. Ticks and frames are
+// not 1:1 here (the fixed-step loop fires 0..4 ticks a frame), so a frame
+// schedule would photograph a different part of the arc on every machine and on
+// every frame rate — which is exactly what a look-iteration harness must not
+// do. The trigger is `PlayerAvatar::AirPoseVy()` crossing the thresholds the
+// pose itself blends on, so each picture is the shape it is named after.
+bool g_shotJump = false;
+// Frames of walking before the jump: enough for the world to stream, the gait
+// to reach steady state and the third-person boom to settle behind the body.
+constexpr uint64_t kShotJumpAtFrame = 220;
+// Hard stop, in case the body lands somewhere it cannot jump from again.
+constexpr uint64_t kShotJumpLastFrame = 420;
+// Which pictures are still owed, in the order the arc reaches them.
+enum class JumpShot { Rise, Apex, Fall, Land, Done };
+JumpShot g_shotJumpWant = JumpShot::Rise;
+const char* g_shotJumpPath = nullptr;  // set for exactly one frame, then taken
+float g_shotJumpVy = 0.0f;             // the vy that picture was taken at, m/s
 
 // --frames N (phase 4b D3): windowed verification harness. 0 = play normally.
 uint64_t g_harnessFrames = 0;
@@ -721,14 +745,79 @@ BurnMats ResolveBurnMats(const std::vector<MaterialDef>& mats) {
   return bm;
 }
 
+// ---- WHAT IS ON A BODY, AS THE HUD HAS TO DRAW IT ---------------------------
+//
+// The dominant coat material's colour: its authored `stain.color`, or its
+// darkest palette entry when it declares none — which is the very fallback
+// ParseStain itself applies, so the HUD and the world agree on what dried
+// blood looks like without either of them naming a hue.
+//
+// NO SWIZZLE, deliberately. materials.cpp's ParseColor stores 0xAABBGGRR so
+// the shader can unpack R out of the low byte, and that is byte-for-byte
+// ImGui's default IM_COL32 packing. The only thing that has to be forced is
+// ALPHA: a palette entry's is whatever the author wrote, and a stain drawn at
+// the liquid's own alpha would vanish. 0 means "nothing to draw".
+uint32_t CoatColorOf(const std::vector<MaterialDef>& mats, uint32_t mat) {
+  if (mat == 0 || mat >= mats.size()) return 0;
+  uint32_t c = mats[mat].gpu.stainColor;
+  if ((c & 0x00FFFFFFu) == 0) c = mats[mat].gpu.color1;
+  if ((c & 0x00FFFFFFu) == 0) return 0;
+  return (c & 0x00FFFFFFu) | 0xFF000000u;
+}
+
+// The material's authored NAME, copied into the UI's own buffer. Copied and
+// not pointed at because R replaces `mats` wholesale (see BodyPartUI).
+void CopyCoatLabel(const std::vector<MaterialDef>& mats, uint32_t mat,
+                   char* out, size_t n) {
+  out[0] = '\0';
+  if (mat == 0 || mat >= mats.size()) return;
+  std::snprintf(out, n, "%s", mats[mat].name.c_str());
+}
+
+// One figure slot's coat, folded from the limbs drawn as that segment.
+//
+// ACCUMULATED PER SLOT rather than assigned per limb, because BodySlotFor is
+// many-to-one: every non-hip spine part lands on the torso. Reading the coat
+// off whichever limb happened to be last would make a two-part torso report
+// half the blood that is on it.
+struct SlotCoat {
+  uint32_t voxels = 0, sumAmt = 0;
+  // Four candidate substances, folded from each contributing limb's own two.
+  // One more level of the approximation LimbCoat already documents: a body is
+  // realistically bloody, or wet, or bloody and wet, and a fifth distinct
+  // substance on one segment contributes to the totals but is not named.
+  uint32_t mat[4] = {}, amt[4] = {};
+  void Add(uint32_t m, uint32_t a) {
+    if (!m || !a) return;
+    for (int k = 0; k < 4; k++) {
+      if (mat[k] == m) { amt[k] += a; return; }
+      if (mat[k] == 0) { mat[k] = m; amt[k] = a; return; }
+    }
+  }
+  uint32_t Top() const {
+    uint32_t best = 0, bestAmt = 0;
+    for (int k = 0; k < 4; k++)
+      if (mat[k] && amt[k] > bestAmt) { best = mat[k]; bestAmt = amt[k]; }
+    return best;
+  }
+};
+
 void FillBodyUI(const PlayerAvatar& avatar, const BurnMats& burnMats,
+                const MobSystem& mobs, const std::vector<MaterialDef>& mats,
                 UIState& ui) {
   for (int i = 0; i < UIState::kSlotCount; i++) ui.body[i] = {};
   for (int i = 0; i < UIState::kSlotCount; i++)
     ui.body[i].label = BodySlotLabel(i);
+  ui.stainFrac = 0.0f;
+  ui.stainMat = 0;
+  ui.stainColor = 0;
+  ui.stainLabel[0] = '\0';
+  ui.stainHudMin = CurrentTuning().coat.hudMinFrac;
   const MobDef* def = avatar.Def();
   ui.bodyValid = def != nullptr;
   if (!def) return;
+  const uint64_t mobId = avatar.Id();
+  SlotCoat slotCoat[UIState::kSlotCount];
   // Walk the DEF's limbs, not PartCount() — the latter includes the borrowed
   // held-item slot, which is not part of the body.
   const int limbCount = (int)def->limbs.size();
@@ -771,7 +860,40 @@ void FillBodyUI(const PlayerAvatar& avatar, const BurnMats& burnMats,
           std::clamp((float)(cooked + charred * 2) / (float)(now * 2), 0.0f,
                      1.0f);
     }
+
+    // What is ON the limb. The ledger is recounted by the creature itself at
+    // its own bounded cadence (Mob::RecountCoat), so this is a read of three
+    // words per limb per frame and a clean body costs nothing.
+    if (const LimbCoat* lc = mobs.LimbCoatOf(mobId, i)) {
+      SlotCoat& sc = slotCoat[slot];
+      sc.voxels += lc->voxels;
+      sc.sumAmt += lc->sumAmt;
+      for (const CoatEntry& e : lc->top) sc.Add(e.mat, e.sumAmt);
+    }
   }
+
+  for (int i = 0; i < UIState::kSlotCount; i++) {
+    const SlotCoat& sc = slotCoat[i];
+    if (sc.voxels == 0) continue;
+    UIState::BodyPartUI& b = ui.body[i];
+    // The same amount-weighted fraction LimbCoat::Frac computes, over the
+    // union of the limbs this segment draws.
+    b.stainFrac = std::clamp(
+        (float)sc.sumAmt / (float)(kBodyStainAmtMax * sc.voxels), 0.0f, 1.0f);
+    b.stainMat = sc.Top();
+    b.stainColor = CoatColorOf(mats, b.stainMat);
+    CopyCoatLabel(mats, b.stainMat, b.stainLabel, sizeof b.stainLabel);
+  }
+
+  // Body-level, from the creature's own ledger rather than by averaging the
+  // slots: BodyCoat is over the BASE limbs, so a blood-soaked robe does not
+  // report the wearer as covered, and re-deriving it here would be a second
+  // answer to a question that already has one.
+  const LimbCoat whole = mobs.BodyCoat(mobId);
+  ui.stainFrac = std::clamp(whole.Frac(), 0.0f, 1.0f);
+  ui.stainMat = whole.top[0].mat;
+  ui.stainColor = CoatColorOf(mats, ui.stainMat);
+  CopyCoatLabel(mats, ui.stainMat, ui.stainLabel, sizeof ui.stainLabel);
 }
 
 // ---- the character panel's live avatar portrait -----------------------------
@@ -3047,6 +3169,9 @@ int main(int argc, char** argv) {
           "  --shot-mob <def>      Mob pose look iteration (def[:limb,...])\n"
           "  --shot-inventory      Character screen (I) with a damaged avatar,\n"
           "                        one frame to screenshot_inventory.bmp\n"
+          "  --shot-jump           Airborne pose look iteration: third person,\n"
+          "                        one BMP per phase of a jump (rise/apex/\n"
+          "                        fall/land), triggered on the pose's own vy\n"
           "  --time <0..1>         Time of day for --shot (0=midnight, 0.5=noon)\n\n"
           "Fluid lab:\n"
           "  --lab [scene]         Windowed fluid lab (basin|hill|faucet|pool|slosh|pond|worldlake)\n"
@@ -3136,6 +3261,14 @@ int main(int argc, char** argv) {
     else if (a == "--shot-inventory") {
       g_shotInventory = true;
       g_harnessFrames = kShotInvLootFrame;
+    }
+    // `--shot-jump` is the AIRBORNE POSE's look-iteration harness: walk the
+    // avatar in third person, jump it, and write one picture per phase of the
+    // arc. See the note at g_shotJump for why the captures are triggered by
+    // the pose's own vel.y rather than by a frame number.
+    else if (a == "--shot-jump") {
+      g_shotJump = true;
+      g_harnessFrames = kShotJumpLastFrame;
     }
     // `--duel-dummy` is the melee FEEL harness: a sword-armed human standing
     // three metres in front of the spawn, with nothing driving it. Mobs have no
@@ -3616,6 +3749,16 @@ int main(int argc, char** argv) {
     // edit — tuning.json keeps the shipped default. --fluid-bench sets it
     // per scene itself.
     if (labScene >= 0) tune.sim.fluidExciteMode = 1;
+    // --shot-jump photographs a POSE, and the default world drops the spawn in
+    // a forest: a third-person boom inside a pine is a picture of bark. Trees
+    // and cover off gives bare terrain to jump on and a clear line to the
+    // body. Forced here rather than in tuning.json because it feeds the shader
+    // constant prelude and therefore worldgen — it has to be true before the
+    // first chunk is generated, not toggled later.
+    if (g_shotJump) {
+      tune.debug.vegetation = 0;
+      tune.debug.groundCover = 0;
+    }
     SetCurrentTuning(tune);
   }
   // The authored edit layer named by worldgen.editLayer. Read here, before any
@@ -4784,6 +4927,91 @@ int main(int argc, char** argv) {
     // only has to be generous enough to reach it.
     if (g_parkDone) glfwSetWindowShouldClose(window, 1);
 
+    // --shot-jump: decide whether THIS frame is one of the four pictures.
+    //
+    // Run here, before the render, so the capture block downstream only has to
+    // check a pointer. The thresholds are read off the same tuning rows the
+    // pose blends on, so a picture called "rise" is the shape the tuck is
+    // authored at rather than "whatever 6 frames after the jump happened to
+    // be" — see the note at g_shotJump.
+    g_shotJumpPath = nullptr;
+    // A GROUNDED FRAME OF THE SAME BODY, FIRST. Judging an airborne pose in
+    // isolation is judging it against a memory: half of "does this look right"
+    // is whether the arms, the lean and the knee bend read as the SAME
+    // character who was walking a moment ago. This is the reference the other
+    // four are compared with, and it costs one frame.
+    if (g_shotJump && frameCounter == kShotJumpAtFrame - 20)
+      g_shotJumpPath = "screenshot_jump_walk.bmp";
+    if (g_shotJump && frameCounter > kShotJumpAtFrame &&
+        g_shotJumpWant != JumpShot::Done && avatar.Spawned()) {
+      const auto& av = CurrentTuning().avatar;
+      // OFF THE PLAYER, NOT OFF THE POSE. `AirPoseVy` is zero whenever
+      // avatar.airPose is off, so triggering on it would make this harness
+      // unable to photograph the thing it is supposed to be compared against —
+      // and an A/B whose control arm writes no files is not an A/B. The
+      // controller's own velocity is the same signal the pose reads anyway.
+      const float vy = player.vel.y * kVoxelMeters;   // voxels/s -> m/s
+      const bool air = !player.grounded;
+      // A FEW FRAMES OF AIR BEFORE THE FIRST PICTURE. The launch velocity is
+      // whole on the very first airborne frame while the pose is still blending
+      // in over ikBlendHalflife, so a bare `vy > threshold` photographs the
+      // standing pose with a jump's velocity attached — measured, 0.25 of the
+      // way in. This is not a fudge for the blend: no animation system snaps,
+      // and "what does the rig look like a tenth of a second into a jump" is
+      // the honest question.
+      static int airFrames = 0;
+      airFrames = air ? airFrames + 1 : 0;
+      switch (g_shotJumpWant) {
+        case JumpShot::Rise:
+          // Most of the way up the launch, so the tuck is nearly whole.
+          if (air && airFrames >= 5 && vy > av.airPoseRiseSpeed * 0.45f) {
+            g_shotJumpPath = "screenshot_jump_rise.bmp";
+            g_shotJumpWant = JumpShot::Apex;
+          }
+          break;
+        case JumpShot::Apex:
+          // The float shape is the vy == 0 end of the blend, by construction.
+          if (air && std::fabs(vy) < av.airPoseRiseSpeed * 0.15f) {
+            g_shotJumpPath = "screenshot_jump_apex.bmp";
+            g_shotJumpWant = JumpShot::Fall;
+          }
+          break;
+        case JumpShot::Fall:
+          // Committed descent. A jump off flat ground never reaches the full
+          // airPoseFallSpeed (it only regains its launch speed), so this asks
+          // for a fraction of the launch speed downward instead — the picture
+          // is of the reach shape coming in, which is what a jump shows.
+          if (air && vy < -av.airPoseRiseSpeed * 0.45f) {
+            g_shotJumpPath = "screenshot_jump_fall.bmp";
+            g_shotJumpWant = JumpShot::Land;
+          }
+          break;
+        case JumpShot::Land: {
+          // The landing PREPARE, taken off the ground probe's own weight
+          // rather than off "the last airborne frame". Those are not the same
+          // picture: the pose fades out over the IK half-life once the feet
+          // are down, so by the time the rig reads grounded the prepare has
+          // already begun unwinding and the photograph is of the `land`
+          // squash instead — a different system's work.
+          //
+          // ...OR the last airborne frame, whichever comes first. The probe's
+          // weight is squared against airPoseLandHeight, so a body that jumps
+          // off a lip and lands lower than it left never reaches the high end
+          // of it — and a harness that silently writes three files instead of
+          // four is worse than one that writes a slightly early fourth.
+          const bool deep = avatar.AirPoseLand() > 0.5f;
+          if ((deep && air) || player.grounded) {
+            g_shotJumpPath = "screenshot_jump_land.bmp";
+            g_shotJumpWant = JumpShot::Done;
+          }
+          break;
+        }
+        default:
+          break;
+      }
+      if (g_shotJumpPath) g_shotJumpVy = vy;
+    }
+
     // --shot-inventory's scripted schedule. Frame-counted rather than
     // wall-clocked so the same picture comes out on any machine.
     if (g_shotInventory) {
@@ -5427,6 +5655,56 @@ int main(int argc, char** argv) {
       // Keep the jump edge fed with `false` so a space held THROUGH a menu
       // does not read as a fresh press the instant it closes.
       eJump.Pressed(false);
+    }
+    // --shot-jump: walk forward and jump once, with nobody at the keyboard.
+    //
+    // A WALKING jump, not a standing one, because the travel lean is part of
+    // the pose (avatar.airPoseLean) and a standing jump shows none of it — the
+    // picture would be of half the feature. Sprint is off: a sprint jump is the
+    // loudest version of the lean and therefore the least useful one to judge
+    // the neutral shape from.
+    if (g_shotJump) {
+      if (frameCounter == 1) {
+        // The dev panel covers the half of the frame the body walks through,
+        // and it is the same reason --shot-inventory hides it: a harness whose
+        // whole output is a picture must not photograph the debug overlay.
+        ui.visible = false;
+        // MID-MORNING, NOT MIDNIGHT. A new world starts just after midnight,
+        // so the default picture is an unlit silhouette — which is useless for
+        // judging a POSE, the one thing this harness exists to show. The
+        // celestial clock is the game's own way to move the sun (the dev
+        // panel's time slider drives it); engage it with a scale change and
+        // then place it, rather than fast-forwarding thousands of ticks.
+        CelestialClock& sky = Celestial();
+        sky.SetScale(2.0f, tick);   // any value but 1.0 engages the clock
+        sky.SetScale(1.0f, tick);   // ...then back to real time, sun placed
+        const int64_t tpd = (int64_t)TicksPerDay(CurrentTuning());
+        sky.ticks = tpd * 42 / 100;   // ~10 a.m.: raking light, clear shapes
+        sky.prevTicks = sky.ticks;
+        sky.rem = 0;
+      }
+      player.fly = false;
+      ui.fly = false;
+      // Third person, or there is nothing to photograph: first person hides
+      // the body and keeps only the arms.
+      camMode = CameraMode::Third;
+      // RUN DIAGONALLY, so the camera gets a THREE-QUARTER view for free.
+      //
+      // In third person the body faces where it RUNS, not where the camera
+      // looks (avatar body facing, thirdperson.h), and the boom stays behind
+      // the CAMERA. So a forward+strafe input turns the body ~40 degrees out of
+      // the view and the picture shows the fore/aft leg scissor and the arms'
+      // depth — both of which a dead-astern shot flattens away entirely, and
+      // the scissor is most of what tells the four shapes apart.
+      // Nearly side-on (~70 degrees out of the view): a jump is read off its
+      // PROFILE — knee tuck, hip angle, the arms' fore/aft — and every one of
+      // those is a depth the camera flattens from behind.
+      pin.forward = 0.4f;
+      pin.strafe = 1.f;
+      pin.sprint = false;
+      cam.yaw = 0.6f;
+      cam.pitch = -0.12f;
+      pin.jumpPressed = (frameCounter == kShotJumpAtFrame);
     }
     // --autofly: hold W+sprint in fly mode, no human at the keyboard. Exists to
     // reproduce the streaming-shift stutter, which only appears when the window
@@ -8681,7 +8959,7 @@ int main(int argc, char** argv) {
       // authored TAG and side suffix rather than by part name, so any humanoid
       // rig fills the same figure. A limb the rig does not have stays absent
       // and simply is not drawn.
-      FillBodyUI(avatar, burnMats, ui);
+      FillBodyUI(avatar, burnMats, mobs, mats, ui);
       ui.locoState = avatar.Spawned() ? avatar.Locomotion().stateName : "";
       ui.spellCost = caster.compiled.manaCost;
       ui.spellWord = caster.compiled.wordCost;
@@ -10163,17 +10441,19 @@ int main(int argc, char** argv) {
       // cache, so nothing thrashes) and read back. The blocking readback is
       // legal here for the same reason it is in --shot: this is the last frame
       // of a harness run, not the frame path of a game.
-      if (g_shotInventory && (frameCounter == kShotInvGearFrame ||
-                              frameCounter == kShotInvCaptureFrame ||
-                              frameCounter == kShotInvGrimoireFrame ||
-                              frameCounter == kShotInvLootFrame)) {
-        const char* shotPath = frameCounter == kShotInvGearFrame
-                                   ? "screenshot_inventory.bmp"
-                               : frameCounter == kShotInvCaptureFrame
-                                   ? "screenshot_inventory_health.bmp"
-                               : frameCounter == kShotInvGrimoireFrame
-                                   ? "screenshot_inventory_grimoire.bmp"
-                                   : "screenshot_inventory_loot.bmp";
+      if ((g_shotInventory && (frameCounter == kShotInvGearFrame ||
+                               frameCounter == kShotInvCaptureFrame ||
+                               frameCounter == kShotInvGrimoireFrame ||
+                               frameCounter == kShotInvLootFrame)) ||
+          g_shotJumpPath) {
+        const char* shotPath =
+            g_shotJumpPath                       ? g_shotJumpPath
+            : frameCounter == kShotInvGearFrame  ? "screenshot_inventory.bmp"
+            : frameCounter == kShotInvCaptureFrame
+                ? "screenshot_inventory_health.bmp"
+            : frameCounter == kShotInvGrimoireFrame
+                ? "screenshot_inventory_grimoire.bmp"
+                : "screenshot_inventory_loot.bmp";
         const uint32_t W = ctx.width, H = ctx.height;
         rhi::Texture shotTex = ctx.device.CreateTexture(
             {W, H, 1}, ctx.surfaceFormat,
@@ -10223,10 +10503,20 @@ int main(int argc, char** argv) {
           // to say so out loud rather than print "wrote".
           uint64_t sum = 0;
           for (uint8_t b : px) sum += b;
-          if (WriteBmpFile(shotPath, px, W, H))
-            std::printf("wrote %s (%ux%u, pixel sum %llu%s)\n", shotPath, W, H,
+          if (WriteBmpFile(shotPath, px, W, H)) {
+            std::printf("wrote %s (%ux%u, pixel sum %llu%s)", shotPath, W, H,
                         (unsigned long long)sum,
                         sum == 0 ? " *** ALL BLACK ***" : "");
+            // THE PICTURE SAYS WHICH POSE IT IS. A file called "fall" proves
+            // nothing on its own — the whole claim of the air pose is that the
+            // shape is a function of vel.y, so the vy the shutter fired at
+            // belongs next to the filename or the harness is only asserting
+            // that four BMPs exist.
+            if (g_shotJumpPath)
+              std::printf(" | vy %+.2f m/s, air %.2f, land %.2f", g_shotJumpVy,
+                          avatar.AirPoseWeight(), avatar.AirPoseLand());
+            std::printf("\n");
+          }
         }
       }
 
