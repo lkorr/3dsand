@@ -389,10 +389,15 @@ PASS(copy_pArgs_pDispatch2, nullptr, PT_TICK, PIPE_NONE, K_COPY, 16,0,12, GRP_NO
      USES(TR(PArgsStage) TW(PDispatchArgs)))
 PASS(copy_pArgs_drawArgs, nullptr, PT_TICK, PIPE_NONE, K_COPY, 0,0,16, GRP_NONE, DYN_NONE, C_PARTICLES, 1,
      USES(TR(PArgsStage) TW(DrawArgs)))
+// A(Support): a particle that comes to rest against a WALL lands with air under
+// it and takes support from nothing, so flagSupportLoss's vacating-side rule
+// never sees it; `flagLandedUnsupported` raises the flag from the landing side
+// instead. `integrate` does not take this use — it writes no voxel.
 PASS(particleResolve, "particleResolve", PT_TICK, PIPE_P_RESOLVE, K_INDIRECT, IND_PDISPATCHARGS,0,0,
      GRP_SLIM_PART, DYN_NONE, C_PARTICLES, 1,
      USES(R(Materials) U(TickUBO) A(Claim) A(ParticleCounts) I(PDispatchArgs)
-          RW(Voxels) RW(ParticlesWrite) A(DirtyOut) R(PageTable) A(PageFaults)))
+          RW(Voxels) RW(ParticlesWrite) A(DirtyOut) A(Support) R(PageTable)
+          A(PageFaults)))
 
 // ---- phase 4b: gas particles (docs/PLAN_gas_particles.md stage 1) ---------
 //

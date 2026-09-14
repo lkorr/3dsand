@@ -231,6 +231,9 @@ bool SetSimField(Tuning& t, const std::string& name, float value) {
   static const IntEntry iFields[] = {
     {"partGravity", &Tuning::Sim::partGravity},
     {"partMaxVel", &Tuning::Sim::partMaxVel},
+    {"partBuoyMax", &Tuning::Sim::partBuoyMax},
+    {"partSettleSpeed", &Tuning::Sim::partSettleSpeed},
+    {"partFloatPatience", &Tuning::Sim::partFloatPatience},
     {"airDensity", &Tuning::Sim::airDensity},
     {"falloffPerCell", &Tuning::Sim::falloffPerCell},
     {"ejectSolid", &Tuning::Sim::ejectSolid},
@@ -651,6 +654,8 @@ bool LoadTuning(const std::string& path, Tuning& out) {
     ReadF(*g, "debrisRestitution", p.debrisRestitution, out, at);
     ReadF(*g, "debrisLinearDamping", p.debrisLinearDamping, out, at);
     ReadF(*g, "debrisAngularDamping", p.debrisAngularDamping, out, at);
+    ReadF(*g, "waterLinearDrag", p.waterLinearDrag, out, at);
+    ReadF(*g, "waterAngularDrag", p.waterAngularDrag, out, at);
     ReadF(*g, "terrainFriction", p.terrainFriction, out, at);
     ReadF(*g, "playerProxyFriction", p.playerProxyFriction, out, at);
     ReadF(*g, "explosionImpulseScale", p.explosionImpulseScale, out, at);
@@ -1245,6 +1250,9 @@ bool LoadTuning(const std::string& path, Tuning& out) {
     const std::string at = "sim";
     ReadI(*g, "partGravity", s.partGravity, out, at);
     ReadI(*g, "partMaxVel", s.partMaxVel, out, at);
+    ReadI(*g, "partBuoyMax", s.partBuoyMax, out, at);
+    ReadI(*g, "partSettleSpeed", s.partSettleSpeed, out, at);
+    ReadI(*g, "partFloatPatience", s.partFloatPatience, out, at);
     ReadI(*g, "airDensity", s.airDensity, out, at);
     ReadI(*g, "falloffPerCell", s.falloffPerCell, out, at);
     ReadI(*g, "ejectSolid", s.ejectSolid, out, at);

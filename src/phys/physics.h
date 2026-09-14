@@ -131,6 +131,25 @@ class Physics {
   bool GetBodyVelocities(uint64_t handle, Vec3& lin, Vec3& angRadPerSec) const;
   void SetBodyVelocities(uint64_t handle, Vec3 lin, Vec3 angRadPerSec);
 
+  // ---- buoyancy (docs/PLAN_debris_buoyancy.md phase 3) ----
+  // One tick of Archimedes for a body crossing a flat liquid surface at
+  // `surfaceYVoxel`. Jolt computes the submerged volume from the COLLIDER —
+  // exactly, per sub-shape — which is what buys the tilt and the bob: the
+  // upward impulse lands at the centre of the submerged part, not at the centre
+  // of mass, so a log with one end out of the water rights itself.
+  //
+  // `buoyancy` is rhoFluid / rhoBody, the ratio Jolt's own parameter means (1 =
+  // neutral, >1 floats, <1 sinks). It is the SAME ratio sim_particle.wgsl
+  // computes for a voxel in flight, off the same materials.json `density`, so a
+  // chip blown off a log and the log itself agree about which way is up.
+  //
+  // Does NOT wake a sleeping body, which is why it takes the Body rather than
+  // the BodyInterface overload: a raft that has come to rest is meant to stay
+  // asleep, and re-impulsing it every tick would mean nothing on water ever
+  // sleeps again (CLAUDE.md rule 2).
+  bool ApplyBuoyancy(uint64_t handle, float surfaceYVoxel, float buoyancy,
+                     float linearDrag, float angularDrag, float dt);
+
   // ---- joints (PLAN §B1) ----
   enum class JointType { Fixed, Hinge, Ball };
 

@@ -353,6 +353,9 @@ SPEC = [
     # sim: DETERMINISM-CRITICAL, integer only (CLAUDE.md rule 1)
     ("sim", "partGravity", "TUNE_PART_GRAVITY", "i", 22),
     ("sim", "partMaxVel", "TUNE_PART_MAX_VEL", "i", 1536),
+    ("sim", "partBuoyMax", "TUNE_PART_BUOY_MAX", "i", 88),
+    ("sim", "partSettleSpeed", "TUNE_PART_SETTLE_SPEED", "i", 24),
+    ("sim", "partFloatPatience", "TUNE_PART_FLOAT_PATIENCE", "u", 180),
     ("sim", "airDensity", "TUNE_AIR_DENSITY", "i", 10),
     ("sim", "falloffPerCell", "TUNE_FALLOFF_PER_CELL", "i", 6),
     ("sim", "ejectSolid", "TUNE_EJECT_SOLID", "u", 250),

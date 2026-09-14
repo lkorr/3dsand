@@ -119,6 +119,22 @@ struct Material {
   // Both are authored in materials.json under "stain" (see materials.h).
   stainPack   : u32,
   stainColor  : u32,
+  // ---- fluid coupling ----
+  // What a voxel of this material does while it is INSIDE a liquid — the word
+  // behind "a rock sinks in a pond and a plank washes about on top of it".
+  //   bits 0..3  : LIFT   0..15, how much of Archimedes it feels. 0 = liquids
+  //                do not touch this material at all (a flight stops dead at
+  //                the surface, which is what everything did before this word
+  //                existed). Which way it MOVES comes from `density`, not from
+  //                here.
+  //   bits 4..7  : DRAG   0..15, per-tick viscous damping, k/16 of velocity.
+  //   bits 8..11 : WANDER 0..15, lateral drift of something already floating,
+  //                in 1/256 voxel per tick.
+  //   bits 12..31: free — the next fluid rule goes here rather than into the
+  //                spare half of some unrelated field.
+  // Authored as `"fluid": {...}` in materials.json; see kFluidPack* in
+  // src/sim/materials.h, which is the side that packs it.
+  fluidPack   : u32,
 };
 
 // stainPack accessors — must match kStainPack* in src/sim/materials.h.
@@ -135,6 +151,14 @@ fn matWashes(m : Material) -> bool { return (m.stainPack & 0x80000000u) != 0u; }
 // Does this material stain what it touches at all? One comparison, so the sim
 // can reject the overwhelmingly common "no" before doing any other work.
 fn matStains(m : Material) -> bool { return (m.stainPack & 0x7u) != 0u; }
+
+// fluidPack accessors — must match kFluidPack* in src/sim/materials.h.
+// LIFT first and on its own line because it is the early-out: a material that
+// does not interact with liquids costs one comparison and nothing else, exactly
+// as matWindResponse == 0 does for the wind field.
+fn matFluidLift(m : Material)   -> u32 { return m.fluidPack & 0xFu; }
+fn matFluidDrag(m : Material)   -> u32 { return (m.fluidPack >> 4u) & 0xFu; }
+fn matFluidWander(m : Material) -> u32 { return (m.fluidPack >> 8u) & 0xFu; }
 
 // ---- wind coupling, authored per material (invariant 7) --------------------
 // Both are 0..15 and both are AUTHORED in materials.json ("wind": {"response":

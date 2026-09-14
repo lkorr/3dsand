@@ -2243,6 +2243,220 @@ int RunWaterfallShot(GpuContext& ctx, World& world, Simulation& sim) {
   return ctx.ReportVkValidation("--shot-waterfall") > 0 ? 1 : 0;
 }
 
+// --shot-debris-pond: the owner's own report, photographed
+// (docs/PLAN_debris_buoyancy.md). "I explode a tree and its voxels all fall on
+// top of the water and form a structure on top of the water."
+//
+// The `debris-float` gate measures this numerically in a sealed basin, which is
+// the right instrument for "did the iron reach the bed" and the wrong one for
+// the thing that was actually reported: a LOOK. So this is the real path end to
+// end — a generated pond, a wooden mass over it, and the blast's own ejecta
+// raining down — with the frame taken twice: once while the chips are still in
+// the air, and once after they have settled.
+//
+// The census printed beside the frames is what makes it more than a picture: it
+// counts wood ABOVE the waterline (the reported bug: a raft in the air) against
+// wood AT it, on the same voxels the camera is looking at.
+int RunDebrisPondShot(GpuContext& ctx, World& world, Simulation& sim,
+                      const std::vector<MaterialDef>& mats) {
+  // THE LAKE IS ASKED FOR BY NAME, not written down. `--shot`'s pond block and
+  // `--shot-fluid-pond` both carry the literal (258,-235) of a tile-hashed
+  // pond, and that site has already moved once — the first cut of this fixture
+  // probed there and found no water at all. The map knows where its water is:
+  // `World::WaterSiteDisc` is the authored lake (map.json's `home_lake`, the
+  // same disc the shader fills), and a map with no water site says so instead
+  // of photographing dry ground.
+  if (World::WaterSiteCount() <= 0) {
+    std::printf("--shot-debris-pond: the loaded map authors no water site\n");
+    return 1;
+  }
+  const World::PondDisc lake = World::WaterSiteDisc(0, kDefaultSeed);
+  const int kPx = lake.cx, kPz = lake.cz;
+  // WHY THE WINDOW HAS TO MOVE (the reason --shot's pond block gives): outside
+  // the residency window a lake shades through the far-field cascade as flat
+  // colour with no surface and no bed, so debris floating on it would be
+  // invisible by construction. Floor division, not truncation — the authored
+  // lake can sit at a negative coordinate, and -235/16 is -14 in C++ where the
+  // chunk that holds it is -15.
+  const IVec3 here{(int)std::floor(kPx / (float)kChunk), 3,
+                   (int)std::floor(kPz / (float)kChunk)};
+  world.SetWindowOrigin({here.x - 8, 0, here.z - 8});
+  SubmitWorldgen(ctx, world, sim, kDefaultSeed);
+  ctx.WaitIdle();
+  FarField far;
+  far.Init(&world);
+  far.FullRefill(here);
+  uint32_t nfar;
+  while ((nfar = far.PrepareTick(ctx.queue)) > 0) {
+    TickParams tp{0, kDefaultSeed, 0, 0};
+    tp.farCount = nfar;
+    ctx.queue.WriteBuffer(world.tickUBO, 0, &tp, sizeof(tp));
+    rhi::CommandEncoder enc = ctx.device.CreateCommandEncoder();
+    sim.EncodeFarFill(enc, nfar);
+    ctx.queue.Submit(enc.Finish());
+  }
+
+  uint32_t waterId = 0, woodId = 0;
+  for (size_t i = 0; i < mats.size(); i++) {
+    if (mats[i].name == "water") waterId = (uint32_t)i;
+    else if (mats[i].name == "wood") woodId = (uint32_t)i;
+  }
+
+  uint32_t t = 0;
+  auto tick = [&](const std::vector<ExplosionOp>& exps,
+                  const std::vector<CellOp>& cells) {
+    SubmitTick(ctx, world, sim, ++t, kDefaultSeed, {}, exps, cells, false,
+               here, false, true);
+    ctx.WaitIdle();
+    ctx.ProcessEvents();
+  };
+  for (int i = 0; i < 30; i++) tick({}, {});
+
+  // WHERE THE WATER ACTUALLY IS, read off the grid rather than derived from
+  // TerrainHeight — which reports the carved floor in the middle of a bowl, and
+  // every literal height in this file that predated a worldgen change was
+  // rendering from inside rock.
+  int waterY = INT32_MIN;
+  {
+    std::vector<uint32_t> cbuf((size_t)kChunkVol);
+    const IVec3 wo = world.WindowOrigin();
+    for (int cy = wo.y; cy < wo.y + (int)kNChunk; cy++) {
+      ReadVoxelsSync(ctx, world,
+                     World::SlotChunkIndex({here.x, cy, here.z}), 1,
+                     cbuf.data(), "debrisPondProbe");
+      for (uint32_t j = 0; j < kChunkVol; j++)
+        if ((cbuf[j] & 0xFFFu) == waterId)
+          waterY = std::max(waterY, cy * (int)kChunk + (int)((j / kChunk) % kChunk));
+    }
+  }
+  if (waterY == INT32_MIN) {
+    std::printf("--shot-debris-pond: the map's water site is at (%d,%d) r%d "
+                "surf %d, but its centre chunk column holds no water voxel\n",
+                kPx, kPz, lake.r, lake.surf);
+    return 1;
+  }
+
+  // The subject: a wooden mass hanging over open water, blown apart in place.
+  // Not a real tree — a tree is rooted on land and the interesting half of the
+  // report is what the CHIPS do — but the same material, the same blast and the
+  // same ejecta path the owner was looking at.
+  // LOW, and it is a FRAMING number. At +26 the trunk was above the top of
+  // every frame a camera looking across the water could take, the blast was
+  // out of shot, and the chips arrived from nowhere. A mass 12 voxels up
+  // scatters into a tight patch the eye can hold in one view.
+  const int trunkY = waterY + 12;
+  std::vector<CellOp> build;
+  for (int y = 0; y < 14; y++)
+    for (int z = -3; z <= 3; z++)
+      for (int x = -3; x <= 3; x++)
+        build.push_back({World::SlotCellIndex({kPx + x, trunkY + y, kPz + z}),
+                         PackVoxNew(woodId, 0u)});
+  tick({}, build);
+  for (int i = 0; i < 4; i++) tick({}, {});
+
+  const uint32_t W = 1920, H = 1080;
+  rhi::Texture offscreen = ctx.device.CreateTexture(
+      {W, H, 1}, rhi::TextureFormat::RGBA8Unorm,
+      rhi::TextureUsage::RenderAttachment | rhi::TextureUsage::CopySrc,
+      "offscreen");
+  rhi::TextureView view = offscreen.CreateView();
+  const Tuning& shotTun = CurrentTuning();
+  const uint32_t ticksPerDay = TicksPerDay(shotTun);
+  const uint32_t shotTick =
+      (uint32_t)((double)g_shotTimeOfDay * (double)ticksPerDay) % ticksPerDay;
+  auto render = [&](Vec3 eye, Vec3 at, const char* path) {
+    const float dx = at.x - eye.x, dy = at.y - eye.y, dz = at.z - eye.z;
+    const float hd = std::sqrt(dx * dx + dz * dz);
+    Camera c;
+    c.yaw = std::atan2(dz, dx);
+    c.pitch = std::atan2(dy, hd);
+    WriteRenderParams(ctx.queue, world, eye, c, (float)W / H, true, 11.7f,
+                      kFarFogDensity, 1080.0f, shotTick);
+    rhi::CommandEncoder enc = ctx.device.CreateCommandEncoder();
+    sim.EncodeShadowResolve(enc);
+    rhi::RenderPass rp =
+        sim.BeginRenderPass(enc, view, rhi::TextureFormat::RGBA8Unorm, W, H);
+    sim.DrawWorld(rp);
+    rp.End();
+    ctx.queue.Submit(enc.Finish());
+    ctx.WaitIdle();
+    rhi::Buffer shotBuf = CreateBuffer(
+        ctx.device, (uint64_t)W * H * 4,
+        rhi::BufferUsage::MapRead | rhi::BufferUsage::CopyDst, "screenshot");
+    rhi::CommandEncoder enc2 = ctx.device.CreateCommandEncoder();
+    rhi::TexelCopyTexture srcT{};
+    srcT.texture = offscreen;
+    rhi::TexelCopyBuffer dstB{};
+    dstB.buffer = shotBuf;
+    dstB.bytesPerRow = W * 4;
+    dstB.rowsPerImage = H;
+    enc2.CopyTextureToBuffer(srcT, dstB, {W, H, 1});
+    ctx.queue.Submit(enc2.Finish());
+    std::vector<uint8_t> pixels((size_t)W * H * 4);
+    if (rhi::ReadBufferBlocking(ctx.device, shotBuf, 0, pixels.data(),
+                                pixels.size()) &&
+        WriteBmpFile(path, pixels, W, H))
+      std::printf("wrote %s\n", path);
+  };
+  // CLOSE. The authored lake is 100+ voxels across and the subject is a patch
+  // of chips a few voxels wide; from the bank it is a speck among the lilypads
+  // worldgen scatters over the same surface.
+  const Vec3 eye{(float)(kPx + 20), (float)(waterY + 7), (float)(kPz + 20)};
+  const Vec3 at{(float)kPx, (float)(waterY + 2), (float)kPz};
+
+  // The blast, then the frame WHILE IT IS IN THE AIR — the one that shows the
+  // chips on their way down rather than where they ended up.
+  tick({{kPx, trunkY + 6, kPz, 9, 900, 0, 0, 0}}, {});
+  for (int i = 0; i < 6; i++) tick({}, {});
+  render(eye, at, "screenshot_debris_pond_blast.bmp");
+
+  // ...and then after it has settled. 400 ticks is well past the point where a
+  // floater's bob has damped out (the gate measures ~40) and past
+  // sim.partFloatPatience, so anything still in flight here is a bug and shows
+  // up in the live count below.
+  for (int i = 0; i < 400; i++) tick({}, {});
+  render(eye, at, "screenshot_debris_pond.bmp");
+  // Straight down over the same patch: the framing-independent frame. A raft
+  // spread flat over the water and a tower standing on it look identical from
+  // the bank and nothing alike from above, which is the whole reported defect.
+  render({(float)kPx, (float)(waterY + 34), (float)(kPz + 1)},
+         {(float)kPx, (float)waterY, (float)kPz},
+         "screenshot_debris_pond_top.bmp");
+
+  // The census, over the column of chunks the blast could have reached: wood
+  // sitting ABOVE the waterline is the reported bug, wood AT it is the fix, and
+  // wood below it is a chip that sank (wood should not, so this is the third
+  // number rather than a lumped "not above").
+  int above = 0, atLine = 0, below = 0, lo = 1 << 30, hi = -(1 << 30);
+  {
+    std::vector<uint32_t> cbuf((size_t)kChunkVol);
+    const IVec3 wo = world.WindowOrigin();
+    for (int cy = wo.y; cy < wo.y + (int)kNChunk; cy++)
+      for (int cz = here.z - 3; cz <= here.z + 3; cz++)
+        for (int cx = here.x - 3; cx <= here.x + 3; cx++) {
+          ReadVoxelsSync(ctx, world, World::SlotChunkIndex({cx, cy, cz}), 1,
+                         cbuf.data(), "debrisPondCensus");
+          for (uint32_t j = 0; j < kChunkVol; j++) {
+            if ((cbuf[j] & 0xFFFu) != woodId) continue;
+            const int y = cy * (int)kChunk + (int)((j / kChunk) % kChunk);
+            lo = std::min(lo, y);
+            hi = std::max(hi, y);
+            if (y > waterY + 1) above++;
+            else if (y >= waterY) atLine++;
+            else below++;
+          }
+        }
+  }
+  uint32_t counts[2] = {};
+  ReadCountsSync(ctx, world, counts);
+  std::printf("--shot-debris-pond: waterline y%d, trunk y%d | wood %d above / "
+              "%d at the waterline / %d under, y%d..%d | %u particles still in "
+              "flight\n",
+              waterY + 1, trunkY, above, atLine, below, lo, hi,
+              std::min(counts[sim.Page()], kParticleCap));
+  return ctx.ReportVkValidation("--shot-debris-pond") > 0 ? 1 : 0;
+}
+
 // --shot-fluid: the MPM water counterpart of --shot. Worldgen, pour a pool of
 // MLS-MPM fluid onto open terrain with the same spawn-op shape the game's mpm
 // tool emits, let it slosh, then keep a narrow stream falling and write
@@ -3118,6 +3332,11 @@ int main(int argc, char** argv) {
   // spout and a plunge basin) and pours for 300 ticks, and paying that on
   // every look-iteration run of the other forty frames is the wrong trade.
   bool shotWaterfall = false;
+  // --shot-debris-pond: the buoyancy fixture (docs/PLAN_debris_buoyancy.md).
+  // Its own flag for the same reason the waterfall has one: it moves the
+  // residency window onto a generated pond, regenerates the world and runs
+  // 450 ticks, which is not a cost the other forty look frames should pay.
+  bool shotDebrisPond = false;
   // --shot-fluid-pond: the same harness aimed into a generated pond, so the
   // MPM isosurface has to share the frame with deep SETTLED water. Separate
   // process rather than an extra block in --shot-fluid because the scene moves
@@ -3164,6 +3383,8 @@ int main(int argc, char** argv) {
           "  --shot                Screenshot-only look iteration\n"
           "  --shot-fluid          MPM fluid screenshot mode\n"
           "  --shot-waterfall      Waterfall mist/spray fixture (CA liquid)\n"
+          "  --shot-debris-pond    Blow a wooden mass apart over a generated\n"
+          "                        pond: does the debris sink, float or hang?\n"
           "  --shot-fluid-pond     MPM fluid poured into a generated pond\n"
           "                        (the MPM/settled-water seam)\n"
           "  --shot-mob <def>      Mob pose look iteration (def[:limb,...])\n"
@@ -3237,6 +3458,7 @@ int main(int argc, char** argv) {
     else if (a == "--shot") shot = true;
     else if (a == "--shot-fluid") shotFluid = true;
     else if (a == "--shot-waterfall") shotWaterfall = true;
+    else if (a == "--shot-debris-pond") shotDebrisPond = true;
     else if (a == "--shot-fluid-pond") shotFluidPond = true;
     // Fluid lab modes. The scene argument is optional (it must not start
     // with '-' or it is the next flag).
@@ -3880,7 +4102,7 @@ int main(int argc, char** argv) {
   };
 
   GLFWwindow* window = nullptr;
-  if (!selftest && !shot && !shotWaterfall && !measure && !perf &&
+  if (!selftest && !shot && !shotWaterfall && !shotDebrisPond && !measure && !perf &&
       !fluidBench && !shaderStats &&
       shotMob.empty() && voxdumpArgs.empty() && !voxserve) {
     if (!glfwInit()) return 1;
@@ -3939,10 +4161,12 @@ int main(int argc, char** argv) {
     const bool voxelTool = voxserve || !voxdumpArgs.empty();
     const bool checkedOutput =
         selftest || verify || measure || perf || renderBudget || budgetArms ||
-        shot || shotFrames || shotWaterfall || shotFluid || shotFluidPond ||
+        shot || shotFrames || shotWaterfall || shotDebrisPond || shotFluid ||
+        shotFluidPond ||
         fluidBench || shaderStats || !shotMob.empty() || !sweepParam.empty();
     const bool rendersHorizon =
-        shot || shotFrames || shotWaterfall || shotFluid || shotFluidPond ||
+        shot || shotFrames || shotWaterfall || shotDebrisPond || shotFluid ||
+        shotFluidPond ||
         !shotMob.empty() || measure || perf || renderBudget || budgetArms ||
         shaderStats || suiteAcceptance ||
         (selftest && stOpt.only.empty() && !stOpt.list && sweepParam.empty());
@@ -4132,7 +4356,8 @@ int main(int argc, char** argv) {
   {
     const bool checkedOutput =
         selftest || verify || measure || perf || renderBudget || budgetArms ||
-        shot || shotFrames || shotWaterfall || shotFluid || shotFluidPond ||
+        shot || shotFrames || shotWaterfall || shotDebrisPond || shotFluid ||
+        shotFluidPond ||
         fluidBench || shaderStats || !shotMob.empty() || !sweepParam.empty();
     const bool voxelTool = voxserve || !voxdumpArgs.empty();
     sim.AllowDeferredFar(!checkedOutput || voxelTool);
@@ -4178,6 +4403,7 @@ int main(int argc, char** argv) {
   if (voxserve) return RunVoxServe(ctx, world, sim, mats);
   if (shot) return RunShots(ctx, world, sim);
   if (shotWaterfall) return RunWaterfallShot(ctx, world, sim);
+  if (shotDebrisPond) return RunDebrisPondShot(ctx, world, sim, mats);
   if (shotFluid || shotFluidPond)
     return RunFluidShot(ctx, world, sim, mats, shotFluidPond);
   if (fluidBench)

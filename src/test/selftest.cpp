@@ -173,7 +173,7 @@ const char* const kOrder[] = {
     "ca-gutter",
     "evaporation", "wind",      "wind-gas",   "wind-prim",
     "blood-stain", "flung-liquid", "fluid-det",     "fluid-settle",
-    "fluid-excite", "fluid-onwater", "fluid-stain", "fluid-react", "far-fog",  "far-downsample",
+    "fluid-excite", "fluid-onwater", "debris-float", "fluid-stain", "fluid-react", "far-fog",  "far-downsample",
     "far-persist",
     // `shadow-cache` recompiles raymarch.wgsl three times (its three arms are
     // const-folded, so they do not exist without a reload) and restores the

@@ -52,7 +52,7 @@
   "ragdollDressMaxShellTwistDeg": "0.5",
   "ragdollDressMaxLimbStretchVox": "4",
   "treeAtlasHash": "53691eda995f232e",
-  "determinismHash": "eb284643",  "determinism": "pass",
+  "determinismHash": "97ac0e71",  "determinism": "pass",
   "sleep": "pass",
   "ca-slope": "pass",
   "ca-slope-hybrid": "fail",

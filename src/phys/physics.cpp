@@ -1751,6 +1751,26 @@ void Physics::SetBodyVelocities(uint64_t handle, Vec3 lin, Vec3 angRadPerSec) {
   bi.SetAngularVelocity(id, JPH::Vec3(angRadPerSec.x, angRadPerSec.y, angRadPerSec.z));
 }
 
+bool Physics::ApplyBuoyancy(uint64_t handle, float surfaceYVoxel, float buoyancy,
+                            float linearDrag, float angularDrag, float dt) {
+  if (!system_ || handle == 0 || dt <= 0.0f) return false;
+  JPH::BodyLockWrite lock(system_->GetBodyLockInterface(), ToBodyID(handle));
+  if (!lock.Succeeded()) return false;
+  JPH::Body& body = lock.GetBody();
+  // Rigid and dynamic: ApplyBuoyancyImpulse asserts the first and dereferences
+  // the motion properties the second guarantees. ACTIVE as well — a velocity
+  // step written into a sleeping body is discarded, and waking it to receive
+  // one is how a raft at rest would come to cost forever.
+  if (!body.IsRigidBody() || !body.IsDynamic() || !body.IsActive()) return false;
+  // A flat surface at the waterline. The x/z of the surface POSITION are
+  // irrelevant to a horizontal plane and Jolt only uses it to place the plane,
+  // so 0 is not a hidden assumption about where the water is.
+  const JPH::RVec3 surface(0.0f, VoxToM(surfaceYVoxel), 0.0f);
+  return body.ApplyBuoyancyImpulse(surface, JPH::Vec3(0, 1, 0), buoyancy,
+                                   linearDrag, angularDrag, JPH::Vec3::sZero(),
+                                   system_->GetGravity(), dt);
+}
+
 void Physics::SetBodyAvatarLayer(uint64_t handle, bool isAvatar) {
   if (!system_ || handle == 0) return;
   JPH::BodyInterface& bi = system_->GetBodyInterface();

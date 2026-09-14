@@ -172,7 +172,85 @@ inline uint32_t DeriveWindFriction(int32_t density) {
   return (uint32_t)(f > (int32_t)kMatWindMax ? (int32_t)kMatWindMax : f);
 }
 
-// GPU-side layout, 64 bytes — must match struct Material in common.wgsl.
+// ---- fluid coupling, a WORD of its own -------------------------------------
+// How a voxel of this material behaves while it is INSIDE a liquid: whether the
+// liquid lifts it, how hard the liquid damps it, and how much it mills about on
+// the surface once it is floating. Read by sim_particle.wgsl (voxels in flight)
+// and by DebrisSystem (rigid bodies), so a rock sinks to the bed of a pond and a
+// plank washes about on top of it.
+//
+// WHY A NEW WORD rather than the bit-stealing every block above does. `flags`
+// has three bits left (two MATF_ spares and bit 31) — enough for the on/off
+// switch and nothing else, and the point of this block is that the NEXT rule
+// after these three has somewhere to go. Fluid coupling is a rule family, not a
+// flag: waterlogging (float now, sink after N ticks soaked), break-up on impact
+// with a surface, entrainment by a current, floating only in liquids one is
+// SIGNIFICANTLY lighter than. Every one of those is a number per material, and
+// scattering them through the spare halves of `emission`, `opacity` and
+// `hardness` is how a struct becomes unreadable. So MaterialGpu is 68 bytes
+// now; the table is 4096 entries, so the whole growth is 16 KiB of a buffer
+// nothing iterates linearly — the cost the bit-packing notes above were
+// avoiding was never the bytes, it was a stride change in a hot loop, and
+// `materials[mat]` is a scattered indexed read either way.
+//
+//   bits 0..3   : LIFT     0..15 — how much of Archimedes this material feels.
+//                 0 = this material does not interact with liquids at all and
+//                 keeps the pre-buoyancy behaviour (a flight stops dead at the
+//                 surface). 15 = full buoyancy: the liquid pushes up with
+//                 g * liquidDensity/myDensity, so whether it rises or sinks
+//                 comes from `density` and needs no authoring. Intermediate
+//                 values are for matter that is lighter than it looks (a
+//                 water-logged log) or heavier (a dense sponge).
+//   bits 4..7   : DRAG     0..15 — per-tick viscous damping, k/16 of velocity.
+//                 This is what makes water read as water rather than as thin
+//                 air: it caps sink speed and it is what turns a buoyant
+//                 particle's rise-overshoot-fall into a settling BOB instead of
+//                 a permanent oscillation.
+//   bits 8..11  : WANDER   0..15 — lateral drift of a particle already floating
+//                 at the surface, in 1/256ths of a voxel per tick. A leaf
+//                 skitters, a log barely moves. Also what keeps debris from
+//                 piling into a tower: a floater that cannot settle where it is
+//                 drifts until it finds free waterline.
+//   bits 12..31 : free. The next rule goes here.
+//
+// Authored in materials.json as `"fluid": {"lift": n, "drag": n, "wander": n}`;
+// any absent key takes the Derive* default below. Never hardcoded per material
+// in a shader (the wind block's invariant 7, same reasoning).
+constexpr uint32_t kFluidPackLiftShift = 0, kFluidPackLiftMask = 0xF;
+constexpr uint32_t kFluidPackDragShift = 4, kFluidPackDragMask = 0xF;
+constexpr uint32_t kFluidPackWanderShift = 8, kFluidPackWanderMask = 0xF;
+constexpr uint32_t kFluidMax = 15;
+
+// Solids and powders feel the liquid; liquids and gases do not.
+//
+// The class test is the whole default because buoyancy is EXACT from density —
+// unlike wind, where the derived default is a guess standing in for a size the
+// grid erased. What the default is really deciding is which populations enter
+// the new code path at all, and liquid/gas ejecta is deliberately left out: a
+// water voxel in flight landing in water is a merge (whose fullness has to go
+// somewhere), not a sink, and that is a different rule than this one.
+inline uint32_t DeriveFluidLift(uint32_t klass) {
+  return (klass == CLASS_SOLID || klass == CLASS_POWDER) ? kFluidMax : 0;
+}
+// Drag goes as 1/density, which is what quadratic drag does to acceleration at
+// a fixed voxel size (decel ~ 1/m). Light debris is stopped by water almost at
+// once; an iron bar keeps most of its speed and knifes to the bottom.
+inline uint32_t DeriveFluidDrag(int32_t density) {
+  int32_t d = density > 0 ? density : 1;
+  int32_t k = 2400 / d;
+  if (k < 1) k = 1;
+  return (uint32_t)(k > (int32_t)kFluidMax ? (int32_t)kFluidMax : k);
+}
+// Wander goes the same way and floors at 0: heavy things do not skitter, and 0
+// is a real answer here (unlike drag, where 0 would mean water has no viscosity
+// at all). 1200 is half the drag constant, so a leaf wanders and stone does not.
+inline uint32_t DeriveFluidWander(int32_t density) {
+  int32_t d = density > 0 ? density : 1;
+  int32_t w = 1200 / d;
+  return (uint32_t)(w > (int32_t)kFluidMax ? (int32_t)kFluidMax : w);
+}
+
+// GPU-side layout, 68 bytes — must match struct Material in common.wgsl.
 struct MaterialGpu {
   uint32_t klass;
   int32_t density;
@@ -187,8 +265,9 @@ struct MaterialGpu {
   uint32_t molten;                  // laser/heat product ID (0 = vaporize to air)
   uint32_t stainPack;               // packed staining behaviour (see below)
   uint32_t stainColor;              // RGBA8 the renderer paints for this stain
+  uint32_t fluidPack;               // packed liquid coupling (see above)
 };
-static_assert(sizeof(MaterialGpu) == 64, "must match common.wgsl Material");
+static_assert(sizeof(MaterialGpu) == 68, "must match common.wgsl Material");
 
 // ---- staining (MaterialGpu.stainPack) --------------------------------------
 // A staining liquid marks the voxels it touches with a stain type + amount in
@@ -400,6 +479,13 @@ struct MaterialDef {
   // knowing the layout. Always populated, whether authored or derived.
   uint32_t windResponse = 0;
   uint32_t windFriction = 0;
+  // Unpacked mirrors of gpu.fluidPack (kFluidPack* above), same contract as the
+  // wind pair: the packed word is the truth, these exist so the tuner and the
+  // wiki can read a value back without knowing the layout. Always populated,
+  // whether authored or derived.
+  uint32_t fluidLift = 0;
+  uint32_t fluidDrag = 0;
+  uint32_t fluidWander = 0;
   // FAR-FIELD LOOK-ALIKE (materials.json "far": "<material name>"). Names the
   // material whose far palette slot this one shares -- "at cascade distance I
   // am that". Empty = this material owns a slot of its own. Resolved by name

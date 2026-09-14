@@ -1942,6 +1942,240 @@ Status GateFluidOnWater(Ctx& c, std::string& detail) {
   return ok ? Status::Pass : Status::Fail;
 }
 
+// ---- debris-float --------------------------------------------------------
+// DEBRIS MEETS A POND (docs/PLAN_debris_buoyancy.md). Owner report, 2026-09-13:
+// explode a tree over water and the chips build a structure ON the surface —
+// they neither sink nor float, they stop dead on the film and stack.
+//
+// The fixture is a sealed basin with eight settled layers of water, and it runs
+// BOTH populations against it in one boot, because the interesting property is
+// that they part ways:
+//
+//   * IRON (7600) must end up UNDER the waterline, on the bed. Reaching the bed
+//     is the half that needs the "may displace a liquid it is denser than" rule
+//     in resolve — the cell a sinking voxel comes to rest in is water, not air,
+//     and without that rule it proposes a cell it can never be given, forever.
+//   * WOOD (600) must end up AT the waterline and nowhere else. Two thresholds,
+//     not one: too deep means buoyancy is not holding it up, and too HIGH is
+//     the reported bug — a chip that stopped on the film, or a second chip that
+//     stacked on the first.
+//
+// Both arms come from the same `density` field with nothing authored per
+// material, which is the design claim as much as it is the fixture's
+// convenience. The particle count at the end is the rule-2 half: a floater that
+// never settles is a live particle forever, so "the ring drained" is the
+// statement that the bob terminates.
+//
+// The BODY arm asks the same question of the other representation. A felled
+// trunk is not particles — it is one Jolt body, and liquids are not in the
+// collider, so a wooden body used to sink through a lake exactly like an iron
+// one. The iron cube is the control, and in this fixture it is a STARK one:
+// the basin is written as CellOps into a harness world that never builds a
+// terrain collider under it, so the iron cube falls through the bed, through
+// the floor and out of the bottom of the world (measured: y -31 after 66
+// ticks). The wood cube, dropped beside it in the same tick from the same
+// height, stops at y 116. Nothing in this fixture can hold either of them up
+// except the water, which makes the differential exactly the claim: the only
+// thing between the wood and the same fate is Archimedes.
+//
+// Both thresholds also hold in the other regime, so a future harness that DOES
+// build collision here does not silently invert the test — the iron would rest
+// on the bed at 111, still under `bedY + 4`.
+Status GateDebrisFloat(Ctx& c, std::string& detail) {
+  GpuContext& ctx = c.ctx;
+  World& world = c.world;
+  Simulation& sim = c.sim;
+
+  uint32_t waterId = 0, woodId = 0, ironId = 0;
+  for (size_t i = 0; i < c.mats.size(); i++) {
+    if (c.mats[i].name == "water") waterId = (uint32_t)i;
+    else if (c.mats[i].name == "wood") woodId = (uint32_t)i;
+    else if (c.mats[i].name == "iron") ironId = (uint32_t)i;
+  }
+  if (!waterId || !woodId || !ironId) {
+    detail = "need materials water/wood/iron";
+    return Status::Fail;
+  }
+
+  const int px = 96, pz = 96, RB = 7;
+  const int bedY = 110, roofY = 127;
+  const int waterTop = bedY + 8;   // 118: the topmost settled layer
+  const int dropY = 124;           // the air pocket above it
+  const int kSpawnTick = 6, kTicks = 320;
+
+  SubmitWorldgen(ctx, world, sim, kDefaultSeed);
+  ctx.WaitIdle();
+
+  std::vector<CellOp> box;
+  auto put = [&](int x, int y, int z, uint32_t m, uint32_t state = 0) {
+    box.push_back({World::SlotCellIndex({x, y, z}),
+                   (m & 0xFFFu) | (state << 12)});
+  };
+  for (int y = bedY - 1; y <= roofY + 1; y++)
+    for (int z = -RB; z <= RB; z++)
+      for (int x = -RB; x <= RB; x++) {
+        const bool shell = x <= -RB + 1 || x >= RB - 1 || z <= -RB + 1 ||
+                           z >= RB - 1 || y <= bedY || y >= roofY;
+        if (shell) put(px + x, y, pz + z, kMatStone);
+        else if (y <= waterTop) put(px + x, y, pz + z, waterId, 7u);
+        else put(px + x, y, pz + z, kMatAir);
+      }
+
+  // One voxel per column, columns kept apart, so a landing site is never
+  // contested: this gate is about where matter COMES TO REST, and two chips
+  // arguing over one cell is the claim system's business, tested elsewhere.
+  std::vector<ParticleSpawn> drop;
+  auto chip = [&](int x, int z, uint32_t mat) {
+    ParticleSpawn s{};
+    s.px = ((px + x) << 8) + 128;
+    s.py = (dropY << 8) + 128;
+    s.pz = ((pz + z) << 8) + 128;
+    s.vy = -64;  // a quarter voxel a tick: arriving, not drifting
+    s.payload = mat & 0xFFFu;
+    s.flags = kPFlagAlive;
+    drop.push_back(s);
+  };
+  int nIron = 0, nWood = 0;
+  for (int z = -4; z <= -2; z++)
+    for (int x = -4; x <= -2; x++) { chip(x, z, ironId); nIron++; }
+  for (int z = 2; z <= 4; z++)
+    for (int x = 2; x <= 4; x++) { chip(x, z, woodId); nWood++; }
+
+  uint32_t t = 60000;
+  for (int i = 0; i < kTicks; i++) {
+    std::vector<CellOp> cops;
+    if (i == 0) cops = box;
+    std::vector<ParticleSpawn> sp;
+    if (i == kSpawnTick) sp = drop;
+    SubmitTick(ctx, world, sim, ++t, kDefaultSeed, {}, {}, cops, false,
+               {6, 7, 6}, false, i >= kSpawnTick, sp);
+    ctx.WaitIdle();
+    ctx.ProcessEvents();
+  }
+
+  uint32_t counts[2] = {};
+  ReadCountsSync(ctx, world, counts);
+  const uint32_t liveEnd = std::min(counts[sim.Page()], kParticleCap);
+
+  // Where did each population come to rest?
+  int ironLo = 1 << 30, ironHi = -(1 << 30), woodLo = 1 << 30,
+      woodHi = -(1 << 30);
+  int ironCells = 0, woodCells = 0;
+  std::vector<uint32_t> cbuf((size_t)kChunkVol);
+  for (int cy = (bedY - 1) / 16; cy <= (roofY + 1) / 16; cy++)
+    for (int cz = (pz - RB) / 16; cz <= (pz + RB) / 16; cz++)
+      for (int cx = (px - RB) / 16; cx <= (px + RB) / 16; cx++) {
+        ReadVoxelsSync(ctx, world, World::SlotChunkIndex({cx, cy, cz}), 1,
+                       cbuf.data(), "debrisFloatVox");
+        for (uint32_t j = 0; j < kChunkVol; j++) {
+          const uint32_t m = cbuf[j] & 0xFFFu;
+          if (m != woodId && m != ironId) continue;
+          const int y = cy * 16 + (int)((j / 16) % 16);
+          if (m == ironId) {
+            ironCells++;
+            ironLo = std::min(ironLo, y);
+            ironHi = std::max(ironHi, y);
+          } else {
+            woodCells++;
+            woodLo = std::min(woodLo, y);
+            woodHi = std::max(woodHi, y);
+          }
+        }
+      }
+
+  // ---- the body arm --------------------------------------------------------
+  // Two 3x3x3 cubes dropped into the same basin, one of each material. The
+  // debris system has to be TICKED for this: PreTick is what pulls the basin
+  // into the CPU mirror, and FloatBodies reads the waterline out of that
+  // mirror. Without the warm-up loop below there is no water as far as the
+  // buoyancy probe is concerned and BOTH cubes fall through.
+  //
+  // SAMPLED PER TICK, not at the end, and that is not a style choice: a body
+  // that comes to rest on the bed is asleep 60 ticks later and SettleBodies
+  // converts it back to voxels, at which point its handle is gone and asking
+  // where it is answers "nowhere". The first cut of this arm read both centres
+  // after the loop, got two dead handles, and reported the same -1 for a body
+  // that had sunk and a body that had never been made.
+  uint64_t hWood = 0, hIron = 0;
+  float woodLowest = 1e9f, ironLowest = 1e9f;
+  int woodSeen = 0, ironSeen = 0;
+  auto tickBodies = [&](int n) {
+    for (int i = 0; i < n; i++) {
+      std::vector<CellOp> cellOps;
+      std::vector<ParticleSpawn> spawns;
+      c.debris.PreTick(++t, world, cellOps, spawns);
+      SubmitTick(ctx, world, sim, t, kDefaultSeed, {}, {}, cellOps, false,
+                 {6, 7, 6}, false, false, spawns);
+      ctx.WaitIdle();
+      ctx.ProcessEvents();
+      c.phys.Step(kTickDt);
+      c.debris.PostStep();
+      Vec3 com{};
+      if (hWood && c.phys.BodyCenterOfMass(hWood, com)) {
+        woodSeen++;
+        woodLowest = std::min(woodLowest, com.y);
+      }
+      if (hIron && c.phys.BodyCenterOfMass(hIron, com)) {
+        ironSeen++;
+        ironLowest = std::min(ironLowest, com.y);
+      }
+    }
+  };
+  tickBodies(40);
+  std::vector<float> density(c.mats.size(), 1000.0f);
+  for (size_t i = 0; i < c.mats.size(); i++)
+    density[i] = std::max(1.0f, (float)c.mats[i].gpu.density);
+  auto cube = [&](uint32_t mat, int ox, int oz, uint64_t& handle) {
+    std::vector<DebrisVoxel> vox;
+    for (int8_t z = 0; z < 3; z++)
+      for (int8_t y = 0; y < 3; y++)
+        for (int8_t x = 0; x < 3; x++)
+          vox.push_back(DebrisVoxel{x, y, z, 0, (uint16_t)mat});
+    handle = c.phys.CreateDebrisBody(vox, {px + ox, dropY, pz + oz}, density);
+    if (!handle) return false;
+    BodyTransform xf{};
+    xf.pos = Vec3{(float)(px + ox), (float)dropY, (float)(pz + oz)};
+    xf.quat[3] = 1;
+    c.debris.AdoptBody(handle, vox, xf);
+    return true;
+  };
+  const bool madeBodies = cube(woodId, -3, 0, hWood) && cube(ironId, 3, 0, hIron);
+  tickBodies(200);
+  const DebrisSystem::FloaterProbe& fp = c.debris.Floaters();
+
+  // The four claims, each failing for its own reason.
+  const bool sank = ironCells >= nIron - 1 && ironHi <= waterTop;
+  const bool floated = woodCells >= nWood - 1 && woodLo >= waterTop &&
+                       woodHi <= waterTop + 2;
+  const bool drained = liveEnd == 0;
+  // The body arm's thresholds are deliberately loose — it is asking "did these
+  // two end up in DIFFERENT places", not "how deep". The measure is the LOWEST
+  // each body ever got: a floating body that is later stamped back into the
+  // grid still never dipped, and a sinking one is not rescued by whatever
+  // happens to it afterwards. 5 voxels of daylight over the bed is a body on
+  // the water rather than under it.
+  const bool bodiesParted = madeBodies && woodSeen > 0 && ironSeen > 0 &&
+                            ironLowest <= (float)(bedY + 4) &&
+                            woodLowest >= (float)(bedY + 5);
+
+  const bool ok = sank && floated && drained && bodiesParted;
+  std::printf("debris-float: %s (iron %d/%d cells y%d..%d, bed %d | wood %d/%d "
+              "cells y%d..%d, waterline %d | live %u | bodies lowest wood "
+              "y%.1f (%d ticks) iron y%.1f (%d ticks), impulses %u, probes "
+              "%u/%u wet, surface y%.0f)\n",
+              ok ? "PASS" : "FAIL", ironCells, nIron, ironLo, ironHi, bedY + 1,
+              woodCells, nWood, woodLo, woodHi, waterTop + 1, liveEnd,
+              woodSeen ? woodLowest : -1.0f, woodSeen,
+              ironSeen ? ironLowest : -1.0f, ironSeen, fp.floatedBodies,
+              fp.floatProbes, fp.floatProbesWet, fp.floatLastSurfaceY);
+  detail = Format("iron y%d..%d (bed %d), wood y%d..%d (waterline %d), live %u,"
+                  " bodies lowest wood %.1f / iron %.1f",
+                  ironLo, ironHi, bedY + 1, woodLo, woodHi, waterTop + 1,
+                  liveEnd, woodSeen ? woodLowest : -1.0f,
+                  ironSeen ? ironLowest : -1.0f);
+  return ok ? Status::Pass : Status::Fail;
+}
+
 // ---- fluid-stain ---------------------------------------------------------
 // Staining parity across the seam (plan §6.2, task 4a): water voxels placed
 // CARRYING a foreign stain (type 3 — "blood-water") are excited, drain
@@ -3442,6 +3676,7 @@ const std::vector<Gate>& SimGates() {
       {"fluid-settle", "sim", {}, false, GateFluidSettle},
       {"fluid-excite", "sim", {}, false, GateFluidExcite},
       {"fluid-onwater", "sim", {}, false, GateFluidOnWater},
+      {"debris-float", "sim", {}, false, GateDebrisFloat},
       {"fluid-stain", "sim", {}, false, GateFluidStain},
       {"fluid-react", "sim", {}, false, GateFluidReact},
       {"prefab", "sim", {}, false, GatePrefab},

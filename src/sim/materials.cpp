@@ -416,6 +416,49 @@ static bool LoadMaterialsJson(const std::string& path, std::vector<MaterialDef>&
       d.gpu.flags |= (d.windFriction & kMatWindFricMask) << kMatWindFricShift;
     }
 
+    // ---- fluid coupling (kFluidPack* in materials.h) ----
+    // What a voxel of this does while it is inside a liquid. Same shape as the
+    // wind block above and for the same reasons: authored by name, absent means
+    // derived, out of range is an error rather than a wrap.
+    //
+    //   "fluid": { "lift": 0..15, "drag": 0..15, "wander": 0..15 }
+    //
+    // The one that carries meaning on its own is lift 0 — "liquids do not touch
+    // this" — which is how a material opts OUT of buoyancy entirely and keeps
+    // the older behaviour of stopping dead at the surface. Everything else is a
+    // strength, and which way a material MOVES is decided by `density` against
+    // the liquid's, never by a knob here.
+    {
+      const json* fj =
+          m.contains("fluid") && m["fluid"].is_object() ? &m["fluid"] : nullptr;
+      const int dLift = (int)DeriveFluidLift(d.gpu.klass);
+      const int dDrag = (int)DeriveFluidDrag(d.gpu.density);
+      const int dWander = (int)DeriveFluidWander(d.gpu.density);
+      int lift = fj ? fj->value("lift", dLift) : dLift;
+      int drag = fj ? fj->value("drag", dDrag) : dDrag;
+      int wander = fj ? fj->value("wander", dWander) : dWander;
+      if (lift < 0 || lift > (int)kFluidMax || drag < 0 ||
+          drag > (int)kFluidMax || wander < 0 || wander > (int)kFluidMax) {
+        errors += path + ": material \"" + d.name +
+                  "\": fluid lift/drag/wander must be 0..15\n";
+        auto cl = [](int v) {
+          return v < 0 ? 0 : (v > (int)kFluidMax ? (int)kFluidMax : v);
+        };
+        lift = cl(lift);
+        drag = cl(drag);
+        wander = cl(wander);
+      }
+      d.fluidLift = (uint32_t)lift;
+      d.fluidDrag = (uint32_t)drag;
+      d.fluidWander = (uint32_t)wander;
+      d.gpu.fluidPack = ((uint32_t)lift & kFluidPackLiftMask)
+                            << kFluidPackLiftShift |
+                        ((uint32_t)drag & kFluidPackDragMask)
+                            << kFluidPackDragShift |
+                        ((uint32_t)wander & kFluidPackWanderMask)
+                            << kFluidPackWanderShift;
+    }
+
     auto colors = m.value("colors", std::vector<std::string>{});
     if (colors.size() != 3) {
       errors += path + ": material \"" + d.name + "\": need exactly 3 colors\n";
