@@ -1026,6 +1026,33 @@ fn g2p(@builtin(global_invocation_id) gid : vec3<u32>) {
   let cell = vec3<i32>(p.px >> 16u, p.py >> 16u, p.pz >> 16u);
   if (!cellResident(cell, T.origin)) { return; }
   if (fluidSolid(cell)) {
+    // H1 DIAGNOSIS instrumentation (temporary). fluidArgs[34..39] are the
+    // spare tail of the 40-word map (the documented map stops at 33) and are
+    // CUMULATIVE — the seam's per-tick clear at the head of sim_fluid_seam
+    // does not touch them, so a gate reading them before and after a window
+    // sees the total for that window. This line is the only place in the
+    // engine where a LIVE particle's eighths are destroyed without being
+    // handed to a voxel or a reaction.
+    //
+    // fpAlive, not fpFullness alone: a DEAD spawn op carries attr 0x1000
+    // (mat 0, fullness 1), so fpFullness says 1 about a particle that never
+    // held anything. wbDrain's dead tail parks at (0,0,0), which is bedrock,
+    // so an unguarded probe here charges the block's whole dead tail to the
+    // kill every tick — measured at 207,574 "killed" eighths against 100,669
+    // that ever entered the pool.
+    //
+    // SPLIT BY CAUSE, because the two have different fixes: [34] is a kill in
+    // real CLASS_SOLID/CLASS_POWDER matter, [37] is a kill in SUBMERGED
+    // LIQUID (fluidSolid's sim.fluidSubmergedSolid arm — the body's own water
+    // is a floor, and a particle that ends up inside it is deleted).
+    if (fpAlive(p.attr)) {
+      let kw = voxWordAt(cell);
+      let kk = materials[voxMat(kw)].klass;
+      let hard = voxMat(kw) != MAT_AIR &&
+                 (kk == CLASS_SOLID || kk == CLASS_POWDER);
+      if (hard) { atomicAdd(&fluidArgs[34u], fpFullness(p.attr)); }
+      else { atomicAdd(&fluidArgs[37u], fpFullness(p.attr)); }
+    }
     p.attr = 0u;
     fluidParticles[gid.x] = p;
     atomicAdd(&fluidArgs[FA_DEAD], 1u);
