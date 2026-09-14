@@ -403,6 +403,11 @@ fn spawnAppend(@builtin(global_invocation_id) gid : vec3<u32>) {
   // produces a dead particle — this only COUNTS them, so a conservation gate
   // can subtract the block's tail from FA_LIVE and see the real in-flight mass.
   if (op.mat == 0u) { atomicAdd(&fluidArgs[FA_SPAWNDEAD], 1u); }
+  // H1 DIAGNOSIS instrumentation (temporary): cumulative eighths that actually
+  // entered the pool as LIVE particles. One eighth per live op, by construction
+  // (fpPack(op.mat, 1u, ...) below). This is the `E'` of pass H1's residual —
+  // the number the ledger's `drained` is supposed to equal.
+  if (op.mat != 0u) { atomicAdd(&fluidArgs[38u], 1u); }
   var p : FluidParticle;
   p.px = op.px; p.py = op.py; p.pz = op.pz;
   // The CFL cap is derived from the substep knob (common.wgsl), so a spawn op
@@ -1178,6 +1183,7 @@ fn exciteEmit(@builtin(workgroup_id) wg : vec3<u32>,
     markDirtyNext(c);
     atomicAdd(&fluidArgs[FA_EXCITED], fullness);
     atomicAdd(&fluidArgs[FA_EMITTED], fullness);
+    atomicAdd(&fluidArgs[36u], fullness);   // H1 DIAGNOSIS: cumulative
   }
 }
 
@@ -1819,6 +1825,7 @@ fn settleColumn(listIdx : u32, base : vec3<i32>, cx : i32, cz : i32,
     // audits and the splash sound cue actually want.
     if (write && existing > 0u) {
       atomicSub(&fluidArgs[FA_SETTLED], existing);
+      atomicSub(&fluidArgs[39u], existing);   // H1 DIAGNOSIS: cumulative net
     }
     if (pool > 0u && !floorOk) {
       if (rec) { atomicAdd(&fluidArgs[FA_SETFLOOR], 1u); }
@@ -1842,6 +1849,10 @@ fn settleColumn(listIdx : u32, base : vec3<i32>, cx : i32, cz : i32,
         markDirtyNext(base + vec3<i32>(cx, y, cz));
       }
       if (place > 0u) { atomicAdd(&fluidArgs[FA_SETTLED], place); }
+      // H1 DIAGNOSIS instrumentation (temporary): cumulative NET eighths the
+      // settle wrote into voxels, on the same net convention as FA_SETTLED
+      // (the atomicSub of `existing` above is mirrored below).
+      if (place > 0u) { atomicAdd(&fluidArgs[39u], place); }
     }
     if (place > 0u) {
       floorOk = true;   // water stacks on water
@@ -2147,6 +2158,9 @@ fn settleKill(@builtin(global_invocation_id) gid : vec3<u32>) {
   // the rest of the block committed. Same bit settleCommit consulted.
   let lo = vec3<u32>(cell & vec3<i32>(CHUNK_MASK));
   if (seamColumnRefused(mark & MARK_LIST_MASK, lo.z * CHUNK + lo.x)) { return; }
+  // H1 DIAGNOSIS instrumentation (temporary): cumulative eighths that died
+  // LEGITIMATELY, i.e. because settleCommit already wrote them into voxels.
+  atomicAdd(&fluidArgs[35u], fpFullness(p.attr));
   p.attr = 0u;
   fluidParticles[gid.x] = p;
   atomicAdd(&fluidArgs[FA_DEAD], 1u);

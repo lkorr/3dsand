@@ -130,9 +130,14 @@ struct VoxelTruth {
 // `yLo`/`yHi` override the descriptor's own water AABB. Pass H needs that: the
 // conservation box for a REAL drain has to contain the shaft and the chamber
 // the jet lands in, or the water that left the lake correctly reads as a leak.
+// H1 DIAGNOSIS instrumentation (temporary, see the block in pass H): `noDisc`
+// drops the disc filter so a sweep can answer "is any of the missing water
+// simply OUTSIDE the lake's disc and therefore invisible to this sweep?" — the
+// chamber is a 29x29 square around the lake centre and its corners sit at
+// d2 = 2*14^2 = 392, so a small enough basin would clip them.
 VoxelTruth SweepBasin(Ctx& c, const WaterBasin& b, const WaterBodyDesc& d,
                       uint32_t matId, int yLoOverride = 0,
-                      int yHiOverride = -1) {
+                      int yHiOverride = -1, bool noDisc = false) {
   VoxelTruth t;
   World& world = c.world;
   std::vector<uint32_t> chunk(kChunkVol);
@@ -176,7 +181,7 @@ VoxelTruth SweepBasin(Ctx& c, const WaterBasin& b, const WaterBodyDesc& d,
               const int x = cx * 16 + lx;
               if (x < d.lo.x || x > d.hi.x) continue;
               const int64_t dx = x - b.cx, dz = z - b.cz;
-              if (dx * dx + dz * dz > b.discD2Max) continue;
+              if (!noDisc && dx * dx + dz * dz > b.discD2Max) continue;
               const uint32_t w = chunk[(size_t)(lz * 16 + ly) * 16 + lx];
               if ((w & 0xFFFu) != matId) continue;
               at(x, y, z) = (uint8_t)(((w >> 12) & 0xFu) + 1u);
@@ -1108,6 +1113,26 @@ Status GateWaterBody(Ctx& c, std::string& detail) {
     // lake is still inside the sum.
     const int boxLo = chBot, boxHi = lakeGeo.surfY;
     const VoxelTruth h0 = SweepBasin(c, lakeGeo, lakeDesc, matId, boxLo, boxHi);
+    // ===== H1 DIAGNOSIS instrumentation (temporary) =========================
+    // The failure prints ONE number and rule 6 says a bare count is not a
+    // measurement. Three extra sweeps split the box into the two halves the
+    // identity is really about, because the residual algebraically reduces to
+    //
+    //     err = (particles actually spawned) - (eighths the ledger debited)
+    //           - (anything else that moved water out of the box)
+    //
+    // and those two families need different owners. The LAKE half above the
+    // chamber roof should fall by exactly `shaved` = drained - debit; the
+    // CHAMBER half should rise by exactly what landed. `noDisc` is the third:
+    // the sweep clips to the lake's disc, and the chamber is a SQUARE.
+    const int lakeLo = chTop + 1;    // shaft mouth upward: the lake's own water
+    const VoxelTruth h0L =
+        SweepBasin(c, lakeGeo, lakeDesc, matId, lakeLo, boxHi);
+    const VoxelTruth h0N =
+        SweepBasin(c, lakeGeo, lakeDesc, matId, boxLo, boxHi, true);
+    uint32_t fa0[kFluidArgsWords] = {};
+    ReadFluidArgsSync(c.ctx, world, fa0);
+    // =======================================================================
     uint32_t pfBefore[4] = {0, 0, 0, 0};
     ReadPageFaultsSync(c.ctx, world, pfBefore);
 
@@ -1119,12 +1144,33 @@ Status GateWaterBody(Ctx& c, std::string& detail) {
     uint64_t seen = 0, cand = 0;
     uint32_t samples = 0;
     tick = RunQuietTicks(c, tick, kDrainWindow, &seen, &cand, &samples);
+    // ===== H1 DIAGNOSIS instrumentation (temporary) =========================
+    // A MID-WINDOW sample, taken at the end of the draining ticks and before
+    // the settle. It separates "the loss accrues WITH the drain" (a per-eighth
+    // rule: a spawn that never happened, a settle that rounds down) from "the
+    // loss accrues while the pool SETTLES" (evaporation, the seam churning a
+    // surface). All reads, no writes, so the world the settle ticks see is the
+    // one they would have seen anyway.
+    const VoxelTruth hM = SweepBasin(c, lakeGeo, lakeDesc, matId, boxLo, boxHi);
+    const VoxelTruth hML =
+        SweepBasin(c, lakeGeo, lakeDesc, matId, lakeLo, boxHi);
+    const LedgerView lvM = ReadLedger(c);
+    uint32_t faM[kFluidArgsWords] = {};
+    ReadFluidArgsSync(c.ctx, world, faM);
+    const int64_t inFlightM = (int64_t)faM[7] - (int64_t)std::min(faM[29], faM[7]);
+    // =======================================================================
     // SETTLE, with the hole still open: the jet is still in flight and the
     // ledger still owes a debit the shave has not taken. Measuring before this
     // would charge the difference to the feature.
     tick = RunQuietTicks(c, tick, 90);
 
     const VoxelTruth h1 = SweepBasin(c, lakeGeo, lakeDesc, matId, boxLo, boxHi);
+    // ===== H1 DIAGNOSIS instrumentation (temporary) =========================
+    const VoxelTruth h1L =
+        SweepBasin(c, lakeGeo, lakeDesc, matId, lakeLo, boxHi);
+    const VoxelTruth h1N =
+        SweepBasin(c, lakeGeo, lakeDesc, matId, boxLo, boxHi, true);
+    // =======================================================================
     const LedgerView lv = ReadLedger(c);
     uint32_t fa[kFluidArgsWords] = {};   // ReadFluidArgsSync fills the whole map
     ReadFluidArgsSync(c.ctx, world, fa);
@@ -1137,6 +1183,107 @@ Status GateWaterBody(Ctx& c, std::string& detail) {
         (int64_t)h1.eighths + inFlight - debitNow - (int64_t)h0.eighths;
     uint32_t pfAfter[4] = {0, 0, 0, 0};
     ReadPageFaultsSync(c.ctx, world, pfAfter);
+
+    // ===== H1 DIAGNOSIS instrumentation (temporary) =========================
+    //
+    // THE DECOMPOSITION. Let E = cumulative emitted (WBS_DRAINED), D = the
+    // outstanding debit, S = cumulative eighths the shave actually removed.
+    // The ledger keeps D = E - S by construction, so S = E - D. Then over the
+    // two halves of the box:
+    //
+    //   LAKE  (above the chamber roof): should fall by exactly S.
+    //         lakeLeak = (h1L - h0L) + S
+    //   CHAMB (the rest of the box):    should gain what landed, and the rest
+    //         is still particles.
+    //         chLeak   = (h1 - h1L) - (h0 - h0L) + inFlight - E
+    //
+    //   err == lakeLeak + chLeak, identically. A negative lakeLeak means the
+    //   LAKE lost water nobody debited (evaporation, the seam, a shave that
+    //   over-took); a negative chLeak means the jet's eighths never arrived (a
+    //   spawn refused, a settle that rounds down, a particle that died).
+    {
+      const int64_t S = drainedNow - debitNow;
+      const int64_t lake0 = (int64_t)h0L.eighths, lake1 = (int64_t)h1L.eighths;
+      const int64_t ch0 = (int64_t)h0.eighths - lake0;
+      const int64_t ch1 = (int64_t)h1.eighths - lake1;
+      const int64_t lakeLeak = (lake1 - lake0) + S;
+      const int64_t chLeak = (ch1 - ch0) + inFlight - drainedNow;
+      const int64_t lakeM = (int64_t)hML.eighths;
+      const int64_t SM = lvM.At(hSlot, WBS_DRAINED) - lvM.At(hSlot, WBS_DEBIT);
+      const int64_t lakeLeakM = (lakeM - lake0) + SM;
+      const int64_t chLeakM = ((int64_t)hM.eighths - lakeM - ch0) + inFlightM -
+                              lvM.At(hSlot, WBS_DRAINED);
+      std::fprintf(
+          stderr,
+          "H1DIAG[%s] err %+lld = lakeLeak %+lld + chLeak %+lld\n"
+          "  lake  %lld -> %lld (%+lld), shaved S=%lld (drained %lld - debit "
+          "%lld)\n"
+          "  chamb %lld -> %lld (%+lld), inFlight %lld (live %u dead %u)\n"
+          "  MID-WINDOW (end of drain, before settle): err %+lld = lakeLeak "
+          "%+lld + chLeak %+lld ; drained %lld debit %lld inFlight %lld\n"
+          "  disc filter: box %llu -> %llu vs NO-DISC %llu -> %llu (d0 %+lld d1 "
+          "%+lld)\n"
+          "  ledger: volume %d area %d seen %d capped %d level %d floorY %d "
+          "surfY %d discD2Max %lld holeArea %d jetv %d\n"
+          "  relevel: credit %d givenT %d takenT %d rvcapped %d\n"
+          "  faults: %u %u 0x%08x 0x%08x\n"
+          "  fluidArgs delta: live %+lld dead %+lld emitted %+lld settled %+lld "
+          "excited %+lld refused %+lld consumed %+lld clamped %+lld "
+          "setrefused %+lld setunstable %+lld spawndead %+lld\n"
+          "  SEAM BOOKS (cumulative over the window, fluidArgs[34..39]):\n"
+          "    in : spawnedLive %lld + excited %lld = %lld\n"
+          "    out: g2p KILL-IN-HARD-SOLID %lld + g2p KILL-IN-SUBMERGED-LIQUID "
+          "%lld + settleKill %lld = %lld\n"
+          "    settle wrote %lld net eighths of voxels (settleKill %lld)\n"
+          "    in - out - liveDelta = %lld  (0 means the seam's books close)\n",
+          arm.name, (long long)err, (long long)lakeLeak, (long long)chLeak,
+          (long long)lake0, (long long)lake1, (long long)(lake1 - lake0),
+          (long long)S, (long long)drainedNow, (long long)debitNow,
+          (long long)ch0, (long long)ch1, (long long)(ch1 - ch0),
+          (long long)inFlight, fa[7], fa[29],
+          (long long)(lakeLeakM + chLeakM), (long long)lakeLeakM,
+          (long long)chLeakM, (long long)lvM.At(hSlot, WBS_DRAINED),
+          (long long)lvM.At(hSlot, WBS_DEBIT), (long long)inFlightM,
+          (unsigned long long)h0.eighths, (unsigned long long)h1.eighths,
+          (unsigned long long)h0N.eighths, (unsigned long long)h1N.eighths,
+          (long long)((int64_t)h0N.eighths - (int64_t)h0.eighths),
+          (long long)((int64_t)h1N.eighths - (int64_t)h1.eighths),
+          lv.At(hSlot, WBS_VOLUME), lv.At(hSlot, WBS_AREA),
+          lv.At(hSlot, WBS_SEEN), lv.At(hSlot, WBS_CAPPED),
+          lv.At(hSlot, WBS_LEVEL), lakeGeo.floorY, lakeGeo.surfY,
+          (long long)lakeGeo.discD2Max, lv.At(hSlot, WBS_HOLEAREA),
+          lv.At(hSlot, WBS_JETV), lv.At(hSlot, WBS_RVCREDIT_W),
+          lv.At(hSlot, WBS_RVGIVENT_W), lv.At(hSlot, WBS_RVTAKENT_W),
+          lv.At(hSlot, WBS_RVCAPPED_W), pfAfter[0] - pfBefore[0],
+          pfAfter[1] - pfBefore[1], pfAfter[2], pfAfter[3],
+          (long long)fa[7] - (long long)fa0[7],
+          (long long)fa[8] - (long long)fa0[8],
+          (long long)fa[9] - (long long)fa0[9],
+          (long long)fa[10] - (long long)fa0[10],
+          (long long)fa[11] - (long long)fa0[11],
+          (long long)fa[12] - (long long)fa0[12],
+          (long long)fa[16] - (long long)fa0[16],
+          (long long)fa[18] - (long long)fa0[18],
+          (long long)fa[25] - (long long)fa0[25],
+          (long long)fa[26] - (long long)fa0[26],
+          (long long)fa[29] - (long long)fa0[29],
+          (long long)fa[38] - (long long)fa0[38],
+          (long long)fa[36] - (long long)fa0[36],
+          (long long)(fa[38] - fa0[38]) + (long long)(fa[36] - fa0[36]),
+          (long long)fa[34] - (long long)fa0[34],
+          (long long)fa[37] - (long long)fa0[37],
+          (long long)fa[35] - (long long)fa0[35],
+          (long long)(fa[34] - fa0[34]) + (long long)(fa[35] - fa0[35]) +
+              (long long)(fa[37] - fa0[37]),
+          (long long)fa[39] - (long long)fa0[39],
+          (long long)fa[35] - (long long)fa0[35],
+          ((long long)(fa[38] - fa0[38]) + (long long)(fa[36] - fa0[36])) -
+              ((long long)(fa[34] - fa0[34]) + (long long)(fa[35] - fa0[35]) +
+               (long long)(fa[37] - fa0[37])) -
+              ((long long)fa[7] - (long long)fa0[7]));
+      std::fflush(stderr);
+    }
+    // ===== end H1 DIAGNOSIS instrumentation =================================
 
     if (ai == 0) {
       hEmit1 = drainedNow;
