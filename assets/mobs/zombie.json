@@ -20,7 +20,9 @@
     "radius": [0.35, 0.62],
     "maxLoss": 0.18,
     "blob": 3.0,
-    "vitalScale": 0.55
+    "vitalScale": 0.55,
+    "//stainScale": "HOW BLOODY THE HOLE IS. A multiple of gore.craterStainRim -- how far past the removed cells the wound soak reaches -- so retuning blood globally still reaches the undead. Above 1 because these wounds are OLD: one that has been open a while has bled around itself, where a fresh blade's kerf has not. It buys BOTH halves of what a wound looks like, which are different mechanisms: the REWRITE turns a mottled fraction of the exposed tissue into the creature's wound material (the blood voxels underneath), and the SMEAR lays a stain over everything the hole exposed including bone, which the rewrite refuses on purpose (the blood staining, and what stops a bite through the skull reading as clean bone). 0 would be a dry, bloodless rot -- for a husk or a bone creature that never had blood in it.",
+    "stainScale": 2.0
   },
 
   "//bleed": "Merged over human's block, so `material` and `perDamage` are inherited. woundHeals is stated rather than left to the `undead` default because THIS is the behaviour the owner asked for by name: a cut goes on rotting outward until the part drops off, which is what every body did before 2026-09-14 and what looked right on the undead and wrong on everything else.",

@@ -4496,9 +4496,14 @@ Status GateUndead(Ctx& c, std::string& detail) {
                        zd.limbs.size() == hd.limbs.size() &&
                        zd.prefab.artColors.size() == hd.prefab.artColors.size();
   // ...and the overrides on top of it actually landed.
+  // ...and it must still be ARMABLE. The NPC AI panel's creature list is every
+  // def publishing a `held_right` socket, because the panel arms what it
+  // spawns — so a variant that lost the inherited socket would silently
+  // vanish from that dropdown with nothing else going wrong.
   const bool overrides = zd.undead && !zd.woundHeals && hd.woundHeals &&
                          zd.rot.enabled && zd.speed < hd.speed &&
-                         zd.speed > 0.0f;
+                         zd.speed > 0.0f &&
+                         zd.FindSocket("held_right") >= 0;
 
   // The palette is a FILTER, so the claim is about the shape of the change and
   // not about any particular colour: greyer (chroma down) and no darker.
@@ -4600,21 +4605,76 @@ Status GateUndead(Ctx& c, std::string& detail) {
   // ---- D: no two are alike -------------------------------------------------
   const bool varies = la.size() == lb.size() && la != lb;
 
+  // ---- E: a rot hole is a WOUND, and it looks like one --------------------
+  // Owner report: a bite showed "just pale underneath, which doesn't look
+  // great". The soak has two halves and they are different mechanisms, so both
+  // are counted separately -- a regression that killed one would otherwise hide
+  // behind the other:
+  //   * WOUND-MATERIAL voxels: flesh rewritten to blood, the red in the hole.
+  //   * STAINED voxels: a tint laid OVER what the hole exposed, bone included
+  //     (which the rewrite refuses on purpose), so a bite through the skull
+  //     does not read as clean bone.
+  // Measured on the authoritative lattice through LimbLattice, and once again
+  // against the LIVING CONTROL ARM: an unrotted human must have neither, or
+  // "there is blood on it" is not a result.
+  auto gore = [&](uint64_t id, const Mob* m, uint32_t& wound, uint32_t& stain) {
+    wound = stain = 0;
+    for (int i = 0; i < m->LimbCount(); i++)
+      for (const PrefabVoxel& v : c.mobs.LimbLattice(id, i)) {
+        if (zd.woundMat && (uint32_t)(v.material & 0xFFFu) == zd.woundMat)
+          wound++;
+        if (v.stain) stain++;
+      }
+  };
+  uint32_t aWound = 0, aStain = 0, hWound = 0, hStain = 0;
+  gore(zA, ma, aWound, aStain);
+  gore(hId, mh, hWound, hStain);
+  // Fractions of the body, so the floor is a look rather than a voxel count
+  // that drifts with the art's resolution.
+  const double woundFrac = aAt0 ? (double)aWound / (double)aAt0 : 0.0;
+  const double stainFrac = aAt0 ? (double)aStain / (double)aAt0 : 0.0;
+  const double woundMin = BaselineNumber("undeadWoundFracMin", 0.02);
+  const double stainMin = BaselineNumber("undeadStainFracMin", 0.02);
+  // ---- THE CONTROL ARM IS NOT ZERO FOR THE REWRITE, AND MUST NOT BE --------
+  //
+  // A LIVING HUMAN ALREADY CONTAINS BLOOD VOXELS: its `anatomy` speckles the
+  // muscle layer with `blood` at fraction 0.06 (assets/mobs/human.json), baked
+  // into the .vox. Measured here at 182 of 26,494. So "the zombie has wound
+  // material and the human has none" is a FALSE claim that this gate asserted
+  // and failed on first run -- correctly, because the claim was wrong rather
+  // than the feature.
+  //
+  // The honest version is a RATIO against that baseline. The two halves of the
+  // soak therefore get different tests, which is right because they are
+  // different mechanisms: the rewrite must clear the anatomy's own blood by a
+  // wide margin, while the SMEAR is only ever applied by damage, so zero on an
+  // unhurt creature is a real and checkable claim for it.
+  const double hWoundFrac = hAt0 ? (double)hWound / (double)hAt0 : 0.0;
+  const double woundOverBase = BaselineNumber("undeadWoundOverAnatomy", 3.0);
+  const bool bloody = zd.rot.stainScale > 0.0f && woundFrac >= woundMin &&
+                      woundFrac >= hWoundFrac * woundOverBase &&
+                      stainFrac >= stainMin && hStain == 0;
+
   RecordObserved("undeadLossFrac", lossA);
   RecordObserved("undeadSpurPerLost", spurPerLost);
   RecordObserved("undeadChromaFrac", hChroma > 0 ? zChroma / hChroma : 0.0);
+  RecordObserved("undeadWoundFrac", woundFrac);
+  RecordObserved("undeadStainFrac", stainFrac);
 
   const bool ok = sameArt && overrides && paler && humanWhole && bitten &&
-                  hurt && intact && dry && chunky && varies;
+                  hurt && intact && dry && chunky && varies && bloody;
   detail = Format(
       "art/rig shared %d, overrides %d, palette chroma %.2f -> %.2f luma %.1f "
       "-> %.1f (%d), human whole %u/%u (%d), zombie %u/%u lost %.3f (%.2f..%.2f"
       ", %d), hp %.1f -> %.1f (%d), intact %d, dry %d, spurs/lost %.3f <= %.3f "
-      "(%d), varies %d",
+      "(%d), varies %d, blood: wound %.3f (>= %.3f and >= %.1fx anatomy "
+      "%.3f) stain %.3f (>= %.3f), human wound/stain %u/%u (%d)",
       sameArt ? 1 : 0, overrides ? 1 : 0, hChroma, zChroma, hLuma, zLuma,
       paler ? 1 : 0, hNow, hAt0, humanWhole ? 1 : 0, aNow, aAt0, lossA, lossMin,
       lossMax, bitten ? 1 : 0, hpH, hpA, hurt ? 1 : 0, intact ? 1 : 0,
-      dry ? 1 : 0, spurPerLost, spurMax, chunky ? 1 : 0, varies ? 1 : 0);
+      dry ? 1 : 0, spurPerLost, spurMax, chunky ? 1 : 0, varies ? 1 : 0,
+      woundFrac, woundMin, woundOverBase, hWoundFrac, stainFrac, stainMin,
+      hWound, hStain, bloody ? 1 : 0);
 
   c.debris.Reset();
   c.mobs.Reset();

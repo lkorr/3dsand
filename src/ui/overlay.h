@@ -349,6 +349,17 @@ struct UIState {
   // with, and a picker that cannot express it would need a second button.
   std::vector<std::string> aiWeaponNames;
   int aiWeaponPick = 0;
+  // WHICH CREATURE the Spawn tab's three buttons put in the world. Same
+  // contract as the weapon picker above and for the same reasons: rebuilt off
+  // the LIVE mob defs at load and on every R, re-found by name afterwards
+  // (a def index is directory order, and adding a creature renumbers it).
+  //
+  // The list is every def that publishes a `held_right` socket — the same
+  // eligibility test the spawn already applied, now surfaced instead of
+  // silently picking for you. That is also why the undead appear here with no
+  // UI edit: a zombie extends the human sidecar, so it inherits the socket.
+  std::vector<std::string> aiCreatureNames;
+  int aiCreaturePick = 0;
   bool aiSaveBehaviors = false;   // one-shot: write assets/mobs/behaviors.json
   bool aiApplyBehavior = false;   // one-shot: aiBehaviorPick -> the selected mob
   bool showAiDebug = false;       // in-world path / target / band viz

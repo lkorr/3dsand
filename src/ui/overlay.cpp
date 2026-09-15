@@ -1245,8 +1245,31 @@ void Overlay::Draw(UIState& s) {
       if (ImGui::BeginTabBar("##aitabs")) {
         // ---- Spawn -------------------------------------------------------
         if (ImGui::BeginTabItem("Spawn")) {
-          ImGui::TextDisabled("spawns a humanoid, a few metres ahead of you");
-          ImGui::TextDisabled("(or at the crosshair hit), armed with:");
+          ImGui::TextDisabled("spawns a creature, a few metres ahead of you");
+          ImGui::TextDisabled("(or at the crosshair hit):");
+          // WHICH CREATURE. Every mob def that can hold a weapon, mirrored by
+          // main.cpp off the live defs — so a new creature (or a variant
+          // sidecar like zombie.json) appears here on the next R with no list
+          // to keep in step by hand.
+          if (!s.aiCreatureNames.empty()) {
+            if (s.aiCreaturePick >= (int)s.aiCreatureNames.size())
+              s.aiCreaturePick = 0;
+            ImGui::SetNextItemWidth(160);
+            if (ImGui::BeginCombo("creature##ai",
+                                  s.aiCreatureNames[s.aiCreaturePick].c_str())) {
+              for (int i = 0; i < (int)s.aiCreatureNames.size(); i++) {
+                ImGui::PushID(i);
+                if (ImGui::Selectable(s.aiCreatureNames[i].c_str(),
+                                      i == s.aiCreaturePick))
+                  s.aiCreaturePick = i;
+                ImGui::PopID();
+              }
+              ImGui::EndCombo();
+            }
+            ImGui::TextDisabled("the undead walk slower, come apart when");
+            ImGui::TextDisabled("cut, and spawn already bitten");
+          }
+          ImGui::TextDisabled("armed with:");
           // WHICH WEAPON. Every melee item in the library plus "(unarmed)",
           // mirrored by main.cpp — so a blade added to items.json appears here
           // on the next R, with no list to keep in step by hand.

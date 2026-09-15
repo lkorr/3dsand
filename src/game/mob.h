@@ -253,6 +253,14 @@ struct MobRotDef {
   // Radius multiplier on a `vital` limb. A chunk out of the skull is the look;
   // losing the head at spawn is a corpse that never walked.
   float vitalScale = 0.55f;
+  // ---- HOW BLOODY THE HOLE IS ----------------------------------------------
+  // Multiplier on `gore.craterStainRim`: how far past the removed cells the
+  // wound soak reaches. A multiple rather than an absolute so retuning blood
+  // globally still reaches the undead. Above 1 because these wounds are OLD —
+  // one that has been open a while has bled around itself, where a blade's
+  // kerf has not. 0 disables the soak entirely (a dry, bloodless rot: bone
+  // creatures, husks, anything that never had blood in it).
+  float stainScale = 2.0f;
   // Limb NAMES or TAGS never bitten. A rig that would rather keep its hands.
   std::vector<std::string> skip;
 };

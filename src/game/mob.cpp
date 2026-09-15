@@ -757,6 +757,8 @@ bool LoadMobDefs(const std::string& dir, const std::vector<MaterialDef>& mats,
         rd.blob = std::max(0.5f, r.value("blob", rd.blob));
         rd.vitalScale = std::clamp(r.value("vitalScale", rd.vitalScale), 0.0f,
                                    1.0f);
+        rd.stainScale = std::clamp(r.value("stainScale", rd.stainScale), 0.0f,
+                                   8.0f);
         if (r.contains("skip") && r["skip"].is_array())
           for (const auto& s : r["skip"])
             if (s.is_string()) rd.skip.push_back(s.get<std::string>());
@@ -10744,6 +10746,7 @@ uint32_t Mob::RotAtSpawn(World& world) {
   // came out looking scuffed, and the number in the sidecar meant nothing.
   constexpr float kRotSphereFill = 0.19f;
 
+  const auto& gt = CurrentTuning().gore;
   // Nothing is thrown into the world (`eject` false) and nothing bleeds
   // (inSpawnRot_), so this stays empty; it exists because CarveLimb's signature
   // wants somewhere to put particles.
@@ -10967,6 +10970,45 @@ uint32_t Mob::RotAtSpawn(World& world) {
         },
         nullptr, &rep);
     removedTotal += rep.count;
+    // ---- A ROT HOLE IS A WOUND, AND IT LOOKS LIKE ONE ----------------------
+    //
+    // Owner report: "when voxels are missing they should have blood stained /
+    // blood voxels underneath ... right now some of them will spawn missing a
+    // bunch of their face or hair and its just pale underneath which doesn't
+    // look great." Exactly right, and the first version of this feature was
+    // deliberately dry — which was the wrong call. A bite is a hole torn in
+    // meat; meat bleeds into it.
+    //
+    // So rot goes through the SAME door the blast crater does: `StainWound`
+    // over the cells the carve actually removed. That buys both halves of what
+    // a wound looks like, and they are different mechanisms —
+    //
+    //   * the REWRITE turns a mottled fraction of the exposed tissue into the
+    //     creature's wound MATERIAL, which is the "blood voxels underneath";
+    //   * the SMEAR lays a stain OVER everything the hole exposed, bone
+    //     included (which the rewrite refuses on purpose), which is the "blood
+    //     stained" and is what stops a cut through bone reading as clean bone.
+    //
+    // Measured from the removed CELLS and not from a ball at their centroid,
+    // for the reason the crater's own note gives at length: a bite's removal
+    // chance falls to zero at its rim, so it is a scatter whose centroid is
+    // inside the limb, and a ball there paints the wrong place.
+    //
+    // NOTE what this does NOT do: bleed. `inSpawnRot_` already refused the drip
+    // budget inside CarveLimb, and StainWound has no drip in it — so the holes
+    // look wet and the creature is not haemorrhaging. That distinction is the
+    // whole reason the two are separate functions.
+    if (rep.count && !rep.cells.empty()) {
+      // Wider than a fresh blade's kerf by `stainScale`, because these are not
+      // fresh: a wound that has been open long enough to dry has bled around
+      // itself, and the owner asked for "more bloody generally around the
+      // chunks". Expressed as a MULTIPLE of the same gore knob the crater
+      // uses, so retuning blood globally still reaches the undead.
+      const float rim = std::max(0.0f, gt.craterStainRim * rd.stainScale);
+      if (rim > 0.0f)
+        StainWound((int)i, rep.centreLocal, 0.0f, seed ^ 0x5B100D1u,
+                   &rep.cells, rim);
+    }
     if (kRotDebug) {
       std::string rs;
       for (float r : radii) {

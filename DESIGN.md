@@ -4324,17 +4324,46 @@ Four properties worth stating because each cost something to get right:
   `blob` and the bite radius being the same order — which is the whole point —
   meant a bite sampled roughly ONE value and then removed everything or nothing,
   and most bites lost that coin flip and vanished.
-* **The holes are OLD.** `Mob::inSpawnRot_` joins the burn and the garment on
-  the line that decides whether a carve bleeds. The hp charge stays outside it,
-  for the reason the burn exclusion gives: the damage is real, only the blood is
-  refused. Without it a zombie arrives haemorrhaging from every hole it has ever
-  had.
+* **The holes are OLD, which is not the same as dry.** Two different things,
+  and the first version of this conflated them and shipped bloodless bites —
+  the owner's report was a zombie missing half its face with "just pale
+  underneath". A rot hole now goes through `StainWound` over the cells the carve
+  actually removed, exactly as a blast crater does, which buys both halves of
+  what a wound looks like: the **rewrite** turns a mottled fraction of the
+  exposed tissue into the creature's wound MATERIAL (the red *in* the hole), and
+  the **smear** lays a stain *over* everything the hole exposed, bone included —
+  which the rewrite refuses on purpose, and which is what stops a bite through
+  the skull reading as clean bone. `rot.stainScale` multiplies
+  `gore.craterStainRim`, above 1 because a wound that has been open a while has
+  bled around itself where a fresh kerf has not; 0 is a bloodless rot, for a
+  husk that never had blood in it.
+
+  What stays refused is **bleeding**: `Mob::inSpawnRot_` joins the burn and the
+  garment on the line deciding whether a carve tops up a drip budget, and
+  `StainWound` has no drip in it. So the holes look wet and the creature is not
+  haemorrhaging — which is exactly why the soak and the drip are separate
+  functions. The hp charge stays outside both, for the reason the burn exclusion
+  gives: the damage is real, only the bleeding is refused.
 
 Gate `undead` asserts all of it against a **living control arm** — the same
 measurement on a human must come back zero, or "voxels are missing" is not a
 result — plus two spawns of the same def differing per-limb (a per-def seed
 would pass every other claim and produce an army of identical corpses), and a
 spur count, since a voxel COUNT cannot tell a torn chunk from a fine sprinkle.
+
+One place that control arm is deliberately **not** zero, and it caught the gate
+out on first run: a living human already contains blood voxels, because its
+anatomy speckles the muscle layer with `blood` at fraction 0.06 (182 of 26,494
+measured). "The zombie has wound material and the human has none" is simply a
+false claim. So the rewrite is tested as a RATIO against that baseline, while
+the smear — which only damage ever applies — is tested against a true zero.
+
+The creature the **NPC AI panel** spawns is a dropdown over every def
+publishing a `held_right` socket (the eligibility test the spawn already applied
+silently — the panel arms what it spawns). The undead appear there with no UI
+edit, because a zombie extends the human sidecar and inherits the socket; the
+gate asserts that socket survives the merge, since losing it would drop the
+variant out of that list with nothing else going wrong.
 
 One bug found on the way out, and it was not in this feature: `--shot-mob`
 renders its own frames and so never ran the frame loop's `if (mbSet.dirty)

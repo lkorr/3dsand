@@ -4775,6 +4775,33 @@ int main(int argc, char** argv) {
       if (ui.aiWeaponNames[i] == want) ui.aiWeaponPick = i;
   };
   rebuildAiWeapons();
+  // WHICH CREATURE the panel spawns. Same contract as the weapon picker above,
+  // for the same reason: the list is rebuilt off the LIVE defs on every R and
+  // the selection is re-found BY NAME, because a def index is directory order
+  // and adding a creature would silently move the pick onto its neighbour.
+  //
+  // Eligibility is "publishes a held_right socket", which is the test the spawn
+  // ALREADY applied silently — the panel arms what it spawns, and a creature
+  // with no fist cannot be armed. Surfacing it as a list rather than resolving
+  // it to one def is the whole change; a variant sidecar (zombie.json extends
+  // human, so it inherits the socket) therefore appears with no UI edit.
+  auto rebuildAiCreatures = [&ui, &mobs, &avatarDefName]() {
+    const std::string was = (ui.aiCreaturePick >= 0 &&
+                             ui.aiCreaturePick < (int)ui.aiCreatureNames.size())
+                                ? ui.aiCreatureNames[ui.aiCreaturePick]
+                                : std::string();
+    ui.aiCreatureNames.clear();
+    for (const MobDef& d : mobs.Defs())
+      if (d.FindSocket("held_right") >= 0) ui.aiCreatureNames.push_back(d.name);
+    // First build defaults to the avatar's own species, which is the def the
+    // old code preferred when it picked for you — so the panel's behaviour is
+    // unchanged until somebody touches the combo.
+    const std::string want = was.empty() ? avatarDefName : was;
+    ui.aiCreaturePick = 0;
+    for (int i = 0; i < (int)ui.aiCreatureNames.size(); i++)
+      if (ui.aiCreatureNames[i] == want) ui.aiCreaturePick = i;
+  };
+  rebuildAiCreatures();
   // Creatures the AI panel put in the world, so its "kill all spawned" button
   // reaps exactly those and leaves content-placed mobs alone.
   std::vector<uint64_t> aiSpawnedMobs;
@@ -6333,6 +6360,9 @@ int main(int argc, char** argv) {
         }
         sim.UploadMicroBodies(ctx.queue, mbSet);
         mobs.SetDefs(std::move(mobDefs));
+        // After SetDefs, not before: the creature list is the LIVE defs, so a
+        // sidecar added or renamed on this R has to be in place first.
+        rebuildAiCreatures();
         // Behaviour profiles reload with the rest of the content. SetBehaviors
         // re-resolves every LIVE mob's profile by name, so retuning a duelist
         // and hitting R is visible on the duelists already fighting you rather
@@ -7084,10 +7114,24 @@ int main(int argc, char** argv) {
         // A humanoid that can actually HOLD the sword: picked by capability
         // (a `held_right` socket) rather than by name, so renaming an asset
         // cannot silently spawn an unarmed creature.
+        // WHAT THE PANEL PICKED, resolved BY NAME at spawn time for the reason
+        // the weapon pick below is: a def index is directory order, and the
+        // list can be rebuilt by an R reload between the click and here.
+        const std::string& creature =
+            ui.aiCreatureNames.empty()
+                ? avatarDefName
+                : ui.aiCreatureNames[ui.aiCreaturePick <
+                                             (int)ui.aiCreatureNames.size()
+                                         ? ui.aiCreaturePick
+                                         : 0];
         int aiDef = -1;
         for (size_t i = 0; i < mobs.Defs().size(); i++) {
           if (mobs.Defs()[i].FindSocket("held_right") < 0) continue;
+          // Fall back to the old rule — first eligible def, preferring the
+          // avatar's own species — if the pick names a def that has gone away
+          // under an R reload. Never spawn nothing because a name went stale.
           if (aiDef < 0 || mobs.Defs()[i].name == avatarDefName) aiDef = (int)i;
+          if (mobs.Defs()[i].name == creature) { aiDef = (int)i; break; }
         }
         if (aiDef >= 0) {
           // Crosshair hit when there is one, otherwise a few metres ahead on
