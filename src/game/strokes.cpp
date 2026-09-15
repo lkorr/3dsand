@@ -71,6 +71,51 @@ bool LoadAttackStyles(const std::string& path, StyleLibrary& out,
     // The optional body animation (strokes.h AttackStyle::clip). Whether a
     // rig HAS it is a mob-load question, answered there with a loader line.
     st.clip = s.value("clip", std::string());
+    // ---- WHAT SWINGS IT, and when (strokes.h; plan §4/§5) ------------------
+    // Every one of these defaults to the behaviour a style authored before
+    // they existed already had: the held weapon, never a fallback, the
+    // profile's reach, no leap, the chest. So the shipped library loads
+    // unchanged on a binary that has them and a file written against them
+    // loads on one that does not (the loader ignores unknown keys by design).
+    st.weapon = s.value("weapon", std::string("held"));
+    if (st.weapon.empty()) st.weapon = "held";
+    st.fallback = s.value("fallback", false);
+    st.reach = std::max(0.0f, s.value("reach", 0.0f));
+    if (s.contains("lunge") && s["lunge"].is_object()) {
+      const auto& l = s["lunge"];
+      st.lunge.ticks = std::max(0, l.value("ticks", 0));
+      st.lunge.speed = std::max(0.0f, l.value("speed", 0.0f));
+      st.lunge.rise = std::max(0.0f, l.value("rise", 0.0f));
+      st.lunge.at = l.value("at", std::string("windup"));
+      // Only two phases can OPEN a lunge: a leap during the recover is a
+      // creature throwing itself at somebody after the blow has landed, which
+      // is a content error rather than a move.
+      if (st.lunge.at != "windup" && st.lunge.at != "cut") {
+        log += path + ": style \"" + st.name + "\" lunges at \"" +
+               st.lunge.at + "\", which is not \"windup\" or \"cut\" — using "
+               "\"windup\"\n";
+        st.lunge.at = "windup";
+      }
+      if (st.lunge.ticks > 0 && !st.lunge.Any())
+        log += path + ": style \"" + st.name +
+               "\" has a lunge with no speed and no rise — it will not leap\n";
+    }
+    if (s.contains("target") && s["target"].is_object()) {
+      for (auto t = s["target"].begin(); t != s["target"].end(); ++t) {
+        if (!t.value().is_number()) continue;
+        const float w = t.value().get<float>();
+        if (w <= 0.0f) continue;   // a zero weight IS the absent entry
+        st.target.push_back(StyleTargetWeight{t.key(), w});
+      }
+      // Deterministic order, because the draw walks this vector and JSON
+      // object order is the library's business, not the author's. Two files
+      // that spell the same weights in a different order must pick the same
+      // limb from the same (mob, tick) — that is rule 1 applied to content.
+      std::sort(st.target.begin(), st.target.end(),
+                [](const StyleTargetWeight& a, const StyleTargetWeight& b) {
+                  return a.tag < b.tag;
+                });
+    }
     // A CUT THAT GOES NOWHERE IS NOT A CUT. It would pose the blade, commit
     // nothing, and hand back a stroke that could never damage anything — and
     // the only symptom would be an NPC that swings and never hits, which is
@@ -93,8 +138,14 @@ bool LoadAttackStyles(const std::string& path, StyleLibrary& out,
   // Parsed AFTER the styles so sectors resolve to indices right here, and
   // skipped as loudly as a bad style: a compass pointing at nothing is a
   // player who clicks and does not swing, which must never be silent.
-  if (j.contains("player") && j["player"].is_object()) {
-    const auto& p = j["player"];
+  //
+  // TWO BLOCKS THROUGH ONE READER: `player` (a weapon in the fist) and
+  // `playerUnarmed` (fists). One function, because a second copy of "resolve a
+  // sector to an index and skip it loudly" is a second place for the skip to
+  // stop being loud.
+  auto readMap = [&](const char* key, PlayerStrikeMap& map) {
+    if (!j.contains(key) || !j[key].is_object()) return;
+    const auto& p = j[key];
     for (const auto& s : p.value("sectors", json::array())) {
       if (!s.is_object()) continue;
       PlayerStrikeMap::Sector sec;
@@ -107,32 +158,34 @@ bool LoadAttackStyles(const std::string& path, StyleLibrary& out,
       const std::string name = s.value("style", "");
       sec.style = lib.Find(name);
       if (sec.style < 0 || (sec.x == 0.0f && sec.y == 0.0f)) {
-        log += path + ": player sector -> \"" + name +
+        log += path + ": " + key + " sector -> \"" + name +
                "\" is unknown or directionless — skipped\n";
         continue;
       }
-      lib.player.sectors.push_back(sec);
+      map.sectors.push_back(sec);
     }
     const auto& na = p.value("neutralAlternate", json::array());
     for (size_t i = 0; i < 2 && i < na.size(); i++) {
       if (!na[i].is_string()) continue;
       const std::string name = na[i].get<std::string>();
-      lib.player.neutral[i] = lib.Find(name);
-      if (lib.player.neutral[i] < 0)
-        log += path + ": player neutralAlternate \"" + name +
+      map.neutral[i] = lib.Find(name);
+      if (map.neutral[i] < 0)
+        log += std::string(path) + ": " + key + " neutralAlternate \"" + name +
                "\" is unknown — skipped\n";
     }
-  }
+  };
+  readMap("player", lib.player);
+  readMap("playerUnarmed", lib.playerUnarmed);
   out = std::move(lib);
   return true;
 }
 
-int QuantizeStrike(const StyleLibrary& lib, float dx, float dy) {
+int QuantizeStrike(const PlayerStrikeMap& map, float dx, float dy) {
   // Max dot, not sector angles: adding a direction is adding a line of JSON,
   // and two sectors that overlap simply split at their bisector.
   int best = -1;
   float bestDot = -1e9f;
-  for (const PlayerStrikeMap::Sector& s : lib.player.sectors) {
+  for (const PlayerStrikeMap::Sector& s : map.sectors) {
     const float d = s.x * dx + s.y * dy;
     if (d > bestDot) {
       bestDot = d;
@@ -142,9 +195,9 @@ int QuantizeStrike(const StyleLibrary& lib, float dx, float dy) {
   return best;
 }
 
-int NeutralStrike(const StyleLibrary& lib, bool right) {
-  const int a = lib.player.neutral[right ? 0 : 1];
-  const int b = lib.player.neutral[right ? 1 : 0];
+int NeutralStrike(const PlayerStrikeMap& map, bool right) {
+  const int a = map.neutral[right ? 0 : 1];
+  const int b = map.neutral[right ? 1 : 0];
   return a >= 0 ? a : b;
 }
 
@@ -304,17 +357,39 @@ StrokeStepResult StepStrokeProgram(StrokeCursor& cur, const AttackStyle* sty,
 
 int PickAttackStyle(const StyleLibrary& lib,
                     const std::vector<std::string>& names, uint64_t mobId,
-                    uint32_t tick) {
+                    uint32_t tick, const Mob* who) {
   if (lib.empty()) return -1;
-  // RESOLVE BY NAME, THEN PICK. Doing it in this order is what makes a profile
-  // that lists one unknown style among four still vary over the other three
-  // instead of stuttering on the hole: the draw is over what actually exists.
+  // RESOLVE BY NAME, THEN FILTER, THEN PICK, and the order is load-bearing at
+  // every step.
+  //
+  //   * RESOLVE FIRST is what makes a profile that lists one unknown style
+  //     among four still vary over the other three instead of stuttering on
+  //     the hole: the draw is over what actually exists.
+  //   * FILTER BEFORE DRAWING, not after: drawing and then rejecting would
+  //     make a disarmed duelist miss three turns in four while it rolled its
+  //     way onto its one punch, which reads as a creature that has stopped
+  //     fighting rather than as one that has lost its sword.
+  //   * FALLBACKS LAST, and as a GROUP. A style is not "worse", it is "only
+  //     when there is nothing better" — so the test is whether ANY
+  //     non-fallback style survived the usability filter, not a per-style
+  //     comparison. That is what makes an armed duelist's punches invisible
+  //     and a disarmed one's the whole of its repertoire.
   int found[8];
   int n = 0;
+  bool haveReal = false;
   for (const std::string& s : names) {
     if (n >= 8) break;
     const int i = lib.Find(s);
-    if (i >= 0) found[n++] = i;
+    if (i < 0) continue;
+    if (who != nullptr && !StyleUsable(*who, lib.styles[i])) continue;
+    found[n++] = i;
+    haveReal = haveReal || !lib.styles[i].fallback;
+  }
+  if (haveReal) {
+    int keep = 0;
+    for (int k = 0; k < n; k++)
+      if (!lib.styles[found[k]].fallback) found[keep++] = found[k];
+    n = keep;
   }
   if (n == 0) return -1;
   if (n == 1) return found[0];

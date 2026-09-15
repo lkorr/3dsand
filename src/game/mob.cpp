@@ -815,6 +815,31 @@ bool LoadMobDefs(const std::string& dir, const std::vector<MaterialDef>& mats,
       // and flagged here instead of being silently cubed.
       def.bleedPerDamage = j["bleed"].value("perDamage", 1.5f);
     }
+    // ---- WHAT THIS CREATURE'S BITE CARRIES (mob.h MobBiteDef; plan §6) -----
+    // By NAME, through the same FindMaterialId `bleed.material` just used, and
+    // for the same reason: a material id is its index in materials.json, which
+    // renumbers the moment somebody inserts a row. Missing is not an error —
+    // a creature with no `bite` block simply tears — but an UNKNOWN name is,
+    // because the only other symptom would be a zombie whose bite is clean.
+    if (j.contains("bite")) {
+      if (!j["bite"].is_object()) {
+        log += jp + ": `bite` is not an object — ignored\n";
+      } else {
+        auto mat = [&](const char* key, uint16_t& out) {
+          const std::string nm = j["bite"].value(key, "");
+          if (nm.empty()) return;
+          const int id = FindMaterialId(mats, nm);
+          if (id < 0)
+            log += jp + ": unknown bite " + key + " material \"" + nm + "\"\n";
+          else
+            out = (uint16_t)id;
+        };
+        mat("infect", def.bite.infectMat);
+        mat("stain", def.bite.infectStain);
+      }
+    }
+    // How much of an AIM effector's yaw the spine takes (mob.h).
+    def.aimSpineShare = std::clamp(j.value("aimSpineShare", 0.35f), 0.0f, 1.0f);
     // ---- WORLD-SPACE SIDECAR LENGTHS (DESIGN.md §3b) --------------------
     // `speed`, `severImpactSpeed`, `gait.rideHeight`, `states[].bodyYOffset`
     // and clip position keys are WORLD VOXELS (or voxels/sec), not art
@@ -1322,6 +1347,81 @@ bool LoadMobDefs(const std::string& dir, const std::vector<MaterialDef>& mats,
         }
       }
 
+      // ---- NATURAL WEAPONS: the parts that ARE weapons (mob.h; plan §3) ----
+      //
+      // Beside the sockets, and parsed the same way and for the same reasons:
+      // both name a rig part and resolve it to an index HERE, so a block
+      // naming a part this rig does not have is a loud diagnostic rather than
+      // a creature that swings nothing.
+      //
+      // THE EDGE IS TWO POINTS IN THE PART'S OWN ART FRAME — the Y-up,
+      // origin-at-the-model's-min-corner frame `MobLimbDef::edgeFrom/edgeTo`
+      // are stored in, converted by `ArtToWorld()` on the line below exactly
+      // as those are. It does NOT take MobLimbDef's scene-axis map (`axis`
+      // with its (x, z, -y) swizzle), because that block authors an OFFSET
+      // ALONG ONE MODEL AXIS from a hilt, and a part has no hilt: a fist's
+      // edge runs from the wrist down and forward to the knuckles, which is
+      // not a multiple of any one axis. Two points is the honest shape, and it
+      // is the frame the Models tab already draws an item edge in.
+      {
+        const float inv = def.ArtToWorld();
+        auto point = [&](const json& v, Vec3 dflt) {
+          if (v.is_array() && v.size() == 3 && v[0].is_number() &&
+              v[1].is_number() && v[2].is_number())
+            return Vec3{v[0].get<float>(), v[1].get<float>(),
+                        v[2].get<float>()};
+          return dflt;
+        };
+        for (const auto& w : j.value("natural", json::array())) {
+          if (!w.is_object()) continue;
+          MobNaturalWeaponDef nw;
+          nw.name = w.value("name", "");
+          nw.part = w.value("part", "");
+          if (nw.name.empty() || nw.part.empty()) {
+            log += jp + ": a natural weapon needs both \"name\" and \"part\"\n";
+            continue;
+          }
+          nw.partIndex = sk.FindPart(nw.part);
+          if (nw.partIndex < 0) {
+            log += jp + ": natural weapon \"" + nw.name + "\" names part \"" +
+                   nw.part + "\", which is not a limb of this rig\n";
+            continue;
+          }
+          const json e = w.contains("edge") && w["edge"].is_object()
+                             ? w["edge"]
+                             : json::object();
+          nw.edgeFrom = point(e.contains("from") ? e["from"] : json(), {}) * inv;
+          nw.edgeTo = point(e.contains("to") ? e["to"] : json(), {}) * inv;
+          nw.edgeHalfWidth = e.value("halfWidth", 1.0f) * inv;
+          // A ZERO-LENGTH EDGE IS NOT A WEAPON. The sweep is a segment from
+          // last tick's position to this one; with from == to there is no
+          // blade to sweep, the melee driver's blade direction is undefined,
+          // and the only symptom would be a creature that punches and never
+          // connects. Same refusal `LoadAttackStyles` gives a cut that travels
+          // nowhere, and the `mob` gate asserts it independently.
+          if ((nw.edgeTo - nw.edgeFrom).len() < 1e-4f) {
+            log += jp + ": natural weapon \"" + nw.name +
+                   "\" has a degenerate edge (from == to) — skipped\n";
+            continue;
+          }
+          if (const json& s2 = w.contains("strike") ? w["strike"] : json();
+              s2.is_object()) {
+            nw.strike.cut = s2.value("cut", 0.0f);
+            nw.strike.blunt = s2.value("blunt", 0.0f);
+            nw.strike.bluntCarve = s2.value("bluntCarve", 0.0f);
+            nw.strike.armorBreak = s2.value("armorBreak", 0.0f);
+            nw.strike.bite = s2.value("bite", 0.0f);
+          }
+          if (!nw.strike.Any())
+            log += jp + ": natural weapon \"" + nw.name +
+                   "\" has no cut, blunt or bite — it will hit for nothing\n";
+          if (def.FindNatural(nw.name) >= 0)
+            log += jp + ": duplicate natural weapon \"" + nw.name +
+                   "\" — last wins\n";
+          def.natural.push_back(std::move(nw));
+        }
+      }
+
       if (j.contains("gait") && j["gait"].is_object()) {
         const json& g = j["gait"];
         GaitDef& gd = sk.gait;
@@ -1428,6 +1528,8 @@ bool LoadMobDefs(const std::string& dir, const std::vector<MaterialDef>& mats,
         rule.minChainsLost = s.value("minChainsLost", 0);
         rule.clip = s.value("clip", "");
         rule.speedScale = s.value("speedScale", 1.0f);
+        // Read AFTER speedScale so its default can BE speedScale (anim.h).
+        rule.lungeScale = s.value("lungeScale", rule.speedScale);
         rule.disableGait = s.value("disableGait", false);
         rule.bodyYOffset = s.value("bodyYOffset", 0.0f) * worldLen;
         rule.groundAlign =
@@ -3082,36 +3184,153 @@ static void NpcStrokeSmoothing(MeleeTuning& t) {
   // to a 4.59 vox miss. Only the stroke-position lag is the mouse filter.
 }
 
+// ---- WHY THIS CREATURE DID NOT SWING, ONCE PER (MOB, REASON) ---------------
+//
+// A dropped attack request has to be LOUD and must not be a flood. Before
+// natural weapons there was one reason ("no such style is loaded") and it
+// printed on every attempt; there are now four, and a zombie whose arms and
+// head are both gone requests an attack every cadence forever. Printing each
+// tick buries the log; printing nothing is the failure this whole readout
+// exists to prevent (CLAUDE.md rule 6: a bare "the NPC does not attack" has
+// four causes and from outside they are the same silence).
+//
+// So: a bitmask per mob id, one bit per reason, cleared when the creature
+// dies or the system resets. Content errors are said exactly once each.
+void MobSystem::ReportNoStroke(const Mob& mob, const ai::Profile* pr,
+                               int reason, const char* detail) {
+  uint8_t& seen = strokeGripe_[mob.id_];
+  const uint8_t bit = (uint8_t)(1u << (reason & 7));
+  if (seen & bit) return;
+  seen |= bit;
+  static const char* kWhy[] = {
+      "its profile is not loaded",
+      "none of its styles is usable (nothing held, and no live natural weapon)",
+      "the target is outside every usable style's reach",
+      "the style names a weapon this rig does not have",
+  };
+  std::printf("mob %llu (\"%s\"): attack dropped — %s%s%s\n",
+              (unsigned long long)mob.id_,
+              pr != nullptr ? pr->name.c_str() : "?",
+              kWhy[reason & 3], detail && *detail ? ": " : "",
+              detail ? detail : "");
+}
+
+// ---- WHICH LIMB OF THE VICTIM (AttackStyle::target; plan §5) --------------
+//
+// Weights over TAGS, drawn counter-based on (attacker id, tick) like every
+// other variation in a stroke, over the victim's LIVE BASE limbs only — a
+// worn shell or a held sword is a rig slot and aiming at one would be aiming
+// at somebody's coat. An absent table, an unknown tag, or a victim with
+// nothing left returns -1, which every caller reads as today's chest.
+int MobSystem::PickTargetLimb(const AttackStyle& sty, const Mob& victim,
+                              uint64_t attackerId, uint32_t tick) {
+  if (sty.target.empty()) return -1;
+  // Accumulate over (tag weight x that tag's live limbs), so a rig with two
+  // arms does not make "arm" twice as likely as its authored weight says: the
+  // tag's weight is split across the limbs that wear it.
+  float total = 0;
+  for (const StyleTargetWeight& w : sty.target) {
+    int n = 0;
+    for (int i = 0; i < victim.AppendedBase(); i++)
+      if (victim.LimbAlive(i) && victim.LimbDefAt(i).tag == w.tag) n++;
+    if (n > 0) total += w.weight;
+  }
+  if (total <= 0.0f) return -1;
+  const float roll =
+      rng::Unit01(rng::Hash3((uint32_t)attackerId ^ 0x7A69Eu, tick, 0)) * total;
+  float acc = 0;
+  for (const StyleTargetWeight& w : sty.target) {
+    std::vector<int> hits;
+    for (int i = 0; i < victim.AppendedBase(); i++)
+      if (victim.LimbAlive(i) && victim.LimbDefAt(i).tag == w.tag)
+        hits.push_back(i);
+    if (hits.empty()) continue;
+    acc += w.weight;
+    if (roll > acc) continue;
+    // ...and WHICH of that tag's limbs, on a second, independent draw: a
+    // bite that always took the left arm would be a distribution over tags
+    // wearing a distribution over limbs.
+    const uint32_t k =
+        rng::Hash3((uint32_t)attackerId ^ 0x7A69Fu, tick, 1) %
+        (uint32_t)hits.size();
+    return hits[k];
+  }
+  return -1;
+}
+
+// SET THE EFFECTOR FROM THE STYLE'S `weapon` (plan §4). Held is the default
+// and is what every style authored before this existed says; a natural weapon
+// resolves against the rig and picks its mode from the rig's own shape — a
+// part an IK chain can serve is a Chain, anything else is an Aim. That is one
+// rule instead of an authored mode field, and it means a creature whose rig
+// later grows a neck chain starts biting through the IK with no content edit.
+bool Mob::ArmForStyle(const AttackStyle& sty) {
+  if (sty.weapon.empty() || sty.weapon == "held") {
+    ClearStrikeEffector();     // falls through to the held item
+    return HeldSlot() >= 0;
+  }
+  const MobNaturalWeaponDef* nw = NaturalWeaponNamed(sty.weapon);
+  if (nw == nullptr || !NaturalWeaponUsable(*nw)) return false;
+  const int idx = def_ != nullptr ? def_->FindNatural(sty.weapon) : -1;
+  int handPart = -1;
+  const bool chained =
+      ChainForEffector(skel_, nw->partIndex, handPart) != nullptr;
+  SetStrikeEffector(nw->partIndex,
+                    chained ? StrikeEffectorMode::Chain
+                            : StrikeEffectorMode::Aim,
+                    idx);
+  return true;
+}
+
 void MobSystem::BeginStroke(Mob& mob, const ai::AttackRequest& req,
                             uint32_t tick) {
   NpcStroke& st = mob.stroke_;
-  // A creature with nothing in its fist has nothing to swing. The request is
-  // dropped rather than queued: the AI's attack clock has already advanced
-  // (ai_behavior.cpp says why), so an unarmed mob simply misses its turn
-  // instead of banking swings to fire the moment somebody hands it a sword.
-  if (mob.HeldSlot() < 0) return;
   const ai::Profile* pr = behaviors_.At(mob.ai_.profile);
   if (pr == nullptr) return;
+  // NO LONGER "IS SOMETHING IN ITS FIST" (plan §5). A creature with an empty
+  // hand and live fists has plenty to swing; what it must not do is start a
+  // stroke with no weapon on the end of it, and that question is
+  // `StyleUsable`'s, asked inside the draw. The request is still DROPPED
+  // rather than queued when nothing is usable: the AI's attack clock has
+  // already advanced (ai_behavior.cpp says why), so a creature with nothing
+  // left simply misses its turn instead of banking swings.
+  //
   // The profile's authored list; `style` is the single-entry spelling of the
   // same thing (ai_behavior.cpp's loader folds one into the other), so a
   // profile written before styles were plural still works.
-  const int si = PickAttackStyle(styles_, pr->attack.styles, mob.id_, tick);
+  const int si =
+      PickAttackStyle(styles_, pr->attack.styles, mob.id_, tick, &mob);
   if (si < 0) {
-    // LOUD, ONCE PER ATTEMPT, and not a crash: a profile naming a style the
-    // library does not have is a content error whose only other symptom is a
-    // creature that requests attacks forever and never swings.
-    std::printf(
-        "mob: \"%s\" asked for attack style \"%s\" and no such style is "
-        "loaded — not swinging\n",
-        pr->name.c_str(),
-        pr->attack.styles.empty() ? "" : pr->attack.styles[0].c_str());
+    ReportNoStroke(mob, pr, 1,
+                   pr->attack.styles.empty()
+                       ? "the profile lists no styles"
+                       : pr->attack.styles[0].c_str());
     return;
   }
   const AttackStyle& sty = *styles_.At(si);
+  // ---- ITS OWN REACH, BEFORE ANYTHING ELSE (plan §5) ---------------------
+  // The AI let this request through against `AttackReachOf` — the LONGEST
+  // reach the creature has — because the AI is style-ignorant by design. This
+  // is where the drawn style gets to say the target is too far for IT: a
+  // zombie that has closed to 14 voxels may lunge-bite (22) and may not punch
+  // (9), and refusing here is what stops the punch swinging at air.
+  const float styleReach = sty.reach > 0.0f ? sty.reach : pr->attack.reach;
+  if (req.distance > 0.0f && styleReach > 0.0f &&
+      req.distance > styleReach + 1e-3f)
+    return;   // not a content error: this style is simply the wrong one now
+  if (!mob.ArmForStyle(sty)) {
+    ReportNoStroke(mob, pr, 3, sty.weapon.c_str());
+    return;
+  }
   st = NpcStroke{};
   st.style = si;
   st.targetId = req.targetId;
   st.targetPoint = req.targetPoint;
+  // ...and WHICH PART of the target (plan §5). Drawn here, once, at the same
+  // instant the style is: a blow that re-chose its limb every tick would be
+  // homing, and the whole point of the windup is that it does not.
+  if (const Mob* victim = FindMobById(req.targetId))
+    st.targetLimb = PickTargetLimb(sty, *victim, mob.id_, tick);
   // ONE SEED PER SWING, mixing who and when. Every draw in the runner indexes
   // off it, so the whole stroke — its style, its start bow, its tempo —
   // replays from the same (mob, tick) and nothing reads a clock.
@@ -3138,12 +3357,19 @@ void MobSystem::BeginStroke(Mob& mob, const ai::AttackRequest& req,
 bool MobSystem::ForceAttack(uint64_t mobId, const std::string& style,
                             Vec3 targetPoint, uint32_t tick) {
   Mob* m = FindMobById(mobId);
-  if (m == nullptr || m->HeldSlot() < 0) return false;
+  if (m == nullptr) return false;
   const int si = styles_.Find(style);
   if (si < 0) return false;
   if (m->stroke_.Active() && m->stroke_.phase != NpcStroke::Phase::Guard)
     return false;
   const AttackStyle& sty = *styles_.At(si);
+  // THE SAME USABILITY QUESTION THE AI's DRAW ASKS, and it has to be asked
+  // here too: a scripted attack that named a style this creature cannot swing
+  // would start a stroke with no edge on the end of it, which is the one thing
+  // the effector generalisation must never let happen. A gate that forces a
+  // punch on a handless body gets `false`, which is an answer it can assert on.
+  if (!StyleUsable(*m, sty)) return false;
+  if (!m->ArmForStyle(sty)) return false;
   NpcStroke& st = m->stroke_;
   st = NpcStroke{};
   st.targetPoint = targetPoint;
@@ -3157,7 +3383,10 @@ bool MobSystem::ForceAttack(uint64_t mobId, const std::string& style,
 
 bool MobSystem::SetGuard(uint64_t mobId, float az, float el, float reachFrac) {
   Mob* m = FindMobById(mobId);
-  if (m == nullptr || m->HeldSlot() < 0) return false;
+  // A GUARD NEEDS AN ARM, NOT A SWORD. Holding a fist across a line is a pose
+  // a creature can take — and with the effector resolving to the held item by
+  // default, an armed one guards with the blade exactly as it always did.
+  if (m == nullptr || m->StrikeEffectorPart() < 0) return false;
   NpcStroke& st = m->stroke_;
   // A guard REPLACES an idle arm or another guard, never a live swing: a
   // creature mid-cut has already committed and the whole point of committing
@@ -3175,6 +3404,25 @@ bool MobSystem::SetGuard(uint64_t mobId, float az, float el, float reachFrac) {
   st.wantEl = el;
   st.wantReach = reachFrac;   // a FRACTION here; resolved against the live arm
   return true;
+}
+
+float MobSystem::AttackReachOf(const Mob& mob) const {
+  const ai::Profile* pr = behaviors_.At(mob.ai_.profile);
+  if (pr == nullptr) return 0.0f;
+  float reach = pr->attack.reach;
+  // THE LONGEST REACH IT CAN ACTUALLY USE. Unusable styles are excluded on
+  // purpose: a zombie whose head has come off must stop standing 22 voxels
+  // away waiting to bite, and it learns that from the same `StyleUsable` the
+  // draw uses rather than from a second rule. `BeginStroke` then refuses the
+  // styles the creature is too far away FOR, so the pair is "close to the
+  // furthest thing you can do, then do whatever fits".
+  for (const std::string& n : pr->attack.styles) {
+    const AttackStyle* s = styles_.At(styles_.Find(n));
+    if (s == nullptr || s->reach <= 0.0f) continue;
+    if (!StyleUsable(mob, *s)) continue;
+    reach = std::max(reach, s->reach);
+  }
+  return reach;
 }
 
 void MobSystem::ClearGuard(uint64_t mobId) {
@@ -3199,11 +3447,31 @@ void MobSystem::ClearGuard(uint64_t mobId) {
 // side) land on the wrong side of the body for that caller. This function
 // briefly used up x fwd, which is the mirror: an NPC's generous weapon-side
 // window sat across its chest.
+// AND A PRONE BODY'S UP IS NOT THE WORLD'S (plan §4, "pose robustness").
+// `bodyUp_` is the fitted ground plane's normal while a ground-aligned loco
+// state is running (Mob::SettleClipOwnedBody) — a crawler lies in a frame
+// tilted to the hill it is on, and its limbs are posed in that frame. A stroke
+// expressed about world up would then be asking for an elevation the body's own
+// shoulders do not have: the punch is solved correctly and lands in the wrong
+// place, by the grade of whatever it is lying on. Weighted by the state's own
+// `groundAlign`, so a body that only half-commits to the ground gets a basis
+// that only half-commits with it.
 static void MobBasis(const Mob& mob, Vec3& right, Vec3& up, Vec3& fwd) {
   up = Vec3{0, 1, 0};
+  const float align = mob.LocoGroundAlign();
+  if (align > 0.0f) {
+    const Vec3 bu = mob.BodyUp();
+    if (bu.len() > 1e-4f) {
+      up = (Vec3{0, 1, 0} * (1.0f - align) + bu.normalized() * align);
+      up = up.len() > 1e-4f ? up.normalized() : Vec3{0, 1, 0};
+    }
+  }
   fwd = mob.Facing();
   if (fwd.len() < 1e-4f) fwd = Vec3{0, 0, 1};
-  fwd = Vec3{fwd.x, 0, fwd.z};
+  // The facing is a HEADING, so it is planar by construction; re-orthogonalise
+  // it against whatever `up` turned out to be rather than flattening it to y=0,
+  // or a tilted basis is not a basis at all.
+  fwd = fwd - up * up.dot(fwd);
   fwd = fwd.len() > 1e-4f ? fwd.normalized() : Vec3{0, 0, 1};
   right = fwd.cross(up);
   right = right.len() > 1e-4f ? right.normalized() : Vec3{-1, 0, 0};
@@ -3221,11 +3489,23 @@ void MobSystem::StepStroke(Mob& mob, uint32_t tick, World& world,
   // cycle. The symptom was a defender standing with its sword exactly where the
   // animation had left it while the gate reported that its guard was set.
   const bool guarding = st.phase == NpcStroke::Phase::Guard;
-  if ((sty == nullptr && !guarding) || mob.HeldSlot() < 0 || !mob.alive_) {
-    // The sword was cut out of the hand, the creature died, or the style
-    // library reloaded out from under a live swing. Drop the pose claim rather
-    // than freezing the arm mid-cut.
+  // ---- IS THERE STILL A WEAPON ON THE END OF THIS ARM? -------------------
+  //
+  // IT IS THE EFFECTOR THAT MATTERS, NOT THE SWORD (plan §5). This used to
+  // read `mob.HeldSlot() < 0`, which is both too strict and too loose once a
+  // fist can swing: a zombie punching with an empty hand would have its stroke
+  // torn down on the tick it started, and a creature biting while holding a
+  // sword would carry on biting after the sword was cut out of its fist — the
+  // second being harmless and the first being the whole feature. The question
+  // is whether the PART DOING THE HITTING is still attached.
+  const int effPart = mob.StrikeEffectorPart();
+  const bool effGone = effPart < 0 || !mob.LimbAlive(effPart);
+  if ((sty == nullptr && !guarding) || effGone || !mob.alive_) {
+    // The fist was cut off, the sword left the hand, the creature died, or the
+    // style library reloaded out from under a live swing. Drop the pose claim
+    // rather than freezing the arm mid-cut.
     st.Reset();
+    mob.ClearStrikeEffector();
     mob.SetWeaponPose(WeaponPose{});
     return;
   }
@@ -3242,8 +3522,11 @@ void MobSystem::StepStroke(Mob& mob, uint32_t tick, World& world,
     // THE ITEM, BY NAME. Mob keeps `heldItem_` as a string precisely because
     // library indices are file-order and every R reload renumbers them
     // (item.h's index hazard), so the resolve happens here, per swing.
+    const MobNaturalWeaponDef* nw = mob.EffectorWeapon();
     const ItemDef* item =
-        items_ != nullptr ? items_->At(items_->Find(mob.HeldItem())) : nullptr;
+        nw == nullptr && items_ != nullptr
+            ? items_->At(items_->Find(mob.HeldItem()))
+            : nullptr;
     EdgeSweep sw;
     sw.aPrev = st.edgeBase;
     sw.bPrev = st.edgeTip;
@@ -3252,11 +3535,26 @@ void MobSystem::StepStroke(Mob& mob, uint32_t tick, World& world,
     sw.flatNow = flat;
     sw.dt = 1.0f / 30.0f;
     sw.halfWidth = halfWidth;
-    sw.damage = item ? item->damage : 12.0f;
-    sw.carveBonus = item ? item->carveBonus : 0.0f;
-    if (item) {
-      const auto& g = CurrentTuning().gore;
-      sw.heft = item->HeftFactor(g.woundHeftRef, g.woundHeftMax);
+    if (nw != nullptr) {
+      // ---- A NATURAL WEAPON'S BLOW (game/impact.h) ------------------------
+      // PACKAGE A MERGE: replace with `sw.strike = mob.StrikeProfileFor(*nw);`
+      // — one line, and `damage` disappears from EdgeSweep with it. Until
+      // then the sweep has only the bare kerf float, so the three parts are
+      // SUMMED into it as a stand-in: a fist reads as a small cut rather than
+      // as trauma, which is wrong in KIND but right in magnitude and keeps
+      // every gate here measuring the geometry it is actually about.
+      const StrikeProfile p = mob.StrikeProfileFor(*nw);
+      sw.damage = p.cut + p.blunt + p.bite;
+      // A fist has no blade behind it, so it gets the neutral heft (1) rather
+      // than an item's volume ratio — which is also what a fabricated sweep
+      // gets and what `EdgeSweep::heft` documents as the default.
+    } else {
+      sw.damage = item ? item->damage : 12.0f;
+      sw.carveBonus = item ? item->carveBonus : 0.0f;
+      if (item) {
+        const auto& g = CurrentTuning().gore;
+        sw.heft = item->HeftFactor(g.woundHeftRef, g.woundHeftMax);
+      }
     }
     sw.tick = tick;
     sw.valid = true;
@@ -3309,16 +3607,25 @@ void MobSystem::StepStroke(Mob& mob, uint32_t tick, World& world,
   // integrated in, and about the SHOULDER rather than the mob's origin — an
   // offset centre smears azimuth into elevation exactly as it does in the
   // swing-plane gate, and this is the number a cut is aimed with.
+  // WHICHEVER JOINT THE STROKE ACTUALLY PIVOTS ABOUT, which is not always a
+  // shoulder any more: for a chain effector it is the chain's ROOT (the
+  // shoulder, or a hip if something ever kicks), and for an aim effector it is
+  // the effector's own parent joint (the chest, for jaws on a neck). Both are
+  // exactly the pivot `WeaponArmPose` measured its hand offset from, which is
+  // the agreement that stops the aim and the pose speaking different frames.
   Vec3 shoulder{};
   bool haveShoulder = false;
-  if (mob.heldPartIndex_ >= 0 &&
-      mob.heldPartIndex_ < (int)mob.skel_.parts.size()) {
-    const int handPart = mob.skel_.parts[mob.heldPartIndex_].parent;
-    // Two joints up from the item: hand -> forearm -> upper arm, whose joint
-    // IS the shoulder.
-    int p = handPart;
-    for (int k = 0; k < 2 && p >= 0; k++) p = mob.skel_.parts[p].parent;
-    if (p >= 0) haveShoulder = mob.PartJointWorld(p, shoulder);
+  if (effPart >= 0 && effPart < (int)mob.skel_.parts.size()) {
+    int pivot = -1;
+    if (mob.StrikeEffectorKind() == StrikeEffectorMode::Aim) {
+      pivot = mob.skel_.parts[effPart].parent;
+    } else {
+      int handPart = -1;
+      if (const IkChain* ch =
+              mob.ChainForEffector(mob.skel_, effPart, handPart))
+        pivot = ch->parts[0];
+    }
+    if (pivot >= 0) haveShoulder = mob.PartJointWorld(pivot, shoulder);
   }
   if (!haveShoulder) {
     const Vec3 ws = mob.def_->worldSize;
@@ -3330,6 +3637,55 @@ void MobSystem::StepStroke(Mob& mob, uint32_t tick, World& world,
   const float liveAz = std::atan2(local.x, local.z);
   const float liveEl = std::asin(std::clamp(local.y / lr, -1.0f, 1.0f));
 
+  // ---- 3b. THE LUNGE (strokes.h StyleLunge; plan §5) ----------------------
+  //
+  // Fired on the FIRST TICK OF ITS NAMED PHASE, before the program advances,
+  // so a windup lunge leaves the ground on the same tick the telegraph starts
+  // and the flight IS the telegraph. `st.lunged` is what makes it once per
+  // stroke: a phase can be entered once, but a zero-length phase under tempo
+  // jitter could otherwise be stepped twice.
+  //
+  // THE MAGNITUDE IS THE GAP, NOT THE AUTHORED SPEED. `speed` is a CEILING —
+  // how fast this creature can throw itself — and the body has to arrive at
+  // striking distance, not inside the victim: a pounce that overshoots ends
+  // with the target behind it and the cut swinging through air. So the
+  // horizontal is `min(speed, (distance - reach) / flight time)`, which makes
+  // the same authored style a long leap from far out and a short hop from
+  // close in, with no second entry for either.
+  if (sty != nullptr && sty->lunge.Any() && !st.lunged && st.phaseTick == 0 &&
+      ((sty->lunge.at == "windup" && st.phase == NpcStroke::Phase::Windup) ||
+       (sty->lunge.at == "cut" && st.phase == NpcStroke::Phase::Cut))) {
+    st.lunged = true;
+    const Vec3 ws = mob.def_->worldSize;
+    const Vec3 centre = mob.origin_ + Vec3{ws.x * 0.5f, ws.y * 0.5f, ws.z * 0.5f};
+    Vec3 to = st.targetPoint - centre;
+    to.y = 0;
+    const float dist = to.len();
+    // A LOCO STATE SCALES IT (anim.h AnimStateRule::lungeScale): a crawler
+    // pounces low and short because it is dragging itself, and that is one
+    // number in its own state rule rather than a branch here.
+    float scale = 1.0f;
+    if (mob.anim_.locoState >= 0 &&
+        mob.anim_.locoState < (int)mob.skel_.states.size())
+      scale = std::max(0.0f, mob.skel_.states[mob.anim_.locoState].lungeScale);
+    const float airTime =
+        std::max(1, sty->lunge.ticks) * (1.0f / 30.0f);
+    // REACH AT LANDING IS THE EFFECTOR'S, NOT THE STYLE'S. The two mean
+    // opposite things and confusing them makes the lunge a no-op: the style's
+    // `reach` is how far out the creature is willing to COMMIT (22 voxels for
+    // bite_lunge, which is the whole point of the move), while what the body
+    // has to arrive at is the distance its jaws can actually bite from — the
+    // arm/neck reach the driver is already bounded by. Measured with the
+    // style's number: every launch computed `dist - 22 <= 0`, capped the
+    // horizontal at zero and produced a creature that hopped on the spot.
+    const float want = (dist - armReach) / airTime;
+    const float mag = std::min(MetresPerSecToCells(sty->lunge.speed) * scale,
+                               std::max(0.0f, want));
+    const Vec3 dir = dist > 1e-3f ? to * (1.0f / dist) : mob.Facing();
+    mob.Launch(Vec3{dir.x * mag, MetresPerSecToCells(sty->lunge.rise) * scale,
+                    dir.z * mag});
+  }
+
   // ---- 4. drive the phase — the SHARED runner (game/strokes.cpp) -----------
   // Everything feel-shaped lives in StepStrokeProgram, which the player's
   // discrete attacks also call; this caller only owns what to do when the
@@ -3338,6 +3694,9 @@ void MobSystem::StepStroke(Mob& mob, uint32_t tick, World& world,
                             right, up, fwd)) {
     case StrokeStepResult::Finished:
       st.Reset();
+      // ...and hand the part back. A punch is over; a sword is still held, and
+      // ClearStrikeEffector falls through to it rather than to nothing.
+      mob.ClearStrikeEffector();
       mob.SetWeaponPose(WeaponPose{});
       return;
     case StrokeStepResult::Idle:
@@ -3380,6 +3739,13 @@ void MobSystem::DecideIntent(Mob& mob, const MobDef& def,
     self.headroomCells = mob.HeadroomCells();
     const ai::Profile* prof = behaviors_.At(mob.ai_.profile);
     self.faction = prof != nullptr ? ai::FactionId(prof->faction) : 0u;
+    // HOW FAR THIS CREATURE CAN REACH, as an INPUT (ai_behavior.h SelfView).
+    // The AI must not learn what styles are (design rule 4, and the note on
+    // AttackTuning::styles), but it cannot decide "close enough to swing"
+    // without the number — so the number is computed where the library and
+    // the rig are both visible and handed across, exactly as the terrain
+    // budgets above it are.
+    self.attackReach = AttackReachOf(mob);
 
     ai::GroundView gv;
     gv.haveGround = sense.haveGround;
@@ -3401,6 +3767,15 @@ void MobSystem::DecideIntent(Mob& mob, const MobDef& def,
 
     ai::IntentOut out;
     if (ai::Think(mob.ai_, behaviors_, self, gv, wv, tick, dt, out)) {
+      // ...and turn its head toward whatever it decided to fight (plan §4's
+      // closing note on ApplyAimPart). Read off the brain rather than passed
+      // out of Think, because it is not an INTENT — the AI has no opinion
+      // about necks, and giving it one would be the closed-ended-system rule
+      // 4 failure in miniature.
+      if (mob.ai_.hasTarget && mob.ai_.visible)
+        mob.SetAimLook(mob.ai_.targetPos);
+      else
+        mob.ClearAimLook();
       mob.desiredHeading_ = out.desiredHeading;
       mob.driveScale_ = out.driveScale;
       mob.driveStrafe_ = out.driveStrafe;
@@ -3547,7 +3922,6 @@ float MobSystem::Steer(Mob& mob, const MobDef& def, float dt) {
 // and a body that needs to fly — a blast — is a ragdoll, which Jolt carries.
 bool MobSystem::UpdateFall(Mob& mob, const MobDef& def,
                            const GroundSense& sense, float dt) {
-  (void)def;
   if (sense.groundUnknown && !sense.haveGround) return mob.airborne_;
   const float drop =
       sense.haveGround ? mob.origin_.y - (float)sense.groundY : 1.0e9f;
@@ -3561,6 +3935,7 @@ bool MobSystem::UpdateFall(Mob& mob, const MobDef& def,
     mob.airborne_ = true;
     mob.fallVel_ = 0.0f;
     mob.airTime_ = 0.0f;
+    mob.airVel_ = Vec3{};
   }
   const auto& tune = CurrentTuning();
   const float g = MetresToCells(tune.physics.gravity);
@@ -3568,14 +3943,68 @@ bool MobSystem::UpdateFall(Mob& mob, const MobDef& def,
   mob.airTime_ += dt;
   mob.fallVel_ = std::max(mob.fallVel_ - g * dt, -terminal);
   const float ny = mob.origin_.y + mob.fallVel_ * dt;
+  // ---- THE FIRST TICK OF A LAUNCH DOES NOT LAND (mob.h `launched_`) -------
+  //
+  // A lunge is fired by StepStroke, which runs AFTER UpdateFall in the tick
+  // (MobSystem::PreTick), so the first UpdateFall to see it is the next tick's
+  // — with the body still standing on the ground it left from. A flat pounce
+  // (rise 0, which a crawler's lungeScale can produce from a perfectly good
+  // authored rise) then has `fallVel_` driven negative by one tick of gravity
+  // before it has moved anywhere, `ny <= groundY` fires, and the leap is over
+  // before it began: the creature twitches and stays put. The latch buys it
+  // the one tick it needs to get clear of its own feet.
+  const bool justLaunched = mob.launched_;
+  mob.launched_ = false;
   // The scan reaches 2.1 m below the min corner and a tick at terminal
   // velocity covers 1.7 m, so a landing is always seen before it is passed.
-  if (sense.haveGround && ny <= (float)sense.groundY) {
+  if (!justLaunched && sense.haveGround && ny <= (float)sense.groundY) {
     mob.origin_.y = (float)sense.groundY;
     mob.airborne_ = false;
     mob.fallVel_ = 0.0f;
     mob.airTime_ = 0.0f;
+    mob.airVel_ = Vec3{};
     return false;  // on the ground again: the drive may run this tick
+  }
+  // ---- ...AND THE PLANAR HALF (mob.h `airVel_`; plan §5) -----------------
+  //
+  // A lunging body travels, and it must travel by the SAME RULES the walk
+  // drive travels by or a pounce becomes the one way in the game to get inside
+  // a rock: `FootprintFooting` against the body's own box, another mob counted
+  // as a wall, and each axis tried alone so a leap that grazes a corner slides
+  // along it instead of stopping dead in mid-air. That is DriveLocomotion's
+  // `fits()` with the standing height thrown away — a body in the air does not
+  // take its Y from the ground it is passing over.
+  if (mob.airVel_.len() > 1e-4f && world_ != nullptr) {
+    const float hx = def.worldSize.x * 0.5f, hz = def.worldSize.z * 0.5f;
+    auto fits = [&](float nx, float nz) {
+      if (BlockedByMob(mob, def, nx + hx, nz + hz)) return false;
+      const Mob::Footing f =
+          mob.FootprintFooting(*world_, def, nx + hx, nz + hz, ny);
+      if (!f.known) return true;    // unknown footing is walkable (ai_nav.h)
+      return !f.wall && f.fits;
+    };
+    const Vec3 want = mob.airVel_ * dt;
+    if (fits(mob.origin_.x + want.x, mob.origin_.z + want.z)) {
+      mob.origin_.x += want.x;
+      mob.origin_.z += want.z;
+    } else {
+      const bool xFirst = std::abs(want.x) >= std::abs(want.z);
+      bool moved = false;
+      for (int pass = 0; pass < 2 && !moved; pass++) {
+        const bool doX = (pass == 0) == xFirst;
+        const float dx = doX ? want.x : 0.0f;
+        const float dz = doX ? 0.0f : want.z;
+        if (dx == 0.0f && dz == 0.0f) continue;
+        if (!fits(mob.origin_.x + dx, mob.origin_.z + dz)) continue;
+        mob.origin_.x += dx;
+        mob.origin_.z += dz;
+        moved = true;
+      }
+      // HIT A WALL IN MID-AIR: the planar velocity is spent, and the body
+      // drops where it is. Killing it rather than sliding forever is what
+      // stops a pounce grinding along a cliff face for its whole flight.
+      if (!moved) mob.airVel_ = Vec3{};
+    }
   }
   mob.origin_.y = ny;
   if (mob.airTime_ >= tune.ragdoll.fallSeconds && !mob.Ragdolled()) {
@@ -4475,6 +4904,11 @@ void MobSystem::UpdateAnimation(Mob& mob, const MobDef& def, World& world,
   // untouched; an NPC mid-stroke leans exactly as the avatar does.
   AnimApplySpineTwist(sk, st, mob.weapon_.torsoTwist, mob.weapon_.torsoPitch,
                       def.rootLimb);
+
+  // ---- stage 3.6: the aim effector, or a look at the target (mob.cpp) ----
+  // PRE-FLATTEN, because it rotates a part about its joint and shares the yaw
+  // with the spine above it. See Mob::ApplyStrikeAim.
+  mob.ApplyStrikeAim(sk, st);
 
   // ---- stage 4: flatten to model space ----
   AnimFlatten(sk, st);
@@ -13649,6 +14083,319 @@ uint32_t Mob::WornAlong(int bodyLimb, const Vec3& from, const Vec3& dir,
   return 0;
 }
 
+// =============================================================================
+// THE STRIKE EFFECTOR — WHICH PART IS SWINGING, AND WHAT IT DOES (plan §4/§3)
+//
+// Everything below this banner used to begin at `heldPartIndex_`, and that one
+// assumption is the whole reason this engine had no fists: an arm can only be
+// driven to serve a blade, an edge can only be read off a held item, and an
+// unarmed creature therefore had nothing to claim the arm WITH. The effector
+// is the indirection that removes it — one part index and one mode — and every
+// consumer below (ApplyWeaponArm, WeaponEdge, WeaponStrokePose, WeaponArmPose,
+// HeadKeepOut) now asks it instead of asking the fist.
+//
+// THE HELD PATH IS UNCHANGED BY CONSTRUCTION. EquipItem sets
+// `Held`/`heldPartIndex_`, and every effector-aware function's Held branch is
+// the code that was there before, reached through one more `if`. That is
+// deliberate: the sword is the thing four gates already measure, and a
+// generalisation that moved it would be indistinguishable from a regression.
+// =============================================================================
+
+void Mob::SetStrikeEffector(int partIndex, StrikeEffectorMode mode,
+                            int naturalIndex) {
+  if (partIndex < 0 || (size_t)partIndex >= skel_.parts.size() ||
+      mode == StrikeEffectorMode::None) {
+    ClearStrikeEffector();
+    return;
+  }
+  strikeEffector_ = partIndex;
+  strikeMode_ = mode;
+  strikeNatural_ = naturalIndex;
+}
+
+void Mob::ClearStrikeEffector() {
+  // DROPS THE OVERRIDE, and that is all it does. A creature that finishes a
+  // punch while still holding a sword goes back to CARRYING the sword — the
+  // item is a real rig slot whose arm the driver owns between strokes — and
+  // that fall-through is `ResolveEffector`'s, not a value written here.
+  strikeEffector_ = -1;
+  strikeMode_ = StrikeEffectorMode::None;
+  strikeNatural_ = -1;
+}
+
+bool Mob::ResolveEffector(int& outPart, StrikeEffectorMode& outMode,
+                          int& outNatural) const {
+  if (strikeMode_ != StrikeEffectorMode::None && strikeEffector_ >= 0 &&
+      (size_t)strikeEffector_ < skel_.parts.size()) {
+    outPart = strikeEffector_;
+    outMode = strikeMode_;
+    outNatural = strikeNatural_;
+    return true;
+  }
+  if (heldPartIndex_ >= 0 && (size_t)heldPartIndex_ < skel_.parts.size()) {
+    outPart = heldPartIndex_;
+    outMode = StrikeEffectorMode::Held;
+    outNatural = -1;
+    return true;
+  }
+  outPart = -1;
+  outMode = StrikeEffectorMode::None;
+  outNatural = -1;
+  return false;
+}
+
+const MobNaturalWeaponDef* Mob::NaturalWeapon(int i) const {
+  if (def_ == nullptr || i < 0 || i >= (int)def_->natural.size()) return nullptr;
+  return &def_->natural[i];
+}
+
+const MobNaturalWeaponDef* Mob::NaturalWeaponNamed(const std::string& n) const {
+  return def_ != nullptr ? NaturalWeapon(def_->FindNatural(n)) : nullptr;
+}
+
+bool Mob::NaturalWeaponUsable(const MobNaturalWeaponDef& nw) const {
+  if (nw.partIndex < 0 || !LimbAlive(nw.partIndex)) return false;
+  // A CHAIN EFFECTOR NEEDS ITS WHOLE CHAIN. The two-bone solver is handed
+  // parts[0] and parts[1] and writes the effector's transform; with the elbow
+  // severed there is no second bone and the solve is a hand hanging in space
+  // off a shoulder. Refusing HERE — before the style is drawn — is what keeps
+  // the driver from ever seeing a broken chain (plan §4's closing line), and
+  // it is why a one-armed zombie's punches quietly stop being options instead
+  // of becoming a pose bug.
+  for (const IkChain& ch : skel_.chains) {
+    if (ch.effector != nw.partIndex &&
+        !(nw.partIndex < (int)skel_.parts.size() &&
+          skel_.parts[nw.partIndex].parent == ch.effector))
+      continue;
+    for (int p : ch.parts)
+      if (!LimbAlive(p)) return false;
+  }
+  return true;
+}
+
+StrikeProfile Mob::StrikeProfileFor(const MobNaturalWeaponDef& nw) const {
+  StrikeProfile p = nw.strike;
+
+  // ---- 1. THE GAUNTLET OVERRIDE (plan §3) ---------------------------------
+  //
+  // A worn piece whose shell is strapped to this weapon's own part, and whose
+  // item carries a `strike` block, REPLACES the profile — it does not add to
+  // it. An iron gauntlet is not "a fist plus iron"; it is a different weapon
+  // that happens to be shaped like a fist, which is exactly why the SWEPT EDGE
+  // stays the fist's own (the shell is a skin over the same knuckles).
+  //
+  // The covered limb is read off the RIG, not off the item's ItemCover list: a
+  // shell is parented to the limb it covers, so `parts[slot].parent` is the
+  // answer and there is no second table to keep in step.
+  //
+  // PACKAGE A MERGE: `ItemDef::strike` is A's field. Until it lands this loop
+  // finds the piece and then has nothing to read, so the override is a no-op
+  // and a gauntleted fist hits exactly as a bare one does. The merge is the
+  // two commented lines below becoming live:
+  //     if (const ItemDef* it = lib->At(lib->Find(worn_[w].item));
+  //         it != nullptr && it->strike.Any()) { p.cut = it->strike.cut; ... }
+  {
+    const ItemLibrary* lib = sys_ != nullptr ? sys_->Items() : nullptr;
+    if (lib != nullptr && nw.partIndex >= 0) {
+      for (const WornPiece& wp : worn_) {
+        bool covers = false;
+        for (int slot : wp.slots) {
+          if (slot < 0 || (size_t)slot >= skel_.parts.size()) continue;
+          if (skel_.parts[slot].parent == nw.partIndex && LimbAlive(slot))
+            covers = true;
+        }
+        if (!covers) continue;
+        // PACKAGE A MERGE: replace this line with the ItemDef::strike read.
+        (void)wp;
+      }
+    }
+  }
+
+  // ---- 2. THE CREATURE'S OWN INFECTION (plan §6) --------------------------
+  //
+  // ORed on rather than replacing, and only onto something that BITES. A
+  // zombie's fist carries no rot — punching somebody does not put your mouth
+  // on them — so the test is the profile's own `bite` term and not the
+  // weapon's name. That is the whole reason infection lives on the creature
+  // and the bite number lives on the weapon: neither file has to know the
+  // other exists.
+  if (p.bite > 0.0f && def_ != nullptr) {
+    if (p.infectMat == 0) p.infectMat = def_->bite.infectMat;
+    if (p.infectStain == 0) p.infectStain = def_->bite.infectStain;
+  }
+  return p;
+}
+
+void Mob::Launch(Vec3 vel) {
+  airborne_ = true;
+  launched_ = true;
+  fallVel_ = vel.y;
+  airVel_ = Vec3{vel.x, 0.0f, vel.z};
+  airTime_ = 0.0f;
+}
+
+bool Mob::AimAnglesTo(const Vec3& dirWorld, float& outYaw,
+                      float& outPitch) const {
+  Vec3 d = dirWorld;
+  if (d.len() < 1e-4f) return false;
+  d = d.normalized();
+  // A HEADING DELTA in the rig's own heading convention (heading 0 = +Z,
+  // positive toward +X), which is the frame ApplyAimPart applies its yaw in —
+  // see the long note the avatar's head-look left about getting this backwards.
+  const float bearing = std::atan2(d.x, d.z);
+  float yaw = bearing - heading_;
+  while (yaw > 3.14159265f) yaw -= 6.28318531f;
+  while (yaw <= -3.14159265f) yaw += 6.28318531f;
+  outYaw = yaw;
+  outPitch = std::asin(std::clamp(d.y, -1.0f, 1.0f));   // positive UP
+  return true;
+}
+
+void Mob::ApplyAimPart(const AnimSkeleton& sk, AnimState& st, int part,
+                       float yaw, float pitch, float weight,
+                       float spineShare) const {
+  // MOVED DOWN FROM PlayerAvatar (the head-look block), verbatim in its
+  // reasoning and generalised in exactly two ways: the part is a parameter
+  // rather than `parts_.head`, and the whole rotation is scaled by `weight` so
+  // a stroke can fade its aim in and out the way the arm claim already does.
+  // The avatar still calls it for its look, so there remains ONE
+  // implementation of "turn a part toward something".
+  if (part < 0 || (size_t)part >= sk.parts.size() ||
+      (size_t)part >= st.local.size())
+    return;
+  if (part < (int)st.partAlive.size() && !st.partAlive[part]) return;
+  const float w = std::clamp(weight, 0.0f, 1.0f);
+  if (w <= 1e-4f) return;
+  if (std::fabs(yaw) < 1e-4f && std::fabs(pitch) < 1e-4f) return;
+  yaw *= w;
+  pitch *= w;
+
+  // The spine carries a share of the YAW so the chest turns into the aim
+  // instead of a head swivelling on a rigid torso. THE ROOT LIMB IS NOT PART
+  // OF THE SPINE FOR THIS PURPOSE even though it carries the tag: rotating the
+  // root yaws the entire rig, legs and all, so the part turns with the body it
+  // is measured against and reads on screen as not turning at all.
+  const int root = def_ != nullptr ? def_->rootLimb : -1;
+  float spineTotal = 0;
+  if (spineShare > 1e-4f) {
+    int nSpine = 0;
+    for (size_t i = 0; i < sk.parts.size(); i++)
+      if (sk.parts[i].tag == "spine" && (int)i != root) nSpine++;
+    if (nSpine > 0) {
+      // Split across however many spine joints the rig has, so a three-segment
+      // back twists the same TOTAL amount as a single torso rather than three
+      // times as far.
+      const float per = yaw * std::clamp(spineShare, 0.0f, 1.0f) / (float)nSpine;
+      for (size_t i = 0; i < sk.parts.size(); i++) {
+        if (sk.parts[i].tag != "spine" || (int)i == root) continue;
+        if (i < st.partAlive.size() && !st.partAlive[i]) continue;
+        if (i >= st.local.size()) continue;
+        st.local[i].rot = QuatNormalize(
+            QuatMul(st.local[i].rot, AxisAngle({0, 1, 0}, per)));
+        spineTotal += per;
+      }
+    }
+  }
+  // The part only needs the REMAINDER — it inherits the spine's share through
+  // the flatten, so adding the full yaw at both joints would double it.
+  const float partYaw = yaw - spineTotal;
+  // Pitch is negated: camera/aim pitch is positive UP, and a positive rotation
+  // about model +X pitches the nose DOWN (scripts/geometry.py: +90 about X
+  // takes +Z to -Y).
+  const Quat look = QuatMul(AxisAngle({0, 1, 0}, partYaw),
+                            AxisAngle({1, 0, 0}, -pitch));
+  st.local[part].rot = QuatNormalize(QuatMul(st.local[part].rot, look));
+}
+
+const IkChain* Mob::ChainForEffector(const AnimSkeleton& sk, int part,
+                                     int& outHandPart) const {
+  outHandPart = -1;
+  if (part < 0 || (size_t)part >= sk.parts.size()) return nullptr;
+  const int parent = sk.parts[part].parent;
+  for (const IkChain& ch : sk.chains) {
+    if (ch.parts.size() < 2 || ch.effector < 0) continue;
+    if (ch.effector != part && ch.effector != parent) continue;
+    outHandPart = ch.effector;
+    return &ch;
+  }
+  return nullptr;
+}
+
+const MobNaturalWeaponDef* Mob::EffectorWeapon() const {
+  int part = -1, natural = -1;
+  StrikeEffectorMode mode = StrikeEffectorMode::None;
+  if (!ResolveEffector(part, mode, natural)) return nullptr;
+  if (mode == StrikeEffectorMode::Held) return nullptr;
+  return NaturalWeapon(natural);
+}
+
+// ---- STAGE 3.5: WHAT THIS CREATURE IS POINTING AT --------------------------
+//
+// TWO USES, ONE MECHANISM, and they are ordered rather than blended because a
+// creature biting you is already looking at you:
+//
+//   1. AN AIM EFFECTOR mid-stroke — the jaws, driven to the blade direction
+//      the stroke driver is steering. This IS the attack; there is no IK
+//      behind it and the body's own travel closes the distance.
+//   2. AN IDLE TARGET LOOK — a creature with an enemy and no live stroke turns
+//      its head toward it. Cheap (one part, a share of the spine, no solve)
+//      and it sells the bite: the head is already on the victim before the
+//      lunge starts, so the leap reads as intent rather than as a lurch.
+//
+// PRE-FLATTEN, at the same stage the avatar's head-look has always run: this
+// writes `st.local[]` and the flatten is what carries it to the part and
+// everything under it.
+void Mob::ApplyStrikeAim(const AnimSkeleton& sk, AnimState& st) const {
+  int effPart = -1, effNatural = -1;
+  StrikeEffectorMode effMode = StrikeEffectorMode::None;
+  const float share = def_ != nullptr ? def_->aimSpineShare : 0.35f;
+  if (ResolveEffector(effPart, effMode, effNatural) &&
+      effMode == StrikeEffectorMode::Aim && weaponWeight_ > 0.0f) {
+    Vec3 dir = weapon_.bladeDir;
+    // The blade direction is what the stroke driver steers; the hand offset is
+    // the fallback for a pose that has not aimed yet (tick 0 of a windup).
+    if (dir.len() < 1e-4f) dir = weapon_.hand;
+    float yaw = 0, pitch = 0;
+    if (AimAnglesTo(dir, yaw, pitch))
+      ApplyAimPart(sk, st, effPart, yaw, pitch, weaponWeight_, share);
+    return;
+  }
+  if (!aimLookValid_ || stroke_.Active()) return;
+  int head = -1;
+  for (size_t i = 0; i < sk.parts.size(); i++)
+    if (sk.parts[i].tag == "head") {
+      head = (int)i;
+      break;
+    }
+  if (head < 0 || !LimbAlive(head)) return;
+  // From the head's own rest position rather than from the body origin: a
+  // creature looking at something beside its feet should tilt its head down,
+  // and measuring from the origin would have it looking level.
+  Vec3 from = origin_;
+  if ((size_t)head < anim_.model.size()) from = origin_ + anim_.model[head].pos;
+  float yaw = 0, pitch = 0;
+  if (!AimAnglesTo(aimLook_ - from, yaw, pitch)) return;
+  // A LOOK IS NOT A STARE. Well under 1 so the creature's head leads its
+  // facing without snapping onto the target and holding — the body's own turn
+  // (Steer) is what closes the rest, and a head pinned at full weight on a
+  // circling enemy reads as an owl.
+  ApplyAimPart(sk, st, head, yaw, pitch, 0.6f, share);
+}
+
+float Mob::LocoGroundAlign() const {
+  if (anim_.locoState < 0 || anim_.locoState >= (int)skel_.states.size())
+    return 0.0f;
+  return skel_.states[anim_.locoState].groundAlign;
+}
+
+// THE STYLE VOCABULARY'S ONE RIG QUESTION (game/strokes.h says why it is
+// declared there and defined here).
+bool StyleUsable(const Mob& who, const AttackStyle& sty) {
+  if (sty.weapon.empty() || sty.weapon == "held") return who.HeldSlot() >= 0;
+  const MobNaturalWeaponDef* nw = who.NaturalWeaponNamed(sty.weapon);
+  return nw != nullptr && who.NaturalWeaponUsable(*nw);
+}
+
 // ---- the weapon arm, shared by both animation drivers -----------------------
 //
 // THE ARM SERVES THE BLADE. Three things happen here and they are in this order
@@ -13680,20 +14427,40 @@ void Mob::ApplyWeaponArm(const AnimSkeleton& sk, AnimState& st,
                          PoseAxisOverride& ov) const {
   ov = PoseAxisOverride{};
   weaponDiag_ = WeaponArmDiag{};
-  if (weaponWeight_ <= 0.0f || heldPartIndex_ < 0 || sk.chains.empty()) return;
-  if ((size_t)heldPartIndex_ >= sk.parts.size()) return;
-  // The weapon arm is the one whose hand is this prop's ancestor. Deriving it
-  // from the rig rather than hardcoding "arm.R" means a left-handed rig, or a
-  // second weapon, needs no change here.
-  const int handPart = sk.parts[heldPartIndex_].parent;
-  if (handPart < 0 || (size_t)handPart >= st.model.size()) return;
-  const IkChain* chain = nullptr;
-  for (const IkChain& ch : sk.chains)
-    if (ch.tag == "arm" && ch.effector == handPart && ch.parts.size() >= 2) {
-      chain = &ch;
-      break;
-    }
-  if (!chain) return;
+  if (weaponWeight_ <= 0.0f) return;
+  int effPart = -1, effNatural = -1;
+  StrikeEffectorMode effMode = StrikeEffectorMode::None;
+  if (!ResolveEffector(effPart, effMode, effNatural)) return;
+
+  // ---- 0. AIM: A PART WITH NO CHAIN (plan §4) -----------------------------
+  //
+  // The jaws are not on the end of anything the two-bone solver can serve —
+  // no rig in the tree puts the head in a chain, and one that did would be
+  // claiming the neck is an arm. So an Aim effector is driven the OTHER way a
+  // part can be pointed at something: rotate it, and a share of the spine,
+  // until its forward lies along the stroke's blade direction. The body's own
+  // travel — the lunge — is what carries it to the target.
+  //
+  // It returns early with no `ov` and no wrist work because there is neither:
+  // there is no elbow to keep in plane and no grip to roll.
+  // AND IT IS APPLIED EARLIER IN THE PIPELINE, so there is nothing to do here.
+  // `ApplyAimPart` writes `st.local[]` — the pre-flatten locals — because it
+  // rotates a part ABOUT ITS JOINT and shares the yaw with the spine ABOVE it,
+  // both of which the flatten then propagates. This stage runs after
+  // AnimFlatten (it is a post-process on model space, like the IK it sits
+  // beside), so an aim written from here would be a write nobody reads.
+  // Mob::ApplyStrikeAim, called at stage 3.5, is where it happens.
+  if (effMode == StrikeEffectorMode::Aim) return;
+
+  if (sk.chains.empty()) return;
+  if ((size_t)effPart >= sk.parts.size()) return;
+  // The weapon arm is the one whose EFFECTOR is this part, or this part's
+  // parent (Mob::ChainForEffector). Deriving it from the rig rather than
+  // hardcoding "arm.R" means a left-handed rig, a second weapon, or a bare
+  // fist needs no change here.
+  int handPart = -1;
+  const IkChain* chain = ChainForEffector(sk, effPart, handPart);
+  if (!chain || handPart < 0 || (size_t)handPart >= st.model.size()) return;
   const float weight = chain->weight * weaponWeight_;
   if (weight <= 0.0f) return;
 
@@ -13906,6 +14673,18 @@ void Mob::ApplyWeaponArm(const AnimSkeleton& sk, AnimState& st,
   // block says which way the blade and its flat run in the item's own box. The
   // composition below is the same one the submit path uses to place the item
   // (itemQ = handQ * gripRot), read backwards.
+  //
+  // ONLY A HELD BLADE HAS A BLADE TO CARRY (plan §4). A natural weapon IS the
+  // part: there is no grip rotation to compose against, no authored flat to
+  // roll to, and a wrist steered to lay a fist "along the stroke" would be
+  // twisting the hand off the arm it is on. The plan states this as
+  // "wristMaxAngle is set to 0 for a natural weapon"; skipping the block is
+  // the same pose and does not depend on a caller remembering to zero a knob.
+  // The elbow's hinge plane above still ran — a punching arm bends — and the
+  // rigid follow-through below still runs, so a gauntlet shell strapped to
+  // the fist travels with it.
+  const bool steerHand = effMode == StrikeEffectorMode::Held;
+  if (steerHand) [&] {
   if (heldPartIndex_ >= (int)limbDefs_.size()) return;
   const MobLimbDef& ld = limbDefs_[heldPartIndex_];
   if (!ld.hasEdge) return;
@@ -13969,6 +14748,7 @@ void Mob::ApplyWeaponArm(const AnimSkeleton& sk, AnimState& st,
   }
   const Quat handRot = QuatNormalize(QuatMul(delta, rigid));
   st.model[handPart].rot = QuatSlerp(rigid, handRot, weight);
+  }();
   weaponHandPreClamp_ = st.model[handPart].rot;
   weaponHandPosPreClamp_ = st.model[handPart].pos;
   weaponUpPreClamp_ = st.model[i0].rot;
@@ -14091,13 +14871,37 @@ bool Mob::WeaponArmPose(Vec3& outHandFromShoulder, float& outReach) const {
   // runs that conversion BACKWARDS, so a caller can read the hand, hand the
   // same value straight back through SetWeaponPose, and get the pose it already
   // had. Taking control of an arm without moving it is exactly that round trip.
-  if (heldPartIndex_ < 0 || heldPartIndex_ >= (int)skel_.parts.size())
-    return false;
-  const int handPart = skel_.parts[heldPartIndex_].parent;
-  if (handPart < 0 || handPart >= (int)skel_.parts.size()) return false;
-  if ((size_t)handPart >= anim_.model.size()) return false;
+  int effPart = -1, effNatural = -1;
+  StrikeEffectorMode effMode = StrikeEffectorMode::None;
+  if (!ResolveEffector(effPart, effMode, effNatural)) return false;
+
+  // ---- AIM: the "arm" is the NECK (plan §4) -------------------------------
+  //
+  // A part in no chain still has a pivot and still has a length, and the
+  // stroke driver needs both: the pivot is what the stroke's azimuth and
+  // elevation are measured about, and the length is what bounds its reach
+  // band. For jaws that pair is the chest joint and neck+head — which is why
+  // an aimed bite is a SHORT stroke that the body's travel has to close,
+  // rather than a swing.
+  if (effMode == StrikeEffectorMode::Aim) {
+    if ((size_t)effPart >= anim_.model.size()) return false;
+    const int par = skel_.parts[effPart].parent;
+    if (par < 0 || (size_t)par >= anim_.model.size()) return false;
+    const Vec3 rel = anim_.model[effPart].pos - anim_.model[par].pos;
+    outHandFromShoulder = Rotate(AxisAngle({0, 1, 0}, heading_), rel);
+    float span = 0;
+    if (const MobNaturalWeaponDef* nw = NaturalWeapon(effNatural))
+      span = (nw->edgeTo - nw->edgeFrom).len();
+    outReach = rel.len() + span;
+    return outReach > 1e-3f;
+  }
+
+  if ((size_t)effPart >= skel_.parts.size()) return false;
+  int handPart = -1;
+  if (ChainForEffector(skel_, effPart, handPart) == nullptr) return false;
+  if (handPart < 0 || (size_t)handPart >= anim_.model.size()) return false;
   for (const IkChain& ch : skel_.chains) {
-    if (ch.tag != "arm" || ch.effector != handPart) continue;
+    if (ch.effector != handPart) continue;
     if (ch.parts.size() < 2) continue;
     const int i0 = ch.parts[0], i1 = ch.parts[1];
     if (i0 < 0 || i1 < 0 || (size_t)i0 >= anim_.model.size() ||
@@ -14137,6 +14941,38 @@ bool Mob::WeaponStrokePose(Vec3& outHandFromShoulder, Vec3& outTipFromShoulder,
   if (!WeaponArmPose(outHandFromShoulder, outReach)) return false;
   outTipFromShoulder = outHandFromShoulder;
   outFlat = Vec3{};
+  int effPart = -1, effNatural = -1;
+  StrikeEffectorMode effMode = StrikeEffectorMode::None;
+  if (!ResolveEffector(effPart, effMode, effNatural)) return true;
+
+  // ---- A NATURAL WEAPON'S TIP (plan §4) -----------------------------------
+  //
+  // Same composition as the held item's, against the PART instead of the
+  // borrowed slot, with one difference that is easy to get wrong: a natural
+  // weapon's edge is authored from the part's MODEL MIN CORNER (mob.h
+  // MobNaturalWeaponDef, matching MobLimbDef::edgeFrom), and `anim_.model[].pos`
+  // is the part's JOINT. `LimbTargetFor` states the relation the other way
+  // round — world min corner = joint - rot * anchorLimb — so the rebasing term
+  // is `-anchorLimb`, and leaving it out puts a fist's knuckles wherever the
+  // wrist happens to be, which is a whole hand's length of quiet error.
+  if (effMode != StrikeEffectorMode::Held) {
+    const MobNaturalWeaponDef* nw = NaturalWeapon(effNatural);
+    if (nw == nullptr || (size_t)effPart >= anim_.model.size() ||
+        (size_t)effPart >= limbs_.size())
+      return true;
+    const Quat pq = anim_.model[effPart].rot;
+    const Vec3 anchor = limbs_[effPart].anchorLimb;
+    const Vec3 tipModel =
+        anim_.model[effPart].pos + QuatRotate(pq, nw->edgeTo - anchor);
+    // Relative to the "hand" the inverse already produced, then added to it,
+    // so the two ends cannot disagree about which pivot they used. For a Chain
+    // effector the hand IS the part; for Aim it is the part's own joint.
+    const Vec3 pivot = anim_.model[effPart].pos;
+    const Quat yaw = AxisAngle({0, 1, 0}, heading_);
+    outTipFromShoulder = outHandFromShoulder + Rotate(yaw, tipModel - pivot);
+    return true;
+  }
+
   if (heldPartIndex_ < 0 || heldPartIndex_ >= (int)limbDefs_.size())
     return true;   // an empty fist still has an arm to steer
   const MobLimbDef& ld = limbDefs_[heldPartIndex_];
@@ -14185,12 +15021,21 @@ bool Mob::HeadKeepOut(Vec3& outCenterFromShoulder, float& outRadius) const {
       (size_t)head >= limbs_.size())
     return false;
   if (!LimbAlive(head)) return false;  // a headless body has nothing to clear
-  if (heldPartIndex_ < 0 || heldPartIndex_ >= (int)skel_.parts.size())
-    return false;
-  const int handPart = skel_.parts[heldPartIndex_].parent;
+  int effPart = -1, effNatural = -1;
+  StrikeEffectorMode effMode = StrikeEffectorMode::None;
+  if (!ResolveEffector(effPart, effMode, effNatural)) return false;
+  // A BITE IS THE HEAD GOING THERE ON PURPOSE (plan §4). The keep-out sphere
+  // exists so an authored windup does not sweep a blade through the wielder's
+  // own face; when the face IS the weapon, the same sphere would forbid every
+  // pose the stroke is for. Skipped, rather than shrunk, because there is no
+  // radius at which "keep the jaws away from the head" means anything.
+  if (effPart == head) return false;
+  if ((size_t)effPart >= skel_.parts.size()) return false;
+  int handPart = -1;
+  if (ChainForEffector(skel_, effPart, handPart) == nullptr) return false;
   if (handPart < 0) return false;
   for (const IkChain& ch : skel_.chains) {
-    if (ch.tag != "arm" || ch.effector != handPart) continue;
+    if (ch.effector != handPart) continue;
     if (ch.parts.size() < 2) continue;
     const int i0 = ch.parts[0];
     if (i0 < 0 || (size_t)i0 >= anim_.model.size()) continue;
@@ -14213,7 +15058,34 @@ bool Mob::HeadKeepOut(Vec3& outCenterFromShoulder, float& outRadius) const {
 
 bool Mob::WeaponEdge(Vec3& outBase, Vec3& outTip, float& outHalfWidth,
                      Vec3* outFlat) const {
-  if (!def_ || heldPartIndex_ < 0) return false;
+  if (!def_) return false;
+  int effPart = -1, effNatural = -1;
+  StrikeEffectorMode effMode = StrikeEffectorMode::None;
+  if (!ResolveEffector(effPart, effMode, effNatural)) return false;
+
+  // ---- A NATURAL WEAPON'S EDGE, in the part's LIVE Jolt frame (plan §4) ---
+  // The same composition the held item takes, against the part's own body:
+  // `xf.pos` IS the model's min corner and the edge is authored from it, so
+  // there is no rebasing here — exactly as there is none below. A natural
+  // weapon authors no flat (there is no blade to lay along a line), so the
+  // sweep reports a zero vector and `MeleeEdgeAlign` reads that as "no
+  // evidence" rather than as a bad angle — a fist cannot land flat.
+  if (effMode != StrikeEffectorMode::Held) {
+    const MobNaturalWeaponDef* nw = NaturalWeapon(effNatural);
+    if (nw == nullptr || effPart < 0 || (size_t)effPart >= limbs_.size())
+      return false;
+    if (!LimbAlive(effPart)) return false;   // severed: nothing to hit with
+    const MobLimb& np = limbs_[effPart];
+    if (!np.body) return false;
+    const Quat nq{np.xf.quat[0], np.xf.quat[1], np.xf.quat[2], np.xf.quat[3]};
+    outBase = np.xf.pos + QuatRotate(nq, nw->edgeFrom);
+    outTip = np.xf.pos + QuatRotate(nq, nw->edgeTo);
+    outHalfWidth = nw->edgeHalfWidth;
+    if (outFlat) *outFlat = Vec3{};
+    return true;
+  }
+
+  if (heldPartIndex_ < 0) return false;
   if (heldPartIndex_ >= (int)limbDefs_.size()) return false;
   const MobLimbDef& ld = limbDefs_[heldPartIndex_];
   if (!ld.hasEdge) return false;

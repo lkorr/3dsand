@@ -461,6 +461,69 @@
       ]
     }
   ],
+  "natural": [
+    {
+      "name": "fist.L",
+      "part": "hand.L",
+      "edge": {
+        "from": [
+          4.0,
+          9.0,
+          4.0
+        ],
+        "to": [
+          4.0,
+          1.5,
+          8.4
+        ],
+        "halfWidth": 4.0
+      },
+      "strike": {
+        "blunt": 4.0
+      }
+    },
+    {
+      "name": "fist.R",
+      "part": "hand.R",
+      "edge": {
+        "from": [
+          4.0,
+          9.0,
+          4.0
+        ],
+        "to": [
+          4.0,
+          1.5,
+          8.4
+        ],
+        "halfWidth": 4.0
+      },
+      "strike": {
+        "blunt": 4.0
+      }
+    },
+    {
+      "name": "jaws",
+      "part": "head",
+      "edge": {
+        "from": [
+          10.0,
+          12.2,
+          8.0
+        ],
+        "to": [
+          10.0,
+          9.9,
+          21.0
+        ],
+        "halfWidth": 6.0
+      },
+      "strike": {
+        "blunt": 1.5,
+        "bite": 7.0
+      }
+    }
+  ],
   "chains": [
     {
       "tag": "leg",

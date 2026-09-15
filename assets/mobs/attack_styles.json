@@ -16,6 +16,18 @@
     "neutralAlternate": ["player_horizontal_r", "player_horizontal_l"]
   },
 
+  "playerUnarmed_notes": "THE SAME COMPASS WITH NOTHING IN YOUR FIST (docs/PLAN_impact_unarmed.md §6). A SECOND map rather than a filter over the first, because the two are different SHAPES: a sword's compass has an overhead and a thrust where a fist's has a jab, a cross and a straight -- asking one set of sectors to mean both would make every punch a re-labelled sword cut. main.cpp picks between them on `meleeArmed`, and which FIST swings comes from the style's own `weapon` (fist.R / fist.L), through the same Mob::ArmForStyle an NPC uses.",
+
+  "playerUnarmed": {
+    "sectors": [
+      { "dir": [1.0, 0.0], "style": "player_punch_r" },
+      { "dir": [-1.0, 0.0], "style": "player_punch_l" },
+      { "dir": [0.0, 1.0], "style": "player_punch_thrust" },
+      { "dir": [0.0, -1.0], "style": "player_punch_r" }
+    ],
+    "neutralAlternate": ["player_punch_r", "player_punch_l"]
+  },
+
   "styles": [
     {
       "name": "player_horizontal_r",
@@ -96,6 +108,114 @@
       "cut": { "ticks": 5, "az": -0.20, "el": 0.00, "reach": 0.85 },
       "recover": { "ticks": 12 },
       "jitter": { "az": 0.08, "el": 0.04, "tempo": 0.28 }
+    },
+
+    {
+      "//": "UNARMED, FROM HERE DOWN (docs/PLAN_impact_unarmed.md §5). Every one of these names a `weapon` -- a natural weapon on the creature's own rig (mob.h MobNaturalWeaponDef) rather than the default \"held\" -- and StyleUsable refuses it on a body that has not got that part, so a one-armed creature's repertoire shrinks by itself. The punches are all `fallback: true`: a duelist lists them beside its cuts, never draws one while a sword is in its fist, and throws nothing else once disarmed. The zombie's bites are NOT fallback, because biting is what it does. Numbers are starting points; the tuner's Attacks lane is where they get finished.",
+
+      "name": "punch_r",
+      "label": "Straight right",
+      "weapon": "fist.R",
+      "fallback": true,
+      "reach": 9,
+      "//shape": "A THRUST, NOT A SWING: a fist has no edge to sweep and no length past the wrist, so the damage has to come from the point going OUT. The reach pair is the thrust's own (-0.40 chamber, +0.80 drive) shortened a little, because an arm ending at a fist reaches less far than one ending at a sword and the band is resolved against the LIVE arm either way (StrokeReachIn). The windup is short -- 8 ticks, 0.27 s -- because a punch that telegraphs like an overhead chop is not a punch.",
+      "windup": { "ticks": 8, "az": 0.22, "el": 0.06, "reach": -0.40 },
+      "cut": { "ticks": 4, "az": -0.26, "el": -0.02, "reach": 0.80 },
+      "recover": { "ticks": 9 },
+      "jitter": { "az": 0.08, "el": 0.05, "tempo": 0.25 },
+      "clip": "punch_r"
+    },
+    {
+      "name": "punch_l",
+      "label": "Straight left",
+      "weapon": "fist.L",
+      "fallback": true,
+      "reach": 9,
+      "//": "The mirror, and the azimuth signs flip with it: azimuth is positive to the mob's RIGHT, so the off hand chambers left and crosses right.",
+      "windup": { "ticks": 9, "az": -0.22, "el": 0.06, "reach": -0.40 },
+      "cut": { "ticks": 4, "az": 0.26, "el": -0.02, "reach": 0.80 },
+      "recover": { "ticks": 10 },
+      "jitter": { "az": 0.08, "el": 0.05, "tempo": 0.25 },
+      "clip": "punch_l"
+    },
+    {
+      "name": "hook_r",
+      "label": "Right hook",
+      "weapon": "fist.R",
+      "fallback": true,
+      "reach": 8,
+      "//shape": "THE ONE PUNCH THAT IS A SWING. Azimuth-dominant and short-radius -- the fist travels around rather than out, which is why `reach` barely moves and the cut's azimuth is 1.1 rad. It reaches a voxel less far than the straights for the same reason a real hook does: the arm is bent through the whole of it.",
+      "windup": { "ticks": 10, "az": 0.75, "el": 0.10, "reach": -0.20 },
+      "cut": { "ticks": 5, "az": -1.10, "el": -0.08, "reach": 0.20 },
+      "recover": { "ticks": 11 },
+      "jitter": { "az": 0.10, "el": 0.05, "tempo": 0.25 },
+      "clip": "punch_r"
+    },
+    {
+      "name": "bite",
+      "label": "Bite",
+      "weapon": "jaws",
+      "reach": 7,
+      "//shape": "THE JAWS ARE AN AIM EFFECTOR, not a chain: no rig puts the head in an IK chain, so the stroke rotates the head and a share of the spine toward the tip direction (Mob::ApplyAimPart) and the head's own short 'reach band' -- neck plus skull -- is all the travel there is. So the cut is mostly a LUNGE OF THE NECK: a small downward pitch and a hard radial drive, which is a head snapping forward. `reach` 7 is close enough to touch; the lunging version below is how a zombie gets there.",
+      "windup": { "ticks": 10, "az": 0.05, "el": 0.30, "reach": -0.35 },
+      "cut": { "ticks": 4, "az": -0.08, "el": -0.45, "reach": 0.85 },
+      "recover": { "ticks": 12 },
+      "jitter": { "az": 0.12, "el": 0.08, "tempo": 0.22 },
+      "clip": "bite"
+    },
+    {
+      "name": "bite_lunge",
+      "label": "Lunge and bite",
+      "weapon": "jaws",
+      "reach": 22,
+      "//reach": "FAR OUTSIDE THE ZOMBIE'S PROFILE REACH (9), which is the whole point: MobSystem::AttackReachOf hands the LONGEST usable style's reach to the AI, so the creature commits from three body-lengths out and the leap closes the rest. BeginStroke then refuses the punches at that distance, so the draw at 20 voxels can only come out as this.",
+      "//lunge": "FIRED AT THE START OF THE WINDUP, so the flight IS the telegraph -- there is no UI indicator and a zombie leaving the ground is the most readable warning in the game. `speed` is a CEILING in m/s, not a command: the magnitude is min(speed, (distance - the EFFECTOR's reach)/airTime), so the body arrives at biting distance instead of through the victim, and the same style is a long leap from far out and a hop from close in. `ticks` is what the AUTHOR is aiming the cut at (10 windup ticks, so the feet land about as the cut starts) and `rise` is what actually buys the time: a ballistic hop is airborne for 2*rise/gravity, so 1.5 m/s against 9.8 m/s^2 is 0.31 s = 9 ticks, which is where this number comes from. It must be non-zero or the launch lands on the tick after it left (mob.cpp UpdateFall's launch latch buys exactly one tick); measured at 1.1 the flight was 6 ticks and the leap fell 3 voxels short of the authored one.",
+      "lunge": { "ticks": 9, "speed": 2.4, "rise": 1.5, "at": "windup" },
+      "//target": "WEIGHTS OVER LIMB TAGS, not names, so any rig that tags its parts answers it. Bites go for arms and torso too, not only the head -- the owner asked for that by name. Hands are in at 0.05 because a bitten-off hand is a thing that should happen occasionally and never look aimed at.",
+      "target": { "head": 0.35, "arm": 0.30, "hand": 0.05, "spine": 0.20, "leg": 0.10 },
+      "windup": { "ticks": 10, "az": 0.05, "el": 0.32, "reach": -0.35 },
+      "cut": { "ticks": 4, "az": -0.08, "el": -0.50, "reach": 0.90 },
+      "recover": { "ticks": 14 },
+      "jitter": { "az": 0.12, "el": 0.08, "tempo": 0.18 },
+      "clip": "lunge"
+    },
+
+    {
+      "//": "THE PLAYER'S UNARMED STRIKES. Shorter windups than the NPC punches for the same reason the player's sword styles are shorter than an NPC's: a click must feel owned. Jitter 0, so a strike goes exactly where it was flicked.",
+
+      "name": "player_punch_r",
+      "label": "Straight right",
+      "weapon": "fist.R",
+      "reach": 9,
+      "//reach": "A DEEPER CHAMBER AND A TICK MORE CUT THAN THE FIRST DRAFT. The driver moves a thrust by leaning the blade off a hand held at a fixed extension (melee.cpp's law of cosines), and a fist's whole blade is one voxel of knuckle -- so the radial channel has far less to work with than a sword's and a three-tick cut did not finish converging on it. Measured by npc-styles: commanded dr 0.92 voxels against its 1.0 floor, where the NPC punches (one more windup tick, one more cut tick) made 1.14.",
+      "windup": { "ticks": 5, "az": 0.20, "el": 0.05, "reach": -0.45 },
+      "cut": { "ticks": 4, "az": -0.24, "el": -0.02, "reach": 0.90 },
+      "recover": { "ticks": 7 },
+      "jitter": { "az": 0.0, "el": 0.0, "tempo": 0.0 },
+      "clip": "punch_r"
+    },
+    {
+      "name": "player_punch_l",
+      "label": "Straight left",
+      "weapon": "fist.L",
+      "reach": 9,
+      "windup": { "ticks": 5, "az": -0.20, "el": 0.05, "reach": -0.45 },
+      "cut": { "ticks": 4, "az": 0.24, "el": -0.02, "reach": 0.90 },
+      "recover": { "ticks": 7 },
+      "jitter": { "az": 0.0, "el": 0.0, "tempo": 0.0 },
+      "clip": "punch_l"
+    },
+    {
+      "name": "player_punch_thrust",
+      "label": "Two-handed drive",
+      "weapon": "fist.R",
+      "reach": 10,
+      "//": "The deepest chamber and the longest drive in the block, and almost no azimuth -- it is the punch you throw with your weight behind it. Down on the compass, where the sword's thrust lives, because it is the same gesture.",
+      "windup": { "ticks": 6, "az": 0.10, "el": 0.02, "reach": -0.50 },
+      "cut": { "ticks": 3, "az": -0.12, "el": 0.00, "reach": 0.95 },
+      "recover": { "ticks": 9 },
+      "jitter": { "az": 0.0, "el": 0.0, "tempo": 0.0 },
+      "clip": "punch_r"
     }
   ]
 }

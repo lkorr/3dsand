@@ -660,9 +660,17 @@ bool Think(Brain& brain, const Library& lib, const SelfView& self,
   // Cadence plus a per-attack hash-RNG jitter. The jitter is the difference
   // between a duelist and a metronome, and it is drawn from (id, tick) so a
   // replay of the same fight produces the same rhythm.
+  // THE REACH IS THE CALLER'S WHEN THE CALLER HAS ONE (ai_behavior.h
+  // SelfView::attackReach): the profile states the creature's ordinary reach
+  // and the stroke system widens it to whatever the longest USABLE style can
+  // close. Which style actually fires, and whether the target is inside ITS
+  // reach, is decided over there — this layer only decides "near enough to
+  // try", and trying costs the attack clock either way.
+  const float reach =
+      self.attackReach > 0.0f ? self.attackReach : pr.attack.reach;
   const bool attackReady =
       brain.hasTarget && brain.visible && tick >= brain.nextAttackTick &&
-      !disengaging && d <= pr.attack.reach && aimErr <= pr.attack.aimTolerance;
+      !disengaging && d <= reach && aimErr <= pr.attack.aimTolerance;
 
   // ---- score every enabled intent ----------------------------------------
   float raw[(int)Intent::Count] = {};

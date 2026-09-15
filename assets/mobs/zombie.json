@@ -30,6 +30,12 @@
     "woundHeals": false
   },
 
+  "//bite": "WHAT ITS TEETH CARRY (MobDef::bite, docs/PLAN_impact_unarmed.md §6). The jaws themselves are the HUMAN'S -- `extends` pulls human.json's whole `natural` array in untouched, and a merge-patch array REPLACES, so restating it here to change one thing would be a copy of the anatomy by another route. What makes this bite different is that THIS CREATURE is rotten, not that its teeth are a different shape: `infect` is the material the tear rewrites exposed FLESH to (armour in the way means no rewrite -- that is the whole reason the struck slot is classified before anything is applied), and `stain` is the liquid whose stain gets smeared over the hole. Both by name, resolved at load like `bleed.material`, because a material id is its row number in materials.json and renumbers the moment somebody inserts one. A human bite has no block here and so just tears.",
+  "bite": { "infect": "rotflesh", "stain": "ichor" },
+
+  "//behavior": "THE WALKING DEAD FIGHT LIKE THE DEAD (assets/mobs/behaviors.json `zombie`). Slower cadence, a reckless band it never backs out of, faction monster, and an attack list that is all natural weapons -- a lunging bite, a standing bite and three punches -- so a zombie with nothing in its hands is as dangerous as one that found a sword. It keeps `reach` 9 for the punches; the lunge states its own 22 and MobSystem::AttackReachOf is what lets the AI stand off at the longer of the two without the profile having to choose.",
+  "behavior": "zombie",
+
   "//speed": "31.5 -> 23.5 world voxels/sec. The gait cadence comes down with it (8 -> 6.4) so the STRIDE shortens a little rather than the legs spinning faster to cover less ground -- stride length is speed/cadence, 3.94 for a human and 3.67 here.",
   "speed": 23.5,
   "gait": {

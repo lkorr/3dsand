@@ -978,6 +978,78 @@ def main():
         "rotation": [0, 0, 0],
     }]
 
+    # ---- natural weapons: the parts that ARE weapons -------------------------
+    # docs/PLAN_impact_unarmed.md §3, mob.h MobNaturalWeaponDef. A fist and a
+    # set of jaws are weapons nobody handed the creature: an authored edge
+    # segment and a StrikeProfile, exactly as an item has, with the segment on
+    # a part of the rig instead of on a borrowed slot.
+    #
+    # THE FRAME IS THE PART'S OWN, ORIGIN AT ITS MODEL MIN CORNER, Y-UP —
+    # the frame MobLimbDef::edgeFrom/edgeTo are stored in, in the same SKIN
+    # units the anchors above are authored in (the loader divides by
+    # ArtToWorld). Authored as FRACTIONS of the part's own box so the numbers
+    # survive re-proportioning the figure: `part_local` turns them into the
+    # skin-unit points the sidecar carries.
+    #
+    # NOT the scene-axis map MobLimbDef's `edge` block uses. That one authors
+    # an OFFSET ALONG ONE MODEL AXIS from a hilt, and a part has no hilt: a
+    # fist's edge runs from the wrist DOWN AND FORWARD to the knuckles, which
+    # is not a multiple of any single axis.
+    def part_local(part, fx, fy, fz):
+        """A point in `part`'s engine-local frame, as fractions of its box.
+
+        `to_engine` maps scene (x, y, z) -> (x, z, -y), so the engine box is
+        (sx, sz, sy): X across, Y up, +Z the way the figure FACES (every
+        builder mirrors in scene y, and engine z = max_y - scene_y)."""
+        size, _mn = LIMBS[part]
+        return [round(fx * size[0], 1), round(fy * size[2], 1),
+                round(fz * size[1], 1)]
+
+    natural = []
+    for side in ("L", "R"):
+        # THE KNUCKLES. From just under the wrist (the top of the hand box,
+        # where the forearm meets it) to the front-low corner of the fist, so
+        # the segment lies ALONG THE FOREARM and ends where a punch actually
+        # lands. The melee driver steers the TIP, so the tip is the knuckles
+        # and not the middle of the hand; `to`'s 1.05 puts it a hair PROUD of
+        # the box, so contact is the fist's surface rather than its centre.
+        natural.append({
+            "name": f"fist.{side}",
+            "part": f"hand.{side}",
+            "edge": {
+                "from": part_local(f"hand.{side}", 0.50, 0.90, 0.50),
+                "to": part_local(f"hand.{side}", 0.50, 0.15, 1.05),
+                # About 0.5 world voxels at 10 cm: a fist is ~10 cm across and
+                # the half-width is a carve RADIUS, so the full width is the
+                # hand. Authored in skin units like the points, and divided by
+                # the same ArtToWorld.
+                "halfWidth": 4.0,
+            },
+            # PURE TRAUMA. A bare fist takes no voxels off anybody (impact.h:
+            # `bluntCarve` 0 is "bruise, never dent") — an iron gauntlet worn
+            # over this same fist REPLACES the profile and does, which is why
+            # the number lives on the item and not here.
+            "strike": {"blunt": 4.0},
+        })
+    # THE FRONT OF THE FACE. From inside the skull, level with the mouth (the
+    # head box runs z 52..67 with EYE_Z at 60, so the mouth sits around 0.37 of
+    # the way up), out past the front face so the teeth lead. The segment's
+    # direction IS the head's forward, which is what the Aim effector steers.
+    natural.append({
+        "name": "jaws",
+        "part": "head",
+        "edge": {
+            "from": part_local("head", 0.50, 0.38, 0.40),
+            "to": part_local("head", 0.50, 0.31, 1.05),
+            "halfWidth": 6.0,
+        },
+        # A BITE IS MOSTLY A TEAR. The small blunt part is the head-butt a set
+        # of jaws arrives attached to. What the tear CARRIES — rot, ichor — is
+        # the creature's (`bite` block, MobBiteDef), not the weapon's: a
+        # zombie inherits these jaws untouched and infects with them.
+        "strike": {"blunt": 1.5, "bite": 7.0},
+    })
+
     # ---- IK chains ----------------------------------------------------------
     chains = []
     for side in ("L", "R"):
@@ -1480,6 +1552,7 @@ def main():
         },
         "limbs": limbs,
         "sockets": sockets,
+        "natural": natural,
         "chains": chains,
         "states": states,
         # Clip `pos` keys are MICRO units (the engine divides them by the scale

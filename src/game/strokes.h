@@ -93,6 +93,46 @@ struct StrokeJitter {
   float tempo = 0;   // fraction of the tick counts, +-
 };
 
+// ---- A BALLISTIC OPENING (AttackStyle::lunge; plan §5) ---------------------
+//
+// A pounce is not a faster walk. The walk drive resolves a whole step against
+// the body's box every tick and cannot leave the ground, so "jump at them and
+// bite" had no expression at all — a zombie either stood in reach or did not.
+// A lunge hands the body a VELOCITY (Mob::Launch) at the start of a named
+// phase and lets `UpdateFall` carry it, wall test and all.
+//
+// METRES PER SECOND, converted once by `MetresPerSecToCells`, for the reason
+// every other authored length in this engine is derived: "2.4" has to mean the
+// same pounce when kVoxelMeters moves. `ticks` is the flight the author is
+// budgeting for — the magnitude is capped so the body arrives at striking
+// distance rather than inside the victim, and lining the landing up with the
+// cut is the AUTHOR's job (windup.ticks ~ ticks; the tuner's Attacks lane
+// shows both).
+struct StyleLunge {
+  int ticks = 0;             // flight the author is aiming the cut at
+  float speed = 0;           // m/s, horizontal CEILING (the closing gap wins)
+  float rise = 0;            // m/s, straight up
+  // Which phase's START fires it: "windup" (the default — the leap IS the
+  // telegraph) or "cut". A string rather than an enum because the phase names
+  // are already this file's vocabulary and an enum would be a second list to
+  // keep in step.
+  std::string at = "windup";
+  bool Any() const { return ticks > 0 && (speed > 0.0f || rise > 0.0f); }
+};
+
+// ---- WHICH LIMB A BLOW IS AIMED AT (AttackStyle::target; plan §5) ----------
+//
+// Weights over LIMB TAGS, not names: a style says "mostly the head, sometimes
+// an arm" and any rig that tags its parts answers it, including one with four
+// of them. Absent = today's behaviour, the chest. Drawn counter-based on
+// (mobId, tick) at BeginStroke like every other variation here, and recorded
+// on NpcStroke::targetLimb so a gate can report the distribution rather than
+// inferring it from where the wounds landed.
+struct StyleTargetWeight {
+  std::string tag;
+  float weight = 0;
+};
+
 struct AttackStyle {
   std::string name;    // the id a behaviour profile refers to
   std::string label;   // human text for the dev readout
@@ -100,6 +140,27 @@ struct AttackStyle {
   StrokeSegment cut;
   int recoverTicks = 10;
   StrokeJitter jitter;
+  // ---- WHAT SWINGS IT (plan §4/§5) ---------------------------------------
+  // "held" (the default, and every style authored before this existed) or the
+  // NAME of a natural weapon on the creature's own rig (mob.h
+  // MobNaturalWeaponDef): "fist.R", "jaws". `StyleUsable` resolves it against
+  // the creature that is trying to swing, so a style naming a weapon this
+  // creature does not have — or whose part has been cut off — is simply not
+  // drawn, rather than starting a stroke with no edge on the end of it.
+  std::string weapon = "held";
+  // ONLY WHEN THERE IS NOTHING BETTER. A duelist lists its punches beside its
+  // cuts; with a sword in its fist it must never draw one, and disarmed it
+  // must. `PickAttackStyle` drops every fallback style when any non-fallback
+  // style is still usable, which expresses that in one line of JSON per style
+  // instead of in a second list per profile.
+  bool fallback = false;
+  // World voxels, centre-to-centre, OVERRIDING the profile's `attack.reach`
+  // for this style alone; 0 = use the profile's. A lunging bite closes 22
+  // voxels and a punch closes 9, and a profile can only state one number —
+  // which is why this is per style and why MobSystem::AttackReachOf exists.
+  float reach = 0;
+  StyleLunge lunge;
+  std::vector<StyleTargetWeight> target;
   // AN AUTHORED BODY ANIMATION TO PLAY WITH THE STROKE, by name (empty = none).
   // The stroke program drives the WEAPON ARM through the melee driver; this is
   // everything else — the step, the shoulder drop, the off hand — keyframed in
@@ -131,6 +192,13 @@ struct PlayerStrikeMap {
 struct StyleLibrary {
   std::vector<AttackStyle> styles;
   PlayerStrikeMap player;
+  // ...and the SAME compass for a player with nothing in their fist (the
+  // `playerUnarmed` block). A second map rather than a `weapon` filter over
+  // the first, because the two are different SHAPES: a sword's compass has an
+  // overhead and a thrust, a fist's has a jab, a cross and a straight, and
+  // asking one set of sectors to mean both would make every punch a
+  // re-labelled sword cut.
+  PlayerStrikeMap playerUnarmed;
   int Find(const std::string& n) const {
     for (size_t i = 0; i < styles.size(); i++)
       if (styles[i].name == n) return (int)i;
@@ -145,11 +213,15 @@ struct StyleLibrary {
 // The flick (screen space, +y down) -> a style index by max dot over the
 // sectors; -1 when the map has none. The caller decides what a -1 means
 // (fall back to NeutralStrike, or don't swing).
-int QuantizeStrike(const StyleLibrary& lib, float dx, float dy);
+//
+// TAKES THE MAP, NOT THE LIBRARY, since the library now holds two of them
+// (`player` and `playerUnarmed`) and the caller is the only thing that knows
+// which fist is empty.
+int QuantizeStrike(const PlayerStrikeMap& map, float dx, float dy);
 // The directionless click: one of the two neutral entries, `right` picking
 // which. Returns the other one when the asked-for side is unresolved, and -1
 // when neither is.
-int NeutralStrike(const StyleLibrary& lib, bool right);
+int NeutralStrike(const PlayerStrikeMap& map, bool right);
 
 // Load assets/mobs/attack_styles.json. Follows every other loader here: a bad
 // entry is skipped LOUDLY into `log` and is never fatal, and an unknown key is
@@ -204,6 +276,17 @@ struct NpcStroke : StrokeCursor {
   MeleeState melee;
   uint64_t targetId = 0;
   Vec3 targetPoint{};        // world voxels, where the blow was aimed
+  // WHICH LIMB OF THE VICTIM was drawn from the style's `target` table, as a
+  // rig slot on that victim; -1 = the chest (the historical aim, and what an
+  // absent table means). Recorded rather than merely used so a gate can assert
+  // the DISTRIBUTION — "40 bites chose at least two tags and not the head
+  // every time" is a claim about the draw, and inferring it from where wounds
+  // ended up would be measuring the sweep instead (CLAUDE.md rule 6).
+  int targetLimb = -1;
+  // ...and the LUNGE, once per stroke. `Mob::Launch` is idempotent-hostile (a
+  // second call mid-flight would re-time the arc), and a phase can be stepped
+  // more than once at a tempo jitter of zero ticks.
+  bool lunged = false;
   // The blade's edge as it was last tick, for the damage sweep. Not valid on
   // the first cut tick — there is no previous position to sweep from, and
   // inventing one is a free hit at the start of every swing.
@@ -229,12 +312,32 @@ struct NpcStroke : StrokeCursor {
   void Reset() { *this = NpcStroke{}; }
 };
 
+// CAN THIS CREATURE SWING THIS STYLE AT ALL (plan §5)?
+//
+//   "held"  -> something is in its fist (HeldSlot() >= 0)
+//   natural -> the def declares that weapon, its part is alive, and — for a
+//              chain effector — so is every part of the chain that serves it.
+//
+// DECLARED HERE AND DEFINED IN mob.cpp, which is the one deliberate oddity in
+// this header. `strokes.h` is included BY `mob.h`, so this file cannot see a
+// Mob; the question is nevertheless part of the STYLE vocabulary, and putting
+// it in mob.h would mean an author looking for "when does a style apply" has
+// to know that the answer lives in the rig. `melee.h` already forward-declares
+// Mob for exactly this reason and this header includes it.
+bool StyleUsable(const Mob& who, const AttackStyle& sty);
+
 // Pick a style for one attack out of a profile's authored list. Counter-based
 // on (mobId, tick) so the sequence replays; returns -1 when the list is empty
 // or names nothing the library knows.
+//
+// `who`, when given, FILTERS: unusable styles are dropped, and then fallback
+// styles are dropped as a group if any non-fallback style survived — so a
+// duelist with a sword never throws a punch and a disarmed one throws nothing
+// else. Null skips both filters, which is what a caller with no creature (the
+// tuner's preview, a gate measuring the library itself) wants.
 int PickAttackStyle(const StyleLibrary& lib,
                     const std::vector<std::string>& names, uint64_t mobId,
-                    uint32_t tick);
+                    uint32_t tick, const Mob* who = nullptr);
 
 // ---------------------------------------------------------------------------
 // THE SHARED STROKE-PROGRAM RUNNER.

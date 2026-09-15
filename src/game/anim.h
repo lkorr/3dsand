@@ -224,6 +224,14 @@ struct AnimStateRule {
   int minChainsLost = 0;          // >= N IK chains disabled ("legs of use lost")
   std::string clip;               // looping loco clip, crossfaded on entry
   float speedScale = 1.0f;        // walk-drive speed multiplier
+  // ...and the same multiplier for a BALLISTIC opening (strokes.h StyleLunge).
+  // Separate from `speedScale` because a leap and a walk are not the same
+  // ability: a body dragging itself on its elbows walks at a fifth speed but
+  // can still throw itself half its own length, and a hopping body is the
+  // other way round. DEFAULTS TO `speedScale` at load rather than to 1, so a
+  // rig that has only ever thought about walking gets the sensible answer for
+  // free and one that cares says so in a key.
+  float lungeScale = 1.0f;
   // The clip owns the pose: suppress gait scheduling, IK, the legacy phase
   // swing and the pelvis bob while this state is active. A crawl keyed on the
   // torso fights all four otherwise.
