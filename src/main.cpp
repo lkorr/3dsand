@@ -6769,23 +6769,59 @@ int main(int argc, char** argv) {
                      : nullptr;
     const bool meleeArmed = ui.tool == UIState::kToolMelee && !ui.magicMode &&
                             heldItem && heldItem->kind == ItemKind::Melee;
-    const bool meleeHeld = meleeArmed && mouseL;
+    // ---- ...AND WITH NOTHING IN YOUR HANDS (plan §6) -----------------------
+    //
+    // "The melee tool is up, nothing is drawn, and this body can punch." The
+    // last clause is deliberately NOT `def->FindNatural("fist.R")`: a weapon
+    // name spelled in C++ is exactly the closed-ended system design rule 4
+    // forbids, and it would make the avatar the one creature whose anatomy the
+    // engine knows by heart. Instead the CONTENT answers it — the
+    // `playerUnarmed` compass resolves, and at least one style it points at is
+    // one this body can actually swing (`StyleUsable`, the same question the
+    // NPC draw asks). Lose both hands and the compass stops resolving on its
+    // own; author a creature with claws instead of fists and nothing here
+    // changes.
+    const bool meleeUnarmed = [&] {
+      if (ui.tool != UIState::kToolMelee || ui.magicMode) return false;
+      if (heldItem != nullptr || !avatar.Spawned()) return false;
+      const StyleLibrary& lib = mobs.AttackStyles();
+      if (!lib.playerUnarmed.Usable()) return false;
+      for (const PlayerStrikeMap::Sector& s : lib.playerUnarmed.sectors)
+        if (const AttackStyle* sty = lib.At(s.style))
+          if (StyleUsable(avatar, *sty)) return true;
+      for (int k = 0; k < 2; k++)
+        if (const AttackStyle* sty = lib.At(lib.playerUnarmed.neutral[k]))
+          if (StyleUsable(avatar, *sty)) return true;
+      return false;
+    }();
+    // WHAT EVERY DOWNSTREAM "IS MELEE LIVE" TEST MEANS NOW. `meleeArmed` still
+    // means "a weapon is drawn" and is what decides whether to equip one; this
+    // is the one the driver, the program and the sweep gate on, because a fist
+    // is as live as a sword.
+    const bool meleeReady = meleeArmed || meleeUnarmed;
+    const bool meleeHeld = meleeReady && mouseL;
     // DISCRETE STRIKES (melee.controlMode 0): the click is the whole input,
     // LATCHED like castQueued above and for the same reason. The direction is
     // read HERE, at the press edge, because the flick is freshest at the
     // instant of intent — a strike fired from the buffer later still cuts the
     // direction that was flicked, aimed wherever the camera is THEN (the
     // aim is resolved at the windup's end, like every stroke).
-    if (mouseLClick && meleeArmed && CurrentTuning().melee.controlMode == 0) {
+    if (mouseLClick && meleeReady && CurrentTuning().melee.controlMode == 0) {
       const StyleLibrary& styleLib = mobs.AttackStyles();
+      // WHICH COMPASS: the sword's, or the fists'. Two maps rather than one
+      // filtered set, because the two are different SHAPES (strokes.h
+      // StyleLibrary::playerUnarmed) — a punch compass has a jab and a cross
+      // where a sword's has an overhead and a thrust.
+      const PlayerStrikeMap& map =
+          meleeArmed ? styleLib.player : styleLib.playerUnarmed;
       float fx = 0, fy = 0;
       int si = -1;
       if (strikePicker.Pick(CurrentTuning().melee.pickMinSpeed, fx, fy))
-        si = QuantizeStrike(styleLib, fx, fy);
+        si = QuantizeStrike(map, fx, fy);
       if (si < 0) {
         // No flick: alternate the two horizontals so plain clicking is a
         // usable L/R rhythm rather than the same cut stamped.
-        si = NeutralStrike(styleLib, strikePicker.altRight);
+        si = NeutralStrike(map, strikePicker.altRight);
         strikePicker.altRight = !strikePicker.altRight;
       }
       if (si >= 0) strikeQueued = si;
@@ -7530,32 +7566,42 @@ int main(int argc, char** argv) {
             // (F5) drops any live program rather than leaving it half-run.
             playerStrike.Reset();
             strikeQueued = strikeBuffered = -1;
-            melee.Update(kTickDt, meleeHeld, meleeArmed, swRight, swUp, swFwd);
+            melee.Update(kTickDt, meleeHeld, meleeReady, swRight, swUp, swFwd);
           } else {
             // DISCRETE: consume the press latch, then step the program. Begin
             // and first step land on the SAME tick, exactly as the NPC's
             // BeginStroke/StepStroke pair does.
-            if (!meleeArmed || !avatar.Spawned()) {
+            if (!meleeReady || !avatar.Spawned()) {
               // Weapon stowed (or body gone) mid-swing: drop the claim the
               // same way MobSystem's teardown guard does.
               playerStrike.Reset();
               strikeBuffered = -1;
+              if (avatar.Spawned()) avatar.ClearStrikeEffector();
             }
-            if (strikeQueued >= 0 && meleeArmed && avatar.Spawned()) {
+            if (strikeQueued >= 0 && meleeReady && avatar.Spawned()) {
               if (!playerStrike.Active()) {
                 if (const AttackStyle* sty =
                         mobs.AttackStyles().At(strikeQueued)) {
-                  // Fresh sliders per swing — MobSystem::BeginStroke says why
-                  // (MeleeTuning is a copy; F5 has to reach the next cut).
-                  ApplyMeleeTuning(melee.tuning);
-                  // The seed is (who, when), like the NPC's; the player's
-                  // styles author jitter 0, so it only matters if an author
-                  // turns jitter back on — and then it still replays.
-                  BeginStrokeProgram(playerStrike, *sty, strikeQueued,
-                                     rng::Hash3(0x504Cu, tick, 0x5747u));
-                  // ...and the style's body animation, exactly as the NPC's
-                  // BeginStroke does (strokes.h AttackStyle::clip).
-                  if (!sty->clip.empty()) avatar.PlayClip(sty->clip);
+                  // ---- POINT THE DRIVER AT THE PART THIS STYLE SWINGS -----
+                  // Exactly what MobSystem::BeginStroke does, and through the
+                  // same call: `player_punch_r` names `fist.R`, so the arm
+                  // chain is claimed on the fist and `avatar.WeaponEdge`
+                  // reports the knuckles. A style whose weapon this body has
+                  // not got refuses HERE, before the program begins, so a
+                  // strike never runs with no edge on the end of it.
+                  if (avatar.ArmForStyle(*sty)) {
+                    // Fresh sliders per swing — MobSystem::BeginStroke says
+                    // why (MeleeTuning is a copy; F5 must reach the next cut).
+                    ApplyMeleeTuning(melee.tuning);
+                    // The seed is (who, when), like the NPC's; the player's
+                    // styles author jitter 0, so it only matters if an author
+                    // turns jitter back on — and then it still replays.
+                    BeginStrokeProgram(playerStrike, *sty, strikeQueued,
+                                       rng::Hash3(0x504Cu, tick, 0x5747u));
+                    // ...and the style's body animation, exactly as the NPC's
+                    // BeginStroke does (strokes.h AttackStyle::clip).
+                    if (!sty->clip.empty()) avatar.PlayClip(sty->clip);
+                  }
                 }
               } else if (playerStrike.phase == StrokeCursor::Phase::Cut ||
                          playerStrike.phase == StrokeCursor::Phase::Recover) {
@@ -7582,6 +7628,11 @@ int main(int argc, char** argv) {
                 strikeCutEdge = playerStrike.Cutting() && !wasCutting;
                 if (r == StrokeStepResult::Finished) {
                   playerStrike.Reset();
+                  // ...and hand the part back, like MobSystem::StepStroke's
+                  // Finished branch. With a sword drawn this falls straight
+                  // through to the held item, so an armed player's arm claim
+                  // between strikes is exactly what it always was.
+                  avatar.ClearStrikeEffector();
                   // Chain the banked strike: promoted to the latch, so it
                   // begins on the next tick through the same door as a fresh
                   // click (one tick of gap, invisible at 30 Hz).
@@ -7596,7 +7647,7 @@ int main(int argc, char** argv) {
               // No program stepped the driver this tick: it idles/unwinds
               // exactly as a released button always did, so the arm hands
               // back over the usual ramp. ONE advance per tick either way.
-              melee.Update(kTickDt, false, meleeArmed, swRight, swUp, swFwd);
+              melee.Update(kTickDt, false, meleeReady, swRight, swUp, swFwd);
             }
           }
           // ---- THE SWING WHOOSH, on the EDGE into Slash --------------------
@@ -8344,7 +8395,7 @@ int main(int argc, char** argv) {
       //
       // Deferred to this point for the same reason the laser kerf is: a carve
       // needs the `spawns` list debris.PreTick fills just above.
-      if (avatar.Spawned() && meleeArmed) {
+      if (avatar.Spawned() && meleeReady) {
         Vec3 eb, et, ef;
         float ehw = 0;
         if (avatar.WeaponEdge(eb, et, ehw, &ef)) {
@@ -8364,13 +8415,31 @@ int main(int argc, char** argv) {
             sw.flatNow = ef;
             sw.dt = kTickDt;
             sw.halfWidth = ehw;
-            sw.damage = heldItem->damage;
-            sw.carveBonus = heldItem->carveBonus;
-            // HEFT: the weapon's own volume against the reference, so a
-            // greatsword cuts deeper than a knife because it IS bigger
-            // (item.h ItemDef::heftVolume). Derived from the art, resolved
-            // here because only the caller knows which item is in the fist.
-            {
+            // ---- WHOSE BLOW IS THIS: THE SWORD'S, OR THE FIST'S? ----------
+            // `WeaponEdge` above already reported whichever the effector
+            // names, so this is the matching half: the numbers come from the
+            // same weapon the segment did. A fist's profile passes through
+            // `StrikeProfileFor`, so a worn gauntlet upgrades the player's
+            // punch exactly as it upgrades an NPC's (plan §3).
+            if (const MobNaturalWeaponDef* fist = avatar.EffectorWeapon()) {
+              // PACKAGE A MERGE: replace with
+              //   `sw.strike = avatar.StrikeProfileFor(*fist);`
+              // — one line, and `damage` leaves EdgeSweep with it. Until then
+              // the three parts are SUMMED into the bare kerf float, which is
+              // wrong in KIND (a punch reads as a small cut) and right in
+              // magnitude, so every gate here measures the geometry it is
+              // actually about.
+              const StrikeProfile p = avatar.StrikeProfileFor(*fist);
+              sw.damage = p.cut + p.blunt + p.bite;
+              // No blade behind it, so the neutral heft (EdgeSweep::heft's
+              // documented default) rather than an item's volume ratio.
+            } else if (heldItem != nullptr) {
+              sw.damage = heldItem->damage;
+              sw.carveBonus = heldItem->carveBonus;
+              // HEFT: the weapon's own volume against the reference, so a
+              // greatsword cuts deeper than a knife because it IS bigger
+              // (item.h ItemDef::heftVolume). Derived from the art, resolved
+              // here because only the caller knows which item is in the fist.
               const auto& goreT = CurrentTuning().gore;
               sw.heft = heldItem->HeftFactor(goreT.woundHeftRef,
                                              goreT.woundHeftMax);
@@ -9389,7 +9458,7 @@ int main(int argc, char** argv) {
       }
       ui.itemSelected = hotbar.selected;
       switch (melee.Phase()) {
-        case SwingPhase::Idle:    ui.swingPhase = meleeArmed ? "ready" : ""; break;
+        case SwingPhase::Idle:    ui.swingPhase = meleeReady ? "ready" : ""; break;
         case SwingPhase::Guard:   ui.swingPhase = "guard"; break;
         case SwingPhase::Wind:    ui.swingPhase = "winding"; break;
         case SwingPhase::Slash:   ui.swingPhase = "SLASH"; break;
@@ -9400,9 +9469,16 @@ int main(int argc, char** argv) {
       // flick's read-back is on screen while the swing is. A banked follow-up
       // is shown too — it is the answer to "did my mid-swing click register".
       ui.swingStyle.clear();
+      // ---- THE WEAPON READOUT SAYS "fists" (plan §6) ------------------------
+      // Through `swingStyle` rather than a new UIState field, because
+      // `ui/overlay.*` belongs to a concurrent session this package may not
+      // edit (plan §1) — and this is the line that already sits under the
+      // swing phase and already names what you are swinging.
+      if (meleeUnarmed) ui.swingStyle = "fists";
       if (playerStrike.Active()) {
         if (const AttackStyle* sty = mobs.AttackStyles().At(playerStrike.style))
-          ui.swingStyle = sty->label;
+          ui.swingStyle =
+              (meleeUnarmed ? "fists: " : "") + sty->label;
         if (strikeBuffered >= 0) {
           if (const AttackStyle* nxt = mobs.AttackStyles().At(strikeBuffered))
             ui.swingStyle += "  (next: " + nxt->label + ")";
