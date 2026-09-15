@@ -1,8 +1,12 @@
 #include "sim/waterbody.h"
 
 #include <algorithm>
+#include <cmath>
+#include <cstddef>
+#include <cstdio>
 #include <cstring>
 
+#include "sim/bytestream.h"
 #include "sim/tuning.h"
 
 namespace sandvox {
@@ -106,6 +110,24 @@ int64_t crossSectionD2(const WaterBasin& b, int y) {
   return std::min<int64_t>(maxD2, b.discD2Max);
 }
 
+// W-D: is this basin id from discovery's reserved range? The top two bits name
+// the source — 00 authored pool, 01 authored lake, 10 tarn, 11 discovered — so
+// the test is a mask rather than a side table that could disagree.
+bool isDiscoveredId(uint32_t id) {
+  return (id & 0xC0000000u) == kWaterDiscoverIdBase;
+}
+
+// W-D: the liquid a discovered probe is made of, BY NAME, because WaterBasin
+// stores a name and the consumer resolves it (design guideline #4). The three
+// ids are the ones WaterMatId below knows; evidence is only ever accumulated
+// for those, so this cannot be handed an id it has no name for.
+const char* waterMatName(uint32_t id) {
+  if (id == kMatWater) return "water";
+  if (id == kMatOil) return "oil";
+  if (id == kMatLava) return "lava";
+  return "";
+}
+
 }  // namespace
 
 // ---- component 2, the analytic half ---------------------------------------
@@ -200,6 +222,393 @@ void WaterBodySystem::Reset() {
   gpu_.drainArmed = false;
   gpu_.sweepSlot = kWaterBodyCap;
   gpu_.sweepLevel = 0;
+  // W3: a splash aimed at a world that no longer exists must not land in the
+  // one that replaces it. The same argument the hole hints and the hot latch
+  // above are cleared on.
+  pendingImp_.clear();
+  armedImp_.clear();
+  gpu_.impulses.clear();
+  gpu_.impulseCount = 0;
+  impRefused_ = 0;
+  // W-D. Reset is "the world this described no longer exists" — a fresh
+  // worldgen, a load — and a probe disc is a statement about water in THAT
+  // world. The saved registry is restored AFTER the grid is in place (the
+  // 'WTRB' section runs from LoadEntities, which LoadWorld calls last), so this
+  // cannot eat a restore.
+  ClearDiscovered();
+  discoverEvictions_ = 0;
+}
+
+void WaterBodySystem::ClearDiscovered() {
+  discovered_.clear();
+  evidence_.clear();
+  evidenceDirty_ = false;
+  discoveredGen_++;
+}
+
+const WaterDiscovered* WaterBodySystem::DiscoveredFor(uint32_t basinId) const {
+  for (const WaterDiscovered& d : discovered_)
+    if (d.basinId == basinId) return &d;
+  return nullptr;
+}
+
+uint32_t WaterBodySystem::FreeDiscoverSlot() const {
+  for (uint32_t s = 0; s < kWaterDiscoveredCap; s++) {
+    bool taken = false;
+    for (const WaterDiscovered& d : discovered_)
+      if (d.basinId == (kWaterDiscoverIdBase | s)) { taken = true; break; }
+    if (!taken) return s;
+  }
+  return kWaterDiscoveredCap;
+}
+
+// ---- W-D: EVIDENCE ACCOUNTING (plan §8.2/§8.3) -----------------------------
+//
+// One liquid placement folded into the coarse grid. Everything here is integer
+// and everything it reads is on the tick stream; there is no voxel read, no
+// snapshot and no clock, which is the whole rule-1 argument for the feature.
+
+void WaterBodySystem::AddEvidence(uint32_t matId, int x, int y, int z,
+                                  uint64_t eighths, uint32_t tick) {
+  if (eighths == 0) return;
+  const int gx = fdiv(x, kWaterEvidenceGrid);
+  const int gz = fdiv(z, kWaterEvidenceGrid);
+  for (WaterEvidenceCell& e : evidence_) {
+    if (e.gx != gx || e.gz != gz || e.matId != matId) continue;
+    e.eighths += eighths;
+    e.loX = std::min(e.loX, x); e.hiX = std::max(e.hiX, x);
+    e.loZ = std::min(e.loZ, z); e.hiZ = std::max(e.hiZ, z);
+    e.loY = std::min(e.loY, y); e.hiY = std::max(e.hiY, y);
+    e.lastTick = tick;
+    evidenceDirty_ = true;
+    return;
+  }
+  if (evidence_.size() >= kWaterEvidenceCap) {
+    // RULE 2, and the eviction key is a property of the WORLD rather than of
+    // iteration order: lowest evidence first, ties by the oldest sighting, ties
+    // by position. A player pouring water across a continent forgets the
+    // thinnest puddle, never the pond they are standing in.
+    size_t worst = 0;
+    for (size_t i = 1; i < evidence_.size(); i++) {
+      const WaterEvidenceCell& a = evidence_[i];
+      const WaterEvidenceCell& b = evidence_[worst];
+      const bool better = a.eighths != b.eighths      ? a.eighths < b.eighths
+                          : a.lastTick != b.lastTick  ? a.lastTick < b.lastTick
+                          : a.gz != b.gz              ? a.gz < b.gz
+                                                      : a.gx < b.gx;
+      if (better) worst = i;
+    }
+    evidence_.erase(evidence_.begin() + (ptrdiff_t)worst);
+  }
+  WaterEvidenceCell e;
+  e.gx = gx; e.gz = gz;
+  e.matId = matId;
+  e.eighths = eighths;
+  e.loX = e.hiX = x;
+  e.loZ = e.hiZ = z;
+  e.loY = e.hiY = y;
+  e.lastTick = tick;
+  evidence_.push_back(e);
+  evidenceDirty_ = true;
+}
+
+void WaterBodySystem::NoteMutations(const World& world, uint32_t tick, int mode,
+                                    int minEighths, const CellOp* cells,
+                                    uint32_t cellCount, const BrushOp* ops,
+                                    uint32_t opCount) {
+  // THE OFF SWITCH, twice, and both are early-outs rather than flags consulted
+  // later: at `sim.waterBodyMode = 0` or `sim.waterDiscoverMinEighths = 0`
+  // nothing is accumulated, so no probe can ever be raised and the tick is
+  // bit-identical to a build without this feature.
+  if (mode == 0 || minEighths <= 0) return;
+
+  // ---- CELL OPS: the exact-cell half of the MutationQueue -----------------
+  // Every in-game system that writes a voxel arrives here (mobs, debris,
+  // prefabs, tree felling, the world edit layer, spells) and so does every
+  // gate's hand-built op list, which is what makes this and the brush loop
+  // below the chokepoint §8.2 asks for.
+  for (uint32_t i = 0; i < cellCount; i++) {
+    // Bit 31 is kCellOpIfAir, a CPU->GPU request flag that never lands in the
+    // grid. An op the grid then REFUSES (the target was not air) still counts
+    // as evidence, because the CPU cannot know: the mirror is 3x3x3 and asking
+    // would be the readback §8.2 forbids. Over-counting costs a probe disc the
+    // GPU then measures and refuses; it cannot cost an eighth.
+    const uint32_t word = cells[i].word & ~kCellOpIfAir;
+    const uint32_t mat = word & 0xFFFu;
+    if (mat != kMatWater && mat != kMatOil && mat != kMatLava) continue;
+    const uint32_t slot = cells[i].cellIdx / kChunkVol;
+    if (slot >= kNumSlots) continue;
+    const uint32_t loc = cells[i].cellIdx % kChunkVol;
+    // A slot index is a MEMORY ADDRESS, not an identity (CLAUDE.md's page-table
+    // rule). SlotToWorldChunk is the one legal way back to a world cell, and
+    // hand-rolling it would put the evidence in another chunk's pond.
+    const IVec3 wc = world.SlotToWorldChunk(slot);
+    const int x = wc.x * (int)kChunk + (int)(loc % kChunk);
+    const int y = wc.y * (int)kChunk + (int)((loc / kChunk) % kChunk);
+    const int z = wc.z * (int)kChunk + (int)(loc / (kChunk * kChunk));
+    AddEvidence(mat, x, y, z, (uint64_t)(((word >> 12) & 0xFu) + 1u), tick);
+  }
+
+  // ---- BRUSH OPS: the player's own hand ----------------------------------
+  // A brush op is a BALL, not a cell, and the CPU knows its exact lattice count
+  // (sim_mutate's own `d2 <= r*r`). Attributed whole to the centre's grid cell:
+  // the largest brush is radius 7, i.e. 15 voxels across, which is under half a
+  // 32-voxel evidence cell, so splitting it across cells would buy nothing a
+  // clustering scan does not already do.
+  for (uint32_t i = 0; i < opCount; i++) {
+    const BrushOp& o = ops[i];
+    if (o.material != kMatWater && o.material != kMatOil &&
+        o.material != kMatLava)
+      continue;
+    const int r = std::clamp(o.radius, 0, 32);
+    int64_t cellsIn = 0;
+    for (int dz = -r; dz <= r; dz++)
+      for (int dy = -r; dy <= r; dy++)
+        for (int dx = -r; dx <= r; dx++)
+          if (dx * dx + dy * dy + dz * dz <= r * r) cellsIn++;
+    // A liquid brush paints FULL cells, so eight eighths each. It is an upper
+    // bound in `mode == 0` (paint into air) whenever the ball overlaps solid
+    // ground, which is the same benign over-count the cell-op loop takes.
+    AddEvidence(o.material, o.x, o.y, o.z, (uint64_t)cellsIn * 8u, tick);
+  }
+}
+
+// THE PROMOTION SCAN. Clusters the evidence grid, bounds each cluster with a
+// circle, and either GROWS the probe already covering it or raises a new one.
+//
+// Run only on a tick where the evidence or the registry moved (`evidenceDirty_`
+// / a release expiry), so a world nobody is pouring into pays one boolean. On
+// the ticks it does run it is O(cells^2) at kWaterEvidenceCap = 192 — a few
+// tens of thousands of integer compares, once, on a tick where a mutation
+// already happened.
+void WaterBodySystem::PromoteEvidence(const World& world, uint32_t tick,
+                                      int minEighths) {
+  const size_t n = evidence_.size();
+  if (n == 0 || minEighths <= 0) return;
+  std::vector<uint8_t> seen(n, 0u);
+  std::vector<size_t> stack, cluster;
+  for (size_t root = 0; root < n; root++) {
+    if (seen[root]) continue;
+    // 8-CONNECTED FLOOD FILL over cells of the SAME LIQUID. A wide shallow pond
+    // spreads its evidence over several grid cells, none of which crosses the
+    // threshold alone; clustering is what lets the pond be discovered and still
+    // leaves a lone bucket in a lone cell under it.
+    cluster.clear();
+    stack.assign(1, root);
+    seen[root] = 1u;
+    while (!stack.empty()) {
+      const size_t cur = stack.back();
+      stack.pop_back();
+      cluster.push_back(cur);
+      for (size_t j = 0; j < n; j++) {
+        if (seen[j] || evidence_[j].matId != evidence_[cur].matId) continue;
+        if (std::abs(evidence_[j].gx - evidence_[cur].gx) > 1) continue;
+        if (std::abs(evidence_[j].gz - evidence_[cur].gz) > 1) continue;
+        seen[j] = 1u;
+        stack.push_back(j);
+      }
+    }
+
+    uint64_t total = 0;
+    int loX = 1 << 30, hiX = -(1 << 30), loZ = 1 << 30, hiZ = -(1 << 30);
+    int loY = 1 << 30, hiY = -(1 << 30);
+    for (size_t k : cluster) {
+      const WaterEvidenceCell& e = evidence_[k];
+      total += e.eighths;
+      loX = std::min(loX, e.loX); hiX = std::max(hiX, e.hiX);
+      loZ = std::min(loZ, e.loZ); hiZ = std::max(hiZ, e.hiZ);
+      loY = std::min(loY, e.loY); hiY = std::max(hiY, e.hiY);
+    }
+    const uint32_t matId = evidence_[cluster[0]].matId;
+    // THE BOUNDING CIRCLE OF THE CONTRIBUTING EVIDENCE, PADDED (§8.3). The disc
+    // is only a BOUND — the sweep's component map trims ownership to the
+    // actually connected water, exactly as it does for an authored basin — so
+    // the pad costs a slightly larger chunk list and never a wrong footprint.
+    const int cx = (loX + hiX) / 2, cz = (loZ + hiZ) / 2;
+    const int halfX = (hiX - loX + 1) / 2, halfZ = (hiZ - loZ + 1) / 2;
+    const int need = (int)isqrt((uint64_t)halfX * (uint64_t)halfX +
+                                (uint64_t)halfZ * (uint64_t)halfZ) +
+                     1 + kWaterDiscoverPad;
+    const int radius = std::min(need, kWaterDiscoverMaxRadius);
+    const int floorY = loY - kWaterDiscoverFloorPad;
+
+    // ---- GROWTH: does a probe already cover this cluster? ----------------
+    WaterDiscovered* grow = nullptr;
+    for (WaterDiscovered& d : discovered_) {
+      if (d.matId != matId || d.releaseUntil != 0) continue;
+      const int64_t dx = cx - d.cx, dz2 = cz - d.cz;
+      const int64_t reach = (int64_t)d.radius + radius;
+      if (dx * dx + dz2 * dz2 <= reach * reach) { grow = &d; break; }
+    }
+    if (grow) {
+      // A BOUNDING CIRCLE OVER BOTH, and the RE-DIRTY that goes with it. The
+      // same latch shape curveDirtyUntil_ has: the entry is a live description
+      // of a pool that is still being poured into, and the GPU must be told to
+      // look again — which is WBF_REPROBE, sent for exactly this one tick.
+      const int64_t dx = cx - grow->cx, dz2 = cz - grow->cz;
+      const int sep = (int)isqrt((uint64_t)(dx * dx + dz2 * dz2));
+      const int want = std::min(std::max(grow->radius, sep + radius),
+                                kWaterDiscoverMaxRadius);
+      const int wantFloor = std::min(grow->floorY, floorY);
+      const int wantTop = std::max(grow->topY, hiY);
+      const uint64_t wantEv = std::max(grow->evidenceEighths, total);
+      const bool moved = want != grow->radius || wantFloor != grow->floorY ||
+                         wantTop != grow->topY || wantEv != grow->evidenceEighths;
+      grow->radius = want;
+      grow->floorY = wantFloor;
+      grow->topY = wantTop;
+      grow->evidenceEighths = wantEv;
+      grow->lastEvidenceTick = tick;
+      if (moved) {
+        grow->reprobeTick = tick;
+        discoveredGen_++;
+      }
+      continue;
+    }
+
+    // ---- A NEW PROBE, if the evidence has earned one --------------------
+    if (total < (uint64_t)minEighths) continue;
+    // NOT INSIDE ANY EXISTING BODY'S FOOTPRINT (§8.3). Tested at CHUNK
+    // granularity and not at disc granularity, because the labelling is by
+    // chunk and two basins sharing one chunk is the STRADDLE — which refuses
+    // BOTH bodies. A probe that cost the harness lake its adoption because
+    // somebody made a puddle on the bank would be a regression bought with a
+    // feature.
+    bool clash = false;
+    const auto overlapsChunkwise = [&](int bx, int bz, int br) {
+      const int pad = (int)kChunk;
+      return std::abs(bx - cx) <= radius + br + pad &&
+             std::abs(bz - cz) <= radius + br + pad;
+    };
+    for (const WaterBasin& b : basins_)
+      if (overlapsChunkwise(b.cx, b.cz, b.radius)) { clash = true; break; }
+    for (const WaterDiscovered& d : discovered_)
+      if (overlapsChunkwise(d.cx, d.cz, d.radius)) { clash = true; break; }
+    if (clash) continue;
+    // RESIDENT, or there is nothing to measure. An out-of-window probe would be
+    // refused by the ladder every tick anyway; not raising it keeps the cap for
+    // probes that can do something.
+    if (!world.ChunkInWindow({(cx - radius) >> 4, floorY >> 4,
+                              (cz - radius) >> 4}) ||
+        !world.ChunkInWindow({(cx + radius) >> 4, (hiY + 2) >> 4,
+                              (cz + radius) >> 4}))
+      continue;
+
+    uint32_t slot = FreeDiscoverSlot();
+    if (slot >= kWaterDiscoveredCap) {
+      // AT THE CAP. Propose the weakest live probe for RELEASE and try again on
+      // a later tick — the new candidate's evidence stays in the grid, and this
+      // scan re-runs when the release expires. NEVER drop a descriptor cold:
+      // reusing a slot against a ledger still holding the old body's level and
+      // debit is the carried-descriptor bug the drain pass documents.
+      WaterDiscovered* weak = nullptr;
+      for (WaterDiscovered& d : discovered_) {
+        if (d.releaseUntil != 0) continue;
+        if (!weak ||
+            (d.evidenceEighths != weak->evidenceEighths
+                 ? d.evidenceEighths < weak->evidenceEighths
+             : d.lastEvidenceTick != weak->lastEvidenceTick
+                 ? d.lastEvidenceTick < weak->lastEvidenceTick
+                 : d.basinId < weak->basinId))
+          weak = &d;
+      }
+      if (weak && weak->evidenceEighths < total) {
+        weak->releaseUntil = tick + kWaterDiscoverReleaseTicks;
+        discoverEvictions_++;
+        discoveredGen_++;
+      }
+      continue;
+    }
+    WaterDiscovered d;
+    d.basinId = kWaterDiscoverIdBase | slot;
+    d.cx = cx; d.cz = cz;
+    d.radius = radius;
+    d.floorY = floorY;
+    d.topY = hiY;
+    d.matId = matId;
+    d.evidenceEighths = total;
+    d.lastEvidenceTick = tick;
+    d.reprobeTick = tick;
+    discovered_.push_back(d);
+    discoveredGen_++;
+  }
+}
+
+// ---- W-D: PERSISTENCE ------------------------------------------------------
+//
+// A FLAT POD ARRAY, nine words an entry, behind the 'WTRB' section's own
+// version. Nothing derived crosses the boundary: not the ledger, not the level,
+// not the curve, not the adoption verdict. On load the entries are re-proposed
+// and the GPU re-adopts by re-measuring the voxels the chunk store restored,
+// which is the same path the entry took the first time and therefore the same
+// path the gate already covers.
+namespace {
+struct WaterDiscoverRec {
+  int32_t cx, cz, radius, floorY, topY;
+  uint32_t matId;
+  uint32_t evLo, evHi;      // evidenceEighths, split so the record is 4-aligned
+  uint32_t slot;            // the basin id's low bits; identity, so it is saved
+};
+}  // namespace
+
+void WaterBodySystem::SaveState(std::vector<uint8_t>& out) const {
+  ByteWriter w{out};
+  std::vector<WaterDiscoverRec> recs;
+  recs.reserve(discovered_.size());
+  for (const WaterDiscovered& d : discovered_) {
+    // A probe already on its way out is not saved. It lost the cap, its
+    // descriptor exists only so the ledger can exit mass-exactly, and there is
+    // nothing about it worth carrying into the next session.
+    if (d.releaseUntil != 0) continue;
+    WaterDiscoverRec r{};
+    r.cx = d.cx; r.cz = d.cz; r.radius = d.radius;
+    r.floorY = d.floorY; r.topY = d.topY;
+    r.matId = d.matId;
+    r.evLo = (uint32_t)(d.evidenceEighths & 0xFFFFFFFFull);
+    r.evHi = (uint32_t)(d.evidenceEighths >> 32);
+    r.slot = d.basinId & ~kWaterDiscoverIdBase;
+    recs.push_back(r);
+  }
+  w.PodVec(recs);
+}
+
+bool WaterBodySystem::LoadState(const uint8_t* data, size_t len,
+                                uint32_t version) {
+  ClearDiscovered();
+  if (version != kSaveVersion) {
+    std::printf("waterbody: unknown WTRB section version %u\n", version);
+    return false;
+  }
+  ByteReader r{data, len};
+  std::vector<WaterDiscoverRec> recs;
+  r.PodVec(recs);
+  if (!r.ok) return false;
+  for (const WaterDiscoverRec& rec : recs) {
+    if (discovered_.size() >= kWaterDiscoveredCap) break;
+    if (rec.slot >= kWaterDiscoveredCap) continue;
+    if (rec.radius <= 0 || rec.radius > kWaterDiscoverMaxRadius) continue;
+    if (rec.matId != kMatWater && rec.matId != kMatOil &&
+        rec.matId != kMatLava)
+      continue;
+    WaterDiscovered d;
+    d.basinId = kWaterDiscoverIdBase | rec.slot;
+    if (DiscoveredFor(d.basinId)) continue;    // a duplicated slot in the file
+    d.cx = rec.cx; d.cz = rec.cz;
+    d.radius = rec.radius;
+    d.floorY = rec.floorY;
+    d.topY = rec.topY;
+    d.matId = rec.matId;
+    d.evidenceEighths = ((uint64_t)rec.evHi << 32) | rec.evLo;
+    d.lastEvidenceTick = 0;
+    // NOT re-probed on load: a restored entry comes back as a fresh
+    // WB_CANDIDATE (the ledger was zeroed with the world), so there is no
+    // WB_REFUSED for a pulse to lift. Sending one would be harmless and
+    // meaningless, and a flag nobody needs is a flag somebody later reads.
+    d.reprobeTick = 0xFFFFFFFFu;
+    discovered_.push_back(d);
+  }
+  discoveredGen_++;
+  return true;
 }
 
 void WaterBodySystem::RebuildBasins(const World& world, uint32_t seed) {
@@ -287,11 +696,58 @@ void WaterBodySystem::RebuildBasins(const World& world, uint32_t seed) {
     }
   }
 
+  // ---- W-D: THE DISCOVERED PROBES, LAST (plan §8) ------------------------
+  //
+  // Last for two reasons that are both about not costing an authored basin
+  // anything. Relabel walks `basins_` in order and the FIRST claimant of a chunk
+  // keeps the label, so appending here means a probe can only ever collide with
+  // a lake that is already labelled — and the straddle branch below refuses only
+  // the newcomer when the newcomer is discovered. And Classify's cap and chunk
+  // budget are charged biggest-volume-first, so an authored lake is never the
+  // one that loses to a probe disc.
+  //
+  // A probe's container is a FLAT-DISC CYLINDER and that is honest about what it
+  // is: the CPU has never seen the water and cannot know the shape of the pit.
+  // The curve it builds is a PREDICTION and plan §3.2 is what makes an
+  // inaccurate one cost pace rather than mass — the shave debits what it
+  // actually removed. The GPU's sweep re-derives the real area(y) for a probe
+  // the player keeps digging in, exactly as it does for a dug authored basin.
+  for (const WaterDiscovered& d : discovered_) {
+    if ((uint32_t)basins_.size() >= kWaterBodyCap) break;
+    const char* name = waterMatName(d.matId);
+    if (name[0] == '\0') continue;
+    WaterBasin b;
+    b.id = d.basinId;
+    b.cx = d.cx;
+    b.cz = d.cz;
+    b.radius = d.radius;
+    b.discD2Max = d.radius * d.radius;
+    b.floorY = d.floorY;
+    // THE FILL LEVEL IS A SEED AND IT DELIBERATELY OVER-REACHES. The adoption
+    // reduce scans (floorY, seedLevel] and takes an atomicMax over the highest
+    // cell of the body's material, so a seed BELOW the real surface would
+    // truncate the measurement and report a body shallower than it is. Two
+    // voxels above the highest evidence costs two empty layers in one pass.
+    b.surfY = d.topY + 2;
+    b.centreDepth = std::max(b.surfY - b.floorY, 1);
+    b.rimDepth = b.centreDepth;
+    // SPILL ABOVE THE SEED, so the ladder's "not overflowing is not flowing"
+    // test does not refuse every probe it is handed. A probe's real containment
+    // is whatever the player dug; the sweep measures the true spill elevation
+    // once the basin goes curve-dirty, and until then this is the same analytic
+    // placeholder the authored pools carry.
+    b.spillY = b.surfY + 8;
+    b.kind = WaterBasinKind::FlatDisc;
+    b.matName = name;
+    basins_.push_back(std::move(b));
+  }
+
   curves_.reserve(basins_.size());
   for (const WaterBasin& b : basins_) curves_.push_back(WaterBasinBuildCurve(b));
 
   builtOrigin_ = o;
   builtSeed_ = seed;
+  builtDiscoveredGen_ = discoveredGen_;
 }
 
 void WaterBodySystem::Relabel(const World& world) {
@@ -337,8 +793,18 @@ void WaterBodySystem::Relabel(const World& world) {
             // both bodies are refused, so the label reaches nothing that acts,
             // and clearing it would mean walking the earlier body's chunk list
             // to keep the two views consistent for no consumer.
+            //
+            // W-D: A PROBE NEVER COSTS AN AUTHORED BASIN ITS ADOPTION. The
+            // symmetric refusal above is right between two basins WORLDGEN
+            // made — neither is more entitled than the other and both are
+            // simulated correctly by the CA. A discovered probe is not in that
+            // position: it is a PROPOSAL the CPU made from evidence, and the
+            // safe degradation for a proposal is to not exist. Refusing the
+            // harness lake because somebody made a puddle on its bank would be
+            // a regression bought with a feature. Probes are appended last, so
+            // the newcomer is always the discovered one when this fires.
             d.straddle = true;
-            bodies_[held - 1].straddle = true;
+            if (!isDiscoveredId(b.id)) bodies_[held - 1].straddle = true;
             straddles_++;
             continue;
           }
@@ -403,11 +869,24 @@ void WaterBodySystem::Classify(const World& world, uint32_t tick) {
   outOfWindow_ = 0;
   uint32_t proposed = 0;
   uint32_t chunkBudget = kWaterChunkCap;
+  // W-D: DISCOVERY'S OWN SHARE OF THE CHUNK LIST (rule 2, charged before
+  // emission). A probe disc's ANALYTIC volume is an over-predicting cylinder,
+  // so it sorts EARLY in the biggest-first order above and would otherwise be
+  // entitled to take the list out from under the lake it is next to. A quarter
+  // of the cap is far more than sixteen probes need and leaves the harness
+  // lake's ~140 entries untouched.
+  uint32_t discoverBudget = kWaterDiscoverChunkShare;
   for (size_t oi = 0; oi < order.size(); oi++) {
     const size_t i = order[oi];
     const WaterBasin& b = basins_[i];
     WaterBodyDesc& d = bodies_[i];
     d.gpuSlot = kNoGpuSlot;
+    // W-D: is this a discovered probe, and is it on its way out? An evicted
+    // probe keeps its descriptor, flagged for release, so the ledger's
+    // mass-exact exit runs before the slot is reused (see kWaterDiscoverReleaseTicks).
+    const WaterDiscovered* probe =
+        isDiscoveredId(b.id) ? DiscoveredFor(b.id) : nullptr;
+    const bool evicting = probe != nullptr && probe->releaseUntil != 0;
 
     // ---- component 5's ladder, enter side, DETERMINISTIC HALF ------------
     // Every test below is a pure function of (seed, window origin, tuning).
@@ -417,7 +896,12 @@ void WaterBodySystem::Classify(const World& world, uint32_t tick) {
     // no reason attached is the bare count CLAUDE.md rule 6 says costs a dozen
     // elimination runs to un-ask.
     WaterBodyRefusal why = WaterBodyRefusal::None;
-    if (d.straddle) {
+    if (evicting) {
+      // AtCap is literally what happened: the probe lost the cap to a better-
+      // evidenced one. Naming it that rather than inventing a refusal keeps the
+      // overlay's reason table at the size it was.
+      why = WaterBodyRefusal::AtCap;
+    } else if (d.straddle) {
       why = WaterBodyRefusal::Straddle;
     } else if (d.chunks.empty() ||
                !world.ChunkInWindow(IVec3{d.lo.x >> 4, d.lo.y >> 4, d.lo.z >> 4}) ||
@@ -444,10 +928,11 @@ void WaterBodySystem::Classify(const World& world, uint32_t tick) {
       // is the smallest candidate -- the one whose honest simulation costs
       // least.
       why = WaterBodyRefusal::AtCap;
-    } else if (d.chunks.size() > chunkBudget) {
+    } else if (d.chunks.size() > chunkBudget ||
+               (probe != nullptr && d.chunks.size() > discoverBudget)) {
       // Rule 2 charges the budget BEFORE emission. See the note on
       // WaterBodyRefusal::NoChunkBudget for why a truncated list is worse than
-      // no list at all.
+      // no list at all. W-D adds discovery's own share on top of the global cap.
       why = WaterBodyRefusal::NoChunkBudget;
     }
 
@@ -484,6 +969,8 @@ void WaterBodySystem::Classify(const World& world, uint32_t tick) {
           proposed < kWaterBodyCap) {
         d.gpuSlot = proposed++;
         chunkBudget -= (uint32_t)d.chunks.size();
+        if (probe) discoverBudget -= (uint32_t)std::min<size_t>(
+            d.chunks.size(), discoverBudget);
       } else if (d.state == WaterBodyState::Releasing) {
         d.state = WaterBodyState::Candidate;
       }
@@ -494,6 +981,7 @@ void WaterBodySystem::Classify(const World& world, uint32_t tick) {
     d.state = WaterBodyState::Proposed;
     d.gpuSlot = proposed++;
     chunkBudget -= (uint32_t)d.chunks.size();
+    if (probe) discoverBudget -= (uint32_t)d.chunks.size();
   }
 
   // ---- M5: THE SPLIT CHILDREN (component 10) -----------------------------
@@ -543,7 +1031,8 @@ void WaterBodySystem::Classify(const World& world, uint32_t tick) {
 // PageTable::UpdateSpawnRing is: a carried set is a set that can be stale, and
 // a stale entry here is a shave aimed at a chunk the page table was never told
 // about. Everything it reads is a pure function of the tick.
-void WaterBodySystem::BuildGpu(uint32_t tick, int testDrain, int drainMax) {
+void WaterBodySystem::BuildGpu(uint32_t tick, int testDrain, int drainMax,
+                               int relevelMax) {
   gpu_.bodies.assign(kWaterBodyScalars, 0);
   gpu_.chunks.clear();
   gpu_.bodyCount = 0;
@@ -592,6 +1081,18 @@ void WaterBodySystem::BuildGpu(uint32_t tick, int testDrain, int drainMax) {
     row[7] |= (int32_t)((d.component & 3u) << 2);
     if (d.isChild)
       row[7] |= 16 | (int32_t)((d.childOf & 0xFFu) << 8);
+    // W-D: bit 5 says "this is a discovered PROBE, apply the size gate and park
+    // a failed measurement in WB_REFUSED"; bit 6 is the one-tick pulse that
+    // lifts that refusal when new evidence landed in the disc. Both are zero
+    // for every body M1-W1 ever proposed, which is what makes
+    // `sim.waterDiscoverMinEighths = 0` an exact identity: with no probe in the
+    // registry no descriptor carries either bit and no branch behind them is
+    // reachable. See WBF_DISCOVER / WBF_REPROBE in common.wgsl.
+    if (isDiscoveredId(d.basinId)) {
+      row[7] |= kWbfDiscover;
+      const WaterDiscovered* probe = DiscoveredFor(d.basinId);
+      if (probe && probe->reprobeTick == tick) row[7] |= kWbfReprobe;
+    }
     for (uint32_t slot : d.chunks) {
       if (gpu_.chunks.size() >= kWaterChunkCap) break;   // Classify charged this
       gpu_.chunks.push_back((k << 16) | (slot & 0xFFFFu));
@@ -623,10 +1124,18 @@ void WaterBodySystem::BuildGpu(uint32_t tick, int testDrain, int drainMax) {
   // no longer declared writes into a JITTER sentinel, which is a lost eighth
   // reported as a page fault. 64 ticks is two orders more than a <=512-eighth
   // debit needs against a 14,493-cell surface.
+  //
+  // W1 (plan §3.6): RELEVEL RIDES THE SAME WINDOW BUT NOT THE SAME KNOB. The
+  // relevel is the second voxel writer here, so its chunks need declaring on
+  // exactly the ticks it can write — but it is not a drain and must not be
+  // switched off by `sim.drainMaxEighthsPerTick = 0`. Hence the OR: either
+  // writer being live arms the footprint, and `sim.waterRelevelMax = 0` is what
+  // switches the relevel half off (and is then an exact identity, because the
+  // CPU also sends 0 in TickParams::waterRelevelMax and both kernels return).
   gpu_.writesThisTick =
       (testDrain > 0 && !gpu_.chunks.empty()) || gpu_.drainArmed ||
-      (drainMax > 0 && tick < drainHotUntil_ + kWaterDrainSettleTicks &&
-       !gpu_.chunks.empty());
+      ((drainMax > 0 || relevelMax > 0) &&
+       tick < drainHotUntil_ + kWaterDrainSettleTicks && !gpu_.chunks.empty());
 
   // ---- M5: THE SWEEP SCHEDULE (plan section 3.4) -------------------------
   //
@@ -679,12 +1188,46 @@ void WaterBodySystem::BuildGpu(uint32_t tick, int testDrain, int drainMax) {
 
 void WaterBodySystem::Tick(const World& world, uint32_t seed, uint32_t tick,
                            int mode, int testDrain, int drainMax,
-                           bool worldEdited, IVec3 editCell) {
+                           int relevelMax, bool worldEdited, IVec3 editCell) {
   mode_ = mode;
   // The hot latch (see waterbody.h). Set from the tick input stream only, so a
   // replay reproduces it and the twice-run determinism gate compares it.
-  if (mode != 0 && drainMax > 0 && worldEdited)
+  //
+  // W1 (plan §3.6): `|| relevelMax > 0`, and the audit found this one BEFORE it
+  // shipped. The latch decides whether the footprint is declared at all, so a
+  // relevel riding the DRAIN knob would mean `sim.drainMaxEighthsPerTick = 0`
+  // silently disables levelling too — a knob about jets switching off a rule
+  // about surfaces, with no error and no gate on it.
+  if (mode != 0 && (drainMax > 0 || relevelMax > 0) && worldEdited)
     drainHotUntil_ = tick + kWaterDrainHotTicks;
+  // ---- W3: AN IMPULSE ARMS THE SAME LATCH (PLAN_water_relevel.md §5) ------
+  //
+  // MEASURED, first run of gate pass T: both impulse arms reported Sigma|q| = 0
+  // with a record sitting in the queue. The record reached TickParams and
+  // `wbFlux` never ran, because `writesThisTick` was false — the lake had been
+  // still for 130 ticks, so the latch above had long expired, and with it the
+  // CPU's permission for the wave to write a voxel at all.
+  //
+  // A BLAST would have armed it by accident: an explosion is a mutation, so
+  // `worldEdited` is true on the tick it lands. A SWIMMER never would — a
+  // player crossing a settled lake writes nothing — so the wake would have
+  // been dead in the shipped game with no gate able to see it. The fix is to
+  // say the thing that is actually true: an impulse IS a disturbance the CPU
+  // knows about, exactly like a dig, so it arms the footprint.
+  //
+  // ITS OWN, SHORTER WINDOW. A dig's consequences are a drain that runs for
+  // minutes (kWaterDrainHotTicks = 900); a splash's are a ring that pass S
+  // measured asleep after 112 ticks. Holding a lake's whole footprint
+  // materialised for thirty seconds because somebody swam past it is rule 2
+  // with the sign flipped, and 240 ticks is eight seconds — twice the measured
+  // life of a ring and a thirtieth of the cost.
+  //
+  // `max`, not assignment: an impulse during a live drain must not SHORTEN that
+  // drain's window.
+  if (mode != 0 && relevelMax > 0 && !pendingImp_.empty()) {
+    drainHotUntil_ =
+        std::max(drainHotUntil_, tick + kWaterImpulseHotTicks);
+  }
   // THE HOLE HINT (component 8's drain seeder). Recorded from the same tick-
   // stream signal on the same tick, against LAST tick's labelling — which is
   // the labelling the caller's own `worldEdited` test used, so the two cannot
@@ -771,9 +1314,44 @@ void WaterBodySystem::Tick(const World& world, uint32_t seed, uint32_t tick,
     gpu_.bodyCount = 0;
     gpu_.writesThisTick = false;
     gpu_.drainArmed = false;
+    // W3: the queue is consumed on EVERY path, including this one. An impulse
+    // is one tick's push; a queue that survived the off switch would fire the
+    // moment someone turned the system back on, which is a disturbance arriving
+    // from session history rather than from the tick stream (rule 1).
+    pendingImp_.clear();
+    armedImp_.clear();
+    gpu_.impulses.clear();
+    gpu_.impulseCount = 0;
     return;
   }
   if (chunkBody_.size() != kNumSlots) chunkBody_.assign(kNumSlots, 0u);
+
+  // ---- W-D: RETIRE EXPIRED EVICTIONS, THEN PROMOTE (plan §8.3) ------------
+  //
+  // The release window has run: the ledger has had kWaterDiscoverReleaseTicks
+  // to square whatever the probe owed (normally nothing — a probe that never
+  // adopted owes nothing at all), so the entry can go and its slot can be
+  // reused. Dropping it here rather than at eviction time is the whole of "never
+  // drop a descriptor cold".
+  {
+    const size_t before = discovered_.size();
+    discovered_.erase(
+        std::remove_if(discovered_.begin(), discovered_.end(),
+                       [&](const WaterDiscovered& d) {
+                         return d.releaseUntil != 0 && tick >= d.releaseUntil;
+                       }),
+        discovered_.end());
+    if (discovered_.size() != before) {
+      discoveredGen_++;
+      // A freed slot is a reason to look at the evidence again: the candidate
+      // that lost the cap is still in the grid and can now be raised.
+      evidenceDirty_ = true;
+    }
+  }
+  if (evidenceDirty_) {
+    evidenceDirty_ = false;
+    PromoteEvidence(world, tick, CurrentTuning().sim.waterDiscoverMinEighths);
+  }
 
   // Rebuild + relabel only when the WINDOW or the SEED moved. Labelling is
   // O(basins x footprint chunks) — a few hundred chunk slots for a default pond
@@ -781,8 +1359,14 @@ void WaterBodySystem::Tick(const World& world, uint32_t seed, uint32_t tick,
   // rule 2 with the sign flipped. The per-tick cost is the classify pass, which
   // is O(bodies) plus one dirty-flag read per labelled chunk.
   const IVec3 o = world.WindowOrigin();
+  // W-D adds `discoveredGen_` to the rebuild trigger and nothing else: a probe
+  // raised, grown, evicted or restored mid-run has to reach `basins_`, and a
+  // registry change is exactly as rare as a window move (it takes a threshold
+  // crossing, which takes hundreds of voxels of poured liquid). Rebuilding
+  // every tick instead would be rule 2 with the sign flipped.
   if (seed != builtSeed_ || o.x != builtOrigin_.x || o.y != builtOrigin_.y ||
-      o.z != builtOrigin_.z || basins_.empty()) {
+      o.z != builtOrigin_.z || basins_.empty() ||
+      discoveredGen_ != builtDiscoveredGen_) {
     const std::vector<WaterBodyState> was = [&] {
       std::vector<WaterBodyState> v;
       v.reserve(bodies_.size());
@@ -809,7 +1393,129 @@ void WaterBodySystem::Tick(const World& world, uint32_t seed, uint32_t tick,
     }
   }
   Classify(world, tick);
-  BuildGpu(tick, testDrain, drainMax);
+  BuildGpu(tick, testDrain, drainMax, relevelMax);
+  BuildImpulses();
+}
+
+// ---- W3: THE IMPULSE DOOR (PLAN_water_relevel.md §5) ----------------------
+bool WaterBodySystem::SpawnImpulse(const WaterImpulse& im) {
+  // DEGENERATE RECORDS ARE REFUSED, NOT CLAMPED. A radius of 0 divides by zero
+  // in the falloff and a strength of 0 is a record that costs a uniform slot to
+  // do nothing; both mean the caller computed something it did not mean to
+  // send, and silently repairing it is how a knob at 0 stops being an identity.
+  if (im.radius <= 0 || im.strength <= 0) return false;
+  // CHARGED BEFORE EMISSION (rule 2). A full queue refuses the newcomer rather
+  // than displacing an earlier one, so the contents stay a pure function of
+  // insertion order and a replay reproduces them.
+  if (pendingImp_.size() >= kWaterImpulseCap) {
+    impRefused_++;
+    return false;
+  }
+  pendingImp_.push_back(im);
+  return true;
+}
+
+// Resolve the queue into the TickParams payload. Two vec4 rows per record, in
+// insertion order — the same shape and the same discipline BuildGpu uses for
+// the descriptors.
+//
+// ONE TICK LATENT, and this is the whole of why there are two vectors. An
+// impulse is spent by `wbFlux`, which is a PURE GATHER over the column heights
+// `wbSurface` stored at the END of the previous tick (§4.3) — a column whose
+// stamp is not this tick's reads as WB_RV_NOTAKE and gets its pipes zeroed. A
+// lake nobody has touched has not run `wbSurface` for however long it has been
+// still, because the CPU zeroes `waterRelevelMax` outside the hot window, so on
+// the tick a splash ARRIVES there is not one valid column in the body.
+//
+// MEASURED, gate pass T's first two runs: Sigma|q| exactly 0 on both impulse
+// arms with a record sitting in TickParams and the latch armed. The record was
+// correct, the kernel was correct, and the tick it landed on had no heightfield
+// under it.
+//
+// So the record accepted on tick N is SHIPPED on tick N+1: the arm above wakes
+// `wbSurface` at N, N stamps for N+1, and the impulse spends a heightfield that
+// exists. That is the same one-tick CPU->GPU latency everything else in the
+// mutation path carries (CLAUDE.md rule 3) rather than a special case.
+void WaterBodySystem::BuildImpulses() {
+  gpu_.impulses.clear();
+  gpu_.impulseCount = 0;
+  const uint32_t n =
+      (uint32_t)std::min<size_t>(armedImp_.size(), kWaterImpulseCap);
+  gpu_.impulses.reserve((size_t)n * kWaterImpulseWords);
+  for (uint32_t i = 0; i < n; i++) {
+    const WaterImpulse& im = armedImp_[i];
+    gpu_.impulses.push_back(im.x);
+    gpu_.impulses.push_back(im.z);
+    gpu_.impulses.push_back(im.radius);
+    gpu_.impulses.push_back(im.strength);
+    gpu_.impulses.push_back(im.dirX);
+    gpu_.impulses.push_back(im.dirZ);
+    gpu_.impulses.push_back(0);
+    gpu_.impulses.push_back(0);
+  }
+  gpu_.impulseCount = n;
+  // This tick's arrivals become next tick's shipment. Not a queue that drains
+  // over several ticks: an impulse is ONE tick's push, so a record is shipped
+  // exactly once and then gone.
+  armedImp_ = pendingImp_;
+  pendingImp_.clear();
+}
+
+bool WaterBodyNoteBlast(WaterBodySystem& wb, const ExplosionOp& e, int knob) {
+  // THE IDENTITY, and it is here rather than in the kernel: at 0 no record is
+  // built, so `waterImpulseCount` stays 0 and `wbFlux` does not execute its
+  // loop. A kernel-side `if (knob == 0)` would be a cheap path; this is an
+  // exact one.
+  if (knob <= 0) return false;
+  WaterImpulse im;
+  im.x = e.x;
+  im.z = e.z;
+  // The blast's OWN radius, in XZ. A sphere of radius R meets the surface in a
+  // disc of radius R at most, and using the explosion's authored number rather
+  // than a knob of our own is what keeps a grenade and a spell blast in
+  // proportion to each other for free.
+  im.radius = e.radius > 0 ? e.radius : 1;
+  im.strength = knob;
+  // (0,0) = RADIAL OUTWARD, which is what a blast is: the column under the
+  // centre pushes every way at once and the rim pushes away from it.
+  im.dirX = 0;
+  im.dirZ = 0;
+  return wb.SpawnImpulse(im);
+}
+
+bool WaterBodyNoteSwimmer(WaterBodySystem& wb, int cellX, int cellZ,
+                          float velX, float velZ, float submersion, int knob) {
+  if (knob <= 0) return false;
+  // A WADER IS NOT A SWIMMER. Below a quarter submerged the body is standing on
+  // the bed with its ankles wet, and a wake behind it would be the surface
+  // reacting to a walk. Same threshold shape player.cpp uses to scale drag and
+  // thrust, stated here so the two cannot drift apart without a reader noticing.
+  if (!(submersion > 0.25f)) return false;
+  // THE FLOAT->INTEGER TRANSCRIPTION, and it happens HERE. Everything below is
+  // integer and every consumer is; the sim never sees an f32 (rule 1). Q8, so a
+  // velocity of one voxel per tick is 256.
+  const float sp = std::sqrt(velX * velX + velZ * velZ);
+  const int32_t spQ8 = (int32_t)std::lround(sp * 256.0f);
+  // A swimmer who has stopped is not dragging anything, and a record whose
+  // direction rounds to (0,0) would read as RADIAL — which is the one way this
+  // encoding can be ambiguous, so it is refused here rather than argued about.
+  if (spQ8 <= 0) return false;
+  WaterImpulse im;
+  im.x = cellX;
+  im.z = cellZ;
+  im.radius = (int32_t)kWaterSwimWakeRadius;
+  // Strength scales with SPEED and with how much of the body is under: a fast
+  // swimmer drags more than a drifting one, and the whole thing is bounded by
+  // the outflow clamp regardless of what the knob says.
+  const int64_t s = (int64_t)knob * spQ8 / 256;
+  im.strength = (int32_t)std::min<int64_t>(s, 1 << 20);
+  if (im.strength <= 0) return false;
+  // DIRECTIONAL, normalised to Q8 so the kernel's split between the X and Z
+  // pipes is a ratio of two integers it can take without a divide by a length.
+  im.dirX = (int32_t)std::lround(velX / sp * 256.0f);
+  im.dirZ = (int32_t)std::lround(velZ / sp * 256.0f);
+  if (im.dirX == 0 && im.dirZ == 0) return false;
+  return wb.SpawnImpulse(im);
 }
 
 uint32_t WaterBodySystem::ProposedCount() const {

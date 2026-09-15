@@ -175,6 +175,8 @@ SPEC = [
     ("render", "waveImpactSpeed", "TUNE_WAVE_IMPACT_SPEED", "f", 1.8),
     ("render", "waveImpactDecay", "TUNE_WAVE_IMPACT_DECAY", "f", 2.5),
     ("render", "waveImpactLen", "TUNE_WAVE_IMPACT_LEN", "f", 0.7),
+    ("render", "waveSimSlope", "TUNE_WAVE_SIM_SLOPE", "f", 0.03),
+    ("render", "waveSimFoam", "TUNE_WAVE_SIM_FOAM", "f", 0.55),
     ("render", "dbgCurrentSpacing", "TUNE_CUR_DBG_SPACING", "f", 6.0),
     ("render", "dbgCurrentRadius", "TUNE_CUR_DBG_RADIUS", "f", 40.0),
     ("render", "reflectionCutoff", "TUNE_REFLECTION_CUTOFF", "f", 0.06),
@@ -435,6 +437,27 @@ SPEC = [
     ("sim", "drainExciteRadius", "TUNE_DRAIN_EXCITE_RADIUS", "i", 6),
     ("sim", "drainCd", "TUNE_DRAIN_CD", "f", 0.6),
     ("sim", "drainGravity", "TUNE_DRAIN_GRAVITY", "f", 900.0),
+
+    # RELEVEL (docs/PLAN_water_relevel.md W1)
+    ("sim", "waterRelevelMax", "TUNE_WATER_RELEVEL_MAX", "i", 4),
+    ("sim", "waterRelevelGain", "TUNE_WATER_RELEVEL_GAIN", "i", 8),
+    ("sim", "waterRelevelDepth", "TUNE_WATER_RELEVEL_DEPTH", "i", 32),
+
+    # SURFACE MOMENTUM (docs/PLAN_water_relevel.md W2)
+    ("sim", "waveMode", "TUNE_WAVE_MODE", "i", 0),
+    ("sim", "waveGravity", "TUNE_WAVE_GRAVITY", "f", 98.0),
+    ("sim", "waveDepthCap", "TUNE_WAVE_DEPTH_CAP", "i", 10),
+    ("sim", "waveDamping", "TUNE_WAVE_DAMPING", "f", 0.8),
+    ("sim", "waveSleepEps", "TUNE_WAVE_SLEEP_EPS", "i", 256),
+
+    # W3: WHAT DISTURBS THE SURFACE (docs/PLAN_water_relevel.md section 5)
+    ("sim", "waveBlastImpulse", "TUNE_WAVE_BLAST_IMPULSE", "i", 3072),
+    ("sim", "waveDrainSink", "TUNE_WAVE_DRAIN_SINK", "i", 1024),
+    ("sim", "waveSwimWake", "TUNE_WAVE_SWIM_WAKE", "i", 512),
+
+    # DISCOVERY (docs/PLAN_water_relevel.md W-D)
+    ("sim", "waterDiscoverMinEighths", "TUNE_WATER_DISCOVER_MIN_EIGHTHS", "i", 4096),
+    ("sim", "waterAdoptMinArea", "TUNE_WATER_ADOPT_MIN_AREA", "i", 64),
     ("sim", "windMode", "TUNE_WIND_MODE", "i", 1),
 
     # gas particles (docs/PLAN_gas_particles.md)

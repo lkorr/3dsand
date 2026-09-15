@@ -115,6 +115,37 @@
 // what refuses a silent disagreement: the box edge MUST be exactly two window
 // edges, because that identity is the whole of the origin derivation in
 // gasOuterOriginVox() (world.h static_asserts the same expression).
+// ---- W3: THE SIM'S SURFACE MOMENTUM (PLAN_water_relevel.md §5) -------------
+//
+// `waterFlux`, the virtual-pipe store sim_waterbody.wgsl's wbFlux owns: six
+// words per world column, four of them non-negative outflow pipes in Q8 eighths
+// per tick. READ-ONLY here — the renderer never writes the world, and this is
+// the only place in the engine outside sim_waterbody.wgsl that names the
+// buffer at all.
+//
+// WHY READ IT WHEN THE HEIGHT IS ALREADY AUTHORITATIVE. §9d.5's rule stands:
+// liquidColumn() below derives the surface from the VOXELS and nothing here
+// overrides it. But that height is quantised to eighths, and the two things it
+// therefore cannot express are exactly the two the pipes carry — sub-eighth
+// tilt BETWEEN the steps, and WHICH WAY the surface is going. Gerstner stays as
+// the far/idle texture; this is the near, disturbed surface.
+//
+// NO PASS-TABLE ROW. The writes have theirs (pass_table.def's WaterFlux rows on
+// the tick table) and every command buffer opens with a global memory barrier,
+// which is the same argument openness and gasOuter are read under.
+@group(0) @binding(22) var<storage, read> waterFluxR : array<i32>;
+// Must match kWaterFluxWords / WV_* in src/sim/world.h and
+// assets/shaders/sim_waterbody.wgsl. Declared here rather than in common.wgsl
+// for the GAS_OUTER_N reason above and CLAUDE.md's: a constant two shaders must
+// agree on still costs nine minutes of pipeline compile if it goes in the
+// prelude, and this pair is read by exactly two.
+const WFLUX_WORDS : u32 = 6u;
+const WFLUX_PX : u32 = 0u;
+const WFLUX_NX : u32 = 1u;
+const WFLUX_PZ : u32 = 2u;
+const WFLUX_NZ : u32 = 3u;
+const WFLUX_STAMP : u32 = 5u;
+
 const GAS_OUTER_N     : u32 = 128u;
 const GAS_OUTER_SHIFT : u32 = 3u;
 const_assert (GAS_OUTER_N << GAS_OUTER_SHIFT) == 2u * WORLD_N;
@@ -5546,6 +5577,50 @@ fn waterCaustics(hitP : vec3f, rd : vec3f, pathVox : f32, depthM : f32) -> f32 {
   return 1.0 + min(caustic * TUNE_CAUSTIC_GAIN, TUNE_CAUSTIC_CAP);
 }
 
+// ---- W3: the sim's own surface momentum, at this column --------------------
+//
+// Returns the column's NET pipe flux in eighths per tick, (x, z). Zero when the
+// column has no valid record, which is every column of every world where the
+// water-body system is off — and zero is what the two consumers below are
+// written to treat as "the pre-W3 image", so nothing about a still lake or an
+// ungoverned puddle changes.
+//
+// THE WHOLE FUNCTION CONST-FOLDS AWAY at render.waveSimSlope 0 and
+// render.waveSimFoam 0, buffer read included. That is deliberate and it is the
+// arm --shader-stats is compared against: two memory notes in this repo record
+// that a small addition to this shader can cliff its register allocation, so
+// the off switch has to remove the code rather than merely skip it.
+//
+// THE VALIDITY TEST IS THE STAMP'S, halved. sim_waterbody.wgsl's readers demand
+// an exact tick match because a stale pipe there would decide a VOXEL WRITE;
+// here a stale one would tint a pixel, so the test is the part that matters —
+// the PAGE BITS, which are what separate two columns exactly WORLD_N apart in
+// the toroidal window — plus a loose freshness bound so a column the window
+// left does not foam forever. A render frame may sit a tick either side of the
+// last sim tick, which is why the bound is a few ticks and not zero.
+fn waveFluxAt(c : vec3<i32>) -> vec2f {
+  if (TUNE_WAVE_SIM_SLOPE <= 0.0 && TUNE_WAVE_SIM_FOAM <= 0.0) {
+    return vec2f(0.0);
+  }
+  let cx = bitcast<u32>(c.x & WORLD_MASK);
+  let cz = bitcast<u32>(c.z & WORLD_MASK);
+  let base = (cz * WORLD_N + cx) * WFLUX_WORDS;
+  let st = bitcast<u32>(waterFluxR[base + WFLUX_STAMP]);
+  let px = bitcast<u32>((c.x - (c.x & WORLD_MASK)) >> WORLD_SHIFT) & 3u;
+  let pz = bitcast<u32>((c.z - (c.z & WORLD_MASK)) >> WORLD_SHIFT) & 3u;
+  if ((st & 0xFu) != ((px << 2u) | pz)) { return vec2f(0.0); }
+  // The stamp holds `tick + 1`, written at the end of a tick for the next one.
+  // Unsigned subtraction, so a stamp from the FUTURE (impossible) or from a
+  // world before an F7 regen (tick rewound to 0) wraps to a huge age and is
+  // rejected rather than trusted.
+  if ((R.tick + 2u) - (st >> 4u) > 3u) { return vec2f(0.0); }
+  // Four non-negative outflows; the net is the difference of the opposing
+  // pairs. Q8 eighths/tick -> eighths/tick.
+  let qx = f32(waterFluxR[base + WFLUX_PX] - waterFluxR[base + WFLUX_NX]);
+  let qz = f32(waterFluxR[base + WFLUX_PZ] - waterFluxR[base + WFLUX_NZ]);
+  return vec2f(qx, qz) * (1.0 / 256.0);
+}
+
 fn waterNormal(cell : vec3<i32>, mat : u32, axis : i32, sgn : f32,
                hitP : vec3f, upFacing : bool) -> vec3f {
   // Side/bottom faces of a liquid volume keep their flat voxel normal: the
@@ -5586,6 +5661,15 @@ fn waterNormal(cell : vec3<i32>, mat : u32, axis : i32, sgn : f32,
   let flowMS = currentAt(hitP, &R).xz * VOXEL_METERS;
   slope += waveSlope(pm, R.time, gain, depthM, flowMS) *
            waterOpenness(cell, mat);
+
+  // W3 (PLAN_water_relevel.md §5). The SIM's own surface momentum, tilting the
+  // normal DOWN-FLOW: a column whose pipes are running toward +x has water
+  // piling away from us that way, so the surface leans with it. This is the
+  // sub-eighth half of the shape — the column gradient above is quantised to
+  // eighths and cannot express a tilt smaller than one, which is exactly the
+  // range a ring spends most of its life in. Additive and small: the Gerstner
+  // field stays the texture, this is the body underneath it.
+  slope += waveFluxAt(cell) * TUNE_WAVE_SIM_SLOPE;
 
   return normalize(vec3f(-slope.x, 1.0, -slope.y));
 }
@@ -6748,7 +6832,14 @@ fn shadeWater(hitP : vec3f, rd : vec3f, mat : u32, cell : vec3<i32>,
     let conv = currentConvergeAt(hitP, &R) * VOXEL_METERS;   // per second
     let flowFoam = clamp((conv - TUNE_WAVE_FOAM_THRESHOLD) * TUNE_WAVE_FOAM_GAIN,
                          0.0, 1.0);
-    let amount = max(shallow, flowFoam);
+    // W3 (PLAN_water_relevel.md §5): FOAM WHERE |q| IS HIGH. The shoreline term
+    // above is about DEPTH and the convergence term about the analytic current;
+    // this one is about the sim's own pipes, so a ring travelling across deep
+    // still water — which neither of the other two can see — carries froth on
+    // its front. max() rather than a sum, like the two already here: three
+    // reasons to foam are not three times the foam.
+    let simFoam = clamp(length(waveFluxAt(cell)) * TUNE_WAVE_SIM_FOAM, 0.0, 1.0);
+    let amount = max(max(shallow, flowFoam), simFoam);
     if (amount > 0.0) {
       let pm = vec2f(hitP.x, hitP.z) * VOXEL_METERS;
       // reuse the ripple field as the foam mask so foam moves with the waves

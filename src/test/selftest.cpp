@@ -844,6 +844,17 @@ int Run(Ctx& c, const Options& opt) {
   }
   auto known = LoadBaseline(bpath);
 
+  // UNBUFFERED STDOUT FOR THE REST OF THE RUN, and it is a diagnostic decision
+  // rather than a style one. A redirected stdout is FULLY buffered under MSVC
+  // (4 KiB, and _IOLBF is treated as _IOFBF on Windows), so a gate that dies
+  // hard takes the last four kilobytes of the log with it — the log then ends
+  // at the engine's startup banner whatever gate actually crashed, which makes
+  // the one question worth asking ("where did it die") unanswerable from the
+  // artefact. Measured: a W1 crash inside `waterbody` produced a 14-line log
+  // whose last line was "physics, debris, mobs, far-field init", and the full
+  // suite's log ended mid-word inside the PREVIOUS gate's output. The cost is
+  // a write syscall per printf in a harness that spends its time on the GPU.
+  std::setvbuf(stdout, nullptr, _IONBF, 0);
   std::printf("=== selftest === (%zu gate%s, backend vulkan)\n", plan.size(),
               plan.size() == 1 ? "" : "s");
 

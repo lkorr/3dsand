@@ -90,6 +90,10 @@ struct RecordCtx {
   // kWaterBodyCap for "none". A pure function of the tick (plan
   // section 3.4) and the whole condition on both sweep rows.
   uint32_t waterSweepSlot = 0xFFFFFFFFu;
+  // W2: sim.waveMode ANDed with "a body is listed this tick"
+  // (docs/PLAN_water_relevel.md §4.2). 0 leaves the surface-momentum row
+  // unrecorded, which is the exact-identity arm.
+  uint32_t waveMode = 0;
   // Chunks the openness refresh walks this tick (render.opennessChunksPerFrame,
   // clamped). Zero suppresses the row entirely, which is what makes
   // `opennessChunksPerFrame = 0` an exact "off" rather than a cheap path.

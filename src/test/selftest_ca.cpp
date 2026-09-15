@@ -72,6 +72,40 @@ Status GateCaSkip(Ctx& c, std::string& detail) {
   constexpr uint32_t kBoomAt = 10;        // tick within the scripted window
   constexpr uint32_t kPipelineTail = 160; // main.cpp's 400, scaled to the gate
 
+  // ---- SUBJECT ISOLATION: no governed body of water in this fixture -------
+  //
+  // The subject here is the CA SKIP MACHINERY, not water governance. The
+  // assertion below — that skips are taken on ticks where the particle pipeline
+  // is recorded — was authored against a world whose lake is an ordinary CA
+  // pond, and its premise is that on a quiet tick NOTHING is moving. From the
+  // day `sim.waterBodyMode` shipped at 1 that premise is false: the harness lake
+  // sits beside the scripted blast, the blast is a mutation, and a mutation arms
+  // the body's hot window — so for the rest of the scripted window the relevel
+  // is doing GENUINE work, marking chunks dirty, and `NoteSnapshot` correctly
+  // refuses the idle proof. The gate then measures the water system.
+  //
+  // MEASURED, the commit that flipped the default, in three same-scope arms:
+  // shipped config 10 of 220 skips and 0 with particles live; `waterBodyMode 0`
+  // 155 of 220 and 95 with particles; `waveMode 0` bit-identical to the shipped
+  // tree, and disarming the drain's op reservation likewise — so it is
+  // governance itself and neither W2 nor W3.
+  //
+  // This is pass H's situation exactly (a fixture that measures the discharge
+  // law had to disarm the surface-momentum layer once it shipped on) and it
+  // takes pass H's fix: disarm the foreign system in the fixture that does not
+  // measure it. NOTHING about the thresholds moves. The CORRECTNESS half —
+  // skip-on and forced produce identical hash sequences — is untouched by this
+  // pin and still runs against whatever else the shipped config does; and the
+  // shipped-config interaction (a governed lake settles and stops waking
+  // chunks) is asserted where it belongs, by the `waterbody` passes' own
+  // awake-at-rest bounds.
+  const Tuning caSaved = CurrentTuning();
+  {
+    Tuning ct = caSaved;
+    ct.sim.waterBodyMode = 0;
+    SetCurrentTuning(ct);
+  }
+
   std::vector<uint32_t> hashes[2];
   uint64_t skips[2] = {0, 0};         // over the scripted (hashed) window
   uint64_t settleSkips[2] = {0, 0};   // over the 300-tick settle, reported only
@@ -157,6 +191,10 @@ Status GateCaSkip(Ctx& c, std::string& detail) {
     }
   }
   sim.SetCaForced(false);
+  // The pin is this gate's own world and nobody else's. Restored before the
+  // verdict so a later gate inherits the shipped config, exactly as the dawn
+  // pins further down this file restore theirs.
+  SetCurrentTuning(caSaved);
 
   // Run 1 must have taken NO skips (that is what forced means, and it is what
   // makes it an oracle rather than a second sample of the same code path); run

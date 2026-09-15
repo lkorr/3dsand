@@ -174,6 +174,14 @@ void World::Init(const rhi::Device& device) {
   waterBodyState = CreateBuffer(
       device, (uint64_t)kWaterBodyStateTotalWords * 4,
       U::Storage | U::CopySrc | U::CopyDst, "waterBodyState");
+  // W2: the surface-momentum store (world.h kWaterFluxWords). The zeroed
+  // allocation IS the correct cold start and needs no reset path, for
+  // reposeSnap's reason: validity is a per-column STAMP carrying the tick and
+  // the window page, so 0 reads as "no record here" from every reader and a
+  // column that arrives in a reused slot after a window shift reads as empty
+  // rather than inheriting the departed column's momentum.
+  waterFlux = CreateBuffer(device, kWaterFluxBytes,
+                           U::Storage | U::CopySrc | U::CopyDst, "waterFlux");
 
   particles[0] = CreateBuffer(device, (uint64_t)kParticleCap * 32, U::Storage, "particlesA");
   particles[1] = CreateBuffer(device, (uint64_t)kParticleCap * 32, U::Storage, "particlesB");

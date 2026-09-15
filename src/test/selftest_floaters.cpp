@@ -1634,6 +1634,69 @@ Status GateCactusFell(Ctx& c, std::string& detail) {
     r.name = name;
     int cutY = 0;
     const CactusFixture f = plant(sandBed, cutY);
+    // ---- THE MIRROR PROLOGUE: pin the ENTRY STATE, not the subject ---------
+    //
+    // SUBJECT ISOLATION applied to entry state, which is the ca-skip pin's
+    // principle aimed at what this arm STARTS from rather than at a mode.
+    //
+    // The subject is FELLING: the severed top becomes a body and the body
+    // falls. `game-arm-body-falls` is the assertion that exists for it, and the
+    // quantity it reads was not a statement about felling at all — it was a
+    // statement about what the PREVIOUS GATE left in the mirror cache. Measured
+    // on one tree, one binary, the same fixture: **13.2 cells standalone
+    // against 1.8 inside `--selftest`**, against a floor of 2.0 that the gate's
+    // own note says should be cleared by ~11. That spread is not felling
+    // physics moving; it is the gate reading a different world in.
+    //
+    // WHY IT CAN DRIFT AT ALL is already written down twenty lines below: the
+    // collider around the body is meshed from a mirror copy, and
+    // `ManageTerrain` re-fetches a cached chunk only while the snapshot still
+    // shows it dirty and never inside 8 ticks of the last request. `plant()`
+    // force-fetches throughout, but `RequestChunkFetch` is a REQUEST — it is
+    // served through the snapshot ring, and at suite scope that ring is
+    // contended by every gate before this one, so a request can be declined and
+    // the arm enters its measured window holding a stale chunk.
+    //
+    // So: the SAME CALL the epilogue uses (`runTick({}, true)` over the
+    // fixture's chunk box), for the same number of ticks the epilogue has
+    // already proved is enough for the mirror to actually land, run BEFORE the
+    // cut goes in. After it, every arm starts from a mirror that is fresh over
+    // this fixture wherever the gate sits in `kOrder`.
+    //
+    // IT DOES NOT TOUCH THE SUBJECT, and that is the line not to cross. The
+    // game arm's defining property is that it gets NO forced fetches once the
+    // cut is in — `runTick({}, forceFetch)` with `forceFetch == false` for all
+    // 300 ticks of the fall, which is what a player standing in the desert
+    // gives the debris system. That is unchanged, and the standalone numbers
+    // confirm it: the game arm falls 13.2 cells with the prologue and 13.2
+    // without it. The floor stays 2.0.
+    //
+    // WHAT IT FIXED, AND WHAT IT DID NOT — recorded because the second half is
+    // the whole diagnosis and the next person should not re-derive it. At suite
+    // scope the prologue moved the CPU arm 2.0 -> 18.4 cells and the STONE arm
+    // 1.3 -> 11.6, i.e. both now behave like their standalone selves, which is
+    // exactly what pinning entry state is supposed to buy. The GAME arm did
+    // NOT move into range (1.8 -> 1.1), and the reason is on the same printed
+    // line: its collider for the body's chunk is built from **mirror v0 vs
+    // cache v0** while the other two read v96272 and v96773. v0 is "never
+    // built" — so for the game arm the collider was not rebuilt after the cut
+    // AT ALL, and no amount of mirror freshness before the cut can change that.
+    //
+    // That rules the mirror cache OUT as the coupling. `ManageTerrain` rebuilds
+    // a chunk's collider only while the snapshot still shows it DIRTY, and the
+    // prologue deliberately leaves the world settled, so on the game arm —
+    // which gets no forced fetches afterwards either — nothing ever re-meshes
+    // the chunk the severed top is standing in. The body rests on geometry that
+    // still holds it. The epilogue agrees: all three arms fall a further 0.0
+    // cells under forced fetches, so each has genuinely come to rest.
+    //
+    // The remaining question is therefore about the debris system's own
+    // collider-build path (NoteGridWrite / pendingVacate_ / ManageTerrain's
+    // dirty-and-8-tick gate), not about this fixture, and it belongs to whoever
+    // owns that overlay. The prologue stays because it is correct on its own
+    // terms and because it is what produced the v0 evidence.
+    constexpr int kMirrorPrologueTicks = 70;
+    for (int i = 0; i < kMirrorPrologueTicks; i++) runTick({}, true);
     const IVec3 aboveLo{f.lo.x, cutY + 3, f.lo.z};
     r.before = countMat(mFlesh, f.lo, f.hi) + countMat(mRib, f.lo, f.hi);
     r.aboveBefore = countMat(mFlesh, aboveLo, f.hi) + countMat(mRib, aboveLo, f.hi);

@@ -1799,7 +1799,37 @@ constexpr uint32_t kWaterChunkCap = 1024;
 // still there and are still spare. M5 widened it again, to 27: the re-audit
 // arm, its attribution tick, and the RESOLVED sweep level (WBS_REAUDIT /
 // WBS_AUDITTICK / WBS_SWEEPY in common.wgsl).
-constexpr uint32_t kWaterBodyStateWords = 27;
+//
+// W1 widened it to 41: the RELEVEL block (docs/PLAN_water_relevel.md §3.2/§3.3
+// — WBS_RV* in common.wgsl). Fourteen words, and every one of them is `RV`
+// rather than `R`: WBS_RSUM (word 12) is ALREADY the adoption/re-audit
+// reduce's running sum, and a re-audit can run while a body is hot and
+// relevelling, so aliasing the two sets would have one pass zeroing the
+// other's accumulator on the tick it mattered most. The twelfth is WBS_RVBASE,
+// which the plan's word list did not have and the implementation needs: the
+// ledger consumes LAST tick's histogram and may lower the level THIS tick, so
+// the bucket origin has to be published by the pass that filled the buckets.
+//
+// W-D widened it to 42 for ONE word, WBS_RAREA — the free-surface CELL COUNT
+// the adoption reduce measured. Discovery's size gate (§8.4) is "adopt iff the
+// measured surface area is at least sim.waterAdoptMinArea", and before this
+// word there was nowhere for that number to come from: `wbReduce` measured the
+// volume and the level and nothing else, and WBS_AREA at adoption is the CPU's
+// ANALYTIC seed, which for a discovered disc is a fabricated cylinder and not a
+// measurement of anything. A gate that read the seed would be the circular
+// probe assertion — the candidate's own guess deciding whether the candidate is
+// real.
+//
+// W2 widened it to 46 for the SLEEP of the surface-momentum layer
+// (docs/PLAN_water_relevel.md §4.3, WBS_WV* in common.wgsl). Four words, and
+// they are `WV` rather than `W` for the reason the relevel block is `RV`: every
+// short prefix in this map is already taken, and two accumulators sharing a
+// word is one pass zeroing the other's tally on the tick it mattered.
+//
+// The pipes themselves are NOT here. They are per COLUMN, not per body, and
+// kWorldN^2 columns will not fit in a 64-entry ledger — see kWaterFluxWords
+// below for the buffer they live in and why it is a binding of its own.
+constexpr uint32_t kWaterBodyStateWords = 46;
 // DRAIN OP SLOTS PER BODY (component 6). The discharge is emitted through the
 // existing spawnAppend seam, which reads a CPU-sized op stream — so the CPU
 // RESERVES a contiguous block per body it proposes and the GPU fills it. This
@@ -1828,6 +1858,7 @@ constexpr uint32_t kWaterDrainOpsPerBody = 512;
 //   [0, kWaterBodyCap * kWaterBodyStateWords)                the ledger
 //   [kWaterCurveBase, + kWaterBodyCap * kWaterCurveWords)    per-body sweep
 //   [kWaterSweepScratchBase, + kWaterSweepScratchWords)      shared scratch
+//   [kWaterRelevelHistBase, + kWaterBodyCap * kWaterRelevelBuckets)  W1 hist
 //
 // THE SPLIT GRID IS A DOWNSAMPLE, and that is the one approximation in M5.
 // Connectivity is computed on a `kWaterSplitGrid`^2 grid laid over the basin's
@@ -1861,11 +1892,131 @@ static_assert(kWaterCurveWords == kWaterSweepHeaderWords + kWaterCurveMaxY +
 // schedule is `basinId % N == tick % N`, plan §3.4), so the openness bitmap the
 // label propagation reads has one writer and one reader per tick.
 constexpr uint32_t kWaterSweepScratchWords = 128;
-constexpr uint32_t kWaterCurveBase = kWaterBodyCap * kWaterBodyStateWords;  // 1664
+constexpr uint32_t kWaterCurveBase = kWaterBodyCap * kWaterBodyStateWords;
 constexpr uint32_t kWaterSweepScratchBase =
     kWaterCurveBase + kWaterBodyCap * kWaterCurveWords;
-constexpr uint32_t kWaterBodyStateTotalWords =
+
+// ---- W1: the RELEVEL HISTOGRAM (docs/PLAN_water_relevel.md §3.2) ----------
+//
+// One bucket per EIGHTH of free-surface height in the band the measure looks
+// at, per body. `wbSurface` accumulates into it; `wbLedger` walks it next tick
+// to publish the give/take cutoffs and ZEROES the block as it consumes it.
+//
+// WHY IT LIVES PAST THE SWEEP SCRATCH AND NOT AT `kWaterCurveBase +
+// kWaterBodyCap * kWaterCurveWords`. That expression IS
+// `kWaterSweepScratchBase` — the shared openness bitmap the split's label
+// propagation reads — so the first draft of the plan would have laid 68 KiB of
+// histogram straight over it, and the symptom would have been a basin that
+// split wrongly only while some other basin was relevelling. Appended AFTER
+// the scratch, which is what "past the END of the existing layout
+// (kWaterBodyStateTotalWords)" has to mean. Still no new binding.
+//
+// THE DEPTH IS A KNOB BUT THE BLOCK IS NOT. `sim.waterRelevelDepth` decides
+// how far below `level` the measure looks; the BUFFER has to be sized at
+// compile time, so the knob is clamped to this ceiling in the shader and the
+// block is sized from the ceiling. A column further down than this clamps into
+// the end bucket and is treated as "deep" — bounded, and a column 32 voxels
+// below the surface is a hole the MPM owns anyway.
+constexpr uint32_t kWaterRelevelDepthMax = 32;
+// 8 eighths per voxel, over [level - DEPTH, level + 1]: DEPTH + 2 voxels.
+constexpr uint32_t kWaterRelevelBuckets = 272;
+static_assert(kWaterRelevelBuckets == 8 * (kWaterRelevelDepthMax + 2),
+              "kWaterRelevelBuckets must cover 8*(depth+2) eighths");
+constexpr uint32_t kWaterRelevelHistBase =
     kWaterSweepScratchBase + kWaterSweepScratchWords;
+constexpr uint32_t kWaterBodyStateTotalWords =
+    kWaterRelevelHistBase + kWaterBodyCap * kWaterRelevelBuckets;
+
+// ---- W2: THE SURFACE-MOMENTUM STORE (docs/PLAN_water_relevel.md §4.1) ------
+//
+// A dense XZ grid over the residency window, one record per COLUMN, indexed
+// `(z & WORLD_MASK) * kWorldN + (x & WORLD_MASK)` exactly like every other
+// window-relative buffer. It gets its own binding because it is per column and
+// there are 262,144 of them: `waterBodyState` is a 64-entry ledger and the
+// relevel histogram already sits past the end of it.
+//
+// FOUR NON-NEGATIVE OUTFLOW PIPES PER COLUMN, all owned by that column — the
+// Mei/O'Brien virtual-pipes layout, and the reason it is outflows rather than
+// two signed shared faces is a WRITE HAZARD and not taste. The outflow clamp
+// has to scale a column's own outflows against what that column may give; with
+// shared faces half of a column's outflows run through a face the NEIGHBOUR
+// owns, so "write the scaled flux back" means two writers per word, which is
+// exactly the mark/apply hazard this subsystem avoids everywhere else. With
+// owned outflows every transfer amount lives in ONE word, written by its owner
+// and gathered by its receiver, so conservation between two columns is exact
+// by construction.
+//
+// THE FIFTH AND SIXTH WORDS ARE WHAT MAKE IT SAFE TO READ:
+//   [4] `s` — the column's free-surface height in EIGHTHS, written by
+//       `wbSurface` at the END of a tick. W2's flux pass gathers five of these
+//       instead of re-walking five columns of voxels (§4.3).
+//   [5] the STAMP. `((tick + 1) << 4) | pageX << 2 | pageZ`, where pageX/pageZ
+//       are the low two bits of the column's WINDOW PAGE (`x / kWorldN`). It is
+//       the whole answer to "what happens on a window shift": the residency
+//       window is toroidal, so a slot is silently reused by a column kWorldN
+//       voxels away, and momentum from the old occupant would otherwise read as
+//       the new one's. The tick half alone would ALMOST do it — but a shift
+//       moves the origin by one CHUNK, so the departed column's stamp can be
+//       exactly one tick old on the tick its slot is re-read, and the page bits
+//       are what separate two columns exactly kWorldN apart. Same idea as
+//       `opennessStamp` (a hash of the world chunk coord) and `reposeSnap` (a
+//       per-slot tick), in one word because one pass writes all six together.
+//
+// THE CONTRACT THE STAMP BUYS, and both passes depend on it: a record whose
+// stamp is not exactly this tick's reads as ZERO, and `wbFlux` writes all four
+// pipes of every column whose stamp IS this tick's. So "fresh stamp" means
+// "wbFlux wrote these four pipes this tick", and a neighbour's pipe is either
+// a real transfer both ends agree on or is not there at all.
+//
+// DERIVED DATA in guideline #3's sense: not hashed, not saved, dropped on a
+// window shift (§6) — the same call the MPM makes for its particles. It IS
+// state that decides voxel writes, so it is integer, tick-ordered, gather-only
+// and one-writer-per-word, and the twice-run comparison covers it by
+// construction.
+constexpr uint32_t kWaterFluxWords = 6;
+constexpr uint32_t kWaterFluxColumns = (uint32_t)kWorldN * (uint32_t)kWorldN;
+constexpr uint64_t kWaterFluxBytes =
+    (uint64_t)kWaterFluxColumns * kWaterFluxWords * 4;   // 6 MiB at 512^2
+
+// ---- W3: THE IMPULSE DOOR (docs/PLAN_water_relevel.md §5) ------------------
+//
+// ONE door, two callers, and that is the whole design. §5 asks for a blast to
+// shove a pond and for a swimmer to drag a wake behind them, and both are the
+// same statement — "at this column, for one tick, push the surface THIS way
+// this hard". So there is one record and one queue rather than two systems that
+// would drift apart, and `sim_explode.wgsl` is left alone: rule 3 keeps the
+// explosion's writes in the mutation path, and a compute pass that reached into
+// `waterFlux` from the explosion kernel would be a second writer of a word
+// `wbFlux` owns (§4.1's whole argument).
+//
+// IT RIDES THE TICK STREAM, in TickParams, exactly as `windPrims` does and for
+// the same reason: a replay reproduces the stream and the twice-run determinism
+// gate compares it, so an impulse can never be a function of when the CPU
+// noticed something. `waterImpulseCount == 0` is an exact identity — `wbFlux`'s
+// loop does not execute and no pipe sees a different number — which is what
+// makes each of the three W3 knobs an identity at 0 (at 0 the CPU emits no
+// record at all, so the count stays 0).
+//
+// Applied BEFORE the outflow clamp in `wbFlux`, so an impulse cannot move more
+// water than the column is allowed to give and conservation is untouched: the
+// clamp is what the ledger's credit term is argued from, and an impulse that
+// bypassed it would be a mass pump with a knob on it.
+constexpr uint32_t kWaterImpulseCap = 8;
+// Two std140 vec4 rows per impulse:
+//   row 0  (x, z, radius, strength)   world column, cells, Q8 flux at the centre
+//   row 1  (dirX, dirZ, 0, 0)         Q8 direction; (0,0) means RADIAL OUTWARD
+// A swimmer whose velocity rounds to (0,0) in Q8 is not moving, and the CPU
+// does not emit a record for it — so the radial sense of (0,0) is never
+// ambiguous in practice, and it is checked on the CPU side rather than argued.
+constexpr uint32_t kWaterImpulseWords = 8;
+constexpr uint32_t kWaterImpulseScalars = 64;
+static_assert(kWaterImpulseScalars == kWaterImpulseCap * kWaterImpulseWords,
+              "kWaterImpulseScalars must equal cap * words");
+// How wide a swimmer's wake is, world cells. A player is roughly two cells
+// across at kVoxelsPerMetre = 10 and the wake wants to be the body plus the
+// water it drags with it, not a bow wave that reaches the far bank. Small
+// enough that the outflow clamp, not the radius, is what bounds the total.
+constexpr uint32_t kWaterSwimWakeRadius = 4;
 // THE SCHEDULE PERIOD (plan §3.4). A basin re-derives on ticks where
 // `slot % kWaterSweepPeriod == tick % kWaterSweepPeriod`, and one LEVEL of its
 // column AABB per scheduled tick. So a full re-derive of a 26-deep bowl costs
@@ -1891,6 +2042,69 @@ constexpr uint32_t kWaterBodyChildren = 1;
 // re-resolved it for itself it would disagree with the clear the ledger
 // already did, on any tick the shave moved the level in between.
 constexpr int32_t kWaterSweepLive = -0x7FFFFFFF;
+
+// ---- W-D: DISCOVERY, the created body (PLAN_water_relevel.md §8) -----------
+//
+// A body the PLAYER makes — a basin dug and filled by hand, a pool a drain
+// leaves behind — has no analytic container, so nothing in M1's registry can
+// name it. §8's answer reuses M2's authority split verbatim: the CPU accounts
+// EVIDENCE (eighths of liquid placed, where) off the tick input stream and
+// PROPOSES a probe disc; the GPU measures the real water and adopts or refuses.
+// The CPU never learns the verdict, so no fence ever reaches a voxel write.
+//
+// Live probe discs. Sixteen inside kWaterBodyCap, so discovery can never crowd
+// the authored basins out of the ledger. Each costs one descriptor, and a
+// REFUSED one costs three ledger loads a tick and no footprint work at all —
+// which is "puddles can be ignored easily" implemented literally.
+constexpr uint32_t kWaterDiscoveredCap = 16;
+// The reserved basin-id range. Authored pools take 1..3, authored lakes
+// 0x4xxxxxxx, tarns 0x8xxxxxxx; discovery takes 0xC0000000 | slot. A basin id
+// is an IDENTITY (the hole hints, the curve-dirty latch and the carried ledger
+// slot are all keyed by it), so it is derived from the probe's SLOT — which a
+// deleted neighbour never renumbers — and never from its index in a vector.
+constexpr uint32_t kWaterDiscoverIdBase = 0xC0000000u;
+// Ticks an EVICTED probe keeps its descriptor, proposed with WBF_RELEASE, before
+// the entry is dropped. Never drop a descriptor cold: the slot would be reused
+// against a ledger still carrying the old body's debit, which is the
+// carried-descriptor bug class the drain pass documents. 600 = 20 s, two orders
+// more than a probe's debit (normally zero) needs to square.
+constexpr uint32_t kWaterDiscoverReleaseTicks = 600;
+// The EVIDENCE GRID: coarse XZ cells, world voxels on a side. 32 is four chunk
+// columns and is chosen so a pond-sized pour lands in a handful of cells while a
+// single bucket lands in one. Evidence is accumulated per (cell, liquid
+// material) and is a pure function of the tick's op list.
+constexpr int kWaterEvidenceGrid = 32;
+// Live evidence cells tracked. Bounded by rule 2 rather than by hoping the
+// player stops pouring: at the cap the LOWEST-evidence cell is evicted (ties by
+// oldest tick, then by position), which is deterministic and costs at worst the
+// forgetting of a puddle nobody was going to get a body out of.
+constexpr uint32_t kWaterEvidenceCap = 192;
+// Chunk-list entries every discovered body TOGETHER may claim, out of
+// kWaterChunkCap. Rule 2 charges the budget before emission, and without a
+// share of its own a probe disc — whose ANALYTIC volume is an over-predicting
+// cylinder, so it sorts EARLY in Classify's biggest-first order — could take
+// the list out from under the authored lake. A quarter of the cap leaves the
+// lake's ~140 entries untouched in every fixture measured.
+constexpr uint32_t kWaterDiscoverChunkShare = 256;
+// Voxels of pad around the bounding circle of the contributing evidence (§8.3),
+// and voxels of floor below the lowest evidence cell. The disc is only a BOUND
+// — the sweep's component map trims ownership to the connected water exactly as
+// it does for an authored basin — so the pad is generosity, not accuracy.
+constexpr int kWaterDiscoverPad = 8;
+constexpr int kWaterDiscoverFloorPad = 4;
+// Largest probe disc. A probe is a proposal, and an unbounded one would list a
+// chunk footprint the share above then refuses in full — better to bound the
+// geometry than to discover a body the budget can never carry.
+constexpr int kWaterDiscoverMaxRadius = 48;
+// THE TWO NEW PER-BODY FLAG BITS, named here rather than written as literals in
+// BuildGpu. They are a PROTOCOL between waterbody.cpp and sim_waterbody.wgsl —
+// TickParams row 1, word 3 — and a protocol restated as a bare `| 32` in one
+// place and a `const WBF_DISCOVER : i32 = 32` in the other is a two-places-
+// must-agree bug with nothing behind it. `check_invariants.py`'s water-ledger
+// check compares these against common.wgsl's WBF_* block; bits 0..4 predate it
+// and are still literals, which is exactly why this pair is not.
+constexpr int32_t kWbfDiscover = 32;   // this body is a discovered PROBE
+constexpr int32_t kWbfReprobe = 64;    // one-tick pulse: new evidence landed
 
 // Largest radius / axial reach a primitive may declare, world cells (51 m).
 // Load-bearing twice: it bounds the footprint the wake budget is spent on, and
@@ -2189,9 +2403,57 @@ struct TickParams {
   // thing that catches it; see vizActive's own note above for the last time.
   // M5 spent two of the five on the sweep schedule above; the total is
   // unchanged, which is why widening TickParams here moved nothing.
-  uint32_t padWb2 = 0;
-  uint32_t padWb3 = 0;
-  uint32_t padWb4 = 0;
+  // ---- W1: RELEVEL, THE RATE AND THE ARM IN ONE WORD ---------------------
+  //
+  // `sim.waterRelevelMax` — eighths a column may move per tick — but ZEROED BY
+  // THE CPU on any tick `WaterBodyGpu::writesThisTick` is false, and that is
+  // the load-bearing half. The relevel is the second voxel WRITER in this
+  // subsystem, so it may only run on a tick whose chunks were declared to the
+  // page table; `writesThisTick` is the CPU's own answer to that and it does
+  // not otherwise reach the GPU. Sending the knob through this word rather than
+  // reading TUNE_WATER_RELEVEL_MAX in the kernel makes the arm and the rate ONE
+  // number with one owner — a kernel that read the tuning const directly would
+  // relevel into a JITTER sentinel the first tick the hot window closed, and
+  // the symptom would be page faults, not a wrong lake.
+  //
+  // (The other two knobs, `sim.waterRelevelGain` and `sim.waterRelevelDepth`,
+  // stay TUNE_* consts: they shape the rule, not whether it may write, and
+  // const-eval keeps the divide and the loop bound out of the uniform.)
+  int32_t waterRelevelMax = 0;
+  // ---- W-D: THE SIZE GATE (PLAN_water_relevel.md §8.4) -------------------
+  //
+  // `sim.waterAdoptMinArea` — the measured free-surface CELL count below which
+  // the ledger refuses a DISCOVERED probe and parks it in WB_REFUSED. Forwarded
+  // through the uniform rather than read as a TUNE_* const for the reason
+  // waterQuietTicks and waterMinVolume are: a gate that wants a different
+  // threshold sets it with SetCurrentTuning and pays no pipeline rebuild.
+  //
+  // It applies ONLY to a body carrying WBF_DISCOVER. An authored basin is a
+  // closed form the registry vouches for, and putting a size gate in front of
+  // it would make `sim.waterDiscoverMinEighths = 0` stop being the exact
+  // identity §8.6 promises — a small authored pool would start being refused by
+  // a knob that is supposed to be about discovery.
+  int32_t waterAdoptMinArea = 0;
+  // ---- W2: THE SURFACE-MOMENTUM ARM (PLAN_water_relevel.md §4.2) ---------
+  //
+  // `sim.waveMode` — 0 OFF, 1 the virtual-pipe layer — and, like
+  // `waterRelevelMax` above, ZEROED BY THE CPU on any tick
+  // `WaterBodyGpu::writesThisTick` is false. The wave apply is folded into
+  // `wbRelevel`, i.e. into the same voxel writer, so it inherits the same rule:
+  // it may only run on a tick whose chunks were declared to the page table.
+  //
+  // It is an ARM and not a rate, so it rides `waterRelevelMax`'s arm rather
+  // than replacing it: at `sim.waterRelevelMax = 0` nothing in this block
+  // writes a voxel at all and the wave has no apply to fold into. The wave's
+  // own knobs (gravity, depth cap, damping, sleep epsilon) stay TUNE_* consts
+  // const-eval'd in the kernel — they shape the rule, not whether it may write.
+  //
+  // At `sim.waveMode` 0 the `waterFlux` pass row is not recorded, no pipe is
+  // written and the wave term in the apply is not evaluated, so the pinned
+  // world hash cannot see W2. It was the padWb4 pad word, so the struct
+  // layout — which check_invariants.py compares against common.wgsl on TOTAL
+  // SIZE — is unchanged.
+  int32_t waveMode = 0;
   // kWaterBodyCap bodies x kWaterBodyWords i32 words, declared WGSL-side as
   // array<vec4<i32>, 128> — the same bytes, since std140 strides a uniform
   // array to 16 B. sim_waterbody.wgsl's wbGeom/wbSeed are the only decoders.
@@ -2256,6 +2518,23 @@ struct TickParams {
   int32_t currentPrimHi[3] = {0, 0, 0};
   int32_t padCp3 = 0;
   int32_t currentPrims[kCurrentPrimScalars] = {};
+  // ---- W3: THE IMPULSE BLOCK (PLAN_water_relevel.md §5; kWaterImpulseCap) --
+  //
+    // AT THE TAIL, and the position is arithmetic rather than taste. Every other
+  // water word is wedged into the 15-word header the note over `waterBodies`
+  // measures, and that header is EXACTLY full — a sixteenth word there slides
+  // every descriptor by two scalars, silently, because C++ packs an int32_t
+  // array at 4-byte alignment while std140 rounds a vec4 array up to 16.
+  // `currentPrims` is a multiple of four scalars, so it ends 16-byte aligned and
+  // this count plus three pads is its own clean 16-byte row in front of the
+  // vec4 array. check_invariants.py compares the two shapes on TOTAL SIZE and
+  // is the only thing that catches a disagreement.
+  //
+  // Zero is the shipping state of every tick nobody blew anything up on, and
+  // zero is an exact identity: `wbFlux`'s impulse loop does not execute.
+  uint32_t waterImpulseCount = 0;
+  uint32_t padWi0 = 0, padWi1 = 0, padWi2 = 0;
+  int32_t waterImpulses[kWaterImpulseScalars] = {};
 };
 
 // Q8 unit for the two dev multipliers above — must match WINDQ_SCALE_ONE in
@@ -3388,6 +3667,13 @@ class World {
   // voxels by the adoption reduce. CopySrc for `--gate waterbody`'s conservation
   // audit; CopyDst so a reset can zero it.
   rhi::Buffer waterBodyState;
+  // ---- W2: the surface-momentum store (kWaterFluxWords above) ----
+  // kWaterFluxColumns * kWaterFluxWords u32 (6 MiB at 512^2). Its own binding
+  // because it is per COLUMN and the ledger is per BODY. Derived data like the
+  // page table: not hashed, not saved, and safe across a window shift through
+  // the per-column stamp rather than through an invalidation pass. CopySrc for
+  // `--gate waterbody` pass S; CopyDst so a load/reset can zero it.
+  rhi::Buffer waterFlux;
 
   // ---- particles + explosions (M5, DESIGN.md §5/§7) ----
   rhi::Buffer particles[2];    // kParticleCap Particle (32 B), double-buffered

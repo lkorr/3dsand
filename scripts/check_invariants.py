@@ -660,6 +660,103 @@ def check_wind_prims():
             f"stride past the primitive it is decoding")
 
 
+def check_water_ledger():
+    """The water-body ledger's word map lives in THREE places, positionally.
+
+    world.h's kWaterBodyStateWords is the STRIDE -- every read of the buffer is
+    `slot * stride + field`. common.wgsl's WBS_* block is the field map the
+    shaders index with. selftest_water.cpp re-declares the same map as a bare
+    `enum : uint32_t` with ONE initialiser, so every name after the first takes
+    its index from its POSITION IN THE LIST.
+
+    Nothing about that is checked by a compiler. A word added to two of the
+    three is a gate that reads the wrong field of the right body (silent: it
+    prints a plausible number), or a shader that writes one body's word into
+    the next body's block (silent until a conservation sum drifts). W1 added
+    twelve words at once, which is exactly the size of change that gets two of
+    three right.
+
+    Also checked: the relevel histogram's own arithmetic, because it is sized
+    from one constant and indexed from another.
+    """
+    wh = read("src/sim/world.h")
+    cw = read("assets/shaders/common.wgsl")
+    st = read("src/test/selftest_water.cpp")
+    if not wh or not cw or not st:
+        return
+    m = re.search(r"constexpr\s+uint32_t\s+kWaterBodyStateWords\s*=\s*(\d+)", wh)
+    if not m:
+        return
+    stride = int(m.group(1))
+    checked.append("water ledger words")
+
+    # common.wgsl: WBS_<NAME> : u32 = <n>u
+    wgsl = {}
+    for name, idx in re.findall(r"\bconst\s+WBS_(\w+)\s*:\s*u32\s*=\s*(\d+)u", cw):
+        wgsl[name] = int(idx)
+    if wgsl:
+        seen = sorted(wgsl.values())
+        if seen != list(range(len(seen))):
+            problems.append(
+                f"common.wgsl's WBS_* indices are not 0..{len(seen) - 1} with "
+                f"no gaps or duplicates: {seen} -- the ledger is addressed as "
+                f"slot * stride + field, so a gap wastes a word and a duplicate "
+                f"makes two fields the same word")
+        if len(seen) != stride:
+            problems.append(
+                f"world.h kWaterBodyStateWords = {stride} but common.wgsl "
+                f"declares {len(seen)} WBS_* words -- the stride and the field "
+                f"map must be the same number or every body but slot 0 reads "
+                f"its neighbour's ledger")
+
+    # selftest_water.cpp: the positional decoder.
+    blk = re.search(r"enum\s*:\s*uint32_t\s*\{\s*WBS_STATE\s*=\s*0\s*,(.*?)\n\};",
+                    st, re.S)
+    if blk:
+        body = re.sub(r"//[^\n]*", "", blk.group(1))
+        names = [n for n in re.findall(r"\b(WBS_\w+)\b", body)]
+        if len(names) + 1 != stride:
+            problems.append(
+                f"src/test/selftest_water.cpp's WBS_* enum declares "
+                f"{len(names) + 1} words but world.h kWaterBodyStateWords = "
+                f"{stride} -- the enum is POSITIONAL (one initialiser), so the "
+                f"gate is reading the wrong field of the right body and saying "
+                f"so with a plausible number")
+
+    # W-D: the per-body FLAG BITS are a protocol between waterbody.cpp (which
+    # ORs them into TickParams row 1, word 3) and sim_waterbody.wgsl (which
+    # decodes them). Bits 0..4 predate this check and are still literals on the
+    # C++ side; the two W-D bits are named in world.h so this can compare them.
+    # A mismatch is silent in the worst way -- every probe would be treated as
+    # an authored basin, so the size gate and the sticky refusal would simply
+    # never fire and discovery would look like it worked.
+    flags_h = {n.upper(): int(v) for n, v in re.findall(
+        r"constexpr\s+int32_t\s+kWbf(\w+)\s*=\s*(\d+)", wh)}
+    flags_w = {n: int(v) for n, v in re.findall(
+        r"\bconst\s+WBF_(\w+)\s*:\s*i32\s*=\s*(\d+)\s*;", cw)}
+    for name, val in flags_h.items():
+        if name not in flags_w:
+            problems.append(
+                f"world.h declares kWbf{name.capitalize()} = {val} but "
+                f"common.wgsl has no WBF_{name} -- the CPU sets a bit no shader "
+                f"reads")
+        elif flags_w[name] != val:
+            problems.append(
+                f"world.h kWbf{name.capitalize()} = {val} but common.wgsl "
+                f"WBF_{name} = {flags_w[name]} -- the CPU and the ledger "
+                f"disagree about which bit means what")
+
+    # The relevel histogram: sized from one constant, indexed from another.
+    dm = re.search(r"constexpr\s+uint32_t\s+kWaterRelevelDepthMax\s*=\s*(\d+)", wh)
+    bk = re.search(r"constexpr\s+uint32_t\s+kWaterRelevelBuckets\s*=\s*(\d+)", wh)
+    if dm and bk and int(bk.group(1)) != 8 * (int(dm.group(1)) + 2):
+        problems.append(
+            f"world.h kWaterRelevelBuckets = {bk.group(1)} but 8 * "
+            f"(kWaterRelevelDepthMax + 2) = {8 * (int(dm.group(1)) + 2)} -- "
+            f"wbSurface clamps into the end bucket, so a short block silently "
+            f"piles every deep column into one bucket instead of overflowing")
+
+
 def check_current_prims():
     """world.h's current-primitive ceilings must match common.wgsl's constants.
 
@@ -1822,6 +1919,7 @@ ALL = {
     "params": check_gpu_structs,
     "windprim": check_wind_prims,
     "curprim": check_current_prims,
+    "waterledger": check_water_ledger,
     "counts": check_tick_counts,
     "farbits": check_far_material_bits,
     "farface": check_far_face_word,
@@ -1850,7 +1948,8 @@ RELEVANT = {
     "src/sim/farfield.h": ["farface"],
     "src/test/selftest.cpp": ["arch"],
     "src/sim/world.h": ["world", "params", "substeps", "windprim",
-                        "curprim"],
+                        "curprim", "waterledger"],
+    "src/test/selftest_water.cpp": ["waterledger"],
     "src/sim/world.cpp": ["worldgen"],
     "assets/shaders/worldgen.wgsl": ["worldgen", "treeatlas"],
     "src/sim/treeatlas.h": ["treeatlas"],
@@ -1883,7 +1982,8 @@ if __name__ == "__main__":
                     run += checks
             if norm.endswith(".wgsl"):
                 run += ["tuning", "world", "params", "windprim",
-                        "curprim", "burntint", "plants", "farface"]
+                        "curprim", "waterledger", "burntint", "plants",
+                        "farface"]
         run = list(dict.fromkeys(run))
         if not run:
             sys.exit(0)  # edited file cannot break any pair

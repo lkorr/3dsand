@@ -4,6 +4,8 @@
 #include <cstring>
 #include <string>
 
+#include "sim/waterbody.h"
+
 namespace {
 constexpr uint32_t FourCC(char a, char b, char c, char d) {
   return (uint32_t)(uint8_t)a | ((uint32_t)(uint8_t)b << 8) |
@@ -484,5 +486,33 @@ EntityIO MakeEntityIO(DebrisSystem& debris, MobSystem& mobs,
           return LoadWorldItems(g, d, n, v);
         }});
   }
+  // ---- W-D: THE DISCOVERED-BODY REGISTRY (PLAN_water_relevel.md §8.3) ------
+  //
+  // Unconditional, and it takes no reference: WaterBodies() is a process global
+  // for the reason WindPrims() is — it has to reach the frame loop, every gate
+  // and both smoke harnesses, and any path that did not get it passed would
+  // describe a world with no lakes in it.
+  //
+  // WHY THIS ONE SYSTEM PERSISTS AND THE REST OF THE WATER RECORD DOES NOT.
+  // Everything else in waterbody.h is DERIVED — basins are a pure function of
+  // (seed, window), the ledger is a cache of aggregates over voxels the loader
+  // has just restored — and derived data is reconstructible and disposable
+  // (design guideline #3). A probe disc is not: it is the residue of what the
+  // player DID, so it is authored-equivalent truth and this is where it lives.
+  // What crosses the boundary is a few ints an entry and nothing that decides a
+  // voxel: on load the entries are re-proposed and the GPU re-adopts each one by
+  // re-measuring the restored water, which is the same path it took the first
+  // time.
+  io.sections.push_back(EntitySection{
+      FourCC('W', 'T', 'R', 'B'), sandvox::WaterBodySystem::kSaveVersion,
+      // Runs on EVERY load, section present or not: a save made before W-D must
+      // not leave this session's probes standing in the loaded world. It clears
+      // ONLY the registry — the basins, the labelling and the GPU ledger belong
+      // to the worldgen/load path and have their own owner.
+      [] { sandvox::WaterBodies().ClearDiscovered(); },
+      [](std::vector<uint8_t>& out) { sandvox::WaterBodies().SaveState(out); },
+      [](const uint8_t* d, size_t n, uint32_t v) {
+        return sandvox::WaterBodies().LoadState(d, n, v);
+      }});
   return io;
 }

@@ -94,6 +94,9 @@ namespace {
 #define PIPE_WATER_HOLE      Pipe::WaterHole
 #define PIPE_WATER_SWEEP     Pipe::WaterSweep
 #define PIPE_WATER_SPLIT     Pipe::WaterSplit
+#define PIPE_WATER_RELEVEL   Pipe::WaterRelevel
+#define PIPE_WATER_SURFACE   Pipe::WaterSurface
+#define PIPE_WATER_FLUX      Pipe::WaterFluxPipe
 #define PIPE_GAS_ARGS1       Pipe::GasArgs1
 #define PIPE_GAS_SPAWN       Pipe::GasSpawnP
 #define PIPE_GAS_INTEGRATE   Pipe::GasIntegrate
@@ -136,6 +139,7 @@ namespace {
 #define C_WATERBODY Cond::WaterBody
 #define C_WATERDRAIN Cond::WaterDrain
 #define C_WATERSWEEP Cond::WaterSweep
+#define C_WATERWAVE  Cond::WaterWave
 #define C_OPENNESS  Cond::Openness
 #define C_GLOW      Cond::Glow
 #define C_GAS       Cond::Gas

@@ -155,9 +155,12 @@ inline constexpr PerfNodeDef kPerfNodes[] = {
     {"waterBodies", "Water Bodies", "simTick", PerfSide::Both,
      PerfScope::WaterBody,
      "waterQuiet;waterLedger;waterDrain;waterReduce;waterShave;waterHole;"
-     "waterSweep;waterSplit",
+     "waterSweep;waterSplit;waterFlux;waterRelevel;waterSurface",
      "Records nothing at all while sim.waterBodyMode is 0. Cost is per BODY, "
-     "not per water voxel."},
+     "not per water voxel. The relevel pair (W1) is per SURFACE COLUMN and only "
+     "inside a disturbed body's hot window, and the surface-momentum pipes "
+     "(W2, sim.waveMode) record no row at all until a body is listed and "
+     "sleep again a second after it stops moving."},
     // `compactNext` belongs to `compact`, not here — it is the second run of
     // the dirty compaction, over the dirty-OUT flags. It was listed in both,
     // which double-counted its GPU time; check_invariants.py's `perfnodes`

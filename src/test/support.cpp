@@ -672,8 +672,49 @@ void SubmitTick(GpuContext& ctx, World& world, Simulation& sim, uint32_t tick,
     spanHead.Close();
     {
       sandvox::PerfSpan spanWb(PerfScope::WaterBody);
+      // ---- W-D: EVIDENCE, BEFORE THE TICK (PLAN_water_relevel.md §8.2) ----
+      //
+      // THE CHOKEPOINT, and it is the reason this call is here and not in the
+      // brush or in a gate. Everything that places a voxel in this engine
+      // arrives at SubmitTick as one of these two lists: the player's brush (and
+      // the spell streams that share it) as `ops`, and every system that writes
+      // exact cells — mobs, debris, prefabs, tree felling, the world edit layer
+      // — plus every gate's hand-built op list as `cells`. There is no other
+      // door into the MutationQueue, so accounting here sees the player and the
+      // harness by the same path, which is what makes gate pass N's positive arm
+      // a statement about the thing a player would do.
+      //
+      // BEFORE wb.Tick, so a threshold crossed by THIS tick's ops raises its
+      // probe on THIS tick rather than one later — the promotion scan runs
+      // inside Tick and reads what this deposited. Nothing it reads is anything
+      // but the op lists and the tick number: no snapshot, no readback, no
+      // clock. Both knobs at their off values make it an immediate return.
+      wb.NoteMutations(world, tick, wt.sim.waterBodyMode,
+                       wt.sim.waterDiscoverMinEighths, cells.data(), cellCount,
+                       ops.data(), (uint32_t)ops.size());
+      // ---- W3: THE BLAST IMPULSE (PLAN_water_relevel.md §5) --------------
+      //
+      // HERE, and not in sim_explode.wgsl, because rule 3 keeps the explosion's
+      // writes in the mutation path and `waterFlux`'s pipes have exactly one
+      // writer (`wbFlux`, §4.1). What crosses is the EVENT — (x, z, radius,
+      // strength) — on the tick input stream, which is the same door the hole
+      // hint above uses and for the same reason: a replay reproduces this list
+      // and the twice-run determinism gate compares it.
+      //
+      // THE SAME CHOKEPOINT NoteMutations JUST USED. `exps` is every explosion
+      // in the engine — the crosshair detonate, grenade fuses, spell blasts and
+      // every gate's hand-built list — because they all arrive at SubmitTick as
+      // this one vector. There is no second door.
+      //
+      // BEFORE wb.Tick, which consumes the queue into the GPU payload, so a
+      // blast on THIS tick disturbs the water on THIS tick.
+      //
+      // At sim.waveBlastImpulse 0 the emitter queues nothing at all.
+      for (const ExplosionOp& e : exps)
+        WaterBodyNoteBlast(wb, e, wt.sim.waveBlastImpulse);
       wb.Tick(world, seed, tick, wt.sim.waterBodyMode, wt.sim.waterBodyTestDrain,
-              wt.sim.drainMaxEighthsPerTick, worldEdited, editCell);
+              wt.sim.drainMaxEighthsPerTick, wt.sim.waterRelevelMax,
+              worldEdited, editCell);
     }
     const WaterBodyGpu& g = wb.Gpu();
     waterGpu = &g;
@@ -683,6 +724,10 @@ void SubmitTick(GpuContext& ctx, World& world, Simulation& sim, uint32_t tick,
     tp.waterTestDrain = wt.sim.waterBodyTestDrain;
     tp.waterQuietTicks = wt.sim.waterBodyQuietTicks;
     tp.waterMinVolume = wt.sim.waterBodyMinVolume;
+    // W-D: discovery's size gate. Read by the ledger's adoption branch and ONLY
+    // for a body carrying WBF_DISCOVER, so with no probe in the registry this
+    // word reaches no branch at all.
+    tp.waterAdoptMinArea = wt.sim.waterAdoptMinArea;
     // M5: the scheduled container re-derive (components 2 case 2 + 10). Both
     // fields are pure functions of the tick — see WaterBodySystem::BuildGpu —
     // and `kWaterBodyCap` here means "nothing sweeps", which is the state of
@@ -717,6 +762,32 @@ void SubmitTick(GpuContext& ctx, World& world, Simulation& sim, uint32_t tick,
     tp.waterDrainBodies = drainBodies;
     tp.waterDrainMax = wt.sim.drainMaxEighthsPerTick;
     tp.waterExciteRadius = wt.sim.drainExciteRadius;
+    // ---- W1: THE RELEVEL RATE, AND ITS ARM, IN ONE WORD ------------------
+    //
+    // ZEROED unless the footprint is declared this tick. `wbRelevel` is the
+    // second voxel WRITER in this subsystem and `writesThisTick` is the CPU's
+    // own answer to "were its chunks handed to the page table"; it does not
+    // otherwise reach the GPU, and a kernel that read TUNE_WATER_RELEVEL_MAX
+    // directly would go on relevelling into JITTER sentinels the first tick the
+    // hot window closed. One number, one owner — the same shape as the drain's
+    // `b < T.waterDrainBodies` refusal.
+    //
+    // At sim.waterRelevelMax 0 this is 0 on every tick, both kernels return on
+    // their first comparison, and W1 is an exact identity.
+    tp.waterRelevelMax = g.writesThisTick ? wt.sim.waterRelevelMax : 0;
+    // ---- W2: THE SURFACE-MOMENTUM ARM (PLAN_water_relevel.md §4.2) -------
+    //
+    // Same word, same owner, same reason. The wave APPLY is folded into
+    // `wbRelevel` — one pass writes a column once per tick (§4.3) — so it is
+    // the same voxel writer and inherits the same permission: it may only run
+    // on a tick whose chunks were handed to the page table. Zeroed with the
+    // relevel's arm rather than separately, because a wave with no apply to
+    // fold into would spend momentum into a column nobody writes.
+    //
+    // At sim.waveMode 0 this is 0 on every tick AND the `waterFlux` row is not
+    // recorded at all (Cond::WaterWave), so W2 is an exact identity.
+    tp.waveMode =
+        (g.writesThisTick && wt.sim.waterRelevelMax > 0) ? wt.sim.waveMode : 0;
     // The total the seam dispatches over: real pours, then the reserved block.
     // Written AFTER tp.fluidSpawnCount's own assignment above on purpose — the
     // WriteBuffer below still uploads only the CPU half, because the GPU owns
@@ -726,6 +797,20 @@ void SubmitTick(GpuContext& ctx, World& world, Simulation& sim, uint32_t tick,
       tp.waterBodies[i] = g.bodies[i];
     for (size_t i = 0; i < g.chunks.size() && i < kWaterChunkCap; i++)
       tp.waterChunks[i] = g.chunks[i];
+    // ---- W3: the impulse block (§5) -------------------------------------
+    //
+    // NOT gated on `writesThisTick` the way the relevel rate above is, and the
+    // asymmetry is the point: an impulse writes no voxel. It is a term in the
+    // head `wbFlux` integrates, and `wbFlux` itself is already refused on any
+    // tick the relevel's arm is down (`T.waveMode` is zeroed with it), so the
+    // permission is inherited rather than restated. Restating it here would
+    // silently drop a blast on the one tick the footprint happened not to be
+    // declared, which is exactly the tick somebody just threw a grenade.
+    //
+    // Empty is the shipping state and an exact identity.
+    tp.waterImpulseCount = g.impulseCount;
+    for (size_t i = 0; i < g.impulses.size() && i < kWaterImpulseScalars; i++)
+      tp.waterImpulses[i] = g.impulses[i];
   }
 
   // ---- THE CURRENT FIELD (plan component 8) --------------------------------

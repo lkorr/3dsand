@@ -403,6 +403,11 @@ fn spawnAppend(@builtin(global_invocation_id) gid : vec3<u32>) {
   // produces a dead particle — this only COUNTS them, so a conservation gate
   // can subtract the block's tail from FA_LIVE and see the real in-flight mass.
   if (op.mat == 0u) { atomicAdd(&fluidArgs[FA_SPAWNDEAD], 1u); }
+  // The `in` side of the seam's mass books (FA_SPAWNLIVE, declared with the
+  // rest of the cumulative block below): eighths that actually entered the pool
+  // as LIVE particles, one per live op by construction (fpPack(op.mat, 1u, ...)
+  // below). A discharge ledger's `drained` is supposed to equal this.
+  if (op.mat != 0u) { atomicAdd(&fluidArgs[FA_SPAWNLIVE], 1u); }
   var p : FluidParticle;
   p.px = op.px; p.py = op.py; p.pz = op.pz;
   // The CFL cap is derived from the substep knob (common.wgsl), so a spawn op
@@ -1178,6 +1183,7 @@ fn exciteEmit(@builtin(workgroup_id) wg : vec3<u32>,
     markDirtyNext(c);
     atomicAdd(&fluidArgs[FA_EXCITED], fullness);
     atomicAdd(&fluidArgs[FA_EMITTED], fullness);
+    atomicAdd(&fluidArgs[FA_EXCITEDCUM], fullness);   // mass books, cumulative
   }
 }
 
@@ -1663,6 +1669,38 @@ const FA_SETFLOOR : u32 = 31u;  // pool with no floor, or trapped under a blocke
 const FA_FORCED : u32 = 32u;
 const FA_SEALED : u32 = 33u;
 
+// ---- THE SEAM'S MASS BOOKS (cumulative, never cleared) ---------------------
+// Every FA_* word above is an EVENT counter for ONE tick: the clear at the head
+// of this file zeroes them, so a gate that samples them sees a snapshot and can
+// never ask "over this window, did as much mass go in as came out?". These four
+// answer exactly that, and they are cumulative BECAUSE the clear skips them —
+// a gate reads the word before and after a window and differences it.
+//
+// They pay for themselves the way CLAUDE.md rule 6 says instruments do: the
+// pass-H1 residual was a bare −73,287 for as long as there was nothing to
+// decompose it into, and one line of these words named the site (g2p deleting
+// particles inside submerged liquid) in four runs. They stay.
+//
+// The books close when:  in − out − liveDelta == 0, where
+//     in  = FA_SPAWNLIVE + FA_EXCITEDCUM
+//     out = FA_KILLHARD (sim_fluid.wgsl) + FA_SETTLEKILL
+// and FA_CALMSUBM (sim_fluid.wgsl) appears in NEITHER — calming is not a
+// transfer. A non-zero result is unaccounted mass, and there is now exactly one
+// deletion path in the engine that is not on the `out` side of this sum: none.
+const FA_SETTLEKILL : u32 = 35u;  // eighths that died LEGITIMATELY, because
+                                  // settleCommit had already written them into
+                                  // voxels. The `out` side's honest half.
+const FA_EXCITEDCUM : u32 = 36u;  // cumulative mirror of FA_EXCITED: eighths
+                                  // that left voxels and became particles.
+const FA_SPAWNLIVE  : u32 = 38u;  // cumulative LIVE spawn ops. One eighth each
+                                  // by construction (fpPack(op.mat, 1u, ...)),
+                                  // which is what a discharge ledger's
+                                  // `drained` is supposed to equal.
+const FA_SETWROTE   : u32 = 39u;  // cumulative NET eighths settle wrote into
+                                  // voxels, on FA_SETTLED's net convention
+                                  // (the atomicSub of the pre-existing content
+                                  // is mirrored).
+
 // ---- THE FORCE-SETTLE BACKSTOP -------------------------------------------
 // Termination, as a mechanism rather than a hope. `settleColumn` walks 16 + 8
 // cells, so a SUBMERGED column has no room by construction and refuses every
@@ -1819,6 +1857,7 @@ fn settleColumn(listIdx : u32, base : vec3<i32>, cx : i32, cz : i32,
     // audits and the splash sound cue actually want.
     if (write && existing > 0u) {
       atomicSub(&fluidArgs[FA_SETTLED], existing);
+      atomicSub(&fluidArgs[FA_SETWROTE], existing);   // mass books, cumulative
     }
     if (pool > 0u && !floorOk) {
       if (rec) { atomicAdd(&fluidArgs[FA_SETFLOOR], 1u); }
@@ -1842,6 +1881,10 @@ fn settleColumn(listIdx : u32, base : vec3<i32>, cx : i32, cz : i32,
         markDirtyNext(base + vec3<i32>(cx, y, cz));
       }
       if (place > 0u) { atomicAdd(&fluidArgs[FA_SETTLED], place); }
+      // Cumulative NET eighths the settle wrote into voxels, on the same net
+      // convention as FA_SETTLED (the atomicSub of `existing` above is
+      // mirrored). The seam's mass books, declared below.
+      if (place > 0u) { atomicAdd(&fluidArgs[FA_SETWROTE], place); }
     }
     if (place > 0u) {
       floorOk = true;   // water stacks on water
@@ -2147,6 +2190,11 @@ fn settleKill(@builtin(global_invocation_id) gid : vec3<u32>) {
   // the rest of the block committed. Same bit settleCommit consulted.
   let lo = vec3<u32>(cell & vec3<i32>(CHUNK_MASK));
   if (seamColumnRefused(mark & MARK_LIST_MASK, lo.z * CHUNK + lo.x)) { return; }
+  // The `out` side of the seam's mass books: cumulative eighths that died
+  // LEGITIMATELY, i.e. because settleCommit already wrote them into voxels.
+  // This is the death a conservation identity must NOT add back — unlike
+  // FA_KILLHARD, the mass is standing in a voxel the sweep can see.
+  atomicAdd(&fluidArgs[FA_SETTLEKILL], fpFullness(p.attr));
   p.attr = 0u;
   fluidParticles[gid.x] = p;
   atomicAdd(&fluidArgs[FA_DEAD], 1u);

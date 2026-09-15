@@ -1954,6 +1954,129 @@ struct Tuning {
     float drainCd = 0.6f;        // orifice discharge coefficient
     float drainGravity = 900.0f; // vox/s^2; should match sim.fluidGravity
 
+    // ---- RELEVEL (docs/PLAN_water_relevel.md W1) --------------------------
+    //
+    // Why this exists at all, in one line: the CA's equalize branch fires at a
+    // 2-eighth difference between neighbours, so a ramp of 1 eighth per 2 cells
+    // is a STABLE FIXED POINT — a 5-voxel cone over an 80-cell radius never
+    // goes away, and above that slope it flattens by diffusion at r^2 ticks per
+    // eighth, which is minutes. Flatter than reach 1 allows needs a global
+    // operation, and the body system already is one.
+    //
+    // Eighths a column may move per tick. 0 is an EXACT IDENTITY: the two new
+    // passes return after their first comparison, no voxel is written, and the
+    // pinned world hash is the pre-W1 one. 4 flattens a 10-voxel cone in ~20
+    // ticks (0.7 s); 8 does it in 10 and starts to read as an edit rather than
+    // as water finding its level.
+    int waterRelevelMax = 4;
+    // Eighths of deficit per EXTRA eighth of rate: k = clamp(|s - m| / gain, 1,
+    // max). A column one voxel down moves at 1 eighth/tick, a column four
+    // voxels down at 4 — so a crater closes fast and a one-eighth ripple does
+    // not get bulldozed.
+    int waterRelevelGain = 8;
+    // How far below the body's level the measure looks, in VOXELS. This sizes
+    // nothing at runtime — the histogram block is sized from world.h's
+    // kWaterRelevelDepthMax and this is clamped to it — but it does decide how
+    // deep a hole still counts as "a low column of this lake" rather than as a
+    // void the MPM owns. A column further down than this clamps into the end
+    // bucket and is treated as deep.
+    int waterRelevelDepth = 32;
+
+    // ---- W2: surface momentum (docs/PLAN_water_relevel.md §4) ----
+    //
+    // The relevel RELAXES: every column moves toward the body's mean and stops.
+    // A real pond OVERSHOOTS — the water beside a crater accelerates into it,
+    // arrives with momentum, piles past level and rings back. That needs one
+    // extra integer per column FACE and nothing else new: four non-negative
+    // outflow pipes per column (the Mei/O'Brien virtual-pipe layout), living in
+    // `world.waterFlux`.
+    //
+    // 0 = OFF and it is an EXACT IDENTITY, stronger than a cheap kernel: the
+    // `waterFlux` pass row is not recorded at all (Cond::WaterWave), so the
+    // pinned world hash cannot see the feature. 1 = the pipe layer is live.
+    int waveMode = 0;
+    // Gravity for the pipe acceleration, in VOXELS/s^2 — the sanctioned
+    // human-unit float lane, exactly like `drainGravity`, and converted to Q8
+    // cells/tick^2 by WGSL const-eval at the top of sim_waterbody.wgsl so the
+    // kernel itself stays integer and bit-deterministic (rule 1).
+    //
+    // 98 is real gravity at kVoxelsPerMetre = 10. The wave speed is
+    // sqrt(g * depth); at the shipped depth cap of 10 voxels that is ~1.04
+    // cells/tick, which is the CFL limit for a reach-1 scheme — raise either
+    // and the ring outruns the grid instead of travelling on it.
+    float waveGravity = 98.0f;
+    // VOXELS of depth the wave speed may see. A deep lake's waves would
+    // otherwise travel faster than one cell per tick, which a reach-1 update
+    // cannot represent; capping the depth caps the speed and reads fine,
+    // because what the eye follows is the ring, not its absolute celerity.
+    int waveDepthCap = 10;
+    // How fast the ring dies, per SECOND. A pipe keeps (1 - damping/30) of its
+    // flux each tick, so 0.8 is an e-folding time of ~1.25 s: a crater rings
+    // three or four times and is gone. 0 never settles and is what the sleep
+    // epsilon exists to make safe anyway; above ~8 the overshoot is invisible
+    // and this is just a slower relevel.
+    float waveDamping = 0.8f;
+    // The Q8 pipe magnitude a body must be STRICTLY UNDER to count as still.
+    // The shipped 256 is not a tolerance: a pipe transfers `q >> 8` whole
+    // eighths, so under 256 it moves literally nothing. A body that is still
+    // AND flat for `fluidSettleTicks` consecutive ticks publishes flux-asleep,
+    // and both W2 passes then return after three loads — which is what keeps a
+    // settled lake inside its hot window at zero cost (rule 2). Measured on the
+    // harness lake: asleep 112 ticks after a 17x17x6 crater.
+    int waveSleepEps = 256;
+
+    // ---- W3: what disturbs the surface (PLAN_water_relevel.md §5) ----
+    //
+    // Three sources of a disturbance the head difference alone cannot produce,
+    // each behind its own knob and each an EXACT IDENTITY at 0. All three are
+    // Q8 pipe flux — the unit the pipes already carry — so none of them needs
+    // the human-unit float lane and none of them puts an f32 in a kernel.
+    //
+    // Peak flux a blast adds to the column under its centre, falling linearly
+    // to nothing at the explosion's own radius. One tick, added before the
+    // outflow clamp, so a blast cannot move more water than the column is
+    // allowed to give. 3072 is twelve whole eighths per tick at the centre —
+    // three times the shipped relevel rate, which is what makes the crater
+    // punch a visible bowl rather than merely smooth one.
+    //
+    // At 0 the CPU emits no impulse record at all, so TickParams'
+    // `waterImpulseCount` stays 0 and `wbFlux` is bit-identical.
+    int waveBlastImpulse = 3072;
+    // Q8 flux a LIVE DISCHARGE pulls its neighbours in with, so the surface
+    // genuinely dips toward the throat instead of the render vortex sitting
+    // over a flat lake. GPU-generated, because "this body is emitting" is a
+    // fact only the ledger knows (WBS_EMIT) — the CPU could learn it only from
+    // the async readback, which is rule 1 through the back door.
+    int waveDrainSink = 1024;
+    // Q8 flux a swimmer drags behind them, per whole voxel-per-tick of their
+    // own submerged speed. Small on purpose: a wake is a trail, not a wave, and
+    // a body that shoved the surface as hard as a blast would let a player pump
+    // a lake by swimming in circles. Bounded anyway by the outflow clamp.
+    int waveSwimWake = 512;
+
+    // ---- W-D: discovery (docs/PLAN_water_relevel.md §8) ----
+    //
+    // A body the PLAYER creates — a basin dug and filled by hand, a pool a
+    // drain leaves behind — is adopted and gets the W1 relevel; a puddle stays
+    // CA and costs nothing. The CPU accounts placed-liquid EVIDENCE off the
+    // mutation stream and proposes a probe disc; the GPU measures the real
+    // water and adopts or refuses it (the M2 authority split, verbatim).
+
+    // EIGHTHS of liquid placed in one cluster of the coarse evidence grid
+    // before a probe disc is raised. 4096 is ~512 full voxels of water — a
+    // small real pond, and three orders more than anything a bucket or a
+    // burst pipe leaves behind. 0 is an EXACT IDENTITY: no evidence is
+    // accumulated, no probe exists, no descriptor carries WBF_DISCOVER, and
+    // the pinned world hash is the pre-W-D one.
+    int waterDiscoverMinEighths = 4096;
+    // MEASURED free-surface CELLS below which the GPU refuses a discovered
+    // probe and parks it in WB_REFUSED (four ledger loads a tick, no footprint
+    // work). This is the backstop behind the CPU filter above, for evidence
+    // that evaporated, soaked away or ran off before the reduce ever looked:
+    // the eighths were genuinely placed, and there is still no body there.
+    // Never applied to an AUTHORED basin — see TickParams::waterAdoptMinArea.
+    int waterAdoptMinArea = 64;
+
     // ---- wind coupling (docs/RESEARCH_wind.md §4.5/§4.6) ----
     // The SHAPE of the field is the `wind` group below; these are what the
     // three SIM consumers do with what they sample. Human-unit floats, the
@@ -2754,6 +2877,24 @@ struct Tuning {
     // (seconds) and the wavelength of the ring train (metres).
     float waveImpactSpeed = 1.8f, waveImpactDecay = 2.5f;
     float waveImpactLen = 0.70f;
+    // ---- W3: the SIM's surface momentum, in the fragment stage ----------
+    // docs/PLAN_water_relevel.md §5, last bullet. `waterFlux` is bound
+    // read-only to the render group and the water surface reads its OWN
+    // column's four pipes. The height stays authoritative through
+    // liquidColumn(); the pipes carry what an eighth-quantised height cannot —
+    // which way the surface is moving and how hard.
+    //
+    // waveSimSlope: how far the normal tilts down-flow, per whole eighth/tick
+    // of net pipe flux. Sub-eighth detail BETWEEN the steps the column height
+    // can express, which is the point of reading the flux at all.
+    // waveSimFoam: how much froth a column running at one whole eighth/tick
+    // gets. It joins the existing shoreline/convergence foam through a max(),
+    // so a sloshing lake foams on its rings and a still one is unchanged.
+    //
+    // BOTH AT 0 CONST-FOLDS THE ENTIRE BLOCK, the buffer read included. That is
+    // the arm --shader-stats is compared against, and it is not optional
+    // bookkeeping: this shader has no register headroom.
+    float waveSimSlope = 0.030f, waveSimFoam = 0.55f;
     // ---- the current-field arrow overlay (plan component 8) -------------
     // A clone of the wind overlay's two knobs, at a water scale: currents are
     // metres per second where wind is tens, so the lattice is tighter and the

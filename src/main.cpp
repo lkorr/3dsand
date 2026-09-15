@@ -60,6 +60,7 @@
 #include "sim/tuning.h"
 #include "sim/stream.h"
 #include "sim/voxload.h"
+#include "sim/waterbody.h"
 #include "sim/wind.h"
 #include "sim/windprim.h"
 #include "sim/currentprim.h"
@@ -8539,6 +8540,35 @@ int main(int argc, char** argv) {
       {
         std::vector<WindPrim> noWinds;
         ui.spellRefused += spells.FilterStreams(ops, exps, spawns, noWinds);
+      }
+      // ---- W3: THE SWIMMER'S WAKE (docs/PLAN_water_relevel.md §5) --------
+      //
+      // HERE, on the TICK, and not beside player.Update above — which runs per
+      // FRAME. The impulse queue is consumed once per sim tick, so a frame-rate
+      // emitter would queue three or four records for one swimmer at 120 Hz and
+      // shove the lake harder on a fast machine than on a slow one. One tick,
+      // one record.
+      //
+      // THE SAME DOOR THE BLAST USES (SubmitTick's WaterBodyNoteBlast call):
+      // one queue, one record type, one kernel term. The conversion — velocity
+      // to Q8, submersion threshold, strength — lives in
+      // WaterBodyNoteSwimmer so the gate exercises the arithmetic the game
+      // runs rather than a copy of it.
+      //
+      // `player.vel` is VOXELS PER SECOND (player.cpp divides its m/s knobs by
+      // kVoxelMeters); the door wants voxels per TICK.
+      //
+      // MOBS ARE NOT WIRED and that is a gap, not an omission of effort: a Mob
+      // carries no submersion or swim state at all today (game/mob.h has no
+      // such field), so there is nothing to read. The door is generic — a mob
+      // that gains one is this same call with different arguments.
+      //
+      // At sim.waveSwimWake 0 nothing is queued at all.
+      if (player.inLiquid) {
+        WaterBodyNoteSwimmer(WaterBodies(), ifloor(player.pos.x),
+                             ifloor(player.pos.z), player.vel.x * kTickDt,
+                             player.vel.z * kTickDt, player.submersion,
+                             CurrentTuning().sim.waveSwimWake);
       }
       double tSubmit0 = NowSeconds();
       SubmitTick(ctx, world, sim, tick, kDefaultSeed, ops, exps, cellOps,

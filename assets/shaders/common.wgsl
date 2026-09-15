@@ -684,9 +684,21 @@ struct TickParams {
   // scheduled", which is every tick of a lake nobody has dug into.
   waterSweepSlot  : u32,
   waterSweepLevel : i32,
-  padWb2 : u32,            // see the alignment arithmetic in world.h
-  padWb3 : u32,
-  padWb4 : u32,
+  // W1: the relevel rate AND its arm, in one word. The CPU zeroes it on any
+  // tick the body's footprint is not declared to the page table
+  // (WaterBodyGpu::writesThisTick), because relevel WRITES voxels — see the
+  // note on waterRelevelMax in world.h.
+  waterRelevelMax : i32,
+  // W-D: the size gate. Measured free-surface CELLS below which the ledger
+  // refuses a DISCOVERED probe (WBF_DISCOVER) and parks it in WB_REFUSED.
+  // Never applied to an authored basin — see world.h.
+  waterAdoptMinArea : i32,
+  // W2: the surface-momentum ARM. 0 = OFF and the `waterFlux` row is not even
+  // recorded; the CPU zeroes it on any tick the footprint is not declared, for
+  // waterRelevelMax's reason — the wave apply is folded into wbRelevel, i.e.
+  // into the same voxel writer. It was the padWb4 pad word, so the struct size
+  // check_invariants.py compares is unchanged.
+  waveMode : i32,
   // WATERBODY_CAP bodies x 2 rows. The literal 128 is deliberate, exactly like
   // windPrims' 96: this file and world.h are compared on TOTAL SIZE by
   // scripts/check_invariants.py, so a cap changed on one side and not the other
@@ -735,6 +747,22 @@ struct TickParams {
   // windPrims' reason: this file and world.h are compared on TOTAL SIZE by
   // scripts/check_invariants.py. Keep 96 = 3 * kCurrentPrimCap.
   currentPrims : array<vec4<i32>, 96>,
+  // ---- W3: the impulse block (PLAN_water_relevel.md §5) -------------------
+  // kWaterImpulseCap records x 2 rows. The literal 16 is deliberate for
+  // currentPrims' reason: this file and world.h are compared on TOTAL SIZE.
+  // Keep 16 = 2 * kWaterImpulseCap.
+  //
+  //   row 0  (x, z, radius, strength)  world column, cells, Q8 flux at centre
+  //   row 1  (dirX, dirZ, 0, 0)        Q8 direction; (0,0) = RADIAL OUTWARD
+  //
+  // Read ONLY by sim_waterbody.wgsl's wbFlux, which is the single writer of
+  // every pipe word (§4.1) — an impulse is another term in the head it already
+  // integrates, not a second writer.
+  waterImpulseCount : u32,
+  padWi0 : u32,
+  padWi1 : u32,
+  padWi2 : u32,
+  waterImpulses : array<vec4<i32>, 16>,
 };
 
 // ---- WATER BODIES: the GPU-owned ledger's word map (M2/M3) -----------------
@@ -815,6 +843,123 @@ const WBS_SWEEPY    : u32 = 26u;
 const WB_SWEEP_LIVE : i32 = -0x7FFFFFFF;
 const WB_SWEEP_NONE : i32 = -0x40000001;
 
+// ============================================================================
+// W1 — THE RELEVEL BLOCK (docs/PLAN_water_relevel.md §3).
+//
+// The shave's mirror image. The shave only ever moves a body's surface DOWN,
+// uniformly, because a drain is a global potential with one number behind it.
+// Relevel moves individual COLUMNS toward the body's own mean surface, which
+// is the operation the reach-1 CA provably cannot perform: its equalize branch
+// fires at a 2-eighth difference, so a ramp of 1 eighth per 2 cells is a stable
+// fixed point and a 5-voxel cone over an 80-cell radius is PERMANENT.
+//
+// `RV`, NOT `R`. WBS_RSUM (word 12) is the adoption/re-audit reduce's running
+// eighth sum and it is live whenever a dug basin re-measures — which is exactly
+// when a body is also relevelling. Two accumulators sharing a word is one pass
+// zeroing the other's tally on the tick it mattered.
+//
+// THE CADENCE IS THE SHAVE'S, one pass further out (plan §3.3, "never read a
+// tally in the pass that writes it"): `wbSurface` fills RVCOUNT/RVSUM and the
+// histogram at the END of this tick's row block, `wbLedger` turns them into
+// cutoffs at the START of the next one, `wbRelevel` spends the cutoffs and
+// reports what it actually moved, and the ledger banks that difference.
+const WBS_RVCOUNT   : u32 = 27u;  // columns the measure found a free surface in
+const WBS_RVSUM     : u32 = 28u;  // sum of their heights, in eighths (8y + full)
+// Published by the ledger from LAST tick's measure, read by the apply.
+const WBS_RVMEAN    : u32 = 29u;  // floor(RVSUM / RVCOUNT), eighths
+// The give/take cutoffs, published exactly as the shave publishes STEPS/FRAC:
+// a whole-bucket threshold plus a dither numerator for the partial bucket at
+// the boundary. A column at the cutoff acts iff
+// `hash3(seed, tick, worldColumnKey) % h[cut] < frac` — the key is the WORLD
+// column, never a chunk-list index, because a list reorders and an index used
+// as an IDENTITY must be the stable one.
+const WBS_RVTAKECUT : u32 = 30u;  // s <  cut takes; s == cut takes on the dither
+const WBS_RVTAKEFRAC : u32 = 31u;
+const WBS_RVGIVECUT : u32 = 32u;  // s >  cut gives; s == cut gives on the dither
+const WBS_RVGIVEFRAC : u32 = 33u;
+// THIS tick's apply report, cleared by the ledger that reads it. Debit what was
+// GRANTED, never what was demanded — the master plan's §3.2, and the reason
+// these are atomics the apply increments rather than the ledger's prediction.
+const WBS_RVGIVEN   : u32 = 34u;
+const WBS_RVTAKEN   : u32 = 35u;
+// THE CREDIT, and it is a STORED field for the reason WBS_DEBIT is: a
+// conservation gate that has to infer a term cannot attribute a failure.
+// `credit += GIVEN - TAKEN` each tick. It may go NEGATIVE — the histogram the
+// cutoffs came from is one tick old, so a take can outrun its gives by a
+// bounded amount. That is water borrowed from the body against next tick's
+// gives, not water invented: while `credit < 0` the ledger publishes NO take
+// cutoff and the gives pay it back first.
+const WBS_RVCREDIT  : u32 = 36u;
+// Attribution: eighths the cutoffs asked for that no cell could hold (a give
+// column whose top cell was thinner than k, a take column whose cell above was
+// not air). Recorded, never asserted — CLAUDE.md rule 6's "a bare count is not
+// a measurement", built in before it is needed.
+const WBS_RVCAPPED  : u32 = 37u;
+// THE HISTOGRAM'S OWN ORIGIN, in eighths, published by the measure that filled
+// it. Not re-derived by the ledger from WBS_LEVEL, and that is not caution: the
+// ledger consumes a histogram written LAST tick and may itself lower the level
+// this tick, so a re-derived base would read every bucket eight slots out on
+// exactly the ticks a lake is draining and relevelling at once.
+const WBS_RVBASE    : u32 = 38u;
+// CUMULATIVE totals, never cleared. RVGIVEN/RVTAKEN are a per-TICK report and
+// the ledger zeroes them as it banks them, so a gate reading the ledger at the
+// end of a window sees whatever the last tick happened to move — which is
+// almost always nothing, and reads exactly like a relevel that never ran. That
+// cost a run: "given 0 / taken 0, credit -1" over ninety ticks was the whole of
+// the evidence, and it could not tell "the cutoffs asked for nothing" from "the
+// apply refused". CLAUDE.md rule 6 — record at the point of the fact.
+const WBS_RVGIVENT  : u32 = 39u;
+const WBS_RVTAKENT  : u32 = 40u;
+// ============================================================================
+// W-D — THE MEASURED SURFACE AREA (docs/PLAN_water_relevel.md §8.4).
+//
+// Filled by `wbReduce` on the single tick a body spends in WB_MEASURING: the
+// number of FREE-SURFACE cells of the body's own material it found (a cell of
+// ours with something that is not ours directly above). Read once, by the
+// ledger's adoption branch, as discovery's size gate.
+//
+// It is a MEASUREMENT and WBS_AREA is not, which is the whole reason it exists
+// as its own word. WBS_AREA at adoption is `seedArea` — the CPU's ANALYTIC
+// prediction — and for a discovered probe that number is the area of a
+// fabricated cylinder the CPU drew around some evidence. Gating adoption on it
+// would be the candidate's own guess deciding whether the candidate is real.
+// The reduce already visits every cell of the footprint; counting free surfaces
+// on the way costs one extra read per COLUMN (the walk goes downward, so the
+// previously read word IS the cell above) and nothing per cell.
+const WBS_RAREA     : u32 = 41u;
+// ============================================================================
+// W2 — THE SURFACE-MOMENTUM SLEEP (docs/PLAN_water_relevel.md §4.3).
+//
+// The PIPES are not here: they are per COLUMN and live in `waterFlux`, a
+// binding of its own (world.h kWaterFluxWords). What is here is the four words
+// the per-body SLEEP needs, because sleep is a statement about a BODY and the
+// ledger is the one thread per body this subsystem has.
+//
+// THE CADENCE IS THE SHAVE'S AGAIN. `wbFlux` reports into WVMAX/WVSUM in the
+// middle of the row block; `wbLedger` reads them at the START of the next one
+// and clears them. Never read a tally in the pass that writes it.
+const WBS_WVMAX     : u32 = 42u;  // this tick's max |q| over the body, Q8
+const WBS_WVSUM     : u32 = 43u;  // this tick's sum |q| over the body, Q8
+// Consecutive ticks the body has been BOTH still (WVMAX under waveSleepEps) and
+// FLAT (the measured surface inside one eighth). Both halves are needed: still
+// alone would sleep a crater that has not started moving yet, and flat alone
+// would sleep a ring passing through its own mean.
+const WBS_WVCALM    : u32 = 44u;
+// PUBLISHED: 1 = flux asleep. One load, and both W2 passes return on it — which
+// is what makes a settled lake inside its hot window cost nothing at all.
+const WBS_WVASLEEP  : u32 = 45u;
+// "Nothing on this side." Deliberately outside any legal eighth height, and on
+// the side that makes the apply's comparison false for every column: no take
+// below a cutoff of -0x40000000, no give above a cutoff of +0x40000000.
+const WB_RV_NOTAKE  : i32 = -0x40000000;
+const WB_RV_NOGIVE  : i32 = 0x40000000;
+// The histogram block's base for body `b`. WATER_RELEVEL_HIST_BASE and
+// WATER_RELEVEL_BUCKETS are GENERATED from world.h (kWaterRelevelHistBase),
+// like every other layout constant in this file.
+fn wbHistBase(b : u32) -> u32 {
+  return WATER_RELEVEL_HIST_BASE + b * WATER_RELEVEL_BUCKETS;
+}
+
 // The ladder, GPU side. Candidate -> Measuring -> Adopted, and Releasing is the
 // way out. Measuring is its own state rather than a flag because the reduce is
 // a WHOLE-FOOTPRINT pass and must run exactly once per adoption: a body that
@@ -824,6 +969,15 @@ const WB_CANDIDATE : i32 = 0;
 const WB_MEASURING : i32 = 1;
 const WB_ADOPTED   : i32 = 2;
 const WB_RELEASING : i32 = 3;
+// W-D: THE STICKY REFUSAL (§8.4). A discovered probe the GPU measured and did
+// not believe in. It is a STATE rather than a return to WB_CANDIDATE, and the
+// difference is the whole idle-cost argument: a candidate counts quiet ticks,
+// re-arms the reduce and runs ONE WHOLE-FOOTPRINT PASS over its disc every
+// `sim.waterBodyQuietTicks`, forever, for a puddle. A refused body reads three
+// words and returns. It leaves this state only when the CPU marks the entry
+// dirty with NEW EVIDENCE (WBF_REPROBE) — which is on the tick input stream, so
+// the tick it re-measures on is deterministic too.
+const WB_REFUSED   : i32 = 4;
 
 // CPU-sent per-body flags (TickParams.waterBodies row 1, word 3).
 const WBF_PROPOSE : i32 = 1;   // the CPU's deterministic tests all passed
@@ -849,6 +1003,20 @@ const WBF_CHILD : i32 = 16;
 // tell that apart from a leak.
 const WBF_PARENT_SHIFT : u32 = 8u;
 const WBF_PARENT_MASK  : i32 = 255;
+// W-D: this body is a DISCOVERED PROBE, not an authored basin. Two things hang
+// off it and nothing else does: the size gate (§8.4) applies, and a failed
+// measurement parks the body in WB_REFUSED instead of returning it to
+// WB_CANDIDATE. Zero for every body M1-W1 ever proposed, which is what makes
+// `sim.waterDiscoverMinEighths = 0` an exact identity — no discovered entry
+// exists, so no descriptor carries this bit and no branch below it is reachable.
+const WBF_DISCOVER : i32 = 32;
+// W-D: NEW EVIDENCE LANDED IN THIS PROBE THIS TICK. Sent on exactly ONE tick —
+// the tick the CPU's evidence accounting grew or re-dirtied the entry — and it
+// is what lifts WB_REFUSED. A latch held for several ticks would return the
+// body to WB_CANDIDATE on every one of them and it could never accumulate the
+// quiet ticks adoption needs, so the one-tick pulse is load-bearing rather than
+// tidy.
+const WBF_REPROBE : i32 = 64;
 // "No split found." atomicMax's identity, and deliberately far below any legal
 // world Y so the first disconnected level found always wins.
 const WB_SPLIT_NONE : i32 = -0x40000000;
@@ -3107,7 +3275,17 @@ fn fpPack(mat : u32, fullness : u32, stainType : u32, stainAmt : u32) -> u32 {
 const FP_EXCITED : u32 = 1u << 22u;
 fn fpExcited(attr : u32) -> bool { return (attr & FP_EXCITED) != 0u; }
 
-// ---- fluidArgsStage word map (32 u32) --------------------------------------
+// ---- fluidArgsStage word map (40 u32 — world.h kFluidArgsWords) ------------
+// THIS COMMENT IS THE OCCUPANCY LEDGER FOR THE WHOLE MAP, including the words
+// whose `const` lives in the one shader that writes them (a const added here
+// re-keys the SPIR-V cache for EVERY shader in the engine and pays the worldgen
+// far-compile cliff, so a word only one kernel touches is declared next to its
+// consumer). Claim a word by adding its row here FIRST. The map read "[27..31]
+// spare" for a while after 27, 29, 30 and 31 had owners.
+//
+// THE MAP IS NOW FULL: 0..39, no spares. The next counter needs
+// kFluidArgsWords raised in world.h (which recompiles the engine), not a
+// hopeful subscript.
 // [0..3]  node-pass dispatch args + active block count (alloc, per substep)
 // [4..6]  per-particle-pass dispatch args ((live+63)/64, 1, 1) — written by
 //         the seam's excite scan once per tick, copied to the indirect buffer
@@ -3143,7 +3321,29 @@ fn fpExcited(attr : u32) -> bool { return (attr & FP_EXCITED) != 0u; }
 // [26]    settle blocks refused as excite-UNSTABLE this tick (the resulting
 //         configuration would immediately satisfy an excite trigger). Split
 //         from [25] because the two are opposite diagnoses.
-// [27..31] spare
+// [27]    FA_EXSEEN     settled seam-liquid cells exciteDetect looked at
+// [28]    FA_EXCANDID   of those, the ones that satisfied a trigger
+// [29]    FA_SPAWNDEAD  dead (mat 0) spawn ops this tick
+// [30]    FA_SETCEIL    ) sim_fluid_seam.wgsl — settle's two refusal sites,
+// [31]    FA_SETFLOOR   ) counted as COLUMNS on the feasibility pass
+// [32]    FA_FORCED     ) sim_fluid_seam.wgsl — the force-settle backstop:
+// [33]    FA_SEALED     ) blocks it got out / blocks still sealed
+//
+// ---- [34..39] THE MASS BOOKS: CUMULATIVE, the per-tick clear skips them -----
+// Everything above is one tick. These are totals, so a gate can read them
+// before and after a window and ask whether as much mass went in as came out.
+// [34]    FA_KILLHARD   sim_fluid.wgsl — eighths g2p DESTROYED inside hard
+//                       solid. The only unaccounted death left in the engine,
+//                       and a conservation identity must add it back.
+// [35]    FA_SETTLEKILL sim_fluid_seam.wgsl — eighths that died legitimately
+//                       (settleCommit had already written them to voxels)
+// [36]    FA_EXCITEDCUM sim_fluid_seam.wgsl — cumulative mirror of FA_EXCITED
+// [37]    FA_CALMSUBM   sim_fluid.wgsl — eighths g2p CALMED inside submerged
+//                       liquid. An EVENT count (re-counted every tick a
+//                       particle stays under), never a mass term: calming is
+//                       not a transfer, so it is on neither side of the books.
+// [38]    FA_SPAWNLIVE  sim_fluid_seam.wgsl — cumulative live spawn ops
+// [39]    FA_SETWROTE   sim_fluid_seam.wgsl — cumulative net eighths settled
 const FA_LIVE      : u32 = 7u;
 const FA_DEAD      : u32 = 8u;
 const FA_EMITTED   : u32 = 9u;

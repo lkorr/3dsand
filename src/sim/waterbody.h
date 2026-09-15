@@ -127,6 +127,15 @@ constexpr uint32_t kWaterDrainHotTicks = 900;
 // declared chunks. See BuildGpu.
 constexpr uint32_t kWaterDrainSettleTicks = 64;
 
+// Ticks a W3 IMPULSE keeps a governed body's footprint declared to the page
+// table (PLAN_water_relevel.md §5). Its own number rather than the drain's
+// because the two events have different lifetimes: a dig starts a discharge
+// that runs for minutes, a splash starts a ring that pass S measured asleep
+// after 112 ticks. 240 is eight seconds — twice the measured life of a ring,
+// and a thirtieth of what a swimmer would otherwise cost a lake every time
+// they crossed it.
+constexpr uint32_t kWaterImpulseHotTicks = 240;
+
 // How a basin's floor is shaped. Two kinds cover every body worldgen makes,
 // and both are closed forms; a third kind is what component 10's union-find
 // sweep will produce for dug terrain.
@@ -294,6 +303,88 @@ struct WaterBodyHole {
   uint32_t tick = 0;   // the tick the mutation arrived on
 };
 
+// ============================================================================
+// W-D — DISCOVERY: a body the PLAYER made (docs/PLAN_water_relevel.md §8).
+//
+// M1's registry knows two kinds of container and both are closed forms of
+// (seed, tuning). A basin the player DUG and FILLED is neither, so until now it
+// stayed CA forever — §6's old first exclusion, lifted by owner decision on
+// 2026-09-14 because the thing the owner actually wants ("blow a hole, watch it
+// settle") should work on a pool they made.
+//
+// THE CONSTRAINT THAT SHAPES ALL OF IT (§8.2). The CPU may not look at voxels:
+// the mirror is 3x3x3 and a readback on the frame path puts fence retirement in
+// a voxel write's control path, which is this file's header note from M1. So
+// discovery takes the SAME authority split M2 took:
+//
+//   * The CPU PROPOSES from the tick stream only. Every liquid-placing brush
+//     op and cell op rides the MutationQueue, so "how many eighths of which
+//     liquid were placed, where" is an EXACT function of the tick's op list.
+//     A replay reproduces it; the twice-run gate compares it by construction.
+//   * The GPU DISPOSES. The existing WB_MEASURING reduce measures the real
+//     water and the ledger adopts or parks the probe in WB_REFUSED. The CPU
+//     never learns the verdict and does not need to — a refused probe's
+//     steady-state cost is four ledger loads a tick.
+//
+// The evidence is therefore a HEURISTIC and is allowed to be wrong in both
+// directions. It over-counts (a `kCellOpIfAir` op the grid refused still
+// counts; the CPU cannot know) and it under-counts (water that ran laterally
+// out of every probe disc is missed, §8.3's stated v1 limit — that water stays
+// CA, which is today's behaviour and not a regression). Neither costs an
+// eighth: evidence decides only whether a DISC IS PROPOSED.
+//
+// WHY THE REGISTRY IS SAVED AND NOTHING ELSE HERE IS. Every other record in
+// this file is derived data — reconstructible from (seed, window, voxels),
+// disposable, never saved. A discovered entry is not: it is the residue of
+// player action, so it is AUTHORED-EQUIVALENT TRUTH in guideline #3's sense and
+// it goes in the world save (the 'WTRB' section, src/game/persist.cpp). What is
+// saved is only the disc and its evidence total — the ledger, the curve and the
+// level stay derived, and the GPU re-adopts a restored entry by re-measuring
+// the restored voxels exactly as it adopted it the first time.
+// ============================================================================
+
+// ONE PROBE DISC. A few integers, which is the whole of what discovery stores.
+struct WaterDiscovered {
+  // kWaterDiscoverIdBase | slot. Assigned from a FREE-SLOT search rather than
+  // from the position in the vector, because a basin id is an IDENTITY (the
+  // hole hints, the curve-dirty latch and the carried GPU ledger slot are all
+  // keyed by it) and evicting a neighbour must not renumber anybody.
+  uint32_t basinId = 0;
+  int cx = 0, cz = 0;            // disc centre, world cells
+  int radius = 0;                // bounding circle of the evidence + pad
+  int floorY = 0;                // lowest evidence Y - kWaterDiscoverFloorPad
+  int topY = 0;                  // highest evidence Y; seeds the fill level
+  uint32_t matId = 0;            // the liquid the evidence was made of
+  // Cumulative eighths of that liquid placed inside this disc. The eviction
+  // key, and the only thing that ranks one probe against another.
+  uint64_t evidenceEighths = 0;
+  uint32_t lastEvidenceTick = 0;
+  // THE ONE TICK WBF_REPROBE IS SENT. Not a latch: a probe re-enters the ladder
+  // from WB_REFUSED on the tick the flag arrives, and a flag held for several
+  // ticks would reset it to WB_CANDIDATE on every one of them so it could never
+  // accumulate the quiet ticks adoption needs. 0xFFFFFFFF = never.
+  uint32_t reprobeTick = 0xFFFFFFFFu;
+  // Non-zero once the entry has lost the cap and is on its way out: proposed
+  // with WBF_RELEASE until this tick, then dropped. NEVER drop a descriptor
+  // cold — the slot would be reused against a ledger carrying the old body's
+  // state, which is the carried-descriptor bug class the drain pass documents.
+  uint32_t releaseUntil = 0;
+};
+
+// ONE COARSE EVIDENCE CELL: kWaterEvidenceGrid voxels square, per liquid
+// material. The accumulator the threshold is crossed in, and it is deliberately
+// NOT per-voxel: a set keyed by cell is O(pond) to grow and O(1) to test, and
+// the disc a cluster of them bounds is the only geometry discovery ever needs.
+struct WaterEvidenceCell {
+  int gx = 0, gz = 0;            // floor-divided grid coords
+  uint32_t matId = 0;
+  uint64_t eighths = 0;
+  // The exact voxel AABB the evidence landed in, so the bounding circle is the
+  // circle around the WATER and not around the grid.
+  int loX = 0, hiX = 0, loZ = 0, hiZ = 0, loY = 0, hiY = 0;
+  uint32_t lastTick = 0;
+};
+
 // ---- component 2, the analytic half ---------------------------------------
 //
 // THE CONTAINER CURVE: cell count at each height, its prefix sum, and a binary
@@ -400,6 +491,42 @@ struct WaterBodyGpu {
   // with no hole in it. That is rule 2 with the sign flipped: cost that scales
   // with the world containing a lake rather than with anything happening to it.
   bool drainArmed = false;
+  // ---- W3: THE IMPULSE BLOCK (PLAN_water_relevel.md §5) ------------------
+  //
+  // <= kWaterImpulseCap records x kWaterImpulseWords i32, copied straight into
+  // TickParams::waterImpulses. Resolved from the pending queue by Tick(), which
+  // also CLEARS the queue: an impulse is one tick's push and nothing about it
+  // persists, so a caller that stops pushing stops disturbing the water with no
+  // expiry rule to get wrong.
+  //
+  // Empty is the shipping state and an exact identity — wbFlux's loop runs zero
+  // times — which is what makes each of §5's three knobs an identity at 0: at 0
+  // the emitter refuses to build the record in the first place.
+  std::vector<int32_t> impulses;
+  uint32_t impulseCount = 0;
+};
+
+// ---- W3: one impulse, the CPU's form (PLAN_water_relevel.md §5) ------------
+//
+// ONE record for the blast AND the swimmer, because they are the same
+// statement: "at this column, for one tick, push the surface this way this
+// hard". Two record types would be two things to keep in step for no gain.
+//
+// `strength` is Q8 pipe flux — the unit `waterFlux`'s pipes already carry — so
+// nothing in the kernel has to convert anything and no float reaches the sim.
+// The falloff is linear to zero at `radius`, computed GPU-side from the column's
+// own distance, so a record is six integers and not a field.
+//
+// `dir` (Q8) is the direction the push points. (0,0) means RADIAL OUTWARD from
+// the centre, which is what a blast is; anything else is a directional shove,
+// which is what a wake is. The emitters below never build a (0,0) directional
+// record — a swimmer whose velocity rounds to zero in Q8 is not moving and gets
+// no record at all — so the overload is never ambiguous.
+struct WaterImpulse {
+  int32_t x = 0, z = 0;       // world column
+  int32_t radius = 0;         // world cells; <= 0 is refused
+  int32_t strength = 0;       // Q8 flux at the centre; <= 0 is refused
+  int32_t dirX = 0, dirZ = 0; // Q8 direction, (0,0) = radial outward
 };
 
 // ---- the system ------------------------------------------------------------
@@ -436,8 +563,75 @@ class WaterBodySystem {
   // 8's drain seeder reads — see WaterBodyHole above. Defaulted so a caller
   // that has no cell to offer still compiles into the M3 behaviour exactly.
   void Tick(const World& world, uint32_t seed, uint32_t tick, int mode,
-            int testDrain, int drainMax, bool worldEdited,
+            int testDrain, int drainMax, int relevelMax, bool worldEdited,
             IVec3 editCell = IVec3{0, 0, 0});
+
+  // ---- W-D: EVIDENCE ACCOUNTING (§8.2/§8.3) ------------------------------
+  //
+  // Called once per tick from SubmitTick — the ONE function the game frame loop,
+  // every gate and both smoke harnesses hand their op lists to — BEFORE Tick()
+  // below, so a threshold crossed by this tick's ops raises a probe on this
+  // tick. That call site is the whole determinism argument in one sentence: the
+  // player's brush arrives as `ops`, a gate's CellOps and every in-game system
+  // that writes a voxel (mobs, debris, prefabs, tree felling, spells, the world
+  // edit layer) arrive as `cells`, and there is no other door into the
+  // MutationQueue. Nothing here reads a voxel, a snapshot or a clock.
+  //
+  // `mode` is sim.waterBodyMode and `minEighths` is sim.waterDiscoverMinEighths;
+  // either at 0 is an immediate return that touches nothing, which is what makes
+  // the off switch an exact identity rather than merely a cheap path.
+  //
+  // A CELL OP carries a SLOT-linear index, so `world` is needed to turn it back
+  // into a world cell (SlotToWorldChunk — a slot index is a memory address, not
+  // an identity, and reading it as one would put the evidence in another
+  // chunk's pond).
+  void NoteMutations(const World& world, uint32_t tick, int mode,
+                     int minEighths, const CellOp* cells, uint32_t cellCount,
+                     const BrushOp* ops, uint32_t opCount);
+
+  // ---- W3: THE IMPULSE DOOR (§5) ----------------------------------------
+  //
+  // Queue one impulse for the NEXT Tick(). Returns false — and changes nothing
+  // — when the queue is full or the record is degenerate (non-positive radius
+  // or strength): budgets are charged BEFORE emission (CLAUDE.md rule 2), so a
+  // caller learns its splash did not happen rather than silently displacing
+  // someone else's.
+  //
+  // DETERMINISTIC BY CONSTRUCTION, in WindPrimSystem::Spawn's exact sense: the
+  // contents are a pure function of the ops and the tick, the order is insertion
+  // order, and there is no expiry to get wrong because Tick() consumes the whole
+  // queue. What it is NOT is a place to put anything derived from a readback or
+  // a wall clock — an impulse decides voxel writes, so it is tick-stream state
+  // and the twice-run comparison covers it.
+  bool SpawnImpulse(const WaterImpulse& im);
+  // The queue as it stands, before Tick() consumes it. For the gate and the
+  // overlay; "the wake did nothing" and "the wake was never queued" are
+  // different bugs (CLAUDE.md rule 6).
+  const std::vector<WaterImpulse>& PendingImpulses() const { return pendingImp_; }
+  uint32_t ImpulsesRefused() const { return impRefused_; }
+
+  const std::vector<WaterDiscovered>& Discovered() const { return discovered_; }
+  // Evidence cells currently tracked. For the overlay and the gate: "no body
+  // appeared" with no reason attached is the bare count rule 6 warns about.
+  const std::vector<WaterEvidenceCell>& Evidence() const { return evidence_; }
+  // Probes the cap made room for by evicting, cumulative. Reported, not
+  // asserted.
+  uint32_t DiscoverEvictions() const { return discoverEvictions_; }
+
+  // ---- W-D: PERSISTENCE ('WTRB', src/game/persist.cpp) -------------------
+  //
+  // The probe registry is the one thing in this file that is NOT derivable from
+  // (seed, window, voxels), so it is the one thing that is saved. Restored
+  // entries are re-proposed on the next tick and the GPU re-adopts them by
+  // re-measuring the voxels the chunk store brought back — no ledger, level,
+  // curve or adoption verdict crosses the save boundary, because all of those
+  // are descriptions of a world that the loader has just replaced.
+  static constexpr uint32_t kSaveVersion = 1;
+  void SaveState(std::vector<uint8_t>& out) const;
+  bool LoadState(const uint8_t* data, size_t len, uint32_t version);
+  // Runs on EVERY load, section present or not: an older save without a 'WTRB'
+  // block must not inherit the previous world's probes.
+  void ClearDiscovered();
 
   // The live hole hint for a basin, or an invalid record. Expires with the same
   // hot window the drain latch uses, so a swirl cannot outlive the dig that
@@ -490,10 +684,28 @@ class WaterBodySystem {
   const WaterBasin* Basin(uint32_t basinId) const;
   const WaterBasinCurve* Curve(uint32_t basinId) const;
 
+  // The discovered entry for a basin id, or nullptr. For the gate and overlay.
+  const WaterDiscovered* DiscoveredFor(uint32_t basinId) const;
+
  private:
   void Relabel(const World& world);
   void Classify(const World& world, uint32_t tick);
-  void BuildGpu(uint32_t tick, int testDrain, int drainMax);
+  void BuildGpu(uint32_t tick, int testDrain, int drainMax, int relevelMax);
+  // W-D: fold one liquid placement into the evidence grid. Returns the cell it
+  // landed in, creating or evicting as the cap requires.
+  void AddEvidence(uint32_t matId, int x, int y, int z, uint64_t eighths,
+                   uint32_t tick);
+  // W-D: scan the evidence clusters and raise / grow probe discs. Pure function
+  // of (evidence_, discovered_, basins_, window, tick, threshold), and run only
+  // on ticks where one of the first two moved — so a world nobody is pouring
+  // into pays one boolean test.
+  void PromoteEvidence(const World& world, uint32_t tick, int minEighths);
+  // W-D: the free slot a new probe takes, or kWaterDiscoveredCap if the registry
+  // is full of live entries.
+  uint32_t FreeDiscoverSlot() const;
+  // W3: resolve the pending queue into gpu_.impulses and clear it. Called from
+  // Tick() after BuildGpu, so a caller cannot forget it and cannot run it twice.
+  void BuildImpulses();
 
   std::vector<WaterBasin> basins_;
   std::vector<WaterBasinCurve> curves_;   // parallel to basins_
@@ -545,7 +757,59 @@ class WaterBodySystem {
   // which is exactly what M2 moved onto the GPU. See PLAN_water_master.md
   // §1.3's open items.
   uint32_t drainHotUntil_ = 0;
+  // ---- W-D ----------------------------------------------------------------
+  std::vector<WaterDiscovered> discovered_;
+  std::vector<WaterEvidenceCell> evidence_;
+  // WHY A GENERATION COUNTER AND NOT A REBUILD EVERY TICK. `basins_` is rebuilt
+  // only when the window or the seed moves, because labelling is
+  // O(basins x footprint chunks) and paying it per tick would be rule 2 with the
+  // sign flipped. A probe raised mid-run has to get into `basins_` all the same,
+  // so it bumps this and Tick() treats it exactly like a window move. Discovery
+  // events are rare by construction (a threshold crossing, an eviction, a
+  // release expiry), so this is the cheap half of the trade and not a loophole
+  // in it.
+  uint32_t discoveredGen_ = 0;
+  uint32_t builtDiscoveredGen_ = 0xFFFFFFFFu;
+  // Set when the evidence or the registry moved; cleared by PromoteEvidence.
+  // The clustering scan is O(cells^2) at kWaterEvidenceCap = 192, which is
+  // nothing on the ticks it runs and would be a standing cost on the ticks it
+  // does not.
+  bool evidenceDirty_ = false;
+  uint32_t discoverEvictions_ = 0;
+  // ---- W3 (§5) ------------------------------------------------------------
+  // Queued this tick, consumed and cleared by Tick(). Insertion order, no
+  // expiry, no persistence: a disturbance is one tick's push.
+  // `pendingImp_` takes this tick's arrivals; `armedImp_` is what Tick() ships
+  // — LAST tick's, because an impulse is spent against the column heights the
+  // previous tick measured (see BuildImpulses). One tick latent, and a record
+  // is shipped exactly once.
+  std::vector<WaterImpulse> pendingImp_;
+  std::vector<WaterImpulse> armedImp_;
+  uint32_t impRefused_ = 0;
 };
+
+// ---- W3: the two EMITTERS, so the conversion lives in ONE place -----------
+//
+// Both turn a game-side event into the WaterImpulse above, and both are here
+// rather than at their call sites for the reason every "two places must agree"
+// note in this repo gives: the blast is emitted from SubmitTick (which sees
+// every explosion in the engine, game and harness alike) and the wake from the
+// player and mob updates, and a gate that built its own record by hand would be
+// testing arithmetic the game does not run.
+//
+// `knob` is sim.waveBlastImpulse / sim.waveSwimWake. At 0 both return false
+// having queued nothing, which is the documented identity: no record means
+// `waterImpulseCount` stays 0 and `wbFlux` is bit-identical.
+bool WaterBodyNoteBlast(WaterBodySystem& wb, const ExplosionOp& e, int knob);
+// `velVoxPerTick` is the swimmer's horizontal velocity in VOXELS PER TICK, and
+// `submersion` is the 0..1 fraction of the body under the surface that
+// player.cpp already computes for drag and thrust. Below a quarter submerged
+// there is no wake: a wader's ankles are not a swimmer.
+//
+// The float->integer transcription happens HERE, on the CPU, exactly as
+// WindPrimAim's does — the sim never sees an f32 (rule 1).
+bool WaterBodyNoteSwimmer(WaterBodySystem& wb, int cellX, int cellZ,
+                          float velX, float velZ, float submersion, int knob);
 
 // THE live system, a global for exactly the reason WindPrims() is one: it has
 // to reach the frame loop, every selftest gate and both smoke harnesses, and
