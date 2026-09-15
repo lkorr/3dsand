@@ -509,6 +509,16 @@ bool LoadMobDefs(const std::string& dir, const std::vector<MaterialDef>& mats,
           def.woundMat = (uint32_t)wid;
       }
       if (def.woundMat == 0) def.woundMat = def.bleedMat;
+      // DOES THE CUT CLOSE? Default true (living flesh); false is the undead
+      // setting and restores the pre-2026-09-14 behaviour for this creature
+      // alone — its wounds go on drying to air, widening, and shedding parts.
+      // See MobDef::woundHeals.
+      if (j["bleed"].contains("woundHeals")) {
+        if (j["bleed"]["woundHeals"].is_boolean())
+          def.woundHeals = j["bleed"]["woundHeals"].get<bool>();
+        else
+          log += jp + ": bleed.woundHeals: expected true or false\n";
+      }
       // Tissue = crumbles to this creature's blood (see MobDef::tissue).
       if (def.bleedMat != 0) {
         def.tissue.assign(mats.size(), 0);
@@ -6118,6 +6128,19 @@ uint32_t Mob::StainWound(int limbIndex, Vec3 centreLocal, float radiusWorld,
   }
 
   uint32_t stained = 0;
+  // ---- REMEMBER WHAT THE BLOOD IS COVERING (MobLimb::woundWas) ------------
+  // Only when this creature's wounds close: an undead body wants the soak to
+  // dry to air and take the limb with it, and recording for it would cost the
+  // table for nothing. Appended unsorted here and sorted once at the end of
+  // the pass, which is what the revive lookup binary-searches.
+  const bool remember = WoundsHeal();
+  const size_t wasBefore = limb.woundWas.size();
+  auto rememberVox = [&](int x, int y, int z, uint16_t wordWas,
+                         uint8_t colorWas) {
+    if (!remember || limb.woundWas.size() >= kWoundWasMax) return;
+    limb.woundWas.push_back({(int16_t)x, (int16_t)y, (int16_t)z, wordWas,
+                             colorWas});
+  };
   // ONE PASS over the authoritative lattice, on a hit tick only. That is the
   // same bound the spall pass carries and it is the honest one: the question
   // "which of my voxels are near the cut" can only be answered by whoever owns
@@ -6184,6 +6207,7 @@ uint32_t Mob::StainWound(int limbIndex, Vec3 centreLocal, float radiusWorld,
     for (PrefabVoxel& v : limb.skinVoxels)
       consider((float)v.x, (float)v.y, (float)v.z, (uint32_t)(v.material & 0xFFFu),
                [&] {
+                 rememberVox(v.x, v.y, v.z, v.material, v.color);
                  v.material = (uint16_t)(stain & 0xFFFu);
                  // The art slot MUST go with it, for the reason
                  // BurnLimbView::Set spells out: a nonzero art colour
@@ -6200,6 +6224,7 @@ uint32_t Mob::StainWound(int limbIndex, Vec3 centreLocal, float radiusWorld,
     for (DebrisVoxel& v : limb.voxels)
       consider((float)v.x, (float)v.y, (float)v.z, (uint32_t)(v.payload & 0xFFFu),
                [&] {
+                 rememberVox(v.x, v.y, v.z, v.payload, v.color);
                  v.payload = (uint16_t)(stain & 0xFFFu);
                  v.color = 0;
                  if (poke)
@@ -6207,6 +6232,28 @@ uint32_t Mob::StainWound(int limbIndex, Vec3 centreLocal, float radiusWorld,
                                  v.z, (uint8_t)(stain & 0xFFu), 0);
                });
   }
+  // The revive lookup binary-searches this, so it is sorted ONCE per hit
+  // rather than kept ordered per insertion. A cell can only be entered while
+  // it is not already the wound material, so a second cut through the same
+  // place cannot duplicate a key -- but the dedupe is kept anyway and keeps
+  // the FIRST (oldest, and therefore the true original) of any pair, because
+  // a table with two answers for one cell is a table that reverts a voxel to
+  // blood.
+  if (remember && limb.woundWas.size() != wasBefore) {
+    std::stable_sort(limb.woundWas.begin(), limb.woundWas.end(),
+                     [](const MobLimb::WoundWas& a, const MobLimb::WoundWas& b) {
+                       return WoundWasKey(a.x, a.y, a.z) <
+                              WoundWasKey(b.x, b.y, b.z);
+                     });
+    limb.woundWas.erase(
+        std::unique(limb.woundWas.begin(), limb.woundWas.end(),
+                    [](const MobLimb::WoundWas& a, const MobLimb::WoundWas& b) {
+                      return WoundWasKey(a.x, a.y, a.z) ==
+                             WoundWasKey(b.x, b.y, b.z);
+                    }),
+        limb.woundWas.end());
+  }
+
   // ---- THE SMEAR (2026-09-13) ---------------------------------------------
   // The rewrite above turns some flesh INTO blood. This lays blood OVER
   // everything the cut exposed -- bone included, which the rewrite refuses on
@@ -6704,7 +6751,46 @@ BurnLimbView Mob::ViewOf(MobLimb& limb) {
   v.carved = &limb.carved;
   v.flipbook = &limb.flipbookModel;
   v.burn = &limb.burn;
+  // ---- the wound revert (BurnLimbView's note) -----------------------------
+  // Armed only on a creature's OWN limbs, which is all this view is ever built
+  // for; a severed limb has become debris and gets DebrisSystem's view, with
+  // none of this set, so a part on the ground goes on rotting the way it
+  // always did. Off entirely for an undead def or with gore.woundHeals off,
+  // and then every line below is the old code path.
+  if (def.woundMat != 0 && WoundsHeal()) {
+    const auto& gt = CurrentTuning().gore;
+    v.woundMat = def.woundMat;
+    v.woundSlow = (uint32_t)std::lround(std::max(1.0f, gt.woundHealSlow));
+    v.revive = &Mob::ReviveWoundVoxel;
+    v.reviveCtx = &limb;
+  }
   return v;
+}
+
+bool Mob::WoundsHeal() const {
+  return def_ && def_->woundHeals && CurrentTuning().gore.woundHeals;
+}
+
+bool Mob::ReviveWoundVoxel(void* ctx, IVec3 p, uint32_t& word,
+                           uint32_t& color) {
+  MobLimb& limb = *(MobLimb*)ctx;
+  if (limb.woundWas.empty()) return false;
+  const uint64_t k = WoundWasKey(p.x, p.y, p.z);
+  const auto it = std::lower_bound(
+      limb.woundWas.begin(), limb.woundWas.end(), k,
+      [](const MobLimb::WoundWas& e, uint64_t key) {
+        return WoundWasKey(e.x, e.y, e.z) < key;
+      });
+  if (it == limb.woundWas.end() || WoundWasKey(it->x, it->y, it->z) != k)
+    return false;
+  word = it->word;
+  color = it->color;
+  // SPENT. A soak reverts once: if the blade comes back through the same cell
+  // StainWound records it again, as whatever it is by then. Leaving the entry
+  // would also make the table a ledger of everything the creature has ever
+  // been cut at, which is not a thing anyone needs and is unbounded.
+  limb.woundWas.erase(it);
+  return true;
 }
 
 // ---- HEAT ACROSS A JOINT ----------------------------------------------------
@@ -6984,6 +7070,18 @@ bool Mob::ReskinLimbMicro(MobLimb& limb, uint32_t skinScale,
     }
     limb.woundLocal = limb.woundLocal - d;
     limb.gushLocal = limb.gushLocal - d;
+    // AND WHAT THE BLOOD IS COVERING MOVES WITH THE LATTICE IT IS KEYED ON.
+    // The table is cell keys into the authoritative lattice, and this rebased
+    // that lattice. A shift not applied here would not be wrong so much as
+    // silently inert -- every remaining soak would stop matching and simply
+    // never revert, which is the old bug back for any limb that had been
+    // carved enough to make the brick's min corner move. Order is preserved
+    // by a uniform translation, so the sort still holds.
+    for (MobLimb::WoundWas& w : limb.woundWas) {
+      w.x = (int16_t)(w.x - shift.x);
+      w.y = (int16_t)(w.y - shift.y);
+      w.z = (int16_t)(w.z - shift.z);
+    }
   }
   return true;
 }
@@ -8546,6 +8644,30 @@ bool MobSystem::BurnOneLimb(BurnLimbView& v, uint32_t tick, uint32_t rngKey,
         MicroBodyPoke(*microSet_, (uint32_t)(*v.microModel), p.x, p.y, p.z,
                       (uint8_t)pm, 0);
     } else {
+      // ---- A WOUND DRIES BACK TO FLESH (BurnLimbView's wound note) --------
+      // Before anything leaves: if this voxel is a SOAK -- flesh StainWound
+      // rewrote to the creature's blood -- and the limb remembers what it
+      // covered, the decay puts that word back instead of taking the voxel.
+      // Blood's authored rule is `decay -> air`, written for a pool on the
+      // ground; inside a limb the same roll has to mean "the wound settles",
+      // not "the wound eats another voxel of the arm".
+      //
+      // Reached only for the body's own wound material, so a burning
+      // creature's ash, smoke and fire are untouched -- those are other
+      // materials and are not in the table. Null `revive` is the undead path,
+      // where the hole widening IS the feature.
+      if (v.woundMat && was == v.woundMat && v.revive) {
+        uint32_t backWord = 0, backColor = 0;
+        if (v.revive(v.reviveCtx, p, backWord, backColor)) {
+          v.SetWord(i, backWord, backColor);
+          if (v.carved && *v.carved && v.microModel && *v.microModel >= 0 &&
+              microSet_)
+            MicroBodyPoke(*microSet_, (uint32_t)(*v.microModel), p.x, p.y, p.z,
+                          (uint8_t)(backWord & 0xFFu), (uint8_t)backColor);
+          changed = true;
+          return;
+        }
+      }
       // Anything not solid LEAVES the body — ash falls off, smoke and fire
       // rise, air is just a hole — and non-air products land in the grid at
       // the voxel's own world cell, so burning matter visibly wastes away
@@ -8768,6 +8890,19 @@ bool MobSystem::BurnOneLimb(BurnLimbView& v, uint32_t tick, uint32_t rngKey,
       const ReactionGpu& r = reactions_[mg.reactOffset + ri];
       if (!ReactLightMatches(r, dayPhase_, /*seesSky=*/true)) continue;
       uint32_t chance = r.chance;
+      // ---- A WOUND SETTLES SLOWER THAN A PUDDLE EVAPORATES ------------------
+      // Blood's authored decay is a rate for a pool in the open (8 per-mille a
+      // tick, a ~3 s half-life), and that is the clock a cut was drying on
+      // because it is the same material. Meat that has bled over itself is
+      // not that, so a body divides it. DECAY rules only: nothing else blood
+      // might be authored to do gets quietly halved along with it. Floored at
+      // 1 for the reason the cross-limb scale below is -- a rule scaled to
+      // zero is "impossible", which is a different statement from "slow".
+      if (v.woundMat && m == v.woundMat && v.woundSlow > 1 &&
+          (r.packed & 3u) == kReactDecay) {
+        const uint32_t slowed = chance / v.woundSlow;
+        chance = slowed ? slowed : 1u;
+      }
       // ---- IS A SIBLING LIMB THE ONLY THING ARMING THIS RULE? --------------
       //
       // Decided ONCE, here, for every shape of rule, because the two shapes

@@ -3296,6 +3296,145 @@ Status GateBlastStain(Ctx& c, std::string& detail) {
   return ok ? Status::Pass : Status::Fail;
 }
 
+// ---------------------------------------------------------------------------
+// wound-heal: the blood dries back to flesh, it does not eat the limb
+// ---------------------------------------------------------------------------
+//
+// THE BUG THIS PINS. `StainWound` rewrites the flesh around a cut to the
+// creature's wound MATERIAL, and the body burn pass runs the ordinary authored
+// reaction table over a limb's lattice. Blood's rule in reactions.json is
+// `decay -> air` at 8 per-mille a tick, written so a pool on the ground dries
+// up and its chunk goes back to sleep (rule 2) -- and it applied, unchanged, to
+// blood INSIDE a limb. So one sword cut opened a hole that then ate itself
+// outward at a ~3 s half-life, and a creature standing still after a single
+// blow shed the limb with no further hits. Owner report, 2026-09-14: "those
+// blood voxels ... entirely evaporate revealing the below structure, which
+// causes limbs to fall off".
+//
+// TWO ARMS, because the claim is a DIFFERENCE and one arm cannot state it:
+//
+//   heal  (gore.woundHeals on)   the soak dries -- and the limb does not lose
+//                                a single voxel doing it.
+//   rot   (gore.woundHeals off)  the soak dries by LEAVING. This is the old
+//                                behaviour, it is the undead setting, and it
+//                                is also the gate's proof that the mechanism
+//                                under test ran at all: if the rot arm loses
+//                                nothing, the decay never fired in this
+//                                fixture and the heal arm's clean bill of
+//                                health is worth nothing (a fixture that
+//                                measures itself).
+//
+// THE LIMB HAS TO BE AWAKE, and saying so is half of what this gate records.
+// The body pass will not look at a limb with no burn index, and it is
+// `BuildBurnIndex` that notices a self-decaying material at all -- it seeds
+// the front from every self-active voxel and sets `alight` from that, which
+// is how a soak with no fire anywhere near it comes to be rolling a decay in
+// the first place. In the game the index is built by the drip's own splatter
+// replay and by the contact stain; in this CPU-only fixture on open ground,
+// with no pool to stand in and no burst that reaches the cut, neither happens
+// and the soak simply sits there (measured: 0 of 92 voxels moved in 600
+// ticks, both arms). So the gate builds the index through the existing test
+// entry point -- `IgniteLimb` with a count of ZERO, which lights nothing and
+// whose only effect is that index. Rule 2 is not being dodged: the wake is
+// real in the game, this fixture is just too quiet to produce it.
+Status GateWoundHeal(Ctx& c, std::string& detail) {
+  MobSystem& mobs = c.mobs;
+  IdCounterScope idScope(mobs);
+  if (!mobs.BurnTablesReady()) {
+    detail = "burn tables not loaded";
+    return Status::Fail;
+  }
+  PrepareWorld(c);
+  const Target t = ChooseTarget(mobs, FixtureSite(c.world, 360));
+  if (!t.valid()) {
+    detail = "no loaded mob def has a severable non-vital limb that bleeds";
+    return Status::Fail;
+  }
+  const uint32_t woundMat = mobs.Defs()[t.defIndex].woundMat;
+  if (!woundMat) {
+    detail = Format("%s has no wound material", t.defName.c_str());
+    return Status::Skip;
+  }
+
+  // Long enough for the soak to be most of the way gone in BOTH arms: at the
+  // authored 8 per-mille the half-life is ~87 ticks, at the healing arm's
+  // halved rate ~173, so 600 ticks leaves under a tenth either way. Short
+  // enough that the creature does not bleed out from the one cut.
+  constexpr int kTicks = 600;
+  const Tuning saved = CurrentTuning();
+
+  struct Arm {
+    uint32_t artCut = 0, artEnd = 0;    // limb voxels after the cut / at rest
+    uint32_t soakCut = 0, soakEnd = 0;  // wound-material voxels, same two ticks
+    bool attached = false, alive = false, cut = false;
+  };
+  auto run = [&](bool heals) -> Arm {
+    Tuning tun = saved;
+    tun.gore.woundHeals = heals;
+    SetCurrentTuning(tun);
+    Arm a;
+    IVec3 pchunk{};
+    const uint64_t id = SpawnTarget(c, t, 360, pchunk);
+    if (!id) return a;
+    const LimbAxis ax = MeasureLimb(mobs, id, t.limb);
+    std::vector<ParticleSpawn> spawns;
+    a.cut = CutOnce(mobs, c.world, id, t.limb, ax, ax.reach * 0.5f, 0.6f, 1.0f,
+                    0x5EA1u, spawns);
+    spawns.clear();
+    if (!mobs.LimbBody(id, t.limb)) return a;  // severed outright: no subject
+    a.artCut = mobs.LimbArtVoxelCount(id, t.limb);
+    a.soakCut = mobs.LimbMaterialCount(id, t.limb, woundMat);
+    // Count 0: nothing is set alight, the index is built, and the soak in it
+    // is what makes the limb `alight` (see the note above).
+    mobs.IgniteLimb(id, t.limb, 0, 0);
+    uint32_t tick = 50000;
+    for (int i = 0; i < kTicks && mobs.IsAlive(id); i++) {
+      std::vector<BrushOp> ops;
+      std::vector<CellOp> cellOps;
+      spawns.clear();
+      mobs.PreTick(tick++, c.world, ops, cellOps, spawns);
+      c.phys.Step(kTickDt);
+      mobs.PostStep();
+    }
+    a.alive = mobs.IsAlive(id);
+    a.attached = mobs.LimbBody(id, t.limb) != 0;
+    if (a.attached) {
+      a.artEnd = mobs.LimbArtVoxelCount(id, t.limb);
+      a.soakEnd = mobs.LimbMaterialCount(id, t.limb, woundMat);
+    }
+    return a;
+  };
+  const Arm heal = run(true);
+  const Arm rot = run(false);
+  SetCurrentTuning(saved);
+
+  // The fixture has to have produced a wound in both arms before any of the
+  // rest means anything.
+  const bool cutOk = heal.cut && rot.cut && heal.soakCut > 0 && rot.soakCut > 0;
+  // ...and the decay has to have RUN, or the heal arm proves nothing. The rot
+  // arm losing voxels is the evidence; it is the bug, reproduced on purpose.
+  const bool rotRan = rot.attached ? rot.artEnd < rot.artCut : true;
+  // THE CLAIM. The soak fades on a living body...
+  const bool healed = heal.attached && heal.soakEnd * 4 < heal.soakCut;
+  // ...and it fades by turning back into flesh, so not one voxel leaves.
+  const bool intact = heal.attached && heal.artEnd == heal.artCut;
+  const bool aliveOk = heal.alive;
+  const bool ok = cutOk && rotRan && healed && intact && aliveOk;
+  detail = Format(
+      "%s %s over %d ticks | heal: %u soaked -> %u, limb %u -> %u voxels "
+      "(%s, %s) | rot: %u soaked -> %u, limb %u -> %u voxels (%s) | "
+      "cut %s, decay ran %s",
+      t.defName.c_str(), t.limbName.c_str(), kTicks, heal.soakCut, heal.soakEnd,
+      heal.artCut, heal.artEnd, heal.attached ? "attached" : "SEVERED",
+      heal.alive ? "alive" : "DEAD", rot.soakCut, rot.soakEnd, rot.artCut,
+      rot.artEnd, rot.attached ? "attached" : "severed", cutOk ? "yes" : "NO",
+      rotRan ? "yes" : "NO");
+  mobs.Reset();
+  c.debris.Reset();
+  if (!rotRan) return Status::Skip;  // nothing to say: the pass never woke
+  return ok ? Status::Pass : Status::Fail;
+}
+
 const std::vector<Gate>& WoundGates() {
   static const std::vector<Gate> g = {
       {"wound-chip", "mob", {}, false, GateWoundChip, /*needsRender=*/false},
@@ -3311,6 +3450,7 @@ const std::vector<Gate>& WoundGates() {
       {"body-stain", "mob", {}, false, GateBodyStain, false},
       {"body-coat", "mob", {}, false, GateBodyCoat, false},
       {"blast-stain", "mob", {}, false, GateBlastStain, false},
+      {"wound-heal", "mob", {}, false, GateWoundHeal, false},
       {"corpse-burn", "mob", {}, false, GateCorpseBurn, false},
   };
   return g;

@@ -374,6 +374,68 @@ function run(W, D, root, errs){
   check('no unattributed GPU time', un.ns === 0,
         un.ns ? (un.names.join(', ')) : '');
 
+  // ---- the two-column split ----
+  //
+  // GPU down the left, CPU down the right. This is the layout's whole claim, so
+  // it is asserted as GEOMETRY rather than as "the class is present": a grid
+  // that silently collapsed to one column (a `1fr` track that a width:100% SVG
+  // blew out, the media query firing at the wrong width) still has every class
+  // and every element, and reads as the stacked page this replaced.
+  const gcol = root.querySelector('.pv-col-gpu');
+  const ccol = root.querySelector('.pv-col-cpu');
+  check('the body splits into a GPU column and a CPU column', !!gcol && !!ccol,
+        (gcol?'':'no GPU column ') + (ccol?'':'no CPU column'));
+  let sideBySide = false;
+  if (gcol && ccol){
+    const g = gcol.getBoundingClientRect(), c = ccol.getBoundingClientRect();
+    sideBySide = c.left >= g.right - 4 && Math.abs(g.top - c.top) < 4;
+    check('the two columns are side by side, not stacked', sideBySide,
+          'gpu ' + g.left.toFixed(0) + '..' + g.right.toFixed(0)
+          + ' top ' + g.top.toFixed(0) + ' / cpu ' + c.left.toFixed(0)
+          + '..' + c.right.toFixed(0) + ' top ' + c.top.toFixed(0));
+    // Content must be on the side its heading claims. A bar that shows up in
+    // the wrong column is worse than no split at all.
+    const txt = e => (e ? e.textContent : '');
+    check('the GPU column holds the GPU rows, the CPU column the CPU rows',
+          /Summed GPU/.test(txt(gcol)) && !/Summed CPU/.test(txt(gcol))
+          && /Summed CPU/.test(txt(ccol)) && !/Summed GPU/.test(txt(ccol)));
+    check('no CPU-tagged bar sits in the GPU column',
+          gcol.querySelectorAll('.pv-side-cpu').length === 0
+          && ccol.querySelectorAll('.pv-side-gpu').length === 0,
+          gcol.querySelectorAll('.pv-side-cpu').length + ' cpu rows left, '
+          + ccol.querySelectorAll('.pv-side-gpu').length + ' gpu rows right');
+    // Each column states its own total, so the comparison the split exists for
+    // can be read without scrolling either list.
+    check('each column states its own total',
+          !!gcol.querySelector('.pv-col-ms') && !!ccol.querySelector('.pv-col-ms'),
+          txt(gcol.querySelector('.pv-col-head')).trim().slice(0, 40) + ' | '
+          + txt(ccol.querySelector('.pv-col-head')).trim().slice(0, 40));
+    // The two timelines share an x axis, and that is only true if they start on
+    // the same screen line — otherwise "the same horizontal position is the same
+    // frame" is a claim you would have to measure with a ruler.
+    if (sideBySide){
+      const gs = gcol.querySelector('.pv-svg'), cs = ccol.querySelector('.pv-svg');
+      const gt = gs ? gs.getBoundingClientRect() : null;
+      const ct = cs ? cs.getBoundingClientRect() : null;
+      check('the two timeline charts start on the same line',
+            !!gt && !!ct && Math.abs(gt.top - ct.top) <= 6
+                 && Math.abs(gt.height - ct.height) <= 2,
+            gt && ct ? 'tops ' + gt.top.toFixed(0) + ' / ' + ct.top.toFixed(0)
+                       + ', heights ' + gt.height.toFixed(0) + ' / '
+                       + ct.height.toFixed(0)
+                     : 'a column has no chart');
+    }
+  }
+  // The long prose folds instead of being deleted: the words must still be in
+  // the DOM, or this became a documentation cut wearing a layout change.
+  const folded = root.querySelectorAll('details.note');
+  check('long notes fold rather than vanish', folded.length >= 3,
+        folded.length + ' collapsible notes');
+  let emptyFold = 0;
+  folded.forEach(d => { if (d.textContent.trim().length < 120) emptyFold++; });
+  check('a folded note still carries its full text', emptyFold === 0,
+        emptyFold + ' folds under 120 chars');
+
   // ---- layout ----
   // A chart 300px wider than its column is invisible to every DOM assertion
   // above and obvious to a human. Measured, not eyeballed.

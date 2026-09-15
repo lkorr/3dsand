@@ -231,6 +231,19 @@ struct MobDef {
   // (BurnLimbView::Set says so), so a stain carried as paint would be
   // invisible on exactly the clothed limbs it matters most on.
   uint32_t woundMat = 0;
+  // DOES A CUT ON THIS CREATURE CLOSE, OR GO ON ROTTING? Sidecar
+  // `bleed.woundHeals`, default true, ANDed with the global gore.woundHeals.
+  //
+  // True (living flesh): the soak around a cut reverts to the tissue it
+  // covered as it dries, at gore.woundHealSlow times the authored rate — the
+  // wound stops spreading, the limb keeps its voxels.
+  //
+  // False (UNDEAD): the soak decays to air like a pool of blood on the ground,
+  // so the hole widens by itself and the part eventually drops off. This is
+  // what every body did before 2026-09-14, and it is the setting to put on a
+  // zombie: nothing else in the rig has to change for a corpse that comes
+  // apart as it walks. See the long note on BurnLimbView's wound fields.
+  bool woundHeals = true;
   // WHICH MATERIALS ARE TISSUE, per material id: the ones a wound soaks. A
   // material is tissue when its `rubble` is this creature's blood (skin, flesh
   // and muscle all crumble to blood in materials.json; bone crumbles to dust),
@@ -561,6 +574,21 @@ struct BurnLimbView {
       (*coll)[i].color = 0;
     }
   }
+  // Put a voxel's WHOLE authored word back, art slot included — the one thing
+  // Set() above deliberately will not do. Its only caller is the wound revert
+  // below, and there the art slot is the point: a cut that heals has to give
+  // back the paint it covered, or a bloodied patch of a painted creature
+  // clears to flat material colour and the wound is still visible as a smear
+  // of the wrong pink.
+  void SetWord(size_t i, uint32_t word, uint32_t color) const {
+    if (skin) {
+      (*skin)[i].material = (uint16_t)word;
+      (*skin)[i].color = (uint8_t)color;
+    } else {
+      (*coll)[i].payload = (uint16_t)word;
+      (*coll)[i].color = (uint8_t)color;
+    }
+  }
   // The body COAT word (voxload.h BodyStain*: material + amount), read and
   // written on the same authoritative lattice the burn does.
   uint16_t Stain(size_t i) const {
@@ -569,6 +597,43 @@ struct BurnLimbView {
   void SetStain(size_t i, uint16_t st) const {
     if (skin) (*skin)[i].stain = st; else (*coll)[i].stain = st;
   }
+
+  // ---- A WOUND IS WET FLESH, NOT A POOL OF BLOOD (gore.woundHeals) --------
+  //
+  // Mob::StainWound rewrites the flesh around a cut to the creature's wound
+  // MATERIAL, and this pass runs the ordinary authored reaction table over a
+  // body's voxels. Blood's own rule in reactions.json is `decay -> air` at 8
+  // per-mille a tick, authored so that a pool on the ground dries up and the
+  // chunk goes back to sleep (rule 2) — and it applied, unchanged, to blood
+  // that is INSIDE a limb. So every sword cut opened a hole that then ate
+  // itself outward at a ~3 s half-life: the soak evaporated, the anatomy under
+  // it showed through, and once enough had gone the geometry rules took the
+  // limb off. The owner's report is "the blood voxels just entirely evaporate
+  // revealing the below structure, which causes limbs to fall off".
+  //
+  // A pool drying and a wound drying are different events. Blood soaked into
+  // meat does not leave a void behind it; it leaves the meat. So on a body:
+  //
+  //   * `woundSlow` divides the wound material's own decay chance, because a
+  //     wound settles over a slower clock than a puddle in the sun, and
+  //   * `revive` hands back the word that voxel held BEFORE the soak covered
+  //     it, so the decay REVERTS the soak instead of removing the voxel.
+  //
+  // Both are off (woundMat 0, revive null, woundSlow 1) for anything that is
+  // not a live creature's own limb, and for a creature whose def says its
+  // wounds do not close — see MobDef::woundHeals. THAT IS THE UNDEAD SETTING:
+  // with it off this is byte-for-byte the old behaviour, and a zombie's cuts
+  // go on rotting outward and shedding its limbs, which is the one place the
+  // bug was worth keeping.
+  uint32_t woundMat = 0;   // this body's wound material; 0 = feature off
+  uint32_t woundSlow = 1;  // divisor on that material's authored decay chance
+  // Returns false (and writes nothing) when this cell is not a remembered
+  // soak; true fills the authored word and art slot and FORGETS the cell, so
+  // one soak reverts once.
+  using ReviveFn = bool (*)(void* ctx, IVec3 p, uint32_t& word,
+                            uint32_t& color);
+  ReviveFn revive = nullptr;
+  void* reviveCtx = nullptr;
 };
 
 // ---- WHAT IS ON A BODY, AS A LEDGER -----------------------------------------
@@ -664,6 +729,19 @@ struct GoreProfile {
 // `carved` under another name). Everything positional is in WORLD voxels;
 // `voxels` is the COLLIDER lattice (physScale units, int8), `skinVoxels` the
 // SKIN lattice (skinScale units, int16, empty when the two coincide).
+// A limb-lattice cell as one sortable key. The lattices are int16 (skin) and
+// int8 (collider), so the bias covers both with room to spare.
+inline uint64_t WoundWasKey(int x, int y, int z) {
+  return ((uint64_t)(uint32_t)(x + 32768) << 34) |
+         ((uint64_t)(uint32_t)(y + 32768) << 17) | (uint64_t)(uint32_t)(z + 32768);
+}
+// Ceiling on MobLimb::woundWas. A blade's soak is a few hundred voxels and
+// each is remembered at most once (StainWound skips a voxel that is already
+// the wound material), so this is only reached by a body that has been cut
+// dozens of times in dozens of places — at which point the oldest soaks
+// stopping being able to revert is the right way to run out.
+inline constexpr size_t kWoundWasMax = 8192;
+
 struct MobLimb {
   uint64_t body = 0;         // 0 = severed or never spawned
   uint64_t joint = 0;        // to parent
@@ -800,6 +878,34 @@ struct MobLimb {
   // 7,000 raw flesh voxels left under a black shell, and would have stood
   // there forever. Against its surface that same body is burnt through.
   uint32_t surfaceAtSpawn = 0;
+  // ---- WHAT THE BLOOD COVERED (BurnLimbView's wound-revert note) ----------
+  // One entry per voxel Mob::StainWound rewrote to the wound material, holding
+  // the word and art slot that voxel had BEFORE the soak. The wound's decay
+  // then puts flesh back instead of leaving a hole. Sorted by WoundWasKey, so
+  // the lookup on the decay path is a binary search over a few hundred
+  // entries; an entry is erased the moment it is spent, so a limb that has
+  // finished drying carries nothing.
+  //
+  // A SPARSE AUXILIARY LAYER, for the reason the design guidelines give: the
+  // voxel word is full (there is nowhere to put "what I used to be"), this is
+  // keyed by limb, it is reconstructible-as-nothing (losing it only means a
+  // soak stops being able to revert, never that geometry is wrong), and it is
+  // bounded by kWoundWasMax whatever a player does with a sword.
+  //
+  // NOT SAVED, and not severed with the limb. Both are the same trade and both
+  // fail the same way: a soak with no entry behind it goes back to decaying to
+  // air, which is the OLD behaviour -- bounded, and it lets the limb go quiet
+  // again (rule 2), which is what a "keep the voxel forever" fallback would
+  // not. So the cost of losing the table is the few seconds of one wound's
+  // drying, in two narrow cases: saving within about six seconds of being cut,
+  // and a limb that was severed with its soak still wet (a part on the ground
+  // is debris and has never had a table at all).
+  struct WoundWas {
+    int16_t x, y, z;
+    uint16_t word;   // material | variant<<12, exactly as the lattice held it
+    uint8_t color;   // the art slot StainWound zeroes
+  };
+  std::vector<WoundWas> woundWas;
   // Per-voxel burning / dissolution (see BodyBurnState above).
   BodyBurnState burn;
   // What is ON this limb, recounted at a bounded cadence (see LimbCoat).
@@ -1765,6 +1871,16 @@ class Mob {
                       uint32_t seed,
                       const std::vector<IVec3>* crater = nullptr,
                       float rimCells = 0.0f);
+  // ---- and the other half: the soak DRIES BACK TO FLESH -------------------
+  // BurnLimbView::ReviveFn over one limb's `woundWas` table. A raw function
+  // pointer for the same reason WornAlong is one: the view is rebuilt per limb
+  // per tick and a capturing std::function would heap-allocate for it. `ctx`
+  // is the MobLimb. Erases the entry it answers with, so one soak reverts once
+  // and a voxel cut again is remembered again, as the new thing it is.
+  static bool ReviveWoundVoxel(void* ctx, IVec3 p, uint32_t& word,
+                               uint32_t& color);
+  // Does this creature's flesh close over a cut? def AND the global switch.
+  bool WoundsHeal() const;
   // ---- BLOOD ON A BODY, from the world and from other bodies -------------
   // Contact: every limb reads the world cells around it once per tick (the
   // same walk the burn pass makes) and takes the stain of any staining

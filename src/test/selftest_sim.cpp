@@ -1978,6 +1978,11 @@ Status GateFluidOnWater(Ctx& c, std::string& detail) {
 // except the water, which makes the differential exactly the claim: the only
 // thing between the wood and the same fate is Archimedes.
 //
+// "NOTHING CAN HOLD THEM UP" IS A PROPERTY OF THE DROP COLUMNS, not of the
+// harness, and the sentence above read as the second until 2026-09-14, when a
+// raft of settled wood CHIPS caught the iron cube and held it at y120.7. Where
+// the cubes are dropped is load-bearing; see the note over the `cube` calls.
+//
 // Both thresholds also hold in the other regime, so a future harness that DOES
 // build collision here does not silently invert the test — the iron would rest
 // on the bed at 111, still under `bedY + 4`.
@@ -2139,7 +2144,23 @@ Status GateDebrisFloat(Ctx& c, std::string& detail) {
     c.debris.AdoptBody(handle, vox, xf);
     return true;
   };
-  const bool madeBodies = cube(woodId, -3, 0, hWood) && cube(ironId, 3, 0, hIron);
+  // z -1 puts both cubes in the band BETWEEN the two chip zones (chips occupy
+  // z -4..-2 and z 2..4; a cube spans three cells from its corner, so -1 is
+  // z -1..1 and touches neither). They used to be dropped at z 0, which is
+  // z 0..2 and clips the wood chips' z 2 column -- and on 2026-09-14, the tick
+  // floating debris stopped being blown about by the wind, that stopped being
+  // harmless. The chips had previously come to rest scattered over y118..120
+  // and the iron cube fell between them; once they settled into a proper flat
+  // raft at the waterline the cube came to rest ON IT, at a centre of mass of
+  // 120.7 = the raft's top at 119 plus half a cube. The arm went red while
+  // reporting a number that had nothing to do with buoyancy.
+  //
+  // So this is a constraint on the fixture and not a tuning of it: THE BODY
+  // ARM MUST BE DROPPED INTO A COLUMN THE PARTICLE ARM NEVER LANDS IN. The
+  // whole claim below is "the only thing between the wood and the iron's fate
+  // is Archimedes", and anything else a cube can rest on makes that a
+  // measurement of the something else.
+  const bool madeBodies = cube(woodId, -3, -1, hWood) && cube(ironId, 3, -1, hIron);
   tickBodies(200);
   const DebrisSystem::FloaterProbe& fp = c.debris.Floaters();
 

@@ -999,6 +999,29 @@ struct Tuning {
     // scratch on a rig authored at any scale. The tint rides at the same
     // stainCutRadius : woundStainRadius ratio the kerf uses.
     float craterStainRim = 1.5f;
+    // ---- E3a. AND THEN THE SOAK DRIES BACK TO FLESH (2026-09-14) -----------
+    // The soak above is the creature's blood as a MATERIAL, sitting in the
+    // limb's own lattice — and the body burn pass runs the ordinary authored
+    // reaction table over that lattice. Blood's rule in reactions.json is
+    // `decay -> air` at 8 per-mille a tick, written so a pool on the ground
+    // dries up and its chunk goes back to sleep (rule 2), and it applied
+    // unchanged to blood inside a limb. Every sword cut therefore opened a
+    // hole that ate itself outward at a ~3 s half-life until the geometry
+    // rules took the limb off: "the blood voxels just entirely evaporate
+    // revealing the below structure, which causes limbs to fall off".
+    //
+    // With `woundHeals` on, a wound-material voxel that rolls its decay is
+    // put BACK to the word it covered (MobLimb::woundWas) instead of being
+    // removed, and rolls it `woundHealSlow` times more slowly, because meat
+    // settling is not a puddle evaporating. The limb keeps its volume and the
+    // red fades off it over about six seconds instead of three.
+    //
+    // OFF IS THE UNDEAD SETTING, and it is exactly the old behaviour: cuts on
+    // a zombie go on rotting outward and shedding its parts. Per-creature as
+    // well as global — mob sidecar `bleed.woundHeals` (MobDef::woundHeals) —
+    // so the living and the walking dead can disagree in one content key.
+    bool woundHeals = true;
+    float woundHealSlow = 2.0f;
 
     // ---- E3b. BLOOD ON A BODY: the stain lattice (2026-09-13) --------------
     // The soak above REWRITES flesh to blood. This is the other half, and it
@@ -2067,7 +2090,13 @@ struct Tuning {
     // The RENDER arm does not consult it (a renderer cannot write a voxel), so
     // the look ships on with the hash pinned.
     //   0 = no sim kernel evaluates the current field
-    //   1 = MPM fluid particles are dragged by it
+    //   1 = MPM fluid nodes (sim_fluid.wgsl) and debris floating in or on a
+    //       liquid (sim_particle.wgsl) are dragged by it
+    //
+    // The debris arm is an EXACT identity at mode 0 for a second reason on top
+    // of currentAtQ's early return: it re-aims a damping term that already
+    // existed and already aimed at zero, so a zero field reproduces it
+    // bit-for-bit. It is still gated, to skip the primitive loop.
     int currentMode = 0;
     // Base circulation of a drain's whirlpool, m^2/s. Gamma, the quantity that
     // is actually conserved: v_theta = Gamma / (2 pi r), so this fixes how far

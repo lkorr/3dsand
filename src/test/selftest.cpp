@@ -381,6 +381,13 @@ const char* const kOrder[] = {
     // chip's worth of blood rather than a repainted surface (owner report
     // 2026-09-13, the second half of the same one body-stain answers).
     "blast-stain",
+    // ...and on a LIVING body that soak dries back to flesh rather than
+    // evaporating: blood's authored `decay -> air` (a rule about a pool on the
+    // ground) was eating the limb outward from every cut until it fell off.
+    // Two arms in one gate, gore.woundHeals on and off, because the claim is a
+    // difference and the off arm is both the undead setting and the proof the
+    // decay ran at all (owner report 2026-09-14).
+    "wound-heal",
     // ...and a corpse that died alight keeps burning: every piece advances
     // its embers, keeps emitting fire, and its brick agrees with its lattice
     // (owner report 2026-09-02: the corpse pulsed at its death colour for

@@ -57,9 +57,17 @@ constexpr float kPortraitHFallback = 448.0f;
 constexpr const char* kPayloadItem = "SVKIT";
 constexpr const char* kPayloadGlyph = "SVGLY";
 // A grimoire page by NAME (plan §12b), and a word's index inside the page
-// being composed (reordering within the row).
+// being composed (reordering within the row). A BOUND key travels as its slot
+// index: what is on it is already in a mirror both ends can read, and a slot is
+// the one thing a key-to-key move needs to name.
 constexpr const char* kPayloadPage = "SVPGE";
 constexpr const char* kPayloadWord = "SVWRD";
+constexpr const char* kPayloadBound = "SVBND";
+
+// Peeking at a payload BEFORE the button is released: what makes the row able
+// to draw the drop it is about to perform instead of performing it silently.
+constexpr ImGuiDragDropFlags kPeek = ImGuiDragDropFlags_AcceptBeforeDelivery |
+                                     ImGuiDragDropFlags_AcceptNoDrawDefaultRect;
 
 // Which chrome sprite carries an item of this kind. A worn piece borrows the
 // engraving its own slot uses when empty, so the thing in your pack and the
@@ -753,6 +761,28 @@ const UIState::GrimoirePageUI* FindPageUI(const UIState& s, const std::string& n
   return nullptr;
 }
 
+// ---- the composer's undo ----------------------------------------------------
+//
+// Called BEFORE every mutation of the word row, from wherever it comes: a drop,
+// a right-click, a drag out of the window. Deep enough to walk back a whole
+// session of fiddling with a sentence, shallow enough that the stack is a few
+// hundred bytes of short strings.
+constexpr int kUndoDepth = 32;
+void PushUndo(UIState& s) {
+  s.grimoireUndo.push_back(s.grimoireEditWords);
+  if ((int)s.grimoireUndo.size() > kUndoDepth) s.grimoireUndo.erase(s.grimoireUndo.begin());
+  // A new edit is a new future: whatever ctrl+Z had set aside is gone.
+  s.grimoireRedo.clear();
+}
+// The open page changed under the stacks (list click, save-with-rename, delete,
+// duplicate — the last three happen in main.cpp, so this is checked every frame
+// rather than wired to the click).
+void DropUndo(UIState& s) {
+  s.grimoireUndo.clear();
+  s.grimoireRedo.clear();
+  s.grimoireUndoPage = s.grimoireSelected;
+}
+
 // One word of the table: the cell, its sort tag, its valence mark, the drag
 // out of it, and the §9 info box on hover.
 // A word straight into the page being composed, at the end (the grimoire's
@@ -762,6 +792,7 @@ bool WriteWordIntoPage(UIState& s, const char* name) {
   const UIState::GrimoirePageUI* sel = FindPageUI(s, s.grimoireSelected);
   if (sel && sel->readOnly) return false;
   if ((int)s.grimoireEditWords.size() >= s.grimoireMaxWords) return false;
+  PushUndo(s);
   s.grimoireEditWords.push_back(name);
   s.grimoireEditDirty = true;
   return true;
@@ -908,6 +939,16 @@ float BoundKeys(UIState& s, ImDrawList* dl, ImVec2 at, float width) {
       std::snprintf(k, sizeof k, bank ? "S%d" : "%d", (col + 1) % 10);
       ui::KeyBadge(dl, ImVec2(gx + 2, gy + 2), k);
     }
+    // A bound key is a drag SOURCE as well as a target: dragging one onto
+    // another moves the binding there and swaps with whatever that key held.
+    // Rearranging the row used to mean finding both words in the table again
+    // and re-dragging them, which is the one thing the table is worst at once
+    // you have twenty keys and know what you want on them.
+    if (filled && ImGui::BeginDragDropSource()) {
+      ImGui::SetDragDropPayload(kPayloadBound, &i, sizeof i);
+      WordDragPreview(g, id.c_str());
+      ImGui::EndDragDropSource();
+    }
     if (ImGui::BeginDragDropTarget()) {
       if (const ImGuiPayload* p = ImGui::AcceptDragDropPayload(kPayloadGlyph)) {
         s.bindGlyph.pending = true;
@@ -920,6 +961,15 @@ float BoundKeys(UIState& s, ImDrawList* dl, ImVec2 at, float width) {
         s.bindGlyph.slot = i;
         s.bindGlyph.glyphId = (const char*)p->Data;
         s.bindGlyph.page = true;
+      }
+      if (const ImGuiPayload* p = ImGui::AcceptDragDropPayload(kPayloadBound)) {
+        int from = -1;
+        std::memcpy(&from, p->Data, sizeof from);
+        if (from >= 0 && from != i) {
+          s.moveBind.pending = true;
+          s.moveBind.from = from;
+          s.moveBind.to = i;
+        }
       }
       ImGui::EndDragDropTarget();
     }
@@ -941,6 +991,7 @@ float BoundKeys(UIState& s, ImDrawList* dl, ImVec2 at, float width) {
         ImGui::PopStyleColor();
         if (!g->desc.empty()) ImGui::TextDisabled("%s", g->desc.c_str());
         ImGui::TextDisabled("%s speaks it  .  right-click to unbind", key);
+        ImGui::TextDisabled("drag it onto another key to move or swap it  .  drag it out to unbind");
       } else if (isPage) {
         ImGui::PushStyleColor(ImGuiCol_Text, ImGui::ColorConvertU32ToFloat4(ui::ColGoldHi()));
         ImGui::Text("[%s]  a page", id.c_str());
@@ -948,6 +999,7 @@ float BoundKeys(UIState& s, ImDrawList* dl, ImVec2 at, float width) {
         const std::string& ro = i < (int)s.glyphSlotReadouts.size() ? s.glyphSlotReadouts[i] : "";
         ImGui::TextDisabled("%s", ro.empty() ? "(a page that names nothing)" : ro.c_str());
         ImGui::TextDisabled("%s speaks it  .  right-click to unbind", key);
+        ImGui::TextDisabled("drag it onto another key to move or swap it  .  drag it out to unbind");
       } else {
         ImGui::TextDisabled("%s: unbound", key);
         ImGui::TextDisabled("drag a word or a page here");
@@ -999,6 +1051,7 @@ void GrimoireBody(UIState& s, ImVec2 at, ImVec2 size) {
         s.grimoireEditName.clear();
         s.grimoireEditWords.clear();
         s.grimoireEditDirty = false;
+        DropUndo(s);
       }
       if (hov) Tip("A blank page: drag words into the row, name it, save it.");
       ImGui::PopID();
@@ -1029,6 +1082,7 @@ void GrimoireBody(UIState& s, ImVec2 at, ImVec2 size) {
         s.grimoireEditName = p.name;
         s.grimoireEditWords = p.words;
         s.grimoireEditDirty = false;
+        DropUndo(s);
       }
       // Right-click: nest this page into the open one (never into itself —
       // the save would refuse the cycle anyway; this just does not offer it).
@@ -1078,6 +1132,29 @@ void GrimoireBody(UIState& s, ImVec2 at, ImVec2 size) {
     const UIState::GrimoirePageUI* sel = FindPageUI(s, s.grimoireSelected);
     const bool readOnly = sel && sel->readOnly;
     float cy = base.y;
+    // The undo stacks belong to the page that is open. Checked here, every
+    // frame, rather than at the clicks that change it — Save-with-rename,
+    // Delete and Duplicate all repoint `grimoireSelected` from main.cpp, and a
+    // stack that outlived one of those would undo into the wrong page.
+    if (s.grimoireUndoPage != s.grimoireSelected) DropUndo(s);
+    // ctrl+Z / ctrl+Y (ctrl+shift+Z too, for the other half of the world).
+    // Suppressed while any widget is active: the name field two lines below is
+    // an InputText, and InputText has its own undo on the same chord.
+    if (!readOnly && !ImGui::IsAnyItemActive()) {
+      if (ImGui::IsKeyChordPressed(ImGuiMod_Ctrl | ImGuiKey_Z) && !s.grimoireUndo.empty()) {
+        s.grimoireRedo.push_back(s.grimoireEditWords);
+        s.grimoireEditWords = s.grimoireUndo.back();
+        s.grimoireUndo.pop_back();
+        s.grimoireEditDirty = true;
+      } else if ((ImGui::IsKeyChordPressed(ImGuiMod_Ctrl | ImGuiKey_Y) ||
+                  ImGui::IsKeyChordPressed(ImGuiMod_Ctrl | ImGuiMod_Shift | ImGuiKey_Z)) &&
+                 !s.grimoireRedo.empty()) {
+        s.grimoireUndo.push_back(s.grimoireEditWords);
+        s.grimoireEditWords = s.grimoireRedo.back();
+        s.grimoireRedo.pop_back();
+        s.grimoireEditDirty = true;
+      }
+    }
     // The name.
     {
       char buf[64];
@@ -1099,23 +1176,62 @@ void GrimoireBody(UIState& s, ImVec2 at, ImVec2 size) {
     // The word row: every cell the page can hold, drawn whether or not it is
     // filled, so the page's capacity is visible and the drop target is the
     // whole row and not one trailing cell. A drop on any empty cell appends.
+    //
+    // WHAT A DROP DOES (2026-09-14). Every cell PEEKS at the payload rather
+    // than waiting for the release, so the row draws the edit it is about to
+    // make — a gold caret at the seam a word will land in, both cells lit when
+    // the drop will exchange them, a red rim when it will be refused:
+    //
+    //   a word from the arsenal, a page from the list   inserted BEFORE the
+    //       cell under the cursor (past the last word: appended)
+    //   a word already in the row, onto a NEIGHBOUR     the two SWAP
+    //   a word already in the row, anywhere else        moved to sit BEFORE
+    //       the word it was dropped on
+    //   ctrl held                                       a move becomes a COPY
+    //
+    // The swap is the case that used to be missing, and its absence read as the
+    // row ignoring the drag: moving a word one place RIGHT is erase-then-
+    // insert-before-its-old-right-neighbour, which lands it exactly where it
+    // already was. (One place LEFT happened to work, which made it worse — the
+    // same gesture answered in one direction and not the other.)
     const int nWords = (int)s.grimoireEditWords.size();
     const int cells = std::max(1, s.grimoireMaxWords);
     const int perRow = std::max(1, (int)((innerW + (kCell - kSlot)) / kCell));
+    const float rowY = cy;
+    auto cellAt = [&](int i) {
+      return ImVec2(base.x + (i % perRow) * kCell, rowY + (i / perRow) * kCell);
+    };
     auto insertWord = [&](int at, const char* name) {
       if (readOnly) return;
       if ((int)s.grimoireEditWords.size() >= s.grimoireMaxWords) return;
       at = std::max(0, std::min(at, (int)s.grimoireEditWords.size()));
+      PushUndo(s);
       s.grimoireEditWords.insert(s.grimoireEditWords.begin() + at, name);
       s.grimoireEditDirty = true;
     };
+    // What is in flight, asked once for the whole row: the source cell is
+    // ghosted while its word is held, and the marker layer under the loop
+    // needs the same answer.
+    const ImGuiPayload* live = ImGui::GetDragDropPayload();
+    const bool dragWord = live && live->IsDataType(kPayloadWord);
+    const int dragFrom = dragWord ? *(const int*)live->Data : -1;
+    const bool copyMod = ImGui::GetIO().KeyCtrl;
+    const bool full = nWords >= s.grimoireMaxWords;
+    // Set by whichever cell is under the cursor, drawn after the row.
+    int caretAt = -1;             // the seam a word would be inserted at
+    int swapA = -1, swapB = -1;   // the pair a drop would exchange
+    int refuseAt = -1;            // the cell that would refuse the drop
+    const char* rowNote = nullptr;
     for (int i = 0; i < cells; i++) {
-      const ImVec2 p(base.x + (i % perRow) * kCell, cy + (i / perRow) * kCell);
+      const ImVec2 p = cellAt(i);
       ImGui::SetCursorScreenPos(p);
       ImGui::PushID(4000 + i);
       ImGui::InvisibleButton("##wd", ImVec2(kSlot, kSlot));
       const bool hov = ImGui::IsItemHovered();
-      const bool has = i < nWords;
+      // The LIVE size, not `nWords`: a right-click below removes a word from
+      // under the rest of this very loop, and the last cell would then index
+      // one past the end of a vector that has already shrunk.
+      const bool has = i < (int)s.grimoireEditWords.size();
       const ui::SlotLook look = hov ? ui::SlotLook::Hover
                                 : has ? ui::SlotLook::Filled
                                       : ui::SlotLook::Empty;
@@ -1142,6 +1258,11 @@ void GrimoireBody(UIState& s, ImVec2 at, ImVec2 size) {
           WordDragPreview(g, w.c_str());
           ImGui::EndDragDropSource();
         }
+        // The cell a held word CAME from, ghosted: the preview under the
+        // cursor is the word, so the row should read as having a hole in it
+        // rather than as holding the word twice.
+        if (dragFrom == i && !copyMod)
+          cd->AddRectFilled(p, ImVec2(p.x + kSlot, p.y + kSlot), Fade(ui::ColInk(), 0.55f));
         if (hov) {
           BeginTip();
           ImGui::PushStyleColor(ImGuiCol_Text, ImGui::ColorConvertU32ToFloat4(ui::ColGoldHi()));
@@ -1151,10 +1272,13 @@ void GrimoireBody(UIState& s, ImVec2 at, ImVec2 size) {
           ImGui::PopStyleColor();
           if (g) ImGui::TextDisabled("%s  .  %s", kSortLabel[g->type], g->desc.c_str());
           else if (pg) ImGui::TextDisabled("%s", pg->readout.c_str());
-          if (!readOnly) ImGui::TextDisabled("drag to reorder  .  right-click or drag out to remove");
+          if (!readOnly)
+            ImGui::TextDisabled("drag to reorder (a neighbour swaps)  .  ctrl+drag to copy  .  "
+                                "right-click or drag out to remove");
           EndTip();
         }
         if (!readOnly && hov && ImGui::IsMouseClicked(ImGuiMouseButton_Right)) {
+          PushUndo(s);
           s.grimoireEditWords.erase(s.grimoireEditWords.begin() + i);
           s.grimoireEditDirty = true;
         }
@@ -1162,24 +1286,111 @@ void GrimoireBody(UIState& s, ImVec2 at, ImVec2 size) {
         Tip(readOnly ? "An authored page: copy it to edit."
                      : "Drop a word from the arsenal, or a page from the list, here.");
       }
-      if (!readOnly && ImGui::BeginDragDropTarget()) {
-        if (const ImGuiPayload* p = ImGui::AcceptDragDropPayload(kPayloadGlyph))
-          insertWord(i, (const char*)p->Data);
-        if (const ImGuiPayload* p = ImGui::AcceptDragDropPayload(kPayloadPage))
-          insertWord(i, (const char*)p->Data);
-        if (const ImGuiPayload* p = ImGui::AcceptDragDropPayload(kPayloadWord)) {
+      // THE DROP. Peeked rather than accepted, so the same code that performs
+      // the edit also describes it to the marker layer below; `IsDelivery` is
+      // the only thing separating "would" from "did".
+      if (ImGui::BeginDragDropTarget()) {
+        const ImGuiPayload* p = ImGui::AcceptDragDropPayload(kPayloadWord, kPeek);
+        const bool moving = p != nullptr;
+        if (!p) p = ImGui::AcceptDragDropPayload(kPayloadGlyph, kPeek);
+        if (!p) p = ImGui::AcceptDragDropPayload(kPayloadPage, kPeek);
+        const bool deliver = p && p->IsDelivery();
+        if (p && readOnly) {
+          refuseAt = i;
+          rowNote = "an authored page cannot be changed - copy it to make one of your own";
+        } else if (p && moving) {
           const int from = *(const int*)p->Data;
-          if (from >= 0 && from < (int)s.grimoireEditWords.size() && from != i) {
-            const std::string w = s.grimoireEditWords[from];
-            s.grimoireEditWords.erase(s.grimoireEditWords.begin() + from);
-            const int to = std::min(i > from ? i - 1 : i, (int)s.grimoireEditWords.size());
-            s.grimoireEditWords.insert(s.grimoireEditWords.begin() + to, w);
-            s.grimoireEditDirty = true;
+          if (from < 0 || from >= nWords) {
+            // A stale index (the row changed under the drag): drop nothing.
+          } else if (copyMod) {
+            // COPY: the word stays where it is and a second one lands at the
+            // seam. `fire fire` is a real sentence and used to mean a second
+            // trip to the table.
+            if (full) {
+              refuseAt = i;
+              rowNote = "this page is full - remove a word to make room";
+            } else {
+              caretAt = std::min(i, nWords);
+              rowNote = "ctrl: a copy - the word you are holding stays where it is";
+              if (deliver) {
+                // By VALUE: the source lives in the vector insertWord is about
+                // to grow, and a c_str() into it would not survive the reallocation.
+                const std::string dup = s.grimoireEditWords[from];
+                insertWord(caretAt, dup.c_str());
+              }
+            }
+          } else if ((i - from == 1 || from - i == 1) && i < nWords) {
+            swapA = from;
+            swapB = i;
+            if (deliver) {
+              PushUndo(s);
+              std::swap(s.grimoireEditWords[from], s.grimoireEditWords[i]);
+              s.grimoireEditDirty = true;
+            }
+          } else if (i != from) {
+            // Before the word under the cursor: the target's index once the
+            // dragged word has been lifted out of the row. Clamped, so a drop
+            // on an empty cell past the end means "put it last".
+            const int to = std::min(i > from ? i - 1 : i, nWords - 1);
+            if (to != from) {
+              caretAt = std::min(i, nWords);
+              if (deliver) {
+                PushUndo(s);
+                const std::string w = s.grimoireEditWords[from];
+                s.grimoireEditWords.erase(s.grimoireEditWords.begin() + from);
+                s.grimoireEditWords.insert(s.grimoireEditWords.begin() + to, w);
+                s.grimoireEditDirty = true;
+              }
+            }
+          }
+        } else if (p) {
+          if (full) {
+            refuseAt = i;
+            rowNote = "this page is full - remove a word to make room";
+          } else {
+            caretAt = std::min(i, nWords);
+            if (deliver) insertWord(caretAt, (const char*)p->Data);
           }
         }
         ImGui::EndDragDropTarget();
       }
       ImGui::PopID();
+    }
+    // THE MARKER LAYER, over the whole row so a marker at a cell's edge is
+    // never buried by the next cell's recess.
+    if (caretAt >= 0) {
+      const ImVec2 cp = cellAt(caretAt);
+      // In the first column the seam would fall outside the child's clip, so
+      // it sits just inside the cell instead of just before it.
+      const float x = std::floor(caretAt % perRow == 0 ? cp.x + 1 : cp.x - 3);
+      cd->AddRectFilled(ImVec2(x, cp.y - 2), ImVec2(x + 4, cp.y + kSlot + 2), ui::ColGoldHi());
+      cd->AddRectFilled(ImVec2(x - 3, cp.y - 5), ImVec2(x + 7, cp.y - 1), ui::ColGoldHi());
+      cd->AddRectFilled(ImVec2(x - 3, cp.y + kSlot + 1), ImVec2(x + 7, cp.y + kSlot + 5),
+                        ui::ColGoldHi());
+    }
+    if (swapA >= 0) {
+      const int pair[2] = {swapA, swapB};
+      for (int k : pair) {
+        const ImVec2 cp = cellAt(k);
+        cd->AddRect(ImVec2(cp.x - 2, cp.y - 2), ImVec2(cp.x + kSlot + 2, cp.y + kSlot + 2),
+                    ui::ColGoldHi(), 0.0f, 0, 2.0f);
+      }
+      // Two arrowheads back to back in the gap, pointing at where each word is
+      // going. Only when the pair is side by side — across a row break there
+      // is no gap to put them in, and the two lit cells say it alone.
+      if (swapA / perRow == swapB / perRow) {
+        const ImVec2 cp = cellAt(std::min(swapA, swapB));
+        const float mx = cp.x + kSlot + (kCell - kSlot) * 0.5f, my = cp.y + kSlot * 0.5f;
+        cd->AddTriangleFilled(ImVec2(mx - 7, my), ImVec2(mx - 1, my - 5), ImVec2(mx - 1, my + 5),
+                              ui::ColGoldHi());
+        cd->AddTriangleFilled(ImVec2(mx + 7, my), ImVec2(mx + 1, my - 5), ImVec2(mx + 1, my + 5),
+                              ui::ColGoldHi());
+      }
+    }
+    if (refuseAt >= 0) {
+      const ImVec2 cp = cellAt(refuseAt);
+      cd->AddRectFilled(cp, ImVec2(cp.x + kSlot, cp.y + kSlot), Fade(ui::ColBlood(), 0.35f));
+      SlotRim(cd, cp, ui::SlotLook::Refuse);
     }
     cy += ((cells + perRow - 1) / perRow) * kCell + 4;
 
@@ -1204,8 +1415,19 @@ void GrimoireBody(UIState& s, ImVec2 at, ImVec2 size) {
       std::snprintf(price, sizeof price, "price %d%s      %d / %d words", s.grimoireEditPrice,
                     s.grimoireEditPriceUnknown ? " + ?" : "", nWords, s.grimoireMaxWords);
       cd->AddText(ImVec2(base.x + 2, cy), Fade(ui::ColParchDim(), 0.9f), price);
+      cy += 16;
+      // The row's gestures, said once where the row is. Four of the five are
+      // invisible otherwise: you find a swap by trying it.
+      if (!readOnly && nWords > 0) {
+        static const char* kGestures =
+            "drag to reorder  .  onto a neighbour to swap  .  ctrl+drag to copy  .  "
+            "right-click to remove  .  ctrl+z undo";
+        cd->AddText(ui::FontSmall(), 13.0f, ImVec2(base.x + 2, cy), Fade(ui::ColParchDim(), 0.75f),
+                    kGestures, nullptr, innerW - 4);
+        cy += ImGui::CalcTextSize(kGestures, nullptr, false, innerW - 4).y;
+      }
       ImGui::PopFont();
-      cy += 20;
+      cy += 6;
     }
 
     // Save / Duplicate / Delete, in the screen's own button. A disabled one is
@@ -1254,7 +1476,13 @@ void GrimoireBody(UIState& s, ImVec2 at, ImVec2 size) {
       ImGui::PushFont(ui::FontSmall());
       const char* msg = nullptr;
       ImU32 col = Fade(ui::ColParchDim(), 0.85f);
-      if (!s.kitMessage.empty() && s.kitMessageAge < 4.0f) {
+      // A live drag speaks FIRST: "this page is full" while you are still
+      // holding the word is a refusal you can act on, and the same sentence
+      // after the release is only a report.
+      if (rowNote) {
+        msg = rowNote;
+        col = refuseAt >= 0 ? ui::ColBloodHi() : ui::ColGoldHi();
+      } else if (!s.kitMessage.empty() && s.kitMessageAge < 4.0f) {
         msg = s.kitMessage.c_str();
         col = ui::ColEmber();
       } else if (readOnly) {
@@ -1659,7 +1887,8 @@ void DrawInventoryScreen(UIState& s) {
         // column is for, said once where the words are.
         ImGui::PushFont(ui::FontSmall());
         dl->AddText(ImVec2(wp.x + kPad, y), Fade(ui::ColParchDim(), 0.8f),
-                    "drag a word onto a key to bind it  .  right-click a key to clear it");
+                    "drag a word onto a key to bind it  .  drag a key onto a key to swap them  .  "
+                    "right-click a key to clear it");
         dl->AddText(ImVec2(wp.x + kPad, y + 14), Fade(ui::ColParchDim(), 0.8f),
                     "right-click a word to write it onto the open page  .  hover to read");
         ImGui::PopFont();
@@ -1761,8 +1990,21 @@ void DrawInventoryScreen(UIState& s) {
         int idx = -1;
         std::memcpy(&idx, p->Data, sizeof(idx));
         if (idx >= 0 && idx < (int)s.grimoireEditWords.size()) {
+          PushUndo(s);
           s.grimoireEditWords.erase(s.grimoireEditWords.begin() + idx);
           s.grimoireEditDirty = true;
+        }
+      } else if (p->IsDataType(kPayloadBound)) {
+        // The same gesture again, one level up: a key dragged off the row
+        // unbinds. "Drag it out" means "I do not want this here" everywhere
+        // else on this screen, and a key was the one place it did nothing.
+        int slot = -1;
+        std::memcpy(&slot, p->Data, sizeof(slot));
+        if (slot >= 0) {
+          s.bindGlyph.pending = true;
+          s.bindGlyph.slot = slot;
+          s.bindGlyph.glyphId.clear();
+          s.bindGlyph.page = false;
         }
       }
     }

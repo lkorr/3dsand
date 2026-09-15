@@ -9583,6 +9583,24 @@ int main(int argc, char** argv) {
           }
         }
       }
+      if (ui.moveBind.pending) {
+        ui.moveBind.pending = false;
+        // A key dragged onto a key: the two EXCHANGE what they hold (an empty
+        // destination makes that a plain move). Read both ends out first —
+        // PageAt returns a reference INTO the array the binds are about to
+        // overwrite, so a copy is not optional here.
+        const int a = ui.moveBind.from, b = ui.moveBind.to;
+        if (a >= 0 && a < kGlyphSlots && b >= 0 && b < kGlyphSlots && a != b) {
+          const int ga = caster.inventory.At(a), gb = caster.inventory.At(b);
+          const std::string pa = caster.inventory.PageAt(a), pb = caster.inventory.PageAt(b);
+          auto put = [&](int slot, int gi, const std::string& page) {
+            if (!page.empty()) caster.inventory.BindPage(slot, page);
+            else caster.inventory.Bind(slot, gi);
+          };
+          put(b, ga, pa);
+          put(a, gb, pb);
+        }
+      }
       if (ui.grimoireOp.pending) {
         ui.grimoireOp.pending = false;
         const UIState::GrimoireIntent& op = ui.grimoireOp;

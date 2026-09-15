@@ -32,11 +32,15 @@ const PT_KERNEL : u32 = PT_K_PARTICLE;
 fn inBounds(c : vec3<i32>) -> bool { return cellResident(c, T.origin); }
 
 // ---- wind (docs/RESEARCH_wind.md §4.6, phase 3) -----------------------------
-// windAtQ speaks Q16.16 world cells per SECOND; particles speak Q24.8 cells per
-// TICK. 65536/256 = 256 fixed-point units and 30 ticks a second, so the divisor
-// is 256*30. A divisor rather than a multiply-shift because it is exact at both
-// ends and this runs once per particle per tick, not once per cell.
-const PART_WIND_SCALE : i32 = 7680;
+// THE FIELD SCALE, shared by both fields this kernel reads. windAtQ and
+// currentAtQ both speak Q16.16 world cells per SECOND; particles speak Q24.8
+// cells per TICK. 65536/256 = 256 fixed-point units and 30 ticks a second, so
+// the divisor is 256*30. A divisor rather than a multiply-shift because it is
+// exact at both ends and this runs once per particle per tick, not once per
+// cell. One constant for both because they are the same transcription — a
+// second one named for water would be the same number with a second place to
+// keep it in step.
+const PART_FIELD_SCALE : i32 = 7680;
 // Fraction of the gap between a particle's velocity and the local wind that
 // closes in ONE TICK at a material's full windResponse of 15, in Q16. Human
 // units in, integer out, at shader compile time — the sim_fluid.wgsl discipline
@@ -149,6 +153,30 @@ fn settleSupported(c : vec3<i32>, myDensity : i32) -> bool {
   if (m.klass == CLASS_SOLID || m.klass == CLASS_POWDER) { return true; }
   if (m.klass == CLASS_LIQUID) { return m.density > myDensity; }
   return false;
+}
+
+// Is the cell under this one a liquid — i.e. is a particle sitting HERE riding
+// a water surface rather than flying through open air?
+//
+// This exists because A FLOATER AT THE WATERLINE IS NOT SUBMERGED. The cell it
+// bobs in is the AIR above the topmost water cell, which is the whole point of
+// `settleSupported`'s liquid arm, and it meant every fluid force in `integrate`
+// — all of which tested the cell the particle is IN — switched off at exactly
+// the moment the particle started floating. What was left acting on a chip of
+// exploded tree sitting on a pond was the wind, at wood's derived response of 8
+// and a leaf's of 15, with nothing pulling the other way. That is the owner's
+// report: rafts of debris skidding across open water.
+//
+// It costs one extra voxWordAt per tick for a particle that has lift and is not
+// already submerged, and there is no cheaper honest test: "am I on the water" is
+// a question about a cell this kernel otherwise never reads. Gating it on the
+// particle being SLOW would have been free and wrong — a chip the wind has
+// already got hold of is not slow, which is the case that has to be caught.
+fn liquidBelow(c : vec3<i32>) -> bool {
+  let b = c + vec3<i32>(0, -1, 0);
+  if (!inBounds(b)) { return false; }
+  let bm = voxMat(voxWordAt(b));
+  return bm != MAT_AIR && materials[bm].klass == CLASS_LIQUID;
 }
 
 // Next-tick dirty mark incl. boundary neighbors (particles run post-CA, so
@@ -346,14 +374,54 @@ fn integrate(@builtin(global_invocation_id) gid : vec3<u32>) {
     let ds = max(myDensity, 1);
     let buoy = min(PART_GRAVITY * materials[startMat].density / ds, PART_BUOY_MAX);
     p.vy += buoy * i32(myLift) / 15;
-    // Viscous damping, k/16 of the velocity per tick. Integer division
-    // truncates toward zero, which is symmetric — an arithmetic shift would
-    // bias every negative component and read as a permanent downward drift
-    // (the same trap the wind drag note below describes).
+  }
+
+  // Riding the surface: not IN the liquid, but touching it. See liquidBelow.
+  // Buoyancy above deliberately stays on `submerged` — Archimedes is a function
+  // of the fluid a voxel has actually displaced, and a floater at the waterline
+  // is on the air limb of its own bob. What `afloat` buys is the two statements
+  // below: the water still has hold of it, and the air does not.
+  let afloat = inFluid && !submerged && liquidBelow(startCell);
+  let wet = submerged || afloat;
+
+  // ---- the water drags it toward wherever the water is GOING ---------------
+  // Viscous damping, k/16 of the gap between the particle and the local current
+  // per tick. "Toward a standstill" was the same statement written for still
+  // water only, and re-aiming it at the field is the whole of this change:
+  // `currentAtQ` returns the zero vector whenever `sim.currentMode` is off, so
+  // the shipping default is an EXACT identity with the pure damping it replaces
+  // and the day the field is switched on a floating log rides it with nothing
+  // further to write. That identity is why this is one term rather than a
+  // damping plus a separate current push, which is the shape sim_fluid.wgsl
+  // uses: a node there has no damping of its own to fold into. Two drags would
+  // also be wrong on their own terms — one aimed at zero and one aimed at `u`
+  // settle a chip somewhere between the two, and a leaf on a river would trail
+  // the water forever.
+  //
+  // The coefficient is the material's own `fluid.drag` and there is no second
+  // knob. `fluid.drag` already answers "how hard does a liquid grab this
+  // material"; "how hard does a MOVING liquid grab it" is the same number.
+  //
+  // Integer division truncates toward zero, which is symmetric — an arithmetic
+  // shift would bias every negative component and read as a permanent downward
+  // drift (the same trap the wind drag note below describes).
+  if (wet) {
     let k = i32(matFluidDrag(materials[myMat]));
-    p.vx -= p.vx * k / 16;
-    p.vy -= p.vy * k / 16;
-    p.vz -= p.vz * k / 16;
+    // Gated on the mode, not on the returned zero, and the reason is the one
+    // sim_fluid.wgsl states: this is a drag, so reading a zero field is not
+    // free of consequence in general. Here it happens to be — the identity
+    // above — and the gate is kept anyway, because it also skips the primitive
+    // loop entirely in the world that has no current in it, which is every
+    // world today.
+    var u = vec3<i32>(0, 0, 0);
+    if (T.currentMode != 0u) { u = currentAtQ(startCell, &T) / PART_FIELD_SCALE; }
+    p.vx -= (p.vx - u.x) * k / 16;
+    p.vz -= (p.vz - u.z) * k / 16;
+    // VERTICALLY only when the particle is actually inside the liquid. A
+    // floater's vertical motion is the bob — gravity against the buoyancy it
+    // was given on the tick it was last under — and damping that from the air
+    // limb would be the water acting on a voxel it is not touching.
+    if (submerged) { p.vy -= (p.vy - u.y) * k / 16; }
   }
 
   // ---- wind (research doc §4.6) -------------------------------------------
@@ -379,7 +447,17 @@ fn integrate(@builtin(global_invocation_id) gid : vec3<u32>) {
   // gravity look broken the day wind shipped (windDragRampQ, common.wgsl, has
   // the numbers). Gravity is untouched above and stays untouched; what changes
   // is how much air there is to fall through.
-  if (T.windMode != WIND_MODE_OFF) {
+  //
+  // ...and NOT for a particle that is in or on water. A voxel touching a liquid
+  // answers to the liquid, and only to the liquid: it has ~800x the density of
+  // the air over it to be dragged by, and a raft of exploded tree skating across
+  // a pond on a breeze is what modelling both at once produced. This is an
+  // exclusion rather than a blend on purpose — a blend would need a submersion
+  // fraction, a grid voxel has no sub-voxel position to derive one from (the
+  // structural fact the buoyancy note at the top of this file is built on), and
+  // the fraction would be invented rather than measured. A chip that is thrown
+  // clear of the water is dry on the tick it clears it and the wind has it back.
+  if (T.windMode != WIND_MODE_OFF && !wet) {
     let resp = i32(matWindResponse(materials[p.payload & 0xFFFu]));
     // Almost every material is 0 (stone chips do not blow around), so the
     // common case is one comparison and no field evaluation at all.
@@ -397,9 +475,9 @@ fn integrate(@builtin(global_invocation_id) gid : vec3<u32>) {
         // Micro spray gets the same law as a whole voxel. It is the same air,
         // and droplets drifting downwind off a splash is most of what phase 3
         // buys.
-        let gx = w.x / PART_WIND_SCALE - p.vx;
-        let gy = w.y / PART_WIND_SCALE - p.vy;
-        let gz = w.z / PART_WIND_SCALE - p.vz;
+        let gx = w.x / PART_FIELD_SCALE - p.vx;
+        let gy = w.y / PART_FIELD_SCALE - p.vy;
+        let gz = w.z / PART_FIELD_SCALE - p.vz;
         // Two steps rather than one product: gap * resp * drag would leave i32
         // at the top of both knobs' ranges. Integer division truncates toward
         // zero, which is symmetric — the asymmetry an arithmetic shift would

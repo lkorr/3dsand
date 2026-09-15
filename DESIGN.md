@@ -3702,6 +3702,25 @@ touch a creature with a sword, lose a limb, anywhere, every time.
   material colour in `microbody.wgsl`, so a stain carried as paint is invisible
   on exactly the painted surfaces it matters most on. It renders, it travels
   with a severed limb, and it ejects as blood when cut again.
+- **...and on a living body that material DRIES BACK TO FLESH, it does not
+  evaporate** (`gore.woundHeals`, 2026-09-14). The body burn pass runs the
+  ordinary authored reaction table over a limb's lattice, and blood's rule in
+  `reactions.json` is `decay → air` at 8 per-mille a tick — written so a pool
+  on the ground dries up and its chunk sleeps (rule 2), and applied unchanged
+  to blood that is *inside a limb*. So every sword cut opened a hole that then
+  ate itself outward at a ~3 s half-life until the sever rules below took the
+  part off: the soak vanished, the anatomy under it showed through, and the
+  limb came apart with no further blows. A pool drying and a wound drying are
+  not the same event — blood soaked into meat leaves the meat, not a void. So a
+  live limb remembers the word each soaked voxel covered (`MobLimb::woundWas`,
+  a sparse aux layer keyed by limb: the word is full, and losing the table only
+  costs the revert), rolls that decay `gore.woundHealSlow`× slower, and puts
+  the flesh and its art slot BACK instead of removing the voxel.
+  **`woundHeals: false` is byte-for-byte the old behaviour and is the UNDEAD
+  setting** — global in `tuning.json` or per creature as the mob sidecar's
+  `bleed.woundHeals`, so a zombie's cuts go on rotting outward and shedding its
+  limbs while the living keep theirs. A severed limb is debris and has never
+  had the table, so a part already on the ground rots either way.
 - **Two structural sever rules, both blade-only.** *Cut through*: a component of
   the limb at least `gore.woundSeverFraction` of what it had is no longer joined
   to the anchor — the edge came out the other side. *Hanging by a thread*: the
@@ -4852,8 +4871,28 @@ mend`, `firebolt` = `fire trail projectile`, `ward` = `transmute null aura
 self`), and for the selected page a name, a word row you drag glyphs and pages
 into and reorder (right-click or drag out to remove), the derived readout on a
 dark page in small type, the price (`?` when it depends on `anything`), and
-Save / Duplicate / Delete. A page is bound to a key by dragging it from the
-list onto the key in the arsenal — the same gesture as a glyph. The row is
+Save / Duplicate / Delete.
+
+**What a drop on the word row DOES, and the fact that you can see it first
+(2026-09-14).** A word or a page from outside lands BEFORE the cell under the
+cursor (past the last word: appended). A word already in the row lands before
+the word it was dropped on — EXCEPT onto an immediate NEIGHBOUR, where the two
+SWAP. That exception is not decoration: moving a word one place right is
+erase-then-insert-before-its-old-right-neighbour, which lands it exactly where
+it already was, so the gesture answered leftward and silently did nothing
+rightward. `ctrl` turns a move into a copy (`fire fire` is a real sentence).
+Every cell PEEKS at the payload (`AcceptBeforeDelivery`) instead of waiting for
+the release, so the row draws the edit it is about to make — a gold caret at
+the seam, both cells lit with arrows between them for a swap, a red rim and a
+reason on the status line for a refusal (full page, authored page) — and the
+source cell is ghosted while its word is in the air. Every mutation of the row,
+from wherever it comes, pushes onto a UI-owned undo stack (`ctrl+Z` /
+`ctrl+Y`, 32 deep) that is DROPPED whenever the open page changes under it, so
+an undo can never paste one page's words into another. A page is bound to a key
+by dragging it from the list onto the key in the arsenal — the same gesture as
+a glyph — and a bound KEY is itself a drag source: onto another key the two
+bindings exchange (`UIState::BindMoveIntent`, the one gesture the single-slot
+bind latch cannot say), out of the panel it unbinds. The row is
 described through the same `DescribeSpell` the live sentence uses, so the
 panel can never disagree with the game about what a page means. Editing a
 page rewires every slot bound to it, because slots hold the page's name.
@@ -9206,13 +9245,32 @@ list.
   outside the AABB, so a still lake pays nothing. Deliberately NOT a symbolic
   divergence: that would be a THIRD transcription of every profile with nothing
   checking it.
-* **MPM particle drag** (`sim_fluid.wgsl`, `FLUID_CURRENT_DRAG`) -- the ONLY sim
+* **MPM particle drag** (`sim_fluid.wgsl`, `FLUID_CURRENT_DRAG`) -- the first sim
   consumer, and the only current knob a shader reads. Gated on
   `T.currentMode` rather than on a zero field, for the same reason the wind block
   beside it is: a drag term with a zero field still pulls every node toward a
   standstill, which is not "no current" but "infinite still water", and it would
   move the pinned hash through the settle seam. Unlike wind there is no exposure
   test -- air touches the skin of a body of water, a current runs through it.
+* **Debris in and on water** (`sim_particle.wgsl`, added 2026-09-14) -- the
+  buoyancy pass's viscous damping, re-aimed from zero at the local current. It
+  needs NO knob of its own: the coefficient is the material's authored
+  `fluid.drag`, which already answers "how hard does a liquid grab this", and
+  "how hard does a MOVING liquid grab it" is the same number. Unlike the MPM
+  arm this one is an exact identity at mode 0 twice over -- `currentAtQ`
+  returns zero, and the term it replaced aimed at zero -- so the gate there is
+  for the primitive loop's cost, not for the hash.
+
+  **The wind is EXCLUDED from the same particles, and that half is the bug
+  fix.** A floater at the waterline is not submerged -- its cell is the air
+  above the topmost water cell -- so every force keyed on the cell the particle
+  is IN switched off exactly when it started floating, leaving the wind acting
+  alone on wood (derived response 8) and leaves (15). Chips of an exploded tree
+  skated across a pond. `liquidBelow` is the missing predicate, and the rule is
+  an exclusion rather than a blend on purpose: blending needs a submersion
+  fraction and a grid voxel has no sub-voxel position to measure one from --
+  the same structural fact that put buoyancy in the particle ring rather than
+  in the CA (§5).
 * **The player** (`player.cpp`, in the `inLiquid` block) -- a drag toward the
   local flow scaled by SUBMERSION, which that file already computes as a
   fraction. Vertical included, deliberately: the downward limb of a drain's

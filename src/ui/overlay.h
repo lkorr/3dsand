@@ -681,6 +681,16 @@ struct UIState {
   std::string grimoireEditReadout;
   int32_t grimoireEditPrice = 0;
   bool grimoireEditPriceUnknown = false;
+  // COMPOSER UNDO, UI-owned like the row itself. Every mutation of the row
+  // pushes the list it replaced onto `grimoireUndo`; ctrl+Z pops it onto
+  // `grimoireRedo`. The stacks belong to ONE page: `grimoireUndoPage` records
+  // which, and the panel drops both the moment the open page changes under
+  // them (a page selected in the list, a save that renamed it, a delete) —
+  // an undo that pasted one page's words into another would be worse than no
+  // undo at all. The row is a drag-built list, and a drag that landed one cell
+  // off is the mistake this panel makes most.
+  std::vector<std::vector<std::string>> grimoireUndo, grimoireRedo;
+  std::string grimoireUndoPage;
   // `glyphSlots` above is already the bound strip (slot -> glyph id) and IS
   // the arsenal's bottom row — the panel and the live hotkeys read one mirror,
   // which is what makes binding in the panel provably the same thing as the
@@ -742,6 +752,14 @@ struct UIState {
     std::string glyphId;       // empty = unbind
     bool page = false;         // glyphId names a grimoire page, not a glyph
   } bindGlyph;
+  // A bound key dragged onto another bound key: the binding MOVES there,
+  // exchanging with whatever was already on that key. One gesture, two binds —
+  // which the single-slot BindIntent above cannot say, and the reason the
+  // twenty keys used to be rearrangeable only by re-dragging from the table.
+  struct BindMoveIntent {
+    bool pending = false;
+    int from = -1, to = -1;    // 0..kGlyphSlots-1
+  } moveBind;
   // A grimoire operation: save the composed page (cycle-checked by main.cpp,
   // refused with the reason in kitMessage), delete a page, or duplicate a
   // read-only starter into the player's own pages.

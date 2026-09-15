@@ -432,6 +432,37 @@ function pvEl(tag, attrs, ...kids){
   for (const c of kids) if (c != null) e.append(c);
   return e;
 }
+/* ---- prose, collapsed to its first sentence --------------------------------
+ *
+ * The explanations are why the numbers on this page can be trusted, so NOTHING
+ * is deleted here. But eight lines of prose above every chart is what made the
+ * tab a single 6,000 px column you had to scroll to compare two halves of one
+ * frame — and in two columns it is worse, because the same words wrap to twice
+ * the height. So a long note keeps its first sentence on screen and puts the
+ * rest behind a disclosure.
+ *
+ * `class="note"` stays on the container either way: the harness reads notes by
+ * that class and a <details>'s textContent includes the collapsed body, so an
+ * assertion about the words still sees them.
+ */
+const PV_NOTE_MAX = 190;
+function pvNote(text, cls){
+  const c = 'note' + (cls ? ' ' + cls : '');
+  if (text.length <= PV_NOTE_MAX) return pvEl('p', { class:c }, text);
+  // Cut at a sentence end, never mid-thought: a summary that trails off is
+  // worse than a long paragraph. A lead-in under 60 chars is not a sentence
+  // worth showing alone, and a tail under 40 is not worth hiding.
+  let cut = -1;
+  const re = /[.?!]\s/g;
+  for (let m; (m = re.exec(text)); )
+    if (m.index >= 60){ cut = m.index + 1; break; }
+  if (cut < 0 || text.length - cut < 40) return pvEl('p', { class:c }, text);
+  const d = pvEl('details', { class:c + ' pv-note-more' });
+  d.append(pvEl('summary', {}, text.slice(0, cut)));
+  d.append(pvEl('span', {}, text.slice(cut).trim()));
+  return d;
+}
+
 const PV_NS = 'http://www.w3.org/2000/svg';
 function pvS(tag, attrs, ...kids){
   const e = document.createElementNS(PV_NS, tag);
@@ -718,6 +749,10 @@ const PV_INK3  = 'var(--faint)';
 const PV_LINE  = 'var(--line)';
 const PV_SURF  = 'var(--card)';
 const PV_GAP   = 2;      // the surface gap between touching fills
+// The viewBox width a chart drawn INSIDE one of the two columns uses. Roughly
+// the pixel width of a column on a 1400 px window, so the labels come out close
+// to 1:1 instead of condensed to two thirds (see pvLineChart).
+const PV_COL_W = 640;
 
 function pvChartFrame(w, h, pad){
   const svg = pvS('svg', { width:'100%', height:h, viewBox:`0 0 ${w} ${h}`,
@@ -774,7 +809,13 @@ function pvRollingPctl(arr, win, p, stride){
  * chart's x domain (0..frames-1) regardless of its own sampling stride.
  */
 function pvLineChart(V, opts){
-  const w = 1000, h = opts.height || 220, padL = 52, padR = 12, padT = 12, padB = 24;
+  // `w` is the VIEWBOX width, not a pixel width — the svg is width:100% with
+  // preserveAspectRatio:none, so this number decides how much the labels get
+  // stretched, not how wide the chart is. A 1000-unit viewBox squeezed into a
+  // 640 px column condenses every tick label to 64%, which is why the column
+  // charts pass PV_COL_W instead.
+  const w = opts.w || 1000;
+  const h = opts.height || 220, padL = 52, padR = 12, padT = 12, padB = 24;
   const n = V.frames;
   const svg = pvChartFrame(w, h);
   if (!n) return svg;
@@ -834,7 +875,8 @@ function pvLineChart(V, opts){
  * a glance in a way a number is not.
  */
 function pvStackedArea(V, opts){
-  const w = 1000, h = opts.height || 240, padL = 52, padR = 12, padT = 12, padB = 24;
+  const w = opts.w || 1000;                        // viewBox units — see pvLineChart
+  const h = opts.height || 240, padL = 52, padR = 12, padT = 12, padB = 24;
   const n = V.frames;
   const svg = pvChartFrame(w, h);
   if (!n) return svg;
@@ -1077,9 +1119,14 @@ function pvBars(rows, opts){
     row.append(pvEl('div', { class:'pv-bar-val' }, pvNum(r.ms) + ' ms'));
     row.append(pvEl('div', { class:'pv-bar-pct' },
                     totalMs > 0 ? pvPct(r.ms/totalMs) : '—'));
-    row.append(pvEl('div', { class:'pv-bar-why' }, r.why || ''));
+    // Only when there IS one. In a column the `why` is a second grid line under
+    // the bar, and an empty div there would spend a line of height on nothing.
+    if (r.why) row.append(pvEl('div', { class:'pv-bar-why' }, r.why));
     if (r.tip){
-      row.title = r.tip;
+      // The denominator rides in the tooltip as well as the line below the bar:
+      // a narrow column ellipsises the visible copy, and a truncated `why` that
+      // cannot be recovered is the same as no `why`.
+      row.title = r.tip + (r.why ? '\n\n' + r.why : '');
     }
     wrap.append(row);
   }
@@ -1118,7 +1165,8 @@ function pvSpark(values, opts){
  * page exists to find.
  */
 function pvHistogram(values, opts){
-  const w = 1000, h = 150, padL = 52, padR = 12, padT = 10, padB = 30;
+  const w = (opts && opts.w) || 1000;              // viewBox units — see pvLineChart
+  const h = 150, padL = 52, padR = 12, padT = 10, padB = 30;
   const svg = pvChartFrame(w, h);
   if (!values.length) return svg;
   const lo = 0, hi = Math.max(pvPctl(values, 0.995) * 1.15, 1);
@@ -1312,11 +1360,22 @@ function renderPerformance(){
   const W = pvRecent(V, pvWinSec);
   const T = pvTotals(W);
   root.append(pvVerdictPanel(V, T, W));
-  root.append(pvTimelineSection(V, T));
-  root.append(pvPercentileSection(V, T));
-  root.append(pvBreakdownSection(V, T, W));
+  // THE TWO HALVES OF ONE FRAME, SIDE BY SIDE. Everything GPU goes down the
+  // left column and everything CPU down the right, because the question this
+  // page is opened with is "which side is the problem" and the old layout made
+  // that a scroll: the GPU timeline, the CPU timeline, the GPU bars and the CPU
+  // bars were four sections stacked ~1,200 px apart, so comparing a spike in
+  // one against the other meant remembering a number rather than seeing it.
+  // Columns are not decoration here — they are what makes the comparison
+  // possible at all.
+  root.append(pvSplitSection(V, T, W));
   root.append(pvCountersSection(V, W));
-  root.append(pvDistributionSection(V));
+  // The whole-frame pair. Neither belongs to a side — they are both about the
+  // frame the two columns above add up to — so they get their own row of two.
+  const frameRow = pvEl('div', { class:'pv-cols' });
+  frameRow.append(pvPercentileSection(V, T));
+  frameRow.append(pvDistributionSection(V));
+  root.append(frameRow);
   if (!V.live){
     root.append(pvComparisonSection());
     root.append(pvPassSection(V));
@@ -1438,20 +1497,32 @@ function pvVerdictPanel(V, T, W){
   return sec;
 }
 
-/* ---- timeline ------------------------------------------------------------- */
-function pvTimelineSection(V, T){
-  const sec = pvEl('section', { class:'pv-sec' });
-  sec.append(pvEl('h3', {}, 'Where the frame goes, over time'));
-  sec.append(pvEl('p', { class:'note' },
+/* ---- timelines ------------------------------------------------------------
+ * One per side, each built into its own column. They were a single section
+ * with two charts stacked; splitting them is what lets the GPU stack and the
+ * CPU stack share a screen line, which is the only way to see that a CPU spike
+ * and a GPU dip are the same event.
+ *
+ * The two charts deliberately do NOT share a y scale, and the CPU one keeps its
+ * budget lines off: a 0.5 ms CPU trace drawn against the GPU's 20 ms axis is a
+ * flat line at zero. Side-by-side makes that temptation stronger, so it is
+ * worth saying again here — these are two measurements that share an x axis and
+ * nothing else.
+ */
+function pvGpuTimeline(V, T){
+  const sec = pvEl('div', {});
+  sec.append(pvEl('h4', { class:'pv-h4' }, 'GPU time, over time'));
+  sec.append(pvNote(
     'Stacked GPU time per component, with the whole frame drawn over it as a '
     + 'line. The gap between the two is the CPU: if the line sits well above the '
     + 'stack, something on the CPU is holding the frame. The dashed lines are '
-    + 'the 60 fps and 30 fps budgets. Hover anywhere for the exact split.'));
+    + 'the 60 fps and 30 fps budgets. Hover anywhere for the exact split.',
+    'pv-tnote'));
 
   const gpuSeries = {};
   for (const k in V.gpu) if (pvSum(V.gpu[k]) > 0) gpuSeries[k] = V.gpu[k];
-  sec.append(pvStackedArea(V, { series:gpuSeries, height:250, side:'gpu',
-                                wall: V.wall }));
+  sec.append(pvStackedArea(V, { series:gpuSeries, height:220, side:'gpu',
+                                w:PV_COL_W, wall: V.wall }));
   // The legend is built from the SAME identity split the stack draws, so a row
   // and a band are never two different things wearing one colour.
   const gHued = T.gpu.filter(g => pvHasHue(g.id, 'gpu'));
@@ -1465,32 +1536,37 @@ function pvTimelineSection(V, T){
   legItems.push({ col:PV_INK, label:'frame time (wall clock)', ms:T.wallMs,
                   line:true });
   sec.append(pvLegend(legItems));
+  return sec;
+}
 
-  if (T.cpuBusy.length){
-    sec.append(pvEl('h3', { class:'pv-h3b' }, 'CPU work, over time'));
-    sec.append(pvEl('p', { class:'note' },
-      'The same frames, CPU side only — a separate chart rather than a '
-      + 'second axis on the one above, because two y-scales on one plot invent a '
-      + 'correlation that is not in the data.'));
-    const cpuSeries = {};
-    for (const k in V.cpu)
-      if (k !== 'present' && pvSum(V.cpu[k]) > 0) cpuSeries[k] = V.cpu[k];
-    // budgets:false -- the frame-budget lines belong to the chart that plots
-    // the whole frame. On a 0.5 ms CPU trace a 20 ms axis is a flat line at
-    // zero, which renders, asserts clean, and shows nothing.
-    sec.append(pvStackedArea(V, { series:cpuSeries, height:170, side:'cpu',
-                                  budgets:false,
-                                  nodeOf: k => pvScopeNode(k) || k }));
-    const cHued = T.cpuBusy.filter(c => pvHasHue(c.id, 'cpu'));
-    const cTail = T.cpuBusy.filter(c => !pvHasHue(c.id, 'cpu'));
-    const cLeg = cHued.map(c => ({ col:pvHue(c.id,'cpu'), label:c.label, ms:c.ms,
-                                   tip: pvScopeNote(c.scope)
-                                     || (pvNodeById(c.id)||{}).note || '' }));
-    if (cTail.length)
-      cLeg.push({ col:PV_OTHER, label:'Other: ' + cTail.map(c=>c.label).join(', '),
-                  ms: cTail.reduce((a,b)=>a+b.ms,0) });
-    sec.append(pvLegend(cLeg));
-  }
+function pvCpuTimeline(V, T){
+  if (!T.cpuBusy.length) return pvEl('span');
+  const sec = pvEl('div', {});
+  sec.append(pvEl('h4', { class:'pv-h4' }, 'CPU time, over time'));
+  sec.append(pvNote(
+    'The same frames, CPU side only — a separate chart rather than a second '
+    + 'axis on the GPU one beside it, because two y-scales on one plot invent a '
+    + 'correlation that is not in the data. The x axis is shared, so a feature '
+    + 'at the same horizontal position in both charts is the same frame.',
+    'pv-tnote'));
+  const cpuSeries = {};
+  for (const k in V.cpu)
+    if (k !== 'present' && pvSum(V.cpu[k]) > 0) cpuSeries[k] = V.cpu[k];
+  // budgets:false -- the frame-budget lines belong to the chart that plots
+  // the whole frame. On a 0.5 ms CPU trace a 20 ms axis is a flat line at
+  // zero, which renders, asserts clean, and shows nothing.
+  sec.append(pvStackedArea(V, { series:cpuSeries, height:220, side:'cpu',
+                                w:PV_COL_W, budgets:false,
+                                nodeOf: k => pvScopeNode(k) || k }));
+  const cHued = T.cpuBusy.filter(c => pvHasHue(c.id, 'cpu'));
+  const cTail = T.cpuBusy.filter(c => !pvHasHue(c.id, 'cpu'));
+  const cLeg = cHued.map(c => ({ col:pvHue(c.id,'cpu'), label:c.label, ms:c.ms,
+                                 tip: pvScopeNote(c.scope)
+                                   || (pvNodeById(c.id)||{}).note || '' }));
+  if (cTail.length)
+    cLeg.push({ col:PV_OTHER, label:'Other: ' + cTail.map(c=>c.label).join(', '),
+                ms: cTail.reduce((a,b)=>a+b.ms,0) });
+  sec.append(pvLegend(cLeg));
   return sec;
 }
 
@@ -1500,7 +1576,7 @@ function pvTimelineSection(V, T){
 function pvPercentileSection(V, T){
   const sec = pvEl('section', { class:'pv-sec' });
   sec.append(pvEl('h3', {}, 'Frame time distribution, over time'));
-  sec.append(pvEl('p', { class:'note' },
+  sec.append(pvNote(
     'Each line is a percentile of the trailing ' + pvPctlWin + ' frames, so the '
     + 'value at any point is the distribution of the recent past rather than one '
     + 'frame. Percentiles rather than a smoothed average on purpose: averaging '
@@ -1558,7 +1634,7 @@ function pvPercentileSection(V, T){
       'Every series is hidden — turn one on above.'));
     return sec;
   }
-  sec.append(pvLineChart(V, { lines, height:230 }));
+  sec.append(pvLineChart(V, { lines, height:230, w:PV_COL_W }));
 
   // Legend carries the WHOLE-RUN value, which is the number you quote. The
   // chart shows how it moved; the legend says where it ended up.
@@ -1710,7 +1786,7 @@ function pvRmDenoms(W){
 function pvRmSection(W, rm, rmMs){
   const box = pvEl('div', { class:'pv-rm' });
   box.append(pvEl('h4', { class:'pv-h4' }, 'Raymarch breakdown (estimated)'));
-  box.append(pvEl('p', { class:'note' },
+  box.append(pvNote(
     'The raymarch bar above is ONE fragment shader -- the shadow ray, the far '
     + 'cascade and the reflections all run inside it, and no timestamp can be '
     + 'put between them. These rows split that single span by the STEPS each '
@@ -1742,16 +1818,20 @@ function pvRmSection(W, rm, rmMs){
  * The list the page exists for. Sorted by cost, GPU and CPU kept apart, each
  * bar carrying the counter that explains it.
  */
-function pvBreakdownSection(V, Tmean, W){
+function pvSplitSection(V, Tmean, W){
   W = W || V;
-  const sec = pvEl('section', { class:'pv-sec' });
-  sec.append(pvEl('h3', {}, 'Cost by engine component'));
+  const sec = pvEl('section', { class:'pv-sec pv-split' });
+  sec.append(pvEl('h3', {}, 'Where the frame goes — GPU and CPU, side by side'));
 
   // The breakdown reads whichever statistic is selected; the verdict panel
   // above keeps the mean (see pvTotals).
   const T = pvStat === 'mean' ? Tmean : pvTotals(W, pvStat);
   const sd = pvStatDef();
 
+  // ONE selector for BOTH columns, above them. Two copies of the same control,
+  // one per column, would be two ways to put the halves of a single frame into
+  // different statistics — a p99 GPU bar beside a mean CPU bar is not a
+  // comparison of anything.
   const chips = pvEl('div', { class:'pv-toggles' });
   for (const s of PV_STATS){
     const on = pvStat === s.key;
@@ -1763,14 +1843,14 @@ function pvBreakdownSection(V, Tmean, W){
   }
   sec.append(chips);
 
-  sec.append(pvEl('p', { class:'note' },
+  sec.append(pvNote(
     (pvStat === 'mean' ? 'Mean' : sd.label) + ' milliseconds per frame over the '
-    + pvWinLabel(W) + '. ' + sd.tip + ' The right-hand column is the work that '
+    + pvWinLabel(W) + '. ' + sd.tip + ' The line under each bar is the work that '
     + 'produced it — a duration with no denominator says a component is slow '
     + 'without saying why. Component names are the same boxes as the Engine '
     + 'tab’s architecture map.'));
   if (pvStat !== 'mean')
-    sec.append(pvEl('p', { class:'note' },
+    sec.append(pvNote(
       'THE PARTS DO NOT ADD TO THE TOTAL under a percentile, and that is '
       + 'arithmetic rather than a bug: each component’s worst frame is a '
       + 'DIFFERENT frame, so adding their ' + sd.label + 's would describe a '
@@ -1825,7 +1905,20 @@ function pvBreakdownSection(V, Tmean, W){
     return parts.join(' · ');
   };
 
-  sec.append(pvEl('h4', { class:'pv-h4' }, 'GPU'));
+  /* ---- the two columns ---- */
+  const grid = pvEl('div', { class:'pv-cols' });
+  const gcol = pvEl('div', { class:'pv-col pv-col-gpu' });
+  const ccol = pvEl('div', { class:'pv-col pv-col-cpu' });
+
+  // Each column states its own total in its heading, because that is the
+  // comparison the split exists to make: "8.4 ms GPU / 3.1 ms CPU busy" is the
+  // whole verdict, and it should be readable without moving your eyes down to
+  // the summed row at the bottom of either list.
+  gcol.append(pvColHead('GPU', T.gpuMs, T.wallMs,
+    'Every timed GPU pass. Passes are sequential on one queue, so this is the '
+    + 'GPU time in the frame.'));
+  gcol.append(pvGpuTimeline(V, Tmean));
+  gcol.append(pvEl('h4', { class:'pv-h4' }, 'Cost by component'));
   const gpuRows = T.gpu.map(g => ({
     label:g.label, ms:g.ms, side:'gpu', col:PV_SEQ[3], why: whyFor(g.id),
     tip: (pvNodeById(g.id)||{}).note || '' }));
@@ -1839,7 +1932,7 @@ function pvBreakdownSection(V, Tmean, W){
     tip:'Every timed GPU pass added together. Passes are sequential on one '
       + 'queue, so this sum IS the GPU time in the frame. Compare it with the '
       + 'frame time: if it fills the frame, the GPU is the limit.' });
-  sec.append(pvBars(gpuRows, { total:T.wallMs }));
+  gcol.append(pvBars(gpuRows, { total:T.wallMs }));
 
   // The raymarch drill-down sits under the bar it explains, not at the bottom
   // of the page: it is the only row up there whose cost cannot be subdivided by
@@ -1847,10 +1940,15 @@ function pvBreakdownSection(V, Tmean, W){
   // Absent entirely on a perf.json recorded before the counters landed.
   if (rm){
     const rmGpu = T.gpu.find(g => g.id === 'raymarch');
-    sec.append(pvRmSection(W, rm, rmGpu ? rmGpu.ms : 0));
+    gcol.append(pvRmSection(W, rm, rmGpu ? rmGpu.ms : 0));
   }
 
-  sec.append(pvEl('h4', { class:'pv-h4' }, 'CPU'));
+  ccol.append(pvColHead('CPU', T.cpuBusyMs, T.wallMs,
+    'Every CPU scope except the present wait. Busy and waiting are concurrent '
+    + 'with the GPU, not sequential with each other.',
+    T.waitMs > 0 ? pvNum(T.waitMs,1) + ' ms waiting on the GPU' : null));
+  ccol.append(pvCpuTimeline(V, Tmean));
+  ccol.append(pvEl('h4', { class:'pv-h4' }, 'Cost by component'));
   const cpuRows = T.cpuBusy.map(c => ({
     label:c.label, ms:c.ms, side:'cpu', col:PV_SEQ[2], why: whyFor(c.id),
     // The SCOPE note first: the bar is labelled with the architecture node
@@ -1872,17 +1970,37 @@ function pvBreakdownSection(V, Tmean, W){
     label:'waiting on the GPU', ms:T.waitMs, col:PV_WAIT, dim:true,
     why:'not work — the shape of the bottleneck',
     tip: pvScopeNote('present') });
-  sec.append(pvBars(cpuRows, { total:T.wallMs }));
+  ccol.append(pvBars(cpuRows, { total:T.wallMs }));
 
+  // The unattributed warning belongs to the GPU column: it is GPU time no
+  // component claims, and it is the reason that column's bars would not add up.
   if (V.unattributed && V.unattributed.ns > 0){
-    sec.append(pvEl('p', { class:'pv-warn' },
+    gcol.append(pvEl('p', { class:'pv-warn' },
       'Unattributed GPU time: ' + pvNum(V.unattributed.ns/1e6/V.frames)
       + ' ms/frame across ' + V.unattributed.names.length + ' pass(es) ('
       + V.unattributed.names.join(', ') + '). These are dispatches no component '
       + 'in perfnodes.h claims — the bars above do not add up to the GPU '
       + 'total until this is zero.'));
   }
+
+  grid.append(gcol, ccol);
+  sec.append(grid);
   return sec;
+}
+
+/* ---- a column heading -----------------------------------------------------
+ * The side, its total, and its share of the frame, in one line each so the two
+ * columns can be compared without reading either list.
+ */
+function pvColHead(side, ms, wallMs, tip, extra){
+  const h = pvEl('div', { class:'pv-col-head pv-col-head-'+side.toLowerCase(),
+                          title: tip || null });
+  h.append(pvEl('span', { class:'pv-col-name' }, side));
+  h.append(pvEl('span', { class:'pv-col-ms' }, pvNum(ms,1) + ' ms'));
+  h.append(pvEl('span', { class:'pv-col-pct' },
+                wallMs > 0 ? pvPct(ms/wallMs) + ' of the frame' : ''));
+  if (extra) h.append(pvEl('span', { class:'pv-col-extra' }, extra));
+  return h;
 }
 
 /* ---- counters -------------------------------------------------------------
@@ -1895,7 +2013,7 @@ function pvCountersSection(V, W){
   if (!keys.length) return pvEl('span');
   const sec = pvEl('section', { class:'pv-sec' });
   sec.append(pvEl('h3', {}, 'What the engine was doing'));
-  sec.append(pvEl('p', { class:'note' },
+  sec.append(pvNote(
     'The denominators. Each is its own chart with its own scale — two '
     + 'counters sharing one plot would imply a relationship the numbers do not '
     + 'have. The big figure is the mean over the ' + pvWinLabel(W)
@@ -1930,7 +2048,7 @@ function pvCountersSection(V, W){
 function pvDistributionSection(V){
   const sec = pvEl('section', { class:'pv-sec' });
   sec.append(pvEl('h3', {}, 'Frame time distribution'));
-  sec.append(pvEl('p', { class:'note' },
+  sec.append(pvNote(
     'Percentiles, not the mean: the mean hides exactly the hitches this page '
     + 'exists to find. These are over the WHOLE run — the plot above is the '
     + 'same statistics over a trailing window, which is where you see when '
@@ -1942,7 +2060,7 @@ function pvDistributionSection(V){
                         ms > 33.34 ? 'amber' : null));
   }
   sec.append(tiles);
-  sec.append(pvHistogram(V.wall, {}));
+  sec.append(pvHistogram(V.wall, { w:PV_COL_W }));
   return sec;
 }
 

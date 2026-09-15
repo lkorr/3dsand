@@ -785,6 +785,8 @@ bool LoadTuning(const std::string& path, Tuning& out) {
     ReadF(*g, "woundStainBlob", e.woundStainBlob, out, at);
     ReadF(*g, "woundStainCoherence", e.woundStainCoherence, out, at);
     ReadF(*g, "craterStainRim", e.craterStainRim, out, at);
+    ReadB(*g, "woundHeals", e.woundHeals, out, at);
+    ReadF(*g, "woundHealSlow", e.woundHealSlow, out, at);
     ReadF(*g, "stainCutRadius", e.stainCutRadius, out, at);
     ReadI(*g, "stainCutAmount", e.stainCutAmount, out, at);
     ReadI(*g, "stainCutBuried", e.stainCutBuried, out, at);
@@ -833,6 +835,10 @@ bool LoadTuning(const std::string& path, Tuning& out) {
     e.woundStainBlob = std::clamp(e.woundStainBlob, 0.25f, 16.0f);
     e.woundStainCoherence = std::clamp(e.woundStainCoherence, 0.0f, 1.0f);
     e.craterStainRim = std::clamp(e.craterStainRim, 0.0f, 16.0f);
+    // A DIVISOR. Below 1 it would make a wound dry FASTER than the authored
+    // rule, which is a different feature wearing this one's name; the ceiling
+    // is where "slower" has become "never" anyway.
+    e.woundHealSlow = std::clamp(e.woundHealSlow, 1.0f, 64.0f);
     e.stainCutRadius = std::clamp(e.stainCutRadius, 0.0f, 16.0f);
     e.stainCutAmount = std::clamp(e.stainCutAmount, 0, 15);
     e.stainCutBuried = std::clamp(e.stainCutBuried, 0, 15);
@@ -2810,6 +2816,8 @@ bool SaveCombatTuning(const std::string& path, const Tuning& t,
     put("woundStainBlob", g.woundStainBlob);
     put("woundStainCoherence", g.woundStainCoherence);
     put("craterStainRim", g.craterStainRim);
+    putB("woundHeals", g.woundHeals);
+    put("woundHealSlow", g.woundHealSlow);
     put("corpseBleedPerVoxel", g.corpseBleedPerVoxel);
     put("bleedGain", g.bleedGain);
     put("bleedHpPerVoxel", g.bleedHpPerVoxel);
