@@ -219,6 +219,11 @@ bool LoadItemAsset(const std::string& dir, size_t materialCount,
 
   d.hp = s.value("hp", 30.0f);
   d.severable = s.value("severable", true);
+  // Greyscale-weave art, i.e. a piece a dye means something on (game/dye.h).
+  // Defaults false, which is every piece authored before the commoner
+  // wardrobe: those are painted in real colours and multiplying them by
+  // another colour is not a feature.
+  d.dyeable = s.value("dyeable", false);
   d.severImpactSpeed = s.value("severImpactSpeed", 0.0f);
   if (s.contains("spring") && s["spring"].is_object()) {
     d.hasSpring = true;

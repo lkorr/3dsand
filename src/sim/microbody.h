@@ -130,7 +130,18 @@ struct MicroBodyInstGpu {
   // 0 bitcasts to 0.0f, so the default is "no flash" for free — which is what
   // debris (phys/debris.cpp) keeps passing.
   uint32_t flashBits = 0;
-  uint32_t pad1 = 0;
+  // THE DYE, packed (game/dye.h): bit 24 set = dyed, low 24 bits the colour in
+  // `unpackColor`'s own byte order. 0 = undyed, which is every body limb, every
+  // piece of debris and every garment nobody has coloured — so the default
+  // costs nothing and the shader's test is one bit.
+  //
+  // The LAST padding word this struct had, taken for the same reason
+  // `flashBits` took the one before it: the struct must stay 16 bytes (the
+  // static_assert below is the only mechanical guard the CPU/WGSL pair has,
+  // because check_invariants.py cannot see a hand-written mirror), so a new
+  // per-instance value either fits in a spare word or does not exist. There
+  // are now no spare words. The next one needs a second buffer.
+  uint32_t dye = 0;
 };
 static_assert(sizeof(MicroBodyInstGpu) == 16,
               "must match microbody.wgsl MicroBodyInst");
@@ -427,5 +438,16 @@ struct MicroBodyRef {
   // may be coarser. Equal values are the ordinary case and mean the two
   // lattices coincide exactly as they did before the split.
   uint32_t skinScale = 1;
+  // The DYE this body renders in (game/dye.h), packed; 0 = undyed, which is
+  // everything except a coloured garment.
+  //
+  // IT BELONGS HERE BECAUSE A MicroBodyRef IS A RENDER DESCRIPTION — the note
+  // three lines up already says so, and "what colour is it" is the same kind
+  // of fact as "which brick" and "at what pitch". Putting it here is also what
+  // makes the severed-garment case free: DebrisSystem::AdoptBody already takes
+  // a ref, both of Mob's hand-off sites already build one from the limb, so a
+  // sleeve cut off a red shirt arrives in the debris system red with no new
+  // argument threaded through either call.
+  uint32_t dye = 0;
   bool Valid() const { return model != kMicroBodyNoModel; }
 };

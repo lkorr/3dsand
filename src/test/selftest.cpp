@@ -53,6 +53,7 @@ const std::vector<Gate>& PlayerKitGates();
 const std::vector<Gate>& GrimoireGates();
 const std::vector<Gate>& SwingGates();
 const std::vector<Gate>& EquipmentGates();
+const std::vector<Gate>& DyeGates();
 const std::vector<Gate>& WoundGates();
 // ONE list for all six combat gates (two feel gates and four NPC ones), even
 // though kOrder splits them to opposite ends of the run: the registry is a
@@ -220,6 +221,12 @@ const char* const kOrder[] = {
     // Pure anim over its own five-part fixture — it touches no shared World and
     // so is order-independent; it sits here to keep the armour gates together.
     "armor-track", "armor-stock",
+    // THE COMMONER WARDROBE AND ITS DYE. Here because it dresses the same
+    // stock rig `armor-stock` just undressed, and for the same reason: the
+    // shipped pieces want a real def on real terrain. Everything else it
+    // asserts is pure CPU (the shader constant, the packing, the stacking
+    // rule, the save payload) and costs nothing.
+    "dye",
     "ragdoll-joints",
     // Beside `ragdoll-joints` and for the same reason: both are pure Jolt over
     // their own fixture, 640 voxels from anything, and both remove every body
@@ -454,7 +461,7 @@ const std::vector<Gate>& Registry() {
                           &WorldIoGates(), &AudioGates(),
                           &VoxRegionGates(),
                           &SpellGates(), &PlayerKitGates(), &GrimoireGates(), &SwingGates(),
-                          &EquipmentGates(), &WoundGates(), &CombatGates()})
+                          &EquipmentGates(), &DyeGates(), &WoundGates(), &CombatGates()})
       pool.insert(pool.end(), g->begin(), g->end());
 
     std::vector<Gate> v;

@@ -1919,9 +1919,10 @@ bool MobSystem::EquipItem(uint64_t mobId, const ItemDef* item,
   return mob ? mob->EquipItem(item, context) : false;
 }
 
-bool MobSystem::WearItem(uint64_t mobId, const ItemDef* item, int equipSlot) {
+bool MobSystem::WearItem(uint64_t mobId, const ItemDef* item, int equipSlot,
+                         uint32_t dye) {
   Mob* mob = FindMobById(mobId);
-  return mob ? mob->WearItem(item, equipSlot) : false;
+  return mob ? mob->WearItem(item, equipSlot, nullptr, dye) : false;
 }
 
 bool MobSystem::UnwearItem(uint64_t mobId, int equipSlot) {
@@ -4899,6 +4900,10 @@ std::string Mob::ShedGearBeforeDetach(int limbIndex) {
   LostGear lg;
   lg.equipSlot = worn_[pi].equipSlot;
   lg.item = worn_[pi].item;
+  // The colour goes with it. The shell about to detach is one of this piece's,
+  // and every shell of one garment carries the same dye (Mob::WearItem).
+  if (limbIndex >= 0 && limbIndex < (int)limbs_.size())
+    lg.dye = limbs_[limbIndex].dye;
   CaptureWorn(lg.equipSlot, lg.damage);
   name = lg.item;
   // The other shells are sewn to this one: they fall as rags. Collected
@@ -11632,7 +11637,7 @@ void Mob::DetachLimb(int limbIndex, bool adopt) {
     // A PIECE OF GEAR HITTING THE FLOOR: tell the ground registry which item
     // that body is, so `E` can pick it up (Mob::LostGear).
     if (!shedAs.empty() && sys_ && sys_->onItemShed_)
-      sys_->onItemShed_(limb.holdBody, shedAs);
+      sys_->onItemShed_(limb.holdBody, shedAs, limb.dye);
     // A GARMENT THAT HAS LEFT IS NOT A FOLLOWER. It is DebrisSystem's now and
     // has real dynamics of its own from the end of the sever hold; a shell that
     // kept its host would be teleported back onto a limb it has fallen off,
@@ -11718,6 +11723,10 @@ void Mob::Die() {
       piece.item = p.item;
       piece.equipSlot = p.equipSlot;
       piece.body = limbs_[idSlot].body;
+      // The colour, off the identity shell — every shell of one garment
+      // carries the same word (Mob::WearItem hands it to all of them), so any
+      // of them would answer; the identity shell is the one already in hand.
+      piece.dye = limbs_[idSlot].dye;
       for (size_t k = 0; k < p.slots.size() && k < p.cover.size(); k++)
         if (p.slots[k] == idSlot) piece.identityCover = p.cover[k];
       for (int s : p.slots)
@@ -11980,7 +11989,11 @@ uint32_t Mob::AppendMicroInsts(std::vector<MicroBodyInstGpu>& out,
       // is a render path that runs once per limb per frame.
       uint32_t bits = 0;
       if (limb.hitFlash > 0.0f) std::memcpy(&bits, &limb.hitFlash, 4);
-      out.push_back({slot, (uint32_t)limb.microModel, bits, 0});
+      // The fourth word is the DYE (game/dye.h), which was the last padding
+      // word this struct had. 0 for every body limb and every undyed piece,
+      // and 0 is what the shader reads as "no dye" — so nothing that is not a
+      // coloured garment costs anything here or on the GPU.
+      out.push_back({slot, (uint32_t)limb.microModel, bits, limb.dye});
     }
     slot++;
   }
@@ -13060,7 +13073,8 @@ void Mob::RemoveAppendedSlots(int first, int count) {
 // no special case anywhere. The only authored number is where its own corner
 // sits relative to the limb's.
 int Mob::AppendWornShell(const ItemDef& item, const ItemCover& cover,
-                         int bodyLimb, const std::string& partName) {
+                         int bodyLimb, const std::string& partName,
+                         uint32_t dye) {
   if (!phys_ || bodyLimb < 0 || bodyLimb >= (int)limbs_.size()) return -1;
   if (cover.voxels.empty()) return -1;
   // A limb that has already come off cannot be covered. Not an error: an
@@ -13179,6 +13193,11 @@ int Mob::AppendWornShell(const ItemDef& item, const ItemCover& cover,
   MobLimb& p = limbs_[slot];
   p.hp = cover.hp;
   p.microModel = cover.microModel;
+  // The colour this garment is (game/dye.h). Per SHELL rather than per piece,
+  // so it survives the shell being cut off and handed to DebrisSystem — see
+  // MobLimb::dye. Render-only: nothing below this line reads it, the collider
+  // does not see it, and it is not hashed.
+  p.dye = dye;
   p.ownSkinScale = itemScale;
   p.ownPhysScale = physScale;
   // restOffset MEANS THE MODEL'S MIN CORNER in the creature's rest frame —
@@ -13313,7 +13332,7 @@ int Mob::AppendWornShell(const ItemDef& item, const ItemCover& cover,
 }
 
 bool Mob::WearItem(const ItemDef* item, int equipSlot,
-                   const WornDamage* damage) {
+                   const WornDamage* damage, uint32_t dye) {
   if (!def_ || !phys_ || !item) return false;
   if (limbs_.empty()) return false;   // unspawned: nothing to put it on
   if (item->cover.empty()) return false;
@@ -13334,7 +13353,7 @@ bool Mob::WearItem(const ItemDef* item, int equipSlot,
     for (int i = 0; i < baseLimbs_ && i < (int)limbDefs_.size(); i++)
       if (limbDefs_[i].name == cv.part) { host = i; break; }
     if (host < 0) continue;
-    const int slot = AppendWornShell(*item, cv, host, cv.part);
+    const int slot = AppendWornShell(*item, cv, host, cv.part, dye);
     if (slot < 0) continue;
     // PUT THE DAMAGE BACK. Indexed by the piece's own COVER ORDER rather than
     // by the appended slot, because a cover entry that found no limb on this

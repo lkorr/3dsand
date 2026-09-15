@@ -22,7 +22,7 @@
       "id": "shortsword",
       "kind": "melee",
       "damage": 10.0,
-      "carveBonus": 0.10,
+      "carveBonus": 0.1,
       "reach": 7.5,
       "desc": "Two feet of straight double-edged blade on a one-hand grip. It gives up the arming sword's last third of reach and about a third of its weight with it, and hands back a weapon you can still swing inside somebody's guard."
     },
@@ -78,6 +78,51 @@
       "id": "iron_sabatons",
       "kind": "armor_boots",
       "desc": "Iron shoes with an ankle cuff. What a spill of acid meets first, and what it gets through last."
+    },
+    {
+      "id": "tunic",
+      "kind": "armor_chest",
+      "desc": "A pull-over linen tunic, sleeves to the elbow and a body to mid-thigh, laced at the throat. What most people are wearing most of the time. It takes a dye evenly and it stops nothing."
+    },
+    {
+      "id": "smock",
+      "kind": "armor_chest",
+      "desc": "A long working smock, full sleeves with cuffs and cloth enough in the skirt to move in. Mended once at the hem already; it will be mended again."
+    },
+    {
+      "id": "jerkin",
+      "kind": "armor_chest",
+      "desc": "A sleeveless leather jerkin laced up the front, cut off at the waist. Bare shoulders, a bound armhole, and rather more between a blade and your ribs than linen manages."
+    },
+    {
+      "id": "trousers",
+      "kind": "armor_legs",
+      "desc": "Straight linen trousers, seamed down the outside of each leg and hemmed where a shoe begins."
+    },
+    {
+      "id": "breeches",
+      "kind": "armor_legs",
+      "desc": "Knee breeches, tied below the knee and leaving the calf to the weather. Worn with wraps, or with boots, or with nothing."
+    },
+    {
+      "id": "hose",
+      "kind": "armor_legs",
+      "desc": "Close linen hose, gartered at the thigh and darned at one knee. Nothing about them is in the way, which is the only thing they have to recommend them."
+    },
+    {
+      "id": "shoes",
+      "kind": "armor_boots",
+      "desc": "Low leather shoes with a stitched sole and a lace across the instep. Better than bare feet on a road and worse than boots anywhere else."
+    },
+    {
+      "id": "clogs",
+      "kind": "armor_boots",
+      "desc": "Wooden clogs on a block sole, an inch of hardwood between you and the mud. They do not soak, they do not rot, and they burn like the log they were."
+    },
+    {
+      "id": "footwraps",
+      "kind": "armor_boots",
+      "desc": "Strips of linen wound round the foot and crossed at the ankle. The cheapest thing that is not going barefoot, and the first thing to catch."
     }
   ]
 }

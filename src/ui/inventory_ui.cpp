@@ -251,7 +251,22 @@ void ItemSlot(UIState& s, const char* id, ImVec2 at,
                       Fade(ui::ColGold(), 0.08f));
     ui::DrawSpriteCentered(dl, ItemIcon(item.kind), ImVec2(mid.x + 1, mid.y + 1),
                            Fade(ui::ColInk(), 0.7f));   // pixel drop shadow
-    ui::DrawSpriteCentered(dl, ItemIcon(item.kind), mid);
+    // THE ICON TAKES THE DYE. The atlas is keyed on kind, so three tunics in
+    // three colours are one picture three times — tinting the sprite is what
+    // makes them three items in the pack instead of a stack that will not
+    // stack. Undyed items pass 0 and draw in the atlas's own ink, exactly as
+    // before.
+    ui::DrawSpriteCentered(dl, ItemIcon(item.kind), mid,
+                           item.dyeSwatch ? item.dyeSwatch : IM_COL32_WHITE);
+    if (item.dyeSwatch) {
+      // ...and a hard 4 px chip in the corner, because a tinted pixel-art icon
+      // at this size reads as a lighting change rather than as a colour. The
+      // chip is the unambiguous one.
+      dl->AddRectFilled(ImVec2(at.x + 3, at.y + 3), ImVec2(at.x + 9, at.y + 9),
+                        item.dyeSwatch);
+      dl->AddRect(ImVec2(at.x + 3, at.y + 3), ImVec2(at.x + 9, at.y + 9),
+                  Fade(ui::ColInk(), 0.8f));
+    }
     if (item.count > 1) {
       char buf[16];
       std::snprintf(buf, sizeof buf, "%d", item.count);
@@ -320,6 +335,17 @@ void ItemSlot(UIState& s, const char* id, ImVec2 at,
       ImGui::TextUnformatted(item.name.c_str());
       ImGui::PopStyleColor();
       if (!item.kind.empty()) ImGui::TextDisabled("%s", item.kind.c_str());
+      // The colour, named and shown. Named because "a rust tunic" is how
+      // somebody refers to their own clothes and a hex triple is not; shown
+      // because twelve names cannot separate two greens the player chose
+      // deliberately (game/dye.h DyeName is lossy on purpose).
+      if (!item.dyeName.empty()) {
+        ImGui::ColorButton("##tipdye",
+                           ImGui::ColorConvertU32ToFloat4(item.dyeSwatch), 0,
+                           ImVec2(12, 12));
+        ImGui::SameLine();
+        ImGui::TextDisabled("dyed %s", item.dyeName.c_str());
+      }
       if (!item.tip.empty()) ImGui::TextUnformatted(item.tip.c_str());
       // CONDITION, and only for something that can be worn: a sword has no
       // shells to count, and printing "100%" against one would invent a

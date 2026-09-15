@@ -332,15 +332,17 @@ struct Bag {
       if (slots[i].Empty()) return i;
     return -1;
   }
-  int Add(int defIndex, int count = 1) {
+  // Merges by def AND DYE, for the reason ItemStack::dye states: a stack is one
+  // colour, so a red tunic must not fold into a stack of blue ones.
+  int Add(int defIndex, int count = 1, uint32_t dye = 0) {
     if (defIndex < 0 || count <= 0) return -1;
     for (int i = 0; i < kSlots; i++)
-      if (!slots[i].Empty() && slots[i].def == defIndex) {
+      if (!slots[i].Empty() && slots[i].def == defIndex && slots[i].dye == dye) {
         slots[i].count += count;
         return i;
       }
     int f = FirstFree();
-    if (f >= 0) slots[f] = {defIndex, count};
+    if (f >= 0) slots[f] = {defIndex, count, dye};
     return f;
   }
 };
@@ -506,9 +508,14 @@ inline std::string KitItemName(const ItemStack& s, const ItemLibrary& lib) {
   return d ? d->name : std::string();
 }
 
+// `dye` rides across the crossing with the name, because it is the OTHER half
+// of what a stack is once garments can be coloured (game/dye.h): a name says
+// which pattern, a dye says which of the hundreds of shirts cut to it this one
+// is. A reload that carried only the name would quietly bleach the player's
+// whole wardrobe, which looks like a rendering bug rather than a data loss.
 inline ItemStack KitItemFromName(const std::string& name, int count,
-                                 const ItemLibrary& lib) {
+                                 const ItemLibrary& lib, uint32_t dye = 0) {
   if (name.empty() || count <= 0) return ItemStack{};
   int i = lib.Find(name);
-  return i < 0 ? ItemStack{} : ItemStack{i, count};
+  return i < 0 ? ItemStack{} : ItemStack{i, count, dye};
 }

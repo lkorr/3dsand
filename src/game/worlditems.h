@@ -38,14 +38,21 @@ struct WorldItem {
   // costs nothing to store. Only the save format reads this; the live body
   // already holds its own voxels.
   std::vector<DebrisVoxel> voxels;
+  // WHAT COLOUR IT IS (game/dye.h), 0 for undyed. Unlike the lattice above,
+  // this is NOT recoverable from the body: the art a dye colours is a neutral
+  // greyscale weave, so a dropped red tunic whose dye the registry forgot is a
+  // grey tunic when you pick it up again, with nothing anywhere to say
+  // otherwise. The body carries the same word for RENDERING
+  // (MicroBodyRef::dye); this is the copy that survives into an ItemStack.
+  uint32_t dye = 0;
 };
 
 class WorldItems {
  public:
-  void Add(uint64_t body, std::string name) {
+  void Add(uint64_t body, std::string name, uint32_t dye = 0) {
     if (!body || name.empty()) return;
     Remove(body);   // a reused handle must not resolve to the old item
-    items_.push_back(WorldItem{body, std::move(name), {}});
+    items_.push_back(WorldItem{body, std::move(name), {}, dye});
   }
   const WorldItem* Find(uint64_t body) const {
     for (const WorldItem& w : items_)
@@ -110,7 +117,8 @@ inline uint64_t DropItemToWorld(const ItemDef& def, Vec3 at, Vec3 vel,
                                 Physics& phys, DebrisSystem& debris,
                                 MicroBodySet* micro, WorldItems& reg,
                                 const std::vector<PrefabVoxel>* lattice =
-                                    nullptr) {
+                                    nullptr,
+                                uint32_t dye = 0) {
   uint32_t scale = 1;
   const std::vector<PrefabVoxel>* authored = ItemGroundVoxels(def, scale);
   const std::vector<PrefabVoxel>* src =
@@ -153,11 +161,15 @@ inline uint64_t DropItemToWorld(const ItemDef& def, Vec3 at, Vec3 vel,
     for (const ItemCover& cv : def.cover)
       if (cv.voxels.size() > best->voxels.size()) best = &cv;
     if (best->microModel >= 0)
-      mref = MicroBodyRef{(uint32_t)best->microModel, scale};
+      mref = MicroBodyRef{(uint32_t)best->microModel, scale, dye};
   } else if (micro && def.microModel >= 0) {
-    mref = MicroBodyRef{(uint32_t)def.microModel, scale};
+    mref = MicroBodyRef{(uint32_t)def.microModel, scale, dye};
   }
   debris.AdoptBody(body, vox, xf, mref, scale);
-  reg.Add(body, def.name);
+  // The colour goes in BOTH places on purpose: on the ref so the thing on the
+  // ground LOOKS right, and on the registry entry so picking it up gives you
+  // back the garment you dropped. Neither is derivable from the other — the
+  // body's word is render state a reload re-packs, the registry's is identity.
+  reg.Add(body, def.name, dye);
   return body;
 }

@@ -31,6 +31,7 @@
 #include "game/equipment.h"
 #include "game/worlditems.h"
 #include "game/corpses.h"
+#include "game/dye.h"
 #include "game/item.h"
 #include "game/melee.h"
 #include "game/mob.h"
@@ -2746,7 +2747,24 @@ int RunMobShot(GpuContext& ctx, World& world, Simulation& sim, Physics& phys,
     // which is how it stayed wrong. The piece goes in the first slot whose
     // authored rule takes its kind — the same choice right-click makes.
     if (!nm.empty() && nm[0] == '+') {
-      const std::string itemName = nm.substr(1);
+      std::string itemName = nm.substr(1);
+      // "+tunic#B4472A" DYES IT (game/dye.h). The commoner wardrobe is painted
+      // in greyscale and gets its colour from a runtime word, so a screenshot
+      // of an undyed tunic photographs the pattern and says nothing at all
+      // about what the garment looks like in play — which is the one question
+      // this harness exists to answer without a live session.
+      uint32_t wearDye = 0;
+      if (size_t hash = itemName.find('#'); hash != std::string::npos) {
+        const unsigned long v =
+            std::strtoul(itemName.c_str() + hash + 1, nullptr, 16);
+        // Authored the way a human writes a colour (#RRGGBB) and packed the
+        // way the GPU reads one (r in the low byte) — the swap is here rather
+        // than in dye.h because this is the only place a dye is ever typed.
+        wearDye = DyePack((float)((v >> 16) & 0xFFu) / 255.0f,
+                          (float)((v >> 8) & 0xFFu) / 255.0f,
+                          (float)(v & 0xFFu) / 255.0f);
+        itemName = itemName.substr(0, hash);
+      }
       const int ii = items.Find(itemName);
       const ItemDef* it = items.At(ii);
       if (!it) {
@@ -2764,12 +2782,14 @@ int RunMobShot(GpuContext& ctx, World& world, Simulation& sim, Physics& phys,
                      ItemKindName(it->kind));
         return 1;
       }
-      if (!mobs.WearItem(id, it, slot))
+      if (!mobs.WearItem(id, it, slot, wearDye))
         std::fprintf(stderr, "--shot-mob: \"%s\" would not go on\n",
                      itemName.c_str());
       else
-        std::printf("--shot-mob: wearing %s in slot %d\n", itemName.c_str(),
-                    slot);
+        std::printf("--shot-mob: wearing %s in slot %d%s%s\n",
+                    itemName.c_str(), slot,
+                    wearDye ? ", dyed " : "",
+                    wearDye ? DyeName(wearDye).c_str() : "");
       continue;
     }
     int li = -1;
@@ -3361,7 +3381,8 @@ int main(int argc, char** argv) {
   bool noAudio = false;  // --noaudio: run silent (also implied by every headless mode)
   bool telemetryEnabled = false;
   uint16_t telemetryPort = 8080;
-  std::string shotMob;  // --shot-mob <def>[:limb|+item,...] (pose/wardrobe look)
+  // --shot-mob <def>[:limb|+item[#RRGGBB],...][@x,z] (pose/wardrobe look)
+  std::string shotMob;
   bool shotFluid = false;  // --shot-fluid (MPM water look iteration)
   // --shot-waterfall: the CA falling-column fixture. Its own flag rather
   // than a frame inside --shot because it BUILDS a scene (a terrace, a
@@ -4363,7 +4384,9 @@ int main(int argc, char** argv) {
   // makes, and the registry is what makes `E` see it (DESIGN.md §8c). The
   // release hook above already forgets it when the body goes.
   mobs.SetOnItemShed(
-      [&ground](uint64_t h, const std::string& name) { ground.Add(h, name); });
+      [&ground](uint64_t h, const std::string& name, uint32_t dye) {
+        ground.Add(h, name, dye);
+      });
   // A CREATURE THAT FELL WITH THINGS ON IT. Die() reports the bodies it became
   // and the gear still on them the instant before the rig forgets; from here
   // on the heap is a corpse the crosshair can name and the character screen
@@ -4775,6 +4798,35 @@ int main(int argc, char** argv) {
       if (ui.aiWeaponNames[i] == want) ui.aiWeaponPick = i;
   };
   rebuildAiWeapons();
+  // ---- THE WARDROBE PICKERS (game/dye.h, the overlay's Wardrobe window) ----
+  //
+  // Every DYEABLE piece, split by the slot it goes in. Same contract as the
+  // weapon picker above and for exactly the same reason: names, not indices,
+  // rebuilt on every R, re-found by name afterwards.
+  //
+  // ELIGIBILITY IS `ItemDef::dyeable`, which is authored in the piece's own
+  // sidecar beside the greyscale art that makes it true — NOT a list of item
+  // names here. Adding a tenth pattern is then a generator run and an R, with
+  // no C++ edit, which is the test of whether this is content or code.
+  auto rebuildWardrobe = [&ui, &items]() {
+    auto fill = [&items](std::vector<std::string>& out, int& pick,
+                         ItemKind kind) {
+      const std::string was =
+          (pick > 0 && pick < (int)out.size()) ? out[pick] : std::string();
+      out.clear();
+      out.push_back("(none)");
+      for (const ItemDef& it : items.items)
+        if (it.kind == kind && it.dyeable) out.push_back(it.name);
+      pick = out.size() > 1 ? 1 : 0;   // first real piece, not "(none)"
+      if (!was.empty())
+        for (int i = 0; i < (int)out.size(); i++)
+          if (out[i] == was) pick = i;
+    };
+    fill(ui.wardrobeShirts, ui.wardrobeShirtPick, ItemKind::ArmorChest);
+    fill(ui.wardrobeLegs, ui.wardrobeLegsPick, ItemKind::ArmorLegs);
+    fill(ui.wardrobeFeet, ui.wardrobeFeetPick, ItemKind::ArmorBoots);
+  };
+  rebuildWardrobe();
   // WHICH CREATURE the panel spawns. Same contract as the weapon picker above,
   // for the same reason: the list is rebuilt off the LIVE defs on every R and
   // the selection is re-found BY NAME, because a def index is directory order
@@ -4947,6 +4999,12 @@ int main(int argc, char** argv) {
   // whenever the avatar is rebuilt, because a fresh rig wears nothing and
   // every slot has to be offered to it again.
   std::string wearTried[kEquipSlotCount];
+  // ...and IN WHAT COLOUR. The sync below compares by item NAME, which is what
+  // makes it survive an R reload — and a name alone cannot tell a red tunic
+  // from a blue one, so dyeing a garment you are already wearing would change
+  // nothing until you took it off. The dye is part of the comparison for the
+  // same reason the name is the rest of it. 0 = undyed (game/dye.h).
+  uint32_t wearDye[kEquipSlotCount] = {};
   // ---- THE SHEATH IS THE WEAPON SLOT -------------------------------------
   //
   // A blade is either DRAWN (a real rig part in the fist, swinging) or STOWED
@@ -5898,8 +5956,12 @@ int main(int argc, char** argv) {
         // silently swallowing or silently dropping: the item stays exactly
         // where it was, which is the only behaviour under which a pickup
         // cannot lose anything.
-        int where = di >= 0 ? kit.bag.Add(di, 1) : -1;
-        if (where < 0 && di >= 0) where = hotbar.Add(di, 1);
+        // ...and in the colour it was lying there in (game/dye.h). The
+        // registry carries the word because the art cannot: a dyed garment is
+        // painted in neutral greys, so a pickup that forgot the dye would hand
+        // back a grey tunic with nothing anywhere to say it had ever been red.
+        int where = di >= 0 ? kit.bag.Add(di, 1, w->dye) : -1;
+        if (where < 0 && di >= 0) where = hotbar.Add(di, 1, w->dye);
         if (where >= 0) {
           ui.kitMessage = "picked up " + w->item;
           // Order matters: the registry entry is dropped by the release hook
@@ -6322,25 +6384,34 @@ int main(int argc, char** argv) {
         // and the character screen makes the consequence permanent rather than
         // transient, so the promise is kept here for all three containers.
         {
+          // Name, count AND DYE. The dye is the other half of what a stack is
+          // (game/dye.h): dropping it here would bleach every coloured garment
+          // the player owns on every R, which reads as a rendering bug rather
+          // than as the data loss it is.
+          struct KitSnap {
+            std::string name;
+            int count = 0;
+            uint32_t dye = 0;
+          };
           auto snapshot = [&](ItemStack* v, int n,
-                              std::vector<std::pair<std::string, int>>& out) {
+                              std::vector<KitSnap>& out) {
             out.clear();
             for (int i = 0; i < n; i++)
-              out.push_back({KitItemName(v[i], items), v[i].count});
+              out.push_back({KitItemName(v[i], items), v[i].count, v[i].dye});
           };
           auto restore = [&](ItemStack* v, int n,
-                             const std::vector<std::pair<std::string, int>>& in) {
+                             const std::vector<KitSnap>& in) {
             for (int i = 0; i < n && i < (int)in.size(); i++) {
-              const ItemStack s = KitItemFromName(in[i].first, in[i].second,
-                                                  items);
-              if (!in[i].first.empty() && s.Empty())
+              const ItemStack s = KitItemFromName(in[i].name, in[i].count,
+                                                  items, in[i].dye);
+              if (!in[i].name.empty() && s.Empty())
                 std::fprintf(stderr,
                              "items reload: \"%s\" is gone; slot emptied\n",
-                             in[i].first.c_str());
+                             in[i].name.c_str());
               v[i] = s;
             }
           };
-          std::vector<std::pair<std::string, int>> hb, bg, eq;
+          std::vector<KitSnap> hb, bg, eq;
           snapshot(hotbar.slots, kItemSlots, hb);
           snapshot(kit.bag.slots, Bag::kSlots, bg);
           snapshot(kit.equip.slots, kEquipSlotCount, eq);
@@ -6357,6 +6428,10 @@ int main(int argc, char** argv) {
           // items.json appears in the combo on this R without disturbing what
           // is already selected.
           rebuildAiWeapons();
+          // ...and the wardrobe's three, for the same reason and by the same
+          // rule: a pattern added to items.json appears on this R without
+          // moving what is already picked.
+          rebuildWardrobe();
         }
         sim.UploadMicroBodies(ctx.queue, mbSet);
         mobs.SetDefs(std::move(mobDefs));
@@ -6756,6 +6831,7 @@ int main(int argc, char** argv) {
             KitItemName(kit.equip.At(lg.equipSlot), items) == lg.item) {
           kit.equip.slots[lg.equipSlot] = ItemStack{};
           wearTried[lg.equipSlot].clear();
+          wearDye[lg.equipSlot] = 0;
         }
         ui.kitMessage = "your " + lg.item + " was cut loose";
       }
@@ -7192,6 +7268,106 @@ int main(int argc, char** argv) {
           avatar.SetLimbVelocities(back.normalized() * MetresToCells(1.5f));
         }
       }
+      // ---- WARDROBE panel: make a set of clothes in a colour --------------
+      //
+      // Producers on the SAME paths the game uses: PlayerKit's own containers
+      // and the ordinary equip slots, so a tunic this button made is a tunic,
+      // not a dev-only object. The only thing the panel adds to an item that
+      // picking one off the ground would not is the dye word.
+      if (ui.wardrobeRandomColor) {
+        ui.wardrobeRandomColor = false;
+        // Hashed off the tick so it is reproducible from a replay and does not
+        // reach for rand(). Full saturation at a middling value is where
+        // clothes live: a random point in the RGB cube is mostly mud.
+        const uint32_t h = rng::Hash3(tick, 0xD1E5u, 0x9E37u);
+        const float hue = (float)(h % 3600u) / 3600.0f;
+        const float sat = 0.45f + (float)((h >> 12) % 100u) / 100.0f * 0.5f;
+        const float val = 0.35f + (float)((h >> 20) % 100u) / 100.0f * 0.5f;
+        DyeFromHsv(hue, sat, val, ui.wardrobeColor);
+      }
+      if (ui.wardrobeSpawnSet || ui.wardrobeWearSet || ui.wardrobeDyeWorn) {
+        const bool wear = ui.wardrobeWearSet;
+        const bool redye = ui.wardrobeDyeWorn;
+        ui.wardrobeSpawnSet = ui.wardrobeWearSet = ui.wardrobeDyeWorn = false;
+        const uint32_t dye = DyePack(ui.wardrobeColor[0], ui.wardrobeColor[1],
+                                     ui.wardrobeColor[2]);
+        const std::string colour = DyeName(dye);
+        if (redye) {
+          // RE-DYE WHAT IS ON. Only the dyeable pieces: the wizard's robe is
+          // painted in real colours and multiplying them by another colour is
+          // not a feature (ItemDef::dyeable). The wear sync a few hundred lines
+          // down notices the changed dye and rebuilds those shells, which is
+          // why nothing here touches the rig.
+          int n = 0;
+          for (int s = 0; s < kEquipSlotCount; s++) {
+            ItemStack& st = kit.equip.slots[s];
+            const ItemDef* d = items.At(st.Empty() ? -1 : st.def);
+            if (d == nullptr || !d->dyeable) continue;
+            st.dye = dye;
+            n++;
+          }
+          ui.wardrobeStatus = n ? ("re-dyed " + std::to_string(n) +
+                                   " worn piece(s) " + colour)
+                                : "nothing you are wearing takes a dye";
+        } else {
+          // THE PICKERS NAME THE PIECES; entry 0 of each is "(none)" and
+          // Find() returns -1 for it, so an outfit of trousers and nothing
+          // else needs no special case.
+          auto picked = [&](const std::vector<std::string>& names, int pick) {
+            return (pick > 0 && pick < (int)names.size()) ? names[pick]
+                                                          : std::string();
+          };
+          const std::string want[3] = {
+              picked(ui.wardrobeShirts, ui.wardrobeShirtPick),
+              picked(ui.wardrobeLegs, ui.wardrobeLegsPick),
+              picked(ui.wardrobeFeet, ui.wardrobeFeetPick)};
+          int made = 0, refused = 0;
+          std::string names;
+          for (const std::string& w : want) {
+            if (w.empty()) continue;
+            const int di = items.Find(w);
+            const ItemDef* d = items.At(di);
+            if (d == nullptr) continue;
+            // WEAR puts it in the equip slot its kind belongs to (swapping
+            // out whatever was there, which lands back in the pack); the
+            // plain spawn goes to the hotbar, falling back to the bag exactly
+            // as a corpse's gear does (game/corpses.h).
+            bool ok = false;
+            if (wear) {
+              const int slot = EquipSlotFor(d->kind, kit.equip);
+              if (slot >= 0) {
+                const ItemStack was = kit.equip.At(slot);
+                if (!was.Empty()) kit.bag.Add(was.def, was.count, was.dye);
+                kit.equip.slots[slot] = ItemStack{di, 1, dye};
+                ok = true;
+              }
+            } else {
+              ok = hotbar.Add(di, 1, dye) >= 0 ||
+                   kit.bag.Add(di, 1, dye) >= 0;
+            }
+            if (ok) {
+              if (!names.empty()) names += ", ";
+              names += w;
+              made++;
+            } else {
+              refused++;
+            }
+          }
+          if (made == 0) {
+            ui.wardrobeStatus = refused ? "no room for any of it"
+                                        : "pick something first";
+          } else {
+            ui.wardrobeStatus = colour + " " + names +
+                                (wear ? " — worn" : " — in your pack");
+            if (refused)
+              ui.wardrobeStatus += "  (" + std::to_string(refused) +
+                                   " refused: no room)";
+          }
+        }
+        ui.kitMessage = ui.wardrobeStatus;
+        ui.kitMessageAge = 0.0f;
+      }
+
       if (ui.aiApplyBehavior) {
         ui.aiApplyBehavior = false;
         if (ui.aiMobSelected >= 0 &&
@@ -7456,6 +7632,7 @@ int main(int argc, char** argv) {
           // A new rig wears nothing (Mob::BuildRig clears its shells), so the
           // armour sync below has to be offered every slot again.
           for (std::string& w : wearTried) w.clear();
+          for (uint32_t& d : wearDye) d = 0;
           tpRig.Snap();   // re-entering from fly: don't ease across the gap
         }
         if (!wantAvatar && avatar.Spawned()) avatar.Despawn();
@@ -7677,10 +7854,12 @@ int main(int argc, char** argv) {
             const ItemStack& st = kit.equip.At(s);
             const ItemDef* want = items.At(st.Empty() ? -1 : st.def);
             const std::string wantName = want ? want->name : std::string();
-            if (avatar.WornItem(s) == wantName && wearTried[s] == wantName)
+            const uint32_t wantDye = st.Empty() ? 0u : st.dye;
+            if (avatar.WornItem(s) == wantName && wearTried[s] == wantName &&
+                wearDye[s] == wantDye)
               continue;
-            if (wearTried[s] == wantName && avatar.WornItem(s).empty() &&
-                !wantName.empty())
+            if (wearTried[s] == wantName && wearDye[s] == wantDye &&
+                avatar.WornItem(s).empty() && !wantName.empty())
               continue;   // already refused this one; nothing has changed
             // TAKING IT OFF KEEPS ITS WOUNDS. The shells are the only place
             // the damage lives while the piece is on, and they are destroyed
@@ -7693,9 +7872,11 @@ int main(int argc, char** argv) {
               if (avatar.CaptureWorn(s, d)) kit.SetDamage(had, std::move(d));
             }
             wearTried[s] = wantName;
+            wearDye[s] = wantDye;
             if (wantName.empty()) {
               avatar.UnwearItem(s);
-            } else if (!avatar.WearItem(want, s, kit.Damage(wantName))) {
+            } else if (!avatar.WearItem(want, s, kit.Damage(wantName),
+                                        wantDye)) {
               ui.kitMessage = "that does not fit you";
               ui.kitMessageAge = 0.0f;
             }
@@ -9180,6 +9361,13 @@ int main(int argc, char** argv) {
       ui.prefabPending = (uint32_t)placer.PendingCount();
       ui.mobCount = mobs.MobCount();
 
+      // What the wardrobe's picked colour is CALLED (game/dye.h). Mirrored
+      // rather than computed in the overlay so the UI keeps its "reads
+      // UIState, knows no headers" shape — and so the name the panel shows is
+      // literally the one the item's tooltip will carry.
+      ui.wardrobeColorName = DyeName(DyePack(
+          ui.wardrobeColor[0], ui.wardrobeColor[1], ui.wardrobeColor[2]));
+
       // ---- NPC AI panel mirror (game/ai_behavior.h) ------------------------
       //
       // The overlay never reaches into MobSystem; everything it draws is
@@ -9642,7 +9830,8 @@ int main(int argc, char** argv) {
           // rather than inside your own capsule.
           const Vec3 at = player.EyePos() + cam.Forward() * 2.0f;
           const Vec3 vel = cam.Forward() * 4.0f + player.vel;
-          if (DropItemToWorld(*def, at, vel, phys, debris, &mbSet, ground)) {
+          if (DropItemToWorld(*def, at, vel, phys, debris, &mbSet, ground,
+                              nullptr, src->dye)) {
             // ONE of the stack. Dropping a count you did not mean to is the
             // mis-click this system's swap-never-overwrite rule exists to
             // prevent, and it applies here too.
@@ -9826,6 +10015,15 @@ int main(int argc, char** argv) {
           // under a drag. ItemKindName is the same table items.json parses
           // through, so there is still exactly one spelling of "armor_legs".
           u.kind = d->kind == ItemKind::None ? "" : ItemKindName(d->kind);
+          // THE DYE, converted to what the panel draws with. ImGui packs its
+          // u32 colours 0xAABBGGRR and the dye word is 0x_1_BBGGRR (dye.h), so
+          // the low 24 bits transfer verbatim and only the alpha is added —
+          // which is the second reason the packing order is the one it is
+          // (the first being that unpackColor reads it directly on the GPU).
+          if (DyeSet(st.dye)) {
+            u.dyeSwatch = 0xFF000000u | (st.dye & 0x00FFFFFFu);
+            u.dyeName = DyeName(st.dye);
+          }
           // Whatever the def actually carries — no invented stats. A melee
           // item has damage and reach; something with neither says nothing
           // rather than saying "0".
@@ -9858,7 +10056,8 @@ int main(int argc, char** argv) {
             ui.lootTitle = c->def;
             for (const CorpseReport::Piece& pc : c->gear) {
               const int di = items.Find(pc.item);
-              UIState::KitSlotUI u = mirror(ItemStack{di, di >= 0 ? 1 : 0});
+              UIState::KitSlotUI u =
+                  mirror(ItemStack{di, di >= 0 ? 1 : 0, pc.dye});
               if (u.name.empty()) u.name = pc.item;   // gone from the library
               if (u.wearable) {
                 u.condition = pc.damage.Condition();

@@ -330,6 +330,20 @@ struct ItemDef {
   // are already the grip rotation's job.
   ItemHilt hilt;
 
+  // ---- CAN THIS PIECE TAKE A DYE? -----------------------------------------
+  // Authored in the sidecar (`"dyeable": true`, emitted by
+  // scripts/gen_peasant_clothes.py). True means THE ART IS A GREYSCALE WEAVE
+  // whose cells are multipliers, so a colour word applied to it is the colour
+  // you see (game/dye.h).
+  //
+  // A FACT ABOUT THE ART, not a permission. Nothing refuses to dye an
+  // un-dyeable item — the shader would happily tint the wizard's robe — but
+  // the result is meaningless, because the robe's art is already black and
+  // multiplying black by red is black. So this is what the wardrobe UI offers a
+  // colour for, and it is authored beside the art that makes it true rather
+  // than being a list of item names anywhere.
+  bool dyeable = false;
+
   // Rig durability while worn: the borrowed slot takes these, so an item is
   // as severable and as knock-loose-able as the limb it replaces.
   float hp = 30.0f;
@@ -430,6 +444,20 @@ constexpr int kItemSlots = 10;
 struct ItemStack {
   int def = -1;      // index into ItemLibrary::items, -1 = empty
   int count = 0;
+  // WHAT COLOUR THIS PARTICULAR ONE IS (game/dye.h). 0 = undyed, which is every
+  // stack that predates the wardrobe and every item that is not a dyeable
+  // garment.
+  //
+  // ON THE STACK, not on the def: the def is the PATTERN and two people in
+  // tunics are wearing the same def. That is the whole reason the dye is a
+  // runtime word rather than baked art — see the note at the top of dye.h.
+  //
+  // WHICH MEANS TWO DYES DO NOT STACK. `Add`/`Bag::Add` merge by def, so
+  // adding a red tunic to a stack of blue ones would quietly repaint them.
+  // Both now require the dye to match as well, and fall through to a fresh
+  // slot when it does not — the same rule every game with enchantments uses,
+  // arrived at for the same reason.
+  uint32_t dye = 0;
   bool Empty() const { return def < 0 || count <= 0; }
 };
 
@@ -450,19 +478,24 @@ struct Inventory {
     selected = ((selected + delta) % n + n) % n;
   }
 
-  // Adds to the first slot already holding this def, else the first empty one.
-  // Returns the slot, or -1 when the hotbar is full — the caller decides what
-  // that means (here: the pickup is refused and the item stays in the world).
-  int Add(int defIndex, int count = 1) {
+  // Adds to the first slot already holding this def AND THIS DYE, else the
+  // first empty one. Returns the slot, or -1 when the hotbar is full — the
+  // caller decides what that means (here: the pickup is refused and the item
+  // stays in the world).
+  //
+  // The dye is part of the merge key for the reason ItemStack::dye states: a
+  // stack is one colour, and folding a red tunic into a stack of blue ones
+  // would repaint them.
+  int Add(int defIndex, int count = 1, uint32_t dye = 0) {
     if (defIndex < 0 || count <= 0) return -1;
     for (int i = 0; i < kItemSlots; i++)
-      if (!slots[i].Empty() && slots[i].def == defIndex) {
+      if (!slots[i].Empty() && slots[i].def == defIndex && slots[i].dye == dye) {
         slots[i].count += count;
         return i;
       }
     for (int i = 0; i < kItemSlots; i++)
       if (slots[i].Empty()) {
-        slots[i] = {defIndex, count};
+        slots[i] = {defIndex, count, dye};
         return i;
       }
     return -1;

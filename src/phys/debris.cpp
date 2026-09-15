@@ -5381,7 +5381,11 @@ void DebrisSystem::BuildXforms(std::vector<BodyXformGpu>& out) const {
 void DebrisSystem::AppendMicroInsts(std::vector<MicroBodyInstGpu>& out) const {
   for (size_t i = 0; i < bodies_.size() && i < kMaxBodies; i++)
     if (bodies_[i].micro.Valid())
-      out.push_back({(uint32_t)i, bodies_[i].micro.model, 0, 0});
+      // No hit flash on debris (it is not a limb anybody can strike into a
+      // flash), but the DYE travels: a sleeve cut off a red shirt is still red
+      // on the ground. game/dye.h, sim/microbody.h MicroBodyRef::dye.
+      out.push_back({(uint32_t)i, bodies_[i].micro.model, 0,
+                     bodies_[i].micro.dye});
 }
 
 uint32_t DebrisSystem::ActiveBodyCount() const {
@@ -5408,6 +5412,8 @@ void DebrisSystem::SaveState(std::vector<uint8_t>& out) const {
     // across sessions (the pool is rebuilt), so load re-packs a brick from the
     // lattice below.
     w.U32(b.micro.Valid() ? 1u : 0u);
+    // The dye (v4). Not derivable from the lattice — see kSaveVersion's note.
+    w.U32(b.micro.dye);
     w.U32(b.bleedMat);
     // THE STRAP, BY INDEX INTO THIS LIST. Jolt handles do not survive a
     // session, and load recreates the bodies in exactly this order, so the
@@ -5449,7 +5455,7 @@ bool DebrisSystem::LoadState(const uint8_t* data, size_t len, uint32_t version) 
   std::vector<PendingStrap> straps;
   for (uint32_t i = 0; i < count && r.ok; i++) {
     BodyTransform xf{};
-    uint32_t physScale = 1, skinScale = 1, hadMicro = 0, bleedMat = 0;
+    uint32_t physScale = 1, skinScale = 1, hadMicro = 0, bleedMat = 0, dye = 0;
     uint32_t hostIdx = 0xFFFFFFFFu;
     Vec3 relPos{};
     float relQuat[4] = {0, 0, 0, 1};
@@ -5459,6 +5465,7 @@ bool DebrisSystem::LoadState(const uint8_t* data, size_t len, uint32_t version) 
     r.U32(physScale);
     r.U32(skinScale);
     r.U32(hadMicro);
+    r.U32(dye);
     r.U32(bleedMat);
     r.U32(hostIdx);
     r.Pod(relPos);
@@ -5510,7 +5517,7 @@ bool DebrisSystem::LoadState(const uint8_t* data, size_t len, uint32_t version) 
                              skinScale, "load", plog);
       if (mi >= 0) {
         microSet_->owned[mi] = 1;  // freeable: this body is the sole holder
-        micro = MicroBodyRef{(uint32_t)mi, skinScale};
+        micro = MicroBodyRef{(uint32_t)mi, skinScale, dye};
       } else if (!plog.empty()) {
         std::fprintf(stderr, "%s", plog.c_str());
       }

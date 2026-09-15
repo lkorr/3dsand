@@ -10737,6 +10737,78 @@ schedule and writes two frames — `screenshot_inventory.bmp` (gear) and
 at, so the harness that judges it produces a picture; it prints the image's
 pixel sum, because "wrote the file" is true of an all-black rectangle too.
 
+### The commoner wardrobe: nine patterns times any colour (added 2026-09-15; `game/dye.h`, `scripts/gen_peasant_clothes.py`, gate `dye`)
+
+> **The art is a PATTERN. The colour arrives at runtime.** A village needs forty
+> outfits; authoring forty is not the answer and authoring one and accepting
+> that everybody matches is not either.
+
+`assets/items` ships nine plain garments — `tunic` / `smock` / `jerkin`,
+`trousers` / `breeches` / `hose`, `shoes` / `clogs` / `footwraps` — built by the
+same derived-geometry rules as the wizard's kit (imported from
+`gen_stock_armor.py`, never restated) and differing from it in exactly one way:
+**they are painted in greyscale, and every cell's grey is a MULTIPLIER rather
+than a pigment.** A cell at 0.70 renders as exactly the colour the player
+picked; the weave noise, the hems, the lacing and the mends are all ratios of
+it and therefore survive being recoloured. Nine silhouettes times a continuous
+colour is the whole variety budget.
+
+**Where the colour lives: `MicroBodyInstGpu`'s fourth word.** It was padding,
+it is already uploaded, and the struct must stay 16 bytes (its `static_assert`
+is the only mechanical guard the CPU/WGSL pair has, because
+`check_invariants.py` cannot see a hand-written mirror). There are now no spare
+words; the next per-instance value needs a second buffer.
+
+The chain is `ItemStack::dye` → `Mob::WearItem` → `MobLimb::dye` →
+`AppendMicroInsts` → `microbody.wgsl`, where albedo becomes
+`dye * luma(art) / DYE_REF`. Four consequences fall out of that placement
+and all four are the reason for it:
+
+* **Two hundred differently-dressed villagers share nine bricks.** Nothing is
+  cloned, nothing is re-packed, and the cost of a dye is one word per instance.
+* **The colour is CONTINUOUS.** The rejected alternative — allocating art
+  palette slots per dye and baking it into the voxels — costs nothing at shade
+  time and has a hard ceiling: the merged art palette is 255 entries *total*
+  across every prefab in the game (`kArtPaletteSlotsGpu`), shared with every
+  creature's skin, so a six-tone ramp buys about forty simultaneous colours.
+* **A severed sleeve keeps its colour.** The dye rides `MicroBodyRef`, which is
+  a render description and is what `DebrisSystem::AdoptBody` already takes — so
+  the hand-off path needed no new argument.
+* **A dye is PAINT, not a material.** Dyed linen burns, tears, dissolves and
+  soaks blood exactly as undyed linen does. Nothing in the sim reads the word
+  and it is never hashed (rule 1). The stain is applied *after* the dye, because
+  blood goes on the cloth rather than being scaled by it.
+
+**Luminance, not a per-channel multiply.** The two are identical on the
+greyscale art this exists for. They differ on art that is *not* greyscale, where
+per-channel tints (the wizard's robe stays black, its gold trim goes muddy) and
+luminance re-colours outright — which is what somebody dyeing a thing expects,
+and which makes a dye applied to an un-dyeable piece merely wrong rather than
+invisible. `ItemDef::dyeable` (authored in the sidecar, beside the art that
+makes it true) is what the wardrobe UI offers a colour for; it is a fact about
+the art, not a permission.
+
+**THE REFERENCE TONE IS STATED THREE TIMES.** `kDyeRef` (`game/dye.h`, the UI),
+`DYE_REF` (`microbody.wgsl`, the GPU) and `DYE_REF_GREY`
+(`gen_peasant_clothes.py`, what the art is painted at). Disagreement is not a
+crash — it is every dyed garment in the game coming out uniformly too bright or
+too dark with the cause two files away — so `--gate dye` parses the shader and
+compares, and the generator asserts against its own ramp.
+
+**Authoring surface.** The Wardrobe panel (mob tool → `Wardrobe...`) is a
+colour wheel and three combos mirrored off the live item library, so a tenth
+pattern is a generator run and an `R`, with no C++ edit. `--shot-mob
+human:+tunic#B4472A,+trousers#3A5470` photographs an outfit headlessly, which is
+the only way the *picture* — the one thing no CPU assertion can see — gets
+judged.
+
+`--gate dye` covers the rest: the constant across the seam, the packing
+(including black, which is why there is a flag bit at all), that every painted
+cell of every dyeable piece is a grey against the MERGED palette the renderer
+actually reads, that three patterns exist per slot, that the dye reaches every
+shell's GPU instance and nothing else's, that a stack is one colour, and that
+the word survives `PLYR` v5.
+
 ## 9d. Biomes and water-body presets — the Environment tab (added 2026-09-01)
 
 > **A biome SELECTS from component libraries and says how often and where.
