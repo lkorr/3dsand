@@ -4727,6 +4727,31 @@ int main(int argc, char** argv) {
   for (const MobDef& d : mobs.Defs()) ui.mobNames.push_back(d.name);
   for (const ai::Profile& p : mobs.Behaviors().profiles)
     ui.aiProfileNames.push_back(p.name);
+  // WHAT THE AI PANEL CAN ARM A SPAWN WITH: every melee item in the library,
+  // by KIND rather than by a list of names, so a blade added to items.json
+  // shows up in the picker on the next R and nothing here has to be edited.
+  //
+  // The selection is re-found BY NAME afterwards for the reason
+  // selftest_playerkit pins: a library index is items.json's order, so an
+  // insert renumbers everything after it and a raw index would silently move
+  // the pick onto the neighbouring weapon.
+  auto rebuildAiWeapons = [&ui, &items]() {
+    const std::string was =
+        (ui.aiWeaponPick >= 0 && ui.aiWeaponPick < (int)ui.aiWeaponNames.size())
+            ? ui.aiWeaponNames[ui.aiWeaponPick]
+            : std::string();
+    ui.aiWeaponNames.clear();
+    ui.aiWeaponNames.push_back("(unarmed)");
+    for (const ItemDef& it : items.items)
+      if (it.kind == ItemKind::Melee) ui.aiWeaponNames.push_back(it.name);
+    // First build has nothing to restore: default to the arming sword, which
+    // is what these buttons armed a spawn with before the picker existed.
+    const std::string want = was.empty() ? std::string("sword") : was;
+    ui.aiWeaponPick = 0;
+    for (int i = 0; i < (int)ui.aiWeaponNames.size(); i++)
+      if (ui.aiWeaponNames[i] == want) ui.aiWeaponPick = i;
+  };
+  rebuildAiWeapons();
   // Creatures the AI panel put in the world, so its "kill all spawned" button
   // reaps exactly those and leaves content-placed mobs alone.
   std::vector<uint64_t> aiSpawnedMobs;
@@ -6277,6 +6302,11 @@ int main(int argc, char** argv) {
           restore(hotbar.slots, kItemSlots, hb);
           restore(kit.bag.slots, Bag::kSlots, bg);
           restore(kit.equip.slots, kEquipSlotCount, eq);
+          // The AI panel's weapon picker is a mirror of the same library, and
+          // by name for the same reason the slots above are: a new blade in
+          // items.json appears in the combo on this R without disturbing what
+          // is already selected.
+          rebuildAiWeapons();
         }
         sim.UploadMicroBodies(ctx.queue, mbSet);
         mobs.SetDefs(std::move(mobDefs));
@@ -7054,8 +7084,17 @@ int main(int argc, char** argv) {
           }
           const uint64_t nid = mobs.Spawn(aiDef, at);
           if (nid != 0) {
-            const ItemDef* sword = items.At(items.Find("sword"));
-            if (sword != nullptr) mobs.EquipItem(nid, sword);
+            // WHAT THE PANEL PICKED, resolved by name at spawn time. Entry 0
+            // is "(unarmed)" and Find() returns -1 for it, so the empty hand
+            // needs no special case — At(-1) is nullptr and the mob spawns
+            // with nothing in its fist, which is a case the AI has to handle
+            // anyway (a duelist that has just been disarmed).
+            const std::string& pick =
+                ui.aiWeaponNames[ui.aiWeaponPick < (int)ui.aiWeaponNames.size()
+                                     ? ui.aiWeaponPick
+                                     : 0];
+            const ItemDef* weapon = items.At(items.Find(pick));
+            if (weapon != nullptr) mobs.EquipItem(nid, weapon);
             mobs.SetMobBehavior(nid, profile);
             aiSpawnedMobs.push_back(nid);
           }

@@ -1245,8 +1245,31 @@ void Overlay::Draw(UIState& s) {
       if (ImGui::BeginTabBar("##aitabs")) {
         // ---- Spawn -------------------------------------------------------
         if (ImGui::BeginTabItem("Spawn")) {
-          ImGui::TextDisabled("spawns a humanoid with a sword, a few metres");
-          ImGui::TextDisabled("ahead of you (or at the crosshair hit)");
+          ImGui::TextDisabled("spawns a humanoid, a few metres ahead of you");
+          ImGui::TextDisabled("(or at the crosshair hit), armed with:");
+          // WHICH WEAPON. Every melee item in the library plus "(unarmed)",
+          // mirrored by main.cpp — so a blade added to items.json appears here
+          // on the next R, with no list to keep in step by hand.
+          if (!s.aiWeaponNames.empty()) {
+            if (s.aiWeaponPick >= (int)s.aiWeaponNames.size())
+              s.aiWeaponPick = 0;
+            ImGui::SetNextItemWidth(160);
+            // "##" so this cannot hash to the same id as the behaviour combo
+            // on the Mobs tab.
+            if (ImGui::BeginCombo("weapon##ai",
+                                  s.aiWeaponNames[s.aiWeaponPick].c_str())) {
+              for (int i = 0; i < (int)s.aiWeaponNames.size(); i++) {
+                ImGui::PushID(i);
+                if (ImGui::Selectable(s.aiWeaponNames[i].c_str(),
+                                      i == s.aiWeaponPick))
+                  s.aiWeaponPick = i;
+                ImGui::PopID();
+              }
+              ImGui::EndCombo();
+            }
+            ImGui::TextDisabled("the blade decides the wound: reach, cut");
+            ImGui::TextDisabled("depth and heft all come off its own art");
+          }
           if (ImGui::Button("dummy##ai")) s.aiSpawnDummy = true;
           ImGui::SameLine();
           ImGui::TextDisabled("blind, never moves, never turns");

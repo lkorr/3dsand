@@ -1,0 +1,56 @@
+{
+  "comment": "A shortsword: the small end of the melee range, where the wound model's heft factor falls BELOW the arming sword instead of above it. Regenerate with scripts/gen_shortblade_items.py \u2014 the edge and hilt blocks are emitted from the same constants that build the mesh, so the hitbox cannot drift from the art. There is deliberately no \"heft\" key: heft is DERIVED from this file's own voxel volume (item.h ItemDef::heftVolume), so re-authoring the blade re-weighs it in the same edit.",
+  "name": "shortsword",
+  "model": "shortsword",
+  "artVoxelsPerMetre": 40,
+  "hp": 20,
+  "severable": true,
+  "severImpactSpeed": 6.0,
+  "grip": {
+    "held_right": {
+      "translation": [
+        0,
+        0,
+        0
+      ],
+      "rotation": [
+        0,
+        -90,
+        0
+      ],
+      "scale": 1.0
+    }
+  },
+  "hilt": {
+    "min": [
+      2,
+      0,
+      0
+    ],
+    "size": [
+      5,
+      6,
+      4
+    ]
+  },
+  "edge": {
+    "from": 9,
+    "to": 28,
+    "axis": [
+      1,
+      0,
+      0
+    ],
+    "flat": [
+      0,
+      0,
+      1
+    ],
+    "halfWidth": 3
+  },
+  "spring": {
+    "halflife": 0.07,
+    "gain": 0.4,
+    "maxAngle": 0.17
+  }
+}

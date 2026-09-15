@@ -337,6 +337,18 @@ struct UIState {
   bool aiSpawnDuelist = false;
   bool aiKillSpawned = false;     // one-shot: despawn everything this panel made
   bool aiRagdollSpawned = false;  // one-shot: knock everything this panel made flat
+  // WHAT THE SPAWN BUTTONS PUT IN ITS HAND. Names rather than library indices,
+  // for the reason selftest_playerkit's "names survive a library reorder" case
+  // exists: an ItemStack's index is items.json's ORDER, so inserting a weapon
+  // renumbers every entry after it. main.cpp rebuilds this list from the item
+  // library at load and on every R hot-reload, and re-finds the selection by
+  // name — so adding a blade to items.json and hitting R moves the picker
+  // without moving what is already selected.
+  //
+  // Entry 0 is "(unarmed)": the empty hand is a real case the AI has to cope
+  // with, and a picker that cannot express it would need a second button.
+  std::vector<std::string> aiWeaponNames;
+  int aiWeaponPick = 0;
   bool aiSaveBehaviors = false;   // one-shot: write assets/mobs/behaviors.json
   bool aiApplyBehavior = false;   // one-shot: aiBehaviorPick -> the selected mob
   bool showAiDebug = false;       // in-world path / target / band viz

@@ -1,0 +1,56 @@
+{
+  "comment": "A dagger: the small end of the melee range, where the wound model's heft factor falls BELOW the arming sword instead of above it. Regenerate with scripts/gen_shortblade_items.py \u2014 the edge and hilt blocks are emitted from the same constants that build the mesh, so the hitbox cannot drift from the art. There is deliberately no \"heft\" key: heft is DERIVED from this file's own voxel volume (item.h ItemDef::heftVolume), so re-authoring the blade re-weighs it in the same edit.",
+  "name": "dagger",
+  "model": "dagger",
+  "artVoxelsPerMetre": 40,
+  "hp": 12,
+  "severable": true,
+  "severImpactSpeed": 4.5,
+  "grip": {
+    "held_right": {
+      "translation": [
+        0,
+        0,
+        0
+      ],
+      "rotation": [
+        0,
+        -90,
+        0
+      ],
+      "scale": 1.0
+    }
+  },
+  "hilt": {
+    "min": [
+      1,
+      0,
+      0
+    ],
+    "size": [
+      4,
+      4,
+      4
+    ]
+  },
+  "edge": {
+    "from": 6,
+    "to": 14,
+    "axis": [
+      1,
+      0,
+      0
+    ],
+    "flat": [
+      0,
+      0,
+      1
+    ],
+    "halfWidth": 2
+  },
+  "spring": {
+    "halflife": 0.05,
+    "gain": 0.45,
+    "maxAngle": 0.2
+  }
+}

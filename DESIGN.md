@@ -3716,7 +3716,11 @@ touch a creature with a sword, lose a limb, anywhere, every time.
   voxel count in world voxels; the factor the wound model consumes is that
   against `gore.woundHeftRef` (the stock arming sword, 5.3). A greatsword cuts
   deeper because it IS bigger, and re-authoring the blade re-weighs it in the
-  same edit. `assets/items/cleaver.*` is the heavy end at 1.85x.
+  same edit. The library spans the factor rather than sitting on one side of
+  it: `dagger` 0.22x, `shortsword` 0.62x, `sword` 1.0x, `cleaver` 1.85x, against
+  a `HeftFactor` floor of 0.2 and a `gore.woundHeftMax` ceiling of 4.0. The
+  small pair is what makes the floor reachable — "a knife needs sustained work"
+  was an unexercised branch until a knife existed.
 - **What survives of the three instant severs.** The joint-proximity rule is
   deleted outright. `severImpactSpeed` remains as an extreme-speed exception
   scaled by `gore.woundImpactSeverScale`, because the authored 9–20 voxels/sec
