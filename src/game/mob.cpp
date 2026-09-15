@@ -1691,6 +1691,12 @@ void MobSystem::OnMaterialsReloaded(const std::vector<MaterialDef>& mats,
   densityOf_.clear();
   classOf_.clear();
   matGpu_.clear();
+  matNames_.clear();
+  matNames_.reserve(mats.size());
+  for (const MaterialDef& m : mats) matNames_.push_back(m.name);
+  // An id is only valid against the table it was resolved from.
+  matNameLast_.clear();
+  matNameLastId_ = 0;
   matSelfActive_.clear();
   matHasPair_.clear();
   matHot_.clear();
@@ -3537,19 +3543,17 @@ void MobSystem::StepStroke(Mob& mob, uint32_t tick, World& world,
     sw.halfWidth = halfWidth;
     if (nw != nullptr) {
       // ---- A NATURAL WEAPON'S BLOW (game/impact.h) ------------------------
-      // PACKAGE A MERGE: replace with `sw.strike = mob.StrikeProfileFor(*nw);`
-      // — one line, and `damage` disappears from EdgeSweep with it. Until
-      // then the sweep has only the bare kerf float, so the three parts are
-      // SUMMED into it as a stand-in: a fist reads as a small cut rather than
-      // as trauma, which is wrong in KIND but right in magnitude and keeps
-      // every gate here measuring the geometry it is actually about.
-      const StrikeProfile p = mob.StrikeProfileFor(*nw);
-      sw.damage = p.cut + p.blunt + p.bite;
-      // A fist has no blade behind it, so it gets the neutral heft (1) rather
-      // than an item's volume ratio — which is also what a fabricated sweep
-      // gets and what `EdgeSweep::heft` documents as the default.
+      // The whole profile, not a number: a fist arrives as trauma, a set of
+      // jaws as a tear, and a worn gauntlet over the fist has already been
+      // folded in by StrikeProfileFor. No blade behind it, so the neutral
+      // heft (EdgeSweep::heft's documented default) rather than an item's
+      // volume ratio - which is also what a fabricated sweep gets.
+      sw.strike = mob.StrikeProfileFor(*nw);
     } else {
-      sw.damage = item ? item->damage : 12.0f;
+      // The whole profile, not a number (game/impact.h): a sword fills
+      // mostly `cut` and behaves exactly as it did, a mace fills `blunt`.
+      if (item != nullptr) sw.strike = item->strike;
+      else sw.strike.cut = 12.0f;
       sw.carveBonus = item ? item->carveBonus : 0.0f;
       if (item) {
         const auto& g = CurrentTuning().gore;
@@ -6537,6 +6541,11 @@ float MobSystem::LimbHp(uint64_t mobId, int limbIndex) const {
     if (m.id_ == mobId) return m.LimbHpAt(limbIndex);
   return -1.0f;
 }
+float MobSystem::LimbBleedBudget(uint64_t mobId, int limbIndex) const {
+  const Mob* m = FindMob(mobId);
+  if (!m || limbIndex < 0 || limbIndex >= (int)m->limbs_.size()) return -1.0f;
+  return m->limbs_[limbIndex].bleedBudget;
+}
 const char* MobSystem::DeathCause(uint64_t mobId) const {
   for (const Mob& m : mobs_)
     if (m.id_ == mobId) return m.DeathCause();
@@ -6859,8 +6868,18 @@ bool Mob::Damage(uint64_t bodyHandle, float amount, Vec3 hitWorldVoxel,
       const float want = (ld.tag == "item") ? fx.flashChip : fx.flashFlesh;
       limb.hitFlash = std::max(limb.hitFlash, want);
     }
-    limb.bleedBudget =
-        AddBleedBudget(limb.bleedBudget, amount * def_->bleedPerDamage);
+    // A PUNCH DOES NOT OPEN YOU (game/impact.h). Trauma still charges hp, still
+    // flinches and still cries out -- only the BLOOD is refused, at
+    // gore.bluntBleedScale of a cut's rate. The same shape as the three
+    // exclusions CarveLimb makes for fire, a garment and a creature born
+    // bitten, and made the same way: a scope the caller opens, read here
+    // rather than threaded through a signature the laser and the blast share.
+    const float bleedScale =
+        inBluntCarve_
+            ? std::clamp(CurrentTuning().gore.bluntBleedScale, 0.0f, 1.0f)
+            : 1.0f;
+    limb.bleedBudget = AddBleedBudget(
+        limb.bleedBudget, amount * def_->bleedPerDamage * bleedScale);
     if (impactSevers || (limb.hp <= 0 && HpZeroSevers((int)i))) {
       Sever((int)i);
     } else {
@@ -6955,9 +6974,32 @@ uint32_t Mob::NeckCount(const MobLimb& limb, float radiusWorld) const {
   return n;
 }
 
+uint32_t Mob::DefaultSmearMat() const {
+  // The SUBSTANCE a cut's tint is made of: the creature's wound material when
+  // that is something the palette can draw, else its blood. Checked through
+  // StainTypeOf rather than used blindly, because a wound material with no
+  // stain block would coat the limb in something invisible.
+  if (!def_) return 0;
+  if (sys_ && sys_->StainTypeOf(def_->woundMat)) return def_->woundMat;
+  if (sys_ && sys_->StainTypeOf(def_->bleedMat)) return def_->bleedMat;
+  return 0;
+}
+
 uint32_t Mob::StainWound(int limbIndex, Vec3 centreLocal, float radiusWorld,
                          uint32_t seed, const std::vector<IVec3>* crater,
                          float rimCells) {
+  // THE ORDINARY CUT: the victim's own wound material, smeared with whatever
+  // that derives to. One line, and it is the only place the old defaults live
+  // now -- see Mob::StainWoundAs for why the two halves are separate arguments.
+  return StainWoundAs(limbIndex, centreLocal, radiusWorld, seed,
+                      def_ ? def_->woundMat : 0u, DefaultSmearMat(), crater,
+                      rimCells);
+}
+
+uint32_t Mob::StainWoundAs(int limbIndex, Vec3 centreLocal, float radiusWorld,
+                           uint32_t seed, uint32_t rewriteMat,
+                           uint32_t smearMat,
+                           const std::vector<IVec3>* crater, float rimCells) {
   if (!def_ || limbIndex < 0 || limbIndex >= (int)limbs_.size()) return 0;
   // A GARMENT HAS NO BLOOD IN IT, and neither has a sword. Both are borrowed
   // rig slots (DESIGN.md §8c) and both reach every path a limb reaches, which
@@ -6965,7 +7007,7 @@ uint32_t Mob::StainWound(int limbIndex, Vec3 centreLocal, float radiusWorld,
   // coat. The held item is not `worn`, so it needs its own exclusion: an
   // appended slot that is not part of the authored rig is luggage.
   if (IsWornSlot(limbIndex) || limbIndex >= baseLimbs_) return 0;
-  const uint32_t stain = def_->woundMat;
+  const uint32_t stain = rewriteMat;
   const bool fromCrater = crater && !crater->empty() && rimCells > 0.0f;
   if (!stain || (!fromCrater && radiusWorld <= 0.0f)) return 0;
   const auto& gt = CurrentTuning().gore;
@@ -7198,17 +7240,19 @@ uint32_t Mob::StainWound(int limbIndex, Vec3 centreLocal, float radiusWorld,
   // on, poked into the brick the rewrite just owned. Counted separately so a
   // caller that asks "did the soak land" still gets the rewrite's answer.
   {
-    // The SUBSTANCE the smear is made of: the creature's wound material when
-    // that is something the palette can draw, else its blood. Checked through
-    // StainTypeOf rather than used blindly, because a wound material with no
-    // stain block would coat the limb in something invisible.
-    const uint32_t woundStains =
-        sys_ && sys_->StainTypeOf(def_->woundMat) ? def_->woundMat : 0u;
+    // THE SUBSTANCE THE SMEAR IS MADE OF IS THE CALLER'S CHOICE, and it is a
+    // separate choice from the rewrite above. A cut passes DefaultSmearMat()
+    // (the creature's woundMat, else its blood) and is unchanged; a BRUISE
+    // passes 0 and lays nothing down, because a punch that bloodied you would
+    // be a cut; a BITE passes its biter's `infectStain`, so the hole is wet
+    // with the thing that made it rather than with the victim's blood.
+    //
+    // Checked through StainTypeOf here rather than trusted, because a caller
+    // that hands over a material with no stain block (rotflesh is a SOLID, and
+    // only liquids may stain) would otherwise coat the limb in something
+    // invisible and charge the ledger a recount for it.
     CutSoak soak;
-    soak.mat = woundStains ? woundStains
-                           : (sys_ && sys_->StainTypeOf(def_->bleedMat)
-                                  ? def_->bleedMat
-                                  : 0u);
+    soak.mat = sys_ && sys_->StainTypeOf(smearMat) ? smearMat : 0u;
     // THE TINT REACHES PAST THE REWRITE IN THE RATIO THE TWO ARE AUTHORED IN
     // (stainCutRadius 1.6 : woundStainRadius 0.9). For a kerf that is exactly
     // stainCutRadius * scale and nothing moves; for a crater it is that ratio
@@ -7688,12 +7732,32 @@ BurnLimbView Mob::ViewOf(MobLimb& limb) {
   // none of this set, so a part on the ground goes on rotting the way it
   // always did. Off entirely for an undead def or with gore.woundHeals off,
   // and then every line below is the old code path.
-  if (def.woundMat != 0 && WoundsHeal()) {
+  // THREE THINGS A WOUND CAN HAVE REWRITTEN THIS FLESH TO, and all three have
+  // to dry back rather than evaporate (game/impact.h; BurnLimbView's own note
+  // on why this is a table now). They are NOT the same clock: blood settling
+  // and a zombie's rot living in you are different events, so the rot entry
+  // carries gore.infectHealSlow instead.
+  if (WoundsHeal()) {
     const auto& gt = CurrentTuning().gore;
-    v.woundMat = def.woundMat;
-    v.woundSlow = (uint32_t)std::lround(std::max(1.0f, gt.woundHealSlow));
-    v.revive = &Mob::ReviveWoundVoxel;
-    v.reviveCtx = &limb;
+    const uint32_t slow =
+        (uint32_t)std::lround(std::max(1.0f, gt.woundHealSlow));
+    int n = 0;
+    auto arm = [&](uint32_t mat, uint32_t divisor) {
+      if (mat == 0 || n >= BurnLimbView::kWoundMats) return;
+      for (int k = 0; k < n; k++)
+        if (v.woundMat[k] == mat) return;   // a creature that bruises in blood
+      v.woundMat[n] = mat;
+      v.woundSlow[n] = divisor;
+      n++;
+    };
+    arm(def.woundMat, slow);                               // a cut
+    arm(sys_ ? sys_->MaterialIdNamed(gt.bruiseMat) : 0u, slow);   // a bruise
+    arm(limb.infectMat,                                    // ...and a bite
+        (uint32_t)std::lround(std::max(1.0f, gt.infectHealSlow)));
+    if (n > 0) {
+      v.revive = &Mob::ReviveWoundVoxel;
+      v.reviveCtx = &limb;
+    }
   }
   return v;
 }
@@ -8779,8 +8843,13 @@ bool Mob::CarveLimb(int limbIndex, World& world,
   }
   if (def.bleedMat && bleeds) {
     if (carveN) limb.woundLocal = carveC;
-    limb.bleedBudget = AddBleedBudget(limb.bleedBudget,
-                                      lost * (float)at0 * def.bleedPerDamage);
+    // ...and a DENT drips at the same reduced rate the trauma that made it
+    // does (Mob::Damage's note): a caved-in face is not an open wound.
+    const float bleedScale =
+        inBluntCarve_ ? std::clamp(gt.bluntBleedScale, 0.0f, 1.0f) : 1.0f;
+    limb.bleedBudget =
+        AddBleedBudget(limb.bleedBudget,
+                       lost * (float)at0 * def.bleedPerDamage * bleedScale);
   }
 
   // Carved down past the point of being a limb at all: it comes off. This is
@@ -8789,9 +8858,16 @@ bool Mob::CarveLimb(int limbIndex, World& world,
   // The FRACTION is measured on the same lattice `at0` counted (skin when
   // there is one); the absolute kMinFragmentVoxels floor stays on the collider,
   // which is what "too few voxels to be a body" has always meant to Jolt.
+  // A BLUNT HIT NEVER TAKES A LIMB OFF, however many land -- the owner's spec
+  // in one line, and this is the whole implementation of it (see
+  // Mob::BluntCarveScope). A face may be caved in well past the point where a
+  // blast would have shed the head; hp reaching zero on a VITAL limb still
+  // kills through HpZeroSevers below, because that is a statement about DEATH
+  // rather than about amputation.
   const bool collapsed =
-      limb.voxels.size() < kMinFragmentVoxels ||
-      (float)nowCount < kLimbCollapseFraction * (float)at0;
+      !inBluntCarve_ &&
+      (limb.voxels.size() < kMinFragmentVoxels ||
+       (float)nowCount < kLimbCollapseFraction * (float)at0);
   // HP IS NO LONGER A DISMEMBERMENT RULE (except where it always was — see
   // HpZeroSevers). It was the third of the three instant severs the owner's
   // spec deletes, and it is the one that survives a blade cut the longest: a
@@ -8961,10 +9037,13 @@ bool Mob::CarveLimb(int limbIndex, World& world,
         }
       }
       // Losing the disconnected mass can itself take the limb under the floor.
-      // Same lattice pairing as the first collapse test above.
-      if (limb.voxels.size() < kMinFragmentVoxels ||
-          (float)(fine ? limb.skinVoxels.size() : limb.voxels.size()) <
-              kLimbCollapseFraction * (float)at0) {
+      // Same lattice pairing as the first collapse test above -- and the same
+      // blunt exclusion, for the same reason: a dent that disconnected a chip
+      // and then found the remainder small is still a dent.
+      if (!inBluntCarve_ &&
+          (limb.voxels.size() < kMinFragmentVoxels ||
+           (float)(fine ? limb.skinVoxels.size() : limb.voxels.size()) <
+               kLimbCollapseFraction * (float)at0)) {
         Sever(limbIndex);
         return false;
       }
@@ -9601,7 +9680,7 @@ bool MobSystem::BurnOneLimb(BurnLimbView& v, uint32_t tick, uint32_t rngKey,
       // creature's ash, smoke and fire are untouched -- those are other
       // materials and are not in the table. Null `revive` is the undead path,
       // where the hole widening IS the feature.
-      if (v.woundMat && was == v.woundMat && v.revive) {
+      if (v.WoundSlot(was) >= 0 && v.revive) {
         uint32_t backWord = 0, backColor = 0;
         if (v.revive(v.reviveCtx, p, backWord, backColor)) {
           v.SetWord(i, backWord, backColor);
@@ -9843,9 +9922,11 @@ bool MobSystem::BurnOneLimb(BurnLimbView& v, uint32_t tick, uint32_t rngKey,
       // might be authored to do gets quietly halved along with it. Floored at
       // 1 for the reason the cross-limb scale below is -- a rule scaled to
       // zero is "impossible", which is a different statement from "slow".
-      if (v.woundMat && m == v.woundMat && v.woundSlow > 1 &&
-          (r.packed & 3u) == kReactDecay) {
-        const uint32_t slowed = chance / v.woundSlow;
+      // Each wound material settles on ITS OWN clock -- blood over about six
+      // seconds, a zombie's rot over minutes (BurnLimbView's wound table).
+      if (const int ws = v.WoundSlot(m);
+          ws >= 0 && v.woundSlow[ws] > 1 && (r.packed & 3u) == kReactDecay) {
+        const uint32_t slowed = chance / v.woundSlow[ws];
         chance = slowed ? slowed : 1u;
       }
       // ---- IS A SIBLING LIMB THE ONLY THING ARMING THIS RULE? --------------
@@ -11281,6 +11362,303 @@ bool Mob::CarveLimbRadial(uint64_t bodyHandle, Vec3 centerWorldVoxel,
   return false;
 }
 
+// ============================================================================
+// THE OTHER TWO KINDS OF BLOW (docs/PLAN_impact_unarmed.md §2, game/impact.h)
+//
+// Mob::CutLimb above is the KERF and it is untouched. These two are its
+// siblings, and every line of them is about what they DO NOT do:
+//
+//   BluntHit  removes almost nothing and never dismembers. A mace kills by
+//             trauma, not by amputation, and a fist kills by neither.
+//   BiteHit   tears rather than cuts, bleeds like a cut, and may take a hand
+//             off only by COLLAPSE -- the geometric rule, not the blade's.
+//
+// Both reach the world through exactly the paths a sword already reaches it
+// through (Damage / CarveLimb / CarveLimbRadial / StainWoundAs). There is no
+// new mutation path here and there is not going to be one: CLAUDE.md rule 3.
+// ============================================================================
+
+bool MobSystem::BluntHit(uint64_t bodyHandle, const ::BluntHit& hit,
+                         World& world, std::vector<ParticleSpawn>& spawns) {
+  for (Mob& mob : mobs_)
+    if (mob.BluntHit(bodyHandle, hit, world, spawns)) return true;
+  // ...AND THE PLAYER IS BRUISED TOO. Same line, same reason, as the one at
+  // the top of MobSystem::CutLimb: the avatar is a Mob that does not live in
+  // `mobs_`, and a handle-keyed entry point that forgot it would let an NPC's
+  // mace pass through the player and melt their arm as debris instead.
+  if (avatar_ != nullptr && avatar_->BluntHit(bodyHandle, hit, world, spawns))
+    return true;
+  return false;
+}
+
+bool MobSystem::BiteHit(uint64_t bodyHandle, const ::BiteHit& hit, World& world,
+                        std::vector<ParticleSpawn>& spawns) {
+  for (Mob& mob : mobs_)
+    if (mob.BiteHit(bodyHandle, hit, world, spawns)) return true;
+  if (avatar_ != nullptr && avatar_->BiteHit(bodyHandle, hit, world, spawns))
+    return true;
+  return false;
+}
+
+uint32_t MobSystem::MaterialIdNamed(const std::string& name) const {
+  if (name.empty()) return 0;
+  // A ONE-ENTRY MEMO, and one entry is genuinely enough: there is exactly one
+  // name-typed tuning row (gore.bruiseMat), and the hot path that asks is
+  // Mob::ViewOf, which asks the SAME name once per limb per tick. A map would
+  // be a second structure to invalidate on a materials reload for no
+  // measurable gain, and the linear scan it replaces is ~130 short strings.
+  //
+  // The MISS is cached as hard as the hit, deliberately: a typo'd material
+  // name would otherwise pay the whole scan on every limb forever, which is
+  // precisely the case where nobody is watching.
+  if (!matNameLast_.empty() && name == matNameLast_) return matNameLastId_;
+  uint32_t id = 0;
+  for (size_t i = 0; i < matNames_.size(); i++)
+    if (matNames_[i] == name) {
+      id = (uint32_t)i;
+      break;
+    }
+  matNameLast_ = name;
+  matNameLastId_ = id;
+  return id;
+}
+
+bool Mob::BluntHit(uint64_t bodyHandle, const ::BluntHit& hit, World& world,
+                   std::vector<ParticleSpawn>& spawns) {
+  if (!def_ || !phys_) return false;
+  int li = -1;
+  for (size_t i = 0; i < limbs_.size(); i++)
+    if (limbs_[i].body == bodyHandle) {
+      li = (int)i;
+      break;
+    }
+  if (li < 0) return false;
+
+  const Tuning& tune = CurrentTuning();
+  const Tuning::Gore& gt = tune.gore;
+  const Tuning::Gear& gear = tune.gear;
+  const float power = std::clamp(hit.power, 0.0f, 1.0f);
+
+  // ---- A WORN SHELL: BREAK IT IN, AND GET THROUGH IT ----------------------
+  //
+  // "Plate stops swords almost entirely; maces go through." Both halves of
+  // that are here, and both are geometric rather than a resist number: the
+  // shell really loses voxels (so the flesh under it is exposed to the NEXT
+  // blow, and to fire, and to acid), and a share of the blow arrives on the
+  // body whether or not it did.
+  if (IsWornSlot(li)) {
+    // The host limb's BODY HANDLE, captured before anything can sever the
+    // shell: `wornHost` is an INDEX, and an index into a list that a Damage()
+    // three lines down may reshape is the classic way to bruise the wrong arm.
+    const int hostIdx = limbs_[li].wornHost;
+    const uint64_t hostBody =
+        (hostIdx >= 0 && hostIdx < (int)limbs_.size()) ? limbs_[hostIdx].body
+                                                       : 0ull;
+    // The shell's own material hardness, read the same way Mob::CutLimb reads
+    // it for the kerf -- first voxel of the authoritative lattice, because a
+    // shell is one material all over.
+    float hard = 0.0f;
+    if (sys_ != nullptr) {
+      uint32_t m = 0;
+      if (!limbs_[li].skinVoxels.empty())
+        m = limbs_[li].skinVoxels[0].material & 0xFFFu;
+      else if (!limbs_[li].voxels.empty())
+        m = limbs_[li].voxels[0].payload & 0xFFFu;
+      if (m < sys_->matGpu_.size()) hard = (float)sys_->matGpu_[m].hardness;
+    }
+    float k = 1.0f;
+    if (hard > 0.0f && gear.bluntHardnessRef > 0.0f)
+      k = std::clamp(gear.bluntHardnessRef / hard,
+                     std::clamp(gear.bluntHardnessMin, 0.0f, 1.0f), 1.0f);
+
+    // 1. THE SHELL TAKES hp. Ordinary Damage on the shell's own slot, which is
+    //    what a piece's condition is made of, at gear.bluntShellHp of the blow.
+    Damage(bodyHandle, hit.hp * gear.bluntShellHp, hit.at, hit.impactSpeed);
+
+    // 2. ...AND IS BEATEN IN. Real voxels, through the ordinary radial carve --
+    //    the same call an explosion makes, so a dented cuirass is dented in
+    //    exactly the way a blasted one is and nothing new had to learn how.
+    //    A weapon with armorBreak 0 (a fist, a bare hand) skips this entirely:
+    //    the radius is 0 and CarveLimbRadial refuses a non-positive one.
+    const float breakR = gear.bluntDentRadius *
+                         std::clamp(hit.armorBreak, 0.0f, 1.0f) * power * k;
+    if (breakR > 0.0f)
+      CarveLimbRadial(bodyHandle, hit.at, breakR, /*ragged=*/true,
+                      /*eject=*/true, world, spawns);
+
+    // 3. ...AND THE REST ARRIVES ON THE BODY UNDERNEATH. Not conditional on
+    //    the shell breaking: the plate deforming IS how the energy gets
+    //    through, which is the whole difference from a blade. No dent and no
+    //    armour break on this pass -- what is under the plate is flesh, and the
+    //    bruise is what a transmitted blow leaves.
+    if (hostBody != 0ull && gear.bluntThrough > 0.0f) {
+      ::BluntHit through = hit;
+      through.hp = hit.hp * gear.bluntThrough;
+      through.carve = 0.0f;
+      through.armorBreak = 0.0f;
+      // The knock-loose rule is the SHELL's, not the wearer's: a strap does not
+      // snap because the blow was fast (Mob::Damage says so in as many words),
+      // and transmitting the speed would only ever arm it on the body.
+      through.impactSpeed = 0.0f;
+      through.seed = hit.seed ^ 0x7A11EDu;
+      BluntHit(hostBody, through, world, spawns);
+    }
+    return true;
+  }
+
+  // ---- LIVE FLESH: TRAUMA, A BRUISE, AND AT MOST A DENT -------------------
+  //
+  // The scope covers the WHOLE blow rather than only the carve, because both
+  // rules it arms are about the same fact -- this is trauma, not an edge. See
+  // Mob::BluntCarveScope.
+  BluntCarveScope blunt(*this);
+  if (!Damage(bodyHandle, hit.hp, hit.at, hit.impactSpeed)) return false;
+  // Damage() can sever (an extreme impact) or kill (a vital limb at zero), and
+  // either reshapes limbs_. Re-resolve rather than trusting `li`; a handle that
+  // is gone means the blow landed and there is nothing left to bruise.
+  li = -1;
+  for (size_t i = 0; i < limbs_.size(); i++)
+    if (limbs_[i].body == bodyHandle) {
+      li = (int)i;
+      break;
+    }
+  if (li < 0) return true;
+
+  // The contact point in the limb's own frame, which is what both the bruise
+  // and the dent are placed in. Read from the limb's live transform, once.
+  phys_->GetTransform(limbs_[li].body, limbs_[li].xf);
+  const Quat q{limbs_[li].xf.quat[0], limbs_[li].xf.quat[1],
+               limbs_[li].xf.quat[2], limbs_[li].xf.quat[3]};
+  const Vec3 local = RotateInv(q, hit.at - limbs_[li].xf.pos);
+
+  // 1. THE BRUISE, first and widest, on skin that is still there. In
+  //    gore.bruiseMat and with NO smear: a punch marks you, it does not
+  //    bloody you (Mob::StainWoundAs).
+  const uint32_t bruiseMat =
+      sys_ != nullptr ? sys_->MaterialIdNamed(gt.bruiseMat) : 0u;
+  if (bruiseMat != 0 && gt.bruiseRadius > 0.0f)
+    StainWoundAs(li, local, gt.bruiseRadius * (0.5f + 0.5f * power),
+                 hit.seed ^ 0xB2015Eu, bruiseMat, /*smearMat=*/0u);
+
+  // 2. THE DENT, only if the weapon has any (a bare fist authors 0 and takes
+  //    nothing). CarveLimbRadial soaks the crater it made in the victim's own
+  //    woundMat on the way out, which is "deletes voxels and replaces them
+  //    with gore" -- and the scope above is what stops the same carve from
+  //    collapsing the limb, however many blows land on it.
+  const float dentR =
+      gt.bluntCarveRadius * std::clamp(hit.carve, 0.0f, 1.0f) * power;
+  if (dentR > 0.0f)
+    CarveLimbRadial(limbs_[li].body, hit.at, dentR, /*ragged=*/true,
+                    /*eject=*/true, world, spawns);
+  return true;
+}
+
+bool Mob::CarveBlob(int limbIndex, Vec3 centreLocal, float radiusWorld,
+                    float blob, uint32_t seed, World& world,
+                    std::vector<ParticleSpawn>& spawns, CarveReport* report) {
+  if (limbIndex < 0 || limbIndex >= (int)limbs_.size() || radiusWorld <= 0.0f)
+    return true;
+  const uint32_t skinScale = std::max(1u, SkinScaleOf(limbs_[limbIndex]));
+  return CarveLimb(limbIndex, world, spawns, /*eject=*/true,
+                   BlobCarveFactory({centreLocal}, {radiusWorld},
+                                    std::max(0.5f, blob), seed, skinScale),
+                   /*spall=*/nullptr, report);
+}
+
+bool Mob::BiteHit(uint64_t bodyHandle, const ::BiteHit& hit, World& world,
+                  std::vector<ParticleSpawn>& spawns) {
+  if (!def_ || !phys_) return false;
+  int li = -1;
+  for (size_t i = 0; i < limbs_.size(); i++)
+    if (limbs_[i].body == bodyHandle) {
+      li = (int)i;
+      break;
+    }
+  if (li < 0) return false;
+
+  const Tuning& tune = CurrentTuning();
+  const Tuning::Gore& gt = tune.gore;
+  const float power = std::clamp(hit.power, 0.0f, 1.0f);
+
+  // ---- ARMOUR DEFENDS, AND THAT IS THE WHOLE RULE -------------------------
+  //
+  // Teeth on a cuirass are a BLOW: a share of the bite arrives as trauma, the
+  // plate is not broken, and there is NO INFECTION. The owner asked for a
+  // rotten wound "that touches FLESH (armour defends)", and this is the one
+  // line that makes it true -- which is also why the classification happens
+  // before any part of the profile is applied (impact.h StruckKind).
+  if (IsWornSlot(li)) {
+    ::BluntHit b;
+    b.at = hit.at;
+    b.hp = hit.hp * std::clamp(tune.gear.biteOnShell, 0.0f, 1.0f);
+    b.power = power;
+    b.carve = 0.0f;
+    b.armorBreak = 0.0f;
+    b.seed = hit.seed ^ 0xB17E5u;
+    return BluntHit(bodyHandle, b, world, spawns);
+  }
+
+  // ---- LIVE FLESH: A TEAR ------------------------------------------------
+  //
+  // Bleeds like a cut, deliberately: this is a hole torn in meat, and refusing
+  // the drip here would make a bite read as a bruise. The scope keeps the
+  // BLADE rules off (a mouth has no direction to cut through in) and leaves
+  // the COLLAPSE sever ON, which is the one line separating a bite from a
+  // punch -- enough bites do take a hand off.
+  BiteScope bite(*this);
+  if (!Damage(bodyHandle, hit.hp, hit.at, /*impactSpeed=*/0.0f)) return false;
+  li = -1;
+  for (size_t i = 0; i < limbs_.size(); i++)
+    if (limbs_[i].body == bodyHandle) {
+      li = (int)i;
+      break;
+    }
+  if (li < 0) return true;
+
+  phys_->GetTransform(limbs_[li].body, limbs_[li].xf);
+  const Quat q{limbs_[li].xf.quat[0], limbs_[li].xf.quat[1],
+               limbs_[li].xf.quat[2], limbs_[li].xf.quat[3]};
+  const Vec3 local = RotateInv(q, hit.at - limbs_[li].xf.pos);
+
+  CarveReport rep{};
+  const uint32_t seed = (uint32_t)id_ * 2654435761u + (uint32_t)li * 40503u +
+                        hit.seed;
+  if (!CarveBlob(li, local, gt.biteRadius * (0.4f + 0.6f * power), gt.biteBlob,
+                 seed, world, spawns, &rep))
+    return true;  // the limb did not survive: CarveLimb's contract applies
+  if (rep.count == 0 || rep.cells.empty()) return true;
+
+  // ---- WHAT THE HOLE IS WET WITH -----------------------------------------
+  //
+  // Measured from the removed CELLS and not from a ball at their centroid, for
+  // the reason the blast crater's own note gives at length: a blob's removal
+  // chance falls to zero at its rim, so it is a scatter whose centroid is
+  // inside the limb.
+  //
+  // Wider than a blade's rim by biteStainScale, because a tear is a ragged
+  // hole rather than a clean slot -- the mess goes further than the damage.
+  const float rim = std::max(0.0f, gt.craterStainRim * gt.biteStainScale);
+  if (rim <= 0.0f) return true;
+  if (hit.infectMat != 0) {
+    // AN INFECTED WOUND. The exposed tissue is rewritten to the BITER's
+    // material and the hole is smeared with the biter's liquid -- the victim's
+    // own blood does not come into it, which is the whole of plan S6.
+    //
+    // StainWoundAs only ever rewrites flesh-class cells (MobDef::tissue), so a
+    // nonzero return IS "the tear exposed flesh". Latching the material on the
+    // limb is what lets the heal path know this rot is a wound settling rather
+    // than a substance decaying (MobLimb::infectMat).
+    const uint32_t took =
+        StainWoundAs(li, rep.centreLocal, 0.0f, seed ^ 0x120FEC7u,
+                     hit.infectMat, hit.infectStain, &rep.cells, rim);
+    if (took > 0) limbs_[li].infectMat = hit.infectMat;
+  } else {
+    // An ordinary tear bleeds like any other wound.
+    StainWound(li, rep.centreLocal, 0.0f, seed ^ 0x7EA12u, &rep.cells, rim);
+  }
+  return true;
+}
+
 // ---- SANDVOX_ROT_DEBUG=1 ----------------------------------------------------
 //
 // Rot's attribution probe, and it earned its keep twice in one session. "3%
@@ -11306,6 +11684,116 @@ static bool RotDebug() {
     return e != nullptr && e[0] != '0';
   }();
   return kOn;
+}
+
+// ---- THE BLOB: ONE PREDICATE, TWO CALLERS ----------------------------------
+//
+// The correlated-noise bite. Extracted 2026-09-15 from Mob::RotAtSpawn, which
+// was its only caller until a zombie's TEETH needed exactly the same hole
+// (game/impact.h BiteHit): rot is what a bite looks like once it is old, and
+// two implementations of that shape would have drifted the first time either
+// was tuned.
+//
+// WHAT IS SHARED IS THE PREDICATE, NOT A CARVE. RotAtSpawn hands its WHOLE
+// list of bites to one CarveLimb call -- that is what makes its volume cap and
+// its single hp charge correct, and splitting it into one call per bite would
+// have charged a spawning zombie N times and given each hole its own chance to
+// collapse the limb. So this takes a LIST and Mob::CarveBlob passes a list of
+// one. One blob, two callers.
+//
+// Every argument is in the limb's own frame: `centres` limb-local WORLD
+// voxels, `radii` world voxels, `blob` the noise's feature size in SKIN
+// voxels, `skinScale` the lattice the noise is sampled on whichever lattice is
+// being tested -- so the collider and the art tear identically and the shape of
+// the damage is a property of the ART rather than of the collider resolution
+// the engine happened to derive.
+Mob::LimbCarveFactory Mob::BlobCarveFactory(std::vector<Vec3> centres,
+                                            std::vector<float> radii,
+                                            float blob, uint32_t nseed,
+                                            uint32_t skinScale) {
+  return [centres, radii, blob, nseed, skinScale](float scale)
+             -> LimbCarveKeep {
+
+          std::vector<Vec3> cs;
+          std::vector<float> r2s;
+          std::vector<float> bias;
+          cs.reserve(centres.size());
+          r2s.reserve(radii.size());
+          bias.reserve(centres.size());
+          // The noise is sampled on the SKIN lattice whichever lattice is being
+          // tested, so the collider and the art tear identically and the shape
+          // of the damage is a property of the ART rather than of the collider
+          // resolution the engine happened to derive. Same rule the blast
+          // crater's jitter follows, and for the same reason.
+          const float toSkin = (float)skinScale / scale;
+          for (size_t b = 0; b < centres.size(); b++) {
+            cs.push_back(centres[b] * scale);
+            const float r = radii[b] * scale;
+            r2s.push_back(r * r);
+            // ---- EACH BITE IS RECENTRED ON ITS OWN NOISE -------------------
+            //
+            // Without this the feature was ~10x weaker than its own shape says
+            // — measured, ratio 0.09 of predicted, with the volume cap not
+            // binding on a single limb. The cause is that `blob` and the bite
+            // radius are deliberately the SAME order (3 skin voxels against
+            // 8): that is what makes the loss come off in chunks rather than
+            // as speckle, and it also means the field barely varies inside one
+            // bite. So a bite did not carve a ragged hole — it sampled roughly
+            // ONE value and then removed everything or nothing, and since the
+            // threshold `(1-t^2)^2` is below 1 everywhere but the exact
+            // centre, most bites lost that coin flip and vanished.
+            //
+            // Subtracting the noise AT THE BITE'S CENTRE fixes the level
+            // without touching the gradient: the centre now always goes
+            // (0.5 < 1), the field still varies with the correlation length
+            // that makes the edge chunky, and every bite lands. The noise
+            // decides the SHAPE of the hole, which is what it is good at; it
+            // no longer gets a vote on whether there is a hole.
+            const Vec3 sc = centres[b] * (float)skinScale;
+            bias.push_back(0.5f - ValueNoise3(nseed, sc.x / blob, sc.y / blob,
+                                              sc.z / blob));
+          }
+          return [=](int x, int y, int z) {
+            const Vec3 c{(float)x + 0.5f, (float)y + 0.5f, (float)z + 0.5f};
+            for (size_t b = 0; b < cs.size(); b++) {
+              const Vec3 dv = c - cs[b];
+              const float d2 = dv.dot(dv);
+              if (d2 >= r2s[b] || r2s[b] <= 0.0f) continue;
+              // Certain at the centre, nothing at the rim, squared so the bite
+              // is a hole with a torn edge rather than a fade across the whole
+              // ball (the same tightening the crater's `carveFalloff` makes).
+              const float t2 = d2 / r2s[b];
+              const float f = 1.0f - t2;
+              const float chance = f * f;
+              const int sx = (int)std::floor((float)x * toSkin);
+              const int sy = (int)std::floor((float)y * toSkin);
+              const int sz = (int)std::floor((float)z * toSkin);
+              // PURE correlated noise, with no white-noise term mixed in: the
+              // owner asked for chunks "largely in groups", and any independent
+              // per-voxel draw at all puts speckle back (see the long note on
+              // ValueNoise3 at the top of this file). `blob` IS the size of one
+              // piece that comes away.
+              const float smooth = ValueNoise3(nseed, (float)sx / blob,
+                                               (float)sy / blob,
+                                               (float)sz / blob);
+              // Two corrections, both about the noise's LEVEL rather than its
+              // shape, and both monotone so the spatial correlation — the
+              // entire reason this is value noise and not a hash — survives:
+              //
+              //   * `bias[b]` recentres this bite on its own centre value, so
+              //     the bite always lands. See the long note where it is built.
+              //   * trilinear value noise is not uniform: it is a smoothed
+              //     blend of eight uniform corners, so it piles up around 0.5
+              //     with a standard deviation near 0.146 against a uniform
+              //     0.289. Stretching about the mean restores the spread, and
+              //     without it the rim is a cliff instead of a tear.
+              const float n = std::clamp(
+                  0.5f + (smooth + bias[b] - 0.5f) * 1.98f, 0.0f, 1.0f);
+              if (n < chance) return false;  // remove
+            }
+            return true;  // keep
+          };
+  };
 }
 
 // ---- BORN BITTEN (MobRotDef, mob.h) ----------------------------------------
@@ -11491,88 +11979,7 @@ uint32_t Mob::RotAtSpawn(World& world) {
     Mob::CarveReport rep{};
     const bool alive = CarveLimb(
         (int)i, world, discard, /*eject=*/false,
-        [&, centres, radii, blob, nseed, skinScale](float scale)
-            -> LimbCarveKeep {
-          std::vector<Vec3> cs;
-          std::vector<float> r2s;
-          std::vector<float> bias;
-          cs.reserve(centres.size());
-          r2s.reserve(radii.size());
-          bias.reserve(centres.size());
-          // The noise is sampled on the SKIN lattice whichever lattice is being
-          // tested, so the collider and the art tear identically and the shape
-          // of the damage is a property of the ART rather than of the collider
-          // resolution the engine happened to derive. Same rule the blast
-          // crater's jitter follows, and for the same reason.
-          const float toSkin = (float)skinScale / scale;
-          for (size_t b = 0; b < centres.size(); b++) {
-            cs.push_back(centres[b] * scale);
-            const float r = radii[b] * scale;
-            r2s.push_back(r * r);
-            // ---- EACH BITE IS RECENTRED ON ITS OWN NOISE -------------------
-            //
-            // Without this the feature was ~10x weaker than its own shape says
-            // — measured, ratio 0.09 of predicted, with the volume cap not
-            // binding on a single limb. The cause is that `blob` and the bite
-            // radius are deliberately the SAME order (3 skin voxels against
-            // 8): that is what makes the loss come off in chunks rather than
-            // as speckle, and it also means the field barely varies inside one
-            // bite. So a bite did not carve a ragged hole — it sampled roughly
-            // ONE value and then removed everything or nothing, and since the
-            // threshold `(1-t^2)^2` is below 1 everywhere but the exact
-            // centre, most bites lost that coin flip and vanished.
-            //
-            // Subtracting the noise AT THE BITE'S CENTRE fixes the level
-            // without touching the gradient: the centre now always goes
-            // (0.5 < 1), the field still varies with the correlation length
-            // that makes the edge chunky, and every bite lands. The noise
-            // decides the SHAPE of the hole, which is what it is good at; it
-            // no longer gets a vote on whether there is a hole.
-            const Vec3 sc = centres[b] * (float)skinScale;
-            bias.push_back(0.5f - ValueNoise3(nseed, sc.x / blob, sc.y / blob,
-                                              sc.z / blob));
-          }
-          return [=](int x, int y, int z) {
-            const Vec3 c{(float)x + 0.5f, (float)y + 0.5f, (float)z + 0.5f};
-            for (size_t b = 0; b < cs.size(); b++) {
-              const Vec3 dv = c - cs[b];
-              const float d2 = dv.dot(dv);
-              if (d2 >= r2s[b] || r2s[b] <= 0.0f) continue;
-              // Certain at the centre, nothing at the rim, squared so the bite
-              // is a hole with a torn edge rather than a fade across the whole
-              // ball (the same tightening the crater's `carveFalloff` makes).
-              const float t2 = d2 / r2s[b];
-              const float f = 1.0f - t2;
-              const float chance = f * f;
-              const int sx = (int)std::floor((float)x * toSkin);
-              const int sy = (int)std::floor((float)y * toSkin);
-              const int sz = (int)std::floor((float)z * toSkin);
-              // PURE correlated noise, with no white-noise term mixed in: the
-              // owner asked for chunks "largely in groups", and any independent
-              // per-voxel draw at all puts speckle back (see the long note on
-              // ValueNoise3 at the top of this file). `blob` IS the size of one
-              // piece that comes away.
-              const float smooth = ValueNoise3(nseed, (float)sx / blob,
-                                               (float)sy / blob,
-                                               (float)sz / blob);
-              // Two corrections, both about the noise's LEVEL rather than its
-              // shape, and both monotone so the spatial correlation — the
-              // entire reason this is value noise and not a hash — survives:
-              //
-              //   * `bias[b]` recentres this bite on its own centre value, so
-              //     the bite always lands. See the long note where it is built.
-              //   * trilinear value noise is not uniform: it is a smoothed
-              //     blend of eight uniform corners, so it piles up around 0.5
-              //     with a standard deviation near 0.146 against a uniform
-              //     0.289. Stretching about the mean restores the spread, and
-              //     without it the rim is a cliff instead of a tear.
-              const float n = std::clamp(
-                  0.5f + (smooth + bias[b] - 0.5f) * 1.98f, 0.0f, 1.0f);
-              if (n < chance) return false;  // remove
-            }
-            return true;  // keep
-          };
-        },
+        BlobCarveFactory(centres, radii, blob, nseed, skinScale),
         nullptr, &rep);
     removedTotal += rep.count;
     // ---- A ROT HOLE IS A WOUND, AND IT LOOKS LIKE ONE ----------------------
@@ -14188,12 +14595,10 @@ StrikeProfile Mob::StrikeProfileFor(const MobNaturalWeaponDef& nw) const {
   // shell is parented to the limb it covers, so `parts[slot].parent` is the
   // answer and there is no second table to keep in step.
   //
-  // PACKAGE A MERGE: `ItemDef::strike` is A's field. Until it lands this loop
-  // finds the piece and then has nothing to read, so the override is a no-op
-  // and a gauntleted fist hits exactly as a bare one does. The merge is the
-  // two commented lines below becoming live:
-  //     if (const ItemDef* it = lib->At(lib->Find(worn_[w].item));
-  //         it != nullptr && it->strike.Any()) { p.cut = it->strike.cut; ... }
+  // The piece's own `strike` block (item.h ItemDef::strike, authored in the
+  // worn sidecar) is the whole override: the four impact numbers move across,
+  // the infection terms do not - a gauntlet has no mouth. A worn piece with
+  // no `strike` block is armour, not a weapon, and leaves the fist alone.
   {
     const ItemLibrary* lib = sys_ != nullptr ? sys_->Items() : nullptr;
     if (lib != nullptr && nw.partIndex >= 0) {
@@ -14205,8 +14610,13 @@ StrikeProfile Mob::StrikeProfileFor(const MobNaturalWeaponDef& nw) const {
             covers = true;
         }
         if (!covers) continue;
-        // PACKAGE A MERGE: replace this line with the ItemDef::strike read.
-        (void)wp;
+        const ItemDef* it = lib->At(lib->Find(wp.item));
+        if (it == nullptr || !it->strike.Any()) continue;
+        p.cut = it->strike.cut;
+        p.blunt = it->strike.blunt;
+        p.bluntCarve = it->strike.bluntCarve;
+        p.armorBreak = it->strike.armorBreak;
+        p.bite = it->strike.bite;
       }
     }
   }

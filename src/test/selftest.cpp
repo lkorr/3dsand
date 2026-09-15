@@ -54,6 +54,7 @@ const std::vector<Gate>& GrimoireGates();
 const std::vector<Gate>& SwingGates();
 const std::vector<Gate>& EquipmentGates();
 const std::vector<Gate>& WoundGates();
+const std::vector<Gate>& ImpactGates();
 // ONE list for all six combat gates (two feel gates and four NPC ones), even
 // though kOrder splits them to opposite ends of the run: the registry is a
 // pool of every gate a TU offers and the ORDER is kOrder's business alone.
@@ -400,6 +401,20 @@ const char* const kOrder[] = {
     // difference and the off arm is both the undead setting and the proof the
     // decay ran at all (owner report 2026-09-14).
     "wound-heal",
+    // ---- THE OTHER TWO KINDS OF BLOW (docs/PLAN_impact_unarmed.md) --------
+    // A strike is three parts now (game/impact.h): the wound gates above own
+    // the CUT, and these four own the BLUNT and the BITE. Appended after them
+    // by the rule the long note in this block states — a new gate in a
+    // shared-World suite goes LAST in its group, so it inherits state instead
+    // of changing what everything after it inherits.
+    //
+    // They belong beside the wound gates rather than beside the combat ones
+    // because they are fabricated blows against a standing fixture, not
+    // strokes through the AI: same perturbation, same scale, same "spawn one
+    // creature, hit it, reset" shape. Each regenerates worldgen on the way in
+    // and resets mobs and debris on every exit, and each restores the id
+    // counter (mob ids seed gore variance).
+    "impact-blunt", "impact-armor", "impact-fist", "bite-rot",
     // ...and a corpse that died alight keeps burning: every piece advances
     // its embers, keeps emitting fire, and its brick agrees with its lattice
     // (owner report 2026-09-02: the corpse pulsed at its death colour for
@@ -465,7 +480,8 @@ const std::vector<Gate>& Registry() {
                           &WorldIoGates(), &AudioGates(),
                           &VoxRegionGates(),
                           &SpellGates(), &PlayerKitGates(), &GrimoireGates(), &SwingGates(),
-                          &EquipmentGates(), &WoundGates(), &CombatGates()})
+                          &EquipmentGates(), &WoundGates(), &ImpactGates(),
+                          &CombatGates()})
       pool.insert(pool.end(), g->begin(), g->end());
 
     std::vector<Gate> v;

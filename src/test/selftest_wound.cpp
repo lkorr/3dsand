@@ -973,7 +973,7 @@ Status GateOneHit(Ctx& c, std::string& detail) {
   // (melee.fullSpeedMps 3.4 m/s = 34 vox/s) with headroom for the body's
   // own motion.
   const ItemDef* sword = c.items.At(c.items.Find("sword"));
-  const float dmg = sword ? sword->damage : 14.0f;
+  const float dmg = sword ? sword->Damage() : 14.0f;
   const float tipSpeed = 45.0f;
   // Three limbs one swing can cross: the fixture limb, its parent, and the
   // root. Hitting the root and a parent is what makes this a whole-body

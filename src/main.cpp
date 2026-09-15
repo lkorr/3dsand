@@ -8420,21 +8420,16 @@ int main(int argc, char** argv) {
             // names, so this is the matching half: the numbers come from the
             // same weapon the segment did. A fist's profile passes through
             // `StrikeProfileFor`, so a worn gauntlet upgrades the player's
-            // punch exactly as it upgrades an NPC's (plan §3).
+            // punch exactly as it upgrades an NPC's (plan section 3). No
+            // blade behind a fist, so the neutral heft (EdgeSweep::heft's
+            // documented default) rather than an item's volume ratio.
             if (const MobNaturalWeaponDef* fist = avatar.EffectorWeapon()) {
-              // PACKAGE A MERGE: replace with
-              //   `sw.strike = avatar.StrikeProfileFor(*fist);`
-              // — one line, and `damage` leaves EdgeSweep with it. Until then
-              // the three parts are SUMMED into the bare kerf float, which is
-              // wrong in KIND (a punch reads as a small cut) and right in
-              // magnitude, so every gate here measures the geometry it is
-              // actually about.
-              const StrikeProfile p = avatar.StrikeProfileFor(*fist);
-              sw.damage = p.cut + p.blunt + p.bite;
-              // No blade behind it, so the neutral heft (EdgeSweep::heft's
-              // documented default) rather than an item's volume ratio.
+              sw.strike = avatar.StrikeProfileFor(*fist);
             } else if (heldItem != nullptr) {
-              sw.damage = heldItem->damage;
+              // The whole profile, not a number (game/impact.h): a sword
+              // fills mostly `cut` and behaves exactly as it did, a mace
+              // fills `blunt`.
+              sw.strike = heldItem->strike;
               sw.carveBonus = heldItem->carveBonus;
               // HEFT: the weapon's own volume against the reference, so a
               // greatsword cuts deeper than a knife because it IS bigger
@@ -9909,7 +9904,7 @@ int main(int argc, char** argv) {
           if (d->kind == ItemKind::Melee) {
             std::snprintf(tip, sizeof tip,
                           "%.0f damage at full speed\n%.1f voxel reach%s",
-                          d->damage, d->reach,
+                          d->strike.cut, d->reach,
                           d->hasEdge ? "\ncuts along its own edge" : "");
             u.tip = tip;
           }

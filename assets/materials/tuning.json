@@ -78,7 +78,13 @@
   "gear": {
     "ruinedCondition": 0.4,
     "cutHardnessRef": 8,
-    "cutHardnessMin": 0.05
+    "cutHardnessMin": 0.05,
+    "bluntDentRadius": 1.2,
+    "bluntHardnessRef": 60,
+    "bluntHardnessMin": 0.15,
+    "bluntThrough": 0.55,
+    "bluntShellHp": 0.6,
+    "biteOnShell": 0.3
   },
   "avatar": {
     "enabled": true,
@@ -288,7 +294,15 @@
       "dist": "uniform",
       "scope": "event",
       "amount": 1.5
-    }
+    },
+    "bruiseRadius": 0.9,
+    "bruiseMat": "skin_bruised",
+    "bluntBleedScale": 0.1,
+    "bluntCarveRadius": 0.7,
+    "biteRadius": 0.45,
+    "biteBlob": 2.5,
+    "biteStainScale": 1.5,
+    "infectHealSlow": 6.0
   },
   "coat": {
     "recountTicks": 8,
@@ -823,7 +837,11 @@
     "opennessChunksPerFrame": 256,
     "opennessStrength": 1,
     "opennessFloor": 0,
-    "enclosedAmbient": [ 0.012, 0.013, 0.016 ],
+    "enclosedAmbient": [
+      0.012,
+      0.013,
+      0.016
+    ],
     "opennessBilinear": 1,
     "giStrength": 2,
     "giDecay": 0.25,

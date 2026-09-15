@@ -201,6 +201,29 @@ Status GateCombatTuning(Ctx& c, std::string& detail) {
       {"combatfx", "fleshVolume", 1.21f, [](const Tuning& t) { return t.combatfx.fleshVolume; }},
       {"combatfx", "clangVolume", 1.31f, [](const Tuning& t) { return t.combatfx.clangVolume; }},
       {"combatfx", "cueRadius", 33.0f, [](const Tuning& t) { return t.combatfx.cueRadius; }},
+      // ---- THE OTHER TWO KINDS OF BLOW (game/impact.h) --------------------
+      // Every NUMERIC row of the blunt/bite model, on the same differential:
+      // write one key, require the loaded value to have moved. `gore.bruiseMat`
+      // is deliberately absent -- it is a STRING (the one name-typed row in
+      // tuning.json, resolved at use through MobSystem::MaterialIdNamed), and
+      // this table's whole mechanism is a float comparison.
+      //
+      // Each value is inside its clamp band and different from anything
+      // shipped, which is the rule the table's own note states: a probe that
+      // happened to equal the default would pass while measuring nothing.
+      {"gore", "bruiseRadius", 1.31f, [](const Tuning& t) { return t.gore.bruiseRadius; }},
+      {"gore", "bluntBleedScale", 0.21f, [](const Tuning& t) { return t.gore.bluntBleedScale; }},
+      {"gore", "bluntCarveRadius", 1.11f, [](const Tuning& t) { return t.gore.bluntCarveRadius; }},
+      {"gore", "biteRadius", 2.11f, [](const Tuning& t) { return t.gore.biteRadius; }},
+      {"gore", "biteBlob", 3.75f, [](const Tuning& t) { return t.gore.biteBlob; }},
+      {"gore", "biteStainScale", 2.25f, [](const Tuning& t) { return t.gore.biteStainScale; }},
+      {"gore", "infectHealSlow", 9.5f, [](const Tuning& t) { return t.gore.infectHealSlow; }},
+      {"gear", "bluntDentRadius", 2.11f, [](const Tuning& t) { return t.gear.bluntDentRadius; }},
+      {"gear", "bluntHardnessRef", 77.0f, [](const Tuning& t) { return t.gear.bluntHardnessRef; }},
+      {"gear", "bluntHardnessMin", 0.31f, [](const Tuning& t) { return t.gear.bluntHardnessMin; }},
+      {"gear", "bluntThrough", 0.71f, [](const Tuning& t) { return t.gear.bluntThrough; }},
+      {"gear", "bluntShellHp", 0.81f, [](const Tuning& t) { return t.gear.bluntShellHp; }},
+      {"gear", "biteOnShell", 0.41f, [](const Tuning& t) { return t.gear.biteOnShell; }},
   };
 
   // The probe file is written next to the real one so a relative path in the
@@ -240,7 +263,34 @@ Status GateCombatTuning(Ctx& c, std::string& detail) {
   }
   std::remove(probePath.c_str());
   check(wired == (int)(sizeof(kProbes) / sizeof(kProbes[0])),
-        "every melee/combatfx key reaches its field");
+        "every melee/combatfx/gore/gear key reaches its field");
+
+  // ---- A2. THE ONE NAME-TYPED ROW ------------------------------------------
+  //
+  // `gore.bruiseMat` names a MATERIAL rather than holding an id, for the
+  // reason its declaration gives at length (the two files hot-reload
+  // independently, so an id would be stale after either). The float
+  // differential above cannot see it, and a row nothing checks is a row that
+  // silently stops being read -- which is exactly the failure mode this whole
+  // gate exists for.
+  {
+    const std::string probePath =
+        sandvox::AssetDir() + "/materials/tuning.strprobe.json";
+    {
+      std::ofstream f(probePath);
+      f << "{\n  \"gore\": { \"bruiseMat\": \"probe_not_a_material\" }\n}\n";
+    }
+    Tuning probed;
+    check(LoadTuning(probePath, probed), "string probe parses");
+    std::remove(probePath.c_str());
+    check(probed.gore.bruiseMat == "probe_not_a_material",
+          "gore.bruiseMat reaches its field as a STRING");
+    // ...and the shipped value is a material that actually exists. A typo here
+    // costs no crash and no warning -- it costs every punch in the game its
+    // bruise, silently, which is the kind of thing only a gate ever notices.
+    check(!shipped.gore.bruiseMat.empty(),
+          "the shipped gore.bruiseMat names something");
+  }
 
   // ---- B. THE CLAMPS ARE REAL ----------------------------------------------
   //
@@ -1917,15 +1967,13 @@ Status GateUnarmedAttack(Ctx& c, std::string& detail) {
   check(requests > 0, "the disarmed AI decided to attack");
   check(cutTicks > 0, "...and its request became a real cut");
   check(hits > 0, "...that landed on the target");
-  // ---- PACKAGE A MERGE --------------------------------------------------
-  // "A PUNCH NEVER DISMEMBERS AND NEVER KERFS" is package A's claim, and its
-  // number here is ZERO. Until `EdgeSweep::strike` lands, the fist's three
-  // parts are summed into the bare `damage` float (MobSystem::StepStroke's
-  // marked stand-in), so a bare fist currently cuts like a small blade. The
-  // bound lives in tests/baseline.json precisely so tightening it to 0 at the
-  // merge costs a JSON edit and no rebuild.
+  // "A PUNCH NEVER DISMEMBERS AND NEVER KERFS": a bare fist's profile is all
+  // `blunt` (human.json `natural`), and the blunt resolver (MobSystem::
+  // BluntHit) bruises without removing a voxel when `bluntCarve` is 0. So the
+  // number here is ZERO, and it lives in tests/baseline.json so that a future
+  // fist that IS allowed a dent costs a JSON edit and no rebuild.
   const uint32_t lostMax =
-      (uint32_t)BaselineNumber("unarmedAttack.fleshLostMax", 400);
+      (uint32_t)BaselineNumber("unarmedAttack.fleshLostMax", 0);
   check(lost <= lostMax,
         "a fist took no more than the authored ceiling off the target");
   RecordObserved("unarmedAttack.fleshLostObserved", (double)lost);

@@ -770,8 +770,36 @@ struct BurnLimbView {
   // with it off this is byte-for-byte the old behaviour, and a zombie's cuts
   // go on rotting outward and shedding its limbs, which is the one place the
   // bug was worth keeping.
-  uint32_t woundMat = 0;   // this body's wound material; 0 = feature off
-  uint32_t woundSlow = 1;  // divisor on that material's authored decay chance
+  // ---- A SMALL TABLE, NOT ONE MATERIAL (2026-09-15) -----------------------
+  //
+  // This was one `woundMat` + one `woundSlow` while blood was the only thing a
+  // wound could rewrite flesh to. The impact model gives a wound a SOURCE
+  // (game/impact.h): a cut leaves the victim's blood, a bruise leaves
+  // gore.bruiseMat, a zombie's bite leaves its infectMat -- three materials in
+  // one limb, each of which must revert rather than evaporate, and the rot one
+  // at its own slower clock (gore.infectHealSlow: a zombie's rot in living
+  // flesh settles over minutes, not seconds).
+  //
+  // So it is a fixed three-entry table rather than a std::vector: this view is
+  // rebuilt PER LIMB PER TICK by BurnTick, and a heap allocation there is the
+  // reason `revive` is a raw function pointer six lines down. Three is what
+  // there are; a fourth source of wound material would widen it here and
+  // nowhere else.
+  //
+  // Entry 0 is the creature's own woundMat, so every reader that used to spell
+  // this `v.woundMat` is asking WoundSlot(m) >= 0 instead, and off (no entry,
+  // revive null) is byte-for-byte the old behaviour.
+  static constexpr int kWoundMats = 3;
+  uint32_t woundMat[kWoundMats] = {0, 0, 0};  // 0 = this slot unused
+  uint32_t woundSlow[kWoundMats] = {1, 1, 1}; // divisor on the authored decay
+  // Which slot `m` is, or -1. Ordinary linear scan over three entries, which
+  // is cheaper than any structure that could replace it.
+  int WoundSlot(uint32_t m) const {
+    if (m == 0) return -1;
+    for (int i = 0; i < kWoundMats; i++)
+      if (woundMat[i] == m) return i;
+    return -1;
+  }
   // Returns false (and writes nothing) when this cell is not a remembered
   // soak; true fills the authored word and art slot and FORGETS the cell, so
   // one soak reverts once.
@@ -1051,6 +1079,20 @@ struct MobLimb {
     uint8_t color;   // the art slot StainWound zeroes
   };
   std::vector<WoundWas> woundWas;
+  // ---- WHAT BIT THIS LIMB ---------------------------------------------------
+  //
+  // The material a BITE rewrote this limb's exposed flesh to (0 = none). It is
+  // remembered on the limb rather than derived, because the wound-revert table
+  // has to know which materials on THIS limb are "a wound settling" as opposed
+  // to "a material decaying", and the only thing that knows a zombie's rot is
+  // in this arm is the bite that put it there. Latched: a second bite by
+  // something else overwrites it, which is the honest answer -- the table can
+  // only carry so many, and the freshest infection is the one still spreading.
+  //
+  // Read by Mob::ViewOf, which arms the revive for it at gore.infectHealSlow.
+  // Never saved: a loaded body's rot is already in its lattice, and it heals
+  // at the ordinary rate from then on rather than not at all.
+  uint16_t infectMat = 0;
   // Per-voxel burning / dissolution (see BodyBurnState above).
   BodyBurnState burn;
   // What is ON this limb, recounted at a bounded cadence (see LimbCoat).
@@ -1087,6 +1129,62 @@ struct BladeCut {
   float power = 1.0f;       // 0..1 swing commitment, for the audio severity
   uint32_t seed = 0;        // ragged-rim / stain draw key; see the note in
                             // Mob::CutLimb about why this is not a tick
+};
+
+// ---- ONE BLUNT HIT ----------------------------------------------------------
+//
+// The argument to Mob::BluntHit, and the sister of BladeCut above. Where a
+// kerf is a SLOT with a direction, trauma is a POINT with a magnitude: a mace
+// does not care which way its head was travelling, only how fast and how much
+// of it there was. So there is no edge axis and no cut direction here, and
+// that absence is the whole difference between the two wounds.
+//
+// WHAT IT DOES AND DOES NOT DO (docs/PLAN_impact_unarmed.md §2 step 4):
+//
+//   * hp falls, the flinch fires, the creature cries out -- through the
+//     ordinary Mob::Damage, so nothing new decides when something dies.
+//   * a BRUISE is stained on, in gore.bruiseMat rather than in the victim's
+//     blood: the material a wound rewrites flesh to is a property of the
+//     STRIKE, not of the struck (plan S6).
+//   * the bleed budget is topped up at gore.bluntBleedScale of a cut's rate.
+//     A punch does not open you.
+//   * only if `carve` > 0 does any voxel LEAVE, and then as a shallow radial
+//     DENT inside a BluntCarveScope, which is what refuses the collapse sever
+//     and the blade rules. A blunt hit NEVER takes a limb off, however many
+//     land -- that was the owner's spec in one line.
+//   * against a WORN shell it breaks shell voxels in proportion to
+//     `armorBreak` and TRANSMITS gear.bluntThrough of itself to the limb
+//     underneath. This is what makes a mace the answer to plate.
+struct BluntHit {
+  Vec3 at{};           // contact point, world voxels
+  float hp = 0.0f;     // trauma to charge, ALREADY scaled by swing power
+  float power = 0.0f;  // 0..1 speed x edge alignment, for the radii below
+  float carve = 0.0f;  // 0..1 of gore.bluntCarveRadius dented out of FLESH
+  float armorBreak = 0.0f;  // 0..1 of gear.bluntDentRadius broken off a SHELL
+  float impactSpeed = 0.0f; // world voxels/sec, for the knock-loose rule
+  uint32_t seed = 0;        // bruise draw key; see BladeCut::seed
+};
+
+// ---- ONE BITE ---------------------------------------------------------------
+//
+// The argument to Mob::BiteHit. A TEAR: a correlated-noise blob torn out of
+// the limb (the same predicate Mob::RotAtSpawn draws the undead's holes with,
+// shared through Mob::CarveBlob so there is one blob and not two), bleeding
+// like a cut, severing only by COLLAPSE -- enough bites really do take a hand
+// off, which a punch must never do, and that difference is exactly one rule.
+//
+// THE INFECTION IS THE INTERESTING PART. If the biter carries one and the tear
+// reached FLESH -- not a shell, not bone -- the exposed tissue is rewritten to
+// `infectMat` and `infectStain`'s stain is smeared over the hole. Armour in
+// the way means no infection at all, which is the entire reason the struck
+// slot is classified (impact.h StruckKind) before any of this runs.
+struct BiteHit {
+  Vec3 at{};           // contact point, world voxels
+  float hp = 0.0f;     // damage to charge, ALREADY scaled by swing power
+  float power = 0.0f;  // 0..1, scales the tear's radius
+  uint16_t infectMat = 0;    // material the tear rewrites exposed flesh to
+  uint16_t infectStain = 0;  // LIQUID whose stain it smears over the hole
+  uint32_t seed = 0;         // tear + stain draw key
 };
 
 class MobSystem;
@@ -1341,6 +1439,66 @@ class Mob {
   // the handle was one of this creature's live limbs.
   bool CutLimb(uint64_t bodyHandle, const BladeCut& cut, World& world,
                std::vector<ParticleSpawn>& spawns);
+  // ---- THE BLUNT PATH (game/impact.h, BluntHit above) ----------------------
+  // Charge trauma to a live limb without opening it: hp, a bruise, at most a
+  // shallow dent, and never a sever. On a WORN slot it breaks shell voxels and
+  // transmits a share to the host limb underneath. Returns true when the
+  // handle was one of this creature's live limbs.
+  bool BluntHit(uint64_t bodyHandle, const ::BluntHit& hit, World& world,
+                std::vector<ParticleSpawn>& spawns);
+  // ---- THE BITE PATH (game/impact.h, BiteHit above) ------------------------
+  // Tear a blob out of a live limb, bleeding like a cut and severing only by
+  // collapse; rewrite what it exposed to the biter's infection when there is
+  // one and the tear reached flesh. Returns true when the handle was one of
+  // this creature's live limbs.
+  bool BiteHit(uint64_t bodyHandle, const ::BiteHit& hit, World& world,
+               std::vector<ParticleSpawn>& spawns);
+
+  // ---- "THIS CARVE IS A DENT" ----------------------------------------------
+  //
+  // RAII around a CarveLimb reached from BluntHit. Two rules read it, and both
+  // are the same statement: A BLUNT HIT NEVER TAKES A LIMB OFF.
+  //
+  //   * the COLLAPSE sever (CarveLimb's "carved down past being a limb at
+  //     all") is skipped, so a face can be caved in past the point where a
+  //     blast would have shed it;
+  //   * the blade rules are unreachable anyway (`inBladeCut_` is false), and
+  //     that is deliberately NOT restated here -- one flag, one meaning.
+  //
+  // What it does NOT suppress is the crater STAIN: the dent is still soaked in
+  // the victim's own woundMat, because "deletes voxels and replaces them with
+  // gore" is exactly what the owner asked a gauntlet to do. The BRUISE is a
+  // separate, wider stain in gore.bruiseMat laid on before the dent.
+  //
+  // hp reaching zero on a vital limb still kills (a caved-in skull), because
+  // that path is HpZeroSevers and is about DEATH rather than about amputation.
+  struct BluntCarveScope {
+    bool& f;
+    bool prev;
+    explicit BluntCarveScope(Mob& m) : f(m.inBluntCarve_), prev(m.inBluntCarve_) {
+      f = true;
+    }
+    ~BluntCarveScope() { f = prev; }
+  };
+
+  // ---- "THIS CARVE IS A TEAR" ----------------------------------------------
+  //
+  // RAII around a CarveLimb reached from BiteHit. The blade rules (cut-through
+  // and the neck) stay off, because a mouth is not an edge and neither rule has
+  // a direction to read -- but the COLLAPSE sever is deliberately LEFT ON:
+  // enough bites DO take a hand off, and that is the one line separating a bite
+  // from a punch.
+  //
+  // It exists as a flag at all rather than as nothing because the bite must not
+  // silently inherit a scope somebody else left standing, and because the
+  // infection rewrite below needs to know the carve it is soaking was a tear.
+  struct BiteScope {
+    bool& f;
+    bool prev;
+    explicit BiteScope(Mob& m) : f(m.inBite_), prev(m.inBite_) { f = true; }
+    ~BiteScope() { f = prev; }
+  };
+
   // Detach a limb now. Root/vital kills instead.
   void Sever(int limbIndex);
   void Die();
@@ -2097,6 +2255,34 @@ class Mob {
                  const LimbCarveFactory& carveAt,
                  const CarveSpall* spall = nullptr,
                  CarveReport* report = nullptr);
+  // ---- ONE BLOB TORN OUT OF A LIMB ----------------------------------------
+  //
+  // The correlated-noise bite Mob::RotAtSpawn draws the undead's holes with,
+  // available to anything that wants ONE of them: a `blob`-sized value-noise
+  // field thresholded against a `(1 - t^2)^2` radial falloff, recentred on its
+  // own centre value so the bite always lands. Every word of why it is shaped
+  // that way is at the predicate itself (mob.cpp BlobCarveFactory).
+  //
+  // The SHARED PART is the predicate, not this function: RotAtSpawn hands
+  // BlobCarveFactory its whole list of bites in ONE CarveLimb call (that is
+  // what makes its volume cap and its single hp charge correct), and this
+  // hands it a list of one. So there is one blob and two callers, rather than
+  // two blobs -- which is what the extraction was for.
+  //
+  // `centreLocal` and `radiusWorld` are limb-local WORLD voxels, like every
+  // other radius here. `report` receives the removed cells so a caller can
+  // soak exactly the hole it made. Returns false when the limb did not survive
+  // (CarveLimb's contract: nothing may touch `limbs_` after that).
+  bool CarveBlob(int limbIndex, Vec3 centreLocal, float radiusWorld, float blob,
+                 uint32_t seed, World& world,
+                 std::vector<ParticleSpawn>& spawns, CarveReport* report);
+  // The blob predicate itself, over a LIST of bites. A member (rather than the
+  // free function it reads as) only because LimbCarveFactory is protected here;
+  // static because it captures nothing of the creature. Mob::RotAtSpawn hands
+  // it every hole a zombie was born with in one call, CarveBlob hands it one.
+  static LimbCarveFactory BlobCarveFactory(std::vector<Vec3> centres,
+                                           std::vector<float> radii, float blob,
+                                           uint32_t nseed, uint32_t skinScale);
   bool ReskinLimbMicro(MobLimb& limb, uint32_t skinScale, uint32_t physScale);
   bool RebuildLimbBody(int limbIndex);
   // ---- BORN BITTEN (MobRotDef) ---------------------------------------------
@@ -2155,6 +2341,37 @@ class Mob {
                       uint32_t seed,
                       const std::vector<IVec3>* crater = nullptr,
                       float rimCells = 0.0f);
+  // ---- ...AND THE SAME SOAK IN SOMEBODY ELSE'S SUBSTANCE -------------------
+  //
+  // StainWound is this, with `rewriteMat` bound to the victim's own woundMat
+  // and `smearMat` to the chain that derives the tint from it. THE MATERIAL A
+  // WOUND REWRITES TISSUE TO IS A PROPERTY OF THE STRIKE, NOT OF THE STRUCK
+  // (plan S6), and that is the entire content of this split:
+  //
+  //   a cut   -> the victim's woundMat (blood). Today's behaviour, unchanged.
+  //   a bruise-> gore.bruiseMat, and NO smear: a punch does not bloody you.
+  //   a bite  -> the biter's infectMat, smeared with its infectStain.
+  //
+  // `smearMat` is the OVERLAY half (phys/bodystain.h SoakCut) and is a
+  // separate argument rather than derived from `rewriteMat`, which is a
+  // deliberate departure from the plan's six-argument sketch: the two halves
+  // genuinely disagree for two of the three callers above. A bruise rewrites
+  // something with no stain block and must smear nothing; a bite rewrites
+  // rotflesh (a solid, which cannot stain by construction -- only liquids may)
+  // and must smear ichor. Deriving one from the other would have made both
+  // wrong, and in opposite directions.
+  //
+  // Everything else is StainWound's contract verbatim, including that both
+  // rewrites go into MobLimb::woundWas, so a bruise and an infection HEAL back
+  // through ReviveWoundVoxel exactly as blood does.
+  uint32_t StainWoundAs(int limbIndex, Vec3 centreLocal, float radiusWorld,
+                        uint32_t seed, uint32_t rewriteMat, uint32_t smearMat,
+                        const std::vector<IVec3>* crater = nullptr,
+                        float rimCells = 0.0f);
+  // The substance StainWound smears when nobody has said otherwise: the
+  // creature's wound material if the palette can draw it, else its blood, else
+  // nothing. One function because three call sites wanted the same chain.
+  uint32_t DefaultSmearMat() const;
   // ---- and the other half: the soak DRIES BACK TO FLESH -------------------
   // BurnLimbView::ReviveFn over one limb's `woundWas` table. A raw function
   // pointer for the same reason WornAlong is one: the view is rebuilt per limb
@@ -2588,6 +2805,13 @@ class Mob {
   // different things and the avatar has no MobSystem at all, which is what
   // Phase C's "an NPC cuts the player" path needs.
   bool inBladeCut_ = false;
+  // ---- "THIS CARVE IS A DENT" / "THIS CARVE IS A TEAR" ---------------------
+  // Set by Mob::BluntCarveScope / Mob::BiteScope (see the notes there) for the
+  // duration of the carve each entry point makes. Both are MOB-level for the
+  // same reason `inBladeCut_` is: the avatar has no MobSystem at all, and an
+  // NPC punching the player has to reach the same rules.
+  bool inBluntCarve_ = false;
+  bool inBite_ = false;
 
   // ---- IS THIS RIG SLOT A GARMENT? -------------------------------------------
   //
@@ -2756,6 +2980,29 @@ class MobSystem {
   void PushBlockEvent(const BlockEvent& ev, const MeleeTuning& t);
   const std::vector<BlockEvent>& BlockEvents() const { return blocks_; }
   void ClearBlockEvents() { blocks_.clear(); }
+
+  // ---- THE OTHER TWO KINDS OF BLOW (game/impact.h) ------------------------
+  // The system-level twins of Damage/CutLimb: resolve the handle against the
+  // mob list and then against the registered avatar, so an NPC's mace reaches
+  // the player for the same reason its sword does (see SetAvatar). Both return
+  // true when the handle was somebody's live limb.
+  bool BluntHit(uint64_t bodyHandle, const ::BluntHit& hit, World& world,
+                std::vector<ParticleSpawn>& spawns);
+  bool BiteHit(uint64_t bodyHandle, const ::BiteHit& hit, World& world,
+               std::vector<ParticleSpawn>& spawns);
+  // ---- A MATERIAL, BY NAME, AT RUNTIME ------------------------------------
+  //
+  // Tuning cannot hold a material id: tuning.json is hot-reloaded on F5 and
+  // materials.json on R, independently, and a compiled-in id would be stale
+  // after either. So `gore.bruiseMat` is a NAME (the one name-typed tuning row
+  // in the file, and the note at its declaration says why), resolved here
+  // against the table this system already mirrors for the burn pass.
+  //
+  // Linear over ~130 short strings, called at most once per blow. A map would
+  // be a second thing to invalidate on reload for no measurable gain; the
+  // MISS is what is cached instead, because a typo'd name would otherwise pay
+  // the scan on every punch forever.
+  uint32_t MaterialIdNamed(const std::string& name) const;
 
   // ---- authored attack styles (game/strokes.h) ----------------------------
   // Hot-reloaded from assets/mobs/attack_styles.json on R, exactly as the
@@ -3322,6 +3569,17 @@ class MobSystem {
   // "dead", which is the one confusion these readouts exist to prevent.
   float TotalHp(uint64_t mobId) const;
   float LimbHp(uint64_t mobId, int limbIndex) const;
+  // ---- HOW MUCH BLOOD THIS WOUND STILL OWES (MobLimb::bleedBudget) --------
+  //
+  // Whole voxels the wound will yet drip, which is a DIFFERENT measurement
+  // from how much it has already dripped (BloodLost) and from how loud it is
+  // right now (BleedSources). The claim it exists for is a comparison: "a mace
+  // charges a fraction of the blood a sword does for the same hp"
+  // (gore.bluntBleedScale), and neither of the other two can state that
+  // without letting a tick run and turning a one-line assertion into a timing
+  // question. -1 for an unknown id or limb, so a gate cannot read "no such
+  // creature" as "dry".
+  float LimbBleedBudget(uint64_t mobId, int limbIndex) const;
   float BloodLost(uint64_t mobId) const;
   // MobLimb::surfaceAtSpawn (0 until the first burn recount takes it).
   uint32_t LimbSurfaceAtSpawn(uint64_t mobId, int limbIndex) const;
@@ -3608,6 +3866,17 @@ class MobSystem {
   // anywhere in the burn path, so "flesh chars" and "cloth catches easily" stay
   // facts about assets/materials/*.json and not about this file.
   std::vector<MaterialGpu> matGpu_;
+  // Material NAMES, in id order, mirrored beside matGpu_ on every reload. The
+  // only consumer is MaterialIdNamed (a name-typed tuning row); kept as its own
+  // vector rather than holding the MaterialDef list because a MaterialDef
+  // carries voxel art, tints and a reaction chain this system has no use for.
+  std::vector<std::string> matNames_;
+  // The one-entry memo MaterialIdNamed keeps; see the note at its definition
+  // for why one entry is enough and why the MISS is cached as hard as the hit.
+  // Cleared with the tables on a materials reload, because an id is only valid
+  // against the table it was resolved from.
+  mutable std::string matNameLast_;
+  mutable uint32_t matNameLastId_ = 0;
   // Per-material burn stage (BurnStageOf) and burnability (BurnableOf),
   // rebuilt with the rest on reload.
   std::vector<uint8_t> burnStage_;
