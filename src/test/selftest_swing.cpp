@@ -2424,6 +2424,331 @@ Status GatePlayerStyles(Ctx& c, std::string& detail) {
   return ok ? Status::Pass : Status::Fail;
 }
 
+// =============================================================================
+// player-unarmed — the fist compass resolves, and a punch drives the fist
+// =============================================================================
+//
+// `player-styles` above is this gate's armed twin and the two differ in
+// exactly one thing: what is on the end of the arm. Everything the player's
+// discrete-strike path does with a sword — resolve a flick to a style, seed
+// the driver from the live rig, step the program, push the pose — has to work
+// with nothing in the fist, and before this package it could not: the whole
+// chain started at `heldPartIndex_`, so an empty hand had no edge, no arm
+// claim and no way to ask for one.
+//
+// THE THREE THINGS THAT CAN SILENTLY BREAK, and one claim each:
+//
+//   1. THE COMPASS. `playerUnarmed` is a second PlayerStrikeMap and main.cpp
+//      picks between the two on `meleeArmed`. A sector pointing at a style the
+//      avatar cannot swing is a click that does nothing.
+//   2. THE EFFECTOR. `ArmForStyle` has to land a Chain effector on the fist
+//      the style names, and `WeaponEdge` has to report that fist's knuckles —
+//      not the sword slot's (there is none) and not the hand's origin.
+//   3. THE ARM. The punch is solved by the same two-bone IK and clamped by the
+//      same pose limits as a sword swing, so the hand must stay inside the
+//      arm's own reach and the clamp must not be fighting the solve. That is
+//      `arm-limits`' subject, asked of a driver it has never seen.
+Status GatePlayerUnarmed(Ctx& c, std::string& detail) {
+  bool ok = true;
+  int checks = 0;
+  auto check = [&](bool cond, const std::string& what) {
+    checks++;
+    if (!cond) {
+      ok = false;
+      std::printf("player-unarmed: FAILED %s\n", what.c_str());
+    }
+  };
+
+  GpuContext& ctx = c.ctx;
+  World& world = c.world;
+  Simulation& sim = c.sim;
+  Physics& phys = c.phys;
+  DebrisSystem& debris = c.debris;
+  MobSystem& mobs = c.mobs;
+
+  int avDef = -1;
+  for (size_t i = 0; i < mobs.Defs().size(); i++)
+    if (mobs.Defs()[i].name == kAvatarDefName) avDef = (int)i;
+  if (avDef < 0) {
+    detail = "no avatar def";
+    std::printf("player-unarmed: SKIP (%s)\n", detail.c_str());
+    return Status::Skip;
+  }
+  const MobDef& ad = mobs.Defs()[avDef];
+  const StyleLibrary& lib = mobs.AttackStyles();
+
+  // ---- 1. THE COMPASS, before anything is spawned -------------------------
+  check(lib.playerUnarmed.Usable(),
+        "attack_styles.json ships a usable playerUnarmed flick map");
+  check(lib.playerUnarmed.sectors.size() >= 3,
+        "...with at least three directions");
+  check(lib.playerUnarmed.neutral[0] >= 0 && lib.playerUnarmed.neutral[1] >= 0,
+        "...and both neutral-alternate punches resolve");
+  check(!ad.natural.empty(),
+        "the avatar's def declares natural weapons at all");
+  std::vector<int> unarmedStyles;
+  for (const PlayerStrikeMap::Sector& s : lib.playerUnarmed.sectors) {
+    const AttackStyle* sty = lib.At(s.style);
+    if (sty == nullptr) continue;
+    check(sty->weapon != "held",
+          "playerUnarmed sector -> \"" + sty->name + "\" is a fist style");
+    check(ad.FindNatural(sty->weapon) >= 0,
+          "...whose weapon \"" + sty->weapon + "\" the avatar rig declares");
+    if (std::find(unarmedStyles.begin(), unarmedStyles.end(), s.style) ==
+        unarmedStyles.end())
+      unarmedStyles.push_back(s.style);
+  }
+  // EVERY NATURAL WEAPON'S EDGE IS REAL. A degenerate one (from == to) has no
+  // direction for the driver to steer and no segment for the sweep to sweep,
+  // and the only symptom is a punch that connects with nothing.
+  for (const MobNaturalWeaponDef& nw : ad.natural) {
+    check(nw.partIndex >= 0,
+          "natural weapon \"" + nw.name + "\" names a live part");
+    check((nw.edgeTo - nw.edgeFrom).len() > 1e-3f,
+          "natural weapon \"" + nw.name + "\" has a non-degenerate edge");
+    check(nw.edgeHalfWidth > 0.0f, "...and a carve width");
+  }
+  if (unarmedStyles.empty()) {
+    detail = "no usable playerUnarmed style";
+    std::printf("player-unarmed: SKIP (%s)\n", detail.c_str());
+    return Status::Skip;
+  }
+
+  IdCounterScope idScope(mobs);
+  debris.Reset();
+  mobs.Reset();
+  SubmitWorldgen(ctx, world, sim, kDefaultSeed);
+  ctx.WaitIdle();
+
+  // The swing-plane / player-styles fixture exactly: axis basis (camera
+  // chirality), window-anchored spawn in the right UNITS.
+  const Vec3 kR{-1, 0, 0}, kU{0, 1, 0}, kF{0, 0, 1};
+  const IVec3 wo = world.WindowOrigin();
+  const int gx = (wo.x + (int)kNChunk / 2) * (int)kChunk;
+  const int gz = (wo.z + (int)kNChunk / 2) * (int)kChunk;
+  const int gh = World::TerrainHeight(gx, gz, kDefaultSeed);
+  uint32_t t = 24200;
+
+  PlayerAvatar avatar;
+  avatar.Init(&phys, &world, &debris, c.mats, &mobs);
+  avatar.SetDefs(&mobs.Defs(), kAvatarDefName);
+  Player pl;
+  pl.fly = false;
+  pl.grounded = true;
+  pl.pos = Vec3{(float)gx + 0.5f, (float)(gh + 2) + Player::kHalfY,
+                (float)gz + 0.5f};
+  if (!avatar.Spawn(pl, 0.0f)) {
+    detail = "avatar spawn failed";
+    std::printf("player-unarmed: SKIP (%s)\n", detail.c_str());
+    return Status::Skip;
+  }
+  // NOTHING IS EQUIPPED, and that is the fixture: `player-styles` puts a sword
+  // in this same hand, so the pair is a differential over one variable.
+  check(avatar.HeldSlot() < 0, "the avatar is holding nothing");
+
+  auto avTick = [&]() {
+    std::vector<BrushOp> ops;
+    std::vector<ParticleSpawn> spawns;
+    std::vector<CellOp> cellOps;
+    avatar.PreTick(t + 1, pl, 0.0f, kTickDt, world, ops, cellOps, spawns);
+    mobs.PreTick(t + 1, world, ops, cellOps, spawns);
+    debris.QueueSupportEvents(world.Snap());
+    debris.PreTick(t + 1, world, cellOps, spawns);
+    ++t;
+    const IVec3 pc{ifloor(pl.pos.x) >> 4, ifloor(pl.pos.y) >> 4,
+                   ifloor(pl.pos.z) >> 4};
+    SubmitTick(ctx, world, sim, t, kDefaultSeed, ops, {}, cellOps, false, pc,
+               true, false, spawns);
+    ctx.WaitIdle();
+    ctx.ProcessEvents();
+    phys.Step(kTickDt);
+    debris.PostStep();
+    mobs.PostStep();
+    avatar.PostStep();
+  };
+  for (int i = 0; i < 10; i++) avTick();
+
+  const int headPart = avatar.PartIndex("head");
+  auto segPointDist = [](const Vec3& a, const Vec3& b, const Vec3& p) {
+    const Vec3 ab = b - a;
+    const float len2 = ab.dot(ab);
+    const float u =
+        len2 > 1e-6f ? std::clamp((p - a).dot(ab) / len2, 0.0f, 1.0f) : 0.0f;
+    return (a + ab * u - p).len();
+  };
+
+  MeleeState melee;
+  ApplyMeleeTuning(melee.tuning);
+  melee.SetHandSign(avatar.HandSign());
+
+  const float minSweep =
+      (float)BaselineNumber("playerUnarmed.minSweepRad", 0.20);
+  const float minEdgeTravel =
+      (float)BaselineNumber("playerUnarmed.minEdgeTravelVox", 0.8);
+  const float headClearMin =
+      (float)BaselineNumber("playerUnarmed.headClearMin", 0.5);
+  const float maxClampRad =
+      (float)BaselineNumber("playerUnarmed.maxClampRad", 1.2);
+  const float maxIkMiss =
+      (float)BaselineNumber("playerUnarmed.maxIkMissVox", 2.5);
+  float headMinOverall = 1e9f;
+
+  for (int si : unarmedStyles) {
+    const AttackStyle& sty = *lib.At(si);
+    melee.Reset();
+    ApplyMeleeTuning(melee.tuning);
+    melee.SetHandSign(avatar.HandSign());
+
+    // ---- 2. THE EFFECTOR ---------------------------------------------------
+    check(avatar.ArmForStyle(sty),
+          "style \"" + sty.name + "\" arms an effector on the avatar");
+    const MobNaturalWeaponDef* nw = avatar.EffectorWeapon();
+    check(nw != nullptr && nw->name == sty.weapon,
+          "...which is the natural weapon the style named");
+    check(avatar.StrikeEffectorKind() == StrikeEffectorMode::Chain,
+          "...on a CHAIN effector (a fist is on an arm, not aimed like jaws)");
+    Vec3 eb0, et0, ef0;
+    float ehw0 = 0;
+    check(avatar.WeaponEdge(eb0, et0, ehw0, &ef0),
+          "...and WeaponEdge reports that fist's knuckles");
+    check((et0 - eb0).len() > 1e-3f, "...as a real segment");
+    check(ef0.len() < 1e-4f,
+          "...with NO flat: a fist cannot land edge-on (MeleeEdgeAlign reads "
+          "a zero vector as 'no evidence', not as a bad angle)");
+
+    StrokeCursor cur;
+    BeginStrokeProgram(cur, sty, si, 0x504D1u + (uint32_t)si);
+
+    float cmdAzArc = 0, cmdElArc = 0, cPrevAz = 0, cPrevEl = 0;
+    bool cHavePrev = false;
+    float rMin = 1e9f, rMax = -1e9f;
+    float edgeTravel = 0, worstClamp = 0, worstMiss = 0;
+    Vec3 prevTip{};
+    bool havePrevTip = false;
+    int cutTicks = 0;
+    float headMin = 1e9f;
+
+    for (int i = 0; i < 90 && cur.Active(); i++) {
+      // main.cpp's discrete tick, in its order.
+      Vec3 hand, tip, flat;
+      float reach = 0;
+      if (avatar.WeaponStrokePose(hand, tip, flat, reach))
+        melee.SetStroke(hand, tip, flat, reach);
+      else
+        melee.ClearArm();
+      {
+        Vec3 kc;
+        float kr = 0;
+        if (avatar.HeadKeepOut(kc, kr))
+          melee.SetKeepOut(kc, kr);
+        else
+          melee.ClearKeepOut();
+      }
+      const StrokeStepResult r =
+          StepStrokeProgram(cur, &sty, melee, 0.0f, 0.0f, kTickDt, kR, kU, kF);
+      if (r == StrokeStepResult::Finished) cur.Reset();
+      avatar.SetWeaponPose(melee.Pose());
+      avTick();
+
+      // ONLY WHILE THE ARM IS FULLY CLAIMED. `ikMiss` is measured after a
+      // solve that AnimSolveTwoBone scaled by `chain.weight * weaponWeight_`,
+      // and `weaponWeight_` is the driver's PoseWeight ramping in from zero —
+      // so on the first ticks of a take-over the hand is deliberately part of
+      // the way to its target and the "miss" is the ramp, not the arm. Read at
+      // full weight it is the claim it says it is: the arm can serve this
+      // punch. (Measured: sampling every tick reported 3.2-5.8 voxels on
+      // strokes whose settled miss is a fraction of one.)
+      const Mob::WeaponArmDiag& d = avatar.WeaponArmDiagnostics();
+      if (d.ran && melee.PoseWeight() > 0.9f) {
+        worstClamp = std::max(worstClamp, d.clampMove);
+        worstMiss = std::max(worstMiss, d.ikMiss);
+      }
+      if (cur.Cutting()) {
+        cutTicks++;
+        const float cr = melee.StrokeRadius();
+        rMin = std::min(rMin, cr);
+        rMax = std::max(rMax, cr);
+        const float ca = melee.StrokeAz(), ce = melee.StrokeEl();
+        if (cHavePrev) {
+          cmdAzArc +=
+              std::fabs(ca - cPrevAz) * std::cos(std::clamp(ce, -1.5f, 1.5f));
+          cmdElArc += std::fabs(ce - cPrevEl);
+        }
+        cPrevAz = ca;
+        cPrevEl = ce;
+        cHavePrev = true;
+        // THE KNUCKLES, IN THE WORLD. The commanded arc says the driver
+        // asked; this says the FIST went — which is the claim that fails if
+        // the effector never reached the rig (a stroke driving nothing looks
+        // perfect from the cursor's side).
+        Vec3 eb, et, ef;
+        float ehw = 0;
+        if (avatar.WeaponEdge(eb, et, ehw, &ef)) {
+          if (havePrevTip) edgeTravel += (et - prevTip).len();
+          prevTip = et;
+          havePrevTip = true;
+        }
+      }
+      // Head clearance on EVERY tick the arm is claimed, windup included. The
+      // keep-out still applies here: the effector is a hand, not the head, so
+      // `HeadKeepOut` reports rather than declining (mob.cpp says why it would
+      // decline for jaws).
+      if (melee.PoseWeight() > 0.05f && headPart >= 0) {
+        Vec3 eb, et, ef, neck;
+        float ehw = 0;
+        if (avatar.WeaponEdge(eb, et, ehw, &ef) &&
+            avatar.PartJointWorld(headPart, neck))
+          headMin = std::min(headMin, segPointDist(eb, et, neck));
+      }
+    }
+    // Hand the arm back before the next style, exactly as main.cpp idles the
+    // driver between strikes.
+    avatar.ClearStrikeEffector();
+    for (int i = 0; i < 12; i++) {
+      melee.Update(kTickDt, false, true, kR, kU, kF);
+      avatar.SetWeaponPose(melee.Pose());
+      avTick();
+    }
+
+    const float dr = rMax > rMin ? rMax - rMin : 0.0f;
+    const std::string n = "\"" + sty.name + "\"";
+    check(cutTicks >= 2, "style " + n + " spent time cutting");
+    check(cmdAzArc + cmdElArc + dr > minSweep,
+          "style " + n + ": the stroke actually drove a channel");
+    // ---- 3. THE ARM ------------------------------------------------------
+    check(edgeTravel > minEdgeTravel,
+          "style " + n + ": the FIST moved through the world, not just the "
+                         "cursor");
+    check(worstMiss < maxIkMiss,
+          "style " + n + ": the arm could serve the punch (IK miss in bounds)");
+    check(worstClamp < maxClampRad,
+          "style " + n + ": the pose clamp was not fighting the solve");
+    check(headMin >= headClearMin,
+          "style " + n + " kept the fist clear of the wielder's own head");
+    headMinOverall = std::min(headMinOverall, headMin);
+    std::printf(
+        "player-unarmed %-22s weapon %-7s cmd arc az %.2f el %.2f, dr %.2f "
+        "vox, knuckles travelled %.2f vox over %d cut ticks; ik miss %.2f, "
+        "clamp %.3f rad, head clearance %.2f vox\n",
+        sty.name.c_str(), sty.weapon.c_str(), cmdAzArc, cmdElArc, dr,
+        edgeTravel, cutTicks, worstMiss, worstClamp,
+        headMin >= 1e9f ? -1.0f : headMin);
+  }
+  RecordObserved("playerUnarmed.headClearObserved",
+                 headMinOverall >= 1e9f ? -1.0 : (double)headMinOverall);
+
+  // Pristine terrain for whoever runs next (rule 7).
+  avatar.Despawn();
+  mobs.Reset();
+  debris.Reset();
+  SubmitWorldgen(ctx, world, sim, kDefaultSeed);
+  ctx.WaitIdle();
+
+  detail = Format("%d checks", checks);
+  std::printf("player-unarmed: %s (%d checks)\n", ok ? "PASS" : "FAIL", checks);
+  return ok ? Status::Pass : Status::Fail;
+}
+
 }  // namespace
 
 const std::vector<Gate>& SwingGates() {
@@ -2439,6 +2764,11 @@ const std::vector<Gate>& SwingGates() {
       // runner on the real rig, plus the head keep-out. World-touching like
       // swing-plane and placed beside it in kOrder.
       {"player-styles", "player", {}, false, GatePlayerStyles},
+      // ...and the same thing with nothing in the fist (plan §8). World-
+      // touching like its two neighbours; kOrder puts it at the very end of
+      // the run with the other unarmed gates, because it spawns an avatar and
+      // that perturbs every id-keyed draw after it.
+      {"player-unarmed", "player", {}, false, GatePlayerUnarmed},
   };
   return g;
 }

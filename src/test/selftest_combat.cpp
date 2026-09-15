@@ -62,6 +62,8 @@
 #include <cstdio>
 #include <cstdlib>
 #include <fstream>
+#include <map>
+#include <set>
 #include <string>
 #include <vector>
 
@@ -1375,10 +1377,44 @@ Status GateNpcStyles(Ctx& c, std::string& detail) {
   const StyleLibrary& lib = c.mobs.AttackStyles();
   check(lib.styles.size() >= 5,
         "the library ships the five styles phase C promised");
+  const MobDef& fixtureDef = *st.def;
   for (const AttackStyle& sty : lib.styles) {
+    // ---- EVERY USABLE STYLE SWEEPS ITS OWN CHANNEL WITH ITS OWN EFFECTOR --
+    //
+    // The fixture is an ARMED humanoid, so `StyleUsable` is the filter that
+    // decides which of the library's styles this creature can be asked for at
+    // all — a punch on a rig with no `natural` block, or a bite on one with no
+    // head, is not a failure, it is a style that does not apply. Skipping on
+    // the same predicate the DRAW uses is what keeps this loop inherited by
+    // every style added later, which is the property the gate was written for.
+    const Mob* fixture = c.mobs.FindMobById(id);
+    if (fixture == nullptr || !StyleUsable(*fixture, sty)) {
+      std::printf("npc-styles %-14s skipped: this rig cannot swing it\n",
+                  sty.name.c_str());
+      continue;
+    }
     if (!c.mobs.ForceAttack(id, sty.name, aim, tick.tick)) {
       check(false, "style \"" + sty.name + "\" would not start");
       continue;
+    }
+    // ...AND IT IS DRIVING THE PART THE STYLE NAMED. One read, and it is the
+    // one thing that cannot be recovered from the arc afterwards: a stroke
+    // whose effector never reached the rig produces a perfectly shaped
+    // COMMAND and moves nothing, which every arc check below would pass.
+    {
+      const Mob* m = c.mobs.FindMobById(id);
+      const MobNaturalWeaponDef* nw = m ? m->EffectorWeapon() : nullptr;
+      if (sty.weapon.empty() || sty.weapon == "held") {
+        check(m != nullptr && nw == nullptr &&
+                  m->StrikeEffectorKind() == StrikeEffectorMode::Held,
+              "style \"" + sty.name + "\" swings the HELD item");
+      } else {
+        check(nw != nullptr && nw->name == sty.weapon,
+              "style \"" + sty.name + "\" swings natural weapon \"" +
+                  sty.weapon + "\"");
+        check(nw != nullptr && fixtureDef.FindNatural(sty.weapon) >= 0,
+              "...which " + fixtureDef.name + " declares");
+      }
     }
     float azMin = 1e9f, azMax = -1e9f, elMin = 1e9f, elMax = -1e9f;
     float rMin = 1e9f, rMax = -1e9f;
@@ -1502,7 +1538,29 @@ Status GateNpcStyles(Ctx& c, std::string& detail) {
       // A THRUST. Reach-dominant: the point goes OUT, not around. Measured in
       // VOXELS (a radius) against radians, so the two are asserted separately
       // rather than compared — comparing them would be comparing units.
-      check(dr > minReach, "style " + n + " (thrust) extended its reach");
+      //
+      // ---- AND A FIST'S THRUST IS STATED ON THE COMMAND -------------------
+      //
+      // Same restatement `_npcStyles_about` records for the swing half of this
+      // branch, for a reason that is structural rather than a tolerance.
+      // The driver's model is A HAND HELD AT A FIXED EXTENSION AND A BLADE
+      // THAT LEANS (melee.cpp's law of cosines): the radial channel moves the
+      // POINT by changing the blade's angle, and `extendLive_` — how far the
+      // hand itself is from the shoulder — is smoothed toward a constant.
+      // With a metre of sword on the end of the fist that produces four
+      // voxels of posed extension; with a fist, whose whole "blade" is one
+      // voxel of knuckle and which is deliberately NOT wrist-steered (plan
+      // §4: there is nothing to lay along a line), the lean has almost nothing
+      // to move and the posed radius travels a fifth of a voxel on a
+      // commanded 1.1.
+      //
+      // So for a natural weapon the claim is "the STROKE drove the radial
+      // channel", which is what a thrust IS, and the claim that the fist
+      // itself moved is carried by the posed-arc check above — the same split,
+      // for the same reason, as the swing check two lines down.
+      const bool natural = !(sty.weapon.empty() || sty.weapon == "held");
+      check((natural ? cmdDr : dr) > minReach,
+            "style " + n + " (thrust) extended its reach");
       // ON THE COMMANDED ARCS, like every other dominance claim here — the
       // restatement _npcStyles_about prescribed (2026-09-01, done when the
       // torso lean moved the posed number past the old absolute cap). A
@@ -1717,6 +1775,578 @@ Status GateDuel(Ctx& c, std::string& detail) {
   return ok ? Status::Pass : Status::Fail;
 }
 
+// =============================================================================
+// THE UNARMED GATES (docs/PLAN_impact_unarmed.md §8)
+// =============================================================================
+//
+// Three gates, and between them they cover the three things that can silently
+// stop working now that a creature can fight with its own body:
+//
+//   unarmed-attack  a creature with nothing in its fist still swings, and the
+//                   STYLE DRAW shrinks to what it still has: no hands means
+//                   only jaws, no head means only fists, neither means no
+//                   stroke at all and one loud line rather than silence.
+//   lunge           a body given a ballistic velocity really leaves the
+//                   ground, really travels, really lands inside reach — and a
+//                   crawler's pounce is the same move, lower and shorter.
+//   bite-target     a style's `target` weights really reach the draw, over
+//                   more than one tag and not always the head.
+//
+// Each one is ITS OWN CLAIM and none of them is "the AI attacked", which
+// npc-strike already owns. Where a claim can be made without ticking the world
+// at all it is: `PickAttackStyle` is a pure function of (library, profile, rig,
+// tick), so the availability half of `unarmed-attack` asks it directly instead
+// of waiting 150 ticks for an AI cadence and then inferring what it drew.
+
+// A rig slot by name, on a live creature. The defs topologically sort their
+// limbs, so a positional index is not stable across a sidecar edit.
+int LimbNamed(const MobDef& def, const char* name) {
+  for (size_t i = 0; i < def.limbs.size(); i++)
+    if (def.limbs[i].name == name) return (int)i;
+  return -1;
+}
+
+// The def that CAN fight unarmed: the one publishing natural weapons. Picked
+// by the presence of the block rather than by name, for the reason CombatDef
+// picks by the socket — a test that names "human" is a test that breaks when
+// the art is re-authored under another name.
+int NaturalDef(const MobSystem& mobs, const char* preferName) {
+  int best = -1;
+  for (size_t i = 0; i < mobs.Defs().size(); i++) {
+    if (mobs.Defs()[i].natural.empty()) continue;
+    if (best < 0) best = (int)i;
+    if (preferName != nullptr && mobs.Defs()[i].name == preferName)
+      return (int)i;
+  }
+  return best;
+}
+
+// =============================================================================
+// unarmed-attack — a fist is a weapon, and losing one costs a style
+// =============================================================================
+Status GateUnarmedAttack(Ctx& c, std::string& detail) {
+  IdCounterScope idScope(c.mobs);
+  bool ok = true;
+  int checks = 0;
+  auto check = [&](bool cond, const std::string& what) {
+    checks++;
+    if (!cond) {
+      ok = false;
+      std::printf("unarmed-attack: FAILED %s\n", what.c_str());
+    }
+  };
+
+  Stage st = OpenStage(c);
+  if (!st.ok) {
+    detail = st.why;
+    std::printf("unarmed-attack: SKIP (%s)\n", detail.c_str());
+    return Status::Skip;
+  }
+  const int natDef = NaturalDef(c.mobs, "human");
+  if (natDef < 0) {
+    detail = "no mob def declares a `natural` block";
+    std::printf("unarmed-attack: SKIP (%s)\n", detail.c_str());
+    CloseStage(c);
+    return Status::Skip;
+  }
+  const MobDef& nd = c.mobs.Defs()[natDef];
+  const StyleLibrary& lib = c.mobs.AttackStyles();
+
+  // ---- A. THE LIBRARY AND THE RIG AGREE --------------------------------
+  // Before any creature moves: every style that names a natural weapon names
+  // one this rig HAS. A style pointing at a weapon nobody declares is a
+  // content error whose only other symptom is a creature that never swings.
+  int naturalStyles = 0;
+  for (const AttackStyle& s : lib.styles) {
+    if (s.weapon.empty() || s.weapon == "held") continue;
+    naturalStyles++;
+    check(nd.FindNatural(s.weapon) >= 0,
+          "style \"" + s.name + "\" names natural weapon \"" + s.weapon +
+              "\", which " + nd.name + " declares");
+  }
+  check(naturalStyles > 0,
+        "attack_styles.json ships at least one natural-weapon style");
+
+  // ---- B. A DISARMED FIGHTER STILL LANDS A BLOW -------------------------
+  //
+  // `swordsman_static` is hostile, immobile and now lists three punches as
+  // FALLBACK styles. Spawned with nothing in its fist, the fallback rule is
+  // the only thing standing between it and a creature that requests attacks
+  // forever and never swings — which is precisely the failure mode this whole
+  // package exists to remove.
+  const float gap = (float)BaselineNumber("unarmedAttack.gapVox", 7.0);
+  std::string why;
+  const uint64_t attacker =
+      SpawnFighter(c, natDef, {st.spot.x, st.spot.y + 1, st.spot.z},
+                   "training_dummy", false, why);
+  const uint64_t target = SpawnFighter(
+      c, natDef,
+      {st.spot.x, st.spot.y + 1, st.spot.z + (int)std::lround(gap)},
+      "training_dummy", false, why);
+  if (attacker == 0 || target == 0) {
+    detail = why.empty() ? "fixture spawn failed" : why;
+    std::printf("unarmed-attack: SKIP (%s)\n", detail.c_str());
+    CloseStage(c);
+    return Status::Skip;
+  }
+  Ticker tick{c, 25200, {st.spot.x >> 4, st.spot.y >> 4, st.spot.z >> 4}};
+  FaceAt(c.mobs, attacker, Chest(c.mobs, target, nd));
+  for (int i = 0; i < 20; i++) tick();
+
+  const uint32_t flesh0 = FleshVoxels(c.mobs, target);
+  check(flesh0 > 0, "the target has flesh before anything swings");
+  c.mobs.ClearAttackRequests();
+  check(c.mobs.SetMobBehavior(attacker, "swordsman_static"),
+        "the disarmed attacker's AI could be stood up");
+
+  int requests = 0, cutTicks = 0, hits = 0;
+  float topSpeed = 0;
+  const int ticks = (int)BaselineNumber("unarmedAttack.aiTicks", 150);
+  for (int i = 0; i < ticks; i++) {
+    tick();
+    requests += (int)c.mobs.AttackRequests().size();
+    c.mobs.ClearAttackRequests();
+    const NpcStroke* s = c.mobs.MobStroke(attacker);
+    if (s == nullptr) continue;
+    if (s->Cutting()) cutTicks++;
+    hits = std::max(hits, s->bodiesHit);
+    topSpeed = std::max(topSpeed, s->topTipSpeed);
+  }
+  const uint32_t flesh1 = FleshVoxels(c.mobs, target);
+  const uint32_t lost = flesh0 > flesh1 ? flesh0 - flesh1 : 0u;
+  check(requests > 0, "the disarmed AI decided to attack");
+  check(cutTicks > 0, "...and its request became a real cut");
+  check(hits > 0, "...that landed on the target");
+  // ---- PACKAGE A MERGE --------------------------------------------------
+  // "A PUNCH NEVER DISMEMBERS AND NEVER KERFS" is package A's claim, and its
+  // number here is ZERO. Until `EdgeSweep::strike` lands, the fist's three
+  // parts are summed into the bare `damage` float (MobSystem::StepStroke's
+  // marked stand-in), so a bare fist currently cuts like a small blade. The
+  // bound lives in tests/baseline.json precisely so tightening it to 0 at the
+  // merge costs a JSON edit and no rebuild.
+  const uint32_t lostMax =
+      (uint32_t)BaselineNumber("unarmedAttack.fleshLostMax", 400);
+  check(lost <= lostMax,
+        "a fist took no more than the authored ceiling off the target");
+  RecordObserved("unarmedAttack.fleshLostObserved", (double)lost);
+  std::printf(
+      "unarmed-attack: %d requests, %d cut ticks, %d bodies hit, top tip "
+      "speed %.1f vox/s, %u flesh voxels lost (ceiling %u) over %d ticks\n",
+      requests, cutTicks, hits, topSpeed, lost, lostMax, ticks);
+
+  // ---- C. THE DRAW SHRINKS WITH THE BODY --------------------------------
+  //
+  // Asked of `PickAttackStyle` DIRECTLY, over 200 ticks, because it is a pure
+  // function of (library, profile, rig, tick) and waiting for an AI cadence to
+  // reveal the same answer would cost thousands of ticks and report it as a
+  // bare count of swings (CLAUDE.md rule 6).
+  const int zombieProfile = c.mobs.Behaviors().Find("zombie");
+  if (zombieProfile < 0) {
+    check(false, "assets/mobs/behaviors.json ships a \"zombie\" profile");
+  } else {
+    const ai::Profile& zp = *c.mobs.Behaviors().At(zombieProfile);
+    Mob* m = c.mobs.FindMobById(attacker);
+    check(m != nullptr, "the attacker is still alive to lose limbs");
+    auto drawn = [&](std::set<std::string>& out) {
+      out.clear();
+      for (uint32_t t = 0; t < 200; t++) {
+        const int i = PickAttackStyle(lib, zp.attack.styles, attacker, t, m);
+        if (i >= 0) out.insert(lib.styles[i].name);
+      }
+    };
+    auto allWeapon = [&](const std::set<std::string>& s, const char* w) {
+      for (const std::string& n : s) {
+        const AttackStyle* a = lib.At(lib.Find(n));
+        if (a == nullptr || a->weapon != w) return false;
+      }
+      return !s.empty();
+    };
+    std::set<std::string> whole;
+    drawn(whole);
+    check(whole.size() >= 2,
+          "a whole body draws more than one of the zombie's styles");
+
+    if (m != nullptr) {
+      // ARMS OFF: only the jaws are left. Severing the UPPER arm takes the
+      // whole chain with it, which is exactly what `NaturalWeaponUsable`
+      // refuses on — a fist on the end of a missing elbow is not a weapon.
+      c.mobs.Sever(attacker, LimbNamed(nd, "armU.L"));
+      c.mobs.Sever(attacker, LimbNamed(nd, "armU.R"));
+      std::set<std::string> armless;
+      drawn(armless);
+      check(allWeapon(armless, "jaws"),
+            "with both arms gone the zombie draws only jaws styles");
+      std::string names;
+      for (const std::string& n : armless) names += " " + n;
+      std::printf("unarmed-attack: armless draw ->%s\n",
+                  names.empty() ? " (nothing)" : names.c_str());
+
+      // ...and with the head off as well, nothing at all — a dropped request
+      // and ONE loud line, never a silent no-op. `-1` IS that answer; the line
+      // is MobSystem::ReportNoStroke's, printed once per (mob, reason).
+      c.mobs.Sever(attacker, LimbNamed(nd, "head"));
+      std::set<std::string> nothing;
+      drawn(nothing);
+      check(nothing.empty(),
+            "with the arms and the head gone there is nothing left to draw");
+    }
+  }
+
+  // ...AND THE FILTER IS PER WEAPON, NOT ALL-OR-NOTHING. One arm off must
+  // cost the styles that swing THAT fist and nothing else, which is the claim
+  // `NaturalWeaponUsable`'s chain walk actually makes.
+  //
+  // THE PLAN ASKED FOR "HEADLESS PICKS ONLY FISTS" HERE and this is that arm,
+  // restated: the human's head is `vital: true`, so `Sever` routes it to Die
+  // (selftest_mob's own fixture says so in as many words) and a live headless
+  // NPC is not a thing this rig can be. The head half of the rule is still
+  // asserted — it is the "nothing left to draw" check above, on a body that
+  // has lost both arms AND its head — and this arm carries the half that is
+  // reachable, which is the sharper one anyway: an all-or-nothing filter would
+  // pass the head test and fail here.
+  //
+  // Asked on a SECOND creature so the one above's missing limbs cannot answer
+  // it by accident (a gate arm that shares a column with another arm measures
+  // the other arm — the memory file has that one written down).
+  if (zombieProfile >= 0) {
+    const uint64_t onearm =
+        SpawnFighter(c, natDef, {st.spot.x + 4, st.spot.y + 1, st.spot.z},
+                     "training_dummy", false, why);
+    check(onearm != 0, "a second unarmed fixture spawned");
+    if (onearm != 0) {
+      for (int i = 0; i < 6; i++) tick();
+      c.mobs.Sever(onearm, LimbNamed(nd, "armU.R"));
+      const ai::Profile& zp = *c.mobs.Behaviors().At(zombieProfile);
+      Mob* bm = c.mobs.FindMobById(onearm);
+      check(bm != nullptr, "...and survived losing one arm");
+      std::set<std::string> left;
+      for (uint32_t t = 0; t < 200 && bm != nullptr; t++) {
+        const int i = PickAttackStyle(lib, zp.attack.styles, onearm, t, bm);
+        if (i >= 0) left.insert(lib.styles[i].name);
+      }
+      bool anyRightFist = false, anyLeftFist = false;
+      for (const std::string& n : left) {
+        const AttackStyle* a = lib.At(lib.Find(n));
+        if (a == nullptr) continue;
+        if (a->weapon == "fist.R") anyRightFist = true;
+        if (a->weapon == "fist.L") anyLeftFist = true;
+      }
+      check(!anyRightFist,
+            "losing the right arm drops every style that swings fist.R");
+      check(anyLeftFist || !left.empty(),
+            "...and leaves the rest of the repertoire alone");
+      // ...AND THE SAME CLAIM WITHOUT THE FALLBACK RULE IN THE WAY. The draw
+      // above answers "what does this body pick", and on a zombie the bites
+      // are non-fallback so they hide the punches entirely — a correct answer
+      // that makes the per-weapon half of the claim vacuous. `StyleUsable` is
+      // the predicate underneath, so ask IT: one arm off must cost fist.R its
+      // styles and leave fist.L's alone.
+      if (bm != nullptr) {
+        const AttackStyle* pr2 = lib.At(lib.Find("punch_r"));
+        const AttackStyle* pl2 = lib.At(lib.Find("punch_l"));
+        check(pr2 != nullptr && pl2 != nullptr,
+              "the punch styles are in the library");
+        if (pr2 && pl2) {
+          check(!StyleUsable(*bm, *pr2),
+                "punch_r is unusable with the right arm gone");
+          check(StyleUsable(*bm, *pl2),
+                "...and punch_l is untouched by it");
+        }
+      }
+      std::string names;
+      for (const std::string& n : left) names += " " + n;
+      std::printf("unarmed-attack: one-armed draw ->%s\n",
+                  names.empty() ? " (nothing)" : names.c_str());
+    }
+  }
+
+  // ---- D. AN ARMED FIGHTER NEVER DRAWS A FALLBACK ------------------------
+  // The other half of the same rule, and the one that says the duelists'
+  // behaviour is UNCHANGED by this package (plan §5 asks for it by name).
+  {
+    const int duelist = c.mobs.Behaviors().Find("duelist");
+    const uint64_t armed =
+        SpawnFighter(c, natDef, {st.spot.x - 4, st.spot.y + 1, st.spot.z},
+                     "training_dummy", true, why);
+    check(duelist >= 0 && armed != 0, "an armed duelist fixture exists");
+    if (duelist >= 0 && armed != 0) {
+      for (int i = 0; i < 6; i++) tick();
+      const ai::Profile& dp = *c.mobs.Behaviors().At(duelist);
+      Mob* am = c.mobs.FindMobById(armed);
+      bool sawFallback = false, sawReal = false;
+      for (uint32_t t = 0; t < 400 && am != nullptr; t++) {
+        const int i = PickAttackStyle(lib, dp.attack.styles, armed, t, am);
+        if (i < 0) continue;
+        (lib.styles[i].fallback ? sawFallback : sawReal) = true;
+      }
+      check(sawReal && !sawFallback,
+            "an armed duelist draws its cuts and never a fallback punch");
+    }
+  }
+
+  CloseStage(c);
+  detail = Format("%d checks", checks);
+  std::printf("unarmed-attack: %s (%d checks)\n", ok ? "PASS" : "FAIL", checks);
+  return ok ? Status::Pass : Status::Fail;
+}
+
+// =============================================================================
+// lunge — a body given a velocity leaves the ground, travels, and lands
+// =============================================================================
+Status GateLunge(Ctx& c, std::string& detail) {
+  IdCounterScope idScope(c.mobs);
+  bool ok = true;
+  int checks = 0;
+  auto check = [&](bool cond, const std::string& what) {
+    checks++;
+    if (!cond) {
+      ok = false;
+      std::printf("lunge: FAILED %s\n", what.c_str());
+    }
+  };
+
+  Stage st = OpenStage(c);
+  if (!st.ok) {
+    detail = st.why;
+    std::printf("lunge: SKIP (%s)\n", detail.c_str());
+    return Status::Skip;
+  }
+  const int natDef = NaturalDef(c.mobs, "zombie");
+  const int lungeStyle = c.mobs.AttackStyles().Find("bite_lunge");
+  if (natDef < 0 || lungeStyle < 0) {
+    detail = natDef < 0 ? "no mob def declares a `natural` block"
+                        : "no \"bite_lunge\" style";
+    std::printf("lunge: SKIP (%s)\n", detail.c_str());
+    CloseStage(c);
+    return Status::Skip;
+  }
+  const MobDef& nd = c.mobs.Defs()[natDef];
+  const AttackStyle& sty = *c.mobs.AttackStyles().At(lungeStyle);
+  check(sty.lunge.Any(), "bite_lunge authors a lunge at all");
+  check(sty.lunge.rise > 0.0f,
+        "...with a non-zero rise (a flat launch lands the tick after it left)");
+
+  // ONE FLIGHT, MEASURED. Returns how far the body travelled in the plane, how
+  // high it got, and whether the stroke cut — three numbers rather than one,
+  // because "the lunge did not work" has three independent causes and from
+  // outside they are the same zero (CLAUDE.md rule 6).
+  struct Flight {
+    bool launched = false;
+    float planar = 0;     // world voxels closed, start to finish
+    float peakRise = 0;   // highest the origin got above its start
+    float topXzSpeed = 0;
+    int airTicks = 0;
+    int cutTicks = 0;
+    float sankBelow = 0;  // deepest the body went under its own start height
+  };
+  const float standOff = (float)BaselineNumber("lunge.standOffVox", 20.0);
+  auto fly = [&](bool crawl, Flight& out) -> bool {
+    std::string why;
+    const uint64_t biter =
+        SpawnFighter(c, natDef, {st.spot.x, st.spot.y + 1, st.spot.z},
+                     "training_dummy", false, why);
+    const uint64_t prey = SpawnFighter(
+        c, natDef,
+        {st.spot.x, st.spot.y + 1, st.spot.z + (int)std::lround(standOff)},
+        "training_dummy", false, why);
+    if (biter == 0 || prey == 0) return false;
+    Ticker tick{c, 25600, {st.spot.x >> 4, st.spot.y >> 4, st.spot.z >> 4}};
+    if (crawl) {
+      // BOTH THIGHS OFF is what puts this rig into its `crawl` state (the
+      // sidecar's rule is `missing: [legU.L, legU.R]`) — `crawl-slope` severs
+      // exactly these two for the same reason.
+      c.mobs.Sever(biter, LimbNamed(nd, "legU.L"));
+      c.mobs.Sever(biter, LimbNamed(nd, "legU.R"));
+    }
+    for (int i = 0; i < 30; i++) tick();   // settle, and let the state latch
+    FaceAt(c.mobs, biter, Chest(c.mobs, prey, nd));
+    const Vec3 from = c.mobs.MobOrigin(biter);
+    if (!c.mobs.ForceAttack(biter, "bite_lunge", Chest(c.mobs, prey, nd),
+                            tick.tick))
+      return false;
+    for (int i = 0; i < 60; i++) {
+      tick();
+      const Mob* m = c.mobs.FindMobById(biter);
+      if (m == nullptr) break;
+      if (m->Airborne()) {
+        out.launched = true;
+        out.airTicks++;
+        const Vec3 v = m->AirVelocity();
+        out.topXzSpeed = std::max(out.topXzSpeed, v.len());
+      }
+      const Vec3 p = m->Origin();
+      out.peakRise = std::max(out.peakRise, p.y - from.y);
+      out.sankBelow = std::max(out.sankBelow, from.y - p.y);
+      const NpcStroke* s = c.mobs.MobStroke(biter);
+      if (s != nullptr && s->Cutting()) out.cutTicks++;
+    }
+    const Mob* m = c.mobs.FindMobById(biter);
+    if (m != nullptr) {
+      const Vec3 to = m->Origin();
+      out.planar = std::sqrt((to.x - from.x) * (to.x - from.x) +
+                             (to.z - from.z) * (to.z - from.z));
+    }
+    c.mobs.Reset();
+    c.debris.Reset();
+    return true;
+  };
+
+  Flight upright, prone;
+  const bool haveA = fly(false, upright);
+  const bool haveB = fly(true, prone);
+  if (!haveA || !haveB) {
+    detail = "lunge fixture spawn or ForceAttack refused";
+    std::printf("lunge: SKIP (%s)\n", detail.c_str());
+    CloseStage(c);
+    return Status::Skip;
+  }
+
+  const float minPlanar = (float)BaselineNumber("lunge.minPlanarVox", 3.0);
+  const float minRise = (float)BaselineNumber("lunge.minRiseVox", 0.3);
+  const float maxSink = (float)BaselineNumber("lunge.maxSinkVox", 1.0);
+  check(upright.launched, "an upright zombie's lunge leaves the ground");
+  check(upright.topXzSpeed > 0.0f,
+        "...with a planar velocity, not just a hop");
+  check(upright.planar > minPlanar, "...and it closes real distance");
+  check(upright.peakRise > minRise, "...rising on the way");
+  check(upright.cutTicks > 0, "...and the stroke still cuts when it lands");
+  // A CRAWLER POUNCES LOW AND SHORT (anim.h AnimStateRule::lungeScale). The
+  // crawl state authors speedScale 0.3 and lungeScale inherits it, so this is
+  // a claim about the scale reaching the launch — a DIFFERENCE, not a number,
+  // so retuning the crawl never touches this gate.
+  check(prone.launched, "a crawling zombie still launches");
+  check(prone.planar < upright.planar,
+        "...but travels less than an upright one (lungeScale)");
+  check(prone.peakRise < upright.peakRise, "...and stays lower");
+  // AND IT DOES NOT TUNNEL. The planar half of a launch is integrated against
+  // the same `fits()` the walk drive uses, so a body can neither pass through
+  // the floor nor end up inside it; a rig that sank would report here rather
+  // than as "the crawler looks wrong" three sessions later.
+  check(prone.sankBelow <= maxSink,
+        "...and never sinks into the ground it is dragging itself over");
+  check(upright.sankBelow <= maxSink, "the upright one does not sink either");
+
+  RecordObserved("lunge.uprightPlanarObserved", (double)upright.planar);
+  RecordObserved("lunge.pronePlanarObserved", (double)prone.planar);
+  RecordObserved("lunge.uprightRiseObserved", (double)upright.peakRise);
+  std::printf(
+      "lunge upright: %d air ticks, planar %.2f vox, peak rise %.2f, top xz "
+      "%.2f vox/s, %d cut ticks, sank %.2f\n"
+      "lunge crawl:   %d air ticks, planar %.2f vox, peak rise %.2f, top xz "
+      "%.2f vox/s, %d cut ticks, sank %.2f\n",
+      upright.airTicks, upright.planar, upright.peakRise, upright.topXzSpeed,
+      upright.cutTicks, upright.sankBelow, prone.airTicks, prone.planar,
+      prone.peakRise, prone.topXzSpeed, prone.cutTicks, prone.sankBelow);
+
+  CloseStage(c);
+  detail = Format("%d checks", checks);
+  std::printf("lunge: %s (%d checks)\n", ok ? "PASS" : "FAIL", checks);
+  return ok ? Status::Pass : Status::Fail;
+}
+
+// =============================================================================
+// bite-target — a blow chooses a LIMB, and not always the same one
+// =============================================================================
+//
+// THE CLAIM IS ABOUT THE DRAW, NOT ABOUT THE WOUNDS. Inferring the target from
+// where the damage landed would measure the sweep's geometry, the victim's
+// pose and the parry table as well — three systems with their own gates — and
+// would report all four as one number. `NpcStroke::targetLimb` records the
+// choice at the instant it is made, which is the only place it is a fact.
+Status GateBiteTarget(Ctx& c, std::string& detail) {
+  IdCounterScope idScope(c.mobs);
+  bool ok = true;
+  int checks = 0;
+  auto check = [&](bool cond, const std::string& what) {
+    checks++;
+    if (!cond) {
+      ok = false;
+      std::printf("bite-target: FAILED %s\n", what.c_str());
+    }
+  };
+
+  Stage st = OpenStage(c);
+  if (!st.ok) {
+    detail = st.why;
+    std::printf("bite-target: SKIP (%s)\n", detail.c_str());
+    return Status::Skip;
+  }
+  const int natDef = NaturalDef(c.mobs, "zombie");
+  const StyleLibrary& lib = c.mobs.AttackStyles();
+  const AttackStyle* sty = lib.At(lib.Find("bite_lunge"));
+  if (natDef < 0 || sty == nullptr) {
+    detail = natDef < 0 ? "no mob def declares a `natural` block"
+                        : "no \"bite_lunge\" style";
+    std::printf("bite-target: SKIP (%s)\n", detail.c_str());
+    CloseStage(c);
+    return Status::Skip;
+  }
+  const MobDef& nd = c.mobs.Defs()[natDef];
+  check(!sty->target.empty(), "bite_lunge authors a target weight table");
+  check(sty->target.size() >= 3,
+        "...over at least three tags (bites go for arms and torso too)");
+
+  std::string why;
+  const uint64_t biter =
+      SpawnFighter(c, natDef, {st.spot.x, st.spot.y + 1, st.spot.z},
+                   "training_dummy", false, why);
+  const uint64_t prey =
+      SpawnFighter(c, natDef, {st.spot.x, st.spot.y + 1, st.spot.z + 5},
+                   "training_dummy", false, why);
+  if (biter == 0 || prey == 0) {
+    detail = why.empty() ? "fixture spawn failed" : why;
+    std::printf("bite-target: SKIP (%s)\n", detail.c_str());
+    CloseStage(c);
+    return Status::Skip;
+  }
+  Ticker tick{c, 25900, {st.spot.x >> 4, st.spot.y >> 4, st.spot.z >> 4}};
+  for (int i = 0; i < 20; i++) tick();
+
+  // 40 FORCED BITES, each one begun and then abandoned: the claim is about the
+  // CHOICE, so the stroke only has to start. Abandoning it (ClearGuard-style,
+  // by resetting) also keeps the fixture from being eaten over 40 swings,
+  // which would change the live-limb set the draw runs over halfway through.
+  const int want = (int)BaselineNumber("biteTarget.bites", 40);
+  std::map<std::string, int> byTag;
+  int chosen = 0, head = 0;
+  for (int i = 0; i < want; i++) {
+    Mob* m = c.mobs.FindMobById(biter);
+    if (m == nullptr) break;
+    m->Stroke().Reset();
+    if (!c.mobs.ForceAttack(biter, "bite_lunge", Chest(c.mobs, prey, nd),
+                            tick.tick + (uint32_t)i))
+      continue;
+    // ForceAttack is the SCRIPTED door and deliberately carries no target id
+    // (it aims at a point), so the limb draw is exercised through the AI's
+    // door instead: BeginStroke is what resolves a victim. Rather than wait on
+    // a cadence, the draw itself is asked here with the same inputs.
+    const int limb = MobSystem::PickTargetLimb(
+        *sty, *c.mobs.FindMobById(prey), biter, tick.tick + (uint32_t)i);
+    if (limb < 0) continue;
+    chosen++;
+    const std::string tag = nd.limbs[limb].tag;
+    byTag[tag]++;
+    if (tag == "head") head++;
+    m->Stroke().Reset();
+  }
+  check(chosen > want / 2, "most of the forced bites chose a limb at all");
+  check(byTag.size() >= 2, "...over at least two distinct limb tags");
+  check(head < chosen, "...and not the head every single time");
+  std::string spread;
+  for (const auto& kv : byTag)
+    spread += " " + kv.first + "=" + std::to_string(kv.second);
+  RecordObserved("biteTarget.tagsObserved", (double)byTag.size());
+  RecordObserved("biteTarget.headFractionObserved",
+                 chosen > 0 ? (double)head / (double)chosen : 0.0);
+  std::printf("bite-target: %d/%d bites chose a limb;%s\n", chosen, want,
+              spread.c_str());
+
+  CloseStage(c);
+  detail = Format("%d checks", checks);
+  std::printf("bite-target: %s (%d checks)\n", ok ? "PASS" : "FAIL", checks);
+  return ok ? Status::Pass : Status::Fail;
+}
+
 }  // namespace
 
 const std::vector<Gate>& CombatGates() {
@@ -1731,6 +2361,14 @@ const std::vector<Gate>& CombatGates() {
       {"npc-block", "mob", {}, false, GateNpcBlock},
       {"npc-styles", "mob", {}, false, GateNpcStyles},
       {"duel", "mob", {}, false, GateDuel},
+      // ---- THE UNARMED HALF (docs/PLAN_impact_unarmed.md §8) --------------
+      // Same shape as the four above and placed with them in kOrder: each
+      // spawns creatures, restores the id counter and regenerates worldgen on
+      // the way out. `lunge` also throws bodies through the air, which is why
+      // it sits after the ones that do not.
+      {"unarmed-attack", "mob", {}, false, GateUnarmedAttack},
+      {"lunge", "mob", {}, false, GateLunge},
+      {"bite-target", "mob", {}, false, GateBiteTarget},
   };
   return g;
 }

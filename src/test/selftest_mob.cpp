@@ -88,6 +88,41 @@ bool mobOk = false;
                   libOk ? "PASS" : "FAIL", files, missing,
                   missing ? ": " : "", missingNames.c_str());
       mobOk = mobOk && libOk;
+
+      // ---- natural weapons (mob.h MobNaturalWeaponDef; PLAN §3) ----------
+      // EVERY `natural` ENTRY ON EVERY DEF, not just the human's: the block
+      // is inherited through `extends`, so a zombie carries the human's jaws
+      // and a rig that renames a part would break the inheritor rather than
+      // the original. Two claims, and they are the two ways the block can be
+      // wrong without anything else noticing — a weapon on a part this rig
+      // has not got never resolves (the loader says so and drops it, so the
+      // survivors must all resolve), and a weapon with a zero-length edge has
+      // no segment for the sweep and no direction for the driver, which reads
+      // downstream as "the creature punches and never connects".
+      {
+        int weapons = 0, bad = 0;
+        std::string badNames;
+        for (const MobDef& md : mobs.Defs())
+          for (const MobNaturalWeaponDef& nw : md.natural) {
+            weapons++;
+            const bool livePart =
+                nw.partIndex >= 0 && nw.partIndex < (int)md.limbs.size() &&
+                md.limbs[nw.partIndex].name == nw.part;
+            const bool realEdge = (nw.edgeTo - nw.edgeFrom).len() > 1e-3f &&
+                                  nw.edgeHalfWidth > 0.0f;
+            if (livePart && realEdge) continue;
+            bad++;
+            badNames += (badNames.empty() ? "" : ", ") + md.name + "/" +
+                        nw.name + (livePart ? " (degenerate edge)"
+                                            : " (no such part)");
+          }
+        const bool natOk = bad == 0;
+        std::printf("mob natural weapons: %s (%d across %d def(s), %d "
+                    "broken%s%s)\n",
+                    natOk ? "PASS" : "FAIL", weapons, (int)mobs.Defs().size(),
+                    bad, bad ? ": " : "", badNames.c_str());
+        mobOk = mobOk && natOk;
+      }
     }
     // Select the dummy BY NAME and resolve limb indices by name too: mob
     // defs load in filename order, so adding assets/mobs/critter.* would

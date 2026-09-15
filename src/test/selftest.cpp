@@ -434,6 +434,17 @@ const char* const kOrder[] = {
     // A saguaro-sized fixture that fits every cap tree-fell crosses: if THIS
     // stays standing the handoff chain itself is at fault, not a limit.
     "cactus-fell",
+    // ---- FISTS, JAWS AND A LUNGE (docs/PLAN_impact_unarmed.md §8) ---------
+    // APPENDED HERE, as late as they can go, by the rule the wound block above
+    // spells out and the `floaters` block sharpens: a new gate in a
+    // shared-World suite goes where it disturbs the fewest gates that were
+    // there first, and "its group" is a tiebreak rather than the constraint.
+    // All four spawn creatures (which perturbs every id-keyed draw after
+    // them), `lunge` throws bodies through the air, and `player-unarmed`
+    // stands an avatar on real terrain — so they go after everything except
+    // `voxregion`, which owns the residency window. Each restores the id
+    // counter and regenerates worldgen on the way out.
+    "unarmed-attack", "lunge", "bite-target", "player-unarmed",
     // LAST of the world-touching gates, and it must be: BuildVoxRegion moves
     // the residency window and resets the page table, which is the state every
     // other gate's fixture placement assumes. It restores both before it

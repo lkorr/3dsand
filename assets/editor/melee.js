@@ -1050,8 +1050,31 @@ function readSegment(j, dflt) {
   };
 }
 
+// strokes.cpp:80 the `lunge` block (strokes.h StyleLunge). m/s, converted to
+// cells by the engine at the moment of the launch; `at` names the PHASE whose
+// start fires it, and only "windup" or "cut" can — a leap during the recover
+// is a creature throwing itself at somebody after the blow landed.
+function readLunge(j, log, styleName) {
+  const out = { ticks: 0, speed: 0, rise: 0, at: 'windup' };
+  if (!j || typeof j !== 'object') return out;
+  out.ticks = Math.max(0, Math.round(Number.isFinite(+j.ticks) ? +j.ticks : 0));
+  out.speed = Math.max(0, Number.isFinite(+j.speed) ? +j.speed : 0);
+  out.rise = Math.max(0, Number.isFinite(+j.rise) ? +j.rise : 0);
+  out.at = j.at === 'cut' ? 'cut' : 'windup';
+  if (j.at !== undefined && j.at !== 'cut' && j.at !== 'windup')
+    log.push(`style "${styleName}" lunges at "${j.at}", which is not `
+             + '"windup" or "cut" - using "windup"');
+  if (out.ticks > 0 && out.speed <= 0 && out.rise <= 0)
+    log.push(`style "${styleName}" has a lunge with no speed and no rise `
+             + '- it will not leap');
+  return out;
+}
+
+// strokes.h StyleLunge::Any
+export const lungeAny = (l) => !!l && l.ticks > 0 && (l.speed > 0 || l.rise > 0);
+
 /**
- * strokes.cpp:32 LoadAttackStyles. Returns { styles, player, log }.
+ * strokes.cpp:32 LoadAttackStyles. Returns { styles, player, playerUnarmed, log }.
  * `log` is the loader's own skip list, shown verbatim in the panel — the same
  * text the engine would print, so an author fixes it once.
  */
@@ -1083,41 +1106,74 @@ export function parseStyleLibrary(json) {
       // strokes.h AttackStyle::clip — the body animation played WITH the
       // stroke, by library name (assets/anims/<name>.json). '' = none.
       clip: typeof s.clip === 'string' ? s.clip : '',
+      // ---- strokes.cpp:78 the unarmed schema (PLAN_impact_unarmed §4/§5) ---
+      // Every default here is the behaviour a style authored before these
+      // existed already had: the held weapon, never a fallback, the profile's
+      // reach, no leap, the chest. A file written against them loads on an
+      // older binary too, because the C++ loader ignores unknown keys.
+      weapon: typeof s.weapon === 'string' && s.weapon ? s.weapon : 'held',
+      fallback: s.fallback === true,
+      reach: Math.max(0, Number.isFinite(+s.reach) ? +s.reach : 0),
+      lunge: readLunge(s.lunge, log, name),
+      // Weights over LIMB TAGS. SORTED BY TAG, exactly as strokes.cpp sorts
+      // them: the draw walks this list, and JSON object order is the
+      // library's business rather than the author's — two files spelling the
+      // same weights in a different order must pick the same limb from the
+      // same (mob, tick). That is CLAUDE.md rule 1 applied to content.
+      target: (s.target && typeof s.target === 'object'
+        ? Object.entries(s.target)
+            .filter(([, w]) => Number.isFinite(+w) && +w > 0)
+            .map(([tag, w]) => ({ tag, weight: +w }))
+            .sort((a, b) => (a.tag < b.tag ? -1 : a.tag > b.tag ? 1 : 0))
+        : []),
       raw: s,                      // the object the editor mutates in place
     });
   }
   // strokes.h:111 PlayerStrikeMap — INDICES, not names, resolved against the
   // library at load time; a sector naming an unknown style is skipped LOUDLY.
-  const player = { sectors: [], neutral: [-1, -1] };
-  const pj = json && json.player;
   const find = n => styles.findIndex(s => s.name === n);
-  if (pj && typeof pj === 'object') {
+  // TWO BLOCKS THROUGH ONE READER, exactly as strokes.cpp's `readMap` does:
+  // `player` (a weapon in the fist) and `playerUnarmed` (fists). A second copy
+  // of "resolve a sector and skip it loudly" is a second place for the skip to
+  // stop being loud.
+  const readMap = (key) => {
+    const map = { sectors: [], neutral: [-1, -1] };
+    const pj = json && json[key];
+    if (!pj || typeof pj !== 'object') return map;
     for (const sec of (Array.isArray(pj.sectors) ? pj.sectors : [])) {
       if (!sec || !Array.isArray(sec.dir) || sec.dir.length !== 2) {
-        log.push('player.sectors: an entry with no 2-element "dir" — skipped');
+        log.push(`${key}.sectors: an entry with no 2-element "dir" — skipped`);
         continue;
       }
       const i = find(sec.style);
       if (i < 0) {
-        log.push(`player.sectors: unknown style "${sec.style}" — skipped`);
+        log.push(`${key}.sectors: unknown style "${sec.style}" — skipped`);
         continue;
       }
-      player.sectors.push({ x: +sec.dir[0] || 0, y: +sec.dir[1] || 0, style: i, raw: sec });
+      map.sectors.push({ x: +sec.dir[0] || 0, y: +sec.dir[1] || 0, style: i, raw: sec });
     }
     const na = Array.isArray(pj.neutralAlternate) ? pj.neutralAlternate : [];
     for (let k = 0; k < 2; k++) {
       if (na[k] === undefined) continue;
       const i = find(na[k]);
-      if (i < 0) log.push(`player.neutralAlternate: unknown style "${na[k]}"`);
-      else player.neutral[k] = i;
+      if (i < 0) log.push(`${key}.neutralAlternate: unknown style "${na[k]}"`);
+      else map.neutral[k] = i;
     }
-  }
-  return { styles, player, log, raw: json };
+    return map;
+  };
+  const player = readMap('player');
+  const playerUnarmed = readMap('playerUnarmed');
+  return { styles, player, playerUnarmed, log, raw: json };
 }
 
-// strokes.h:118 PlayerStrikeMap::Usable
+// strokes.h:118 PlayerStrikeMap::Usable. Takes a LIBRARY (meaning its armed
+// map) or a bare map, which is the one place this port deliberately differs
+// from the C++: there the signature moved to the map because the caller always
+// knows which fist is empty, and here the existing callers (attacks.js, the
+// data gate) pass a library and have no fists to speak of.
+const mapOf = (x) => (x && x.player ? x.player : x);
 export const playerMapUsable = lib =>
-  !!lib && (lib.player.sectors.length > 0 || lib.player.neutral[0] >= 0);
+  !!lib && (mapOf(lib).sectors.length > 0 || mapOf(lib).neutral[0] >= 0);
 
 /**
  * strokes.cpp:127 QuantizeStrike — the flick (screen space, +y down) -> a
@@ -1127,12 +1183,13 @@ export const playerMapUsable = lib =>
  * the compass being data.
  */
 export function quantizeStrike(lib, dx, dy) {
-  if (!lib || !lib.player.sectors.length) return -1;
+  const map = mapOf(lib);
+  if (!map || !map.sectors.length) return -1;
   const len = Math.sqrt(dx * dx + dy * dy);
   if (len < 1e-6) return -1;
   const nx = dx / len, ny = dy / len;
   let best = -1, bestDot = -2;
-  for (const s of lib.player.sectors) {
+  for (const s of map.sectors) {
     const sl = Math.sqrt(s.x * s.x + s.y * s.y);
     if (sl < 1e-6) continue;
     const d = (nx * s.x + ny * s.y) / sl;
@@ -1144,23 +1201,48 @@ export function quantizeStrike(lib, dx, dy) {
 // strokes.cpp:142 NeutralStrike — the directionless click alternates the two
 // neutral entries; returns the other one when the asked-for side is unresolved.
 export function neutralStrike(lib, right) {
-  if (!lib) return -1;
-  const n = lib.player.neutral;
+  const map = mapOf(lib);
+  if (!map) return -1;
+  const n = map.neutral;
   const want = right ? 0 : 1;
   if (n[want] >= 0) return n[want];
   return n[want ^ 1] >= 0 ? n[want ^ 1] : -1;
 }
 
-// strokes.cpp:302 PickAttackStyle — RESOLVE BY NAME, THEN PICK, so a profile
-// listing one unknown style among four still varies over the other three.
-export function pickAttackStyle(lib, names, mobId, tick) {
+/**
+ * strokes.cpp:302 PickAttackStyle — RESOLVE BY NAME, THEN FILTER, THEN PICK,
+ * and the order is load-bearing at every step (the C++ carries the argument
+ * in full):
+ *
+ *   - RESOLVE FIRST, so a profile listing one unknown style among four still
+ *     varies over the other three instead of stuttering on the hole.
+ *   - FILTER BEFORE DRAWING, so a disarmed duelist does not miss three turns
+ *     in four rolling its way onto its one punch.
+ *   - FALLBACKS LAST AND AS A GROUP: a style is not "worse", it is "only when
+ *     there is nothing better", so the test is whether ANY non-fallback style
+ *     survived — which is what makes an armed duelist's punches invisible and
+ *     a disarmed one's the whole of its repertoire.
+ *
+ * `usable` is the port of `StyleUsable(const Mob&, const AttackStyle&)`, which
+ * cannot come across as-is: it asks a RIG whether a natural weapon's part is
+ * still attached, and this file has no rig. It arrives as a PREDICATE instead,
+ * so the preview can answer it from the open sidecar's own `natural` block;
+ * omitting it means "everything is usable", which is what a caller with no
+ * creature in front of it wants.
+ */
+export function pickAttackStyle(lib, names, mobId, tick, usable) {
   if (!lib || !lib.styles.length) return -1;
-  const found = [];
+  let found = [];
+  let haveReal = false;
   for (const s of names || []) {
     if (found.length >= 8) break;
     const i = lib.styles.findIndex(x => x.name === s);
-    if (i >= 0) found.push(i);
+    if (i < 0) continue;
+    if (usable && !usable(lib.styles[i])) continue;
+    found.push(i);
+    haveReal = haveReal || !lib.styles[i].fallback;
   }
+  if (haveReal) found = found.filter(i => !lib.styles[i].fallback);
   if (!found.length) return -1;
   if (found.length === 1) return found[0];
   const h = hash3(((mobId >>> 0) ^ kSaltStyle) >>> 0, tick >>> 0, 0);
@@ -1183,7 +1265,7 @@ export function pickAttackStyle(lib, names, mobId, tick) {
      StrokeReachIn / BeginStrokeProgram                 strokes.cpp:170-188
      StepStrokeProgram                                  strokes.cpp:190-300
      LoadAttackStyles / QuantizeStrike / NeutralStrike  strokes.cpp:20-160
-     PickAttackStyle                                    strokes.cpp:302-320
+     PickAttackStyle (+ the usable/fallback filter)     strokes.cpp:302-340
      Hash3 / SignedUnit / Pcg                           sim/rng.h:22-36
 
    NOT PORTED, and each is a deliberate line rather than an omission:
@@ -1192,6 +1274,15 @@ export function pickAttackStyle(lib, names, mobId, tick) {
        the debris system. The panel therefore reports the blade's SPEED and
        EDGE ALIGNMENT — the two inputs the damage formula scales by — and says
        nothing about damage numbers, rather than inventing a second formula.
+     StyleUsable (mob.cpp)  asks a RIG whether a natural weapon's part is
+       still attached, which this file has no way to know. pickAttackStyle
+       takes the answer as a PREDICATE instead, so the preview supplies the
+       open sidecar's own `natural` block and the law stays in one place.
+     Mob::Launch / UpdateFall's airVel_ integration (mob.cpp)  a lunge needs
+       the world's footing probes and another mob counted as a wall; the
+       Attacks lane shows the flight as a TIMELINE (lands at tick N vs cut
+       starts at M), which is the part an author can act on, rather than a
+       second ballistics model that would drift.
      Mob::ApplyWeaponArm's hinge-axis override (mob.cpp:7850)  the editor's
        clamp port (anim.js animClampPoseLimits) accepts overrides; rig.js
        supplies the steered plane the same way mob.cpp does.

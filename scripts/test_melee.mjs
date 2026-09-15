@@ -130,6 +130,79 @@ check(flickName(0, 1) === 'player_thrust', 'flick DOWN (+y) -> thrust',
 check(MELEE.neutralStrike(lib, true) !== MELEE.neutralStrike(lib, false),
   'the two neutral entries differ');
 
+/* --------------------------------------------------------------------------
+   THE UNARMED SCHEMA (docs/PLAN_impact_unarmed.md §4/§5)
+
+   Four fields and a second compass, each of which defaults to the behaviour a
+   style authored before them already had — so the interesting assertions are
+   that the defaults really are inert and that the new keys really do reach the
+   parsed style. A key that silently failed to parse would read exactly like a
+   style nobody had got round to authoring.
+   ------------------------------------------------------------------------ */
+{
+  const by = n => lib.styles.find(s => s.name === n);
+  for (const s of lib.styles) {
+    if (!s.name.startsWith('player_') && !s.raw.weapon)
+      check(s.weapon === 'held' && !s.fallback && s.reach === 0
+            && !MELEE.lungeAny(s.lunge) && s.target.length === 0,
+        `style "${s.name}" authored before the unarmed schema is unchanged`);
+  }
+  const punch = by('punch_r'), bite = by('bite_lunge');
+  check(!!punch && punch.weapon === 'fist.R' && punch.fallback
+        && punch.reach > 0,
+    'punch_r names a natural weapon, is a fallback, and states its own reach');
+  check(!!bite && bite.weapon === 'jaws' && !bite.fallback,
+    'bite_lunge names the jaws and is NOT a fallback');
+  check(!!bite && MELEE.lungeAny(bite.lunge) && bite.lunge.at === 'windup'
+        && bite.lunge.rise > 0,
+    'bite_lunge has a lunge that fires at the windup and leaves the ground',
+    bite ? JSON.stringify(bite.lunge) : '(missing)');
+  // A LUNGE WITH NO RISE LANDS ON THE TICK AFTER IT LEFT (mob.cpp UpdateFall's
+  // launch latch buys exactly one tick), so every authored one must climb.
+  for (const s of lib.styles)
+    if (MELEE.lungeAny(s.lunge))
+      check(s.lunge.rise > 0, `style "${s.name}" lunges with a non-zero rise`);
+  // The target table is SORTED BY TAG, because the draw walks it and JSON
+  // object order is the library's business rather than the author's.
+  check(!!bite && bite.target.length >= 3
+        && bite.target.every((t, i) => i === 0 || bite.target[i - 1].tag < t.tag),
+    'bite_lunge has a target table, sorted by tag for a reproducible draw');
+
+  // The fallback filter: an armed creature never draws a punch, a disarmed one
+  // draws nothing else. `usable` stands in for the rig (see pickAttackStyle).
+  const listed = ['horizontal_r', 'overhead', 'thrust', 'punch_r', 'punch_l'];
+  const armed = new Set(), unarmed = new Set();
+  for (let t = 0; t < 400; t++) {
+    armed.add(MELEE.pickAttackStyle(lib, listed, 7, t, () => true));
+    unarmed.add(MELEE.pickAttackStyle(lib, listed, 7, t,
+      s => s.weapon !== 'held'));
+  }
+  check([...armed].every(i => i >= 0 && !lib.styles[i].fallback),
+    'an armed creature never draws a fallback style over 400 ticks');
+  check([...unarmed].every(i => i >= 0 && lib.styles[i].weapon !== 'held')
+        && unarmed.size >= 2,
+    'a disarmed one draws only its natural weapons, and varies over them');
+  check(MELEE.pickAttackStyle(lib, listed, 7, 0, () => false) === -1,
+    'nothing usable draws -1 rather than a style with no weapon behind it');
+
+  // ...and the second compass.
+  check(MELEE.playerMapUsable(lib.playerUnarmed),
+    'attack_styles.json ships a usable playerUnarmed flick map');
+  const fistName = (x, y) => {
+    const i = MELEE.quantizeStrike(lib.playerUnarmed, x, y);
+    return i >= 0 ? lib.styles[i].name : '(none)';
+  };
+  check(fistName(1, 0) === 'player_punch_r', 'fists: flick RIGHT -> punch_r',
+    `got ${fistName(1, 0)}`);
+  check(fistName(-1, 0) === 'player_punch_l', 'fists: flick LEFT -> punch_l',
+    `got ${fistName(-1, 0)}`);
+  check(fistName(0, 1) === 'player_punch_thrust',
+    'fists: flick DOWN (+y) -> the two-handed drive', `got ${fistName(0, 1)}`);
+  for (const sec of lib.playerUnarmed.sectors)
+    check(lib.styles[sec.style].weapon !== 'held',
+      `playerUnarmed sector -> "${lib.styles[sec.style].name}" is a fist style`);
+}
+
 /* ==========================================================================
    3. the driver, on a synthetic arm.
 
