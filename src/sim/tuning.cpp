@@ -275,6 +275,9 @@ bool SetSimField(Tuning& t, const std::string& name, float value) {
     {"waveMode", &Tuning::Sim::waveMode},
     {"waveDepthCap", &Tuning::Sim::waveDepthCap},
     {"waveSleepEps", &Tuning::Sim::waveSleepEps},
+    {"waveBlastImpulse", &Tuning::Sim::waveBlastImpulse},
+    {"waveDrainSink", &Tuning::Sim::waveDrainSink},
+    {"waveSwimWake", &Tuning::Sim::waveSwimWake},
     {"waterDiscoverMinEighths", &Tuning::Sim::waterDiscoverMinEighths},
     {"waterAdoptMinArea", &Tuning::Sim::waterAdoptMinArea},
     {"windMode", &Tuning::Sim::windMode},
@@ -1340,6 +1343,9 @@ bool LoadTuning(const std::string& path, Tuning& out) {
     ReadI(*g, "waveDepthCap", s.waveDepthCap, out, at);
     ReadF(*g, "waveDamping", s.waveDamping, out, at);
     ReadI(*g, "waveSleepEps", s.waveSleepEps, out, at);
+    ReadI(*g, "waveBlastImpulse", s.waveBlastImpulse, out, at);
+    ReadI(*g, "waveDrainSink", s.waveDrainSink, out, at);
+    ReadI(*g, "waveSwimWake", s.waveSwimWake, out, at);
     ReadI(*g, "waterDiscoverMinEighths", s.waterDiscoverMinEighths, out, at);
     ReadI(*g, "waterAdoptMinArea", s.waterAdoptMinArea, out, at);
     ReadI(*g, "windMode", s.windMode, out, at);
@@ -1662,6 +1668,25 @@ bool LoadTuning(const std::string& path, Tuning& out) {
     if (s.waveSleepEps < 0) {
       out.warnings.push_back("sim.waveSleepEps negative; clamped to 0");
       s.waveSleepEps = 0;
+    }
+    // W3. All three are Q8 pipe flux and all three are OFF at 0, which is the
+    // documented identity, so only the negative side is a typo. The ceilings are
+    // generous rather than tuned: the outflow clamp in wbFlux is the real bound
+    // on what any of them can move, and a knob whose value the clamp eats is
+    // merely useless rather than dangerous. 65536 is 256 whole eighths/tick,
+    // two orders past anything the clamp will pass.
+    {
+      const int kWaveImpulseMax = 65536;
+      auto clampWave = [&](int& v, const char* name) {
+        if (v < 0 || v > kWaveImpulseMax) {
+          out.warnings.push_back(std::string("sim.") + name +
+                                 " out of 0..65536; clamped");
+          v = v < 0 ? 0 : kWaveImpulseMax;
+        }
+      };
+      clampWave(s.waveBlastImpulse, "waveBlastImpulse");
+      clampWave(s.waveDrainSink, "waveDrainSink");
+      clampWave(s.waveSwimWake, "waveSwimWake");
     }
     // W-D. A negative threshold would read as "off" by accident rather than on
     // purpose; 0 is the deliberate off switch and is left alone.
@@ -2138,6 +2163,11 @@ bool LoadTuning(const std::string& path, Tuning& out) {
     ReadF(*g, "glintPowerFar", r.glintPowerFar, out, at);
     ReadF(*g, "foamDepth", r.foamDepth, out, at);
     ReadF(*g, "foamStrength", r.foamStrength, out, at);
+    // W3 render (PLAN_water_relevel.md §5). Read from JSON rather than left to
+    // the C++ default, so the tuner's slider actually reaches the shader const
+    // TuningWgslBlock emits from the struct.
+    ReadF(*g, "waveSimSlope", r.waveSimSlope, out, at);
+    ReadF(*g, "waveSimFoam", r.waveSimFoam, out, at);
     ReadF(*g, "iceF0", r.iceF0, out, at);
     ReadF(*g, "iceFresnelPower", r.iceFresnelPower, out, at);
     ReadF(*g, "iceAbsorb", r.iceAbsorb, out, at);

@@ -747,6 +747,22 @@ struct TickParams {
   // windPrims' reason: this file and world.h are compared on TOTAL SIZE by
   // scripts/check_invariants.py. Keep 96 = 3 * kCurrentPrimCap.
   currentPrims : array<vec4<i32>, 96>,
+  // ---- W3: the impulse block (PLAN_water_relevel.md §5) -------------------
+  // kWaterImpulseCap records x 2 rows. The literal 16 is deliberate for
+  // currentPrims' reason: this file and world.h are compared on TOTAL SIZE.
+  // Keep 16 = 2 * kWaterImpulseCap.
+  //
+  //   row 0  (x, z, radius, strength)  world column, cells, Q8 flux at centre
+  //   row 1  (dirX, dirZ, 0, 0)        Q8 direction; (0,0) = RADIAL OUTWARD
+  //
+  // Read ONLY by sim_waterbody.wgsl's wbFlux, which is the single writer of
+  // every pipe word (§4.1) — an impulse is another term in the head it already
+  // integrates, not a second writer.
+  waterImpulseCount : u32,
+  padWi0 : u32,
+  padWi1 : u32,
+  padWi2 : u32,
+  waterImpulses : array<vec4<i32>, 16>,
 };
 
 // ---- WATER BODIES: the GPU-owned ledger's word map (M2/M3) -----------------

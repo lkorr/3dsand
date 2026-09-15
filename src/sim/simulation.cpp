@@ -503,6 +503,24 @@ bool Simulation::Init(const rhi::Device& device, World& world,
         // has no other source of synchronisation in this engine, which is why
         // GasOuter is on the pass table at all.
         entry(21, T::ReadOnlyStorage, S::Fragment),               // gasOuter
+        // W3: the surface-momentum store (PLAN_water_relevel.md §5, last
+        // bullet; world.h kWaterFluxWords). The water surface reads its OWN
+        // column's four pipes for the two things an eighth-quantised column
+        // height cannot carry — which way the surface is moving and how hard.
+        //
+        // READ-ONLY, fragment-only, and the arrow is the one every render entry
+        // here has: sim -> render. `wbFlux` is the sole writer and it runs on
+        // the TICK command buffer; every command buffer opens with a global
+        // memory barrier, which is what covers the compute -> fragment hop for
+        // openness and gasOuter as well, so this needs no pass-table row of its
+        // own (the writes already have theirs).
+        //
+        // Declared HERE, on the SIM side, for gasOuter's stated reason: a
+        // binding a shader names must exist in the layout or the pipeline will
+        // not build, and that is the one thing a renderer edit cannot add for
+        // itself. At render.waveSimSlope/Foam 0 the shader never reads it and
+        // the whole block const-folds away — the entry costs one descriptor.
+        entry(22, T::ReadOnlyStorage, S::Fragment),               // waterFlux
     };
     renderBGL_ = device.CreateBindGroupLayout(entries, std::size(entries));
 
@@ -660,6 +678,7 @@ bool Simulation::Init(const rhi::Device& device, World& world,
         b(19, world_->irradiance),
         b(20, world_->glow),
         b(21, world_->gasOuter),
+        b(22, world_->waterFlux),
     };
     renderBG_ = device.CreateBindGroup(renderBGL_, entries, std::size(entries), "renderBG");
   }

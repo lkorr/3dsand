@@ -692,6 +692,26 @@ void SubmitTick(GpuContext& ctx, World& world, Simulation& sim, uint32_t tick,
       wb.NoteMutations(world, tick, wt.sim.waterBodyMode,
                        wt.sim.waterDiscoverMinEighths, cells.data(), cellCount,
                        ops.data(), (uint32_t)ops.size());
+      // ---- W3: THE BLAST IMPULSE (PLAN_water_relevel.md §5) --------------
+      //
+      // HERE, and not in sim_explode.wgsl, because rule 3 keeps the explosion's
+      // writes in the mutation path and `waterFlux`'s pipes have exactly one
+      // writer (`wbFlux`, §4.1). What crosses is the EVENT — (x, z, radius,
+      // strength) — on the tick input stream, which is the same door the hole
+      // hint above uses and for the same reason: a replay reproduces this list
+      // and the twice-run determinism gate compares it.
+      //
+      // THE SAME CHOKEPOINT NoteMutations JUST USED. `exps` is every explosion
+      // in the engine — the crosshair detonate, grenade fuses, spell blasts and
+      // every gate's hand-built list — because they all arrive at SubmitTick as
+      // this one vector. There is no second door.
+      //
+      // BEFORE wb.Tick, which consumes the queue into the GPU payload, so a
+      // blast on THIS tick disturbs the water on THIS tick.
+      //
+      // At sim.waveBlastImpulse 0 the emitter queues nothing at all.
+      for (const ExplosionOp& e : exps)
+        WaterBodyNoteBlast(wb, e, wt.sim.waveBlastImpulse);
       wb.Tick(world, seed, tick, wt.sim.waterBodyMode, wt.sim.waterBodyTestDrain,
               wt.sim.drainMaxEighthsPerTick, wt.sim.waterRelevelMax,
               worldEdited, editCell);
@@ -777,6 +797,20 @@ void SubmitTick(GpuContext& ctx, World& world, Simulation& sim, uint32_t tick,
       tp.waterBodies[i] = g.bodies[i];
     for (size_t i = 0; i < g.chunks.size() && i < kWaterChunkCap; i++)
       tp.waterChunks[i] = g.chunks[i];
+    // ---- W3: the impulse block (§5) -------------------------------------
+    //
+    // NOT gated on `writesThisTick` the way the relevel rate above is, and the
+    // asymmetry is the point: an impulse writes no voxel. It is a term in the
+    // head `wbFlux` integrates, and `wbFlux` itself is already refused on any
+    // tick the relevel's arm is down (`T.waveMode` is zeroed with it), so the
+    // permission is inherited rather than restated. Restating it here would
+    // silently drop a blast on the one tick the footprint happened not to be
+    // declared, which is exactly the tick somebody just threw a grenade.
+    //
+    // Empty is the shipping state and an exact identity.
+    tp.waterImpulseCount = g.impulseCount;
+    for (size_t i = 0; i < g.impulses.size() && i < kWaterImpulseScalars; i++)
+      tp.waterImpulses[i] = g.impulses[i];
   }
 
   // ---- THE CURRENT FIELD (plan component 8) --------------------------------

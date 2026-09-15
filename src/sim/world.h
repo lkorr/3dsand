@@ -1977,6 +1977,46 @@ constexpr uint32_t kWaterFluxWords = 6;
 constexpr uint32_t kWaterFluxColumns = (uint32_t)kWorldN * (uint32_t)kWorldN;
 constexpr uint64_t kWaterFluxBytes =
     (uint64_t)kWaterFluxColumns * kWaterFluxWords * 4;   // 6 MiB at 512^2
+
+// ---- W3: THE IMPULSE DOOR (docs/PLAN_water_relevel.md §5) ------------------
+//
+// ONE door, two callers, and that is the whole design. §5 asks for a blast to
+// shove a pond and for a swimmer to drag a wake behind them, and both are the
+// same statement — "at this column, for one tick, push the surface THIS way
+// this hard". So there is one record and one queue rather than two systems that
+// would drift apart, and `sim_explode.wgsl` is left alone: rule 3 keeps the
+// explosion's writes in the mutation path, and a compute pass that reached into
+// `waterFlux` from the explosion kernel would be a second writer of a word
+// `wbFlux` owns (§4.1's whole argument).
+//
+// IT RIDES THE TICK STREAM, in TickParams, exactly as `windPrims` does and for
+// the same reason: a replay reproduces the stream and the twice-run determinism
+// gate compares it, so an impulse can never be a function of when the CPU
+// noticed something. `waterImpulseCount == 0` is an exact identity — `wbFlux`'s
+// loop does not execute and no pipe sees a different number — which is what
+// makes each of the three W3 knobs an identity at 0 (at 0 the CPU emits no
+// record at all, so the count stays 0).
+//
+// Applied BEFORE the outflow clamp in `wbFlux`, so an impulse cannot move more
+// water than the column is allowed to give and conservation is untouched: the
+// clamp is what the ledger's credit term is argued from, and an impulse that
+// bypassed it would be a mass pump with a knob on it.
+constexpr uint32_t kWaterImpulseCap = 8;
+// Two std140 vec4 rows per impulse:
+//   row 0  (x, z, radius, strength)   world column, cells, Q8 flux at the centre
+//   row 1  (dirX, dirZ, 0, 0)         Q8 direction; (0,0) means RADIAL OUTWARD
+// A swimmer whose velocity rounds to (0,0) in Q8 is not moving, and the CPU
+// does not emit a record for it — so the radial sense of (0,0) is never
+// ambiguous in practice, and it is checked on the CPU side rather than argued.
+constexpr uint32_t kWaterImpulseWords = 8;
+constexpr uint32_t kWaterImpulseScalars = 64;
+static_assert(kWaterImpulseScalars == kWaterImpulseCap * kWaterImpulseWords,
+              "kWaterImpulseScalars must equal cap * words");
+// How wide a swimmer's wake is, world cells. A player is roughly two cells
+// across at kVoxelsPerMetre = 10 and the wake wants to be the body plus the
+// water it drags with it, not a bow wave that reaches the far bank. Small
+// enough that the outflow clamp, not the radius, is what bounds the total.
+constexpr uint32_t kWaterSwimWakeRadius = 4;
 // THE SCHEDULE PERIOD (plan §3.4). A basin re-derives on ticks where
 // `slot % kWaterSweepPeriod == tick % kWaterSweepPeriod`, and one LEVEL of its
 // column AABB per scheduled tick. So a full re-derive of a 26-deep bowl costs
@@ -2478,6 +2518,23 @@ struct TickParams {
   int32_t currentPrimHi[3] = {0, 0, 0};
   int32_t padCp3 = 0;
   int32_t currentPrims[kCurrentPrimScalars] = {};
+  // ---- W3: THE IMPULSE BLOCK (PLAN_water_relevel.md §5; kWaterImpulseCap) --
+  //
+    // AT THE TAIL, and the position is arithmetic rather than taste. Every other
+  // water word is wedged into the 15-word header the note over `waterBodies`
+  // measures, and that header is EXACTLY full — a sixteenth word there slides
+  // every descriptor by two scalars, silently, because C++ packs an int32_t
+  // array at 4-byte alignment while std140 rounds a vec4 array up to 16.
+  // `currentPrims` is a multiple of four scalars, so it ends 16-byte aligned and
+  // this count plus three pads is its own clean 16-byte row in front of the
+  // vec4 array. check_invariants.py compares the two shapes on TOTAL SIZE and
+  // is the only thing that catches a disagreement.
+  //
+  // Zero is the shipping state of every tick nobody blew anything up on, and
+  // zero is an exact identity: `wbFlux`'s impulse loop does not execute.
+  uint32_t waterImpulseCount = 0;
+  uint32_t padWi0 = 0, padWi1 = 0, padWi2 = 0;
+  int32_t waterImpulses[kWaterImpulseScalars] = {};
 };
 
 // Q8 unit for the two dev multipliers above — must match WINDQ_SCALE_ONE in

@@ -2002,6 +2002,35 @@ struct Tuning {
     // harness lake: asleep 112 ticks after a 17x17x6 crater.
     int waveSleepEps = 256;
 
+    // ---- W3: what disturbs the surface (PLAN_water_relevel.md §5) ----
+    //
+    // Three sources of a disturbance the head difference alone cannot produce,
+    // each behind its own knob and each an EXACT IDENTITY at 0. All three are
+    // Q8 pipe flux — the unit the pipes already carry — so none of them needs
+    // the human-unit float lane and none of them puts an f32 in a kernel.
+    //
+    // Peak flux a blast adds to the column under its centre, falling linearly
+    // to nothing at the explosion's own radius. One tick, added before the
+    // outflow clamp, so a blast cannot move more water than the column is
+    // allowed to give. 3072 is twelve whole eighths per tick at the centre —
+    // three times the shipped relevel rate, which is what makes the crater
+    // punch a visible bowl rather than merely smooth one.
+    //
+    // At 0 the CPU emits no impulse record at all, so TickParams'
+    // `waterImpulseCount` stays 0 and `wbFlux` is bit-identical.
+    int waveBlastImpulse = 3072;
+    // Q8 flux a LIVE DISCHARGE pulls its neighbours in with, so the surface
+    // genuinely dips toward the throat instead of the render vortex sitting
+    // over a flat lake. GPU-generated, because "this body is emitting" is a
+    // fact only the ledger knows (WBS_EMIT) — the CPU could learn it only from
+    // the async readback, which is rule 1 through the back door.
+    int waveDrainSink = 1024;
+    // Q8 flux a swimmer drags behind them, per whole voxel-per-tick of their
+    // own submerged speed. Small on purpose: a wake is a trail, not a wave, and
+    // a body that shoved the surface as hard as a blast would let a player pump
+    // a lake by swimming in circles. Bounded anyway by the outflow clamp.
+    int waveSwimWake = 512;
+
     // ---- W-D: discovery (docs/PLAN_water_relevel.md §8) ----
     //
     // A body the PLAYER creates — a basin dug and filled by hand, a pool a
@@ -2819,6 +2848,24 @@ struct Tuning {
     // (seconds) and the wavelength of the ring train (metres).
     float waveImpactSpeed = 1.8f, waveImpactDecay = 2.5f;
     float waveImpactLen = 0.70f;
+    // ---- W3: the SIM's surface momentum, in the fragment stage ----------
+    // docs/PLAN_water_relevel.md §5, last bullet. `waterFlux` is bound
+    // read-only to the render group and the water surface reads its OWN
+    // column's four pipes. The height stays authoritative through
+    // liquidColumn(); the pipes carry what an eighth-quantised height cannot —
+    // which way the surface is moving and how hard.
+    //
+    // waveSimSlope: how far the normal tilts down-flow, per whole eighth/tick
+    // of net pipe flux. Sub-eighth detail BETWEEN the steps the column height
+    // can express, which is the point of reading the flux at all.
+    // waveSimFoam: how much froth a column running at one whole eighth/tick
+    // gets. It joins the existing shoreline/convergence foam through a max(),
+    // so a sloshing lake foams on its rings and a still one is unchanged.
+    //
+    // BOTH AT 0 CONST-FOLDS THE ENTIRE BLOCK, the buffer read included. That is
+    // the arm --shader-stats is compared against, and it is not optional
+    // bookkeeping: this shader has no register headroom.
+    float waveSimSlope = 0.030f, waveSimFoam = 0.55f;
     // ---- the current-field arrow overlay (plan component 8) -------------
     // A clone of the wind overlay's two knobs, at a water scale: currents are
     // metres per second where wind is tens, so the lattice is tighter and the

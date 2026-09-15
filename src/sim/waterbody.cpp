@@ -1,6 +1,7 @@
 #include "sim/waterbody.h"
 
 #include <algorithm>
+#include <cmath>
 #include <cstddef>
 #include <cstdio>
 #include <cstring>
@@ -221,6 +222,14 @@ void WaterBodySystem::Reset() {
   gpu_.drainArmed = false;
   gpu_.sweepSlot = kWaterBodyCap;
   gpu_.sweepLevel = 0;
+  // W3: a splash aimed at a world that no longer exists must not land in the
+  // one that replaces it. The same argument the hole hints and the hot latch
+  // above are cleared on.
+  pendingImp_.clear();
+  armedImp_.clear();
+  gpu_.impulses.clear();
+  gpu_.impulseCount = 0;
+  impRefused_ = 0;
   // W-D. Reset is "the world this described no longer exists" — a fresh
   // worldgen, a load — and a probe disc is a statement about water in THAT
   // world. The saved registry is restored AFTER the grid is in place (the
@@ -1191,6 +1200,34 @@ void WaterBodySystem::Tick(const World& world, uint32_t seed, uint32_t tick,
   // about surfaces, with no error and no gate on it.
   if (mode != 0 && (drainMax > 0 || relevelMax > 0) && worldEdited)
     drainHotUntil_ = tick + kWaterDrainHotTicks;
+  // ---- W3: AN IMPULSE ARMS THE SAME LATCH (PLAN_water_relevel.md §5) ------
+  //
+  // MEASURED, first run of gate pass T: both impulse arms reported Sigma|q| = 0
+  // with a record sitting in the queue. The record reached TickParams and
+  // `wbFlux` never ran, because `writesThisTick` was false — the lake had been
+  // still for 130 ticks, so the latch above had long expired, and with it the
+  // CPU's permission for the wave to write a voxel at all.
+  //
+  // A BLAST would have armed it by accident: an explosion is a mutation, so
+  // `worldEdited` is true on the tick it lands. A SWIMMER never would — a
+  // player crossing a settled lake writes nothing — so the wake would have
+  // been dead in the shipped game with no gate able to see it. The fix is to
+  // say the thing that is actually true: an impulse IS a disturbance the CPU
+  // knows about, exactly like a dig, so it arms the footprint.
+  //
+  // ITS OWN, SHORTER WINDOW. A dig's consequences are a drain that runs for
+  // minutes (kWaterDrainHotTicks = 900); a splash's are a ring that pass S
+  // measured asleep after 112 ticks. Holding a lake's whole footprint
+  // materialised for thirty seconds because somebody swam past it is rule 2
+  // with the sign flipped, and 240 ticks is eight seconds — twice the measured
+  // life of a ring and a thirtieth of the cost.
+  //
+  // `max`, not assignment: an impulse during a live drain must not SHORTEN that
+  // drain's window.
+  if (mode != 0 && relevelMax > 0 && !pendingImp_.empty()) {
+    drainHotUntil_ =
+        std::max(drainHotUntil_, tick + kWaterImpulseHotTicks);
+  }
   // THE HOLE HINT (component 8's drain seeder). Recorded from the same tick-
   // stream signal on the same tick, against LAST tick's labelling — which is
   // the labelling the caller's own `worldEdited` test used, so the two cannot
@@ -1277,6 +1314,14 @@ void WaterBodySystem::Tick(const World& world, uint32_t seed, uint32_t tick,
     gpu_.bodyCount = 0;
     gpu_.writesThisTick = false;
     gpu_.drainArmed = false;
+    // W3: the queue is consumed on EVERY path, including this one. An impulse
+    // is one tick's push; a queue that survived the off switch would fire the
+    // moment someone turned the system back on, which is a disturbance arriving
+    // from session history rather than from the tick stream (rule 1).
+    pendingImp_.clear();
+    armedImp_.clear();
+    gpu_.impulses.clear();
+    gpu_.impulseCount = 0;
     return;
   }
   if (chunkBody_.size() != kNumSlots) chunkBody_.assign(kNumSlots, 0u);
@@ -1349,6 +1394,128 @@ void WaterBodySystem::Tick(const World& world, uint32_t seed, uint32_t tick,
   }
   Classify(world, tick);
   BuildGpu(tick, testDrain, drainMax, relevelMax);
+  BuildImpulses();
+}
+
+// ---- W3: THE IMPULSE DOOR (PLAN_water_relevel.md §5) ----------------------
+bool WaterBodySystem::SpawnImpulse(const WaterImpulse& im) {
+  // DEGENERATE RECORDS ARE REFUSED, NOT CLAMPED. A radius of 0 divides by zero
+  // in the falloff and a strength of 0 is a record that costs a uniform slot to
+  // do nothing; both mean the caller computed something it did not mean to
+  // send, and silently repairing it is how a knob at 0 stops being an identity.
+  if (im.radius <= 0 || im.strength <= 0) return false;
+  // CHARGED BEFORE EMISSION (rule 2). A full queue refuses the newcomer rather
+  // than displacing an earlier one, so the contents stay a pure function of
+  // insertion order and a replay reproduces them.
+  if (pendingImp_.size() >= kWaterImpulseCap) {
+    impRefused_++;
+    return false;
+  }
+  pendingImp_.push_back(im);
+  return true;
+}
+
+// Resolve the queue into the TickParams payload. Two vec4 rows per record, in
+// insertion order — the same shape and the same discipline BuildGpu uses for
+// the descriptors.
+//
+// ONE TICK LATENT, and this is the whole of why there are two vectors. An
+// impulse is spent by `wbFlux`, which is a PURE GATHER over the column heights
+// `wbSurface` stored at the END of the previous tick (§4.3) — a column whose
+// stamp is not this tick's reads as WB_RV_NOTAKE and gets its pipes zeroed. A
+// lake nobody has touched has not run `wbSurface` for however long it has been
+// still, because the CPU zeroes `waterRelevelMax` outside the hot window, so on
+// the tick a splash ARRIVES there is not one valid column in the body.
+//
+// MEASURED, gate pass T's first two runs: Sigma|q| exactly 0 on both impulse
+// arms with a record sitting in TickParams and the latch armed. The record was
+// correct, the kernel was correct, and the tick it landed on had no heightfield
+// under it.
+//
+// So the record accepted on tick N is SHIPPED on tick N+1: the arm above wakes
+// `wbSurface` at N, N stamps for N+1, and the impulse spends a heightfield that
+// exists. That is the same one-tick CPU->GPU latency everything else in the
+// mutation path carries (CLAUDE.md rule 3) rather than a special case.
+void WaterBodySystem::BuildImpulses() {
+  gpu_.impulses.clear();
+  gpu_.impulseCount = 0;
+  const uint32_t n =
+      (uint32_t)std::min<size_t>(armedImp_.size(), kWaterImpulseCap);
+  gpu_.impulses.reserve((size_t)n * kWaterImpulseWords);
+  for (uint32_t i = 0; i < n; i++) {
+    const WaterImpulse& im = armedImp_[i];
+    gpu_.impulses.push_back(im.x);
+    gpu_.impulses.push_back(im.z);
+    gpu_.impulses.push_back(im.radius);
+    gpu_.impulses.push_back(im.strength);
+    gpu_.impulses.push_back(im.dirX);
+    gpu_.impulses.push_back(im.dirZ);
+    gpu_.impulses.push_back(0);
+    gpu_.impulses.push_back(0);
+  }
+  gpu_.impulseCount = n;
+  // This tick's arrivals become next tick's shipment. Not a queue that drains
+  // over several ticks: an impulse is ONE tick's push, so a record is shipped
+  // exactly once and then gone.
+  armedImp_ = pendingImp_;
+  pendingImp_.clear();
+}
+
+bool WaterBodyNoteBlast(WaterBodySystem& wb, const ExplosionOp& e, int knob) {
+  // THE IDENTITY, and it is here rather than in the kernel: at 0 no record is
+  // built, so `waterImpulseCount` stays 0 and `wbFlux` does not execute its
+  // loop. A kernel-side `if (knob == 0)` would be a cheap path; this is an
+  // exact one.
+  if (knob <= 0) return false;
+  WaterImpulse im;
+  im.x = e.x;
+  im.z = e.z;
+  // The blast's OWN radius, in XZ. A sphere of radius R meets the surface in a
+  // disc of radius R at most, and using the explosion's authored number rather
+  // than a knob of our own is what keeps a grenade and a spell blast in
+  // proportion to each other for free.
+  im.radius = e.radius > 0 ? e.radius : 1;
+  im.strength = knob;
+  // (0,0) = RADIAL OUTWARD, which is what a blast is: the column under the
+  // centre pushes every way at once and the rim pushes away from it.
+  im.dirX = 0;
+  im.dirZ = 0;
+  return wb.SpawnImpulse(im);
+}
+
+bool WaterBodyNoteSwimmer(WaterBodySystem& wb, int cellX, int cellZ,
+                          float velX, float velZ, float submersion, int knob) {
+  if (knob <= 0) return false;
+  // A WADER IS NOT A SWIMMER. Below a quarter submerged the body is standing on
+  // the bed with its ankles wet, and a wake behind it would be the surface
+  // reacting to a walk. Same threshold shape player.cpp uses to scale drag and
+  // thrust, stated here so the two cannot drift apart without a reader noticing.
+  if (!(submersion > 0.25f)) return false;
+  // THE FLOAT->INTEGER TRANSCRIPTION, and it happens HERE. Everything below is
+  // integer and every consumer is; the sim never sees an f32 (rule 1). Q8, so a
+  // velocity of one voxel per tick is 256.
+  const float sp = std::sqrt(velX * velX + velZ * velZ);
+  const int32_t spQ8 = (int32_t)std::lround(sp * 256.0f);
+  // A swimmer who has stopped is not dragging anything, and a record whose
+  // direction rounds to (0,0) would read as RADIAL — which is the one way this
+  // encoding can be ambiguous, so it is refused here rather than argued about.
+  if (spQ8 <= 0) return false;
+  WaterImpulse im;
+  im.x = cellX;
+  im.z = cellZ;
+  im.radius = (int32_t)kWaterSwimWakeRadius;
+  // Strength scales with SPEED and with how much of the body is under: a fast
+  // swimmer drags more than a drifting one, and the whole thing is bounded by
+  // the outflow clamp regardless of what the knob says.
+  const int64_t s = (int64_t)knob * spQ8 / 256;
+  im.strength = (int32_t)std::min<int64_t>(s, 1 << 20);
+  if (im.strength <= 0) return false;
+  // DIRECTIONAL, normalised to Q8 so the kernel's split between the X and Z
+  // pipes is a ratio of two integers it can take without a divide by a length.
+  im.dirX = (int32_t)std::lround(velX / sp * 256.0f);
+  im.dirZ = (int32_t)std::lround(velZ / sp * 256.0f);
+  if (im.dirX == 0 && im.dirZ == 0) return false;
+  return wb.SpawnImpulse(im);
 }
 
 uint32_t WaterBodySystem::ProposedCount() const {

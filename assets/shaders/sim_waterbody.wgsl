@@ -1624,6 +1624,137 @@ fn wvNeighbour(x : i32, z : i32, owner : u32, comp : u32, g : vec4<i32>,
 }
 
 // ============================================================================
+// W3 — WHAT DISTURBS A SLEEPING BODY (docs/PLAN_water_relevel.md §5).
+//
+// The flux sleep is what makes a settled lake free (§4.3): both wave passes
+// return after three loads and nothing in the body is evaluated. That is
+// exactly right for a lake nobody is doing anything to — and exactly wrong on
+// the tick somebody throws a grenade into it, because the disturbance does not
+// come from a head difference the sleeping body could have noticed. So the two
+// W3 sources that arrive from OUTSIDE the heightfield override the flag for the
+// tick they land on:
+//
+//   * an IMPULSE on the tick stream (blast, swimmer wake). One uniform compare,
+//     true only on a tick something actually happened, so a still world pays a
+//     single `!=` for the whole feature.
+//   * a LIVE DISCHARGE (WBS_EMIT > 0). A body emptying through a throat is not
+//     still by any definition; the sink below is what makes its surface dip.
+//
+// The override lasts ONE TICK and needs to: `wbFlux` writes real pipes under
+// it, the ledger sees WVMAX over the epsilon at the top of the NEXT tick, and
+// `calm` resets to zero by the normal rule. Nothing here clears the flag — a
+// pass that wrote the ledger's own sleep word would be a second writer of it.
+//
+// USED BY BOTH `wbFlux` AND `wbRelevel`, deliberately. Conservation across a
+// pipe depends on the giver and the receiver agreeing that the pipe exists
+// (wvEligible's note); the sleep test is part of that agreement, so it is one
+// function and not two copies.
+fn wvBodyAwake(b : u32) -> bool {
+  if (wbGet(b, WBS_WVASLEEP) == 0) { return true; }
+  if (T.waterImpulseCount > 0u) { return true; }
+  if (TUNE_WAVE_DRAIN_SINK > 0 && wbGet(b, WBS_EMIT) > 0) { return true; }
+  return false;
+}
+
+// ---- W3: THE IMPULSE TERM (plan §5, first and third bullets) --------------
+//
+// Adds this tick's CPU-sent impulses into a column's four outflow pipes. It is
+// a TERM IN THE HEAD, not a second writer: `wbFlux` is still the only thing
+// that stores a pipe word, and the result still goes through the outflow clamp
+// below — so an impulse can never move more water than the column is allowed to
+// give and the mass identity the ledger's credit is argued from is untouched.
+//
+// `add` is accumulated rather than written so the caller can zero the pipes of
+// a WALL afterwards; a pipe with nowhere to deliver must stay 0 whatever the
+// blast said (see the `ns[d] == WB_RV_NOTAKE` branch).
+//
+// SPLIT BY |dx| AND |dz| over their sum rather than by a normalised vector:
+// integer, exact, and the L1 split is the right one for a 4-pipe stencil —
+// the four pipes ARE the L1 basis, so a diagonal push is genuinely half in each
+// axis and nothing is lost to a rounding of a cosine.
+fn wvImpulseAdd(x : i32, z : i32, add : ptr<function, array<i32, 4>>) {
+  for (var k = 0u; k < T.waterImpulseCount && k < 8u; k++) {
+    let r0 = T.waterImpulses[k * 2u];
+    let r1 = T.waterImpulses[k * 2u + 1u];
+    let rad = max(r0.z, 1);
+    let dx = x - r0.x;
+    let dz = z - r0.y;
+    let d2 = dx * dx + dz * dz;
+    if (d2 > rad * rad) { continue; }
+    // LINEAR FALLOFF to nothing at the rim, integer. wbIsqrt is exact over u32
+    // and bit-identical everywhere, which is why it is here and not `sqrt()`.
+    let dist = i32(wbIsqrt(u32(d2)));
+    let amp = (r0.w * (rad - dist)) / rad;
+    if (amp <= 0) { continue; }
+    if (r1.x == 0 && r1.y == 0) {
+      // RADIAL OUTWARD — a blast. The column under the exact centre has no
+      // outward direction at all, so it pushes a quarter into each of the four:
+      // that is the seed of the expanding ring rather than a special case
+      // apologising for a division by zero.
+      let ax = abs(dx);
+      let az = abs(dz);
+      let den = ax + az;
+      if (den == 0) {
+        let e = amp / 4;
+        (*add)[WV_PX] += e;
+        (*add)[WV_NX] += e;
+        (*add)[WV_PZ] += e;
+        (*add)[WV_NZ] += e;
+      } else {
+        let qx = (amp * ax) / den;
+        let qz = (amp * az) / den;
+        if (dx > 0) { (*add)[WV_PX] += qx; } else if (dx < 0) { (*add)[WV_NX] += qx; }
+        if (dz > 0) { (*add)[WV_PZ] += qz; } else if (dz < 0) { (*add)[WV_NZ] += qz; }
+      }
+    } else {
+      // DIRECTIONAL — a swimmer's wake. Same L1 split, of the Q8 direction the
+      // CPU normalised (waterbody.cpp's WaterBodyNoteSwimmer); (0,0) is refused
+      // there, so this branch always has a direction to split.
+      let ax = abs(r1.x);
+      let az = abs(r1.y);
+      let den = max(ax + az, 1);
+      let qx = (amp * ax) / den;
+      let qz = (amp * az) / den;
+      if (r1.x > 0) { (*add)[WV_PX] += qx; } else if (r1.x < 0) { (*add)[WV_NX] += qx; }
+      if (r1.y > 0) { (*add)[WV_PZ] += qz; } else if (r1.y < 0) { (*add)[WV_NZ] += qz; }
+    }
+  }
+}
+
+// ---- W3: THE DRAIN SINK (plan §5, second bullet) --------------------------
+//
+// A live discharge pulls the surface toward its throat, so §9d's render vortex
+// sits over a sim dip instead of over a flat lake. GPU-SIDE, and it has to be:
+// "this body is emitting, this many eighths, through a hole HERE" is a fact the
+// ledger derives from a level the GPU owns, and the CPU could only learn it
+// from the async readback — which is rule 1 through the back door (the same
+// argument that moved quiescence off the CPU at M2).
+//
+// The sense is the mirror of a blast: INWARD, so a column pushes its outflow
+// toward the hole. Falloff is linear over WAVE_SINK_RADIUS, and the column ON
+// the hole gets nothing — it has no inward direction, and it is the one column
+// the discharge is already emptying through the jet.
+const WAVE_SINK_RADIUS : i32 = 10;
+fn wvSinkAdd(x : i32, z : i32, hx : i32, hz : i32,
+             add : ptr<function, array<i32, 4>>) {
+  let dx = hx - x;      // TOWARD the hole, which is the whole difference
+  let dz = hz - z;
+  let d2 = dx * dx + dz * dz;
+  if (d2 > WAVE_SINK_RADIUS * WAVE_SINK_RADIUS) { return; }
+  let ax = abs(dx);
+  let az = abs(dz);
+  let den = ax + az;
+  if (den == 0) { return; }
+  let dist = i32(wbIsqrt(u32(d2)));
+  let amp = (TUNE_WAVE_DRAIN_SINK * (WAVE_SINK_RADIUS - dist)) / WAVE_SINK_RADIUS;
+  if (amp <= 0) { return; }
+  let qx = (amp * ax) / den;
+  let qz = (amp * az) / den;
+  if (dx > 0) { (*add)[WV_PX] += qx; } else if (dx < 0) { (*add)[WV_NX] += qx; }
+  if (dz > 0) { (*add)[WV_PZ] += qz; } else if (dz < 0) { (*add)[WV_NZ] += qz; }
+}
+
+// ============================================================================
 // W2 — THE PIPES (`wbFlux`, plan §4.2). One workgroup per listed chunk, one
 // thread per column, and a thread writes ONLY its own column's four outflow
 // words. No atomics except the two sleep reports, no CAS, no scheduling
@@ -1663,7 +1794,9 @@ fn wbFlux(@builtin(workgroup_id) wg : vec3<u32>,
   if (T.waterRelevelMax <= 0) { return; }
   let st = wbGet(b, WBS_STATE);
   if (st != WB_ADOPTED) { return; }
-  if (wbGet(b, WBS_WVASLEEP) != 0) { return; }
+  // W3: the sleep, with the two outside-the-heightfield overrides folded in
+  // (wvBodyAwake). A still world still pays one uniform compare for it.
+  if (!wvBodyAwake(b)) { return; }
   let level = wbGet(b, WBS_LEVEL);
   let wc = wbSlotWorldChunk(slot);
   if (!wbColumnLayer(wc.y, level)) { return; }
@@ -1706,12 +1839,36 @@ fn wbFlux(@builtin(workgroup_id) wg : vec3<u32>,
   ns[WV_PZ] = wvNeighbour(x, z + 1, owner, comp, g, rad, level, shaveBusy);
   ns[WV_NZ] = wvNeighbour(x, z - 1, owner, comp, g, rad, level, shaveBusy);
 
+  // ---- W3: THE OUTSIDE TERMS, GATHERED FIRST (plan §5) -------------------
+  //
+  // Accumulated before the head loop and added inside it, so every W3 push goes
+  // through the SAME wall test and the SAME outflow clamp the head does. That
+  // ordering is the entire safety argument: a blast cannot push water through a
+  // bank, cannot move more than the column may give, and cannot open a pipe the
+  // receiving end will not gather.
+  var add : array<i32, 4> = array<i32, 4>(0, 0, 0, 0);
+  if (T.waterImpulseCount > 0u) { wvImpulseAdd(x, z, &add); }
+  if (TUNE_WAVE_DRAIN_SINK > 0) {
+    // A LIVE DISCHARGE ONLY. `WBS_EMIT` is the eighths the ledger granted this
+    // tick after every cap — one evaluation, two consumers, which is plan §6's
+    // rule and the reason the sink reads the published word rather than
+    // re-deriving a head of its own.
+    if (wbGet(b, WBS_EMIT) > 0) {
+      let key = wbGet(b, WBS_HOLEKEY);
+      if (key != WB_HOLE_NONE) {
+        wvSinkAdd(x, z, wbHoleX(key, g.x), wbHoleZ(key, g.y), &add);
+      }
+    }
+  }
+
   var q : array<i32, 4>;
   var total = 0;
   for (var d = 0u; d < 4u; d++) {
     if (ns[d] == WB_RV_NOTAKE) {
       // A WALL. No head, no flow, and the stored flux goes with it — a pipe
       // that cannot deliver must not be subtracted from this column either.
+      // W3's `add` goes with it too: an impulse aimed at a bank is absorbed by
+      // the bank, which is what a bank is for.
       q[d] = 0;
       continue;
     }
@@ -1727,7 +1884,12 @@ fn wbFlux(@builtin(workgroup_id) wg : vec3<u32>,
       // reverses the flow: through zero and out of the NEIGHBOUR's pipe.
       drive = dh + WAVE_HEAD_EPS;
     }
-    var v = max(waterFlux[fb + d], 0) + WAVE_G_Q8 * depth * drive;
+    // W3's push joins the head's, in the same accumulator and the same units
+    // (Q8 eighths/tick). Added BEFORE the max(v, 0) so an impulse aimed against
+    // a standing head drains that pipe toward zero exactly as an opposing head
+    // does — momentum reverses through zero and out of the neighbour's pipe,
+    // and no word ever carries a sign.
+    var v = max(waterFlux[fb + d], 0) + WAVE_G_Q8 * depth * drive + add[d];
     // NEGATIVE FLUX IS THE NEIGHBOUR'S PIPE, not this one going backwards. An
     // opposing head drains this pipe to zero first and then pushes the reverse
     // pipe, which is how momentum reverses through zero without either word
@@ -1813,7 +1975,11 @@ fn wbRelevel(@builtin(workgroup_id) wg : vec3<u32>,
   let giveCut = wbGet(b, WBS_RVGIVECUT);
   // W2: whether the wave half has anything to deliver. The SAME three loads
   // wbFlux gated on, so the two passes agree about whether pipes exist at all.
-  let waveOn = T.waveMode > 0 && wbGet(b, WBS_WVASLEEP) == 0;
+  // W3: the same override wbFlux takes (wvBodyAwake), because the two passes
+  // have to agree that pipes exist — a tick where the flux pass wrote pipes and
+  // the apply refused to gather them would leave a whole tick of momentum
+  // sitting in the store, which is not a loss but is a lie about the instant.
+  let waveOn = T.waveMode > 0 && wvBodyAwake(b);
   // The ledger published nothing: the surface is inside {m, m+1} and there is
   // no credit outstanding. Six loads and out — this is the resting cost of
   // the whole feature on a flat lake inside its hot window. `waveOn` joins the

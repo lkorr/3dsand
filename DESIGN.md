@@ -9285,6 +9285,120 @@ so pass N runs its round trip before the crater rather than after. Whether M5's
 ladder restart under a live map deserves its own fix is a question for the split
 machinery, not for discovery.
 
+### 5b.11 W3: what disturbs the surface (added 2026-09-14)
+
+`docs/PLAN_water_relevel.md` section 5. W2's pipes carry a ring the HEIGHTFIELD
+started - a crater, a bank giving way. W3 is the three sources that start one
+from OUTSIDE it, plus the render half that reads the pipes back.
+
+**THE STACK SHIPS ON FROM THIS COMMIT.** `sim.waterBodyMode` and `sim.waveMode`
+both default to 1 in `assets/materials/tuning.json`. That is the ship decision
+for the whole relevel / discovery / slosh / W3 package and it is what moved the
+pinned world hash. Every off switch remains an exact identity - mode 0 records
+no GPU pass at all, `waveMode` 0 does not record the `waterFlux` row, and each
+of the four W3 knobs is independently an identity at 0.
+
+**One record, one door, two callers.** A blast and a swimmer are the same
+statement - *at this column, for one tick, push the surface this way this hard*
+- so there is one `WaterImpulse` (x, z, radius, Q8 strength, Q8 direction;
+(0,0) means radial outward), one bounded queue on `WaterBodySystem`, one
+`TickParams` block (`kWaterImpulseCap` = 8 records x two `vec4<i32>` rows) and
+one term in `wbFlux`. Two record types would be two things to keep in step for
+no gain.
+
+**`sim_explode.wgsl` does not touch the flux buffer, and that is rule 3 plus
+section 4.1.** Rule 3 keeps the explosion's writes in the mutation path;
+section 4.1's whole argument for owned outflows over shared signed faces is that
+every pipe word has exactly one writer. A compute pass reaching into
+`waterFlux` from the explosion kernel would break both. What crosses instead is
+the EVENT, on the tick input stream, through `SubmitTick` - the one function the
+game frame loop, every gate and both smoke harnesses hand their op lists to, so
+the crosshair detonate, grenade fuses, spell blasts and a gate's hand-built list
+all arrive by one path. The swimmer enters at the same door from `main.cpp`'s
+TICK site (not from `player.Update`, which runs per FRAME: a frame-rate emitter
+would shove the lake harder on a fast machine than on a slow one).
+
+**The drain sink is the exception, and has to be.** "This body is emitting, this
+many eighths, through a hole HERE" is derived by the ledger from a level the GPU
+owns (`WBS_EMIT`, `WBS_HOLEKEY`). The CPU could learn it only from the async
+readback, which is rule 1 through the back door - the same hazard M2 moved
+quiescence off the CPU for. So the sink is generated in `wbFlux` from the
+published words, behind `TUNE_WAVE_DRAIN_SINK`.
+
+**Everything is added BEFORE the outflow clamp.** An impulse is another term in
+the head `wbFlux` already integrates, so it passes through the same wall test
+(`ns[d] == WB_RV_NOTAKE` zeroes the pipe whatever the blast said) and the same
+per-column give limit. A W3 push therefore changes WHERE the water is and never
+how much, and gate pass T carries the section 3.5 conservation identity on every
+arm to say so. It is also added before `max(v, 0)`, so an impulse against a
+standing head drains that pipe through zero exactly as an opposing head does.
+
+**Two bugs the gate found, both about a lake being asleep.** The flux sleep
+(section 4.3) is what makes a settled lake free: both wave passes return after
+three loads. That is correct for a lake nobody is doing anything to and exactly
+wrong on the tick a grenade lands in it, so `wvBodyAwake` overrides the flag for
+one tick on an impulse or a live discharge - one uniform compare in a still
+world, and it clears itself by the normal rule (the ledger sees `WVMAX` over the
+epsilon next tick and resets `calm`). The second took two runs and a three-stage
+counter to name: **the impulse arrived a tick too EARLY**. `wbFlux` is a pure
+gather over the column heights `wbSurface` stored at the END of the previous
+tick, and a lake nobody has touched has not run `wbSurface` for as long as it
+has been still - so on the tick a splash arrives there is not one valid column
+in the body and every pipe reads `WB_RV_NOTAKE`. A record accepted on tick N is
+now shipped on N+1: accepting it arms the footprint latch, N measures, N+1
+spends a heightfield that exists. That is the same one-tick CPU->GPU latency the
+rest of the mutation path carries. A blast alone would have hidden it forever
+(an explosion is a mutation, so it arms the latch by accident); a swimmer, who
+writes nothing, would have been silently dead in the shipped game.
+
+**Its own hot window.** `kWaterImpulseHotTicks` = 240 rather than the dig's 900:
+a dig's consequence is a drain that runs for minutes, a splash's is a ring pass
+S measured asleep after 112 ticks. Holding a lake's whole footprint materialised
+for thirty seconds every time somebody swam past it is rule 2 with the sign
+flipped. `max`, not assignment, so an impulse during a live drain cannot shorten
+that drain's window.
+
+**The render half (section 5's last bullet).** `waterFlux` is bound READ-ONLY to
+`renderBGL_` at binding 22 - declared on the sim side for `gasOuter`'s stated
+reason, and needing no pass-table row of its own because the writes have theirs
+and every command buffer opens with a global memory barrier. Section 9d.5's rule
+stands: `liquidColumn()` derives the surface from the VOXELS and nothing
+overrides it. But that height is quantised to eighths, and the two things it
+therefore cannot express are exactly what the pipes carry - sub-eighth tilt
+BETWEEN the steps, and which way the surface is going. So `waveFluxAt()` returns
+the column's net pipe flux, the normal leans down-flow by `render.waveSimSlope`,
+and a column running hard foams by `render.waveSimFoam`, joined to the shoreline
+and convergence terms by `max()`. Gerstner stays the far/idle texture. The
+validity test is the stamp's PAGE BITS (the toroidal-aliasing half, which is the
+one that matters for a pixel) plus a loose freshness bound, not the exact tick
+match the sim readers demand - a stale pipe there would decide a voxel write,
+here it would tint a pixel. **Both knobs at 0 const-fold the entire block away,
+buffer read included**, which is not bookkeeping: this fragment shader has no
+register headroom (two memory notes record a small change cliffing it) and that
+is the arm `--shader-stats` is compared against. Measured: +177 SPIR-V
+instructions on 159,487.
+
+**Gate `waterbody` pass T**, every arm a PAIR. Blast: sum|q| peaks at 1,028,008
+Q8 with the knob on and is EXACTLY 0 with it at 0 - nothing queued, nothing
+shipped, no pipe touched. Wake: 53,739 against 0. Sink: a DIFFERENTIAL and not
+an identity, because the shaft disturbs the surface either way - 16,227,477
+against 16,217,094 over the same 60 draining ticks - and the arm FAILS rather
+than skips if the shaft never emitted, since a sink generated from `WBS_EMIT`
+cannot be measured in a fixture with no emission. The conservation identity
+closes at +0 on all four impulse arms, with 0 page faults. The failure messages
+name the three stages separately (queued / shipped / footprint declared),
+because "sum|q| was 0" is a bare count and it cost two runs before it was not.
+
+**Two things W3 does not do.** MOBS have no submersion or swim state at all
+(`game/mob.h`), so the swimmer wake is the player only - the door is generic and
+a mob that gains one is a single call. And pass H now disarms `waveMode`
+explicitly: it measures whether the DISCHARGE LAW is mass-exact, and the
+surface-momentum layer became a second mover of settled water the day the
+default shipped at 1 (H1's ledger-only identity went +0 to +1225 eighths against
+a 256-eighth slack with nothing else changed). That is the same discipline
+passes R, N and S already state in their own words; the wave's own conservation
+is asserted exactly, on its own fixture, by S and T.
+
 ## 9d. The current field, and surface waves (added 2026-08-29)
 
 `docs/PLAN_water_master.md` components 8 and 9 (milestone M4, "it looks alive").

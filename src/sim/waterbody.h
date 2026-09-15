@@ -127,6 +127,15 @@ constexpr uint32_t kWaterDrainHotTicks = 900;
 // declared chunks. See BuildGpu.
 constexpr uint32_t kWaterDrainSettleTicks = 64;
 
+// Ticks a W3 IMPULSE keeps a governed body's footprint declared to the page
+// table (PLAN_water_relevel.md §5). Its own number rather than the drain's
+// because the two events have different lifetimes: a dig starts a discharge
+// that runs for minutes, a splash starts a ring that pass S measured asleep
+// after 112 ticks. 240 is eight seconds — twice the measured life of a ring,
+// and a thirtieth of what a swimmer would otherwise cost a lake every time
+// they crossed it.
+constexpr uint32_t kWaterImpulseHotTicks = 240;
+
 // How a basin's floor is shaped. Two kinds cover every body worldgen makes,
 // and both are closed forms; a third kind is what component 10's union-find
 // sweep will produce for dug terrain.
@@ -482,6 +491,42 @@ struct WaterBodyGpu {
   // with no hole in it. That is rule 2 with the sign flipped: cost that scales
   // with the world containing a lake rather than with anything happening to it.
   bool drainArmed = false;
+  // ---- W3: THE IMPULSE BLOCK (PLAN_water_relevel.md §5) ------------------
+  //
+  // <= kWaterImpulseCap records x kWaterImpulseWords i32, copied straight into
+  // TickParams::waterImpulses. Resolved from the pending queue by Tick(), which
+  // also CLEARS the queue: an impulse is one tick's push and nothing about it
+  // persists, so a caller that stops pushing stops disturbing the water with no
+  // expiry rule to get wrong.
+  //
+  // Empty is the shipping state and an exact identity — wbFlux's loop runs zero
+  // times — which is what makes each of §5's three knobs an identity at 0: at 0
+  // the emitter refuses to build the record in the first place.
+  std::vector<int32_t> impulses;
+  uint32_t impulseCount = 0;
+};
+
+// ---- W3: one impulse, the CPU's form (PLAN_water_relevel.md §5) ------------
+//
+// ONE record for the blast AND the swimmer, because they are the same
+// statement: "at this column, for one tick, push the surface this way this
+// hard". Two record types would be two things to keep in step for no gain.
+//
+// `strength` is Q8 pipe flux — the unit `waterFlux`'s pipes already carry — so
+// nothing in the kernel has to convert anything and no float reaches the sim.
+// The falloff is linear to zero at `radius`, computed GPU-side from the column's
+// own distance, so a record is six integers and not a field.
+//
+// `dir` (Q8) is the direction the push points. (0,0) means RADIAL OUTWARD from
+// the centre, which is what a blast is; anything else is a directional shove,
+// which is what a wake is. The emitters below never build a (0,0) directional
+// record — a swimmer whose velocity rounds to zero in Q8 is not moving and gets
+// no record at all — so the overload is never ambiguous.
+struct WaterImpulse {
+  int32_t x = 0, z = 0;       // world column
+  int32_t radius = 0;         // world cells; <= 0 is refused
+  int32_t strength = 0;       // Q8 flux at the centre; <= 0 is refused
+  int32_t dirX = 0, dirZ = 0; // Q8 direction, (0,0) = radial outward
 };
 
 // ---- the system ------------------------------------------------------------
@@ -543,6 +588,27 @@ class WaterBodySystem {
   void NoteMutations(const World& world, uint32_t tick, int mode,
                      int minEighths, const CellOp* cells, uint32_t cellCount,
                      const BrushOp* ops, uint32_t opCount);
+
+  // ---- W3: THE IMPULSE DOOR (§5) ----------------------------------------
+  //
+  // Queue one impulse for the NEXT Tick(). Returns false — and changes nothing
+  // — when the queue is full or the record is degenerate (non-positive radius
+  // or strength): budgets are charged BEFORE emission (CLAUDE.md rule 2), so a
+  // caller learns its splash did not happen rather than silently displacing
+  // someone else's.
+  //
+  // DETERMINISTIC BY CONSTRUCTION, in WindPrimSystem::Spawn's exact sense: the
+  // contents are a pure function of the ops and the tick, the order is insertion
+  // order, and there is no expiry to get wrong because Tick() consumes the whole
+  // queue. What it is NOT is a place to put anything derived from a readback or
+  // a wall clock — an impulse decides voxel writes, so it is tick-stream state
+  // and the twice-run comparison covers it.
+  bool SpawnImpulse(const WaterImpulse& im);
+  // The queue as it stands, before Tick() consumes it. For the gate and the
+  // overlay; "the wake did nothing" and "the wake was never queued" are
+  // different bugs (CLAUDE.md rule 6).
+  const std::vector<WaterImpulse>& PendingImpulses() const { return pendingImp_; }
+  uint32_t ImpulsesRefused() const { return impRefused_; }
 
   const std::vector<WaterDiscovered>& Discovered() const { return discovered_; }
   // Evidence cells currently tracked. For the overlay and the gate: "no body
@@ -637,6 +703,9 @@ class WaterBodySystem {
   // W-D: the free slot a new probe takes, or kWaterDiscoveredCap if the registry
   // is full of live entries.
   uint32_t FreeDiscoverSlot() const;
+  // W3: resolve the pending queue into gpu_.impulses and clear it. Called from
+  // Tick() after BuildGpu, so a caller cannot forget it and cannot run it twice.
+  void BuildImpulses();
 
   std::vector<WaterBasin> basins_;
   std::vector<WaterBasinCurve> curves_;   // parallel to basins_
@@ -707,7 +776,40 @@ class WaterBodySystem {
   // does not.
   bool evidenceDirty_ = false;
   uint32_t discoverEvictions_ = 0;
+  // ---- W3 (§5) ------------------------------------------------------------
+  // Queued this tick, consumed and cleared by Tick(). Insertion order, no
+  // expiry, no persistence: a disturbance is one tick's push.
+  // `pendingImp_` takes this tick's arrivals; `armedImp_` is what Tick() ships
+  // — LAST tick's, because an impulse is spent against the column heights the
+  // previous tick measured (see BuildImpulses). One tick latent, and a record
+  // is shipped exactly once.
+  std::vector<WaterImpulse> pendingImp_;
+  std::vector<WaterImpulse> armedImp_;
+  uint32_t impRefused_ = 0;
 };
+
+// ---- W3: the two EMITTERS, so the conversion lives in ONE place -----------
+//
+// Both turn a game-side event into the WaterImpulse above, and both are here
+// rather than at their call sites for the reason every "two places must agree"
+// note in this repo gives: the blast is emitted from SubmitTick (which sees
+// every explosion in the engine, game and harness alike) and the wake from the
+// player and mob updates, and a gate that built its own record by hand would be
+// testing arithmetic the game does not run.
+//
+// `knob` is sim.waveBlastImpulse / sim.waveSwimWake. At 0 both return false
+// having queued nothing, which is the documented identity: no record means
+// `waterImpulseCount` stays 0 and `wbFlux` is bit-identical.
+bool WaterBodyNoteBlast(WaterBodySystem& wb, const ExplosionOp& e, int knob);
+// `velVoxPerTick` is the swimmer's horizontal velocity in VOXELS PER TICK, and
+// `submersion` is the 0..1 fraction of the body under the surface that
+// player.cpp already computes for drag and thrust. Below a quarter submerged
+// there is no wake: a wader's ankles are not a swimmer.
+//
+// The float->integer transcription happens HERE, on the CPU, exactly as
+// WindPrimAim's does — the sim never sees an f32 (rule 1).
+bool WaterBodyNoteSwimmer(WaterBodySystem& wb, int cellX, int cellZ,
+                          float velX, float velZ, float submersion, int knob);
 
 // THE live system, a global for exactly the reason WindPrims() is one: it has
 // to reach the frame loop, every selftest gate and both smoke harnesses, and

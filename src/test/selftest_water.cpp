@@ -1095,6 +1095,19 @@ Status GateWaterBody(Ctx& c, std::string& detail) {
     ht.sim.drainExciteRadius = arm.shellRadius;
     ht.sim.fluidSplashRate = arm.splash;
     ht.sim.waterBodyTestDrain = 0;   // the DISCHARGE is the source now
+    // W3, and it is the SAME DISCIPLINE passes R/N/S state in their own words:
+    // this pass measures whether the DISCHARGE LAW is mass-exact, so the
+    // fixture must contain nothing else that moves settled water. The MPM seam
+    // is already disarmed per arm above; the surface-momentum layer became a
+    // second mover the day `sim.waveMode` shipped at 1, and an arm that
+    // inherited it would be reporting the sum of two rules under one identity.
+    //
+    // MEASURED, the run that flipped the default: H1's ledger-only identity
+    // went from +0 to +1225 eighths against a 256-eighth strict slack with
+    // nothing else changed. The wave's OWN conservation is asserted exactly, on
+    // its own fixture, by passes S and T — it is not going untested here, it is
+    // going untested HERE.
+    ht.sim.waveMode = 0;
     SetCurrentTuning(ht);
     tick = RunQuietTicks(c, tick, 130);
 
@@ -2598,6 +2611,367 @@ Status GateWaterBody(Ctx& c, std::string& detail) {
     tick = RunQuietTicks(c, tick, 60);
   }
 
+  mark("pass T");
+  // ========================================================== pass T (W3)
+  //
+  // WHAT DISTURBS THE SURFACE. docs/PLAN_water_relevel.md §5. Pass S proved the
+  // pipes carry a ring the HEIGHTFIELD started; these are the three sources that
+  // start one from OUTSIDE it — a blast, a swimmer, and a live discharge — and
+  // each is behind its own knob that must be an exact identity at 0.
+  //
+  // THE SHAPE OF EVERY ARM IS THE SAME, and it is the minimum that proves
+  // anything: run the fixture with the knob OFF and with it ON, and require the
+  // measured effect to be exactly zero in the first and non-zero in the second.
+  // Either half alone is a green light about nothing — an "on" arm with no
+  // control cannot tell the feature from the crater the CA would have closed
+  // anyway (pass R's lesson), and an "off" arm with no treatment cannot tell an
+  // identity from a knob that reaches no kernel at all.
+  //
+  // THE IMPULSE ARMS GO THROUGH THE GAME'S OWN EMITTERS, not through
+  // SpawnImpulse directly: WaterBodyNoteBlast and WaterBodyNoteSwimmer are what
+  // SubmitTick and main.cpp's frame loop call, so the arithmetic under test is
+  // the arithmetic the game runs rather than a copy of it (the
+  // gate-hardcodes-the-cast gotcha, applied to a conversion).
+  //
+  // NOT A REAL EXPLOSION, deliberately. Detonating over the lake would carve
+  // voxels, and then the mass identity below would be measuring sim_explode
+  // rather than the pipes. The door is the same either way — SubmitTick turns
+  // every ExplosionOp in the engine into exactly this call — so handing the
+  // emitter an ExplosionOp and letting the impulse ride the tick stream tests
+  // the whole path from the event to the pipe with nothing else moving.
+  std::string w3Note;
+  {
+    const uint32_t w3Ticks =
+        (uint32_t)std::max(1.0, BaselineNumber("waterbodyW3Ticks", 60.0));
+    const uint32_t w3Settle =
+        (uint32_t)std::max(1.0, BaselineNumber("waterbodyW3SettleTicks", 60.0));
+    const uint32_t w3Bin =
+        (uint32_t)std::max(1.0, BaselineNumber("waterbodyW3BinTicks", 10.0));
+    const double w3RiseTolPct = BaselineNumber("waterbodyW3RiseTolPct", 10.0);
+    const int64_t w3Slack =
+        (int64_t)BaselineNumber("waterbodyW3SlackEighths", 64.0);
+    // The blast the emitter is handed. Radius is the lake's own scale rather
+    // than a literal: a 20-cell disc on a r68 pool is a stone in a pond, which
+    // is what this is meant to look like.
+    const int w3BlastR = std::min(kMaxExplosionRadius, 20);
+    const int w3SwimQ = (int)BaselineNumber("waterbodyW3SwimKnob", 4096.0);
+    const int w3SinkQ = (int)BaselineNumber("waterbodyW3SinkKnob", 4096.0);
+
+    // One world per arm, built the way pass S builds its: same lake, no test
+    // tap, no MPM, the relevel and the wave both armed explicitly (the shipped
+    // tuning arms neither, and a pass that inherited either would be a green
+    // light about a feature that never ran).
+    auto armTuning = [&](int blast, int swim, int sink, int drainMax) {
+      Tuning w = t;
+      w.sim.waterBodyTestDrain = 0;
+      w.sim.drainMaxEighthsPerTick = drainMax;
+      w.sim.fluidExciteMode = 0;
+      w.sim.drainExciteRadius = 0;
+      w.sim.fluidSplashRate = 0.0f;
+      w.sim.waterBodyMode = 1;
+      w.sim.waterRelevelMax =
+          t.sim.waterRelevelMax > 0 ? t.sim.waterRelevelMax : 4;
+      w.sim.waveMode = 1;
+      w.sim.waveBlastImpulse = blast;
+      w.sim.waveSwimWake = swim;
+      w.sim.waveDrainSink = sink;
+      return w;
+    };
+
+    // ---- ARM 1+2: the two CPU-door sources, four runs ---------------------
+    //
+    // Each run: rebuild, settle, snapshot the box, fire the source ONCE, sample
+    // Sigma|q| per tick, settle, re-measure. The two OFF runs are the controls
+    // and their `peak` must be exactly 0 — not "small", zero: at knob 0 the
+    // emitter queues no record at all, so TickParams::waterImpulseCount stays 0
+    // and wbFlux's loop does not execute. Anything else means the identity is
+    // not an identity.
+    struct ImpArm {
+      const char* name;
+      bool swim;        // false = blast
+      int knob;
+    };
+    const ImpArm w3Arms[4] = {
+        {"blast off", false, 0},
+        {"blast on", false, t.sim.waveBlastImpulse > 0 ? t.sim.waveBlastImpulse
+                                                       : 3072},
+        {"wake off", true, 0},
+        {"wake on", true, w3SwimQ},
+    };
+    int64_t w3Peak[4] = {0, 0, 0, 0};
+    int64_t w3Err[4] = {0, 0, 0, 0};
+    int w3BadBin[4] = {-1, -1, -1, -1};
+    uint32_t w3Queued[4] = {0, 0, 0, 0};
+    uint32_t w3Shipped[4] = {0, 0, 0, 0};
+    bool w3Wrote[4] = {false, false, false, false};
+    uint32_t w3Pf[4] = {0, 0, 0, 0};
+    std::string w3Bins[4];
+    for (int a = 0; a < 4; a++) {
+      const ImpArm& arm = w3Arms[a];
+      WaterBodies().Reset();
+      SubmitWorldgen(c.ctx, world, c.sim, kDefaultSeed);
+      SetCurrentTuning(armTuning(arm.swim ? 0 : arm.knob,
+                                 arm.swim ? arm.knob : 0, 0, 0));
+      tick = RunQuietTicks(c, tick, 130);
+      const WaterBodyDesc* wd = WaterBodies().Find(1);
+      if (!wd || wd->gpuSlot >= kWaterBodyCap) {
+        fail(Format("pass T (%s): the authored lake is not proposed", arm.name));
+        continue;
+      }
+      const uint32_t wSlot = wd->gpuSlot;
+      {
+        const LedgerView lv = ReadLedger(c);
+        if (lv.At(wSlot, WBS_STATE) != WB_ADOPTED) {
+          fail(Format("pass T (%s): the lake is %s, not adopted, before the "
+                      "impulse",
+                      arm.name, LedgerStateName(lv.At(wSlot, WBS_STATE))));
+          continue;
+        }
+      }
+      const int wBoxLo = lakeGeo.floorY - kCraterDepth;
+      const int wBoxHi = lakeGeo.surfY;
+      const VoxelTruth v0 =
+          SweepBasin(c, lakeGeo, lakeDesc, matId, wBoxLo, wBoxHi);
+      uint32_t wPf0[4] = {0, 0, 0, 0};
+      ReadPageFaultsSync(c.ctx, world, wPf0);
+
+      // THE EVENT. Queued on the CPU exactly as the game queues it, then the
+      // very next SubmitTick consumes it (WaterBodySystem::Tick) and ships it
+      // in TickParams. Nothing is written to the world.
+      if (arm.swim) {
+        // One voxel per tick due east, fully submerged: a swimmer at a
+        // plausible speed rather than a maximum.
+        WaterBodyNoteSwimmer(WaterBodies(), lakeGeo.cx, lakeGeo.cz, 1.0f, 0.0f,
+                             1.0f, arm.knob);
+      } else {
+        const ExplosionOp w3Exp{lakeGeo.cx, lakeGeo.surfY, lakeGeo.cz, w3BlastR,
+                                256, 0, 0, 0};
+        WaterBodyNoteBlast(WaterBodies(), w3Exp, arm.knob);
+      }
+      w3Queued[a] = (uint32_t)WaterBodies().PendingImpulses().size();
+
+      int64_t binMax = 0;
+      uint32_t inBin = 0;
+      std::vector<int64_t> bins;
+      for (uint32_t i = 0; i < w3Ticks; i++) {
+        tick = RunQuietTicks(c, tick, 1);
+        // THREE STAGES, THREE NUMBERS (CLAUDE.md rule 6). A bare "Sigma|q| was
+        // 0" cost two runs: the record was queued, the uniform carried it, and
+        // the tick it landed on had no measured heightfield under it. So the
+        // SHIPPED count is recorded separately from the QUEUED count and from
+        // the flux, and the three together say which of the three stages
+        // dropped it. `Gpu().impulseCount` is what the last Tick() put in
+        // TickParams, and it survives until the next one.
+        w3Shipped[a] += WaterBodies().Gpu().impulseCount;
+        w3Wrote[a] = w3Wrote[a] || WaterBodies().Gpu().writesThisTick;
+        const LedgerView lvi = ReadLedger(c);
+        const int64_t qs = lvi.At(wSlot, WBS_WVSUM_W);
+        if (qs > w3Peak[a]) w3Peak[a] = qs;
+        binMax = std::max(binMax, qs);
+        if (++inBin >= w3Bin) {
+          bins.push_back(binMax);
+          binMax = 0;
+          inBin = 0;
+        }
+      }
+      if (inBin > 0) bins.push_back(binMax);
+      tick = RunQuietTicks(c, tick, w3Settle);
+      const VoxelTruth v1 =
+          SweepBasin(c, lakeGeo, lakeDesc, matId, wBoxLo, wBoxHi);
+      const LedgerView lv1 = ReadLedger(c);
+      uint32_t wFa[kFluidArgsWords] = {};
+      ReadFluidArgsSync(c.ctx, world, wFa);
+      uint32_t wPf1[4] = {0, 0, 0, 0};
+      ReadPageFaultsSync(c.ctx, world, wPf1);
+      w3Pf[a] = wPf1[0] - wPf0[0];
+      const int64_t inFlight =
+          (int64_t)wFa[7] - (int64_t)std::min(wFa[29], wFa[7]);
+      // Pass S's identity, term for term. An impulse is added BEFORE the
+      // outflow clamp, so it can change WHERE water is and never HOW MUCH —
+      // and this is the line that says so.
+      w3Err[a] = (int64_t)v1.eighths + inFlight + lv1.At(wSlot, WBS_DRAINED) -
+                 lv1.At(wSlot, WBS_DEBIT) +
+                 (lv1.At(wSlot, WBS_RVCREDIT_W) + lv1.At(wSlot, WBS_RVGIVEN_W) -
+                  lv1.At(wSlot, WBS_RVTAKEN_W)) -
+                 (int64_t)v0.eighths;
+      // Dissipation, binned for pass S's stated reason (a reflected ring
+      // focuses and can lift the sum for a tick).
+      int peakBin = -1;
+      for (size_t i = 0; i < bins.size(); i++)
+        if (peakBin < 0 || bins[i] > bins[(size_t)peakBin]) peakBin = (int)i;
+      for (size_t i = (size_t)std::max(peakBin, 0) + 1;
+           peakBin >= 0 && i < bins.size(); i++) {
+        if ((double)bins[i] >
+            (double)bins[i - 1] * (1.0 + w3RiseTolPct / 100.0)) {
+          w3BadBin[a] = (int)i;
+          break;
+        }
+      }
+      for (size_t i = 0; i < bins.size() && i < 12; i++) {
+        if (i) w3Bins[a] += ",";
+        w3Bins[a] += std::to_string((long long)bins[i]);
+      }
+    }
+    for (int a = 0; a < 4; a++) {
+      const ImpArm& arm = w3Arms[a];
+      const bool on = arm.knob > 0;
+      if (!on) {
+        // THE IDENTITY. Exactly zero, both halves: nothing queued and no pipe
+        // ever moved.
+        if (w3Queued[a] != 0 || w3Shipped[a] != 0)
+          fail(Format("pass T (%s): the emitter queued %u impulses at knob 0 "
+                      "and shipped %u — the off switch is not an identity, it "
+                      "is a cheap path",
+                      arm.name, w3Queued[a], w3Shipped[a]));
+        if (w3Peak[a] != 0)
+          fail(Format(
+              "pass T (%s): Sigma|q| reached %lld with the knob at 0. Nothing "
+              "in this fixture disturbs the lake but the impulse, so a non-zero "
+              "peak means the control arm is not a control",
+              arm.name, (long long)w3Peak[a]));
+      } else {
+        if (w3Queued[a] != 1)
+          fail(Format("pass T (%s): the emitter queued %u impulses, expected 1 "
+                      "— the record was refused before it reached TickParams",
+                      arm.name, w3Queued[a]));
+        // EXACTLY ONE TICK'S WORTH. An impulse is one push; a shipment counted
+        // over sixty ticks that is not 1 means the record was re-sent, which
+        // would make a splash a standing force.
+        if (w3Shipped[a] != 1)
+          fail(Format("pass T (%s): the impulse was shipped on %u ticks, "
+                      "expected exactly 1 — an impulse is ONE tick's push, and "
+                      "a record re-sent every tick is a standing force with a "
+                      "knob on it",
+                      arm.name, w3Shipped[a]));
+        if (w3Peak[a] <= 0)
+          fail(Format(
+              "pass T (%s): Sigma|q| was 0 for the whole window at knob %d "
+              "(%u queued, %u shipped in TickParams, footprint declared: %s). "
+              "Those three numbers name the stage: 0 queued is the emitter's "
+              "refusal path, 0 shipped is BuildImpulses or the mode-0 clear, "
+              "shipped-but-no-flux with no footprint is the hot latch, and "
+              "shipped-with-a-footprint is wbFlux itself (wvEligible's stamp, "
+              "or wvBodyAwake)",
+              arm.name, arm.knob, w3Queued[a], w3Shipped[a],
+              w3Wrote[a] ? "yes" : "no"));
+        if (w3BadBin[a] >= 0)
+          fail(Format("pass T (%s): Sigma|q| ROSE after its peak at bin %d "
+                      "[%s]. An impulse is one tick's push; a heightfield that "
+                      "keeps gaining momentum after it is creating energy",
+                      arm.name, w3BadBin[a], w3Bins[a].c_str()));
+      }
+      if (w3Err[a] < -w3Slack || w3Err[a] > w3Slack)
+        fail(Format("CONSERVATION (pass T, %s): the lake is off by %+lld "
+                    "eighths. An impulse is added BEFORE the outflow clamp, so "
+                    "it can move water sideways and never create it",
+                    arm.name, (long long)w3Err[a]));
+      if (w3Pf[a] != 0)
+        fail(Format("pass T (%s): %u page faults — an impulse pushed a write "
+                    "into a sentinel chunk",
+                    arm.name, w3Pf[a]));
+    }
+
+    // ---- ARM 3: the drain sink -------------------------------------------
+    //
+    // A DIFFERENTIAL AND NOT AN IDENTITY, because the fixture itself disturbs
+    // the surface: a discharge shaves the lake whether or not the sink is on,
+    // so Sigma|q| is non-zero in both arms and the claim has to be that the
+    // sink adds to it. What IS exact is the other half — the sink is generated
+    // GPU-side from WBS_EMIT, so an arm where the fixture never discharged
+    // proves nothing at all and says so.
+    //
+    // PASS H'S PUNCH, cell for cell (the same shaft, the same sealed chamber,
+    // the same constants). A second geometry for the same question is a second
+    // thing to keep in step, and this one is already known to make a hole the
+    // detector finds.
+    int64_t w3SinkQsum[2] = {0, 0};
+    int64_t w3SinkEmit[2] = {0, 0};
+    for (int a = 0; a < 2; a++) {
+      const int knob = a == 0 ? 0 : w3SinkQ;
+      WaterBodies().Reset();
+      SubmitWorldgen(c.ctx, world, c.sim, kDefaultSeed);
+      SetCurrentTuning(armTuning(0, 0, knob, 512));
+      tick = RunQuietTicks(c, tick, 130);
+      const WaterBodyDesc* wd = WaterBodies().Find(1);
+      if (!wd || wd->gpuSlot >= kWaterBodyCap) {
+        fail(Format("pass T (sink %d): the authored lake is not proposed", knob));
+        continue;
+      }
+      const uint32_t wSlot = wd->gpuSlot;
+      const int chTop = lakeGeo.floorY - kShaftDepth;
+      const int chBot = chTop - kChamberH;
+      std::vector<CellOp> punch;
+      for (int y = chBot; y <= lakeGeo.floorY; y++) {
+        const bool inShaft = y > chTop;
+        const int half = inShaft ? kShaftR : kChamberR;
+        for (int z = lakeGeo.cz - half; z <= lakeGeo.cz + half; z++)
+          for (int x = lakeGeo.cx - half; x <= lakeGeo.cx + half; x++) {
+            const bool wall =
+                !inShaft && (y == chBot ||
+                             std::abs(x - lakeGeo.cx) == kChamberR ||
+                             std::abs(z - lakeGeo.cz) == kChamberR);
+            punch.push_back({World::SlotCellIndex({x, y, z}),
+                             wall ? (uint32_t)kMatStone : 0u});
+          }
+      }
+      SubmitTick(c.ctx, c.world, c.sim, tick, kDefaultSeed, {}, {}, punch, false,
+                 c.world.WindowOrigin(), true, false);
+      c.ctx.ProcessEvents();
+      tick++;
+      for (uint32_t i = 0; i < w3Ticks; i++) {
+        tick = RunQuietTicks(c, tick, 1);
+        const LedgerView lvi = ReadLedger(c);
+        w3SinkQsum[a] += lvi.At(wSlot, WBS_WVSUM_W);
+        w3SinkEmit[a] += lvi.At(wSlot, WBS_EMIT);
+      }
+    }
+    for (int a = 0; a < 2; a++) {
+      if (w3SinkEmit[a] <= 0)
+        fail(Format(
+            "pass T (sink %s) proves nothing: the punched shaft never "
+            "discharged a single eighth over %u ticks, so WBS_EMIT was 0 and "
+            "the sink branch was never reached whatever the knob said",
+            a == 0 ? "off" : "on", w3Ticks));
+    }
+    if (w3SinkEmit[0] > 0 && w3SinkEmit[1] > 0 &&
+        w3SinkQsum[1] <= w3SinkQsum[0])
+      fail(Format(
+          "pass T (sink): Sigma|q| over the drain window is %lld with the sink "
+          "at %d against %lld with it at 0 — the knob reached no kernel. The "
+          "sink is a TUNE_ const (TUNE_WAVE_DRAIN_SINK), so a stale pipeline "
+          "cache or a missing tuning_params.def row are the two candidates "
+          "before the kernel itself",
+          (long long)w3SinkQsum[1], w3SinkQ, (long long)w3SinkQsum[0]));
+
+    RecordObserved("waterbodyW3BlastPeak", (double)w3Peak[1]);
+    RecordObserved("waterbodyW3WakePeak", (double)w3Peak[3]);
+    RecordObserved("waterbodyW3SinkQOn", (double)w3SinkQsum[1]);
+    RecordObserved("waterbodyW3SinkQOff", (double)w3SinkQsum[0]);
+    RecordObserved("waterbodyW3SinkEmit", (double)w3SinkEmit[1]);
+    // ONE LINE, EVERY TERM (rule 6): "W3 did nothing" is four different bugs —
+    // the emitter refused the record, the uniform never carried it, the kernel
+    // never read it, or the body was asleep and stayed asleep.
+    w3Note = Format(
+        "W3(blast r%d, wake 1 vox/tick, sink knob %d) blast Sigma|q| peak "
+        "%lld on / %lld off (%u queued / %u shipped on) | wake peak %lld on / "
+        "%lld off (%u queued / %u shipped on) | sink Sigma|q| %lld on / %lld "
+        "off over %u ticks, emitted %lld eighths | identities "
+        "%+lld/%+lld/%+lld/%+lld eighths | %u/%u/%u/%u page faults",
+        w3BlastR, w3SinkQ, (long long)w3Peak[1], (long long)w3Peak[0],
+        w3Queued[1], w3Shipped[1], (long long)w3Peak[3], (long long)w3Peak[2],
+        w3Queued[3], w3Shipped[3],
+        (long long)w3SinkQsum[1], (long long)w3SinkQsum[0], w3Ticks,
+        (long long)w3SinkEmit[1], (long long)w3Err[0], (long long)w3Err[1],
+        (long long)w3Err[2], (long long)w3Err[3], w3Pf[0], w3Pf[1], w3Pf[2],
+        w3Pf[3]);
+
+    // Leave the world settled and pristine for the passes that hash it.
+    SetCurrentTuning(t);
+    WaterBodies().Reset();
+    SubmitWorldgen(c.ctx, world, c.sim, kDefaultSeed);
+    tick = RunQuietTicks(c, tick, 60);
+  }
+
   mark("pass B");
   // ========================================================== pass B (M5)
   //
@@ -3044,6 +3418,7 @@ Status GateWaterBody(Ctx& c, std::string& detail) {
   detail += " | " + relevelNote;
   detail += " | " + discoverNote;
   detail += " | " + sloshNote;
+  detail += " | " + w3Note;
   detail += " | " + splitNote;
   detail += Format(
       " | DETERMINISM mid-drain %08x/%08x, end %08x/%08x",

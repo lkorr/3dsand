@@ -212,6 +212,18 @@ TP_F(render, waveFoamGain, TUNE_WAVE_FOAM_GAIN, 3.0f)
 TP_F(render, waveImpactSpeed, TUNE_WAVE_IMPACT_SPEED, 1.8f)
 TP_F(render, waveImpactDecay, TUNE_WAVE_IMPACT_DECAY, 2.5f)
 TP_F(render, waveImpactLen, TUNE_WAVE_IMPACT_LEN, 0.70f)
+// W3 render (docs/PLAN_water_relevel.md section 5, last bullet). The SIM's own
+// surface momentum, read in the fragment stage from `waterFlux`. The height is
+// already authoritative through liquidColumn(); what the pipes add is what the
+// eighth-quantised height CANNOT carry -- which way the surface is moving, and
+// how hard. waveSimSlope tilts the normal a little down-flow (sub-eighth
+// detail between the steps the column height can express); waveSimFoam froths
+// the columns whose pipes are running hardest. BOTH AT 0 CONST-FOLDS THE WHOLE
+// BLOCK, including the buffer read, which is not a nicety: the raymarch
+// fragment shader has no register headroom and this is the arm --shader-stats
+// is compared against.
+TP_F(render, waveSimSlope, TUNE_WAVE_SIM_SLOPE, 0.030f)
+TP_F(render, waveSimFoam, TUNE_WAVE_SIM_FOAM, 0.55f)
 TP_F(render, dbgCurrentSpacing, TUNE_CUR_DBG_SPACING, 6.0f)
 TP_F(render, dbgCurrentRadius, TUNE_CUR_DBG_RADIUS, 40.0f)
 TP_F(render, reflectionCutoff, TUNE_REFLECTION_CUTOFF, 0.06f)
@@ -768,6 +780,22 @@ TP_F(sim, waveGravity, TUNE_WAVE_GRAVITY, 98.0f)
 TP_I(sim, waveDepthCap, TUNE_WAVE_DEPTH_CAP, 10)
 TP_F(sim, waveDamping, TUNE_WAVE_DAMPING, 0.8f)
 TP_I(sim, waveSleepEps, TUNE_WAVE_SLEEP_EPS, 256)
+
+// ---- W3: WHAT DISTURBS THE SURFACE (docs/PLAN_water_relevel.md section 5) ----
+// Three sources, three knobs, each an identity at 0 and each independent of the
+// other two. All integer (rule 1): they are Q8 pipe flux, which is the unit the
+// pipes already carry, so nothing here needs the human-unit float lane.
+// waveBlastImpulse and waveSwimWake are spent on the CPU -- they scale the
+// `strength` word of a TickParams impulse record, and at 0 no record is emitted
+// at all, so the count stays 0 and wbFlux's loop does not execute. That is why
+// neither is read as a TUNE_ const and why `--sweep` on either reports one hash
+// on a script that blows nothing up and swims nowhere: the reachability proof
+// for these two is the GATE, not the sweep (W-D learned the same lesson).
+// waveDrainSink IS a kernel const, because the sink is generated GPU-side from
+// WBS_EMIT -- a live discharge is a fact only the ledger knows.
+TP_I(sim, waveBlastImpulse, TUNE_WAVE_BLAST_IMPULSE, 3072)
+TP_I(sim, waveDrainSink, TUNE_WAVE_DRAIN_SINK, 1024)
+TP_I(sim, waveSwimWake, TUNE_WAVE_SWIM_WAKE, 512)
 
 // ---- DISCOVERY (docs/PLAN_water_relevel.md W-D) ----
 // A body the PLAYER created gets adopted; puddles stay CA at no cost. Both are
