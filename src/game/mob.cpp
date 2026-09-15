@@ -14368,17 +14368,26 @@ void Mob::ApplyStrikeAim(const AnimSkeleton& sk, AnimState& st) const {
       break;
     }
   if (head < 0 || !LimbAlive(head)) return;
-  // From the head's own rest position rather than from the body origin: a
-  // creature looking at something beside its feet should tilt its head down,
-  // and measuring from the origin would have it looking level.
-  Vec3 from = origin_;
-  if ((size_t)head < anim_.model.size()) from = origin_ + anim_.model[head].pos;
+  // FROM THE HEAD, IN THE WORLD, off its LIVE transform. A creature looking at
+  // something by its feet should tilt its head down, so the origin will not do
+  // — and neither will `origin_ + anim_.model[head].pos`, which is a PREFAB-
+  // LOCAL offset added to a world position with the body's yaw left out of it:
+  // that is a couple of voxels of error whose direction rotates with the
+  // creature, which is the worst shape an error can have. `PartJointWorld` is
+  // the same `xf.pos + rot * anchorLimb` composition the submit path inverts.
+  Vec3 from{};
+  if (!PartJointWorld(head, from)) return;
   float yaw = 0, pitch = 0;
   if (!AimAnglesTo(aimLook_ - from, yaw, pitch)) return;
   // A LOOK IS NOT A STARE. Well under 1 so the creature's head leads its
   // facing without snapping onto the target and holding — the body's own turn
   // (Steer) is what closes the rest, and a head pinned at full weight on a
   // circling enemy reads as an owl.
+  //
+  // IT ALSO MOVES THE KEEP-OUT SPHERE the stroke driver clamps against
+  // (Mob::HeadKeepOut reads this same posed head), so a look that whipped the
+  // head around would shove a swing off its line as a side effect. That is the
+  // other reason it is a fraction.
   ApplyAimPart(sk, st, head, yaw, pitch, 0.6f, share);
 }
 
