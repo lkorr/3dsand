@@ -1890,6 +1890,29 @@ class Mob {
   };
   const WeaponArmDiag& WeaponArmDiagnostics() const { return weaponDiag_; }
 
+  // WHY THE JAWS ARE NOT WHERE THE STROKE ASKED, in four numbers.
+  //
+  // The aim effector's equivalent of WeaponArmDiag, and it exists for the same
+  // reason: "the head barely follows the driver" is invisible from outside as
+  // anything but a bite that looks limp, and it has at least three causes --
+  // the aim was never applied, it was applied and diluted by a weight or a
+  // spine share, or it was applied in full about a pivot that could not serve
+  // it. The COMMANDED pair is recorded where the ask is made and the POSED
+  // pair where the flatten and the clamp have finished with it, so the two are
+  // an honest before/after rather than a round trip (a circular probe asserts
+  // nothing -- the memory file has that one written down).
+  //
+  // Radians, in `AimAnglesTo`'s convention: yaw is a HEADING DELTA in the
+  // rig's own convention and pitch is positive UP.
+  struct AimDiag {
+    bool ran = false;
+    int part = -1;          // the rig slot being aimed
+    int natural = -1;       // its natural weapon, for the forward vector
+    float cmdYaw = 0, cmdPitch = 0;
+    float gotYaw = 0, gotPitch = 0;
+  };
+  const AimDiag& AimDiagnostics() const { return aimDiag_; }
+
   // ---- render plumbing (per creature; MobSystem chains these over its list) -
   // The Append* walks MUST visit slots in the same order: the slot a transform
   // lands in is the slot the instance records. Each returns the next slot.
@@ -2760,6 +2783,7 @@ class Mob {
   NpcStroke stroke_{};
   float weaponWeight_ = 0;     // weapon_.weight, clamped once on the way in
   mutable WeaponArmDiag weaponDiag_{};
+  mutable AimDiag aimDiag_{};
   mutable Quat weaponHandPreClamp_{}, weaponUpPreClamp_{}, weaponLoPreClamp_{};
   mutable Vec3 weaponHandPosPreClamp_{};
   mutable int weaponHandPart_ = -1, weaponUpPart_ = -1, weaponLoPart_ = -1;
@@ -3023,8 +3047,14 @@ class MobSystem {
   // ForceAttack: swing `style` at `targetPoint`, now. False if the creature has
   // no weapon, the style is not loaded, or a stroke is already live (a queued
   // swing is an unbounded backlog, rule 2 — see the note at PreTick's call).
+  //
+  // `seed`, when non-zero, REPLACES the (mob, tick) hash every draw in the
+  // stroke keys off -- the style pick's bow and, crucially, the TEMPO JITTER
+  // that sets the windup and cut tick counts. A gate that wants the same swing
+  // whatever ran before it passes one; the game passes nothing and keeps the
+  // variation it is there for. See the note at the call site.
   bool ForceAttack(uint64_t mobId, const std::string& style, Vec3 targetPoint,
-                   uint32_t tick);
+                   uint32_t tick, uint32_t seed = 0);
   // SetGuard: hold the blade at a stated azimuth/elevation in the creature's
   // OWN facing basis, with the point pushed out to `reachFrac` of the arm's
   // reach. Held until ClearGuard or until an attack replaces it. This is how a

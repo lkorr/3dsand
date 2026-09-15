@@ -3361,7 +3361,7 @@ void MobSystem::BeginStroke(Mob& mob, const ai::AttackRequest& req,
 }
 
 bool MobSystem::ForceAttack(uint64_t mobId, const std::string& style,
-                            Vec3 targetPoint, uint32_t tick) {
+                            Vec3 targetPoint, uint32_t tick, uint32_t seed) {
   Mob* m = FindMobById(mobId);
   if (m == nullptr) return false;
   const int si = styles_.Find(style);
@@ -3379,7 +3379,22 @@ bool MobSystem::ForceAttack(uint64_t mobId, const std::string& style,
   NpcStroke& st = m->stroke_;
   st = NpcStroke{};
   st.targetPoint = targetPoint;
-  BeginStrokeProgram(st, sty, si, rng::Hash3((uint32_t)mobId, tick, 0x5747u));
+  // ---- A SCRIPTED SWING MAY NAME ITS OWN SEED (2026-09-15) --------------
+  //
+  // Every draw in the runner keys off this one number, and the tempo jitter it
+  // produces changes the stroke's TICK COUNTS -- so the same style is a
+  // five-tick cut from one (mob, tick) pair and a three-tick cut from another.
+  // For the game that is the whole point (two duelists must not beat time
+  // together); for a GATE it is a coin flip on the run order, because a mob id
+  // depends on how many creatures earlier gates spawned. `npc-styles` measured
+  // a punch's radial travel at 1.14 voxels standalone and 0.94 in-suite
+  // against its own 1.0 floor, on identical code.
+  //
+  // 0 keeps the derived seed, so the game and every existing caller are
+  // untouched; a caller that needs the SAME swing in any scope passes one.
+  BeginStrokeProgram(st, sty, si,
+                     seed != 0 ? seed
+                               : rng::Hash3((uint32_t)mobId, tick, 0x5747u));
   st.melee.Reset();
   st.melee.SetHandSign(m->HandSign());
   ApplyMeleeTuning(st.melee.tuning);   // BeginStroke says why
@@ -3622,7 +3637,11 @@ void MobSystem::StepStroke(Mob& mob, uint32_t tick, World& world,
   if (effPart >= 0 && effPart < (int)mob.skel_.parts.size()) {
     int pivot = -1;
     if (mob.StrikeEffectorKind() == StrikeEffectorMode::Aim) {
-      pivot = mob.skel_.parts[effPart].parent;
+      // THE PART'S OWN JOINT, matching WeaponArmPose (which says at length why
+      // the parent joint was wrong): the head rotates about its neck, so that
+      // is the point the aim is a bearing FROM. Using the chest put the aim and
+      // the pose in two frames a whole neck apart.
+      pivot = effPart;
     } else {
       int handPart = -1;
       if (const IkChain* ch =
@@ -14761,15 +14780,57 @@ void Mob::ApplyStrikeAim(const AnimSkeleton& sk, AnimState& st) const {
   const float share = def_ != nullptr ? def_->aimSpineShare : 0.35f;
   if (ResolveEffector(effPart, effMode, effNatural) &&
       effMode == StrikeEffectorMode::Aim && weaponWeight_ > 0.0f) {
-    Vec3 dir = weapon_.bladeDir;
-    // The blade direction is what the stroke driver steers; the hand offset is
-    // the fallback for a pose that has not aimed yet (tick 0 of a windup).
+    // ---- THE STROKE'S OWN BEARING, NOT THE POSE'S BLADE DIRECTION --------
+    //
+    // `weapon_.bladeDir` is the driver's solved blade LEAN (melee.cpp's law of
+    // cosines: the angle a rigid bar has to sit at so its far end reaches the
+    // commanded radius from a hand held at `extendLive_`). For a held sword
+    // that is exactly right. For an aim effector there is no bar and no hand:
+    // the part IS the weapon and the only thing it can do is POINT. Driving it
+    // at the lean meant the head chased a quantity derived from a geometry it
+    // is not in, and realised a fraction of the pitch it was given.
+    //
+    // `StrokeAz`/`StrokeEl` are the driver's commanded bearing about the pivot
+    // in the wielder's own basis -- the same two numbers `npc-styles` measures
+    // a stroke's shape in, and the same ones the windup and cut phases steer.
+    // Laid straight onto the part's forward they are a 1:1 ask, which is what
+    // makes a bite snap.
+    //
+    // NO SMOOTHING ANYWHERE ON THIS PATH, and that is deliberate: the avatar's
+    // head-look eases `lookYaw_`/`lookPitch_` toward their goals before it
+    // calls ApplyAimPart (a glance is a slow thing), and a four-tick cut can
+    // never catch a goal through a 0.12 s halflife. A stroke owns its part
+    // outright.
+    Vec3 dir{};
+    if (stroke_.Active() && stroke_.style >= 0) {
+      Vec3 right, up, fwd;
+      MobBasis(*this, right, up, fwd);
+      const float az = stroke_.melee.StrokeAz(), el = stroke_.melee.StrokeEl();
+      const float ce = std::cos(el);
+      dir = right * (ce * std::sin(az)) + up * std::sin(el) +
+            fwd * (ce * std::cos(az));
+    }
+    // A guard, or a pose pushed in by something that is not a stroke program,
+    // still has a blade direction and nothing better to offer.
+    if (dir.len() < 1e-4f) dir = weapon_.bladeDir;
     if (dir.len() < 1e-4f) dir = weapon_.hand;
     float yaw = 0, pitch = 0;
-    if (AimAnglesTo(dir, yaw, pitch))
-      ApplyAimPart(sk, st, effPart, yaw, pitch, weaponWeight_, share);
+    if (!AimAnglesTo(dir, yaw, pitch)) return;
+    // FULL WEIGHT THROUGH THE CUT. `weaponWeight_` is PoseWeight, which is
+    // already 1 in every phase except a releasing recover, so this changes
+    // nothing today -- it is here so that a future change to the arm-claim
+    // ramp cannot quietly halve a bite, which is the exact failure this
+    // function was rewritten to remove.
+    const float w = stroke_.Cutting() ? 1.0f : weaponWeight_;
+    aimDiag_.ran = true;
+    aimDiag_.cmdYaw = yaw;
+    aimDiag_.cmdPitch = pitch;
+    aimDiag_.part = effPart;
+    aimDiag_.natural = effNatural;
+    ApplyAimPart(sk, st, effPart, yaw, pitch, w, share);
     return;
   }
+  aimDiag_.ran = false;
   if (!aimLookValid_ || stroke_.Active()) return;
   int head = -1;
   for (size_t i = 0; i < sk.parts.size(); i++)
@@ -15194,6 +15255,28 @@ void Mob::ApplyWeaponArm(const AnimSkeleton& sk, AnimState& st,
 }
 
 void Mob::RecordWeaponClamp(const AnimSkeleton& sk, const AnimState& st) const {
+  // ---- WHERE THE AIMED PART ACTUALLY ENDED UP POINTING ---------------------
+  //
+  // HERE, and not in ApplyStrikeAim, for the same reason `clampMove` is here:
+  // the aim writes a LOCAL rotation before the flatten and the clamp runs
+  // after it, so the only place the posed forward exists is this one. Recorded
+  // rather than trusted, because "the head barely follows the driver" is a
+  // claim nobody can make from outside without the pair of numbers -- and the
+  // pair is what caught the neck-lever bug (commanded 0.51 rad of pitch,
+  // realised 0.08).
+  if (aimDiag_.ran && aimDiag_.part >= 0 &&
+      (size_t)aimDiag_.part < st.model.size()) {
+    if (const MobNaturalWeaponDef* nw = NaturalWeapon(aimDiag_.natural)) {
+      const Vec3 edge = nw->edgeTo - nw->edgeFrom;
+      if (edge.len() > 1e-4f) {
+        const Vec3 fwdModel =
+            QuatRotate(st.model[aimDiag_.part].rot, edge.normalized());
+        const Vec3 fwdWorld =
+            Rotate(AxisAngle({0, 1, 0}, heading_), fwdModel);
+        AimAnglesTo(fwdWorld, aimDiag_.gotYaw, aimDiag_.gotPitch);
+      }
+    }
+  }
   (void)sk;
   if (!weaponDiag_.ran || weaponHandPart_ < 0) return;
   if ((size_t)weaponHandPart_ >= st.model.size()) return;
@@ -15294,24 +15377,35 @@ bool Mob::WeaponArmPose(Vec3& outHandFromShoulder, float& outReach) const {
   StrikeEffectorMode effMode = StrikeEffectorMode::None;
   if (!ResolveEffector(effPart, effMode, effNatural)) return false;
 
-  // ---- AIM: the "arm" is the NECK (plan §4) -------------------------------
+  // ---- AIM: THE PIVOT IS THE PART'S OWN JOINT, AND THERE IS NO ARM -------
   //
   // A part in no chain still has a pivot and still has a length, and the
   // stroke driver needs both: the pivot is what the stroke's azimuth and
   // elevation are measured about, and the length is what bounds its reach
-  // band. For jaws that pair is the chest joint and neck+head — which is why
-  // an aimed bite is a SHORT stroke that the body's travel has to close,
-  // rather than a swing.
+  // band.
+  //
+  // THE FIRST VERSION USED THE PARENT JOINT (the chest) AND neck+head AS THE
+  // REACH, AND THAT IS WHERE THE BITE WENT (2026-09-15). It reads well -- "the
+  // jaws are on the end of a neck the way a hand is on the end of an arm" --
+  // and it is wrong in the one way that matters: FOUR OF THOSE FIVE AND A HALF
+  // VOXELS ARE RIGID. Nothing rotates about the chest; the head rotates about
+  // its OWN joint. So the driver was handed a lever it could not move, and
+  // every radian of commanded elevation came back divided by the fraction of
+  // that lever the head actually owns -- measured, `bite` realised 0.08 rad of
+  // posed pitch on 0.51 commanded, about a fifth, which on screen is a zombie
+  // that lunges at your throat without ever opening its mouth at you.
+  //
+  // So the pivot is the PART'S OWN joint and the "arm" is zero length: the
+  // hand IS the pivot, the point is the edge tip, and the whole stroke is one
+  // part rotating. `bladeLen_` in the driver then equals the edge span and
+  // `RadiusBand`'s annulus is the head's own swing, which is the truth.
   if (effMode == StrikeEffectorMode::Aim) {
     if ((size_t)effPart >= anim_.model.size()) return false;
-    const int par = skel_.parts[effPart].parent;
-    if (par < 0 || (size_t)par >= anim_.model.size()) return false;
-    const Vec3 rel = anim_.model[effPart].pos - anim_.model[par].pos;
-    outHandFromShoulder = Rotate(AxisAngle({0, 1, 0}, heading_), rel);
     float span = 0;
     if (const MobNaturalWeaponDef* nw = NaturalWeapon(effNatural))
       span = (nw->edgeTo - nw->edgeFrom).len();
-    outReach = rel.len() + span;
+    outHandFromShoulder = Vec3{};   // the hand IS the pivot
+    outReach = span;
     return outReach > 1e-3f;
   }
 
@@ -15379,13 +15473,46 @@ bool Mob::WeaponStrokePose(Vec3& outHandFromShoulder, Vec3& outTipFromShoulder,
     if (nw == nullptr || (size_t)effPart >= anim_.model.size() ||
         (size_t)effPart >= limbs_.size())
       return true;
+    // ---- A CHAIN EFFECTOR REPORTS NO BLADE AT ALL (2026-09-15) -----------
+    //
+    // `MeleeState::RadiusBand` has two models and picks between them on
+    // `bladeLen_`: with a blade it solves the reach ANNULUS of a rigid bar
+    // pinned at a hand held `extendLive_` from the shoulder, and with none it
+    // says "the point IS the hand, so the band is simply the arm". A fist is
+    // the second case wearing the first's clothes -- the knuckles ride one
+    // voxel past the wrist on a five-voxel arm -- and reporting that voxel as
+    // a blade cost two things at once:
+    //
+    //   * THE BAND COLLAPSED. |L - handRadius| .. L + handRadius with L = 1.1
+    //     and the hand at 4 is [3.1, 4.9]: one and three quarter voxels of
+    //     travel where the arm can genuinely serve nearly five. An authored
+    //     thrust (-0.45 chamber, +0.90 drive) was then clipped at both ends,
+    //     which is why `npc-styles` measured a punch's radial travel at 0.94
+    //     voxels against its own 1.0 floor and flipped on tempo jitter.
+    //   * THE RADIAL DRIVE LEAKED INTO ELEVATION. The blade's lean is solved
+    //     by the law of cosines and laid in the plane of `perpL_`, which is
+    //     taken from the travel TANGENT -- and the tangent of a nearly pure
+    //     thrust is ill-conditioned, so a one-voxel bar swung through a large
+    //     angle to serve a radius change and took the point's elevation with
+    //     it. Measured: a punch authoring 0.02 rad of elevation commanded
+    //     0.7 rad of it.
+    //
+    // So a natural weapon reports its TIP AT ITS HAND. The driver then steers
+    // the hand along the arm's own band, no lean is computed, and the knuckles
+    // ride ahead of it exactly as they do in life. NOTHING about the hitbox
+    // moves: `WeaponEdge` reads the authored segment off the live transform
+    // and is a separate question from where the driver is steering.
+    if (effMode == StrikeEffectorMode::Chain) return true;
+    // ---- AN AIM EFFECTOR IS ONE PART ROTATING ---------------------------
+    // Same statement, for the same reason, with the pivot at the part's own
+    // joint (WeaponArmPose said why): the point is the edge tip and the hand
+    // is the pivot, so the driver's `bladeLen_` IS the edge span and its
+    // azimuth/elevation ARE the part's own forward. That is what makes a
+    // commanded pitch arrive as a head that actually pitches.
     const Quat pq = anim_.model[effPart].rot;
     const Vec3 anchor = limbs_[effPart].anchorLimb;
     const Vec3 tipModel =
         anim_.model[effPart].pos + QuatRotate(pq, nw->edgeTo - anchor);
-    // Relative to the "hand" the inverse already produced, then added to it,
-    // so the two ends cannot disagree about which pivot they used. For a Chain
-    // effector the hand IS the part; for Aim it is the part's own joint.
     const Vec3 pivot = anim_.model[effPart].pos;
     const Quat yaw = AxisAngle({0, 1, 0}, heading_);
     outTipFromShoulder = outHandFromShoulder + Rotate(yaw, tipModel - pivot);
@@ -15443,12 +15570,29 @@ bool Mob::HeadKeepOut(Vec3& outCenterFromShoulder, float& outRadius) const {
   int effPart = -1, effNatural = -1;
   StrikeEffectorMode effMode = StrikeEffectorMode::None;
   if (!ResolveEffector(effPart, effMode, effNatural)) return false;
-  // A BITE IS THE HEAD GOING THERE ON PURPOSE (plan §4). The keep-out sphere
-  // exists so an authored windup does not sweep a blade through the wielder's
-  // own face; when the face IS the weapon, the same sphere would forbid every
-  // pose the stroke is for. Skipped, rather than shrunk, because there is no
-  // radius at which "keep the jaws away from the head" means anything.
-  if (effPart == head) return false;
+  // ---- THE SPHERE IS FOR A BLADE, AND ONLY FOR A BLADE -------------------
+  //
+  // A BITE IS THE HEAD GOING THERE ON PURPOSE (plan §4): when the face IS the
+  // weapon the sphere would forbid every pose the stroke is for, and there is
+  // no radius at which "keep the jaws away from the head" means anything.
+  //
+  // AND A FIST IS NOT A BLADE EITHER. What this sphere models is a LONG RIGID
+  // SEGMENT swung about the shoulder: a held sword is a child of the hand, its
+  // far end is a metre from any joint, and no pose limit in the rig knows it
+  // exists -- so nothing but this stops an authored windup laying it through
+  // the wielder's own skull. A natural weapon's segment IS the part, one voxel
+  // of knuckle on the end of an arm whose shoulder cone and elbow hinge are
+  // already clamped every tick (AnimClampPoseLimits); the rig bounds it by
+  // construction, and a 2-voxel sphere sized off the head model is wider than
+  // the whole fist. Left on, it shoved a chambered punch -- which legitimately
+  // sits beside the chin -- out and up, which is the elevation half of the
+  // "a punch should read as a punch" report.
+  //
+  // MEASURED, not assumed: `player-unarmed` probes the clearance INDEPENDENTLY
+  // (the physics edge segment against the head limb's joint, every tick the
+  // arm is claimed) and holds it at 3.3-3.7 voxels with this off -- the arm
+  // never brings the knuckles near the face on its own.
+  if (effMode != StrikeEffectorMode::Held) return false;
   if ((size_t)effPart >= skel_.parts.size()) return false;
   int handPart = -1;
   if (ChainForEffector(skel_, effPart, handPart) == nullptr) return false;

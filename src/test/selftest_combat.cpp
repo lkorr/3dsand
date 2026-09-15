@@ -1443,7 +1443,29 @@ Status GateNpcStyles(Ctx& c, std::string& detail) {
                   sty.name.c_str());
       continue;
     }
-    if (!c.mobs.ForceAttack(id, sty.name, aim, tick.tick)) {
+    // ---- THE SAME SWING IN EVERY SCOPE (2026-09-15) ---------------------
+    //
+    // A FIXED SEED, derived from the style's NAME and nothing else. Every draw
+    // in the runner keys off the stroke's seed, and the one that matters here
+    // is the TEMPO JITTER: it scales the windup and cut TICK COUNTS, so the
+    // same style is a five-tick cut from one (mob id, tick) pair and a
+    // three-tick one from another -- and a mob id depends on how many
+    // creatures the gates before this one spawned. Measured on identical code,
+    // `punch_r` reported 1.14 voxels of commanded radial travel standalone and
+    // 0.94 in-suite, straddling its own 1.0 floor; `bite` reported 0.26 rad of
+    // posed arc standalone and 0.23 in-suite against 0.25.
+    //
+    // That is the scope-stability failure `_npcStyles_about` names, arriving
+    // by a different door: the earlier one was a CLAIM that moved between
+    // scopes, this is an INPUT that does. Pinning it costs the gate nothing it
+    // was measuring -- the jitter is a character feature, not a property of a
+    // style's shape -- and every style still draws a DIFFERENT seed, so
+    // nothing is measured at one lucky tempo.
+    const uint32_t styleSeed =
+        rng::Hash3(0x5C0BEu,
+                   (uint32_t)std::hash<std::string>{}(sty.name), 0x5747u) |
+        1u;
+    if (!c.mobs.ForceAttack(id, sty.name, aim, tick.tick, styleSeed)) {
       check(false, "style \"" + sty.name + "\" would not start");
       continue;
     }
@@ -1489,12 +1511,61 @@ Status GateNpcStyles(Ctx& c, std::string& detail) {
     float cPrevAz = 0, cPrevEl = 0;
     bool cHavePrev = false;
     int cutTicks = 0;
+    // ---- WHAT THE EFFECTOR ITSELF DID, in its own units (2026-09-15) -----
+    //
+    // `ReadTip` reports the driver's seed pose about the stroke's pivot, which
+    // is the right coordinate for a SWORD and a poor one for anything else.
+    // For a Chain effector it now reports the HAND (a fist has no blade to
+    // lean, so mob.cpp deliberately reports its tip at its hand); for an Aim
+    // effector it reports a point on a part that ROTATES about its own joint.
+    // Neither is a lie and neither is what a reader wants to know, which is:
+    // DID THE FIST MOVE, AND DID THE JAWS TURN.
+    //
+    // So a natural weapon is measured on its own terms, off the LIVE physics
+    // transform the damage sweep uses:
+    //   Chain -> the knuckles' world PATH LENGTH in voxels across the cut
+    //   Aim   -> the part's forward-vector ANGULAR travel in radians
+    // Accumulated per tick, like every arc here, so a blow that goes out and
+    // comes back is not read as having gone nowhere.
+    float edgePath = 0;          // Chain: voxels the tip travelled
+    float fwdTurn = 0;           // Aim: radians the forward turned
+    Vec3 prevEdgeTip{};
+    Vec3 prevFwd{};
+    bool haveEdgePrev = false;
+    // ...and the rig's own COMMANDED/POSED pair for an aimed part
+    // (Mob::AimDiag). The travel above says the head moved; this says whether
+    // it moved as far as it was TOLD, which is a different question and the
+    // one that caught the neck-lever bug.
+    float aimCmdPitchLo = 1e9f, aimCmdPitchHi = -1e9f;
+    float aimGotPitchLo = 1e9f, aimGotPitchHi = -1e9f;
     for (int i = 0; i < 90; i++) {
       tick();
       const NpcStroke* s = c.mobs.MobStroke(id);
       if (s == nullptr) break;
       if (s->phase == NpcStroke::Phase::Cut) {
         cutTicks++;
+        if (const Mob* m = c.mobs.FindMobById(id)) {
+          Vec3 eb, et, ef;
+          float ehw = 0;
+          if (m->WeaponEdge(eb, et, ehw, &ef)) {
+            const Vec3 f = (et - eb).len() > 1e-5f ? (et - eb).normalized()
+                                                   : Vec3{0, 0, 1};
+            if (haveEdgePrev) {
+              edgePath += (et - prevEdgeTip).len();
+              fwdTurn += std::acos(std::clamp(f.dot(prevFwd), -1.0f, 1.0f));
+            }
+            prevEdgeTip = et;
+            prevFwd = f;
+            haveEdgePrev = true;
+          }
+          const Mob::AimDiag& ad = m->AimDiagnostics();
+          if (ad.ran) {
+            aimCmdPitchLo = std::min(aimCmdPitchLo, ad.cmdPitch);
+            aimCmdPitchHi = std::max(aimCmdPitchHi, ad.cmdPitch);
+            aimGotPitchLo = std::min(aimGotPitchLo, ad.gotPitch);
+            aimGotPitchHi = std::max(aimGotPitchHi, ad.gotPitch);
+          }
+        }
         const TipRead t = ReadTip(c.mobs, id);
         if (t.valid) {
           azMin = std::min(azMin, t.az);
@@ -1577,13 +1648,77 @@ Status GateNpcStyles(Ctx& c, std::string& detail) {
 
     // ITS OWN CLAIM, FROM ITS OWN AUTHORED NUMBERS. Nothing here names a style,
     // so the check is inherited by every style added later: whichever channel
-    // the author asked to travel in must be the one the SWORD travelled in.
+    // the author asked to travel in must be the one the WEAPON travelled in.
     const float wantAz = std::fabs(sty.cut.az);
     const float wantEl = std::fabs(sty.cut.el);
     const float wantR = std::fabs(sty.cut.reach);
     const std::string n = "\"" + sty.name + "\"";
-    check(posedAz + posedEl > minSweep,
-          "style " + n + ": the SWORD moved, not just the stroke");
+    const bool natural = !(sty.weapon.empty() || sty.weapon == "held");
+    // AN AIM EFFECTOR IS ONE THE RIG CANNOT SERVE WITH A CHAIN, and the rig is
+    // the authority on which those are -- not a name in this file. Asked of
+    // the live creature, so a def that later grows a neck chain makes its bite
+    // a Chain effector and this gate follows it with no edit.
+    bool aimed = false;
+    if (natural) {
+      const Mob* m = c.mobs.FindMobById(id);
+      aimed = m != nullptr &&
+              m->StrikeEffectorKind() == StrikeEffectorMode::Aim;
+    }
+    // ---- "THE WEAPON MOVED, NOT JUST THE STROKE" -------------------------
+    //
+    // Three weapons, three units, and the words name which one -- "the SWORD
+    // moved" is the wrong sentence about a fist.
+    //
+    // A FRACTION OF WHAT THE STYLE COMMANDED rather than an absolute floor,
+    // because an absolute floor is half of what made this gate flip between
+    // scopes: a cut given three ticks by tempo jitter instead of five
+    // legitimately travels less, and a claim stated against its own command
+    // scales with it. (The other half is the jitter itself, pinned at the
+    // ForceAttack above.)
+    const float travelFrac =
+        (float)BaselineNumber("npcStyles.naturalTravelFrac", 0.5);
+    if (aimed) {
+      // JAWS: the part's forward has to TURN, by a real share of the angular
+      // travel the cut asked for.
+      const float wantTurn = (wantAz + wantEl) * travelFrac;
+      check(fwdTurn > wantTurn,
+            "style " + n + ": the JAWS turned (" + Format("%.2f", fwdTurn) +
+                " rad of " + Format("%.2f", wantAz + wantEl) + " commanded)");
+      // ...AND THE HEAD IS WHERE IT WAS TOLD TO BE, not a fifth of the way
+      // there. Stated on the SPAN of each so a stroke that never reaches its
+      // extreme is caught where an average would hide it, and read off the
+      // rig's own before/after pair (Mob::AimDiag) rather than re-derived
+      // here -- this is the claim that caught the neck-lever bug.
+      const float cmdSpan = aimCmdPitchHi > aimCmdPitchLo
+                                ? aimCmdPitchHi - aimCmdPitchLo
+                                : 0.0f;
+      const float gotSpan = aimGotPitchHi > aimGotPitchLo
+                                ? aimGotPitchHi - aimGotPitchLo
+                                : 0.0f;
+      const float followFrac =
+          (float)BaselineNumber("npcStyles.aimFollowFrac", 0.6);
+      check(cmdSpan > 0.1f,
+            "style " + n + ": the driver commanded real pitch");
+      check(gotSpan > cmdSpan * followFrac,
+            "style " + n + ": the POSED head followed it (" +
+                Format("%.2f", gotSpan) + " rad of " +
+                Format("%.2f", cmdSpan) + " commanded)");
+      RecordObserved("npcStyles.aimCmdPitchObserved", (double)cmdSpan);
+      RecordObserved("npcStyles.aimGotPitchObserved", (double)gotSpan);
+    } else if (natural) {
+      // A FIST: the knuckles have to travel through the WORLD. In voxels,
+      // against the reach band the arm can actually serve, because a punch is
+      // a distance and not an angle.
+      const float wantPath =
+          (float)BaselineNumber("npcStyles.fistPathVox", 1.0);
+      check(edgePath > wantPath,
+            "style " + n + ": the FIST moved (" + Format("%.2f", edgePath) +
+                " vox of knuckle travel)");
+      RecordObserved("npcStyles.fistPathObserved", (double)edgePath);
+    } else {
+      check(posedAz + posedEl > minSweep,
+            "style " + n + ": the SWORD moved, not just the stroke");
+    }
     if (wantR > wantAz && wantR > wantEl) {
       // A THRUST. Reach-dominant: the point goes OUT, not around. Measured in
       // VOXELS (a radius) against radians, so the two are asserted separately
@@ -1608,7 +1743,6 @@ Status GateNpcStyles(Ctx& c, std::string& detail) {
       // channel", which is what a thrust IS, and the claim that the fist
       // itself moved is carried by the posed-arc check above — the same split,
       // for the same reason, as the swing check two lines down.
-      const bool natural = !(sty.weapon.empty() || sty.weapon == "held");
       check((natural ? cmdDr : dr) > minReach,
             "style " + n + " (thrust) extended its reach");
       // ON THE COMMANDED ARCS, like every other dominance claim here — the
@@ -1637,13 +1771,16 @@ Status GateNpcStyles(Ctx& c, std::string& detail) {
             "style " + n + " (diagonal) is genuinely diagonal");
     }
     std::printf(
-        "npc-styles %-14s authored (az %.2f el %.2f reach %.2f) -> swept "
-        "commanded arc az %.2f el %.2f; posed arc az %.2f el %.2f (spans "
-        "%.2f / %.2f) dr %.2f vox (commanded dr %.2f, r %.2f..%.2f) over %d "
-        "cut ticks\n",
-        sty.name.c_str(), sty.cut.az, sty.cut.el, sty.cut.reach, az, el,
-        posedAz, posedEl, azSpan, elSpan, dr, cmdDr, cmdRMin, cmdRMax,
-        cutTicks);
+        "npc-styles %-14s [%-7s] authored (az %.2f el %.2f reach %.2f) -> "
+        "swept commanded arc az %.2f el %.2f; posed arc az %.2f el %.2f "
+        "(spans %.2f / %.2f) dr %.2f vox (commanded dr %.2f, r %.2f..%.2f) "
+        "over %d cut ticks; effector knuckle path %.2f vox, forward turn "
+        "%.2f rad, head pitch commanded %.2f -> posed %.2f\n",
+        sty.name.c_str(), sty.weapon.c_str(), sty.cut.az, sty.cut.el,
+        sty.cut.reach, az, el, posedAz, posedEl, azSpan, elSpan, dr, cmdDr,
+        cmdRMin, cmdRMax, cutTicks, edgePath, fwdTurn,
+        aimCmdPitchHi > aimCmdPitchLo ? aimCmdPitchHi - aimCmdPitchLo : 0.0f,
+        aimGotPitchHi > aimGotPitchLo ? aimGotPitchHi - aimGotPitchLo : 0.0f);
   }
 
   CloseStage(c);

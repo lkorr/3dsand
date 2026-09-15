@@ -156,11 +156,13 @@
       "label": "Bite",
       "weapon": "jaws",
       "reach": 7,
-      "//shape": "THE JAWS ARE AN AIM EFFECTOR, not a chain: no rig puts the head in an IK chain, so the stroke rotates the head and a share of the spine toward the tip direction (Mob::ApplyAimPart) and the head's own short 'reach band' -- neck plus skull -- is all the travel there is. So the cut is mostly a LUNGE OF THE NECK: a small downward pitch and a hard radial drive, which is a head snapping forward. `reach` 7 is close enough to touch; the lunging version below is how a zombie gets there.",
-      "windup": { "ticks": 10, "az": 0.05, "el": 0.30, "reach": -0.35 },
-      "cut": { "ticks": 4, "az": -0.08, "el": -0.45, "reach": 0.85 },
+      "//shape": "THE JAWS ARE AN AIM EFFECTOR, not a chain: no rig puts the head in an IK chain, so the stroke ROTATES the head (and a share of the spine) until its forward lies along the bearing the driver commands -- Mob::ApplyStrikeAim lays StrokeAz/StrokeEl straight onto it. THE MOTION IS THEREFORE ALL IN THE ANGULAR CHANNELS. A first draft put it in `reach` (windup -0.35, cut +0.85) on the theory that a bite is a head thrusting forward, and that is what a head DOES -- but a part that can only point cannot translate, and the radial channel moved nothing at all. What carries the jaws to the throat is the BODY: `bite_lunge` leaps, and a standing bite is authored for a target already inside reach 7. So: rear back half a radian, then snap down and through by nearly one. The small `reach` pair is a token so the driver still has a radius to hold.",
+      "windup": { "ticks": 10, "az": 0.05, "el": 0.50, "reach": -0.10 },
+      "cut": { "ticks": 4, "az": -0.08, "el": -0.95, "reach": 0.20 },
       "recover": { "ticks": 12 },
       "jitter": { "az": 0.12, "el": 0.08, "tempo": 0.22 },
+      "//target": "THE SAME WEIGHTS THE LUNGING BITE USES, and it needs them for the commoner case rather than the rarer one: a zombie already in reach -- crawling, cornered, or with its victim on the ground -- bites with THIS style, and without a table every one of those blows went to the chest (MobSystem::PickTargetLimb reads an absent table as `-1`, which BeginStroke turns into today's chest aim). The owner asked for bites that go for arms and torso too; that has to be true of the bite you actually meet.",
+      "target": { "head": 0.35, "arm": 0.30, "hand": 0.05, "spine": 0.20, "leg": 0.10 },
       "clip": "bite"
     },
     {
@@ -173,8 +175,9 @@
       "lunge": { "ticks": 9, "speed": 2.4, "rise": 1.5, "at": "windup" },
       "//target": "WEIGHTS OVER LIMB TAGS, not names, so any rig that tags its parts answers it. Bites go for arms and torso too, not only the head -- the owner asked for that by name. Hands are in at 0.05 because a bitten-off hand is a thing that should happen occasionally and never look aimed at.",
       "target": { "head": 0.35, "arm": 0.30, "hand": 0.05, "spine": 0.20, "leg": 0.10 },
-      "windup": { "ticks": 10, "az": 0.05, "el": 0.32, "reach": -0.35 },
-      "cut": { "ticks": 4, "az": -0.08, "el": -0.50, "reach": 0.90 },
+      "//shape": "Elevation-dominant like the standing bite above, and for the reason spelled out there: an aim effector POINTS, it does not translate, so a bite's motion has to live in the angular channels. A touch more of it than the standing one -- the body is arriving at speed and the head snaps through further.",
+      "windup": { "ticks": 10, "az": 0.05, "el": 0.55, "reach": -0.10 },
+      "cut": { "ticks": 4, "az": -0.08, "el": -1.05, "reach": 0.20 },
       "recover": { "ticks": 14 },
       "jitter": { "az": 0.12, "el": 0.08, "tempo": 0.18 },
       "clip": "lunge"
