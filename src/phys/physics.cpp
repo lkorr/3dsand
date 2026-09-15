@@ -67,7 +67,27 @@ constexpr JPH::ObjectLayer PLAYER = 2;
 // "walking forward moves me backwards/diagonally, sporadically". Your own body
 // must never be able to push you.
 constexpr JPH::ObjectLayer AVATAR = 3;
-constexpr JPH::ObjectLayer NUM = 4;
+// A HELD PROP: geometry that is CARRIED, not simulated. Collides with NOTHING
+// — not terrain, not debris, not another creature, not the player proxy — and
+// is fully visible to every QUERY (ray casts, shape casts, overlap tests).
+//
+// The split this layer makes is the same one AVATAR makes, taken to its end:
+// CONTACTS vs VISIBILITY. A sword in a fist is posed by its wielder's hand
+// every tick — it is kinematic and jointed to the hand, so contacts can never
+// move the weapon itself, and the only thing they can do is move everything
+// the weapon touches. That is not physics, it is a kinematic body of rig mass
+// sweeping through the world at swing speed, and it reads as exactly the jank
+// it is: standing next to an armed NPC shoves you off your feet, and walking
+// through a fight scatters the corpses.
+//
+// NOTHING IN COMBAT IS LOST BY THIS, because nothing in combat was ever routed
+// through these contacts. A swing damages via `MeleeSweep`'s ray probes down
+// the blade's own axis (game/melee.cpp `CastRayBody`), a parry is decided
+// GEOMETRICALLY by `MobSystem::FindParry` on the two edge segments, and melee
+// applies no impulses at all. All three keep working here, because a query
+// filter is what they go through and this layer is in DynamicLayerFilter.
+constexpr JPH::ObjectLayer PROP = 4;
+constexpr JPH::ObjectLayer NUM = 5;
 }  // namespace Layers
 
 namespace BP {
@@ -94,6 +114,12 @@ class ObjVsBPFilter final : public JPH::ObjectVsBroadPhaseLayerFilter {
   bool ShouldCollide(JPH::ObjectLayer layer, JPH::BroadPhaseLayer bp) const override {
     if (layer == Layers::STATIC) return bp == BP::MOVING;  // static vs moving only
     if (layer == Layers::PLAYER) return bp == BP::MOVING;  // proxy: bodies only
+    // A held prop is rejected by the pair filter against every layer there is,
+    // so stopping it here costs the broadphase nothing and saves it pairing a
+    // fast-swinging body against the whole world every step. This filter is
+    // the SIMULATION's; queries take a JPH::BroadPhaseLayerFilter instead and
+    // are unaffected (see Layers::PROP).
+    if (layer == Layers::PROP) return false;
     return true;
   }
 };
@@ -101,6 +127,11 @@ class ObjVsBPFilter final : public JPH::ObjectVsBroadPhaseLayerFilter {
 class ObjPairFilter final : public JPH::ObjectLayerPairFilter {
  public:
   bool ShouldCollide(JPH::ObjectLayer a, JPH::ObjectLayer b) const override {
+    // A held prop has no contacts with anything, including another prop: two
+    // blades that cross are a PARRY, decided geometrically by
+    // MobSystem::FindParry, and letting the solver see them as well would put
+    // a second, disagreeing answer underneath the one combat actually reads.
+    if (a == Layers::PROP || b == Layers::PROP) return false;
     // The avatar's own limbs never touch the player proxy they live inside.
     if ((a == Layers::PLAYER && b == Layers::AVATAR) ||
         (a == Layers::AVATAR && b == Layers::PLAYER))
@@ -111,13 +142,18 @@ class ObjPairFilter final : public JPH::ObjectLayerPairFilter {
   }
 };
 
-// "Any body a query should be able to see", i.e. both dynamic layers.
+// "Any body a query should be able to see", i.e. every non-static layer.
 // SpecifiedObjectLayerFilter takes a single layer, which stopped being enough
-// once the avatar moved off MOVING.
+// once the avatar moved off MOVING — and PROP is here for the same reason it
+// is: the split those layers make is about CONTACTS, not about visibility.
+// A laser must still be able to burn a sword out of somebody's hand, the look
+// ray must still name it, and melee's blade probes must still be able to find
+// one.
 class DynamicLayerFilter final : public JPH::ObjectLayerFilter {
  public:
   bool ShouldCollide(JPH::ObjectLayer layer) const override {
-    return layer == Layers::MOVING || layer == Layers::AVATAR;
+    return layer == Layers::MOVING || layer == Layers::AVATAR ||
+           layer == Layers::PROP;
   }
 };
 
@@ -1778,6 +1814,28 @@ void Physics::SetBodyAvatarLayer(uint64_t handle, bool isAvatar) {
   if (!bi.IsAdded(id)) return;
   // Both layers map to BP::MOVING, so this never needs a broadphase rebuild.
   bi.SetObjectLayer(id, isAvatar ? Layers::AVATAR : Layers::MOVING);
+}
+
+void Physics::SetBodyPropLayer(uint64_t handle, bool isProp) {
+  if (!system_ || handle == 0) return;
+  JPH::BodyInterface& bi = system_->GetBodyInterface();
+  JPH::BodyID id = ToBodyID(handle);
+  if (!bi.IsAdded(id)) return;
+  // IDEMPOTENT, AND IT DOES NOT CLOBBER. This is called every time a held
+  // item's collider is rebuilt (a carve, a burn) and once per equip, so it has
+  // to be safe to repeat; and clearing it must not overwrite a layer somebody
+  // else set for a reason. In particular ReleaseToWorldWhenClear parks a
+  // just-dropped weapon on AVATAR until it has fallen clear of the player, and
+  // a blanket `isProp ? PROP : MOVING` here would undo that and hand the
+  // player the exact shove that release exists to prevent.
+  const JPH::ObjectLayer cur = bi.GetObjectLayer(id);
+  if (isProp) {
+    if (cur != Layers::PROP) bi.SetObjectLayer(id, Layers::PROP);
+  } else if (cur == Layers::PROP) {
+    bi.SetObjectLayer(id, Layers::MOVING);
+  }
+  // Like the avatar split, both layers map to BP::MOVING: no broadphase
+  // rebuild, so this is free to call per tick if it ever needs to be.
 }
 
 bool Physics::WorldBounds(uint64_t handle, float outMin[3],

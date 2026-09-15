@@ -4671,6 +4671,27 @@ void Mob::StartRagdoll(float minSeconds, const char* why) {
     phys_->GetTransform(limb.body, limb.xf);
     phys_->SetBodyKinematic(limb.body, false);
     phys_->ActivateBody(limb.body);
+    // A WEAPON THAT IS NO LONGER BEING CARRIED IS AN OBJECT AGAIN. The held
+    // slot is exempt from contacts while a living hand is posing it
+    // (Layers::PROP, EquipItem) — and the line above has just handed it to the
+    // solver, so from here it is solved for like every other limb and needs
+    // the floor to exist. Left on PROP it would fall through the world,
+    // dragging the wrist it is jointed to after it.
+    //
+    // The NPC branch below would clear it as a side effect (a release sets the
+    // layer outright); this is said explicitly because the AVATAR branch
+    // takes no exemption and would otherwise drop the player's own sword out
+    // of the map every time they were knocked down.
+    if ((int)i == heldSlot_) {
+      phys_->SetBodyPropLayer(limb.body, false);
+      // ...and it rejoins the layer the rest of THIS creature's limbs are on,
+      // which for the avatar is the player-exempt one. Clearing PROP on its
+      // own drops to the plain MOVING layer, and the player's own guard going
+      // limp inside the player's own capsule is precisely the unresolvable
+      // overlap Die() and DetachLimb both document. An NPC's falls through to
+      // the release below, exactly as its limbs do.
+      if (AvatarLayer()) phys_->SetBodyAvatarLayer(limb.body, true);
+    }
     // An NPC's limbs live on the plain MOVING layer. Flipping them dynamic
     // inside the player's capsule — a blast at sword's reach — is the same
     // unresolvable overlap Die() documents, and the answer is the same: off
@@ -5118,6 +5139,13 @@ void Mob::BeginGetUp(World& world) {
     phys_->GetTransform(limb.body, limb.xf);
     getUpFrom_[i] = limb.xf;
     phys_->SetBodyKinematic(limb.body, true);
+    // BACK IN THE FIST, BACK OFF THE SOLVER. The mirror of StartRagdoll: the
+    // hand is posing this weapon again from the next tick, so its contacts go
+    // back to being something that can only move other people. Without this a
+    // creature that had been knocked down once would be swinging a blade that
+    // shoves the player, and the bug would only ever reproduce after a
+    // ragdoll.
+    if ((int)i == heldSlot_) phys_->SetBodyPropLayer(limb.body, true);
   }
   ragdoll_ = RagdollPhase::GetUp;
   ragdollT_ = 0.0f;
@@ -7375,6 +7403,16 @@ bool Mob::RebuildLimbBody(int limbIndex) {
   // rebuilds the collider. Your own body must not push you — including after it
   // has been rebuilt.
   if (AvatarLayer()) phys_->SetBodyAvatarLayer(limb.body, true);
+  // ...and the PROP EXEMPTION, for exactly the same reason and reachable from
+  // exactly the same places. A weapon is carved and burned like any other
+  // slot, and a rebuilt blade that started back on the plain MOVING layer
+  // would be shoving the player again from the first acid drop or laser graze
+  // that touched it. Only while it is still BEING HELD: a rebuild during a
+  // ragdoll deliberately hands the piece back to the solver (`kinematic` is
+  // false above), and a prop that is not carried has to be able to hit the
+  // floor.
+  if (limbIndex == heldSlot_ && kinematic)
+    phys_->SetBodyPropLayer(limb.body, true);
 
   if (limb.joint) {
     phys_->DestroyJoint(limb.joint);
@@ -11920,9 +11958,26 @@ bool Mob::EquipItem(const ItemDef* item, const char* context) {
     return false;
   }
   phys_->SetBodyKinematic(p.body, true);
-  // On the wearer's layer: your own sword must not shove you any more than
-  // your own elbow may (meaningful for the avatar; an NPC's stays dynamic).
-  if (AvatarLayer()) phys_->SetBodyAvatarLayer(p.body, true);
+  // A HELD WEAPON HAS NO CONTACTS, WHOEVER IS HOLDING IT.
+  //
+  // This used to be `if (AvatarLayer()) SetBodyAvatarLayer(true)` — your own
+  // sword must not shove you any more than your own elbow may — which left an
+  // NPC's drawn blade on the ordinary layer. A kinematic body reports its
+  // rig's mass, so it cleared PlayerPushOut's kick-it-aside gate and shoved
+  // the player a depenetration a tick for as long as they stood in it; and the
+  // avatar's own, exempt from the player but not from anything else, swept
+  // corpses and debris aside as it swung. Neither is physics anybody asked
+  // for: the blade is pinned to a hand by a Fixed joint and posed every tick,
+  // so a contact can never move the WEAPON, only its victim.
+  //
+  // Layers::PROP is the whole fix (phys/physics.h SetBodyPropLayer): no
+  // contacts with anything, still visible to every ray. The swing is
+  // unaffected — MeleeSweepDamage probes with CastRayBody, FindParry is
+  // segment-vs-segment geometry, and melee applies no impulses at all — and
+  // the moment this item stops being held, every path that lets go of it
+  // (DetachLimb, TickSeveredHolds, DropItemToWorld, GoLimp) ends in
+  // ReleaseToWorldWhenClear or AdoptBody, which set the layer outright.
+  phys_->SetBodyPropLayer(p.body, true);
 
   // THE GRIP POINT IN THE BODY'S OWN FRAME.
   //

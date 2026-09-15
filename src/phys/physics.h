@@ -281,6 +281,42 @@ class Physics {
   // "you" and should be able to bump into you like any other debris.
   void SetBodyAvatarLayer(uint64_t handle, bool isAvatar);
 
+  // A HELD WEAPON IS CARRIED, NOT SIMULATED.
+  //
+  // Move a body onto (or off) the PROP layer, which generates contacts with
+  // NOTHING — no terrain, no debris, no creature, no player proxy — while
+  // staying fully visible to ray casts and every other query.
+  //
+  // WHY THIS EXISTS. A sword in a fist is a kinematic body posed by its
+  // wielder's hand every tick and pinned to it by a Fixed joint. Contacts can
+  // therefore never move the WEAPON; the only thing they can do is move
+  // whatever the weapon is inside. Because a kinematic body reports its rig's
+  // mass, an NPC's drawn sword sailed straight past PlayerPushOut's
+  // kick-it-aside mass gate and depenetrated the player's capsule every tick
+  // it overlapped — standing near an armed NPC shoved you off your feet, and
+  // a swing dragged you with it. In the other direction your own blade, swept
+  // at swing speed, scattered every dynamic body it passed through: corpses,
+  // ragdolls and loose debris flung out of the way by a weapon you were only
+  // carrying. Reported as "fights feel clunky and weird".
+  //
+  // IT COSTS COMBAT NOTHING, because no part of combat was ever routed
+  // through these contacts and melee applies no impulses at all:
+  //   * the swing's hit detection ray-casts down the blade's own axis
+  //     (game/melee.cpp MeleeSweepDamage -> CastRayBody), and rays see this
+  //     layer;
+  //   * a parry is decided GEOMETRICALLY, segment against segment, by
+  //     MobSystem::FindParry — which the comment there says outright, because
+  //     a blade collider is a quarter of a voxel thick and the probes could
+  //     never answer it;
+  //   * Mob::WeaponEdge needs the body's TRANSFORM, which is why this moves a
+  //     body between layers rather than removing it.
+  //
+  // A prop that stops being held — dropped, thrown, knocked loose, severed
+  // with the arm, or dynamic under a ragdoll — must come off this layer, or
+  // it will fall through the floor. Every one of those paths already ends in
+  // ReleaseToWorldWhenClear or AdoptBody, which set the layer outright.
+  void SetBodyPropLayer(uint64_t handle, bool isProp);
+
   // A BODY BORN INSIDE SOMEBODY MUST NOT SHOVE THEM OUT OF IT.
   //
   // Everything that leaves a creature — a severed limb, a cut strap's
@@ -369,7 +405,7 @@ class Physics {
     float depthVox = 0;
   };
   // Which object layer a body is on: 0 STATIC, 1 MOVING, 2 PLAYER, 3 AVATAR,
-  // -1 dead. The layer is the whole of whether a body can shove the player,
+  // 4 PROP, -1 dead. The layer is the whole of whether a body can shove the player,
   // so a push that should have been impossible is answered by this.
   int BodyObjectLayer(uint64_t handle) const;
   Vec3 PlayerPushOut(uint64_t handle, Vec3 centerVoxel,

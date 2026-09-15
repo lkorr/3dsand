@@ -1209,11 +1209,29 @@ Status GateNpcBlock(Ctx& c, std::string& detail) {
     check(want != 0, "the defender's held item occupies a rig slot with a body");
     check(haveGuard && (gt - gb).len() > 1.0f,
           "...and publishes a real cutting edge for the parry to meet");
+    // ...AND THAT BODY GENERATES NO CONTACTS WHILE IT IS BEING HELD.
+    //
+    // The wiring half of Layers::PROP (phys/physics.h SetBodyPropLayer); the
+    // behaviour half — no push in either direction, still visible to rays —
+    // is asserted on bare bodies in `player-body`. Here because this gate is
+    // the one place an NPC is standing in the world with a real drawn blade,
+    // which is precisely the configuration that used to shove the player off
+    // their feet for standing too close to it.
+    //
+    // 4 is Layers::PROP. A bare number because the enum is file-local to
+    // physics.cpp on purpose and BodyObjectLayer's contract is the number, but
+    // the whole point of the assertion is that it is NOT 1 (MOVING): that is
+    // the value this shipped with, and the value a rebuild after a carve
+    // silently restored until RebuildLimbBody learned to re-apply it.
+    const int heldLayer = want != 0 ? c.phys.BodyObjectLayer(want) : -1;
+    check(heldLayer == 4,
+          "...and is on the contact-free prop layer, so a drawn weapon cannot "
+          "shove anybody");
     std::printf(
         "npc-block guard: slot %d, edge (%.1f,%.1f,%.1f)..(%.1f,%.1f,%.1f), "
-        "length %.2f vox\n",
+        "length %.2f vox, layer %d (4 = prop)\n",
         dm ? dm->HeldSlot() : -1, gb.x, gb.y, gb.z, gt.x, gt.y, gt.z,
-        (gt - gb).len());
+        (gt - gb).len(), heldLayer);
   }
 
 

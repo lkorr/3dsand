@@ -5407,6 +5407,67 @@ the world (`ragdoll player on fire`). What it found, in order of damage:
   5% of `playerMassKg` cannot push the player at all (the 80 kg proxy pushes
   it instead). Standing on a log or being shoved by a corpse is unchanged.
 
+### A held weapon is CARRIED, not simulated (2026-09-15; `Layers::PROP`, `Physics::SetBodyPropLayer`)
+
+Reported as "holding a sword moves other mobs, walking into an inactive sword
+moves me, fights feel clunky". Both halves are one mechanism, and it is not a
+tuning number: **a held item is a rig limb** (`game/item.h`, "A BORROWED SLOT"),
+so `Mob::EquipItem` gives it a Jolt body like any other limb — kinematic,
+jointed to the hand, and until now on the ordinary `MOVING` layer for everyone
+except the player.
+
+A kinematic body cannot be moved BY a contact, only THROUGH one. So the held
+weapon's contacts could never do anything except move other things:
+
+- **Toward the player.** A kinematic limb reports its whole rig's mass, so an
+  NPC's drawn blade sailed past `PlayerPushOut`'s `kPushMinMassFrac` gate —
+  the one that exists so a body you could kick aside cannot move you — and
+  depenetrated the capsule every tick it overlapped. Standing at sword's reach
+  of an armed NPC shoved you off your feet.
+- **Away from it.** The avatar's own sword was exempt from the player
+  (`AVATAR`) but from nothing else, so a swing swept every DYNAMIC body it
+  passed through: corpses, limp ragdolls and loose debris punted aside by a
+  weapon you were merely carrying. Measured on bare bodies in `player-body`: a
+  kinematic block dragged past a 10 kg sphere moves it **23.24 voxels** as an
+  ordinary body and **0.00** as a prop.
+
+`Layers::PROP` is the whole fix, and it is `AVATAR`'s argument taken to its
+end — **the split is about CONTACTS, not about VISIBILITY**. It collides with
+nothing at all, including another prop, and it stays in `DynamicLayerFilter`,
+so every query still sees it.
+
+**NOTHING IN COMBAT WAS ROUTED THROUGH THOSE CONTACTS**, which is why this
+costs the swing nothing and is the part to check before touching it again:
+- damage is ray probes tiled down the blade's own axis
+  (`MeleeSweepDamage` → `CastRayBody`), and it is the TARGET's limbs those
+  rays need, never the swinging weapon's collider;
+- a parry is decided GEOMETRICALLY by `MobSystem::FindParry` on the two edge
+  segments — `npc-block` already says in as many words that the collider
+  cannot answer it, being a quarter of a voxel thick;
+- melee applies **no impulses anywhere**. The only "force" a hit carries is
+  `impactSpeed`, which feeds `severImpactSpeed` and the kerf depth.
+- `Mob::WeaponEdge` needs the body's TRANSFORM, which is why this moves a body
+  between layers rather than removing it.
+
+**The flag is not set once.** A prop that stops being carried must come off the
+layer or it falls through the world, and a prop that resumes being carried must
+go back on:
+| Path | What it does |
+|---|---|
+| `EquipItem` | sets it |
+| `RebuildLimbBody` | re-applies it — a weapon is carved and burned like any other slot, and a rebuilt body starts on the default layer (the same trap `AVATAR` hit from every damage source; see the note there) |
+| `StartRagdoll` | clears it, since the line above just handed the limb to the solver — and hands the AVATAR's back to `AVATAR` rather than letting it fall to `MOVING` inside the player's own capsule |
+| `BeginGetUp` | sets it again, or a creature knocked down once would swing a shoving blade forever after |
+| `Die` / `DetachLimb` / `TickSeveredHolds` / `DropItemToWorld` | already set the layer outright (`ReleaseToWorldWhenClear`, `AdoptBody`), so letting go needs no new code |
+
+Asserted in two halves, deliberately: `player-body` pins the BEHAVIOUR on bare
+bodies (push 4.00 → 0.000 → 4.00 vox as the flag goes on and off, the sweep
+figures above, and — the arm that matters most — **a ray still hits it**, since
+a "fix" that hid props from queries too would pass everything else while
+silently deleting melee). `npc-block` pins the WIRING, because it is the one
+gate with an NPC standing in the world holding a real drawn blade.
+
+
 ### Mob steering: intent vs actuation (2026-08-21; `game/mob.cpp`)
 
 Locomotion was one block that read the ground, snapped `heading += 90°` when

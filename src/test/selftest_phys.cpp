@@ -672,6 +672,93 @@ bool pushOk = false;
         pendingAfter, pushAfter);
   }
 
+  // A CARRIED PROP HAS NO CONTACTS, IN EITHER DIRECTION
+  // (Physics::SetBodyPropLayer, Layers::PROP).
+  //
+  // A held weapon is a kinematic body posed by its wielder's hand and pinned
+  // to it by a joint, so a contact can never move the WEAPON — only whatever
+  // the weapon is inside. Because a kinematic body reports its rig's mass it
+  // sailed past PlayerPushOut's kick-it-aside gate, so standing next to an
+  // armed NPC shoved the player, and your own blade swept every dynamic body
+  // it passed through out of the way. Both directions are asserted here
+  // because they are two different filters (the query's and the simulation's)
+  // and either one alone would leave half the bug.
+  //
+  // THE THIRD ARM IS THE ONE THAT MATTERS MOST: rays must still see a prop.
+  // The layer is what makes the whole change safe for combat — melee probes
+  // down the blade with CastRayBody, a laser must still be able to burn a
+  // sword out of a hand — and a "fix" that hid props from queries too would
+  // pass the first two arms while silently deleting melee.
+  bool propOk = false;
+  {
+    at = Vec3{500.0f, 500.0f, 500.0f};
+    phys.MovePlayerBody(pb, at, kTickDt);
+    phys.SetBodyVelocity(pb, Vec3{});
+    phys.Step(kTickDt);
+    phys.MovePlayerBody(pb, at, kTickDt);
+    phys.SetBodyVelocity(pb, Vec3{});
+
+    uint64_t prop = stoneBlock({499, 499, 499});  // straddles the capsule
+    const float pushPlain = phys.PlayerPushOut(pb, at).len();
+    phys.SetBodyPropLayer(prop, true);
+    const float pushProp = phys.PlayerPushOut(pb, at).len();
+    // ...and a ray fired along +x from well outside still finds it.
+    float frac = 1.0f;
+    const uint64_t rayHit =
+        phys.CastRayBody(Vec3{480.0f, 500.0f, 500.0f}, Vec3{1, 0, 0}, 40.0f,
+                         frac);
+    const int layerWhileProp = phys.BodyObjectLayer(prop);
+    phys.SetBodyPropLayer(prop, false);
+    const float pushBack = phys.PlayerPushOut(pb, at).len();
+    phys.RemoveBody(prop);
+
+    // THE OTHER DIRECTION: a prop swept through a resting body leaves it
+    // where it lies. A kinematic block is driven along +x straight through a
+    // light sphere — the sword-through-a-corpse case — once on each layer.
+    // Only horizontal displacement counts; both fall freely here.
+    auto sweepThrough = [&](bool asProp) {
+      std::vector<DebrisVoxel> vox;
+      for (int z = 0; z < 3; z++)
+        for (int y = 0; y < 3; y++)
+          for (int x = 0; x < 3; x++)
+            vox.push_back({(int8_t)x, (int8_t)y, (int8_t)z, 0, kMatStone});
+      BodyTransform bxf{};
+      bxf.pos = Vec3{600.0f, 500.0f, 500.0f};
+      bxf.quat[3] = 1.0f;
+      const uint64_t blade =
+          phys.CreateDebrisBodyXf(vox, bxf, dens, /*allowKinematic=*/true);
+      phys.SetBodyKinematic(blade, true);
+      if (asProp) phys.SetBodyPropLayer(blade, true);
+      const float startX = 612.0f;
+      // 10 kg: comfortably under the player's kick-it-aside mass, and the
+      // kind of thing a blade would otherwise punt across the field.
+      const uint64_t ball =
+          phys.CreateSphereBody({startX, 500.0f, 500.0f}, 4.0f, 150.0f);
+      for (int i = 0; i < 12; i++) {
+        bxf.pos.x += 2.2f;
+        phys.MoveKinematicBody(blade, bxf.pos, bxf.quat, kTickDt);
+        phys.Step(kTickDt);
+      }
+      BodyTransform out{};
+      phys.GetTransform(ball, out);
+      phys.RemoveBody(ball);
+      phys.RemoveBody(blade);
+      return out.pos.x - startX;
+    };
+    const float sweptAsBody = sweepThrough(false);
+    const float sweptAsProp = sweepThrough(true);
+
+    propOk = pushPlain > 0.01f && pushProp < 1e-3f && pushBack > 0.01f &&
+             rayHit == prop && layerWhileProp == 4 && sweptAsBody > 2.0f &&
+             std::fabs(sweptAsProp) < 0.5f;
+    std::printf(
+        "player body: carried prop %s (push %.2f -> %.3f -> %.2f vox, ray %s, "
+        "layer %d, swept %.2f vox as body / %.2f as prop)\n",
+        propOk ? "ok" : "FAILED", pushPlain, pushProp, pushBack,
+        rayHit == prop ? "hits" : "MISSED", layerWhileProp, sweptAsBody,
+        sweptAsProp);
+  }
+
   // mass-relative shove: the proxy is dynamic with a real mass, so walking
   // into a light sphere must move it far more than the same walk into a
   // heavy one (both fall freely — only horizontal displacement counts).
@@ -695,7 +782,7 @@ bool pushOk = false;
   float heavyMoved = walkInto(12000.0f);  // ~780 kg lead sphere
   phys.RemoveBody(pb);
   bool shoveOk = lightMoved > 2.0f && lightMoved > 3.0f * heavyMoved;
-  pushOk = pushNear > 0.01f && pushFar < 1e-3f && shoveOk && releaseOk;
+  pushOk = pushNear > 0.01f && pushFar < 1e-3f && shoveOk && releaseOk && propOk;
   std::printf(
       "player body: %s (overlap push %.2f vox, clear push %.3f vox, "
       "shove light %.1f vox vs heavy %.1f vox)\n",
