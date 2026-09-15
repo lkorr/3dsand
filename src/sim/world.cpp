@@ -228,6 +228,10 @@ void World::Init(const rhi::Device& device) {
   // the CPU writes it and one kernel reads it; nothing copies it back.
   gasFarEmit = CreateBuffer(device, (uint64_t)kGasFarEmitWords * 4,
                             U::Storage | U::CopyDst, "gasFarEmit");
+  // The long-range density box (world.h kGasFarOuterN). CopySrc for the gate,
+  // CopyDst for the per-tick clear, exactly like gasOuter.
+  gasFarOuter = CreateBuffer(device, (uint64_t)kGasFarOuterWords * 4,
+                             U::Storage | U::CopySrc | U::CopyDst, "gasFarOuter");
 
   // MLS-MPM fluid (world.h fluid block). CopySrc on the particle pair is for
   // the fluid gates' mass audits; the frame path reads back only the small

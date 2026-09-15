@@ -57,4 +57,15 @@ const RenderSpec& LastRenderSpec();
 void SetGasRenderActive(bool active);
 bool GasRenderActive();
 
+// ---- the LONG-RANGE gas box (RenderParams flag bit 5, world.h kGasFarOuterN)
+// The same question one LOD out: is there anything in the 51.2 m..409.6 m
+// density box this frame. SEPARATE from the flag above rather than folded into
+// it, because they gate different work and the common cases differ -- a
+// campfire ten metres away arms the near flag every frame and must not also put
+// a 16-sample walk of a second 4 MiB volume on every terrain pixel. Same
+// correctness role too: the long-range box is cleared only on ticks its own row
+// is recorded, so with this off the box is stale and must not be sampled.
+void SetGasFarRenderActive(bool active);
+bool GasFarRenderActive();
+
 }  // namespace sandvox

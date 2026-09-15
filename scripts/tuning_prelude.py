@@ -337,6 +337,7 @@ SPEC = [
     # far FIRE PLUMES: smoke from fires the window has left behind
     ("render", "farPlumeStrength", "TUNE_FAR_PLUME_STRENGTH", "f", 1.0),
     ("render", "farPlumeHeight", "TUNE_FAR_PLUME_HEIGHT", "f", 28.0),
+    ("render", "farPlumeRange", "TUNE_FAR_PLUME_RANGE", "f", 409.6),
 
     # in-window LOD handoff (PLAN_surface_flight_perf.md A1)
     ("render", "lodHandoffDist", "TUNE_LOD_HANDOFF_DIST", "f", 24.0),

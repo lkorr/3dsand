@@ -364,6 +364,7 @@ bool Simulation::Init(const rhi::Device& device, World& world,
         // it writes gasOuter, which is binding 6 here -- one more read-only
         // entry against a whole extra layout to bind.
         entry(11, T::ReadOnlyStorage), // gasFarEmit
+        entry(12, T::Storage),         // gasFarOuter (the long-range box)
     };
     gasBGL_ = device.CreateBindGroupLayout(gentries, std::size(gentries));
 
@@ -527,6 +528,15 @@ bool Simulation::Init(const rhi::Device& device, World& world,
         // itself. At render.waveSimSlope/Foam 0 the shader never reads it and
         // the whole block const-folds away — the entry costs one descriptor.
         entry(22, T::ReadOnlyStorage, S::Fragment),               // waterFlux
+        // The LONG-RANGE gas density box (world.h kGasFarOuterN). Same
+        // standing and the same arrow as gasOuter at 21, at eight times
+        // the cell: sim_gas's wide splat is the sole writer, on the TICK
+        // command buffer, and the raymarcher reads it in the FRAGMENT
+        // stage of the same frame. Declared HERE for gasOuter's stated
+        // reason -- a binding a shader names must exist in the layout or
+        // the pipeline will not build, and that is the one thing a
+        // renderer edit cannot add for itself.
+        entry(23, T::ReadOnlyStorage, S::Fragment),               // gasFarOuter
     };
     renderBGL_ = device.CreateBindGroupLayout(entries, std::size(entries));
 
@@ -644,6 +654,7 @@ bool Simulation::Init(const rhi::Device& device, World& world,
         b(9, reactionBuf_),
         b(10, world_->gasSpawnOps),
         b(11, world_->gasFarEmit),
+        b(12, world_->gasFarOuter),
     };
     gasBG_[page] =
         device.CreateBindGroup(gasBGL_, gentries, std::size(gentries), "gasBG");
@@ -686,6 +697,7 @@ bool Simulation::Init(const rhi::Device& device, World& world,
         b(20, world_->glow),
         b(21, world_->gasOuter),
         b(22, world_->waterFlux),
+        b(23, world_->gasFarOuter),
     };
     renderBG_ = device.CreateBindGroup(renderBGL_, entries, std::size(entries), "renderBG");
   }
@@ -1518,6 +1530,7 @@ bool Simulation::BuildPipelines(const rhi::Device& device, std::string* err) {
   pool.Add([&] { gArgs2_ = MakeComputePipeline(device, gasPL_, mGas, "gasArgs2", "gasArgs2"); });
   pool.Add([&] { gResolve_ = MakeComputePipeline(device, gasPL_, mGas, "gasResolve", "gasResolve"); });
   pool.Add([&] { gFarPlume_ = MakeComputePipeline(device, gasPL_, mGas, "gasFarPlume", "gasFarPlume"); });
+  pool.Add([&] { gFarPlumeW_ = MakeComputePipeline(device, gasPL_, mGas, "gasFarPlumeWide", "gasFarPlumeWide"); });
 
   pool.Add([&] { fluidMark_ = MakeComputePipeline(device, fluidPL_, mFluid, "mark", "fluidMark"); });
   pool.Add([&] { fluidAlloc_ = MakeComputePipeline(device, fluidPL_, mFluid, "alloc", "fluidAlloc"); });
@@ -1853,6 +1866,7 @@ struct RecordCtx {
   // range, and then the splat row records NOTHING -- and the density box's
   // clear falls back to the parcel latch alone, exactly as before.
   uint32_t gasFarEmitCount = 0;
+  uint32_t gasFarWideCount = 0;
   // Angle of repose (world.h kReposeSnap*). See the latch in EncodeTick.
   bool reposeActive = false;
 };
@@ -1953,6 +1967,7 @@ const rhi::Buffer& Simulation::PassBuffer(pass::Buf b) const {
     case B::GasDispatchArgs:     return world_->gasDispatchArgs;
     case B::GasOuter:            return world_->gasOuter;
     case B::GasFarEmit:          return world_->gasFarEmit;
+    case B::GasFarOuter:         return world_->gasFarOuter;
     case B::ReposeSnap:          return world_->reposeSnap;
     default:                return world_->voxels;
   }
@@ -1982,6 +1997,7 @@ const rhi::ComputePipeline& Simulation::PassPipeline(pass::Pipe p) const {
     case P::GasArgs2:       return gArgs2_;
     case P::GasResolve:     return gResolve_;
     case P::GasFarPlume:    return gFarPlume_;
+    case P::GasFarPlumeWide: return gFarPlumeW_;
     case P::PArgs1:         return pArgs1_;
     case P::PSpawn:         return pSpawn_;
     case P::PIntegrate:     return pIntegrate_;
@@ -2080,6 +2096,7 @@ void Simulation::RecordTable(const rhi::CommandEncoder& enc, pass::Table which,
   tc.vizActive = cx.vizActive;
   tc.gasActive = cx.gasActive;
   tc.gasFarEmitCount = cx.gasFarEmitCount;
+  tc.gasFarWideCount = cx.gasFarWideCount;
   tc.reposeActive = cx.reposeActive;
 
   rhi::TableBindings tb{};
@@ -2543,6 +2560,13 @@ void Simulation::EncodeTick(const rhi::CommandEncoder& enc, uint32_t opsCount,
   // clear falls back to the parcel latch alone.
   cx.gasFarEmitCount =
       CurrentTuning().render.farPlumeStrength > 0.0f ? farPlumeCount_ : 0u;
+  // The LONG-RANGE half, on the same terms. Its own count because the two
+  // emitter lists are disjoint and cover different distance bands: a world
+  // whose only frozen fire is 300 m out records the wide rows and not the fine
+  // ones, and vice versa. `render.farPlumeRange` 0 empties the wide list
+  // CPU-side, so the knob is an exact off switch here too.
+  cx.gasFarWideCount =
+      CurrentTuning().render.farPlumeStrength > 0.0f ? farPlumeWideCount_ : 0u;
 
   // ---- the repose snapshot prepass ----------------------------------------
   // `anyRepose_` is a property of the MATERIAL TABLE, latched in UploadTables,
@@ -2575,6 +2599,14 @@ void Simulation::EncodeTick(const rhi::CommandEncoder& enc, uint32_t opsCount,
   if (gasSeenHold_ > 0) gasSeenHold_--;
   sandvox::SetGasRenderActive((gasOn && gasSeenHold_ > 0) ||
                               cx.gasFarEmitCount > 0);
+  // The LONG-RANGE box gets its OWN render flag rather than sharing that one.
+  // Sharing would put a 16-sample walk of a second 4 MiB volume on every
+  // terrain pixel of every frame in which a campfire smokes ten metres away,
+  // which is the whole class of cost RFLAG_GAS exists to avoid -- and it is a
+  // correctness gate on the same terms: the long-range box is only cleared on
+  // ticks its own row is recorded, so with the flag off it is stale and must
+  // not be sampled.
+  sandvox::SetGasFarRenderActive(cx.gasFarWideCount > 0);
 
   RecordTable(enc, pass::Table::Tick, &cx);
 

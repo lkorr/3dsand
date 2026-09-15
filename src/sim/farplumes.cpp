@@ -2,6 +2,7 @@
 
 #include <algorithm>
 #include <cstdint>
+#include <cstdlib>
 
 namespace {
 
@@ -34,6 +35,29 @@ inline bool InBox(IVec3 v, IVec3 originVox) {
 inline bool ChunkInWindow(IVec3 wc, IVec3 wo) {
   const int n = (int)kNChunk;
   const int dx = wc.x - wo.x, dy = wc.y - wo.y, dz = wc.z - wo.z;
+  return dx >= 0 && dy >= 0 && dz >= 0 && dx < n && dy < n && dz < n;
+}
+
+// ---- the LONG-RANGE box (world.h kGasFarOuterN) ---------------------------
+// Origin FLOORED to the cell, which gasOuter's is not and does not need to be:
+// the window origin is a multiple of 16 voxels and this cell is 64, so without
+// the floor the whole lattice would slide sideways on every window shift. The
+// same expression lives in sim_gas.wgsl's gasFarOuterOrigin and in
+// raymarch.wgsl's gasFarOuterOriginVox — three copies of an identity world.h
+// static_asserts, exactly as the fine box already has.
+inline int FloorToCell(int v, uint32_t shift) { return (v >> shift) << shift; }
+
+inline IVec3 WideOriginVox(IVec3 windowOriginChunks) {
+  const int o = kGasFarOuterOffsetVox;
+  return {FloorToCell(windowOriginChunks.x * (int)kChunk - o, kGasFarOuterShift),
+          FloorToCell(windowOriginChunks.y * (int)kChunk - o, kGasFarOuterShift),
+          FloorToCell(windowOriginChunks.z * (int)kChunk - o, kGasFarOuterShift)};
+}
+
+inline bool InWideBox(IVec3 v, IVec3 originVox) {
+  const int n = (int)(kGasFarOuterN << kGasFarOuterShift);
+  const int dx = v.x - originVox.x, dy = v.y - originVox.y,
+            dz = v.z - originVox.z;
   return dx >= 0 && dy >= 0 && dz >= 0 && dx < n && dy < n && dz < n;
 }
 
@@ -140,68 +164,142 @@ void FarPlumes::NoteUniformChunk(IVec3 wc, uint32_t mat) {
   Replace(wc, e, n);
 }
 
-void FarPlumes::Build(IVec3 windowOriginChunks) {
+namespace {
+// One candidate emitter with its rank. Distance is squared euclidean from the
+// window centre; the BAND it falls in is decided by the max norm, which is a
+// different metric on purpose (see the header).
+struct Ranked {
+  int64_t d2;
+  FarPlumes::Emitter e;
+};
+bool RankLess(const Ranked& a, const Ranked& b) {
+  if (a.d2 != b.d2) return a.d2 < b.d2;
+  if (a.e.x != b.e.x) return a.e.x < b.e.x;
+  if (a.e.y != b.e.y) return a.e.y < b.e.y;
+  return a.e.z < b.e.z;
+}
+// Cap to `max` nearest, then SORT — and the sort is not cosmetic. The emitter
+// INDEX is one of the inputs to the shader's animation hash, so an unordered
+// rebuild would re-roll every plume's turbulence whenever an unrelated chunk
+// was evicted. Sorting by distance means a rebuild that did not change which
+// fires are near does not change their indices either.
+void CapAndSort(std::vector<Ranked>& v, size_t max) {
+  if (v.size() > max) {
+    std::nth_element(v.begin(), v.begin() + max, v.end(), RankLess);
+    v.resize(max);
+  }
+  std::sort(v.begin(), v.end(), RankLess);
+}
+void WriteSection(std::vector<uint32_t>& words, size_t base,
+                  const std::vector<Ranked>& v) {
+  for (size_t i = 0; i < v.size(); i++) {
+    uint32_t* w = words.data() + base + i * kGasFarEmitStride;
+    w[0] = (uint32_t)v[i].e.x;
+    w[1] = (uint32_t)v[i].e.y;
+    w[2] = (uint32_t)v[i].e.z;
+    w[3] = v[i].e.strength;
+  }
+}
+}  // namespace
+
+void FarPlumes::Build(IVec3 windowOriginChunks, int32_t rangeVox) {
   if (!dirty_ && windowOriginChunks.x == builtOrigin_.x &&
       windowOriginChunks.y == builtOrigin_.y &&
-      windowOriginChunks.z == builtOrigin_.z)
+      windowOriginChunks.z == builtOrigin_.z && rangeVox == builtRange_)
     return;
   dirty_ = false;
   builtOrigin_ = windowOriginChunks;
+  builtRange_ = rangeVox;
 
   const IVec3 ov = BoxOriginVox(windowOriginChunks);
-  // The window CENTRE in voxels — the same point the crossfade band measures
-  // from, and the right tie-breaker here for the same reason: what the player
-  // can see is bounded by the window, not by where the camera happens to look.
-  const int64_t cx = (int64_t)windowOriginChunks.x * (int)kChunk + kWorldN / 2;
-  const int64_t cy = (int64_t)windowOriginChunks.y * (int)kChunk + kWorldN / 2;
-  const int64_t cz = (int64_t)windowOriginChunks.z * (int)kChunk + kWorldN / 2;
+  const IVec3 wov = WideOriginVox(windowOriginChunks);
+  // The window CENTRE in voxels — the same point the voxel/parcel crossfade
+  // measures from, and the right origin here for the same reason: what the
+  // player can see is bounded by the window, not by where the camera looks.
+  const int cx = windowOriginChunks.x * (int)kChunk + (int)kWorldN / 2;
+  const int cy = windowOriginChunks.y * (int)kChunk + (int)kWorldN / 2;
+  const int cz = windowOriginChunks.z * (int)kChunk + (int)kWorldN / 2;
+  // The handover distance, in the MAX NORM: the fine box's own half-extent.
+  // Inside it a fire is drawn at 0.8 m cells, outside at 6.4 m. Strict, so no
+  // emitter feeds both boxes and "no double-brightening" is a property of the
+  // data rather than of a blend weight.
+  const int fineHalf = (int)kWorldN;
 
-  struct Ranked { int64_t d2; Emitter e; };
-  std::vector<Ranked> keep;
-  keep.reserve(byChunk_.size() * 2);
+  std::vector<Ranked> fine;
+  fine.reserve(byChunk_.size() * 2);
+  // The wide section is aggregated AGAIN, per COARSE column: a 6.4 m cell
+  // holds up to 8x8 fine columns in x/z and four chunks in y, so without this
+  // one burning hillside would spend the whole 256-emitter budget on a patch
+  // 64 voxels across and everything else in the band would be silent.
+  std::unordered_map<Key, Emitter, KeyHash> wide;
+
   for (const auto& kv : byChunk_) {
     const IVec3 wc{kv.first.x, kv.first.y, kv.first.z};
     // RESIDENT CHUNKS ARE DROPPED. A fire inside the window is a running fire:
     // the CA makes real smoke voxels for it, sim_step splats those into the
-    // same box, and an emitter on top would draw the plume twice. This is also
+    // fine box, and an emitter on top would draw the plume twice. This is also
     // what retires an emitter when the player walks back to a fire — no event
     // is needed, the test simply stops passing.
     if (ChunkInWindow(wc, windowOriginChunks)) continue;
     for (const Emitter& e : kv.second) {
-      if (!InBox({e.x, e.y, e.z}, ov)) continue;
-      const int64_t dx = e.x - cx, dy = e.y - cy, dz = e.z - cz;
-      keep.push_back({dx * dx + dy * dy + dz * dz, e});
+      const int dx = e.x - cx, dy = e.y - cy, dz = e.z - cz;
+      const int mx = std::max(std::abs(dx), std::max(std::abs(dy), std::abs(dz)));
+      const int64_t d2 = (int64_t)dx * dx + (int64_t)dy * dy + (int64_t)dz * dz;
+      if (mx < fineHalf) {
+        if (InBox({e.x, e.y, e.z}, ov)) fine.push_back({d2, e});
+        continue;
+      }
+      if (rangeVox <= 0 || mx > rangeVox) continue;
+      if (!InWideBox({e.x, e.y, e.z}, wov)) continue;
+      // Bucket by the COARSE cell the emitter stands in. Strengths add and the
+      // topmost hot voxel wins, so a whole burning hillside becomes ONE
+      // emitter whose strength says how much of it is alight — which is what
+      // the shader turns into a taller, denser column.
+      const Key k{(e.x - wov.x) >> kGasFarOuterShift,
+                  (e.y - wov.y) >> kGasFarOuterShift,
+                  (e.z - wov.z) >> kGasFarOuterShift};
+      auto it = wide.find(k);
+      if (it == wide.end()) {
+        wide.emplace(k, e);
+      } else {
+        // Saturating, because the record's strength is a u32 and a hillside
+        // could in principle overflow one.
+        it->second.strength =
+            (uint32_t)std::min<uint64_t>((uint64_t)it->second.strength + e.strength,
+                                         0xFFFFFFFFull);
+        if (e.y > it->second.y) {
+          it->second.y = e.y;
+          it->second.x = e.x;
+          it->second.z = e.z;
+        }
+      }
     }
   }
-  if (keep.size() > kGasFarEmitMax) {
-    std::nth_element(keep.begin(), keep.begin() + kGasFarEmitMax, keep.end(),
-                     [](const Ranked& a, const Ranked& b) { return a.d2 < b.d2; });
-    keep.resize(kGasFarEmitMax);
-  }
-  // SORTED, and not merely truncated. The list is a stable identity for the
-  // shader's animation hash (the emitter INDEX is one of its inputs), so an
-  // unordered rebuild would re-roll every plume's turbulence whenever an
-  // unrelated chunk was evicted. Sorting by distance means a rebuild that did
-  // not change which fires are near does not change their indices either.
-  std::sort(keep.begin(), keep.end(),
-            [](const Ranked& a, const Ranked& b) {
-              if (a.d2 != b.d2) return a.d2 < b.d2;
-              if (a.e.x != b.e.x) return a.e.x < b.e.x;
-              if (a.e.y != b.e.y) return a.e.y < b.e.y;
-              return a.e.z < b.e.z;
-            });
 
-  count_ = (uint32_t)keep.size();
-  words_.assign(kGasFarEmitHdr + (size_t)count_ * kGasFarEmitStride, 0u);
-  words_[0] = count_;
-  words_[1] = kGasOuterShift;   // see world.h: which box this list was built for
-  for (uint32_t i = 0; i < count_; i++) {
-    uint32_t* w = words_.data() + kGasFarEmitHdr + (size_t)i * kGasFarEmitStride;
-    w[0] = (uint32_t)keep[i].e.x;
-    w[1] = (uint32_t)keep[i].e.y;
-    w[2] = (uint32_t)keep[i].e.z;
-    w[3] = keep[i].e.strength;
+  std::vector<Ranked> wideRanked;
+  wideRanked.reserve(wide.size());
+  for (const auto& kv : wide) {
+    const int dx = kv.second.x - cx, dy = kv.second.y - cy,
+              dz = kv.second.z - cz;
+    wideRanked.push_back(
+        {(int64_t)dx * dx + (int64_t)dy * dy + (int64_t)dz * dz, kv.second});
   }
+
+  CapAndSort(fine, kGasFarEmitMax);
+  CapAndSort(wideRanked, kGasFarEmitMaxWide);
+
+  count_ = (uint32_t)fine.size();
+  countWide_ = (uint32_t)wideRanked.size();
+  // The image is always full size: the wide section starts at a FIXED word so
+  // the shader can address it without reading the fine count first, and a
+  // short buffer would leave the previous list's tail on the GPU.
+  words_.assign(kGasFarEmitWords, 0u);
+  words_[0] = count_;
+  words_[1] = kGasOuterShift;       // which box the fine section was built for
+  words_[2] = countWide_;
+  words_[3] = kGasFarOuterShift;    // ...and the wide one
+  WriteSection(words_, kGasFarEmitHdr, fine);
+  WriteSection(words_, kGasFarEmitWideBase, wideRanked);
   version_++;
 }
 

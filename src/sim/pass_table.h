@@ -82,6 +82,10 @@ enum class Buf : uint8_t {
   // read the table does not know about is the failure mode this file exists to
   // make impossible.
   GasFarEmit,
+  // The LONG-RANGE density box (world.h kGasFarOuterN). Exactly GasOuter's
+  // standing -- render-only derived data written on the tick command buffer and
+  // read by the raymarcher in the fragment stage -- at eight times the cell.
+  GasFarOuter,
   // Render-only derived data, on the table for the shadow cache's reason: the
   // splat WRITES it on the tick command buffer and the raymarcher READS it in
   // the fragment stage, and a hazard the table does not know about generates
@@ -257,6 +261,10 @@ enum class Pipe : uint8_t {
   // own condition, so a world with frozen fires and no parcels pays for this
   // row and none of the five above it.
   GasFarPlume,
+  // ...and the same kernel one LOD out (sim_gas.wgsl `gasFarPlumeWide`), for
+  // the fires past gasOuter's reach. A seventh gas entry point on the same
+  // layout, writing only the long-range box.
+  GasFarPlumeWide,
   // The angle-of-repose occupancy snapshot: a second entry point of
   // sim_step.wgsl, not a new module, so it costs no bind-group layout and
   // cannot drift from the kernel that reads it.
@@ -439,6 +447,13 @@ enum class Cond : uint8_t {
   // population that does not exist (rule 2).
   GasFarEmit,
   GasOuter,
+  // GasFarWide: the CPU handed the GPU at least one LONG-RANGE emitter this
+  // tick. It gates the wide splat AND the long-range box's own clear, which is
+  // the union discipline the two conditions above state, in its simplest form:
+  // this box has exactly ONE writer, so "whoever writes it" and "the clear"
+  // are the same predicate and there is nothing to union. render.farPlumeRange
+  // 0 makes it false and nothing about the long-range box is recorded at all.
+  GasFarWide,
   // Any LOADED material authors a non-default `repose` AND the CA has work.
   // The first half is a property of materials.json, latched once at
   // UploadTables rather than recomputed per tick; the second is CaActive,
@@ -523,6 +538,8 @@ enum class DispatchSel : uint32_t {
   // buffer and no readback — which is the whole reason the emitter list is a
   // CPU-side index rather than a GPU one.
   GasFarEmitSel,
+  // One workgroup per LONG-RANGE emitter, same argument as the line above.
+  GasFarWideSel,
 };
 
 // Max `uses` entries on any row. Asserted against the widest row at compile

@@ -139,6 +139,14 @@ PASS(fill_gasClaim, nullptr, PT_TICK, PIPE_NONE, K_FILL, 0,0,0, GRP_NONE, DYN_NO
      USES(TW(GasClaim)))
 PASS(fill_gasOuter, nullptr, PT_TICK, PIPE_NONE, K_FILL, 0,0,0, GRP_NONE, DYN_NONE, C_GASOUT, 1,
      USES(TW(GasOuter)))
+// The LONG-RANGE box's clear (world.h kGasFarOuterN). Its condition is simply
+// its one writer's: unlike gasOuter, nothing but the wide splat ever touches
+// it, so "cleared" and "written" are the same predicate. A tick with no distant
+// fire in range clears nothing and the box keeps its last content, which is
+// safe for exactly gasOuter's reason -- the render flag that licenses sampling
+// it drops on the same tick.
+PASS(fill_gasFarOuter, nullptr, PT_TICK, PIPE_NONE, K_FILL, 0,0,0, GRP_NONE, DYN_NONE, C_GASWIDE, 1,
+     USES(TW(GasFarOuter)))
 
 // ---- phase 1: prep (one ComputePassEncoder today: mutate+explode+compact) --
 // D_OPS/D_CELLS/D_EXP/D_SPAWN are dispatch-extent selectors resolved from the
@@ -580,6 +588,17 @@ PASS(gasResolve, "gasResolve", PT_TICK, PIPE_GAS_RESOLVE, K_INDIRECT, IND_GASARG
 PASS(gasFarPlume, "gasFarPlume", PT_TICK, PIPE_GAS_FARPLUME, K_COMPUTE, D_GASFAREMIT,1,1,
      GRP_SLIM_GAS, DYN_NONE, C_GASFAR, 1,
      USES(U(TickUBO) R(GasFarEmit) A(GasOuter)))
+// ...and the same kernel one LOD out, into the long-range box. Its own
+// condition, so a world whose only distant fire is 300 m away records THIS row
+// and not the one above it -- the two emitter lists are disjoint by
+// construction (the CPU splits them in the max norm at the fine box's own
+// half-extent), so the two rows never draw the same fire twice.
+//
+// Same read set, same single write: U(TickUBO) for the tick and the wind,
+// R(GasFarEmit) for the list, A(GasFarOuter) for the only thing it produces.
+PASS(gasFarPlumeWide, "gasFarPlume", PT_TICK, PIPE_GAS_FARPLUMEW, K_COMPUTE, D_GASFARWIDE,1,1,
+     GRP_SLIM_GAS, DYN_NONE, C_GASWIDE, 1,
+     USES(U(TickUBO) R(GasFarEmit) A(GasFarOuter)))
 
 // ---- phase 5a: hash tick (whole-world scan; also refreshes occupancy) ------
 PASS(occupancyFull, "occupancyFull+pick(hashTick)", PT_TICK, PIPE_OCCUPANCY, K_COMPUTE, D_CHUNKS,1,1, GRP_SIM, DYN_ZERO, C_HASH, 1,

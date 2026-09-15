@@ -547,6 +547,10 @@ TP_F(render, gasBlendStart, TUNE_GAS_BLEND_START, 0.5f)
 // height is how far the synthesized column climbs, in METRES.
 TP_F(render, farPlumeStrength, TUNE_FAR_PLUME_STRENGTH, 1.0f)
 TP_F(render, farPlumeHeight, TUNE_FAR_PLUME_HEIGHT, 28.0f)
+// How far out a frozen fire still smokes, in METRES. Clamped to the long-range
+// box's own half-extent; 0 leaves the wide list empty, which is the exact off
+// switch for the whole long-range half.
+TP_F(render, farPlumeRange, TUNE_FAR_PLUME_RANGE, 409.6f)
 
 // ---- in-window LOD handoff (PLAN_surface_flight_perf.md A1) ----
 TP_F(render, lodHandoffDist, TUNE_LOD_HANDOFF_DIST, 24.0f)

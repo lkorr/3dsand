@@ -81,19 +81,33 @@ class FarPlumes {
   // "the UPLOAD cap was", and the gate prints both.
   uint64_t RefusedChunks() const { return refusedChunks_; }
 
-  // Rebuild the upload list for the window at `windowOriginChunks`, dropping
-  // every emitter that is back inside the residency window (in-window fire
-  // makes REAL smoke through the CA, and counting it twice would put a second
-  // plume on top of the first) or outside the gasOuter box. Nearest to the
-  // window centre wins when more than kGasFarEmitMax survive.
+  // Rebuild BOTH upload sections for the window at `windowOriginChunks`,
+  // dropping every emitter that is back inside the residency window (in-window
+  // fire makes REAL smoke through the CA, and counting it twice would put a
+  // second plume on top of the first). What survives is then split by distance,
+  // in the MAX NORM from the window centre — the same metric the voxel/parcel
+  // crossfade uses, and for the same reason: it is exactly the half-extent at
+  // every point of all six faces, so the handover distance does not depend on
+  // which way the camera looks.
   //
-  // Cheap to call every tick: it returns immediately unless the index changed
-  // or the window moved, which are the only two things that can change the
-  // answer.
-  void Build(IVec3 windowOriginChunks);
+  //   < kWorldN voxels        the FINE section (gasOuter, 0.8 m cells)
+  //   >= kWorldN, <= rangeVox the WIDE section (gasFarOuter, 6.4 m cells),
+  //                           aggregated again per COARSE column
+  //
+  // The split is STRICT — no emitter is in both — which is what makes "no
+  // double-brightening" a property of the data rather than of a blend weight
+  // the renderer has to get right. `rangeVox` is render.farPlumeRange in
+  // voxels; 0 produces an empty wide section, which is the feature's exact off
+  // switch (no emitters, no row, no clear, no sampling).
+  //
+  // Cheap to call every tick: it returns immediately unless the index changed,
+  // the window moved, or the range changed — the only three things that can
+  // change the answer.
+  void Build(IVec3 windowOriginChunks, int32_t rangeVox);
 
-  // Emitters in the list Build() last produced.
+  // Emitters in each section of the list Build() last produced.
   uint32_t Count() const { return count_; }
+  uint32_t CountWide() const { return countWide_; }
 
   // Hand the caller the words to upload, ONCE per version. Returns false when
   // the buffer on the GPU already holds this list — which is every tick of a
@@ -133,10 +147,12 @@ class FarPlumes {
   static constexpr size_t kChunkCap = 4096;
   uint64_t refusedChunks_ = 0;
 
-  std::vector<uint32_t> words_;      // the upload image, header + records
-  uint32_t count_ = 0;               // emitters in it
+  std::vector<uint32_t> words_;      // the upload image, header + both sections
+  uint32_t count_ = 0;               // emitters in the fine section
+  uint32_t countWide_ = 0;           // emitters in the wide section
   uint32_t version_ = 0;             // bumped by every rebuild
   uint32_t uploadedVersion_ = 0;     // the version the GPU buffer holds
   bool dirty_ = true;                // the index changed since the last Build
   IVec3 builtOrigin_{INT32_MIN, INT32_MIN, INT32_MIN};
+  int32_t builtRange_ = -1;
 };

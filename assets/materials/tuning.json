@@ -802,6 +802,7 @@
     "gasBlendStart": 0.5,
     "farPlumeStrength": 1,
     "farPlumeHeight": 28,
+    "farPlumeRange": 409.6,
     "lodHandoffDist": 26,
     "renderScale": 1,
     "taa": 0,

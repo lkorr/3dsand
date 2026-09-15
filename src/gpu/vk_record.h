@@ -126,6 +126,10 @@ struct RecordCtx {
   // not recorded at all; it also decides, together with gasActive, whether the
   // density box is cleared (C_GASOUT).
   uint32_t gasFarEmitCount = 0;
+  // ...and the LONG-RANGE emitters (world.h kGasFarOuterN). 0 = no fire is in
+  // the 51.2 m..409.6 m band, and then neither the wide splat nor the wide
+  // box's clear is recorded.
+  uint32_t gasFarWideCount = 0;
   // Any loaded material authors a `repose` AND the CA has work this tick
   // (world.h kReposeSnap*). False for a materials.json with no repose line,
   // and then the snapshot prepass is not recorded at all.

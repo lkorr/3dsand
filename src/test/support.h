@@ -360,8 +360,12 @@ void ReadGasOuterAboveSync(GpuContext& ctx, World& world, int32_t worldY,
 //   ReadGasOuterBoxSync    the same box folded over ONE world-voxel box, for a
 //                          gate that has to say WHICH column the density is
 //                          over rather than only that there is some
+//   ReadGasFarOuterBoxSync the LONG-RANGE box (world.h kGasFarOuterN), same
+//                          shape of question one LOD out
 void ReadGasOuterBoxSync(GpuContext& ctx, World& world, IVec3 loVox,
                          IVec3 hiVox, uint32_t* outMax, uint64_t* outSum);
+void ReadGasFarOuterBoxSync(GpuContext& ctx, World& world, IVec3 loVox,
+                            IVec3 hiVox, uint32_t* outMax, uint64_t* outSum);
 uint32_t ReadActiveChunksSync(GpuContext& ctx, World& world, Simulation& sim);
 
 // THE CPU SEAM for gate voxel dumps (PLAN_page_table.md §2.1a, fifth site).

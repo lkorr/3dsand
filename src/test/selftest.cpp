@@ -282,6 +282,10 @@ const char* const kOrder[] = {
     // regenerates immediately, and regenerates again on the way out, so the
     // gates after it still find pristine terrain.
     "gas-farplume",
+    // ...and its long-range half, appended after it for the group's own
+    // stated reason. It builds the same kind of fixture 200 m out and
+    // regenerates on the way out, so it leaves the world as it found it.
+    "gas-farplume2",
     // The swing's OTHER half. `swing` up top is MeleeState alone and costs
     // milliseconds; this one stands an avatar on real terrain with the blade
     // drawn, spawns a dummy to cut, and measures the sword's world trajectory

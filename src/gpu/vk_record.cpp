@@ -130,6 +130,7 @@ bool Recorder::CondHolds(pass::Cond c, const RecordCtx& cx) {
     case pass::Cond::Glow:       return cx.glowChunks > 0;
     case pass::Cond::Gas:        return cx.gasActive;
     case pass::Cond::GasFarEmit: return cx.gasFarEmitCount > 0;
+    case pass::Cond::GasFarWide: return cx.gasFarWideCount > 0;
     // The union: whoever writes the density box this tick, its clear has
     // to run (pass_table.def's fill_gasOuter note).
     case pass::Cond::GasOuter:   return cx.gasActive || cx.gasFarEmitCount > 0;
@@ -170,6 +171,8 @@ uint32_t Recorder::Extent(uint32_t v, const RecordCtx& cx) {
     // it is (world.h kGasFarEmitMax).
     case pass::DispatchSel::GasFarEmitSel:
       return cx.gasFarEmitCount;
+    case pass::DispatchSel::GasFarWideSel:
+      return cx.gasFarWideCount;
     default:                          return v;
   }
 }

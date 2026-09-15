@@ -213,8 +213,15 @@ class Simulation {
   // the row exists at all. Latched rather than per-call because the emitter
   // list only changes when the world does, and the buffer keeps holding the
   // last list until it does.
-  void NoteFarPlumes(uint32_t count) { farPlumeCount_ = count; }
+  // `wide` is the LONG-RANGE list (world.h kGasFarOuterN), which is disjoint
+  // from `fine`: the CPU splits the surviving emitters by distance, so the two
+  // counts never describe the same fire.
+  void NoteFarPlumes(uint32_t fine, uint32_t wide) {
+    farPlumeCount_ = fine;
+    farPlumeWideCount_ = wide;
+  }
   uint32_t FarPlumeCount() const { return farPlumeCount_; }
+  uint32_t FarPlumeWideCount() const { return farPlumeWideCount_; }
   uint32_t GasLive() const { return gasLive_; }
   // NoteGasSeen: is there gas ANYWHERE the renderer would have to draw --
   // parcels outside the window OR gas voxels inside it. The second half is the
@@ -668,6 +675,8 @@ class Simulation {
   // Far fire plumes (world.h kGasFarEmitMax): a sixth gas entry point on the
   // same layout, whose only output is the render-only density box.
   rhi::ComputePipeline gFarPlume_;
+  // ...and its long-range sibling (world.h kGasFarOuterN).
+  rhi::ComputePipeline gFarPlumeW_;
   // Live only after PublishFarPipelines. Until then both are INVALID handles
   // and the recorder skips their rows (vk_record.cpp's null-pipeline continue).
   rhi::ComputePipeline farFill_, farPatchFill_, farDown_;
@@ -820,6 +829,7 @@ class Simulation {
   // list CHANGES, so the count is a standing fact about the buffer rather
   // than a count of this tick's inputs.
   uint32_t farPlumeCount_ = 0;
+  uint32_t farPlumeWideCount_ = 0;
   uint32_t gasIdleTicks_ = kGasIdleTicks;
   // fluidBG_ pages like particleBG_: binding 6 is THIS tick's particle write
   // page (next tick's read page), the splash droplets' destination. Binding 0

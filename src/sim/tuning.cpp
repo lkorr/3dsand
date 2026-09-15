@@ -2386,6 +2386,7 @@ bool LoadTuning(const std::string& path, Tuning& out) {
     ReadF(*g, "gasBlendStart", r.gasBlendStart, out, at);
     ReadF(*g, "farPlumeStrength", r.farPlumeStrength, out, at);
     ReadF(*g, "farPlumeHeight", r.farPlumeHeight, out, at);
+    ReadF(*g, "farPlumeRange", r.farPlumeRange, out, at);
     ReadF(*g, "lodHandoffDist", r.lodHandoffDist, out, at);
     ReadF(*g, "renderScale", r.renderScale, out, at);
     ReadI(*g, "taa", r.taa, out, at);
@@ -2577,6 +2578,16 @@ bool LoadTuning(const std::string& path, Tuning& out) {
     if (r.farPlumeHeight < 0.0f) { r.farPlumeHeight = 0.0f; }
     if (r.farPlumeHeight > (float)kWorldN * kVoxelMeters) {
       r.farPlumeHeight = (float)kWorldN * kVoxelMeters;
+    }
+    // The long-range reach, clamped to the box that holds it: half of
+    // (kGasFarOuterN << kGasFarOuterShift) voxels, in metres. Past that an
+    // emitter is outside the box and the splat would drop it anyway, so the
+    // clamp turns "does nothing" into "is the maximum".
+    if (r.farPlumeRange < 0.0f) { r.farPlumeRange = 0.0f; }
+    {
+      const float maxM =
+          (float)((kGasFarOuterN << kGasFarOuterShift) / 2) * kVoxelMeters;
+      if (r.farPlumeRange > maxM) r.farPlumeRange = maxM;
     }
     if (r.lodHandoffDist < 2.0f) { r.lodHandoffDist = 2.0f; }
     // A scale above 1 would be supersampling the most expensive shader in the

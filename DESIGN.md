@@ -1343,11 +1343,82 @@ nobody cleared is the direct positive observation that no gas row was recorded,
 where asserting zero density would have been satisfied by a row that ran and
 added nothing.
 
-**What it does not do.** The density box spans two window edges — ±51.2 m — so a
-fire further out than that is still silent. A coarser second box sampled in the
-raymarch's far segment is the next step; the emitter list header carries the box
-SHIFT it was built for (`kGasFarEmitHdr` word 1) so a second scale can consume
-the same records without either side guessing which box the other meant.
+**THE LONG-RANGE HALF (the same day; `gasFarPlumeWide`, `gasFarOuter`).** ±51.2 m
+is a sliver of what the cascade draws, so a fire 200 m out was still a silent
+orange smear. There is a second density box, identical in every respect except
+its cell size:
+
+* **128 cells of 64 voxels — 6.4 m cells over ±409.6 m.** The number this is
+  chosen FOR is the box edge: `128 << 6 = 8,192` voxels is **exactly far cascade
+  level 4's box edge** (`kFarN << (4 + kFarShiftBase)`, which reduces to
+  `16 * kWorldN` because the cascade's alignment constant makes
+  `kFarN << kFarShiftBase == kWorldN`). Matching a cascade box edge means the
+  plume LOD boundary and the terrain LOD boundary are the same distance instead
+  of two visible rings, and levels 5..8 sit behind the pinned fog at ~90% and up,
+  so there is nothing past it worth a third box. At the far edge a 6.4 m cell
+  still subtends ~16 px at 1080p. Same 4 MiB as its sibling.
+* **Its origin is FLOORED to the cell** and gasOuter's is not. The window origin
+  is a multiple of 16 voxels and this cell is 64, so without the floor the whole
+  lattice would slide 1.6 m sideways on every window shift and a settled plume
+  would visibly re-quantise as the player walked. It costs up to 48 voxels of
+  off-centreness out of ±409.6 m.
+* **The two emitter lists are DISJOINT**, split in the max norm at the fine box's
+  own half-extent, and they live in two sections of one buffer (the header words
+  reserved when the fine half landed now carry the wide count and the wide box's
+  shift). A fire is in one list or the other, never both — so "the two boxes
+  cannot double-brighten" is a property of the DATA rather than of a blend weight
+  the renderer has to get right, and the raymarch needs no crossfade at all: the
+  coarse segment simply starts where the fine box's ends.
+* **The wide list is aggregated AGAIN, per coarse column.** A 6.4 m cell holds up
+  to 8x8 fine columns in x/z and four chunks in y, so without it one burning
+  hillside would spend the whole 256-emitter budget on a patch 64 voxels across.
+  Aggregating also buys information the fine list does not have: the wide
+  emitter's strength is the SUM of its fine columns', so the kernel reads TWO
+  things out of it — density saturating at one full column (past that a fire is
+  not more opaque, it is bigger) and a height multiplier of `sqrt(columns)`
+  capped at 4. A burning tree is a wisp; a burning hillside is a column four
+  times as tall and proportionally wide.
+* **The shape is shared, and carried in METRES.** `plumeSplat` is one function
+  both kernels call; the radius and the height are metres divided by the box's
+  cell size at the point of use, because a radius in CELLS would make the same
+  fire eight times wider in the coarse box than in the fine one.
+* **The raymarch cost is a third segment of `gasOuterFill`**, 16 steps, gated on
+  its own `RenderParams` bit 5 rather than sharing bit 3 — a campfire ten metres
+  away arms bit 3 every frame and must not also put a second 4 MiB volume walk on
+  every terrain pixel. The samples fold into the SAME accumulator with **no scale
+  factor**: a cell's count over 512 is a volume FRACTION, a dimensionless number,
+  so `count * dt` is voxel-lengths of gas at either scale. Measured with
+  `--shader-stats`, before and after: the raymarch fragment stays at **128
+  registers, 160 bytes of local memory, pressure 160** — byte-identical spill —
+  and the binary grows 1,631,232 -> 1,632,512 (+0.08%). It was the only one of 97
+  executables to move at all.
+* **Cost:** one condition, `C_GASWIDE`, gates the wide splat AND the wide box's
+  clear — this box has exactly one writer, so "whoever writes it" and "the clear"
+  are the same predicate and there is nothing to union. `render.farPlumeRange` 0
+  empties the wide list CPU-side, and then no row is recorded, the 4 MiB box is
+  never cleared, the flag stays down and the coarse segment is not walked.
+
+**Gate:** `gas-farplume2`, the same fixture 204.8 m out. Its four claims are the
+near gate's, plus the one that is specific to having two boxes: the NEAR box must
+read exactly zero over the same column and the fine emitter count must be zero
+while the wide one is not — the disjointness asserted rather than assumed,
+without which a bug that put every emitter in both lists would pass the density
+claim. Its first run failed on an assertion the GATE had wrong, and the failure
+is worth recording: the no-emitter arm's box is NOT empty, because with no wide
+emitter there is no row and therefore no clear, so it still holds the previous
+arm's plume. Requiring `== 0` there would have required the clear to run in a
+world where the whole feature is off, which is exactly the per-tick cost rule 2
+forbids. What it asserts instead is that nothing arms, nothing is recorded and
+the box is untouched.
+
+**What it does not do.** Past ±409.6 m a fire is still silent, and deliberately:
+that band is behind ~90% fog. The handover between the two boxes is a STRICT
+switch rather than a crossfade, so a fire crossing 51.2 m as the window walks
+changes plume representation in one frame — bounded (both plumes are the same
+physical column, the cells differ) and the same class of transition the cascade
+itself makes at a level boundary. If it proves visible, the fix is a per-emitter
+weight so a shell of distance feeds both lists with complementary strengths; the
+record is full at four words, so that costs a fifth.
 
 ### MLS-MPM liquid (2026-08-22..23; `sim_fluid.wgsl` + `sim_fluid_seam.wgsl`, docs/PLAN_mpm_fluids.md)
 
