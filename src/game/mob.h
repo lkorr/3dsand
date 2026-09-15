@@ -3280,6 +3280,34 @@ class MobSystem {
   // driveAlignZero) so the drive can scale forward speed by it.
   float Steer(Mob& mob, const MobDef& def, float dt);
 
+  // ---- CREATURES DO NOT STAND INSIDE EACH OTHER ----------------------------
+  //
+  // A body's own footprint radius in WORLD voxels: the mean half-extent of its
+  // prefab box in x and z. Mean rather than max on purpose — `worldSize` is the
+  // ART's bounding box, so a rig with its arms out would otherwise claim a
+  // personal space the size of its wingspan.
+  static float BodyRadius(const MobDef& def);
+  // Centre of that footprint in world voxels (origin_ is the MIN CORNER).
+  static Vec3 BodyCentre(const Mob& mob, const MobDef& def);
+  // Sum of the crowding pushes from every other live mob inside the spacing
+  // radius, as a WORLD-space xz vector of magnitude 0..1 pointing away from the
+  // crowd. Zero when nothing is close, which is what keeps a lone creature —
+  // and every existing single-mob fixture — bit-for-bit as it was.
+  Vec3 CrowdPush(const Mob& self, const MobDef& selfDef) const;
+  // Fold that push into the mob's DRIVE (never its heading — anim.h
+  // LocomotionDef::spacingMul says why at length). Runs between DecideIntent
+  // and Steer: the AI has had its say about where to go, and this is the body
+  // declining to walk through another body on the way.
+  void ApplyCrowdSpacing(Mob& mob, const MobDef& def);
+  // Would a body of `def` centred at (cx, cz) be inside another mob? Used by
+  // the drive's move resolve as a hard floor under the soft push above.
+  // `allowIfFurther` is the escape hatch that makes this safe: a move which
+  // INCREASES separation is always legal, so two bodies that somehow start
+  // overlapped (a spawn on the same column, a teleport) push apart instead of
+  // welding together, and nothing can ever be permanently stuck.
+  bool BlockedByMob(const Mob& self, const MobDef& def, float cx,
+                    float cz) const;
+
   // Apply the resulting motion: settle onto the ground and translate along the
   // ACTUAL facing (never the desired one — that is what makes a turn arc).
   void DriveLocomotion(Mob& mob, const MobDef& def, const GroundSense& sense,

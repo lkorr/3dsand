@@ -243,6 +243,13 @@ const char* const kOrder[] = {
     // wants, and it leaves nothing behind: no ticks, no fire, and it resets
     // mobs and debris on both exits.
     "undead",
+    // Mob-vs-mob spacing. Next to `undead` and for the same reasons: it
+    // regenerates worldgen on the way in, ticks no fire and pours no acid,
+    // and resets mobs and debris on every exit. It also RESTORES the mob defs
+    // it edits for its control arm, which matters more than usual here --
+    // gates share one MobSystem, so a def left modified would retune every
+    // NPC gate after it.
+    "crowd",
     // Armour reactivity, right after `mob-burn` and for the same reasons: it
     // lights real fires and pours real acid at absolute coordinates, and it
     // regenerates the world on the way out so the gates after it still find

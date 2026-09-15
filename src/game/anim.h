@@ -178,6 +178,36 @@ struct LocomotionDef {
   // complaint. A real walker's torso stays near vertical; this is a lean, not
   // a surface alignment.
   float tiltMaxDeg = 14.0f;
+
+  // ---- PERSONAL SPACE (MobSystem::CrowdSpacing) ----------------------------
+  //
+  // Two creatures chasing one target converge on the SAME point, because that
+  // is what "walk at it" means and nothing downstream had an opinion about the
+  // other bodies in the way. The reported symptom is a pile: three duelists
+  // standing inside each other, one visible.
+  //
+  // The fix is a DRIVE, not a heading. That distinction is the whole design:
+  // folding separation into `desiredHeading_` would turn a fighter away from
+  // the thing it is fighting, and facing is what the stroke driver, the parry
+  // test and the attack arbiter all read. So a crowded mob SIDESTEPS — it
+  // keeps looking at its target and gives ground laterally, which is also what
+  // a person does — and only refuses forward drive when the thing it would
+  // walk into is directly ahead.
+  //
+  // A MULTIPLE OF THE BODIES' OWN SIZE rather than metres, unlike every budget
+  // above it. Those are terrain questions ("how big a ledge is a wall") and a
+  // ledge does not scale with the creature; this is a body question, and a
+  // critter inheriting a human's metre of personal space would refuse to enter
+  // a corridor it fits in three abreast. Spacing is `(rA + rB) * spacingMul`
+  // where r is each body's own footprint radius.
+  //
+  // 0 disables it: the mob neither pushes nor is pushed, and walks through
+  // crowds exactly as it did before.
+  float spacingMul = 1.6f;
+  // How hard a crowded body sidesteps, as a fraction of its own walk speed.
+  // Deliberately well under 1: separation is a lean, not a scramble, and a mob
+  // that spends its whole speed budget on spacing never closes with anything.
+  float crowdPush = 0.55f;
 };
 
 // Locomotion state selected by DISMEMBERMENT: each rule pairs a predicate over

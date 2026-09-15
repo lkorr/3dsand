@@ -5609,6 +5609,73 @@ a "fix" that hid props from queries too would pass everything else while
 silently deleting melee). `npc-block` pins the WIRING, because it is the one
 gate with an NPC standing in the world holding a real drawn blade.
 
+### Creatures do not stand inside each other (2026-09-15; `MobSystem::CrowdPush` / `ApplyCrowdSpacing` / `BlockedByMob`, `LocomotionDef::spacingMul`, gate `crowd`)
+
+Owner report: creatures chasing one target "bunch up into the same space and
+overlap". They did, and nothing in the locomotion pipeline had an opinion about
+it — "walk at the target" is exactly what each of them was told and the target
+is one point, so convergence is the correct answer to the question they were
+each asked. The missing constraint is that the other bodies exist.
+
+**Separation is a DRIVE, never a heading.** This is the whole design decision.
+Folding a repulsion vector into `desiredHeading_` is the textbook boids answer
+and it is wrong here: heading is what the stroke driver, the parry test and the
+attack arbiter all read, so a crowded duelist would turn away from the thing it
+is fighting in order to make room. Instead a crowded body **sidesteps** — it
+keeps facing its target and gives ground laterally, which is also what a person
+does — and the forward term is allowed only to **brake**, never to push. A
+crowd behind you must not shove you forward into the enemy you were circling.
+
+Two mechanisms, because either alone is wrong in a way the other is not:
+
+| | what it is | why it is not sufficient alone |
+|---|---|---|
+| `CrowdPush` | soft, a drive, runs between `DecideIntent` and `Steer` | a fast body crosses the spacing radius within one tick before the push acts |
+| `BlockedByMob` | hard, inside the drive's `fits()` move resolve | a blocked mob keeps trying, so bodies grind against invisible walls |
+
+Together they give way and then stop, which is what a crowd does. The hard rule
+sits in `fits()` specifically so the **existing wall-slide applies to it
+unchanged**: a body that cannot step straight into its neighbour tries each axis
+alone and slides around it, exactly as it already does to rock.
+
+`BlockedByMob` has one escape that makes it safe: **a move which increases
+separation is always legal.** Without it an overlap is a trap — two bodies that
+somehow start inside each other (spawned on one column, shoved together by
+terrain, teleported) would find every move refused and weld themselves in place
+forever. With it, overlap is self-correcting and nothing can be permanently
+stuck.
+
+Spacing is `(rA + rB) * spacingMul` where `r` is each body's own footprint
+radius — **a multiple of the bodies' own size, not metres**, unlike every other
+budget in `LocomotionDef`. Those are terrain questions ("how big a ledge is a
+wall") and a ledge does not scale with the creature; this is a body question,
+and a critter inheriting a human's metre of personal space would refuse to enter
+a corridor it fits in three abreast. The radius is the **mean** half-extent in
+x and z rather than the max, because `worldSize` is the ART's bounding box and a
+rig with its arms out would otherwise claim its wingspan. The hard floor is
+`rA + rB` (the bodies touching) rather than the full spacing radius: spacing is
+a preference the push expresses, contact is the geometry, and blocking at the
+preference would fence a duelist at arm's length from everything it wants to
+hit. `spacingMul = 0` disables both halves.
+
+Height separates too — bodies more than half a body height apart in ground level
+are on different storeys and ignore each other, which is self-scaling rather
+than a constant that rots when the voxel size moves. Limp ragdolls are excluded:
+a prone body is scenery, and the footprint model describes something standing.
+
+Cost is `kMaxMobs` (16) squared at worst — 120 pairs of two compares and a sqrt,
+cheaper than one ground probe, sleeping to nothing when bodies are apart. A
+spatial index at that bound would be a second source of truth about where
+creatures are for no measurable gain.
+
+Gate `crowd` is **two arms, and the second is the point**: four duelists
+converge on one target, and the control arm reruns the same fixture with
+`spacingMul` zeroed *in the def* — data only, no rebuild, no test-only code
+path. "No two bodies overlapped" is vacuously true of a fixture that never
+crowded them, so the control arm has to overlap badly before the result means
+anything. Measured: bodies touch at 3.38 voxels; **on**, the closest two ever
+came was 3.39 with zero overlap ticks; **off**, 0.80 with 13.
+
 ### Mob steering: intent vs actuation (2026-08-21; `game/mob.cpp`)
 
 Locomotion was one block that read the ground, snapped `heading += 90°` when

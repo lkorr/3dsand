@@ -4446,6 +4446,147 @@ uint64_t AiSpawn(Ctx& c, int defIndex, IVec3 at, const char* profile,
   return id;
 }
 
+// ---- crowd -----------------------------------------------------------------
+//
+// Owner report: creatures chasing one target "bunch up into the same space and
+// overlap". Four duelists are pointed at one actor from four sides and the
+// claim is that they end up AROUND it rather than inside each other.
+//
+// TWO ARMS, AND THE SECOND ONE IS THE POINT. "No two bodies overlapped" is
+// vacuously true of a fixture that never crowded them in the first place — a
+// spawn spread too wide, a target nobody reached, an AI that never closed. So
+// the control arm runs the SAME fixture with `spacingMul` zeroed in the def and
+// must overlap badly. A DATA-only control arm (no rebuild, no second binary,
+// no code path that exists for the test), which is the cheapest honest way to
+// prove a fixture measures its subject.
+Status GateCrowd(Ctx& c, std::string& detail) {
+  c.debris.Reset();
+  c.mobs.Reset();
+  SubmitWorldgen(c.ctx, c.world, c.sim, kDefaultSeed);
+  c.ctx.WaitIdle();
+
+  const int defIndex = AiHumanoidDef(c.mobs);
+  if (defIndex < 0) {
+    detail = "no mob def publishes a held_right socket";
+    return Status::Fail;
+  }
+  if (c.mobs.Behaviors().profiles.empty()) {
+    detail = "assets/mobs/behaviors.json loaded no profiles";
+    return Status::Fail;
+  }
+  // The pristine defs, kept so the control arm can be handed a modified copy
+  // and the gate can put the originals back on the way out. Gates share one
+  // World and one MobSystem (selftest.h kOrder), so leaving a def edited here
+  // would silently retune every NPC gate after this one.
+  const std::vector<MobDef> pristine = c.mobs.Defs();
+
+  int relief = 0;
+  const IVec3 anchor = AiFixtureCentre(c.world);
+  const IVec3 spot =
+      AiFlatSpot(anchor.x, anchor.z, 96, 16, kDefaultSeed, relief);
+
+  // One arm: spawn four duelists on the points of a compass around a target
+  // they all want, and report the closest two bodies ever got.
+  struct Arm {
+    float minGap = 1e9f;    // closest centre-to-centre distance seen, voxels
+    float minSep = 0.0f;    // the distance at which those two bodies touch
+    int overlapTicks = 0;   // ticks with ANY pair interpenetrating
+    int alive = 0;
+  };
+  auto runArm = [&](Arm& out) {
+    c.debris.Reset();
+    c.mobs.Reset();
+    const MobDef& def = c.mobs.Defs()[defIndex];
+    // Radius the engine itself uses, mirrored here rather than guessed: the
+    // gate must assert against the same geometry the feature enforces, or it
+    // is measuring a number of its own invention.
+    const float r = std::max(0.25f, 0.25f * (def.worldSize.x + def.worldSize.z));
+    out.minSep = 2.0f * r;
+    // Far enough out that they must CONVERGE to crowd (so the fixture tests
+    // approach, not just spawn placement), close enough to arrive inside the
+    // tick budget.
+    const int ring = std::max(8, (int)(out.minSep * 4.0f));
+    const int dxs[4] = {1, -1, 0, 0};
+    const int dzs[4] = {0, 0, 1, -1};
+    std::vector<uint64_t> ids;
+    std::string why;
+    for (int k = 0; k < 4; k++) {
+      const IVec3 at{spot.x + dxs[k] * ring, spot.y + 1, spot.z + dzs[k] * ring};
+      const uint64_t id = AiSpawn(c, defIndex, at, "duelist", why);
+      if (id != 0) ids.push_back(id);
+    }
+    // ONE target for all four: that is the whole scenario. Placed at the
+    // fixture centre so every duelist wants the same point.
+    c.mobs.SetPlayerActor(Vec3{(float)spot.x, (float)spot.y + 8.0f,
+                               (float)spot.z},
+                          3.0f, 17.0f, true);
+    AiTicker tick{c, 7000, {spot.x >> 4, spot.y >> 4, spot.z >> 4}};
+    const int ticks = (int)BaselineNumber("crowdTicks", 240);
+    for (int t = 0; t < ticks; t++) {
+      tick();
+      for (size_t a = 0; a < ids.size(); a++) {
+        if (!c.mobs.IsAlive(ids[a])) continue;
+        for (size_t b = a + 1; b < ids.size(); b++) {
+          if (!c.mobs.IsAlive(ids[b])) continue;
+          const Vec3 pa = c.mobs.MobOrigin(ids[a]);
+          const Vec3 pb = c.mobs.MobOrigin(ids[b]);
+          // Origins are MIN CORNERS of identical bodies, so the centre offset
+          // cancels and the origin delta IS the centre delta.
+          const float dx = pa.x - pb.x, dz = pa.z - pb.z;
+          const float d = std::sqrt(dx * dx + dz * dz);
+          out.minGap = std::min(out.minGap, d);
+          if (d < out.minSep) out.overlapTicks++;
+        }
+      }
+    }
+    for (uint64_t id : ids)
+      if (c.mobs.IsAlive(id)) out.alive++;
+    c.mobs.ClearPlayerActor();
+    c.mobs.ClearAttackRequests();
+  };
+
+  Arm on{};
+  runArm(on);
+
+  // ---- the control arm: the same fixture with spacing switched OFF --------
+  Arm off{};
+  {
+    std::vector<MobDef> noSpacing = pristine;
+    for (MobDef& d : noSpacing) d.skel.loco.spacingMul = 0.0f;
+    c.mobs.SetDefs(std::move(noSpacing));
+    runArm(off);
+    c.mobs.SetDefs(std::vector<MobDef>(pristine));
+  }
+
+  // A tolerance, not equality: the drive resolves in discrete steps and may
+  // end a tick a hair inside the touching distance before the next one pushes
+  // back out. Anything approaching a body's own radius is a real overlap.
+  const double slack = BaselineNumber("crowdOverlapSlackFrac", 0.12);
+  const float floorOn = on.minSep * (float)(1.0 - slack);
+  const bool spaced = on.alive == 4 && on.minGap >= floorOn;
+  // THE FIXTURE MUST ACTUALLY CROWD. If the control arm also stays apart, this
+  // gate is measuring nothing and says so rather than passing.
+  const bool crowdedWithout = off.minGap < on.minSep;
+  const bool better = on.minGap > off.minGap;
+
+  RecordObserved("crowdMinGapOn", on.minGap);
+  RecordObserved("crowdMinGapOff", off.minGap);
+  RecordObserved("crowdOverlapTicksOff", off.overlapTicks);
+
+  const bool ok = spaced && crowdedWithout && better;
+  detail = Format(
+      "touching at %.2f vox | ON min gap %.2f (>= %.2f), %d overlap ticks, "
+      "%d/4 alive | OFF min gap %.2f, %d overlap ticks | spaced %d, fixture "
+      "crowds %d, improved %d",
+      on.minSep, on.minGap, floorOn, on.overlapTicks, on.alive, off.minGap,
+      off.overlapTicks, spaced ? 1 : 0, crowdedWithout ? 1 : 0,
+      better ? 1 : 0);
+
+  c.debris.Reset();
+  c.mobs.Reset();
+  return ok ? Status::Pass : Status::Fail;
+}
+
 // ---- undead ----------------------------------------------------------------
 //
 // One gate for the whole of "a zombie is a human, differently" (mob.h
@@ -7083,6 +7224,11 @@ const std::vector<Gate>& MobGates() {
       // whose cuts do not close. Counts only, and no ticks at all — rot
       // happens inside Spawn.
       {"undead", "mob", {}, false, GateUndead, /*needsRender=*/false},
+      // Creatures give each other room instead of piling into one point.
+      // Two arms in one gate, the second with spacing zeroed IN THE DEF, so
+      // the fixture has to prove it crowds before "they did not overlap"
+      // means anything.
+      {"crowd", "mob", {}, false, GateCrowd, /*needsRender=*/false},
       // NPC AI. No render either: every claim is a distance, an angle or a
       // count, which is what makes them iterable with `--gate` alone.
       {"ai-dummy", "mob", {}, false, GateAiDummy, /*needsRender=*/false},

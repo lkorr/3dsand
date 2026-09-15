@@ -1371,6 +1371,13 @@ bool LoadMobDefs(const std::string& dir, const std::vector<MaterialDef>& mats,
         ld.stepDownM = l.value("stepDownM", ld.stepDownM);
         ld.headroomM = l.value("headroomM", ld.headroomM);
         ld.tiltMaxDeg = l.value("tiltMaxDeg", ld.tiltMaxDeg);
+        // Personal space. A MULTIPLE of the two bodies' own footprint radii,
+        // not metres — see the note in anim.h for why this one budget is not
+        // authored the way the terrain ones above it are.
+        ld.spacingMul = l.value("spacingMul", ld.spacingMul);
+        ld.crowdPush = l.value("crowdPush", ld.crowdPush);
+        if (ld.spacingMul < 0) ld.spacingMul = 0;
+        ld.crowdPush = std::clamp(ld.crowdPush, 0.0f, 1.0f);
         // A zero-width align band would divide by zero in the drive scale.
         if (ld.driveAlignZero <= ld.driveAlignFull)
           ld.driveAlignZero = ld.driveAlignFull + 1e-3f;
@@ -3602,6 +3609,158 @@ bool MobSystem::UpdateFall(Mob& mob, const MobDef& def,
 // if the body does not fit, try each axis alone. Sliding falls out of that —
 // a mob grazing a rock walks along it instead of stalling against it — and so
 // does climbing, because "fits" includes a legal step up onto the destination.
+// ---- locomotion stage 2.75: PERSONAL SPACE ---------------------------------
+//
+// Owner report: creatures chasing one target "bunch up into the same space and
+// overlap". They do, and nothing in the pipeline above had an opinion about it
+// — "walk at the target" is exactly what every one of them was told, and the
+// target is one point. Two mechanisms, deliberately, because one of them alone
+// is wrong in a way the other is not:
+//
+//   * CrowdPush is SOFT and it is a DRIVE. It makes a crowded body give ground
+//     laterally while still facing what it is fighting. This is the one that
+//     produces the LOOK the owner asked for — a ring around the target rather
+//     than a pile on it — and it is the one doing the work in practice.
+//   * BlockedByMob is HARD and lives in the drive's move resolve. It is the
+//     floor under the push: a body may not step into another body, whatever
+//     the steering wanted. Without it, a fast mob can still cross the spacing
+//     radius in one tick before the push has time to act.
+//
+// Soft alone leaves visible overlap in a scrum; hard alone reads as bodies
+// grinding against invisible walls, because a blocked mob keeps trying. Both
+// together give way and then stop, which is what a crowd does.
+float MobSystem::BodyRadius(const MobDef& def) {
+  return std::max(0.25f, 0.25f * (def.worldSize.x + def.worldSize.z));
+}
+
+Vec3 MobSystem::BodyCentre(const Mob& mob, const MobDef& def) {
+  return Vec3{mob.origin_.x + def.worldSize.x * 0.5f, mob.origin_.y,
+              mob.origin_.z + def.worldSize.z * 0.5f};
+}
+
+Vec3 MobSystem::CrowdPush(const Mob& self, const MobDef& selfDef) const {
+  const LocomotionDef& lo = self.skel_.loco;
+  if (lo.spacingMul <= 0.0f) return Vec3{};
+  const float rSelf = BodyRadius(selfDef);
+  const Vec3 cSelf = BodyCentre(self, selfDef);
+  Vec3 push{};
+  // kMaxMobs is 16, so this is at most 120 pairs of two compares and a sqrt —
+  // cheaper than one ground probe, and it sleeps to nothing the moment bodies
+  // are apart. Not worth a spatial index at this bound, and a grid here would
+  // be a second source of truth about where creatures are.
+  for (const Mob& other : mobs_) {
+    if (&other == &self) continue;
+    if (!other.alive_ || other.def_ == nullptr) continue;
+    // A limp body is lying down and is not part of a crowd — it is scenery,
+    // and the walk drive steps over prone things rather than round them.
+    if (other.ragdoll_ != Mob::RagdollPhase::None) continue;
+    const MobDef& od = *other.def_;
+    const float want = (rSelf + BodyRadius(od)) * lo.spacingMul;
+    if (want <= 0.0f) continue;
+    const Vec3 cOther = BodyCentre(other, od);
+    float dx = cSelf.x - cOther.x, dz = cSelf.z - cOther.z;
+    // HEIGHT IS A SEPARATOR TOO. Two creatures on floors ten voxels apart are
+    // not crowding each other, and without this a mob on a roof sidesteps away
+    // from one in the cellar. `origin_.y` is the MIN corner, so this compares
+    // the ground each is standing on; half a body height is generous enough to
+    // ignore a staircase and strict enough to separate storeys, and it scales
+    // with the creature instead of being a constant that rots when the voxel
+    // size moves.
+    if (std::abs(cSelf.y - cOther.y) > selfDef.worldSize.y * 0.5f) continue;
+    const float d2 = dx * dx + dz * dz;
+    if (d2 >= want * want) continue;
+    float len = std::sqrt(d2);
+    if (len < 1e-4f) {
+      // EXACTLY CO-LOCATED, which a normalize would turn into a NaN and a
+      // random jitter would turn into two bodies shoving each other the same
+      // way forever. Derived from the id pair instead, so the two disagree by
+      // construction: each takes the bearing its own id hashes to, and the
+      // lower id is flipped, so they leave along one line in opposite
+      // directions and a replay does it identically.
+      const uint32_t h = rng::Hash3((uint32_t)(self.id_ ^ other.id_), 0x5EAu, 0);
+      const float ang = (float)(h & 0xFFFFu) * (6.2831853f / 65536.0f);
+      const float s = self.id_ < other.id_ ? -1.0f : 1.0f;
+      dx = std::cos(ang) * s;
+      dz = std::sin(ang) * s;
+      len = 1.0f;
+    }
+    // Linear falloff: full strength when the centres coincide, nothing at the
+    // spacing radius. Linear rather than inverse-square on purpose — an
+    // inverse law is enormous at contact and makes a scrum explode.
+    const float w = (want - len) / want;
+    push.x += (dx / len) * w;
+    push.z += (dz / len) * w;
+  }
+  // The SUM is uncapped (three neighbours push three times as hard) but the
+  // result is not: a body surrounded on all sides would otherwise be asked for
+  // several times its own walk speed and would jitter.
+  const float m = std::sqrt(push.x * push.x + push.z * push.z);
+  if (m > 1.0f) { push.x /= m; push.z /= m; }
+  return push;
+}
+
+void MobSystem::ApplyCrowdSpacing(Mob& mob, const MobDef& def) {
+  const LocomotionDef& lo = mob.skel_.loco;
+  if (lo.spacingMul <= 0.0f || lo.crowdPush <= 0.0f) return;
+  const Vec3 push = CrowdPush(mob, def);
+  if (push.x == 0.0f && push.z == 0.0f) return;   // nobody near: costs nothing
+
+  // Into the mob's OWN frame, because that is the frame the drive works in and
+  // the two components mean different things there.
+  const Vec3 fwd{std::sin(mob.heading_), 0, std::cos(mob.heading_)};
+  const Vec3 rgt{std::cos(mob.heading_), 0, -std::sin(mob.heading_)};
+  const float lat = push.x * rgt.x + push.z * rgt.z;
+  const float ahead = push.x * fwd.x + push.z * fwd.z;
+
+  // THE LATERAL TERM IS THE FEATURE. It is added to the strafe rather than
+  // replacing it, so a duelist's authored footwork and its need for elbow room
+  // compose instead of one silently winning.
+  mob.driveStrafe_ = std::clamp(mob.driveStrafe_ + lat * lo.crowdPush, -1.0f,
+                                1.0f);
+
+  // THE FORWARD TERM ONLY EVER BRAKES. `ahead < 0` means the crowd is in front
+  // of me, so stop walking into it; `ahead > 0` means the crowd is BEHIND me,
+  // and using that to shove the body forward would be a creature fleeing its
+  // allies into the enemy it was circling. So: scale the forward drive down
+  // toward zero, never up, and never past a reverse.
+  if (ahead < 0.0f && mob.driveScale_ > 0.0f) {
+    const float brake = std::clamp(1.0f + ahead * lo.crowdPush, 0.0f, 1.0f);
+    mob.driveScale_ *= brake;
+  }
+}
+
+bool MobSystem::BlockedByMob(const Mob& self, const MobDef& def, float cx,
+                             float cz) const {
+  const LocomotionDef& lo = self.skel_.loco;
+  if (lo.spacingMul <= 0.0f) return false;
+  const float rSelf = BodyRadius(def);
+  const Vec3 cNow = BodyCentre(self, def);
+  for (const Mob& other : mobs_) {
+    if (&other == &self) continue;
+    if (!other.alive_ || other.def_ == nullptr) continue;
+    if (other.ragdoll_ != Mob::RagdollPhase::None) continue;
+    const MobDef& od = *other.def_;
+    const Vec3 cOther = BodyCentre(other, od);
+    if (std::abs(cNow.y - cOther.y) > def.worldSize.y * 0.5f) continue;
+    // THE HARD FLOOR IS THE BODIES TOUCHING, not the spacing radius. Spacing is
+    // a preference the push expresses; this is the geometry. Blocking at the
+    // full spacing radius would fence creatures apart at arm's length and stop
+    // a duelist ever reaching its target.
+    const float minSep = rSelf + BodyRadius(od);
+    const float ndx = cx - cOther.x, ndz = cz - cOther.z;
+    const float nd2 = ndx * ndx + ndz * ndz;
+    if (nd2 >= minSep * minSep) continue;          // no overlap there
+    const float odx = cNow.x - cOther.x, odz = cNow.z - cOther.z;
+    // ALWAYS ALLOW A MOVE THAT SEPARATES. Without this an overlap is a TRAP:
+    // two bodies that start inside each other (spawned on one column, shoved
+    // together by terrain, teleported) would find every move refused and weld
+    // themselves in place forever. This makes overlap self-correcting instead.
+    if (nd2 > odx * odx + odz * odz) continue;
+    return true;
+  }
+  return false;
+}
+
 void MobSystem::DriveLocomotion(Mob& mob, const MobDef& def,
                                 const GroundSense& sense, float align,
                                 float dt) {
@@ -3688,6 +3847,13 @@ void MobSystem::DriveLocomotion(Mob& mob, const MobDef& def,
   // now? Unknown footing is walkable (ai_nav.h rule 1) and keeps the height it
   // came from, so a creature is never fenced in by the edge of the CPU mirror.
   auto fits = [&](float nx, float nz, float& outStandY) {
+    // ANOTHER BODY IS A WALL. Tested FIRST and independently of the terrain
+    // footing, so the existing wall-slide below applies to it unchanged: a mob
+    // that cannot step straight into its neighbour tries each axis alone and
+    // slides around it, which is the same thing it already does to rock. The
+    // "may always move apart" escape in BlockedByMob is what stops this being
+    // a trap for bodies that are already overlapped.
+    if (BlockedByMob(mob, def, nx + hx, nz + hz)) return false;
     const Mob::Footing f =
         mob.FootprintFooting(*world_, def, nx + hx, nz + hz, mob.origin_.y);
     if (!f.known) {
@@ -4536,6 +4702,11 @@ void MobSystem::PreTick(uint32_t tick, World& world, std::vector<BrushOp>& ops,
       GroundSense sense = SenseGround(mob, def, world);
       const size_t attacksBefore = attacks_.size();
       DecideIntent(mob, def, sense, tick, dt);
+      // PERSONAL SPACE, between the intent and the steer. The AI has had its
+      // say about where to go; this is the body declining to walk through
+      // another body on the way, and it deliberately edits the DRIVE and not
+      // the heading — a fighter must keep facing what it is fighting.
+      ApplyCrowdSpacing(mob, def);
       float align = Steer(mob, def, dt);
       // Gravity first: a falling creature does not walk. UpdateFall may flip
       // the mob into a ragdoll mid-air, in which case this tick's pose is the
