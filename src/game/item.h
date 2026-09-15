@@ -6,6 +6,7 @@
 #include <vector>
 
 #include "game/anim.h"
+#include "game/impact.h"
 #include "sim/microbody.h"
 #include "sim/voxload.h"
 
@@ -361,10 +362,31 @@ struct ItemDef {
   bool hasEdgeFlat = false;
   Vec3 edgeFlat{0, 1, 0};
 
-  // ---- melee ----
-  // Damage per hit at full swing speed. Scaled by how fast the edge is
-  // actually travelling, so a lazy wave scratches and a committed cut opens.
-  float damage = 12.0f;
+  // ---- melee: WHAT A HIT IS MADE OF (game/impact.h) -----------------------
+  //
+  // THREE NUMBERS, NOT ONE. Until 2026-09-15 an item carried a single
+  // `damage` float and every weapon in the game therefore arrived as the same
+  // thing — a kerf — which is precisely why there was no mace and no fist.
+  // A profile says how much of a hit is a CUT, how much is BLUNT trauma, and
+  // (for a set of jaws) how much is a TEAR, and one resolver in
+  // MeleeSweepDamage does the right thing for all of them.
+  //
+  // `damage` IS `strike.cut` and the items.json KEY IS NOT RENAMED: four rows
+  // and a gate already spell it that way, and "damage" is still the honest
+  // name for the part of a blow that opens a wound. Everything at full swing
+  // speed, scaled by how fast the edge is really travelling, exactly as
+  // `damage` always was — melee.h note 2: SPEED IS THE DAMAGE.
+  //
+  // A WORN piece may carry one too (a gauntlet's `strike` block in its own
+  // sidecar): that is the profile that REPLACES the fist's when the fist
+  // under it swings, which is what makes "iron gauntlets cave a face in"
+  // content rather than a weapon kind.
+  StrikeProfile strike;
+  // The one number the readers that only ever wanted "how hard does this cut"
+  // still want (the hotbar tooltip, a gate's fabricated sweep). A method
+  // rather than a mirrored field, because a mirror is a second source of
+  // truth that goes stale the first time somebody sets one and not the other.
+  float Damage() const { return strike.cut; }
   // Extra carve radius beyond the blade's own authored halfWidth, world
   // voxels. This is the difference between a cut and a cleave; keep it small,
   // since the blade geometry is supposed to be what decides the wound.

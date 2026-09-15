@@ -3624,7 +3624,10 @@ function matchesQuery(tab,pr,g,q){
 // file is specifically the tuning.json parameter list, and the C++ side reads
 // these from a different struct entirely (ItemDef, not Tuning).
 const ITEM_BEHAVIOUR=[
-  {k:'damage',n:'Damage',d:'Damage per hit at a full-speed swing. Scaled by how fast the edge is actually travelling, so a lazy wave scratches and a committed cut opens.',min:0,max:60,step:0.5},
+  {k:'damage',n:'Damage (cut)',d:'THE CUT PART of a hit, at a full-speed swing — the kerf the blade opens. Scaled by how fast the edge is actually travelling, so a lazy wave scratches and a committed cut opens. The key is still called `damage` because it always was and because "damage" is still the honest name for the half of a blow that wounds; the engine reads it into StrikeProfile.cut (src/game/impact.h). A weapon with 0 here has no edge at all.',min:0,max:60,step:0.5},
+  {k:'blunt',n:'Blunt',d:'THE TRAUMA PART, in the same hp units and scaled the same way. This is what a mace is made of (16, against its 2 of cut) and what a sword has a token of (2): hp charged to the limb WITHOUT removing it, a bruise on the skin, and — crucially — never a dismemberment, however many blows land. Against worn armour it is the part that gets THROUGH: a share of it is transmitted to the limb under the plate whether or not the plate broke. The shapes it scales (bruise radius, dent radius, how much gets through) are on the Gore and Gear tuning tabs.',min:0,max:60,step:0.5},
+  {k:'bluntCarve',n:'Dent fraction',d:'How much of the tuning’s dent radius (Gore › "dent radius") a full-power blunt hit takes out of FLESH. 0 for a bare fist — a punch bruises and removes nothing — about 0.35 for an iron gauntlet, 0.6 for a mace. The dent is a radial crater soaked in the victim’s own gore, which is the "deletes voxels and replaces them with gore, caving a face in SLOWLY" the owner asked for; the collapse sever is refused for the whole blow, so it can never take the limb.',min:0,max:1,step:0.05},
+  {k:'armorBreak',n:'Armour break',d:'How much of the tuning’s plate-dent radius (Gear › "dent into plate") a full-power hit breaks out of a WORN SHELL, before the shell material’s own hardness scales it. 0 for a fist, 0.05 for a sword (an edge skates off plate), 0.8 for a mace. What comes off is real geometry, so the flesh it exposes is then reachable by the next blow, by fire and by acid — there is no armour-value number anywhere in this engine and there is not going to be one.',min:0,max:1,step:0.05},
   {k:'carveBonus',n:'Carve bonus',d:'Extra carve radius beyond the blade’s own authored halfWidth, in world voxels. The difference between a cut and a cleave — keep it small, since the blade geometry is meant to decide the wound.',min:0,max:2,step:0.05,u:'vox'},
   {k:'reach',n:'Reach',d:'Reach in world voxels from the shoulder, used to size the swing arc.',min:1,max:20,step:0.5,u:'vox'},
 ];
@@ -3636,8 +3639,40 @@ const ITEM_SIDECAR=[
   {k:'severImpactSpeed',n:'Sever impact speed',d:'A hit at or above this speed knocks the item loose regardless of hp. 0 = never severs on impact alone.',min:0,max:40,step:0.5},
 ];
 
+// A WORN PIECE THAT IS ALSO A WEAPON. Gauntlets: the fist inside them swings,
+// and what it swings with is the GAUNTLET’s profile, not the hand’s. Those
+// numbers do not belong in items.json — they are a fact about a piece of
+// armour, read only when a fist is thrown — so they live in the piece’s own
+// sidecar under a `strike` object, and these rows are NESTED: `k` is a dotted
+// path that itemNum walks (see itemPath below). Rows appear on every sidecar,
+// and a piece that has never had one gets the object created on first edit,
+// which is the same thing the grip and edge editors below do.
+const ITEM_SIDECAR_STRIKE=[
+  {k:'strike.blunt',n:'Blunt',d:'Trauma this piece delivers when the part it covers is used to strike, in the same hp units as a weapon’s. Iron gauntlets ship 9: rather more than a bare fist’s 4, and a long way short of a mace’s 16.',min:0,max:60,step:0.5},
+  {k:'strike.bluntCarve',n:'Dent fraction',d:'How much of the Gore tab’s dent radius a full-power hit takes out of flesh. A bare fist authors 0 and removes nothing; gauntlets 0.35, which is what turns punching from bruising into "caving a face in slowly".',min:0,max:1,step:0.05},
+  {k:'strike.armorBreak',n:'Armour break',d:'How much of the Gear tab’s plate-dent radius a punch breaks out of somebody else’s shell. 0.3 for iron gauntlets — a gauntleted fist is a small mace.',min:0,max:1,step:0.05},
+  {k:'strike.cut',n:'Cut',d:'A cutting part, for a piece with a blade on it (a spiked gauntlet, a bladed vambrace). 0 for everything shipped.',min:0,max:60,step:0.5},
+];
+
+// Walk a dotted `k` down an object, creating the intermediate objects. Returns
+// [holder, leafKey] so the editor can read and write through it exactly as it
+// does a flat row — which is the whole point: itemNum stays one function.
+function itemPath(obj,k){
+  const parts=k.split('.');
+  let o=obj;
+  for(let i=0;i<parts.length-1;i++){
+    if(typeof o[parts[i]]!=='object'||o[parts[i]]===null)o[parts[i]]={};
+    o=o[parts[i]];
+  }
+  return [o,parts[parts.length-1]];
+}
+
 function itemNum(host,obj,row,onEdit){
-  const cur=obj[row.k];
+  // NESTED ROWS. `row.k` may be a dotted path (`strike.blunt`), which is what a
+  // worn piece’s sidecar needs: the flat rows above and the nested ones share
+  // this one editor rather than growing a second copy of it.
+  const [hold,key]=itemPath(obj,row.k);
+  const cur=hold[key];
   const wrap=el('div',{class:'trow'});
   wrap.append(el('div',{class:'nm',title:row.k},
     el('span',{class:'dotc'}),el('span',{class:'txt'},row.n)));
@@ -3651,7 +3686,7 @@ function itemNum(host,obj,row,onEdit){
     // slider cannot represent (0.30000000000000004 and friends).
     if(row.step)n=Math.round(n/row.step)*row.step;
     n=parseFloat(n.toFixed(6));
-    obj[row.k]=n;
+    hold[key]=n;
     rng.value=n; if(!fromBox)box.value=n;
     onEdit();
   };
@@ -3774,6 +3809,19 @@ function renderItems(){
       for(const row of ITEM_SIDECAR){
         if(sc[row.k]===undefined)sc[row.k]=row.min;
         itemNum(scHost,sc,row,mark);
+      }
+
+      // The STRIKE block, for the pieces that are also weapons. Shown on every
+      // worn piece rather than only on the ones that already have the object,
+      // because "can I make these boots hurt" is a question the Items tab
+      // should be able to answer without hand-editing JSON.
+      if(Array.isArray(sc.cover)&&sc.cover.length){
+        scHost.append(el('div',{class:'tsec'},el('b',{},'Strikes with'),
+          el('span',{},'assets/items/'+it.id+'.json — what the part under this '+
+                       'piece hits with. A fist in a gauntlet swings the '+
+                       'GAUNTLET’s numbers, not the hand’s. All zero = this is '+
+                       'armour and nothing else.')));
+        for(const row of ITEM_SIDECAR_STRIKE)itemNum(scHost,sc,row,mark);
       }
 
       scHost.append(el('div',{class:'tsec'},el('b',{},'Grip'),

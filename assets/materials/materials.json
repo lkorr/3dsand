@@ -3114,7 +3114,8 @@
       ],
       "tags": [
         "mineral"
-      ]    },
+      ]
+    },
     {
       "comment": "The firm half of a sand cover. A powder cap laid on ground at or past the angle of repose avalanches out from under itself on the tick it is generated -- worldgen's job is to make matter AT REST -- so genCellIn lays SANDSTONE wherever the slope gate takes the loose depth to zero, and over the whole cap on a lake's berm wall, which the analytic noise slope cannot see at all. Sand's own colours a shade darker and greyer, so a cut bank reads as rock rather than as loose sand that forgot to fall. `far` aliases sand: at cascade distance a dune and the cliff behind it are one thing, and the 128 far palette slots were already full.",
       "id": "sandstone",
@@ -3136,6 +3137,96 @@
         "dissolvable"
       ],
       "molten": "molten_glass"
+    },
+    {
+      "//": "A BITE'S WOUND FLESH (docs/PLAN_impact_unarmed.md S6, game/impact.h). What a zombie's teeth leave behind in living meat: the material Mob::StainWoundAs rewrites exposed tissue to when the biter carries an infection, which is the same mechanism a cut uses to leave `blood` and charring uses to leave `flesh_charred`. It is a SOLID because it is flesh -- gone wrong, greenish and faintly luminous, but still the creature's own body, which is why it carves, burns and severs like any other tissue with no new code. It crumbles to `ichor` rather than to blood: what runs out of a rotten wound is not blood any more. The low emission is what sells 'rotten' at a glance in a dark room without a light source or a shader path -- it is the only glow field a material has (see `fire` at 255 and `acid` at 45). Far-aliased to `flesh`: at cascade distance a rotten arm and an arm are the same pixel, and the far palette is exactly full.",
+      "id": "rotflesh",
+      "class": "solid",
+      "density": 960,
+      "hardness": 5,
+      "rubble": "ichor",
+      "far": "flesh",
+      "colors": [
+        "#4a5c28",
+        "#3a4a1e",
+        "#5c7034"
+      ],
+      "emission": 70,
+      "tags": [
+        "flammable",
+        "organic",
+        "dissolvable"
+      ],
+      "molten": "fire"
+    },
+    {
+      "//": "WHAT RUNS OUT OF A ROTTEN WOUND. `rotflesh`'s rubble, and the liquid whose STAIN a zombie's bite smears over the hole it tore (BiteHit::infectStain) -- the same pairing `blood` has with the flesh that crumbles to it. Stain type \"rot\" takes palette slot 3, after wet (1) and blood (2), which is why these rows are appended rather than inserted. It does NOT wash, unlike water's: rinsing an infection off in a stream is not a thing that should work. Everything else is blood's own numbers at a slower, thicker value (moveEvery 3 against 2), because ichor is blood that has been sitting. Far-aliased to `acid`, the other dark green liquid in the table.",
+      "id": "ichor",
+      "arcane": 3,
+      "class": "liquid",
+      "density": 1030,
+      "hardness": 4,
+      "moveEvery": 3,
+      "opacity": 190,
+      "emission": 40,
+      "far": "acid",
+      "molten": "steam",
+      "colors": [
+        "#2c3f18",
+        "#1e2c10",
+        "#3d5524"
+      ],
+      "stain": {
+        "type": "rot",
+        "color": "#3f5a2a",
+        "amount": 5,
+        "chance": 90,
+        "consume": 6,
+        "washes": false
+      },
+      "coat": {
+        "decay": 40,
+        "shed": 300,
+        "effects": []
+      },
+      "tags": [
+        "organic",
+        "dissolvable"
+      ]
+    },
+    {
+      "//": "A PUNCH LEAVES A MARK (docs/PLAN_impact_unarmed.md S6). gore.bruiseMat's default, and the material a BLUNT hit rewrites skin to -- the third thing a wound can turn flesh into, beside blood and rot. Skin's own hardness and density, because it IS skin: only the colour has changed, so it burns on the same clock through the same authored chain and crumbles to the same blood. The `tints` list is the one real difference and it is the whole feature: a bruise is not one colour but an AGE -- fresh red-purple, then deep purple, then the green and yellow of one a few days old -- and the art-colour quantization picks the nearest entry to whatever complexion the voxel was painted, so a green-fleshed mob bruises greenish rather than snapping to human purple (the same rule skin / flesh_cooked follow, in the same order). It reverts to the skin it covered as the wound closes (gore.woundHealSlow, MobLimb::woundWas). Far-aliased to `skin`: a bruise is not visible at cascade distance.",
+      "id": "skin_bruised",
+      "class": "solid",
+      "density": 1010,
+      "hardness": 8,
+      "rubble": "blood",
+      "far": "skin",
+      "colors": [
+        "#6e3a52",
+        "#5a2d43",
+        "#824a63"
+      ],
+      "tints": [
+        "#6e3a52",
+        "#8a5570",
+        "#5e2c46",
+        "#43203a",
+        "#7a5a2e",
+        "#6b7038",
+        "#3a2430",
+        "#4a6040",
+        "#55606e",
+        "#7a4258",
+        "#4e3f70",
+        "#8a8046"
+      ],
+      "tags": [
+        "flammable",
+        "organic",
+        "dissolvable"
+      ],
+      "molten": "fire"
     }
   ]
 }

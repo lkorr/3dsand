@@ -199,6 +199,29 @@ Status GateCombatTuning(Ctx& c, std::string& detail) {
       {"combatfx", "fleshVolume", 1.21f, [](const Tuning& t) { return t.combatfx.fleshVolume; }},
       {"combatfx", "clangVolume", 1.31f, [](const Tuning& t) { return t.combatfx.clangVolume; }},
       {"combatfx", "cueRadius", 33.0f, [](const Tuning& t) { return t.combatfx.cueRadius; }},
+      // ---- THE OTHER TWO KINDS OF BLOW (game/impact.h) --------------------
+      // Every NUMERIC row of the blunt/bite model, on the same differential:
+      // write one key, require the loaded value to have moved. `gore.bruiseMat`
+      // is deliberately absent -- it is a STRING (the one name-typed row in
+      // tuning.json, resolved at use through MobSystem::MaterialIdNamed), and
+      // this table's whole mechanism is a float comparison.
+      //
+      // Each value is inside its clamp band and different from anything
+      // shipped, which is the rule the table's own note states: a probe that
+      // happened to equal the default would pass while measuring nothing.
+      {"gore", "bruiseRadius", 1.31f, [](const Tuning& t) { return t.gore.bruiseRadius; }},
+      {"gore", "bluntBleedScale", 0.21f, [](const Tuning& t) { return t.gore.bluntBleedScale; }},
+      {"gore", "bluntCarveRadius", 1.11f, [](const Tuning& t) { return t.gore.bluntCarveRadius; }},
+      {"gore", "biteRadius", 2.11f, [](const Tuning& t) { return t.gore.biteRadius; }},
+      {"gore", "biteBlob", 3.75f, [](const Tuning& t) { return t.gore.biteBlob; }},
+      {"gore", "biteStainScale", 2.25f, [](const Tuning& t) { return t.gore.biteStainScale; }},
+      {"gore", "infectHealSlow", 9.5f, [](const Tuning& t) { return t.gore.infectHealSlow; }},
+      {"gear", "bluntDentRadius", 2.11f, [](const Tuning& t) { return t.gear.bluntDentRadius; }},
+      {"gear", "bluntHardnessRef", 77.0f, [](const Tuning& t) { return t.gear.bluntHardnessRef; }},
+      {"gear", "bluntHardnessMin", 0.31f, [](const Tuning& t) { return t.gear.bluntHardnessMin; }},
+      {"gear", "bluntThrough", 0.71f, [](const Tuning& t) { return t.gear.bluntThrough; }},
+      {"gear", "bluntShellHp", 0.81f, [](const Tuning& t) { return t.gear.bluntShellHp; }},
+      {"gear", "biteOnShell", 0.41f, [](const Tuning& t) { return t.gear.biteOnShell; }},
   };
 
   // The probe file is written next to the real one so a relative path in the
@@ -238,7 +261,34 @@ Status GateCombatTuning(Ctx& c, std::string& detail) {
   }
   std::remove(probePath.c_str());
   check(wired == (int)(sizeof(kProbes) / sizeof(kProbes[0])),
-        "every melee/combatfx key reaches its field");
+        "every melee/combatfx/gore/gear key reaches its field");
+
+  // ---- A2. THE ONE NAME-TYPED ROW ------------------------------------------
+  //
+  // `gore.bruiseMat` names a MATERIAL rather than holding an id, for the
+  // reason its declaration gives at length (the two files hot-reload
+  // independently, so an id would be stale after either). The float
+  // differential above cannot see it, and a row nothing checks is a row that
+  // silently stops being read -- which is exactly the failure mode this whole
+  // gate exists for.
+  {
+    const std::string probePath =
+        sandvox::AssetDir() + "/materials/tuning.strprobe.json";
+    {
+      std::ofstream f(probePath);
+      f << "{\n  \"gore\": { \"bruiseMat\": \"probe_not_a_material\" }\n}\n";
+    }
+    Tuning probed;
+    check(LoadTuning(probePath, probed), "string probe parses");
+    std::remove(probePath.c_str());
+    check(probed.gore.bruiseMat == "probe_not_a_material",
+          "gore.bruiseMat reaches its field as a STRING");
+    // ...and the shipped value is a material that actually exists. A typo here
+    // costs no crash and no warning -- it costs every punch in the game its
+    // bruise, silently, which is the kind of thing only a gate ever notices.
+    check(!shipped.gore.bruiseMat.empty(),
+          "the shipped gore.bruiseMat names something");
+  }
 
   // ---- B. THE CLAMPS ARE REAL ----------------------------------------------
   //

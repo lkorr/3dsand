@@ -527,6 +527,21 @@ bool LoadTuning(const std::string& path, Tuning& out) {
     ReadF(*g, "cutHardnessMin", c.cutHardnessMin, out, at);
     if (c.cutHardnessRef < 0.0f) c.cutHardnessRef = 0.0f;
     c.cutHardnessMin = std::clamp(c.cutHardnessMin, 0.0f, 1.0f);
+    // ---- trauma against a shell (game/impact.h) ----------------------------
+    ReadF(*g, "bluntDentRadius", c.bluntDentRadius, out, at);
+    c.bluntDentRadius = std::clamp(c.bluntDentRadius, 0.0f, 8.0f);
+    ReadF(*g, "bluntHardnessRef", c.bluntHardnessRef, out, at);
+    if (c.bluntHardnessRef < 0.0f) c.bluntHardnessRef = 0.0f;
+    ReadF(*g, "bluntHardnessMin", c.bluntHardnessMin, out, at);
+    c.bluntHardnessMin = std::clamp(c.bluntHardnessMin, 0.0f, 1.0f);
+    ReadF(*g, "bluntThrough", c.bluntThrough, out, at);
+    // Above 1 would mean more energy reaching the body through a cuirass than
+    // without one, which is not a balance choice -- it is a sign error.
+    c.bluntThrough = std::clamp(c.bluntThrough, 0.0f, 1.0f);
+    ReadF(*g, "bluntShellHp", c.bluntShellHp, out, at);
+    c.bluntShellHp = std::clamp(c.bluntShellHp, 0.0f, 4.0f);
+    ReadF(*g, "biteOnShell", c.biteOnShell, out, at);
+    c.biteOnShell = std::clamp(c.biteOnShell, 0.0f, 1.0f);
   }
 
   if (const json* g = Find(j, "avatar")) {
@@ -816,6 +831,34 @@ bool LoadTuning(const std::string& path, Tuning& out) {
     ReadF(*g, "woundNeckRadius", e.woundNeckRadius, out, at);
     ReadF(*g, "woundNeckFraction", e.woundNeckFraction, out, at);
     ReadF(*g, "woundImpactSeverScale", e.woundImpactSeverScale, out, at);
+    // ---- E6. trauma and teeth (game/impact.h) -------------------------------
+    ReadF(*g, "bruiseRadius", e.bruiseRadius, out, at);
+    e.bruiseRadius = std::clamp(e.bruiseRadius, 0.0f, 8.0f);
+    // BY NAME, not by id -- see Tuning::Gore::bruiseMat for why. An empty
+    // string is legal and means "do not bruise"; an unknown name resolves to 0
+    // at use and means the same thing, so there is nothing to clamp here.
+    ReadStr(*g, "bruiseMat", e.bruiseMat, out, at);
+    ReadF(*g, "bluntBleedScale", e.bluntBleedScale, out, at);
+    e.bluntBleedScale = std::clamp(e.bluntBleedScale, 0.0f, 1.0f);
+    ReadF(*g, "bluntCarveRadius", e.bluntCarveRadius, out, at);
+    // Ceiling, not taste: a dent as wide as a limb stops being a dent and
+    // becomes an amputation by arithmetic, which is the one thing a blunt hit
+    // must never be (Mob::BluntCarveScope).
+    e.bluntCarveRadius = std::clamp(e.bluntCarveRadius, 0.0f, 4.0f);
+    ReadF(*g, "biteRadius", e.biteRadius, out, at);
+    e.biteRadius = std::clamp(e.biteRadius, 0.0f, 8.0f);
+    ReadF(*g, "biteBlob", e.biteBlob, out, at);
+    // Floored at the same 0.5 the crater's and rot's blob sizes are: below one
+    // lattice cell the correlated field degenerates to white noise and the
+    // tear goes back to being speckle (see ValueNoise3).
+    e.biteBlob = std::max(e.biteBlob, 0.5f);
+    ReadF(*g, "biteStainScale", e.biteStainScale, out, at);
+    e.biteStainScale = std::clamp(e.biteStainScale, 0.0f, 8.0f);
+    ReadF(*g, "infectHealSlow", e.infectHealSlow, out, at);
+    // Floored at 1 for the reason woundHealSlow is: a divisor below 1 would
+    // make rot decay FASTER than the puddle rule it is dividing, and 0 is a
+    // division by zero rather than "never heals" (that is `woundHeals` off).
+    e.infectHealSlow = std::clamp(e.infectHealSlow, 1.0f, 512.0f);
     // ---- F. blood is health / G. burns cap health (game/mob.h) -------------
     ReadF(*g, "bleedHpPerVoxel", e.bleedHpPerVoxel, out, at);
     ReadB(*g, "stumpBleedsOpen", e.stumpBleedsOpen, out, at);

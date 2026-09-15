@@ -471,6 +471,40 @@ def build_boots(per_limb, occ):
     return out
 
 
+def build_gauntlets(per_limb, occ):
+    """Hand, plus a short cuff up the forearm.
+
+    THE SAME SHAPE AS A BOOT, and for the same reason: a hand and a foot are
+    both a stub at the end of a limb, so capping one with a per-z `tube` leaves
+    the identical hole -- the forearm stands in the middle of the cap, the body
+    subtraction removes exactly the part of the lid it passes through, and bare
+    skin shows between the glove and the sleeve. A full 26-dilation has no face
+    it does not generate, and the cuff closes the seam where the arm leaves it.
+
+    A GAUNTLET IS ALSO A WEAPON, which is what makes this piece different from
+    every other one in this file. Its sidecar carries a `strike` block
+    (src/game/item.h ItemDef::strike), and when the fist inside it swings, that
+    profile is what the blow is made of -- "with iron gauntlets it also deletes
+    voxels and replaces them with gore, caving a face in SLOWLY", in the
+    owner's words, as four numbers rather than as a weapon KIND.
+
+    The cuff cells belong to the HAND's shell and rotate with the wrist. At two
+    authored micro -- half a world voxel -- the flex is smaller than one
+    collider cell, and putting them on the forearm instead would mean the
+    gauntlets covered a limb their cover entry does not name."""
+    out = {}
+    arms = {"hand.L": "armL.L", "hand.R": "armL.R"}
+    for hand, forearm in arms.items():
+        cells = per_limb[hand]
+        # The hands hang at the BOTTOM of the arm chain, so the seam with the
+        # forearm is at HIGH z (gen_human's figure stands with arms down).
+        z1 = max(c[2] for c in cells)
+        shell = dilate26(cells, occ)
+        shell |= tube(per_limb[forearm], occ, 1, zlo=z1 + 1, zhi=z1 + 2)
+        out[hand] = shell
+    return out
+
+
 # ---- colour -----------------------------------------------------------------
 
 def shade(cells, base, dark):
@@ -616,7 +650,22 @@ def main():
          build_pants(per_limb, occ)),
         ("iron_sabatons", "armor_boots", IRON_MAT, (IRON, IRON_SHADE), 32.0,
          build_boots(per_limb, occ)),
+        ("iron_gauntlets", "armor_hands", IRON_MAT, (IRON, IRON_SHADE), 24.0,
+         build_gauntlets(per_limb, occ)),
     ]
+    # Which pieces are also weapons, by name, and what they hit with. Kept
+    # beside the table rather than in it so the other nine rows do not grow a
+    # column of `None` -- and by NAME because that is what the sidecar key is.
+    #
+    # THE NUMBERS. blunt 9 sits between a bare fist's 4 (assets/mobs/human.json
+    # `natural`, package B) and a mace's 16: a gauntleted punch is a small mace.
+    # bluntCarve 0.35 against a mace's 0.6 is the "caving a face in SLOWLY"
+    # half -- voxels really leave, a few per blow. armorBreak 0.3 means an
+    # armoured fist beats another man's plate in, slower than a mace and not
+    # at all like a sword's 0.05.
+    STRIKES = {
+        "iron_gauntlets": {"blunt": 9.0, "bluntCarve": 0.35, "armorBreak": 0.3},
+    }
 
     rows = []
     for name, kind, mat, (base, dark), hp, shells in pieces:
@@ -691,6 +740,8 @@ def main():
             "severable": True,
             "cover": sorted(cover, key=lambda c: c["part"]),
         }
+        if name in STRIKES:
+            sidecar["strike"] = STRIKES[name]
         with open(os.path.join(out_dir, name + ".json"), "w") as f:
             json.dump(sidecar, f, indent=2)
             f.write("\n")
@@ -740,6 +791,11 @@ ITEM_DESC = {
                     "fireproof, and slow to dissolve.",
     "iron_sabatons": "Iron shoes with an ankle cuff. What a spill of acid "
                      "meets first, and what it gets through last.",
+    "iron_gauntlets": "Articulated iron over the back of each hand, with a "
+                      "cuff to the wrist. They will not stop much on their "
+                      "own; what they change is what your fists are for. A "
+                      "bare hand bruises. These cave a face in, a little at "
+                      "a time, and beat another man's plate while they do it.",
 }
 
 if __name__ == "__main__":

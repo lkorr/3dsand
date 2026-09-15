@@ -8364,7 +8364,9 @@ int main(int argc, char** argv) {
             sw.flatNow = ef;
             sw.dt = kTickDt;
             sw.halfWidth = ehw;
-            sw.damage = heldItem->damage;
+            // The whole profile, not a number (game/impact.h): a sword fills
+            // only `cut` and behaves exactly as it did, a mace fills `blunt`.
+            sw.strike = heldItem->strike;
             sw.carveBonus = heldItem->carveBonus;
             // HEFT: the weapon's own volume against the reference, so a
             // greatsword cuts deeper than a knife because it IS bigger
@@ -9833,7 +9835,7 @@ int main(int argc, char** argv) {
           if (d->kind == ItemKind::Melee) {
             std::snprintf(tip, sizeof tip,
                           "%.0f damage at full speed\n%.1f voxel reach%s",
-                          d->damage, d->reach,
+                          d->strike.cut, d->reach,
                           d->hasEdge ? "\ncuts along its own edge" : "");
             u.tip = tip;
           }

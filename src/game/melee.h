@@ -544,7 +544,20 @@ struct EdgeSweep {
   Vec3 flatNow{};          // blade's flat normal now, world; zero = unauthored
   float dt = 1.0f / 60.0f; // seconds the sweep covers (tip speed comes from it)
   float halfWidth = 0;     // carve radius, world voxels
-  float damage = 0;        // the item's damage at full swing speed
+  // WHAT THIS BLOW IS MADE OF (game/impact.h StrikeProfile): a CUT part, a
+  // BLUNT part and a BITE part, each at full swing speed and each scaled by
+  // the same `power` the bare `damage` float this replaced always was.
+  //
+  // A PROFILE RATHER THAN A NUMBER, because the sweep is the one place all
+  // three can be resolved against the same struck thing: a mace must break
+  // the plate AND bruise the arm under it in one pass, and a bite must be
+  // refused its infection by the armour it did not get through. Splitting
+  // that into three sweeps would mean three probe walks, three parry tests
+  // and three chances for them to disagree about what was hit.
+  //
+  // A sword fills only `cut` (plus a token `blunt`), so a caller that ports
+  // `damage` straight onto `strike.cut` gets byte-identical behaviour.
+  StrikeProfile strike;
   float carveBonus = 0;    // extra carve radius beyond the blade's own
   // HOW MUCH WEAPON IS BEHIND THE EDGE, dimensionless (item.h
   // ItemDef::HeftFactor: the item's own voxel volume against

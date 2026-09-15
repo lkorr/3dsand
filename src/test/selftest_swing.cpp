@@ -1863,7 +1863,7 @@ Status GateSwingPlane(Ctx& c, std::string& detail) {
           sw.flatNow = b.flat;
           sw.dt = kTickDt;
           sw.halfWidth = sword->edgeHalfWidth;
-          sw.damage = sword->damage;
+          sw.strike = sword->strike;
           sw.carveBonus = sword->carveBonus;
           // The SHIPPED sword's heft, not the neutral default: the kerf's
           // depth scales with it, so a gate that left it at 1 would be
@@ -2017,7 +2017,7 @@ Status GateSwingPlane(Ctx& c, std::string& detail) {
       sw.flatNow = edgeOn ? Vec3{0, 1, 0} : Vec3{1, 0, 0};
       sw.dt = kTickDt;
       sw.halfWidth = sword->edgeHalfWidth;
-      sw.damage = sword->damage;
+      sw.strike = sword->strike;
       sw.carveBonus = sword->carveBonus;
       // Same sword, same tick seed in both arms — the whole point of the pair
       // is that they differ ONLY in the blade's roll, and the kerf's seed and

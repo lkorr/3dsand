@@ -1,6 +1,6 @@
 {
   "comment": "Items are CONTENT, like materials.json and glyphs.json \u00e2\u20ac\u201d not look-and-feel knobs like tuning.json. This file holds an item's BEHAVIOUR: its id, the kind the engine switches on, and its damage numbers. THE ART IS NOT HERE, and it is not part of any creature either: each item owns <id>.vox plus an <id>.json sidecar carrying its grip and its cutting edge. A held item BORROWS a rig slot, so while worn it is a real rig part \u00e2\u20ac\u201d severable with the arm, droppable as debris, carvable per voxel \u00e2\u20ac\u201d but its geometry has its own origin, so a weapon can never inflate the box of the body holding it. That was a real bug: as a rig prop the sword reached 30 micro outside mina's prefab box and drew her body offset from her own arm. Hot-reloads on R alongside materials and glyphs.",
-  "kinds": "melee = swung, and cuts along the `edge` segment its own sidecar declares (see scripts/gen_sword_item.py). The blade geometry is what decides the wound; `carveBonus` only widens it.",
+  "kinds": "melee = swung, and cuts along the `edge` segment its own sidecar declares (see scripts/gen_sword_item.py). The blade geometry is what decides the wound; `carveBonus` only widens it. A HIT IS THREE PARTS (src/game/impact.h): `damage` is the CUT part (the key is not renamed -- it is still the honest name for the half of a blow that opens a wound), `blunt` is trauma that charges hp and bruises without ever dismembering, and `bite` is a tear (authored on creatures, not on items). `bluntCarve` and `armorBreak` are 0..1 fractions of a tuning radius -- how much of gore.bluntCarveRadius a blow dents out of flesh, and how much of gear.bluntDentRadius it breaks out of a worn shell. That is why a mace beats plate and a sword does not.",
   "items": [
     {
       "id": "sword",
@@ -8,6 +8,8 @@
       "damage": 14.0,
       "carveBonus": 0.15,
       "reach": 9.0,
+      "blunt": 2.0,
+      "armorBreak": 0.05,
       "desc": "A straight double-edged arming sword. Held point-up; it cuts with the length of its blade, so where you land it is where the wound opens."
     },
     {
@@ -16,14 +18,17 @@
       "damage": 20.0,
       "carveBonus": 0.25,
       "reach": 11.0,
+      "blunt": 4.0,
+      "armorBreak": 0.1,
       "desc": "A two-handed cleaver, wide at the tip and heavy with it. It is not quicker than a sword and it is not subtler; it simply arrives with more behind the edge, and takes a limb in a third of the blows."
     },
     {
       "id": "shortsword",
       "kind": "melee",
       "damage": 10.0,
-      "carveBonus": 0.10,
+      "carveBonus": 0.1,
       "reach": 7.5,
+      "blunt": 1.0,
       "desc": "Two feet of straight double-edged blade on a one-hand grip. It gives up the arming sword's last third of reach and about a third of its weight with it, and hands back a weapon you can still swing inside somebody's guard."
     },
     {
@@ -32,7 +37,19 @@
       "damage": 6.5,
       "carveBonus": 0.04,
       "reach": 6.5,
+      "blunt": 1.0,
       "desc": "A hand's length of point, and barely a fifth of the sword behind it. It will not take an arm off in one pass and it was never going to; what it does is open the same wound over and over while standing closer than a sword can answer."
+    },
+    {
+      "id": "mace",
+      "kind": "melee",
+      "damage": 2.0,
+      "blunt": 16.0,
+      "bluntCarve": 0.6,
+      "armorBreak": 0.8,
+      "carveBonus": 0.0,
+      "reach": 8.0,
+      "desc": "A flanged head on a short wrapped haft. It has almost no edge and does not want one: what it does is arrive, and a man in plate is still a man with a plate-shaped dent in him. Against an unarmoured body it bruises and caves rather than opening, so it will hammer somebody to death without ever taking an arm off."
     },
     {
       "id": "hood",
@@ -78,6 +95,11 @@
       "id": "iron_sabatons",
       "kind": "armor_boots",
       "desc": "Iron shoes with an ankle cuff. What a spill of acid meets first, and what it gets through last."
+    },
+    {
+      "id": "iron_gauntlets",
+      "kind": "armor_hands",
+      "desc": "Articulated iron over the back of each hand, with a cuff to the wrist. They will not stop much on their own; what they change is what your fists are for. A bare hand bruises. These cave a face in, a little at a time, and beat another man's plate while they do it."
     }
   ]
 }
