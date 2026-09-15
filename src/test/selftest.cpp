@@ -275,6 +275,13 @@ const char* const kOrder[] = {
     // gates and the same class of perturbation; `sleep` wants a world nobody
     // has thrown 4,096 gas voxels into.
     "gas-leave", "gas-reenter",
+    // ...and the far fire plumes, APPENDED to that group rather than spliced
+    // into it (CLAUDE.md rule 7: a new gate in a shared-World suite goes last
+    // in its group, so it inherits state instead of changing what everything
+    // after it inherits). It paints one chunk of ember, harvests the words,
+    // regenerates immediately, and regenerates again on the way out, so the
+    // gates after it still find pristine terrain.
+    "gas-farplume",
     // The swing's OTHER half. `swing` up top is MeleeState alone and costs
     // milliseconds; this one stands an avatar on real terrain with the blade
     // drawn, spawns a dummy to cut, and measures the sword's world trajectory

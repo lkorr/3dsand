@@ -10,6 +10,7 @@
 #include <thread>
 
 #include "gpu/resources.h"
+#include "sim/farplumes.h"  // FarPlumes::SetMaterials (what a frozen fire is)
 #include "sim/pagetable.h"
 #include "sim/renderspec.h"  // LastRenderSpec(): which raymarch variant this frame takes
 #include "sim/tuning.h"      // fluidExciteMode gates the seam recording
@@ -358,6 +359,11 @@ bool Simulation::Init(const rhi::Device& device, World& world,
         entry(8, T::Uniform),          // FarParams (the cascade origins)
         entry(9, T::ReadOnlyStorage),  // reactions: the RK_DECAY bucket
         entry(10, T::ReadOnlyStorage), // gasSpawnOps (CPU-authored spawns)
+        // The far fire-plume emitter list (world.h kGasFarEmitMax). In THIS
+        // group rather than a group of its own because the kernel that reads
+        // it writes gasOuter, which is binding 6 here -- one more read-only
+        // entry against a whole extra layout to bind.
+        entry(11, T::ReadOnlyStorage), // gasFarEmit
     };
     gasBGL_ = device.CreateBindGroupLayout(gentries, std::size(gentries));
 
@@ -637,6 +643,7 @@ bool Simulation::Init(const rhi::Device& device, World& world,
         b(8, world_->farUBO),
         b(9, reactionBuf_),
         b(10, world_->gasSpawnOps),
+        b(11, world_->gasFarEmit),
     };
     gasBG_[page] =
         device.CreateBindGroup(gasBGL_, gentries, std::size(gentries), "gasBG");
@@ -1042,6 +1049,12 @@ void Simulation::UploadTables(const rhi::Queue& queue,
     // entries to answer a constant would be the thing rule 2 is about.
     if (mats[i].gpu.repose != 0) anyRepose_ = true;
   }
+  // WHAT A FROZEN FIRE IS MADE OF, latched here for anyRepose_'s reason and at
+  // the same instant: it is a property of the authored table, it changes only
+  // on a materials reload, and a reload comes back through this function. The
+  // far fire-plume index (src/sim/farplumes.h) asks this per evicted voxel and
+  // must not be scanning tag STRINGS to do it.
+  FarPlumes::SetMaterials(mats);
 
   // Mirror the stain palette into the reserved top entries (kStainPaletteBase,
   // materials.h): the renderer maps a voxel's 3-bit stain TYPE to a colour by
@@ -1504,6 +1517,7 @@ bool Simulation::BuildPipelines(const rhi::Device& device, std::string* err) {
   pool.Add([&] { gIntegrate_ = MakeComputePipeline(device, gasPL_, mGas, "gasIntegrate", "gasIntegrate"); });
   pool.Add([&] { gArgs2_ = MakeComputePipeline(device, gasPL_, mGas, "gasArgs2", "gasArgs2"); });
   pool.Add([&] { gResolve_ = MakeComputePipeline(device, gasPL_, mGas, "gasResolve", "gasResolve"); });
+  pool.Add([&] { gFarPlume_ = MakeComputePipeline(device, gasPL_, mGas, "gasFarPlume", "gasFarPlume"); });
 
   pool.Add([&] { fluidMark_ = MakeComputePipeline(device, fluidPL_, mFluid, "mark", "fluidMark"); });
   pool.Add([&] { fluidAlloc_ = MakeComputePipeline(device, fluidPL_, mFluid, "alloc", "fluidAlloc"); });
@@ -1834,6 +1848,11 @@ struct RecordCtx {
   bool vizActive = false;
   // Gas particles (docs/PLAN_gas_particles.md). See the latch in EncodeTick.
   bool gasActive = false;
+  // Far fire-plume emitters this tick (world.h kGasFarEmitMax). Mirrors
+  // rhi::TableCtx. Zero on every tick of a world with no evicted fire in
+  // range, and then the splat row records NOTHING -- and the density box's
+  // clear falls back to the parcel latch alone, exactly as before.
+  uint32_t gasFarEmitCount = 0;
   // Angle of repose (world.h kReposeSnap*). See the latch in EncodeTick.
   bool reposeActive = false;
 };
@@ -1933,6 +1952,7 @@ const rhi::Buffer& Simulation::PassBuffer(pass::Buf b) const {
     case B::GasArgsStage:        return world_->gasArgs;
     case B::GasDispatchArgs:     return world_->gasDispatchArgs;
     case B::GasOuter:            return world_->gasOuter;
+    case B::GasFarEmit:          return world_->gasFarEmit;
     case B::ReposeSnap:          return world_->reposeSnap;
     default:                return world_->voxels;
   }
@@ -1961,6 +1981,7 @@ const rhi::ComputePipeline& Simulation::PassPipeline(pass::Pipe p) const {
     case P::GasIntegrate:   return gIntegrate_;
     case P::GasArgs2:       return gArgs2_;
     case P::GasResolve:     return gResolve_;
+    case P::GasFarPlume:    return gFarPlume_;
     case P::PArgs1:         return pArgs1_;
     case P::PSpawn:         return pSpawn_;
     case P::PIntegrate:     return pIntegrate_;
@@ -2058,6 +2079,7 @@ void Simulation::RecordTable(const rhi::CommandEncoder& enc, pass::Table which,
   tc.caActive = cx.caActive;
   tc.vizActive = cx.vizActive;
   tc.gasActive = cx.gasActive;
+  tc.gasFarEmitCount = cx.gasFarEmitCount;
   tc.reposeActive = cx.reposeActive;
 
   rhi::TableBindings tb{};
@@ -2506,6 +2528,22 @@ void Simulation::EncodeTick(const rhi::CommandEncoder& enc, uint32_t opsCount,
                            gasLive_ > 0 || gasIdleTicks_ < kGasIdleTicks);
   gasSpawnsThisTick_ = 0;
 
+  // ---- C_GASFAR: the frozen fires, which are NOT a parcel population -------
+  //
+  // A fire the residency window has left behind smokes through a synthesized
+  // splat (world.h kGasFarEmitMax), not through the parcel pool — so it gets
+  // its own condition and deliberately does NOT arm cx.gasActive. Arming that
+  // would record all five parcel rows, and gasSpawnStep alone is a fixed
+  // 1,042-workgroup dispatch over both spawn lists whether or not anything is
+  // in them. A distant fire burning for an hour would pay that every tick for
+  // a population of zero, which is precisely what rule 2 forbids.
+  //
+  // `render.farPlumeStrength` 0 is an EXACT off switch on the same terms
+  // sim.gasMode 0 is: the count goes to zero, the row is not recorded, and the
+  // clear falls back to the parcel latch alone.
+  cx.gasFarEmitCount =
+      CurrentTuning().render.farPlumeStrength > 0.0f ? farPlumeCount_ : 0u;
+
   // ---- the repose snapshot prepass ----------------------------------------
   // `anyRepose_` is a property of the MATERIAL TABLE, latched in UploadTables,
   // so a world whose materials.json carries no `repose` line never records the
@@ -2526,8 +2564,17 @@ void Simulation::EncodeTick(const rhi::CommandEncoder& enc, uint32_t opsCount,
   // and holds for kGasSeenTicks past the last snapshot that saw either. When
   // the plume is really gone the flag drops and raymarch.wgsl skips the fade,
   // the band and the fold entirely. See renderspec.h.
+  //
+  // A FROZEN FIRE ARMS IT DIRECTLY, with no hold: unlike a parcel population,
+  // the emitter list is a CPU-side fact the CPU already has in hand this tick,
+  // so there is nothing latent to cover. If emitters exist the box is being
+  // written and must be sampled; when the last one leaves range the flag drops
+  // on the same tick the splat stops, which is exactly right — there is no
+  // frame on which the box holds a plume the renderer is told to ignore, and
+  // none on which it is told to read a box nobody cleared.
   if (gasSeenHold_ > 0) gasSeenHold_--;
-  sandvox::SetGasRenderActive(gasOn && gasSeenHold_ > 0);
+  sandvox::SetGasRenderActive((gasOn && gasSeenHold_ > 0) ||
+                              cx.gasFarEmitCount > 0);
 
   RecordTable(enc, pass::Table::Tick, &cx);
 

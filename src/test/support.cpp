@@ -17,6 +17,7 @@
 #include "measure/perfscope.h"
 #include "sim/biomes.h"
 #include "sim/farfield.h"
+#include "sim/farplumes.h"
 #include "sim/treeatlas.h"
 #include "sim/worldmap.h"
 #include "sim/wind.h"
@@ -919,6 +920,31 @@ void SubmitTick(GpuContext& ctx, World& world, Simulation& sim, uint32_t tick,
       std::memcpy(hdr.data() + kGasSpHdr, gas.data(), gas.size() * sizeof(GasSpawnOp));
     ctx.queue.WriteBuffer(world.gasSpawnOps, 0, hdr.data(), hdr.size() * 4);
     sim.NoteGasSpawns((uint32_t)gas.size());
+  }
+
+  // ---- far fire plumes (world.h kGasFarEmitMax) --------------------------
+  // The OPPOSITE upload discipline to the gas spawn list above, and for the
+  // opposite reason. A spawn op is consumed on the tick it arrives, so its
+  // buffer must be rewritten every tick or the previous tick's ops respawn.
+  // The emitter list is a STANDING description of where the frozen fires are:
+  // it changes only when a chunk is evicted, re-loaded or the window moves, so
+  // it is uploaded only when Build() says it changed — which is no ticks at all
+  // in a world nobody has set alight, and one tick per window shift otherwise.
+  //
+  // Simulation is told the count BEFORE EncodeTick for NoteGasSpawns' reason:
+  // the count is the splat row's dispatch extent AND half the condition on the
+  // density box's clear, both of which the recorder resolves there.
+  //
+  // Null before Stream::Init, and null is simply "no emitters" — a harness that
+  // never streams behaves exactly as it did before the feature existed.
+  if (world.farPlumes) {
+    FarPlumes& plumes = *world.farPlumes;
+    plumes.Build(world.WindowOrigin());
+    const uint32_t* pw = nullptr;
+    uint32_t pn = 0;
+    if (plumes.TakeUpload(&pw, &pn))
+      ctx.queue.WriteBuffer(world.gasFarEmit, 0, pw, (size_t)pn * 4);
+    sim.NoteFarPlumes(plumes.Count());
   }
 
   // Day/night sleep handshake. The daylight-gated reactions deliberately do
@@ -2058,6 +2084,48 @@ void ReadGasOuterAboveSync(GpuContext& ctx, World& world, int32_t worldY,
         sum += v;
       }
   }
+  if (outMax) *outMax = mx;
+  if (outSum) *outSum = sum;
+}
+
+// The outer density box, folded over ONE WORLD-VOXEL BOX. The `Above` fold
+// beside this one answers "is there a plume up there anywhere", which is the
+// right question for a gate whose fixture is the only gas in the world; a gate
+// that has to say WHICH column the density is over needs a box, and asserting
+// on the whole-box sum instead would pass on a plume that came out somewhere
+// else entirely.
+//
+// Same mapping, same three copies of one identity: originVox = windowOrigin -
+// kWorldN/2, cell = (voxel - originVox) >> kGasOuterShift. Ends are inclusive
+// in CELLS, so a box smaller than a cell still reads the cell it lands in.
+void ReadGasOuterBoxSync(GpuContext& ctx, World& world, IVec3 loVox,
+                         IVec3 hiVox, uint32_t* outMax, uint64_t* outSum) {
+  std::vector<uint32_t> g(kGasOuterWords, 0u);
+  rhi::ReadbackBlocking(ctx.device, ctx.queue, world.gasOuter, 0, g.data(),
+                        (size_t)kGasOuterWords * 4, "gasOuterBoxRead");
+  const IVec3 wo = world.WindowOrigin();
+  const int32_t h = (int32_t)(kWorldN / 2);
+  const int32_t o[3] = {wo.x * (int32_t)kChunk - h, wo.y * (int32_t)kChunk - h,
+                        wo.z * (int32_t)kChunk - h};
+  const int32_t lv[3] = {loVox.x, loVox.y, loVox.z};
+  const int32_t hv[3] = {hiVox.x, hiVox.y, hiVox.z};
+  int32_t lo[3], hi[3];
+  for (int a = 0; a < 3; a++) {
+    lo[a] = std::max((lv[a] - o[a]) >> (int32_t)kGasOuterShift, 0);
+    hi[a] = std::min((hv[a] - o[a]) >> (int32_t)kGasOuterShift,
+                     (int32_t)kGasOuterN - 1);
+  }
+  uint32_t mx = 0;
+  uint64_t sum = 0;
+  const uint16_t* b = (const uint16_t*)g.data();
+  for (int32_t cz = lo[2]; cz <= hi[2]; cz++)
+    for (int32_t cy = lo[1]; cy <= hi[1]; cy++)
+      for (int32_t cx = lo[0]; cx <= hi[0]; cx++) {
+        const uint32_t v = b[((uint32_t)cz * kGasOuterN + (uint32_t)cy) *
+                                 kGasOuterN + (uint32_t)cx];
+        if (v > mx) mx = v;
+        sum += v;
+      }
   if (outMax) *outMax = mx;
   if (outSum) *outSum = sum;
 }

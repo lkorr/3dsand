@@ -357,6 +357,11 @@ uint32_t GasAboveYSync(GpuContext& ctx, World& world, Simulation& sim,
                        int32_t worldY, uint32_t* outTotal = nullptr);
 void ReadGasOuterAboveSync(GpuContext& ctx, World& world, int32_t worldY,
                            uint32_t* outMax, uint64_t* outSum);
+//   ReadGasOuterBoxSync    the same box folded over ONE world-voxel box, for a
+//                          gate that has to say WHICH column the density is
+//                          over rather than only that there is some
+void ReadGasOuterBoxSync(GpuContext& ctx, World& world, IVec3 loVox,
+                         IVec3 hiVox, uint32_t* outMax, uint64_t* outSum);
 uint32_t ReadActiveChunksSync(GpuContext& ctx, World& world, Simulation& sim);
 
 // THE CPU SEAM for gate voxel dumps (PLAN_page_table.md §2.1a, fifth site).

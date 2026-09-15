@@ -62,6 +62,10 @@ const PT_KERNEL : u32 = PT_K_GAS;
 // not a grid cell). Same shape as gasSpawn: word 0 is the count, records from
 // word GAS_SP_HDR. Part of the per-tick input stream, exactly like spawnOps.
 @group(1) @binding(10) var<storage, read> gasSpawnOps : array<u32>;
+// The far fire-plume emitter list (world.h kGasFarEmitMax): [0] count, [1] the
+// box shift it was built for, [2..3] reserved, then 4-word records. CPU-built
+// from the eviction harvest and uploaded only on the ticks it changes.
+@group(1) @binding(11) var<storage, read> gasFarEmit : array<u32>;
 
 // ---- constants that must agree with sim_step.wgsl and src/sim/world.h ------
 // Kept out of common.wgsl on purpose (CLAUDE.md: a constant only its consumers
@@ -117,6 +121,64 @@ const GAS_CEILING_VOX : i32 = 192;
 // derivation cannot alias.
 const GAS_KEY_SALT   : u32 = 0x9A17u;
 const GAS_DECAY_SALT : u32 = 0x2C05u;
+const GAS_PLUME_SALT : u32 = 0x5B31u;
+
+// ---- FAR FIRE PLUMES (world.h's kGasFarEmitMax block) ----------------------
+// The emitter list's layout, which the CPU writes and this file reads.
+// check_invariants.py pins these against world.h.
+const GAS_FAR_EMIT_HDR    : u32 = 4u;
+const GAS_FAR_EMIT_STRIDE : u32 = 4u;
+const GAS_FAR_EMIT_MAX    : u32 = 256u;   // kGasFarEmitMax
+// The most hot voxels one emitter can stand for: a gasOuter cell in x/z by a
+// fine chunk in y. The strength is divided by it, so "a fully burning column"
+// is 1.0 whatever the cell size becomes.
+const GAS_FAR_STRENGTH_MAX : u32 = 1024u; // kGasFarEmitStrengthMax
+
+// One thread per CELL of height. 64 is the whole budget: the tuning clamp
+// keeps render.farPlumeHeight inside the box's half-extent (51.2 m = 64 cells),
+// so a thread per height covers the tallest legal plume with no loop.
+const FAR_PLUME_STEPS : u32 = 64u;
+// Splats per height step. Three, scattered inside a radius that grows with
+// height — this is what makes a plume rather than a line of cells.
+const FAR_PLUME_PUFFS : u32 = 3u;
+// How wide the column gets by the top, in cells, and how wide it starts.
+const FAR_PLUME_R0     : f32 = 0.4;
+const FAR_PLUME_SPREAD : f32 = 3.2;
+// Nominal density added per splat at the BASE of a fully burning column at
+// render.farPlumeStrength 1. The renderer divides a cell's count by (1<<SHIFT)^3
+// = 512 to get a volume fraction, so 3 x 56 = 168 is about a third of a solid
+// cell — a distinct but see-through plume, with several fires stacking toward
+// opaque.
+const FAR_PLUME_DENSITY : f32 = 56.0;
+// ---- THE ANTI-CARRY BOUND, and it is a PROOF rather than a margin ----------
+// gasOuter packs two 16-bit cells per word, so an add that overflows its half
+// carries into the neighbour's — a bright cell one over, on some runs only.
+// The parcel splat guards this by adding exactly 1; this one adds a WEIGHT, so
+// the guard has to be sized.
+//
+// Within one emitter no two threads can collide: a thread owns one cell of
+// HEIGHT and the three puffs only move in x/z, so every add of one workgroup
+// lands in a distinct cell-y. Across emitters they can, and the bound on how
+// many is the list cap itself. So the worst reachable value after a race is
+//
+//     FAR_PLUME_CEIL + (GAS_FAR_EMIT_MAX * FAR_PLUME_PUFFS - 1) * FAR_PLUME_ADD_MAX
+//
+// and the const_assert below is that it still fits 16 bits. FAR_PLUME_CEIL is
+// where this kernel stops adding at all: 4,096 is eight times a fully solid
+// cell, i.e. far past opaque, so nothing visible is lost by capping there.
+const FAR_PLUME_CEIL    : u32 = 4096u;
+const FAR_PLUME_ADD_MAX : u32 = 80u;
+const_assert FAR_PLUME_CEIL +
+    (GAS_FAR_EMIT_MAX * FAR_PLUME_PUFFS - 1u) * FAR_PLUME_ADD_MAX <= 0xFFFFu;
+// How fast a plume packet rises, in gasOuter cells per tick. A gas voxel takes
+// one whole cell per tick in the CA's ladder and a cell is 1<<GAS_OUTER_SHIFT
+// voxels, so 1/8 is the parcel's own speed and the far plume climbs at the
+// speed the near smoke does.
+const FAR_PLUME_RISE : f32 = 0.125;
+// Voxels per second a plume rises, used ONLY to turn the wind speed into a
+// tilt: lateral cells per vertical cell is (wind vox/s) / this. 1 voxel/tick at
+// 60 ticks/s.
+const FAR_PLUME_RISE_VPS : f32 = 60.0;
 
 // (a) RESIDENCY, in the tickets-P0 sense (docs/tickets_p0_audit.md): every
 // caller here asks "may I read or write this cell", never "where is the window
@@ -240,6 +302,21 @@ fn gasSplat(c : vec3<i32>) {
   let sh = 16u * (li & 1u);
   if (((atomicLoad(&gasOuter[word]) >> sh) & 0xFFFFu) >= GAS_OUTER_MAX) { return; }
   atomicAdd(&gasOuter[word], 1u << sh);
+}
+
+// The far fire plume's add: a WEIGHT into one CELL, where gasSplat takes a
+// voxel and adds one. Separate rather than a parameter on gasSplat because the
+// two have different overflow arguments and the argument is the interesting
+// part of both — see FAR_PLUME_CEIL above.
+fn gasOuterAddCell(d : vec3<i32>, amount : u32) {
+  let n = i32(GAS_OUTER_N);
+  if (d.x < 0 || d.y < 0 || d.z < 0 || d.x >= n || d.y >= n || d.z >= n) { return; }
+  if (amount == 0u) { return; }
+  let li = (u32(d.z) * GAS_OUTER_N + u32(d.y)) * GAS_OUTER_N + u32(d.x);
+  let word = li >> 1u;
+  let sh = 16u * (li & 1u);
+  if (((atomicLoad(&gasOuter[word]) >> sh) & 0xFFFFu) >= FAR_PLUME_CEIL) { return; }
+  atomicAdd(&gasOuter[word], min(amount, FAR_PLUME_ADD_MAX) << sh);
 }
 
 // Next-tick dirty mark incl. boundary neighbours — the gas passes run after
@@ -523,4 +600,98 @@ fn gasResolve(@builtin(global_invocation_id) gid : vec3<u32>) {
   // the world hash instead, so the two never double-count a parcel and never
   // drop one.
   atomicAdd(&gasSpawn[GAS_SP_DIGEST], particlePriority(p));
+}
+
+// ======================= FAR FIRE PLUMES ====================================
+//
+// The smoke of a fire the residency window has LEFT BEHIND. Such a fire is
+// frozen mid-burn: its embers were downsampled into the far cascade by the last
+// `fardown` and stay there, visibly orange, for the rest of the session — while
+// its smoke dies within about four seconds, because a smoke parcel is only ever
+// born at the window face by the running CA and then decays at the material's
+// authored rate. This kernel puts the smoke back.
+//
+// ONE WORKGROUP PER EMITTER, ONE THREAD PER CELL OF HEIGHT. The list is short
+// (world.h kGasFarEmitMax) and CPU-built, so the dispatch is direct: nothing
+// here needs a GPU-side count or an indirect args buffer.
+//
+// WHAT IT MAY TOUCH: gasOuter, and nothing else. gasOuter is render-only
+// derived data — the sim never reads it, the world hash never covers it, and it
+// is rebuilt from scratch every tick. That is why this kernel may use f32 at
+// all (CLAUDE.md rule 1's integer-only requirement is about the CA and about
+// anything the hash can see) and why a frozen fire cannot move the world. It
+// does NOT create parcels: the parcel pool is deterministic sim state pinned by
+// GAS_SP_DIGEST, and a parcel that drifts back in writes a hashed voxel.
+//
+// THE ANIMATION IS STATELESS. There is no per-plume state anywhere: the
+// billowing comes from hashing (emitter index, height packet), and the packet
+// index slides downward with the tick, so a given lump of turbulence RISES
+// through the column at FAR_PLUME_RISE cells a tick instead of the column
+// flickering in place.
+@compute @workgroup_size(64)
+fn gasFarPlume(@builtin(workgroup_id) wg : vec3<u32>,
+               @builtin(local_invocation_id) li : vec3<u32>) {
+  let n = min(gasFarEmit[0], GAS_FAR_EMIT_MAX);
+  if (wg.x >= n) { return; }
+
+  // Height, in cells. The tuning clamp keeps this inside FAR_PLUME_STEPS (see
+  // the constant), and the min is the belt to that brace: a knob edited past
+  // the clamp costs a shorter plume, never an out-of-bounds thread.
+  let cellVox = f32(1u << GAS_OUTER_SHIFT);
+  let hCells = min(u32(max(TUNE_FAR_PLUME_HEIGHT / (VOXEL_METERS * cellVox), 1.0)),
+                   FAR_PLUME_STEPS);
+  let s = li.x;
+  if (s >= hCells) { return; }
+
+  let b = GAS_FAR_EMIT_HDR + wg.x * GAS_FAR_EMIT_STRIDE;
+  let base = vec3<i32>(bitcast<i32>(gasFarEmit[b + 0u]),
+                       bitcast<i32>(gasFarEmit[b + 1u]),
+                       bitcast<i32>(gasFarEmit[b + 2u]));
+  // 0..1: how much of this column footprint is actually on fire.
+  let burn = clamp(f32(gasFarEmit[b + 3u]) / f32(GAS_FAR_STRENGTH_MAX), 0.0, 1.0);
+  // The emitter's own cell, from the SAME expression the CPU filtered the list
+  // with and the renderer samples the box with (gasOuterCell above).
+  let c0 = gasOuterCell(base);
+
+  // ---- the shape ----------------------------------------------------------
+  let t = f32(s) / f32(hCells);          // 0 at the fire, 1 at the top
+  // Wind tilt: lateral cells per vertical cell is the wind speed over the rise
+  // speed, both in voxels/s. windDirQ is the unit downwind XZ the CA and the
+  // renderer already share, so a far plume leans the way the near grass does.
+  var tilt = vec2f(0.0, 0.0);
+  if (T.windMode != WIND_MODE_OFF) {
+    let dir = vec2f(f32(T.windDirQ.x), f32(T.windDirQ.y)) / 65536.0;
+    let spd = f32(T.windSpeedQ) / 65536.0;          // voxels/s
+    tilt = dir * (spd / FAR_PLUME_RISE_VPS) * f32(s);
+  }
+  // The column widens and dilutes with height, which is the whole reason it
+  // reads as smoke and not as a bar.
+  let rad = FAR_PLUME_R0 + FAR_PLUME_SPREAD * t;
+  // Density taper. Not to zero at the top: a plume that vanishes at a hard
+  // height reads as a cut-off, and the renderer's fog is what should finish it.
+  let taper = 1.0 - 0.7 * t;
+
+  // ---- the packet, which is what MOVES -------------------------------------
+  // A lump of turbulence born at the fire has risen FAR_PLUME_RISE cells a tick
+  // since, so the lump now at height s was born (s - risen) cells ago. Hashing
+  // on that difference makes the pattern travel up the column at exactly the
+  // speed a parcel would, with no state. The bias keeps the u32 conversion away
+  // from a wrap discontinuity at low tick counts.
+  let risen = i32(f32(T.tick) * FAR_PLUME_RISE);
+  let packet = u32(i32(s) - risen + 0x40000);
+
+  for (var k = 0u; k < FAR_PLUME_PUFFS; k++) {
+    let h = hash3(GAS_PLUME_SALT ^ (wg.x * 2654435761u), packet, k);
+    // Two signed unit-ish offsets and one density roll out of one hash.
+    let ox = (f32(h & 0xFFu) / 127.5 - 1.0) * rad;
+    let oz = (f32((h >> 8u) & 0xFFu) / 127.5 - 1.0) * rad;
+    // 0.35..1.0 — the billow. Without it every puff is the same brightness and
+    // the column is a smooth cone.
+    let bill = 0.35 + 0.65 * f32((h >> 16u) & 0xFFu) / 255.0;
+    let amt = TUNE_FAR_PLUME_STRENGTH * FAR_PLUME_DENSITY * burn * taper * bill;
+    gasOuterAddCell(vec3<i32>(c0.x + i32(round(tilt.x + ox)),
+                              c0.y + i32(s),
+                              c0.z + i32(round(tilt.y + oz))),
+                    u32(max(amt, 0.0)));
+  }
 }

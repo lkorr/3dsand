@@ -126,11 +126,18 @@ PASS(fill_actVoxViz, nullptr, PT_TICK, PIPE_NONE, K_FILL, 0,0,0, GRP_NONE, DYN_N
 // tick because it is a per-tick SPLAT, not an accumulator: a stale byte is a
 // plume that stopped existing several seconds ago still hanging in the sky.
 // gasClaim mirrors fill_claim exactly.
+//
+// fill_gasOuter is the one of the three that is NOT on C_GAS: the density box
+// has a second writer now (the far fire plumes, world.h kGasFarEmitMax), and a
+// frozen fire's plume must be cleared on the ticks it is splatted even in a
+// world with no parcels and a settled CA. C_GASOUT is exactly that union. The
+// other two fills stay on C_GAS because they belong to the parcel pipeline,
+// which a frozen fire deliberately does not arm.
 PASS(fill_gasSpawn, nullptr, PT_TICK, PIPE_NONE, K_FILL, 0,0,0, GRP_NONE, DYN_NONE, C_GAS, 1,
      USES(TW(GasSpawn)))
 PASS(fill_gasClaim, nullptr, PT_TICK, PIPE_NONE, K_FILL, 0,0,0, GRP_NONE, DYN_NONE, C_GAS, 1,
      USES(TW(GasClaim)))
-PASS(fill_gasOuter, nullptr, PT_TICK, PIPE_NONE, K_FILL, 0,0,0, GRP_NONE, DYN_NONE, C_GAS, 1,
+PASS(fill_gasOuter, nullptr, PT_TICK, PIPE_NONE, K_FILL, 0,0,0, GRP_NONE, DYN_NONE, C_GASOUT, 1,
      USES(TW(GasOuter)))
 
 // ---- phase 1: prep (one ComputePassEncoder today: mutate+explode+compact) --
@@ -548,6 +555,31 @@ PASS(gasResolve, "gasResolve", PT_TICK, PIPE_GAS_RESOLVE, K_INDIRECT, IND_GASARG
      USES(R(Materials) U(TickUBO) A(GasClaim) A(GasCounts) A(GasSpawn)
           I(GasDispatchArgs) RW(Voxels) RW(GasParticlesWrite) A(DirtyOut)
           A(GasOuter) R(PageTable) A(PageFaults)))
+
+// ---- phase 4c: FAR FIRE PLUMES (world.h kGasFarEmitMax) -------------------
+//
+// The smoke of fires the residency window has left behind, which are frozen
+// mid-burn in the cascade and would otherwise smoke for four seconds and then
+// glow silently forever. One workgroup per CPU-supplied emitter, synthesizing
+// a rising, drifting column into the density box.
+//
+// ITS WHOLE OUTPUT IS A(GasOuter), and that is the safety argument rather than
+// a description. GasOuter is render-only derived data: the sim never reads it
+// and the world hash never covers it. This row touches no voxel, no parcel, no
+// claim and no dirty flag, so a frozen fire cannot move the world — which is
+// the property that let the feature ship without a rebaseline.
+//
+// AFTER gasResolve, so both writers of the box are behind the same clear and
+// the CPU-side condition on the clear (C_GASOUT) covers both of them. It is
+// NOT in the "gasResolve" pass group: under C_GASFAR alone it is recorded on
+// ticks where gasResolve is not, and a group label shared with a row that may
+// be absent is a PassTimer scope that means two different things run to run.
+//
+// R(GasFarEmit) + U(TickUBO) is the whole read set: the list, and the tick +
+// window origin + wind field the animation keys on.
+PASS(gasFarPlume, "gasFarPlume", PT_TICK, PIPE_GAS_FARPLUME, K_COMPUTE, D_GASFAREMIT,1,1,
+     GRP_SLIM_GAS, DYN_NONE, C_GASFAR, 1,
+     USES(U(TickUBO) R(GasFarEmit) A(GasOuter)))
 
 // ---- phase 5a: hash tick (whole-world scan; also refreshes occupancy) ------
 PASS(occupancyFull, "occupancyFull+pick(hashTick)", PT_TICK, PIPE_OCCUPANCY, K_COMPUTE, D_CHUNKS,1,1, GRP_SIM, DYN_ZERO, C_HASH, 1,

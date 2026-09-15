@@ -1255,6 +1255,100 @@ cells outside an X face into an inward wind). The first never asserts the quiet
 top plane alone — the same run must show that smoke reached the face and left
 through it, or a broken fixture passes too.
 
+### Far fire plumes: the smoke of fires the window has left behind (2026-09-15; `sim_gas.wgsl` `gasFarPlume`, `src/sim/farplumes.h`)
+
+**The gap.** A chunk evicted mid-burn is FROZEN. Its `ember` / `lava` /
+burning-foliage voxels were downsampled into the far cascade by the last
+`fardown`, so the fire stays visibly orange at cascade distance for the rest of
+the session — that is the cascade working. Its SMOKE is not, and that is the
+hole: a smoke parcel is only ever born at the window face by the running CA
+(`gasLeave`), and the parcels already in flight die on smoke's authored
+9/1000-per-tick decay, ~3.7 s mean. So within about four seconds of the eviction
+a distant forest fire is a silent orange smear with nothing rising off it.
+Nothing was wrong; the producer had simply left.
+
+**The shape.** The CPU keeps an index of WHERE the frozen fires are and the GPU
+synthesizes their plumes. Both halves are deliberately small:
+
+* `FarPlumes` (`src/sim/farplumes.h`) is fed from the SAME eviction harvest that
+  feeds `FarEdits`, at the same four call sites in `stream.cpp` — the one place
+  the CPU ever sees an evicted chunk's voxels. It aggregates per gasOuter COLUMN
+  FOOTPRINT: a cell is 8 voxels and a chunk is 16, so a burning chunk
+  contributes at most FOUR emitters however much of it is alight, each carrying
+  the column's hot-voxel count and its topmost hot voxel. What counts as fire is
+  data (`hot` tag + emission > 0 + not a gas), latched from the material table
+  by `Simulation::UploadTables`; no material id appears anywhere in the feature.
+  `fire` itself is CLASS_GAS and `farCellIsSolid` never writes a gas into the
+  cascade, so what is actually visible out there is the ember under the flame,
+  which is exactly the set the rule selects.
+* `Build()` drops every emitter that is back INSIDE the residency window and
+  every one outside the density box, then keeps the 256 nearest the window
+  centre. The in-window drop is what stops a plume being drawn twice: a resident
+  fire is a running fire, the CA makes real smoke voxels for it, and `sim_step`
+  already splats those into the same box. No retirement event is needed for
+  either direction — the test simply stops passing when the window arrives, and
+  starts again when it leaves.
+* `gasFarPlume` is one workgroup per emitter, one thread per CELL of height. Each
+  thread scatters three puffs into a radius that grows with height, tilted
+  downwind by (wind speed / rise speed) and modulated by a hash of (emitter,
+  height packet) where the packet index slides down with the tick — so the
+  billowing RISES through the column at the speed a parcel would, with no state
+  anywhere.
+
+**It is render-only, structurally.** The only buffer it writes is `gasOuter`,
+which the sim never reads, the world hash never covers, and which is rebuilt
+from scratch every tick. It does NOT queue parcels: the parcel pool is
+deterministic sim state pinned by `kGasSpDigest`, and a parcel that drifts back
+in writes a hashed voxel — so a frozen fire able to spawn parcels would be a
+frozen fire able to move the world. There is no path from the index to
+`QueueGasSpawns`. The `gas-farplume` gate asserts this as a DIFFERENTIAL rather
+than against a pinned number: the same fixture with and without the emitter list
+must produce an identical per-tick world-hash series.
+
+**Cost (rule 2).** A frozen fire deliberately does NOT arm `C_GAS`. Arming it
+would record all five parcel rows, and `gasSpawnStep` alone is a fixed
+1,042-workgroup dispatch over both spawn lists whether anything is in them or
+not — a distant fire burning for an hour would pay that every tick for a
+population of zero. So the splat has its own condition (`C_GASFAR`,
+`gasFarEmitCount > 0`) and the density box's per-tick CLEAR moved to their union
+(`C_GASOUT`). That union is load-bearing, not tidy: the clear used to be on
+`C_GAS`, and with parcels off and emitters live the box would never be cleared
+while the splat kept adding to it — a plume that accumulates forever. The
+emitter list is uploaded only on the ticks it CHANGES (an eviction, a store hit,
+a window move), so a world nobody has set alight writes no bytes and records no
+rows, exactly as before.
+
+**The anti-carry bound is a proof, not a margin.** `gasOuter` packs two 16-bit
+cells per word, so an add that overflows its half carries into the neighbour's
+— a bright cell one over, on some runs only. The parcel splat gets away with a
+load-then-add because it adds exactly 1; this one adds a weight, so the guard is
+sized: within one emitter no two threads can collide (a thread owns one cell of
+height and the puffs only move in x/z), so the worst reachable value after a
+race is `FAR_PLUME_CEIL + (kGasFarEmitMax * PUFFS - 1) * ADD_MAX`, and a
+`const_assert` in `sim_gas.wgsl` is that it still fits 16 bits.
+
+**Knobs:** `render.farPlumeStrength` (0 = exact off: no emitters, no row, no
+write) and `render.farPlumeHeight` (metres, clamped to the box).
+
+**Gate:** `gas-farplume`. One chunk of the first hot+emissive+non-gas material in
+the table, harvested off the GPU and handed to the index at a coordinate half a
+window away — the same words eviction would have handed it, without forcing a
+window shift that would move the origin out from under every gate after it
+(`far-persist` feeds `FarEdits` the same way and for the same reason). Four
+claims, none of which passes alone: density over the fire's own column AND zero
+over a control column the same size; an identical world-hash series with the
+emitters removed; a downwind lean in a 20 m/s wind; and, with every gas
+condition false, a density box that is byte-identical four ticks later — a box
+nobody cleared is the direct positive observation that no gas row was recorded,
+where asserting zero density would have been satisfied by a row that ran and
+added nothing.
+
+**What it does not do.** The density box spans two window edges — ±51.2 m — so a
+fire further out than that is still silent. A coarser second box sampled in the
+raymarch's far segment is the next step; the emitter list header carries the box
+SHIFT it was built for (`kGasFarEmitHdr` word 1) so a second scale can consume
+the same records without either side guessing which box the other meant.
+
 ### MLS-MPM liquid (2026-08-22..23; `sim_fluid.wgsl` + `sim_fluid_seam.wgsl`, docs/PLAN_mpm_fluids.md)
 
 The EXCITED state of liquid: an MLS-MPM particle solver (plan Phases 0+1)

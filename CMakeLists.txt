@@ -430,6 +430,7 @@ add_library(sandvox_core OBJECT
   src/sim/stream.cpp
   src/sim/farfield.cpp
   src/sim/faredits.cpp
+  src/sim/farplumes.cpp
   src/sim/chunkstore.cpp
   src/sim/simulation.cpp
   src/sim/pass_table.cpp

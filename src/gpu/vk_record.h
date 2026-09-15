@@ -121,6 +121,11 @@ struct RecordCtx {
   // be stepped whether or not any chunk is awake. False on every tick of a
   // settled world with no plume, and then no gas row is recorded at all.
   bool gasActive = false;
+  // Far fire-plume emitters the CPU handed the GPU this tick (world.h
+  // kGasFarEmitMax). 0 = no frozen fire is in range, and then the splat row is
+  // not recorded at all; it also decides, together with gasActive, whether the
+  // density box is cleared (C_GASOUT).
+  uint32_t gasFarEmitCount = 0;
   // Any loaded material authors a `repose` AND the CA has work this tick
   // (world.h kReposeSnap*). False for a materials.json with no repose line,
   // and then the snapshot prepass is not recorded at all.

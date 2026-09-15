@@ -51,8 +51,9 @@ const RenderSpec& LastRenderSpec();
 // in trace(), the in-band coarse sampling for rays that HIT, and the fold in
 // fs() -- all test it, so a world with no smoke pays nothing for any of it.
 // It is also a correctness gate and not only a budget: gasOuter is cleared
-// only on ticks the sim records the gas rows, so with the flag off the box is
-// stale and must not be sampled.
+// only on ticks the sim records the box's clear row (C_GASOUT — parcels OR far
+// fire-plume emitters, pass_table.def), so with the flag off the box is stale
+// and must not be sampled.
 void SetGasRenderActive(bool active);
 bool GasRenderActive();
 

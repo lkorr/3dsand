@@ -2384,6 +2384,8 @@ bool LoadTuning(const std::string& path, Tuning& out) {
     ReadF(*g, "farShadowReach", r.farShadowReach, out, at);
     ReadI(*g, "farBlockerHitLevel", r.farBlockerHitLevel, out, at);
     ReadF(*g, "gasBlendStart", r.gasBlendStart, out, at);
+    ReadF(*g, "farPlumeStrength", r.farPlumeStrength, out, at);
+    ReadF(*g, "farPlumeHeight", r.farPlumeHeight, out, at);
     ReadF(*g, "lodHandoffDist", r.lodHandoffDist, out, at);
     ReadF(*g, "renderScale", r.renderScale, out, at);
     ReadI(*g, "taa", r.taa, out, at);
@@ -2564,6 +2566,18 @@ bool LoadTuning(const std::string& path, Tuning& out) {
     // face and the seam would come back with a step in it.
     if (r.gasBlendStart < 0.0f) { r.gasBlendStart = 0.0f; }
     if (r.gasBlendStart > 1.0f) { r.gasBlendStart = 1.0f; }
+    // Far fire plumes. 0 is the off switch and must stay reachable, so the
+    // floor is 0 rather than a small positive; the ceiling keeps a mistyped
+    // value from saturating every cell of the density box (GAS_OUTER_MAX) and
+    // fogging the whole horizon white. Height is clamped to the box's own
+    // half-extent in metres — past that the shader clamps anyway, and a knob
+    // whose top half does nothing is a knob that reads as broken.
+    if (r.farPlumeStrength < 0.0f) { r.farPlumeStrength = 0.0f; }
+    if (r.farPlumeStrength > 16.0f) { r.farPlumeStrength = 16.0f; }
+    if (r.farPlumeHeight < 0.0f) { r.farPlumeHeight = 0.0f; }
+    if (r.farPlumeHeight > (float)kWorldN * kVoxelMeters) {
+      r.farPlumeHeight = (float)kWorldN * kVoxelMeters;
+    }
     if (r.lodHandoffDist < 2.0f) { r.lodHandoffDist = 2.0f; }
     // A scale above 1 would be supersampling the most expensive shader in the
     // engine; below a quarter the frame is 400x225 and the UI text on top is

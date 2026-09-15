@@ -8,6 +8,7 @@
 #include "math3d.h"
 #include "sim/chunkstore.h"
 #include "sim/faredits.h"
+#include "sim/farplumes.h"
 #include "sim/materials.h"
 #include "sim/world.h"
 
@@ -129,6 +130,7 @@ class Stream {
     DiscardPendingShifts();  // the verdicts describe the REPLACED world
     store_.Clear();
     farEdits_.Clear();
+    farPlumes_.Clear();
     modified_.assign(kNumSlots, 0);
   }
 
@@ -136,6 +138,9 @@ class Stream {
   // The far-field edit index. LoadWorld rebuilds it from the store it just
   // bound; nothing else outside Stream writes it.
   FarEdits& Edits() { return farEdits_; }
+  // The far fire-plume emitter index, fed from the same harvest sites as
+  // Edits() above. Same standing: derived, disposable, never sim state.
+  FarPlumes& Plumes() { return farPlumes_; }
   uint32_t ShiftCount() const { return shifts_; }
   size_t PendingEvictions() const { return pending_.size(); }
 
@@ -275,6 +280,11 @@ class Stream {
   // "which chunks diverged from procgen" is streaming's answer, not the
   // renderer's; World just holds the pointer so FarField can reach it.
   FarEdits farEdits_;
+  // Where the fires the window has left behind are (src/sim/farplumes.h). Fed
+  // beside farEdits_ at every site that harvests an evicted chunk's words,
+  // because the two answer different questions about the SAME observation and
+  // the one thing that must not happen is for them to see different worlds.
+  FarPlumes farPlumes_;
   std::vector<uint8_t> blockerOf_;  // per material: stops a ray (occ high 16)
   std::vector<uint8_t> modified_;   // per slot, sticky since last recycle
   std::deque<PendingEvict> pending_;

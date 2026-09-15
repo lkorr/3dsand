@@ -129,6 +129,10 @@ bool Recorder::CondHolds(pass::Cond c, const RecordCtx& cx) {
     case pass::Cond::Openness:   return cx.opennessChunks > 0;
     case pass::Cond::Glow:       return cx.glowChunks > 0;
     case pass::Cond::Gas:        return cx.gasActive;
+    case pass::Cond::GasFarEmit: return cx.gasFarEmitCount > 0;
+    // The union: whoever writes the density box this tick, its clear has
+    // to run (pass_table.def's fill_gasOuter note).
+    case pass::Cond::GasOuter:   return cx.gasActive || cx.gasFarEmitCount > 0;
     case pass::Cond::ReposeActive: return cx.reposeActive;
   }
   return false;
@@ -161,6 +165,11 @@ uint32_t Recorder::Extent(uint32_t v, const RecordCtx& cx) {
     // tick, and asking would mean a readback in the tick path.
     case pass::DispatchSel::GasSpawnSel:
       return (kGasSpawnPerTick + kGasCpuSpawnPerTick + 63) / 64;
+    // One workgroup per far fire-plume emitter. A real count, not a compile-
+    // time extent: the CPU built the list this tick and knows exactly how long
+    // it is (world.h kGasFarEmitMax).
+    case pass::DispatchSel::GasFarEmitSel:
+      return cx.gasFarEmitCount;
     default:                          return v;
   }
 }

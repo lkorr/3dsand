@@ -540,6 +540,14 @@ TP_I(render, farBlockerHitLevel, TUNE_FAR_BLOCKER_HIT_LEVEL, 0)
 // ---- gas voxel -> parcel crossfade (PLAN_gas_particles.md stage 1b) ----
 TP_F(render, gasBlendStart, TUNE_GAS_BLEND_START, 0.5f)
 
+// ---- far FIRE PLUMES: smoke from fires the window has left behind ----
+// Render-only, and in the render group for that reason rather than for
+// convenience: nothing here reaches the CA or the parcel pool. Strength is a
+// density multiplier and 0 is the exact off switch (no row recorded at all);
+// height is how far the synthesized column climbs, in METRES.
+TP_F(render, farPlumeStrength, TUNE_FAR_PLUME_STRENGTH, 1.0f)
+TP_F(render, farPlumeHeight, TUNE_FAR_PLUME_HEIGHT, 28.0f)
+
 // ---- in-window LOD handoff (PLAN_surface_flight_perf.md A1) ----
 TP_F(render, lodHandoffDist, TUNE_LOD_HANDOFF_DIST, 24.0f)
 TP_F(render, shadowMaxDist, TUNE_SHADOW_MAX_DIST, 999.0f)

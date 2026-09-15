@@ -224,6 +224,10 @@ void World::Init(const rhi::Device& device) {
                                  "gasDispatchArgs");
   gasOuter = CreateBuffer(device, (uint64_t)kGasOuterWords * 4,
                           U::Storage | U::CopySrc | U::CopyDst, "gasOuter");
+  // The far fire-plume emitter list (world.h kGasFarEmitMax). CopyDst only:
+  // the CPU writes it and one kernel reads it; nothing copies it back.
+  gasFarEmit = CreateBuffer(device, (uint64_t)kGasFarEmitWords * 4,
+                            U::Storage | U::CopyDst, "gasFarEmit");
 
   // MLS-MPM fluid (world.h fluid block). CopySrc on the particle pair is for
   // the fluid gates' mass audits; the frame path reads back only the small

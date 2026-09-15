@@ -1797,6 +1797,15 @@ def check_gas_consts():
         ("kGasOuterShift", "GAS_OUTER_SHIFT", [("sim_gas.wgsl", gas),
                                                ("sim_step.wgsl", step),
                                                ("raymarch.wgsl", raymarch)]),
+        # ---- far fire plumes (world.h's kGasFarEmitMax block) -------------
+        # The emitter list's LAYOUT, which the CPU writes (src/sim/farplumes.cpp)
+        # and sim_gas's gasFarPlume reads. A stride that disagreed would not
+        # crash: it would read a neighbouring emitter's coordinate as a
+        # strength and draw plumes in the wrong places, which is exactly the
+        # class of failure that only a checker catches.
+        ("kGasFarEmitMax", "GAS_FAR_EMIT_MAX", [("sim_gas.wgsl", gas)]),
+        ("kGasFarEmitHdr", "GAS_FAR_EMIT_HDR", [("sim_gas.wgsl", gas)]),
+        ("kGasFarEmitStride", "GAS_FAR_EMIT_STRIDE", [("sim_gas.wgsl", gas)]),
     ]
     for cname, wname, shaders in pairs:
         want = cxx(cname)
@@ -1814,6 +1823,27 @@ def check_gas_consts():
                     f"gas: {fname} {wname} = {got} but world.h {cname} = "
                     f"{want} -- a cap raised on one side only is a buffer "
                     f"overrun the GPU will not report")
+
+    # kGasFarEmitStrengthMax is DERIVED in world.h (the gasOuter cell area in
+    # x/z times the fine chunk height), so it cannot be scraped as a literal --
+    # it is recomputed here from the two constants it is built from, which is
+    # the point: the shader divides by it to normalise "how much of this column
+    # is on fire", and a stale copy would make every far plume the wrong
+    # density by a constant factor with nothing to notice.
+    sh = cxx("kGasOuterShift")
+    ch = cxx("kChunk")
+    if sh is not None and ch is not None:
+        want = (1 << sh) * (1 << sh) * ch
+        got = wgsl(gas, "GAS_FAR_STRENGTH_MAX")
+        if got is None:
+            problems.append(
+                "gas: sim_gas.wgsl does not declare GAS_FAR_STRENGTH_MAX, "
+                f"which must equal world.h's kGasFarEmitStrengthMax ({want})")
+        elif got != want:
+            problems.append(
+                f"gas: sim_gas.wgsl GAS_FAR_STRENGTH_MAX = {got} but world.h "
+                f"derives kGasFarEmitStrengthMax = {want} from kGasOuterShift "
+                f"({sh}) and kChunk ({ch})")
 
     # ---- the gas DIRTY-REASON bits ------------------------------------
     # world.h's kDirtyReasonName is a positional table -- the bit is the row

@@ -137,12 +137,17 @@ inline constexpr PerfNodeDef kPerfNodes[] = {
      "Scales with the live particle count, not the world. Integrate is the "
      "DDA; resolve is the atomicMax claim."},
     {"gasSys", "Gas Particles", "simTick", PerfSide::Gpu, PerfScope::Count,
-     "gasSpawn;gasArgs1;gasIntegrate;gasArgs2;gasResolve",
+     "gasSpawn;gasArgs1;gasIntegrate;gasArgs2;gasResolve;gasFarPlume",
      "Gas that has left the residency window (docs/PLAN_gas_particles.md). "
      "Scales with the live parcel count, not the world, and is recorded at all "
      "only while parcels exist or the CA has work. What it BUYS is on the "
      "caLoop row: the top-plane smoke sheet that used to hold up to 1,024 "
-     "chunks awake stops existing."},
+     "chunks awake stops existing. `gasFarPlume` is charged here too and is "
+     "the one row of the six that is NOT a parcel pass: it synthesizes the "
+     "smoke of fires the window has left behind (world.h kGasFarEmitMax) "
+     "straight into the density box, one workgroup per emitter, under its own "
+     "condition -- so a world with distant fires and no parcels shows time on "
+     "this row with the other five recording nothing."},
     {"fluidSys", "MLS-MPM Fluid", "simTick", PerfSide::Gpu, PerfScope::Count,
      "fluidMark;fluidAlloc;fluidClear;fluidP2g1;fluidP2g2;fluidGridUp;fluidG2p;"
      "seam_compact_count;seam_compact_scan;seam_compact_scatter;seam_spawn;"

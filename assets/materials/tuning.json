@@ -800,6 +800,8 @@
     "farShadowReach": 24,
     "farBlockerHitLevel": 0,
     "gasBlendStart": 0.5,
+    "farPlumeStrength": 1,
+    "farPlumeHeight": 28,
     "lodHandoffDist": 26,
     "renderScale": 1,
     "taa": 0,

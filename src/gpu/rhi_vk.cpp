@@ -835,6 +835,7 @@ void RecordTableVulkan(const CommandEncoder& enc, pass::Table which, const Table
   cxv.waveMode = cx.waveMode;
   cxv.opennessChunks = cx.opennessChunks;
   cxv.gasActive = cx.gasActive;
+  cxv.gasFarEmitCount = cx.gasFarEmitCount;
   cxv.reposeActive = cx.reposeActive;
   cxv.glowChunks = cx.glowChunks;
   cxv.hashEnable = cx.hashEnable;

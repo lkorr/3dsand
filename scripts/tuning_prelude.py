@@ -334,6 +334,10 @@ SPEC = [
     # gas voxel -> parcel crossfade (PLAN_gas_particles.md stage 1b)
     ("render", "gasBlendStart", "TUNE_GAS_BLEND_START", "f", 0.5),
 
+    # far FIRE PLUMES: smoke from fires the window has left behind
+    ("render", "farPlumeStrength", "TUNE_FAR_PLUME_STRENGTH", "f", 1.0),
+    ("render", "farPlumeHeight", "TUNE_FAR_PLUME_HEIGHT", "f", 28.0),
+
     # in-window LOD handoff (PLAN_surface_flight_perf.md A1)
     ("render", "lodHandoffDist", "TUNE_LOD_HANDOFF_DIST", "f", 24.0),
     ("render", "shadowMaxDist", "TUNE_SHADOW_MAX_DIST", "f", 999.0),
