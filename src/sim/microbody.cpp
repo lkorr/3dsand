@@ -1,9 +1,37 @@
 #include "sim/microbody.h"
 
 #include <algorithm>
+#include <cstdio>
 #include <unordered_set>
 
 namespace {
+
+// Say out loud that a ceiling refused, without ever becoming a flood.
+//
+// See MicroBodySet::refusals for why this exists at all. First refusal, then
+// every power of two: a one-off under a momentary peak costs one line, and a
+// table that has genuinely run out — which refuses thousands of times a second,
+// once per burning voxel per tick — costs a dozen over a whole session while
+// being impossible to miss.
+//
+// Both ceilings are named in every line because WHICH one refused decides what
+// to do about it, and the owned/retired split is what separates "too much is
+// live at once" from "something is leaking records".
+void NoteRefusal(MicroBodySet& set, const char* what) {
+  set.refusals++;
+  const uint32_t n = set.refusals;
+  if (n & (n - 1)) return;  // not a power of two
+  uint32_t owned = 0;
+  for (uint8_t o : set.owned) owned += o ? 1u : 0u;
+  std::fprintf(stderr,
+               "micro body: %s REFUSED (%u so far) — %zu/%u model records "
+               "(%u owned, %zu retired), %zu/%u pool words. Damaged bodies "
+               "keep a stale skin: carves, char and blood stop showing until "
+               "corpses are culled.\n",
+               what, n, set.models.size(), kMaxMicroBodyModels, owned,
+               set.freeModels.size(), set.pool.size(),
+               kMicroBodyPoolWordsWorld);
+}
 
 // Word count for a brick of `cellCount` micro voxels (2 per word).
 //
@@ -305,6 +333,11 @@ int MicroBodyPack(MicroBodySet& set, const std::vector<PrefabVoxel>& voxels,
   if (set.freeModels.empty() && set.models.size() >= kMaxMicroBodyModels) {
     log += label + ": micro body model table full (" +
            std::to_string(kMaxMicroBodyModels) + ")\n";
+    // ...and said where somebody will see it. `log` is the LOADER's channel and
+    // most of Pack's callers are not the loader — a carved gobbet, a refitted
+    // garment shell — so several of them hand this string to a local that is
+    // never printed.
+    NoteRefusal(set, "MicroBodyPack: model table");
     return -1;
   }
 
@@ -351,6 +384,7 @@ int MicroBodyPack(MicroBodySet& set, const std::vector<PrefabVoxel>& voxels,
   if (base == UINT32_MAX) {
     log += label + ": micro body brick pool full (" +
            std::to_string(kMicroBodyPoolWordsWorld) + " words)\n";
+    NoteRefusal(set, "MicroBodyPack: brick pool");
     return -1;
   }
   const size_t payloadWords = WordsFor(cellCount);
@@ -428,7 +462,14 @@ int MicroBodyClone(MicroBodySet& set, uint32_t model) {
     slot = set.freeModels.back();
     set.freeModels.pop_back();
   } else {
-    if (set.models.size() >= kMaxMicroBodyModels) return -1;
+    if (set.models.size() >= kMaxMicroBodyModels) {
+      // THE REFUSAL THE OWNER ACTUALLY SEES. Every damage path in the engine
+      // funnels through MicroBodyOwn -> here: a carve, a zombie's spawn rot, a
+      // burning voxel, a blood mark. When this line fires, gore has stopped
+      // appearing on every body in the world at once.
+      NoteRefusal(set, "MicroBodyClone: model table");
+      return -1;
+    }
     slot = (uint32_t)set.models.size();
     set.models.push_back(MicroBodyModelGpu{});
     set.owned.resize(set.models.size(), 0);
@@ -438,6 +479,7 @@ int MicroBodyClone(MicroBodySet& set, uint32_t model) {
   uint32_t base = PoolAlloc(set, words);
   if (base == UINT32_MAX) {
     set.freeModels.push_back(slot);  // give the record back; nothing changed
+    NoteRefusal(set, "MicroBodyClone: brick pool");
     return -1;
   }
   // Re-read: the push_back above may have reallocated `models`.
@@ -489,7 +531,10 @@ bool MicroBodyEdit(MicroBodySet& set, uint32_t model,
     // Grew past the reserved block (a split half re-based into a wider box):
     // needs a new one. Free at the size actually reserved, not at the dims.
     uint32_t base = PoolAlloc(set, words);
-    if (base == UINT32_MAX) return false;
+    if (base == UINT32_MAX) {
+      NoteRefusal(set, "MicroBodyEdit: brick pool");
+      return false;
+    }
     PoolFree(set, m.base, haveWords);
     m.base = base;
     set.blockWords[model] = (uint32_t)words;
@@ -547,7 +592,10 @@ bool MicroBodyPokeStain(MicroBodySet& set, uint32_t model, int x, int y, int z,
     // reserved-size discipline MicroBodyEdit follows.
     const size_t words = payloadWords + StainWordsFor(cells);
     const uint32_t base = PoolAlloc(set, words);
-    if (base == UINT32_MAX) return false;
+    if (base == UINT32_MAX) {
+      NoteRefusal(set, "MicroBodyPokeStain: brick pool");
+      return false;
+    }
     std::copy(set.pool.begin() + m.base, set.pool.begin() + m.base + payloadWords,
               set.pool.begin() + base);
     std::fill(set.pool.begin() + base + payloadWords,

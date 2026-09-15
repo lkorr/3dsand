@@ -179,6 +179,24 @@ struct MicroBodySet {
   // Retired owned model records, reusable so a long fight does not exhaust
   // kMaxMicroBodyModels even though the pool words are recycled.
   std::vector<uint32_t> freeModels;
+
+  // ---- WHEN A CEILING IS HIT --------------------------------------------
+  //
+  // Every allocator in this file degrades by REFUSING: the call returns -1, the
+  // caller leaves the skin alone, and the body's authoritative voxels change
+  // with nothing on screen to show it. That degradation is correct — losing
+  // detail under memory pressure beats refusing to be destructible — and it was
+  // completely SILENT, which is the whole reason a 256-record table shipped as
+  // a mystery instead of as a line of stderr. Owner report 2026-09-15: "after
+  // killing a bunch of zombies, new zombies spawn with 0 gore and won't get any
+  // when I hit them; it fixes itself when I leave the area with the corpses."
+  // Every word of that is this counter's story — the corpses were holding the
+  // records — and nothing in the engine said so.
+  //
+  // COUNTED rather than logged at the call site, because a full table refuses
+  // once per burning voxel per tick: the report has to be rate limited, and the
+  // count is itself the number worth reporting.
+  uint32_t refusals = 0;
   // Set by any mutation; the caller re-uploads and clears. Batching one upload
   // per tick rather than one per edit is rule 2 applied to PCIe traffic.
   bool dirty = false;

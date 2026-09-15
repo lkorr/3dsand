@@ -3182,13 +3182,52 @@ neighbors, so this needs an explicit connectivity pass:
     fails on any.
   - **`MicroBodyPack` recycles too (2026-09-14).** Pack is not only the loader —
     every carved gobbet and every re-fitted garment shell packs one — and it
-    read neither `freeModels` nor `freeList`, so both the 256-entry record table
-    and the pool's high-water mark were one-way ratchets. It now takes a retired
+    read neither `freeModels` nor `freeList`, so both the record table and the
+    pool's high-water mark were one-way ratchets. It now takes a retired
     record and allocates through `PoolAlloc` like everything else. Relatedly,
     `Mob::AddWornShell` set `carved = true` on a resampled shell's brick without
     setting `owned`, and `MicroBodyFree` refuses to reclaim a shared block — so
     every equip/unwear cycle leaked its words, despite the comment there
     claiming otherwise since the day it landed.
+  - **THE MODEL TABLE IS SHARED RECORDS PLUS EVERY OWNED CLONE, and it was
+    sized against the first half only (2026-09-15).** Owner report: "after
+    killing a bunch of zombies, new zombies spawn with 0 gore and won't get any
+    when I hit them; it fixes itself when I leave the area with the corpses" —
+    which is a precise description of an allocator, not of a rendering bug.
+    `kMaxMicroBodyModels` was 256 and its comment named only the SHARED
+    population, "one record per (def, limb) pair". That population had grown to
+    **148 records at load**: 87 mob limb models against **61 item models**,
+    because every garment COVER PANEL is a record and nine peasant garments had
+    just landed. 108 records were left for the whole world's damage, and a
+    zombie's `rot` block carves ~11 of its 15 limbs AT SPAWN — clones a corpse
+    then holds until it is culled. So the seventh zombie exhausted the table,
+    `MicroBodyOwn` began refusing for every body in the world at once, and every
+    carve, char and blood mark stopped appearing. Walking away culled the
+    corpses and handed the records back, which is the whole of "it fixes
+    itself". The ceiling is now 1024 — shared plus `kMaxBodySlots`, since an
+    owned brick belongs to a drawn body part — and the pool doubled to 2 MiW
+    behind it, because the two ceilings have to be sized against the same scene
+    or the cheaper one merely moves the wall (148 records already cost 313k of
+    the old 1 MiW, and ~350 live clones at ~1.5x their model's payload would
+    have hit it next).
+    - **The defect was the SILENCE, not the number.** Refusing is the designed
+      degradation and it is correct — losing detail under memory pressure beats
+      refusing to be destructible — but nothing anywhere said it had fired, so a
+      hard ceiling presented as "gore quietly stopped working". Every refusal
+      now counts into `MicroBodySet::refusals` and prints at each power of two
+      (rate-limited because a full table refuses once per burning voxel per
+      tick), naming WHICH ceiling refused and the owned/retired split, which is
+      what separates "too much is live at once" from "something is leaking
+      records". The load line reports the shared population too, so how close to
+      the wall a fresh world starts is a number and not an archaeology exercise.
+    - **`BurnBodies` owns its brick LAZILY now**, at the first poke. It used to
+      clone up front for any body `willScan` admitted — and `willScan` admits
+      any body with a pair rule and a dirty chunk near it, which during a fight
+      is every corpse on the ground. A pile of corpses therefore spent a record
+      and ~1.5x a model's words apiece on smoke drifting past. The up-front
+      clone bought branch-free poke sites; the branch it saved is one
+      predictable test per poked voxel.
+    - Render-only throughout, so `determinismHash` does not move.
   - This also fixed two latent scale bugs that only bit once micro bodies could
     be damaged: `ShatterBody` built fragment colliders at pitch 1 (inflating a
     scale-2 fragment to 8× its mass) and `VoxelsToParticles` emitted one

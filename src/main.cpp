@@ -4357,6 +4357,15 @@ int main(int argc, char** argv) {
     // grip context), so print them either way rather than only on failure.
     if (!ierr.empty()) std::fprintf(stderr, "%s", ierr.c_str());
     if (itemsOk) std::printf("loaded %zu items\n", items.items.size());
+    // WHAT THE SHARED POPULATION COSTS, said once, because it is half of a
+    // ceiling the other half of which is spent at runtime on damaged bodies
+    // (world.h kMaxMicroBodyModels). Every garment added here is four more
+    // records nobody's gore gets to use, and until 2026-09-15 there was no
+    // number anywhere that said how close to the wall a fresh world started.
+    std::printf("micro bodies: %zu/%u shared model records, %zu/%u pool words "
+                "after mobs + items\n",
+                mbSet.models.size(), kMaxMicroBodyModels, mbSet.pool.size(),
+                kMicroBodyPoolWordsWorld);
     sim.UploadMicroBodies(ctx.queue, mbSet);
     mobs.SetDefs(std::move(mobDefs));
     // NPC behaviour profiles (game/ai_behavior.h). Content, like materials and

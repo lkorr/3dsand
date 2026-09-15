@@ -2725,15 +2725,31 @@ void DebrisSystem::BurnBodies(uint32_t tick, World& world,
     scanners = scanners > 0 ? scanners - 1 : 0;
     // A micro body must OWN its brick before a poke can land: a shared model
     // backs every instance of its def, and charring one would char them all.
-    // Done up front rather than at the first write so the poke sites stay
-    // branch-free; a body that never changes pays one clone it did not need,
-    // which only happens to a body the pass has already decided is reactive.
-    if (b.micro.Valid() && microSet_) {
-      const int own = MicroBodyOwn(*microSet_, b.micro.model);
-      // Pool full: the body still really burns, its skin just stops keeping up.
-      if (own >= 0) b.micro.model = (uint32_t)own;
-    }
-    const bool canPoke = b.micro.Valid() && microSet_;
+    //
+    // OWNED LAZILY, AT THE FIRST WRITE. This used to happen up front, "so the
+    // poke sites stay branch-free; a body that never changes pays one clone it
+    // did not need, which only happens to a body the pass has already decided
+    // is reactive." Reactive is not the same as CHANGING: `willScan` admits any
+    // body with a pair rule and a dirty chunk anywhere near it, which during a
+    // fight is every corpse on the ground. So a pile of corpses cloned fifteen
+    // bricks apiece for smoke drifting past, and a clone costs BOTH ceilings —
+    // a model record and ~1.5x the model's words (world.h kMaxMicroBodyModels,
+    // and the owner report it is now sized against). The branch it saved is one
+    // predictable test per poked voxel.
+    int ownState = 0;  // 0 not tried, 1 owned, -1 refused (don't retry per voxel)
+    auto poke = [&](IVec3 p, uint8_t mat) {
+      if (ownState == 0) {
+        if (!b.micro.Valid() || !microSet_) { ownState = -1; return; }
+        const int own = MicroBodyOwn(*microSet_, b.micro.model);
+        // Pool full: the body still really burns, its skin just stops keeping
+        // up — and now says so once (MicroBodySet::refusals).
+        if (own < 0) { ownState = -1; return; }
+        b.micro.model = (uint32_t)own;
+        ownState = 1;
+      }
+      if (ownState < 0) return;
+      MicroBodyPoke(*microSet_, b.micro.model, p.x, p.y, p.z, mat, 0);
+    };
     // The lattice scale is also the divisor for every world-space quantity
     // derived from a body-local coordinate. Getting this wrong does not fail
     // loudly — it puts a scale-8 limb's fire eight cells away from the limb.
@@ -2828,8 +2844,7 @@ void DebrisSystem::BurnBodies(uint32_t tick, World& world,
         // re-derives dims, rebases the origin and re-packs the whole payload —
         // right for a carve (the shape changed), catastrophic per tick for a
         // state change (the shape did not; one voxel's material did).
-        if (canPoke)
-          MicroBodyPoke(*microSet_, b.micro.model, p.x, p.y, p.z, (uint8_t)pm, 0);
+        poke(p, (uint8_t)pm);
       } else {
         if (pm != 0 && pm < matGpu_.size() && opsBudget > 0 &&
             cellOps.size() < kMaxCellOpsPerTick) {
@@ -2851,8 +2866,7 @@ void DebrisSystem::BurnBodies(uint32_t tick, World& world,
           }
         }
         lat.Set(vi, 0, 0);  // compacted below
-        if (canPoke)
-          MicroBodyPoke(*microSet_, b.micro.model, p.x, p.y, p.z, 0, 0);
+        poke(p, 0);
         removed++;
       }
       changed = true;
