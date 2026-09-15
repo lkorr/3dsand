@@ -238,6 +238,11 @@ const char* const kOrder[] = {
     // pours real acid at absolute coordinates, and it regenerates the world on
     // the way out so the gates after it still find pristine terrain (rule 7).
     "mob-burn",
+    // The undead variant. Straight after `mob-burn` because it regenerates
+    // worldgen on the way in, which is exactly what a gate following that one
+    // wants, and it leaves nothing behind: no ticks, no fire, and it resets
+    // mobs and debris on both exits.
+    "undead",
     // Armour reactivity, right after `mob-burn` and for the same reasons: it
     // lights real fires and pours real acid at absolute coordinates, and it
     // regenerates the world on the way out so the gates after it still find

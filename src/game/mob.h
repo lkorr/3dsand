@@ -214,6 +214,49 @@ inline constexpr uint32_t kMaxPhysScale = (uint32_t)(
         ? 1
         : kColliderVoxelsPerMetre / kVoxelsPerMetre);
 
+// ---- WHAT IS ALREADY MISSING (sidecar `rot`) --------------------------------
+//
+// A creature that is born having ALREADY been damaged. Each limb is bitten a
+// few times at spawn, through the ordinary carve path (Mob::CarveLimb), so
+// there is no second notion of "damage" anywhere: the voxels really are gone,
+// the collider and the micro brick really are rebuilt around the holes, hp is
+// charged for the volume exactly as a sword's would be, and `voxelsAtSpawn`
+// stays the PRISTINE count — which is what makes a rotted zombie read as 78%
+// of a body in the HUD instead of as a whole small one.
+//
+// The bites are correlated-noise blobs, the same ValueNoise3 field the blast
+// crater tears with, for the reason the crater note gives at length: an
+// independent draw per voxel has no feature size, so white noise produces
+// speckle and only a smooth field produces a CHUNK. The owner asked for
+// "chunks... largely in groups", and the feature size is `blob`.
+//
+// EVERY LENGTH HERE IS A FRACTION OF THE LIMB'S OWN EXTENT, never an absolute
+// voxel count. A hand and a torso differ by two orders of magnitude in volume,
+// and a radius authored in voxels would erase one and graze the other; the
+// same numbers on a critter and on mina have to mean the same thing.
+struct MobRotDef {
+  bool enabled = false;
+  // Bites per limb, inclusive. Rolled per (mob, limb), so two zombies from the
+  // same def are missing different pieces — that is the point of the feature.
+  int bitesMin = 0, bitesMax = 2;
+  // Bite radius as a fraction of the limb's bounding-sphere radius.
+  float radiusMin = 0.22f, radiusMax = 0.46f;
+  // Ceiling on the fraction of a limb's volume the whole rot may take. Enforced
+  // by SCALING THE RADII DOWN before carving, not by stopping part-way: a bite
+  // abandoned half-done would leave a lopsided hole, and the cap has to hold on
+  // a hand as firmly as on a torso. Well under Mob::kLimbCollapseFraction
+  // (0.25 LEFT is a collapse) by default, so rot never severs at spawn.
+  float maxLoss = 0.22f;
+  // Correlated-noise feature size in SKIN voxels: how big one torn-away piece
+  // is. Same units and same field as gore.carveBlobSize.
+  float blob = 2.5f;
+  // Radius multiplier on a `vital` limb. A chunk out of the skull is the look;
+  // losing the head at spawn is a corpse that never walked.
+  float vitalScale = 0.55f;
+  // Limb NAMES or TAGS never bitten. A rig that would rather keep its hands.
+  std::vector<std::string> skip;
+};
+
 struct MobDef {
   std::string name;
   Prefab prefab;               // one model per limb
@@ -243,6 +286,10 @@ struct MobDef {
   // what every body did before 2026-09-14, and it is the setting to put on a
   // zombie: nothing else in the rig has to change for a corpse that comes
   // apart as it walks. See the long note on BurnLimbView's wound fields.
+  //
+  // DEFAULTS TO FALSE ON AN UNDEAD DEF (`MobDef::undead`), because that is the
+  // whole content of the word — see the note there. An explicit
+  // `bleed.woundHeals` still wins either way.
   bool woundHeals = true;
   // WHICH MATERIALS ARE TISSUE, per material id: the ones a wound soaks. A
   // material is tissue when its `rubble` is this creature's blood (skin, flesh
@@ -254,6 +301,25 @@ struct MobDef {
   // the pre-anatomy behaviour.
   std::vector<uint8_t> tissue;
   float bleedPerDamage = 1.5f; // wound budget voxels per point of damage
+  // ---- IS THIS THING ALIVE? (sidecar `undead`) -----------------------------
+  //
+  // One flag, and deliberately only two consequences, because "undead" here is
+  // a CONTENT word and not an engine subsystem:
+  //
+  //   * `woundHeals` defaults to FALSE. Living flesh dries a cut back to meat;
+  //     a corpse's cut goes on rotting outward until the part drops off. That
+  //     is byte-for-byte the pre-2026-09-14 behaviour, which the owner asked to
+  //     keep for the walking dead precisely because limbs coming off looked
+  //     right on them and wrong on everything else.
+  //   * `rot` is honoured at spawn. A living creature is born whole.
+  //
+  // NOTHING ELSE BRANCHES ON IT, and adding a branch here should feel like a
+  // decision rather than a convenience: the slower walk, the paler skin and the
+  // softer joints of a zombie are all ordinary sidecar numbers, and they stay
+  // ordinary sidecar numbers so that "undead" does not quietly become the name
+  // of a second creature pipeline. A ghoul that sprints is then one file.
+  bool undead = false;
+  MobRotDef rot;
   float speed = 4.0f;          // voxels/sec walk speed
   // Micro-voxel AUTHORING scale (docs/PLAN_voxel_editor.md §C): 1 = the legacy
   // path (limb .vox coords ARE world voxels, drawn as instanced cubes), 2|4|8 =
@@ -1825,6 +1891,16 @@ class Mob {
                  CarveReport* report = nullptr);
   bool ReskinLimbMicro(MobLimb& limb, uint32_t skinScale, uint32_t physScale);
   bool RebuildLimbBody(int limbIndex);
+  // ---- BORN BITTEN (MobRotDef) ---------------------------------------------
+  // Runs ONCE, from MobSystem::Spawn, immediately after BuildRig and before the
+  // creature is published. Carves the def's `rot` blobs out of every eligible
+  // limb through CarveLimb, so the holes are real geometry and the hp charge is
+  // the ordinary one. Returns the number of voxels it removed across the rig
+  // (0 for anything that is not rotted), which is what the `undead` gate reads.
+  //
+  // NOT called from the save-load overlay: a saved zombie already has its holes
+  // in its saved lattice, and rotting it again on every load would eat it.
+  uint32_t RotAtSpawn(World& world);
 
  public:
   // ---- MEND (docs/PLAN_magic_grammar.md §7; game/spell.h verb `mend`) -------
@@ -2246,6 +2322,16 @@ class Mob {
   // Re-entrancy guard: FlushBurn expresses itself as a CarveLimb, and
   // CarveLimb flushes before it reads the lattice.
   bool inBurnFlush_ = false;
+  // ---- "THESE HOLES ARE OLD" -------------------------------------------------
+  // Set for the duration of RotAtSpawn's carves, and read by the same line that
+  // already refuses to bleed a burning limb or a garment: a creature born
+  // bitten is not bleeding from those bites. Without it a zombie would arrive
+  // haemorrhaging from every hole it has ever had and paint the ground red the
+  // moment it walked into view, which is the opposite of what "already
+  // wounded" should look like. The HP CHARGE is deliberately outside it, for
+  // the reason the burn exclusion gives: the damage is real, only the blood is
+  // refused.
+  bool inSpawnRot_ = false;
   // ---- "THIS CARVE IS AN EDGE, NOT A BLAST OR A FIRE" ------------------------
   //
   // Set for the duration of Mob::CutLimb's carve, and read by exactly two
@@ -3219,6 +3305,10 @@ class MobSystem {
   World* world_ = nullptr;
   DebrisSystem* debris_ = nullptr;
   MicroBodySet* microSet_ = nullptr;  // shared brick pool; see SetMicroSet
+  // True only inside LoadState. Spawn() honours MobRotDef unless this is set:
+  // a saved creature already carries the holes it was born with, in its saved
+  // lattice, and biting it again on every load would eat it.
+  bool loading_ = false;
   std::vector<float> densityOf_;
   std::vector<uint32_t> classOf_;
   // ---- burn tables, rebuilt on materials hot-reload --------------------------

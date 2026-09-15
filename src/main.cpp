@@ -2850,6 +2850,28 @@ int RunMobShot(GpuContext& ctx, World& world, Simulation& sim, Physics& phys,
   // no avatar, which the registry represents explicitly (nullptr) — all three
   // arrays still agree with each other by construction, which is the property
   // the hand-rolled version here had silently lost.
+  // ---- THE BRICKS THEMSELVES, which this harness used to never send --------
+  //
+  // A limb's micro brick is uploaded once at startup (UploadMicroBodies, after
+  // the mob defs load) and then again only from the FRAME LOOP's `if
+  // (mbSet.dirty)`. RunMobShot is not the frame loop: it runs its own ticks and
+  // renders its own frames, so every brick edit made after boot — a
+  // copy-on-write clone from a carve, a burn's per-voxel poke, and now a
+  // creature born bitten (MobRotDef) — stayed on the CPU and the GPU went on
+  // marching the pristine model, or none at all.
+  //
+  // The symptom is that the affected limbs DO NOT DRAW. Measured with the
+  // undead: eleven of fifteen limbs were carved at spawn and eleven of fifteen
+  // were invisible, the four that rendered being exactly the four that happened
+  // to roll zero bites — with the rig itself perfectly healthy (every limb had
+  // its own micro record, its own body and its full voxel count).
+  //
+  // Which makes it a real hole in what this harness is FOR: it exists to answer
+  // "what does a damaged body actually look like" without a live session, and
+  // damage was the one thing it could not photograph.
+  if (MicroBodySet* mbs = debris.MicroSet(); mbs != nullptr && mbs->dirty)
+    sim.UploadMicroBodies(ctx.queue, *mbs);
+
   BodyRegistry bodyReg(debris, mobs, nullptr);
   std::vector<BodyXformGpu> xf;
   bodyReg.BuildXforms(xf);

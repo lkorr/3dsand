@@ -1,0 +1,39 @@
+{
+  "//": "THE WALKING DEAD. A human that is paler, slower, already bitten, and whose cuts do not close. There is no zombie.vox and there should not be one: `extends` pulls in human.json's whole rig (limbs, chains, clips, states, sockets, anatomy) and `model` follows it to human.vox, so this creature keeps tracking the human as the human is edited — including what is under its skin, which is BAKED into the .vox by scripts/anatomize_mob.mjs and would silently diverge in a copy. Everything below is an override; RFC 7396 merge-patch, so an array or a number replaces and an object merges key by key (see the note above LoadMobDefs in src/game/mob.cpp).",
+
+  "extends": "human",
+
+  "//undead": "Two consequences and no more (MobDef::undead): `bleed.woundHeals` defaults to false here, and the `rot` block below is honoured at spawn. Everything else that makes a zombie a zombie is an ordinary sidecar number, on purpose.",
+  "undead": true,
+
+  "//palette": "A FILTER over human.vox's art palette, not a colour table -- restating the colours would be a copy of the art by another route, which is the thing `extends` exists to avoid. Applied before the merged palette dedupes by RGB, so the human is untouched. Chroma down to a bit under half, a touch lighter, and a fifth of the way toward a sickly grey-green.",
+  "palette": {
+    "saturation": 0.45,
+    "brightness": 1.05,
+    "tint": "#B9C3AE",
+    "tintAmount": 0.18
+  },
+
+  "//rot": "WHAT IT ARRIVED MISSING. Up to three bites per limb, each a correlated-noise blob so the loss comes off in groups rather than as speckle, rolled per (mob, limb) so no two are alike -- and 0 is in the range on purpose, so roughly a quarter of the limbs are untouched and the damage reads as random rather than as a uniform coating. Radii are FRACTIONS of each limb's own extent, so a hand and a torso read the same. THE BITES ARE DRAWN GENEROUSLY AND THEN FITTED TO `maxLoss`, which is what makes maxLoss the knob to turn: it is the ceiling on one limb's volume, enforced by shrinking every bite by a common factor rather than by dropping any (a bite abandoned part-way leaves a lopsided hole, and the total would depend on the order the draws came out). 0.18 against Mob::kLimbCollapseFraction, which severs a limb at 0.25 REMAINING -- so rot is never what takes a part off at spawn. Vital limbs (head, torso) get vitalScale on both the radius and the budget: a chunk out of the skull is the look, losing it before the first step is a corpse that never walked.",
+  "rot": {
+    "bites": [0, 4],
+    "radius": [0.35, 0.62],
+    "maxLoss": 0.18,
+    "blob": 3.0,
+    "vitalScale": 0.55
+  },
+
+  "//bleed": "Merged over human's block, so `material` and `perDamage` are inherited. woundHeals is stated rather than left to the `undead` default because THIS is the behaviour the owner asked for by name: a cut goes on rotting outward until the part drops off, which is what every body did before 2026-09-14 and what looked right on the undead and wrong on everything else.",
+  "bleed": {
+    "woundHeals": false
+  },
+
+  "//speed": "31.5 -> 23.5 world voxels/sec. The gait cadence comes down with it (8 -> 6.4) so the STRIDE shortens a little rather than the legs spinning faster to cover less ground -- stride length is speed/cadence, 3.94 for a human and 3.67 here.",
+  "speed": 23.5,
+  "gait": {
+    "cadence": 6.4,
+    "stepHeight": 0.06,
+    "leadTime": 0.14,
+    "stepDuration": 0.14
+  }
+}

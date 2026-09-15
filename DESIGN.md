@@ -4230,6 +4230,119 @@ two ticks a level, a value an author can set -- it falls to 62 in 47 ticks; a
 direct deposit on a stone cell of the room reads blood's slot at amount 5 and
 the cell is still stone.
 
+### A creature is a variant of another creature (2026-09-15; sidecar `extends`/`model`/`palette`, `MobDef::undead`, `MobRotDef`, `Mob::RotAtSpawn`, gate `undead`)
+
+A zombie is a human who walks slower, is paler, does not heal, and arrives
+already bitten. Four differences, none of them geometry — and the first design
+question is therefore not "how do we carve a zombie" but "how does a creature
+exist that is MOSTLY another creature".
+
+The answer the mob loader used to give was: it cannot. Discovery was "every
+`.vox` in `assets/mobs/`, paired with the `.json` beside it", which makes the
+ART the identity of a creature. Adding a zombie that way means copying
+`human.vox` — a 150 KB binary that stops tracking the original the first time
+anybody edits the human, which is the unowned-diverging-representation failure
+design guideline 3 exists to prevent, and worse here than usual because the
+**anatomy is baked into the `.vox`** (`scripts/anatomize_mob.mjs`): the copy
+would quietly diverge in what is under its skin and no test anywhere would say
+so. The 64 KB sidecar would have to be duplicated too, rig and clips and all.
+
+So a def is now named for its SIDECAR, and the sidecar says what it wears:
+
+| key | meaning |
+|---|---|
+| `"model": "<stem>"` | use `<stem>.vox` instead of my own |
+| `"extends": "<stem>"` | ...and start from `<stem>.json`'s contents |
+
+`extends` implies `model`, and is resolved by RFC 7396 merge-patch: objects
+merge key by key, an array or scalar REPLACES wholesale, and an explicit `null`
+deletes. That is what a rig override actually wants — `"speed": 22` replaces a
+number, `"limbs": [...]` replaces the whole list rather than merging fifteen
+entries positionally, and `"clips": {"walk": {"durationMs": 900}}` reaches one
+field of one clip without restating its tracks. Depth-bounded at 8 (the bound is
+the diagnostic; a cycle and an eight-deep chain are the same content mistake).
+A `.json` with neither key and no `.vox` of its own is **not a mob** and is
+passed over in silence — that is what `attack_styles.json` and `behaviors.json`
+are, and keying on the field rather than on a filename blocklist means the next
+shared table in that directory needs no code change.
+
+`assets/mobs/zombie.json` is 30 lines and there is no `zombie.vox`.
+
+**The recolour is a FILTER, not a colour table.** `palette` takes
+`saturation`, `brightness`, `tint` + `tintAmount` and is applied to the def's
+copy of the prefab's art palette *before* `MicroBodyMergeArt` folds it into the
+shared one — which is also why it must happen there, since the merge dedupes by
+RGB and recolouring afterwards would repaint the human too. Desaturation is
+about Rec. 709 luma rather than the channel mean, because a mean desaturate
+darkens reds and lightens greens, which on skin reads as the wrong ethnicity
+rather than as the wrong health. A per-slot table was rejected for the reason
+the `.vox` copy was: restating dozens of authored colours is a copy of the art
+by another route, and a filter keeps tracking the original.
+
+**`undead` is a content word, not a subsystem.** It does exactly two things:
+it defaults `bleed.woundHeals` to false, and it makes `rot` apply at spawn.
+Nothing else in the engine branches on it, and that is deliberate — the slower
+walk, the paler skin and the shorter stride are ordinary sidecar numbers and
+stay ordinary sidecar numbers, so that "undead" never becomes the name of a
+second creature pipeline. A ghoul that sprints is one file.
+
+The `woundHeals` half is the owner's ask restated: the 2026-09-14 wound-heal
+work (see *A wound is seen*) stopped blood evaporation hollowing limbs out, and
+in doing so stopped limbs falling off a few seconds after a hit. That looked
+*right* on the walking dead and wrong on everything else, so `woundHeals: false`
+is byte-for-byte the old behaviour, per creature.
+
+**Rot is the ordinary carve, not a second notion of damage.** `Mob::RotAtSpawn`
+hands a few blobs per limb to `CarveLimb` — the same function a sword, a blast
+and a fire reach. The holes are real geometry, the collider and the micro brick
+are rebuilt around them, the connectivity split runs, and hp is charged for the
+volume exactly as any other damage would be. It runs after the mob is pushed
+into `mobs_` (a carve clones the brick copy-on-write, rebuilds the Jolt body and
+can re-enter the system by id to sever) and before `Spawn` returns, so
+`voxelsAtSpawn` is the PRISTINE count — a rotted zombie reads as three-quarters
+of a body rather than as a whole small one. `MobSystem::loading_` keeps it off
+the save path, where the holes are already in the saved lattice.
+
+Four properties worth stating because each cost something to get right:
+
+* **Every length is a FRACTION of the limb's own extent.** A hand and a torso
+  differ by two orders of magnitude in volume; a radius in voxels would erase
+  one and graze the other.
+* **The bites are drawn generously and then FITTED to `maxLoss`**, by shrinking
+  every radius by a common cube root rather than by dropping any. A bite
+  abandoned part-way leaves a lopsided hole and makes the total depend on the
+  order the draws came out. This is also what makes `maxLoss` the knob an author
+  turns: before it bound, it was inert and the result was whatever the radii
+  happened to be — measured, 2.2% loss against an authored 20%.
+* **The loss comes off in GROUPS.** Pure correlated value noise, no white-noise
+  term, at feature size `blob` — the same argument the blast crater's
+  `carveBlobSize` makes at length: an independent draw per voxel has no feature
+  size, so no falloff shape can turn speckle into a chunk. Two level
+  corrections make it work: the noise is stretched about its mean (trilinear
+  value noise piles up around 0.5 at σ≈0.146 against a uniform 0.289), and
+  **each bite is recentred on the noise at its own centre**. Without the second,
+  `blob` and the bite radius being the same order — which is the whole point —
+  meant a bite sampled roughly ONE value and then removed everything or nothing,
+  and most bites lost that coin flip and vanished.
+* **The holes are OLD.** `Mob::inSpawnRot_` joins the burn and the garment on
+  the line that decides whether a carve bleeds. The hp charge stays outside it,
+  for the reason the burn exclusion gives: the damage is real, only the blood is
+  refused. Without it a zombie arrives haemorrhaging from every hole it has ever
+  had.
+
+Gate `undead` asserts all of it against a **living control arm** — the same
+measurement on a human must come back zero, or "voxels are missing" is not a
+result — plus two spawns of the same def differing per-limb (a per-def seed
+would pass every other claim and produce an army of identical corpses), and a
+spur count, since a voxel COUNT cannot tell a torn chunk from a fine sprinkle.
+
+One bug found on the way out, and it was not in this feature: `--shot-mob`
+renders its own frames and so never ran the frame loop's `if (mbSet.dirty)
+UploadMicroBodies`, meaning **no brick edited after boot ever reached the GPU
+there** — every carved, burnt or rotted limb silently did not draw. The harness
+exists to answer "what does a damaged body look like" without a live session,
+and damage was the one thing it could not photograph.
+
 ### What is under the skin (2026-09-02; `assets/editor/anatomy.js`, sidecar `anatomy`, `scripts/anatomize_mob.mjs`)
 
 Every limb was skin all the way through. A cut face showed skin, a burn-through
@@ -5466,7 +5579,6 @@ figures above, and — the arm that matters most — **a ray still hits it**, si
 a "fix" that hid props from queries too would pass everything else while
 silently deleting melee). `npc-block` pins the WIRING, because it is the one
 gate with an NPC standing in the world holding a real drawn blade.
-
 
 ### Mob steering: intent vs actuation (2026-08-21; `game/mob.cpp`)
 

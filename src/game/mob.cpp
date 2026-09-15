@@ -415,6 +415,229 @@ static std::vector<ClipLibraryEntry> LoadClipLibrary(const std::string& dir,
   return lib;
 }
 
+// ---- A MOB IS A SIDECAR AND SOME ART, AND THEY NEED NOT BE THE SAME FILE ----
+//
+// Discovery used to be "every .vox in the directory, paired with the .json
+// beside it", which made the ART the identity of a creature. That is the wrong
+// way round the moment two creatures want the same body: a zombie is a human
+// who walks slower, is paler and does not heal, and duplicating human.vox to
+// say so buys a 150 KB binary that silently stops tracking the original the
+// first time anybody edits the human — the unowned-diverging-representation
+// failure design guideline 3 is about, and worse here than usual because the
+// ANATOMY is baked into the .vox (scripts/anatomize_mob.mjs), so the copy would
+// diverge in what is under its skin and nothing would say so.
+//
+// So a def is named for its SIDECAR, and the sidecar says which art it wears:
+//
+//   "model":   "<stem>"  — use <stem>.vox instead of my own
+//   "extends": "<stem>"  — and start from <stem>.json's contents
+//
+// `extends` implies `model` (a rig that inherits a skeleton wants the body that
+// skeleton was authored against), so zombie.json states one of them, not two.
+//
+// A .json with NEITHER and no .vox of its own is not a mob at all and is passed
+// over in silence — that is what attack_styles.json and behaviors.json are, and
+// keying on the presence of the field rather than on a filename blocklist means
+// the next shared table in this directory needs no code change.
+struct MobSource {
+  std::string name;      // def name = the SIDECAR's stem
+  std::string voxPath;
+  std::string jsonPath;
+};
+
+// `extends` is resolved by RFC 7396 merge-patch (nlohmann's `merge_patch`):
+// objects merge key by key, an ARRAY OR SCALAR REPLACES WHOLESALE, and an
+// explicit `null` DELETES the inherited key. That is exactly the behaviour a
+// rig override wants — `"speed": 22` replaces a number, `"limbs": [...]`
+// replaces the whole limb list rather than merging fifteen entries positionally
+// (which would be meaningless), and `"clips": {"walk": {"durationMs": 900}}`
+// reaches one field of one clip without restating its tracks.
+constexpr int kMaxSidecarExtends = 8;
+
+static bool ReadSidecarJson(const std::string& path, json& out,
+                            std::string& log) {
+  std::ifstream f(path);
+  if (!f) {
+    log += path + ": missing sidecar\n";
+    return false;
+  }
+  try {
+    out = json::parse(f);
+  } catch (const std::exception& e) {
+    log += path + ": JSON parse error: " + std::string(e.what()) + "\n";
+    return false;
+  }
+  if (!out.is_object()) {
+    log += path + ": sidecar is not a JSON object — skipped\n";
+    return false;
+  }
+  return true;
+}
+
+// Depth-bounded rather than cycle-detected: the bound is the diagnostic. A rig
+// eight deep is already a content mistake and a cycle is the same mistake with
+// a hang attached, so one check answers both.
+static bool ResolveSidecar(const std::string& dir, const std::string& path,
+                           json& out, std::string& log, int depth) {
+  if (depth > kMaxSidecarExtends) {
+    log += path + ": `extends` nested more than " +
+           std::to_string(kMaxSidecarExtends) + " deep (a cycle?) — skipped\n";
+    return false;
+  }
+  json child;
+  if (!ReadSidecarJson(path, child, log)) return false;
+  const std::string base = child.value("extends", std::string());
+  if (base.empty()) {
+    out = std::move(child);
+    return true;
+  }
+  json parent;
+  const std::string bp =
+      (std::filesystem::path(dir) / (base + ".json")).string();
+  if (!ResolveSidecar(dir, bp, parent, log, depth + 1)) {
+    log += path + ": extends \"" + base + "\", which did not load — skipped\n";
+    return false;
+  }
+  // Not inherited: an `extends` chain is resolved here, once, and a def that
+  // carried the key downstream would invite a second reader to resolve it
+  // again against a different base.
+  child.erase("extends");
+  parent.merge_patch(child);
+  out = std::move(parent);
+  return true;
+}
+
+// Which .vox a sidecar wears: its own `model`, else the art of whatever it
+// extends (transitively), else the file beside it. Returns the STEM.
+static std::string ModelStemFor(const std::string& dir, const std::string& stem,
+                                int depth) {
+  if (depth > kMaxSidecarExtends) return stem;
+  const std::string jp = (std::filesystem::path(dir) / (stem + ".json")).string();
+  std::ifstream f(jp);
+  if (!f) return stem;
+  json j;
+  try {
+    j = json::parse(f);
+  } catch (const std::exception&) {
+    return stem;  // the real parse reports it; this pass only routes
+  }
+  if (!j.is_object()) return stem;
+  const std::string model = j.value("model", std::string());
+  if (!model.empty()) return model;
+  const std::string base = j.value("extends", std::string());
+  if (!base.empty()) return ModelStemFor(dir, base, depth + 1);
+  return stem;
+}
+
+static std::vector<MobSource> CollectMobSources(const std::string& dir,
+                                                std::string& log,
+                                                std::error_code& ec) {
+  std::vector<MobSource> src;
+  std::vector<std::string> voxStems, jsonStems;
+  for (auto& e : std::filesystem::directory_iterator(dir, ec)) {
+    if (!e.is_regular_file()) continue;
+    const std::string ext = e.path().extension().string();
+    if (ext == ".vox") voxStems.push_back(e.path().stem().string());
+    else if (ext == ".json") jsonStems.push_back(e.path().stem().string());
+  }
+  if (ec) return src;
+  // Sorted for a stable hot-reload order, which is also a stable def INDEX
+  // order — the spawn UI and every save file address defs by index.
+  std::sort(voxStems.begin(), voxStems.end());
+  std::sort(jsonStems.begin(), jsonStems.end());
+  auto path = [&](const std::string& stem, const char* ext) {
+    return (std::filesystem::path(dir) / (stem + ext)).string();
+  };
+  auto hasVox = [&](const std::string& s) {
+    return std::binary_search(voxStems.begin(), voxStems.end(), s);
+  };
+  // Own-art defs first, in name order, so adding a derived creature cannot
+  // renumber the ones that were already there.
+  for (const std::string& s : voxStems)
+    src.push_back({s, path(s, ".vox"), path(s, ".json")});
+  for (const std::string& s : jsonStems) {
+    if (hasVox(s)) continue;  // already paired above
+    const std::string model = ModelStemFor(dir, s, 0);
+    if (model == s) continue;  // no `model`, no `extends`: a shared table
+    if (!hasVox(model)) {
+      log += path(s, ".json") + ": wears model \"" + model +
+             "\", and there is no " + model + ".vox in this directory\n";
+      continue;
+    }
+    src.push_back({s, path(model, ".vox"), path(s, ".json")});
+  }
+  return src;
+}
+
+// ---- RECOLOURING ONE CREATURE'S ART (sidecar `palette`) --------------------
+//
+// The other half of "a zombie is a human": the paint, not the geometry. A
+// prefab's art palette is a flat list of RGB (voxload.h), so a whole-body
+// recolour is a function on that list applied before MicroBodyMergeArt folds it
+// into the shared one — which is also WHY it has to happen here and not later.
+// The merge deduplicates by RGB, so two defs painted the same colour share one
+// slot; recolouring after the merge would repaint the human as well.
+//
+// Three operations, applied in this order, all of them optional:
+//
+//   "saturation": x   multiply chroma about the luma (0 = grey, 1 = unchanged)
+//   "brightness": x   multiply luma (1 = unchanged)
+//   "tint": "#RRGGBB" + "tintAmount": 0..1   lerp toward a colour
+//
+// Deliberately NOT a per-slot colour table. A creature's palette is authored
+// art with dozens of entries, and a variant that restated them would be a copy
+// of the art by another route — the same divergence `model` exists to avoid.
+// This is a filter, so it keeps tracking the original.
+static void ApplyPaletteRecolour(const json& p, std::vector<uint32_t>& colors,
+                                 const std::string& where, std::string& log) {
+  if (!p.is_object()) {
+    log += where + ": `palette` is not an object — ignored\n";
+    return;
+  }
+  const float sat = p.value("saturation", 1.0f);
+  const float bright = p.value("brightness", 1.0f);
+  float amount = std::clamp(p.value("tintAmount", 0.0f), 0.0f, 1.0f);
+  uint32_t tint = 0;
+  if (p.contains("tint")) {
+    const std::string hex = p["tint"].is_string()
+                                ? p["tint"].get<std::string>()
+                                : std::string();
+    const size_t at = hex.find_first_not_of('#');
+    if (at == std::string::npos || hex.size() - at != 6) {
+      log += where + ": palette.tint \"" + hex +
+             "\" is not #RRGGBB — tint ignored\n";
+      amount = 0.0f;
+    } else {
+      tint = (uint32_t)std::strtoul(hex.substr(at).c_str(), nullptr, 16);
+      // A tint with no amount is a no-op that reads like a bug in the file.
+      if (!p.contains("tintAmount")) amount = 1.0f;
+    }
+  }
+  if (sat == 1.0f && bright == 1.0f && amount == 0.0f) return;
+  auto chan = [](float v) {
+    return (uint32_t)std::clamp((int)std::lround(v), 0, 255);
+  };
+  for (uint32_t& c : colors) {
+    if (c == 0) continue;  // unused slot (voxload zero-fills the 128)
+    float r = (float)((c >> 16) & 0xFF);
+    float g = (float)((c >> 8) & 0xFF);
+    float b = (float)(c & 0xFF);
+    // Rec. 709 luma: a desaturate that used the plain mean would darken reds
+    // and lighten greens, which on skin reads as the wrong ethnicity rather
+    // than as the wrong health.
+    const float y = 0.2126f * r + 0.7152f * g + 0.0722f * b;
+    r = (y + (r - y) * sat) * bright;
+    g = (y + (g - y) * sat) * bright;
+    b = (y + (b - y) * sat) * bright;
+    if (amount > 0.0f) {
+      r += ((float)((tint >> 16) & 0xFF) - r) * amount;
+      g += ((float)((tint >> 8) & 0xFF) - g) * amount;
+      b += ((float)(tint & 0xFF) - b) * amount;
+    }
+    c = (chan(r) << 16) | (chan(g) << 8) | chan(b);
+  }
+}
+
 bool LoadMobDefs(const std::string& dir, const std::vector<MaterialDef>& mats,
                  std::vector<MobDef>& out, MicroBodySet& micro,
                  std::string& log) {
@@ -440,27 +663,37 @@ bool LoadMobDefs(const std::string& dir, const std::vector<MaterialDef>& mats,
     MicroBodySetStainSlots(micro, std::move(slotOfMat));
   }
   std::error_code ec;
-  std::vector<std::string> voxPaths;
-  for (auto& e : std::filesystem::directory_iterator(dir, ec))
-    if (e.is_regular_file() && e.path().extension() == ".vox")
-      voxPaths.push_back(e.path().string());
+  const std::vector<MobSource> sources = CollectMobSources(dir, log, ec);
   if (ec) return true;  // no mob dir: nothing to load
-  std::sort(voxPaths.begin(), voxPaths.end());
   // The shared clip library lives BESIDE the mob dir (assets/anims/), not in
   // it: it is authored per clip, not per creature, and the tuner writes it
   // through its own /api/model route.
   const std::vector<ClipLibraryEntry> clipLib = LoadClipLibrary(
       (std::filesystem::path(dir).parent_path() / "anims").string(), log);
 
-  for (const std::string& vp : voxPaths) {
+  for (const MobSource& src : sources) {
+    // THE SIDECAR IS READ FIRST, because the art merge below is no longer
+    // unconditional: `palette` recolours this def's copy of the art, and the
+    // merge deduplicates by RGB, so the recolour has to be in place before the
+    // fold or the two defs would share the original's slots.
+    const std::string& jp = src.jsonPath;
+    json j;
+    if (!ResolveSidecar(dir, jp, j, log, 0)) continue;
+
     MobDef def;
     std::string err, warn;
-    if (!LoadVoxFile(vp, mats.size(), def.prefab, err, warn)) {
-      log += vp + ": " + err;
+    if (!LoadVoxFile(src.voxPath, mats.size(), def.prefab, err, warn)) {
+      log += src.voxPath + ": " + err;
       continue;
     }
     log += warn;
-    def.name = def.prefab.name;
+    // Named for the SIDECAR, not for the art: two creatures may wear one .vox
+    // and they are not the same creature. Identical to the old behaviour for
+    // every def that owns its own file, which is all of them but the variants.
+    def.name = src.name;
+
+    if (j.contains("palette"))
+      ApplyPaletteRecolour(j["palette"], def.prefab.artColors, jp, log);
 
     // Fold this file's art colours into the one palette every def resolves
     // against, and rewrite its voxels' slots to the merged numbering NOW —
@@ -474,21 +707,61 @@ bool LoadMobDefs(const std::string& dir, const std::vector<MaterialDef>& mats,
           if (v.color) v.color = remap[v.color];
     }
 
-    std::string jp = vp.substr(0, vp.size() - 4) + ".json";
-    std::ifstream f(jp);
-    if (!f) {
-      log += def.name + ": missing sidecar " + jp + " — skipped\n";
-      continue;
-    }
-    json j;
-    try {
-      j = json::parse(f);
-    } catch (const std::exception& e) {
-      log += jp + ": JSON parse error: " + e.what() + "\n";
-      continue;
-    }
-
     std::string root = j.value("root", "");
+    // ---- UNDEAD (MobDef::undead) -------------------------------------------
+    // Read BEFORE `bleed`, because it moves the default `bleed.woundHeals`
+    // lands on and an explicit key in the block below must still win.
+    if (j.contains("undead")) {
+      if (j["undead"].is_boolean()) def.undead = j["undead"].get<bool>();
+      else log += jp + ": undead: expected true or false\n";
+    }
+    if (def.undead) def.woundHeals = false;
+    // ---- BORN BITTEN (MobRotDef) -------------------------------------------
+    if (j.contains("rot")) {
+      const json& r = j["rot"];
+      if (!r.is_object()) {
+        log += jp + ": `rot` is not an object — ignored\n";
+      } else {
+        MobRotDef& rd = def.rot;
+        rd.enabled = r.value("enabled", true);
+        // A [min, max] pair, because a rig whose every limb lost the same
+        // amount reads as a design rather than as damage. A bare number is
+        // accepted and means "exactly this".
+        auto range = [&](const char* key, float& lo, float& hi) {
+          if (!r.contains(key)) return;
+          const json& v = r[key];
+          if (v.is_number()) {
+            lo = hi = v.get<float>();
+          } else if (v.is_array() && v.size() == 2 && v[0].is_number() &&
+                     v[1].is_number()) {
+            lo = v[0].get<float>();
+            hi = v[1].get<float>();
+          } else {
+            log += jp + ": rot." + key +
+                   ": expected a number or [min, max]\n";
+            return;
+          }
+          if (hi < lo) std::swap(lo, hi);
+        };
+        float bl = (float)rd.bitesMin, bh = (float)rd.bitesMax;
+        range("bites", bl, bh);
+        rd.bitesMin = std::max(0, (int)std::lround(bl));
+        rd.bitesMax = std::max(rd.bitesMin, (int)std::lround(bh));
+        range("radius", rd.radiusMin, rd.radiusMax);
+        rd.radiusMin = std::clamp(rd.radiusMin, 0.0f, 2.0f);
+        rd.radiusMax = std::clamp(rd.radiusMax, rd.radiusMin, 2.0f);
+        // Hard-capped at kLimbCollapseFraction's complement with room to
+        // spare: rot must never be the thing that takes a limb off at spawn,
+        // or a zombie's head could roll before it had taken a step.
+        rd.maxLoss = std::clamp(r.value("maxLoss", rd.maxLoss), 0.0f, 0.5f);
+        rd.blob = std::max(0.5f, r.value("blob", rd.blob));
+        rd.vitalScale = std::clamp(r.value("vitalScale", rd.vitalScale), 0.0f,
+                                   1.0f);
+        if (r.contains("skip") && r["skip"].is_array())
+          for (const auto& s : r["skip"])
+            if (s.is_string()) rd.skip.push_back(s.get<std::string>());
+      }
+    }
     if (j.contains("bleed")) {
       std::string bm = j["bleed"].value("material", "");
       int id = FindMaterialId(mats, bm);
@@ -1670,6 +1943,29 @@ uint64_t MobSystem::Spawn(int defIndex, IVec3 atVoxel) {
                               (float)atVoxel.z}))
     return 0;
   mobs_.push_back(std::move(mob));
+  // BORN BITTEN (MobRotDef), and it has to be HERE — after the push, not before
+  // it. A carve is not a pure edit of the limb list: it clones the limb's micro
+  // brick copy-on-write, rebuilds the Jolt body, and can re-enter this system by
+  // mob ID to sever or to kill. Carving the local `mob` and then moving it into
+  // `mobs_` left every one of those pointing at the moved-from object, and the
+  // symptom was a zombie whose bitten limbs simply did not draw: measured with
+  // --shot-mob against a `rot.enabled: false` control arm, the whole upper body
+  // was invisible with rot on and perfect with it off.
+  //
+  // `voxelsAtSpawn` is still the PRISTINE count, which is the property that
+  // actually mattered about doing it early — BuildRig took it, and a carve only
+  // ever moves the live count. And the creature is still unpublished to the
+  // caller (Spawn has not returned its id), so nobody outside can have seen the
+  // whole version.
+  //
+  // ...EXCEPT ON A LOAD. LoadState calls Spawn to derive everything the save
+  // deliberately does not carry, then OVERLAYS the saved lattice and hp — so a
+  // saved zombie already has its holes, and rotting it again would charge a
+  // second set of bites to a body that is about to have its real ones restored.
+  // The overlay would mostly paper over it, which is the dangerous part: the
+  // one case it could not is a rot bite severing a limb before the overlay
+  // runs, reshaping the list the overlay is about to index.
+  if (world_ != nullptr && !loading_) mobs_.back().RotAtSpawn(*world_);
   instancesDirty_ = true;
   return mobs_.back().id_;
 }
@@ -7805,6 +8101,10 @@ bool Mob::CarveLimb(int limbIndex, World& world,
   // mistake: this function is reached by causes that are not a cut, and it was
   // written as though every caller were one.
   //
+  //   * A CREATURE BORN BITTEN IS NOT BLEEDING FROM THOSE BITES. RotAtSpawn's
+  //     holes are the damage a zombie ARRIVED with, and a fresh drip budget on
+  //     every one of them would have it haemorrhage its way across the map from
+  //     the first frame. See Mob::inSpawnRot_.
   //   * A GARMENT HAS NO BLOOD IN IT. A shell is a borrowed rig slot, so
   //     `def.bleedMat` — the WEARER's blood — was being sprayed out of a
   //     burning robe. See Mob::IsWornSlot.
@@ -7817,7 +8117,7 @@ bool Mob::CarveLimb(int limbIndex, World& world,
   //
   // The HP CHARGE above is deliberately outside both: fire still kills you, and
   // a burnt shell still loses its own durability. Only the blood is refused.
-  const bool bleeds = !inBurnFlush_ && !IsWornSlot(limbIndex);
+  const bool bleeds = !inBurnFlush_ && !inSpawnRot_ && !IsWornSlot(limbIndex);
   // ---- WHERE THE MATTER ACTUALLY LEFT ---------------------------------------
   // Centroid and spread of what was removed, in limb-local WORLD voxels — the
   // frame woundLocal is read in (PreTick rotates it by the limb's live quat).
@@ -10374,6 +10674,365 @@ bool Mob::CarveLimbRadial(uint64_t bodyHandle, Vec3 centerWorldVoxel,
   return false;
 }
 
+// ---- SANDVOX_ROT_DEBUG=1 ----------------------------------------------------
+//
+// Rot's attribution probe, and it earned its keep twice in one session. "3%
+// lost against an authored 20%" and "the limbs do not draw" are both BARE
+// COUNTS, and a bare count buys one hypothesis per run (CLAUDE.md rule 6). Two
+// lines instead:
+//
+//   `rot <limb>`     — the limb's size, the radii actually drawn, whether the
+//                      volume cap bound, and what came off against what the
+//                      bite shape predicts. Said "the cap never binds, and the
+//                      bites are landing at a tenth of their own shape", which
+//                      is two different defects and neither was guessable.
+//   `rotpost <limb>` — every limb's micro record, body and voxel counts after
+//                      the whole rot, flagging two limbs that share a record.
+//                      Said "the rig is perfectly healthy", which moved the
+//                      invisible-limb hunt off the carve entirely and onto the
+//                      harness that was never uploading the bricks.
+//
+// Kept, not deleted: both are one `if` in a path that runs once per spawn.
+static bool RotDebug() {
+  static const bool kOn = [] {
+    const char* e = std::getenv("SANDVOX_ROT_DEBUG");
+    return e != nullptr && e[0] != '0';
+  }();
+  return kOn;
+}
+
+// ---- BORN BITTEN (MobRotDef, mob.h) ----------------------------------------
+//
+// The whole feature, and deliberately no new carving machinery in it: rot is a
+// handful of blobs handed to CarveLimb, which is the same function a sword, a
+// blast and a fire all reach. So the holes are real geometry, the collider and
+// the micro brick are rebuilt around them, the connectivity split runs, and hp
+// is charged for the volume exactly as any other damage would be — a rotted
+// zombie is a damaged creature, not a creature with a damaged LOOK.
+//
+// Run from MobSystem::Spawn, after BuildRig and before the mob is published.
+// `voxelsAtSpawn` is therefore the PRISTINE count, which is the point: the HUD,
+// the burn fraction and every sever rule all measure against a whole body, so
+// a zombie reads as three-quarters of one instead of as a small whole one.
+uint32_t Mob::RotAtSpawn(World& world) {
+  if (!phys_ || !def_) return 0;
+  const MobRotDef& rd = def_->rot;
+  if (!rd.enabled || rd.bitesMax <= 0 || rd.maxLoss <= 0.0f) return 0;
+
+  // WHAT FRACTION OF A BITE SPHERE ACTUALLY LEAVES, and `maxLoss` is nonsense
+  // without it: the cap is applied to the spheres the draws produced, and the
+  // author's number is about the LIMB.
+  //
+  // It is not a guess. The predicate removes a cell when the noise falls below
+  // `(1 - t^2)^2` at radius fraction t, and once the noise is spread to
+  // approximately uniform (see the standardisation in the predicate) that is
+  // simply the mean of the chance field over the ball:
+  //
+  //   integral over 0..1 of (1-t^2)^2 * 3t^2 dt  =  1 - 6/5 + 3/7  =  0.229
+  //
+  // ...that being the value if the bite were centred INSIDE the limb and the
+  // noise decorrelated within it. Neither is quite true — a bite is centred on
+  // the SURFACE, so a good half of the ball is in air, and the noise is
+  // correlated at `blob` on purpose. So the analytic figure is a starting
+  // point and this is the MEASURED one: 0.19, the mean of got/predicted across
+  // a human rig's fifteen limbs with SANDVOX_ROT_DEBUG=1.
+  //
+  // The first version of this constant was 0.5, "overstated on purpose to be
+  // safe" — and safe in the wrong direction is still wrong: it shrank every
+  // bite by cbrt(0.19/0.5) and the gate measured a zombie losing 2.2% of
+  // itself against an authored 20%. A creature that is meant to look eaten
+  // came out looking scuffed, and the number in the sidecar meant nothing.
+  constexpr float kRotSphereFill = 0.19f;
+
+  // Nothing is thrown into the world (`eject` false) and nothing bleeds
+  // (inSpawnRot_), so this stays empty; it exists because CarveLimb's signature
+  // wants somewhere to put particles.
+  std::vector<ParticleSpawn> discard;
+  inSpawnRot_ = true;
+  uint32_t removedTotal = 0;
+
+  for (size_t i = 0; i < limbs_.size(); i++) {
+    MobLimb& limb = limbs_[i];
+    if (!limb.body || limb.voxels.empty()) continue;
+    // A garment is not anatomy — the same exclusion the wound soak and the coat
+    // recount both make. Rotting the robe is a separate feature (and a nicer
+    // one done as authored art than as a carve).
+    if (IsWornSlot((int)i)) continue;
+    const MobLimbDef& ld = limbDefs_[i];
+    bool skipped = false;
+    for (const std::string& s : rd.skip)
+      if (s == ld.name || (!ld.tag.empty() && s == ld.tag)) skipped = true;
+    if (skipped) continue;
+
+    const uint32_t physScale = std::max(1u, PhysScaleOf(limb));
+    const uint32_t skinScale = std::max(1u, SkinScaleOf(limb));
+    const bool fine = limb.HasFineSkin();
+    // The AUTHORITATIVE lattice — the one `voxelsAtSpawn` counted and the one
+    // a bite has to be aimed at, or a fine-skinned limb would be bitten where
+    // its collider is rather than where its art is.
+    const uint32_t lat = fine ? skinScale : physScale;
+    const size_t nCells = fine ? limb.skinVoxels.size() : limb.voxels.size();
+    if (nCells < 32) continue;  // too small to lose a chunk and still be a limb
+
+    // The limb's own size, in WORLD voxels: every length in MobRotDef is a
+    // fraction of this, so one set of numbers fits a critter's paw and mina's
+    // torso. `limb.size` is in COLLIDER units, hence the physScale divide —
+    // the same conversion CarveLimbRadial's `limbExtent` makes.
+    const float extent = std::max(
+        0.5f, 0.5f *
+                  Vec3{(float)limb.size.x, (float)limb.size.y,
+                       (float)limb.size.z}
+                      .len() /
+                  (float)physScale);
+
+    // Per (mob, limb): two zombies off the same def are missing different
+    // pieces, and the same zombie is missing the same pieces on a replay.
+    const uint32_t seed = (uint32_t)(id_ * 0x9E3779B9u) ^ 0x5A17C0DEu ^
+                          ((uint32_t)i * 0x85EBCA6Bu);
+    // Counter-based, like every other draw in this engine (sim/rng.h): a pure
+    // function of (seed, index), so a replay of the same spawn produces the
+    // same body. `next` is the counter, not a stream.
+    uint32_t next = 0;
+    auto draw = [&]() { return Hash3(seed, next++, 0x203B17E5u); };
+    const int span = rd.bitesMax - rd.bitesMin + 1;
+    int bites = rd.bitesMin + (int)(draw() % (uint32_t)std::max(1, span));
+    if (bites <= 0) continue;
+
+    // ---- WHERE A BITE GOES: a cell with an open face --------------------
+    // Aimed at the SURFACE and not at a random cell of the volume, because a
+    // hole nobody can see is damage the player was charged for and never shown.
+    // On a torso an interior pick is mostly interior, and this is exactly the
+    // "count is not a shape" failure: the hp would be right and the creature
+    // would look untouched.
+    auto key = [](int x, int y, int z) {
+      return (uint64_t)(uint32_t)(x + 32768) |
+             ((uint64_t)(uint32_t)(y + 32768) << 16) |
+             ((uint64_t)(uint32_t)(z + 32768) << 32);
+    };
+    std::unordered_set<uint64_t> occ;
+    occ.reserve(nCells * 2);
+    auto cellAt = [&](size_t k) {
+      return fine ? IVec3{limb.skinVoxels[k].x, limb.skinVoxels[k].y,
+                          limb.skinVoxels[k].z}
+                  : IVec3{limb.voxels[k].x, limb.voxels[k].y, limb.voxels[k].z};
+    };
+    for (size_t k = 0; k < nCells; k++) {
+      const IVec3 c = cellAt(k);
+      occ.insert(key(c.x, c.y, c.z));
+    }
+    const int d6[6][3] = {{1, 0, 0},  {-1, 0, 0}, {0, 1, 0},
+                          {0, -1, 0}, {0, 0, 1},  {0, 0, -1}};
+    std::vector<IVec3> surface;
+    surface.reserve(nCells / 4 + 1);
+    for (size_t k = 0; k < nCells; k++) {
+      const IVec3 c = cellAt(k);
+      for (const auto& dd : d6)
+        if (!occ.count(key(c.x + dd[0], c.y + dd[1], c.z + dd[2]))) {
+          surface.push_back(c);
+          break;
+        }
+    }
+    if (surface.empty()) continue;
+
+    // ---- draw the bites, then make them fit ---------------------------------
+    std::vector<Vec3> centres;   // limb-local WORLD voxels
+    std::vector<float> radii;    // world voxels
+    const float vital = ld.vital ? rd.vitalScale : 1.0f;
+    for (int b = 0; b < bites; b++) {
+      const IVec3 c = surface[draw() % (uint32_t)surface.size()];
+      const float u = rng::Unit01(draw());
+      const float r =
+          (rd.radiusMin + (rd.radiusMax - rd.radiusMin) * u) * extent * vital;
+      if (r <= 0.0f) continue;
+      centres.push_back(Vec3{((float)c.x + 0.5f) / (float)lat,
+                             ((float)c.y + 0.5f) / (float)lat,
+                             ((float)c.z + 0.5f) / (float)lat});
+      radii.push_back(r);
+    }
+    if (centres.empty()) continue;
+
+    // THE CAP IS APPLIED BY SHRINKING, NOT BY DROPPING BITES. A bite abandoned
+    // part-way would leave a lopsided hole and a body whose damage depended on
+    // the order the draws came out; scaling every radius by the same cube root
+    // keeps the SHAPE the author asked for and only makes it smaller. Overlaps
+    // are double-counted here, which errs toward less removal.
+    float volLimb = 0.0f, predicted = 0.0f;
+    bool capped = false;
+    {
+      volLimb = (float)nCells / ((float)lat * lat * lat);
+      float volBites = 0.0f;
+      for (float r : radii) volBites += 4.18879f * r * r * r;  // (4/3)pi r^3
+      // `vitalScale` scales the BUDGET as well as the drawn radii, and it has
+      // to: the cap renormalises whatever was drawn back up to the budget, so
+      // scaling only the radii would hand a vital limb the same total loss in
+      // more, smaller holes — which is not what "go easier on the head" means.
+      const float budget = rd.maxLoss * vital * volLimb;
+      const float taken = volBites * kRotSphereFill;
+      capped = taken > budget && taken > 0.0f;
+      if (capped) {
+        const float k = std::cbrt(budget / taken);
+        for (float& r : radii) r *= k;
+      }
+      predicted = 0.0f;
+      for (float r : radii) predicted += 4.18879f * r * r * r * kRotSphereFill;
+    }
+
+    const bool kRotDebug = RotDebug();
+    const float blob = std::max(0.5f, rd.blob);
+    const uint32_t nseed = seed ^ 0xB0DEC0DEu;
+    Mob::CarveReport rep{};
+    const bool alive = CarveLimb(
+        (int)i, world, discard, /*eject=*/false,
+        [&, centres, radii, blob, nseed, skinScale](float scale)
+            -> LimbCarveKeep {
+          std::vector<Vec3> cs;
+          std::vector<float> r2s;
+          std::vector<float> bias;
+          cs.reserve(centres.size());
+          r2s.reserve(radii.size());
+          bias.reserve(centres.size());
+          // The noise is sampled on the SKIN lattice whichever lattice is being
+          // tested, so the collider and the art tear identically and the shape
+          // of the damage is a property of the ART rather than of the collider
+          // resolution the engine happened to derive. Same rule the blast
+          // crater's jitter follows, and for the same reason.
+          const float toSkin = (float)skinScale / scale;
+          for (size_t b = 0; b < centres.size(); b++) {
+            cs.push_back(centres[b] * scale);
+            const float r = radii[b] * scale;
+            r2s.push_back(r * r);
+            // ---- EACH BITE IS RECENTRED ON ITS OWN NOISE -------------------
+            //
+            // Without this the feature was ~10x weaker than its own shape says
+            // — measured, ratio 0.09 of predicted, with the volume cap not
+            // binding on a single limb. The cause is that `blob` and the bite
+            // radius are deliberately the SAME order (3 skin voxels against
+            // 8): that is what makes the loss come off in chunks rather than
+            // as speckle, and it also means the field barely varies inside one
+            // bite. So a bite did not carve a ragged hole — it sampled roughly
+            // ONE value and then removed everything or nothing, and since the
+            // threshold `(1-t^2)^2` is below 1 everywhere but the exact
+            // centre, most bites lost that coin flip and vanished.
+            //
+            // Subtracting the noise AT THE BITE'S CENTRE fixes the level
+            // without touching the gradient: the centre now always goes
+            // (0.5 < 1), the field still varies with the correlation length
+            // that makes the edge chunky, and every bite lands. The noise
+            // decides the SHAPE of the hole, which is what it is good at; it
+            // no longer gets a vote on whether there is a hole.
+            const Vec3 sc = centres[b] * (float)skinScale;
+            bias.push_back(0.5f - ValueNoise3(nseed, sc.x / blob, sc.y / blob,
+                                              sc.z / blob));
+          }
+          return [=](int x, int y, int z) {
+            const Vec3 c{(float)x + 0.5f, (float)y + 0.5f, (float)z + 0.5f};
+            for (size_t b = 0; b < cs.size(); b++) {
+              const Vec3 dv = c - cs[b];
+              const float d2 = dv.dot(dv);
+              if (d2 >= r2s[b] || r2s[b] <= 0.0f) continue;
+              // Certain at the centre, nothing at the rim, squared so the bite
+              // is a hole with a torn edge rather than a fade across the whole
+              // ball (the same tightening the crater's `carveFalloff` makes).
+              const float t2 = d2 / r2s[b];
+              const float f = 1.0f - t2;
+              const float chance = f * f;
+              const int sx = (int)std::floor((float)x * toSkin);
+              const int sy = (int)std::floor((float)y * toSkin);
+              const int sz = (int)std::floor((float)z * toSkin);
+              // PURE correlated noise, with no white-noise term mixed in: the
+              // owner asked for chunks "largely in groups", and any independent
+              // per-voxel draw at all puts speckle back (see the long note on
+              // ValueNoise3 at the top of this file). `blob` IS the size of one
+              // piece that comes away.
+              const float smooth = ValueNoise3(nseed, (float)sx / blob,
+                                               (float)sy / blob,
+                                               (float)sz / blob);
+              // Two corrections, both about the noise's LEVEL rather than its
+              // shape, and both monotone so the spatial correlation — the
+              // entire reason this is value noise and not a hash — survives:
+              //
+              //   * `bias[b]` recentres this bite on its own centre value, so
+              //     the bite always lands. See the long note where it is built.
+              //   * trilinear value noise is not uniform: it is a smoothed
+              //     blend of eight uniform corners, so it piles up around 0.5
+              //     with a standard deviation near 0.146 against a uniform
+              //     0.289. Stretching about the mean restores the spread, and
+              //     without it the rim is a cliff instead of a tear.
+              const float n = std::clamp(
+                  0.5f + (smooth + bias[b] - 0.5f) * 1.98f, 0.0f, 1.0f);
+              if (n < chance) return false;  // remove
+            }
+            return true;  // keep
+          };
+        },
+        nullptr, &rep);
+    removedTotal += rep.count;
+    if (kRotDebug) {
+      std::string rs;
+      for (float r : radii) {
+        char b[32];
+        std::snprintf(b, sizeof(b), "%.2f ", r);
+        rs += b;
+      }
+      // RE-READ THE LATTICE; DO NOT TRUST rep.count. CarveReport::count is the
+      // COLLIDER delta whenever the collider noticed anything, and only falls
+      // back to the skin's own count when it did not — so on a fine-skinned rig
+      // it is a number about a different lattice, 8x coarser in volume, and
+      // dividing it by lat^3 under-reports the loss by exactly that. The first
+      // version of this probe did precisely that and made a working carve look
+      // broken (gotcha: record at the point of failure, in the right units).
+      const size_t nAfter = limbs_[i].HasFineSkin() ? limbs_[i].skinVoxels.size()
+                                                    : limbs_[i].voxels.size();
+      const float gotVol =
+          (float)(nCells > nAfter ? nCells - nAfter : 0) /
+          ((float)lat * lat * lat);
+      std::fprintf(
+          stderr,
+          "rot %s/%-8s cells %5zu vol %6.2f extent %5.2f lat %u | bites %d "
+          "r[ %s] capped %d | predicted %5.2f (%4.1f%%) got %5.2f (%4.1f%%) "
+          "ratio %.2f\n",
+          def_->name.c_str(), ld.name.c_str(), nCells, volLimb, extent, lat,
+          (int)radii.size(), rs.c_str(), capped ? 1 : 0, predicted,
+          volLimb > 0 ? 100.0f * predicted / volLimb : 0.0f, gotVol,
+          volLimb > 0 ? 100.0f * gotVol / volLimb : 0.0f,
+          predicted > 0 ? gotVol / predicted : 0.0f);
+    }
+    if (!alive) {
+      // The cap above is meant to make this unreachable, and if it is reached
+      // the limb list has been reshaped under the loop (CarveLimb's contract):
+      // stop touching it. Said out loud rather than swallowed, because a def
+      // that rots itself apart at spawn is a content bug and there is no other
+      // moment at which anybody would notice.
+      inSpawnRot_ = false;
+      return removedTotal;
+    }
+  }
+
+  inSpawnRot_ = false;
+  if (RotDebug()) {
+    // EVERY limb's brick record after the whole rot, in one place. A per-carve
+    // line cannot see the failure this is looking for: "two limbs share one
+    // micro model" is a statement about the SET, and it is the known way limbs
+    // go invisible here (a shared record's first free zeroes its dims).
+    for (size_t i = 0; i < limbs_.size(); i++) {
+      int dup = -1;
+      for (size_t k = 0; k < i; k++)
+        if (limbs_[k].microModel == limbs_[i].microModel &&
+            limbs_[i].microModel >= 0)
+          dup = (int)k;
+      std::fprintf(stderr,
+                   "rotpost %s/%-8s micro %3d carved %d body %llu coll %5zu "
+                   "skin %5zu%s\n",
+                   def_->name.c_str(), limbDefs_[i].name.c_str(),
+                   limbs_[i].microModel, limbs_[i].carved ? 1 : 0,
+                   (unsigned long long)limbs_[i].body, limbs_[i].voxels.size(),
+                   limbs_[i].skinVoxels.size(),
+                   dup >= 0 ? "  *** SHARES A RECORD ***" : "");
+    }
+  }
+  return removedTotal;
+}
+
 void MobSystem::CarveMobsRadial(Vec3 centerWorldVoxel, float radiusVoxels,
                                 World& world,
                                 std::vector<ParticleSpawn>& spawns) {
@@ -11684,6 +12343,14 @@ bool MobSystem::LoadState(const uint8_t* data, size_t len, uint32_t version) {
     std::printf("mob: unknown MOBS section version %u\n", version);
     return false;
   }
+  // Scoped rather than set-and-clear: every `return` below is an early exit on
+  // a malformed section, and a flag left true would silently stop every later
+  // spawn in the session from rotting.
+  struct LoadGuard {
+    bool& f;
+    explicit LoadGuard(bool& b) : f(b) { f = true; }
+    ~LoadGuard() { f = false; }
+  } loadGuard(loading_);
   ByteReader r{data, len};
   uint32_t count = 0;
   r.U32(count);
@@ -11735,6 +12402,8 @@ bool MobSystem::LoadState(const uint8_t* data, size_t len, uint32_t version) {
     // Spawn() first: it derives everything the save deliberately does not
     // carry (anim state, joints, rest sole, flipbooks, gore profile) from the
     // def, exactly as a fresh mob would. The saved damage overlays that.
+    // `loading_` is what keeps spawn-time rot (MobRotDef) out of it — see the
+    // note at that call.
     uint64_t id = Spawn(defIndex, {ifloor(origin.x), ifloor(origin.y),
                                    ifloor(origin.z)});
     if (id == 0) {

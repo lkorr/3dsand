@@ -4446,6 +4446,181 @@ uint64_t AiSpawn(Ctx& c, int defIndex, IVec3 at, const char* profile,
   return id;
 }
 
+// ---- undead ----------------------------------------------------------------
+//
+// One gate for the whole of "a zombie is a human, differently" (mob.h
+// MobDef::undead / MobRotDef, assets/mobs/zombie.json). Four claims, and the
+// first two are the ones that would otherwise rot silently:
+//
+//   A. THE VARIANT WEARS THE ORIGINAL'S BODY. `extends` and `model` exist so
+//      that human.vox has exactly one copy in the repo. If somebody later
+//      "fixes" the loader by pairing .json to .vox by filename again, the
+//      zombie simply stops existing — which nothing else here would notice,
+//      because every other claim is about a def that failed to load.
+//   B. A LIVING CREATURE IS BORN WHOLE. The control arm, and the reason the
+//      rot claims mean anything: "voxels are missing" is not a result unless
+//      the same measurement on a human comes back zero.
+//   C. THE DAMAGE IS REAL AND IT IS CHARGED. Voxels gone from the
+//      authoritative lattice, hp down with them, nothing severed, and — the
+//      easy one to lose — NO BLOOD, because these holes are old.
+//   D. NO TWO ARE ALIKE. Per-limb loss differs between two spawns of the same
+//      def. A per-DEF seed would pass every claim above and produce an army of
+//      identical corpses.
+//
+// No ticks at all: rot happens inside Spawn, so everything here is a count
+// taken the instant after it.
+Status GateUndead(Ctx& c, std::string& detail) {
+  c.debris.Reset();
+  c.mobs.Reset();
+  SubmitWorldgen(c.ctx, c.world, c.sim, kDefaultSeed);
+  c.ctx.WaitIdle();
+
+  int zi = -1, hi = -1;
+  for (int i = 0; i < (int)c.mobs.Defs().size(); i++) {
+    if (c.mobs.Defs()[i].name == "zombie") zi = i;
+    if (c.mobs.Defs()[i].name == "human") hi = i;
+  }
+  if (zi < 0 || hi < 0) {
+    detail = zi < 0 ? "no \"zombie\" mob def (assets/mobs/zombie.json)"
+                    : "no \"human\" mob def to compare against";
+    return Status::Fail;
+  }
+  const MobDef& zd = c.mobs.Defs()[zi];
+  const MobDef& hd = c.mobs.Defs()[hi];
+
+  // ---- A: the variant wears the original's art and rig ---------------------
+  const bool sameArt = zd.prefab.size.x == hd.prefab.size.x &&
+                       zd.prefab.size.y == hd.prefab.size.y &&
+                       zd.prefab.size.z == hd.prefab.size.z &&
+                       zd.skinScale == hd.skinScale &&
+                       zd.limbs.size() == hd.limbs.size() &&
+                       zd.prefab.artColors.size() == hd.prefab.artColors.size();
+  // ...and the overrides on top of it actually landed.
+  const bool overrides = zd.undead && !zd.woundHeals && hd.woundHeals &&
+                         zd.rot.enabled && zd.speed < hd.speed &&
+                         zd.speed > 0.0f;
+
+  // The palette is a FILTER, so the claim is about the shape of the change and
+  // not about any particular colour: greyer (chroma down) and no darker.
+  auto meanOf = [](const std::vector<uint32_t>& cs, bool chroma) {
+    double sum = 0;
+    int n = 0;
+    for (uint32_t v : cs) {
+      if (v == 0) continue;  // unused slot (voxload zero-fills all 128)
+      const int r = (int)((v >> 16) & 0xFF), g = (int)((v >> 8) & 0xFF),
+                b = (int)(v & 0xFF);
+      sum += chroma ? (double)(std::max({r, g, b}) - std::min({r, g, b}))
+                    : 0.2126 * r + 0.7152 * g + 0.0722 * b;
+      n++;
+    }
+    return n ? sum / n : 0.0;
+  };
+  const double zChroma = meanOf(zd.prefab.artColors, true);
+  const double hChroma = meanOf(hd.prefab.artColors, true);
+  const double zLuma = meanOf(zd.prefab.artColors, false);
+  const double hLuma = meanOf(hd.prefab.artColors, false);
+  const double chromaMax = BaselineNumber("undeadChromaFracMax", 0.75);
+  const bool paler = hChroma > 0.0 && zChroma < hChroma * chromaMax &&
+                     zLuma >= hLuma;
+
+  // ---- spawn: one human, two zombies, same ground -------------------------
+  int relief = 0;
+  const IVec3 anchor = AiFixtureCentre(c.world);
+  const IVec3 spot =
+      AiFlatSpot(anchor.x, anchor.z, 96, 16, kDefaultSeed, relief);
+  const int step = std::max(8, (int)hd.worldSize.x * 3);
+  const uint64_t hId = c.mobs.Spawn(hi, {spot.x, spot.y + 1, spot.z});
+  const uint64_t zA = c.mobs.Spawn(zi, {spot.x + step, spot.y + 1, spot.z});
+  const uint64_t zB = c.mobs.Spawn(zi, {spot.x + 2 * step, spot.y + 1, spot.z});
+  Mob* mh = c.mobs.FindMobById(hId);
+  Mob* ma = c.mobs.FindMobById(zA);
+  Mob* mb = c.mobs.FindMobById(zB);
+  if (!mh || !ma || !mb) {
+    detail = "Spawn refused (human, zombie A or zombie B)";
+    c.debris.Reset();
+    c.mobs.Reset();
+    return Status::Fail;
+  }
+
+  // Counts on the AUTHORITATIVE lattice — the one LimbVoxelsAtSpawn counted.
+  // Mixing it with the collider's would scale every fraction below by
+  // (skinScale/physScale)^3 and make a 20% loss read as 0.3%.
+  auto tally = [&](uint64_t id, const Mob* m, std::vector<uint32_t>& perLimb,
+                   uint32_t& at0, uint32_t& now, uint32_t& spurs) {
+    at0 = now = spurs = 0;
+    perLimb.clear();
+    for (int i = 0; i < m->LimbCount(); i++) {
+      const uint32_t a = c.mobs.LimbVoxelsAtSpawn(id, i);
+      const uint32_t n = c.mobs.LimbArtVoxelCount(id, i);
+      at0 += a;
+      now += n;
+      perLimb.push_back(a > n ? a - n : 0u);
+      // Voxels left with four or more open faces: what SPECKLE leaves behind
+      // and a torn chunk does not (LimbOpenFaceCount's own note). This is the
+      // "largely in groups" half of the owner's ask expressed as a number —
+      // a count of missing voxels alone cannot tell the two apart.
+      spurs += c.mobs.LimbOpenFaceCount(id, i, 4);
+    }
+  };
+  std::vector<uint32_t> lh, la, lb;
+  uint32_t hAt0 = 0, hNow = 0, hSpur = 0, aAt0 = 0, aNow = 0, aSpur = 0;
+  uint32_t bAt0 = 0, bNow = 0, bSpur = 0;
+  tally(hId, mh, lh, hAt0, hNow, hSpur);
+  tally(zA, ma, la, aAt0, aNow, aSpur);
+  tally(zB, mb, lb, bAt0, bNow, bSpur);
+
+  // ---- B: the living control arm ------------------------------------------
+  const bool humanWhole = hAt0 > 0 && hNow == hAt0;
+
+  // ---- C: the damage is real, bounded, charged, and dry -------------------
+  const double lossA = aAt0 ? (double)(aAt0 - aNow) / (double)aAt0 : 0.0;
+  const double lossMin = BaselineNumber("undeadLossFracMin", 0.01);
+  // The authored ceiling plus slack for the cap's own estimate of how much of
+  // a bite sphere leaves (Mob::RotAtSpawn kRotSphereFill). If this trips, the
+  // cap is not holding and a limb is one bad draw from collapsing.
+  const double lossMax = BaselineNumber("undeadLossFracMax", 0.30);
+  const bool bitten = lossA >= lossMin && lossA <= lossMax && aNow < aAt0;
+  const float hpH = c.mobs.TotalHp(hId), hpA = c.mobs.TotalHp(zA);
+  const bool hurt = hpA > 0.0f && hpH > 0.0f && hpA < hpH;
+  // Rot must never be what takes a limb off: no sever, no death, same rig.
+  const bool intact = c.mobs.IsAlive(zA) && c.mobs.IsAlive(zB) &&
+                      ma->LimbCount() == mh->LimbCount() &&
+                      mb->LimbCount() == mh->LimbCount();
+  // THE HOLES ARE OLD. Without Mob::inSpawnRot_ every bite tops up a drip
+  // budget and the creature arrives haemorrhaging.
+  const bool dry = c.mobs.BloodLost(zA) <= 0.0f;
+  // Chunks, not speckle: spurs per voxel lost, against the same body's own
+  // baseline roughness (the human's spur count is what the ART already has).
+  const uint32_t lostA = aAt0 - aNow;
+  const double spurPerLost =
+      lostA ? (double)(aSpur > hSpur ? aSpur - hSpur : 0u) / (double)lostA : 0.0;
+  const double spurMax = BaselineNumber("undeadMaxSpurPerLost", 0.20);
+  const bool chunky = spurPerLost <= spurMax;
+
+  // ---- D: no two are alike -------------------------------------------------
+  const bool varies = la.size() == lb.size() && la != lb;
+
+  RecordObserved("undeadLossFrac", lossA);
+  RecordObserved("undeadSpurPerLost", spurPerLost);
+  RecordObserved("undeadChromaFrac", hChroma > 0 ? zChroma / hChroma : 0.0);
+
+  const bool ok = sameArt && overrides && paler && humanWhole && bitten &&
+                  hurt && intact && dry && chunky && varies;
+  detail = Format(
+      "art/rig shared %d, overrides %d, palette chroma %.2f -> %.2f luma %.1f "
+      "-> %.1f (%d), human whole %u/%u (%d), zombie %u/%u lost %.3f (%.2f..%.2f"
+      ", %d), hp %.1f -> %.1f (%d), intact %d, dry %d, spurs/lost %.3f <= %.3f "
+      "(%d), varies %d",
+      sameArt ? 1 : 0, overrides ? 1 : 0, hChroma, zChroma, hLuma, zLuma,
+      paler ? 1 : 0, hNow, hAt0, humanWhole ? 1 : 0, aNow, aAt0, lossA, lossMin,
+      lossMax, bitten ? 1 : 0, hpH, hpA, hurt ? 1 : 0, intact ? 1 : 0,
+      dry ? 1 : 0, spurPerLost, spurMax, chunky ? 1 : 0, varies ? 1 : 0);
+
+  c.debris.Reset();
+  c.mobs.Reset();
+  return ok ? Status::Pass : Status::Fail;
+}
+
 // ---- ai-dummy --------------------------------------------------------------
 Status GateAiDummy(Ctx& c, std::string& detail) {
   c.debris.Reset();
@@ -6844,6 +7019,10 @@ const std::vector<Gate>& MobGates() {
       {"mob", "mob", {}, false, GateMob, /*needsRender=*/true},
       // Per-voxel body reactivity. No render: every claim is a count.
       {"mob-burn", "mob", {}, false, GateMobBurn, /*needsRender=*/false},
+      // A creature that is a recolour of another one, born already bitten,
+      // whose cuts do not close. Counts only, and no ticks at all — rot
+      // happens inside Spawn.
+      {"undead", "mob", {}, false, GateUndead, /*needsRender=*/false},
       // NPC AI. No render either: every claim is a distance, an angle or a
       // count, which is what makes them iterable with `--gate` alone.
       {"ai-dummy", "mob", {}, false, GateAiDummy, /*needsRender=*/false},
