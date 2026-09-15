@@ -332,17 +332,46 @@ fn nodeWordBase(bm : u32, nc : vec3<i32>) -> u32 {
   return ((bm - 1u) * CHUNK_VOL + (lo.z * CHUNK + lo.y) * CHUNK + lo.x) * FLUID_GW;
 }
 
+// ---- WHY THIS IS A REASON AND NOT A BOOL -----------------------------------
+// `fluidSolid` used to answer one question with one bool, and its two
+// particle-side callers wanted OPPOSITE things from the same `true`:
+//
+//   g2p's entry check        deleted the particle and its eighths outright;
+//   g2p's advect back-projection reverted the step and zeroed the velocity, so
+//                            the particle survives and goes CALM.
+//
+// That was harmless while "solid" meant rock. The RIDE-THE-SURFACE arm below
+// (2026-09-08) made a submerged liquid cell solid too, so a pool growing around
+// an in-flight particle started ANNIHILATING it — measured at 73,701 eighths in
+// pass H1 of the `waterbody` gate against its −73,287 residual, while the
+// hard-solid arm killed exactly 0. The block's own last paragraph promised the
+// back-projection's behaviour for precisely this case; the entry check
+// contradicted it.
+//
+// So the predicate returns a REASON, one implementation, and the two wrappers
+// below are the only vocabulary the callers get. Same one-function-two-callers
+// discipline `bridgeLevel` documents: the alternative is two predicates that
+// agree today and drift the next time someone adds an arm.
+const FSOLID_OPEN : u32 = 0u;   // fluid may occupy this cell
+const FSOLID_HARD : u32 = 1u;   // rock / powder / outside the window: inert
+                                // matter a particle can never legally be IN,
+                                // and that the back-projection cannot save it
+                                // from once it is.
+const FSOLID_SUBM : u32 = 2u;   // the INTERIOR of the body's own liquid: a
+                                // floor for momentum, but still fluid — a
+                                // particle here is misplaced, not doomed.
+
 // Terrain for the grid boundary condition: solids and powders block; CA
 // liquids and gases do not. A settled liquid is NOT a wall — it is a fluid, and
 // the way it stops a particle is by weighing something, which is what
 // seedSettledMass below gives it. Out-of-window is solid and inert.
-fn fluidSolid(c : vec3<i32>) -> bool {
-  if (!cellResident(c, T.origin)) { return true; }
+fn fluidSolidReason(c : vec3<i32>) -> u32 {
+  if (!cellResident(c, T.origin)) { return FSOLID_HARD; }
   let w = voxWordAt(c);
   let mat = voxMat(w);
-  if (mat == MAT_AIR) { return false; }
+  if (mat == MAT_AIR) { return FSOLID_OPEN; }
   let k = materials[mat].klass;
-  if (k == CLASS_SOLID || k == CLASS_POWDER) { return true; }
+  if (k == CLASS_SOLID || k == CLASS_POWDER) { return FSOLID_HARD; }
   // ---- RIDE THE SURFACE (sim.fluidSubmergedSolid) -------------------------
   //
   // SUBMERGED liquid is a floor; free-surface liquid is not. The block above
@@ -378,17 +407,33 @@ fn fluidSolid(c : vec3<i32>) -> bool {
   //
   // A splash therefore lands ON the pool and spreads instead of plunging
   // through it (the owner's call, this session). Particles already inside when
-  // the rule turns on are handled by the back-projection below — it reverts and
-  // zeroes velocity, so they go CALM, which is exactly what lets the seam's
-  // force-settle backstop pick them up and drain them.
+  // the rule turns on go CALM — BOTH at the back-projection below, which
+  // reverts and zeroes velocity, and at g2p's entry check, which zeroes
+  // velocity and the affine C in place. That is what lets the seam's
+  // force-settle backstop pick them up and drain them, and it is why this arm
+  // reports FSOLID_SUBM rather than FSOLID_HARD.
   if (FLUID_SUBMERGED_SOLID != 0 && k == CLASS_LIQUID &&
       voxState(w) + 1u >= 8u) {
     let above = c + vec3<i32>(0, 1, 0);
     if (cellResident(above, T.origin) && voxMat(voxWordAt(above)) == mat) {
-      return true;
+      return FSOLID_SUBM;
     }
   }
-  return false;
+  return FSOLID_OPEN;
+}
+
+// The grid boundary condition and the advect back-projection want "is this cell
+// closed to fluid", whichever way. Both reasons close a cell.
+fn fluidSolid(c : vec3<i32>) -> bool {
+  return fluidSolidReason(c) != FSOLID_OPEN;
+}
+
+// The one caller that may DESTROY a particle wants only the reason it cannot
+// recover from. Deleting a particle is the only place in the engine where live
+// mass ceases to exist without being handed to a voxel or a reaction, so the
+// predicate that licenses it is deliberately the narrow one.
+fn fluidHardSolid(c : vec3<i32>) -> bool {
+  return fluidSolidReason(c) == FSOLID_HARD;
 }
 
 // The live particle population is GPU-OWNED now (the seam's compaction /
@@ -1014,6 +1059,24 @@ fn gridUpdate(@builtin(workgroup_id) wg : vec3<u32>,
   atomicStore(&fluidGrid[ni + 3u], v.z);
 }
 
+// ---- this kernel's two words of the FA_* map (world.h kFluidArgsWords) ------
+// Declared HERE, not in common.wgsl: nothing else in the engine writes them and
+// a const added to common.wgsl re-keys the SPIR-V cache for every shader (the
+// same reason FA_SETCEIL..FA_SEALED live in sim_fluid_seam.wgsl). The
+// authoritative OCCUPANCY ledger for the 40-word map is the comment block at
+// common.wgsl's FA_LIVE — add a row there when you claim a word, or the next
+// person claims it twice.
+//
+// BOTH ARE CUMULATIVE. The seam's per-tick clear (sim_fluid_seam.wgsl, head of
+// the tick) zeroes the event counters and deliberately skips these, so a gate
+// reads the word before and after a window and differences it.
+const FA_KILLHARD : u32 = 34u;  // eighths DESTROYED by g2p's hard-solid delete.
+                                // A conservation identity must add this back:
+                                // it is mass that left the world unaccounted.
+const FA_CALMSUBM : u32 = 37u;  // eighths CALMED by g2p inside submerged
+                                // liquid. An event count (re-counted every tick
+                                // a particle stays under), never a mass term.
+
 // ---- G2P: gather velocity, rebuild C (APIC), update J, damp, advect ---------
 // Pure gather: each thread writes only its own particle, so this cannot race.
 // A particle with no reachable nodes (out of window, over-budget chunk) sums
@@ -1025,33 +1088,62 @@ fn g2p(@builtin(global_invocation_id) gid : vec3<u32>) {
   var p = fluidParticles[gid.x];
   let cell = vec3<i32>(p.px >> 16u, p.py >> 16u, p.pz >> 16u);
   if (!cellResident(cell, T.origin)) { return; }
-  if (fluidSolid(cell)) {
-    // H1 DIAGNOSIS instrumentation (temporary). fluidArgs[34..39] are the
-    // spare tail of the 40-word map (the documented map stops at 33) and are
-    // CUMULATIVE — the seam's per-tick clear at the head of sim_fluid_seam
-    // does not touch them, so a gate reading them before and after a window
-    // sees the total for that window. This line is the only place in the
-    // engine where a LIVE particle's eighths are destroyed without being
-    // handed to a voxel or a reaction.
+  // ---- the particle woke up inside something ------------------------------
+  // Two reasons, two outcomes, and conflating them was a real mass leak (see
+  // the long block at fluidSolidReason). The cell can only have closed UNDER
+  // the particle — the back-projection at the end of this kernel is what stops
+  // it moving into a closed cell — so this is always the world changing, never
+  // the particle misbehaving.
+  let why = fluidSolidReason(cell);
+  if (why == FSOLID_SUBM) {
+    // GO CALM, EXACTLY AS THE BACK-PROJECTION DOES. The pool grew over this
+    // particle: it is inside its own substance, which is a floor for momentum
+    // but is not matter it has to be rescued from. Zero the velocity and the
+    // affine C (a non-zero C re-injects that momentum through APIC on the very
+    // next p2g, so keeping it would be "calm" in name only) and leave it alive
+    // where it is. The seam's force-settle backstop drains it from there; the
+    // FLUID_SUBMERGED_SOLID block above is written on the promise that this is
+    // what happens.
+    //
+    // Counted in eighths, and it is an EVENT count, not a mass: a particle
+    // that stays under for twenty ticks is counted twenty times. It is a
+    // pressure gauge for "how much of the pool is holding particles it cannot
+    // settle", not a term in any conservation identity.
+    if (fpAlive(p.attr)) {
+      atomicAdd(&fluidArgs[FA_CALMSUBM], fpFullness(p.attr));
+    }
+    p.vx = 0; p.vy = 0; p.vz = 0;
+    p.c00 = 0; p.c01 = 0; p.c02 = 0;
+    p.c10 = 0; p.c11 = 0; p.c12 = 0;
+    p.c20 = 0; p.c21 = 0; p.c22 = 0;
+    fluidParticles[gid.x] = p;
+    return;
+  }
+  // Explicitly `== FSOLID_HARD`, not `!= FSOLID_OPEN`: if someone adds a third
+  // reason and forgets this site, the particle should keep simulating, not be
+  // deleted. The safe default for an unknown reason is to destroy nothing.
+  if (why == FSOLID_HARD) {
+    // HARD SOLID: rock closed over the particle (an explosion backfilling, a
+    // spell casting stone, worldgen restoring a chunk) or the window moved out
+    // from under it. There is no legal cell to hand the eighths back to, so
+    // this is the ONE place in the engine where live mass ceases to exist
+    // without becoming a voxel or a reaction product.
+    //
+    // NO DELETION PATH MAY DESTROY MASS SILENTLY. FA_KILLHARD banks the
+    // eighths so a conservation gate can add them back and keep its identity
+    // STRICT, instead of widening a slack that then has room to hide the next
+    // leak. Cumulative, never cleared: the seam's per-tick clear at the head of
+    // sim_fluid_seam deliberately skips it, so a gate that reads the word
+    // before and after a window gets that window's total.
     //
     // fpAlive, not fpFullness alone: a DEAD spawn op carries attr 0x1000
-    // (mat 0, fullness 1), so fpFullness says 1 about a particle that never
-    // held anything. wbDrain's dead tail parks at (0,0,0), which is bedrock,
-    // so an unguarded probe here charges the block's whole dead tail to the
+    // (mat 0, fullness 1), so fpFullness claims one eighth for a particle that
+    // never held anything. wbDrain's dead op tail parks at (0,0,0), which is
+    // bedrock, so an unguarded counter here charges the whole dead tail to the
     // kill every tick — measured at 207,574 "killed" eighths against 100,669
-    // that ever entered the pool.
-    //
-    // SPLIT BY CAUSE, because the two have different fixes: [34] is a kill in
-    // real CLASS_SOLID/CLASS_POWDER matter, [37] is a kill in SUBMERGED
-    // LIQUID (fluidSolid's sim.fluidSubmergedSolid arm — the body's own water
-    // is a floor, and a particle that ends up inside it is deleted).
+    // that had ever entered the pool.
     if (fpAlive(p.attr)) {
-      let kw = voxWordAt(cell);
-      let kk = materials[voxMat(kw)].klass;
-      let hard = voxMat(kw) != MAT_AIR &&
-                 (kk == CLASS_SOLID || kk == CLASS_POWDER);
-      if (hard) { atomicAdd(&fluidArgs[34u], fpFullness(p.attr)); }
-      else { atomicAdd(&fluidArgs[37u], fpFullness(p.attr)); }
+      atomicAdd(&fluidArgs[FA_KILLHARD], fpFullness(p.attr));
     }
     p.attr = 0u;
     fluidParticles[gid.x] = p;

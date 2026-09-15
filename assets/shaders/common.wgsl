@@ -3259,7 +3259,17 @@ fn fpPack(mat : u32, fullness : u32, stainType : u32, stainAmt : u32) -> u32 {
 const FP_EXCITED : u32 = 1u << 22u;
 fn fpExcited(attr : u32) -> bool { return (attr & FP_EXCITED) != 0u; }
 
-// ---- fluidArgsStage word map (32 u32) --------------------------------------
+// ---- fluidArgsStage word map (40 u32 — world.h kFluidArgsWords) ------------
+// THIS COMMENT IS THE OCCUPANCY LEDGER FOR THE WHOLE MAP, including the words
+// whose `const` lives in the one shader that writes them (a const added here
+// re-keys the SPIR-V cache for EVERY shader in the engine and pays the worldgen
+// far-compile cliff, so a word only one kernel touches is declared next to its
+// consumer). Claim a word by adding its row here FIRST. The map read "[27..31]
+// spare" for a while after 27, 29, 30 and 31 had owners.
+//
+// THE MAP IS NOW FULL: 0..39, no spares. The next counter needs
+// kFluidArgsWords raised in world.h (which recompiles the engine), not a
+// hopeful subscript.
 // [0..3]  node-pass dispatch args + active block count (alloc, per substep)
 // [4..6]  per-particle-pass dispatch args ((live+63)/64, 1, 1) — written by
 //         the seam's excite scan once per tick, copied to the indirect buffer
@@ -3295,7 +3305,29 @@ fn fpExcited(attr : u32) -> bool { return (attr & FP_EXCITED) != 0u; }
 // [26]    settle blocks refused as excite-UNSTABLE this tick (the resulting
 //         configuration would immediately satisfy an excite trigger). Split
 //         from [25] because the two are opposite diagnoses.
-// [27..31] spare
+// [27]    FA_EXSEEN     settled seam-liquid cells exciteDetect looked at
+// [28]    FA_EXCANDID   of those, the ones that satisfied a trigger
+// [29]    FA_SPAWNDEAD  dead (mat 0) spawn ops this tick
+// [30]    FA_SETCEIL    ) sim_fluid_seam.wgsl — settle's two refusal sites,
+// [31]    FA_SETFLOOR   ) counted as COLUMNS on the feasibility pass
+// [32]    FA_FORCED     ) sim_fluid_seam.wgsl — the force-settle backstop:
+// [33]    FA_SEALED     ) blocks it got out / blocks still sealed
+//
+// ---- [34..39] THE MASS BOOKS: CUMULATIVE, the per-tick clear skips them -----
+// Everything above is one tick. These are totals, so a gate can read them
+// before and after a window and ask whether as much mass went in as came out.
+// [34]    FA_KILLHARD   sim_fluid.wgsl — eighths g2p DESTROYED inside hard
+//                       solid. The only unaccounted death left in the engine,
+//                       and a conservation identity must add it back.
+// [35]    FA_SETTLEKILL sim_fluid_seam.wgsl — eighths that died legitimately
+//                       (settleCommit had already written them to voxels)
+// [36]    FA_EXCITEDCUM sim_fluid_seam.wgsl — cumulative mirror of FA_EXCITED
+// [37]    FA_CALMSUBM   sim_fluid.wgsl — eighths g2p CALMED inside submerged
+//                       liquid. An EVENT count (re-counted every tick a
+//                       particle stays under), never a mass term: calming is
+//                       not a transfer, so it is on neither side of the books.
+// [38]    FA_SPAWNLIVE  sim_fluid_seam.wgsl — cumulative live spawn ops
+// [39]    FA_SETWROTE   sim_fluid_seam.wgsl — cumulative net eighths settled
 const FA_LIVE      : u32 = 7u;
 const FA_DEAD      : u32 = 8u;
 const FA_EMITTED   : u32 = 9u;

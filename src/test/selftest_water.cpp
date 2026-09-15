@@ -130,7 +130,7 @@ struct VoxelTruth {
 // `yLo`/`yHi` override the descriptor's own water AABB. Pass H needs that: the
 // conservation box for a REAL drain has to contain the shaft and the chamber
 // the jet lands in, or the water that left the lake correctly reads as a leak.
-// H1 DIAGNOSIS instrumentation (temporary, see the block in pass H): `noDisc`
+// H1DIAG instrumentation (permanent, see the block in pass H): `noDisc`
 // drops the disc filter so a sweep can answer "is any of the missing water
 // simply OUTSIDE the lake's disc and therefore invisible to this sweep?" — the
 // chamber is a 29x29 square around the lake centre and its corners sit at
@@ -293,6 +293,23 @@ enum : uint32_t {
   SW_MAPGEN, SW_SPILLYN, SW_SPLITYN,
 };
 constexpr int32_t kSplitNone = -0x40000000;
+// ---- the FA_* words this gate reads ---------------------------------------
+// C++ has no view of the shaders' `const FA_* : u32`, so the subscripts are
+// spelled out once here rather than as bare numbers at the eleven use sites.
+// The authoritative occupancy ledger for the 40-word map is the comment block
+// above `FA_LIVE` in assets/shaders/common.wgsl; these must agree with it.
+//
+// [34..39] are THE SEAM'S MASS BOOKS: cumulative, deliberately skipped by the
+// per-tick clear at the head of sim_fluid_seam.wgsl, so a window's total is
+// (after - before). Everything else in the map is one tick.
+constexpr uint32_t kFaLive = 7;         // FA_LIVE
+constexpr uint32_t kFaSpawnDead = 29;   // FA_SPAWNDEAD
+constexpr uint32_t kFaKillHard = 34;    // FA_KILLHARD    (sim_fluid.wgsl)
+constexpr uint32_t kFaSettleKill = 35;  // FA_SETTLEKILL  (sim_fluid_seam.wgsl)
+constexpr uint32_t kFaExcitedCum = 36;  // FA_EXCITEDCUM  (sim_fluid_seam.wgsl)
+constexpr uint32_t kFaCalmSubm = 37;    // FA_CALMSUBM    (sim_fluid.wgsl)
+constexpr uint32_t kFaSpawnLive = 38;   // FA_SPAWNLIVE   (sim_fluid_seam.wgsl)
+constexpr uint32_t kFaSetWrote = 39;    // FA_SETWROTE    (sim_fluid_seam.wgsl)
 // THE PASS-H FIXTURE. A 5x5 shaft through the lake floor into a sealed
 // 25x25x16 chamber — the same puncture `--fluid-bench wp5` uses, and for the
 // same reason: a shaft on its own fills in three ticks and the hole stops
@@ -1118,9 +1135,15 @@ Status GateWaterBody(Ctx& c, std::string& detail) {
     // lake is still inside the sum.
     const int boxLo = chBot, boxHi = lakeGeo.surfY;
     const VoxelTruth h0 = SweepBasin(c, lakeGeo, lakeDesc, matId, boxLo, boxHi);
-    // ===== H1 DIAGNOSIS instrumentation (temporary) =========================
-    // The failure prints ONE number and rule 6 says a bare count is not a
-    // measurement. Three extra sweeps split the box into the two halves the
+    // ===== H1DIAG: the residual's decomposition, permanently ================
+    // A bare residual is not a measurement (CLAUDE.md rule 6). These sweeps and
+    // the seam's cumulative mass books are what turned a flat "-73,287 eighths"
+    // into "g2p is deleting particles that end up inside submerged liquid" in
+    // four runs instead of fourteen, and they print on every run — PASS or
+    // FAIL — because the run where you wish you had them is the one where the
+    // number has already moved.
+    //
+    // Three extra sweeps split the box into the two halves the
     // identity is really about, because the residual algebraically reduces to
     //
     //     err = (particles actually spawned) - (eighths the ledger debited)
@@ -1149,7 +1172,7 @@ Status GateWaterBody(Ctx& c, std::string& detail) {
     uint64_t seen = 0, cand = 0;
     uint32_t samples = 0;
     tick = RunQuietTicks(c, tick, kDrainWindow, &seen, &cand, &samples);
-    // ===== H1 DIAGNOSIS instrumentation (temporary) =========================
+    // ===== H1DIAG: the mid-window split =====================================
     // A MID-WINDOW sample, taken at the end of the draining ticks and before
     // the settle. It separates "the loss accrues WITH the drain" (a per-eighth
     // rule: a spawn that never happened, a settle that rounds down) from "the
@@ -1162,7 +1185,8 @@ Status GateWaterBody(Ctx& c, std::string& detail) {
     const LedgerView lvM = ReadLedger(c);
     uint32_t faM[kFluidArgsWords] = {};
     ReadFluidArgsSync(c.ctx, world, faM);
-    const int64_t inFlightM = (int64_t)faM[7] - (int64_t)std::min(faM[29], faM[7]);
+    const int64_t inFlightM = (int64_t)faM[kFaLive] -
+                              (int64_t)std::min(faM[kFaSpawnDead], faM[kFaLive]);
     // =======================================================================
     // SETTLE, with the hole still open: the jet is still in flight and the
     // ledger still owes a debit the shave has not taken. Measuring before this
@@ -1170,7 +1194,7 @@ Status GateWaterBody(Ctx& c, std::string& detail) {
     tick = RunQuietTicks(c, tick, 90);
 
     const VoxelTruth h1 = SweepBasin(c, lakeGeo, lakeDesc, matId, boxLo, boxHi);
-    // ===== H1 DIAGNOSIS instrumentation (temporary) =========================
+    // ===== H1DIAG: the same three sweeps, after ============================
     const VoxelTruth h1L =
         SweepBasin(c, lakeGeo, lakeDesc, matId, lakeLo, boxHi);
     const VoxelTruth h1N =
@@ -1181,15 +1205,29 @@ Status GateWaterBody(Ctx& c, std::string& detail) {
     ReadFluidArgsSync(c.ctx, world, fa);
     // ONE EIGHTH PER PARTICLE (every seam-born particle carries fullness 1),
     // minus the dead tail of this tick's reserved discharge block.
-    const int64_t inFlight = (int64_t)fa[7] - (int64_t)std::min(fa[29], fa[7]);
+    const int64_t inFlight =
+        (int64_t)fa[kFaLive] -
+        (int64_t)std::min(fa[kFaSpawnDead], fa[kFaLive]);
     const int64_t debitNow = lv.At(hSlot, WBS_DEBIT);
     const int64_t drainedNow = lv.At(hSlot, WBS_DRAINED);
-    const int64_t err =
-        (int64_t)h1.eighths + inFlight - debitNow - (int64_t)h0.eighths;
+    // THE BANKED KILL IS A TERM, NOT A SLACK. g2p deletes a particle that finds
+    // itself inside HARD solid — rock closed over it, or the window moved — and
+    // there is no legal cell to hand its eighths back to, so that mass really
+    // does leave the world. It is the only unaccounted deletion left in the
+    // engine and FA_KILLHARD banks it (sim_fluid.wgsl), which lets this
+    // identity stay STRICT: the alternative is widening the slack until the
+    // kill fits, and a slack wide enough to hide a legitimate deletion is wide
+    // enough to hide the next leak. Measured in this fixture the jet never
+    // touches rock, so the term is 0 and costs nothing to carry — which is
+    // exactly the condition under which you should carry it.
+    const int64_t killedHard =
+        (int64_t)fa[kFaKillHard] - (int64_t)fa0[kFaKillHard];
+    const int64_t err = (int64_t)h1.eighths + inFlight + killedHard - debitNow -
+                        (int64_t)h0.eighths;
     uint32_t pfAfter[4] = {0, 0, 0, 0};
     ReadPageFaultsSync(c.ctx, world, pfAfter);
 
-    // ===== H1 DIAGNOSIS instrumentation (temporary) =========================
+    // ===== H1DIAG: the residual, decomposed. PRINTED EVERY RUN ==============
     //
     // THE DECOMPOSITION. Let E = cumulative emitted (WBS_DRAINED), D = the
     // outstanding debit, S = cumulative eighths the shave actually removed.
@@ -1199,8 +1237,8 @@ Status GateWaterBody(Ctx& c, std::string& detail) {
     //   LAKE  (above the chamber roof): should fall by exactly S.
     //         lakeLeak = (h1L - h0L) + S
     //   CHAMB (the rest of the box):    should gain what landed, and the rest
-    //         is still particles.
-    //         chLeak   = (h1 - h1L) - (h0 - h0L) + inFlight - E
+    //         is still particles (or banked in FA_KILLHARD).
+    //         chLeak   = (h1 - h1L) - (h0 - h0L) + inFlight + killedHard - E
     //
     //   err == lakeLeak + chLeak, identically. A negative lakeLeak means the
     //   LAKE lost water nobody debited (evaporation, the seam, a shave that
@@ -1212,7 +1250,21 @@ Status GateWaterBody(Ctx& c, std::string& detail) {
       const int64_t ch0 = (int64_t)h0.eighths - lake0;
       const int64_t ch1 = (int64_t)h1.eighths - lake1;
       const int64_t lakeLeak = (lake1 - lake0) + S;
-      const int64_t chLeak = (ch1 - ch0) + inFlight - drainedNow;
+      const int64_t chLeak =
+          (ch1 - ch0) + inFlight + killedHard - drainedNow;
+      // THE SEAM'S OWN BOOKS, independent of the ledger: in == out + liveDelta
+      // or mass appeared or vanished inside the MPM seam itself. FA_CALMSUBM is
+      // on NEITHER side — a calmed particle is still alive and still counted in
+      // liveDelta, so adding it would double-count. That it is not a term here
+      // is the whole content of the H1 fix: it used to be a KILL, which put it
+      // on `out` while its mass went nowhere.
+      const int64_t booksIn0 =
+          (int64_t)fa[kFaSpawnLive] - (int64_t)fa0[kFaSpawnLive];
+      const int64_t booksIn1 =
+          (int64_t)fa[kFaExcitedCum] - (int64_t)fa0[kFaExcitedCum];
+      const int64_t booksOut1 =
+          (int64_t)fa[kFaSettleKill] - (int64_t)fa0[kFaSettleKill];
+      const int64_t liveDelta = (int64_t)fa[kFaLive] - (int64_t)fa0[kFaLive];
       const int64_t lakeM = (int64_t)hML.eighths;
       const int64_t SM = lvM.At(hSlot, WBS_DRAINED) - lvM.At(hSlot, WBS_DEBIT);
       const int64_t lakeLeakM = (lakeM - lake0) + SM;
@@ -1223,7 +1275,8 @@ Status GateWaterBody(Ctx& c, std::string& detail) {
           "H1DIAG[%s] err %+lld = lakeLeak %+lld + chLeak %+lld\n"
           "  lake  %lld -> %lld (%+lld), shaved S=%lld (drained %lld - debit "
           "%lld)\n"
-          "  chamb %lld -> %lld (%+lld), inFlight %lld (live %u dead %u)\n"
+          "  chamb %lld -> %lld (%+lld), inFlight %lld (live %u dead %u), "
+          "banked hard-solid kill %lld\n"
           "  MID-WINDOW (end of drain, before settle): err %+lld = lakeLeak "
           "%+lld + chLeak %+lld ; drained %lld debit %lld inFlight %lld\n"
           "  disc filter: box %llu -> %llu vs NO-DISC %llu -> %llu (d0 %+lld d1 "
@@ -1235,17 +1288,18 @@ Status GateWaterBody(Ctx& c, std::string& detail) {
           "  fluidArgs delta: live %+lld dead %+lld emitted %+lld settled %+lld "
           "excited %+lld refused %+lld consumed %+lld clamped %+lld "
           "setrefused %+lld setunstable %+lld spawndead %+lld\n"
-          "  SEAM BOOKS (cumulative over the window, fluidArgs[34..39]):\n"
-          "    in : spawnedLive %lld + excited %lld = %lld\n"
-          "    out: g2p KILL-IN-HARD-SOLID %lld + g2p KILL-IN-SUBMERGED-LIQUID "
-          "%lld + settleKill %lld = %lld\n"
-          "    settle wrote %lld net eighths of voxels (settleKill %lld)\n"
+          "  SEAM BOOKS (cumulative over the window, FA_* words 34..39):\n"
+          "    in : FA_SPAWNLIVE %lld + FA_EXCITEDCUM %lld = %lld\n"
+          "    out: FA_KILLHARD %lld + FA_SETTLEKILL %lld = %lld\n"
+          "    FA_SETWROTE %lld net eighths into voxels; FA_CALMSUBM %lld "
+          "calm events (NOT a transfer, on neither side)\n"
           "    in - out - liveDelta = %lld  (0 means the seam's books close)\n",
           arm.name, (long long)err, (long long)lakeLeak, (long long)chLeak,
           (long long)lake0, (long long)lake1, (long long)(lake1 - lake0),
           (long long)S, (long long)drainedNow, (long long)debitNow,
           (long long)ch0, (long long)ch1, (long long)(ch1 - ch0),
-          (long long)inFlight, fa[7], fa[29],
+          (long long)inFlight, fa[kFaLive], fa[kFaSpawnDead],
+          (long long)killedHard,
           (long long)(lakeLeakM + chLeakM), (long long)lakeLeakM,
           (long long)chLeakM, (long long)lvM.At(hSlot, WBS_DRAINED),
           (long long)lvM.At(hSlot, WBS_DEBIT), (long long)inFlightM,
@@ -1261,7 +1315,7 @@ Status GateWaterBody(Ctx& c, std::string& detail) {
           lv.At(hSlot, WBS_RVGIVENT_W), lv.At(hSlot, WBS_RVTAKENT_W),
           lv.At(hSlot, WBS_RVCAPPED_W), pfAfter[0] - pfBefore[0],
           pfAfter[1] - pfBefore[1], pfAfter[2], pfAfter[3],
-          (long long)fa[7] - (long long)fa0[7],
+          (long long)fa[kFaLive] - (long long)fa0[kFaLive],
           (long long)fa[8] - (long long)fa0[8],
           (long long)fa[9] - (long long)fa0[9],
           (long long)fa[10] - (long long)fa0[10],
@@ -1271,24 +1325,17 @@ Status GateWaterBody(Ctx& c, std::string& detail) {
           (long long)fa[18] - (long long)fa0[18],
           (long long)fa[25] - (long long)fa0[25],
           (long long)fa[26] - (long long)fa0[26],
-          (long long)fa[29] - (long long)fa0[29],
-          (long long)fa[38] - (long long)fa0[38],
-          (long long)fa[36] - (long long)fa0[36],
-          (long long)(fa[38] - fa0[38]) + (long long)(fa[36] - fa0[36]),
-          (long long)fa[34] - (long long)fa0[34],
-          (long long)fa[37] - (long long)fa0[37],
-          (long long)fa[35] - (long long)fa0[35],
-          (long long)(fa[34] - fa0[34]) + (long long)(fa[35] - fa0[35]) +
-              (long long)(fa[37] - fa0[37]),
-          (long long)fa[39] - (long long)fa0[39],
-          (long long)fa[35] - (long long)fa0[35],
-          ((long long)(fa[38] - fa0[38]) + (long long)(fa[36] - fa0[36])) -
-              ((long long)(fa[34] - fa0[34]) + (long long)(fa[35] - fa0[35]) +
-               (long long)(fa[37] - fa0[37])) -
-              ((long long)fa[7] - (long long)fa0[7]));
+          (long long)fa[kFaSpawnDead] - (long long)fa0[kFaSpawnDead],
+          (long long)booksIn0, (long long)booksIn1,
+          (long long)(booksIn0 + booksIn1), (long long)killedHard,
+          (long long)booksOut1, (long long)(killedHard + booksOut1),
+          (long long)fa[kFaSetWrote] - (long long)fa0[kFaSetWrote],
+          (long long)fa[kFaCalmSubm] - (long long)fa0[kFaCalmSubm],
+          (long long)(booksIn0 + booksIn1 - killedHard - booksOut1 -
+                      liveDelta));
       std::fflush(stderr);
     }
-    // ===== end H1 DIAGNOSIS instrumentation =================================
+    // ===== end H1DIAG ======================================================
 
     if (ai == 0) {
       hEmit1 = drainedNow;
@@ -1312,7 +1359,8 @@ Status GateWaterBody(Ctx& c, std::string& detail) {
           arm.shellRadius, (unsigned long long)cand, (unsigned long long)seen,
           samples, (double)cand / (double)kDrainWindow,
           lv.At(hSlot, WBS_LEVEL), lv.At(hSlot, WBS_HOLEAREA),
-          lv.At(hSlot, WBS_JETV), (long long)inFlight, fa[7], fa[29]);
+          lv.At(hSlot, WBS_JETV), (long long)inFlight, fa[kFaLive],
+          fa[kFaSpawnDead]);
     }
 
     // WHY NEITHER ARM IS A STRICT EQUALITY, and it is worth being exact about
@@ -1329,6 +1377,14 @@ Status GateWaterBody(Ctx& c, std::string& detail) {
     // it downstream of the ledger — `capped` is 0, so the shave was never short
     // and the debit followed what it granted, every tick.
     //
+    // WHAT THE SLACK IS NOT FOR: a deletion the engine knows it performed. The
+    // residual sat at -73,287 for a while because g2p was annihilating
+    // particles that ended up inside submerged liquid; the fix was to stop
+    // doing that (they go calm now), and the one deletion that REMAINS legal
+    // — a particle inside hard solid — is banked in FA_KILLHARD and added
+    // back above rather than absorbed here. A slack wide enough to cover a
+    // known deletion is wide enough to cover the next unknown one.
+    //
     // So the bound is small and it lives in JSON: it is an assertion that the
     // discharge is not a PUMP, not a claim that a churning pool is lossless.
     const int64_t slack = (int64_t)BaselineNumber(
@@ -1339,12 +1395,15 @@ Status GateWaterBody(Ctx& c, std::string& detail) {
       fail(Format(
           "CONSERVATION (pass %s): basin %u slot %u is off by %+lld eighths. "
           "box %llu -> %llu (%+lld), in flight %lld (live %u, dead ops %u), "
-          "ledger drained %lld, outstanding debit %lld, capped %d, level %d, "
-          "hole area %d, %u page faults",
+          "banked hard-solid kill %lld, ledger drained %lld, outstanding debit "
+          "%lld, capped %d, level %d, hole area %d, %u page faults — the "
+          "H1DIAG lines above decompose this into lake / chamber and the seam's "
+          "mass books",
           arm.name, lakeDesc.basinId, hSlot, (long long)err,
           (unsigned long long)h0.eighths, (unsigned long long)h1.eighths,
           (long long)((int64_t)h1.eighths - (int64_t)h0.eighths),
-          (long long)inFlight, fa[7], fa[29], (long long)drainedNow,
+          (long long)inFlight, fa[kFaLive], fa[kFaSpawnDead],
+          (long long)killedHard, (long long)drainedNow,
           (long long)debitNow, lv.At(hSlot, WBS_CAPPED),
           lv.At(hSlot, WBS_LEVEL), lv.At(hSlot, WBS_HOLEAREA),
           pfAfter[0] - pfBefore[0]));
