@@ -3697,8 +3697,10 @@ touch a creature with a sword, lose a limb, anywhere, every time.
   a point on the art.
 - **Blood is a MATERIAL, not a colour.** `StainWound` rewrites a hash-selected
   fraction of the flesh around the cut to the creature's wound material
-  (`bleed.woundMaterial`, defaulting to its own blood) — the same mechanism
-  charring uses, and for the same reason: a nonzero art slot overrides the
+  (`bleed.woundMaterial`, defaulting to its own blood; since 2026-09-15 that
+  material is a PARAMETER — `Mob::StainWoundAs` — because a bruise and a bite
+  leave the striker's material, not the victim's, see *Damage kinds* below) —
+  the same mechanism charring uses, and for the same reason: a nonzero art slot overrides the
   material colour in `microbody.wgsl`, so a stain carried as paint is invisible
   on exactly the painted surfaces it matters most on. It renders, it travels
   with a severed limb, and it ejects as blood when cut again.
@@ -3749,6 +3751,146 @@ touch a creature with a sword, lose a limb, anywhere, every time.
 
 Gated by `wound-chip` / `wound-accumulate` / `wound-heft` / `wound-bleed`, with
 the hit-count BAND (not an exact count) in `tests/baseline.json`.
+
+### Damage kinds: cut, blunt, bite (2026-09-15; `game/impact.h`, `Mob::BluntHit` / `Mob::BiteHit`, `sim/tuning.h` §E6, `docs/PLAN_impact_unarmed.md`)
+
+Everything above is a KERF, and until this landed a kerf was all there was:
+`EdgeSweep` carried one `damage` float and the only things `MeleeSweepDamage`
+could do with a body it met were `Damage` it and `CutLimb` it. A sword, a mace
+and a fist arrived as the same thing, which is why there was no mace and no
+fist — and why armour was a wall rather than a mechanic. `gear.cutHardnessRef`
+correctly scales a blade's slot to a twentieth of itself on iron (hardness 160
+against skin's 8); with an edge as the only thing a blow could be, "correctly"
+meant "proof against everything".
+
+**A strike is THREE NUMBERS, not one kind.** `StrikeProfile` (`game/impact.h`)
+is `cut` / `blunt` / `bite`, each hp at full swing speed, plus two 0..1
+fractions (`bluntCarve`, `armorBreak`) that scale a tuning radius rather than
+naming a size in voxels, plus `infectMat` / `infectStain`. An `enum DamageKind`
+was rejected for the reason design rule 4 rejects every closed-ended system
+here: it would make a sword pure cut and a mace pure blunt and neither is true
+— a sword's flat and pommel bruise, a flanged mace tears skin. Three numbers
+let `items.json` say `sword: damage 14, blunt 2, armorBreak 0.05` and
+`mace: damage 2, blunt 16, bluntCarve 0.6, armorBreak 0.8` and the SAME
+resolution code do the right thing for both; `damage` is deliberately not
+renamed, because it IS the cut part. `Total()` is the one number the pre-impact
+callers wanted — debris melting and the parry spend a blow whole, since what a
+blade catching a mace loses is its own hp and trauma is as bad for it as an
+edge.
+
+**One sweep resolves all three against the same struck thing**, in this order:
+the PARRY, geometrically and first, and the one place the parts are not
+distinguished; then CLASSIFICATION, asked once (`StruckKind`: a slot below
+`AppendedBase()` is FLESH, one at or above it tagged `worn` is a SHELL, the one
+at `HeldSlot()` is a WEAPON, an unowned body is DEBRIS — three resolvers and two
+gates read it, and an enum is cheaper to keep agreeing than three copies of the
+same two `if`s); then the CUT if `cut > 0`, the whole wound model above
+unchanged, inside a `BladeCutScope` that now ENDS with the kerf, because a mace
+caving a skull in is not a dismemberment and must not arm the wet dismember cue;
+then `Mob::BluntHit` if `blunt > 0`; then `Mob::BiteHit` if `bite > 0`, with the
+infection terms copied onto it ONLY when the classification said FLESH — armour
+in the way means no infection, and that decision belongs to the sweep because "a
+bite that touched flesh" is a fact about what this sweep met. Debris melts on
+`Total()` and skips the rest. Every part draws off one per-probe key, so a
+replay of the same tick cuts, bruises and tears identically.
+
+**Blunt is trauma, and it never takes a limb off.** On FLESH `Mob::BluntHit`
+charges hp through the ordinary `Damage` (flinch, hurt cry, and death on a vital
+limb at zero, all unchanged), tops the drip budget up at only
+`gore.bluntBleedScale` of a cut's rate — a punch does not open you — stains a
+BRUISE in `gore.bruiseMat` over `gore.bruiseRadius · (0.5 + 0.5·power)`, and
+removes a voxel only if the weapon authored `bluntCarve`: a shallow radial DENT
+of `gore.bluntCarveRadius · bluntCarve · power`, through the same
+`CarveLimbRadial` an explosion calls, soaked in the victim's own `woundMat` on
+the way out. The whole blow runs inside `Mob::BluntCarveScope`, and that scope
+is the entire implementation of the owner's one-line spec: the COLLAPSE sever is
+skipped, so a face may be caved in well past the point at which a blast would
+have shed the head, however many blows land. hp reaching zero on a vital limb
+still kills, because `HpZeroSevers` is about DEATH rather than about amputation.
+A bare fist authors `bluntCarve` 0 and removes literally nothing.
+
+**...and blunt is how armour is answered.** On a SHELL the same call does three
+things and not one of them is a resist number. The piece takes
+`gear.bluntShellHp` of the blow as its own hp (under 1, or a plate would be
+destroyed by the same number of hits that kill its wearer and armour would have
+no history). It is BEATEN IN over
+`gear.bluntDentRadius · armorBreak · power · k` — real voxels, through the
+ordinary radial carve, so the flesh under it is exposed to the next blow and to
+fire and acid. And `gear.bluntThrough` of the blow TRANSMITS to the limb the
+shell is strapped to (`MobLimb::wornHost`) as trauma with a bruise, no dent and
+no bleed, whether or not the shell broke — the plate deforming IS how the energy
+arrives, which is the whole difference from a blade. `k` is the shell's own
+hardness against `gear.bluntHardnessRef` floored at `gear.bluntHardnessMin`,
+exactly as the kerf is scaled but referenced at 60 rather than 8: iron keeps
+about 38% of a dent where it keeps 5% of a slot. That is "plate stops swords
+almost entirely; maces go through", as geometry.
+
+**A bite is a tear, and it severs only by collapse.** `Mob::BiteHit` on FLESH
+charges hp, bleeds like a cut (refusing the drip would make a bite read as a
+bruise), and carves a correlated-noise BLOB of
+`gore.biteRadius · (0.4 + 0.6·power)` at feature size `gore.biteBlob` — the same
+predicate `Mob::RotAtSpawn` draws the undead's holes with, now one
+implementation shared through `Mob::CarveBlob`. `Mob::BiteScope` marks the carve
+as a tear so it cannot inherit a blade scope somebody left standing; the blade
+rules stay off (a mouth has no direction to cut through in) and the collapse
+sever is deliberately left ON, because enough bites DO take a hand off and that
+is the single rule separating a bite from a punch. On a SHELL a bite is
+`gear.biteOnShell` of itself as blunt trauma, with no break and no infection.
+
+**The material a wound rewrites flesh to is a property of the SOURCE.**
+`Mob::StainWound` had the victim's `woundMat` baked into it, which is right for
+a cut and wrong for everything else; it is now a one-line wrapper over
+`Mob::StainWoundAs(limb, centre, radius, seed, rewriteMat, smearMat, ...)`. A
+cut leaves the creature's own blood, a punch leaves `gore.bruiseMat` with no
+smear at all, and a zombie's bite leaves the BITER's `rotflesh` smeared with the
+biter's `ichor` — the victim's blood does not come into it. Because
+`StainWoundAs` only ever rewrites flesh-class cells (`MobDef::tissue`), a
+nonzero return IS "the tear exposed flesh", which is how an infection knows it
+landed; the material is latched on the limb (`MobLimb::infectMat`) so the heal
+path can tell a wound settling from a substance decaying. All three rewrites dry
+BACK through `ReviveWoundVoxel` where `WoundsHeal()` says so, on their own
+clocks — blood and a bruise at `gore.woundHealSlow`, rot at
+`gore.infectHealSlow` (6.0 against 2.0), because rot living in you is not a
+wound settling. In an undead it never goes away, which is the point.
+
+**Three materials, appended after `blood` so the stain slots keep their
+numbers.** `rotflesh` (solid, greenish, `emission` 70, organic + dissolvable,
+crumbling to `ichor`, because what runs out of a rotten wound is not blood any
+more); `ichor` (liquid, `stain.type: "rot"` — palette slot 3, after wet and
+blood — and `washes: false`, since rinsing an infection off in a stream is not a
+thing that should work); and `skin_bruised`, skin's own hardness and density
+with a `tints` ladder that is an AGE rather than a colour, picked by the
+art-colour quantization so a green-fleshed creature bruises greenish. All three
+far-alias onto existing entries, because the far palette was exactly full.
+
+**Fourteen tuning rows, all CPU-only** (`Tuning::Gore` §E6, `Tuning::Gear`):
+`gore.bruiseRadius` 0.9, `gore.bruiseMat` `"skin_bruised"`,
+`gore.bluntBleedScale` 0.1, `gore.bluntCarveRadius` 0.7, `gore.biteRadius` 0.45,
+`gore.biteBlob` 2.5, `gore.biteStainScale` 1.5, `gore.infectHealSlow` 6.0,
+`gear.bluntDentRadius` 1.2, `gear.bluntHardnessRef` 60,
+`gear.bluntHardnessMin` 0.15, `gear.bluntThrough` 0.55, `gear.bluntShellHp` 0.6,
+`gear.biteOnShell` 0.3. `bruiseMat` is the file's FIRST NAME-TYPED ROW and could
+not be anything else: `tuning.json` reloads on F5 and `materials.json` on R,
+independently, so an id here would silently start meaning a different substance
+the first time anybody inserted a material. It resolves at use through
+`MobSystem::MaterialIdNamed`, and an unknown name resolves to 0 = no bruise,
+which is the right failure for a cosmetic row. (`biteRadius` is the one number
+the plan got wrong at 1.1: that is most of the cross-section of a 1.2-voxel
+thigh, and `bite-rot` measured one bite taking 936 of 1344 voxels and the second
+collapsing the limb — an amputation with teeth rather than a wound.)
+
+Four gates in `selftest_impact.cpp`, fabricated sweeps against a standing
+fixture rather than strokes through the AI, at the end of the wound group:
+`impact-blunt` (a mace past hp zero with the limb still attached, bruise cells
+> 0, the dent inside its band, less bleeding than the same hp of cuts),
+`impact-armor` (a sword on a cuirass takes at most a chip and leaves the host's
+hp alone; a mace beats the same plate in and the man inside it takes hp,
+asserted RELATIVE to the blade arm because the property is the difference),
+`impact-fist` (a bare fist removes exactly zero voxels; a gauntleted one removes
+some, per hit under the wound gates' own figure for one sword cut, which is what
+makes "caving a face in SLOWLY" mean something) and `bite-rot` (rotflesh > 0
+through skin, exactly 0 through iron). Every numeric row above is in the
+`combat-tuning` round-trip table, with a string probe for `bruiseMat`.
 
 ### Blood is health, and burns cap it (2026-09-02; `Mob::DrainBlood`, `Mob::RecountBurn`, `sim/tuning.h` §F/§G)
 
@@ -4294,7 +4436,9 @@ is byte-for-byte the old behaviour, per creature.
 
 **Rot is the ordinary carve, not a second notion of damage.** `Mob::RotAtSpawn`
 hands a few blobs per limb to `CarveLimb` — the same function a sword, a blast
-and a fire reach. The holes are real geometry, the collider and the micro brick
+and a fire reach, through the same `Mob::BlobCarveFactory` a BITE tears with
+(2026-09-15), so a zombie's own holes and the ones it leaves in you are one
+implementation of one shape. The holes are real geometry, the collider and the micro brick
 are rebuilt around them, the connectivity split runs, and hp is charged for the
 volume exactly as any other damage would be. It runs after the mob is pushed
 into `mobs_` (a carve clones the brick copy-on-write, rebuilds the Jolt body and
@@ -5098,9 +5242,12 @@ swept from where it was last tick to where it is now; whatever that quad passes
 through is cut, at the point it was crossed. So the location struck is the
 location that loses voxels — which is only worth saying because §7's live-limb
 carving already made "lose voxels *there*" expressible. Melee adds no gore
-code: it calls `CarveLimbRadial` for flesh and `MeltBodyAt` for debris, the
-same two calls the laser splits between, and dismemberment stays geometric
-(a limb comes off when the cuts disconnect it, not when a counter hits zero).
+code: it reaches flesh through `Mob::CutLimb` / `BluntHit` / `BiteHit` and
+debris through `MeltBodyAt`, and every one of those ends in the same
+`CarveLimb` / `CarveLimbRadial` the laser and the blast already call.
+Dismemberment stays geometric (a limb comes off when the cuts disconnect it,
+not when a counter hits zero) — and a blunt blow refuses even that, see
+*Damage kinds: cut, blunt, bite*.
 
 **The mouse is the swing.** Holding the attack button hands the weapon arm to
 the mouse, and past a speed threshold the blade commits a cut along the
@@ -5241,7 +5388,10 @@ it used to call `CarveLimbRadial` it now fills the kerf described in the wound
 model section above and calls `Mob::CutLimb`. Keeping that construction inside
 the sweep rather than at each call site is deliberate — the player's cut, an
 NPC's cut and the gate's cut are then the same cut by construction, and there is
-no second copy of the depth formula to drift.
+no second copy of the depth formula to drift. Since 2026-09-15 the sweep
+resolves THREE parts rather than one — `EdgeSweep::damage` became
+`EdgeSweep::strike`, a whole `StrikeProfile` — and the kerf is only the first of
+them.
 
 The two halves meet at exactly one number. `MeleeSweepDamage` forms
 `power = speedRamp * MeleeEdgeAlign(...)` once, and everything downstream reads
@@ -5424,8 +5574,44 @@ ground" is a third state (`GroundSense::groundUnknown`, from a new out-param
 on `GroundHeightAt`): gravity waits on an unfetched column rather than
 dropping the creature through terrain the mirror has not delivered — the
 projectile trap in CLAUDE.md, mob edition. The gait is off while airborne
-(it would IK the legs to the floor being fallen toward). Vertical only: an
-NPC has no planar velocity state, and a body that needs to fly is a ragdoll.
+(it would IK the legs to the floor being fallen toward).
+
+**...and a body can be THROWN, which is the lunge** (2026-09-15; `Mob::Launch`,
+`AttackStyle::lunge`). Freefall used to be vertical only — "an NPC has no planar
+velocity state, and a body that needs to fly is a ragdoll" — so "jump at them
+and bite" had no expression at all: the walk drive resolves a whole step against
+the body's box every tick and cannot leave the ground, so a zombie either stood
+in reach or did not. `Mob::Launch(vel)` sets `airborne_`, puts the vertical on
+`fallVel_` and keeps the horizontal in `airVel_`, which `UpdateFall` integrates
+by the SAME rules the walk drive travels by — `FootprintFooting` against the
+body's own box, another mob counted as a wall, each axis tried alone so a leap
+that grazes a corner slides along it — because otherwise a pounce is the one way
+in the game to get inside a rock. Hitting a wall in mid-air spends the planar
+velocity and the body drops where it is. `launched_` is a one-tick latch: a
+lunge is fired by `StepStroke`, which runs AFTER `UpdateFall`, so the first
+`UpdateFall` to see it still has the body on the ground it left from — without
+it a flat pounce has `fallVel_` driven negative by one tick of gravity before it
+has moved anywhere, the landing test fires, and the creature twitches and stays
+put.
+
+A style fires one at the FIRST tick of its named phase (`"windup"` by default,
+so the leap IS the telegraph), once per stroke. The authored `speed` is a
+CEILING and not the magnitude: the horizontal is
+`min(speed, (distance − reach) / flight time)`, so the same style is a long leap
+from far out and a short hop from close in, and the body arrives at striking
+distance rather than inside the victim. The `reach` there is the EFFECTOR's —
+the arm or neck the driver is already bounded by — and not the style's, which
+means how far out the creature is willing to COMMIT: measured with the style's
+own 22, every launch computed `dist − 22 <= 0`, capped the horizontal at zero
+and produced a creature that hopped on the spot. The loco state scales it
+through `AnimStateRule::lungeScale`, which defaults at load to that state's
+`speedScale` rather than to 1 — a body dragging itself on its elbows walks at a
+fifth speed but can still throw itself half its own length — so a crawling
+zombie pounces low and short from one number in its own state rule. Lining the
+landing up with the cut is the AUTHOR's job. Gated by `lunge`: a zombie at twice
+its reach leaves the ground, closes real distance and lands with the cut still
+live; a crawler does the same lower and shorter, and neither sinks into the
+ground it travels over.
 
 **The get-up is procedural and nothing is authored.** `TickRagdollLimp`
 watches the pelvis: past `minSeconds`, once it has moved slower than
@@ -5956,7 +6142,8 @@ the driver can actually put the point and the two are nothing like the same
 length. There is no `enum SwingKind` anywhere: a profile lists opaque style ids,
 `PickAttackStyle` draws one per attack, and a name the library has never heard
 of gets a loud skip rather than a crash. Shipped: `horizontal_r`,
-`horizontal_l`, `overhead`, `diagonal`, `thrust`.
+`horizontal_l`, `overhead`, `diagonal`, `thrust`, and — since a part of the
+body can be a weapon — `punch_r`, `punch_l`, `hook_r`, `bite`, `bite_lunge`.
 
 **The windup IS the telegraph.** There is no UI indicator by design: a style's
 windup is 10–14 ticks of visible blade raise, and `npc-strike` asserts its
@@ -5990,6 +6177,87 @@ has no `armU.R`). The tuner's clip lane writes the library ("→ library") and
 reads it back ("← library" copies a file into the open sidecar for editing);
 the Attacks lane's `clip` picker lists it. The `mob` gate asserts every library
 file compiled onto the human under its stem — that is the name a style uses.
+
+
+**A style names WHAT SWINGS IT, and what it can reach** (2026-09-15;
+`docs/PLAN_impact_unarmed.md` §5). Five fields, all optional, all data:
+
+- `weapon` — `"held"` (the default, and what every style authored before this
+  existed says) or the name of a natural weapon on the creature's own rig
+  (`"fist.R"`, `"jaws"`).
+- `fallback` — only drawn when there is nothing better. A duelist lists its
+  punches beside its cuts; with a sword in its fist it must never draw one, and
+  disarmed it must. `PickAttackStyle` resolves names, FILTERS by `StyleUsable`,
+  then drops every fallback style as a GROUP if any non-fallback style survived,
+  then draws. Filtering before drawing rather than after is what stops a
+  disarmed duelist missing three turns in four while it rolls its way onto its
+  one punch, which reads as a creature that has stopped fighting rather than one
+  that has lost its sword.
+- `reach` — world voxels, overriding the profile's `attack.reach` for this style
+  alone. A lunging bite commits from 22 and a punch from 9, and a profile can
+  state only one number.
+- `lunge` — a ballistic opening; see the locomotion section above.
+- `target` — weights over LIMB TAGS rather than names, so any rig that tags its
+  parts answers it. `MobSystem::PickTargetLimb` accumulates over (tag weight x
+  that tag's LIVE BASE limbs), so two arms do not make "arm" twice as likely as
+  its authored weight, draws counter-based on (attacker, tick), then draws again
+  for WHICH of that tag's limbs — a bite that always took the left arm would be
+  a distribution over tags wearing a distribution over limbs. Worn shells and
+  held items are excluded: aiming at one is aiming at somebody's coat. The
+  choice is recorded on `NpcStroke::targetLimb` the instant it is made, so a
+  gate asserts the DRAW instead of inferring it from where the wounds landed,
+  and it is drawn ONCE per stroke — a blow that re-chose its limb every tick
+  would be homing, and the whole point of a windup is that it is not.
+
+**`StyleUsable` is the style vocabulary's one question about a rig**, declared
+in `strokes.h` and defined in `mob.cpp` — the header is included BY `mob.h` so
+it cannot see a `Mob`, but an author looking for "when does a style apply"
+should not have to know the answer lives in the rig. `"held"` asks
+`HeldSlot() >= 0`; a natural weapon asks that the def declares it, that its part
+is alive, and — for a chain effector — that every part of the chain serving it
+is alive, because a two-bone solve with the elbow severed is a hand hanging in
+space off a shoulder. Refusing BEFORE the draw keeps the driver from ever seeing
+a broken chain: a one-armed zombie's punches quietly stop being options instead
+of becoming a pose bug. `MobSystem::ForceAttack` asks the same question, so a
+gate forcing a punch on a handless body gets `false` and can assert on it.
+
+**Reach reaches the AI without the AI learning what a style is.**
+`MobSystem::AttackReachOf` is the longest reach the creature can ACTUALLY use —
+the profile's, raised by the longest `reach` among its USABLE styles, so a
+zombie whose head has come off stops standing 22 voxels away waiting to bite —
+and it is handed to `ai::Think` on `ai::SelfView::attackReach`, exactly as the
+creature's own step-up and headroom budgets are. `BeginStroke` then refuses a
+drawn style whose own reach the target is outside, which stops a zombie that has
+closed to 14 voxels swinging a 9-voxel punch at air; that refusal says nothing,
+because it is not a content error. One that IS is loud: `ReportNoStroke` prints
+once per (mob, reason) off a bitmask, because there are four reasons now and a
+creature with nothing left requests an attack every cadence forever.
+
+**The player has a second compass.** `StyleLibrary::playerUnarmed` is a
+`PlayerStrikeMap` beside `player`, and it is a second map rather than a `weapon`
+filter over the first because the two are different SHAPES: a sword's compass
+has an overhead and a thrust, a fist's has a jab, a cross and a straight, and
+asking one set of sectors to mean both makes every punch a re-labelled sword
+cut. `main.cpp` picks between them on whether anything is drawn, and "this body
+can punch" is answered by CONTENT rather than by a `FindNatural("fist.R")`
+spelled in C++: the compass resolves and at least one style it points at passes
+`StyleUsable` on the avatar. Lose both hands and it stops resolving on its own;
+author a creature with claws and nothing in the frame loop changes.
+`meleeArmed` still means "a weapon is drawn" and still decides what to equip;
+`meleeReady = meleeArmed || meleeUnarmed` is what the driver, the program and
+the sweep gate on, because a fist is as live as a sword.
+
+The content that came with it: `punch_r` / `punch_l` / `hook_r` are
+`fallback: true`, so the armed profiles that now list them are behaviourally
+unchanged and `unarmed-attack` asserts in as many words that an armed fighter
+never draws one; `bite` and `bite_lunge` are not fallbacks. `behaviors.json` gained a `zombie` profile whose every style
+is a natural weapon, so a disarmed zombie is as dangerous as an armed one and
+losing a hand costs it one style rather than all of them. It is also the first
+profile whose `attack.reach` (9) is not the whole story: `bite_lunge` states 22
+of its own and `AttackReachOf` hands the longer to the arbiter, so the creature
+commits from three body-lengths out and the leap closes the gap. Putting 22 in
+the profile instead would have it stand off at 22 to punch, which is the
+coupling per-style reach exists to break.
 
 **The player's swing is bound to the body like the head is** (2026-09-01;
 `melee.aimYaw` / `aimReleaseYaw`, `ResolveSwingBasis` in `game/thirdperson.*`).
@@ -6074,6 +6342,123 @@ one exchange.
   as teleport-slicing and let camera orientation, rather than the carved
   geometry, decide what fell off. `SplitBody` survives for that plane-cut case
   but is no longer on the laser path.
+
+### Natural weapons and strike effectors (2026-09-15; sidecar `natural`, `Mob::SetStrikeEffector` / `ApplyAimPart`, `docs/PLAN_impact_unarmed.md` §3/§4)
+
+The whole pipeline above began at `heldPartIndex_`, and that one assumption is
+why this engine had no fists: an arm could only be driven to serve a blade, an
+edge could only be read off a held item, and an unarmed creature therefore had
+nothing to claim the arm WITH.
+
+**A part of the body IS a weapon.** `MobNaturalWeaponDef` is exactly what an
+item already is — an edge segment and a `StrikeProfile` — with the segment
+living on a part of the rig instead of on a borrowed slot. `human.json` ships
+three (`fist.L`, `fist.R`, `jaws`), and `zombie.json` inherits them untouched
+through `extends`. Modelling jaws as an invisible held item was rejected because
+a slot outlives a part: a headless zombie would still bite, a fist would be in
+the parry table, and every rig would ship two `.vox` files. THE PART IS THE
+AUTHORITY, which makes `StyleUsable` one check rather than a sync problem. The
+`edge` is two POINTS in the part's own art frame — the Y-up,
+origin-at-the-model's-min-corner frame `MobLimbDef::edgeFrom`/`edgeTo` use,
+scaled by `artVoxelsPerMetre` at load exactly as those are — rather than an axis
+plus two offsets, because a part has no hilt to measure from: a fist's edge runs
+wrist to knuckles and a jaw's throat to teeth. A zero-length edge is refused at
+load and asserted against by the `mob` gate, because its only symptom is a
+creature that punches and never connects.
+
+**A worn piece may REPLACE the profile.** `Mob::StrikeProfileFor` looks for a
+shell parented to the weapon's own part whose item carries a `strike` block of
+its own — `iron_gauntlets` is the first — and the four impact numbers move
+across wholesale. An iron gauntlet is not "a fist plus iron"; it is a different
+weapon that happens to be shaped like a fist, which is exactly why the swept
+EDGE stays the fist's own. The covered limb is read off the RIG
+(`parts[slot].parent`), not off the item's cover list, so there is no second
+table to keep in step. The creature's own `bite: {infect, stain}` (`MobBiteDef`;
+`zombie.json` says `rotflesh` + `ichor`) is then OR-ed on, and only onto a
+profile that already bites — a zombie's fist carries no rot, because punching
+somebody does not put your mouth on them. That split is the whole reason the
+infection lives on the creature and the bite number on the weapon: neither file
+has to know the other exists.
+
+**The effector is one part index and one mode** (`Mob::SetStrikeEffector`,
+`StrikeEffectorMode`), and every consumer — `ApplyWeaponArm`, `WeaponEdge`,
+`WeaponStrokePose`, `WeaponArmPose`, `HeadKeepOut` — asks it instead of asking
+the fist. `ResolveEffector` falls through to the held item when nothing is set,
+so **the held path is unchanged by construction**: every Held branch is the code
+that was there before, reached through one more `if`. `Mob::ArmForStyle` sets
+the effector from the style's `weapon` and picks the MODE from the rig's own
+shape — a part an IK chain can serve is a Chain, anything else is an Aim — which
+is one rule instead of an authored mode field, and means a creature whose rig
+later grows a neck chain starts biting through the IK with no content edit.
+
+- **Held** — the arm chain is solved to the driver's hand target and the wrist
+  lays the blade along `bladeDir`. Today's behaviour, untouched.
+- **Chain** (a fist) — the same solve, minus three things. There is no blade to
+  steer, so the wrist does not. There is no blade to LEAN, so
+  `WeaponStrokePose` reports the TIP AT THE HAND: `MeleeState::RadiusBand` picks
+  between two models on `bladeLen_`, and reporting a knuckle one voxel past the
+  wrist as a blade collapsed a five-voxel arm's usable band to 1.75 voxels and
+  leaked the radial drive into elevation through an ill-conditioned tangent.
+  Nothing about the hitbox moves with it — `WeaponEdge` reads the authored
+  segment off the live transform, a separate question from where the driver
+  steers. And the head KEEP-OUT is off: that sphere models a long rigid segment
+  swung about the shoulder that no pose limit knows exists, where a fist is a
+  knuckle on an arm whose shoulder cone and elbow hinge are clamped every tick
+  anyway — left on, a sphere wider than the whole fist shoved a chambered punch,
+  which legitimately sits beside the chin, out and up.
+- **Aim** (the jaws) — no rig puts the head in a chain and one that did would be
+  claiming the neck is an arm, so the part is driven the other way a part can be
+  pointed at something: `Mob::ApplyAimPart` rotates it, and an authored share of
+  the spine (`MobDef::aimSpineShare`, 0.35 — anatomy, so a rig fact and not a
+  tuning one), until its forward lies along the stroke's bearing; the body's own
+  travel closes the distance. That bearing is the driver's `StrokeAz`/`StrokeEl`
+  laid straight onto the part's forward, NOT `weapon_.bladeDir`, which is a
+  rigid bar's law-of-cosines LEAN and therefore derived from a geometry the head
+  is not in. The pivot is the part's OWN joint rather than its parent's:
+  measured with the chest as the pivot, the head realised 0.08 rad of a
+  commanded 0.51 because four of five and a half voxels of "neck" were rigid.
+  Nothing on this path is smoothed — a four-tick cut cannot catch a goal through
+  a 0.12 s halflife, and a stroke owns its part outright, which is what makes a
+  bite snap. `ApplyAimPart` writes the PRE-FLATTEN locals, so it runs at stage
+  3.5 and `ApplyWeaponArm` returns immediately for an Aim effector.
+
+`ApplyAimPart` is the avatar's head-look, moved down onto `Mob` verbatim in its
+reasoning and generalised in two ways: the part is a parameter, and the rotation
+is scaled by a weight so a stroke can fade its aim the way the arm claim does.
+There is therefore ONE implementation of "turn a part toward something", and it
+has a second use — **a creature with a target and no live stroke turns its head
+toward it** (`Mob::SetAimLook`, at 0.6 weight, because a look is not a stare and
+because the posed head also moves the keep-out sphere the driver clamps
+against). It is read off the brain rather than passed out of `ai::Think`, since
+it is not an intent: the AI has no opinion about necks, and giving it one would
+be design rule 4's failure in miniature. It sells the bite for almost nothing,
+because the head is already on the victim before the leap. The direction is
+taken from where the head IS (`Mob::PartJointWorld`, off the live transform) and
+not from `origin_ + model[head].pos`, which is a prefab-local offset added to a
+world position with the body's yaw left out — a couple of voxels of error whose
+direction rotates with the creature, the worst shape an error can have.
+
+**The pose composes with whatever the body is doing**, because the effector
+drive runs where the arm drive always ran, after the loco clip and the gait, so
+a crawling body's punch is solved from wherever the crawl clip left the shoulder.
+`MobBasis` takes the body's live `BodyUp()` weighted by the loco state's
+`groundAlign` rather than world up: a prone creature is posed in a frame tilted
+to the hill it lies on, and a stroke expressed about world up asks for an
+elevation its shoulders do not have — solved correctly and landing in the wrong
+place, by the grade of whatever it is lying on.
+
+Gates: `unarmed-attack` (a disarmed duelist still lands a punch and loses zero
+flesh doing it, and the style draw shrinks with the body — arms off leaves jaws,
+head off leaves fists, both gone leaves −1 and one loud line), `bite-target`
+(40 forced bites choose at least two tags, and not the head every time),
+`player-unarmed` (the compass resolves, `ArmForStyle` lands a Chain effector on
+the named fist, `WeaponEdge` reports its knuckles with NO flat — a fist cannot
+land edge-on — and the punch is clamped by the same IK and pose limits a sword
+swing is), and `npc-styles`, extended to measure a fist as the knuckles' world
+PATH LENGTH and jaws as the forward vector's ANGULAR travel, because the posed
+tip about the stroke's pivot is the SWORD's coordinate and neither of the others
+is in it. The `mob` gate asserts every `natural` entry on every def names a live
+part and has a real edge.
 
 ### Combat feel: hit-stop, hit flash, and the three melee cues (2026-08-31; `sim/tuning.h` `Tuning::CombatFx`, `audio/cues.*`, `assets/shaders/microbody.wgsl`)
 
@@ -6400,7 +6785,10 @@ the variance profile and drip spray).
 
 What the avatar does differently is confined to two seams. The DRIVER:
 `PlayerAvatar::PreTick` takes position and facing from `Player` (plus its own
-gait, ledge-hang arm IK, head look, weapon-arm pose and footfall events) where
+gait, ledge-hang arm IK, weapon-arm pose, footfall events, and the ANGLES for
+its head look — the look itself is `Mob::ApplyAimPart`, which lives on the base
+class because a creature pointing its jaws at your throat is the same
+operation) where
 `MobSystem::PreTick` runs the AI stages — everything else in the two PreTicks
 is the same `Mob` upkeep calls. And the EXPLICIT-EXCEPTION virtuals on `Mob`:
 `AvatarLayer()` (limbs ride the AVATAR physics layer), `OnBodyReleasedToWorld`
@@ -10339,7 +10727,12 @@ let go of, so removing the robe cannot mend the boots.
 
 ### Protection is geometry and materials, never a number
 
-There is no armour class, no resist field and no damage mitigation anywhere.
+There is no armour class, no resist field and no damage mitigation anywhere —
+with one exception, and it is a mechanism rather than a mitigation: a blunt
+blow transmits `gear.bluntThrough` of itself through a shell to the limb
+underneath, because a plate deforming is how the energy arrives (see *Damage
+kinds: cut, blunt, bite*). The dent it leaves is real geometry like everything
+else here.
 Cloth burns because it IS `robe_cloth` (chance 200/1000 against skin's 90);
 steel stops acid because `steel` carries no `tag:dissolvable`, so acid's rule
 never matches it. The one genuinely new mechanic is **occlusion**: the burn
@@ -10562,6 +10955,12 @@ worn slots: a strap does not snap because the blow was fast. Held blades were
 never carved (the sweep skips the held slot) and flesh keeps the wound model
 the `wound` gate pins. `armor-wear` 3c cuts a steel cube and a cloth cube of
 identical geometry with one kerf.
+
+**The answer to a plate is not a better edge.** Armour that could not be
+answered was a wall rather than a mechanic, which is what the blunt half of
+*Damage kinds: cut, blunt, bite* exists to fix: a mace beats the same shell in
+over `gear.bluntDentRadius` and puts `gear.bluntThrough` of itself into the
+body underneath either way.
 
 ### What leaves a body cannot launch anybody
 
