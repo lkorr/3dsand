@@ -482,6 +482,12 @@ const char* const kOrder[] = {
     // `voxregion`, which owns the residency window. Each restores the id
     // counter and regenerates worldgen on the way out.
     "unarmed-attack", "lunge", "bite-target", "player-unarmed",
+    // ...and the directional flinch, appended by the same rule as the four
+    // above and for the same reason: it spawns a creature. It is the most
+    // easily perturbed of the group — its whole measurement is a differential
+    // against the rig's own idle wobble — so it goes where nothing else can
+    // leave a body standing in its fixture.
+    "hit-react",
     // LAST of the world-touching gates, and it must be: BuildVoxRegion moves
     // the residency window and resets the page table, which is the state every
     // other gate's fixture placement assumes. It restores both before it

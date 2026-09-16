@@ -1482,6 +1482,21 @@ void PlayerAvatar::UpdateAnimation(float dt, World& world, bool grounded,
   // they hang off — see ApplyAirArms for why they are posed rather than solved.
   ApplyAirArms(sk, st);
 
+  // ---- the body answers a blow (mob.h Mob::HitReact) ----------------------
+  // THE SAME CALL THE NPC DRIVER MAKES, for the reason the weapon arm is the
+  // same call: a capability of a creature is written once on Mob and the
+  // avatar gets it (mob.h, the inheritance note). Composes additively with the
+  // air lean directly above — both are bounded small rotations on the same
+  // root and spine locals — and, like it, must be pre-flatten so everything
+  // hanging off the spine inherits the rock.
+  //
+  // IT DOES NOT MOVE THE CAMERA, and that is not an oversight: the eye is
+  // PlayerState::ViewEyePos, off `pos`, which this layer never touches. In
+  // first person you see your own arms take the hit; in third you see the whole
+  // body do it. A view kick is a separate knob and a separate argument about
+  // motion sickness.
+  ApplyHitReact(sk, st, dt);
+
   AnimFlatten(sk, st);
 
   // `grounded` is part of the gate, not just an input to it: a gait with no

@@ -1250,6 +1250,14 @@ bool LoadTuning(const std::string& path, Tuning& out) {
     ReadF(*g, "flashFlesh", e.flashFlesh, out, at);
     ReadF(*g, "flashSever", e.flashSever, out, at);
     ReadF(*g, "flashHalflife", e.flashHalflife, out, at);
+    ReadB(*g, "hitReact", e.hitReact, out, at);
+    ReadF(*g, "hitReactRefDamage", e.hitReactRefDamage, out, at);
+    ReadF(*g, "hitReactMaxScale", e.hitReactMaxScale, out, at);
+    ReadF(*g, "hitReactLeanDeg", e.hitReactLeanDeg, out, at);
+    ReadF(*g, "hitReactSpineShare", e.hitReactSpineShare, out, at);
+    ReadF(*g, "hitReactPushFrac", e.hitReactPushFrac, out, at);
+    ReadF(*g, "hitReactLimbDeg", e.hitReactLimbDeg, out, at);
+    ReadF(*g, "hitReactHalflife", e.hitReactHalflife, out, at);
     ReadF(*g, "whooshVolume", e.whooshVolume, out, at);
     ReadF(*g, "whooshMinSpeed", e.whooshMinSpeed, out, at);
     ReadF(*g, "whooshRateSlow", e.whooshRateSlow, out, at);
@@ -1282,6 +1290,18 @@ bool LoadTuning(const std::string& path, Tuning& out) {
     // exp2(-dt/halflife), which is 0/0 at 0), leaving every struck limb lit for
     // the rest of the session.
     e.flashHalflife = std::clamp(e.flashHalflife, 0.01f, 2.0f);
+    // THE REACTION IS SLIGHT BY CONSTRUCTION, and these are the numbers that
+    // say so. 25 degrees of lean or a fifth of a body height of shove is no
+    // longer a flinch — it is a stagger, which is a different feature with a
+    // recovery state and an AI opinion about it. A zero halflife never decays,
+    // exactly as the flash's does not.
+    e.hitReactRefDamage = std::max(e.hitReactRefDamage, 0.1f);
+    e.hitReactMaxScale = std::clamp(e.hitReactMaxScale, 1.0f, 8.0f);
+    e.hitReactLeanDeg = std::clamp(e.hitReactLeanDeg, 0.0f, 25.0f);
+    e.hitReactSpineShare = std::clamp(e.hitReactSpineShare, 0.0f, 1.0f);
+    e.hitReactPushFrac = std::clamp(e.hitReactPushFrac, 0.0f, 0.2f);
+    e.hitReactLimbDeg = std::clamp(e.hitReactLimbDeg, 0.0f, 45.0f);
+    e.hitReactHalflife = std::clamp(e.hitReactHalflife, 0.01f, 0.6f);
     e.whooshVolume = std::clamp(e.whooshVolume, 0.0f, 4.0f);
     e.whooshMinSpeed = std::max(e.whooshMinSpeed, 0.0f);
     e.whooshRateSlow = std::clamp(e.whooshRateSlow, 0.25f, 4.0f);
@@ -2972,6 +2992,14 @@ bool SaveCombatTuning(const std::string& path, const Tuning& t,
     put("flashFlesh", f.flashFlesh);
     put("flashSever", f.flashSever);
     put("flashHalflife", f.flashHalflife);
+    putB("hitReact", f.hitReact);
+    put("hitReactRefDamage", f.hitReactRefDamage);
+    put("hitReactMaxScale", f.hitReactMaxScale);
+    put("hitReactLeanDeg", f.hitReactLeanDeg);
+    put("hitReactSpineShare", f.hitReactSpineShare);
+    put("hitReactPushFrac", f.hitReactPushFrac);
+    put("hitReactLimbDeg", f.hitReactLimbDeg);
+    put("hitReactHalflife", f.hitReactHalflife);
     put("whooshVolume", f.whooshVolume);
     put("whooshMinSpeed", f.whooshMinSpeed);
     put("whooshRateSlow", f.whooshRateSlow);

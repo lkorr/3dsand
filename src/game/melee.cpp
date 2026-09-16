@@ -663,6 +663,16 @@ EdgeSweepResult MeleeSweepDamage(const EdgeSweep& s, const MeleeTuning& t,
       // is exactly as bad for it as a sword's edge (StrikeProfile::Total).
       mobs.Damage(blockBody, s.strike.Total() * power * t.blockItemDamage,
                   blockAt, out.tipSpeed);
+      // ...AND THE GUARD IS DRIVEN BACK. A parry that produces a clang and a
+      // number is the one thing in this whole system that still reads as a
+      // sound effect: the two blades meet and neither body acknowledges it.
+      // The blocker gets the ordinary directional flinch (Mob::HitReact) off
+      // the same blade travel the blow had — full profile, undiminished by
+      // `blockItemDamage`, because what a parry SPARES is the blocker's hp and
+      // not the blocker's balance. `blockBody` is the weapon's own borrowed
+      // slot, which has no worn host, so this spends no limb flick: it is the
+      // body rocking behind a held guard, which is exactly what a parry is.
+      mobs.HitReact(blockBody, sweepDir, s.strike.Total(), power);
       // ...and the defender's guard is beaten open a little, deterministically.
       mobs.PushBlockEvent(out.block, t);
       return out;
@@ -839,6 +849,28 @@ EdgeSweepResult MeleeSweepDamage(const EdgeSweep& s, const MeleeTuning& t,
         debris.MeltBodyAt(hb, at, radius, world, spawns);
         continue;
       }
+
+      // ---- 0. THE BODY ANSWERS, AND IT ANSWERS DIRECTIONALLY --------------
+      //
+      // BEFORE the three resolvers, not after, because any of them can take
+      // the struck limb OFF: `Damage` severs past the impact threshold and
+      // `CutLimb` severs when the lattice parts, and a reaction resolved after
+      // that would be handed a slot that no longer belongs to the creature it
+      // was measured on. A limb that is about to leave still gets its flinch —
+      // for the one tick before it goes, which is the tick the player is
+      // looking at.
+      //
+      // `sweepDir` is the BLADE'S OWN TRAVEL, the same vector the kerf bores
+      // along (`BladeCut::cutDir` below), and not the line from attacker to
+      // victim. A horizontal cut that came across the body shoves you
+      // sideways; the attacker-to-victim vector would shove you backwards and
+      // read as a push rather than as a cut. Whole profile, because a mace
+      // that never breaks the skin still moves you (game/impact.h).
+      //
+      // ONE LINE, THREE POPULATIONS: an NPC hit by the player, the player hit
+      // by an NPC, and an NPC hit by an NPC all arrive here, because all three
+      // swing through this function.
+      mobs.HitReact(hb, sweepDir, s.strike.Total(), power);
 
       // The draw key every part below shares, so a replay of the same tick
       // against the same probe cuts, bruises and tears identically. One

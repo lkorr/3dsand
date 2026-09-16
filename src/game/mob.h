@@ -1853,6 +1853,51 @@ class Mob {
   // creature has decided to fight. PRE-FLATTEN; the driver calls it beside
   // AnimApplySpineTwist.
   void ApplyStrikeAim(const AnimSkeleton& sk, AnimState& st) const;
+  // ---- THE HIT REACTION: WHICH WAY THE BLOW CAME FROM ---------------------
+  //
+  // A landed blow already says "something hit" (the hit-stop dip) and "here"
+  // (the hit flash). Neither says WHICH WAY, and a hit with no direction in it
+  // reads as a light going on rather than as a thing striking a body. This is
+  // the third channel and it is the one the player feels: the struck creature
+  // rocks AWAY from the blade's own travel and settles back inside a quarter
+  // second.
+  //
+  // WHAT IT IS NOT. Nothing here moves `origin_`, `heading_`, `bodyY_` or a
+  // collider. It writes `st.local[]` — the same pre-flatten locals the gait
+  // bob, the spine twist and the aim write — so the planted feet, the personal
+  // space, the A* plan and every hitbox are exactly where they were. That is
+  // what lets it fire on EVERY hit with no animation to author, no budget to
+  // charge and no recovery state for the AI to know about. A stagger that
+  // actually displaces a creature is a different feature with different
+  // consequences, and this is deliberately not it.
+  //
+  // THREE PARTS, one impulse (game/impact.h's law: a profile of numbers, not a
+  // kind). The body LEANS away, the root is SHOVED, and the limb that was
+  // actually struck FLICKS about its own joint — the last being the only one
+  // that says which arm. All three ride one critically damped spring apiece
+  // (anim.h AnimSpringStep, Holden's closed form: exact at any dt, so a frame
+  // spike cannot make it explode) driven by an initial VELOCITY with the goal
+  // at rest, which is the shape that goes out and comes back rather than
+  // easing to a new home.
+  //
+  // WHY THE SPRING IS CLAMPED AS WELL AS DAMPED. A cut is CONTINUOUS
+  // (melee.h EdgeSweep::struck): the blade is still in the wound next tick and
+  // the sweep lands again, so the impulse arrives once per cut tick and would
+  // pump the spring four times for one swing. `SpringDef::maxAngle` bounds the
+  // displacement at the authored peak, so a long cut holds the lean instead of
+  // multiplying it — which is what a blade dwelling in a wound looks like.
+  // The velocity is PEAK-HELD within a tick for the reason the flash and the
+  // dip are: several probes of one sweep meeting one limb are one blow.
+  void HitReact(int limbIndex, Vec3 dirWorld, float hp, float power);
+  // Stage 3.7 of the pose pipeline, PRE-FLATTEN and after the aim: steps the
+  // springs and writes the lean, the shove and the flick into `st.local`.
+  // Costs nothing at all while no reaction is live — the whole layer is behind
+  // one bool that clears itself when the last spring goes quiet (CLAUDE.md
+  // rule 2, applied to a presentation layer).
+  void ApplyHitReact(const AnimSkeleton& sk, AnimState& st, float dt);
+  // Is a reaction running? For the gates and the dev readout; also the one
+  // thing `--shot-mob` can assert without reaching into the springs.
+  bool HitReactLive() const { return hitReact_.live; }
   // WHAT TO LOOK AT while not swinging, in world voxels. Set by the AI seam
   // each tick it has a target and cleared when it does not, so a creature that
   // loses sight of you stops staring through the wall.
@@ -2767,6 +2812,31 @@ class Mob {
   // What this creature is looking at between strokes (Mob::SetAimLook).
   Vec3 aimLook_{};
   bool aimLookValid_ = false;
+  // ---- the directional flinch (Mob::HitReact / Mob::ApplyHitReact) --------
+  //
+  // `lean` is RADIANS about the rig's own axes: .x pitches the body about
+  // model +X (positive takes +Y toward +Z, the facing direction) and .z rolls
+  // it about model +Z (positive takes +Y toward -X). .y is unused — a blow
+  // does not spin you about your own spine, and pretending it does reads as a
+  // creature shrugging.
+  //
+  // `push` is PREFAB VOXELS in the rig's own frame, added to the root's local
+  // position. The feet are IK'd to world points the gait planted, so the body
+  // moves and the legs take it up: the lurch is absorbed rather than skated.
+  //
+  // `limb` is PER PART and parallel to `skel_.parts`, sized on first use. One
+  // spring per limb rather than one spring and an index because a second blow
+  // on a different arm would otherwise steal the first one's spring and snap
+  // it home; 15 parts of 24 bytes is not worth a rule nobody can see on screen.
+  struct HitReactState {
+    SpringState lean;
+    SpringState push;
+    std::vector<SpringState> limb;
+    // The gate on the whole layer. Set by HitReact, cleared by ApplyHitReact
+    // the tick every spring is quiet — so a creature nobody is hitting pays
+    // one bool test per tick and not one spring step.
+    bool live = false;
+  } hitReact_;
   // ---- this body's terrain budgets, in CELLS (anim.h LocomotionDef) -------
   // Authored in metres per rig and resolved once in BuildRig. THE ONE COPY:
   // the walk drive's footprint collider, the 8-way sense fan, the freefall
@@ -3291,6 +3361,19 @@ class MobSystem {
   // flinch clip when the rig defines one.
   bool Damage(uint64_t bodyHandle, float amount, Vec3 hitWorldVoxel,
               float impactSpeed = 0.0f);
+
+  // THE DIRECTIONAL HALF OF A LANDED BLOW (Mob::HitReact). By body handle for
+  // the reason Damage is: the melee sweep knows a Jolt body and a travel
+  // direction, and has no business knowing which creature owns either. Routes
+  // through FindOwner, so it reaches NPCs and the player's own avatar through
+  // exactly one path. Returns true when the handle belonged to a live rig.
+  //
+  // `dirWorld` is the direction the WEAPON was travelling — not the vector
+  // from attacker to victim. The two agree for a thrust and disagree for every
+  // swing, and it is the swing that has to look right: a horizontal cut that
+  // came across the body pushes you sideways, which is the read the vector to
+  // the attacker throws away.
+  bool HitReact(uint64_t bodyHandle, Vec3 dirWorld, float hp, float power);
 
   // ---- per-voxel carving (docs/DESIGN.md §7 "Carving living bodies") ---------
   //

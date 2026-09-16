@@ -6884,6 +6884,57 @@ the only half a silent headless run has.
 a moment, and a per-tick test plays the sample five times over one cut. The edge
 is remembered across frames so it survives a frame that ran no ticks at all.
 
+**The third channel is WHICH WAY** (2026-09-16; `Mob::HitReact` /
+`Mob::ApplyHitReact`, `combatfx.hitReact*`, gate `hit-react`). Hit-stop says
+*something landed* and the flash says *here*; neither says which way, and a blow
+with no direction in it reads as a light going on rather than as a thing
+striking a body. A struck creature now rocks AWAY from the blade's own travel on
+a critically damped spring and is back on its feet in about a quarter second.
+
+*It is a pose, not a push.* Nothing in it moves `origin_`, `heading_`, `bodyY_`
+or a collider — it writes `st.local[]`, the same pre-flatten channel the gait
+bob, the spine twist and the aim write, at **stage 3.7** between the aim and the
+flatten. Planted feet, personal space, the A\* plan and every hitbox are exactly
+where they were, which is the whole licence for firing it on EVERY hit with no
+animation to author, no budget to charge and no recovery state for the AI to
+know about. A stagger that displaces a creature is a different feature. The
+`hit-react` gate asserts the promise directly: origin and heading unchanged
+across a blow.
+
+*Three parts, one impulse.* The body LEANS (split root/spine by
+`hitReactSpineShare`, the distribution law `ApplyAimPart` already uses), the root
+is SHOVED (a fraction of the creature's **own height**, so one number means the
+same lurch on a rat and a troll; the legs are IK'd to planted feet, so the body
+travels and the legs absorb it), and the limb that was actually struck FLICKS
+about its own joint — the only one of the three that says *which arm*. A hit on
+an appended slot is redirected to its `wornHost`, because a shell is posed off
+its host in `PostStep` and flicking the garment would leave the shoulder under it
+still; a parried weapon has no host, so a parry spends lean and shove and no
+flick. A limb inside an IK chain is overwritten by the stage-5 solve, and that is
+correct: a planted foot does not fly up because a shin was hit.
+
+*Why the spring is clamped as well as damped.* A cut is CONTINUOUS
+(`EdgeSweep::struck`) — the blade is still in the wound next tick and the sweep
+lands again, so the impulse arrives once per cut tick. `SpringDef::maxAngle`
+bounds the displacement at the authored peak, so a long cut **holds** the lean
+instead of pumping it four times over, which is what a blade dwelling in a wound
+looks like. Within one tick the velocity is peak-held, for the reason the flash
+and the dip are: several probes of one sweep meeting one limb are one blow.
+
+*How hard comes from the profile, not from a name.* `StrikeProfile::Total()`
+over `hitReactRefDamage`, capped, so a mace out-shoves a fist because it IS
+harder and nothing in C++ knows a weapon by name (design rule 4). The whole
+thing enters at ONE line in `MeleeSweepDamage`, placed BEFORE the three
+resolvers because any of them can sever the slot being measured — so an NPC hit
+by the player, the player hit by an NPC, and an NPC hit by an NPC all get it,
+because all three swing through that function.
+
+*The one number that had to be found by eye.* `hitReactLeanDeg` shipped at 6
+first and at 6 a victim of a sword through the chest did not perceptibly move.
+`--shot-strike human+sword horizontal_r human` is what settled it at 10 — a gate
+can prove the body goes the right way and comes back, and cannot tell you that
+the amount is invisible.
+
 ### Animation pipeline (2026-08-20; `game/anim`, docs/PLAN_voxel_editor.md §B)
 
 The single-sine limb swing became a layered pose pipeline. **All of it is

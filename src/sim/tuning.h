@@ -1582,6 +1582,58 @@ struct Tuning {
     // the same blow. Short: a flash the player can still see when the next blow
     // lands stops reading as a hit and starts reading as a shader bug.
     float flashHalflife = 0.075f;
+    // ---- hit reaction: the body answers, and it answers DIRECTIONALLY -------
+    //
+    // Hit-stop says "something landed" and the flash says "here". Neither says
+    // WHICH WAY, and a blow with no direction in it reads as a light going on
+    // rather than as a thing hitting a body. This is the third channel: a
+    // struck creature rocks AWAY from the blade's own travel, on a critically
+    // damped spring (anim.h SpringDef — Holden's closed form, stable at any
+    // dt), and is back on its feet inside a quarter second.
+    //
+    // SLIGHT IS THE POINT. This is not a stagger and not a knockback: nothing
+    // here moves the creature's ORIGIN, so pathing, personal space, the gait's
+    // planted feet and every collider stay exactly where they were. It is a
+    // pose-space lean the feet absorb, which is why it can fire on every hit
+    // without an animation budget or a recovery state machine.
+    bool hitReact = true;
+    // THE BLOW THIS IS ALL MEASURED AGAINST, in hp at full swing speed. A
+    // strike's whole profile (game/impact.h StrikeProfile::Total) over this is
+    // the multiplier on every peak below, so a mace shoves harder than a fist
+    // because it IS harder, and nothing here has to know a weapon's name.
+    // 14 is a sword's cut — the reference blow is "an ordinary sword hit".
+    float hitReactRefDamage = 14.0f;
+    // ...and the ceiling on that multiplier, so a freak number in an items.json
+    // cannot fold somebody in half.
+    float hitReactMaxScale = 2.2f;
+    // Peak lean away from the blow at the reference blow, in DEGREES. The
+    // spring is CLAMPED at this, so a cut that lasts four ticks and re-pumps
+    // the spring on each of them still leans exactly this far — it just stays
+    // leaned while the blade is in the wound, which is what a blade in a wound
+    // does.
+    // Landed on by eye through `--shot-strike human+sword horizontal_r human`,
+    // which is the only instrument for this: a gate can prove the body goes the
+    // right way and comes back, and cannot tell you 6 degrees is invisible.
+    // It was 6 first, and at 6 the victim of a sword through the chest did not
+    // perceptibly move.
+    float hitReactLeanDeg = 10.0f;
+    // ...of which the SPINE takes this share and the root limb the rest. All on
+    // the root tips the creature like a signpost; all on the spine leaves the
+    // hips unnaturally still. Same distribution law as Mob::ApplyAimPart.
+    float hitReactSpineShare = 0.55f;
+    // Peak shove of the root, as a fraction of the creature's OWN HEIGHT, so
+    // one number means the same lurch on a rat and on a troll. Horizontal
+    // components come from the blow's travel; the vertical one is what makes an
+    // overhead blow drive a body DOWN into its knees.
+    float hitReactPushFrac = 0.050f;
+    // Peak flick of the STRUCK limb about its own joint, degrees. This is the
+    // part that says which arm was hit. Stage 6 clamps it to the joint's
+    // authored range like everything else, so it cannot produce a pose the rig
+    // says is impossible.
+    float hitReactLimbDeg = 22.0f;
+    // Seconds to halve. The whole reaction is over in about 4x this; past
+    // ~0.2 s it stops reading as a flinch and starts reading as a wobble.
+    float hitReactHalflife = 0.110f;
     // ---- combat cues --------------------------------------------------------
     // Volumes are the same 0..N trim every other cue group uses; radius is the
     // audible radius in METRES, matching Tuning::Audio.

@@ -194,6 +194,16 @@ Status GateCombatTuning(Ctx& c, std::string& detail) {
       {"combatfx", "flashFlesh", 1.11f, [](const Tuning& t) { return t.combatfx.flashFlesh; }},
       {"combatfx", "flashSever", 2.11f, [](const Tuning& t) { return t.combatfx.flashSever; }},
       {"combatfx", "flashHalflife", 0.121f, [](const Tuning& t) { return t.combatfx.flashHalflife; }},
+      // ---- the directional flinch (mob.h Mob::HitReact) -------------------
+      // `hitReact` itself is the group's second BOOL and is absent for the same
+      // reason `hitStop` is: this table's mechanism is a float comparison.
+      {"combatfx", "hitReactRefDamage", 21.0f, [](const Tuning& t) { return t.combatfx.hitReactRefDamage; }},
+      {"combatfx", "hitReactMaxScale", 3.10f, [](const Tuning& t) { return t.combatfx.hitReactMaxScale; }},
+      {"combatfx", "hitReactLeanDeg", 9.50f, [](const Tuning& t) { return t.combatfx.hitReactLeanDeg; }},
+      {"combatfx", "hitReactSpineShare", 0.31f, [](const Tuning& t) { return t.combatfx.hitReactSpineShare; }},
+      {"combatfx", "hitReactPushFrac", 0.041f, [](const Tuning& t) { return t.combatfx.hitReactPushFrac; }},
+      {"combatfx", "hitReactLimbDeg", 21.0f, [](const Tuning& t) { return t.combatfx.hitReactLimbDeg; }},
+      {"combatfx", "hitReactHalflife", 0.121f, [](const Tuning& t) { return t.combatfx.hitReactHalflife; }},
       {"combatfx", "whooshVolume", 0.71f, [](const Tuning& t) { return t.combatfx.whooshVolume; }},
       {"combatfx", "whooshMinSpeed", 411.0f, [](const Tuning& t) { return t.combatfx.whooshMinSpeed; }},
       {"combatfx", "whooshRateSlow", 0.71f, [](const Tuning& t) { return t.combatfx.whooshRateSlow; }},
@@ -314,7 +324,10 @@ Status GateCombatTuning(Ctx& c, std::string& detail) {
   "combatfx": {
     "hitStopChipScale": 0.0, "hitStopFleshScale": -1.0,
     "hitStopSeverScale": 0.0, "hitStopSeverMs": 100000.0,
-    "flashHalflife": 0.0, "cueRadius": 0.0
+    "flashHalflife": 0.0, "cueRadius": 0.0,
+    "hitReactHalflife": 0.0, "hitReactRefDamage": 0.0,
+    "hitReactLeanDeg": 400.0, "hitReactLimbDeg": 400.0,
+    "hitReactPushFrac": 3.0, "hitReactMaxScale": 0.0
   }
 })";
     }
@@ -335,6 +348,20 @@ Status GateCombatTuning(Ctx& c, std::string& detail) {
     // struck limb would stay lit for the session.
     check(bad.combatfx.flashHalflife > 0.0f, "flash halflife > 0");
     check(bad.combatfx.cueRadius > 0.0f, "cue radius > 0");
+
+    // ---- THE FLINCH STAYS A FLINCH ----------------------------------------
+    // Two divisions and one promise. `hitReactHalflife` divides inside
+    // HitReactImpulse AND inside AnimSpringStep; `hitReactRefDamage` divides
+    // the strike profile. And the promise the whole feature is sold on is that
+    // it is SLIGHT — a lean or a flick in the hundreds of degrees, or a shove
+    // of three body heights, is a creature folded inside out, which no amount
+    // of downstream clamping recovers.
+    check(bad.combatfx.hitReactHalflife > 0.0f, "hit-react halflife > 0");
+    check(bad.combatfx.hitReactRefDamage > 0.0f, "hit-react reference blow > 0");
+    check(bad.combatfx.hitReactMaxScale >= 1.0f, "hit-react scale ceiling >= 1");
+    check(bad.combatfx.hitReactLeanDeg <= 45.0f, "hit-react lean stays a lean");
+    check(bad.combatfx.hitReactLimbDeg <= 90.0f, "hit-react flick stays a flick");
+    check(bad.combatfx.hitReactPushFrac <= 0.5f, "hit-react shove stays a shove");
 
     // Divisions and degenerate smoothing.
     check(bad.melee.slashTime > 0.0f, "slash time > 0");
@@ -2592,6 +2619,232 @@ Status GateBiteTarget(Ctx& c, std::string& detail) {
   return ok ? Status::Pass : Status::Fail;
 }
 
+// =============================================================================
+// hit-react — a struck body rocks AWAY from the blade, and puts itself back
+// =============================================================================
+//
+// FOUR CLAIMS, and the first two are the ones that would otherwise be checked
+// by eye and never again:
+//
+//   A. SOMETHING MOVES, and by more than the rig's own idle wobble. Measured
+//      as a differential against a noise floor sampled from the SAME creature
+//      over the SAME number of ticks immediately before the blow — not against
+//      zero, because a standing figure is never still (the gait oscillator runs
+//      free on an NPC) and "absolute zero is a rate claim" is a trap this suite
+//      has fallen into before.
+//   B. IT MOVES THE RIGHT WAY. The sign law in Mob::ApplyHitReact is four
+//      lines of quaternion convention, it is invisible at a glance, and getting
+//      it backwards produces a creature that leans INTO the sword — the one
+//      failure of this feature that reads as a bug rather than as a taste
+//      difference. Asserted against a known world direction, and then again
+//      MIRRORED, because a formulation that ignored the direction entirely
+//      would pass the first half.
+//   C. IT IS A FLINCH AND NOT A STAGGER. Bounded above, and back home inside
+//      the advertised recovery — a reaction still visible when the next blow
+//      lands is a wobble.
+//   D. NOTHING ELSE MOVED. The whole argument for firing this on every hit
+//      with no budget and no AI state is that it is POSE-SPACE ONLY: the
+//      origin, the heading and therefore the collider, the personal space and
+//      the A* plan are untouched. That promise is one line to break and one
+//      check to keep.
+//
+// THE WITNESS IS THE LIVE RIG, not the springs. `PartJointWorld` composes the
+// transform the kinematic submit actually pushed into Jolt, so this measures
+// what the renderer and the colliders see — a gate that read `hitReact_.lean`
+// back would be asserting that a float it set is the float it set (the
+// circular-probe note in the memory file, and the reason `swing-plane`
+// measures the blade instead of the command).
+//
+// THE CENTROID rather than a named part, because a gate that says "watch the
+// head" is a gate that fails the day a rig is re-authored without one. The
+// mean joint of every live BODY limb moves with the lean and the shove and is
+// a fact about any rig with limbs at all.
+Vec3 BodyCentroid(Mob* m) {
+  if (m == nullptr) return Vec3{};
+  Vec3 sum{};
+  int n = 0;
+  // `PartJointWorld` is the liveness test as well as the read: it refuses a
+  // slot with no collider, which is exactly what a severed part is here.
+  for (int i = 0; i < m->AppendedBase(); i++) {
+    Vec3 p;
+    if (!m->PartJointWorld(i, p)) continue;
+    sum = sum + p;
+    n++;
+  }
+  return n > 0 ? sum * (1.0f / (float)n) : Vec3{};
+}
+
+Status GateHitReact(Ctx& c, std::string& detail) {
+  IdCounterScope idScope(c.mobs);
+  bool ok = true;
+  int checks = 0;
+  auto check = [&](bool cond, const char* what) {
+    checks++;
+    if (!cond) {
+      ok = false;
+      std::printf("hit-react: FAILED %s\n", what);
+    }
+  };
+
+  Stage st = OpenStage(c);
+  if (!st.ok) {
+    detail = st.why;
+    std::printf("hit-react: SKIP (%s)\n", detail.c_str());
+    return Status::Skip;
+  }
+
+  std::string why;
+  const uint64_t who =
+      SpawnFighter(c, st.defIndex, {st.spot.x, st.spot.y + 1, st.spot.z},
+                   "training_dummy", false, why);
+  if (who == 0) {
+    detail = why.empty() ? "fixture spawn failed" : why;
+    std::printf("hit-react: SKIP (%s)\n", detail.c_str());
+    CloseStage(c);
+    return Status::Skip;
+  }
+
+  Ticker tick{c, 31000, {st.spot.x >> 4, st.spot.y >> 4, st.spot.z >> 4}};
+  // FACING +Z, which is heading 0 — the rig frame and the world frame agree, so
+  // a blow stated in world +X is a blow stated in model +X and the sign law is
+  // being read directly rather than through a rotation that could cancel an
+  // error in it.
+  FaceAt(c.mobs, who, Vec3{(float)st.spot.x, (float)st.spot.y,
+                           (float)st.spot.z + 32.0f});
+  for (int i = 0; i < 48; i++) tick();
+
+  Mob* m = c.mobs.FindMobById(who);
+  if (m == nullptr) {
+    detail = "fixture vanished while settling";
+    std::printf("hit-react: SKIP (%s)\n", detail.c_str());
+    CloseStage(c);
+    return Status::Skip;
+  }
+  // SOMETHING TO HIT. The first body limb that has a collider at all — named
+  // by the rig rather than by this file, for the reason the centroid is.
+  uint64_t target = 0;
+  for (int i = 0; i < m->AppendedBase() && target == 0; i++)
+    target = c.mobs.LimbBody(who, i);
+  if (target == 0) {
+    detail = "fixture has no limb collider to strike";
+    std::printf("hit-react: SKIP (%s)\n", detail.c_str());
+    CloseStage(c);
+    return Status::Skip;
+  }
+
+  const int kWindow = 26;   // ticks watched after a blow: ~0.43 s, ~5 halflives
+
+  // ---- THE NOISE FLOOR, from the same creature over the same span ----------
+  Vec3 rest = BodyCentroid(m);
+  float noise = 0;
+  for (int i = 0; i < kWindow; i++) {
+    tick();
+    noise = std::max(noise, (BodyCentroid(c.mobs.FindMobById(who)) - rest).len());
+  }
+  rest = BodyCentroid(c.mobs.FindMobById(who));
+
+  // ---- ONE BLOW, TRAVELLING WORLD +X --------------------------------------
+  // The reference damage and a full-power ramp, so the peak is the authored
+  // peak and the bound below is a statement about the tuning rather than about
+  // whatever number happened to come out of a sweep.
+  const float refHp = CurrentTuning().combatfx.hitReactRefDamage;
+  auto strike = [&](Vec3 dir) {
+    return c.mobs.HitReact(target, dir, refHp, 1.0f);
+  };
+  check(strike(Vec3{1, 0, 0}), "the blow reaches a live rig through FindOwner");
+
+  const Vec3 origin0 = c.mobs.MobOrigin(who);
+  const float heading0 = c.mobs.MobHeading(who);
+  Vec3 peakOff{};
+  float peak = 0;
+  int peakTick = -1;
+  for (int i = 0; i < kWindow; i++) {
+    tick();
+    const Vec3 off = BodyCentroid(c.mobs.FindMobById(who)) - rest;
+    if (off.len() > peak) {
+      peak = off.len();
+      peakOff = off;
+      peakTick = i;
+    }
+  }
+
+  // ---- A. IT MOVED, AND NOT BY ACCIDENT -----------------------------------
+  const double floorMul = BaselineNumber("hitReact.noiseMultiple", 4.0);
+  check(peak > noise * (float)floorMul,
+        "the reaction clears the rig's own idle wobble");
+  check(peak > (float)BaselineNumber("hitReact.minPeakVox", 0.35),
+        "the reaction is big enough to see");
+
+  // ---- C. ...AND IT IS STILL A FLINCH -------------------------------------
+  check(peak < (float)BaselineNumber("hitReact.maxPeakVox", 4.0),
+        "the reaction is a flinch, not a stagger");
+  // A peak that lands on the LAST tick of the window is a spring that has not
+  // turned over yet, which means the halflife and the window disagree — and
+  // the recovery check below would then be measuring a rise, not a fall.
+  check(peakTick >= 0 && peakTick < kWindow - 4,
+        "the reaction peaks and turns over inside the window");
+
+  // ---- B. AWAY FROM THE BLADE ---------------------------------------------
+  // Along the blow, not merely "somewhere else": a sideways artefact of the
+  // gait would satisfy a bare displacement test.
+  const float alongX = peak > 1e-5f ? peakOff.x / peak : 0.0f;
+  check(alongX > (float)BaselineNumber("hitReact.alongFrac", 0.5),
+        "the body goes AWAY from the blade's travel, not into it");
+  RecordObserved("hitReact.observedAlong", alongX);
+  RecordObserved("hitReact.observedPeakVox", peak);
+  RecordObserved("hitReact.observedNoiseVox", noise);
+
+  // ---- D. AND NOTHING THE WORLD CAN FEEL MOVED ----------------------------
+  // The whole licence for firing this on every hit. `Near` on the origin
+  // rather than equality because the fixture is a live creature the gait is
+  // still settling under — what is being denied is a SHOVE, not a micrometre.
+  {
+    const Vec3 d = c.mobs.MobOrigin(who) - origin0;
+    check(d.len() < std::max(noise, 0.05f),
+          "the reaction moved no collider: the origin is where it was");
+    check(std::fabs(c.mobs.MobHeading(who) - heading0) < 1e-3f,
+          "the reaction turned nobody: the heading is where it was");
+  }
+
+  // ---- C2. IT PUTS ITSELF BACK --------------------------------------------
+  for (int i = 0; i < kWindow; i++) tick();
+  {
+    Mob* live = c.mobs.FindMobById(who);
+    const float left = (BodyCentroid(live) - rest).len();
+    check(left < peak * (float)BaselineNumber("hitReact.settleFrac", 0.25) ||
+              left <= noise,
+          "the body is back on its feet inside two windows");
+    check(live != nullptr && !live->HitReactLive(),
+          "the layer switched itself off (CLAUDE.md rule 2)");
+  }
+
+  // ---- B2. THE MIRROR -----------------------------------------------------
+  // The half that makes the direction claim mean something. A reaction that
+  // ignored `dirWorld` and always leaned the same way passes every check above.
+  rest = BodyCentroid(c.mobs.FindMobById(who));
+  strike(Vec3{-1, 0, 0});
+  Vec3 mirrorOff{};
+  float mirrorPeak = 0;
+  for (int i = 0; i < kWindow; i++) {
+    tick();
+    const Vec3 off = BodyCentroid(c.mobs.FindMobById(who)) - rest;
+    if (off.len() > mirrorPeak) {
+      mirrorPeak = off.len();
+      mirrorOff = off;
+    }
+  }
+  check(mirrorOff.x < 0.0f && peakOff.x > 0.0f,
+        "a mirrored blow mirrors the reaction");
+  RecordObserved("hitReact.observedMirrorX", mirrorOff.x);
+
+  CloseStage(c);
+  detail = Format("peak %.2f vox (noise %.2f), along %.2f, mirror x %.2f",
+                  peak, noise, alongX, mirrorOff.x);
+  std::printf("hit-react: %s (%d checks, %s)\n", ok ? "PASS" : "FAIL", checks,
+              detail.c_str());
+  return ok ? Status::Pass : Status::Fail;
+}
+
 }  // namespace
 
 const std::vector<Gate>& CombatGates() {
@@ -2614,6 +2867,11 @@ const std::vector<Gate>& CombatGates() {
       {"unarmed-attack", "mob", {}, false, GateUnarmedAttack},
       {"lunge", "mob", {}, false, GateLunge},
       {"bite-target", "mob", {}, false, GateBiteTarget},
+      // ---- the directional flinch (mob.h Mob::HitReact) -------------------
+      // Spawns one passive dummy and hits it twice through the ordinary
+      // MobSystem entry point. Same shape as the ones above — id scope in,
+      // worldgen out — so `--gate hit-react` is the whole of iterating on it.
+      {"hit-react", "mob", {}, false, GateHitReact},
   };
   return g;
 }

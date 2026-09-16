@@ -5327,6 +5327,13 @@ void MobSystem::UpdateAnimation(Mob& mob, const MobDef& def, World& world,
   // with the spine above it. See Mob::ApplyStrikeAim.
   mob.ApplyStrikeAim(sk, st);
 
+  // ---- stage 3.7: the body answers a blow (mob.h Mob::HitReact) ----
+  // AFTER the aim and the twist, so a creature mid-bite that gets hit rocks
+  // on top of the pose its stroke is holding rather than instead of it; and
+  // pre-flatten, because it writes the same `st.local` channel the gait bob
+  // and the spine twist do. Free when nothing has hit this creature.
+  mob.ApplyHitReact(sk, st, dt);
+
   // ---- stage 4: flatten to model space ----
   AnimFlatten(sk, st);
 
@@ -7237,6 +7244,19 @@ bool MobSystem::Damage(uint64_t bodyHandle, float amount, Vec3 hitWorldVoxel,
       avatar_->Damage(bodyHandle, amount, hitWorldVoxel, impactSpeed))
     return true;
   return false;
+}
+
+bool MobSystem::HitReact(uint64_t bodyHandle, Vec3 dirWorld, float hp,
+                         float power) {
+  // ONE LOOKUP, BOTH POPULATIONS. FindOwner already scans the mobs and then
+  // the avatar, which is exactly the reach this wants: the player being hit is
+  // a creature being hit, and the whole point of PlayerAvatar deriving from Mob
+  // is that a new capability is written once (mob.h, the inheritance note).
+  int limbIndex = -1;
+  Mob* owner = FindOwner(bodyHandle, &limbIndex);
+  if (owner == nullptr || limbIndex < 0) return false;
+  owner->HitReact(limbIndex, dirWorld, hp, power);
+  return true;
 }
 
 bool Mob::Damage(uint64_t bodyHandle, float amount, Vec3 hitWorldVoxel,
@@ -15503,6 +15523,255 @@ void Mob::ApplyAimPart(const AnimSkeleton& sk, AnimState& st, int part,
   const Quat look = QuatMul(AxisAngle({0, 1, 0}, partYaw),
                             AxisAngle({1, 0, 0}, -pitch));
   st.local[part].rot = QuatNormalize(QuatMul(st.local[part].rot, look));
+}
+
+// ============================================================================
+// THE HIT REACTION — a blow arrives from SOMEWHERE (mob.h Mob::HitReact)
+// ============================================================================
+//
+// Two functions and a rule about which frame everything is in.
+//
+// THE FRAME IS THE RIG'S, REACHED BY A PURE UN-YAW. `RotateInv(yaw, v)` and
+// nothing else: it is the conversion the legs, the ledge-hang arms and the
+// whole weapon-arm solve use, and the submit path maps model -> world with the
+// plain yaw, so the plain inverse is the only map that makes a world-space
+// command reproduce in the rig. The body tilt (`bodyUp_`) is deliberately left
+// out for the same reason those three leave it out — it is a foot-plane fact
+// applied after the pose, and folding it in here would make a blow's direction
+// depend on the slope the victim happens to be standing on.
+//
+// THE SIGNS, worked from scripts/geometry.py's convention and the same two
+// lines Mob::ApplyAimPart cites: a positive rotation about model +X takes +Y
+// toward +Z, and a positive rotation about model +Z takes +Y toward -X. So a
+// blow travelling +Z tips the body's up-axis toward +Z with `+d.z` about X,
+// and a blow travelling +X tips it toward +X with `-d.x` about Z. Getting
+// either backwards produces a creature that leans INTO the sword, which is the
+// one failure mode of this whole feature that reads as a bug rather than as a
+// taste difference — so both are stated here and asserted by the `hit-react`
+// gate against a known blow direction rather than by eye.
+namespace {
+
+// The velocity that makes a critically damped spring PEAK at `amp`.
+//
+// AnimSpringStep integrates Holden's closed form with `y = 2*ln2/halflife`;
+// released from rest with velocity v and a goal of 0 it traces
+// x(t) = v*t*e^(-y*t), whose maximum is v/(e*y) at t = 1/y. Inverting that is
+// what lets every knob above be authored as "the peak, in degrees" instead of
+// as an impulse nobody can picture.
+float HitReactImpulse(float amp, float halflife) {
+  const float y = 1.38629436f / std::max(halflife, 1e-3f);
+  return amp * 2.71828183f * y;
+}
+
+// PEAK-HELD, NOT ACCUMULATED — the rule the hit flash and the hit-stop dip
+// already live by, and for the same reason: several probes of one sweep
+// meeting one limb on one tick are ONE blow, not four. The bigger impulse
+// wins outright rather than being averaged in, so a heavy hit landing in the
+// same tick as a graze is a heavy hit.
+void HitReactPump(SpringState& s, Vec3 v) {
+  if (v.len() > s.v.len()) s.v = v;
+}
+
+}  // namespace
+
+void Mob::HitReact(int limbIndex, Vec3 dirWorld, float hp, float power) {
+  const Tuning::CombatFx& fx = CurrentTuning().combatfx;
+  if (!fx.hitReact) return;
+  if (dirWorld.len() < 1e-4f) return;
+  // A LIMP OR DEAD BODY DOES NOT FLINCH. Once the ragdoll owns the rig, Jolt
+  // is what places every limb and the pose pipeline has stopped re-posing it
+  // (SubmitPose skips a limp limb) — so a spring written here would be a write
+  // nobody reads, and on the GET-UP it would fight the blend that is carrying
+  // the body off the floor. A corpse being hit already has an answer for where
+  // it goes, and it is a better one than this: the impulse goes into Jolt.
+  if (ragdoll_ != RagdollPhase::None || !alive_) return;
+  // HOW HARD, measured against a reference blow rather than against a weapon's
+  // name (mob.h). `hp` is the strike's whole profile at full swing speed and
+  // `power` is the sweep's own speed x edge-alignment ramp, so a fast graze
+  // and a slow heavy swing both land somewhere sensible on the same scale.
+  const float scale =
+      std::clamp(hp * std::clamp(power, 0.0f, 1.0f) /
+                     std::max(fx.hitReactRefDamage, 0.1f),
+                 0.0f, std::max(fx.hitReactMaxScale, 1.0f));
+  if (scale <= 1e-3f) return;
+  const Vec3 d = RotateInv(AxisAngle({0, 1, 0}, heading_), dirWorld.normalized());
+  const float hl = fx.hitReactHalflife;
+
+  // ---- the body leans away -------------------------------------------------
+  const float leanAmp = fx.hitReactLeanDeg * 0.0174532925f * scale;
+  if (leanAmp > 1e-5f) {
+    const float v = HitReactImpulse(leanAmp, hl);
+    HitReactPump(hitReact_.lean, Vec3{d.z * v, 0.0f, -d.x * v});
+  }
+
+  // ---- ...and is shoved, in the rig's own units ----------------------------
+  // A FRACTION OF THE CREATURE'S OWN HEIGHT, so `hitReactPushFrac` means the
+  // same lurch on every def and nothing here has to know how big a human is.
+  // Prefab voxels, because `st.local` positions are prefab-local.
+  const float pushAmp =
+      fx.hitReactPushFrac * (def_ != nullptr ? def_->worldSize.y : 32.0f) * scale;
+  if (pushAmp > 1e-5f) {
+    const float v = HitReactImpulse(pushAmp, hl);
+    HitReactPump(hitReact_.push, d * v);
+  }
+
+  // ---- ...and the limb that was actually hit flicks ------------------------
+  //
+  // WHICH LIMB, and the redirection that makes a cuirass work. A hit on an
+  // APPENDED slot — a worn shell, a parrying sword — is not a hit on a limb
+  // the pose pipeline drives: a shell is posed off its host in PostStep
+  // (DriveWornShells) and a held item off the hand, so flicking either one
+  // would move the garment and leave the shoulder under it still. The blow is
+  // handed to the HOST limb instead, which is the thing that was really
+  // struck; a held weapon has no host, so a parry keeps the lean and the shove
+  // and spends no flick. The body still answers — it simply answers with its
+  // whole self, which is what being hit through armour feels like.
+  int part = limbIndex;
+  if (part >= AppendedBase() && part >= 0 && (size_t)part < limbs_.size())
+    part = limbs_[part].wornHost;
+  if (part >= 0 && (size_t)part < skel_.parts.size() && LimbAlive(part)) {
+    const float limbAmp = fx.hitReactLimbDeg * 0.0174532925f * scale;
+    if (limbAmp > 1e-5f) {
+      hitReact_.limb.resize(skel_.parts.size(), SpringState{});
+      const float v = HitReactImpulse(limbAmp, hl);
+      HitReactPump(hitReact_.limb[part], Vec3{d.z * v, 0.0f, -d.x * v});
+    }
+  }
+  hitReact_.live = true;
+}
+
+void Mob::ApplyHitReact(const AnimSkeleton& sk, AnimState& st, float dt) {
+  if (!hitReact_.live) return;
+  const Tuning::CombatFx& fx = CurrentTuning().combatfx;
+  // F5'd OFF MID-REACTION. Drop the state rather than freezing it: a master
+  // switch that leaves the last flinch stuck on the body is worse than one
+  // that does nothing.
+  if (!fx.hitReact) {
+    hitReact_ = HitReactState{};
+    return;
+  }
+  const float hl = fx.hitReactHalflife;
+  const float scaleMax = std::max(fx.hitReactMaxScale, 1.0f);
+  // THE CLAMP IS THE WHOLE ANSWER TO A MULTI-TICK CUT (mob.h). `maxAngle`
+  // bounds the spring's displacement, so a blade that lands on four
+  // consecutive ticks holds the lean at its authored peak instead of pumping
+  // it four times over. The ceiling is the peak a reference blow reaches TIMES
+  // the scale ceiling, so a mace still out-leans a fist — what it cannot do is
+  // out-lean itself by dwelling.
+  SpringDef leanDef;
+  leanDef.halflife = hl;
+  leanDef.maxAngle = fx.hitReactLeanDeg * 0.0174532925f * scaleMax;
+  SpringDef pushDef;
+  pushDef.halflife = hl;
+  pushDef.maxAngle =
+      fx.hitReactPushFrac * (def_ != nullptr ? def_->worldSize.y : 32.0f) * scaleMax;
+  SpringDef limbDef;
+  limbDef.halflife = hl;
+  limbDef.maxAngle = fx.hitReactLimbDeg * 0.0174532925f * scaleMax;
+
+  // Goal is REST for all three: this is a thing that goes out and comes back,
+  // not a thing that eases to a new home.
+  AnimSpringStep(leanDef, hitReact_.lean, Vec3{}, dt);
+  AnimSpringStep(pushDef, hitReact_.push, Vec3{}, dt);
+  for (SpringState& s : hitReact_.limb) AnimSpringStep(limbDef, s, Vec3{}, dt);
+
+  // ---- has it gone quiet? --------------------------------------------------
+  // Measured on the DISPLACEMENT and the VELOCITY both: a spring at its turning
+  // point has zero velocity and is nowhere near home, and one passing through
+  // rest at speed is not finished either. The epsilons are a thousandth of a
+  // degree and a thousandth of a voxel — below anything a 3-voxel-wide limb
+  // can show.
+  auto quiet = [](const SpringState& s, float xEps) {
+    return s.x.len() < xEps && s.v.len() < xEps * 40.0f;
+  };
+  bool allQuiet = quiet(hitReact_.lean, 1.7e-5f) && quiet(hitReact_.push, 1e-3f);
+  for (const SpringState& s : hitReact_.limb) allQuiet &= quiet(s, 1.7e-5f);
+  if (allQuiet) {
+    hitReact_ = HitReactState{};
+    return;
+  }
+
+  const int root = def_ != nullptr ? def_->rootLimb : -1;
+
+  // ---- 1. THE LEAN, SPLIT ROOT / SPINE ------------------------------------
+  //
+  // Both ends of the split are load-bearing. ALL ON THE ROOT tips the creature
+  // like a signpost in wind — the legs are IK'd to planted feet so they take it
+  // up, but the torso, arms and head arrive as one rigid board. ALL ON THE
+  // SPINE leaves the hips perfectly still under a chest that jerks, which reads
+  // as a separate object on top of a statue. The share is the same
+  // distribution law Mob::ApplyAimPart uses for its yaw, including the part
+  // that is easy to get wrong: the ROOT IS EXCLUDED from the spine count even
+  // though it carries the tag, and the spine's share is divided by however many
+  // joints the rig has so a three-segment back bends as far in TOTAL as a
+  // one-segment one.
+  const Vec3 lean = hitReact_.lean.x;
+  auto tip = [](Transform& t, float pitchX, float rollZ) {
+    t.rot = QuatNormalize(
+        Mul(t.rot, Mul(AxisAngle({1, 0, 0}, pitchX), AxisAngle({0, 0, 1}, rollZ))));
+  };
+  const float spineShare = std::clamp(fx.hitReactSpineShare, 0.0f, 1.0f);
+  int nSpine = 0;
+  for (size_t i = 0; i < sk.parts.size(); i++)
+    if (sk.parts[i].tag == "spine" && (int)i != root && LimbAlive((int)i)) nSpine++;
+  // THE SHARE FALLS BACK TO THE ROOT when a rig has no spine to speak of (the
+  // legacy dummy, a four-legged critter authored without the tag). Handing it
+  // to nobody would make the knob silently disable the lean on those rigs,
+  // which is the silent-failure shape CLAUDE.md's data note warns about.
+  const float onSpine = nSpine > 0 ? spineShare : 0.0f;
+  if (nSpine > 0) {
+    const float per = onSpine / (float)nSpine;
+    for (size_t i = 0; i < sk.parts.size(); i++) {
+      if (sk.parts[i].tag != "spine" || (int)i == root) continue;
+      if (!LimbAlive((int)i) || i >= st.local.size()) continue;
+      tip(st.local[i], lean.x * per, lean.z * per);
+    }
+  }
+  if (root >= 0 && (size_t)root < st.local.size()) {
+    tip(st.local[root], lean.x * (1.0f - onSpine), lean.z * (1.0f - onSpine));
+    // ---- 2. THE SHOVE ------------------------------------------------------
+    // On the ROOT'S LOCAL POSITION, exactly where the gait's bob and sway go —
+    // so it is the same channel, in the same units, composed the same way, and
+    // the flatten carries it to every part for free. The feet do not move: the
+    // leg chains are solved to world points the gait planted, so what the
+    // player sees is a body driven back over its own feet and recovering.
+    st.local[root].pos = st.local[root].pos + hitReact_.push.x;
+  }
+
+  // ---- 3. THE FLICK OF THE STRUCK LIMB ------------------------------------
+  //
+  // APPLIED IN MODEL SPACE, ABOUT THE PART'S OWN JOINT, and the conjugation is
+  // why. Post-multiplying a part's local rotation (what ApplyAimPart does)
+  // expresses the rotation in the PART'S own frame, which for a head or a
+  // spine segment whose rest is near identity is the same thing and for a
+  // forearm hanging at 90 degrees is not: the same "tip away from the blow"
+  // would come out as a twist. Pre-multiplying by `conj(parent) * R * parent`
+  // instead makes the flatten produce `R * model[i].rot` — the rotation applied
+  // in the RIG's frame, which is the frame `d` was measured in.
+  //
+  // The parent's model rotation is LAST TICK'S: this stage runs before the
+  // flatten that will refresh it. A tick of lag on a 13-degree flinch is not a
+  // thing anybody can see, and reaching for the fresh one would mean running
+  // this after the flatten, where a write to `st.local` is a write nobody
+  // reads (the note in Mob::ApplyWeaponArm says so about the aim).
+  //
+  // A limb in an IK CHAIN is overwritten by the solve at stage 5 and that is
+  // correct rather than a limitation: a planted foot does not fly up because a
+  // shin was hit, and the weapon arm mid-stroke belongs to the stroke. Those
+  // bodies still lean and still get shoved — the flick is only ever the
+  // accent on top.
+  for (size_t i = 0; i < hitReact_.limb.size() && i < st.local.size(); i++) {
+    const Vec3& f = hitReact_.limb[i].x;
+    if (f.len() < 1.7e-5f) continue;
+    if ((int)i == root || !LimbAlive((int)i)) continue;
+    Quat r = Mul(AxisAngle({1, 0, 0}, f.x), AxisAngle({0, 0, 1}, f.z));
+    const int par = sk.parts[i].parent;
+    if (par >= 0 && (size_t)par < st.model.size()) {
+      const Quat& pr = st.model[par].rot;
+      r = Mul(QuatConj(pr), Mul(r, pr));
+    }
+    st.local[i].rot = QuatNormalize(Mul(r, st.local[i].rot));
+  }
 }
 
 const IkChain* Mob::ChainForEffector(const AnimSkeleton& sk, int part,
