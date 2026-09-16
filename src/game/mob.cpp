@@ -7519,7 +7519,16 @@ bool Mob::Damage(uint64_t bodyHandle, float amount, Vec3 hitWorldVoxel,
     limb.bleedBudget = AddBleedBudget(
         limb.bleedBudget, amount * def_->bleedPerDamage * bleedScale);
     if (impactSevers || (limb.hp <= 0 && HpZeroSevers((int)i))) {
-      Sever((int)i);
+      // A MACE KILLS BUT DOES NOT DISMEMBER — on living tissue. Rotten undead
+      // tissue falls apart either way, which is the whole visual difference
+      // between beating a man and beating a zombie. Sever() on a vital limb
+      // detaches it THEN dies; here we skip the detach and die outright.
+      if (inBluntCarve_ && def_ && !def_->undead && ld.vital) {
+        deathCause_ = "vital limb destroyed";
+        Die();
+      } else {
+        Sever((int)i);
+      }
     } else {
       // non-fatal hit: flinch. This is the one wired trigger for now — it
       // exercises the whole clip layer (sample/blend/mask/blend-out).
