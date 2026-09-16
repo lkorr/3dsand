@@ -226,7 +226,12 @@ def check_arch_paths():
                       read("src/test/selftest.cpp"), re.S)
     if not order:
         return
-    known = set(re.findall(r'"([a-z-]+)"', order.group(1)))
+    # [a-z0-9-] and not [a-z-]: a gate name may contain a DIGIT, and the
+    # narrower class silently dropped such a name from `known` -- which made
+    # this check report the opposite of the truth (a gate that IS in kOrder
+    # reported as missing from it) the first time one was added. A checker that
+    # cries wolf is worse than no checker.
+    known = set(re.findall(r'"([a-z0-9-]+)"', order.group(1)))
     cited = set()
     for arr in re.findall(r"\btst:\s*\[(.*?)\]", block.group(1), re.S):
         cited |= set(re.findall(r"'([^']+)'", arr))
@@ -1797,6 +1802,25 @@ def check_gas_consts():
         ("kGasOuterShift", "GAS_OUTER_SHIFT", [("sim_gas.wgsl", gas),
                                                ("sim_step.wgsl", step),
                                                ("raymarch.wgsl", raymarch)]),
+        # ---- far fire plumes (world.h's kGasFarEmitMax block) -------------
+        # The emitter list's LAYOUT, which the CPU writes (src/sim/farplumes.cpp)
+        # and sim_gas's gasFarPlume reads. A stride that disagreed would not
+        # crash: it would read a neighbouring emitter's coordinate as a
+        # strength and draw plumes in the wrong places, which is exactly the
+        # class of failure that only a checker catches.
+        ("kGasFarEmitMax", "GAS_FAR_EMIT_MAX", [("sim_gas.wgsl", gas)]),
+        ("kGasFarEmitHdr", "GAS_FAR_EMIT_HDR", [("sim_gas.wgsl", gas)]),
+        ("kGasFarEmitStride", "GAS_FAR_EMIT_STRIDE", [("sim_gas.wgsl", gas)]),
+        ("kGasFarEmitMaxWide", "GAS_FAR_WIDE_MAX", [("sim_gas.wgsl", gas)]),
+        # The LONG-RANGE box. THREE declarations again and for gasOuter's
+        # reason: sim_gas splats into it and raymarch samples it, and a common
+        # .wgsl constant would cost the whole SPIR-V cache. Either of them
+        # disagreeing about the cell size is a plume drawn in the wrong place,
+        # silently.
+        ("kGasFarOuterN", "GAS_FAROUT_N", [("sim_gas.wgsl", gas),
+                                           ("raymarch.wgsl", raymarch)]),
+        ("kGasFarOuterShift", "GAS_FAROUT_SHIFT", [("sim_gas.wgsl", gas),
+                                                   ("raymarch.wgsl", raymarch)]),
     ]
     for cname, wname, shaders in pairs:
         want = cxx(cname)
@@ -1814,6 +1838,49 @@ def check_gas_consts():
                     f"gas: {fname} {wname} = {got} but world.h {cname} = "
                     f"{want} -- a cap raised on one side only is a buffer "
                     f"overrun the GPU will not report")
+
+    # kGasFarEmitStrengthMax is DERIVED in world.h (the gasOuter cell area in
+    # x/z times the fine chunk height), so it cannot be scraped as a literal --
+    # it is recomputed here from the two constants it is built from, which is
+    # the point: the shader divides by it to normalise "how much of this column
+    # is on fire", and a stale copy would make every far plume the wrong
+    # density by a constant factor with nothing to notice.
+    # kGasFarEmitWideBase is DERIVED (the header plus the whole fine section),
+    # so like kGasFarEmitStrengthMax below it is recomputed here from the parts
+    # rather than scraped. It is the word the wide splat starts reading at: get
+    # it wrong and the kernel reads a fine emitter's COORDINATE as a wide
+    # emitter's strength, which draws plumes at plausible-looking wrong places.
+    hdr = cxx("kGasFarEmitHdr")
+    stride = cxx("kGasFarEmitStride")
+    fineMax = cxx("kGasFarEmitMax")
+    if hdr is not None and stride is not None and fineMax is not None:
+        want = hdr + fineMax * stride
+        got = wgsl(gas, "GAS_FAR_WIDE_BASE")
+        if got is None:
+            problems.append(
+                "gas: sim_gas.wgsl does not declare GAS_FAR_WIDE_BASE, which "
+                f"must equal world.h's kGasFarEmitWideBase ({want})")
+        elif got != want:
+            problems.append(
+                f"gas: sim_gas.wgsl GAS_FAR_WIDE_BASE = {got} but world.h "
+                f"derives kGasFarEmitWideBase = {want} from kGasFarEmitHdr "
+                f"({hdr}) + kGasFarEmitMax ({fineMax}) * kGasFarEmitStride "
+                f"({stride})")
+
+    sh = cxx("kGasOuterShift")
+    ch = cxx("kChunk")
+    if sh is not None and ch is not None:
+        want = (1 << sh) * (1 << sh) * ch
+        got = wgsl(gas, "GAS_FAR_STRENGTH_MAX")
+        if got is None:
+            problems.append(
+                "gas: sim_gas.wgsl does not declare GAS_FAR_STRENGTH_MAX, "
+                f"which must equal world.h's kGasFarEmitStrengthMax ({want})")
+        elif got != want:
+            problems.append(
+                f"gas: sim_gas.wgsl GAS_FAR_STRENGTH_MAX = {got} but world.h "
+                f"derives kGasFarEmitStrengthMax = {want} from kGasOuterShift "
+                f"({sh}) and kChunk ({ch})")
 
     # ---- the gas DIRTY-REASON bits ------------------------------------
     # world.h's kDirtyReasonName is a positional table -- the bit is the row

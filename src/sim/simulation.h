@@ -206,6 +206,22 @@ class Simulation {
     if (live != 0) settledProven_ = false;
   }
   void NoteGasSpawns(uint32_t n) { gasSpawnsThisTick_ += n; }
+  // Far fire plumes (world.h kGasFarEmitMax). How many frozen-fire emitters
+  // the CPU has in the buffer for THIS tick -- the dispatch extent of the
+  // splat row and half of the density box's clear condition. Set before
+  // EncodeTick for NoteGasSpawns' reason: the recorder decides there whether
+  // the row exists at all. Latched rather than per-call because the emitter
+  // list only changes when the world does, and the buffer keeps holding the
+  // last list until it does.
+  // `wide` is the LONG-RANGE list (world.h kGasFarOuterN), which is disjoint
+  // from `fine`: the CPU splits the surviving emitters by distance, so the two
+  // counts never describe the same fire.
+  void NoteFarPlumes(uint32_t fine, uint32_t wide) {
+    farPlumeCount_ = fine;
+    farPlumeWideCount_ = wide;
+  }
+  uint32_t FarPlumeCount() const { return farPlumeCount_; }
+  uint32_t FarPlumeWideCount() const { return farPlumeWideCount_; }
   uint32_t GasLive() const { return gasLive_; }
   // NoteGasSeen: is there gas ANYWHERE the renderer would have to draw --
   // parcels outside the window OR gas voxels inside it. The second half is the
@@ -656,6 +672,11 @@ class Simulation {
   // Gas particles (sim_gas.wgsl, docs/PLAN_gas_particles.md stage 1). Five
   // entry points shaped like the ballistic five above.
   rhi::ComputePipeline gArgs1_, gSpawn_, gIntegrate_, gArgs2_, gResolve_;
+  // Far fire plumes (world.h kGasFarEmitMax): a sixth gas entry point on the
+  // same layout, whose only output is the render-only density box.
+  rhi::ComputePipeline gFarPlume_;
+  // ...and its long-range sibling (world.h kGasFarOuterN).
+  rhi::ComputePipeline gFarPlumeW_;
   // Live only after PublishFarPipelines. Until then both are INVALID handles
   // and the recorder skips their rows (vk_record.cpp's null-pipeline continue).
   rhi::ComputePipeline farFill_, farPatchFill_, farDown_;
@@ -803,6 +824,12 @@ class Simulation {
   uint32_t gasSeenHold_ = 0;
   uint32_t gasLive_ = 0;
   uint32_t gasSpawnsThisTick_ = 0;
+  // Far fire-plume emitters currently in world_->gasFarEmit. NOT reset per
+  // tick, unlike gasSpawnsThisTick_: the buffer is uploaded only when the
+  // list CHANGES, so the count is a standing fact about the buffer rather
+  // than a count of this tick's inputs.
+  uint32_t farPlumeCount_ = 0;
+  uint32_t farPlumeWideCount_ = 0;
   uint32_t gasIdleTicks_ = kGasIdleTicks;
   // fluidBG_ pages like particleBG_: binding 6 is THIS tick's particle write
   // page (next tick's read page), the splash droplets' destination. Binding 0

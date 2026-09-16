@@ -110,6 +110,8 @@ PIPE_TO_MEMBER = {
     "PIPE_GAS_INTEGRATE": "gIntegrate_",
     "PIPE_GAS_ARGS2": "gArgs2_",
     "PIPE_GAS_RESOLVE": "gResolve_",
+    "PIPE_GAS_FARPLUME": "gFarPlume_",
+    "PIPE_GAS_FARPLUMEW": "gFarPlumeW_",
     "PIPE_FAR_FILL": "farFill_",
     # The edit-patch half `far` was split into (PLAN_shader_compile package C).
     "PIPE_FAR_PATCH_FILL": "farPatchFill_",
@@ -199,6 +201,13 @@ BUF_TO_WGSL = {
     "GasArgsStage": {"gasArgs"},
     "GasDispatchArgs": set(),
     "GasOuter": {"gasOuter"},
+    # The far fire-plume emitter list (world.h kGasFarEmitMax), binding 11 of
+    # the GAS group and nowhere else: the CPU writes it and one kernel reads it.
+    "GasFarEmit": {"gasFarEmit"},
+    # The LONG-RANGE density box (world.h kGasFarOuterN), binding 12 of the GAS
+    # group and 23 of the render group. Two independent declarations, two legal
+    # numbers, same buffer -- exactly gasOuter's situation one LOD out.
+    "GasFarOuter": {"gasFarOuter"},
     "RenderUBO": {"R"},
     "Reactions": {"reactions"},
     "DirtyList": {"dirtyList", "farDirty"},
@@ -374,7 +383,13 @@ _FAR_GROUP1 = {"farVox", "farOcc", "farList", "F", "farDirty", "farPatch"}
 # group of its own rather than an extension of the particle group.
 _GAS_GROUP1 = {"gasRead", "gasWrite", "gasCounts", "gasSpawn", "gasClaim",
                "gasArgs", "gasOuter", "farVox", "farP", "reactions",
-               "gasSpawnOps"}
+               "gasSpawnOps",
+               # Far fire plumes: the emitter list, binding 11. In THIS group
+               # rather than one of its own because the kernel that reads it
+               # writes gasOuter, which is already here.
+               "gasFarEmit",
+               # ...and the long-range box the wide splat writes, binding 12.
+               "gasFarOuter"}
 _FLUID_GROUP1 = {"fluidParticles", "fluidSpawnOps", "fluidBlockMap",
                  "fluidBlockList", "fluidGrid", "fluidArgs",
                  # splash coupling: particle write page + counts (bindings 6/7)

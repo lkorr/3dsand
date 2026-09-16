@@ -186,6 +186,9 @@ void Stream::Init(GpuContext* ctx, World* world, Simulation* sim, uint32_t seed)
   // Publish the far-field edit index so FarField can reach it through World
   // (world.h's `farEdits`, forward-declared exactly like `pages`).
   world_->farEdits = &farEdits_;
+  // ...and the far fire-plume index beside it, for SubmitTick to build the
+  // emitter list from (world.h's `farPlumes`).
+  world_->farPlumes = &farPlumes_;
   modified_.assign(kNumSlots, 0);
 }
 
@@ -422,8 +425,10 @@ void Stream::EvictSlots(const std::vector<uint32_t>& slots, bool filter) {
       // resident window, pristine chunks included, and those are re-derivable
       // by the sieve. Indexing them would add ~73 no-op entries per chunk over
       // 32,768 slots on every save, for nothing.
-      if (modified_[s] != 0)
+      if (modified_[s] != 0) {
         farEdits_.NoteUniformChunk(wc, world_->PageEntryOfSlot(s) & kPtMatMask);
+        farPlumes_.NoteUniformChunk(wc, world_->PageEntryOfSlot(s) & kPtMatMask);
+      }
       sentRle.reserve(kChunkVol * 2);  // see the re-reserve in CompleteOldest
       continue;
     }
@@ -582,11 +587,18 @@ void Stream::CompleteOldest(bool discard) {
           // chunk's content, and it is what lets a sieve refill put the
           // player's crater back after the chunk has left the window.
           if (p.items[i].edited) {
-            if (e != 0u)
+            if (e != 0u) {
               farEdits_.NoteUniformChunk(p.items[i].wc, e & kPtMatMask);
-            else
+              farPlumes_.NoteUniformChunk(p.items[i].wc, e & kPtMatMask);
+            } else {
               farEdits_.NoteChunk(p.items[i].wc,
                                   (const uint32_t*)(ptr + i * kChunkBytes));
+              // The SAME words, at the same instant: this is where a chunk
+              // that was on fire when the window left it becomes a plume the
+              // renderer can still see (src/sim/farplumes.h).
+              farPlumes_.NoteChunk(p.items[i].wc,
+                                   (const uint32_t*)(ptr + i * kChunkBytes));
+            }
           }
           // RE-RESERVE AFTER THE MOVE, or the move costs more than the copy it
           // replaced. std::move leaves the scratch with NO CAPACITY, so the
@@ -679,6 +691,11 @@ void Stream::FillSlots(const std::vector<uint32_t>& slots, bool deferWake) {
       // again, and it is what re-seeds the index for chunks that were only
       // ever loaded from disk in this session.
       farEdits_.NoteChunk(wc, data.data());
+      // A store hit is a chunk coming BACK, so its plume entry is refreshed
+      // rather than dropped: Build() is what drops it while the chunk is
+      // resident, and refreshing here means the emitter is correct the moment
+      // the window leaves it again.
+      farPlumes_.NoteChunk(wc, data.data());
       // Contributor (d) to the CPU dirty mirror (§3.1a): the two dirty writes
       // below wake this slot on the next tick, in BOTH pages, decided by
       // streaming rather than by the tick loop. Its own chunk is materialized

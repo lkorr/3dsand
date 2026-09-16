@@ -17,6 +17,7 @@
 #include "measure/perfscope.h"
 #include "sim/biomes.h"
 #include "sim/farfield.h"
+#include "sim/farplumes.h"
 #include "sim/treeatlas.h"
 #include "sim/worldmap.h"
 #include "sim/wind.h"
@@ -261,10 +262,16 @@ RenderSpec gRenderSpec;
 // gRenderSpec above is one: the value crosses from simulation.cpp to the one
 // author of the flag word, and neither TU may include the other's header.
 bool gGasRenderActive = false;
+// ...and the same latch for the LONG-RANGE box (world.h kGasFarOuterN). Its
+// own variable rather than a second bit of the one above, because the two gate
+// different work and are true in different worlds.
+bool gGasFarRenderActive = false;
 }
 const RenderSpec& LastRenderSpec() { return gRenderSpec; }
 void SetGasRenderActive(bool active) { gGasRenderActive = active; }
 bool GasRenderActive() { return gGasRenderActive; }
+void SetGasFarRenderActive(bool active) { gGasFarRenderActive = active; }
+bool GasFarRenderActive() { return gGasFarRenderActive; }
 
 void WriteRenderParams(const rhi::Queue& queue, const World& world,
                        const Vec3& eye, const Camera& cam, float aspect,
@@ -285,15 +292,18 @@ void WriteRenderParams(const rhi::Queue& queue, const World& world,
   // bit 0 = sun shadows, bit 1 = active-voxel debug highlight (extraFlags),
   // bit 2 = short-range mode, bit 3 = gas may be present (the crossfade;
   // docs/PLAN_gas_particles.md stage 1b), bit 4 = short-range NEAR arm (the
-  // 50 m ceiling instead of the 100 m one). Bits 2, 3 and 4 are OR'd in here
-  // rather than passed by the caller so that every drawing path gets them —
-  // see ShortRangeMode above and SetGasRenderActive in renderspec.h.
+  // 50 m ceiling instead of the 100 m one), bit 5 = the LONG-RANGE gas box has
+  // something in it (world.h kGasFarOuterN — a frozen fire past 51.2 m). Bits
+  // 2, 3, 4 and 5 are OR'd in here rather than passed by the caller so that
+  // every drawing path gets them — see ShortRangeMode above and
+  // SetGasRenderActive / SetGasFarRenderActive in renderspec.h.
   //
   // Bit 4 is deliberately NOT reflected into RenderSpec: it picks a distance
   // inside a branch bit 2 already guards, so it changes no shader's shape and
   // must not double the pipeline variants.
   rp.flags = (shadows ? 1u : 0u) | extraFlags | (ShortRangeMode() ? 4u : 0u) |
-             (GasRenderActive() ? 8u : 0u) | (ShortRangeNear() ? 16u : 0u);
+             (GasRenderActive() ? 8u : 0u) | (ShortRangeNear() ? 16u : 0u) |
+             (GasFarRenderActive() ? 32u : 0u);
   // Publish the SPEC_* predicates for this frame (support.h RenderSpec). Read
   // off `rp` rather than off the arguments, so the record is the WORD THAT WAS
   // UPLOADED and not a second derivation of it.
@@ -919,6 +929,36 @@ void SubmitTick(GpuContext& ctx, World& world, Simulation& sim, uint32_t tick,
       std::memcpy(hdr.data() + kGasSpHdr, gas.data(), gas.size() * sizeof(GasSpawnOp));
     ctx.queue.WriteBuffer(world.gasSpawnOps, 0, hdr.data(), hdr.size() * 4);
     sim.NoteGasSpawns((uint32_t)gas.size());
+  }
+
+  // ---- far fire plumes (world.h kGasFarEmitMax) --------------------------
+  // The OPPOSITE upload discipline to the gas spawn list above, and for the
+  // opposite reason. A spawn op is consumed on the tick it arrives, so its
+  // buffer must be rewritten every tick or the previous tick's ops respawn.
+  // The emitter list is a STANDING description of where the frozen fires are:
+  // it changes only when a chunk is evicted, re-loaded or the window moves, so
+  // it is uploaded only when Build() says it changed — which is no ticks at all
+  // in a world nobody has set alight, and one tick per window shift otherwise.
+  //
+  // Simulation is told the count BEFORE EncodeTick for NoteGasSpawns' reason:
+  // the count is the splat row's dispatch extent AND half the condition on the
+  // density box's clear, both of which the recorder resolves there.
+  //
+  // Null before Stream::Init, and null is simply "no emitters" — a harness that
+  // never streams behaves exactly as it did before the feature existed.
+  if (world.farPlumes) {
+    FarPlumes& plumes = *world.farPlumes;
+    // render.farPlumeRange is metres; the index wants voxels, and the clamp in
+    // LoadTuning has already held it inside the long-range box, so this is a
+    // unit conversion and not a second bound.
+    const int32_t rangeVox =
+        (int32_t)(CurrentTuning().render.farPlumeRange / kVoxelMeters);
+    plumes.Build(world.WindowOrigin(), rangeVox);
+    const uint32_t* pw = nullptr;
+    uint32_t pn = 0;
+    if (plumes.TakeUpload(&pw, &pn))
+      ctx.queue.WriteBuffer(world.gasFarEmit, 0, pw, (size_t)pn * 4);
+    sim.NoteFarPlumes(plumes.Count(), plumes.CountWide());
   }
 
   // Day/night sleep handshake. The daylight-gated reactions deliberately do
@@ -2058,6 +2098,88 @@ void ReadGasOuterAboveSync(GpuContext& ctx, World& world, int32_t worldY,
         sum += v;
       }
   }
+  if (outMax) *outMax = mx;
+  if (outSum) *outSum = sum;
+}
+
+// The outer density box, folded over ONE WORLD-VOXEL BOX. The `Above` fold
+// beside this one answers "is there a plume up there anywhere", which is the
+// right question for a gate whose fixture is the only gas in the world; a gate
+// that has to say WHICH column the density is over needs a box, and asserting
+// on the whole-box sum instead would pass on a plume that came out somewhere
+// else entirely.
+//
+// Same mapping, same three copies of one identity: originVox = windowOrigin -
+// kWorldN/2, cell = (voxel - originVox) >> kGasOuterShift. Ends are inclusive
+// in CELLS, so a box smaller than a cell still reads the cell it lands in.
+void ReadGasOuterBoxSync(GpuContext& ctx, World& world, IVec3 loVox,
+                         IVec3 hiVox, uint32_t* outMax, uint64_t* outSum) {
+  std::vector<uint32_t> g(kGasOuterWords, 0u);
+  rhi::ReadbackBlocking(ctx.device, ctx.queue, world.gasOuter, 0, g.data(),
+                        (size_t)kGasOuterWords * 4, "gasOuterBoxRead");
+  const IVec3 wo = world.WindowOrigin();
+  const int32_t h = (int32_t)(kWorldN / 2);
+  const int32_t o[3] = {wo.x * (int32_t)kChunk - h, wo.y * (int32_t)kChunk - h,
+                        wo.z * (int32_t)kChunk - h};
+  const int32_t lv[3] = {loVox.x, loVox.y, loVox.z};
+  const int32_t hv[3] = {hiVox.x, hiVox.y, hiVox.z};
+  int32_t lo[3], hi[3];
+  for (int a = 0; a < 3; a++) {
+    lo[a] = std::max((lv[a] - o[a]) >> (int32_t)kGasOuterShift, 0);
+    hi[a] = std::min((hv[a] - o[a]) >> (int32_t)kGasOuterShift,
+                     (int32_t)kGasOuterN - 1);
+  }
+  uint32_t mx = 0;
+  uint64_t sum = 0;
+  const uint16_t* b = (const uint16_t*)g.data();
+  for (int32_t cz = lo[2]; cz <= hi[2]; cz++)
+    for (int32_t cy = lo[1]; cy <= hi[1]; cy++)
+      for (int32_t cx = lo[0]; cx <= hi[0]; cx++) {
+        const uint32_t v = b[((uint32_t)cz * kGasOuterN + (uint32_t)cy) *
+                                 kGasOuterN + (uint32_t)cx];
+        if (v > mx) mx = v;
+        sum += v;
+      }
+  if (outMax) *outMax = mx;
+  if (outSum) *outSum = sum;
+}
+
+// The LONG-RANGE box (world.h kGasFarOuterN), folded over a world-voxel box.
+// Same shape as the reader above; the two differ only in the buffer, the cell
+// shift and the ORIGIN RULE, and the third is the one that matters — this box's
+// origin is floored to the cell so the lattice is fixed in world space.
+// Restating it here rather than parameterising the near reader keeps the gate's
+// copy of the mapping next to the mapping's own justification.
+void ReadGasFarOuterBoxSync(GpuContext& ctx, World& world, IVec3 loVox,
+                            IVec3 hiVox, uint32_t* outMax, uint64_t* outSum) {
+  std::vector<uint32_t> g(kGasFarOuterWords, 0u);
+  rhi::ReadbackBlocking(ctx.device, ctx.queue, world.gasFarOuter, 0, g.data(),
+                        (size_t)kGasFarOuterWords * 4, "gasFarOuterBoxRead");
+  const IVec3 wo = world.WindowOrigin();
+  const int32_t sh = (int32_t)kGasFarOuterShift;
+  const int32_t wov[3] = {wo.x * (int32_t)kChunk, wo.y * (int32_t)kChunk,
+                          wo.z * (int32_t)kChunk};
+  int32_t o[3];
+  for (int a = 0; a < 3; a++)
+    o[a] = ((wov[a] - kGasFarOuterOffsetVox) >> sh) << sh;
+  const int32_t lv[3] = {loVox.x, loVox.y, loVox.z};
+  const int32_t hv[3] = {hiVox.x, hiVox.y, hiVox.z};
+  int32_t lo[3], hi[3];
+  for (int a = 0; a < 3; a++) {
+    lo[a] = std::max((lv[a] - o[a]) >> sh, 0);
+    hi[a] = std::min((hv[a] - o[a]) >> sh, (int32_t)kGasFarOuterN - 1);
+  }
+  uint32_t mx = 0;
+  uint64_t sum = 0;
+  const uint16_t* b = (const uint16_t*)g.data();
+  for (int32_t cz = lo[2]; cz <= hi[2]; cz++)
+    for (int32_t cy = lo[1]; cy <= hi[1]; cy++)
+      for (int32_t cx = lo[0]; cx <= hi[0]; cx++) {
+        const uint32_t v = b[((uint32_t)cz * kGasFarOuterN + (uint32_t)cy) *
+                                 kGasFarOuterN + (uint32_t)cx];
+        if (v > mx) mx = v;
+        sum += v;
+      }
   if (outMax) *outMax = mx;
   if (outSum) *outSum = sum;
 }

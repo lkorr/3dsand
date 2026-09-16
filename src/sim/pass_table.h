@@ -76,6 +76,16 @@ enum class Buf : uint8_t {
   GasSpawnOps,
   GasArgsStage,
   GasDispatchArgs,
+  // The far fire-plume emitter list (world.h kGasFarEmitMax). CPU-written,
+  // read by ONE kernel, and its only product is GasOuter — so it carries a
+  // host-write -> shader-read hazard and nothing else. On the table because a
+  // read the table does not know about is the failure mode this file exists to
+  // make impossible.
+  GasFarEmit,
+  // The LONG-RANGE density box (world.h kGasFarOuterN). Exactly GasOuter's
+  // standing -- render-only derived data written on the tick command buffer and
+  // read by the raymarcher in the fragment stage -- at eight times the cell.
+  GasFarOuter,
   // Render-only derived data, on the table for the shadow cache's reason: the
   // splat WRITES it on the tick command buffer and the raymarcher READS it in
   // the fragment stage, and a hazard the table does not know about generates
@@ -245,6 +255,16 @@ enum class Pipe : uint8_t {
   // reasons; GasArgs1 additionally zeroes the write page's cursor, which is
   // why the gas pool needs no per-tick fill.
   GasArgs1, GasSpawnP, GasIntegrate, GasArgs2, GasResolve,
+  // Far fire plumes: the frozen-fire density splat (sim_gas.wgsl
+  // `gasFarPlume`). A sixth gas entry point, in the gas group, writing only
+  // GasOuter — it is not part of the parcel pipeline and is recorded under its
+  // own condition, so a world with frozen fires and no parcels pays for this
+  // row and none of the five above it.
+  GasFarPlume,
+  // ...and the same kernel one LOD out (sim_gas.wgsl `gasFarPlumeWide`), for
+  // the fires past gasOuter's reach. A seventh gas entry point on the same
+  // layout, writing only the long-range box.
+  GasFarPlumeWide,
   // The angle-of-repose occupancy snapshot: a second entry point of
   // sim_step.wgsl, not a new module, so it costs no bind-group layout and
   // cannot drift from the kernel that reads it.
@@ -412,6 +432,28 @@ enum class Cond : uint8_t {
   // are false and every gas row records NOTHING — which is what makes the
   // system free when it is not being used (rule 2).
   Gas,
+  // ---- the two far fire-plume conditions (world.h kGasFarEmitMax) ----------
+  // GasFarEmit: the CPU handed the GPU at least one frozen-fire emitter this
+  // tick. It gates the splat row ALONE, so a world with no evicted fire in it
+  // records nothing new whatever the parcels are doing.
+  //
+  // GasOuter: Gas OR GasFarEmit — "somebody is going to write the density box
+  // this tick". It gates the box's per-tick CLEAR, and it has to be the union
+  // rather than either half: gasOuter is a per-tick SPLAT, not an accumulator,
+  // so a tick that splats without clearing leaves last tick's plume added to
+  // this one's, and a tick that clears without splatting is a plume that
+  // flickers out. The five PARCEL rows stay on Gas — arming them for a frozen
+  // fire would pay gasSpawnStep's fixed 1,042 workgroups forever for a
+  // population that does not exist (rule 2).
+  GasFarEmit,
+  GasOuter,
+  // GasFarWide: the CPU handed the GPU at least one LONG-RANGE emitter this
+  // tick. It gates the wide splat AND the long-range box's own clear, which is
+  // the union discipline the two conditions above state, in its simplest form:
+  // this box has exactly ONE writer, so "whoever writes it" and "the clear"
+  // are the same predicate and there is nothing to union. render.farPlumeRange
+  // 0 makes it false and nothing about the long-range box is recorded at all.
+  GasFarWide,
   // Any LOADED material authors a non-default `repose` AND the CA has work.
   // The first half is a property of materials.json, latched once at
   // UploadTables rather than recomputed per tick; the second is CaActive,
@@ -491,6 +533,13 @@ enum class DispatchSel : uint32_t {
   // knows, and asking would mean a readback in the tick path).
   GasSpawnSel,
   IndGasDispatchArgs,  // indirect: world.gasDispatchArgs @ 0
+  // ONE WORKGROUP PER EMITTER. The count is CPU-known (the CPU built the list
+  // this tick), so unlike the parcel dispatches this needs no indirect args
+  // buffer and no readback — which is the whole reason the emitter list is a
+  // CPU-side index rather than a GPU one.
+  GasFarEmitSel,
+  // One workgroup per LONG-RANGE emitter, same argument as the line above.
+  GasFarWideSel,
 };
 
 // Max `uses` entries on any row. Asserted against the widest row at compile

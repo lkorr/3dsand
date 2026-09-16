@@ -3328,6 +3328,43 @@ struct Tuning {
     // coarse gas starting at the face) and gets stage 1's hard edge back --
     // which is how to A/B it without a rebuild, since F5 reloads this.
     float gasBlendStart = 0.5f;
+    // ---- FAR FIRE PLUMES (world.h kGasFarEmitMax, sim_gas.wgsl
+    // `gasFarPlume`) ---------------------------------------------------------
+    //
+    // A fire whose chunk leaves the residency window is frozen mid-burn: its
+    // embers stay baked into the far cascade and glow for the rest of the
+    // session, while its smoke dies within about four seconds because smoke
+    // parcels are only ever born at the window face by the running CA. These
+    // two knobs shape the column the GPU synthesizes into the coarse density
+    // box for each such fire instead.
+    //
+    // farPlumeStrength: density multiplier on the splat. 0 is an EXACT off
+    // switch and not a cheap path — the emitter count goes to zero, so the
+    // splat row is not recorded, no buffer is written, and the box's clear
+    // falls back to the parcel latch exactly as it did before the feature
+    // existed. That is the A/B arm, and F5 reloads it.
+    float farPlumeStrength = 1.0f;
+    // How far the synthesized column climbs above the fire, in METRES. The
+    // shader converts with kVoxelMeters and then clamps to the density box, so
+    // a value past the box edge costs nothing extra and simply saturates. 28 m
+    // is a little over half the box's half-extent, which reads as a tall plume
+    // from outside without the top of every column sitting on the box lid.
+    float farPlumeHeight = 28.0f;
+    // HOW FAR OUT A FROZEN FIRE STILL SMOKES, in metres.
+    //
+    // There are TWO density boxes. gasOuter spans ±51.2 m at 0.8 m cells; the
+    // long-range box (world.h kGasFarOuterN) spans ±409.6 m at 6.4 m cells,
+    // which is exactly far cascade level 4's box edge. This is the outer bound
+    // on the second one, in the max norm from the window centre, and it is
+    // clamped to the box so a value past it saturates rather than doing
+    // nothing visible.
+    //
+    // 0 is an EXACT off switch for the long-range half only, and a genuinely
+    // useful one: the wide emitter list comes out empty, so the wide splat row
+    // is not recorded, its 4 MiB box is never cleared, the render flag stays
+    // down and the raymarch's coarse segment is not walked. Near plumes carry
+    // on. That is the A/B arm for what the long-range box costs.
+    float farPlumeRange = 409.6f;
     float lodHandoffDist = 24.0f;
     // ---- frame pacing and internal resolution (CPU-only: no .def row, no
     // TUNE_* constant — nothing here reaches a shader) ----------------------

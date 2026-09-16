@@ -489,6 +489,110 @@ static_assert(kGasOuterN << kGasOuterShift == 2 * kWorldN,
               "the gas outer box must span exactly two window edges — the "
               "renderer derives its origin from that identity");
 
+// ---- FAR FIRE PLUMES: emitters for fires the window has left behind --------
+//
+// THE GAP. A chunk that leaves the residency window mid-burn is FROZEN: its
+// `ember`/`lava`/burning-foliage voxels stay baked into the far cascade by the
+// last `fardown`, so the fire is still visibly orange from 60 m away — forever.
+// Its smoke is not. Smoke parcels are only ever BORN at the window face by the
+// running CA (sim_step's `gasLeave`), and the ones already in flight die on
+// smoke's authored decay in ~3.7 s. The distant fire goes dark within seconds
+// of being evicted and then burns silently for the rest of the session.
+//
+// So the CPU keeps an index of where the frozen fires are (src/sim/farplumes.h,
+// fed by the same eviction harvest that feeds FarEdits) and hands the GPU a
+// short list of EMITTERS, one per gasOuter column footprint. `gasFarPlume` in
+// sim_gas.wgsl synthesizes a rising, drifting, billowing column into gasOuter
+// for each of them.
+//
+// RENDER-ONLY, and structurally so: the only buffer this feature writes is
+// gasOuter, which the sim never reads and the world hash never covers. It does
+// not touch the parcel pool, whose digest IS hashed (kGasSpDigest) — a frozen
+// fire must not be able to move the world.
+//
+// 256 emitters is ~100 simultaneous distant fires' worth of column (a burning
+// tree is one or two footprints), and the list is sorted nearest-first, so
+// overflow drops the emitters least likely to be on screen. The cap is what
+// makes the per-tick cost a constant rather than a function of how much of the
+// world has ever been on fire (rule 2).
+constexpr uint32_t kGasFarEmitMax = 256;
+// Header: [0] = FINE emitter count, [1] = the box SHIFT the fine section was
+// built for (kGasOuterShift), [2] = WIDE emitter count, [3] = the wide box
+// shift (kGasFarOuterShift). Words 2/3 were reserved when the fine half
+// landed, for exactly this: a second, coarser density box consuming the same
+// buffer and the same record shape without either side guessing which scale
+// the other meant.
+constexpr uint32_t kGasFarEmitHdr = 4;
+// Per record: world voxel x, y, z (i32; y is the TOPMOST hot voxel in the
+// column) then the strength, which is the hot-voxel count in that column.
+// WORLD VOXELS, never cell coords — which is what lets one record shape serve
+// two boxes of different cell sizes.
+constexpr uint32_t kGasFarEmitStride = 4;
+// The WIDE section (the long-range box below). Its own cap rather than a share
+// of the fine one: the two lists cover disjoint distance bands and a frame with
+// 256 near fires should not be able to starve the far ones.
+constexpr uint32_t kGasFarEmitMaxWide = 256;
+constexpr uint32_t kGasFarEmitWideBase =
+    kGasFarEmitHdr + kGasFarEmitMax * kGasFarEmitStride;   // 1,028
+constexpr uint32_t kGasFarEmitWords =
+    kGasFarEmitWideBase + kGasFarEmitMaxWide * kGasFarEmitStride;  // 2,052 u32 = 8.2 KiB
+// A column footprint is one gasOuter cell in x/z by one fine CHUNK in y, so the
+// most hot voxels one emitter can stand for is (1<<kGasOuterShift)^2 * kChunk.
+// The shader divides by it, so it is a constant both sides must agree on.
+constexpr uint32_t kGasFarEmitStrengthMax =
+    (1u << kGasOuterShift) * (1u << kGasOuterShift) * kChunk;   // 1,024
+static_assert(kChunk % (1u << kGasOuterShift) == 0,
+              "a fine chunk must tile the gasOuter cell in x/z, or an emitter "
+              "column would straddle two cells and the CPU aggregation would "
+              "not match the cell the shader splats into");
+
+// ---- THE LONG-RANGE BOX: fires past the gasOuter box still smoke -----------
+//
+// gasOuter spans exactly two window edges — ±51.2 m — which is a fraction of
+// what the cascade DRAWS. A fire 200 m away is plainly visible as frozen orange
+// in the far field and has nowhere to put its smoke. So there is a second,
+// coarser density box, identical in every respect except its cell size.
+//
+// WHY 64 VOXELS (6.4 m) PER CELL, i.e. shift 6. The box is 128 cells per axis
+// like its sibling, so the edge is 128 << 6 = 8,192 voxels = **exactly far
+// cascade LEVEL 4's box edge** (`kFarN << (4 + kFarShiftBase)`, which reduces
+// to 16 * kWorldN because the cascade's alignment constant makes
+// `kFarN << kFarShiftBase == kWorldN`). That is the number this cell size is
+// chosen FOR: ±409.6 m is the band where a fire is still a distinct shape
+// rather than a fogged smear — levels 5..8 sit behind the pinned fog at ~90%
+// and up — and matching a cascade box edge means the plume LOD boundary and
+// the terrain LOD boundary are the same distance instead of two rings. At the
+// far edge a 6.4 m cell still subtends ~16 px at 1080p, so the coarseness is
+// under the pixel budget rather than over it. Same 4 MiB as gasOuter.
+constexpr uint32_t kGasFarOuterN = 128;
+constexpr uint32_t kGasFarOuterShift = 6;
+constexpr uint32_t kGasFarOuterCells =
+    kGasFarOuterN * kGasFarOuterN * kGasFarOuterN;
+constexpr uint32_t kGasFarOuterWords = kGasFarOuterCells / 2;  // 4 MiB, two u16/word
+static_assert(kGasFarOuterN << kGasFarOuterShift == 16 * kWorldN,
+              "the long-range box must span exactly far cascade level 4's box "
+              "edge — see the paragraph above; both the splat and the sampler "
+              "derive their origin from that identity");
+// The box is centred on the window, so its min corner sits this far below the
+// window's. Unlike gasOuter's, the origin is then FLOORED to the cell size: the
+// window origin is a multiple of 16 voxels and the cell is 64, so without the
+// floor the whole cell lattice would slide 1.6 m sideways every window shift
+// and a settled plume would visibly re-quantise as the player walked. Flooring
+// costs up to 48 voxels of off-centreness out of ±409.6 m and buys a lattice
+// fixed in WORLD space.
+constexpr int32_t kGasFarOuterOffsetVox =
+    (int32_t)((kGasFarOuterN << kGasFarOuterShift) / 2) - (int32_t)(kWorldN / 2);
+static_assert(kGasFarOuterOffsetVox % (int32_t)(1u << kGasFarOuterShift) == 0,
+              "the centring offset must itself be a whole number of cells, or "
+              "flooring the origin would not keep the lattice world-fixed");
+// The most fine emitters one WIDE record can aggregate, for the shader's
+// normalisation: a coarse cell is (1 << (wide - fine)) fine cells per axis in
+// x/z, and a fine emitter spans one chunk in y, so a coarse cell holds
+// (ratio^2 in x/z) x (cell/chunk in y) fine columns.
+constexpr uint32_t kGasFarWideRatio = 1u << (kGasFarOuterShift - kGasOuterShift);
+static_assert(kGasFarOuterShift > kGasOuterShift,
+              "the long-range box must be COARSER than gasOuter");
+
 // gasSpawn / gasSpawnOps header words. The buffer is an 8-word header followed
 // by Particle-shaped records; the header doubles as this tick's gas counters,
 // which is free because the whole buffer is cleared before the CA runs.
@@ -3741,6 +3845,16 @@ class World {
   // The outer density box: RENDER-ONLY derived data. Not hashed, not saved,
   // rebuilt from scratch every tick. CopySrc so a gate can read it back.
   rhi::Buffer gasOuter;         // kGasOuterWords u32 (two u16 counts each)
+  // The far fire-plume emitter list (see kGasFarEmitMax). CPU-built from the
+  // eviction harvest, uploaded only on the ticks it CHANGES, read by
+  // sim_gas's `gasFarPlume`. Part of the per-tick input stream in shape, but
+  // its only product is gasOuter, so nothing here is hashed.
+  rhi::Buffer gasFarEmit;       // kGasFarEmitWords u32 (fine + wide sections)
+  // The LONG-RANGE density box (see kGasFarOuterN). Same standing as gasOuter
+  // in every respect — render-only, not hashed, not saved, cleared and
+  // re-splatted on every tick that has a wide emitter — and differing only in
+  // its cell size. CopySrc so a gate can read it back.
+  rhi::Buffer gasFarOuter;      // kGasFarOuterWords u32 (two u16 counts each)
 
   // ---- MLS-MPM fluid (see the fluid block above kFluidCap) ----
   // fluidGrid, fluidBlockMap and fluidBlockList are per-substep scratch,
@@ -3831,6 +3945,13 @@ class World {
   // so world.h stays free of the streaming headers. Null before Stream::Init,
   // and null-checked by FarField (a fill with no index is the old behavior).
   class FarEdits* farEdits = nullptr;
+
+  // The CPU's far fire-plume emitter index (src/sim/farplumes.h), owned by
+  // Stream beside `farEdits` and fed by the same eviction harvest — the one
+  // place the CPU ever sees an evicted chunk's voxels. Forward-declared for
+  // farEdits' reason. Null before Stream::Init, and null-checked by SubmitTick
+  // (no index = no emitters = exactly today's behaviour).
+  class FarPlumes* farPlumes = nullptr;
 
   // ---- THE SNAPSHOT READBACK RING, SIZED FROM THE PIPELINE (P2-D) ---------
   //

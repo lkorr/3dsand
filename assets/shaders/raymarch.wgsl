@@ -134,6 +134,11 @@
 // the tick table) and every command buffer opens with a global memory barrier,
 // which is the same argument openness and gasOuter are read under.
 @group(0) @binding(22) var<storage, read> waterFluxR : array<i32>;
+
+// The LONG-RANGE gas density box (world.h kGasFarOuterN), for the fires the
+// near box does not reach. Same layout, same u16 pair-per-word packing, same
+// render-only standing; eight times the cell and eight times the span.
+@group(0) @binding(23) var<storage, read> gasFarOuter : array<u32>;
 // Must match kWaterFluxWords / WV_* in src/sim/world.h and
 // assets/shaders/sim_waterbody.wgsl. Declared here rather than in common.wgsl
 // for the GAS_OUTER_N reason above and CLAUDE.md's: a constant two shaders must
@@ -165,12 +170,37 @@ const GAS_OUTER_STEPS : u32 = 16u;
 // window half-extent per axis (~22 m on the diagonal at gasBlendStart 0.5) and
 // 12 samples is ~1.8 m apart at worst, about two cells.
 const GAS_BAND_STEPS  : u32 = 12u;
+// ---- the LONG-RANGE box (world.h kGasFarOuterN) ---------------------------
+// Declared here for GAS_OUTER_N's reason and pinned by check_invariants.py the
+// same way: a constant two shaders must AGREE on, kept out of common.wgsl
+// because that file's cost is the entire SPIR-V cache.
+const GAS_FAROUT_N     : u32 = 128u;
+const GAS_FAROUT_SHIFT : u32 = 6u;
+const_assert (GAS_FAROUT_N << GAS_FAROUT_SHIFT) == 16u * WORLD_N;
+const GAS_FAROUT_OFF : i32 = i32((GAS_FAROUT_N << GAS_FAROUT_SHIFT) / 2u) -
+                             i32(WORLD_N / 2u);
+// Samples across the long-range segment. The segment runs from the near box's
+// exit out to at most 409.6 m, so 16 steps is ~23 m apart at worst — about
+// three and a half cells, i.e. UNDER-sampled relative to the grid and
+// deliberately so. The subject out there is a column a handful of cells across
+// subtending a few dozen pixels; the per-pixel dither turns the sparse cadence
+// into a stipple rather than into shells, exactly as it does for the near box's
+// own 16, and more steps here would be paid by every terrain pixel of every
+// frame with a distant fire in it.
+const GAS_FAROUT_STEPS : u32 = 16u;
 // R.flags bit 3: GAS MAY BE PRESENT this frame. Set by the CPU from the sim's
 // own gas latch (Simulation::GasRenderActive) and OFF in a world with no
 // smoke in it, which is what keeps the whole of the crossfade — the band
 // sampling, the per-cell fade in trace(), the coarse fold in fs() — at exactly
 // zero cost in the common case. Every one of those three tests it.
 const RFLAG_GAS : u32 = 8u;
+// R.flags bit 5: the LONG-RANGE box has something in it this frame. Its own bit
+// and not a second meaning for bit 3, because the two are true in different
+// worlds: a campfire ten metres away arms bit 3 every frame and must not also
+// put a second 4 MiB volume walk on every terrain pixel. Same correctness role
+// as bit 3 — the long-range box is only cleared on ticks its own row is
+// recorded, so with this off it is stale and must not be sampled.
+const RFLAG_GASFAR : u32 = 32u;
 
 // ---- THE CROSSFADE WEIGHT (stage 1b) ---------------------------------------
 // 0 where gas is drawn as VOXELS and 1 where it is drawn from the coarse box,
@@ -3532,6 +3562,35 @@ fn gasOuterCountAt(p : vec3f) -> f32 {
   return f32((gasOuter[li >> 1u] >> (16u * (li & 1u))) & 0xFFFFu);
 }
 
+// The same two functions for the LONG-RANGE box. IDENTICAL EXPRESSIONS to
+// sim_gas.wgsl's gasFarOuterOrigin/gasFarOuterCell, for gasOuterOriginVox's
+// reason: the splatter and the sampler agreeing on where cell (0,0,0) is IS the
+// interface. The one difference from the near box is the FLOOR — the window
+// origin is a multiple of 16 voxels and this cell is 64, so without it the
+// lattice would slide 1.6 m sideways on every window shift and a settled plume
+// would visibly re-quantise as the player walked.
+fn gasFarOuterOriginVox() -> vec3<i32> {
+  return (((R.origin * i32(CHUNK)) - vec3<i32>(GAS_FAROUT_OFF))
+          >> vec3<u32>(GAS_FAROUT_SHIFT)) << vec3<u32>(GAS_FAROUT_SHIFT);
+}
+
+// THE COUNT MEANS THE SAME THING IN BOTH BOXES, and that is what makes the two
+// segments fold into one accumulator with no scale factor anywhere. A cell's
+// count over 512 is the FRACTION of that cell which is gas — a dimensionless
+// number — so the integral of it along the ray is voxel-lengths of solid gas
+// whatever the cell size happens to be. The 512 at the bottom of gasOuterFill
+// is that denominator; it was first derived as "fine voxels in a fine cell",
+// and it serves both.
+fn gasFarOuterCountAt(p : vec3f) -> f32 {
+  let d = (vec3<i32>(floor(p)) - gasFarOuterOriginVox())
+          >> vec3<u32>(GAS_FAROUT_SHIFT);
+  if (any(d < vec3<i32>(0)) || any(d >= vec3<i32>(i32(GAS_FAROUT_N)))) {
+    return 0.0;
+  }
+  let li = (u32(d.z) * GAS_FAROUT_N + u32(d.y)) * GAS_FAROUT_N + u32(d.x);
+  return f32((gasFarOuter[li >> 1u] >> (16u * (li & 1u))) & 0xFFFFu);
+}
+
 // WHICH gas the box is made of. gasOuter stores a count and no material (§2.5:
 // "one gas material in stage 1"), so the renderer has to name one, and it
 // names it by PROPERTY rather than by id — hardcoding a material id in a
@@ -3665,6 +3724,44 @@ fn gasOuterFill(ro : vec3f, rdIn : vec3f, tEnd : f32, px : vec2f) -> f32 {
       t += dt;
     }
   }
+  // ---- THE LONG-RANGE SEGMENT (world.h kGasFarOuterN) ----------------------
+  // The fires past the near box's ±51.2 m. It is a THIRD segment rather than a
+  // wider version of the first because the two boxes hold DISJOINT emitter sets
+  // — the CPU splits them in the max norm at the near box's own half-extent —
+  // so there is nothing to crossfade and nothing that can be counted twice; the
+  // handover is in the data.
+  //
+  // Starts at the near box's exit, so the near field pays nothing for it beyond
+  // the flag test. Its samples fold into the SAME accumulator with no scale
+  // factor: a cell's count over 512 is a volume fraction in either box (see
+  // gasFarOuterCountAt), so `count * dt` is voxel-lengths of gas at either
+  // scale.
+  if ((R.flags & RFLAG_GASFAR) != 0u) {
+    // Concentric with the window box like the other two, so the same six slab
+    // distances serve it: push both of each axis's planes out by half the
+    // difference of the two edges.
+    let extF = (f32(GAS_FAROUT_N << GAS_FAROUT_SHIFT) - f32(WORLD_N))
+               * 0.5 * abs(inv);
+    // Never nearer than where the NEAR box gave up: inside that, the fine
+    // segment above is the authority and the wide list is empty by
+    // construction. `tB` IS that distance -- it is the near box's exit, already
+    // clamped by tEnd, and reusing it costs nothing and cannot disagree with
+    // the segment it bounds. (If tEnd cut tB short, tF1 <= tEnd <= tF0 and the
+    // loop below does not run, which is the right answer: the ray stopped.)
+    let tF0 = max(max(max(tminW.x - extF.x, tminW.y - extF.y),
+                      max(tminW.z - extF.z, 0.0)), tB);
+    let tF1 = min(min(tmaxW.x + extF.x, min(tmaxW.y + extF.y, tmaxW.z + extF.z)),
+                  tEnd);
+    if (tF1 > tF0) {
+      let dt = (tF1 - tF0) / f32(GAS_FAROUT_STEPS);
+      var t = tF0 + dt * jit;
+      for (var i = 0u; i < GAS_FAROUT_STEPS; i++) {
+        acc += gasFarOuterCountAt(ro + rd * t) * dt;
+        t += dt;
+      }
+    }
+  }
+
   // Count -> volume fraction: one parcel IS one fine voxel of gas (that is
   // what left the window), and a cell holds (1 << SHIFT)^3 of them. So the
   // integral of (count / cellVolume) along the ray is exactly the number of
@@ -9124,7 +9221,7 @@ fn fs(in : VSOut) -> FSOut {
   // block far below, where the near march's tau is turned into a tint. This is
   // the whole of the render side: one number, folded into one accumulator.
   var gasFarFill = 0.0;
-  if ((R.flags & RFLAG_GAS) != 0u) {
+  if ((R.flags & (RFLAG_GAS | RFLAG_GASFAR)) != 0u) {
     var tStop = 1e30;
     if (h.hit || h.saturated) { tStop = h.t; }
     else if (far.hit) { tStop = far.t; }
