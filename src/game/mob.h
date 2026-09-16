@@ -3332,6 +3332,11 @@ class MobSystem {
   // equip...) is the per-creature surface; the id-keyed wrappers below remain
   // for callers that only hold a body handle or an id.
   Mob* FindMobById(uint64_t id);
+  // A creature by TARGET id, which includes the player: the avatar is a Mob
+  // outside `mobs_` and its actor id is the reserved ai::kPlayerActorId. Use
+  // this wherever the id came from the AI; `FindMobById` where it did not.
+  // See the note on the definition for what the missing case cost.
+  Mob* FindCombatantById(uint64_t id);
   // Mob combat scaffolding: hand any creature an item, exactly as the player
   // equips one (the implementation is Mob::EquipItem, shared with the avatar).
   bool EquipItem(uint64_t mobId, const ItemDef* item,

@@ -358,8 +358,16 @@ bool SaveBehaviors(const std::string& path, const Library& lib, std::string& err
 // are both actors, which is the entire reason mob-vs-mob combat is a data
 // change later rather than a second code path: target selection scans this list
 // and never asks what KIND of thing an entry is.
+// THE PLAYER'S RESERVED ACTOR ID. Mob ids start at 1 (MobSystem::nextId_), so
+// 0 can mean "you" with no collision -- but it also means `FindMobById(0)`
+// comes back empty, because the avatar is a Mob that lives OUTSIDE `mobs_`
+// (MobSystem::SetAvatar). Anything that resolves a target id to a CREATURE has
+// to say so explicitly; `MobSystem::FindCombatantById` is that function, and
+// this constant is why it has to exist.
+constexpr uint64_t kPlayerActorId = 0;
+
 struct Actor {
-  uint64_t id = 0;          // mob id; 0 is reserved for the player
+  uint64_t id = 0;          // mob id; kPlayerActorId (0) is reserved for the player
   Vec3 centre{};            // world voxels, body centre
   float radius = 1.0f;      // horizontal half-extent, for stand-off distance
   float height = 2.0f;

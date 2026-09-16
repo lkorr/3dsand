@@ -973,15 +973,23 @@ EdgeSweepResult MeleeSweepDamage(const EdgeSweep& s, const MeleeTuning& t,
         bt.at = at;
         bt.hp = s.strike.bite * power;
         bt.power = power;
-        // ARMOUR DEFENDS, and the decision is made HERE rather than inside the
-        // wound model: "a bite that touches FLESH" is a fact about what this
-        // sweep met, and a shell in the way is the whole of the defence. The
-        // teeth still land (Mob::BiteHit turns them into trauma on a shell);
-        // they simply carry nothing.
-        if (kind == StruckKind::Flesh) {
-          bt.infectMat = s.strike.infectMat;
-          bt.infectStain = s.strike.infectStain;
-        }
+        // ---- THE STRUCK KIND IS NOT HANDED DOWN (2026-09-16) --------------
+        //
+        // It used to be: the infection was attached only `if (kind ==
+        // StruckKind::Flesh)`, on the theory that "a bite that touches flesh"
+        // is a fact about what this sweep met. It is not. Whether teeth REACH
+        // flesh depends on what the garment in the way is MADE OF -- linen is
+        // hardness 4 and steel 200 -- and on which limb is strapped under it,
+        // and only the creature knows either. Deciding it here made a tunic as
+        // bite-proof as a cuirass, which is why a clothed victim saw nothing
+        // but bruises.
+        //
+        // So the profile arrives whole and `Mob::BiteHit` asks `IsWornSlot`
+        // for itself, exactly as `Mob::BluntHit` already did and for the
+        // reason stated six lines above this: only the rig can find the limb
+        // underneath a shell to transmit through.
+        bt.infectMat = s.strike.infectMat;
+        bt.infectStain = s.strike.infectStain;
         bt.seed = hitSeed ^ 0xB17Eu;
         mobs.BiteHit(hb, bt, world, spawns);
       }

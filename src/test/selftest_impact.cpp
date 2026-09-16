@@ -979,6 +979,62 @@ Status GateBiteRot(Ctx& c, std::string& detail) {
     c.debris.Reset();
   }
 
+  // ---- ARM C: THE SAME TEETH ON A TUNIC -----------------------------------
+  //
+  // THE CONTRAST ARM B NEEDED. Arm B's zero was read as "armour defends", and
+  // for a plate it is -- but the rule it was testing was `IsWornSlot`, which is
+  // true of a LINEN SHIRT as well, and nothing in this gate could tell the two
+  // apart. So a tunic was as bite-proof as steel: teeth on a clothed chest ran
+  // no tear, carried no infection and left a faint bruise, which is exactly
+  // what the owner reported as not being able to detect a bite at all.
+  //
+  // Same fixture, same bites, same infection as arm B -- only the GARMENT
+  // differs, so a difference in the reading can only be the material. Linen is
+  // hardness 4 against iron's 160 and the ramp is gear.biteThroughSoft(14)
+  // ..biteThroughHard(60), so this arm must infect the flesh underneath while
+  // arm B still must not. Two arms that share a column prove nothing (that is
+  // its own gotcha); these two share every column but the one under test.
+  const ItemDef* tunic = c.items.At(c.items.Find("tunic"));
+  uint32_t clothHostRot = 0;
+  float clothHostHp0 = 0, clothHostHp1 = 0;
+  bool woreCloth = false;
+  if (tunic) {
+    const int chestSlot = (int)EquipSlotId::Chest;
+    const uint64_t id = SpawnTarget(c, t, 435);
+    Mob* m = id ? mobs.FindMobById(id) : nullptr;
+    if (m && chestSlot >= 0 && m->WearItem(tunic, chestSlot)) {
+      int shell = -1;
+      for (int li = m->AppendedBase(); li < m->LimbCount(); li++)
+        if (m->WornHostOf(li) == t.torso) { shell = li; break; }
+      if (shell >= 0) {
+        woreCloth = true;
+        clothHostHp0 = mobs.LimbHp(id, t.torso);
+        clothHostHp1 = clothHostHp0;
+        const Vec3 at = mobs.LimbVoxelPos(id, shell, 11u);
+        // ---- READ AFTER EVERY BITE, FOR ARM A'S REASON ---------------------
+        //
+        // The torso is VITAL, and teeth that reach it through linen reach it
+        // at full strength: ten bites of 7 hp against 60 killed the limb, and
+        // the end-of-loop read then reported `0 rotflesh, hp -1` -- a correct
+        // measurement of nothing, and the exact trap arm A's own note warns
+        // about. The state kept is the last from a bite that LEFT THE HOST
+        // ALIVE, which is what "the rot reached the flesh" is a claim about.
+        for (int k = 0; k < kHits; k++) {
+          if (!mobs.LimbBody(id, shell) || !mobs.LimbBody(id, t.torso)) break;
+          BiteOnce(mobs, c.world, id, shell, at, kHp, (uint16_t)rotMat,
+                   (uint16_t)ichor, kPower,
+                   0xC107u + (uint32_t)k * 2654435761u, spawns);
+          if (!mobs.LimbBody(id, t.torso)) break;
+          clothHostRot = mobs.LimbMaterialCount(id, t.torso, rotMat);
+          clothHostHp1 = mobs.LimbHp(id, t.torso);
+        }
+      }
+    }
+    mobs.Reset();
+    c.debris.Reset();
+  }
+  RecordObserved("biteRotThroughClothCells", (double)clothHostRot);
+
   RecordObserved("biteRotCells", (double)rot);
   RecordObserved("biteRotStainedCells", (double)stained);
   RecordObserved("biteRotLostVoxels", (double)lost);
@@ -1017,17 +1073,25 @@ Status GateBiteRot(Ctx& c, std::string& detail) {
   RecordObserved("biteRotBitesToSever", (double)(attached ? 0 : bites + 1));
   const bool held = attached && bites == kHits;
 
+  // CLOTH IS NOT ARMOUR: teeth through a tunic must reach the flesh under it
+  // and infect it. The hp drop alone would not prove it -- arm B's plate also
+  // drops host hp, through the blunt share -- so the claim is the ROT, which
+  // is the one thing `IsWornSlot` used to refuse unconditionally.
+  const bool bitThroughCloth = !woreCloth || clothHostRot > 0;
   const bool ok = tore && infected && wet && bled && defended && landed &&
-                  held;
+                  held && bitThroughCloth;
   detail = Format(
       "%s/%s x%d bites (%.1f hp, rotflesh + ichor): %d landed, %u voxels torn "
       "out, %u rotflesh, %u stained, bleed budget %.2f, limb %s | on an iron "
       "cuirass: %u rotflesh on the plate, %u on the body under it, host hp "
-      "%.1f -> %.1f (%s)",
+      "%.1f -> %.1f (%s) | through a tunic: %u rotflesh on the body under it, "
+      "host hp %.1f -> %.1f (%s)",
       t.defName.c_str(), t.limbName.c_str(), kHits, kHp, bites, lost, rot,
       stained, bleed, attached ? "still attached" : "TORN OFF", shellRot,
       hostRot, shellHostHp0, shellHostHp1,
-      wore ? "worn" : "no cuirass — armour arm skipped");
+      wore ? "worn" : "no cuirass — armour arm skipped", clothHostRot,
+      clothHostHp0, clothHostHp1,
+      woreCloth ? "worn" : "no tunic — cloth arm skipped");
   return ok ? Status::Pass : Status::Fail;
 }
 

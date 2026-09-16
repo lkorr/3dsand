@@ -2613,6 +2613,76 @@ Status GateBiteTarget(Ctx& c, std::string& detail) {
   std::printf("bite-target: %d/%d bites chose a limb;%s\n", chosen, want,
               spread.c_str());
 
+  // ---- ...AND THE LOOKUP THAT DECIDES WHETHER THE DRAW RUNS AT ALL --------
+  //
+  // Everything above asks `PickTargetLimb` DIRECTLY, and says so. That proves
+  // the draw and leaves the seam in front of it untested -- which is exactly
+  // where the bug was: `StartStroke` reaches the draw through
+  // `if (const Mob* victim = FindMobById(targetId))`, the player's target id
+  // is the reserved ai::kPlayerActorId (0), and the avatar is a Mob that lives
+  // OUTSIDE `mobs_`. So against the PLAYER the lookup came back empty, the
+  // draw never ran, `targetLimb` stayed -1 and every NPC blow fell through to
+  // BeginStrokeProgram's default chest aim. All five authored bite weights
+  // were dead against the one target the game is mostly about, and the chest
+  // is the one place a garment always covers -- so the teeth landed on cloth
+  // every time and the owner reported never being able to detect a bite.
+  //
+  // A gate that only ever asks the draw is a fixture that measures itself.
+  // This arm goes through `ForceAttack`'s `targetId`, which is the same
+  // `StartStroke` door the AI uses.
+  {
+    const uint32_t seedTick = tick.tick + 1000u;
+    const Vec3 aimAt = Chest(c.mobs, prey, nd);
+    // The draw is only ever attempted on a style that HAS a weight table, so
+    // the two arms below differ in one thing: whether the victim resolves.
+    auto drawAgainstPlayer = [&](uint32_t k) -> int {
+      Mob* m = c.mobs.FindMobById(biter);
+      if (m == nullptr) return -2;
+      m->Stroke().Reset();
+      if (!c.mobs.ForceAttack(biter, "bite_lunge", aimAt, seedTick + k, 0,
+                              ai::kPlayerActorId))
+        return -2;
+      const NpcStroke* s = c.mobs.MobStroke(biter);
+      const int limb = s != nullptr ? s->targetLimb : -2;
+      m->Stroke().Reset();
+      return limb;
+    };
+    // CONTROL ARM: no avatar registered, which is every headless run and was
+    // the whole world before this. The lookup must find nobody and the blow
+    // must fall through to the chest, exactly as it always did.
+    c.mobs.SetAvatar(nullptr);
+    const int blind = drawAgainstPlayer(0);
+    // ...AND THE SUBJECT: the player registered. `SetAvatar` takes a Mob*, and
+    // the prey is one -- the claim is about the LOOKUP, not about PlayerAvatar,
+    // so borrowing a body already in the fixture keeps this arm to the seam it
+    // is testing.
+    Mob* asPlayer = c.mobs.FindMobById(prey);
+    c.mobs.SetAvatar(asPlayer);
+    int drawn = 0, spread = 0;
+    std::map<std::string, int> playerTags;
+    for (uint32_t k = 1; k <= 12; k++) {
+      const int limb = drawAgainstPlayer(k);
+      if (limb < 0) continue;
+      drawn++;
+      playerTags[nd.limbs[limb].tag]++;
+    }
+    spread = (int)playerTags.size();
+    // MUST be restored: gates share one MobSystem and a dangling avatar_ would
+    // follow this one into every gate after it (selftest.h's ordering note).
+    c.mobs.SetAvatar(nullptr);
+    check(blind == -1, "with no avatar, a blow at the player aims at the chest");
+    check(drawn > 0, "...and with one registered, the limb draw actually runs");
+    check(spread >= 2, "...over more than one limb tag, not the chest every time");
+    std::string ps;
+    for (const auto& kv : playerTags)
+      ps += " " + kv.first + "=" + std::to_string(kv.second);
+    RecordObserved("biteTarget.playerTagsObserved", (double)spread);
+    std::printf(
+        "bite-target: at the PLAYER (actor id 0): no avatar -> targetLimb %d; "
+        "avatar registered -> %d/12 drew a limb;%s\n",
+        blind, drawn, ps.c_str());
+  }
+
   CloseStage(c);
   detail = Format("%d checks", checks);
   std::printf("bite-target: %s (%d checks)\n", ok ? "PASS" : "FAIL", checks);

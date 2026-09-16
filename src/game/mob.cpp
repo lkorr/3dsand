@@ -1878,7 +1878,7 @@ const ai::Brain* MobSystem::MobBrain(uint64_t mobId) const {
 
 void MobSystem::SetPlayerActor(Vec3 centreVox, float radius, float height,
                                bool alive) {
-  playerActor_.id = 0;   // 0 is the reserved player id; mob ids start at 1
+  playerActor_.id = ai::kPlayerActorId;  // 0; mob ids start at 1
   playerActor_.centre = centreVox;
   playerActor_.radius = radius;
   playerActor_.height = height;
@@ -2031,6 +2031,34 @@ Mob* MobSystem::FindMobById(uint64_t id) {
   for (Mob& mob : mobs_)
     if (mob.id_ == id) return &mob;
   return nullptr;
+}
+
+// ---- WHO A BLOW IS AIMED AT, AND THE PLAYER IS A WHO ------------------------
+//
+// `FindMobById` answers over `mobs_`, and the avatar is a Mob that is NOT in it
+// (MobSystem::SetAvatar says why). An AI's `targetId` is an ACTOR id, and the
+// player's is the reserved 0 (ai::kPlayerActorId) -- so every id-keyed lookup
+// on the attack path silently missed the one target the game is mostly about.
+//
+// WHAT THAT COST, because it is not obvious from the signature: `StartStroke`
+// draws WHICH LIMB a blow goes for with `if (const Mob* victim =
+// FindMobById(targetId))`, so against the player the draw never ran,
+// `targetLimb` stayed -1, and BeginStrokeProgram fell through to its default
+// chest aim. Every authored `target` table in attack_styles.json was therefore
+// dead against you -- the zombie's bites are weighted head 0.35 / arm 0.30 /
+// hand 0.05 / spine 0.20 / leg 0.10, and all five of those landed on the chest.
+// And the chest is the one place a garment always covers: `Mob::BiteHit` turns
+// teeth on a worn shell into `gear.biteOnShell` of blunt trauma with NO tear
+// and NO infection, so a clothed player could be bitten indefinitely and see
+// nothing but bruises. Reported as "I literally cannot see or detect a bite on
+// my character".
+//
+// A SEPARATE FUNCTION rather than widening `FindMobById`, which has ten other
+// callers (EquipItem, the block drain, the dev overlay) that mean "a mob in my
+// list" and would start answering with the player if this were folded in.
+Mob* MobSystem::FindCombatantById(uint64_t id) {
+  if (id == ai::kPlayerActorId) return avatar_;   // null in a headless run
+  return FindMobById(id);
 }
 
 bool MobSystem::EquipItem(uint64_t mobId, const ItemDef* item,
@@ -3426,7 +3454,7 @@ void MobSystem::StartStroke(Mob& mob, int styleIndex, uint64_t targetId,
   // A SCRIPTED SWING AIMS AT A POINT AND MAY NAME NO VICTIM, and that is still
   // worth a draw: `--shot-strike` and the gates hand a target id when they have
   // one, and the limb choice is a fact about the STYLE, not about who asked.
-  if (const Mob* victim = FindMobById(targetId))
+  if (const Mob* victim = FindCombatantById(targetId))
     st.targetLimb = PickTargetLimb(sty, *victim, mob.id_, tick);
   // ONE SEED PER SWING, mixing who and when. Every draw in the runner indexes
   // off it, so the whole stroke — its style, its start bow, its tempo —
@@ -12252,22 +12280,80 @@ bool Mob::BiteHit(uint64_t bodyHandle, const ::BiteHit& hit, World& world,
   const Tuning::Gore& gt = tune.gore;
   const float power = std::clamp(hit.power, 0.0f, 1.0f);
 
-  // ---- ARMOUR DEFENDS, AND THAT IS THE WHOLE RULE -------------------------
+  // ---- ARMOUR DEFENDS -- AND A LINEN SHIRT IS NOT ARMOUR ------------------
   //
-  // Teeth on a cuirass are a BLOW: a share of the bite arrives as trauma, the
-  // plate is not broken, and there is NO INFECTION. The owner asked for a
-  // rotten wound "that touches FLESH (armour defends)", and this is the one
-  // line that makes it true -- which is also why the classification happens
-  // before any part of the profile is applied (impact.h StruckKind).
+  // Teeth on a cuirass are a BLOW: a share of the bite arrives as trauma and
+  // the plate is not broken. That half is unchanged.
+  //
+  // WHAT CHANGED (2026-09-16) is that "worn" used to be the whole test, so a
+  // TUNIC stopped a zombie's jaws exactly as dead as steel: the tear never
+  // ran, the infection was dropped, and a clothed victim could be bitten
+  // indefinitely for nothing but a faint bruise. The owner reported it as not
+  // being able to detect a bite on their character at all -- and against the
+  // PLAYER it was total, because every NPC blow aimed at the default chest
+  // point (MobSystem::FindCombatantById) and the chest is the one place a
+  // garment always covers.
+  //
+  // WHAT DECIDES IT IS THE SHELL'S OWN MATERIAL, and the hardness is read here
+  // the same way Mob::BluntHit reads it for the dent and Mob::CutLimb for the
+  // kerf: the first voxel of the authoritative lattice, because a shell is one
+  // material all over. No new authored field, and a garment added tomorrow
+  // answers this without being edited. See Tuning::Gear::biteThroughSoft.
   if (IsWornSlot(li)) {
+    const Tuning::Gear& gear = tune.gear;
+    float hard = 0.0f;
+    if (sys_ != nullptr) {
+      uint32_t m = 0;
+      if (!limbs_[li].skinVoxels.empty())
+        m = limbs_[li].skinVoxels[0].material & 0xFFFu;
+      else if (!limbs_[li].voxels.empty())
+        m = limbs_[li].voxels[0].payload & 0xFFFu;
+      if (m < sys_->matGpu_.size()) hard = (float)sys_->matGpu_[m].hardness;
+    }
+    // 1 at or below the soft point, 0 at or above the hard one, linear
+    // between. A shell whose material could not be read (hardness 0) counts as
+    // soft, which is the safe way round: the failure is a bite that lands, not
+    // a creature that is silently invulnerable.
+    float through = 1.0f;
+    if (hard > gear.biteThroughSoft) {
+      const float span = std::max(gear.biteThroughHard - gear.biteThroughSoft, 1e-3f);
+      through = std::clamp((gear.biteThroughHard - hard) / span, 0.0f, 1.0f);
+    }
+    // THE GARMENT IS BITTEN WHATEVER IT IS MADE OF. Teeth closing on a shirt
+    // still charge it hp and still bruise the wearer through it -- that is the
+    // path this branch always had, and a bite that tore the flesh underneath
+    // without marking the cloth would be a hole with no hole in the sleeve.
     ::BluntHit b;
     b.at = hit.at;
-    b.hp = hit.hp * std::clamp(tune.gear.biteOnShell, 0.0f, 1.0f);
+    b.hp = hit.hp * std::clamp(gear.biteOnShell, 0.0f, 1.0f);
     b.power = power;
     b.carve = 0.0f;
     b.armorBreak = 0.0f;
     b.seed = hit.seed ^ 0xB17E5u;
-    return BluntHit(bodyHandle, b, world, spawns);
+    const bool marked = BluntHit(bodyHandle, b, world, spawns);
+
+    // ...AND WHAT IS LEFT REACHES THE LIMB UNDERNEATH. The same transmission
+    // Mob::BluntHit does for a mace, for the same reason and with the same
+    // trap avoided: `wornHost` is an INDEX, and the BluntHit above may have
+    // severed the shell and reshaped `limbs_`, so the host is re-resolved here
+    // rather than captured before it.
+    if (through <= 0.0f) return marked;
+    int li2 = -1;
+    for (size_t i = 0; i < limbs_.size(); i++)
+      if (limbs_[i].body == bodyHandle) { li2 = (int)i; break; }
+    const int hostIdx = li2 >= 0 ? limbs_[li2].wornHost : -1;
+    if (hostIdx < 0 || hostIdx >= (int)limbs_.size()) return marked;
+    const uint64_t hostBody = limbs_[hostIdx].body;
+    if (hostBody == 0ull) return marked;
+    // The infection rides through undiminished when anything does: rot is a
+    // material the teeth carry, not a quantity they spend, so a bite that
+    // reaches flesh at all infects it. Only the DAMAGE is scaled.
+    ::BiteHit deep = hit;
+    deep.hp = hit.hp * through;
+    deep.seed = hit.seed ^ 0x7EE7Du;
+    // Recurses onto a slot below AppendedBase(), so it takes the flesh branch
+    // below and cannot loop: a host limb is never itself a worn shell.
+    return BiteHit(hostBody, deep, world, spawns) || marked;
   }
 
   // ---- LIVE FLESH: A TEAR ------------------------------------------------

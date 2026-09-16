@@ -346,11 +346,32 @@ struct Tuning {
     // of hits that kill the wearer, and then the armour would have no history.
     float bluntShellHp = 0.6f;
     // A BITE ON ARMOUR IS A BLOW, NOT A WOUND. Fraction of a bite's damage
-    // that lands as blunt trauma when the teeth meet a worn shell. There is
-    // deliberately no shell-breaking and NO INFECTION on this path: armour
-    // defends, and that is the whole reason the struck slot is classified
-    // (impact.h StruckKind) before any part of the profile is applied.
+    // that lands as blunt trauma when the teeth meet a worn shell. No
+    // shell-breaking on this path: teeth do not dent plate.
     float biteOnShell = 0.3f;
+    // ---- ...BUT A LINEN SHIRT IS NOT ARMOUR (2026-09-16) -----------------
+    //
+    // "Armour defends" was applied to every garment equally, so a tunic
+    // stopped a zombie's teeth exactly as dead as a cuirass: the whole bite
+    // became `biteOnShell` of blunt trauma, the tear never ran and the
+    // infection was dropped. A clothed player could be bitten indefinitely and
+    // see nothing but bruises, which is what the owner reported.
+    //
+    // WHAT DECIDES IT IS THE SHELL'S OWN MATERIAL HARDNESS, read off the first
+    // voxel of its lattice exactly as the blunt path already reads it for the
+    // dent. That is a fact the garment already carries, so this needs no new
+    // field on nineteen item files and a garment authored tomorrow answers it
+    // for free -- and it is the same "one authoritative source per fact" rule
+    // that put the kerf's hardness there.
+    //
+    // A TWO-POINT RAMP rather than a ratio, because a ratio has no zero: teeth
+    // pass entirely at or below `biteThroughSoft` (leather, 14 -- linen is 4
+    // and cloth 5, so every woven garment is inside it), nothing passes at or
+    // above `biteThroughHard`, and it is linear between. Iron is 160 and steel
+    // 200, so plate stops a bite dead and keeps the behaviour the knob above
+    // was written for.
+    float biteThroughSoft = 14.0f;
+    float biteThroughHard = 60.0f;
   } gear;
 
   // ---- player avatar ----
@@ -675,6 +696,41 @@ struct Tuning {
     // mass ratio, so this vs a body's density-derived mass decides how far a
     // walking player moves it.
     float playerMassKg = 80.0f;
+    // ---- A LIVING CREATURE MAY LEAN INTO YOU (PlayerPushOut) --------------
+    //
+    // How deep a LIVE rig's limb may sit inside the player's capsule before it
+    // displaces the player at all, and the most it may displace them in one
+    // tick once it is deeper than that.
+    //
+    // WHY THIS EXISTS. A creature's posed limbs are KINEMATIC bodies on the
+    // ordinary MOVING layer reporting their whole rig's mass, so every one of
+    // them sails past the kick-it-aside mass gate and depenetrates the proxy
+    // by its full overlap, every tick, for as long as it overlaps. Nothing
+    // holds an NPC out of you either — `CrowdPush` and `BlockedByMob` iterate
+    // `mobs_`, and the player is an `ai::Actor`, not a Mob — so a creature
+    // whose band floor is 2 voxels walks into your volume and then bulldozes
+    // you out of it. Reported as "the zombies push my body around", and it is
+    // also why they could not bite: the standing `bite`'s derived reach is
+    // about 2 voxels (MobSystem::StyleReachOn), which is nearly contact, and
+    // the victim was being shoved out of contact on the very tick the teeth
+    // arrived.
+    //
+    // ONLY KINEMATIC BODIES, and that is the discriminator rather than a new
+    // flag: a live posed rig is the only thing kinematic on MOVING. A corpse
+    // or a ragdoll is dynamic (the solver pushes it out and the mass gate
+    // already covers it), a held weapon is on PROP, a severed limb mid-hold is
+    // on AVATAR. So this softens a creature LEANING on you and changes nothing
+    // about being crushed by a log.
+    //
+    // THE SLACK IS THE FEATURE AND THE CAP IS THE NET. The slack is what lets
+    // teeth reach: a head may come a voxel and a half inside you for free. The
+    // cap stops the remainder ever being a launch — past the slack you are
+    // eased out at a bounded rate instead of teleported a body-width, which is
+    // what the full depenetration was worth at 30 Hz (~36 m/s).
+    //
+    // Zero slack with a huge cap is the old behaviour exactly.
+    float creaturePhaseVox = 1.5f;
+    float creaturePushMaxVox = 0.35f;
     // Rolling spheres (analytic colliders, not boxed voxels).
     float sphereFriction = 0.5f, sphereRestitution = 0.3f;
     float sphereAngularDamping = 0.05f;

@@ -759,6 +759,82 @@ bool pushOk = false;
         sweptAsProp);
   }
 
+  // ---- A LIVING CREATURE MAY LEAN ON YOU, AND MAY NOT LAUNCH YOU ----------
+  //
+  // (Tuning::Physics::creaturePhaseVox / creaturePushMaxVox.)
+  //
+  // A creature's posed limbs are KINEMATIC bodies on the ordinary MOVING layer
+  // reporting the whole rig's mass, so every one of them sailed past the
+  // kick-it-aside gate and depenetrated the proxy by its FULL overlap, every
+  // tick, for as long as it overlapped. Nothing holds an NPC out of the player
+  // either -- CrowdPush and BlockedByMob iterate `mobs_`, and the player is an
+  // ai::Actor -- so a zombie whose band floor is 2 voxels walks into your
+  // volume and bulldozes you out of it. That is "the mobs push my body
+  // around", and it is also why the teeth could not reach: the standing bite's
+  // derived reach is about 2 voxels, and the victim was being shoved out of
+  // contact on the tick the jaws closed.
+  //
+  // THE CONTROL ARM IS THE SAME BODY, DYNAMIC. Both arms are the same shape at
+  // the same positions against the same proxy, and only the MOTION TYPE moves
+  // -- which is the discriminator the rule is written on (a corpse, a ragdoll
+  // and loose debris are dynamic and must keep the old full-depth push). Two
+  // arms that differed in geometry as well would prove nothing about which of
+  // the two mattered.
+  bool phaseOk = false;
+  {
+    const Tuning::Physics& pt = CurrentTuning().physics;
+    // Swept rather than sampled at one depth: the claim is about a RANGE
+    // (free inside the slack, bounded past it), and one position could sit on
+    // either side of the knee by luck. Pure narrow-phase, no Step, so this is
+    // bit-reproducible.
+    auto sweep = [&](bool kinematic, float& outMax, float& outShallow) {
+      outMax = 0.0f;
+      outShallow = -1.0f;
+      uint64_t b = stoneBlock({500, 499, 499});
+      phys.SetBodyKinematic(b, kinematic);
+      for (int i = 0; i <= 24; i++) {
+        // From clear of the block to buried in it, along +x.
+        Vec3 p{501.5f + 9.0f - (float)i * 0.4f, 500.0f, 500.0f};
+        const float d = phys.PlayerPushOut(pb, p).len();
+        outMax = std::max(outMax, d);
+        // The SHALLOWEST overlapping position, taken off the arm that can see
+        // one: the dynamic arm has no slack, so its first non-zero reading is
+        // where the two bodies first touch. That same index is what the
+        // kinematic arm has to answer zero at.
+        if (outShallow < 0.0f && d > 1e-4f) outShallow = (float)i;
+      }
+      phys.RemoveBody(b);
+      return;
+    };
+    float dynMax = 0, dynFirst = -1, kinMax = 0, kinFirst = -1;
+    sweep(false, dynMax, dynFirst);
+    sweep(true, kinMax, kinFirst);
+    // The cap is a per-tick ceiling in voxels; allow a hair for the fact that
+    // the deepest sub-shape decides it and the axis is normalised.
+    const float cap = pt.creaturePushMaxVox + 1e-3f;
+    // 1. THE GEOMETRY REALLY DOES BURY IT. Without this the two zeroes below
+    //    are a fixture that cannot fail: a sweep that never overlapped would
+    //    satisfy every other clause.
+    const bool buried = dynMax > cap * 2.0f;
+    // 2. A LIVE LIMB IS RATE-LIMITED. This is the "launched across the field"
+    //    half: past the slack you are eased out, not teleported.
+    const bool capped = kinMax <= cap;
+    // 3. ...AND FREE INSIDE THE SLACK. The dynamic arm pushes from the first
+    //    touch; the kinematic one must still be reading zero there, which is
+    //    what lets a mouth close on you.
+    const bool phases = dynFirst >= 0 && kinFirst > dynFirst;
+    // 4. DEBRIS IS UNTOUCHED. A dynamic body must still shove at full depth,
+    //    or this "fix" has quietly made every corpse and boulder walk-through.
+    const bool debrisUnchanged = dynMax > cap;
+    phaseOk = buried && capped && phases && debrisUnchanged;
+    std::printf(
+        "player body: creature phase-in %s (slack %.2f vox, cap %.2f vox/tick "
+        "| kinematic peak %.3f vox, first push at step %.0f; dynamic peak "
+        "%.3f vox, first push at step %.0f)\n",
+        phaseOk ? "ok" : "FAILED", pt.creaturePhaseVox, pt.creaturePushMaxVox,
+        kinMax, kinFirst, dynMax, dynFirst);
+  }
+
   // mass-relative shove: the proxy is dynamic with a real mass, so walking
   // into a light sphere must move it far more than the same walk into a
   // heavy one (both fall freely — only horizontal displacement counts).
@@ -782,7 +858,8 @@ bool pushOk = false;
   float heavyMoved = walkInto(12000.0f);  // ~780 kg lead sphere
   phys.RemoveBody(pb);
   bool shoveOk = lightMoved > 2.0f && lightMoved > 3.0f * heavyMoved;
-  pushOk = pushNear > 0.01f && pushFar < 1e-3f && shoveOk && releaseOk && propOk;
+  pushOk = pushNear > 0.01f && pushFar < 1e-3f && shoveOk && releaseOk &&
+           propOk && phaseOk;
   std::printf(
       "player body: %s (overlap push %.2f vox, clear push %.3f vox, "
       "shove light %.1f vox vs heavy %.1f vox)\n",

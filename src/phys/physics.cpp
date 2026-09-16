@@ -1322,8 +1322,9 @@ Vec3 Physics::PlayerPushOut(uint64_t handle, Vec3 centerVoxel,
   // was. Kinematic limbs (a living creature's) report their rig mass and
   // keep pushing; the avatar's own are on Layers::AVATAR and never seen here.
   constexpr float kPushMinMassFrac = 0.05f;
-  const float minMass = kPushMinMassFrac * std::max(CurrentTuning().physics.playerMassKg, 1.0f);
-  struct Deepest { JPH::BodyID id; JPH::Vec3 axis; float depth; };
+  const Tuning::Physics& pt = CurrentTuning().physics;
+  const float minMass = kPushMinMassFrac * std::max(pt.playerMassKg, 1.0f);
+  struct Deepest { JPH::BodyID id; JPH::Vec3 axis; float depth; bool alive; };
   std::vector<Deepest> perBody;
   for (const JPH::CollideShapeResult& hit : collector.mHits) {
     float len = hit.mPenetrationAxis.Length();
@@ -1335,17 +1336,46 @@ Vec3 Physics::PlayerPushOut(uint64_t handle, Vec3 centerVoxel,
       merged = true;
       break;
     }
-    if (!merged) perBody.push_back({hit.mBodyID2, hit.mPenetrationAxis / len, hit.mPenetrationDepth});
+    if (merged) continue;
+    // A LIVE CREATURE'S POSED LIMB, and the motion type IS the question.
+    // Kinematic on MOVING is only ever a rig somebody is driving: a corpse or
+    // a ragdoll has been handed to the solver and is dynamic, a held weapon is
+    // on PROP, a severed limb mid-hold is on AVATAR. See the tuning note on
+    // physics.creaturePhaseVox for why that distinction earns a softer rule.
+    const bool alive = bi.GetMotionType(hit.mBodyID2) == JPH::EMotionType::Kinematic;
+    perBody.push_back({hit.mBodyID2, hit.mPenetrationAxis / len,
+                       hit.mPenetrationDepth, alive});
   }
+  // A CREATURE MAY LEAN INTO YOU, AND MAY NOT LAUNCH YOU. Both halves are
+  // metres here because that is the frame `mPenetrationDepth` is in; the
+  // authored numbers are voxels.
+  const float phaseM = pt.creaturePhaseVox * kVoxelMeters;
+  const float capM = pt.creaturePushMaxVox * kVoxelMeters;
   JPH::Vec3 push = JPH::Vec3::sZero();
   for (const Deepest& d : perBody) {
     const float m = BodyMass(FromBodyID(d.id));
     if (m < minMass) continue;
+    float depth = d.depth;
+    if (d.alive) {
+      // THE SLACK IS SPENT FIRST. Inside it the creature is simply standing in
+      // you and you do not move at all, which is the whole of what makes a
+      // 2-voxel bite reach: nothing shoves the victim out of contact on the
+      // tick the teeth close.
+      depth -= phaseM;
+      if (depth <= 0.0f) continue;
+      // ...AND WHAT IS LEFT IS RATE-LIMITED, so a creature that buries itself
+      // eases you out over several ticks instead of teleporting you a
+      // body-width in one. A cap of 0 would weld you together, so it is only
+      // applied when the author asked for one.
+      if (capM > 0.0f) depth = std::min(depth, capM);
+    }
     // mPenetrationAxis points the way shape 2 (the body) moves to separate;
     // the player moves the opposite way
-    push -= d.axis * d.depth;
-    if (outWorst && d.depth / kVoxelMeters > outWorst->depthVox)
-      *outWorst = PushSource{FromBodyID(d.id), m, d.depth / kVoxelMeters};
+    push -= d.axis * depth;
+    // The EFFECTIVE depth, not the raw overlap: this reports what actually
+    // moved the player, which is the only number a budget gate can assert on.
+    if (outWorst && depth / kVoxelMeters > outWorst->depthVox)
+      *outWorst = PushSource{FromBodyID(d.id), m, depth / kVoxelMeters};
   }
   return Vec3{push.GetX(), push.GetY(), push.GetZ()} * (1.0f / kVoxelMeters);
 }
