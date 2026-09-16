@@ -70,7 +70,18 @@ struct PlayerKitRefs {
 // player's pages (name + words, all by name), then the twenty bound slots as
 // (kind, name) pairs. A v3 payload still loads: an empty grimoire, and the ten
 // bound names it carries land in bank A. v2 and older are refused as before.
-constexpr uint32_t kPlayerKitSaveVersion = 4;
+// Version 5 appends the DYES (game/dye.h): one word per slot of each of the
+// three containers, in the same order and with the same self-describing counts
+// the slots themselves use.
+//
+// APPENDED RATHER THAN WIDENING THE SLOT RECORDS, which would have been
+// tidier. The slot section is the FIRST thing in the payload, so putting a
+// fourth field in it moves every byte after it and makes v4 unreadable — and
+// the point of the tail-append shape this format already uses (worn damage in
+// v2, the grimoire in v4) is that an older payload keeps loading and simply
+// stops early. A v4 kit loads with every garment undyed, which is exactly what
+// it was.
+constexpr uint32_t kPlayerKitSaveVersion = 5;
 constexpr uint32_t kPlayerKitOldestLoadable = 3;
 
 // ITEMS ON THE GROUND ('ITMS'): what is lying around, by name and pose.
@@ -97,7 +108,11 @@ struct WorldItemRefs {
   bool Complete() const { return reg && phys && debris && items; }
 };
 
-constexpr uint32_t kWorldItemSaveVersion = 1;
+// v2 inserts the DYE (game/dye.h) after each entry's name: a dropped red tunic
+// and a dropped blue one share a name and a lattice, so the colour is the only
+// thing telling them apart and nothing else in the record implies it. v1 still
+// loads — its items come back undyed, which is what they were.
+constexpr uint32_t kWorldItemSaveVersion = 2;
 
 // The 'PLYR' serializer, exposed so the grimoire gate can write an OLDER
 // version's payload (everything up to that version's last block) and prove

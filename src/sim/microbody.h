@@ -130,7 +130,18 @@ struct MicroBodyInstGpu {
   // 0 bitcasts to 0.0f, so the default is "no flash" for free — which is what
   // debris (phys/debris.cpp) keeps passing.
   uint32_t flashBits = 0;
-  uint32_t pad1 = 0;
+  // THE DYE, packed (game/dye.h): bit 24 set = dyed, low 24 bits the colour in
+  // `unpackColor`'s own byte order. 0 = undyed, which is every body limb, every
+  // piece of debris and every garment nobody has coloured — so the default
+  // costs nothing and the shader's test is one bit.
+  //
+  // The LAST padding word this struct had, taken for the same reason
+  // `flashBits` took the one before it: the struct must stay 16 bytes (the
+  // static_assert below is the only mechanical guard the CPU/WGSL pair has,
+  // because check_invariants.py cannot see a hand-written mirror), so a new
+  // per-instance value either fits in a spare word or does not exist. There
+  // are now no spare words. The next one needs a second buffer.
+  uint32_t dye = 0;
 };
 static_assert(sizeof(MicroBodyInstGpu) == 16,
               "must match microbody.wgsl MicroBodyInst");
@@ -168,6 +179,24 @@ struct MicroBodySet {
   // Retired owned model records, reusable so a long fight does not exhaust
   // kMaxMicroBodyModels even though the pool words are recycled.
   std::vector<uint32_t> freeModels;
+
+  // ---- WHEN A CEILING IS HIT --------------------------------------------
+  //
+  // Every allocator in this file degrades by REFUSING: the call returns -1, the
+  // caller leaves the skin alone, and the body's authoritative voxels change
+  // with nothing on screen to show it. That degradation is correct — losing
+  // detail under memory pressure beats refusing to be destructible — and it was
+  // completely SILENT, which is the whole reason a 256-record table shipped as
+  // a mystery instead of as a line of stderr. Owner report 2026-09-15: "after
+  // killing a bunch of zombies, new zombies spawn with 0 gore and won't get any
+  // when I hit them; it fixes itself when I leave the area with the corpses."
+  // Every word of that is this counter's story — the corpses were holding the
+  // records — and nothing in the engine said so.
+  //
+  // COUNTED rather than logged at the call site, because a full table refuses
+  // once per burning voxel per tick: the report has to be rate limited, and the
+  // count is itself the number worth reporting.
+  uint32_t refusals = 0;
   // Set by any mutation; the caller re-uploads and clears. Batching one upload
   // per tick rather than one per edit is rule 2 applied to PCIe traffic.
   bool dirty = false;
@@ -427,5 +456,16 @@ struct MicroBodyRef {
   // may be coarser. Equal values are the ordinary case and mean the two
   // lattices coincide exactly as they did before the split.
   uint32_t skinScale = 1;
+  // The DYE this body renders in (game/dye.h), packed; 0 = undyed, which is
+  // everything except a coloured garment.
+  //
+  // IT BELONGS HERE BECAUSE A MicroBodyRef IS A RENDER DESCRIPTION — the note
+  // three lines up already says so, and "what colour is it" is the same kind
+  // of fact as "which brick" and "at what pitch". Putting it here is also what
+  // makes the severed-garment case free: DebrisSystem::AdoptBody already takes
+  // a ref, both of Mob's hand-off sites already build one from the limb, so a
+  // sleeve cut off a red shirt arrives in the debris system red with no new
+  // argument threaded through either call.
+  uint32_t dye = 0;
   bool Valid() const { return model != kMicroBodyNoModel; }
 };

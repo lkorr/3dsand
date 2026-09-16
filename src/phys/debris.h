@@ -787,7 +787,14 @@ class DebrisSystem {
   // A worn shell on a corpse is a follower of the limb it covers, and a section
   // that did not carry the relationship reloaded an armoured corpse as a pile
   // of free bodies sharing the same space, which is the motor by another route.
-  static constexpr uint32_t kSaveVersion = 3;
+  //
+  // 4 (2026-09-15): the DYE (game/dye.h). One word per body, beside the scales
+  // it belongs with. It is render state like the brick above — but UNLIKE the
+  // brick it is not derivable from the lattice, because the whole point of a
+  // dye is that the art it colours is a neutral greyscale weave. A dropped red
+  // shirt that reloaded grey would be the one visible way this system could
+  // silently lose data, so the word travels.
+  static constexpr uint32_t kSaveVersion = 4;
   void SaveState(std::vector<uint8_t>& out) const;
   // Contract (worldio LoadEntities): Reset() has already run.
   bool LoadState(const uint8_t* data, size_t len, uint32_t version);

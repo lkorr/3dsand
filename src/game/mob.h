@@ -972,10 +972,13 @@ struct MobLimb {
   // Mob::SkinScaleOf / PhysScaleOf, never directly.
   uint32_t ownSkinScale = 0;
   uint32_t ownPhysScale = 0;
-  // Takes the SKIN scale: a MicroBodyRef is a render description.
+  // Takes the SKIN scale: a MicroBodyRef is a render description, and so is
+  // the dye — which is why a severed garment keeps its colour without anything
+  // on the hand-off path knowing it exists.
   MicroBodyRef MicroRef(uint32_t skinScale) const {
-    return microModel < 0 ? MicroBodyRef{}
-                          : MicroBodyRef{(uint32_t)microModel, skinScale};
+    return microModel < 0
+               ? MicroBodyRef{}
+               : MicroBodyRef{(uint32_t)microModel, skinScale, dye};
   }
   Vec3 restOffset{};         // limb min corner from creature min corner (rest)
   Vec3 anchorRoot{};         // joint anchor from creature min corner (rest)
@@ -1007,6 +1010,22 @@ struct MobLimb {
   // voxel word (there are no spare bits), it is not saved, and it is not
   // hashed.
   float hitFlash = 0;
+  // THE DYE this shell was worn in (game/dye.h). 0 on every body limb and on
+  // every undyed piece, which is what the GPU's default word already means, so
+  // nothing that does not wear a dyed garment changes at all.
+  //
+  // ON THE LIMB rather than on the WornPiece, even though it is a property of
+  // the PIECE and every shell of one garment shares it. Two reasons, and the
+  // second is the load-bearing one:
+  //   * AppendMicroInsts walks limbs_ and has no piece in hand; going back to
+  //     worn_ per limb per frame to ask "which garment is this shell" is a
+  //     search inside a render loop for a value that never changes.
+  //   * A SEVERED SHELL STOPS BEING PART OF A PIECE. It is handed to
+  //     DebrisSystem with its lattice and its micro ref (DetachLimb), and the
+  //     colour has to travel with it — a sleeve that turns grey the moment it
+  //     is cut off is the exact bug the per-instance design is otherwise free
+  //     of. The limb is the thing that survives that hand-off.
+  uint32_t dye = 0;
   // A severed part is handed to DebrisSystem immediately but holds its last
   // animated pose KINEMATICALLY for a beat before flipping dynamic.
   uint64_t holdBody = 0;
@@ -1248,6 +1267,11 @@ struct CorpseReport {
     int identityCover = -1;         // that body's ItemCover index (worn only)
     std::vector<uint64_t> rags;     // the piece's other shells
     WornDamage damage;              // as it was at death
+    // The COLOUR it was (game/dye.h), read off the identity shell. Travels for
+    // the same reason `damage` does: what you loot off a body has to be the
+    // thing that was on it. Without this a red tunic on a corpse loots into
+    // your pack undyed, which reads as the item having been swapped.
+    uint32_t dye = 0;
   };
   std::vector<Piece> gear;
 };
@@ -1572,8 +1596,12 @@ class Mob {
   // is the common case; passing a blob captured by CaptureWorn is what makes
   // taking your boots off and putting them back on stop being a repair
   // (game/equipment.h WornDamage).
+  // `dye` is the colour this particular garment is (game/dye.h), 0 for undyed
+  // — which is every piece that is not a commoner weave, and every caller that
+  // predates the wardrobe. It is carried onto each shell rather than stored on
+  // the piece; see MobLimb::dye for why.
   bool WearItem(const ItemDef* item, int equipSlot,
-                const WornDamage* damage = nullptr);
+                const WornDamage* damage = nullptr, uint32_t dye = 0);
   bool UnwearItem(int equipSlot);
   // Read what a worn piece has been through, in its item's cover order. Call
   // it BEFORE UnwearItem: the shells are the only place the damage lives while
@@ -1623,6 +1651,7 @@ class Mob {
     std::string item;
     bool held = false;
     WornDamage damage;      // empty for the held item
+    uint32_t dye = 0;       // the colour it was (game/dye.h), 0 for undyed
   };
   const std::vector<LostGear>& LostGearEvents() const { return lostGear_; }
   void ClearLostGear() { lostGear_.clear(); }
@@ -2469,7 +2498,8 @@ class Mob {
   // -1. Split out of WearItem so the per-cover loop reads as a list of shells
   // rather than as one 200-line function.
   int AppendWornShell(const ItemDef& item, const ItemCover& cover,
-                      int bodyLimb, const std::string& partName);
+                      int bodyLimb, const std::string& partName,
+                      uint32_t dye = 0);
   // Replace a shell's authoritative lattice with a saved one and re-derive
   // everything downstream of it (collider, brick, Jolt body). The same three
   // steps MobSystem::LoadState takes for a carved limb, and for the same
@@ -3125,7 +3155,12 @@ class MobSystem {
   // body it did not drop is a thing you can pick up (Mob::LostGear). Not
   // fired for a shell consumed by fire (there is no body) nor for the rags a
   // piece sheds beside its identity shell.
-  void SetOnItemShed(std::function<void(uint64_t, const std::string&)> cb) {
+  // The third argument is the piece's DYE (game/dye.h), 0 for undyed and for
+  // everything that is not a coloured garment. The body already RENDERS in it
+  // (MicroBodyRef::dye travelled with the adopt); this is what lets the ground
+  // registry hand the same colour back when somebody picks it up.
+  void SetOnItemShed(
+      std::function<void(uint64_t, const std::string&, uint32_t)> cb) {
     onItemShed_ = std::move(cb);
   }
   // A CREATURE FELL WITH THINGS ON IT. Called once from Mob::Die with the
@@ -3160,7 +3195,8 @@ class MobSystem {
   // AI that chooses to put a helmet on is out of scope — but the API is what
   // makes "the goblin is wearing the helmet it dropped" content rather than a
   // feature.
-  bool WearItem(uint64_t mobId, const ItemDef* item, int equipSlot);
+  bool WearItem(uint64_t mobId, const ItemDef* item, int equipSlot,
+                uint32_t dye = 0);
   bool UnwearItem(uint64_t mobId, int equipSlot);
 
   // Once per tick BEFORE debris.PreTick: kinematic walk drive, terrain
@@ -4012,7 +4048,7 @@ class MobSystem {
   // its weapon BY NAME and the swing looks it up.
   StyleLibrary styles_;
   const ItemLibrary* items_ = nullptr;
-  std::function<void(uint64_t, const std::string&)> onItemShed_;
+  std::function<void(uint64_t, const std::string&, uint32_t)> onItemShed_;
   std::function<void(const CorpseReport&)> onCorpse_;
   std::vector<BlockEvent> blocks_;
   // The player's body, registered by main.cpp so the handle-keyed lookups can

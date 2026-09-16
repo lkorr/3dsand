@@ -999,6 +999,12 @@ void Overlay::Draw(UIState& s) {
     if (ImGui::Button("NPC AI...")) s.aiWindowOpen = !s.aiWindowOpen;
     ImGui::SameLine();
     ImGui::TextDisabled("%d live", (int)s.aiMobIds.size());
+    // Beside the AI button because the two are used together: you spawn a
+    // villager and then you dress it.
+    if (ImGui::Button("Wardrobe..."))
+      s.wardrobeWindowOpen = !s.wardrobeWindowOpen;
+    ImGui::SameLine();
+    ImGui::TextDisabled("dye a set of clothes");
   }
   // Off the MELEE tool, which is the one context where every knob in the panel
   // is about what you are currently doing. Deliberately not off the mob tool
@@ -1227,6 +1233,99 @@ void Overlay::Draw(UIState& s) {
         }
         ImGui::EndTabBar();
       }
+    }
+    ImGui::End();
+  }
+
+  // ---- WARDROBE window (game/dye.h) ---------------------------------------
+  //
+  // THREE PATTERNS AND A COLOUR WHEEL. The clothes in assets/items are painted
+  // in greyscale — every cell a multiplier rather than a pigment
+  // (scripts/gen_peasant_clothes.py) — so what comes out of this window is a
+  // pattern index and one packed RGB word, and the same nine .vox files dress
+  // an entire village in nine hundred different outfits.
+  //
+  // Same shape as the AI window below: the overlay owns no game state, the
+  // combos are mirrors main.cpp rebuilds off the live item library, and every
+  // button is a one-shot bool main.cpp consumes. That is also what makes the
+  // picker survive an R hot-reload — see UIState's wardrobe block.
+  if (s.wardrobeWindowOpen) {
+    ImGui::SetNextWindowPos(ImVec2(300, 60), ImGuiCond_FirstUseEver);
+    ImGui::SetNextWindowSize(ImVec2(360, 560), ImGuiCond_FirstUseEver);
+    if (ImGui::Begin("Wardrobe", &s.wardrobeWindowOpen)) {
+      ImGui::TextDisabled("three patterns per slot, any colour:");
+      ImGui::TextDisabled("the art is a greyscale weave and the");
+      ImGui::TextDisabled("colour is applied at shade time, so the");
+      ImGui::TextDisabled("seams, hems and mends survive the dye");
+      ImGui::Separator();
+
+      auto combo = [&](const char* label, const std::vector<std::string>& names,
+                       int& pick) {
+        if (names.empty()) {
+          ImGui::TextDisabled("%s: no dyeable pieces in items.json", label);
+          return;
+        }
+        if (pick >= (int)names.size()) pick = 0;
+        ImGui::SetNextItemWidth(150);
+        // "##" so three combos of the same shape cannot hash together.
+        const std::string id = std::string(label) + "##wardrobe";
+        if (ImGui::BeginCombo(id.c_str(), names[pick].c_str())) {
+          for (int i = 0; i < (int)names.size(); i++) {
+            ImGui::PushID(i);
+            if (ImGui::Selectable(names[i].c_str(), i == pick)) pick = i;
+            ImGui::PopID();
+          }
+          ImGui::EndCombo();
+        }
+      };
+      combo("shirt", s.wardrobeShirts, s.wardrobeShirtPick);
+      combo("legs", s.wardrobeLegs, s.wardrobeLegsPick);
+      combo("feet", s.wardrobeFeet, s.wardrobeFeetPick);
+
+      ImGui::Separator();
+      // THE COLOUR WHEEL. PickerHueWheel rather than the bar-and-square: a
+      // wheel is the one picker where "somewhere over there in the greens" is a
+      // single gesture, which is what choosing a villager's shirt actually is.
+      // No alpha, no input boxes — a dye has neither.
+      ImGui::ColorPicker3("##wardrobedye", s.wardrobeColor,
+                          ImGuiColorEditFlags_PickerHueWheel |
+                              ImGuiColorEditFlags_NoSidePreview |
+                              ImGuiColorEditFlags_NoInputs |
+                              ImGuiColorEditFlags_NoLabel);
+      // The name main.cpp mirrored for this colour, beside a swatch of it. The
+      // name is what ends up in the item's tooltip, so showing it here is how
+      // you find out that the thing you picked is going to be called "rust".
+      ImGui::ColorButton("##wardrobeswatch",
+                         ImVec4(s.wardrobeColor[0], s.wardrobeColor[1],
+                                s.wardrobeColor[2], 1.0f),
+                         0, ImVec2(28, 28));
+      ImGui::SameLine();
+      ImGui::TextUnformatted(s.wardrobeColorName.empty()
+                                 ? "(undyed)"
+                                 : s.wardrobeColorName.c_str());
+      ImGui::SameLine();
+      if (ImGui::Button("random##wardrobe")) s.wardrobeRandomColor = true;
+
+      ImGui::Separator();
+      if (ImGui::Button("into the pack##wardrobe")) s.wardrobeSpawnSet = true;
+      ImGui::SameLine();
+      ImGui::TextDisabled("hotbar, else the bag");
+      if (ImGui::Button("...and put it on##wardrobe")) s.wardrobeWearSet = true;
+      ImGui::SameLine();
+      ImGui::TextDisabled("straight into the equip slots");
+      if (ImGui::Button("re-dye what I'm wearing##wardrobe"))
+        s.wardrobeDyeWorn = true;
+      ImGui::SameLine();
+      ImGui::TextDisabled("every dyeable piece on the body");
+      if (!s.wardrobeStatus.empty()) {
+        ImGui::Separator();
+        ImGui::TextWrapped("%s", s.wardrobeStatus.c_str());
+      }
+      ImGui::Separator();
+      ImGui::TextDisabled("a dye is PAINT, not a material: dyed linen");
+      ImGui::TextDisabled("burns, tears and soaks blood exactly as");
+      ImGui::TextDisabled("undyed linen does, and a sleeve cut off");
+      ImGui::TextDisabled("keeps its colour on the ground");
     }
     ImGui::End();
   }

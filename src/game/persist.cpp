@@ -161,6 +161,29 @@ void SavePlayerKitBytes(const PlayerKitRefs& r, std::vector<uint8_t>& out, uint3
     PutU32(out, (uint32_t)k);
     PutStr(out, k == SlotKind::Page ? gi.PageAt(i) : glyphName(gi.At(i)));
   }
+  if (version < 5) return;
+
+  // ---- v5: the dyes (game/dye.h) --------------------------------------------
+  //
+  //   u32 hotbarCount  then per slot: u32 dye
+  //   u32 bagCount     then per slot: u32 dye
+  //   u32 equipCount   then per slot: u32 dye
+  //
+  // A PARALLEL ARRAY, appended, rather than a fourth field on each slot record
+  // — see kPlayerKitSaveVersion's note: the slot section is the first thing in
+  // the payload and widening it would make every older payload unreadable, for
+  // a value whose absence means precisely "undyed".
+  //
+  // Self-describing counts for the same reason the slot section's are: a build
+  // whose Bag::kSlots has changed reads an older file correctly instead of
+  // walking off the end.
+  auto putDyes = [&](const ItemStack* v, int n) {
+    PutU32(out, (uint32_t)n);
+    for (int i = 0; i < n; i++) PutU32(out, v[i].Empty() ? 0u : v[i].dye);
+  };
+  putDyes(r.hotbar->slots, kItemSlots);
+  putDyes(r.kit->bag.slots, Bag::kSlots);
+  putDyes(r.kit->equip.slots, kEquipSlotCount);
 }
 
 bool LoadPlayerKit(const PlayerKitRefs& r, const uint8_t* data, size_t len,
@@ -290,6 +313,23 @@ bool LoadPlayerKit(const PlayerKitRefs& r, const uint8_t* data, size_t len,
       }
     }
   }
+  // ---- v5: the dyes ----------------------------------------------------------
+  // Applied only to slots that actually resolved to something: a dye on a slot
+  // whose item is gone would be a colour attached to nothing, and the stack is
+  // already empty by here.
+  if (version >= 5) {
+    auto getDyes = [&](ItemStack* v, int n) {
+      const uint32_t count = rd.U32();
+      for (uint32_t i = 0; i < count && rd.ok; i++) {
+        const uint32_t d = rd.U32();
+        if (!rd.ok || (int)i >= n) continue;
+        if (!v[i].Empty()) v[i].dye = d;
+      }
+    };
+    getDyes(r.hotbar->slots, kItemSlots);
+    getDyes(r.kit->bag.slots, Bag::kSlots);
+    getDyes(r.kit->equip.slots, kEquipSlotCount);
+  }
   if (dropped > 0)
     std::fprintf(stderr,
                  "PLYR: %d saved entries name content that no longer exists; "
@@ -323,6 +363,11 @@ void SaveWorldItems(const WorldItemRefs& r, std::vector<uint8_t>& out) {
   PutU32(out, (uint32_t)all.size());
   for (const WorldItem& w : all) {
     PutStr(out, w.item);
+    // v2: THE DYE (game/dye.h). Written next to the name because it is the
+    // other half of what the thing on the ground IS — a dropped red tunic and
+    // a dropped blue one share a name and a lattice, and the word is not
+    // recoverable from either.
+    PutU32(out, w.dye);
     BodyTransform xf{};
     r.phys->GetTransform(w.body, xf);
     PutF32(out, xf.pos.x);
@@ -354,7 +399,10 @@ void SaveWorldItems(const WorldItemRefs& r, std::vector<uint8_t>& out) {
 
 bool LoadWorldItems(const WorldItemRefs& r, const uint8_t* data, size_t len,
                     uint32_t version) {
-  if (version != kWorldItemSaveVersion) {
+  // A RANGE, not an equality. v2 inserts one word per entry and everything
+  // else about the record is unchanged, so a v1 payload still reads exactly as
+  // it did — with no dyes, which is what it had.
+  if (version > kWorldItemSaveVersion || version < 1) {
     std::fprintf(stderr, "ITMS: unknown version %u (this build writes %u)\n",
                  version, kWorldItemSaveVersion);
     return false;
@@ -364,6 +412,7 @@ bool LoadWorldItems(const WorldItemRefs& r, const uint8_t* data, size_t len,
   int dropped = 0;
   for (uint32_t i = 0; i < n && rd.ok; i++) {
     const std::string name = rd.Str();
+    const uint32_t dye = version >= 2 ? rd.U32() : 0u;
     const uint32_t bx = rd.U32(), by = rd.U32(), bz = rd.U32();
     if (!rd.ok) break;
     Vec3 at{};
@@ -397,7 +446,7 @@ bool LoadWorldItems(const WorldItemRefs& r, const uint8_t* data, size_t len,
       continue;
     }
     DropItemToWorld(*d, at, Vec3{}, *r.phys, *r.debris, r.micro, *r.reg,
-                    lat.empty() ? nullptr : &lat);
+                    lat.empty() ? nullptr : &lat, dye);
   }
   if (dropped > 0)
     std::fprintf(stderr,

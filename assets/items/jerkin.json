@@ -1,0 +1,40 @@
+{
+  "comment": "The jerkin, a DYEABLE commoner garment: one shell per covered limb, each of which becomes a real rig slot on the wearer and therefore burns, dissolves, carves, severs and drops exactly as a limb does. The art is a GREYSCALE WEAVE \u2014 every cell is a multiplier on the wearer's dye (game/dye.h), not a colour \u2014 so one pattern covers every colour anybody picks. Geometry is the stock human's own silhouette dilated outward by one authored micro. Regenerate with scripts/gen_peasant_clothes.py; `offset` and `fitBox` are MEASURED off gen_human.py's limb table, so editing them by hand puts the garment off the body.",
+  "name": "jerkin",
+  "artVoxelsPerMetre": 80,
+  "hp": 44.0,
+  "severable": true,
+  "dyeable": true,
+  "cover": [
+    {
+      "part": "hips",
+      "model": "hips",
+      "offset": [
+        -2,
+        0,
+        -2
+      ],
+      "fitBox": [
+        20,
+        20,
+        12
+      ],
+      "hp": 22.0
+    },
+    {
+      "part": "torso",
+      "model": "torso",
+      "offset": [
+        -2,
+        0,
+        -2
+      ],
+      "fitBox": [
+        20,
+        36,
+        12
+      ],
+      "hp": 22.0
+    }
+  ]
+}

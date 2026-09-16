@@ -568,7 +568,7 @@ Status GateArmorWear(Ctx& c, std::string& detail) {
   // rag. The sword knocked from the hand takes the same road.
   {
     std::vector<std::pair<uint64_t, std::string>> shed;
-    mobs.SetOnItemShed([&shed](uint64_t h, const std::string& n) {
+    mobs.SetOnItemShed([&shed](uint64_t h, const std::string& n, uint32_t) {
       shed.push_back({h, n});
     });
     check(mob->WearItem(&robe, chestSlot), "the robe goes on for the cut");

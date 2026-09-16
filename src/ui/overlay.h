@@ -407,6 +407,39 @@ struct UIState {
   std::string aiLastBlock;
   int aiBlockCount = 0;
 
+  // ---- WARDROBE (game/dye.h, scripts/gen_peasant_clothes.py) --------------
+  //
+  // The colour half of the commoner clothes. The art is nine greyscale
+  // patterns whose cells are multipliers; the colour arrives at runtime as one
+  // packed word, so a shirt, a pair of trousers and a pair of shoes plus a
+  // point on a colour wheel is a whole outfit nobody had to draw.
+  //
+  // SAME SHAPE AS THE AI PANEL ABOVE, deliberately, down to the one-shot
+  // bools: the overlay owns no game state, the pickers are mirrors main.cpp
+  // rebuilds off the LIVE item library on every R, and the selection is
+  // re-found BY NAME afterwards — so adding a tenth pattern to
+  // gen_peasant_clothes.py and hitting R puts it in the combo without
+  // disturbing what is already picked.
+  bool wardrobeWindowOpen = false;
+  // The dye, as the picker's own 0..1 RGB. Packed by main.cpp when it spawns,
+  // never here — UIState is a POD the overlay may only read and write, and
+  // packing it here would put game/dye.h in the UI's dependency set for no
+  // gain.
+  float wardrobeColor[3] = {0.42f, 0.22f, 0.58f};
+  // Dyeable pieces by slot, mirrored from the item library. Entry 0 of each is
+  // "(none)", so an outfit of trousers and nothing else is expressible without
+  // a second button.
+  std::vector<std::string> wardrobeShirts, wardrobeLegs, wardrobeFeet;
+  int wardrobeShirtPick = 0, wardrobeLegsPick = 0, wardrobeFeetPick = 0;
+  bool wardrobeSpawnSet = false;   // one-shot: the whole outfit into the pack
+  bool wardrobeWearSet = false;    // one-shot: ...and put it on
+  bool wardrobeRandomColor = false;  // one-shot: reroll wardrobeColor
+  bool wardrobeDyeWorn = false;    // one-shot: recolour what is already worn
+  std::string wardrobeStatus;      // what the last button did
+  // What the picked colour is CALLED (game/dye.h DyeName), mirrored per frame
+  // so the overlay does not need the header.
+  std::string wardrobeColorName;
+
   std::vector<std::string> materialNames;  // index == material id
   std::vector<uint32_t> materialColors;    // 0xAABBGGRR swatch (gpu color0)
   bool visible = true;
@@ -628,6 +661,18 @@ struct UIState {
     float condition = 1.0f;
     bool wearable = false;
     bool ruined = false;
+    // ---- the DYE (game/dye.h) ------------------------------------------------
+    // The item's colour as a 0xAABBGGRR swatch ImGui can draw directly, and 0
+    // for undyed — which is every weapon, every plate piece and every garment
+    // nobody has coloured. Pre-converted by main.cpp rather than handed over
+    // packed, so this panel keeps its "reads UIState, knows no headers" shape.
+    //
+    // This is the whole reason a dyed item is legible in the pack at all. The
+    // icon is drawn from a sprite atlas keyed on KIND, so three tunics in three
+    // colours are three identical pictures; the swatch is what tells them
+    // apart, and `dyeName` is what the tooltip says out loud.
+    uint32_t dyeSwatch = 0;
+    std::string dyeName;
   };
   std::vector<KitSlotUI> bagSlots;      // Bag::kSlots, row-major
   std::vector<KitSlotUI> hotbarSlots;   // kItemSlots

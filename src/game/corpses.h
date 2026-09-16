@@ -190,7 +190,12 @@ inline LootResult TakeCorpseLoot(CorpseReport& corpse, int index, KitRef dest,
     if (dest.space == KitSpace::Equip &&
         !EquipSlotAccepts(dest.index, def->kind))
       return LootResult::WrongKind;
-    if (!d->Empty() && d->def != di && kit.bag.FirstFree() < 0)
+    // A slot holding the same def in a DIFFERENT colour is not a stack this
+    // can grow (game/dye.h): it swaps, so it needs the bag free exactly as a
+    // different item would.
+    if (!d->Empty() &&
+        (d->def != di || d->dye != corpse.gear[index].dye) &&
+        kit.bag.FirstFree() < 0)
       return LootResult::NoRoom;
   }
 
@@ -199,22 +204,25 @@ inline LootResult TakeCorpseLoot(CorpseReport& corpse, int index, KitRef dest,
   corpse.gear.erase(corpse.gear.begin() + index);
   if (outItem) *outItem = piece.item;
 
+  // THE COLOUR COMES WITH IT (game/dye.h). It is carried on the piece rather
+  // than re-derived, because there is nothing to re-derive it from: a dye is
+  // not recoverable from the greyscale art it colours.
   if (dest.space == KitSpace::None) {
-    int where = kit.bag.Add(di, 1);
-    if (where < 0) where = hotbar.Add(di, 1);
+    int where = kit.bag.Add(di, 1, piece.dye);
+    if (where < 0) where = hotbar.Add(di, 1, piece.dye);
     (void)where;   // proven above
   } else {
     ItemStack* d = kit.Resolve(dest, hotbar);
     if (d->Empty()) {
-      *d = ItemStack{di, 1};
-    } else if (d->def == di) {
+      *d = ItemStack{di, 1, piece.dye};
+    } else if (d->def == di && d->dye == piece.dye) {
       d->count++;
     } else {
       // SWAP-NEVER-OVERWRITE, with the pack standing in for the corpse as the
       // other end: what was in the slot goes to the first free bag slot.
       const int free = kit.bag.FirstFree();
       kit.bag.slots[free] = *d;
-      *d = ItemStack{di, 1};
+      *d = ItemStack{di, 1, piece.dye};
     }
   }
 
@@ -268,7 +276,10 @@ inline bool ShedCorpseLoot(CorpseReport& corpse, int index,
   // the ground registry FIRST, so the shed robe reads as a robe, and when it
   // is picked up its release fires OnBodyGone, which is what takes it out of
   // the heap. One door out, the same one every other body uses.
-  ground.Add(piece.body, piece.item);
+  // ...in the colour it was worn in: the body already renders dyed (its
+  // MicroBodyRef carries the word), and this is the copy that makes picking it
+  // up hand back the same garment (game/dye.h).
+  ground.Add(piece.body, piece.item, piece.dye);
   for (uint64_t r : piece.rags) debris.DestroyBody(r);
   return true;
 }

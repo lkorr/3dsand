@@ -1,0 +1,40 @@
+{
+  "comment": "The footwraps, a DYEABLE commoner garment: one shell per covered limb, each of which becomes a real rig slot on the wearer and therefore burns, dissolves, carves, severs and drops exactly as a limb does. The art is a GREYSCALE WEAVE \u2014 every cell is a multiplier on the wearer's dye (game/dye.h), not a colour \u2014 so one pattern covers every colour anybody picks. Geometry is the stock human's own silhouette dilated outward by one authored micro. Regenerate with scripts/gen_peasant_clothes.py; `offset` and `fitBox` are MEASURED off gen_human.py's limb table, so editing them by hand puts the garment off the body.",
+  "name": "footwraps",
+  "artVoxelsPerMetre": 80,
+  "hp": 14.0,
+  "severable": true,
+  "dyeable": true,
+  "cover": [
+    {
+      "part": "foot.L",
+      "model": "foot.L",
+      "offset": [
+        -4,
+        0,
+        -4
+      ],
+      "fitBox": [
+        8,
+        8,
+        14
+      ],
+      "hp": 7.0
+    },
+    {
+      "part": "foot.R",
+      "model": "foot.R",
+      "offset": [
+        -4,
+        0,
+        -4
+      ],
+      "fitBox": [
+        8,
+        8,
+        14
+      ],
+      "hp": 7.0
+    }
+  ]
+}

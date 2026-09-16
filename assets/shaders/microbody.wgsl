@@ -80,8 +80,11 @@ struct BodyXform {
 // its 16-byte static_assert is the only mechanical guard the pair has — nothing
 // checks this layout, so the struct must not grow. 0 bitcasts to 0.0, which is
 // what debris bodies keep passing.
+// `dye_bits` is the garment DYE (src/game/dye.h): bit 24 set = dyed, low 24
+// bits the colour in unpackColor's own byte order. 0 = undyed, which is every
+// body limb, every piece of debris and every garment nobody has coloured.
 struct MicroBodyInst {
-  slot : u32, model : u32, flash_bits : u32, _b : u32,
+  slot : u32, model : u32, flash_bits : u32, dye_bits : u32,
 };
 @group(1) @binding(3) var<storage, read> insts : array<MicroBodyInst>;
 
@@ -125,7 +128,38 @@ struct VSOut {
   // carries none -- bit 30 of the dims word (sim/microbody.h). A shared def
   // model never has one; a body grows one the first time it is bloodied.
   @location(9) @interpolate(flat) stainBase : u32,
+  // THE DYE, already unpacked, and its flag as a separate float so the
+  // fragment does no bit work at all. Flat and carried here for the same
+  // reason `flash` is: it is constant across the instance, and refetching
+  // insts[] per fragment is a dependent storage load on every pixel a garment
+  // covers. `dyeOn` is 0.0 or 1.0 so the blend below is a mix() rather than a
+  // branch — a branch on a value that is uniform across the whole draw call
+  // still costs the divergent path on some drivers, and mix() cannot.
+  @location(10) @interpolate(flat) dye : vec3f,
+  @location(11) @interpolate(flat) dyeOn : f32,
 };
+
+// ---- THE DYE REFERENCE TONE (src/game/dye.h kDyeRef) ------------------------
+//
+// A garment authored for dyeing is painted in GREYSCALE, and each cell's grey
+// is a MULTIPLIER rather than a colour: a cell at this value renders as exactly
+// the colour the player picked, one at half it renders at half, and the weave,
+// the seams and the hems all survive being recoloured because they are ratios
+// rather than pigments. One divide, at the one place albedo is decided.
+//
+// STATED IN THREE PLACES AND CHECKED IN TWO: here (the GPU), kDyeRef in
+// src/game/dye.h (the UI's preview), and DYE_REF_GREY in
+// scripts/gen_peasant_clothes.py (what the art is actually painted at, which
+// asserts against its own ramp). A disagreement is not a crash — it is every
+// dyed garment in the game coming out uniformly too bright or too dark with
+// the cause two files away — so `--gate items` compares this literal against
+// the header's.
+//
+// DECLARED HERE, NOT IN common.wgsl. This is the only shader that dyes
+// anything, and a common.wgsl edit misses the SPIR-V cache for every shader in
+// the engine — measured at 536 s of pipeline compile for eight constants
+// (CLAUDE.md, "What needs a rebuild").
+const DYE_REF : f32 = 0.70;
 
 // vi in 0..35 -> a corner of the unit box. Every face must wind the SAME way
 // around its own outward normal, or `cullMode: Front` keeps a different subset
@@ -196,6 +230,11 @@ fn vs(@builtin(vertex_index) vi : u32,
   out.scale = scale;
   out.slot = slot;
   out.flash = bitcast<f32>(insts[inst].flash_bits);
+  let dyeBits = insts[inst].dye_bits;
+  // unpackColor is the same decode the art palette uses, which is exactly why
+  // the CPU packs the dye in that byte order (src/game/dye.h).
+  out.dye = unpackColor(dyeBits & 0xFFFFFFu);
+  out.dyeOn = select(0.0, 1.0, (dyeBits & 0x1000000u) != 0u);
   out.cut = microBodyCutFaces(m);
   // Payload is 2 voxels per word; the stain lattice sits right after it.
   let cells = u32(dims.x * dims.y * dims.z);
@@ -533,6 +572,30 @@ fn fs(in : VSOut) -> FSOut {
   } else {
     albedo = paletteJitter(mat, u32(c.x * 7 + c.y * 13 + c.z * 29));
   }
+  // ---- THE DYE (src/game/dye.h) --------------------------------------------
+  //
+  // A dyed instance's art is a greyscale weave, so its albedo carries no hue
+  // of its own and everything it does carry is TONE: the base cloth, the
+  // shadow threads, the hem, the lacing, the patch. Multiplying the picked
+  // colour by that tone over the reference grey reproduces the picked colour
+  // exactly where the cloth is plain and keeps every one of those markings as
+  // a ratio of it. Nine patterns times any colour is the whole wardrobe.
+  //
+  // LUMINANCE, not a per-channel multiply. The two are identical on the
+  // greyscale art this is for, and they differ on art that is NOT greyscale —
+  // where per-channel would tint (the robe's black stays black, its gold trim
+  // turns a muddy version of the dye) and luminance re-colours outright. The
+  // second is the behaviour somebody dyeing a thing expects, and it means a
+  // dye applied to an un-dyeable piece is merely wrong rather than invisible.
+  //
+  // BEFORE the stain, deliberately: blood goes ON the cloth, so it must not be
+  // scaled by the cloth's colour. Same order the ground uses for its own
+  // stains, and the same reason.
+  albedo = mix(albedo,
+               in.dye * (dot(albedo, vec3f(0.2126, 0.7152, 0.0722)) /
+                         DYE_REF),
+               in.dyeOn);
+
   // Blood (or whatever else soaked in) OVER the art, before lighting, exactly
   // where the ground applies its own stain: a stain is a change to what the
   // surface is, and it has to take the scene's light like the skin under it.

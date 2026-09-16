@@ -1707,16 +1707,51 @@ constexpr uint32_t kMicroPoolWordsWorld = 1u << 20;
 // for that at all.
 //
 // The buffer is allocated at this size UNCONDITIONALLY (simulation.cpp), so this
-// number is VRAM every world pays whether or not it has a micro body. 1 MiW =
-// 4 MiB buys room for ~4M micro voxels — a fleet of 8x-skin characters — while
-// staying in the same order as the static pool above rather than quietly
-// becoming the largest buffer in the engine. It remains a HARD ceiling (rule 2):
-// past it MicroBodyOwn fails and the body keeps a stale skin, which is the
-// documented graceful degradation, not an unbounded allocation.
-constexpr uint32_t kMicroBodyPoolWordsWorld = 1u << 20;
-// Per-limb model records, indexed by body slot through kMaxBodySlots-sized
-// slot table. One record per (def, limb) pair across every loaded mob def.
-constexpr uint32_t kMaxMicroBodyModels = 256;
+// number is VRAM every world pays whether or not it has a micro body. It remains
+// a HARD ceiling (rule 2): past it MicroBodyOwn fails and the body keeps a stale
+// skin, which is the documented graceful degradation, not an unbounded
+// allocation.
+//
+// 2 MiW = 8 MiB, DOUBLED 2026-09-15 to stay behind the model table below rather
+// than in front of it. The two ceilings have to be sized against the same
+// scene or the cheaper one just moves the wall: 148 shared records cost ~200k
+// words at load, and an owned clone is the model's payload plus a stain lattice
+// — about 1.5x — so the ~350 clones a fight's worth of corpses and bloodied
+// creatures can hold live run to ~800k. At 1 MiW the pool would have become the
+// new "gore stopped working" the moment the table stopped being it.
+constexpr uint32_t kMicroBodyPoolWordsWorld = 2u << 20;
+// ---- THE MODEL TABLE IS SHARED RECORDS **PLUS** EVERY OWNED CLONE ----------
+//
+// Two populations, and sizing this to the first one is the bug it shipped with
+// (owner report 2026-09-15: "after killing a bunch of zombies, new zombies
+// spawn with 0 gore and won't get any when I hit them; it fixes itself when I
+// leave the area with the corpses").
+//
+//   SHARED, packed at load, never freed: one record per (def, limb) pair across
+//   every mob def, plus one per garment COVER PANEL and per held item model.
+//   That second half is the one that grew — 87 limb models against 61 item
+//   models on 2026-09-15, 148 of the 256 records gone before a single creature
+//   has been hit, and every new garment is another four.
+//
+//   OWNED, copy-on-write, one per BODY PART that has been damaged, burnt,
+//   bloodied or refitted (sim/microbody.h). A zombie's `rot` block carves ~11
+//   of its 15 limbs at SPAWN, so a corpse is ~11 records and holds them until
+//   it is culled. 108 free records is seven zombies, which is exactly how many
+//   the owner got before every carve, char and blood mark stopped appearing.
+//
+// So the ceiling has to be `shared + the most owned clones that can be live at
+// once`, and the second term is bounded by the render slot table: an owned
+// brick belongs to a drawn body part, and kMaxBodySlots is how many of those
+// there can be. 1024 is that sum with room for the content side to keep
+// growing — 16 KiB of table, uploaded whole every dirty frame, which is still
+// nothing next to the 4 MiB pool the records point into.
+//
+// It remains a HARD ceiling, and past it MicroBodyOwn still refuses and the
+// body keeps a stale skin. What changed alongside this number is that the
+// refusal is no longer SILENT (MicroBodySet::refusals) — a cap whose only
+// symptom is "gore quietly stopped working" is a cap nobody can diagnose.
+static_assert(kMaxBodySlots <= 512, "micro-body model ceiling derived below");
+constexpr uint32_t kMaxMicroBodyModels = 1024;
 // A micro body's model has no micro model when its slot maps here.
 constexpr uint32_t kMicroBodyNoModel = 0xFFFFFFFFu;
 
