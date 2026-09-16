@@ -18,6 +18,23 @@
       }
     },
     {
+      "comment": "THE SPACING FIXTURE'S PROFILE (src/test/selftest_mob.cpp GateCrowd). Mobile, hostile and it WANTS the target -- which is the whole of what a crowd test needs -- with no `attack` intent and no styles at all, so it walks into the scrum and never swings. It exists because `crowd` is a gate about PERSONAL SPACE and a fixture of four ARMED duelists converging on one point is a knife fight: they are held 3.6 voxels apart by the very feature under test, their swords are 8 voxels long, and they are inside each other's arcs by construction. Measured 2026-09-15, with a sword that finally connects (the sweep's probe no longer dies inside the wielder): 11 attack requests, 54 cut ticks and one of the four dead, on a gate whose spacing numbers were passing perfectly. Friendly fire is `duel`'s subject and it has its own gate; asserting it here made the spacing claim hostage to it. Same reason `training_dummy` exists three entries down.",
+      "name": "crowder",
+      "label": "Crowder (spacing fixture)",
+      "color": 3238002687,
+      "faction": "monster",
+      "hysteresis": 0.28,
+      "perception": { "sightRange": 46, "fovDegrees": 300, "requireLos": true, "aggro": "hostile", "alertDecayTicks": 180, "keepRangeScale": 1.45 },
+      "movement": { "mobile": true, "rangeMin": 0, "rangeMax": 2, "bandSlack": 1.4, "approachSpeed": 1.0, "strafeSpeed": 0.5, "retreatSpeed": 0.0, "circleTendency": 0.0, "circleHoldTicks": 34, "repathTicks": 10, "navRadius": 30 },
+      "attack": { "styles": [], "reach": 0, "aimTolerance": 0.4, "cadenceTicks": 0, "jitterTicks": 0, "commitTicks": 0, "disengageTicks": 0 },
+      "intents": {
+        "idle": { "weight": 0.05, "cooldownTicks": 0, "minDwellTicks": 0 },
+        "face": { "weight": 0.45, "cooldownTicks": 0, "minDwellTicks": 4 },
+        "approach": { "weight": 1.15, "cooldownTicks": 0, "minDwellTicks": 8 },
+        "holdRange": { "weight": 1.05, "cooldownTicks": 0, "minDwellTicks": 8 }
+      }
+    },
+    {
       "comment": "A dummy of a DIFFERENT FACTION, so a hostile creature will actually pick it as a target. `dummy` is faction \"monster\" and so is everything that would swing at it, which makes it a training partner nobody attacks. Otherwise identical: blind, passive, immobile.",
       "name": "training_dummy",
       "label": "Training dummy (quarry)",

@@ -3561,9 +3561,33 @@ float MobSystem::StyleReachOn(const Mob& mob, const AttackStyle& sty) const {
       // air). The edge is read off the live weapon, which is the same segment
       // the sweep is about to probe with, so a chipped or re-authored blade
       // moves this number with it.
+      // ---- AND THE ARM DELIVERS A QUARTER OF ITSELF, NOT TWO THIRDS -----
+      //
+      // The first version of this took `armReach * 0.65 + the blade`, and for
+      // a sword that came out at 11.25 voxels -- LONGER THAN THE BLOW LANDS.
+      // Measured through `--shot-strike human+sword horizontal_r human` at its
+      // own derived stand-off of 11: `120 rays cast, 120 found air`, the point
+      // 2.3 voxels short of the victim's nearest voxel. A horizontal cut is
+      // ACROSS the body, so at the moment it passes the target the blade is
+      // not extended toward it, and the hand is held at `handExtend` of its
+      // band rather than at the end of the arm.
+      //
+      // A creature that commits from further than its weapon lands is not a
+      // cosmetic error: it swings early and often, and in a crowd it swings
+      // into its neighbours. That is what took `crowd` from four survivors to
+      // three -- four armed duelists converging on one point, 11 attack
+      // requests and 54 cut ticks between them, worst survivor on 261 hp of
+      // 345 -- on a gate whose subject is personal space and which had never
+      // been a knife fight before.
+      //
+      // A quarter of the arm is what the two weapons in the repo agree on: a
+      // sword lands at about 9 (npc-strike's fixture has used a 9-voxel gap
+      // since it was written) and a mace at about 6 (which is the stand-off
+      // package C photographed it working at). Same shape as the natural
+      // weapon's term above, and re-measurable the same way.
       Vec3 hand{};
       float armR = 0.0f;
-      if (mob.WeaponArmPose(hand, armR)) effector = armR * 0.65f;
+      if (mob.WeaponArmPose(hand, armR)) effector = armR * 0.25f;
       Vec3 eb{}, et{};
       float ehw = 0.0f;
       if (mob.WeaponEdge(eb, et, ehw)) effector += (et - eb).len();
@@ -3618,6 +3642,13 @@ float MobSystem::AttackReachOf(const Mob& mob) const {
   // draw uses rather than from a second rule. `BeginStroke` then refuses the
   // styles the creature is too far away FOR, so the pair is "close to the
   // furthest thing you can do, then do whatever fits".
+  //
+  // MAKING THE PROFILE A FALLBACK RATHER THAN A FLOOR WAS TRIED AND REVERTED
+  // (2026-09-15). It is the right shape -- a creature should not commit from
+  // a distance no style it owns can serve -- and it cost `ai-approach` and
+  // `corpse-armor`, which are tuned around the band a duelist keeps. The
+  // change belongs with a pass over those two fixtures, not smuggled in
+  // behind a spacing fix.
   for (const std::string& n : pr->attack.styles) {
     const AttackStyle* s = styles_.At(styles_.Find(n));
     if (s == nullptr) continue;
