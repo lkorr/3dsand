@@ -1292,6 +1292,10 @@ void Overlay::Draw(UIState& s) {
             }
             ImGui::TextDisabled("the blade decides the wound: reach, cut");
             ImGui::TextDisabled("depth and heft all come off its own art");
+            ImGui::TextDisabled("\"fists\" is a weapon now, not the absence of");
+            ImGui::TextDisabled("one: a bare hand bruises and never severs,");
+            ImGui::TextDisabled("and a mace beats plate in where a sword");
+            ImGui::TextDisabled("skates off it");
           }
           if (ImGui::Button("dummy##ai")) s.aiSpawnDummy = true;
           ImGui::SameLine();

@@ -961,6 +961,13 @@ export function buildSkeleton(sidecar, models) {
       minChainsLost: +s.minChainsLost || 0,
       clip: s.clip || '',
       speedScale: s.speedScale ?? 1.0,
+      // mob.cpp:1532 -- HOW FAR THIS STATE CAN THROW ITSELF, as a fraction of
+      // an authored `lunge`. Defaults to `speedScale` because the two answer
+      // the same question about the same body: a crawler that walks at 0.3 of
+      // its own speed pounces at 0.3 of its own leap, and a state that wanted
+      // them different would say so. The Attacks lane reads it to time the arc
+      // it draws (attacks.js, the lunge timeline).
+      lungeScale: s.lungeScale ?? (s.speedScale ?? 1.0),
       disableGait: !!s.disableGait,
       bodyYOffset: +s.bodyYOffset || 0,
       // >0 = PRONE: the engine fits a plane through the ground under the
@@ -1075,6 +1082,70 @@ export function animApplySpineTwist(sk, st, yawRight, pitchUp, rootLimb) {
     if (i < (st.partAlive?.length ?? 0) && !st.partAlive[i]) continue;
     st.local[i].rot = qnorm(qmul(st.local[i].rot, d));
   }
+}
+
+/**
+ * mob.cpp:14683 Mob::ApplyAimPart — TURN ONE PART, AND A SHARE OF THE SPINE,
+ * TOWARD SOMETHING.
+ *
+ * The other way a part can be pointed at a target, and the one the jaws use:
+ * no chain, no solver, no reach band. The part is rotated about ITS OWN JOINT
+ * and the spine takes an authored share of the YAW so the chest turns into the
+ * aim instead of a head swivelling on a rigid torso.
+ *
+ * PRE-FLATTEN, and that is not a detail. This writes `st.local[]` because it
+ * rotates a part about its joint and shares the yaw with the spine ABOVE it;
+ * the flatten is what carries both to the part and to everything under it. An
+ * aim written after the flatten (where the IK and the weapon arm live) would
+ * be a write nobody reads — mob.cpp says exactly this in ApplyWeaponArm's
+ * stage 0, which returns early for the same reason.
+ *
+ * THE ROOT LIMB IS NOT PART OF THE SPINE HERE even though it carries the tag:
+ * rotating the root yaws the entire rig, legs and all, so the part turns with
+ * the body it is measured against and reads on screen as not turning at all.
+ *
+ * `yaw` is a heading delta in the rig's own convention (0 = +Z, positive
+ * toward +X) and `pitch` is positive UP; the negation below is the same one
+ * mob.cpp states — a positive rotation about model +X pitches the nose DOWN
+ * (scripts/geometry.py: +90 about X takes +Z to -Y).
+ */
+export function animApplyAimPart(sk, st, part, yaw, pitch, weight, spineShare,
+                                 rootLimb) {
+  if (part < 0 || part >= sk.parts.length || part >= st.local.length) return;
+  if (part < (st.partAlive?.length ?? 0) && !st.partAlive[part]) return;
+  const w = Math.max(0, Math.min(1, weight));
+  if (w <= 1e-4) return;
+  if (Math.abs(yaw) < 1e-4 && Math.abs(pitch) < 1e-4) return;
+  yaw *= w;
+  pitch *= w;
+
+  let spineTotal = 0;
+  const share = Math.max(0, Math.min(1, spineShare || 0));
+  if (share > 1e-4) {
+    let nSpine = 0;
+    for (let i = 0; i < sk.parts.length; i++)
+      if (sk.parts[i].tag === 'spine' && i !== rootLimb) nSpine++;
+    if (nSpine > 0) {
+      // Split across however many spine joints the rig has, so a three-segment
+      // back twists the same TOTAL amount as a single torso rather than three
+      // times as far.
+      const per = yaw * share / nSpine;
+      for (let i = 0; i < sk.parts.length; i++) {
+        if (sk.parts[i].tag !== 'spine' || i === rootLimb) continue;
+        if (i < (st.partAlive?.length ?? 0) && !st.partAlive[i]) continue;
+        if (i >= st.local.length) continue;
+        st.local[i].rot = qnorm(qmul(st.local[i].rot,
+                                     qaxisangle(v3(0, 1, 0), per)));
+        spineTotal += per;
+      }
+    }
+  }
+  // The part only needs the REMAINDER — it inherits the spine's share through
+  // the flatten, so adding the full yaw at both joints would double it.
+  const partYaw = yaw - spineTotal;
+  const look = qmul(qaxisangle(v3(0, 1, 0), partYaw),
+                    qaxisangle(v3(1, 0, 0), -pitch));
+  st.local[part].rot = qnorm(qmul(st.local[part].rot, look));
 }
 
 /* ============================================================================
