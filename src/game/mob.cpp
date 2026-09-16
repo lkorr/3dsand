@@ -3951,42 +3951,18 @@ void MobSystem::StepStroke(Mob& mob, uint32_t tick, World& world,
   // ---- 3. THE AIM: the target's bearing about THIS mob's shoulder ----------
   //
   // Taken in the mob's own basis so it is the same coordinate the stroke is
-  // integrated in, and about the SHOULDER rather than the mob's origin — an
+  // integrated in, and about the PIVOT rather than the mob's origin — an
   // offset centre smears azimuth into elevation exactly as it does in the
   // swing-plane gate, and this is the number a cut is aimed with.
-  // WHICHEVER JOINT THE STROKE ACTUALLY PIVOTS ABOUT, which is not always a
-  // shoulder any more: for a chain effector it is the chain's ROOT (the
-  // shoulder, or a hip if something ever kicks), and for an aim effector it is
-  // the effector's own parent joint (the chest, for jaws on a neck). Both are
-  // exactly the pivot `WeaponArmPose` measured its hand offset from, which is
-  // the agreement that stops the aim and the pose speaking different frames.
+  // `Mob::StrokePivotWorld` is which joint that is and why; the fallback is a
+  // body-box estimate for a rig that cannot answer.
   Vec3 shoulder{};
-  bool haveShoulder = false;
-  if (effPart >= 0 && effPart < (int)mob.skel_.parts.size()) {
-    int pivot = -1;
-    if (mob.StrikeEffectorKind() == StrikeEffectorMode::Aim) {
-      // THE PART'S OWN JOINT, matching WeaponArmPose (which says at length why
-      // the parent joint was wrong): the head rotates about its neck, so that
-      // is the point the aim is a bearing FROM. Using the chest put the aim and
-      // the pose in two frames a whole neck apart.
-      pivot = effPart;
-    } else {
-      int handPart = -1;
-      if (const IkChain* ch =
-              mob.ChainForEffector(mob.skel_, effPart, handPart))
-        pivot = ch->parts[0];
-    }
-    if (pivot >= 0) haveShoulder = mob.PartJointWorld(pivot, shoulder);
-  }
-  if (!haveShoulder) {
+  if (!mob.StrokePivotWorld(shoulder)) {
     const Vec3 ws = mob.def_->worldSize;
     shoulder = mob.origin_ + Vec3{ws.x * 0.5f, ws.y * 0.82f, ws.z * 0.5f};
   }
-  const Vec3 toTarget = st.targetPoint - shoulder;
-  const Vec3 local{toTarget.dot(right), toTarget.dot(up), toTarget.dot(fwd)};
-  const float lr = std::max(local.len(), 1e-4f);
-  const float liveAz = std::atan2(local.x, local.z);
-  const float liveEl = std::asin(std::clamp(local.y / lr, -1.0f, 1.0f));
+  float liveAz = 0, liveEl = 0, lr = 0;
+  StrokeAimAt(shoulder, st.targetPoint, right, up, fwd, liveAz, liveEl, lr);
 
   // ---- 3b. THE LUNGE (strokes.h StyleLunge; plan §5) ----------------------
   //
@@ -16537,6 +16513,27 @@ bool Mob::WeaponArmPose(Vec3& outHandFromShoulder, float& outReach) const {
     return outReach > 1e-3f;
   }
   return false;
+}
+
+bool Mob::StrokePivotWorld(Vec3& out) const {
+  int effPart = -1, effNatural = -1;
+  StrikeEffectorMode effMode = StrikeEffectorMode::None;
+  if (!ResolveEffector(effPart, effMode, effNatural)) return false;
+  if (effPart < 0 || (size_t)effPart >= skel_.parts.size()) return false;
+  int pivot = -1;
+  if (effMode == StrikeEffectorMode::Aim) {
+    // THE PART'S OWN JOINT, matching WeaponArmPose (which says at length why
+    // the parent joint was wrong): the head rotates about its neck, so that is
+    // the point the aim is a bearing FROM. Using the chest put the aim and the
+    // pose in two frames a whole neck apart.
+    pivot = effPart;
+  } else {
+    int handPart = -1;
+    if (const IkChain* ch = ChainForEffector(skel_, effPart, handPart))
+      pivot = ch->parts[0];
+  }
+  if (pivot < 0) return false;
+  return PartJointWorld(pivot, out);
 }
 
 bool Mob::WeaponStrokePose(Vec3& outHandFromShoulder, Vec3& outTipFromShoulder,

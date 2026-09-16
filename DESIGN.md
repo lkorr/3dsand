@@ -5522,7 +5522,7 @@ The mouse-steer experiment below is preserved intact as `controlMode = 1`, but
 what ships is `0`: a click fires an **authored stroke program** — the same
 `attack_styles.json` entries the NPCs replay, new `player_*` rows with short
 windups and zero jitter — through the same `MeleeState`, with the **camera as
-the basis and (az 0, el 0) as the aim**, so every strike's mid-travel passes
+the basis**, so every strike's mid-travel passes
 through the crosshair line. Direction is picked by the **flick at the press**
 (`game/strike_pick.h`, quantized against the JSON `player` sector map; a
 still-mouse click alternates the two horizontals), one strike buffers during
@@ -5542,6 +5542,28 @@ pre-flatten, so NPCs inherit it) and a **head keep-out** clamp in the driver
 the wielder's own head, in both modes). The `player-styles` gate replays
 every authored style through the player path on the real rig and asserts each
 style's claims from its own authored numbers, head clearance included.
+
+**THE AIM IS A POINT, NOT A DIRECTION (2026-09-16).** The strike tick used to
+pass `(az 0, el 0, dist 0)` — "the camera IS the aim" — which is true of a
+DIRECTION and false of a BLOW. A stroke is a bearing about the **arm's own
+pivot**, and a shoulder sits ~2 voxels under the eye and ~2 to the side, so a
+bearing copied from the camera sends the weapon down a line *parallel* to the
+crosshair and a whole shoulder offset off it: a few degrees at sword reach,
+and a collarbone instead of a head at arm's length. It now resolves a **point**
+— nearest of the first dynamic body down the crosshair line (the rig's own
+limbs excluded, for the reason the E-prompt ray excludes them), the first
+solid voxel marched on the CPU mirror, or a fallback 40 voxels out that
+reproduces the old camera-parallel aim to within a few degrees, so open air is
+unchanged and the two cases meet continuously — and takes its bearing through
+`StrokeAimAt` about `Mob::StrokePivotWorld`, both extracted from the pair
+`MobSystem::StepStroke` was already doing by hand. The ray is
+`player.EyePos()` + `cam.Forward()`, the brush's own pair, so the third-person
+boom cannot move where a strike lands. The distance is real now too, which
+arms the cut-radius clamp (`StepStrokeProgram`'s `toTarget`) that stops a fist
+sailing past a chest two voxels away — it had never fired for the player.
+`player-unarmed` gained an aim pass, a **differential**: one punch twice at
+one fixed point, aimed and camera-parallel, scored as the closest the knuckles
+came — 0.58 vox against 1.82.
 
 **The pose is the hitbox.** A swing does not switch on a hitbox during an
 animation window and it does not test a cone in front of the crosshair. The

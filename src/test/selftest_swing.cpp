@@ -2739,6 +2739,102 @@ Status GatePlayerUnarmed(Ctx& c, std::string& detail) {
   RecordObserved("playerUnarmed.headClearObserved",
                  headMinOverall >= 1e9f ? -1.0 : (double)headMinOverall);
 
+  // ---- 4. THE AIM: A PUNCH LANDS ON WHAT THE CROSSHAIR IS ON --------------
+  //
+  // THE FOURTH SILENT BREAK, and the one the three above cannot see: every
+  // check so far is aimed at OPEN AIR — liveAz/liveEl/liveDist all zero — so a
+  // punch that drives the fist beautifully in entirely the wrong DIRECTION
+  // passes all of them. That was the shipped bug: main.cpp passed (0, 0, 0)
+  // because "the camera IS the aim", which is true of a direction and false of
+  // a blow. The stroke is a bearing about the ARM'S PIVOT, and the shoulder
+  // sits a couple of voxels below the eye and a couple to the side, so a
+  // bearing copied from the camera put the knuckles a whole shoulder offset
+  // low and wide of the thing under the crosshair — the difference between a
+  // head and a collarbone at punching range.
+  //
+  // A DIFFERENTIAL, not an absolute (rule 6): the same punch twice at the same
+  // fixed world point, once aimed at it through `StrokeAimAt` and once with
+  // the old camera-parallel (0, 0, 0), reported as the closest the KNUCKLES
+  // came to the point. One number alone would answer "does a punch go near a
+  // target" with something that depends on where the fixture put the target;
+  // the pair answers "does aiming DO anything", which is the claim.
+  {
+    const int si = lib.Find("player_punch_r");
+    const AttackStyle* sty = lib.At(si);
+    Vec3 eyeish{};
+    if (sty != nullptr && headPart >= 0 &&
+        avatar.PartJointWorld(headPart, eyeish)) {
+      // Four voxels down the crosshair line FROM THE HEAD: inside the arm's
+      // own band, and a full shoulder offset off the line the camera-parallel
+      // aim drives the fist along. Fixed before either run so both are scored
+      // against the same point.
+      const Vec3 target = eyeish + kF * 4.0f;
+      auto runAt = [&](bool aimed) -> float {
+        melee.Reset();
+        ApplyMeleeTuning(melee.tuning);
+        melee.SetHandSign(avatar.HandSign());
+        avatar.ArmForStyle(*sty);
+        StrokeCursor cur;
+        BeginStrokeProgram(cur, *sty, si, 0x504E1u);
+        float best = 1e9f;
+        for (int i = 0; i < 90 && cur.Active(); i++) {
+          Vec3 hand, tip, flat;
+          float reach = 0;
+          if (avatar.WeaponStrokePose(hand, tip, flat, reach))
+            melee.SetStroke(hand, tip, flat, reach);
+          else
+            melee.ClearArm();
+          Vec3 kc;
+          float kr = 0;
+          if (avatar.HeadKeepOut(kc, kr))
+            melee.SetKeepOut(kc, kr);
+          else
+            melee.ClearKeepOut();
+          // main.cpp's strike tick: the pivot off the live rig, the bearing to
+          // the aim point in the swing basis. The control arm passes the zeros
+          // it used to.
+          float az = 0, el = 0, dist = 0;
+          Vec3 pivot;
+          if (aimed && avatar.StrokePivotWorld(pivot))
+            StrokeAimAt(pivot, target, kR, kU, kF, az, el, dist);
+          const StrokeStepResult r = StepStrokeProgram(
+              cur, sty, melee, az, el, dist, kTickDt, kR, kU, kF);
+          if (r == StrokeStepResult::Finished) cur.Reset();
+          avatar.SetWeaponPose(melee.Pose());
+          avTick();
+          Vec3 eb, et, ef;
+          float ehw = 0;
+          if (avatar.WeaponEdge(eb, et, ehw, &ef))
+            best = std::min(best, segPointDist(eb, et, target));
+        }
+        avatar.ClearStrikeEffector();
+        for (int i = 0; i < 12; i++) {
+          melee.Update(kTickDt, false, true, kR, kU, kF);
+          avatar.SetWeaponPose(melee.Pose());
+          avTick();
+        }
+        return best >= 1e9f ? -1.0f : best;
+      };
+      const float blind = runAt(false);
+      const float aimed = runAt(true);
+      const float missMax =
+          (float)BaselineNumber("playerUnarmed.aimMissVox", 1.6);
+      const float gainMin =
+          (float)BaselineNumber("playerUnarmed.aimGainVox", 0.5);
+      check(aimed >= 0.0f && aimed < missMax,
+            "an AIMED punch puts the knuckles on the point the crosshair is "
+            "on");
+      check(blind >= 0.0f && aimed < blind - gainMin,
+            "...and closer to it than the camera-parallel aim it replaced");
+      RecordObserved("playerUnarmed.aimMissObserved", (double)aimed);
+      RecordObserved("playerUnarmed.aimBlindObserved", (double)blind);
+      std::printf(
+          "player-unarmed aim              knuckles came %.2f vox from the aim "
+          "point (camera-parallel: %.2f)\n",
+          aimed, blind);
+    }
+  }
+
   // Pristine terrain for whoever runs next (rule 7).
   avatar.Despawn();
   mobs.Reset();
