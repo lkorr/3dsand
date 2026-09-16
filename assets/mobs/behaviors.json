@@ -49,6 +49,24 @@
       }
     },
     {
+      "comment": "THE RETREATING QUARRY (src/test/selftest_mob.cpp GateAiPursue). The owner's report turned into a fixture: \"enemy mobs need to be able to hit you if you're crouchwalking away from them\". A crouching player walks at player.walkSpeed 1.6 m/s x crouchSpeedScale 0.5 = 0.8 m/s = 8 world voxels a second, and the `human` def that gate spawns walks at 31.5 -- so retreatSpeed 0.25 reproduces a crouchwalk on a body the melee sweep can actually cut. A published player ACTOR could not be the subject: it has no limbs to wound and no hp to take off, so a gate built on one would be measuring attack REQUESTS again, which is the half that was never broken.",
+      "//how": "It back-pedals FACING the attacker, which is what a retreating player does and is also just holdRange's actuator (\"never turn your back to give ground\"). The band is 400..420 so every tick of the fight reports \"much too close\" and the retreat runs at a constant rate instead of tapering as it would near a real band edge. It never swings: no attack intent and no style its library knows. requireLos false so a fixture cannot fail for a line-of-sight flicker at three voxels.",
+      "//speed": "retreatSpeed 0.25 IS the crouchwalk the report named, and the gate DOES NOT USE IT: GateAiPursue clones this profile and overrides the number, because measured against a literal crouchwalk the PRE-FIX duelist does fine (it walks at 31.5, so it wins back the twenty-seven voxels its own step-off gives away inside the same cadence that produced them, and the two arms came out level at 12.2 contacts per 100 ticks against 11.9). A fixture that cannot fail measures nothing. The regime the report is really about is a retreat that is a real fraction of the chase, which is the ordinary case in the game rather than an exotic one -- a WALKING player is 16 vox/s against a zombie's 23.5, and a sprinting one is 31.5, which is a human duelist's entire walk speed. The authored 0.25 is kept because it is the honest documentation of the reported scenario and because any other caller wanting \"a quarry that gives ground\" wants a plausible one.",
+      "name": "retreater",
+      "label": "Retreating quarry (pursuit fixture)",
+      "color": 3238002687,
+      "faction": "quarry",
+      "hysteresis": 0.4,
+      "perception": { "sightRange": 60, "fovDegrees": 360, "requireLos": false, "aggro": "hostile", "alertDecayTicks": 300, "keepRangeScale": 2.0 },
+      "movement": { "mobile": true, "rangeMin": 400, "rangeMax": 420, "bandSlack": 1.0, "approachSpeed": 0, "strafeSpeed": 0, "retreatSpeed": 0.25, "circleTendency": 0, "circleHoldTicks": 24, "repathTicks": 30, "navRadius": 8 },
+      "attack": { "styles": [], "reach": 0, "aimTolerance": 0.45, "cadenceTicks": 0, "jitterTicks": 0, "commitTicks": 0, "disengageTicks": 0, "pursueSpeed": 0, "leadTicks": 0 },
+      "intents": {
+        "idle": { "weight": 0.05, "cooldownTicks": 0, "minDwellTicks": 0 },
+        "face": { "weight": 0.3, "cooldownTicks": 0, "minDwellTicks": 0 },
+        "holdRange": { "weight": 1.0, "cooldownTicks": 0, "minDwellTicks": 0 }
+      }
+    },
+    {
       "comment": "A duelist of the OPPOSING faction, so two of them fight. Identical to `duelist` apart from the faction name.",
       "name": "duelist_blue",
       "label": "Duelist (blue)",
@@ -57,7 +75,7 @@
       "hysteresis": 0.28,
       "perception": { "sightRange": 46, "fovDegrees": 300, "requireLos": true, "aggro": "hostile", "alertDecayTicks": 180, "keepRangeScale": 1.45 },
       "movement": { "mobile": true, "rangeMin": 7, "rangeMax": 11, "bandSlack": 1.4, "approachSpeed": 1.0, "strafeSpeed": 0.5, "retreatSpeed": 0.75, "circleTendency": 0.75, "circleHoldTicks": 34, "repathTicks": 10, "navRadius": 30 },
-      "attack": { "styles": ["horizontal_r", "horizontal_l", "overhead", "diagonal", "thrust", "punch_r", "punch_l", "hook_r"], "reach": 10, "aimTolerance": 0.4, "cadenceTicks": 34, "jitterTicks": 22, "commitTicks": 10, "disengageTicks": 26 },
+      "attack": { "styles": ["horizontal_r", "horizontal_l", "overhead", "diagonal", "thrust", "punch_r", "punch_l", "hook_r"], "reach": 10, "aimTolerance": 0.4, "cadenceTicks": 34, "jitterTicks": 22, "commitTicks": 10, "disengageTicks": 26, "pursueSpeed": 0.7, "leadTicks": 15 },
       "intents": {
         "idle": { "weight": 0.05, "cooldownTicks": 0, "minDwellTicks": 0 },
         "face": { "weight": 0.45, "cooldownTicks": 0, "minDwellTicks": 4 },
@@ -75,7 +93,7 @@
       "hysteresis": 0.25,
       "perception": { "sightRange": 34, "fovDegrees": 360, "requireLos": true, "aggro": "hostile", "alertDecayTicks": 150, "keepRangeScale": 1.4 },
       "movement": { "mobile": false, "rangeMin": 0, "rangeMax": 0, "bandSlack": 1.5, "approachSpeed": 0, "strafeSpeed": 0, "retreatSpeed": 0, "circleTendency": 0, "circleHoldTicks": 24, "repathTicks": 30, "navRadius": 8 },
-      "attack": { "styles": ["horizontal_r", "overhead", "thrust", "punch_r", "punch_l", "hook_r"], "reach": 11, "aimTolerance": 0.5, "cadenceTicks": 36, "jitterTicks": 14, "commitTicks": 10, "disengageTicks": 0 },
+      "attack": { "styles": ["horizontal_r", "overhead", "thrust", "punch_r", "punch_l", "hook_r"], "reach": 11, "aimTolerance": 0.5, "cadenceTicks": 36, "jitterTicks": 14, "commitTicks": 10, "disengageTicks": 0, "pursueSpeed": 0, "leadTicks": 14 },
       "intents": {
         "idle": { "weight": 0.05, "cooldownTicks": 0, "minDwellTicks": 0 },
         "face": { "weight": 1.0, "cooldownTicks": 0, "minDwellTicks": 0 },
@@ -83,6 +101,7 @@
       }
     },
     {
+      "//pursuit": "A SWING IS A STEP FORWARD (2026-09-16). `pursueSpeed` 0.7 is the fraction of its walk speed this duelist may spend closing WHILE a blow is committed -- before it existed the commit window pinned the mob to `face`, which writes no drive, so it stood perfectly still for 10 ticks and then gave ground for 26 more, and a target simply walking backwards was never in range when the cadence came round. `leadTicks` 15 is where the blow is AIMED: the stroke freezes its target point at the request and every NPC sword cut here is windup 12..14 plus half a cut of 5..7, so the edge arrives about fifteen ticks after the decision and aiming at the present misses by however far you have moved since. Both numbers are per-profile because they are the creature's character -- a zombie leads by 12 and pursues at 0.9 (it does not give ground at all), a static swordsman pursues at 0 and still leads by 14.",
       "name": "duelist",
       "label": "Duelist",
       "color": 3225419775,
@@ -90,7 +109,7 @@
       "hysteresis": 0.28,
       "perception": { "sightRange": 46, "fovDegrees": 300, "requireLos": true, "aggro": "hostile", "alertDecayTicks": 180, "keepRangeScale": 1.45 },
       "movement": { "mobile": true, "rangeMin": 7, "rangeMax": 11, "bandSlack": 1.4, "approachSpeed": 1.0, "strafeSpeed": 0.5, "retreatSpeed": 0.75, "circleTendency": 0.75, "circleHoldTicks": 34, "repathTicks": 10, "navRadius": 30 },
-      "attack": { "styles": ["horizontal_r", "horizontal_l", "overhead", "diagonal", "thrust", "punch_r", "punch_l", "hook_r"], "reach": 10, "aimTolerance": 0.4, "cadenceTicks": 34, "jitterTicks": 22, "commitTicks": 10, "disengageTicks": 26 },
+      "attack": { "styles": ["horizontal_r", "horizontal_l", "overhead", "diagonal", "thrust", "punch_r", "punch_l", "hook_r"], "reach": 10, "aimTolerance": 0.4, "cadenceTicks": 34, "jitterTicks": 22, "commitTicks": 10, "disengageTicks": 26, "pursueSpeed": 0.7, "leadTicks": 15 },
       "intents": {
         "idle": { "weight": 0.05, "cooldownTicks": 0, "minDwellTicks": 0 },
         "face": { "weight": 0.45, "cooldownTicks": 0, "minDwellTicks": 4 },
@@ -110,7 +129,7 @@
       "hysteresis": 0.35,
       "perception": { "sightRange": 34, "fovDegrees": 360, "requireLos": true, "aggro": "hostile", "alertDecayTicks": 300, "keepRangeScale": 1.6 },
       "movement": { "mobile": true, "rangeMin": 2, "rangeMax": 7, "bandSlack": 2.0, "approachSpeed": 1.0, "strafeSpeed": 0.15, "retreatSpeed": 0.0, "circleTendency": 0.1, "circleHoldTicks": 40, "repathTicks": 14, "navRadius": 30 },
-      "attack": { "styles": ["bite_lunge", "bite", "punch_r", "punch_l", "hook_r"], "reach": 9, "aimTolerance": 0.55, "cadenceTicks": 48, "jitterTicks": 20, "commitTicks": 14, "disengageTicks": 0 },
+      "attack": { "styles": ["bite_lunge", "bite", "punch_r", "punch_l", "hook_r"], "reach": 9, "aimTolerance": 0.55, "cadenceTicks": 48, "jitterTicks": 20, "commitTicks": 14, "disengageTicks": 0, "pursueSpeed": 0.9, "leadTicks": 12 },
       "intents": {
         "idle": { "weight": 0.05, "cooldownTicks": 0, "minDwellTicks": 0 },
         "face": { "weight": 0.5, "cooldownTicks": 0, "minDwellTicks": 4 },

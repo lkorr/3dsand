@@ -320,6 +320,11 @@ const char* const kOrder[] = {
     // resets four times over but writes no terrain, so it inherits the world
     // `ai-approach` restored and hands it on untouched.
     "ai-reach",
+    // ...and `ai-pursue` after THAT, by the same append rule again: it also
+    // only spawns and resets (a duelist and a quarry, twice) and writes no
+    // terrain, so it inherits the world `ai-reach` handed on and hands the same
+    // one to `ai-slope`.
+    "ai-pursue",
     // ...and the same group's sloped-terrain half, appended last in it for the
     // reason above: `ai-slope` writes a real stone ramp and regenerates on the
     // way out, exactly as `ai-approach` does with its wall.

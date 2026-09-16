@@ -229,7 +229,79 @@ struct AttackTuning {
   // Ticks after a commit during which the mob prefers to give ground. Reading
   // as "hit and step off" rather than "stand in the blender" is most of what
   // makes a duel feel like a duel.
+  //
+  // IT IS SUSPENDED AGAINST A TARGET THAT IS ALREADY LEAVING — see the
+  // `holdGround` note in Think. Stepping off from someone who is running away
+  // is not footwork, it is a second retreat, and two of them is a creature
+  // that never fights again.
   uint32_t disengageTicks = 22;
+
+  // ---- STRIKE WHILE CLOSING (2026-09-16) ----------------------------------
+  //
+  // Fraction of the creature's own walk speed it may spend keeping the target
+  // in range WHILE a swing is committed. 0 restores the original behaviour,
+  // which was to plant the feet from the instant of the decision until the
+  // commit window expired.
+  //
+  // Owner report: "enemy mobs need to be able to hit you if you're
+  // crouchwalking away from them". Planting the feet is the whole of why they
+  // could not. The sequence was: decide to attack (RequestAttack writes a
+  // heading and NO drive), then `commitUntil` pins the mob to FaceTarget
+  // (which also writes no drive) for `commitTicks`, then `disengageUntil`
+  // lifts the band floor to its ceiling for `disengageTicks` more. A `duelist`
+  // therefore stood still for 10 ticks and then actively gave ground for 26,
+  // 36 ticks out of a 34-tick cadence — against a target walking away at even
+  // half its speed, every one of those ticks is gap it has to win back before
+  // it is allowed to try again. It never was.
+  //
+  // A SWING IS A STEP FORWARD. This is the number that says how much of one.
+  float pursueSpeed = 0.6f;
+
+  // A target opening the range faster than this FRACTION OF OUR OWN WALK SPEED
+  // cancels the `disengageTicks` window — see the `holdGround` note in Think.
+  //
+  // IT IS A NOISE FLOOR, NOT A JUDGEMENT. The first version of this was 0.30,
+  // reasoned as "a third of walk speed is where a retreat stops being a
+  // shuffle", and it was wrong for the only case it was written for: the
+  // reported scenario is a CROUCHWALKING player, which is
+  // `player.walkSpeed` 1.6 m/s x `crouchSpeedScale` 0.5 = 8 world voxels a
+  // second, against a `human` mob that walks at 31.5 — a ratio of 0.25, under
+  // the threshold, so the suspension never fired once in a 360-tick fight that
+  // was entirely about it (`ai-pursue` reported `held 0`). Sizing a floor by
+  // reasoning about what "counts" as running away is how that happens.
+  //
+  // The honest rule is that ANY target opening the range is one you do not step
+  // away from, and the only thing a threshold is needed for is to stop a gait's
+  // bob and yaw — a fraction of a voxel per tick, surviving the low pass as a
+  // voxel or two a second — from reading as flight. Hence a floor just above
+  // that, and no opinion about pace.
+  //
+  // A LARGE VALUE RESTORES THE ORIGINAL BEHAVIOUR (step off from anyone,
+  // always), which is what `duelist_flatfooted` uses to give the `ai-pursue`
+  // gate a repro arm that costs no rebuild and no second binary.
+  float holdGroundFrac = 0.08f;
+
+  // How far AHEAD of the target the blow is aimed, in ticks. **-1 = use
+  // `commitTicks`** (the default); 0 = no lead at all, which is what this
+  // engine did before 2026-09-16 and what the gate's repro arm asks for.
+  //
+  // THE AIM POINT IS FROZEN AT THE REQUEST AND NEVER REFRESHED — `StartStroke`
+  // copies `AttackRequest::targetPoint` onto the stroke and `StepStroke`
+  // re-derives the bearing from that same stored point every tick (mob.cpp,
+  // "THE AIM: the target's bearing about THIS mob's shoulder"). So a stroke
+  // aimed at where the target stood when the decision was taken is still aimed
+  // there fifteen ticks later, when the edge actually arrives. That is correct
+  // for the TELEGRAPH — a committed cut must not home, and `strokes.h` says so
+  // — but it means the point the AI hands over has to be where the target WILL
+  // BE, not where it is. Aiming at the present against a body in motion is a
+  // guaranteed miss dressed up as a design principle.
+  //
+  // The right value is the delay from the decision to the middle of the cut:
+  // `windup.ticks + cut.ticks/2` of the styles this profile draws
+  // (assets/mobs/attack_styles.json — the NPC sword cuts are 12..14 + 5..7, so
+  // about 15; the punches and the bite are about 12). Tempo jitter moves it, so
+  // it is an estimate and is authored as one.
+  int32_t leadTicks = -1;
 };
 
 // Per-intent authored knobs. An intent absent from the JSON keeps weight 0 and
@@ -427,6 +499,35 @@ struct Brain {
   float targetDist = 0;
   float bearingError = 0;        // radians, target bearing minus heading
 
+  // ---- HOW THE TARGET IS MOVING (2026-09-16) -------------------------------
+  //
+  // World voxels/sec, low-passed, and the ONLY thing in this struct that is
+  // about the target's future rather than its present. Three decisions read it
+  // and none of them can be made without it: where to aim a blow that lands
+  // fifteen ticks from now, whether the range will still be closed by then, and
+  // whether giving ground after a swing is footwork or surrender.
+  //
+  // Sampled ONLY between consecutive visible ticks of the SAME target
+  // (`velSampleTick`), because the two other ways a remembered position moves
+  // are both lies: `Perceive` freezes `targetPos` at `lastSeenPos` while the
+  // alert decays, so a differenced position reports a creature standing still,
+  // and the tick it is re-acquired it reports one that teleported.
+  Vec3 targetVel{};
+  Vec3 prevTargetPos{};
+  uint32_t velSampleTick = 0;
+  uint64_t velTargetId = 0;      // whose position prevTargetPos is
+  bool haveTargetVel = false;
+  // `targetVel` projected onto the line from us to it: + = opening the range.
+  // The sign is the whole question — a target closing with us needs no pursuit
+  // and no lead, and one that is leaving needs both.
+  float targetRadial = 0;
+  // Centre-to-centre distance PREDICTED for the moment the edge arrives, which
+  // is what the commit test and the style draw are made against. A diagnostic
+  // as much as a value: `targetDist` and this disagreeing by six voxels is the
+  // difference between a creature that swings at you and one that swings at
+  // where you were (CLAUDE.md rule 6 — record it, do not re-derive it later).
+  float leadDist = 0;
+
   // ---- arbiter ----
   Intent intent = Intent::Idle;
   uint32_t intentSince = 0;
@@ -439,6 +540,14 @@ struct Brain {
   uint32_t disengageUntil = 0;
   uint32_t lastAttackTick = 0;   // sticky; the dev panel reads it
   uint32_t attacksIssued = 0;
+  // The forward drive the pursuit term added on top of whatever the winning
+  // intent asked for, this tick, and whether the disengage window was SKIPPED
+  // because the target was already leaving. Both are diagnostics: "the mob did
+  // not hit me" has four causes (never committed / committed and stood still /
+  // closed but aimed behind / landed and did nothing) and from outside they are
+  // one bare zero.
+  float pursueDrive = 0;
+  bool heldGround = false;
 
   // ---- footwork ----
   int circleSign = 0;            // -1 / +1, redrawn on a cadence

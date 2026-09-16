@@ -154,7 +154,10 @@ Intent IntentFromName(const std::string& s) {
 //     "attack": {
 //       "style": "slash", "reach": 9.5, "aimTolerance": 0.45,
 //       "cadenceTicks": 38, "jitterTicks": 20,
-//       "commitTicks": 10, "disengageTicks": 24
+//       "commitTicks": 10, "disengageTicks": 24,
+//       "pursueSpeed": 0.6,     // walk-speed fraction usable WHILE swinging
+//       "holdGroundFrac": 0.08, // a target leaving this fast cancels the step-off
+//       "leadTicks": 15         // aim ahead by this; -1 = commitTicks, 0 = none
 //     },
 //     "intents": {                    // ABSENT = weight 0 = disabled
 //       "idle":      { "weight": 0.05 },
@@ -259,6 +262,17 @@ bool LoadBehaviors(const std::string& path, Library& out, std::string& log) {
       pr.attack.jitterTicks = q.value("jitterTicks", 18u);
       pr.attack.commitTicks = q.value("commitTicks", 10u);
       pr.attack.disengageTicks = q.value("disengageTicks", 22u);
+      // Absent means "a swing is a step forward, at a bit over half speed" and
+      // "lead the blow by the commit window" -- both live defaults rather than
+      // zeros, because the behaviour they replace (plant the feet, aim at the
+      // present) is not one any profile would author on purpose. A profile that
+      // genuinely wants a stock-still swing says `"pursueSpeed": 0`.
+      pr.attack.pursueSpeed = q.value("pursueSpeed", 0.6f);
+      pr.attack.holdGroundFrac = q.value("holdGroundFrac", 0.08f);
+      // -1, NOT 0: "absent" and "no lead at all" are different answers, and the
+      // second one has to remain sayable because it is the behaviour this
+      // engine had until 2026-09-16 and the `ai-pursue` gate keeps an arm on it.
+      pr.attack.leadTicks = q.value("leadTicks", -1);
     }
     if (p.contains("intents") && p["intents"].is_object()) {
       for (auto& [k, v] : p["intents"].items()) {
@@ -341,7 +355,10 @@ bool SaveBehaviors(const std::string& path, const Library& lib,
       << ", \"cadenceTicks\": " << p.attack.cadenceTicks
       << ", \"jitterTicks\": " << p.attack.jitterTicks
       << ", \"commitTicks\": " << p.attack.commitTicks
-      << ", \"disengageTicks\": " << p.attack.disengageTicks << " },\n";
+      << ", \"disengageTicks\": " << p.attack.disengageTicks
+      << ", \"pursueSpeed\": " << num(p.attack.pursueSpeed)
+      << ", \"holdGroundFrac\": " << num(p.attack.holdGroundFrac)
+      << ", \"leadTicks\": " << p.attack.leadTicks << " },\n";
     o << "      \"intents\": {\n";
     bool first = true;
     for (int k = 0; k < (int)Intent::Count; k++) {
@@ -471,6 +488,84 @@ void Perceive(Brain& b, const Profile& pr, const SelfView& self,
 }
 
 // ---------------------------------------------------------------------------
+// HOW THE TARGET IS MOVING (2026-09-16)
+//
+// One finite difference and one low pass, and it is the only thing in this file
+// that looks forward. Three decisions below cannot be made without it — where
+// to aim a blow that lands fifteen ticks from now, whether the range will still
+// be closed when it does, and whether the post-swing step-off is footwork or
+// surrender — and all three were being made against the target's PRESENT
+// position, which is why a creature walking backwards was untouchable.
+//
+// IT SAMPLES ONLY BETWEEN CONSECUTIVE VISIBLE TICKS OF ONE TARGET, and each of
+// those three words is load-bearing:
+//
+//   * VISIBLE — `Perceive` freezes `targetPos` at `lastSeenPos` while the alert
+//     decays, so differencing a remembered position reports a creature standing
+//     perfectly still for as long as it stays out of sight. That is the single
+//     most dangerous reading available: it says "no lead needed" about exactly
+//     the target that just broke contact.
+//   * CONSECUTIVE — the tick a target is re-acquired, the difference spans the
+//     whole occlusion and reports a teleport.
+//   * ONE TARGET — `Perceive` takes the NEAREST hostile every tick and will
+//     switch mid-fight; differencing across a switch measures the gap between
+//     two creatures, not the motion of either.
+//
+// Failing any of them zeroes the velocity rather than holding the last one.
+// A stale extrapolation aims worse than no extrapolation: aiming where a
+// creature IS misses a moving one, but aiming fifteen ticks along a heading it
+// abandoned two seconds ago misses a stationary one too.
+// ---------------------------------------------------------------------------
+void TrackTargetMotion(Brain& b, const SelfView& self, uint32_t tick, float dt) {
+  b.targetRadial = 0;
+  if (!b.hasTarget || !b.visible) {
+    b.haveTargetVel = false;
+    b.targetVel = Vec3{};
+    return;
+  }
+
+  const bool usable = b.haveTargetVel && tick == b.velSampleTick + 1 &&
+                      b.velTargetId == b.targetId && dt > 1e-5f;
+  if (usable) {
+    float ix = (b.targetPos.x - b.prevTargetPos.x) / dt;
+    float iz = (b.targetPos.z - b.prevTargetPos.z) / dt;
+    // A SANITY CEILING, not a tuning knob. A body that is launched by a blast,
+    // knocked back by a mace or moved by a gate fixture differences into
+    // hundreds of voxels a second, and one such sample through the low pass
+    // would aim the next several swings at the horizon.
+    const float cap = std::max(1.0f, self.speed) * 4.0f;
+    const float m = std::sqrt(ix * ix + iz * iz);
+    if (m > cap) {
+      ix *= cap / m;
+      iz *= cap / m;
+    }
+    // A gait bobs and yaws the body centre by a fraction of a voxel every tick,
+    // which the raw difference reports as several voxels a second of sideways
+    // drift. Unfiltered, the aim point wanders by about that much per tick and
+    // a lead is worse than none.
+    constexpr float kAlpha = 0.25f;
+    b.targetVel.x += (ix - b.targetVel.x) * kAlpha;
+    b.targetVel.z += (iz - b.targetVel.z) * kAlpha;
+  } else {
+    b.targetVel = Vec3{};
+  }
+  b.prevTargetPos = b.targetPos;
+  b.velSampleTick = tick;
+  b.velTargetId = b.targetId;
+  b.haveTargetVel = true;
+
+  // The RADIAL component is the only one the decisions below want: a target
+  // circling us at speed is not getting away, and treating its tangential
+  // motion as flight would have every creature charge a fencer who has not
+  // moved an inch further off.
+  const Vec3 c = self.Centre();
+  const float dx = b.targetPos.x - c.x, dz = b.targetPos.z - c.z;
+  const float len = std::sqrt(dx * dx + dz * dz);
+  if (len > 1e-3f)
+    b.targetRadial = (b.targetVel.x * dx + b.targetVel.z * dz) / len;
+}
+
+// ---------------------------------------------------------------------------
 // Navigation follow-through
 // ---------------------------------------------------------------------------
 
@@ -597,6 +692,7 @@ bool Think(Brain& brain, const Library& lib, const SelfView& self,
   out.attack = false;
 
   Perceive(brain, pr, self, view, tick);
+  TrackTargetMotion(brain, self, tick, dt);
 
   const Vec3 centre = self.Centre();
   const float bearing =
@@ -663,7 +759,37 @@ bool Think(Brain& brain, const Library& lib, const SelfView& self,
     }
   }
 
-  const bool disengaging = tick < brain.disengageUntil;
+  // ---- ...AND THE STEP-OFF IS SUSPENDED AGAINST A TARGET THAT IS LEAVING ---
+  //
+  // `disengageTicks` is "hit and step off", and it is exactly right against
+  // someone standing their ground. Against someone WALKING AWAY it is a SECOND
+  // RETREAT: the mob gives ground for 26 ticks to a target already giving
+  // ground, the gap grows at the sum of both speeds, and by the time the
+  // cadence comes round the creature is outside its band and starts the whole
+  // approach again. It never gets a second swing off.
+  //
+  // This is a DIFFERENT failure from the frozen feet the pursuit term below
+  // fixes, and it is the one that survives it: it happens after the commit
+  // window has expired, with the arbiter picking exactly the intent its author
+  // asked for. Both had to go for "crouchwalk backwards and nothing can touch
+  // you" to stop being true.
+  //
+  // THE THRESHOLD IS A NOISE FLOOR AND NOTHING MORE. Any target opening the
+  // range is one you do not step away from; all a number is needed for is to
+  // stop a gait's bob from reading as flight. AttackTuning::holdGroundFrac
+  // records what sizing it as a judgement about PACE cost -- the first version
+  // was 0.30 and never fired once against the crouchwalking player it was
+  // written for.
+  //
+  // AUTHORED, so the whole of this change is
+  // reversible from JSON: a profile with a huge `holdGroundFrac`, `pursueSpeed`
+  // 0 and `leadTicks` 0 is the creature this engine shipped before today, which
+  // is how `ai-pursue` carries its own repro arm instead of needing a second
+  // binary to compare against.
+  brain.heldGround =
+      tick < brain.disengageUntil &&
+      brain.targetRadial > self.speed * std::max(0.0f, pr.attack.holdGroundFrac);
+  const bool disengaging = tick < brain.disengageUntil && !brain.heldGround;
   if (disengaging && hi > 0) lo = hi;
   const float d = brain.targetDist;
   const float slack = std::max(0.25f, pr.movement.bandSlack);
@@ -708,6 +834,77 @@ bool Think(Brain& brain, const Library& lib, const SelfView& self,
     return std::clamp(std::abs(remaining) / perTick, 0.0f, 1.0f);
   };
 
+  // ---- STRIKE WHILE CLOSING (2026-09-16) ----------------------------------
+  //
+  // Two numbers come out of this block, and every remaining decision in Think
+  // consumes one of them: how hard to keep walking forward WHILE a swing is
+  // committed (`pursue`), and how far away the target will be when the edge
+  // actually arrives (`brain.leadDist`). See AttackTuning::pursueSpeed for the
+  // measured failure both of them answer.
+  const float pursueCap =
+      pr.movement.mobile ? std::clamp(pr.attack.pursueSpeed, 0.0f, 1.0f) : 0.0f;
+  float pursue = 0;
+  if (pursueCap > 0.0f && brain.hasTarget && hi > 0) {
+    // Aim to stand a slack INSIDE the far edge of what this body can strike
+    // from rather than exactly on it. A blow taken at the last reachable
+    // millivoxel is one the victim's next step defeats, and `hi` has already
+    // been slid onto the weapon above — so this is "comfortably in range for
+    // whatever is actually in my hand", not a re-guess of the band.
+    const float goal = std::max(0.0f, hi - slack);
+    if (d > goal) pursue = std::min(pursueCap, arrive(d - goal));
+    // ...AND NEVER LET THE GAP OPEN WHILE THE BLADE IS OUT. Inside `goal`
+    // there is no distance to close, but a target walking away is still walking
+    // away — matching its radial speed is the difference between a swing that
+    // arrives and one that is a body-length behind. Not applied when we are
+    // inside the band FLOOR: down there HoldRange is deliberately backing off,
+    // and overriding its retreat would make the creature chase a target that is
+    // already too close to hit.
+    if (brain.targetRadial > 0.0f && d > lo)
+      pursue = std::max(
+          pursue, std::min(pursueCap, brain.targetRadial /
+                                          std::max(1e-3f, self.speed)));
+  }
+
+  // WHERE IT WILL BE, NOT WHERE IT IS.
+  //
+  // THE ALIGNMENT DISCOUNT IS APPLIED TO THE PREDICTION AND NOWHERE ELSE.
+  // `DriveLocomotion` scales forward speed by how well the nose is on the
+  // heading (`fwdDrive = base * driveScale * align`), so a creature forty
+  // degrees off does not cover what a straight-line estimate promises. Crediting
+  // closure it cannot deliver is not a harmless optimism: `brain.leadDist` is
+  // what `PickAttackStyle` draws against, so an over-prediction picks a SHORTER
+  // style than the fight needs and the swing arrives out of its own reach —
+  // precisely the wasted-cadence failure the distance-aware draw exists to
+  // stop. Cosine is what `align` is.
+  const float closeRate = pursue * self.speed * std::max(0.0f, std::cos(aimErr)) -
+                          brain.targetRadial;
+  const float leadTicks = (float)(pr.attack.leadTicks >= 0
+                                      ? (uint32_t)pr.attack.leadTicks
+                                      : pr.attack.commitTicks);
+  const float leadT = leadTicks * std::max(dt, 1e-4f);
+  // ---- THE PREDICTION MAY ONLY BRING A COMMIT FORWARD, NEVER PUSH IT BACK --
+  //
+  // Clamped to the PRESENT distance, and this is not a safety margin — it is
+  // the whole difference between the lead being a feature and being a way to
+  // make a creature passive. Measured through `ai-pursue`'s per-knob arms: with
+  // the lead on and the pursuit off, `closeRate` is just `-targetRadial`, so a
+  // fleeing target predicts FURTHER than it is, `attackReady` fails, and the
+  // duelist issued ONE attack request in 360 ticks against the eight the
+  // unmodified creature managed. It did less damage than the bug this change
+  // was written to fix.
+  //
+  // The asymmetry is justified rather than convenient: refusing to swing
+  // because the target MIGHT be out of reach in fifteen ticks spends a whole
+  // cadence on a certainty of nothing, while swinging and missing costs the
+  // same cadence and sometimes lands. And the refusal is not this layer's to
+  // make anyway — `BeginStroke` checks the drawn style's own reach at the
+  // instant the stroke would start, which is later and better informed.
+  //
+  // The AIM POINT below is deliberately NOT clamped: where to put the edge is a
+  // different question from whether to throw it, and there the extrapolation is
+  // right in both directions.
+  brain.leadDist = std::clamp(d - closeRate * leadT, 0.0f, d);
+
   // ---- the attack clock ---------------------------------------------------
   // Cadence plus a per-attack hash-RNG jitter. The jitter is the difference
   // between a duelist and a metronome, and it is drawn from (id, tick) so a
@@ -720,9 +917,20 @@ bool Think(Brain& brain, const Library& lib, const SelfView& self,
   // try", and trying costs the attack clock either way.
   const float reach =
       self.attackReach > 0.0f ? self.attackReach : pr.attack.reach;
+  //
+  // ...AND IT IS TESTED AGAINST THE PREDICTED RANGE, NOT THE PRESENT ONE. The
+  // question a commit answers is "will this land", and a blow decided now lands
+  // `leadTicks` from now. Both directions matter and they are not symmetric: a
+  // target closing with us (or one we are closing on, which is what `pursue`
+  // above guarantees we will be doing) is committed to EARLIER, which is the
+  // whole of "move forward and hit at the same time"; a target outrunning us is
+  // committed to later or not at all, which saves the cadence for a turn the
+  // creature can actually win instead of spending it on a swing `BeginStroke`
+  // will drop.
   const bool attackReady =
       brain.hasTarget && brain.visible && tick >= brain.nextAttackTick &&
-      !disengaging && d <= reach && aimErr <= pr.attack.aimTolerance;
+      !disengaging && brain.leadDist <= reach &&
+      aimErr <= pr.attack.aimTolerance;
 
   // ---- score every enabled intent ----------------------------------------
   float raw[(int)Intent::Count] = {};
@@ -930,15 +1138,84 @@ bool Think(Brain& brain, const Library& lib, const SelfView& self,
       // readout and for a future scripted attack that wants to name one.
       out.request.style =
           pr.attack.styles.empty() ? std::string() : pr.attack.styles[0];
-      out.request.targetPoint = brain.targetPos;
+      // ---- THE BLOW IS AIMED AHEAD OF THE TARGET (AttackTuning::leadTicks) --
+      //
+      // This point is FROZEN by the stroke: `StartStroke` copies it and
+      // `StepStroke` re-derives the bearing from the stored copy every tick,
+      // never from the live victim (mob.cpp, "THE AIM"). That is right and
+      // deliberate — a committed cut must not home — but it makes this the ONE
+      // instant at which the blow's destination is chosen, and choosing the
+      // target's present position at that instant aims fifteen ticks behind
+      // anything that is moving.
+      //
+      // BOUNDED BY HALF A STRIKE REACH. A target that covers more than that
+      // inside the window is not one this swing was ever going to meet, and an
+      // unbounded extrapolation would aim the cut into open ground well past
+      // the fight — which reads as the creature deliberately swinging at
+      // nothing, and is worse than being a step behind.
+      Vec3 aimPoint = brain.targetPos;
+      {
+        float lx = brain.targetVel.x * leadT, lz = brain.targetVel.z * leadT;
+        const float span = self.strikeReach > 0.0f ? self.strikeReach : reach;
+        const float budget = std::max(1.0f, span * 0.5f);
+        const float m = std::sqrt(lx * lx + lz * lz);
+        if (m > budget) {
+          lx *= budget / m;
+          lz *= budget / m;
+        }
+        aimPoint.x += lx;
+        aimPoint.z += lz;
+      }
+      out.request.targetPoint = aimPoint;
       out.request.tick = tick;
       out.request.commitTicks = pr.attack.commitTicks;
-      out.request.distance = d;
+      // THE PREDICTED RANGE, for the same reason `attackReady` used it: this is
+      // the number `PickAttackStyle` filters on and `BeginStroke` refuses
+      // against, and both of them are deciding what can reach at IMPACT.
+      out.request.distance = brain.leadDist;
       break;
     }
 
     default:
       break;
+  }
+
+  // ---- ...AND THE FEET KEEP MOVING THROUGH THE SWING ----------------------
+  //
+  // APPLIED AFTER THE ARBITER, AND THAT IS THE POINT. The commit window
+  // overrides the winning intent with FaceTarget outright — "no amount of
+  // utility may spin it mid-swing" — and FaceTarget writes a heading and no
+  // drive at all. So the override that keeps a creature from pirouetting was
+  // also the thing nailing its feet to the ground for the whole telegraph, and
+  // no intent weight anywhere in behaviors.json could have reached it. A
+  // profile author looking at this was choosing between a mob that swings
+  // straight and a mob that walks.
+  //
+  // The two are not actually in tension: holding a FACING and holding a
+  // POSITION are different promises, and the stroke system only ever needed the
+  // first. Nothing downstream cares that the body translated — the aim is taken
+  // about the shoulder in the mob's own basis and re-derived from the live
+  // pivot every tick, so walking forward through a windup carries the blade
+  // with it and lengthens the blow rather than breaking it.
+  //
+  // `max`, never a replacement. An intent that already wants to close harder
+  // keeps its own number, and a HoldRange retreat (negative drive, too close)
+  // is untouched because `pursue` is zero inside the band floor.
+  const bool swinging =
+      brain.intent == Intent::RequestAttack || tick < brain.commitUntil;
+  brain.pursueDrive = 0;
+  if (swinging && pursue > 0.0f && brain.hasTarget) {
+    float fwd = pursue;
+    // The drive's forward probe is not advice, it is a veto: `DriveLocomotion`
+    // refuses forward motion outright while probe 0 is blocked. Ask the same fan
+    // HoldRange asks rather than promising a step into a wall and reporting a
+    // pursuit that never happened.
+    const int p = ProbeFor(bearing, self.heading);
+    if (ground.haveGround && !ground.clear[p]) fwd = 0;
+    if (fwd > out.driveScale) {
+      out.driveScale = fwd;
+      brain.pursueDrive = fwd;
+    }
   }
 
   // A profile that cannot move its feet cannot move them by any route. Enforced

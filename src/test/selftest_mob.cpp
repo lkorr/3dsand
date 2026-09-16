@@ -5440,6 +5440,496 @@ Status GateAiReach(Ctx& c, std::string& detail) {
   return ok ? Status::Pass : Status::Fail;
 }
 
+// ---- ai-pursue --------------------------------------------------------------
+//
+// Owner report, 2026-09-16: "enemy mobs need to be able to hit you if you're
+// crouchwalking away from them ... attacks should be occurring while they walk
+// forward simultaneously". THE SUBJECT IS A MOVING TARGET, and every existing
+// AI gate fights a stationary one — `ai-reach`, `ai-approach`, `npc-strike`,
+// `npc-styles` and `unarmed-attack` all put a `training_dummy` (blind, passive,
+// IMMOBILE) in front of the subject, and `duel`'s two duelists circle each
+// other rather than withdraw. So the suite tested the one case where standing
+// still between swings costs nothing.
+//
+// THREE THINGS WERE WRONG AND ALL THREE ARE INVISIBLE AGAINST A DUMMY:
+//
+//   1. THE FEET WERE NAILED DOWN FOR THE WHOLE TELEGRAPH. `RequestAttack` wrote
+//      a heading and no drive, then `commitUntil` overrode the arbiter with
+//      FaceTarget — which also writes no drive — for `commitTicks`. Ten ticks
+//      of standing still. Against a dummy that is free.
+//   2. THE STEP-OFF WAS A SECOND RETREAT. `disengageTicks` then lifted the band
+//      floor to its ceiling for 26 more ticks, so the mob gave ground to a
+//      target that was ALSO giving ground. Measured on this fixture's numbers:
+//      the duelist backs off at 0.75 x 31.5 = 23.6 vox/s while the quarry leaves
+//      at 8, so the gap opens at 31.6 vox/s for 26 ticks — TWENTY-SEVEN VOXELS,
+//      which then costs 26 more ticks to walk back. Sixty-two ticks per swing
+//      against a 34..56 tick cadence. Against a dummy the mob steps off and the
+//      dummy is still there.
+//   3. THE BLOW WAS AIMED WHERE THE TARGET HAD BEEN. `StartStroke` freezes
+//      `AttackRequest::targetPoint` and `StepStroke` re-derives the aim from
+//      that stored copy every tick, so a cut that lands ~15 ticks after the
+//      decision (windup 12..14 plus half a cut of 5..7) was aimed 4 voxels
+//      behind a target moving at a crouchwalk. Against a dummy the error is
+//      exactly zero.
+//
+// THE CLAIM IS DAMAGE, NOT REQUESTS, for the reason `ai-reach`'s header gives
+// at length: a request `BeginStroke` drops and a request that opens a wound are
+// the same number from outside.
+//
+// ...AND IT IS A DIFFERENTIAL AGAINST THE PRE-FIX CREATURE, which is the part
+// that makes it a regression test rather than a smoke test. The first version
+// of this gate asserted absolute numbers -- "landed at least four blows, took
+// hp off" -- and the fixed code cleared them comfortably. So did the broken
+// code, because a flat-footed duelist still connects eventually; an absolute
+// floor cannot tell "hits it" from "hits it three times as slowly". So one arm
+// is a clone of `duelist` with this change's three knobs turned off
+// (`pursueSpeed` 0, `holdGroundFrac` 99, `leadTicks` 0), the claim is that the
+// shipped one out-damages it, and the claim is unfalsifiable by tuning because
+// both arms move together.
+//
+// THREE THINGS THIS GATE LEARNED THE EXPENSIVE WAY, all of them about how to
+// MEASURE a duel rather than about the AI:
+//
+//   * A FIXTURE THAT CANNOT FAIL MEASURES NOTHING. The quarry was first
+//     authored at the owner's literal crouchwalk -- 8 vox/s -- and against that
+//     the PRE-FIX duelist does fine: it walks at 31.5, so it wins back the
+//     twenty-seven voxels its own step-off gives away inside the cadence that
+//     produced them, and the two arms came out level (12.2 contacts per 100
+//     ticks against 11.9). The regime the report is really about is a retreat
+//     that is a real fraction of the chase, which is the ordinary case in the
+//     game: a walking player is 16 vox/s against a zombie's 23.5. At 0.6 of the
+//     attacker's speed the pre-fix arm manages THREE attack requests in 720
+//     ticks and one round of zero damage in 240.
+//   * ONE FIGHT IS NOT A MEASUREMENT. A cut that reaches a neck severs it and
+//     ends the duel outright whatever the health bar said, so the same profile
+//     measured on three occasions gave kill ticks of 11, 103 and 204. Hence
+//     `rounds`, and hence it being a baseline number rather than a literal:
+//     raising it costs no rebuild.
+//   * AVERAGING PER-FIGHT RATES HANDS THE ARM TO THE FLUKE. One round ended in
+//     a first-swing decapitation at tick 21 -- 4.76%/t against its siblings'
+//     0.20 -- and the mean of the three gave that single cut 89% of the score.
+//     Arm::Rate pools instead: total damage over total ticks.
+Status GateAiPursue(Ctx& c, std::string& detail) {
+  c.debris.Reset();
+  c.mobs.Reset();
+
+  const int defIndex = AiHumanoidDef(c.mobs);
+  if (defIndex < 0) {
+    detail = "no mob def publishes a held_right socket";
+    return Status::Fail;
+  }
+  const MobDef& def = c.mobs.Defs()[defIndex];
+  for (const char* p : {"duelist", "training_dummy", "retreater"})
+    if (c.mobs.Behaviors().Find(p) < 0) {
+      detail = std::string("behaviors.json is missing \"") + p + "\"";
+      return Status::Fail;
+    }
+
+  int relief = 0;
+  const IVec3 anchor = AiFixtureCentre(c.world);
+  const IVec3 spot = AiFlatSpot(anchor.x, anchor.z, 96, 22, kDefaultSeed, relief);
+  const int gapVox = (int)BaselineNumber("aiPursueGapVox", 16);
+  const int ticks = (int)BaselineNumber("aiPursueTicks", 240);
+  const int rounds = (int)BaselineNumber("aiPursueRounds", 3);
+
+  // See `ai-reach`: a player actor left over from an earlier gate in this
+  // shared World is a nearer target of another faction and would silently
+  // become the subject of the fight.
+  c.mobs.ClearPlayerActor();
+
+  // ---- THE REPRO ARM IS BUILT HERE, NOT AUTHORED --------------------------
+  //
+  // One clone of `duelist` with this change's three knobs turned off, dropped
+  // again on the way out. It could have been a fixture profile in
+  // behaviors.json and briefly was; it belongs in the gate because
+  // behaviors.json is CONTENT -- a profile nothing in the game spawns, existing
+  // only so a test can subtract a feature from itself, is noise in the file an
+  // author reads to learn what creatures exist. All three knobs are data, so
+  // the comparison needs no second binary (CLAUDE.md, "Authoring
+  // cheap-to-verify work").
+  //
+  // `holdGroundFrac` 99 is "step off from anyone, however fast they are already
+  // leaving"; `leadTicks` 0 is "aim where it is standing right now".
+  // ---- ...AND SO IS THE QUARRY, AT A SPEED THAT MAKES THE FIGHT HARD ------
+  //
+  // `behaviors.json` authors the `retreater` at a CROUCHWALK, which is what the
+  // owner reported and is 8 world voxels a second (player.walkSpeed 1.6 m/s x
+  // crouchSpeedScale 0.5). Measured against it, the pre-fix duelist does FINE:
+  // it walks at 31.5, so it wins back the twenty-seven voxels its own step-off
+  // gives away inside the same cadence that produced them, and the two arms
+  // came out level (12.2 contacts per 100 ticks against 11.9). A fixture that
+  // cannot fail is not measuring anything.
+  //
+  // The regime the report is actually about is the one where the retreat is a
+  // real fraction of the chase. It is the common case in the game and not an
+  // exotic one: a player WALKING is 16 vox/s against a zombie's 23.5 -- 68% --
+  // and a sprinting one is 31.5, which is a `human` duelist's entire walk
+  // speed. So the fixture asks for a stated fraction of the attacker's own
+  // speed and reports the ratio it achieved, rather than inheriting a number
+  // authored for a different question.
+  const float fleeFrac = (float)BaselineNumber("aiPursueFleeFrac", 0.6);
+  const size_t libSize0 = c.mobs.Behaviors().profiles.size();
+  {
+    ai::Library& lib = c.mobs.BehaviorsMut();
+    const int base = lib.Find("duelist");
+    if (base >= 0 && lib.Find("_aip_prefix") < 0) {
+      ai::Profile p = lib.profiles[(size_t)base];
+      p.name = "_aip_prefix";
+      p.label = "duelist (pre-2026-09-16)";
+      p.attack.pursueSpeed = 0.0f;
+      p.attack.holdGroundFrac = 99.0f;
+      p.attack.leadTicks = 0;
+      lib.profiles.push_back(std::move(p));
+    }
+    const int q = lib.Find("retreater");
+    if (q >= 0 && lib.Find("_aip_runner") < 0) {
+      ai::Profile p = lib.profiles[(size_t)q];
+      p.name = "_aip_runner";
+      p.label = "retreater (fast)";
+      // `retreatSpeed` is a multiplier on the QUARRY's own def speed, and both
+      // bodies here are the same def -- so the fraction is the ratio directly.
+      p.movement.retreatSpeed = fleeFrac;
+      lib.profiles.push_back(std::move(p));
+    }
+  }
+
+  // ---- ONE FIGHT ----------------------------------------------------------
+  struct Fight {
+    int requests = 0, cutTicks = 0, hits = 0;
+    float hp0 = 0, hp1 = 0;
+    int liveTicks = 0, killTick = -1;
+    float travel = 0, meanGap = 0, maxGap = 0;
+    int heldGroundTicks = 0, pursueTicks = 0;
+    int startMobs = 0;          // fixture health, not a result
+    float fellVox = 0;
+    float Taken() const {
+      if (killTick >= 0) return 1.0f;
+      return hp0 > 1e-3f ? std::clamp((hp0 - hp1) / hp0, 0.0f, 1.0f) : 0.0f;
+    }
+    // FRACTION OF THE QUARRY'S HEALTH PER HUNDRED TICKS. `Taken()` alone
+    // SATURATES and cannot state this gate's claim: measured, the pursuing
+    // duelist killed its fleeing quarry at tick 103 and the flat-footed one
+    // killed the same quarry at tick 303 -- a threefold difference in exactly
+    // the thing under test -- and both arms reported "100%". Dividing by the
+    // length of the fight is the whole fix, and it degrades in the right
+    // direction: an arm that never kills is charged the full tick budget.
+    float Rate() const { return 100.0f * Taken() / (float)std::max(1, liveTicks); }
+    float FleeRate() const {
+      return liveTicks > 0 ? travel * 30.0f / (float)liveTicks : 0.0f;
+    }
+  };
+
+  AiTicker tick{c, 7800, {spot.x >> 4, spot.y >> 4, spot.z >> 4}};
+  std::string err;
+
+  auto fight = [&](const char* attacker, const char* quarry, Fight& f) {
+    c.mobs.Reset();
+    c.debris.Reset();
+    // ---- A FRESH WORLD PER FIGHT, WHICH THE STATIONARY GATES DO NOT NEED ---
+    //
+    // `ai-reach` resets only the mob and debris systems between its five arms
+    // and is right to: its quarry is a `training_dummy`, so every one of those
+    // fights happens in the same two square metres. A RETREATING quarry drags
+    // the fight a hundred voxels across the map and leaves a trail of blood,
+    // loose limbs and cut ground behind it that the next fixture would spawn
+    // into.
+    SubmitWorldgen(c.ctx, c.world, c.sim, kDefaultSeed);
+    c.ctx.WaitIdle();
+
+    const int tz = spot.z + gapVox;
+    const int th = World::TerrainHeight(spot.x, tz, kDefaultSeed);
+    const uint64_t target = c.mobs.Spawn(
+        defIndex, {spot.x - (int)(def.worldSize.x * 0.5f), th + 1,
+                   tz - (int)(def.worldSize.z * 0.5f)});
+    if (target == 0 || !c.mobs.SetMobBehavior(target, quarry)) {
+      err = std::string("could not place the quarry \"") + quarry + "\"";
+      return;
+    }
+    const uint64_t att = AiSpawn(
+        c, defIndex,
+        {spot.x - (int)(def.worldSize.x * 0.5f), spot.y + 1,
+         spot.z - (int)(def.worldSize.z * 0.5f)},
+        attacker, err);
+    if (att == 0) return;
+    c.mobs.SetHeading(att, 0.0f);
+
+    // Settle the rig onto the ground before anything is measured: the reach and
+    // the band both come off a live pose (ai-reach says why).
+    for (int i = 0; i < 4; i++) tick();
+
+    Vec3 prev = AiMobCentre(c.mobs, target, def);
+    float startY = prev.y, lowY = prev.y;
+    f.startMobs = (int)c.mobs.MobCount();
+    f.hp0 = c.mobs.TotalHp(target);
+    double gapSum = 0;
+    int prevHit = 0;
+    for (int i = 0; i < ticks; i++) {
+      tick();
+      f.requests += (int)c.mobs.AttackRequests().size();
+      c.mobs.ClearAttackRequests();
+      // CONTACT EVENTS, counted as RISES of the per-stroke tally, for the same
+      // reason ai-reach counts them that way: `bodiesHit` is cleared when a
+      // stroke resets, so a max over it measures the breadth of ONE swing
+      // rather than how often the creature connected.
+      if (const NpcStroke* st = c.mobs.MobStroke(att)) {
+        if (st->Cutting()) f.cutTicks++;
+        if (st->bodiesHit > prevHit) f.hits += st->bodiesHit - prevHit;
+        prevHit = st->bodiesHit;
+      } else {
+        prevHit = 0;
+      }
+      // ---- WHY, NOT JUST WHETHER (CLAUDE.md rule 6) ------------------------
+      // The three fixes are separable and a bare damage figure cannot tell them
+      // apart, so the brain's own record of two of them is read here: a fight
+      // that goes badly AND reports 0 pursued ticks is a drive failure, one
+      // that reports plenty of them and still misses is an AIM failure. The
+      // repro arm must report zero of both, or it is not reproducing anything.
+      if (const ai::Brain* b = c.mobs.MobBrain(att)) {
+        if (b->heldGround) f.heldGroundTicks++;
+        if (b->pursueDrive > 0.0f) f.pursueTicks++;
+      }
+      if (!c.mobs.IsAlive(target)) {
+        f.killTick = i;
+        break;
+      }
+      f.liveTicks++;
+      // PATH LENGTH, NOT DISPLACEMENT, accumulated per tick: the quarry is
+      // killed partway through most of these fights, and a start-to-finish line
+      // would report the fight that was won FASTEST as the one whose fixture
+      // barely moved.
+      const Vec3 now = AiMobCentre(c.mobs, target, def);
+      lowY = std::min(lowY, now.y);
+      f.travel += AiPlanar(prev, now);
+      prev = now;
+      const float gap = AiPlanar(AiMobCentre(c.mobs, att, def), now);
+      gapSum += (double)gap;
+      f.maxGap = std::max(f.maxGap, gap);
+    }
+    f.fellVox = startY - lowY;
+    f.hp1 = c.mobs.IsAlive(target) ? c.mobs.TotalHp(target) : 0.0f;
+    if (f.liveTicks > 0) f.meanGap = (float)(gapSum / (double)f.liveTicks);
+  };
+
+  // ---- ONE ARM: THE SAME FIGHT SEVERAL TIMES ------------------------------
+  //
+  // REPEATED, AND THIS IS THE PART THAT TOOK THREE RUNS TO LEARN. A duel here
+  // is not a smooth damage race: a cut that reaches a neck severs it and ends
+  // the fight outright, whatever the loser's health bar said a tick earlier. So
+  // one fight is a coin toss with a long tail, and the same profile measured on
+  // three occasions gave kill ticks of 11, 103 and 204 -- a twentyfold spread
+  // on the very number this gate compares. A single-fight differential is
+  // reading that noise, and it will fail on a good change as readily as it
+  // passes on a bad one (CLAUDE.md memory: "Ragdoll gate arms are knife-edge").
+  //
+  // The rounds are not seeded differently on purpose: mob ids advance with
+  // every spawn and every draw in the stroke system is counter-based on
+  // (mobId, tick), so consecutive rounds are already different fights and are
+  // still a pure function of the run. Nothing here reads a clock.
+  struct Arm {
+    const char* name;
+    const char* attacker;
+    const char* quarry;
+    int rounds = 1;
+    std::vector<Fight> f;
+    // POOLED ACROSS THE ROUNDS -- total damage over total ticks -- and NOT the
+    // mean of the per-fight rates. Measured: one round ended in a first-swing
+    // decapitation at tick 21, which is a per-fight rate of 4.76%/t against the
+    // 0.20 its two siblings scored, and averaging the three handed that single
+    // lucky cut 89% of the arm. Pooling weights a round by how long it lasted,
+    // which is the only weighting that treats a short fight as a short fight.
+    float Rate() const {
+      double taken = 0;
+      int t = 0;
+      for (const Fight& x : f) {
+        taken += (double)x.Taken();
+        t += std::max(1, x.liveTicks);
+      }
+      return t > 0 ? (float)(100.0 * taken / (double)t) : 0.0f;
+    }
+    // ...and the same pooling for CONTACTS, which is the lower-variance half of
+    // the same question: a decapitation is one hit and ends a fight, so hits
+    // per tick and damage per tick fail in opposite directions and reporting
+    // both makes a fluke obvious instead of decisive.
+    float HitRate() const {
+      int h = 0, t = 0;
+      for (const Fight& x : f) {
+        h += x.hits;
+        t += std::max(1, x.liveTicks);
+      }
+      return t > 0 ? 100.0f * (float)h / (float)t : 0.0f;
+    }
+    // ---- SWINGS DELIVERED PER HUNDRED TICKS. THE GATE'S PRIMARY CLAIM. -----
+    //
+    // A CUT TICK IS A SWING THAT ACTUALLY HAPPENED, and that is exactly what
+    // the owner asked for: "attacks should be occurring while they walk forward
+    // simultaneously". It is counted downstream of every way a decision can
+    // evaporate -- the arbiter has to pick RequestAttack, `PickAttackStyle` has
+    // to find a style whose reach covers the distance, `BeginStroke` has to
+    // accept it, and the windup has to run to completion -- so unlike a request
+    // count it cannot be satisfied by a creature that merely decides to attack.
+    //
+    // IT IS ALSO THE ONLY HIGH-COUNT SIGNAL HERE. Damage is not: a cut that
+    // reaches a neck ends the fight outright, so `Rate()` is a lottery over a
+    // handful of events and it FLIPPED SIGN between two runs of this gate (3.28
+    // in favour of the fix standalone, 0.71 against it inside a --verify
+    // subset) while the swing rate stayed 3.9x and 6.0x in favour across the
+    // same two runs. Whether a given swing decapitates is the damage model's
+    // business; whether a swing HAPPENS at all is this layer's, and it is the
+    // half that was broken.
+    float SwingRate() const {
+      int cut = 0, t = 0;
+      for (const Fight& x : f) {
+        cut += x.cutTicks;
+        t += std::max(1, x.liveTicks);
+      }
+      return t > 0 ? 100.0f * (float)cut / (float)t : 0.0f;
+    }
+    float MeanGap() const {
+      double s = 0;
+      for (const Fight& x : f) s += (double)x.meanGap;
+      return f.empty() ? 0.0f : (float)(s / (double)f.size());
+    }
+    float FleeRate() const {
+      double s = 0;
+      for (const Fight& x : f) s += (double)x.FleeRate();
+      return f.empty() ? 0.0f : (float)(s / (double)f.size());
+    }
+    int Sum(int Fight::*m) const {
+      int n = 0;
+      for (const Fight& x : f) n += x.*m;
+      return n;
+    }
+    int Kills() const {
+      int n = 0;
+      for (const Fight& x : f)
+        if (x.killTick >= 0) n++;
+      return n;
+    }
+  };
+  // The CONTROL is first: a stationary quarry is the configuration every other
+  // AI gate already measures, so an arm that moved here means this change
+  // reached past its subject. One round -- it is a sanity check on the band,
+  // not a damage race, and its quarry cannot dodge anything.
+  Arm arms[] = {{"static", "duelist", "training_dummy", 1},
+                {"prefix", "_aip_prefix", "_aip_runner", rounds},
+                {"pursuing", "duelist", "_aip_runner", rounds}};
+
+  for (Arm& a : arms)
+    for (int r = 0; r < a.rounds; r++) {
+      Fight f;
+      fight(a.attacker, a.quarry, f);
+      if (!err.empty()) {
+        detail = std::string("arm ") + a.name + ": " + err;
+        return Status::Fail;
+      }
+      a.f.push_back(f);
+    }
+
+  c.mobs.Reset();
+  c.debris.Reset();
+  // Drop the cloned repro arm so the rest of the suite sees the authored
+  // library it would have seen anyway. After Reset(), so no live brain is
+  // holding an index into what is about to be truncated.
+  if (c.mobs.Behaviors().profiles.size() > libSize0)
+    c.mobs.BehaviorsMut().profiles.resize(libSize0);
+
+  const Arm& stat = arms[0];
+  const Arm& pre = arms[1];
+  const Arm& run = arms[2];
+
+  // ---- the claims ---------------------------------------------------------
+  //
+  // 1. THE FIXTURE ACTUALLY RAN AWAY, in BOTH retreating arms. First, and it is
+  //    the "a fixture that measures itself" guard: a `retreater` that wedged on
+  //    a rise, fell in a hole or never perceived its attacker is a statue, and
+  //    then the differential below is one duelist beating a dummy against
+  //    another duelist beating a dummy. A crouchwalk is
+  //    walkSpeed 1.6 m/s x crouchSpeedScale 0.5 = 8 vox/s; asking for 3 as a
+  //    MEAN over the rounds tolerates both the terrain it has to cross and the
+  //    rounds that end early, without tolerating a statue.
+  const float minFlee = (float)BaselineNumber("aiPursueMinFleeVoxPerSec", 3.0);
+  const bool fled = run.FleeRate() >= minFlee && pre.FleeRate() >= minFlee;
+  // 2. IT LANDED BLOWS ON SOMETHING WALKING AWAY, and they mattered. An
+  //    ABSOLUTE floor and deliberately a loose one: it is here so that a change
+  //    which swings enthusiastically at thin air cannot pass claim 3, not to
+  //    state the size of the improvement. Damage is a lottery on this fixture
+  //    (see Arm::SwingRate) and a tight threshold on it would make the gate
+  //    flap.
+  const int minHits = (int)BaselineNumber("aiPursueMinHits", 6);
+  const float minRate = (float)BaselineNumber("aiPursueMinRate", 0.15);
+  const bool landed = run.Sum(&Fight::hits) >= minHits && run.Rate() >= minRate;
+  // 3. ...AND IT SWUNG FAR MORE OFTEN THAN THE CREATURE THAT COULD NOT. THE
+  //    CLAIM. The same fight, the same quarry, the same tick budget, fought by
+  //    the creature this engine shipped before 2026-09-16, compared on SWINGS
+  //    DELIVERED per tick -- the one measure here with enough events in it to
+  //    mean something (Arm::SwingRate says why at length, including the run
+  //    where the damage ratio said the opposite). Measured 3.9x and 6.0x
+  //    against a threshold of 2.
+  const float minRatio = (float)BaselineNumber("aiPursueMinSwingRatio", 2.0);
+  const float swingRatio = pre.SwingRate() > 1e-4f
+                               ? run.SwingRate() / pre.SwingRate()
+                               : (run.SwingRate() > 0 ? 99.0f : 0.0f);
+  const bool beatsRepro = swingRatio >= minRatio;
+  const float rateRatio = pre.Rate() > 1e-4f
+                              ? run.Rate() / pre.Rate()
+                              : (run.Rate() > 0 ? 99.0f : 0.0f);
+  // 4. ...AND THE REPRO IS REALLY THE OLD CREATURE. Its two observable knobs
+  //    must be OFF and the subject's must be ON, which the brain reports
+  //    directly: an arm reading somebody else's profile would make the
+  //    differential a comparison between two identical fighters.
+  const bool reproIsOld = pre.Sum(&Fight::pursueTicks) == 0 &&
+                          pre.Sum(&Fight::heldGroundTicks) == 0 &&
+                          run.Sum(&Fight::pursueTicks) > 0;
+  // 5. THE CONTROL DID NOT MOVE. A stationary target is what every other AI
+  //    gate measures; if this arm's stand-off left the duelist's band, the
+  //    change reached past its subject and `ai-reach`, `duel` and `npc-styles`
+  //    are being retuned behind their own backs.
+  const float tol = (float)BaselineNumber("aiPursueBandTolVox", 2.5);
+  const bool controlHeld = stat.MeanGap() >= 7.0f - tol &&
+                           stat.MeanGap() <= 11.0f + tol && stat.Rate() > 0.0f;
+
+  RecordObserved("aiPursueSwingPursuing", (double)run.SwingRate());
+  RecordObserved("aiPursueSwingPrefix", (double)pre.SwingRate());
+  RecordObserved("aiPursueSwingRatio", (double)swingRatio);
+  RecordObserved("aiPursueRatePursuing", (double)run.Rate());
+  RecordObserved("aiPursueRatePrefix", (double)pre.Rate());
+  RecordObserved("aiPursueRateRatio", (double)rateRatio);
+  RecordObserved("aiPursueHitsPursuing", (double)run.Sum(&Fight::hits));
+  RecordObserved("aiPursueHitsPrefix", (double)pre.Sum(&Fight::hits));
+  RecordObserved("aiPursueGapPursuing", (double)run.MeanGap());
+  RecordObserved("aiPursueGapPrefix", (double)pre.MeanGap());
+  RecordObserved("aiPursueGapStatic", (double)stat.MeanGap());
+  RecordObserved("aiPursueFleeVoxPerSec", (double)run.FleeRate());
+
+  const bool ok = fled && landed && beatsRepro && reproIsOld && controlHeld;
+  std::string per;
+  for (const Arm& a : arms) {
+    per += Format("%s[%dx: ", a.name, (int)a.f.size());
+    for (const Fight& f : a.f)
+      per += Format("%.0f%%/%dt%s ", f.Taken() * 100.0f, f.liveTicks,
+                    f.killTick >= 0 ? "K" : "");
+    per += Format(
+        "] %.1f cut/100t, %.2f%%hp/t, %.1f hit/100t, %d req, %d cut, %d hit, "
+        "%d kill, gap %.1f, held %d, pursued %d, fled %.1f vox/s, %d mobs, "
+        "fell %.1f | ",
+        a.SwingRate(), a.Rate(), a.HitRate(), a.Sum(&Fight::requests),
+        a.Sum(&Fight::cutTicks),
+        a.Sum(&Fight::hits), a.Kills(), a.MeanGap(),
+        a.Sum(&Fight::heldGroundTicks), a.Sum(&Fight::pursueTicks),
+        a.FleeRate(), a.f.empty() ? 0 : a.f[0].startMobs,
+        a.f.empty() ? 0.0f : a.f[0].fellVox);
+  }
+  detail = Format(
+      "%d ticks x %d rounds from %d vox (relief %d): %squarry fled>=%.0f "
+      "vox/s=%d, landed >=%d hits at >=%.2f%%/t=%d, OUT-SWUNG THE PRE-FIX REPRO "
+      "%.2fx (>=%.2fx)=%d [damage %.2fx, not asserted], repro really "
+      "flat-footed=%d, control in band=%d",
+      ticks, rounds, gapVox, relief, per.c_str(), minFlee, fled ? 1 : 0,
+      minHits, minRate, landed ? 1 : 0, swingRatio, minRatio,
+      beatsRepro ? 1 : 0, rateRatio, reproIsOld ? 1 : 0, controlHeld ? 1 : 0);
+  return ok ? Status::Pass : Status::Fail;
+}
+
 Status GateAiApproach(Ctx& c, std::string& detail) {
   c.debris.Reset();
   c.mobs.Reset();
@@ -7678,6 +8168,11 @@ const std::vector<Gate>& MobGates() {
       // feet -- the one configuration every fixture above happens to avoid,
       // because each of them is either armed with a sword or nailed down.
       {"ai-reach", "mob", {}, false, GateAiReach, /*needsRender=*/false},
+      // ...and the one every fixture above ALSO avoids: a target that is
+      // WALKING AWAY. Both of the two before this fight a `training_dummy`,
+      // which is blind, passive and immobile by construction, so standing
+      // still between swings and aiming at the present cost nothing.
+      {"ai-pursue", "mob", {}, false, GateAiPursue, /*needsRender=*/false},
       // The sloped-terrain regime the three above never touch: a real ramp,
       // asserting the body stays ON it (never inside it) and does not lean
       // like furniture while climbing.

@@ -6422,6 +6422,56 @@ rather than when a blow lands, because this layer must not learn whether a blow
 landed — an AI that waits for hit confirmation stops swinging the moment the
 seam is stubbed.
 
+**A swing is a step forward, and it is aimed where the target will be
+(2026-09-16; `attack.pursueSpeed`, `holdGroundFrac`, `leadTicks`).** Holding a
+*facing* through a stroke and holding a *position* are different promises, and
+the commit window was making both. Three separate things followed from that, and
+a creature fighting a target that walks away lost to all three at once:
+
+1. **The feet were nailed down for the whole telegraph.** `RequestAttack` wrote
+   a heading and no drive; the commit override then replaced the winning intent
+   with FaceTarget, which also writes no drive. `attack.pursueSpeed` is the
+   fraction of walk speed a creature may spend closing *while* a blow is
+   committed, applied after the arbiter (the only place that can reach past the
+   override) and only ever as a `max`, so an intent that already wants to close
+   harder keeps its own number and a too-close retreat is untouched.
+2. **The step-off was a second retreat.** `disengageTicks` lifts the band floor
+   to its ceiling after every swing — "hit and step off", and right against
+   someone standing their ground. Against someone already leaving, the gap opens
+   at the sum of both speeds and the creature never gets a second swing away.
+   The window is now suspended while the target's *radial* velocity exceeds
+   `holdGroundFrac` of the creature's own speed. That threshold is a **noise
+   floor, not a judgement about pace** — sized as the latter (0.30) it never
+   fired once against the crouchwalking player it was written for, because a
+   crouchwalk is 0.25 of a `human`'s walk.
+3. **The blow was aimed where the target had been.** `StartStroke` freezes
+   `AttackRequest::targetPoint` and `StepStroke` re-derives the aim from that
+   stored copy every tick — correct, because a committed cut must not home —
+   which makes the request the *one* instant the destination is chosen.
+   `leadTicks` (`-1` = use `commitTicks`, `0` = none) extrapolates along
+   `Brain::targetVel` to where the edge will actually arrive: windup plus half a
+   cut, about 15 ticks for the NPC sword styles.
+
+`Brain::targetVel` is sampled only between **consecutive visible ticks of one
+target**, because the two other ways a remembered position moves are both lies —
+`Perceive` freezes `targetPos` while an alert decays, so a differenced position
+reports a creature standing perfectly still, which is the most dangerous
+available reading of the target that just broke contact.
+
+The predicted distance (`Brain::leadDist`) gates the commit and feeds
+`PickAttackStyle`, and is **clamped to the present distance so it can only bring
+a commit forward, never push one back**. Unclamped it made the creature passive:
+with the lead on and the pursuit off, a fleeing target predicts *further* than it
+is, and the duelist issued one attack request in 360 ticks against the eight the
+unmodified creature managed. Refusing to swing because the target might be out of
+reach in fifteen ticks spends a whole cadence on a certainty of nothing, and the
+refusal is not this layer's to make anyway — `BeginStroke` checks the drawn
+style's own reach at the instant the stroke would start.
+
+All three are authored per profile and all three are data, which is what lets the
+`ai-pursue` gate carry its own pre-fix repro arm instead of needing a second
+binary.
+
 **Determinism.** Everything here is CPU-float gameplay state beside the gait and
 the melee pose; the AI never writes a voxel, it writes a desired heading and a
 drive vector. It runs only inside the fixed 30 Hz tick, and every random draw —
