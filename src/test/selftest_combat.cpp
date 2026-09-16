@@ -69,6 +69,7 @@
 
 #include "audio/cues.h"
 #include "game/ai_behavior.h"
+#include "game/bodyreg.h"
 #include "game/item.h"
 #include "game/melee.h"
 #include "game/mob.h"
@@ -2264,6 +2265,156 @@ Status GateZombieDraw(Ctx& c, std::string& detail) {
 }
 
 // =============================================================================
+// limb-alias — ONE BRICK RECORD, ONE HOLDER, through a whole fight
+// =============================================================================
+//
+// Owner report 2026-09-16: "I kill a few zombies and then my torso or arm
+// swaps with one of theirs; my foot becomes a zombie torso."
+//
+// A limb wearing another creature's shape has exactly two causes and they live
+// in different files, which is why eliminating them one run at a time (rule 6)
+// was never going to end:
+//
+//   THE RECORD   two entities holding one `MicroBodySet` model index. The
+//                first edit rewrites the other's art, the first free zeroes
+//                the record's dims, and the freed record goes back on
+//                `freeModels` while a live body still points at it — so the
+//                NEXT carve anywhere in the world is handed a record with a
+//                stale holder (sim/microbody.h MicroBodyClone).
+//   THE SLOT     an instance is (slot, model) and the shader draws `model` at
+//                `bodyXforms[slot]`. A slot base built from a COUNT rather
+//                than from the walk that emitted the transforms puts every
+//                mob limb and avatar part at somebody else's transform —
+//                `DebrisSystem::AdoptBody` takes no cap, so `bodies_` runs
+//                past kMaxBodies whenever a corpse hands over fifteen limbs
+//                at once, and `BodyCount()` then overstates the slots the
+//                debris walks actually wrote (game/bodyreg.cpp).
+//
+// Both are checked by `BodyRegistry::AuditMicroModels` + `BuildMicroInsts`,
+// which name the two entities involved instead of reporting a count. This gate
+// is the fixture that makes them fire: a real brawl, run until corpses pile up,
+// audited EVERY tick — because the aliasing window opens at a death and can
+// close again at the next cull, and a check at the end would photograph an
+// empty room.
+//
+// THE FIXTURE HAS TO PRODUCE DEATHS, and a fixture that cannot fail measures
+// nothing: the detail line reports the corpse count, so a run that killed
+// nobody says so rather than passing on an empty audit.
+Status GateLimbAlias(Ctx& c, std::string& detail) {
+  IdCounterScope idScope(c.mobs);
+  bool ok = true;
+  int checks = 0;
+  auto check = [&](bool cond, const std::string& what) {
+    checks++;
+    if (!cond) {
+      ok = false;
+      std::printf("limb-alias: FAILED %s\n", what.c_str());
+    }
+  };
+
+  Stage st = OpenStage(c);
+  if (!st.ok) {
+    detail = st.why;
+    std::printf("limb-alias: SKIP (%s)\n", detail.c_str());
+    return Status::Skip;
+  }
+  // THREE DUELS, not one. The record table is a shared allocator and the fault
+  // it is being asked about is a RECYCLED index — which needs somebody still
+  // alive to carve while somebody else's corpse is being culled. One pair dies
+  // once and the pool never turns over.
+  //
+  // THE SHAPE IS `duel`'s, deliberately: opposed profiles, armed, and FACED AT
+  // EACH OTHER before the first tick. That gate's own note says why — a
+  // creature spawned behind another is outside its 300-degree field of view
+  // and nothing in the behaviour layer ever looks around, so an unfaced pair
+  // stands back to back for the whole run. Measured here first: three
+  // zombie/duelist pairs six voxels apart produced 0 deaths and 1 debris body
+  // in 900 ticks, which is a fixture that cannot fail.
+  const float gap = (float)BaselineNumber("limbAlias.gapVox", 14.0);
+  std::string why;
+  std::vector<uint64_t> fighters;
+  for (int k = 0; k < 3; k++) {
+    const int dx = (k - 1) * 12;
+    const uint64_t red =
+        SpawnFighter(c, st.defIndex, {st.spot.x + dx, st.spot.y + 1, st.spot.z},
+                     "duelist", true, why);
+    const uint64_t blue = SpawnFighter(
+        c, st.defIndex,
+        {st.spot.x + dx, st.spot.y + 1, st.spot.z + (int)std::lround(gap)},
+        "duelist_blue", true, why);
+    if (red == 0 || blue == 0) {
+      detail = why.empty() ? "fixture spawn failed" : why;
+      std::printf("limb-alias: SKIP (%s)\n", detail.c_str());
+      CloseStage(c);
+      return Status::Skip;
+    }
+    fighters.push_back(red);
+    fighters.push_back(blue);
+  }
+  Ticker settle{c, 26400, {st.spot.x >> 4, st.spot.y >> 4, st.spot.z >> 4}};
+  for (int i = 0; i < 4; i++) settle();   // rigs onto the ground, nothing else
+  for (size_t k = 0; k + 1 < fighters.size(); k += 2) {
+    FaceAt(c.mobs, fighters[k], Chest(c.mobs, fighters[k + 1], *st.def));
+    FaceAt(c.mobs, fighters[k + 1], Chest(c.mobs, fighters[k], *st.def));
+  }
+
+  // The registry the frame loop builds, with the brick pool attached — without
+  // `MicroSet()` the audit is a no-op and this gate would pass on nothing.
+  const MicroBodySet* mset = c.debris.MicroSet();
+  check(mset != nullptr, "the debris system publishes a MicroBodySet");
+
+  Ticker& tick = settle;
+  uint32_t faults = 0, peakBodies = 0, peakSlots = 0, deaths = 0;
+  uint32_t firstFaultTick = 0;
+  const int ticks = (int)BaselineNumber("limbAlias.ticks", 900);
+  std::vector<MicroBodyInstGpu> insts;
+  for (int i = 0; i < ticks; i++) {
+    tick();
+    BodyRegistry reg(c.debris, c.mobs, nullptr, mset);
+    // BOTH halves, every tick: BuildMicroInsts carries the slot-space checks
+    // and AuditMicroModels carries the holder checks, and the two failures are
+    // not reachable from each other's evidence.
+    reg.BuildMicroInsts(insts);
+    const uint32_t f = reg.AuditMicroModels();
+    if (f > 0 && faults == 0) firstFaultTick = (uint32_t)i;
+    faults += f;
+    peakBodies = std::max(peakBodies, c.debris.BodyCount());
+    peakSlots = std::max(peakSlots, reg.TotalSlots());
+  }
+  for (uint64_t id : fighters)
+    if (c.mobs.FindMobById(id) == nullptr) deaths++;
+
+  // A CORPSE IS THE PRECONDITION, not the subject. The fault needs a death to
+  // put a record back on the free list and a survivor to take it, so a run
+  // that produced neither has not tested anything and must not report PASS.
+  check(deaths > 0,
+        Format("the brawl killed somebody (%u of %zu fighters gone in %d ticks)",
+               deaths, fighters.size(), ticks));
+  check(peakBodies > 0, "the fight produced debris bodies");
+  check(faults == 0,
+        Format("no brick record has two holders and no instance claims "
+               "another body's slot (%u faults, first at tick %u — the named "
+               "reports are on stderr and in build/microbody_audit.log)",
+               faults, firstFaultTick));
+
+  RecordObserved("limbAliasFaults", (double)faults);
+  RecordObserved("limbAliasDeaths", (double)deaths);
+  RecordObserved("limbAliasPeakBodies", (double)peakBodies);
+  RecordObserved("limbAliasPeakSlots", (double)peakSlots);
+  std::printf(
+      "limb-alias: %d ticks, %u of %zu fighters dead, peak %u debris bodies / "
+      "%u body slots (ceiling %u), %u faults\n",
+      ticks, deaths, fighters.size(), peakBodies, peakSlots, kMaxBodySlots,
+      faults);
+
+  CloseStage(c);
+  detail = Format("%u faults over %d ticks; %u dead, peak %u bodies / %u slots",
+                  faults, ticks, deaths, peakBodies, peakSlots);
+  std::printf("limb-alias: %s (%d checks)\n", ok ? "PASS" : "FAIL", checks);
+  return ok ? Status::Pass : Status::Fail;
+}
+
+// =============================================================================
 // unarmed-attack — a fist is a weapon, and losing one costs a style
 // =============================================================================
 Status GateUnarmedAttack(Ctx& c, std::string& detail) {
@@ -3106,6 +3257,10 @@ const std::vector<Gate>& CombatGates() {
       {"lunge", "mob", {}, false, GateLunge},
       {"bite-target", "mob", {}, false, GateBiteTarget},
       {"zombie-draw", "mob", {}, false, GateZombieDraw},
+      // ...and the one that watches the BRICK POOL while they do it. Same
+      // fixture shape, same place in kOrder, but its subject is the render
+      // bookkeeping the fight churns rather than the fight.
+      {"limb-alias", "mob", {}, false, GateLimbAlias},
       // ---- the directional flinch (mob.h Mob::HitReact) -------------------
       // Spawns one passive dummy and hits it twice through the ordinary
       // MobSystem entry point. Same shape as the ones above — id scope in,

@@ -2068,6 +2068,11 @@ class Mob {
   void AppendXforms(std::vector<BodyXformGpu>& out) const;
   uint32_t AppendMicroInsts(std::vector<MicroBodyInstGpu>& out,
                             uint32_t slotBase) const;
+  // Every brick record this creature holds, DRAWN OR NOT (sim/microbody.h
+  // MicroHolder). A limb keeps `microModel` after a sever hands the brick to
+  // DebrisSystem and after Die() does, so the slots that no longer draw are
+  // precisely the stale holders worth naming. Audit path only.
+  void AppendMicroHolders(std::vector<MicroHolder>& out) const;
   void AppendDebugBoxes(std::vector<DebugBox>& out, size_t limit,
                         uint32_t color) const;
   uint32_t LimbBodyCount() const;
@@ -3608,13 +3613,19 @@ class MobSystem {
 
   // Render plumbing: limbs append after the debris bodies' slots.
   bool InstancesDirty() const { return instancesDirty_; }
-  void AppendInstances(std::vector<BodyVoxInst>& out, uint32_t slotBase);
+  // Both return THE NEXT FREE SLOT, which is not `slotBase + LimbBodyCount()`:
+  // the walks stop at kMaxBodySlots and the count does not. A caller stacking
+  // another system after this one must use the returned value, or it lays that
+  // system's parts over somebody else's transforms (game/bodyreg.cpp).
+  uint32_t AppendInstances(std::vector<BodyVoxInst>& out, uint32_t slotBase);
   void AppendXforms(std::vector<BodyXformGpu>& out) const;
   // Append this system's micro limbs to the COMPACTED draw list, using the same
   // slot walk as AppendXforms/AppendInstances so the recorded slot is the one
   // the limb's transform lands in — sim/microbody.h.
-  void AppendMicroInsts(std::vector<MicroBodyInstGpu>& out,
-                        uint32_t slotBase) const;
+  uint32_t AppendMicroInsts(std::vector<MicroBodyInstGpu>& out,
+                            uint32_t slotBase) const;
+  // Every brick record every creature in this system holds, drawn or not.
+  void AppendMicroHolders(std::vector<MicroHolder>& out) const;
   // Collision-box debug overlay (world.h DebugBox, the dev panel's "collision
   // boxes" toggle). One oriented wireframe per LIVE limb body, read from the
   // body's actual Jolt collider via Physics::GetLocalBounds — not from the

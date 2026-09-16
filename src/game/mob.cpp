@@ -8825,8 +8825,14 @@ void Mob::ReleaseLimbMicro(MobLimb& limb) {
   // model, which every other instance of that mob is also using. MicroBodyFree
   // ignores shared models, but the `carved` gate makes the intent explicit at
   // the call site rather than relying on that.
-  if (limb.carved && limb.microModel >= 0 && MicroSet())
+  if (limb.carved && limb.microModel >= 0 && MicroSet()) {
     MicroBodyFree(*MicroSet(), (uint32_t)limb.microModel);
+    // The record is back on `freeModels` and the next MicroBodyClone anywhere
+    // will hand it to somebody else. A slot that went on pointing at it would
+    // be that somebody's second, invisible owner — the same two-holder state
+    // DetachLimb's note describes, reached by the other door.
+    limb.microModel = -1;
+  }
   limb.carved = false;
 }
 
@@ -13899,6 +13905,27 @@ void Mob::DetachLimb(int limbIndex, bool adopt) {
                        std::move(limb.skinVoxels), def.bleedMat, WoundOf(limb));
     limb.skinVoxels.clear();
     limb.carved = false;
+    // ...AND THE SLOT FORGETS THE INDEX, not just the ownership. `carved =
+    // false` says "do not free this", which stops the double-free and stops
+    // nothing else: the slot survives the sever (it holds the kinematic piece
+    // for kSeverHoldSeconds, and the avatar keeps its whole limb list past
+    // death), so it is still a HOLDER of a record DebrisSystem now owns. Two
+    // holders is the state every lifecycle rule in sim/microbody.h is written
+    // to exclude — the first edit rewrites the other's art, the first free
+    // zeroes the record's dims, and the record goes back on `freeModels` while
+    // the survivor still points at it, so the next carve ANYWHERE in the world
+    // is handed a brick with a stale owner. Owner report 2026-09-16: "I kill a
+    // few zombies and then my torso swaps with one of theirs; my foot becomes
+    // a zombie torso." Caught by the `limb-alias` gate, which named this exact
+    // slot ("human#2 limb hips (NO BODY, in sever hold, DEAD)").
+    //
+    // -1 and not "keep it, it is only a read" because the re-own is a single
+    // MicroBodyOwn away: that call answers "may this body edit its brick?" and
+    // an already-owned record returns ITSELF, so any later reskin of this slot
+    // would silently start editing the debris body's brick and mark itself
+    // carved. Nothing draws from the slot in the meantime — AppendInstances
+    // and AppendMicroInsts both skip a limb with no body.
+    limb.microModel = -1;
     limb.holdBody = limb.body;
     limb.holdSeconds = kSeverHoldSeconds;
     // ...AND IT KEEPS ITS GEAR ON. The shells noted above were adopted by the
@@ -14104,6 +14131,11 @@ void Mob::Die() {
     phys_->ReleaseToWorldWhenClear(limb.body);
     limb.skinVoxels.clear();
     limb.carved = false;  // brick ownership moved with the body (see DetachLimb)
+    // ...and the index with it. The avatar does NOT drop its limb list on
+    // death (DropLimbListOnDeath), so without this every one of the player's
+    // slots spends the whole death screen — and everything after it — holding
+    // a record its corpse owns. See the long note in DetachLimb.
+    limb.microModel = -1;
     limb.body = 0;
     if (limb.joint) limb.joint = 0;  // ownership follows the bodies now
     if (i < anim_.partAlive.size()) anim_.partAlive[i] = 0;
@@ -14136,11 +14168,12 @@ void Mob::Die() {
   }
 }
 
-void MobSystem::AppendInstances(std::vector<BodyVoxInst>& out,
-                                uint32_t slotBase) {
+uint32_t MobSystem::AppendInstances(std::vector<BodyVoxInst>& out,
+                                    uint32_t slotBase) {
   uint32_t slot = slotBase;
   for (Mob& mob : mobs_) slot = mob.AppendInstances(out, slot);
   instancesDirty_ = false;
+  return slot;
 }
 
 uint32_t Mob::AppendInstances(std::vector<BodyVoxInst>& out, uint32_t slotBase) {
@@ -14259,10 +14292,11 @@ void MobSystem::FlashBody(uint64_t bodyHandle, float amount) {
       }
 }
 
-void MobSystem::AppendMicroInsts(std::vector<MicroBodyInstGpu>& out,
-                                 uint32_t slotBase) const {
+uint32_t MobSystem::AppendMicroInsts(std::vector<MicroBodyInstGpu>& out,
+                                     uint32_t slotBase) const {
   uint32_t slot = slotBase;
   for (const Mob& mob : mobs_) slot = mob.AppendMicroInsts(out, slot);
+  return slot;
 }
 
 uint32_t Mob::AppendMicroInsts(std::vector<MicroBodyInstGpu>& out,
@@ -14290,6 +14324,33 @@ uint32_t Mob::AppendMicroInsts(std::vector<MicroBodyInstGpu>& out,
     slot++;
   }
   return slot;
+}
+
+void MobSystem::AppendMicroHolders(std::vector<MicroHolder>& out) const {
+  for (const Mob& mob : mobs_) mob.AppendMicroHolders(out);
+}
+
+void Mob::AppendMicroHolders(std::vector<MicroHolder>& out) const {
+  for (size_t i = 0; i < limbs_.size(); i++) {
+    const MobLimb& limb = limbs_[i];
+    if (limb.microModel < 0) continue;
+    // The state that decides whether this holder is legitimate, spelled out:
+    // `carved` says the slot believes it OWNS the record, and a slot with no
+    // body has already handed its brick to DebrisSystem (DetachLimb / Die) —
+    // so "no body, carved" and "no body" on an owned record are the two
+    // shapes a stale holder takes.
+    char buf[224];
+    std::snprintf(buf, sizeof(buf), "%s#%llu limb %s%s (%s%s%s%s)",
+                  def_ ? def_->name.c_str() : "?",
+                  (unsigned long long)id_,
+                  i < limbDefs_.size() ? limbDefs_[i].name.c_str() : "?",
+                  (int)i >= baseLimbs_ ? " [appended]" : "",
+                  limb.body ? "body" : "NO BODY",
+                  limb.carved ? ", carved" : "",
+                  limb.holdBody ? ", in sever hold" : "",
+                  alive_ ? "" : ", DEAD");
+    out.push_back({(uint32_t)limb.microModel, buf});
+  }
 }
 
 uint64_t MobSystem::LimbBody(uint64_t mobId, int limbIndex) const {

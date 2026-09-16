@@ -11673,7 +11673,15 @@ int main(int argc, char** argv) {
       // sends only the WORD RANGES that changed (per-voxel burning dirties the
       // pool every tick, and the whole pool is 4 MiB).
       if (mbSet.dirty) sim.UploadMicroBodies(ctx.queue, mbSet);
-      BodyRegistry bodyReg(debris, mobs, &avatar);
+      BodyRegistry bodyReg(debris, mobs, &avatar, &mbSet);
+      // WHO ELSE IS HOLDING MY ARM. One index sweep while everything is
+      // healthy, a named report the moment two entities point at one brick
+      // record or a holder is left pointing at a freed one — the owner-visible
+      // symptom of either is a limb wearing another creature's shape.
+      // Rate-limited to one line per distinct fault and mirrored to
+      // build/microbody_audit.log, because this fires while somebody is
+      // playing and a windowed session's stderr goes nowhere.
+      bodyReg.AuditMicroModels();
       if (bodyReg.AnyInstancesDirty()) {
         std::vector<BodyVoxInst> inst;
         bodyReg.BuildInstances(inst);

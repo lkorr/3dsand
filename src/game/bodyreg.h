@@ -1,4 +1,5 @@
 #pragma once
+#include <cstdarg>
 #include <cstdint>
 #include <vector>
 
@@ -33,8 +34,9 @@
 class BodyRegistry {
  public:
   BodyRegistry(DebrisSystem& debris, MobSystem& mobs,
-               PlayerAvatar* avatar /*nullable*/)
-      : debris_(debris), mobs_(mobs), avatar_(avatar) {}
+               PlayerAvatar* avatar /*nullable*/,
+               const MicroBodySet* microSet = nullptr)
+      : debris_(debris), mobs_(mobs), avatar_(avatar), microSet_(microSet) {}
 
   // Per-slot transforms, refreshed every frame (cheap).
   void BuildXforms(std::vector<BodyXformGpu>& out) const;
@@ -45,6 +47,15 @@ class BodyRegistry {
   // and an empty result means the pass is skipped entirely (sim/microbody.h).
   void BuildMicroInsts(std::vector<MicroBodyInstGpu>& out) const;
 
+  // ---- the brick-record audit ----------------------------------------------
+  // "Does any record have two holders, or a holder pointing at a record that
+  // has already been freed?" Returns the number of faults reported; 0 is
+  // clean. Cheap when clean (one index sweep, no strings), so the frame loop
+  // can call it every tick — see the two-phase note in the .cpp.
+  //
+  // Needs `microSet` in the constructor; without one it is a no-op.
+  uint32_t AuditMicroModels() const;
+
   // Total slots the walk currently occupies (== xform count).
   uint32_t TotalSlots() const;
   // Any system's instance list changed since it was last built. Slot bases
@@ -52,7 +63,19 @@ class BodyRegistry {
   bool AnyInstancesDirty() const;
 
  private:
+  // Rate-limited fault report: stderr AND build/microbody_audit.log, one line
+  // per distinct message ever (a body-swap persists, so an unthrottled report
+  // is thousands of identical lines a second).
+  void Report(const char* fmt, ...) const;
+
   DebrisSystem& debris_;
   MobSystem& mobs_;
   PlayerAvatar* avatar_;
+  const MicroBodySet* microSet_ = nullptr;
+  // Audit scratch. A BodyRegistry is constructed per frame at every call site,
+  // so these buy nothing across frames — they exist so the audit's cheap phase
+  // allocates nothing on the frames where it finds nothing, which is all of
+  // them until something is wrong.
+  mutable std::vector<uint32_t> scratch_;
+  mutable std::vector<MicroHolder> holders_;
 };

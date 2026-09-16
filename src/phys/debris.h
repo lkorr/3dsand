@@ -1,4 +1,5 @@
 #pragma once
+#include <algorithm>
 #include <array>
 #include <chrono>
 #include <cstdint>
@@ -333,8 +334,25 @@ class DebrisSystem {
   // per-slot array to filter afterwards) is what makes a world with no micro
   // bodies cost one loop and no allocation — sim/microbody.h.
   void AppendMicroInsts(std::vector<MicroBodyInstGpu>& out) const;
+  // Every brick record this system holds, drawn or not (sim/microbody.h
+  // MicroHolder). Used by the aliasing audit, never by the frame path.
+  void AppendMicroHolders(std::vector<MicroHolder>& out) const;
   uint32_t InstanceCount() const { return instanceCount_; }
   uint32_t BodyCount() const { return (uint32_t)bodies_.size(); }
+  // HOW MANY SLOTS THIS SYSTEM OCCUPIES IN THE SHARED BODY SLOT SPACE, which
+  // is NOT BodyCount(): the three render walks all stop at kMaxBodies, and
+  // `bodies_` is allowed past it between an adoption and the next PostStep
+  // cull (AdoptBody takes no cap — a corpse hands over fifteen limbs at once).
+  //
+  // Everything downstream of this system indexes ONE shared transform array,
+  // so a slot base taken from BodyCount() while the walks emitted fewer puts
+  // every mob limb and every avatar part at somebody else's transform. That is
+  // a body-swap, not a missing body, and it is invisible in any test that does
+  // not push past two hundred bodies. game/bodyreg.cpp is the only caller that
+  // should ever need this.
+  uint32_t SlotCount() const {
+    return (uint32_t)std::min<size_t>(bodies_.size(), kMaxBodies);
+  }
   // Voxels across every body, counted on each one's AUTHORITATIVE lattice.
   //
   // The obvious alternative — counting the cube instances BuildInstances emits

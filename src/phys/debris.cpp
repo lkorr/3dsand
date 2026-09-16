@@ -5402,6 +5402,22 @@ void DebrisSystem::AppendMicroInsts(std::vector<MicroBodyInstGpu>& out) const {
                      bodies_[i].micro.dye});
 }
 
+void DebrisSystem::AppendMicroHolders(std::vector<MicroHolder>& out) const {
+  // EVERY body, not just the ones the walks above draw. A body past kMaxBodies
+  // is still a holder — it owns its record and its ReleaseBody will still free
+  // it — and it is exactly the one an overflowing cull is about to retire.
+  for (size_t i = 0; i < bodies_.size(); i++) {
+    const Body& b = bodies_[i];
+    if (!b.micro.Valid()) continue;
+    char buf[160];
+    std::snprintf(buf, sizeof(buf),
+                  "debris body %zu/%zu (handle %llu, serial %u%s)", i,
+                  bodies_.size(), (unsigned long long)b.handle, b.serial,
+                  i >= kMaxBodies ? ", PAST kMaxBodies" : "");
+    out.push_back({b.micro.model, buf});
+  }
+}
+
 uint32_t DebrisSystem::ActiveBodyCount() const {
   uint32_t n = 0;
   for (const Body& b : bodies_)

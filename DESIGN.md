@@ -5849,6 +5849,29 @@ handmade art becomes matter the existing destruction pipeline already breaks.
   Jolt `GroupFilterTable` — adjacent limb boxes otherwise fight their joints
   and the ragdoll never sleeps. Mob limbs render as extra body slots appended
   after the debris bodies (shared 12-bit slot space, `kMaxBodySlots`).
+
+  **A SLOT BASE IS WHAT THE WALK EMITTED, NEVER WHAT THE SYSTEM CONTAINS**
+  (`game/bodyreg.cpp`, 2026-09-16). Three parallel arrays are indexed by body
+  slot — the transforms, the cube instances and the compacted micro-body draw
+  list — and an instance is `(slot, model)` drawn at `bodyXforms[slot]`, so a
+  base that is one too high does not lose a body, it SWAPS two. The mob base
+  used to be `DebrisSystem::BodyCount()` while all three debris walks stop at
+  `kMaxBodies`, and `AdoptBody` takes no cap — a corpse hands over fifteen
+  limbs at once and `bodies_` sits past the ceiling until the next `PostStep`
+  cull. `DebrisSystem::SlotCount()` is the emitted count and is the only legal
+  base; the mob walks return their next free slot for the same reason.
+
+  **A BRICK RECORD HAS EXACTLY ONE HOLDER**, and handing a limb to
+  `AdoptBody` means the slot forgets the index, not merely the ownership flag.
+  `Mob::DetachLimb` and `Mob::Die` clear `carved` AND `microModel`: the slot
+  outlives the hand-off (it holds the kinematic piece for the sever beat, and
+  the avatar keeps its whole limb list past death), so a slot that kept the
+  index is a second holder of a record `DebrisSystem` now owns — and
+  `MicroBodyOwn` returns an already-owned record to whoever asks, so one later
+  reskin starts editing the corpse's brick. Both failures are asserted every
+  tick by `BodyRegistry::AuditMicroModels` + `BuildMicroInsts`, which name the
+  two entities rather than counting; the `limb-alias` gate is the fixture that
+  makes them fire (three duels, audited per tick, faults 15 -> 0).
 ### A creature knocked down gets back up: the live ragdoll (2026-09-09; `Mob::StartRagdoll`, `sim/tuning.h` Ragdoll)
 
 Until now the only ragdoll was death. `Mob::Die` flips every limb dynamic and

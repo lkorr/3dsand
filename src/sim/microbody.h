@@ -426,6 +426,31 @@ constexpr uint32_t kMicroBodyDimsMask = 0x3FFFFFFFu;
 // call it blindly.
 void MicroBodyFree(MicroBodySet& set, uint32_t model);
 
+// ---- WHO HOLDS A BRICK RECORD (the aliasing audit) --------------------------
+//
+// A record has exactly ONE holder. Every lifecycle rule in this file assumes
+// it: an edit rewrites the block in place, a free zeroes the record's dims and
+// puts it back on `freeModels`. Two holders therefore means one of them is
+// about to go invisible and the record is about to be handed to a THIRD body
+// that is still alive — which is how a corpse's limb ends up drawn on a living
+// creature (owner report 2026-09-16: "I kill a few zombies and then my torso
+// swaps with one of theirs; my foot becomes a zombie torso").
+//
+// Detecting that from the DRAW LIST alone is not enough, and that is the whole
+// reason this exists as a separate walk. A stale holder is very often one that
+// does not draw — a limb whose `body` went to zero at a sever, a slot in the
+// hold beat after a cut, a first-person-suppressed avatar part — and those are
+// exactly the holders whose eventual free takes a live body's brick with it.
+// So every system enumerates EVERY index it holds, drawn or not, and says what
+// it is in words: the report has to name two entities, or it is just a number.
+struct MicroHolder {
+  uint32_t model = kMicroBodyNoModel;
+  // "debris body 12 (handle 0x…, serial 940)", "zombie#7 limb head
+  // (body, carved)", "avatar limb l_foot (SEVERED, no body)". Built by the
+  // holding system, because only it can name its own parts.
+  std::string what;
+};
+
 // A body's micro rendering, passed along when ownership of the body moves.
 //
 // This travels as an explicit argument (MobSystem hands it to
