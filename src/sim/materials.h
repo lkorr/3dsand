@@ -605,8 +605,13 @@ struct MaterialDef {
   // here reaches a shader or the sim.
   //
   // Seconds a body voxel takes to lose ONE amount level of this coat. 0 =
-  // never dries on its own; only washing takes it off (blood).
+  // never dries on its own; only washing takes it off.
   float coatDecay = 0.0f;
+  // Minimum coat amount that drying will NOT decay below. A coat at this
+  // level sits there until something else removes it — a fresh hit, water,
+  // or a material change. 0 = dries completely; 1..15 leaves a residual
+  // stain so a beaten creature never looks entirely clean.
+  uint32_t coatDecayFloor = 0;
   // Per-mille chance that a coated foot deposits some of it on the ground at a
   // footfall -- how a bloodied boot leaves prints. 0 = tracks nothing.
   uint32_t coatShed = 0;

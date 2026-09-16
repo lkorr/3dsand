@@ -584,6 +584,7 @@
       },
       "coat": {
         "decay": 20,
+        "decayFloor": 1,
         "shed": 400,
         "effects": []
       },
@@ -3212,6 +3213,7 @@
       "_coat_note": "A BRUISE FADES, it is not washed off. The material rewrite this replaced healed through MobLimb::woundWas, which reverted a voxel in one step the moment the wound closed; a coat decays a level at a time instead, which is both what a bruise does and the mechanism blood and water already use. 45 s per level against a ceiling of 11 is about eight minutes to clear, so a beaten creature stays visibly beaten for the rest of a fight and a while after it. shed 0: a bruise is UNDER the skin and nothing rubs it off on the furniture.",
       "coat": {
         "decay": 45.0,
+        "decayFloor": 2,
         "shed": 0
       },
       "colors": [

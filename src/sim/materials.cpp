@@ -215,6 +215,7 @@ static void ParseCoat(const json& m, const std::string& path, MaterialDef& d,
   }
   float decay = co.value("decay", 0.0f);
   int shed = co.value("shed", 0);
+  int decayFloor = co.value("decayFloor", 0);
   if (decay < 0.0f) {
     errors += path + ": material \"" + d.name +
               "\": coat decay must be >= 0 seconds per level (0 = never)\n";
@@ -225,7 +226,13 @@ static void ParseCoat(const json& m, const std::string& path, MaterialDef& d,
               "\": coat shed must be 0..1000 per-mille\n";
     shed = 0;
   }
+  if (decayFloor < 0 || decayFloor > 15) {
+    errors += path + ": material \"" + d.name +
+              "\": coat decayFloor must be 0..15\n";
+    decayFloor = 0;
+  }
   d.coatDecay = decay;
+  d.coatDecayFloor = (uint32_t)decayFloor;
   d.coatShed = (uint32_t)shed;
   d.coatEffects = co.value("effects", std::vector<std::string>{});
 }

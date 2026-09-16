@@ -1714,6 +1714,7 @@ void MobSystem::OnMaterialsReloaded(const std::vector<MaterialDef>& mats,
   matAttacksBody_.clear();
   stainSlotOfMat_.clear();
   coatDecay_.clear();
+  coatDecayFloor_.clear();
   coatShed_.clear();
   coatEffects_.clear();
   for (uint32_t& m : matOfStainType_) m = 0;
@@ -1801,6 +1802,7 @@ void MobSystem::OnMaterialsReloaded(const std::vector<MaterialDef>& mats,
     if (slot != 0 && slot < 8u && matOfStainType_[slot] == 0)
       matOfStainType_[slot] = (uint32_t)(stainSlotOfMat_.size() - 1);
     coatDecay_.push_back(m.coatDecay);
+    coatDecayFloor_.push_back(m.coatDecayFloor);
     coatShed_.push_back(m.coatShed);
     coatEffects_.push_back(m.coatEffects);
   }
@@ -10992,6 +10994,8 @@ void Mob::StainTick(uint32_t tick, World& world, uint32_t& budget) {
       const float secs = en.mat < sys_->coatDecay_.size()
                              ? sys_->coatDecay_[en.mat] : 0.0f;
       if (secs <= 0.0f) continue;
+      const uint32_t floor = en.mat < sys_->coatDecayFloor_.size()
+                                 ? sys_->coatDecayFloor_[en.mat] : 0u;
       const long tk = std::lround((double)secs * 30.0 / (double)ct.decayScale);
       const uint32_t decayTicks = (uint32_t)std::max<long>(1, tk);
       if (tick % decayTicks != 0) continue;
@@ -11010,7 +11014,7 @@ void Mob::StainTick(uint32_t tick, World& world, uint32_t& budget) {
         const size_t vi = (from + j) % n;
         const uint16_t cur = v.Stain(vi);
         const uint32_t amt = BodyStainAmt(cur);
-        if (amt == 0 || BodyStainMat(cur) != en.mat) continue;
+        if (amt == 0 || amt <= floor || BodyStainMat(cur) != en.mat) continue;
         // UNEVEN, on purpose: dropping every voxel a level at once makes a
         // limb fade like a slider. Half of them per period is the same mean
         // rate and reads as drying.

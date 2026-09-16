@@ -4185,6 +4185,7 @@ class MobSystem {
   // rest of the tables. `coatEffects_` is the raw tag lists; nothing here
   // interprets them (rule 4).
   std::vector<float> coatDecay_;
+  std::vector<uint32_t> coatDecayFloor_;
   std::vector<uint32_t> coatShed_;
   std::vector<std::vector<std::string>> coatEffects_;
   // Deposits every creature together may track onto the ground this tick
