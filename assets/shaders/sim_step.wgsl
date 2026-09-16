@@ -322,11 +322,54 @@ const DIRTY_M_GASEDGE   : u32 = 33554432u;  // gas wanted out of the window
 // out for the same reason (a film step is a move). DIRTY_R_REACT and
 // DIRTY_R_STAIN are the matched-but-did-not-fire / unsaturated-neighbour idle
 // marks; their WROTE counterparts are what count.
+//
+// ---- AND DIRTY_M_DISPLACE WAS IN THE SET AND SHOULD NEVER HAVE BEEN ---------
+//
+// Removed 2026-09-16, on the owner's report of a desert pond whose shore never
+// settles: "water voxels just swap back and forth really really fast endlessly,
+// keeping the simulation alive in all of those chunks."
+//
+// THE MEASUREMENT, from `--gate pond-shore` pass C (the owner's own shore, one
+// splash, day phase pinned to noon), against passes A and B at the same site
+// which both go quiet:
+//
+//   5 of 507 shore chunks awake at tick 300 (quiet from -1)
+//     by reason: MOVE 2 displace 2
+//     2 words changed / 1 BACK where they started
+//     first at (-2344,112,1670) water<->steam
+//       y+0  ~~~~~~~   ~~~~~^~     <- the flat pond SURFACE
+//
+// A water cell and a steam cell trading places, forever. `displace` is stage 3's
+// lighter-fluid branch, and read what that move is: a LATERAL, WHOLE-CELL swap
+// of two fluids. Both cells keep their y, so SUM(f*y) is unchanged. Both keep
+// their fullness, so SUM(f*f) is unchanged. IT IS NEUTRAL IN BOTH — which is the
+// exact property this whole block exists to say a move may not have while also
+// being its own cause.
+//
+// So the set contained a member that satisfies neither half of its own
+// definition: `displace` is not a strict decrease of a bounded integer, and it
+// is not an external input. Two consequences, and the second is the one that
+// cost the owner a pond:
+//   * it licensed ITSELF, so once a shore started swapping it never stopped;
+//   * it licensed the FILM steps, so the 2-cycle `ca-gutter` proves cannot
+//     terminate on its own got a standing permit from an unrelated rule.
+//
+// WHAT STARTS IT is daylight, and that is why no existing gate could see it.
+// reactions.json authors evaporation as water -> steam `when: "day"` with
+// `minCount: 4` non-water faces; `ca-gutter` and `ca-slope` both PIN THE PHASE
+// TO A DIM DAWN and say why ("freezing and evaporation are authored mass sinks
+// and would make the audit inexact"). Correct for an audit, and it means every
+// liquid gate in the engine ran with the one rule that seeds the churn switched
+// off. `pond-shore` pass C pins noon instead.
+//
+// The branch itself is licensed now too (see stepLiquid stage 3) — removing the
+// bit alone would stop it licensing the films while leaving it free to license
+// itself through some other chunk's genuine work.
 const FILM_LICENCE : u32 =
     DIRTY_R_WRITE | DIRTY_R_SEAM | DIRTY_R_PARTICLE | DIRTY_R_WATERBODY |
     DIRTY_R_MUTATE | DIRTY_R_STAINW | DIRTY_R_REACTW |
     DIRTY_M_DOWN | DIRTY_M_DIAG | DIRTY_M_EQUAL | DIRTY_M_SPLIT |
-    DIRTY_M_DISPLACE | DIRTY_M_BRIDGE | DIRTY_M_POWDER | DIRTY_M_GAS |
+    DIRTY_M_BRIDGE | DIRTY_M_POWDER | DIRTY_M_GAS |
     DIRTY_M_SOLO;
 
 // Set once per workgroup at the top of main from dirtyIn[ci]; read by BOTH film
@@ -1761,7 +1804,12 @@ fn canFlowAnywhere(c : vec3<i32>, w : u32, mat : u32, m : Material) -> bool {
       if (f >= LIQ_SPLIT_MIN) { return true; }
       if ((pressed || filmStepAllowed(c, d)) &&
           canDisplace(m.density, false, nw)) { return true; }
-    } else if (canDisplace(m.density, false, nw)) {
+    } else if (gFilmLicence && canDisplace(m.density, false, nw)) {
+      // Mirrors stepLiquid's licensed lateral displace. The two MUST agree —
+      // loose here pins a chunk awake forever, tight lets a cell sleep with work
+      // left — and the licence is a workgroup-uniform bool, so testing it first
+      // keeps the non-uniform load off the common path exactly as the film
+      // predicates do.
       return true;
     }
   }
@@ -1944,7 +1992,28 @@ fn stepLiquid(c : vec3<i32>, idx : u32, w : u32, mat : u32, m : Material, rnd : 
                       select(0u, DIRTY_M_FILMPRESS, pressed) | sub);
         return true;
       }
-    } else if (tryMove(c, n, w, m.density, false)) {
+    } else if (gFilmLicence && tryMove(c, n, w, m.density, false)) {
+      // THE LATERAL DISPLACE IS A NEUTRAL MOVE AND NEEDS THE SAME LICENCE THE
+      // FILM STEPS DO. See the FILM_LICENCE block: this swaps two whole fluid
+      // cells at the SAME level, so SUM(f*y) is unchanged and SUM(f*f) is
+      // unchanged, and a move neutral in both may not be its own cause. It was
+      // ungated, and DIRTY_M_DISPLACE was in the licence set, so it was its own
+      // cause twice over — `--gate pond-shore` pass C caught a water cell and a
+      // steam cell trading places at a pond surface forever.
+      //
+      // NOT A DOWNWARD DISPLACE, which is the reason this costs nothing real:
+      // stages 1 and 2 above go through tryDescend and mark DOWN / DIAG. Water
+      // falling through smoke, oil rising through water, a liquid dropping into
+      // a gas pocket — all of those strictly decrease SUM(f*y) and never reach
+      // here. What reaches here is a same-level sideways swap, which has no
+      // driving force behind it in the first place: a liquid at rest beside a
+      // gas at the same height has no reason to trade with it, and now it only
+      // does so while the chunk is genuinely doing something.
+      //
+      // The licence does NOT stop a real flow. While a pour, a breach or a
+      // drain is running the chunk is full of descents and splits, so the
+      // licence is granted every tick and this behaves exactly as before; what
+      // it loses is the case where two settled fluids are the last thing awake.
       markDirtyR(c, DIRTY_M_DISPLACE | sub);
       return true;
     }

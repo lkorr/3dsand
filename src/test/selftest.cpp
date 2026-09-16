@@ -179,6 +179,12 @@ const char* const kOrder[] = {
     // 2-wide geometry the thin-film riser step CANNOT resolve, asserted to go
     // to sleep rather than to drain.
     "ca-gutter",
+    // ...and the same rule where it is NOT isolated: a real desert tarn's sand
+    // shore, shipped tuning, seam on. Right after ca-gutter because the two are
+    // one claim in two halves. It stands the window somewhere else entirely and
+    // regenerates at the origin before returning, so it neither needs nor
+    // disturbs a neighbour.
+    "pond-shore",
     "evaporation", "wind",      "wind-gas",   "wind-prim",
     "blood-stain", "flung-liquid", "fluid-det",     "fluid-settle",
     "fluid-excite", "fluid-onwater", "debris-float", "fluid-stain", "fluid-react", "far-fog",  "far-downsample",

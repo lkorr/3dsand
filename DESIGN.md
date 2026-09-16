@@ -791,10 +791,52 @@ SSBO lists of chunk indices.
     the same blob on standing water), `ca-gutter` (the negative of `ca-slope`:
     a 2-wide slot cut into a plateau, the geometry the riser step cannot
     resolve, asserted to SLEEP rather than to drain).
+- **…AND THE SET HAD A NEUTRAL RULE IN IT — `DIRTY_M_DISPLACE`** (2026-09-16).
+  The doctrine above is right and was applied to one rule short. **The lateral
+  lighter-fluid displace** (`stepLiquid` stage 3's last branch) swaps two whole
+  fluid cells at the SAME level: both keep their `y`, so `SUM(f*y)` is
+  unchanged, and both keep their fullness, so `SUM(f*f)` is unchanged. It is
+  neutral in both — and it was ungated, *and* its mark was a member of
+  `FILM_LICENCE`, so it licensed itself and the film branches as well.
+  Measured at the owner's desert tarn (`--gate pond-shore`, pass C): 5 of 507
+  shore chunks awake forever, reasons `MOVE 2 displace 2`, 1 of 2 changed words
+  back where it started, `water<->steam` at (-2344,112,1670) — a steam cell
+  batted back and forth between water cells on a flat pond surface.
+  **What starts it is DAYLIGHT**, which is why nothing caught it: evaporation is
+  authored `when: "day"`, and `ca-gutter`/`ca-slope` both pin the phase to a dim
+  dawn *on purpose* ("freezing and evaporation are authored mass sinks and would
+  make the audit inexact"). Correct for an audit, and it meant every liquid gate
+  in the engine ran with the rule that seeds the churn switched off. `ca-gutter`
+  additionally cuts its slot from stone and sets `fluidExciteMode 0`, so nothing
+  in its fixture can grant a licence at all — a correct test of the rule and of
+  nothing else, while the licence's entire soundness argument is about *what
+  else is in the chunk*.
+  **Fix**: the bit is out of `FILM_LICENCE` and the branch takes the same
+  licence the film steps do (and so does its `canFlowAnywhere` mirror — the two
+  must agree or a chunk pins awake or sleeps with work left). A **downward**
+  displace is untouched: stages 1–2 go through `tryDescend` and strictly
+  decrease `SUM(f*y)`, so water still falls through smoke and oil still
+  stratifies. What is lost is only the same-level sideways swap between two
+  settled fluids, which had no driving force behind it in the first place.
+  Gate: **`pond-shore`** — the owner's own shore at (-2317,112,1674), three
+  passes (pristine / disturbed by a splash / disturbed at NOON), reporting awake
+  chunks, the reason histogram, a 2-cycle count and the water ledger. It is the
+  first gate in the engine to tick a PROCEDURAL pond at all: `terrain` pass D
+  reports 0 awake because its window is the harness pad, which the map's own
+  site table declares as "no tarns".
+  - **Also measured, and it is worth knowing**: a sand bank drinks **132,033
+    eighths** out of that pond in its first 130 ticks, through sand's authored
+    `absorb: {capacity: 6}`, and then saturates and stops. That is the designed
+    behaviour of absorption (§6) at a shoreline's scale, not a leak — the ledger
+    in `pond-shore` is what says it *stopped*.
 - **Gas**: inverse powder (up, then up-diagonals, then lateral), plus decay chance.
 - **Solid**: doesn't move; participates in reactions and structural checks only.
 - **Density displacement**: a mover entering a cell occupied by a less-dense
-  fluid swaps with it (oil floats on water; sand sinks through both).
+  fluid swaps with it (oil floats on water; sand sinks through both). DOWNWARD
+  and diagonal displacements are free — they strictly decrease `SUM(f*y)`. A
+  LATERAL one between two liquids/gases at the same level changes neither
+  Lyapunov function, so for a liquid it needs the film licence; see the
+  `DIRTY_M_DISPLACE` entry above.
 
 ### Race safety (and determinism)
 Two GPU threads must never both claim the same destination cell — and the *winner*

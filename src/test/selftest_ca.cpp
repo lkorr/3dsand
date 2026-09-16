@@ -11,6 +11,7 @@
 // hash sequences match. A single-run hash cannot see "this chunk was processed
 // one tick late"; two runs can.
 
+#include <algorithm>
 #include <cstdio>
 #include <cstring>
 #include <string>
@@ -1022,6 +1023,473 @@ Status GateCaGutter(Ctx& c, std::string& detail) {
   return ok ? Status::Pass : Status::Fail;
 }
 
+// ---- pond-shore ----------------------------------------------------------
+//
+// THE SHAPE `ca-gutter` PROVED SAFE, AT A PLACE WHERE IT IS NOT.
+//
+// The owner's report, 2026-09-16, from the live game at world (-2317,112,1674):
+// "in a pond in the desert ... water voxels just swap back and forth really
+// really fast endlessly, keeping the simulation alive in all of those chunks."
+// A whole-cell swap of water and air is the CA's FILM STEP and nothing else —
+// it is the only liquid move in sim_step.wgsl that is neutral in BOTH Lyapunov
+// functions (same SUM(f*y), same SUM(f*f)) and can therefore 2-cycle.
+//
+// THE GUARD ALREADY EXISTS AND `ca-gutter` ALREADY TESTS IT. FILM_LICENCE says
+// a film may only step in a chunk where something that strictly decreased a
+// Lyapunov function happened last tick, so a neutral move cannot be its own
+// cause. So why is there still a report?
+//
+// BECAUSE ca-gutter DISABLES EVERY LICENCE SOURCE IN ORDER TO ISOLATE THE RULE.
+// Read its fixture: `fluidExciteMode = 0` (no seam), a chamber cut from STONE
+// (no absorb capacity, so no staining that spends mass), no water body, no
+// particles. Nothing in that box can hand the film a licence, so the licence is
+// never granted and the 2-cycle cannot run. It is a correct test of the rule
+// and a test of NOTHING ELSE — and the licence's soundness argument is entirely
+// about what else is in the chunk:
+//
+//   "Every bit below is either a move that strictly decreases a bounded integer
+//    ... or an EXTERNAL input (a mutation, the seam, a particle landing, a
+//    reaction firing). NONE OF THEM CAN BE CAUSED BY A FILM STEP."
+//
+// That last sentence is the whole fix, it is quantified over the licence set,
+// and `ca-gutter` cannot see it because its fixture empties the set. So this
+// gate is the other half: the SAME rule, at a real place, with the shipped
+// tuning and nothing switched off.
+//
+// WHY THIS SITE AND NOT A BUILT FIXTURE. A desert tarn's bank is a thin SAND
+// cap over sandstone at a shallow angle, with the waterline cutting across the
+// loose grains (`--voxdump -2352,96,1648,64,64,64,1` shows `s~sssss~~~` at the
+// water's own level). Two things live there that a stone chamber cannot have:
+//   * sand authors `absorb: {capacity: 6}`, so every film touching a dry grain
+//     writes a stain (DIRTY_R_STAINW, in the licence set) and spends an eighth
+//     of itself doing it;
+//   * the seam ships ON (`sim.fluidExciteMode` 1), and exciteDetect runs POST-CA
+//     over the same dirty chunks, marking DIRTY_R_SEAM on a chunk and its eight
+//     neighbours whenever it converts a cell.
+// Both are in FILM_LICENCE. Whether either can be CAUSED by a film step is
+// exactly the claim above, and this gate is where it gets measured.
+//
+// No gate in the engine ticked a procedural pond before this one. `terrain`
+// pass D reports `0 chunks still awake after 120 ticks` — and its window is the
+// harness pad, which the map's own site table declares as "no tarns". That is
+// why a never-sleeping shoreline survived a fix aimed at it.
+//
+// WHAT IT REPORTS, in the order a diagnosis needs it (CLAUDE.md rule 6 — a bare
+// count of awake chunks is the non-measurement that cost 14 elimination runs
+// once already):
+//   1. HOW MANY chunks are awake, and the DIRTY_R_*/DIRTY_M_* reason histogram,
+//      which names the stage: `film` is the riser branch, `film-press` the
+//      pressed one, and whatever sits beside them is what granted the licence.
+//   2. THE 2-CYCLE COUNT. Three voxel samples one tick apart: a cell with
+//      S0 != S1 and S2 == S0 has come back to where it started, which is a
+//      shuffle and not work. "N words changed" and "N words changed and N-2 of
+//      them are back" are different findings and only the second names a cycle.
+//   3. THE WATER LEDGER, start against end. Absorption into a sand bank is a
+//      real mass sink and a legitimate reason for a shore to stay busy for a
+//      while; a pond that is still losing eighths at tick 300 is a different
+//      bug from one that is merely shuffling them.
+//
+// The window is moved and RESTORED (with a regeneration) on the way out, for
+// the reason selftest.h states in as many words: a later gate that hardcodes a
+// world position instead of anchoring to WindowOrigin() would fire into solid
+// space.
+Status GatePondShore(Ctx& c, std::string& detail) {
+  GpuContext& ctx = c.ctx;
+  World& world = c.world;
+  Simulation& sim = c.sim;
+  const uint32_t seed = kDefaultSeed;
+
+  uint32_t waterId = 0, sandId = 0;
+  for (size_t i = 0; i < c.mats.size(); i++) {
+    if (c.mats[i].name == "water") waterId = (uint32_t)i;
+    if (c.mats[i].name == "sand") sandId = (uint32_t)i;
+  }
+  if (waterId == 0) { detail = "no 'water' material"; return Status::Fail; }
+
+  // The owner's shore, as a CHUNK origin that puts it in the middle of the
+  // residency window. Voxel (-2317,112,1674) is chunk (-145,7,104); the window
+  // is kWorldN/kChunk chunks on a side, so back off half of that on each axis.
+  // Written from the voxel coordinate rather than as three magic numbers so
+  // that a change to kWorldN moves the window instead of decentring the pond.
+  const int half = (int)(kWorldN / kChunk) / 2;
+  const IVec3 site{-2317, 112, 1674};
+  const IVec3 siteChunk{site.x >> 4, site.y >> 4, site.z >> 4};
+  const IVec3 shoreOrigin{siteChunk.x - half, siteChunk.y - half,
+                          siteChunk.z - half};
+  const IVec3 savedOrigin = world.WindowOrigin();
+
+  // NOTHING IS SWITCHED OFF. That is the point of the gate: `ca-gutter` already
+  // covers the rule in isolation, and every knob this one might pin (the seam,
+  // the day phase, the water bodies) is a licence source under test.
+  world.SetWindowOrigin(shoreOrigin);
+  SubmitWorldgen(ctx, world, sim, seed);
+  ctx.WaitIdle();
+
+  // WORLD chunk coords, not window-local, and this is the one thing about the
+  // gate that is easy to get wrong: SubmitTick's `playerChunk` reaches
+  // World::MirrorBaseFor, which clamps against origin_, and SlotChunkIndex
+  // masks a WORLD chunk into the torus. Handing either a local index reads a
+  // different place in the world and measures nothing -- the first cut of this
+  // gate did exactly that and reported `water 0 -> 0 eighths`, a fixture that
+  // cannot fail. Every other gate here sits at origin (0,0,0) where the two
+  // spaces coincide, which is why the mistake is available at all.
+  const IVec3 playerChunk = siteChunk;
+
+  // The chunk slots a 3-chunk-tall band around the waterline occupies, over a
+  // 12-chunk square centred on the site: the shore, not the whole pond floor.
+  // These are what the ledger and the diff are read over, so the numbers are
+  // about the shoreline rather than about the window.
+  std::vector<uint32_t> shoreChunks;
+  for (int dz = -6; dz <= 6; dz++)
+    for (int dy = -1; dy <= 1; dy++)
+      for (int dx = -6; dx <= 6; dx++)
+        shoreChunks.push_back(World::SlotChunkIndex(
+            {siteChunk.x + dx, siteChunk.y + dy, siteChunk.z + dz}));
+
+  // ---- the water ledger before ------------------------------------------
+  auto waterEighths = [&](const char* tag) -> uint64_t {
+    uint64_t sum = 0;
+    std::vector<uint32_t> buf((size_t)kChunkVol);
+    for (uint32_t ci : shoreChunks) {
+      ReadVoxelsSync(ctx, world, ci, 1, buf.data(), tag);
+      for (uint32_t k = 0; k < kChunkVol; k++)
+        if ((buf[k] & 0xFFFu) == waterId) sum += ((buf[k] >> 12) & 0xFu) + 1u;
+    }
+    return sum;
+  };
+  const uint64_t water0 = waterEighths("shoreLedger0");
+
+  // ---- one measurement, used by both passes -------------------------------
+  // A pass is: tick to quiet (or give up), then say HOW MANY chunks are awake,
+  // WHY, and whether what they are doing is work or a shuffle. Written once
+  // because the two passes must agree about all three or the comparison between
+  // them means nothing.
+  uint32_t t = 52000;
+  struct PassOut {
+    uint32_t awake = 0;
+    int quietAt = -1;
+    std::string why;
+    uint32_t changed = 0, cycled = 0;
+    uint32_t cycMat = 0, cycState = 0, cycStain = 0;
+    uint32_t cycWater = 0, cycAir = 0, cycSand = 0, cycOther = 0;
+    std::string worst;
+  };
+  auto runPass = [&](int ticks, const std::vector<CellOp>& ops) -> PassOut {
+    PassOut o;
+    for (int i = 0; i < ticks; i++) {
+      SubmitTick(ctx, world, sim, ++t, seed, {}, {},
+                 i == 0 ? ops : std::vector<CellOp>{}, false, playerChunk, false,
+                 true);
+      if (i >= 20 && i % 10 == 0) {
+        ctx.WaitIdle();
+        std::vector<uint32_t> flags(kNumSlots, 0);
+        rhi::ReadbackBlocking(ctx.device, ctx.queue, sim.DirtyActive(), 0,
+                              flags.data(), kNumSlots * 4, "shoreActive");
+        o.awake = 0;
+        for (uint32_t ci : shoreChunks)
+          if (flags[ci] != 0) o.awake++;
+        if (o.awake == 0 && o.quietAt < 0) o.quietAt = i;
+        else if (o.awake != 0) o.quietAt = -1;
+      }
+    }
+    ctx.WaitIdle();
+
+    // ---- HOW MANY, AND WHY, FROM ONE READ ---------------------------------
+    // The reason bitmask, through kDirtyReasonName (world.h) -- the one table,
+    // for the reason the `sleep` gate records: a private copy of the names
+    // silently drops whatever bit was added last.
+    //
+    // `o.awake` IS OVERWRITTEN HERE ON PURPOSE. The loop above samples every
+    // tenth tick, so the count it leaves behind is tick 290's and the histogram
+    // below is tick 300's -- and this gate printed "3 of 507 shore chunks awake
+    // ... by reason: none - fully quiet" on its first run after the fix landed,
+    // which is the `sleep` gate's own recorded mistake ("two readings of one
+    // buffer that cannot both be true") reproduced exactly. The periodic sample
+    // keeps its job, which is quietAt; the VERDICT number comes from the same
+    // read as the reason for it.
+    std::vector<uint32_t> awakeSlots;
+    {
+      std::vector<uint32_t> flags(kNumSlots, 0);
+      rhi::ReadbackBlocking(ctx.device, ctx.queue, sim.DirtyActive(), 0,
+                            flags.data(), kNumSlots * 4, "shoreWhy");
+      uint32_t hist[kDirtyReasonBits] = {0};
+      for (uint32_t ci : shoreChunks) {
+        if (flags[ci] == 0) continue;
+        awakeSlots.push_back(ci);
+        for (int b = 0; b < kDirtyReasonBits; b++)
+          if (flags[ci] & (1u << b)) hist[b]++;
+      }
+      o.awake = (uint32_t)awakeSlots.size();
+      for (int b = 0; b < kDirtyReasonBits; b++)
+        if (hist[b]) o.why += Format(" %s %u", kDirtyReasonName[b], hist[b]);
+      if (o.why.empty()) o.why = " none - fully quiet";
+    }
+
+    // ---- IS IT WORK OR IS IT A SHUFFLE? ----------------------------------
+    // Three samples one tick apart over the awake chunks. A word that changed on
+    // the first tick and is back to its starting value on the second is a
+    // 2-cycle, and that is the signature the film step leaves. Split by field so
+    // a pond soaking into its bed (stain) cannot be mistaken for a film creeping
+    // (fullness) or a grain moving (material).
+    if (awakeSlots.empty()) return o;
+    const size_t n = std::min<size_t>(awakeSlots.size(), 16);
+    std::vector<std::vector<uint32_t>> s0(n), s1(n);
+    for (size_t i = 0; i < n; i++) {
+      s0[i].assign(kChunkVol, 0);
+      ReadVoxelsSync(ctx, world, awakeSlots[i], 1, s0[i].data(), "shoreS0");
+    }
+    SubmitTick(ctx, world, sim, ++t, seed, {}, {}, {}, false, playerChunk, false,
+               true);
+    ctx.WaitIdle();
+    for (size_t i = 0; i < n; i++) {
+      s1[i].assign(kChunkVol, 0);
+      ReadVoxelsSync(ctx, world, awakeSlots[i], 1, s1[i].data(), "shoreS1");
+    }
+    SubmitTick(ctx, world, sim, ++t, seed, {}, {}, {}, false, playerChunk, false,
+               true);
+    ctx.WaitIdle();
+    std::vector<uint32_t> s2(kChunkVol, 0);
+    for (size_t i = 0; i < n; i++) {
+      ReadVoxelsSync(ctx, world, awakeSlots[i], 1, s2.data(), "shoreS2");
+      for (size_t v = 0; v < kChunkVol; v++) {
+        // The STAMP (bits 16..18) and the excite scratch (19..23) are excluded:
+        // both legitimately differ tick to tick on a cell that did nothing, and
+        // counting them would report every visited cell as a cycle.
+        const uint32_t m = 0xFF00FFFFu;
+        const uint32_t a = s0[i][v] & m, b = s1[i][v] & m, d = s2[v] & m;
+        if (a == b) continue;
+        o.changed++;
+        if (d != a) continue;
+        o.cycled++;
+        if ((a & 0xFFFu) != (b & 0xFFFu)) o.cycMat++;
+        if (((a >> 12) & 0xFu) != ((b >> 12) & 0xFu)) o.cycState++;
+        if ((a & 0x7F000000u) != (b & 0x7F000000u)) o.cycStain++;
+        const uint32_t am = a & 0xFFFu;
+        if (am == waterId) o.cycWater++;
+        else if (am == 0) o.cycAir++;
+        else if (am == sandId) o.cycSand++;
+        else o.cycOther++;
+        // WHERE, AND WHAT IS AROUND IT. A coordinate alone says which chunk to
+        // go and look at; the two vertical slices say which RULE, and that is
+        // the difference this gate exists for. `ca-gutter`'s whole finding was
+        // that a film against ONE riser and a film between TWO are told apart
+        // only by cells the shader may not read -- so the CPU, with no lattice
+        // bound, is the one place the distinction can be drawn.
+        if (o.worst.empty()) {
+          const IVec3 wc = world.SlotToWorldChunk(awakeSlots[i]);
+          const IVec3 at{wc.x * 16 + (int)(v % 16),
+                         wc.y * 16 + (int)((v / 16) % 16),
+                         wc.z * 16 + (int)(v / 256)};
+          auto nm = [&](uint32_t mm) {
+            return mm == 0 ? "air"
+                           : mm < c.mats.size() ? c.mats[mm].name.c_str() : "?";
+          };
+          o.worst = Format(" first at (%d,%d,%d) %s<->%s", at.x, at.y, at.z,
+                           nm(am), nm(b & 0xFFFu));
+          // One character per material, over a 7-wide x 5-tall window on each
+          // of the two lateral axes, read from the POST-move sample so what is
+          // printed is the state the next tick acts on. Chunk-local only: the
+          // cycling cell can sit on a chunk face, and stitching neighbours in
+          // would need four more readbacks to draw two more columns.
+          const char* key = " .#~Ss*";  // air stone water sand sandstone other
+          auto glyph = [&](int lx, int ly, int lz) -> char {
+            if (lx < 0 || lx > 15 || ly < 0 || ly > 15 || lz < 0 || lz > 15)
+              return '?';
+            const uint32_t q = s2[(size_t)((lz * 16 + ly) * 16 + lx)] & 0xFFFu;
+            if (q == 0) return '.';
+            if (q == waterId) return '~';
+            if (q == sandId) return 's';
+            const std::string& n2 = c.mats[q].name;
+            if (n2 == "steam") return '^';
+            if (n2 == "sandstone") return 'S';
+            if (n2 == "stone") return '#';
+            return '*';
+          };
+          (void)key;
+          const int lx = (int)(v % 16), ly = (int)((v / 16) % 16),
+                    lz = (int)(v / 256);
+          o.worst += "  [x-z slices, '.' air '~' water '^' steam 's' sand "
+                     "'S' sandstone '#' stone, cell at the centre]";
+          for (int yy = 2; yy >= -2; yy--) {
+            o.worst += Format("\n  y%+d  ", yy);
+            for (int xx = -3; xx <= 3; xx++) o.worst += glyph(lx + xx, ly + yy, lz);
+            o.worst += "   ";
+            for (int zz = -3; zz <= 3; zz++) o.worst += glyph(lx, ly + yy, lz + zz);
+          }
+        }
+      }
+    }
+    return o;
+  };
+
+  auto say = [&](const char* label, const PassOut& o, int ticks) {
+    return Format(
+        "%s: %u of %zu shore chunks awake at tick %d (quiet from %d), by"
+        " reason:%s, over 2 further ticks %u words changed / %u BACK where they"
+        " started (material %u, fullness %u, stain %u; water %u, air %u,"
+        " sand %u, other %u)%s",
+        label, o.awake, shoreChunks.size(), ticks, o.quietAt, o.why.c_str(),
+        o.changed, o.cycled, o.cycMat, o.cycState, o.cycStain, o.cycWater,
+        o.cycAir, o.cycSand, o.cycOther, o.worst.c_str());
+  };
+
+  // ---- PASS A: the world as generated -------------------------------------
+  // 300 ticks is ten seconds of game time on a world that arrives at rest: the
+  // pond generates level (every column of the voxdump tops at y112 with fullness
+  // 8), so anything still moving at the end is something the CA started itself.
+  //
+  // This pass is EXPECTED to be busy for a while and then stop. A desert tarn's
+  // bank is loose sand and sand authors `absorb: {capacity: 6}`, so the first
+  // hundred-odd ticks are the bank drinking -- real work, with a bounded end
+  // (the reachable surface is finite and stain only ever climbs). The ledger
+  // below is what says the drinking STOPPED rather than merely slowed.
+  const int kTicksA = 300;
+  const PassOut a = runPass(kTicksA, {});
+  const uint64_t water1 = waterEighths("shoreLedger1");
+
+  // ---- PASS B: AND NOW DISTURB IT -----------------------------------------
+  //
+  // THE PASS THAT MATCHES THE REPORT, and pass A is the reason it has to exist.
+  // A pristine tarn settles; the owner's pond is one that has been PLAYED IN.
+  // Every licence source in FILM_LICENCE is an external input, so the question
+  // the report actually asks is not "does a fresh shore sleep" but "does a
+  // shore that has been disturbed GO BACK to sleep" -- and those are different
+  // claims the moment a neutral rule can be licensed by the consequences of its
+  // own move.
+  //
+  // THE DISTURBANCE IS A SPLASH ON THE WATERLINE, which is what a body entering
+  // the water is from the CA's point of view: a slug of water dropped where the
+  // loose sand meets the pond. It is placed at the found waterline rather than
+  // at a literal coordinate, because a shoreline moves when worldgen does and a
+  // fixture that hardcodes its site measures open water the first time a curve
+  // is retuned.
+  std::vector<CellOp> splash;
+  IVec3 splashAt{0, 0, 0};
+  {
+    // Find the waterline: a surface water cell (air above) with SAND on a
+    // lateral face. That is the shore, by definition, and it is the one place
+    // the two licence sources this gate exists to test -- the sand's absorb
+    // capacity and the seam's free-surface triggers -- both apply.
+    std::vector<uint32_t> buf((size_t)kChunkVol);
+    for (int dz = -2; dz <= 2 && splash.empty(); dz++)
+      for (int dx = -2; dx <= 2 && splash.empty(); dx++) {
+        const IVec3 wc{siteChunk.x + dx, siteChunk.y, siteChunk.z + dz};
+        ReadVoxelsSync(ctx, world, World::SlotChunkIndex(wc), 1, buf.data(),
+                       "shoreFind");
+        for (uint32_t k = 0; k < kChunkVol && splash.empty(); k++) {
+          if ((buf[k] & 0xFFFu) != waterId) continue;
+          const int lx = (int)(k % 16), ly = (int)((k / 16) % 16),
+                    lz = (int)(k / 256);
+          if (ly == 15) continue;                       // no cell above to read
+          if ((buf[k + 16] & 0xFFFu) != 0u) continue;   // not a free surface
+          bool touchesSand = false;
+          if (lx > 0 && (buf[k - 1] & 0xFFFu) == sandId) touchesSand = true;
+          if (lx < 15 && (buf[k + 1] & 0xFFFu) == sandId) touchesSand = true;
+          if (lz > 0 && (buf[k - 256] & 0xFFFu) == sandId) touchesSand = true;
+          if (lz < 15 && (buf[k + 256] & 0xFFFu) == sandId) touchesSand = true;
+          if (!touchesSand) continue;
+          splashAt = {wc.x * 16 + lx, wc.y * 16 + ly, wc.z * 16 + lz};
+          // 4x2x4 full cells, three above the surface: 32 cells of water, the
+          // same order as ca-level-pond's blob, dropped where it has to run
+          // down a loose sand bank to find the level again.
+          for (int sz = 0; sz < 4; sz++)
+            for (int sy = 0; sy < 2; sy++)
+              for (int sx = 0; sx < 4; sx++)
+                splash.push_back(
+                    {World::SlotCellIndex({splashAt.x + sx - 2, splashAt.y + sy + 3,
+                                           splashAt.z + sz - 2}),
+                     (waterId & 0xFFFu) | (7u << 12)});
+        }
+      }
+  }
+  const PassOut b = runPass(kTicksA, splash);
+  const uint64_t water2 = waterEighths("shoreLedger2");
+
+  // ---- PASS C: THE SUN IS UP ----------------------------------------------
+  //
+  // Passes A and B run at whatever day phase the tick counter lands on, which
+  // is what every other gate here does and is exactly the wrong thing for this
+  // question. reactions.json authors evaporation as
+  //
+  //   water --(when:"day", needsSky, minLight 120, >=4 NON-water faces)--> steam
+  //
+  // and the `minCount: 4` is the whole point of the rule: deep water and a flat
+  // pond surface (1 non-water face, the air above) are IMMUNE, and a thin film
+  // on an exposed bank -- air above, sand below, sand to one side -- is not.
+  // That predicate is a description of a shoreline.
+  //
+  // WHY THAT IS A LICENCE AND NOT JUST A LEAK. Every firing writes a voxel and
+  // marks DIRTY_R_REACTW, which is IN FILM_LICENCE. And it is self-renewing in
+  // the one way the licence's soundness argument does not cover: evaporating a
+  // rim cell leaves a gap, the pond levels into the gap, and the cell that
+  // arrives is a new rim cell with the same 4 non-water faces. So for as long
+  // as the sun is up, a sand shore hands the film rules a licence every tick,
+  // and the 2-cycle `ca-gutter` proves cannot terminate on its own runs with
+  // nothing to stop it.
+  //
+  // `ca-gutter` and `ca-slope` both pin the phase to a dim dawn and say why in
+  // as many words -- "freezing and evaporation are authored mass sinks and
+  // would make the audit inexact". Correct for an audit, and it is also the
+  // reason neither of them could ever see this. THIS pass pins the opposite.
+  //
+  // Not a fixture knob: `dayNight.freeze` is a shipped tuning field and noon is
+  // a state the world is in for half of every in-game day.
+  Tuning noon = CurrentTuning();
+  noon.dayNight.freeze = 1;
+  noon.dayNight.freezePhase = (int)kDayNoon;
+  const Tuning savedTuning = CurrentTuning();
+  SetCurrentTuning(noon);
+  // The world has to be TOLD the sun moved: a light-gated rule deliberately
+  // does not hold its chunk awake (see doReactions), so the day phase itself is
+  // the wake signal and a pinned phase change with nothing dirty would simply
+  // never be noticed. One splash does it, and it is the same disturbance pass B
+  // used so the two are comparable.
+  const PassOut d = runPass(kTicksA, splash);
+  const uint64_t water3 = waterEighths("shoreLedger3");
+  SetCurrentTuning(savedTuning);
+
+  // ---- restore, so the window is where the next gate expects it -----------
+  world.SetWindowOrigin(savedOrigin);
+  SubmitWorldgen(ctx, world, sim, seed);
+  ctx.WaitIdle();
+
+  const int cap = (int)BaselineNumber("pondShore.awakeMax", 32);
+  // A BAND WITH NO WATER IN IT IS NOT A QUIET SHORE, it is a gate pointed at
+  // the wrong place, and "0 awake" is what both look like. The first cut of
+  // this gate handed SlotChunkIndex a window-local index and passed while
+  // reading empty sky; the ledger is the one reading that tells those apart, so
+  // it is a failure condition and not just a printed number.
+  const bool foundPond = water0 > 0;
+  // ...and a pass B that never found a waterline to splash on is pass A run
+  // twice wearing a second name. Same argument, same failure.
+  const bool foundShore = !splash.empty();
+  const bool ok = foundPond && foundShore && (int)a.awake <= cap &&
+                  (int)b.awake <= cap && (int)d.awake <= cap;
+  detail = Format(
+      "the owner's desert shore at (%d,%d,%d), cap %d | %s | %s | %s | splash of"
+      " 32 cells at (%d,%d,%d) | water %llu -> %llu -> %llu -> %llu eighths"
+      " (bank drank %+lld, splash %+lld, noon %+lld)",
+      site.x, site.y, site.z, cap, say("A pristine", a, kTicksA).c_str(),
+      say("B disturbed", b, kTicksA).c_str(),
+      say("C disturbed at NOON", d, kTicksA).c_str(), splashAt.x, splashAt.y,
+      splashAt.z, (unsigned long long)water0, (unsigned long long)water1,
+      (unsigned long long)water2, (unsigned long long)water3,
+      (long long)water1 - (long long)water0,
+      (long long)water2 - (long long)water1,
+      (long long)water3 - (long long)water2);
+  if (!foundPond)
+    detail += "  <-- NO WATER IN THE BAND: the gate is pointed at the wrong place";
+  if (!foundShore)
+    detail += "  <-- NO WATERLINE FOUND: pass B disturbed nothing";
+  RecordObserved("pondShore.awakeObserved", (double)a.awake);
+  RecordObserved("pondShore.cycledObserved", (double)b.cycled);
+  RecordObserved("pondShore.disturbedAwakeObserved", (double)b.awake);
+  RecordObserved("pondShore.noonAwakeObserved", (double)d.awake);
+  RecordObserved("pondShore.noonCycledObserved", (double)d.cycled);
+  std::printf("pond-shore: %s (%s)\n", ok ? "PASS" : "FAIL", detail.c_str());
+  return ok ? Status::Pass : Status::Fail;
+}
+
 // ---- repose ---------------------------------------------------------------
 //
 // PER-MATERIAL ANGLE OF REPOSE. Until the `repose` field existed, every powder
@@ -1318,6 +1786,10 @@ const std::vector<Gate>& CaGates() {
       {"ca-level", "sim", {}, false, GateCaLevel},
       {"ca-level-pond", "sim", {}, false, GateCaLevelPond},
       {"ca-gutter", "sim", {}, false, GateCaGutter},
+      // The other half of ca-gutter: the same rule at a real shoreline, with
+      // nothing switched off. It moves the residency window and regenerates on
+      // the way out, so it owes nothing to what ran before it.
+      {"pond-shore", "sim", {}, false, GatePondShore},
   };
   return g;
 }
