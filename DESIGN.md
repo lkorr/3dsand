@@ -4377,6 +4377,46 @@ Four properties worth stating because each cost something to get right:
   bled around itself where a fresh kerf has not; 0 is a bloodless rot, for a
   husk that never had blood in it.
 
+* **...and every hole is a different AGE** (2026-09-15, `MobRotDef::dryFraction`
+  / `wet`). The version above handed `StainWound` the whole limb's removed cells
+  in ONE call, so every hole on a body came out equally bloody — and a body whose
+  wounds are all the same age reads as uniform however right any single one of
+  them looks. The owner's word for what it should be is a MISHMASH: half the
+  holes old and dry, showing the flesh and bone the anatomy baked under the skin,
+  the other half still wet, and a SPECTRUM in between rather than two settings.
+
+  So wetness is a property of one BITE, and three things have to be true:
+
+  - **The roll is a ramp with an atom at zero.** `dryFraction` of the bites get
+    no soak at all — not a small one, a dry hole is a different look from a
+    faint one — and the rest ramp from `wet[0]` (a trace) to `wet[1]`.
+  - **The cells are ATTRIBUTED.** `CarveReport::cells` is one flat list of
+    everything the carve took off the limb, so a per-bite soak has to decide
+    which cells belong to which hole. Nearest in NORMALISED distance (d²/r²),
+    not absolute: the bites differ in radius by up to 2x and the removal falloff
+    is a function of t, so a cell two cells outside a small bite is further
+    *into* it than one four cells inside a large one. Every removed cell is
+    claimed by some bite, so the connectivity split's strays land on the nearest
+    hole rather than being dropped. A dry bite is attributed and then simply not
+    soaked, which is what lets a wet neighbour bleed into it — adjacent holes of
+    different ages, not a body with one blood level.
+  - **The ramp is uniform in HOW BLOODY IT LOOKS, not in `wet`.** `wet` scales
+    the amount linearly and the reach as its square root (a smear that fades to
+    nothing within one cell is invisible at this resolution, so a trace has to
+    stay narrow rather than stay faint everywhere), which puts the stained count
+    at roughly `wet^2.5` — and a linear ramp through a quantity that enters at
+    the 2.5th power spends most of its length in the faint end. Measured: half
+    dry plus a linear ramp took the rewrite from 0.095 of the body to 0.022, a
+    4.3x cut for a change meant to remove half. `v^(1/2.5)` inverts it, and the
+    wettest holes are as bloody as every hole used to be (0.029 / 0.137 against
+    0.095 / 0.290, with 38% of hole-wall voxels completely clean).
+
+  The bite count and `maxLoss` went up 25% / 30% in the same commit, and they
+  had to move TOGETHER: the bites are drawn generously and then fitted to the
+  budget, so raising the count alone would have bought more, smaller holes and
+  a body no more chewed than before. What came off was the BLOOD, not the
+  damage, so the damage is what compensates.
+
   What stays refused is **bleeding**: `Mob::inSpawnRot_` joins the burn and the
   garment on the line deciding whether a carve tops up a drip budget, and
   `StainWound` has no drip in it. So the holes look wet and the creature is not
@@ -4396,6 +4436,16 @@ anatomy speckles the muscle layer with `blood` at fraction 0.06 (182 of 26,494
 measured). "The zombie has wound material and the human has none" is simply a
 false claim. So the rewrite is tested as a RATIO against that baseline, while
 the smear — which only damage ever applies — is tested against a true zero.
+
+The gate's other end is **claim F, that not every hole bled**, and it needs no
+recipe lookup to say what "in a hole" means: a hole's wall is an EXPOSED voxel
+(an empty 6-neighbour on the limb's own lattice) whose material is one the
+INTACT body never shows — and the set of materials a whole body does show is
+measured off the living control arm rather than hardcoded, so the claim survives
+an art edit, an anatomy change or a material rename. Voxels already rewritten to
+the wound material are excluded, being blood by construction. Both ends of the
+band are asserted, because either alone is satisfied by a uniform: all-dry is
+the bloodless rot this replaced, all-wet is what replaced it.
 
 The creature the **NPC AI panel** spawns is a dropdown over every def
 publishing a `held_right` socket (the eligibility test the spawn already applied

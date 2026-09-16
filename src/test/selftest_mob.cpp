@@ -4796,26 +4796,110 @@ Status GateUndead(Ctx& c, std::string& detail) {
                       woundFrac >= hWoundFrac * woundOverBase &&
                       stainFrac >= stainMin && hStain == 0;
 
+  // ---- F: NOT EVERY HOLE BLED (2026-09-15, MobRotDef::dryFraction) ---------
+  //
+  // Claim E above says there IS blood, which the first version of the soak
+  // satisfied by making every hole on the body equally bloody -- and a body
+  // whose wounds are all the same age reads as uniform however right any one
+  // of them looks. The owner's word for what it should be is a MISHMASH. So
+  // this claim is the other end of the same spectrum: a real share of the
+  // holes must be DRY, showing the flesh and bone the anatomy baked under the
+  // skin with no blood over it at all.
+  //
+  // WHAT COUNTS AS "IN A HOLE", WITHOUT A RECIPE LOOKUP. A hole's wall is an
+  // EXPOSED voxel (one with an empty 6-neighbour on this limb's own lattice)
+  // whose material is one the intact body never shows -- muscle, fat, bone,
+  // whatever the anatomy put under the skin. The set of materials a whole body
+  // DOES show is not hardcoded here: it is measured off the LIVING CONTROL ARM
+  // this gate already spawns, so the claim keeps working when the human's art,
+  // its anatomy recipe or its clothing changes, and cannot be broken by a
+  // material rename.
+  //
+  // Voxels already rewritten to the wound material are excluded: they are
+  // blood by construction, so counting them either way would be answering a
+  // different question. What is left is "of the tissue showing through the
+  // holes, how much of it has nothing on it".
+  //
+  // Both ENDS are asserted, because either alone is satisfied by a uniform:
+  // all-dry is the bloodless rot this replaced and all-wet is what it replaced
+  // it with.
+  std::vector<uint32_t> skinMats;  // what a WHOLE body shows, measured
+  auto exposedInner = [&](uint64_t id, const Mob* m,
+                          std::vector<uint32_t>* mats, uint32_t& wall,
+                          uint32_t& clean) {
+    wall = clean = 0;
+    for (int i = 0; i < m->LimbCount(); i++) {
+      const std::vector<PrefabVoxel>& lat = c.mobs.LimbLattice(id, i);
+      std::unordered_set<uint64_t> occ;
+      occ.reserve(lat.size() * 2);
+      auto key = [](int x, int y, int z) {
+        return (uint64_t)(uint32_t)(x + 32768) |
+               ((uint64_t)(uint32_t)(y + 32768) << 16) |
+               ((uint64_t)(uint32_t)(z + 32768) << 32);
+      };
+      for (const PrefabVoxel& v : lat)
+        if (v.material) occ.insert(key(v.x, v.y, v.z));
+      static const int d6[6][3] = {{1, 0, 0},  {-1, 0, 0}, {0, 1, 0},
+                                   {0, -1, 0}, {0, 0, 1},  {0, 0, -1}};
+      for (const PrefabVoxel& v : lat) {
+        const uint32_t mat = (uint32_t)(v.material & 0xFFFu);
+        if (!mat) continue;
+        bool open = false;
+        for (const auto& dd : d6)
+          if (!occ.count(key(v.x + dd[0], v.y + dd[1], v.z + dd[2]))) {
+            open = true;
+            break;
+          }
+        if (!open) continue;
+        if (mats) {  // control arm: RECORD what a whole body shows
+          mats->push_back(mat);
+          continue;
+        }
+        if (zd.woundMat && mat == zd.woundMat) continue;  // is blood already
+        if (std::find(skinMats.begin(), skinMats.end(), mat) != skinMats.end())
+          continue;
+        wall++;
+        if (!v.stain) clean++;
+      }
+    }
+  };
+  uint32_t wall = 0, wallClean = 0, ignA = 0, ignB = 0;
+  exposedInner(hId, mh, &skinMats, ignA, ignB);
+  std::sort(skinMats.begin(), skinMats.end());
+  skinMats.erase(std::unique(skinMats.begin(), skinMats.end()), skinMats.end());
+  exposedInner(zA, ma, nullptr, wall, wallClean);
+  const double dryWallFrac = wall ? (double)wallClean / (double)wall : 0.0;
+  const double dryWallMin = BaselineNumber("undeadDryWallFracMin", 0.20);
+  const double dryWallMax = BaselineNumber("undeadDryWallFracMax", 0.85);
+  // The floor on `wall` is the vacuity guard: "0 of 0 wall voxels are clean"
+  // would otherwise pass or fail on a division rather than on the feature.
+  const bool mishmash = wall >= 200 && dryWallFrac >= dryWallMin &&
+                        dryWallFrac <= dryWallMax;
+
   RecordObserved("undeadLossFrac", lossA);
   RecordObserved("undeadSpurPerLost", spurPerLost);
   RecordObserved("undeadChromaFrac", hChroma > 0 ? zChroma / hChroma : 0.0);
   RecordObserved("undeadWoundFrac", woundFrac);
   RecordObserved("undeadStainFrac", stainFrac);
+  RecordObserved("undeadDryWallFrac", dryWallFrac);
 
   const bool ok = sameArt && overrides && paler && humanWhole && bitten &&
-                  hurt && intact && dry && chunky && varies && bloody;
+                  hurt && intact && dry && chunky && varies && bloody &&
+                  mishmash;
   detail = Format(
       "art/rig shared %d, overrides %d, palette chroma %.2f -> %.2f luma %.1f "
       "-> %.1f (%d), human whole %u/%u (%d), zombie %u/%u lost %.3f (%.2f..%.2f"
       ", %d), hp %.1f -> %.1f (%d), intact %d, dry %d, spurs/lost %.3f <= %.3f "
       "(%d), varies %d, blood: wound %.3f (>= %.3f and >= %.1fx anatomy "
-      "%.3f) stain %.3f (>= %.3f), human wound/stain %u/%u (%d)",
+      "%.3f) stain %.3f (>= %.3f), human wound/stain %u/%u (%d), dry hole "
+      "walls %u/%u = %.3f (%.2f..%.2f, %d)",
       sameArt ? 1 : 0, overrides ? 1 : 0, hChroma, zChroma, hLuma, zLuma,
       paler ? 1 : 0, hNow, hAt0, humanWhole ? 1 : 0, aNow, aAt0, lossA, lossMin,
       lossMax, bitten ? 1 : 0, hpH, hpA, hurt ? 1 : 0, intact ? 1 : 0,
       dry ? 1 : 0, spurPerLost, spurMax, chunky ? 1 : 0, varies ? 1 : 0,
       woundFrac, woundMin, woundOverBase, hWoundFrac, stainFrac, stainMin,
-      hWound, hStain, bloody ? 1 : 0);
+      hWound, hStain, bloody ? 1 : 0, wallClean, wall, dryWallFrac, dryWallMin,
+      dryWallMax, mishmash ? 1 : 0);
 
   c.debris.Reset();
   c.mobs.Reset();

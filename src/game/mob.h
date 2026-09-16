@@ -261,6 +261,40 @@ struct MobRotDef {
   // kerf has not. 0 disables the soak entirely (a dry, bloodless rot: bone
   // creatures, husks, anything that never had blood in it).
   float stainScale = 2.0f;
+  // ---- ...AND HOW MANY OF THE HOLES ARE BLOODY AT ALL (2026-09-15) ---------
+  //
+  // WETNESS IS A PROPERTY OF ONE BITE, not of the creature and not of the limb.
+  // Staining the whole limb in one pass — which is what the first version did,
+  // because `StainWound` was handed every cell the carve took — gives every
+  // hole on a body the same amount of blood, and a body whose wounds are all
+  // equally fresh reads as uniform however good any single hole looks. The
+  // owner's word for what it should be instead is a MISHMASH: some holes dry
+  // and old, showing the flesh and bone the anatomy put under the skin, and
+  // some still wet.
+  //
+  // So every bite rolls its own `wet` in 0..1 and the roll is a SPECTRUM with
+  // an atom at zero, not a coin flip:
+  //
+  //   u < dryFraction          -> wet 0, no soak at all. The hole is a hole:
+  //                               skin, flesh, muscle and bone as baked, which
+  //                               is what the dry version of this feature
+  //                               looked like and what half of them should
+  //                               still look like.
+  //   otherwise                -> wet ramps linearly from `wetMin` to `wetMax`
+  //                               across the rest of the range, so the bloody
+  //                               half is itself a gradient from a trace to a
+  //                               fresh wound rather than a second uniform.
+  //
+  // `wetMin` is deliberately small but NOT zero: it is the "minute amount of
+  // blood" end of the spectrum, and floored at something the 0..15 stain scale
+  // can still represent after the taper (below about 0.07 the smear rounds to
+  // nothing and the bite may as well have been dry, which the dry roll already
+  // provides on purpose).
+  //
+  // dryFraction 1 is the bloodless rot `stainScale` 0 also gives; 0 is the
+  // every-hole-bleeds behaviour this replaced.
+  float dryFraction = 0.5f;
+  float wetMin = 0.12f, wetMax = 1.0f;
   // Limb NAMES or TAGS never bitten. A rig that would rather keep its hands.
   std::vector<std::string> skip;
 };
@@ -1980,10 +2014,19 @@ class Mob {
   // `radiusWorld` as how far past the hole the blood reaches. A kerf is one
   // shape and a ball round it is a fair description of it; a crater is not —
   // see the note on CellDist in phys/bodystain.h.
+  //
+  // `wetness` (0..1) is HOW MUCH BLOOD THERE IS, as distinct from how far it
+  // reaches. 1 is a fresh wound and is what every blade, blast and bite passes;
+  // below 1 both halves of the soak thin together — fewer voxels rewritten,
+  // a lighter tint, bone shown only faintly — and the reach comes in as
+  // sqrt(wetness), more slowly than the amount, because a stain that fades
+  // to nothing over one cell is a stain nobody can see at this resolution.
+  // 0 returns immediately and leaves the hole dry. Only `Mob::RotAtSpawn`
+  // passes anything else today, per BITE (MobRotDef::dryFraction).
   uint32_t StainWound(int limbIndex, Vec3 centreLocal, float radiusWorld,
                       uint32_t seed,
                       const std::vector<IVec3>* crater = nullptr,
-                      float rimCells = 0.0f);
+                      float rimCells = 0.0f, float wetness = 1.0f);
   // ---- and the other half: the soak DRIES BACK TO FLESH -------------------
   // BurnLimbView::ReviveFn over one limb's `woundWas` table. A raw function
   // pointer for the same reason WornAlong is one: the view is rebuilt per limb

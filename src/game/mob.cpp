@@ -759,6 +759,16 @@ bool LoadMobDefs(const std::string& dir, const std::vector<MaterialDef>& mats,
                                    1.0f);
         rd.stainScale = std::clamp(r.value("stainScale", rd.stainScale), 0.0f,
                                    8.0f);
+        // How many holes bleed at all, and how hard the ones that do. `wet` is
+        // a [min, max] range like every other spread in this block, so it is
+        // authored the same way `radius` is; the floor on wetMin is what keeps
+        // "a trace" from rounding to "dry" and duplicating dryFraction by
+        // accident (MobRotDef).
+        rd.dryFraction = std::clamp(r.value("dryFraction", rd.dryFraction),
+                                    0.0f, 1.0f);
+        range("wet", rd.wetMin, rd.wetMax);
+        rd.wetMin = std::clamp(rd.wetMin, 0.07f, 1.0f);
+        rd.wetMax = std::clamp(rd.wetMax, rd.wetMin, 1.0f);
         if (r.contains("skip") && r["skip"].is_array())
           for (const auto& s : r["skip"])
             if (s.is_string()) rd.skip.push_back(s.get<std::string>());
@@ -6528,7 +6538,7 @@ uint32_t Mob::NeckCount(const MobLimb& limb, float radiusWorld) const {
 
 uint32_t Mob::StainWound(int limbIndex, Vec3 centreLocal, float radiusWorld,
                          uint32_t seed, const std::vector<IVec3>* crater,
-                         float rimCells) {
+                         float rimCells, float wetness) {
   if (!def_ || limbIndex < 0 || limbIndex >= (int)limbs_.size()) return 0;
   // A GARMENT HAS NO BLOOD IN IT, and neither has a sword. Both are borrowed
   // rig slots (DESIGN.md §8c) and both reach every path a limb reaches, which
@@ -6539,9 +6549,25 @@ uint32_t Mob::StainWound(int limbIndex, Vec3 centreLocal, float radiusWorld,
   const uint32_t stain = def_->woundMat;
   const bool fromCrater = crater && !crater->empty() && rimCells > 0.0f;
   if (!stain || (!fromCrater && radiusWorld <= 0.0f)) return 0;
+  // ---- HOW MUCH BLOOD, AS DISTINCT FROM HOW FAR IT REACHES ----------------
+  // A DRY WOUND IS NOT A SMALL WOUND. `wet` 0 means the hole shows what the
+  // anatomy put under the skin and nothing else, which is a different look
+  // from a tiny bloody one — so it returns before anything is touched rather
+  // than scaling the radius to a cell and a half.
+  //
+  // Below 1 the two halves of the soak thin TOGETHER (both the fraction of
+  // tissue rewritten and the amount of tint laid over it), because they are
+  // both descriptions of the same quantity of blood; the REACH is scaled by
+  // sqrt(wet) instead, i.e. more slowly, for the reason a faint wide haze is
+  // worse than a faint tight smudge: a smear that fades to nothing within one
+  // cell is invisible at this lattice's resolution, so a trace of blood has to
+  // stay narrow rather than stay faint everywhere.
+  const float wet = std::clamp(wetness, 0.0f, 1.0f);
+  if (wet <= 0.0f) return 0;
+  const float reach = std::sqrt(wet);
   const auto& gt = CurrentTuning().gore;
-  const float density = std::clamp(gt.woundStainDensity, 0.0f, 1.0f);
-  const float surface = std::clamp(gt.woundStainSurface, 0.0f, 1.0f);
+  const float density = std::clamp(gt.woundStainDensity * wet, 0.0f, 1.0f);
+  const float surface = std::clamp(gt.woundStainSurface * wet, 0.0f, 1.0f);
   if (density <= 0.0f && surface <= 0.0f) return 0;
   const float coherence = std::clamp(gt.woundStainCoherence, 0.0f, 1.0f);
 
@@ -6550,7 +6576,7 @@ uint32_t Mob::StainWound(int limbIndex, Vec3 centreLocal, float radiusWorld,
   const float scale =
       (float)std::max(1u, fine ? SkinScaleOf(limb) : PhysScaleOf(limb));
   const Vec3 c = centreLocal * scale;
-  const float r = radiusWorld * scale;
+  const float r = radiusWorld * scale * reach;
   const float r2 = r * r;
   // Blotch size in this lattice's own units. Authored in WORLD voxels like
   // every other radius here, so a fine skin gets a finer-grained field of the
@@ -6560,9 +6586,10 @@ uint32_t Mob::StainWound(int limbIndex, Vec3 centreLocal, float radiusWorld,
   // and shared with the smear below, padded by the wider of the two reaches
   // so neither runs off the end of the field into `1e9`.
   const float tintRatio = gt.stainCutRadius / std::max(0.05f, gt.woundStainRadius);
-  const float rimL = fromCrater ? rimCells : 0.0f;
-  const float tintL =
-      fromCrater ? rimCells * tintRatio : gt.stainCutRadius * scale;
+  const float rimL = fromCrater ? rimCells * reach : 0.0f;
+  const float tintL = (fromCrater ? rimCells * tintRatio
+                                  : gt.stainCutRadius * scale) *
+                      reach;
   const CellDist craterDist =
       fromCrater ? BuildCellDist(*crater, (int)std::ceil(std::max(rimL, tintL)) + 1)
                  : CellDist{};
@@ -6786,10 +6813,16 @@ uint32_t Mob::StainWound(int limbIndex, Vec3 centreLocal, float radiusWorld,
     // of the rim, measured off the same distance field.
     soak.radius = tintL;
     if (useCrater) soak.from = &craterDist;
-    soak.amountExposed = gt.stainCutAmount;
-    soak.amountBuried = gt.stainCutBuried;
-    soak.buriedChance = gt.stainCutBuriedChance;
-    soak.boneMin = gt.stainBoneMin;
+    // Every amount thins with `wet` together — including the BONE FLOOR, which
+    // is the one that matters most for the look being asked for here: an old
+    // dry-ish hole through a skull should show bone with a trace on it, not
+    // bone painted to the same floor a fresh bite leaves. Rounded, so a very
+    // faint bite can land on 0 for the buried cells and 1 or 2 on the exposed
+    // ones, which is exactly "a minute amount of blood".
+    soak.amountExposed = (int)std::lround((float)gt.stainCutAmount * wet);
+    soak.amountBuried = (int)std::lround((float)gt.stainCutBuried * wet);
+    soak.buriedChance = gt.stainCutBuriedChance * wet;
+    soak.boneMin = (int)std::lround((float)gt.stainBoneMin * wet);
     soak.tissue = &tissue;
     StainLattice L;
     if (fine) L.skin = &limb.skinVoxels; else L.coll = &limb.voxels;
@@ -11016,6 +11049,7 @@ uint32_t Mob::RotAtSpawn(World& world) {
     // ---- draw the bites, then make them fit ---------------------------------
     std::vector<Vec3> centres;   // limb-local WORLD voxels
     std::vector<float> radii;    // world voxels
+    std::vector<float> wetRolls; // 0 = a dry hole; see the soak block below
     const float vital = ld.vital ? rd.vitalScale : 1.0f;
     for (int b = 0; b < bites; b++) {
       const IVec3 c = surface[draw() % (uint32_t)surface.size()];
@@ -11174,16 +11208,104 @@ uint32_t Mob::RotAtSpawn(World& world) {
     // budget inside CarveLimb, and StainWound has no drip in it — so the holes
     // look wet and the creature is not haemorrhaging. That distinction is the
     // whole reason the two are separate functions.
-    if (rep.count && !rep.cells.empty()) {
+    //
+    // ---- AND EVERY BITE IS A DIFFERENT AGE (2026-09-15) ---------------------
+    //
+    // That first version handed `StainWound` the whole limb's removed cells in
+    // ONE call, so every hole on a body came out equally bloody — which reads
+    // as uniform no matter how right any single hole looks, and was the next
+    // owner report: "every chunk that's taken out of a zombie by default has
+    // blood around it ... I want a mishmash of decayed/open wounds and bone,
+    // and half of it more fresh looking with blood stains", on a SPECTRUM and
+    // not as two settings.
+    //
+    // Wetness is therefore a property of one BITE. Two things have to be true
+    // for that to mean anything, and each is a separate piece of work below:
+    //
+    //   1. the roll, which is a ramp with an atom at zero (MobRotDef::
+    //      dryFraction / wetMin / wetMax) — `dryFraction` of the bites get no
+    //      soak at all and the rest fade in from a trace to a fresh wound;
+    //   2. ATTRIBUTION, because `rep.cells` is one flat list of everything the
+    //      carve took off this limb and a per-bite soak needs to know which
+    //      cells belong to which hole. Nearest in NORMALISED distance
+    //      (d²/r²), not in absolute distance: the bites differ in radius by up
+    //      to 2x and the falloff `(1-t²)²` is a function of t, so a cell two
+    //      cells outside a small bite is further "into" it than a cell four
+    //      cells inside a large one. Every removed cell is claimed by some
+    //      bite — the fallback is the argmin, so the connectivity split's
+    //      strays land on whichever hole they are closest to rather than being
+    //      dropped.
+    //
+    // A DRY BITE IS NOT SKIPPED CHEAPLY BY LUCK. Its cells are still attributed
+    // and then simply not soaked, so a wet bite overlapping it does not have
+    // its own blood stolen, and the dry hole keeps whatever the neighbouring
+    // wet one bled into it. That is the mishmash: adjacent holes of different
+    // ages, not a body with a global blood level.
+    if (rep.count && !rep.cells.empty() && !centres.empty()) {
       // Wider than a fresh blade's kerf by `stainScale`, because these are not
       // fresh: a wound that has been open long enough to dry has bled around
       // itself, and the owner asked for "more bloody generally around the
       // chunks". Expressed as a MULTIPLE of the same gore knob the crater
       // uses, so retuning blood globally still reaches the undead.
       const float rim = std::max(0.0f, gt.craterStainRim * rd.stainScale);
-      if (rim > 0.0f)
-        StainWound((int)i, rep.centreLocal, 0.0f, seed ^ 0x5B100D1u,
-                   &rep.cells, rim);
+      const float dry = std::clamp(rd.dryFraction, 0.0f, 1.0f);
+      wetRolls.assign(centres.size(), 0.0f);
+      for (size_t b = 0; b < centres.size(); b++) {
+        const float u = rng::Unit01(draw());
+        if (u < dry) continue;  // this hole is old, and shows flesh and bone
+        const float v = (u - dry) / std::max(1e-4f, 1.0f - dry);
+        // ---- THE RAMP IS UNIFORM IN HOW BLOODY IT LOOKS ---------------------
+        //
+        // NOT in `wet`, and that is not a detail. `wet` scales the amount of
+        // blood linearly and its reach as sqrt, so the number of voxels that
+        // end up carrying any goes as roughly wet^2.5 — and a linear ramp
+        // through a quantity that enters the answer at the 2.5th power spends
+        // most of its length in the faint end. Measured, first run: half the
+        // bites dry and the rest ramped linearly took the rewrite from 0.095
+        // of the body to 0.022, a 4.3x cut for a feature that was meant to
+        // remove half. The owner asked for half of them to be "more fresh
+        // looking with blood stains"; a linear ramp gives almost none of them.
+        //
+        // v^(1/2.5) inverts that power, so equal slices of the roll are equal
+        // steps of VISIBLE blood: the wettest bites are as bloody as every
+        // bite used to be, the faint end is still reached (that is the "minute
+        // amount of blood that varies"), and it is simply spread evenly in
+        // between instead of piling up at the bottom.
+        const float vv = std::pow(v, 0.4f);
+        wetRolls[b] = rd.wetMin + (rd.wetMax - rd.wetMin) * vv;
+      }
+      if (rim > 0.0f) {
+        // Bite geometry in the AUTHORITATIVE lattice's own units, which is what
+        // rep.cells is in; hoisted out of the per-cell loop.
+        std::vector<Vec3> cl(centres.size());
+        std::vector<float> rl2(centres.size());
+        for (size_t b = 0; b < centres.size(); b++) {
+          cl[b] = centres[b] * (float)lat;
+          const float rr = std::max(1e-3f, radii[b] * (float)lat);
+          rl2[b] = rr * rr;
+        }
+        std::vector<std::vector<IVec3>> byBite(centres.size());
+        for (const IVec3& cell : rep.cells) {
+          size_t best = 0;
+          float bestT = 1e30f;
+          for (size_t b = 0; b < cl.size(); b++) {
+            const Vec3 d{(float)cell.x + 0.5f - cl[b].x,
+                         (float)cell.y + 0.5f - cl[b].y,
+                         (float)cell.z + 0.5f - cl[b].z};
+            const float t = d.dot(d) / rl2[b];
+            if (t < bestT) { bestT = t; best = b; }
+          }
+          byBite[best].push_back(cell);
+        }
+        for (size_t b = 0; b < centres.size(); b++) {
+          if (wetRolls[b] <= 0.0f || byBite[b].empty()) continue;
+          // Per-bite seed: two holes on one limb must not stain the same
+          // pattern, and the same hole on a replay must.
+          StainWound((int)i, centres[b], 0.0f,
+                     seed ^ 0x5B100D1u ^ (uint32_t)((b + 1) * 0x9E3779B9u),
+                     &byBite[b], rim, wetRolls[b]);
+        }
+      }
     }
     if (kRotDebug) {
       std::string rs;
@@ -11204,13 +11326,23 @@ uint32_t Mob::RotAtSpawn(World& world) {
       const float gotVol =
           (float)(nCells > nAfter ? nCells - nAfter : 0) /
           ((float)lat * lat * lat);
+      // WHICH HOLES BLED, and how much. Printed beside the radii because the
+      // two together are the whole of what one bite is, and because "the
+      // zombie looks too dry / too bloody" is otherwise a claim about a roll
+      // nothing records — the exact bare-count trap the run-budget rules name.
+      std::string ws;
+      for (float w : wetRolls) {
+        char b[32];
+        std::snprintf(b, sizeof(b), "%.2f ", w);
+        ws += b;
+      }
       std::fprintf(
           stderr,
           "rot %s/%-8s cells %5zu vol %6.2f extent %5.2f lat %u | bites %d "
-          "r[ %s] capped %d | predicted %5.2f (%4.1f%%) got %5.2f (%4.1f%%) "
-          "ratio %.2f\n",
+          "r[ %s] wet[ %s] capped %d | predicted %5.2f (%4.1f%%) got %5.2f "
+          "(%4.1f%%) ratio %.2f\n",
           def_->name.c_str(), ld.name.c_str(), nCells, volLimb, extent, lat,
-          (int)radii.size(), rs.c_str(), capped ? 1 : 0, predicted,
+          (int)radii.size(), rs.c_str(), ws.c_str(), capped ? 1 : 0, predicted,
           volLimb > 0 ? 100.0f * predicted / volLimb : 0.0f, gotVol,
           volLimb > 0 ? 100.0f * gotVol / volLimb : 0.0f,
           predicted > 0 ? gotVol / predicted : 0.0f);
