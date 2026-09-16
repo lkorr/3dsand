@@ -3252,11 +3252,47 @@ static bool StyleDebugOn() {
   return on;
 }
 
+// ---- ...AND IT WRITES ITS OWN FILE ----------------------------------------
+//
+// Because the readout is useless if it only reaches a terminal. It is a
+// WINDOWED GAME the owner has to play for a minute to provoke the bug, on
+// Windows, from whichever shell they happen to have open -- so "pipe it to
+// tee" is a step that can be got wrong, scrollback that can be lost, and a
+// shell dialect (`2>&1 |` vs `*>` vs `>`) per person. A fixed path costs
+// nothing and always survives.
+//
+// Truncated once per process so a fresh run is not read as an old one, flushed
+// per line because the interesting case is a game still running (or one that
+// crashed), and stdout is still written so the gates' output is unchanged.
+static std::FILE* StyleDebugFile() {
+  static std::FILE* f = [] () -> std::FILE* {
+    if (!StyleDebugOn()) return nullptr;
+    std::FILE* h = std::fopen("build/style_debug.log", "w");
+    if (h == nullptr) h = std::fopen("style_debug.log", "w");  // no build/ yet
+    return h;
+  }();
+  return f;
+}
+
+// One call site's worth of "say it twice", so the two never drift.
+template <typename... A>
+static void StyleDebugSay(const char* fmt, A... a) {
+  if (!StyleDebugOn()) return;
+  std::printf(fmt, a...);
+  if (std::FILE* f = StyleDebugFile()) {
+    std::fprintf(f, fmt, a...);
+    std::fflush(f);
+  }
+}
+
 void MobSystem::ReportNoStroke(const Mob& mob, const ai::Profile* pr,
                                int reason, const char* detail) {
   uint8_t& seen = strokeGripe_[mob.id_];
   const uint8_t bit = (uint8_t)(1u << (reason & 7));
-  if (seen & bit) return;
+  // ONCE PER MOB PER REASON, so a creature that cannot swing does not fill the
+  // log -- EXCEPT under the style debug, where the whole point is to watch a
+  // live fight and "it stopped complaining" reads as "it started working".
+  if ((seen & bit) && !StyleDebugOn()) return;
   seen |= bit;
   static const char* kWhy[] = {
       "its profile is not loaded",
@@ -3269,6 +3305,17 @@ void MobSystem::ReportNoStroke(const Mob& mob, const ai::Profile* pr,
               pr != nullptr ? pr->name.c_str() : "?",
               kWhy[reason & 3], detail && *detail ? ": " : "",
               detail ? detail : "");
+  // ...and into the same file the draw readout writes, so ONE artefact carries
+  // the whole story: a creature that swings the wrong thing and one that
+  // swings nothing are the two halves of "it is just punching".
+  if (std::FILE* f = StyleDebugFile()) {
+    std::fprintf(f, "mob %llu (\"%s\"): attack dropped - %s%s%s\n",
+                 (unsigned long long)mob.id_,
+                 pr != nullptr ? pr->name.c_str() : "?",
+                 kWhy[reason & 3], detail && *detail ? ": " : "",
+                 detail ? detail : "");
+    std::fflush(f);
+  }
 }
 
 // ---- WHICH LIMB OF THE VICTIM (AttackStyle::target; plan §5) --------------
@@ -3410,21 +3457,21 @@ void MobSystem::BeginStroke(Mob& mob, const ai::AttackRequest& req,
   // dropped, the profile not listing them), and eliminating them one per run
   // is exactly what CLAUDE.md rule 6 forbids. One line per style says which.
   if (StyleDebugOn()) {
-    std::printf("mob %llu (\"%s\") draws \"%s\" at %.2f (+%.2f body):",
-                (unsigned long long)mob.id_, pr->name.c_str(),
-                styles_.At(si)->name.c_str(), req.distance, slack);
+    StyleDebugSay("mob %llu (\"%s\") draws \"%s\" at %.2f (+%.2f body):",
+                  (unsigned long long)mob.id_, pr->name.c_str(),
+                  styles_.At(si)->name.c_str(), req.distance, slack);
     for (const std::string& n : pr->attack.styles) {
       const AttackStyle* s = styles_.At(styles_.Find(n));
-      if (s == nullptr) { std::printf("  %s=NOSTYLE", n.c_str()); continue; }
+      if (s == nullptr) { StyleDebugSay("  %s=NOSTYLE", n.c_str()); continue; }
       const bool usable = StyleUsable(mob, *s);
       const float r = usable ? StyleReachOn(mob, *s) : 0.0f;
       const char* verdict =
           !usable ? "unusable"
                   : (r > 0.0f && req.distance > r + slack ? "TOO FAR" : "ok");
-      std::printf("  %s%s[reach %.2f %s]", n.c_str(),
-                  s->fallback ? "(fb)" : "", r, verdict);
+      StyleDebugSay("  %s%s[reach %.2f %s]", n.c_str(),
+                    s->fallback ? "(fb)" : "", r, verdict);
     }
-    std::printf("\n");
+    StyleDebugSay("%s", "\n");
   }
   const AttackStyle& sty = *styles_.At(si);
   // ---- ITS OWN REACH, BEFORE ANYTHING ELSE (plan §5) ---------------------
@@ -3450,8 +3497,16 @@ void MobSystem::BeginStroke(Mob& mob, const ai::AttackRequest& req,
   // picks its own style (a script, a scripted duel) still gets the refusal.
   const float styleReach = StyleReachOn(mob, sty);
   if (req.distance > 0.0f && styleReach > 0.0f &&
-      req.distance > styleReach + slack)
+      req.distance > styleReach + slack) {
+    // A DRAWN STYLE CAN STILL DIE HERE, and until now that was silent -- so
+    // "it drew a bite" and "it swung a bite" were indistinguishable from
+    // outside, and a creature refusing every blow after a correct draw looked
+    // exactly like one drawing the wrong blow. The readout above prints the
+    // draw; this prints the drop, so one run tells the two apart.
+    StyleDebugSay("  ...and DROPPED it: %.2f > reach %.2f + %.2f body\n",
+                  req.distance, styleReach, slack);
     return;   // not a content error: this style is simply the wrong one now
+  }
   if (!mob.ArmForStyle(sty)) {
     ReportNoStroke(mob, pr, 3, sty.weapon.c_str());
     return;
