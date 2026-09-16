@@ -327,13 +327,13 @@ struct Tuning {
     // the plate is genuinely gone there, so the flesh under it is exposed to
     // the next blow, to fire and to acid -- "indent/destroy plate (revealing
     // flesh)" in the owner's words, with no armour-value number anywhere.
-    float bluntDentRadius = 1.2f;
+    float bluntDentRadius = 3.0f;
     // ...scaled by the shell's own MATERIAL HARDNESS, exactly as the kerf is,
     // against this reference and floored here. 60 rather than the kerf's 8
     // because the whole point is that plate is much LESS proof against trauma
     // than against an edge: iron (160) keeps about 38% of the dent, where it
     // keeps 5% of a kerf.
-    float bluntHardnessRef = 60.0f;
+    float bluntHardnessRef = 120.0f;
     float bluntHardnessMin = 0.15f;
     // WHAT GETS THROUGH. Fraction of a blunt blow's hp that is TRANSMITTED to
     // the limb the shell is strapped to (MobLimb::wornHost), as trauma with a
