@@ -3450,17 +3450,8 @@ void MobSystem::BeginStroke(Mob& mob, const ai::AttackRequest& req,
   // picks its own style (a script, a scripted duel) still gets the refusal.
   const float styleReach = StyleReachOn(mob, sty);
   if (req.distance > 0.0f && styleReach > 0.0f &&
-      req.distance > styleReach + slack) {
-    // A DRAWN STYLE CAN STILL DIE HERE, and until now that was silent -- so
-    // "it drew a bite" and "it swung a bite" were indistinguishable from
-    // outside, and a creature refusing every blow after a correct draw looked
-    // exactly like one drawing the wrong blow. The readout above prints the
-    // draw; this prints the drop, so one run tells the two apart.
-    if (StyleDebugOn())
-      std::printf("  ...and DROPPED it: %.2f > reach %.2f + %.2f body\n",
-                  req.distance, styleReach, slack);
+      req.distance > styleReach + slack)
     return;   // not a content error: this style is simply the wrong one now
-  }
   if (!mob.ArmForStyle(sty)) {
     ReportNoStroke(mob, pr, 3, sty.weapon.c_str());
     return;

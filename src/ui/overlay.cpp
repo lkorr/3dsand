@@ -1657,11 +1657,15 @@ void Overlay::Draw(UIState& s) {
                   "Below this, a click has no direction and the strike\n"
                   "alternates horizontal left/right instead.");
             f("torso twist share", &m.torsoShare, 0.0f, 1.0f, "%.2f");
+            if (ImGui::IsItemHovered())
+              ImGui::SetTooltip(
+                  "Fraction of the stroke's azimuth the torso carries,\n"
+                  "like the head-look's spine share. 0 = arm only.");
             f("torso pitch share", &m.torsoPitch, 0.0f, 1.0f, "%.2f");
             if (ImGui::IsItemHovered())
               ImGui::SetTooltip(
-                  "Fractions of the stroke's azimuth/elevation the torso\n"
-                  "carries, like the head-look's spine share. 0 = arm only.");
+                  "Fraction of the stroke's elevation the torso carries.\n"
+                  "0 = arm only, 1 = whole body pitches into the blow.");
             f("head keep-out (m)", &m.headClearM, 0.0f, 0.5f, "%.2f");
             if (ImGui::IsItemHovered())
               ImGui::SetTooltip(
@@ -1672,17 +1676,45 @@ void Overlay::Draw(UIState& s) {
           if (ImGui::CollapsingHeader("Aim", ImGuiTreeNodeFlags_DefaultOpen)) {
             ImGui::TextDisabled("radians of tip travel per mouse pixel");
             f("aim gain x", &m.aimGainX, 0.0005f, 0.02f, "%.4f");
+            if (ImGui::IsItemHovered())
+              ImGui::SetTooltip("Radians of tip azimuth per mouse pixel.");
             f("aim gain y", &m.aimGainY, 0.0005f, 0.02f, "%.4f");
+            if (ImGui::IsItemHovered())
+              ImGui::SetTooltip("Radians of tip elevation per mouse pixel.");
             f("commit speed (px/s)", &m.commitSpeed, 100.0f, 3000.0f, "%.0f");
+            if (ImGui::IsItemHovered())
+              ImGui::SetTooltip(
+                  "Mouse px/s that commits a guard to a cut. Below this\n"
+                  "the blade is held; above it the stroke fires.");
             f("direction smoothing (s)", &m.dirSmoothing, 0.005f, 0.4f);
+            if (ImGui::IsItemHovered())
+              ImGui::SetTooltip(
+                  "Seconds of mouse history averaged to pick the stroke\n"
+                  "direction. Higher = less twitchy, slower to respond.");
             f("reach gain (m/unit)", &m.reachGainM, 0.0f, 0.02f, "%.4f");
+            if (ImGui::IsItemHovered())
+              ImGui::SetTooltip("Metres of tip reach per dReach unit.");
           }
           if (ImGui::CollapsingHeader("Arc", ImGuiTreeNodeFlags_DefaultOpen)) {
             f("swing arc (rad)", &m.swingArc, 0.0f, 3.1f, "%.2f");
+            if (ImGui::IsItemHovered())
+              ImGui::SetTooltip("Radians the committed cut carries the point.");
             f("anticipation", &m.swingAnticipate, 0.0f, 1.0f, "%.2f");
+            if (ImGui::IsItemHovered())
+              ImGui::SetTooltip(
+                  "Fraction of the arc pulled back before the cut. Higher\n"
+                  "= bigger wind-up; 0 = the cut starts where you are.");
             f("mid-stroke bow", &m.swingExtend, 0.0f, 0.6f, "%.2f");
+            if (ImGui::IsItemHovered())
+              ImGui::SetTooltip(
+                  "Fraction of reach the arc bows outward by at mid-\n"
+                  "stroke, widening the sweep. 0 = straight-line cut.");
             f("slash time (s)", &m.slashTime, 0.03f, 0.6f);
+            if (ImGui::IsItemHovered())
+              ImGui::SetTooltip("Seconds the committed slash takes.");
             f("recover time (s)", &m.recoverTime, 0.03f, 0.8f);
+            if (ImGui::IsItemHovered())
+              ImGui::SetTooltip("Seconds of follow-through after the cut.");
           }
           if (ImGui::CollapsingHeader("Where the point may go",
                                       ImGuiTreeNodeFlags_DefaultOpen)) {
@@ -1698,8 +1730,20 @@ void Overlay::Draw(UIState& s) {
                   "1.83 is 105 deg: the whole front plus a little past\n"
                   "side-on, which is still a real wind-up.");
             f("azimuth across (rad)", &m.azAcross, 0.2f, 3.1f, "%.2f");
+            if (ImGui::IsItemHovered())
+              ImGui::SetTooltip(
+                  "How far across the body the point may go, measured\n"
+                  "from straight ahead toward the off-hand side.");
             f("elevation min (rad)", &m.elMin, -1.55f, -0.1f, "%.2f");
+            if (ImGui::IsItemHovered())
+              ImGui::SetTooltip(
+                  "Lowest the point may go, in radians. -1.55 is the arm\n"
+                  "hanging at the side.");
             f("elevation max (rad)", &m.elMax, 0.1f, 1.55f, "%.2f");
+            if (ImGui::IsItemHovered())
+              ImGui::SetTooltip(
+                  "Highest the point may go, in radians. 1.48 is\n"
+                  "directly overhead.");
           }
           if (ImGui::CollapsingHeader("Arm and wrist",
                                       ImGuiTreeNodeFlags_DefaultOpen)) {
@@ -1736,6 +1780,11 @@ void Overlay::Draw(UIState& s) {
                   "alignment as it moves. 1.0 is the old behaviour.");
             f("steer ramp: still below (m/s)", &m.steerSpeedLoMps, 0.0f, 6.0f,
               "%.2f");
+            if (ImGui::IsItemHovered())
+              ImGui::SetTooltip(
+                  "Blade tip speed in m/s below which the wrist stays\n"
+                  "at the steer floor. Below this the blade keeps its\n"
+                  "grip pose rather than aligning to the stroke.");
             f("steer ramp: committed above (m/s)", &m.steerSpeedHiMps, 0.05f,
               12.0f, "%.2f");
             if (ImGui::IsItemHovered())
@@ -1799,36 +1848,75 @@ void Overlay::Draw(UIState& s) {
                   "The anatomy is enforced on the BEND PLANE above, where\n"
                   "it is free. This is left as the A/B.");
             f("hand extension", &m.handExtend, 0.15f, 1.0f, "%.2f");
+            if (ImGui::IsItemHovered())
+              ImGui::SetTooltip(
+                  "How far the hand reaches out, as a fraction of arm\n"
+                  "reach. Lower = the arm bends more; higher = straighter.");
             f("extension smoothing (s)", &m.extendSmoothing, 0.005f, 1.0f);
+            if (ImGui::IsItemHovered())
+              ImGui::SetTooltip("Halflife on extension changes, in seconds.");
             f("reach fraction", &m.reachFraction, 0.2f, 0.99f, "%.2f");
+            if (ImGui::IsItemHovered())
+              ImGui::SetTooltip(
+                  "Fraction of arm reach the hand may use. Caps how far\n"
+                  "the tip can extend from the shoulder.");
             f("lean turn rate (rad/s)", &m.leanTurnRate, 0.5f, 60.0f, "%.1f");
+            if (ImGui::IsItemHovered())
+              ImGui::SetTooltip(
+                  "Radians/sec the lean plane may turn. Limits how fast\n"
+                  "the body tilts to serve the stroke.");
             f("blade smoothing (s)", &m.bladeSmoothing, 0.005f, 0.4f);
+            if (ImGui::IsItemHovered())
+              ImGui::SetTooltip(
+                  "Halflife on the blade frame, in seconds. The blade's\n"
+                  "own orientation lags the wrist by this.");
             {
-              // Only the SIGN is read (melee.h), so this is a choice and not a
-              // slider. A slider here would let two knobs disagree about where
-              // the hand is.
               bool handLeads = m.handLead >= 0.0f;
               if (ImGui::Checkbox("hand leads the point (sabre cut)",
                                   &handLeads)) {
                 m.handLead = handLeads ? 1.0f : -1.0f;
                 moved = true;
               }
+              if (ImGui::IsItemHovered())
+                ImGui::SetTooltip(
+                    "ON = the hand leads the blade tip (sabre draw-cut).\n"
+                    "OFF = the point leads (a thrust or a chop where the\n"
+                    "tip arrives first).");
             }
           }
           if (ImGui::CollapsingHeader("Guard position")) {
             f("fallback reach (m)", &m.fallbackReachM, 0.1f, 1.5f, "%.2f");
+            if (ImGui::IsItemHovered())
+              ImGui::SetTooltip(
+                  "Reach in metres used when the rig has no arm data.\n"
+                  "The seed of last resort for unarmed/fallback poses.");
             f("guard forward (m)", &m.guardForwardM, 0.0f, 0.6f, "%.2f");
+            if (ImGui::IsItemHovered())
+              ImGui::SetTooltip(
+                  "Metres forward of the shoulder the guard rests at\n"
+                  "when nothing else drives the hand.");
             f("guard up (m)", &m.guardUpM, 0.0f, 0.6f, "%.2f");
+            if (ImGui::IsItemHovered())
+              ImGui::SetTooltip("Metres above the shoulder the guard rests at.");
             f("guard side (m)", &m.guardSideM, 0.0f, 0.6f, "%.2f");
+            if (ImGui::IsItemHovered())
+              ImGui::SetTooltip(
+                  "Metres to the weapon side the guard rests at.");
           }
           if (ImGui::CollapsingHeader("Aim body binding")) {
             f("aim yaw (deg)", &m.aimYaw, 0.0f, 180.0f, "%.0f");
+            if (ImGui::IsItemHovered())
+              ImGui::SetTooltip(
+                  "Degrees the camera may lead the body's facing before\n"
+                  "the swing pins at the cone edge. 180 = camera IS the\n"
+                  "basis wherever it looks (old behaviour).");
             f("aim release yaw (deg)", &m.aimReleaseYaw, 0.0f, 180.0f, "%.0f");
             if (ImGui::IsItemHovered())
               ImGui::SetTooltip(
-                  "How far the camera may lead the body before the swing\n"
-                  "fades to the body's own forward. 180 = old behaviour\n"
-                  "(camera IS the basis wherever it looks).");
+                  "Degrees before straight-behind over which the swing\n"
+                  "fades to the body's own forward — so a camera orbited\n"
+                  "to the character's face gets a swing that goes the\n"
+                  "way the character faces, not at the lens.");
           }
           ImGui::EndChild();
           ImGui::EndTabItem();
@@ -1842,7 +1930,15 @@ void Overlay::Draw(UIState& s) {
                                       ImGuiTreeNodeFlags_DefaultOpen)) {
             ImGui::TextDisabled("tip speed, in m/s, at the two ends of the ramp");
             f("full damage at (m/s)", &t.melee.fullSpeedMps, 0.1f, 20.0f, "%.2f");
+            if (ImGui::IsItemHovered())
+              ImGui::SetTooltip(
+                  "Blade tip speed in m/s for full damage. A swing\n"
+                  "faster than this does no extra — it is the ceiling.");
             f("nothing below (m/s)", &t.melee.minSpeedMps, 0.0f, 20.0f, "%.2f");
+            if (ImGui::IsItemHovered())
+              ImGui::SetTooltip(
+                  "Tip speed below which a hit does nothing at all.\n"
+                  "Resting the blade on someone is not a cut.");
             f("flat-on floor", &t.melee.edgeFloor, 0.0f, 1.0f, "%.2f");
             if (ImGui::IsItemHovered())
               ImGui::SetTooltip(
@@ -1873,8 +1969,16 @@ void Overlay::Draw(UIState& s) {
                   "reads as an invincible AI rather than as a bad number.");
             f("wear on the blade", &t.melee.blockItemDamage, 0.0f, 1.0f,
               "%.2f");
+            if (ImGui::IsItemHovered())
+              ImGui::SetTooltip(
+                  "Fraction of the blow the blocking blade takes as hp\n"
+                  "damage. Parrying is not free — it wears your weapon.");
             f("guard beaten · az (rad)", &t.melee.blockNudgeAz, 0.0f, 1.0f,
               "%.2f");
+            if (ImGui::IsItemHovered())
+              ImGui::SetTooltip(
+                  "Radians the defender's guard is shoved in azimuth\n"
+                  "at full power. Opens the guard for the next blow.");
             f("guard beaten · el (rad)", &t.melee.blockNudgeEl, 0.0f, 1.0f,
               "%.2f");
             if (ImGui::IsItemHovered())
@@ -1891,47 +1995,180 @@ void Overlay::Draw(UIState& s) {
             ImGui::TextDisabled("a cut is a slot; dismemberment is what is");
             ImGui::TextDisabled("left of the lattice afterwards");
             f("bite, standing still (vox)", &g.cutDepth, 0.0f, 2.0f, "%.2f");
+            if (ImGui::IsItemHovered())
+              ImGui::SetTooltip(
+                  "How deep the kerf goes at zero swing speed, in world\n"
+                  "voxels. The base depth before speed adds more.");
             f("bite from speed (vox)", &g.cutDepthPower, 0.0f, 4.0f, "%.2f");
+            if (ImGui::IsItemHovered())
+              ImGui::SetTooltip(
+                  "Extra depth added at full swing speed. Total depth is\n"
+                  "(base + this * power) * heft. A greatsword at full\n"
+                  "swing opens a gash three times as deep as a lazy wave.");
             f("cut length (vox)", &g.cutLength, 0.1f, 8.0f, "%.2f");
+            if (ImGui::IsItemHovered())
+              ImGui::SetTooltip(
+                  "Half-length of the slot along the edge at full power.\n"
+                  "Makes a cut read as a slice, not a puncture. Scaled\n"
+                  "by 0.4 + 0.6 * power so a graze is short.");
             f("cut width x blade", &g.cutWidth, 0.05f, 2.0f, "%.2f");
+            if (ImGui::IsItemHovered())
+              ImGui::SetTooltip(
+                  "Kerf half-thickness as a multiple of the blade's own\n"
+                  "authored edgeHalfWidth. Below 1 because the edge is\n"
+                  "thinner than the widest part of the blade.");
             i32("spall rounds", &g.cutSpallRounds, 0, 4);
+            if (ImGui::IsItemHovered())
+              ImGui::SetTooltip(
+                  "Rounds of spall after the cut. Each round widens the\n"
+                  "gash into its own rim, so sustained hits dismember.\n"
+                  "0 = every cut is a clean bore.");
             f("spall strength", &g.cutSpallStrength, 0.0f, 1.0f, "%.2f");
+            if (ImGui::IsItemHovered())
+              ImGui::SetTooltip(
+                  "How aggressively each spall round removes voxels at\n"
+                  "the rim of the cut. Higher = wider gashes.");
           }
           if (ImGui::CollapsingHeader("When a limb comes off")) {
             f("sever fraction", &g.woundSeverFraction, 0.05f, 0.95f, "%.2f");
+            if (ImGui::IsItemHovered())
+              ImGui::SetTooltip(
+                  "A cut that disconnects at least this fraction of the\n"
+                  "limb's remaining voxels fires a sever. The edge came\n"
+                  "out the other side.");
             f("neck radius (vox)", &g.woundNeckRadius, 0.0f, 8.0f, "%.2f");
+            if (ImGui::IsItemHovered())
+              ImGui::SetTooltip(
+                  "Radius in world voxels of the sphere checked around\n"
+                  "the joint anchor for the hanging-by-a-thread test.");
             f("neck fraction", &g.woundNeckFraction, 0.0f, 0.95f, "%.2f");
+            if (ImGui::IsItemHovered())
+              ImGui::SetTooltip(
+                  "Below this fraction of the joint's original voxels,\n"
+                  "the limb is not attached to anything worth the name\n"
+                  "and comes off.");
             f("impact-sever scale", &g.woundImpactSeverScale, 0.0f, 16.0f, "%.1f");
+            if (ImGui::IsItemHovered())
+              ImGui::SetTooltip(
+                  "Multiplier on each mob's authored severImpactSpeed.\n"
+                  "Those numbers were written when any fast hit severed\n"
+                  "outright, so this scales them up to keep the old\n"
+                  "thresholds as an extreme-speed exception only.");
           }
           if (ImGui::CollapsingHeader("Heft (how much weapon)")) {
             f("reference volume", &g.woundHeftRef, 0.01f, 40.0f, "%.2f");
+            if (ImGui::IsItemHovered())
+              ImGui::SetTooltip(
+                  "World-voxel volume of the weapon that reads as heft\n"
+                  "1.0. Derived from art, not authored: the stock sword\n"
+                  "is 5.3 world voxels. Retune this and every weapon\n"
+                  "rescales together.");
             f("heft ceiling", &g.woundHeftMax, 1.0f, 32.0f, "%.1f");
+            if (ImGui::IsItemHovered())
+              ImGui::SetTooltip(
+                  "Max heft multiplier. Caps how much a comically large\n"
+                  "weapon can amplify a single swing's kerf depth.");
           }
           if (ImGui::CollapsingHeader("Blood")) {
             f("stain radius (vox)", &g.woundStainRadius, 0.0f, 8.0f, "%.2f");
+            if (ImGui::IsItemHovered())
+              ImGui::SetTooltip(
+                  "Radius in world voxels around a cut that gets soaked\n"
+                  "in blood. The wound's visual footprint on the flesh.");
             f("stain density", &g.woundStainDensity, 0.0f, 1.0f, "%.2f");
+            if (ImGui::IsItemHovered())
+              ImGui::SetTooltip(
+                  "Fraction of buried voxels in the stain radius that\n"
+                  "take the blood material. Below 1 so the soak is\n"
+                  "mottled, not a uniform red repaint.");
             f("bleed gain (per mob)", &g.bleedGain, 0.0f, 8.0f, "%.2f");
+            if (ImGui::IsItemHovered())
+              ImGui::SetTooltip(
+                  "Per-mob multiplier on all blood quantities (spray,\n"
+                  "sever, voxels). The global 'how wet is this game'\n"
+                  "dial. Centre is 1.0.");
             ImGui::TextDisabled("every drop is hp (Mob::DrainBlood)");
             f("hp per blood voxel", &g.bleedHpPerVoxel, 0.0f, 5.0f, "%.2f");
+            if (ImGui::IsItemHovered())
+              ImGui::SetTooltip(
+                  "HP cost per whole blood voxel that drips into the\n"
+                  "world. The drip IS the damage — a creature that\n"
+                  "stands in its own blood is dying.");
             ImGui::Checkbox("stumps never close", &g.stumpBleedsOpen);
+            if (ImGui::IsItemHovered())
+              ImGui::SetTooltip(
+                  "ON = severed stumps bleed forever. OFF = they\n"
+                  "eventually clot and stop dripping.");
           }
           if (ImGui::CollapsingHeader("Wound stain shape")) {
             f("surface spread", &g.woundStainSurface, 0.0f, 2.0f, "%.2f");
+            if (ImGui::IsItemHovered())
+              ImGui::SetTooltip(
+                  "Chance an EXPOSED voxel (hole walls, skin at the\n"
+                  "mouth) takes the blood material. The wound's visible\n"
+                  "face — what you see when you look at the cut.");
             f("blob size", &g.woundStainBlob, 0.0f, 4.0f, "%.2f");
+            if (ImGui::IsItemHovered())
+              ImGui::SetTooltip(
+                  "Feature size of the correlated noise in world voxels.\n"
+                  "Controls how large the blotches of blood are. Without\n"
+                  "correlation the soak is a fine speckle, not a smear.");
             f("coherence", &g.woundStainCoherence, 0.0f, 1.0f, "%.2f");
+            if (ImGui::IsItemHovered())
+              ImGui::SetTooltip(
+                  "0 = old independent per-voxel draws (fine speckle).\n"
+                  "1 = fully correlated (blotchy smear). Blends between\n"
+                  "the two noise fields.");
             f("crater rim stain", &g.craterStainRim, 0.0f, 4.0f, "%.2f");
+            if (ImGui::IsItemHovered())
+              ImGui::SetTooltip(
+                  "How far past removed cells the blood reaches on a\n"
+                  "blast crater, in skin-lattice cells. Larger than cut\n"
+                  "stain because a blast is messier than a clean slot.");
           }
           if (ImGui::CollapsingHeader("Wound healing")) {
             b("wounds heal", &g.woundHeals);
+            if (ImGui::IsItemHovered())
+              ImGui::SetTooltip(
+                  "ON = wound-material voxels revert to flesh instead of\n"
+                  "decaying to air. The red fades off over seconds.\n"
+                  "OFF = the undead setting: cuts rot outward and shed\n"
+                  "parts, exactly the old behaviour.");
             f("heal slow factor", &g.woundHealSlow, 0.5f, 20.0f, "%.1f");
+            if (ImGui::IsItemHovered())
+              ImGui::SetTooltip(
+                  "Blood's own decay rate is divided by this inside a\n"
+                  "limb, so wounds settle slower than a puddle on the\n"
+                  "ground. 2 = a cut fades over ~6 s instead of ~3 s.");
             f("corpse bleed/voxel", &g.corpseBleedPerVoxel, 0.0f, 8.0f, "%.2f");
+            if (ImGui::IsItemHovered())
+              ImGui::SetTooltip(
+                  "Blood voxels a corpse owes per world voxel carved off\n"
+                  "it. A dismembered corpse bleeds from where it is cut,\n"
+                  "through the same cap as a live wound.");
           }
           if (ImGui::CollapsingHeader("Blunt and bruise",
                                       ImGuiTreeNodeFlags_DefaultOpen)) {
             ImGui::TextDisabled("a punch, a mace, a pommel — the non-edge half");
             f("bruise radius (vox)", &g.bruiseRadius, 0.0f, 4.0f, "%.2f");
+            if (ImGui::IsItemHovered())
+              ImGui::SetTooltip(
+                  "How far a punch discolours the skin, in world voxels\n"
+                  "at full power. Scaled by (0.5 + 0.5 * power), so\n"
+                  "even a glancing hit marks.");
             f("bruise step (per hit)", &g.bruiseStep, 0.5f, 15.0f, "%.1f");
+            if (ImGui::IsItemHovered())
+              ImGui::SetTooltip(
+                  "Amount (0..15 scale) added per hit. At 6 (40%%) a\n"
+                  "contact bruises on the first blow, saturates on the\n"
+                  "second, and the third is blood. Below ~4 the mottle\n"
+                  "noise makes the bruise nearly invisible.");
             f("bruise ceiling", &g.bruiseMax, 1.0f, 15.0f, "%.1f");
+            if (ImGui::IsItemHovered())
+              ImGui::SetTooltip(
+                  "Max bruise amount. 12 of 15 is 80%%: deep purple but\n"
+                  "short of opaque, so the anatomy underneath still\n"
+                  "shows. Past here further hits lay blood instead.");
             f("bruise->bleed chance", &g.bruiseBleedChance, 0.0f, 1.0f, "%.2f");
             if (ImGui::IsItemHovered())
               ImGui::SetTooltip(
@@ -1943,23 +2180,79 @@ void Overlay::Draw(UIState& s) {
                   "Fraction of a cut's drip budget that blunt trauma uses.\n"
                   "0 = maces are dry; 1 = bleeds like a sword.");
             f("blunt carve radius (vox)", &g.bluntCarveRadius, 0.0f, 4.0f, "%.2f");
+            if (ImGui::IsItemHovered())
+              ImGui::SetTooltip(
+                  "How deep a full-power blunt hit dents flesh, in world\n"
+                  "voxels. Scaled by the weapon's bluntCarve fraction\n"
+                  "(fist 0, gauntlet ~0.35, mace ~0.6). The crater is\n"
+                  "soaked in the victim's woundMat.");
           }
           if (ImGui::CollapsingHeader("Bite")) {
             f("bite radius (vox)", &g.biteRadius, 0.0f, 2.0f, "%.2f");
+            if (ImGui::IsItemHovered())
+              ImGui::SetTooltip(
+                  "Radius of the tear in world voxels at full power.\n"
+                  "0.45 is a hole about 9 cm across — a bite. Enough\n"
+                  "of them still take a hand off via collapse sever.");
             f("bite blob size", &g.biteBlob, 0.5f, 8.0f, "%.1f");
+            if (ImGui::IsItemHovered())
+              ImGui::SetTooltip(
+                  "Feature size of the correlated noise in skin voxels.\n"
+                  "The size of one piece that comes away — same shape\n"
+                  "as a zombie rot hole.");
             f("bite stain scale", &g.biteStainScale, 0.0f, 4.0f, "%.1f");
+            if (ImGui::IsItemHovered())
+              ImGui::SetTooltip(
+                  "Multiple of craterStainRim for the bite's blood soak.\n"
+                  "Above 1 because a tear is a ragged hole: the mess\n"
+                  "goes further than the damage.");
             f("infection heal slow", &g.infectHealSlow, 0.5f, 20.0f, "%.1f");
+            if (ImGui::IsItemHovered())
+              ImGui::SetTooltip(
+                  "Divisor on the decay of the material a bite rewrites\n"
+                  "flesh to (the biter's infection). Larger = rot stays\n"
+                  "longer. On undead whose wounds don't heal, rot never\n"
+                  "goes away regardless.");
           }
           if (ImGui::CollapsingHeader("Armour vs blunt/bite")) {
             Tuning::Gear& gr = t.gear;
             ImGui::TextDisabled("shell hardness interaction");
             f("ruined condition", &gr.ruinedCondition, 0.05f, 0.95f, "%.2f");
+            if (ImGui::IsItemHovered())
+              ImGui::SetTooltip(
+                  "Below this fraction of its authored voxels, a worn\n"
+                  "piece is RUINED. Condition is measured in voxels still\n"
+                  "there, because a shell protects by being in the way.");
             f("cut hardness ref", &gr.cutHardnessRef, 1.0f, 255.0f, "%.0f");
+            if (ImGui::IsItemHovered())
+              ImGui::SetTooltip(
+                  "Material hardness that takes a blade's kerf unscaled.\n"
+                  "Skin is 8 (cut like flesh), iron is 160 (chipped).\n"
+                  "The kerf is scaled by this / shell hardness.");
             f("cut hardness floor", &gr.cutHardnessMin, 0.0f, 1.0f, "%.3f");
+            if (ImGui::IsItemHovered())
+              ImGui::SetTooltip(
+                  "Floor on the hardness scaling. Even the hardest shell\n"
+                  "takes at least this fraction of the kerf.");
             ImGui::TextDisabled("blunt: mace vs plate");
             f("dent radius (vox)", &gr.bluntDentRadius, 0.0f, 8.0f, "%.1f");
+            if (ImGui::IsItemHovered())
+              ImGui::SetTooltip(
+                  "How far a full-power hit at armorBreak 1 breaks into\n"
+                  "a worn shell, in world voxels. The plate is genuinely\n"
+                  "gone, exposing the flesh to the next blow, fire, acid.");
             f("blunt hardness ref", &gr.bluntHardnessRef, 1.0f, 255.0f, "%.0f");
+            if (ImGui::IsItemHovered())
+              ImGui::SetTooltip(
+                  "Material hardness reference for the dent, like the\n"
+                  "kerf's. 120 rather than 8 because plate is much LESS\n"
+                  "proof against trauma than against an edge: iron keeps\n"
+                  "~38%% of the dent vs 5%% of a kerf.");
             f("blunt hardness floor", &gr.bluntHardnessMin, 0.0f, 1.0f, "%.3f");
+            if (ImGui::IsItemHovered())
+              ImGui::SetTooltip(
+                  "Floor on the blunt hardness scaling. Even the hardest\n"
+                  "shell takes at least this fraction of the dent.");
             f("blunt pass-through", &gr.bluntThrough, 0.0f, 1.0f, "%.2f");
             if (ImGui::IsItemHovered())
               ImGui::SetTooltip(
@@ -1967,9 +2260,24 @@ void Overlay::Draw(UIState& s) {
                   "under the shell, as trauma. This is the number that\n"
                   "says plate stops swords but maces go through.");
             f("blunt shell hp cost", &gr.bluntShellHp, 0.0f, 2.0f, "%.2f");
+            if (ImGui::IsItemHovered())
+              ImGui::SetTooltip(
+                  "Fraction of the blow the shell itself takes as hp.\n"
+                  "Under 1 so plate that absorbed the whole blow is not\n"
+                  "destroyed in the same number of hits as the wearer.");
             ImGui::TextDisabled("bite vs armour");
             f("bite on shell (frac)", &gr.biteOnShell, 0.0f, 1.0f, "%.2f");
+            if (ImGui::IsItemHovered())
+              ImGui::SetTooltip(
+                  "Fraction of a bite's damage that lands as blunt\n"
+                  "trauma when teeth meet a hard shell. No shell-\n"
+                  "breaking: teeth do not dent plate.");
             f("bite through: soft <=", &gr.biteThroughSoft, 0.0f, 60.0f, "%.0f");
+            if (ImGui::IsItemHovered())
+              ImGui::SetTooltip(
+                  "Material hardness at or below which teeth pass\n"
+                  "entirely through a garment. Linen is 4, cloth 5,\n"
+                  "leather 14 — so every woven garment lets a bite in.");
             f("bite through: hard >=", &gr.biteThroughHard, 1.0f, 255.0f, "%.0f");
             if (ImGui::IsItemHovered())
               ImGui::SetTooltip(
@@ -1980,8 +2288,21 @@ void Overlay::Draw(UIState& s) {
           if (ImGui::CollapsingHeader("Burns cap health")) {
             ImGui::TextDisabled("burnt fraction -> max hp, three knots");
             f("burnt at mid knot", &g.burnCapMidFraction, 0.05f, 0.95f, "%.2f");
+            if (ImGui::IsItemHovered())
+              ImGui::SetTooltip(
+                  "Burn fraction at the middle knot of the health curve.\n"
+                  "Three knots: 0%% burn = full hp, this = mid health,\n"
+                  "death fraction = dead.");
             f("health at mid knot", &g.burnCapMidHealth, 0.0f, 1.0f, "%.2f");
+            if (ImGui::IsItemHovered())
+              ImGui::SetTooltip(
+                  "Max hp fraction at the middle knot. Shapes how fast\n"
+                  "health drops as burns accumulate.");
             f("burnt = death", &g.burnDeathFraction, 0.1f, 1.0f, "%.2f");
+            if (ImGui::IsItemHovered())
+              ImGui::SetTooltip(
+                  "Burnt fraction at which the creature dies outright.\n"
+                  "1.0 = must be fully charred; lower = dies sooner.");
           }
           ImGui::EndChild();
           ImGui::EndTabItem();
@@ -2005,21 +2326,49 @@ void Overlay::Draw(UIState& s) {
                   "never what a tick computes, so the sim is untouched.");
             ImGui::TextDisabled("chip: debris, a dropped item, a held weapon");
             f("chip speed", &fx.hitStopChipScale, 0.02f, 1.0f, "%.2fx");
+            if (ImGui::IsItemHovered())
+              ImGui::SetTooltip(
+                  "Tick-rate multiplier during a chip hit-stop.\n"
+                  "0.15 = the world runs at 15%% speed.");
             f("chip length (ms)", &fx.hitStopChipMs, 0.0f, 400.0f, "%.0f");
+            if (ImGui::IsItemHovered())
+              ImGui::SetTooltip("Duration of the chip dip in real milliseconds.");
             ImGui::TextDisabled("flesh: a live creature was hurt");
             f("flesh speed", &fx.hitStopFleshScale, 0.02f, 1.0f, "%.2fx");
+            if (ImGui::IsItemHovered())
+              ImGui::SetTooltip("Tick-rate multiplier during a flesh hit-stop.");
             f("flesh length (ms)", &fx.hitStopFleshMs, 0.0f, 400.0f, "%.0f");
+            if (ImGui::IsItemHovered())
+              ImGui::SetTooltip("Duration of the flesh dip in real milliseconds.");
             ImGui::TextDisabled("sever: a limb came off");
             f("sever speed", &fx.hitStopSeverScale, 0.02f, 1.0f, "%.2fx");
+            if (ImGui::IsItemHovered())
+              ImGui::SetTooltip("Tick-rate multiplier during a sever hit-stop.");
             f("sever length (ms)", &fx.hitStopSeverMs, 0.0f, 400.0f, "%.0f");
+            if (ImGui::IsItemHovered())
+              ImGui::SetTooltip(
+                  "Duration of the sever dip in real milliseconds.\n"
+                  "Tiers are strictly ordered: a sever in the same\n"
+                  "frame as a chip must not be shortened by it.");
           }
           if (ImGui::CollapsingHeader("Hit flash",
                                       ImGuiTreeNodeFlags_DefaultOpen)) {
             ImGui::TextDisabled("additive, linear HDR, before the tonemap");
             f("chip flash", &fx.flashChip, 0.0f, 4.0f, "%.2f");
+            if (ImGui::IsItemHovered())
+              ImGui::SetTooltip("Peak additive flash intensity for a chip hit.");
             f("flesh flash", &fx.flashFlesh, 0.0f, 4.0f, "%.2f");
+            if (ImGui::IsItemHovered())
+              ImGui::SetTooltip("Peak additive flash intensity for a flesh hit.");
             f("sever flash", &fx.flashSever, 0.0f, 4.0f, "%.2f");
+            if (ImGui::IsItemHovered())
+              ImGui::SetTooltip("Peak additive flash intensity for a sever.");
             f("halflife (s)", &fx.flashHalflife, 0.01f, 0.6f);
+            if (ImGui::IsItemHovered())
+              ImGui::SetTooltip(
+                  "Seconds to halve the flash. Aged on the tick so it\n"
+                  "slows under hit-stop. Keep short — a flash still\n"
+                  "visible at the next blow reads as a shader bug.");
           }
           if (ImGui::CollapsingHeader("Hit reaction",
                                       ImGuiTreeNodeFlags_DefaultOpen)) {
@@ -2029,23 +2378,84 @@ void Overlay::Draw(UIState& s) {
                   "A struck creature rocks AWAY from the blade's travel.\n"
                   "Pose-space lean only — nothing here moves the origin.");
             f("reference damage (hp)", &fx.hitReactRefDamage, 1.0f, 60.0f, "%.1f");
+            if (ImGui::IsItemHovered())
+              ImGui::SetTooltip(
+                  "HP at full swing speed that reads as the baseline\n"
+                  "blow. A strike's total profile over this is the\n"
+                  "multiplier on every peak below — a mace shoves\n"
+                  "harder than a fist because it IS harder. 14 is a\n"
+                  "sword's cut.");
             f("max scale", &fx.hitReactMaxScale, 0.5f, 8.0f, "%.1f");
+            if (ImGui::IsItemHovered())
+              ImGui::SetTooltip(
+                  "Ceiling on the damage multiplier, so a freak number\n"
+                  "in items.json cannot fold somebody in half.");
             f("lean (deg)", &fx.hitReactLeanDeg, 0.0f, 45.0f, "%.1f");
+            if (ImGui::IsItemHovered())
+              ImGui::SetTooltip(
+                  "Peak lean away from the blow at the reference damage,\n"
+                  "in degrees. The spring is clamped, so a multi-tick\n"
+                  "cut leans exactly this far and holds there while the\n"
+                  "blade is in the wound.");
             f("spine share", &fx.hitReactSpineShare, 0.0f, 1.0f, "%.2f");
+            if (ImGui::IsItemHovered())
+              ImGui::SetTooltip(
+                  "Fraction of the lean the spine carries vs the root\n"
+                  "limb. All on root = tips like a signpost. All on\n"
+                  "spine = hips unnaturally still.");
             f("push (frac of height)", &fx.hitReactPushFrac, 0.0f, 0.3f, "%.3f");
+            if (ImGui::IsItemHovered())
+              ImGui::SetTooltip(
+                  "Peak root shove as a fraction of the creature's own\n"
+                  "height. Same lurch on a rat and a troll. Horizontal\n"
+                  "from the blade's travel; vertical is what makes an\n"
+                  "overhead blow drive a body into its knees.");
             f("struck limb flick (deg)", &fx.hitReactLimbDeg, 0.0f, 90.0f, "%.1f");
+            if (ImGui::IsItemHovered())
+              ImGui::SetTooltip(
+                  "Peak flick of the struck limb about its own joint.\n"
+                  "This is the part that says WHICH arm was hit.\n"
+                  "Clamped to the joint's authored range.");
             f("halflife (s)", &fx.hitReactHalflife, 0.01f, 0.5f);
+            if (ImGui::IsItemHovered())
+              ImGui::SetTooltip(
+                  "Seconds to halve. The whole reaction is over in ~4x\n"
+                  "this. Past ~0.2 s it stops reading as a flinch and\n"
+                  "starts reading as a wobble.");
           }
           if (ImGui::CollapsingHeader("Sound",
                                       ImGuiTreeNodeFlags_DefaultOpen)) {
             f("whoosh volume", &fx.whooshVolume, 0.0f, 3.0f, "%.2f");
+            if (ImGui::IsItemHovered())
+              ImGui::SetTooltip("Volume trim for the blade whoosh cue.");
             f("whoosh silent below (px/s)", &fx.whooshMinSpeed, 0.0f, 2000.0f,
               "%.0f");
+            if (ImGui::IsItemHovered())
+              ImGui::SetTooltip(
+                  "Mouse px/s below which a committed stroke gets no\n"
+                  "whoosh. A cut that barely moved should not sound\n"
+                  "like one.");
             f("whoosh pitch, slow", &fx.whooshRateSlow, 0.4f, 2.0f, "%.2f");
+            if (ImGui::IsItemHovered())
+              ImGui::SetTooltip(
+                  "Pitch multiplier at the slow end of the swing.\n"
+                  "Lower = deeper whoosh for a lazy stroke.");
             f("whoosh pitch, fast", &fx.whooshRateFast, 0.4f, 2.0f, "%.2f");
+            if (ImGui::IsItemHovered())
+              ImGui::SetTooltip(
+                  "Pitch multiplier at the fast end. A faster cut is a\n"
+                  "higher, tighter whoosh.");
             f("flesh impact volume", &fx.fleshVolume, 0.0f, 3.0f, "%.2f");
+            if (ImGui::IsItemHovered())
+              ImGui::SetTooltip("Volume trim for the flesh impact cue.");
             f("blade clang volume", &fx.clangVolume, 0.0f, 3.0f, "%.2f");
+            if (ImGui::IsItemHovered())
+              ImGui::SetTooltip("Volume trim for the blade-on-blade clang cue.");
             f("audible radius (m)", &fx.cueRadius, 1.0f, 120.0f, "%.0f");
+            if (ImGui::IsItemHovered())
+              ImGui::SetTooltip(
+                  "Radius in metres within which combat sounds are\n"
+                  "audible. Same unit as audio cue groups.");
             ImGui::TextDisabled("assets are PLACEHOLDERS —");
             ImGui::TextDisabled("scripts/gen_combat_sounds.py");
           }
