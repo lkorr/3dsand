@@ -6380,6 +6380,16 @@ void Mob::BleedTick(uint32_t tick, World& world, std::vector<BrushOp>& ops,
   const float dropletVox = 1.0f / (float)(ms * ms * ms);
   for (size_t li = 0; li < limbs_.size(); li++) {
     MobLimb& limb = limbs_[li];
+    // A GARMENT DOES NOT BLEED. Damage() tops up a bleed budget on whatever
+    // slot the blow met, and a blunt hit through plate meets the SHELL first
+    // (game/impact.h): its budget is charged so the hp accounting stays one
+    // path, but the drip must not draw blood out of iron. The flesh under it
+    // is charged separately and bleeds for itself. Same refusal CarveLimb
+    // and StainWound make for a worn slot, made here for the drip.
+    if (IsWornSlot((int)li)) {
+      limb.bleedBudget = 0.0f;
+      continue;
+    }
     Quat lq{limb.xf.quat[0], limb.xf.quat[1], limb.xf.quat[2],
             limb.xf.quat[3]};
 
