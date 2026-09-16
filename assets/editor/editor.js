@@ -152,6 +152,13 @@ let hiltBox = null;            // wireframe outline of the item's hilt region
 // me these lines" is the only thing rig.js needs and a second consumer should
 // not need a second mesh.
 let strokeTrail = null;
+// ...and a SECOND one, for segments that are not a sweep: a natural weapon's
+// authored edge (the fist's knuckles, the jaws), drawn while its row is open
+// in the rig panel. A separate mesh rather than a flag on the trail because
+// the two have different lifetimes — the trail is rebuilt per frame while a
+// stroke runs, this one persists while a row is selected — and because a
+// standing rig must be able to show an edge with no swing in progress.
+let naturalEdges = null;
 let resizeHandles = [];        // 6 spheres, one per bounding-box face
 let canvas = null, host = null;
 let initialised = false, initFailed = false;
@@ -1391,6 +1398,7 @@ function newModel(dx, dy, dz, name = 'untitled') {
   activeModel = 0;
   grid = doc.models[0].grid;
   docPath = null; docName = name; sidecar = null; sidecarPath = null;
+  derivedFrom = null;
   resetPeel();
   clearUndo();               // also resets any open structural transaction
   setSelection(null);
@@ -1512,6 +1520,16 @@ function buildScene() {
   strokeTrail.renderOrder = 1000;
   strokeTrail.visible = false;
   scene.add(strokeTrail);
+
+  // The natural-weapon edge overlay: same material, one renderOrder above, so
+  // an authored edge stays readable against a trail drawn through it.
+  naturalEdges = new THREE.LineSegments(
+    new THREE.BufferGeometry(),
+    new THREE.LineBasicMaterial({ vertexColors: true, transparent: true,
+                                  opacity: 0.95, depthTest: false }));
+  naturalEdges.renderOrder = 1001;
+  naturalEdges.visible = false;
+  scene.add(naturalEdges);
 
   // Resize handles: 6 spheres on each face of the active model's bounding box.
   const FACE_DEFS = [
@@ -2474,7 +2492,18 @@ export function setHiltBox(state) {
  * per-frame rebuild of that is cheaper than the bookkeeping to update one in
  * place — the same trade the frame strip's thumbnails make.
  */
-export function setStrokeTrail(segs) {
+export function setStrokeTrail(segs) { fillSegments(strokeTrail, segs); }
+
+/**
+ * The same overlay, for a natural weapon's AUTHORED edge (mob.h
+ * MobNaturalWeaponDef): the segment a fist or a set of jaws sweeps, drawn
+ * while its row is open so `from`/`to` can be typed against a picture instead
+ * of against a running game. Same contract as setStrokeTrail; null hides it.
+ */
+export function setNaturalEdges(segs) { fillSegments(naturalEdges, segs); }
+
+function fillSegments(mesh, segs) {
+  const strokeTrail = mesh;
   if (!strokeTrail) return;
   if (!segs || !segs.length) { strokeTrail.visible = false; return; }
   const pos = new Float32Array(segs.length * 6);
@@ -4217,17 +4246,118 @@ function buildHelpPanel() {
    10. file I/O
    ========================================================================== */
 
+/* ---- CREATURES THAT WEAR ANOTHER FILE'S ART ------------------------------
+ *
+ * A mob is named for its SIDECAR, and the sidecar says which art it wears
+ * (mob.cpp, the note above MobSource): `"model": "<stem>"` borrows a .vox and
+ * `"extends": "<stem>"` borrows the whole rig as well, RFC 7396 merge-patch.
+ * zombie.json is the first of these — there is no zombie.vox and there should
+ * not be one, because the anatomy is BAKED into human.vox and a copy would
+ * diverge in what is under its skin with nothing to say so.
+ *
+ * The file list filtered to `.vox` and so such a creature could not be opened
+ * at all: you could not look at a zombie, preview its bite, or read the rig
+ * its styles are authored against. It appears here resolved to its base art.
+ *
+ * READ-ONLY, AND THAT IS A DELIBERATE STOP RATHER THAN AN OVERSIGHT. What is
+ * on screen is the MERGED document — human.json with zombie.json poured over
+ * it — and the file on disk is the OVERRIDE alone. Writing the merge back
+ * would flatten the human's entire rig into zombie.json, which is exactly the
+ * copy `extends` exists to prevent, and working out which keys were overrides
+ * means diffing against a base that may itself have moved. So the art and the
+ * sidecar are both refused at save, by name, with the file to edit instead.
+ * ------------------------------------------------------------------------ */
+
+// path -> { vox, stem } for every sidecar in the list that wears other art.
+// Probed once per session: it is one fetch per .json with no .vox beside it,
+// which is one file today.
+let derivedScan = null;
+// Set while such a document is open. Null for an ordinary model.
+let derivedFrom = null;
+
+/** RFC 7396 merge-patch, the same rule nlohmann's merge_patch applies. */
+function mergePatch(target, patch) {
+  if (patch === null || typeof patch !== 'object' || Array.isArray(patch))
+    return patch;
+  const out = (target && typeof target === 'object' && !Array.isArray(target))
+    ? target : {};
+  for (const k of Object.keys(patch)) {
+    if (patch[k] === null) delete out[k];
+    else out[k] = mergePatch(out[k], patch[k]);
+  }
+  return out;
+}
+
+const readJson = async (path) => {
+  const r = await fetch('/api/model?path=' + encodeURIComponent(path),
+    { cache: 'no-store' });
+  if (!r.ok) throw new Error(path + ': HTTP ' + r.status);
+  return JSON.parse(await r.text());
+};
+
+/**
+ * Resolve a sidecar's `extends` chain into one document, and say which .vox it
+ * wears — mob.cpp's ResolveSidecar and ModelStemFor, in that order and with
+ * the same depth bound (a rig eight deep is a content mistake and a cycle is
+ * the same mistake with a hang attached, so one check answers both).
+ */
+async function resolveSidecarChain(dir, stem, depth = 0) {
+  if (depth > 8) throw new Error('`extends` nested more than 8 deep (a cycle?)');
+  const j = await readJson(dir + '/' + stem + '.json');
+  const base = typeof j.extends === 'string' ? j.extends : '';
+  const model = typeof j.model === 'string' ? j.model : '';
+  if (!base) return { doc: j, vox: (model || stem) };
+  const parent = await resolveSidecarChain(dir, base, depth + 1);
+  // `extends` is not inherited: the chain is resolved here, once.
+  const child = { ...j };
+  delete child.extends;
+  return { doc: mergePatch(parent.doc, child), vox: (model || parent.vox) };
+}
+
+async function scanDerived(files) {
+  if (derivedScan) return derivedScan;
+  derivedScan = new Map();
+  const vox = new Set(files.filter(f => /\.vox$/i.test(f.path)).map(f => f.path));
+  for (const f of files) {
+    if (!/\.json$/i.test(f.path)) continue;
+    const stem = f.path.replace(/\.json$/i, '');
+    if (vox.has(stem + '.vox')) continue;      // an ordinary paired sidecar
+    let j = null;
+    try { j = await readJson(f.path); } catch { continue; }
+    if (!j || typeof j !== 'object') continue;
+    // A .json with NEITHER key and no .vox of its own is not a mob at all —
+    // that is what attack_styles.json and behaviors.json are, and keying on
+    // the field rather than on a filename blocklist means the next shared
+    // table in this directory needs no code change.
+    const wears = (typeof j.model === 'string' && j.model) ||
+                  (typeof j.extends === 'string' && j.extends) || '';
+    if (!wears) continue;
+    const dir = f.dir || stem.split('/')[0];
+    derivedScan.set(f.path, { dir, stem: stem.split('/').pop() });
+  }
+  return derivedScan;
+}
+
 async function refreshFileList() {
   if (!ui.fileSel) return;
   try {
     const j = await (await fetch('/api/models', { cache: 'no-store' })).json();
+    const derived = await scanDerived(j.files || []);
     ui.fileSel.innerHTML = '';
     ui.fileSel.append(el('option', { value: '' }, '— open a model —'));
     for (const f of (j.files || [])) {
-      if (!f.path.endsWith('.vox')) continue;         // .json are sidecars
-      ui.fileSel.append(el('option', { value: f.path }, f.path));
+      if (f.path.endsWith('.vox')) {
+        ui.fileSel.append(el('option', { value: f.path }, f.path));
+        continue;
+      }
+      // ...and the sidecars that wear somebody else's art, marked as what they
+      // are so nobody opens one expecting to paint it.
+      if (derived.has(f.path))
+        ui.fileSel.append(el('option', { value: f.path },
+          f.path + '  (overrides, art read-only)'));
     }
-    if (docPath) ui.fileSel.value = docPath;
+    const want = derivedFrom ? derivedFrom.sidecarPath : docPath;
+    if (want) ui.fileSel.value = want;
   } catch {
     ui.fileSel.innerHTML = '';
     ui.fileSel.append(el('option', { value: '' }, '(server not available)'));
@@ -4237,9 +4367,29 @@ async function refreshFileList() {
 async function openPath(path) {
   if (!path) return;
   if (docDirty && !confirm('Discard unsaved model changes?')) {
-    ui.fileSel.value = docPath || '';
+    ui.fileSel.value = (derivedFrom ? derivedFrom.sidecarPath : docPath) || '';
     return;
   }
+  // A DERIVED SIDECAR: resolve the chain first, then open the art it wears and
+  // pour the merged document in over the pairing the .vox load would have
+  // found. The order matters — openPath's own sidecar fetch reads
+  // "<vox>.json", which for a zombie is the HUMAN'S, so the override has to be
+  // applied after it rather than instead of it.
+  let derivedWant = null;
+  if (/\.json$/i.test(path)) {
+    const entry = (derivedScan && derivedScan.get(path)) || null;
+    if (!entry) { hooks.toast(path + ' is not a model sidecar', true); return; }
+    try {
+      const res = await resolveSidecarChain(entry.dir, entry.stem);
+      derivedWant = { sidecarPath: path, doc: res.doc,
+                      name: entry.stem, vox: entry.dir + '/' + res.vox + '.vox' };
+      path = derivedWant.vox;
+    } catch (e) {
+      hooks.toast('could not resolve ' + path + ': ' + (e.message || e), true);
+      return;
+    }
+  }
+  derivedFrom = null;
   try {
     const r = await fetch('/api/model?path=' + encodeURIComponent(path), { cache: 'no-store' });
     if (!r.ok) throw new Error('HTTP ' + r.status);
@@ -4278,6 +4428,12 @@ async function openPath(path) {
     } catch (e) {
       hooks.toast('sidecar ' + sidecarPath + ' did not parse — treating as absent', true);
       sidecar = null;
+    }
+    if (derivedWant) {
+      sidecar = derivedWant.doc;
+      sidecarPath = derivedWant.sidecarPath;
+      docName = derivedWant.name;
+      derivedFrom = { sidecarPath: derivedWant.sidecarPath, voxPath: path };
     }
 
     clearDirty();
@@ -4322,6 +4478,18 @@ function applyPreset(v) {
 
 async function save(saveAs) {
   if (!grid) return;
+  // See the note at derivedFrom: what is on screen is the MERGE, the file on
+  // disk is the override alone, and writing one over the other would flatten
+  // the base rig into it. The refusal names both files rather than greying a
+  // button out, because "why can I not save" is the question.
+  if (derivedFrom && !saveAs) {
+    hooks.toast(derivedFrom.sidecarPath + ' wears ' + derivedFrom.voxPath +
+      ' and is shown MERGED — saving would flatten the base rig into the ' +
+      'override. Edit ' + derivedFrom.sidecarPath + ' by hand, or open ' +
+      derivedFrom.voxPath + ' to change the art every creature that extends ' +
+      'it wears.', true);
+    return;
+  }
   let path = docPath;
   if (saveAs || !path) {
     const suggest = path || 'models/' + docName + '.vox';
@@ -4433,6 +4601,9 @@ async function save(saveAs) {
 
     docPath = path;
     sidecarPath = spath;
+    // A "save as" off a derived creature FORKS it: the merged rig and the
+    // borrowed art are now this file's own, and it stops being an override.
+    derivedFrom = null;
     docName = path.split('/').pop().replace(/\.vox$/i, '');
     clearDirty();
     await refreshFileList();
@@ -4577,6 +4748,10 @@ export const getDocName = () => docName;
  *  The creature shelf lists every OTHER creature, and identity is the path:
  *  two files can share a stem across models/ and mobs/. */
 export const getDocPath = () => docPath || '';
+// Null for an ordinary model; { sidecarPath, voxPath } when the open document
+// is a creature that WEARS another file's art (see the note at derivedFrom).
+// The rig panel says so rather than letting a refused save be the first news.
+export const derivedInfo = () => derivedFrom;
 export const getSelection = () => selection;
 export const getSidecar = () => sidecar;
 export const getMaterials = () => materials;

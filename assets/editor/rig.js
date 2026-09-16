@@ -1574,6 +1574,23 @@ function renderRigPanel() {
         onclick: () => { if (!syncLimbsToModels()) toast('every model already has a limb'); renderAllPanels(); },
       }, 'sync')));
 
+  // A CREATURE THAT WEARS ANOTHER FILE'S ART (mobs/zombie.json). Everything
+  // below is the MERGED rig — the base's, with this file's overrides poured
+  // over it — so it previews, swings and reports exactly as the engine's does,
+  // and nothing here can be written back. Said up front rather than letting a
+  // refused save be the first news of it.
+  {
+    const d = ed.derivedInfo?.();
+    if (d)
+      sideEl.append(el('div', { class: 'rignote atkwarn' },
+        'READ-ONLY: ' + d.sidecarPath + ' has no art of its own — it wears ' +
+        d.voxPath + ' and overrides that rig by RFC 7396 merge-patch. What is ' +
+        'shown is the MERGE; the file on disk is the override alone, so ' +
+        'saving would flatten the base rig into it. Edit ' + d.sidecarPath +
+        ' by hand for an override, or open ' + d.voxPath + ' to change the ' +
+        'art every creature extending it wears.'));
+  }
+
   const L = limbs();
   if (!L.length) {
     sideEl.append(el('div', { class: 'rignote' },
@@ -2166,6 +2183,8 @@ function renderRigTail() {
     renderHeldItem();
   });
 
+  renderNaturalWeapons();
+
   /* ---- chains (read-only summary; authored by Split-to-model + this) ---- */
   sideEl.append(
     el('div', { class: 'righdr' }, 'IK chains',
@@ -2297,6 +2316,235 @@ function renderRigTail() {
   // Live gait readout, so the author can see the state machine working.
   sideEl.append(el('div', { class: 'rignote', id: 'gaitState' }, ''));
   renderGaitReadout();
+}
+
+/* ==========================================================================
+   NATURAL WEAPONS — the parts of this rig that ARE weapons.
+
+   THE ANATOMY ANSWER TO THE ITEM SOCKET ABOVE, and it sits beside it for that
+   reason: a socket says where a thing the creature was HANDED attaches, and
+   this says which parts of it are already weapons. A fist and a set of jaws
+   are exactly what an item is — AN EDGE SEGMENT AND A StrikeProfile
+   (game/impact.h) — with the segment living on a part of the rig instead of on
+   a borrowed slot. mob.h MobNaturalWeaponDef says why it is not just an
+   invisible held item: the slot would outlive the part, so a headless zombie
+   could still bite.
+
+   WHAT AN AUTHOR IS ACTUALLY DOING HERE is drawing a line through a fist. The
+   numbers are the same voxels the rest of this panel speaks, and the segment
+   is drawn in the viewport while its row is open — `from: [4, 9, 4]` means
+   nothing typed against a text field and everything typed against a picture.
+   ========================================================================== */
+
+// Which natural-weapon row is open, or -1. Panel state, not document state.
+let selectedNatural = -1;
+
+function renderNaturalWeapons() {
+  const NW = naturalList();
+  sideEl.append(
+    el('div', { class: 'righdr' }, 'Natural weapons',
+      el('span', { class: 'spacer' }),
+      el('button', {
+        class: 'small',
+        title: selectedPart
+          ? 'make the selected limb a weapon'
+          : 'select a limb first — a natural weapon lives ON a part',
+        onclick: () => addNaturalFromSelection(),
+      }, '+ weapon')));
+
+  if (!NW.length) {
+    sideEl.append(el('div', { class: 'rignote' },
+      'None. A rig with no `natural` block can only fight with something in ' +
+      'its fist: every unarmed style names a weapon by name ("fist.R", ' +
+      '"jaws"), and StyleUsable refuses a style whose weapon this creature ' +
+      'has not got — so a disarmed creature with none of these simply never ' +
+      'attacks. Select a hand and press "+ weapon".'));
+  }
+
+  NW.forEach((nw, i) => {
+    const on = selectedNatural === i;
+    const pi = skel ? skel.findPart(nw.part || '') : -1;
+    const mode = pi < 0 ? '—' : (chainForEffector(pi, {}) >= 0 ? 'chain' : 'aim');
+    sideEl.append(el('div', { class: 'rigrow' + (on ? ' on' : '') },
+      el('button', {
+        class: 'small' + (on ? ' on' : ''),
+        title: 'edit this weapon and draw its edge in the viewport',
+        onclick: () => {
+          selectedNatural = on ? -1 : i;
+          if (!on && nw.part) selectedPart = nw.part;
+          renderAllPanels();
+          ed.invalidate();
+        },
+      }, on ? '◉' : '○'),
+      el('span', { style: 'flex:1;min-width:0;overflow:hidden;text-overflow:ellipsis' },
+        (nw.name || '—') + '  on ' + (nw.part || '—')),
+      el('span', { class: 'rigdim', title: mode === 'aim'
+        ? 'no IK chain serves this part, so the driver AIMS it: the part and a '
+          + 'share of the spine rotate until its forward lies along the stroke'
+        : mode === 'chain'
+          ? 'an IK chain serves this part, so the driver solves the arm to it — '
+            + 'the same solve a sword gets, with no wrist steering'
+          : 'this part is not a limb of this rig' }, mode),
+      el('button', {
+        class: 'icon danger', title: 'remove this natural weapon',
+        onclick: () => {
+          naturalList().splice(i, 1);
+          if (selectedNatural === i) selectedNatural = -1;
+          else if (selectedNatural > i) selectedNatural--;
+          touched(); renderAllPanels(); ed.invalidate();
+        },
+      }, '✕')));
+    if (on) sideEl.append(naturalBody(nw));
+  });
+
+  // A STILL RIG STILL DRAWS ITS EDGE. stepPreviewFixed refreshes the overlay
+  // every tick, but it only runs while something wants a posed rig — and the
+  // common case for typing these numbers is a rig standing at rest.
+  renderNaturalEdgeOverlay();
+
+  if (skel && NW.some(w => !w || !w.part || skel.findPart(w.part) < 0))
+    sideEl.append(el('div', { class: 'rignote atkwarn' },
+      'A weapon above names a part this rig has not got — the engine skips it ' +
+      'LOUDLY at load, and every style naming it becomes unusable.'));
+}
+
+function addNaturalFromSelection() {
+  if (!selectedPart) {
+    toast('select a limb first (the fist, or the head)', true);
+    return;
+  }
+  const doc = sc();
+  if (!Array.isArray(doc.natural)) doc.natural = [];
+  // SEEDED FROM THE PART'S OWN BOX, not from zeros. An all-zero edge is
+  // degenerate and the engine refuses one at load ("from == to"), so the first
+  // thing a new entry would do is not exist. The default runs down the part's
+  // own box through its centre, which is roughly a knuckle line and is at
+  // least visible.
+  const m = ed.getModels().find(x => x.name === selectedPart);
+  const d = m ? m.dim : { x: 4, y: 4, z: 4 };
+  const o = m ? m.offset : { x: 0, y: 0, z: 0 };
+  const cx = o.x + d.x * 0.5, cz = o.z + d.z * 0.5;
+  let name = selectedPart;
+  for (let k = 2; naturalList().some(w => w && w.name === name); k++)
+    name = selectedPart + '_' + k;
+  doc.natural.push({
+    name, part: selectedPart,
+    edge: { from: [cx, o.y + d.y, cz], to: [cx, o.y, o.z + d.z],
+            halfWidth: Math.max(1, Math.round(Math.min(d.x, d.z) * 0.5)) },
+    strike: { blunt: 4.0 },
+  });
+  selectedNatural = naturalList().length - 1;
+  touched(); renderAllPanels(); ed.invalidate();
+}
+
+/** One natural weapon's editor, rendered inline under its row. */
+function naturalBody(nw) {
+  const body = el('div', { class: 'rigbody' });
+
+  const nameIn = el('input', { class: 'cell id', value: nw.name || '' });
+  nameIn.addEventListener('change', () => {
+    nw.name = nameIn.value.trim();
+    touched(); renderAllPanels();
+  });
+  body.append(field('name', nameIn,
+    'what a style\'s `weapon` names — "fist.R", "jaws"'));
+
+  const partSel = el('select', { class: 'cell' });
+  partSel.append(el('option', { value: '' }, '(none)'));
+  for (const l of limbs()) partSel.append(el('option', { value: l.name }, l.name));
+  partSel.value = nw.part || '';
+  partSel.addEventListener('change', () => {
+    nw.part = partSel.value;
+    if (nw.part) selectedPart = nw.part;
+    touched(); renderAllPanels(); ed.invalidate();
+  });
+  body.append(field('part', partSel,
+    'the rig part that IS the weapon; severing it makes every style naming ' +
+    'this weapon unusable'));
+
+  if (!nw.edge || typeof nw.edge !== 'object') nw.edge = {};
+  const e = nw.edge;
+  body.append(el('div', { class: 'rignote' },
+    'THE EDGE IS TWO POINTS IN THE PART\'S OWN ART FRAME — the same Y-up, ' +
+    'origin-at-the-MODEL\'S-MIN-CORNER voxels this file is drawn in; not ' +
+    'world voxels, and not an offset along an axis (a part has no hilt to ' +
+    'measure one from). A fist\'s runs from the wrist to the knuckles, a ' +
+    'jaw\'s from the throat to the teeth. The engine scales them by ' +
+    'artVoxelsPerMetre at load, exactly as it scales a limb\'s own edge. ' +
+    'from == to is refused at load: there would be no segment to sweep.'));
+  const redraw = () => { touched(); ed.invalidate(); renderNaturalEdgeOverlay(); };
+  body.append(field('from', vecInput(e, 'from', [0, 0, 0], redraw),
+    'the base of the segment (the wrist)'));
+  body.append(field('to', vecInput(e, 'to', [0, 0, 0], redraw),
+    'its far end (the knuckles, the teeth)'));
+  body.append(field('halfWidth',
+    numInput(e, 'halfWidth', { ph: '2.5', after: redraw }),
+    'carve radius about the segment, in the same voxels'));
+
+  // ---- the StrikeProfile (game/impact.h) --------------------------------
+  if (!nw.strike || typeof nw.strike !== 'object') nw.strike = {};
+  const st = nw.strike;
+  body.append(el('div', { class: 'rignote' },
+    'WHAT IT DOES WHEN IT LANDS. A strike is three numbers and not a KIND: hp ' +
+    'at full swing speed arriving as a kerf (cut), as trauma (blunt) and as a ' +
+    'tear (bite), all three resolved by one sweep against whatever it hit. A ' +
+    'bare fist is blunt only with bluntCarve 0 — which is what makes a punch ' +
+    'bruise without ever taking an arm off. A worn piece carrying its own ' +
+    '`strike` block REPLACES this profile when the fist under it swings (the ' +
+    'gauntlet override), and the creature\'s own `bite` block is what adds ' +
+    'the rot.'));
+  for (const [k, ph, hint] of [
+    ['cut', '0', 'hp arriving as a KERF — the blade wound model'],
+    ['blunt', '4', 'hp arriving as TRAUMA: a bruise, next to no bleeding, and ' +
+                   'never a sever however many land'],
+    ['bluntCarve', '0', '0..1 of gore.bluntCarveRadius dented out of FLESH at ' +
+                        'full power. 0 for a bare fist; a gauntlet is ~0.35'],
+    ['armorBreak', '0', '0..1 of gear.bluntDentRadius broken out of a WORN ' +
+                        'SHELL at full power. 0 for a fist, 0.8 for a mace'],
+    ['bite', '0', 'hp arriving as a TEAR: a rot-blob carve that bleeds like a ' +
+                  'cut and severs only by collapse'],
+  ])
+    body.append(field(k, numInput(st, k, { ph, after: () => touched() }), hint));
+
+  return body;
+}
+
+/**
+ * Draw the open natural weapon's edge in the viewport, on the LIVE pose, so
+ * the segment moves with the part as the rig walks or swings — the same
+ * derivation the damage sweep uses (naturalEdgeModel), which is what stops the
+ * picture and the hitbox drifting apart.
+ */
+function renderNaturalEdgeOverlay() {
+  const NW = naturalList();
+  const nw = selectedNatural >= 0 ? NW[selectedNatural] : null;
+  const seg = nw ? naturalEdgeModel(nw) : null;
+  if (!seg) { ed.setNaturalEdges?.(null); return; }
+  const lo = lungeOffsetModel();
+  const a = AN.vadd(seg.base, lo), b = AN.vadd(seg.tip, lo);
+  const segs = [{ a: [a.x, a.y, a.z], b: [b.x, b.y, b.z], color: 0x7cf03a }];
+  // A CROSS AT THE TIP, sized by halfWidth — the carve radius is half of what
+  // the edge actually is, and a bare line hides it entirely.
+  const hw = seg.halfWidth;
+  if (hw > 0.01) {
+    const d = AN.vsub(b, a);
+    const len = AN.vlen(d) || 1;
+    const dir = AN.vmul(d, 1 / len);
+    const cand = [AN.v3(1, 0, 0), AN.v3(0, 1, 0), AN.v3(0, 0, 1)];
+    let best = 0, bd = 2;
+    for (let i = 0; i < 3; i++) {
+      const dot = Math.abs(AN.vdot(dir, cand[i]));
+      if (dot < bd) { bd = dot; best = i; }
+    }
+    const u = AN.vnorm(AN.vcross(dir, cand[best]));
+    const v = AN.vnorm(AN.vcross(u, dir));
+    for (const ax of [u, v]) {
+      const p0 = AN.vsub(b, AN.vmul(ax, hw)), p1 = AN.vadd(b, AN.vmul(ax, hw));
+      segs.push({ a: [p0.x, p0.y, p0.z], b: [p1.x, p1.y, p1.z],
+                  color: 0x3a8f5f, alpha: 0.8 });
+    }
+  }
+  ed.setNaturalEdges?.(segs);
 }
 
 // Build a two-bone chain from the selected limb + its parent, which is the
@@ -3023,6 +3271,12 @@ function stepPreviewFixed(dt) {
     if (wp) AN.animApplySpineTwist(skel, anim, wp.torsoTwist, wp.torsoPitch,
                                    skel.rootLimb);
   }
+  // ---- stage 3.5b: an AIM effector points its own part (mob.cpp:14777) ---
+  // Also pre-flatten, and after the torso twist for the same reason the engine
+  // orders them that way: the spine share this adds rides on top of whatever
+  // the swing's own torso lean already put there.
+  lastAim = null;
+  applyStrikeAim();
   // stage 4
   AN.animFlatten(skel, anim);
   // gait + stage 5 IK
@@ -3059,6 +3313,9 @@ function stepPreviewFixed(dt) {
   // the hand's animated transform, so anything sampled earlier is a tick stale.
   recordStrokeTrail();
   pushStrokeTrail();
+  // The open natural weapon's edge rides the live pose too — same reason the
+  // trail is sampled here and not earlier.
+  renderNaturalEdgeOverlay();
   ed.invalidate();
 }
 
@@ -3118,11 +3375,25 @@ function modelTransform(modelIndex) {
     dy = anim.bodyY - restY;
   }
 
+  // THE LUNGE CARRIES THE WHOLE BODY, so it is added here rather than to any
+  // one part: the arc is a translation of the creature, exactly as
+  // Mob::Launch moves `origin_` and every limb rides it. In FILE voxels,
+  // which is the one conversion this seam owns.
+  const lg = lungeOffsetModel();
   return {
     pivot: { x: anchor.x, y: anchor.y, z: anchor.z },
     quat: dq,
-    pos: { x: dp.x, y: dp.y + dy, z: dp.z },
+    pos: { x: dp.x + lg.x, y: dp.y + dy + lg.y, z: dp.z + lg.z },
   };
+}
+
+/** Where the lunge has carried the body, in FILE voxels. Zero when not flying. */
+function lungeOffsetModel() {
+  if (!lungeArc) return AN.v3();
+  const S = rigScale();
+  // Forward is +Z at heading 0 (the rig's own frame), which is the direction
+  // the preview's walk already travels in.
+  return AN.v3(0, lungeArc.y * S, lungeArc.x * S);
 }
 
 // The preview runs whenever something wants a posed rig: the gait walk, clip
@@ -3213,6 +3484,30 @@ const kSoloHoldTicks = 24;    // 0.8 s of holding the segment's end pose
 // The rig parts the driver needs. -1 until weaponRebuild() finds them.
 let wpHandPart = -1, wpChain = -1, wpHeadPart = -1;
 
+// ---- THE STRIKE EFFECTOR (mob.cpp:14530 Mob::SetStrikeEffector) -----------
+//
+// WHICH PART THE DRIVER IS MOVING, and how. Until the unarmed package the
+// answer was always "the hand the weapon socket names", because the whole
+// swing pipeline started at the held item; a fist and a set of jaws have no
+// item, so the part itself has to be nameable (game/impact.h
+// StrikeEffectorMode, docs/PLAN_impact_unarmed.md §4):
+//
+//   'held'   the socket's hand, holding an item. Today's path, untouched.
+//   'chain'  a natural weapon on a part an IK chain serves (a fist): the same
+//            two-bone solve, no wrist steering (there is no blade to lay along
+//            a line), and the swept edge is the PART'S OWN.
+//   'aim'    a natural weapon on a part in no chain (the jaws): the part and a
+//            share of the spine are ROTATED until the part's forward lies
+//            along the stroke's bearing. No IK at all.
+//
+// `strikeEff` is the OVERRIDE and -1 means "no override" — resolveEffector()
+// then falls through to the held hand, exactly as Mob::ResolveEffector does,
+// so a creature that finishes a punch while still holding a sword goes back to
+// carrying the sword without anything having to write that value back.
+let strikeEff = -1;              // part index, or -1
+let strikeMode = 'none';         // 'none' | 'held' | 'chain' | 'aim'
+let strikeNatural = -1;          // index into the sidecar's `natural` array
+
 // THE SIM RUNS AT 30 Hz AND SO DOES A STROKE. `ticks` in attack_styles.json
 // are sim ticks, and StepStrokeProgram advances exactly one per call, so the
 // preview must step on the same clock or a 12-tick windup would not be 0.40 s.
@@ -3271,6 +3566,162 @@ function weaponRebuild() {
   weaponSeedFromRig();
 }
 
+/* --------------------------------------------------------------------------
+   NATURAL WEAPONS (mob.h MobNaturalWeaponDef; the sidecar's `natural` block)
+
+   A fist and a set of jaws are weapons nobody handed the creature: an authored
+   EDGE SEGMENT and a StrikeProfile, living on a part of the rig instead of on
+   a borrowed slot. The editor reads the same array the engine does and does
+   not resolve it any further — `partIndex` is looked up per call rather than
+   cached, because the Models tab renames and deletes limbs while the panel is
+   open and a cached index would outlive the part it names.
+   -------------------------------------------------------------------------- */
+
+const naturalList = () => {
+  const a = sc()?.natural;
+  return Array.isArray(a) ? a : [];
+};
+const naturalIndexNamed = (name) =>
+  naturalList().findIndex(w => w && w.name === name);
+
+/**
+ * mob.cpp:14746 Mob::ChainForEffector — the chain whose EFFECTOR is this part
+ * or this part's parent. Deriving it from the rig rather than naming an arm is
+ * what lets a left-handed rig, a second weapon or a bare fist need no change
+ * here.
+ *
+ * Returns the chain INDEX (rig.js addresses chains by index everywhere else)
+ * or -1, and writes the hand part into `out.hand`.
+ */
+function chainForEffector(part, out) {
+  if (out) out.hand = -1;
+  if (!skel || part < 0 || part >= skel.parts.length) return -1;
+  const parent = skel.parts[part].parent;
+  for (let i = 0; i < skel.chains.length; i++) {
+    const ch = skel.chains[i];
+    if (!ch || (ch.parts || []).length < 2 || ch.effector < 0) continue;
+    if (ch.effector !== part && ch.effector !== parent) continue;
+    if (out) out.hand = ch.effector;
+    return i;
+  }
+  return -1;
+}
+
+/**
+ * mob.cpp:14582 Mob::NaturalWeaponUsable — the part is alive AND, for a chain
+ * effector, so is every part of the chain that serves it. In the editor
+ * nothing is severed, so "alive" reduces to "is a limb of this rig" — but the
+ * shape is kept because it is the thing the panel's warning is about: a style
+ * naming a weapon this rig does not declare is a content error whose only
+ * other symptom is a creature that never swings.
+ */
+function naturalUsable(nw) {
+  if (!skel || !nw || !nw.part) return false;
+  const pi = skel.findPart(nw.part);
+  if (pi < 0) return false;
+  const out = {};
+  const ci = chainForEffector(pi, out);
+  if (ci >= 0)
+    for (const k of skel.chains[ci].parts) if (k < 0 || k >= skel.parts.length) return false;
+  return true;
+}
+
+/**
+ * mob.cpp:14552 Mob::ResolveEffector — the explicit override if there is one,
+ * else the held hand. Returns { part, mode, natural }; part < 0 means the rig
+ * cannot say (no socket, no arm, no natural weapon).
+ */
+function resolveEffector() {
+  if (strikeMode !== 'none' && strikeEff >= 0 && skel &&
+      strikeEff < skel.parts.length)
+    return { part: strikeEff, mode: strikeMode, natural: strikeNatural };
+  if (wpHandPart >= 0) return { part: wpHandPart, mode: 'held', natural: -1 };
+  return { part: -1, mode: 'none', natural: -1 };
+}
+
+/**
+ * mob.cpp:3273 Mob::ArmForStyle — point the driver at whatever this style
+ * swings. Called from beginStroke, exactly where MobSystem::BeginStroke calls
+ * it, so the preview and the game choose the effector from the same field.
+ *
+ * Returns false when the style names a weapon this rig has not got, which is
+ * the same answer that stops the engine starting a stroke with no edge on the
+ * end of it — the panel says so rather than previewing a swing the game would
+ * never play.
+ */
+function armForStyle(sty) {
+  if (!sty || !sty.weapon || sty.weapon === 'held') {
+    clearStrikeEffector();
+    return wpHandPart >= 0;
+  }
+  const ni = naturalIndexNamed(sty.weapon);
+  const nw = ni >= 0 ? naturalList()[ni] : null;
+  if (!nw || !naturalUsable(nw)) return false;
+  const pi = skel.findPart(nw.part);
+  const out = {};
+  const chained = chainForEffector(pi, out) >= 0;
+  strikeEff = pi;
+  strikeMode = chained ? 'chain' : 'aim';
+  strikeNatural = ni;
+  return true;
+}
+
+function clearStrikeEffector() {
+  strikeEff = -1;
+  strikeMode = 'none';
+  strikeNatural = -1;
+}
+
+/**
+ * mob.cpp:15622 Mob::WeaponEdge, natural branch — the authored segment on the
+ * part's LIVE transform, in the editor's MODEL space (file voxels).
+ *
+ * TWO DIFFERENCES FROM THE ENGINE, both of them frame bookkeeping:
+ *
+ *   * NO ArtToWorld SCALING. The engine multiplies the authored points by
+ *     `def.ArtToWorld()` at load because its model space is WORLD voxels; the
+ *     editor's is file voxels, which is the frame the numbers are authored in.
+ *     The seam converts once, where every other length does (weaponArmSeed).
+ *   * THE ORIGIN IS THE JOINT, NOT THE MIN CORNER. `WeaponEdge` composes
+ *     against the limb's Jolt transform, whose position IS the model's min
+ *     corner; `anim.model[i].pos` is the part's JOINT. mob.cpp states the
+ *     relation in WeaponStrokePose — world min corner = joint - rot * anchor —
+ *     so the rebasing term is `-anchorLocal`, and leaving it out puts a fist's
+ *     knuckles wherever the wrist happens to be, which is a whole hand's
+ *     length of quiet error.
+ */
+function naturalEdgeModel(nw) {
+  if (!nw || !skel || !anim?.model?.length) return null;
+  const i = skel.findPart(nw.part);
+  if (i < 0 || !anim.model[i]) return null;
+  const e = nw.edge || {};
+  const pt = (v) => (Array.isArray(v) && v.length === 3)
+    ? AN.v3(+v[0] || 0, +v[1] || 0, +v[2] || 0) : null;
+  const from = pt(e.from), to = pt(e.to);
+  if (!from || !to) return null;
+  const m = anim.model[i];
+  const a = skel.parts[i].anchorLocal;
+  const place = (q) => AN.vadd(m.pos, AN.qrot(m.rot, AN.vsub(q, a)));
+  return { base: place(from), tip: place(to), part: i,
+           halfWidth: +e.halfWidth || 0, flat: AN.v3() };
+}
+
+/**
+ * The segment the driver is actually swinging, whichever effector is live:
+ * the held item's blade, or the natural weapon's own edge. `flat` is a zero
+ * vector for a natural weapon, which melee.js's edge-alignment reads as "no
+ * evidence" rather than as a bad angle — a fist cannot land flat (mob.cpp
+ * WeaponEdge says the same in the same words).
+ */
+function effectorEdgeModel() {
+  const eff = resolveEffector();
+  if (eff.mode === 'chain' || eff.mode === 'aim') {
+    const nw = naturalList()[eff.natural];
+    return nw ? naturalEdgeModel(nw) : null;
+  }
+  return bladeSegmentModel();
+}
+
 // tuning.json's melee block, live off the HOST'S OWN tuning document — the
 // same object the Tuning tab edits, so one number has one home and a knob
 // moved there is visible in the very next previewed swing. Supplied through
@@ -3290,13 +3741,53 @@ const meleeTuning = () => MELEE.meleeTuningFrom(tuningDoc());
  * is exactly the case the engine answers with ClearArm.
  */
 function weaponArmSeed() {
-  if (!skel || !anim || !anim.model.length || wpChain < 0) return null;
-  const ch = skel.chains[wpChain];
+  if (!skel || !anim || !anim.model.length) return null;
+  const eff = resolveEffector();
+
+  // ---- AIM: THE PIVOT IS THE PART'S OWN JOINT, AND THERE IS NO ARM -------
+  //
+  // mob.cpp:15402. A part in no chain still has a pivot and still has a
+  // length, and the driver needs both — the pivot is what the stroke's azimuth
+  // and elevation are measured about, the length is what bounds its reach
+  // band. THE PIVOT IS THE PART'S OWN JOINT AND NOT THE PARENT'S, which is
+  // where the engine's first version of this went wrong: four of the neck's
+  // five voxels are rigid, nothing rotates about the chest, and handing the
+  // driver a lever it cannot move divides every commanded radian by the
+  // fraction the head actually owns (measured there: 0.08 rad realised on 0.51
+  // commanded, which on screen is a bite that never opens its mouth).
+  //
+  // So the "hand" IS the pivot, the point is the edge tip, and `bladeLen_`
+  // becomes the edge span — one part rotating, which is what a bite is.
+  if (eff.mode === 'aim') {
+    const nw = naturalList()[eff.natural];
+    const seg = nw ? naturalEdgeModel(nw) : null;
+    if (!seg || !anim.model[seg.part]) return null;
+    const S = rigScale();
+    const pivot = anim.model[seg.part].pos;
+    const span = AN.vlen(AN.vsub(seg.tip, seg.base)) / S;
+    if (!(span > 1e-3)) return null;
+    return {
+      hand: AN.v3(),                                   // the hand IS the pivot
+      tip: AN.vmul(AN.vsub(seg.tip, pivot), 1 / S),
+      flat: AN.v3(), reach: span, shoulder: pivot, S,
+    };
+  }
+
+  // ---- HELD / CHAIN: a two-bone arm ---------------------------------------
+  // The chain is the one whose EFFECTOR is the part or the part's parent, so a
+  // fist is served by the arm the hand is on the end of without anything
+  // naming "arm.R" (mob.cpp:14941).
+  const hand = { hand: -1 };
+  const ci = eff.part >= 0 ? chainForEffector(eff.part, hand) : wpChain;
+  if (ci < 0 || !skel.chains[ci]) return null;
+  const ch = skel.chains[ci];
+  const handPart = hand.hand >= 0 ? hand.hand : wpHandPart;
+  if (handPart < 0 || !anim.model[handPart]) return null;
   const i0 = ch.parts[0], i1 = ch.parts[1];
   if (i0 < 0 || i1 < 0 || !anim.model[i0] || !anim.model[i1]) return null;
   const S = rigScale();
   const shoulder = anim.model[i0].pos;
-  const handModel = anim.model[wpHandPart].pos;
+  const handModel = anim.model[handPart].pos;
   // Heading is 0 in the editor, so Rotate(yaw, .) is the identity and the
   // model-space difference IS the shoulder-relative offset.
   const handFromShoulder = AN.vmul(AN.vsub(handModel, shoulder), 1 / S);
@@ -3305,12 +3796,31 @@ function weaponArmSeed() {
   // including the effector-IS-the-lower-bone case, which animSolveTwoBone
   // extends by the bone's rest length (mob.cpp:8204).
   const root = anim.model[i0].pos, joint = anim.model[i1].pos;
-  const tipJoint = (wpHandPart === i1)
+  const tipJoint = (handPart === i1)
     ? AN.vadd(joint, AN.qrot(anim.model[i1].rot, skel.parts[i1].rest.pos))
-    : anim.model[wpHandPart].pos;
+    : anim.model[handPart].pos;
   const reach = (AN.vlen(AN.vsub(joint, root)) +
                  AN.vlen(AN.vsub(tipJoint, joint))) / S;
   if (!(reach > 1e-3)) return null;
+
+  // ---- A CHAIN EFFECTOR REPORTS NO BLADE AT ALL (mob.cpp:15477) ----------
+  //
+  // `MeleeState::RadiusBand` has two models and picks between them on
+  // `bladeLen_`: with a blade it solves the reach ANNULUS of a rigid bar pinned
+  // at a hand held `extendLive_` from the shoulder, and with none it says "the
+  // point IS the hand, so the band is simply the arm". A fist is the second
+  // case wearing the first's clothes — the knuckles ride a voxel past the
+  // wrist — and reporting that voxel as a blade collapsed the band to under two
+  // voxels of travel and leaked the radial drive into elevation (measured in
+  // the engine: a punch authoring 0.02 rad of elevation commanded 0.7 of it).
+  //
+  // So a natural weapon reports its TIP AT ITS HAND. Nothing about the hitbox
+  // moves: the swept edge is still the authored segment on the live transform
+  // (effectorEdgeModel), which is a separate question from where the driver is
+  // steering.
+  if (eff.mode === 'chain')
+    return { hand: handFromShoulder, tip: handFromShoulder, flat: AN.v3(),
+             reach, shoulder, S };
 
   // ---- the BLADE half, off the same live pose so the two ends of the seed
   // cannot disagree by a leaning spine's worth of voxels.
@@ -3437,13 +3947,119 @@ function weaponSeedFromRig() {
   const seed = weaponArmSeed();
   if (seed) melee.setStroke(seed.hand, seed.tip, seed.flat, seed.reach);
   else melee.clearArm();
-  const keep = headKeepOut();
+  // ---- THE SPHERE IS FOR A BLADE, AND ONLY FOR A BLADE (mob.cpp:15570) ---
+  //
+  // What the keep-out models is a LONG RIGID SEGMENT swung about the shoulder:
+  // a held sword is a child of the hand, its far end is a metre from any
+  // joint, and no pose limit in the rig knows it exists. A natural weapon's
+  // segment IS the part — a voxel of knuckle on an arm whose shoulder cone and
+  // elbow hinge are already clamped every tick — and a sphere sized off the
+  // head model is wider than the whole fist, so left on it shoves a chambered
+  // punch (which legitimately sits beside the chin) out and up. And when the
+  // face IS the weapon there is no radius at which "keep the jaws away from
+  // the head" means anything at all.
+  const keep = resolveEffector().mode === 'held' ? headKeepOut() : null;
   if (keep) melee.setKeepOut(keep.center, keep.radius);
   else melee.clearKeepOut();
 }
 
+/* --------------------------------------------------------------------------
+   THE LUNGE, AS A TIMELINE THE AUTHOR CAN LINE UP (strokes.h StyleLunge)
+
+   The engine's launch (Mob::Launch) hands the BODY a velocity and UpdateFall
+   carries it, wall test and all. The preview has no world, no footing probe
+   and no victim to be a wall, so it does NOT re-implement that: what it
+   reproduces is the arc's own arithmetic — the magnitude the engine solves at
+   the moment of the launch, and the ballistic flight that follows from the
+   authored rise — and it translates the previewed body along it.
+
+   WHY THAT IS THE USEFUL HALF. Lining the landing up with the cut is the
+   AUTHOR'S job (strokes.h says so in as many words: "windup.ticks ~ ticks"),
+   and the thing they cannot see from the JSON is that those two numbers are
+   measured on different clocks — `lunge.ticks` is what the magnitude is
+   BUDGETED against, while the flight actually ends when gravity brings the
+   rise back to the ground. The panel prints both against the tick the cut
+   starts on, which is the number to move.
+
+   THE STAND-OFF IS THE STYLE'S OWN `reach`, because that is the distance the
+   creature commits from: MobSystem::BeginStroke refuses a style whose reach
+   the target is outside, so a lunging bite authored at 22 voxels launches from
+   at most 22. The arrival distance is the EFFECTOR's reach and not the style's
+   — the two mean opposite things and confusing them makes the lunge a no-op
+   (mob.cpp:3697 measured every launch computing `dist - 22 <= 0` and produced
+   a creature that hopped on the spot).
+   -------------------------------------------------------------------------- */
+let lungeArc = null;
+
+/** The loco state the preview is in, and what it scales a leap by. */
+function lungeStateScale() {
+  if (!skel || !anim) return { scale: 1, state: '' };
+  const r = AN.animSelectState(skel, anim);
+  if (r < 0 || !skel.states?.[r]) return { scale: 1, state: '' };
+  const rule = skel.states[r];
+  return { scale: Math.max(0, rule.lungeScale ?? 1), state: rule.name || '' };
+}
+
+/**
+ * Solve the arc one style would fly, without flying it. Pure: the panel calls
+ * it to print the timeline on a rig that is standing still.
+ */
+function lungeSolve(sty) {
+  if (!sty || !MELEE.lungeAny(sty.lunge)) return null;
+  const t = tuningDoc();
+  // physics.gravity is metres/s^2 and the arc is in WORLD voxels, so it goes
+  // through the same MetresToCells every other authored length does.
+  const g = (Number.isFinite(+t?.physics?.gravity) ? +t.physics.gravity : 9.8)
+            / MELEE.kVoxelMeters;
+  const seed = weaponArmSeed();
+  const armReach = (seed?.reach ?? 0) > 1e-3 ? seed.reach
+                                             : 0.60 / MELEE.kVoxelMeters;
+  const { scale, state } = lungeStateScale();
+  const standOff = sty.reach > 0 ? sty.reach : armReach * 2;
+  const airTime = Math.max(1, sty.lunge.ticks) / 30;
+  const want = (standOff - armReach) / airTime;
+  const mag = Math.min(sty.lunge.speed / MELEE.kVoxelMeters * scale,
+                       Math.max(0, want));
+  const rise = sty.lunge.rise / MELEE.kVoxelMeters * scale;
+  // A BALLISTIC FLIGHT ENDS WHERE IT STARTED: the preview ground is the body's
+  // own launch height, so the flight is 2*rise/g — plus the one tick
+  // UpdateFall's launch latch buys, which is why a lunge with no rise lands
+  // the tick after it left (strokes.h, and test_melee.mjs asserts every
+  // shipped lunge climbs).
+  const landTicks = Math.max(1, Math.round(2 * rise / Math.max(g, 1e-6) * 30));
+  return { mag, rise, g, scale, state, standOff, armReach,
+           budget: Math.max(1, sty.lunge.ticks), landTicks,
+           at: sty.lunge.at, travel: mag * landTicks / 30 };
+}
+
+/**
+ * ONE DELIBERATE DIFFERENCE FROM THE ENGINE. There, the effector is chosen at
+ * BeginStroke and cleared at the end of the stroke — a creature is only ever
+ * holding a weapon or swinging one. Here the panel is an AUTHORING surface:
+ * clicking the `bite` chip has to move the readout onto the head, draw the
+ * jaws' edge and report the head's own reach band BEFORE anything swings, or
+ * every number under the author's cursor describes a different weapon from the
+ * one being edited.
+ *
+ * So between strokes the effector follows the SELECTION. A live stroke owns it
+ * outright, exactly as the engine's does.
+ *
+ * CALLED FROM tick(), NOT ONLY FROM weaponTick — the preview loop only runs
+ * when something wants a posed rig (a gait, an open clip, a live stroke), and
+ * the common case for reading the panel is a rig standing still with none of
+ * those. Driving it off the preview meant selecting a bite changed nothing
+ * until you pressed swing.
+ */
+function syncEffectorToSelection() {
+  if (strokeLive()) return;
+  const lib = ATK.library();
+  const sel = lib ? lib.styles[ATK.styleIndex()] : null;
+  if (!sel || !armForStyle(sel)) clearStrikeEffector();
+}
+
 function weaponTick() {
   dbgWeaponTicks++;
+  syncEffectorToSelection();
   // ---- 1. WHERE THE BLADE IS NOW ---------------------------------------
   weaponSeedFromRig();
 
@@ -3471,6 +4087,31 @@ function weaponTick() {
   const aim = ATK.currentAim();
   const P = MELEE.STROKE_PHASE;
   const phaseBefore = strokeCur.phase;
+  // ---- 3b. THE LUNGE, fired on the FIRST TICK OF ITS NAMED PHASE and before
+  // the program advances (mob.cpp:3678), so a windup lunge leaves the ground on
+  // the same tick the telegraph starts and the flight IS the telegraph.
+  if (sty && !lungeArc && strokeCur.phaseTick === 0 &&
+      ((sty.lunge.at === 'windup' && strokeCur.phase === P.Windup) ||
+       (sty.lunge.at === 'cut' && strokeCur.phase === P.Cut))) {
+    const sol = lungeSolve(sty);
+    if (sol)
+      lungeArc = { ...sol, x: 0, y: 0, vy: sol.rise, airTicks: 0,
+                   landed: false, cutStart: -1 };
+  }
+  if (lungeArc && !lungeArc.landed) {
+    // Forward along the rig's own facing (+Z at heading 0) and up, integrated
+    // on the STROKE's 30 Hz clock — the same one Mob::UpdateFall runs on.
+    lungeArc.x += lungeArc.mag * kStrokeDt;
+    lungeArc.y += lungeArc.vy * kStrokeDt;
+    lungeArc.vy -= lungeArc.g * kStrokeDt;
+    lungeArc.airTicks++;
+    if (lungeArc.airTicks > 1 && lungeArc.y <= 0) {
+      lungeArc.y = 0;
+      lungeArc.landed = true;
+    }
+  }
+  if (lungeArc && lungeArc.cutStart < 0 && strokeCur.phase === P.Cut)
+    lungeArc.cutStart = strokeTick;
   const r = MELEE.stepStrokeProgram(strokeCur, sty, melee, aim.az, aim.el,
                                     kStrokeDt, right, up, fwd);
   strokeTick++;
@@ -3511,10 +4152,24 @@ function beginStroke(styleIndex) {
   const sty = lib.styles[styleIndex];
   if (!sty) return;
   strokeStyle = styleIndex;
+  // ---- POINT THE DRIVER AT WHATEVER THIS STYLE SWINGS (mob.cpp:3327) -----
+  // MobSystem::BeginStroke calls ArmForStyle here, before the program is
+  // seeded, and refuses the swing when the creature has not got the weapon.
+  // The preview refuses it the same way rather than running a stroke with no
+  // edge on the end of it — a style previewed against a rig that does not
+  // declare its natural weapon is a content error, and showing a plausible
+  // swing for it is how one ships.
+  if (!armForStyle(lib.styles[styleIndex])) {
+    strokeStyle = -1;
+    toast('"' + (sty.weapon || 'held') + '" is not on this rig — add it in the ' +
+          'Natural weapons block, or pick a style this creature can swing', true);
+    return;
+  }
   strokeCur = MELEE.newStrokeCursor();
   melee.tuning = meleeTuning();
   melee.reset();
   strokeTick = 0;
+  lungeArc = null;
   strokeTrail.length = 0;
   strokeTipPrev = null;
   strokeTipSpeed = 0;
@@ -3547,6 +4202,12 @@ function beginStroke(styleIndex) {
 
 function stopStroke() {
   strokeCur = MELEE.newStrokeCursor();
+  // mob.cpp:14542 ClearStrikeEffector — DROPS THE OVERRIDE, and that is all:
+  // a rig that finishes a punch while still holding a sword goes back to
+  // carrying the sword through resolveEffector's fall-through, not through a
+  // value written here.
+  clearStrikeEffector();
+  lungeArc = null;
   strokeHoldTicks = 0;
   if (melee) melee.reset();
   strokeTrail.length = 0;
@@ -3566,8 +4227,21 @@ function stopStroke() {
  */
 function applyWeaponArm() {
   const pose = weaponPose();
-  if (!pose || wpChain < 0 || !anim?.model?.length) return null;
-  const ch = skel.chains[wpChain];
+  if (!pose || !anim?.model?.length) return null;
+  const eff = resolveEffector();
+  // ---- AIM: A PART WITH NO CHAIN (mob.cpp:14915, stage 0) ---------------
+  //
+  // The jaws are not on the end of anything the two-bone solver can serve, so
+  // an aim effector is driven the other way a part can be pointed at
+  // something — and it is applied EARLIER, in applyStrikeAim, because it
+  // writes the PRE-FLATTEN locals (it rotates a part about its joint and
+  // shares the yaw with the spine above it). This stage runs after the
+  // flatten, so an aim written from here would be a write nobody reads.
+  if (eff.mode === 'aim') return null;
+  const hand = { hand: -1 };
+  const ci = eff.part >= 0 ? chainForEffector(eff.part, hand) : wpChain;
+  if (ci < 0 || !skel.chains[ci]) return null;
+  const ch = skel.chains[ci];
   const weight = ch.weight * pose.weight;
   if (weight <= 0) return null;
   const S = rigScale();
@@ -3626,6 +4300,73 @@ function applyWeaponArm() {
   lastElbowOverride = { part: i1, axis, blend: clamp(pose.steerAmount, 0, 1) };
   return lastElbowOverride;
 }
+
+/**
+ * mob.cpp:14777 Mob::ApplyStrikeAim — stage 3.5, and PRE-FLATTEN.
+ *
+ * When the effector is an AIM part (the jaws), this IS the attack: the part
+ * and an authored share of the spine are rotated until the part's forward lies
+ * along the stroke's own bearing. There is no IK behind it and, in the game,
+ * the body's travel — the lunge — is what carries it to the target.
+ *
+ * THE STROKE'S BEARING, NOT THE POSE'S BLADE DIRECTION, and the distinction is
+ * the whole reason the bite reads as a snap. `pose.bladeDir` is the driver's
+ * solved blade LEAN (melee.js's law of cosines: the angle a rigid bar has to
+ * sit at so its far end reaches the commanded radius from a hand held at the
+ * live extension). For a held sword that is exactly right; for an aim effector
+ * there is no bar and no hand, so driving the part at the lean meant chasing a
+ * quantity derived from a geometry it is not in. `strokeAz`/`strokeEl` are the
+ * commanded bearing about the pivot in the wielder's own basis — laid straight
+ * onto the part's forward they are a 1:1 ask.
+ *
+ * NO SMOOTHING, deliberately: a four-tick cut can never catch a goal through a
+ * halflife. A stroke owns its part outright.
+ *
+ * Returns the applied {yaw, pitch} for the readout, or null.
+ */
+function applyStrikeAim() {
+  const eff = resolveEffector();
+  if (eff.mode !== 'aim' || !melee || !skel || !anim?.local?.length) return null;
+  const w0 = melee.poseWeight();
+  if (!(w0 > 0)) return null;
+  // The rig's own facing basis. Heading is 0 in the editor and the model is
+  // authored in its own frame, so fwd = +Z, up = +Y and right = fwd x up = -X
+  // — the sign anim.cpp:404 states and the side every def's `.R` limbs sit on.
+  const right = AN.v3(-1, 0, 0), up = AN.v3(0, 1, 0), fwd = AN.v3(0, 0, 1);
+  let dir = AN.v3();
+  if (strokeLive()) {
+    const az = melee.strokeAz(), el = melee.strokeEl();
+    const ce = Math.cos(el);
+    dir = AN.vadd(AN.vadd(AN.vmul(right, ce * Math.sin(az)),
+                          AN.vmul(up, Math.sin(el))),
+                  AN.vmul(fwd, ce * Math.cos(az)));
+  }
+  // A guard, or a pose pushed in by something that is not a stroke program,
+  // still has a blade direction and nothing better to offer.
+  const pose = melee.pose();
+  if (AN.vlen(dir) < 1e-4 && pose) dir = pose.bladeDir || AN.v3();
+  if (AN.vlen(dir) < 1e-4 && pose) dir = pose.hand || AN.v3();
+  if (AN.vlen(dir) < 1e-4) return null;
+  dir = AN.vnorm(dir);
+  // mob.cpp:14666 AimAnglesTo, at heading 0: a bearing in the rig's own
+  // heading convention (0 = +Z, positive toward +X) and a pitch positive UP.
+  const yaw = Math.atan2(dir.x, dir.z);
+  const pitch = Math.asin(Math.max(-1, Math.min(1, dir.y)));
+  // FULL WEIGHT THROUGH THE CUT: PoseWeight is already 1 in every phase except
+  // a releasing recover, so this changes nothing today — it is here so that a
+  // future change to the arm-claim ramp cannot quietly halve a bite.
+  const w = (strokeCur?.phase === MELEE.STROKE_PHASE.Cut) ? 1 : w0;
+  const share = Number.isFinite(+sc()?.aimSpineShare) ? +sc().aimSpineShare : 0.35;
+  AN.animApplyAimPart(skel, anim, eff.part, yaw, pitch, w, share, skel.rootLimb);
+  lastAim = { part: eff.part, yaw, pitch, weight: w, share };
+  return lastAim;
+}
+
+// What applyStrikeAim last commanded, for the panel's readout and the harness.
+// Null when no aim effector ran this tick — which is the distinction a bare
+// "the head did not move" cannot make: no aim was asked for, versus one was
+// asked for and the part refused it.
+let lastAim = null;
 
 // The override the stage-6 clamp was last handed, kept for the test seam.
 // Measuring the elbow's bend about its AUTHORED axis while the driver is
@@ -3698,20 +4439,74 @@ function bindAttacks() {
     }),
     armInfo: () => {
       if (!skel) return { chain: -1 };
-      const ch = wpChain >= 0 ? skel.chains[wpChain] : null;
+      // THE CHAIN THE EFFECTOR IS ON, not the socket's — with a fist style
+      // selected the panel's per-limb rows and reach band must describe the
+      // arm that is actually swinging.
+      const eff = resolveEffector();
+      const h = { hand: -1 };
+      const ci = eff.mode === 'aim' ? -1
+               : eff.part >= 0 ? chainForEffector(eff.part, h) : wpChain;
+      const ch = ci >= 0 ? skel.chains[ci] : null;
       const seed = weaponArmSeed();
       const band = melee ? melee.reachBand() : { lo: 0, hi: 0 };
       return {
-        chain: wpChain,
-        armName: ch ? ch.parts.map(i => skel.parts[i]?.name).join(' → ') : '',
-        armParts: ch ? ch.parts.map(i => skel.parts[i]).filter(Boolean) : [],
+        // AIM REPORTS chain 0, NOT -1. The panel treats a negative chain as
+        // "this rig has no weapon arm at all" and replaces its whole readout
+        // with that warning — true for a sword, and nonsense for a bite, which
+        // needs no chain by construction.
+        chain: eff.mode === 'aim' ? 0 : ci,
+        armName: ch ? ch.parts.map(i => skel.parts[i]?.name).join(' → ')
+                    : (eff.part >= 0 ? (skel.parts[eff.part]?.name || '') : ''),
+        armParts: ch ? ch.parts.map(i => skel.parts[i]).filter(Boolean)
+                     : (eff.part >= 0 && skel.parts[eff.part]
+                        ? [skel.parts[eff.part]] : []),
         handSign: melee ? melee.handSign_ : 1,
         reach: seed?.reach ?? 0,
         bladeLen: melee?.bladeLen_ ?? 0,
         blade: !!bladeSegmentModel(),
         bandLo: band.lo, bandHi: band.hi,
+        // ---- which part the driver is moving, and with what ---------------
+        effPart: eff.part >= 0 ? (skel.parts[eff.part]?.name || '') : '',
+        effMode: eff.mode,
+        effWeapon: eff.natural >= 0 ? (naturalList()[eff.natural]?.name || '') : '',
+        aim: lastAim ? { yaw: lastAim.yaw, pitch: lastAim.pitch,
+                         share: lastAim.share } : null,
       };
     },
+    // The open rig's own `natural` block, for the style's weapon picker: a
+    // style names a weapon and only this rig can say whether it has one.
+    naturalWeapons: () => naturalList().map(w => ({
+      name: w?.name || '', part: w?.part || '',
+      usable: naturalUsable(w),
+      mode: (() => {
+        const pi = skel ? skel.findPart(w?.part || '') : -1;
+        return pi < 0 ? '—' : (chainForEffector(pi, {}) >= 0 ? 'chain' : 'aim');
+      })(),
+    })),
+    // Every limb TAG this rig publishes, for the `target` weight row. Tags and
+    // not names, because that is what a style's table is keyed on (strokes.h
+    // StyleTargetWeight: "any rig that tags its parts answers it, including
+    // one with four of them").
+    limbTags: () => {
+      const out = [];
+      for (const p of (skel?.parts || []))
+        if (p.tag && !out.includes(p.tag)) out.push(p.tag);
+      return out.sort();
+    },
+    // The arc a style would fly, solved but not flown, plus the live flight
+    // when one is in the air. See lungeSolve.
+    lungeInfo: (sty) => {
+      const sol = lungeSolve(sty);
+      if (!sol) return null;
+      return { ...sol, live: lungeArc ? {
+        airTicks: lungeArc.airTicks, landed: lungeArc.landed,
+        cutStart: lungeArc.cutStart, x: lungeArc.x, y: lungeArc.y } : null };
+    },
+    // The post-jitter tick counts of the LIVE program, so the timeline can say
+    // which tick the cut actually starts on rather than the authored one.
+    cursorTicks: () => ({ windup: strokeCur?.windupTicks ?? 0,
+                          cut: strokeCur?.cutTicks ?? 0,
+                          tick: strokeTick }),
   });
 }
 
@@ -3723,7 +4518,10 @@ function bindAttacks() {
  */
 function recordStrokeTrail() {
   if (!strokeLive()) return;
-  const blade = bladeSegmentModel();
+  // WHICHEVER EDGE IS SWINGING. A fist's knuckles and a set of jaws leave a
+  // trail for the same reason a blade does, and they are the only picture of
+  // where an unarmed style actually puts its hitbox.
+  const blade = effectorEdgeModel();
   if (!blade) return;
   // ---- the two numbers the damage formula scales by ---------------------
   // TIP SPEED, in WORLD voxels/sec, because melee.minSpeedMps and
@@ -3748,7 +4546,12 @@ function recordStrokeTrail() {
   }
   strokeTipPrev = blade.tip;
   if (!ATK.trailEnabled()) { strokeTrail.length = 0; return; }
-  strokeTrail.push({ base: blade.base, tip: blade.tip, phase: strokeCur.phase });
+  // RECORDED WITH THE OFFSET IT HAPPENED AT. The body's lunge translation is
+  // applied by the renderer (modelTransform), so a trail sampled in model space
+  // would stay behind on the launch pad while the creature flew away from it.
+  const lo = lungeOffsetModel();
+  strokeTrail.push({ base: AN.vadd(blade.base, lo), tip: AN.vadd(blade.tip, lo),
+                     phase: strokeCur.phase });
   while (strokeTrail.length > kStrokeTrailMax) strokeTrail.shift();
 }
 
@@ -4859,6 +5662,9 @@ function tick(dt) {
     if (ended) { reseedPose(); renderClipLane(); }
   }
 
+  // The effector follows the selected style even on a still rig — see
+  // syncEffectorToSelection for why this is not inside the preview loop.
+  syncEffectorToSelection();
   if (previewActive()) {
     stepPreview(dt);
     renderGaitReadout();
@@ -4989,6 +5795,19 @@ function installTestSeam() {
         blade: !!bladeSegmentModel(),
         socket: weaponSocket()?.name ?? '',
         item: heldItemId || '',
+        // WHICH PART THE DRIVER IS MOVING (game/impact.h StrikeEffectorMode).
+        // The harness asserts a natural-weapon style drives the part it names,
+        // which is the one claim the arithmetic tests cannot make: melee.js
+        // has no rig and cannot know what "jaws" resolves to.
+        effPart: (() => { const e = resolveEffector();
+          return e.part >= 0 ? (skel?.parts[e.part]?.name || '') : ''; })(),
+        effMode: resolveEffector().mode,
+        effWeapon: (() => { const e = resolveEffector();
+          return e.natural >= 0 ? (naturalList()[e.natural]?.name || '') : ''; })(),
+        // What the rig declares, so a failure above says whether the style
+        // named something wrong or the rig is missing it.
+        natural: naturalList().map(w => (w?.name || '?') + '@' + (w?.part || '?')),
+        aimRan: !!lastAim,
       };
     },
     strokeState: () => {
