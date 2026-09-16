@@ -43,7 +43,7 @@
     {
       "id": "mace",
       "kind": "melee",
-      "damage": 2.0,
+      "damage": 0,
       "blunt": 16.0,
       "bluntCarve": 0.6,
       "armorBreak": 0.8,
