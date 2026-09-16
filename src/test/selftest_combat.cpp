@@ -1406,10 +1406,36 @@ Status GateNpcStyles(Ctx& c, std::string& detail) {
 
   // Straight ahead, level, at arm's length: an aim with no bias of its own, so
   // what is measured is the STYLE and not where a target happens to be.
-  const Vec3 o = c.mobs.MobOrigin(id);
-  const Vec3 aim{o.x + st.def->worldSize.x * 0.5f,
-                 o.y + st.def->worldSize.y * 0.66f,
-                 o.z + st.def->worldSize.z * 0.5f + 11.0f};
+  //
+  // RE-DERIVED PER STYLE, INSIDE THE LOOP (2026-09-15), because one of the
+  // styles MOVES THE ATTACKER. `bite_lunge` leaps 16.67 voxels, and a point
+  // fixed before the loop is a point the creature has flown past by the time
+  // the next style is asked for -- so every style after the lunge in library
+  // order was aimed backwards over the fixture's own shoulder and drove its
+  // azimuth into the across-the-body stop. Measured: `punch_r` (before the
+  // lunge) commanded azimuth -0.17..0.11 and `player_punch_r` (after it)
+  // -1.40..1.01, on styles whose authored numbers differ by two hundredths of
+  // a radian; the range did not move when the authoring was changed, because
+  // the authoring was never what set it.
+  //
+  // The aim is DEFINED relative to the attacker -- "straight ahead, level, at
+  // arm's length" -- so following the attacker is what the sentence above
+  // always meant. `aimFor` is that sentence.
+  //
+  // ...AND AT THE DISTANCE THE STYLE IS FOR. Eleven voxels is arm's length and
+  // is right for a style that stands and swings; a LUNGING style crosses three
+  // body-lengths and would fly straight past it, leaving the cut aimed over
+  // its own shoulder.  is the distance the AI would
+  // really commit from, which is the distance the blow is really made at.
+  auto aimFor = [&](const AttackStyle& s2) {
+    const Vec3 o2 = c.mobs.MobOrigin(id);
+    float ahead = 11.0f;
+    if (const Mob* m2 = c.mobs.FindMobById(id))
+      ahead = std::max(ahead, c.mobs.StyleReachOn(*m2, s2));
+    return Vec3{o2.x + st.def->worldSize.x * 0.5f,
+                o2.y + st.def->worldSize.y * 0.66f,
+                o2.z + st.def->worldSize.z * 0.5f + ahead};
+  };
 
   const float domMin = (float)BaselineNumber("npcStyles.dominanceMin", 1.3);
   const float minSweep = (float)BaselineNumber("npcStyles.minSweepRad", 0.25);
@@ -1465,6 +1491,12 @@ Status GateNpcStyles(Ctx& c, std::string& detail) {
         rng::Hash3(0x5C0BEu,
                    (uint32_t)std::hash<std::string>{}(sty.name), 0x5747u) |
         1u;
+    // ...AND THE FIXTURE FACES IT. A lunge leaves the creature where it
+    // landed AND pointing where it was going; a stroke expressed in the body's
+    // own basis, made by a body facing the wrong way, is a stroke aimed at
+    // nothing (selftest_combat's FaceAt says the same for the same reason).
+    const Vec3 aim = aimFor(sty);
+    FaceAt(c.mobs, id, aim);
     if (!c.mobs.ForceAttack(id, sty.name, aim, tick.tick, styleSeed)) {
       check(false, "style \"" + sty.name + "\" would not start");
       continue;
@@ -1508,6 +1540,8 @@ Status GateNpcStyles(Ctx& c, std::string& detail) {
     // THE COMMANDED ARCS TOO. See the note at the dominance checks below for
     // why the CLAIM is stated on these and not on the posed sword.
     float cmdAzArc = 0, cmdElArc = 0;
+    float cmdAzLo = 1e9f, cmdAzHi = -1e9f;
+    float blade = -1.0f;
     float cPrevAz = 0, cPrevEl = 0;
     bool cHavePrev = false;
     int cutTicks = 0;
@@ -1597,6 +1631,9 @@ Status GateNpcStyles(Ctx& c, std::string& detail) {
           cmdRMin = std::min(cmdRMin, cr);
           cmdRMax = std::max(cmdRMax, cr);
           const float ca = s->melee.StrokeAz(), ce = s->melee.StrokeEl();
+        blade = s->melee.BladeLength();
+        cmdAzLo = std::min(cmdAzLo, ca);
+        cmdAzHi = std::max(cmdAzHi, ca);
           if (cHavePrev) {
             cmdAzArc += std::fabs(ca - cPrevAz) *
                         std::cos(std::clamp(ce, -1.5f, 1.5f));
@@ -1719,7 +1756,28 @@ Status GateNpcStyles(Ctx& c, std::string& detail) {
       check(posedAz + posedEl > minSweep,
             "style " + n + ": the SWORD moved, not just the stroke");
     }
-    if (wantR > wantAz && wantR > wantEl) {
+    // ---- A STYLE THAT LEAPS CANNOT HAVE ITS SHAPE MEASURED THIS WAY -----
+    //
+    // Every claim below is stated in the WIELDER'S OWN BASIS about its own
+    // pivot, and that coordinate only means what it says while the wielder is
+    // standing still. A lunging style moves the body sixteen voxels DURING the
+    // stroke, so the bearing to a fixed aim sweeps under the blow and the
+    // gate reads the FLIGHT as azimuth: `bite_lunge` authors 0.08 rad of it
+    // and commanded 1.53, pinned against the across-the-body stop at -1.40,
+    // and the number did not move when the authoring did -- because the
+    // authoring was never what set it.
+    //
+    // WHAT IS STILL ASSERTED FOR IT, and it is the sharper pair: the effector's
+    // own travel above (the jaws turned 2.35 rad) and the rig's own
+    // commanded-versus-posed pitch (0.92 -> 1.18), neither of which is
+    // expressed in a frame the body's travel can rotate. A lunge's SHAPE is a
+    // question for the Attacks lane, which can show the arc and the arc it was
+    // asked for side by side; it is not one a body in mid-air can answer.
+    if (sty.lunge.Any()) {
+      std::printf("npc-styles %-14s dominance not asserted: it LEAPS, and the "
+                  "basis the claim is stated in travels with it\n",
+                  sty.name.c_str());
+    } else if (wantR > wantAz && wantR > wantEl) {
       // A THRUST. Reach-dominant: the point goes OUT, not around. Measured in
       // VOXELS (a radius) against radians, so the two are asserted separately
       // rather than compared — comparing them would be comparing units.
@@ -1775,10 +1833,12 @@ Status GateNpcStyles(Ctx& c, std::string& detail) {
         "swept commanded arc az %.2f el %.2f; posed arc az %.2f el %.2f "
         "(spans %.2f / %.2f) dr %.2f vox (commanded dr %.2f, r %.2f..%.2f) "
         "over %d cut ticks; effector knuckle path %.2f vox, forward turn "
-        "%.2f rad, head pitch commanded %.2f -> posed %.2f\n",
+        "%.2f rad, commanded az %.2f..%.2f, blade %.2f, head pitch commanded %.2f -> "
+        "posed %.2f\n",
         sty.name.c_str(), sty.weapon.c_str(), sty.cut.az, sty.cut.el,
         sty.cut.reach, az, el, posedAz, posedEl, azSpan, elSpan, dr, cmdDr,
         cmdRMin, cmdRMax, cutTicks, edgePath, fwdTurn,
+        cmdAzLo, cmdAzHi, blade,
         aimCmdPitchHi > aimCmdPitchLo ? aimCmdPitchHi - aimCmdPitchLo : 0.0f,
         aimGotPitchHi > aimGotPitchLo ? aimGotPitchHi - aimGotPitchLo : 0.0f);
   }

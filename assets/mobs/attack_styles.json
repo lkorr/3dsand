@@ -193,8 +193,8 @@
       "weapon": "fist.R",
       "reach": 0,
       "//reach": "A DEEPER CHAMBER AND A TICK MORE CUT THAN THE FIRST DRAFT. The driver moves a thrust by leaning the blade off a hand held at a fixed extension (melee.cpp's law of cosines), and a fist's whole blade is one voxel of knuckle -- so the radial channel has far less to work with than a sword's and a three-tick cut did not finish converging on it. Measured by npc-styles: commanded dr 0.92 voxels against its 1.0 floor, where the NPC punches (one more windup tick, one more cut tick) made 1.14.",
-      "windup": { "ticks": 5, "az": 0.20, "el": 0.05, "reach": -0.45 },
-      "cut": { "ticks": 4, "az": -0.24, "el": -0.02, "reach": 0.90 },
+      "windup": { "ticks": 7, "az": 0.08, "el": 0.05, "reach": -0.45 },
+      "cut": { "ticks": 4, "az": -0.10, "el": -0.02, "reach": 0.90 },
       "recover": { "ticks": 7 },
       "jitter": { "az": 0.0, "el": 0.0, "tempo": 0.0 },
       "clip": "punch_r"
@@ -204,8 +204,8 @@
       "label": "Straight left",
       "weapon": "fist.L",
       "reach": 0,
-      "windup": { "ticks": 5, "az": -0.20, "el": 0.05, "reach": -0.45 },
-      "cut": { "ticks": 4, "az": 0.24, "el": -0.02, "reach": 0.90 },
+      "windup": { "ticks": 7, "az": -0.08, "el": 0.05, "reach": -0.45 },
+      "cut": { "ticks": 4, "az": 0.10, "el": -0.02, "reach": 0.90 },
       "recover": { "ticks": 7 },
       "jitter": { "az": 0.0, "el": 0.0, "tempo": 0.0 },
       "clip": "punch_l"

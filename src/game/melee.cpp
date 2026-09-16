@@ -1854,8 +1854,33 @@ void MeleeState::Update(float dt, bool held, bool armed, const Vec3& right,
       // no pop on the tick that commits, and the arc still finishes at exactly
       // one `swingArc` for the fold above to absorb.
       const float drive = e - tuning.swingAnticipate * bow;
-      swingAz_ = cutAz_ * tuning.swingArc * drive;
-      swingEl_ = cutEl_ * tuning.swingArc * drive;
+      // ---- AND THE ARC IS THE BLADE'S, NOT A CONSTANT (2026-09-15) --------
+      //
+      // `cutAz_`/`cutEl_` are a UNIT direction and `swingArc` is a flat 2.0
+      // radians, so every committed cut got the same two radians of
+      // follow-through whatever it had asked for. For a sword that IS the law
+      // -- the blade's own momentum carries it across your body and the player
+      // steers back from there, which is what the fold above is about. For a
+      // FIST it is a defect with no defence: `player_punch_r` authors 0.24 rad
+      // of azimuth and commanded 2.45, and `npc-styles` reported the thrust
+      // turning into a swing on a 10.75-voxel hooking knuckle path.
+      //
+      // THE FOLLOW-THROUGH IS THE WEAPON'S MOMENTUM, so it scales with how
+      // much weapon there is past the hand. `bladeLen_` is the length the
+      // driver already holds and already builds the whole lean geometry from,
+      // and it is ZERO for a bladeless weapon by construction (a chain
+      // effector reports its tip at its hand -- mob.cpp says why), so a punch
+      // ends where it was driven and a sword is untouched.
+      //
+      // The reference is half a metre of blade, in METRES so it follows
+      // kVoxelMeters like every other length here: a sword (5.5 voxels at
+      // 10 cm) saturates at the full authored arc, a mace (4.5) keeps 0.9, a
+      // set of jaws (1.65) gets a third of one, a fist none.
+      const float kArcBladeRef = MetresToCells(0.50f);
+      const float arcScale =
+          std::clamp(bladeLen_ / std::max(kArcBladeRef, 1e-3f), 0.0f, 1.0f);
+      swingAz_ = cutAz_ * tuning.swingArc * arcScale * drive;
+      swingEl_ = cutEl_ * tuning.swingArc * arcScale * drive;
       swingOut_ = bow * tuning.swingExtend * tipReach;
       break;
     }

@@ -1910,6 +1910,11 @@ class Mob {
     int natural = -1;       // its natural weapon, for the forward vector
     float cmdYaw = 0, cmdPitch = 0;
     float gotYaw = 0, gotPitch = 0;
+    // World voxels the aimed part was carried FORWARD along its aim this tick
+    // (the neck extending into a bite; Mob::ApplyStrikeAim). Zero outside a cut,
+    // and the one number that says whether the jaws were given the reach to
+    // close the last half-body of the gap a pounce cannot.
+    float lean = 0;
   };
   const AimDiag& AimDiagnostics() const { return aimDiag_; }
 

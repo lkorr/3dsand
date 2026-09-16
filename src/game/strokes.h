@@ -384,10 +384,24 @@ enum class StrokeStepResult : uint8_t { Idle = 0, Live, Finished };
 // in the given basis — the NPC re-derives them from its target every tick and
 // the windup tracks them until the commit freezes the aim; a player attack
 // passes (0, 0), because the camera IS the aim. `dt` is the caller's tick.
+// `liveDist` is HOW FAR THE TARGET IS from the same pivot `liveAz`/`liveEl`
+// are measured about, in world voxels; 0 means "no target", which is what a
+// player attack passes because the camera is the aim and a crosshair has no
+// distance.
+//
+// IT BOUNDS THE CUT'S RADIUS, and that is the whole of what it is for. The
+// authored `reach` offsets are positions in the arm's own BAND -- they say
+// "chamber back a little, then drive to full extension" -- and nothing in them
+// knows where the target is. A sword at ten voxels never notices: the band tops
+// out well short of the victim and the blade covers the rest. A FIST AT TWO
+// VOXELS DOES: the hand drove to 3.90 of a 4.7-voxel band at a chest 2.0 away
+// and the knuckles sailed straight past it, which is the "a punch at arm's
+// length misses" report. Clamped, the blow crosses the target instead of
+// overshooting it, and every stroke already inside its band is unchanged.
 StrokeStepResult StepStrokeProgram(StrokeCursor& cur, const AttackStyle* sty,
                                    MeleeState& m, float liveAz, float liveEl,
-                                   float dt, const Vec3& right, const Vec3& up,
-                                   const Vec3& fwd);
+                                   float liveDist, float dt, const Vec3& right,
+                                   const Vec3& up, const Vec3& fwd);
 
 // An authored reach offset -> a radius the arm can actually serve. Public
 // because the gates state their expectations in the same band positions the

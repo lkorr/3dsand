@@ -245,8 +245,15 @@ void BeginStrokeProgram(StrokeCursor& cur, const AttackStyle& sty,
 
 StrokeStepResult StepStrokeProgram(StrokeCursor& cur, const AttackStyle* sty,
                                    MeleeState& m, float liveAz, float liveEl,
-                                   float dt, const Vec3& right, const Vec3& up,
-                                   const Vec3& fwd) {
+                                   float liveDist, float dt, const Vec3& right,
+                                   const Vec3& up, const Vec3& fwd) {
+  // THE POINT MAY NOT BE DRIVEN MORE THAN A LITTLE PAST THE TARGET (strokes.h
+  // says why at length). A fifth past it is the follow-through a blow needs to
+  // pass THROUGH what it hits rather than stopping on its surface; beyond that
+  // the weapon is only travelling somewhere the target is not.
+  auto toTarget = [&](float banded) {
+    return liveDist > 0.0f ? std::min(banded, liveDist * 1.2f) : banded;
+  };
   // The start bow: a deterministic wobble on where the windup lands, so ten
   // swings do not look stamped. Zero for a guard, which has no style behind
   // it — and zero for the player's styles, which author `jitter` at 0 so a
@@ -303,7 +310,7 @@ StrokeStepResult StepStrokeProgram(StrokeCursor& cur, const AttackStyle* sty,
       // an arm sits at when it is neither chambered nor extended, so an
       // authored `reach` of 0 is "wherever a guard holds it" and the offsets
       // are readable as what they are.
-      cur.wantReach = StrokeReachIn(m, sty->windup.reach);
+      cur.wantReach = toTarget(StrokeReachIn(m, sty->windup.reach));
       steerTo(cur.wantAz, cur.wantEl, cur.wantReach);
       if (++cur.phaseTick >= cur.windupTicks) {
         // ---- COMMIT. The aim is frozen HERE and never refreshed: a target
@@ -326,7 +333,8 @@ StrokeStepResult StepStrokeProgram(StrokeCursor& cur, const AttackStyle* sty,
       // of one displaced by however much the arm fell short.
       const float toAz = cur.aimAz + 0.5f * sty->cut.az;
       const float toEl = cur.aimEl + 0.5f * sty->cut.el;
-      const float toR = StrokeReachIn(m, sty->windup.reach + sty->cut.reach);
+      const float toR =
+          toTarget(StrokeReachIn(m, sty->windup.reach + sty->cut.reach));
       const int left = std::max(1, cur.cutTicks - cur.phaseTick);
       const MeleeTuning& t = m.tuning;
       smp.dx = ((toAz - m.StrokeAz()) / (float)left) / t.aimGainX;

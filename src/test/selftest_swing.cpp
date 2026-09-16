@@ -2288,7 +2288,8 @@ Status GatePlayerStyles(Ctx& c, std::string& detail) {
           melee.ClearKeepOut();
       }
       const StrokeStepResult r =
-          StepStrokeProgram(cur, &sty, melee, 0.0f, 0.0f, kTickDt, kR, kU, kF);
+          StepStrokeProgram(cur, &sty, melee, 0.0f, 0.0f, 0.0f, kTickDt,
+                            kR, kU, kF);
       if (r == StrokeStepResult::Finished) cur.Reset();
       avatar.SetWeaponPose(melee.Pose());
       avTick();
@@ -2645,7 +2646,8 @@ Status GatePlayerUnarmed(Ctx& c, std::string& detail) {
           melee.ClearKeepOut();
       }
       const StrokeStepResult r =
-          StepStrokeProgram(cur, &sty, melee, 0.0f, 0.0f, kTickDt, kR, kU, kF);
+          StepStrokeProgram(cur, &sty, melee, 0.0f, 0.0f, 0.0f, kTickDt,
+                            kR, kU, kF);
       if (r == StrokeStepResult::Finished) cur.Reset();
       avatar.SetWeaponPose(melee.Pose());
       avTick();

@@ -1003,6 +1003,14 @@ class MeleeState {
   // `bladeLen_` is the rig's own hand-to-point distance.
   Vec3 armHand_{}, armTip_{}, armFlat_{};
   float armReach_ = 0, bladeLen_ = 0;
+
+ public:
+  // The rig's own hand-to-point distance, as the driver last received it. The
+  // follow-through arc scales with it (melee.cpp, Slash), so a diagnostic that
+  // cannot see it cannot tell a bladeless weapon from a mis-seeded one.
+  float BladeLength() const { return bladeLen_; }
+
+ private:
   bool armValid_ = false;
   // The head keep-out sphere (SetKeepOut). World-frame offset from the
   // shoulder; 0 radius = no sphere = clamp off.

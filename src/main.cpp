@@ -8371,9 +8371,12 @@ int main(int argc, char** argv) {
                 // liveAz/liveEl = (0, 0): the camera IS the aim, so every
                 // strike's mid-travel passes through the crosshair line.
                 const bool wasCutting = playerStrike.Cutting();
+                // liveAz/liveEl/liveDist = 0: the CAMERA is the aim, so
+                // every strike's mid-travel passes through the crosshair line
+                // and there is no target distance to bound the reach with.
                 const StrokeStepResult r = StepStrokeProgram(
-                    playerStrike, sty, melee, 0.0f, 0.0f, kTickDt, swRight,
-                    swUp, swFwd);
+                    playerStrike, sty, melee, 0.0f, 0.0f, 0.0f, kTickDt,
+                    swRight, swUp, swFwd);
                 stepped = r != StrokeStepResult::Idle;
                 strikeCutEdge = playerStrike.Cutting() && !wasCutting;
                 if (r == StrokeStepResult::Finished) {
