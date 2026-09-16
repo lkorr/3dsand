@@ -2096,6 +2096,174 @@ int NaturalDef(const MobSystem& mobs, const char* preferName) {
 }
 
 // =============================================================================
+// zombie-draw — WHAT DOES A ZOMBIE ACTUALLY SWING, running its own AI
+// =============================================================================
+//
+// THE HARNESS THAT DID NOT EXIST, and its absence is why "the zombie is just
+// punching" survived two fixes aimed at it. Everything else in this file either
+// forces a named style (`ForceAttack`, `--shot-strike`) or asks the draw with a
+// distance the fixture chose -- so the one question the owner keeps asking,
+// "left to itself, at the range it actually stands at, what does it pick?", had
+// no instrument at all. A bare "it punches" has four causes that look identical
+// from outside (the jaws unusable, the bites out of reach, the fallback group
+// not being dropped, the profile not listing them) and eliminating them one per
+// run is what CLAUDE.md rule 6 forbids.
+//
+// So: a real zombie on the real `zombie` profile, chasing a real target, with
+// its own cadence and its own band, and a HISTOGRAM of what came out plus the
+// reach table that explains it.
+Status GateZombieDraw(Ctx& c, std::string& detail) {
+  IdCounterScope idScope(c.mobs);
+  bool ok = true;
+  int checks = 0;
+  auto check = [&](bool cond, const std::string& what) {
+    checks++;
+    if (!cond) {
+      ok = false;
+      std::printf("zombie-draw: FAILED %s\n", what.c_str());
+    }
+  };
+
+  Stage st = OpenStage(c);
+  if (!st.ok) {
+    detail = st.why;
+    std::printf("zombie-draw: SKIP (%s)\n", detail.c_str());
+    return Status::Skip;
+  }
+  // BY NAME AND NO FALLBACK. `NaturalDef` silently returns the FIRST def with a
+  // natural block when the preferred name has none, so a gate that asked it for
+  // "zombie" and got `human` would test the wrong creature and say nothing --
+  // the fixture-that-measures-itself trap, and this gate exists because of one.
+  int zdef = -1;
+  for (size_t i = 0; i < c.mobs.Defs().size(); i++)
+    if (c.mobs.Defs()[i].name == "zombie") zdef = (int)i;
+  if (zdef < 0 || c.mobs.Defs()[(size_t)zdef].natural.empty()) {
+    detail = zdef < 0 ? "no mob def named \"zombie\""
+                      : "the zombie def declares no `natural` block";
+    std::printf("zombie-draw: SKIP (%s)\n", detail.c_str());
+    CloseStage(c);
+    return Status::Skip;
+  }
+  const MobDef& nd = c.mobs.Defs()[(size_t)zdef];
+
+  std::string why;
+  // Spawned at the far edge of the zombie's own sight (34) so the run covers
+  // the APPROACH as well as the standing fight: the draw is a function of
+  // distance, and a fixture parked at one range only ever asks about that one.
+  const uint64_t biter =
+      SpawnFighter(c, zdef, {st.spot.x, st.spot.y + 1, st.spot.z}, "zombie",
+                   false, why);
+  // THE VICTIM IS A HUMAN, not a second zombie: the creature the owner is
+  // asking about is the PLAYER, whose avatar is the human rig, and a zombie
+  // prey brings its own `undead` death rules into a gate about the attacker.
+  int hdef = -1;
+  for (size_t i = 0; i < c.mobs.Defs().size(); i++)
+    if (c.mobs.Defs()[i].name == "human") hdef = (int)i;
+  const uint64_t prey = SpawnFighter(
+      c, hdef >= 0 ? hdef : zdef, {st.spot.x, st.spot.y + 1, st.spot.z + 9},
+      "training_dummy", false, why);
+  if (biter == 0 || prey == 0) {
+    detail = why.empty() ? "fixture spawn failed" : why;
+    std::printf("zombie-draw: SKIP (%s)\n", detail.c_str());
+    CloseStage(c);
+    return Status::Skip;
+  }
+  Ticker tick{c, 26400, {st.spot.x >> 4, st.spot.y >> 4, st.spot.z >> 4}};
+  for (int i = 0; i < 20; i++) tick();
+
+  // THE REACH TABLE, ONCE, BEFORE ANYTHING SWINGS. This is the half that
+  // explains the histogram below: a style the draw never returns is either
+  // unusable or out of reach, and those are different bugs.
+  const Mob* zm = c.mobs.FindMobById(biter);
+  const StyleLibrary& lib = c.mobs.AttackStyles();
+  std::string reachTable;
+  int usableReal = 0;
+  const ai::Profile* zpr = c.mobs.Behaviors().At(c.mobs.Behaviors().Find("zombie"));
+  if (zm != nullptr && zpr != nullptr) {
+    for (const std::string& n : zpr->attack.styles) {
+      const AttackStyle* s = lib.At(lib.Find(n));
+      if (s == nullptr) { reachTable += " " + n + "=NOSTYLE"; continue; }
+      const bool u = StyleUsable(*zm, *s);
+      const float r = StyleReachOn(*zm, *s);
+      if (u && !s->fallback) usableReal++;
+      reachTable += Format(" %s%s=%.1f%s", n.c_str(), s->fallback ? "(fb)" : "",
+                           r, u ? "" : "/UNUSABLE");
+    }
+  }
+  check(usableReal > 0,
+        "at least one NON-fallback style (a bite) is usable on a live zombie");
+
+  // ---- THE RUN: its own AI, its own cadence, its own band ----------------
+  std::map<std::string, int> drawn;
+  int strokes = 0, cutTicks = 0;
+  float minDist = 1e9f, maxDist = 0;
+  bool wasActive = false;
+  int goneBiter = 0, gonePrey = 0, alive = 0;
+  const int ticks = (int)BaselineNumber("zombieDraw.aiTicks", 600);
+  for (int i = 0; i < ticks; i++) {
+    tick();
+    const Mob* m = c.mobs.FindMobById(biter);
+    const Mob* p = c.mobs.FindMobById(prey);
+    // NOT `break`. A fixture that stops on the first missing frame reports a
+    // correct measurement of nothing and hides WHICH of the two went: the prey
+    // dying of its own bites is the feature working, the biter vanishing is a
+    // broken fixture. Both are counted and said out loud.
+    if (m == nullptr) { goneBiter++; continue; }
+    if (p == nullptr) { gonePrey++; continue; }
+    alive++;
+    const Vec3 d = m->Origin() - p->Origin();
+    const float dist = Vec3{d.x, 0, d.z}.len();
+    minDist = std::min(minDist, dist);
+    maxDist = std::max(maxDist, dist);
+    const NpcStroke* s = c.mobs.MobStroke(biter);
+    if (s == nullptr) continue;
+    if (s->Cutting()) cutTicks++;
+    const bool active = s->Active() && s->phase != NpcStroke::Phase::Guard;
+    if (active && !wasActive && s->style >= 0) {
+      strokes++;
+      const AttackStyle* as = lib.At(s->style);
+      drawn[as != nullptr ? as->name : "?"]++;
+    }
+    wasActive = active;
+  }
+
+  int bites = 0, punches = 0;
+  for (const auto& kv : drawn) {
+    const AttackStyle* as = lib.At(lib.Find(kv.first));
+    if (as == nullptr) continue;
+    (as->fallback ? punches : bites) += kv.second;
+  }
+  std::string hist;
+  for (const auto& kv : drawn) hist += " " + kv.first + "=" + std::to_string(kv.second);
+
+  RecordObserved("zombieDraw.strokes", (double)strokes);
+  RecordObserved("zombieDraw.bites", (double)bites);
+  RecordObserved("zombieDraw.punches", (double)punches);
+
+  check(strokes > 0, "the zombie swung at all over the run");
+  // THE CLAIM THE OWNER IS MAKING. A zombie's bites are NOT fallback and its
+  // punches are, so PickAttackStyle drops the punches as a GROUP the moment a
+  // bite survives the usability+reach filter. Punches outnumbering bites means
+  // the bites are being filtered out at the range this creature actually
+  // fights at -- which is exactly "it is just punching".
+  check(bites > 0, "...and at least one of those swings was a BITE");
+  check(bites >= punches,
+        "...with bites not outnumbered by the fallback punches");
+
+  std::printf(
+      "zombie-draw: %d strokes over %d ticks (%d both-alive, biter gone %d, prey "
+      "gone %d), distance %.1f..%.1f, %d cut ticks |%s | reaches:%s\n",
+      strokes, ticks, alive, goneBiter, gonePrey, alive ? minDist : 0.0f,
+      maxDist, cutTicks, hist.c_str(), reachTable.c_str());
+
+  CloseStage(c);
+  detail = Format("%d strokes: %d bites, %d punches;%s", strokes, bites,
+                  punches, reachTable.c_str());
+  std::printf("zombie-draw: %s (%d checks)\n", ok ? "PASS" : "FAIL", checks);
+  return ok ? Status::Pass : Status::Fail;
+}
+
+// =============================================================================
 // unarmed-attack — a fist is a weapon, and losing one costs a style
 // =============================================================================
 Status GateUnarmedAttack(Ctx& c, std::string& detail) {
@@ -2937,6 +3105,7 @@ const std::vector<Gate>& CombatGates() {
       {"unarmed-attack", "mob", {}, false, GateUnarmedAttack},
       {"lunge", "mob", {}, false, GateLunge},
       {"bite-target", "mob", {}, false, GateBiteTarget},
+      {"zombie-draw", "mob", {}, false, GateZombieDraw},
       // ---- the directional flinch (mob.h Mob::HitReact) -------------------
       // Spawns one passive dummy and hits it twice through the ordinary
       // MobSystem entry point. Same shape as the ones above — id scope in,

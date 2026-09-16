@@ -486,7 +486,7 @@ const char* const kOrder[] = {
     // stands an avatar on real terrain — so they go after everything except
     // `voxregion`, which owns the residency window. Each restores the id
     // counter and regenerates worldgen on the way out.
-    "unarmed-attack", "lunge", "bite-target", "player-unarmed",
+    "unarmed-attack", "lunge", "bite-target", "zombie-draw", "player-unarmed",
     // ...and the directional flinch, appended by the same rule as the four
     // above and for the same reason: it spawns a creature. It is the most
     // easily perturbed of the group — its whole measurement is a differential

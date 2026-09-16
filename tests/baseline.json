@@ -402,6 +402,7 @@
   "lunge.pronePlanarObserved": "0",
   "lunge.uprightRiseObserved": "0",
   "bite-target": "pass",
+  "zombie-draw": "pass",
   "biteTarget.bites": "40",
   "biteTarget.tagsObserved": "0",
   "biteTarget.headFractionObserved": "0",

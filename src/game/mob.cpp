@@ -3243,6 +3243,15 @@ static void NpcStrokeSmoothing(MeleeTuning& t) {
 //
 // So: a bitmask per mob id, one bit per reason, cleared when the creature
 // dies or the system resets. Content errors are said exactly once each.
+// SANDVOX_STYLE_DEBUG=1 — read once. See the readout in BeginStroke.
+static bool StyleDebugOn() {
+  static const bool on = [] {
+    const char* e = std::getenv("SANDVOX_STYLE_DEBUG");
+    return e != nullptr && *e && *e != '0';
+  }();
+  return on;
+}
+
 void MobSystem::ReportNoStroke(const Mob& mob, const ai::Profile* pr,
                                int reason, const char* detail) {
   uint8_t& seen = strokeGripe_[mob.id_];
@@ -3390,6 +3399,32 @@ void MobSystem::BeginStroke(Mob& mob, const ai::AttackRequest& req,
                          : pr->attack.styles[0].c_str());
     }
     return;
+  }
+  // ---- SANDVOX_STYLE_DEBUG=1: WHY THIS STYLE AND NOT THE OTHERS ----------
+  //
+  // `ReportNoStroke` only speaks when NOTHING was drawn, so the far more
+  // confusing case -- a creature that DOES swing, with the wrong thing, every
+  // time -- printed nothing at all. "The zombie is just punching" is a bare
+  // observation with at least four causes that look identical from outside
+  // (the jaws not usable, the bites out of reach, the fallback group not being
+  // dropped, the profile not listing them), and eliminating them one per run
+  // is exactly what CLAUDE.md rule 6 forbids. One line per style says which.
+  if (StyleDebugOn()) {
+    std::printf("mob %llu (\"%s\") draws \"%s\" at %.2f (+%.2f body):",
+                (unsigned long long)mob.id_, pr->name.c_str(),
+                styles_.At(si)->name.c_str(), req.distance, slack);
+    for (const std::string& n : pr->attack.styles) {
+      const AttackStyle* s = styles_.At(styles_.Find(n));
+      if (s == nullptr) { std::printf("  %s=NOSTYLE", n.c_str()); continue; }
+      const bool usable = StyleUsable(mob, *s);
+      const float r = usable ? StyleReachOn(mob, *s) : 0.0f;
+      const char* verdict =
+          !usable ? "unusable"
+                  : (r > 0.0f && req.distance > r + slack ? "TOO FAR" : "ok");
+      std::printf("  %s%s[reach %.2f %s]", n.c_str(),
+                  s->fallback ? "(fb)" : "", r, verdict);
+    }
+    std::printf("\n");
   }
   const AttackStyle& sty = *styles_.At(si);
   // ---- ITS OWN REACH, BEFORE ANYTHING ELSE (plan §5) ---------------------
