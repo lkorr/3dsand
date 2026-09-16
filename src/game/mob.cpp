@@ -3315,13 +3315,50 @@ void MobSystem::BeginStroke(Mob& mob, const ai::AttackRequest& req,
   // The profile's authored list; `style` is the single-entry spelling of the
   // same thing (ai_behavior.cpp's loader folds one into the other), so a
   // profile written before styles were plural still works.
-  const int si =
-      PickAttackStyle(styles_, pr->attack.styles, mob.id_, tick, &mob);
+  // ---- THE DRAW KNOWS HOW FAR IT IS (2026-09-16) --------------------------
+  //
+  // `distance` and the body's slack go INTO the draw now, so the style that
+  // comes back is one that can actually arrive. It used to be a uniform roll
+  // over everything usable, re-checked against the SAME two numbers twenty
+  // lines below and thrown away on a mismatch — which meant a creature whose
+  // repertoire is long and short (a zombie's lunging bite beside its standing
+  // one) silently binned a share of its swings equal to the share of short
+  // styles in its list, every cadence, forever. See PickAttackStyle.
+  const float slack =
+      mob.Def() != nullptr ? mob.Def()->worldSize.z * 0.5f : 1.0f;
+  const int si = PickAttackStyle(styles_, pr->attack.styles, mob.id_, tick,
+                                 &mob, req.distance, slack);
   if (si < 0) {
-    ReportNoStroke(mob, pr, 1,
-                   pr->attack.styles.empty()
-                       ? "the profile lists no styles"
-                       : pr->attack.styles[0].c_str());
+    // TWO DIFFERENT SILENCES, TOLD APART. "Nothing is usable" is a rig or a
+    // content fault; "nothing reaches" is a POSITIONING fault, and until now
+    // the second one printed nothing at all while being by far the more common
+    // (CLAUDE.md rule 6: record at the point of failure, and a bare "the NPC
+    // does not attack" has four causes that look identical from outside).
+    const bool anyUsable = [&] {
+      for (const std::string& n : pr->attack.styles) {
+        const AttackStyle* s = styles_.At(styles_.Find(n));
+        if (s != nullptr && StyleUsable(mob, *s)) return true;
+      }
+      return false;
+    }();
+    if (anyUsable && req.distance > 0.0f) {
+      // `StrikeReachOf`, NOT `AttackReachOf`. The latter has the profile's
+      // authored reach as a floor under it, so it reports the number the AI
+      // COMMITTED on rather than the number that did the refusing — which is
+      // the one fact this line exists to carry. Printing the floor here said
+      // "longest usable 10.0" for a creature holding a 2.2-voxel dagger.
+      char why[128];
+      std::snprintf(why, sizeof(why),
+                    "target at %.1f, longest drawable %.1f (+%.1f body), "
+                    "committed on %.1f",
+                    req.distance, StrikeReachOf(mob), slack, AttackReachOf(mob));
+      ReportNoStroke(mob, pr, 2, why);
+    } else {
+      ReportNoStroke(mob, pr, 1,
+                     pr->attack.styles.empty()
+                         ? "the profile lists no styles"
+                         : pr->attack.styles[0].c_str());
+    }
     return;
   }
   const AttackStyle& sty = *styles_.At(si);
@@ -3341,9 +3378,12 @@ void MobSystem::BeginStroke(Mob& mob, const ai::AttackRequest& req,
   // ZERO cut ticks, every one refused for being a fraction of a voxel out of
   // its own reach. Half a body is the width of the thing being hit, which is
   // the term the estimate is missing.
+  // THE DRAW HAS ALREADY APPLIED THIS (see the note on the pick above), so
+  // reaching it means the two disagreed — which they cannot, since both ask
+  // the same `StyleReachOn` with the same `slack`. Kept as an assertion in
+  // production form: cheap, and it is the seam where a future caller that
+  // picks its own style (a script, a scripted duel) still gets the refusal.
   const float styleReach = StyleReachOn(mob, sty);
-  const float slack =
-      mob.Def() != nullptr ? mob.Def()->worldSize.z * 0.5f : 1.0f;
   if (req.distance > 0.0f && styleReach > 0.0f &&
       req.distance > styleReach + slack)
     return;   // not a content error: this style is simply the wrong one now
@@ -3640,6 +3680,56 @@ float MobSystem::StyleReachOn(const Mob& mob, const AttackStyle& sty) const {
   // ATTACKER'S centre, so the two halves cancel and what is left is the plain
   // sum. Measured, it stood the pair a whole body too far apart.
   return effector + closes;
+}
+
+float MobSystem::StrikeReachOf(const Mob& mob) const {
+  const ai::Profile* pr = behaviors_.At(mob.ai_.profile);
+  if (pr == nullptr) return 0.0f;
+  // THE SAME SUM AS AttackReachOf WITH NO FLOOR UNDER IT, and the whole reason
+  // both exist is that "how far do I commit from" and "where do I stand" are
+  // different questions that had been sharing one number.
+  //
+  // The floor there is what lets an author say "this creature commits from 10"
+  // and have it mean something. It is also the one term that does NOT shrink
+  // when the weapon does, so using it to place the feet stood a dagger-holding
+  // duelist at sword distance and it never swung again. ai_behavior.h
+  // SelfView::strikeReach has the measurement; the band uses this, the commit
+  // gate uses that, and neither is a floor for the other.
+  //
+  // 0 when nothing resolves — "no opinion", which the arbiter reads as "keep
+  // the authored band" rather than as "reach nothing and walk into them".
+  //
+  // ---- AND IT OBEYS THE FALLBACK RULE, BECAUSE THE DRAW DOES --------------
+  //
+  // `PickAttackStyle` drops every fallback style as a GROUP the moment any
+  // non-fallback one is usable, so an armed duelist never throws a punch. A
+  // reach taken over styles including those punches is therefore a reach over
+  // blows this creature will not strike — and since a fist reaches the whole
+  // 5.0-voxel arm, longer than a mace (4.4) or a dagger (2.2) delivers, the
+  // punch WINS THE MAXIMUM for every short weapon in the repo.
+  //
+  // Measured through `ai-reach` before this rule was mirrored here: mace,
+  // dagger and bare fists all reported exactly 5.0 — the arm, three times —
+  // so the band was placed for a punch the creature was never going to throw
+  // and a dagger still stood two voxels outside its own blade. It landed 1 hit
+  // in 420 ticks and took 0 voxels off the target. The band has to be placed
+  // for the blow that will actually be DRAWN, which means this sum and the
+  // draw must filter the same way.
+  float reach = 0.0f, fallbackReach = 0.0f;
+  bool haveReal = false;
+  for (const std::string& n : pr->attack.styles) {
+    const AttackStyle* s = styles_.At(styles_.Find(n));
+    if (s == nullptr) continue;
+    if (!StyleUsable(mob, *s)) continue;
+    const float r = StyleReachOn(mob, *s);
+    if (s->fallback) {
+      fallbackReach = std::max(fallbackReach, r);
+    } else {
+      haveReal = true;
+      reach = std::max(reach, r);
+    }
+  }
+  return haveReal ? reach : fallbackReach;
 }
 
 float MobSystem::AttackReachOf(const Mob& mob) const {
@@ -4044,6 +4134,10 @@ void MobSystem::DecideIntent(Mob& mob, const MobDef& def,
     // the rig are both visible and handed across, exactly as the terrain
     // budgets above it are.
     self.attackReach = AttackReachOf(mob);
+    // ...and the same answer with no authored floor under it, which is what the
+    // FOOTWORK is placed on. Two numbers because they answer two questions —
+    // see MobSystem::StrikeReachOf.
+    self.strikeReach = StrikeReachOf(mob);
 
     ai::GroundView gv;
     gv.haveGround = sense.haveGround;
@@ -7327,6 +7421,172 @@ uint32_t Mob::StainWound(int limbIndex, Vec3 centreLocal, float radiusWorld,
   return StainWoundAs(limbIndex, centreLocal, radiusWorld, seed,
                       def_ ? def_->woundMat : 0u, DefaultSmearMat(), crater,
                       rimCells, wetness);
+}
+
+// ============================================================================
+// A BRUISE DEEPENS (2026-09-16)
+//
+// The blunt mark used to go through `StainWoundAs`, which REWRITES a voxel's
+// material -- and a rewrite is all-or-nothing per cell, so the only place the
+// falloff could live was in the FRACTION of cells rewritten. A punch therefore
+// produced a hash-picked scatter of flat `skin_bruised` voxels, and a second
+// punch produced a different scatter beside the first. Nothing about that reads
+// as a mark on a body; it reads as pixel damage.
+//
+// This is the same geometry writing the BODY COAT instead (phys/bodystain.h):
+// the voxel keeps its material and its art colour, and gains an amount that
+// microbody.wgsl multiplies and lerps over the albedo. So:
+//
+//   * the falloff lives in the AMOUNT -- a bruise is dark at the contact and
+//     fades out at the rim, on the same voxels, instead of being dense at the
+//     centre and sparse at the edge;
+//   * repeat blows ADD (bodystain.h AddBodyStain), so the same patch darkens
+//     in `gore.bruiseStep` increments to a `gore.bruiseMax` ceiling, which is
+//     the "each hit adds 15% up to 75%" the owner asked for;
+//   * and past 60% of that ceiling a blow may break the skin instead of
+//     deepening it, laying the creature's own blood over the worst of it.
+//
+// EVERY VOXEL IN RANGE IS TOUCHED, not a subset -- that is the whole point of
+// moving to an alpha, and it is why there is no coherence draw here the way
+// `StainWoundAs` has one: the mottle a bruise needs is in the per-voxel jitter
+// on the amount, which varies the SHADE rather than punching holes in it.
+uint32_t Mob::BruiseLimb(int limbIndex, Vec3 centreLocal, float radiusWorld,
+                         uint32_t seed, uint32_t bruiseMat, float power) {
+  if (!def_ || limbIndex < 0 || limbIndex >= (int)limbs_.size()) return 0;
+  // Same two exclusions StainWoundAs makes, and for the same reason: a worn
+  // garment and a held sword are borrowed rig slots, and neither bruises.
+  if (IsWornSlot(limbIndex) || limbIndex >= baseLimbs_) return 0;
+  if (bruiseMat == 0 || radiusWorld <= 0.0f) return 0;
+  const auto& gt = CurrentTuning().gore;
+  const uint32_t cap =
+      (uint32_t)std::lround(std::clamp(gt.bruiseMax, 0.0f, 15.0f));
+  if (cap == 0 || gt.bruiseStep <= 0.0f) return 0;
+
+  MobLimb& limb = limbs_[limbIndex];
+  const bool fine = limb.HasFineSkin();
+  const float scale =
+      (float)std::max(1u, fine ? SkinScaleOf(limb) : PhysScaleOf(limb));
+  const Vec3 c = centreLocal * scale;
+  const float r = radiusWorld * scale;
+  const float r2 = r * r;
+  const std::vector<uint8_t>& tissue = def_->tissue;
+  const float pw = std::clamp(power, 0.0f, 1.0f);
+
+  // WHEN IT BREAKS INSTEAD OF DARKENING: at the ceiling, not before it. "Each
+  // hit adds more, up to 80%, and then after that is blood" -- so a voxel that
+  // can still take more bruise takes more bruise, and only a saturated one
+  // rolls. Expressed as a fraction of the cap so lowering `bruiseMax` moves
+  // both together.
+  constexpr float kBruiseBleedAt = 1.0f;
+  const uint32_t bleedFrom = (uint32_t)std::lround((float)cap * kBruiseBleedAt);
+  const uint32_t bloodMat = def_->bleedMat;
+  const float bleedChance =
+      std::clamp(gt.bruiseBleedChance, 0.0f, 1.0f) * pw;
+
+  // The brick must be OWNED before it can be poked, or the poke repaints every
+  // creature sharing the packed model. Same copy-on-write StainWoundAs takes.
+  MicroBodySet* micro = MicroSet();
+  bool poke = false;
+  if (micro && limb.microModel >= 0) {
+    const int own = MicroBodyOwn(*micro, (uint32_t)limb.microModel);
+    if (own >= 0) {
+      limb.microModel = own;
+      limb.carved = true;
+      limb.flipbookModel = -1;
+      poke = true;
+    }
+  }
+
+  uint32_t marked = 0;
+  auto bruise = [&](int vx, int vy, int vz, uint32_t mat, uint16_t curStain,
+                    auto&& setStain) {
+    if (mat == 0) return;
+    // Bone does not bruise: a contusion is a burst capillary bed, and the
+    // hole-shows-bone rule (MobDef::tissue) is the same one that governs here.
+    if (!tissue.empty() && (mat >= tissue.size() || !tissue[mat])) return;
+    const Vec3 d{(float)vx + 0.5f - c.x, (float)vy + 0.5f - c.y,
+                 (float)vz + 0.5f - c.z};
+    const float d2 = d.dot(d);
+    if (d2 >= r2) return;
+    const float t = std::sqrt(d2 / r2);
+    const uint32_t h = Hash3(seed, (uint32_t)(vx * 73856093),
+                             (uint32_t)(vy * 19349663) ^ (uint32_t)(vz * 83492791));
+    // ---- THE FULL STEP AT THE CONTACT, AND A SPECTRUM OUT TO THE RIM -------
+    //
+    // ONE multiplier below 1, not three. The first version was
+    //     step * (1 - t*t) * jitter(0.55..1.0) * (0.5 + 0.5*power)
+    // which is the classic way to author a number that never arrives: each
+    // factor is individually defensible and together they delivered under half
+    // the authored step even at dead centre, so `bruiseStep` never meant what
+    // it said and the coat sat below the renderer's mottle threshold (see
+    // Tuning::Gore::bruiseStep for that arithmetic). POWER IS GONE FROM HERE
+    // ENTIRELY -- it already scales the RADIUS at the call site, and charging
+    // it twice made a glancing blow both smaller AND fainter. Jitter is
+    // narrowed to 0.85..1.0: enough to break the patch up, not enough to eat
+    // the blow.
+    //
+    // What is left is the taper, and it is the one the owner asked for by
+    // name: a mace lands "a spectrum of bruise/wound applied in a circle
+    // radiating outwards in how weakly applied each is". `1 - t*t` is that
+    // circle -- full step at the middle, about three quarters at half the
+    // radius, a fifth at the edge.
+    const float jitter = 0.85f + 0.15f * (float)((h >> 16) & 0xFFu) / 255.0f;
+    const float want = gt.bruiseStep * (1.0f - t * t) * jitter;
+    const uint32_t add = (uint32_t)std::lround(want);
+    if (add == 0) return;
+
+    // ---- ...AND WHERE IT HAS ALREADY GONE AS DARK AS A BRUISE GETS --------
+    const uint32_t curAmt = BodyStainAmt(curStain);
+    const uint32_t curMat = BodyStainMat(curStain);
+    if (bloodMat != 0 && bleedChance > 0.0f && curMat == bruiseMat &&
+        curAmt >= bleedFrom) {
+      const float roll = (float)(h & 0xFFFFu) / 65535.0f;
+      if (roll < bleedChance) {
+        // Blood goes on at the bruise's own depth, not at a cut's: what has
+        // happened is that a deep contusion has broken the skin, and it should
+        // read as continuous with the mark around it rather than as a splash.
+        const uint16_t next =
+            RaiseBodyStain(curStain, bloodMat, std::max(curAmt, add));
+        if (next != curStain) {
+          setStain(next);
+          marked++;
+        }
+        return;
+      }
+    }
+
+    const uint16_t next = AddBodyStain(curStain, bruiseMat, add, cap);
+    if (next == curStain) return;
+    setStain(next);
+    marked++;
+  };
+
+  if (fine) {
+    for (PrefabVoxel& v : limb.skinVoxels)
+      bruise(v.x, v.y, v.z, (uint32_t)(v.material & 0xFFFu), v.stain,
+             [&](uint16_t s) {
+               v.stain = s;
+               if (poke)
+                 MicroBodyPokeStain(*micro, (uint32_t)limb.microModel, v.x, v.y,
+                                    v.z, s);
+             });
+  } else {
+    for (DebrisVoxel& v : limb.voxels)
+      bruise(v.x, v.y, v.z, (uint32_t)(v.payload & 0xFFFu), v.stain,
+             [&](uint16_t s) {
+               v.stain = s;
+               if (poke)
+                 MicroBodyPokeStain(*micro, (uint32_t)limb.microModel, v.x, v.y,
+                                    v.z, s);
+             });
+  }
+  // THE LEDGER OWES A RECOUNT (mob.h LimbCoat). Without this the bruise is
+  // invisible to everything that reads "what is on this creature" — including
+  // the coat DECAY sweep, which walks the ledger's materials and would
+  // therefore never dry a bruise off. A stain written behind the ledger's back
+  // is a stain that is permanent by accident.
+  if (marked) coatDirty_ = true;
+  return marked;
 }
 
 uint32_t Mob::StainWoundAs(int limbIndex, Vec3 centreLocal, float radiusWorld,
@@ -11804,6 +12064,22 @@ bool Mob::BluntHit(uint64_t bodyHandle, const ::BluntHit& hit, World& world,
   // blow, and to fire, and to acid), and a share of the blow arrives on the
   // body whether or not it did.
   if (IsWornSlot(li)) {
+    // ---- A DENT IN A PLATE IS STILL A DENT (2026-09-16) -------------------
+    //
+    // The scope belongs here for exactly the reason Mob::BluntCarveScope
+    // states: A BLUNT HIT NEVER TAKES A LIMB OFF. A worn shell IS a limb slot
+    // (`ld.severable = true`, so a cut STRAP drops the pauldron), and this
+    // branch used to `return` five lines before the flesh branch below
+    // constructed its scope — so the armour carve ran unguarded and the
+    // collapse sever was live against it.
+    //
+    // That is a real severance reached purely by blunt voxel removal, and
+    // `gear.bluntDentRadius` going 1.2 -> 3.0 (commit 5a94954) is what made it
+    // reachable in a couple of blows: once a cuirass is carved below
+    // kLimbCollapseFraction (25%) of its spawn voxels, CarveLimb calls Sever()
+    // and the piece drops off the body. A mace should beat plate IN, and beat
+    // the wearer through it; shearing it off the straps is a blade's job.
+    BluntCarveScope blunt(*this);
     // The host limb's BODY HANDLE, captured before anything can sever the
     // shell: `wornHost` is an INDEX, and an index into a list that a Damage()
     // three lines down may reshape is the classic way to bruise the wrong arm.
@@ -11888,14 +12164,17 @@ bool Mob::BluntHit(uint64_t bodyHandle, const ::BluntHit& hit, World& world,
                limbs_[li].xf.quat[2], limbs_[li].xf.quat[3]};
   const Vec3 local = RotateInv(q, hit.at - limbs_[li].xf.pos);
 
-  // 1. THE BRUISE, first and widest, on skin that is still there. In
-  //    gore.bruiseMat and with NO smear: a punch marks you, it does not
-  //    bloody you (Mob::StainWoundAs).
+  // 1. THE BRUISE, first and widest, on skin that is still there. An
+  //    ACCUMULATING COAT in gore.bruiseMat rather than a rewrite of the skin
+  //    to it: a punch marks you, it does not repaint you, and the mark gets
+  //    darker the more of them land (Mob::BruiseLimb). The radius still scales
+  //    with power so a glancing blow marks a smaller patch; how DARK the patch
+  //    goes is now the step's business, not the radius's.
   const uint32_t bruiseMat =
       sys_ != nullptr ? sys_->MaterialIdNamed(gt.bruiseMat) : 0u;
   if (bruiseMat != 0 && gt.bruiseRadius > 0.0f)
-    StainWoundAs(li, local, gt.bruiseRadius * (0.5f + 0.5f * power),
-                 hit.seed ^ 0xB2015Eu, bruiseMat, /*smearMat=*/0u);
+    BruiseLimb(li, local, gt.bruiseRadius * (0.5f + 0.5f * power),
+               hit.seed ^ 0xB2015Eu, bruiseMat, power);
 
   // 2. THE DENT, only if the weapon has any (a bare fist authors 0 and takes
   //    nothing). CarveLimbRadial soaks the crater it made in the victim's own
@@ -13556,6 +13835,45 @@ uint32_t MobSystem::LimbStainedMatCount(uint64_t mobId, int limbIndex,
       if ((any || (v.payload & 0xFFFu) == (mat & 0xFFFu)) &&
           BodyStainAmt(v.stain) >= minAmt && BodyStainAmt(v.stain) > 0)
         n++;
+  }
+  return n;
+}
+
+// ---- WHAT IS ON THE VOXEL, NOT WHAT THE VOXEL IS ---------------------------
+//
+// `LimbStainedMatCount` above reads `mat` as the voxel's OWN MATERIAL and asks
+// "how many cells made of this carry any coat". That is the right question for
+// "is the bone under the wound bloodied"; it is the wrong one, and silently so,
+// for "how much of this limb is bruised" -- which is a question about the COAT
+// WORD's material (phys/bodystain.h), a different field on the same voxel.
+//
+// The distinction cost a wrong diagnosis on 2026-09-16: `impact-blunt` and
+// `impact-fist` were moved onto the first function when a bruise stopped being
+// a material rewrite, reported "bruised 0" after twenty-four mace blows, and
+// looked exactly like a bruise that was never applied. The bruises were all
+// there. Nothing made of `skin_bruised` was, because that is the whole point of
+// the change.
+uint32_t MobSystem::LimbCoatMatCount(uint64_t mobId, int limbIndex,
+                                     uint32_t coatMat, uint32_t minAmt) const {
+  const Mob* mob = nullptr;
+  for (const Mob& m : mobs_)
+    if (m.id_ == mobId) { mob = &m; break; }
+  if (!mob && avatar_ && avatar_->id_ == mobId) mob = avatar_;
+  if (!mob || limbIndex < 0 || limbIndex >= (int)mob->limbs_.size()) return 0;
+  const MobLimb& l = mob->limbs_[limbIndex];
+  const bool any = coatMat == 0xFFFFFFFFu;
+  uint32_t n = 0;
+  auto hit = [&](uint16_t stain) {
+    const uint32_t amt = BodyStainAmt(stain);
+    return amt > 0 && amt >= minAmt &&
+           (any || BodyStainMat(stain) == (coatMat & 0xFFFu));
+  };
+  if (l.HasFineSkin()) {
+    for (const PrefabVoxel& v : l.skinVoxels)
+      if (hit(v.stain)) n++;
+  } else {
+    for (const DebrisVoxel& v : l.voxels)
+      if (hit(v.stain)) n++;
   }
   return n;
 }
@@ -15371,6 +15689,15 @@ bool StyleUsable(const Mob& who, const AttackStyle& sty) {
   if (sty.weapon.empty() || sty.weapon == "held") return who.HeldSlot() >= 0;
   const MobNaturalWeaponDef* nw = who.NaturalWeaponNamed(sty.weapon);
   return nw != nullptr && who.NaturalWeaponUsable(*nw);
+}
+
+// The vocabulary's OTHER rig question (strokes.h says why it is declared
+// there). A forward, not a second implementation: one answer to "how far does
+// this style reach on this body", so the draw that filters on it and the
+// refusal that re-checks it can never disagree.
+float StyleReachOn(const Mob& who, const AttackStyle& sty) {
+  const MobSystem* sys = who.Sys();
+  return sys != nullptr ? sys->StyleReachOn(who, sty) : 0.0f;
 }
 
 // ---- the weapon arm, shared by both animation drivers -----------------------

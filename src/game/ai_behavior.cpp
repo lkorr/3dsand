@@ -611,6 +611,58 @@ bool Think(Brain& brain, const Library& lib, const SelfView& self,
   // only at the outer edge, so HoldRange gives ground without needing an
   // intent of its own.
   float lo = pr.movement.rangeMin, hi = pr.movement.rangeMax;
+
+  // ---- THE BAND FOLLOWS THE WEAPON (2026-09-16) ---------------------------
+  //
+  // An authored band is a CHARACTER — "I like to fight four voxels wide, at
+  // arm's length, and step off after" — and it was being read as a fixed pair
+  // of distances. Those are not the same claim, and the difference is every
+  // reported symptom of a passive AI: `duelist` authors 7..11 because a SWORD
+  // lands at about 9, and hands the same 7..11 to a creature holding a dagger
+  // that lands at 3.5. It then stands at 9 and swings at nothing, because
+  // `BeginStroke` refuses a style the target is outside the reach of and the
+  // profile's own `attack.reach` floor (see SelfView::strikeReach) keeps
+  // saying the range is fine.
+  //
+  // So the band is slid INSIDE what this body can actually hit: keep its
+  // authored WIDTH and drop its CEILING onto strike distance. Width is the
+  // character and survives; the distances are facts about the weapon and do
+  // not.
+  //
+  // THE CEILING RATHER THAN THE MIDDLE, and that is the second version of this
+  // rule. Anchoring the MIDDLE was tried first and left the top half of the
+  // band outside the weapon — which sounds harmless and is not, because the
+  // disengage window below lifts the floor to the ceiling after every swing.
+  // A creature therefore spent `disengageTicks` of every cadence parked at
+  // exactly the one edge of its band it could not strike from, and committed
+  // from there as often as not. Measured through `ai-reach`: bare fists, reach
+  // 5.0 plus 1.1 of body, settled at 6.3 and landed ONE hit in 420 ticks. The
+  // honest statement is "wherever in my band I am standing, I can hit you",
+  // and only the ceiling expresses it.
+  //
+  // `+ half a body depth` is the same slack `BeginStroke` forgives, and for
+  // the same reason: `StrikeReachOf` estimates a centre-to-centre distance for
+  // a surface-to-surface event, so the victim's own width is the term it is
+  // missing. Matching the two means the band's far edge lands exactly on the
+  // last distance a swing is accepted from instead of a hair outside it.
+  //
+  // INWARD ONLY, deliberately: a creature must never be pushed FURTHER out
+  // than its author asked. A zombie's longest drawable style is a 23-voxel
+  // lunging bite, and widening its band onto that would have it orbit at 23
+  // and pounce from across a field — a different creature. It keeps 2..7.
+  if (self.strikeReach > 0.0f && hi > lo) {
+    const float ceiling = self.strikeReach + self.size.z * 0.5f;
+    if (hi > ceiling) {
+      const float shift = hi - ceiling;
+      // The floor may reach 0 — two bodies are held apart by ApplyCrowdSpacing
+      // anyway, so a band that asks for contact gets as close as the spacing
+      // rule permits and no closer. It must not INVERT, though: hi is pinned
+      // above lo so the Schmitt trigger below still has a band to trigger on.
+      lo = std::max(0.0f, lo - shift);
+      hi = std::max(lo + 0.5f, hi - shift);
+    }
+  }
+
   const bool disengaging = tick < brain.disengageUntil;
   if (disengaging && hi > 0) lo = hi;
   const float d = brain.targetDist;

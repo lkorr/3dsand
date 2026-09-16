@@ -55,6 +55,21 @@ struct StainLattice {
 // subtractive rule). Returns the coat word.
 uint16_t RaiseBodyStain(uint16_t cur, uint32_t mat, uint32_t amt);
 
+// ---- ...AND THE OTHER WAY A COAT GETS DEEPER --------------------------------
+//
+// ADD `add` to what is already there, capped at `cap`. `RaiseBodyStain` above
+// is a MAXIMUM and that is right for a splash -- being bled on twice does not
+// make you twice as red, because the second splash is the same blood at the
+// same strength. A BRUISE is the other shape entirely: it is an injury that
+// ACCUMULATES, and asking Raise to express it would peg it at one blow's worth
+// forever however many landed.
+//
+// The cross-material rule is Raise's, unchanged: a different coat already in
+// place is only repainted by a strictly larger amount, so a bruise spreading
+// under blood does not wash the blood off. Returns the coat word; `cur` when
+// already at or past the cap, which is what makes the ceiling cheap to test.
+uint16_t AddBodyStain(uint16_t cur, uint32_t mat, uint32_t add, uint32_t cap);
+
 // ---- DISTANCE TO WHAT THE CARVE ACTUALLY TOOK -------------------------------
 //
 // A BALL ROUND A CENTROID IS NOT A CRATER. The blast crater's predicate removes

@@ -1148,9 +1148,51 @@ struct Tuning {
     // BRUISING. How far a punch discolours the skin around it, in world
     // voxels, at full power -- scaled by (0.5 + 0.5 * power), so even a
     // glancing hit marks. There is no lower bound on how many blows this
-    // takes: repeat hits deepen the same patch because the rewrite is keyed on
+    // takes: repeat hits deepen the same patch because the coat is keyed on
     // the lattice position, exactly as the blood soak is.
     float bruiseRadius = 0.9f;
+    // ---- A BRUISE IS AN ALPHA THAT DEEPENS, NOT A REPAINT (2026-09-16) -----
+    //
+    // It used to REWRITE the skin voxel to `bruiseMat`, and that is why it
+    // looked wrong: the rewrite is all-or-nothing per voxel, so the falloff had
+    // nowhere to go but into a hash-picked SUBSET of the cells in the radius.
+    // One blow left a scatter of flat purple voxels, the next left a different
+    // scatter, and the result read as speckled damage rather than as a mark.
+    //
+    // It is a BODY COAT now (phys/bodystain.h): the voxel keeps its material
+    // and its art colour, and carries a 0..15 amount that microbody.wgsl
+    // multiplies and lerps over the albedo. Every blow ADDS `bruiseStep` to
+    // whatever is already there, so the same patch darkens in even steps and
+    // the falloff lives in the AMOUNT where it belongs.
+    //
+    // TWO PUNCHES TO A FULL BRUISE: 6 of 15 is 40%, so the contact goes to 40%
+    // on the first blow and 80% on the second, and the third is blood.
+    //
+    // IT WAS 2.25 (15% a blow) AND THAT WAS INVISIBLE, which is worth writing
+    // down because the arithmetic is not obvious from here. The renderer does
+    // not draw `amt` directly: `microbody.wgsl` bodyStainTint thresholds it
+    // against a value-noise mottle first --
+    //     cover = (amt/15 * (1 + stainMottle) - mottle * stainMottle) * stainCoverage
+    // -- with `stainMottle` 0.85 and `stainCoverage` 1.35. At amt 2 that is
+    // (0.246 - 0.85 * mottle) * 1.35, which is NEGATIVE for any voxel whose
+    // mottle exceeds 0.29: about seven voxels in ten drew nothing at all, and
+    // the rest drew a cover of ~0.2. The owner's report was "I don't see any
+    // bruising at all", and that is why. At amt 6 the same expression clears
+    // zero for ~87% of voxels; at 12 it saturates. A coat amount below about a
+    // quarter of full is not a faint stain in this renderer, it is no stain.
+    float bruiseStep = 6.0f;
+    // ...AND IT STOPS SHORT OF OPAQUE. 12 of 15 is 80%: deep purple, and still
+    // short of the flat stain colour that would cost the anatomy underneath.
+    // What happens past here is not a darker bruise, it is blood.
+    float bruiseMax = 12.0f;
+    // AND THEN IT BREAKS. Per-voxel chance, at full power, that a blow lays
+    // BLOOD over a voxel ALREADY AT THE CEILING instead of doing nothing --
+    // "each hit adds until 80%, and then after that is blood". A chance rather
+    // than a flip so a hammered limb goes wet in a spreading scatter over
+    // several blows and the two coats interleave the way a real contusion does;
+    // at 0.5 a saturated patch is visibly bloody within two or three further
+    // blows. 0 disables it and leaves a bruise a bruise forever.
+    float bruiseBleedChance = 0.5f;
     // ...and WHAT it discolours the skin to, BY NAME.
     //
     // THE ONE NAME-TYPED TUNING ROW IN THE FILE, and the reason is that it

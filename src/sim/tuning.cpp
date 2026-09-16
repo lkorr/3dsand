@@ -834,6 +834,14 @@ bool LoadTuning(const std::string& path, Tuning& out) {
     // ---- E6. trauma and teeth (game/impact.h) -------------------------------
     ReadF(*g, "bruiseRadius", e.bruiseRadius, out, at);
     e.bruiseRadius = std::clamp(e.bruiseRadius, 0.0f, 8.0f);
+    ReadF(*g, "bruiseStep", e.bruiseStep, out, at);
+    // The coat is a 0..15 nibble, so a step past it is a step to full opacity
+    // in one blow -- legal, and what an author asking for 15 means.
+    e.bruiseStep = std::clamp(e.bruiseStep, 0.0f, 15.0f);
+    ReadF(*g, "bruiseMax", e.bruiseMax, out, at);
+    e.bruiseMax = std::clamp(e.bruiseMax, 0.0f, 15.0f);
+    ReadF(*g, "bruiseBleedChance", e.bruiseBleedChance, out, at);
+    e.bruiseBleedChance = std::clamp(e.bruiseBleedChance, 0.0f, 1.0f);
     // BY NAME, not by id -- see Tuning::Gore::bruiseMat for why. An empty
     // string is legal and means "do not bruise"; an unknown name resolves to 0
     // at use and means the same thing, so there is nothing to clamp here.

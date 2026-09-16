@@ -365,7 +365,7 @@ StrokeStepResult StepStrokeProgram(StrokeCursor& cur, const AttackStyle* sty,
 
 int PickAttackStyle(const StyleLibrary& lib,
                     const std::vector<std::string>& names, uint64_t mobId,
-                    uint32_t tick, const Mob* who) {
+                    uint32_t tick, const Mob* who, float distance, float slack) {
   if (lib.empty()) return -1;
   // RESOLVE BY NAME, THEN FILTER, THEN PICK, and the order is load-bearing at
   // every step.
@@ -382,6 +382,9 @@ int PickAttackStyle(const StyleLibrary& lib,
   //     non-fallback style survived the usability filter, not a per-style
   //     comparison. That is what makes an armed duelist's punches invisible
   //     and a disarmed one's the whole of its repertoire.
+  //   * AND THE REACH FILTER SITS WITH USABILITY, not after the draw. See the
+  //     header: a style that cannot arrive is not a worse choice, it is not a
+  //     choice, and rolling onto one spends the whole cadence on nothing.
   int found[8];
   int n = 0;
   bool haveReal = false;
@@ -390,6 +393,15 @@ int PickAttackStyle(const StyleLibrary& lib,
     const int i = lib.Find(s);
     if (i < 0) continue;
     if (who != nullptr && !StyleUsable(*who, lib.styles[i])) continue;
+    if (who != nullptr && distance > 0.0f) {
+      // A style that reports no reach at all (nothing to measure, no rig
+      // answer) is NOT filtered out: 0 means "unknown", not "zero voxels", and
+      // the same convention the refusal in BeginStroke uses. Being wrong in the
+      // permissive direction here costs one dropped swing; being wrong in the
+      // strict one silently deletes a creature's whole repertoire.
+      const float r = StyleReachOn(*who, lib.styles[i]);
+      if (r > 0.0f && distance > r + slack) continue;
+    }
     found[n++] = i;
     haveReal = haveReal || !lib.styles[i].fallback;
   }

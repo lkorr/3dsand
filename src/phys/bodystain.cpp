@@ -14,6 +14,20 @@ uint16_t RaiseBodyStain(uint16_t cur, uint32_t mat, uint32_t amt) {
   return amt > curAmt ? PackBodyStain(mat, amt) : cur;
 }
 
+uint16_t AddBodyStain(uint16_t cur, uint32_t mat, uint32_t add, uint32_t cap) {
+  if (add == 0 || mat == 0) return cur;
+  cap = std::min<uint32_t>(cap, kBodyStainAmtMax);
+  if (cap == 0) return cur;
+  const uint32_t curAmt = BodyStainAmt(cur), curMat = BodyStainMat(cur);
+  if (curAmt != 0 && curMat != mat) {
+    // Somebody else's coat is here. Same rule Raise uses -- only a strictly
+    // larger amount repaints -- so a deepening bruise never wipes blood off.
+    return add > curAmt ? PackBodyStain(mat, std::min(add, cap)) : cur;
+  }
+  if (curAmt >= cap) return cur;   // already at the ceiling: nothing to add
+  return PackBodyStain(mat, std::min(curAmt + add, cap));
+}
+
 CellDist BuildCellDist(const std::vector<IVec3>& seeds, int pad) {
   CellDist f;
   if (seeds.empty() || pad < 0) return f;

@@ -3114,7 +3114,10 @@ static void SampleSlots(MobSystem& mobs, uint64_t id, int slots,
     s.art = mobs.LimbArtVoxelCount(id, i);
     s.hp = mobs.LimbHp(id, i);
     s.bleed = mobs.LimbBleedBudget(id, i);
-    if (bruiseMat) s.bruise = mobs.LimbMaterialCount(id, i, bruiseMat);
+    // A bruise is a COAT, not a material rewrite (DESIGN.md, "A bruise is an
+    // alpha that deepens"), so counting voxels whose MATERIAL is `bruiseMat`
+    // reports zero on a thoroughly beaten limb. Count the ones wearing it.
+    if (bruiseMat) s.bruise = mobs.LimbCoatMatCount(id, i, bruiseMat, 1);
     if (rotMat) s.rot = mobs.LimbMaterialCount(id, i, rotMat);
     s.stain = mobs.LimbStainCount(id, i, 1);
   }

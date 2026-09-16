@@ -316,6 +316,10 @@ const char* const kOrder[] = {
     // its group, so it inherits state instead of changing what everything
     // after it inherits.
     "ai-dummy", "ai-face", "ai-approach",
+    // ...and `ai-reach` after them, by the same append rule: it spawns and
+    // resets four times over but writes no terrain, so it inherits the world
+    // `ai-approach` restored and hands it on untouched.
+    "ai-reach",
     // ...and the same group's sloped-terrain half, appended last in it for the
     // reason above: `ai-slope` writes a real stone ramp and regenerates on the
     // way out, exactly as `ai-approach` does with its wall.

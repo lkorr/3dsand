@@ -1327,6 +1327,11 @@ class Mob {
   // between four mechanisms that all end in the same ragdoll.
   const char* DeathCause() const { return deathCause_; }
   const MobDef* Def() const { return def_; }
+  // The shared services this creature was spawned against. Public for the same
+  // reason `StyleUsable`/`StyleReachOn` are free functions declared in
+  // strokes.h: the style vocabulary asks questions of a creature, and the
+  // answers happen to live one indirection away. Never null on a spawned mob.
+  MobSystem* Sys() const { return sys_; }
   Vec3 Origin() const { return origin_; }
   float BodyY() const { return bodyY_; }
 
@@ -2470,6 +2475,15 @@ class Mob {
                         uint32_t seed, uint32_t rewriteMat, uint32_t smearMat,
                         const std::vector<IVec3>* crater = nullptr,
                         float rimCells = 0.0f, float wetness = 1.0f);
+  // ---- THE BLUNT MARK, WHICH IS NOT A REWRITE (2026-09-16) ----------------
+  //
+  // Lays an ACCUMULATING body coat over every tissue voxel in range instead of
+  // repainting a hash-picked subset of them, so a bruise is an alpha that
+  // deepens by `gore.bruiseStep` a blow to a `gore.bruiseMax` ceiling and then
+  // may break into blood. See the long note at the definition for why the
+  // rewrite could never look right. Returns voxels whose coat changed.
+  uint32_t BruiseLimb(int limbIndex, Vec3 centreLocal, float radiusWorld,
+                      uint32_t seed, uint32_t bruiseMat, float power);
   // The substance StainWound smears when nobody has said otherwise: the
   // creature's wound material if the palette can draw it, else its blood, else
   // nothing. One function because three call sites wanted the same chain.
@@ -3155,6 +3169,10 @@ class MobSystem {
   // computed here, where both the library and the rig are visible, and handed
   // into `ai::Think` as an INPUT on SelfView.
   float AttackReachOf(const Mob& mob) const;
+  // The same maximum WITHOUT the profile's `attack.reach` as a floor: what this
+  // body can actually hit with right now, 0 for "no opinion". The footwork band
+  // is placed on it (ai_behavior.h SelfView::strikeReach).
+  float StrikeReachOf(const Mob& mob) const;
   // ---- HOW FAR THIS STYLE CAN ACTUALLY LAND (2026-09-15) -----------------
   //
   // World voxels, centre-to-centre, DERIVED FROM THE BODY: the effector's own
@@ -3623,6 +3641,13 @@ class MobSystem {
   uint32_t LimbStainCount(uint64_t mobId, int limbIndex, uint32_t minAmt) const;
   uint32_t LimbStainedMatCount(uint64_t mobId, int limbIndex, uint32_t mat,
                                uint32_t minAmt) const;
+  // ...and the OTHER field on the same voxel: how many cells are WEARING a coat
+  // of `coatMat` (0xFFFFFFFF = any) at `minAmt` or deeper. The one above filters
+  // on what the voxel IS MADE OF; this filters on what is ON it, which is what
+  // "how much of this limb is bruised" means. Mixing the two reports 0 for a
+  // thoroughly bruised limb — see the note at the definition.
+  uint32_t LimbCoatMatCount(uint64_t mobId, int limbIndex, uint32_t coatMat,
+                            uint32_t minAmt) const;
   // The highest WORLD y (voxels) of any voxel of this limb carrying a stain
   // of at least `minAmt`, through the limb's live pose; -1e30 when none. What
   // "a shallow pool stains the ankles and not the thigh" is measured as.

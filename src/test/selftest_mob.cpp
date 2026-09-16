@@ -5149,6 +5149,297 @@ Status GateAiFace(Ctx& c, std::string& detail) {
 }
 
 // ---- ai-approach -----------------------------------------------------------
+// ---- ai-reach --------------------------------------------------------------
+//
+// Owner report, 2026-09-16: NPCs "circle and stay out of reach", a mace swings
+// rarely, a dagger never swings, and a zombie does not bite. Four symptoms, one
+// cause, and NOTHING IN THE SUITE COULD SEE ANY OF IT — which is the first
+// thing this gate is for.
+//
+// The hole was structural rather than an oversight: every MOBILE duelist
+// fixture in the suite equips a sword (AiSpawn does it unasked), and the only
+// unarmed fixture is `swordsman_static`, which is immobile and hand-placed at
+// four voxels. So the suite tested exactly the one configuration that worked.
+// The band and the profile floor are BOTH sword numbers — `duelist` authors
+// reach 10 and a band of 7..11 — and nothing that ever held anything shorter
+// was allowed to move its own feet. Measured: `duel`, `ai-approach`,
+// `npc-styles`, `lunge` and `bite-target` are byte-identical across the fix.
+//
+// THE SUBJECT IS THE COUPLING BETWEEN A WEAPON'S REACH AND A CREATURE'S FEET,
+// so the fixture is the same duelist four times over holding four different
+// lengths of steel, allowed to walk. The claim is that each one closes to
+// somewhere it can actually hit from and then HITS — not that it issues
+// requests, which is what `ai-approach` asserts and which stayed perfectly
+// green through the whole bug. A request that `BeginStroke` drops is
+// indistinguishable from a request that lands unless you count the cuts.
+//
+// The dagger arm is the one that fails without the fix: reach about 3.5 against
+// a band floor of 7, so every swing is refused for being out of its own reach
+// and the creature orbits forever at sword distance. The sword arm is the
+// control in the other direction — it must NOT move, because the band's mid
+// (9.0) already sits on what a sword lands at, and a fix that "improved" the
+// armed case would be retuning every other NPC gate behind this one's back.
+Status GateAiReach(Ctx& c, std::string& detail) {
+  c.debris.Reset();
+  c.mobs.Reset();
+  SubmitWorldgen(c.ctx, c.world, c.sim, kDefaultSeed);
+  c.ctx.WaitIdle();
+
+  const int defIndex = AiHumanoidDef(c.mobs);
+  if (defIndex < 0) {
+    detail = "no mob def publishes a held_right socket";
+    return Status::Fail;
+  }
+  const MobDef& def = c.mobs.Defs()[defIndex];
+  if (c.mobs.Behaviors().Find("duelist") < 0 ||
+      c.mobs.Behaviors().Find("training_dummy") < 0) {
+    detail = "behaviors.json is missing \"duelist\" or \"training_dummy\"";
+    return Status::Fail;
+  }
+
+  int relief = 0;
+  const IVec3 anchor = AiFixtureCentre(c.world);
+  const IVec3 spot = AiFlatSpot(anchor.x, anchor.z, 96, 22, kDefaultSeed, relief);
+  const int gapVox = (int)BaselineNumber("aiReachGapVox", 18);
+  const int ticks = (int)BaselineNumber("aiReachTicks", 420);
+
+  // THE PLAYER IS PUT OUT OF THE WAY. `SetPlayerActor` publishes an actor of
+  // faction "player", and a hostile duelist takes the NEAREST target of another
+  // faction — so a player left at the origin (or left over from an earlier
+  // gate, which is the real hazard in a shared-World suite) silently becomes
+  // the subject and the dummy is never approached at all.
+  c.mobs.ClearPlayerActor();
+
+  struct Arm {
+    const char* name;
+    const char* item;   // nullptr = bare fists
+    // nullptr = the `duelist` humanoid. A named def/profile pair is how the
+    // ZOMBIE arm gets in: its whole repertoire is natural weapons, so it is the
+    // case where "the band follows what you fight with" is not about steel at
+    // all — and it is the one the owner actually reported.
+    const char* defName = nullptr;
+    const char* profile = nullptr;
+    float reach = 0;    // StrikeReachOf, world voxels
+    int requests = 0;
+    int cutTicks = 0;
+    int hits = 0;
+    float settled = 0;  // mean centre-to-centre over the last third of the fight
+    uint32_t lost = 0;  // flesh voxels taken off the dummy
+    float hp0 = 0, hp1 = 0;
+    int killTick = -1;  // >= 0 = the quarry died and the run stopped there
+  };
+  // Longest to shortest, which is also most-likely-to-work to least: the
+  // ordering is not load-bearing but it makes the printed line read as a ramp.
+  Arm arms[] = {{"sword", "sword"},
+                {"mace", "mace"},
+                {"dagger", "dagger"},
+                {"fists", nullptr},
+                // THE BITE. Owner report, verbatim: "the zombies also aren't
+                // biting at all". Same defect seen from the other side — its
+                // list is 50/50 between a 23-voxel lunging bite and a 3.3-voxel
+                // standing one, and the draw was blind to distance, so every
+                // roll that landed on the short one was thrown away by
+                // `BeginStroke` with the 48-tick cadence already spent.
+                {"zombie-bite", nullptr, "zombie", "zombie"}};
+
+  AiTicker tick{c, 7800, {spot.x >> 4, spot.y >> 4, spot.z >> 4}};
+
+  for (Arm& a : arms) {
+    c.mobs.Reset();
+    c.debris.Reset();
+
+    // The quarry first and standing still: `training_dummy` is blind, passive,
+    // immobile and of faction "quarry", so it is a target that never fights
+    // back and never walks out of the measurement.
+    const int tz = spot.z + gapVox;
+    const int th = World::TerrainHeight(spot.x, tz, kDefaultSeed);
+    std::string why;
+    const uint64_t target = c.mobs.Spawn(
+        defIndex, {spot.x - (int)(def.worldSize.x * 0.5f), th + 1,
+                   tz - (int)(def.worldSize.z * 0.5f)});
+    if (target == 0 || !c.mobs.SetMobBehavior(target, "training_dummy")) {
+      detail = std::string("could not place the quarry for arm ") + a.name;
+      return Status::Fail;
+    }
+
+    // ...and the subject, ARMED BEFORE IT IS TICKED. `StrikeReachOf` asks the
+    // LIVE weapon how long it is, so a creature ticked before it is handed its
+    // mace spends those ticks placing its feet for a fist.
+    int attDef = defIndex;
+    if (a.defName != nullptr) {
+      attDef = -1;
+      for (size_t k = 0; k < c.mobs.Defs().size(); k++)
+        if (c.mobs.Defs()[k].name == a.defName) attDef = (int)k;
+      if (attDef < 0) {
+        detail = std::string("no mob def named \"") + a.defName + "\"";
+        return Status::Fail;
+      }
+    }
+    const MobDef& adef = c.mobs.Defs()[attDef];
+    const uint64_t att = c.mobs.Spawn(
+        attDef, {spot.x - (int)(adef.worldSize.x * 0.5f), spot.y + 1,
+                 spot.z - (int)(adef.worldSize.z * 0.5f)});
+    if (att == 0 ||
+        !c.mobs.SetMobBehavior(att, a.profile ? a.profile : "duelist")) {
+      detail = std::string("could not place the attacker for arm ") + a.name;
+      return Status::Fail;
+    }
+    if (a.item != nullptr) {
+      const ItemDef* it = c.items.At(c.items.Find(a.item));
+      if (it == nullptr || !c.mobs.EquipItem(att, it)) {
+        detail = std::string("could not equip \"") + a.item + "\"";
+        return Status::Fail;
+      }
+    }
+    c.mobs.SetHeading(att, 0.0f);
+
+    // A few ticks to settle the rig onto the ground BEFORE the reach is read:
+    // the arm's bone lengths come off a live pose.
+    for (int i = 0; i < 4; i++) tick();
+    if (Mob* m = c.mobs.FindMobById(att)) a.reach = c.mobs.StrikeReachOf(*m);
+
+    const uint32_t flesh0 = [&] {
+      uint32_t n = 0;
+      Mob* m = c.mobs.FindMobById(target);
+      if (m == nullptr) return n;
+      for (int i = 0; i < m->AppendedBase(); i++)
+        if (c.mobs.LimbBody(target, i)) n += c.mobs.LimbVoxelCount(target, i);
+      return n;
+    }();
+
+    a.hp0 = c.mobs.TotalHp(target);
+    // ---- ONLY WHILE THERE IS SOMETHING TO STAND OFF FROM -------------------
+    //
+    // Sampled into a list and truncated at the kill rather than averaged over a
+    // fixed tail, because the tail is not always a fight. Measured: the mace
+    // arm beat the dummy to death around tick 250, the duelist lost its target
+    // (`Perceive` drops a dead one), went idle and drifted — and a last-third
+    // mean reported it "standing off" at 17.7 voxels, which is a reading of a
+    // creature with nobody to fight. A stand-off measured after the duel is
+    // over is not a stand-off.
+    std::vector<float> dists;
+    dists.reserve((size_t)ticks);
+    int prevHit = 0;
+    for (int i = 0; i < ticks; i++) {
+      tick();
+      a.requests += (int)c.mobs.AttackRequests().size();
+      c.mobs.ClearAttackRequests();
+      // CONTACT EVENTS, NOT THE WIDEST SWEEP. `NpcStroke::bodiesHit` is a
+      // per-stroke counter cleared when the stroke resets, so the `max` the
+      // other gates take is the breadth of ONE swing — 20 for a sword crossing
+      // a torso, 1 for a punch — and comparing that number between weapons
+      // measures the shape of the sweep rather than how often the creature
+      // connected. Counting the RISES totals the contacts across every stroke.
+      if (const NpcStroke* s = c.mobs.MobStroke(att)) {
+        if (s->Cutting()) a.cutTicks++;
+        if (s->bodiesHit > prevHit) a.hits += s->bodiesHit - prevHit;
+        prevHit = s->bodiesHit;
+      } else {
+        prevHit = 0;
+      }
+      if (!c.mobs.IsAlive(target)) {
+        a.killTick = i;
+        break;
+      }
+      // THE LIVE POSITIONS OF BOTH. Measured against a SNAPSHOT of the target's
+      // centre first, which quietly turned "how far apart did they fight" into
+      // "how far has the target been knocked from where it started": the mace
+      // arm shoves the dummy across the ground, and the gate reported a
+      // stand-off of 15.3 voxels for two bodies that were touching.
+      dists.push_back(
+          AiPlanar(AiMobCentre(c.mobs, att, adef), AiMobCentre(c.mobs, target, def)));
+    }
+    a.hp1 = c.mobs.IsAlive(target) ? c.mobs.TotalHp(target) : 0.0f;
+    // The last third of the LIVE ticks: the first two are the walk in, and
+    // averaging an 18-voxel approach into the stand-off reports a number the
+    // creature never stood at.
+    if (!dists.empty()) {
+      const size_t from = dists.size() - dists.size() / 3;
+      double s = 0;
+      for (size_t k = from; k < dists.size(); k++) s += dists[k];
+      a.settled = (float)(s / (double)(dists.size() - from));
+    }
+    const uint32_t flesh1 = [&] {
+      uint32_t n = 0;
+      Mob* m = c.mobs.FindMobById(target);
+      if (m == nullptr) return n;
+      for (int i = 0; i < m->AppendedBase(); i++)
+        if (c.mobs.LimbBody(target, i)) n += c.mobs.LimbVoxelCount(target, i);
+      return n;
+    }();
+    a.lost = flesh0 > flesh1 ? flesh0 - flesh1 : 0u;
+  }
+
+  c.mobs.Reset();
+  c.debris.Reset();
+
+  // ---- the claims ---------------------------------------------------------
+  //
+  // ONE PER ARM, AND IT IS ABOUT CUTS RATHER THAN REQUESTS. See the header: the
+  // whole defect lived in the gap between deciding to attack and a swing
+  // existing, so a gate that counts decisions measures the half that was never
+  // broken.
+  //
+  // AND "LANDED" IS NOT "HIT ONCE". The first run of this gate passed on one
+  // body-hit and zero voxels for three of its four arms, which is a creature
+  // that grazed something once in fourteen seconds — the band had moved but
+  // was still placed for a punch the armed creature would never throw
+  // (MobSystem::StrikeReachOf). A fluke contact is exactly what a
+  // marginally-too-far fighter produces, so the floor has to be above one.
+  const int minHits = (int)BaselineNumber("aiReachMinHits", 3);
+  bool allSwung = true, allLanded = true;
+  for (const Arm& a : arms) {
+    if (a.cutTicks <= 0) allSwung = false;
+    if (a.hits < minHits) allLanded = false;
+  }
+  // ...AND THE BLOWS MATTERED. Measured as hp rather than as voxels, because
+  // voxels are not a fair common currency here: a mace authors `cut` 0 and a
+  // dagger's kerf is small enough on purpose ("it will not take an arm off and
+  // it was never going to") that 21 landed hits removed nothing measurable,
+  // while the sword stripped the target's whole 3328. hp is what every one of
+  // the four is trying to do, so hp is the claim they can all be held to.
+  bool allHurt = true;
+  for (const Arm& a : arms)
+    if (!(a.killTick >= 0 || a.hp1 < a.hp0)) allHurt = false;
+  // ...AND THE FEET FOLLOWED THE STEEL. A dagger fighter must stand closer than
+  // a swordsman; without that the arms above could all pass on a fixture that
+  // simply spawned everything within arm's reach. Compared between arms rather
+  // than against a literal, so re-proportioning the rig or re-authoring a blade
+  // moves both sides together.
+  const Arm& sword = arms[0];
+  const Arm& dagger = arms[2];
+  const bool closer = dagger.settled < sword.settled;
+  // The sword arm is the NO-OP CONTROL. `duelist`'s band is 7..11 and its mid
+  // is 9.0; a sword lands at about the same, so the shift is zero and the arm
+  // must still stand in the authored band. A fix that dragged the armed case
+  // inward would be silently retuning `duel`, `crowd` and `ai-approach`.
+  const float tol = (float)BaselineNumber("aiReachBandTolVox", 2.5);
+  const bool swordUnmoved =
+      sword.settled >= 7.0f - tol && sword.settled <= 11.0f + tol;
+
+  RecordObserved("aiReachSwordSettled", (double)sword.settled);
+  RecordObserved("aiReachDaggerSettled", (double)dagger.settled);
+  RecordObserved("aiReachFistCutTicks", (double)arms[3].cutTicks);
+  RecordObserved("aiReachDaggerCutTicks", (double)dagger.cutTicks);
+
+  const bool ok = allSwung && allLanded && allHurt && closer && swordUnmoved;
+  std::string per;
+  for (const Arm& a : arms)
+    per += Format(
+        "%s(reach %.1f: %d req, %d cut, %d hit, hp %.0f->%.0f%s, %u vox, stood "
+        "%.1f) ",
+        a.name, a.reach, a.requests, a.cutTicks, a.hits, a.hp0, a.hp1,
+        a.killTick >= 0 ? Format(" KILLED t%d", a.killTick).c_str() : "",
+        a.lost, a.settled);
+  detail = Format(
+      "%d ticks from %d vox, band [7,11]: %s| every arm swung=%d landed>=%d=%d, "
+      "hurt it=%d, dagger closer than sword=%d, sword still in band=%d",
+      ticks, gapVox, per.c_str(), allSwung ? 1 : 0, minHits,
+      allLanded ? 1 : 0, allHurt ? 1 : 0,
+      closer ? 1 : 0, swordUnmoved ? 1 : 0);
+  return ok ? Status::Pass : Status::Fail;
+}
+
 Status GateAiApproach(Ctx& c, std::string& detail) {
   c.debris.Reset();
   c.mobs.Reset();
@@ -7383,6 +7674,10 @@ const std::vector<Gate>& MobGates() {
       {"ai-dummy", "mob", {}, false, GateAiDummy, /*needsRender=*/false},
       {"ai-face", "mob", {}, false, GateAiFace, /*needsRender=*/false},
       {"ai-approach", "mob", {}, false, GateAiApproach, /*needsRender=*/false},
+      // The coupling between a weapon's LENGTH and where a creature puts its
+      // feet -- the one configuration every fixture above happens to avoid,
+      // because each of them is either armed with a sword or nailed down.
+      {"ai-reach", "mob", {}, false, GateAiReach, /*needsRender=*/false},
       // The sloped-terrain regime the three above never touch: a real ramp,
       // asserting the body stays ON it (never inside it) and does not lean
       // like furniture while climbing.

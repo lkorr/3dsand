@@ -4001,8 +4001,9 @@ replay of the same tick cuts, bruises and tears identically.
 **Blunt is trauma, and it never takes a limb off.** On FLESH `Mob::BluntHit`
 charges hp through the ordinary `Damage` (flinch, hurt cry, and death on a vital
 limb at zero, all unchanged), tops the drip budget up at only
-`gore.bluntBleedScale` of a cut's rate — a punch does not open you — stains a
-BRUISE in `gore.bruiseMat` over `gore.bruiseRadius · (0.5 + 0.5·power)`, and
+`gore.bluntBleedScale` of a cut's rate — a punch does not open you — lays a
+BRUISE in `gore.bruiseMat` over `gore.bruiseRadius · (0.5 + 0.5·power)` (a
+COAT, not a rewrite — see "A bruise is an alpha that deepens" below), and
 removes a voxel only if the weapon authored `bluntCarve`: a shallow radial DENT
 of `gore.bluntCarveRadius · bluntCarve · power`, through the same
 `CarveLimbRadial` an explosion calls, soaked in the victim's own `woundMat` on
@@ -4025,9 +4026,21 @@ shell is strapped to (`MobLimb::wornHost`) as trauma with a bruise, no dent and
 no bleed, whether or not the shell broke — the plate deforming IS how the energy
 arrives, which is the whole difference from a blade. `k` is the shell's own
 hardness against `gear.bluntHardnessRef` floored at `gear.bluntHardnessMin`,
-exactly as the kerf is scaled but referenced at 60 rather than 8: iron keeps
-about 38% of a dent where it keeps 5% of a slot. That is "plate stops swords
-almost entirely; maces go through", as geometry.
+exactly as the kerf is scaled but referenced at 120 rather than 8. That is
+"plate stops swords almost entirely; maces go through", as geometry.
+
+**A dent in a plate is still a dent** (2026-09-16). The shell branch returns
+before the flesh branch below it constructs `Mob::BluntCarveScope`, so for a
+while the armour carve ran UNSCOPED and the collapse sever was live against it:
+a worn slot is `severable` (a cut strap drops the pauldron), so once
+`CarveLimbRadial` had taken a cuirass below `kLimbCollapseFraction` — 25% of its
+spawn voxels — `CarveLimb` called `Sever()` and the piece fell off the body.
+Raising `gear.bluntDentRadius` 1.2 → 3.0 is what brought that inside a couple of
+blows, and from outside it reads as a mace dismembering people. The scope now
+opens at the top of the shell branch as well, so the rule
+`Mob::BluntCarveScope` states — A BLUNT HIT NEVER TAKES A LIMB OFF — holds for
+every slot rather than only for flesh. A mace beats plate IN and beats the
+wearer through it; shearing it off the straps is an edge's job.
 
 **A bite is a tear, and it severs only by collapse.** `Mob::BiteHit` on FLESH
 charges hp, bleeds like a cut (refusing the drip would make a bite read as a
@@ -4045,17 +4058,58 @@ is the single rule separating a bite from a punch. On a SHELL a bite is
 `Mob::StainWound` had the victim's `woundMat` baked into it, which is right for
 a cut and wrong for everything else; it is now a one-line wrapper over
 `Mob::StainWoundAs(limb, centre, radius, seed, rewriteMat, smearMat, ...)`. A
-cut leaves the creature's own blood, a punch leaves `gore.bruiseMat` with no
-smear at all, and a zombie's bite leaves the BITER's `rotflesh` smeared with the
+cut leaves the creature's own blood, a punch leaves `gore.bruiseMat` as a coat
+(below) rather than as a rewrite, and a zombie's bite leaves the BITER's `rotflesh` smeared with the
 biter's `ichor` — the victim's blood does not come into it. Because
 `StainWoundAs` only ever rewrites flesh-class cells (`MobDef::tissue`), a
 nonzero return IS "the tear exposed flesh", which is how an infection knows it
 landed; the material is latched on the limb (`MobLimb::infectMat`) so the heal
-path can tell a wound settling from a substance decaying. All three rewrites dry
+path can tell a wound settling from a substance decaying. The rewrites dry
 BACK through `ReviveWoundVoxel` where `WoundsHeal()` says so, on their own
-clocks — blood and a bruise at `gore.woundHealSlow`, rot at
+clocks — blood at `gore.woundHealSlow`, rot at
 `gore.infectHealSlow` (6.0 against 2.0), because rot living in you is not a
 wound settling. In an undead it never goes away, which is the point.
+
+**A bruise is an alpha that deepens, not a repaint** (2026-09-16;
+`Mob::BruiseLimb`, `AddBodyStain`). It was a rewrite like the other two, and it
+was the wrong shape for what a bruise IS. A rewrite is all-or-nothing per voxel,
+so the only place the falloff could live was in the FRACTION of cells rewritten:
+one blow left a hash-picked scatter of flat `skin_bruised` voxels and the next
+left a different scatter beside it, which reads as pixel damage rather than as a
+mark on a body. It is a BODY COAT now (`phys/bodystain.h`) — the voxel keeps its
+material AND its art colour, and carries a 0..15 amount `microbody.wgsl`
+multiplies and lerps over the albedo, the same blend blood and water already
+use. Three consequences, and they are the whole point: the falloff lives in the
+AMOUNT, so a bruise is dark at the contact and fades at the rim ON THE SAME
+VOXELS; every tissue cell in range is touched rather than a subset, with the
+mottle moved into a per-voxel jitter that varies the SHADE instead of punching
+holes in it; and repeat blows ADD `gore.bruiseStep` (6 of 15 = 40% a hit) to a
+`gore.bruiseMax` ceiling (12 = 80%, short of opaque so the anatomy stays
+readable underneath). So a contact goes 40% on the first punch, 80% on the
+second, and AT the ceiling a further blow rolls `gore.bruiseBleedChance` per
+voxel to lay the creature's own blood there instead — bruising deepens until it
+turns to blood.
+
+**A coat below about a quarter of full draws NOTHING**, which is why the first
+shipped step of 15% a blow was reported as "I don't see any bruising at all".
+`bodyStainTint` does not draw `amt` directly: it thresholds against a
+value-noise mottle first, `cover = (amt/15 · (1 + stainMottle) − mottle ·
+stainMottle) · stainCoverage`, and at `stainMottle` 0.85 an amount of 2 is
+negative for any voxel whose mottle exceeds 0.29 — seven in ten drew clean. The
+applicator compounded it by scaling the authored step by the taper AND a
+0.55..1.0 jitter AND `(0.5 + 0.5·power)`, three factors below one that between
+them delivered under half the authored value at dead centre. Power is now spent
+on the RADIUS only (it was being charged twice), the jitter is narrowed to
+0.85..1.0, and what remains of the taper is the shape the owner asked for by
+name: a mace leaves "a spectrum of bruise/wound applied in a circle radiating
+outwards in how weakly applied each is". Because there is no rewrite there is no `woundWas` entry either, so a
+bruise fades rather than reverting: `skin_bruised` authors `coat.decay` 45 s per
+level, through the same ledger-driven drying sweep that evaporates water.
+`skin_bruised` is also the first SOLID with a stain block, which
+`materials.cpp` used to refuse outright — `"bodyOnly": true` is a material
+saying "I am a coat, never a spill", and it forces the liquid path's `chance`
+and `consume` to zero rather than trusting them, because those only mean
+anything on a soak a solid can never reach.
 
 **Three materials, appended after `blood` so the stain slots keep their
 numbers.** `rotflesh` (solid, greenish, `emission` 70, organic + dissolvable,
@@ -6480,10 +6534,48 @@ gate forcing a punch on a handless body gets `false` and can assert on it.
 the profile's, raised by the longest `reach` among its USABLE styles, so a
 zombie whose head has come off stops standing 22 voxels away waiting to bite —
 and it is handed to `ai::Think` on `ai::SelfView::attackReach`, exactly as the
-creature's own step-up and headroom budgets are. `BeginStroke` then refuses a
-drawn style whose own reach the target is outside, which stops a zombie that has
-closed to 14 voxels swinging a 9-voxel punch at air; that refusal says nothing,
-because it is not a content error. One that IS is loud: `ReportNoStroke` prints
+creature's own step-up and headroom budgets are.
+
+**The footwork band follows the WEAPON, and the draw knows how far it is**
+(2026-09-16). Those two numbers together are the whole of a defect that read, from
+outside, as the AI having gone passive: NPCs circling out of reach, a mace
+swinging rarely, a dagger never swinging at all, and a zombie that would not
+bite.
+
+The cause is that `AttackReachOf` takes the profile's `attack.reach` as a FLOOR
+and the footwork band (`movement.rangeMin`/`rangeMax`) was read as a fixed pair
+of distances. `duelist` authors reach 10 and a band of 7..11 — all three are
+SWORD numbers, because a sword is what it was tuned holding. Hand the same
+creature a dagger and they are still 10, 7 and 11: it walks to 7..11, holds
+there, commits on the floor of 10, draws a cut that lands at about 3.5, and
+`BeginStroke` drops the swing with the cadence, commit and disengage clocks
+already spent. Graded by blade length, that is exactly the reported symptom —
+sword fine, mace marginal at the band's inner edge, fist and dagger never.
+
+So there are now two reaches, because "how far do I commit from" and "where do I
+stand" were one number answering two questions. `MobSystem::StrikeReachOf` is
+the same maximum WITHOUT the floor — what this body can actually hit with right
+now — and `ai::Think` slides the authored band, whole and keeping its authored
+WIDTH, until its middle sits on it. Width is the character and survives; the
+distance is a fact about the weapon and does not. INWARD ONLY, on both counts
+that matter: a zombie's longest usable style is a 23-voxel lunge and anchoring
+its band on that would have it orbit at 23, and `duelist`'s mid is (7+11)/2 = 9
+against a sword that lands at about 9, so the armed case shifts by zero and
+every fixture tuned around it is untouched. Only the weapons that were already
+broken move.
+
+`PickAttackStyle` takes the distance too, and filters on it BEFORE the draw
+rather than after. The draw used to be uniform over everything usable with
+`BeginStroke` re-checking the result against the same two numbers and binning
+it on a mismatch — so a creature whose repertoire is long and short silently
+lost a share of its swings equal to the share of short styles in its list. A
+zombie is 50/50 between a 23-voxel lunging bite and a 3.3-voxel standing one, so
+past about four voxels HALF its attacks were discarded by its own draw, once a
+cadence, forever. The refusal in `BeginStroke` is kept as an assertion for
+callers that pick their own style, and the "nothing reaches" case is no longer
+silent: it reports through `ReportNoStroke` reason 2 with the distance and the
+longest reach on the line, which is the difference between a positioning fault
+and a content one. `ReportNoStroke` prints
 once per (mob, reason) off a bitmask, because there are four reasons now and a
 creature with nothing left requests an attack every cadence forever.
 

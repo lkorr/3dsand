@@ -296,6 +296,9 @@
       "amount": 1.5
     },
     "bruiseRadius": 0.9,
+    "bruiseStep": 6.0,
+    "bruiseMax": 12.0,
+    "bruiseBleedChance": 0.5,
     "bruiseMat": "skin_bruised",
     "bluntBleedScale": 0.1,
     "bluntCarveRadius": 0.7,

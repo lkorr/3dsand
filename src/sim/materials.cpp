@@ -107,9 +107,26 @@ static void ParseStain(const json& m, const std::string& path,
   // Only a liquid can stain what it touches. The sim rule runs off the liquid
   // movement path, and a staining SOLID would need a different mechanism
   // entirely — rejecting it here beats silently doing nothing at runtime.
-  if (d.gpu.klass != CLASS_LIQUID) {
+  //
+  // ---- ...AND THAT MECHANISM NOW EXISTS, FOR BODIES (2026-09-16) ----------
+  //
+  // `"bodyOnly": true` is a solid saying "I am a COAT, not a spill". The body
+  // stain (phys/bodystain.h) is a 16-bit word on a creature's own lattice,
+  // written by C++ at the point of injury and narrowed to this palette slot
+  // only for rendering — it never goes near the liquid movement path, so the
+  // objection above does not apply to it and the rejection was costing the one
+  // thing a solid legitimately wants a stain slot FOR: a bruise, which is a
+  // colour that deepens under the skin rather than a fluid lying on it.
+  //
+  // The world-facing half of the block is FORCED to zero rather than trusted,
+  // because those fields only mean anything on the liquid path: a bodyOnly
+  // stain with a `chance` would read as a rule that never fires, which is the
+  // silent-no-op this check exists to prevent in the first place.
+  const bool bodyOnly = s.value("bodyOnly", false);
+  if (d.gpu.klass != CLASS_LIQUID && !bodyOnly) {
     errors += path + ": material \"" + d.name +
-              "\": only liquids can stain (class is not liquid)\n";
+              "\": only liquids can stain (class is not liquid; a solid that "
+              "means a body COAT must say \"bodyOnly\": true)\n";
     return;
   }
   d.stain = s.value("type", d.name);
@@ -134,8 +151,12 @@ static void ParseStain(const json& m, const std::string& path,
   d.gpu.stainColor = color;
 
   int amount = s.value("amount", 5);
-  int chance = s.value("chance", 60);
-  int consume = s.value("consume", 0);
+  // A BODY COAT HAS NO SPILL. `chance`/`consume` drive the liquid soak in
+  // sim_particle.wgsl and a solid never reaches it, so they are forced rather
+  // than defaulted: an authored value there would be a rule that reads as live
+  // and never fires. `amount` survives because the BODY path uses it.
+  int chance = bodyOnly ? 0 : s.value("chance", 60);
+  int consume = bodyOnly ? 0 : s.value("consume", 0);
   if (amount < 1 || amount > (int)kStainAmtMax) {
     errors += path + ": material \"" + d.name + "\": stain amount must be 1.." +
               std::to_string(kStainAmtMax) + "\n";

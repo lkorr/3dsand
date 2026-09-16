@@ -432,11 +432,24 @@ Status GateImpactBlunt(Ctx& c, std::string& detail) {
   }
 
   // ---- ARM B: THE WOUND MODEL ITSELF --------------------------------------
-  uint32_t before = 0, after = 0, bruise = 0;
+  uint32_t before = 0, after = 0, bruise = 0, bruiseOne = 0, bruiseDeep = 0;
   float hp0 = 0, hp1 = 0, bluntBleed = 0;
   bool attached = false, alive = false;
   size_t severs = 0;
   const uint32_t bruiseMat = c.mobs.MaterialIdNamed(CurrentTuning().gore.bruiseMat);
+  // MORE THAN ONE BLOW'S WORTH, in coat levels — the threshold the "it deepens"
+  // claim below is measured against.
+  //
+  // NOT THE CEILING ITSELF, and the difference is load-bearing now that a voxel
+  // AT the ceiling rolls to become blood instead (`gore.bruiseBleedChance`).
+  // Counting only saturated BRUISE cells would fall back toward zero as the
+  // middle of the patch went wet — the gate would go red precisely because the
+  // feature was working. One step plus one is the honest line: no single blow
+  // can reach it, so anything above it accumulated.
+  const auto& gtune = CurrentTuning().gore;
+  const uint32_t bruiseCap = (uint32_t)std::lround(
+                                 std::clamp(gtune.bruiseStep, 0.0f, 15.0f)) +
+                             1u;
   {
     const uint64_t id = SpawnTarget(c, t, 415);
     if (!id) {
@@ -454,6 +467,13 @@ Status GateImpactBlunt(Ctx& c, std::string& detail) {
       if (!mobs.LimbBody(id, t.limb)) break;
       BluntOnce(mobs, c.world, id, t.limb, at, mace, kPower,
                 0xB100u + (uint32_t)k * 2654435761u, spawns);
+      // AFTER THE FIRST BLOW ONLY. A bruise is an accumulating COAT now
+      // (DESIGN.md, "A bruise is an alpha that deepens"), so the claim worth
+      // asserting is not "some voxels are bruised" but "the SAME voxels got
+      // darker" — and that needs a reading from before the rest of the blows
+      // landed to compare against.
+      if (k == 0 && bruiseMat && mobs.LimbBody(id, t.limb))
+        bruiseOne = mobs.LimbCoatMatCount(id, t.limb, bruiseMat, 1);
     }
     attached = mobs.LimbBody(id, t.limb) != 0;
     alive = mobs.IsAlive(id);
@@ -461,7 +481,16 @@ Status GateImpactBlunt(Ctx& c, std::string& detail) {
     if (attached) {
       after = mobs.LimbArtVoxelCount(id, t.limb);
       hp1 = mobs.LimbHp(id, t.limb);
-      bruise = bruiseMat ? mobs.LimbMaterialCount(id, t.limb, bruiseMat) : 0u;
+      // THE COAT, NOT THE MATERIAL. Counting `skin_bruised` VOXELS was right
+      // while a bruise was a material rewrite and is now always zero: the
+      // voxel keeps its own material and carries the bruise as a 0..15 body
+      // stain instead. `minAmt` 1 is "marked at all".
+      bruise = bruiseMat ? mobs.LimbCoatMatCount(id, t.limb, bruiseMat, 1) : 0u;
+      // ...and how many have been driven past a single blow's worth. This is
+      // the half that proves the accumulation rather than merely the marking.
+      bruiseDeep = (bruiseMat && bruiseCap)
+                       ? mobs.LimbCoatMatCount(id, t.limb, bruiseMat, bruiseCap)
+                       : 0u;
       bluntBleed = mobs.LimbBleedBudget(id, t.limb);
     }
     mobs.Reset();
@@ -508,6 +537,8 @@ Status GateImpactBlunt(Ctx& c, std::string& detail) {
   RecordObserved("impactBluntLostFraction", (double)frac);
   RecordObserved("impactBluntHpDrop", (double)(hp0 - hp1));
   RecordObserved("impactBluntBruiseCells", (double)bruise);
+  RecordObserved("impactBluntBruiseAfterOne", (double)bruiseOne);
+  RecordObserved("impactBluntBruiseAtCap", (double)bruiseDeep);
   RecordObserved("impactBluntBleedBudget", (double)bluntBleed);
   RecordObserved("impactBluntCutBleedBudget", (double)cutBleed);
   RecordObserved("impactBluntSweptLost", (double)sweptLost);
@@ -520,21 +551,39 @@ Status GateImpactBlunt(Ctx& c, std::string& detail) {
   const bool heldOn = attached && severs == 0;
   const bool pastZero = hp1 <= 0.0f;
   const bool marked = bruiseMat != 0 && bruise > 0;
+  // ---- ...AND IT DEEPENED RATHER THAN SPREADING (2026-09-16) --------------
+  //
+  // TWO CLAIMS, because either alone is satisfied by the bug it replaced. A
+  // rewrite spread: every blow converted a fresh hash-picked subset, so the
+  // COUNT grew and nothing ever got darker. So the test is that `kHits` blows
+  // on ONE SPOT drove some voxels all the way to the authored ceiling, which a
+  // per-blow step of `gore.bruiseStep` can only reach by accumulating — and
+  // that the patch did not simply keep spreading instead, which is what the
+  // second half pins by holding the final count near the first blow's.
+  //
+  // `bruiseOne * 3` is deliberately loose: the radius scales with power and the
+  // taper is jittered, so later blows legitimately catch a few rim cells the
+  // first missed. What it refuses is the old behaviour, where the count grew
+  // without bound because coverage was the only channel the mark had.
+  const bool deepened = bruiseCap == 0 || bruiseDeep > 0;
+  const bool concentrated = bruiseOne > 0 && bruise <= bruiseOne * 3;
   const bool drier = bluntBleed < cutBleed;
   // ...and the RESOLVER dispatched it: the sweep-driven arm did the same kind
   // of damage through the front door.
   const bool resolver = sweptRan && sweptHpDrop > 0.0f && sweptAttached;
 
-  const bool ok = hurt && sized && heldOn && pastZero && marked && drier &&
-                  resolver;
+  const bool ok = hurt && sized && heldOn && pastZero && marked && deepened &&
+                  concentrated && drier && resolver;
   detail = Format(
       "%s/%s x%d mace(blunt %.0f, dent %.2f): hp %.1f -> %.1f, %u -> %u voxels "
-      "(%.1f%%, cap %.0f%%), %u bruised, attached=%d severs=%zu alive=%d | "
+      "(%.1f%%, cap %.0f%%), bruised %u after one blow -> %u after %d (%u past "
+      "%u/15, i.e. more than one blow), attached=%d severs=%zu alive=%d | "
       "bleed budget %.2f vs %.2f for the same hp as cuts | through the real "
       "sweep: hp -%.1f, %u voxels, attached=%d",
       t.defName.c_str(), t.limbName.c_str(), kHits, mace.blunt,
       mace.bluntCarve, hp0, hp1, before, after, frac * 100.0f,
-      dentMax * 100.0, bruise, attached ? 1 : 0, severs, alive ? 1 : 0,
+      dentMax * 100.0, bruiseOne, bruise, kHits, bruiseDeep, bruiseCap,
+      attached ? 1 : 0, severs, alive ? 1 : 0,
       bluntBleed, cutBleed, sweptHpDrop, sweptLost, sweptAttached ? 1 : 0);
   return ok ? Status::Pass : Status::Fail;
 }
@@ -774,7 +823,11 @@ Status GateImpactFist(Ctx& c, std::string& detail) {
     a.attached = mobs.LimbBody(id, t.limb) != 0;
     if (a.attached) {
       a.after = mobs.LimbArtVoxelCount(id, t.limb);
-      a.bruise = bruiseMat ? mobs.LimbMaterialCount(id, t.limb, bruiseMat) : 0u;
+      // The COAT, not the material -- a bruise no longer rewrites the voxel it
+      // marks (DESIGN.md, "A bruise is an alpha that deepens"), so the old
+      // material count is always zero now. `minAmt` 1 is "marked at all", which
+      // is the claim this arm makes: a bare fist bruises and takes nothing.
+      a.bruise = bruiseMat ? mobs.LimbCoatMatCount(id, t.limb, bruiseMat, 1) : 0u;
     }
     mobs.Reset();
     c.debris.Reset();

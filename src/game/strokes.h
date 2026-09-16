@@ -339,6 +339,14 @@ struct NpcStroke : StrokeCursor {
 // Mob for exactly this reason and this header includes it.
 bool StyleUsable(const Mob& who, const AttackStyle& sty);
 
+// HOW FAR THIS STYLE REACHES ON THIS BODY, world voxels, centre-to-centre — the
+// effector's own span plus whatever a lunge closes. Declared here and defined
+// in mob.cpp for the same reason `StyleUsable` is (see its note): it is part of
+// the style vocabulary, and it is the second half of the same question. A thin
+// forward of `MobSystem::StyleReachOn`; 0 when the creature has no system, no
+// def, or nothing to swing.
+float StyleReachOn(const Mob& who, const AttackStyle& sty);
+
 // Pick a style for one attack out of a profile's authored list. Counter-based
 // on (mobId, tick) so the sequence replays; returns -1 when the list is empty
 // or names nothing the library knows.
@@ -348,9 +356,34 @@ bool StyleUsable(const Mob& who, const AttackStyle& sty);
 // duelist with a sword never throws a punch and a disarmed one throws nothing
 // else. Null skips both filters, which is what a caller with no creature (the
 // tuner's preview, a gate measuring the library itself) wants.
+//
+// ---- AND IT DRAWS ONLY FROM WHAT CAN LAND (2026-09-16) --------------------
+//
+// `distance` > 0 adds a third filter: a style whose own reach cannot cover it
+// is not a candidate. THE ALTERNATIVE WAS A SILENT WASTED TURN, and it is the
+// single biggest reason a zombie looks like it has stopped fighting.
+//
+// The draw used to be uniform over everything usable, and `BeginStroke` then
+// refused the result if the target was outside THAT style's reach — dropping
+// the attack after `ai::Think` had already advanced the cadence, the commit
+// and the disengage clocks. A zombie's list is 50/50 between a 23-voxel lunging
+// bite and a 3.3-voxel standing one, so at any distance past about four voxels
+// HALF ITS SWINGS WERE DISCARDED BY ITS OWN DRAW, once every 48-tick cadence,
+// with no log line anywhere (the refusal was commented "not a content error").
+// Filtering first spends the turn on a style that can actually arrive.
+//
+// `slack` is the victim's own half-depth, the term `StyleReachOn`'s estimate is
+// missing: it is a centre-to-centre number for a surface-to-surface event, and
+// comparing it to an exact distance without it makes the test a coin flip at
+// exactly the range creatures stand at (mob.cpp says so at length).
+//
+// Returns -1 when nothing can reach, which is a REAL answer and the caller is
+// expected to say so — the creature is committed from further than anything it
+// owns can serve, and that is worth a line.
 int PickAttackStyle(const StyleLibrary& lib,
                     const std::vector<std::string>& names, uint64_t mobId,
-                    uint32_t tick, const Mob* who = nullptr);
+                    uint32_t tick, const Mob* who = nullptr,
+                    float distance = 0.0f, float slack = 0.0f);
 
 // ---------------------------------------------------------------------------
 // THE SHARED STROKE-PROGRAM RUNNER.

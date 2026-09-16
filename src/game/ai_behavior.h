@@ -352,6 +352,30 @@ struct SelfView {
   // system, which knows both the library and the rig, answers the question and
   // the arbiter simply uses the answer.
   float attackReach = 0.0f;
+  // ---- ...AND HOW FAR IT REACHES WITH NO PROFILE FLOOR UNDER IT ----------
+  //
+  // `attackReach` above is `max(profile.reach, the styles)` — a FLOOR, so that
+  // a creature commits from the distance its author had in mind. THE FOOTWORK
+  // BAND CANNOT USE THAT NUMBER, because a floor is exactly the wrong shape
+  // for "where should I stand": it is the one term that does not shrink when
+  // the weapon does.
+  //
+  // Measured 2026-09-16, and it is the whole of "the AI has gone passive": the
+  // `duelist` profile authors reach 10 and a band of 7..11 — both of them
+  // SWORD numbers, because a sword is what it was tuned holding. Give the same
+  // creature a dagger and every one of those numbers is still 10, 7 and 11,
+  // while `BeginStroke` refuses any style the target is outside the reach OF
+  // (mob.cpp, "ITS OWN REACH, BEFORE ANYTHING ELSE"). So it walks to 7..11,
+  // holds there, commits on the profile's floor of 10, draws a dagger cut that
+  // lands at about 3.5 — and the swing is dropped, silently, with the cadence
+  // already spent. A mace lands at about 6 and squeaks through at the very
+  // inner edge; a fist lands at 5 and does not; a dagger never swings at all.
+  //
+  // So this is the SAME sum WITHOUT the floor: the longest reach among the
+  // styles this creature can actually use right now, 0 when none resolves
+  // (which reads as "no opinion — keep the authored band"). `Think` pulls the
+  // band in onto it, and only ever INWARD; see the band-geometry note there.
+  float strikeReach = 0.0f;
   Vec3 Centre() const {
     return Vec3{origin.x + size.x * 0.5f, origin.y + size.y * 0.5f,
                 origin.z + size.z * 0.5f};
