@@ -230,6 +230,17 @@ float StrokeReachIn(const MeleeState& m, float offset) {
   return std::clamp(lo + (kNeutralReach + offset) * span, lo, hi);
 }
 
+void StrokeAimAt(const Vec3& pivot, const Vec3& target, const Vec3& right,
+                 const Vec3& up, const Vec3& fwd, float& outAz, float& outEl,
+                 float& outDist) {
+  const Vec3 to = target - pivot;
+  const Vec3 local{to.dot(right), to.dot(up), to.dot(fwd)};
+  const float r = std::max(local.len(), 1e-4f);
+  outAz = std::atan2(local.x, local.z);
+  outEl = std::asin(std::clamp(local.y / r, -1.0f, 1.0f));
+  outDist = r;
+}
+
 void BeginStrokeProgram(StrokeCursor& cur, const AttackStyle& sty,
                         int styleIndex, uint32_t seed) {
   cur.style = styleIndex;

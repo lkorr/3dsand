@@ -1917,6 +1917,19 @@ class Mob {
   // target the IK will be handed on the very next tick.
   bool WeaponStrokePose(Vec3& outHandFromShoulder, Vec3& outTipFromShoulder,
                         Vec3& outFlat, float& outReach) const;
+  // WHICHEVER JOINT THE STROKE ACTUALLY PIVOTS ABOUT, in world voxels — the
+  // point the driver's azimuth and elevation are a bearing FROM, and therefore
+  // the point an aim has to be measured about. Not always a shoulder: for a
+  // chain effector it is the chain's ROOT (a shoulder, or a hip if something
+  // ever kicks), and for an aim effector it is the part's OWN joint (the neck,
+  // for jaws). Both are exactly the pivot `WeaponArmPose` measured its hand
+  // offset from, which is the agreement that stops the aim and the pose
+  // speaking different frames.
+  //
+  // False when there is nothing armed, or the rig cannot answer; the callers
+  // (MobSystem::StepStroke, main.cpp's player strike) fall back to a body-box
+  // estimate rather than aiming from the origin.
+  bool StrokePivotWorld(Vec3& out) const;
   // THE WIELDER'S OWN HEAD as a keep-out sphere for the stroke driver
   // (MeleeState::SetKeepOut): centre relative to the weapon arm's LIVE chain
   // root (the same shoulder anchor WeaponStrokePose speaks, same anim_.model

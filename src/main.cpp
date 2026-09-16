@@ -5683,6 +5683,11 @@ int main(int argc, char** argv) {
   uint64_t lootCorpse = 0;
   bool lootOpenedScreen = false;
   std::vector<uint64_t> lookIgnore;   // the avatar's own limbs, per frame
+  // ...and the same list for the STRIKE aim ray (the melee tick's, below).
+  // Its own vector rather than a share of `lookIgnore`: that one is filled in
+  // the frame block and read by the E prompt, and the melee ray runs inside
+  // the tick loop, where overwriting it would silently change what E offers.
+  std::vector<uint64_t> strikeIgnore;
   // RMB held (a beam stays lit while it is), and Delete pressed in magic mode
   // (drop the newest status), both read on the frame and consumed by the tick.
   bool beamHeld = false;
@@ -8556,14 +8561,73 @@ int main(int argc, char** argv) {
                 // The style library reloaded out from under a live swing.
                 playerStrike.Reset();
               } else {
-                // liveAz/liveEl = (0, 0): the camera IS the aim, so every
-                // strike's mid-travel passes through the crosshair line.
                 const bool wasCutting = playerStrike.Cutting();
-                // liveAz/liveEl/liveDist = 0: the CAMERA is the aim, so
-                // every strike's mid-travel passes through the crosshair line
-                // and there is no target distance to bound the reach with.
+                // ---- THE AIM: WHERE THE CROSSHAIR IS, NOT WHERE IT POINTS --
+                //
+                // This used to pass (0, 0, 0) — "the camera IS the aim" — and
+                // that is true of a DIRECTION and false of a BLOW. The stroke
+                // is a bearing about the arm's own pivot (strokes.h
+                // StrokeAimAt), and the shoulder sits a couple of voxels under
+                // the eye and a couple to the side of it; copying the camera's
+                // bearing therefore lands the fist a whole shoulder offset low
+                // and wide of whatever is under the crosshair. At sword range
+                // that is a few degrees. AT PUNCHING RANGE IT IS THE
+                // DIFFERENCE BETWEEN A HEAD AND A COLLARBONE, which is the
+                // "my punches don't go where I'm pointing" report.
+                //
+                // So resolve a POINT and take the bearing to it. Nearest of:
+                //   * the first dynamic BODY down the crosshair line (a mob's
+                //     head — the case the whole thing is for), the rig's own
+                //     limbs excluded for the reason the E ray excludes them
+                //     (the eye sits inside your own head collider and Jolt
+                //     reports a shape the ray starts in as a hit at t=0);
+                //   * the first solid VOXEL, marched on the CPU mirror. Not
+                //     `snap.pick`, which the brush reads: that ray starts at
+                //     the RENDER camera, and a punch may not move because the
+                //     player pushed the third-person boom out.
+                //   * failing both, a point far down the line, which reproduces
+                //     the old camera-parallel aim to within a few degrees —
+                //     so a strike at open air is unchanged and the two cases
+                //     meet continuously instead of snapping.
+                //
+                // From `player.EyePos()` along `cam.Forward()`, the same pair
+                // the brush, the laser and the grenade use, so the camera
+                // cannot change where a strike lands.
+                float aimAz = 0, aimEl = 0, aimDist = 0;
+                {
+                  Vec3 pivot;
+                  if (avatar.StrokePivotWorld(pivot)) {
+                    // Far enough that the fallback is effectively the camera
+                    // line, short enough to stay inside the CPU mirror's
+                    // 3x3x3 window for the voxel half (world.h KindAt).
+                    constexpr float kAimRange = 40.0f;
+                    const Vec3 eye = player.EyePos();
+                    const Vec3 look = cam.Forward();
+                    float hitDist = kAimRange;
+                    strikeIgnore.clear();
+                    avatar.AppendLiveLimbBodies(strikeIgnore);
+                    float frac = 1.0f;
+                    if (phys.CastRayBody(eye, look, kAimRange, frac,
+                                         strikeIgnore))
+                      hitDist = std::min(hitDist, frac * kAimRange);
+                    // The voxel half, quarter-voxel steps from a half-voxel
+                    // out (step 0 is the cell the eye is already in). Unknown
+                    // is NOT a hit — the projectile convention, and the mirror
+                    // answers Unknown past ~48 voxels.
+                    for (float d = 0.5f; d < hitDist; d += 0.25f) {
+                      const Vec3 p = eye + look * d;
+                      if (kindAt(IVec3{ifloor(p.x), ifloor(p.y),
+                                       ifloor(p.z)}) == CellKind::Solid) {
+                        hitDist = d;
+                        break;
+                      }
+                    }
+                    StrokeAimAt(pivot, eye + look * hitDist, swRight, swUp,
+                                swFwd, aimAz, aimEl, aimDist);
+                  }
+                }
                 const StrokeStepResult r = StepStrokeProgram(
-                    playerStrike, sty, melee, 0.0f, 0.0f, 0.0f, kTickDt,
+                    playerStrike, sty, melee, aimAz, aimEl, aimDist, kTickDt,
                     swRight, swUp, swFwd);
                 stepped = r != StrokeStepResult::Idle;
                 strikeCutEdge = playerStrike.Cutting() && !wasCutting;

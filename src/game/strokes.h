@@ -441,3 +441,23 @@ StrokeStepResult StepStrokeProgram(StrokeCursor& cur, const AttackStyle* sty,
 // styles are authored in.
 float StrokeReachIn(const MeleeState& m, float offset);
 
+// A WORLD POINT -> THE THREE NUMBERS `StepStrokeProgram` AIMS WITH.
+//
+// The bearing of `target` about `pivot`, in the basis the stroke is integrated
+// in, plus the distance between them. Extracted from MobSystem::StepStroke
+// when the player's discrete strikes became a second caller, for the reason
+// the runner itself was: two implementations of "where is the target" is two
+// implementations of where a blow lands.
+//
+// THE PIVOT IS NOT THE EYE, and that is the whole reason this exists. A player
+// strike used to pass (0, 0, 0) — "the camera IS the aim" — which is true only
+// of a DIRECTION, and a punch is not a direction: the fist swings about a
+// shoulder that sits ~2.5 voxels under the eye and ~2 to the side of it, so at
+// arm's length a bearing copied from the camera lands the knuckles a shoulder
+// offset low and wide of whatever the crosshair is on. At sword range the same
+// error is a few degrees; at punching range it is the difference between a
+// head and a collarbone.
+void StrokeAimAt(const Vec3& pivot, const Vec3& target, const Vec3& right,
+                 const Vec3& up, const Vec3& fwd, float& outAz, float& outEl,
+                 float& outDist);
+
