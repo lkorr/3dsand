@@ -1270,6 +1270,19 @@ export function pickAttackStyle(lib, names, mobId, tick, usable) {
 
    NOT PORTED, and each is a deliberate line rather than an omission:
 
+     MeleeSweepDamage's IMPULSE RULE and PROBE GEOMETRY (melee.cpp, 2026-09-15)
+       blunt and bite land ONCE per body per stroke (EdgeSweep::struck) where
+       the kerf continues every tick, and a SELF-MOUNTED edge -- a fist, a set
+       of jaws -- probes along its TRAVEL with the wielder's own bodies
+       excluded from the cast, because its edge is one of them. Both live
+       where the sweep does, and the panel reports speed and edge alignment
+       rather than damage, so neither reaches this file. The Attacks lane
+       showing "lands at tick N vs cut starts at M" is the part an author acts
+       on.
+     MobSystem::StyleReachOn (mob.cpp)  a natural style's `reach` of 0 means
+       ASK THE BODY: the effector's own reach plus what the lunge closes. It
+       needs a live rig, so the lane shows the authored 0 as "derived" rather
+       than inventing a number here.
      MeleeSweepDamage / FindParry (melee.cpp)   need a World, a Jolt scene and
        the debris system. The panel therefore reports the blade's SPEED and
        EDGE ALIGNMENT — the two inputs the damage formula scales by — and says

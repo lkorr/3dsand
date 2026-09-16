@@ -679,6 +679,11 @@ EdgeSweepResult MeleeSweepDamage(const EdgeSweep& s, const MeleeTuning& t,
   // One hit per body per swing tick: without this the same limb is carved once
   // per probe and a single cut removes a whole arm.
   std::vector<uint64_t> hitBodies;
+  // Every body the wielder still owns: its limbs, its worn shells and whatever
+  // is in its fist. Handed to every probe so a ray that begins inside the
+  // creature swinging it passes straight out (see the note in the loop).
+  std::vector<uint64_t> selfBodies;
+  wielder.AppendLiveLimbBodies(selfBodies);
   for (int step = 1; step <= steps && (int)hitBodies.size() < 8; step++) {
     const float u = (float)step / (float)steps;
     const Vec3 a = s.aPrev + (s.aNow - s.aPrev) * u;
@@ -705,21 +710,89 @@ EdgeSweepResult MeleeSweepDamage(const EdgeSweep& s, const MeleeTuning& t,
     // because the last START point plus its own tile is what reaches the tip.
     // Casting from the tip as well would put a whole extra tile PAST the point,
     // which is a hitbox longer than the weapon.
-    const float probe = std::max(segLen / (float)along + radius, 0.6f);
+    // A SELF-MOUNTED EDGE PROBES ALONG ITS TRAVEL (melee.h selfMounted): a
+    // fist damages what it runs into, and its own axis points back up the arm.
+    // The reach is its own thickness rather than its (negligible) length, so
+    // the hitbox is the fist and the voxel it is about to occupy.
+    const bool alongTravel = s.selfMounted && sweepDir.len() > 1e-4f;
+    // ---- AND EVERY PROBE OVERHANGS BY A CELL ----------------------------
+    // The rays end at the weapon's own carve radius past the last sample, and
+    // the thing they are trying to find is a voxel CENTRE -- which sits up to
+    // half a cell's diagonal (0.87 voxels) inside the surface the blade is
+    // actually touching. So a weapon whose edge is in contact still probed
+    // short of the thing it was in contact with: measured, a mace 0.5 voxels
+    // from the victim's nearest voxel, 95 rays cast and 95 of them air. The
+    // overhang is that discretisation and nothing more.
+    const float kCellReach = 0.87f;
+    const float probe =
+        alongTravel ? std::max(radius * 2.0f + kCellReach, 0.6f)
+                    : std::max(segLen / (float)along + radius + kCellReach,
+                               0.6f);
     for (int k = 0; k < along; k++) {
       const float v = (float)k / (float)along;
       const Vec3 p = a + (b - a) * v;
+      const Vec3 dir = alongTravel ? sweepDir : seg.normalized();
+      // ---- THE WIELDER IS SKIPPED THROUGH, NOT STOPPED AT (2026-09-15) ----
+      //
+      // A weapon must not cut its wielder: the wielder's own parts are
+      // permanently inside the swing arc, so without that rule every guard
+      // would saw through the arm holding it. But ABANDONING THE PROBE on the
+      // wielder's own body is a different rule, and it is the one that made a
+      // fist unable to hit anything at all.
+      //
+      // A HELD BLADE'S EDGE STARTS OUTSIDE ITS OWNER — at the ricasso, past
+      // the fist — so its probe ray never begins inside one of the wielder's
+      // colliders and the `continue` never fired in anger. A NATURAL WEAPON'S
+      // EDGE *IS* ONE OF THOSE COLLIDERS: the fist's segment runs down the
+      // inside of hand.R, so every ray's first hit was the wielder's own hand,
+      // every probe was thrown away, and no punch or bite in the game could
+      // ever land. Measured through `--shot-strike`: the knuckles' hitbox
+      // OVERLAPPING the victim (-0.2 voxels of clearance) and still `0 bodies
+      // hit`, on every scenario C photographed.
+      //
+      // So the ray steps PAST its owner's body and carries on with what is
+      // left of its length. Bounded at three skips -- an arm, a hand, and a
+      // sleeve is as many of the wielder as any probe can be inside -- so this
+      // cannot become an unbounded march (rule 2), and it is exactly the old
+      // behaviour for a sword, which never hits the branch.
+      // ---- THE WIELDER IS EXCLUDED, NOT STEPPED OVER ---------------------
+      //
+      // A weapon must not cut its wielder, and the old rule said so by
+      // DROPPING any probe whose first hit was the owner's own body. For a
+      // held blade that never fired in anger: the edge starts at the ricasso,
+      // already clear of the fist, so the ray begins in open air. A NATURAL
+      // WEAPON'S EDGE *IS* ONE OF THE WIELDER'S COLLIDERS -- the fist's
+      // segment runs down the inside of hand.R, the jaws' out through the
+      // skull -- and Jolt reports a convex shape the origin is INSIDE as a hit
+      // at fraction 0 (physics.h says so where this overload is declared). So
+      // every probe a fist or a set of jaws ever cast was thrown away on its
+      // own hand, and no punch or bite in the game could land. Measured
+      // through `--shot-strike`, with the knuckles' hitbox OVERLAPPING the
+      // victim: `12 rays cast: 0 found air, 12 never left the wielder, 0 found
+      // a body`.
+      //
+      // The ignore-list cast is the fix and it is the one physics.h added this
+      // overload for. One list per sweep, not per probe -- a rig is a dozen
+      // bodies and this loop runs up to thirty times.
       float frac = 1.0f;
-      const uint64_t hb = phys.CastRayBody(p, seg.normalized(), probe, frac);
-      if (!hb) continue;
+      const uint64_t hb = phys.CastRayBody(p, dir, probe, frac, selfBodies);
+      out.probesCast++;
+      if (!hb) {
+        out.probesAir++;
+        continue;
+      }
+      // A ray that STILL found the wielder means AppendLiveLimbBodies missed a
+      // body the creature owns -- a real bug, and one nobody would otherwise
+      // see. Counted rather than asserted so the harness can report it.
+      if (wielder.OwnsBody(hb)) {
+        out.probesSelf++;
+        continue;
+      }
+      out.probesBody++;
       bool seen = false;
       for (uint64_t h : hitBodies) seen |= (h == hb);
       if (seen) continue;
-      // A weapon must not cut its wielder. The wielder's own parts are
-      // permanently inside the swing arc — the blade starts in its own hand —
-      // so without this every guard would saw through the arm holding it.
-      if (wielder.OwnsBody(hb)) continue;
-      const Vec3 at = p + seg.normalized() * (frac * probe);
+      const Vec3 at = p + dir * (frac * probe);
 
       // A PROBE THAT DID FIND A WEAPON. The geometric test above is what
       // actually detects parries; this is the safety net for the rare ray that
@@ -824,12 +897,26 @@ EdgeSweepResult MeleeSweepDamage(const EdgeSweep& s, const MeleeTuning& t,
         }
       }
 
+      // ---- IS THIS THE FIRST TIME THIS STROKE HAS TOUCHED THIS SLOT? ------
+      //
+      // Asked ONCE, before either impulse, and consumed by both: a mace that
+      // bruises and a set of jaws that tears are the same event arriving, and
+      // asking separately would let a profile carrying both spend two first
+      // contacts on one meeting. See EdgeSweep::struck for why an impulse is
+      // not a kerf.
+      bool firstContact = true;
+      if (s.struck != nullptr && (s.strike.blunt > 0.0f || s.strike.bite > 0.0f)) {
+        for (uint64_t h : *s.struck)
+          if (h == hb) firstContact = false;
+        if (firstContact) s.struck->push_back(hb);
+      }
+
       // ---- 2. THE BLUNT PART — trauma, a bruise, and never a sever ---------
       //
       // The struck kind is deliberately NOT handed down: Mob::BluntHit asks
       // IsWornSlot for itself, because it also has to find the limb UNDERNEATH
       // a shell to transmit through, and only the creature knows that.
-      if (s.strike.blunt > 0.0f) {
+      if (s.strike.blunt > 0.0f && firstContact) {
         BluntHit bh;
         bh.at = at;
         bh.hp = s.strike.blunt * power;
@@ -842,7 +929,9 @@ EdgeSweepResult MeleeSweepDamage(const EdgeSweep& s, const MeleeTuning& t,
       }
 
       // ---- 3. THE BITE PART — a tear, and an infection armour refuses ------
-      if (s.strike.bite > 0.0f) {
+      // Once per slot per stroke, like the blunt part above and for the same
+      // reason: teeth close once.
+      if (s.strike.bite > 0.0f && firstContact) {
         BiteHit bt;
         bt.at = at;
         bt.hp = s.strike.bite * power;

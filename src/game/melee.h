@@ -575,6 +575,62 @@ struct EdgeSweep {
   // kerf may key on a Jolt float (game/mob.h BladeCut::seed).
   uint32_t tick = 0;
   bool valid = false;
+  // ---- WHAT THIS STROKE HAS ALREADY STRUCK (2026-09-15) -----------------
+  //
+  // A CUT IS A KERF AND A BLUNT BLOW IS AN IMPULSE, and the difference only
+  // shows up once a stroke lasts more than one tick. The kerf is CONTINUOUS:
+  // the blade is still in the wound on the next tick, `CutLimb` snaps to the
+  // entry plane it already opened, and carrying the same cut deeper is what a
+  // sword does. Trauma is not like that. You are hit by a mace ONCE per swing,
+  // and there is no sense in which the second tick of the same follow-through
+  // is a second blow.
+  //
+  // Leaving it per-tick multiplied every blunt and bite number by the length
+  // of the cut phase AND by the number of probes that met the same slot.
+  // Measured through `--shot-strike` on `human+mace horizontal_r
+  // human+iron_cuirass`: 14 body hits over 7 cut ticks, all SIX cuirass shells
+  // taken from 40 hp to 0 and 1,664 voxels each, where package A's own
+  // `impact-armor` gate -- which fabricates ONE sweep per blow -- measured 7
+  // shell voxels for six direct `BluntHit` calls. The resolver was right and
+  // the number of times it ran was wrong.
+  //
+  // So: a CALLER-OWNED set of the rig slots this stroke has already delivered
+  // its impulse to. Blunt and bite land on FIRST CONTACT and are then silent
+  // for the rest of the stroke; the cut is untouched and still runs every tick.
+  //
+  // BY BODY HANDLE, not by creature: a swing that crosses an arm and then the
+  // chest legitimately bruises both, and a mace that meets three plates of the
+  // same cuirass legitimately dents three plates. What it may not do is dent
+  // the same plate four times because the phase was four ticks long.
+  //
+  // NULL MEANS "NO STROKE IDENTITY", which is exactly what a fabricated gate
+  // sweep wants: `impact-blunt` hits a bare arm N times on purpose and each of
+  // those N is its own blow. Only a live stroke owns one of these
+  // (StrokeCursor::struck), and it is cleared when the stroke resets.
+  std::vector<uint64_t>* struck = nullptr;
+  // ---- IS THE EDGE PART OF THE WIELDER? (2026-09-15) --------------------
+  //
+  // A HELD BLADE IS A THING YOU POINT; A FIST IS A THING YOU THROW, and the
+  // probe geometry is different in a way no tolerance can paper over.
+  //
+  // The probes cast ALONG THE EDGE'S OWN AXIS, which for a sword is exactly
+  // right: the blade is long, the wrist lays it along the stroke, and tiling
+  // rays down its length is what makes "the pose is the hitbox" true. A
+  // natural weapon has neither property. Its edge is a voxel of knuckle or an
+  // inch of jaw, it is deliberately NOT wrist-steered (there is nothing to lay
+  // along a line), and the axis it does have points back down the arm that is
+  // swinging it -- so every ray began inside the wielder's own hand and ran up
+  // its own forearm. Measured through `--shot-strike`, with the knuckles'
+  // hitbox OVERLAPPING the victim: `12 rays cast: 0 found air, 12 never left
+  // the wielder, 0 found a body`. No fist or set of jaws in the game had ever
+  // hit anything.
+  //
+  // So a self-mounted edge probes along the direction it is TRAVELLING, which
+  // is what a fist actually damages: whatever it runs into. The flag is set by
+  // the callers that know (Mob::StepStroke and main.cpp's player sweep, off
+  // `EffectorWeapon`), never guessed from the geometry -- a short sword is not
+  // a fist and the engine should not have to decide by length.
+  bool selfMounted = false;
 };
 
 // What one tick's sweep actually did. Reported rather than printed so the gate
@@ -592,6 +648,15 @@ struct EdgeSweepResult {
   // (MeleeState::Arrest for the player, NpcStroke's cut phase for an NPC) —
   // this function has no business reaching into either.
   bool arrested = false;
+  // ---- WHERE THE PROBE RAYS WENT (CLAUDE.md rule 6) --------------------
+  // `bodiesHit 0` has four causes and from outside they are one number: the
+  // sweep never ran, no ray was cast, every ray found empty air, or every ray
+  // was eaten by the wielder's own body. These four words separate them, and
+  // they are what `--shot-strike` prints. Cost: four increments per probe.
+  int probesCast = 0;      // rays actually fired
+  int probesAir = 0;       // ...that found nothing at all
+  int probesSelf = 0;      // ...that were still inside the wielder at the end
+  int probesBody = 0;      // ...that found somebody else
   BlockEvent block{};
 };
 

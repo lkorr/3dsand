@@ -3320,27 +3320,68 @@ void MobSystem::BeginStroke(Mob& mob, const ai::AttackRequest& req,
   // is where the drawn style gets to say the target is too far for IT: a
   // zombie that has closed to 14 voxels may lunge-bite (22) and may not punch
   // (9), and refusing here is what stops the punch swinging at air.
-  const float styleReach = sty.reach > 0.0f ? sty.reach : pr->attack.reach;
+  //
+  // WITH A BODY'S SLACK ON IT. `StyleReachOn` is an ESTIMATE of a
+  // centre-to-centre distance for a surface-to-surface event, and `distance`
+  // is exact -- so comparing them to the last millivoxel makes the refusal a
+  // coin flip at exactly the range creatures actually stand at. Two humans are
+  // held about four and a half voxels apart by `ApplyCrowdSpacing` and a punch
+  // reaches five: measured, `unarmed-attack` reported 4 attack requests and
+  // ZERO cut ticks, every one refused for being a fraction of a voxel out of
+  // its own reach. Half a body is the width of the thing being hit, which is
+  // the term the estimate is missing.
+  const float styleReach = StyleReachOn(mob, sty);
+  const float slack =
+      mob.Def() != nullptr ? mob.Def()->worldSize.z * 0.5f : 1.0f;
   if (req.distance > 0.0f && styleReach > 0.0f &&
-      req.distance > styleReach + 1e-3f)
+      req.distance > styleReach + slack)
     return;   // not a content error: this style is simply the wrong one now
   if (!mob.ArmForStyle(sty)) {
     ReportNoStroke(mob, pr, 3, sty.weapon.c_str());
     return;
   }
+  StartStroke(mob, si, req.targetId, req.targetPoint, tick, 0);
+}
+
+// ============================================================================
+// ONE DOOR INTO A SWING (2026-09-15)
+//
+// `BeginStroke` (the AI's) and `ForceAttack` (a script's, a gate's,
+// `--shot-strike`'s) both start the same stroke, and they had drifted: the AI's
+// drew the style's `target` limb and played its `clip`, and the scripted one
+// did neither. So a harness built to photograph a bite photographed a creature
+// that never chose a limb and never hunched its shoulders, and the pictures
+// were of a different move from the one the game plays.
+//
+// That is the "two implementations of one feel" failure `strokes.h` was written
+// to prevent, arriving through the back door of a test seam. Everything a
+// stroke IS now lives here and both callers are the decisions IN FRONT of it:
+// which style, at what, and whether it is allowed.
+// ============================================================================
+void MobSystem::StartStroke(Mob& mob, int styleIndex, uint64_t targetId,
+                            Vec3 targetPoint, uint32_t tick, uint32_t seed) {
+  const AttackStyle& sty = *styles_.At(styleIndex);
+  NpcStroke& st = mob.stroke_;
   st = NpcStroke{};
-  st.style = si;
-  st.targetId = req.targetId;
-  st.targetPoint = req.targetPoint;
-  // ...and WHICH PART of the target (plan §5). Drawn here, once, at the same
-  // instant the style is: a blow that re-chose its limb every tick would be
-  // homing, and the whole point of the windup is that it does not.
-  if (const Mob* victim = FindMobById(req.targetId))
+  st.style = styleIndex;
+  st.targetId = targetId;
+  st.targetPoint = targetPoint;
+  // WHICH PART of the target (plan §5). Drawn here, once, at the same instant
+  // the style is: a blow that re-chose its limb every tick would be homing, and
+  // the whole point of the windup is that it does not.
+  //
+  // A SCRIPTED SWING AIMS AT A POINT AND MAY NAME NO VICTIM, and that is still
+  // worth a draw: `--shot-strike` and the gates hand a target id when they have
+  // one, and the limb choice is a fact about the STYLE, not about who asked.
+  if (const Mob* victim = FindMobById(targetId))
     st.targetLimb = PickTargetLimb(sty, *victim, mob.id_, tick);
   // ONE SEED PER SWING, mixing who and when. Every draw in the runner indexes
   // off it, so the whole stroke — its style, its start bow, its tempo —
-  // replays from the same (mob, tick) and nothing reads a clock.
-  BeginStrokeProgram(st, sty, si, rng::Hash3((uint32_t)mob.id_, tick, 0x5747u));
+  // replays from the same (mob, tick) and nothing reads a clock. A caller that
+  // needs the SAME swing in any scope passes its own (mob.h ForceAttack).
+  BeginStrokeProgram(st, sty, styleIndex,
+                     seed != 0 ? seed
+                               : rng::Hash3((uint32_t)mob.id_, tick, 0x5747u));
   st.melee.Reset();
   st.melee.SetHandSign(mob.HandSign());
   // THE NPC'S BLADE OBEYS THE SAME SLIDERS AS THE PLAYER'S. Applied at every
@@ -3355,13 +3396,14 @@ void MobSystem::BeginStroke(Mob& mob, const ai::AttackRequest& req,
   ApplyMeleeTuning(st.melee.tuning);
   NpcStrokeSmoothing(st.melee.tuning);
   // The style's body animation, if it names one (strokes.h AttackStyle::clip).
-  // Same clip layer as a flinch or a jump; the arm claim below still wins on
-  // the weapon arm, so the clip is the rest of the body joining the swing.
+  // Same clip layer as a flinch or a jump; the arm claim still wins on the
+  // weapon arm, so the clip is the rest of the body joining the swing.
   if (!sty.clip.empty()) mob.PlayClip(sty.clip);
 }
 
 bool MobSystem::ForceAttack(uint64_t mobId, const std::string& style,
-                            Vec3 targetPoint, uint32_t tick, uint32_t seed) {
+                            Vec3 targetPoint, uint32_t tick, uint32_t seed,
+                            uint64_t targetId) {
   Mob* m = FindMobById(mobId);
   if (m == nullptr) return false;
   const int si = styles_.Find(style);
@@ -3376,29 +3418,10 @@ bool MobSystem::ForceAttack(uint64_t mobId, const std::string& style,
   // punch on a handless body gets `false`, which is an answer it can assert on.
   if (!StyleUsable(*m, sty)) return false;
   if (!m->ArmForStyle(sty)) return false;
-  NpcStroke& st = m->stroke_;
-  st = NpcStroke{};
-  st.targetPoint = targetPoint;
-  // ---- A SCRIPTED SWING MAY NAME ITS OWN SEED (2026-09-15) --------------
-  //
-  // Every draw in the runner keys off this one number, and the tempo jitter it
-  // produces changes the stroke's TICK COUNTS -- so the same style is a
-  // five-tick cut from one (mob, tick) pair and a three-tick cut from another.
-  // For the game that is the whole point (two duelists must not beat time
-  // together); for a GATE it is a coin flip on the run order, because a mob id
-  // depends on how many creatures earlier gates spawned. `npc-styles` measured
-  // a punch's radial travel at 1.14 voxels standalone and 0.94 in-suite
-  // against its own 1.0 floor, on identical code.
-  //
-  // 0 keeps the derived seed, so the game and every existing caller are
-  // untouched; a caller that needs the SAME swing in any scope passes one.
-  BeginStrokeProgram(st, sty, si,
-                     seed != 0 ? seed
-                               : rng::Hash3((uint32_t)mobId, tick, 0x5747u));
-  st.melee.Reset();
-  st.melee.SetHandSign(m->HandSign());
-  ApplyMeleeTuning(st.melee.tuning);   // BeginStroke says why
-  NpcStrokeSmoothing(st.melee.tuning);
+  // ...AND THEN THE SAME DOOR (MobSystem::StartStroke). A scripted swing that
+  // skipped the limb draw and the clip was a different move from the AI's, and
+  // a harness that photographs a different move is worse than no harness.
+  StartStroke(*m, si, targetId, targetPoint, tick, seed);
   return true;
 }
 
@@ -3427,6 +3450,163 @@ bool MobSystem::SetGuard(uint64_t mobId, float az, float el, float reachFrac) {
   return true;
 }
 
+float MobSystem::StyleReachOn(const Mob& mob, const AttackStyle& sty) const {
+  if (sty.reach > 0.0f) return sty.reach;   // an author's override still wins
+  // ---- WHAT THE BODY CAN ACTUALLY DO ------------------------------------
+  //
+  // Three terms, and each one is a length the rig or the style already owns:
+  //
+  //   THE EFFECTOR'S OWN REACH. `WeaponArmPose` reports it for whichever part
+  //   the style names -- an arm's two bone lengths for a fist, the edge span
+  //   for jaws -- and it is measured from the pivot the stroke is expressed
+  //   about, which is the same pivot the AI's distance is not. That is why the
+  //   third term exists.
+  //
+  //   THE LUNGE. A style that leaps closes ground before it strikes, so its
+  //   reach is its arm PLUS its flight: the ceiling the launch may use
+  //   (`speed`) over the time it is airborne. The launch law caps the
+  //   horizontal at exactly the gap it has to close, so a committed lunge
+  //   arrives at striking distance rather than through the victim -- these two
+  //   numbers are the same arithmetic read forwards instead of backwards.
+  //
+  //   A BODY'S HALF-DEPTH. `attack.reach` is centre-to-centre and a creature
+  //   is not a point: the surface a fist has to meet is half a torso nearer
+  //   than the centre the distance is measured to. The ATTACKER'S own depth
+  //   stands in for the victim's, which is exact for two of a kind and the
+  //   right order of magnitude for anything else.
+  //
+  // A held weapon gets the same treatment through `ItemDef::reach`, which is
+  // what the item itself says it can do.
+  //
+  // ASKED OF THE STYLE, NOT OF THE EFFECTOR THAT HAPPENS TO BE ARMED. The
+  // question is "how far could this creature reach IF it swung this", and the
+  // AI asks it about every style in its list while none of them is running —
+  // so going through `WeaponArmPose` (which reads the LIVE effector) would
+  // have answered every question with the currently-held weapon's number, or
+  // with nothing at all for an empty-handed creature. The chain is found the
+  // same way `ArmForStyle` finds it, and measured off the same live bones.
+  float effector = 0.0f;
+  if (const MobNaturalWeaponDef* nw = mob.NaturalWeaponNamed(sty.weapon)) {
+    // THE EDGE COUNTS ONLY WHERE IT POINTS FORWARD. For an AIM effector it is
+    // the whole reach -- the jaws ARE the segment, and the segment is the
+    // head's forward. For a CHAIN effector it is a fist's wrist-to-knuckle
+    // line, which hangs DOWN off the arm and adds a voxel of nothing to how
+    // far the punch travels; counting it stood the pair a voxel too far apart
+    // and the harness measured the shortfall.
+    int handPart = -1;
+    const bool chained =
+        mob.ChainForEffector(mob.skel_, nw->partIndex, handPart) != nullptr;
+    effector = chained ? 0.0f : (nw->edgeTo - nw->edgeFrom).len();
+    handPart = -1;
+    if (const IkChain* ch =
+            mob.ChainForEffector(mob.skel_, nw->partIndex, handPart)) {
+      // The LIVE bone lengths, not an authored guess: a creature that has lost
+      // a forearm has a shorter punch and should commit from closer in. Same
+      // L1 + L2 the two-bone solver clamps its own annulus against.
+      const int i0 = ch->parts[0], i1 = ch->parts[1];
+      float bones = 0.0f;
+      if ((size_t)i0 < mob.anim_.model.size() &&
+          (size_t)i1 < mob.anim_.model.size() &&
+          handPart >= 0 && (size_t)handPart < mob.anim_.model.size())
+        bones = (mob.anim_.model[i1].pos - mob.anim_.model[i0].pos).len() +
+                (mob.anim_.model[handPart].pos - mob.anim_.model[i1].pos).len();
+      // ---- AN ARM DOES NOT DELIVER ITS OWN LENGTH -------------------------
+      //
+      // L1 + L2 is the STRAIGHT arm, and the driver never straightens it. The
+      // hand is held at `handExtend` of a band that is itself `reachFraction`
+      // of the arm, `StrokeReachIn` only touches the top of that band on the
+      // last tick of the cut, and the aim at a chest is BELOW level so part of
+      // what is left goes downward rather than forward. The forward distance a
+      // punch actually delivers is about three quarters of the bone length.
+      //
+      // MEASURED, not reasoned, and re-measured until the harness landed the
+      // blow. `--shot-strike human punch_r human` with the full 5.0-voxel arm
+      // in this term stood the pair 7 voxels apart and put the knuckles 3.0
+      // voxels short; the hand's own commanded reach never exceeded 3.90 in
+      // any frame of it, and what is left of that after the aim's downward
+      // tilt and the pose clamp's 0.65 is the forward distance below.
+      //
+      // A FRACTION AND NOT A SECOND LENGTH, so it follows the rig: re-proportion
+      // the arm and the number moves with it. If the driver's reach law changes
+      // this is the line to re-measure, and the harness is how.
+      // ---- AND THE FULL BONE LENGTH IS THE ANSWER, MEASURED TWICE --------
+      //
+      // Three quarters of it, then 0.65, were tried against the forward
+      // distance a punch delivers (the hand's own commanded reach tops out at
+      // 3.90 of a 5.0 arm, and the aim at a chest is below level). Both are
+      // SHORTER THAN TWO BODIES CAN STAND APART: `ApplyCrowdSpacing` holds two
+      // humans at about four and a half voxels, so a creature whose committing
+      // distance is 3.25 never gets to swing at all -- measured, `unarmed-
+      // attack` reported 4 attack requests and ZERO cut ticks, every one of
+      // them refused by BeginStroke for being out of its own reach.
+      //
+      // So the reach is the arm, and what is left over is AIM rather than
+      // distance: the shortfall the harness still measures at the far end of
+      // the band is the punch crossing from an off-centre shoulder, which is a
+      // question about where a blow is aimed and not about how far it goes.
+      effector += bones;
+    }
+  } else if (items_ != nullptr && !mob.HeldItem().empty()) {
+    // A HELD WEAPON SAYS HOW FAR IT REACHES, and `ItemDef::reach` is that
+    // number — the mace's 8 against the sword's 10 is the whole difference
+    // between the two at the footwork level, and a profile's `attack.reach`
+    // that ignored it made every armed creature stand off at sword distance
+    // whatever it was holding.
+    if (const ItemDef* it = items_->At(items_->Find(mob.HeldItem()))) {
+      // THE SAME TWO TERMS AS A FIST: what the arm delivers, plus the weapon
+      // on the end of it. `ItemDef::reach` alone is the BLADE's own statement
+      // and taking it as the whole answer stood a mace-holder ten voxels off
+      // and put its head 3.9 short (measured; 98 of its 100 probe rays found
+      // air). The edge is read off the live weapon, which is the same segment
+      // the sweep is about to probe with, so a chipped or re-authored blade
+      // moves this number with it.
+      Vec3 hand{};
+      float armR = 0.0f;
+      if (mob.WeaponArmPose(hand, armR)) effector = armR * 0.65f;
+      Vec3 eb{}, et{};
+      float ehw = 0.0f;
+      if (mob.WeaponEdge(eb, et, ehw)) effector += (et - eb).len();
+      else effector = std::max(effector, it->reach);
+    }
+  }
+  float closes = 0.0f;
+  if (sty.lunge.Any()) {
+    float scale = 1.0f;
+    if (mob.anim_.locoState >= 0 &&
+        mob.anim_.locoState < (int)mob.skel_.states.size())
+      scale = std::max(0.0f, mob.skel_.states[mob.anim_.locoState].lungeScale);
+    // THE SAME FLIGHT THE LAUNCH WILL USE, which is the BALLISTIC one and not
+    // the authored tick count: a hop is airborne for 2*rise/g and the author's
+    // `ticks` is the number they are aiming the cut at. Using `ticks` here and
+    // the ballistic time over there made the two chase each other -- the reach
+    // grew with the authored flight, the leap only got the real one, and the
+    // creature committed from a distance its own pounce could not cross.
+    // Measured: raising the lunge's speed ceiling moved the stand-off from 23
+    // to 35 and the landing from 4.3 voxels short to 15.1.
+    const float g0 = MetresToCells(CurrentTuning().physics.gravity);
+    const float rise0 = MetresPerSecToCells(sty.lunge.rise) * scale;
+    const float ballistic0 = g0 > 1e-3f ? 2.0f * rise0 / g0 : 1.0f;
+    const float flight0 =
+        std::max(1.0f / 30.0f,
+                 std::min((float)std::max(1, sty.lunge.ticks) * (1.0f / 30.0f),
+                          ballistic0));
+    // ---- AND WHAT A EULER-INTEGRATED HOP ACTUALLY DELIVERS ---------------
+    // The closed form 2*rise/g is the flight of a parabola; `UpdateFall` walks
+    // one in straight per-tick steps from a body that starts ON the ground, and
+    // loses about half a tick at each end plus the launch latch. Measured
+    // through `--shot-strike` across the speed range: a leap whose closed form
+    // says 30.6 voxels covers 20. The factor is that measurement, and the
+    // harness is how to re-take it if the fall integrator changes.
+    closes = MetresPerSecToCells(sty.lunge.speed) * scale * flight0 * 0.65f;
+  }
+  // NO BODY-DEPTH TERM. The first version added half a torso for "the victim's
+  // surface is nearer than its centre", and it double-counts: the pivot the
+  // effector's reach is measured from (a shoulder, a neck) already sits at the
+  // ATTACKER'S centre, so the two halves cancel and what is left is the plain
+  // sum. Measured, it stood the pair a whole body too far apart.
+  return effector + closes;
+}
+
 float MobSystem::AttackReachOf(const Mob& mob) const {
   const ai::Profile* pr = behaviors_.At(mob.ai_.profile);
   if (pr == nullptr) return 0.0f;
@@ -3439,9 +3619,9 @@ float MobSystem::AttackReachOf(const Mob& mob) const {
   // furthest thing you can do, then do whatever fits".
   for (const std::string& n : pr->attack.styles) {
     const AttackStyle* s = styles_.At(styles_.Find(n));
-    if (s == nullptr || s->reach <= 0.0f) continue;
+    if (s == nullptr) continue;
     if (!StyleUsable(mob, *s)) continue;
-    reach = std::max(reach, s->reach);
+    reach = std::max(reach, StyleReachOn(mob, *s));
   }
   return reach;
 }
@@ -3576,12 +3756,28 @@ void MobSystem::StepStroke(Mob& mob, uint32_t tick, World& world,
       }
     }
     sw.tick = tick;
+    // BLUNT AND BITE ARE IMPULSES (melee.h EdgeSweep::struck): the stroke's
+    // own set, so the mace bruises each plate once however long its cut phase
+    // ran. The kerf is unaffected and still deepens every tick.
+    sw.struck = &st.struck;
+    // A FIST IS PART OF THE ARM THAT THROWS IT (melee.h selfMounted), and
+    // probes along its TRAVEL. A set of JAWS does not: its edge already points
+    // out of the face -- that is what the Aim effector spends the whole stroke
+    // making true -- so the edge axis is the right probe direction and the
+    // travel (a downward arc) is the wrong one. Measured: probing a bite along
+    // its travel sent every ray down into the biter's own chest.
+    sw.selfMounted = nw != nullptr &&
+                     mob.StrikeEffectorKind() == StrikeEffectorMode::Chain;
     sw.valid = true;
     const EdgeSweepResult res =
         MeleeSweepDamage(sw, st.melee.tuning, mob, *phys_, *this, *debris_,
                          world, spawns);
     st.sweeps++;
     st.bodiesHit += res.bodiesHit;
+    st.probesCast += res.probesCast;
+    st.probesAir += res.probesAir;
+    st.probesSelf += res.probesSelf;
+    st.probesBody += res.probesBody;
     st.topTipSpeed = std::max(st.topTipSpeed, res.tipSpeed);
     if (res.arrested) {
       // PARRIED. The cut is over: the remaining cut ticks are abandoned and
@@ -3693,6 +3889,19 @@ void MobSystem::StepStroke(Mob& mob, uint32_t tick, World& world,
       scale = std::max(0.0f, mob.skel_.states[mob.anim_.locoState].lungeScale);
     const float airTime =
         std::max(1, sty->lunge.ticks) * (1.0f / 30.0f);
+    // THE FLIGHT IS AS LONG AS THE BODY IS ACTUALLY IN THE AIR, which is set
+    // by the RISE and gravity and not by the authored tick count: a ballistic
+    // hop is airborne for 2*v/g. Sizing the horizontal against the authored
+    // `ticks` when the real flight is shorter lands the creature short by the
+    // ratio, every time, and the author has no way to see it -- measured, a
+    // 9-tick authored lunge at rise 1.1 m/s was airborne for 6 and fell 3
+    // voxels short of its own reach. Taking the shorter of the two keeps the
+    // author's number as the CEILING it reads as while making the arithmetic
+    // honest about the arc the body will really fly.
+    const float g = MetresToCells(CurrentTuning().physics.gravity);
+    const float riseCells = MetresPerSecToCells(sty->lunge.rise) * scale;
+    const float ballistic = g > 1e-3f ? 2.0f * riseCells / g : airTime;
+    const float flight = std::max(1.0f / 30.0f, std::min(airTime, ballistic));
     // REACH AT LANDING IS THE EFFECTOR'S, NOT THE STYLE'S. The two mean
     // opposite things and confusing them makes the lunge a no-op: the style's
     // `reach` is how far out the creature is willing to COMMIT (22 voxels for
@@ -3701,7 +3910,28 @@ void MobSystem::StepStroke(Mob& mob, uint32_t tick, World& world,
     // arm/neck reach the driver is already bounded by. Measured with the
     // style's number: every launch computed `dist - 22 <= 0`, capped the
     // horizontal at zero and produced a creature that hopped on the spot.
-    const float want = (dist - armReach) / airTime;
+    // ---- THE POUNCE AIMS AT YOU; THE WALL TEST STOPS IT ------------------
+    //
+    // Subtracting the effector's reach here was meant to make the body arrive
+    // at striking distance rather than through the victim, and it overshot in
+    // the wrong direction: a launch loses a little to the first-tick latch and
+    // to integrating a curve in straight steps, so the reach came OFF TWICE
+    // and a 23-voxel lunge landed 4.3 short with the jaws reaching 1.7.
+    // Measured, that is a zombie that leaps the whole way and then stands
+    // there snapping at air.
+    //
+    // There is already something that stops a body arriving inside another
+    // one, and it is the same `fits()` the walk drive uses: `BlockedByMob`
+    // refuses the step that would overlap and `airVel_` is spent against it
+    // (mob.cpp UpdateFall). So the leap is aimed AT the target and the wall
+    // test arbitrates the last voxel -- one rule doing the job instead of two
+    // estimates of it.
+    // THE SAME 0.65 `StyleReachOn` APPLIES, and for the same reason: the
+    // closed-form flight is a parabola's and UpdateFall walks it in straight
+    // per-tick steps, so the velocity needed to COVER `dist` is the one that
+    // would cover it in the time the integrator really gives. Sizing against
+    // the closed form left every pounce a quarter short.
+    const float want = dist / (flight * 0.65f);
     const float mag = std::min(MetresPerSecToCells(sty->lunge.speed) * scale,
                                std::max(0.0f, want));
     const Vec3 dir = dist > 1e-3f ? to * (1.0f / dist) : mob.Facing();
@@ -15502,6 +15732,26 @@ bool Mob::WeaponStrokePose(Vec3& outHandFromShoulder, Vec3& outTipFromShoulder,
     // ride ahead of it exactly as they do in life. NOTHING about the hitbox
     // moves: `WeaponEdge` reads the authored segment off the live transform
     // and is a separate question from where the driver is steering.
+    // ---- AND IT IS REPORTED, NOT SUPPRESSED (2026-09-15) ----------------
+    //
+    // Reporting a Chain effector's tip AT ITS HAND was tried, to take the
+    // driver's "no blade: the point IS the hand" path and open up the reach
+    // band a one-voxel bar collapses. It does open it -- the commanded radial
+    // travel went 0.94 -> 2.16 voxels -- and it costs more than it buys: with
+    // `bladeLen_` at zero the driver's lean machinery drops out entirely and
+    // the azimuth channel runs free, so a straight punch commanded 2.20 rad of
+    // azimuth against an authored 0.24 and `npc-styles` correctly reported
+    // that a thrust had turned into a swing. The knuckles' 10.2-voxel path
+    // through the world was the same thing seen from outside.
+    //
+    // The band is not what was stopping punches landing -- the probe rays
+    // dying inside the wielder's own hand was (melee.cpp's ignore-list cast).
+    // But the band collapse is real on its own account: with the knuckles
+    // reported as a blade the authored thrust was clipped at both ends and
+    // `npc-styles` measured 0.94 voxels of radial travel against its own 1.0
+    // floor. Removing it and MEASURING found the azimuth blow-up was already
+    // there without it, so the band is opened and the swing question is left
+    // where it belongs -- with the authored numbers and a human's eye.
     if (effMode == StrikeEffectorMode::Chain) return true;
     // ---- AN AIM EFFECTOR IS ONE PART ROTATING ---------------------------
     // Same statement, for the same reason, with the pivot at the part's own
@@ -15643,7 +15893,34 @@ bool Mob::WeaponEdge(Vec3& outBase, Vec3& outTip, float& outHalfWidth,
     const Quat nq{np.xf.quat[0], np.xf.quat[1], np.xf.quat[2], np.xf.quat[3]};
     outBase = np.xf.pos + QuatRotate(nq, nw->edgeFrom);
     outTip = np.xf.pos + QuatRotate(nq, nw->edgeTo);
-    outHalfWidth = nw->edgeHalfWidth;
+    // ---- A FIST IS A FIST-SIZED THING, NOT A WIRE (2026-09-15) ----------
+    //
+    // `MeleeSweepDamage` sweeps a SEGMENT and asks how near each voxel came to
+    // it; `halfWidth` is the whole of the blow's thickness. For a sword that
+    // is right -- a blade really is a plane a couple of centimetres thick, and
+    // the length of the segment does the work. A natural weapon has almost no
+    // length (1.1 voxels of knuckle, 1.7 of jaw against a sword's 8), so the
+    // half-width is all it has, and authored as the RADIUS OF THE CARVE it is
+    // far thinner than the thing swinging: a fist is ~10 cm of bone and
+    // knuckle, and it was probing as a 5 cm wire.
+    //
+    // Measured through `--shot-strike`: `human@2 punch_r human` put the point
+    // 0.7 voxels from the victim's nearest voxel with a 0.5-voxel half-width
+    // and reported ZERO bodies hit. The punch was in contact and the geometry
+    // said it was not.
+    //
+    // So the PROBE gets a floor of half a real fist while the authored number
+    // stays what it is. It is a length in METRES like every other body
+    // dimension here, so it follows kVoxelMeters instead of meaning something
+    // different at every world scale; and it is a MAX, so a creature that
+    // authors a genuinely broad weapon (a club of a forearm, a whale's jaw)
+    // keeps its own number.
+    // A WHOLE VOXEL, not half of one: the probe measures to voxel CENTRES, and
+    // a cell's own half-diagonal is 0.87 of a voxel -- so a hitbox sized to the
+    // fist's surface is still short of the surface it is trying to touch by
+    // most of a cell. 10 cm covers both the fist and that discretisation, and
+    // is the number the harness lands.
+    outHalfWidth = std::max(nw->edgeHalfWidth, MetresToCells(0.10f));
     if (outFlat) *outFlat = Vec3{};
     return true;
   }

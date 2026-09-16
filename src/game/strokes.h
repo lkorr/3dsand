@@ -260,6 +260,15 @@ struct StrokeCursor {
   // Where the windup is steering to, in the wielder's basis.
   float wantAz = 0, wantEl = 0, wantReach = 0;
 
+  // ---- WHAT THIS STROKE HAS ALREADY BRUISED (melee.h EdgeSweep::struck) --
+  // Rig slots this swing has already delivered its BLUNT/BITE impulse to. On
+  // the cursor rather than on the sweep because the sweep is one tick and the
+  // impulse is one STROKE -- the thing that owns "this swing" is the thing
+  // that owns the phase machine. Cleared by Reset(), so a new swing hits
+  // afresh; a `std::vector` because a stroke meets a handful of slots at most
+  // and a set would allocate for every one of them.
+  std::vector<uint64_t> struck;
+
   bool Active() const { return phase != Phase::Idle; }
   bool Cutting() const { return phase == Phase::Cut; }
   void Reset() { *this = StrokeCursor{}; }
@@ -306,6 +315,10 @@ struct NpcStroke : StrokeCursor {
   int sweeps = 0;        // ticks a damage sweep actually ran
   int bodiesHit = 0;     // summed over those ticks
   float topTipSpeed = 0; // fastest the edge went, world voxels/sec
+  // ...and WHERE THE PROBE RAYS WENT, summed over the stroke (melee.h
+  // EdgeSweepResult). A stroke that reports `bodiesHit 0` is answering a
+  // question with a number that has four causes; these say which.
+  int probesCast = 0, probesAir = 0, probesSelf = 0, probesBody = 0;
 
   // Shadows StrokeCursor::Reset on purpose: an NPC reset clears the whole
   // swing (melee state, edge memory, damage tallies), not just the program.

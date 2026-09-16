@@ -148,9 +148,19 @@ check(MELEE.neutralStrike(lib, true) !== MELEE.neutralStrike(lib, false),
         `style "${s.name}" authored before the unarmed schema is unchanged`);
   }
   const punch = by('punch_r'), bite = by('bite_lunge');
+  // REACH 0 IS THE ANSWER NOW, not a missing number: a natural style asks the
+  // BODY how far it reaches (MobSystem::StyleReachOn), because every authored
+  // one was a lie the rig could not keep -- punch_r claimed 9 on an arm that
+  // reaches 5 and --shot-strike measured the fist stopping 6.7 voxels short.
+  // So the assertion is the opposite of what it was: a natural style must NOT
+  // carry a hand-guessed reach.
   check(!!punch && punch.weapon === 'fist.R' && punch.fallback
-        && punch.reach > 0,
-    'punch_r names a natural weapon, is a fallback, and states its own reach');
+        && punch.reach === 0,
+    'punch_r names a natural weapon, is a fallback, and derives its reach');
+  for (const s2 of lib.styles)
+    if (s2.weapon !== 'held')
+      check(s2.reach === 0,
+        `natural style "${s2.name}" derives its reach from the body`);
   check(!!bite && bite.weapon === 'jaws' && !bite.fallback,
     'bite_lunge names the jaws and is NOT a fallback');
   check(!!bite && MELEE.lungeAny(bite.lunge) && bite.lunge.at === 'windup'

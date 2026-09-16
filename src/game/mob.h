@@ -3053,8 +3053,12 @@ class MobSystem {
   // that sets the windup and cut tick counts. A gate that wants the same swing
   // whatever ran before it passes one; the game passes nothing and keeps the
   // variation it is there for. See the note at the call site.
+  // `targetId`, when non-zero, is WHO is being hit -- which is what lets a
+  // scripted swing draw the style's `target` limb (MobSystem::PickTargetLimb).
+  // Zero aims at the point alone and takes today's chest, which is what a
+  // caller with no victim in mind wants.
   bool ForceAttack(uint64_t mobId, const std::string& style, Vec3 targetPoint,
-                   uint32_t tick, uint32_t seed = 0);
+                   uint32_t tick, uint32_t seed = 0, uint64_t targetId = 0);
   // SetGuard: hold the blade at a stated azimuth/elevation in the creature's
   // OWN facing basis, with the point pushed out to `reachFrac` of the arm's
   // reach. Held until ClearGuard or until an attack replaces it. This is how a
@@ -3071,6 +3075,21 @@ class MobSystem {
   // computed here, where both the library and the rig are visible, and handed
   // into `ai::Think` as an INPUT on SelfView.
   float AttackReachOf(const Mob& mob) const;
+  // ---- HOW FAR THIS STYLE CAN ACTUALLY LAND (2026-09-15) -----------------
+  //
+  // World voxels, centre-to-centre, DERIVED FROM THE BODY: the effector's own
+  // reach (an arm plus its edge, or a neck lean plus the jaws) plus whatever
+  // the style's lunge closes, plus a body's half-depth for the victim it is
+  // walking into. A style's authored `reach` OVERRIDES it when non-zero.
+  //
+  // WHY THE DEFAULT IS DERIVED AND THE STYLES NOW AUTHOR ZERO. Every natural
+  // style shipped a hand-guessed number and every one of them was a lie the
+  // rig could not keep: `punch_r` claimed 9 on an arm that reaches 5, so the
+  // AI committed from nine voxels out and the fist stopped 6.7 short of the
+  // victim -- measured through `--shot-strike`, which is what found it. A
+  // number an author cannot check against the rig is a number that rots the
+  // moment the art changes, and the rig already knows the answer.
+  float StyleReachOn(const Mob& mob, const AttackStyle& sty) const;
   // ---- WHICH LIMB A BLOW IS AIMED AT (strokes.h StyleTargetWeight) --------
   //
   // Draws from the style's `target` weights over the victim's LIVE BASE limbs,
@@ -3805,6 +3824,12 @@ class MobSystem {
   // animation. The long note at their definitions says why the order within a
   // tick is what it is.
   void BeginStroke(Mob& mob, const ai::AttackRequest& req, uint32_t tick);
+  // THE ONE DOOR INTO A SWING: everything a stroke IS, with the decisions
+  // about WHETHER left to its two callers (the AI's BeginStroke and the
+  // scripted ForceAttack). See the long note at the definition for what
+  // drifted apart before it existed.
+  void StartStroke(Mob& mob, int styleIndex, uint64_t targetId,
+                   Vec3 targetPoint, uint32_t tick, uint32_t seed);
   void StepStroke(Mob& mob, uint32_t tick, World& world,
                   std::vector<ParticleSpawn>& spawns);
   // Why an attack request was dropped, ONCE per (mob, reason) — see the long

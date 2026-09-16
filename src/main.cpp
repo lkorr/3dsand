@@ -3180,21 +3180,55 @@ int RunStrikeShot(GpuContext& ctx, World& world, Simulation& sim, Physics& phys,
     mobs.PostStep();
   };
 
-  // ---- HOW FAR APART. The style's own reach if it states one, else the
-  // profile's — the same precedence MobSystem::BeginStroke applies, and the
-  // reason it matters here is that a lunging bite states 22 and a punch
-  // states 9: stood at the punch's distance the lunge has nowhere to go, and
-  // stood at the lunge's the punch is refused before it draws.
-  float gap = A.gap > 0.0f ? A.gap : sty.reach;
+  // ---- HOW FAR APART: THE DISTANCE THE AI WOULD ACTUALLY COMMIT FROM -----
+  //
+  // `MobSystem::StyleReachOn` -- the same number `BeginStroke` refuses a style
+  // against and `AttackReachOf` hands the arbiter -- which for a style that
+  // authors no `reach` is derived from the body: the effector's own reach plus
+  // whatever the lunge closes plus a body's half-depth. Photographing a blow
+  // at any other distance photographs a fight that never happens, and the
+  // harness's old fallback (the profile's 9, or a flat 10) is exactly how a
+  // punch came to be measured from nine voxels out on an arm that reaches
+  // five.
+  //
+  // IT NEEDS A LIVE RIG, so the attacker is spawned and given a few ticks to
+  // flatten a pose FIRST and the victim is placed afterwards. A `@gap`
+  // override still wins outright -- that is what it is for.
+  const uint64_t idA = mobs.Spawn(defA, {spawnX, h + 1, spawnZ});
+  if (!idA) {
+    std::fprintf(stderr, "--shot-strike: spawn failed\n");
+    return 1;
+  }
+  // PINNED BEFORE IT IS TICKED, not after. `duelist` is mobile and hostile,
+  // and four ticks of it is four ticks of a 31.5 vox/s walk -- measured, the
+  // attacker had wandered 3.2 voxels out of its own stand-off before the
+  // victim was even placed, and the readout's "shoulder-to-chest" came back
+  // at 3.8 on a 7-voxel gap. A harness that photographs a distance has to own
+  // that distance from the first tick.
+  mobs.SetMobBehavior(idA, "training_dummy");
+  // ---- ARMED BEFORE IT IS MEASURED --------------------------------------
+  // `StyleReachOn` asks the LIVE weapon how far it reaches, so a mace has to
+  // be in the fist before the stand-off is computed -- measured, computing it
+  // first stood a mace-holder at the profile's 10 and 98 of its 100 probe rays
+  // found air. Only the HELD item is needed here (armour changes no reach);
+  // the full `dress` still runs below and is what reports what was worn.
+  for (const std::string& nm0 : A.items) {
+    const ItemDef* it0 = items.At(items.Find(nm0));
+    if (it0 != nullptr && it0->kind == ItemKind::Melee) mobs.EquipItem(idA, it0);
+  }
+  for (int i = 0; i < 4; i++) mobTick();
+  float gap = A.gap;
   if (gap <= 0.0f) {
-    const int prof = mobs.Behaviors().Find(dA.behavior.empty() ? "duelist"
-                                                               : dA.behavior);
-    const ai::Profile* p = mobs.Behaviors().At(prof);
-    gap = (p != nullptr && p->attack.reach > 0.0f) ? p->attack.reach : 9.0f;
+    if (Mob* m0 = mobs.FindMobById(idA)) gap = mobs.StyleReachOn(*m0, sty);
+    if (gap <= 0.0f) {
+      const int prof = mobs.Behaviors().Find(dA.behavior.empty() ? "duelist"
+                                                                 : dA.behavior);
+      const ai::Profile* p = mobs.Behaviors().At(prof);
+      gap = (p != nullptr && p->attack.reach > 0.0f) ? p->attack.reach : 9.0f;
+    }
   }
   const int gapZ = std::max(2, (int)std::lround(gap));
 
-  const uint64_t idA = mobs.Spawn(defA, {spawnX, h + 1, spawnZ});
   const int hB = World::TerrainHeight(spawnX, spawnZ + gapZ, kDefaultSeed);
   const uint64_t idB = mobs.Spawn(defB, {spawnX, hB + 1, spawnZ + gapZ});
   if (!idA || !idB) {
@@ -3432,6 +3466,17 @@ int RunStrikeShot(GpuContext& ctx, World& world, Simulation& sim, Physics& phys,
   std::string weaponName = "(nothing)";
   float edgeGap = 1e9f, edgeLen = 0, chestGap = -1;
   bool sampled = false;
+  // ---- WHY THE POINT DID NOT GET THERE, in the arm's own numbers ---------
+  // A bare "0.7 voxels short" has four causes and from outside they are the
+  // same miss: the driver never COMMANDED the extension, the IK could not
+  // serve it, the pose clamp took it back, or the reported hand and the solved
+  // hand disagree. Mob::WeaponArmDiag separates all four, and this harness is
+  // where a human reads them (CLAUDE.md rule 6: attribution beats elimination).
+  int probesCast = 0, probesAir = 0, probesSelf = 0, probesBody = 0;
+  int diagTicks = 0, diagRan = 0;
+  float cmdReachMax = 0, gotReachMax = 0;
+  float worstIkMiss = 0, worstClampShift = 0, worstRoundTrip = 0;
+  float worstShoulderClamp = 0, worstElbowClamp = 0;
   auto sampleWeapon = [&]() {
     Mob* m = mobs.FindMobById(idA);
     if (m == nullptr) return;
@@ -3470,6 +3515,18 @@ int RunStrikeShot(GpuContext& ctx, World& world, Simulation& sim, Physics& phys,
         best = std::min(best, (mobs.LimbVoxelPos(idB, li, v) - tip).len());
     }
     if (best < 1e8f) edgeGap = std::min(edgeGap, best - hw);
+    const Mob::WeaponArmDiag& d = m->WeaponArmDiagnostics();
+    diagTicks++;
+    if (d.ran) {
+      diagRan++;
+      cmdReachMax = std::max(cmdReachMax, d.cmdHand.len());
+      gotReachMax = std::max(gotReachMax, d.gotHand.len());
+      worstIkMiss = std::max(worstIkMiss, d.ikMiss);
+      worstClampShift = std::max(worstClampShift, d.clampShift);
+      worstRoundTrip = std::max(worstRoundTrip, d.roundTrip);
+      worstShoulderClamp = std::max(worstShoulderClamp, d.shoulderClamp);
+      worstElbowClamp = std::max(worstElbowClamp, d.elbowClamp);
+    }
   };
   for (int i = 0; i < 260; i++) {
     const Mob* m = mobs.FindMobById(idA);
@@ -3477,6 +3534,10 @@ int RunStrikeShot(GpuContext& ctx, World& world, Simulation& sim, Physics& phys,
     if (s != nullptr) {
       if (s->Cutting()) cutTicks++;
       sweeps = std::max(sweeps, s->sweeps);
+      probesCast = std::max(probesCast, s->probesCast);
+      probesAir = std::max(probesAir, s->probesAir);
+      probesSelf = std::max(probesSelf, s->probesSelf);
+      probesBody = std::max(probesBody, s->probesBody);
       bodiesHit = std::max(bodiesHit, s->bodiesHit);
       topTipSpeed = std::max(topTipSpeed, s->topTipSpeed);
       if (s->targetLimb >= 0) targetLimb = s->targetLimb;
@@ -3555,6 +3616,27 @@ int RunStrikeShot(GpuContext& ctx, World& world, Simulation& sim, Physics& phys,
       A.gap > 0.0f ? " (@ override)" : "", sty.reach, profA.c_str(),
       sweeps, cutTicks, bodiesHit, topTipSpeed,
       arrested ? " (ARRESTED by a parry)" : "", edgeLen, edgeGap, chestGap);
+  // ---- THE ARM, when there is one (Mob::WeaponArmDiag) ------------------
+  // Printed for every chain effector, held or natural, because "the point did
+  // not get there" is the same question for a sword and a fist and the four
+  // causes are the same four. `commanded -> solved` is the pair that matters:
+  // they agree when the arm served the ask and diverge by exactly the
+  // shortfall when it could not.
+  std::printf(
+      "  probes      %d rays cast: %d found air, %d never left the wielder, "
+      "%d found a body\n",
+      probesCast, probesAir, probesSelf, probesBody);
+  // ZERO IS AS INFORMATIVE AS ANY OTHER NUMBER HERE: an aim effector has no
+  // arm and reports 0/N, which is how a reader tells "the jaws are not on a
+  // chain" from "the chain never ran".
+  if (diagTicks > 0)
+    std::printf(
+        "  arm[%d/%d]   hand reach commanded %.2f -> solved %.2f vox; ik miss "
+        "%.2f, clamp shift %.2f vox (shoulder %.2f rad, elbow %.2f rad), "
+        "read-back err %.2f\n",
+        diagRan, diagTicks, cmdReachMax, gotReachMax, worstIkMiss,
+        worstClampShift,
+        worstShoulderClamp, worstElbowClamp, worstRoundTrip);
   if (targetLimb >= 0 && targetLimb < (int)dB.limbs.size())
     std::printf("  aimed at    %s (the style's `target` table drew it)\n",
                 dB.limbs[(size_t)targetLimb].name.c_str());
@@ -5692,6 +5774,11 @@ int main(int argc, char** argv) {
   // from an unknown pose would carve a segment the blade never travelled.
   Vec3 lastEdgeBase{}, lastEdgeTip{};
   bool lastEdgeValid = false;
+  // Rig slots the player's CURRENT swing has already delivered a blunt/bite
+  // impulse to (melee.h EdgeSweep::struck). Owned here rather than on either
+  // cursor because the player has two cut states -- the discrete program's and
+  // the freeform driver's -- and one swing must mean one impulse in both.
+  std::vector<uint64_t> playerStruck;
   // --duel-dummy fires once, from inside the tick loop (see the note there).
   bool duelDummySpawned = false;
 
@@ -9069,6 +9156,12 @@ int main(int argc, char** argv) {
           // alone made thrusts free actions (the player-styles gate caught
           // it). This is the NPC's own contract: MobSystem::StepStroke sweeps
           // on the CURSOR's cut, and tip speed still scales the damage.
+          // ONE STROKE, ONE IMPULSE PER SLOT (melee.h EdgeSweep::struck). The
+          // set is cleared on the first tick neither cut state is live, which
+          // is the same "is a cut happening" test the sweep gates on -- so a
+          // freeform wave and a discrete program both get exactly one blunt
+          // hit per body per swing with no mode read of their own.
+          if (!(melee.Cutting() || playerStrike.Cutting())) playerStruck.clear();
           if (lastEdgeValid && (melee.Cutting() || playerStrike.Cutting())) {
             EdgeSweep sw;
             sw.aPrev = lastEdgeBase;
@@ -9103,6 +9196,14 @@ int main(int argc, char** argv) {
                                              goreT.woundHeftMax);
             }
             sw.tick = tick;
+            // BLUNT AND BITE ARE IMPULSES (melee.h EdgeSweep::struck). The
+            // player has TWO cut states -- the discrete program's cursor and
+            // the freeform driver's own Slash -- so the set is owned here and
+            // cleared on the tick neither is cutting, which is mode-blind and
+            // is the same line the sweep gate below already reads.
+            sw.struck = &playerStruck;
+            // A FIST IS PART OF THE ARM THAT THROWS IT (melee.h selfMounted).
+            sw.selfMounted = avatar.EffectorWeapon() != nullptr;
             sw.valid = true;
             // ---- WHAT THE BLOW WAS, MEASURED FROM WHAT IT LEFT BEHIND ------
             //
