@@ -825,6 +825,31 @@ bool LoadMobDefs(const std::string& dir, const std::vector<MaterialDef>& mats,
       // and flagged here instead of being silently cubed.
       def.bleedPerDamage = j["bleed"].value("perDamage", 1.5f);
     }
+    // ---- WHAT THIS CREATURE'S BITE CARRIES (mob.h MobBiteDef; plan §6) -----
+    // By NAME, through the same FindMaterialId `bleed.material` just used, and
+    // for the same reason: a material id is its index in materials.json, which
+    // renumbers the moment somebody inserts a row. Missing is not an error —
+    // a creature with no `bite` block simply tears — but an UNKNOWN name is,
+    // because the only other symptom would be a zombie whose bite is clean.
+    if (j.contains("bite")) {
+      if (!j["bite"].is_object()) {
+        log += jp + ": `bite` is not an object — ignored\n";
+      } else {
+        auto mat = [&](const char* key, uint16_t& out) {
+          const std::string nm = j["bite"].value(key, "");
+          if (nm.empty()) return;
+          const int id = FindMaterialId(mats, nm);
+          if (id < 0)
+            log += jp + ": unknown bite " + key + " material \"" + nm + "\"\n";
+          else
+            out = (uint16_t)id;
+        };
+        mat("infect", def.bite.infectMat);
+        mat("stain", def.bite.infectStain);
+      }
+    }
+    // How much of an AIM effector's yaw the spine takes (mob.h).
+    def.aimSpineShare = std::clamp(j.value("aimSpineShare", 0.35f), 0.0f, 1.0f);
     // ---- WORLD-SPACE SIDECAR LENGTHS (DESIGN.md §3b) --------------------
     // `speed`, `severImpactSpeed`, `gait.rideHeight`, `states[].bodyYOffset`
     // and clip position keys are WORLD VOXELS (or voxels/sec), not art
@@ -1332,6 +1357,81 @@ bool LoadMobDefs(const std::string& dir, const std::vector<MaterialDef>& mats,
         }
       }
 
+      // ---- NATURAL WEAPONS: the parts that ARE weapons (mob.h; plan §3) ----
+      //
+      // Beside the sockets, and parsed the same way and for the same reasons:
+      // both name a rig part and resolve it to an index HERE, so a block
+      // naming a part this rig does not have is a loud diagnostic rather than
+      // a creature that swings nothing.
+      //
+      // THE EDGE IS TWO POINTS IN THE PART'S OWN ART FRAME — the Y-up,
+      // origin-at-the-model's-min-corner frame `MobLimbDef::edgeFrom/edgeTo`
+      // are stored in, converted by `ArtToWorld()` on the line below exactly
+      // as those are. It does NOT take MobLimbDef's scene-axis map (`axis`
+      // with its (x, z, -y) swizzle), because that block authors an OFFSET
+      // ALONG ONE MODEL AXIS from a hilt, and a part has no hilt: a fist's
+      // edge runs from the wrist down and forward to the knuckles, which is
+      // not a multiple of any one axis. Two points is the honest shape, and it
+      // is the frame the Models tab already draws an item edge in.
+      {
+        const float inv = def.ArtToWorld();
+        auto point = [&](const json& v, Vec3 dflt) {
+          if (v.is_array() && v.size() == 3 && v[0].is_number() &&
+              v[1].is_number() && v[2].is_number())
+            return Vec3{v[0].get<float>(), v[1].get<float>(),
+                        v[2].get<float>()};
+          return dflt;
+        };
+        for (const auto& w : j.value("natural", json::array())) {
+          if (!w.is_object()) continue;
+          MobNaturalWeaponDef nw;
+          nw.name = w.value("name", "");
+          nw.part = w.value("part", "");
+          if (nw.name.empty() || nw.part.empty()) {
+            log += jp + ": a natural weapon needs both \"name\" and \"part\"\n";
+            continue;
+          }
+          nw.partIndex = sk.FindPart(nw.part);
+          if (nw.partIndex < 0) {
+            log += jp + ": natural weapon \"" + nw.name + "\" names part \"" +
+                   nw.part + "\", which is not a limb of this rig\n";
+            continue;
+          }
+          const json e = w.contains("edge") && w["edge"].is_object()
+                             ? w["edge"]
+                             : json::object();
+          nw.edgeFrom = point(e.contains("from") ? e["from"] : json(), {}) * inv;
+          nw.edgeTo = point(e.contains("to") ? e["to"] : json(), {}) * inv;
+          nw.edgeHalfWidth = e.value("halfWidth", 1.0f) * inv;
+          // A ZERO-LENGTH EDGE IS NOT A WEAPON. The sweep is a segment from
+          // last tick's position to this one; with from == to there is no
+          // blade to sweep, the melee driver's blade direction is undefined,
+          // and the only symptom would be a creature that punches and never
+          // connects. Same refusal `LoadAttackStyles` gives a cut that travels
+          // nowhere, and the `mob` gate asserts it independently.
+          if ((nw.edgeTo - nw.edgeFrom).len() < 1e-4f) {
+            log += jp + ": natural weapon \"" + nw.name +
+                   "\" has a degenerate edge (from == to) — skipped\n";
+            continue;
+          }
+          if (const json& s2 = w.contains("strike") ? w["strike"] : json();
+              s2.is_object()) {
+            nw.strike.cut = s2.value("cut", 0.0f);
+            nw.strike.blunt = s2.value("blunt", 0.0f);
+            nw.strike.bluntCarve = s2.value("bluntCarve", 0.0f);
+            nw.strike.armorBreak = s2.value("armorBreak", 0.0f);
+            nw.strike.bite = s2.value("bite", 0.0f);
+          }
+          if (!nw.strike.Any())
+            log += jp + ": natural weapon \"" + nw.name +
+                   "\" has no cut, blunt or bite — it will hit for nothing\n";
+          if (def.FindNatural(nw.name) >= 0)
+            log += jp + ": duplicate natural weapon \"" + nw.name +
+                   "\" — last wins\n";
+          def.natural.push_back(std::move(nw));
+        }
+      }
+
       if (j.contains("gait") && j["gait"].is_object()) {
         const json& g = j["gait"];
         GaitDef& gd = sk.gait;
@@ -1438,6 +1538,8 @@ bool LoadMobDefs(const std::string& dir, const std::vector<MaterialDef>& mats,
         rule.minChainsLost = s.value("minChainsLost", 0);
         rule.clip = s.value("clip", "");
         rule.speedScale = s.value("speedScale", 1.0f);
+        // Read AFTER speedScale so its default can BE speedScale (anim.h).
+        rule.lungeScale = s.value("lungeScale", rule.speedScale);
         rule.disableGait = s.value("disableGait", false);
         rule.bodyYOffset = s.value("bodyYOffset", 0.0f) * worldLen;
         rule.groundAlign =
@@ -1599,6 +1701,12 @@ void MobSystem::OnMaterialsReloaded(const std::vector<MaterialDef>& mats,
   densityOf_.clear();
   classOf_.clear();
   matGpu_.clear();
+  matNames_.clear();
+  matNames_.reserve(mats.size());
+  for (const MaterialDef& m : mats) matNames_.push_back(m.name);
+  // An id is only valid against the table it was resolved from.
+  matNameLast_.clear();
+  matNameLastId_ = 0;
   matSelfActive_.clear();
   matHasPair_.clear();
   matHot_.clear();
@@ -3093,40 +3201,198 @@ static void NpcStrokeSmoothing(MeleeTuning& t) {
   // to a 4.59 vox miss. Only the stroke-position lag is the mouse filter.
 }
 
+// ---- WHY THIS CREATURE DID NOT SWING, ONCE PER (MOB, REASON) ---------------
+//
+// A dropped attack request has to be LOUD and must not be a flood. Before
+// natural weapons there was one reason ("no such style is loaded") and it
+// printed on every attempt; there are now four, and a zombie whose arms and
+// head are both gone requests an attack every cadence forever. Printing each
+// tick buries the log; printing nothing is the failure this whole readout
+// exists to prevent (CLAUDE.md rule 6: a bare "the NPC does not attack" has
+// four causes and from outside they are the same silence).
+//
+// So: a bitmask per mob id, one bit per reason, cleared when the creature
+// dies or the system resets. Content errors are said exactly once each.
+void MobSystem::ReportNoStroke(const Mob& mob, const ai::Profile* pr,
+                               int reason, const char* detail) {
+  uint8_t& seen = strokeGripe_[mob.id_];
+  const uint8_t bit = (uint8_t)(1u << (reason & 7));
+  if (seen & bit) return;
+  seen |= bit;
+  static const char* kWhy[] = {
+      "its profile is not loaded",
+      "none of its styles is usable (nothing held, and no live natural weapon)",
+      "the target is outside every usable style's reach",
+      "the style names a weapon this rig does not have",
+  };
+  std::printf("mob %llu (\"%s\"): attack dropped — %s%s%s\n",
+              (unsigned long long)mob.id_,
+              pr != nullptr ? pr->name.c_str() : "?",
+              kWhy[reason & 3], detail && *detail ? ": " : "",
+              detail ? detail : "");
+}
+
+// ---- WHICH LIMB OF THE VICTIM (AttackStyle::target; plan §5) --------------
+//
+// Weights over TAGS, drawn counter-based on (attacker id, tick) like every
+// other variation in a stroke, over the victim's LIVE BASE limbs only — a
+// worn shell or a held sword is a rig slot and aiming at one would be aiming
+// at somebody's coat. An absent table, an unknown tag, or a victim with
+// nothing left returns -1, which every caller reads as today's chest.
+int MobSystem::PickTargetLimb(const AttackStyle& sty, const Mob& victim,
+                              uint64_t attackerId, uint32_t tick) {
+  if (sty.target.empty()) return -1;
+  // Accumulate over (tag weight x that tag's live limbs), so a rig with two
+  // arms does not make "arm" twice as likely as its authored weight says: the
+  // tag's weight is split across the limbs that wear it.
+  float total = 0;
+  for (const StyleTargetWeight& w : sty.target) {
+    int n = 0;
+    for (int i = 0; i < victim.AppendedBase(); i++)
+      if (victim.LimbAlive(i) && victim.LimbDefAt(i).tag == w.tag) n++;
+    if (n > 0) total += w.weight;
+  }
+  if (total <= 0.0f) return -1;
+  const float roll =
+      rng::Unit01(rng::Hash3((uint32_t)attackerId ^ 0x7A69Eu, tick, 0)) * total;
+  float acc = 0;
+  for (const StyleTargetWeight& w : sty.target) {
+    std::vector<int> hits;
+    for (int i = 0; i < victim.AppendedBase(); i++)
+      if (victim.LimbAlive(i) && victim.LimbDefAt(i).tag == w.tag)
+        hits.push_back(i);
+    if (hits.empty()) continue;
+    acc += w.weight;
+    if (roll > acc) continue;
+    // ...and WHICH of that tag's limbs, on a second, independent draw: a
+    // bite that always took the left arm would be a distribution over tags
+    // wearing a distribution over limbs.
+    const uint32_t k =
+        rng::Hash3((uint32_t)attackerId ^ 0x7A69Fu, tick, 1) %
+        (uint32_t)hits.size();
+    return hits[k];
+  }
+  return -1;
+}
+
+// SET THE EFFECTOR FROM THE STYLE'S `weapon` (plan §4). Held is the default
+// and is what every style authored before this existed says; a natural weapon
+// resolves against the rig and picks its mode from the rig's own shape — a
+// part an IK chain can serve is a Chain, anything else is an Aim. That is one
+// rule instead of an authored mode field, and it means a creature whose rig
+// later grows a neck chain starts biting through the IK with no content edit.
+bool Mob::ArmForStyle(const AttackStyle& sty) {
+  if (sty.weapon.empty() || sty.weapon == "held") {
+    ClearStrikeEffector();     // falls through to the held item
+    return HeldSlot() >= 0;
+  }
+  const MobNaturalWeaponDef* nw = NaturalWeaponNamed(sty.weapon);
+  if (nw == nullptr || !NaturalWeaponUsable(*nw)) return false;
+  const int idx = def_ != nullptr ? def_->FindNatural(sty.weapon) : -1;
+  int handPart = -1;
+  const bool chained =
+      ChainForEffector(skel_, nw->partIndex, handPart) != nullptr;
+  SetStrikeEffector(nw->partIndex,
+                    chained ? StrikeEffectorMode::Chain
+                            : StrikeEffectorMode::Aim,
+                    idx);
+  return true;
+}
+
 void MobSystem::BeginStroke(Mob& mob, const ai::AttackRequest& req,
                             uint32_t tick) {
   NpcStroke& st = mob.stroke_;
-  // A creature with nothing in its fist has nothing to swing. The request is
-  // dropped rather than queued: the AI's attack clock has already advanced
-  // (ai_behavior.cpp says why), so an unarmed mob simply misses its turn
-  // instead of banking swings to fire the moment somebody hands it a sword.
-  if (mob.HeldSlot() < 0) return;
   const ai::Profile* pr = behaviors_.At(mob.ai_.profile);
   if (pr == nullptr) return;
+  // NO LONGER "IS SOMETHING IN ITS FIST" (plan §5). A creature with an empty
+  // hand and live fists has plenty to swing; what it must not do is start a
+  // stroke with no weapon on the end of it, and that question is
+  // `StyleUsable`'s, asked inside the draw. The request is still DROPPED
+  // rather than queued when nothing is usable: the AI's attack clock has
+  // already advanced (ai_behavior.cpp says why), so a creature with nothing
+  // left simply misses its turn instead of banking swings.
+  //
   // The profile's authored list; `style` is the single-entry spelling of the
   // same thing (ai_behavior.cpp's loader folds one into the other), so a
   // profile written before styles were plural still works.
-  const int si = PickAttackStyle(styles_, pr->attack.styles, mob.id_, tick);
+  const int si =
+      PickAttackStyle(styles_, pr->attack.styles, mob.id_, tick, &mob);
   if (si < 0) {
-    // LOUD, ONCE PER ATTEMPT, and not a crash: a profile naming a style the
-    // library does not have is a content error whose only other symptom is a
-    // creature that requests attacks forever and never swings.
-    std::printf(
-        "mob: \"%s\" asked for attack style \"%s\" and no such style is "
-        "loaded — not swinging\n",
-        pr->name.c_str(),
-        pr->attack.styles.empty() ? "" : pr->attack.styles[0].c_str());
+    ReportNoStroke(mob, pr, 1,
+                   pr->attack.styles.empty()
+                       ? "the profile lists no styles"
+                       : pr->attack.styles[0].c_str());
     return;
   }
   const AttackStyle& sty = *styles_.At(si);
+  // ---- ITS OWN REACH, BEFORE ANYTHING ELSE (plan §5) ---------------------
+  // The AI let this request through against `AttackReachOf` — the LONGEST
+  // reach the creature has — because the AI is style-ignorant by design. This
+  // is where the drawn style gets to say the target is too far for IT: a
+  // zombie that has closed to 14 voxels may lunge-bite (22) and may not punch
+  // (9), and refusing here is what stops the punch swinging at air.
+  //
+  // WITH A BODY'S SLACK ON IT. `StyleReachOn` is an ESTIMATE of a
+  // centre-to-centre distance for a surface-to-surface event, and `distance`
+  // is exact -- so comparing them to the last millivoxel makes the refusal a
+  // coin flip at exactly the range creatures actually stand at. Two humans are
+  // held about four and a half voxels apart by `ApplyCrowdSpacing` and a punch
+  // reaches five: measured, `unarmed-attack` reported 4 attack requests and
+  // ZERO cut ticks, every one refused for being a fraction of a voxel out of
+  // its own reach. Half a body is the width of the thing being hit, which is
+  // the term the estimate is missing.
+  const float styleReach = StyleReachOn(mob, sty);
+  const float slack =
+      mob.Def() != nullptr ? mob.Def()->worldSize.z * 0.5f : 1.0f;
+  if (req.distance > 0.0f && styleReach > 0.0f &&
+      req.distance > styleReach + slack)
+    return;   // not a content error: this style is simply the wrong one now
+  if (!mob.ArmForStyle(sty)) {
+    ReportNoStroke(mob, pr, 3, sty.weapon.c_str());
+    return;
+  }
+  StartStroke(mob, si, req.targetId, req.targetPoint, tick, 0);
+}
+
+// ============================================================================
+// ONE DOOR INTO A SWING (2026-09-15)
+//
+// `BeginStroke` (the AI's) and `ForceAttack` (a script's, a gate's,
+// `--shot-strike`'s) both start the same stroke, and they had drifted: the AI's
+// drew the style's `target` limb and played its `clip`, and the scripted one
+// did neither. So a harness built to photograph a bite photographed a creature
+// that never chose a limb and never hunched its shoulders, and the pictures
+// were of a different move from the one the game plays.
+//
+// That is the "two implementations of one feel" failure `strokes.h` was written
+// to prevent, arriving through the back door of a test seam. Everything a
+// stroke IS now lives here and both callers are the decisions IN FRONT of it:
+// which style, at what, and whether it is allowed.
+// ============================================================================
+void MobSystem::StartStroke(Mob& mob, int styleIndex, uint64_t targetId,
+                            Vec3 targetPoint, uint32_t tick, uint32_t seed) {
+  const AttackStyle& sty = *styles_.At(styleIndex);
+  NpcStroke& st = mob.stroke_;
   st = NpcStroke{};
-  st.style = si;
-  st.targetId = req.targetId;
-  st.targetPoint = req.targetPoint;
+  st.style = styleIndex;
+  st.targetId = targetId;
+  st.targetPoint = targetPoint;
+  // WHICH PART of the target (plan §5). Drawn here, once, at the same instant
+  // the style is: a blow that re-chose its limb every tick would be homing, and
+  // the whole point of the windup is that it does not.
+  //
+  // A SCRIPTED SWING AIMS AT A POINT AND MAY NAME NO VICTIM, and that is still
+  // worth a draw: `--shot-strike` and the gates hand a target id when they have
+  // one, and the limb choice is a fact about the STYLE, not about who asked.
+  if (const Mob* victim = FindMobById(targetId))
+    st.targetLimb = PickTargetLimb(sty, *victim, mob.id_, tick);
   // ONE SEED PER SWING, mixing who and when. Every draw in the runner indexes
   // off it, so the whole stroke — its style, its start bow, its tempo —
-  // replays from the same (mob, tick) and nothing reads a clock.
-  BeginStrokeProgram(st, sty, si, rng::Hash3((uint32_t)mob.id_, tick, 0x5747u));
+  // replays from the same (mob, tick) and nothing reads a clock. A caller that
+  // needs the SAME swing in any scope passes its own (mob.h ForceAttack).
+  BeginStrokeProgram(st, sty, styleIndex,
+                     seed != 0 ? seed
+                               : rng::Hash3((uint32_t)mob.id_, tick, 0x5747u));
   st.melee.Reset();
   st.melee.SetHandSign(mob.HandSign());
   // THE NPC'S BLADE OBEYS THE SAME SLIDERS AS THE PLAYER'S. Applied at every
@@ -3141,34 +3407,41 @@ void MobSystem::BeginStroke(Mob& mob, const ai::AttackRequest& req,
   ApplyMeleeTuning(st.melee.tuning);
   NpcStrokeSmoothing(st.melee.tuning);
   // The style's body animation, if it names one (strokes.h AttackStyle::clip).
-  // Same clip layer as a flinch or a jump; the arm claim below still wins on
-  // the weapon arm, so the clip is the rest of the body joining the swing.
+  // Same clip layer as a flinch or a jump; the arm claim still wins on the
+  // weapon arm, so the clip is the rest of the body joining the swing.
   if (!sty.clip.empty()) mob.PlayClip(sty.clip);
 }
 
 bool MobSystem::ForceAttack(uint64_t mobId, const std::string& style,
-                            Vec3 targetPoint, uint32_t tick) {
+                            Vec3 targetPoint, uint32_t tick, uint32_t seed,
+                            uint64_t targetId) {
   Mob* m = FindMobById(mobId);
-  if (m == nullptr || m->HeldSlot() < 0) return false;
+  if (m == nullptr) return false;
   const int si = styles_.Find(style);
   if (si < 0) return false;
   if (m->stroke_.Active() && m->stroke_.phase != NpcStroke::Phase::Guard)
     return false;
   const AttackStyle& sty = *styles_.At(si);
-  NpcStroke& st = m->stroke_;
-  st = NpcStroke{};
-  st.targetPoint = targetPoint;
-  BeginStrokeProgram(st, sty, si, rng::Hash3((uint32_t)mobId, tick, 0x5747u));
-  st.melee.Reset();
-  st.melee.SetHandSign(m->HandSign());
-  ApplyMeleeTuning(st.melee.tuning);   // BeginStroke says why
-  NpcStrokeSmoothing(st.melee.tuning);
+  // THE SAME USABILITY QUESTION THE AI's DRAW ASKS, and it has to be asked
+  // here too: a scripted attack that named a style this creature cannot swing
+  // would start a stroke with no edge on the end of it, which is the one thing
+  // the effector generalisation must never let happen. A gate that forces a
+  // punch on a handless body gets `false`, which is an answer it can assert on.
+  if (!StyleUsable(*m, sty)) return false;
+  if (!m->ArmForStyle(sty)) return false;
+  // ...AND THEN THE SAME DOOR (MobSystem::StartStroke). A scripted swing that
+  // skipped the limb draw and the clip was a different move from the AI's, and
+  // a harness that photographs a different move is worse than no harness.
+  StartStroke(*m, si, targetId, targetPoint, tick, seed);
   return true;
 }
 
 bool MobSystem::SetGuard(uint64_t mobId, float az, float el, float reachFrac) {
   Mob* m = FindMobById(mobId);
-  if (m == nullptr || m->HeldSlot() < 0) return false;
+  // A GUARD NEEDS AN ARM, NOT A SWORD. Holding a fist across a line is a pose
+  // a creature can take — and with the effector resolving to the held item by
+  // default, an armed one guards with the blade exactly as it always did.
+  if (m == nullptr || m->StrikeEffectorPart() < 0) return false;
   NpcStroke& st = m->stroke_;
   // A guard REPLACES an idle arm or another guard, never a live swing: a
   // creature mid-cut has already committed and the whole point of committing
@@ -3186,6 +3459,213 @@ bool MobSystem::SetGuard(uint64_t mobId, float az, float el, float reachFrac) {
   st.wantEl = el;
   st.wantReach = reachFrac;   // a FRACTION here; resolved against the live arm
   return true;
+}
+
+float MobSystem::StyleReachOn(const Mob& mob, const AttackStyle& sty) const {
+  if (sty.reach > 0.0f) return sty.reach;   // an author's override still wins
+  // ---- WHAT THE BODY CAN ACTUALLY DO ------------------------------------
+  //
+  // Three terms, and each one is a length the rig or the style already owns:
+  //
+  //   THE EFFECTOR'S OWN REACH. `WeaponArmPose` reports it for whichever part
+  //   the style names -- an arm's two bone lengths for a fist, the edge span
+  //   for jaws -- and it is measured from the pivot the stroke is expressed
+  //   about, which is the same pivot the AI's distance is not. That is why the
+  //   third term exists.
+  //
+  //   THE LUNGE. A style that leaps closes ground before it strikes, so its
+  //   reach is its arm PLUS its flight: the ceiling the launch may use
+  //   (`speed`) over the time it is airborne. The launch law caps the
+  //   horizontal at exactly the gap it has to close, so a committed lunge
+  //   arrives at striking distance rather than through the victim -- these two
+  //   numbers are the same arithmetic read forwards instead of backwards.
+  //
+  //   A BODY'S HALF-DEPTH. `attack.reach` is centre-to-centre and a creature
+  //   is not a point: the surface a fist has to meet is half a torso nearer
+  //   than the centre the distance is measured to. The ATTACKER'S own depth
+  //   stands in for the victim's, which is exact for two of a kind and the
+  //   right order of magnitude for anything else.
+  //
+  // A held weapon gets the same treatment through `ItemDef::reach`, which is
+  // what the item itself says it can do.
+  //
+  // ASKED OF THE STYLE, NOT OF THE EFFECTOR THAT HAPPENS TO BE ARMED. The
+  // question is "how far could this creature reach IF it swung this", and the
+  // AI asks it about every style in its list while none of them is running —
+  // so going through `WeaponArmPose` (which reads the LIVE effector) would
+  // have answered every question with the currently-held weapon's number, or
+  // with nothing at all for an empty-handed creature. The chain is found the
+  // same way `ArmForStyle` finds it, and measured off the same live bones.
+  float effector = 0.0f;
+  if (const MobNaturalWeaponDef* nw = mob.NaturalWeaponNamed(sty.weapon)) {
+    // THE EDGE COUNTS ONLY WHERE IT POINTS FORWARD. For an AIM effector it is
+    // the whole reach -- the jaws ARE the segment, and the segment is the
+    // head's forward. For a CHAIN effector it is a fist's wrist-to-knuckle
+    // line, which hangs DOWN off the arm and adds a voxel of nothing to how
+    // far the punch travels; counting it stood the pair a voxel too far apart
+    // and the harness measured the shortfall.
+    int handPart = -1;
+    const bool chained =
+        mob.ChainForEffector(mob.skel_, nw->partIndex, handPart) != nullptr;
+    effector = chained ? 0.0f : (nw->edgeTo - nw->edgeFrom).len();
+    handPart = -1;
+    if (const IkChain* ch =
+            mob.ChainForEffector(mob.skel_, nw->partIndex, handPart)) {
+      // The LIVE bone lengths, not an authored guess: a creature that has lost
+      // a forearm has a shorter punch and should commit from closer in. Same
+      // L1 + L2 the two-bone solver clamps its own annulus against.
+      const int i0 = ch->parts[0], i1 = ch->parts[1];
+      float bones = 0.0f;
+      if ((size_t)i0 < mob.anim_.model.size() &&
+          (size_t)i1 < mob.anim_.model.size() &&
+          handPart >= 0 && (size_t)handPart < mob.anim_.model.size())
+        bones = (mob.anim_.model[i1].pos - mob.anim_.model[i0].pos).len() +
+                (mob.anim_.model[handPart].pos - mob.anim_.model[i1].pos).len();
+      // ---- AN ARM DOES NOT DELIVER ITS OWN LENGTH -------------------------
+      //
+      // L1 + L2 is the STRAIGHT arm, and the driver never straightens it. The
+      // hand is held at `handExtend` of a band that is itself `reachFraction`
+      // of the arm, `StrokeReachIn` only touches the top of that band on the
+      // last tick of the cut, and the aim at a chest is BELOW level so part of
+      // what is left goes downward rather than forward. The forward distance a
+      // punch actually delivers is about three quarters of the bone length.
+      //
+      // MEASURED, not reasoned, and re-measured until the harness landed the
+      // blow. `--shot-strike human punch_r human` with the full 5.0-voxel arm
+      // in this term stood the pair 7 voxels apart and put the knuckles 3.0
+      // voxels short; the hand's own commanded reach never exceeded 3.90 in
+      // any frame of it, and what is left of that after the aim's downward
+      // tilt and the pose clamp's 0.65 is the forward distance below.
+      //
+      // A FRACTION AND NOT A SECOND LENGTH, so it follows the rig: re-proportion
+      // the arm and the number moves with it. If the driver's reach law changes
+      // this is the line to re-measure, and the harness is how.
+      // ---- AND THE FULL BONE LENGTH IS THE ANSWER, MEASURED TWICE --------
+      //
+      // Three quarters of it, then 0.65, were tried against the forward
+      // distance a punch delivers (the hand's own commanded reach tops out at
+      // 3.90 of a 5.0 arm, and the aim at a chest is below level). Both are
+      // SHORTER THAN TWO BODIES CAN STAND APART: `ApplyCrowdSpacing` holds two
+      // humans at about four and a half voxels, so a creature whose committing
+      // distance is 3.25 never gets to swing at all -- measured, `unarmed-
+      // attack` reported 4 attack requests and ZERO cut ticks, every one of
+      // them refused by BeginStroke for being out of its own reach.
+      //
+      // So the reach is the arm, and what is left over is AIM rather than
+      // distance: the shortfall the harness still measures at the far end of
+      // the band is the punch crossing from an off-centre shoulder, which is a
+      // question about where a blow is aimed and not about how far it goes.
+      effector += bones;
+    }
+  } else if (items_ != nullptr && !mob.HeldItem().empty()) {
+    // A HELD WEAPON SAYS HOW FAR IT REACHES, and `ItemDef::reach` is that
+    // number — the mace's 8 against the sword's 10 is the whole difference
+    // between the two at the footwork level, and a profile's `attack.reach`
+    // that ignored it made every armed creature stand off at sword distance
+    // whatever it was holding.
+    if (const ItemDef* it = items_->At(items_->Find(mob.HeldItem()))) {
+      // THE SAME TWO TERMS AS A FIST: what the arm delivers, plus the weapon
+      // on the end of it. `ItemDef::reach` alone is the BLADE's own statement
+      // and taking it as the whole answer stood a mace-holder ten voxels off
+      // and put its head 3.9 short (measured; 98 of its 100 probe rays found
+      // air). The edge is read off the live weapon, which is the same segment
+      // the sweep is about to probe with, so a chipped or re-authored blade
+      // moves this number with it.
+      // ---- AND THE ARM DELIVERS A QUARTER OF ITSELF, NOT TWO THIRDS -----
+      //
+      // The first version of this took `armReach * 0.65 + the blade`, and for
+      // a sword that came out at 11.25 voxels -- LONGER THAN THE BLOW LANDS.
+      // Measured through `--shot-strike human+sword horizontal_r human` at its
+      // own derived stand-off of 11: `120 rays cast, 120 found air`, the point
+      // 2.3 voxels short of the victim's nearest voxel. A horizontal cut is
+      // ACROSS the body, so at the moment it passes the target the blade is
+      // not extended toward it, and the hand is held at `handExtend` of its
+      // band rather than at the end of the arm.
+      //
+      // A creature that commits from further than its weapon lands is not a
+      // cosmetic error: it swings early and often, and in a crowd it swings
+      // into its neighbours. That is what took `crowd` from four survivors to
+      // three -- four armed duelists converging on one point, 11 attack
+      // requests and 54 cut ticks between them, worst survivor on 261 hp of
+      // 345 -- on a gate whose subject is personal space and which had never
+      // been a knife fight before.
+      //
+      // A quarter of the arm is what the two weapons in the repo agree on: a
+      // sword lands at about 9 (npc-strike's fixture has used a 9-voxel gap
+      // since it was written) and a mace at about 6 (which is the stand-off
+      // package C photographed it working at). Same shape as the natural
+      // weapon's term above, and re-measurable the same way.
+      Vec3 hand{};
+      float armR = 0.0f;
+      if (mob.WeaponArmPose(hand, armR)) effector = armR * 0.25f;
+      Vec3 eb{}, et{};
+      float ehw = 0.0f;
+      if (mob.WeaponEdge(eb, et, ehw)) effector += (et - eb).len();
+      else effector = std::max(effector, it->reach);
+    }
+  }
+  float closes = 0.0f;
+  if (sty.lunge.Any()) {
+    float scale = 1.0f;
+    if (mob.anim_.locoState >= 0 &&
+        mob.anim_.locoState < (int)mob.skel_.states.size())
+      scale = std::max(0.0f, mob.skel_.states[mob.anim_.locoState].lungeScale);
+    // THE SAME FLIGHT THE LAUNCH WILL USE, which is the BALLISTIC one and not
+    // the authored tick count: a hop is airborne for 2*rise/g and the author's
+    // `ticks` is the number they are aiming the cut at. Using `ticks` here and
+    // the ballistic time over there made the two chase each other -- the reach
+    // grew with the authored flight, the leap only got the real one, and the
+    // creature committed from a distance its own pounce could not cross.
+    // Measured: raising the lunge's speed ceiling moved the stand-off from 23
+    // to 35 and the landing from 4.3 voxels short to 15.1.
+    const float g0 = MetresToCells(CurrentTuning().physics.gravity);
+    const float rise0 = MetresPerSecToCells(sty.lunge.rise) * scale;
+    const float ballistic0 = g0 > 1e-3f ? 2.0f * rise0 / g0 : 1.0f;
+    const float flight0 =
+        std::max(1.0f / 30.0f,
+                 std::min((float)std::max(1, sty.lunge.ticks) * (1.0f / 30.0f),
+                          ballistic0));
+    // ---- AND WHAT A EULER-INTEGRATED HOP ACTUALLY DELIVERS ---------------
+    // The closed form 2*rise/g is the flight of a parabola; `UpdateFall` walks
+    // one in straight per-tick steps from a body that starts ON the ground, and
+    // loses about half a tick at each end plus the launch latch. Measured
+    // through `--shot-strike` across the speed range: a leap whose closed form
+    // says 30.6 voxels covers 20. The factor is that measurement, and the
+    // harness is how to re-take it if the fall integrator changes.
+    closes = MetresPerSecToCells(sty.lunge.speed) * scale * flight0 * 0.65f;
+  }
+  // NO BODY-DEPTH TERM. The first version added half a torso for "the victim's
+  // surface is nearer than its centre", and it double-counts: the pivot the
+  // effector's reach is measured from (a shoulder, a neck) already sits at the
+  // ATTACKER'S centre, so the two halves cancel and what is left is the plain
+  // sum. Measured, it stood the pair a whole body too far apart.
+  return effector + closes;
+}
+
+float MobSystem::AttackReachOf(const Mob& mob) const {
+  const ai::Profile* pr = behaviors_.At(mob.ai_.profile);
+  if (pr == nullptr) return 0.0f;
+  float reach = pr->attack.reach;
+  // THE LONGEST REACH IT CAN ACTUALLY USE. Unusable styles are excluded on
+  // purpose: a zombie whose head has come off must stop standing 22 voxels
+  // away waiting to bite, and it learns that from the same `StyleUsable` the
+  // draw uses rather than from a second rule. `BeginStroke` then refuses the
+  // styles the creature is too far away FOR, so the pair is "close to the
+  // furthest thing you can do, then do whatever fits".
+  //
+  // MAKING THE PROFILE A FALLBACK RATHER THAN A FLOOR WAS TRIED AND REVERTED
+  // (2026-09-15). It is the right shape -- a creature should not commit from
+  // a distance no style it owns can serve -- and it cost `ai-approach` and
+  // `corpse-armor`, which are tuned around the band a duelist keeps. The
+  // change belongs with a pass over those two fixtures, not smuggled in
+  // behind a spacing fix.
+  for (const std::string& n : pr->attack.styles) {
+    const AttackStyle* s = styles_.At(styles_.Find(n));
+    if (s == nullptr) continue;
+    if (!StyleUsable(mob, *s)) continue;
+    reach = std::max(reach, StyleReachOn(mob, *s));
+  }
+  return reach;
 }
 
 void MobSystem::ClearGuard(uint64_t mobId) {
@@ -3210,11 +3690,31 @@ void MobSystem::ClearGuard(uint64_t mobId) {
 // side) land on the wrong side of the body for that caller. This function
 // briefly used up x fwd, which is the mirror: an NPC's generous weapon-side
 // window sat across its chest.
+// AND A PRONE BODY'S UP IS NOT THE WORLD'S (plan §4, "pose robustness").
+// `bodyUp_` is the fitted ground plane's normal while a ground-aligned loco
+// state is running (Mob::SettleClipOwnedBody) — a crawler lies in a frame
+// tilted to the hill it is on, and its limbs are posed in that frame. A stroke
+// expressed about world up would then be asking for an elevation the body's own
+// shoulders do not have: the punch is solved correctly and lands in the wrong
+// place, by the grade of whatever it is lying on. Weighted by the state's own
+// `groundAlign`, so a body that only half-commits to the ground gets a basis
+// that only half-commits with it.
 static void MobBasis(const Mob& mob, Vec3& right, Vec3& up, Vec3& fwd) {
   up = Vec3{0, 1, 0};
+  const float align = mob.LocoGroundAlign();
+  if (align > 0.0f) {
+    const Vec3 bu = mob.BodyUp();
+    if (bu.len() > 1e-4f) {
+      up = (Vec3{0, 1, 0} * (1.0f - align) + bu.normalized() * align);
+      up = up.len() > 1e-4f ? up.normalized() : Vec3{0, 1, 0};
+    }
+  }
   fwd = mob.Facing();
   if (fwd.len() < 1e-4f) fwd = Vec3{0, 0, 1};
-  fwd = Vec3{fwd.x, 0, fwd.z};
+  // The facing is a HEADING, so it is planar by construction; re-orthogonalise
+  // it against whatever `up` turned out to be rather than flattening it to y=0,
+  // or a tilted basis is not a basis at all.
+  fwd = fwd - up * up.dot(fwd);
   fwd = fwd.len() > 1e-4f ? fwd.normalized() : Vec3{0, 0, 1};
   right = fwd.cross(up);
   right = right.len() > 1e-4f ? right.normalized() : Vec3{-1, 0, 0};
@@ -3232,11 +3732,23 @@ void MobSystem::StepStroke(Mob& mob, uint32_t tick, World& world,
   // cycle. The symptom was a defender standing with its sword exactly where the
   // animation had left it while the gate reported that its guard was set.
   const bool guarding = st.phase == NpcStroke::Phase::Guard;
-  if ((sty == nullptr && !guarding) || mob.HeldSlot() < 0 || !mob.alive_) {
-    // The sword was cut out of the hand, the creature died, or the style
-    // library reloaded out from under a live swing. Drop the pose claim rather
-    // than freezing the arm mid-cut.
+  // ---- IS THERE STILL A WEAPON ON THE END OF THIS ARM? -------------------
+  //
+  // IT IS THE EFFECTOR THAT MATTERS, NOT THE SWORD (plan §5). This used to
+  // read `mob.HeldSlot() < 0`, which is both too strict and too loose once a
+  // fist can swing: a zombie punching with an empty hand would have its stroke
+  // torn down on the tick it started, and a creature biting while holding a
+  // sword would carry on biting after the sword was cut out of its fist — the
+  // second being harmless and the first being the whole feature. The question
+  // is whether the PART DOING THE HITTING is still attached.
+  const int effPart = mob.StrikeEffectorPart();
+  const bool effGone = effPart < 0 || !mob.LimbAlive(effPart);
+  if ((sty == nullptr && !guarding) || effGone || !mob.alive_) {
+    // The fist was cut off, the sword left the hand, the creature died, or the
+    // style library reloaded out from under a live swing. Drop the pose claim
+    // rather than freezing the arm mid-cut.
     st.Reset();
+    mob.ClearStrikeEffector();
     mob.SetWeaponPose(WeaponPose{});
     return;
   }
@@ -3253,8 +3765,11 @@ void MobSystem::StepStroke(Mob& mob, uint32_t tick, World& world,
     // THE ITEM, BY NAME. Mob keeps `heldItem_` as a string precisely because
     // library indices are file-order and every R reload renumbers them
     // (item.h's index hazard), so the resolve happens here, per swing.
+    const MobNaturalWeaponDef* nw = mob.EffectorWeapon();
     const ItemDef* item =
-        items_ != nullptr ? items_->At(items_->Find(mob.HeldItem())) : nullptr;
+        nw == nullptr && items_ != nullptr
+            ? items_->At(items_->Find(mob.HeldItem()))
+            : nullptr;
     EdgeSweep sw;
     sw.aPrev = st.edgeBase;
     sw.bPrev = st.edgeTip;
@@ -3263,19 +3778,48 @@ void MobSystem::StepStroke(Mob& mob, uint32_t tick, World& world,
     sw.flatNow = flat;
     sw.dt = 1.0f / 30.0f;
     sw.halfWidth = halfWidth;
-    sw.damage = item ? item->damage : 12.0f;
-    sw.carveBonus = item ? item->carveBonus : 0.0f;
-    if (item) {
-      const auto& g = CurrentTuning().gore;
-      sw.heft = item->HeftFactor(g.woundHeftRef, g.woundHeftMax);
+    if (nw != nullptr) {
+      // ---- A NATURAL WEAPON'S BLOW (game/impact.h) ------------------------
+      // The whole profile, not a number: a fist arrives as trauma, a set of
+      // jaws as a tear, and a worn gauntlet over the fist has already been
+      // folded in by StrikeProfileFor. No blade behind it, so the neutral
+      // heft (EdgeSweep::heft's documented default) rather than an item's
+      // volume ratio - which is also what a fabricated sweep gets.
+      sw.strike = mob.StrikeProfileFor(*nw);
+    } else {
+      // The whole profile, not a number (game/impact.h): a sword fills
+      // mostly `cut` and behaves exactly as it did, a mace fills `blunt`.
+      if (item != nullptr) sw.strike = item->strike;
+      else sw.strike.cut = 12.0f;
+      sw.carveBonus = item ? item->carveBonus : 0.0f;
+      if (item) {
+        const auto& g = CurrentTuning().gore;
+        sw.heft = item->HeftFactor(g.woundHeftRef, g.woundHeftMax);
+      }
     }
     sw.tick = tick;
+    // BLUNT AND BITE ARE IMPULSES (melee.h EdgeSweep::struck): the stroke's
+    // own set, so the mace bruises each plate once however long its cut phase
+    // ran. The kerf is unaffected and still deepens every tick.
+    sw.struck = &st.struck;
+    // A FIST IS PART OF THE ARM THAT THROWS IT (melee.h selfMounted), and
+    // probes along its TRAVEL. A set of JAWS does not: its edge already points
+    // out of the face -- that is what the Aim effector spends the whole stroke
+    // making true -- so the edge axis is the right probe direction and the
+    // travel (a downward arc) is the wrong one. Measured: probing a bite along
+    // its travel sent every ray down into the biter's own chest.
+    sw.selfMounted = nw != nullptr &&
+                     mob.StrikeEffectorKind() == StrikeEffectorMode::Chain;
     sw.valid = true;
     const EdgeSweepResult res =
         MeleeSweepDamage(sw, st.melee.tuning, mob, *phys_, *this, *debris_,
                          world, spawns);
     st.sweeps++;
     st.bodiesHit += res.bodiesHit;
+    st.probesCast += res.probesCast;
+    st.probesAir += res.probesAir;
+    st.probesSelf += res.probesSelf;
+    st.probesBody += res.probesBody;
     st.topTipSpeed = std::max(st.topTipSpeed, res.tipSpeed);
     if (res.arrested) {
       // PARRIED. The cut is over: the remaining cut ticks are abandoned and
@@ -3320,16 +3864,29 @@ void MobSystem::StepStroke(Mob& mob, uint32_t tick, World& world,
   // integrated in, and about the SHOULDER rather than the mob's origin — an
   // offset centre smears azimuth into elevation exactly as it does in the
   // swing-plane gate, and this is the number a cut is aimed with.
+  // WHICHEVER JOINT THE STROKE ACTUALLY PIVOTS ABOUT, which is not always a
+  // shoulder any more: for a chain effector it is the chain's ROOT (the
+  // shoulder, or a hip if something ever kicks), and for an aim effector it is
+  // the effector's own parent joint (the chest, for jaws on a neck). Both are
+  // exactly the pivot `WeaponArmPose` measured its hand offset from, which is
+  // the agreement that stops the aim and the pose speaking different frames.
   Vec3 shoulder{};
   bool haveShoulder = false;
-  if (mob.heldPartIndex_ >= 0 &&
-      mob.heldPartIndex_ < (int)mob.skel_.parts.size()) {
-    const int handPart = mob.skel_.parts[mob.heldPartIndex_].parent;
-    // Two joints up from the item: hand -> forearm -> upper arm, whose joint
-    // IS the shoulder.
-    int p = handPart;
-    for (int k = 0; k < 2 && p >= 0; k++) p = mob.skel_.parts[p].parent;
-    if (p >= 0) haveShoulder = mob.PartJointWorld(p, shoulder);
+  if (effPart >= 0 && effPart < (int)mob.skel_.parts.size()) {
+    int pivot = -1;
+    if (mob.StrikeEffectorKind() == StrikeEffectorMode::Aim) {
+      // THE PART'S OWN JOINT, matching WeaponArmPose (which says at length why
+      // the parent joint was wrong): the head rotates about its neck, so that
+      // is the point the aim is a bearing FROM. Using the chest put the aim and
+      // the pose in two frames a whole neck apart.
+      pivot = effPart;
+    } else {
+      int handPart = -1;
+      if (const IkChain* ch =
+              mob.ChainForEffector(mob.skel_, effPart, handPart))
+        pivot = ch->parts[0];
+    }
+    if (pivot >= 0) haveShoulder = mob.PartJointWorld(pivot, shoulder);
   }
   if (!haveShoulder) {
     const Vec3 ws = mob.def_->worldSize;
@@ -3341,14 +3898,103 @@ void MobSystem::StepStroke(Mob& mob, uint32_t tick, World& world,
   const float liveAz = std::atan2(local.x, local.z);
   const float liveEl = std::asin(std::clamp(local.y / lr, -1.0f, 1.0f));
 
+  // ---- 3b. THE LUNGE (strokes.h StyleLunge; plan §5) ----------------------
+  //
+  // Fired on the FIRST TICK OF ITS NAMED PHASE, before the program advances,
+  // so a windup lunge leaves the ground on the same tick the telegraph starts
+  // and the flight IS the telegraph. `st.lunged` is what makes it once per
+  // stroke: a phase can be entered once, but a zero-length phase under tempo
+  // jitter could otherwise be stepped twice.
+  //
+  // THE MAGNITUDE IS THE GAP, NOT THE AUTHORED SPEED. `speed` is a CEILING —
+  // how fast this creature can throw itself — and the body has to arrive at
+  // striking distance, not inside the victim: a pounce that overshoots ends
+  // with the target behind it and the cut swinging through air. So the
+  // horizontal is `min(speed, (distance - reach) / flight time)`, which makes
+  // the same authored style a long leap from far out and a short hop from
+  // close in, with no second entry for either.
+  if (sty != nullptr && sty->lunge.Any() && !st.lunged && st.phaseTick == 0 &&
+      ((sty->lunge.at == "windup" && st.phase == NpcStroke::Phase::Windup) ||
+       (sty->lunge.at == "cut" && st.phase == NpcStroke::Phase::Cut))) {
+    st.lunged = true;
+    const Vec3 ws = mob.def_->worldSize;
+    const Vec3 centre = mob.origin_ + Vec3{ws.x * 0.5f, ws.y * 0.5f, ws.z * 0.5f};
+    Vec3 to = st.targetPoint - centre;
+    to.y = 0;
+    const float dist = to.len();
+    // A LOCO STATE SCALES IT (anim.h AnimStateRule::lungeScale): a crawler
+    // pounces low and short because it is dragging itself, and that is one
+    // number in its own state rule rather than a branch here.
+    float scale = 1.0f;
+    if (mob.anim_.locoState >= 0 &&
+        mob.anim_.locoState < (int)mob.skel_.states.size())
+      scale = std::max(0.0f, mob.skel_.states[mob.anim_.locoState].lungeScale);
+    const float airTime =
+        std::max(1, sty->lunge.ticks) * (1.0f / 30.0f);
+    // THE FLIGHT IS AS LONG AS THE BODY IS ACTUALLY IN THE AIR, which is set
+    // by the RISE and gravity and not by the authored tick count: a ballistic
+    // hop is airborne for 2*v/g. Sizing the horizontal against the authored
+    // `ticks` when the real flight is shorter lands the creature short by the
+    // ratio, every time, and the author has no way to see it -- measured, a
+    // 9-tick authored lunge at rise 1.1 m/s was airborne for 6 and fell 3
+    // voxels short of its own reach. Taking the shorter of the two keeps the
+    // author's number as the CEILING it reads as while making the arithmetic
+    // honest about the arc the body will really fly.
+    const float g = MetresToCells(CurrentTuning().physics.gravity);
+    const float riseCells = MetresPerSecToCells(sty->lunge.rise) * scale;
+    const float ballistic = g > 1e-3f ? 2.0f * riseCells / g : airTime;
+    const float flight = std::max(1.0f / 30.0f, std::min(airTime, ballistic));
+    // REACH AT LANDING IS THE EFFECTOR'S, NOT THE STYLE'S. The two mean
+    // opposite things and confusing them makes the lunge a no-op: the style's
+    // `reach` is how far out the creature is willing to COMMIT (22 voxels for
+    // bite_lunge, which is the whole point of the move), while what the body
+    // has to arrive at is the distance its jaws can actually bite from — the
+    // arm/neck reach the driver is already bounded by. Measured with the
+    // style's number: every launch computed `dist - 22 <= 0`, capped the
+    // horizontal at zero and produced a creature that hopped on the spot.
+    // ---- THE POUNCE AIMS AT YOU; THE WALL TEST STOPS IT ------------------
+    //
+    // Subtracting the effector's reach here was meant to make the body arrive
+    // at striking distance rather than through the victim, and it overshot in
+    // the wrong direction: a launch loses a little to the first-tick latch and
+    // to integrating a curve in straight steps, so the reach came OFF TWICE
+    // and a 23-voxel lunge landed 4.3 short with the jaws reaching 1.7.
+    // Measured, that is a zombie that leaps the whole way and then stands
+    // there snapping at air.
+    //
+    // There is already something that stops a body arriving inside another
+    // one, and it is the same `fits()` the walk drive uses: `BlockedByMob`
+    // refuses the step that would overlap and `airVel_` is spent against it
+    // (mob.cpp UpdateFall). So the leap is aimed AT the target and the wall
+    // test arbitrates the last voxel -- one rule doing the job instead of two
+    // estimates of it.
+    // THE SAME 0.65 `StyleReachOn` APPLIES, and for the same reason: the
+    // closed-form flight is a parabola's and UpdateFall walks it in straight
+    // per-tick steps, so the velocity needed to COVER `dist` is the one that
+    // would cover it in the time the integrator really gives. Sizing against
+    // the closed form left every pounce a quarter short.
+    const float want = dist / (flight * 0.65f);
+    const float mag = std::min(MetresPerSecToCells(sty->lunge.speed) * scale,
+                               std::max(0.0f, want));
+    const Vec3 dir = dist > 1e-3f ? to * (1.0f / dist) : mob.Facing();
+    mob.Launch(Vec3{dir.x * mag, MetresPerSecToCells(sty->lunge.rise) * scale,
+                    dir.z * mag});
+  }
+
   // ---- 4. drive the phase — the SHARED runner (game/strokes.cpp) -----------
   // Everything feel-shaped lives in StepStrokeProgram, which the player's
   // discrete attacks also call; this caller only owns what to do when the
   // program ends (drop the pose claim) and the NPC's fixed 30 Hz dt.
-  switch (StepStrokeProgram(st, sty, st.melee, liveAz, liveEl, 1.0f / 30.0f,
-                            right, up, fwd)) {
+  // `lr` is the target's distance from the very pivot the aim was taken about
+  // (a few lines up), so the bound and the bearing cannot disagree about which
+  // shoulder they meant.
+  switch (StepStrokeProgram(st, sty, st.melee, liveAz, liveEl, lr,
+                            1.0f / 30.0f, right, up, fwd)) {
     case StrokeStepResult::Finished:
       st.Reset();
+      // ...and hand the part back. A punch is over; a sword is still held, and
+      // ClearStrikeEffector falls through to it rather than to nothing.
+      mob.ClearStrikeEffector();
       mob.SetWeaponPose(WeaponPose{});
       return;
     case StrokeStepResult::Idle:
@@ -3391,6 +4037,13 @@ void MobSystem::DecideIntent(Mob& mob, const MobDef& def,
     self.headroomCells = mob.HeadroomCells();
     const ai::Profile* prof = behaviors_.At(mob.ai_.profile);
     self.faction = prof != nullptr ? ai::FactionId(prof->faction) : 0u;
+    // HOW FAR THIS CREATURE CAN REACH, as an INPUT (ai_behavior.h SelfView).
+    // The AI must not learn what styles are (design rule 4, and the note on
+    // AttackTuning::styles), but it cannot decide "close enough to swing"
+    // without the number — so the number is computed where the library and
+    // the rig are both visible and handed across, exactly as the terrain
+    // budgets above it are.
+    self.attackReach = AttackReachOf(mob);
 
     ai::GroundView gv;
     gv.haveGround = sense.haveGround;
@@ -3412,6 +4065,15 @@ void MobSystem::DecideIntent(Mob& mob, const MobDef& def,
 
     ai::IntentOut out;
     if (ai::Think(mob.ai_, behaviors_, self, gv, wv, tick, dt, out)) {
+      // ...and turn its head toward whatever it decided to fight (plan §4's
+      // closing note on ApplyAimPart). Read off the brain rather than passed
+      // out of Think, because it is not an INTENT — the AI has no opinion
+      // about necks, and giving it one would be the closed-ended-system rule
+      // 4 failure in miniature.
+      if (mob.ai_.hasTarget && mob.ai_.visible)
+        mob.SetAimLook(mob.ai_.targetPos);
+      else
+        mob.ClearAimLook();
       mob.desiredHeading_ = out.desiredHeading;
       mob.driveScale_ = out.driveScale;
       mob.driveStrafe_ = out.driveStrafe;
@@ -3558,7 +4220,6 @@ float MobSystem::Steer(Mob& mob, const MobDef& def, float dt) {
 // and a body that needs to fly — a blast — is a ragdoll, which Jolt carries.
 bool MobSystem::UpdateFall(Mob& mob, const MobDef& def,
                            const GroundSense& sense, float dt) {
-  (void)def;
   if (sense.groundUnknown && !sense.haveGround) return mob.airborne_;
   const float drop =
       sense.haveGround ? mob.origin_.y - (float)sense.groundY : 1.0e9f;
@@ -3572,6 +4233,7 @@ bool MobSystem::UpdateFall(Mob& mob, const MobDef& def,
     mob.airborne_ = true;
     mob.fallVel_ = 0.0f;
     mob.airTime_ = 0.0f;
+    mob.airVel_ = Vec3{};
   }
   const auto& tune = CurrentTuning();
   const float g = MetresToCells(tune.physics.gravity);
@@ -3579,15 +4241,94 @@ bool MobSystem::UpdateFall(Mob& mob, const MobDef& def,
   mob.airTime_ += dt;
   mob.fallVel_ = std::max(mob.fallVel_ - g * dt, -terminal);
   const float ny = mob.origin_.y + mob.fallVel_ * dt;
+  // ---- THE FIRST TICK OF A LAUNCH DOES NOT LAND (mob.h `launched_`) -------
+  //
+  // A lunge is fired by StepStroke, which runs AFTER UpdateFall in the tick
+  // (MobSystem::PreTick), so the first UpdateFall to see it is the next tick's
+  // — with the body still standing on the ground it left from. A flat pounce
+  // (rise 0, which a crawler's lungeScale can produce from a perfectly good
+  // authored rise) then has `fallVel_` driven negative by one tick of gravity
+  // before it has moved anywhere, `ny <= groundY` fires, and the leap is over
+  // before it began: the creature twitches and stays put. The latch buys it
+  // the one tick it needs to get clear of its own feet.
+  const bool justLaunched = mob.launched_;
+  mob.launched_ = false;
   // The scan reaches 2.1 m below the min corner and a tick at terminal
   // velocity covers 1.7 m, so a landing is always seen before it is passed.
-  if (sense.haveGround && ny <= (float)sense.groundY) {
+  if (!justLaunched && sense.haveGround && ny <= (float)sense.groundY) {
     mob.origin_.y = (float)sense.groundY;
     mob.airborne_ = false;
     mob.fallVel_ = 0.0f;
     mob.airTime_ = 0.0f;
+    mob.airVel_ = Vec3{};
     return false;  // on the ground again: the drive may run this tick
   }
+  // ---- ...AND THE PLANAR HALF (mob.h `airVel_`; plan §5) -----------------
+  //
+  // A lunging body travels, and it must travel by the SAME RULES the walk
+  // drive travels by or a pounce becomes the one way in the game to get inside
+  // a rock: `FootprintFooting` against the body's own box, another mob counted
+  // as a wall, and each axis tried alone so a leap that grazes a corner slides
+  // along it instead of stopping dead in mid-air. That is DriveLocomotion's
+  // `fits()` with the standing height thrown away — a body in the air does not
+  // take its Y from the ground it is passing over.
+  // ---- WHERE A LUNGE'S DISTANCE GOES (SANDVOX_LUNGE_TRACE=1) ------------
+  // One line per airborne tick: the body, both velocities and the fits()
+  // verdict. "The leap covers 65% of its closed form" is a bare number with
+  // six candidate causes and no way to tell them apart from outside (CLAUDE.md
+  // rule 6); this prints which tick loses what.
+  static const bool kTrace = std::getenv("SANDVOX_LUNGE_TRACE") != nullptr;
+  const char* verdict = "-";
+  if (mob.airVel_.len() > 1e-4f && world_ != nullptr) {
+    const float hx = def.worldSize.x * 0.5f, hz = def.worldSize.z * 0.5f;
+    const char* why = "";
+    auto fits = [&](float nx, float nz) {
+      if (BlockedByMob(mob, def, nx + hx, nz + hz)) { why = "mob"; return false; }
+      const Mob::Footing f =
+          mob.FootprintFooting(*world_, def, nx + hx, nz + hz, ny);
+      if (!f.known) return true;    // unknown footing is walkable (ai_nav.h)
+      if (f.wall) { why = "wall"; return false; }
+      if (!f.fits) { why = "overhang"; return false; }
+      return true;
+    };
+    const Vec3 want = mob.airVel_ * dt;
+    if (fits(mob.origin_.x + want.x, mob.origin_.z + want.z)) {
+      mob.origin_.x += want.x;
+      mob.origin_.z += want.z;
+      verdict = "full";
+    } else {
+      const bool xFirst = std::abs(want.x) >= std::abs(want.z);
+      bool moved = false;
+      for (int pass = 0; pass < 2 && !moved; pass++) {
+        const bool doX = (pass == 0) == xFirst;
+        const float dx = doX ? want.x : 0.0f;
+        const float dz = doX ? 0.0f : want.z;
+        if (dx == 0.0f && dz == 0.0f) continue;
+        if (!fits(mob.origin_.x + dx, mob.origin_.z + dz)) continue;
+        mob.origin_.x += dx;
+        mob.origin_.z += dz;
+        moved = true;
+        verdict = doX ? "slid-x" : "slid-z";
+      }
+      // HIT A WALL IN MID-AIR: the planar velocity is spent, and the body
+      // drops where it is. Killing it rather than sliding forever is what
+      // stops a pounce grinding along a cliff face for its whole flight.
+      if (!moved) {
+        mob.airVel_ = Vec3{};
+        verdict = why;
+      }
+    }
+  } else if (mob.airborne_) {
+    verdict = mob.airVel_.len() <= 1e-4f ? "no-airVel" : "no-world";
+  }
+  if (kTrace && mob.airborne_)
+    std::printf(
+        "lunge-trace t+%2d  origin (%.2f,%.2f,%.2f)  airVel (%.2f,%.2f) |%.2f| "
+        " fallVel %.2f  ny %.2f  ground %d(%s)  fits=%s%s\n",
+        (int)std::lround(mob.airTime_ * 30.0f), mob.origin_.x, mob.origin_.y,
+        mob.origin_.z, mob.airVel_.x, mob.airVel_.z, mob.airVel_.len(),
+        mob.fallVel_, ny, sense.groundY, sense.haveGround ? "seen" : "unknown",
+        verdict, justLaunched ? "  [LAUNCH TICK]" : "");
   mob.origin_.y = ny;
   if (mob.airTime_ >= tune.ragdoll.fallSeconds && !mob.Ragdolled()) {
     // Long enough in the air to go limp. The limbs take the fall speed with
@@ -4486,6 +5227,11 @@ void MobSystem::UpdateAnimation(Mob& mob, const MobDef& def, World& world,
   // untouched; an NPC mid-stroke leans exactly as the avatar does.
   AnimApplySpineTwist(sk, st, mob.weapon_.torsoTwist, mob.weapon_.torsoPitch,
                       def.rootLimb);
+
+  // ---- stage 3.6: the aim effector, or a look at the target (mob.cpp) ----
+  // PRE-FLATTEN, because it rotates a part about its joint and shares the yaw
+  // with the spine above it. See Mob::ApplyStrikeAim.
+  mob.ApplyStrikeAim(sk, st);
 
   // ---- stage 4: flatten to model space ----
   AnimFlatten(sk, st);
@@ -5708,6 +6454,16 @@ void Mob::BleedTick(uint32_t tick, World& world, std::vector<BrushOp>& ops,
   const float dropletVox = 1.0f / (float)(ms * ms * ms);
   for (size_t li = 0; li < limbs_.size(); li++) {
     MobLimb& limb = limbs_[li];
+    // A GARMENT DOES NOT BLEED. Damage() tops up a bleed budget on whatever
+    // slot the blow met, and a blunt hit through plate meets the SHELL first
+    // (game/impact.h): its budget is charged so the hp accounting stays one
+    // path, but the drip must not draw blood out of iron. The flesh under it
+    // is charged separately and bleeds for itself. Same refusal CarveLimb
+    // and StainWound make for a worn slot, made here for the drip.
+    if (IsWornSlot((int)li)) {
+      limb.bleedBudget = 0.0f;
+      continue;
+    }
     Quat lq{limb.xf.quat[0], limb.xf.quat[1], limb.xf.quat[2],
             limb.xf.quat[3]};
 
@@ -6118,6 +6874,11 @@ float MobSystem::LimbHp(uint64_t mobId, int limbIndex) const {
     if (m.id_ == mobId) return m.LimbHpAt(limbIndex);
   return -1.0f;
 }
+float MobSystem::LimbBleedBudget(uint64_t mobId, int limbIndex) const {
+  const Mob* m = FindMob(mobId);
+  if (!m || limbIndex < 0 || limbIndex >= (int)m->limbs_.size()) return -1.0f;
+  return m->limbs_[limbIndex].bleedBudget;
+}
 const char* MobSystem::DeathCause(uint64_t mobId) const {
   for (const Mob& m : mobs_)
     if (m.id_ == mobId) return m.DeathCause();
@@ -6440,8 +7201,18 @@ bool Mob::Damage(uint64_t bodyHandle, float amount, Vec3 hitWorldVoxel,
       const float want = (ld.tag == "item") ? fx.flashChip : fx.flashFlesh;
       limb.hitFlash = std::max(limb.hitFlash, want);
     }
-    limb.bleedBudget =
-        AddBleedBudget(limb.bleedBudget, amount * def_->bleedPerDamage);
+    // A PUNCH DOES NOT OPEN YOU (game/impact.h). Trauma still charges hp, still
+    // flinches and still cries out -- only the BLOOD is refused, at
+    // gore.bluntBleedScale of a cut's rate. The same shape as the three
+    // exclusions CarveLimb makes for fire, a garment and a creature born
+    // bitten, and made the same way: a scope the caller opens, read here
+    // rather than threaded through a signature the laser and the blast share.
+    const float bleedScale =
+        inBluntCarve_
+            ? std::clamp(CurrentTuning().gore.bluntBleedScale, 0.0f, 1.0f)
+            : 1.0f;
+    limb.bleedBudget = AddBleedBudget(
+        limb.bleedBudget, amount * def_->bleedPerDamage * bleedScale);
     if (impactSevers || (limb.hp <= 0 && HpZeroSevers((int)i))) {
       Sever((int)i);
     } else {
@@ -6536,9 +7307,33 @@ uint32_t Mob::NeckCount(const MobLimb& limb, float radiusWorld) const {
   return n;
 }
 
+uint32_t Mob::DefaultSmearMat() const {
+  // The SUBSTANCE a cut's tint is made of: the creature's wound material when
+  // that is something the palette can draw, else its blood. Checked through
+  // StainTypeOf rather than used blindly, because a wound material with no
+  // stain block would coat the limb in something invisible.
+  if (!def_) return 0;
+  if (sys_ && sys_->StainTypeOf(def_->woundMat)) return def_->woundMat;
+  if (sys_ && sys_->StainTypeOf(def_->bleedMat)) return def_->bleedMat;
+  return 0;
+}
+
 uint32_t Mob::StainWound(int limbIndex, Vec3 centreLocal, float radiusWorld,
                          uint32_t seed, const std::vector<IVec3>* crater,
                          float rimCells, float wetness) {
+  // THE ORDINARY CUT: the victim's own wound material, smeared with whatever
+  // that derives to. One line, and it is the only place the old defaults live
+  // now -- see Mob::StainWoundAs for why the two halves are separate arguments.
+  return StainWoundAs(limbIndex, centreLocal, radiusWorld, seed,
+                      def_ ? def_->woundMat : 0u, DefaultSmearMat(), crater,
+                      rimCells, wetness);
+}
+
+uint32_t Mob::StainWoundAs(int limbIndex, Vec3 centreLocal, float radiusWorld,
+                           uint32_t seed, uint32_t rewriteMat,
+                           uint32_t smearMat,
+                           const std::vector<IVec3>* crater, float rimCells,
+                           float wetness) {
   if (!def_ || limbIndex < 0 || limbIndex >= (int)limbs_.size()) return 0;
   // A GARMENT HAS NO BLOOD IN IT, and neither has a sword. Both are borrowed
   // rig slots (DESIGN.md §8c) and both reach every path a limb reaches, which
@@ -6546,7 +7341,7 @@ uint32_t Mob::StainWound(int limbIndex, Vec3 centreLocal, float radiusWorld,
   // coat. The held item is not `worn`, so it needs its own exclusion: an
   // appended slot that is not part of the authored rig is luggage.
   if (IsWornSlot(limbIndex) || limbIndex >= baseLimbs_) return 0;
-  const uint32_t stain = def_->woundMat;
+  const uint32_t stain = rewriteMat;
   const bool fromCrater = crater && !crater->empty() && rimCells > 0.0f;
   if (!stain || (!fromCrater && radiusWorld <= 0.0f)) return 0;
   // ---- HOW MUCH BLOOD, AS DISTINCT FROM HOW FAR IT REACHES ----------------
@@ -6796,17 +7591,19 @@ uint32_t Mob::StainWound(int limbIndex, Vec3 centreLocal, float radiusWorld,
   // on, poked into the brick the rewrite just owned. Counted separately so a
   // caller that asks "did the soak land" still gets the rewrite's answer.
   {
-    // The SUBSTANCE the smear is made of: the creature's wound material when
-    // that is something the palette can draw, else its blood. Checked through
-    // StainTypeOf rather than used blindly, because a wound material with no
-    // stain block would coat the limb in something invisible.
-    const uint32_t woundStains =
-        sys_ && sys_->StainTypeOf(def_->woundMat) ? def_->woundMat : 0u;
+    // THE SUBSTANCE THE SMEAR IS MADE OF IS THE CALLER'S CHOICE, and it is a
+    // separate choice from the rewrite above. A cut passes DefaultSmearMat()
+    // (the creature's woundMat, else its blood) and is unchanged; a BRUISE
+    // passes 0 and lays nothing down, because a punch that bloodied you would
+    // be a cut; a BITE passes its biter's `infectStain`, so the hole is wet
+    // with the thing that made it rather than with the victim's blood.
+    //
+    // Checked through StainTypeOf here rather than trusted, because a caller
+    // that hands over a material with no stain block (rotflesh is a SOLID, and
+    // only liquids may stain) would otherwise coat the limb in something
+    // invisible and charge the ledger a recount for it.
     CutSoak soak;
-    soak.mat = woundStains ? woundStains
-                           : (sys_ && sys_->StainTypeOf(def_->bleedMat)
-                                  ? def_->bleedMat
-                                  : 0u);
+    soak.mat = sys_ && sys_->StainTypeOf(smearMat) ? smearMat : 0u;
     // THE TINT REACHES PAST THE REWRITE IN THE RATIO THE TWO ARE AUTHORED IN
     // (stainCutRadius 1.6 : woundStainRadius 0.9). For a kerf that is exactly
     // stainCutRadius * scale and nothing moves; for a crater it is that ratio
@@ -7292,12 +8089,32 @@ BurnLimbView Mob::ViewOf(MobLimb& limb) {
   // none of this set, so a part on the ground goes on rotting the way it
   // always did. Off entirely for an undead def or with gore.woundHeals off,
   // and then every line below is the old code path.
-  if (def.woundMat != 0 && WoundsHeal()) {
+  // THREE THINGS A WOUND CAN HAVE REWRITTEN THIS FLESH TO, and all three have
+  // to dry back rather than evaporate (game/impact.h; BurnLimbView's own note
+  // on why this is a table now). They are NOT the same clock: blood settling
+  // and a zombie's rot living in you are different events, so the rot entry
+  // carries gore.infectHealSlow instead.
+  if (WoundsHeal()) {
     const auto& gt = CurrentTuning().gore;
-    v.woundMat = def.woundMat;
-    v.woundSlow = (uint32_t)std::lround(std::max(1.0f, gt.woundHealSlow));
-    v.revive = &Mob::ReviveWoundVoxel;
-    v.reviveCtx = &limb;
+    const uint32_t slow =
+        (uint32_t)std::lround(std::max(1.0f, gt.woundHealSlow));
+    int n = 0;
+    auto arm = [&](uint32_t mat, uint32_t divisor) {
+      if (mat == 0 || n >= BurnLimbView::kWoundMats) return;
+      for (int k = 0; k < n; k++)
+        if (v.woundMat[k] == mat) return;   // a creature that bruises in blood
+      v.woundMat[n] = mat;
+      v.woundSlow[n] = divisor;
+      n++;
+    };
+    arm(def.woundMat, slow);                               // a cut
+    arm(sys_ ? sys_->MaterialIdNamed(gt.bruiseMat) : 0u, slow);   // a bruise
+    arm(limb.infectMat,                                    // ...and a bite
+        (uint32_t)std::lround(std::max(1.0f, gt.infectHealSlow)));
+    if (n > 0) {
+      v.revive = &Mob::ReviveWoundVoxel;
+      v.reviveCtx = &limb;
+    }
   }
   return v;
 }
@@ -8383,8 +9200,13 @@ bool Mob::CarveLimb(int limbIndex, World& world,
   }
   if (def.bleedMat && bleeds) {
     if (carveN) limb.woundLocal = carveC;
-    limb.bleedBudget = AddBleedBudget(limb.bleedBudget,
-                                      lost * (float)at0 * def.bleedPerDamage);
+    // ...and a DENT drips at the same reduced rate the trauma that made it
+    // does (Mob::Damage's note): a caved-in face is not an open wound.
+    const float bleedScale =
+        inBluntCarve_ ? std::clamp(gt.bluntBleedScale, 0.0f, 1.0f) : 1.0f;
+    limb.bleedBudget =
+        AddBleedBudget(limb.bleedBudget,
+                       lost * (float)at0 * def.bleedPerDamage * bleedScale);
   }
 
   // Carved down past the point of being a limb at all: it comes off. This is
@@ -8393,9 +9215,16 @@ bool Mob::CarveLimb(int limbIndex, World& world,
   // The FRACTION is measured on the same lattice `at0` counted (skin when
   // there is one); the absolute kMinFragmentVoxels floor stays on the collider,
   // which is what "too few voxels to be a body" has always meant to Jolt.
+  // A BLUNT HIT NEVER TAKES A LIMB OFF, however many land -- the owner's spec
+  // in one line, and this is the whole implementation of it (see
+  // Mob::BluntCarveScope). A face may be caved in well past the point where a
+  // blast would have shed the head; hp reaching zero on a VITAL limb still
+  // kills through HpZeroSevers below, because that is a statement about DEATH
+  // rather than about amputation.
   const bool collapsed =
-      limb.voxels.size() < kMinFragmentVoxels ||
-      (float)nowCount < kLimbCollapseFraction * (float)at0;
+      !inBluntCarve_ &&
+      (limb.voxels.size() < kMinFragmentVoxels ||
+       (float)nowCount < kLimbCollapseFraction * (float)at0);
   // HP IS NO LONGER A DISMEMBERMENT RULE (except where it always was — see
   // HpZeroSevers). It was the third of the three instant severs the owner's
   // spec deletes, and it is the one that survives a blade cut the longest: a
@@ -8565,10 +9394,13 @@ bool Mob::CarveLimb(int limbIndex, World& world,
         }
       }
       // Losing the disconnected mass can itself take the limb under the floor.
-      // Same lattice pairing as the first collapse test above.
-      if (limb.voxels.size() < kMinFragmentVoxels ||
-          (float)(fine ? limb.skinVoxels.size() : limb.voxels.size()) <
-              kLimbCollapseFraction * (float)at0) {
+      // Same lattice pairing as the first collapse test above -- and the same
+      // blunt exclusion, for the same reason: a dent that disconnected a chip
+      // and then found the remainder small is still a dent.
+      if (!inBluntCarve_ &&
+          (limb.voxels.size() < kMinFragmentVoxels ||
+           (float)(fine ? limb.skinVoxels.size() : limb.voxels.size()) <
+               kLimbCollapseFraction * (float)at0)) {
         Sever(limbIndex);
         return false;
       }
@@ -9205,7 +10037,7 @@ bool MobSystem::BurnOneLimb(BurnLimbView& v, uint32_t tick, uint32_t rngKey,
       // creature's ash, smoke and fire are untouched -- those are other
       // materials and are not in the table. Null `revive` is the undead path,
       // where the hole widening IS the feature.
-      if (v.woundMat && was == v.woundMat && v.revive) {
+      if (v.WoundSlot(was) >= 0 && v.revive) {
         uint32_t backWord = 0, backColor = 0;
         if (v.revive(v.reviveCtx, p, backWord, backColor)) {
           v.SetWord(i, backWord, backColor);
@@ -9447,9 +10279,11 @@ bool MobSystem::BurnOneLimb(BurnLimbView& v, uint32_t tick, uint32_t rngKey,
       // might be authored to do gets quietly halved along with it. Floored at
       // 1 for the reason the cross-limb scale below is -- a rule scaled to
       // zero is "impossible", which is a different statement from "slow".
-      if (v.woundMat && m == v.woundMat && v.woundSlow > 1 &&
-          (r.packed & 3u) == kReactDecay) {
-        const uint32_t slowed = chance / v.woundSlow;
+      // Each wound material settles on ITS OWN clock -- blood over about six
+      // seconds, a zombie's rot over minutes (BurnLimbView's wound table).
+      if (const int ws = v.WoundSlot(m);
+          ws >= 0 && v.woundSlow[ws] > 1 && (r.packed & 3u) == kReactDecay) {
+        const uint32_t slowed = chance / v.woundSlow[ws];
         chance = slowed ? slowed : 1u;
       }
       // ---- IS A SIBLING LIMB THE ONLY THING ARMING THIS RULE? --------------
@@ -10885,6 +11719,303 @@ bool Mob::CarveLimbRadial(uint64_t bodyHandle, Vec3 centerWorldVoxel,
   return false;
 }
 
+// ============================================================================
+// THE OTHER TWO KINDS OF BLOW (docs/PLAN_impact_unarmed.md §2, game/impact.h)
+//
+// Mob::CutLimb above is the KERF and it is untouched. These two are its
+// siblings, and every line of them is about what they DO NOT do:
+//
+//   BluntHit  removes almost nothing and never dismembers. A mace kills by
+//             trauma, not by amputation, and a fist kills by neither.
+//   BiteHit   tears rather than cuts, bleeds like a cut, and may take a hand
+//             off only by COLLAPSE -- the geometric rule, not the blade's.
+//
+// Both reach the world through exactly the paths a sword already reaches it
+// through (Damage / CarveLimb / CarveLimbRadial / StainWoundAs). There is no
+// new mutation path here and there is not going to be one: CLAUDE.md rule 3.
+// ============================================================================
+
+bool MobSystem::BluntHit(uint64_t bodyHandle, const ::BluntHit& hit,
+                         World& world, std::vector<ParticleSpawn>& spawns) {
+  for (Mob& mob : mobs_)
+    if (mob.BluntHit(bodyHandle, hit, world, spawns)) return true;
+  // ...AND THE PLAYER IS BRUISED TOO. Same line, same reason, as the one at
+  // the top of MobSystem::CutLimb: the avatar is a Mob that does not live in
+  // `mobs_`, and a handle-keyed entry point that forgot it would let an NPC's
+  // mace pass through the player and melt their arm as debris instead.
+  if (avatar_ != nullptr && avatar_->BluntHit(bodyHandle, hit, world, spawns))
+    return true;
+  return false;
+}
+
+bool MobSystem::BiteHit(uint64_t bodyHandle, const ::BiteHit& hit, World& world,
+                        std::vector<ParticleSpawn>& spawns) {
+  for (Mob& mob : mobs_)
+    if (mob.BiteHit(bodyHandle, hit, world, spawns)) return true;
+  if (avatar_ != nullptr && avatar_->BiteHit(bodyHandle, hit, world, spawns))
+    return true;
+  return false;
+}
+
+uint32_t MobSystem::MaterialIdNamed(const std::string& name) const {
+  if (name.empty()) return 0;
+  // A ONE-ENTRY MEMO, and one entry is genuinely enough: there is exactly one
+  // name-typed tuning row (gore.bruiseMat), and the hot path that asks is
+  // Mob::ViewOf, which asks the SAME name once per limb per tick. A map would
+  // be a second structure to invalidate on a materials reload for no
+  // measurable gain, and the linear scan it replaces is ~130 short strings.
+  //
+  // The MISS is cached as hard as the hit, deliberately: a typo'd material
+  // name would otherwise pay the whole scan on every limb forever, which is
+  // precisely the case where nobody is watching.
+  if (!matNameLast_.empty() && name == matNameLast_) return matNameLastId_;
+  uint32_t id = 0;
+  for (size_t i = 0; i < matNames_.size(); i++)
+    if (matNames_[i] == name) {
+      id = (uint32_t)i;
+      break;
+    }
+  matNameLast_ = name;
+  matNameLastId_ = id;
+  return id;
+}
+
+bool Mob::BluntHit(uint64_t bodyHandle, const ::BluntHit& hit, World& world,
+                   std::vector<ParticleSpawn>& spawns) {
+  if (!def_ || !phys_) return false;
+  int li = -1;
+  for (size_t i = 0; i < limbs_.size(); i++)
+    if (limbs_[i].body == bodyHandle) {
+      li = (int)i;
+      break;
+    }
+  if (li < 0) return false;
+
+  const Tuning& tune = CurrentTuning();
+  const Tuning::Gore& gt = tune.gore;
+  const Tuning::Gear& gear = tune.gear;
+  const float power = std::clamp(hit.power, 0.0f, 1.0f);
+
+  // ---- A WORN SHELL: BREAK IT IN, AND GET THROUGH IT ----------------------
+  //
+  // "Plate stops swords almost entirely; maces go through." Both halves of
+  // that are here, and both are geometric rather than a resist number: the
+  // shell really loses voxels (so the flesh under it is exposed to the NEXT
+  // blow, and to fire, and to acid), and a share of the blow arrives on the
+  // body whether or not it did.
+  if (IsWornSlot(li)) {
+    // The host limb's BODY HANDLE, captured before anything can sever the
+    // shell: `wornHost` is an INDEX, and an index into a list that a Damage()
+    // three lines down may reshape is the classic way to bruise the wrong arm.
+    const int hostIdx = limbs_[li].wornHost;
+    const uint64_t hostBody =
+        (hostIdx >= 0 && hostIdx < (int)limbs_.size()) ? limbs_[hostIdx].body
+                                                       : 0ull;
+    // The shell's own material hardness, read the same way Mob::CutLimb reads
+    // it for the kerf -- first voxel of the authoritative lattice, because a
+    // shell is one material all over.
+    float hard = 0.0f;
+    if (sys_ != nullptr) {
+      uint32_t m = 0;
+      if (!limbs_[li].skinVoxels.empty())
+        m = limbs_[li].skinVoxels[0].material & 0xFFFu;
+      else if (!limbs_[li].voxels.empty())
+        m = limbs_[li].voxels[0].payload & 0xFFFu;
+      if (m < sys_->matGpu_.size()) hard = (float)sys_->matGpu_[m].hardness;
+    }
+    float k = 1.0f;
+    if (hard > 0.0f && gear.bluntHardnessRef > 0.0f)
+      k = std::clamp(gear.bluntHardnessRef / hard,
+                     std::clamp(gear.bluntHardnessMin, 0.0f, 1.0f), 1.0f);
+
+    // 1. THE SHELL TAKES hp. Ordinary Damage on the shell's own slot, which is
+    //    what a piece's condition is made of, at gear.bluntShellHp of the blow.
+    Damage(bodyHandle, hit.hp * gear.bluntShellHp, hit.at, hit.impactSpeed);
+
+    // 2. ...AND IS BEATEN IN. Real voxels, through the ordinary radial carve --
+    //    the same call an explosion makes, so a dented cuirass is dented in
+    //    exactly the way a blasted one is and nothing new had to learn how.
+    //    A weapon with armorBreak 0 (a fist, a bare hand) skips this entirely:
+    //    the radius is 0 and CarveLimbRadial refuses a non-positive one.
+    const float breakR = gear.bluntDentRadius *
+                         std::clamp(hit.armorBreak, 0.0f, 1.0f) * power * k;
+    if (breakR > 0.0f)
+      CarveLimbRadial(bodyHandle, hit.at, breakR, /*ragged=*/true,
+                      /*eject=*/true, world, spawns);
+
+    // 3. ...AND THE REST ARRIVES ON THE BODY UNDERNEATH. Not conditional on
+    //    the shell breaking: the plate deforming IS how the energy gets
+    //    through, which is the whole difference from a blade. No dent and no
+    //    armour break on this pass -- what is under the plate is flesh, and the
+    //    bruise is what a transmitted blow leaves.
+    if (hostBody != 0ull && gear.bluntThrough > 0.0f) {
+      ::BluntHit through = hit;
+      through.hp = hit.hp * gear.bluntThrough;
+      through.carve = 0.0f;
+      through.armorBreak = 0.0f;
+      // The knock-loose rule is the SHELL's, not the wearer's: a strap does not
+      // snap because the blow was fast (Mob::Damage says so in as many words),
+      // and transmitting the speed would only ever arm it on the body.
+      through.impactSpeed = 0.0f;
+      through.seed = hit.seed ^ 0x7A11EDu;
+      BluntHit(hostBody, through, world, spawns);
+    }
+    return true;
+  }
+
+  // ---- LIVE FLESH: TRAUMA, A BRUISE, AND AT MOST A DENT -------------------
+  //
+  // The scope covers the WHOLE blow rather than only the carve, because both
+  // rules it arms are about the same fact -- this is trauma, not an edge. See
+  // Mob::BluntCarveScope.
+  BluntCarveScope blunt(*this);
+  if (!Damage(bodyHandle, hit.hp, hit.at, hit.impactSpeed)) return false;
+  // Damage() can sever (an extreme impact) or kill (a vital limb at zero), and
+  // either reshapes limbs_. Re-resolve rather than trusting `li`; a handle that
+  // is gone means the blow landed and there is nothing left to bruise.
+  li = -1;
+  for (size_t i = 0; i < limbs_.size(); i++)
+    if (limbs_[i].body == bodyHandle) {
+      li = (int)i;
+      break;
+    }
+  if (li < 0) return true;
+
+  // The contact point in the limb's own frame, which is what both the bruise
+  // and the dent are placed in. Read from the limb's live transform, once.
+  phys_->GetTransform(limbs_[li].body, limbs_[li].xf);
+  const Quat q{limbs_[li].xf.quat[0], limbs_[li].xf.quat[1],
+               limbs_[li].xf.quat[2], limbs_[li].xf.quat[3]};
+  const Vec3 local = RotateInv(q, hit.at - limbs_[li].xf.pos);
+
+  // 1. THE BRUISE, first and widest, on skin that is still there. In
+  //    gore.bruiseMat and with NO smear: a punch marks you, it does not
+  //    bloody you (Mob::StainWoundAs).
+  const uint32_t bruiseMat =
+      sys_ != nullptr ? sys_->MaterialIdNamed(gt.bruiseMat) : 0u;
+  if (bruiseMat != 0 && gt.bruiseRadius > 0.0f)
+    StainWoundAs(li, local, gt.bruiseRadius * (0.5f + 0.5f * power),
+                 hit.seed ^ 0xB2015Eu, bruiseMat, /*smearMat=*/0u);
+
+  // 2. THE DENT, only if the weapon has any (a bare fist authors 0 and takes
+  //    nothing). CarveLimbRadial soaks the crater it made in the victim's own
+  //    woundMat on the way out, which is "deletes voxels and replaces them
+  //    with gore" -- and the scope above is what stops the same carve from
+  //    collapsing the limb, however many blows land on it.
+  const float dentR =
+      gt.bluntCarveRadius * std::clamp(hit.carve, 0.0f, 1.0f) * power;
+  if (dentR > 0.0f)
+    CarveLimbRadial(limbs_[li].body, hit.at, dentR, /*ragged=*/true,
+                    /*eject=*/true, world, spawns);
+  return true;
+}
+
+bool Mob::CarveBlob(int limbIndex, Vec3 centreLocal, float radiusWorld,
+                    float blob, uint32_t seed, World& world,
+                    std::vector<ParticleSpawn>& spawns, CarveReport* report) {
+  if (limbIndex < 0 || limbIndex >= (int)limbs_.size() || radiusWorld <= 0.0f)
+    return true;
+  const uint32_t skinScale = std::max(1u, SkinScaleOf(limbs_[limbIndex]));
+  return CarveLimb(limbIndex, world, spawns, /*eject=*/true,
+                   BlobCarveFactory({centreLocal}, {radiusWorld},
+                                    std::max(0.5f, blob), seed, skinScale),
+                   /*spall=*/nullptr, report);
+}
+
+bool Mob::BiteHit(uint64_t bodyHandle, const ::BiteHit& hit, World& world,
+                  std::vector<ParticleSpawn>& spawns) {
+  if (!def_ || !phys_) return false;
+  int li = -1;
+  for (size_t i = 0; i < limbs_.size(); i++)
+    if (limbs_[i].body == bodyHandle) {
+      li = (int)i;
+      break;
+    }
+  if (li < 0) return false;
+
+  const Tuning& tune = CurrentTuning();
+  const Tuning::Gore& gt = tune.gore;
+  const float power = std::clamp(hit.power, 0.0f, 1.0f);
+
+  // ---- ARMOUR DEFENDS, AND THAT IS THE WHOLE RULE -------------------------
+  //
+  // Teeth on a cuirass are a BLOW: a share of the bite arrives as trauma, the
+  // plate is not broken, and there is NO INFECTION. The owner asked for a
+  // rotten wound "that touches FLESH (armour defends)", and this is the one
+  // line that makes it true -- which is also why the classification happens
+  // before any part of the profile is applied (impact.h StruckKind).
+  if (IsWornSlot(li)) {
+    ::BluntHit b;
+    b.at = hit.at;
+    b.hp = hit.hp * std::clamp(tune.gear.biteOnShell, 0.0f, 1.0f);
+    b.power = power;
+    b.carve = 0.0f;
+    b.armorBreak = 0.0f;
+    b.seed = hit.seed ^ 0xB17E5u;
+    return BluntHit(bodyHandle, b, world, spawns);
+  }
+
+  // ---- LIVE FLESH: A TEAR ------------------------------------------------
+  //
+  // Bleeds like a cut, deliberately: this is a hole torn in meat, and refusing
+  // the drip here would make a bite read as a bruise. The scope keeps the
+  // BLADE rules off (a mouth has no direction to cut through in) and leaves
+  // the COLLAPSE sever ON, which is the one line separating a bite from a
+  // punch -- enough bites do take a hand off.
+  BiteScope bite(*this);
+  if (!Damage(bodyHandle, hit.hp, hit.at, /*impactSpeed=*/0.0f)) return false;
+  li = -1;
+  for (size_t i = 0; i < limbs_.size(); i++)
+    if (limbs_[i].body == bodyHandle) {
+      li = (int)i;
+      break;
+    }
+  if (li < 0) return true;
+
+  phys_->GetTransform(limbs_[li].body, limbs_[li].xf);
+  const Quat q{limbs_[li].xf.quat[0], limbs_[li].xf.quat[1],
+               limbs_[li].xf.quat[2], limbs_[li].xf.quat[3]};
+  const Vec3 local = RotateInv(q, hit.at - limbs_[li].xf.pos);
+
+  CarveReport rep{};
+  const uint32_t seed = (uint32_t)id_ * 2654435761u + (uint32_t)li * 40503u +
+                        hit.seed;
+  if (!CarveBlob(li, local, gt.biteRadius * (0.4f + 0.6f * power), gt.biteBlob,
+                 seed, world, spawns, &rep))
+    return true;  // the limb did not survive: CarveLimb's contract applies
+  if (rep.count == 0 || rep.cells.empty()) return true;
+
+  // ---- WHAT THE HOLE IS WET WITH -----------------------------------------
+  //
+  // Measured from the removed CELLS and not from a ball at their centroid, for
+  // the reason the blast crater's own note gives at length: a blob's removal
+  // chance falls to zero at its rim, so it is a scatter whose centroid is
+  // inside the limb.
+  //
+  // Wider than a blade's rim by biteStainScale, because a tear is a ragged
+  // hole rather than a clean slot -- the mess goes further than the damage.
+  const float rim = std::max(0.0f, gt.craterStainRim * gt.biteStainScale);
+  if (rim <= 0.0f) return true;
+  if (hit.infectMat != 0) {
+    // AN INFECTED WOUND. The exposed tissue is rewritten to the BITER's
+    // material and the hole is smeared with the biter's liquid -- the victim's
+    // own blood does not come into it, which is the whole of plan S6.
+    //
+    // StainWoundAs only ever rewrites flesh-class cells (MobDef::tissue), so a
+    // nonzero return IS "the tear exposed flesh". Latching the material on the
+    // limb is what lets the heal path know this rot is a wound settling rather
+    // than a substance decaying (MobLimb::infectMat).
+    const uint32_t took =
+        StainWoundAs(li, rep.centreLocal, 0.0f, seed ^ 0x120FEC7u,
+                     hit.infectMat, hit.infectStain, &rep.cells, rim);
+    if (took > 0) limbs_[li].infectMat = hit.infectMat;
+  } else {
+    // An ordinary tear bleeds like any other wound.
+    StainWound(li, rep.centreLocal, 0.0f, seed ^ 0x7EA12u, &rep.cells, rim);
+  }
+  return true;
+}
+
 // ---- SANDVOX_ROT_DEBUG=1 ----------------------------------------------------
 //
 // Rot's attribution probe, and it earned its keep twice in one session. "3%
@@ -10910,6 +12041,116 @@ static bool RotDebug() {
     return e != nullptr && e[0] != '0';
   }();
   return kOn;
+}
+
+// ---- THE BLOB: ONE PREDICATE, TWO CALLERS ----------------------------------
+//
+// The correlated-noise bite. Extracted 2026-09-15 from Mob::RotAtSpawn, which
+// was its only caller until a zombie's TEETH needed exactly the same hole
+// (game/impact.h BiteHit): rot is what a bite looks like once it is old, and
+// two implementations of that shape would have drifted the first time either
+// was tuned.
+//
+// WHAT IS SHARED IS THE PREDICATE, NOT A CARVE. RotAtSpawn hands its WHOLE
+// list of bites to one CarveLimb call -- that is what makes its volume cap and
+// its single hp charge correct, and splitting it into one call per bite would
+// have charged a spawning zombie N times and given each hole its own chance to
+// collapse the limb. So this takes a LIST and Mob::CarveBlob passes a list of
+// one. One blob, two callers.
+//
+// Every argument is in the limb's own frame: `centres` limb-local WORLD
+// voxels, `radii` world voxels, `blob` the noise's feature size in SKIN
+// voxels, `skinScale` the lattice the noise is sampled on whichever lattice is
+// being tested -- so the collider and the art tear identically and the shape of
+// the damage is a property of the ART rather than of the collider resolution
+// the engine happened to derive.
+Mob::LimbCarveFactory Mob::BlobCarveFactory(std::vector<Vec3> centres,
+                                            std::vector<float> radii,
+                                            float blob, uint32_t nseed,
+                                            uint32_t skinScale) {
+  return [centres, radii, blob, nseed, skinScale](float scale)
+             -> LimbCarveKeep {
+
+          std::vector<Vec3> cs;
+          std::vector<float> r2s;
+          std::vector<float> bias;
+          cs.reserve(centres.size());
+          r2s.reserve(radii.size());
+          bias.reserve(centres.size());
+          // The noise is sampled on the SKIN lattice whichever lattice is being
+          // tested, so the collider and the art tear identically and the shape
+          // of the damage is a property of the ART rather than of the collider
+          // resolution the engine happened to derive. Same rule the blast
+          // crater's jitter follows, and for the same reason.
+          const float toSkin = (float)skinScale / scale;
+          for (size_t b = 0; b < centres.size(); b++) {
+            cs.push_back(centres[b] * scale);
+            const float r = radii[b] * scale;
+            r2s.push_back(r * r);
+            // ---- EACH BITE IS RECENTRED ON ITS OWN NOISE -------------------
+            //
+            // Without this the feature was ~10x weaker than its own shape says
+            // — measured, ratio 0.09 of predicted, with the volume cap not
+            // binding on a single limb. The cause is that `blob` and the bite
+            // radius are deliberately the SAME order (3 skin voxels against
+            // 8): that is what makes the loss come off in chunks rather than
+            // as speckle, and it also means the field barely varies inside one
+            // bite. So a bite did not carve a ragged hole — it sampled roughly
+            // ONE value and then removed everything or nothing, and since the
+            // threshold `(1-t^2)^2` is below 1 everywhere but the exact
+            // centre, most bites lost that coin flip and vanished.
+            //
+            // Subtracting the noise AT THE BITE'S CENTRE fixes the level
+            // without touching the gradient: the centre now always goes
+            // (0.5 < 1), the field still varies with the correlation length
+            // that makes the edge chunky, and every bite lands. The noise
+            // decides the SHAPE of the hole, which is what it is good at; it
+            // no longer gets a vote on whether there is a hole.
+            const Vec3 sc = centres[b] * (float)skinScale;
+            bias.push_back(0.5f - ValueNoise3(nseed, sc.x / blob, sc.y / blob,
+                                              sc.z / blob));
+          }
+          return [=](int x, int y, int z) {
+            const Vec3 c{(float)x + 0.5f, (float)y + 0.5f, (float)z + 0.5f};
+            for (size_t b = 0; b < cs.size(); b++) {
+              const Vec3 dv = c - cs[b];
+              const float d2 = dv.dot(dv);
+              if (d2 >= r2s[b] || r2s[b] <= 0.0f) continue;
+              // Certain at the centre, nothing at the rim, squared so the bite
+              // is a hole with a torn edge rather than a fade across the whole
+              // ball (the same tightening the crater's `carveFalloff` makes).
+              const float t2 = d2 / r2s[b];
+              const float f = 1.0f - t2;
+              const float chance = f * f;
+              const int sx = (int)std::floor((float)x * toSkin);
+              const int sy = (int)std::floor((float)y * toSkin);
+              const int sz = (int)std::floor((float)z * toSkin);
+              // PURE correlated noise, with no white-noise term mixed in: the
+              // owner asked for chunks "largely in groups", and any independent
+              // per-voxel draw at all puts speckle back (see the long note on
+              // ValueNoise3 at the top of this file). `blob` IS the size of one
+              // piece that comes away.
+              const float smooth = ValueNoise3(nseed, (float)sx / blob,
+                                               (float)sy / blob,
+                                               (float)sz / blob);
+              // Two corrections, both about the noise's LEVEL rather than its
+              // shape, and both monotone so the spatial correlation — the
+              // entire reason this is value noise and not a hash — survives:
+              //
+              //   * `bias[b]` recentres this bite on its own centre value, so
+              //     the bite always lands. See the long note where it is built.
+              //   * trilinear value noise is not uniform: it is a smoothed
+              //     blend of eight uniform corners, so it piles up around 0.5
+              //     with a standard deviation near 0.146 against a uniform
+              //     0.289. Stretching about the mean restores the spread, and
+              //     without it the rim is a cliff instead of a tear.
+              const float n = std::clamp(
+                  0.5f + (smooth + bias[b] - 0.5f) * 1.98f, 0.0f, 1.0f);
+              if (n < chance) return false;  // remove
+            }
+            return true;  // keep
+          };
+  };
 }
 
 // ---- BORN BITTEN (MobRotDef, mob.h) ----------------------------------------
@@ -11096,88 +12337,7 @@ uint32_t Mob::RotAtSpawn(World& world) {
     Mob::CarveReport rep{};
     const bool alive = CarveLimb(
         (int)i, world, discard, /*eject=*/false,
-        [&, centres, radii, blob, nseed, skinScale](float scale)
-            -> LimbCarveKeep {
-          std::vector<Vec3> cs;
-          std::vector<float> r2s;
-          std::vector<float> bias;
-          cs.reserve(centres.size());
-          r2s.reserve(radii.size());
-          bias.reserve(centres.size());
-          // The noise is sampled on the SKIN lattice whichever lattice is being
-          // tested, so the collider and the art tear identically and the shape
-          // of the damage is a property of the ART rather than of the collider
-          // resolution the engine happened to derive. Same rule the blast
-          // crater's jitter follows, and for the same reason.
-          const float toSkin = (float)skinScale / scale;
-          for (size_t b = 0; b < centres.size(); b++) {
-            cs.push_back(centres[b] * scale);
-            const float r = radii[b] * scale;
-            r2s.push_back(r * r);
-            // ---- EACH BITE IS RECENTRED ON ITS OWN NOISE -------------------
-            //
-            // Without this the feature was ~10x weaker than its own shape says
-            // — measured, ratio 0.09 of predicted, with the volume cap not
-            // binding on a single limb. The cause is that `blob` and the bite
-            // radius are deliberately the SAME order (3 skin voxels against
-            // 8): that is what makes the loss come off in chunks rather than
-            // as speckle, and it also means the field barely varies inside one
-            // bite. So a bite did not carve a ragged hole — it sampled roughly
-            // ONE value and then removed everything or nothing, and since the
-            // threshold `(1-t^2)^2` is below 1 everywhere but the exact
-            // centre, most bites lost that coin flip and vanished.
-            //
-            // Subtracting the noise AT THE BITE'S CENTRE fixes the level
-            // without touching the gradient: the centre now always goes
-            // (0.5 < 1), the field still varies with the correlation length
-            // that makes the edge chunky, and every bite lands. The noise
-            // decides the SHAPE of the hole, which is what it is good at; it
-            // no longer gets a vote on whether there is a hole.
-            const Vec3 sc = centres[b] * (float)skinScale;
-            bias.push_back(0.5f - ValueNoise3(nseed, sc.x / blob, sc.y / blob,
-                                              sc.z / blob));
-          }
-          return [=](int x, int y, int z) {
-            const Vec3 c{(float)x + 0.5f, (float)y + 0.5f, (float)z + 0.5f};
-            for (size_t b = 0; b < cs.size(); b++) {
-              const Vec3 dv = c - cs[b];
-              const float d2 = dv.dot(dv);
-              if (d2 >= r2s[b] || r2s[b] <= 0.0f) continue;
-              // Certain at the centre, nothing at the rim, squared so the bite
-              // is a hole with a torn edge rather than a fade across the whole
-              // ball (the same tightening the crater's `carveFalloff` makes).
-              const float t2 = d2 / r2s[b];
-              const float f = 1.0f - t2;
-              const float chance = f * f;
-              const int sx = (int)std::floor((float)x * toSkin);
-              const int sy = (int)std::floor((float)y * toSkin);
-              const int sz = (int)std::floor((float)z * toSkin);
-              // PURE correlated noise, with no white-noise term mixed in: the
-              // owner asked for chunks "largely in groups", and any independent
-              // per-voxel draw at all puts speckle back (see the long note on
-              // ValueNoise3 at the top of this file). `blob` IS the size of one
-              // piece that comes away.
-              const float smooth = ValueNoise3(nseed, (float)sx / blob,
-                                               (float)sy / blob,
-                                               (float)sz / blob);
-              // Two corrections, both about the noise's LEVEL rather than its
-              // shape, and both monotone so the spatial correlation — the
-              // entire reason this is value noise and not a hash — survives:
-              //
-              //   * `bias[b]` recentres this bite on its own centre value, so
-              //     the bite always lands. See the long note where it is built.
-              //   * trilinear value noise is not uniform: it is a smoothed
-              //     blend of eight uniform corners, so it piles up around 0.5
-              //     with a standard deviation near 0.146 against a uniform
-              //     0.289. Stretching about the mean restores the spread, and
-              //     without it the rim is a cliff instead of a tear.
-              const float n = std::clamp(
-                  0.5f + (smooth + bias[b] - 0.5f) * 1.98f, 0.0f, 1.0f);
-              if (n < chance) return false;  // remove
-            }
-            return true;  // keep
-          };
-        },
+        BlobCarveFactory(centres, radii, blob, nseed, skinScale),
         nullptr, &rep);
     removedTotal += rep.count;
     // ---- A ROT HOLE IS A WOUND, AND IT LOOKS LIKE ONE ----------------------
@@ -13800,6 +14960,419 @@ uint32_t Mob::WornAlong(int bodyLimb, const Vec3& from, const Vec3& dir,
   return 0;
 }
 
+// =============================================================================
+// THE STRIKE EFFECTOR — WHICH PART IS SWINGING, AND WHAT IT DOES (plan §4/§3)
+//
+// Everything below this banner used to begin at `heldPartIndex_`, and that one
+// assumption is the whole reason this engine had no fists: an arm can only be
+// driven to serve a blade, an edge can only be read off a held item, and an
+// unarmed creature therefore had nothing to claim the arm WITH. The effector
+// is the indirection that removes it — one part index and one mode — and every
+// consumer below (ApplyWeaponArm, WeaponEdge, WeaponStrokePose, WeaponArmPose,
+// HeadKeepOut) now asks it instead of asking the fist.
+//
+// THE HELD PATH IS UNCHANGED BY CONSTRUCTION. EquipItem sets
+// `Held`/`heldPartIndex_`, and every effector-aware function's Held branch is
+// the code that was there before, reached through one more `if`. That is
+// deliberate: the sword is the thing four gates already measure, and a
+// generalisation that moved it would be indistinguishable from a regression.
+// =============================================================================
+
+void Mob::SetStrikeEffector(int partIndex, StrikeEffectorMode mode,
+                            int naturalIndex) {
+  if (partIndex < 0 || (size_t)partIndex >= skel_.parts.size() ||
+      mode == StrikeEffectorMode::None) {
+    ClearStrikeEffector();
+    return;
+  }
+  strikeEffector_ = partIndex;
+  strikeMode_ = mode;
+  strikeNatural_ = naturalIndex;
+}
+
+void Mob::ClearStrikeEffector() {
+  // DROPS THE OVERRIDE, and that is all it does. A creature that finishes a
+  // punch while still holding a sword goes back to CARRYING the sword — the
+  // item is a real rig slot whose arm the driver owns between strokes — and
+  // that fall-through is `ResolveEffector`'s, not a value written here.
+  strikeEffector_ = -1;
+  strikeMode_ = StrikeEffectorMode::None;
+  strikeNatural_ = -1;
+}
+
+bool Mob::ResolveEffector(int& outPart, StrikeEffectorMode& outMode,
+                          int& outNatural) const {
+  if (strikeMode_ != StrikeEffectorMode::None && strikeEffector_ >= 0 &&
+      (size_t)strikeEffector_ < skel_.parts.size()) {
+    outPart = strikeEffector_;
+    outMode = strikeMode_;
+    outNatural = strikeNatural_;
+    return true;
+  }
+  if (heldPartIndex_ >= 0 && (size_t)heldPartIndex_ < skel_.parts.size()) {
+    outPart = heldPartIndex_;
+    outMode = StrikeEffectorMode::Held;
+    outNatural = -1;
+    return true;
+  }
+  outPart = -1;
+  outMode = StrikeEffectorMode::None;
+  outNatural = -1;
+  return false;
+}
+
+const MobNaturalWeaponDef* Mob::NaturalWeapon(int i) const {
+  if (def_ == nullptr || i < 0 || i >= (int)def_->natural.size()) return nullptr;
+  return &def_->natural[i];
+}
+
+const MobNaturalWeaponDef* Mob::NaturalWeaponNamed(const std::string& n) const {
+  return def_ != nullptr ? NaturalWeapon(def_->FindNatural(n)) : nullptr;
+}
+
+bool Mob::NaturalWeaponUsable(const MobNaturalWeaponDef& nw) const {
+  if (nw.partIndex < 0 || !LimbAlive(nw.partIndex)) return false;
+  // A CHAIN EFFECTOR NEEDS ITS WHOLE CHAIN. The two-bone solver is handed
+  // parts[0] and parts[1] and writes the effector's transform; with the elbow
+  // severed there is no second bone and the solve is a hand hanging in space
+  // off a shoulder. Refusing HERE — before the style is drawn — is what keeps
+  // the driver from ever seeing a broken chain (plan §4's closing line), and
+  // it is why a one-armed zombie's punches quietly stop being options instead
+  // of becoming a pose bug.
+  for (const IkChain& ch : skel_.chains) {
+    if (ch.effector != nw.partIndex &&
+        !(nw.partIndex < (int)skel_.parts.size() &&
+          skel_.parts[nw.partIndex].parent == ch.effector))
+      continue;
+    for (int p : ch.parts)
+      if (!LimbAlive(p)) return false;
+  }
+  return true;
+}
+
+StrikeProfile Mob::StrikeProfileFor(const MobNaturalWeaponDef& nw) const {
+  StrikeProfile p = nw.strike;
+
+  // ---- 1. THE GAUNTLET OVERRIDE (plan §3) ---------------------------------
+  //
+  // A worn piece whose shell is strapped to this weapon's own part, and whose
+  // item carries a `strike` block, REPLACES the profile — it does not add to
+  // it. An iron gauntlet is not "a fist plus iron"; it is a different weapon
+  // that happens to be shaped like a fist, which is exactly why the SWEPT EDGE
+  // stays the fist's own (the shell is a skin over the same knuckles).
+  //
+  // The covered limb is read off the RIG, not off the item's ItemCover list: a
+  // shell is parented to the limb it covers, so `parts[slot].parent` is the
+  // answer and there is no second table to keep in step.
+  //
+  // The piece's own `strike` block (item.h ItemDef::strike, authored in the
+  // worn sidecar) is the whole override: the four impact numbers move across,
+  // the infection terms do not - a gauntlet has no mouth. A worn piece with
+  // no `strike` block is armour, not a weapon, and leaves the fist alone.
+  {
+    const ItemLibrary* lib = sys_ != nullptr ? sys_->Items() : nullptr;
+    if (lib != nullptr && nw.partIndex >= 0) {
+      for (const WornPiece& wp : worn_) {
+        bool covers = false;
+        for (int slot : wp.slots) {
+          if (slot < 0 || (size_t)slot >= skel_.parts.size()) continue;
+          if (skel_.parts[slot].parent == nw.partIndex && LimbAlive(slot))
+            covers = true;
+        }
+        if (!covers) continue;
+        const ItemDef* it = lib->At(lib->Find(wp.item));
+        if (it == nullptr || !it->strike.Any()) continue;
+        p.cut = it->strike.cut;
+        p.blunt = it->strike.blunt;
+        p.bluntCarve = it->strike.bluntCarve;
+        p.armorBreak = it->strike.armorBreak;
+        p.bite = it->strike.bite;
+      }
+    }
+  }
+
+  // ---- 2. THE CREATURE'S OWN INFECTION (plan §6) --------------------------
+  //
+  // ORed on rather than replacing, and only onto something that BITES. A
+  // zombie's fist carries no rot — punching somebody does not put your mouth
+  // on them — so the test is the profile's own `bite` term and not the
+  // weapon's name. That is the whole reason infection lives on the creature
+  // and the bite number lives on the weapon: neither file has to know the
+  // other exists.
+  if (p.bite > 0.0f && def_ != nullptr) {
+    if (p.infectMat == 0) p.infectMat = def_->bite.infectMat;
+    if (p.infectStain == 0) p.infectStain = def_->bite.infectStain;
+  }
+  return p;
+}
+
+void Mob::Launch(Vec3 vel) {
+  airborne_ = true;
+  launched_ = true;
+  fallVel_ = vel.y;
+  airVel_ = Vec3{vel.x, 0.0f, vel.z};
+  airTime_ = 0.0f;
+}
+
+bool Mob::AimAnglesTo(const Vec3& dirWorld, float& outYaw,
+                      float& outPitch) const {
+  Vec3 d = dirWorld;
+  if (d.len() < 1e-4f) return false;
+  d = d.normalized();
+  // A HEADING DELTA in the rig's own heading convention (heading 0 = +Z,
+  // positive toward +X), which is the frame ApplyAimPart applies its yaw in —
+  // see the long note the avatar's head-look left about getting this backwards.
+  const float bearing = std::atan2(d.x, d.z);
+  float yaw = bearing - heading_;
+  while (yaw > 3.14159265f) yaw -= 6.28318531f;
+  while (yaw <= -3.14159265f) yaw += 6.28318531f;
+  outYaw = yaw;
+  outPitch = std::asin(std::clamp(d.y, -1.0f, 1.0f));   // positive UP
+  return true;
+}
+
+void Mob::ApplyAimPart(const AnimSkeleton& sk, AnimState& st, int part,
+                       float yaw, float pitch, float weight,
+                       float spineShare) const {
+  // MOVED DOWN FROM PlayerAvatar (the head-look block), verbatim in its
+  // reasoning and generalised in exactly two ways: the part is a parameter
+  // rather than `parts_.head`, and the whole rotation is scaled by `weight` so
+  // a stroke can fade its aim in and out the way the arm claim already does.
+  // The avatar still calls it for its look, so there remains ONE
+  // implementation of "turn a part toward something".
+  if (part < 0 || (size_t)part >= sk.parts.size() ||
+      (size_t)part >= st.local.size())
+    return;
+  if (part < (int)st.partAlive.size() && !st.partAlive[part]) return;
+  const float w = std::clamp(weight, 0.0f, 1.0f);
+  if (w <= 1e-4f) return;
+  if (std::fabs(yaw) < 1e-4f && std::fabs(pitch) < 1e-4f) return;
+  yaw *= w;
+  pitch *= w;
+
+  // The spine carries a share of the YAW so the chest turns into the aim
+  // instead of a head swivelling on a rigid torso. THE ROOT LIMB IS NOT PART
+  // OF THE SPINE FOR THIS PURPOSE even though it carries the tag: rotating the
+  // root yaws the entire rig, legs and all, so the part turns with the body it
+  // is measured against and reads on screen as not turning at all.
+  const int root = def_ != nullptr ? def_->rootLimb : -1;
+  float spineTotal = 0;
+  if (spineShare > 1e-4f) {
+    int nSpine = 0;
+    for (size_t i = 0; i < sk.parts.size(); i++)
+      if (sk.parts[i].tag == "spine" && (int)i != root) nSpine++;
+    if (nSpine > 0) {
+      // Split across however many spine joints the rig has, so a three-segment
+      // back twists the same TOTAL amount as a single torso rather than three
+      // times as far.
+      const float per = yaw * std::clamp(spineShare, 0.0f, 1.0f) / (float)nSpine;
+      for (size_t i = 0; i < sk.parts.size(); i++) {
+        if (sk.parts[i].tag != "spine" || (int)i == root) continue;
+        if (i < st.partAlive.size() && !st.partAlive[i]) continue;
+        if (i >= st.local.size()) continue;
+        st.local[i].rot = QuatNormalize(
+            QuatMul(st.local[i].rot, AxisAngle({0, 1, 0}, per)));
+        spineTotal += per;
+      }
+    }
+  }
+  // The part only needs the REMAINDER — it inherits the spine's share through
+  // the flatten, so adding the full yaw at both joints would double it.
+  const float partYaw = yaw - spineTotal;
+  // Pitch is negated: camera/aim pitch is positive UP, and a positive rotation
+  // about model +X pitches the nose DOWN (scripts/geometry.py: +90 about X
+  // takes +Z to -Y).
+  const Quat look = QuatMul(AxisAngle({0, 1, 0}, partYaw),
+                            AxisAngle({1, 0, 0}, -pitch));
+  st.local[part].rot = QuatNormalize(QuatMul(st.local[part].rot, look));
+}
+
+const IkChain* Mob::ChainForEffector(const AnimSkeleton& sk, int part,
+                                     int& outHandPart) const {
+  outHandPart = -1;
+  if (part < 0 || (size_t)part >= sk.parts.size()) return nullptr;
+  const int parent = sk.parts[part].parent;
+  for (const IkChain& ch : sk.chains) {
+    if (ch.parts.size() < 2 || ch.effector < 0) continue;
+    if (ch.effector != part && ch.effector != parent) continue;
+    outHandPart = ch.effector;
+    return &ch;
+  }
+  return nullptr;
+}
+
+const MobNaturalWeaponDef* Mob::EffectorWeapon() const {
+  int part = -1, natural = -1;
+  StrikeEffectorMode mode = StrikeEffectorMode::None;
+  if (!ResolveEffector(part, mode, natural)) return nullptr;
+  if (mode == StrikeEffectorMode::Held) return nullptr;
+  return NaturalWeapon(natural);
+}
+
+// ---- STAGE 3.5: WHAT THIS CREATURE IS POINTING AT --------------------------
+//
+// TWO USES, ONE MECHANISM, and they are ordered rather than blended because a
+// creature biting you is already looking at you:
+//
+//   1. AN AIM EFFECTOR mid-stroke — the jaws, driven to the blade direction
+//      the stroke driver is steering. This IS the attack; there is no IK
+//      behind it and the body's own travel closes the distance.
+//   2. AN IDLE TARGET LOOK — a creature with an enemy and no live stroke turns
+//      its head toward it. Cheap (one part, a share of the spine, no solve)
+//      and it sells the bite: the head is already on the victim before the
+//      lunge starts, so the leap reads as intent rather than as a lurch.
+//
+// PRE-FLATTEN, at the same stage the avatar's head-look has always run: this
+// writes `st.local[]` and the flatten is what carries it to the part and
+// everything under it.
+void Mob::ApplyStrikeAim(const AnimSkeleton& sk, AnimState& st) const {
+  int effPart = -1, effNatural = -1;
+  StrikeEffectorMode effMode = StrikeEffectorMode::None;
+  const float share = def_ != nullptr ? def_->aimSpineShare : 0.35f;
+  if (ResolveEffector(effPart, effMode, effNatural) &&
+      effMode == StrikeEffectorMode::Aim && weaponWeight_ > 0.0f) {
+    // ---- THE STROKE'S OWN BEARING, NOT THE POSE'S BLADE DIRECTION --------
+    //
+    // `weapon_.bladeDir` is the driver's solved blade LEAN (melee.cpp's law of
+    // cosines: the angle a rigid bar has to sit at so its far end reaches the
+    // commanded radius from a hand held at `extendLive_`). For a held sword
+    // that is exactly right. For an aim effector there is no bar and no hand:
+    // the part IS the weapon and the only thing it can do is POINT. Driving it
+    // at the lean meant the head chased a quantity derived from a geometry it
+    // is not in, and realised a fraction of the pitch it was given.
+    //
+    // `StrokeAz`/`StrokeEl` are the driver's commanded bearing about the pivot
+    // in the wielder's own basis -- the same two numbers `npc-styles` measures
+    // a stroke's shape in, and the same ones the windup and cut phases steer.
+    // Laid straight onto the part's forward they are a 1:1 ask, which is what
+    // makes a bite snap.
+    //
+    // NO SMOOTHING ANYWHERE ON THIS PATH, and that is deliberate: the avatar's
+    // head-look eases `lookYaw_`/`lookPitch_` toward their goals before it
+    // calls ApplyAimPart (a glance is a slow thing), and a four-tick cut can
+    // never catch a goal through a 0.12 s halflife. A stroke owns its part
+    // outright.
+    Vec3 dir{};
+    if (stroke_.Active() && stroke_.style >= 0) {
+      Vec3 right, up, fwd;
+      MobBasis(*this, right, up, fwd);
+      const float az = stroke_.melee.StrokeAz(), el = stroke_.melee.StrokeEl();
+      const float ce = std::cos(el);
+      dir = right * (ce * std::sin(az)) + up * std::sin(el) +
+            fwd * (ce * std::cos(az));
+    }
+    // A guard, or a pose pushed in by something that is not a stroke program,
+    // still has a blade direction and nothing better to offer.
+    if (dir.len() < 1e-4f) dir = weapon_.bladeDir;
+    if (dir.len() < 1e-4f) dir = weapon_.hand;
+    float yaw = 0, pitch = 0;
+    if (!AimAnglesTo(dir, yaw, pitch)) return;
+    // FULL WEIGHT THROUGH THE CUT. `weaponWeight_` is PoseWeight, which is
+    // already 1 in every phase except a releasing recover, so this changes
+    // nothing today -- it is here so that a future change to the arm-claim
+    // ramp cannot quietly halve a bite, which is the exact failure this
+    // function was rewritten to remove.
+    const float w = stroke_.Cutting() ? 1.0f : weaponWeight_;
+    aimDiag_.ran = true;
+    aimDiag_.cmdYaw = yaw;
+    aimDiag_.cmdPitch = pitch;
+    aimDiag_.part = effPart;
+    aimDiag_.natural = effNatural;
+    ApplyAimPart(sk, st, effPart, yaw, pitch, w, share);
+    // ---- AND THE NECK CARRIES IT (2026-09-15) ---------------------------
+    //
+    // A ROTATION CANNOT CLOSE A GAP, and that is the whole of why bites still
+    // missed after the lunge was working. The flight trace says the leap does
+    // exactly what it should: it flies five ticks and stops on `BlockedByMob`
+    // with the two bodies TOUCHING, which is where a pounce belongs. From
+    // there the victim's nearest voxel is still 4.3 voxels from the teeth,
+    // because the jaws are a 1.7-voxel segment on a head whose joint sits at
+    // the biter's own centre -- half of that gap is the biter's own chest.
+    //
+    // So the head is TRANSLATED forward along its aim as the cut runs: the
+    // neck extends and the shoulders follow, which is what an animal doing
+    // this actually does. In the PART'S OWN local frame, because that is the
+    // frame `st.local` positions are in and the frame the aim has just been
+    // written into -- so the lean goes wherever the head is now pointing, for
+    // free, and needs no second copy of the aim geometry.
+    //
+    // ON THE CUT'S PROGRESS, not on the arm claim: a head that jutted out the
+    // instant the stroke began would spend its whole windup with its neck
+    // stretched, which is the opposite of a creature gathering itself.
+    if (stroke_.Cutting() && def_ != nullptr &&
+        (size_t)effPart < st.local.size()) {
+      if (const MobNaturalWeaponDef* nw = NaturalWeapon(effNatural)) {
+        const Vec3 edge = nw->edgeTo - nw->edgeFrom;
+        if (edge.len() > 1e-4f) {
+          const float prog =
+              std::clamp((float)(stroke_.phaseTick + 1) /
+                             (float)std::max(1, stroke_.cutTicks),
+                         0.0f, 1.0f);
+          // A BODY'S OWN DEPTH is how far a neck and a lean carry a head past
+          // the chest it is attached to, and it is the exact term the gap
+          // above is made of -- so it follows the rig instead of being a
+          // number somebody picked.
+          // 1.25 BODIES DEEP, measured rather than guessed: at one body the
+          // teeth still stopped 2.3 voxels from the victim's nearest voxel
+          // (from 4.3 with no lean at all), and the probe reaches about 1.9
+          // past the tip. A neck and a set of shoulders extending a quarter
+          // past the chest is what the frames show and what closes it.
+          const float lean = def_->worldSize.z * 1.25f * prog;
+          st.local[effPart].pos =
+              st.local[effPart].pos +
+              QuatRotate(st.local[effPart].rot, edge.normalized()) * lean;
+          aimDiag_.lean = lean;
+        }
+      }
+    }
+    return;
+  }
+  aimDiag_.ran = false;
+  if (!aimLookValid_ || stroke_.Active()) return;
+  int head = -1;
+  for (size_t i = 0; i < sk.parts.size(); i++)
+    if (sk.parts[i].tag == "head") {
+      head = (int)i;
+      break;
+    }
+  if (head < 0 || !LimbAlive(head)) return;
+  // FROM THE HEAD, IN THE WORLD, off its LIVE transform. A creature looking at
+  // something by its feet should tilt its head down, so the origin will not do
+  // — and neither will `origin_ + anim_.model[head].pos`, which is a PREFAB-
+  // LOCAL offset added to a world position with the body's yaw left out of it:
+  // that is a couple of voxels of error whose direction rotates with the
+  // creature, which is the worst shape an error can have. `PartJointWorld` is
+  // the same `xf.pos + rot * anchorLimb` composition the submit path inverts.
+  Vec3 from{};
+  if (!PartJointWorld(head, from)) return;
+  float yaw = 0, pitch = 0;
+  if (!AimAnglesTo(aimLook_ - from, yaw, pitch)) return;
+  // A LOOK IS NOT A STARE. Well under 1 so the creature's head leads its
+  // facing without snapping onto the target and holding — the body's own turn
+  // (Steer) is what closes the rest, and a head pinned at full weight on a
+  // circling enemy reads as an owl.
+  //
+  // IT ALSO MOVES THE KEEP-OUT SPHERE the stroke driver clamps against
+  // (Mob::HeadKeepOut reads this same posed head), so a look that whipped the
+  // head around would shove a swing off its line as a side effect. That is the
+  // other reason it is a fraction.
+  ApplyAimPart(sk, st, head, yaw, pitch, 0.6f, share);
+}
+
+float Mob::LocoGroundAlign() const {
+  if (anim_.locoState < 0 || anim_.locoState >= (int)skel_.states.size())
+    return 0.0f;
+  return skel_.states[anim_.locoState].groundAlign;
+}
+
+// THE STYLE VOCABULARY'S ONE RIG QUESTION (game/strokes.h says why it is
+// declared there and defined here).
+bool StyleUsable(const Mob& who, const AttackStyle& sty) {
+  if (sty.weapon.empty() || sty.weapon == "held") return who.HeldSlot() >= 0;
+  const MobNaturalWeaponDef* nw = who.NaturalWeaponNamed(sty.weapon);
+  return nw != nullptr && who.NaturalWeaponUsable(*nw);
+}
+
 // ---- the weapon arm, shared by both animation drivers -----------------------
 //
 // THE ARM SERVES THE BLADE. Three things happen here and they are in this order
@@ -13831,20 +15404,40 @@ void Mob::ApplyWeaponArm(const AnimSkeleton& sk, AnimState& st,
                          PoseAxisOverride& ov) const {
   ov = PoseAxisOverride{};
   weaponDiag_ = WeaponArmDiag{};
-  if (weaponWeight_ <= 0.0f || heldPartIndex_ < 0 || sk.chains.empty()) return;
-  if ((size_t)heldPartIndex_ >= sk.parts.size()) return;
-  // The weapon arm is the one whose hand is this prop's ancestor. Deriving it
-  // from the rig rather than hardcoding "arm.R" means a left-handed rig, or a
-  // second weapon, needs no change here.
-  const int handPart = sk.parts[heldPartIndex_].parent;
-  if (handPart < 0 || (size_t)handPart >= st.model.size()) return;
-  const IkChain* chain = nullptr;
-  for (const IkChain& ch : sk.chains)
-    if (ch.tag == "arm" && ch.effector == handPart && ch.parts.size() >= 2) {
-      chain = &ch;
-      break;
-    }
-  if (!chain) return;
+  if (weaponWeight_ <= 0.0f) return;
+  int effPart = -1, effNatural = -1;
+  StrikeEffectorMode effMode = StrikeEffectorMode::None;
+  if (!ResolveEffector(effPart, effMode, effNatural)) return;
+
+  // ---- 0. AIM: A PART WITH NO CHAIN (plan §4) -----------------------------
+  //
+  // The jaws are not on the end of anything the two-bone solver can serve —
+  // no rig in the tree puts the head in a chain, and one that did would be
+  // claiming the neck is an arm. So an Aim effector is driven the OTHER way a
+  // part can be pointed at something: rotate it, and a share of the spine,
+  // until its forward lies along the stroke's blade direction. The body's own
+  // travel — the lunge — is what carries it to the target.
+  //
+  // It returns early with no `ov` and no wrist work because there is neither:
+  // there is no elbow to keep in plane and no grip to roll.
+  // AND IT IS APPLIED EARLIER IN THE PIPELINE, so there is nothing to do here.
+  // `ApplyAimPart` writes `st.local[]` — the pre-flatten locals — because it
+  // rotates a part ABOUT ITS JOINT and shares the yaw with the spine ABOVE it,
+  // both of which the flatten then propagates. This stage runs after
+  // AnimFlatten (it is a post-process on model space, like the IK it sits
+  // beside), so an aim written from here would be a write nobody reads.
+  // Mob::ApplyStrikeAim, called at stage 3.5, is where it happens.
+  if (effMode == StrikeEffectorMode::Aim) return;
+
+  if (sk.chains.empty()) return;
+  if ((size_t)effPart >= sk.parts.size()) return;
+  // The weapon arm is the one whose EFFECTOR is this part, or this part's
+  // parent (Mob::ChainForEffector). Deriving it from the rig rather than
+  // hardcoding "arm.R" means a left-handed rig, a second weapon, or a bare
+  // fist needs no change here.
+  int handPart = -1;
+  const IkChain* chain = ChainForEffector(sk, effPart, handPart);
+  if (!chain || handPart < 0 || (size_t)handPart >= st.model.size()) return;
   const float weight = chain->weight * weaponWeight_;
   if (weight <= 0.0f) return;
 
@@ -14057,6 +15650,18 @@ void Mob::ApplyWeaponArm(const AnimSkeleton& sk, AnimState& st,
   // block says which way the blade and its flat run in the item's own box. The
   // composition below is the same one the submit path uses to place the item
   // (itemQ = handQ * gripRot), read backwards.
+  //
+  // ONLY A HELD BLADE HAS A BLADE TO CARRY (plan §4). A natural weapon IS the
+  // part: there is no grip rotation to compose against, no authored flat to
+  // roll to, and a wrist steered to lay a fist "along the stroke" would be
+  // twisting the hand off the arm it is on. The plan states this as
+  // "wristMaxAngle is set to 0 for a natural weapon"; skipping the block is
+  // the same pose and does not depend on a caller remembering to zero a knob.
+  // The elbow's hinge plane above still ran — a punching arm bends — and the
+  // rigid follow-through below still runs, so a gauntlet shell strapped to
+  // the fist travels with it.
+  const bool steerHand = effMode == StrikeEffectorMode::Held;
+  if (steerHand) [&] {
   if (heldPartIndex_ >= (int)limbDefs_.size()) return;
   const MobLimbDef& ld = limbDefs_[heldPartIndex_];
   if (!ld.hasEdge) return;
@@ -14120,6 +15725,7 @@ void Mob::ApplyWeaponArm(const AnimSkeleton& sk, AnimState& st,
   }
   const Quat handRot = QuatNormalize(QuatMul(delta, rigid));
   st.model[handPart].rot = QuatSlerp(rigid, handRot, weight);
+  }();
   weaponHandPreClamp_ = st.model[handPart].rot;
   weaponHandPosPreClamp_ = st.model[handPart].pos;
   weaponUpPreClamp_ = st.model[i0].rot;
@@ -14146,6 +15752,28 @@ void Mob::ApplyWeaponArm(const AnimSkeleton& sk, AnimState& st,
 }
 
 void Mob::RecordWeaponClamp(const AnimSkeleton& sk, const AnimState& st) const {
+  // ---- WHERE THE AIMED PART ACTUALLY ENDED UP POINTING ---------------------
+  //
+  // HERE, and not in ApplyStrikeAim, for the same reason `clampMove` is here:
+  // the aim writes a LOCAL rotation before the flatten and the clamp runs
+  // after it, so the only place the posed forward exists is this one. Recorded
+  // rather than trusted, because "the head barely follows the driver" is a
+  // claim nobody can make from outside without the pair of numbers -- and the
+  // pair is what caught the neck-lever bug (commanded 0.51 rad of pitch,
+  // realised 0.08).
+  if (aimDiag_.ran && aimDiag_.part >= 0 &&
+      (size_t)aimDiag_.part < st.model.size()) {
+    if (const MobNaturalWeaponDef* nw = NaturalWeapon(aimDiag_.natural)) {
+      const Vec3 edge = nw->edgeTo - nw->edgeFrom;
+      if (edge.len() > 1e-4f) {
+        const Vec3 fwdModel =
+            QuatRotate(st.model[aimDiag_.part].rot, edge.normalized());
+        const Vec3 fwdWorld =
+            Rotate(AxisAngle({0, 1, 0}, heading_), fwdModel);
+        AimAnglesTo(fwdWorld, aimDiag_.gotYaw, aimDiag_.gotPitch);
+      }
+    }
+  }
   (void)sk;
   if (!weaponDiag_.ran || weaponHandPart_ < 0) return;
   if ((size_t)weaponHandPart_ >= st.model.size()) return;
@@ -14242,13 +15870,48 @@ bool Mob::WeaponArmPose(Vec3& outHandFromShoulder, float& outReach) const {
   // runs that conversion BACKWARDS, so a caller can read the hand, hand the
   // same value straight back through SetWeaponPose, and get the pose it already
   // had. Taking control of an arm without moving it is exactly that round trip.
-  if (heldPartIndex_ < 0 || heldPartIndex_ >= (int)skel_.parts.size())
-    return false;
-  const int handPart = skel_.parts[heldPartIndex_].parent;
-  if (handPart < 0 || handPart >= (int)skel_.parts.size()) return false;
-  if ((size_t)handPart >= anim_.model.size()) return false;
+  int effPart = -1, effNatural = -1;
+  StrikeEffectorMode effMode = StrikeEffectorMode::None;
+  if (!ResolveEffector(effPart, effMode, effNatural)) return false;
+
+  // ---- AIM: THE PIVOT IS THE PART'S OWN JOINT, AND THERE IS NO ARM -------
+  //
+  // A part in no chain still has a pivot and still has a length, and the
+  // stroke driver needs both: the pivot is what the stroke's azimuth and
+  // elevation are measured about, and the length is what bounds its reach
+  // band.
+  //
+  // THE FIRST VERSION USED THE PARENT JOINT (the chest) AND neck+head AS THE
+  // REACH, AND THAT IS WHERE THE BITE WENT (2026-09-15). It reads well -- "the
+  // jaws are on the end of a neck the way a hand is on the end of an arm" --
+  // and it is wrong in the one way that matters: FOUR OF THOSE FIVE AND A HALF
+  // VOXELS ARE RIGID. Nothing rotates about the chest; the head rotates about
+  // its OWN joint. So the driver was handed a lever it could not move, and
+  // every radian of commanded elevation came back divided by the fraction of
+  // that lever the head actually owns -- measured, `bite` realised 0.08 rad of
+  // posed pitch on 0.51 commanded, about a fifth, which on screen is a zombie
+  // that lunges at your throat without ever opening its mouth at you.
+  //
+  // So the pivot is the PART'S OWN joint and the "arm" is zero length: the
+  // hand IS the pivot, the point is the edge tip, and the whole stroke is one
+  // part rotating. `bladeLen_` in the driver then equals the edge span and
+  // `RadiusBand`'s annulus is the head's own swing, which is the truth.
+  if (effMode == StrikeEffectorMode::Aim) {
+    if ((size_t)effPart >= anim_.model.size()) return false;
+    float span = 0;
+    if (const MobNaturalWeaponDef* nw = NaturalWeapon(effNatural))
+      span = (nw->edgeTo - nw->edgeFrom).len();
+    outHandFromShoulder = Vec3{};   // the hand IS the pivot
+    outReach = span;
+    return outReach > 1e-3f;
+  }
+
+  if ((size_t)effPart >= skel_.parts.size()) return false;
+  int handPart = -1;
+  if (ChainForEffector(skel_, effPart, handPart) == nullptr) return false;
+  if (handPart < 0 || (size_t)handPart >= anim_.model.size()) return false;
   for (const IkChain& ch : skel_.chains) {
-    if (ch.tag != "arm" || ch.effector != handPart) continue;
+    if (ch.effector != handPart) continue;
     if (ch.parts.size() < 2) continue;
     const int i0 = ch.parts[0], i1 = ch.parts[1];
     if (i0 < 0 || i1 < 0 || (size_t)i0 >= anim_.model.size() ||
@@ -14288,6 +15951,91 @@ bool Mob::WeaponStrokePose(Vec3& outHandFromShoulder, Vec3& outTipFromShoulder,
   if (!WeaponArmPose(outHandFromShoulder, outReach)) return false;
   outTipFromShoulder = outHandFromShoulder;
   outFlat = Vec3{};
+  int effPart = -1, effNatural = -1;
+  StrikeEffectorMode effMode = StrikeEffectorMode::None;
+  if (!ResolveEffector(effPart, effMode, effNatural)) return true;
+
+  // ---- A NATURAL WEAPON'S TIP (plan §4) -----------------------------------
+  //
+  // Same composition as the held item's, against the PART instead of the
+  // borrowed slot, with one difference that is easy to get wrong: a natural
+  // weapon's edge is authored from the part's MODEL MIN CORNER (mob.h
+  // MobNaturalWeaponDef, matching MobLimbDef::edgeFrom), and `anim_.model[].pos`
+  // is the part's JOINT. `LimbTargetFor` states the relation the other way
+  // round — world min corner = joint - rot * anchorLimb — so the rebasing term
+  // is `-anchorLimb`, and leaving it out puts a fist's knuckles wherever the
+  // wrist happens to be, which is a whole hand's length of quiet error.
+  if (effMode != StrikeEffectorMode::Held) {
+    const MobNaturalWeaponDef* nw = NaturalWeapon(effNatural);
+    if (nw == nullptr || (size_t)effPart >= anim_.model.size() ||
+        (size_t)effPart >= limbs_.size())
+      return true;
+    // ---- A CHAIN EFFECTOR REPORTS NO BLADE AT ALL (2026-09-15) -----------
+    //
+    // `MeleeState::RadiusBand` has two models and picks between them on
+    // `bladeLen_`: with a blade it solves the reach ANNULUS of a rigid bar
+    // pinned at a hand held `extendLive_` from the shoulder, and with none it
+    // says "the point IS the hand, so the band is simply the arm". A fist is
+    // the second case wearing the first's clothes -- the knuckles ride one
+    // voxel past the wrist on a five-voxel arm -- and reporting that voxel as
+    // a blade cost two things at once:
+    //
+    //   * THE BAND COLLAPSED. |L - handRadius| .. L + handRadius with L = 1.1
+    //     and the hand at 4 is [3.1, 4.9]: one and three quarter voxels of
+    //     travel where the arm can genuinely serve nearly five. An authored
+    //     thrust (-0.45 chamber, +0.90 drive) was then clipped at both ends,
+    //     which is why `npc-styles` measured a punch's radial travel at 0.94
+    //     voxels against its own 1.0 floor and flipped on tempo jitter.
+    //   * THE RADIAL DRIVE LEAKED INTO ELEVATION. The blade's lean is solved
+    //     by the law of cosines and laid in the plane of `perpL_`, which is
+    //     taken from the travel TANGENT -- and the tangent of a nearly pure
+    //     thrust is ill-conditioned, so a one-voxel bar swung through a large
+    //     angle to serve a radius change and took the point's elevation with
+    //     it. Measured: a punch authoring 0.02 rad of elevation commanded
+    //     0.7 rad of it.
+    //
+    // So a natural weapon reports its TIP AT ITS HAND. The driver then steers
+    // the hand along the arm's own band, no lean is computed, and the knuckles
+    // ride ahead of it exactly as they do in life. NOTHING about the hitbox
+    // moves: `WeaponEdge` reads the authored segment off the live transform
+    // and is a separate question from where the driver is steering.
+    // ---- AND IT IS REPORTED, NOT SUPPRESSED (2026-09-15) ----------------
+    //
+    // Reporting a Chain effector's tip AT ITS HAND was tried, to take the
+    // driver's "no blade: the point IS the hand" path and open up the reach
+    // band a one-voxel bar collapses. It does open it -- the commanded radial
+    // travel went 0.94 -> 2.16 voxels -- and it costs more than it buys: with
+    // `bladeLen_` at zero the driver's lean machinery drops out entirely and
+    // the azimuth channel runs free, so a straight punch commanded 2.20 rad of
+    // azimuth against an authored 0.24 and `npc-styles` correctly reported
+    // that a thrust had turned into a swing. The knuckles' 10.2-voxel path
+    // through the world was the same thing seen from outside.
+    //
+    // The band is not what was stopping punches landing -- the probe rays
+    // dying inside the wielder's own hand was (melee.cpp's ignore-list cast).
+    // But the band collapse is real on its own account: with the knuckles
+    // reported as a blade the authored thrust was clipped at both ends and
+    // `npc-styles` measured 0.94 voxels of radial travel against its own 1.0
+    // floor. Removing it and MEASURING found the azimuth blow-up was already
+    // there without it, so the band is opened and the swing question is left
+    // where it belongs -- with the authored numbers and a human's eye.
+    if (effMode == StrikeEffectorMode::Chain) return true;
+    // ---- AN AIM EFFECTOR IS ONE PART ROTATING ---------------------------
+    // Same statement, for the same reason, with the pivot at the part's own
+    // joint (WeaponArmPose said why): the point is the edge tip and the hand
+    // is the pivot, so the driver's `bladeLen_` IS the edge span and its
+    // azimuth/elevation ARE the part's own forward. That is what makes a
+    // commanded pitch arrive as a head that actually pitches.
+    const Quat pq = anim_.model[effPart].rot;
+    const Vec3 anchor = limbs_[effPart].anchorLimb;
+    const Vec3 tipModel =
+        anim_.model[effPart].pos + QuatRotate(pq, nw->edgeTo - anchor);
+    const Vec3 pivot = anim_.model[effPart].pos;
+    const Quat yaw = AxisAngle({0, 1, 0}, heading_);
+    outTipFromShoulder = outHandFromShoulder + Rotate(yaw, tipModel - pivot);
+    return true;
+  }
+
   if (heldPartIndex_ < 0 || heldPartIndex_ >= (int)limbDefs_.size())
     return true;   // an empty fist still has an arm to steer
   const MobLimbDef& ld = limbDefs_[heldPartIndex_];
@@ -14336,12 +16084,38 @@ bool Mob::HeadKeepOut(Vec3& outCenterFromShoulder, float& outRadius) const {
       (size_t)head >= limbs_.size())
     return false;
   if (!LimbAlive(head)) return false;  // a headless body has nothing to clear
-  if (heldPartIndex_ < 0 || heldPartIndex_ >= (int)skel_.parts.size())
-    return false;
-  const int handPart = skel_.parts[heldPartIndex_].parent;
+  int effPart = -1, effNatural = -1;
+  StrikeEffectorMode effMode = StrikeEffectorMode::None;
+  if (!ResolveEffector(effPart, effMode, effNatural)) return false;
+  // ---- THE SPHERE IS FOR A BLADE, AND ONLY FOR A BLADE -------------------
+  //
+  // A BITE IS THE HEAD GOING THERE ON PURPOSE (plan §4): when the face IS the
+  // weapon the sphere would forbid every pose the stroke is for, and there is
+  // no radius at which "keep the jaws away from the head" means anything.
+  //
+  // AND A FIST IS NOT A BLADE EITHER. What this sphere models is a LONG RIGID
+  // SEGMENT swung about the shoulder: a held sword is a child of the hand, its
+  // far end is a metre from any joint, and no pose limit in the rig knows it
+  // exists -- so nothing but this stops an authored windup laying it through
+  // the wielder's own skull. A natural weapon's segment IS the part, one voxel
+  // of knuckle on the end of an arm whose shoulder cone and elbow hinge are
+  // already clamped every tick (AnimClampPoseLimits); the rig bounds it by
+  // construction, and a 2-voxel sphere sized off the head model is wider than
+  // the whole fist. Left on, it shoved a chambered punch -- which legitimately
+  // sits beside the chin -- out and up, which is the elevation half of the
+  // "a punch should read as a punch" report.
+  //
+  // MEASURED, not assumed: `player-unarmed` probes the clearance INDEPENDENTLY
+  // (the physics edge segment against the head limb's joint, every tick the
+  // arm is claimed) and holds it at 3.3-3.7 voxels with this off -- the arm
+  // never brings the knuckles near the face on its own.
+  if (effMode != StrikeEffectorMode::Held) return false;
+  if ((size_t)effPart >= skel_.parts.size()) return false;
+  int handPart = -1;
+  if (ChainForEffector(skel_, effPart, handPart) == nullptr) return false;
   if (handPart < 0) return false;
   for (const IkChain& ch : skel_.chains) {
-    if (ch.tag != "arm" || ch.effector != handPart) continue;
+    if (ch.effector != handPart) continue;
     if (ch.parts.size() < 2) continue;
     const int i0 = ch.parts[0];
     if (i0 < 0 || (size_t)i0 >= anim_.model.size()) continue;
@@ -14364,7 +16138,61 @@ bool Mob::HeadKeepOut(Vec3& outCenterFromShoulder, float& outRadius) const {
 
 bool Mob::WeaponEdge(Vec3& outBase, Vec3& outTip, float& outHalfWidth,
                      Vec3* outFlat) const {
-  if (!def_ || heldPartIndex_ < 0) return false;
+  if (!def_) return false;
+  int effPart = -1, effNatural = -1;
+  StrikeEffectorMode effMode = StrikeEffectorMode::None;
+  if (!ResolveEffector(effPart, effMode, effNatural)) return false;
+
+  // ---- A NATURAL WEAPON'S EDGE, in the part's LIVE Jolt frame (plan §4) ---
+  // The same composition the held item takes, against the part's own body:
+  // `xf.pos` IS the model's min corner and the edge is authored from it, so
+  // there is no rebasing here — exactly as there is none below. A natural
+  // weapon authors no flat (there is no blade to lay along a line), so the
+  // sweep reports a zero vector and `MeleeEdgeAlign` reads that as "no
+  // evidence" rather than as a bad angle — a fist cannot land flat.
+  if (effMode != StrikeEffectorMode::Held) {
+    const MobNaturalWeaponDef* nw = NaturalWeapon(effNatural);
+    if (nw == nullptr || effPart < 0 || (size_t)effPart >= limbs_.size())
+      return false;
+    if (!LimbAlive(effPart)) return false;   // severed: nothing to hit with
+    const MobLimb& np = limbs_[effPart];
+    if (!np.body) return false;
+    const Quat nq{np.xf.quat[0], np.xf.quat[1], np.xf.quat[2], np.xf.quat[3]};
+    outBase = np.xf.pos + QuatRotate(nq, nw->edgeFrom);
+    outTip = np.xf.pos + QuatRotate(nq, nw->edgeTo);
+    // ---- A FIST IS A FIST-SIZED THING, NOT A WIRE (2026-09-15) ----------
+    //
+    // `MeleeSweepDamage` sweeps a SEGMENT and asks how near each voxel came to
+    // it; `halfWidth` is the whole of the blow's thickness. For a sword that
+    // is right -- a blade really is a plane a couple of centimetres thick, and
+    // the length of the segment does the work. A natural weapon has almost no
+    // length (1.1 voxels of knuckle, 1.7 of jaw against a sword's 8), so the
+    // half-width is all it has, and authored as the RADIUS OF THE CARVE it is
+    // far thinner than the thing swinging: a fist is ~10 cm of bone and
+    // knuckle, and it was probing as a 5 cm wire.
+    //
+    // Measured through `--shot-strike`: `human@2 punch_r human` put the point
+    // 0.7 voxels from the victim's nearest voxel with a 0.5-voxel half-width
+    // and reported ZERO bodies hit. The punch was in contact and the geometry
+    // said it was not.
+    //
+    // So the PROBE gets a floor of half a real fist while the authored number
+    // stays what it is. It is a length in METRES like every other body
+    // dimension here, so it follows kVoxelMeters instead of meaning something
+    // different at every world scale; and it is a MAX, so a creature that
+    // authors a genuinely broad weapon (a club of a forearm, a whale's jaw)
+    // keeps its own number.
+    // A WHOLE VOXEL, not half of one: the probe measures to voxel CENTRES, and
+    // a cell's own half-diagonal is 0.87 of a voxel -- so a hitbox sized to the
+    // fist's surface is still short of the surface it is trying to touch by
+    // most of a cell. 10 cm covers both the fist and that discretisation, and
+    // is the number the harness lands.
+    outHalfWidth = std::max(nw->edgeHalfWidth, MetresToCells(0.10f));
+    if (outFlat) *outFlat = Vec3{};
+    return true;
+  }
+
+  if (heldPartIndex_ < 0) return false;
   if (heldPartIndex_ >= (int)limbDefs_.size()) return false;
   const MobLimbDef& ld = limbDefs_[heldPartIndex_];
   if (!ld.hasEdge) return false;

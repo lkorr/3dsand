@@ -511,6 +511,7 @@ add_library(sandvox_core OBJECT
   src/test/selftest_equipment.cpp
   src/test/selftest_dye.cpp
   src/test/selftest_wound.cpp
+  src/test/selftest_impact.cpp
   src/test/selftest_audio.cpp
   src/audio/device.cpp
   src/audio/library.cpp

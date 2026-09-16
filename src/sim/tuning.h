@@ -312,6 +312,45 @@ struct Tuning {
     // (160) is chipped. See Mob::CutLimb. 0 disables the scaling.
     float cutHardnessRef = 8.0f;
     float cutHardnessMin = 0.05f;
+
+    // ---- A MACE IS THE ANSWER TO PLATE -------------------------------------
+    //
+    // The three rows above are what makes a BLADE skate off iron. These are
+    // the other half of the same argument, and the reason the owner asked for
+    // a mace at all: armour that cannot be answered is not a mechanic, it is a
+    // wall. A blunt hit does to a shell what an edge cannot -- it breaks it
+    // in, and a share of it arrives on the body underneath regardless.
+    //
+    // How far a full-power hit at armorBreak 1 breaks INTO a worn shell, in
+    // world voxels, before the weapon's own `armorBreak` fraction scales it
+    // (a fist 0, a sword 0.05, a mace 0.8). Radial, and it is real geometry:
+    // the plate is genuinely gone there, so the flesh under it is exposed to
+    // the next blow, to fire and to acid -- "indent/destroy plate (revealing
+    // flesh)" in the owner's words, with no armour-value number anywhere.
+    float bluntDentRadius = 3.0f;
+    // ...scaled by the shell's own MATERIAL HARDNESS, exactly as the kerf is,
+    // against this reference and floored here. 60 rather than the kerf's 8
+    // because the whole point is that plate is much LESS proof against trauma
+    // than against an edge: iron (160) keeps about 38% of the dent, where it
+    // keeps 5% of a kerf.
+    float bluntHardnessRef = 120.0f;
+    float bluntHardnessMin = 0.15f;
+    // WHAT GETS THROUGH. Fraction of a blunt blow's hp that is TRANSMITTED to
+    // the limb the shell is strapped to (MobLimb::wornHost), as trauma with a
+    // bruise and no dent. This is the number that says "plate stops swords
+    // almost entirely; maces go through": it is charged whether or not the
+    // shell broke, because the shell deforming is how the energy arrives.
+    float bluntThrough = 0.55f;
+    // ...and how much of it the shell itself takes as hp. Under 1 because a
+    // plate that absorbed the whole blow would be destroyed by the same number
+    // of hits that kill the wearer, and then the armour would have no history.
+    float bluntShellHp = 0.6f;
+    // A BITE ON ARMOUR IS A BLOW, NOT A WOUND. Fraction of a bite's damage
+    // that lands as blunt trauma when the teeth meet a worn shell. There is
+    // deliberately no shell-breaking and NO INFECTION on this path: armour
+    // defends, and that is the whole reason the struck slot is classified
+    // (impact.h StruckKind) before any part of the profile is applied.
+    float biteOnShell = 0.3f;
   } gear;
 
   // ---- player avatar ----
@@ -1093,6 +1132,82 @@ struct Tuning {
     // nothing below ever gets a chance to run. Scaling here rather than
     // rewriting every mob sidecar keeps it one knob and one rebuild-free edit.
     float woundImpactSeverScale = 4.0f;
+
+    // ---- E6. TRAUMA AND TEETH (docs/PLAN_impact_unarmed.md §2) -------------
+    //
+    // The wound model above is a KERF, and until 2026-09-15 it was the only
+    // wound this engine had: every weapon arrived as an edge, which is why
+    // there was no mace and no fist. A strike is now three parts (game/
+    // impact.h StrikeProfile), and these are the numbers the other two read.
+    //
+    // THE VICTIM DOES NOT DECIDE WHAT THE WOUND IS MADE OF. A cut leaves the
+    // creature's own woundMat; a bruise leaves `bruiseMat`; a bite leaves the
+    // BITER's infection. That is the one idea these rows encode, and it is
+    // what `Mob::StainWoundAs` exists for.
+
+    // BRUISING. How far a punch discolours the skin around it, in world
+    // voxels, at full power -- scaled by (0.5 + 0.5 * power), so even a
+    // glancing hit marks. There is no lower bound on how many blows this
+    // takes: repeat hits deepen the same patch because the rewrite is keyed on
+    // the lattice position, exactly as the blood soak is.
+    float bruiseRadius = 0.9f;
+    // ...and WHAT it discolours the skin to, BY NAME.
+    //
+    // THE ONE NAME-TYPED TUNING ROW IN THE FILE, and the reason is that it
+    // cannot be anything else. An id would be stale after either hot reload:
+    // tuning.json reloads on F5 and materials.json on R, independently, and a
+    // number here would silently start meaning a different substance the first
+    // time somebody inserted a material. So it is resolved at USE through
+    // MobSystem::MaterialIdNamed, the same way a mob sidecar's
+    // `bleed.material` is resolved at load -- behaviour is data, and a
+    // material is named (CLAUDE.md design rule 4).
+    //
+    // An unknown name resolves to 0, which means "no bruise": the blow still
+    // lands, still hurts and still dents, it simply leaves no mark. That is
+    // the right failure for a cosmetic row -- louder would mean a typo in a
+    // colour costing somebody their combat.
+    std::string bruiseMat = "skin_bruised";
+    // A PUNCH DOES NOT OPEN YOU. Fraction of a cut's drip budget that blunt
+    // trauma tops up (Mob::Damage and the dent's own carve). 0 makes a mace a
+    // completely dry weapon; 1 makes it bleed like a sword, which is the
+    // behaviour this whole split exists to avoid.
+    float bluntBleedScale = 0.1f;
+    // How deep a DENT a full-power blunt hit takes out of flesh, in world
+    // voxels, before the weapon's own `bluntCarve` fraction scales it. A fist
+    // authors 0 and removes nothing at all; a gauntlet ~0.35 and a mace ~0.6
+    // of this. Radial, never a kerf, and inside a Mob::BluntCarveScope that
+    // refuses the collapse sever -- the crater is still soaked in the victim's
+    // woundMat, which is the "replace them with gore" half of the owner's
+    // spec.
+    float bluntCarveRadius = 0.7f;
+    // A BITE. Radius of the tear in world voxels at full power, scaled by
+    // (0.4 + 0.6 * power); `biteBlob` is the correlated noise's feature size
+    // in SKIN voxels, i.e. the size of one piece that comes away. Same pair,
+    // same meaning, as a zombie's `rot.radius` / `rot.blob` -- a bite and the
+    // hole a zombie was born with are the same shape (Mob::CarveBlob).
+    //
+    // THE PLAN AUTHORED 1.1 AND THE MEASUREMENT SAYS 0.45. The world is ten
+    // voxels to the metre and a human thigh is about 1.2 world voxels thick,
+    // so a 1.1-voxel ball is most of a limb's cross-section: `bite-rot`
+    // measured ONE bite taking 936 of 1344 voxels off a thigh and the second
+    // collapsing it, which is not a rotten wound -- it is an amputation with
+    // teeth, and it put the gate on a knife-edge where a different mob id
+    // flipped the answer. 0.45 is a hole about 9 cm across, which is a bite.
+    // Enough of them still take a hand off, because the collapse sever is left
+    // ON for a bite (Mob::BiteScope) -- it simply takes several.
+    float biteRadius = 0.45f;
+    float biteBlob = 2.5f;
+    // ...and how much wider than a blade's crater rim the bite's soak reaches,
+    // as a MULTIPLE of craterStainRim. Above 1 because a tear is a ragged hole
+    // rather than a clean slot: the mess goes further than the damage.
+    float biteStainScale = 1.5f;
+    // ROT SETTLES SLOWER THAN BLOOD DOES. `woundHealSlow` divides blood's own
+    // decay inside a limb so a cut fades over ~6 s instead of ~3 s; an
+    // infection is not a wound settling, it is something living in you, so it
+    // gets its own (larger) divisor. Applies to the material a BITE rewrote
+    // flesh to (MobLimb::infectMat), on a creature whose wounds heal at all --
+    // in an undead, whose do not, rot never goes away, which is the point.
+    float infectHealSlow = 6.0f;
 
     // ========================================================================
     // F. BLOOD IS HEALTH — every drop that leaves a body is hp leaving it

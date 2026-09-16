@@ -55,6 +55,7 @@ const std::vector<Gate>& SwingGates();
 const std::vector<Gate>& EquipmentGates();
 const std::vector<Gate>& DyeGates();
 const std::vector<Gate>& WoundGates();
+const std::vector<Gate>& ImpactGates();
 // ONE list for all six combat gates (two feel gates and four NPC ones), even
 // though kOrder splits them to opposite ends of the run: the registry is a
 // pool of every gate a TU offers and the ORDER is kOrder's business alone.
@@ -418,6 +419,20 @@ const char* const kOrder[] = {
     // difference and the off arm is both the undead setting and the proof the
     // decay ran at all (owner report 2026-09-14).
     "wound-heal",
+    // ---- THE OTHER TWO KINDS OF BLOW (docs/PLAN_impact_unarmed.md) --------
+    // A strike is three parts now (game/impact.h): the wound gates above own
+    // the CUT, and these four own the BLUNT and the BITE. Appended after them
+    // by the rule the long note in this block states — a new gate in a
+    // shared-World suite goes LAST in its group, so it inherits state instead
+    // of changing what everything after it inherits.
+    //
+    // They belong beside the wound gates rather than beside the combat ones
+    // because they are fabricated blows against a standing fixture, not
+    // strokes through the AI: same perturbation, same scale, same "spawn one
+    // creature, hit it, reset" shape. Each regenerates worldgen on the way in
+    // and resets mobs and debris on every exit, and each restores the id
+    // counter (mob ids seed gore variance).
+    "impact-blunt", "impact-armor", "impact-fist", "bite-rot",
     // ...and a corpse that died alight keeps burning: every piece advances
     // its embers, keeps emitting fire, and its brick agrees with its lattice
     // (owner report 2026-09-02: the corpse pulsed at its death colour for
@@ -452,6 +467,17 @@ const char* const kOrder[] = {
     // A saguaro-sized fixture that fits every cap tree-fell crosses: if THIS
     // stays standing the handoff chain itself is at fault, not a limit.
     "cactus-fell",
+    // ---- FISTS, JAWS AND A LUNGE (docs/PLAN_impact_unarmed.md §8) ---------
+    // APPENDED HERE, as late as they can go, by the rule the wound block above
+    // spells out and the `floaters` block sharpens: a new gate in a
+    // shared-World suite goes where it disturbs the fewest gates that were
+    // there first, and "its group" is a tiebreak rather than the constraint.
+    // All four spawn creatures (which perturbs every id-keyed draw after
+    // them), `lunge` throws bodies through the air, and `player-unarmed`
+    // stands an avatar on real terrain — so they go after everything except
+    // `voxregion`, which owns the residency window. Each restores the id
+    // counter and regenerates worldgen on the way out.
+    "unarmed-attack", "lunge", "bite-target", "player-unarmed",
     // LAST of the world-touching gates, and it must be: BuildVoxRegion moves
     // the residency window and resets the page table, which is the state every
     // other gate's fixture placement assumes. It restores both before it
@@ -472,7 +498,8 @@ const std::vector<Gate>& Registry() {
                           &WorldIoGates(), &AudioGates(),
                           &VoxRegionGates(),
                           &SpellGates(), &PlayerKitGates(), &GrimoireGates(), &SwingGates(),
-                          &EquipmentGates(), &DyeGates(), &WoundGates(), &CombatGates()})
+                          &EquipmentGates(), &DyeGates(), &WoundGates(), &ImpactGates(),
+                          &CombatGates()})
       pool.insert(pool.end(), g->begin(), g->end());
 
     std::vector<Gate> v;

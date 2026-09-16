@@ -51,3 +51,6 @@ AGENTS_BOARD.md
 # history. Prose notes ABOUT a reference belong in docs/refs as .md and are not
 # matched here.
 docs/refs/*/
+
+# --shot-strike frames, kept on disk for a human eye, never in the tree
+shots/

@@ -580,8 +580,231 @@ function programCard(sty) {
     card.append(row);
   }
 
+  card.append(weaponRow(sty), lungeBlock(sty), targetRow(sty));
   card.append(derivedLine(sty));
   return card;
+}
+
+/* ---- WHAT SWINGS IT, AND WHEN (docs/PLAN_impact_unarmed.md §4/§5) --------
+ *
+ * Four fields that each default to the behaviour a style authored before they
+ * existed already had — the held weapon, never a fallback, the profile's
+ * reach, no leap, the chest — so an older file loads unchanged and a newer one
+ * loads on an older binary. That is also why they are edited HERE rather than
+ * in a second panel: they are part of the same authoring act as the windup
+ * and the cut, and splitting "what the arm does" from "which arm" is how you
+ * get a punch authored against a sword's coordinates.
+ * ------------------------------------------------------------------------ */
+
+function weaponRow(sty) {
+  const r = sty.raw;
+  const row = el('div', { class: 'atkrow' });
+
+  // ---- the weapon picker --------------------------------------------
+  // "held" plus THE OPEN RIG'S OWN natural weapons, because only the rig can
+  // answer what "jaws" means: StyleUsable asks a creature whether the part is
+  // there and alive, which no amount of reading this JSON can decide
+  // (melee.js's citation block says the same about the port).
+  const nat = host?.naturalWeapons?.() || [];
+  const sel = el('select', { class: 'small', title:
+    'WHAT SWINGS THIS STYLE. "held" is whatever is in the fist — every style ' +
+    'authored before the unarmed package. A natural weapon is a part of the ' +
+    'rig that IS a weapon (the Natural weapons block in the rig panel): the ' +
+    'driver steers THAT part, and PickAttackStyle drops the style entirely ' +
+    'when the creature has not got it or it has been cut off.' });
+  sel.append(el('option', { value: 'held' }, 'held item'));
+  for (const w of nat)
+    sel.append(el('option', { value: w.name },
+      w.name + ' (' + w.mode + ' · ' + (w.part || '?') + ')'));
+  const cur = sty.weapon || 'held';
+  if (cur !== 'held' && !nat.some(w => w.name === cur))
+    sel.append(el('option', { value: cur }, cur + ' — not on this rig'));
+  sel.value = cur;
+  sel.addEventListener('change', () => {
+    const v = sel.value;
+    if (v === cur) return;
+    editStyles('weapon', () => {
+      if (v === 'held') delete r.weapon; else r.weapon = v;
+    });
+  });
+  row.append(el('label', { title: 'the effector the stroke driver moves' }, 'weapon'), sel);
+
+  // ---- fallback -------------------------------------------------------
+  row.append(chip('fallback', !!sty.fallback, () =>
+    editStyles('fallback', () => {
+      if (sty.fallback) delete r.fallback; else r.fallback = true;
+    }),
+    'ONLY WHEN THERE IS NOTHING BETTER. PickAttackStyle drops every fallback ' +
+    'style as a group the moment any non-fallback one is still usable, which ' +
+    'is what makes a duelist\'s punches invisible while it holds a sword and ' +
+    'the whole of its repertoire once disarmed. Every punch in the shipped ' +
+    'library is one; the zombie\'s bites are not.'));
+
+  // ---- reach ----------------------------------------------------------
+  row.append(el('label', { title: 'world voxels' }, 'reach'), numCell({
+    step: 1, min: 0, max: 200,
+    title: 'WORLD VOXELS, centre to centre, overriding the behaviour ' +
+      'profile\'s attack.reach for THIS style alone; 0 = use the profile\'s. ' +
+      'A lunging bite closes 22 and a punch closes 9, and a profile can only ' +
+      'state one number — MobSystem::AttackReachOf hands the AI the longest ' +
+      'of them and BeginStroke refuses a style the target is outside.',
+    get: () => num(r.reach, 0),
+    sub: sty.reach > 0 ? fmt(sty.reach * MELEE.kVoxelMeters, 2) + ' m' : 'profile',
+    subTitle: 'the same distance in metres',
+    set: v => editStyles('reach', () => { if (v > 0) r.reach = v; else delete r.reach; }),
+  }));
+  if (cur !== 'held' && !nat.some(w => w.name === cur && w.usable))
+    row.append(el('span', { class: 'hint' },
+      '⚠ the open rig declares no usable "' + cur + '"'));
+  return row;
+}
+
+/**
+ * THE BALLISTIC OPENING, and the timeline that makes it authorable.
+ *
+ * strokes.h states the contract and leaves one thing to the author: "lining
+ * the landing up with the cut is the AUTHOR's job (windup.ticks ~ ticks; the
+ * tuner's Attacks lane shows both)". This is that. The two numbers are on
+ * different clocks — `ticks` is what the horizontal magnitude is BUDGETED
+ * against, while the flight actually ends when gravity brings `rise` back down
+ * — so the panel solves the arc and prints the landing tick beside the tick
+ * the cut starts on.
+ */
+function lungeBlock(sty) {
+  const r = sty.raw;
+  const wrapEl = el('div', {});
+  const has = MELEE.lungeAny(sty.lunge) ||
+              (r.lunge && typeof r.lunge === 'object');
+  const head = el('div', { class: 'atkrow' },
+    el('label', { title:
+      'A POUNCE IS NOT A FASTER WALK. The walk drive resolves a whole step ' +
+      'against the body\'s box every tick and cannot leave the ground, so a ' +
+      'lunge hands the body a VELOCITY (Mob::Launch) at the start of a named ' +
+      'phase and UpdateFall carries it, wall test and all.' }, 'lunge'));
+  if (!has) {
+    head.append(chip('+ lunge', false, () => editStyles('add lunge', () => {
+      r.lunge = { ticks: 9, speed: 2.4, rise: 1.1, at: 'windup' };
+    }), 'give this style a leap'));
+    wrapEl.append(head);
+    return wrapEl;
+  }
+  head.append(el('button', { class: 'small danger', title: 'no leap',
+    onclick: () => editStyles('remove lunge', () => { delete r.lunge; }) }, '✕'));
+  wrapEl.append(head);
+
+  const j = r.lunge;
+  const seg = el('div', { class: 'atkseg' });
+  seg.append(el('div', {}),
+    el('div', { class: 'hdr', title: 'the flight the author is BUDGETING for' }, 'ticks'),
+    el('div', { class: 'hdr', title: 'm/s, horizontal ceiling' }, 'speed'),
+    el('div', { class: 'hdr', title: 'm/s, straight up' }, 'rise'),
+    el('div', { class: 'hdr', title: 'which phase\'s START fires it' }, 'at'));
+  seg.append(el('div', { class: 'lbl' }, 'leap'));
+  seg.append(numCell({
+    int: true, step: 1, min: 0, max: 60, dflt: 9,
+    title: 'THE FLIGHT THE MAGNITUDE IS BUDGETED AGAINST, not the flight that ' +
+      'happens: the horizontal is min(speed, (gap − the effector\'s reach) ÷ ' +
+      'this), so the same authored style is a long leap from far out and a ' +
+      'short hop from close in. The landing is decided by `rise` and gravity — ' +
+      'the preview prints both.',
+    get: () => Math.max(0, Math.round(num(j.ticks, 0))),
+    sub: fmt(Math.max(0, Math.round(num(j.ticks, 0))) * TICK_MS / 1000, 2) + ' s',
+    set: v => editStyles('lunge ticks', () => { j.ticks = v; }),
+  }));
+  seg.append(numCell({
+    step: 0.1, min: 0, max: 20,
+    title: 'METRES PER SECOND, a CEILING on the horizontal — how fast this ' +
+      'creature can throw itself. Converted once by MetresPerSecToCells, for ' +
+      'the reason every other authored length here is derived.',
+    get: () => num(j.speed, 0),
+    sub: fmt(num(j.speed, 0) / MELEE.kVoxelMeters, 1) + ' v/s',
+    set: v => editStyles('lunge speed', () => { j.speed = v; }),
+  }));
+  seg.append(numCell({
+    step: 0.1, min: 0, max: 20,
+    title: 'METRES PER SECOND straight up. A LUNGE WITH NO RISE LANDS THE TICK ' +
+      'AFTER IT LEFT — UpdateFall\'s launch latch buys exactly one — so every ' +
+      'authored lunge must climb (scripts/test_melee.mjs asserts it).',
+    get: () => num(j.rise, 0),
+    sub: fmt(num(j.rise, 0) / MELEE.kVoxelMeters, 1) + ' v/s',
+    set: v => editStyles('lunge rise', () => { j.rise = v; }),
+  }));
+  const at = el('select', { class: 'small', title:
+    'WHICH PHASE\'S START FIRES IT. "windup" (the default) makes the leap the ' +
+    'telegraph itself; "cut" throws the body after the blow has committed. A ' +
+    'leap during the recover would be a creature hurling itself at somebody ' +
+    'after the blow landed, so those two are the only values the loader takes.' });
+  for (const v of ['windup', 'cut']) at.append(el('option', { value: v }, v));
+  at.value = j.at === 'cut' ? 'cut' : 'windup';
+  at.addEventListener('change', () => {
+    const v = at.value;
+    if (v === (j.at || 'windup')) return;
+    editStyles('lunge at', () => { j.at = v; });
+  });
+  seg.append(el('div', { class: 'atkcell' }, at));
+  wrapEl.append(seg);
+  return wrapEl;
+}
+
+/**
+ * WHICH LIMB A BLOW IS AIMED AT — weights over LIMB TAGS, not names, so any
+ * rig that tags its parts answers the same table (strokes.h StyleTargetWeight).
+ * One row per tag the OPEN RIG publishes, which is the only honest list: a
+ * weight on a tag this creature has not got is a weight that never wins.
+ */
+function targetRow(sty) {
+  const r = sty.raw;
+  const tags = host?.limbTags?.() || [];
+  const wrapEl = el('div', {});
+  const head = el('div', { class: 'atkrow' },
+    el('label', { title:
+      'Absent = today\'s behaviour, the chest. Drawn counter-based on (mobId, ' +
+      'tick) at BeginStroke like every other variation here, over the ' +
+      'victim\'s LIVE base limbs, and recorded on NpcStroke::targetLimb so a ' +
+      'gate can assert the DISTRIBUTION rather than inferring it from where ' +
+      'the wounds landed.' }, 'target'));
+  if (!tags.length) {
+    head.append(el('span', { class: 'hint' },
+      'the open rig tags no limbs — tag them in the rig panel and the weights ' +
+      'appear here'));
+    wrapEl.append(head);
+    return wrapEl;
+  }
+  const have = r.target && typeof r.target === 'object' ? r.target : null;
+  head.append(el('span', { class: 'hint' },
+    have ? 'weights over this rig\'s tags; 0 = never' : 'none — the chest'),
+    chip(have ? 'clear' : '+ table', false, () => editStyles('target table', () => {
+      if (have) delete r.target;
+      else r.target = Object.fromEntries(tags.map(t => [t, t === 'head' ? 0.35 : 0.2]));
+    }), have ? 'drop the table: the blow goes to the chest again'
+            : 'weight this style over the tags this rig publishes'));
+  wrapEl.append(head);
+  if (!have) return wrapEl;
+
+  const grid = el('div', { class: 'atkseg',
+    style: 'grid-template-columns:repeat(' +
+           Math.min(6, Math.max(2, tags.length)) + ',minmax(0,1fr))' });
+  // Normalised alongside the raw weight, because the draw is proportional and
+  // "0.35" means nothing without the total it is 0.35 OF.
+  let total = 0;
+  for (const t of tags) total += Math.max(0, num(have[t], 0));
+  for (const t of tags)
+    grid.append(el('div', { class: 'atkcell' },
+      el('div', { class: 'hdr', style: 'font-size:9.5px', title: 'limb tag' }, t),
+      numCell({
+        step: 0.05, min: 0, max: 10,
+        title: 'relative weight; the draw is proportional, so only the ratios ' +
+               'matter. 0 (or absent) means this tag is never chosen.',
+        get: () => num(have[t], 0),
+        sub: total > 1e-6
+          ? Math.round(Math.max(0, num(have[t], 0)) / total * 100) + '%' : '—',
+        subTitle: 'share of the draw',
+        set: v => editStyles('target ' + t, () => {
+          if (v > 0) have[t] = v; else delete have[t];
+        }),
+      })));
+  wrapEl.append(grid);
+  return wrapEl;
 }
 
 /** Where an authored reach offset lands on the arm currently previewing. */
@@ -710,9 +933,56 @@ function previewCard(sty) {
     chip('centre', false, () => { aim = { az: 0, el: 0 }; render(); }));
   card.append(t2);
 
-  if (sty) card.append(strokeBar(sty));
+  if (sty) card.append(strokeBar(sty), lungeTimeline(sty));
   card.append(readout());
   return card;
+}
+
+/**
+ * LANDS AT TICK N, CUT STARTS AT TICK M — the one line an author can act on.
+ *
+ * Both numbers are counted from the first tick of the program, and they are
+ * measured on different clocks on purpose:
+ *
+ *   LANDS  the ballistic flight the authored `rise` actually buys against
+ *          physics.gravity, integrated on the stroke's own 30 Hz clock. It is
+ *          NOT `lunge.ticks` — that number is the BUDGET the horizontal
+ *          magnitude is solved against, and the two agreeing is the thing
+ *          being authored, not something the loader enforces.
+ *   CUT    the post-jitter `windupTicks` of the LIVE program when one is
+ *          running, and the authored count otherwise. A style with
+ *          jitter.tempo has no single answer here, which is itself worth
+ *          seeing: a leap timed against the mean lands early half the time.
+ *
+ * The preview flies the arc from the STYLE'S OWN reach, because that is the
+ * distance BeginStroke commits from, and arrives at the EFFECTOR's reach —
+ * confusing those two is what made the engine's first lunge hop on the spot.
+ */
+function lungeTimeline(sty) {
+  const box = el('div', { class: 'atkderived', id: 'atkLunge' });
+  const info = host?.lungeInfo?.(sty);
+  if (!info) { box.style.display = 'none'; return box; }
+  box.append(el('span', { id: 'atkLungeText' }, lungeText(sty, info)));
+  return box;
+}
+
+function lungeText(sty, info) {
+  const cur = host?.cursorTicks?.() || { windup: 0 };
+  const cutAt = cur.windup > 0 ? cur.windup : sty.windup.ticks;
+  const land = info.at === 'cut' ? cutAt + info.landTicks : info.landTicks;
+  const slack = land - cutAt;
+  const state = info.state ? ` · ${info.state} ×${fmt(info.scale, 2)}` : '';
+  const live = info.live
+    ? `  ·  in the air ${info.live.airTicks}t, ${fmt(info.live.x, 1)} vox out` +
+      (info.live.landed ? ' (landed)' : '')
+    : '';
+  return `lunge: lands at tick ${land}, cut starts at tick ${cutAt}` +
+    (Math.abs(slack) <= 1 ? '  ✓ lined up'
+      : slack > 0 ? `  ⚠ ${slack} ticks late — the cut fires in mid-air`
+                  : `  ⚠ ${-slack} ticks early — it lands and then winds up`) +
+    `  ·  budget ${info.budget}t, travels ${fmt(info.travel, 1)} vox from a ` +
+    `${fmt(info.standOff, 0)}-voxel stand-off to a ${fmt(info.armReach, 1)}-` +
+    `voxel reach${state}${live}`;
 }
 
 function aimSlider(key) {
@@ -785,6 +1055,14 @@ function readout() {
   };
   box.append(
     line('phase', phaseText(st), 'the STROKE PROGRAM\'s phase'),
+    line('effector', effectorText(a),
+      'WHICH PART THE DRIVER IS MOVING, and how (game/impact.h ' +
+      'StrikeEffectorMode). "held" is the socket\'s hand with an item in it; ' +
+      '"chain" is a natural weapon an IK chain serves — the same solve, no ' +
+      'wrist steering, the part\'s own edge; "aim" is a part in no chain (the ' +
+      'jaws), rotated with a share of the spine until its forward lies along ' +
+      'the stroke. An aim effector shows the yaw/pitch it was commanded, which ' +
+      'is the number a bite that does not snap is missing.'),
     line('driver', st.meleePhase || 'idle',
       'MeleeState: guard / wind / slash / recover. A windup deliberately stays ' +
       'in GUARD — that is what "under commitSpeed" means.'),
@@ -821,6 +1099,14 @@ function readout() {
 
 // The readout's derived strings, shared by the first render and tickUI.
 const phaseText = st => (st.phase || 'idle') + (st.holding ? ' (held)' : '');
+const effectorText = a => {
+  if (!a || !a.effMode || a.effMode === 'none') return '—';
+  const what = a.effWeapon ? ' · ' + a.effWeapon : '';
+  const aim = a.aim
+    ? `  ${fmt(a.aim.yaw)} / ${fmt(a.aim.pitch)} rad, spine ${fmt(a.aim.share, 2)}`
+    : '';
+  return `${a.effPart || '?'} · ${a.effMode}${what}${aim}`;
+};
 const startText = st => st.start
   ? `${fmt(st.start.az)} / ${fmt(st.start.el)}` : '—';
 function targetText(st) {
@@ -859,6 +1145,7 @@ export function tickUI() {
       if (s) s.textContent = v;
     };
     set('phase', phaseText(st));
+    set('effector', effectorText(a));
     set('driver', st.meleePhase || 'idle');
     set('az/el', `${fmt(st.az)} / ${fmt(st.el)}`);
     set('start', startText(st));
@@ -871,6 +1158,14 @@ export function tickUI() {
     set('weight', fmt(st.weight));
     set('blade', fmt(a.bladeLen));
     set('band', `${fmt(a.bandLo)}–${fmt(a.bandHi)}`);
+  }
+  // The flight, live. Text only — rebuilding the element would drop the
+  // author's focus, which is the whole reason tickUI is not a re-render.
+  {
+    const lt = wrap.querySelector('#atkLungeText');
+    const sty = lib?.styles[selected];
+    const info = sty ? host.lungeInfo?.(sty) : null;
+    if (lt && sty && info) lt.textContent = lungeText(sty, info);
   }
   const bar = wrap.querySelector('#atkStrokeBar');
   if (bar) {

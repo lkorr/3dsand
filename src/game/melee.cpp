@@ -219,6 +219,28 @@ bool LoadItemAsset(const std::string& dir, size_t materialCount,
 
   d.hp = s.value("hp", 30.0f);
   d.severable = s.value("severable", true);
+  // ---- A WORN PIECE THAT IS ALSO A WEAPON --------------------------------
+  //
+  // items.json carries the profile for a HELD item, because that is where an
+  // item's behaviour numbers live. A gauntlet's does not belong there: it is a
+  // fact about a piece of ARMOUR, read only when the fist inside it swings
+  // (plan S2's gauntlet override), and putting it in the behaviour file would
+  // mean every armour row grew four melee keys it has no use for.
+  //
+  // So it is authored in the piece's own sidecar and parsed into the SAME
+  // field. A sidecar block overrides whatever items.json said, and a piece
+  // with no block leaves the profile empty -- which is what `Any()` reads as
+  // "this is not a weapon".
+  if (s.contains("strike") && s["strike"].is_object()) {
+    const json& st = s["strike"];
+    d.strike.cut = st.value("cut", d.strike.cut);
+    d.strike.blunt = st.value("blunt", d.strike.blunt);
+    d.strike.bluntCarve =
+        std::clamp(st.value("bluntCarve", d.strike.bluntCarve), 0.0f, 1.0f);
+    d.strike.armorBreak =
+        std::clamp(st.value("armorBreak", d.strike.armorBreak), 0.0f, 1.0f);
+    d.strike.bite = st.value("bite", d.strike.bite);
+  }
   // Greyscale-weave art, i.e. a piece a dye means something on (game/dye.h).
   // Defaults false, which is every piece authored before the commoner
   // wardrobe: those are painted in real colours and multiplying them by
@@ -475,7 +497,18 @@ bool LoadItems(const std::string& dir, size_t materialCount,
                 "\" — skipped\n";
       continue;
     }
-    d.damage = it.value("damage", 12.0f);
+    // ---- THE STRIKE PROFILE (game/impact.h) --------------------------------
+    // `damage` IS the CUT part and the key is deliberately not renamed: it is
+    // still the honest name for the half of a blow that opens a wound, and
+    // four shipped rows plus a gate already spell it that way. The other three
+    // are new and all default to 0, so every item that predates the impact
+    // model loads as a pure kerf and behaves exactly as it did.
+    d.strike.cut = it.value("damage", 12.0f);
+    d.strike.blunt = it.value("blunt", 0.0f);
+    // 0..1 fractions of a TUNING radius rather than sizes in voxels, for the
+    // kVoxelMeters reason every other length in this engine is derived.
+    d.strike.bluntCarve = std::clamp(it.value("bluntCarve", 0.0f), 0.0f, 1.0f);
+    d.strike.armorBreak = std::clamp(it.value("armorBreak", 0.0f), 0.0f, 1.0f);
     d.carveBonus = it.value("carveBonus", 0.0f);
     // The authored heft OVERRIDE. Absent (or 0) is the normal case and means
     // "derive it from the art" — LoadItemAsset below fills heftVolume and
@@ -624,8 +657,12 @@ EdgeSweepResult MeleeSweepDamage(const EdgeSweep& s, const MeleeTuning& t,
       // knocked out of the hand — both by mechanisms that were already there.
       // Deliberately NOT inside a BladeCutScope: a clang is not a
       // dismemberment and must not arm the wet cue.
-      mobs.Damage(blockBody, s.damage * power * t.blockItemDamage, blockAt,
-                  out.tipSpeed);
+      // EVERYTHING THE BLOW CAN DO, against the item that stopped it. A parry
+      // is the one place the three parts of a strike are NOT distinguished:
+      // what a blade catching a mace loses is its own hp, and a mace's trauma
+      // is exactly as bad for it as a sword's edge (StrikeProfile::Total).
+      mobs.Damage(blockBody, s.strike.Total() * power * t.blockItemDamage,
+                  blockAt, out.tipSpeed);
       // ...and the defender's guard is beaten open a little, deterministically.
       mobs.PushBlockEvent(out.block, t);
       return out;
@@ -647,6 +684,11 @@ EdgeSweepResult MeleeSweepDamage(const EdgeSweep& s, const MeleeTuning& t,
   // One hit per body per swing tick: without this the same limb is carved once
   // per probe and a single cut removes a whole arm.
   std::vector<uint64_t> hitBodies;
+  // Every body the wielder still owns: its limbs, its worn shells and whatever
+  // is in its fist. Handed to every probe so a ray that begins inside the
+  // creature swinging it passes straight out (see the note in the loop).
+  std::vector<uint64_t> selfBodies;
+  wielder.AppendLiveLimbBodies(selfBodies);
   for (int step = 1; step <= steps && (int)hitBodies.size() < 8; step++) {
     const float u = (float)step / (float)steps;
     const Vec3 a = s.aPrev + (s.aNow - s.aPrev) * u;
@@ -673,21 +715,89 @@ EdgeSweepResult MeleeSweepDamage(const EdgeSweep& s, const MeleeTuning& t,
     // because the last START point plus its own tile is what reaches the tip.
     // Casting from the tip as well would put a whole extra tile PAST the point,
     // which is a hitbox longer than the weapon.
-    const float probe = std::max(segLen / (float)along + radius, 0.6f);
+    // A SELF-MOUNTED EDGE PROBES ALONG ITS TRAVEL (melee.h selfMounted): a
+    // fist damages what it runs into, and its own axis points back up the arm.
+    // The reach is its own thickness rather than its (negligible) length, so
+    // the hitbox is the fist and the voxel it is about to occupy.
+    const bool alongTravel = s.selfMounted && sweepDir.len() > 1e-4f;
+    // ---- AND EVERY PROBE OVERHANGS BY A CELL ----------------------------
+    // The rays end at the weapon's own carve radius past the last sample, and
+    // the thing they are trying to find is a voxel CENTRE -- which sits up to
+    // half a cell's diagonal (0.87 voxels) inside the surface the blade is
+    // actually touching. So a weapon whose edge is in contact still probed
+    // short of the thing it was in contact with: measured, a mace 0.5 voxels
+    // from the victim's nearest voxel, 95 rays cast and 95 of them air. The
+    // overhang is that discretisation and nothing more.
+    const float kCellReach = 0.87f;
+    const float probe =
+        alongTravel ? std::max(radius * 2.0f + kCellReach, 0.6f)
+                    : std::max(segLen / (float)along + radius + kCellReach,
+                               0.6f);
     for (int k = 0; k < along; k++) {
       const float v = (float)k / (float)along;
       const Vec3 p = a + (b - a) * v;
+      const Vec3 dir = alongTravel ? sweepDir : seg.normalized();
+      // ---- THE WIELDER IS SKIPPED THROUGH, NOT STOPPED AT (2026-09-15) ----
+      //
+      // A weapon must not cut its wielder: the wielder's own parts are
+      // permanently inside the swing arc, so without that rule every guard
+      // would saw through the arm holding it. But ABANDONING THE PROBE on the
+      // wielder's own body is a different rule, and it is the one that made a
+      // fist unable to hit anything at all.
+      //
+      // A HELD BLADE'S EDGE STARTS OUTSIDE ITS OWNER — at the ricasso, past
+      // the fist — so its probe ray never begins inside one of the wielder's
+      // colliders and the `continue` never fired in anger. A NATURAL WEAPON'S
+      // EDGE *IS* ONE OF THOSE COLLIDERS: the fist's segment runs down the
+      // inside of hand.R, so every ray's first hit was the wielder's own hand,
+      // every probe was thrown away, and no punch or bite in the game could
+      // ever land. Measured through `--shot-strike`: the knuckles' hitbox
+      // OVERLAPPING the victim (-0.2 voxels of clearance) and still `0 bodies
+      // hit`, on every scenario C photographed.
+      //
+      // So the ray steps PAST its owner's body and carries on with what is
+      // left of its length. Bounded at three skips -- an arm, a hand, and a
+      // sleeve is as many of the wielder as any probe can be inside -- so this
+      // cannot become an unbounded march (rule 2), and it is exactly the old
+      // behaviour for a sword, which never hits the branch.
+      // ---- THE WIELDER IS EXCLUDED, NOT STEPPED OVER ---------------------
+      //
+      // A weapon must not cut its wielder, and the old rule said so by
+      // DROPPING any probe whose first hit was the owner's own body. For a
+      // held blade that never fired in anger: the edge starts at the ricasso,
+      // already clear of the fist, so the ray begins in open air. A NATURAL
+      // WEAPON'S EDGE *IS* ONE OF THE WIELDER'S COLLIDERS -- the fist's
+      // segment runs down the inside of hand.R, the jaws' out through the
+      // skull -- and Jolt reports a convex shape the origin is INSIDE as a hit
+      // at fraction 0 (physics.h says so where this overload is declared). So
+      // every probe a fist or a set of jaws ever cast was thrown away on its
+      // own hand, and no punch or bite in the game could land. Measured
+      // through `--shot-strike`, with the knuckles' hitbox OVERLAPPING the
+      // victim: `12 rays cast: 0 found air, 12 never left the wielder, 0 found
+      // a body`.
+      //
+      // The ignore-list cast is the fix and it is the one physics.h added this
+      // overload for. One list per sweep, not per probe -- a rig is a dozen
+      // bodies and this loop runs up to thirty times.
       float frac = 1.0f;
-      const uint64_t hb = phys.CastRayBody(p, seg.normalized(), probe, frac);
-      if (!hb) continue;
+      const uint64_t hb = phys.CastRayBody(p, dir, probe, frac, selfBodies);
+      out.probesCast++;
+      if (!hb) {
+        out.probesAir++;
+        continue;
+      }
+      // A ray that STILL found the wielder means AppendLiveLimbBodies missed a
+      // body the creature owns -- a real bug, and one nobody would otherwise
+      // see. Counted rather than asserted so the harness can report it.
+      if (wielder.OwnsBody(hb)) {
+        out.probesSelf++;
+        continue;
+      }
+      out.probesBody++;
       bool seen = false;
       for (uint64_t h : hitBodies) seen |= (h == hb);
       if (seen) continue;
-      // A weapon must not cut its wielder. The wielder's own parts are
-      // permanently inside the swing arc — the blade starts in its own hand —
-      // so without this every guard would saw through the arm holding it.
-      if (wielder.OwnsBody(hb)) continue;
-      const Vec3 at = p + seg.normalized() * (frac * probe);
+      const Vec3 at = p + dir * (frac * probe);
 
       // A PROBE THAT DID FIND A WEAPON. The geometric test above is what
       // actually detects parries; this is the safety net for the rare ray that
@@ -702,56 +812,146 @@ EdgeSweepResult MeleeSweepDamage(const EdgeSweep& s, const MeleeTuning& t,
         if (owner != nullptr && li >= 0 && li == owner->HeldSlot()) continue;
       }
       hitBodies.push_back(hb);
+
+      // ---- WHAT WAS STRUCK, ASKED ONCE (game/impact.h StruckKind) ----------
+      //
+      // Three resolvers read this and two gates assert on it, and an enum is
+      // cheaper to keep agreeing than three copies of the same two `if`s. The
+      // split is the RIG's own, exactly as MobSystem::FindOwner documents it:
+      // a slot below AppendedBase() is anatomy, the one at HeldSlot() is a
+      // weapon (already resolved above, and skipped by the guard just before
+      // this), anything else appended is a worn shell, and a body with no
+      // owner at all is debris.
+      StruckKind kind = StruckKind::Debris;
+      {
+        int li = -1;
+        Mob* owner = mobs.FindOwner(hb, &li);
+        if (owner != nullptr && li >= 0)
+          kind = li < owner->AppendedBase() ? StruckKind::Flesh
+                                            : StruckKind::Shell;
+      }
+
       // LIVE FLESH CARVES; DEBRIS MELTS. The same two populations the laser
-      // splits on, through the same two calls — a mob limb loses voxels exactly
-      // where the edge crossed it, which is what makes dismemberment geometric
-      // rather than a threshold (DESIGN.md §7 "Carving living bodies").
-      const float dmg = s.damage * power;
-      // Everything severed inside this scope is a BLADE cut, and gets the wet
-      // dismember sound on top of the creature's own cry. Both calls below can
-      // sever several frames deep — Damage() at zero hp or over the impact
-      // threshold, CutLimb() when the lattice is cut through — so the cause is
-      // marked around them rather than passed down through a chain the laser
-      // and explosions also use.
-      MobSystem::BladeCutScope blade(mobs, power);
-      if (mobs.Damage(hb, dmg, at, out.tipSpeed)) {
-        // A KERF, NOT A BITE. The radial carve this replaced took a sphere out
-        // of the limb, which at any radius that felt like a sword was most of
-        // an arm — and Damage() severed on contact anyway, so the shape never
-        // got to matter. Now it is the only thing that decides dismemberment:
-        // the slot follows the blade's own edge and the direction the swing is
-        // going, and a limb comes off when the lattice has been cut through
-        // (game/mob.h BladeCut).
-        //
-        // THIS IS THE ONLY PLACE THE KERF IS BUILT. It lives inside the sweep
-        // rather than at the player's call site precisely because there are
-        // three callers — the player's tick, an attacking NPC's tick, and the
-        // gate — and a second copy of these six lines is how the player's cut
-        // and the NPC's quietly stop being the same cut.
-        BladeCut cut;
-        cut.at = at;
-        cut.edgeAxis = seg.normalized();
-        // A stationary blade has no travel direction to speak of; fall back to
-        // boring along its own length, which is what a press with no swing
-        // behind it does.
-        cut.cutDir = sweepDir.len() > 1e-4f ? sweepDir : seg.normalized();
-        // The blade's OWN thickness decides the kerf's width; the tuning knob
-        // only scales it, because the geometry is supposed to be what decides
-        // the wound (items.json says so about carveBonus for the same reason).
-        cut.halfWidth = std::max(radius * goreT.cutWidth, 0.08f);
-        // `power` here is speed x edge-alignment (see the note where it is
-        // formed) and `s.heft` is the weapon's own volume, so how deep the
-        // wound goes is: how fast, how well-angled, and how much sword.
-        cut.depth = (goreT.cutDepth + goreT.cutDepthPower * power) * s.heft;
-        cut.length = goreT.cutLength * (0.4f + 0.6f * power) * s.heft;
-        cut.power = power;
-        // Counter-based, off the tick and the probe index: the ragged rim and
-        // the blood soak must replay identically, and nothing here may key on
-        // a Jolt float.
-        cut.seed = s.tick * 2654435761u + (uint32_t)hitBodies.size() * 40503u;
-        mobs.CutLimb(hb, cut, world, spawns);
-      } else {
+      // splits on — but a loose body has no wound model to speak of, so
+      // EVERYTHING that can hurt melts it in one call (StrikeProfile::Total),
+      // which is exactly what the single `damage` float used to do here.
+      if (kind == StruckKind::Debris) {
         debris.MeltBodyAt(hb, at, radius, world, spawns);
+        continue;
+      }
+
+      // The draw key every part below shares, so a replay of the same tick
+      // against the same probe cuts, bruises and tears identically. One
+      // counter, three salts: nothing here may key on a Jolt float.
+      const uint32_t hitSeed =
+          s.tick * 2654435761u + (uint32_t)hitBodies.size() * 40503u;
+
+      // ---- 1. THE CUT PART — today's whole wound model, unchanged ----------
+      //
+      // A weapon with no edge at all (a fist; a mace, very nearly) skips the
+      // kerf outright rather than building a zero-depth slot and asking the
+      // wound model to notice that it is nothing.
+      if (s.strike.cut > 0.0f) {
+        const float dmg = s.strike.cut * power;
+        // Everything severed inside this scope is a BLADE cut, and gets the wet
+        // dismember sound on top of the creature's own cry. Both calls below can
+        // sever several frames deep — Damage() at zero hp or over the impact
+        // threshold, CutLimb() when the lattice is cut through — so the cause is
+        // marked around them rather than passed down through a chain the laser
+        // and explosions also use.
+        //
+        // IT ENDS WITH THE KERF. The blunt and bite parts below are
+        // deliberately OUTSIDE it: a mace caving a skull in is not a
+        // dismemberment and must not arm the wet cue.
+        MobSystem::BladeCutScope blade(mobs, power);
+        if (mobs.Damage(hb, dmg, at, out.tipSpeed)) {
+          // A KERF, NOT A BITE. The radial carve this replaced took a sphere
+          // out of the limb, which at any radius that felt like a sword was
+          // most of an arm — and Damage() severed on contact anyway, so the
+          // shape never got to matter. Now it is the only thing that decides
+          // dismemberment: the slot follows the blade's own edge and the
+          // direction the swing is going, and a limb comes off when the lattice
+          // has been cut through (game/mob.h BladeCut).
+          //
+          // THIS IS THE ONLY PLACE THE KERF IS BUILT. It lives inside the sweep
+          // rather than at the player's call site precisely because there are
+          // three callers — the player's tick, an attacking NPC's tick, and the
+          // gate — and a second copy of these six lines is how the player's cut
+          // and the NPC's quietly stop being the same cut.
+          BladeCut cut;
+          cut.at = at;
+          cut.edgeAxis = seg.normalized();
+          // A stationary blade has no travel direction to speak of; fall back
+          // to boring along its own length, which is what a press with no swing
+          // behind it does.
+          cut.cutDir = sweepDir.len() > 1e-4f ? sweepDir : seg.normalized();
+          // The blade's OWN thickness decides the kerf's width; the tuning knob
+          // only scales it, because the geometry is supposed to be what decides
+          // the wound (items.json says so about carveBonus for the same reason).
+          cut.halfWidth = std::max(radius * goreT.cutWidth, 0.08f);
+          // `power` here is speed x edge-alignment (see the note where it is
+          // formed) and `s.heft` is the weapon's own volume, so how deep the
+          // wound goes is: how fast, how well-angled, and how much sword.
+          cut.depth = (goreT.cutDepth + goreT.cutDepthPower * power) * s.heft;
+          cut.length = goreT.cutLength * (0.4f + 0.6f * power) * s.heft;
+          cut.power = power;
+          // Counter-based, off the tick and the probe index: the ragged rim and
+          // the blood soak must replay identically.
+          cut.seed = hitSeed;
+          mobs.CutLimb(hb, cut, world, spawns);
+        }
+      }
+
+      // ---- IS THIS THE FIRST TIME THIS STROKE HAS TOUCHED THIS SLOT? ------
+      //
+      // Asked ONCE, before either impulse, and consumed by both: a mace that
+      // bruises and a set of jaws that tears are the same event arriving, and
+      // asking separately would let a profile carrying both spend two first
+      // contacts on one meeting. See EdgeSweep::struck for why an impulse is
+      // not a kerf.
+      bool firstContact = true;
+      if (s.struck != nullptr && (s.strike.blunt > 0.0f || s.strike.bite > 0.0f)) {
+        for (uint64_t h : *s.struck)
+          if (h == hb) firstContact = false;
+        if (firstContact) s.struck->push_back(hb);
+      }
+
+      // ---- 2. THE BLUNT PART — trauma, a bruise, and never a sever ---------
+      //
+      // The struck kind is deliberately NOT handed down: Mob::BluntHit asks
+      // IsWornSlot for itself, because it also has to find the limb UNDERNEATH
+      // a shell to transmit through, and only the creature knows that.
+      if (s.strike.blunt > 0.0f && firstContact) {
+        BluntHit bh;
+        bh.at = at;
+        bh.hp = s.strike.blunt * power;
+        bh.power = power;
+        bh.carve = s.strike.bluntCarve;
+        bh.armorBreak = s.strike.armorBreak;
+        bh.impactSpeed = out.tipSpeed;
+        bh.seed = hitSeed ^ 0xB1u;
+        mobs.BluntHit(hb, bh, world, spawns);
+      }
+
+      // ---- 3. THE BITE PART — a tear, and an infection armour refuses ------
+      // Once per slot per stroke, like the blunt part above and for the same
+      // reason: teeth close once.
+      if (s.strike.bite > 0.0f && firstContact) {
+        BiteHit bt;
+        bt.at = at;
+        bt.hp = s.strike.bite * power;
+        bt.power = power;
+        // ARMOUR DEFENDS, and the decision is made HERE rather than inside the
+        // wound model: "a bite that touches FLESH" is a fact about what this
+        // sweep met, and a shell in the way is the whole of the defence. The
+        // teeth still land (Mob::BiteHit turns them into trauma on a shell);
+        // they simply carry nothing.
+        if (kind == StruckKind::Flesh) {
+          bt.infectMat = s.strike.infectMat;
+          bt.infectStain = s.strike.infectStain;
+        }
+        bt.seed = hitSeed ^ 0xB17Eu;
+        mobs.BiteHit(hb, bt, world, spawns);
       }
     }
   }
@@ -1659,8 +1859,33 @@ void MeleeState::Update(float dt, bool held, bool armed, const Vec3& right,
       // no pop on the tick that commits, and the arc still finishes at exactly
       // one `swingArc` for the fold above to absorb.
       const float drive = e - tuning.swingAnticipate * bow;
-      swingAz_ = cutAz_ * tuning.swingArc * drive;
-      swingEl_ = cutEl_ * tuning.swingArc * drive;
+      // ---- AND THE ARC IS THE BLADE'S, NOT A CONSTANT (2026-09-15) --------
+      //
+      // `cutAz_`/`cutEl_` are a UNIT direction and `swingArc` is a flat 2.0
+      // radians, so every committed cut got the same two radians of
+      // follow-through whatever it had asked for. For a sword that IS the law
+      // -- the blade's own momentum carries it across your body and the player
+      // steers back from there, which is what the fold above is about. For a
+      // FIST it is a defect with no defence: `player_punch_r` authors 0.24 rad
+      // of azimuth and commanded 2.45, and `npc-styles` reported the thrust
+      // turning into a swing on a 10.75-voxel hooking knuckle path.
+      //
+      // THE FOLLOW-THROUGH IS THE WEAPON'S MOMENTUM, so it scales with how
+      // much weapon there is past the hand. `bladeLen_` is the length the
+      // driver already holds and already builds the whole lean geometry from,
+      // and it is ZERO for a bladeless weapon by construction (a chain
+      // effector reports its tip at its hand -- mob.cpp says why), so a punch
+      // ends where it was driven and a sword is untouched.
+      //
+      // The reference is half a metre of blade, in METRES so it follows
+      // kVoxelMeters like every other length here: a sword (5.5 voxels at
+      // 10 cm) saturates at the full authored arc, a mace (4.5) keeps 0.9, a
+      // set of jaws (1.65) gets a third of one, a fist none.
+      const float kArcBladeRef = MetresToCells(0.50f);
+      const float arcScale =
+          std::clamp(bladeLen_ / std::max(kArcBladeRef, 1e-3f), 0.0f, 1.0f);
+      swingAz_ = cutAz_ * tuning.swingArc * arcScale * drive;
+      swingEl_ = cutEl_ * tuning.swingArc * arcScale * drive;
       swingOut_ = bow * tuning.swingExtend * tipReach;
       break;
     }

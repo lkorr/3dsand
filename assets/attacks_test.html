@@ -458,6 +458,66 @@ try {
   }
   btnLike(view, '■ stop')?.click();
 
+  /* ====================================================================
+     2b. A NATURAL-WEAPON STYLE DRIVES THE PART IT NAMES.
+
+     THE ONE CLAIM THE ARITHMETIC TESTS CANNOT MAKE. `node
+     scripts/test_melee.mjs` checks that "jaws" parses off the style and stays
+     on it; what it cannot check is that "jaws" RESOLVES — melee.js has no rig,
+     no `natural` block and no idea which part that name means. The failure
+     this catches is the whole reason the effector exists: a punch previewed
+     through the sword's arm and a bite previewed through the sword's arm look
+     identical on screen and are the wrong weapon in both cases.
+
+     Both modes, because they are different code paths (rig.js
+     applyWeaponArm's chain solve versus applyStrikeAim's pre-flatten rotate)
+     and each would pass the other's assertion vacuously.
+     ==================================================================== */
+  note('');
+  note('--- natural weapons drive their own part ---');
+  {
+    const nat = api.armInfo().natural;      // may be undefined on an old seam
+    for (const [style, wantPart, wantMode, watch] of [
+      ['punch_r', 'hand.R', 'chain', ['armU.R', 'armL.R']],
+      ['bite', 'head', 'aim', ['head']],
+    ]) {
+      const chipBtn = btn(view, style);
+      say(!!chipBtn, `the "${style}" style has a chip`);
+      if (!chipBtn) continue;
+      chipBtn.click();
+      // The effector follows the SELECTION between strokes
+      // (rig.js syncEffectorToSelection), so it must land on the right part
+      // before anything swings. WAITED IN REAL MILLISECONDS, not in preview
+      // frames: with no gait, no open clip and no live stroke the preview loop
+      // is not running at all, so frames() would sit out its whole cap for a
+      // rig that is behaving correctly.
+      await sleep(500);
+      const a0 = api.armInfo();
+      say(a0.effPart === wantPart && a0.effMode === wantMode,
+        `selecting "${style}" points the driver at ${wantPart} (${wantMode})`,
+        `effPart "${a0.effPart}" mode "${a0.effMode}" weapon "${a0.effWeapon}"`);
+      const sw = btnLike(view, '▶ swing');
+      if (!sw) continue;
+      sw.click();
+      await frames(6);
+      const a1 = api.armInfo();
+      say(api.strokeState().live, `"${style}" starts a real stroke`,
+        'phase ' + api.strokeState().phase);
+      say(a1.effPart === wantPart,
+        `...and the LIVE stroke still drives ${wantPart}`, `"${a1.effPart}"`);
+      if (wantMode === 'aim')
+        say(a1.aimRan, 'the aim stage ran (applyStrikeAim wrote the locals)');
+      // ...and the part MOVES. An effector that resolves and then poses
+      // nothing is the same bare zero from outside (CLAUDE.md rule 6).
+      const swept = await measureSweep(api, watch, 30);
+      const best = Math.max(...watch.map(n => swept[n] || 0));
+      say(best > 3, `the ${wantPart} actually moves through the stroke`,
+        watch.map(n => `${n} ${(swept[n] || 0).toFixed(1)}°`).join('  '));
+      btnLike(view, '■ stop')?.click();
+      await sleep(300);
+    }
+    if (nat) note('  rig declares: ' + nat.join(', '));
+  }
 
   // ---- LAYOUT, which is the other half of the report --------------------
   // "The boxes are full screen wide and needlessly large" and "numbers are cut

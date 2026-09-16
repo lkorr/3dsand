@@ -18,6 +18,23 @@
       }
     },
     {
+      "comment": "THE SPACING FIXTURE'S PROFILE (src/test/selftest_mob.cpp GateCrowd). Mobile, hostile and it WANTS the target -- which is the whole of what a crowd test needs -- with no `attack` intent and no styles at all, so it walks into the scrum and never swings. It exists because `crowd` is a gate about PERSONAL SPACE and a fixture of four ARMED duelists converging on one point is a knife fight: they are held 3.6 voxels apart by the very feature under test, their swords are 8 voxels long, and they are inside each other's arcs by construction. Measured 2026-09-15, with a sword that finally connects (the sweep's probe no longer dies inside the wielder): 11 attack requests, 54 cut ticks and one of the four dead, on a gate whose spacing numbers were passing perfectly. Friendly fire is `duel`'s subject and it has its own gate; asserting it here made the spacing claim hostage to it. Same reason `training_dummy` exists three entries down.",
+      "name": "crowder",
+      "label": "Crowder (spacing fixture)",
+      "color": 3238002687,
+      "faction": "monster",
+      "hysteresis": 0.28,
+      "perception": { "sightRange": 46, "fovDegrees": 300, "requireLos": true, "aggro": "hostile", "alertDecayTicks": 180, "keepRangeScale": 1.45 },
+      "movement": { "mobile": true, "rangeMin": 0, "rangeMax": 2, "bandSlack": 1.4, "approachSpeed": 1.0, "strafeSpeed": 0.5, "retreatSpeed": 0.0, "circleTendency": 0.0, "circleHoldTicks": 34, "repathTicks": 10, "navRadius": 30 },
+      "attack": { "styles": [], "reach": 0, "aimTolerance": 0.4, "cadenceTicks": 0, "jitterTicks": 0, "commitTicks": 0, "disengageTicks": 0 },
+      "intents": {
+        "idle": { "weight": 0.05, "cooldownTicks": 0, "minDwellTicks": 0 },
+        "face": { "weight": 0.45, "cooldownTicks": 0, "minDwellTicks": 4 },
+        "approach": { "weight": 1.15, "cooldownTicks": 0, "minDwellTicks": 8 },
+        "holdRange": { "weight": 1.05, "cooldownTicks": 0, "minDwellTicks": 8 }
+      }
+    },
+    {
       "comment": "A dummy of a DIFFERENT FACTION, so a hostile creature will actually pick it as a target. `dummy` is faction \"monster\" and so is everything that would swing at it, which makes it a training partner nobody attacks. Otherwise identical: blind, passive, immobile.",
       "name": "training_dummy",
       "label": "Training dummy (quarry)",
@@ -40,7 +57,7 @@
       "hysteresis": 0.28,
       "perception": { "sightRange": 46, "fovDegrees": 300, "requireLos": true, "aggro": "hostile", "alertDecayTicks": 180, "keepRangeScale": 1.45 },
       "movement": { "mobile": true, "rangeMin": 7, "rangeMax": 11, "bandSlack": 1.4, "approachSpeed": 1.0, "strafeSpeed": 0.5, "retreatSpeed": 0.75, "circleTendency": 0.75, "circleHoldTicks": 34, "repathTicks": 10, "navRadius": 30 },
-      "attack": { "styles": ["horizontal_r", "horizontal_l", "overhead", "diagonal", "thrust"], "reach": 10, "aimTolerance": 0.4, "cadenceTicks": 34, "jitterTicks": 22, "commitTicks": 10, "disengageTicks": 26 },
+      "attack": { "styles": ["horizontal_r", "horizontal_l", "overhead", "diagonal", "thrust", "punch_r", "punch_l", "hook_r"], "reach": 10, "aimTolerance": 0.4, "cadenceTicks": 34, "jitterTicks": 22, "commitTicks": 10, "disengageTicks": 26 },
       "intents": {
         "idle": { "weight": 0.05, "cooldownTicks": 0, "minDwellTicks": 0 },
         "face": { "weight": 0.45, "cooldownTicks": 0, "minDwellTicks": 4 },
@@ -58,7 +75,7 @@
       "hysteresis": 0.25,
       "perception": { "sightRange": 34, "fovDegrees": 360, "requireLos": true, "aggro": "hostile", "alertDecayTicks": 150, "keepRangeScale": 1.4 },
       "movement": { "mobile": false, "rangeMin": 0, "rangeMax": 0, "bandSlack": 1.5, "approachSpeed": 0, "strafeSpeed": 0, "retreatSpeed": 0, "circleTendency": 0, "circleHoldTicks": 24, "repathTicks": 30, "navRadius": 8 },
-      "attack": { "styles": ["horizontal_r", "overhead", "thrust"], "reach": 11, "aimTolerance": 0.5, "cadenceTicks": 36, "jitterTicks": 14, "commitTicks": 10, "disengageTicks": 0 },
+      "attack": { "styles": ["horizontal_r", "overhead", "thrust", "punch_r", "punch_l", "hook_r"], "reach": 11, "aimTolerance": 0.5, "cadenceTicks": 36, "jitterTicks": 14, "commitTicks": 10, "disengageTicks": 0 },
       "intents": {
         "idle": { "weight": 0.05, "cooldownTicks": 0, "minDwellTicks": 0 },
         "face": { "weight": 1.0, "cooldownTicks": 0, "minDwellTicks": 0 },
@@ -73,7 +90,7 @@
       "hysteresis": 0.28,
       "perception": { "sightRange": 46, "fovDegrees": 300, "requireLos": true, "aggro": "hostile", "alertDecayTicks": 180, "keepRangeScale": 1.45 },
       "movement": { "mobile": true, "rangeMin": 7, "rangeMax": 11, "bandSlack": 1.4, "approachSpeed": 1.0, "strafeSpeed": 0.5, "retreatSpeed": 0.75, "circleTendency": 0.75, "circleHoldTicks": 34, "repathTicks": 10, "navRadius": 30 },
-      "attack": { "styles": ["horizontal_r", "horizontal_l", "overhead", "diagonal", "thrust"], "reach": 10, "aimTolerance": 0.4, "cadenceTicks": 34, "jitterTicks": 22, "commitTicks": 10, "disengageTicks": 26 },
+      "attack": { "styles": ["horizontal_r", "horizontal_l", "overhead", "diagonal", "thrust", "punch_r", "punch_l", "hook_r"], "reach": 10, "aimTolerance": 0.4, "cadenceTicks": 34, "jitterTicks": 22, "commitTicks": 10, "disengageTicks": 26 },
       "intents": {
         "idle": { "weight": 0.05, "cooldownTicks": 0, "minDwellTicks": 0 },
         "face": { "weight": 0.45, "cooldownTicks": 0, "minDwellTicks": 4 },
@@ -81,6 +98,25 @@
         "holdRange": { "weight": 1.05, "cooldownTicks": 0, "minDwellTicks": 8 },
         "circle": { "weight": 0.9, "cooldownTicks": 18, "minDwellTicks": 26 },
         "attack": { "weight": 3.0, "cooldownTicks": 0, "minDwellTicks": 0 }
+      }
+    },
+    {
+      "comment": "THE WALKING DEAD. Every style it owns is a NATURAL WEAPON (docs/PLAN_impact_unarmed.md), so a disarmed zombie is exactly as dangerous as an armed one -- which is the whole feature: it bites and it punches, and losing a hand costs it one style rather than all of them. It is the first profile whose reach is not the whole story: `bite_lunge` states 22 of its own, and MobSystem::AttackReachOf hands the LONGER of the two to the arbiter, so the creature commits from three body-lengths out and the leap closes the gap. Putting 22 here instead would have it stand off at 22 to punch, which is the coupling the per-style reach exists to break.",
+      "//character": "SLOWER AND RECKLESS. A 48-tick cadence against the duelist's 34 (a zombie winds up, it does not fence), a band that starts INSIDE the duelist's (2..7 against 7..11) and almost no retreat or circling -- the dead do not give ground and they do not look for an angle. `disengageTicks` 0 for the same reason: a duelist hits and steps off, a zombie hits and keeps coming. Sight is shorter (34) and the fov is the full 360, because it does not need to be looking at you.",
+      "name": "zombie",
+      "label": "Zombie",
+      "color": 3234093772,
+      "faction": "monster",
+      "hysteresis": 0.35,
+      "perception": { "sightRange": 34, "fovDegrees": 360, "requireLos": true, "aggro": "hostile", "alertDecayTicks": 300, "keepRangeScale": 1.6 },
+      "movement": { "mobile": true, "rangeMin": 2, "rangeMax": 7, "bandSlack": 2.0, "approachSpeed": 1.0, "strafeSpeed": 0.15, "retreatSpeed": 0.0, "circleTendency": 0.1, "circleHoldTicks": 40, "repathTicks": 14, "navRadius": 30 },
+      "attack": { "styles": ["bite_lunge", "bite", "punch_r", "punch_l", "hook_r"], "reach": 9, "aimTolerance": 0.55, "cadenceTicks": 48, "jitterTicks": 20, "commitTicks": 14, "disengageTicks": 0 },
+      "intents": {
+        "idle": { "weight": 0.05, "cooldownTicks": 0, "minDwellTicks": 0 },
+        "face": { "weight": 0.5, "cooldownTicks": 0, "minDwellTicks": 4 },
+        "approach": { "weight": 1.4, "cooldownTicks": 0, "minDwellTicks": 8 },
+        "holdRange": { "weight": 0.6, "cooldownTicks": 0, "minDwellTicks": 8 },
+        "attack": { "weight": 3.2, "cooldownTicks": 0, "minDwellTicks": 0 }
       }
     }
   ]

@@ -130,6 +130,89 @@ check(flickName(0, 1) === 'player_thrust', 'flick DOWN (+y) -> thrust',
 check(MELEE.neutralStrike(lib, true) !== MELEE.neutralStrike(lib, false),
   'the two neutral entries differ');
 
+/* --------------------------------------------------------------------------
+   THE UNARMED SCHEMA (docs/PLAN_impact_unarmed.md §4/§5)
+
+   Four fields and a second compass, each of which defaults to the behaviour a
+   style authored before them already had — so the interesting assertions are
+   that the defaults really are inert and that the new keys really do reach the
+   parsed style. A key that silently failed to parse would read exactly like a
+   style nobody had got round to authoring.
+   ------------------------------------------------------------------------ */
+{
+  const by = n => lib.styles.find(s => s.name === n);
+  for (const s of lib.styles) {
+    if (!s.name.startsWith('player_') && !s.raw.weapon)
+      check(s.weapon === 'held' && !s.fallback && s.reach === 0
+            && !MELEE.lungeAny(s.lunge) && s.target.length === 0,
+        `style "${s.name}" authored before the unarmed schema is unchanged`);
+  }
+  const punch = by('punch_r'), bite = by('bite_lunge');
+  // REACH 0 IS THE ANSWER NOW, not a missing number: a natural style asks the
+  // BODY how far it reaches (MobSystem::StyleReachOn), because every authored
+  // one was a lie the rig could not keep -- punch_r claimed 9 on an arm that
+  // reaches 5 and --shot-strike measured the fist stopping 6.7 voxels short.
+  // So the assertion is the opposite of what it was: a natural style must NOT
+  // carry a hand-guessed reach.
+  check(!!punch && punch.weapon === 'fist.R' && punch.fallback
+        && punch.reach === 0,
+    'punch_r names a natural weapon, is a fallback, and derives its reach');
+  for (const s2 of lib.styles)
+    if (s2.weapon !== 'held')
+      check(s2.reach === 0,
+        `natural style "${s2.name}" derives its reach from the body`);
+  check(!!bite && bite.weapon === 'jaws' && !bite.fallback,
+    'bite_lunge names the jaws and is NOT a fallback');
+  check(!!bite && MELEE.lungeAny(bite.lunge) && bite.lunge.at === 'windup'
+        && bite.lunge.rise > 0,
+    'bite_lunge has a lunge that fires at the windup and leaves the ground',
+    bite ? JSON.stringify(bite.lunge) : '(missing)');
+  // A LUNGE WITH NO RISE LANDS ON THE TICK AFTER IT LEFT (mob.cpp UpdateFall's
+  // launch latch buys exactly one tick), so every authored one must climb.
+  for (const s of lib.styles)
+    if (MELEE.lungeAny(s.lunge))
+      check(s.lunge.rise > 0, `style "${s.name}" lunges with a non-zero rise`);
+  // The target table is SORTED BY TAG, because the draw walks it and JSON
+  // object order is the library's business rather than the author's.
+  check(!!bite && bite.target.length >= 3
+        && bite.target.every((t, i) => i === 0 || bite.target[i - 1].tag < t.tag),
+    'bite_lunge has a target table, sorted by tag for a reproducible draw');
+
+  // The fallback filter: an armed creature never draws a punch, a disarmed one
+  // draws nothing else. `usable` stands in for the rig (see pickAttackStyle).
+  const listed = ['horizontal_r', 'overhead', 'thrust', 'punch_r', 'punch_l'];
+  const armed = new Set(), unarmed = new Set();
+  for (let t = 0; t < 400; t++) {
+    armed.add(MELEE.pickAttackStyle(lib, listed, 7, t, () => true));
+    unarmed.add(MELEE.pickAttackStyle(lib, listed, 7, t,
+      s => s.weapon !== 'held'));
+  }
+  check([...armed].every(i => i >= 0 && !lib.styles[i].fallback),
+    'an armed creature never draws a fallback style over 400 ticks');
+  check([...unarmed].every(i => i >= 0 && lib.styles[i].weapon !== 'held')
+        && unarmed.size >= 2,
+    'a disarmed one draws only its natural weapons, and varies over them');
+  check(MELEE.pickAttackStyle(lib, listed, 7, 0, () => false) === -1,
+    'nothing usable draws -1 rather than a style with no weapon behind it');
+
+  // ...and the second compass.
+  check(MELEE.playerMapUsable(lib.playerUnarmed),
+    'attack_styles.json ships a usable playerUnarmed flick map');
+  const fistName = (x, y) => {
+    const i = MELEE.quantizeStrike(lib.playerUnarmed, x, y);
+    return i >= 0 ? lib.styles[i].name : '(none)';
+  };
+  check(fistName(1, 0) === 'player_punch_r', 'fists: flick RIGHT -> punch_r',
+    `got ${fistName(1, 0)}`);
+  check(fistName(-1, 0) === 'player_punch_l', 'fists: flick LEFT -> punch_l',
+    `got ${fistName(-1, 0)}`);
+  check(fistName(0, 1) === 'player_punch_thrust',
+    'fists: flick DOWN (+y) -> the two-handed drive', `got ${fistName(0, 1)}`);
+  for (const sec of lib.playerUnarmed.sectors)
+    check(lib.styles[sec.style].weapon !== 'held',
+      `playerUnarmed sector -> "${lib.styles[sec.style].name}" is a fist style`);
+}
+
 /* ==========================================================================
    3. the driver, on a synthetic arm.
 
@@ -524,6 +607,148 @@ section('anim.js stage 3.5 — AnimApplySpineTwist');
       'the twist lands on the non-root spine part with the engine\'s sign',
       `got ${ang === null ? 'null' : ang.toFixed(4)}`);
   }
+}
+
+/* --------------------------------------------------------------------------
+   stage 3.5b — animApplyAimPart (mob.cpp Mob::ApplyAimPart)
+
+   THE BITE'S WHOLE MECHANISM, and the one stage in the preview with no IK
+   behind it: a part in no chain is pointed at something by ROTATING IT ABOUT
+   ITS OWN JOINT, with an authored share of the yaw taken by the spine. Three
+   things can be quietly wrong and none of them is visible in a screenshot —
+   the share can be added twice (the part inherits the spine's rotation through
+   the flatten), the pitch sign can be inverted (a positive rotation about
+   model +X pitches the nose DOWN), and the root spine part can be included
+   (which yaws the entire creature, so the head reads as not turning at all).
+   ------------------------------------------------------------------------ */
+section('anim.js stage 3.5b — animApplyAimPart');
+{
+  const sidecar = {
+    root: 'hips',
+    limbs: [
+      { name: 'hips', tag: 'spine' },
+      { name: 'torso', parent: 'hips', tag: 'spine', anchor: [0, 1, 0] },
+      { name: 'head', parent: 'torso', tag: 'head', anchor: [0, 2, 0] },
+    ],
+  };
+  const models = sidecar.limbs.map(l => ({
+    name: l.name, offset: { x: 0, y: 0, z: 0 }, dim: { x: 2, y: 2, z: 2 },
+  }));
+  const sk = AN.buildSkeleton(sidecar, models);
+  const head = sk.findPart('head'), torso = sk.findPart('torso');
+  const mk = () => {
+    const st = { clips: [], local: [], model: [],
+                 partAlive: sk.parts.map(() => 1), springs: [] };
+    AN.animSampleAndBlend(sk, st, 0);
+    return st;
+  };
+  // Zero in, nothing touched — the engine's own early-out, and what keeps an
+  // idle rig and every legacy gate pose untouched.
+  {
+    const st = mk();
+    const before = JSON.stringify(st.local);
+    AN.animApplyAimPart(sk, st, head, 0, 0, 1, 0.35, sk.rootLimb);
+    check(before === JSON.stringify(st.local), 'a zero aim is an exact no-op');
+  }
+  // The share splits: one non-root spine part takes `spineShare` of the yaw and
+  // the PART takes the remainder, never the whole (it inherits the spine's
+  // through the flatten, so adding the full yaw at both joints doubles it).
+  {
+    const st = mk();
+    AN.animApplyAimPart(sk, st, head, 0.8, 0, 1, 0.25, sk.rootLimb);
+    const spineYaw = AN.animHingeAngleAbout(st.local[torso].rot, { x: 0, y: 1, z: 0 });
+    const headYaw = AN.animHingeAngleAbout(st.local[head].rot, { x: 0, y: 1, z: 0 });
+    check(spineYaw !== null && near(spineYaw, 0.2, 1e-4),
+      'the spine takes exactly its authored share of the yaw',
+      `${spineYaw === null ? 'null' : spineYaw.toFixed(4)} of 0.8 x 0.25`);
+    check(headYaw !== null && near(headYaw, 0.6, 1e-4),
+      'the part takes the REMAINDER, not the whole yaw',
+      `${headYaw === null ? 'null' : headYaw.toFixed(4)}`);
+    check(JSON.stringify(st.local[sk.rootLimb].rot) ===
+          JSON.stringify(mk().local[sk.rootLimb].rot),
+      'the ROOT spine part is never yawed (it would turn the whole creature)');
+  }
+  // spineShare 0 puts all of it on the part — the A/B for "the chest does not
+  // follow" without touching any other number.
+  {
+    const st = mk();
+    AN.animApplyAimPart(sk, st, head, 0.8, 0, 1, 0, sk.rootLimb);
+    const headYaw = AN.animHingeAngleAbout(st.local[head].rot, { x: 0, y: 1, z: 0 });
+    check(headYaw !== null && near(headYaw, 0.8, 1e-4),
+      'spineShare 0 leaves the whole yaw on the part');
+  }
+  // PITCH IS POSITIVE UP and is applied negated, because a positive rotation
+  // about model +X takes +Z to -Y (scripts/geometry.py). Measured on where the
+  // part's FORWARD ends up, not on a quaternion component, because the sign of
+  // a component is not a pitch.
+  {
+    const st = mk();
+    AN.animApplyAimPart(sk, st, head, 0, 0.5, 1, 0, sk.rootLimb);
+    const fwd = AN.qrot(st.local[head].rot, { x: 0, y: 0, z: 1 });
+    check(fwd.y > 0.4, 'a positive pitch points the part UP',
+      `forward.y ${fwd.y.toFixed(3)}`);
+  }
+  // Weight scales the whole rotation, which is what lets a stroke fade its aim
+  // in and out the way the arm claim already does.
+  {
+    const st = mk();
+    AN.animApplyAimPart(sk, st, head, 0.8, 0, 0.5, 0, sk.rootLimb);
+    const headYaw = AN.animHingeAngleAbout(st.local[head].rot, { x: 0, y: 1, z: 0 });
+    check(headYaw !== null && near(headYaw, 0.4, 1e-4),
+      'weight 0.5 halves the commanded yaw');
+    const st2 = mk();
+    const before = JSON.stringify(st2.local);
+    AN.animApplyAimPart(sk, st2, head, 0.8, 0, 0, 0.35, sk.rootLimb);
+    check(before === JSON.stringify(st2.local), 'weight 0 is an exact no-op');
+  }
+  // A DEAD PART IS NOT AIMED. `StyleUsable` refuses the style before it starts,
+  // but the pose stage must not pose a limb that is gone either.
+  {
+    const st = mk();
+    st.partAlive[head] = 0;
+    const before = JSON.stringify(st.local);
+    AN.animApplyAimPart(sk, st, head, 0.8, 0.3, 1, 0.35, sk.rootLimb);
+    check(before === JSON.stringify(st.local), 'a severed part is not aimed');
+  }
+}
+
+/* --------------------------------------------------------------------------
+   AnimStateRule::lungeScale (mob.cpp:1532)
+
+   A loco state scales a leap the way it scales a walk, and it DEFAULTS TO
+   speedScale — the two answer the same question about the same body, so a
+   crawler that walks at 0.3 of its own speed pounces at 0.3 of its own leap.
+   The Attacks lane reads it to time the arc it draws, so a default that
+   silently came out 1 would draw every crawler's lunge as an upright one.
+   ------------------------------------------------------------------------ */
+section('anim.js — AnimStateRule::lungeScale');
+{
+  const sk = AN.buildSkeleton({
+    root: 'hips',
+    limbs: [{ name: 'hips' }, { name: 'legU.L', parent: 'hips', anchor: [0, 0, 0] },
+            { name: 'legU.R', parent: 'hips', anchor: [1, 0, 0] }],
+    states: [
+      { name: 'crawl', missing: ['legU.L', 'legU.R'], speedScale: 0.3 },
+      { name: 'limp', missingAny: ['legU.L'], speedScale: 0.6, lungeScale: 0.1 },
+    ],
+  }, ['hips', 'legU.L', 'legU.R'].map(n => ({
+    name: n, offset: { x: 0, y: 0, z: 0 }, dim: { x: 2, y: 2, z: 2 },
+  })));
+  const crawl = sk.states.find(s => s.name === 'crawl');
+  const limp = sk.states.find(s => s.name === 'limp');
+  check(!!crawl && crawl.lungeScale === 0.3,
+    'lungeScale defaults to speedScale when the state does not state one',
+    String(crawl && crawl.lungeScale));
+  check(!!limp && limp.lungeScale === 0.1,
+    'an authored lungeScale overrides it', String(limp && limp.lungeScale));
+  // ...and the shipped human, which is what the lane actually previews.
+  const human = JSON.parse(readFileSync(join(ROOT, 'assets/mobs/human.json'), 'utf8'));
+  const hsk = AN.buildSkeleton(human, human.limbs.map(l => ({
+    name: l.name, offset: { x: 0, y: 0, z: 0 }, dim: { x: 2, y: 2, z: 2 },
+  })));
+  check(hsk.states.every(s => Number.isFinite(s.lungeScale) && s.lungeScale >= 0),
+    'every state on the shipped human rig resolves a usable lungeScale',
+    hsk.states.map(s => `${s.name}=${s.lungeScale}`).join(' '));
 }
 
 section('anim.js — clip rate and the blend-in clock');

@@ -88,6 +88,41 @@ bool mobOk = false;
                   libOk ? "PASS" : "FAIL", files, missing,
                   missing ? ": " : "", missingNames.c_str());
       mobOk = mobOk && libOk;
+
+      // ---- natural weapons (mob.h MobNaturalWeaponDef; PLAN §3) ----------
+      // EVERY `natural` ENTRY ON EVERY DEF, not just the human's: the block
+      // is inherited through `extends`, so a zombie carries the human's jaws
+      // and a rig that renames a part would break the inheritor rather than
+      // the original. Two claims, and they are the two ways the block can be
+      // wrong without anything else noticing — a weapon on a part this rig
+      // has not got never resolves (the loader says so and drops it, so the
+      // survivors must all resolve), and a weapon with a zero-length edge has
+      // no segment for the sweep and no direction for the driver, which reads
+      // downstream as "the creature punches and never connects".
+      {
+        int weapons = 0, bad = 0;
+        std::string badNames;
+        for (const MobDef& md : mobs.Defs())
+          for (const MobNaturalWeaponDef& nw : md.natural) {
+            weapons++;
+            const bool livePart =
+                nw.partIndex >= 0 && nw.partIndex < (int)md.limbs.size() &&
+                md.limbs[nw.partIndex].name == nw.part;
+            const bool realEdge = (nw.edgeTo - nw.edgeFrom).len() > 1e-3f &&
+                                  nw.edgeHalfWidth > 0.0f;
+            if (livePart && realEdge) continue;
+            bad++;
+            badNames += (badNames.empty() ? "" : ", ") + md.name + "/" +
+                        nw.name + (livePart ? " (degenerate edge)"
+                                            : " (no such part)");
+          }
+        const bool natOk = bad == 0;
+        std::printf("mob natural weapons: %s (%d across %d def(s), %d "
+                    "broken%s%s)\n",
+                    natOk ? "PASS" : "FAIL", weapons, (int)mobs.Defs().size(),
+                    bad, bad ? ": " : "", badNames.c_str());
+        mobOk = mobOk && natOk;
+      }
     }
     // Select the dummy BY NAME and resolve limb indices by name too: mob
     // defs load in filename order, so adding assets/mobs/critter.* would
@@ -4492,6 +4527,13 @@ Status GateCrowd(Ctx& c, std::string& detail) {
     float minSep = 0.0f;    // the distance at which those two bodies touch
     int overlapTicks = 0;   // ticks with ANY pair interpenetrating
     int alive = 0;
+    // ---- WHY ONE OF THEM IS NOT ALIVE (CLAUDE.md rule 6) ----------------
+    // "3/4 alive" is a bare number with two very different causes -- they cut
+    // each other, or one fell over and bled out -- and a spacing gate that
+    // silently became a knife fight would read exactly the same either way.
+    int requests = 0;       // attack requests issued over the arm
+    int cutTicks = 0;       // ticks any of them was in a committed cut
+    float minHp = 1e9f;     // the worst-off survivor
   };
   auto runArm = [&](Arm& out) {
     c.debris.Reset();
@@ -4512,7 +4554,19 @@ Status GateCrowd(Ctx& c, std::string& detail) {
     std::string why;
     for (int k = 0; k < 4; k++) {
       const IVec3 at{spot.x + dxs[k] * ring, spot.y + 1, spot.z + dzs[k] * ring};
-      const uint64_t id = AiSpawn(c, defIndex, at, "duelist", why);
+      // ---- `crowder`, NOT `duelist` (2026-09-15) ------------------------
+      //
+      // A duelist is armed and swings, and four of them converging on one
+      // point are inside each other's arcs BY CONSTRUCTION -- the spacing
+      // feature under test is exactly what holds them 3.6 voxels apart with
+      // 8-voxel swords. That was harmless only while blades quietly failed to
+      // connect; with the sweep's probe no longer dying inside its own
+      // wielder, the same fixture became a knife fight (11 attack requests, 54
+      // cut ticks, one of the four dead) while every spacing number it exists
+      // to measure kept passing. `crowder` wants the target and walks at it
+      // and has no attack intent at all, so this gate measures its own
+      // subject; friendly fire is `duel`'s, and `duel` asserts it.
+      const uint64_t id = AiSpawn(c, defIndex, at, "crowder", why);
       if (id != 0) ids.push_back(id);
     }
     // ONE target for all four: that is the whole scenario. Placed at the
@@ -4524,6 +4578,13 @@ Status GateCrowd(Ctx& c, std::string& detail) {
     const int ticks = (int)BaselineNumber("crowdTicks", 240);
     for (int t = 0; t < ticks; t++) {
       tick();
+      out.requests += (int)c.mobs.AttackRequests().size();
+      c.mobs.ClearAttackRequests();
+      for (uint64_t id : ids) {
+        if (!c.mobs.IsAlive(id)) continue;
+        const NpcStroke* s = c.mobs.MobStroke(id);
+        if (s != nullptr && s->Cutting()) out.cutTicks++;
+      }
       for (size_t a = 0; a < ids.size(); a++) {
         if (!c.mobs.IsAlive(ids[a])) continue;
         for (size_t b = a + 1; b < ids.size(); b++) {
@@ -4540,7 +4601,10 @@ Status GateCrowd(Ctx& c, std::string& detail) {
       }
     }
     for (uint64_t id : ids)
-      if (c.mobs.IsAlive(id)) out.alive++;
+      if (c.mobs.IsAlive(id)) {
+        out.alive++;
+        out.minHp = std::min(out.minHp, c.mobs.TotalHp(id));
+      }
     c.mobs.ClearPlayerActor();
     c.mobs.ClearAttackRequests();
   };
@@ -4576,9 +4640,10 @@ Status GateCrowd(Ctx& c, std::string& detail) {
   const bool ok = spaced && crowdedWithout && better;
   detail = Format(
       "touching at %.2f vox | ON min gap %.2f (>= %.2f), %d overlap ticks, "
-      "%d/4 alive | OFF min gap %.2f, %d overlap ticks | spaced %d, fixture "
-      "crowds %d, improved %d",
-      on.minSep, on.minGap, floorOn, on.overlapTicks, on.alive, off.minGap,
+      "%d/4 alive (%d requests, %d cut ticks, worst hp %.0f) | OFF min gap "
+      "%.2f, %d overlap ticks | spaced %d, fixture crowds %d, improved %d",
+      on.minSep, on.minGap, floorOn, on.overlapTicks, on.alive, on.requests,
+      on.cutTicks, on.minHp >= 1e8f ? -1.0f : on.minHp, off.minGap,
       off.overlapTicks, spaced ? 1 : 0, crowdedWithout ? 1 : 0,
       better ? 1 : 0);
 

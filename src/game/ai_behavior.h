@@ -338,6 +338,20 @@ struct SelfView {
   int stepUpCells = 2;
   int stepDownCells = 5;
   int headroomCells = 3;
+  // ---- HOW FAR THIS BODY CAN REACH, THIS TICK (plan §5) ------------------
+  //
+  // `max(profile.reach, the longest reach among the styles it can still USE)`,
+  // computed by MobSystem::AttackReachOf and handed in. 0 = "ask the profile",
+  // which is what every caller that has no style library says.
+  //
+  // IT IS AN INPUT AND NOT A LOOKUP, and that is the whole point. This layer
+  // refuses to know what styles exist (AttackTuning::styles says so at
+  // length), but a zombie that lunges 22 voxels and a duelist that cuts at 10
+  // cannot share one authored number — and putting 22 in the zombie's profile
+  // would have it stand off at 22 with a sword in its hand too. So the stroke
+  // system, which knows both the library and the rig, answers the question and
+  // the arbiter simply uses the answer.
+  float attackReach = 0.0f;
   Vec3 Centre() const {
     return Vec3{origin.x + size.x * 0.5f, origin.y + size.y * 0.5f,
                 origin.z + size.z * 0.5f};

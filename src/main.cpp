@@ -3006,6 +3006,713 @@ int RunMobShot(GpuContext& ctx, World& world, Simulation& sim, Physics& phys,
   return ctx.ReportVkValidation("--shot-mob") > 0 ? 1 : 0;
 }
 
+// ===========================================================================
+// --shot-strike <attacker>[:limb,...][+item,...] <style> [<target>[...]]
+//
+// ONE BLOW, PHOTOGRAPHED AND COUNTED. --shot-mob answers "what does this body
+// look like"; this answers "what does this blow DO", which since 2026-09-15 is
+// a different question with three independent halves (game/impact.h): a strike
+// is a CUT, a BLUNT part and a BITE part, and from outside all three arrive as
+// the same creature being a bit smaller than it was.
+//
+// WHY IT PRINTS A TABLE AND NOT A NUMBER. "The mace does not seem to do much"
+// has at least six causes — the style was refused, the stroke never reached a
+// cut tick, the edge was too slow (melee.minSpeed), it passed through nothing,
+// it hit the PLATE and stopped, or it hit and the wound was small — and a bare
+// "hp fell by 4" separates none of them (CLAUDE.md rule 6). So the readout
+// carries the stroke's own tally (sweeps, bodies hit, top tip speed, the limb
+// the style DREW), the profile that was actually swung (after the gauntlet
+// override and the creature's infection), and a per-slot diff of everything
+// the wound model can move: flesh and shell voxels, hp, bleed budget, bruise
+// cells, infected cells, rot stain.
+//
+// The diff is per SLOT and taken before/after rather than per hit, because a
+// sweep meets several slots in one tick (a plate and the chest under it) and
+// "one line per hit" would have to invent an attribution the resolver does not
+// make. Every slot that moved gets a line; nothing that moved is left out.
+//
+// THE PICTURES ARE TAKEN ON THE STROKE'S OWN PHASES, not on frame numbers, for
+// the reason --shot-jump states: the tick counts are tempo-jittered, so a
+// frame schedule photographs a different part of the swing on every seed.
+// ===========================================================================
+
+// `name[:limb,limb][+item,item]` — the same spelling --shot-mob takes, plus a
+// `+` list that may be repeated. Deliberately permissive about which separator
+// repeats: `human+mace+iron_gauntlets` and `human+mace,iron_gauntlets` are the
+// same request and guessing wrong costs a rebuild.
+struct StrikeSide {
+  std::string def;
+  std::vector<std::string> severs, items;
+  // `@<voxels>` on the ATTACKER: stand them this far apart instead of at the
+  // style's own reach. Not a convenience — the default is the honest one (a
+  // style states the distance it commits from, and photographing it there is
+  // how you find out it cannot actually reach), but once that is known, LOOKING
+  // at the wound needs a blow that lands. --shot-mob's `@x,z` is the same idea
+  // for the same reason.
+  float gap = 0;
+};
+
+static void SplitCsv(const std::string& s, std::vector<std::string>& out) {
+  size_t p = 0;
+  while (p <= s.size()) {
+    const size_t c = s.find(',', p);
+    const size_t end = (c == std::string::npos) ? s.size() : c;
+    if (end > p) out.push_back(s.substr(p, end - p));
+    if (c == std::string::npos) break;
+    p = c + 1;
+  }
+}
+
+static StrikeSide ParseStrikeSide(const std::string& spec) {
+  StrikeSide out;
+  size_t p = 0;
+  std::string head;
+  // Everything up to the first '+' is the def and its sever list; each '+'
+  // chunk after that is one or more item names.
+  const size_t firstPlus = spec.find('+');
+  head = (firstPlus == std::string::npos) ? spec : spec.substr(0, firstPlus);
+  if (firstPlus != std::string::npos) {
+    p = firstPlus + 1;
+    while (p <= spec.size()) {
+      const size_t nx = spec.find('+', p);
+      const size_t end = (nx == std::string::npos) ? spec.size() : nx;
+      SplitCsv(spec.substr(p, end - p), out.items);
+      if (nx == std::string::npos) break;
+      p = nx + 1;
+    }
+  }
+  if (const size_t at = head.find('@'); at != std::string::npos) {
+    out.gap = (float)std::atof(head.c_str() + at + 1);
+    head = head.substr(0, at);
+  }
+  const size_t colon = head.find(':');
+  out.def = (colon == std::string::npos) ? head : head.substr(0, colon);
+  if (colon != std::string::npos) SplitCsv(head.substr(colon + 1), out.severs);
+  return out;
+}
+
+// Everything the wound model can move on one rig slot, in one struct, so a
+// before/after pair is a subtraction rather than nine parallel arrays.
+struct SlotState {
+  uint32_t art = 0;      // art voxels still on the lattice
+  float hp = 0;
+  float bleed = 0;
+  uint32_t bruise = 0;   // gore.bruiseMat cells
+  uint32_t rot = 0;      // rotflesh cells
+  uint32_t stain = 0;    // stained cells, any type
+  bool alive = false;
+};
+
+static void SampleSlots(MobSystem& mobs, uint64_t id, int slots,
+                        uint32_t bruiseMat, uint32_t rotMat,
+                        std::vector<SlotState>& out) {
+  out.assign((size_t)std::max(slots, 0), SlotState{});
+  for (int i = 0; i < slots; i++) {
+    SlotState& s = out[(size_t)i];
+    s.alive = mobs.LimbBody(id, i) != 0;
+    if (!s.alive) continue;
+    s.art = mobs.LimbArtVoxelCount(id, i);
+    s.hp = mobs.LimbHp(id, i);
+    s.bleed = mobs.LimbBleedBudget(id, i);
+    if (bruiseMat) s.bruise = mobs.LimbMaterialCount(id, i, bruiseMat);
+    if (rotMat) s.rot = mobs.LimbMaterialCount(id, i, rotMat);
+    s.stain = mobs.LimbStainCount(id, i, 1);
+  }
+}
+
+int RunStrikeShot(GpuContext& ctx, World& world, Simulation& sim, Physics& phys,
+                  DebrisSystem& debris, MobSystem& mobs,
+                  const ItemLibrary& items, const std::string& attackerSpec,
+                  const std::string& styleName,
+                  const std::string& targetSpec) {
+  const StrikeSide A = ParseStrikeSide(attackerSpec);
+  const StrikeSide B =
+      ParseStrikeSide(targetSpec.empty() ? std::string("human") : targetSpec);
+  auto findDef = [&](const std::string& n) {
+    for (size_t i = 0; i < mobs.Defs().size(); i++)
+      if (mobs.Defs()[i].name == n) return (int)i;
+    return -1;
+  };
+  const int defA = findDef(A.def), defB = findDef(B.def);
+  if (defA < 0 || defB < 0) {
+    std::fprintf(stderr, "--shot-strike: no mob def named \"%s\"\n",
+                 defA < 0 ? A.def.c_str() : B.def.c_str());
+    return 1;
+  }
+  const int styleIdx = mobs.AttackStyles().Find(styleName);
+  if (styleIdx < 0) {
+    std::fprintf(stderr, "--shot-strike: no attack style named \"%s\"\n",
+                 styleName.c_str());
+    return 1;
+  }
+  const AttackStyle& sty = *mobs.AttackStyles().At(styleIdx);
+  const MobDef& dA = mobs.Defs()[defA];
+  const MobDef& dB = mobs.Defs()[defB];
+
+  // ---- FLAT GROUND, because a strike is measured in voxels ---------------
+  // The default --shot-mob column is forested and sloped; a lunge that lands
+  // on a root reports a landing distance that is about the root. This walks a
+  // small neighbourhood for the flattest 5x5 it can find, which is cheap
+  // (TerrainHeight is the same function worldgen uses) and makes the two
+  // creatures' feet comparable.
+  int spawnX = 137, spawnZ = 139, bestSpread = 1 << 30;
+  for (int ox = -48; ox <= 48; ox += 8) {
+    for (int oz = -48; oz <= 48; oz += 8) {
+      int lo = 1 << 30, hi = -(1 << 30);
+      for (int dx = -2; dx <= 2; dx++)
+        for (int dz = -2; dz <= 34; dz += 4) {
+          const int h = World::TerrainHeight(137 + ox + dx, 139 + oz + dz,
+                                             kDefaultSeed);
+          lo = std::min(lo, h);
+          hi = std::max(hi, h);
+        }
+      if (hi - lo < bestSpread) {
+        bestSpread = hi - lo;
+        spawnX = 137 + ox;
+        spawnZ = 139 + oz;
+      }
+    }
+  }
+
+  SubmitWorldgen(ctx, world, sim, kDefaultSeed);
+  ctx.WaitIdle();
+  const int h = World::TerrainHeight(spawnX, spawnZ, kDefaultSeed);
+  uint32_t t = 6000;
+  for (int i = 0; i < 60; i++)
+    SubmitTick(ctx, world, sim, ++t, kDefaultSeed, {}, {}, {}, false,
+               {8, h / 16, 8}, false, false);
+  ctx.WaitIdle();
+
+  auto mobTick = [&]() {
+    std::vector<BrushOp> ops;
+    std::vector<ParticleSpawn> spawns;
+    std::vector<CellOp> cellOps;
+    mobs.PreTick(t + 1, world, ops, cellOps, spawns);
+    debris.QueueSupportEvents(world.Snap());
+    debris.PreTick(t + 1, world, cellOps, spawns);
+    ++t;
+    SubmitTick(ctx, world, sim, t, kDefaultSeed, ops, {}, cellOps, false,
+               {8, h / 16, 8}, true, false, spawns);
+    ctx.WaitIdle();
+    ctx.ProcessEvents();
+    phys.Step(kTickDt);
+    debris.PostStep();
+    mobs.PostStep();
+  };
+
+  // ---- HOW FAR APART: THE DISTANCE THE AI WOULD ACTUALLY COMMIT FROM -----
+  //
+  // `MobSystem::StyleReachOn` -- the same number `BeginStroke` refuses a style
+  // against and `AttackReachOf` hands the arbiter -- which for a style that
+  // authors no `reach` is derived from the body: the effector's own reach plus
+  // whatever the lunge closes plus a body's half-depth. Photographing a blow
+  // at any other distance photographs a fight that never happens, and the
+  // harness's old fallback (the profile's 9, or a flat 10) is exactly how a
+  // punch came to be measured from nine voxels out on an arm that reaches
+  // five.
+  //
+  // IT NEEDS A LIVE RIG, so the attacker is spawned and given a few ticks to
+  // flatten a pose FIRST and the victim is placed afterwards. A `@gap`
+  // override still wins outright -- that is what it is for.
+  const uint64_t idA = mobs.Spawn(defA, {spawnX, h + 1, spawnZ});
+  if (!idA) {
+    std::fprintf(stderr, "--shot-strike: spawn failed\n");
+    return 1;
+  }
+  // PINNED BEFORE IT IS TICKED, not after. `duelist` is mobile and hostile,
+  // and four ticks of it is four ticks of a 31.5 vox/s walk -- measured, the
+  // attacker had wandered 3.2 voxels out of its own stand-off before the
+  // victim was even placed, and the readout's "shoulder-to-chest" came back
+  // at 3.8 on a 7-voxel gap. A harness that photographs a distance has to own
+  // that distance from the first tick.
+  mobs.SetMobBehavior(idA, "training_dummy");
+  // ---- ARMED BEFORE IT IS MEASURED --------------------------------------
+  // `StyleReachOn` asks the LIVE weapon how far it reaches, so a mace has to
+  // be in the fist before the stand-off is computed -- measured, computing it
+  // first stood a mace-holder at the profile's 10 and 98 of its 100 probe rays
+  // found air. Only the HELD item is needed here (armour changes no reach);
+  // the full `dress` still runs below and is what reports what was worn.
+  for (const std::string& nm0 : A.items) {
+    const ItemDef* it0 = items.At(items.Find(nm0));
+    if (it0 != nullptr && it0->kind == ItemKind::Melee) mobs.EquipItem(idA, it0);
+  }
+  for (int i = 0; i < 4; i++) mobTick();
+  float gap = A.gap;
+  if (gap <= 0.0f) {
+    if (Mob* m0 = mobs.FindMobById(idA)) gap = mobs.StyleReachOn(*m0, sty);
+    if (gap <= 0.0f) {
+      const int prof = mobs.Behaviors().Find(dA.behavior.empty() ? "duelist"
+                                                                 : dA.behavior);
+      const ai::Profile* p = mobs.Behaviors().At(prof);
+      gap = (p != nullptr && p->attack.reach > 0.0f) ? p->attack.reach : 9.0f;
+    }
+  }
+  const int gapZ = std::max(2, (int)std::lround(gap));
+
+  const int hB = World::TerrainHeight(spawnX, spawnZ + gapZ, kDefaultSeed);
+  const uint64_t idB = mobs.Spawn(defB, {spawnX, hB + 1, spawnZ + gapZ});
+  if (!idA || !idB) {
+    std::fprintf(stderr, "--shot-strike: spawn failed\n");
+    return 1;
+  }
+  // Heading 0 is +Z (the rig convention), so the attacker already faces the
+  // target's column and the target faces back down it.
+  mobs.SetHeading(idA, 0.0f);
+  mobs.SetHeading(idB, 3.14159265f);
+  // ---- BOTH SIDES ARE PINNED, and that is a deliberate deviation ---------
+  //
+  // Spawn already applied each def's own `behavior` (zombie.json names one),
+  // and for anything the AI decides that is the right profile. It is the wrong
+  // one for a MEASUREMENT, for two separate reasons that both showed up on the
+  // first run:
+  //
+  //   * A duelist KEEPS ITS RANGE. Stood at the style's own reach and left for
+  //     65 settle ticks, both creatures walked to the profile's preferred band
+  //     — measured 11.0 voxels shoulder-to-chest whether they were placed 7
+  //     apart or 9, which makes the stand-off this harness is FOR unauthorable.
+  //   * A hostile profile SWINGS ON ITS OWN CLOCK, and `ForceAttack` refuses
+  //     while a stroke is live (a queued swing is an unbounded backlog), so the
+  //     blow being photographed would sometimes be a different one.
+  //
+  // `training_dummy` is blind, passive and immobile, so neither happens and
+  // the heading stays where it was put. Nothing about the BLOW changes:
+  // ForceAttack replays the named style through the same stroke program the
+  // AI's request would have started, and the profile has no say in it.
+  const std::string profA = dA.behavior.empty() ? "duelist" : dA.behavior;
+  mobs.SetMobBehavior(idA, "training_dummy");
+  mobs.SetMobBehavior(idB, "training_dummy");
+
+  auto dress = [&](uint64_t id, const StrikeSide& side, const char* who) {
+    for (const std::string& nm : side.items) {
+      const ItemDef* it = items.At(items.Find(nm));
+      if (it == nullptr) {
+        std::fprintf(stderr, "--shot-strike: no item named \"%s\"\n", nm.c_str());
+        continue;
+      }
+      if (ItemKindIsWorn(it->kind)) {
+        const int slot = EquipSlotFor(it->kind, Equipment{});
+        if (slot < 0 || !mobs.WearItem(id, it, slot))
+          std::fprintf(stderr, "--shot-strike: %s could not wear %s\n", who,
+                       nm.c_str());
+        else
+          std::printf("--shot-strike: %s wears %s (slot %d)\n", who, nm.c_str(),
+                      slot);
+      } else if (!mobs.EquipItem(id, it)) {
+        std::fprintf(stderr, "--shot-strike: %s could not hold %s\n", who,
+                     nm.c_str());
+      } else {
+        std::printf("--shot-strike: %s holds %s\n", who, nm.c_str());
+      }
+    }
+  };
+  auto maim = [&](uint64_t id, const MobDef& d, const StrikeSide& side,
+                  const char* who) {
+    for (const std::string& nm : side.severs) {
+      int li = -1;
+      for (size_t i = 0; i < d.limbs.size(); i++)
+        if (d.limbs[i].name == nm) li = (int)i;
+      if (li < 0) {
+        std::fprintf(stderr, "--shot-strike: %s (\"%s\") has no limb \"%s\"\n",
+                     who, d.name.c_str(), nm.c_str());
+        continue;
+      }
+      mobs.Sever(id, li);
+      std::printf("--shot-strike: %s loses %s\n", who, nm.c_str());
+    }
+  };
+  dress(idA, A, "attacker");
+  dress(idB, B, "target");
+  for (int i = 0; i < 20; i++) mobTick();   // settle, and let the gait pose
+  maim(idA, dA, A, "attacker");
+  maim(idB, dB, B, "target");
+  // Long enough for a severed rig to fall into its crawl state and latch it —
+  // the whole point of the "zombie with both legU off" case is that the state
+  // rule has taken effect before the leap is asked for.
+  for (int i = 0; i < 45; i++) mobTick();
+
+  auto chestOf = [&](uint64_t id, const MobDef& d) {
+    return mobs.MobOrigin(id) + Vec3{d.worldSize.x * 0.5f, d.worldSize.y * 0.62f,
+                                     d.worldSize.z * 0.5f};
+  };
+
+  const uint32_t bruiseMat = mobs.MaterialIdNamed(CurrentTuning().gore.bruiseMat);
+  const uint32_t rotMat = mobs.MaterialIdNamed("rotflesh");
+  Mob* mB = mobs.FindMobById(idB);
+  Mob* mA = mobs.FindMobById(idA);
+  if (mA == nullptr || mB == nullptr) {
+    std::fprintf(stderr, "--shot-strike: a combatant did not survive setup\n");
+    return 1;
+  }
+  const int slotsB = mB->LimbCount();
+  std::vector<SlotState> before, after;
+  SampleSlots(mobs, idB, slotsB, bruiseMat, rotMat, before);
+  const float hpB0 = mobs.TotalHp(idB);
+
+  // ---- SWING IT. A FIXED SEED, because the tempo jitter decides the tick
+  // counts and a look-iteration harness whose swing changes length between
+  // runs cannot be compared to itself (mob.h ForceAttack says the same).
+  // RE-ASSERTED AFTER THE SETTLE, not only at spawn: a gait, a slide down a
+  // dune or a single AI tick before the pin took can leave a creature a few
+  // degrees off, and a stroke aimed from a body facing 10 degrees wide is a
+  // different swing (the aim is taken in the wielder's own basis).
+  mobs.SetHeading(idA, 0.0f);
+  mobs.SetHeading(idB, 3.14159265f);
+  const Vec3 aimAt = chestOf(idB, dB);
+  const Vec3 fromA = mobs.MobOrigin(idA);
+  if (!mobs.ForceAttack(idA, styleName, aimAt, t, 0x5EED51UL)) {
+    std::fprintf(stderr,
+                 "--shot-strike: \"%s\" was refused — the attacker has no "
+                 "weapon for it, or a stroke was already live. Styles this "
+                 "creature can use:", styleName.c_str());
+    for (const AttackStyle& s2 : mobs.AttackStyles().styles)
+      if (StyleUsable(*mA, s2)) std::fprintf(stderr, " %s", s2.name.c_str());
+    std::fprintf(stderr, "\n");
+    return 1;
+  }
+
+  // ---- the camera, and the five pictures --------------------------------
+  const uint32_t W = 1280, H = 720;
+  const Tuning& tun = CurrentTuning();
+  const uint32_t ticksPerDay = TicksPerDay(tun);
+  const uint32_t shotTick =
+      (uint32_t)((double)g_shotTimeOfDay * (double)ticksPerDay) % ticksPerDay;
+  std::vector<MicroBodyInstGpu> microInsts;
+  std::vector<BodyVoxInst> inst;
+  auto shoot = [&](const char* phaseName) {
+    // PUBLISHED EVERY SHOT, not once at the end. This harness is not the frame
+    // loop, so the brick upload and the instance arrays only happen where they
+    // are called — and the whole point here is that the body CHANGES between
+    // pictures (--shot-mob learned this the hard way: eleven carved limbs did
+    // not draw at all).
+    if (MicroBodySet* mbs = debris.MicroSet(); mbs != nullptr && mbs->dirty)
+      sim.UploadMicroBodies(ctx.queue, *mbs);
+    BodyRegistry bodyReg(debris, mobs, nullptr);
+    std::vector<BodyXformGpu> xf;
+    bodyReg.BuildXforms(xf);
+    if (!xf.empty())
+      ctx.queue.WriteBuffer(world.bodyXforms, 0, xf.data(),
+                            xf.size() * sizeof(BodyXformGpu));
+    microInsts.clear();
+    bodyReg.BuildMicroInsts(microInsts);
+    inst.clear();
+    bodyReg.BuildInstances(inst);
+    if (!inst.empty())
+      ctx.queue.WriteBuffer(world.bodyInstances, 0, inst.data(),
+                            inst.size() * sizeof(BodyVoxInst));
+
+    // FRAMED ON THE PAIR, from three-quarters: the attacker's own forward
+    // rotated 40 degrees off, raised a little. A side-on camera hides the
+    // closing distance and a front-on one hides the arm.
+    const Vec3 pa = mobs.MobOrigin(idA) +
+                    Vec3{dA.worldSize.x * 0.5f, dA.worldSize.y * 0.55f,
+                         dA.worldSize.z * 0.5f};
+    const Vec3 pb = chestOf(idB, dB);
+    const Vec3 mid = (pa + pb) * 0.5f;
+    const float sep = (pb - pa).len();
+    // FRAMED ON WHAT IS IN THE PICTURE, which is two creatures and the gap
+    // between them — not on a bounding sphere. 1.9x the taller creature's
+    // whole height left the pair at a third of the frame and the wound
+    // unreadable, which for a look-iteration harness is the only failure that
+    // matters. The +6 is elbow room so a lunge does not leave the frame.
+    const float span = std::max(sep, std::max(dA.worldSize.y, dB.worldSize.y));
+    const float dist = std::max(16.0f, 1.15f * (span + 6.0f));
+    const Vec3 dir = Vec3{0.77f, 0.42f, -0.64f}.normalized();
+    const Vec3 eye = mid + dir * dist;
+    const Vec3 look = (mid - eye).normalized();
+    Camera cam;
+    cam.yaw = std::atan2(look.z, look.x);
+    cam.pitch = std::asin(std::clamp(look.y, -1.0f, 1.0f));
+    WriteRenderParams(ctx.queue, world, eye, cam, (float)W / H, true, 0.0f,
+                      kFarFogDensity, 1080.0f, shotTick);
+    rhi::Texture tex = ctx.device.CreateTexture(
+        {W, H, 1}, rhi::TextureFormat::RGBA8Unorm,
+        rhi::TextureUsage::RenderAttachment | rhi::TextureUsage::CopySrc,
+        "shotTarget");
+    uint32_t microCount = sim.UploadMicroBodyInsts(ctx.queue, microInsts);
+    rhi::CommandEncoder enc = ctx.device.CreateCommandEncoder();
+    sim.EncodeShadowResolve(enc);
+    rhi::RenderPass rp = sim.BeginRenderPass(
+        enc, tex.CreateView(), rhi::TextureFormat::RGBA8Unorm, W, H);
+    sim.DrawWorld(rp);
+    sim.DrawBodies(rp, (uint32_t)inst.size());
+    sim.DrawMicroBodies(rp, microCount);
+    rp.End();
+    rhi::Buffer shotBuf = CreateBuffer(
+        ctx.device, (uint64_t)W * H * 4,
+        rhi::BufferUsage::MapRead | rhi::BufferUsage::CopyDst, "strikeShot");
+    rhi::TexelCopyTexture srcT{};
+    srcT.texture = tex;
+    rhi::TexelCopyBuffer dstB{};
+    dstB.buffer = shotBuf;
+    dstB.bytesPerRow = W * 4;
+    dstB.rowsPerImage = H;
+    rhi::Extent3D ext{W, H, 1};
+    enc.CopyTextureToBuffer(srcT, dstB, ext);
+    ctx.queue.Submit(enc.Finish());
+    std::vector<uint8_t> pixels((size_t)W * H * 4, 0);
+    rhi::ReadBufferBlocking(ctx.device, shotBuf, 0, pixels.data(),
+                            (size_t)(pixels.size()));
+    char path[256];
+    std::snprintf(path, sizeof(path), "shot_strike_%s_%s.bmp",
+                  styleName.c_str(), phaseName);
+    if (WriteBmpFile(path, pixels, W, H)) std::printf("wrote %s\n", path);
+  };
+
+  // ---- run the stroke, photographing its own phases ----------------------
+  bool shotWindup = false, shotCutStart = false, shotCutEnd = false;
+  bool shotRecover = false;
+  int airTicks = 0, cutTicks = 0, sweeps = 0, bodiesHit = 0;
+  int targetLimb = -1, tailTicks = -1;
+  bool arrested = false, launched = false;
+  float topTipSpeed = 0, peakRise = 0;
+  Vec3 landedAt = fromA;
+  bool wasCutting = false;
+  // ---- WHAT SWUNG, AND HOW CLOSE IT EVER GOT ----------------------------
+  //
+  // The effector is CLEARED when the stroke ends (Mob::ClearStrikeEffector — a
+  // creature that finishes a punch goes back to carrying whatever is in its
+  // fist), so asking afterwards which weapon swung answers "(nothing)". The
+  // weapon is therefore latched on the first cut tick.
+  //
+  // THE GAP IS THE MINIMUM OVER THE WHOLE CUT, and sampling it once was the
+  // instrument's own first bug: a cut OPENS at the chamber, so one sample on
+  // the first cut tick measures how far the fist was BEFORE it travelled and
+  // reported a punch from 6 voxels as 5.1 voxels short of a body it might well
+  // have reached. "How close did the point ever get" is the question, and it
+  // is the one that separates a STAND-OFF problem (the style's `reach` is
+  // further than the arm can serve) from a wound-model one (it touched and did
+  // nothing). A bare `bodiesHit 0` says neither — CLAUDE.md rule 6.
+  StrikeProfile prof{};
+  std::string weaponName = "(nothing)";
+  float edgeGap = 1e9f, edgeLen = 0, chestGap = -1;
+  bool sampled = false;
+  // ---- WHY THE POINT DID NOT GET THERE, in the arm's own numbers ---------
+  // A bare "0.7 voxels short" has four causes and from outside they are the
+  // same miss: the driver never COMMANDED the extension, the IK could not
+  // serve it, the pose clamp took it back, or the reported hand and the solved
+  // hand disagree. Mob::WeaponArmDiag separates all four, and this harness is
+  // where a human reads them (CLAUDE.md rule 6: attribution beats elimination).
+  int probesCast = 0, probesAir = 0, probesSelf = 0, probesBody = 0;
+  int diagTicks = 0, diagRan = 0;
+  float cmdReachMax = 0, gotReachMax = 0;
+  float worstIkMiss = 0, worstClampShift = 0, worstRoundTrip = 0;
+  float worstShoulderClamp = 0, worstElbowClamp = 0;
+  auto sampleWeapon = [&]() {
+    Mob* m = mobs.FindMobById(idA);
+    if (m == nullptr) return;
+    if (!sampled) {
+      sampled = true;
+      if (const MobNaturalWeaponDef* nw = m->EffectorWeapon(); nw != nullptr) {
+        prof = m->StrikeProfileFor(*nw);
+        weaponName = nw->name + " (" + nw->part + ", " +
+                     (m->StrikeEffectorKind() == StrikeEffectorMode::Aim
+                          ? "aim" : "chain") + ")";
+      } else if (!m->HeldItem().empty()) {
+        if (const ItemDef* it = items.At(items.Find(m->HeldItem()));
+            it != nullptr) {
+          prof = it->strike;
+          weaponName = m->HeldItem() + " (held)";
+        }
+      }
+      const Vec3 shoulder =
+          mobs.MobOrigin(idA) + Vec3{dA.worldSize.x * 0.5f,
+                                     dA.worldSize.y * 0.62f,
+                                     dA.worldSize.z * 0.5f};
+      chestGap = (chestOf(idB, dB) - shoulder).len();
+    }
+    Vec3 base{}, tip{};
+    float hw = 0;
+    if (!m->WeaponEdge(base, tip, hw, nullptr)) return;
+    edgeLen = (tip - base).len();
+    // To the NEAREST LIVE VOXEL of the victim, which is the question the
+    // sweep's probe rays actually ask — not to its centre, which a creature
+    // with any width at all makes meaningless.
+    float best = 1e9f;
+    for (int li = 0; li < slotsB; li++) {
+      if (!mobs.LimbBody(idB, li)) continue;
+      const uint32_t n = mobs.LimbVoxelCount(idB, li);
+      for (uint32_t v = 0; v < n; v += 17u)
+        best = std::min(best, (mobs.LimbVoxelPos(idB, li, v) - tip).len());
+    }
+    if (best < 1e8f) edgeGap = std::min(edgeGap, best - hw);
+    const Mob::WeaponArmDiag& d = m->WeaponArmDiagnostics();
+    diagTicks++;
+    if (d.ran) {
+      diagRan++;
+      cmdReachMax = std::max(cmdReachMax, d.cmdHand.len());
+      gotReachMax = std::max(gotReachMax, d.gotHand.len());
+      worstIkMiss = std::max(worstIkMiss, d.ikMiss);
+      worstClampShift = std::max(worstClampShift, d.clampShift);
+      worstRoundTrip = std::max(worstRoundTrip, d.roundTrip);
+      worstShoulderClamp = std::max(worstShoulderClamp, d.shoulderClamp);
+      worstElbowClamp = std::max(worstElbowClamp, d.elbowClamp);
+    }
+  };
+  for (int i = 0; i < 260; i++) {
+    const Mob* m = mobs.FindMobById(idA);
+    const NpcStroke* s = m != nullptr ? mobs.MobStroke(idA) : nullptr;
+    if (s != nullptr) {
+      if (s->Cutting()) cutTicks++;
+      sweeps = std::max(sweeps, s->sweeps);
+      probesCast = std::max(probesCast, s->probesCast);
+      probesAir = std::max(probesAir, s->probesAir);
+      probesSelf = std::max(probesSelf, s->probesSelf);
+      probesBody = std::max(probesBody, s->probesBody);
+      bodiesHit = std::max(bodiesHit, s->bodiesHit);
+      topTipSpeed = std::max(topTipSpeed, s->topTipSpeed);
+      if (s->targetLimb >= 0) targetLimb = s->targetLimb;
+      arrested = arrested || s->arrested;
+    }
+    if (m != nullptr) {
+      if (m->Airborne()) {
+        launched = true;
+        airTicks++;
+      } else if (launched) {
+        landedAt = m->Origin();
+      }
+      peakRise = std::max(peakRise, m->Origin().y - fromA.y);
+    }
+    // HALFWAY THROUGH THE WINDUP, not at its start: the first tick of a
+    // telegraph is the rest pose with one frame of lean on it, which is a
+    // picture of nothing.
+    if (s != nullptr && !shotWindup &&
+        s->phase == NpcStroke::Phase::Windup &&
+        s->phaseTick * 2 >= s->windupTicks) {
+      shotWindup = true;
+      shoot("windup");
+    }
+    if (s != nullptr && s->Cutting()) sampleWeapon();
+    if (s != nullptr && !shotCutStart && s->Cutting()) {
+      shotCutStart = true;
+      shoot("cut_start");
+    }
+    if (s != nullptr && !shotCutEnd && s->Cutting() &&
+        s->phaseTick + 1 >= s->cutTicks) {
+      shotCutEnd = true;
+      shoot("cut_end");
+    }
+    if (s != nullptr && !shotRecover &&
+        s->phase == NpcStroke::Phase::Recover &&
+        s->phaseTick * 2 >= s->recoverTicks) {
+      shotRecover = true;
+      shoot("recover");
+    }
+    const bool live = s != nullptr && s->Active();
+    if (!live && wasCutting && tailTicks < 0) tailTicks = 0;
+    wasCutting = wasCutting || (s != nullptr && s->Cutting());
+    if (tailTicks >= 0) {
+      if (tailTicks >= 20) break;
+      tailTicks++;
+    }
+    mobTick();
+  }
+  // The last picture is the one the OWNER asked for by name: twenty ticks
+  // after the swing is over, which is where the blood has finished running and
+  // a rot wound has had time to look like one.
+  if (!shotCutStart) shoot("cut_start");
+  if (!shotRecover) shoot("recover");
+  shoot("after20");
+
+  // ---- WHAT IT DID ------------------------------------------------------
+  SampleSlots(mobs, idB, slotsB, bruiseMat, rotMat, after);
+  sampleWeapon();   // a stroke that never cut still has a weapon to name
+  if (edgeGap > 1e8f) edgeGap = -1.0f;   // never measured: say so, not 1e9
+  std::printf(
+      "\n--shot-strike: %s  \"%s\"  ->  %s\n"
+      "  weapon      %s\n"
+      "  profile     cut %.1f  blunt %.1f  bluntCarve %.2f  armorBreak %.2f  "
+      "bite %.1f  infect %u/%u\n"
+      "  stand-off   %d voxels%s (style reach %.0f)\n"
+      "  behaviour   %s (both sides pinned to training_dummy for the shot: an\n"
+      "              AI that keeps its range makes the stand-off unauthorable)\n"
+      "  stroke      %d sweep ticks, %d cut ticks, %d bodies hit, top tip "
+      "%.1f vox/s%s\n"
+      "  geometry    a %.1f-voxel edge; over the cut its point came within "
+      "%.1f vox of the victim's nearest voxel (shoulder-to-chest %.1f)\n",
+      attackerSpec.c_str(), styleName.c_str(),
+      targetSpec.empty() ? "human" : targetSpec.c_str(), weaponName.c_str(),
+      prof.cut, prof.blunt, prof.bluntCarve, prof.armorBreak, prof.bite,
+      (unsigned)prof.infectMat, (unsigned)prof.infectStain, gapZ,
+      A.gap > 0.0f ? " (@ override)" : "", sty.reach, profA.c_str(),
+      sweeps, cutTicks, bodiesHit, topTipSpeed,
+      arrested ? " (ARRESTED by a parry)" : "", edgeLen, edgeGap, chestGap);
+  // ---- THE ARM, when there is one (Mob::WeaponArmDiag) ------------------
+  // Printed for every chain effector, held or natural, because "the point did
+  // not get there" is the same question for a sword and a fist and the four
+  // causes are the same four. `commanded -> solved` is the pair that matters:
+  // they agree when the arm served the ask and diverge by exactly the
+  // shortfall when it could not.
+  std::printf(
+      "  probes      %d rays cast: %d found air, %d never left the wielder, "
+      "%d found a body\n",
+      probesCast, probesAir, probesSelf, probesBody);
+  // ZERO IS AS INFORMATIVE AS ANY OTHER NUMBER HERE: an aim effector has no
+  // arm and reports 0/N, which is how a reader tells "the jaws are not on a
+  // chain" from "the chain never ran".
+  if (diagTicks > 0)
+    std::printf(
+        "  arm[%d/%d]   hand reach commanded %.2f -> solved %.2f vox; ik miss "
+        "%.2f, clamp shift %.2f vox (shoulder %.2f rad, elbow %.2f rad), "
+        "read-back err %.2f\n",
+        diagRan, diagTicks, cmdReachMax, gotReachMax, worstIkMiss,
+        worstClampShift,
+        worstShoulderClamp, worstElbowClamp, worstRoundTrip);
+  if (targetLimb >= 0 && targetLimb < (int)dB.limbs.size())
+    std::printf("  aimed at    %s (the style's `target` table drew it)\n",
+                dB.limbs[(size_t)targetLimb].name.c_str());
+  else
+    std::printf("  aimed at    the chest (no `target` table, or nothing live)\n");
+  if (sty.lunge.Any() || launched)
+    std::printf(
+        "  lunge       %s: %d air ticks, peak rise %.2f vox, travelled %.2f "
+        "vox (authored %d ticks at %.1f m/s, rise %.1f)\n",
+        launched ? "LAUNCHED" : "never left the ground", airTicks, peakRise,
+        std::sqrt((landedAt.x - fromA.x) * (landedAt.x - fromA.x) +
+                  (landedAt.z - fromA.z) * (landedAt.z - fromA.z)),
+        sty.lunge.ticks, sty.lunge.speed, sty.lunge.rise);
+  std::printf("  victim hp   %.1f -> %.1f\n", hpB0, mobs.TotalHp(idB));
+
+  // Per-slot, and only the slots that MOVED. `< AppendedBase()` is the rig's
+  // own flesh/shell split (game/impact.h StruckKind) and is the line the
+  // resolver classifies on, so the report names it the same way.
+  std::printf("  slot                 kind   voxels     hp        bleed   "
+              "bruise  rot   stain\n");
+  bool anyRow = false;
+  for (int i = 0; i < slotsB && i < (int)after.size(); i++) {
+    const SlotState& b = before[(size_t)i];
+    const SlotState& a = after[(size_t)i];
+    const int dArt = (int)a.art - (int)b.art;
+    const bool moved = dArt != 0 || std::fabs(a.hp - b.hp) > 0.01f ||
+                       std::fabs(a.bleed - b.bleed) > 0.01f ||
+                       a.bruise != b.bruise || a.rot != b.rot ||
+                       a.stain != b.stain || a.alive != b.alive;
+    if (!moved) continue;
+    anyRow = true;
+    std::string name;
+    const char* kind = "flesh";
+    if (i < mB->AppendedBase()) {
+      name = (i < (int)dB.limbs.size()) ? dB.limbs[(size_t)i].name
+                                        : std::string("limb?");
+    } else {
+      kind = (i == mB->HeldSlot()) ? "held" : "shell";
+      const int host = mB->WornHostOf(i);
+      name = std::string(kind) + " over " +
+             ((host >= 0 && host < (int)dB.limbs.size())
+                  ? dB.limbs[(size_t)host].name
+                  : std::string("?"));
+    }
+    std::printf("  %-20s %-6s %6d   %6.1f->%-6.1f %5.1f  %+6d %+5d %+6d%s\n",
+                name.c_str(), kind, dArt, b.hp, a.hp, a.bleed,
+                (int)a.bruise - (int)b.bruise, (int)a.rot - (int)b.rot,
+                (int)a.stain - (int)b.stain,
+                (b.alive && !a.alive) ? "   SEVERED" : "");
+  }
+  if (!anyRow)
+    std::printf("  (nothing on the target changed — the blow missed, or it "
+                "was too slow to do anything: melee.minSpeedMps)\n");
+  return ctx.ReportVkValidation("--shot-strike") > 0 ? 1 : 0;
+}
+
 
 struct KeyEdge {
   bool prev = false;
@@ -3381,8 +4088,12 @@ int main(int argc, char** argv) {
   bool noAudio = false;  // --noaudio: run silent (also implied by every headless mode)
   bool telemetryEnabled = false;
   uint16_t telemetryPort = 8080;
-  // --shot-mob <def>[:limb|+item[#RRGGBB],...][@x,z] (pose/wardrobe look)
-  std::string shotMob;
+  std::string shotMob;  // --shot-mob <def>[:limb|+item[#RRGGBB],...][@x,z] (pose/wardrobe look)
+  // --shot-strike <attacker>[:limb,...][+item,...] <style> [<target>[...]]:
+  // the IMPACT look-iteration harness. Three words rather than one colon-
+  // separated string because two of them are creature specs that already use
+  // ':' and '+', and a fourth separator on top of those is unreadable.
+  std::string shotStrikeA, shotStrikeStyle, shotStrikeB;
   bool shotFluid = false;  // --shot-fluid (MPM water look iteration)
   // --shot-waterfall: the CA falling-column fixture. Its own flag rather
   // than a frame inside --shot because it BUILDS a scene (a terrace, a
@@ -3445,6 +4156,11 @@ int main(int argc, char** argv) {
           "  --shot-fluid-pond     MPM fluid poured into a generated pond\n"
           "                        (the MPM/settled-water seam)\n"
           "  --shot-mob <def>      Mob pose look iteration (def[:limb,...])\n"
+          "  --shot-strike <attacker> <style> [<target>]\n"
+          "                        One blow, photographed on its own phases and\n"
+          "                        counted per rig slot. Each creature is\n"
+          "                        <def>[@gap][:limb,...][+item,...], e.g.\n"
+          "                        --shot-strike zombie bite_lunge human+iron_cuirass\n"
           "  --shot-inventory      Character screen (I) with a damaged avatar,\n"
           "                        one frame to screenshot_inventory.bmp\n"
           "  --shot-jump           Airborne pose look iteration: third person,\n"
@@ -3661,6 +4377,22 @@ int main(int argc, char** argv) {
     else if (a == "--shot-mob") {
       if (i + 1 >= argc) { std::fprintf(stderr, "--shot-mob requires a mob def\n"); return 1; }
       shotMob = argv[++i];
+    }
+    else if (a == "--shot-strike") {
+      if (i + 2 >= argc) {
+        std::fprintf(stderr,
+                     "--shot-strike wants <attacker>[@gap][:limb,...][+item,...] "
+                     "<style> [<target>[:limb,...][+item,...]]\n"
+                     "  e.g. --shot-strike zombie bite_lunge human+iron_cuirass\n");
+        return 1;
+      }
+      shotStrikeA = argv[++i];
+      shotStrikeStyle = argv[++i];
+      // The target is optional, so it is only taken when the next word is not
+      // another flag — otherwise `--shot-strike human punch_r --vk-validation`
+      // would eat the flag as a creature and report "no mob def named
+      // --vk-validation", which is a confusing way to say "you left it out".
+      if (i + 1 < argc && argv[i + 1][0] != '-') shotStrikeB = argv[++i];
     }
     else if (a == "--noaudio") noAudio = true;
     else if (a == "--telemetry") telemetryEnabled = true;
@@ -4479,6 +5211,9 @@ int main(int argc, char** argv) {
                          stOpt.jsonPath);
   if (!shotMob.empty())
     return RunMobShot(ctx, world, sim, phys, debris, mobs, items, shotMob);
+  if (!shotStrikeA.empty())
+    return RunStrikeShot(ctx, world, sim, phys, debris, mobs, items,
+                         shotStrikeA, shotStrikeStyle, shotStrikeB);
   if (rebaseline) stOpt.rebaseline = true;
 
   // --sweep sim.X=a,b,c [--sweep-gate <gate>]: run the determinism check at
@@ -4796,7 +5531,15 @@ int main(int argc, char** argv) {
             ? ui.aiWeaponNames[ui.aiWeaponPick]
             : std::string();
     ui.aiWeaponNames.clear();
-    ui.aiWeaponNames.push_back("(unarmed)");
+    // "fists" RATHER THAN "(unarmed)", AND THAT IS A BEHAVIOUR CHANGE, NOT A
+    // RELABEL. Before the impact package an empty hand meant a creature that
+    // could not attack at all, so the entry was the ABSENCE of a choice; it
+    // now names a weapon — a rig's `natural` block gives it fists and jaws,
+    // and behaviors.json lists punch/bite styles as fallbacks, so a creature
+    // spawned this way fights. The sentinel still works by being a name no
+    // item has: `items.Find("fists")` returns -1, At(-1) is nullptr, and the
+    // mob spawns with nothing in its fist (see the spawn site below).
+    ui.aiWeaponNames.push_back("fists");
     for (const ItemDef& it : items.items)
       if (it.kind == ItemKind::Melee) ui.aiWeaponNames.push_back(it.name);
     // First build has nothing to restore: default to the arming sword, which
@@ -5097,6 +5840,11 @@ int main(int argc, char** argv) {
   // from an unknown pose would carve a segment the blade never travelled.
   Vec3 lastEdgeBase{}, lastEdgeTip{};
   bool lastEdgeValid = false;
+  // Rig slots the player's CURRENT swing has already delivered a blunt/bite
+  // impulse to (melee.h EdgeSweep::struck). Owned here rather than on either
+  // cursor because the player has two cut states -- the discrete program's and
+  // the freeform driver's -- and one swing must mean one impulse in both.
+  std::vector<uint64_t> playerStruck;
   // --duel-dummy fires once, from inside the tick loop (see the note there).
   bool duelDummySpawned = false;
 
@@ -6854,23 +7602,59 @@ int main(int argc, char** argv) {
                      : nullptr;
     const bool meleeArmed = ui.tool == UIState::kToolMelee && !ui.magicMode &&
                             heldItem && heldItem->kind == ItemKind::Melee;
-    const bool meleeHeld = meleeArmed && mouseL;
+    // ---- ...AND WITH NOTHING IN YOUR HANDS (plan §6) -----------------------
+    //
+    // "The melee tool is up, nothing is drawn, and this body can punch." The
+    // last clause is deliberately NOT `def->FindNatural("fist.R")`: a weapon
+    // name spelled in C++ is exactly the closed-ended system design rule 4
+    // forbids, and it would make the avatar the one creature whose anatomy the
+    // engine knows by heart. Instead the CONTENT answers it — the
+    // `playerUnarmed` compass resolves, and at least one style it points at is
+    // one this body can actually swing (`StyleUsable`, the same question the
+    // NPC draw asks). Lose both hands and the compass stops resolving on its
+    // own; author a creature with claws instead of fists and nothing here
+    // changes.
+    const bool meleeUnarmed = [&] {
+      if (ui.tool != UIState::kToolMelee || ui.magicMode) return false;
+      if (heldItem != nullptr || !avatar.Spawned()) return false;
+      const StyleLibrary& lib = mobs.AttackStyles();
+      if (!lib.playerUnarmed.Usable()) return false;
+      for (const PlayerStrikeMap::Sector& s : lib.playerUnarmed.sectors)
+        if (const AttackStyle* sty = lib.At(s.style))
+          if (StyleUsable(avatar, *sty)) return true;
+      for (int k = 0; k < 2; k++)
+        if (const AttackStyle* sty = lib.At(lib.playerUnarmed.neutral[k]))
+          if (StyleUsable(avatar, *sty)) return true;
+      return false;
+    }();
+    // WHAT EVERY DOWNSTREAM "IS MELEE LIVE" TEST MEANS NOW. `meleeArmed` still
+    // means "a weapon is drawn" and is what decides whether to equip one; this
+    // is the one the driver, the program and the sweep gate on, because a fist
+    // is as live as a sword.
+    const bool meleeReady = meleeArmed || meleeUnarmed;
+    const bool meleeHeld = meleeReady && mouseL;
     // DISCRETE STRIKES (melee.controlMode 0): the click is the whole input,
     // LATCHED like castQueued above and for the same reason. The direction is
     // read HERE, at the press edge, because the flick is freshest at the
     // instant of intent — a strike fired from the buffer later still cuts the
     // direction that was flicked, aimed wherever the camera is THEN (the
     // aim is resolved at the windup's end, like every stroke).
-    if (mouseLClick && meleeArmed && CurrentTuning().melee.controlMode == 0) {
+    if (mouseLClick && meleeReady && CurrentTuning().melee.controlMode == 0) {
       const StyleLibrary& styleLib = mobs.AttackStyles();
+      // WHICH COMPASS: the sword's, or the fists'. Two maps rather than one
+      // filtered set, because the two are different SHAPES (strokes.h
+      // StyleLibrary::playerUnarmed) — a punch compass has a jab and a cross
+      // where a sword's has an overhead and a thrust.
+      const PlayerStrikeMap& map =
+          meleeArmed ? styleLib.player : styleLib.playerUnarmed;
       float fx = 0, fy = 0;
       int si = -1;
       if (strikePicker.Pick(CurrentTuning().melee.pickMinSpeed, fx, fy))
-        si = QuantizeStrike(styleLib, fx, fy);
+        si = QuantizeStrike(map, fx, fy);
       if (si < 0) {
         // No flick: alternate the two horizontals so plain clicking is a
         // usable L/R rhythm rather than the same cut stamped.
-        si = NeutralStrike(styleLib, strikePicker.altRight);
+        si = NeutralStrike(map, strikePicker.altRight);
         strikePicker.altRight = !strikePicker.altRight;
       }
       if (si >= 0) strikeQueued = si;
@@ -7237,10 +8021,11 @@ int main(int argc, char** argv) {
           const uint64_t nid = mobs.Spawn(aiDef, at);
           if (nid != 0) {
             // WHAT THE PANEL PICKED, resolved by name at spawn time. Entry 0
-            // is "(unarmed)" and Find() returns -1 for it, so the empty hand
-            // needs no special case — At(-1) is nullptr and the mob spawns
-            // with nothing in its fist, which is a case the AI has to handle
-            // anyway (a duelist that has just been disarmed).
+            // is "fists" and Find() returns -1 for it, so the empty hand needs
+            // no special case — At(-1) is nullptr and the mob spawns with
+            // nothing in its fist, which is no longer a creature that cannot
+            // fight: its `natural` weapons and its profile's fallback punches
+            // are what it swings (docs/PLAN_impact_unarmed.md §3/§5).
             const std::string& pick =
                 ui.aiWeaponNames[ui.aiWeaponPick < (int)ui.aiWeaponNames.size()
                                      ? ui.aiWeaponPick
@@ -7716,32 +8501,42 @@ int main(int argc, char** argv) {
             // (F5) drops any live program rather than leaving it half-run.
             playerStrike.Reset();
             strikeQueued = strikeBuffered = -1;
-            melee.Update(kTickDt, meleeHeld, meleeArmed, swRight, swUp, swFwd);
+            melee.Update(kTickDt, meleeHeld, meleeReady, swRight, swUp, swFwd);
           } else {
             // DISCRETE: consume the press latch, then step the program. Begin
             // and first step land on the SAME tick, exactly as the NPC's
             // BeginStroke/StepStroke pair does.
-            if (!meleeArmed || !avatar.Spawned()) {
+            if (!meleeReady || !avatar.Spawned()) {
               // Weapon stowed (or body gone) mid-swing: drop the claim the
               // same way MobSystem's teardown guard does.
               playerStrike.Reset();
               strikeBuffered = -1;
+              if (avatar.Spawned()) avatar.ClearStrikeEffector();
             }
-            if (strikeQueued >= 0 && meleeArmed && avatar.Spawned()) {
+            if (strikeQueued >= 0 && meleeReady && avatar.Spawned()) {
               if (!playerStrike.Active()) {
                 if (const AttackStyle* sty =
                         mobs.AttackStyles().At(strikeQueued)) {
-                  // Fresh sliders per swing — MobSystem::BeginStroke says why
-                  // (MeleeTuning is a copy; F5 has to reach the next cut).
-                  ApplyMeleeTuning(melee.tuning);
-                  // The seed is (who, when), like the NPC's; the player's
-                  // styles author jitter 0, so it only matters if an author
-                  // turns jitter back on — and then it still replays.
-                  BeginStrokeProgram(playerStrike, *sty, strikeQueued,
-                                     rng::Hash3(0x504Cu, tick, 0x5747u));
-                  // ...and the style's body animation, exactly as the NPC's
-                  // BeginStroke does (strokes.h AttackStyle::clip).
-                  if (!sty->clip.empty()) avatar.PlayClip(sty->clip);
+                  // ---- POINT THE DRIVER AT THE PART THIS STYLE SWINGS -----
+                  // Exactly what MobSystem::BeginStroke does, and through the
+                  // same call: `player_punch_r` names `fist.R`, so the arm
+                  // chain is claimed on the fist and `avatar.WeaponEdge`
+                  // reports the knuckles. A style whose weapon this body has
+                  // not got refuses HERE, before the program begins, so a
+                  // strike never runs with no edge on the end of it.
+                  if (avatar.ArmForStyle(*sty)) {
+                    // Fresh sliders per swing — MobSystem::BeginStroke says
+                    // why (MeleeTuning is a copy; F5 must reach the next cut).
+                    ApplyMeleeTuning(melee.tuning);
+                    // The seed is (who, when), like the NPC's; the player's
+                    // styles author jitter 0, so it only matters if an author
+                    // turns jitter back on — and then it still replays.
+                    BeginStrokeProgram(playerStrike, *sty, strikeQueued,
+                                       rng::Hash3(0x504Cu, tick, 0x5747u));
+                    // ...and the style's body animation, exactly as the NPC's
+                    // BeginStroke does (strokes.h AttackStyle::clip).
+                    if (!sty->clip.empty()) avatar.PlayClip(sty->clip);
+                  }
                 }
               } else if (playerStrike.phase == StrokeCursor::Phase::Cut ||
                          playerStrike.phase == StrokeCursor::Phase::Recover) {
@@ -7761,13 +8556,21 @@ int main(int argc, char** argv) {
                 // liveAz/liveEl = (0, 0): the camera IS the aim, so every
                 // strike's mid-travel passes through the crosshair line.
                 const bool wasCutting = playerStrike.Cutting();
+                // liveAz/liveEl/liveDist = 0: the CAMERA is the aim, so
+                // every strike's mid-travel passes through the crosshair line
+                // and there is no target distance to bound the reach with.
                 const StrokeStepResult r = StepStrokeProgram(
-                    playerStrike, sty, melee, 0.0f, 0.0f, kTickDt, swRight,
-                    swUp, swFwd);
+                    playerStrike, sty, melee, 0.0f, 0.0f, 0.0f, kTickDt,
+                    swRight, swUp, swFwd);
                 stepped = r != StrokeStepResult::Idle;
                 strikeCutEdge = playerStrike.Cutting() && !wasCutting;
                 if (r == StrokeStepResult::Finished) {
                   playerStrike.Reset();
+                  // ...and hand the part back, like MobSystem::StepStroke's
+                  // Finished branch. With a sword drawn this falls straight
+                  // through to the held item, so an armed player's arm claim
+                  // between strikes is exactly what it always was.
+                  avatar.ClearStrikeEffector();
                   // Chain the banked strike: promoted to the latch, so it
                   // begins on the next tick through the same door as a fresh
                   // click (one tick of gap, invisible at 30 Hz).
@@ -7782,7 +8585,7 @@ int main(int argc, char** argv) {
               // No program stepped the driver this tick: it idles/unwinds
               // exactly as a released button always did, so the arm hands
               // back over the usual ramp. ONE advance per tick either way.
-              melee.Update(kTickDt, false, meleeArmed, swRight, swUp, swFwd);
+              melee.Update(kTickDt, false, meleeReady, swRight, swUp, swFwd);
             }
           }
           // ---- THE SWING WHOOSH, on the EDGE into Slash --------------------
@@ -8534,7 +9337,7 @@ int main(int argc, char** argv) {
       //
       // Deferred to this point for the same reason the laser kerf is: a carve
       // needs the `spawns` list debris.PreTick fills just above.
-      if (avatar.Spawned() && meleeArmed) {
+      if (avatar.Spawned() && meleeReady) {
         Vec3 eb, et, ef;
         float ehw = 0;
         if (avatar.WeaponEdge(eb, et, ehw, &ef)) {
@@ -8545,6 +9348,12 @@ int main(int argc, char** argv) {
           // alone made thrusts free actions (the player-styles gate caught
           // it). This is the NPC's own contract: MobSystem::StepStroke sweeps
           // on the CURSOR's cut, and tip speed still scales the damage.
+          // ONE STROKE, ONE IMPULSE PER SLOT (melee.h EdgeSweep::struck). The
+          // set is cleared on the first tick neither cut state is live, which
+          // is the same "is a cut happening" test the sweep gates on -- so a
+          // freeform wave and a discrete program both get exactly one blunt
+          // hit per body per swing with no mode read of their own.
+          if (!(melee.Cutting() || playerStrike.Cutting())) playerStruck.clear();
           if (lastEdgeValid && (melee.Cutting() || playerStrike.Cutting())) {
             EdgeSweep sw;
             sw.aPrev = lastEdgeBase;
@@ -8554,18 +9363,39 @@ int main(int argc, char** argv) {
             sw.flatNow = ef;
             sw.dt = kTickDt;
             sw.halfWidth = ehw;
-            sw.damage = heldItem->damage;
-            sw.carveBonus = heldItem->carveBonus;
-            // HEFT: the weapon's own volume against the reference, so a
-            // greatsword cuts deeper than a knife because it IS bigger
-            // (item.h ItemDef::heftVolume). Derived from the art, resolved
-            // here because only the caller knows which item is in the fist.
-            {
+            // ---- WHOSE BLOW IS THIS: THE SWORD'S, OR THE FIST'S? ----------
+            // `WeaponEdge` above already reported whichever the effector
+            // names, so this is the matching half: the numbers come from the
+            // same weapon the segment did. A fist's profile passes through
+            // `StrikeProfileFor`, so a worn gauntlet upgrades the player's
+            // punch exactly as it upgrades an NPC's (plan section 3). No
+            // blade behind a fist, so the neutral heft (EdgeSweep::heft's
+            // documented default) rather than an item's volume ratio.
+            if (const MobNaturalWeaponDef* fist = avatar.EffectorWeapon()) {
+              sw.strike = avatar.StrikeProfileFor(*fist);
+            } else if (heldItem != nullptr) {
+              // The whole profile, not a number (game/impact.h): a sword
+              // fills mostly `cut` and behaves exactly as it did, a mace
+              // fills `blunt`.
+              sw.strike = heldItem->strike;
+              sw.carveBonus = heldItem->carveBonus;
+              // HEFT: the weapon's own volume against the reference, so a
+              // greatsword cuts deeper than a knife because it IS bigger
+              // (item.h ItemDef::heftVolume). Derived from the art, resolved
+              // here because only the caller knows which item is in the fist.
               const auto& goreT = CurrentTuning().gore;
               sw.heft = heldItem->HeftFactor(goreT.woundHeftRef,
                                              goreT.woundHeftMax);
             }
             sw.tick = tick;
+            // BLUNT AND BITE ARE IMPULSES (melee.h EdgeSweep::struck). The
+            // player has TWO cut states -- the discrete program's cursor and
+            // the freeform driver's own Slash -- so the set is owned here and
+            // cleared on the tick neither is cutting, which is mode-blind and
+            // is the same line the sweep gate below already reads.
+            sw.struck = &playerStruck;
+            // A FIST IS PART OF THE ARM THAT THROWS IT (melee.h selfMounted).
+            sw.selfMounted = avatar.EffectorWeapon() != nullptr;
             sw.valid = true;
             // ---- WHAT THE BLOW WAS, MEASURED FROM WHAT IT LEFT BEHIND ------
             //
@@ -9586,7 +10416,7 @@ int main(int argc, char** argv) {
       }
       ui.itemSelected = hotbar.selected;
       switch (melee.Phase()) {
-        case SwingPhase::Idle:    ui.swingPhase = meleeArmed ? "ready" : ""; break;
+        case SwingPhase::Idle:    ui.swingPhase = meleeReady ? "ready" : ""; break;
         case SwingPhase::Guard:   ui.swingPhase = "guard"; break;
         case SwingPhase::Wind:    ui.swingPhase = "winding"; break;
         case SwingPhase::Slash:   ui.swingPhase = "SLASH"; break;
@@ -9597,9 +10427,16 @@ int main(int argc, char** argv) {
       // flick's read-back is on screen while the swing is. A banked follow-up
       // is shown too — it is the answer to "did my mid-swing click register".
       ui.swingStyle.clear();
+      // ---- THE WEAPON READOUT SAYS "fists" (plan §6) ------------------------
+      // Through `swingStyle` rather than a new UIState field, because
+      // `ui/overlay.*` belongs to a concurrent session this package may not
+      // edit (plan §1) — and this is the line that already sits under the
+      // swing phase and already names what you are swinging.
+      if (meleeUnarmed) ui.swingStyle = "fists";
       if (playerStrike.Active()) {
         if (const AttackStyle* sty = mobs.AttackStyles().At(playerStrike.style))
-          ui.swingStyle = sty->label;
+          ui.swingStyle =
+              (meleeUnarmed ? "fists: " : "") + sty->label;
         if (strikeBuffered >= 0) {
           if (const AttackStyle* nxt = mobs.AttackStyles().At(strikeBuffered))
             ui.swingStyle += "  (next: " + nxt->label + ")";
@@ -10040,7 +10877,7 @@ int main(int argc, char** argv) {
           if (d->kind == ItemKind::Melee) {
             std::snprintf(tip, sizeof tip,
                           "%.0f damage at full speed\n%.1f voxel reach%s",
-                          d->damage, d->reach,
+                          d->strike.cut, d->reach,
                           d->hasEdge ? "\ncuts along its own edge" : "");
             u.tip = tip;
           }
