@@ -1340,11 +1340,16 @@ struct Tuning {
     // dread over a session and fast enough to be fatal if nothing is done. 0 on
     // either is the old static behaviour of that half.
     //
-    // RATE, NOT CHANCE, and per minute rather than per tick, because that is
-    // the unit the question is actually asked in ("how long have I got"). The
-    // pass converts to lattice voxels per tick with the limb's own scale^3, so
-    // a fine skin rots at the same PHYSICAL rate as a coarse one instead of 512
-    // times slower.
+    // AN AVERAGE, REALISED BY CHANCE. Per minute rather than per tick because
+    // that is the unit the question is actually asked in ("how long have I
+    // got"), and the pass converts to lattice voxels per tick with the limb's
+    // own scale^3, so a fine skin rots at the same PHYSICAL rate as a coarse
+    // one instead of 512 times slower. What it does NOT do is bank the
+    // fraction and spend it in instalments: each tick rolls an independent
+    // chance whose expectation is this number, and each voxel is drawn
+    // uniformly from the eligible rim, because a batched average of the right
+    // size still looks like a machine (see the note above Mob::InfectTick for
+    // the version that did, and what it looked like).
     float infectSpreadRate = 1.0f;  // world voxels/minute, per infected limb
     float infectRotRate = 0.5f;     // world voxels/minute, per infected limb
 

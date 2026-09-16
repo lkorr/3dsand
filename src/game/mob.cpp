@@ -11106,16 +11106,31 @@ void Mob::BurnTick(uint32_t tick, World& world, std::vector<CellOp>& cellOps,
 // That jump is parameter-free on purpose -- it is the condition "this limb is
 // full", not a third rate to keep in sync with the other two.
 //
+// IT ADVANCES BY CHANCE, NOT BY INSTALMENTS, and that is the difference
+// between this reading as a disease and reading as a machine. The first version
+// banked the fractional voxels owed each tick in an accumulator and spent them
+// in BURSTS of ~32 once the balance crossed a threshold, to amortise the
+// O(limb) sweep a conversion needs. The average was right and the result was
+// wrong: a third of a second of rot appearing all at once, every few seconds,
+// and -- because the candidates were taken as a contiguous run of a list held
+// in lattice STORAGE order -- appearing as a ROW. Owner report, and a fair one:
+// "all of the rotted voxels are spreading simultaneously".
+//
+// So there is no accumulator and no batching. `InfectDraw` rolls an independent
+// chance every tick whose expectation IS the authored rate, and every voxel is
+// then drawn uniformly, without replacement, from the whole eligible rim. At
+// the shipped 1 vox/min a skinScale-8 limb converts one voxel on roughly one
+// tick in three and a half, somewhere random along its edge.
+//
 // COST (rule 2). A creature nothing has bitten pays one `infectMat != 0` test
-// per limb, forever. An infected limb pays a float add per tick and an O(limb)
-// sweep per BURST -- and the burst, not the tick, is the unit of work for the
-// reason the accumulators on MobLimb spell out: at the default rate on a
-// skinScale-8 limb one whole lattice voxel is owed every four ticks, and paying
-// an index build and a full sweep for 1/512th of a world voxel four times a
-// second is the exact tax rule 2 exists to refuse. The dense index is built
-// inside the burst and left to the burn pass's ordinary grace period to drop;
-// holding one open for every infected limb would be a permanent per-limb
-// allocation, which is the thing that rule forbids outright.
+// per limb, forever. An infected limb pays TWO HASHES AND A COMPARE on a tick
+// whose dice come up zero -- five ticks in seven at the shipped rate -- and
+// never looks at its lattice at all. That ordering is what pays for dropping
+// the burst: the sweep is behind the draw, not in front of it, so losing the
+// amortisation costs a sweep on the ticks that do something rather than on
+// every tick. The dense index is built inside the step and left to the burn
+// pass's ordinary grace period to drop; holding one open for every infected
+// limb would be a permanent per-limb allocation, which rule 2 forbids outright.
 //
 // NOT HASHED and never in the grid: this is CPU body state like every other
 // gore mechanic here, and nothing it does reaches a voxel the world hash reads.
@@ -11123,14 +11138,43 @@ void Mob::BurnTick(uint32_t tick, World& world, std::vector<CellOp>& cellOps,
 
 namespace {
 
-// How big one burst is, as a shift on the lattice voxels in a world voxel. At
-// skinScale 8 that is 512 >> 4 = 32 sub-voxels, i.e. a sixteenth of a world
-// voxel -- below anything the eye resolves, which is the point: the burst is a
-// cost amortiser, not a visible step. Floored at 1 so a coarse limb (scale 1,
-// where a lattice voxel IS a world voxel) still moves one voxel at a time, and
-// capped so a cranked-up rate cannot make one burst walk the whole limb.
-constexpr uint32_t kInfectBurstShift = 4;
-constexpr uint32_t kInfectBurstMax = 64;
+// ---- AN AVERAGE RATE, ROLLED INDEPENDENTLY EVERY TICK -----------------------
+//
+// How many voxels the infection moves THIS tick, given how many it moves per
+// tick on average. Whole part plus a Bernoulli trial on the fraction, so the
+// expectation is exactly `ratePerTick` at every rate, not just small ones.
+//
+// At anything anyone plays at the whole part is 0 and this is one coin flip: at
+// the shipped 1 vox/min on a skinScale-8 limb the rate is 0.284 lattice voxels
+// a tick, so roughly one tick in three and a half converts ONE voxel and the
+// rest convert none. That is the whole of the fix -- the first version banked
+// the fraction in an accumulator and spent ~32 voxels at once when it crossed a
+// threshold, which is the same average and a visibly wrong result.
+//
+// The key must vary with tick AND limb or every infected limb on a creature
+// flips on the same ticks, which would reintroduce the batching one level up.
+uint32_t InfectDraw(float ratePerTick, uint32_t key) {
+  if (!(ratePerTick > 0.0f)) return 0;
+  const uint32_t whole = (uint32_t)ratePerTick;
+  const float frac = ratePerTick - (float)whole;
+  const float u = (float)(key & 0xFFFFFFu) * (1.0f / 16777216.0f);
+  return whole + (u < frac ? 1u : 0u);
+}
+
+// Sampling WITHOUT REPLACEMENT from a candidate pool, by swap-and-pop. Uniform,
+// O(1) per draw, no shuffle and no second array -- and it cannot hand the same
+// voxel back twice, which a modulo walk over a shared list can.
+//
+// The pool is mutated, which is why the callers hand over lists they are done
+// reading. Returns false when the pool has run dry.
+bool InfectTake(std::vector<uint32_t>& pool, uint32_t key, uint32_t& out) {
+  if (pool.empty()) return false;
+  const size_t k = (size_t)(key % (uint32_t)pool.size());
+  out = pool[k];
+  pool[k] = pool.back();
+  pool.pop_back();
+  return true;
+}
 
 }  // namespace
 
@@ -11157,32 +11201,27 @@ bool Mob::InfectTick(uint32_t tick, World& world,
     const uint32_t scale =
         limb.HasFineSkin() ? SkinScaleOf(limb) : PhysScaleOf(limb);
     const float lat = (float)scale * (float)scale * (float)scale;
-    limb.infectSpreadAcc += gt.infectSpreadRate * lat * perTick;
-    limb.infectRotAcc += gt.infectRotRate * lat * perTick;
-    const uint32_t burst = std::clamp((uint32_t)lat >> kInfectBurstShift, 1u,
-                                      kInfectBurstMax);
-    const float fburst = (float)burst;
-    if (limb.infectSpreadAcc < fburst && limb.infectRotAcc < fburst) continue;
-    // EITHER accumulator reaching the burst spends BOTH, down to their whole
-    // parts. One sweep answers both questions and the two rates are usually
-    // within a factor of a few of each other, so splitting them into separate
-    // bursts would double the cost to buy nothing.
-    uint32_t nSpread = 0, nRot = 0;
-    if (limb.infectSpreadAcc >= 1.0f) {
-      nSpread = (uint32_t)limb.infectSpreadAcc;
-      limb.infectSpreadAcc -= (float)nSpread;
-    }
-    if (limb.infectRotAcc >= 1.0f) {
-      nRot = (uint32_t)limb.infectRotAcc;
-      limb.infectRotAcc -= (float)nRot;
-    }
-    if (!InfectBurst(li, tick, nSpread, nRot, world, spawns)) return false;
+    // TWO INDEPENDENT ROLLS, every tick, keyed apart. Spread and rot are
+    // separate processes and sharing one draw would correlate them: every
+    // voxel the rot took would be a voxel the spread also moved on, which is
+    // not a thing either rate says.
+    const uint32_t key = (uint32_t)id_ * 0x9E3779B9u + (uint32_t)li * 2654435761u;
+    const uint32_t nSpread =
+        InfectDraw(gt.infectSpreadRate * lat * perTick, Hash3(key, tick, 0x5DEEDu));
+    const uint32_t nRot =
+        InfectDraw(gt.infectRotRate * lat * perTick, Hash3(key, tick, 0x2077u));
+    // THE DICE ARE ROLLED BEFORE ANYTHING IS LOOKED AT, and this is what keeps
+    // the pass cheap now that it no longer batches: a tick that converts
+    // nothing -- roughly five in seven at the shipped rate -- costs two hashes
+    // and a compare, and never touches the limb's lattice at all.
+    if (nSpread == 0 && nRot == 0) continue;
+    if (!InfectStep(li, tick, nSpread, nRot, world, spawns)) return false;
   }
   return true;
 }
 
-bool Mob::InfectBurst(int li, uint32_t tick, uint32_t nSpread, uint32_t nRot,
-                      World& world, std::vector<ParticleSpawn>& spawns) {
+bool Mob::InfectStep(int li, uint32_t tick, uint32_t nSpread, uint32_t nRot,
+                     World& world, std::vector<ParticleSpawn>& spawns) {
   MobLimb& limb = limbs_[li];
   const uint32_t infect = (uint32_t)limb.infectMat & 0xFFFu;
   BurnLimbView v = ViewOf(limb);
@@ -11219,7 +11258,6 @@ bool Mob::InfectBurst(int li, uint32_t tick, uint32_t nSpread, uint32_t nRot,
     // goes quiet and costs one test a tick again. Not a cure: whatever the
     // spread already pushed across a joint is still going.
     limb.infectMat = 0;
-    limb.infectSpreadAcc = limb.infectRotAcc = 0.0f;
     return true;
   }
 
@@ -11264,15 +11302,21 @@ bool Mob::InfectBurst(int li, uint32_t tick, uint32_t nSpread, uint32_t nRot,
     cand.erase(std::unique(cand.begin(), cand.end()), cand.end());
     if (!cand.empty()) {
       ownBrick();
-      // A CONTIGUOUS RUN, not a scatter. The candidate list is in lattice
-      // storage order, so consecutive entries are spatially near each other and
-      // the rot advances as a patch; picking independently at random over the
-      // whole rim would speckle the limb with isolated green voxels, which is
-      // the same mistake the wound stain's correlated noise exists to avoid.
-      const size_t start =
-          Hash3((uint32_t)id_, tick, (uint32_t)li) % cand.size();
-      for (uint32_t k = 0; k < nSpread && k < cand.size(); k++) {
-        const size_t i = cand[(start + k) % cand.size()];
+      // UNIFORM OVER THE WHOLE RIM, drawn without replacement. The first
+      // version took a CONTIGUOUS RUN out of this list on the theory that the
+      // rot should advance as a patch rather than speckle -- but the list is in
+      // lattice STORAGE order, so a run of it is a row, and a burst's worth
+      // taken that way is a slab of the limb turning over in one instant. The
+      // patch is already guaranteed by the candidate rule itself (only the
+      // six-neighbours of existing rot are ever eligible); the draw's job is
+      // only to decide which part of that rim moves first, and the honest
+      // answer to that is chance.
+      for (uint32_t k = 0; k < nSpread; k++) {
+        uint32_t ci = 0;
+        if (!InfectTake(cand, Hash3((uint32_t)id_, tick, (uint32_t)li * 977u + k),
+                        ci))
+          break;
+        const size_t i = ci;
         const IVec3 p = v.At(i);
         const uint32_t rr = Hash3((uint32_t)i, tick, 0x9E3779B9u);
         // DELIBERATELY NOT RECORDED IN `woundWas`. That table is what lets a
@@ -11308,12 +11352,21 @@ bool Mob::InfectBurst(int li, uint32_t tick, uint32_t nSpread, uint32_t nRot,
           break;
         }
     }
-    const std::vector<uint32_t>& pool = face.empty() ? rotten : face;
+    // A NON-CONST reference to whichever local list is in play: the draw below
+    // consumes the pool, and both of these are locals nothing reads afterwards
+    // (the spread step above already had its look at `rotten`).
+    std::vector<uint32_t>& pool = face.empty() ? rotten : face;
     ownBrick();
-    const size_t start =
-        Hash3((uint32_t)id_ ^ 0x5B0Du, tick, (uint32_t)li) % pool.size();
-    for (uint32_t k = 0; k < nRot && k < pool.size(); k++) {
-      const uint32_t i = pool[(start + k) % pool.size()];
+    // Uniform and without replacement, for the spread's reason one screen up:
+    // a contiguous run of a storage-ordered list is a row of the limb, and
+    // holes that open a row at a time do not read as rot.
+    for (uint32_t k = 0; k < nRot; k++) {
+      uint32_t i = 0;
+      if (!InfectTake(pool,
+                      Hash3((uint32_t)id_ ^ 0x5B0Du, tick,
+                            (uint32_t)li * 977u + k),
+                      i))
+        break;
       const IVec3 p = v.At(i);
       v.Set(i, 0, 0);  // tombstone; FlushBurn compacts it away
       const uint32_t c = cellOf(p);

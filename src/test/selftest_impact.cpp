@@ -1144,6 +1144,8 @@ Status GateBiteInfect(Ctx& c, std::string& detail) {
     uint32_t rot0 = 0, rot1 = 0;   // infected voxels, after the bite / after
     uint32_t vox0 = 0, vox1 = 0;   // the limb's art voxels, same two moments
     uint32_t elsewhere = 0;        // rot on OTHER limbs at the end (the jump)
+    uint32_t maxStep = 0;          // most voxels gained on any ONE tick
+    uint32_t movedTicks = 0;       // ticks on which anything changed at all
     bool attached = false;
   };
   auto run = [&](float spread, float rot, int inset) {
@@ -1161,6 +1163,11 @@ Status GateBiteInfect(Ctx& c, std::string& detail) {
              (uint16_t)ichor, 0.85f, 0xB17Eu, spawns);
     r.rot0 = mobs.LimbMaterialCount(id, t.limb, rotMat);
     r.vox0 = mobs.LimbArtVoxelCount(id, t.limb);
+    // SEEDED, not left at 0: the per-tick step below diffs against the previous
+    // reading, and starting from zero would score the bite's own 65 voxels as
+    // the first tick's step and make the burst assertion unfailable.
+    r.rot1 = r.rot0;
+    r.vox1 = r.vox0;
     uint32_t tick = 40000;
     for (int i = 0; i < kTicks; i++) {
       if (!mobs.LimbBody(id, t.limb)) break;
@@ -1170,8 +1177,22 @@ Status GateBiteInfect(Ctx& c, std::string& detail) {
       mobs.PreTick(tick++, c.world, ops, cellOps, spawns);
       // Kept from the last tick the limb was STILL ON, for arm A of
       // `bite-rot`'s reason: reading after a collapse measures a stump.
+      const uint32_t was = r.rot1;
       r.rot1 = mobs.LimbMaterialCount(id, t.limb, rotMat);
       r.vox1 = mobs.LimbArtVoxelCount(id, t.limb);
+      // ---- HOW MUCH MOVES IN ONE TICK ---------------------------------------
+      // The reading that catches the defect the first version shipped with. It
+      // banked the fractional voxels owed and spent them in bursts of ~32, so
+      // the AVERAGE was right and every assertion above passed while the rot
+      // visibly advanced in slabs. A rate realised by chance moves 0, 1 or 2
+      // voxels a tick at this arm's rate; a rate realised in instalments moves
+      // nothing for a hundred ticks and then a slab. Only the average would
+      // ever have distinguished them, and the average is the thing both get
+      // right -- so the gate has to look at the STEP.
+      if (r.rot1 > was) {
+        r.maxStep = std::max(r.maxStep, r.rot1 - was);
+        r.movedTicks++;
+      }
     }
     r.attached = mobs.LimbBody(id, t.limb) != 0;
     // The JOINT JUMP, observed and deliberately not asserted: whether it fires
@@ -1212,9 +1233,18 @@ Status GateBiteInfect(Ctx& c, std::string& detail) {
   //    statements about this pass rather than about the bite, the burn, or
   //    anything else PreTick does to a creature for 300 ticks.
   const bool controlStill = b.rot1 <= b.rot0 && b.vox1 >= b.vox0;
+  // 4. IT ARRIVES A VOXEL AT A TIME, NOT IN SLABS. The one assertion the first
+  //    shipped version would have failed: at this arm's spread rate the pass
+  //    owes ~1.7 lattice voxels a tick, so an honest per-tick draw can only
+  //    ever hand over 1 or 2 and the ceiling is generous headroom on that. The
+  //    burst version owed the same average and delivered it 32 at a time.
+  const uint32_t kMaxStep = (uint32_t)BaselineNumber("biteInfectMaxStep", 4);
+  const bool gradual = a.maxStep <= kMaxStep;
 
   std::string s = "grew " + std::to_string(a.rot0) + "->" +
-                  std::to_string(a.rot1) + " rot, ate " +
+                  std::to_string(a.rot1) + " rot over " +
+                  std::to_string(a.movedTicks) + " ticks (max " +
+                  std::to_string(a.maxStep) + "/tick), ate " +
                   std::to_string(a.vox0 - std::min(a.vox0, a.vox1)) +
                   " vox (limb " + (a.attached ? "on" : "OFF") + ", " +
                   std::to_string(a.elsewhere) + " across joints); control " +
@@ -1222,10 +1252,15 @@ Status GateBiteInfect(Ctx& c, std::string& detail) {
                   " rot, " + std::to_string(b.vox0) + "->" +
                   std::to_string(b.vox1) + " vox";
   detail = s;
-  if (grew && ate && controlStill) return Status::Pass;
+  if (grew && ate && controlStill && gradual) return Status::Pass;
   if (!grew) detail = "the infection did not spread: " + s;
   else if (!ate) detail = "the infection took no voxels: " + s;
-  else detail = "the CONTROL arm moved with both rates at 0: " + s;
+  else if (!controlStill)
+    detail = "the CONTROL arm moved with both rates at 0: " + s;
+  else
+    detail = "the rot arrived in SLABS, not voxel by voxel (max " +
+             std::to_string(a.maxStep) + "/tick, ceiling " +
+             std::to_string(kMaxStep) + "): " + s;
   return Status::Fail;
 }
 

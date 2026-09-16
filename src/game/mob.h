@@ -1155,26 +1155,14 @@ struct MobLimb {
   // Never saved: a loaded body's rot is already in its lattice, and it heals
   // at the ordinary rate from then on rather than not at all.
   uint16_t infectMat = 0;
-  // ---- ...AND HOW MUCH OF IT IS OWED (Mob::InfectTick) ----------------------
-  //
-  // Fractional LATTICE voxels the infection has earned but not yet spent, one
-  // accumulator per half of the disease (gore.infectSpreadRate /
-  // gore.infectRotRate). They exist because the rates are authored in world
-  // voxels per MINUTE and the pass runs every tick: at the default 1 vox/min on
-  // a skinScale-8 limb that is 0.28 lattice voxels a tick, and rounding it to
-  // an integer each tick is either 0 forever or 8.5x too fast.
-  //
-  // Spent in BURSTS rather than the moment one whole voxel is owed. Every burst
-  // costs an O(limb) sweep and a dense index build, so converting one voxel at
-  // a time would pay that ~4 times a second for a change of 1/512th of a world
-  // voxel -- invisible, and precisely the "cost scales with activity" tax rule 2
-  // exists to refuse. The burst size scales with the lattice (see
-  // kInfectBurstShift), so a coarse limb still moves one voxel at a time.
-  //
-  // Never saved: a loaded body's rot is in its lattice, and it starts the next
-  // minute's clock from zero rather than owing the time it spent on disk.
-  float infectSpreadAcc = 0.0f;
-  float infectRotAcc = 0.0f;
+  // THE INFECTION CARRIES NO CLOCK STATE, deliberately. The first version held
+  // two fractional accumulators here and spent them in BURSTS of ~32 lattice
+  // voxels, to amortise the O(limb) sweep each conversion needs. That is a
+  // defensible cost argument and it produced a visibly wrong result: a third of
+  // a second's worth of rot appearing all at once, every few seconds, in one
+  // slab. A disease does not advance in steps. Mob::InfectTick now rolls an
+  // independent chance every tick instead and holds nothing between them -- see
+  // the note above that function for why the rate still comes out exact.
   // Per-voxel burning / dissolution (see BodyBurnState above).
   BodyBurnState burn;
   // What is ON this limb, recounted at a bounded cadence (see LimbCoat).
@@ -2690,10 +2678,10 @@ class Mob {
   // Returns false when that has happened and the caller must touch nothing.
   bool InfectTick(uint32_t tick, World& world,
                   std::vector<ParticleSpawn>& spawns);
-  // One limb's burst, once enough voxels are owed. Same return contract.
-  bool InfectBurst(int limbIndex, uint32_t tick, uint32_t nSpread,
-                   uint32_t nRot, World& world,
-                   std::vector<ParticleSpawn>& spawns);
+  // One limb, on a tick whose dice came up non-zero. Same return contract.
+  bool InfectStep(int limbIndex, uint32_t tick, uint32_t nSpread,
+                  uint32_t nRot, World& world,
+                  std::vector<ParticleSpawn>& spawns);
   // ...and the jump across a joint, when the limb has no tissue left to take.
   // Arms a rig-adjacent limb's `infectMat` and rewrites its `nSeed` voxels
   // nearest this one, so the rot appears at the joint rather than in the middle
