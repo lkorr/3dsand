@@ -7426,8 +7426,9 @@ bool Mob::Damage(uint64_t bodyHandle, float amount, Vec3 hitWorldVoxel,
     // A STRAP DOES NOT SNAP BECAUSE THE BLOW WAS FAST. The impact rule is the
     // sword-knocked-from-the-hand rule; a cuirass leaves by being cut through
     // (CarveLimb) or never.
-    const bool impactSevers = !IsWornSlot((int)i) && ld.severImpactSpeed > 0 &&
-                              impactBar > 0 && impactSpeed >= impactBar;
+    const bool impactSevers = !inBluntCarve_ && !IsWornSlot((int)i) &&
+                              ld.severImpactSpeed > 0 && impactBar > 0 &&
+                              impactSpeed >= impactBar;
     limb.hp -= amount;
     limb.woundLocal = RotateInv(q, hitWorldVoxel - limb.xf.pos);
     // ---- THE HIT FLASH ------------------------------------------------------
