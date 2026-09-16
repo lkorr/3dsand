@@ -873,6 +873,10 @@ bool LoadMobDefs(const std::string& dir, const std::vector<MaterialDef>& mats,
     // "no AI": the creature keeps the wander-and-avoid DecideIntent has always
     // had, so adding this system changed nothing about any existing sidecar.
     def.behavior = j.value("behavior", std::string());
+    // The pose held while pursuing, BY NAME, resolved against this rig's own
+    // clips below (MobDef::chaseClip). Absent = the creature chases in
+    // whatever pose it walks in, which is every def but the undead.
+    def.chaseClip = j.value("chaseClip", std::string());
 
     // Sound slots (assets/sound_schema.js). Presentation only, so a bad entry
     // is skipped rather than failing the def — a mob with a typo'd sound name
@@ -1596,6 +1600,13 @@ bool LoadMobDefs(const std::string& dir, const std::vector<MaterialDef>& mats,
         if (!rule.clip.empty() && sk.FindClip(rule.clip) < 0)
           log += jp + ": state \"" + rule.name + "\" names unknown clip \"" +
                  rule.clip + "\"\n";
+      // Same reason, one field over: a typo'd chaseClip would present as "the
+      // zombie chases with its arms down", which looks like a decision rather
+      // than a miss. Checked HERE and not at the loader line that reads it,
+      // because the library clips are only on the rig by this point.
+      if (!def.chaseClip.empty() && sk.FindClip(def.chaseClip) < 0)
+        log += jp + ": chaseClip names unknown clip \"" + def.chaseClip +
+               "\"\n";
 
       const json fbJson = j.contains("flipbooks") && j["flipbooks"].is_object()
                               ? j["flipbooks"]
@@ -5370,6 +5381,53 @@ void MobSystem::UpdateAnimation(Mob& mob, const MobDef& def, World& world,
   const AnimStateRule* loco =
       st.locoState >= 0 ? &sk.states[st.locoState] : nullptr;
   const bool clipOwnsPose = loco && loco->disableGait;
+
+  // ---- the chase pose: arms out while the dead come for you ----------------
+  // `MobDef::chaseClip` (zombie.json names `reach`). Held while the brain has
+  // a target and is doing something about it, dropped otherwise, and dropped
+  // for the duration of a strike: the clip is ADDITIVE, so leaving it on top
+  // of an authored punch or bite would add 80 degrees of shoulder to every
+  // blow. A dismemberment state that owns the pose outright (crawl, squirm)
+  // wins for the same reason it beats the gait swing.
+  //
+  // `Intent::Idle` is the whole of "not chasing" on purpose: every other verb
+  // in the set — approach, hold the band, circle, face, swing — is a creature
+  // engaged with something, and an undead that reached only while walking
+  // FORWARD would drop its arms the moment it arrived, which is exactly when
+  // the pose matters most.
+  if (!def.chaseClip.empty()) {
+    const int ci = sk.FindClip(def.chaseClip);
+    if (ci >= 0) {
+      const bool striking = mob.stroke_.Active() &&
+                            mob.stroke_.phase != NpcStroke::Phase::Guard;
+      const bool want = mob.ai_.hasTarget && !striking && !clipOwnsPose &&
+                        mob.ai_.intent != ai::Intent::Idle;
+      // Seconds to reach the pose, and to give it up. Fast enough that the
+      // arms are already down by the time a punch's own clip has blended in
+      // (0.09 s on the library strokes) without the snap a hard switch gives.
+      constexpr float kChasePoseRampS = 0.18f;
+      const float step = dt / kChasePoseRampS;
+      mob.chasePose_ = want ? std::min(1.0f, mob.chasePose_ + step)
+                            : std::max(0.0f, mob.chasePose_ - step);
+      if (mob.chasePose_ > 0.0f) {
+        // REVIVE BEFORE REQUESTING. PlayClipIndex skips an instance already
+        // marked `stopping` and appends a second one beside it, so a target
+        // re-acquired inside the blend-out would leave two of this clip
+        // stacked (avatar.cpp's airPose note is the same trap). Clearing the
+        // flag first makes the request a no-op on the instance we already own.
+        for (ClipInstance& inst : st.clips)
+          if (inst.clip == ci) { inst.stopping = false; inst.weight = mob.chasePose_; }
+        mob.PlayClipIndex(ci);   // no-op once the instance is running
+        for (ClipInstance& inst : st.clips)
+          if (inst.clip == ci) inst.weight = mob.chasePose_;
+      } else {
+        // Retire it at zero rather than leaving a weightless instance to be
+        // sampled every tick for the rest of the creature's life.
+        for (ClipInstance& inst : st.clips)
+          if (inst.clip == ci) inst.stopping = true;
+      }
+    }
+  }
 
   // ---- stages 1-3: sample active clips, blend, apply additives ----
   AnimSampleAndBlend(sk, st, dt);
@@ -10993,10 +11051,398 @@ void Mob::BurnTick(uint32_t tick, World& world, std::vector<CellOp>& cellOps,
     if (limbs_[li].burn.removed && !FlushBurn(li, world, spawns, false))
       return;
   }
+  // WHAT A ZOMBIE LEFT IN YOU, one tick older. Here rather than in its own
+  // caller so the player reaches it through the same seam an NPC does
+  // (PlayerAvatar::BurnParts -> here), and after the burn because both express
+  // themselves through FlushBurn and running them in one order everywhere is
+  // cheaper to reason about than two. May sever or kill, so the same return.
+  if (!InfectTick(tick, world, spawns)) return;
   // The burn cap (Gore §G). Recounted at a bounded cadence while the lattice
   // is changing and not at all while it is not; may kill the creature, and is
   // last here for the same reason FlushBurn returns above.
   RecountBurn(tick);
+}
+
+// ============================================================================
+// THE INFECTION IS ALIVE (2026-09-16, gore.infectSpreadRate / infectRotRate)
+//
+// Before this a bite's rot was a PICTURE. Mob::BiteHit rewrote the tissue the
+// tear exposed to the biter's `infectMat`, latched it on the limb, and that was
+// the end of it: on a creature whose wounds close it dried back at
+// gore.infectHealSlow, on an undead it did nothing at all, and on the player it
+// sat in the arm unchanged until something else killed them. Something a zombie
+// put in you that never gets any worse is not an infection, it is a tattoo.
+//
+// Two rates make it a clock, and they are deliberately the only two:
+//
+//   SPREAD  healthy tissue with rot against it becomes rot. Only MobDef::tissue
+//           voxels (bone stays bone; a worn shell is not the body and is
+//           excluded a slot earlier), and only the SIX-NEIGHBOURS of what is
+//           already infected, so the disease advances as a front out of the
+//           wound rather than appearing all over the limb. Pushed outward from
+//           the rotten set, never pulled by scanning for candidates -- the same
+//           shape, and the same reason, as the burn front.
+//
+//   ROT     infected voxels leave for good. Expressed as burn REMOVALS and
+//           flushed through FlushBurn, so the whole tail is CarveLimb's
+//           existing behaviour reached by a new cause: hp falls with the
+//           fraction of the limb that is gone, a limb eaten past
+//           kLimbCollapseFraction severs, a `vital` limb eaten through kills.
+//           There is no infection-specific death rule and there must not be.
+//
+// WHY IT EVENTUALLY KILLS YOU, which a per-limb disease otherwise would not:
+// when a limb has no tissue left to take, the spread JUMPS A JOINT into a
+// rig-adjacent limb (InfectAcrossJoint), preferring the parent. A bitten hand
+// saturates, goes up the forearm, the arm, and into the torso, which is vital.
+// That jump is parameter-free on purpose -- it is the condition "this limb is
+// full", not a third rate to keep in sync with the other two.
+//
+// COST (rule 2). A creature nothing has bitten pays one `infectMat != 0` test
+// per limb, forever. An infected limb pays a float add per tick and an O(limb)
+// sweep per BURST -- and the burst, not the tick, is the unit of work for the
+// reason the accumulators on MobLimb spell out: at the default rate on a
+// skinScale-8 limb one whole lattice voxel is owed every four ticks, and paying
+// an index build and a full sweep for 1/512th of a world voxel four times a
+// second is the exact tax rule 2 exists to refuse. The dense index is built
+// inside the burst and left to the burn pass's ordinary grace period to drop;
+// holding one open for every infected limb would be a permanent per-limb
+// allocation, which is the thing that rule forbids outright.
+//
+// NOT HASHED and never in the grid: this is CPU body state like every other
+// gore mechanic here, and nothing it does reaches a voxel the world hash reads.
+// ============================================================================
+
+namespace {
+
+// How big one burst is, as a shift on the lattice voxels in a world voxel. At
+// skinScale 8 that is 512 >> 4 = 32 sub-voxels, i.e. a sixteenth of a world
+// voxel -- below anything the eye resolves, which is the point: the burst is a
+// cost amortiser, not a visible step. Floored at 1 so a coarse limb (scale 1,
+// where a lattice voxel IS a world voxel) still moves one voxel at a time, and
+// capped so a cranked-up rate cannot make one burst walk the whole limb.
+constexpr uint32_t kInfectBurstShift = 4;
+constexpr uint32_t kInfectBurstMax = 64;
+
+}  // namespace
+
+bool Mob::InfectTick(uint32_t tick, World& world,
+                     std::vector<ParticleSpawn>& spawns) {
+  if (!alive_ || !def_ || !sys_) return true;
+  const auto& gt = CurrentTuning().gore;
+  if (gt.infectSpreadRate <= 0.0f && gt.infectRotRate <= 0.0f) return true;
+  // World voxels per MINUTE is the unit the question is asked in ("how long
+  // have I got"); the sim clock is a fixed 30 Hz, as everywhere else in this
+  // file.
+  const float perTick = 1.0f / (60.0f * 30.0f);
+  for (int li = 0; li < (int)limbs_.size(); li++) {
+    MobLimb& limb = limbs_[li];
+    if (limb.infectMat == 0) continue;
+    // A GARMENT AND A HELD SWORD ARE NOT ANATOMY. The same two exclusions
+    // StainWoundAs makes and for the same reason: both are borrowed rig slots,
+    // and rotting a sword is not a disease.
+    if (li >= baseLimbs_ || IsWornSlot(li) || !limb.body) continue;
+    // ...AND IN THIS LIMB'S OWN UNITS. A rate in world voxels converted with
+    // the limb's scale^3 makes a fine skin rot at the same PHYSICAL rate as a
+    // coarse one; using the rate as a lattice count directly would have made a
+    // skinScale-8 limb rot 512 times too slowly for the same authored number.
+    const uint32_t scale =
+        limb.HasFineSkin() ? SkinScaleOf(limb) : PhysScaleOf(limb);
+    const float lat = (float)scale * (float)scale * (float)scale;
+    limb.infectSpreadAcc += gt.infectSpreadRate * lat * perTick;
+    limb.infectRotAcc += gt.infectRotRate * lat * perTick;
+    const uint32_t burst = std::clamp((uint32_t)lat >> kInfectBurstShift, 1u,
+                                      kInfectBurstMax);
+    const float fburst = (float)burst;
+    if (limb.infectSpreadAcc < fburst && limb.infectRotAcc < fburst) continue;
+    // EITHER accumulator reaching the burst spends BOTH, down to their whole
+    // parts. One sweep answers both questions and the two rates are usually
+    // within a factor of a few of each other, so splitting them into separate
+    // bursts would double the cost to buy nothing.
+    uint32_t nSpread = 0, nRot = 0;
+    if (limb.infectSpreadAcc >= 1.0f) {
+      nSpread = (uint32_t)limb.infectSpreadAcc;
+      limb.infectSpreadAcc -= (float)nSpread;
+    }
+    if (limb.infectRotAcc >= 1.0f) {
+      nRot = (uint32_t)limb.infectRotAcc;
+      limb.infectRotAcc -= (float)nRot;
+    }
+    if (!InfectBurst(li, tick, nSpread, nRot, world, spawns)) return false;
+  }
+  return true;
+}
+
+bool Mob::InfectBurst(int li, uint32_t tick, uint32_t nSpread, uint32_t nRot,
+                      World& world, std::vector<ParticleSpawn>& spawns) {
+  MobLimb& limb = limbs_[li];
+  const uint32_t infect = (uint32_t)limb.infectMat & 0xFFFu;
+  BurnLimbView v = ViewOf(limb);
+  if (infect == 0 || v.Size() == 0) {
+    limb.infectMat = 0;
+    return true;
+  }
+  sys_->EnsureBurnIndex(v);
+  BodyBurnState& st = limb.burn;
+  // Refused (an absurd bounding box, see BuildBurnIndex). Not an error and not
+  // a cure: the owed voxels are still owed, and the next burst tries again.
+  if (st.idx.empty()) return true;
+  const IVec3 bm = st.min, bd = st.dims;
+  auto cellOf = [&](IVec3 p) -> uint32_t {
+    const int lx = p.x - bm.x, ly = p.y - bm.y, lz = p.z - bm.z;
+    if (lx < 0 || ly < 0 || lz < 0 || lx >= bd.x || ly >= bd.y || lz >= bd.z)
+      return kNoBurnCell;
+    return (uint32_t)(((size_t)lz * bd.y + ly) * bd.x + lx);
+  };
+  // Voxel index + 1, 0 for "nothing here". The queued bit is masked because the
+  // burn pass sets it on the shared index and this pass must read through it.
+  auto voxAt = [&](uint32_t c) -> uint32_t {
+    return c == kNoBurnCell ? 0u : (st.idx[c] & ~kBurnQueued);
+  };
+
+  // ---- ONE sweep: who is rotten --------------------------------------------
+  std::vector<uint32_t> rotten;
+  const size_t n = v.Size();
+  for (size_t i = 0; i < n; i++)
+    if ((v.Mat(i) & 0xFFFu) == infect) rotten.push_back((uint32_t)i);
+  if (rotten.empty()) {
+    // NOTHING LEFT TO SPREAD FROM. The rot ate everything it could reach on
+    // this limb (or a carve took the lot away with a chunk of arm), so the limb
+    // goes quiet and costs one test a tick again. Not a cure: whatever the
+    // spread already pushed across a joint is still going.
+    limb.infectMat = 0;
+    limb.infectSpreadAcc = limb.infectRotAcc = 0.0f;
+    return true;
+  }
+
+  // THE BRICK MUST BE OWNED BEFORE IT CAN BE POKED -- every instance of a def
+  // shares one packed model until something damages a particular body, so
+  // rotting one unowned would rot every creature of that species. Same
+  // copy-on-write, and the same three flags, as StainWoundAs and the burn.
+  MicroBodySet* micro = MicroSet();
+  bool poke = false;
+  auto ownBrick = [&]() {
+    if (poke || !micro || limb.microModel < 0) return;
+    const int own = MicroBodyOwn(*micro, (uint32_t)limb.microModel);
+    if (own < 0) return;  // pool full: the body rots, the skin stops keeping up
+    limb.microModel = own;
+    limb.carved = true;
+    limb.flipbookModel = -1;
+    poke = true;
+  };
+
+  uint32_t grown = 0, eaten = 0;
+
+  // ---- SPREAD: the tissue the rot is touching ------------------------------
+  if (nSpread > 0) {
+    const std::vector<uint8_t>& tissue = def_->tissue;
+    std::vector<uint32_t> cand;
+    for (uint32_t ri : rotten) {
+      const IVec3 p = v.At(ri);
+      for (const IVec3& d : kBurnDirs) {
+        const uint32_t j = voxAt(cellOf({p.x + d.x, p.y + d.y, p.z + d.z}));
+        if (j == 0) continue;
+        const uint32_t m = v.Mat(j - 1) & 0xFFFu;
+        if (m == 0 || m == infect) continue;
+        // SOFT TISSUE ONLY, out of the same MobDef::tissue table the wound soak
+        // reads: bone stays bone, and a charred or already-dissolved voxel is
+        // not meat either. One definition of "what a wound may rewrite", not
+        // two that agree until somebody edits one.
+        if (!tissue.empty() && (m >= tissue.size() || !tissue[m])) continue;
+        cand.push_back(j - 1);
+      }
+    }
+    std::sort(cand.begin(), cand.end());
+    cand.erase(std::unique(cand.begin(), cand.end()), cand.end());
+    if (!cand.empty()) {
+      ownBrick();
+      // A CONTIGUOUS RUN, not a scatter. The candidate list is in lattice
+      // storage order, so consecutive entries are spatially near each other and
+      // the rot advances as a patch; picking independently at random over the
+      // whole rim would speckle the limb with isolated green voxels, which is
+      // the same mistake the wound stain's correlated noise exists to avoid.
+      const size_t start =
+          Hash3((uint32_t)id_, tick, (uint32_t)li) % cand.size();
+      for (uint32_t k = 0; k < nSpread && k < cand.size(); k++) {
+        const size_t i = cand[(start + k) % cand.size()];
+        const IVec3 p = v.At(i);
+        const uint32_t rr = Hash3((uint32_t)i, tick, 0x9E3779B9u);
+        // DELIBERATELY NOT RECORDED IN `woundWas`. That table is what lets a
+        // soak dry BACK to the flesh it covered; an infection that undoes
+        // itself is the behaviour this whole pass replaces.
+        v.Set(i, infect, (rr >> 6) % 3u);
+        if (poke)
+          MicroBodyPoke(*micro, (uint32_t)limb.microModel, p.x, p.y, p.z,
+                        (uint8_t)infect, 0);
+        grown++;
+      }
+    }
+    // SATURATED: no tissue of this limb is touching the rot any more, so the
+    // spread it is owed goes across a joint instead of being dropped. This is
+    // what makes an untreated bite fatal (see the header note).
+    if (grown < nSpread)
+      grown += InfectAcrossJoint(li, tick, nSpread - grown);
+  }
+
+  // ---- ROT: what the infection takes away ----------------------------------
+  if (nRot > 0) {
+    // PREFER THE EXPOSED. A rotten voxel with an empty six-neighbour is on the
+    // surface of the wound, so eating it widens the hole the bite made; eating
+    // the interior first would hollow the limb out where nothing can see it and
+    // then collapse it with no warning. Falls back to the whole rotten set once
+    // the surface has gone, which is a limb rotted through.
+    std::vector<uint32_t> face;
+    for (uint32_t ri : rotten) {
+      const IVec3 p = v.At(ri);
+      for (const IVec3& d : kBurnDirs)
+        if (voxAt(cellOf({p.x + d.x, p.y + d.y, p.z + d.z})) == 0) {
+          face.push_back(ri);
+          break;
+        }
+    }
+    const std::vector<uint32_t>& pool = face.empty() ? rotten : face;
+    ownBrick();
+    const size_t start =
+        Hash3((uint32_t)id_ ^ 0x5B0Du, tick, (uint32_t)li) % pool.size();
+    for (uint32_t k = 0; k < nRot && k < pool.size(); k++) {
+      const uint32_t i = pool[(start + k) % pool.size()];
+      const IVec3 p = v.At(i);
+      v.Set(i, 0, 0);  // tombstone; FlushBurn compacts it away
+      const uint32_t c = cellOf(p);
+      if (c != kNoBurnCell) st.idx[c] = 0;  // gone NOW: neighbours see through
+      st.removed++;
+      // NOT `burntAway`. That counter feeds the burn cap (Mob::RecountBurn),
+      // and an infection eating an arm is not a burn -- counted, it would kill
+      // a rotting creature of "burns" with nothing ever having been alight, the
+      // same way acid did before BurnOneLimb learned the difference.
+      if (poke)
+        MicroBodyPoke(*micro, (uint32_t)limb.microModel, p.x, p.y, p.z, 0, 0);
+      eaten++;
+    }
+  }
+
+  if (grown || eaten) {
+    MarkInstancesDirty();
+    burnFracDirty_ = true;
+  }
+  // LAST, because it may sever the limb or kill the creature -- after which
+  // `limb`, `v` and `st` are all dangling and the caller must touch nothing.
+  if (eaten && limbs_[li].burn.removed &&
+      !FlushBurn(li, world, spawns, /*force=*/false))
+    return false;
+  return true;
+}
+
+uint32_t Mob::InfectAcrossJoint(int fromLimb, uint32_t tick, uint32_t nSeed) {
+  if (!def_ || nSeed == 0) return 0;
+  const int nl = std::min((int)limbs_.size(), (int)limbDefs_.size());
+  if (fromLimb < 0 || fromLimb >= nl) return 0;
+  const uint32_t infect = (uint32_t)limbs_[fromLimb].infectMat & 0xFFFu;
+  if (infect == 0) return 0;
+
+  // ---- who is next to me, by NAME -----------------------------------------
+  // The rig's adjacency is a parent string on each slot and nothing else keeps
+  // a resolved index; a dozen string compares once per saturation is cheaper
+  // than a second parent table that could disagree with the one the animation
+  // pipeline builds. `limbDefs_` rather than `def_->limbs` because this
+  // creature's rig is the one that has the worn and held slots appended to it.
+  const std::string& self = limbDefs_[fromLimb].name;
+  const std::string& up = limbDefs_[fromLimb].parent;
+  int parent = -1, child = -1;
+  for (int k = 0; k < nl; k++) {
+    if (k == fromLimb || k >= baseLimbs_ || IsWornSlot(k)) continue;
+    if (!limbs_[k].body || limbs_[k].infectMat != 0) continue;
+    if (!up.empty() && limbDefs_[k].name == up) parent = k;
+    else if (!self.empty() && limbDefs_[k].parent == self && child < 0) child = k;
+  }
+  // PARENT FIRST. Walking UP the rig is what carries a bitten hand to the
+  // torso, which is `vital` and is the reason an untreated bite is fatal; a
+  // child is the fallback for a limb bitten at the extremity end of the chain.
+  const int to = parent >= 0 ? parent : child;
+  if (to < 0) return 0;
+
+  MobLimb& dst = limbs_[to];
+  const bool fine = dst.HasFineSkin();
+  const uint32_t scale = fine ? SkinScaleOf(dst) : PhysScaleOf(dst);
+  const size_t n = fine ? dst.skinVoxels.size() : dst.voxels.size();
+  if (n == 0) return 0;
+
+  // ---- WHERE THEY TOUCH ----------------------------------------------------
+  // The rot has to appear AT THE JOINT, not in the middle of the next limb.
+  // Distance ordering survives a rigid transform, so the source limb's centre
+  // is brought into the destination's own lattice frame once and every
+  // comparison below is a subtract and a dot in lattice units -- no per-voxel
+  // rotation, and no world-space vector to keep in sync with the pose.
+  const MobLimb& src = limbs_[fromLimb];
+  const Quat sq{src.xf.quat[0], src.xf.quat[1], src.xf.quat[2], src.xf.quat[3]};
+  const float sinv = 1.0f / (float)std::max(1u, PhysScaleOf(src));
+  const Vec3 srcCentre =
+      src.xf.pos + Rotate(sq, Vec3{(float)src.size.x * 0.5f * sinv,
+                                   (float)src.size.y * 0.5f * sinv,
+                                   (float)src.size.z * 0.5f * sinv});
+  const Quat dq{dst.xf.quat[0], dst.xf.quat[1], dst.xf.quat[2], dst.xf.quat[3]};
+  const Vec3 ref = RotateInv(dq, srcCentre - dst.xf.pos) * (float)scale;
+
+  const std::vector<uint8_t>& tissue = def_->tissue;
+  std::vector<std::pair<float, uint32_t>> nearest;
+  nearest.reserve(n);
+  for (size_t i = 0; i < n; i++) {
+    const uint32_t m =
+        fine ? (uint32_t)(dst.skinVoxels[i].material & 0xFFFu)
+             : (uint32_t)(dst.voxels[i].payload & 0xFFFu);
+    if (m == 0 || m == infect) continue;
+    if (!tissue.empty() && (m >= tissue.size() || !tissue[m])) continue;
+    const IVec3 p = fine ? IVec3{dst.skinVoxels[i].x, dst.skinVoxels[i].y,
+                                 dst.skinVoxels[i].z}
+                         : IVec3{dst.voxels[i].x, dst.voxels[i].y,
+                                 dst.voxels[i].z};
+    const Vec3 d{(float)p.x + 0.5f - ref.x, (float)p.y + 0.5f - ref.y,
+                 (float)p.z + 0.5f - ref.z};
+    nearest.push_back({d.dot(d), (uint32_t)i});
+  }
+  if (nearest.empty()) return 0;  // the next limb is bone, or already all rot
+  const size_t take = std::min<size_t>(nSeed, nearest.size());
+  std::nth_element(nearest.begin(), nearest.begin() + (take - 1), nearest.end(),
+                   [](const std::pair<float, uint32_t>& a,
+                      const std::pair<float, uint32_t>& b) {
+                     return a.first < b.first;
+                   });
+
+  MicroBodySet* micro = MicroSet();
+  bool poke = false;
+  if (micro && dst.microModel >= 0) {
+    const int own = MicroBodyOwn(*micro, (uint32_t)dst.microModel);
+    if (own >= 0) {
+      dst.microModel = own;
+      dst.carved = true;
+      dst.flipbookModel = -1;
+      poke = true;
+    }
+  }
+  for (size_t k = 0; k < take; k++) {
+    const uint32_t i = nearest[k].second;
+    const uint32_t rr = Hash3((uint32_t)i, tick, 0xB17Eu);
+    const uint16_t w = (uint16_t)(infect | (((rr >> 6) % 3u) << 12));
+    IVec3 p;
+    if (fine) {
+      dst.skinVoxels[i].material = w;
+      dst.skinVoxels[i].color = 0;
+      p = {dst.skinVoxels[i].x, dst.skinVoxels[i].y, dst.skinVoxels[i].z};
+    } else {
+      dst.voxels[i].payload = w;
+      dst.voxels[i].color = 0;
+      p = {dst.voxels[i].x, dst.voxels[i].y, dst.voxels[i].z};
+    }
+    if (poke)
+      MicroBodyPoke(*micro, (uint32_t)dst.microModel, p.x, p.y, p.z,
+                    (uint8_t)infect, 0);
+  }
+  // THE LATCH IS WHAT MAKES IT A LIMB THE PASS VISITS. Without it the voxels
+  // would be rot the disease had forgotten about: dead art, spreading nowhere.
+  dst.infectMat = (uint16_t)infect;
+  // The destination's dense index, if it has one, needs no fixing up: it is an
+  // occupancy map from position to voxel INDEX, and a rewrite changes neither.
+  MarkInstancesDirty();
+  return (uint32_t)take;
 }
 
 // ============================================================================

@@ -2223,6 +2223,30 @@ void Overlay::Draw(UIState& s) {
                   "flesh to (the biter's infection). Larger = rot stays\n"
                   "longer. On undead whose wounds don't heal, rot never\n"
                   "goes away regardless.");
+            ImGui::TextDisabled("the infection is alive");
+            f("infection spread (vox/min)", &g.infectSpreadRate, 0.0f, 20.0f,
+              "%.2f");
+            if (ImGui::IsItemHovered())
+              ImGui::SetTooltip(
+                  "How fast the rot GROWS, in world voxels a minute, per\n"
+                  "infected limb. It converts healthy tissue next to\n"
+                  "itself — soft tissue only, bone stays bone — so it\n"
+                  "creeps out from the wound as a front. A limb with no\n"
+                  "tissue left crosses a JOINT into the next limb, which\n"
+                  "is how a bitten hand eventually reaches the torso.\n"
+                  "0 = a bite is a static mark again.");
+            f("rot / disintegration (vox/min)", &g.infectRotRate, 0.0f, 20.0f,
+              "%.2f");
+            if (ImGui::IsItemHovered())
+              ImGui::SetTooltip(
+                  "How fast the rot EATS you, in world voxels a minute,\n"
+                  "per infected limb. Infected voxels evaporate for good.\n"
+                  "Charged through the ordinary burn flush: hp falls with\n"
+                  "the fraction of the limb that is gone, a limb eaten\n"
+                  "past collapse comes off, a vital limb eaten through\n"
+                  "kills. Below the spread rate the infection grows while\n"
+                  "you shrink — an untreated bite is fatal. 0 = spreads\n"
+                  "but never consumes.");
           }
           if (ImGui::CollapsingHeader("Armour vs blunt/bite")) {
             Tuning::Gear& gr = t.gear;

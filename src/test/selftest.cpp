@@ -441,7 +441,7 @@ const char* const kOrder[] = {
     // creature, hit it, reset" shape. Each regenerates worldgen on the way in
     // and resets mobs and debris on every exit, and each restores the id
     // counter (mob ids seed gore variance).
-    "impact-blunt", "impact-armor", "impact-fist", "bite-rot",
+    "impact-blunt", "impact-armor", "impact-fist", "bite-rot", "bite-infect",
     // ...and a corpse that died alight keeps burning: every piece advances
     // its embers, keeps emitting fire, and its brick agrees with its lattice
     // (owner report 2026-09-02: the corpse pulsed at its death colour for

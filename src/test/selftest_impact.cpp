@@ -1095,6 +1095,140 @@ Status GateBiteRot(Ctx& c, std::string& detail) {
   return ok ? Status::Pass : Status::Fail;
 }
 
+// ---------------------------------------------------------------------------
+// bite-infect — the rot a bite leaves GROWS, and it EATS the limb
+// ---------------------------------------------------------------------------
+//
+// `bite-rot` above asserts the tear and the rewrite: that a bite leaves rotten
+// flesh behind and that armour refuses it. It says nothing about what happens
+// NEXT, and until 2026-09-16 the answer was "nothing at all" -- the rewrite sat
+// at exactly the size the teeth left it, forever.
+//
+// A DIFFERENTIAL WITH A DATA-ONLY CONTROL ARM. Both arms bite the same limb of
+// the same creature with the same seed and then run the same number of ticks;
+// the ONLY difference is that arm B sets both rates to 0, which is the shipped
+// "off" switch and therefore also the pre-feature engine. So a difference in
+// the reading can only be the pass, and a broken pass cannot pass by accident:
+// arm A's assertions are the exact statements arm B is asserted to contradict.
+//
+// RATES, NOT THE DEFAULTS. At the shipped 1.0 / 0.5 vox/min this gate would
+// have to run for minutes; it cranks both and asserts the DIRECTION, because
+// the amount is a tuning question and pinning it would make every retune a
+// gate failure. What is bounded on purpose is the rot: hard enough to be
+// unmistakable, gentle enough that the limb does not collapse-sever inside the
+// window -- a gate whose fixture is destroyed before it measures reports a
+// correct measurement of nothing (see arm A of `bite-rot` for the last time
+// that happened here).
+Status GateBiteInfect(Ctx& c, std::string& detail) {
+  MobSystem& mobs = c.mobs;
+  IdCounterScope idScope(mobs);
+  PrepareWorld(c);
+  const Target t = ChooseTarget(mobs, FixtureSite(c.world, 405));
+  if (!t.valid()) {
+    detail = "no loaded mob def has a severable non-vital limb that bleeds";
+    return Status::Fail;
+  }
+  const uint32_t rotMat = c.mobs.MaterialIdNamed("rotflesh");
+  const uint32_t ichor = c.mobs.MaterialIdNamed("ichor");
+  if (!rotMat || !ichor) {
+    detail = "materials.json has no `rotflesh` / `ichor`";
+    return Status::Skip;
+  }
+
+  const Tuning saved = CurrentTuning();
+  const int kTicks = (int)BaselineNumber("biteInfectTicks", 300);
+  const float kSpread = (float)BaselineNumber("biteInfectSpread", 6.0);
+  const float kRot = (float)BaselineNumber("biteInfectRot", 2.0);
+
+  struct Run {
+    uint32_t rot0 = 0, rot1 = 0;   // infected voxels, after the bite / after
+    uint32_t vox0 = 0, vox1 = 0;   // the limb's art voxels, same two moments
+    uint32_t elsewhere = 0;        // rot on OTHER limbs at the end (the jump)
+    bool attached = false;
+  };
+  auto run = [&](float spread, float rot, int inset) {
+    Run r;
+    Tuning tt = saved;
+    tt.gore.infectSpreadRate = spread;
+    tt.gore.infectRotRate = rot;
+    SetCurrentTuning(tt);
+    std::vector<ParticleSpawn> spawns;
+    const uint64_t id = SpawnTarget(c, t, inset);
+    if (!id) { SetCurrentTuning(saved); return r; }
+    const LimbAxis ax = MeasureLimb(mobs, id, t.limb);
+    const Vec3 at = ax.anchor + ax.along * (ax.reach * 0.5f);
+    BiteOnce(mobs, c.world, id, t.limb, at, 4.0f, (uint16_t)rotMat,
+             (uint16_t)ichor, 0.85f, 0xB17Eu, spawns);
+    r.rot0 = mobs.LimbMaterialCount(id, t.limb, rotMat);
+    r.vox0 = mobs.LimbArtVoxelCount(id, t.limb);
+    uint32_t tick = 40000;
+    for (int i = 0; i < kTicks; i++) {
+      if (!mobs.LimbBody(id, t.limb)) break;
+      std::vector<BrushOp> ops;
+      std::vector<CellOp> cellOps;
+      spawns.clear();
+      mobs.PreTick(tick++, c.world, ops, cellOps, spawns);
+      // Kept from the last tick the limb was STILL ON, for arm A of
+      // `bite-rot`'s reason: reading after a collapse measures a stump.
+      r.rot1 = mobs.LimbMaterialCount(id, t.limb, rotMat);
+      r.vox1 = mobs.LimbArtVoxelCount(id, t.limb);
+    }
+    r.attached = mobs.LimbBody(id, t.limb) != 0;
+    // The JOINT JUMP, observed and deliberately not asserted: whether it fires
+    // inside this window depends on how fast the bitten limb saturates, which
+    // is the one number here that is properly a tuning question.
+    if (const Mob* m = mobs.FindMobById(id))
+      for (int li = 0; li < m->LimbCount(); li++)
+        if (li != t.limb) r.elsewhere += mobs.LimbMaterialCount(id, li, rotMat);
+    mobs.Reset();
+    c.debris.Reset();
+    SetCurrentTuning(saved);
+    return r;
+  };
+
+  const Run a = run(kSpread, kRot, 415);
+  const Run b = run(0.0f, 0.0f, 425);
+  SetCurrentTuning(saved);
+
+  RecordObserved("biteInfectRotAfterBite", (double)a.rot0);
+  RecordObserved("biteInfectRotGrown", (double)a.rot1);
+  RecordObserved("biteInfectVoxelsEaten",
+                 (double)(a.vox0 - std::min(a.vox0, a.vox1)));
+  RecordObserved("biteInfectAcrossJoint", (double)a.elsewhere);
+  RecordObserved("biteInfectControlRot", (double)b.rot1);
+  RecordObserved("biteInfectControlVoxels",
+                 (double)(b.vox0 - std::min(b.vox0, b.vox1)));
+
+  if (a.rot0 == 0) {
+    detail = "the bite left no infection at all — this is `bite-rot`'s job";
+    return Status::Fail;
+  }
+  // 1. IT GROWS. More of the limb is rotten than the teeth made rotten.
+  const bool grew = a.rot1 > a.rot0;
+  // 2. IT EATS. Voxels really left the limb, and the limb is still attached —
+  //    a severed limb would be a different (and much cruder) claim.
+  const bool ate = a.vox1 < a.vox0;
+  // 3. ...AND NEITHER HAPPENS WITH THE RATES AT 0, which is what makes 1 and 2
+  //    statements about this pass rather than about the bite, the burn, or
+  //    anything else PreTick does to a creature for 300 ticks.
+  const bool controlStill = b.rot1 <= b.rot0 && b.vox1 >= b.vox0;
+
+  std::string s = "grew " + std::to_string(a.rot0) + "->" +
+                  std::to_string(a.rot1) + " rot, ate " +
+                  std::to_string(a.vox0 - std::min(a.vox0, a.vox1)) +
+                  " vox (limb " + (a.attached ? "on" : "OFF") + ", " +
+                  std::to_string(a.elsewhere) + " across joints); control " +
+                  std::to_string(b.rot0) + "->" + std::to_string(b.rot1) +
+                  " rot, " + std::to_string(b.vox0) + "->" +
+                  std::to_string(b.vox1) + " vox";
+  detail = s;
+  if (grew && ate && controlStill) return Status::Pass;
+  if (!grew) detail = "the infection did not spread: " + s;
+  else if (!ate) detail = "the infection took no voxels: " + s;
+  else detail = "the CONTROL arm moved with both rates at 0: " + s;
+  return Status::Fail;
+}
+
 }  // namespace
 
 const std::vector<Gate>& ImpactGates() {
@@ -1103,6 +1237,7 @@ const std::vector<Gate>& ImpactGates() {
       {"impact-armor", "mob", {}, false, GateImpactArmor, false},
       {"impact-fist", "mob", {}, false, GateImpactFist, false},
       {"bite-rot", "mob", {}, false, GateBiteRot, false},
+      {"bite-infect", "mob", {}, false, GateBiteInfect, false},
   };
   return g;
 }

@@ -877,6 +877,14 @@ bool LoadTuning(const std::string& path, Tuning& out) {
     // make rot decay FASTER than the puddle rule it is dividing, and 0 is a
     // division by zero rather than "never heals" (that is `woundHeals` off).
     e.infectHealSlow = std::clamp(e.infectHealSlow, 1.0f, 512.0f);
+    ReadF(*g, "infectSpreadRate", e.infectSpreadRate, out, at);
+    ReadF(*g, "infectRotRate", e.infectRotRate, out, at);
+    // Ceilings rather than taste, and the same one for both: a rate past a
+    // human body's worth of voxels a minute stops being a disease and becomes a
+    // dissolve, and the pass's per-burst work scales with it. 0 is meaningful on
+    // either (see the note in tuning.h) so neither has a floor above it.
+    e.infectSpreadRate = std::clamp(e.infectSpreadRate, 0.0f, 240.0f);
+    e.infectRotRate = std::clamp(e.infectRotRate, 0.0f, 240.0f);
     // ---- F. blood is health / G. burns cap health (game/mob.h) -------------
     ReadF(*g, "bleedHpPerVoxel", e.bleedHpPerVoxel, out, at);
     ReadB(*g, "stumpBleedsOpen", e.stumpBleedsOpen, out, at);
@@ -3064,6 +3072,8 @@ bool SaveCombatTuning(const std::string& path, const Tuning& t,
     put("biteBlob", g.biteBlob);
     put("biteStainScale", g.biteStainScale);
     put("infectHealSlow", g.infectHealSlow);
+    put("infectSpreadRate", g.infectSpreadRate);
+    put("infectRotRate", g.infectRotRate);
   }
   if (group("gear", lo, hi)) {
     const Tuning::Gear& gr = t.gear;

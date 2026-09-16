@@ -1306,6 +1306,47 @@ struct Tuning {
     // flesh to (MobLimb::infectMat), on a creature whose wounds heal at all --
     // in an undead, whose do not, rot never goes away, which is the point.
     float infectHealSlow = 6.0f;
+    // ---- AN INFECTION IS ALIVE, AND IT IS EATING YOU ------------------------
+    //
+    // Until 2026-09-16 a bite's rot was a PICTURE: `infectMat` rewrote the
+    // tissue the tear exposed and then sat there, the same shape forever, on a
+    // creature whose wounds heal at all it dried back and on an undead it did
+    // nothing. Something a zombie put in you that never got any worse is not an
+    // infection, it is a tattoo.
+    //
+    // These two rates are what make it a CLOCK (Mob::InfectTick). Both are in
+    // WORLD VOXELS PER MINUTE and both are charged PER INFECTED LIMB, so being
+    // bitten five times really is five times the disease:
+    //
+    //   SPREAD  converts healthy tissue next to the rot into more rot. Only
+    //           MobDef::tissue voxels -- bone stays bone, a worn shell is not
+    //           the body -- and only the six-neighbours of what is already
+    //           infected, so it grows as a front from the wound rather than
+    //           appearing all over. When a limb has no tissue left to take it
+    //           crosses a JOINT into a rig-adjacent limb, which is the whole
+    //           reason an untreated bite on the hand eventually reaches the
+    //           torso and kills. That jump is parameter-free on purpose: it is
+    //           "the limb is full", not a second rate to keep in sync.
+    //
+    //   ROT     takes infected voxels away for good -- the ichor evaporates,
+    //           the hole is real. Expressed through the ordinary burn flush, so
+    //           hp falls with the fraction of the limb that is gone, a limb
+    //           eaten past kLimbCollapseFraction comes off, and a `vital` limb
+    //           eaten through kills, with no death rule of its own.
+    //
+    // SPREAD ABOVE ROT IS A DISEASE; ROT ABOVE SPREAD IS A SCAB. At the
+    // defaults the infected mass grows half a voxel a minute while half a voxel
+    // a minute of the creature leaves, which is slow enough to be a background
+    // dread over a session and fast enough to be fatal if nothing is done. 0 on
+    // either is the old static behaviour of that half.
+    //
+    // RATE, NOT CHANCE, and per minute rather than per tick, because that is
+    // the unit the question is actually asked in ("how long have I got"). The
+    // pass converts to lattice voxels per tick with the limb's own scale^3, so
+    // a fine skin rots at the same PHYSICAL rate as a coarse one instead of 512
+    // times slower.
+    float infectSpreadRate = 1.0f;  // world voxels/minute, per infected limb
+    float infectRotRate = 0.5f;     // world voxels/minute, per infected limb
 
     // ========================================================================
     // F. BLOOD IS HEALTH — every drop that leaves a body is hp leaving it

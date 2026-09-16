@@ -503,6 +503,15 @@ struct MobDef {
   // every other cross-asset reference in this engine (CLAUDE.md design rule 4).
   // Empty = no AI: the creature keeps the legacy wander-and-avoid.
   std::string behavior;
+  // THE POSE A CREATURE HOLDS WHILE IT IS COMING FOR YOU. A clip name (sidecar
+  // or assets/anims), played by MobSystem::UpdateAnimation whenever the brain
+  // has a target and is not idling, and weight-ramped down to nothing when it
+  // does not — see Mob::chasePose_. Empty on every def but the undead, which is
+  // the point: "arms outstretched" is a zombie's ANIMATION and not a zombie's
+  // special case in code, so anything else that should stalk with a held pose
+  // (a charging beast lowering its head) names its own clip and costs no C++.
+  // Additive clips compose with the gait, so the body still shambles under it.
+  std::string chaseClip;
 
   const std::string& Sound(const char* slot) const {
     static const std::string kNone;
@@ -1146,6 +1155,26 @@ struct MobLimb {
   // Never saved: a loaded body's rot is already in its lattice, and it heals
   // at the ordinary rate from then on rather than not at all.
   uint16_t infectMat = 0;
+  // ---- ...AND HOW MUCH OF IT IS OWED (Mob::InfectTick) ----------------------
+  //
+  // Fractional LATTICE voxels the infection has earned but not yet spent, one
+  // accumulator per half of the disease (gore.infectSpreadRate /
+  // gore.infectRotRate). They exist because the rates are authored in world
+  // voxels per MINUTE and the pass runs every tick: at the default 1 vox/min on
+  // a skinScale-8 limb that is 0.28 lattice voxels a tick, and rounding it to
+  // an integer each tick is either 0 forever or 8.5x too fast.
+  //
+  // Spent in BURSTS rather than the moment one whole voxel is owed. Every burst
+  // costs an O(limb) sweep and a dense index build, so converting one voxel at
+  // a time would pay that ~4 times a second for a change of 1/512th of a world
+  // voxel -- invisible, and precisely the "cost scales with activity" tax rule 2
+  // exists to refuse. The burst size scales with the lattice (see
+  // kInfectBurstShift), so a coarse limb still moves one voxel at a time.
+  //
+  // Never saved: a loaded body's rot is in its lattice, and it starts the next
+  // minute's clock from zero rather than owing the time it spent on disk.
+  float infectSpreadAcc = 0.0f;
+  float infectRotAcc = 0.0f;
   // Per-voxel burning / dissolution (see BodyBurnState above).
   BodyBurnState burn;
   // What is ON this limb, recounted at a bounded cadence (see LimbCoat).
@@ -2649,6 +2678,28 @@ class Mob {
                  std::vector<ParticleSpawn>& spawns, bool force);
   void StripBurnTombstones(MobLimb& limb);
 
+  // ---- the infection's clock (gore.infectSpreadRate / infectRotRate) --------
+  //
+  // Runs at the tail of BurnTick, so the player reaches it through exactly the
+  // same seam an NPC does (PlayerAvatar::BurnParts -> Mob::BurnTick). Costs one
+  // `infectMat != 0` test per limb on a creature nothing has bitten, which is
+  // every creature in the world until a zombie gets its teeth into one.
+  //
+  // MAY RESHAPE limbs_: the rot's removals go out through FlushBurn, which
+  // expresses itself as a carve and can sever the limb or kill the creature.
+  // Returns false when that has happened and the caller must touch nothing.
+  bool InfectTick(uint32_t tick, World& world,
+                  std::vector<ParticleSpawn>& spawns);
+  // One limb's burst, once enough voxels are owed. Same return contract.
+  bool InfectBurst(int limbIndex, uint32_t tick, uint32_t nSpread,
+                   uint32_t nRot, World& world,
+                   std::vector<ParticleSpawn>& spawns);
+  // ...and the jump across a joint, when the limb has no tissue left to take.
+  // Arms a rig-adjacent limb's `infectMat` and rewrites its `nSeed` voxels
+  // nearest this one, so the rot appears at the joint rather than in the middle
+  // of the next limb. Returns the number of limbs it lit (0 or 1).
+  uint32_t InfectAcrossJoint(int fromLimb, uint32_t tick, uint32_t nSeed);
+
   // Shared services, borrowed from MobSystem (burn tables, micro pool,
   // material tables, event sinks). Never null on a spawned creature.
   MicroBodySet* MicroSet() const;
@@ -2958,6 +3009,16 @@ class Mob {
   WeaponPose weapon_{};
   // The authored attack this creature is executing, if any (game/strokes.h).
   NpcStroke stroke_{};
+  // HOW MUCH OF `MobDef::chaseClip` IS ON RIGHT NOW, 0..1, ramped in
+  // MobSystem::UpdateAnimation. A weight and not a start/stop, because the
+  // pose has to come off INSTANTLY-ish for a strike (an additive hold summed
+  // onto an authored punch is a corrupted punch) and back on after it, and a
+  // clip retired and restarted twice a second never gets past a fraction of
+  // its blend-in — the same mechanism the walk/run hysteresis note in
+  // avatar.cpp describes, which is what "arms held out stiff" was the first
+  // time round. Driving the instance's `weight` instead keeps one instance
+  // alive for the whole pursuit and moves only the number.
+  float chasePose_ = 0;
   float weaponWeight_ = 0;     // weapon_.weight, clamped once on the way in
   mutable WeaponArmDiag weaponDiag_{};
   mutable AimDiag aimDiag_{};
@@ -3951,6 +4012,19 @@ class MobSystem {
                    std::vector<CellOp>& cellOps, uint32_t& frontBudget,
                    uint32_t& opsBudget);
   uint32_t IgniteOneLimb(BurnLimbView& v, uint32_t count, uint32_t onlyMat);
+  // The dense lattice index, on demand. The infection pass (Mob::InfectBurst)
+  // needs the same position -> voxel map the burn does, and for the same two
+  // jobs: asking what a voxel's six neighbours are, and handing FlushBurn the
+  // set of cells a removal cleared. Building it is MobSystem's, exactly as it
+  // is for the burn — there is one index and one builder, not two that agree
+  // until the lattice layout changes.
+  //
+  // NOT held open. The caller builds it inside a burst and lets the burn pass's
+  // ordinary grace period drop it again; pinning it for every infected limb
+  // would be the permanent per-limb allocation rule 2 forbids.
+  void EnsureBurnIndex(BurnLimbView& v) {
+    if (v.burn && v.burn->idx.empty()) BuildBurnIndex(v);
+  }
   // True once the reaction mirror has been built. A caller with no tables must
   // not burn: it would silently do nothing rather than fail.
   bool BurnTablesReady() const { return !reactions_.empty() && !matGpu_.empty(); }
