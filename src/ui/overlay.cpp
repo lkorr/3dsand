@@ -1623,7 +1623,7 @@ void Overlay::Draw(UIState& s) {
 
       if (ImGui::Button("Save")) s.combatSave = true;
       ImGui::SameLine();
-      ImGui::TextDisabled("patches melee/combatfx/gore in tuning.json");
+      ImGui::TextDisabled("patches melee/combatfx/gore/gear in tuning.json");
       if (!s.combatSaveStatus.empty()) {
         ImGui::SameLine();
         ImGui::TextDisabled("%s", s.combatSaveStatus.c_str());
@@ -1815,6 +1815,21 @@ void Overlay::Draw(UIState& s) {
               }
             }
           }
+          if (ImGui::CollapsingHeader("Guard position")) {
+            f("fallback reach (m)", &m.fallbackReachM, 0.1f, 1.5f, "%.2f");
+            f("guard forward (m)", &m.guardForwardM, 0.0f, 0.6f, "%.2f");
+            f("guard up (m)", &m.guardUpM, 0.0f, 0.6f, "%.2f");
+            f("guard side (m)", &m.guardSideM, 0.0f, 0.6f, "%.2f");
+          }
+          if (ImGui::CollapsingHeader("Aim body binding")) {
+            f("aim yaw (deg)", &m.aimYaw, 0.0f, 180.0f, "%.0f");
+            f("aim release yaw (deg)", &m.aimReleaseYaw, 0.0f, 180.0f, "%.0f");
+            if (ImGui::IsItemHovered())
+              ImGui::SetTooltip(
+                  "How far the camera may lead the body before the swing\n"
+                  "fades to the body's own forward. 180 = old behaviour\n"
+                  "(camera IS the basis wherever it looks).");
+          }
           ImGui::EndChild();
           ImGui::EndTabItem();
         }
@@ -1899,7 +1914,68 @@ void Overlay::Draw(UIState& s) {
             ImGui::TextDisabled("every drop is hp (Mob::DrainBlood)");
             f("hp per blood voxel", &g.bleedHpPerVoxel, 0.0f, 5.0f, "%.2f");
             ImGui::Checkbox("stumps never close", &g.stumpBleedsOpen);
-            ImGui::TextDisabled("the rest of gore.* is in the browser tuner");
+          }
+          if (ImGui::CollapsingHeader("Wound stain shape")) {
+            f("surface spread", &g.woundStainSurface, 0.0f, 2.0f, "%.2f");
+            f("blob size", &g.woundStainBlob, 0.0f, 4.0f, "%.2f");
+            f("coherence", &g.woundStainCoherence, 0.0f, 1.0f, "%.2f");
+            f("crater rim stain", &g.craterStainRim, 0.0f, 4.0f, "%.2f");
+          }
+          if (ImGui::CollapsingHeader("Wound healing")) {
+            b("wounds heal", &g.woundHeals);
+            f("heal slow factor", &g.woundHealSlow, 0.5f, 20.0f, "%.1f");
+            f("corpse bleed/voxel", &g.corpseBleedPerVoxel, 0.0f, 8.0f, "%.2f");
+          }
+          if (ImGui::CollapsingHeader("Blunt and bruise",
+                                      ImGuiTreeNodeFlags_DefaultOpen)) {
+            ImGui::TextDisabled("a punch, a mace, a pommel — the non-edge half");
+            f("bruise radius (vox)", &g.bruiseRadius, 0.0f, 4.0f, "%.2f");
+            f("bruise step (per hit)", &g.bruiseStep, 0.5f, 15.0f, "%.1f");
+            f("bruise ceiling", &g.bruiseMax, 1.0f, 15.0f, "%.1f");
+            f("bruise->bleed chance", &g.bruiseBleedChance, 0.0f, 1.0f, "%.2f");
+            if (ImGui::IsItemHovered())
+              ImGui::SetTooltip(
+                  "Per-voxel chance a blow lays BLOOD over a voxel already\n"
+                  "at the bruise ceiling. 0 = bruises stay dry forever.");
+            f("blunt bleed scale", &g.bluntBleedScale, 0.0f, 1.0f, "%.2f");
+            if (ImGui::IsItemHovered())
+              ImGui::SetTooltip(
+                  "Fraction of a cut's drip budget that blunt trauma uses.\n"
+                  "0 = maces are dry; 1 = bleeds like a sword.");
+            f("blunt carve radius (vox)", &g.bluntCarveRadius, 0.0f, 4.0f, "%.2f");
+          }
+          if (ImGui::CollapsingHeader("Bite")) {
+            f("bite radius (vox)", &g.biteRadius, 0.0f, 2.0f, "%.2f");
+            f("bite blob size", &g.biteBlob, 0.5f, 8.0f, "%.1f");
+            f("bite stain scale", &g.biteStainScale, 0.0f, 4.0f, "%.1f");
+            f("infection heal slow", &g.infectHealSlow, 0.5f, 20.0f, "%.1f");
+          }
+          if (ImGui::CollapsingHeader("Armour vs blunt/bite")) {
+            Tuning::Gear& gr = t.gear;
+            ImGui::TextDisabled("shell hardness interaction");
+            f("ruined condition", &gr.ruinedCondition, 0.05f, 0.95f, "%.2f");
+            f("cut hardness ref", &gr.cutHardnessRef, 1.0f, 255.0f, "%.0f");
+            f("cut hardness floor", &gr.cutHardnessMin, 0.0f, 1.0f, "%.3f");
+            ImGui::TextDisabled("blunt: mace vs plate");
+            f("dent radius (vox)", &gr.bluntDentRadius, 0.0f, 8.0f, "%.1f");
+            f("blunt hardness ref", &gr.bluntHardnessRef, 1.0f, 255.0f, "%.0f");
+            f("blunt hardness floor", &gr.bluntHardnessMin, 0.0f, 1.0f, "%.3f");
+            f("blunt pass-through", &gr.bluntThrough, 0.0f, 1.0f, "%.2f");
+            if (ImGui::IsItemHovered())
+              ImGui::SetTooltip(
+                  "Fraction of a blunt blow's hp that reaches the limb\n"
+                  "under the shell, as trauma. This is the number that\n"
+                  "says plate stops swords but maces go through.");
+            f("blunt shell hp cost", &gr.bluntShellHp, 0.0f, 2.0f, "%.2f");
+            ImGui::TextDisabled("bite vs armour");
+            f("bite on shell (frac)", &gr.biteOnShell, 0.0f, 1.0f, "%.2f");
+            f("bite through: soft <=", &gr.biteThroughSoft, 0.0f, 60.0f, "%.0f");
+            f("bite through: hard >=", &gr.biteThroughHard, 1.0f, 255.0f, "%.0f");
+            if (ImGui::IsItemHovered())
+              ImGui::SetTooltip(
+                  "Material hardness ramp: teeth pass entirely at or below\n"
+                  "'soft' (linen=4, cloth=5, leather=14), nothing passes\n"
+                  "at or above 'hard' (iron=160, steel=200).");
           }
           if (ImGui::CollapsingHeader("Burns cap health")) {
             ImGui::TextDisabled("burnt fraction -> max hp, three knots");
@@ -1944,6 +2020,21 @@ void Overlay::Draw(UIState& s) {
             f("flesh flash", &fx.flashFlesh, 0.0f, 4.0f, "%.2f");
             f("sever flash", &fx.flashSever, 0.0f, 4.0f, "%.2f");
             f("halflife (s)", &fx.flashHalflife, 0.01f, 0.6f);
+          }
+          if (ImGui::CollapsingHeader("Hit reaction",
+                                      ImGuiTreeNodeFlags_DefaultOpen)) {
+            b("hit-react on", &fx.hitReact);
+            if (ImGui::IsItemHovered())
+              ImGui::SetTooltip(
+                  "A struck creature rocks AWAY from the blade's travel.\n"
+                  "Pose-space lean only — nothing here moves the origin.");
+            f("reference damage (hp)", &fx.hitReactRefDamage, 1.0f, 60.0f, "%.1f");
+            f("max scale", &fx.hitReactMaxScale, 0.5f, 8.0f, "%.1f");
+            f("lean (deg)", &fx.hitReactLeanDeg, 0.0f, 45.0f, "%.1f");
+            f("spine share", &fx.hitReactSpineShare, 0.0f, 1.0f, "%.2f");
+            f("push (frac of height)", &fx.hitReactPushFrac, 0.0f, 0.3f, "%.3f");
+            f("struck limb flick (deg)", &fx.hitReactLimbDeg, 0.0f, 90.0f, "%.1f");
+            f("halflife (s)", &fx.hitReactHalflife, 0.01f, 0.5f);
           }
           if (ImGui::CollapsingHeader("Sound",
                                       ImGuiTreeNodeFlags_DefaultOpen)) {

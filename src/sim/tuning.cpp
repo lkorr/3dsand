@@ -542,6 +542,12 @@ bool LoadTuning(const std::string& path, Tuning& out) {
     c.bluntShellHp = std::clamp(c.bluntShellHp, 0.0f, 4.0f);
     ReadF(*g, "biteOnShell", c.biteOnShell, out, at);
     c.biteOnShell = std::clamp(c.biteOnShell, 0.0f, 1.0f);
+    ReadF(*g, "biteThroughSoft", c.biteThroughSoft, out, at);
+    ReadF(*g, "biteThroughHard", c.biteThroughHard, out, at);
+    c.biteThroughSoft = std::max(0.0f, c.biteThroughSoft);
+    // The ramp must have width, or a hardness exactly on the pair divides by
+    // zero; an author who wants a hard cliff gets it from a narrow band.
+    c.biteThroughHard = std::max(c.biteThroughHard, c.biteThroughSoft + 1e-3f);
   }
 
   if (const json* g = Find(j, "avatar")) {
@@ -691,6 +697,10 @@ bool LoadTuning(const std::string& path, Tuning& out) {
     ReadF(*g, "explosionMaxSpeed", p.explosionMaxSpeed, out, at);
     ReadF(*g, "explosionBodyDamageScale", p.explosionBodyDamageScale, out, at);
     ReadF(*g, "playerMassKg", p.playerMassKg, out, at);
+    ReadF(*g, "creaturePhaseVox", p.creaturePhaseVox, out, at);
+    ReadF(*g, "creaturePushMaxVox", p.creaturePushMaxVox, out, at);
+    p.creaturePhaseVox = std::max(0.0f, p.creaturePhaseVox);
+    p.creaturePushMaxVox = std::max(0.0f, p.creaturePushMaxVox);
     ReadF(*g, "sphereFriction", p.sphereFriction, out, at);
     ReadF(*g, "sphereRestitution", p.sphereRestitution, out, at);
     ReadF(*g, "sphereAngularDamping", p.sphereAngularDamping, out, at);
@@ -2978,6 +2988,8 @@ bool SaveCombatTuning(const std::string& path, const Tuning& t,
     put("torsoShare", m.torsoShare);
     put("torsoPitch", m.torsoPitch);
     put("headClearM", m.headClearM);
+    put("aimYaw", m.aimYaw);
+    put("aimReleaseYaw", m.aimReleaseYaw);
   }
   if (group("combatfx", lo, hi)) {
     const Tuning::CombatFx& f = t.combatfx;
@@ -3010,9 +3022,8 @@ bool SaveCombatTuning(const std::string& path, const Tuning& t,
   }
   // GORE TOO, because the Combat panel's Damage tab edits it. A Save button
   // that silently declined to save one of its own three tabs is the worst kind
-  // of bug: the work is gone and nothing said so. Only the keys that tab
-  // exposes are written — the rest of gore.* belongs to the browser tuner and
-  // must not be re-emitted from a struct the panel never showed.
+  // of bug: the work is gone and nothing said so. GEAR TOO, because the
+  // Damage tab's "Armour vs blunt/bite" section edits it.
   if (group("gore", lo, hi)) {
     const Tuning::Gore& g = t.gore;
     put("cutDepth", g.cutDepth);
@@ -3042,6 +3053,31 @@ bool SaveCombatTuning(const std::string& path, const Tuning& t,
     put("burnCapMidFraction", g.burnCapMidFraction);
     put("burnCapMidHealth", g.burnCapMidHealth);
     put("burnDeathFraction", g.burnDeathFraction);
+    // E6: blunt / bruise / bite — the panel's new "Blunt and bruise" + "Bite"
+    put("bruiseRadius", g.bruiseRadius);
+    put("bruiseStep", g.bruiseStep);
+    put("bruiseMax", g.bruiseMax);
+    put("bruiseBleedChance", g.bruiseBleedChance);
+    put("bluntBleedScale", g.bluntBleedScale);
+    put("bluntCarveRadius", g.bluntCarveRadius);
+    put("biteRadius", g.biteRadius);
+    put("biteBlob", g.biteBlob);
+    put("biteStainScale", g.biteStainScale);
+    put("infectHealSlow", g.infectHealSlow);
+  }
+  if (group("gear", lo, hi)) {
+    const Tuning::Gear& gr = t.gear;
+    put("ruinedCondition", gr.ruinedCondition);
+    put("cutHardnessRef", gr.cutHardnessRef);
+    put("cutHardnessMin", gr.cutHardnessMin);
+    put("bluntDentRadius", gr.bluntDentRadius);
+    put("bluntHardnessRef", gr.bluntHardnessRef);
+    put("bluntHardnessMin", gr.bluntHardnessMin);
+    put("bluntThrough", gr.bluntThrough);
+    put("bluntShellHp", gr.bluntShellHp);
+    put("biteOnShell", gr.biteOnShell);
+    put("biteThroughSoft", gr.biteThroughSoft);
+    put("biteThroughHard", gr.biteThroughHard);
   }
 
   if (!missing.empty()) {
