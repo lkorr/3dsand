@@ -3943,8 +3943,11 @@ void MobSystem::StepStroke(Mob& mob, uint32_t tick, World& world,
   // Everything feel-shaped lives in StepStrokeProgram, which the player's
   // discrete attacks also call; this caller only owns what to do when the
   // program ends (drop the pose claim) and the NPC's fixed 30 Hz dt.
-  switch (StepStrokeProgram(st, sty, st.melee, liveAz, liveEl, 1.0f / 30.0f,
-                            right, up, fwd)) {
+  // `lr` is the target's distance from the very pivot the aim was taken about
+  // (a few lines up), so the bound and the bearing cannot disagree about which
+  // shoulder they meant.
+  switch (StepStrokeProgram(st, sty, st.melee, liveAz, liveEl, lr,
+                            1.0f / 30.0f, right, up, fwd)) {
     case StrokeStepResult::Finished:
       st.Reset();
       // ...and hand the part back. A punch is over; a sword is still held, and
@@ -4227,19 +4230,30 @@ bool MobSystem::UpdateFall(Mob& mob, const MobDef& def,
   // along it instead of stopping dead in mid-air. That is DriveLocomotion's
   // `fits()` with the standing height thrown away — a body in the air does not
   // take its Y from the ground it is passing over.
+  // ---- WHERE A LUNGE'S DISTANCE GOES (SANDVOX_LUNGE_TRACE=1) ------------
+  // One line per airborne tick: the body, both velocities and the fits()
+  // verdict. "The leap covers 65% of its closed form" is a bare number with
+  // six candidate causes and no way to tell them apart from outside (CLAUDE.md
+  // rule 6); this prints which tick loses what.
+  static const bool kTrace = std::getenv("SANDVOX_LUNGE_TRACE") != nullptr;
+  const char* verdict = "-";
   if (mob.airVel_.len() > 1e-4f && world_ != nullptr) {
     const float hx = def.worldSize.x * 0.5f, hz = def.worldSize.z * 0.5f;
+    const char* why = "";
     auto fits = [&](float nx, float nz) {
-      if (BlockedByMob(mob, def, nx + hx, nz + hz)) return false;
+      if (BlockedByMob(mob, def, nx + hx, nz + hz)) { why = "mob"; return false; }
       const Mob::Footing f =
           mob.FootprintFooting(*world_, def, nx + hx, nz + hz, ny);
       if (!f.known) return true;    // unknown footing is walkable (ai_nav.h)
-      return !f.wall && f.fits;
+      if (f.wall) { why = "wall"; return false; }
+      if (!f.fits) { why = "overhang"; return false; }
+      return true;
     };
     const Vec3 want = mob.airVel_ * dt;
     if (fits(mob.origin_.x + want.x, mob.origin_.z + want.z)) {
       mob.origin_.x += want.x;
       mob.origin_.z += want.z;
+      verdict = "full";
     } else {
       const bool xFirst = std::abs(want.x) >= std::abs(want.z);
       bool moved = false;
@@ -4252,13 +4266,27 @@ bool MobSystem::UpdateFall(Mob& mob, const MobDef& def,
         mob.origin_.x += dx;
         mob.origin_.z += dz;
         moved = true;
+        verdict = doX ? "slid-x" : "slid-z";
       }
       // HIT A WALL IN MID-AIR: the planar velocity is spent, and the body
       // drops where it is. Killing it rather than sliding forever is what
       // stops a pounce grinding along a cliff face for its whole flight.
-      if (!moved) mob.airVel_ = Vec3{};
+      if (!moved) {
+        mob.airVel_ = Vec3{};
+        verdict = why;
+      }
     }
+  } else if (mob.airborne_) {
+    verdict = mob.airVel_.len() <= 1e-4f ? "no-airVel" : "no-world";
   }
+  if (kTrace && mob.airborne_)
+    std::printf(
+        "lunge-trace t+%2d  origin (%.2f,%.2f,%.2f)  airVel (%.2f,%.2f) |%.2f| "
+        " fallVel %.2f  ny %.2f  ground %d(%s)  fits=%s%s\n",
+        (int)std::lround(mob.airTime_ * 30.0f), mob.origin_.x, mob.origin_.y,
+        mob.origin_.z, mob.airVel_.x, mob.airVel_.z, mob.airVel_.len(),
+        mob.fallVel_, ny, sense.groundY, sense.haveGround ? "seen" : "unknown",
+        verdict, justLaunched ? "  [LAUNCH TICK]" : "");
   mob.origin_.y = ny;
   if (mob.airTime_ >= tune.ragdoll.fallSeconds && !mob.Ragdolled()) {
     // Long enough in the air to go limp. The limbs take the fall speed with
@@ -15068,6 +15096,52 @@ void Mob::ApplyStrikeAim(const AnimSkeleton& sk, AnimState& st) const {
     aimDiag_.part = effPart;
     aimDiag_.natural = effNatural;
     ApplyAimPart(sk, st, effPart, yaw, pitch, w, share);
+    // ---- AND THE NECK CARRIES IT (2026-09-15) ---------------------------
+    //
+    // A ROTATION CANNOT CLOSE A GAP, and that is the whole of why bites still
+    // missed after the lunge was working. The flight trace says the leap does
+    // exactly what it should: it flies five ticks and stops on `BlockedByMob`
+    // with the two bodies TOUCHING, which is where a pounce belongs. From
+    // there the victim's nearest voxel is still 4.3 voxels from the teeth,
+    // because the jaws are a 1.7-voxel segment on a head whose joint sits at
+    // the biter's own centre -- half of that gap is the biter's own chest.
+    //
+    // So the head is TRANSLATED forward along its aim as the cut runs: the
+    // neck extends and the shoulders follow, which is what an animal doing
+    // this actually does. In the PART'S OWN local frame, because that is the
+    // frame `st.local` positions are in and the frame the aim has just been
+    // written into -- so the lean goes wherever the head is now pointing, for
+    // free, and needs no second copy of the aim geometry.
+    //
+    // ON THE CUT'S PROGRESS, not on the arm claim: a head that jutted out the
+    // instant the stroke began would spend its whole windup with its neck
+    // stretched, which is the opposite of a creature gathering itself.
+    if (stroke_.Cutting() && def_ != nullptr &&
+        (size_t)effPart < st.local.size()) {
+      if (const MobNaturalWeaponDef* nw = NaturalWeapon(effNatural)) {
+        const Vec3 edge = nw->edgeTo - nw->edgeFrom;
+        if (edge.len() > 1e-4f) {
+          const float prog =
+              std::clamp((float)(stroke_.phaseTick + 1) /
+                             (float)std::max(1, stroke_.cutTicks),
+                         0.0f, 1.0f);
+          // A BODY'S OWN DEPTH is how far a neck and a lean carry a head past
+          // the chest it is attached to, and it is the exact term the gap
+          // above is made of -- so it follows the rig instead of being a
+          // number somebody picked.
+          // 1.25 BODIES DEEP, measured rather than guessed: at one body the
+          // teeth still stopped 2.3 voxels from the victim's nearest voxel
+          // (from 4.3 with no lean at all), and the probe reaches about 1.9
+          // past the tip. A neck and a set of shoulders extending a quarter
+          // past the chest is what the frames show and what closes it.
+          const float lean = def_->worldSize.z * 1.25f * prog;
+          st.local[effPart].pos =
+              st.local[effPart].pos +
+              QuatRotate(st.local[effPart].rot, edge.normalized()) * lean;
+          aimDiag_.lean = lean;
+        }
+      }
+    }
     return;
   }
   aimDiag_.ran = false;

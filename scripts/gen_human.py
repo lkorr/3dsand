@@ -1040,8 +1040,17 @@ def main():
         "part": "head",
         "edge": {
             "from": part_local("head", 0.50, 0.38, 0.40),
-            "to": part_local("head", 0.50, 0.31, 1.05),
-            "halfWidth": 6.0,
+            # PAST THE FACE, not to it. The probe rays tile the segment and
+            # reach about their own half-width beyond the tip, so a bite's
+            # REACH is this number -- and jaws that stopped at the skin of the
+            # face could not touch a victim the biter's own body was already
+            # pressed against, because half that gap is the biter's chest.
+            # 1.70 of the head box is an open mouth's bite volume; the CARVE
+            # stays bounded by gore.biteRadius, so this lengthens the reach and
+            # not the wound. Measured: 4.3 voxels short of the victim at 1.05,
+            # landing at 1.70 with halfWidth 12.
+            "to": part_local("head", 0.50, 0.28, 1.70),
+            "halfWidth": 12.0,
         },
         # A BITE IS MOSTLY A TEAR. The small blunt part is the head-butt a set
         # of jaws arrives attached to. What the tear CARRIES — rot, ichor — is
