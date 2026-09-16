@@ -958,31 +958,115 @@ function touched() {
   _touchTimer = setTimeout(() => { ed.commitSidecarUndo(); }, 120);
 }
 
+// ---- WHICH KEY SAYS HOW DENSE THE ART IS, AND HOW TO MOVE IT ----------------
+//
+// The three size/detail buttons below all have to agree with `skinScaleOf`
+// about where a document states its resolution: the legacy `skinScale` /
+// `scale`, or the modern `artVoxelsPerMetre` that every shipped asset uses.
+// Until 2026-09-16 they did not — each one read `s.skinScale ?? s.scale`
+// directly and then branched on `else if (s.scale != null)`, which NO SHIPPED
+// ITEM has. Every failure was silent:
+//
+//   * "2× size" and "/2 size" changed NOTHING on a modern item and toasted a
+//     scale move that had not happened.
+//   * "2× detail" doubled the GEOMETRY and left `hilt`, `edge` and
+//     `grip.translation` behind on the old lattice — and the runtime puts the
+//     hilt box's CENTRE on the rig's socket, so the weapon came back twice the
+//     size and floating beside the fist. That is what happened to the mace
+//     (owner report 2026-09-16), and it is why all three now go through here.
+//
+// Returns { get, set, kind } where the value is ART VOXELS PER WORLD VOXEL —
+// the same number `skinScaleOf` returns, whichever key the file uses — or null
+// for a document that declares no resolution at all (a bare .vox with no
+// sidecar key), for which "same world size, finer voxels" is not expressible
+// and the caller must say so rather than pretend.
+function docDensity(s) {
+  const legacy = +(s?.skinScale ?? s?.scale);
+  if (Number.isFinite(legacy) && legacy > 0) {
+    const key = s.skinScale != null ? 'skinScale' : 'scale';
+    return {
+      kind: key,
+      get: () => legacy,
+      set: (n) => {
+        // One key wins. A document that carried both would be read one way by
+        // `skinScaleOf` and another by whatever touched it last.
+        delete s.skinScale; delete s.scale;
+        if (n > 1 || key === 'scale') s[key] = n;
+      },
+    };
+  }
+  const a = +s?.artVoxelsPerMetre;
+  if (Number.isFinite(a) && a > 0)
+    return {
+      kind: 'artVoxelsPerMetre',
+      get: () => a / kVoxelsPerMetre,
+      // The authored fact is voxels per METRE; the world scale is derived from
+      // it. Halving the physical size means doubling the density, and the art
+      // grid is not touched at all — which is why this direction can never
+      // detach a hilt from its geometry.
+      set: (n) => { s.artVoxelsPerMetre = n * kVoxelsPerMetre; },
+    };
+  return null;
+}
+
+// EVERY SIDECAR LENGTH MEASURED IN THE ART LATTICE, in one place. This list is
+// a contract with `LoadItemDefs` (game/melee.cpp): each of these is multiplied
+// by `ItemDef::ArtToWorld()` at load, so each of them must move when the art
+// grid does. Anything new that is a length in file voxels belongs here, or the
+// next "2× detail" silently detaches it from the art it describes.
+//
+// NOT here, deliberately: `spring.*` (seconds and radians), `hp`,
+// `severImpactSpeed` (m/s) and `grip[*].rotation` (degrees) — none of them is
+// a length, and scaling them would be a different bug with the same shape.
+function scaleItemArtUnits(s, f) {
+  if (s.hilt) {
+    if (Array.isArray(s.hilt.min)) s.hilt.min = s.hilt.min.map(v => v * f);
+    if (Array.isArray(s.hilt.size)) s.hilt.size = s.hilt.size.map(v => v * f);
+  }
+  if (s.edge)
+    for (const k of ['from', 'to', 'halfWidth'])
+      if (s.edge[k] != null) s.edge[k] = +s.edge[k] * f;
+  for (const ctx of Object.values(s.grip || {}))
+    if (Array.isArray(ctx.translation))
+      ctx.translation = ctx.translation.map(v => v * f);
+  // A worn piece (robe, cuirass) measures its shells against the WEARER's limb
+  // box, but in the ITEM's art units — melee.cpp multiplies both by the same
+  // `invScale`, so both scale here too.
+  for (const c of (Array.isArray(s.cover) ? s.cover : []))
+    for (const k of ['offset', 'fitBox'])
+      if (Array.isArray(c[k])) c[k] = c[k].map(v => v * f);
+}
+
 /**
  * Upscale the whole document 2×: geometry (editor.js doubles every model and
  * offset), then everything in the sidecar that is measured in voxels —
- * anchors and clip pos keys — and finally `skinScale`, so the creature keeps
- * its world size and gains detail. This is THE way to give an existing mob
- * finer microvoxels: skinScale 4 → 8 halves the voxel size without moving a
- * joint or changing a clip's meaning.
+ * anchors, clip pos keys and an item's hilt/edge/grip — and finally the
+ * density key, so the asset keeps its world size and gains detail. This is THE
+ * way to give an existing mob finer microvoxels: 40 → 80 art voxels/metre
+ * halves the voxel size without moving a joint or changing a clip's meaning.
  *
  * This function is also the authoritative INVENTORY of which sidecar fields
  * are measured in micro units: limbs[].anchor, clips[*].tracks[*].pos[].v,
- * editor.parts[].box, plus the model grids and offsets editor.js handles.
- * gait.rideHeight, gait.stepHeight and states[].bodyYOffset are WORLD units
- * and are deliberately untouched — doubling them would raise the creature off
- * the ground by exactly the amount it just gained in detail.
+ * editor.parts[].box, everything in `scaleItemArtUnits`, plus the model grids
+ * and offsets editor.js handles. gait.rideHeight, gait.stepHeight and
+ * states[].bodyYOffset are WORLD units and are deliberately untouched —
+ * doubling them would raise the creature off the ground by exactly the amount
+ * it just gained in detail.
  */
 function upscale2x() {
   const s = sc();
-  const scl = +(s.skinScale ?? s.scale) || 1;
-  const isItem = !isRigged() && s.scale != null;
-  if ((isRigged() || isItem) && scl >= 8) {
+  const den = docDensity(s);
+  const scl = den ? den.get() : 1;
+  if (den && scl >= 8) {
     toast('already at scale 8 — the finest the engine accepts', true);
     return;
   }
-  const scaleNote = isRigged() ? `, anchors/keys double, and skinScale goes ${scl} → ${scl * 2}`
-    : isItem ? `, scale goes ${scl} → ${scl * 2} (same world size, finer detail)`
+  if (!den && !confirm(
+      'This file declares no artVoxelsPerMetre, so doubling the geometry also ' +
+      'doubles its WORLD SIZE — there is no density key to compensate.\n\n' +
+      'Upscale anyway?')) return;
+  const scaleNote = den
+    ? `, lengths double, and ${den.kind} follows (same world size, finer detail)`
     : '';
   if (!confirm('Upscale 2×? Every voxel becomes a 2×2×2 block' + scaleNote +
       '.')) return;
@@ -991,11 +1075,11 @@ function upscale2x() {
   // art by exactly a factor of two.
   ed.beginStructural();
   let ok = false;
-  try { ok = upscale2xInner(s, scl, isItem); }
+  try { ok = upscale2xInner(s, den, scl); }
   finally { ed.endStructural('2× detail', ok); }
 }
 
-function upscale2xInner(s, scl, isItem) {
+function upscale2xInner(s, den, scl) {
   if (!ed.upscaleDoc()) return false;    // toasts its own reason on failure
   for (const l of limbs())
     if (Array.isArray(l.anchor) && l.anchor.length === 3)
@@ -1010,77 +1094,60 @@ function upscale2xInner(s, scl, isItem) {
       if (Array.isArray(p.box))
         // lo doubles; hi is an inclusive cell index, so its block ends at 2h+1.
         p.box = [p.box[0].map(v => v * 2), p.box[1].map(v => v * 2 + 1)];
-  if (isRigged()) {
-    delete s.scale;             // one key wins (see the scale dropdown)
-    s.skinScale = scl * 2;
-  } else if (s.scale != null) {
-    // Standalone item (sword, torch, …): `scale` is item micro units per world
-    // voxel. Doubling geometry + scale keeps the same world size, same as
-    // skinScale does for mobs. Also double hilt.min since it is in micro units.
-    s.scale = scl * 2;
-    if (s.hilt && Array.isArray(s.hilt.min))
-      s.hilt.min = s.hilt.min.map(v => v * 2);
-    if (s.hilt && Array.isArray(s.hilt.size))
-      s.hilt.size = s.hilt.size.map(v => v * 2);
-    if (s.edge) {
-      if (s.edge.from != null) s.edge.from *= 2;
-      if (s.edge.to != null) s.edge.to *= 2;
-      if (s.edge.halfWidth != null) s.edge.halfWidth *= 2;
-    }
-    for (const ctx of Object.values(s.grip || {}))
-      if (Array.isArray(ctx.translation))
-        ctx.translation = ctx.translation.map(v => v * 2);
-  }
+  // UNCONDITIONAL, and that is the fix. These fields are art units whether the
+  // document is a rigged mob or a standalone weapon, and whether it states a
+  // `scale` or an `artVoxelsPerMetre`; the old code only reached them down the
+  // one branch no shipped file takes.
+  scaleItemArtUnits(s, 2);
+  if (den) den.set(scl * 2);
   touched();
   bindGizmo();
   ed.refreshMicroGhost?.();
   ed.invalidate();
   renderAllPanels();
-  toast('upscaled 2×' + (isRigged()
-    ? ` — skinScale ${scl * 2}: same world size, ${scl * 2}× voxel density`
-    : isItem
-      ? ` — scale ${scl * 2}: same world size, ${scl * 2}× voxel density`
-      : ' — the model is twice the resolution (and twice the world size)'));
+  toast('upscaled 2×' + (den
+    ? ` — ${den.kind} follows: same world size, ${scl * 2}× voxel density`
+    : ' — the model is twice the resolution (and twice the world size)'));
   return true;
 }
 
-function growSize2x() {
+// ---- THE TWO SIZE BUTTONS ---------------------------------------------------
+//
+// Neither touches geometry OR any art-unit length: they move the density key
+// alone, which is exactly why they cannot move a hilt off its grip. What
+// changes is how big one art voxel is in the world, and every authored length
+// is in art voxels, so the whole weapon — grip included — scales as one piece.
+//
+// `resizeDoc(f)` is "multiply the WORLD size by f".
+function resizeDoc(f, what) {
   const s = sc();
-  const scl = +(s.skinScale ?? s.scale) || 1;
-  if (scl <= 1) {
-    toast('already at scale 1 — cannot grow further (would need scale < 1)', true);
+  const den = docDensity(s);
+  if (!den) {
+    toast('this file declares no artVoxelsPerMetre (or scale) — nothing to ' +
+          'resize against; add one on the Items panel first', true);
     return;
   }
-  if (isRigged()) {
-    delete s.scale;
-    s.skinScale = scl / 2;
-    if (s.skinScale <= 1) delete s.skinScale;
-  } else if (s.scale != null) {
-    s.scale = scl / 2;
-    if (s.scale <= 1) s.scale = 1;
+  const scl = den.get();
+  const next = scl / f;          // bigger world size = coarser = lower density
+  // The engine's legal ladder: `SkinScaleFor` takes a whole number of art
+  // voxels per world voxel and `MicroBodyPack` refuses past 8. Below 1 the art
+  // would have to be downsampled, which sim/scale.h declines to define.
+  if (next < 1 || next > 8 || !Number.isInteger(next)) {
+    toast(next > 8
+      ? 'already at scale 8 — the finest the engine accepts'
+      : 'already at scale 1 — the coarsest the engine accepts', true);
+    return;
   }
+  den.set(next);
   touched(); ed.refreshMicroGhost?.(); ed.invalidate();
   renderAllPanels();
-  toast(`scale ${scl} → ${scl / 2}: same voxels, twice the world size`);
+  toast(`${what}: ${den.kind} ${den.kind === 'artVoxelsPerMetre'
+    ? `${scl * kVoxelsPerMetre} → ${next * kVoxelsPerMetre}/m`
+    : `${scl} → ${next}`} — same voxels, grip and edge move with them`);
 }
 
-function shrinkSize2x() {
-  const s = sc();
-  const scl = +(s.skinScale ?? s.scale) || 1;
-  if (scl >= 8) {
-    toast('already at scale 8 — the finest the engine accepts', true);
-    return;
-  }
-  if (isRigged()) {
-    delete s.scale;
-    s.skinScale = scl * 2;
-  } else if (s.scale != null) {
-    s.scale = scl * 2;
-  }
-  touched(); ed.refreshMicroGhost?.(); ed.invalidate();
-  renderAllPanels();
-  toast(`scale ${scl} → ${scl * 2}: same voxels, half the world size`);
-}
+function growSize2x() { resizeDoc(2, 'twice the world size'); }
+function shrinkSize2x() { resizeDoc(0.5, 'half the world size'); }
 
 // A limb entry for every model that does not have one yet. This is how a
 // freshly split model becomes riggable without hand-editing JSON.
@@ -1495,18 +1562,23 @@ function renderRigPanel() {
       }, 'show all') : null,
       el('button', {
         class: 'small',
-        title: 'double the resolution: every voxel becomes 2×2×2, anchors and ' +
-          'pos keys double, scale bumps — same world size, finer voxels',
+        title: 'double the resolution: every voxel becomes 2×2×2, and every ' +
+          'authored length doubles with it — anchors, pos keys, and an item’s ' +
+          'hilt, edge and grip. Same world size, finer voxels',
         onclick: upscale2x,
       }, '2× detail'),
       el('button', {
         class: 'small',
-        title: 'double world size: halve the scale so each voxel is bigger — no geometry change, fully reversible',
+        title: 'double world size: halve the density (artVoxelsPerMetre 80 → 40) ' +
+          'so each voxel is bigger. No geometry and no authored length changes, ' +
+          'so the grip stays exactly where it is. Fully reversible',
         onclick: growSize2x,
       }, '2× size'),
       el('button', {
         class: 'small',
-        title: 'halve world size: double the scale so each voxel is smaller — no geometry change, fully reversible',
+        title: 'halve world size: double the density (artVoxelsPerMetre 40 → 80) ' +
+          'so each voxel is smaller. No geometry and no authored length changes, ' +
+          'so the grip stays exactly where it is. Fully reversible',
         onclick: shrinkSize2x,
       }, '/2 size'),
       el('button', {

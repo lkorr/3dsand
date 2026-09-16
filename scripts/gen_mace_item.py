@@ -20,8 +20,8 @@ TWO ART DECISIONS, BOTH MECHANICAL:
 
  1. `edge` IS THE HEAD'S SPAN, not the whole weapon. `MeleeSweepDamage` sweeps
     that segment and nothing else, so authoring the haft into it would make the
-    shaft as dangerous as the flanges — and a mace's whole character is that
-    only the last quarter of it hurts.
+    shaft as dangerous as the ball — and a mace's whole character is that only
+    the last quarter of it hurts.
 
  2. NO `flat`. `MeleeEdgeAlign` returns 1 when a weapon declares no flat, which
     is exactly right here: a mace has no edge to lay along the line of travel,
@@ -29,6 +29,20 @@ TWO ART DECISIONS, BOTH MECHANICAL:
     field is what makes a badly-rolled cut a slap; a club cannot be slapped
     with. Do NOT add one "for completeness" — it would silently halve the
     weapon.
+
+WHY THE ART IS TWO SHAPES AND NOT SIX (2026-09-16). The first version of this
+weapon was a leather-wrapped haft, a steel pommel knob, a swelling drum, four
+cross flanges and a rounded crown — five silhouettes stacked inside a head that
+is NINE MICRO VOXELS ACROSS. At that budget a flange is one voxel wide, which is
+indistinguishable from the drum it stands on, and the whole head read as a grey
+smear with a bobble at each end. It is now what the owner asked for in one line:
+a plain wood stick socketed into a steel ball. Two materials, two primitives,
+and a silhouette that survives being four pixels tall on screen.
+
+The corollary, for anyone tempted to put the spikes back: a morning star's studs
+would need to stand at least two micro clear of the ball to read, which is a
+ball of radius ~7 in a 16-wide box — a head nearly as wide as the weapon is
+long. Detail below the voxel budget is not detail, it is noise.
 
 Everything else is gen_sword_item.py's shape, deliberately: same .vox writer,
 same hilt-box convention (the runtime puts the box's centre on the rig's
@@ -44,27 +58,60 @@ import os
 import struct
 
 # ---- palette (assets/prefabs — palette index == material ID) ----------------
-# Same two as the sword, and asserted against materials.json in main() rather
-# than trusted: a renumbered material turns the head into whatever took its
-# slot, and the symptom is a weapon that behaves correctly and looks wrong.
-STEEL = 57      # the head and the flanges
-GRIP = 58       # grip_leather, the wrapped haft
+# Asserted against materials.json in main() rather than trusted: a renumbered
+# material turns the ball into whatever took its slot, and the symptom is a
+# weapon that behaves correctly and looks wrong.
+#
+# The stick is `staff_wood` (54) and NOT `wood` (2), for the reason that
+# material's own note in materials.json gives at length: staff_wood is the
+# TINTED one, placed only by prefabs and items, so its state nibble is a finish
+# picker nobody else writes. `wood` is what every tree in the world is made of
+# and worldgen scribbles `rnd % 3` into its nibble. The wizard's staff is
+# authored against the same slot (scripts/gen_wizard.py).
+STEEL = 57      # the ball
+WOOD = 54       # staff_wood, the stick
 STEEL_ID = "steel"
-GRIP_ID = "grip_leather"
+WOOD_ID = "staff_wood"
 
-SCALE = 4       # micro voxels per world voxel, matching the mina rig
+# ---- resolution -------------------------------------------------------------
+# THE WEAPON WAS HALVED BY CHANGING THIS, NOT BY SHRINKING THE ART (2026-09-16).
+# The first ball was 0.23 m across — wider than a human head — and read as
+# comical in the hand. The obvious fix, halving the art dimensions at the
+# weapons' usual 40/m, does not work: a stick has to be 4 art voxels across to
+# render as a stick rather than a dotted line, so a ball half the size would be
+# 5 across and the two shapes would be indistinguishable. Detail below the
+# voxel budget is not detail; see the docstring.
+#
+# So the mace is authored at 80 art voxels per metre instead — 1.25 cm units,
+# the SAME resolution as the human body and every garment and plate in
+# assets/items. The art grid below is unchanged in shape and the physical size
+# it maps to halves. `SkinScaleFor` accepts it exactly (80 / kVoxelsPerMetre 10
+# = 8 micro per world voxel, no upsample), and the hilt/edge spans are art
+# units that `ItemDef::ArtToWorld` converts through the same factor, so nothing
+# drifts.
+#
+# IF THE SIZE IS EVER TUNED AGAIN, TUNE IT HERE OR IN MACE_LEN — NOT IN THE
+# TUNER'S MODEL EDITOR. Rescaling the .vox box there moves the geometry out
+# from under the `hilt` block, whose CENTRE is what the runtime puts on the
+# rig's socket; the symptom is a weapon floating beside the fist, and it is
+# what happened on 2026-09-16.
+SCALE = 8       # micro voxels per world voxel; artVoxelsPerMetre = SCALE * 10
 
 # ---- dimensions, micro units ------------------------------------------------
-# A mace is SHORTER than an arming sword and most of its mass is at one end.
-# 32 micro = 8 world voxels overall, against the sword's 11.
-MACE_LEN = 32           # butt to crown
-MACE_GRIP = 14          # micro of wrapped haft behind the head
-MACE_HEAD = 10          # micro of head (flanged section)
-MACE_HALF_W = 4         # head half-width at the widest flange
-HAFT_R = 1.2            # haft radius, micro
-FLANGES = 4             # how many vanes stand out of the head
+# One micro is 1.25 cm. 44 micro = 0.55 m overall, against the sword's 1.2 m:
+# a one-handed morning star, short because nearly all of its mass is at one end.
+MACE_LEN = 44           # butt to the crown of the ball
+MACE_GRIP = 14          # micro of stick the fist can close on (the hilt box)
+MACE_HALF_W = 5         # half the box in y/z — the ball at its equator
+BALL_R = 4.6            # steel ball radius, micro (0.115 m across — half a head)
+BALL_CX = 39.0          # the ball's centre along x
+HAFT_R = 1.7            # stick radius: the smallest that fills a 4-micro cross
+                        # under ellipse_mask. 4 micro is 5 cm of haft, and the
+                        # ball is 2.3x that — the ratio the silhouette needs.
 
-assert MACE_GRIP + MACE_HEAD <= MACE_LEN, "head runs off the end of the haft"
+assert BALL_CX + BALL_R >= MACE_LEN - 1, "the ball does not reach the crown"
+assert BALL_CX - BALL_R > MACE_GRIP, "the ball swallows the grip"
+assert BALL_R <= MACE_HALF_W, "the ball is wider than the box that holds it"
 
 
 # ---- .vox writing (same helpers as gen_sword_item.py) -----------------------
@@ -124,71 +171,40 @@ def ellipse_mask(x, y, cx, cy, rx, ry):
 
 # ---- the weapon -------------------------------------------------------------
 def mace_vox(size):
-    """A wrapped haft with a flanged head at HIGH x, pommel at LOW x.
+    """A plain wood stick with a steel ball on the HIGH-x end.
 
     Same handedness rule as the sword: an item's own box has no wearer, so it
     is authored butt-first and the GRIP ROTATION is what aims it. Keeping a
     mirror here would mean the art and the grip both encoded "which way is
     outboard", and they would disagree the next time either changed.
 
-    THE HEAD IS ROUND IN CROSS-SECTION, not thin like a blade. That is the
-    readable difference between the two weapons at a glance, and it is also
-    what makes "no flat" honest: there is no thin axis to lay along a cut.
+    THE HEAD IS A SPHERE, not a thin blade. That is the readable difference
+    between the two weapons at a glance — one silhouette each, at any distance —
+    and it is also what makes "no flat" honest: there is no thin axis to lay
+    along a cut.
+
+    The stick runs all the way to the ball's CENTRE rather than stopping at its
+    surface, so the two never separate however the ball's radius is retuned.
+    The buried part is simply overwritten by steel below.
     """
     sx, sy, sz = size
     out = []
     cy, cz = sy * 0.5, sz * 0.5
-    head_x0 = MACE_GRIP
-    head_x1 = MACE_GRIP + MACE_HEAD
+    r2 = BALL_R * BALL_R
 
     for x in range(sx):
-        if x < 2:
-            # Pommel: a steel counterweight, so the weapon balances at the hand
-            # rather than dragging the point down. Wider than the haft.
-            for z in range(sz):
-                for y in range(sy):
-                    if ellipse_mask(y, z, cy, cz, 1.9, 1.9):
-                        out.append((x, y, z, STEEL))
-        elif x < head_x0:
-            # The wrapped haft. Round and thin: this is the part that must NOT
-            # be in the `edge` segment below.
-            for z in range(sz):
-                for y in range(sy):
-                    if ellipse_mask(y, z, cy, cz, HAFT_R, HAFT_R):
-                        out.append((x, y, z, GRIP))
-        elif x < head_x1:
-            # ---- the head ----------------------------------------------------
-            # A drum, plus FLANGES standing out of it. The drum swells toward
-            # the middle of the head (`t` is 0 at both ends), which is what
-            # makes it read as a mace rather than as a pipe, and the vanes are
-            # a cross laid on it -- four half-width spokes in the y/z plane,
-            # tapering to the crown so the silhouette comes to a blunt point.
-            t = (x - head_x0) / max(head_x1 - 1 - head_x0, 1)
-            swell = 1.0 - 0.55 * (2.0 * t - 1.0) ** 2   # 0.45 .. 1 .. 0.45
-            drum = 2.1 + 0.6 * swell
-            vane = MACE_HALF_W * (0.55 + 0.45 * swell)
-            for z in range(sz):
-                for y in range(sy):
-                    dy, dz = y + 0.5 - cy, z + 0.5 - cz
-                    if dy * dy + dz * dz <= drum * drum:
-                        out.append((x, y, z, STEEL))
-                        continue
-                    # The vanes: a cross in y/z. `FLANGES` is 4 and the two
-                    # axes are what four of them means; a different count would
-                    # want a real angular test, and this weapon does not.
-                    assert FLANGES == 4, "the cross below is four vanes by hand"
-                    if abs(dz) <= 1.0 and abs(dy) <= vane:
-                        out.append((x, y, z, STEEL))
-                    elif abs(dy) <= 1.0 and abs(dz) <= vane:
-                        out.append((x, y, z, STEEL))
-        else:
-            # The crown: a short steel cap past the flanges, rounded off.
-            t = (x - head_x1) / max(sx - 1 - head_x1, 1)
-            r = 2.2 * (1.0 - 0.7 * t * t)
-            for z in range(sz):
-                for y in range(sy):
-                    if ellipse_mask(y, z, cy, cz, r, r):
-                        out.append((x, y, z, STEEL))
+        dx = x + 0.5 - BALL_CX
+        for z in range(sz):
+            dz = z + 0.5 - cz
+            for y in range(sy):
+                dy = y + 0.5 - cy
+                # The ball wins wherever the two overlap: same first-write-wins
+                # convention as the rig generator, stated as an order here
+                # rather than left to the dedupe pass in main().
+                if dx * dx + dy * dy + dz * dz <= r2:
+                    out.append((x, y, z, STEEL))
+                elif dx <= 0.0 and ellipse_mask(y, z, cy, cz, HAFT_R, HAFT_R):
+                    out.append((x, y, z, WOOD))
     return out
 
 
@@ -202,7 +218,7 @@ def main():
     # material silently turns this into a weapon made of something else.
     with open(os.path.join(root, "assets", "materials", "materials.json")) as mf:
         mats = json.load(mf)["materials"]
-    for idx, want in ((STEEL, STEEL_ID), (GRIP, GRIP_ID)):
+    for idx, want in ((STEEL, STEEL_ID), (WOOD, WOOD_ID)):
         assert idx <= len(mats) and mats[idx - 1]["id"] == want, (
             f"materials.json[{idx - 1}] is "
             f"{mats[idx - 1]['id'] if idx <= len(mats) else '(missing)'!r}, not "
@@ -240,23 +256,29 @@ def main():
 
     sidecar = {
         "comment": (
-            "The mace: a standalone item, held by BORROWING a rig slot exactly "
-            "as the sword is. Its whole reason to exist is the BLUNT half of "
-            "the impact model (src/game/impact.h) — it goes through plate a "
-            "sword skates off, and it dents flesh instead of opening it. Two "
-            "art facts are mechanical and are emitted from the same constants "
-            "that build the mesh: `edge` is the HEAD's span only (the haft "
-            "must not cut), and there is deliberately NO `flat` — a mace has "
-            "no edge to align, so MeleeEdgeAlign returns 1 and a badly-rolled "
-            "swing does full damage. Regenerate with scripts/gen_mace_item.py."),
+            "The mace: a morning star, a plain wood stick socketed into a "
+            "steel ball. A standalone item, held by BORROWING a rig slot "
+            "exactly as the sword is. Its whole reason to exist is the BLUNT "
+            "half of the impact model (src/game/impact.h) — it goes through "
+            "plate a sword skates off, and it dents flesh instead of opening "
+            "it. Two art facts are mechanical and are emitted from the same "
+            "constants that build the mesh: `edge` is the BALL's span only "
+            "(the stick must not cut), and there is deliberately NO `flat` — a "
+            "mace has no edge to align, so MeleeEdgeAlign returns 1 and a "
+            "badly-rolled swing does full damage. Regenerate with "
+            "scripts/gen_mace_item.py."),
         "name": "mace",
         "model": "mace",
         # THE AUTHORED RESOLUTION, in the units the loader actually reads, and
         # NOT a bare `"scale"`. A bare scale still loads — melee.cpp's legacy
         # branch multiplies it by kLegacyAuthoringVoxelsPerMetre and WARNS —
         # but emitting the derived number is how a generator's output stops
-        # drifting from what the loader wants, and every shipped sibling
-        # (sword, cleaver, dagger, shortsword) already reads 40.
+        # drifting from what the loader wants.
+        #
+        # 80, where the other weapons read 40. That is DELIBERATE and it is how
+        # this weapon got smaller — see the SCALE note above. It is not an odd
+        # number: the human body, and every garment and plate that has to land
+        # in the body's frame, is already authored at 80.
         "artVoxelsPerMetre": SCALE * 10,
         # Heavier than the sword and harder to knock out of a hand: there is no
         # edge to catch on, and a parry with a mace is a shove.
@@ -273,22 +295,24 @@ def main():
                 "scale": 1.0,
             }
         },
-        # WHERE THE FIST CLOSES: the wrapped haft between the pommel knob and
-        # the head, which is exactly the span mace_vox() fills with GRIP
-        # leather. The runtime puts this box's centre on the rig's socket, so
-        # the placement needs no tuned constant at all.
+        # WHERE THE FIST CLOSES: the low end of the stick, well clear of the
+        # ball. Its centre is x = 8 — the same place the flanged version put it,
+        # so the held pose did not move when the art was redrawn. The runtime
+        # puts this box's centre on the rig's socket, so the placement needs no
+        # tuned constant at all.
         "hilt": {
             "min": [2, 0, 0],
             "size": [MACE_GRIP - 2, 2 * MACE_HALF_W, 2 * MACE_HALF_W],
         },
-        # THE HEAD, AND ONLY THE HEAD. MeleeSweepDamage tiles this segment with
+        # THE BALL, AND ONLY THE BALL. MeleeSweepDamage tiles this segment with
         # probes and nothing outside it can hit anything — which is what makes
         # "only the last quarter of a mace hurts" geometry rather than a rule.
+        # Emitted from BALL_CX/BALL_R so the hitbox cannot drift from the art.
         #
         # NO "flat" KEY. See the docstring: MeleeEdgeAlign returns 1 for a
         # weapon that declares none, and that is the correct answer for a club.
         "edge": {
-            "from": MACE_GRIP,
+            "from": int(BALL_CX - BALL_R),
             "to": MACE_LEN,
             "axis": [1, 0, 0],
             "halfWidth": MACE_HALF_W,
@@ -303,8 +327,9 @@ def main():
 
     print(f"wrote {out_dir}/mace.vox  ({len(uniq)} voxels, size {size})")
     print(f"wrote {out_dir}/mace.json")
-    print(f"  haft {MACE_GRIP} micro, head {MACE_GRIP}..{MACE_LEN} micro "
-          f"= {MACE_LEN / SCALE} world voxels overall, edge is the head only")
+    print(f"  stick 0..{BALL_CX - BALL_R:.0f} micro, ball r{BALL_R} at "
+          f"x={BALL_CX} = {MACE_LEN / SCALE} world voxels overall, "
+          f"edge is the ball only")
 
 
 if __name__ == "__main__":
