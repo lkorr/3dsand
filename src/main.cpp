@@ -7981,13 +7981,19 @@ int main(int argc, char** argv) {
       // the same creature.
       if (labScene >= 0) {
         ui.aiSpawnDummy = ui.aiSpawnStatic = ui.aiSpawnDuelist = false;
+        ui.aiSpawnOwn = false;
         ui.aiKillSpawned = false;
       }
-      if (ui.aiSpawnDummy || ui.aiSpawnStatic || ui.aiSpawnDuelist) {
-        const char* profile = ui.aiSpawnDummy      ? "dummy"
-                              : ui.aiSpawnStatic   ? "swordsman_static"
-                                                   : "duelist";
+      if (ui.aiSpawnDummy || ui.aiSpawnStatic || ui.aiSpawnDuelist ||
+          ui.aiSpawnOwn) {
+        // EMPTY MEANS "THE CREATURE'S OWN", resolved once the def is known --
+        // see UIState::aiSpawnOwn for what the override was costing.
+        const char* profile = ui.aiSpawnOwn         ? ""
+                              : ui.aiSpawnDummy     ? "dummy"
+                              : ui.aiSpawnStatic    ? "swordsman_static"
+                                                    : "duelist";
         ui.aiSpawnDummy = ui.aiSpawnStatic = ui.aiSpawnDuelist = false;
+        ui.aiSpawnOwn = false;
         // A humanoid that can actually HOLD the sword: picked by capability
         // (a `held_right` socket) rather than by name, so renaming an asset
         // cannot silently spawn an unarmed creature.
@@ -8040,7 +8046,22 @@ int main(int argc, char** argv) {
                                      : 0];
             const ItemDef* weapon = items.At(items.Find(pick));
             if (weapon != nullptr) mobs.EquipItem(nid, weapon);
-            mobs.SetMobBehavior(nid, profile);
+            // THE SIDECAR'S OWN PROFILE when the button asked for it, and the
+            // same `empty() ? "duelist" : behavior` fallback --shot-strike
+            // uses, so a def that names none still gets something that fights.
+            const std::string prof =
+                *profile != '\0' ? std::string(profile)
+                : d.behavior.empty() ? std::string("duelist")
+                                     : d.behavior;
+            if (!mobs.SetMobBehavior(nid, prof)) {
+              // A NAMED PROFILE THAT IS NOT LOADED leaves the creature on the
+              // legacy wander, where it walks off and never fights — and it
+              // did it silently. The panel is a dev tool; say so.
+              std::printf(
+                  "AI panel: \"%s\" asked for behaviour \"%s\", which is not in"
+                  " behaviors.json — it will not fight\n",
+                  d.name.c_str(), prof.c_str());
+            }
             aiSpawnedMobs.push_back(nid);
           }
         }

@@ -335,6 +335,23 @@ struct UIState {
   bool aiSpawnDummy = false;      // one-shot: spawn ahead of the crosshair
   bool aiSpawnStatic = false;
   bool aiSpawnDuelist = false;
+  // ---- ...AND THE CREATURE'S OWN (2026-09-16) -----------------------------
+  //
+  // The three above are BEHAVIOUR PRESETS and they silently overrode whatever
+  // the sidecar asked for, so a creature whose whole character is its profile
+  // could not be spawned from this panel at all. Picking `zombie` in the
+  // creature list and pressing any of them produced a zombie BODY running the
+  // `duelist` profile -- which lists five sword styles and three fallback
+  // punches and NOT ONE BITE -- so with an empty hand every non-fallback style
+  // was unusable and the thing could only ever throw a punch.
+  //
+  // That is the whole of "the zombie is still just punching", and nothing was
+  // wrong with the zombie: it was never a zombie. This spawns the creature on
+  // the profile its own JSON names (`MobDef::behavior`), which is the rule the
+  // rest of the engine already follows -- `--shot-strike` reads
+  // `dA.behavior.empty() ? "duelist" : dA.behavior`, and this panel was the one
+  // producer that did not.
+  bool aiSpawnOwn = false;
   bool aiKillSpawned = false;     // one-shot: despawn everything this panel made
   bool aiRagdollSpawned = false;  // one-shot: knock everything this panel made flat
   // WHAT THE SPAWN BUTTONS PUT IN ITS HAND. Names rather than library indices,

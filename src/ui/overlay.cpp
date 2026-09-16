@@ -1396,6 +1396,16 @@ void Overlay::Draw(UIState& s) {
             ImGui::TextDisabled("and a mace beats plate in where a sword");
             ImGui::TextDisabled("skates off it");
           }
+          // FIRST, because it is the one that spawns the creature you PICKED
+          // rather than a behaviour preset wearing its body. The three below
+          // override the sidecar's own `behavior`, which is right when you
+          // want a duelist and wrong every other time -- a zombie on the
+          // `duelist` profile has no bite in its style list and can only
+          // punch.
+          if (ImGui::Button("as authored##ai")) s.aiSpawnOwn = true;
+          ImGui::SameLine();
+          ImGui::TextDisabled("its own JSON behaviour (zombie -> bites)");
+          ImGui::TextDisabled("...or override that with a preset:");
           if (ImGui::Button("dummy##ai")) s.aiSpawnDummy = true;
           ImGui::SameLine();
           ImGui::TextDisabled("blind, never moves, never turns");
