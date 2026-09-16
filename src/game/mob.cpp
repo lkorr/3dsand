@@ -3539,15 +3539,51 @@ float MobSystem::StyleReachOn(const Mob& mob, const AttackStyle& sty) const {
   float effector = 0.0f;
   if (const MobNaturalWeaponDef* nw = mob.NaturalWeaponNamed(sty.weapon)) {
     // THE EDGE COUNTS ONLY WHERE IT POINTS FORWARD. For an AIM effector it is
-    // the whole reach -- the jaws ARE the segment, and the segment is the
-    // head's forward. For a CHAIN effector it is a fist's wrist-to-knuckle
-    // line, which hangs DOWN off the arm and adds a voxel of nothing to how
-    // far the punch travels; counting it stood the pair a voxel too far apart
-    // and the harness measured the shortfall.
+    // the reach -- the jaws ARE the segment, and the segment is the head's
+    // forward. For a CHAIN effector it is a fist's wrist-to-knuckle line,
+    // which hangs DOWN off the arm and adds a voxel of nothing to how far the
+    // punch travels; counting it stood the pair a voxel too far apart and the
+    // harness measured the shortfall.
+    //
+    // ---- ...AND AN AIM EFFECTOR DELIVERS ABOUT THREE FIFTHS OF ITS SPAN ----
+    //
+    // The whole span was the first version and it is a LIE BY A WHOLE VOXEL,
+    // which was enough that no zombie in the game could bite. Three things eat
+    // the difference and none of them is visible in the authored numbers:
+    //
+    //   * THE SEGMENT STARTS INSIDE THE SKULL. A chain effector's reach is
+    //     measured from a JOINT, which is a point on the body's surface-to-be;
+    //     the jaws' edge runs from the THROAT to the teeth, so its first voxel
+    //     or so is behind the face and cannot touch anything.
+    //   * IT POINTS, SO THE CUT TILTS IT. `bite` swings 0.95 rad of elevation
+    //     about the aim, and a span held at an angle delivers its cosine.
+    //   * THE HEAD IS ABOVE THE CHEST IT IS AIMED AT, so the last of the span
+    //     is spent going DOWN rather than forward.
+    //
+    // MEASURED, like the sword's quarter-arm below and by the same harness.
+    // `--shot-strike zombie bite human` stands the pair at whatever this
+    // function returns, so it is a closed loop: at the full 3.3-voxel span it
+    // reported `21 rays cast: 21 found air, 0 bodies hit` and a victim with
+    // nothing on it changed, and at 2 it lands. So the number this has to come
+    // back with is 2, and the fraction is that measurement.
+    //
+    // A FRACTION AND NOT A SECOND LENGTH, so it follows the art: re-author the
+    // jaws and the stand-off moves with them. Re-take it with --shot-strike if
+    // the stroke driver's aim law changes.
+    //
+    // WHAT IT BUYS is not really a standing bite -- 2 voxels is nearly contact
+    // and `ApplyCrowdSpacing` plus an authored band keep a creature further out
+    // than that most of the time. It is that `bite` now REFUSES the distances
+    // it was whiffing from, so `PickAttackStyle` comes back with `bite_lunge`
+    // instead, and the lunge aims AT the target and lands (-10 voxels and rot
+    // +20 on the same harness). The bug was never the pounce; it was a
+    // standing bite claiming ground the pounce should have been asked for.
+    constexpr float kAimEffectorForward = 0.60f;
     int handPart = -1;
     const bool chained =
         mob.ChainForEffector(mob.skel_, nw->partIndex, handPart) != nullptr;
-    effector = chained ? 0.0f : (nw->edgeTo - nw->edgeFrom).len();
+    effector = chained ? 0.0f
+                       : (nw->edgeTo - nw->edgeFrom).len() * kAimEffectorForward;
     handPart = -1;
     if (const IkChain* ch =
             mob.ChainForEffector(mob.skel_, nw->partIndex, handPart)) {
