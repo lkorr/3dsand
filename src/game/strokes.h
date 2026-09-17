@@ -161,6 +161,22 @@ struct AttackStyle {
   float reach = 0;
   StyleLunge lunge;
   std::vector<StyleTargetWeight> target;
+  // ---- ...AND WHAT IT GOES FOR WHEN IT IS ON THE GROUND (2026-09-17) ------
+  //
+  // The same table, used instead of `target` when the ATTACKER is prone --
+  // i.e. when its active dismemberment loco state is one that lays the body on
+  // the ground (anim.h AnimStateRule::groundAlign above 0: crawl, squirm).
+  // A thing dragging itself along on its elbows cannot reach your head, and a
+  // zombie whose legs are gone going for the legs is the whole reason the
+  // crawl state is worth having.
+  //
+  // A SECOND AUTHORED TABLE, not a hardcoded rule in the draw: which limbs a
+  // crawler can reach is a fact about that creature's shape, and a rig whose
+  // prone form is a snake rearing up would want the opposite. Empty (the
+  // default, and every style authored before this) means "no change" -- the
+  // ordinary table is used whatever posture the attacker is in, which is
+  // exactly the old behaviour.
+  std::vector<StyleTargetWeight> targetProne;
   // AN AUTHORED BODY ANIMATION TO PLAY WITH THE STROKE, by name (empty = none).
   // The stroke program drives the WEAPON ARM through the melee driver; this is
   // everything else — the step, the shoulder drop, the off hand — keyframed in
@@ -268,6 +284,12 @@ struct StrokeCursor {
   // afresh; a `std::vector` because a stroke meets a handful of slots at most
   // and a set would allocate for every one of them.
   std::vector<uint64_t> struck;
+  // ...and whether this swing has already BITTEN (melee.h EdgeSweep::bitten).
+  // A separate latch and not an entry in the set above, because a bite is once
+  // per STROKE rather than once per slot: one pair of jaws closes on one
+  // thing, however many bodies the head swept past on the way. Cleared by
+  // Reset() with everything else.
+  bool bitten = false;
 
   bool Active() const { return phase != Phase::Idle; }
   bool Cutting() const { return phase == Phase::Cut; }

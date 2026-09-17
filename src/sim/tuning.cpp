@@ -885,6 +885,17 @@ bool LoadTuning(const std::string& path, Tuning& out) {
     // either (see the note in tuning.h) so neither has a floor above it.
     e.infectSpreadRate = std::clamp(e.infectSpreadRate, 0.0f, 240.0f);
     e.infectRotRate = std::clamp(e.infectRotRate, 0.0f, 240.0f);
+    ReadF(*g, "infectMobMult", e.infectMobMult, out, at);
+    e.infectMobMult = std::clamp(e.infectMobMult, 0.0f, 50.0f);
+    // The coat the rot lays on the bone it uncovers. All three are cosmetic
+    // and all three are meaningful at their floor: 0 stain = white bone back,
+    // 0 vary = one flat shade, 0 ichor = the victim's blood only.
+    ReadF(*g, "infectBoneStain", e.infectBoneStain, out, at);
+    e.infectBoneStain = std::clamp(e.infectBoneStain, 0.0f, 15.0f);
+    ReadF(*g, "infectBoneStainVary", e.infectBoneStainVary, out, at);
+    e.infectBoneStainVary = std::clamp(e.infectBoneStainVary, 0.0f, 15.0f);
+    ReadF(*g, "infectBoneIchor", e.infectBoneIchor, out, at);
+    e.infectBoneIchor = std::clamp(e.infectBoneIchor, 0.0f, 1.0f);
     // ---- F. blood is health / G. burns cap health (game/mob.h) -------------
     ReadF(*g, "bleedHpPerVoxel", e.bleedHpPerVoxel, out, at);
     ReadB(*g, "stumpBleedsOpen", e.stumpBleedsOpen, out, at);
@@ -3074,6 +3085,10 @@ bool SaveCombatTuning(const std::string& path, const Tuning& t,
     put("infectHealSlow", g.infectHealSlow);
     put("infectSpreadRate", g.infectSpreadRate);
     put("infectRotRate", g.infectRotRate);
+    put("infectMobMult", g.infectMobMult);
+    put("infectBoneStain", g.infectBoneStain);
+    put("infectBoneStainVary", g.infectBoneStainVary);
+    put("infectBoneIchor", g.infectBoneIchor);
   }
   if (group("gear", lo, hi)) {
     const Tuning::Gear& gr = t.gear;

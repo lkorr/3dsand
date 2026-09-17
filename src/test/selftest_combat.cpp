@@ -2876,6 +2876,27 @@ Status GateBiteTarget(Ctx& c, std::string& detail) {
   check(!sty->target.empty(), "bite_lunge authors a target weight table");
   check(sty->target.size() >= 3,
         "...over at least three tags (bites go for arms and torso too)");
+  // ---- THE ARM IS THE FAVOURITE, NOT THE HEAD (2026-09-17) ---------------
+  //
+  // Asserted on the AUTHORED table rather than on the drawn distribution, and
+  // that is the right scope: 40 draws cannot separate 0.40 from 0.35 at any
+  // honest confidence, so a gate that tried would either be a coin flip or
+  // would need hundreds of draws to say something the content file states
+  // outright. What CAN go wrong is somebody editing the weights back, and this
+  // catches exactly that. The distribution arm below still asserts that the
+  // draw really spreads over tags.
+  {
+    float armW = 0.0f, headW = 0.0f;
+    for (const StyleTargetWeight& w : sty->target) {
+      if (w.tag == "arm") armW = w.weight;
+      if (w.tag == "head") headW = w.weight;
+    }
+    check(armW > headW,
+          "...and it favours the ARM over the head (a throat-first zombie "
+          "reads as a scripted execution, and the head is `vital`)");
+  }
+  check(!sty->targetProne.empty(),
+        "...and authors a PRONE table, for when the biter is on the ground");
 
   std::string why;
   const uint64_t biter =
@@ -2912,7 +2933,8 @@ Status GateBiteTarget(Ctx& c, std::string& detail) {
     // door instead: BeginStroke is what resolves a victim. Rather than wait on
     // a cadence, the draw itself is asked here with the same inputs.
     const int limb = MobSystem::PickTargetLimb(
-        *sty, *c.mobs.FindMobById(prey), biter, tick.tick + (uint32_t)i);
+        *sty, *c.mobs.FindMobById(prey), biter, /*attackerProne=*/0.0f,
+        tick.tick + (uint32_t)i);
     if (limb < 0) continue;
     chosen++;
     const std::string tag = nd.limbs[limb].tag;
@@ -3000,6 +3022,76 @@ Status GateBiteTarget(Ctx& c, std::string& detail) {
         "bite-target: at the PLAYER (actor id 0): no avatar -> targetLimb %d; "
         "avatar registered -> %d/12 drew a limb;%s\n",
         blind, drawn, ps.c_str());
+  }
+
+  // ---- ...AND A CRAWLER GOES FOR THE LEGS (2026-09-17) -------------------
+  //
+  // TWO ARMS, because the feature has two halves that fail independently, and
+  // the second is the seam this gate's own note above was written about.
+  //
+  //   THE DRAW: hand `PickTargetLimb` a prone weight directly and check that
+  //   it switches tables. Same style, same victim and the same ticks as the
+  //   upright sweep above, so the two distributions are comparable and the
+  //   only difference between them is the posture.
+  //
+  //   THE SEAM: take the biter's legs off, let the anim poll run, and check
+  //   that the creature really does report a prone loco state. That is the
+  //   number BeginStroke feeds the draw, and without this arm "crawlers bite
+  //   legs" would pass on a rig whose crawl state nothing ever selects.
+  {
+    std::map<std::string, int> proneTags;
+    int proneDrawn = 0, proneLeg = 0;
+    for (uint32_t k = 0; k < (uint32_t)want; k++) {
+      Mob* pv = c.mobs.FindMobById(prey);
+      if (pv == nullptr) break;
+      const int limb = MobSystem::PickTargetLimb(*sty, *pv, biter,
+                                                 /*attackerProne=*/1.0f,
+                                                 tick.tick + k);
+      if (limb < 0) continue;
+      proneDrawn++;
+      const std::string tag = nd.limbs[limb].tag;
+      proneTags[tag]++;
+      if (tag == "leg") proneLeg++;
+    }
+    // 0.6 against an authored 0.9 is deliberately slack: the weight is split
+    // across the tag's LIVE limbs, and an earlier gate can leave the fixture
+    // short of one, so pinning the authored number would turn this into an
+    // assertion about the fixture's anatomy. What is claimed is "the table
+    // switched", and the upright table puts legs at 0.14.
+    const double legFrac =
+        proneDrawn > 0 ? (double)proneLeg / (double)proneDrawn : 0.0;
+    check(proneDrawn > want / 2, "a prone biter still draws a limb");
+    check(legFrac > 0.6,
+          "...and goes for the LEGS, which is all a crawler can reach");
+    RecordObserved("biteTarget.proneLegFractionObserved", legFrac);
+
+    // THE SEAM: both legs off -> the `crawl` loco state -> groundAlign > 0.
+    float prone = -1.0f;
+    if (Mob* m = c.mobs.FindMobById(biter)) {
+      check(m->LocoGroundAlign() <= 0.0f,
+            "...the biter was NOT prone before its legs came off");
+      // The UPPER leg, by name, exactly as the armless arm of
+      // `unarmed-attack` does: the crawl state's rule lists `legU.L`/`legU.R`
+      // and severing the upper joint takes the whole chain with it.
+      c.mobs.Sever(biter, LimbNamed(nd, "legU.L"));
+      c.mobs.Sever(biter, LimbNamed(nd, "legU.R"));
+      // The state is polled in the anim tick, not at Sever, so this is a few
+      // ticks and not a read straight after the cut.
+      for (int i = 0; i < 6; i++) tick();
+      if (Mob* still = c.mobs.FindMobById(biter))
+        prone = still->LocoGroundAlign();
+    }
+    check(prone > 0.0f,
+          "...and a legless biter really does report a PRONE loco state, "
+          "which is the number BeginStroke feeds the draw");
+    RecordObserved("biteTarget.proneGroundAlignObserved", (double)prone);
+    std::string pt;
+    for (const auto& kv : proneTags)
+      pt += " " + kv.first + "=" + std::to_string(kv.second);
+    std::printf(
+        "bite-target: PRONE biter: %d/%d drew a limb, legs %.0f%%;%s | "
+        "legless groundAlign %.2f\n",
+        proneDrawn, want, legFrac * 100.0, pt.c_str(), (double)prone);
   }
 
   CloseStage(c);

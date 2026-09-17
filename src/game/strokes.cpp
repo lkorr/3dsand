@@ -100,22 +100,35 @@ bool LoadAttackStyles(const std::string& path, StyleLibrary& out,
         log += path + ": style \"" + st.name +
                "\" has a lunge with no speed and no rise — it will not leap\n";
     }
-    if (s.contains("target") && s["target"].is_object()) {
-      for (auto t = s["target"].begin(); t != s["target"].end(); ++t) {
+    // Both target tables read the same way, because they ARE the same table
+    // asked under two postures (strokes.h AttackStyle::targetProne).
+    auto readTargets = [&](const char* key,
+                           std::vector<StyleTargetWeight>& out) {
+      if (!s.contains(key) || !s[key].is_object()) return;
+      for (auto t = s[key].begin(); t != s[key].end(); ++t) {
         if (!t.value().is_number()) continue;
         const float w = t.value().get<float>();
         if (w <= 0.0f) continue;   // a zero weight IS the absent entry
-        st.target.push_back(StyleTargetWeight{t.key(), w});
+        out.push_back(StyleTargetWeight{t.key(), w});
       }
       // Deterministic order, because the draw walks this vector and JSON
       // object order is the library's business, not the author's. Two files
       // that spell the same weights in a different order must pick the same
       // limb from the same (mob, tick) — that is rule 1 applied to content.
-      std::sort(st.target.begin(), st.target.end(),
+      std::sort(out.begin(), out.end(),
                 [](const StyleTargetWeight& a, const StyleTargetWeight& b) {
                   return a.tag < b.tag;
                 });
-    }
+    };
+    readTargets("target", st.target);
+    readTargets("targetProne", st.targetProne);
+    // A prone table with no upright one to fall back to would make the style
+    // aim at the chest while standing and at the legs while crawling, which
+    // is a content bug that looks like a targeting bug.
+    if (!st.targetProne.empty() && st.target.empty())
+      log += path + ": style \"" + st.name +
+             "\" has `targetProne` but no `target` — it will aim at the chest "
+             "unless the attacker is on the ground\n";
     // A CUT THAT GOES NOWHERE IS NOT A CUT. It would pose the blade, commit
     // nothing, and hand back a stroke that could never damage anything — and
     // the only symptom would be an NPC that swings and never hits, which is

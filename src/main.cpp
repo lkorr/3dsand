@@ -3127,7 +3127,7 @@ int RunStrikeShot(GpuContext& ctx, World& world, Simulation& sim, Physics& phys,
                   DebrisSystem& debris, MobSystem& mobs,
                   const ItemLibrary& items, const std::string& attackerSpec,
                   const std::string& styleName,
-                  const std::string& targetSpec) {
+                  const std::string& targetSpec, int tailTicksWanted) {
   const StrikeSide A = ParseStrikeSide(attackerSpec);
   const StrikeSide B =
       ParseStrikeSide(targetSpec.empty() ? std::string("human") : targetSpec);
@@ -3604,7 +3604,7 @@ int RunStrikeShot(GpuContext& ctx, World& world, Simulation& sim, Physics& phys,
     if (!live && wasCutting && tailTicks < 0) tailTicks = 0;
     wasCutting = wasCutting || (s != nullptr && s->Cutting());
     if (tailTicks >= 0) {
-      if (tailTicks >= 20) break;
+      if (tailTicks >= tailTicksWanted) break;
       tailTicks++;
     }
     mobTick();
@@ -3612,9 +3612,17 @@ int RunStrikeShot(GpuContext& ctx, World& world, Simulation& sim, Physics& phys,
   // The last picture is the one the OWNER asked for by name: twenty ticks
   // after the swing is over, which is where the blood has finished running and
   // a rot wound has had time to look like one.
+  //
+  // ...AND A DISEASE IS SLOWER THAN A BLOW. `--shot-strike-tail <n>` moves that
+  // tail, because the wound an INFECTION makes does not exist twenty ticks
+  // after the bite -- the rot is still the size of the teeth. Photographing
+  // what it eventually looks like (a limb worked through to bloodied bone,
+  // Mob::InfectStep) needs hundreds, and the picture is named for the count so
+  // two tails can sit side by side in a directory.
   if (!shotCutStart) shoot("cut_start");
   if (!shotRecover) shoot("recover");
-  shoot("after20");
+  const std::string tailName = "after" + std::to_string(tailTicksWanted);
+  shoot(tailName.c_str());
 
   // ---- WHAT IT DID ------------------------------------------------------
   SampleSlots(mobs, idB, slotsB, bruiseMat, rotMat, after);
@@ -4097,6 +4105,9 @@ int main(int argc, char** argv) {
   // separated string because two of them are creature specs that already use
   // ':' and '+', and a fourth separator on top of those is unreadable.
   std::string shotStrikeA, shotStrikeStyle, shotStrikeB;
+  // Ticks simulated after the stroke ends, before the last --shot-strike
+  // picture. 20 is what a blow needs; an infection needs hundreds.
+  int shotStrikeTail = 20;
   bool shotFluid = false;  // --shot-fluid (MPM water look iteration)
   // --shot-waterfall: the CA falling-column fixture. Its own flag rather
   // than a frame inside --shot because it BUILDS a scene (a terrace, a
@@ -4396,6 +4407,13 @@ int main(int argc, char** argv) {
       // would eat the flag as a creature and report "no mob def named
       // --vk-validation", which is a confusing way to say "you left it out".
       if (i + 1 < argc && argv[i + 1][0] != '-') shotStrikeB = argv[++i];
+    }
+    else if (a == "--shot-strike-tail") {
+      if (i + 1 >= argc) {
+        std::fprintf(stderr, "--shot-strike-tail wants <ticks>\n");
+        return 1;
+      }
+      shotStrikeTail = std::max(0, atoi(argv[++i]));
     }
     else if (a == "--noaudio") noAudio = true;
     else if (a == "--telemetry") telemetryEnabled = true;
@@ -5216,7 +5234,8 @@ int main(int argc, char** argv) {
     return RunMobShot(ctx, world, sim, phys, debris, mobs, items, shotMob);
   if (!shotStrikeA.empty())
     return RunStrikeShot(ctx, world, sim, phys, debris, mobs, items,
-                         shotStrikeA, shotStrikeStyle, shotStrikeB);
+                         shotStrikeA, shotStrikeStyle, shotStrikeB,
+                         shotStrikeTail);
   if (rebaseline) stOpt.rebaseline = true;
 
   // --sweep sim.X=a,b,c [--sweep-gate <gate>]: run the determinism check at
@@ -5853,6 +5872,10 @@ int main(int argc, char** argv) {
   // cursor because the player has two cut states -- the discrete program's and
   // the freeform driver's -- and one swing must mean one impulse in both.
   std::vector<uint64_t> playerStruck;
+  // ...and whether this swing has already BITTEN (melee.h EdgeSweep::bitten).
+  // Once per STROKE rather than once per slot, and cleared on the same line
+  // `playerStruck` is, for the same two-cut-states reason.
+  bool playerBitten = false;
   // --duel-dummy fires once, from inside the tick loop (see the note there).
   bool duelDummySpawned = false;
 
@@ -9441,7 +9464,10 @@ int main(int argc, char** argv) {
           // is the same "is a cut happening" test the sweep gates on -- so a
           // freeform wave and a discrete program both get exactly one blunt
           // hit per body per swing with no mode read of their own.
-          if (!(melee.Cutting() || playerStrike.Cutting())) playerStruck.clear();
+          if (!(melee.Cutting() || playerStrike.Cutting())) {
+            playerStruck.clear();
+            playerBitten = false;
+          }
           if (lastEdgeValid && (melee.Cutting() || playerStrike.Cutting())) {
             EdgeSweep sw;
             sw.aPrev = lastEdgeBase;
@@ -9482,6 +9508,7 @@ int main(int argc, char** argv) {
             // cleared on the tick neither is cutting, which is mode-blind and
             // is the same line the sweep gate below already reads.
             sw.struck = &playerStruck;
+            sw.bitten = &playerBitten;
             // A FIST IS PART OF THE ARM THAT THROWS IT (melee.h selfMounted).
             sw.selfMounted = avatar.EffectorWeapon() != nullptr;
             sw.valid = true;

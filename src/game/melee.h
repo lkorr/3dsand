@@ -608,6 +608,48 @@ struct EdgeSweep {
   // those N is its own blow. Only a live stroke owns one of these
   // (StrokeCursor::struck), and it is cleared when the stroke resets.
   std::vector<uint64_t>* struck = nullptr;
+  // ---- ...AND A MOUTH CLOSES ONCE, ON ONE THING (2026-09-17) -------------
+  //
+  // `struck` above is BY BODY, and for the blunt part that is exactly right: a
+  // swing that crosses an arm and then the chest legitimately bruises both. A
+  // BITE is not that shape. Teeth are one pair of jaws arriving at one place,
+  // and the sweep that carries them tiles the whole travel of the stroke with
+  // rays -- so a lunging zombie whose head passed a shoulder, a chest and an
+  // arm on its way in tore THREE holes, each with its own rot, out of one
+  // snap. Owner report: a single lunge leaving a mark on the head, the torso
+  // and an arm.
+  //
+  // A SECOND LATCH RATHER THAN A RULE ON THE FIRST, because the two really do
+  // disagree: "once per slot" and "once, full stop" are different sentences
+  // and a bite needs the second. Set only when `BiteHit` reports the teeth
+  // found something to close on, so a probe that met a body whose limb lookup
+  // failed does not spend the stroke's one bite on nothing.
+  //
+  // ...AND IT ALSO CLOSES A HOLE IN `struck` THAT ONLY A CARVING IMPULSE CAN
+  // FALL THROUGH, which is the half the A/B actually measured. `struck` is a
+  // set of BODY HANDLES, and a bite CARVES: `CarveLimb` ends in
+  // `Mob::RebuildLimbBody`, whose own comment says "The handle CHANGES" --
+  // Jolt gets a new body built round the new lattice. So the slot the teeth
+  // just tore is no longer in the set under any name, and the next cut tick's
+  // probe meets it as a stranger and bites it again. The blunt part never sees
+  // this because jaws and fists author `bluntCarve` 0 and therefore never
+  // rebuild anything. Measured on `--shot-strike zombie bite_lunge human`,
+  // same seed, same stand-off, latch the only difference: ONE upper arm lost
+  // 6 voxels, 8.2 hp and 22.7 of bleed budget to a single lunge, against 2
+  // voxels, 4.9 hp and 4.5 with the latch in -- three bites reported as one.
+  //
+  // NOTE for whoever gets to the mace: the same hole is open for
+  // `gore.bluntCarveRadius` > 0, because `CarveLimbRadial` reaches the same
+  // rebuild. A blunt weapon with a dent will re-dent the same plate every cut
+  // tick of its stroke, and `struck` cannot see it happening. The real fix is
+  // to key that set on (mob, limb slot) rather than on a handle the impulse
+  // itself invalidates; it is not done here because debris bodies in the same
+  // set have no limb slot to key on.
+  //
+  // NULL MEANS "NO STROKE IDENTITY", exactly as `struck` does, and for the
+  // same reason: `bite-rot` fabricates ten separate sweeps on purpose and each
+  // of them is its own bite.
+  bool* bitten = nullptr;
   // ---- IS THE EDGE PART OF THE WIELDER? (2026-09-15) --------------------
   //
   // A HELD BLADE IS A THING YOU POINT; A FIST IS A THING YOU THROW, and the

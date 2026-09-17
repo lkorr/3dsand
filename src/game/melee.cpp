@@ -968,7 +968,11 @@ EdgeSweepResult MeleeSweepDamage(const EdgeSweep& s, const MeleeTuning& t,
       // ---- 3. THE BITE PART — a tear, and an infection armour refuses ------
       // Once per slot per stroke, like the blunt part above and for the same
       // reason: teeth close once.
-      if (s.strike.bite > 0.0f && firstContact) {
+      // ...and at most ONE bite for the whole stroke (melee.h EdgeSweep::
+      // bitten). `firstContact` alone is per BODY, which lets one lunge tear
+      // the head, the chest and an arm as the jaws sweep past all three.
+      if (s.strike.bite > 0.0f && firstContact &&
+          !(s.bitten != nullptr && *s.bitten)) {
         BiteHit bt;
         bt.at = at;
         bt.hp = s.strike.bite * power;
@@ -991,7 +995,12 @@ EdgeSweepResult MeleeSweepDamage(const EdgeSweep& s, const MeleeTuning& t,
         bt.infectMat = s.strike.infectMat;
         bt.infectStain = s.strike.infectStain;
         bt.seed = hitSeed ^ 0xB17Eu;
-        mobs.BiteHit(hb, bt, world, spawns);
+        // Latched on a LANDED bite, not on an attempted one: `BiteHit` returns
+        // false when the handle no longer resolves to a limb (it was severed
+        // by the cut part a few lines up, say), and spending the stroke's one
+        // bite on that would make a zombie miss for reasons nobody can see.
+        if (mobs.BiteHit(hb, bt, world, spawns) && s.bitten != nullptr)
+          *s.bitten = true;
       }
     }
   }

@@ -1155,6 +1155,18 @@ struct MobLimb {
   // Never saved: a loaded body's rot is already in its lattice, and it heals
   // at the ordinary rate from then on rather than not at all.
   uint16_t infectMat = 0;
+  // ...AND WHAT IT LOOKS LIKE WHERE IT HAS EATEN THROUGH TO THE BONE.
+  //
+  // The LIQUID the bite smeared over the hole (a zombie's `bite.stain`, i.e.
+  // ichor -- 0 = none / not a liquid the palette can draw). Latched beside
+  // `infectMat` for one reason: the rot EATS FLESH AND LEAVES BONE, and bone
+  // is the one thing in the lattice it can neither convert nor remove, so a
+  // limb rotted through used to end up as a white anatomical bone sitting in a
+  // green wound. The infection pass coats what it exposes (Mob::InfectStep),
+  // and the substance it coats it with is a mix of this and the victim's own
+  // blood. Without the latch the pass would have to guess, because by the time
+  // the rot reaches bone the bite that carried the stain is long gone.
+  uint16_t infectStain = 0;
   // THE INFECTION CARRIES NO CLOCK STATE, deliberately. The first version held
   // two fractional accumulators here and spent them in BURSTS of ~32 lattice
   // voxels, to amortise the O(limb) sweep each conversion needs. That is a
@@ -3337,8 +3349,12 @@ class MobSystem {
   // rather than about where wounds ended up, and (later) the Attacks lane's
   // target-weight row. A MobSystem member rather than a free function so it
   // can ask `Mob::LimbAlive`, which is protected.
+  // `attackerProne` is the ATTACKER's `Mob::LocoGroundAlign()` -- above 0 and
+  // the style's `targetProne` table is drawn from instead of its `target` one,
+  // so a crawler goes for what a crawler can reach. Pass 0 for "upright".
   static int PickTargetLimb(const AttackStyle& sty, const Mob& victim,
-                            uint64_t attackerId, uint32_t tick);
+                            uint64_t attackerId, float attackerProne,
+                            uint32_t tick);
   // The item library, so an NPC's sweep can read the damage, carve bonus and
   // HEFT of whatever is in its fist. By POINTER and not owned: items reload on
   // R and a copy here would be a second, stale library. The Mob stores its held

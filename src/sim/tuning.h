@@ -1352,6 +1352,37 @@ struct Tuning {
     // the version that did, and what it looked like).
     float infectSpreadRate = 1.0f;  // world voxels/minute, per infected limb
     float infectRotRate = 0.5f;     // world voxels/minute, per infected limb
+    float infectMobMult = 1.0f;     // multiplier on both rates for mob limbs only
+
+    // ---- ...AND WHAT IT LEAVES STANDING IN THE HOLE ------------------------
+    //
+    // The rot eats TISSUE and cannot touch bone, so a limb rotted through ends
+    // as a clean, near-white skeleton in a green wound -- which is not what
+    // rot looks like. Every voxel the infection takes coats the non-tissue
+    // voxels it was touching (Mob::InfectStep), so bone is bloodied exactly as
+    // it is uncovered. This is the incremental form of a cut's
+    // `CutSoak::boneMin`, which already does it for a blade.
+    //
+    // MEAN COAT on the body-stain 0..15 scale. The coat is an ALPHA over the
+    // voxel's own colour, so this is "how much of the bone is hidden": 15 is
+    // opaque gore, 0 turns the whole thing off and bone comes out white again
+    // (the pre-2026-09-17 behaviour, kept reachable).
+    float infectBoneStain = 11.0f;
+    // ...AND THE SPREAD ROUND IT, +/- this, drawn per voxel and keyed on the
+    // bone voxel's own position so a cell exposed twice does not change
+    // colour. THIS IS THE ROW THAT KEEPS IT READING AS BONE: at 0 every
+    // exposed cell takes the identical amount and the surface is a flat slab
+    // of red, however well chosen the mean. The variation is what lets the
+    // bone show through in patches. Clamped into 0..15 after the jitter, so a
+    // wide spread simply saturates at the ends rather than wrapping.
+    float infectBoneStainVary = 5.0f;
+    // WHICH SUBSTANCE, per voxel: this fraction take the INFECTION's own stain
+    // (the biter's `bite.stain` -- a zombie's ichor, green) and the rest the
+    // victim's blood (dark red). Two hues interleaved at the voxel scale read
+    // as a diseased, mottled surface; 0 or 1 is one flat colour over the
+    // whole exposure. Falls back to whichever of the two exists when the other
+    // does not (a creature with no blood, a biter with no ichor).
+    float infectBoneIchor = 0.45f;
 
     // ========================================================================
     // F. BLOOD IS HEALTH — every drop that leaves a body is hp leaving it

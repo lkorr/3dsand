@@ -1130,6 +1130,9 @@ Status GateBiteInfect(Ctx& c, std::string& detail) {
   }
   const uint32_t rotMat = c.mobs.MaterialIdNamed("rotflesh");
   const uint32_t ichor = c.mobs.MaterialIdNamed("ichor");
+  // Not required: a mob set with no `bone` simply skips the coat claim below
+  // rather than failing a gate about the infection's clock.
+  const uint32_t boneMat = c.mobs.MaterialIdNamed("bone");
   if (!rotMat || !ichor) {
     detail = "materials.json has no `rotflesh` / `ichor`";
     return Status::Skip;
@@ -1146,6 +1149,14 @@ Status GateBiteInfect(Ctx& c, std::string& detail) {
     uint32_t elsewhere = 0;        // rot on OTHER limbs at the end (the jump)
     uint32_t maxStep = 0;          // most voxels gained on any ONE tick
     uint32_t movedTicks = 0;       // ticks on which anything changed at all
+    // ---- BONE THE ROT UNCOVERED (2026-09-17) ------------------------------
+    // Coated BONE voxels, after the bite and at the end. The bite's own soak
+    // already floors a coat on the bone inside its radius (CutSoak::boneMin),
+    // so the claim can only ever be the DELTA -- bone the ROT exposed, past
+    // where the teeth reached, is bone nothing has bloodied unless
+    // Mob::InfectStep does it. `boneDeep1` is the same count at a high
+    // threshold, which is how a FLAT coat is told from a varied one.
+    uint32_t bone0 = 0, bone1 = 0, boneDeep1 = 0;
     bool attached = false;
   };
   auto run = [&](float spread, float rot, int inset) {
@@ -1153,6 +1164,16 @@ Status GateBiteInfect(Ctx& c, std::string& detail) {
     Tuning tt = saved;
     tt.gore.infectSpreadRate = spread;
     tt.gore.infectRotRate = rot;
+    // ...AND THE MULTIPLIER THAT SITS ON TOP OF BOTH. `infectMobMult` is a
+    // debug crank (watch a bite advance without retuning the base rates) and
+    // it multiplies exactly the two numbers this gate authors, so leaving it
+    // at whatever tuning.json happens to hold means the arm is not the arm.
+    // At 4.8 -- a value this tree was carrying -- arm A ran at 28.8 vox/min,
+    // ate a thigh in 114 ticks, collapse-severed the limb and reported "the
+    // infection did not spread", which is a correct measurement of a stump
+    // (the same failure arm A of `bite-rot` has its own note about). A gate
+    // that sets a rate has to set every factor of it.
+    tt.gore.infectMobMult = 1.0f;
     SetCurrentTuning(tt);
     std::vector<ParticleSpawn> spawns;
     const uint64_t id = SpawnTarget(c, t, inset);
@@ -1163,11 +1184,13 @@ Status GateBiteInfect(Ctx& c, std::string& detail) {
              (uint16_t)ichor, 0.85f, 0xB17Eu, spawns);
     r.rot0 = mobs.LimbMaterialCount(id, t.limb, rotMat);
     r.vox0 = mobs.LimbArtVoxelCount(id, t.limb);
+    if (boneMat) r.bone0 = mobs.LimbStainedMatCount(id, t.limb, boneMat, 1);
     // SEEDED, not left at 0: the per-tick step below diffs against the previous
     // reading, and starting from zero would score the bite's own 65 voxels as
     // the first tick's step and make the burst assertion unfailable.
     r.rot1 = r.rot0;
     r.vox1 = r.vox0;
+    r.bone1 = r.bone0;
     uint32_t tick = 40000;
     for (int i = 0; i < kTicks; i++) {
       if (!mobs.LimbBody(id, t.limb)) break;
@@ -1180,6 +1203,13 @@ Status GateBiteInfect(Ctx& c, std::string& detail) {
       const uint32_t was = r.rot1;
       r.rot1 = mobs.LimbMaterialCount(id, t.limb, rotMat);
       r.vox1 = mobs.LimbArtVoxelCount(id, t.limb);
+      // Read every tick, for the reason the two above are: the last reading
+      // taken while the limb was STILL ON is the one that means anything, and
+      // a count taken after a collapse-sever is a count of a stump.
+      if (boneMat) {
+        r.bone1 = mobs.LimbStainedMatCount(id, t.limb, boneMat, 1);
+        r.boneDeep1 = mobs.LimbStainedMatCount(id, t.limb, boneMat, 14);
+      }
       // ---- HOW MUCH MOVES IN ONE TICK ---------------------------------------
       // The reading that catches the defect the first version shipped with. It
       // banked the fractional voxels owed and spent them in bursts of ~32, so
@@ -1217,6 +1247,9 @@ Status GateBiteInfect(Ctx& c, std::string& detail) {
                  (double)(a.vox0 - std::min(a.vox0, a.vox1)));
   RecordObserved("biteInfectAcrossJoint", (double)a.elsewhere);
   RecordObserved("biteInfectControlRot", (double)b.rot1);
+  RecordObserved("biteInfectBoneCoatedAtBite", (double)a.bone0);
+  RecordObserved("biteInfectBoneCoated", (double)a.bone1);
+  RecordObserved("biteInfectBoneCoatedDeep", (double)a.boneDeep1);
   RecordObserved("biteInfectControlVoxels",
                  (double)(b.vox0 - std::min(b.vox0, b.vox1)));
 
@@ -1240,6 +1273,29 @@ Status GateBiteInfect(Ctx& c, std::string& detail) {
   //    burst version owed the same average and delivered it 32 at a time.
   const uint32_t kMaxStep = (uint32_t)BaselineNumber("biteInfectMaxStep", 4);
   const bool gradual = a.maxStep <= kMaxStep;
+  // 5. WHAT IT UNCOVERS IS BLOODIED, NOT WHITE. The rot eats tissue and cannot
+  //    touch bone, so a limb it works through ends as a skeleton -- and before
+  //    2026-09-17 that skeleton was the authored near-white, because the only
+  //    thing that had ever coated bone was a CUT's soak and its radius ends
+  //    where the teeth stopped. Asserted as a delta against the reading taken
+  //    the instant after the bite for exactly that reason: `bone0` is the
+  //    teeth's work, everything past it is the infection's.
+  const bool bonedelta = boneMat == 0 || a.bone1 > a.bone0;
+  //    ...and the control arm proves it is the ROT doing it: with both rates
+  //    at 0 nothing new is uncovered, so nothing new is coated.
+  const bool controlBone = boneMat == 0 || b.bone1 <= b.bone0;
+  //    ...AND IT IS NOT ONE FLAT COLOUR. The coat is an alpha over the bone's
+  //    own shade, so a varied amount is what keeps the exposure reading as
+  //    bone under gore rather than as a slab of paint (gore.infectBoneStainVary
+  //    is the row, and 0 there is the failure this catches). With the shipped
+  //    11 +/- 5 roughly a fifth of the cells land at 14 or 15: all of them
+  //    would mean the mean is pinned at the ceiling, none of them means the
+  //    jitter is gone. Only asked once the sample is big enough for the
+  //    fraction to mean anything -- a gate arm that turns on three voxels is a
+  //    knife edge, not a claim.
+  const uint32_t kVaryMin = (uint32_t)BaselineNumber("biteInfectBoneVaryMin", 12);
+  const bool varied = boneMat == 0 || a.bone1 < kVaryMin ||
+                      (a.boneDeep1 > 0 && a.boneDeep1 < a.bone1);
 
   std::string s = "grew " + std::to_string(a.rot0) + "->" +
                   std::to_string(a.rot1) + " rot over " +
@@ -1250,13 +1306,24 @@ Status GateBiteInfect(Ctx& c, std::string& detail) {
                   std::to_string(a.elsewhere) + " across joints); control " +
                   std::to_string(b.rot0) + "->" + std::to_string(b.rot1) +
                   " rot, " + std::to_string(b.vox0) + "->" +
-                  std::to_string(b.vox1) + " vox";
+                  std::to_string(b.vox1) + " vox; bone coated " +
+                  std::to_string(a.bone0) + "->" + std::to_string(a.bone1) +
+                  " (" + std::to_string(a.boneDeep1) + " deep), control " +
+                  std::to_string(b.bone0) + "->" + std::to_string(b.bone1);
   detail = s;
-  if (grew && ate && controlStill && gradual) return Status::Pass;
+  if (grew && ate && controlStill && gradual && bonedelta && controlBone &&
+      varied)
+    return Status::Pass;
   if (!grew) detail = "the infection did not spread: " + s;
   else if (!ate) detail = "the infection took no voxels: " + s;
   else if (!controlStill)
     detail = "the CONTROL arm moved with both rates at 0: " + s;
+  else if (!bonedelta)
+    detail = "the rot uncovered bone and left it CLEAN (white): " + s;
+  else if (!controlBone)
+    detail = "the CONTROL arm coated bone with both rates at 0: " + s;
+  else if (!varied)
+    detail = "the bone coat is one FLAT amount, not a spectrum: " + s;
   else
     detail = "the rot arrived in SLABS, not voxel by voxel (max " +
              std::to_string(a.maxStep) + "/tick, ceiling " +
