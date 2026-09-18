@@ -556,6 +556,17 @@ static bool LoadMaterialsJson(const std::string& path, std::vector<MaterialDef>&
 
     d.rubble = m.value("rubble", "");
     d.molten = m.value("molten", "");
+    // ---- gore weights (materials.h woundHp / brainHp / rotRate) -------------
+    // All three are CPU-only body rules: nothing here reaches a shader, the
+    // sim, or the world hash. Clamped rather than rejected because a silly
+    // number in a data file should misbehave visibly, not refuse to load.
+    d.woundHp = m.value("woundHp", 1.0f);
+    if (!(d.woundHp >= 0.0f)) d.woundHp = 0.0f;   // also catches NaN
+    d.brainHp = m.value("brainHp", false);
+    // -1 = unauthored, which MobDef resolves per creature against `tissue`.
+    // Only clamp the TOP: the negative sentinel has to survive.
+    d.rotRate = m.value("rotRate", -1.0f);
+    if (d.rotRate > 1.0f) d.rotRate = 1.0f;
     // The tariff base. Derived from density when not authored: a voxel of
     // something heavy is worth more to conjure than a voxel of smoke, which is
     // the right default for the long tail and wrong for exactly the materials
@@ -1085,6 +1096,11 @@ static bool LoadReactionsJson(const std::string& path, std::vector<MaterialDef>&
       }
       if (!on) continue;
     }
+    // infectSpread rules are dropped entirely when the rate is zero, same as
+    // a weather switch that is off: the rot is turned off by the slider.
+    if (r.value("infectSpread", false) &&
+        CurrentTuning().gore.infectSpreadRate <= 0.0f)
+      continue;
 
     ReactionGpu g{};
     g.nbrMat = kNbrAny;
@@ -1209,6 +1225,21 @@ static bool LoadReactionsJson(const std::string& path, std::vector<MaterialDef>&
     if (ignites) {
       const int pct = CurrentTuning().combustion.spreadPct;
       chanceMille = chanceMille * (double)(pct > 0 ? pct : 100) / 100.0;
+      if (chanceMille > 1000.0) chanceMille = 1000.0;
+      if (chanceMille < kReactChanceMinMille) chanceMille = kReactChanceMinMille;
+    }
+    // ---- "infectSpread": grid-side rot, driven by gore.infectSpreadRate -----
+    //
+    // The mob-side infection (Mob::TickInfection) converts tissue at
+    // gore.infectSpreadRate world voxels per minute per limb. These grid rules
+    // are the same disease on world voxels. A grid cell at 30 Hz with chance c
+    // per-mille converts each of its 6 faces at c/1000 per tick, giving
+    // 6 * c/1000 * 1800 = 10.8c expected conversions per cell per minute. So
+    // c = infectSpreadRate / 10.8 to match the mob-side rate. The authored
+    // chance is a placeholder; the tuning value replaces it entirely.
+    // Rate == 0 is handled above (the rule is dropped).
+    if (r.value("infectSpread", false)) {
+      chanceMille = (double)CurrentTuning().gore.infectSpreadRate / 10.8;
       if (chanceMille > 1000.0) chanceMille = 1000.0;
       if (chanceMille < kReactChanceMinMille) chanceMille = kReactChanceMinMille;
     }

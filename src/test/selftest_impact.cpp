@@ -1157,6 +1157,8 @@ Status GateBiteInfect(Ctx& c, std::string& detail) {
     // Mob::InfectStep does it. `boneDeep1` is the same count at a high
     // threshold, which is how a FLAT coat is told from a varied one.
     uint32_t bone0 = 0, bone1 = 0, boneDeep1 = 0;
+    // Cumulative coats applied by the infection (MobLimb::infectBoneCoated).
+    uint32_t boneCoats = 0;
     bool attached = false;
   };
   auto run = [&](float spread, float rot, int inset) {
@@ -1209,6 +1211,14 @@ Status GateBiteInfect(Ctx& c, std::string& detail) {
       if (boneMat) {
         r.bone1 = mobs.LimbStainedMatCount(id, t.limb, boneMat, 1);
         r.boneDeep1 = mobs.LimbStainedMatCount(id, t.limb, boneMat, 14);
+        // ...AND THE COAT AS AN ACT, NOT AS A POPULATION (2026-09-18).
+        // The two censuses above stopped being able to answer "did the rot
+        // bloody what it uncovered" the day the rot was allowed to EAT bone
+        // (materials.json bone.rotRate): a coated bone voxel is converted to
+        // rotflesh a few ticks later and leaves the census, so a coat that is
+        // working perfectly reads as a FALLING count -- observed 9 -> 7. This
+        // counts every coat applied and never decrements.
+        r.boneCoats = mobs.LimbInfectBoneCoated(id, t.limb);
       }
       // ---- HOW MUCH MOVES IN ONE TICK ---------------------------------------
       // The reading that catches the defect the first version shipped with. It
@@ -1250,6 +1260,7 @@ Status GateBiteInfect(Ctx& c, std::string& detail) {
   RecordObserved("biteInfectBoneCoatedAtBite", (double)a.bone0);
   RecordObserved("biteInfectBoneCoated", (double)a.bone1);
   RecordObserved("biteInfectBoneCoatedDeep", (double)a.boneDeep1);
+  RecordObserved("biteInfectBoneCoats", (double)a.boneCoats);
   RecordObserved("biteInfectControlVoxels",
                  (double)(b.vox0 - std::min(b.vox0, b.vox1)));
 
@@ -1280,10 +1291,17 @@ Status GateBiteInfect(Ctx& c, std::string& detail) {
   //    where the teeth stopped. Asserted as a delta against the reading taken
   //    the instant after the bite for exactly that reason: `bone0` is the
   //    teeth's work, everything past it is the infection's.
-  const bool bonedelta = boneMat == 0 || a.bone1 > a.bone0;
+  //    Measured as COATS APPLIED rather than as coated voxels surviving: the
+  //    rot eats bone now, so a voxel this pass bloodies is converted a few
+  //    ticks later and drops out of any census of it (see the note at the
+  //    reading). `boneCoats` only ever rises, so it states the claim -- the rot
+  //    bloodied bone it uncovered -- without the answer depending on whether
+  //    that bone is still standing at the end of the window.
+  const bool bonedelta = boneMat == 0 || a.boneCoats > 0;
   //    ...and the control arm proves it is the ROT doing it: with both rates
-  //    at 0 nothing new is uncovered, so nothing new is coated.
-  const bool controlBone = boneMat == 0 || b.bone1 <= b.bone0;
+  //    at 0 nothing new is uncovered, so nothing new is coated. The bite's own
+  //    soak is not this pass and does not touch the counter.
+  const bool controlBone = boneMat == 0 || b.boneCoats == 0;
   //    ...AND IT IS NOT ONE FLAT COLOUR. The coat is an alpha over the bone's
   //    own shade, so a varied amount is what keeps the exposure reading as
   //    bone under gore rather than as a slab of paint (gore.infectBoneStainVary
@@ -1309,7 +1327,9 @@ Status GateBiteInfect(Ctx& c, std::string& detail) {
                   std::to_string(b.vox1) + " vox; bone coated " +
                   std::to_string(a.bone0) + "->" + std::to_string(a.bone1) +
                   " (" + std::to_string(a.boneDeep1) + " deep), control " +
-                  std::to_string(b.bone0) + "->" + std::to_string(b.bone1);
+                  std::to_string(b.bone0) + "->" + std::to_string(b.bone1) +
+                  "; rot applied " + std::to_string(a.boneCoats) +
+                  " bone coats (control " + std::to_string(b.boneCoats) + ")";
   detail = s;
   if (grew && ate && controlStill && gradual && bonedelta && controlBone &&
       varied)
@@ -1321,7 +1341,7 @@ Status GateBiteInfect(Ctx& c, std::string& detail) {
   else if (!bonedelta)
     detail = "the rot uncovered bone and left it CLEAN (white): " + s;
   else if (!controlBone)
-    detail = "the CONTROL arm coated bone with both rates at 0: " + s;
+    detail = "the CONTROL arm's rot applied bone coats with both rates at 0: " + s;
   else if (!varied)
     detail = "the bone coat is one FLAT amount, not a spectrum: " + s;
   else

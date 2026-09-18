@@ -896,6 +896,8 @@ bool LoadTuning(const std::string& path, Tuning& out) {
     e.infectBoneStainVary = std::clamp(e.infectBoneStainVary, 0.0f, 15.0f);
     ReadF(*g, "infectBoneIchor", e.infectBoneIchor, out, at);
     e.infectBoneIchor = std::clamp(e.infectBoneIchor, 0.0f, 1.0f);
+    ReadF(*g, "brainHpPerVoxel", e.brainHpPerVoxel, out, at);
+    e.brainHpPerVoxel = std::clamp(e.brainHpPerVoxel, 0.0f, 200.0f);
     // ---- F. blood is health / G. burns cap health (game/mob.h) -------------
     ReadF(*g, "bleedHpPerVoxel", e.bleedHpPerVoxel, out, at);
     ReadB(*g, "stumpBleedsOpen", e.stumpBleedsOpen, out, at);
@@ -3089,6 +3091,7 @@ bool SaveCombatTuning(const std::string& path, const Tuning& t,
     put("infectBoneStain", g.infectBoneStain);
     put("infectBoneStainVary", g.infectBoneStainVary);
     put("infectBoneIchor", g.infectBoneIchor);
+    put("brainHpPerVoxel", g.brainHpPerVoxel);
   }
   if (group("gear", lo, hi)) {
     const Tuning::Gear& gr = t.gear;

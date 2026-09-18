@@ -1193,7 +1193,11 @@
       "tags": [
         "organic",
         "dissolvable"
-      ]
+      ],
+      "//woundHp": "Three times skin. Bone is the deepest thing a wound reaches on most limbs, so a blade or blast that takes bone out has done materially more than one that skimmed the surface.",
+      "woundHp": 3,
+      "//rotRate": "THE ROT CHEWS THROUGH BONE, AT HALF SPEED. Bone's `rubble` is dust rather than blood, so it is NOT in MobDef::tissue and before this it was simply invisible to Mob::InfectStep -- an infection ate a limb down to a clean skeleton and then stopped forever. This is the one field that makes it eligible, and 0.5 is literally 'half as likely as flesh to be taken in any given draw'. The wound SOAK still refuses bone (that gate is still `tissue`, on purpose, so a sword hole shows bone through the blood instead of turning it red); only the infection reads this.",
+      "rotRate": 0.5
     },
     {
       "id": "steel",
@@ -2911,7 +2915,9 @@
         "organic",
         "dissolvable"
       ],
-      "molten": "fire"
+      "molten": "fire",
+      "//woundHp": "Twice skin's cost per voxel: a wound that has reached muscle is deeper than one that has not. See the note on `woundHp` in sim/materials.h -- these are RELATIVE weights normalised by the limb's own total, so raising this makes a deep wound cost more THAN A SHALLOW ONE without changing what it costs to destroy the limb outright.",
+      "woundHp": 2
     },
     {
       "//": "leaf_burning for the pine family: pine_needles / pine_dark / pine_lit ignite to this. Same numbers as leaf_burning in every field and the same rules in reactions.json -- the only thing that differs is the palette, which is the plain needle tier's, because a burn-tinted material's colours are the leaf the renderer pulses back to. See leaf_burning's note.",
@@ -2978,6 +2984,31 @@
         "mineral"
       ],
       "molten": "lava"
+    },
+    {
+      "//": "WHAT IS INSIDE THE SKULL. Baked as the open-ended CORE of the head's anatomy recipe (assets/mobs/human.json anatomy.limbs.head), so `brain` is by definition everything the two-voxel bone shell encloses -- there is no geometric brain test anywhere, only this material. Ordinary tissue in every other respect: `rubble: blood` is what puts it in MobDef::tissue, so a wound soaks it and the rot eats it at the full rate without a single special case. What makes it different is `woundHp`, and specifically `brainHp`: every voxel of it destroyed by ANY cause -- rot, a blade, a blast, a spell -- also subtracts gore.brainHpPerVoxel flat, on top of the ordinary volume damage. That is the whole of 'a hit to the brain kills you'; death itself is the existing rule (head hp 0 -> Sever -> vital -> Die), not a new one.",
+      "//id": "MUST stay at a material id <= 127: it is BAKED INTO human.vox, and a .vox palette slot >= 128 is read as an art colour, not a material (sim/voxload.h kArtPaletteBase). Inserted here, directly after `iron` (121), because 122..127 was the only free window above every id any .vox in the repo actually bakes.",
+      "id": "brain",
+      "class": "solid",
+      "density": 1040,
+      "hardness": 6,
+      "rubble": "blood",
+      "//colors": "Pinkish grey, a touch paler and less saturated than muscle so an opened skull reads as a different substance from a cut thigh. Linear light, like every other row.",
+      "colors": [
+        "#b58c93",
+        "#a37c83",
+        "#c49aa1"
+      ],
+      "tags": [
+        "flammable",
+        "organic",
+        "dissolvable"
+      ],
+      "//far": "MANDATORY, not decoration. The far-field cascade has exactly 128 palette slots and they are all owned; a 129th owner is a hard load error (sim/materials.cpp). Brain and flesh are the same colour at 50 m, so they share flesh's slot.",
+      "far": "flesh",
+      "molten": "fire",
+      "woundHp": 1,
+      "brainHp": true
     },
     {
       "//": "BIG TOADSTOOL (analytic TILE plant): one knee-high fly agaric per 7x7 tile, stem in the centre column, cap over a 3x3 footprint two to three cells tall. Worldgen paints the whole footprint with this material and the renderer rebuilds ONE mushroom from the tile hash in every cell of it (plantTileAt in common.wgsl, tracePlant in raymarch.wgsl). Inert like the rest of the undergrowth set.",
@@ -3156,7 +3187,8 @@
       "tags": [
         "flammable",
         "organic",
-        "dissolvable"
+        "dissolvable",
+        "infectious"
       ],
       "molten": "fire"
     },

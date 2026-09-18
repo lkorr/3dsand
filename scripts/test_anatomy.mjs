@@ -20,7 +20,7 @@ const ok = (cond, what) => {
   console.log('  FAIL ' + what); fails++; return false;
 };
 
-const MAT = { skin: 51, linen: 111, flesh: 117, muscle: 118, bone: 56, blood: 32 };
+const MAT = { skin: 51, linen: 111, flesh: 117, muscle: 118, bone: 56, blood: 32, brain: 122 };
 
 // A 9x9x9 solid block split into two models along y: the lower 4 rows and
 // the upper 5. The seam faces are each model's OWN faces, so they read as

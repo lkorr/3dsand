@@ -663,6 +663,51 @@ struct MaterialDef {
   // populated: a powder that authors nothing reads 45, and a non-powder reads
   // 45 too (the field means nothing for it, and 0 would read as a legal angle).
   int32_t reposeDeg = kReposeDegDefault;
+  // ---- WHAT IT COSTS A BODY TO LOSE A VOXEL OF THIS (materials.json) --------
+  //
+  // A RELATIVE WEIGHT, not an hp amount. Mob::CarveLimb charges damage as the
+  // fraction of a limb's own weighted volume that has gone, so these numbers
+  // only ever say how much a voxel of THIS costs COMPARED TO its neighbours --
+  // skin 1, muscle 2, bone 3. Destroying a limb outright still costs exactly
+  // what it always did, because the denominator is that same weighted total;
+  // what changes is that a wound which reached bone now outscores a graze of
+  // the same volume. That is the whole feature, and it is why this is a weight
+  // rather than an hp figure: an absolute cost per voxel would have rebalanced
+  // every weapon in the game the day it landed.
+  //
+  // 1.0 for anything that does not author it, so a material nobody has thought
+  // about behaves exactly as it did before this field existed.
+  float woundHp = 1.0f;
+  // ---- ...AND WHETHER IT IS BRAIN ------------------------------------------
+  //
+  // The one exception to "relative weight" above. A voxel of a material with
+  // this set ALSO subtracts gore.brainHpPerVoxel flat when it is destroyed, by
+  // any cause, on top of its ordinary share of the volume damage. Set on
+  // `brain` alone, and the reason it is a material flag rather than a test for
+  // "inside the head" is that there is no geometric brain anywhere: the head's
+  // anatomy recipe bakes brain as its open-ended core, and after that the
+  // substance is the only thing that knows.
+  //
+  // Death is NOT special-cased off this. The flat charge drives head hp to 0
+  // and the existing rule takes it from there (HpZeroSevers -> Sever -> vital
+  // -> Die), which is the same path a mace to the skull already used.
+  bool brainHp = false;
+  // ---- HOW READILY THE ROT CONVERTS IT -------------------------------------
+  //
+  // Read ONLY by Mob::InfectStep's spread. 1.0 = as fast as flesh, 0.5 = half
+  // as likely to be drawn in any given tick, 0 = the infection cannot touch it.
+  //
+  // NEGATIVE means UNAUTHORED, and that is load-bearing rather than a sentinel
+  // for tidiness: the default has to be "whatever MobDef::tissue already said"
+  // (1 for tissue, 0 for everything else), and that answer depends on the
+  // CREATURE -- tissue is derived per def from which materials crumble to THAT
+  // creature's blood. A plain 0.0 default here would have silently switched the
+  // infection off for every material in the game.
+  //
+  // `bone` authors 0.5, which is the point of the field: bone crumbles to dust,
+  // so it is not tissue, so before this the rot ate a limb down to a clean
+  // skeleton and stopped.
+  float rotRate = -1.0f;
   // Sound sets for this surface, keyed by SLOT ("footstep", "impact",
   // "break", ...). Each value names a set relative to the slot's namespace, so
   // "footstep": "leaf" resolves to the set "footsteps/leaf" — one FOLDER under

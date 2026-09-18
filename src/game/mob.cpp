@@ -819,6 +819,24 @@ bool LoadMobDefs(const std::string& dir, const std::vector<MaterialDef>& mats,
         }
         if (!any) def.tissue.clear();
       }
+      // ---- THE GORE WEIGHTS, FLATTENED (mob.h MobDef::woundHp) -------------
+      // Built here rather than read from `mats` at every voxel because the
+      // damage and infection passes are per-voxel hot paths. `rotRate` is the
+      // only one that needs `tissue`: an unauthored (negative) rate means "do
+      // what tissue already said", which is 1 for tissue and 0 for the rest --
+      // so bone, which crumbles to dust and is therefore not tissue, is
+      // invisible to the rot until materials.json gives it a rate.
+      def.woundHp.assign(mats.size(), 1.0f);
+      def.brainMat.assign(mats.size(), 0);
+      def.rotRate.assign(mats.size(), 0.0f);
+      for (size_t mi = 0; mi < mats.size(); mi++) {
+        def.woundHp[mi] = mats[mi].woundHp;
+        def.brainMat[mi] = mats[mi].brainHp ? 1 : 0;
+        const bool isTissue =
+            def.tissue.empty() || (mi < def.tissue.size() && def.tissue[mi]);
+        def.rotRate[mi] = mats[mi].rotRate >= 0.0f ? mats[mi].rotRate
+                                                   : (isTissue ? 1.0f : 0.0f);
+      }
       // NOT rescaled: this is a COUNT of voxels a wound may still owe, i.e.
       // a volume budget, and volume goes as the cube of the voxel scale. It
       // is gore rate rather than size or shape, so it is left as authored
@@ -1721,6 +1739,7 @@ void MobSystem::OnMaterialsReloaded(const std::vector<MaterialDef>& mats,
   matSelfActive_.clear();
   matHasPair_.clear();
   matHot_.clear();
+  matInfectious_.clear();
   matRewritesNbr_.clear();
   matAttacksBody_.clear();
   stainSlotOfMat_.clear();
@@ -1765,6 +1784,7 @@ void MobSystem::OnMaterialsReloaded(const std::vector<MaterialDef>& mats,
     return any ? (all & ~none) : 0u;
   };
   const uint32_t hotMask = tagBit("hot");
+  const uint32_t infectiousMask = tagBit("infectious");
   const uint32_t dissolvableMask = tagBit("dissolvable");
 
   for (const auto& m : mats) {
@@ -1789,6 +1809,7 @@ void MobSystem::OnMaterialsReloaded(const std::vector<MaterialDef>& mats,
     matHasPair_.push_back(hasPair);
     matRewritesNbr_.push_back(rewritesNbr);
     matHot_.push_back((m.gpu.tagMask & hotMask) != 0 ? 1 : 0);
+    matInfectious_.push_back((infectiousMask && (m.gpu.tagMask & infectiousMask)) ? 1 : 0);
     // Could any of those rewrites land on a creature? See matAttacksBody_.
     uint8_t attacks = 0;
     for (uint32_t ri = 0; ri < m.gpu.reactCount; ri++) {
@@ -2232,6 +2253,10 @@ bool Mob::BuildRig(const MobDef& def, Vec3 origin) {
     limb.voxelsAtSpawn = (uint32_t)(limb.HasFineSkin() ? limb.skinVoxels.size()
                                                        : limb.voxels.size());
     limb.voxelsCharged = limb.voxelsAtSpawn;  // nothing lost, nothing charged
+    // ...and the same totals weighted by substance (mob.h MobLimb::weightAtSpawn).
+    LimbWoundTotals(limb, limb.weightAtSpawn, limb.brainAtSpawn);
+    limb.weightCharged = limb.weightAtSpawn;
+    limb.brainCharged = limb.brainAtSpawn;
     // The body origin is the limb's min corner in WORLD voxels; the collider
     // is built at pitch 1/physScale so its collider-unit local coordinates land
     // in the right physical place. Not an integer cell any more at scale>1,
@@ -9122,12 +9147,21 @@ int Mob::RestoreVoxels(int limbIndex, uint32_t material, int count) {
   if (limb.voxelsAtSpawn > 0)
     limb.hp = std::min(hpMax, limb.hp + hpMax * (float)placed / (float)limb.voxelsAtSpawn);
   limb.voxelsCharged += (uint32_t)placed;
+  // The weighted totals are recomputed rather than incremented: a graft places
+  // whatever substance the donor was made of, so `placed` alone does not say
+  // what was added. Taking the total from the lattice is the same rule the
+  // carve uses and cannot disagree with it.
+  LimbWoundTotals(limb, limb.weightCharged, limb.brainCharged);
   // Art, then collider, the order the carve uses; and the burn index points
   // at the old lattice now.
   if (limb.microModel >= 0) ReskinLimbMicro(limb, skinScale, physScale);
   RebuildLimbBody(limbIndex);
   DropBurnIndex(limb.burn);
   limb.carved = true;
+  const uint32_t matId = material & 0xFFFu;
+  if (limb.infectMat == 0 && sys_ &&
+      matId < sys_->matInfectious_.size() && sys_->matInfectious_[matId])
+    limb.infectMat = (uint16_t)matId;
   return placed;
 }
 
@@ -9363,6 +9397,43 @@ void Mob::EmitCarvedFragment(const MobLimb& src, uint32_t physScale,
     debris_->WoundBody(h, src.xf.pos,
                        partWorldVox * CurrentTuning().gore.corpseBleedPerVoxel,
                        0);
+}
+
+// ---- WHAT THIS LIMB IS WORTH RIGHT NOW, BY SUBSTANCE ------------------------
+//
+// One pass over the authoritative lattice -- the same one `voxelsCharged`
+// counts, so the two totals always describe the same set of voxels. O(n), which
+// is the order CarveLimb is already paying for the array rebuild, the
+// downsample and the connectivity walk; measured against those it does not
+// show up.
+//
+// A def with no weight table (built before materials were available) reports
+// weight == the plain voxel count and no brain, which is the pre-feature
+// behaviour exactly: every voxel weighs 1 and the fraction is the old fraction.
+void Mob::LimbWoundTotals(const MobLimb& limb, float& weight,
+                          uint32_t& brain) const {
+  weight = 0.0f;
+  brain = 0;
+  const bool fine = limb.HasFineSkin();
+  if (!def_) {
+    weight = (float)(fine ? limb.skinVoxels.size() : limb.voxels.size());
+    return;
+  }
+  if (fine) {
+    for (const PrefabVoxel& v : limb.skinVoxels) {
+      const uint32_t m = (uint32_t)(v.material & 0xFFFu);
+      if (m == 0) continue;
+      weight += def_->WoundHpOf(m);
+      if (def_->IsBrain(m)) brain++;
+    }
+  } else {
+    for (const DebrisVoxel& v : limb.voxels) {
+      const uint32_t m = (uint32_t)(v.payload & 0xFFFu);
+      if (m == 0) continue;
+      weight += def_->WoundHpOf(m);
+      if (def_->IsBrain(m)) brain++;
+    }
+  }
 }
 
 bool Mob::CarveLimb(int limbIndex, World& world,
@@ -9631,7 +9702,56 @@ bool Mob::CarveLimb(int limbIndex, World& world,
   const uint32_t lostCount = prevCount > nowCount ? prevCount - nowCount : 0u;
   limb.voxelsCharged = nowCount;
   const float lost = (float)lostCount / (float)at0;
-  limb.hp -= lost * limbDefs_[limbIndex].hp * kCarveDamagePerVolume;
+  // ---- ...AND DEEP MATTER COSTS MORE THAN SHALLOW (2026-09-18) --------------
+  //
+  // `lost` above is the fraction of the limb's VOLUME that went, and it stays
+  // exactly that because everything below still wants it: blood is a volume
+  // (a wound bleeds by how big the hole is, not how deep) and so is the hurt
+  // voice. Only the HP charge moves to a weighted fraction.
+  //
+  // The weights are per material (materials.json `woundHp`: skin 1, muscle 2,
+  // bone 3) and the denominator is this limb's OWN weighted total, so
+  // destroying it outright still costs precisely what it always did --
+  // `weightAtSpawn` cancels. What changes is the ratio between two wounds of
+  // equal volume: one that reached bone now outscores one that skimmed the
+  // skin. Expressing it as a weight rather than as hp-per-voxel is what kept
+  // this from rebalancing every weapon in the game on the day it landed.
+  //
+  // A delta of recomputed totals, for the same reason `voxelsCharged` is one:
+  // voxels leave by four different doors in this function (the predicate, the
+  // spall rounds, the connectivity split, the collider re-derive) and only a
+  // total taken from the live lattice sees all of them.
+  float nowWeight = 0.0f;
+  uint32_t nowBrain = 0;
+  LimbWoundTotals(limb, nowWeight, nowBrain);
+  const float w0 = limb.weightAtSpawn > 0.0f ? limb.weightAtSpawn : (float)at0;
+  const float prevWeight = limb.weightCharged;
+  const float lostWeight =
+      prevWeight > nowWeight ? prevWeight - nowWeight : 0.0f;
+  limb.weightCharged = nowWeight;
+  limb.hp -= (lostWeight / w0) * limbDefs_[limbIndex].hp * kCarveDamagePerVolume;
+  // ---- ...AND THE BRAIN IS NOT A FRACTION OF ANYTHING ----------------------
+  //
+  // The one absolute charge in this function. Every brain voxel destroyed --
+  // by rot, a blade, a blast, a spell, it does not matter which, because they
+  // all arrive here -- subtracts a flat gore.brainHpPerVoxel on top of its
+  // ordinary share of the volume above.
+  //
+  // There is deliberately NO death rule here. This drives head hp to 0 and the
+  // existing machinery does the rest (HpZeroSevers is true for a vital limb,
+  // Sever sees `vital` and calls Die), which is the same path a mace to the
+  // skull has always taken. Compare the note above InfectTick: "There is no
+  // infection-specific death rule and there must not be."
+  const uint32_t lostBrain =
+      limb.brainCharged > nowBrain ? limb.brainCharged - nowBrain : 0u;
+  limb.brainCharged = nowBrain;
+  // A CREATURE BORN BITTEN ARRIVED WITH THOSE HOLES. RotAtSpawn's bites are
+  // the damage a zombie SPAWNED with, not damage it is taking now, so the
+  // brain charge must not fire for them — a zombie whose spawn roll ate five
+  // brain voxels would die before its first tick. Only NEW damage (rot
+  // advancing, a blade, a blast) charges the flat penalty.
+  if (lostBrain && !inSpawnRot_)
+    limb.hp -= (float)lostBrain * CurrentTuning().gore.brainHpPerVoxel;
   // ---- WHAT MAY BLEED, AND WHAT MAY NOT ------------------------------------
   //
   // Two exclusions, both of them reported as bugs and both of them the same
@@ -9743,8 +9863,17 @@ bool Mob::CarveLimb(int limbIndex, World& world,
   // routes to Sever(), which still routes to Die() — the creature dies of
   // damage, it simply does not come apart of it.
   if (collapsed || (limb.hp <= 0 && HpZeroSevers(limbIndex))) {
-    // Sever() re-enters this mob by id and may call Die(); after it, neither
-    // `mob` nor `limb` may be assumed live, so nothing below may touch them.
+    // A vital limb killed by ROT or FIRE (inBurnFlush_) dies WITHOUT detaching.
+    // Sever() for a severable vital limb pops the head off and then Dies,
+    // which is correct for a blade decapitation but wrong for brain damage: the
+    // rot ate the inside, not the neck. Die() directly leaves the head attached
+    // and the corpse collapses as a whole.
+    if (inBurnFlush_ && !collapsed && limbIndex < (int)limbDefs_.size() &&
+        limbDefs_[limbIndex].vital && limbDefs_[limbIndex].severable) {
+      deathCause_ = "vital limb burnt/dissolved away";
+      Die();
+      return false;
+    }
     Sever(limbIndex);
     return false;
   }
@@ -9970,6 +10099,9 @@ bool Mob::CarveLimb(int limbIndex, World& world,
   // to the NEXT carve, which is the same off-by-a-history error in slower form.
   limb.voxelsCharged =
       (uint32_t)(fine ? limb.skinVoxels.size() : limb.voxels.size());
+  // The weighted totals ride the same re-sync, for the same reason: the split
+  // took real substance away and it must not be billed to the next carve.
+  LimbWoundTotals(limb, limb.weightCharged, limb.brainCharged);
 
   // Art, then collider. ReskinLimbMicro may shift the limb origin, and the
   // collider must be built from the voxels in their FINAL frame.
@@ -11128,12 +11260,12 @@ void Mob::BurnTick(uint32_t tick, World& world, std::vector<CellOp>& cellOps,
 //           kLimbCollapseFraction severs, a `vital` limb eaten through kills.
 //           There is no infection-specific death rule and there must not be.
 //
-// WHY IT EVENTUALLY KILLS YOU, which a per-limb disease otherwise would not:
-// when a limb has no tissue left to take, the spread JUMPS A JOINT into a
-// rig-adjacent limb (InfectAcrossJoint), preferring the parent. A bitten hand
-// saturates, goes up the forearm, the arm, and into the torso, which is vital.
-// That jump is parameter-free on purpose -- it is the condition "this limb is
-// full", not a third rate to keep in sync with the other two.
+// INFECTION CROSSES A JOINT AT THE ANCHOR. Each limb is its own sparse
+// lattice: when infection on the source reaches within sqrt(3) lattice cells
+// of the source's joint anchor, the destination seeds one tissue voxel near
+// ITS OWN anchor (the same physical point, in its own frame). This replaced
+// a world-space voxel adjacency test that failed on joints where the two
+// models don't overlap (arms sit outside the torso's voxel cloud).
 //
 // IT ADVANCES BY CHANCE, NOT BY INSTALMENTS, and that is the difference
 // between this reading as a disease and reading as a machine. The first version
@@ -11235,10 +11367,11 @@ bool Mob::InfectTick(uint32_t tick, World& world,
     // voxel the rot took would be a voxel the spread also moved on, which is
     // not a thing either rate says.
     const uint32_t key = (uint32_t)id_ * 0x9E3779B9u + (uint32_t)li * 2654435761u;
+    const float mult = gt.infectMobMult;
     const uint32_t nSpread =
-        InfectDraw(gt.infectSpreadRate * lat * perTick, Hash3(key, tick, 0x5DEEDu));
+        InfectDraw(gt.infectSpreadRate * mult * lat * perTick, Hash3(key, tick, 0x5DEEDu));
     const uint32_t nRot =
-        InfectDraw(gt.infectRotRate * lat * perTick, Hash3(key, tick, 0x2077u));
+        InfectDraw(gt.infectRotRate * mult * lat * perTick, Hash3(key, tick, 0x2077u));
     // THE DICE ARE ROLLED BEFORE ANYTHING IS LOOKED AT, and this is what keeps
     // the pass cheap now that it no longer batches: a tick that converts
     // nothing -- roughly five in seven at the shipped rate -- costs two hashes
@@ -11312,7 +11445,6 @@ bool Mob::InfectStep(int li, uint32_t tick, uint32_t nSpread, uint32_t nRot,
 
   // ---- SPREAD: the tissue the rot is touching ------------------------------
   if (nSpread > 0) {
-    const std::vector<uint8_t>& tissue = def_->tissue;
     std::vector<uint32_t> cand;
     for (uint32_t ri : rotten) {
       const IVec3 p = v.At(ri);
@@ -11321,11 +11453,27 @@ bool Mob::InfectStep(int li, uint32_t tick, uint32_t nSpread, uint32_t nRot,
         if (j == 0) continue;
         const uint32_t m = v.Mat(j - 1) & 0xFFFu;
         if (m == 0 || m == infect) continue;
-        // SOFT TISSUE ONLY, out of the same MobDef::tissue table the wound soak
-        // reads: bone stays bone, and a charred or already-dissolved voxel is
-        // not meat either. One definition of "what a wound may rewrite", not
-        // two that agree until somebody edits one.
-        if (!tissue.empty() && (m >= tissue.size() || !tissue[m])) continue;
+        // WHAT THE ROT MAY EAT, AND HOW READILY (materials.json `rotRate`).
+        //
+        // This used to be the MobDef::tissue boolean the wound soak reads, and
+        // that is why an infection ate a limb down to a clean skeleton and then
+        // stopped forever: bone crumbles to dust rather than blood, so it is
+        // not tissue, so it was invisible here. Now the SUBSTANCE answers --
+        // 1.0 for flesh, 0.5 for bone, 0 for a charred or dissolved voxel --
+        // and the unauthored default is still exactly the old tissue test, so
+        // nothing but bone changed behaviour.
+        //
+        // The rate is rolled AT ADMISSION rather than at conversion: a bone
+        // neighbour enters the candidate pool only half the time, so over many
+        // ticks it converts at half flesh's rate without the draw below having
+        // to know materials exist. Keyed on the voxel and the tick so a given
+        // cell is not re-rolled into the pool every tick until it wins.
+        const float rr = def_->RotRateOf(m);
+        if (!(rr > 0.0f)) continue;
+        if (rr < 1.0f) {
+          const uint32_t roll = Hash3(j, tick, 0xB04Eu) & 0xFFFFu;
+          if ((float)roll * (1.0f / 65536.0f) >= rr) continue;
+        }
         cand.push_back(j - 1);
       }
     }
@@ -11360,11 +11508,65 @@ bool Mob::InfectStep(int li, uint32_t tick, uint32_t nSpread, uint32_t nRot,
         grown++;
       }
     }
-    // SATURATED: no tissue of this limb is touching the rot any more, so the
-    // spread it is owed goes across a joint instead of being dropped. This is
-    // what makes an untreated bite fatal (see the header note).
-    if (grown < nSpread)
-      grown += InfectAcrossJoint(li, tick, nSpread - grown);
+    // Cross a joint when infection on THIS limb has reached the joint area.
+    // Each limb is its own lattice; the destination seeds at ITS OWN anchor
+    // (the same physical point, in its own frame) rather than requiring
+    // world-space voxel adjacency — which failed for joints where the two
+    // models don't overlap (arms: the shoulder anchor sits outside the torso's
+    // voxel cloud, so no torso voxel was ever within range of an arm voxel).
+    if (!rotten.empty()) {
+      const Quat sq{limb.xf.quat[0], limb.xf.quat[1], limb.xf.quat[2],
+                    limb.xf.quat[3]};
+      const uint32_t sc = v.scale;
+      const float invSc = 1.0f / (float)std::max(1u, sc);
+      const float jointR2 = 3.0f;
+      // Lattice extent of the source limb so the joint anchor can be CLAMPED
+      // to the model boundary. The anchor may sit outside the voxel cloud
+      // (arms: the shoulder anchor is 6+ lattice cells past the torso's edge
+      // at skinScale 8). Clamping moves the search centre to the model edge;
+      // the tight 2-cell radius then captures exactly the boundary voxels
+      // without pulling in the whole limb the way a bloated radius did.
+      const uint32_t srcRatio = sc / std::max(1u, v.physScale);
+      const float srcExtX = (float)(v.size.x * (int)std::max(1u, srcRatio));
+      const float srcExtY = (float)(v.size.y * (int)std::max(1u, srcRatio));
+      const float srcExtZ = (float)(v.size.z * (int)std::max(1u, srcRatio));
+      const int nl2 = std::min((int)limbs_.size(), (int)limbDefs_.size());
+      const std::string& self = limbDefs_[li].name;
+      const std::string& up = limbDefs_[li].parent;
+      for (int k = 0; k < nl2; k++) {
+        if (k == li || k >= baseLimbs_ || IsWornSlot(k)) continue;
+        if (!limbs_[k].body || limbs_[k].infectMat != 0) continue;
+        Vec3 jointLocal{};
+        bool adjacent = false;
+        if (!up.empty() && limbDefs_[k].name == up) {
+          adjacent = true;
+          jointLocal = limb.anchorLimb;
+        } else if (!self.empty() && limbDefs_[k].parent == self) {
+          adjacent = true;
+          jointLocal = limbs_[k].anchorRoot - limb.restOffset;
+        }
+        if (!adjacent) continue;
+        const Vec3 jLat{
+            std::clamp(jointLocal.x * (float)sc, 0.5f, srcExtX - 0.5f),
+            std::clamp(jointLocal.y * (float)sc, 0.5f, srcExtY - 0.5f),
+            std::clamp(jointLocal.z * (float)sc, 0.5f, srcExtZ - 0.5f)};
+        std::vector<Vec3> srcWorld;
+        for (uint32_t ri : rotten) {
+          const IVec3 p = v.At(ri);
+          const float dx = (float)p.x + 0.5f - jLat.x;
+          const float dy = (float)p.y + 0.5f - jLat.y;
+          const float dz = (float)p.z + 0.5f - jLat.z;
+          if (dx * dx + dy * dy + dz * dz > jointR2) continue;
+          srcWorld.push_back(
+              limb.xf.pos +
+              Rotate(sq, Vec3{((float)p.x + 0.5f) * invSc,
+                              ((float)p.y + 0.5f) * invSc,
+                              ((float)p.z + 0.5f) * invSc}));
+        }
+        if (srcWorld.empty()) continue;
+        grown += InfectAcrossJoint(li, tick, k, srcWorld);
+      }
+    }
   }
 
   // ---- WHAT THE ROT LEAVES BEHIND IS NOT CLEAN BONE (2026-09-17) -----------
@@ -11458,6 +11660,15 @@ bool Mob::InfectStep(int li, uint32_t tick, uint32_t nSpread, uint32_t nRot,
         MicroBodyPokeStain(*micro, (uint32_t)limb.microModel, bp.x, bp.y, bp.z,
                            next);
       coated++;
+      // CUMULATIVE, and never decremented -- which is the whole point of it.
+      // The obvious reading of "does the rot bloody the bone it uncovers" is a
+      // census of coated bone voxels, and that census became a LIE the moment
+      // the rot was allowed to eat bone (materials.json bone.rotRate): a bone
+      // voxel this pass coats is converted to rotflesh a few ticks later and
+      // drops straight out of it, so a working coat reads as a FALLING number.
+      // Measured: `bone coated 9->7` on a run that was coating correctly the
+      // whole way. This counts the act instead of the survivors.
+      limb.infectBoneCoated++;
     }
   };
 
@@ -11527,78 +11738,85 @@ bool Mob::InfectStep(int li, uint32_t tick, uint32_t nSpread, uint32_t nRot,
   return true;
 }
 
-uint32_t Mob::InfectAcrossJoint(int fromLimb, uint32_t tick, uint32_t nSeed) {
-  if (!def_ || nSeed == 0) return 0;
+uint32_t Mob::InfectAcrossJoint(int fromLimb, uint32_t tick, int toLimb,
+                                const std::vector<Vec3>& srcWorld) {
+  if (!def_ || srcWorld.empty()) return 0;
   const int nl = std::min((int)limbs_.size(), (int)limbDefs_.size());
   if (fromLimb < 0 || fromLimb >= nl) return 0;
+  if (toLimb < 0 || toLimb >= nl) return 0;
   const uint32_t infect = (uint32_t)limbs_[fromLimb].infectMat & 0xFFFu;
   if (infect == 0) return 0;
+  if (!limbs_[toLimb].body || limbs_[toLimb].infectMat != 0) return 0;
+  if (toLimb >= baseLimbs_ || IsWornSlot(toLimb)) return 0;
 
-  // ---- who is next to me, by NAME -----------------------------------------
-  // The rig's adjacency is a parent string on each slot and nothing else keeps
-  // a resolved index; a dozen string compares once per saturation is cheaper
-  // than a second parent table that could disagree with the one the animation
-  // pipeline builds. `limbDefs_` rather than `def_->limbs` because this
-  // creature's rig is the one that has the worn and held slots appended to it.
-  const std::string& self = limbDefs_[fromLimb].name;
-  const std::string& up = limbDefs_[fromLimb].parent;
-  int parent = -1, child = -1;
-  for (int k = 0; k < nl; k++) {
-    if (k == fromLimb || k >= baseLimbs_ || IsWornSlot(k)) continue;
-    if (!limbs_[k].body || limbs_[k].infectMat != 0) continue;
-    if (!up.empty() && limbDefs_[k].name == up) parent = k;
-    else if (!self.empty() && limbDefs_[k].parent == self && child < 0) child = k;
-  }
-  if (to < 0 || to >= nl) return 0;
-  if (!limbs_[to].body || limbs_[to].infectMat != 0) return 0;
-  if (to >= baseLimbs_ || IsWornSlot(to)) return 0;
-
-  MobLimb& dst = limbs_[to];
+  MobLimb& dst = limbs_[toLimb];
   const bool fine = dst.HasFineSkin();
   const uint32_t scale = fine ? SkinScaleOf(dst) : PhysScaleOf(dst);
   const size_t n = fine ? dst.skinVoxels.size() : dst.voxels.size();
   if (n == 0) return 0;
 
-  // ---- WHERE THEY TOUCH ----------------------------------------------------
-  // The rot has to appear AT THE JOINT, not in the middle of the next limb.
-  // Distance ordering survives a rigid transform, so the source limb's centre
-  // is brought into the destination's own lattice frame once and every
-  // comparison below is a subtract and a dot in lattice units -- no per-voxel
-  // rotation, and no world-space vector to keep in sync with the pose.
-  const MobLimb& src = limbs_[fromLimb];
-  const Quat sq{src.xf.quat[0], src.xf.quat[1], src.xf.quat[2], src.xf.quat[3]};
-  const float sinv = 1.0f / (float)std::max(1u, PhysScaleOf(src));
-  const Vec3 srcCentre =
-      src.xf.pos + Rotate(sq, Vec3{(float)src.size.x * 0.5f * sinv,
-                                   (float)src.size.y * 0.5f * sinv,
-                                   (float)src.size.z * 0.5f * sinv});
-  const Quat dq{dst.xf.quat[0], dst.xf.quat[1], dst.xf.quat[2], dst.xf.quat[3]};
-  const Vec3 ref = RotateInv(dq, srcCentre - dst.xf.pos) * (float)scale;
+  // ---- ANCHOR-BASED SEEDING ------------------------------------------------
+  // The caller verified the source has infection near ITS joint anchor. The
+  // destination seeds at ITS OWN anchor — the same physical point, expressed in
+  // the destination's lattice — CLAMPED to the model's bounding box so the
+  // search centre is always inside the voxel cloud. Without clamping, the arm's
+  // shoulder anchor lands 6+ lattice cells outside the torso model and no
+  // tissue is ever found within the tight 2-cell radius.
+  Vec3 dstAnchorWorld;
+  const std::string& srcName = limbDefs_[fromLimb].name;
+  if (limbDefs_[toLimb].parent == srcName) {
+    dstAnchorWorld = dst.anchorLimb;
+  } else {
+    dstAnchorWorld = limbs_[fromLimb].anchorRoot - dst.restOffset;
+  }
+  const uint32_t dstPhys = fine ? PhysScaleOf(dst) : scale;
+  const uint32_t dstRatio = scale / std::max(1u, dstPhys);
+  const float dstExtX = (float)(dst.size.x * (int)std::max(1u, dstRatio));
+  const float dstExtY = (float)(dst.size.y * (int)std::max(1u, dstRatio));
+  const float dstExtZ = (float)(dst.size.z * (int)std::max(1u, dstRatio));
+  const Vec3 jLat{
+      std::clamp(dstAnchorWorld.x * (float)scale, 0.5f, dstExtX - 0.5f),
+      std::clamp(dstAnchorWorld.y * (float)scale, 0.5f, dstExtY - 0.5f),
+      std::clamp(dstAnchorWorld.z * (float)scale, 0.5f, dstExtZ - 0.5f)};
+  const float jointR2 = 3.0f;
 
-  const std::vector<uint8_t>& tissue = def_->tissue;
-  std::vector<std::pair<float, uint32_t>> nearest;
-  nearest.reserve(n);
+  std::vector<uint32_t> candidates;
   for (size_t i = 0; i < n; i++) {
     const uint32_t m =
         fine ? (uint32_t)(dst.skinVoxels[i].material & 0xFFFu)
              : (uint32_t)(dst.voxels[i].payload & 0xFFFu);
     if (m == 0 || m == infect) continue;
-    if (!tissue.empty() && (m >= tissue.size() || !tissue[m])) continue;
+    // Same substance rule as the within-limb spread, and the same admission
+    // roll: bone may be what the infection lands on across a joint, but only
+    // half as readily as flesh, so the seed does not preferentially pick the
+    // skeleton just because it happens to sit nearest the anchor.
+    const float rr = def_->RotRateOf(m);
+    if (!(rr > 0.0f)) continue;
+    if (rr < 1.0f) {
+      const uint32_t roll = Hash3((uint32_t)i, tick, 0x5EEDu) & 0xFFFFu;
+      if ((float)roll * (1.0f / 65536.0f) >= rr) continue;
+    }
     const IVec3 p = fine ? IVec3{dst.skinVoxels[i].x, dst.skinVoxels[i].y,
                                  dst.skinVoxels[i].z}
                          : IVec3{dst.voxels[i].x, dst.voxels[i].y,
                                  dst.voxels[i].z};
-    const Vec3 d{(float)p.x + 0.5f - ref.x, (float)p.y + 0.5f - ref.y,
-                 (float)p.z + 0.5f - ref.z};
-    nearest.push_back({d.dot(d), (uint32_t)i});
+    const float dx = (float)p.x + 0.5f - jLat.x;
+    const float dy = (float)p.y + 0.5f - jLat.y;
+    const float dz = (float)p.z + 0.5f - jLat.z;
+    if (dx * dx + dy * dy + dz * dz <= jointR2)
+      candidates.push_back((uint32_t)i);
   }
-  if (nearest.empty()) return 0;  // the next limb is bone, or already all rot
-  const size_t take = std::min<size_t>(nSeed, nearest.size());
-  std::nth_element(nearest.begin(), nearest.begin() + (take - 1), nearest.end(),
-                   [](const std::pair<float, uint32_t>& a,
-                      const std::pair<float, uint32_t>& b) {
-                     return a.first < b.first;
-                   });
+  if (candidates.empty()) return 0;
+
+  // ONE SEED, drawn uniformly: the within-limb spread takes it from here, and
+  // seeding a single voxel at the joint reads as the infection creeping across
+  // rather than appearing as a patch. The old world-space approach found 1-5
+  // boundary voxels naturally; with the anchor radius the pool is larger, so
+  // drawing one keeps the onset the same.
+  uint32_t ci = 0;
+  if (!InfectTake(candidates, Hash3((uint32_t)id_, tick,
+                                    (uint32_t)toLimb * 0x9E3779B9u), ci))
+    return 0;
 
   MicroBodySet* micro = MicroSet();
   bool poke = false;
@@ -11611,34 +11829,27 @@ uint32_t Mob::InfectAcrossJoint(int fromLimb, uint32_t tick, uint32_t nSeed) {
       poke = true;
     }
   }
-  for (size_t k = 0; k < take; k++) {
-    const uint32_t i = nearest[k].second;
-    const uint32_t rr = Hash3((uint32_t)i, tick, 0xB17Eu);
+  {
+    const uint32_t rr = Hash3(ci, tick, 0xB17Eu);
     const uint16_t w = (uint16_t)(infect | (((rr >> 6) % 3u) << 12));
     IVec3 p;
     if (fine) {
-      dst.skinVoxels[i].material = w;
-      dst.skinVoxels[i].color = 0;
-      p = {dst.skinVoxels[i].x, dst.skinVoxels[i].y, dst.skinVoxels[i].z};
+      dst.skinVoxels[ci].material = w;
+      dst.skinVoxels[ci].color = 0;
+      p = {dst.skinVoxels[ci].x, dst.skinVoxels[ci].y, dst.skinVoxels[ci].z};
     } else {
-      dst.voxels[i].payload = w;
-      dst.voxels[i].color = 0;
-      p = {dst.voxels[i].x, dst.voxels[i].y, dst.voxels[i].z};
+      dst.voxels[ci].payload = w;
+      dst.voxels[ci].color = 0;
+      p = {dst.voxels[ci].x, dst.voxels[ci].y, dst.voxels[ci].z};
     }
     if (poke)
       MicroBodyPoke(*micro, (uint32_t)dst.microModel, p.x, p.y, p.z,
                     (uint8_t)infect, 0);
   }
-  // THE LATCH IS WHAT MAKES IT A LIMB THE PASS VISITS. Without it the voxels
-  // would be rot the disease had forgotten about: dead art, spreading nowhere.
   dst.infectMat = (uint16_t)infect;
-  // The liquid travels with it, or the arm's bone would be bloodied and the
-  // shoulder's -- same disease, one joint along -- would come out white.
   dst.infectStain = limbs_[fromLimb].infectStain;
-  // The destination's dense index, if it has one, needs no fixing up: it is an
-  // occupancy map from position to voxel INDEX, and a rewrite changes neither.
   MarkInstancesDirty();
-  return (uint32_t)take;
+  return 1;
 }
 
 // ============================================================================
@@ -13142,7 +13353,12 @@ bool Mob::BiteHit(uint64_t bodyHandle, const ::BiteHit& hit, World& world,
     const uint32_t took =
         StainWoundAs(li, rep.centreLocal, 0.0f, seed ^ 0x120FEC7u,
                      hit.infectMat, hit.infectStain, &rep.cells, rim);
-    if (took > 0) limbs_[li].infectMat = hit.infectMat;
+    if (took > 0) {
+      limbs_[li].infectMat = hit.infectMat;
+      // ...and the liquid it came in, which is what the rot will paint the
+      // bone with once it has eaten the flesh off it (MobLimb::infectStain).
+      limbs_[li].infectStain = hit.infectStain;
+    }
   } else {
     // An ordinary tear bleeds like any other wound.
     StainWound(li, rep.centreLocal, 0.0f, seed ^ 0x7EA12u, &rep.cells, rim);
@@ -14749,6 +14965,15 @@ uint32_t MobSystem::LimbStainedMatCount(uint64_t mobId, int limbIndex,
   return n;
 }
 
+uint32_t MobSystem::LimbInfectBoneCoated(uint64_t mobId, int limbIndex) const {
+  const Mob* mob = nullptr;
+  for (const Mob& m : mobs_)
+    if (m.id_ == mobId) { mob = &m; break; }
+  if (!mob && avatar_ && avatar_->id_ == mobId) mob = avatar_;
+  if (!mob || limbIndex < 0 || limbIndex >= (int)mob->limbs_.size()) return 0;
+  return mob->limbs_[limbIndex].infectBoneCoated;
+}
+
 // ---- WHAT IS ON THE VOXEL, NOT WHAT THE VOXEL IS ---------------------------
 //
 // `LimbStainedMatCount` above reads `mat` as the voxel's OWN MATERIAL and asks
@@ -15802,6 +16027,9 @@ int Mob::AppendWornShell(const ItemDef& item, const ItemCover& cover,
   p.voxelsAtSpawn =
       (uint32_t)(p.HasFineSkin() ? p.skinVoxels.size() : p.voxels.size());
   p.voxelsCharged = p.voxelsAtSpawn;
+  LimbWoundTotals(p, p.weightAtSpawn, p.brainAtSpawn);
+  p.weightCharged = p.weightAtSpawn;
+  p.brainCharged = p.brainAtSpawn;
 
   // Placed by the SAME two steps the drive loop takes, in the same order, so
   // the wear frame and every frame after it agree and the shell does not pop
@@ -15964,6 +16192,9 @@ void Mob::RestoreShellLattice(int slot, const WornShellDamage& d) {
   // piece's worth of damage to come apart.
   L.voxelsCharged =
       (uint32_t)(L.HasFineSkin() ? L.skinVoxels.size() : L.voxels.size());
+  // Same for the weighted totals; `weightAtSpawn` is left alone for the same
+  // reason `voxelsAtSpawn` is -- it is the authored denominator.
+  LimbWoundTotals(L, L.weightCharged, L.brainCharged);
 
   // Art, then collider, in that order: ReskinLimbMicro may shift the limb
   // origin and the body must be built from the voxels in their FINAL frame.

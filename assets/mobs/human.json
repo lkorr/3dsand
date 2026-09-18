@@ -6,7 +6,7 @@
     "perDamage": 2.5
   },
   "anatomy": {
-    "//": "What is under the skin, by depth from the surface, baked into human.vox by `node scripts/anatomize_mob.mjs human` or the tuner's Apply recipe button (assets/editor/anatomy.js documents the format). Materials by NAME. `keep` leaves the painted surface alone; `garments` are surface voxels that are clothes, so the voxel under them is skin. Head override: a bone skull two deep around a flesh brain.",
+    "//": "What is under the skin, by depth from the surface, baked into human.vox by `node scripts/anatomize_mob.mjs human` or the tuner's Apply recipe button (assets/editor/anatomy.js documents the format). Materials by NAME. `keep` leaves the painted surface alone; `garments` are surface voxels that are clothes, so the voxel under them is skin. Head override: a bone skull two deep around a `brain` core.",
     "layers": [
       {
         "material": "skin",
@@ -33,6 +33,7 @@
       "linen"
     ],
     "limbs": {
+      "//head": "A bone skull two deep around a BRAIN. The core layer is open-ended, so `brain` is by definition everything the shell encloses -- there is no geometric brain test anywhere in the engine, and this recipe is the only thing that decides what is one. Losing a voxel of it costs gore.brainHpPerVoxel flat on top of the ordinary volume damage (materials.json `brain`), which is why the skull in front of it matters: the rot chews bone at half rate (bone.rotRate), so breaching takes time and what is behind goes fast.",
       "head": {
         "layers": [
           {
@@ -49,7 +50,7 @@
             "depth": 2
           },
           {
-            "material": "flesh"
+            "material": "brain"
           }
         ]
       }
@@ -82,7 +83,7 @@
   "limbs": [
     {
       "name": "hips",
-      "hp": 60,
+      "hp": 180,
       "severable": false,
       "tag": "spine"
     },
@@ -90,7 +91,7 @@
       "name": "torso",
       "parent": "hips",
       "joint": "ball",
-      "hp": 60,
+      "hp": 180,
       "severable": false,
       "vital": true,
       "tag": "spine",
@@ -104,7 +105,7 @@
       "name": "head",
       "parent": "torso",
       "joint": "ball",
-      "hp": 45,
+      "hp": 135,
       "severable": true,
       "vital": true,
       "tag": "head",
@@ -124,7 +125,7 @@
       "name": "armU.L",
       "parent": "torso",
       "joint": "ball",
-      "hp": 16,
+      "hp": 48,
       "severable": true,
       "tag": "arm",
       "anchor": [
@@ -167,7 +168,7 @@
       "name": "armL.L",
       "parent": "armU.L",
       "joint": "hinge",
-      "hp": 13,
+      "hp": 39,
       "severable": true,
       "tag": "arm",
       "axis": [
@@ -198,7 +199,7 @@
       "name": "hand.L",
       "parent": "armL.L",
       "joint": "ball",
-      "hp": 9,
+      "hp": 27,
       "severable": true,
       "tag": "hand",
       "anchor": [
@@ -212,7 +213,7 @@
       "name": "armU.R",
       "parent": "torso",
       "joint": "ball",
-      "hp": 16,
+      "hp": 48,
       "severable": true,
       "tag": "arm",
       "anchor": [
@@ -255,7 +256,7 @@
       "name": "armL.R",
       "parent": "armU.R",
       "joint": "hinge",
-      "hp": 13,
+      "hp": 39,
       "severable": true,
       "tag": "arm",
       "axis": [
@@ -286,7 +287,7 @@
       "name": "hand.R",
       "parent": "armL.R",
       "joint": "ball",
-      "hp": 9,
+      "hp": 27,
       "severable": true,
       "tag": "hand",
       "anchor": [
@@ -300,7 +301,7 @@
       "name": "legU.L",
       "parent": "hips",
       "joint": "ball",
-      "hp": 22,
+      "hp": 66,
       "severable": true,
       "tag": "leg",
       "anchor": [
@@ -323,7 +324,7 @@
       "name": "legL.L",
       "parent": "legU.L",
       "joint": "hinge",
-      "hp": 18,
+      "hp": 54,
       "severable": true,
       "tag": "leg",
       "axis": [
@@ -353,7 +354,7 @@
       "name": "foot.L",
       "parent": "legL.L",
       "joint": "hinge",
-      "hp": 12,
+      "hp": 36,
       "severable": true,
       "tag": "foot",
       "axis": [
@@ -374,7 +375,7 @@
       "name": "legU.R",
       "parent": "hips",
       "joint": "ball",
-      "hp": 22,
+      "hp": 66,
       "severable": true,
       "tag": "leg",
       "anchor": [
@@ -397,7 +398,7 @@
       "name": "legL.R",
       "parent": "legU.R",
       "joint": "hinge",
-      "hp": 18,
+      "hp": 54,
       "severable": true,
       "tag": "leg",
       "axis": [
@@ -427,7 +428,7 @@
       "name": "foot.R",
       "parent": "legL.R",
       "joint": "hinge",
-      "hp": 12,
+      "hp": 36,
       "severable": true,
       "tag": "foot",
       "axis": [

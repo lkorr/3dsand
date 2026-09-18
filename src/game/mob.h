@@ -394,6 +394,37 @@ struct MobDef {
   // no material crumbles to), which StainWound reads as "soak everything",
   // the pre-anatomy behaviour.
   std::vector<uint8_t> tissue;
+  // ---- THE GORE WEIGHTS, FLATTENED PER MATERIAL ID -------------------------
+  //
+  // Straight copies of MaterialDef::woundHp / brainHp / rotRate, resolved once
+  // at load into vectors indexed by material id, exactly as `tissue` above is.
+  // The point of flattening is that the damage and infection passes run per
+  // VOXEL on a hot path and must not hold a material table or do a lookup by
+  // name; the point of carrying them per DEF rather than globally is `rotRate`,
+  // whose unauthored default is "whatever tissue said", and tissue is itself
+  // per-creature.
+  //
+  // All three are empty on a def built before materials were available, and
+  // every reader treats empty / past-the-end as the pre-feature default (weight
+  // 1, not brain, rot per `tissue`).
+  std::vector<float> woundHp;
+  std::vector<uint8_t> brainMat;
+  std::vector<float> rotRate;
+  // Per-material weight, defaulting to 1 past the end of the table so a mob
+  // whose def predates the weights behaves exactly as it used to.
+  float WoundHpOf(uint32_t mat) const {
+    return mat < woundHp.size() ? woundHp[mat] : 1.0f;
+  }
+  bool IsBrain(uint32_t mat) const {
+    return mat < brainMat.size() && brainMat[mat] != 0;
+  }
+  // 0 = the rot cannot touch it. Past the end falls back to `tissue`, which is
+  // the behaviour every caller had before rotRate existed.
+  float RotRateOf(uint32_t mat) const {
+    if (mat < rotRate.size()) return rotRate[mat];
+    if (tissue.empty()) return 1.0f;   // "no anatomy" = soak/eat everything
+    return (mat < tissue.size() && tissue[mat]) ? 1.0f : 0.0f;
+  }
   float bleedPerDamage = 1.5f; // wound budget voxels per point of damage
   // ---- IS THIS THING ALIVE? (sidecar `undead`) -----------------------------
   //
@@ -1087,6 +1118,37 @@ struct MobLimb {
   // every carve re-charges everything the limb has ever lost — see the
   // incremental-loss note in Mob::CarveLimb.
   uint32_t voxelsCharged = 0;
+  // ---- THE SAME PAIR, WEIGHTED BY WHAT THE VOXELS WERE MADE OF -------------
+  //
+  // `voxelsAtSpawn` / `voxelsCharged` count voxels; these sum
+  // MobDef::WoundHpOf over the same set, so a bone voxel weighs three times a
+  // skin one. The hp charge in Mob::CarveLimb is driven by THESE, and the raw
+  // counts above stay exactly as they were because SEVERING still reads them:
+  // a limb collapses on the fraction of its VOLUME that is gone, which is a
+  // structural question and has nothing to do with what the volume was made
+  // of. Keeping both is what let the depth weights land without touching
+  // dismemberment at all.
+  //
+  // `brainCharged` is the count of BRAIN voxels already charged, and it is a
+  // separate running total rather than a weight because brain is the one
+  // material that costs an ABSOLUTE hp amount per voxel
+  // (gore.brainHpPerVoxel) on top of its share of the volume.
+  //
+  // All three are deltas against the previous carve, for the same reason
+  // `voxelsCharged` is: removals arrive from the carve predicate, the spall
+  // rounds, the connectivity split and the collider re-derive, and a delta on
+  // a total recomputed from the live lattice catches every one of them
+  // without any of those paths knowing this accounting exists.
+  float weightAtSpawn = 0;
+  float weightCharged = 0;
+  uint32_t brainAtSpawn = 0;
+  uint32_t brainCharged = 0;
+  // How many non-tissue voxels (bone) this limb's infection has COATED over
+  // its life. Cumulative and never decremented, because the rot eats bone now
+  // and so a census of coated bone falls while the coat is working perfectly
+  // -- see the note at the increment in Mob::InfectStep. Diagnostic only:
+  // nothing reads it but the `bite-infect` gate.
+  uint32_t infectBoneCoated = 0;
   // ---- HOW MUCH FLESH THIS LIMB HAS AT ITS JOINT ---------------------------
   // Voxel count inside a sphere of gore.woundNeckRadius around `anchorLimb`,
   // on whichever lattice is authoritative. It is what "hanging by a thread"
@@ -2443,6 +2505,12 @@ class Mob {
                  const LimbCarveFactory& carveAt,
                  const CarveSpall* spall = nullptr,
                  CarveReport* report = nullptr);
+  // Sum MobDef::WoundHpOf over a limb's CURRENT authoritative lattice, and
+  // count its brain voxels, in one pass. This is what MobLimb::weightCharged /
+  // brainCharged are deltas of; see the note on those fields for why the
+  // accounting is a recomputed total rather than a running subtraction.
+  void LimbWoundTotals(const MobLimb& limb, float& weight,
+                       uint32_t& brain) const;
   // ---- ONE BLOB TORN OUT OF A LIMB ----------------------------------------
   //
   // The correlated-noise bite Mob::RotAtSpawn draws the undead's holes with,
@@ -2699,11 +2767,11 @@ class Mob {
   bool InfectStep(int limbIndex, uint32_t tick, uint32_t nSpread,
                   uint32_t nRot, World& world,
                   std::vector<ParticleSpawn>& spawns);
-  // ...and the jump across a joint, when the limb has no tissue left to take.
-  // Arms a rig-adjacent limb's `infectMat` and rewrites its `nSeed` voxels
-  // nearest this one, so the rot appears at the joint rather than in the middle
-  // of the next limb. Returns the number of limbs it lit (0 or 1).
-  uint32_t InfectAcrossJoint(int fromLimb, uint32_t tick, uint32_t nSeed);
+  // Cross-joint infection: converts tissue voxels on `toLimb` that are
+  // world-space adjacent to the infected voxel positions in `srcWorld`.
+  // Returns the number of voxels converted (0 if nothing touched).
+  uint32_t InfectAcrossJoint(int fromLimb, uint32_t tick, int toLimb,
+                             const std::vector<Vec3>& srcWorld);
 
   // Shared services, borrowed from MobSystem (burn tables, micro pool,
   // material tables, event sinks). Never null on a spawned creature.
@@ -3818,6 +3886,11 @@ class MobSystem {
   uint32_t LimbStainCount(uint64_t mobId, int limbIndex, uint32_t minAmt) const;
   uint32_t LimbStainedMatCount(uint64_t mobId, int limbIndex, uint32_t mat,
                                uint32_t minAmt) const;
+  // Cumulative count of bone voxels this limb's rot has bloodied as it
+  // uncovered them (MobLimb::infectBoneCoated). The census above cannot answer
+  // that question any more, because the rot converts bone and a coated voxel
+  // leaves the census the moment it does.
+  uint32_t LimbInfectBoneCoated(uint64_t mobId, int limbIndex) const;
   // ...and the OTHER field on the same voxel: how many cells are WEARING a coat
   // of `coatMat` (0xFFFFFFFF = any) at `minAmt` or deeper. The one above filters
   // on what the voxel IS MADE OF; this filters on what is ON it, which is what
@@ -4247,6 +4320,7 @@ class MobSystem {
   WornStats wornStats_{};
   BurnStats burnStats_{};
   std::vector<uint8_t> matHot_;         // carries tag:hot
+  std::vector<uint8_t> matInfectious_; // carries tag:infectious
   // Material has a pair rule that REWRITES ITS NEIGHBOUR. This is the inbound
   // half of the world coupling and it is what makes acid work with no
   // acid-specific code: `acid + tag:dissolvable -> neighborBecomes air` is
