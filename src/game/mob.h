@@ -1845,6 +1845,16 @@ class Mob {
   // what testing the point costs.
   uint32_t WornAlong(int bodyLimb, const Vec3& from, const Vec3& dir,
                      float dist);
+  // The same march, answering WHICH shell (its rig slot, -1 for none) and
+  // WHERE it was met, for a caller that wants to redirect a blow onto it
+  // rather than merely know the flesh is covered — the melee sweep, which
+  // asks from a flesh hit back along the blade's travel (melee.cpp, "armour
+  // defends from cuts"). `maxSteps` is the caller's own bound on the lattice
+  // march: the burn pass keeps its short kWornMarchMax because it asks per
+  // voxel per tick; a sweep asks a few times per swing and has to cross half
+  // a torso to find the entry side of the coat.
+  int WornShellAlong(int bodyLimb, const Vec3& from, const Vec3& dir,
+                     float dist, int maxSteps, uint32_t* outMat, Vec3* outAt);
   // Does any shell cover this body limb at all? The cheap gate in front of the
   // probe, so an undressed creature never even transforms a point.
   bool LimbHasShells(int bodyLimb) const;

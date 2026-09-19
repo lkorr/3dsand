@@ -16947,7 +16947,16 @@ bool Mob::LimbHasShells(int bodyLimb) const {
 // integrity threshold, no armour value, nothing to tune.
 uint32_t Mob::WornAlong(int bodyLimb, const Vec3& from, const Vec3& dir,
                         float dist) {
-  if (worn_.empty() || bodyLimb < 0) return 0;
+  uint32_t mat = 0;
+  WornShellAlong(bodyLimb, from, dir, dist, kWornMarchMax, &mat, nullptr);
+  return mat;
+}
+
+int Mob::WornShellAlong(int bodyLimb, const Vec3& from, const Vec3& dir,
+                        float dist, int maxSteps, uint32_t* outMat,
+                        Vec3* outAt) {
+  if (outMat) *outMat = 0;
+  if (worn_.empty() || bodyLimb < 0) return -1;
   for (WornPiece& piece : worn_) {
     for (size_t k = 0; k < piece.slots.size(); k++) {
       const int s = piece.slots[k];
@@ -17034,8 +17043,8 @@ uint32_t Mob::WornAlong(int bodyLimb, const Vec3& from, const Vec3& dir,
           dl > 1e-6f ? RotateInv(q, dir * (1.0f / dl)) : Vec3{0, 0, 0};
       // Bounded, like every other loop in this system: a caller asking for a
       // long ray gets a truncated one rather than an unbounded cost.
-      const int steps =
-          std::min(kWornMarchMax, std::max(1, (int)(dist * scale) + 1));
+      const int steps = std::min(std::max(1, maxSteps),
+                                 std::max(1, (int)(dist * scale) + 1));
       for (int st = 0; st < steps; st++) {
         const int lx = ifloor(l.x) - ix.min.x, ly = ifloor(l.y) - ix.min.y,
                   lz = ifloor(l.z) - ix.min.z;
@@ -17043,13 +17052,22 @@ uint32_t Mob::WornAlong(int bodyLimb, const Vec3& from, const Vec3& dir,
             ly < ix.dims.y && lz < ix.dims.z) {
           const uint32_t m =
               ix.mat[(size_t)(((size_t)lz * ix.dims.y + ly) * ix.dims.x + lx)];
-          if (m) return m;
+          if (m) {
+            if (outMat) *outMat = m;
+            // Where along the march the shell was met, back in world voxels:
+            // `st` lattice cells of 1/scale each along the unit direction.
+            if (outAt)
+              *outAt = dl > 1e-6f
+                           ? from + dir * ((float)st / (scale * dl))
+                           : from;
+            return s;
+          }
         }
         l += stepL;
       }
     }
   }
-  return 0;
+  return -1;
 }
 
 // =============================================================================

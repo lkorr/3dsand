@@ -708,6 +708,9 @@ struct EdgeSweepResult {
   int probesAir = 0;       // ...that found nothing at all
   int probesSelf = 0;      // ...that were still inside the wielder at the end
   int probesBody = 0;      // ...that found somebody else
+  // ...that found flesh with a worn shell between it and the blade's travel,
+  // and were redirected onto the shell ("armour defends from cuts").
+  int probesCovered = 0;
   BlockEvent block{};
 };
 

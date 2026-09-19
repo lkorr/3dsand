@@ -787,6 +787,150 @@ Status GateImpactArmor(Ctx& c, std::string& detail) {
     return Status::Fail;
   }
 
+  // ---- ARM C: THE SWORD THROUGH THE REAL SWEEP (2026-09-19) ---------------
+  //
+  // The two arms above build the kerf ON THE SHELL SLOT by hand, so they
+  // measure the hardness rule and nothing about how a stroke FINDS the shell.
+  // The owner's report was "my sword is cutting directly through the plate",
+  // and it was: the probes tiling a blade that has swept into the body start
+  // past the one-micro-thick plate and meet the flesh collider first, and that
+  // flesh was struck as if bare. This arm sweeps the shipped sword THROUGH the
+  // torso's own centre, exactly as impact-blunt's arm A does with the mace,
+  // once dressed and once bare, and the claim is the DIFFERENCE: the bare
+  // torso is cut (or the fixture is measuring nothing) and the dressed one
+  // keeps its flesh while the plate takes the chips.
+  struct Swept {
+    uint32_t fleshBefore = 0, fleshLost = 0;
+    uint32_t shellBefore = 0, shellLost = 0;
+    float hpDrop = 0.0f;
+    int covered = 0;
+    bool ran = false, wore = false;
+  };
+  const int kSweptHits = (int)BaselineNumber("impactArmorSweptHits", 3);
+  auto sweep = [&](bool dressed) -> Swept {
+    Swept r;
+    mobs.Reset();
+    c.debris.Reset();
+    // A wielder that owns nothing in the way, as impact-blunt explains: the
+    // sweep refuses to cut its own wielder, so the victim cannot be it.
+    const uint64_t wid = mobs.Spawn(t.defIndex, FixtureSite(c.world, 405));
+    const uint64_t id = mobs.Spawn(t.defIndex, FixtureSite(c.world, 435));
+    if (!wid || !id) return r;
+    Mob* m = mobs.FindMobById(id);
+    if (!m) return r;
+    if (dressed) {
+      if (!m->WearItem(cuirass, chestSlot)) return r;
+      r.wore = true;
+    }
+    for (int i = 0; i < 8; i++) {
+      std::vector<BrushOp> ops;
+      std::vector<ParticleSpawn> st;
+      std::vector<CellOp> cellOps;
+      mobs.PreTick(3000u + (uint32_t)i, c.world, ops, cellOps, st);
+      c.phys.Step(kTickDt);
+      mobs.PostStep();
+    }
+    mobs.ClearSeverEvents();
+    mobs.ClearSeverStats();
+    Mob* wielder = mobs.FindMobById(wid);
+    m = mobs.FindMobById(id);
+    if (!wielder || !m) return r;
+    int shell = -1;
+    if (dressed) {
+      for (int li = m->AppendedBase(); li < m->LimbCount(); li++)
+        if (m->WornHostOf(li) == t.torso) { shell = li; break; }
+      if (shell < 0) return r;
+      r.shellBefore = mobs.LimbArtVoxelCount(id, shell);
+    }
+    const LimbAxis ax = MeasureLimb(mobs, id, t.torso);
+    r.fleshBefore = mobs.LimbArtVoxelCount(id, t.torso);
+    const float hp0 = mobs.LimbHp(id, t.torso);
+    const Vec3 mid = ax.anchor + ax.along * (ax.reach * 0.5f);
+    const Vec3 cand[3] = {{1, 0, 0}, {0, 1, 0}, {0, 0, 1}};
+    int b = 0;
+    float bd = 2.0f;
+    for (int i = 0; i < 3; i++) {
+      const float d = std::fabs(ax.along.dot(cand[i]));
+      if (d < bd) { bd = d; b = i; }
+    }
+    const Vec3 travel = ax.along.cross(cand[b]).normalized();
+    const Vec3 edge = travel.cross(ax.along).normalized();
+    MeleeTuning mt;
+    ApplyMeleeTuning(mt);
+    const float step = mt.fullSpeed * kTickDt * 1.2f;
+    uint32_t fleshNow = r.fleshBefore;
+    uint32_t shellNow = r.shellBefore;
+    float hpNow = hp0;
+    for (int k = 0; k < kSweptHits && mobs.LimbBody(id, t.torso); k++) {
+      // The edge ends INSIDE the torso, so the sub-steps between the two poses
+      // carry the probes through the plate and into the flesh behind it --
+      // which is the whole failure path this arm exists to run.
+      EdgeSweep sw;
+      sw.aPrev = mid - edge * 1.5f - travel * step;
+      sw.bPrev = mid + edge * 1.5f - travel * step;
+      sw.aNow = mid - edge * 1.5f;
+      sw.bNow = mid + edge * 1.5f;
+      sw.flatNow = Vec3{};   // alignment 1: the claim is not about the ramp
+      sw.dt = kTickDt;
+      sw.halfWidth = 0.12f;
+      sw.strike = sword->strike;
+      sw.heft = 1.0f;
+      sw.tick = 7100u + (uint32_t)k;
+      sw.valid = true;
+      const EdgeSweepResult res = MeleeSweepDamage(sw, mt, *wielder, c.phys,
+                                                   mobs, c.debris, c.world,
+                                                   spawns);
+      if (res.bodiesHit > 0) r.ran = true;
+      r.covered += res.probesCovered;
+      // Read after every blow, so a control arm whose victim dies of the last
+      // cut still reports what the cuts before it took rather than "all of it".
+      if (mobs.IsAlive(id) && mobs.LimbBody(id, t.torso)) {
+        fleshNow = mobs.LimbArtVoxelCount(id, t.torso);
+        hpNow = mobs.LimbHp(id, t.torso);
+        if (shell >= 0 && mobs.LimbBody(id, shell))
+          shellNow = mobs.LimbArtVoxelCount(id, shell);
+      }
+    }
+    r.fleshLost = r.fleshBefore > fleshNow ? r.fleshBefore - fleshNow : 0u;
+    r.shellLost = r.shellBefore > shellNow ? r.shellBefore - shellNow : 0u;
+    r.hpDrop = hp0 - hpNow;
+    mobs.Reset();
+    c.debris.Reset();
+    return r;
+  };
+  const Swept sweptBare = sweep(false);
+  const Swept sweptDressed = sweep(true);
+  if (!sweptDressed.wore) {
+    detail = "the cuirass did not go on the swept rig";
+    return Status::Skip;
+  }
+  RecordObserved("impactArmorSweptBareFleshLost", (double)sweptBare.fleshLost);
+  RecordObserved("impactArmorSweptDressedFleshLost",
+                 (double)sweptDressed.fleshLost);
+  RecordObserved("impactArmorSweptDressedShellLost",
+                 (double)sweptDressed.shellLost);
+  RecordObserved("impactArmorSweptCovered", (double)sweptDressed.covered);
+  // The bare torso is CUT, or nothing below is a measurement.
+  const bool sweptRan = sweptBare.ran && sweptDressed.ran;
+  const bool bareCut = sweptBare.fleshLost > 0;
+  // The dressed one keeps its flesh: at most a fraction of what the bare one
+  // lost AND at most a sliver of the torso, because "a fraction of bare" alone
+  // is satisfied by a bare arm that happened to lose a great deal.
+  const double sweptFrac =
+      BaselineNumber("impactArmorSweptDressedMaxFraction", 0.10);
+  const double sweptTorsoMax =
+      BaselineNumber("impactArmorSweptDressedMaxTorsoFraction", 0.01);
+  const bool sweptSheltered =
+      (double)sweptDressed.fleshLost <=
+          std::max(1.0, (double)sweptBare.fleshLost * sweptFrac) &&
+      (double)sweptDressed.fleshLost <=
+          (double)sweptDressed.fleshBefore * sweptTorsoMax;
+  // ...and the plate took the blows: chipped, and at least one probe that
+  // found flesh was turned back onto it. A sweep that never reached the flesh
+  // at all would pass the two lines above while proving nothing about the
+  // redirect.
+  const bool plateTook = sweptDressed.shellLost > 0 && sweptDressed.covered > 0;
+
   const uint32_t bladeLost =
       blade.shellBefore > blade.shellAfter ? blade.shellBefore - blade.shellAfter : 0u;
   const uint32_t clubLost =
@@ -840,15 +984,23 @@ Status GateImpactArmor(Ctx& c, std::string& detail) {
   // the rewrite is gated on the STRIKE rather than firing on any wound.
   const bool clean = club.rot == 0 && blade.rot == 0;
 
-  const bool ok = skated && sheltered && beatIn && got && dry && clean;
+  const bool ok = skated && sheltered && beatIn && got && dry && clean &&
+                  sweptRan && bareCut && sweptSheltered && plateTook;
   detail = Format(
       "%s/%s in an iron cuirass, x%d each: SWORD took %u/%u shell voxels "
       "(%.1f%%, cap %.0f%%) and %.1f host hp | MACE took %u/%u (%.1f%%) and "
-      "%.1f host hp, bleed budget %.2f (as trauma %.2f, as a cut %.2f), rot %u",
+      "%.1f host hp, bleed budget %.2f (as trauma %.2f, as a cut %.2f), rot %u "
+      "| swept sword x%d through the torso: bare lost %u/%u flesh (hp -%.1f); "
+      "dressed lost %u flesh (hp -%.1f, cap %.0f%% of bare and %.1f%% of the "
+      "torso), plate chipped %u/%u, %d probes turned back onto it%s",
       t.defName.c_str(), mobs.Defs()[t.defIndex].limbs[t.torso].name.c_str(),
       kHits, bladeLost, blade.shellBefore, bladeFrac * 100.0f, chipMax * 100.0,
       bladeHost, clubLost, club.shellBefore, clubFrac * 100.0f, clubHost,
-      club.hostBleed, asTrauma, asACut, club.rot);
+      club.hostBleed, asTrauma, asACut, club.rot, kSweptHits,
+      sweptBare.fleshLost, sweptBare.fleshBefore, sweptBare.hpDrop,
+      sweptDressed.fleshLost, sweptDressed.hpDrop, sweptFrac * 100.0,
+      sweptTorsoMax * 100.0, sweptDressed.shellLost, sweptDressed.shellBefore,
+      sweptDressed.covered, sweptRan ? "" : " (A SWEEP HIT NOTHING)");
   return ok ? Status::Pass : Status::Fail;
 }
 

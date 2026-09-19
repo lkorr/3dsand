@@ -11732,6 +11732,40 @@ whether Jolt can be handed a body at all. `ShedGearBeforeDetach` and
 its piece to the ground registry — there is simply no longer a route that a
 sword opens on its own.
 
+**...and it defends from cuts** (same day; `melee.cpp` "armour defends from
+cuts", `Mob::WornShellAlong`, `impact-armor` arm C). Taking the sever away
+exposed the second half of the owner's report: "my sword is cutting directly
+through the plate". It was. The melee sweep tiles the blade with ray probes
+and re-casts them at up to six sub-steps between the blade's previous and
+current pose; a shell is one micro thick and its collider is that thin surface
+with nothing inside, so the probes of a blade that has already swept INTO the
+body start past the plate and meet the flesh collider first. `StruckKind` is
+answered per body, so that flesh took the whole bare-flesh wound model while
+the first probe from outside chipped the cuirass. `impact-armor` could not see
+it: its two arms build the kerf on the shell slot by hand and never run the
+sweep through the body.
+
+The fix is the burn pass's occlusion question asked of a blow. On a FLESH hit
+whose limb has shells, the sweep marches from the hit point back along the
+blade's TRAVEL (`Mob::WornShellAlong` — `WornAlong` with the slot and the
+meeting point returned, and the caller's own march bound, since a probe that
+started deep in a torso has to cross the flesh's interior to reach the entry
+side of the coat). If a shell is there the blow is RETARGETED onto it before
+any resolver runs: the cut chips the plate under the hardness rule, the blunt
+part dents it and transmits `gear.bluntThrough`, the bite is refused by what
+the shell is made of, and the plate is deduplicated per swing tick like any
+other body. If the march finds nothing — a hole, or a coat burnt away — the
+flesh is exposed and the cut lands. No armour value was added; "wears through
+in holes" is the same emergent statement fire already makes. The flinch keeps
+the flesh handle (a follower shell has no spring), and the march can never
+find the FAR side of the coat, the thing the burn pass's short reach guards
+against, because it walks toward where the blade came from and leaves the body
+on that side. `impact-armor` arm C now sweeps the shipped sword through the
+torso's centre bare and dressed: bare must be cut, dressed must keep its flesh
+(caps in `tests/baseline.json`), and the plate must be chipped with at least
+one probe turned back onto it — or a sweep that never reached the flesh would
+pass while proving nothing.
+
 **The NPC AI panel dresses what it spawns** (`UIState::aiOutfit`, the Spawn
 tab's "wearing:" block). Nothing / random commoner clothes (a dyeable piece per
 slot, each in its own hashed colour) / full plate (every slot's `iron_*` piece)

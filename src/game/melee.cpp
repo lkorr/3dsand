@@ -790,7 +790,7 @@ EdgeSweepResult MeleeSweepDamage(const EdgeSweep& s, const MeleeTuning& t,
       // overload for. One list per sweep, not per probe -- a rig is a dozen
       // bodies and this loop runs up to thirty times.
       float frac = 1.0f;
-      const uint64_t hb = phys.CastRayBody(p, dir, probe, frac, selfBodies);
+      uint64_t hb = phys.CastRayBody(p, dir, probe, frac, selfBodies);
       out.probesCast++;
       if (!hb) {
         out.probesAir++;
@@ -807,7 +807,7 @@ EdgeSweepResult MeleeSweepDamage(const EdgeSweep& s, const MeleeTuning& t,
       bool seen = false;
       for (uint64_t h : hitBodies) seen |= (h == hb);
       if (seen) continue;
-      const Vec3 at = p + dir * (frac * probe);
+      Vec3 at = p + dir * (frac * probe);
 
       // A PROBE THAT DID FIND A WEAPON. The geometric test above is what
       // actually detects parries; this is the safety net for the rare ray that
@@ -816,18 +816,9 @@ EdgeSweepResult MeleeSweepDamage(const EdgeSweep& s, const MeleeTuning& t,
       // borrowed slot the item filled (Mob::EquipItem), so this cannot drift
       // from what is really in the fist, and it is the same distinction
       // Mob::StainWound draws when it refuses to bleed a sword.
-      {
-        int li = -1;
-        Mob* owner = mobs.FindOwner(hb, &li);
-        if (owner != nullptr && li >= 0 && li == owner->HeldSlot()) continue;
-      }
-      hitBodies.push_back(hb);
-      // FIRST contact wins: a sweep that catches two limbs made one noise, and
-      // it was made where the blade arrived first.
-      if (!out.hasHitAt) {
-        out.hitAt = at;
-        out.hasHitAt = true;
-      }
+      int li = -1;
+      Mob* owner = mobs.FindOwner(hb, &li);
+      if (owner != nullptr && li >= 0 && li == owner->HeldSlot()) continue;
 
       // ---- WHAT WAS STRUCK, ASKED ONCE (game/impact.h StruckKind) ----------
       //
@@ -839,12 +830,103 @@ EdgeSweepResult MeleeSweepDamage(const EdgeSweep& s, const MeleeTuning& t,
       // this), anything else appended is a worn shell, and a body with no
       // owner at all is debris.
       StruckKind kind = StruckKind::Debris;
-      {
-        int li = -1;
-        Mob* owner = mobs.FindOwner(hb, &li);
-        if (owner != nullptr && li >= 0)
-          kind = li < owner->AppendedBase() ? StruckKind::Flesh
-                                            : StruckKind::Shell;
+      if (owner != nullptr && li >= 0)
+        kind = li < owner->AppendedBase() ? StruckKind::Flesh
+                                          : StruckKind::Shell;
+
+      // ---- ARMOUR DEFENDS FROM CUTS (2026-09-19) ---------------------------
+      //
+      // A shell is one authored micro thick and its collider is that thin
+      // surface with nothing inside, so the probes tiling a blade that has
+      // already SWEPT INTO the body start past the plate and see the flesh
+      // collider first. Until this, that flesh was struck as if bare: the
+      // first probe from outside chipped the cuirass, the next sub-step's
+      // probes cut the torso underneath, and from the player's side the sword
+      // went straight through the plate. The `impact-armor` gate could not see
+      // it because it built the kerf on the shell slot by hand rather than
+      // sweeping through the body (it does both now).
+      //
+      // The fix is the burn pass's own occlusion question asked of a blow: from
+      // where the blade met the flesh, back along the blade's TRAVEL, is there
+      // a shell in the way? If so the blow belongs to the shell — retargeted
+      // here, before any resolver, so the cut chips the plate (Mob::CutLimb's
+      // hardness rule), the blunt part dents it and transmits through it
+      // (Mob::BluntHit's shell branch), and the bite is refused by whatever
+      // the shell is made of. If the march finds nothing — the plate has a
+      // hole there, or the coat burnt away — the flesh is exposed and the cut
+      // lands. "Armour wears through in holes" stays emergent: no armour
+      // value, nothing to tune, the same probe fire reads.
+      //
+      // Back along the TRAVEL rather than along the probe ray: a probe runs
+      // down the blade's own axis and the blade arrived along the swing, so
+      // the plate the edge had to pass to reach this cell is in that direction
+      // (a thrust's two are the same). A press with no travel asks along the
+      // ray instead. The reach is half a torso plus a coat: from a probe that
+      // started deep inside the body the march has to cross the flesh's own
+      // interior (the shell index holds nothing there) before it meets the
+      // entry side. It can never find the far side, which is what the burn
+      // pass's short reach guards against, because it marches TOWARD where
+      // the blade came from and leaves the body on that side.
+      //
+      // The flinch keeps the flesh handle: the body reacts where it was hit,
+      // and a follower shell (MobLimb::wornHost) has no spring of its own.
+      // The dedup then runs on the SHELL's handle, so the plate is resolved
+      // once per swing tick like every other body.
+      const uint64_t struckBody = hb;
+      if (kind == StruckKind::Flesh && owner->LimbHasShells(li)) {
+        const Vec3 back = (sweepDir.len() > 1e-4f ? sweepDir * -1.0f
+                                                  : dir * -1.0f)
+                              .normalized();
+        constexpr float kCoverReach = 6.0f;   // world voxels
+        constexpr int kCoverSteps = 64;       // lattice cells, whatever scale
+        // A HOLE IS AS WIDE AS THE BLADE, OR IT IS A SCRATCH. One march is one
+        // lattice cell wide, and the chip a sword leaves in iron is a one-cell
+        // slit along the blade's own edge line — exactly the line the next
+        // identical stroke's probes march down. Measured with a single ray:
+        // the first stroke chipped the plate and the second went through the
+        // scratch as if the plate were not there (impact-armor arm C, 30 flesh
+        // voxels from a cuirass). So the march is a small BUNDLE — the centre
+        // plus four rays offset by the blade's carve radius across its travel
+        // — and the flesh is exposed only if NONE of them meets the shell: the
+        // gap has to be at least the blade's width. A mace's dent (a radius of
+        // voxels, not a cell) still reads as open, and a slit still wears the
+        // plate: two strokes side by side merge into a hole.
+        Vec3 u = back.cross(Vec3{0, 1, 0});
+        if (u.len() < 0.15f) u = back.cross(Vec3{1, 0, 0});
+        u = u.normalized();
+        const Vec3 v = back.cross(u).normalized();
+        const float spread = std::max(radius, 0.15f);
+        const Vec3 origins[5] = {at, at + u * spread, at - u * spread,
+                                 at + v * spread, at - v * spread};
+        int shell = -1;
+        Vec3 coverAt{};
+        for (const Vec3& o : origins) {
+          Vec3 hitAt{};
+          const int sh = owner->WornShellAlong(li, o, back, kCoverReach,
+                                               kCoverSteps, nullptr, &hitAt);
+          if (sh < 0) continue;
+          shell = sh;
+          coverAt = hitAt;
+          break;
+        }
+        const uint64_t sb =
+            shell >= 0 ? mobs.LimbBody(owner->Id(), shell) : 0ull;
+        if (sb != 0ull) {
+          out.probesCovered++;
+          bool shellSeen = false;
+          for (uint64_t h : hitBodies) shellSeen |= (h == sb);
+          if (shellSeen) continue;   // the plate already took this swing
+          hb = sb;
+          at = coverAt;
+          kind = StruckKind::Shell;
+        }
+      }
+      hitBodies.push_back(hb);
+      // FIRST contact wins: a sweep that catches two limbs made one noise, and
+      // it was made where the blade arrived first.
+      if (!out.hasHitAt) {
+        out.hitAt = at;
+        out.hasHitAt = true;
       }
 
       // LIVE FLESH CARVES; DEBRIS MELTS. The same two populations the laser
@@ -876,7 +958,7 @@ EdgeSweepResult MeleeSweepDamage(const EdgeSweep& s, const MeleeTuning& t,
       // ONE LINE, THREE POPULATIONS: an NPC hit by the player, the player hit
       // by an NPC, and an NPC hit by an NPC all arrive here, because all three
       // swing through this function.
-      mobs.HitReact(hb, sweepDir, s.strike.Total(), power);
+      mobs.HitReact(struckBody, sweepDir, s.strike.Total(), power);
 
       // The draw key every part below shares, so a replay of the same tick
       // against the same probe cuts, bruises and tears identically. One
