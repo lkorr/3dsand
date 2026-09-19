@@ -967,7 +967,8 @@ bool LimbBoxCorners(const PlayerAvatar& av, Physics& phys, int part,
 // and the origin of a heavily dismembered body is nowhere near the part of it
 // you can still see (the same lesson --shot-mob learned about corpses).
 PortraitCam MakePortraitCam(const PlayerAvatar& av, Physics& phys, float yaw,
-                            float pitch, float aspect) {
+                            float pitch, float aspect, float zoom,
+                            float panX, float panY) {
   PortraitCam pc;
   if (!av.Spawned() || !av.Def()) return pc;
   Vec3 lo{1e9f, 1e9f, 1e9f}, hi{-1e9f, -1e9f, -1e9f};
@@ -987,31 +988,19 @@ PortraitCam MakePortraitCam(const PlayerAvatar& av, Physics& phys, float yaw,
   pc.target = (lo + hi) * 0.5f;
   pc.tanHalf = std::tan(CurrentTuning().camera.fovY * 0.5f);
   pc.aspect = aspect;
-  // FIT HEIGHT AND WIDTH SEPARATELY, but take the width from the HORIZONTAL
-  // RADIUS rather than from the box's x or z extent. Both halves of that matter:
-  //   * a bounding SPHERE is far too loose for a standing figure — the body is
-  //     ~17 voxels tall and ~6 across, so the diagonal is nearly the height and
-  //     fitting it leaves the character a third of the frame with air all round;
-  //   * but the box's own x/z extents SWING as the orbit turns, so a fit taken
-  //     from them would make the character breathe in and out while you drag.
-  // The horizontal radius is the largest half-extent in the ground plane, which
-  // is rotation-invariant, and the height does not rotate at all.
   const Vec3 half = (hi - lo) * 0.5f;
   const float halfH = std::max(0.5f, half.y);
   const float radiusXZ = std::max(0.5f, std::max(half.x, half.z));
   const float fitV = halfH / pc.tanHalf;
   const float fitH = radiusXZ / (pc.tanHalf * std::max(aspect, 1e-3f));
-  // The margin covers two things at once: air around the silhouette, and the
-  // fact that a camera TILTED off the horizontal needs more vertical room than
-  // the body's own half-height (the tilt swings the frame off the box centre,
-  // and a fit computed as if it were level crops the head).
-  const float dist = std::max(fitV, fitH) * 1.28f;
+  const float dist = std::max(fitV, fitH) * 1.28f / std::max(zoom, 0.1f);
 
-  // Orbit: the camera looks ALONG (yaw, pitch) and is pushed back down that
-  // ray from the target. Pitch is clamped by the panel that produces it, so
-  // this needs no second clamp — one owner for one rule.
   pc.cam.yaw = yaw;
   pc.cam.pitch = pitch;
+  // Pan: shift the target along the camera's right and up axes, scaled by the
+  // body's half-height so the pan amount is body-size-invariant.
+  pc.target = pc.target + pc.cam.Right() * (panX * halfH) +
+              pc.cam.Up() * (panY * halfH);
   pc.eye = pc.target - pc.cam.Forward() * dist;
   pc.valid = true;
   return pc;
@@ -5979,7 +5968,9 @@ int main(int argc, char** argv) {
     float power = 0.0f;   // 0..1
     Vec3 at{};
   };
-  CombatCueRequest combatWhooshCue, combatFleshCue, combatClangCue;
+  CombatCueRequest combatWhooshCue, combatFleshCue, combatClangCue,
+                   combatStrikeCue, combatCutCue;
+  bool combatStrikeEdged = true;
   // The swing whoosh fires on the EDGE into Slash, not while Slash is held:
   // committing is a moment, and a per-tick test would play the sample five
   // times over one cut. Remembered across frames, so the edge survives a frame
@@ -6003,6 +5994,12 @@ int main(int argc, char** argv) {
   // not need a Mob, because a parry between two NPCs has no player in it.
   auto CombatBlockCue = [&](const Vec3& at, float power) {
     const float pw = std::clamp(power, 0.0f, 1.0f);
+    if (!combatStrikeCue.pending || pw > combatStrikeCue.power) {
+      combatStrikeCue.power = pw;
+      combatStrikeCue.at = at;
+      combatStrikeEdged = true;
+    }
+    combatStrikeCue.pending = true;
     if (!combatClangCue.pending || pw > combatClangCue.power) {
       combatClangCue.power = pw;
       combatClangCue.at = at;
@@ -7149,7 +7146,29 @@ int main(int argc, char** argv) {
         if (ui.prefabSelected >= (int)prefabs.size()) ui.prefabSelected = 0;
         // mob defs too (tuning dummy.json live is the test loop); live mobs
         // reference the old defs by index, so they respawn fresh
-        mobs.Reset();
+        // EVERY HOLDER OF A MODEL INDEX DIES BEFORE THE TABLE IT INDEXES.
+        //
+        // A micro model index is a POSITION in `mbSet.models`, and the rebuild
+        // below throws that vector away and packs a new one. Live mobs had to
+        // go anyway (they hold DEF indices, hence the old `mobs.Reset()` here);
+        // debris bodies and the avatar hold BRICK indices and were being left
+        // behind — so every corpse, gib, severed limb and dropped item on the
+        // ground came out of the reload drawing whatever def happened to land
+        // at its old position. That is the limb swap that SURVIVED the fix to
+        // the sever path (92fb188): a leg redrawn as a torso, your arm as a
+        // zombie's head, arriving on an R / F5 / a combat-slider edit rather
+        // than on a kill. The stale holders also FREE against the new table
+        // later, which is how one corpse hands a live creature's brick to a
+        // third body — `build/microbody_audit.log` is full of exactly that,
+        // every offending holder a debris body ("holds model 212 of 184").
+        //
+        // Reset, not remap: the shared records line up again only if the assets
+        // are byte-identical, and every copy-on-write clone (a carve, a char, a
+        // bloodied limb) is gone whatever we do. Through BodyRegistry because
+        // that is the one type that enumerates ALL THREE holder populations —
+        // a fourth system arriving must be dropped here too, and the gate that
+        // pins this calls the same function.
+        BodyRegistry(debris, mobs, &avatar, &mbSet).ReleaseMicroHolders();
         mobs.OnMaterialsReloaded(mats, reactions);
         std::vector<MobDef> mobDefs;
         std::string mlog;
@@ -9582,11 +9601,29 @@ int main(int argc, char** argv) {
               // same sound.
               CombatCueRequest& q = flesh ? combatFleshCue : combatClangCue;
               const float pw = res.power * res.edgeAlign;
+              const Vec3 hitAt = (sw.aNow + sw.bNow) * 0.5f;
               if (!q.pending || pw > q.power) {
                 q.power = pw;
-                q.at = (sw.aNow + sw.bNow) * 0.5f;
+                q.at = hitAt;
               }
               q.pending = true;
+              // Weapon impact layer: the sword's ring or the mace's thud,
+              // on ANY body contact regardless of flesh/armor.
+              const bool edged = sw.strike.cut > sw.strike.blunt;
+              if (!combatStrikeCue.pending || pw > combatStrikeCue.power) {
+                combatStrikeCue.power = pw;
+                combatStrikeCue.at = hitAt;
+                combatStrikeEdged = edged;
+              }
+              combatStrikeCue.pending = true;
+              // Wet cutting layer: edged weapons contacting flesh.
+              if (flesh && edged) {
+                if (!combatCutCue.pending || pw > combatCutCue.power) {
+                  combatCutCue.power = pw;
+                  combatCutCue.at = hitAt;
+                }
+                combatCutCue.pending = true;
+              }
             }
           }
           lastEdgeBase = eb;
@@ -10061,19 +10098,28 @@ int main(int argc, char** argv) {
         // tick loop, which runs 0..4 times a frame, and audio is a per-frame
         // job.
         //
-        // A SWORD BLOW CAN LEGITIMATELY MAKE FOUR SOUNDS: `whoosh` when the
-        // cut committed, `flesh` when it landed, then the creature's own
-        // `hurt` (or `sever` + `dismember` if a limb came off) from the blocks
-        // below. They are four different facts about one event and a fight is
-        // less readable without any of them — but the FIRST TWO are what tell
-        // the player about their own action, so they go first.
+        // A SWORD BLOW CAN LEGITIMATELY MAKE SIX SOUNDS: `whoosh` when the
+        // cut committed, `strike_edge` or `strike_blunt` for the weapon's own
+        // ring/thud, `flesh` when it landed on a body, `cut` for the wet
+        // slicing of an edged weapon in flesh, then the creature's own `hurt`
+        // (or `sever` + `dismember` if a limb came off) from the blocks below.
         if (combatWhooshCue.pending) {
           audioCues.Combat(audio::Cues::CombatCue::Whoosh, combatWhooshCue.at,
                            combatWhooshCue.power);
         }
+        if (combatStrikeCue.pending) {
+          audioCues.Combat(combatStrikeEdged
+                               ? audio::Cues::CombatCue::StrikeEdge
+                               : audio::Cues::CombatCue::StrikeBlunt,
+                           combatStrikeCue.at, combatStrikeCue.power);
+        }
         if (combatFleshCue.pending) {
           audioCues.Combat(audio::Cues::CombatCue::Flesh, combatFleshCue.at,
                            combatFleshCue.power);
+        }
+        if (combatCutCue.pending) {
+          audioCues.Combat(audio::Cues::CombatCue::Cut, combatCutCue.at,
+                           combatCutCue.power);
         }
         if (combatClangCue.pending) {
           audioCues.Combat(audio::Cues::CombatCue::Clang, combatClangCue.at,
@@ -10168,6 +10214,8 @@ int main(int argc, char** argv) {
       combatWhooshCue.pending = false;
       combatFleshCue.pending = false;
       combatClangCue.pending = false;
+      combatStrikeCue.pending = false;
+      combatCutCue.pending = false;
       // (The hit flash is NOT decayed here. It ages on the tick, inside
       // MobSystem::PreTick, because a frame-driven decay is never called by
       // the selftest — see MobSystem::DecayHitFlash.)
@@ -10595,12 +10643,79 @@ int main(int argc, char** argv) {
         // this is a comment: a rig's forward is (sin h, ., cos h) while a
         // Camera's is (cos yaw, ., sin yaw), so a camera LOOKING AT the face
         // needs forward == -rigForward, i.e. yaw = atan2(-cos h, -sin h).
+        // Reset: set TARGETS to defaults — the lerp below animates there.
+        if (ui.portraitReset) {
+          ui.portraitZoomTarget = 1.0f;
+          ui.portraitPanXTarget = 0.0f;
+          ui.portraitPanYTarget = 0.0f;
+          ui.portraitReset = false;
+        }
+        // Focus on a limb: compute its world-space bounding box and set
+        // TARGETS so the portrait smoothly frames the limb.
+        if (ui.portraitFocusSlot >= 0) {
+          const int slot = ui.portraitFocusSlot;
+          ui.portraitFocusSlot = -1;
+          if (slot < UIState::kSlotCount && avatar.Def()) {
+            // Need a temporary camera at the current orbit to get right/up.
+            Camera tmpCam;
+            const float fy = std::atan2(-std::cos(avatarHeading),
+                                        -std::sin(avatarHeading));
+            tmpCam.yaw = fy + ui.portraitYaw;
+            tmpCam.pitch = ui.portraitPitch;
+            Vec3 bodyLo{1e9f,1e9f,1e9f}, bodyHi{-1e9f,-1e9f,-1e9f};
+            Vec3 limbLo{1e9f,1e9f,1e9f}, limbHi{-1e9f,-1e9f,-1e9f};
+            bool anyBody = false, anyLimb = false;
+            const int lc = (int)avatar.Def()->limbs.size();
+            for (int p = 0; p < lc; p++) {
+              Vec3 c[8];
+              if (!LimbBoxCorners(avatar, phys, p, c)) continue;
+              const int s = BodySlotFor(avatar.PartName(p), avatar.PartTag(p));
+              for (const Vec3& v : c) {
+                bodyLo = Vec3{std::min(bodyLo.x,v.x),std::min(bodyLo.y,v.y),std::min(bodyLo.z,v.z)};
+                bodyHi = Vec3{std::max(bodyHi.x,v.x),std::max(bodyHi.y,v.y),std::max(bodyHi.z,v.z)};
+                anyBody = true;
+                if (s == slot) {
+                  limbLo = Vec3{std::min(limbLo.x,v.x),std::min(limbLo.y,v.y),std::min(limbLo.z,v.z)};
+                  limbHi = Vec3{std::max(limbHi.x,v.x),std::max(limbHi.y,v.y),std::max(limbHi.z,v.z)};
+                  anyLimb = true;
+                }
+              }
+            }
+            if (anyBody && anyLimb) {
+              const Vec3 bodyCentre = (bodyLo + bodyHi) * 0.5f;
+              const Vec3 limbCentre = (limbLo + limbHi) * 0.5f;
+              const Vec3 bodyHalf = (bodyHi - bodyLo) * 0.5f;
+              const Vec3 limbHalf = (limbHi - limbLo) * 0.5f;
+              const float halfH = std::max(0.5f, bodyHalf.y);
+              const Vec3 d = limbCentre - bodyCentre;
+              ui.portraitPanXTarget = d.dot(tmpCam.Right()) / halfH;
+              ui.portraitPanYTarget = d.dot(tmpCam.Up()) / halfH;
+              const float limbSpan = std::max({limbHalf.x, limbHalf.y, limbHalf.z, 0.5f});
+              ui.portraitZoomTarget = std::clamp(halfH / limbSpan * 0.55f, 1.0f, 6.0f);
+            }
+          }
+        }
+        // Smooth lerp: exponential ease toward the target each frame.
+        {
+          const float lerpDt = dt;
+          const float rate = 12.0f;
+          const float t = 1.0f - std::exp(-rate * lerpDt);
+          auto ease = [t](float& cur, float tgt) {
+            if (std::abs(cur - tgt) < 0.001f) cur = tgt;
+            else cur += (tgt - cur) * t;
+          };
+          ease(ui.portraitZoom, ui.portraitZoomTarget);
+          ease(ui.portraitPanX, ui.portraitPanXTarget);
+          ease(ui.portraitPanY, ui.portraitPanYTarget);
+        }
         const float frontYaw =
             std::atan2(-std::cos(avatarHeading), -std::sin(avatarHeading));
         portraitCam = MakePortraitCam(avatar, phys, frontYaw + ui.portraitYaw,
                                       ui.portraitPitch,
-                                      (float)kPortraitW / (float)kPortraitH);
-        if (ui.inspectMode) ProjectBodyUI(avatar, phys, portraitCam, ui);
+                                      (float)kPortraitW / (float)kPortraitH,
+                                      ui.portraitZoom, ui.portraitPanX,
+                                      ui.portraitPanY);
+        ProjectBodyUI(avatar, phys, portraitCam, ui);
       }
 
       // ======================================================================
@@ -11188,6 +11303,15 @@ int main(int argc, char** argv) {
       if (ui.combatTuningDirty) {
         ui.combatTuningDirty = false;
         ApplyMeleeTuning(melee.tuning);
+        // infectSpreadRate drives grid-side reaction chances compiled by
+        // LoadAssets, so recompile ONLY when it actually moved. Every other
+        // combat slider is CPU-only and needs no materials reload.
+        static float prevInfectSpread = CurrentTuning().gore.infectSpreadRate;
+        const float curInfectSpread = CurrentTuning().gore.infectSpreadRate;
+        if (curInfectSpread != prevInfectSpread) {
+          ui.reloadMaterials = true;
+          prevInfectSpread = curInfectSpread;
+        }
       }
       if (ui.combatSave) {
         ui.combatSave = false;

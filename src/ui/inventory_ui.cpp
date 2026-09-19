@@ -463,18 +463,18 @@ void GlyphInfoBox(const UIState::GlyphUI& g, const char* sortName) {
 void Portrait(UIState& s, ImVec2 at, ImVec2 size) {
   ImDrawList* dl = ImGui::GetWindowDrawList();
   const ImVec2 br(at.x + size.x, at.y + size.y);
-  // The frame's own backdrop, drawn UNDER the image. Deliberately a different
-  // colour from the portrait pass's clear (main.cpp kPortraitClear): when the
-  // two matched, "the texture is not being sampled" and "the pass drew nothing
-  // but its clear" produced pixel-identical results and cost a diagnosis.
   dl->AddRectFilled(at, br, IM_COL32(16, 12, 22, 255));
   ui::InnerShadow(dl, at, br, 10.0f, 0.5f);
 
   ImGui::SetCursorScreenPos(at);
-  ImGui::InvisibleButton("##portrait", size);
+  ImGui::InvisibleButton("##portrait", size,
+                         ImGuiButtonFlags_MouseButtonLeft |
+                         ImGuiButtonFlags_MouseButtonRight);
   const bool hovered = ImGui::IsItemHovered();
-  const bool dragging = ImGui::IsItemActive() &&
-                        ImGui::IsMouseDragging(ImGuiMouseButton_Left, 0.0f);
+  const bool dragL = ImGui::IsItemActive() &&
+                     ImGui::IsMouseDragging(ImGuiMouseButton_Left, 0.0f);
+  const bool dragR = ImGui::IsItemActive() &&
+                     ImGui::IsMouseDragging(ImGuiMouseButton_Right, 0.0f);
 
   if (s.portraitTex) {
     dl->AddImage((ImTextureID)s.portraitTex, at, br);
@@ -485,27 +485,55 @@ void Portrait(UIState& s, ImVec2 at, ImVec2 size) {
                        at.y + (size.y - ts.y) * 0.5f),
                 Fade(ui::ColParchDim(), 0.6f), msg);
   }
-  // A recess vignette OVER the picture: the portrait is a window into a
-  // lit box, and the edges of a lit box are darker than its middle.
   ui::InnerShadow(dl, at, br, 16.0f, 0.55f);
   ui::Grain(dl, at, br, 0.035f);
 
-  // ORBIT. The drag turns the portrait camera; pitch is clamped well short of
-  // the poles because a camera that can pass over the head gimbals and the
-  // avatar flips upside down mid-drag.
-  if (dragging) {
+  // ORBIT (left drag).
+  if (dragL) {
     const ImVec2 d = ImGui::GetIO().MouseDelta;
-    // Drag left turns the body to the left, and drag DOWN tilts the camera to
-    // look down at it — the sign every model viewer uses, and the one that
-    // matches Camera::pitch (positive = looking up).
     s.portraitYaw -= d.x * 0.012f;
     s.portraitPitch = std::clamp(s.portraitPitch - d.y * 0.008f, -0.9f, 0.9f);
   }
-  // HEAD LOOK. While NOT dragging, the cursor over the frame is reported to
-  // main.cpp, which turns it into a real SetLook — the character glances at
-  // the mouse. Reported rather than applied because posing a rig is game
-  // state; this function only knows where the pointer is.
-  s.portraitLookValid = hovered && !dragging;
+  // PAN (right drag): instant — writes both current and target.
+  if (dragR) {
+    const ImVec2 d = ImGui::GetIO().MouseDelta;
+    const float dx = -d.x * 0.006f, dy = d.y * 0.006f;
+    s.portraitPanX += dx;  s.portraitPanXTarget += dx;
+    s.portraitPanY += dy;  s.portraitPanYTarget += dy;
+  }
+  // ZOOM (scroll wheel): instant — writes both current and target.
+  if (hovered) {
+    const float wheel = ImGui::GetIO().MouseWheel;
+    if (wheel != 0.0f) {
+      const float factor = std::pow(1.15f, wheel);
+      s.portraitZoom = std::clamp(s.portraitZoom * factor, 0.5f, 6.0f);
+      s.portraitZoomTarget = s.portraitZoom;
+    }
+  }
+  // DOUBLE-CLICK A LIMB to zoom in on it. Detected here rather than from a
+  // separate button layer because the portrait's own InvisibleButton covers
+  // the whole area and eats the click — a second button on top never sees it.
+  if (hovered && s.bodyValid &&
+      ImGui::IsMouseDoubleClicked(ImGuiMouseButton_Left)) {
+    const ImVec2 m = ImGui::GetMousePos();
+    const float mx = (m.x - at.x) / size.x;
+    const float my = (m.y - at.y) / size.y;
+    int best = -1;
+    float bestArea = 1e9f;
+    for (int i = 0; i < UIState::kSlotCount; i++) {
+      const UIState::BodyPartUI& b = s.body[i];
+      if (!b.present || b.severed || !b.projValid) continue;
+      if (mx < b.projMin[0] || mx > b.projMax[0]) continue;
+      if (my < b.projMin[1] || my > b.projMax[1]) continue;
+      const float area = (b.projMax[0] - b.projMin[0]) *
+                         (b.projMax[1] - b.projMin[1]);
+      if (area < bestArea) { bestArea = area; best = i; }
+    }
+    if (best >= 0) s.portraitFocusSlot = best;
+  }
+
+  // HEAD LOOK: only while not dragging at all.
+  s.portraitLookValid = hovered && !dragL && !dragR;
   if (s.portraitLookValid) {
     const ImVec2 m = ImGui::GetMousePos();
     s.portraitLook[0] = std::clamp((m.x - at.x) / size.x * 2.0f - 1.0f, -1.0f,
@@ -516,11 +544,23 @@ void Portrait(UIState& s, ImVec2 at, ImVec2 size) {
 
   if (hovered) ui::Glow(dl, at, br, ui::ColGold(), 6.0f, 0.22f);
   ui::Draw9(dl, "panel_inner", at, br);
-  if (hovered && !dragging) {
-    const char* hint = "drag to turn";
+
+  // RESET button — shown when the target differs from the default (not the
+  // current, so it stays visible while the animation is still closing).
+  const bool dirty = s.portraitZoomTarget != 1.0f ||
+                     std::abs(s.portraitPanXTarget) > 0.001f ||
+                     std::abs(s.portraitPanYTarget) > 0.001f;
+  if (dirty) {
+    if (ui::Button("##portraitreset", ImVec2(br.x - 54, br.y - 28), "reset",
+                   false, 48))
+      s.portraitReset = true;
+  } else if (hovered && !dragL && !dragR) {
+    const char* hint = "drag to turn  .  scroll to zoom  .  right-drag to pan";
+    ImGui::PushFont(ui::FontSmall());
     const ImVec2 ts = ImGui::CalcTextSize(hint);
-    ui::ShadowText(dl, ImVec2(br.x - ts.x - 12, br.y - ts.y - 10),
+    ui::ShadowText(dl, ImVec2(br.x - ts.x - 8, br.y - ts.y - 8),
                    Fade(ui::ColParchDim(), 0.7f), hint);
+    ImGui::PopFont();
   }
 }
 

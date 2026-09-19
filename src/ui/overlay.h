@@ -652,6 +652,18 @@ struct UIState {
   // absolute and slightly negative: looking a little DOWN at a standing figure
   // is the angle that reads as a portrait rather than as a worm's-eye shot.
   float portraitYaw = 0.0f, portraitPitch = -0.08f;
+  // Zoom and pan: the CURRENT values are what the camera reads this frame.
+  // The TARGET values are where it is heading — set by limb focus or reset,
+  // then the per-frame lerp in main.cpp closes the gap. Direct manipulation
+  // (scroll wheel, right-drag) writes BOTH so the response is instant.
+  float portraitZoom = 1.0f;
+  float portraitPanX = 0.0f, portraitPanY = 0.0f;
+  float portraitZoomTarget = 1.0f;
+  float portraitPanXTarget = 0.0f, portraitPanYTarget = 0.0f;
+  // One-shot: reset orbit, zoom and pan to defaults.
+  bool portraitReset = false;
+  // One-shot: zoom and pan to frame the given BodySlot. -1 = none.
+  int portraitFocusSlot = -1;
   // Cursor position over the portrait frame, normalized to [-1,1] with +y up,
   // valid only while the pointer is inside it and not dragging. main.cpp turns
   // this into a SetLook() so the character glances at the mouse — GAME state
