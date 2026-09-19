@@ -1960,6 +1960,30 @@ class Mob {
   void ApplyAimPart(const AnimSkeleton& sk, AnimState& st, int part, float yaw,
                     float pitch, float weight, float spineShare) const;
   bool AimAnglesTo(const Vec3& dirWorld, float& outYaw, float& outPitch) const;
+  // ---- ...AND THE SAME THING SOLVED IN THE FRAME THE PART IS ACTUALLY IN --
+  //
+  // `ApplyAimPart` takes a yaw/pitch pair and multiplies it onto the part's
+  // LOCAL rotation, which silently assumes the part's parents are upright: it
+  // is a delta about the part's own axes, and those axes are wherever the
+  // chain above the part has put them. That is fine for a standing creature
+  // whose torso is within a few degrees of vertical and it is WRONG BY NINETY
+  // DEGREES for a crawler — the `crawl` clip pitches the hips 74 deg forward
+  // (override mode, so it is the pose and not a lean on top of one), so a
+  // commanded yaw came out as pitch, a commanded pitch came out as yaw, and a
+  // legless zombie's bite went wherever that arithmetic sent it. Reported as
+  // "zombie bites when crawling are extremely inaccurate".
+  //
+  // So this one takes the DIRECTION and solves for the local rotation that
+  // actually points `edgeLocal` (the natural weapon's own axis, in the part's
+  // model frame) along `dirWorld`, walking the parent chain to get the frame
+  // right. `spineShare` of the YAW error is still handed to the spine first,
+  // so the chest turns into the bite exactly as it did; the part then solves
+  // for whatever is left, which is what makes the result exact rather than
+  // approximately exact. Model space maps to world with the plain heading yaw
+  // here, the same map `RecordWeaponClamp` and the weapon-arm solve use.
+  void AimPartAlong(const AnimSkeleton& sk, AnimState& st, int part,
+                    Vec3 edgeLocal, Vec3 dirWorld, float weight,
+                    float spineShare) const;
   // Stage 3.5 of the pose pipeline (see the long note at the definition): the
   // Aim effector's drive, or — with no stroke live — a look at whatever this
   // creature has decided to fight. PRE-FLATTEN; the driver calls it beside
@@ -2059,6 +2083,14 @@ class Mob {
   // inverts, which is the joint itself. The `swing-plane` gate measures the
   // sword's arc about the shoulder with it.
   bool PartJointWorld(int part, Vec3& out) const;
+  // WHERE A LIMB'S MIDDLE IS, in world voxels, off the same live transform.
+  //
+  // THE JOINT IS THE WRONG POINT TO AIM AT, which is the whole reason this
+  // exists beside `PartJointWorld`: a leg's joint is its HIP, and a crawling
+  // zombie told to bite a leg would be aimed at the top of a standing victim's
+  // thigh — a place its jaws are nowhere near. The centre of the limb's own
+  // collider box is the part as a target rather than as a pivot.
+  bool LimbCentreWorld(int part, Vec3& out) const;
   // THE STROKE DRIVER'S COMMAND TO THE RIG (game/melee.h). Presentation only;
   // consumed by the driver's own animation pass through ApplyWeaponArm.
   void SetWeaponPose(const WeaponPose& pose);
@@ -2716,8 +2748,38 @@ class Mob {
   // deepens by `gore.bruiseStep` a blow to a `gore.bruiseMax` ceiling and then
   // may break into blood. See the long note at the definition for why the
   // rewrite could never look right. Returns voxels whose coat changed.
+  //
+  // `hp` is the blunt part of the blow that is laying this mark, and it is
+  // what scales the step (Tuning::Gore::bruiseHpRef): a fist and a mace used
+  // to bruise identically, which made "the same thing with fists, only slower"
+  // impossible to say. Pass 0 for "a full blow".
+  //
+  // ---- ...AND WHAT IT FOUND ALREADY THERE ---------------------------------
+  //
+  // `report` is how the caller reaches the third rung of the blunt ladder
+  // (Tuning::Gore::pulpCarveFrom). The sweep over the contact sphere already
+  // reads every voxel's coat, so it is free to say how much of the CORE has
+  // already been beaten open — and that share, not the weapon alone, is what
+  // decides whether this blow removes anything. A separate probe pass would
+  // walk the same lattice twice to learn the same fact.
+  //
+  // The core is the inner half-radius, deliberately: the taper means the rim
+  // of a bruise never saturates however many blows land, so a share measured
+  // over the whole sphere would be permanently small and no weapon would ever
+  // earn a dent.
+  struct BruiseReport {
+    uint32_t marked = 0;  // coat words changed by THIS blow
+    uint32_t core = 0;    // tissue voxels inside the contact core
+    uint32_t pulped = 0;  // of those, already wearing blood at gore.pulpAmt or deeper
+    // 0 on clean skin, 1 on a core that is wholly pulp. The number the dent
+    // radius is scaled by.
+    float Ripeness() const {
+      return core ? (float)pulped / (float)core : 0.0f;
+    }
+  };
   uint32_t BruiseLimb(int limbIndex, Vec3 centreLocal, float radiusWorld,
-                      uint32_t seed, uint32_t bruiseMat, float power);
+                      uint32_t seed, uint32_t bruiseMat, float power,
+                      float hp = 0.0f, BruiseReport* report = nullptr);
   // The substance StainWound smears when nobody has said otherwise: the
   // creature's wound material if the palette can draw it, else its blood, else
   // nothing. One function because three call sites wanted the same chain.
@@ -2991,6 +3053,11 @@ class Mob {
   // cauterised or garment-covered stump refuses for the same reasons the drip
   // does.
   float dragW_ = 0;
+  // The direction the body is being towed, in the RIG'S OWN frame, low-passed:
+  // what the dead limb swings away from. Lagged rather than instantaneous so a
+  // turn whips the leg around behind the new heading instead of rotating a
+  // fixed pose with the hips — see the note at its update.
+  Vec3 dragLag_{};
   float dragTrailDist_ = 0;    // world voxels travelled since the last smear
   Vec3 dragContact_{};         // where the stump is scrubbing, world voxels
   bool dragContactValid_ = false;
@@ -3609,8 +3676,8 @@ class MobSystem {
   // Damage a limb by physics body handle (laser, explosions). Returns true
   // if the handle belonged to a live mob limb. Severs / kills at 0 hp, and a
   // hit whose impact speed (voxels/sec) exceeds the limb's severImpactSpeed
-  // severs regardless of remaining hp. A non-fatal hit triggers the "attack"
-  // flinch clip when the rig defines one.
+  // severs regardless of remaining hp. Starts NO clip — the visible answer to
+  // a blow is HitReact below, not a keyframed pose.
   bool Damage(uint64_t bodyHandle, float amount, Vec3 hitWorldVoxel,
               float impactSpeed = 0.0f);
 
@@ -3929,6 +3996,11 @@ class MobSystem {
   int SwingingFeet(uint64_t mobId) const;
   int PlantedFeet(uint64_t mobId) const;
   int ActiveClips(uint64_t mobId) const;
+  // Start a named one-shot on a mob by id. False if the mob or the clip is
+  // missing. For the gates: since a blow no longer fires a clip (Damage), this
+  // is how the clip layer — sample / mask / blend-in / blend-out — gets
+  // exercised without a mechanic existing to exercise it.
+  bool PlayClip(uint64_t mobId, const std::string& name);
   // Active dismemberment locomotion state: index into the def's authored
   // `states` list (AnimSkeleton::states), -1 for normal locomotion.
   int LocoState(uint64_t mobId) const;

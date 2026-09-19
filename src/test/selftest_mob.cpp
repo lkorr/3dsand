@@ -358,14 +358,16 @@ bool mobOk = false;
       int afterFeet = mobs.SwingingFeet(cid) + mobs.PlantedFeet(cid);
       bool legLost = mobs.IsAlive(cid) && afterFeet < beforeFeet;
 
-      // flinch clip: a non-fatal hit on the torso starts "attack"
-      uint64_t torso = mobs.LimbBody(cid, critterLimb("torso"));
-      mobs.Damage(torso, 1.0f, mobs.MobOrigin(cid), 0.0f);
+      // clip layer: start a one-shot directly. This used to be driven by a
+      // non-fatal hit, which started "attack" — that placeholder is gone (a
+      // blow is answered by HitReact, not by the victim swinging), so the gate
+      // drives the clip itself rather than keeping a bad mechanic alive.
+      bool clipStarted = mobs.PlayClip(cid, "attack");
       int clipsNow = mobs.ActiveClips(cid);
       for (int i = 0; i < 40; i++) mobTick({});
       int clipsLater = mobs.ActiveClips(cid);
       // the clip must both START and eventually retire (blend-out works)
-      bool clipOk = clipsNow >= 1 && clipsLater == 0;
+      bool clipOk = clipStarted && clipsNow >= 1 && clipsLater == 0;
 
       bool gaitOk = oneGroup && stepped && grounded && legLost && clipOk &&
                     walksForward;
