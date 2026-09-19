@@ -218,6 +218,27 @@ const SOUND_SCHEMA = {
        fallback:'silent.',
        gain:'combatfx.clangVolume, scaled by the blow’s power',
        pitch:'higher for a faster blow'},
+
+      {k:'strike_edge', n:'weapon impact (edge)', prefix:'melee',
+       d:'The sword’s own ring when it contacts ANYTHING — flesh, armor, another blade. Fires alongside `flesh` or `clang`, never instead of either: those tell the player what they hit, this tells them what hit it. An edged weapon (StrikeProfile.cut > blunt) selects this slot; a blunt one selects strike_blunt.',
+       fires:'audio::Cues::Combat(StrikeEdge) — main.cpp, when the melee sweep hits any body and the weapon is edged',
+       fallback:'silent.',
+       gain:'combatfx.strikeEdgeVolume, scaled by blow power',
+       pitch:'lower for a heavier blow'},
+
+      {k:'strike_blunt', n:'weapon impact (blunt)', prefix:'melee',
+       d:'The mace’s own thud on contact — the heavy, dull counterpart to strike_edge. Selected when StrikeProfile.blunt >= cut.',
+       fires:'audio::Cues::Combat(StrikeBlunt) — main.cpp, when the melee sweep hits any body and the weapon is blunt',
+       fallback:'silent.',
+       gain:'combatfx.strikeBluntVolume, scaled by blow power',
+       pitch:'lower for a heavier blow'},
+
+      {k:'cut', n:'flesh cut (wet)', prefix:'melee',
+       d:'The wet slicing of an edged weapon going through flesh — distinct from `flesh` (the thud of impact) and from `dismember` (the creature’s own sound when a limb comes off). Fires on EVERY sword-on-flesh contact, not just severs, because a cut that doesn’t take a limb off still parts tissue.',
+       fires:'audio::Cues::Combat(Cut) — main.cpp, when the melee sweep hits flesh and the weapon is edged',
+       fallback:'silent.',
+       gain:'combatfx.cutVolume, scaled by blow power',
+       pitch:'lower for a heavier blow'},
     ],
   },
 };

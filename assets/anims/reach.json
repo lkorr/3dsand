@@ -1,0 +1,55 @@
+{
+  "//": "THE DEAD COME FOR YOU WITH THEIR ARMS OUT. An ADDITIVE hold, not a motion: it raises both shoulders to roughly 80 degrees of forward flexion, leaves a few degrees of elbow bend, and lets the hands droop, and then does almost nothing for the rest of its cycle. The slow counter-phased drift (76<->82 on one shoulder, 81<->75 on the other) exists only so the pose is not a statue -- an outstretched arm that is perfectly still reads as a rig that has frozen, which is the exact failure the notes in anim.cpp and avatar.cpp describe. Additive on purpose, so whatever swing the body already has survives underneath: on an NPC that is the procedural swingAmp sine (MobSystem::UpdateAnimation), on a clip-driven rig it is the walk/run arm cycle, and in both cases the arms shamble while they reach instead of being pinned. Rotations are pure X, positive = backward/down (anim.cpp's convention, the same sign the walk clip's arm tracks use), so no part of this clip depends on which way the lateral axis points. Played by MobSystem::UpdateAnimation for any def with a `chaseClip`, weight-ramped by Mob::chasePose_ -- it is NOT started or stopped per tick, the weight is what moves.",
+  "name": "reach",
+  "sidecarVoxelsPerMetre": 10,
+  "durationMs": 2600,
+  "loop": true,
+  "mode": "additive",
+  "blendInMs": 260,
+  "blendOutMs": 260,
+  "mask": ["armU.L", "armL.L", "hand.L", "armU.R", "armL.R", "hand.R"],
+  "tracks": {
+    "armU.L": {
+      "rot": [
+        { "t": 0,    "q": [-0.6157, 0, 0, 0.7880], "ease": "quadInOut" },
+        { "t": 1300, "q": [-0.6561, 0, 0, 0.7547], "ease": "quadInOut" },
+        { "t": 2600, "q": [-0.6157, 0, 0, 0.7880] }
+      ]
+    },
+    "armL.L": {
+      "rot": [
+        { "t": 0,    "q": [-0.1219, 0, 0, 0.9925], "ease": "quadInOut" },
+        { "t": 1300, "q": [-0.1736, 0, 0, 0.9848], "ease": "quadInOut" },
+        { "t": 2600, "q": [-0.1219, 0, 0, 0.9925] }
+      ]
+    },
+    "hand.L": {
+      "rot": [
+        { "t": 0,    "q": [0.3420, 0, 0, 0.9397], "ease": "quadInOut" },
+        { "t": 1300, "q": [0.3827, 0, 0, 0.9239], "ease": "quadInOut" },
+        { "t": 2600, "q": [0.3420, 0, 0, 0.9397] }
+      ]
+    },
+    "armU.R": {
+      "rot": [
+        { "t": 0,    "q": [-0.6494, 0, 0, 0.7604], "ease": "quadInOut" },
+        { "t": 1300, "q": [-0.6088, 0, 0, 0.7934], "ease": "quadInOut" },
+        { "t": 2600, "q": [-0.6494, 0, 0, 0.7604] }
+      ]
+    },
+    "armL.R": {
+      "rot": [
+        { "t": 0,    "q": [-0.1650, 0, 0, 0.9863], "ease": "quadInOut" },
+        { "t": 1300, "q": [-0.1132, 0, 0, 0.9936], "ease": "quadInOut" },
+        { "t": 2600, "q": [-0.1650, 0, 0, 0.9863] }
+      ]
+    },
+    "hand.R": {
+      "rot": [
+        { "t": 0,    "q": [0.3827, 0, 0, 0.9239], "ease": "quadInOut" },
+        { "t": 1300, "q": [0.3007, 0, 0, 0.9537], "ease": "quadInOut" },
+        { "t": 2600, "q": [0.3827, 0, 0, 0.9239] }
+      ]
+    }
+  }
+}

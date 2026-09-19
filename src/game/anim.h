@@ -528,14 +528,20 @@ AnimStump AnimFindStumpLeg(const AnimSkeleton& sk, const AnimState& st);
 //            The caller eases this, which is what makes entering and leaving
 //            the drag a blend rather than a switch.
 //   leanRad  how far the pelvis rolls INTO the stump at weight 1.
-//   trailRad how far behind the body the dead leg hangs at full speed.
+//   trailRad how far the dead leg swings away from the direction of travel.
+//   splayRad how far OUTBOARD it hangs, always, away from the good leg.
+//   dragLag  THE DIRECTION THE BODY IS TRAVELLING, in the rig's own frame,
+//            already low-passed by the caller, magnitude 0..1 of walking pace.
+//            This is what makes the drag free rather than a pose: a limb being
+//            towed points away from the tow, so the leg swings out behind
+//            whatever direction you are actually moving and keeps swinging for
+//            a moment after you turn. A fixed backward trail is the version
+//            that reads as "one leg hiding behind the other".
 //   phase    gait phase, 0..1 — the stump catches and slips as it scrubs.
-//   speedT   0..1 of the body's own walk speed; the trail and the scrub grow
-//            with it, so a drag at a standstill is just a lean.
 void AnimApplyStumpDrag(const AnimSkeleton& sk, AnimState& st,
                         const AnimStump& stump, int rootLimb, float weight,
-                        float leanRad, float trailRad, float phase,
-                        float speedT);
+                        float leanRad, float trailRad, float splayRad,
+                        Vec3 dragLag, float phase);
 
 // Stage 4. One linear parent-before-child pass; requires sk.ParentsFirst().
 void AnimFlatten(const AnimSkeleton& sk, AnimState& st);

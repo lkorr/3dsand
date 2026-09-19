@@ -56,6 +56,23 @@ class BodyRegistry {
   // Needs `microSet` in the constructor; without one it is a no-op.
   uint32_t AuditMicroModels() const;
 
+  // ---- the teardown a model-table rebuild REQUIRES ---------------------------
+  // A micro model index is a POSITION in MicroBodySet::models, and LoadMobDefs
+  // rebuilds that vector wholesale on every asset reload. Anything still
+  // holding an index across that line draws somebody else's brick — and frees a
+  // record it does not own when it finally lets go. The holder populations are
+  // exactly the three the audit above walks, which is why this lives here and
+  // not at the reload site: a fourth system added to the walk is a fourth
+  // system that has to be dropped, and the two lists cannot drift if they are
+  // the same list. Call immediately BEFORE the set is replaced, never after.
+  void ReleaseMicroHolders();
+  // How many holders of a model index exist right now, across every system.
+  // ZERO IS THE ONLY STATE IN WHICH THE MODEL TABLE MAY BE REBUILT, so this is
+  // both what ReleaseMicroHolders establishes and what the `limb-alias` gate
+  // asserts about it — a count, unlike the audit, is meaningful when the fault
+  // has not happened yet.
+  uint32_t MicroHolderCount() const;
+
   // Total slots the walk currently occupies (== xform count).
   uint32_t TotalSlots() const;
   // Any system's instance list changed since it was last built. Slot bases

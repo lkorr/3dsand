@@ -43,6 +43,9 @@
   "//behavior": "THE WALKING DEAD FIGHT LIKE THE DEAD (assets/mobs/behaviors.json `zombie`). Slower cadence, a reckless band it never backs out of, faction monster, and an attack list that is all natural weapons -- a lunging bite, a standing bite and three punches -- so a zombie with nothing in its hands is as dangerous as one that found a sword. It keeps `reach` 9 for the punches; the lunge states its own 22 and MobSystem::AttackReachOf is what lets the AI stand off at the longer of the two without the profile having to choose.",
   "behavior": "zombie",
 
+  "//chaseClip": "ARMS OUT WHEN IT IS COMING FOR YOU (assets/anims/reach.json, MobDef::chaseClip). An additive hold on the shoulders, elbows and wrists, weight-ramped on whenever the brain has a target and off for the duration of a strike, so the walk still swings underneath it and a punch is still the punch that was authored. It is named here rather than switched on by `undead` because it is an ANIMATION, not a consequence of being dead: anything else that should stalk in a held pose names its own clip.",
+  "chaseClip": "reach",
+
   "//speed": "31.5 -> 23.5 world voxels/sec. The gait cadence comes down with it (8 -> 6.4) so the STRIDE shortens a little rather than the legs spinning faster to cover less ground -- stride length is speed/cadence, 3.94 for a human and 3.67 here.",
   "speed": 23.5,
   "gait": {

@@ -471,13 +471,13 @@ AnimStump AnimFindStumpLeg(const AnimSkeleton& sk, const AnimState& st) {
 
 void AnimApplyStumpDrag(const AnimSkeleton& sk, AnimState& st,
                         const AnimStump& stump, int rootLimb, float weight,
-                        float leanRad, float trailRad, float phase,
-                        float speedT) {
+                        float leanRad, float trailRad, float splayRad,
+                        Vec3 dragLag, float phase) {
   if (stump.chain < 0 || stump.chain >= (int)sk.chains.size()) return;
   const float w = std::clamp(weight, 0.0f, 1.0f);
   if (w <= 1e-3f) return;
   const float kPi = 3.14159265f;
-  const float sp = std::clamp(speedT, 0.0f, 1.0f);
+  const float sp = std::clamp(Vec3{dragLag.x, 0, dragLag.z}.len(), 0.0f, 1.0f);
 
   // ---- the lean --------------------------------------------------------
   // A positive rotation about model +Z takes +X toward +Y, i.e. it LIFTS the
@@ -514,23 +514,38 @@ void AnimApplyStumpDrag(const AnimSkeleton& sk, AnimState& st,
   // step, and a drag is the absence of that. Nlerp against what the earlier
   // stages produced, by the same weight, so the hand-over is continuous.
   //
-  // A positive rotation about model +X swings a downward-hanging bone toward
-  // -Z, and the rigs' forward is +Z, so positive IS backward: the stump
-  // trails. The scrub is the catch-and-slip of a limb being dragged over
-  // ground, at one cycle per stride, and it only exists while moving.
+  // TWO ROTATIONS AND A CONSTANT, and the constant is the one that fixes the
+  // "leg hiding behind the other leg" read:
+  //
+  //   SPLAY — the limb hangs OUTBOARD, away from the good leg, always and
+  //     regardless of travel. It is not being carried under the body, it is
+  //     swinging off the side of a tipped pelvis, and without it the two legs
+  //     occupy the same silhouette from every angle that matters.
+  //   TRAIL — it swings away from the DIRECTION OF TRAVEL, both components.
+  //     A positive rotation about model +X swings a downward-hanging bone
+  //     toward -Z and the rigs' forward is +Z, so walking forward pitches it
+  //     back; a positive rotation about +Z swings the same bone toward +X, so
+  //     travelling toward +X rolls it toward -X. Because `dragLag` is a lagged
+  //     direction, turning whips the leg around behind you instead of
+  //     rotating a fixed pose with the body.
+  //   SCRUB — the catch-and-slip of a limb dragged over ground, once per
+  //     stride, scaled by how fast it is actually being towed.
   const IkChain& ch = sk.chains[stump.chain];
-  const float scrub = 0.055f * sp * std::sin(2.0f * kPi * phase);
+  const float scrub = 0.07f * sp * std::sin(2.0f * kPi * phase);
+  const float legPitch = trailRad * dragLag.z + scrub;
+  const float legRoll = splayRad * stump.sideX - trailRad * dragLag.x;
   for (size_t pi = 0; pi < ch.parts.size(); pi++) {
     const int p = ch.parts[pi];
     if (p < 0 || p >= (int)st.local.size()) continue;
     if (p < (int)st.partAlive.size() && !st.partAlive[p]) break;
-    // The hip carries the trail; the bones below it straighten toward rest and
-    // take a fraction of it, which is what makes the limb read as dead weight
-    // rather than as a leg being held out.
-    const float a = pi == 0 ? trailRad * (0.35f + 0.65f * sp) + scrub
-                            : trailRad * 0.2f * sp + scrub * 0.5f;
-    const Quat want =
-        QuatNormalize(QuatMul(sk.parts[p].rest.rot, QuatAxisAngle({1, 0, 0}, a)));
+    // The hip carries it; the bones below take a fraction and otherwise
+    // straighten toward rest, which is what makes the limb read as dead weight
+    // being towed rather than as a leg being held out.
+    const float f = pi == 0 ? 1.0f : 0.35f;
+    const Quat want = QuatNormalize(
+        QuatMul(sk.parts[p].rest.rot,
+                QuatMul(QuatAxisAngle({1, 0, 0}, legPitch * f),
+                        QuatAxisAngle({0, 0, 1}, legRoll * f))));
     st.local[p].rot = QuatNormalize(QuatNlerp(st.local[p].rot, want, w));
   }
 }

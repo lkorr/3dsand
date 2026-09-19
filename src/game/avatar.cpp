@@ -93,6 +93,27 @@ constexpr float kCrouchHalflife = 0.05f;
 // commit site in UpdateGait for why a one-legged pump is not a gait.
 constexpr float kDragCrouchHalflife = 0.55f;
 
+// ...and how far the STANDING knee bends to let the stump reach the floor, in
+// leg lengths, at a full drag. Under the kMaxCrouchLegLengths ceiling above on
+// purpose — this is a limp, not a squat — and it is a FLOOR under the walking
+// crouch rather than a term added to it (see the commit site).
+constexpr float kDragSinkLegLengths = 0.15f;
+
+// ---- WHAT THE DRAG COSTS, AND WHAT A HOP BUYS BACK -------------------------
+//
+// The fraction of its one-legged walking speed a body keeps while it is
+// actually scrubbing a stump along the ground: a third, so dragging is three
+// times slower than the same body in the air.
+//
+// It is charged on `dragW_` and NOT on the loco state, which is the whole
+// mechanic. `dragW_` falls to nothing inside one hop's airtime (mob.cpp
+// kDragReleaseHalflife) and takes the better part of a second to come back on
+// landing, so a player who keeps jumping keeps the speed and a player who walks
+// it off does not. Nothing here tests for a jump; the incentive falls out of
+// the same weight that drives the pose, so the thing you SEE is exactly the
+// thing you are being charged for.
+constexpr float kDragSpeedPenalty = 1.0f / 3.0f;
+
 // The HELD crouch (Ctrl, tuning.json player.crouchKneeDrop): its ceiling in
 // leg lengths and its half-life. The ceiling keeps an authored drop from
 // folding the leg past what the two-bone solve can pose; the half-life is
@@ -506,6 +527,13 @@ AvatarLocomotion PlayerAvatar::Locomotion() const {
           std::clamp(1.0f + (bodyY_ - origin_.y) / standing, 0.15f, 1.0f);
     }
   }
+  // ---- THE DRAG COSTS YOU SPEED; A HOP DOES NOT (kDragSpeedPenalty) -------
+  // Multiplied onto whatever the state authored rather than replacing it: the
+  // state says what a one-legged body is worth, this says what dragging that
+  // body along the floor costs on top. Zero when both feet are on, zero in the
+  // air, and eased in and out with the pose, so there is no threshold to feel.
+  out.speedScale *= 1.0f - dragW_ * (1.0f - kDragSpeedPenalty);
+
   // Jumping is derived from LEG LIVENESS rather than authored per state: it is
   // a physical fact about how many legs are under you, and stating it once
   // here keeps a new state rule from silently getting a free jump.
@@ -884,6 +912,22 @@ void PlayerAvatar::UpdateGait(float dt, World& world, uint32_t tick) {
   // Clamped because `legLength` and the foot targets are both authored data in
   // the end: a rig asking for a stride longer than its own leg would otherwise
   // drive the pelvis into the floor rather than simply failing to reach.
+  // ---- THE GOOD KNEE PAYS FOR THE STUMP'S CLEARANCE ----------------------
+  //
+  // The lean cannot buy it on its own, and the arithmetic says so: rolling the
+  // pelvis into the short side drops that hip by (hip half-width) * sin(lean),
+  // which on this rig is under a third of a voxel against a whole foot of
+  // missing leg. A person makes up the rest by BENDING THE STANDING KNEE — and
+  // that is precisely what the stance crouch already is. It lowers the pelvis
+  // while the feet stay on the world points the gait planted, so the bend goes
+  // into the knee and the planted foot does not slide.
+  //
+  // A FLOOR under the walking demand, not a term added to it: the stride's own
+  // crouch already oscillates up to the same clamp, and adding them would drive
+  // the pelvis through the floor at the far end of every step.
+  if (dragW_ > 0.0f && crouchLegLength > 0.0f)
+    crouchNeed =
+        std::max(crouchNeed, dragW_ * crouchLegLength * kDragSinkLegLengths);
   crouchNeed = std::clamp(crouchNeed, 0.0f,
                           kMaxCrouchLegLengths * crouchLegLength);
   // Eased, not assigned — but on a SHORT half-life, which the per-foot form

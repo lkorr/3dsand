@@ -195,6 +195,27 @@ uint32_t BodyRegistry::AuditMicroModels() const {
   return faults;
 }
 
+uint32_t BodyRegistry::MicroHolderCount() const {
+  holders_.clear();
+  debris_.AppendMicroHolders(holders_);
+  mobs_.AppendMicroHolders(holders_);
+  if (avatar_) avatar_->AppendMicroHolders(holders_);
+  uint32_t n = 0;
+  for (const MicroHolder& h : holders_)
+    if (h.model != kMicroBodyNoModel) n++;
+  return n;
+}
+
+void BodyRegistry::ReleaseMicroHolders() {
+  // DEBRIS LAST. The other two can hand a body to it on the way out (a sever
+  // in flight, a dropped shell), and a body adopted after the sweep would be a
+  // holder that outlived the table by one line — the same off-by-one-event
+  // that made this bug survive the sever-path fix in the first place.
+  mobs_.Reset();
+  if (avatar_) avatar_->Despawn();
+  debris_.Reset();
+}
+
 void BodyRegistry::Report(const char* fmt, ...) const {
   char msg[512];
   va_list ap;

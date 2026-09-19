@@ -1199,6 +1199,30 @@
       "neighbor": "tag:hot",
       "chance": 90,
       "selfBecomes": "flesh_cooked"
+    },
+    {
+      "note": "-------- rot: rotflesh spreads to adjacent living tissue in the world grid --------\nThe mob-side infection (gore.infectSpreadRate) converts tissue on limbs through Mob::TickInfection. These rules are the GRID-SIDE mirror: rotflesh that has settled into the world (a severed limb's remains, a corpse's puddle) infects any flesh, skin or muscle it touches. Chance 8 per-mille is deeply subcritical (~0.048 expected conversions per tick per cell), so it creeps rather than explodes and the chunk sleeps once the front runs out of tissue. Bone is deliberately immune."
+    },
+    {
+      "self": "rotflesh",
+      "neighbor": "skin",
+      "chance": 1,
+      "infectSpread": true,
+      "neighborBecomes": "rotflesh"
+    },
+    {
+      "self": "rotflesh",
+      "neighbor": "flesh",
+      "chance": 1,
+      "infectSpread": true,
+      "neighborBecomes": "rotflesh"
+    },
+    {
+      "self": "rotflesh",
+      "neighbor": "muscle",
+      "chance": 1,
+      "infectSpread": true,
+      "neighborBecomes": "rotflesh"
     }
   ]
 }
