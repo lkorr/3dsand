@@ -529,7 +529,36 @@ void Portrait(UIState& s, ImVec2 at, ImVec2 size) {
                          (b.projMax[1] - b.projMin[1]);
       if (area < bestArea) { bestArea = area; best = i; }
     }
-    if (best >= 0) s.portraitFocusSlot = best;
+    if (best >= 0) {
+      s.portraitFocusSlot = best;
+      s.portraitPivotSlot = best;
+    }
+  }
+
+  // SINGLE-CLICK to select a limb in inspect mode. Detected on deactivation
+  // (release) so drags do not fire it. The distance gate separates a click
+  // from an orbit that barely moved, and the click-count gate lets double-
+  // click-to-frame through without also selecting.
+  if (s.inspectMode && s.bodyValid &&
+      ImGui::IsItemDeactivated() &&
+      ImGui::IsMouseReleased(ImGuiMouseButton_Left) &&
+      ImGui::GetIO().MouseDragMaxDistanceSqr[0] < 9.0f &&
+      ImGui::GetIO().MouseClickedCount[0] < 2) {
+    const ImVec2 m = ImGui::GetMousePos();
+    const float mx = (m.x - at.x) / size.x;
+    const float my = (m.y - at.y) / size.y;
+    int best = -1;
+    float bestArea = 1e9f;
+    for (int i = 0; i < UIState::kSlotCount; i++) {
+      const UIState::BodyPartUI& b = s.body[i];
+      if (!b.present || b.severed || !b.projValid) continue;
+      if (mx < b.projMin[0] || mx > b.projMax[0]) continue;
+      if (my < b.projMin[1] || my > b.projMax[1]) continue;
+      const float area = (b.projMax[0] - b.projMin[0]) *
+                         (b.projMax[1] - b.projMin[1]);
+      if (area < bestArea) { bestArea = area; best = i; }
+    }
+    s.inspectSelected = best;
   }
 
   // HEAD LOOK: only while not dragging at all.
@@ -579,20 +608,16 @@ void InspectOverlay(const UIState& s, ImVec2 at, ImVec2 size) {
 
   for (int i = 0; i < UIState::kSlotCount; i++) {
     const UIState::BodyPartUI& b = s.body[i];
-    // A severed limb is not drawn over: it is simply NOT IN THE PICTURE, which
-    // says it better than any marker could (see BodyPartUI's note).
     if (b.severed || !b.projValid) continue;
-    // Outline only what is actually wrong. Ringing every limb would make the
-    // portrait unreadable and would say nothing.
     const float worst = std::min(b.hpFrac, b.voxelFrac);
-    // A limb can be perfectly healthy and covered in something, which is a
-    // thing worth pointing at on a portrait — so a coat above the threshold
-    // is now its own reason not to skip the limb.
     const bool coated = b.stainFrac >= s.stainHudMin && b.stainColor != 0;
-    if (worst > 0.98f && b.burningVoxels == 0 && !b.bleeding && !coated)
+    const bool selected = s.inspectSelected == i;
+    if (!selected && worst > 0.98f && b.burningVoxels == 0 && !b.bleeding && !coated)
       continue;
     ImU32 col = ui::ColEmber();
-    if (b.burningVoxels > 0)
+    if (selected)
+      col = Fade(ui::ColGoldHi(), 0.7f + 0.3f * flash);
+    else if (b.burningVoxels > 0)
       col = Fade(ui::ColEmber(), 0.5f + 0.5f * flash);
     else if (b.bleeding)
       col = Fade(ui::ColBloodHi(), 0.45f + 0.55f * flash);
@@ -675,18 +700,28 @@ void InspectCastPicks(UIState& s, ImVec2 at, ImVec2 size) {
 // `stainMin` is UIState::stainHudMin, threaded in rather than reached for:
 // this file has no sim header and the row must use the SAME cut-off the HUD
 // and the portrait callout use, or a limb would be listed with no chip on it.
-void InjuryRow(const UIState::BodyPartUI& b, float stainMin) {
+void InjuryRow(UIState& s, int slot, float stainMin) {
+  const UIState::BodyPartUI& b = s.body[slot];
   ImDrawList* dl = ImGui::GetWindowDrawList();
-  // Where the bars start. Fixed, so every row's bars line up into a column
-  // that can be read down rather than per-row.
   const float kBarX = 190.0f;
   const float kBarW = 130.0f;
+  const bool selected = s.inspectSelected == slot;
 
   {
+    ImGui::PushID(5000 + slot);
     const ImVec2 p = ImGui::GetCursorScreenPos();
-    ui::ShadowText(dl, p, b.severed ? ui::ColBloodHi() : ui::ColParch(),
-                   b.label);
-    ImGui::Dummy(ImVec2(0, ImGui::GetTextLineHeight()));
+    const float lh = ImGui::GetTextLineHeight();
+    ImGui::InvisibleButton("##lbl", ImVec2(kBarX - 8, lh));
+    if (ImGui::IsItemClicked()) s.inspectSelected = slot;
+    if (selected)
+      dl->AddRectFilled(ImVec2(p.x - 4, p.y - 1), ImVec2(p.x + kBarX - 10, p.y + lh + 1),
+                        Fade(ui::ColGold(), 0.15f));
+    else if (ImGui::IsItemHovered())
+      dl->AddRectFilled(ImVec2(p.x - 4, p.y - 1), ImVec2(p.x + kBarX - 10, p.y + lh + 1),
+                        Fade(ui::ColGold(), 0.08f));
+    ui::ShadowText(dl, p, b.severed ? ui::ColBloodHi() :
+                   (selected ? ui::ColGoldHi() : ui::ColParch()), b.label);
+    ImGui::PopID();
   }
 
   if (b.severed) {
@@ -768,24 +803,38 @@ void InjuryRow(const UIState::BodyPartUI& b, float stainMin) {
   if (b.burningVoxels > 0) chip(ui::ColEmber(), "BURNING %u", b.burningVoxels);
   if (b.charredFrac > 0.02f)
     chip(ui::ColEmber(), "CHARRED %.0f%%", b.charredFrac * 100.0f);
-  // Last, because it is the only chip here that is not damage: BLEEDING and
-  // BURNING are things to act on, a coat is a thing to notice.
+  if (any) {
+    ImGui::NewLine();
+    ImGui::Unindent(12.0f);
+  }
+  // SURFACE: stains on a separate line with a "surface:" label so they
+  // cannot be misread as damage.
   if (b.stainFrac >= stainMin && b.stainColor != 0) {
-    // Uppercased into a stack buffer to match the other chips' voice. The
-    // label is a material name ("blood", "water"), so 24 bytes is generous.
     char up[sizeof b.stainLabel];
     size_t k = 0;
     for (; k + 1 < sizeof up && b.stainLabel[k]; k++)
       up[k] = (char)std::toupper((unsigned char)b.stainLabel[k]);
     up[k] = '\0';
-    // The substance's own colour, lightened the way the portrait callout
-    // lightens it, so a dark dried red still reads as a chip rather than as
-    // a hole punched in the row.
-    chip(ui::Mix(b.stainColor, IM_COL32_WHITE, 0.35f), "%s %.0f%%",
-         k ? up : "COATED", b.stainFrac * 100.0f);
-  }
-  if (any) {
-    ImGui::NewLine();
+    ImGui::Indent(12.0f);
+    ImGui::PushFont(ui::FontSmall());
+    ImGui::TextDisabled("surface:");
+    ImGui::PopFont();
+    ImGui::SameLine();
+    {
+      char buf[48];
+      std::snprintf(buf, sizeof buf, "%s %.0f%%", k ? up : "COATED",
+                    b.stainFrac * 100.0f);
+      const ImU32 sc = ui::Mix(b.stainColor, IM_COL32_WHITE, 0.35f);
+      const ImVec2 ts = ImGui::CalcTextSize(buf);
+      const ImVec2 p = ImGui::GetCursorScreenPos();
+      dl->AddRectFilled(ImVec2(p.x - 4, p.y), ImVec2(p.x + ts.x + 4, p.y + ts.y),
+                        Fade(ui::ColInk(), 0.7f));
+      dl->AddRectFilled(ImVec2(p.x - 4, p.y + ts.y - 2),
+                        ImVec2(p.x + ts.x + 4, p.y + ts.y), Fade(sc, 0.8f));
+      ImGui::PushStyleColor(ImGuiCol_Text, ImGui::ColorConvertU32ToFloat4(sc));
+      ImGui::TextUnformatted(buf);
+      ImGui::PopStyleColor();
+    }
     ImGui::Unindent(12.0f);
   }
   ImGui::Dummy(ImVec2(0, 6));
@@ -1636,6 +1685,184 @@ void LootPanel(UIState& s, ImVec2 pos, ImVec2 size, const ui::PanelStyle& st,
   ImGui::End();
 }
 
+// ---- the DETAIL COLUMN for a selected limb ---------------------------------
+//
+// Drawn beside the injury list when a limb is clicked in the portrait or in
+// the injury row. Shows tissue composition, condition and surface state in
+// explicit sections so the player can tell what the limb IS (tissue), what
+// happened TO it (damage) and what is ON it (surface).
+void LimbDetail(const UIState& s, ImVec2 at, ImVec2 size) {
+  if (s.inspectSelected < 0 || s.inspectSelected >= UIState::kSlotCount) return;
+  const UIState::BodyPartUI& b = s.body[s.inspectSelected];
+  ImGui::SetCursorScreenPos(at);
+  ImGui::BeginChild("##limbdetail", size, ImGuiChildFlags_None,
+                    ImGuiWindowFlags_NoBackground);
+  ImDrawList* dl = ImGui::GetWindowDrawList();
+  const ImVec2 base = ImGui::GetCursorScreenPos();
+  const float w = ImGui::GetContentRegionAvail().x;
+  float y = base.y;
+  const float kBarW = std::min(w - 80, 120.0f);
+
+  // Limb name as a heading.
+  {
+    ImGui::PushStyleColor(ImGuiCol_Text, ImGui::ColorConvertU32ToFloat4(
+                                             ui::ColGoldHi()));
+    ImGui::SetCursorScreenPos(ImVec2(base.x, y));
+    ImGui::TextUnformatted(b.label);
+    ImGui::PopStyleColor();
+    y += ImGui::GetTextLineHeight() + 4;
+  }
+
+  if (b.severed) {
+    ImGui::SetCursorScreenPos(ImVec2(base.x, y));
+    ImGui::PushStyleColor(ImGuiCol_Text, ImGui::ColorConvertU32ToFloat4(
+                                             ui::ColBloodHi()));
+    ImGui::TextUnformatted("SEVERED");
+    ImGui::PopStyleColor();
+    ImGui::EndChild();
+    return;
+  }
+
+  // ---- TISSUE COMPOSITION ----------------------------------------------------
+  y = ui::Subheading(dl, ImVec2(base.x, y), w, "TISSUE") + 2;
+
+  auto tissueBar = [&](const char* name, uint32_t count, uint32_t total,
+                       ImU32 col) {
+    if (count == 0 && total == 0) return;
+    ImGui::PushFont(ui::FontSmall());
+    ImGui::SetCursorScreenPos(ImVec2(base.x + 4, y));
+    ImGui::TextDisabled("%-8s", name);
+    ImGui::SameLine(72);
+    char buf[16];
+    std::snprintf(buf, sizeof buf, "%u", count);
+    ImGui::TextUnformatted(buf);
+    ImGui::SameLine(108);
+    if (total > 0 && kBarW > 20) {
+      const ImVec2 a(base.x + 108, std::floor(y + 2));
+      const ImVec2 b(a.x + kBarW, a.y + 8);
+      const float frac = std::min(1.0f, (float)count / (float)total);
+      dl->AddRectFilled(a, b, Fade(ui::ColInk(), 0.5f));
+      if (frac > 0.001f)
+        dl->AddRectFilled(a, ImVec2(a.x + (b.x - a.x) * frac, b.y), Fade(col, 0.8f));
+      dl->AddRect(a, b, Fade(IM_COL32_WHITE, 0.12f));
+    }
+    ImGui::PopFont();
+    y += 14;
+  };
+  const uint32_t total = b.voxelTotal > 0 ? b.voxelTotal : 1;
+  tissueBar("skin",   b.voxelSkin,   total, IM_COL32(210, 185, 155, 255));
+  tissueBar("flesh",  b.voxelFlesh,  total, IM_COL32(180, 90,  90,  255));
+  tissueBar("muscle", b.voxelMuscle, total, IM_COL32(160, 70,  80,  255));
+  tissueBar("bone",   b.voxelBone,   total, IM_COL32(220, 215, 200, 255));
+  if (b.voxelBrain > 0 || b.voxelBrainMax > 0) {
+    tissueBar("brain", b.voxelBrain, total, IM_COL32(225, 190, 195, 255));
+    if (b.voxelBrainMax > 0 && b.voxelBrain < b.voxelBrainMax) {
+      ImGui::PushFont(ui::FontSmall());
+      ImGui::SetCursorScreenPos(ImVec2(base.x + 8, y));
+      ImGui::PushStyleColor(ImGuiCol_Text, ImGui::ColorConvertU32ToFloat4(
+                                               ui::ColBloodHi()));
+      char miss[48];
+      std::snprintf(miss, sizeof miss, "%u / %u missing",
+                    b.voxelBrainMax - b.voxelBrain, b.voxelBrainMax);
+      ImGui::TextUnformatted(miss);
+      ImGui::PopStyleColor();
+      ImGui::PopFont();
+      y += 14;
+    }
+  }
+  y += 4;
+
+  // ---- CONDITION --------------------------------------------------------------
+  y = ui::Subheading(dl, ImVec2(base.x, y), w, "CONDITION") + 2;
+
+  auto condBar = [&](const char* label, float frac, ImU32 fill) {
+    ImGui::PushFont(ui::FontSmall());
+    ImGui::SetCursorScreenPos(ImVec2(base.x + 4, y));
+    ImGui::TextDisabled("%s", label);
+    ImGui::SameLine(108);
+    if (kBarW > 20) {
+      const ImVec2 a(base.x + 108, std::floor(y + 2));
+      const ImVec2 bv(a.x + kBarW, a.y + 8);
+      ui::ValueBar(dl, a, bv, frac, fill, false);
+    }
+    ImGui::PopFont();
+    y += 14;
+  };
+  {
+    char hpCap[48];
+    std::snprintf(hpCap, sizeof hpCap, "hp  %.0f / %.0f", b.hp, b.hpMax);
+    condBar(hpCap, b.hpFrac, ui::ColBloodHi());
+  }
+  {
+    char intCap[32];
+    std::snprintf(intCap, sizeof intCap, "intact  %.0f%%", b.voxelFrac * 100.0f);
+    condBar(intCap, b.voxelFrac, ui::ColSteel());
+  }
+
+  // Active damage states.
+  if (b.bleeding || b.burningVoxels > 0 || b.charredFrac > 0.02f) {
+    ImGui::PushFont(ui::FontSmall());
+    if (b.bleeding) {
+      ImGui::SetCursorScreenPos(ImVec2(base.x + 8, y));
+      ImGui::PushStyleColor(ImGuiCol_Text, ImGui::ColorConvertU32ToFloat4(
+                                               ui::ColBloodHi()));
+      ImGui::TextUnformatted("BLEEDING");
+      ImGui::PopStyleColor();
+      y += 14;
+    }
+    if (b.burningVoxels > 0) {
+      ImGui::SetCursorScreenPos(ImVec2(base.x + 8, y));
+      ImGui::PushStyleColor(ImGuiCol_Text, ImGui::ColorConvertU32ToFloat4(
+                                               ui::ColEmber()));
+      char buf[32];
+      std::snprintf(buf, sizeof buf, "BURNING %u voxels", b.burningVoxels);
+      ImGui::TextUnformatted(buf);
+      ImGui::PopStyleColor();
+      y += 14;
+    }
+    if (b.charredFrac > 0.02f) {
+      ImGui::SetCursorScreenPos(ImVec2(base.x + 8, y));
+      ImGui::PushStyleColor(ImGuiCol_Text, ImGui::ColorConvertU32ToFloat4(
+                                               ui::ColEmber()));
+      char buf[32];
+      std::snprintf(buf, sizeof buf, "CHARRED %.0f%%", b.charredFrac * 100.0f);
+      ImGui::TextUnformatted(buf);
+      ImGui::PopStyleColor();
+      y += 14;
+    }
+    ImGui::PopFont();
+  }
+  y += 4;
+
+  // ---- SURFACE ----------------------------------------------------------------
+  y = ui::Subheading(dl, ImVec2(base.x, y), w, "SURFACE") + 2;
+  ImGui::PushFont(ui::FontSmall());
+  if (b.stainFrac >= s.stainHudMin && b.stainColor != 0) {
+    ImGui::SetCursorScreenPos(ImVec2(base.x + 4, y));
+    ImVec4 sc = ImGui::ColorConvertU32ToFloat4(b.stainColor);
+    sc.w = 1.0f;
+    ImGui::ColorButton("##stc", sc, ImGuiColorEditFlags_NoTooltip |
+                                    ImGuiColorEditFlags_NoPicker,
+                       ImVec2(10, 10));
+    ImGui::SameLine();
+    char buf[48];
+    std::snprintf(buf, sizeof buf, "%s  %.0f%%",
+                  b.stainLabel[0] ? b.stainLabel : "coated",
+                  b.stainFrac * 100.0f);
+    ImGui::TextUnformatted(buf);
+    y += 16;
+  } else {
+    ImGui::SetCursorScreenPos(ImVec2(base.x + 4, y));
+    ImGui::TextDisabled("clean");
+    y += 14;
+  }
+  ImGui::PopFont();
+
+  ImGui::SetCursorScreenPos(ImVec2(base.x, y));
+  ImGui::Dummy(ImVec2(w, 4));
+  ImGui::EndChild();
+}
+
 }  // namespace
 
 void DrawInventoryScreen(UIState& s) {
@@ -1654,7 +1881,12 @@ void DrawInventoryScreen(UIState& s) {
       s.portraitW > 0 ? (float)s.portraitW : kPortraitWFallback;
   const float kPortraitH =
       s.portraitH > 0 ? (float)s.portraitH : kPortraitHFallback;
-  const float leftW = kPad * 2 + kSlot * 2 + kSlotGap * 2 + kPortraitW + 8;
+  const float kDetailW = 260.0f;
+  const bool showDetail = s.inspectMode && s.inspectSelected >= 0 &&
+                          s.inspectSelected < UIState::kSlotCount &&
+                          s.body[s.inspectSelected].present;
+  const float leftBase = kPad * 2 + kSlot * 2 + kSlotGap * 2 + kPortraitW + 8;
+  const float leftW = leftBase + (showDetail ? kDetailW + kColGap : 0.0f);
   const float top = 28.0f;
   // Room under the panels for the footer hint's tab.
   const float bottom = std::max(top + 200.0f, disp.y - 46.0f);
@@ -1723,8 +1955,10 @@ void DrawInventoryScreen(UIState& s) {
       if (ui::Button("##mode",
                      ImVec2(wp.x + ws.x - kFrame - 10 - bw,
                             wp.y + kFrame + std::floor((ui::kHeaderH - ts.y - 8) * 0.5f)),
-                     label, s.inspectMode, bw))
+                     label, s.inspectMode, bw)) {
         s.inspectMode = !s.inspectMode;
+        s.inspectSelected = -1;
+      }
       if (ImGui::IsItemHovered())
         Tip(s.inspectMode
                 ? "Back to equipment."
@@ -1772,41 +2006,37 @@ void DrawInventoryScreen(UIState& s) {
     y = portY + kPortraitH + 16;
 
     if (s.inspectMode) {
-      // The injury list, worst first. `order` is rebuilt every frame — it is
-      // 15 entries and the sort key changes as the body takes damage, so
-      // caching it would only buy a stale list.
-      y = ui::Subheading(dl, ImVec2(wp.x + kPad, y), ws.x - kPad * 2, "INJURIES");
+      const float injuryW = showDetail ? (leftBase - kPad * 2) : (ws.x - kPad * 2);
+      y = ui::Subheading(dl, ImVec2(wp.x + kPad, y), injuryW, "INJURIES");
       y += 4;
+      const float injuryY = y;
       ImGui::SetCursorScreenPos(ImVec2(wp.x + kPad, y));
       ImGui::PushClipRect(ImVec2(wp.x + kPad, y),
-                          ImVec2(wp.x + ws.x - kPad, wp.y + ws.y - kPad), true);
+                          ImVec2(wp.x + kPad + injuryW, wp.y + ws.y - kPad), true);
       ImGui::BeginChild("##injuries",
-                        ImVec2(ws.x - kPad * 2, wp.y + ws.y - kPad - y - 6),
+                        ImVec2(injuryW, wp.y + ws.y - kPad - y - 6),
                         ImGuiChildFlags_None, ImGuiWindowFlags_NoBackground);
       int order[UIState::kSlotCount];
       int n = 0;
       for (int i = 0; i < UIState::kSlotCount; i++)
         if (s.body[i].present) order[n++] = i;
-      std::stable_sort(order, order + n, [&](int a, int b) {
+      std::stable_sort(order, order + n, [&](int a, int bb) {
         auto score = [&](int i) {
           const UIState::BodyPartUI& p = s.body[i];
-          if (p.severed) return -1.0f;             // gone: always first
-          return std::min(p.hpFrac, p.voxelFrac);  // then worst-off
+          if (p.severed) return -1.0f;
+          return std::min(p.hpFrac, p.voxelFrac);
         };
-        return score(a) < score(b);
+        return score(a) < score(bb);
       });
       bool anyHurt = false;
       for (int i = 0; i < n; i++) {
-        const UIState::BodyPartUI& b = s.body[order[i]];
-        // A coat is a CONDITION, not an injury, but the health view is the
-        // only place that reports per-limb condition at all — so a limb whose
-        // only news is that it is drenched is listed here rather than nowhere.
-        const bool hurt = b.severed || b.bleeding || b.burningVoxels > 0 ||
-                          b.hpFrac < 0.999f || b.voxelFrac < 0.999f ||
-                          (b.stainFrac >= s.stainHudMin && b.stainColor != 0);
+        const UIState::BodyPartUI& bi = s.body[order[i]];
+        const bool hurt = bi.severed || bi.bleeding || bi.burningVoxels > 0 ||
+                          bi.hpFrac < 0.999f || bi.voxelFrac < 0.999f ||
+                          (bi.stainFrac >= s.stainHudMin && bi.stainColor != 0);
         if (!hurt) continue;
         anyHurt = true;
-        InjuryRow(b, s.stainHudMin);
+        InjuryRow(s, order[i], s.stainHudMin);
       }
       if (!anyHurt) {
         ImGui::TextDisabled(s.bodyValid ? "Not a scratch."
@@ -1814,6 +2044,12 @@ void DrawInventoryScreen(UIState& s) {
       }
       ImGui::EndChild();
       ImGui::PopClipRect();
+      if (showDetail) {
+        const float detailX = wp.x + kPad + leftBase - kPad + kColGap;
+        LimbDetail(s, ImVec2(detailX, injuryY),
+                   ImVec2(wp.x + ws.x - kPad - detailX,
+                          wp.y + ws.y - kPad - injuryY));
+      }
     } else {
       // Sheath + quick slots: what is on your person but not in your hand.
       y = ui::Subheading(dl, ImVec2(wp.x + kPad, y), ws.x - kPad * 2,

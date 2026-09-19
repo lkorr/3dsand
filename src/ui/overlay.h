@@ -553,6 +553,14 @@ struct UIState {
     // mid-frame, and one dangling frame is not worth the four bytes saved.
     char stainLabel[24] = {0};
     float hp = 0, hpMax = 0;     // absolute, for the numeric readout
+    // Per-tissue voxel counts: what the limb is MADE OF right now.
+    uint32_t voxelTotal = 0;     // surviving voxels (same as PartVoxelCount)
+    uint32_t voxelSkin = 0;
+    uint32_t voxelFlesh = 0;
+    uint32_t voxelMuscle = 0;
+    uint32_t voxelBone = 0;
+    uint32_t voxelBrain = 0;
+    uint32_t voxelBrainMax = 0;  // brain voxels at spawn (for "X missing")
     // WHERE THE LIMB IS ON THE PORTRAIT, so the inspector can outline it.
     // Normalized to the portrait frame: (0,0) top-left, (1,1) bottom-right,
     // as the screen-space bounds of the limb's projected oriented box.
@@ -635,6 +643,7 @@ struct UIState {
 
   bool inventoryOpen = false;   // I toggles; main.cpp owns the cursor/capture
   bool inspectMode = false;     // left panel: CHARACTER (gear) vs HEALTH
+  int inspectSelected = -1;     // BodySlot of the limb whose detail is open, -1 = none
 
   // ---- the live avatar portrait (main.cpp's second render pass) ------------
   // `portraitTex` is an ImTextureID (a VkDescriptorSet behind the scenes) that
@@ -664,6 +673,11 @@ struct UIState {
   bool portraitReset = false;
   // One-shot: zoom and pan to frame the given BodySlot. -1 = none.
   int portraitFocusSlot = -1;
+  // The limb the orbit PIVOTS around. -1 = whole body center of mass (the
+  // default). Set by double-click-to-frame; cleared by reset. While set,
+  // left-drag rotates around that limb's world-space center rather than the
+  // body's, so clicking a hand and orbiting keeps the hand centered.
+  int portraitPivotSlot = -1;
   // Cursor position over the portrait frame, normalized to [-1,1] with +y up,
   // valid only while the pointer is inside it and not dragging. main.cpp turns
   // this into a SetLook() so the character glances at the mouse — GAME state
