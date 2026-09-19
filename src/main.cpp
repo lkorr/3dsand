@@ -6003,6 +6003,10 @@ int main(int argc, char** argv) {
   CombatCueRequest combatWhooshCue, combatFleshCue, combatClangCue,
                    combatStrikeCue, combatCutCue;
   bool combatStrikeEdged = true;
+  // THE WHOOSH IS THE ONE CUE THAT IS NOT AN INSTANT, so its voice is kept and
+  // moved. Handle from Cues::Combat; self-invalidating, so nothing here has to
+  // know when the sample ended (audio/world.h PlayOneShotTracked).
+  int combatWhooshVoice = -1;
   // The swing whoosh fires on the EDGE into Slash, not while Slash is held:
   // committing is a moment, and a per-tick test would play the sample five
   // times over one cut. Remembered across frames, so the edge survives a frame
@@ -8792,14 +8796,18 @@ int main(int argc, char** argv) {
             if (sp > lo) {
               combatWhooshCue.pending = true;
               combatWhooshCue.power = std::clamp((sp - lo) / (hi - lo), 0.0f, 1.0f);
-              // AT THE HAND, not at the tip: the sound is air moving past the
-              // whole blade, and putting it at the point makes a long weapon's
-              // whoosh pan away from the player who swung it.
+              // A POINT ALONG THE BLADE, not either end of it, and the SAME
+              // point the voice then follows for the length of the sample (the
+              // audio block moves it every frame). The hand alone was where this
+              // used to sit: safe, but it barely travels, so a cut across the
+              // body made no pan at all; the tip alone swings a metre wide of the
+              // player holding it. `combatfx.whooshEdgeFrac` is the dial.
               Vec3 eb, et, ef;
               float ehw = 0;
-              combatWhooshCue.at = avatar.WeaponEdge(eb, et, ehw, &ef)
-                                       ? eb
-                                       : player.pos;
+              combatWhooshCue.at =
+                  avatar.WeaponEdge(eb, et, ehw, &ef)
+                      ? eb + (et - eb) * fx.whooshEdgeFrac
+                      : player.pos;
             }
           }
           meleePhasePrev = melee.Phase();
@@ -9647,7 +9655,14 @@ int main(int argc, char** argv) {
               // same sound.
               CombatCueRequest& q = flesh ? combatFleshCue : combatClangCue;
               const float pw = res.power * res.edgeAlign;
-              const Vec3 hitAt = (sw.aNow + sw.bNow) * 0.5f;
+              // AT THE CONTACT POINT, not at the middle of the blade. The
+              // segment midpoint is where the WEAPON is; on a sword that is up
+              // to half a metre from the wound, and a listener standing right in
+              // front of what they just hit could hear the blow off to one side
+              // (reported 2026-09-19). `hitAt` is the probe ray's own hit
+              // position — the same place the kerf is bored.
+              const Vec3 hitAt = res.hasHitAt ? res.hitAt
+                                              : (sw.aNow + sw.bNow) * 0.5f;
               if (!q.pending || pw > q.power) {
                 q.power = pw;
                 q.at = hitAt;
@@ -10091,6 +10106,17 @@ int main(int argc, char** argv) {
       sandvox::PerfSpan spanAudio(sandvox::PerfScope::Audio);
       const Vec3 earPos = player.ViewEyePos();
       if (audioCues.Enabled()) {
+        // THE LISTENER IS PUBLISHED FIRST, BEFORE ANY CUE IS FIRED (2026-09-19).
+        // Every trigger below is placed relative to the pose AudioWorld is
+        // holding (PlayOneShot ranks and pre-positions the voice against
+        // `listener_`), so publishing at the END of the block — which is what
+        // this did — spatialized this frame's impacts against LAST frame's head.
+        // A mouse flick during a swing is tens of degrees per frame, and the
+        // whole error lands on the one sound the player is listening hardest to.
+        // The FULL Update still runs at the end of the block: it reaps bleed
+        // loops, which must see the frame's MobBleed calls, and re-solves
+        // occlusion once per voice.
+        audioCues.PublishListener(earPos, cam.yaw, cam.pitch);
         for (const PlayerAvatar::Footfall& ff : avatar.Footfalls()) {
           if (ff.landing)
             audioCues.Land(ff.mat, ff.posVox, ff.fallSpeed);
@@ -10149,9 +10175,45 @@ int main(int argc, char** argv) {
         // ring/thud, `flesh` when it landed on a body, `cut` for the wet
         // slicing of an edged weapon in flesh, then the creature's own `hurt`
         // (or `sever` + `dismember` if a limb came off) from the blocks below.
-        if (combatWhooshCue.pending) {
-          audioCues.Combat(audio::Cues::CombatCue::Whoosh, combatWhooshCue.at,
-                           combatWhooshCue.power);
+        //
+        // AND THE WHOOSH MOVES WHILE IT PLAYS. The other five are instants: a
+        // blade touched a body at one place at one moment. A whoosh is the air a
+        // blade is STILL shifting, so its voice tracks the weapon for as long as
+        // the sample lasts, which is what makes a cut from left to right pan
+        // from left to right instead of hanging where the cut committed.
+        //
+        // `whooshPan` scales the whole offset from the ear, because this is the
+        // one sound in the game whose source is IN THE PLAYER'S OWN HANDS: at 0
+        // it collapses onto the head and is effectively mono, which is the dial
+        // to reach for if a swing sweeping across your own stereo image reads as
+        // wrong rather than as physical.
+        {
+          const Tuning::CombatFx& fxa = CurrentTuning().combatfx;
+          auto whooshAt = [&](const Vec3& p) {
+            return earPos + (p - earPos) * fxa.whooshPan;
+          };
+          if (combatWhooshCue.pending) {
+            combatWhooshVoice =
+                audioCues.Combat(audio::Cues::CombatCue::Whoosh,
+                                 whooshAt(combatWhooshCue.at),
+                                 combatWhooshCue.power);
+          }
+          if (!audioCues.CombatActive(combatWhooshVoice))
+            combatWhooshVoice = -1;   // sample ended: stop paying for the follow
+          if (combatWhooshVoice >= 0) {
+            Vec3 eb, et, ef;
+            float ehw = 0;
+            if (avatar.WeaponEdge(eb, et, ehw, &ef)) {
+              audioCues.MoveCombat(
+                  combatWhooshVoice,
+                  whooshAt(eb + (et - eb) * fxa.whooshEdgeFrac));
+            } else {
+              // Weapon sheathed, dropped, or the arm holding it came off
+              // mid-swing: leave the sound where it was made rather than
+              // teleporting it to the player.
+              combatWhooshVoice = -1;
+            }
+          }
         }
         if (combatStrikeCue.pending) {
           audioCues.Combat(combatStrikeEdged

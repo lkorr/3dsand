@@ -63,6 +63,13 @@ class Cues {
   // `world` may be null (headless), which disables the occlusion solve.
   void Update(float dt, const Vec3& listenerPosVox, float yaw, float pitch, World* world);
 
+  // Publish the listener pose EARLY, before the frame fires any cue. Every
+  // trigger is placed relative to the pose the audio world is holding, so a cue
+  // fired before this ran was spatialized against the previous frame's head —
+  // tens of degrees of error during a mouse flick, on exactly the sounds the
+  // player is listening hardest to. Cheap: it stores the pose and nothing else.
+  void PublishListener(const Vec3& listenerPosVox, float yaw, float pitch);
+
   // Load the sound LIBRARY and nothing else — no device, no mixer, no voices.
   //
   // SPLIT OUT OF Init FOR THE SAME REASON ProbeAmbience IS: a headless run has
@@ -150,8 +157,22 @@ class Cues {
   // bed's is. `power` in [0,1] is how hard the event was — stroke speed for a
   // whoosh, the sweep's speed x edge-alignment for the other two — and drives
   // gain and a pitch bend, the same shape Land and Impact use.
-  enum class CombatCue { Whoosh, Flesh, Clang };
-  void Combat(CombatCue cue, const Vec3& posVox, float power);
+  //
+  // RETURNS A TRACKING HANDLE (-1 if nothing started). A whoosh is the only cue
+  // here that is NOT a point event: it is the air a blade is still moving, so
+  // the caller keeps calling MoveCombat with the weapon's position for as long
+  // as the swing lasts and the sound pans with the blade. The impact cues are
+  // genuine instants and should ignore the handle. See MoveCombat.
+  enum class CombatCue { Whoosh, Flesh, Clang, StrikeEdge, StrikeBlunt, Cut };
+  int Combat(CombatCue cue, const Vec3& posVox, float power);
+
+  // Move a still-playing cue (the handle from Combat). Silently does nothing
+  // once the sample has finished or its voice was stolen, so a caller may keep
+  // calling with a handle it never checked.
+  void MoveCombat(int handle, const Vec3& posVox);
+  // Is that cue still sounding? Callers use it to stop paying for the tracking
+  // work once the sample has ended.
+  bool CombatActive(int handle) const;
 
   // Resolve one combat slot to a library id, or -1 when nothing is recorded.
   // DEVICE-FREE, like MobSetId: it touches only the library, so a headless gate

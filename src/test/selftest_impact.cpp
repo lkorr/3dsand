@@ -350,6 +350,11 @@ Status GateImpactBlunt(Ctx& c, std::string& detail) {
   float sweptHpDrop = 0.0f;
   bool sweptAttached = false;
   bool sweptRan = false;
+  // The contact point the sweep reports, and how far off the struck limb's own
+  // axis it ever fell. `sweptHitMissing` is the honest failure: a sweep that hit
+  // a body and reported no position at all.
+  bool sweptHitReported = false, sweptHitMissing = false;
+  float sweptHitOff = 0.0f;
   {
     // TWO CREATURES, because MeleeSweepDamage needs a WIELDER and refuses to
     // cut one (`wielder.OwnsBody`) -- handing it the victim would make every
@@ -420,6 +425,25 @@ Status GateImpactBlunt(Ctx& c, std::string& detail) {
       const EdgeSweepResult r = MeleeSweepDamage(sw, mt, *wielder, c.phys, mobs,
                                                  c.debris, c.world, spawns);
       if (r.bodiesHit > 0) sweptRan = true;
+      // ---- WHERE THE BLOW SAYS IT LANDED (2026-09-19) --------------------
+      //
+      // The sweep now reports its own contact point, because the IMPACT SOUND is
+      // made there and its callers had nothing better than the middle of the
+      // blade — half a metre from the wound on a long weapon, which is audible
+      // as the blow coming from the wrong place and was reported as exactly
+      // that. So: a sweep that hit somebody must SAY where, and the place must
+      // be on the limb it hit. Measured against the limb's own axis segment,
+      // which is what this fixture already built to aim the blow.
+      if (r.bodiesHit > 0 && r.hasHitAt) {
+        sweptHitReported = true;
+        const Vec3 d = r.hitAt - ax.anchor;
+        const float tAlong =
+            std::clamp(d.dot(ax.along), 0.0f, std::max(ax.reach, 0.001f));
+        const float off = (r.hitAt - (ax.anchor + ax.along * tAlong)).len();
+        sweptHitOff = std::max(sweptHitOff, off);
+      } else if (r.bodiesHit > 0) {
+        sweptHitMissing = true;
+      }
     }
     const bool alive = mobs.LimbBody(id, t.limb) != 0;
     sweptAttached = alive;
@@ -450,6 +474,19 @@ Status GateImpactBlunt(Ctx& c, std::string& detail) {
   const uint32_t bruiseCap = (uint32_t)std::lround(
                                  std::clamp(gtune.bruiseStep, 0.0f, 15.0f)) +
                              1u;
+  // ---- THE LADDER'S MIDDLE RUNG, MEASURED (2026-09-19) --------------------
+  //
+  // Blood ON the limb, at the depth that counts as pulp -- i.e. skin that the
+  // repeated blows BROKE, not blood that ran onto it. The dent below cannot
+  // happen without it (Tuning::Gore::pulpCarveFrom), so asserting only "a mace
+  // removes something" leaves the interesting failure invisible: the rung
+  // shipped with `RaiseBodyStain` refusing every conversion, which no gate
+  // could see because `bluntCarveRadius` was 0 as well and the dent claim was
+  // therefore red for an unrelated-looking reason.
+  const uint32_t bloodMat = mobs.Defs()[t.defIndex].bleedMat;
+  const uint32_t pulpAt =
+      (uint32_t)std::lround(std::clamp(gtune.pulpAmt, 1.0f, 15.0f));
+  uint32_t pulped = 0, pulpedOne = 0;
   {
     const uint64_t id = SpawnTarget(c, t, 415);
     if (!id) {
@@ -472,8 +509,13 @@ Status GateImpactBlunt(Ctx& c, std::string& detail) {
       // asserting is not "some voxels are bruised" but "the SAME voxels got
       // darker" — and that needs a reading from before the rest of the blows
       // landed to compare against.
-      if (k == 0 && bruiseMat && mobs.LimbBody(id, t.limb))
-        bruiseOne = mobs.LimbCoatMatCount(id, t.limb, bruiseMat, 1);
+      if (k == 0 && mobs.LimbBody(id, t.limb)) {
+        if (bruiseMat) bruiseOne = mobs.LimbCoatMatCount(id, t.limb, bruiseMat, 1);
+        // ZERO IS THE CLAIM HERE, and it is half of what makes the ladder a
+        // ladder: one blow on intact skin bruises and breaks nothing.
+        if (bloodMat)
+          pulpedOne = mobs.LimbCoatMatCount(id, t.limb, bloodMat, pulpAt);
+      }
     }
     attached = mobs.LimbBody(id, t.limb) != 0;
     alive = mobs.IsAlive(id);
@@ -491,6 +533,7 @@ Status GateImpactBlunt(Ctx& c, std::string& detail) {
       bruiseDeep = (bruiseMat && bruiseCap)
                        ? mobs.LimbCoatMatCount(id, t.limb, bruiseMat, bruiseCap)
                        : 0u;
+      pulped = bloodMat ? mobs.LimbCoatMatCount(id, t.limb, bloodMat, pulpAt) : 0u;
       bluntBleed = mobs.LimbBleedBudget(id, t.limb);
     }
     mobs.Reset();
@@ -539,6 +582,8 @@ Status GateImpactBlunt(Ctx& c, std::string& detail) {
   RecordObserved("impactBluntBruiseCells", (double)bruise);
   RecordObserved("impactBluntBruiseAfterOne", (double)bruiseOne);
   RecordObserved("impactBluntBruiseAtCap", (double)bruiseDeep);
+  RecordObserved("impactBluntPulpedAfterOne", (double)pulpedOne);
+  RecordObserved("impactBluntPulped", (double)pulped);
   RecordObserved("impactBluntBleedBudget", (double)bluntBleed);
   RecordObserved("impactBluntCutBleedBudget", (double)cutBleed);
   RecordObserved("impactBluntSweptLost", (double)sweptLost);
@@ -567,24 +612,60 @@ Status GateImpactBlunt(Ctx& c, std::string& detail) {
   // without bound because coverage was the only channel the mark had.
   const bool deepened = bruiseCap == 0 || bruiseDeep > 0;
   const bool concentrated = bruiseOne > 0 && bruise <= bruiseOne * 3;
+  // ---- ...AND IT CLIMBED THE LADDER IN ORDER (2026-09-19) -----------------
+  //
+  // THREE CLAIMS, and the ORDER is the whole of what is being tested. A blunt
+  // weapon that broke skin on contact would pass the second alone; one that
+  // dented on contact would pass the dent band alone. What neither can fake is
+  // "nothing at all on the first blow, both after two dozen in the same spot".
+  const bool openedNothingAtFirst = pulpedOne == 0 && bruiseOne > 0;
+  const bool broke = bloodMat != 0 && pulped > 0;
+  // ...and the mark did not go ENTIRELY wet. A FLOOR, not a majority, and the
+  // difference matters: this arm lands every one of two dozen blows on the
+  // SAME point, which is the case the owner wants to be gruesome, so blood
+  // outnumbering bruise here is the feature and not a bug. (The "bulk of a
+  // mace kill is still bruises" half of the spec is about blows that land in
+  // different places, and it holds by construction -- the bruise radius is
+  // more than twice the dent's and applies on EVERY blow where the dent
+  // applies on few.)
+  //
+  // What this refuses is measured and specific. The taper used to live only in
+  // the STEP, so every cell in the radius eventually crawled to the same
+  // global ceiling and the whole patch converted: 431 bruised voxels became 4,
+  // with 538 bloodied and a hard edge where the mark used to fade. A bruise
+  // ceiling that tapers with the blow (Mob::BruiseLimb, `voxCap`) is the fix,
+  // and this is the line that would have caught it.
+  const bool spectrum = pulped == 0 || bruise * 2 >= pulped;
   const bool drier = bluntBleed < cutBleed;
   // ...and the RESOLVER dispatched it: the sweep-driven arm did the same kind
   // of damage through the front door.
   const bool resolver = sweptRan && sweptHpDrop > 0.0f && sweptAttached;
+  // ...and it said WHERE, on the limb. The tolerance is the fixture's own
+  // geometry: a 0.4-voxel blade half-width plus the probe's 0.87-voxel cell
+  // reach plus the limb's radius, which for every rig in the game is under 3
+  // voxels from its axis. Loose enough not to care which rig ChooseTarget picks,
+  // tight enough that a stale midpoint (~5+ voxels away along the blade, and
+  // free to be anywhere at all) cannot pass.
+  const bool located =
+      sweptHitReported && !sweptHitMissing && sweptHitOff < 4.0f;
 
   const bool ok = hurt && sized && heldOn && pastZero && marked && deepened &&
-                  concentrated && drier && resolver;
+                  concentrated && openedNothingAtFirst && broke && spectrum &&
+                  drier && resolver && located;
   detail = Format(
       "%s/%s x%d mace(blunt %.0f, dent %.2f): hp %.1f -> %.1f, %u -> %u voxels "
       "(%.1f%%, cap %.0f%%), bruised %u after one blow -> %u after %d (%u past "
       "%u/15, i.e. more than one blow), attached=%d severs=%zu alive=%d | "
+      "ladder: %u pulped (blood >= %u/15) after one blow -> %u after %d | "
       "bleed budget %.2f vs %.2f for the same hp as cuts | through the real "
-      "sweep: hp -%.1f, %u voxels, attached=%d",
+      "sweep: hp -%.1f, %u voxels, attached=%d, contact reported=%d/%d, worst "
+      "%.2f vox off the limb axis",
       t.defName.c_str(), t.limbName.c_str(), kHits, mace.blunt,
       mace.bluntCarve, hp0, hp1, before, after, frac * 100.0f,
       dentMax * 100.0, bruiseOne, bruise, kHits, bruiseDeep, bruiseCap,
-      attached ? 1 : 0, severs, alive ? 1 : 0,
-      bluntBleed, cutBleed, sweptHpDrop, sweptLost, sweptAttached ? 1 : 0);
+      attached ? 1 : 0, severs, alive ? 1 : 0, pulpedOne, pulpAt, pulped, kHits,
+      bluntBleed, cutBleed, sweptHpDrop, sweptLost, sweptAttached ? 1 : 0,
+      sweptHitReported ? 1 : 0, sweptHitMissing ? 0 : 1, sweptHitOff);
   return ok ? Status::Pass : Status::Fail;
 }
 

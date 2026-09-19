@@ -104,6 +104,7 @@
   "audio-impact": "pass",
   "audio-mob-voice": "pass",
   "audio-ambience": "pass",
+  "audio-spatial": "pass",
   "far-fog": "pass",
   "far-downsample": "pass",
   "far-persist": "pass",

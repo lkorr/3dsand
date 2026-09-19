@@ -213,7 +213,9 @@ const char* const kOrder[] = {
     "player-walk", "player-waterjump", "player-ledgegrab", "player-crouch",
     "player-fastfall",
     "player-plants", "debris",
-    "audio-impact", "audio-mob-voice", "audio-ambience",
+    // `audio-spatial` touches no World at all (it is the mixer and a Camera),
+    // so its slot is free; it sits with the other audio gates.
+    "audio-impact", "audio-mob-voice", "audio-ambience", "audio-spatial",
     // "mob" restored to its original slot (it sat between prefab and
     // settle-back until ec764e8 dropped it from both here and MobGates()).
     // The position matters: gates share one World and several depend on what

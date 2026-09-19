@@ -69,6 +69,13 @@ class AudioWorld {
   // headless selftest paths never build one.
   void Update(const ListenerPose& listener, World* world);
 
+  // Publish the pose WITHOUT re-solving anything. Sounds triggered later in the
+  // frame are ranked and pre-positioned against this (PlayOneShot), so the game
+  // calls it before it fires any cue; the full Update at the end of the frame is
+  // what re-solves occlusion, and doing that twice would double the ray cost
+  // (rule 2) for no gain.
+  void SetListener(const ListenerPose& listener) { listener_ = listener; }
+
   // Acoustic table indexed by material id, and the occlusion knobs. Both are
   // re-published from tuning each frame by the cue layer.
   void SetAcoustics(std::vector<MaterialAcoustics> a) { acoustics_ = std::move(a); }
@@ -80,6 +87,18 @@ class AudioWorld {
   // and every playing voice outranks it.
   bool PlayOneShot(const std::vector<float>* buf, const Vec3& posVox,
                    const VoiceConfig& cfg);
+
+  // Same, but returns a handle the caller can keep MOVING while the sample
+  // plays (-1 if it was not started). This is what makes a sword's whoosh pan
+  // across the swing instead of being pinned where the cut committed: a
+  // one-shot is not always a point event, and the ones that are not are the
+  // ones attached to something in motion. The handle carries a generation, so
+  // it goes inert the moment the sample ends or the slot is stolen -- a stale
+  // handle can never drag a later sound around the world.
+  int PlayOneShotTracked(const std::vector<float>* buf, const Vec3& posVox,
+                         const VoiceConfig& cfg);
+  bool OneShotActive(int handle) const;
+  void SetOneShotPos(int handle, const Vec3& posVox);
 
   // Starts a looping voice. Returns a stable handle for StopLoop/SetLoopPos,
   // or -1 if the loop pool is exhausted.
@@ -122,6 +141,9 @@ class AudioWorld {
   // Generation counter per loop voice, so a stale handle from a loop that
   // already ended cannot silence whatever took its slot.
   std::vector<uint32_t> loopGen_;
+  // Same trick for tracked one-shots (PlayOneShotTracked): bumped every time a
+  // slot is acquired, so only the caller that started THIS sound can move it.
+  std::vector<uint32_t> oneShotGen_;
 
   // Audio-thread scratch, preallocated in Init.
   std::vector<float> mixL_, mixR_, scratchIn_, srcL_, srcR_;

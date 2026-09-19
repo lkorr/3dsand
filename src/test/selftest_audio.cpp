@@ -21,6 +21,8 @@
 #include <vector>
 
 #include "audio/cues.h"
+#include "audio/world.h"
+#include "game/camera.h"
 #include "sim/materials.h"
 #include "sim/tuning.h"
 #include "test/selftest.h"
@@ -402,6 +404,235 @@ Status GateAudioAmbience(Ctx& c, std::string& detail) {
   return ok ? Status::Pass : Status::Fail;
 }
 
+// ---- spatial: WHICH EAR THE SOUND COMES OUT OF -------------------------------
+//
+// THE ONE GATE IN THIS FILE THAT DOES LISTEN, and the note at the top of the
+// file is why it had to be written: "these assert on events, never on sound"
+// was true, and it left the entire listener transform — the axis map, the
+// listener yaw, the sign of the pitch — with no coverage whatsoever. It shipped
+// broken for a month (fixed 2026-09-19): a bare `(x, y_up, z) -> (x, z, y_up)`
+// swizzle has determinant -1, so it REFLECTED the sound field rather than
+// rotating it, and a sound dead ahead of the player came out of the right
+// speaker at every yaw; pitch was negated on top, so looking up put a blade
+// swinging at chest height overhead. Both were reported by ear, by the player,
+// and no gate in the suite had an opinion.
+//
+// It needs no device: AudioWorld::Init only prepares the voice pool, and
+// Render() is a pure function of the params and the sample. So this is real DSP
+// output — twelve camera poses, a wideband burst placed two metres away along a
+// direction taken from `Camera`'s OWN basis (never a hand-rolled one — the
+// camera's is left-handed and that is exactly the trap this gate guards), and
+// the assertion is on the energy that comes out of each ear.
+//
+// The claims are SIGNS, not magnitudes. "Right is louder on the right" survives
+// any tuning of the head-shadow filters, the distance curve or the pinna EQ;
+// "right is 3.4 dB louder" would have to be re-pinned every time somebody
+// touched one, and that is how a gate becomes something people delete. The
+// measured values are recorded as observations instead.
+
+// One probe: a fresh world (so no voice reuses another probe's smoother state),
+// one burst, a quarter second of render. Returns per-ear energy.
+struct EarEnergy {
+  double left = 0, right = 0;
+  double hfSum = 0;   // high-frequency content of the sum, for elevation
+};
+
+EarEnergy RenderProbe(const Vec3& earVox, float yaw, float pitch,
+                      const Vec3& srcVox, const std::vector<float>& burst) {
+  audio::AudioWorld aw;
+  audio::ListenerPose lp;
+  lp.posVox = earVox;
+  lp.yaw = yaw;
+  lp.pitch = pitch;
+  aw.Init(48000.0, lp);
+  aw.SetMasterGain(1.0f);
+  aw.Update(lp, nullptr);
+
+  audio::VoiceConfig cfg;
+  cfg.gain = 1.0f;
+  cfg.audibleRadius = 40.0f;
+  cfg.verbWet = 0.0f;   // reverb is diffuse by design and would blur the ILD
+  cfg.doppler = false;
+  if (!aw.PlayOneShot(&burst, srcVox, cfg)) return EarEnergy{};
+
+  EarEnergy e;
+  std::vector<float> out(2 * 512, 0.0f);
+  float prevSum = 0.0f;
+  for (int block = 0; block < 24; block++) {   // 24 x 512 = 0.26 s
+    std::fill(out.begin(), out.end(), 0.0f);
+    aw.Render(out.data(), 512);
+    for (int i = 0; i < 512; i++) {
+      const float l = out[2 * i], r = out[2 * i + 1];
+      e.left += (double)l * l;
+      e.right += (double)r * r;
+      const float sum = l + r;
+      const float d = sum - prevSum;   // one-pole difference = crude HF meter
+      prevSum = sum;
+      e.hfSum += (double)d * d;
+    }
+  }
+  return e;
+}
+
+Status GateAudioSpatial(Ctx& c, std::string& detail) {
+  (void)c;   // no world, no GPU: this gate is the mixer and nothing else
+
+  // A wideband burst. Deterministic LCG rather than <random>, so the gate's
+  // numbers are the same on every machine and in every run.
+  std::vector<float> burst((size_t)(48000 * 0.18));
+  uint32_t s = 0x1234567u;
+  for (size_t i = 0; i < burst.size(); i++) {
+    s = s * 1664525u + 1013904223u;
+    const float n = (float)((int32_t)(s >> 8) % 20001 - 10000) / 10000.0f;
+    // Short fades: a hard edge on a 180 ms burst is a click, and a click is
+    // broadband energy in the wrong place for the HF meter.
+    const float ramp = 0.006f * (float)burst.size();
+    const float aIn = std::min(1.0f, (float)i / ramp);
+    const float aOut = std::min(1.0f, (float)(burst.size() - i) / ramp);
+    burst[i] = n * 0.5f * std::min(aIn, aOut);
+  }
+
+  const Vec3 ear{100.0f, 40.0f, 100.0f};
+  const float distVox = 2.0f / kVoxelMeters;   // two metres out
+
+  struct Pose { float yaw, pitch; };
+  const Pose poses[] = {{0.0f, 0.0f},     {1.5708f, 0.0f}, {3.1416f, 0.0f},
+                        {2.35f, 0.0f},    {0.7f, 1.2f},    {2.35f, 1.2f},
+                        {0.7f, -1.2f},    {2.35f, -1.2f}};
+
+  int fails = 0;
+  std::string firstFail;
+  double worstFrontSkew = 0.0, worstSideRatio = 1e9;
+  for (const Pose& p : poses) {
+    Camera cam;
+    cam.yaw = p.yaw;
+    cam.pitch = p.pitch;
+    // THE CAMERA'S OWN BASIS. `Camera::Right()` is `Forward() x +Y`, which makes
+    // the basis left-handed (right is -X when forward is +Z); building a
+    // textbook right-handed one here would only test this gate's arithmetic
+    // against itself, and the defect being guarded IS a handedness mistake.
+    const Vec3 fwd = cam.Forward(), right = cam.Right();
+
+    const EarEnergy front = RenderProbe(ear, p.yaw, p.pitch, ear + fwd * distVox, burst);
+    const EarEnergy rt = RenderProbe(ear, p.yaw, p.pitch, ear + right * distVox, burst);
+    const EarEnergy lf = RenderProbe(ear, p.yaw, p.pitch, ear - right * distVox, burst);
+
+    // 1. STRAIGHT AHEAD IS CENTRED. This is the assertion that fails loudest on
+    //    a reflected frame: the old code put a source dead ahead hard right at
+    //    every yaw, which is precisely the bug report.
+    const double fTot = front.left + front.right;
+    const double frontSkew =
+        fTot > 0 ? std::abs(front.left - front.right) / fTot : 1.0;
+    // 2. THE RIGHT-HAND SIDE COMES OUT OF THE RIGHT EAR, and vice versa.
+    const double rRatio = rt.left > 0 ? rt.right / rt.left : 0.0;
+    const double lRatio = lf.right > 0 ? lf.left / lf.right : 0.0;
+
+    worstFrontSkew = std::max(worstFrontSkew, frontSkew);
+    worstSideRatio = std::min(worstSideRatio, std::min(rRatio, lRatio));
+
+    const bool ok = frontSkew < 0.25 && rRatio > 1.15 && lRatio > 1.15;
+    if (!ok) {
+      fails++;
+      if (firstFail.empty())
+        firstFail = Format(
+            "yaw %.2f pitch %.2f: front skew %.3f (want <0.25), right/left "
+            "%.2f, left/right %.2f (want >1.15)",
+            p.yaw, p.pitch, frontSkew, rRatio, lRatio);
+    }
+  }
+
+  // 3. ELEVATION IS NOT UPSIDE DOWN — TESTED AS AN INVARIANCE, NOT AS A TIMBRE.
+  //
+  //    The obvious test ("overhead should sound brighter than underfoot") is a
+  //    claim about the ENGINE's pinna model, not about this conversion, and it
+  //    is not even true of this engine as measured: the floor bounce combs a
+  //    delayed copy into anything low, which puts high-frequency energy back.
+  //    A gate that asserts it is asserting somebody else's design.
+  //
+  //    What is genuinely ours is that PITCH ROTATES THE SOURCE THE RIGHT WAY.
+  //    So: turn the head instead of moving the source, and check that two poses
+  //    which put the source in the SAME place relative to the face measure the
+  //    same. Looking up 1.5 rad, a sound directly overhead is nearly dead ahead
+  //    of your face, and a sound level with you is nearly underfoot. Reverse the
+  //    sign of the pitch and those two swap — so the test is that each pitched
+  //    probe is nearer its own reference than the other one. Whatever the pinna
+  //    model does with elevation, it does the same thing to both members of a
+  //    pair, which is why this survives tuning and the brightness test does not.
+  const Vec3 up{0.0f, 1.0f, 0.0f};
+  Camera flat;
+  flat.yaw = 0.7f;
+  flat.pitch = 0.0f;
+  const Vec3 flatFwd = flat.Forward();
+  auto bright = [](const EarEnergy& e) {
+    const double tot = e.left + e.right;
+    return tot > 0 ? e.hfSum / tot : 0.0;
+  };
+  // References, head level: dead ahead, and straight underfoot.
+  const double refAhead =
+      bright(RenderProbe(ear, 0.7f, 0.0f, ear + flatFwd * distVox, burst));
+  const double refUnder =
+      bright(RenderProbe(ear, 0.7f, 0.0f, ear - up * distVox, burst));
+  // The same two places relative to the FACE, reached by pitching up instead.
+  const double upAhead =
+      bright(RenderProbe(ear, 0.7f, 1.5f, ear + up * distVox, burst));
+  const double upUnder =
+      bright(RenderProbe(ear, 0.7f, 1.5f, ear + flatFwd * distVox, burst));
+
+  // COMPARED AS A RANKING, NOT AS A DISTANCE. The two pitched probes sit at
+  // different WORLD positions by construction, and the early-reflection stage
+  // images the room from the world position, so each pitched measurement carries
+  // a common-mode offset from its reference (measured: about -0.35 on this
+  // metric, in the same direction for both). That offset sinks a nearest-match
+  // test and leaves the ORDER untouched — so the claim is the order:
+  //
+  //   head level:      ahead is brighter than underfoot          (the reference)
+  //   head pitched up: overhead is brighter than level-with-you  (must agree)
+  //
+  // Negate the pitch and it does not merely weaken, it INVERTS: overhead becomes
+  // behind-you (rear shadow, dull) and level-with-you becomes the zenith (+5 dB
+  // pinna peak, bright), so the sign flips. That is the whole defect, in one
+  // comparison, with no dependence on what the pinna model does in absolute
+  // terms.
+  const double refGap = refAhead - refUnder;
+  const double upGap = upAhead - upUnder;
+  // Resolution check first: if the metric cannot separate the zenith from the
+  // nadir at all, the ranking below means nothing and the gate must say so
+  // rather than pass (a fixture that cannot fail measures nothing).
+  if (std::abs(refGap) < 0.1) {
+    fails++;
+    if (firstFail.empty())
+      firstFail = Format(
+          "elevation metric has no resolution: ahead %.4f vs underfoot %.4f",
+          refAhead, refUnder);
+  } else if ((upGap > 0.0) != (refGap > 0.0) || std::abs(upGap) < 0.05) {
+    fails++;
+    if (firstFail.empty())
+      firstFail = Format(
+          "pitch rotates the wrong way: level head ranks ahead %.4f over "
+          "underfoot %.4f (gap %+.4f), but pitched up 1.5 rad it ranks overhead "
+          "%.4f over level-with-you %.4f (gap %+.4f)",
+          refAhead, refUnder, refGap, upAhead, upUnder, upGap);
+  }
+
+  RecordObserved("audioSpatial.worstFrontSkew", worstFrontSkew);
+  RecordObserved("audioSpatial.worstSideRatio", worstSideRatio);
+  RecordObserved("audioSpatial.brightAhead", refAhead);
+  RecordObserved("audioSpatial.brightUnder", refUnder);
+  RecordObserved("audioSpatial.brightPitchedAhead", upAhead);
+  RecordObserved("audioSpatial.brightPitchedUnder", upUnder);
+
+  const bool ok = fails == 0;
+  detail = ok ? Format(
+                    "8 poses: worst front skew %.3f, worst side ratio %.2fx; "
+                    "pitch invariance ahead %.4f~%.4f, under %.4f~%.4f",
+                    worstFrontSkew, worstSideRatio, upAhead, refAhead, upUnder,
+                    refUnder)
+              : Format("%d of 9 checks failed; first: %s", fails,
+                       firstFail.c_str());
+  std::printf("audio spatial: %s (%s)\n", ok ? "PASS" : "FAIL", detail.c_str());
+  return ok ? Status::Pass : Status::Fail;
+}
+
 }  // namespace
 
 const std::vector<Gate>& AudioGates() {
@@ -409,6 +640,7 @@ const std::vector<Gate>& AudioGates() {
       {"audio-impact", "audio", {}, false, GateAudioImpact},
       {"audio-mob-voice", "audio", {}, false, GateAudioMobVoice},
       {"audio-ambience", "audio", {}, false, GateAudioAmbience},
+      {"audio-spatial", "audio", {}, false, GateAudioSpatial},
   };
   return g;
 }

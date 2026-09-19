@@ -32,15 +32,36 @@ The engine is **Z-up, Y-forward, right-handed** (Blender-style):
 
     x = right      y = FORWARD      z = UP
 
-sandvox is **Y-up** (`Vec3{x, y_up, z}`). `AudioWorld::MakeParams`
-(`src/audio/world.cpp`) does the swizzle — sandvox `(x, y, z)` becomes engine
-`(x, z, y)`. Everything the engine is fed is in **meters**, not voxels;
-sandvox positions are voxels, so they are multiplied by `kVoxelMeters` at the
-same boundary. Both conversions happen in exactly one function on purpose.
+sandvox is **Y-up**, and its camera basis is **LEFT-handed**: `Camera::Right()`
+is `Forward() × +Y`, so right is −X when forward is +Z (and that is genuinely
+screen-right — the renderer marches `camRight * ndc.x`).
+
+`AudioWorld::MakeParams` (`src/audio/world.cpp`) therefore maps sandvox
+`(x, y_up, z)` to engine `(−x, z, y_up)` with `listenerYaw = π/2 − cam.yaw` and
+`listenerPitch = cam.pitch` unchanged. Everything the engine is fed is in
+**meters**, not voxels; sandvox positions are voxels, so they are multiplied by
+`kVoxelMeters` at the same boundary. All of it happens in exactly one function on
+purpose.
+
+**Do not drop the minus.** Until 2026-09-19 this was a bare `(x, z, y)` swizzle —
+determinant −1, so it REFLECTED the sound field instead of rotating it, and no
+listener yaw can undo a reflection. Front came out of the right ear at every
+yaw; the player's right came out of the centre. The pitch was negated to
+"compensate", which fixed nothing and inverted elevation as well. Derivation:
+
+    camera forward (flat)   = ( cos a, 0, sin a )        sandvox
+    engine forward at yaw Y = ( -sin Y, cos Y, 0 )       engine (inverse yaw about Z)
+    engine(camera forward)  = ( -cos a, sin a, 0 )
+    => sin Y = cos a, cos Y = sin a  =>  Y = pi/2 - a
 
 Azimuth is `atan2(x, y)` and elevation `atan2(z, horizontal)` (`Coordinates.cpp`),
 and the listener transform applies inverse yaw about Z then inverse pitch about
-X (`Engine.cpp`), so positive yaw is counter-clockwise seen from above.
+X (`Engine.cpp`) — so positive yaw is counter-clockwise seen from above and
+positive pitch is nose-UP, which is what sandvox's `pitch` already means.
+
+The `audio-spatial` selftest gate renders real audio through a real engine and
+asserts which ear it comes out of at twelve camera poses. Run it after ANY edit
+to this conversion: `--selftest --gate audio-spatial`, no GPU, no device.
 
 ## Local modifications
 

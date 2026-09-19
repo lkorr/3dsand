@@ -693,6 +693,17 @@ struct EdgeSweepResult {
   // sweep never ran, no ray was cast, every ray found empty air, or every ray
   // was eaten by the wielder's own body. These four words separate them, and
   // they are what `--shot-strike` prints. Cost: four increments per probe.
+  // ---- WHERE THE BLOW LANDED (2026-09-19) ------------------------------
+  // The FIRST contact point of the first body this sweep found, in world
+  // voxels: the probe ray's own hit position, the exact place the kerf is bored
+  // and the flinch impulse applied. Reported because the impact SOUND has to be
+  // made there and callers had nothing better to use — main.cpp was placing the
+  // flesh/clang/strike/cut cues at the midpoint of the blade segment, which on a
+  // long weapon is half a metre from the wound and reads, correctly, as the
+  // sound coming from the wrong place. `hasHitAt` is false when no body was
+  // touched (a hit into terrain or thin air), and then `hitAt` is untouched.
+  Vec3 hitAt{};
+  bool hasHitAt = false;
   int probesCast = 0;      // rays actually fired
   int probesAir = 0;       // ...that found nothing at all
   int probesSelf = 0;      // ...that were still inside the wielder at the end

@@ -26,6 +26,9 @@ constexpr float kStartupRampSec = 0.5f;
 // step.
 constexpr float kMasterSlewSec = 0.05f;
 
+// Quarter turn, for the listener-yaw conversion in MakeParams.
+constexpr float kHalfPi = 1.57079632679489661923f;
+
 }  // namespace
 
 void AudioWorld::Init(double sampleRate, const ListenerPose& initialListener) {
@@ -41,6 +44,7 @@ void AudioWorld::Init(double sampleRate, const ListenerPose& initialListener) {
   loops_.clear();
   oneShots_.clear();
   loopGen_.assign(kLoopVoices, 0);
+  oneShotGen_.assign(kOneShotVoices, 0);
 
   Voice probe;
   probe.worldPos = initialListener.posVox * kVoxelMeters;
@@ -70,24 +74,49 @@ xyzpan::EngineParams AudioWorld::MakeParams(const Voice& v, const Vec3& srcVox,
 
   // ---- THE ONE COORDINATE CONVERSION ------------------------------------
   // sandvox: voxels, Y up.   xyzpan: meters, Z up / Y forward.
-  // So (x, y_up, z) -> (x, z, y_up) and everything scales by kVoxelMeters.
+  //
   // Meters are required, not merely convenient: the engine's binaural cues use
   // virtual ears offset by 0.087 UNITS, which is only a head radius if a unit
   // is a meter. Feeding voxels would put the ears 87 cm apart.
+  //
+  // THE AXIS MAP IS (x, y_up, z) -> (-x, z, y_up), AND THE MINUS IS THE WHOLE
+  // BALL GAME (fixed 2026-09-19; it used to be a bare swizzle with a negated
+  // pitch to "compensate", and the result was that a sound dead ahead of the
+  // player came out of the RIGHT speaker at every yaw).
+  //
+  // Why: the engine is right-handed with x=right, y=forward, z=up
+  // (xyzpan/Coordinates.h), and sandvox's camera basis is LEFT-handed —
+  // `Camera::Right()` is `Forward() x +Y`, so right is -X when forward is +Z
+  // (game/camera.cpp; the renderer marches `camRight * ndc.x`, so that IS
+  // screen-right). A bare (x, z, y) swizzle has determinant -1, so it does not
+  // just rotate the sound field, it REFLECTS it, and no choice of listener yaw
+  // can undo a reflection. Negating x restores the handedness; then the listener
+  // yaw is fixed by matching the two forward vectors:
+  //
+  //   camera forward (flat)      = ( cos a, 0, sin a )          sandvox
+  //   engine forward at yaw Y    = ( -sin Y, cos Y, 0 )         engine
+  //   engine(camera forward)     = ( -cos a, sin a, 0 )
+  //   => sin Y = cos a, cos Y = sin a  =>  Y = pi/2 - a
+  //
+  // and the pitch passes through UNNEGATED: the engine applies inverse pitch
+  // about x after inverse yaw, so positive listenerPitch is nose-up, which is
+  // what sandvox's `pitch` already means (`Camera::Forward().y = sin(pitch)`).
+  // Negating it inverted elevation — looking straight up put a blade swinging at
+  // chest height overhead, which is exactly how it sounded.
+  //
+  // Verified end-to-end by the `audio-spatial` gate, which renders real audio
+  // through a real engine and asserts the ear the sound comes out of.
   const Vec3 sM = srcVox * kVoxelMeters;
   const Vec3 lM = listener.posVox * kVoxelMeters;
-  p.x = sM.x;
+  p.x = -sM.x;
   p.y = sM.z;
   p.z = sM.y;
-  p.listenerX = lM.x;
+  p.listenerX = -lM.x;
   p.listenerY = lM.z;
   p.listenerZ = lM.y;
 
-  // Yaw: sandvox measures the camera's heading with the same handedness the
-  // engine expects once Y and Z are swapped, so it passes through. Pitch is
-  // negated because swapping the two axes above mirrors the elevation sense.
-  p.listenerYaw = listener.yaw;
-  p.listenerPitch = -listener.pitch;
+  p.listenerYaw = kHalfPi - listener.yaw;
+  p.listenerPitch = listener.pitch;
   p.listenerRoll = 0.0f;
 
   p.sphereRadius = std::max(0.5f, v.audibleRadius);
@@ -154,18 +183,25 @@ void AudioWorld::Update(const ListenerPose& listener, World* world) {
 
 bool AudioWorld::PlayOneShot(const std::vector<float>* buf, const Vec3& posVox,
                              const VoiceConfig& cfg) {
-  if (buf == nullptr || buf->empty()) return false;
+  return PlayOneShotTracked(buf, posVox, cfg) >= 0;
+}
+
+int AudioWorld::PlayOneShotTracked(const std::vector<float>* buf,
+                                   const Vec3& posVox, const VoiceConfig& cfg) {
+  if (buf == nullptr || buf->empty()) return -1;
 
   const float distM = (posVox - listener_.posVox).len() * kVoxelMeters;
   const float rank = Audibility(cfg.gain, distM, cfg.audibleRadius);
   // Below this the sound is inaudible in the mix; spending a voice on it would
   // only starve one that matters.
-  if (rank < 1e-4f) return false;
+  if (rank < 1e-4f) return -1;
 
   Voice* pick = nullptr;
-  for (auto& v : oneShots_) {
-    if (!v->Active()) {
-      pick = v.get();
+  size_t pickSlot = 0;
+  for (size_t i = 0; i < oneShots_.size(); i++) {
+    if (!oneShots_[i]->Active()) {
+      pick = oneShots_[i].get();
+      pickSlot = i;
       break;
     }
   }
@@ -176,17 +212,21 @@ bool AudioWorld::PlayOneShot(const std::vector<float>* buf, const Vec3& posVox,
     // newcomer is clearly louder. The margin stops a stream of similar-ranked
     // sounds from cutting each other off every frame.
     Voice* worst = nullptr;
+    size_t worstSlot = 0;
     float worstRank = rank * 0.7f;
-    for (auto& v : oneShots_) {
-      const float d = (v->worldPos - listener_.posVox * kVoxelMeters).len();
-      const float r = Audibility(v->triggerGain, d, v->audibleRadius);
+    for (size_t i = 0; i < oneShots_.size(); i++) {
+      Voice& v = *oneShots_[i];
+      const float d = (v.worldPos - listener_.posVox * kVoxelMeters).len();
+      const float r = Audibility(v.triggerGain, d, v.audibleRadius);
       if (r < worstRank) {
         worstRank = r;
-        worst = v.get();
+        worst = &v;
+        worstSlot = i;
       }
     }
-    if (worst == nullptr) return false;  // everything playing outranks this
+    if (worst == nullptr) return -1;  // everything playing outranks this
     pick = worst;
+    pickSlot = worstSlot;
     steal = true;
   }
 
@@ -207,7 +247,10 @@ bool AudioWorld::PlayOneShot(const std::vector<float>* buf, const Vec3& posVox,
     pick->Retrigger(buf, cfg.gain, cfg.rate);
   else
     pick->Trigger(buf, cfg.gain, cfg.rate);
-  return true;
+  // Bumped whether or not the caller wanted a handle: the point of the counter
+  // is that every previously issued handle for this slot dies here.
+  oneShotGen_[pickSlot] = (oneShotGen_[pickSlot] + 1) & 0x7FFFFFu;  // stays positive as an int
+  return (int)((oneShotGen_[pickSlot] << 8) | (uint32_t)pickSlot);
 }
 
 int AudioWorld::PlayLoop(const std::vector<float>* buf, const Vec3& posVox,
@@ -238,6 +281,19 @@ namespace {
 inline int LoopSlot(int handle) { return handle & 0xFF; }
 inline uint32_t LoopGenOf(int handle) { return (uint32_t)handle >> 8; }
 }  // namespace
+
+bool AudioWorld::OneShotActive(int handle) const {
+  if (handle < 0) return false;
+  const int i = LoopSlot(handle);   // same encoding, separate table
+  if (i < 0 || i >= (int)oneShots_.size()) return false;
+  if (oneShotGen_[(size_t)i] != LoopGenOf(handle)) return false;
+  return oneShots_[(size_t)i]->Active();
+}
+
+void AudioWorld::SetOneShotPos(int handle, const Vec3& posVox) {
+  if (!OneShotActive(handle)) return;
+  oneShots_[(size_t)LoopSlot(handle)]->worldPos = posVox * kVoxelMeters;
+}
 
 bool AudioWorld::LoopActive(int handle) const {
   if (handle < 0) return false;

@@ -4046,15 +4046,59 @@ limb at zero, all unchanged), tops the drip budget up at only
 `gore.bluntBleedScale` of a cut's rate — a punch does not open you — lays a
 BRUISE in `gore.bruiseMat` over `gore.bruiseRadius · (0.5 + 0.5·power)` (a
 COAT, not a rewrite — see "A bruise is an alpha that deepens" below), and
-removes a voxel only if the weapon authored `bluntCarve`: a shallow radial DENT
-of `gore.bluntCarveRadius · bluntCarve · power`, through the same
-`CarveLimbRadial` an explosion calls, soaked in the victim's own `woundMat` on
-the way out. The whole blow runs inside `Mob::BluntCarveScope`, and that scope
+removes a voxel only if the weapon authored `bluntCarve` AND the spot it landed
+on has already been beaten open (see "A blunt blow climbs a ladder" below): a
+shallow radial DENT of `gore.bluntCarveRadius · bluntCarve · power · earned`,
+through the same `CarveLimbRadial` an explosion calls, soaked in the victim's
+own `woundMat` on the way out. The whole blow runs inside `Mob::BluntCarveScope`, and that scope
 is the entire implementation of the owner's one-line spec: the COLLAPSE sever is
 skipped, so a face may be caved in well past the point at which a blast would
 have shed the head, however many blows land. hp reaching zero on a vital limb
 still kills, because `HpZeroSevers` is about DEATH rather than about amputation.
-A bare fist authors `bluntCarve` 0 and removes literally nothing.
+
+**A blunt blow climbs a ladder, and every rung is earned on the spot it hit**
+(2026-09-19; `Mob::BruiseLimb`, `Mob::BruiseReport`, `gore.pulp*`). Until this,
+the dent above fired from the FIRST blow at a radius that depended only on the
+weapon — so `gore.bluntCarveRadius` was a choice between a mace that shaves
+voxels off a pristine arm and (what shipped, 0) a mace that only ever bruises,
+however long you swing it. The owner's report was "beating someone with a mace
+just keeps adding more and more bruises". Neither setting is the thing, because
+what a beating does is not a per-blow constant — it is a HISTORY:
+
+1. **Clean skin bruises.** The coat deepens by `gore.bruiseStep`, scaled by how
+   hard the blow was (`gore.bruiseHpRef`: a 4 hp fist against a 16 hp reference
+   lands a square-rooted half-step, which is the whole of "the same thing with
+   fists, only slower"), toward a ceiling that TAPERS with distance from the
+   contact — a cell at the rim cannot be driven past a light mark by that blow
+   however many land, so only the middle can ever reach the depth that breaks.
+2. **A saturated patch breaks.** At `gore.bruiseBleedFrom` of that ceiling a
+   further blow rolls `gore.bruiseBleedChance` per voxel and lays the
+   creature's own BLOOD there instead, at the bruise's own depth.
+3. **Broken, bloodied tissue comes away.** `Mob::BruiseLimb` reports what share
+   of the contact CORE (the inner half-radius — the rim never saturates, so a
+   share measured over the whole sphere would stay permanently small) already
+   wears blood at `gore.pulpAmt` or deeper; the dent radius is scaled by how far
+   that share has climbed past `gore.pulpCarveFrom`. It compounds, on purpose:
+   the crater is soaked in blood and `woundMat`, so what it exposes reads as
+   pulp to the NEXT blow.
+
+The reading is the BRUISE's, so a blow that laid no bruise earns no dent — the
+right coupling rather than an accident, since the mark IS the record of the
+damage. Measured (`impact-blunt`): 24 mace blows on ONE point take 3.1% of a
+thigh and leave 177 bruised cells around 275 bloodied ones; a bare fist takes
+nothing and the same blows spread over a limb stay almost all bruise. A bare
+fist authors a small `bluntCarve` (0.3 on `human.json`) and still removes
+nothing until it has punched one spot bloody.
+
+**...and the bruise→blood rung had never once fired.** It was written in
+2026-09-16 as `RaiseBodyStain(cur, bloodMat, max(curAmt, add))`, and Raise's
+cross-material rule is "only a STRICTLY larger amount repaints" — but the
+branch is gated on the bruise being AT its ceiling, so the amount offered IS
+`curAmt` and `curAmt > curAmt` is false for every voxel, every blow, forever.
+`gore.bruiseBleedChance` shipped at 0, which is what you tune a rung to after
+watching it do nothing. It packs the coat outright now: this is not a splash
+arriving and being adjudicated against what is already there, it is the same
+injury changing state, and the decision was made by the roll one line above.
 
 **...and blunt is how armour is answered.** On a SHELL the same call does three
 things and not one of them is a resist number. The piece takes
@@ -4128,9 +4172,21 @@ mottle moved into a per-voxel jitter that varies the SHADE instead of punching
 holes in it; and repeat blows ADD `gore.bruiseStep` (6 of 15 = 40% a hit) to a
 `gore.bruiseMax` ceiling (12 = 80%, short of opaque so the anatomy stays
 readable underneath). So a contact goes 40% on the first punch, 80% on the
-second, and AT the ceiling a further blow rolls `gore.bruiseBleedChance` per
-voxel to lay the creature's own blood there instead — bruising deepens until it
-turns to blood.
+second, and at `gore.bruiseBleedFrom` of the ceiling a further blow rolls
+`gore.bruiseBleedChance` per voxel to lay the creature's own blood there
+instead — bruising deepens until it turns to blood.
+
+That ceiling is PER VOXEL AND TAPERED (2026-09-19), not the global one. The
+taper used to live only in the STEP, which decides how FAST a cell darkens and
+not how far, so over enough blows on one point every cell in the radius crawled
+to the same ceiling and — once the bleed rung above actually worked — the
+ENTIRE mark went wet: measured, 431 bruised voxels down to 4 with 538 bloodied,
+a patch of blood with a hard edge and no bruise around it. Scaling the ceiling
+by the same `1 − t²` gives back the shape the taper was always claimed to
+produce: blood at the contact, deep purple around it, fading out. It is per
+BLOW rather than per voxel forever, so a second blow landing closer
+legitimately raises that cell's ceiling — which is how a beating walks across a
+limb.
 
 **A coat below about a quarter of full draws NOTHING**, which is why the first
 shipped step of 15% a blow was reported as "I don't see any bruising at all".
@@ -12400,8 +12456,20 @@ recorded in `src/audio/xyzpan/VENDORED_FROM.md` — read it before touching
 
 Two conversions happen in exactly one function (`AudioWorld::MakeParams`):
 
-- **Axes.** The engine is Z-up / Y-forward; sandvox is Y-up. `(x, y, z)` →
-  `(x, z, y)`.
+- **Axes.** The engine is Z-up / Y-forward and **right-handed**; sandvox is Y-up
+  and its camera basis is **left-handed** (`Camera::Right()` is `Forward() × +Y`,
+  so right is −X when forward is +Z). So the map is `(x, y, z) → (−x, z, y)` and
+  the listener yaw is `π/2 − cam.yaw`; pitch passes through unchanged.
+  **The minus sign is the whole thing.** It was a bare `(x, z, y)` swizzle with a
+  negated pitch "to compensate" until 2026-09-19, and a swizzle with determinant
+  −1 does not rotate the sound field, it REFLECTS it: a sound dead ahead of the
+  player came out of the RIGHT speaker at every yaw, the player's actual right
+  came out of the centre, and the negated pitch inverted elevation on top of it
+  (look straight up and a blade swinging at chest height sounded overhead). Both
+  were reported by ear. Nothing in the suite had an opinion, because every audio
+  gate asserted on EVENTS; `audio-spatial` is the gate that listens, and it
+  asserts signs (which ear, is up brighter than down) over twelve camera poses
+  rather than magnitudes, so tuning the head-shadow filters cannot break it.
 - **Units.** The engine needs METERS, not voxels — its binaural cues use virtual
   ears offset by 0.087 *units*, which is a head radius only if a unit is a
   meter. Feeding voxels would put the listener's ears 87 cm apart.

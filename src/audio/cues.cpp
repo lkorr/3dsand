@@ -135,6 +135,7 @@ const std::map<std::string, std::string> Cues::kSlotPrefix = {
     // filing it under a creature would be a claim the fallback chain cannot
     // honour.
     {"whoosh", "melee"},       {"flesh", "melee"},     {"clang", "melee"},
+    {"strike_edge", "melee"},  {"strike_blunt", "melee"}, {"cut", "melee"},
     // World beds (see the `world` owner in sound_schema.js). One owner, so the
     // set name is fixed in code; the slot exists here so the tuner and the
     // wiki can describe it.
@@ -322,6 +323,15 @@ void Cues::ApplyTuning() {
   world_.SetOcclusionTuning(ot);
 }
 
+void Cues::PublishListener(const Vec3& listenerPosVox, float yaw, float pitch) {
+  if (!enabled_) return;
+  ListenerPose lp;
+  lp.posVox = listenerPosVox;
+  lp.yaw = yaw;
+  lp.pitch = pitch;
+  world_.SetListener(lp);
+}
+
 void Cues::Update(float dt, const Vec3& listenerPosVox, float yaw, float pitch,
                   World* world) {
   if (!enabled_) return;
@@ -492,9 +502,12 @@ void Cues::Break(uint32_t matId, const Vec3& posVox, int sizeVoxels) {
 namespace {
 const char* CombatSlotName(Cues::CombatCue c) {
   switch (c) {
-    case Cues::CombatCue::Whoosh: return "whoosh";
-    case Cues::CombatCue::Flesh:  return "flesh";
-    case Cues::CombatCue::Clang:  return "clang";
+    case Cues::CombatCue::Whoosh:      return "whoosh";
+    case Cues::CombatCue::Flesh:       return "flesh";
+    case Cues::CombatCue::Clang:       return "clang";
+    case Cues::CombatCue::StrikeEdge:  return "strike_edge";
+    case Cues::CombatCue::StrikeBlunt: return "strike_blunt";
+    case Cues::CombatCue::Cut:         return "cut";
   }
   return "whoosh";
 }
@@ -512,15 +525,24 @@ int Cues::CombatSetId(CombatCue cue) const {
   return lib_.Find(it->second + "/" + std::string(slot));
 }
 
-void Cues::Combat(CombatCue cue, const Vec3& posVox, float power) {
+void Cues::MoveCombat(int handle, const Vec3& posVox) {
+  if (!enabled_ || handle < 0) return;
+  world_.SetOneShotPos(handle, posVox);
+}
+
+bool Cues::CombatActive(int handle) const {
+  return enabled_ && handle >= 0 && world_.OneShotActive(handle);
+}
+
+int Cues::Combat(CombatCue cue, const Vec3& posVox, float power) {
   // COUNTED BEFORE THE DEVICE CHECK. See Stats::combat — this is the only
   // signal a headless gate has that the game asked for the right sound at the
   // right moment, and putting it after `enabled_` would freeze it at 0 in
   // exactly the runs that need it.
   stats_.combat++;
-  if (!enabled_) return;
+  if (!enabled_) return -1;
   const int setId = CombatSetId(cue);
-  if (setId < 0) return;   // nothing recorded for this slot: silent, not loud
+  if (setId < 0) return -1;  // nothing recorded for this slot: silent, not loud
   const Tuning::CombatFx& t = CurrentTuning().combatfx;
   const float k = std::clamp(power, 0.0f, 1.0f);
 
@@ -545,6 +567,18 @@ void Cues::Combat(CombatCue cue, const Vec3& posVox, float power) {
       gain = t.clangVolume * (0.40f + 0.85f * k);
       rate = 0.92f + 0.32f * k;
       break;
+    case CombatCue::StrikeEdge:
+      gain = t.strikeEdgeVolume * (0.35f + 0.85f * k);
+      rate = 1.05f - 0.20f * k;
+      break;
+    case CombatCue::StrikeBlunt:
+      gain = t.strikeBluntVolume * (0.40f + 0.80f * k);
+      rate = 0.95f - 0.25f * k;
+      break;
+    case CombatCue::Cut:
+      gain = t.cutVolume * (0.30f + 0.90f * k);
+      rate = 1.0f - 0.15f * k;
+      break;
   }
 
   if ((int)lastVariant_.size() <= setId)
@@ -560,7 +594,9 @@ void Cues::Combat(CombatCue cue, const Vec3& posVox, float power) {
   // swing reads as a pitch bug.
   cfg.doppler = false;
   cfg.rate = std::clamp(rate, 0.25f, 4.0f);
-  if (!world_.PlayOneShot(buf, posVox, cfg)) stats_.dropped++;
+  const int handle = world_.PlayOneShotTracked(buf, posVox, cfg);
+  if (handle < 0) stats_.dropped++;
+  return handle;
 }
 
 int Cues::MobSetId(const MobDef& def, MobEvent ev) const {
