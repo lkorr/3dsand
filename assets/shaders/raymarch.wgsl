@@ -139,6 +139,15 @@
 // near box does not reach. Same layout, same u16 pair-per-word packing, same
 // render-only standing; eight times the cell and eight times the span.
 @group(0) @binding(23) var<storage, read> gasFarOuter : array<u32>;
+// The FLAME box (world.h kGasFlameWords), BOTH LODs in one binding: the fine
+// grid (gasOuter's geometry exactly) from word 0, the wide grid (gasFarOuter's
+// geometry exactly) from GAS_FLAME_WIDE_BASE. Its counts are EMISSION, not
+// absorption -- they are the flame of the fires the window has left behind,
+// which the far cascade cannot hold because `fire` is CLASS_GAS. Sampled in
+// the SAME loops that sample the two density boxes (gasOuterFill) rather than
+// by a march of its own: a second volumetric walk in this fragment shader is
+// exactly what gotcha-raymarch-register-cliff says not to add.
+@group(0) @binding(24) var<storage, read> gasFlame : array<u32>;
 // Must match kWaterFluxWords / WV_* in src/sim/world.h and
 // assets/shaders/sim_waterbody.wgsl. Declared here rather than in common.wgsl
 // for the GAS_OUTER_N reason above and CLAUDE.md's: a constant two shaders must
@@ -285,6 +294,32 @@ const GAS_DETAIL_OCT_WIDE : u32 = 3u;
 // protects more of the upper column too, which is the thickness the report
 // asked for. Raise it to carve deeper.
 const GAS_CORE_COUNT : f32 = 51.2;
+// ...AND THE WIDE BOX NEEDS ITS OWN, because the two boxes hold the same plume
+// at DIFFERENT COUNT SCALES ON PURPOSE (2026-09-19).
+//
+// sim_gas.wgsl's wide deposit multiplies by FAR_PLUME_WIDE_FILL /
+// FAR_PLUME_WIDE_CHORD, i.e. 1.5/8, so that a RAY collects the same integral
+// from either box: a ray crosses a 6.4 m cell in 8x the path length of a
+// 0.8 m one, so equal integral means the wide box's PER-CELL COUNT is ~5.3x
+// lower. That is correct and is what the handover measurement (14 vs 12.5
+// voxel-lengths) confirmed.
+//
+// GAS_CORE_COUNT is a per-cell COUNT threshold, and it was applied to both.
+// So the same fire sat at 60..160 in fine cells and 11..30 in wide ones, and
+// GAS_ERODE 0.6 erases everything below 0.6 * 51.2 = 30.7: the fine box drew
+// it and the wide box carved it to nothing. A big fire escaped because its
+// adds saturate at FAR_PLUME_ADD_MAX (240) in BOTH boxes, which is why the
+// report was "the big fire smokes at distance and the small trees do not,
+// while midrange is fine for all of them" -- the symptom of one threshold
+// straddling two scales, not of a cap.
+//
+// Derived from the same two numbers the deposit divides by, so the two cannot
+// drift apart; check_invariants.py pins the mirrored FILL against sim_gas.wgsl
+// (CHORD is derivable here from the two shifts).
+const GAS_CORE_WIDE_FILL : f32 = 1.5;   // MIRRORS sim_gas.wgsl FAR_PLUME_WIDE_FILL
+const GAS_CORE_COUNT_WIDE : f32 =
+    GAS_CORE_COUNT * GAS_CORE_WIDE_FILL /
+    f32(1u << (GAS_FAROUT_SHIFT - GAS_OUTER_SHIFT));
 // The deepest bite, in SHAPE units (see gasErode). 0.6 means the noise can eat
 // everything below 60% of core density and nothing at or above core.
 const GAS_ERODE : f32 = 0.6;
@@ -3741,6 +3776,77 @@ fn gasFarOuterCountAt(p : vec3f) -> f32 {
   return mix(mix(x00, x10, u.y), mix(x01, x11, u.y), u.z);
 }
 
+// ---- THE FLAME BOX'S TWO SAMPLERS (world.h kGasFlameWords) ----------------
+//
+// The four functions above, against one binding and two base words. They are
+// duplicated rather than parameterised for gasFarOuterCell's stated reason --
+// WGSL has no portable way to hand a function a pointer to one of two storage
+// bindings -- but the ORIGIN and CELL math is not duplicated at all: the fine
+// grid IS gasOuter's geometry and the wide grid IS gasFarOuter's, so both reuse
+// those boxes' origin functions outright. That reuse is the whole point of
+// giving the flame the same two lattices: a flame that quantised on a third
+// lattice would drift against the smoke column standing on the same fire.
+//
+// FILTERED IDENTICALLY (half-cell bias, smoothstepped trilinear weights, zero
+// outside) for the same two reasons the density boxes are: nearest sampling of
+// a 6.4 m cell draws rectangles, and plain trilinear creases along the lattice
+// diagonals.
+const GAS_FLAME_WIDE_BASE : u32 =
+    (GAS_OUTER_N * GAS_OUTER_N * GAS_OUTER_N) / 2u;   // world.h kGasFlameWideBase
+
+fn gasFlameFineCell16(d : vec3<i32>) -> f32 {
+  if (any(d < vec3<i32>(0)) || any(d >= vec3<i32>(i32(GAS_OUTER_N)))) {
+    return 0.0;
+  }
+  let li = (u32(d.z) * GAS_OUTER_N + u32(d.y)) * GAS_OUTER_N + u32(d.x);
+  return f32((gasFlame[li >> 1u] >> (16u * (li & 1u))) & 0xFFFFu);
+}
+
+fn gasFlameFineAt(p : vec3f) -> f32 {
+  let g = (p - vec3f(gasOuterOriginVox())) *
+          (1.0 / f32(1u << GAS_OUTER_SHIFT)) - vec3f(0.5);
+  let b = floor(g);
+  let f = g - b;
+  let u = f * f * (3.0 - 2.0 * f);
+  let d = vec3<i32>(b);
+  let x00 = mix(gasFlameFineCell16(d),
+                gasFlameFineCell16(d + vec3<i32>(1, 0, 0)), u.x);
+  let x10 = mix(gasFlameFineCell16(d + vec3<i32>(0, 1, 0)),
+                gasFlameFineCell16(d + vec3<i32>(1, 1, 0)), u.x);
+  let x01 = mix(gasFlameFineCell16(d + vec3<i32>(0, 0, 1)),
+                gasFlameFineCell16(d + vec3<i32>(1, 0, 1)), u.x);
+  let x11 = mix(gasFlameFineCell16(d + vec3<i32>(0, 1, 1)),
+                gasFlameFineCell16(d + vec3<i32>(1, 1, 1)), u.x);
+  return mix(mix(x00, x10, u.y), mix(x01, x11, u.y), u.z);
+}
+
+fn gasFlameWideCell16(d : vec3<i32>) -> f32 {
+  if (any(d < vec3<i32>(0)) || any(d >= vec3<i32>(i32(GAS_FAROUT_N)))) {
+    return 0.0;
+  }
+  let li = (u32(d.z) * GAS_FAROUT_N + u32(d.y)) * GAS_FAROUT_N + u32(d.x);
+  let w = GAS_FLAME_WIDE_BASE + (li >> 1u);
+  return f32((gasFlame[w] >> (16u * (li & 1u))) & 0xFFFFu);
+}
+
+fn gasFlameWideAt(p : vec3f) -> f32 {
+  let g = (p - vec3f(gasFarOuterOriginVox())) /
+          vec3f(vec3<u32>(1u) << GAS_FAROUT_SHIFTS) - vec3f(0.5);
+  let b = floor(g);
+  let f = g - b;
+  let u = f * f * (3.0 - 2.0 * f);
+  let d = vec3<i32>(b);
+  let x00 = mix(gasFlameWideCell16(d),
+                gasFlameWideCell16(d + vec3<i32>(1, 0, 0)), u.x);
+  let x10 = mix(gasFlameWideCell16(d + vec3<i32>(0, 1, 0)),
+                gasFlameWideCell16(d + vec3<i32>(1, 1, 0)), u.x);
+  let x01 = mix(gasFlameWideCell16(d + vec3<i32>(0, 0, 1)),
+                gasFlameWideCell16(d + vec3<i32>(1, 0, 1)), u.x);
+  let x11 = mix(gasFlameWideCell16(d + vec3<i32>(0, 1, 1)),
+                gasFlameWideCell16(d + vec3<i32>(1, 1, 1)), u.x);
+  return mix(mix(x00, x10, u.y), mix(x01, x11, u.y), u.z);
+}
+
 // ---- THE PROCEDURAL HALF: billows the grid cannot hold --------------------
 // Erode a sampled count with fbm. `w` is 0..1 and is how much of the bite to
 // take — the fine far segment ramps it in from the window face so the detail
@@ -3757,7 +3863,8 @@ fn gasFarOuterCountAt(p : vec3f) -> f32 {
 // Gated on `count > 0` by the caller's own early-out below, which matters: the
 // overwhelming majority of samples along any ray are empty, and this is sixteen
 // hashes.
-fn gasErode(count : f32, p : vec3f, featureM : f32, oct : u32, w : f32) -> f32 {
+fn gasErode(count : f32, p : vec3f, featureM : f32, oct : u32, w : f32,
+            core : f32) -> f32 {
   let rise = R.time * (GAS_RISE_MPS / VOXEL_METERS);
   let q = (p - vec3f(0.0, rise, 0.0)) * (VOXEL_METERS / featureM);
   // fbm sums 0.5, 0.25, ... so `oct` octaves span 0..(1 - 2^-oct). Normalising
@@ -3765,8 +3872,11 @@ fn gasErode(count : f32, p : vec3f, featureM : f32, oct : u32, w : f32) -> f32 {
   // asked for — otherwise the wide box's third octave would silently erode
   // harder than the fine box's two.
   let n = clamp(fbm(q, oct) / (1.0 - exp2(-f32(oct))), 0.0, 1.0);
-  // THE SHAPE: the sample as a fraction of what counts as core density.
-  let s = min(count * (1.0 / GAS_CORE_COUNT), 1.0);
+  // THE SHAPE: the sample as a fraction of what counts as core density FOR
+  // THIS BOX. `core` is a parameter and not GAS_CORE_COUNT directly because
+  // the fine and wide boxes carry the same plume at count scales that differ
+  // by the wide deposit's chord division -- see GAS_CORE_COUNT_WIDE.
+  let s = min(count / core, 1.0);
   // THE REMAP, and it being a remap rather than a subtraction is the whole
   // lesson of this function's first version. Subtracting a fixed amount takes
   // it out of the CORE as well as the skirts, and a far plume has no brightness
@@ -3820,6 +3930,26 @@ fn gasOuterMat() -> u32 {
   return 0u;
 }
 
+// WHICH material the FLAME box is made of, gasOuterMat's rule with the
+// predicate inverted: the first EMISSIVE gas in the table, which on the shipped
+// table is `fire` -- the very material that is never written to the far cascade
+// and whose absence out there this box exists to repair. By PROPERTY and never
+// by id, for gasOuterMat's stated reason.
+//
+// Walked once per pixel and ONLY on a pixel that already found flame, so a
+// world with no emissive gas in its table never reaches the loop -- and such a
+// world has no fire to synthesize either, which is the case where the cost
+// would not have been paid for.
+fn gasFlameMat() -> u32 {
+  let n = arrayLength(&materials);
+  for (var i = 1u; i < n; i++) {
+    if (materials[i].klass == CLASS_GAS && materials[i].emission > 0u) {
+      return i;
+    }
+  }
+  return 0u;
+}
+
 // Integrate coarse gas volume along the ray. Returns voxel-lengths of pure gas
 // — the same unit trace() accumulates into mediaTau before multiplying by
 // opacity, which is what lets fs() feed the result into the one media
@@ -3841,7 +3971,7 @@ fn gasOuterMat() -> u32 {
 // one that reached sky. A plume behind a hill is occluded by the hill, and a
 // plume behind a wall five metres away is occluded by the wall — which is what
 // makes it safe to run this on rays that DID hit.
-fn gasOuterFill(ro : vec3f, rdIn : vec3f, tEnd : f32, px : vec2f) -> f32 {
+fn gasOuterFill(ro : vec3f, rdIn : vec3f, tEnd : f32, px : vec2f) -> vec2f {
   var rd = rdIn;
   if (abs(rd.x) < 1e-6) { rd.x = select(-1e-6, 1e-6, rd.x >= 0.0); }
   if (abs(rd.y) < 1e-6) { rd.y = select(-1e-6, 1e-6, rd.y >= 0.0); }
@@ -3870,6 +4000,26 @@ fn gasOuterFill(ro : vec3f, rdIn : vec3f, tEnd : f32, px : vec2f) -> f32 {
   // crossfade and stipple the seam back in.
   let jit = gasDither(px);
   var acc = 0.0;
+  // ...and the FLAME, accumulated in the SAME three loops at the same sample
+  // points (world.h kGasFlameWords). A second accumulator, not a second march:
+  // one more buffer read per step on pixels that already found gas, against a
+  // whole extra volumetric walk in a fragment shader that has no register
+  // headroom left (gotcha-raymarch-register-cliff).
+  //
+  // NOT ERODED. gasErode carves the thin parts of a cloud, which is what smoke
+  // pulling apart looks like; a flame has its own billow baked into the splat
+  // and carving it would only punch holes in a small bright object. Skipping it
+  // is also most of what keeps this cheap.
+  //
+  // WHAT IS NOT MODELLED, stated rather than left to be found: the flame is NOT
+  // attenuated by smoke in front of it inside this march. Doing it properly
+  // needs a front-to-back running transmittance, and the three segments are not
+  // marched in depth order (the in-window band is nearer than segment one). The
+  // error is small where it matters -- a flame sits at the BASE of its own
+  // column, so a ray reaching it has crossed little of that fire's smoke -- and
+  // it is the same approximation the paragraph at the fold in fs() already
+  // records for the far gas against near media.
+  var flm = 0.0;
 
   // ---- OUTSIDE THE WINDOW (stage 1's segment) ------------------------------
   // Starts at the WINDOW EXIT, not at trace()'s tExit: trace()'s tExit is not
@@ -3885,6 +4035,12 @@ fn gasOuterFill(ro : vec3f, rdIn : vec3f, tEnd : f32, px : vec2f) -> f32 {
   // `acc` is count x LENGTH, not a bare sum, because the two segments have
   // different step budgets and therefore different dt. Each loop multiplies in
   // its own.
+  // Hoisted out of the segment below because the LONG-RANGE segment uses the
+  // same ramp, measured from the same tA. The two boxes now draw the same
+  // plume simultaneously over the whole outer band (world.h kGasFarBlendVox),
+  // so if one of them eroded and the other did not, the crossfade would swap
+  // one texture for another instead of being invisible.
+  let rampInv = 8.0 / f32(WORLD_N);
   if (tB > tA) {
     let dt = (tB - tA) / f32(GAS_OUTER_STEPS);
     var t = tA + dt * jit;
@@ -3899,7 +4055,6 @@ fn gasOuterFill(ro : vec3f, rdIn : vec3f, tEnd : f32, px : vec2f) -> f32 {
     // segment still gets the detail it is here for. (A ramp over the whole
     // segment would reach full erosion only at the far end, i.e. never where it
     // matters.)
-    let rampInv = 8.0 / f32(WORLD_N);
     for (var i = 0u; i < GAS_OUTER_STEPS; i++) {
       let p = ro + rd * t;
       var c = gasOuterCountAt(p);
@@ -3908,9 +4063,15 @@ fn gasOuterFill(ro : vec3f, rdIn : vec3f, tEnd : f32, px : vec2f) -> f32 {
         // gain as well, which is what made a plume thin at the window face and
         // fat fifty metres past it; see the look-pass block at the top.
         let ramp = clamp((t - tA) * rampInv, 0.0, 1.0);
-        c = gasErode(c, p, GAS_DETAIL_FINE_M, GAS_DETAIL_OCT_FINE, ramp);
+        c = gasErode(c, p, GAS_DETAIL_FINE_M, GAS_DETAIL_OCT_FINE, ramp,
+                     GAS_CORE_COUNT);
       }
       acc += c * dt;
+      // TUNE_FAR_FLAME_STRENGTH is a compile-time constant in the tuning
+      // prelude, so 0 const-folds this and the sampler call away entirely --
+      // the knob is an exact off switch in the renderer as well as in the
+      // recorder, which is what makes the A/B arm free on both sides.
+      if (TUNE_FAR_FLAME_STRENGTH > 0.0) { flm += gasFlameFineAt(p) * dt; }
       t += dt;
     }
   }
@@ -3945,16 +4106,29 @@ fn gasOuterFill(ro : vec3f, rdIn : vec3f, tEnd : f32, px : vec2f) -> f32 {
       let p = ro + rd * t;
       // The count is weighted by the SAME ramp trace() faded the voxels by,
       // so the two representations sum to one plume across the whole shell.
-      acc += gasOuterCountAt(p) * gasBlendW(p) * dt;
+      let bw = gasBlendW(p);
+      acc += gasOuterCountAt(p) * bw * dt;
+      // THE FLAME CROSSFADES ON THE SAME WEIGHT THE SMOKE DOES, and that is the
+      // whole answer to "make the LOD bleed into the simulation". gasBlendW is
+      // 0 at the inner edge of the band and 1 at the window face -- the exact
+      // complement of the fade trace() applies to the CA's own fire voxels over
+      // the same shell. So walking toward a distant fire, the synthesized flame
+      // thins out over ~25 m while the real one fades in, and there is no
+      // distance at which one switches off and the other on.
+      if (TUNE_FAR_FLAME_STRENGTH > 0.0) { flm += gasFlameFineAt(p) * bw * dt; }
       t += dt;
     }
   }
   // ---- THE LONG-RANGE SEGMENT (world.h kGasFarOuterN) ----------------------
   // The fires past the near box's ±51.2 m. It is a THIRD segment rather than a
-  // wider version of the first because the two boxes hold DISJOINT emitter sets
-  // — the CPU splits them in the max norm at the near box's own half-extent —
-  // so there is nothing to crossfade and nothing that can be counted twice; the
-  // handover is in the data.
+  // wider version of the first because the two boxes are different GRIDS, not
+  // because they hold different fires: since world.h kGasFarBlendVox became the
+  // whole fine band, every emitter outside the window is in BOTH lists with
+  // weights that sum to 255, so most of what this segment draws over the near
+  // band is the fading-in twin of something the first segment is also drawing.
+  // Nothing is counted twice because the SPLIT IS STILL IN THE DATA — it moved
+  // from a radius to a pair of weights — and the renderer still applies no
+  // distance term of its own to either.
   //
   // Starts at the near box's exit, so the near field pays nothing for it beyond
   // the flag test. Its samples fold into the SAME accumulator with no scale
@@ -3995,9 +4169,21 @@ fn gasOuterFill(ro : vec3f, rdIn : vec3f, tEnd : f32, px : vec2f) -> f32 {
           // to be here (a ramped 1/4..1/12, on top of a 4x gain) was
           // compensating for a splat that wrote the same counts at both
           // scales; the compensation belonged in the splat and is now there.
-          c = gasErode(c, p, GAS_DETAIL_WIDE_M, GAS_DETAIL_OCT_WIDE, 1.0);
+          //
+          // THE SAME RAMP THE FINE SEGMENT USES, from the same tA. This
+          // segment starts at the window face, where the fine segment's
+          // erosion is 0 — running this one at a flat 1.0 put full-strength
+          // coarse noise on the twin of a plume whose fine half had none, and
+          // the crossfade between them then swapped one texture for another
+          // right where it was supposed to be invisible.
+          let ramp = clamp((t - tA) * rampInv, 0.0, 1.0);
+          // GAS_CORE_COUNT_WIDE, not GAS_CORE_COUNT: this box's counts are
+          // ~5.3x lower for the same plume by construction. See the constant.
+          c = gasErode(c, p, GAS_DETAIL_WIDE_M, GAS_DETAIL_OCT_WIDE, ramp,
+                       GAS_CORE_COUNT_WIDE);
         }
         acc += c * dt;
+        if (TUNE_FAR_FLAME_STRENGTH > 0.0) { flm += gasFlameWideAt(p) * dt; }
         t += dt;
       }
     }
@@ -4015,8 +4201,14 @@ fn gasOuterFill(ro : vec3f, rdIn : vec3f, tEnd : f32, px : vec2f) -> f32 {
   // with parcels stacked in it reads brighter. Stage 1's byte capped this at
   // 192/512 = 0.375 full, which was a visible ceiling on brightness the moment
   // in-window voxels started splatting into the same box.
+  //
+  // ONE DENOMINATOR FOR ALL FOUR GRIDS. The two coarse deposits are already
+  // divided by the chord ratio at the point they are WRITTEN (sim_gas.wgsl
+  // FAR_PLUME_WIDE_FILL / FAR_FLAME_WIDE_FILL), precisely so that a ray
+  // collects the same line integral from either cell size -- which is what
+  // lets this be a single divide and what makes both LOD handovers invisible.
   let cellVox = f32(1u << GAS_OUTER_SHIFT);
-  return acc / (cellVox * cellVox * cellVox);
+  return vec2f(acc, flm) / (cellVox * cellVox * cellVox);
 }
 
 // ---- THE VALID BOX (2026-09-10): the box a far reader may march ------------
@@ -4681,6 +4873,87 @@ fn lodShadeFade(tVox : f32) -> f32 {
   let fpx = R.viewPx * 0.5 / R.tanHalfFov;
   let voxPx = fpx / max(tVox, 1.0);
   return 1.0 - smoothstep(LOD_SHADE_PX_FULL, LOD_SHADE_PX_START, voxPx);
+}
+
+// ---- FAR EMBER PLASMA: the breath on a fire the window has left behind -----
+//
+// A chunk evicted mid-burn is FROZEN. Its ember / lava / burning-foliage voxels
+// were downsampled into the far cascade by the last `fardown` and they stay
+// exactly as they were for the rest of the session: a distant fire is a STATIC
+// orange smear, and `burnTint`'s breath (common.wgsl, keyed on the cell and the
+// clock) is a few percent of amplitude on an authored colour, which is not
+// enough to read as fire at 200 m. Everything that made the near field's fire
+// move -- the CA advancing, the per-cell flicker in trace()'s media branch, the
+// actual flame volume -- stops at the window face.
+//
+// So the cascade's emissive cells get a slow, large-feature PLASMA field over
+// their emission: a drifting, domain-warped fbm in WORLD METRES, so the pattern
+// is a fixed physical size and a fire does not re-quantise as the cascade level
+// under it changes. Two terms, and they are doing different jobs:
+//
+//   * THE CRAWL -- a warped fbm, drifting upward at FAR_EMBER_RISE_MPS, which
+//     makes light move ACROSS a bed of coals rather than the whole bed
+//     brightening at once. Warped rather than plain because plain fbm reads as
+//     mottling; the warp is what gives it the licking, folding shape.
+//   * THE PULSE -- one low-frequency sine per COARSE cell, so a whole fire
+//     breathes together instead of every cell arguing with its neighbours.
+//     Phase is hashed off the coarse cell, so two fires on the same hillside
+//     do not beat in sync.
+//
+// THE FADE IS THE POINT (and is what the caller ramps): amplitude is 0 at the
+// window face and reaches full over FAR_EMBER_FADE_VOX, so the plasma FADES IN
+// with distance rather than switching on at a shell. Close in, the real CA fire
+// and its own flicker are what you are looking at and this must not argue with
+// them; far out, it is the only thing moving.
+//
+// RENDER-ONLY float math on render-only data -- no sim state is read or written
+// and the world hash does not cover any of it (CLAUDE.md rule 1 scopes to sim
+// state). Consts live HERE, not in common.wgsl: only this file reads them, and
+// a common.wgsl const costs every shader a SPIR-V cache miss (~536 s measured).
+const FAR_EMBER_FEATURE_M : f32 = 2.2;   // crawl feature size, metres
+const FAR_EMBER_WARP_M    : f32 = 1.1;   // how far the domain warp displaces
+const FAR_EMBER_RISE_MPS  : f32 = 0.45;  // the crawl drifts up this fast
+const FAR_EMBER_WARP_HZ   : f32 = 0.11;  // the warp field's own slow evolution
+const FAR_EMBER_PULSE_HZ  : f32 = 0.55;  // the per-fire breath
+const FAR_EMBER_PULSE_M   : f32 = 9.0;   // how big one "fire" is for the pulse
+const FAR_EMBER_FLOOR     : f32 = 0.18;  // darkest a cooling coal ever gets
+// The fade-in distance, in fine VOXELS past the window face. Half a window
+// (world.h kWorldN / 2 = 25.6 m) -- long enough that no shell is visible,
+// short enough that the plasma is fully alive well inside the fine gas box.
+const FAR_EMBER_FADE_VOX : f32 = 256.0;
+
+// 0..~1.4 multiplier on a frozen fire's emission. `p` is the hit point in fine
+// VOXELS (the renderer's working unit); `amp` is 0..1 and is the only thing the
+// caller varies.
+fn farEmberPlasma(p : vec3f, amp : f32) -> f32 {
+  if (amp <= 1e-3) { return 1.0; }
+  let pm = p * VOXEL_METERS;                       // metres
+  // Domain warp: a coarse fbm displacing the sample of a finer one. One extra
+  // fbm call, and it is the difference between "mottled" and "molten".
+  let wq = pm * (1.0 / (FAR_EMBER_FEATURE_M * 3.0)) +
+           vec3f(0.0, 0.0, R.time * FAR_EMBER_WARP_HZ);
+  let warp = (fbm(wq, 2u) - 0.375) * (FAR_EMBER_WARP_M / FAR_EMBER_FEATURE_M);
+  // The crawl. Rising in +Y, which is why the y term is SUBTRACTED: the field
+  // moves up through the coals, the coals do not move down through the field.
+  let q = (pm - vec3f(0.0, R.time * FAR_EMBER_RISE_MPS, 0.0)) *
+          (1.0 / FAR_EMBER_FEATURE_M) + vec3f(warp);
+  // fbm sums 0.5 + 0.25 + 0.125 = 0.875 over three octaves; normalise so the
+  // amplitude below means the same thing whatever the octave count.
+  let crawl = clamp(fbm(q, 3u) / 0.875, 0.0, 1.0);
+  // The per-fire breath. floor() to a FAR_EMBER_PULSE_M cell so one fire is one
+  // phase; the hash keeps neighbouring fires out of lockstep.
+  let pc = floor(pm * (1.0 / FAR_EMBER_PULSE_M));
+  let ph = f32(hash3(u32(i32(pc.x) + 0x4000), u32(i32(pc.y) + 0x4000),
+                     u32(i32(pc.z) + 0x4000)) & 0xFFFFu) *
+           (6.28318 / 65536.0);
+  let pulse = 0.5 + 0.5 * sin(R.time * (6.28318 * FAR_EMBER_PULSE_HZ) + ph);
+  // Two thirds crawl, one third pulse: the spatial term carries the look and
+  // the breath is a bias on it, not a second pattern competing with it.
+  let field = crawl * 0.67 + pulse * 0.33;
+  // Remap about 1.0 so amp = 0 is EXACTLY the old picture (the `noplasma` arm
+  // is a knob at zero, not a second code path), with a floor so a coal in the
+  // trough is dark rather than absent.
+  return max(1.0 + amp * (2.0 * field - 1.0), FAR_EMBER_FLOOR);
 }
 
 // ============================================================================
@@ -9462,11 +9735,17 @@ fn fs(in : VSOut) -> FSOut {
   // block far below, where the near march's tau is turned into a tint. This is
   // the whole of the render side: one number, folded into one accumulator.
   var gasFarFill = 0.0;
+  // ...and the flame the same walk collected (world.h kGasFlameWords), in the
+  // same units: voxel-lengths. It becomes EMISSION rather than optical depth,
+  // folded into the one fire-glow accumulator CA fire already uses.
+  var gasFlameFill = 0.0;
   if ((R.flags & (RFLAG_GAS | RFLAG_GASFAR)) != 0u) {
     var tStop = 1e30;
     if (h.hit || h.saturated) { tStop = h.t; }
     else if (far.hit) { tStop = far.t; }
-    gasFarFill = gasOuterFill(R.camPos, rd, tStop, in.pos.xy);
+    let gf = gasOuterFill(R.camPos, rd, tStop, in.pos.xy);
+    gasFarFill = gf.x;
+    gasFlameFill = gf.y;
   }
 
   // ---- MPM fluid march (see the MPM FLUID SURFACE / VOXELIZED blocks) ----
@@ -9691,8 +9970,21 @@ fn fs(in : VSOut) -> FSOut {
       // direct sun) so the two representations agree across the seam.
       let fsun = keyLightColor() * lambert;
       color = albedo * face * (ambientAt(n) * ao + fsun);
-      let emis = bt.emis;
-      if (emis > 0.0) { color += albedo * emis * TUNE_EMISSIVE_STRENGTH; }
+      // ---- the frozen fire's breath (farEmberPlasma) ----
+      // A cascade ember is a fire the window left behind: nothing about it
+      // moves any more. The plasma field crawls and pulses over its emission,
+      // FADED IN with distance from the window face so the near field's own
+      // flicker is never argued with. Costs two fbm calls on emissive far
+      // pixels ONLY -- `emis > 0` is a handful of pixels in a frame that has a
+      // distant fire in it and none at all in a frame that does not.
+      var emis = bt.emis;
+      if (emis > 0.0) {
+        let tFace = far.t - f32(WORLD_N) * 0.5;
+        let amp = TUNE_FAR_EMBER_PLASMA *
+                  clamp(tFace / FAR_EMBER_FADE_VOX, 0.0, 1.0);
+        emis *= farEmberPlasma(hitP, amp);
+        color += albedo * emis * TUNE_EMISSIVE_STRENGTH;
+      }
       if (h.liqT <= 0.0) { color = applyAerial(color, rd, far.t); }
       else { color = applyAerial(color, rd, far.t - h.liqT); }
     } else {
@@ -10119,6 +10411,42 @@ fn fs(in : VSOut) -> FSOut {
   var mediaMat  = h.mediaMat;
   var mediaTau  = h.mediaTau;
   var mediaTint = h.mediaTint;
+  // ---- THE FAR FLAME, folded into the SAME fire accumulator as CA fire ----
+  //
+  // This is the whole point of the flame box and the reason it is not a
+  // separate composite layer. `h.fireGlow` is what trace() accumulates from
+  // in-window fire voxels, and the block near the bottom of this function turns
+  // it into colour through a temperature ramp over the fire material's own
+  // palette plus a global breath. Adding the far flame HERE means the
+  // synthesized flame and the real one go through one ramp, one breath and one
+  // tonemap -- so at the window face, where the crossfade weight hands the
+  // picture from one to the other, there is no colour step to see. A second
+  // composite would have painted the far flame over the near one at full
+  // strength and put exactly the seam this feature exists to remove.
+  //
+  // `h.fireMat` is claimed only when the near march found no fire at all: a ray
+  // that crossed real flame keeps that material, and the far flame simply adds
+  // to its glow. Both resolve to the same `fire` entry on the shipped table,
+  // and naming it by PROPERTY rather than by id is the same rule gasOuterMat
+  // follows -- no material id in a shader.
+  // `h` is a `let`, so the two fire fields are carried forward in locals from
+  // here to the composite at the bottom of the function rather than written
+  // back into the hit.
+  var fireMat = h.fireMat;
+  var fireGlow = h.fireGlow;
+  if (gasFlameFill > 1e-4) {
+    if (fireMat == 0u) { fireMat = gasFlameMat(); }
+    if (fireMat != 0u) {
+      // Voxel-lengths x the material's own emission, which is the same
+      // conversion trace()'s media branch makes for an in-window fire voxel
+      // (cellFire there is emission/255 x flicker, accumulated over the
+      // segment). NO look constant and no second copy of the strength knob:
+      // render.farFlameStrength is already in the deposit, and applying it
+      // again here would square it.
+      fireGlow += gasFlameFill * (f32(materials[fireMat].emission) / 255.0);
+    }
+  }
+
   if (gasFarFill > 1e-4) {
     let gm = gasOuterMat();
     if (gm != 0u) {
@@ -10345,9 +10673,13 @@ fn fs(in : VSOut) -> FSOut {
   // fire glow: additive, from the flicker-weighted emissive path. Intensity
   // drives a temperature ramp across the material palette — stray flame
   // voxels stay wispy deep-orange, plume cores saturate toward white-hot.
-  if (h.fireMat != 0u && h.fireGlow > 0.0) {
-    let fm = materials[h.fireMat];
-    let x = 1.0 - exp(-h.fireGlow * TUNE_FIRE_GLOW_RATE);
+  // `fireMat` / `fireGlow`, not h.* : the far flame (world.h kGasFlameWords)
+  // was folded into these locals above, so the synthesized flame and the CA's
+  // own go through this one ramp and this one breath. That shared path IS the
+  // crossfade at the window face.
+  if (fireMat != 0u && fireGlow > 0.0) {
+    let fm = materials[fireMat];
+    let x = 1.0 - exp(-fireGlow * TUNE_FIRE_GLOW_RATE);
     var fc = mix(unpackColor(fm.color2), unpackColor(fm.color0),
                  clamp(x * 2.0, 0.0, 1.0));
     fc = mix(fc, unpackColor(fm.color1) * 1.25 + vec3f(0.10, 0.06, 0.0),

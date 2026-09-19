@@ -2521,6 +2521,9 @@ bool LoadTuning(const std::string& path, Tuning& out) {
     ReadF(*g, "farPlumeStrength", r.farPlumeStrength, out, at);
     ReadF(*g, "farPlumeHeight", r.farPlumeHeight, out, at);
     ReadF(*g, "farPlumeRange", r.farPlumeRange, out, at);
+    ReadF(*g, "farEmberPlasma", r.farEmberPlasma, out, at);
+    ReadF(*g, "farFlameStrength", r.farFlameStrength, out, at);
+    ReadF(*g, "farFlameHeight", r.farFlameHeight, out, at);
     ReadF(*g, "lodHandoffDist", r.lodHandoffDist, out, at);
     ReadF(*g, "renderScale", r.renderScale, out, at);
     ReadI(*g, "taa", r.taa, out, at);
@@ -2722,6 +2725,21 @@ bool LoadTuning(const std::string& path, Tuning& out) {
       const float maxM =
           (float)((kGasFarOuterN << kGasFarOuterShift) / 2) * kVoxelMeters;
       if (r.farPlumeRange > maxM) r.farPlumeRange = maxM;
+    }
+    // The ember breath is a multiplier ABOUT 1.0 (farEmberPlasma remaps to
+    // 1 + amp*(2f-1)), so 1.0 is already "0 to 2x emission" and anything past
+    // it only deepens the troughs against the same floor. Clamped there rather
+    // than left open because a value of 5 reads as a strobe, not as fire.
+    if (r.farEmberPlasma < 0.0f) { r.farEmberPlasma = 0.0f; }
+    if (r.farEmberPlasma > 1.0f) { r.farEmberPlasma = 1.0f; }
+    // Flame strength on farPlumeStrength's terms (0 = exact off switch), and
+    // flame HEIGHT clamped to the fine density box's half-extent for the same
+    // reason the plume's is: past it the shader clamps anyway.
+    if (r.farFlameStrength < 0.0f) { r.farFlameStrength = 0.0f; }
+    if (r.farFlameStrength > 16.0f) { r.farFlameStrength = 16.0f; }
+    if (r.farFlameHeight < 0.0f) { r.farFlameHeight = 0.0f; }
+    if (r.farFlameHeight > (float)kWorldN * kVoxelMeters) {
+      r.farFlameHeight = (float)kWorldN * kVoxelMeters;
     }
     if (r.lodHandoffDist < 2.0f) { r.lodHandoffDist = 2.0f; }
     // A scale above 1 would be supersampling the most expensive shader in the

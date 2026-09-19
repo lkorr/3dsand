@@ -94,20 +94,49 @@ class FarPlumes {
   //   >= kWorldN, <= rangeVox the WIDE section (gasFarOuter, 6.4 m cells),
   //                           aggregated again per COARSE column
   //
-  // The split is STRICT — no emitter is in both — which is what makes "no
-  // double-brightening" a property of the data rather than of a blend weight
-  // the renderer has to get right. `rangeVox` is render.farPlumeRange in
-  // voxels; 0 produces an empty wide section, which is the feature's exact off
-  // switch (no emitters, no row, no clear, no sampling).
+  // The split is NOT strict: an emitter within world.h kGasFarBlendVox of the
+  // fine box's face — which is the whole band, so every emitter outside the
+  // window — is in BOTH sections, with complementary weights in the top byte
+  // of its strength word. "No double-brightening" is those weights summing to
+  // 255, which is still a property of the DATA rather than of a blend the
+  // renderer has to get right. `rangeVox` is render.farPlumeRange in voxels;
+  // 0 produces an empty wide section, which is the feature's exact off switch
+  // (no emitters, no row, no clear, no sampling).
   //
   // Cheap to call every tick: it returns immediately unless the index changed,
-  // the window moved, or the range changed — the only three things that can
-  // change the answer.
+  // the window moved, the range changed, or the EYE moved far enough to matter
+  // (SetEye below) — and the last of those is additionally gated on the index
+  // being non-empty, so a world with no frozen fires still pays nothing.
   void Build(IVec3 windowOriginChunks, int32_t rangeVox);
+
+  // THE EYE, in ABSOLUTE world voxels. Which LIST an emitter is in is decided
+  // from the window centre (above); its crossfade WEIGHT is decided from here,
+  // because the centre only moves when the window shifts and a weight keyed on
+  // a value that moves 16 voxels at a time steps visibly as the player walks.
+  // See world.h kGasFarEyeSlackVox for why the two origins cannot contradict
+  // each other, and kGasFarEyeStepVox for how far this must move to earn a
+  // rebuild.
+  //
+  // OPTIONAL. Until it is called the weights are measured from the window
+  // centre exactly as they were, which is what every headless harness and gate
+  // gets — they have no camera, and a fixture's weight should not depend on
+  // where a notional one stands.
+  void SetEye(IVec3 absVox) { eye_ = absVox; hasEye_ = true; }
 
   // Emitters in each section of the list Build() last produced.
   uint32_t Count() const { return count_; }
   uint32_t CountWide() const { return countWide_; }
+
+  // ---- what the caps did on the last build ---------------------------------
+  // All three caps used to fail by deleting smoke silently, which is how "the
+  // big fire smokes and the trees beside it do not" reached a bug report
+  // instead of a printed line. Two of them now DEGRADE instead: a fine emitter
+  // that does not fit is promoted to the wide list (coarser, not absent), and
+  // a wide list that does not fit re-buckets at a coarser cell. These report
+  // both, so a gate or an overlay can say which bound.
+  uint32_t FinePromoted() const { return capFinePromoted_; }
+  uint32_t WideBucketScale() const { return 1u << capWideExtraShift_; }
+  uint32_t WideDropped() const { return capWideDropped_; }
 
   // Hand the caller the words to upload, ONCE per version. Returns false when
   // the buffer on the GPU already holds this list — which is every tick of a
@@ -148,8 +177,21 @@ class FarPlumes {
   // chunk forever. Past the cap new burning chunks are refused (counted, so
   // "the index was the bound" is a printed number); chunks already in it keep
   // updating, so a fire that goes out still removes itself.
-  static constexpr size_t kChunkCap = 4096;
+  // 4096 until 2026-09-19, which is a 25.6 m cube of solid burning matter and
+  // nothing like a forest fire. Past it the refusal is FIRST-COME-FIRST-SERVED
+  // — the chunks that burned EARLIEST hold the index and every tree lit
+  // afterwards is silent, which is the exact shape of the "the fire I started
+  // first is the only one smoking" report. Raised 8x; an entry is a key, a
+  // small vector and at most four emitters, so the ceiling is ~5 MB and it is
+  // paid only by a session that has actually set that much alight. Refusals
+  // are still counted and now printed (Build), because a bound that deletes
+  // smoke must never again be silent.
+  static constexpr size_t kChunkCap = 32768;
   uint64_t refusedChunks_ = 0;
+  uint32_t capFinePromoted_ = 0;
+  uint32_t capWideExtraShift_ = 0;
+  uint32_t capWideDropped_ = 0;
+  uint32_t capReportSkip_ = 0;
 
   std::vector<uint32_t> words_;      // the upload image, header + both sections
   uint32_t count_ = 0;               // emitters in the fine section
@@ -159,4 +201,12 @@ class FarPlumes {
   bool dirty_ = true;                // the index changed since the last Build
   IVec3 builtOrigin_{INT32_MIN, INT32_MIN, INT32_MIN};
   int32_t builtRange_ = -1;
+  IVec3 eye_{0, 0, 0};
+  bool hasEye_ = false;
+  IVec3 builtEye_{INT32_MIN, INT32_MIN, INT32_MIN};
+  // The previous upload image, to decide whether this rebuild actually CHANGED
+  // anything. The eye moves constantly, so Build now runs on most ticks of a
+  // walking player; without this every one of them would bump version_ and
+  // re-upload 8.2 KiB whether or not a single weight byte moved.
+  std::vector<uint32_t> prevWords_;
 };

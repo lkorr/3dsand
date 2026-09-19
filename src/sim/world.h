@@ -541,9 +541,58 @@ constexpr uint32_t kGasFarEmitWeightShift = 24;
 // lists, with complementary weights that the kernels multiply into the mass:
 // the fine plume fades out over the shell at full size, the wide one fades in
 // at full size, and the sum of what a ray collects is the same at every point
-// of the shell. One wide cell across, so the shell is as wide as the coarsest
-// thing being faded.
-constexpr int32_t kGasFarBlendVox = 64;   // one wide cell; pinned below
+// of the shell.
+//
+// THE SHELL IS THE WHOLE FINE BAND (2026-09-19, second pass). It was one wide
+// cell (64 vox = 6.4 m) out of a 25.6 m band, which is a crossfade only in the
+// sense that a hard edge with a 6 m bevel on it is a crossfade: the player
+// still saw the coarse representation arrive over about two paces. The band an
+// emitter can be in the fine list at all is (windowHalf, fineHalf] = (256, 512]
+// voxels of max norm, so the shell is now 256 voxels and the handover occupies
+// ALL of it — an emitter is full-fine at the window face, 50/50 at 38.4 m, and
+// full-wide at the fine box's face. The weight curve is a SMOOTHSTEP, not the
+// linear ramp it was: a linear weight has a slope discontinuity at each end of
+// the shell, and a slope discontinuity in a plume's brightness against fog is
+// visible as the ring the shell exists to remove. The smoothstep's flat ends
+// are also what keeps the coarse twin from mattering in the near field — at
+// 30 m it is 8% of the mass, drawn at 6.4 m cells, under a fine plume at 92%.
+constexpr int32_t kGasFarBlendVox = 256;  // the whole fine band; pinned below
+// ...and the far end of the wide list is a shell too. The wide list's outer
+// edge is min(render.farPlumeRange, the box's own half-extent), and until now a
+// plume simply stopped existing one voxel past it. Nothing lies beyond to fade
+// INTO, so this fades to nothing — which is the same thing fog does to it a few
+// hundred metres earlier and therefore reads as "it faded out", not "it went
+// out". 512 voxels = 51.2 m, one window, at a distance where that subtends
+// very little.
+constexpr int32_t kGasFarRangeFadeVox = 512;
+// BOTH SHELLS ARE MEASURED FROM THE EYE, NOT THE WINDOW CENTRE, and these two
+// are what makes that safe and cheap.
+//
+// The centre is the right origin for deciding WHICH LIST an emitter is in (it
+// is exactly the half-extent at every point of all six faces, so the handover
+// radius does not depend on where the camera stands). It is the wrong origin
+// for a WEIGHT, because it only moves when the window SHIFTS — one chunk,
+// 1.6 m, `Stream::ShiftAxis` — so a weight keyed on it walks down a 256-voxel
+// shell in sixteen steps of ~6% each, one per chunk boundary crossed. That is
+// the "it changes in discrete steps as I travel" report. The eye moves every
+// frame, so a weight keyed on IT is continuous.
+//
+// THE SLACK is what keeps the two origins from contradicting each other. The
+// weight must already be 0 by the time the CPU drops the record, or the plume
+// pops out at whatever weight it still had. Max-norm triangle inequality:
+// eyeDist >= centreDist - |eye - centre|, so ending every ramp this far short
+// of its list boundary is a proof rather than a margin — provided the bound
+// holds. Stream recentres when the player is 2 chunks off centre and shifts
+// ONE AXIS PER FRAME, so |eye - centre| is ~3-4 chunks in steady state; 6
+// chunks is headroom for the diagonal case where two axes are waiting their
+// turn. Outrun it (a teleport, a debug fly at absurd speed) and the fade
+// degrades to the step it used to be — never to a wrong plume.
+constexpr int32_t kGasFarEyeSlackVox = 96;   // 6 chunks
+// How far the eye must move to earn a rebuild. Build is otherwise called and
+// returns immediately; this is what stops a walking player from rebuilding and
+// re-uploading the list on all 60 ticks a second. 2 voxels is 0.8% of the
+// shell — below the quantisation of the 0..255 weight byte it feeds.
+constexpr int32_t kGasFarEyeStepVox = 2;
 // The WIDE section (the long-range box below). Its own cap rather than a share
 // of the fine one: the two lists cover disjoint distance bands and a frame with
 // 256 near fires should not be able to starve the far ones.
@@ -630,10 +679,87 @@ static_assert(kGasFarOuterOffsetVoxY % (int32_t)(1u << kGasFarOuterShiftY) == 0,
 // x/z, and a fine emitter spans one chunk in y, so a coarse cell holds
 // (ratio^2 in x/z) x (cell/chunk in y) fine columns.
 constexpr uint32_t kGasFarWideRatio = 1u << (kGasFarOuterShift - kGasOuterShift);
-static_assert(kGasFarBlendVox == (int32_t)(1u << kGasFarOuterShift),
-              "the crossfade shell is one wide cell across (see kGasFarBlendVox)");
+// The shell is exactly the band an emitter can be in the fine list: from the
+// window face (where the fine list starts, because a resident chunk's fire is
+// drawn by the CA instead) to the fine box's face. Wider than that and the
+// weight would still be climbing when the fine list drops the emitter, i.e. a
+// step; narrower and the handover is a bevelled edge again.
+static_assert(kGasFarBlendVox == (int32_t)kWorldN - (int32_t)(kWorldN / 2),
+              "the crossfade shell spans the whole fine-emitter band "
+              "(see kGasFarBlendVox)");
+static_assert(kGasFarBlendVox % (int32_t)(1u << kGasFarOuterShift) == 0,
+              "...and a whole number of wide cells across");
 static_assert(kGasFarOuterShift > kGasOuterShift,
               "the long-range box must be COARSER than gasOuter");
+
+// ---- THE FLAME BOX: what a fire outside the window is MISSING -------------
+//
+// The plume system above gives a frozen fire its SMOKE back. It does not give
+// it back its FLAME, and the reason is structural rather than an oversight:
+// `fire` is CLASS_GAS, and a gas is never written to the far cascade at all.
+// So outside the residency window a fire is a bed of frozen ember/lava voxels
+// with nothing above it, and the flame VOLUME — the thing that actually reads
+// as fire — springs into existence the moment the chunk streams back in. That
+// is the "fire voxels pop in when you get close enough" report.
+//
+// This box is the flame, synthesized from the SAME FarPlumes emitter list the
+// smoke comes from, by the same two kernels' worth of code one LOD apart. Its
+// contents are an EMISSIVE density, folded by the raymarcher into the one
+// fire-glow accumulator CA fire already uses — so the far flame takes the same
+// temperature ramp, the same breath and the same tonemap as the near one, and
+// the seam at the window face is a crossfade rather than a switch.
+//
+// ONE BUFFER, TWO GRIDS, and that is a deliberate saving rather than a packing
+// trick. A grid per LOD would be two more storage bindings in BOTH the gas
+// group and the render group, two clear rows and two pass-table buffer ids,
+// for two arrays that are always written together and always read together.
+// Concatenating them costs one offset constant, and the offset is a whole
+// number of words so neither grid's u16 pairing is disturbed.
+//
+//   [0, kGasFlameFineWords)                 the FINE grid  — gasOuter's
+//                                           geometry EXACTLY (origin, cell,
+//                                           index), so the sampler is the same
+//                                           expression with a different base
+//   [kGasFlameWideBase, kGasFlameWords)     the WIDE grid  — gasFarOuter's
+//                                           geometry exactly, same argument
+//
+// "Exactly" is load-bearing: the splatter and the sampler agreeing on where
+// cell (0,0,0) is IS the interface, and reusing a geometry that two kernels
+// and two sampler functions already agree on is how this feature avoids
+// inventing a third lattice that could drift from the other two.
+constexpr uint32_t kGasFlameFineWords = kGasOuterWords;      // 1 Mi u32 = 4 MiB
+constexpr uint32_t kGasFlameWideBase = kGasFlameFineWords;
+constexpr uint32_t kGasFlameWideWords = kGasFarOuterWords;   // 1 Mi u32 = 4 MiB
+constexpr uint32_t kGasFlameWords = kGasFlameFineWords + kGasFlameWideWords;
+static_assert(kGasFlameWideBase * 2u % 2u == 0,
+              "the wide grid must start on a WORD boundary or its two-u16 "
+              "packing would be half a cell out of phase with its index");
+
+// The flame column is SHORT — render.farFlameHeight defaults to 4 m against
+// the plume's 28 — so it needs far fewer height steps than FAR_PLUME_STEPS,
+// and the workgroup is sized to it. One thread per height cell, as the plume
+// kernels are.
+constexpr uint32_t kGasFlameSteps = 16;
+
+// THE ANTI-CARRY PROOF, and it is this box's version of the one at
+// FAR_PLUME_ADD_MAX rather than a copy of it. Two u16 counts share a word, so
+// a count that overflows 0xFFFF carries into its neighbour and paints a cell
+// that has no fire anywhere near it. The bound is the same shape: one emitter
+// reaches a given cell at most once per height step (the kernels merge
+// same-cell puffs before they add, exactly as the plume kernels do), so the
+// worst case is every emitter in a section landing on one cell.
+//
+// Deliberately TIGHTER than the plume's. A flame is a small, bright, local
+// thing: its whole job is to saturate at its core and be gone a few metres
+// away, so it needs neither the plume's 240-per-add headroom nor its 4,096
+// ceiling, and a lower ceiling buys a bigger safety margin under the same u16.
+constexpr uint32_t kGasFlameAddMax = 160;
+constexpr uint32_t kGasFlameCeil = 2048;
+static_assert(kGasFlameCeil + (kGasFarEmitMax - 1u) * kGasFlameAddMax <= 0xFFFFu,
+              "fine flame counts must not carry into the neighbouring u16");
+static_assert(kGasFlameCeil + (kGasFarEmitMaxWide - 1u) * kGasFlameAddMax <=
+                  0xFFFFu,
+              "wide flame counts must not carry into the neighbouring u16");
 
 // gasSpawn / gasSpawnOps header words. The buffer is an 8-word header followed
 // by Particle-shaped records; the header doubles as this tick's gas counters,
@@ -3897,6 +4023,12 @@ class World {
   // re-splatted on every tick that has a wide emitter — and differing only in
   // its cell size. CopySrc so a gate can read it back.
   rhi::Buffer gasFarOuter;      // kGasFarOuterWords u32 (two u16 counts each)
+  // The FLAME box (see kGasFlameWords): both LODs of the synthesized emissive
+  // flame in one allocation, fine grid first, wide grid at kGasFlameWideBase.
+  // Exactly the standing of the two boxes above — render-only derived data,
+  // not hashed, not saved, cleared and re-splatted on the ticks it is written
+  // — and, like them, CopySrc so a gate can read it back.
+  rhi::Buffer gasFlame;         // kGasFlameWords u32 (two u16 counts each)
 
   // ---- MLS-MPM fluid (see the fluid block above kFluidCap) ----
   // fluidGrid, fluidBlockMap and fluidBlockList are per-substep scratch,

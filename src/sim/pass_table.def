@@ -147,6 +147,16 @@ PASS(fill_gasOuter, nullptr, PT_TICK, PIPE_NONE, K_FILL, 0,0,0, GRP_NONE, DYN_NO
 // it drops on the same tick.
 PASS(fill_gasFarOuter, nullptr, PT_TICK, PIPE_NONE, K_FILL, 0,0,0, GRP_NONE, DYN_NONE, C_GASWIDE, 1,
      USES(TW(GasFarOuter)))
+// The FLAME box's clear (world.h kGasFlameWords). ONE row for BOTH grids,
+// because they share one allocation -- which is why its condition is the UNION
+// of the two splats rather than either alone. That union is not a convenience:
+// a tick that splats the fine grid without clearing the wide one would leave
+// the wide grid holding a flame from several seconds ago, hanging in the sky at
+// a fire that has since gone out, and a tick that clears without splatting is a
+// flame that flickers off for a frame. Both halves off = no row and no 8 MiB
+// touched, which is what makes the feature free when it is not in use (rule 2).
+PASS(fill_gasFlame, nullptr, PT_TICK, PIPE_NONE, K_FILL, 0,0,0, GRP_NONE, DYN_NONE, C_GASFLAME, 1,
+     USES(TW(GasFlame)))
 
 // ---- phase 1: prep (one ComputePassEncoder today: mutate+explode+compact) --
 // D_OPS/D_CELLS/D_EXP/D_SPAWN are dispatch-extent selectors resolved from the
@@ -599,6 +609,32 @@ PASS(gasFarPlume, "gasFarPlume", PT_TICK, PIPE_GAS_FARPLUME, K_COMPUTE, D_GASFAR
 PASS(gasFarPlumeWide, "gasFarPlume", PT_TICK, PIPE_GAS_FARPLUMEW, K_COMPUTE, D_GASFARWIDE,1,1,
      GRP_SLIM_GAS, DYN_NONE, C_GASWIDE, 1,
      USES(U(TickUBO) R(GasFarEmit) A(GasFarOuter)))
+
+// ---- phase 4d: FAR FIRE FLAMES (world.h kGasFlameWords) -------------------
+//
+// The other half of the far fire LOD, and the half that is about the fire
+// rather than about its smoke. `fire` is CLASS_GAS, and a gas is never written
+// to the far cascade at all, so a burning chunk the window has evicted keeps
+// its embers and loses its FLAME outright -- which is why flame springs into
+// existence the moment that chunk streams back in. These two rows synthesize
+// it, from the SAME emitter list the plume rows above read.
+//
+// EVERYTHING THE PLUME ROWS' SAFETY ARGUMENT SAYS APPLIES WORD FOR WORD, and
+// that is the reason the flame is a second pair of splats rather than anything
+// cleverer: the whole output is A(GasFlame), which is render-only derived data
+// the sim never reads and the world hash never covers. No voxel, no parcel, no
+// claim, no dirty flag. A fire outside the window still cannot move the world.
+//
+// Their own conditions (render.farFlameStrength, not farPlumeStrength) so the
+// two halves are independently switchable -- "smoke, no flame" is the arm that
+// prices the flame, and "flame, no smoke" is how its look is judged without a
+// column of smoke over it.
+PASS(gasFarFlame, "gasFarFlame", PT_TICK, PIPE_GAS_FARFLAME, K_COMPUTE, D_GASFLAME,1,1,
+     GRP_SLIM_GAS, DYN_NONE, C_GASFLAMEF, 1,
+     USES(U(TickUBO) R(GasFarEmit) A(GasFlame)))
+PASS(gasFarFlameWide, "gasFarFlame", PT_TICK, PIPE_GAS_FARFLAMEW, K_COMPUTE, D_GASFLAMEWIDE,1,1,
+     GRP_SLIM_GAS, DYN_NONE, C_GASFLAMEW, 1,
+     USES(U(TickUBO) R(GasFarEmit) A(GasFlame)))
 
 // ---- phase 5a: hash tick (whole-world scan; also refreshes occupancy) ------
 PASS(occupancyFull, "occupancyFull+pick(hashTick)", PT_TICK, PIPE_OCCUPANCY, K_COMPUTE, D_CHUNKS,1,1, GRP_SIM, DYN_ZERO, C_HASH, 1,

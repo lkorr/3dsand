@@ -137,7 +137,8 @@ inline constexpr PerfNodeDef kPerfNodes[] = {
      "Scales with the live particle count, not the world. Integrate is the "
      "DDA; resolve is the atomicMax claim."},
     {"gasSys", "Gas Particles", "simTick", PerfSide::Gpu, PerfScope::Count,
-     "gasSpawn;gasArgs1;gasIntegrate;gasArgs2;gasResolve;gasFarPlume;gasFarPlumeWide",
+     "gasSpawn;gasArgs1;gasIntegrate;gasArgs2;gasResolve;gasFarPlume;gasFarPlumeWide;"
+     "gasFarFlame;gasFarFlameWide",
      "Gas that has left the residency window (docs/PLAN_gas_particles.md). "
      "Scales with the live parcel count, not the world, and is recorded at all "
      "only while parcels exist or the CA has work. What it BUYS is on the "
@@ -151,7 +152,14 @@ inline constexpr PerfNodeDef kPerfNodes[] = {
      "same kernel one LOD out, into the long-range box (world.h "
      "kGasFarOuterN): the two emitter lists are disjoint, so a frozen fire "
      "shows up on exactly one of the two rows depending on how far away it "
-     "is."},
+     "is. `gasFarFlame` / `gasFarFlameWide` are the FLAME half of the same "
+     "feature (world.h kGasFlameWords) and are charged here for the same "
+     "reason: `fire` is CLASS_GAS and never reaches the far cascade, so a "
+     "fire outside the window keeps its embers and loses its flame, and these "
+     "two synthesize it back into the flame box. They run over the same two "
+     "emitter lists under their OWN condition (render.farFlameStrength), so "
+     "smoke-without-flame and flame-without-smoke each show up as one pair of "
+     "rows going quiet."},
     {"fluidSys", "MLS-MPM Fluid", "simTick", PerfSide::Gpu, PerfScope::Count,
      "fluidMark;fluidAlloc;fluidClear;fluidP2g1;fluidP2g2;fluidGridUp;fluidG2p;"
      "seam_compact_count;seam_compact_scan;seam_compact_scatter;seam_spawn;"

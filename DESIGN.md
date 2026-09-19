@@ -1407,9 +1407,10 @@ its cell size:
 * **The two emitter lists are split in the max norm at the fine box's own
   half-extent** and live in two sections of one buffer (the header words
   reserved when the fine half landed now carry the wide count and the wide box's
-  shift). They were strictly DISJOINT until the crossfade shell below; a fire
-  deeper than one wide cell inside the face is fine-only, past the face
-  wide-only, and in the shell it is in both with weights that sum to one.
+  shift). They were strictly DISJOINT until the crossfade shell below; now the
+  shell is the WHOLE fine band, so every fire outside the window and inside the
+  fine box's face is in both lists with weights that sum to one, and only a
+  fire past the face is single-list.
 * **The wide list is aggregated AGAIN, per coarse column.** A 6.4 m cell holds up
   to 8x8 fine columns in x/z and four chunks in y, so without it one burning
   hillside would spend the whole 256-emitter budget on a patch 64 voxels across.
@@ -1538,7 +1539,7 @@ transitioning to the farthest LOD."* Cause: the split was per EMITTER, and a
 burning tree is several emitters (2x2 columns per chunk, several chunks), so its
 columns crossed 409.6 m one at a time — the fine plume lost columns and shrank
 while the wide aggregate gained them. Now an emitter within `kGasFarBlendVox`
-(64 voxels, one wide cell) INSIDE the fine box's face is in BOTH lists, with
+INSIDE the fine box's face is in BOTH lists, with
 complementary weights carried in the top byte of the record's strength word
 (low 24 bits the count). The fine kernel multiplies the weight into `burn`; the
 wide kernel multiplies it into the MASS only and derives height and width from
@@ -1555,6 +1556,175 @@ What still steps: `hMul = sqrt(columns)` capped at 4 makes a LARGE fire's wide
 column taller than its fine columns, so a hillside fire gains height across the
 shell (a single tree, `cols < 1`, does not). Inherent to "many columns" vs "one
 aggregate"; attack it if it reads.
+
+**Fourth round: the shell is the whole band, and both ends of the wide list
+fade.** The report: *"there are discrete points where you see it switch over."*
+The shell above was ONE wide cell — 64 voxels, 6.4 m — out of a 25.6 m band, so
+it was a hard edge with a bevel on it and the player still walked through the
+handover in about two paces. Three changes, all of them the same idea:
+
+* `kGasFarBlendVox` is **256 voxels, the whole band an emitter can be in the
+  fine list at all** (from the window face, where the fine list starts because a
+  resident chunk's fire is drawn by the CA instead, to the fine box's face). An
+  emitter is full-fine at the window face, 50/50 at 38.4 m, full-wide at 51.2 m.
+  Wider is not available: past the face the fine list drops the emitter, so the
+  weight would still be climbing when the record vanished — a step again.
+* The weight curve is a **smoothstep**, not the linear ramp it was. A linear
+  weight has a slope discontinuity at each end of the shell, and a slope
+  discontinuity in a plume's brightness against fog reads as the same ring the
+  shell exists to remove. The flat ends are also what keeps the coarse twin out
+  of the near field: at 30 m it is 8% of the mass.
+* **The wide list's OUTER edge fades too** (`kGasFarRangeFadeVox`, 512 voxels).
+  Its far edge is `min(render.farPlumeRange, the box's own half-extent)` and a
+  plume simply stopped existing one voxel past it. Nothing lies beyond to fade
+  into, so this fades to nothing — which is what fog does to it a few hundred
+  metres earlier anyway, so it reads as "faded out", not "went out". Applied
+  before the wide aggregation, so a coarse cell straddling the edge fades by how
+  much of its fire is past it (the same rule the inner shell's strength-weighted
+  mean follows).
+
+And one renderer half: the long-range segment's **erosion now ramps from the
+window face on the same `rampInv` the fine segment uses**. It ran at a flat 1.0,
+which was harmless while the two boxes held different fires and is not now —
+over the whole band the coarse twin of a plume whose fine half had no erosion
+yet was drawn with full coarse noise, so the crossfade swapped one texture for
+another exactly where it was supposed to be invisible.
+
+**Fifth round, two reports from the same session.**
+
+*"It changes in discrete steps as I travel."* The shell above is measured in
+the max norm **from the window centre**, and the centre only moves when the
+window SHIFTS — one chunk, 1.6 m, `Stream::ShiftAxis`. So a weight keyed on it
+walks a 256-voxel shell in sixteen jumps of ~6%, one per chunk boundary
+crossed. Which LIST an emitter is in still comes from the centre (that metric
+is exactly the half-extent at every point of all six faces, so the handover
+radius does not depend on where the camera looks); the WEIGHT now comes from
+`FarPlumes::SetEye`, the player's continuous position, set once a frame by the
+game loop. The two origins cannot contradict each other because every ramp ends
+`kGasFarEyeSlackVox` (96 voxels, 6 chunks) short of its list boundary: by the
+max-norm triangle inequality `eyeDist >= centreDist - |eye - centre|`, that is a
+proof the weight has already reached 0 before the record is dropped, not a
+margin. `SetEye` is OPTIONAL — unset, the weights are the window-centre ones
+they were, which is what every headless harness and gate gets. Build now runs
+on most ticks of a walking player, so it is gated on `kGasFarEyeStepVox`
+(2 voxels) AND on the index being non-empty, and it bumps `version_` only when
+the 8.2 KiB image actually differs.
+
+*"If there is a large mass of smoke, smaller masses give off none at all."*
+**Three caps, and all three failed by deleting smoke silently.** A burning tree
+is 40–100 column emitters and the fine section holds 256 kept NEAREST-FIRST, so
+three or four trees exhausted it and every other fire in the world went out. Two
+of the three now DEGRADE instead of dropping:
+
+* **The fine cap promotes its overflow to the WIDE list.** The caps used to be
+  applied after the wide aggregation had already run inline in the same loop,
+  which is what made the fine cap a delete; `Build` is now a candidate pass
+  followed by the caps followed by the aggregation. An emitter that cannot
+  afford a 0.8 m column gets a 6.4 m one — a real LOD step-down, and the weight
+  machinery to express it already existed (promotion is just `wFine = 0`).
+* **The wide aggregation COARSENS instead of truncating.** If more than 256
+  coarse cells hold fire, the bucket edge doubles and it re-aggregates, until it
+  fits. The record carries a world position and a strength, so nothing
+  downstream knows how wide the bucket was, and the shader's existing clamps
+  (`hMul = sqrt(cols)` capped at 4, `stack` clamped to `CHORD^2`) mean a huge
+  aggregate draws one fat column rather than a huge one.
+* **The index cap was 4096 chunks and FIRST-COME-FIRST-SERVED** — the chunks
+  that burned earliest hold it and every tree lit afterwards is refused, which
+  is the exact shape of the report. Raised to 32768 (~5 MB worst case, paid only
+  by a session that has set that much alight). Still a bound, so refusals are
+  still counted — and now PRINTED.
+* **A bound cap is never silent again.** `Build` prints one throttled line
+  naming which of the three is biting, how many were promoted, what bucket scale
+  the wide list needed, and how many were genuinely dropped. `FinePromoted()`,
+  `WideBucketScale()` and `WideDropped()` expose the same to a gate.
+
+`gas-farplume` grew **arm E** for this: its fixture stands 376 voxels from the
+window centre (checked against `kGasFarBlendVox`, not a literal), so the wide
+box must hold the fading-in twin of the plume arm A measures in the near box,
+and the wide box's control column must be zero. Paired with the CONTROL column
+rather than with the no-emitter arm, because with no emitters there is no wide
+row and therefore no CLEAR — "empty with no emitters" is a claim the feature is
+designed to make false (that is arm D's whole point).
+
+**Sixth round: `GAS_CORE_COUNT` was one threshold across two boxes whose counts
+are on different scales BY CONSTRUCTION.** The report after the caps were fixed:
+*"midrange works for multiple trees, the distant smoke still doesn't."* The caps
+were a real bug and were not this one.
+
+`sim_gas.wgsl`'s wide deposit multiplies by `FAR_PLUME_WIDE_FILL /
+FAR_PLUME_WIDE_CHORD` (1.5/8) so that a RAY collects the same integral from
+either box — a ray crosses a 6.4 m cell in 8x the path length of a 0.8 m one, so
+equal integral means the wide box's PER-CELL COUNT is ~5.3x lower. That is
+correct, deliberate, and is what the handover measurement (14 vs 12.5
+voxel-lengths) confirmed. But `raymarch.wgsl`'s `gasErode` thresholds on a
+per-cell COUNT against `GAS_CORE_COUNT` = 51.2, and `GAS_ERODE` = 0.6 erases
+everything below 0.6 x 51.2 = **30.7 counts** — the constant's own comment says
+so. So the same fire sat at 60–160 in fine cells (drawn) and 11–30 in wide ones
+(carved to nothing). A big fire escaped because its adds saturate at
+`FAR_PLUME_ADD_MAX` (240) in BOTH boxes; that is precisely "the big fire smokes
+at distance and the small trees do not, while midrange is fine for all of them".
+
+`GAS_CORE_COUNT_WIDE` is now derived from the same two numbers the deposit
+divides by (51.2 x 1.5/8 = 9.6) and `gasErode` takes the core as a parameter.
+Measured on the new fixture: a tree-sized fire peaks at 5 in the wide box
+against a core of 9.6 (shape 0.52) and at ~27 in the fine box against 51.2
+(shape 0.53) — **the two boxes now agree on how eroded a given fire is**, which
+is the property that was missing. WGSL-only; no rebuild, no hash move.
+`check_invariants.py` pins raymarch's mirrored `GAS_CORE_WIDE_FILL` against
+sim_gas's `FAR_PLUME_WIDE_FILL`, because the two drifting apart does not crash,
+does not move a hash, and is invisible to every gate — the erosion is a
+RENDER-side function and the gates read the density box.
+
+**Seventh round, and it is the sixth seen from the other side.** The report
+after the threshold fix: *"billowing clouds from locations with no fire or
+extremely minimal amounts."*
+
+`gasFarPlumeWide`'s size term was `clamp(sqrt(cols), 1.0, 4.0)`, and `cols` is
+`strength / kGasFarEmitStrengthMax` — so **hMul = 1 means one FULL fine column
+of fire**, a whole 16-voxel-deep chunk column saturated. Flooring the clamp
+there gave a chunk with three hot voxels in it the same 28 m column at the same
+4.3 m radius as a burning tree, only fainter: **only the MASS ever scaled with
+`cols`, never the SIZE.** The comment above the constant had said the intent all
+along ("one burning tree is a wisp; a burning hillside is a column four times as
+tall") and the floor stopped it one step short of meaning anything.
+
+That was survivable only while the renderer eroded faint full-size columns away,
+and it stopped being survivable the moment `GAS_CORE_COUNT_WIDE` fixed the
+threshold that was doing it. **Rounds six and seven are one defect seen from
+either side** — size that does not follow the fire, with an erosion threshold
+accidentally standing in for it — which is why fixing the threshold flipped the
+report from "no smoke" straight to "too much smoke". `FAR_PLUME_WIDE_HMIN`
+(0.05) is now a minimum visible wisp rather than a full column; below it a
+deposit rounds to zero anyway, so the bound is about keeping the puff radius off
+exactly zero.
+
+Measured: the whole-chunk fixture is **unchanged** (`cols` 3.99, hMul 2.0, peak
+129 — big fires never touched this floor), and the tree-sized one goes from a
+28 m column at peak 5 to a 14 m one at peak 4. The per-cell density barely
+moves, which is the point: what shrank is the column, not the opacity.
+
+And a second route to the same picture was closed on the CPU side: the wide
+bucket **coarsening added in round five is now capped at two doublings**. Merging
+buckets CONCENTRATES MASS AT ONE POSITION — an aggregate stands at its topmost
+member's coordinate and carries the SUM of its members' strengths, which the
+shader reads as "how big is this fire" — so unbounded coarsening could collapse
+a scatter of small fires into one record drawing a 4x-height column somewhere
+none of them was. At x4 the bucket is 25.6 m, a genuinely local cluster.
+
+`gas-farplume2` grew **arm E** for the half a gate CAN see: every other arm there
+paints a whole chunk of ember (~4,000 hot voxels, four saturated columns), which
+is one to two orders of magnitude more than a burning tree and sat far above the
+threshold the whole time. Arm E keeps one hot voxel in sixteen and asserts the
+wide deposit does not collapse. It is a floor on the DEPOSIT, not a look target;
+the look half is the invariant pin.
+
+...and **arm F** for the caps: 81 whole burning chunks (~324 emitters) against
+the 256-record fine section, plus one chunk placed unambiguously FARTHER from
+the window centre than any of them, so the nearest-first cap is guaranteed to
+reject it. Measured `fine 256/256 (68 promoted to wide)` and, over that farthest
+chunk's own column, **`fine 0, wide 3054`** — the empty fine column beside the
+full wide one is what distinguishes "promoted" from "it was in the fine list all
+along", and under the old code that chunk had no smoke in either box.
 
 **The second round (same day): the wide cell is anisotropic, the animation is
 continuous, and the index can explain itself.** Three more reports against the

@@ -764,6 +764,22 @@ struct PlumeRun {
   uint32_t colMax = 0, ctrlMax = 0;
   uint64_t colSum = 0, ctrlSum = 0;
   uint64_t loSum = 0, hiSum = 0;       // the column box's -x / +x halves
+  // The LONG-RANGE box over the SAME column. Arm E (the crossfade shell): this
+  // fixture stands 376 voxels from the window centre in the max norm, which is
+  // inside world.h kGasFarBlendVox of the fine box's face, so the emitter must
+  // be in BOTH lists and this must be non-zero.
+  uint32_t wideMax = 0;
+  uint64_t wideSum = 0, wideCtrlSum = 0;
+  // Arm F only: the FARTHEST burning chunk's own column, read in both boxes.
+  // It is the one the nearest-first fine cap must have rejected, so the fine
+  // box must be empty over it and the wide box must not be.
+  uint64_t farColFineSum = 0, farColWideSum = 0;
+  // ARM G, the FLAME box (world.h kGasFlameWords), fine grid, over the same
+  // two columns. `fire` is CLASS_GAS and never reaches the far cascade, so
+  // this box is the only place a fire outside the window HAS a flame; a zero
+  // here with emitters present means the flame splat is not running.
+  uint32_t flameMax = 0;
+  uint64_t flameSum = 0, flameCtrlSum = 0;
   uint32_t renderFlagTicks = 0;
 };
 
@@ -835,6 +851,26 @@ Status GateGasFarPlume(Ctx& c, std::string& detail) {
              "be dropped as a live fire and the gate would measure nothing";
     return Status::Fail;
   }
+  // ...and it must land inside the fine/wide CROSSFADE SHELL (world.h
+  // kGasFarBlendVox), which since 2026-09-19 is the WHOLE band an emitter can
+  // be in the fine list: arm E below asserts this emitter reaches BOTH lists,
+  // and that claim is only meaningful if the site is in the shell. Derived
+  // from the site and the constant, never compared against a literal distance
+  // (memory: gotcha-gate-hardcodes-fixture-site).
+  const int ctrX = wo.x * (int)kChunk + (int)kWorldN / 2;
+  const int ctrY = wo.y * (int)kChunk + (int)kWorldN / 2;
+  const int ctrZ = wo.z * (int)kChunk + (int)kWorldN / 2;
+  const int fixMx = std::max(
+      std::abs(wcOut.x * (int)kChunk + (int)kChunk / 2 - ctrX),
+      std::max(std::abs(wcOut.y * (int)kChunk + (int)kChunk / 2 - ctrY),
+               std::abs(wcOut.z * (int)kChunk + (int)kChunk / 2 - ctrZ)));
+  if (fixMx <= (int)kWorldN - kGasFarBlendVox || fixMx >= (int)kWorldN) {
+    detail = Format("the fixture sits %d voxels from the window centre, which "
+                    "is outside the fine/wide crossfade shell (%d..%d) - arm E "
+                    "would be asserting nothing",
+                    fixMx, (int)kWorldN - kGasFarBlendVox, (int)kWorldN);
+    return Status::Fail;
+  }
 
   // ---- harvest the words the eviction path would have handed the index ----
   SubmitWorldgen(ctx, world, sim, kDefaultSeed);
@@ -872,7 +908,26 @@ Status GateGasFarPlume(Ctx& c, std::string& detail) {
   // `withEmitters` is the ONLY thing that differs between arms A and B, which
   // is what makes the hash comparison a claim about this feature and not about
   // the fixture.
-  auto run = [&](bool withEmitters, bool windEast) -> PlumeRun {
+  // THE CAP ARM's fixture (arm F). `capFill` is a block of burning chunks big
+  // enough that its emitters overflow the fine section on their own, and
+  // `wcFar` is one more chunk placed unambiguously FARTHER from the window
+  // centre than any of them -- so the nearest-first cap is guaranteed to
+  // reject it and the promotion is guaranteed to be what draws it. Both are
+  // anchored to WindowOrigin and sized from kGasFarEmitMax, never literals.
+  std::vector<IVec3> capFill;
+  for (int dy = 0; dy < 4; dy++)
+    for (int dz = 0; dz < 20; dz++)
+      capFill.push_back({wo.x - 8, wo.y + 18 + dy, wo.z + 4 + dz});
+  const IVec3 wcFar{wo.x - 8, wo.y + 20, wo.z + 40};
+  // Its own probe column, far enough from the filler block that no filler
+  // plume can reach it: 17 chunks of z is 272 voxels and a plume is ~40 wide.
+  const int fx = wcFar.x * (int)kChunk + (int)kChunk / 2;
+  const int fz = wcFar.z * (int)kChunk + (int)kChunk / 2;
+  const IVec3 farLo{fx - half, wcFar.y * (int)kChunk, fz - half};
+  const IVec3 farHi{fx + half, wcFar.y * (int)kChunk + reach, fz + half};
+
+  // mode 0 = the one-chunk fixture, 1 = no emitters at all, 2 = the cap arm.
+  auto run = [&](int mode, bool windEast) -> PlumeRun {
     PlumeRun r;
     {
       Tuning t = saved;
@@ -883,6 +938,7 @@ Status GateGasFarPlume(Ctx& c, std::string& detail) {
       // running on the far-emitter half of the union alone.
       t.sim.gasMode = (int)kGasModeWall;
       t.render.farPlumeStrength = 1.0f;
+      t.render.farFlameStrength = 1.0f;
       t.sim.windMode = windEast ? (int)kWindModeDrift : (int)kWindModeOff;
       t.wind.weatherAuto = false;
       t.wind.windDirDeg = 90.0f;     // +x, as the `wind-gas` gate establishes
@@ -893,7 +949,11 @@ Status GateGasFarPlume(Ctx& c, std::string& detail) {
     SubmitWorldgen(ctx, world, sim, kDefaultSeed);
     ctx.WaitIdle();
     plumes.Clear();
-    if (withEmitters) plumes.NoteChunk(wcOut, words.data());
+    if (mode == 0) plumes.NoteChunk(wcOut, words.data());
+    if (mode == 2) {
+      for (const IVec3& wc : capFill) plumes.NoteChunk(wc, words.data());
+      plumes.NoteChunk(wcFar, words.data());
+    }
 
     for (uint32_t i = 1; i <= ticks; i++) {
       SubmitTick(ctx, world, sim, i, kDefaultSeed, {}, {}, {}, true,
@@ -911,21 +971,43 @@ Status GateGasFarPlume(Ctx& c, std::string& detail) {
                         {px - 1, colHi.y, colHi.z}, nullptr, &r.loSum);
     ReadGasOuterBoxSync(ctx, world, {px + 1, colLo.y, colLo.z}, colHi,
                         nullptr, &r.hiSum);
+    ReadGasFarOuterBoxSync(ctx, world, colLo, colHi, &r.wideMax, &r.wideSum);
+    ReadGasFarOuterBoxSync(ctx, world, ctlLo, ctlHi, nullptr, &r.wideCtrlSum);
+    ReadGasFlameBoxSync(ctx, world, colLo, colHi, &r.flameMax, &r.flameSum);
+    ReadGasFlameBoxSync(ctx, world, ctlLo, ctlHi, nullptr, &r.flameCtrlSum);
+    if (mode == 2) {
+      ReadGasOuterBoxSync(ctx, world, farLo, farHi, nullptr, &r.farColFineSum);
+      ReadGasFarOuterBoxSync(ctx, world, farLo, farHi, nullptr, &r.farColWideSum);
+    }
     return r;
   };
 
-  const PlumeRun a = run(true, false);
+  const PlumeRun a = run(0, false);
   const uint32_t emitters = plumes.Count();
   const uint64_t refusedChunks = plumes.RefusedChunks();
+  // Latched HERE, not read at format time: arm F leaves 81 chunks in the
+  // index and this phrase is about arm A's one-chunk fixture.
+  const size_t indexChunks = plumes.Chunks();
 
   // ---- arm D: the off switch, measured as a box nobody cleared ------------
   // Continues from arm A WITHOUT resetting anything, so the box still holds
   // arm A's plume. With gasMode 0 already and farPlumeStrength now 0, the
   // emitter count goes to zero, C_GASOUT is false, and the clear is not
   // recorded — so four more ticks must leave the box exactly as it was.
+  //
+  // render.farFlameStrength GOES OFF TOO, and it is not a broadening of the
+  // arm's claim — it is what keeps the claim the one the arm was written to
+  // make. The far fire LOD grew a second half (world.h kGasFlameWords): the
+  // flame splats run over the SAME two emitter lists under their own knob, and
+  // SetGasRenderActive is their render flag as well as the plume's. With the
+  // flame still on, `offFlagTicks` counts the flame's ticks and the arm reads
+  // as "the plume off switch leaks" when nothing of the sort has happened.
+  // What this arm measures is "with every far-fire condition false, is any gas
+  // row recorded at all", so every far-fire condition is what it must set.
   {
     Tuning t = CurrentTuning();
     t.render.farPlumeStrength = 0.0f;
+    t.render.farFlameStrength = 0.0f;
     SetCurrentTuning(t);
   }
   uint32_t offFlagTicks = 0;
@@ -941,8 +1023,21 @@ Status GateGasFarPlume(Ctx& c, std::string& detail) {
   ReadGasOuterBoxSync(ctx, world, colLo, colHi, &offMax, &offSum);
   const uint32_t offCount = sim.FarPlumeCount();
 
-  const PlumeRun b = run(false, false);
-  const PlumeRun w = run(true, true);
+  const PlumeRun b = run(1, false);
+  const PlumeRun w = run(0, true);
+  // ---- arm F: the fine cap OVERFLOWS, and nothing goes silent -------------
+  // 81 whole burning chunks -> ~324 column emitters against a 256-record fine
+  // section. Before 2026-09-19 the surplus was simply deleted, which is how a
+  // handful of burning trees could switch off the smoke of every other fire in
+  // the world. It is now PROMOTED to the wide list, so the farthest chunk --
+  // the one the nearest-first cap is guaranteed to have rejected -- must have
+  // an empty fine column and a non-empty wide one.
+  const PlumeRun f = run(2, false);
+  const uint32_t capFine = plumes.Count();
+  const uint32_t capWide = plumes.CountWide();
+  const uint32_t capPromoted = plumes.FinePromoted();
+  const uint32_t capBucket = plumes.WideBucketScale();
+  const uint64_t capRefused = plumes.RefusedChunks();
   SetCurrentTuning(saved);
 
   // ---- the assertions -----------------------------------------------------
@@ -957,6 +1052,47 @@ Status GateGasFarPlume(Ctx& c, std::string& detail) {
   const bool placed = a.ctrlSum == 0;
   const bool flagged = a.renderFlagTicks == ticks;
   const bool quiet = b.colSum == 0 && b.ctrlSum == 0 && b.renderFlagTicks == 0;
+  // ARM E, THE CROSSFADE SHELL. The fixture is inside kGasFarBlendVox of the
+  // fine box's face (checked above), so the CPU must have put it in BOTH lists
+  // with complementary weights and the LONG-RANGE box must hold the fading-in
+  // twin of the plume arm A just measured in the near box. Non-zero, not a
+  // floor: the weight at this distance is a smoothstep of the site and pinning
+  // a number would re-pin the gate every time the shell is retuned.
+  //
+  // PAIRED WITH THE CONTROL COLUMN, not with the no-emitter arm — and that is
+  // not a convenience, it is arm D's rule applied to the other box. With no
+  // emitters there is no wide row, so nothing CLEARS the wide box and arm B
+  // reads arm A's plume still sitting in it; "empty with no emitters" is a
+  // claim the feature is designed to make false. What makes this arm A's own
+  // plume rather than anyone's leftovers is that it is over the FIRE and the
+  // control column a quarter of the box away is exactly zero.
+  const bool faded = a.wideSum > 0 && a.wideCtrlSum == 0;
+  // ARM G, THE FLAME. The other half of the far fire LOD (world.h
+  // kGasFlameWords), and the half that exists because `fire` is CLASS_GAS and
+  // is therefore never written to the far cascade at ALL -- so outside the
+  // window a fire has embers and no flame until this box supplies one.
+  //
+  // PAIRED WITH THE CONTROL COLUMN for arm E's reason, restated because it is
+  // the mistake this file has made before: with no emitters there is no flame
+  // row, so nothing clears the flame box and arm B would read arm A's flame
+  // still sitting in it. "Empty with no emitters" is a claim the feature is
+  // designed to make false. What makes this arm A's own flame is that it is
+  // over the FIRE while the control column a quarter of the box away is zero.
+  //
+  // Non-zero rather than a floor, for arm E's reason as well: the deposit is
+  // a smoothstepped crossfade weight times a per-fire pulse times a per-puff
+  // billow, and pinning a number here would re-pin the gate to the look.
+  const bool flamed = a.flameSum > 0 && a.flameMax > 0 && a.flameCtrlSum == 0;
+  // ARM F. Three claims that only mean something together: the cap really was
+  // the bound (a fixture that fits proves nothing), the surplus was PROMOTED
+  // rather than dropped, and the promotion is visible as DENSITY -- over the
+  // farthest chunk specifically, which is the one that cannot have been kept.
+  // The empty FINE column beside the full wide one is what distinguishes
+  // "promoted" from "it was in the fine list all along".
+  const bool capBound =
+      capFine == kGasFarEmitMax && capPromoted > 0 && capRefused == 0;
+  const bool capDrawn =
+      f.farColWideSum > 0 && f.farColFineSum == 0 && capWide > 0;
 
   uint32_t compared = 0, divergedAt = 0;
   for (const auto& kv : a.hash) {
@@ -992,19 +1128,33 @@ Status GateGasFarPlume(Ctx& c, std::string& detail) {
       "material %s (id %u) | %u/%u voxels painted -> %u emitters in range "
       "(index holds %zu chunks, %llu refused) | column box: max %u (floor %u), "
       "sum %llu (floor %llu) | control box the same size: max %u, sum %llu | "
+      "CROSSFADE SHELL at %d vox (shell %d..%d): wide box over the same column "
+      "max %u, sum %llu (the fading-in twin), control column %llu | "
+      "CAP arm: %zu chunks -> fine %u/%u (%u promoted to wide), wide %u at "
+      "bucket x%u, %llu refused; the FARTHEST chunk column: fine %llu (must be "
+      "0), wide %llu | "
       "render flag %u/%u ticks | NO-EMITTER arm: column %llu, control %llu, "
       "flag %u ticks, world hash identical over %u ticks (%s) | wind arm: "
       "downwind %llu vs upwind %llu | OFF arm: column %llu/max %u (was "
       "%llu/%u), %u still in the buffer, flag %u/4 ticks",
       c.mats[hotId].name.c_str(), hotId, painted, kChunkVol, emitters,
-      plumes.Chunks(), (unsigned long long)refusedChunks, a.colMax, minMax,
+      indexChunks, (unsigned long long)refusedChunks, a.colMax, minMax,
       (unsigned long long)a.colSum, (unsigned long long)minSum, a.ctrlMax,
-      (unsigned long long)a.ctrlSum, a.renderFlagTicks, ticks,
+      (unsigned long long)a.ctrlSum, fixMx, (int)kWorldN - kGasFarBlendVox,
+      (int)kWorldN, a.wideMax, (unsigned long long)a.wideSum,
+      (unsigned long long)a.wideCtrlSum, capFill.size() + 1, capFine,
+      kGasFarEmitMax, capPromoted, capWide, capBucket,
+      (unsigned long long)capRefused, (unsigned long long)f.farColFineSum,
+      (unsigned long long)f.farColWideSum, a.renderFlagTicks, ticks,
       (unsigned long long)b.colSum, (unsigned long long)b.ctrlSum,
       b.renderFlagTicks, compared, inert ? "INERT" : "MOVED",
       (unsigned long long)w.hiSum, (unsigned long long)w.loSum,
       (unsigned long long)offSum, offMax, (unsigned long long)a.colSum,
       a.colMax, offCount, offFlagTicks);
+  detail += Format(" | FLAME box over the same column: max %u, sum %llu, "
+                   "control %llu",
+                   a.flameMax, (unsigned long long)a.flameSum,
+                   (unsigned long long)a.flameCtrlSum);
 
   if (!noted)
     detail += " -- the fixture never reached the index: the paint or the "
@@ -1018,6 +1168,11 @@ Status GateGasFarPlume(Ctx& c, std::string& detail) {
   if (!flagged)
     detail += " -- the gas RENDER flag did not arm on every tick, so the "
               "raymarcher skips the box the splat just filled";
+  if (!flamed)
+    detail += " -- NO FLAME over the frozen fire: the flame box is empty (or "
+              "the control column is not), so a fire outside the window still "
+              "has embers and nothing above them -- which is the pop this "
+              "feature exists to remove";
   if (!quiet)
     detail += " -- the box is not empty with NO emitters: something else is "
               "writing it and arm A measured that instead";
@@ -1031,13 +1186,34 @@ Status GateGasFarPlume(Ctx& c, std::string& detail) {
   if (!drifted)
     detail += " -- the plume does not lean downwind in a 20 m/s east wind: the "
               "wind wire in gasFarPlume is dead";
+  if (!faded)
+    detail += a.wideSum == 0
+                  ? " -- the LONG-RANGE box is EMPTY over a fire inside the "
+                    "crossfade shell: the fine/wide handover is a hard split "
+                    "again and the coarse plume will pop in at the fine box's "
+                    "face"
+                  : " -- the wide box's CONTROL column is not zero, so the "
+                    "fading-in twin is not where the fire is";
   if (!offExact)
     detail += " -- at render.farPlumeStrength 0 with sim.gasMode 0 the density "
               "box CHANGED, so a gas row is still being recorded in a world "
               "where every gas condition is false";
 
+  if (!capBound)
+    detail += " -- the cap arm did not actually overflow the fine section (or "
+              "the INDEX refused chunks first), so it asserts nothing about "
+              "what happens when it does";
+  if (!capDrawn)
+    detail += f.farColWideSum == 0
+                  ? " -- THE FARTHEST BURNING CHUNK HAS NO SMOKE: the fine cap "
+                    "dropped it instead of promoting it to the wide list, "
+                    "which is the bug where a big fire silences every other "
+                    "fire in the world"
+                  : " -- the farthest chunk is in the FINE box, so the cap did "
+                    "not reject it and the promotion is untested";
   const bool ok = noted && drawn && placed && flagged && quiet && inert &&
-                  drifted && offExact;
+                  drifted && offExact && faded && capBound && capDrawn &&
+                  flamed;
   std::printf("gas-farplume: %s (%s)\n", ok ? "PASS" : "FAIL", detail.c_str());
 
   // Leave the world as it was found (rule 7), index included: an emitter left
@@ -1063,17 +1239,23 @@ Status GateGasFarPlume(Ctx& c, std::string& detail) {
 // THE FIXTURE is `gas-farplume`'s, moved out. The same harvested ember chunk is
 // handed to the index at a coordinate ~200 m from the window centre instead of
 // ~13 m outside it, which is the one thing that decides which of the two
-// disjoint emitter lists it lands in.
+// emitter lists it lands in. The lists are no longer disjoint EVERYWHERE --
+// since world.h kGasFarBlendVox became the whole fine band, everything from
+// the window face to the fine box's face is in both with complementary
+// weights, and `gas-farplume` arm E asserts exactly that. They are still
+// disjoint out HERE, past the shell, which is what claim B below reads.
 //
 // FOUR CLAIMS, and the first two are a PAIR — neither means anything alone:
 //
 //   A. THE FAR PLUME EXISTS. Density in the long-range box over the frozen
 //      fire's column, and exactly ZERO over a control column the same size.
 //   B. IT IS IN THE RIGHT BOX. The near box must be EMPTY over the same site,
-//      and the fine emitter count must be 0 while the wide one is not. That is
-//      the disjointness of the two lists asserted rather than assumed, and it
-//      is what makes "no double-brightening" a property of the data. Without
-//      it a bug that put every emitter in both lists would pass A.
+//      and the fine emitter count must be 0 while the wide one is not. PAST
+//      THE CROSSFADE SHELL the two lists are still strictly disjoint, and this
+//      asserts it rather than assuming it -- a bug that put every emitter in
+//      both lists at every distance would pass A, and would double-brighten
+//      every distant fire. What stops the shell from being that bug is that
+//      its two weights sum to 255, which is a property of the data here too.
 //   C. THE WORLD DID NOT MOVE. The same fixture with the wide list EMPTY, and
 //      the per-tick world hash series must be IDENTICAL — the render-only
 //      claim, repeated for the long-range half, as a differential rather than
@@ -1162,6 +1344,27 @@ Status GateGasFarPlume2(Ctx& c, std::string& detail) {
   SubmitWorldgen(ctx, world, sim, kDefaultSeed);
   ctx.WaitIdle();
 
+  // ---- arm E's fixture: a TREE-SIZED fire, not a solid chunk of ember -----
+  // Every other arm here paints a WHOLE chunk, which is ~4,000 hot voxels and
+  // four saturated columns. A burning tree is one or two orders of magnitude
+  // less than that, and the wide splat's mass is LINEAR in the column count it
+  // aggregates -- so the whole-chunk fixture sat comfortably above the
+  // renderer's erosion threshold while a tree sat under it and was carved to
+  // nothing. That is the "the big fire smokes at distance and the small trees
+  // do not" report, and no arm could see it. `sparseDiv` is how much of the
+  // chunk stays alight.
+  const int sparseDiv = (int)BaselineNumber("gasFarPlume2SparseDiv", 16);
+  std::vector<uint32_t> sparse(words);
+  uint32_t sparseHot = 0;
+  {
+    uint32_t seen = 0;
+    for (uint32_t i = 0; i < kChunkVol; i++) {
+      if ((sparse[i] & 0xFFFu) != hotId) continue;
+      if ((seen++ % (uint32_t)sparseDiv) == 0) { sparseHot++; continue; }
+      sparse[i] = 0u;   // air
+    }
+  }
+
   // The probe boxes. The coarse cell is 6.4 m and a WIDE emitter's column is
   // stretched by how big the fire is, so the box is generous in every axis;
   // the control is the same shape a quarter of the far box away in z.
@@ -1177,15 +1380,26 @@ Status GateGasFarPlume2(Ctx& c, std::string& detail) {
 
   const Tuning saved = CurrentTuning();
 
+  // ...and its own site, far enough from arm A's that the two plumes cannot
+  // overlap: 64 chunks of z is 1,024 voxels against a wide column a few cells
+  // across.
+  const IVec3 wcSparse{wcOut.x, wcOut.y, wcOut.z + 64};
+  const int spz = wcSparse.z * (int)kChunk + (int)kChunk / 2;
+  const IVec3 spLo{exv - half, pyBase, spz - half};
+  const IVec3 spHi{exv + half, pyBase + reach, spz + half};
+
   struct Run {
     std::map<uint32_t, uint32_t> hash;
     uint32_t wideMax = 0, ctrlMax = 0, fineMax = 0;
+    uint32_t spMax = 0;
+    uint64_t spSum = 0;
     uint64_t wideSum = 0, ctrlSum = 0, fineSum = 0;
     uint32_t farFlagTicks = 0, nearFlagTicks = 0;
     uint32_t emittersFine = 0, emittersWide = 0;
   };
 
-  auto run = [&](bool withEmitters) -> Run {
+  // mode 0 = the whole-chunk fixture, 1 = no emitters, 2 = the tree-sized one.
+  auto run = [&](int mode) -> Run {
     Run r;
     {
       Tuning t = saved;
@@ -1200,7 +1414,8 @@ Status GateGasFarPlume2(Ctx& c, std::string& detail) {
     SubmitWorldgen(ctx, world, sim, kDefaultSeed);
     ctx.WaitIdle();
     plumes.Clear();
-    if (withEmitters) plumes.NoteChunk(wcOut, words.data());
+    if (mode == 0) plumes.NoteChunk(wcOut, words.data());
+    if (mode == 2) plumes.NoteChunk(wcSparse, sparse.data());
 
     for (uint32_t i = 1; i <= ticks; i++) {
       SubmitTick(ctx, world, sim, i, kDefaultSeed, {}, {}, {}, true,
@@ -1218,13 +1433,16 @@ Status GateGasFarPlume2(Ctx& c, std::string& detail) {
     ReadGasFarOuterBoxSync(ctx, world, colLo, colHi, &r.wideMax, &r.wideSum);
     ReadGasFarOuterBoxSync(ctx, world, ctlLo, ctlHi, &r.ctrlMax, &r.ctrlSum);
     // THE NEAR BOX OVER THE SAME SITE. It must be empty, and that is claim B:
-    // the two emitter lists are disjoint, so a fire this far out must be drawn
-    // by exactly one of them.
+    // this fixture is far PAST the crossfade shell (world.h kGasFarBlendVox),
+    // where the two lists are still strictly disjoint, so a fire this far out
+    // must be drawn by exactly one of them.
     ReadGasOuterBoxSync(ctx, world, colLo, colHi, &r.fineMax, &r.fineSum);
+    if (mode == 2) ReadGasFarOuterBoxSync(ctx, world, spLo, spHi, &r.spMax,
+                                          &r.spSum);
     return r;
   };
 
-  const Run a = run(true);
+  const Run a = run(0);
 
   // ---- arm D: render.farPlumeRange 0, measured as a box nobody cleared ----
   {
@@ -1245,7 +1463,13 @@ Status GateGasFarPlume2(Ctx& c, std::string& detail) {
   ReadGasFarOuterBoxSync(ctx, world, colLo, colHi, &offMax, &offSum);
   const uint32_t offWide = sim.FarPlumeWideCount();
 
-  const Run b = run(false);
+  const Run b = run(1);
+  // ---- arm E: a TREE-SIZED fire at the same distance ----------------------
+  // The wide splat's mass is LINEAR in the columns it aggregates and the
+  // renderer erodes anything under GAS_ERODE x its core threshold to nothing,
+  // so "does a whole chunk of ember show up" and "does a tree show up" are
+  // different questions. Only the second one was ever asked by a player.
+  const Run e = run(2);
   SetCurrentTuning(saved);
 
   // ---- the assertions -----------------------------------------------------
@@ -1255,6 +1479,15 @@ Status GateGasFarPlume2(Ctx& c, std::string& detail) {
   // Claim B: the fire is in the WIDE list and only there, and the near box
   // holds nothing over it.
   const bool disjoint = a.emittersFine == 0 && a.fineSum == 0;
+  // ARM E. The floor is the renderer's own erasure threshold for THIS box:
+  // gasErode carves everything below GAS_ERODE x GAS_CORE_COUNT_WIDE to
+  // exactly zero, so a peak cell under it is a plume the player cannot see
+  // however much the box says is in it. In baseline.json rather than here
+  // because it mirrors two WGSL constants and a tuned threshold should not
+  // cost a rebuild; check_invariants.py pins the WGSL half.
+  const uint32_t spFloor =
+      (uint32_t)BaselineNumber("gasFarPlume2SparseMinCellMax", 6);
+  const bool sparseDrawn = e.spMax >= spFloor && e.spSum > 0;
   const bool flagged = a.farFlagTicks == ticks;
   // THE NO-EMITTER ARM'S BOX IS NOT EMPTY, AND THAT IS THE POINT. The
   // long-range box is cleared only on ticks its own row is recorded, and with
@@ -1284,7 +1517,9 @@ Status GateGasFarPlume2(Ctx& c, std::string& detail) {
 
   detail = Format(
       "material %s (id %u) | %u/%u painted, frozen fire %d chunks (%.1f m) out "
-      "-> %u WIDE emitters and %u fine | long-range box over its column: max %u "
+      "-> %u WIDE emitters and %u fine | TREE arm: %u hot voxels (1/%d of the "
+      "chunk) -> wide column peak %u (erosion floor %u), sum %llu | "
+      "long-range box over its column: max %u "
       "(floor %u), sum %llu (floor %llu) | control box the same size: max %u, "
       "sum %llu | the NEAR box over the same column: max %u, sum %llu (must be "
       "0 - the lists are disjoint) | far render flag %u/%u ticks, near flag "
@@ -1295,6 +1530,7 @@ Status GateGasFarPlume2(Ctx& c, std::string& detail) {
       "%llu/%u), %u wide emitters, flag %u/4 ticks",
       c.mats[hotId].name.c_str(), hotId, painted, kChunkVol, outChunks,
       (double)outChunks * kChunk * kVoxelMeters, a.emittersWide, a.emittersFine,
+      sparseHot, sparseDiv, e.spMax, spFloor, (unsigned long long)e.spSum,
       a.wideMax, minMax, (unsigned long long)a.wideSum,
       (unsigned long long)minSum, a.ctrlMax, (unsigned long long)a.ctrlSum,
       a.fineMax, (unsigned long long)a.fineSum, a.farFlagTicks, ticks,
@@ -1334,8 +1570,13 @@ Status GateGasFarPlume2(Ctx& c, std::string& detail) {
     detail += " -- at render.farPlumeRange 0 the long-range box CHANGED, so a "
               "row is still being recorded for a band with no emitters in it";
 
+  if (!sparseDrawn)
+    detail += Format(" -- A TREE-SIZED FIRE IS INVISIBLE AT DISTANCE: peak %u "
+                     "in the long-range box against the %u the renderer erodes "
+                     "away, so only big fires get distant smoke",
+                     e.spMax, spFloor);
   const bool ok = noted && drawn && placed && disjoint && flagged && quiet &&
-                  inert && offExact;
+                  inert && offExact && sparseDrawn;
   std::printf("gas-farplume2: %s (%s)\n", ok ? "PASS" : "FAIL", detail.c_str());
 
   plumes.Clear();

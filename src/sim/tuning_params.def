@@ -552,6 +552,16 @@ TP_F(render, farPlumeHeight, TUNE_FAR_PLUME_HEIGHT, 28.0f)
 // switch for the whole long-range half.
 TP_F(render, farPlumeRange, TUNE_FAR_PLUME_RANGE, 3276.8f)
 
+// ---- far FIRE LOD: the frozen ember's breath, and the synthesized flame ----
+// `fire` is CLASS_GAS and never reaches the far cascade, so outside the window
+// a fire is embers with no flame and nothing about it moves. farEmberPlasma is
+// the amplitude of the crawl+pulse over a cascade ember's emission (0 = exact
+// off switch, the fbm calls are not made); farFlame* shape the short emissive
+// column synthesized from the same emitter list the smoke comes from.
+TP_F(render, farEmberPlasma, TUNE_FAR_EMBER_PLASMA, 0.55f)
+TP_F(render, farFlameStrength, TUNE_FAR_FLAME_STRENGTH, 1.0f)
+TP_F(render, farFlameHeight, TUNE_FAR_FLAME_HEIGHT, 4.0f)
+
 // ---- in-window LOD handoff (PLAN_surface_flight_perf.md A1) ----
 TP_F(render, lodHandoffDist, TUNE_LOD_HANDOFF_DIST, 24.0f)
 TP_F(render, shadowMaxDist, TUNE_SHADOW_MAX_DIST, 999.0f)

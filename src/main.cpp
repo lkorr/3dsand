@@ -7895,6 +7895,14 @@ int main(int argc, char** argv) {
       // most one 1-chunk shift per axis)
       IVec3 playerChunkNow{ifloor(player.pos.x) >> 4, ifloor(player.pos.y) >> 4,
                            ifloor(player.pos.z) >> 4};
+      // ...and the CONTINUOUS position, for the far-plume crossfade weights.
+      // The chunk coord above is what the window recentres on and is therefore
+      // the wrong input for a weight: it moves 16 voxels at a time. See
+      // world.h kGasFarEyeSlackVox. This is the only caller — a headless
+      // harness never sets it and keeps the window-centre weights it had.
+      if (world.farPlumes)
+        world.farPlumes->SetEye({ifloor(player.pos.x), ifloor(player.pos.y),
+                                 ifloor(player.pos.z)});
       uint32_t farCount = 0;
       {
         // ---- STREAM: the row that flying lights up --------------------

@@ -677,6 +677,9 @@ class Simulation {
   rhi::ComputePipeline gFarPlume_;
   // ...and its long-range sibling (world.h kGasFarOuterN).
   rhi::ComputePipeline gFarPlumeW_;
+  // The far FLAME splats (world.h kGasFlameWords), fine and wide.
+  rhi::ComputePipeline gFarFlame_;
+  rhi::ComputePipeline gFarFlameW_;
   // Live only after PublishFarPipelines. Until then both are INVALID handles
   // and the recorder skips their rows (vk_record.cpp's null-pipeline continue).
   rhi::ComputePipeline farFill_, farPatchFill_, farDown_;

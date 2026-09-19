@@ -1665,6 +1665,10 @@ def check_burn_tint_sites():
             "shadeMolten: lava, an OPAQUE liquid, which can never be foliage",
         ("raymarch.wgsl", "(f32(materials[mat].emission) / 255.0) * fl"):
             "the media march: gases only, and no gas carries the flag",
+        ("raymarch.wgsl", "gasFlameFill * (f32(materials[fireMat].emission)"):
+            "the far flame box: fireMat is resolved by gasFlameMat() to an "
+            "EMISSIVE GAS, and burnTint is a foliage-palette feature that no "
+            "gas carries -- same argument as the media march above",
     }
 
     pat = re.compile(r"emission\s*\)\s*/\s*255\.0")
@@ -1754,6 +1758,14 @@ def check_env_predictions():
     checked.append("env predictions")
 
 
+def _wgsl_float(txt, name):
+    """A `const NAME : f32 = 1.5;` literal, or None. The integer scraper beside
+    this one refuses a decimal point, and the wide box's FILL is a fraction."""
+    m = re.search(r"const\s+" + re.escape(name) + r"\s*:\s*f32\s*=\s*"
+                  r"([0-9]*\.?[0-9]+)\s*;", txt)
+    return float(m.group(1)) if m else None
+
+
 def check_gas_consts():
     """The gas package's three-way agreement (docs/PLAN_gas_particles.md).
 
@@ -1827,6 +1839,7 @@ def check_gas_consts():
         ("kGasFarOuterShiftY", "GAS_FAROUT_SHIFT_Y", [("sim_gas.wgsl", gas),
                                                       ("raymarch.wgsl", raymarch)]),
     ]
+    wgslf = _wgsl_float
     for cname, wname, shaders in pairs:
         want = cxx(cname)
         if want is None:
@@ -1886,6 +1899,37 @@ def check_gas_consts():
                 f"gas: sim_gas.wgsl GAS_FAR_STRENGTH_MAX = {got} but world.h "
                 f"derives kGasFarEmitStrengthMax = {want} from kGasOuterShift "
                 f"({sh}) and kChunk ({ch})")
+
+    # ---- the wide box's own CORE threshold (2026-09-19) ----------------
+    # sim_gas.wgsl's wide deposit scales by FAR_PLUME_WIDE_FILL /
+    # FAR_PLUME_WIDE_CHORD so that a RAY collects the same integral from either
+    # box -- which means the wide box's PER-CELL COUNT is that much lower for
+    # the same plume. raymarch.wgsl's gasErode thresholds on a per-cell COUNT,
+    # so it needs its own core value derived from the SAME ratio, and it
+    # mirrors FILL to get it (CHORD it derives from the two shifts it already
+    # declares).
+    #
+    # These drifting apart does not crash and does not move a hash: it makes
+    # distant smoke either vanish (threshold too high -- the bug this pin was
+    # written for, where a tree-sized fire sat under GAS_ERODE * core and was
+    # carved to nothing while the same fire drew fine at midrange) or turn into
+    # a solid slab (too low). Neither is visible to any gate, because the
+    # erosion is a RENDER-side function and the gates read the density box.
+    fill = wgslf(gas, "FAR_PLUME_WIDE_FILL")
+    mirror = wgslf(raymarch, "GAS_CORE_WIDE_FILL")
+    if fill is None:
+        problems.append("gas: sim_gas.wgsl has no FAR_PLUME_WIDE_FILL")
+    elif mirror is None:
+        problems.append(
+            "gas: raymarch.wgsl does not declare GAS_CORE_WIDE_FILL, which "
+            f"must mirror sim_gas.wgsl FAR_PLUME_WIDE_FILL ({fill}) so the "
+            "wide box's erosion threshold tracks the wide deposit's scale")
+    elif abs(mirror - fill) > 1e-6:
+        problems.append(
+            f"gas: raymarch.wgsl GAS_CORE_WIDE_FILL = {mirror} but "
+            f"sim_gas.wgsl FAR_PLUME_WIDE_FILL = {fill} -- the renderer would "
+            "threshold the long-range box at the wrong density and either "
+            "erase distant plumes or draw them as slabs, with every gate green")
 
     # ---- the gas DIRTY-REASON bits ------------------------------------
     # world.h's kDirtyReasonName is a positional table -- the bit is the row

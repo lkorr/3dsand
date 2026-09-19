@@ -82,6 +82,17 @@ struct TableCtx {
   // the 51.2 m..409.6 m band, and then neither the wide splat nor the wide
   // box's clear is recorded.
   uint32_t gasFarWideCount = 0;
+  // ---- the FLAME box's own counts (world.h kGasFlameWords) ----------------
+  // The same two emitter lists, counted AGAIN under render.farFlameStrength
+  // instead of render.farPlumeStrength. Separate fields rather than a reuse of
+  // the two above because the two halves of the far fire LOD are independently
+  // switchable: "smoke but no flame" is the arm that shows what the flame
+  // costs, and "flame but no smoke" is how the flame's own look is judged
+  // without a column of smoke over it. 0 in either leaves that LOD's splat row
+  // unrecorded; 0 in BOTH leaves the flame box's clear unrecorded too, so the
+  // feature off is no row, not a cheap row (rule 2).
+  uint32_t gasFlameCount = 0;
+  uint32_t gasFlameWideCount = 0;
   // Any loaded material authors a `repose` AND the CA has work this tick
   // (world.h kReposeSnap*). False for a materials.json with no repose line, and
   // then the snapshot prepass is not recorded at all.

@@ -364,6 +364,10 @@ void ReadGasOuterAboveSync(GpuContext& ctx, World& world, int32_t worldY,
 //                          shape of question one LOD out
 void ReadGasOuterBoxSync(GpuContext& ctx, World& world, IVec3 loVox,
                          IVec3 hiVox, uint32_t* outMax, uint64_t* outSum);
+//   ReadGasFlameBoxSync    the FLAME box's FINE grid (world.h kGasFlameWords),
+//                          which shares gasOuter's lattice exactly
+void ReadGasFlameBoxSync(GpuContext& ctx, World& world, IVec3 loVox,
+                         IVec3 hiVox, uint32_t* outMax, uint64_t* outSum);
 void ReadGasFarOuterBoxSync(GpuContext& ctx, World& world, IVec3 loVox,
                             IVec3 hiVox, uint32_t* outMax, uint64_t* outSum);
 uint32_t ReadActiveChunksSync(GpuContext& ctx, World& world, Simulation& sim);

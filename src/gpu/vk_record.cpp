@@ -134,6 +134,15 @@ bool Recorder::CondHolds(pass::Cond c, const RecordCtx& cx) {
     // The union: whoever writes the density box this tick, its clear has
     // to run (pass_table.def's fill_gasOuter note).
     case pass::Cond::GasOuter:   return cx.gasActive || cx.gasFarEmitCount > 0;
+    case pass::Cond::GasFlameFine: return cx.gasFlameCount > 0;
+    case pass::Cond::GasFlameWide: return cx.gasFlameWideCount > 0;
+    // The flame box holds BOTH LODs in one allocation (world.h kGasFlameWords),
+    // so its single clear is the union of its two writers — fill_gasOuter's
+    // argument, in the form the concatenation forces: clearing on a tick only
+    // one grid is splatted also clears the other, which is correct because a
+    // grid with no splat this tick must read as empty and not as last tick's.
+    case pass::Cond::GasFlame:
+      return cx.gasFlameCount > 0 || cx.gasFlameWideCount > 0;
     case pass::Cond::ReposeActive: return cx.reposeActive;
   }
   return false;
@@ -173,6 +182,12 @@ uint32_t Recorder::Extent(uint32_t v, const RecordCtx& cx) {
       return cx.gasFarEmitCount;
     case pass::DispatchSel::GasFarWideSel:
       return cx.gasFarWideCount;
+    // The FLAME splats run over the same two lists, counted under their own
+    // knob (see RecordCtx::gasFlameCount).
+    case pass::DispatchSel::GasFlameSel:
+      return cx.gasFlameCount;
+    case pass::DispatchSel::GasFlameWideSel:
+      return cx.gasFlameWideCount;
     default:                          return v;
   }
 }
