@@ -5572,6 +5572,18 @@ void MobSystem::UpdateAnimation(Mob& mob, const MobDef& def, World& world,
   // and the spine twist do. Free when nothing has hit this creature.
   mob.ApplyHitReact(sk, st, dt);
 
+  // ---- stage 3.55: the one-footed drag (mob.h Mob::TickStumpDrag) ----
+  // Same stage and same reasoning as the avatar's call: pre-flatten, composing
+  // with the bob and the reaction above rather than replacing them. A creature
+  // with both feet is one AnimFindStumpLeg query and out.
+  {
+    const AnimStump stump = mob.TickStumpDrag(dt, !mob.airborne_, clipOwnsPose);
+    mob.TrackStumpContact(world, stump, dt);
+  }
+
+  if (loco && loco->groundAlign > 0.0f)
+    AnimDragDeadLegs(sk, st, mob.speedNow_, st.gaitPhase);
+
   // ---- stage 4: flatten to model space ----
   AnimFlatten(sk, st);
 
@@ -7014,6 +7026,45 @@ void Mob::BleedTick(uint32_t tick, World& world, std::vector<BrushOp>& ops,
     // reason given at the gout: a kill here invalidates `limb`.
     if (!DrainBlood(clumpVox + (float)sprayed * dropletVox)) return;
   }
+
+  // ---- THE STUMP LEAVES A SMEAR (mob.h, the one-footed drag) --------------
+  //
+  // A dragged stump is a wound in continuous contact with the floor, so it
+  // paints one. Deliberately NOT a second bleed source: it spends the same
+  // per-tick op budget the drip does, it costs hp through the same DrainBlood,
+  // and it refuses on the same grounds (a garment does not bleed, a cauterised
+  // wound is closed). What it does differently is WHERE and WHEN — at the
+  // ground contact the pose pass recorded, once per SPACING of travel rather
+  // than once per drip period, so the trail is a line behind the body at any
+  // speed instead of a pool under a body that stopped.
+  //
+  // One voxel, not a clump: a smear is the limb wiping matter along the floor,
+  // and a sphere of blood every stride reads as a bleeding-out, which this is
+  // not (the stump's own drip above is still doing that at the wound).
+  constexpr float kDragSmearSpacing = 1.4f;  // world voxels between marks
+  if (dragContactValid_ && alive_ && dragStumpLimb_ >= 0 &&
+      dragStumpLimb_ < (int)limbs_.size() &&
+      dragTrailDist_ >= kDragSmearSpacing &&
+      bleedOps < gore.bleedOpsPerTick) {
+    MobLimb& stumpLimb = limbs_[dragStumpLimb_];
+    const bool open = stumpLimb.stumpOpen || stumpLimb.bleedBudget >= 1.0f ||
+                      stumpLimb.gushTicks > 0;
+    if (open && !IsWornSlot(dragStumpLimb_) && !WoundCharred(stumpLimb) &&
+        world.CellInWindow({ifloor(dragContact_.x), ifloor(dragContact_.y),
+                            ifloor(dragContact_.z)})) {
+      dragTrailDist_ = 0.0f;
+      ops.push_back({ifloor(dragContact_.x), ifloor(dragContact_.y),
+                     ifloor(dragContact_.z), 0, def.bleedMat,
+                     0 /*paint into air*/, 0, 0});
+      bleedOps++;
+      // Blood on the floor is blood out of the body, by the same measure as
+      // every other drop. Last statement for the usual reason: a kill here
+      // reshapes limbs_ and `stumpLimb` is gone with it.
+      if (!DrainBlood(1.0f)) return;
+    } else if (!open) {
+      dragTrailDist_ = 0.0f;  // a closed stump banks no smear for later
+    }
+  }
 }
 
 // ---- blood is health --------------------------------------------------------
@@ -7794,6 +7845,30 @@ void Mob::EnsureJointCounts(int limbIndex) {
     // decides, exactly as it did before this existed.
     child.socketAtSpawn = n ? n : MobLimb::kSocketUnmeasured;
   }
+}
+
+bool Mob::JointRuleApplies(int limbIndex) const {
+  // BLUNT NEVER AMPUTATES. The owner's spec, and the one exclusion here that is
+  // about the weapon rather than about the physics (Mob::BluntCarveScope).
+  if (inBluntCarve_) return false;
+  // FIRE KEEPS ITS OWN ACCOUNT — the same carve-out HpZeroSevers makes, for a
+  // sharper reason than "the gate says so". A joint measure is taken at a point
+  // CLAMPED to the limb's surface (the anchor is a rig point and usually sits
+  // on or past the model's face), and fire eats the SURFACE first and by
+  // definition: the neck sample is therefore the fastest-emptying region of a
+  // burning limb, and generalising the rule to it decapitated a body at 87% of
+  // its spawn volume 30 ticks in, before any of the charring the `mob-burn`
+  // gate exists to describe. A creature burns through and chars; it does not
+  // come apart at the joints.
+  //
+  // ROT IS NOT FIRE even though it shares FlushBurn's plumbing. An infection
+  // is local by construction — it works out from the bite through the tissue it
+  // is touching, so when it reaches a joint it is genuinely eating that joint,
+  // which is the whole of what this rule wants to know. So the test is "is this
+  // limb infected", not "is this a burn flush".
+  if (!inBurnFlush_) return true;
+  if (limbIndex < 0 || limbIndex >= (int)limbs_.size()) return false;
+  return limbs_[limbIndex].infectMat != 0;
 }
 
 bool Mob::JointAttached(int limbIndex) const {
@@ -10266,7 +10341,7 @@ bool Mob::CarveLimb(int limbIndex, World& world,
   // first. Blunt keeps its exclusion (it never amputates, however many land).
   //
   // Bounded: one or two passes over a lattice, on a tick that already carved.
-  if (!inBluntCarve_ && !JointAttached(limbIndex)) {
+  if (JointRuleApplies(limbIndex) && !JointAttached(limbIndex)) {
     Sever(limbIndex);
     return false;
   }
@@ -10316,7 +10391,11 @@ bool Mob::CarveLimb(int limbIndex, World& world,
   // child, and it is the half the owner's report is actually about: the rot
   // crosses into the torso and hollows the shoulder, which is a change to the
   // torso's lattice and shows up in no measurement an arm takes of itself.
-  if (!inBluntCarve_ && !DropDisconnectedChildren(limbIndex)) return false;
+  // The CAUSE is judged on the limb that was carved — it is this limb's socket
+  // that was destroyed, so it is this limb's infection (or blade, or blast)
+  // that must be the thing allowed to do it.
+  if (JointRuleApplies(limbIndex) && !DropDisconnectedChildren(limbIndex))
+    return false;
   return true;
 }
 
@@ -17105,6 +17184,134 @@ const MobNaturalWeaponDef* Mob::EffectorWeapon() const {
   if (!ResolveEffector(part, mode, natural)) return nullptr;
   if (mode == StrikeEffectorMode::Held) return nullptr;
   return NaturalWeapon(natural);
+}
+
+// ---- STAGE 3.55: THE ONE-FOOTED DRAG ---------------------------------------
+//
+// The pose itself is anim.cpp's (AnimApplyStumpDrag, which is where the
+// argument for leaning into the short side lives). This is the half that has to
+// know about a BODY: how fast it is going, whether it is on the ground, which
+// clip it is playing, and where its stump is scrubbing.
+//
+// Everything here is presentation and none of it is hashed — the drag changes
+// the pose and the blood it leaves, not the walk drive. A one-footed body still
+// moves at its state's authored `speedScale`.
+namespace {
+// How far the pelvis rolls into the stump, and how far behind the body the dead
+// leg hangs at full pace. The lean is the load-bearing one: it is what lets a
+// leg that is a foot too short reach the floor at all. Both are file-local
+// constants rather than tuning rows because they are RIG GEOMETRY expressed as
+// an angle — every human-shaped rig wants the same numbers, and a body that
+// wants different ones wants a different anatomy, not a slider.
+constexpr float kDragLeanRad = 0.20f;    // ~11.5 degrees
+constexpr float kDragTrailRad = 0.38f;   // ~22 degrees
+// How quickly the body commits to the drag and lets go of it. Long enough to
+// read as a body shifting its weight rather than as a state change: entering it
+// at a walk takes about three of these, and a jump is out of it before the feet
+// clear a voxel.
+constexpr float kDragHalflife = 0.28f;
+// ...and how quickly it lets go, which is deliberately much faster. THIS IS
+// WHAT MAKES HOPPING A CHOICE: leaving the ground drops the drag inside a
+// single hop's airtime, so a player who keeps jumping never re-enters it, while
+// the slower rise means landing and walking eases back in over the better part
+// of a second instead of snapping on at the first grounded tick.
+constexpr float kDragReleaseHalflife = 0.10f;
+// The fraction of the rig's own top speed at which the drag is fully committed.
+// Well under 1 because the drag is what walking IS for this body — the ramp
+// exists to blend out at a STANDSTILL (where a one-footed body stands square
+// on its good leg), not to reserve it for a sprint.
+constexpr float kDragSpeedRef = 0.30f;
+// Below this the body is standing, not dragging, and nothing is scrubbing the
+// ground: no contact, no smear.
+constexpr float kDragContactWeight = 0.45f;
+// How far the stump hangs BEHIND its own hip, in leg lengths, when the contact
+// is probed. The dead leg trails; asking the column directly under the hip
+// would put the smear a stride ahead of the limb that is making it.
+constexpr float kDragContactTrail = 0.35f;
+}  // namespace
+
+AnimStump Mob::TickStumpDrag(float dt, bool grounded, bool clipOwnsPose) {
+  const AnimSkeleton& sk = skel_;
+  AnimState& st = anim_;
+  AnimStump stump = AnimFindStumpLeg(sk, st);
+  // A prone state owns the pose outright and already has its own dead-leg
+  // handling (AnimDragDeadLegs); a dead or limp body is not walking anywhere.
+  const bool eligible = stump.chain >= 0 && !clipOwnsPose && alive_ &&
+                        ragdoll_ == RagdollPhase::None;
+  const float top = def_ != nullptr ? std::max(def_->speed, 0.01f) : 1.0f;
+  const float sp = std::clamp(speedNow_ / (top * kDragSpeedRef), 0.0f, 1.0f);
+  const float want = (eligible && grounded) ? sp : 0.0f;
+  const float hl = want > dragW_ ? kDragHalflife : kDragReleaseHalflife;
+  const float k = 1.0f - std::pow(0.5f, dt / hl);
+  dragW_ += (want - dragW_) * k;
+  if (dragW_ < 1e-3f) dragW_ = 0.0f;
+  if (dragW_ > 0.999f) dragW_ = 1.0f;
+  if (!eligible || dragW_ <= 0.0f) {
+    if (dragW_ <= 0.0f) {
+      dragContactValid_ = false;
+      dragStumpLimb_ = -1;
+      dragTrailDist_ = 0.0f;
+    }
+    return eligible ? stump : AnimStump{};
+  }
+
+  // THE AUTHORED HOP AND THE DRAG KEY THE SAME PELVIS. `limp` is an additive
+  // clip with a hips track — it is the body springing off its good ankle, which
+  // is the motion this layer replaces — so it is faded out by exactly the
+  // amount the drag has faded in rather than stopped outright. At a standstill
+  // the clip is back at full weight, which is what "interpolate between the
+  // idle frame and the drag" means from the clip side.
+  if (st.locoState >= 0 && st.locoState < (int)sk.states.size() &&
+      !sk.states[st.locoState].clip.empty()) {
+    const int lc = sk.FindClip(sk.states[st.locoState].clip);
+    for (ClipInstance& inst : st.clips)
+      if (inst.clip == lc && !inst.stopping) inst.weight = 1.0f - dragW_;
+  }
+
+  AnimApplyStumpDrag(sk, st, stump, def_ != nullptr ? def_->rootLimb : -1,
+                     dragW_, kDragLeanRad, kDragTrailRad, st.gaitPhase, sp);
+  return stump;
+}
+
+void Mob::TrackStumpContact(World& world, const AnimStump& stump, float dt) {
+  if (stump.chain < 0 || dragW_ < kDragContactWeight || def_ == nullptr) {
+    dragContactValid_ = false;
+    dragStumpLimb_ = -1;
+    return;
+  }
+  const AnimSkeleton& sk = skel_;
+  const IkChain& ch = sk.chains[stump.chain];
+  if (ch.parts.empty()) {
+    dragContactValid_ = false;
+    return;
+  }
+  // The hip anchor is prefab-absolute (the pose pipeline's frame all the way
+  // through), so this is the same composition the gait's stance point uses:
+  // body origin + pivot + yaw * (anchor - pivot).
+  const Vec3 pivot{def_->worldSize.x * 0.5f, 0, def_->worldSize.z * 0.5f};
+  const Quat yaw = AxisAngle({0, 1, 0}, heading_);
+  const Vec3 hipW = Vec3{origin_.x, bodyY_, origin_.z} + pivot +
+                    Rotate(yaw, sk.parts[ch.parts[0]].anchorLocal - pivot);
+  float legLen = 1.0f;
+  if (stump.chain < (int)anim_.feet.size())
+    legLen = std::max(0.5f, anim_.feet[stump.chain].legLength);
+  const Vec3 back = Rotate(yaw, Vec3{0, 0, -1});
+  const Vec3 at = hipW + back * (legLen * kDragContactTrail);
+  int gy = 0;
+  if (!GroundHeightAt(world, ifloor(at.x), ifloor(at.z),
+                      ifloor(origin_.y) + 2, gy)) {
+    dragContactValid_ = false;
+    return;
+  }
+  // GroundHeightAt returns the SURFACE — the first cell above the solid — which
+  // is the cell a smear is painted into, and the one the stump is in contact
+  // with. No lift: blood on the ground is on the ground.
+  dragContact_ = Vec3{at.x, (float)gy, at.z};
+  dragContactValid_ = true;
+  dragStumpLimb_ = stump.tip;
+  // Metered by DISTANCE, not by time: a body inching along must not repaint one
+  // voxel every tick (rule 2, applied to gore).
+  dragTrailDist_ += speedNow_ * dt;
 }
 
 // ---- STAGE 3.5: WHAT THIS CREATURE IS POINTING AT --------------------------

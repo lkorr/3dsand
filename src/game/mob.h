@@ -2007,6 +2007,25 @@ class Mob {
   // one bool that clears itself when the last spring goes quiet (CLAUDE.md
   // rule 2, applied to a presentation layer).
   void ApplyHitReact(const AnimSkeleton& sk, AnimState& st, float dt);
+  // ---- THE ONE-FOOTED DRAG: the drivers' half (anim.h AnimApplyStumpDrag) --
+  //
+  // Stage 3.55, called by both drivers next to ApplyHitReact and PRE-FLATTEN.
+  // Eases `dragW_` toward what the body's footing and speed ask for, fades the
+  // loco clip out under it (the authored `limp` hop and a drag key the same
+  // pelvis, and playing both is the worst of the two), and applies the pose.
+  // Returns the live stump so the caller can hand it to TrackStumpContact.
+  //
+  // `grounded` is the caller's own debounced view — losing the drag for the one
+  // tick a bump crest costs would be the pop this layer exists to avoid — and
+  // AIR IS WHAT ENDS IT: a jump eases the drag out on the way up, which is how
+  // the player opts out of it by hopping.
+  AnimStump TickStumpDrag(float dt, bool grounded, bool clipOwnsPose);
+  // ...and where the stump is scrubbing, for the smear. Probes the ground under
+  // the dead leg's hip and meters the distance travelled; BleedTick spends it.
+  void TrackStumpContact(World& world, const AnimStump& stump, float dt);
+  // How committed to the drag this body is, 0..1. For the drivers (the stance
+  // crouch is low-passed under a drag) and for the gates.
+  float StumpDragWeight() const { return dragW_; }
   // Is a reaction running? For the gates and the dev readout; also the one
   // thing `--shot-mob` can assert without reaching into the springs.
   bool HitReactLive() const { return hitReact_.live; }
@@ -2621,6 +2640,10 @@ class Mob {
   // THIS limb, so they have to be recorded before this limb is the one being
   // eaten.
   void EnsureJointCounts(int limbIndex);
+  // May the joint-attachment rule take a limb off for the carve in progress?
+  // Blunt never amputates; fire keeps its own account; everything else — blade,
+  // blast, and rot even though rot rides the burn flush — may.
+  bool JointRuleApplies(int limbIndex) const;
   // Is `limbIndex` still held on by flesh — on BOTH sides of its joint? False
   // when either side has fallen below gore.woundNeckFraction of what it had.
   bool JointAttached(int limbIndex) const;
@@ -2951,6 +2974,27 @@ class Mob {
   // voxels, re-chosen wherever the pose is touching), so it is the chaotic
   // component of a crawl's bob and the one the eye blames on the arms.
   float proneLift_ = 0;
+  // ---- THE ONE-FOOTED DRAG (anim.h AnimApplyStumpDrag) --------------------
+  //
+  // `dragW_` is the eased commitment to the drag, 0 at a standstill and 1 at
+  // walking pace, and it is the whole of "do not switch, blend": both drivers
+  // drive it from speed and from footing, so standing up out of a drag, taking
+  // off into a hop and landing back into one are all one number moving.
+  //
+  // The rest is the SMEAR. A stump scrubbing over ground leaves blood where it
+  // touches, which is a distance-metered event, not a per-tick one: dragging
+  // slowly must not paint the same voxel thirty times a second. So the pose
+  // pass records where the stump is touching and how far the body has moved
+  // since the last mark, and BleedTick — the one place that already knows this
+  // creature's blood material, its op budget and what a drop costs in hp —
+  // spends it. `dragStumpLimb_` is the limb the blood comes OUT of, so a
+  // cauterised or garment-covered stump refuses for the same reasons the drip
+  // does.
+  float dragW_ = 0;
+  float dragTrailDist_ = 0;    // world voxels travelled since the last smear
+  Vec3 dragContact_{};         // where the stump is scrubbing, world voxels
+  bool dragContactValid_ = false;
+  int dragStumpLimb_ = -1;
   // ---- live ragdoll state (see RagdollPhase above) ----
   RagdollPhase ragdoll_ = RagdollPhase::None;
   float ragdollT_ = 0;         // seconds in the current phase

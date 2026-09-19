@@ -1351,6 +1351,188 @@ Status GateBiteInfect(Ctx& c, std::string& detail) {
   return Status::Fail;
 }
 
+// ---------------------------------------------------------------------------
+// joint-rot — a limb whose ATTACHMENT has been eaten comes off (2026-09-19)
+// ---------------------------------------------------------------------------
+//
+// `bite-infect` asserts the rot's clock; this asserts its STRUCTURAL
+// consequence, which had none. Owner report: "all of the voxels connecting a
+// shoulder to the torso can get rotted off but the limb is still attached" —
+// and the reason was that the only dismemberment rule rot could reach was
+// whole-limb volume (kLimbCollapseFraction, 25%), while an infection that opens
+// a hole THROUGH a shoulder removes a few percent of an arm. The joint rule
+// that makes "cut at the joint" work for a sword was gated `inBladeCut_`.
+//
+// THE TEETH GO INTO THE TORSO AND THE ARM IS WHAT COMES OFF. That is the exact
+// shape of the report, and it is also the only fixture that states the claim
+// UNAMBIGUOUSLY. Biting the arm itself does not: rot that hollows a limb splits
+// it, the anchor component keeps the identity, and the pre-existing
+// kMinFragmentVoxels rule takes it off on its own — measured, a control arm
+// with this whole feature switched off lost the limb 21 ticks later by that
+// route, at the same 80% volume, which is two readings of one event and not a
+// differential. Nothing eats the ARM here, so nothing but the socket can
+// explain it leaving.
+//
+// THE CLAIM IS ABOUT THE JOINT, NOT ABOUT THE VOLUME, so the assertion is a
+// conjunction: the limb came OFF, the creature was ALIVE when it did (Die()
+// takes every limb with it, so "no body" alone is not an amputation), and the
+// limb still had most of ITSELF when it went.
+//
+// A DATA-ONLY CONTROL ARM (the pattern `bite-infect` uses and for its reason):
+// both arms bite the same torso at the same shoulder with the same seed and the
+// same rot rates, and the ONLY difference is `gore.woundNeckRadius = 0` in arm
+// B, which is the shipped "off" switch for the joint measure itself
+// (Mob::JointAttached returns early). So arm A's sever cannot be scored to the
+// bite, the burn, the blood or anything else PreTick does for 600 ticks.
+Status GateJointRot(Ctx& c, std::string& detail) {
+  MobSystem& mobs = c.mobs;
+  IdCounterScope idScope(mobs);
+  PrepareWorld(c);
+  const Target t = ChooseTarget(mobs, FixtureSite(c.world, 465));
+  if (!t.valid() || t.torso < 0 || t.torso == t.limb) {
+    detail = "no loaded mob def has a severable non-vital limb on a torso";
+    return Status::Fail;
+  }
+  const uint32_t rotMat = c.mobs.MaterialIdNamed("rotflesh");
+  const uint32_t ichor = c.mobs.MaterialIdNamed("ichor");
+  if (!rotMat || !ichor) {
+    detail = "materials.json has no `rotflesh` / `ichor`";
+    return Status::Skip;
+  }
+
+  const Tuning saved = CurrentTuning();
+  const int kTicks = (int)BaselineNumber("jointRotTicks", 600);
+  const float kSpread = (float)BaselineNumber("jointRotSpread", 12.0);
+  const float kRot = (float)BaselineNumber("jointRotRate", 8.0);
+
+  struct Run {
+    uint32_t rot0 = 0;      // infected voxels the bite left (0 = it MISSED)
+    uint32_t vox0 = 0;      // the limb's art voxels the instant after the bite
+    uint32_t voxLast = 0;   // ...and on the last tick it was still attached
+    int offAt = -1;         // tick the limb came off, or -1
+    // ...AND WAS THE CREATURE STILL ALIVE WHEN IT DID. Without this the gate
+    // cannot fail: Die() hands every limb to the debris system, so `LimbBody`
+    // goes null on DEATH as well as on amputation, and both arms of the first
+    // version were really measuring how fast the bite's blood loss killed the
+    // fixture (98 ticks vs 119, 83% vs 80% — two readings of the same event).
+    bool aliveAtOff = false;
+  };
+  auto run = [&](float neckRadius, int inset) {
+    Run r;
+    Tuning tt = saved;
+    tt.gore.infectSpreadRate = kSpread;
+    tt.gore.infectRotRate = kRot;
+    // Every factor of the rate, for the reason `bite-infect` spells out: a
+    // debug crank left at whatever tuning.json holds means the arm is not the
+    // arm.
+    tt.gore.infectMobMult = 1.0f;
+    tt.gore.woundNeckRadius = neckRadius;
+    SetCurrentTuning(tt);
+    std::vector<ParticleSpawn> spawns;
+    const uint64_t id = SpawnTarget(c, t, inset);
+    if (!id) { SetCurrentTuning(saved); return r; }
+    // ---- THE TEETH GO INTO THE TORSO, AT THE ARM'S SHOULDER ---------------
+    // `LimbAnchorPos` of the ARM is the joint in world space — the same point
+    // the socket measure is taken about, expressed in the parent's frame. A
+    // generous bite radius because the anchor is a RIG POINT and may sit just
+    // outside the torso's voxel cloud (Mob::SocketCentreInParent clamps for
+    // exactly that reason); `rot0` below is what proves the teeth found flesh.
+    const LimbAxis ax = MeasureLimb(mobs, id, t.limb);
+    BiteOnce(mobs, c.world, id, t.torso, ax.anchor, 5.0f, (uint16_t)rotMat,
+             (uint16_t)ichor, 0.85f, 0xB17Eu, spawns);
+    r.rot0 = mobs.LimbMaterialCount(id, t.torso, rotMat);
+    // ...and every reading after this is about the ARM, which nothing has
+    // touched. If it leaves, the socket is the only thing that can have taken
+    // it.
+    r.vox0 = mobs.LimbArtVoxelCount(id, t.limb);
+    r.voxLast = r.vox0;
+    uint32_t tick = 40000;
+    for (int i = 0; i < kTicks; i++) {
+      if (!mobs.LimbBody(id, t.limb)) {
+        r.offAt = i;
+        const Mob* m = mobs.FindMobById(id);
+        r.aliveAtOff = m && m->Alive();
+        break;
+      }
+      // The last reading taken while the limb was STILL ON is the only one
+      // that means anything — after the sever this counts a stump.
+      r.voxLast = mobs.LimbArtVoxelCount(id, t.limb);
+      std::vector<BrushOp> ops;
+      std::vector<CellOp> cellOps;
+      spawns.clear();
+      mobs.PreTick(tick++, c.world, ops, cellOps, spawns);
+    }
+    mobs.Reset();
+    c.debris.Reset();
+    SetCurrentTuning(saved);
+    return r;
+  };
+
+  const Run a = run(saved.gore.woundNeckRadius, 475);
+  const Run b = run(0.0f, 485);
+  SetCurrentTuning(saved);
+
+  const auto frac = [](const Run& r) {
+    return r.vox0 ? (float)r.voxLast / (float)r.vox0 : 0.0f;
+  };
+  RecordObserved("jointRotOffAt", (double)a.offAt);
+  RecordObserved("jointRotFracAtSever", (double)frac(a));
+  RecordObserved("jointRotControlOffAt", (double)b.offAt);
+
+  // How much of itself the limb must still have when it leaves, for the sever
+  // to be a statement about the JOINT rather than about the volume. Comfortably
+  // above kLimbCollapseFraction (25%), which is the rule that already worked.
+  const float kFracMin = (float)BaselineNumber("jointRotFracMin", 0.5);
+  // AN AMPUTATION, NOT A DEATH — see Run::aliveAtOff.
+  const bool cameOff = a.offAt >= 0 && a.aliveAtOff;
+  const bool stillALimb = frac(a) >= kFracMin;
+  // The control must not reach the same verdict, and "it never lost the limb"
+  // is the wrong way to say that: with the joint measure off the rot crosses
+  // the joint and eventually eats the leg ITSELF, and the old whole-limb
+  // collapse rule then takes it — measured at tick 338 with 28% of it left,
+  // against arm A's tick 49 with 95%. Both are limbs coming off a live
+  // creature, and the number that tells them apart is the one the claim is
+  // about: with the joint measure off, nothing takes a limb that is still
+  // MOSTLY THERE.
+  const bool controlHeld =
+      b.offAt < 0 || !b.aliveAtOff || frac(b) < kFracMin;
+
+  std::string s =
+      "torso bite left " + std::to_string(a.rot0) + " rotten at the " +
+      t.limbName + " joint; the " + t.limbName + " (" +
+      std::to_string(a.vox0) + " vox, untouched) came " +
+      (a.offAt >= 0 ? "OFF at tick " + std::to_string(a.offAt) +
+                          (a.aliveAtOff ? " (alive)" : " (ON DEATH)")
+                    : std::string("off NEVER")) +
+      " with " + std::to_string((int)(frac(a) * 100.0f)) +
+      "% of itself left (floor " + std::to_string((int)(kFracMin * 100.0f)) +
+      "%); control (neck measure off) bit " + std::to_string(b.rot0) + ", " +
+      (b.offAt < 0 ? std::string("stayed on")
+                   : "came off at tick " + std::to_string(b.offAt) +
+                         (b.aliveAtOff ? " (alive)" : " (ON DEATH)")) +
+      " at " + std::to_string((int)(frac(b) * 100.0f)) + "%";
+  detail = s;
+  // A BITE THAT MISSED MEASURES NOTHING — and it is the failure this fixture is
+  // most likely to have, because the point it aims at is a rig anchor. Checked
+  // first so it can never be reported as "the rule did not fire".
+  if (a.rot0 == 0 || b.rot0 == 0) {
+    detail = "the bite landed no infection — this fixture measured nothing: " + s;
+    return Status::Fail;
+  }
+  if (cameOff && stillALimb && controlHeld) return Status::Pass;
+  if (!cameOff)
+    detail = a.offAt < 0
+                 ? "the rot ate the joint and the limb stayed attached: " + s
+                 : "the creature DIED with the limb still on — the rot never "
+                   "took it: " + s;
+  else if (!stillALimb)
+    detail = "the limb collapsed on VOLUME, not at the joint: " + s;
+  else
+    detail = "the CONTROL arm lost a limb that was still mostly there, with "
+             "the neck measure off — this gate's sever is not the joint rule: " + s;
+  return Status::Fail;
+}
+
 }  // namespace
 
 const std::vector<Gate>& ImpactGates() {
@@ -1360,6 +1542,7 @@ const std::vector<Gate>& ImpactGates() {
       {"impact-fist", "mob", {}, false, GateImpactFist, false},
       {"bite-rot", "mob", {}, false, GateBiteRot, false},
       {"bite-infect", "mob", {}, false, GateBiteInfect, false},
+      {"joint-rot", "mob", {}, false, GateJointRot, false},
   };
   return g;
 }
