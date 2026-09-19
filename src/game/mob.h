@@ -1164,6 +1164,25 @@ struct MobLimb {
   // count — which is CONSERVATIVE (a lower denominator makes the sever harder,
   // never easier), so it fails safe.
   uint32_t neckAtSpawn = 0;
+  // ---- HOW MUCH FLESH THE PARENT HAS AT THIS JOINT -------------------------
+  // The OTHER HALF of the same question, and the one no count taken on this
+  // limb can answer: an arm is held on by the shoulder of the TORSO as much as
+  // by the shoulder of the arm, and a rot that eats the torso's shoulder pocket
+  // leaves this limb 100% intact, 100% "necked", and attached to nothing. Owner
+  // report 2026-09-19: "all of the voxels connecting a shoulder to the torso
+  // can get rotted off but the limb is still attached".
+  //
+  // Voxels of the PARENT within gore.woundNeckRadius of the joint, measured on
+  // the parent's lattice with the centre CLAMPED into the parent's bounding box
+  // (the shoulder anchor of an arm sits several cells outside the torso's voxel
+  // cloud — the same clamp Mob::InfectAcrossJoint makes, for the same reason).
+  // Held on the CHILD because the joint is the child's: a parent has many.
+  //
+  // 0 = not taken yet; kSocketUnmeasured = taken and found empty at spawn, i.e.
+  // this rig's geometry gives no parent-side sample and the test is skipped
+  // rather than being permanently satisfied.
+  static constexpr uint32_t kSocketUnmeasured = 0xFFFFFFFFu;
+  uint32_t socketAtSpawn = 0;
   // ---- HOW MUCH SKIN THIS LIMB HAS ------------------------------------------
   // Burnable voxels with at least one open face, on the authoritative lattice,
   // taken lazily on the first burn recount (0 = not yet taken; floored at 1).
@@ -1412,6 +1431,8 @@ class Mob {
 
   uint64_t Id() const { return id_; }
   bool Alive() const { return alive_; }
+  bool Swinging() const { return swinging_; }
+  void SetSwinging(bool v) { swinging_ = v; }
   // WHY it died, as a static string, or "" while alive. Set at every Die()
   // call site that knows (a vital limb lost, blood loss, the burn cap), so a
   // gate that finds a corpse can say what killed it instead of guessing
@@ -2576,6 +2597,36 @@ class Mob {
   // whichever lattice is authoritative. ONE pass, no allocation. This is the
   // measure MobLimb::neckAtSpawn records and the neck sever compares against.
   uint32_t NeckCount(const MobLimb& limb, float radiusWorld) const;
+  // The same count about an ARBITRARY point of the limb's own frame, in
+  // limb-local world voxels. NeckCount is this with the joint anchor; the
+  // socket measure is this with the joint expressed in the PARENT's frame.
+  uint32_t NeckCountAt(const MobLimb& limb, Vec3 centreLimb,
+                       float radiusWorld) const;
+  // A point in a limb's local frame (world voxels) pulled inside that limb's
+  // lattice bounding box. A joint anchor is a rig point and may sit outside the
+  // voxel cloud entirely; this is what makes a joint measurement sample the
+  // flesh the joint is seated against instead of the empty space beside it.
+  Vec3 ClampToLimbBox(const MobLimb& limb, Vec3 pLimb) const;
+  // Index of `limbIndex`'s parent limb, or -1 (root, no parent, or a parent
+  // name that names nothing). Parentage is by NAME in limbDefs_, which is the
+  // only place it exists.
+  int ParentLimbIndex(int limbIndex) const;
+  // Where this limb's joint sits in its PARENT's local frame, clamped into the
+  // parent's lattice bounding box. Limb-local world voxels, ready for
+  // NeckCountAt.
+  Vec3 SocketCentreInParent(const MobLimb& parent, const MobLimb& child) const;
+  // Take MobLimb::neckAtSpawn for `limbIndex` and MobLimb::socketAtSpawn for
+  // every child of it, if they have not been taken. Called at the top of a
+  // carve, BEFORE it removes anything — the children's sockets are measured on
+  // THIS limb, so they have to be recorded before this limb is the one being
+  // eaten.
+  void EnsureJointCounts(int limbIndex);
+  // Is `limbIndex` still held on by flesh — on BOTH sides of its joint? False
+  // when either side has fallen below gore.woundNeckFraction of what it had.
+  bool JointAttached(int limbIndex) const;
+  // Sever any child of `parentIndex` whose socket in it has been eaten away.
+  // Returns whether the creature is still alive (severing a vital child kills).
+  bool DropDisconnectedChildren(int parentIndex);
   // Soak the flesh around a cut. Rewrites the MATERIAL of a hash-selected
   // fraction of the voxels within `radiusWorld` of `centreLocal` (limb-local
   // world voxels) to the creature's wound material, and pokes the micro brick
@@ -2788,6 +2839,7 @@ class Mob {
   int defIndex_ = -1;          // into MobSystem's def list (events, persistence)
   const MobDef* def_ = nullptr;
   bool alive_ = true;
+  bool swinging_ = false;
   GoreProfile gore_;           // this creature's own bleed character
   // ---- blood loss and the burn cap (see the public block above) -----------
   float bloodLost_ = 0.0f;

@@ -5830,6 +5830,7 @@ void MobSystem::PreTick(uint32_t tick, World& world, std::vector<BrushOp>& ops,
       if (attacks_.size() > attacksBefore && !mob.stroke_.Active())
         BeginStroke(mob, attacks_.back(), tick);
       StepStroke(mob, tick, world, spawns);
+      mob.swinging_ = mob.stroke_.Cutting();
 
       // ---- stages 1-5: pose the rig (float presentation state) ----
       UpdateAnimation(mob, def, world, dt, tick);
@@ -7427,7 +7428,7 @@ bool MobSystem::FindParry(const Mob& wielder, const Vec3& aPrev,
   outBody = 0;
   float best = gap;
   auto test = [&](Mob& m) {
-    if (&m == &wielder || !m.alive_ || m.HeldSlot() < 0) return;
+    if (&m == &wielder || !m.alive_ || !m.swinging_ || m.HeldSlot() < 0) return;
     Vec3 db, dt, dflat;
     float dhw = 0;
     if (!m.WeaponEdge(db, dt, dhw, &dflat)) return;
@@ -7647,12 +7648,42 @@ bool Mob::HpZeroSevers(int limbIndex) const {
 }
 
 uint32_t Mob::NeckCount(const MobLimb& limb, float radiusWorld) const {
+  // CLAMPED, since 2026-09-19. A joint anchor is a rig POINT and is under no
+  // obligation to land inside the limb's voxel cloud — several do not, and at
+  // the shipped woundNeckRadius (0.26 world voxels) a centre half a voxel
+  // outside the model catches nothing at all. That read as "the neck is empty"
+  // on an untouched limb, which under the old blade-only rule meant the limb
+  // came off on the first cut that reached this test and under the general
+  // rule would mean the first tick of rot ANYWHERE on it. The clamp moves the
+  // centre to the nearest point of the limb's own lattice, which is the flesh
+  // the joint is actually seated in.
+  return NeckCountAt(limb, ClampToLimbBox(limb, limb.anchorLimb), radiusWorld);
+}
+
+Vec3 Mob::ClampToLimbBox(const MobLimb& limb, Vec3 pLimb) const {
+  const bool fine = limb.HasFineSkin();
+  const uint32_t scale =
+      std::max(1u, fine ? SkinScaleOf(limb) : PhysScaleOf(limb));
+  // `limb.size` is in physScale units; multiplied out and divided back down it
+  // is the extent in WORLD voxels, which is the frame `pLimb` is in.
+  const uint32_t ratio = std::max(1u, scale / std::max(1u, PhysScaleOf(limb)));
+  const float k = (float)ratio / (float)scale;
+  const float m = 0.5f / (float)scale;  // half a lattice cell inside the face
+  const Vec3 e{(float)limb.size.x * k, (float)limb.size.y * k,
+               (float)limb.size.z * k};
+  return Vec3{std::clamp(pLimb.x, m, std::max(m, e.x - m)),
+              std::clamp(pLimb.y, m, std::max(m, e.y - m)),
+              std::clamp(pLimb.z, m, std::max(m, e.z - m))};
+}
+
+uint32_t Mob::NeckCountAt(const MobLimb& limb, Vec3 centreLimb,
+                          float radiusWorld) const {
   if (radiusWorld <= 0.0f) return 0;
   const bool fine = limb.HasFineSkin();
   const float scale =
       (float)std::max(1u, fine ? SkinScaleOf(limb) : PhysScaleOf(limb));
-  // The anchor is stored in limb-local WORLD voxels; the lattice is not.
-  const Vec3 a = limb.anchorLimb * scale;
+  // The centre is stored in limb-local WORLD voxels; the lattice is not.
+  const Vec3 a = centreLimb * scale;
   const float r = radiusWorld * scale;
   const float r2 = r * r;
   uint32_t n = 0;
@@ -7667,6 +7698,153 @@ uint32_t Mob::NeckCount(const MobLimb& limb, float radiusWorld) const {
     for (const DebrisVoxel& v : limb.voxels)
       test((float)v.x, (float)v.y, (float)v.z);
   return n;
+}
+
+// ============================================================================
+// A LIMB MAY NOT FLOAT (2026-09-19)
+//
+// The neck rule below CarveLimb's connectivity split has always asked the right
+// question — "is there still flesh AT THE JOINT" — and asked it of only half
+// the joint, on only one of the four ways a limb can lose that flesh.
+//
+// Both halves of the gap are the same owner report: a zombie bites your
+// shoulder, the infection eats the shoulder out, and the arm hangs there on a
+// joint with nothing around it until you die of the blood instead.
+//
+//   * THE CAUSE. The neck test was `inBladeCut_` only, so rot, fire and blast
+//     could not reach it. Whole-limb `kLimbCollapseFraction` (25% of the limb's
+//     volume) is all that stood behind them, and an infection that opens a hole
+//     THROUGH THE SHOULDER removes maybe 5% of an arm's volume. Generalised
+//     here to every cause but blunt — blunt still never amputates, which is the
+//     owner's spec and the one exclusion that is deliberate (Mob::BluntCarveScope).
+//
+//   * THE SIDE. An arm is held on by the torso's shoulder as much as by the
+//     arm's. Rot spreads across the joint (Mob::InfectAcrossJoint) and then
+//     works on the TORSO, where it eats the pocket the arm sits in; the arm's
+//     own neck count never moves, so nothing on the arm could ever notice.
+//     MobLimb::socketAtSpawn is that missing measure, and it is checked from
+//     BOTH ends — when the child is carved, and when the PARENT is
+//     (DropDisconnectedChildren), because it is the parent's carve that
+//     actually destroys it.
+//
+// Together these are the general statement of the sword rule the owner named as
+// the reference: a limb comes off when the flesh at its attachment is gone,
+// whatever removed it and whichever side of the joint it was on.
+// ============================================================================
+
+int Mob::ParentLimbIndex(int limbIndex) const {
+  if (!def_) return -1;
+  const int nl = std::min((int)limbs_.size(), (int)limbDefs_.size());
+  if (limbIndex < 0 || limbIndex >= nl) return -1;
+  if (limbIndex == def_->rootLimb) return -1;
+  const std::string& up = limbDefs_[limbIndex].parent;
+  if (up.empty()) return -1;
+  for (int k = 0; k < nl; k++)
+    if (k != limbIndex && limbDefs_[k].name == up) return k;
+  return -1;
+}
+
+Vec3 Mob::SocketCentreInParent(const MobLimb& parent,
+                               const MobLimb& child) const {
+  // The joint in the parent's local frame, in WORLD voxels: both offsets are
+  // from the creature's rest-pose min corner, so the difference is the joint
+  // measured from the parent's own corner. (This is the construction
+  // InfectAcrossJoint makes when it seeds a parent from a child.)
+  const Vec3 j = child.anchorRoot - parent.restOffset;
+  // CLAMPED INTO THE PARENT'S BOX. An arm's shoulder anchor sits several cells
+  // OUTSIDE the torso's voxel cloud — the rig hangs the limb off a point, not
+  // off a cell — so an unclamped sphere of woundNeckRadius finds nothing there
+  // on a perfectly healthy torso and the socket would read empty from the
+  // start. Clamping moves the centre to the nearest point of the parent's
+  // lattice, which is exactly the surface the arm is seated against. (The same
+  // clamp Mob::InfectAcrossJoint makes to seed a parent across a joint.)
+  return ClampToLimbBox(parent, j);
+}
+
+void Mob::EnsureJointCounts(int limbIndex) {
+  if (!def_) return;
+  const auto& gt = CurrentTuning().gore;
+  if (gt.woundNeckRadius <= 0.0f) return;
+  const int nl = std::min((int)limbs_.size(), (int)limbDefs_.size());
+  if (limbIndex < 0 || limbIndex >= nl) return;
+  MobLimb& limb = limbs_[limbIndex];
+  // This limb's own neck, on its own lattice. Floored at 1 so a limb whose
+  // anchor sits outside its own lattice records a real answer once instead of
+  // re-measuring on every carve — the comparison then reads "the neck is
+  // empty", which is the correct verdict for that geometry anyway.
+  if (limb.neckAtSpawn == 0)
+    limb.neckAtSpawn = std::max(1u, NeckCount(limb, gt.woundNeckRadius));
+  // ...and the socket every CHILD of it sits in, measured on THIS limb. Taken
+  // here, at the top of this limb's carve, because a carve of this limb is
+  // precisely what destroys those sockets: measured afterwards they would
+  // record the damage as the baseline, and the test could never fire.
+  const std::string& self = limbDefs_[limbIndex].name;
+  if (self.empty()) return;
+  for (int k = 0; k < nl; k++) {
+    if (k == limbIndex || limbDefs_[k].parent != self) continue;
+    MobLimb& child = limbs_[k];
+    if (child.socketAtSpawn != 0) continue;
+    if (!child.body) continue;
+    const uint32_t n =
+        NeckCountAt(limb, SocketCentreInParent(limb, child), gt.woundNeckRadius);
+    // NO PARENT-SIDE SAMPLE means NO PARENT-SIDE TEST. A rig whose joint lands
+    // in empty parent geometry even after the clamp (a tail on a hollow shell,
+    // a borrowed item slot) must not be treated as "the socket is already
+    // gone" — it is treated as unmeasurable and only the child's own neck
+    // decides, exactly as it did before this existed.
+    child.socketAtSpawn = n ? n : MobLimb::kSocketUnmeasured;
+  }
+}
+
+bool Mob::JointAttached(int limbIndex) const {
+  if (!def_) return true;
+  const auto& gt = CurrentTuning().gore;
+  if (gt.woundNeckRadius <= 0.0f) return true;
+  const int nl = std::min((int)limbs_.size(), (int)limbDefs_.size());
+  if (limbIndex < 0 || limbIndex >= nl) return true;
+  if (limbIndex == def_->rootLimb) return true;   // the root is not jointed
+  if (!limbDefs_[limbIndex].severable) return true;
+  const MobLimb& limb = limbs_[limbIndex];
+  if (!limb.body) return true;
+  // ---- THIS SIDE: the limb's own flesh at its anchor ----
+  if (limb.neckAtSpawn > 0 &&
+      (float)NeckCount(limb, gt.woundNeckRadius) <
+          gt.woundNeckFraction * (float)limb.neckAtSpawn)
+    return false;
+  // ---- THE OTHER SIDE: the parent's flesh around the same joint ----
+  if (limb.socketAtSpawn == 0 ||
+      limb.socketAtSpawn == MobLimb::kSocketUnmeasured)
+    return true;  // never measured, or unmeasurable on this rig
+  const int p = ParentLimbIndex(limbIndex);
+  if (p < 0) return true;
+  const MobLimb& parent = limbs_[p];
+  // A parent that has already come off is not a verdict about this joint —
+  // Sever/DetachLimb cascades to children by itself and got here first.
+  if (!parent.body) return true;
+  const uint32_t now = NeckCountAt(parent, SocketCentreInParent(parent, limb),
+                                   gt.woundNeckRadius);
+  return (float)now >= gt.woundNeckFraction * (float)limb.socketAtSpawn;
+}
+
+bool Mob::DropDisconnectedChildren(int parentIndex) {
+  if (!def_ || !alive_) return alive_;
+  const int nl = std::min((int)limbs_.size(), (int)limbDefs_.size());
+  if (parentIndex < 0 || parentIndex >= nl) return true;
+  const std::string self = limbDefs_[parentIndex].name;  // by VALUE: Sever may
+  if (self.empty()) return true;                         // reshape limbDefs_
+  for (int k = 0; k < nl && alive_; k++) {
+    if (k == parentIndex || k >= (int)limbs_.size()) continue;
+    if (k >= (int)limbDefs_.size() || limbDefs_[k].parent != self) continue;
+    // A GARMENT IS NOT ANATOMY and a held sword is not a joint — the two
+    // exclusions every gore path in this file makes. A worn shell is seated on
+    // its host's surface, not in a socket, and shedding a coat because the
+    // chest under it burnt is not what any of this is about.
+    if (k >= baseLimbs_ || IsWornSlot(k)) continue;
+    if (!limbs_[k].body) continue;
+    if (JointAttached(k)) continue;
+    Sever(k);
+  }
+  return alive_;
 }
 
 uint32_t Mob::DefaultSmearMat() const {
@@ -9454,14 +9632,11 @@ bool Mob::CarveLimb(int limbIndex, World& world,
   if (!limb.body || limb.voxels.empty()) return true;
   const MobDef& def = *def_;
   const auto& gt = CurrentTuning().gore;
-  // HOW MUCH FLESH THIS LIMB HAD AT ITS JOINT, taken lazily, here, before this
-  // carve removes anything (MobLimb::neckAtSpawn says why it is not taken at
-  // spawn). Floored at 1 so a limb whose anchor sits outside its own lattice
-  // records a real answer once instead of re-measuring on every carve — the
-  // comparison then reads "the neck is empty", which is the correct verdict
-  // for that geometry anyway.
-  if (limb.neckAtSpawn == 0)
-    limb.neckAtSpawn = std::max(1u, NeckCount(limb, gt.woundNeckRadius));
+  // HOW MUCH FLESH THERE IS AT THIS LIMB'S JOINTS, taken lazily, here, before
+  // this carve removes anything (MobLimb::neckAtSpawn says why it is not taken
+  // at spawn). Both sides: this limb's own neck, and the socket each of its
+  // CHILDREN sits in on this limb's lattice.
+  EnsureJointCounts(limbIndex);
   // NOTE: limb.xf is deliberately NOT refreshed from Jolt here. the predicate
   // was built against the pose the CALLER measured, and a live limb is
   // kinematic — the animation pipeline re-poses it every tick — so re-reading
@@ -10083,14 +10258,17 @@ bool Mob::CarveLimb(int limbIndex, World& world,
   // "still one piece" forever, and without this rule a patient player could saw
   // an arm to a thread and never take it off.
   //
-  // Blade only, same reasoning. Bounded: one pass over the limb's lattice, on
-  // a hit tick, after a carve that already did several.
-  if (inBladeCut_ && limb.neckAtSpawn > 0 && gt.woundNeckRadius > 0.0f) {
-    const uint32_t neck = NeckCount(limb, gt.woundNeckRadius);
-    if ((float)neck < gt.woundNeckFraction * (float)limb.neckAtSpawn) {
-      Sever(limbIndex);
-      return false;
-    }
+  // EVERY CAUSE BUT BLUNT, and BOTH SIDES of the joint — see the block above
+  // Mob::ParentLimbIndex. This was `inBladeCut_` and the limb's own lattice
+  // only, which made it a statement about swords rather than about attachment:
+  // rot ate the shoulder out and no rule in this function could see it, so the
+  // arm hung on a joint surrounded by nothing until the blood loss killed you
+  // first. Blunt keeps its exclusion (it never amputates, however many land).
+  //
+  // Bounded: one or two passes over a lattice, on a tick that already carved.
+  if (!inBluntCarve_ && !JointAttached(limbIndex)) {
+    Sever(limbIndex);
+    return false;
   }
 
   // Re-sync the charged count: a connectivity split above threw mass away
@@ -10127,6 +10305,18 @@ bool Mob::CarveLimb(int limbIndex, World& world,
     if (sys_)
     sys_->PushVoice(*this, MobSystem::VoiceKind::Hurt, limb.xf.pos,
                     lost * kCarveDamagePerVolume);
+
+  // ---- WHAT WAS HANGING OFF WHAT THIS CARVE JUST ATE ------------------------
+  //
+  // LAST, and after every use of `limb` above, because Sever() invalidates that
+  // reference and may kill the creature outright.
+  //
+  // The carve took flesh out of THIS limb; the arm seated in it has no idea.
+  // This is the half of the attachment rule that cannot be checked from the
+  // child, and it is the half the owner's report is actually about: the rot
+  // crosses into the torso and hollows the shoulder, which is a change to the
+  // torso's lattice and shows up in no measurement an arm takes of itself.
+  if (!inBluntCarve_ && !DropDisconnectedChildren(limbIndex)) return false;
   return true;
 }
 

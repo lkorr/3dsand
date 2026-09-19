@@ -420,11 +420,9 @@ struct MeleeTuning {
   // ---- the edge leads the cut ---------------------------------------------
   // ---- BLOCKING IS EMERGENT (Phase C) --------------------------------------
   //
-  // There is NO block button and no block state. A blade physically in the path
-  // of a stroke stops it, because MeleeSweepDamage's probes hit the defender's
-  // WEAPON before they hit the defender — the held item is a real rig slot with
-  // a real collider (DESIGN.md 8c), so it was always in the way and the sweep
-  // was simply carving straight through it. A parry is that hit, classified.
+  // There is NO block button and no block state. A parry happens when two
+  // swinging blades cross — both combatants must be in a committed cut for the
+  // geometry test to fire. A held weapon that is not swinging is not a parry.
   //
   // The four numbers below are what a parry costs. They live in tuning.json as
   // `melee.block*` with the rest of the group (promoted at the phase C/D merge)

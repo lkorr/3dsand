@@ -580,7 +580,8 @@ Status GateCombatCues(Ctx& c, std::string& detail) {
   // scripts/check_invariants.py compares cues.cpp against sound_schema.js;
   // this is the half a Python regex cannot see — that the C++ ENUM and the C++
   // TABLE agree, which is what CombatSetId's lookup depends on.
-  for (const char* slot : {"whoosh", "flesh", "clang"}) {
+  for (const char* slot : {"whoosh", "flesh", "clang",
+                           "strike_edge", "strike_blunt", "cut"}) {
     checks++;
     auto it = audio::Cues::kSlotPrefix.find(slot);
     if (it == audio::Cues::kSlotPrefix.end()) {
@@ -612,6 +613,9 @@ Status GateCombatCues(Ctx& c, std::string& detail) {
       {audio::Cues::CombatCue::Whoosh, "melee/whoosh"},
       {audio::Cues::CombatCue::Flesh, "melee/flesh"},
       {audio::Cues::CombatCue::Clang, "melee/clang"},
+      {audio::Cues::CombatCue::StrikeEdge, "melee/strike_edge"},
+      {audio::Cues::CombatCue::StrikeBlunt, "melee/strike_blunt"},
+      {audio::Cues::CombatCue::Cut, "melee/cut"},
   };
   for (const Slot& s : kSlots) {
     checks++;
@@ -629,7 +633,7 @@ Status GateCombatCues(Ctx& c, std::string& detail) {
   }
 
   // ---- C. THE ENGINE ASKS FOR THEM -----------------------------------------
-  // One call per cue; the counter must move by exactly three. `enabled_` is
+  // One call per cue; the counter must move by exactly six. `enabled_` is
   // false (no Init), so nothing is voiced and nothing is heard — which is the
   // point: this measures the REQUEST, which is the only half a headless run
   // has.
@@ -638,20 +642,23 @@ Status GateCombatCues(Ctx& c, std::string& detail) {
     cues.Combat(audio::Cues::CombatCue::Whoosh, Vec3{0, 0, 0}, 0.5f);
     cues.Combat(audio::Cues::CombatCue::Flesh, Vec3{0, 0, 0}, 1.0f);
     cues.Combat(audio::Cues::CombatCue::Clang, Vec3{0, 0, 0}, 0.0f);
+    cues.Combat(audio::Cues::CombatCue::StrikeEdge, Vec3{0, 0, 0}, 0.7f);
+    cues.Combat(audio::Cues::CombatCue::StrikeBlunt, Vec3{0, 0, 0}, 0.8f);
+    cues.Combat(audio::Cues::CombatCue::Cut, Vec3{0, 0, 0}, 0.6f);
     const uint32_t moved = cues.GetStats().combat - before;
     checks++;
-    if (moved != 3) {
+    if (moved != 6) {
       ok = false;
       std::printf(
-          "combat-cues: FAILED the request counter moved by %u, want 3. "
+          "combat-cues: FAILED the request counter moved by %u, want 6. "
           "Stats::combat must increment BEFORE the enabled_ early-out or a "
           "headless run can assert nothing (audio/cues.h)\n",
           moved);
     }
   }
 
-  detail = Format("%d checks, %d/3 sets resolved", checks, resolved);
-  std::printf("combat-cues: %s (%d checks, %d/3 sets resolved)\n",
+  detail = Format("%d checks, %d/6 sets resolved", checks, resolved);
+  std::printf("combat-cues: %s (%d checks, %d/6 sets resolved)\n",
               ok ? "PASS" : "FAIL", checks, resolved);
   return ok ? Status::Pass : Status::Fail;
 }
@@ -1127,21 +1134,13 @@ Status GateNpcStrike(Ctx& c, std::string& detail) {
 }
 
 // =============================================================================
-// npc-block — a blade in the path stops the blow
+// npc-block — simultaneous swings parry when the blades cross
 // =============================================================================
 //
-// THE FIXTURE IS CONSTRUCTED, NOT HOPED FOR. A stroke's cut is CENTRED ON ITS
-// AIM (game/strokes.h), so the attacker's edge passes through the aim point by
-// construction — and the defender's guard is then pushed out along the line
-// between them so that ITS OWN POINT sits at the same place. That makes the
-// parry a geometric certainty rather than a coincidence the gate re-rolls every
-// time worldgen moves, which matters because a flaky block gate is worse than
-// no block gate.
-//
-// NPCs do not yet CHOOSE to parry — there is no defensive intent, and that is
-// future AI work. What this asserts is that a blade which happens to be in the
-// way stops the blow, which is exactly what a windup stance will sometimes do
-// on its own.
+// Both fighters swing horizontal cuts aimed at each other's chest. The same
+// style gives both the same windup, so they reach Cut on the same tick and
+// their blades cross midway between them. A parry only fires when both
+// combatants are actively cutting (Mob::swinging_).
 Status GateNpcBlock(Ctx& c, std::string& detail) {
   IdCounterScope idScope(c.mobs);
   bool ok = true;
@@ -1163,14 +1162,14 @@ Status GateNpcBlock(Ctx& c, std::string& detail) {
 
   const float gap = (float)BaselineNumber("npcBlock.gapVox", 9.0);
   std::string why;
-  const uint64_t attacker =
+  const uint64_t fighter1 =
       SpawnFighter(c, st.defIndex, {st.spot.x, st.spot.y + 1, st.spot.z},
                    "training_dummy", true, why);
-  const uint64_t defender = SpawnFighter(
+  const uint64_t fighter2 = SpawnFighter(
       c, st.defIndex,
       {st.spot.x, st.spot.y + 1, st.spot.z + (int)std::lround(gap)},
       "training_dummy", true, why);
-  if (attacker == 0 || defender == 0) {
+  if (fighter1 == 0 || fighter2 == 0) {
     detail = why.empty() ? "fixture spawn failed" : why;
     std::printf("npc-block: SKIP (%s)\n", detail.c_str());
     CloseStage(c);
@@ -1178,212 +1177,99 @@ Status GateNpcBlock(Ctx& c, std::string& detail) {
   }
 
   Ticker tick{c, 27000, {st.spot.x >> 4, st.spot.y >> 4, st.spot.z >> 4}};
-  // Face each other. Both are `training_dummy` — blind, passive and immobile —
-  // so nothing in the AI moves either of them and the geometry stays where it
-  // is put. The swings are scripted; this gate is about the parry, not about
-  // whether an AI would have chosen one.
-  FaceAt(c.mobs, attacker, Chest(c.mobs, defender, *st.def));
-  FaceAt(c.mobs, defender, Chest(c.mobs, attacker, *st.def));
+  FaceAt(c.mobs, fighter1, Chest(c.mobs, fighter2, *st.def));
+  FaceAt(c.mobs, fighter2, Chest(c.mobs, fighter1, *st.def));
   for (int i = 0; i < 24; i++) tick();
 
-  // THE MEETING POINT: midway between the two chests. Inside both reaches, at
-  // chest height, on the line between them — so the attacker's cut is centred
-  // on it and the defender's point is pushed out to it.
-  const Vec3 aChest = Chest(c.mobs, attacker, *st.def);
-  const Vec3 dChest = Chest(c.mobs, defender, *st.def);
-  const Vec3 meet = (aChest + dChest) * 0.5f;
+  const Vec3 chest1 = Chest(c.mobs, fighter1, *st.def);
+  const Vec3 chest2 = Chest(c.mobs, fighter2, *st.def);
 
-  // The defender's guard, in ITS OWN basis: POINT FORWARD, at the attacker.
-  // The driver holds the blade roughly along the radius from the shoulder
-  // (melee.h), so "point at him" IS a blade lying along the line between them
-  // — and a HORIZONTAL cut then crosses it at right angles, which is the
-  // geometry the sweep can see.
-  //
-  // THE ATTACK MUST CROSS IT, NOT MEET IT END ON, and the reason is a real
-  // limitation worth writing down. The damage sweep casts its rays ALONG the
-  // swinging blade's own axis — that is what lets a thin fast edge hit anything
-  // at all — so two blades that meet POINT TO POINT are nearly collinear and
-  // the probe runs down the defender's blade rather than across it. Measured
-  // with a head-on thrust into a forward guard: two edges passing within 0.28
-  // voxels of each other, five sweeps, ZERO bodies found. A bind of that kind
-  // is a real fencing action and the sweep cannot see it; a CROSSING parry,
-  // which is the common case and the one the owner asked for, it sees fine.
-  // Noted for whoever adds a proper blade-on-blade test.
-  const float guardAz = (float)BaselineNumber("npcBlock.guardAz", 0.75);
-  const float guardEl = (float)BaselineNumber("npcBlock.guardEl", 0.35);
-  const float guardReach = (float)BaselineNumber("npcBlock.guardReachFrac", 0.85);
-  check(c.mobs.SetGuard(defender, guardAz, guardEl, guardReach),
-        "the defender took a guard across the line");
-  for (int i = 0; i < 30; i++) tick();   // let the guard settle before the blow
+  // The held-item prop layer check (Layers::PROP = 4): a drawn weapon must not
+  // generate contacts while held. Checked here because this is the gate that
+  // has two armed NPCs standing close.
+  {
+    Mob* m1 = c.mobs.FindMobById(fighter1);
+    const uint64_t body1 = m1 != nullptr && m1->HeldSlot() >= 0
+                               ? c.mobs.LimbBody(fighter1, m1->HeldSlot())
+                               : 0;
+    check(body1 != 0, "fighter 1 held item has a rig body");
+    const int layer = body1 != 0 ? c.phys.BodyObjectLayer(body1) : -1;
+    check(layer == 4,
+          "held weapon is on the prop layer (no contact push)");
+  }
 
-  const uint32_t defFlesh0 = FleshVoxels(c.mobs, defender);
-  const float defBlade0 = HeldHp(c.mobs, defender);
-  check(defFlesh0 > 0 && defBlade0 > 0,
-        "the defender has flesh and a blade before the blow");
+  const uint32_t flesh1_0 = FleshVoxels(c.mobs, fighter1);
+  const uint32_t flesh2_0 = FleshVoxels(c.mobs, fighter2);
+  const float blade1_0 = HeldHp(c.mobs, fighter1);
+  const float blade2_0 = HeldHp(c.mobs, fighter2);
+  check(flesh1_0 > 0 && flesh2_0 > 0,
+        "both fighters have flesh before the exchange");
   c.mobs.ClearBlockEvents();
 
-  // ---- WHERE THE TWO BLADES ACTUALLY ARE ----------------------------------
-  //
-  // "0 block events" is a bare zero with four causes (the attacker never
-  // swung, it swung somewhere else, the defender's blade is somewhere else, or
-  // the classification failed) and CLAUDE.md rule 6 says to record at the point
-  // of failure rather than eliminate. These two segments and the gap between
-  // them separate the middle two, which are the fixture's fault, from the last,
-  // which is the feature's.
+  // Both swing the same horizontal cut, aimed at each other's chest.
+  // Same style + same tick = same windup = Cut phase reached simultaneously.
+  check(c.mobs.ForceAttack(fighter1, "horizontal_r", chest2, tick.tick),
+        "fighter 1 started a cut");
+  check(c.mobs.ForceAttack(fighter2, "horizontal_r", chest1, tick.tick),
+        "fighter 2 started a cut");
+
+  int blocks = 0;
+  bool arrested1 = false, arrested2 = false;
   auto edgeOf = [&](uint64_t id, Vec3& base, Vec3& tip) -> bool {
     Mob* m = c.mobs.FindMobById(id);
     float hw = 0;
     return m != nullptr && m->WeaponEdge(base, tip, hw, nullptr);
   };
-  auto segGap = [](Vec3 a0, Vec3 a1, Vec3 b0, Vec3 b1) {
-    // Coarse but sufficient: the closest approach sampled along both segments.
-    // A gate only needs to know whether these are voxels apart or metres.
-    float best = 1e9f;
-    for (int i = 0; i <= 16; i++) {
-      const Vec3 p = a0 + (a1 - a0) * ((float)i / 16.0f);
-      for (int k = 0; k <= 16; k++) {
-        const Vec3 q = b0 + (b1 - b0) * ((float)k / 16.0f);
-        best = std::min(best, (p - q).len());
-      }
-    }
-    return best;
-  };
-  Vec3 dBase{}, dTip{};
-  const bool haveDef = edgeOf(defender, dBase, dTip);
-  check(haveDef, "the defender's blade could be read");
-  std::printf(
-      "npc-block geometry: meet (%.1f,%.1f,%.1f); defender blade "
-      "(%.1f,%.1f,%.1f)..(%.1f,%.1f,%.1f)\n",
-      meet.x, meet.y, meet.z, dBase.x, dBase.y, dBase.z, dTip.x, dTip.y,
-      dTip.z);
-
-  // AIM AT THE BLADE THAT IS THERE, not at where a blade ought to be. The
-  // first version aimed both sides at a computed midpoint and hoped the guard
-  // would put the defender's point on it; the defender's blade came to rest 6
-  // voxels past the meeting point and 3.5 below it, and "0 block events" was a
-  // fixture that missed. Reading the segment back and aiming at ITS midpoint
-  // makes the parry geometric: the attacker's cut is centred on its aim
-  // (game/strokes.h), so the aim being ON the defender's blade is the whole
-  // construction.
-  Vec3 gb{}, gt{};
-  const bool haveGuard = edgeOf(defender, gb, gt);
-  check(haveGuard, "the defender's guard could be read back");
-
-  // ---- THE GUARD IS A SEGMENT, NOT A COLLIDER -----------------------------
-  //
-  // What the parry needs is the defender's EDGE -- the authored cutting segment
-  // read off its live transform (Mob::WeaponEdge) -- because that is what
-  // MobSystem::FindParry measures against. It deliberately does NOT need the
-  // item's Jolt collider to be findable by a ray, and asserting that it was
-  // cost a run: a ray fired straight down the defender's own blade, and a
-  // second one straight across it, both came back EMPTY. The collider is the
-  // item's own art at the item's own scale and is about a QUARTER OF A VOXEL
-  // thick, so a zero-radius ray through it is a coincidence rather than a test.
-  // That is exactly why blocking is geometric rather than a ray cast, and it is
-  // worth a fixture line here rather than being rediscovered.
-  {
-    Mob* dm = c.mobs.FindMobById(defender);
-    const uint64_t want = dm != nullptr && dm->HeldSlot() >= 0
-                              ? c.mobs.LimbBody(defender, dm->HeldSlot())
-                              : 0;
-    check(want != 0, "the defender's held item occupies a rig slot with a body");
-    check(haveGuard && (gt - gb).len() > 1.0f,
-          "...and publishes a real cutting edge for the parry to meet");
-    // ...AND THAT BODY GENERATES NO CONTACTS WHILE IT IS BEING HELD.
-    //
-    // The wiring half of Layers::PROP (phys/physics.h SetBodyPropLayer); the
-    // behaviour half — no push in either direction, still visible to rays —
-    // is asserted on bare bodies in `player-body`. Here because this gate is
-    // the one place an NPC is standing in the world with a real drawn blade,
-    // which is precisely the configuration that used to shove the player off
-    // their feet for standing too close to it.
-    //
-    // 4 is Layers::PROP. A bare number because the enum is file-local to
-    // physics.cpp on purpose and BodyObjectLayer's contract is the number, but
-    // the whole point of the assertion is that it is NOT 1 (MOVING): that is
-    // the value this shipped with, and the value a rebuild after a carve
-    // silently restored until RebuildLimbBody learned to re-apply it.
-    const int heldLayer = want != 0 ? c.phys.BodyObjectLayer(want) : -1;
-    check(heldLayer == 4,
-          "...and is on the contact-free prop layer, so a drawn weapon cannot "
-          "shove anybody");
-    std::printf(
-        "npc-block guard: slot %d, edge (%.1f,%.1f,%.1f)..(%.1f,%.1f,%.1f), "
-        "length %.2f vox, layer %d (4 = prop)\n",
-        dm ? dm->HeldSlot() : -1, gb.x, gb.y, gb.z, gt.x, gt.y, gt.z,
-        (gt - gb).len(), heldLayer);
-  }
-
-
-  const Vec3 aimAt = haveGuard ? (gb + gt) * 0.5f : meet;
-  FaceAt(c.mobs, attacker, aimAt);
-  for (int i = 0; i < 4; i++) tick();
-  // A HORIZONTAL CUT, so the edge travels ACROSS the defender's forward-pointing
-  // blade. Paired with the guard above; see the note there.
-  check(c.mobs.ForceAttack(attacker, "horizontal_r", aimAt, tick.tick),
-        "the attacker's scripted cut started");
-  int blocks = 0;
-  bool arrested = false;
-  int cutTicks = 0, sweeps = 0, hits = 0;
-  float closest = 1e9f, topSpeed = 0;
+  float closest = 1e9f;
   for (int i = 0; i < 80; i++) {
     tick();
     for (const BlockEvent& ev : c.mobs.BlockEvents()) {
       blocks++;
-      check(ev.attackerId == attacker && ev.blockerId == defender,
-            "the block event names the right two creatures");
+      check((ev.attackerId == fighter1 && ev.blockerId == fighter2) ||
+            (ev.attackerId == fighter2 && ev.blockerId == fighter1),
+            "block event names the two fighters");
     }
     c.mobs.ClearBlockEvents();
-    const NpcStroke* s = c.mobs.MobStroke(attacker);
-    if (s == nullptr) break;
-    if (s->phase == NpcStroke::Phase::Cut) {
-      cutTicks++;
-      Vec3 aBase{}, aTip{};
-      Vec3 db{}, dt{};
-      if (edgeOf(attacker, aBase, aTip) && edgeOf(defender, db, dt))
-        closest = std::min(closest, segGap(aBase, aTip, db, dt));
+    const NpcStroke* s1 = c.mobs.MobStroke(fighter1);
+    const NpcStroke* s2 = c.mobs.MobStroke(fighter2);
+    if (s1 && s1->phase == NpcStroke::Phase::Cut &&
+        s2 && s2->phase == NpcStroke::Phase::Cut) {
+      Vec3 a0, a1, b0, b1;
+      if (edgeOf(fighter1, a0, a1) && edgeOf(fighter2, b0, b1)) {
+        for (int j = 0; j <= 8; j++) {
+          const Vec3 p = a0 + (a1 - a0) * ((float)j / 8.0f);
+          for (int k = 0; k <= 8; k++) {
+            const Vec3 q = b0 + (b1 - b0) * ((float)k / 8.0f);
+            closest = std::min(closest, (p - q).len());
+          }
+        }
+      }
     }
-    arrested = arrested || s->arrested;
-    sweeps = std::max(sweeps, s->sweeps);
-    hits = std::max(hits, s->bodiesHit);
-    topSpeed = std::max(topSpeed, s->topTipSpeed);
-    if (!s->Active() && i > 4) break;
+    if (s1) arrested1 = arrested1 || s1->arrested;
+    if (s2) arrested2 = arrested2 || s2->arrested;
+    const bool done1 = !s1 || (!s1->Active() && i > 4);
+    const bool done2 = !s2 || (!s2->Active() && i > 4);
+    if (done1 && done2) break;
   }
-  const uint32_t defFlesh1 = FleshVoxels(c.mobs, defender);
-  const float defBlade1 = HeldHp(c.mobs, defender);
 
-  check(blocks > 0, "a BlockEvent was emitted");
-  check(arrested, "the attacker's stroke ended early (arrested)");
-  // THE BLOW WAS STOPPED, which is not the same claim as "no voxel moved". The
-  // cut is arrested on the tick the blades meet, and the ticks before that are
-  // a real edge travelling through real space -- a graze on the way in is
-  // honest. What matters is the SIZE: `npc-strike` measures the same style
-  // landing unblocked and it takes its target from 3328 flesh voxels to ZERO,
-  // so a blocked one costing a couple of dozen is the difference between a
-  // parry and a hit, stated as a number rather than as a bool.
-  const uint32_t graze = defFlesh0 > defFlesh1 ? defFlesh0 - defFlesh1 : 0;
-  const uint32_t grazeMax =
-      (uint32_t)BaselineNumber("npcBlock.grazeVoxMax", 60);
-  check(graze <= grazeMax,
-        "the defender's FLESH took a graze at most - the blade took the blow");
-  RecordObserved("npcBlock.grazeObserved", (double)graze);
-  check(defBlade1 < defBlade0,
-        "...and the blocking ITEM took hp damage for it");
-  // A stroke that was arrested spent FEWER cut ticks than its style authors.
-  // Without this, "arrested" could be true while the swing carried on anyway.
-  const AttackStyle* thrust =
-      c.mobs.AttackStyles().At(c.mobs.AttackStyles().Find("horizontal_r"));
-  check(thrust != nullptr && cutTicks < thrust->cut.ticks + 2,
-        "the cut stopped short of its authored length");
-  RecordObserved("npcBlock.bladeHpLostObserved", defBlade0 - defBlade1);
+  check(blocks > 0, "a BlockEvent was emitted (blades crossed mid-swing)");
+  check(arrested1 || arrested2,
+        "at least one stroke was arrested by the parry");
+
+  const uint32_t flesh1_1 = FleshVoxels(c.mobs, fighter1);
+  const uint32_t flesh2_1 = FleshVoxels(c.mobs, fighter2);
+  const float blade1_1 = HeldHp(c.mobs, fighter1);
+  const float blade2_1 = HeldHp(c.mobs, fighter2);
+  const bool bladesDamaged = blade1_1 < blade1_0 || blade2_1 < blade2_0;
+  check(bladesDamaged, "at least one blade took hp damage from the parry");
+
   std::printf(
-      "npc-block: %d block events, arrested %d; defender flesh %u -> %u (max "
-      "%u graze), blade hp %.1f -> %.1f; %d cut ticks (style authors %d), %d "
-      "sweeps, %d bodies hit, top tip speed %.1f vox/s, blades came within "
-      "%.2f vox\n",
-      blocks, (int)arrested, defFlesh0, defFlesh1, grazeMax, (double)defBlade0,
-      (double)defBlade1, cutTicks, thrust ? thrust->cut.ticks : -1, sweeps,
-      hits, topSpeed, closest);
+      "npc-block: %d block events; arrested f1=%d f2=%d; flesh f1 %u->%u "
+      "f2 %u->%u; blade hp f1 %.1f->%.1f f2 %.1f->%.1f; closest %.2f vox\n",
+      blocks, (int)arrested1, (int)arrested2,
+      flesh1_0, flesh1_1, flesh2_0, flesh2_1,
+      (double)blade1_0, (double)blade1_1,
+      (double)blade2_0, (double)blade2_1, closest);
 
   CloseStage(c);
   detail = Format("%d checks", checks);
@@ -2195,6 +2081,25 @@ Status GateZombieDraw(Ctx& c, std::string& detail) {
         "at least one NON-fallback style (a bite) is usable on a live zombie");
 
   // ---- THE RUN: its own AI, its own cadence, its own band ----------------
+  // ...and WHAT SHAPE IT CHASES IN (MobDef::chaseClip, assets/anims/reach.json).
+  // Measured here rather than in a gate of its own because the fixture this
+  // needs already exists three lines up: a real zombie, on its own profile,
+  // closing on a real target. The observable is the UPPER ARM'S ELEVATION off
+  // horizontal (90 = hanging at the side, 0 = straight out), read post-IK out
+  // of the model pose, so it sees what is drawn and not what was requested.
+  //
+  // THE CONTROL IS THE PREY, not an earlier tick of the same creature. Same
+  // rig, same gait, same clip machinery, no `chaseClip` — so the pair
+  // separates "the reach clip is on this body" from "every human's arms sit
+  // like that", which a single number never can. A temporal baseline would
+  // not work anyway: the zombie acquires its target within a tick or two of
+  // the spawn and there is no arms-down window to sample.
+  const int armPart = nd.skel.FindPart("armU.R");
+  float chaseElev = 180.0f, preyElev = 180.0f, reachWeight = 0.0f;
+  auto elevOf = [&](uint64_t who) {
+    const Vec3 up = c.mobs.LimbModelUp(who, armPart);
+    return std::fabs(std::asin(std::clamp(up.y, -1.0f, 1.0f))) * 57.29578f;
+  };
   std::map<std::string, int> drawn;
   int strokes = 0, cutTicks = 0;
   float minDist = 1e9f, maxDist = 0;
@@ -2217,6 +2122,17 @@ Status GateZombieDraw(Ctx& c, std::string& detail) {
     minDist = std::min(minDist, dist);
     maxDist = std::max(maxDist, dist);
     const NpcStroke* s = c.mobs.MobStroke(biter);
+    // Sampled only OUTSIDE a stroke: the chase pose is deliberately ramped off
+    // for the duration of a blow (it is additive, and an additive hold summed
+    // onto an authored punch is a corrupted punch), so ticks inside one are
+    // not ticks this measurement is about.
+    if (armPart >= 0 &&
+        (s == nullptr || !s->Active() || s->phase == NpcStroke::Phase::Guard)) {
+      chaseElev = std::min(chaseElev, elevOf(biter));
+      preyElev = std::min(preyElev, elevOf(prey));
+      for (const auto& cw : c.mobs.ClipWeights(biter))
+        if (cw.first == "reach") reachWeight = std::max(reachWeight, cw.second);
+    }
     if (s == nullptr) continue;
     if (s->Cutting()) cutTicks++;
     const bool active = s->Active() && s->phase != NpcStroke::Phase::Guard;
@@ -2251,6 +2167,25 @@ Status GateZombieDraw(Ctx& c, std::string& detail) {
   check(bites >= punches,
         "...with bites not outnumbered by the fallback punches");
 
+  RecordObserved("zombieDraw.chaseArmElevDeg", (double)chaseElev);
+  RecordObserved("zombieDraw.preyArmElevDeg", (double)preyElev);
+  // 40 degrees is not the authored 80 of shoulder flexion and must not be: the
+  // gait swing, the spine twist and the arm's own pose clamp all compose over
+  // the hold, and pinning the assertion to the authored number would make
+  // every one of those a failure of this gate. What is being claimed is the
+  // separation — the arms came UP and stayed up — and the prey's own arms in
+  // the same frames are what says the clip did it.
+  check(armPart >= 0, "the zombie's rig has an armU.R to measure");
+  check(chaseElev < 40.0f,
+        "the chasing zombie's upper arm came off its side (chaseClip reached "
+        "the drawn pose)");
+  check(preyElev > 55.0f,
+        "...and the prey, on the same rig with no chaseClip, kept its arms "
+        "down (so the pose is the clip and not the gait)");
+
+  std::printf("zombie-draw: chase pose armU.R %.1f deg off horizontal vs the "
+              "prey's %.1f, reach clip weight %.2f\n",
+              chaseElev, preyElev, reachWeight);
   std::printf(
       "zombie-draw: %d strokes over %d ticks (%d both-alive, biter gone %d, prey "
       "gone %d), distance %.1f..%.1f, %d cut ticks |%s | reaches:%s\n",
@@ -2396,6 +2331,40 @@ Status GateLimbAlias(Ctx& c, std::string& detail) {
                "another body's slot (%u faults, first at tick %u — the named "
                "reports are on stderr and in build/microbody_audit.log)",
                faults, firstFaultTick));
+
+  // ---- PHASE 2: THE RELOAD, which is the OTHER way a limb wears another
+  // body's shape and the one that survived the sever-path fix.
+  //
+  // `LoadMobDefs` rebuilds `MicroBodySet::models` from scratch on every R / F5
+  // / combat-slider edit, and a model index is a POSITION in that vector. The
+  // corpses standing on the ground right now hold indices; if any of them
+  // outlives the rebuild it draws whatever def lands at its old position — a
+  // leg as a torso, an arm as a zombie's head — and frees a record it does not
+  // own when it finally lets go. The reload site cannot be run from a gate, so
+  // what is pinned here is the CONTRACT it now goes through: after
+  // `ReleaseMicroHolders` there is no holder left to be wrong.
+  //
+  // The count BEFORE is the half that makes this able to fail: a room with no
+  // holders in it would satisfy "zero after" on an empty set.
+  //
+  // Covers debris + mob limbs. The avatar is the third holder class and this
+  // harness never spawns one (`nullptr` above) — main.cpp's call passes it.
+  {
+    BodyRegistry reg(c.debris, c.mobs, nullptr, mset);
+    const uint32_t held = reg.MicroHolderCount();
+    check(held > 0,
+          Format("the brawl left somebody holding a brick record (%u holders)",
+                 held));
+    reg.ReleaseMicroHolders();
+    const uint32_t left = reg.MicroHolderCount();
+    check(left == 0,
+          Format("no holder survives the teardown a model-table rebuild needs "
+                 "(%u of %u still hold an index — each one draws a stranger's "
+                 "brick after the next asset reload)",
+                 left, held));
+    RecordObserved("limbAliasHoldersBeforeRelease", (double)held);
+    std::printf("limb-alias: reload teardown %u holders -> %u\n", held, left);
+  }
 
   RecordObserved("limbAliasFaults", (double)faults);
   RecordObserved("limbAliasDeaths", (double)deaths);

@@ -744,6 +744,20 @@ struct BurnMats {
   std::vector<uint32_t> charred;  // "gone": charred + ash
 };
 
+struct TissueMats {
+  uint32_t skin = 0, flesh = 0, muscle = 0, bone = 0, brain = 0;
+};
+
+TissueMats ResolveTissueMats(const MobSystem& mobs) {
+  TissueMats t;
+  t.skin   = mobs.MaterialIdNamed("skin");
+  t.flesh  = mobs.MaterialIdNamed("flesh");
+  t.muscle = mobs.MaterialIdNamed("muscle");
+  t.bone   = mobs.MaterialIdNamed("bone");
+  t.brain  = mobs.MaterialIdNamed("brain");
+  return t;
+};
+
 BurnMats ResolveBurnMats(const std::vector<MaterialDef>& mats) {
   BurnMats bm;
   // Named, never hardcoded by id (CLAUDE.md conventions), and the NAME LIST
@@ -818,6 +832,7 @@ struct SlotCoat {
 };
 
 void FillBodyUI(const PlayerAvatar& avatar, const BurnMats& burnMats,
+                const TissueMats& tissueMats,
                 const MobSystem& mobs, const std::vector<MaterialDef>& mats,
                 UIState& ui) {
   for (int i = 0; i < UIState::kSlotCount; i++) ui.body[i] = {};
@@ -875,6 +890,14 @@ void FillBodyUI(const PlayerAvatar& avatar, const BurnMats& burnMats,
           std::clamp((float)(cooked + charred * 2) / (float)(now * 2), 0.0f,
                      1.0f);
     }
+
+    b.voxelTotal = now;
+    if (tissueMats.skin)   b.voxelSkin   = avatar.PartMaterialCount(i, tissueMats.skin);
+    if (tissueMats.flesh)  b.voxelFlesh  = avatar.PartMaterialCount(i, tissueMats.flesh);
+    if (tissueMats.muscle) b.voxelMuscle = avatar.PartMaterialCount(i, tissueMats.muscle);
+    if (tissueMats.bone)   b.voxelBone   = avatar.PartMaterialCount(i, tissueMats.bone);
+    if (tissueMats.brain)  b.voxelBrain  = avatar.PartMaterialCount(i, tissueMats.brain);
+    b.voxelBrainMax = avatar.PartBrainAtSpawn(i);
 
     // What is ON the limb. The ledger is recounted by the creature itself at
     // its own bounded cadence (Mob::RecountCoat), so this is a read of three
@@ -968,24 +991,32 @@ bool LimbBoxCorners(const PlayerAvatar& av, Physics& phys, int part,
 // you can still see (the same lesson --shot-mob learned about corpses).
 PortraitCam MakePortraitCam(const PlayerAvatar& av, Physics& phys, float yaw,
                             float pitch, float aspect, float zoom,
-                            float panX, float panY) {
+                            float panX, float panY, int pivotSlot = -1) {
   PortraitCam pc;
   if (!av.Spawned() || !av.Def()) return pc;
   Vec3 lo{1e9f, 1e9f, 1e9f}, hi{-1e9f, -1e9f, -1e9f};
+  Vec3 pivotLo{1e9f,1e9f,1e9f}, pivotHi{-1e9f,-1e9f,-1e9f};
+  bool anyPivot = false;
   const int limbCount = (int)av.Def()->limbs.size();
   bool any = false;
   for (int i = 0; i < limbCount; i++) {
     Vec3 c[8];
     if (!LimbBoxCorners(av, phys, i, c)) continue;
     any = true;
+    const int s = BodySlotFor(av.PartName(i), av.PartTag(i));
     for (const Vec3& p : c) {
       lo = Vec3{std::min(lo.x, p.x), std::min(lo.y, p.y), std::min(lo.z, p.z)};
       hi = Vec3{std::max(hi.x, p.x), std::max(hi.y, p.y), std::max(hi.z, p.z)};
+      if (s == pivotSlot) {
+        pivotLo = Vec3{std::min(pivotLo.x,p.x),std::min(pivotLo.y,p.y),std::min(pivotLo.z,p.z)};
+        pivotHi = Vec3{std::max(pivotHi.x,p.x),std::max(pivotHi.y,p.y),std::max(pivotHi.z,p.z)};
+        anyPivot = true;
+      }
     }
   }
   if (!any) return pc;
 
-  pc.target = (lo + hi) * 0.5f;
+  pc.target = anyPivot ? (pivotLo + pivotHi) * 0.5f : (lo + hi) * 0.5f;
   pc.tanHalf = std::tan(CurrentTuning().camera.fovY * 0.5f);
   pc.aspect = aspect;
   const Vec3 half = (hi - lo) * 0.5f;
@@ -5851,6 +5882,7 @@ int main(int argc, char** argv) {
   // Burn-material ids for the inspector's charred readout, resolved ONCE here
   // and again after every materials reload — never per frame (see ResolveBurnMats).
   BurnMats burnMats = ResolveBurnMats(mats);
+  TissueMats tissueMats = ResolveTissueMats(mobs);
   // The blade's position last tick, so the sweep has something to sweep FROM.
   // Invalid until the first tick with a weapon drawn — a swing that started
   // from an unknown pose would carve a segment the blade never travelled.
@@ -6425,6 +6457,12 @@ int main(int argc, char** argv) {
         captured = false;
       } else {
         captured = captureBeforeUi;
+        ui.portraitYaw = 0.0f;  ui.portraitPitch = -0.08f;
+        ui.portraitZoom = 1.0f; ui.portraitZoomTarget = 1.0f;
+        ui.portraitPanX = 0.0f; ui.portraitPanXTarget = 0.0f;
+        ui.portraitPanY = 0.0f; ui.portraitPanYTarget = 0.0f;
+        ui.portraitPivotSlot = -1;
+        ui.inspectSelected = -1;
       }
       glfwSetInputMode(window, GLFW_CURSOR,
                        captured ? GLFW_CURSOR_DISABLED : GLFW_CURSOR_NORMAL);
@@ -6438,6 +6476,12 @@ int main(int argc, char** argv) {
       if (ui.inventoryOpen) {
         ui.inventoryOpen = false;
         captured = captureBeforeUi;
+        ui.portraitYaw = 0.0f;  ui.portraitPitch = -0.08f;
+        ui.portraitZoom = 1.0f; ui.portraitZoomTarget = 1.0f;
+        ui.portraitPanX = 0.0f; ui.portraitPanXTarget = 0.0f;
+        ui.portraitPanY = 0.0f; ui.portraitPanYTarget = 0.0f;
+        ui.portraitPivotSlot = -1;
+        ui.inspectSelected = -1;
       } else {
         captured = !captured;
       }
@@ -7285,6 +7329,7 @@ int main(int argc, char** argv) {
         // removes or reorders flesh_charred/ash has to re-resolve here or the
         // inspector's charred readout counts the wrong material.
         burnMats = ResolveBurnMats(mats);
+        tissueMats = ResolveTissueMats(mobs);
         ui.materialNames.clear();
         ui.materialColors.clear();
         for (auto& m : mats) {
@@ -9467,6 +9512,7 @@ int main(int argc, char** argv) {
       //
       // Deferred to this point for the same reason the laser kerf is: a carve
       // needs the `spawns` list debris.PreTick fills just above.
+      avatar.SetSwinging(melee.Cutting() || playerStrike.Cutting());
       if (avatar.Spawned() && meleeReady) {
         Vec3 eb, et, ef;
         float ehw = 0;
@@ -10528,7 +10574,7 @@ int main(int argc, char** argv) {
       // authored TAG and side suffix rather than by part name, so any humanoid
       // rig fills the same figure. A limb the rig does not have stays absent
       // and simply is not drawn.
-      FillBodyUI(avatar, burnMats, mobs, mats, ui);
+      FillBodyUI(avatar, burnMats, tissueMats, mobs, mats, ui);
       ui.locoState = avatar.Spawned() ? avatar.Locomotion().stateName : "";
       ui.spellCost = caster.compiled.manaCost;
       ui.spellWord = caster.compiled.wordCost;
@@ -10648,6 +10694,7 @@ int main(int argc, char** argv) {
           ui.portraitZoomTarget = 1.0f;
           ui.portraitPanXTarget = 0.0f;
           ui.portraitPanYTarget = 0.0f;
+          ui.portraitPivotSlot = -1;
           ui.portraitReset = false;
         }
         // Focus on a limb: compute its world-space bounding box and set
@@ -10682,14 +10729,12 @@ int main(int argc, char** argv) {
               }
             }
             if (anyBody && anyLimb) {
-              const Vec3 bodyCentre = (bodyLo + bodyHi) * 0.5f;
-              const Vec3 limbCentre = (limbLo + limbHi) * 0.5f;
               const Vec3 bodyHalf = (bodyHi - bodyLo) * 0.5f;
               const Vec3 limbHalf = (limbHi - limbLo) * 0.5f;
               const float halfH = std::max(0.5f, bodyHalf.y);
-              const Vec3 d = limbCentre - bodyCentre;
-              ui.portraitPanXTarget = d.dot(tmpCam.Right()) / halfH;
-              ui.portraitPanYTarget = d.dot(tmpCam.Up()) / halfH;
+              // The orbit now pivots on the limb itself, so pan resets to zero.
+              ui.portraitPanXTarget = 0.0f;
+              ui.portraitPanYTarget = 0.0f;
               const float limbSpan = std::max({limbHalf.x, limbHalf.y, limbHalf.z, 0.5f});
               ui.portraitZoomTarget = std::clamp(halfH / limbSpan * 0.55f, 1.0f, 6.0f);
             }
@@ -10714,7 +10759,7 @@ int main(int argc, char** argv) {
                                       ui.portraitPitch,
                                       (float)kPortraitW / (float)kPortraitH,
                                       ui.portraitZoom, ui.portraitPanX,
-                                      ui.portraitPanY);
+                                      ui.portraitPanY, ui.portraitPivotSlot);
         ProjectBodyUI(avatar, phys, portraitCam, ui);
       }
 
@@ -10746,6 +10791,12 @@ int main(int argc, char** argv) {
           if (lootOpenedScreen && ui.inventoryOpen) {
             ui.inventoryOpen = false;
             captured = captureBeforeUi;
+            ui.portraitYaw = 0.0f;  ui.portraitPitch = -0.08f;
+            ui.portraitZoom = 1.0f; ui.portraitZoomTarget = 1.0f;
+            ui.portraitPanX = 0.0f; ui.portraitPanXTarget = 0.0f;
+            ui.portraitPanY = 0.0f; ui.portraitPanYTarget = 0.0f;
+            ui.portraitPivotSlot = -1;
+            ui.inspectSelected = -1;
             glfwSetInputMode(window, GLFW_CURSOR,
                              captured ? GLFW_CURSOR_DISABLED
                                       : GLFW_CURSOR_NORMAL);
