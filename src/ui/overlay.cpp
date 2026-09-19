@@ -1430,6 +1430,52 @@ void Overlay::Draw(UIState& s) {
             ImGui::TextDisabled("and a mace beats plate in where a sword");
             ImGui::TextDisabled("skates off it");
           }
+          // WHAT IT WEARS. A mode combo, and under "custom" one picker per
+          // worn equip slot — mirrors main.cpp rebuilds off the item library
+          // (UIState::aiOutfit), so a new piece in assets/items appears here on
+          // the next R with no list to keep in step by hand.
+          ImGui::TextDisabled("wearing:");
+          {
+            static const char* kOutfits[] = {"nothing", "random clothes",
+                                             "full plate", "custom pieces"};
+            ImGui::SetNextItemWidth(160);
+            ImGui::Combo("outfit##ai", &s.aiOutfit, kOutfits, 4);
+            if (s.aiOutfit == 1) {
+              ImGui::TextDisabled("a shirt, legs and shoes drawn from the");
+              ImGui::TextDisabled("dyeable commoner set, each its own colour");
+            } else if (s.aiOutfit == 2) {
+              ImGui::TextDisabled("every slot's iron_* piece: helm, cuirass,");
+              ImGui::TextDisabled("greaves, sabatons, gauntlets");
+            } else if (s.aiOutfit == 3) {
+              ImGui::TextDisabled("(none) leaves that slot bare");
+              const int n = (int)std::min(s.aiWearNames.size(),
+                                          s.aiWearSlotLabels.size());
+              if ((int)s.aiWearPick.size() < n) s.aiWearPick.resize(n, 0);
+              for (int i = 0; i < n; i++) {
+                const std::vector<std::string>& names = s.aiWearNames[i];
+                if (names.size() <= 1) continue;   // nothing fits this slot
+                int& pick = s.aiWearPick[i];
+                if (pick < 0 || pick >= (int)names.size()) pick = 0;
+                ImGui::PushID(i);
+                ImGui::SetNextItemWidth(160);
+                // The label is the slot's own name from the equip table, so
+                // this reads "Head", "Chest", ... exactly as the character
+                // screen does.
+                if (ImGui::BeginCombo((s.aiWearSlotLabels[i] + "##aiwear").c_str(),
+                                      names[pick].c_str())) {
+                  for (int k = 0; k < (int)names.size(); k++) {
+                    ImGui::PushID(k);
+                    if (ImGui::Selectable(names[k].c_str(), k == pick)) pick = k;
+                    ImGui::PopID();
+                  }
+                  ImGui::EndCombo();
+                }
+                ImGui::PopID();
+              }
+            }
+            ImGui::TextDisabled("a blade no longer cuts armour OFF: it wears");
+            ImGui::TextDisabled("through in holes, and leaves with the limb");
+          }
           // FIRST, because it is the one that spawns the creature you PICKED
           // rather than a behaviour preset wearing its body. The three below
           // override the sidecar's own `behavior`, which is right when you

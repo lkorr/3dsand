@@ -10262,10 +10262,25 @@ bool Mob::CarveLimb(int limbIndex, World& world,
   // blast would have shed the head; hp reaching zero on a VITAL limb still
   // kills through HpZeroSevers below, because that is a statement about DEATH
   // rather than about amputation.
+  // A WORN SHELL IS NOT SEVERED BY DAMAGE (2026-09-19). Every structural rule
+  // in this function — the collapse fraction here, the connectivity split and
+  // the cut-through below it, the joint rule after that — was written for
+  // FLESH, and on a shell they answered a question armour does not ask: a
+  // cuirass is one authored micro thick, so a kerf sized for a thigh parts it
+  // in one blow, and "the strap is cut" fired on every second sword stroke.
+  // The owner's call: armour wears through in HOLES (the occlusion probe reads
+  // those as exposure already), it is CONSUMED by fire and acid (the burn
+  // flush keeps the collapse rule, or a robe burnt to nothing would sit on the
+  // body as an empty slot), and it leaves the body with the limb it is
+  // strapped to or with the corpse — never on its own because a blade cut it.
+  // The absolute kMinFragmentVoxels floor stays for every cause: that one is
+  // about whether Jolt can still be handed a body, not about dismemberment.
+  const bool shellStaysOn = IsWornSlot(limbIndex) && !inBurnFlush_;
   const bool collapsed =
       !inBluntCarve_ &&
       (limb.voxels.size() < kMinFragmentVoxels ||
-       (float)nowCount < kLimbCollapseFraction * (float)at0);
+       (!shellStaysOn &&
+        (float)nowCount < kLimbCollapseFraction * (float)at0));
   // HP IS NO LONGER A DISMEMBERMENT RULE (except where it always was — see
   // HpZeroSevers). It was the third of the three instant severs the owner's
   // spec deletes, and it is the one that survives a blade cut the longest: a
@@ -10449,8 +10464,9 @@ bool Mob::CarveLimb(int limbIndex, World& world,
       // and then found the remainder small is still a dent.
       if (!inBluntCarve_ &&
           (limb.voxels.size() < kMinFragmentVoxels ||
-           (float)(fine ? limb.skinVoxels.size() : limb.voxels.size()) <
-               kLimbCollapseFraction * (float)at0)) {
+           (!shellStaysOn &&
+            (float)(fine ? limb.skinVoxels.size() : limb.voxels.size()) <
+                kLimbCollapseFraction * (float)at0))) {
         Sever(limbIndex);
         return false;
       }
@@ -10473,7 +10489,9 @@ bool Mob::CarveLimb(int limbIndex, World& world,
       //
       // BLADE ONLY — see Mob::inBladeCut_. A blast has no "other side" and
       // fire has a tested account of its own.
-      if (inBladeCut_ &&
+      // ...and never a WORN SHELL: the edge coming out the other side of a
+      // plate is a hole in the plate, not a cut strap (shellStaysOn above).
+      if (inBladeCut_ && !shellStaysOn &&
           (float)partedOff >= gt.woundSeverFraction * (float)n) {
         Sever(limbIndex);
         return false;
@@ -10503,7 +10521,13 @@ bool Mob::CarveLimb(int limbIndex, World& world,
   // first. Blunt keeps its exclusion (it never amputates, however many land).
   //
   // Bounded: one or two passes over a lattice, on a tick that already carved.
-  if (JointRuleApplies(limbIndex) && !JointAttached(limbIndex)) {
+  //
+  // NOT FOR A WORN SHELL (shellStaysOn above): a garment has no joint, its
+  // "neck" is wherever its anchor point happened to land on the panel, and a
+  // few voxels carved there read as "hanging by a thread" on a plate that is
+  // otherwise whole.
+  if (!shellStaysOn && JointRuleApplies(limbIndex) &&
+      !JointAttached(limbIndex)) {
     Sever(limbIndex);
     return false;
   }

@@ -11708,6 +11708,39 @@ answered was a wall rather than a mechanic, which is what the blunt half of
 over `gear.bluntDentRadius` and puts `gear.bluntThrough` of itself into the
 body underneath either way.
 
+### A blade does not cut armour OFF (2026-09-19; `CarveLimb`'s `shellStaysOn`)
+
+The chip above was the first half of the owner's call and this is the second:
+a worn shell is **never severed by damage**. `CarveLimb`'s structural rules —
+the 25% collapse fraction, the connectivity split's cut-through, the
+hanging-by-a-thread joint rule — were all written for flesh, and on a shell
+each answered a question armour does not ask. A cuirass is one authored micro
+thick, so a kerf through it parted the plate on the first blow that found the
+edge; the joint rule measured "the neck" at wherever the shell's anchor point
+happened to land on the panel, so a few voxels carved there read as a limb
+about to fall off a plate that was otherwise whole. From outside both were
+"his armour fell off when I hit it", which is not a mechanic anyone tunes.
+
+What remains is exactly the list *A worn piece is a set of borrowed rig slots*
+promised: a shell wears through in HOLES (the occlusion probe reads those as
+exposure), it is CONSUMED by fire and acid (the burn flush keeps the collapse
+rule, or a robe burnt to nothing would sit on the body as an empty slot), and
+it leaves the body with the limb it is strapped to or with the corpse. The
+absolute `kMinFragmentVoxels` floor stays for every cause because it is about
+whether Jolt can be handed a body at all. `ShedGearBeforeDetach` and
+`armor-wear` 3d are unchanged: a shell that leaves by *any* route still takes
+its piece to the ground registry — there is simply no longer a route that a
+sword opens on its own.
+
+**The NPC AI panel dresses what it spawns** (`UIState::aiOutfit`, the Spawn
+tab's "wearing:" block). Nothing / random commoner clothes (a dyeable piece per
+slot, each in its own hashed colour) / full plate (every slot's `iron_*` piece)
+/ custom, one picker per worn equip slot, so "only a helmet and a cuirass" is
+two combos. Through `MobSystem::WearItem` on the same slots the player's kit
+uses, so the spawn is a creature in armour and not a dev object: its plate
+dents, its cloth burns, its corpse loots. The pickers are per-slot mirrors of
+the item library (`EquipSlotAccepts`), rebuilt on R and re-found by name.
+
 ### What leaves a body cannot launch anybody
 
 Everything that leaves a creature — a severed limb, a cut strap's plate, a

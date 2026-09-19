@@ -377,6 +377,26 @@ struct UIState {
   // UI edit: a zombie extends the human sidecar, so it inherits the socket.
   std::vector<std::string> aiCreatureNames;
   int aiCreaturePick = 0;
+  // ---- WHAT THE SPAWN WEARS (2026-09-19) ----------------------------------
+  //
+  // Until this the panel spawned every creature naked, and the only way to
+  // watch armour take a blow was to dress the AVATAR through the wardrobe and
+  // let something hit you. `aiOutfit` is the mode: 0 nothing (what it always
+  // did), 1 random commoner clothes (a dyeable piece per slot, each in its own
+  // random colour), 2 full plate (every slot's iron piece), 3 custom — one
+  // picker per worn equip slot, so "only a helmet and a cuirass" is two combos
+  // rather than a preset somebody has to author.
+  //
+  // The pickers are mirrors of the item library BY SLOT, rebuilt by main.cpp
+  // on every R and re-found by name, exactly like the weapon picker above.
+  // Indexed by worn equip slot in EquipSlotId order (Head, Chest, Legs, Boots,
+  // Shoulders, Hands, Belt, Trinket); entry 0 of each name list is "(none)".
+  // A slot no shipped item fits stays a one-entry list and the overlay skips
+  // drawing it, so the panel only ever shows slots something can go in.
+  int aiOutfit = 0;
+  std::vector<std::string> aiWearSlotLabels;
+  std::vector<std::vector<std::string>> aiWearNames;
+  std::vector<int> aiWearPick;
   bool aiSaveBehaviors = false;   // one-shot: write assets/mobs/behaviors.json
   bool aiApplyBehavior = false;   // one-shot: aiBehaviorPick -> the selected mob
   bool showAiDebug = false;       // in-world path / target / band viz

@@ -5621,6 +5621,37 @@ int main(int argc, char** argv) {
     fill(ui.wardrobeFeet, ui.wardrobeFeetPick, ItemKind::ArmorBoots);
   };
   rebuildWardrobe();
+  // ---- THE AI PANEL'S OUTFIT PICKERS (UIState::aiOutfit) -------------------
+  //
+  // One name list per WORN equip slot, every item the slot's authored rule
+  // accepts (EquipSlotAccepts — the same test a drag onto the character screen
+  // makes), dyeable or not. Same contract as the three wardrobe lists: names,
+  // rebuilt on every R, the pick re-found by name afterwards. The slot LABEL
+  // travels with it so the overlay can say "Head" without including the equip
+  // table.
+  auto rebuildAiWear = [&ui, &items]() {
+    std::vector<std::string> was(kEquipSlotCount);
+    for (int s = 0; s < (int)ui.aiWearNames.size() && s < kEquipSlotCount; s++)
+      if (s < (int)ui.aiWearPick.size() && ui.aiWearPick[s] > 0 &&
+          ui.aiWearPick[s] < (int)ui.aiWearNames[s].size())
+        was[s] = ui.aiWearNames[s][ui.aiWearPick[s]];
+    ui.aiWearSlotLabels.clear();
+    ui.aiWearNames.clear();
+    ui.aiWearPick.clear();
+    for (int s = 0; s < kEquipSlotCount; s++) {
+      if (!EquipSlotIsWorn(s)) break;   // Head..Trinket lead the table
+      std::vector<std::string> names{"(none)"};
+      for (const ItemDef& it : items.items)
+        if (EquipSlotAccepts(s, it.kind)) names.push_back(it.name);
+      int pick = 0;
+      for (int i = 0; i < (int)names.size(); i++)
+        if (!was[s].empty() && names[i] == was[s]) pick = i;
+      ui.aiWearSlotLabels.push_back(EquipSlotAt(s).label);
+      ui.aiWearNames.push_back(std::move(names));
+      ui.aiWearPick.push_back(pick);
+    }
+  };
+  rebuildAiWear();
   // WHICH CREATURE the panel spawns. Same contract as the weapon picker above,
   // for the same reason: the list is rebuilt off the LIVE defs on every R and
   // the selection is re-found BY NAME, because a def index is directory order
@@ -7287,6 +7318,7 @@ int main(int argc, char** argv) {
           // rule: a pattern added to items.json appears on this R without
           // moving what is already picked.
           rebuildWardrobe();
+          rebuildAiWear();
         }
         sim.UploadMicroBodies(ctx.queue, mbSet);
         mobs.SetDefs(std::move(mobDefs));
@@ -8137,6 +8169,68 @@ int main(int argc, char** argv) {
                                      : 0];
             const ItemDef* weapon = items.At(items.Find(pick));
             if (weapon != nullptr) mobs.EquipItem(nid, weapon);
+            // WHAT IT WEARS (UIState::aiOutfit). Through MobSystem::WearItem,
+            // the path the player's own equip slots take, so a spawn dressed
+            // here is a creature in armour and not a dev-only object: its
+            // plate dents, its cloth burns, and its corpse can be looted.
+            //
+            // Slot by slot in EquipSlotId order, one piece per slot. The
+            // random outfit and the dye are hashed off the tick and the mob id
+            // rather than rand(), so a replay dresses the same crowd.
+            {
+              int dressed = 0;
+              for (int s = 0; s < (int)ui.aiWearNames.size(); s++) {
+                if (!EquipSlotIsWorn(s)) break;
+                const ItemDef* piece = nullptr;
+                const uint32_t roll = rng::Hash3(tick, (uint32_t)nid, (uint32_t)s);
+                if (ui.aiOutfit == 1) {
+                  // RANDOM CLOTHES: a dyeable piece of this slot's kind. The
+                  // commoner set is chest / legs / boots, so a helmet slot has
+                  // no candidates and stays bare, which is the point.
+                  std::vector<const ItemDef*> cands;
+                  for (const ItemDef& it : items.items)
+                    if (it.dyeable && EquipSlotAccepts(s, it.kind))
+                      cands.push_back(&it);
+                  if (!cands.empty()) piece = cands[roll % cands.size()];
+                } else if (ui.aiOutfit == 2) {
+                  // FULL PLATE: the slot's `iron_*` piece. By name prefix
+                  // rather than by material because the stock set is authored
+                  // that way (scripts/gen_stock_armor.py) and nothing on an
+                  // ItemDef says "this is armour rather than a shirt".
+                  for (const ItemDef& it : items.items)
+                    if (EquipSlotAccepts(s, it.kind) &&
+                        it.name.rfind("iron_", 0) == 0) {
+                      piece = &it;
+                      break;
+                    }
+                } else if (ui.aiOutfit == 3) {
+                  const int wp = s < (int)ui.aiWearPick.size() ? ui.aiWearPick[s]
+                                                                : 0;
+                  if (wp > 0 && wp < (int)ui.aiWearNames[s].size())
+                    piece = items.At(items.Find(ui.aiWearNames[s][wp]));
+                }
+                if (piece == nullptr) continue;
+                // A dyeable piece gets a colour, the same "full saturation at a
+                // middling value" the wardrobe's random button uses: a random
+                // point in the RGB cube is mostly mud.
+                uint32_t dye = 0;
+                if (piece->dyeable) {
+                  float rgb[3];
+                  DyeFromHsv((float)(roll % 3600u) / 3600.0f,
+                             0.45f + (float)((roll >> 12) % 100u) / 100.0f * 0.5f,
+                             0.35f + (float)((roll >> 20) % 100u) / 100.0f * 0.5f,
+                             rgb);
+                  dye = DyePack(rgb[0], rgb[1], rgb[2]);
+                }
+                if (mobs.WearItem(nid, piece, s, dye)) dressed++;
+                else
+                  std::printf("AI panel: \"%s\" would not go on %s\n",
+                              piece->name.c_str(), d.name.c_str());
+              }
+              if (ui.aiOutfit != 0)
+                std::printf("AI panel: %s spawned wearing %d piece(s)\n",
+                            d.name.c_str(), dressed);
+            }
             // THE SIDECAR'S OWN PROFILE when the button asked for it, and the
             // same `empty() ? "duelist" : behavior` fallback --shot-strike
             // uses, so a def that names none still gets something that fights.
