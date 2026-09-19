@@ -1821,6 +1821,11 @@ def check_gas_consts():
                                            ("raymarch.wgsl", raymarch)]),
         ("kGasFarOuterShift", "GAS_FAROUT_SHIFT", [("sim_gas.wgsl", gas),
                                                    ("raymarch.wgsl", raymarch)]),
+        # ...and the ANISOTROPIC y shift (2026-09-19): 8-voxel cells vertically.
+        # The three copies disagreeing here is a plume drawn at the wrong
+        # HEIGHT — the ground-smoke bug this cell size was introduced to fix.
+        ("kGasFarOuterShiftY", "GAS_FAROUT_SHIFT_Y", [("sim_gas.wgsl", gas),
+                                                      ("raymarch.wgsl", raymarch)]),
     ]
     for cname, wname, shaders in pairs:
         want = cxx(cname)

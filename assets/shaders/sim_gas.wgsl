@@ -137,6 +137,10 @@ const GAS_FAR_EMIT_MAX    : u32 = 256u;   // kGasFarEmitMax
 // fine chunk in y. The strength is divided by it, so "a fully burning column"
 // is 1.0 whatever the cell size becomes.
 const GAS_FAR_STRENGTH_MAX : u32 = 1024u; // kGasFarEmitStrengthMax
+// The strength word's layout (world.h kGasFarEmitStrengthMask / WeightShift):
+// low 24 bits the count, top byte the crossfade weight.
+const GAS_FAR_STRENGTH_MASK : u32 = 0xFFFFFFu;
+const GAS_FAR_WEIGHT_SHIFT : u32 = 24u;
 // The WIDE section of the same buffer (world.h kGasFarEmitMaxWide /
 // kGasFarEmitWideBase): the emitters for the long-range box, at a FIXED word
 // offset so this kernel can address them without first reading the fine count.
@@ -146,6 +150,15 @@ const GAS_FAR_WIDE_BASE : u32 = 1028u;
 const GAS_FAROUT_N     : u32 = 128u;
 const GAS_FAROUT_SHIFT : u32 = 6u;
 const_assert (GAS_FAROUT_N << GAS_FAROUT_SHIFT) == 16u * WORLD_N;
+// The cell is ANISOTROPIC (world.h kGasFarOuterShiftY): 64 voxels in x/z and 8
+// in y, so the box's vertical span is the fine box's ±409.6 m. A 51.2 m-tall
+// cell put a canopy-height plume base in a cell that reached the ground.
+const GAS_FAROUT_SHIFT_Y : u32 = 3u;
+const_assert (GAS_FAROUT_N << GAS_FAROUT_SHIFT_Y) == 2u * WORLD_N;
+const GAS_FAROUT_OFF_Y : i32 = i32((GAS_FAROUT_N << GAS_FAROUT_SHIFT_Y) / 2u) -
+                               i32(WORLD_N / 2u);
+const GAS_FAROUT_SHIFTS : vec3<u32> =
+    vec3<u32>(GAS_FAROUT_SHIFT, GAS_FAROUT_SHIFT_Y, GAS_FAROUT_SHIFT);
 // The centring offset, floored-origin (world.h kGasFarOuterOffsetVox). The
 // fine box does not need the floor and this one does: the window origin is a
 // multiple of 16 voxels and this cell is 64, so without it the lattice would
@@ -164,54 +177,122 @@ const FAR_PLUME_WIDE_HMAX : f32 = 4.0;
 // keeps render.farPlumeHeight inside the box's half-extent (51.2 m = 64 cells),
 // so a thread per height covers the tallest legal plume with no loop.
 const FAR_PLUME_STEPS : u32 = 64u;
-// Splats per height step. Three, scattered inside a radius that grows with
-// height — this is what makes a plume rather than a line of cells.
-const FAR_PLUME_PUFFS : u32 = 3u;
+// ---- THE PUFFS, and the one afternoon they were something else -------------
+//
+// The deposit is hash-scattered PUFFS per height step: FAR_PLUME_PUFFS points
+// inside a radius that grows with height, each rounded to a cell. For one
+// afternoon on 2026-09-19 it was an enumerated disc footprint that filled every
+// cell the plume's cross-section touched, with a wander on the column, and it
+// looked "completely different and worse": a broad soft body whose base was
+// several chunks across, so the smoke no longer read as coming FROM the fire.
+// The puff look — a thin, broken, wispy column at 6.4 m cells — was the one the
+// player liked; it just needed to be THICKER. So the puffs are back, and the
+// thickness comes from what that afternoon did leave behind:
+//
+//   ONE EMITTER ADDS TO A GIVEN CELL AT MOST ONCE. Puffs of one thread that
+//   round to the same cell are MERGED before the add (gasFarPlume's `seen`
+//   loop), and the wide box deposits one bilinear puff whose four cells are
+//   distinct by construction. That divides the anti-carry worst case by the
+//   puff count, which is what let FAR_PLUME_ADD_MAX go 80 -> 240 and the
+//   per-puff density 72 -> 240 — the thickness — with the proof below getting
+//   STRONGER rather than weaker.
+//
+// Puffs per height step. Five, not three: with the merge above the count no
+// longer appears in the proof, so it is purely how many cells of the upper
+// column get smoke (the base rounds them all into one cell whatever the
+// number). Five is what fills the top of the old radius without the column
+// turning into the solid body the footprint was.
+const FAR_PLUME_PUFFS : u32 = 5u;
 // How wide the column gets by the top and how wide it starts, in METRES.
-// Metres and not cells, because there are two boxes now and a radius in cells
+// Metres and not cells, because there are two boxes and a radius in cells
 // would make the SAME fire eight times wider in the coarse box than in the
 // fine one -- the shape has to be a property of the plume, not of the grid it
-// is drawn on. (0.32 m / 2.56 m are exactly the 0.4 / 3.2 cells this was
-// before, at gasOuter's 0.8 m cell, so the near look is unchanged.)
+// is drawn on. These are the numbers the liked look had; they are under one
+// 6.4 m cell for most of the column, which is WHY it reads as a wisp.
 const FAR_PLUME_R0_M     : f32 = 0.32;
-const FAR_PLUME_SPREAD_M : f32 = 2.56;
-// Nominal density added per splat at the BASE of a fully burning column at
+const FAR_PLUME_SPREAD_M : f32 = 4.0;
+// Density per PUFF at the base of a fully burning column at
 // render.farPlumeStrength 1. The renderer divides a cell's count by (1<<SHIFT)^3
-// = 512 to get a volume fraction, so 3 x 56 = 168 is about a third of a solid
-// cell — a distinct but see-through plume, with several fires stacking toward
-// opaque.
-const FAR_PLUME_DENSITY : f32 = 56.0;
+// = 512 to get a volume fraction, so 240 is a cell 47% smoke by volume.
+//
+// 72 -> 240 (2026-09-19) is the "thicker". At the BASE it changes little: the
+// old three puffs of 72 all rounded into one cell and stacked to 216. In the
+// UPPER column, where the puffs scatter into separate cells, each cell used to
+// get ONE puff of 72 and now gets one of 240 — 3.3x — and that upper column is
+// what a distant fire mostly shows. It is exactly the 4x the renderer used to
+// apply as a distance-ramped gain, moved into the data so it holds at every
+// distance instead of switching on fifty metres past the window face.
+//
+// Equal to FAR_PLUME_ADD_MAX on purpose: strength 1 is the top of the range and
+// render.farPlumeStrength past 1 clips per-add (silently — nothing visible
+// breaks, the knob just stops doing anything). Raise ADD_MAX to go further,
+// and re-check the proof below.
+const FAR_PLUME_DENSITY : f32 = 240.0;
+// THE WIDE BOX'S CHORD, in fine cells per wide cell: 1 << (6 - 3) = 8. A ray
+// crosses 64 voxels of a wide cell against 8 of a fine one, so the same count
+// is eight times the optical depth; the wide deposit divides its mass by this
+// so the coarse box renders the fine box's column to the same opacity. This
+// was a hand-ramped 1/4..1/12 in the RENDERER until 2026-09-19; it is a
+// property of the two grids and belongs where the counts are written.
+const FAR_PLUME_WIDE_CHORD : f32 = f32(1u << (GAS_FAROUT_SHIFT - GAS_OUTER_SHIFT));
+// The wide cell is only wider in x/z; in y it is the fine cell, so the two
+// boxes hold a plume at the same number of height cells and one rise speed.
+const_assert GAS_FAROUT_SHIFT_Y == GAS_OUTER_SHIFT;
+// ...and how many fine cells a ray crosses of the fine column, on average over
+// its height: one at the base (every puff in one cell), about two at the top
+// (five puffs over a disc 1.3 cells across). The wide deposit is ONE puff per
+// height step against the fine box's five, so its mass is scaled by this over
+// the chord to match the fine box's LINE INTEGRAL rather than its puff count.
+// Measured, not derived: the gas-farplume gate's fine column against the
+// gas-farplume2 gate's wide one.
+const FAR_PLUME_WIDE_FILL : f32 = 1.5;
 // ---- THE ANTI-CARRY BOUND, and it is a PROOF rather than a margin ----------
 // gasOuter packs two 16-bit cells per word, so an add that overflows its half
 // carries into the neighbour's — a bright cell one over, on some runs only.
 // The parcel splat guards this by adding exactly 1; this one adds a WEIGHT, so
 // the guard has to be sized.
 //
-// Within one emitter no two threads can collide: a thread owns one cell of
-// HEIGHT and the three puffs only move in x/z, so every add of one workgroup
-// lands in a distinct cell-y. Across emitters they can, and the bound on how
-// many is the list cap itself. So the worst reachable value after a race is
+// ONE EMITTER CAN REACH A CELL ONLY ONCE, and that is what sizes this. A thread
+// owns one cell of HEIGHT; the fine kernel MERGES puffs that round to one cell
+// before adding, and the wide kernel's single bilinear puff touches four
+// distinct cells. So no two adds of one workgroup can land in the same cell. Across emitters they can, and the
+// bound on how many is the list cap itself. So the worst reachable value after
+// a race is
 //
-//     FAR_PLUME_CEIL + (GAS_FAR_EMIT_MAX * FAR_PLUME_PUFFS - 1) * FAR_PLUME_ADD_MAX
+//     FAR_PLUME_CEIL + (GAS_FAR_EMIT_MAX - 1) * FAR_PLUME_ADD_MAX
 //
-// and the const_assert below is that it still fits 16 bits. FAR_PLUME_CEIL is
-// where this kernel stops adding at all: 4,096 is eight times a fully solid
-// cell, i.e. far past opaque, so nothing visible is lost by capping there.
+// and the const_assert below is that it still fits 16 bits. That is a factor of
+// FAR_PLUME_PUFFS tighter than the unmerged version's bound, and spending
+// it on ADD_MAX is what pays for a physical density instead of a renderer-side
+// gain: 4,096 + 255 x 240 = 65,296, i.e. the 240 is the largest per-add this
+// packing admits at a 256-emitter cap and there is no margin left to take.
+//
+// FAR_PLUME_CEIL is where this kernel stops adding at all: 4,096 is eight times
+// a fully solid cell, i.e. far past opaque, so nothing visible is lost there.
 const FAR_PLUME_CEIL    : u32 = 4096u;
-const FAR_PLUME_ADD_MAX : u32 = 80u;
+const FAR_PLUME_ADD_MAX : u32 = 240u;
 const_assert FAR_PLUME_CEIL +
-    (GAS_FAR_EMIT_MAX * FAR_PLUME_PUFFS - 1u) * FAR_PLUME_ADD_MAX <= 0xFFFFu;
+    (GAS_FAR_EMIT_MAX - 1u) * FAR_PLUME_ADD_MAX <= 0xFFFFu;
 // ...and the SAME proof for the long-range box, restated against its own cap
 // rather than shared with the one above. The two caps are equal today; stating
 // it twice is what makes raising one of them a compile error instead of a
 // carry into a neighbouring cell on some runs.
 const_assert FAR_PLUME_CEIL +
-    (GAS_FAR_WIDE_MAX * FAR_PLUME_PUFFS - 1u) * FAR_PLUME_ADD_MAX <= 0xFFFFu;
-// How fast a plume packet rises, in gasOuter cells per tick. A gas voxel takes
-// one whole cell per tick in the CA's ladder and a cell is 1<<GAS_OUTER_SHIFT
-// voxels, so 1/8 is the parcel's own speed and the far plume climbs at the
-// speed the near smoke does.
-const FAR_PLUME_RISE : f32 = 0.125;
+    (GAS_FAR_WIDE_MAX - 1u) * FAR_PLUME_ADD_MAX <= 0xFFFFu;
+// How fast a plume packet rises, in VOXELS per tick — not in cells, which is
+// what this constant used to be and was a bug the moment a second box existed.
+// A gas voxel takes one whole voxel per tick in the CA's ladder, so 1.0 is the
+// parcel's own speed and the far plume climbs at the speed the near smoke does.
+//
+// IT HAS TO BE VOXELS BECAUSE THE TWO BOXES INDEX HEIGHT IN THEIR OWN CELLS.
+// `risen` is subtracted from `s`, and `s` counts 0.8 m cells in the fine box
+// and 6.4 m cells in the wide one. Expressed in cells, the same number made the
+// wide box's billows climb EIGHT TIMES too fast — 48 m/s rather than 6 — so a
+// distant plume scrolled like a shimmer instead of rising like smoke. Dividing
+// by the caller's own cellVox is what makes it one physical speed; the fine box
+// still evaluates to exactly the 0.125 it always had, so its contents do not
+// move. Consistent with FAR_PLUME_RISE_VPS below: 1 voxel/tick x 60 tps = 60.
+const FAR_PLUME_RISE_VOX : f32 = 1.0;
 // Voxels per second a plume rises, used ONLY to turn the wind speed into a
 // tilt: lateral cells per vertical cell is (wind vox/s) / this. 1 voxel/tick at
 // 60 ticks/s.
@@ -362,12 +443,13 @@ fn gasOuterAddCell(d : vec3<i32>, amount : u32) {
 // portable way to hand a kernel a pointer to one of two storage bindings, and
 // because the ORIGIN RULE genuinely differs: this one is floored to the cell.
 fn gasFarOuterOrigin() -> vec3<i32> {
-  return (((T.origin * i32(CHUNK)) - vec3<i32>(GAS_FAROUT_OFF))
-          >> vec3<u32>(GAS_FAROUT_SHIFT)) << vec3<u32>(GAS_FAROUT_SHIFT);
+  let off = vec3<i32>(GAS_FAROUT_OFF, GAS_FAROUT_OFF_Y, GAS_FAROUT_OFF);
+  return (((T.origin * i32(CHUNK)) - off) >> GAS_FAROUT_SHIFTS)
+         << GAS_FAROUT_SHIFTS;
 }
 
 fn gasFarOuterCell(c : vec3<i32>) -> vec3<i32> {
-  return (c - gasFarOuterOrigin()) >> vec3<u32>(GAS_FAROUT_SHIFT);
+  return (c - gasFarOuterOrigin()) >> GAS_FAROUT_SHIFTS;
 }
 
 fn gasFarOuterAddCell(d : vec3<i32>, amount : u32) {
@@ -379,6 +461,35 @@ fn gasFarOuterAddCell(d : vec3<i32>, amount : u32) {
   let sh = 16u * (li & 1u);
   if (((atomicLoad(&gasFarOuter[word]) >> sh) & 0xFFFFu) >= FAR_PLUME_CEIL) { return; }
   atomicAdd(&gasFarOuter[word], min(amount, FAR_PLUME_ADD_MAX) << sh);
+}
+
+// Deposit one puff at a FRACTIONAL x/z cell offset, bilinearly across the four
+// cells that straddle it. See PlumePuff's `fxz`: at 51.2 m cells a rounded
+// puff makes the column a bar.
+//
+// Y IS EXACT AND STAYS EXACT, which is not a detail — it is what keeps the
+// anti-carry proof above true word for word: a thread owns one cell of HEIGHT,
+// so its four adds are four distinct cells and no other thread of the
+// workgroup can reach them. Spreading in y would let two threads reach one
+// cell and the bound would have to be re-derived.
+//
+// The clamp happens BEFORE the split: `a` is already <= FAR_PLUME_ADD_MAX, the
+// four weights are in [0,1] and sum to 1, so every individual add is <=
+// ADD_MAX (what the const_assert counts). Clamping after the split would have
+// let a puff deposit up to 4x ADD_MAX and quietly invalidated the bound.
+fn gasFarOuterAddBilinear(c0 : vec3<i32>, fxz : vec2f, y : i32, amount : u32) {
+  let a = f32(min(amount, FAR_PLUME_ADD_MAX));
+  if (a <= 0.0) { return; }
+  let b = floor(fxz);
+  let f = fxz - b;
+  let bi = vec2<i32>(b);
+  let g = 1.0 - f;
+  // u32() truncates, so the four parts sum to slightly UNDER `a`. That is the
+  // conservative direction for the bound.
+  gasFarOuterAddCell(c0 + vec3<i32>(bi.x,      y, bi.y     ), u32(a * g.x * g.y));
+  gasFarOuterAddCell(c0 + vec3<i32>(bi.x + 1,  y, bi.y     ), u32(a * f.x * g.y));
+  gasFarOuterAddCell(c0 + vec3<i32>(bi.x,      y, bi.y + 1 ), u32(a * g.x * f.y));
+  gasFarOuterAddCell(c0 + vec3<i32>(bi.x + 1,  y, bi.y + 1 ), u32(a * f.x * f.y));
 }
 
 // Next-tick dirty mark incl. boundary neighbours — the gas passes run after
@@ -696,15 +807,22 @@ fn gasResolve(@builtin(global_invocation_id) gid : vec3<u32>) {
 // THE ANIMATION IS STATELESS. There is no per-plume state anywhere: the
 // billowing comes from hashing (emitter index, height packet), and the packet
 // index slides downward with the tick, so a given lump of turbulence RISES
-// through the column at FAR_PLUME_RISE cells a tick instead of the column
-// flickering in place.
+// through the column at FAR_PLUME_RISE_VOX voxels a tick instead of the column
+// flickering in place — one physical speed in both boxes, which is the whole
+// point of that constant being in voxels rather than in cells.
 
-// One splat: which cell OFFSET from the emitter's own cell, and how much.
+// One puff: which cell OFFSET from the emitter's own cell, and how much.
 // Offsets rather than absolute cells so the one shape function serves both
 // boxes — the caller adds its own `c0`, which is the only thing that differs.
-struct PlumeSplat {
+struct PlumePuff {
   off : vec3<i32>,
-  amount : u32,
+  // The SAME x/z offset, unrounded, for the wide box's bilinear deposit: its
+  // cell is 51.2 m against a plume radius under 5 m, so round() would send
+  // every puff of every height step to one cell and the column would be a bar
+  // with no taper, no per-height wander and no wind tilt until the wind was
+  // strong enough to jump a whole cell.
+  fxz : vec2f,
+  amt : f32,
 };
 
 // THE SHAPE, shared by both scales. `cellVox` is the box's cell size in voxels,
@@ -716,9 +834,20 @@ struct PlumeSplat {
 // (whose emitter is one 0.8 m column footprint and carries no information about
 // how large the fire really is) and sqrt(fine columns) for the wide list, whose
 // emitter aggregates up to 256 of them.
-fn plumeSplat(burn : f32, hMul : f32, s : u32, hCells : u32, idx : u32,
-              k : u32, cellVox : f32) -> PlumeSplat {
-  var o : PlumeSplat;
+//
+// THE COLUMN STANDS ON THE FIRE. The only lateral terms are the wind tilt (zero
+// at s = 0) and the puff scatter (radius 0.32 m at s = 0, a twentieth of a
+// cell), so the base of the plume is the emitter's own cell and nothing else.
+// The footprint pass added a height-keyed snake here and it put the base a cell
+// sideways at s = 0 (cos 0 = 1), which with the disc on top of it is what made
+// the smoke look as though it came from chunks away. No snake.
+// `cellXZ` / `cellY` are the box's cell sizes in voxels, and they are the ONLY
+// scale-bearing inputs: the radius, the tilt and the rise are carried in
+// physical units and divided by them here. They differ for the wide box (64
+// across, 8 tall) and not for the fine one.
+fn plumePuff(burn : f32, hMul : f32, s : u32, hCells : u32, idx : u32,
+             k : u32, cellXZ : f32, cellY : f32) -> PlumePuff {
+  var o : PlumePuff;
   let t = f32(s) / f32(hCells);          // 0 at the fire, 1 at the top
   // Wind tilt: lateral cells per vertical cell is the wind speed over the rise
   // speed, both in voxels/s — a RATIO, so it is the same number in either box
@@ -728,44 +857,66 @@ fn plumeSplat(burn : f32, hMul : f32, s : u32, hCells : u32, idx : u32,
   if (T.windMode != WIND_MODE_OFF) {
     let dir = vec2f(f32(T.windDirQ.x), f32(T.windDirQ.y)) / 65536.0;
     let spd = f32(T.windSpeedQ) / 65536.0;          // voxels/s
-    tilt = dir * (spd / FAR_PLUME_RISE_VPS) * f32(s);
+    // ...times this height in VOXELS, over the x/z cell: the ratio is voxels
+    // per voxel, and the two cell sizes need not agree.
+    tilt = dir * (spd / FAR_PLUME_RISE_VPS) * (f32(s) * cellY / cellXZ);
   }
   // The column widens and dilutes with height, which is the whole reason it
   // reads as smoke and not as a bar.
   let radM = (FAR_PLUME_R0_M + FAR_PLUME_SPREAD_M * t) * hMul;
-  let rad = radM / (VOXEL_METERS * cellVox);
+  let rad = radM / (VOXEL_METERS * cellXZ);
   // Density taper. Not to zero at the top: a plume that vanishes at a hard
   // height reads as a cut-off, and the renderer's fog is what should finish it.
-  let taper = 1.0 - 0.7 * t;
+  // 0.4 leaves the top at 60%, so the upper column — most of what you see of a
+  // distant fire — is a body of smoke rather than a taper to nothing.
+  let taper = 1.0 - 0.4 * t;
 
   // ---- the packet, which is what MOVES -------------------------------------
-  // A lump of turbulence born at the fire has risen FAR_PLUME_RISE cells a tick
-  // since, so the lump now at height s was born (s - risen) cells ago. Hashing
-  // on that difference makes the pattern travel up the column at exactly the
-  // speed a parcel would, with no state. The bias keeps the u32 conversion away
-  // from a wrap discontinuity at low tick counts.
-  let risen = i32(f32(T.tick) * FAR_PLUME_RISE);
-  let packet = u32(i32(s) - risen + 0x40000);
-
-  let h = hash3(GAS_PLUME_SALT ^ (idx * 2654435761u), packet, k);
-  // Two signed unit-ish offsets and one density roll out of one hash.
-  let ox = (f32(h & 0xFFu) / 127.5 - 1.0) * rad;
-  let oz = (f32((h >> 8u) & 0xFFu) / 127.5 - 1.0) * rad;
+  // A lump of turbulence born at the fire has risen FAR_PLUME_RISE_VOX voxels a
+  // tick since — (FAR_PLUME_RISE_VOX / cellY) of THIS box's height cells, which
+  // is what keeps the two boxes at one physical speed. So the lump now at
+  // height s was born (s - risen) cells ago, and hashing on that difference
+  // makes the pattern travel up the column at exactly the speed a parcel would,
+  // with no state.
+  //
+  // CONTINUOUS, NOT AN INTEGER (2026-09-19). `risen` used to be truncated, so
+  // every puff held its cell for eight ticks and then every puff in the column
+  // re-rolled at once — smoke that stepped rather than rose, the "choppy
+  // framerate" report. Now the lump index is fractional: the lump just below
+  // this height (pA, at s - f) and the one just above (pA + 1) are both rolled
+  // and their offsets and billow are MIXED by f. As the column rises f runs
+  // 1 -> 0, pA steps down and f wraps to 1 — and at the wrap both sides of
+  // the mix evaluate to the same lump, so nothing jumps. Two hashes a puff.
+  // The bias keeps the u32 conversion away from a wrap at low tick counts.
+  let risenF = f32(T.tick) * (FAR_PLUME_RISE_VOX / cellY);
+  let packetF = f32(s) - risenF;
+  let pA = floor(packetF);
+  let f = packetF - pA;
+  let salt = GAS_PLUME_SALT ^ (idx * 2654435761u);
+  let hA = hash3(salt, u32(i32(pA) + 0x40000), k);
+  let hB = hash3(salt, u32(i32(pA) + 0x40001), k);
+  // Two signed unit-ish offsets and one density roll out of each hash.
+  let oA = vec2f(f32(hA & 0xFFu), f32((hA >> 8u) & 0xFFu)) / 127.5 - 1.0;
+  let oB = vec2f(f32(hB & 0xFFu), f32((hB >> 8u) & 0xFFu)) / 127.5 - 1.0;
+  let oxz = mix(oA, oB, f) * rad;
   // 0.35..1.0 — the billow. Without it every puff is the same brightness and
   // the column is a smooth cone.
-  let bill = 0.35 + 0.65 * f32((h >> 16u) & 0xFFu) / 255.0;
-  let amt = TUNE_FAR_PLUME_STRENGTH * FAR_PLUME_DENSITY * burn * taper * bill;
-  o.off = vec3<i32>(i32(round(tilt.x + ox)), i32(s), i32(round(tilt.y + oz)));
-  o.amount = u32(max(amt, 0.0));
+  let bill = 0.35 + 0.65 * mix(f32((hA >> 16u) & 0xFFu),
+                               f32((hB >> 16u) & 0xFFu), f) / 255.0;
+  let ox = oxz.x;
+  let oz = oxz.y;
+  o.amt = TUNE_FAR_PLUME_STRENGTH * FAR_PLUME_DENSITY * burn * taper * bill;
+  o.fxz = vec2f(tilt.x + ox, tilt.y + oz);
+  o.off = vec3<i32>(i32(round(o.fxz.x)), i32(s), i32(round(o.fxz.y)));
   return o;
 }
 
 // How many cells of height this plume gets. `hMul` scales it, and the min
 // against FAR_PLUME_STEPS is the belt to the tuning clamp's brace: a knob
 // edited past the clamp costs a shorter plume, never an out-of-bounds thread.
-fn plumeHeightCells(hMul : f32, cellVox : f32) -> u32 {
+fn plumeHeightCells(hMul : f32, cellY : f32) -> u32 {
   let m = TUNE_FAR_PLUME_HEIGHT * hMul;
-  return min(u32(max(m / (VOXEL_METERS * cellVox), 1.0)), FAR_PLUME_STEPS);
+  return min(u32(max(m / (VOXEL_METERS * cellY), 1.0)), FAR_PLUME_STEPS);
 }
 
 @compute @workgroup_size(64)
@@ -783,15 +934,50 @@ fn gasFarPlume(@builtin(workgroup_id) wg : vec3<u32>,
   let base = vec3<i32>(bitcast<i32>(gasFarEmit[b + 0u]),
                        bitcast<i32>(gasFarEmit[b + 1u]),
                        bitcast<i32>(gasFarEmit[b + 2u]));
-  // 0..1: how much of this column footprint is actually on fire.
-  let burn = clamp(f32(gasFarEmit[b + 3u]) / f32(GAS_FAR_STRENGTH_MAX), 0.0, 1.0);
+  // 0..1: how much of this column footprint is actually on fire, times the
+  // CROSSFADE WEIGHT in the word's top byte (world.h kGasFarBlendVox): an
+  // emitter in the shell inside the fine box's face fades out here at full
+  // size while its wide twin fades in.
+  let sw = gasFarEmit[b + 3u];
+  let burn = clamp(f32(sw & GAS_FAR_STRENGTH_MASK) / f32(GAS_FAR_STRENGTH_MAX),
+                   0.0, 1.0) * (f32(sw >> GAS_FAR_WEIGHT_SHIFT) / 255.0);
   // The emitter's own cell, from the SAME expression the CPU filtered the list
   // with and the renderer samples the box with (gasOuterCell above).
   let c0 = gasOuterCell(base);
 
+  // THE MERGE. Every (cell, amount) a puff wants to deposit goes through one
+  // list that sums same-cell entries, and each cell is added ONCE — so an
+  // emitter reaches a cell at most once per height, which is the fact the
+  // anti-carry proof at FAR_PLUME_ADD_MAX rests on. The sum is clamped by
+  // gasOuterAddCell's own min() against ADD_MAX, which is what keeps a stacked
+  // base cell at the old three-puff density rather than five times it.
+  //
+  // BILINEAR, like the wide box, since the packet went continuous: a puff whose
+  // position glides has to be able to glide between cells, and a rounded
+  // deposit would hop a whole 6.4 m cell at a time. Four entries per puff.
+  var seen : array<vec2<i32>, 4u * FAR_PLUME_PUFFS>;
+  var amt : array<f32, 4u * FAR_PLUME_PUFFS>;
+  var nSeen = 0u;
   for (var k = 0u; k < FAR_PLUME_PUFFS; k++) {
-    let sp = plumeSplat(burn, 1.0, s, hCells, wg.x, k, cellVox);
-    gasOuterAddCell(c0 + sp.off, sp.amount);
+    let sp = plumePuff(burn, 1.0, s, hCells, wg.x, k, cellVox, cellVox);
+    let b = floor(sp.fxz);
+    let fr = sp.fxz - b;
+    let bi = vec2<i32>(b);
+    for (var q = 0u; q < 4u; q++) {
+      let cell = bi + vec2<i32>(i32(q & 1u), i32(q >> 1u));
+      let w = select(1.0 - fr.x, fr.x, (q & 1u) == 1u) *
+              select(1.0 - fr.y, fr.y, (q >> 1u) == 1u);
+      let a = sp.amt * w;
+      var merged = false;
+      for (var m = 0u; m < nSeen; m++) {
+        if (all(seen[m] == cell)) { amt[m] += a; merged = true; break; }
+      }
+      if (!merged) { seen[nSeen] = cell; amt[nSeen] = a; nSeen++; }
+    }
+  }
+  for (var m = 0u; m < nSeen; m++) {
+    gasOuterAddCell(c0 + vec3<i32>(seen[m].x, i32(s), seen[m].y),
+                    u32(max(amt[m], 0.0)));
   }
 }
 
@@ -814,22 +1000,45 @@ fn gasFarPlumeWide(@builtin(workgroup_id) wg : vec3<u32>,
   // strength is the SUM and can be far more than one full column. Two different
   // things are read out of it, which is the whole reason the wide list is worth
   // aggregating rather than just truncating:
-  //   burn  saturates at ONE full column. Past that a plume is not denser, it
-  //         is bigger — and at this range "how opaque" is not the signal.
+  //   cols  how many full fine columns it stands for, which scales the MASS
+  //         (see `stack` below) -- the fine box stacks those columns' counts
+  //         in its own cells, and the wide box has to stack them too or the
+  //         handover drops to a fraction of the fine box's opacity.
   //   hMul  sqrt(columns), capped. One burning tree is a wisp; a burning
   //         hillside is a column four times as tall and proportionally wide.
-  let cols = f32(gasFarEmit[b + 3u]) / f32(GAS_FAR_STRENGTH_MAX);
-  let burn = clamp(cols, 0.0, 1.0);
+  let sw = gasFarEmit[b + 3u];
+  let cols = f32(sw & GAS_FAR_STRENGTH_MASK) / f32(GAS_FAR_STRENGTH_MAX);
+  // The crossfade weight scales the MASS only (below): the height and width
+  // come from the unweighted column count, so a plume fading in across the
+  // shell fades in at its full size rather than growing into it.
+  let blend = f32(sw >> GAS_FAR_WEIGHT_SHIFT) / 255.0;
   let hMul = clamp(sqrt(max(cols, 0.0)), 1.0, FAR_PLUME_WIDE_HMAX);
 
-  let cellVox = f32(1u << GAS_FAROUT_SHIFT);
-  let hCells = plumeHeightCells(hMul, cellVox);
+  let cellXZ = f32(1u << GAS_FAROUT_SHIFT);
+  let cellY = f32(1u << GAS_FAROUT_SHIFT_Y);
+  let hCells = plumeHeightCells(hMul, cellY);
   let s = li.x;
   if (s >= hCells) { return; }
 
   let c0 = gasFarOuterCell(base);
-  for (var k = 0u; k < FAR_PLUME_PUFFS; k++) {
-    let sp = plumeSplat(burn, hMul, s, hCells, wg.x + 0x9E37u, k, cellVox);
-    gasFarOuterAddCell(c0 + sp.off, sp.amount);
-  }
+  // ONE bilinear puff per height step, not five: four cells that are distinct
+  // by construction, which is this box's half of the one-add-per-cell rule the
+  // anti-carry proof rests on. Its mass is the fine box's five puffs' worth of
+  // LINE INTEGRAL — five over the chord, times the fine cells a ray crosses —
+  // so the coarse box shows the fine box's column at the fine box's opacity
+  // and the renderer folds both into one accumulator with no scale at all.
+  //
+  // AND IT STACKS. The fine box draws a burning chunk as up to four emitters
+  // whose puffs land in the same or adjacent cells and ADD; a hillside is
+  // dozens of fine columns per 51.2 m cell, all of them summing there. The
+  // wide emitter is the aggregate of those columns, so its mass is one
+  // column's times how many it stands for -- `cols`, not `burn` (which
+  // saturates at one and was measured 3-4x too faint against the fine box on
+  // the gas-farplume2 fixture). Capped at the 8x8 fine columns a wide cell
+  // holds; the per-add clamp in gasFarOuterAddCell saturates a real hillside
+  // at 47% smoke by volume long before that, which is opaque.
+  let sp = plumePuff(1.0, hMul, s, hCells, wg.x + 0x9E37u, 0u, cellXZ, cellY);
+  let stack = clamp(cols, 0.0, FAR_PLUME_WIDE_CHORD * FAR_PLUME_WIDE_CHORD) * blend;
+  let m = sp.amt * stack * (FAR_PLUME_WIDE_FILL / FAR_PLUME_WIDE_CHORD);
+  gasFarOuterAddBilinear(c0, sp.fxz, i32(s), u32(max(m, 0.0)));
 }

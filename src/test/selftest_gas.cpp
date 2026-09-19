@@ -1056,7 +1056,7 @@ Status GateGasFarPlume(Ctx& c, std::string& detail) {
 // cascade DRAWS. A fire 200 m out is plainly visible as frozen orange in the
 // far field and, before this, had nowhere at all to put its smoke: it was not
 // in the near box, so package A could not help it. The LONG-RANGE box (world.h
-// kGasFarOuterN) is 128 cells of 64 voxels — 6.4 m cells over ±409.6 m, which
+// kGasFarOuterN) is 128 cells of 64 x 8 x 64 voxels — 51.2 m across, 6.4 m tall, which
 // is exactly far cascade level 4's box edge, so the plume LOD boundary and the
 // terrain LOD boundary are the same distance instead of two visible rings.
 //

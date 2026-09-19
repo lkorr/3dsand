@@ -1385,12 +1385,12 @@ nobody cleared is the direct positive observation that no gas row was recorded,
 where asserting zero density would have been satisfied by a row that ran and
 added nothing.
 
-**THE LONG-RANGE HALF (the same day; `gasFarPlumeWide`, `gasFarOuter`).** ±51.2 m
-is a sliver of what the cascade draws, so a fire 200 m out was still a silent
+**THE LONG-RANGE HALF (the same day; `gasFarPlumeWide`, `gasFarOuter`).** The fine
+box's ±409.6 m is a sliver of what the cascade draws, so a fire 200 m out was still a silent
 orange smear. There is a second density box, identical in every respect except
 its cell size:
 
-* **128 cells of 64 voxels — 6.4 m cells over ±409.6 m.** The number this is
+* **128 cells of 64 x 8 x 64 voxels — 51.2 m across, 6.4 m tall, over ±3276.8 m in x/z and the fine box's ±409.6 m in y** (anisotropic since 2026-09-19, below). The number this is
   chosen FOR is the box edge: `128 << 6 = 8,192` voxels is **exactly far cascade
   level 4's box edge** (`kFarN << (4 + kFarShiftBase)`, which reduces to
   `16 * kWorldN` because the cascade's alignment constant makes
@@ -1403,14 +1403,13 @@ its cell size:
   is a multiple of 16 voxels and this cell is 64, so without the floor the whole
   lattice would slide 1.6 m sideways on every window shift and a settled plume
   would visibly re-quantise as the player walked. It costs up to 48 voxels of
-  off-centreness out of ±409.6 m.
-* **The two emitter lists are DISJOINT**, split in the max norm at the fine box's
-  own half-extent, and they live in two sections of one buffer (the header words
+  off-centreness out of ±3276.8 m.
+* **The two emitter lists are split in the max norm at the fine box's own
+  half-extent** and live in two sections of one buffer (the header words
   reserved when the fine half landed now carry the wide count and the wide box's
-  shift). A fire is in one list or the other, never both — so "the two boxes
-  cannot double-brighten" is a property of the DATA rather than of a blend weight
-  the renderer has to get right, and the raymarch needs no crossfade at all: the
-  coarse segment simply starts where the fine box's ends.
+  shift). They were strictly DISJOINT until the crossfade shell below; a fire
+  deeper than one wide cell inside the face is fine-only, past the face
+  wide-only, and in the shell it is in both with weights that sum to one.
 * **The wide list is aggregated AGAIN, per coarse column.** A 6.4 m cell holds up
   to 8x8 fine columns in x/z and four chunks in y, so without it one burning
   hillside would spend the whole 256-emitter budget on a patch 64 voxels across.
@@ -1420,11 +1419,11 @@ its cell size:
   not more opaque, it is bigger) and a height multiplier of `sqrt(columns)`
   capped at 4. A burning tree is a wisp; a burning hillside is a column four
   times as tall and proportionally wide.
-* **The shape is shared, and carried in METRES.** `plumeSplat` is one function
+* **The shape is shared, and carried in METRES.** `plumeShape` is one function
   both kernels call; the radius and the height are metres divided by the box's
   cell size at the point of use, because a radius in CELLS would make the same
   fire eight times wider in the coarse box than in the fine one.
-* **The raymarch cost is a third segment of `gasOuterFill`**, 16 steps, gated on
+* **The raymarch cost is a third segment of `gasOuterFill`**, 32 steps, gated on
   its own `RenderParams` bit 5 rather than sharing bit 3 — a campfire ten metres
   away arms bit 3 every frame and must not also put a second 4 MiB volume walk on
   every terrain pixel. The samples fold into the SAME accumulator with **no scale
@@ -1453,14 +1452,150 @@ world where the whole feature is off, which is exactly the per-tick cost rule 2
 forbids. What it asserts instead is that nothing arms, nothing is recorded and
 the box is untouched.
 
-**What it does not do.** Past ±409.6 m a fire is still silent, and deliberately:
-that band is behind ~90% fog. The handover between the two boxes is a STRICT
-switch rather than a crossfade, so a fire crossing 51.2 m as the window walks
-changes plume representation in one frame — bounded (both plumes are the same
+**What it does not do.** Past `render.farPlumeRange` a fire is silent. The
+handover between the two boxes is a STRICT switch rather than a crossfade, so a
+fire crossing 409.6 m as the window walks changes plume representation in one
+frame — bounded (both plumes are the same
 physical column, the cells differ) and the same class of transition the cascade
 itself makes at a level boundary. If it proves visible, the fix is a per-emitter
 weight so a shell of distance feeds both lists with complementary strengths; the
 record is full at four words, so that costs a fifth.
+
+### One smoke density, three resolutions (2026-09-19; `sim_gas.wgsl` `plumePuff`, `raymarch.wgsl` `gasOuterFill`)
+
+The report was that a burning tree's smoke went **wispy and half-transparent the
+moment its chunk left the window, and then billowed into a cloud further out** --
+i.e. the representations of one plume (CA voxels + parcels in the window, the
+fine box outside it, the coarse box past 409.6 m) each drew it at a different
+opacity, with the changes landing exactly at the handovers. Three things the
+renderer was doing, and one thing it was compensating for:
+
+* **A 4x brightness gain, ramped in over the 51.2 m past the window face.** It
+  existed because a far plume read as nothing; it meant the plume was at 1x
+  exactly where it handed over from real smoke and at 4x fifty metres later.
+  Deleted.
+* **A wide-box correction ramped from 1/4 to 1/12 over the next 60 m**, because
+  the same fire came out ~24x more opaque in the coarse box. Deleted; the
+  correction is a property of the two grids and is applied where the counts
+  are WRITTEN (`FAR_PLUME_WIDE_CHORD`, below).
+* **A meander that warped the coarse box's LOOKUP** (not its data), displacing
+  that box's plume up to 8 m from the fine box's drawing of the same column --
+  a lateral jump at the handover. Deleted.
+* **The splat's per-puff density was capped at 80 by the anti-carry proof**,
+  which counted `256 emitters x 3 puffs` adds into one cell. The upper column,
+  where the puffs scatter into separate cells, got one puff of 72 per cell.
+  That thinness is what the 4x gain was hiding.
+
+**What did NOT change: the look.** The deposit is still hash-scattered puffs
+rounded to cells, radius 0.32 m at the fire to 4.3 m at 28 m, taper to 60% --
+the thin, broken, wispy column the player liked. For one afternoon it was an
+enumerated disc footprint with a height-keyed snake, and that was rejected on
+sight: a broad soft body whose base was several chunks across, so the smoke no
+longer read as coming FROM the fire (the snake's `cos 0 = 1` put the base a cell
+sideways, and the disc on top of it did the rest). Recorded so nobody tries it
+again as a first move: **the thickness problem was density, not shape.**
+
+**Where the thickness came from: one emitter adds to a cell at most once.** The
+fine kernel MERGES puffs of one thread that round to the same cell before adding
+(`seen` loop); the wide kernel deposits one bilinear puff whose four cells are
+distinct by construction. The anti-carry worst case therefore drops from
+`(EMIT x PUFFS - 1) x ADD_MAX` to `(EMIT - 1) x ADD_MAX`, which let
+`FAR_PLUME_ADD_MAX` go 80 -> **240** with the proof getting STRONGER
+(`4096 + 255 x 240 = 65,296 <= 0xFFFF`, no margin left) -- and with the puff
+count out of the proof, five puffs instead of three fill the top of the radius.
+Per-puff density 72 -> 240: unchanged at the BASE (three 72s stacked to 216
+before; the merge sums to the same cell and the clamp holds it at 240), 3.3x in
+the UPPER column, which is what a distant fire mostly shows. That is the 4x the
+renderer used to ramp in, moved into the data so it holds at every distance.
+
+**The wide box agrees by arithmetic, not by a ramp.** Its one puff carries
+`amt x cols x FILL / CHORD`: `CHORD = 8` fine cells per wide cell (a ray crosses
+64 voxels of a wide cell against 8 of a fine one -- the exact factor the old
+comment derived), `FILL = 1.5` fine cells a ray crosses of the fine column on
+average over its height (measured on the two gate fixtures), and `cols` because
+the fine box STACKS the columns a wide emitter aggregates -- a burning chunk is
+four fine emitters adding into the same cells, and `burn` saturating at one
+column was measured 3-4x too faint against it. Result on the fixtures: the fine
+column peaks at 796 (four stacked emitters), the wide at 100, and a ray
+integrates ~14 vs ~12.5 voxel-lengths across the handover, where the two
+representations used to differ by the 24x that the 1/4..1/12 ramp existed for.
+`gasOuterFill` now folds all three segments into one accumulator with **no scale
+factor of any kind**; `render.farPlumeStrength` is the one knob and has no
+distance in it.
+
+**`render.farPlumeRange` defaulted to exactly the distance the wide list
+starts.** The wide section takes emitters at max-norm >= `kWorldN` voxels
+(409.6 m) and <= the range; the default range was 409.6 m and the tuner's slider
+maximum was 409.6 m as well, so the long-range half was **unreachable** -- a fire
+past 409.6 m had no smoke at all, the box was never written, and the "billowing
+cloud" the report described was the fine box at 4x, not the coarse one. Default
+3276.8 m (the box's own half-extent), slider to match. It costs nothing for a
+world whose fires are close: the wide list is capped and sorted nearest-first.
+
+**The handover is a CROSSFADE SHELL now, not a strict split (third round, same
+day).** The reported symptom: *"the smoke trail shrinks down really small before
+transitioning to the farthest LOD."* Cause: the split was per EMITTER, and a
+burning tree is several emitters (2x2 columns per chunk, several chunks), so its
+columns crossed 409.6 m one at a time — the fine plume lost columns and shrank
+while the wide aggregate gained them. Now an emitter within `kGasFarBlendVox`
+(64 voxels, one wide cell) INSIDE the fine box's face is in BOTH lists, with
+complementary weights carried in the top byte of the record's strength word
+(low 24 bits the count). The fine kernel multiplies the weight into `burn`; the
+wide kernel multiplies it into the MASS only and derives height and width from
+the unweighted count, so the coarse plume fades in at full size instead of
+growing into it. A wide record aggregating several columns carries their
+strength-weighted mean weight. The raymarch's wide segment now starts at the
+WINDOW FACE rather than at the fine box's exit, because the fading-in twin lives
+in wide cells inside the fine box's volume and the old start never sampled them.
+"No double-brightening" is no longer a property of disjoint data; it is the
+weights summing to one, and a ray through the shell collects the same total at
+every point of it.
+
+What still steps: `hMul = sqrt(columns)` capped at 4 makes a LARGE fire's wide
+column taller than its fine columns, so a hillside fire gains height across the
+shell (a single tree, `cols < 1`, does not). Inherent to "many columns" vs "one
+aggregate"; attack it if it reads.
+
+**The second round (same day): the wide cell is anisotropic, the animation is
+continuous, and the index can explain itself.** Three more reports against the
+build above:
+
+* *"At a larger distance the ground under the trees is covered in smoke."* The
+  wide cell was 51.2 m TALL. A plume base at canopy height sat in a cell that
+  reached the ground, and the sampler's smoothstepped trilinear then bled it a
+  cell further down — so a burning canopy painted smoke over a 100 m footprint
+  of ground. The vertical never needed 51.2 m: fires are on the terrain and
+  plumes climb tens of metres, so the box is now **64 x 8 x 64 voxels**
+  (`kGasFarOuterShiftY = kGasOuterShift`), 128 y-cells spanning exactly the
+  fine box's ±409.6 m, same 4 MiB, x/z reach untouched. Every per-axis
+  expression (origin floor, cell mapping, the reader in `support.cpp`, the
+  raymarch slab test, the tilt-per-height-cell in `plumePuff`) took the y
+  shift on its y line, and `check_invariants.py` pins the three copies. It
+  also makes a plume the SAME number of height cells in both boxes, where the
+  wide column had been one cell tall against the fine box's four.
+* *"The framerate of the smoke LOD is choppy."* `risen` — how far the
+  turbulence packet has climbed — was truncated to an integer, so every puff
+  held its cell for eight ticks (64 in the wide box) and then the whole column
+  re-rolled at once. It is fractional now: the lump just below a height and the
+  lump just above are both hashed and their offsets and billow are MIXED by the
+  fraction, which is continuous through the wrap because both sides of the mix
+  evaluate to the same lump there. Two hashes a puff. And since a puff's
+  position now glides, the fine deposit went BILINEAR too (four cells a puff,
+  merged per cell before the single add) — a rounded deposit would still have
+  hopped a whole 6.4 m cell.
+* *"Two distant burning trees swap their smoke as I step forward and back."*
+  Not reproduced here and not diagnosable by reading: the harvest that feeds
+  the index is asynchronous (a plane's readback completes ticks after the
+  eviction), a store MISS on the way back in re-derives a chunk from worldgen +
+  1-in-8 `FarEdits` samples, the emitter sort key is distance from a window
+  centre that moves, and the far march's `tEnd` bounds the smoke integral
+  behind pending cascade faces. Any of those could do it. So the index got an
+  instrument instead of a guess: **`SANDVOX_PLUME_DEBUG=1`** prints one stderr
+  line per harvest that changes a chunk's emitter count (with the hot-voxel
+  total) and one per chunk whose LIST changes on a rebuild (`IN-WINDOW` /
+  `fine` / `wide` / `out-of-range` / `outside-box`, with the window origin).
+  If the swap shows there, it is the index; if the lines are quiet while the
+  smoke swaps, it is the renderer's `tEnd`.
 
 ### MLS-MPM liquid (2026-08-22..23; `sim_fluid.wgsl` + `sim_fluid_seam.wgsl`, docs/PLAN_mpm_fluids.md)
 

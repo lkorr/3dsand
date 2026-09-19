@@ -179,6 +179,18 @@ const GAS_FAROUT_SHIFT : u32 = 6u;
 const_assert (GAS_FAROUT_N << GAS_FAROUT_SHIFT) == 16u * WORLD_N;
 const GAS_FAROUT_OFF : i32 = i32((GAS_FAROUT_N << GAS_FAROUT_SHIFT) / 2u) -
                              i32(WORLD_N / 2u);
+// ANISOTROPIC in y (world.h kGasFarOuterShiftY): 8-voxel cells vertically, so
+// the box's vertical span is the fine box's and a plume base at canopy height
+// does not sit in a cell that reaches the ground.
+const GAS_FAROUT_SHIFT_Y : u32 = 3u;
+const_assert (GAS_FAROUT_N << GAS_FAROUT_SHIFT_Y) == 2u * WORLD_N;
+const GAS_FAROUT_OFF_Y : i32 = i32((GAS_FAROUT_N << GAS_FAROUT_SHIFT_Y) / 2u) -
+                               i32(WORLD_N / 2u);
+const GAS_FAROUT_SHIFTS : vec3<u32> =
+    vec3<u32>(GAS_FAROUT_SHIFT, GAS_FAROUT_SHIFT_Y, GAS_FAROUT_SHIFT);
+const GAS_FAROUT_EDGE : vec3f = vec3f(f32(GAS_FAROUT_N << GAS_FAROUT_SHIFT),
+                                      f32(GAS_FAROUT_N << GAS_FAROUT_SHIFT_Y),
+                                      f32(GAS_FAROUT_N << GAS_FAROUT_SHIFT));
 // Samples across the long-range segment. The segment runs from the near box's
 // exit out to at most 409.6 m, so 16 steps is ~23 m apart at worst — about
 // three and a half cells, i.e. UNDER-sampled relative to the grid and
@@ -187,7 +199,99 @@ const GAS_FAROUT_OFF : i32 = i32((GAS_FAROUT_N << GAS_FAROUT_SHIFT) / 2u) -
 // into a stipple rather than into shells, exactly as it does for the near box's
 // own 16, and more steps here would be paid by every terrain pixel of every
 // frame with a distant fire in it.
-const GAS_FAROUT_STEPS : u32 = 16u;
+const GAS_FAROUT_STEPS : u32 = 32u;
+// ---- THE LOOK PASS (2026-09-19): why the boxes are not drawn as boxes -------
+// The two constants above describe a sampler that was correct and looked like
+// static in a rectangle. Both halves of that are worth writing down.
+//
+//   * THE RECTANGLE was the NEAREST fetch. A wide cell is 64 voxels = 51.2 m
+//     and the splat put a whole plume inside about one of them, so the thing on
+//     screen was not a plume drawn coarsely -- it was an axis-aligned constant-
+//     density box, and a nearest fetch draws a box's silhouette exactly.
+//   * THE STATIC was the per-pixel jitter carrying the whole sampler: too few
+//     steps across a very long segment made "did this ray sample the cell at
+//     all" a Bernoulli trial per pixel, which is what white noise looks like.
+//
+// The cure is the one every cheap cloud renderer uses (Guerrilla's Nubis, and
+// Scratchapixel's volcano-plume chapter states the same structure): a SMOOTH
+// low-resolution base shape, plus PROCEDURAL detail that supplies the billows
+// the grid can never hold. Concretely, here:
+//
+//   1. smoothstep-weighted trilinear instead of nearest, so a cell is a soft
+//      lobe rather than a cube (the smoothstep, not plain trilinear, because
+//      plain trilinear is C0 and leaves visible creases along the lattice
+//      diagonals at a 51.2 m cell);
+//   2. fbm erosion of the sampled density, which carves the smooth lobe back
+//      into cauliflower;
+//   3. 32 wide steps rather than 16, which is the only part that costs anything
+//      per pixel and is paid ONLY when R.flags has RFLAG_GASFAR -- a world with
+//      no distant fire in it does not run this loop at all.
+//
+// ---- WHAT THIS FILE NO LONGER DOES, AND WHY (the second pass) --------------
+// The first version of that list had two more entries, and both were BRIGHTNESS
+// KNOBS KEYED ON WHICH LOD YOU WERE LOOKING AT:
+//
+//   * a 4x gain ramped in over the 51.2 m past the window face, to make a far
+//     plume legible against fog;
+//   * a wide-box correction ramped from 1/4 to 1/12 over the next 60 m, to stop
+//     the same fire being ~24x more opaque in the coarse box than in the fine.
+//
+// Together they meant one column of smoke had three different opacities
+// depending on how far away it was, with the changes landing exactly where the
+// representation changed -- so what a player walking away from a burning tree
+// saw was: real CA smoke, then a THIN synthesized plume at the window face
+// (gain 1), then the same plume swelling 4x over the next fifty metres, then a
+// handover to a box read at a quarter of its counts. That is precisely the
+// "it goes wispy and then suddenly billows" report, and none of it was smoke
+// behaving like smoke.
+//
+// Both are gone. The plume now carries ONE density from the splat
+// (sim_gas.wgsl FAR_PLUME_DENSITY, per puff, 3.3x what it was), and the wide
+// box's deposit divides its mass by the chord ratio of the two grids
+// (FAR_PLUME_WIDE_CHORD) at the point the counts are WRITTEN, so the two boxes
+// render the same fire to the same opacity and this file folds both segments
+// into one accumulator with no scale factor of any kind. The only remaining
+// scale on plume brightness is render.farPlumeStrength, which is global and
+// has no distance in it. If the far field needs more smoke, that is the knob --
+// and it moves the near field with it, which is the point.
+//
+// The meander went the same way. It used to warp the wide box's LOOKUP, which
+// displaced that box's plume by up to 8 m relative to the fine box's drawing of
+// the same column -- a lateral jump at the handover. (An attempt to put a snake
+// into the DATA instead put the column's BASE a cell sideways; there is no
+// snake anywhere now, and the column stands on the fire.)
+
+// The finest billow, in metres, and how many octaves of it, per box.
+//
+// THE WIDE BOX GETS MORE DETAIL THAN THE FINE ONE, WHICH IS THE OPPOSITE OF THE
+// FIRST GUESS HERE. The reflex is "it is further away, so give it coarser
+// features"; that is wrong because it confuses screen size with data content. A
+// fine plume already HAS structure -- the splat scatters five puffs per height
+// step across a disc that reaches a cell or two wide, so the grid itself
+// carries the shape and the noise only has to break up the cell edges. A wide
+// plume has NONE: at 51.2 m cells the whole column lands in the two-to-four
+// cells one bilinear puff straddles, so after filtering it is a smooth
+// ellipsoid and every bit of structure it will ever have must be invented
+// here. It also is not small on screen -- a ~100 m blob at 400 m is ~230 px --
+// so it can carry detail down to the ~10 m the third octave reaches.
+const GAS_DETAIL_FINE_M : f32 = 6.0;
+const GAS_DETAIL_WIDE_M : f32 = 12.0;
+const GAS_DETAIL_OCT_FINE : u32 = 2u;
+const GAS_DETAIL_OCT_WIDE : u32 = 3u;
+// What counts as a plume's CORE, in cell counts: a sample at or above this is
+// never eaten by the erosion, below it the noise carves. Unchanged from the
+// liked look: it protected a stacked base cell outright and let the noise
+// work on the scattered upper puffs, and with those puffs 3.3x denser now it
+// protects more of the upper column too, which is the thickness the report
+// asked for. Raise it to carve deeper.
+const GAS_CORE_COUNT : f32 = 51.2;
+// The deepest bite, in SHAPE units (see gasErode). 0.6 means the noise can eat
+// everything below 60% of core density and nothing at or above core.
+const GAS_ERODE : f32 = 0.6;
+// How fast the procedural detail climbs, metres/second. Matched by eye to
+// sim_gas.wgsl's FAR_PLUME_RISE_VOX so the invented billows travel with the
+// splatted ones instead of swimming through them.
+const GAS_RISE_MPS : f32 = 1.5;
 // R.flags bit 3: GAS MAY BE PRESENT this frame. Set by the CPU from the sim's
 // own gas latch (Simulation::GasRenderActive) and OFF in a world with no
 // smoke in it, which is what keeps the whole of the crossfade — the band
@@ -3543,23 +3647,48 @@ fn gasOuterOriginVox() -> vec3<i32> {
   return R.origin * i32(CHUNK) - vec3<i32>(i32(WORLD_N) / 2);
 }
 
-// Parcel count in the cell containing world position `p`, 0 outside the box.
-// NEAREST, not trilinear — §2.5 asked for trilinear and this is the one
-// deviation in the sampler. Trilinear is eight byte fetches from four words
-// per sample and seven lerps of live state; nearest is one. The smoothing it
-// would buy is already bought twice over by the sampler being coarser than the
-// cell (see GAS_OUTER_STEPS) and by the per-pixel jitter below, which turns
-// the sample cadence into a stipple rather than into shells. If a future plume
-// reads as blocky at close range, the cheap fix is more steps, not filtering.
-fn gasOuterCountAt(p : vec3f) -> f32 {
-  // Arithmetic shift, so the mapping is floor division and matches the sim's
-  // `(c - origin) >> shift` for negative coordinates as well as positive.
-  let d = (vec3<i32>(floor(p)) - gasOuterOriginVox()) >> vec3<u32>(GAS_OUTER_SHIFT);
+// One cell of the fine box by integer cell coordinate, 0 outside it. The bounds
+// test is the FILTER'S EDGE RULE as well as a safety check: returning 0 for an
+// out-of-range corner is what makes the trilinear lobe fade out at the box face
+// instead of clamping the face's value outward into a smear.
+fn gasOuterCell16(d : vec3<i32>) -> f32 {
   if (any(d < vec3<i32>(0)) || any(d >= vec3<i32>(i32(GAS_OUTER_N)))) {
     return 0.0;
   }
   let li = (u32(d.z) * GAS_OUTER_N + u32(d.y)) * GAS_OUTER_N + u32(d.x);
   return f32((gasOuter[li >> 1u] >> (16u * (li & 1u))) & 0xFFFFu);
+}
+
+// Parcel count at world position `p`, filtered. TRILINEAR WITH SMOOTHSTEP
+// WEIGHTS, which is the reversal of this function's original comment and the
+// reason is in THE LOOK PASS block up at GAS_FAROUT_STEPS: nearest does not
+// render a coarse plume bluntly, it renders a rectangle, because the cell is
+// 6.4 m here and 51.2 m in the box next door and a whole plume is about one
+// cell across. Eight fetches buy the silhouette.
+//
+// The weights are smoothstepped (u = f*f*(3-2f)) rather than raw. Plain
+// trilinear is C0: its gradient jumps at every cell boundary, which on a 51.2 m
+// cell draws faint creases along the lattice diagonals — the box edge turned
+// down rather than removed. Three multiplies per axis removes it outright.
+//
+// The half-cell bias puts the samples on cell CENTRES. Without it the filter is
+// off by half a cell in each axis and a plume leans away from the fire that
+// made it.
+fn gasOuterCountAt(p : vec3f) -> f32 {
+  let g = (p - vec3f(gasOuterOriginVox())) *
+          (1.0 / f32(1u << GAS_OUTER_SHIFT)) - vec3f(0.5);
+  let b = floor(g);
+  let f = g - b;
+  let u = f * f * (3.0 - 2.0 * f);
+  let d = vec3<i32>(b);
+  let x00 = mix(gasOuterCell16(d), gasOuterCell16(d + vec3<i32>(1, 0, 0)), u.x);
+  let x10 = mix(gasOuterCell16(d + vec3<i32>(0, 1, 0)),
+                gasOuterCell16(d + vec3<i32>(1, 1, 0)), u.x);
+  let x01 = mix(gasOuterCell16(d + vec3<i32>(0, 0, 1)),
+                gasOuterCell16(d + vec3<i32>(1, 0, 1)), u.x);
+  let x11 = mix(gasOuterCell16(d + vec3<i32>(0, 1, 1)),
+                gasOuterCell16(d + vec3<i32>(1, 1, 1)), u.x);
+  return mix(mix(x00, x10, u.y), mix(x01, x11, u.y), u.z);
 }
 
 // The same two functions for the LONG-RANGE box. IDENTICAL EXPRESSIONS to
@@ -3570,8 +3699,9 @@ fn gasOuterCountAt(p : vec3f) -> f32 {
 // lattice would slide 1.6 m sideways on every window shift and a settled plume
 // would visibly re-quantise as the player walked.
 fn gasFarOuterOriginVox() -> vec3<i32> {
-  return (((R.origin * i32(CHUNK)) - vec3<i32>(GAS_FAROUT_OFF))
-          >> vec3<u32>(GAS_FAROUT_SHIFT)) << vec3<u32>(GAS_FAROUT_SHIFT);
+  let off = vec3<i32>(GAS_FAROUT_OFF, GAS_FAROUT_OFF_Y, GAS_FAROUT_OFF);
+  return (((R.origin * i32(CHUNK)) - off) >> GAS_FAROUT_SHIFTS)
+         << GAS_FAROUT_SHIFTS;
 }
 
 // THE COUNT MEANS THE SAME THING IN BOTH BOXES, and that is what makes the two
@@ -3581,14 +3711,88 @@ fn gasFarOuterOriginVox() -> vec3<i32> {
 // whatever the cell size happens to be. The 512 at the bottom of gasOuterFill
 // is that denominator; it was first derived as "fine voxels in a fine cell",
 // and it serves both.
-fn gasFarOuterCountAt(p : vec3f) -> f32 {
-  let d = (vec3<i32>(floor(p)) - gasFarOuterOriginVox())
-          >> vec3<u32>(GAS_FAROUT_SHIFT);
+fn gasFarOuterCell16(d : vec3<i32>) -> f32 {
   if (any(d < vec3<i32>(0)) || any(d >= vec3<i32>(i32(GAS_FAROUT_N)))) {
     return 0.0;
   }
   let li = (u32(d.z) * GAS_FAROUT_N + u32(d.y)) * GAS_FAROUT_N + u32(d.x);
   return f32((gasFarOuter[li >> 1u] >> (16u * (li & 1u))) & 0xFFFFu);
+}
+
+// Filtered exactly like the fine box — same half-cell bias, same smoothstepped
+// weights, same zero-outside edge rule. This is the box the rectangles in the
+// bug report came from: its cell is 51.2 m, so it is the one that needed the
+// filter most and the one the creases would have shown on.
+fn gasFarOuterCountAt(p : vec3f) -> f32 {
+  let g = (p - vec3f(gasFarOuterOriginVox())) / vec3f(vec3<u32>(1u) << GAS_FAROUT_SHIFTS)
+          - vec3f(0.5);
+  let b = floor(g);
+  let f = g - b;
+  let u = f * f * (3.0 - 2.0 * f);
+  let d = vec3<i32>(b);
+  let x00 = mix(gasFarOuterCell16(d),
+                gasFarOuterCell16(d + vec3<i32>(1, 0, 0)), u.x);
+  let x10 = mix(gasFarOuterCell16(d + vec3<i32>(0, 1, 0)),
+                gasFarOuterCell16(d + vec3<i32>(1, 1, 0)), u.x);
+  let x01 = mix(gasFarOuterCell16(d + vec3<i32>(0, 0, 1)),
+                gasFarOuterCell16(d + vec3<i32>(1, 0, 1)), u.x);
+  let x11 = mix(gasFarOuterCell16(d + vec3<i32>(0, 1, 1)),
+                gasFarOuterCell16(d + vec3<i32>(1, 1, 1)), u.x);
+  return mix(mix(x00, x10, u.y), mix(x01, x11, u.y), u.z);
+}
+
+// ---- THE PROCEDURAL HALF: billows the grid cannot hold --------------------
+// Erode a sampled count with fbm. `w` is 0..1 and is how much of the bite to
+// take — the fine far segment ramps it in from the window face so the detail
+// does not switch on as a visible shell where the un-eroded in-window band
+// hands over, and the band itself never calls this at all (it has to stay the
+// exact complement of the fade trace() applies to real voxels, and inventing
+// detail on one side of that crossfade would tear it).
+//
+// The noise rides UP with the smoke: the sample position is pulled down by
+// GAS_RISE_MPS x time, so a given billow travels the column rather than the
+// column flickering in place — the same trick, for the same reason, as the
+// `packet` index in sim_gas.wgsl's plumePacket.
+//
+// Gated on `count > 0` by the caller's own early-out below, which matters: the
+// overwhelming majority of samples along any ray are empty, and this is sixteen
+// hashes.
+fn gasErode(count : f32, p : vec3f, featureM : f32, oct : u32, w : f32) -> f32 {
+  let rise = R.time * (GAS_RISE_MPS / VOXEL_METERS);
+  let q = (p - vec3f(0.0, rise, 0.0)) * (VOXEL_METERS / featureM);
+  // fbm sums 0.5, 0.25, ... so `oct` octaves span 0..(1 - 2^-oct). Normalising
+  // by that keeps the bite the same depth whichever octave count the caller
+  // asked for — otherwise the wide box's third octave would silently erode
+  // harder than the fine box's two.
+  let n = clamp(fbm(q, oct) / (1.0 - exp2(-f32(oct))), 0.0, 1.0);
+  // THE SHAPE: the sample as a fraction of what counts as core density.
+  let s = min(count * (1.0 / GAS_CORE_COUNT), 1.0);
+  // THE REMAP, and it being a remap rather than a subtraction is the whole
+  // lesson of this function's first version. Subtracting a fixed amount takes
+  // it out of the CORE as well as the skirts, and a far plume has no brightness
+  // to spare — the first pass shipped a column that was correctly shaped and
+  // nearly invisible. (s - e)/(1 - e) is exactly 1 wherever s is 1, whatever
+  // the noise says, so the column keeps every bit of its opacity and only the
+  // thin parts are carved. This is the standard cloud remap for the same
+  // reason every cloud renderer uses it.
+  //
+  // (1 - n) so the bite is deepest where the noise is LOW: the holes are the
+  // quiet parts of the field, which is what reads as smoke pulling apart.
+  let e = GAS_ERODE * w * (1.0 - n);
+  let s2 = max(s - e, 0.0) / max(1.0 - e, 1e-3);
+  return count * (s2 / max(s, 1e-3));
+}
+
+// Low-discrepancy per-pixel offset for the gas march (Jimenez's interleaved
+// gradient noise). farDither's white noise is right for a CASCADE SEAM, where
+// the job is only that no two adjacent pixels line up; it is wrong for a
+// sparsely-sampled volume, where each pixel's draw decides a near-Bernoulli
+// outcome and white noise therefore renders as television static — which is
+// exactly what the plume looked like. IGN spreads the offsets over every 3x3
+// neighbourhood instead of drawing them independently, so the same step budget
+// resolves as a soft grain. Time-free and keyed on the pixel, like farDither.
+fn gasDither(px : vec2f) -> f32 {
+  return fract(52.9829189 * fract(0.06711056 * px.x + 0.00583715 * px.y));
 }
 
 // WHICH gas the box is made of. gasOuter stores a count and no material (§2.5:
@@ -3664,7 +3868,7 @@ fn gasOuterFill(ro : vec3f, rdIn : vec3f, tEnd : f32, px : vec2f) -> f32 {
   // of the LOD ring that dither exists to break. ONE draw, shared by both
   // segments — two independent dithers would decorrelate the two halves of the
   // crossfade and stipple the seam back in.
-  let jit = farDither(px);
+  let jit = gasDither(px);
   var acc = 0.0;
 
   // ---- OUTSIDE THE WINDOW (stage 1's segment) ------------------------------
@@ -3684,8 +3888,29 @@ fn gasOuterFill(ro : vec3f, rdIn : vec3f, tEnd : f32, px : vec2f) -> f32 {
   if (tB > tA) {
     let dt = (tB - tA) / f32(GAS_OUTER_STEPS);
     var t = tA + dt * jit;
+    // The erosion RAMPS IN across this segment rather than switching on at tA.
+    // tA is the window face, and the band loop below samples the same box up to
+    // that face with no detail at all (it has to — it is the complement of the
+    // voxel fade). A step from "no detail" to "full detail" at a fixed distance
+    // is a shell of noise centred on the camera, which is the same artefact the
+    // dither exists to prevent. An EIGHTH of a window fades it in over 51.2 m,
+    // which is eight of this box's cells and a fifth of the segment — long
+    // enough that the handover is not a plane, short enough that most of the
+    // segment still gets the detail it is here for. (A ramp over the whole
+    // segment would reach full erosion only at the far end, i.e. never where it
+    // matters.)
+    let rampInv = 8.0 / f32(WORLD_N);
     for (var i = 0u; i < GAS_OUTER_STEPS; i++) {
-      acc += gasOuterCountAt(ro + rd * t) * dt;
+      let p = ro + rd * t;
+      var c = gasOuterCountAt(p);
+      if (c > 0.0) {
+        // The ramp drives the EROSION ONLY. It used to drive a 4x brightness
+        // gain as well, which is what made a plume thin at the window face and
+        // fat fifty metres past it; see the look-pass block at the top.
+        let ramp = clamp((t - tA) * rampInv, 0.0, 1.0);
+        c = gasErode(c, p, GAS_DETAIL_FINE_M, GAS_DETAIL_OCT_FINE, ramp);
+      }
+      acc += c * dt;
       t += dt;
     }
   }
@@ -3740,23 +3965,39 @@ fn gasOuterFill(ro : vec3f, rdIn : vec3f, tEnd : f32, px : vec2f) -> f32 {
     // Concentric with the window box like the other two, so the same six slab
     // distances serve it: push both of each axis's planes out by half the
     // difference of the two edges.
-    let extF = (f32(GAS_FAROUT_N << GAS_FAROUT_SHIFT) - f32(WORLD_N))
-               * 0.5 * abs(inv);
-    // Never nearer than where the NEAR box gave up: inside that, the fine
-    // segment above is the authority and the wide list is empty by
-    // construction. `tB` IS that distance -- it is the near box's exit, already
-    // clamped by tEnd, and reusing it costs nothing and cannot disagree with
-    // the segment it bounds. (If tEnd cut tB short, tF1 <= tEnd <= tF0 and the
-    // loop below does not run, which is the right answer: the ray stopped.)
+    // Per axis, because the box is anisotropic: its y edge is the fine box's,
+    // so extF.y is the fine segment's own ext.y.
+    let extF = (GAS_FAROUT_EDGE - f32(WORLD_N)) * 0.5 * abs(inv);
+    // From the WINDOW FACE, not from the fine box's exit (which is where this
+    // started until 2026-09-19). The wide list is no longer empty inside the
+    // fine box: the crossfade shell (world.h kGasFarBlendVox) puts an emitter
+    // in the outer 51.2 m of the fine box into BOTH lists, and its wide twin
+    // lives in wide cells that sit INSIDE the fine box's volume -- a segment
+    // that began at the fine box's exit never sampled them, and the fade-in
+    // half of the crossfade would simply have been missing. Same step count,
+    // so the cost is a slightly longer dt over a segment that is mostly empty
+    // this near anyway.
     let tF0 = max(max(max(tminW.x - extF.x, tminW.y - extF.y),
-                      max(tminW.z - extF.z, 0.0)), tB);
+                      max(tminW.z - extF.z, 0.0)), tA);
     let tF1 = min(min(tmaxW.x + extF.x, min(tmaxW.y + extF.y, tmaxW.z + extF.z)),
                   tEnd);
     if (tF1 > tF0) {
       let dt = (tF1 - tF0) / f32(GAS_FAROUT_STEPS);
       var t = tF0 + dt * jit;
       for (var i = 0u; i < GAS_FAROUT_STEPS; i++) {
-        acc += gasFarOuterCountAt(ro + rd * t) * dt;
+        let p = ro + rd * t;
+        var c = gasFarOuterCountAt(p);
+        if (c > 0.0) {
+          // NO SCALE. A count is a volume fraction over the same 512 in either
+          // box — which is only true because sim_gas.wgsl's wide deposit divides
+          // its mass by the two grids' chord ratio (FAR_PLUME_WIDE_CHORD), so
+          // the coarse box needs no correction here and gets none. What used
+          // to be here (a ramped 1/4..1/12, on top of a 4x gain) was
+          // compensating for a splat that wrote the same counts at both
+          // scales; the compensation belonged in the splat and is now there.
+          c = gasErode(c, p, GAS_DETAIL_WIDE_M, GAS_DETAIL_OCT_WIDE, 1.0);
+        }
+        acc += c * dt;
         t += dt;
       }
     }

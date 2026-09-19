@@ -524,10 +524,26 @@ constexpr uint32_t kGasFarEmitMax = 256;
 // the other meant.
 constexpr uint32_t kGasFarEmitHdr = 4;
 // Per record: world voxel x, y, z (i32; y is the TOPMOST hot voxel in the
-// column) then the strength, which is the hot-voxel count in that column.
-// WORLD VOXELS, never cell coords — which is what lets one record shape serve
-// two boxes of different cell sizes.
+// column) then the strength word: bits 0..23 the hot-voxel count (a column's,
+// or the wide list's SUM of columns), bits 24..31 the CROSSFADE WEIGHT 0..255
+// (see kGasFarBlendVox). WORLD VOXELS, never cell coords — which is what lets
+// one record shape serve two boxes of different cell sizes.
 constexpr uint32_t kGasFarEmitStride = 4;
+constexpr uint32_t kGasFarEmitStrengthMask = 0xFFFFFFu;
+constexpr uint32_t kGasFarEmitWeightShift = 24;
+// THE CROSSFADE SHELL (2026-09-19). The two lists used to be split STRICTLY at
+// the fine box's half-extent, per EMITTER — and a burning tree is several
+// emitters (2x2 columns per chunk, several chunks), so as it crossed 409.6 m
+// its columns crossed one at a time: the fine plume lost columns and SHRANK
+// while the wide aggregate gained them, and the player saw the trail collapse
+// to a wisp before the coarse blob appeared. Now an emitter whose max-norm
+// distance is within this many voxels INSIDE the fine box's face feeds BOTH
+// lists, with complementary weights that the kernels multiply into the mass:
+// the fine plume fades out over the shell at full size, the wide one fades in
+// at full size, and the sum of what a ray collects is the same at every point
+// of the shell. One wide cell across, so the shell is as wide as the coarsest
+// thing being faded.
+constexpr int32_t kGasFarBlendVox = 64;   // one wide cell; pinned below
 // The WIDE section (the long-range box below). Its own cap rather than a share
 // of the fine one: the two lists cover disjoint distance bands and a frame with
 // 256 near fires should not be able to starve the far ones.
@@ -566,6 +582,23 @@ static_assert(kChunk % (1u << kGasOuterShift) == 0,
 // under the pixel budget rather than over it. Same 4 MiB as gasOuter.
 constexpr uint32_t kGasFarOuterN = 128;
 constexpr uint32_t kGasFarOuterShift = 6;
+// ...IN X AND Z. The cell is ANISOTROPIC (2026-09-19): 64 voxels across but only
+// 8 tall — the fine box's own height cell. A 51.2 m-TALL cell was the "ground
+// under the trees is covered in smoke" report: a plume whose base sits at
+// canopy height lands in a cell that reaches the ground, and the sampler's
+// filter then bleeds it a cell further down. Nothing in the vertical needed
+// 51.2 m: the box's job in y is the same ±409.6 m the fine box covers (fires
+// are on the terrain, plumes climb tens of metres), so 128 cells of 8 voxels
+// span exactly that and the x/z reach is untouched. Same 4 MiB. It also makes
+// a plume the same number of height cells in both boxes, so the wide column is
+// no longer one cell tall against the fine box's four.
+constexpr uint32_t kGasFarOuterShiftY = 3;
+static_assert(kGasFarOuterShiftY == kGasOuterShift,
+              "the wide box's height cell IS the fine box's, so a plume is the "
+              "same number of height cells in both");
+static_assert(kGasFarOuterN << kGasFarOuterShiftY == 2 * kWorldN,
+              "the long-range box's VERTICAL span is the fine box's: ±kWorldN "
+              "around the window centre");
 constexpr uint32_t kGasFarOuterCells =
     kGasFarOuterN * kGasFarOuterN * kGasFarOuterN;
 constexpr uint32_t kGasFarOuterWords = kGasFarOuterCells / 2;  // 4 MiB, two u16/word
@@ -585,11 +618,20 @@ constexpr int32_t kGasFarOuterOffsetVox =
 static_assert(kGasFarOuterOffsetVox % (int32_t)(1u << kGasFarOuterShift) == 0,
               "the centring offset must itself be a whole number of cells, or "
               "flooring the origin would not keep the lattice world-fixed");
+// The y offset: with the vertical span equal to the fine box's, this is
+// kWorldN/2 — the wide box's y origin IS the fine box's y origin, and the floor
+// to an 8-voxel cell is a no-op on a window origin that is a multiple of 16.
+constexpr int32_t kGasFarOuterOffsetVoxY =
+    (int32_t)((kGasFarOuterN << kGasFarOuterShiftY) / 2) - (int32_t)(kWorldN / 2);
+static_assert(kGasFarOuterOffsetVoxY % (int32_t)(1u << kGasFarOuterShiftY) == 0,
+              "the y centring offset must be a whole number of y cells");
 // The most fine emitters one WIDE record can aggregate, for the shader's
 // normalisation: a coarse cell is (1 << (wide - fine)) fine cells per axis in
 // x/z, and a fine emitter spans one chunk in y, so a coarse cell holds
 // (ratio^2 in x/z) x (cell/chunk in y) fine columns.
 constexpr uint32_t kGasFarWideRatio = 1u << (kGasFarOuterShift - kGasOuterShift);
+static_assert(kGasFarBlendVox == (int32_t)(1u << kGasFarOuterShift),
+              "the crossfade shell is one wide cell across (see kGasFarBlendVox)");
 static_assert(kGasFarOuterShift > kGasOuterShift,
               "the long-range box must be COARSER than gasOuter");
 

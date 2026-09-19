@@ -2,6 +2,7 @@
 
 #include <algorithm>
 #include <cstdint>
+#include <cstdio>
 #include <cstdlib>
 
 namespace {
@@ -9,6 +10,20 @@ namespace {
 // Which material ids are frozen fire, by id. Rebuilt whole by SetMaterials, so
 // there is no stale half-state after a reload that renamed or removed one.
 std::vector<uint8_t> g_hot;
+
+// SANDVOX_PLUME_DEBUG=1: one stderr line per change to what the index holds
+// for a chunk (which harvest replaced it, and with how many emitters) and per
+// change to which LIST a chunk's emitters land in on a rebuild. The report it
+// exists for: "two distant burning trees swap their smoke as I step". That is
+// either the index (a harvest zeroing a chunk, or a chunk crossing a band) or
+// it is the renderer, and this prints which — CLAUDE.md rule 6, attribution
+// before elimination.
+bool PlumeDebug() {
+  static const bool on = std::getenv("SANDVOX_PLUME_DEBUG") != nullptr;
+  return on;
+}
+const char* const kBandName[] = {"none", "IN-WINDOW", "fine", "wide",
+                                 "out-of-range", "outside-box", "fine+wide"};
 
 // The gasOuter box, restated from world.h's one expression:
 //   originVox = windowOriginChunks * kChunk - kWorldN/2
@@ -47,18 +62,22 @@ inline bool ChunkInWindow(IVec3 wc, IVec3 wo) {
 // static_asserts, exactly as the fine box already has.
 inline int FloorToCell(int v, uint32_t shift) { return (v >> shift) << shift; }
 
+// The cell is ANISOTROPIC (world.h kGasFarOuterShiftY): 64 voxels in x/z, 8
+// in y, so every per-axis expression here takes the y shift on its y line.
 inline IVec3 WideOriginVox(IVec3 windowOriginChunks) {
   const int o = kGasFarOuterOffsetVox;
+  const int oy = kGasFarOuterOffsetVoxY;
   return {FloorToCell(windowOriginChunks.x * (int)kChunk - o, kGasFarOuterShift),
-          FloorToCell(windowOriginChunks.y * (int)kChunk - o, kGasFarOuterShift),
+          FloorToCell(windowOriginChunks.y * (int)kChunk - oy, kGasFarOuterShiftY),
           FloorToCell(windowOriginChunks.z * (int)kChunk - o, kGasFarOuterShift)};
 }
 
 inline bool InWideBox(IVec3 v, IVec3 originVox) {
   const int n = (int)(kGasFarOuterN << kGasFarOuterShift);
+  const int ny = (int)(kGasFarOuterN << kGasFarOuterShiftY);
   const int dx = v.x - originVox.x, dy = v.y - originVox.y,
             dz = v.z - originVox.z;
-  return dx >= 0 && dy >= 0 && dz >= 0 && dx < n && dy < n && dz < n;
+  return dx >= 0 && dy >= 0 && dz >= 0 && dx < n && dy < ny && dz < n;
 }
 
 }  // namespace
@@ -92,6 +111,14 @@ void FarPlumes::Clear() {
 void FarPlumes::Replace(IVec3 wc, const Emitter* e, uint32_t n) {
   const Key k{wc.x, wc.y, wc.z};
   auto it = byChunk_.find(k);
+  if (PlumeDebug()) {
+    const size_t old = it == byChunk_.end() ? 0 : it->second.size();
+    uint32_t str = 0;
+    for (uint32_t i = 0; i < n; i++) str += e[i].strength;
+    if (old != n || n != 0)
+      std::fprintf(stderr, "plume: note chunk (%d,%d,%d) emitters %zu -> %u "
+                   "(hot voxels %u)\n", wc.x, wc.y, wc.z, old, n, str);
+  }
   if (n == 0) {
     // The fire went out and the chunk was evicted again. Removing the entry is
     // the whole of "a plume stops" — there is no per-emitter lifetime, because
@@ -171,6 +198,7 @@ namespace {
 struct Ranked {
   int64_t d2;
   FarPlumes::Emitter e;
+  uint32_t w8;   // crossfade weight 0..255 (world.h kGasFarBlendVox)
 };
 bool RankLess(const Ranked& a, const Ranked& b) {
   if (a.d2 != b.d2) return a.d2 < b.d2;
@@ -197,7 +225,8 @@ void WriteSection(std::vector<uint32_t>& words, size_t base,
     w[0] = (uint32_t)v[i].e.x;
     w[1] = (uint32_t)v[i].e.y;
     w[2] = (uint32_t)v[i].e.z;
-    w[3] = v[i].e.strength;
+    w[3] = (v[i].e.strength & kGasFarEmitStrengthMask) |
+           (std::min(v[i].w8, 255u) << kGasFarEmitWeightShift);
   }
 }
 }  // namespace
@@ -231,7 +260,12 @@ void FarPlumes::Build(IVec3 windowOriginChunks, int32_t rangeVox) {
   // holds up to 8x8 fine columns in x/z and four chunks in y, so without this
   // one burning hillside would spend the whole 256-emitter budget on a patch
   // 64 voxels across and everything else in the band would be silent.
-  std::unordered_map<Key, Emitter, KeyHash> wide;
+  // Per coarse cell: the aggregate emitter, plus the WEIGHTED strength sum so
+  // the record's crossfade weight can be the strength-weighted mean of its
+  // columns' — a cell straddling the shell fades by how much of its fire is in
+  // the shell, not by whichever column happened to be noted last.
+  struct WideAgg { Emitter e; uint64_t sw; };
+  std::unordered_map<Key, WideAgg, KeyHash> wide;
 
   for (const auto& kv : byChunk_) {
     const IVec3 wc{kv.first.x, kv.first.y, kv.first.z};
@@ -240,49 +274,88 @@ void FarPlumes::Build(IVec3 windowOriginChunks, int32_t rangeVox) {
     // fine box, and an emitter on top would draw the plume twice. This is also
     // what retires an emitter when the player walks back to a fire — no event
     // is needed, the test simply stops passing.
-    if (ChunkInWindow(wc, windowOriginChunks)) continue;
+    uint8_t band = 0;
+    if (ChunkInWindow(wc, windowOriginChunks)) band = 1;
     for (const Emitter& e : kv.second) {
+      if (band == 1) break;
       const int dx = e.x - cx, dy = e.y - cy, dz = e.z - cz;
       const int mx = std::max(std::abs(dx), std::max(std::abs(dy), std::abs(dz)));
       const int64_t d2 = (int64_t)dx * dx + (int64_t)dy * dy + (int64_t)dz * dz;
+      // THE CROSSFADE SHELL (world.h kGasFarBlendVox): inside the fine box's
+      // face by less than the shell, an emitter is in BOTH lists with weights
+      // that sum to one. Past the face it is wide only; deeper in, fine only.
+      uint32_t wFine = 255, wWide = 0;
       if (mx < fineHalf) {
-        if (InBox({e.x, e.y, e.z}, ov)) fine.push_back({d2, e});
-        continue;
+        if (mx >= fineHalf - kGasFarBlendVox) {
+          wFine = (uint32_t)((fineHalf - mx) * 255 / kGasFarBlendVox);
+          wWide = 255 - wFine;
+        }
+        if (InBox({e.x, e.y, e.z}, ov)) { fine.push_back({d2, e, wFine}); band = 2; }
+        else band = 5;
+        if (wWide == 0) continue;
+        // ...and fall through into the wide list with the complement.
+      } else {
+        wFine = 0; wWide = 255;
       }
-      if (rangeVox <= 0 || mx > rangeVox) continue;
-      if (!InWideBox({e.x, e.y, e.z}, wov)) continue;
+      if (rangeVox <= 0 || mx > rangeVox) { if (band != 2) band = 4; continue; }
+      if (!InWideBox({e.x, e.y, e.z}, wov)) { if (band != 2) band = 5; continue; }
+      band = band == 2 ? 6 : 3;
       // Bucket by the COARSE cell the emitter stands in. Strengths add and the
       // topmost hot voxel wins, so a whole burning hillside becomes ONE
       // emitter whose strength says how much of it is alight — which is what
       // the shader turns into a taller, denser column.
       const Key k{(e.x - wov.x) >> kGasFarOuterShift,
-                  (e.y - wov.y) >> kGasFarOuterShift,
+                  (e.y - wov.y) >> kGasFarOuterShiftY,
                   (e.z - wov.z) >> kGasFarOuterShift};
       auto it = wide.find(k);
       if (it == wide.end()) {
-        wide.emplace(k, e);
+        wide.emplace(k, WideAgg{e, (uint64_t)e.strength * wWide});
       } else {
-        // Saturating, because the record's strength is a u32 and a hillside
-        // could in principle overflow one.
-        it->second.strength =
-            (uint32_t)std::min<uint64_t>((uint64_t)it->second.strength + e.strength,
-                                         0xFFFFFFFFull);
-        if (e.y > it->second.y) {
-          it->second.y = e.y;
-          it->second.x = e.x;
-          it->second.z = e.z;
+        // Saturating at the 24 bits the record's strength field has; a
+        // hillside could in principle overflow one.
+        it->second.e.strength =
+            (uint32_t)std::min<uint64_t>((uint64_t)it->second.e.strength + e.strength,
+                                         (uint64_t)kGasFarEmitStrengthMask);
+        it->second.sw += (uint64_t)e.strength * wWide;
+        if (e.y > it->second.e.y) {
+          it->second.e.y = e.y;
+          it->second.e.x = e.x;
+          it->second.e.z = e.z;
         }
       }
     }
+    if (PlumeDebug()) dbgBand_[kv.first] = band;
+  }
+
+  if (PlumeDebug()) {
+    // Membership transitions since the last build, chunk by chunk.
+    for (const auto& kv : byChunk_) {
+      const uint8_t now = dbgBand_[kv.first];
+      auto it = dbgLastBand_.find(kv.first);
+      const uint8_t was = it == dbgLastBand_.end() ? 0 : it->second;
+      if (was != now)
+        std::fprintf(stderr, "plume: build origin (%d,%d,%d): chunk (%d,%d,%d) "
+                     "%s -> %s (%zu emitters)\n", windowOriginChunks.x,
+                     windowOriginChunks.y, windowOriginChunks.z, kv.first.x,
+                     kv.first.y, kv.first.z, kBandName[was], kBandName[now],
+                     kv.second.size());
+    }
+    dbgLastBand_ = dbgBand_;
+    dbgBand_.clear();
   }
 
   std::vector<Ranked> wideRanked;
   wideRanked.reserve(wide.size());
   for (const auto& kv : wide) {
-    const int dx = kv.second.x - cx, dy = kv.second.y - cy,
-              dz = kv.second.z - cz;
+    const Emitter& e = kv.second.e;
+    const int dx = e.x - cx, dy = e.y - cy, dz = e.z - cz;
+    // Strength-weighted mean of the columns' weights; the strength itself is
+    // saturating, so divide the weighted sum by the UNSATURATED total for the
+    // mean to stay a mean.
+    const uint32_t w8 = e.strength ? (uint32_t)std::min<uint64_t>(
+                                         kv.second.sw / e.strength, 255) : 255;
     wideRanked.push_back(
-        {(int64_t)dx * dx + (int64_t)dy * dy + (int64_t)dz * dz, kv.second});
+        {(int64_t)dx * dx + (int64_t)dy * dy + (int64_t)dz * dz, e, w8});
   }
 
   CapAndSort(fine, kGasFarEmitMax);
@@ -290,6 +363,11 @@ void FarPlumes::Build(IVec3 windowOriginChunks, int32_t rangeVox) {
 
   count_ = (uint32_t)fine.size();
   countWide_ = (uint32_t)wideRanked.size();
+  if (PlumeDebug())
+    std::fprintf(stderr, "plume: build origin (%d,%d,%d) range %d vox: %u fine, "
+                 "%u wide, index %zu chunks\n", windowOriginChunks.x,
+                 windowOriginChunks.y, windowOriginChunks.z, rangeVox, count_,
+                 countWide_, byChunk_.size());
   // The image is always full size: the wide section starts at a FIXED word so
   // the shader can address it without reading the fine count first, and a
   // short buffer would leave the previous list's tail on the GPU.

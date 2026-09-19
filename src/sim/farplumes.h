@@ -139,6 +139,10 @@ class FarPlumes {
   void Replace(IVec3 wc, const Emitter* e, uint32_t n);
 
   std::unordered_map<Key, std::vector<Emitter>, KeyHash> byChunk_;
+  // SANDVOX_PLUME_DEBUG only (farplumes.cpp PlumeDebug): which list each
+  // chunk's emitters landed in on the last two builds, so a rebuild can print
+  // the transitions. Empty and untouched when the variable is unset.
+  std::unordered_map<Key, uint8_t, KeyHash> dbgBand_, dbgLastBand_;
   // THE INDEX IS CAPPED TOO, not only the upload. Without this a session that
   // set half a forest alight and flew away would grow an entry per burning
   // chunk forever. Past the cap new burning chunks are refused (counted, so

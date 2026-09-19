@@ -232,11 +232,15 @@ W_MICROSHIFT="$(sed -n 's/.*constexpr[a-z0-9_ ]* kMicroPoolWordsWorld = 1u << \(
   echo "check_shaders: cannot parse kMicroPoolWordsWorld from $WORLD_H" >&2; exit 1; }
 W_MICROPOOL=$((1 << W_MICROSHIFT))
 
-# Dynamic microvoxel body pool (same shift-expression problem as above).
-W_MBSHIFT="$(sed -n 's/.*constexpr[a-z0-9_ ]* kMicroBodyPoolWordsWorld = 1u << \([0-9]*\);.*/\1/p' "$WORLD_H" | head -1)"
-[ -n "$W_MBSHIFT" ] || {
+# Dynamic microvoxel body pool (same shift-expression problem as above), except
+# that this one's mantissa is not always 1: it was raised to `2u << 20` and the
+# 1u-only scrape then failed the whole script, which is a checker that stops
+# validating shaders because an unrelated pool grew. Parse both halves.
+W_MBMANT="$(sed -n 's/.*constexpr[a-z0-9_ ]* kMicroBodyPoolWordsWorld = \([0-9]*\)u << [0-9]*;.*/\1/p' "$WORLD_H" | head -1)"
+W_MBSHIFT="$(sed -n 's/.*constexpr[a-z0-9_ ]* kMicroBodyPoolWordsWorld = [0-9]*u << \([0-9]*\);.*/\1/p' "$WORLD_H" | head -1)"
+[ -n "$W_MBSHIFT" ] && [ -n "$W_MBMANT" ] || {
   echo "check_shaders: cannot parse kMicroBodyPoolWordsWorld from $WORLD_H" >&2; exit 1; }
-W_MBPOOL=$((1 << W_MBSHIFT))
+W_MBPOOL=$((W_MBMANT << W_MBSHIFT))
 
 # Water bodies (docs/PLAN_water_master.md M2). Plain literals in world.h, so a
 # straight scrape — same rule as everything else here: world.h is the source.

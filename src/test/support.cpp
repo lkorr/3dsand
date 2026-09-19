@@ -2156,18 +2156,22 @@ void ReadGasFarOuterBoxSync(GpuContext& ctx, World& world, IVec3 loVox,
   rhi::ReadbackBlocking(ctx.device, ctx.queue, world.gasFarOuter, 0, g.data(),
                         (size_t)kGasFarOuterWords * 4, "gasFarOuterBoxRead");
   const IVec3 wo = world.WindowOrigin();
-  const int32_t sh = (int32_t)kGasFarOuterShift;
+  // Anisotropic cell (world.h kGasFarOuterShiftY): 64 voxels in x/z, 8 in y.
+  const int32_t shv[3] = {(int32_t)kGasFarOuterShift, (int32_t)kGasFarOuterShiftY,
+                          (int32_t)kGasFarOuterShift};
+  const int32_t offv[3] = {kGasFarOuterOffsetVox, kGasFarOuterOffsetVoxY,
+                           kGasFarOuterOffsetVox};
   const int32_t wov[3] = {wo.x * (int32_t)kChunk, wo.y * (int32_t)kChunk,
                           wo.z * (int32_t)kChunk};
   int32_t o[3];
   for (int a = 0; a < 3; a++)
-    o[a] = ((wov[a] - kGasFarOuterOffsetVox) >> sh) << sh;
+    o[a] = ((wov[a] - offv[a]) >> shv[a]) << shv[a];
   const int32_t lv[3] = {loVox.x, loVox.y, loVox.z};
   const int32_t hv[3] = {hiVox.x, hiVox.y, hiVox.z};
   int32_t lo[3], hi[3];
   for (int a = 0; a < 3; a++) {
-    lo[a] = std::max((lv[a] - o[a]) >> sh, 0);
-    hi[a] = std::min((hv[a] - o[a]) >> sh, (int32_t)kGasFarOuterN - 1);
+    lo[a] = std::max((lv[a] - o[a]) >> shv[a], 0);
+    hi[a] = std::min((hv[a] - o[a]) >> shv[a], (int32_t)kGasFarOuterN - 1);
   }
   uint32_t mx = 0;
   uint64_t sum = 0;
