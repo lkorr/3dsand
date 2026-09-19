@@ -1344,6 +1344,39 @@ struct Tuning {
     // a decapitation.
     float pulpAmt = 8.0f;        // blood-coat depth (0..15) that counts as pulped
     float pulpCarveFrom = 0.3f;  // pulped share of the core below which nothing comes away
+    // ---- PULPED TISSUE DISSOLVES (the blunt counterpart of bite rot) ---------
+    //
+    // Until now the dent was instant: `CarveLimbRadial` in one call, one tick,
+    // the voxels gone. That made a mace blow EITHER quiet (bruise only) or
+    // surgical (a clean sphere of nothing), with no middle that reads as beaten
+    // flesh coming apart. These two rows are the middle. When a blow earns a
+    // dent (ripeness > pulpCarveFrom), the limb is flagged for DISSOLUTION
+    // instead, and Mob::BluntPulpTick eats pulped voxels one at a time at this
+    // rate -- the same per-tick Bernoulli draw the infection uses, so the
+    // disappearance is noisy, gradual, and never a slab.
+    //
+    // The candidates are blood-coated voxels at `pulpAmt` depth or deeper on
+    // the same limb. Further blows keep adding pulp; the dissolution keeps
+    // eating it. Both run concurrently, which is why sustained hits on one
+    // spot cave it in faster than the first blow alone would.
+    float pulpRotRate = 1.5f;  // world voxels/minute, per flagged limb
+    // ---- UNARMED OVERRIDES --------------------------------------------------
+    //
+    // A fist and a mace share every row above, and the only thing that
+    // separated them was `bruiseHpRef`'s square-root scaling on the step. That
+    // is not enough: a punch should mark a smaller area, break the skin less
+    // readily, and cave nothing in under any amount of beating -- all of which
+    // are SHAPE differences, not rate differences, and the sqrt cannot say them.
+    //
+    // Each row below overrides the matching row above when the blow is from a
+    // natural weapon (BluntHit::unarmed). A NEGATIVE value means "use the main
+    // row": the default, and the way to say "fists and maces are the same here".
+    float unarmedBruiseRadius = -1.0f;
+    float unarmedBruiseStep = -1.0f;
+    float unarmedBleedChance = -1.0f;
+    float unarmedBleedScale = -1.0f;
+    float unarmedCarveRadius = -1.0f;
+    float unarmedPulpCarveFrom = -1.0f;
     // A BITE. Radius of the tear in world voxels at full power, scaled by
     // (0.4 + 0.6 * power); `biteBlob` is the correlated noise's feature size
     // in SKIN voxels, i.e. the size of one piece that comes away. Same pair,
@@ -1860,6 +1893,25 @@ struct Tuning {
     // higher, tighter whoosh, so the LOW value belongs to the slow stroke.
     float whooshRateSlow = 0.82f;
     float whooshRateFast = 1.25f;
+    // ---- where the whoosh IS, and how much of that you hear ----------------
+    // A whoosh is not a point event: it is the air a blade is STILL moving, so
+    // the voice follows the weapon for as long as the sample lasts and a cut
+    // from left to right pans from left to right (main.cpp, the audio block).
+    //
+    // `whooshEdgeFrac` picks the point along the authored edge that is tracked,
+    // 0 = the hand, 1 = the tip. Neither end is right: the hand barely moves, so
+    // the sound does not travel; the tip is where most of the noise is made
+    // (air drag goes with speed cubed) but on a long weapon it swings a metre
+    // wide of the player holding it and the pan becomes a gimmick.
+    float whooshEdgeFrac = 0.55f;
+    // How much of the whoosh's position to actually USE, as a fraction of the
+    // way from the listener's own ear to the tracked point. 1 = fully
+    // spatialized; 0 = pinned to your head, which is effectively mono and is
+    // the escape hatch if a swing in your own hands panning across the image
+    // reads as wrong rather than as physical. Only the player's own swings go
+    // through this; an NPC's whoosh is somebody ELSE's weapon and is always
+    // placed where it is.
+    float whooshPan = 1.0f;
     float fleshVolume = 0.90f;
     float clangVolume = 0.85f;
     float strikeEdgeVolume = 0.65f;

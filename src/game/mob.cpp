@@ -7656,7 +7656,11 @@ bool Mob::Damage(uint64_t bodyHandle, float amount, Vec3 hitWorldVoxel,
     // rather than threaded through a signature the laser and the blast share.
     const float bleedScale =
         inBluntCarve_
-            ? std::clamp(CurrentTuning().gore.bluntBleedScale, 0.0f, 1.0f)
+            ? std::clamp((inUnarmedBlunt_ &&
+                          CurrentTuning().gore.unarmedBleedScale >= 0.0f)
+                             ? CurrentTuning().gore.unarmedBleedScale
+                             : CurrentTuning().gore.bluntBleedScale,
+                         0.0f, 1.0f)
             : 1.0f;
     limb.bleedBudget = AddBleedBudget(
         limb.bleedBudget, amount * def_->bleedPerDamage * bleedScale);
@@ -8029,7 +8033,7 @@ uint32_t Mob::StainWound(int limbIndex, Vec3 centreLocal, float radiusWorld,
 // beaten in the same place a dozen times.
 uint32_t Mob::BruiseLimb(int limbIndex, Vec3 centreLocal, float radiusWorld,
                          uint32_t seed, uint32_t bruiseMat, float power,
-                         float hp, BruiseReport* report) {
+                         float hp, BruiseReport* report, bool unarmed) {
   if (report) *report = BruiseReport{};
   if (!def_ || limbIndex < 0 || limbIndex >= (int)limbs_.size()) return 0;
   // Same two exclusions StainWoundAs makes, and for the same reason: a worn
@@ -8037,9 +8041,15 @@ uint32_t Mob::BruiseLimb(int limbIndex, Vec3 centreLocal, float radiusWorld,
   if (IsWornSlot(limbIndex) || limbIndex >= baseLimbs_) return 0;
   if (bruiseMat == 0 || radiusWorld <= 0.0f) return 0;
   const auto& gt = CurrentTuning().gore;
+  const float effStep =
+      (unarmed && gt.unarmedBruiseStep >= 0.0f) ? gt.unarmedBruiseStep
+                                                  : gt.bruiseStep;
+  const float effBleedChance =
+      (unarmed && gt.unarmedBleedChance >= 0.0f) ? gt.unarmedBleedChance
+                                                  : gt.bruiseBleedChance;
   const uint32_t cap =
       (uint32_t)std::lround(std::clamp(gt.bruiseMax, 0.0f, 15.0f));
-  if (cap == 0 || gt.bruiseStep <= 0.0f) return 0;
+  if (cap == 0 || effStep <= 0.0f) return 0;
 
   MobLimb& limb = limbs_[limbIndex];
   const bool fine = limb.HasFineSkin();
@@ -8074,7 +8084,7 @@ uint32_t Mob::BruiseLimb(int limbIndex, Vec3 centreLocal, float radiusWorld,
       (float)cap * std::clamp(gt.bruiseBleedFrom, 0.0f, 1.0f));
   const uint32_t bloodMat = def_->bleedMat;
   const float bleedChance =
-      std::clamp(gt.bruiseBleedChance, 0.0f, 1.0f) * pw * blowScale;
+      std::clamp(effBleedChance, 0.0f, 1.0f) * pw * blowScale;
 
   // Rung 3's reading. `pulpAmt` is a DEPTH of blood, not merely "wet": a single
   // spray from a cut elsewhere should not make a limb crumble under a punch,
@@ -8153,7 +8163,7 @@ uint32_t Mob::BruiseLimb(int limbIndex, Vec3 centreLocal, float radiusWorld,
     // fist and a mace, and it has a floor under it so it cannot vanish.
     const float jitter = 0.85f + 0.15f * (float)((h >> 16) & 0xFFu) / 255.0f;
     const float taper = 1.0f - t * t;
-    const float want = gt.bruiseStep * taper * jitter * blowScale;
+    const float want = effStep * taper * jitter * blowScale;
     const uint32_t add = (uint32_t)std::lround(want);
     if (add == 0) return;
 
@@ -10229,7 +10239,12 @@ bool Mob::CarveLimb(int limbIndex, World& world,
     // ...and a DENT drips at the same reduced rate the trauma that made it
     // does (Mob::Damage's note): a caved-in face is not an open wound.
     const float bleedScale =
-        inBluntCarve_ ? std::clamp(gt.bluntBleedScale, 0.0f, 1.0f) : 1.0f;
+        inBluntCarve_
+            ? std::clamp((inUnarmedBlunt_ && gt.unarmedBleedScale >= 0.0f)
+                             ? gt.unarmedBleedScale
+                             : gt.bluntBleedScale,
+                         0.0f, 1.0f)
+            : 1.0f;
     limb.bleedBudget =
         AddBleedBudget(limb.bleedBudget,
                        lost * (float)at0 * def.bleedPerDamage * bleedScale);
@@ -11643,6 +11658,9 @@ void Mob::BurnTick(uint32_t tick, World& world, std::vector<CellOp>& cellOps,
   // themselves through FlushBurn and running them in one order everywhere is
   // cheaper to reason about than two. May sever or kill, so the same return.
   if (!InfectTick(tick, world, spawns)) return;
+  // PULPED TISSUE DISSOLVES (the blunt counterpart of InfectTick). Same
+  // position, same FlushBurn tail, same return contract.
+  if (!BluntPulpTick(tick, world, spawns)) return;
   // The burn cap (Gore §G). Recounted at a bounded cadence while the lattice
   // is changing and not at all while it is not; may kill the creature, and is
   // last here for the same reason FlushBurn returns above.
@@ -12266,6 +12284,135 @@ uint32_t Mob::InfectAcrossJoint(int fromLimb, uint32_t tick, int toLimb,
   dst.infectStain = limbs_[fromLimb].infectStain;
   MarkInstancesDirty();
   return 1;
+}
+
+// ============================================================================
+// PULPED TISSUE DISSOLVES (2026-09-19, gore.pulpRotRate)
+//
+// The blunt counterpart of InfectTick, and deliberately simpler: there is no
+// SPREAD phase (blunt trauma does not rot healthy tissue -- that progression is
+// driven by further BLOWS, not by time) and no cross-joint migration. The one
+// phase that runs is ROT: pulped voxels -- those wearing the victim's own blood
+// at gore.pulpAmt depth or deeper -- are eaten one at a time at pulpRotRate,
+// through the same Bernoulli draw and the same FlushBurn tail the infection
+// uses, so the disappearance is noisy, gradual, and reads as beaten flesh
+// coming apart rather than as a clean sphere of nothing.
+//
+// COST (rule 2). A limb nothing has beaten pays one `bluntPulp` bool test,
+// forever. A flagged limb that rolls zero this tick pays two hashes and a
+// compare and never touches its lattice. The sweep is behind the draw.
+// ============================================================================
+
+bool Mob::BluntPulpTick(uint32_t tick, World& world,
+                        std::vector<ParticleSpawn>& spawns) {
+  if (!alive_ || !def_ || !sys_) return true;
+  const auto& gt = CurrentTuning().gore;
+  if (gt.pulpRotRate <= 0.0f) return true;
+  const float perTick = 1.0f / (60.0f * 30.0f);
+  const uint32_t bloodMat = def_->bleedMat;
+  if (bloodMat == 0) return true;
+  const uint32_t pulpAt =
+      (uint32_t)std::lround(std::clamp(gt.pulpAmt, 1.0f, 15.0f));
+
+  for (int li = 0; li < (int)limbs_.size(); li++) {
+    MobLimb& limb = limbs_[li];
+    if (!limb.bluntPulp) continue;
+    if (li >= baseLimbs_ || IsWornSlot(li) || !limb.body) continue;
+    const uint32_t scale =
+        limb.HasFineSkin() ? SkinScaleOf(limb) : PhysScaleOf(limb);
+    const float lat = (float)scale * (float)scale * (float)scale;
+    const uint32_t key =
+        (uint32_t)id_ * 0x9E3779B9u + (uint32_t)li * 2654435761u;
+    const uint32_t nRot =
+        InfectDraw(gt.pulpRotRate * lat * perTick,
+                   Hash3(key, tick, 0xD1550u));
+    if (nRot == 0) continue;
+
+    // ---- ONE SWEEP: who is pulped ------------------------------------------
+    BurnLimbView v = ViewOf(limb);
+    sys_->EnsureBurnIndex(v);
+    BodyBurnState& bs = limb.burn;
+    if (bs.idx.empty()) continue;
+    const IVec3 bm = bs.min, bd = bs.dims;
+    auto cellOf = [&](IVec3 p) -> uint32_t {
+      const int lx = p.x - bm.x, ly = p.y - bm.y, lz = p.z - bm.z;
+      if (lx < 0 || ly < 0 || lz < 0 || lx >= bd.x || ly >= bd.y ||
+          lz >= bd.z)
+        return kNoBurnCell;
+      return (uint32_t)(((size_t)lz * bd.y + ly) * bd.x + lx);
+    };
+    auto voxAt = [&](uint32_t c) -> uint32_t {
+      return c == kNoBurnCell ? 0u : (bs.idx[c] & ~kBurnQueued);
+    };
+
+    std::vector<uint32_t> candidates;
+    const size_t n = v.Size();
+    for (size_t i = 0; i < n; i++) {
+      if ((v.Mat(i) & 0xFFFu) == 0) continue;
+      const uint16_t st = v.Stain(i);
+      if (BodyStainMat(st) == bloodMat && BodyStainAmt(st) >= pulpAt)
+        candidates.push_back((uint32_t)i);
+    }
+    if (candidates.empty()) {
+      limb.bluntPulp = false;
+      continue;
+    }
+
+    // ---- DISSOLVE: tombstone voxels, same pattern as InfectStep's rot ------
+    MicroBodySet* micro = MicroSet();
+    bool poke = false;
+    auto ownBrick = [&]() {
+      if (poke || !micro || limb.microModel < 0) return;
+      const int own = MicroBodyOwn(*micro, (uint32_t)limb.microModel);
+      if (own < 0) return;
+      limb.microModel = own;
+      limb.carved = true;
+      limb.flipbookModel = -1;
+      poke = true;
+    };
+
+    // Prefer surface voxels (those with an empty neighbour) so the hole
+    // opens outward rather than hollowing the limb invisibly.
+    std::vector<uint32_t> face;
+    for (uint32_t ci : candidates) {
+      const IVec3 p = v.At(ci);
+      static constexpr IVec3 dirs[] = {{1, 0, 0},  {-1, 0, 0}, {0, 1, 0},
+                                       {0, -1, 0}, {0, 0, 1},  {0, 0, -1}};
+      for (const IVec3& d : dirs)
+        if (voxAt(cellOf({p.x + d.x, p.y + d.y, p.z + d.z})) == 0) {
+          face.push_back(ci);
+          break;
+        }
+    }
+    std::vector<uint32_t>& pool = face.empty() ? candidates : face;
+    ownBrick();
+
+    uint32_t eaten = 0;
+    for (uint32_t k = 0; k < nRot; k++) {
+      uint32_t i = 0;
+      if (!InfectTake(pool,
+                      Hash3((uint32_t)id_ ^ 0x6B1Du, tick,
+                            (uint32_t)li * 977u + k),
+                      i))
+        break;
+      const IVec3 p = v.At(i);
+      v.Set(i, 0, 0);
+      const uint32_t c = cellOf(p);
+      if (c != kNoBurnCell) bs.idx[c] = 0;
+      bs.removed++;
+      if (poke)
+        MicroBodyPoke(*micro, (uint32_t)limb.microModel, p.x, p.y, p.z, 0, 0);
+      eaten++;
+    }
+    if (eaten) {
+      MarkInstancesDirty();
+      burnFracDirty_ = true;
+      if (limbs_[li].burn.removed &&
+          !FlushBurn(li, world, spawns, false))
+        return false;
+    }
+  }
+  return true;
 }
 
 // ============================================================================
@@ -13503,7 +13650,7 @@ bool Mob::BluntHit(uint64_t bodyHandle, const ::BluntHit& hit, World& world,
     // kLimbCollapseFraction (25%) of its spawn voxels, CarveLimb calls Sever()
     // and the piece drops off the body. A mace should beat plate IN, and beat
     // the wearer through it; shearing it off the straps is a blade's job.
-    BluntCarveScope blunt(*this);
+    BluntCarveScope blunt(*this, hit.unarmed);
     // The host limb's BODY HANDLE, captured before anything can sever the
     // shell: `wornHost` is an INDEX, and an index into a list that a Damage()
     // three lines down may reshape is the classic way to bruise the wrong arm.
@@ -13568,7 +13715,7 @@ bool Mob::BluntHit(uint64_t bodyHandle, const ::BluntHit& hit, World& world,
   // The scope covers the WHOLE blow rather than only the carve, because both
   // rules it arms are about the same fact -- this is trauma, not an edge. See
   // Mob::BluntCarveScope.
-  BluntCarveScope blunt(*this);
+  BluntCarveScope blunt(*this, hit.unarmed);
   if (!Damage(bodyHandle, hit.hp, hit.at, hit.impactSpeed)) return false;
   // Damage() can sever (an extreme impact) or kill (a vital limb at zero), and
   // either reshapes limbs_. Re-resolve rather than trusting `li`; a handle that
@@ -13588,6 +13735,25 @@ bool Mob::BluntHit(uint64_t bodyHandle, const ::BluntHit& hit, World& world,
                limbs_[li].xf.quat[2], limbs_[li].xf.quat[3]};
   const Vec3 local = RotateInv(q, hit.at - limbs_[li].xf.pos);
 
+  // ---- UNARMED OVERRIDES (2026-09-19) -------------------------------------
+  //
+  // A fist and a mace shared every row until now. When the blow is from a
+  // natural weapon, the gore struct's unarmed overrides replace the matching
+  // base values, so a punch can mark a smaller area, break the skin less
+  // readily, and cave nothing in. A negative override means "same as the base".
+  const float effBruiseRadius =
+      (hit.unarmed && gt.unarmedBruiseRadius >= 0.0f) ? gt.unarmedBruiseRadius
+                                                       : gt.bruiseRadius;
+  const float effBleedChance =
+      (hit.unarmed && gt.unarmedBleedChance >= 0.0f) ? gt.unarmedBleedChance
+                                                      : gt.bruiseBleedChance;
+  const float effCarveRadius =
+      (hit.unarmed && gt.unarmedCarveRadius >= 0.0f) ? gt.unarmedCarveRadius
+                                                      : gt.bluntCarveRadius;
+  const float effPulpCarveFrom =
+      (hit.unarmed && gt.unarmedPulpCarveFrom >= 0.0f) ? gt.unarmedPulpCarveFrom
+                                                        : gt.pulpCarveFrom;
+
   // 1. THE BRUISE, first and widest, on skin that is still there. An
   //    ACCUMULATING COAT in gore.bruiseMat rather than a rewrite of the skin
   //    to it: a punch marks you, it does not repaint you, and the mark gets
@@ -13597,46 +13763,35 @@ bool Mob::BluntHit(uint64_t bodyHandle, const ::BluntHit& hit, World& world,
   const uint32_t bruiseMat =
       sys_ != nullptr ? sys_->MaterialIdNamed(gt.bruiseMat) : 0u;
   BruiseReport mark;
-  if (bruiseMat != 0 && gt.bruiseRadius > 0.0f)
-    BruiseLimb(li, local, gt.bruiseRadius * (0.5f + 0.5f * power),
-               hit.seed ^ 0xB2015Eu, bruiseMat, power, hit.hp, &mark);
+  if (bruiseMat != 0 && effBruiseRadius > 0.0f)
+    BruiseLimb(li, local, effBruiseRadius * (0.5f + 0.5f * power),
+               hit.seed ^ 0xB2015Eu, bruiseMat, power, hit.hp, &mark,
+               hit.unarmed);
 
-  // 2. THE DENT -- AND IT HAS TO BE EARNED (2026-09-19).
+  // 2. THE DENT -- EARNED AND NOW DISSOLVED (2026-09-19).
   //
   // The weapon's `bluntCarve` is still the ceiling (a bare fist authors almost
   // nothing and a mace ~0.6 of the tuning radius), but it is no longer the
   // whole story: the radius is scaled by how much of the contact core this
   // blow found ALREADY pulped -- bloodied at `gore.pulpAmt` after the bruise
-  // there saturated and broke. Tuning::Gore::pulpCarveFrom has the ladder
-  // written out; the short version is that a mace on an intact arm takes
-  // NOTHING and a mace on the same square inch of a skull for the twelfth time
-  // caves it in.
+  // there saturated and broke.
   //
-  // This is why `bluntCarveRadius` could be turned back on at all. It shipped
-  // at 0 because the only alternative was a weapon that shaved voxels off
-  // undamaged flesh from the first blow, and "beating someone with a mace just
-  // keeps adding more and more bruises" was the result.
-  //
-  // The reading is the BRUISE's, so a blow that laid no bruise (bruising
-  // disabled, a slot that does not take a coat) earns no dent either. That is
-  // the right coupling rather than an accident: the mark IS the record of the
-  // damage, and a dent with no history behind it is the behaviour being
-  // removed here.
-  const float ripeFrom = std::clamp(gt.pulpCarveFrom, 0.0f, 1.0f);
+  // DISSOLUTION REPLACES THE INSTANT CARVE. Before this, earned > 0 fired
+  // CarveLimbRadial: a clean sphere of nothing, in one tick. Now it flags
+  // the limb for Mob::BluntPulpTick, which eats pulped voxels one at a time
+  // at gore.pulpRotRate -- the same per-tick Bernoulli draw the infection
+  // uses, so the disappearance is noisy, gradual, and never a slab. The
+  // flag stays on and the tick keeps eating until no pulped voxels remain,
+  // so further blows on the same spot keep feeding the dissolution.
+  const float ripeFrom = std::clamp(effPulpCarveFrom, 0.0f, 1.0f);
   const float earned =
       ripeFrom >= 1.0f
           ? 0.0f
           : std::clamp((mark.Ripeness() - ripeFrom) / (1.0f - ripeFrom), 0.0f,
                        1.0f);
-  // CarveLimbRadial soaks the crater it made in the victim's own woundMat on
-  // the way out, which is "deletes voxels and replaces them with gore" -- and
-  // the scope above is what stops the same carve from collapsing the limb,
-  // however many blows land on it.
-  const float dentR = gt.bluntCarveRadius *
-                      std::clamp(hit.carve, 0.0f, 1.0f) * power * earned;
-  if (dentR > 0.0f)
-    CarveLimbRadial(limbs_[li].body, hit.at, dentR, /*ragged=*/true,
-                    /*eject=*/true, world, spawns);
+  if (earned > 0.0f && effCarveRadius > 0.0f &&
+      std::clamp(hit.carve, 0.0f, 1.0f) > 0.0f)
+    limbs_[li].bluntPulp = true;
   return true;
 }
 

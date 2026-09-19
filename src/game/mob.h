@@ -1258,6 +1258,13 @@ struct MobLimb {
   // the note above that function for why the rate still comes out exact.
   // Per-voxel burning / dissolution (see BodyBurnState above).
   BodyBurnState burn;
+  // PULPED TISSUE IS DISSOLVING. Set by Mob::BluntHit when a blow earns a
+  // dent (ripeness > pulpCarveFrom) and cleared by BluntPulpTick when no
+  // pulped voxels remain. While true the dissolution tick eats blood-coated
+  // voxels at gore.pulpRotRate, one at a time, in a noisy pattern -- the
+  // same per-tick Bernoulli draw the infection uses. No clock state for the
+  // same reason InfectTick carries none (see the note above that function).
+  bool bluntPulp = false;
   // What is ON this limb, recounted at a bounded cadence (see LimbCoat).
   // Index-parallel by construction because it rides the limb itself, which is
   // what RemoveAppendedSlots moves wholesale.
@@ -1326,6 +1333,8 @@ struct BluntHit {
   float armorBreak = 0.0f;  // 0..1 of gear.bluntDentRadius broken off a SHELL
   float impactSpeed = 0.0f; // world voxels/sec, for the knock-loose rule
   uint32_t seed = 0;        // bruise draw key; see BladeCut::seed
+  bool unarmed = false;     // true for natural weapons (fist/jaw), selects
+                            // the unarmed overrides in Tuning::Gore
 };
 
 // ---- ONE BITE ---------------------------------------------------------------
@@ -1650,10 +1659,15 @@ class Mob {
   struct BluntCarveScope {
     bool& f;
     bool prev;
-    explicit BluntCarveScope(Mob& m) : f(m.inBluntCarve_), prev(m.inBluntCarve_) {
+    bool& u;
+    bool uprev;
+    BluntCarveScope(Mob& m, bool unarmed = false)
+        : f(m.inBluntCarve_), prev(m.inBluntCarve_),
+          u(m.inUnarmedBlunt_), uprev(m.inUnarmedBlunt_) {
       f = true;
+      u = unarmed;
     }
-    ~BluntCarveScope() { f = prev; }
+    ~BluntCarveScope() { f = prev; u = uprev; }
   };
 
   // ---- "THIS CARVE IS A TEAR" ----------------------------------------------
@@ -2779,7 +2793,8 @@ class Mob {
   };
   uint32_t BruiseLimb(int limbIndex, Vec3 centreLocal, float radiusWorld,
                       uint32_t seed, uint32_t bruiseMat, float power,
-                      float hp = 0.0f, BruiseReport* report = nullptr);
+                      float hp = 0.0f, BruiseReport* report = nullptr,
+                      bool unarmed = false);
   // The substance StainWound smears when nobody has said otherwise: the
   // creature's wound material if the palette can draw it, else its blood, else
   // nothing. One function because three call sites wanted the same chain.
@@ -2899,6 +2914,12 @@ class Mob {
   // Returns false when that has happened and the caller must touch nothing.
   bool InfectTick(uint32_t tick, World& world,
                   std::vector<ParticleSpawn>& spawns);
+  // PULPED TISSUE DISSOLVES (the blunt counterpart of InfectTick). One tick
+  // older, same Bernoulli draw, same FlushBurn tail. Eats voxels wearing the
+  // victim's own blood at gore.pulpAmt depth or deeper. Same return contract
+  // as InfectTick: false means limbs_ was reshaped and the caller must stop.
+  bool BluntPulpTick(uint32_t tick, World& world,
+                     std::vector<ParticleSpawn>& spawns);
   // One limb, on a tick whose dice came up non-zero. Same return contract.
   bool InfectStep(int limbIndex, uint32_t tick, uint32_t nSpread,
                   uint32_t nRot, World& world,
@@ -3309,6 +3330,7 @@ class Mob {
   // same reason `inBladeCut_` is: the avatar has no MobSystem at all, and an
   // NPC punching the player has to reach the same rules.
   bool inBluntCarve_ = false;
+  bool inUnarmedBlunt_ = false;
   bool inBite_ = false;
 
   // ---- IS THIS RIG SLOT A GARMENT? -------------------------------------------

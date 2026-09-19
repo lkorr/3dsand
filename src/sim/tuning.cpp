@@ -852,6 +852,14 @@ bool LoadTuning(const std::string& path, Tuning& out) {
     e.bruiseMax = std::clamp(e.bruiseMax, 0.0f, 15.0f);
     ReadF(*g, "bruiseBleedChance", e.bruiseBleedChance, out, at);
     e.bruiseBleedChance = std::clamp(e.bruiseBleedChance, 0.0f, 1.0f);
+    ReadF(*g, "bruiseBleedFrom", e.bruiseBleedFrom, out, at);
+    e.bruiseBleedFrom = std::clamp(e.bruiseBleedFrom, 0.0f, 1.0f);
+    ReadF(*g, "bruiseHpRef", e.bruiseHpRef, out, at);
+    // Non-negative only: 0 means "do not scale the step by hp at all", which is
+    // the pre-2026-09-19 behaviour and the honest way to switch this off.
+    e.bruiseHpRef = std::max(e.bruiseHpRef, 0.0f);
+    ReadF(*g, "bruiseHpFloor", e.bruiseHpFloor, out, at);
+    e.bruiseHpFloor = std::clamp(e.bruiseHpFloor, 0.0f, 1.0f);
     // BY NAME, not by id -- see Tuning::Gore::bruiseMat for why. An empty
     // string is legal and means "do not bruise"; an unknown name resolves to 0
     // at use and means the same thing, so there is nothing to clamp here.
@@ -863,6 +871,20 @@ bool LoadTuning(const std::string& path, Tuning& out) {
     // becomes an amputation by arithmetic, which is the one thing a blunt hit
     // must never be (Mob::BluntCarveScope).
     e.bluntCarveRadius = std::clamp(e.bluntCarveRadius, 0.0f, 4.0f);
+    ReadF(*g, "pulpAmt", e.pulpAmt, out, at);
+    e.pulpAmt = std::clamp(e.pulpAmt, 1.0f, 15.0f);
+    ReadF(*g, "pulpCarveFrom", e.pulpCarveFrom, out, at);
+    // 1 is legal and means "never": nothing short of a wholly bloodied core
+    // earns a dent, and a core is never wholly anything because of the taper.
+    e.pulpCarveFrom = std::clamp(e.pulpCarveFrom, 0.0f, 1.0f);
+    ReadF(*g, "pulpRotRate", e.pulpRotRate, out, at);
+    e.pulpRotRate = std::max(e.pulpRotRate, 0.0f);
+    ReadF(*g, "unarmedBruiseRadius", e.unarmedBruiseRadius, out, at);
+    ReadF(*g, "unarmedBruiseStep", e.unarmedBruiseStep, out, at);
+    ReadF(*g, "unarmedBleedChance", e.unarmedBleedChance, out, at);
+    ReadF(*g, "unarmedBleedScale", e.unarmedBleedScale, out, at);
+    ReadF(*g, "unarmedCarveRadius", e.unarmedCarveRadius, out, at);
+    ReadF(*g, "unarmedPulpCarveFrom", e.unarmedPulpCarveFrom, out, at);
     ReadF(*g, "biteRadius", e.biteRadius, out, at);
     e.biteRadius = std::clamp(e.biteRadius, 0.0f, 8.0f);
     ReadF(*g, "biteBlob", e.biteBlob, out, at);
@@ -1293,8 +1315,13 @@ bool LoadTuning(const std::string& path, Tuning& out) {
     ReadF(*g, "whooshMinSpeed", e.whooshMinSpeed, out, at);
     ReadF(*g, "whooshRateSlow", e.whooshRateSlow, out, at);
     ReadF(*g, "whooshRateFast", e.whooshRateFast, out, at);
+    ReadF(*g, "whooshEdgeFrac", e.whooshEdgeFrac, out, at);
+    ReadF(*g, "whooshPan", e.whooshPan, out, at);
     ReadF(*g, "fleshVolume", e.fleshVolume, out, at);
     ReadF(*g, "clangVolume", e.clangVolume, out, at);
+    ReadF(*g, "strikeEdgeVolume", e.strikeEdgeVolume, out, at);
+    ReadF(*g, "strikeBluntVolume", e.strikeBluntVolume, out, at);
+    ReadF(*g, "cutVolume", e.cutVolume, out, at);
     ReadF(*g, "cueRadius", e.cueRadius, out, at);
 
     // ---- BOUNDS ---------------------------------------------------------------
@@ -1337,8 +1364,13 @@ bool LoadTuning(const std::string& path, Tuning& out) {
     e.whooshMinSpeed = std::max(e.whooshMinSpeed, 0.0f);
     e.whooshRateSlow = std::clamp(e.whooshRateSlow, 0.25f, 4.0f);
     e.whooshRateFast = std::clamp(e.whooshRateFast, 0.25f, 4.0f);
+    e.whooshEdgeFrac = std::clamp(e.whooshEdgeFrac, 0.0f, 1.0f);
+    e.whooshPan = std::clamp(e.whooshPan, 0.0f, 1.0f);
     e.fleshVolume = std::clamp(e.fleshVolume, 0.0f, 4.0f);
     e.clangVolume = std::clamp(e.clangVolume, 0.0f, 4.0f);
+    e.strikeEdgeVolume = std::clamp(e.strikeEdgeVolume, 0.0f, 4.0f);
+    e.strikeBluntVolume = std::clamp(e.strikeBluntVolume, 0.0f, 4.0f);
+    e.cutVolume = std::clamp(e.cutVolume, 0.0f, 4.0f);
     e.cueRadius = std::clamp(e.cueRadius, 1.0f, 400.0f);
   }
 
@@ -3037,8 +3069,13 @@ bool SaveCombatTuning(const std::string& path, const Tuning& t,
     put("whooshMinSpeed", f.whooshMinSpeed);
     put("whooshRateSlow", f.whooshRateSlow);
     put("whooshRateFast", f.whooshRateFast);
+    put("whooshEdgeFrac", f.whooshEdgeFrac);
+    put("whooshPan", f.whooshPan);
     put("fleshVolume", f.fleshVolume);
     put("clangVolume", f.clangVolume);
+    put("strikeEdgeVolume", f.strikeEdgeVolume);
+    put("strikeBluntVolume", f.strikeBluntVolume);
+    put("cutVolume", f.cutVolume);
     put("cueRadius", f.cueRadius);
   }
   // GORE TOO, because the Combat panel's Damage tab edits it. A Save button
@@ -3079,8 +3116,20 @@ bool SaveCombatTuning(const std::string& path, const Tuning& t,
     put("bruiseStep", g.bruiseStep);
     put("bruiseMax", g.bruiseMax);
     put("bruiseBleedChance", g.bruiseBleedChance);
+    put("bruiseBleedFrom", g.bruiseBleedFrom);
+    put("bruiseHpRef", g.bruiseHpRef);
+    put("bruiseHpFloor", g.bruiseHpFloor);
     put("bluntBleedScale", g.bluntBleedScale);
     put("bluntCarveRadius", g.bluntCarveRadius);
+    put("pulpAmt", g.pulpAmt);
+    put("pulpCarveFrom", g.pulpCarveFrom);
+    put("pulpRotRate", g.pulpRotRate);
+    put("unarmedBruiseRadius", g.unarmedBruiseRadius);
+    put("unarmedBruiseStep", g.unarmedBruiseStep);
+    put("unarmedBleedChance", g.unarmedBleedChance);
+    put("unarmedBleedScale", g.unarmedBleedScale);
+    put("unarmedCarveRadius", g.unarmedCarveRadius);
+    put("unarmedPulpCarveFrom", g.unarmedPulpCarveFrom);
     put("biteRadius", g.biteRadius);
     put("biteBlob", g.biteBlob);
     put("biteStainScale", g.biteStainScale);

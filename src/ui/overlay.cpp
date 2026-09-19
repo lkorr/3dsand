@@ -117,6 +117,57 @@ void Overlay::UnregisterTexture(uint64_t id) {
   if (id) ImGui_ImplVulkan_RemoveTexture((VkDescriptorSet)id);
 }
 
+// Double-click any slider to type a precise value (one at a time).
+static ImGuiID sManualInputId    = 0;
+static bool    sManualInputFocus = false;
+
+static bool EditableSliderFloat(const char* label, float* v, float lo, float hi,
+                                const char* fmt = "%.3f") {
+  ImGuiID id = ImGui::GetID(label);
+  if (sManualInputId == id) {
+    if (sManualInputFocus) {
+      ImGui::SetKeyboardFocusHere();
+      sManualInputFocus = false;
+    }
+    ImGui::InputFloat(label, v, 0, 0, fmt);
+    if (ImGui::IsItemDeactivated()) {
+      *v = std::clamp(*v, lo, hi);
+      sManualInputId = 0;
+      return true;
+    }
+    return false;
+  }
+  bool changed = ImGui::SliderFloat(label, v, lo, hi, fmt);
+  if (ImGui::IsItemHovered() && ImGui::IsMouseDoubleClicked(0)) {
+    sManualInputId = id;
+    sManualInputFocus = true;
+  }
+  return changed;
+}
+
+static bool EditableSliderInt(const char* label, int* v, int lo, int hi) {
+  ImGuiID id = ImGui::GetID(label);
+  if (sManualInputId == id) {
+    if (sManualInputFocus) {
+      ImGui::SetKeyboardFocusHere();
+      sManualInputFocus = false;
+    }
+    ImGui::InputInt(label, v, 0, 0);
+    if (ImGui::IsItemDeactivated()) {
+      *v = std::clamp(*v, lo, hi);
+      sManualInputId = 0;
+      return true;
+    }
+    return false;
+  }
+  bool changed = ImGui::SliderInt(label, v, lo, hi);
+  if (ImGui::IsItemHovered() && ImGui::IsMouseDoubleClicked(0)) {
+    sManualInputId = id;
+    sManualInputFocus = true;
+  }
+  return changed;
+}
+
 bool Overlay::WantsMouse() const { return ImGui::GetIO().WantCaptureMouse; }
 bool Overlay::WantsKeyboard() const {
   return ImGui::GetIO().WantCaptureKeyboard;
@@ -862,7 +913,7 @@ void Overlay::Draw(UIState& s) {
   // system carries the violence — and because they are the two things you want
   // to A/B against each other. Pinning one to 0 while pushing the other is the
   // fastest way to see which tier a given effect is actually coming from.
-  if (ImGui::SliderFloat("wind x voxels", &s.windGasScale, 0.0f, 16.0f, "%.2fx"))
+  if (EditableSliderFloat("wind x voxels", &s.windGasScale, 0.0f, 16.0f, "%.2fx"))
     s.windTuningDirty = true;
   if (ImGui::IsItemHovered())
     ImGui::SetTooltip(
@@ -876,7 +927,7 @@ void Overlay::Draw(UIState& s) {
         "SETTLED voxels are untouched at any value - that is entrainment,\n"
         "which is sim.windMode 2 and off. 0 pins the CA tier still.\n"
         "Changes the world hash. Deterministic, just a different world.");
-  if (ImGui::SliderFloat("wind x particles", &s.windPartScale, 0.0f, 16.0f, "%.2fx"))
+  if (EditableSliderFloat("wind x particles", &s.windPartScale, 0.0f, 16.0f, "%.2fx"))
     s.windTuningDirty = true;
   if (ImGui::IsItemHovered())
     ImGui::SetTooltip(
@@ -888,8 +939,8 @@ void Overlay::Draw(UIState& s) {
         "Per-material response still applies, so heavy debris moves less than\n"
         "spray at the same multiplier. 0 pins the particle tier still.\n"
         "Changes the world hash. Deterministic, just a different world.");
-  if (ImGui::SliderFloat("wind fall onset", &s.windDragRef, 1.0f, 120.0f,
-                         "%.0f m/s"))
+  if (EditableSliderFloat("wind fall onset", &s.windDragRef, 1.0f, 120.0f,
+                          "%.0f m/s"))
     s.windTuningDirty = true;
   if (ImGui::IsItemHovered())
     ImGui::SetTooltip(
@@ -916,13 +967,13 @@ void Overlay::Draw(UIState& s) {
     const char* kinds[] = {"cone (fan / jet)", "burst (blast or vacuum)",
                            "vortex (tornado)"};
     ImGui::Combo("kind", &s.windFanKind, kinds, 3);
-    ImGui::SliderFloat("speed", &s.windFanSpeed, -40.0f, 40.0f, "%.0f m/s");
+    EditableSliderFloat("speed", &s.windFanSpeed, -40.0f, 40.0f, "%.0f m/s");
     if (ImGui::IsItemHovered())
       ImGui::SetTooltip(
           "Core speed at the mouth. NEGATIVE is legal and useful: it turns a\n"
           "burst into a vacuum and a cone into a draw.");
-    ImGui::SliderInt("radius", &s.windFanRadius, 1, 64);
-    ImGui::SliderInt("reach", &s.windFanReach, 1, 128);
+    EditableSliderInt("radius", &s.windFanRadius, 1, 64);
+    EditableSliderInt("reach", &s.windFanReach, 1, 128);
     ImGui::Checkbox("may move SETTLED powder", &s.windFanEntrain);
     if (ImGui::IsItemHovered())
       ImGui::SetTooltip(
@@ -984,6 +1035,14 @@ void Overlay::Draw(UIState& s) {
   ImGui::SameLine();
   ImGui::RadioButton("mpm", &s.tool, UIState::kToolFluid);
 
+  if (ImGui::Button("Combat")) s.combatWindowOpen = !s.combatWindowOpen;
+  ImGui::SameLine();
+  if (ImGui::Button("NPC AI")) s.aiWindowOpen = !s.aiWindowOpen;
+  ImGui::SameLine();
+  if (ImGui::Button("Fluid")) s.fluidWindowOpen = !s.fluidWindowOpen;
+  ImGui::SameLine();
+  if (ImGui::Button("Wardrobe")) s.wardrobeWindowOpen = !s.wardrobeWindowOpen;
+
   if (s.tool == UIState::kToolMelee) {
     ImGui::TextDisabled("hold LMB to guard, then FLICK the mouse to cut");
   }
@@ -992,31 +1051,6 @@ void Overlay::Draw(UIState& s) {
     ImGui::Text("mpm particles: %u / 262144", s.fluidCount);
     ImGui::SameLine();
     if (ImGui::Button("clear (U)")) s.clearFluid = true;
-    if (ImGui::Button("fluid tuning..."))
-      s.fluidWindowOpen = !s.fluidWindowOpen;
-  }
-  if (s.tool == UIState::kToolMob) {
-    if (ImGui::Button("NPC AI...")) s.aiWindowOpen = !s.aiWindowOpen;
-    ImGui::SameLine();
-    ImGui::TextDisabled("%d live", (int)s.aiMobIds.size());
-    // Beside the AI button because the two are used together: you spawn a
-    // villager and then you dress it.
-    if (ImGui::Button("Wardrobe..."))
-      s.wardrobeWindowOpen = !s.wardrobeWindowOpen;
-    ImGui::SameLine();
-    ImGui::TextDisabled("dye a set of clothes");
-  }
-  // Off the MELEE tool, which is the one context where every knob in the panel
-  // is about what you are currently doing. Deliberately not off the mob tool
-  // beside the AI button: the two panels are used together, and a fight is
-  // tuned from the weapon's end.
-  if (s.tool == UIState::kToolMelee) {
-    if (ImGui::Button("Combat...")) s.combatWindowOpen = !s.combatWindowOpen;
-    ImGui::SameLine();
-    if (s.hitStopScale < 0.999f)
-      ImGui::TextDisabled("HIT-STOP %.2fx", s.hitStopScale);
-    else
-      ImGui::TextDisabled("stroke / gore / feel");
   }
   if (s.tool == UIState::kToolBrush) {
     ImGui::TextDisabled("LMB paint  RMB erase  1-8 / combo below");
@@ -1120,10 +1154,10 @@ void Overlay::Draw(UIState& s) {
       ImGui::Separator();
 
       auto fslider = [](const char* label, float* v, float lo, float hi) {
-        ImGui::SliderFloat(label, v, lo, hi, "%.2f");
+        EditableSliderFloat(label, v, lo, hi, "%.2f");
       };
       auto islider = [](const char* label, int* v, int lo, int hi) {
-        ImGui::SliderInt(label, v, lo, hi);
+        EditableSliderInt(label, v, lo, hi);
       };
       auto fcheck = [](const char* label, int* v) {
         bool on = *v != 0;
@@ -1522,11 +1556,11 @@ void Overlay::Draw(UIState& s) {
             // knobs cost nothing to apply (no shader touches them), and an AI
             // you have to press Apply to feel is an AI you cannot tune.
             auto f = [&s](const char* label, float* v, float lo, float hi) {
-              if (ImGui::SliderFloat(label, v, lo, hi, "%.2f"))
+              if (EditableSliderFloat(label, v, lo, hi, "%.2f"))
                 s.aiTuningDirty = true;
             };
             auto i32 = [&s](const char* label, int* v, int lo, int hi) {
-              if (ImGui::SliderInt(label, v, lo, hi)) s.aiTuningDirty = true;
+              if (EditableSliderInt(label, v, lo, hi)) s.aiTuningDirty = true;
             };
             auto b = [&s](const char* label, bool* v) {
               if (ImGui::Checkbox(label, v)) s.aiTuningDirty = true;
@@ -1572,12 +1606,12 @@ void Overlay::Draw(UIState& s) {
               for (int k = 0; k < 6; k++) {
                 ImGui::PushID(k);
                 ImGui::TextUnformatted(kIntent[k]);
-                if (ImGui::SliderFloat("weight", &s.aiIntentWeight[k], 0.0f,
-                                       4.0f, "%.2f"))
+                if (EditableSliderFloat("weight", &s.aiIntentWeight[k], 0.0f,
+                                        4.0f, "%.2f"))
                   s.aiTuningDirty = true;
-                if (ImGui::SliderInt("cooldown", &s.aiIntentCooldown[k], 0, 180))
+                if (EditableSliderInt("cooldown", &s.aiIntentCooldown[k], 0, 180))
                   s.aiTuningDirty = true;
-                if (ImGui::SliderInt("min dwell", &s.aiIntentDwell[k], 0, 180))
+                if (EditableSliderInt("min dwell", &s.aiIntentDwell[k], 0, 180))
                   s.aiTuningDirty = true;
                 ImGui::PopID();
                 ImGui::Separator();
@@ -1622,10 +1656,10 @@ void Overlay::Draw(UIState& s) {
       // every one of these lands on the next tick.
       auto f = [&moved](const char* label, float* v, float lo, float hi,
                         const char* fmt = "%.3f") {
-        if (ImGui::SliderFloat(label, v, lo, hi, fmt)) moved = true;
+        if (EditableSliderFloat(label, v, lo, hi, fmt)) moved = true;
       };
       auto i32 = [&moved](const char* label, int* v, int lo, int hi) {
-        if (ImGui::SliderInt(label, v, lo, hi)) moved = true;
+        if (EditableSliderInt(label, v, lo, hi)) moved = true;
       };
       auto b = [&moved](const char* label, bool* v) {
         if (ImGui::Checkbox(label, v)) moved = true;
@@ -2184,6 +2218,26 @@ void Overlay::Draw(UIState& s) {
               ImGui::SetTooltip(
                   "Per-voxel chance a blow lays BLOOD over a voxel already\n"
                   "at the bruise ceiling. 0 = bruises stay dry forever.");
+            f("...from what depth", &g.bruiseBleedFrom, 0.0f, 1.0f, "%.2f");
+            if (ImGui::IsItemHovered())
+              ImGui::SetTooltip(
+                  "Fraction of the ceiling a voxel must reach before the\n"
+                  "roll above is made. 1.0 is EXACTLY saturated, which the\n"
+                  "0.85..1.0 step jitter makes a blow harder to reach than\n"
+                  "it looks; 0.85 is 'hit a bruise again and it bleeds'.");
+            f("full-step hp", &g.bruiseHpRef, 0.0f, 64.0f, "%.1f");
+            if (ImGui::IsItemHovered())
+              ImGui::SetTooltip(
+                  "THE FIST/MACE DIFFERENCE. Blunt hp that earns the whole\n"
+                  "bruise step; a weaker blow gets a SQUARE-ROOTED share.\n"
+                  "Root not linear: a linear quarter-step would land under\n"
+                  "the mottle threshold and a punch would mark nothing.\n"
+                  "0 = every blow marks like a full one.");
+            f("...floor under it", &g.bruiseHpFloor, 0.0f, 1.0f, "%.2f");
+            if (ImGui::IsItemHovered())
+              ImGui::SetTooltip(
+                  "Smallest share of the step a weak blow can be cut to,\n"
+                  "so an incidental tap still leaves a visible mark.");
             f("blunt bleed scale", &g.bluntBleedScale, 0.0f, 1.0f, "%.2f");
             if (ImGui::IsItemHovered())
               ImGui::SetTooltip(
@@ -2192,10 +2246,77 @@ void Overlay::Draw(UIState& s) {
             f("blunt carve radius (vox)", &g.bluntCarveRadius, 0.0f, 4.0f, "%.2f");
             if (ImGui::IsItemHovered())
               ImGui::SetTooltip(
-                  "How deep a full-power blunt hit dents flesh, in world\n"
-                  "voxels. Scaled by the weapon's bluntCarve fraction\n"
-                  "(fist 0, gauntlet ~0.35, mace ~0.6). The crater is\n"
-                  "soaked in the victim's woundMat.");
+                  "How deep a blunt hit dents flesh THAT IS ALREADY PULPED,\n"
+                  "in world voxels. Scaled by the weapon's bluntCarve\n"
+                  "fraction (fist 0.3, gauntlet ~0.35, mace ~0.6) AND by\n"
+                  "the pulp share below -- nothing comes off clean skin.\n"
+                  "The crater is soaked in the victim's woundMat.");
+            ImGui::TextDisabled("pulping: bruise -> blood -> voxels come away");
+            f("pulped at (coat depth)", &g.pulpAmt, 1.0f, 15.0f, "%.0f");
+            if (ImGui::IsItemHovered())
+              ImGui::SetTooltip(
+                  "How deep a coat of the victim's own BLOOD a voxel must\n"
+                  "wear to count as pulp. A depth, not merely 'wet': one\n"
+                  "spray from a cut elsewhere must not make a limb crumble\n"
+                  "under a punch.");
+            f("dents past pulp share", &g.pulpCarveFrom, 0.0f, 1.0f, "%.2f");
+            if (ImGui::IsItemHovered())
+              ImGui::SetTooltip(
+                  "Share of the contact CORE (inner half of the bruise\n"
+                  "radius) that must already be pulp before ANY voxel is\n"
+                  "removed; past it the dent ramps to full. 0 restores the\n"
+                  "old 'first blow dents' behaviour. This is what makes\n"
+                  "sustained hits on one spot cave a skull in while a mace\n"
+                  "on an intact arm only bruises.");
+            ImGui::TextDisabled("dissolution: pulped voxels dissolve over time");
+            f("pulp rot (vox/min)", &g.pulpRotRate, 0.0f, 20.0f, "%.2f");
+            if (ImGui::IsItemHovered())
+              ImGui::SetTooltip(
+                  "How fast PULPED tissue dissolves, in world voxels a\n"
+                  "minute, per flagged limb. When a blow earns a dent the\n"
+                  "limb is flagged, and this rate eats blood-coated voxels\n"
+                  "one at a time in a noisy pattern — the same Bernoulli\n"
+                  "draw the infection uses. Replaces the old instant carve.\n"
+                  "0 = pulped tissue stays put (bruise only, no dissolution).");
+          }
+          if (ImGui::CollapsingHeader("Unarmed overrides")) {
+            ImGui::TextDisabled("negative = use the base value above");
+            f("bruise radius (vox)##unarmed", &g.unarmedBruiseRadius,
+              -1.0f, 4.0f, "%.2f");
+            if (ImGui::IsItemHovered())
+              ImGui::SetTooltip(
+                  "Bruise radius for natural weapons (fists, jaws).\n"
+                  "Negative = same as the base row above.");
+            f("bruise step##unarmed", &g.unarmedBruiseStep,
+              -1.0f, 15.0f, "%.1f");
+            if (ImGui::IsItemHovered())
+              ImGui::SetTooltip(
+                  "Bruise step per hit for natural weapons.\n"
+                  "Negative = same as the base row.");
+            f("bleed chance##unarmed", &g.unarmedBleedChance,
+              -1.0f, 1.0f, "%.2f");
+            if (ImGui::IsItemHovered())
+              ImGui::SetTooltip(
+                  "Bruise-to-blood chance for natural weapons.\n"
+                  "Negative = same as the base row.");
+            f("bleed scale##unarmed", &g.unarmedBleedScale,
+              -1.0f, 1.0f, "%.2f");
+            if (ImGui::IsItemHovered())
+              ImGui::SetTooltip(
+                  "Fraction of a cut's drip budget for unarmed blunt.\n"
+                  "Negative = same as the base row.");
+            f("dent radius##unarmed", &g.unarmedCarveRadius,
+              -1.0f, 4.0f, "%.2f");
+            if (ImGui::IsItemHovered())
+              ImGui::SetTooltip(
+                  "Blunt carve radius for natural weapons.\n"
+                  "Negative = same as the base row.");
+            f("dents past pulp share##unarmed", &g.unarmedPulpCarveFrom,
+              -1.0f, 1.0f, "%.2f");
+            if (ImGui::IsItemHovered())
+              ImGui::SetTooltip(
+                  "Pulp share threshold for natural weapons.\n"
+                  "Negative = same as the base row.");
           }
           if (ImGui::CollapsingHeader("Bite")) {
             f("bite radius (vox)", &g.biteRadius, 0.0f, 2.0f, "%.2f");
@@ -2247,6 +2368,15 @@ void Overlay::Draw(UIState& s) {
                   "kills. Below the spread rate the infection grows while\n"
                   "you shrink — an untreated bite is fatal. 0 = spreads\n"
                   "but never consumes.");
+            if (EditableSliderFloat("mob multiplier", &g.infectMobMult,
+                                    0.0f, 50.0f, "%.1f"))
+              SetCurrentTuning(t);
+            if (ImGui::IsItemHovered())
+              ImGui::SetTooltip(
+                  "Scales both spread and rot rates on mob limbs only.\n"
+                  "The grid-side reactions are unaffected. Crank this up\n"
+                  "to watch an infection advance in real time without\n"
+                  "touching the base rates or reloading materials.");
           }
           if (ImGui::CollapsingHeader("Armour vs blunt/bite")) {
             Tuning::Gear& gr = t.gear;

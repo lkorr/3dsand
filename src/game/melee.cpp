@@ -822,6 +822,12 @@ EdgeSweepResult MeleeSweepDamage(const EdgeSweep& s, const MeleeTuning& t,
         if (owner != nullptr && li >= 0 && li == owner->HeldSlot()) continue;
       }
       hitBodies.push_back(hb);
+      // FIRST contact wins: a sweep that catches two limbs made one noise, and
+      // it was made where the blade arrived first.
+      if (!out.hasHitAt) {
+        out.hitAt = at;
+        out.hasHitAt = true;
+      }
 
       // ---- WHAT WAS STRUCK, ASKED ONCE (game/impact.h StruckKind) ----------
       //
@@ -962,6 +968,7 @@ EdgeSweepResult MeleeSweepDamage(const EdgeSweep& s, const MeleeTuning& t,
         bh.armorBreak = s.strike.armorBreak;
         bh.impactSpeed = out.tipSpeed;
         bh.seed = hitSeed ^ 0xB1u;
+        bh.unarmed = s.selfMounted;
         mobs.BluntHit(hb, bh, world, spawns);
       }
 
