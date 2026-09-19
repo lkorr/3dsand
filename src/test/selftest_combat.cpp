@@ -3063,6 +3063,133 @@ Status GateBiteTarget(Ctx& c, std::string& detail) {
         proneDrawn, want, legFrac * 100.0, pt.c_str(), (double)prone);
   }
 
+  // ---- ...AND THE BLOW IS THEN AIMED AT THE LIMB IT DREW (2026-09-19) -----
+  //
+  // EVERY ARM ABOVE ASSERTS A CHOICE THAT STEERED NOTHING. `targetLimb` was
+  // drawn, recorded and reported, and `StartStroke` went on handing the stroke
+  // the caller's point -- the victim's BODY CENTRE -- so the whole table was
+  // decoration: the drawn limb never reached the aim, and `bite-target` passed
+  // on every one of its claims while a crawler aimed at a standing victim's
+  // chest. The report was "zombie bites when crawling are extremely
+  // inaccurate", and it was accurate.
+  //
+  // This is the arm that would have caught it, and it is deliberately not a
+  // sweep: whether the teeth then CONNECT is a fact about reach, pose and the
+  // half-width, and every one of those would make this arm move for reasons
+  // that are not the bug. Where the blow is POINTED is one comparison against
+  // the limb's own middle.
+  //
+  // The biter is legless and prone by now (the arm above severed it), which is
+  // the posture the report is about: `targetProne` sends nine draws in ten at
+  // a leg, so most of these aims are also the vertical claim.
+  {
+    const Vec3 chest = Chest(c.mobs, prey, nd);
+    int aimed = 0, onLimb = 0, legAims = 0, legLow = 0;
+    double worstDy = 0.0;
+    for (uint32_t k = 0; k < 16; k++) {
+      Mob* m = c.mobs.FindMobById(biter);
+      Mob* pv = c.mobs.FindMobById(prey);
+      if (m == nullptr || pv == nullptr) break;
+      m->Stroke().Reset();
+      // THE STANDING BITE, not the lunge: a crawler in contact is the case the
+      // report is about, and it is the style with no flight to confuse the
+      // point with. Through `ForceAttack`'s target id, which is the same
+      // `StartStroke` door the AI's `BeginStroke` goes through.
+      if (!c.mobs.ForceAttack(biter, "bite", chest, tick.tick + 3000u + k, 0,
+                              prey))
+        continue;
+      const NpcStroke* s = c.mobs.MobStroke(biter);
+      Vec3 lc{};
+      if (s == nullptr || s->targetLimb < 0 ||
+          !pv->LimbCentreWorld(s->targetLimb, lc)) {
+        m->Stroke().Reset();
+        continue;
+      }
+      aimed++;
+      const double dy = std::fabs((double)(s->targetPoint.y - lc.y));
+      worstDy = std::max(worstDy, dy);
+      // A voxel of slack and no more: the aim carries the request's PLANAR
+      // lead onto the limb and takes the height from the limb outright, so
+      // there is nothing left to be off by vertically.
+      if (dy < 1.0) onLimb++;
+      if (nd.limbs[(size_t)s->targetLimb].tag == "leg") {
+        legAims++;
+        // The number the bug was: a standing victim's chest against the leg
+        // the crawler actually drew. Two voxels is well inside the gap on any
+        // rig whose legs are not its torso.
+        if (s->targetPoint.y < chest.y - 2.0f) legLow++;
+      }
+      m->Stroke().Reset();
+    }
+    check(aimed >= 8, "a prone biter's forced bites resolve a limb to aim at");
+    check(onLimb == aimed,
+          "...and every one is aimed at THAT limb's own middle, not at the "
+          "body centre the caller asked for");
+    check(legAims > 0, "...with legs among them, as the prone table says");
+    check(legLow == legAims,
+          "...and a bite that drew a LEG is aimed well below the chest");
+    RecordObserved("biteTarget.aimLimbDyWorst", worstDy);
+    std::printf(
+        "bite-target: AIM: %d bites aimed at the drawn limb (%d on-limb, "
+        "worst dy %.2f vox); %d legs, %d of them below the chest\n",
+        aimed, onLimb, worstDy, legAims, legLow);
+
+    // ---- ...AND THE HEAD REALLY ENDS UP POINTING THERE -------------------
+    //
+    // THE OTHER HALF OF THE SAME REPORT, and it is a different mechanism:
+    // aiming a blow correctly and POSING the part along that aim are two
+    // steps, and the second one was upright-only. `ApplyAimPart` multiplies a
+    // yaw/pitch pair onto the part's LOCAL rotation, i.e. about axes the chain
+    // above the part has already moved -- and the `crawl` clip pitches the
+    // hips 74 deg forward in override mode, so on a crawler the commanded yaw
+    // came out mostly as pitch and the commanded pitch mostly as yaw. The rig
+    // records both ends (Mob::AimDiag: what the driver asked for, and what the
+    // posed edge actually points at, read after the flatten and the clamp), so
+    // the claim is one subtraction and needs no geometry of its own here.
+    //
+    // 0.25 rad is stated as a bound on a BITE rather than fitted to the run:
+    // 14 degrees is about the half-angle a set of jaws covers at contact, so
+    // an error under it still lands on what was aimed at and an error over it
+    // is a bite that goes somewhere else. The pre-fix pose misses by the
+    // parent's own tilt, which is a radian and a quarter.
+    Mob* m = c.mobs.FindMobById(biter);
+    if (m != nullptr) {
+      m->Stroke().Reset();
+      float worstYaw = 0, worstPitch = 0;
+      int sampled = 0;
+      if (c.mobs.ForceAttack(biter, "bite", chest, tick.tick + 4000u, 0,
+                             prey)) {
+        for (int i = 0; i < 24; i++) {
+          tick();
+          const Mob* mm = c.mobs.FindMobById(biter);
+          const NpcStroke* s = c.mobs.MobStroke(biter);
+          if (mm == nullptr || s == nullptr) break;
+          if (!s->Cutting()) continue;
+          const Mob::AimDiag& ad = mm->AimDiagnostics();
+          if (!ad.ran) continue;
+          sampled++;
+          auto wrap = [](float a) {
+            while (a > 3.14159265f) a -= 6.28318531f;
+            while (a <= -3.14159265f) a += 6.28318531f;
+            return std::fabs(a);
+          };
+          worstYaw = std::max(worstYaw, wrap(ad.gotYaw - ad.cmdYaw));
+          worstPitch = std::max(worstPitch, std::fabs(ad.gotPitch - ad.cmdPitch));
+        }
+      }
+      check(sampled > 0, "a prone biter's cut is sampled at all");
+      check(worstYaw < 0.25f && worstPitch < 0.25f,
+            "...and while PRONE the jaws end up pointing where the stroke "
+            "commanded, not rotated by the crawl pose's own pitch");
+      RecordObserved("biteTarget.proneAimErrYaw", (double)worstYaw);
+      RecordObserved("biteTarget.proneAimErrPitch", (double)worstPitch);
+      std::printf(
+          "bite-target: PRONE aim: %d cut ticks, worst commanded->posed error "
+          "yaw %.3f rad, pitch %.3f rad\n",
+          sampled, (double)worstYaw, (double)worstPitch);
+    }
+  }
+
   CloseStage(c);
   detail = Format("%d checks", checks);
   std::printf("bite-target: %s (%d checks)\n", ok ? "PASS" : "FAIL", checks);

@@ -6653,6 +6653,16 @@ file compiled onto the human under its stem — that is the name a style uses.
   gate asserts the DRAW instead of inferring it from where the wounds landed,
   and it is drawn ONCE per stroke — a blow that re-chose its limb every tick
   would be homing, and the whole point of a windup is that it is not.
+  **And the stroke is then AIMED at it** (2026-09-19): `StartStroke` replaces
+  the request's point — the victim's body CENTRE — with the drawn limb's own
+  middle (`Mob::LimbCentreWorld`, the collider box's centre off the live
+  transform; the limb's JOINT would aim a leg bite at a standing victim's hip),
+  carrying the request's planar LEAD across and taking the height from the limb
+  outright. Until that landed the table steered nothing at all: every authored
+  weight was recorded and then discarded, most visibly on a crawler, whose
+  `targetProne` sends nine bites in ten at a leg and sent all ten at a chest it
+  could not reach. `targetProne` is the second table, drawn from instead of
+  `target` whenever the BITER is prone (`Mob::LocoGroundAlign() > 0`).
 
 **`StyleUsable` is the style vocabulary's one question about a rig**, declared
 in `strokes.h` and defined in `mob.cpp` — the header is included BY `mob.h` so
@@ -6891,10 +6901,21 @@ later grows a neck chain starts biting through the IK with no content edit.
   which legitimately sits beside the chin, out and up.
 - **Aim** (the jaws) — no rig puts the head in a chain and one that did would be
   claiming the neck is an arm, so the part is driven the other way a part can be
-  pointed at something: `Mob::ApplyAimPart` rotates it, and an authored share of
+  pointed at something: `Mob::AimPartAlong` rotates it, and an authored share of
   the spine (`MobDef::aimSpineShare`, 0.35 — anatomy, so a rig fact and not a
   tuning one), until its forward lies along the stroke's bearing; the body's own
-  travel closes the distance. That bearing is the driver's `StrokeAz`/`StrokeEl`
+  travel closes the distance. **It is solved in the part's PARENT frame**
+  (2026-09-19): the spine takes its share of the yaw error first, the part's
+  world forward is then re-read and the remainder closed exactly, so nothing on
+  this path assumes the chain above the part is upright. `ApplyAimPart`, the
+  angle form, multiplied a yaw/pitch pair onto the part's LOCAL rotation — a
+  delta about axes the parents have already moved — which is a few degrees of
+  error on a standing creature and NINETY on a crawler, whose `crawl` clip
+  pitches the hips 74° forward in override mode: commanded yaw arrived as pitch
+  and commanded pitch as yaw. Measured by `bite-target`'s prone arm off the
+  rig's own commanded/posed pair: 1.589 rad of yaw error under the old form
+  (`SANDVOX_AIM_OLD=1`, the control arm), 0.000 under this one. The angle form
+  stays for the avatar's head-look and for an aim effector with no edge. That bearing is the driver's `StrokeAz`/`StrokeEl`
   laid straight onto the part's forward, NOT `weapon_.bladeDir`, which is a
   rigid bar's law-of-cosines LEAN and therefore derived from a geometry the head
   is not in. The pivot is the part's OWN joint rather than its parent's:
@@ -6902,7 +6923,7 @@ later grows a neck chain starts biting through the IK with no content edit.
   commanded 0.51 because four of five and a half voxels of "neck" were rigid.
   Nothing on this path is smoothed — a four-tick cut cannot catch a goal through
   a 0.12 s halflife, and a stroke owns its part outright, which is what makes a
-  bite snap. `ApplyAimPart` writes the PRE-FLATTEN locals, so it runs at stage
+  bite snap. Both forms write the PRE-FLATTEN locals, so the aim runs at stage
   3.5 and `ApplyWeaponArm` returns immediately for an Aim effector.
 
 `ApplyAimPart` is the avatar's head-look, moved down onto `Mob` verbatim in its

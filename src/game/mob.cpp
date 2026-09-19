@@ -17666,6 +17666,16 @@ void Mob::TrackStumpContact(World& world, const AnimStump& stump, float dt) {
 // PRE-FLATTEN, at the same stage the avatar's head-look has always run: this
 // writes `st.local[]` and the flatten is what carries it to the part and
 // everything under it.
+// SANDVOX_AIM_OLD=1 -- the control arm: the angle form below, multiplied onto
+// the part's local rotation as if its parents were upright. This is what every
+// aim effector did before 2026-09-19 and it exists because the alternative way
+// to ask "is the crawler's head pointing where the stroke told it to" is a
+// second build of a second tree. Measured with it on, `bite-target`'s prone
+// arm reports 1.589 rad of yaw error; off, 0.000. Read once, and a diagnostic
+// switch like SANDVOX_PRONE_RAW rather than something to leave set: a posed
+// body feeds hashed state.
+static const bool kAimOldAngles = std::getenv("SANDVOX_AIM_OLD") != nullptr;
+
 void Mob::ApplyStrikeAim(const AnimSkeleton& sk, AnimState& st) const {
   int effPart = -1, effNatural = -1;
   StrikeEffectorMode effMode = StrikeEffectorMode::None;
@@ -17731,7 +17741,8 @@ void Mob::ApplyStrikeAim(const AnimSkeleton& sk, AnimState& st) const {
     // the commanded bearing, in the parent's real frame. The angle pair is
     // still computed above — it is what `aimDiag_` reports and what
     // `RecordWeaponClamp` checks the realised pose against.
-    if (const MobNaturalWeaponDef* aimNw = NaturalWeapon(effNatural)) {
+    if (const MobNaturalWeaponDef* aimNw = NaturalWeapon(effNatural);
+        aimNw != nullptr && !kAimOldAngles) {
       AimPartAlong(sk, st, effPart, aimNw->edgeTo - aimNw->edgeFrom, dir, w,
                    share);
     } else {

@@ -129,7 +129,8 @@
       "hysteresis": 0.35,
       "perception": { "sightRange": 34, "fovDegrees": 360, "requireLos": true, "aggro": "hostile", "alertDecayTicks": 300, "keepRangeScale": 1.6 },
       "movement": { "mobile": true, "rangeMin": 2, "rangeMax": 7, "bandSlack": 2.0, "approachSpeed": 1.0, "strafeSpeed": 0.15, "retreatSpeed": 0.0, "circleTendency": 0.1, "circleHoldTicks": 40, "repathTicks": 14, "navRadius": 30 },
-      "attack": { "styles": ["bite_lunge", "bite", "punch_r", "punch_l", "hook_r"], "reach": 9, "aimTolerance": 0.55, "cadenceTicks": 48, "jitterTicks": 20, "commitTicks": 14, "disengageTicks": 0, "pursueSpeed": 0.9, "leadTicks": 12 },
+      "//attack": "aimTolerance 0.55 -> 0.95 and cadence 48 -> 40 (2026-09-19). THE CONE IS HOW FAR OFF ITS NOSE A THING MAY BE AND STILL BE ATTACKED, and a zombie is the creature with the least business being fussy about it: 0.55 rad is a 63-degree window that a target sidestepping at contact range leaves in a handful of ticks, so the cadence came up and nothing came out of it. 0.95 is most of a hemisphere in front, which is also what the bite's own lateral sweep now covers -- the two are the same claim about how wide the mouth's approach is, one at the decision and one at the stroke. The cadence comes down with it because a swing that is now allowed to be thrown is one the creature should be throwing: 40 ticks is 1.33 s between attempts, still far slower than the duelist's 34.",
+      "attack": { "styles": ["bite_lunge", "bite", "punch_r", "punch_l", "hook_r"], "reach": 9, "aimTolerance": 0.95, "cadenceTicks": 40, "jitterTicks": 20, "commitTicks": 14, "disengageTicks": 0, "pursueSpeed": 0.9, "leadTicks": 12 },
       "intents": {
         "idle": { "weight": 0.05, "cooldownTicks": 0, "minDwellTicks": 0 },
         "face": { "weight": 0.5, "cooldownTicks": 0, "minDwellTicks": 4 },

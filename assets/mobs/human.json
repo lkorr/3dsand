@@ -519,8 +519,9 @@
           9.0,
           34.0
         ],
-        "halfWidth": 12.0
+        "halfWidth": 19.0
       },
+      "//halfWidth": "HOW WIDE A MOUTH IS, in art units (x0.125 = world voxels), and it is the size of the BITE rather than the size of the teeth: the sweep probes a capsule of this radius about the edge segment, so it is the one number that says how close the jaws have to come to count as closing on something. 12 (1.5 voxels) was narrower than the head it is on and made a bite a needle threaded at arm's length -- against a moving leg, most swings that looked like contact were not. 19 is 2.4 voxels, about the width of the skull, which is the honest answer to 'what did the mouth cover'.",
       "strike": {
         "blunt": 1.5,
         "bite": 7.0
