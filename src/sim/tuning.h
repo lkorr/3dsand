@@ -93,7 +93,7 @@ int ApplyVarianceI(int base, const Variance& v, uint32_t seed, uint32_t tick,
 struct Tuning {
   // ---- player movement (meters / seconds; converted to voxels at use) ----
   struct Player {
-    std::string model = "mina";
+    std::string model = "human";
     float flySpeed = 13.75f, flySprint = 32.5f;
     float walkSpeed = 4.5f, sprintSpeed = 8.0f;
     float gravity = 9.81f;
@@ -1248,7 +1248,37 @@ struct Tuning {
     // several blows and the two coats interleave the way a real contusion does;
     // at 0.5 a saturated patch is visibly bloody within two or three further
     // blows. 0 disables it and leaves a bruise a bruise forever.
-    float bruiseBleedChance = 0.5f;
+    float bruiseBleedChance = 0.55f;
+    // ---- HOW FAR UP THE CEILING A VOXEL HAS TO BE TO BREAK ------------------
+    //
+    // Fraction of `bruiseMax` at or past which `bruiseBleedChance` is rolled.
+    // It was hardcoded at 1.0, i.e. EXACTLY the ceiling, and that is a harder
+    // line than it looks: the per-voxel jitter is 0.85..1.0, so a patch two
+    // blows of 6 deep lands at 10 or 11 of a 12 ceiling and has to wait for a
+    // THIRD blow merely to round up. 0.85 lets the contact break on the blow
+    // after it saturates instead of the blow after that, which is the whole
+    // difference between "hit a bruise again and it bleeds" and "hit a bruise
+    // three more times".
+    float bruiseBleedFrom = 0.85f;
+    // ---- A WEAK BLOW MARKS LESS (the fist/mace difference) ------------------
+    //
+    // `bruiseStep` is authored for a FULL blow, and until 2026-09-19 a punch
+    // and a mace deposited exactly the same coat -- which made "similar with
+    // fists, but slower" unexpressible, because the whole ladder below
+    // (saturate -> bleed -> pulp) is clocked by how fast the coat deepens.
+    //
+    // This is the hp that earns the full step: a blow carrying `bruiseHpRef` of
+    // blunt gets `bruiseStep`, and a weaker one gets a SQUARE-ROOTED share of
+    // it. Root, not linear, for the reason `bruiseStep` itself documents at
+    // length -- a coat below about a quarter of full draws NOTHING in this
+    // renderer, so a fist at a quarter of a mace's hp scaled linearly would
+    // leave a mark nobody can see and the owner would report "punching does
+    // nothing" exactly as they once reported it of 15%-a-blow bruising. Rooted,
+    // a 4 hp fist against a 16 hp reference lands half a step (20% a punch,
+    // visible) and needs about twice the blows to reach the same place.
+    float bruiseHpRef = 16.0f;
+    // ...and the floor under that share, so an incidental tap still marks.
+    float bruiseHpFloor = 0.45f;
     // ...and WHAT it discolours the skin to, BY NAME.
     //
     // THE ONE NAME-TYPED TUNING ROW IN THE FILE, and the reason is that it
@@ -1277,7 +1307,43 @@ struct Tuning {
     // refuses the collapse sever -- the crater is still soaked in the victim's
     // woundMat, which is the "replace them with gore" half of the owner's
     // spec.
+    //
+    // NOTHING IS REMOVED UNTIL THE SPOT IS PULPED -- see `pulpCarveFrom`. This
+    // is the radius a blow lands on tissue that has ALREADY been beaten open,
+    // not the radius of a first blow on clean skin.
     float bluntCarveRadius = 0.7f;
+    // ---- THE THIRD RUNG: PULPED TISSUE COMES AWAY (2026-09-19) --------------
+    //
+    // A blunt blow used to dent from the FIRST hit, at a radius that depended
+    // only on the weapon -- so `bluntCarveRadius` was a choice between "a mace
+    // shaves voxels off a pristine arm" and (what shipped, 0) "a mace only ever
+    // bruises, however long you beat somebody with it". Neither is the thing:
+    // the owner's spec is a LADDER, and each rung has to be EARNED on the spot
+    // being hit.
+    //
+    //   1. clean skin       -> the coat deepens by `bruiseStep` to `bruiseMax`
+    //   2. a saturated one  -> `bruiseBleedChance` breaks it and lays BLOOD
+    //   3. broken, bloodied -> voxels start coming away
+    //
+    // Rung 3 is these two rows. `Mob::BruiseLimb` reports how much of the
+    // contact CORE already wears blood at `pulpAmt` or deeper; the dent radius
+    // is `bluntCarveRadius` scaled by how far that share has climbed past
+    // `pulpCarveFrom`. So the first blows on an intact limb remove NOTHING at
+    // any weapon's `bluntCarve`, and a crater only opens where somebody has
+    // hit the same place over and over -- which is also why the bulk of what a
+    // mace kill leaves behind is still bruise: the bruise radius is wider than
+    // the dent by a factor of two or more, and it applies on every blow while
+    // the dent applies on few.
+    //
+    // A COMPOUNDING RULE ON PURPOSE. The crater `CarveLimbRadial` opens is
+    // soaked in the victim's own woundMat and blood, so the tissue it exposes
+    // reads as pulped to the NEXT blow and the hole deepens faster than it
+    // started. That is "if a player consistently hits just the exact same spot
+    // it will become pretty gruesome"; the sever is still refused outright
+    // (Mob::BluntCarveScope), so a caved-in skull is a caved-in skull and never
+    // a decapitation.
+    float pulpAmt = 8.0f;        // blood-coat depth (0..15) that counts as pulped
+    float pulpCarveFrom = 0.3f;  // pulped share of the core below which nothing comes away
     // A BITE. Radius of the tear in world voxels at full power, scaled by
     // (0.4 + 0.6 * power); `biteBlob` is the correlated noise's feature size
     // in SKIN voxels, i.e. the size of one piece that comes away. Same pair,
@@ -1796,6 +1862,9 @@ struct Tuning {
     float whooshRateFast = 1.25f;
     float fleshVolume = 0.90f;
     float clangVolume = 0.85f;
+    float strikeEdgeVolume = 0.65f;
+    float strikeBluntVolume = 0.70f;
+    float cutVolume = 0.50f;
     float cueRadius = 22.0f;   // metres
   } combatfx;
 

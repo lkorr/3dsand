@@ -480,7 +480,8 @@
         "halfWidth": 4.0
       },
       "strike": {
-        "blunt": 4.0
+        "blunt": 4.0,
+        "bluntCarve": 0.3
       }
     },
     {
@@ -500,7 +501,8 @@
         "halfWidth": 4.0
       },
       "strike": {
-        "blunt": 4.0
+        "blunt": 4.0,
+        "bluntCarve": 0.3
       }
     },
     {
@@ -629,15 +631,16 @@
       "groundAlign": 1.0
     },
     {
-      "name": "hop",
+      "name": "crawl.feet",
       "missing": [
         "foot.L",
         "foot.R"
       ],
-      "clip": "hop",
-      "speedScale": 0.45,
+      "clip": "crawl",
+      "speedScale": 0.35,
       "disableGait": true,
-      "bodyYOffset": -0.1
+      "bodyYOffset": 0.0,
+      "groundAlign": 1.0
     },
     {
       "name": "limp",
@@ -676,7 +679,7 @@
   ],
   "clips": {
     "idle": {
-      "durationMs": 3200,
+      "durationMs": 8000,
       "loop": true,
       "mode": "additive",
       "blendInMs": 400,
@@ -701,7 +704,7 @@
               "ease": "quadInOut"
             },
             {
-              "t": 1600,
+              "t": 4000,
               "q": [
                 -0.0122,
                 0,
@@ -711,7 +714,7 @@
               "ease": "quadInOut"
             },
             {
-              "t": 3200,
+              "t": 8000,
               "q": [
                 0,
                 0,
@@ -731,7 +734,7 @@
               "ease": "quadInOut"
             },
             {
-              "t": 1600,
+              "t": 4000,
               "v": [
                 0,
                 0.16,
@@ -740,7 +743,7 @@
               "ease": "quadInOut"
             },
             {
-              "t": 3200,
+              "t": 8000,
               "v": [
                 0,
                 0,
@@ -762,7 +765,7 @@
               "ease": "quadInOut"
             },
             {
-              "t": 1100,
+              "t": 2750,
               "q": [
                 0,
                 0.0436,
@@ -772,7 +775,7 @@
               "ease": "quadInOut"
             },
             {
-              "t": 2300,
+              "t": 5750,
               "q": [
                 0,
                 -0.0349,
@@ -782,7 +785,7 @@
               "ease": "quadInOut"
             },
             {
-              "t": 3200,
+              "t": 8000,
               "q": [
                 0,
                 0,
@@ -805,7 +808,7 @@
               "ease": "quadInOut"
             },
             {
-              "t": 1600,
+              "t": 4000,
               "q": [
                 0,
                 0,
@@ -815,7 +818,7 @@
               "ease": "quadInOut"
             },
             {
-              "t": 3200,
+              "t": 8000,
               "q": [
                 0,
                 0,
@@ -838,7 +841,7 @@
               "ease": "quadInOut"
             },
             {
-              "t": 1600,
+              "t": 4000,
               "q": [
                 0,
                 0,
@@ -848,7 +851,7 @@
               "ease": "quadInOut"
             },
             {
-              "t": 3200,
+              "t": 8000,
               "q": [
                 0,
                 0,

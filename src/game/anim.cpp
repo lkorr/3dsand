@@ -394,6 +394,147 @@ void AnimSampleAndBlend(const AnimSkeleton& sk, AnimState& st, float dt) {
   }
 }
 
+// ---- stage 3.6: procedural leg drag for footless crawlers -------------------
+
+void AnimDragDeadLegs(const AnimSkeleton& sk, AnimState& st,
+                      float speed, float gaitPhase) {
+  const float kPi = 3.14159265f;
+  for (size_t c = 0; c < sk.chains.size(); c++) {
+    const IkChain& ch = sk.chains[c];
+    if (ch.tag != "leg") continue;
+    if (ch.effector < 0 || ch.effector >= (int)st.partAlive.size()) continue;
+    if (st.partAlive[ch.effector]) continue;
+
+    bool anyAlive = false;
+    for (int p : ch.parts)
+      if (p >= 0 && p < (int)st.partAlive.size() && st.partAlive[p])
+        anyAlive = true;
+    if (!anyAlive) continue;
+
+    float speedT = std::clamp(speed / 2.5f, 0.0f, 1.0f);
+    float phase = gaitPhase * 2.0f * kPi + (c & 1 ? kPi : 0.0f);
+
+    for (size_t pi = 0; pi < ch.parts.size(); pi++) {
+      int p = ch.parts[pi];
+      if (p < 0 || p >= (int)st.partAlive.size() || !st.partAlive[p]) continue;
+      float swayAmp = (0.04f + 0.10f * speedT) * (pi == 0 ? 1.0f : 0.6f);
+      float sway = swayAmp * std::sin(phase);
+      Quat drag = QuatAxisAngle({1, 0, 0}, sway);
+      st.local[p].rot = QuatNormalize(QuatMul(st.local[p].rot, drag));
+    }
+  }
+}
+
+// ---- stage 3.55: the one-footed drag ---------------------------------------
+
+AnimStump AnimFindStumpLeg(const AnimSkeleton& sk, const AnimState& st) {
+  AnimStump out;
+  // Collect the leg chains first: the predicate is about the PAIR (one stump,
+  // one whole leg), so no single chain can answer it on its own.
+  int stumpChain = -1, wholeChain = -1, nLegs = 0;
+  for (size_t c = 0; c < sk.chains.size(); c++) {
+    const IkChain& ch = sk.chains[c];
+    if (ch.tag != "leg" || ch.parts.empty()) continue;
+    nLegs++;
+    auto alive = [&](int p) {
+      return p >= 0 &&
+             (p >= (int)st.partAlive.size() || st.partAlive[p] != 0);
+    };
+    bool bonesAlive = alive(ch.parts[0]);
+    bool allAlive = bonesAlive && alive(ch.effector);
+    for (int p : ch.parts) allAlive = allAlive && alive(p);
+    if (allAlive) {
+      if (wholeChain < 0) wholeChain = (int)c;
+    } else if (bonesAlive && !alive(ch.effector) && stumpChain < 0) {
+      stumpChain = (int)c;
+    }
+  }
+  // Exactly one of each. Two stumps is a crawler and no stump is a walker;
+  // neither wants this layer, and both have an authored state already.
+  if (nLegs != 2 || stumpChain < 0 || wholeChain < 0) return out;
+
+  const IkChain& ch = sk.chains[stumpChain];
+  out.chain = stumpChain;
+  out.tip = ch.parts[0];
+  for (int p : ch.parts) {
+    if (p < 0 || (p < (int)st.partAlive.size() && !st.partAlive[p])) break;
+    out.tip = p;  // walk down the chain while the bones last
+  }
+  // WHICH WAY TO LEAN, asked of the rig rather than of a naming convention: the
+  // two hips are the only two points that define the midline, so the stump is
+  // on +X exactly when its hip anchor is the further one along +X.
+  const float mine = sk.parts[ch.parts[0]].anchorLocal.x;
+  const float theirs = sk.parts[sk.chains[wholeChain].parts[0]].anchorLocal.x;
+  out.sideX = mine >= theirs ? 1.0f : -1.0f;
+  return out;
+}
+
+void AnimApplyStumpDrag(const AnimSkeleton& sk, AnimState& st,
+                        const AnimStump& stump, int rootLimb, float weight,
+                        float leanRad, float trailRad, float phase,
+                        float speedT) {
+  if (stump.chain < 0 || stump.chain >= (int)sk.chains.size()) return;
+  const float w = std::clamp(weight, 0.0f, 1.0f);
+  if (w <= 1e-3f) return;
+  const float kPi = 3.14159265f;
+  const float sp = std::clamp(speedT, 0.0f, 1.0f);
+
+  // ---- the lean --------------------------------------------------------
+  // A positive rotation about model +Z takes +X toward +Y, i.e. it LIFTS the
+  // +X hip. Leaning into the stump means dropping its side, so the sign is
+  // negated against `sideX`. It is applied at the ROOT and nowhere else on the
+  // way down: the good leg is IK-solved to a world point and simply takes the
+  // roll up in its knee (which is what a real compensating leg does), while the
+  // dead leg has no solve and rides the pelvis down — that ride IS the
+  // clearance this whole layer exists to buy.
+  const float roll = -stump.sideX * leanRad * w;
+  if (rootLimb >= 0 && rootLimb < (int)st.local.size() &&
+      (rootLimb >= (int)st.partAlive.size() || st.partAlive[rootLimb])) {
+    st.local[rootLimb].rot =
+        QuatNormalize(QuatMul(st.local[rootLimb].rot,
+                              QuatAxisAngle({0, 0, 1}, roll)));
+  }
+  // A third of it given back up the spine, so the shoulders and head stay
+  // nearer level than the hips. The body is lopsided, not toppling.
+  int nSpine = 0;
+  for (size_t i = 0; i < sk.parts.size(); i++)
+    if (sk.parts[i].tag == "spine" && (int)i != rootLimb) nSpine++;
+  if (nSpine > 0) {
+    const Quat per = QuatAxisAngle({0, 0, 1}, -roll * 0.33f / (float)nSpine);
+    for (size_t i = 0; i < sk.parts.size(); i++) {
+      if (sk.parts[i].tag != "spine" || (int)i == rootLimb) continue;
+      if (i < st.partAlive.size() && !st.partAlive[i]) continue;
+      st.local[i].rot = QuatNormalize(QuatMul(st.local[i].rot, per));
+    }
+  }
+
+  // ---- the dead leg ----------------------------------------------------
+  // Blended FROM the rest pose rather than composed onto the live one: the
+  // clip and the legacy swing are still keying this leg as though it could
+  // step, and a drag is the absence of that. Nlerp against what the earlier
+  // stages produced, by the same weight, so the hand-over is continuous.
+  //
+  // A positive rotation about model +X swings a downward-hanging bone toward
+  // -Z, and the rigs' forward is +Z, so positive IS backward: the stump
+  // trails. The scrub is the catch-and-slip of a limb being dragged over
+  // ground, at one cycle per stride, and it only exists while moving.
+  const IkChain& ch = sk.chains[stump.chain];
+  const float scrub = 0.055f * sp * std::sin(2.0f * kPi * phase);
+  for (size_t pi = 0; pi < ch.parts.size(); pi++) {
+    const int p = ch.parts[pi];
+    if (p < 0 || p >= (int)st.local.size()) continue;
+    if (p < (int)st.partAlive.size() && !st.partAlive[p]) break;
+    // The hip carries the trail; the bones below it straighten toward rest and
+    // take a fraction of it, which is what makes the limb read as dead weight
+    // rather than as a leg being held out.
+    const float a = pi == 0 ? trailRad * (0.35f + 0.65f * sp) + scrub
+                            : trailRad * 0.2f * sp + scrub * 0.5f;
+    const Quat want =
+        QuatNormalize(QuatMul(sk.parts[p].rest.rot, QuatAxisAngle({1, 0, 0}, a)));
+    st.local[p].rot = QuatNormalize(QuatNlerp(st.local[p].rot, want, w));
+  }
+}
+
 // ---- stage 3.5: the torso serves the swing ----------------------------------
 
 void AnimApplySpineTwist(const AnimSkeleton& sk, AnimState& st, float yawRight,

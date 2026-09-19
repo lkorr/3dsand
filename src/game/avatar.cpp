@@ -87,6 +87,12 @@ constexpr float kMaxCrouchLegLengths = 0.30f;
 // gives back the permanent half-crouch it replaced.
 constexpr float kCrouchHalflife = 0.05f;
 
+// ...and what it becomes at a full stump drag, where that same oscillation is
+// the hop rather than the walk. Longer than any step period this rig can run,
+// so what reaches the pelvis is the crouch's AVERAGE and not its swing. See the
+// commit site in UpdateGait for why a one-legged pump is not a gait.
+constexpr float kDragCrouchHalflife = 0.55f;
+
 // The HELD crouch (Ctrl, tuning.json player.crouchKneeDrop): its ceiling in
 // leg lengths and its half-life. The ceiling keeps an authored drop from
 // folding the leg past what the two-bone solve can pose; the half-life is
@@ -889,8 +895,21 @@ void PlayerAvatar::UpdateGait(float dt, World& world, uint32_t tick) {
   // must stay short: the demand now oscillates ONCE PER STEP, and a half-life
   // near the step period would low-pass exactly the rise-and-fall this change
   // exists to produce — averaging it back into the constant crouch it replaced.
+  //
+  // ...EXCEPT WHILE A STUMP IS DRAGGING, and that exception is the hop.
+  //
+  // The demand above oscillates once per step BY DESIGN, and on two legs that
+  // is a walking pelvis. On one leg it is the bug: the surviving foot takes
+  // every step, so the period doubles, the excursion is the whole stride's
+  // worth of reach, and a 0.05 s filter passes all of it — the body rises and
+  // falls a full crouch once per stride, which is exactly "it hops endlessly".
+  // A dragging body is carried by a leg it never picks up, so the pump is not
+  // describing anything: low-pass it away in proportion to how committed to the
+  // drag the body is, and the pelvis slews instead of springing.
+  const float crouchHl =
+      kCrouchHalflife + (kDragCrouchHalflife - kCrouchHalflife) * dragW_;
   stanceCrouch_ += (crouchNeed - stanceCrouch_) *
-                   (1.0f - std::pow(0.5f, dt / kCrouchHalflife));
+                   (1.0f - std::pow(0.5f, dt / crouchHl));
 
   // BODY HEIGHT COMES FROM THE PLAYER, NOT FROM THE FEET.
   //
@@ -1496,6 +1515,21 @@ void PlayerAvatar::UpdateAnimation(float dt, World& world, bool grounded,
   // body do it. A view kick is a separate knob and a separate argument about
   // motion sickness.
   ApplyHitReact(sk, st, dt);
+
+  // ---- stage 3.55: the one-footed drag (mob.h Mob::TickStumpDrag) ---------
+  // THE SHARED CALL, for the reason the weapon arm and the hit reaction are
+  // shared calls: a one-footed player and a one-footed NPC are the same body.
+  // `grounded` is the gait's debounced view deliberately — the drag must not
+  // drop out for the tick a bump crest costs — and it is also how a HOP works:
+  // leaving the ground eases the drag out on the way up and eases it back in on
+  // landing, so pressing jump is the player's way of not dragging.
+  {
+    const AnimStump stump = TickStumpDrag(dt, grounded, clipOwnsPose);
+    TrackStumpContact(world, stump, dt);
+  }
+
+  if (loco && loco->groundAlign > 0.0f)
+    AnimDragDeadLegs(sk, st, speedNow_, st.gaitPhase);
 
   AnimFlatten(sk, st);
 

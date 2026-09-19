@@ -3331,9 +3331,9 @@ Status GateMobBurn(Ctx& c, std::string& detail) {
 
   int wizDef = -1;
   for (size_t i = 0; i < mobs.Defs().size(); i++)
-    if (mobs.Defs()[i].name == "wizard") wizDef = (int)i;
+    if (mobs.Defs()[i].name == kAvatarDefName) wizDef = (int)i;
   if (wizDef < 0) {
-    detail = "no wizard def (the fixture: cloth over skin on one rig)";
+    detail = "no avatar def (the fixture: cloth over skin on one rig)";
     return Status::Fail;
   }
   const int nLimbs = (int)mobs.Defs()[wizDef].limbs.size();

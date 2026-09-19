@@ -482,6 +482,61 @@ int AnimSelectState(const AnimSkeleton& sk, const AnimState& st);
 // times by dt and retires finished non-looping clips.
 void AnimSampleAndBlend(const AnimSkeleton& sk, AnimState& st, float dt);
 
+// Stage 3.6 — procedural leg drag for footless crawlers. When a leg chain's
+// effector (foot) is dead but the leg bones survive, the legs trail behind a
+// prone body with a velocity-responsive lazy sway instead of holding a static
+// clip pose. Writes st.local, so must run BEFORE AnimFlatten. Only meaningful
+// when the body is prone (caller gates on groundAlign > 0).
+void AnimDragDeadLegs(const AnimSkeleton& sk, AnimState& st,
+                      float speed, float gaitPhase);
+
+// ---- THE ONE-FOOTED BODY DRAGS ITS STUMP; IT DOES NOT HOP FOREVER ----------
+//
+// A body that has lost ONE foot (or one shin) still has a leg on that side, and
+// the leg is a few voxels too short to reach the floor. Nothing in the pipeline
+// said so, so the survivor walked on the good leg alone: the gait planted one
+// foot, the stance crouch pumped once per step against a step period twice as
+// long as a biped's, and the pelvis rose and fell a whole crouch every stride.
+// That reads as a permanent hop — a body springing off its one good ankle
+// forever, which is neither how a person moves nor something a player can opt
+// out of.
+//
+// What a person actually does is TIP INTO THE SHORT SIDE. The pelvis rolls
+// toward the stump until the shortened leg can reach, the dead leg hangs
+// straight and trails, and the whole body slews along scrubbing it over the
+// ground. Hopping is then a CHOICE (jump), not the only gait available.
+//
+// This is derived geometry, not an authored state: the predicate is "this leg's
+// effector is severed, its bones are not, and the other leg is whole", which is
+// exactly the anatomy that makes a drag possible. A body that has lost the
+// whole leg has nothing to drag and keeps the authored `limp` hop; a body that
+// has lost both feet is already a crawler (crawl.feet) and matches neither.
+struct AnimStump {
+  int chain = -1;      // leg chain whose effector (the foot) is gone
+  int tip = -1;        // deepest SURVIVING bone in it — the stump itself
+  float sideX = 0;     // +1 when that hip sits at the rig's model +X side
+};
+
+// The stump this rig is standing on, or `chain < 0` for none. Pure query.
+AnimStump AnimFindStumpLeg(const AnimSkeleton& sk, const AnimState& st);
+
+// Stage 3.55 — the drag layer. Writes st.local, so it runs BEFORE AnimFlatten
+// and composes with everything else written there (the gait bob, the hit
+// reaction, the spine twist) rather than replacing any of them.
+//
+//   weight   0 = stand as if nothing were missing, 1 = fully committed drag.
+//            The caller eases this, which is what makes entering and leaving
+//            the drag a blend rather than a switch.
+//   leanRad  how far the pelvis rolls INTO the stump at weight 1.
+//   trailRad how far behind the body the dead leg hangs at full speed.
+//   phase    gait phase, 0..1 — the stump catches and slips as it scrubs.
+//   speedT   0..1 of the body's own walk speed; the trail and the scrub grow
+//            with it, so a drag at a standstill is just a lean.
+void AnimApplyStumpDrag(const AnimSkeleton& sk, AnimState& st,
+                        const AnimStump& stump, int rootLimb, float weight,
+                        float leanRad, float trailRad, float phase,
+                        float speedT);
+
 // Stage 4. One linear parent-before-child pass; requires sk.ParentsFirst().
 void AnimFlatten(const AnimSkeleton& sk, AnimState& st);
 

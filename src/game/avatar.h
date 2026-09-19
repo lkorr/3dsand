@@ -324,6 +324,10 @@ class PlayerAvatar : public Mob {
     return part >= 0 && part < (int)limbs_.size() ? limbs_[part].voxelsAtSpawn
                                                  : 0u;
   }
+  uint32_t PartBrainAtSpawn(int part) const {
+    return part >= 0 && part < (int)limbs_.size() ? limbs_[part].brainAtSpawn
+                                                 : 0u;
+  }
 
   // Actively losing blood: either an arterial gush from a fresh stump or an
   // ordinary wound still owing whole voxels of blood.
@@ -479,7 +483,7 @@ class PlayerAvatar : public Mob {
                  std::vector<ParticleSpawn>& spawns);
 
   const std::vector<MobDef>* defs_ = nullptr;
-  std::string defName_ = "wizard";
+  std::string defName_ = "human";
 
   AvatarParts parts_;
   AvatarLocoClips locoClips_;

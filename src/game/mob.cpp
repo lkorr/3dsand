@@ -7971,8 +7971,19 @@ uint32_t Mob::StainWound(int limbIndex, Vec3 centreLocal, float radiusWorld,
 // moving to an alpha, and it is why there is no coherence draw here the way
 // `StainWoundAs` has one: the mottle a bruise needs is in the per-voxel jitter
 // on the amount, which varies the SHADE rather than punching holes in it.
+//
+// ---- AND THE THIRD RUNG: WHAT IT FOUND ALREADY BROKEN (2026-09-19) ---------
+//
+// The sweep below reads every voxel's coat anyway, so it also COUNTS: how many
+// tissue voxels sit in the contact core, and how many of those already wear
+// blood at `gore.pulpAmt` or deeper. `Mob::BluntHit` scales its dent radius by
+// that share (Tuning::Gore::pulpCarveFrom), which is what makes a blunt weapon
+// remove nothing from an intact limb and open a crater in one that has been
+// beaten in the same place a dozen times.
 uint32_t Mob::BruiseLimb(int limbIndex, Vec3 centreLocal, float radiusWorld,
-                         uint32_t seed, uint32_t bruiseMat, float power) {
+                         uint32_t seed, uint32_t bruiseMat, float power,
+                         float hp, BruiseReport* report) {
+  if (report) *report = BruiseReport{};
   if (!def_ || limbIndex < 0 || limbIndex >= (int)limbs_.size()) return 0;
   // Same two exclusions StainWoundAs makes, and for the same reason: a worn
   // garment and a held sword are borrowed rig slots, and neither bruises.
@@ -7993,16 +8004,41 @@ uint32_t Mob::BruiseLimb(int limbIndex, Vec3 centreLocal, float radiusWorld,
   const std::vector<uint8_t>& tissue = def_->tissue;
   const float pw = std::clamp(power, 0.0f, 1.0f);
 
-  // WHEN IT BREAKS INSTEAD OF DARKENING: at the ceiling, not before it. "Each
-  // hit adds more, up to 80%, and then after that is blood" -- so a voxel that
-  // can still take more bruise takes more bruise, and only a saturated one
-  // rolls. Expressed as a fraction of the cap so lowering `bruiseMax` moves
-  // both together.
-  constexpr float kBruiseBleedAt = 1.0f;
-  const uint32_t bleedFrom = (uint32_t)std::lround((float)cap * kBruiseBleedAt);
+  // ---- HOW HARD THIS BLOW WAS, AS A SHARE OF A FULL ONE -------------------
+  //
+  // A fist and a mace deposited the same coat until 2026-09-19, which made the
+  // whole ladder clock at the same rate for both. Rooted rather than linear --
+  // see Tuning::Gore::bruiseHpRef; a linear share would put a punch under the
+  // renderer's mottle threshold and it would mark nothing at all. `hp` 0 (the
+  // default, and what every non-blunt caller passes) means "a full blow".
+  float blowScale = 1.0f;
+  if (hp > 0.0f && gt.bruiseHpRef > 0.0f)
+    blowScale = std::clamp(std::sqrt(hp / gt.bruiseHpRef),
+                           std::clamp(gt.bruiseHpFloor, 0.0f, 1.0f), 1.0f);
+
+  // WHEN IT BREAKS INSTEAD OF DARKENING: at the ceiling, or just under it.
+  // "Each hit adds more, up to 80%, and then after that is blood" -- so a voxel
+  // that can still take more bruise takes more bruise, and only a saturated one
+  // rolls. Expressed as a FRACTION of the cap (`gore.bruiseBleedFrom`) so
+  // lowering `bruiseMax` moves both together, and so the jitter on the step
+  // cannot leave a patch parked one level short of a line it can only reach by
+  // rounding up.
+  const uint32_t bleedFrom = (uint32_t)std::lround(
+      (float)cap * std::clamp(gt.bruiseBleedFrom, 0.0f, 1.0f));
   const uint32_t bloodMat = def_->bleedMat;
   const float bleedChance =
-      std::clamp(gt.bruiseBleedChance, 0.0f, 1.0f) * pw;
+      std::clamp(gt.bruiseBleedChance, 0.0f, 1.0f) * pw * blowScale;
+
+  // Rung 3's reading. `pulpAmt` is a DEPTH of blood, not merely "wet": a single
+  // spray from a cut elsewhere should not make a limb crumble under a punch,
+  // and the bleed rung above lays its blood at the bruise's own (deep) amount
+  // precisely so that tissue somebody actually beat open reads differently
+  // from tissue that was rained on.
+  const uint32_t pulpAt =
+      (uint32_t)std::lround(std::clamp(gt.pulpAmt, 1.0f, 15.0f));
+  // The inner half-radius, in the squared metric the sweep already works in.
+  const float core2 = r2 * 0.25f;
+  uint32_t coreCells = 0, pulpedCells = 0;
 
   // The brick must be OWNED before it can be poked, or the poke repaints every
   // creature sharing the packed model. Same copy-on-write StainWoundAs takes.
@@ -8032,6 +8068,18 @@ uint32_t Mob::BruiseLimb(int limbIndex, Vec3 centreLocal, float radiusWorld,
     const float t = std::sqrt(d2 / r2);
     const uint32_t h = Hash3(seed, (uint32_t)(vx * 73856093),
                              (uint32_t)(vy * 19349663) ^ (uint32_t)(vz * 83492791));
+    // ---- THE READING FOR RUNG 3, taken BEFORE this blow changes anything ---
+    //
+    // Before, not after, and that matters: a blow must be scored against the
+    // damage it ARRIVED at, or the first blow that breaks the skin would also
+    // be the first blow that carves, and the ladder would have two rungs
+    // instead of three. The count is over the core only (mob.h BruiseReport).
+    if (d2 < core2) {
+      coreCells++;
+      if (bloodMat != 0 && BodyStainMat(curStain) == bloodMat &&
+          BodyStainAmt(curStain) >= pulpAt)
+        pulpedCells++;
+    }
     // ---- THE FULL STEP AT THE CONTACT, AND A SPECTRUM OUT TO THE RIM -------
     //
     // ONE multiplier below 1, not three. The first version was
@@ -8051,8 +8099,13 @@ uint32_t Mob::BruiseLimb(int limbIndex, Vec3 centreLocal, float radiusWorld,
     // radiating outwards in how weakly applied each is". `1 - t*t` is that
     // circle -- full step at the middle, about three quarters at half the
     // radius, a fifth at the edge.
+    //
+    // `blowScale` is the ONE factor added to that pair since, and it is the
+    // one thing the two-multiplier rule above does not forbid: it is not a
+    // second opinion about the same falloff, it is the difference between a
+    // fist and a mace, and it has a floor under it so it cannot vanish.
     const float jitter = 0.85f + 0.15f * (float)((h >> 16) & 0xFFu) / 255.0f;
-    const float want = gt.bruiseStep * (1.0f - t * t) * jitter;
+    const float want = gt.bruiseStep * (1.0f - t * t) * jitter * blowScale;
     const uint32_t add = (uint32_t)std::lround(want);
     if (add == 0) return;
 
@@ -8107,6 +8160,11 @@ uint32_t Mob::BruiseLimb(int limbIndex, Vec3 centreLocal, float radiusWorld,
   // therefore never dry a bruise off. A stain written behind the ledger's back
   // is a stain that is permanent by accident.
   if (marked) coatDirty_ = true;
+  if (report) {
+    report->marked = marked;
+    report->core = coreCells;
+    report->pulped = pulpedCells;
+  }
   return marked;
 }
 
@@ -13449,17 +13507,44 @@ bool Mob::BluntHit(uint64_t bodyHandle, const ::BluntHit& hit, World& world,
   //    goes is now the step's business, not the radius's.
   const uint32_t bruiseMat =
       sys_ != nullptr ? sys_->MaterialIdNamed(gt.bruiseMat) : 0u;
+  BruiseReport mark;
   if (bruiseMat != 0 && gt.bruiseRadius > 0.0f)
     BruiseLimb(li, local, gt.bruiseRadius * (0.5f + 0.5f * power),
-               hit.seed ^ 0xB2015Eu, bruiseMat, power);
+               hit.seed ^ 0xB2015Eu, bruiseMat, power, hit.hp, &mark);
 
-  // 2. THE DENT, only if the weapon has any (a bare fist authors 0 and takes
-  //    nothing). CarveLimbRadial soaks the crater it made in the victim's own
-  //    woundMat on the way out, which is "deletes voxels and replaces them
-  //    with gore" -- and the scope above is what stops the same carve from
-  //    collapsing the limb, however many blows land on it.
-  const float dentR =
-      gt.bluntCarveRadius * std::clamp(hit.carve, 0.0f, 1.0f) * power;
+  // 2. THE DENT -- AND IT HAS TO BE EARNED (2026-09-19).
+  //
+  // The weapon's `bluntCarve` is still the ceiling (a bare fist authors almost
+  // nothing and a mace ~0.6 of the tuning radius), but it is no longer the
+  // whole story: the radius is scaled by how much of the contact core this
+  // blow found ALREADY pulped -- bloodied at `gore.pulpAmt` after the bruise
+  // there saturated and broke. Tuning::Gore::pulpCarveFrom has the ladder
+  // written out; the short version is that a mace on an intact arm takes
+  // NOTHING and a mace on the same square inch of a skull for the twelfth time
+  // caves it in.
+  //
+  // This is why `bluntCarveRadius` could be turned back on at all. It shipped
+  // at 0 because the only alternative was a weapon that shaved voxels off
+  // undamaged flesh from the first blow, and "beating someone with a mace just
+  // keeps adding more and more bruises" was the result.
+  //
+  // The reading is the BRUISE's, so a blow that laid no bruise (bruising
+  // disabled, a slot that does not take a coat) earns no dent either. That is
+  // the right coupling rather than an accident: the mark IS the record of the
+  // damage, and a dent with no history behind it is the behaviour being
+  // removed here.
+  const float ripeFrom = std::clamp(gt.pulpCarveFrom, 0.0f, 1.0f);
+  const float earned =
+      ripeFrom >= 1.0f
+          ? 0.0f
+          : std::clamp((mark.Ripeness() - ripeFrom) / (1.0f - ripeFrom), 0.0f,
+                       1.0f);
+  // CarveLimbRadial soaks the crater it made in the victim's own woundMat on
+  // the way out, which is "deletes voxels and replaces them with gore" -- and
+  // the scope above is what stops the same carve from collapsing the limb,
+  // however many blows land on it.
+  const float dentR = gt.bluntCarveRadius *
+                      std::clamp(hit.carve, 0.0f, 1.0f) * power * earned;
   if (dentR > 0.0f)
     CarveLimbRadial(limbs_[li].body, hit.at, dentR, /*ragged=*/true,
                     /*eject=*/true, world, spawns);
