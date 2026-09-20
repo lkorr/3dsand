@@ -1,0 +1,146 @@
+{
+  "name": "land",
+  "sidecarVoxelsPerMetre": 10,
+  "durationMs": 420,
+  "loop": false,
+  "mode": "additive",
+  "blendInMs": 40,
+  "blendOutMs": 180,
+  "mask": [
+    "torso",
+    "hips",
+    "armU.L",
+    "armU.R"
+  ],
+  "tracks": {
+    "hips": {
+      "pos": [
+        {
+          "t": 0,
+          "v": [
+            0,
+            0,
+            0
+          ],
+          "ease": "cubicOut"
+        },
+        {
+          "t": 110,
+          "v": [
+            0,
+            -0.8,
+            0
+          ],
+          "ease": "cubicInOut"
+        },
+        {
+          "t": 420,
+          "v": [
+            0,
+            0,
+            0
+          ]
+        }
+      ]
+    },
+    "torso": {
+      "rot": [
+        {
+          "t": 0,
+          "q": [
+            0,
+            0,
+            0,
+            1
+          ],
+          "ease": "cubicOut"
+        },
+        {
+          "t": 110,
+          "q": [
+            0.1219,
+            0,
+            0,
+            0.9925
+          ],
+          "ease": "cubicInOut"
+        },
+        {
+          "t": 420,
+          "q": [
+            0,
+            0,
+            0,
+            1
+          ]
+        }
+      ]
+    },
+    "armU.L": {
+      "rot": [
+        {
+          "t": 0,
+          "q": [
+            0,
+            0,
+            0,
+            1
+          ],
+          "ease": "cubicOut"
+        },
+        {
+          "t": 110,
+          "q": [
+            -0.342,
+            0,
+            0,
+            0.9397
+          ],
+          "ease": "cubicInOut"
+        },
+        {
+          "t": 420,
+          "q": [
+            0,
+            0,
+            0,
+            1
+          ]
+        }
+      ]
+    },
+    "armU.R": {
+      "rot": [
+        {
+          "t": 0,
+          "q": [
+            0,
+            0,
+            0,
+            1
+          ],
+          "ease": "cubicOut"
+        },
+        {
+          "t": 110,
+          "q": [
+            -0.342,
+            0,
+            0,
+            0.9397
+          ],
+          "ease": "cubicInOut"
+        },
+        {
+          "t": 420,
+          "q": [
+            0,
+            0,
+            0,
+            1
+          ]
+        }
+      ]
+    }
+  }
+}

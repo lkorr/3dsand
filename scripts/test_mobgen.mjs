@@ -88,6 +88,35 @@ function avatarConstants() {
   };
 }
 
+/** THE SHARED CLIP LIBRARY, as a sidecar `clips` block would have spelled it.
+ *
+ * `assets/anims/<name>.json` is one clip in the sidecar clip schema plus two
+ * keys the library adds for itself: `name` (how PlayClip and attack_styles.json
+ * address it) and `sidecarVoxelsPerMetre` (the world-length stamp its position
+ * keys are written at, the same one a sidecar carries). Strip those two and
+ * what is left is EXACTLY what used to sit inline in every generated sidecar,
+ * which is what lets section A keep comparing the whole clip set against the
+ * Python reference after the move.
+ *
+ * Only clips written at the generator's own scale are usable that way, so a
+ * library file stamped at some other voxel size is skipped rather than
+ * silently compared at the wrong length. */
+function clipLibrary() {
+  const dir = path.join(ROOT, 'assets/anims');
+  const out = {};
+  for (const f of fs.readdirSync(dir).sort()) {
+    if (!f.endsWith('.json')) continue;
+    const doc = readJson(path.join(dir, f));
+    const name = doc.name || f.replace(/\.json$/, '');
+    const vpm = doc.sidecarVoxelsPerMetre ?? 10;
+    const c = { ...doc };
+    delete c.name;
+    delete c.sidecarVoxelsPerMetre;
+    out[name] = vpm === mg.SIDECAR_VOXELS_PER_METRE ? c : null;
+  }
+  return out;
+}
+
 /** A parsed .vox reduced to what MUST match: one entry per model, in order. */
 function digestPrefab(buf) {
   const { prefab, warnings } = readVox(buf);
@@ -234,6 +263,32 @@ section('A. the default genome reproduces scripts/gen_human.py (round off)');
   // generated body needs the anatomy recipe and an explicit
   // sidecarVoxelsPerMetre.
   const mine = JSON.parse(JSON.stringify(built.sidecar));
+  // THE CLIPS THE GENERATOR NO LONGER EMITS ARE STILL COMPARED, out of the
+  // shared library they moved to. The Python reference carries all fifteen
+  // inline; the generator now derives only `walk` and `run` (their period is a
+  // function of THIS figure's leg) and inherits the rest from assets/anims/,
+  // which is what the loader does at runtime. Re-assembling the two here keeps
+  // this a port test of the whole clip set rather than of the leftovers — and
+  // it is what asserts the moved files are byte-for-byte what they replaced.
+  //
+  // `attack` was a second NAME for `cast` and is not in the library: nothing
+  // selects it (attack_styles.json names none of these), MobSystem stopped
+  // playing it at 96c86d5, and critter.json authors its own. Dropped from both
+  // sides rather than aliased back in, so the reference stops claiming a clip
+  // the engine does not have.
+  const lib = clipLibrary();
+  const theirClips = { ...ref.sidecar.clips };
+  delete theirClips.attack;
+  for (const k of Object.keys(theirClips))
+    ok(lib[k] !== undefined || mine.clips[k] !== undefined,
+       `clip "${k}" is still reachable — in the sidecar or in assets/anims/`);
+  mine.clips = { ...lib, ...mine.clips };
+  for (const k of Object.keys(mine.clips))
+    if (mine.clips[k] === null) delete mine.clips[k];   // a foreign voxel scale
+  const mineClipsOnly = Object.fromEntries(
+    Object.keys(theirClips).filter(k => k in mine.clips).map(k => [k, mine.clips[k]]));
+  const dc = diff(mineClipsOnly, theirClips, 'clips');
+  ok(!dc, 'every clip matches the reference, sidecar and library together', dc);
   const theirs = JSON.parse(JSON.stringify(ref.sidecar));
   ok(mine.artVoxelsPerMetre === theirs.skinScale * 10,
      'artVoxelsPerMetre says what the legacy skinScale said',
@@ -244,9 +299,10 @@ section('A. the default genome reproduces scripts/gen_human.py (round off)');
      !!mine.anatomy.limbs.head,
      'the anatomy recipe is present, with the head override');
   for (const k of ['artVoxelsPerMetre', 'sidecarVoxelsPerMetre', 'anatomy',
-                   'genome'])
+                   'genome', 'clips'])
     delete mine[k];
   delete theirs.skinScale;
+  delete theirs.clips;   // compared above, against the library as well
   const ds = diff(mine, theirs, 'sidecar');
   ok(!ds, 'every other sidecar field matches the reference exactly', ds);
 }
@@ -672,9 +728,15 @@ section('G. the archetype vocabulary is the only place limb names live');
   for (const st of built3.sidecar.states)
     for (const p of [...(st.missing || []), ...(st.missingAny || [])])
       ok(names.has(p), `state part "${p}" is a real limb`);
+  // A state's clip is resolved against the sidecar AND the shared library,
+  // exactly as LoadMobDefs resolves it — the prone and maimed clips live in
+  // assets/anims/ now, and a rig that names one it cannot reach is the "the mob
+  // just slides" failure mob.cpp logs about.
+  const reachable = { ...clipLibrary(), ...built3.sidecar.clips };
   for (const st of built3.sidecar.states)
-    ok(!!built3.sidecar.clips[st.clip],
-       `state "${st.name}" names a clip this rig has`);
+    ok(reachable[st.clip] != null,
+       `state "${st.name}" names a clip this rig can reach`,
+       `"${st.clip}" is neither in the sidecar nor in assets/anims/`);
   for (const g of built3.sidecar.gait.groups)
     for (const p of g) ok(names.has(p), `gait group part "${p}" is a real limb`);
   // The builders must not know they are building a humanoid. The one place the

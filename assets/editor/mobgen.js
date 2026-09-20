@@ -1801,13 +1801,6 @@ const qy = deg => { const h = radians(deg) * 0.5;
   return [0.0, qround(Math.sin(h)), 0.0, qround(Math.cos(h))]; };
 const qz = deg => { const h = radians(deg) * 0.5;
   return [0.0, 0.0, qround(Math.sin(h)), qround(Math.cos(h))]; };
-/** X then Z, matching QuatFromEulerDeg's X->Y->Z order (anim.h). */
-const qxz = (dx, dz) => {
-  const a = radians(dx) * 0.5, b = radians(dz) * 0.5;
-  const sa = Math.sin(a), ca = Math.cos(a), sb = Math.sin(b), cb = Math.cos(b);
-  return [qround(sa * cb), qround(sa * sb), qround(ca * sb), qround(ca * cb)];
-};
-const IDENT = [0.0, 0.0, 0.0, 1.0];
 
 /** hp and severImpactSpeed per limb: extremities come off easily and the
  *  spine does not. hp is SCALED BY VOLUME below — a heavier build really is
@@ -1931,6 +1924,21 @@ function gaitNumbers(table, opts) {
   };
 }
 
+/** THE ONLY CLIPS A CHARACTER OWNS ARE THE TWO THAT ARE DERIVED FROM ITS BODY.
+ *
+ * `idle jump fall land hang cast limp hop crawl squirm onearm headless` used to
+ * be emitted here, byte-identical into every generated sidecar, which is
+ * exactly the frozen copy this generator's characters are not supposed to be.
+ * They live in `assets/anims/` now — the shared library `LoadMobDefs` compiles
+ * onto every rig whose part names it fits — so editing the crawl edits every
+ * body's crawl, with no re-bake of anything.
+ *
+ * walk and run stay here because their PERIOD is derived from this figure's leg
+ * (gaitNumbers, armCycleMs): a short character does not walk on the human's
+ * clock. Everything else about them is shared, and a later pass can move the
+ * keys to the library too and leave only `durationMs` behind (the loader
+ * retimes a duration-only clip patch).
+ */
 function buildClips(gait) {
   const { walkMs, runMs } = gait;
   const swing = (deg, period = 900, phase = 0, ease = 'quadInOut') => {
@@ -1941,36 +1949,6 @@ function buildClips(gait) {
   };
   const clips = {};
 
-  // idle: a slow breath in the spine and a drifting head. Small amplitudes.
-  //
-  // A BREATH IS 8 SECONDS. The excursions here are tiny on purpose — 1.4
-  // degrees of spine, 5 of head yaw — and the smaller the excursion, the
-  // slower it has to run to read as breathing rather than as a twitch. The
-  // shipped human was retimed by 2.5x (96c86d5) and this is that retime, key
-  // for key; the quaternions do not move, only the clock does.
-  clips.idle = {
-    durationMs: 8000, loop: true, mode: 'additive',
-    blendInMs: 400, blendOutMs: 400,
-    mask: ['torso', 'head', 'armU.L', 'armU.R'],
-    tracks: {
-      torso: { rot: [{ t: 0, q: qx(0), ease: 'quadInOut' },
-                     { t: 4000, q: qx(-1.4), ease: 'quadInOut' },
-                     { t: 8000, q: qx(0) }],
-               pos: [{ t: 0, v: [0, 0, 0], ease: 'quadInOut' },
-                     { t: 4000, v: [0, 0.08, 0], ease: 'quadInOut' },
-                     { t: 8000, v: [0, 0, 0] }] },
-      head: { rot: [{ t: 0, q: qy(0), ease: 'quadInOut' },
-                    { t: 2750, q: qy(5), ease: 'quadInOut' },
-                    { t: 5750, q: qy(-4), ease: 'quadInOut' },
-                    { t: 8000, q: qy(0) }] },
-      'armU.L': { rot: [{ t: 0, q: qz(0), ease: 'quadInOut' },
-                        { t: 4000, q: qz(2.0), ease: 'quadInOut' },
-                        { t: 8000, q: qz(0) }] },
-      'armU.R': { rot: [{ t: 0, q: qz(0), ease: 'quadInOut' },
-                        { t: 4000, q: qz(-2.0), ease: 'quadInOut' },
-                        { t: 8000, q: qz(0) }] },
-    },
-  };
 
   // walk/run arm swing: additive over the gait, masked to the arms and spine
   // so the IK-driven legs are untouched. Periods derived above.
@@ -2006,258 +1984,6 @@ function buildClips(gait) {
     };
   }
 
-  // JUMPING. The legs TUCK, which on this rig is a NEGATIVE rotation about X:
-  // +X swings a hanging limb backward. Positive keys here raked both legs out
-  // BEHIND the character, which is what "both back legs move behind him" was.
-  clips.jump = {
-    durationMs: 500, loop: false, mode: 'additive',
-    blendInMs: 60, blendOutMs: 200,
-    mask: ['torso', 'armU.L', 'armU.R', 'legU.L', 'legU.R'],
-    tracks: {
-      torso: { rot: [{ t: 0, q: qx(0), ease: 'cubicOut' },
-                     { t: 160, q: qx(-10), ease: 'cubicInOut' },
-                     { t: 500, q: qx(0) }] },
-      'armU.L': { rot: [{ t: 0, q: qx(0), ease: 'cubicOut' },
-                        { t: 200, q: qx(-42), ease: 'cubicInOut' },
-                        { t: 500, q: qx(0) }] },
-      'armU.R': { rot: [{ t: 0, q: qx(0), ease: 'cubicOut' },
-                        { t: 200, q: qx(-42), ease: 'cubicInOut' },
-                        { t: 500, q: qx(0) }] },
-      'legU.L': { rot: [{ t: 0, q: qx(0), ease: 'cubicOut' },
-                        { t: 220, q: qx(-32), ease: 'cubicInOut' },
-                        { t: 500, q: qx(0) }] },
-      'legU.R': { rot: [{ t: 0, q: qx(0), ease: 'cubicOut' },
-                        { t: 220, q: qx(-22), ease: 'cubicInOut' },
-                        { t: 500, q: qx(0) }] },
-    },
-  };
-  // FALLING. Authored NEAR-NATURAL and opened out by WEIGHT, not by being one
-  // wide pose that switches on: avatar.cpp ramps this clip's weight over
-  // avatar.fallFlailDelay/fallFlailRamp seconds of air, so a step off a kerb
-  // plays a hint of it and only a genuine drop reaches the full shape. Arms go
-  // OUT TO THE SIDES; model +X is the character's LEFT, so .L abducts with +Z.
-  clips.fall = {
-    durationMs: 900, loop: true, mode: 'additive',
-    blendInMs: 250, blendOutMs: 250,
-    mask: ['torso', 'armU.L', 'armU.R', 'armL.L', 'armL.R'],
-    tracks: {
-      torso: { rot: [{ t: 0, q: qx(7), ease: 'quadInOut' },
-                     { t: 450, q: qx(11), ease: 'quadInOut' },
-                     { t: 900, q: qx(7) }] },
-      'armU.L': { rot: [{ t: 0, q: qxz(14, 52), ease: 'quadInOut' },
-                        { t: 450, q: qxz(4, 62), ease: 'quadInOut' },
-                        { t: 900, q: qxz(14, 52) }] },
-      'armU.R': { rot: [{ t: 0, q: qxz(4, -62), ease: 'quadInOut' },
-                        { t: 450, q: qxz(14, -52), ease: 'quadInOut' },
-                        { t: 900, q: qxz(4, -62) }] },
-      'armL.L': { rot: [{ t: 0, q: qx(-18), ease: 'quadInOut' },
-                        { t: 450, q: qx(-30), ease: 'quadInOut' },
-                        { t: 900, q: qx(-18) }] },
-      'armL.R': { rot: [{ t: 0, q: qx(-30), ease: 'quadInOut' },
-                        { t: 450, q: qx(-18), ease: 'quadInOut' },
-                        { t: 900, q: qx(-30) }] },
-    },
-  };
-  clips.land = {
-    durationMs: 420, loop: false, mode: 'additive',
-    blendInMs: 40, blendOutMs: 180,
-    mask: ['torso', 'hips', 'armU.L', 'armU.R'],
-    tracks: {
-      hips: { pos: [{ t: 0, v: [0, 0, 0], ease: 'cubicOut' },
-                    { t: 110, v: [0, -0.4, 0], ease: 'cubicInOut' },
-                    { t: 420, v: [0, 0, 0] }] },
-      torso: { rot: [{ t: 0, q: qx(0), ease: 'cubicOut' },
-                     { t: 110, q: qx(14), ease: 'cubicInOut' },
-                     { t: 420, q: qx(0) }] },
-      'armU.L': { rot: [{ t: 0, q: qx(0), ease: 'cubicOut' },
-                        { t: 110, q: qx(-40), ease: 'cubicInOut' },
-                        { t: 420, q: qx(0) }] },
-      'armU.R': { rot: [{ t: 0, q: qx(0), ease: 'cubicOut' },
-                        { t: 110, q: qx(-40), ease: 'cubicInOut' },
-                        { t: 420, q: qx(0) }] },
-    },
-  };
-  // HANG: the ledge-grab pose, played BY NAME from game/avatar.cpp.
-  clips.hang = {
-    durationMs: 1600, loop: true, mode: 'override',
-    blendInMs: 120, blendOutMs: 180,
-    mask: ['armU.L', 'armL.L', 'armU.R', 'armL.R'],
-    tracks: {
-      'armU.L': { rot: [{ t: 0, q: qx(-145), ease: 'quadInOut' },
-                        { t: 800, q: qx(-148), ease: 'quadInOut' },
-                        { t: 1600, q: qx(-145) }] },
-      'armU.R': { rot: [{ t: 0, q: qx(-145), ease: 'quadInOut' },
-                        { t: 800, q: qx(-148), ease: 'quadInOut' },
-                        { t: 1600, q: qx(-145) }] },
-      'armL.L': { rot: [{ t: 0, q: qx(-20) }] },
-      'armL.R': { rot: [{ t: 0, q: qx(-20) }] },
-    },
-  };
-  // cast: the right arm thrusts forward. Override + masked to that arm so it
-  // fully owns the limb while it plays; everything else keeps walking.
-  clips.cast = {
-    durationMs: 560, loop: false, mode: 'override',
-    blendInMs: 80, blendOutMs: 220,
-    mask: ['armU.R', 'armL.R', 'hand.R', 'torso'],
-    tracks: {
-      'armU.R': { rot: [{ t: 0, q: qx(0), ease: 'cubicOut' },
-                        { t: 150, q: qx(-95), ease: 'cubicInOut' },
-                        { t: 300, q: qx(-74), ease: 'cubicInOut' },
-                        { t: 560, q: qx(0) }] },
-      'armL.R': { rot: [{ t: 0, q: qx(-18), ease: 'cubicOut' },
-                        { t: 150, q: qx(-52), ease: 'cubicInOut' },
-                        { t: 300, q: qx(-10), ease: 'cubicInOut' },
-                        { t: 560, q: qx(-18) }] },
-      'hand.R': { rot: [{ t: 0, q: IDENT }] },
-      torso: { rot: [{ t: 0, q: qy(0), ease: 'cubicOut' },
-                     { t: 150, q: qy(-14), ease: 'cubicInOut' },
-                     { t: 560, q: qy(0) }] },
-    },
-  };
-  // flinch on non-fatal damage (MobSystem plays "attack"; the avatar plays
-  // this by the same name, so both drivers share one convention)
-  clips.attack = clips.cast;
-
-  // ---- dismemberment locomotion ------------------------------------------
-  clips.limp = {
-    durationMs: 1000, loop: true, mode: 'additive',
-    blendInMs: 300, blendOutMs: 300,
-    mask: ['torso', 'hips', 'armU.L', 'armU.R'],
-    tracks: {
-      torso: { rot: [{ t: 0, q: qx(16), ease: 'quadInOut' },
-                     { t: 500, q: qx(9), ease: 'quadInOut' },
-                     { t: 1000, q: qx(16) }] },
-      hips: { rot: [{ t: 0, q: qz(7), ease: 'quadInOut' },
-                    { t: 500, q: qz(-3), ease: 'quadInOut' },
-                    { t: 1000, q: qz(7) }],
-              pos: [{ t: 0, v: [0, -0.3, 0], ease: 'quadInOut' },
-                    { t: 500, v: [0, -0.08, 0], ease: 'quadInOut' },
-                    { t: 1000, v: [0, -0.3, 0] }] },
-      'armU.L': { rot: [{ t: 0, q: qx(-26), ease: 'quadInOut' },
-                        { t: 500, q: qx(-8), ease: 'quadInOut' },
-                        { t: 1000, q: qx(-26) }] },
-      'armU.R': { rot: [{ t: 0, q: qx(-14) }] },
-    },
-  };
-  clips.hop = {
-    durationMs: 760, loop: true, mode: 'override',
-    blendInMs: 220,
-    mask: ['torso', 'hips', 'legU.L', 'legL.L', 'legU.R', 'legL.R',
-           'armU.L', 'armU.R'],
-    tracks: {
-      hips: { pos: [{ t: 0, v: [0, 0, 0], ease: 'cubicOut' },
-                    { t: 260, v: [0, 0.9, 0], ease: 'cubicInOut' },
-                    { t: 520, v: [0, 0, 0], ease: 'cubicIn' },
-                    { t: 760, v: [0, 0, 0] }],
-              rot: [{ t: 0, q: qx(10), ease: 'cubicInOut' },
-                    { t: 260, q: qx(-6), ease: 'cubicInOut' },
-                    { t: 760, q: qx(10) }] },
-      torso: { rot: [{ t: 0, q: qx(12), ease: 'cubicInOut' },
-                     { t: 260, q: qx(-4), ease: 'cubicInOut' },
-                     { t: 760, q: qx(12) }] },
-      'legU.L': { rot: [{ t: 0, q: qx(28), ease: 'cubicInOut' },
-                        { t: 260, q: qx(-14), ease: 'cubicInOut' },
-                        { t: 760, q: qx(28) }] },
-      'legU.R': { rot: [{ t: 0, q: qx(28), ease: 'cubicInOut' },
-                        { t: 260, q: qx(-14), ease: 'cubicInOut' },
-                        { t: 760, q: qx(28) }] },
-      'legL.L': { rot: [{ t: 0, q: qx(-46), ease: 'cubicInOut' },
-                        { t: 260, q: qx(-16), ease: 'cubicInOut' },
-                        { t: 760, q: qx(-46) }] },
-      'legL.R': { rot: [{ t: 0, q: qx(-46), ease: 'cubicInOut' },
-                        { t: 260, q: qx(-16), ease: 'cubicInOut' },
-                        { t: 760, q: qx(-46) }] },
-      'armU.L': { rot: [{ t: 0, q: qx(-30), ease: 'cubicInOut' },
-                        { t: 260, q: qx(-62), ease: 'cubicInOut' },
-                        { t: 760, q: qx(-30) }] },
-      'armU.R': { rot: [{ t: 0, q: qx(-30), ease: 'cubicInOut' },
-                        { t: 260, q: qx(-62), ease: 'cubicInOut' },
-                        { t: 760, q: qx(-30) }] },
-    },
-  };
-  clips.crawl = {
-    durationMs: 1200, loop: true, mode: 'override',
-    blendInMs: 260,
-    mask: ['torso', 'hips', 'head', 'armU.L', 'armL.L', 'armU.R', 'armL.R',
-           'legU.L', 'legL.L', 'legU.R', 'legL.R'],
-    tracks: {
-      hips: { rot: [{ t: 0, q: qx(74), ease: 'quadInOut' },
-                    { t: 600, q: qx(80), ease: 'quadInOut' },
-                    { t: 1200, q: qx(74) }] },
-      torso: { rot: [{ t: 0, q: qy(-9), ease: 'quadInOut' },
-                     { t: 600, q: qy(9), ease: 'quadInOut' },
-                     { t: 1200, q: qy(-9) }] },
-      head: { rot: [{ t: 0, q: qx(-48), ease: 'quadInOut' },
-                    { t: 600, q: qx(-38), ease: 'quadInOut' },
-                    { t: 1200, q: qx(-48) }] },
-      'armU.L': { rot: [{ t: 0, q: qx(-96), ease: 'quadInOut' },
-                        { t: 600, q: qx(-30), ease: 'quadInOut' },
-                        { t: 1200, q: qx(-96) }] },
-      'armU.R': { rot: [{ t: 0, q: qx(-30), ease: 'quadInOut' },
-                        { t: 600, q: qx(-96), ease: 'quadInOut' },
-                        { t: 1200, q: qx(-30) }] },
-      'armL.L': { rot: [{ t: 0, q: qx(-40), ease: 'quadInOut' },
-                        { t: 600, q: qx(-70), ease: 'quadInOut' },
-                        { t: 1200, q: qx(-40) }] },
-      'armL.R': { rot: [{ t: 0, q: qx(-70), ease: 'quadInOut' },
-                        { t: 600, q: qx(-40), ease: 'quadInOut' },
-                        { t: 1200, q: qx(-70) }] },
-      'legU.L': { rot: [{ t: 0, q: qx(-8) }] },
-      'legU.R': { rot: [{ t: 0, q: qx(-8) }] },
-      'legL.L': { rot: [{ t: 0, q: qx(-14) }] },
-      'legL.R': { rot: [{ t: 0, q: qx(-14) }] },
-    },
-  };
-  clips.squirm = {
-    durationMs: 1600, loop: true, mode: 'override',
-    blendInMs: 300,
-    mask: ['torso', 'hips', 'head'],
-    tracks: {
-      hips: { rot: [{ t: 0, q: qx(84), ease: 'quadInOut' },
-                    { t: 800, q: qx(88), ease: 'quadInOut' },
-                    { t: 1600, q: qx(84) }] },
-      torso: { rot: [{ t: 0, q: qy(-16), ease: 'quadInOut' },
-                     { t: 800, q: qy(16), ease: 'quadInOut' },
-                     { t: 1600, q: qy(-16) }] },
-      head: { rot: [{ t: 0, q: qx(-30), ease: 'quadInOut' },
-                    { t: 800, q: qx(-20), ease: 'quadInOut' },
-                    { t: 1600, q: qx(-30) }] },
-    },
-  };
-  clips.onearm = {
-    durationMs: 1400, loop: true, mode: 'additive',
-    blendInMs: 260, blendOutMs: 260,
-    mask: ['torso', 'armU.L', 'armU.R'],
-    tracks: {
-      torso: { rot: [{ t: 0, q: qz(5), ease: 'quadInOut' },
-                     { t: 700, q: qz(2), ease: 'quadInOut' },
-                     { t: 1400, q: qz(5) }] },
-      'armU.L': { rot: [{ t: 0, q: qx(-6), ease: 'quadInOut' },
-                        { t: 700, q: qx(4), ease: 'quadInOut' },
-                        { t: 1400, q: qx(-6) }] },
-      'armU.R': { rot: [{ t: 0, q: qx(-6), ease: 'quadInOut' },
-                        { t: 700, q: qx(4), ease: 'quadInOut' },
-                        { t: 1400, q: qx(-6) }] },
-    },
-  };
-  clips.headless = {
-    durationMs: 900, loop: true, mode: 'additive',
-    blendInMs: 120, blendOutMs: 200,
-    mask: ['torso', 'armU.L', 'armU.R', 'armL.L', 'armL.R'],
-    tracks: {
-      torso: { rot: [{ t: 0, q: qz(-4), ease: 'quadInOut' },
-                     { t: 450, q: qz(4), ease: 'quadInOut' },
-                     { t: 900, q: qz(-4) }] },
-      'armU.L': { rot: [{ t: 0, q: qx(-70), ease: 'quadInOut' },
-                        { t: 450, q: qx(-95), ease: 'quadInOut' },
-                        { t: 900, q: qx(-70) }] },
-      'armU.R': { rot: [{ t: 0, q: qx(-95), ease: 'quadInOut' },
-                        { t: 450, q: qx(-70), ease: 'quadInOut' },
-                        { t: 900, q: qx(-95) }] },
-      'armL.L': { rot: [{ t: 0, q: qx(-60) }] },
-      'armL.R': { rot: [{ t: 0, q: qx(-60) }] },
-    },
-  };
   return clips;
 }
 
@@ -2313,7 +2039,7 @@ function scaleClipPositions(clips, factor) {
   if (factor === 1) return clips;
   const seen = new Set();
   for (const c of Object.values(clips)) {
-    if (seen.has(c)) continue;          // `attack` aliases `cast`
+    if (seen.has(c)) continue;          // two names may share one clip object
     seen.add(c);
     for (const tr of Object.values(c.tracks || {}))
       for (const k of tr.pos || []) k.v = k.v.map(v => pyRound(v * factor, 4));
