@@ -60,9 +60,15 @@
 
 export const ANATOMY_VERSION = 1;
 
-/** The stock human recipe: what `human.json` carries. Exported so the editor
- *  has something to apply to a mob whose sidecar has no `anatomy` block, and
- *  so the test can pin its shape. */
+/** THE STOCK HUMAN RECIPE, and the ONE copy of it.
+ *
+ * `mobgen.anatomyRecipe()` returns this with the authoring notes a sidecar
+ * carries attached; `human.json` carries that; the editor applies this to a mob
+ * whose sidecar has no `anatomy` block; `scripts/test_anatomy.mjs` pins it.
+ * Four readers, one definition — which it was not until 2026-09-20, when this
+ * constant still had `flesh` inside the skull where every other copy said
+ * `brain`, and the test pinned the stale value. A recipe with two copies is the
+ * same class of bug as a body with two copies, one layer up. */
 export const DEFAULT_ANATOMY = {
   layers: [
     { material: 'skin', depth: 1, keep: true },
@@ -70,15 +76,31 @@ export const DEFAULT_ANATOMY = {
     { material: 'muscle', depth: 1, speckle: { material: 'blood', fraction: 0.06 } },
     { material: 'bone' },
   ],
+  // The human's shorts are the `linen` MATERIAL and not paint, because burning
+  // a voxel clears its art colour and painted-on clothing would char into bare
+  // flesh. So the clause is live: it is what puts skin rather than flesh under
+  // them. (Generated bodies paint their shorts instead and have no linen at
+  // all, which makes it inert there — and means a generated character has
+  // flesh where the human has skin. A real asymmetry, in the ART and not in
+  // this recipe.)
   garments: ['linen'],
   limbs: {
-    // The skull is a shell, and what it protects is not bone.
+    // THE SKULL IS A SHELL AND WHAT IT PROTECTS IS NOT BONE. The flesh ring
+    // over it is the SCALP and is not decoration: without it bone sits one
+    // voxel under the paint, so a graze that should have opened a scalp rings
+    // off the skull and the wound model's depth weights (skin/flesh 1,
+    // muscle 2, bone 3) start at 3 for every head hit. The bone is two deep
+    // because the rot chews it at half rate (bone.rotRate), so breaching takes
+    // time and what is behind goes fast; `brain` is open-ended, so it is by
+    // definition everything the shell encloses — there is no geometric brain
+    // test anywhere in the engine and this recipe is the only thing that
+    // decides what is one.
     head: {
       layers: [
         { material: 'skin', depth: 1, keep: true },
         { material: 'flesh', depth: 1 },
         { material: 'bone', depth: 2 },
-        { material: 'flesh' },
+        { material: 'brain' },
       ],
     },
   },

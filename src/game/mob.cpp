@@ -13,6 +13,7 @@
 #include <nlohmann/json.hpp>
 
 #include "game/item.h"
+#include "game/anatomy_resolve.h"
 #include "game/rigrender.h"
 #include "game/sidecar.h"
 #include "phys/bodystain.h"
@@ -937,6 +938,17 @@ bool LoadMobDefs(const std::string& dir, const std::vector<MaterialDef>& mats,
       def.artUpsample = 1;
       ok = false;
     }
+    // ---- WHAT IS UNDER THE SKIN (game/anatomy_resolve.h) -------------------
+    // From the RESOLVED sidecar, so `extends` and `effects` reach it: a
+    // character inherits the human's recipe the way it inherits the human's
+    // clips, and a `skeletal` effect is a patch rather than a second body.
+    //
+    // HERE, and not below the upsample: depth is counted in ART voxels, and a
+    // block-replicated 2x body would measure every layer twice as thick. After
+    // the palette merge, because that renumbers `color` and this clears it.
+    if (j.contains("anatomy"))
+      anatomy::Resolve(def.prefab, j["anatomy"], mats, jp, log);
+
     if (def.artUpsample > 1) {
       UpsamplePrefab(def.prefab, def.artUpsample);
       log += def.name + ": art is " + std::to_string(def.artVoxelsPerMetre) +

@@ -21,6 +21,7 @@
 #include "game/item.h"
 #include "game/thirdperson.h"
 #include "game/brush.h"
+#include "game/anatomy_resolve.h"
 #include "game/sidecar.h"
 #include "game/camera.h"
 #include "game/player.h"
@@ -147,6 +148,137 @@ Status GateSidecarResolve(Ctx& c, std::string& detail) {
            std::to_string(loud) + "; wrote build/sidecar_resolved.json";
   std::printf("sidecar-resolve: %s (%s)\n", ok ? "PASS" : "FAIL",
               detail.c_str());
+  if (!log.empty()) std::printf("%s", log.c_str());
+  return ok ? Status::Pass : Status::Fail;
+}
+
+// ---- anatomy-parity ---------------------------------------------------------
+//
+// WHAT IS UNDER THE SKIN IS COMPUTED IN TWO LANGUAGES, AND THEY HAVE TO AGREE.
+//
+// assets/editor/anatomy.js bakes it into the .vox; src/game/anatomy_resolve.cpp
+// re-derives it at load. Two implementations of one rule is exactly the
+// divergence design guideline 3 is about, and this one is invisible when it
+// goes wrong — a different speckle hash gives a different set of blood vessels
+// through the muscle, which looks as correct as the right one.
+//
+// So the gate is two arms, and it is the SECOND that makes two implementations
+// safe:
+//
+//   A. THE RESOLVE IS A NO-OP ON BAKED ART. Re-derive over the raw .vox as it
+//      sits on disk; nothing may be rewritten. This catches a stale body (art
+//      that predates a recipe edit) AND a drift in either direction — if the
+//      two disagree anywhere, the C++ rewrites the voxel the JS baked.
+//
+//   B. THE RESOLVE REPRODUCES THE BAKE. Strip a body's materials back to bare
+//      surface in memory, re-derive, and compare to the disk art voxel for
+//      voxel. Arm A alone would pass if the resolve did nothing at all; this
+//      is what says it does the whole job.
+//
+// No world, no GPU, no fixtures: it reads files and merges JSON.
+Status GateAnatomyParity(Ctx& c, std::string& detail) {
+  const std::string dir = AssetDir() + "/mobs";
+  std::string log;
+  int checked = 0, staleVox = 0, mismatch = 0, rebuilt = 0;
+  std::string worst;
+  std::error_code ec;
+  std::vector<std::string> stems;
+  for (auto& e : std::filesystem::directory_iterator(dir, ec))
+    if (e.is_regular_file() && e.path().extension() == ".vox")
+      stems.push_back(e.path().stem().string());
+  std::sort(stems.begin(), stems.end());
+
+  for (const std::string& stem : stems) {
+    const std::string jp = (std::filesystem::path(dir) / (stem + ".json")).string();
+    nlohmann::json j;
+    if (!sidecar::Load(dir, jp, j, log)) continue;
+    if (!j.contains("anatomy")) continue;   // critter, dummy: no recipe, no claim
+    Prefab disk;
+    std::string err, warn;
+    if (!LoadVoxFile((std::filesystem::path(dir) / (stem + ".vox")).string(),
+                     c.mats.size(), disk, err, warn))
+      continue;
+    checked++;
+
+    // ---- A ----
+    Prefab asDisk = disk;
+    const anatomy::Report ra =
+        anatomy::Resolve(asDisk, j["anatomy"], c.mats, stem, log);
+    if (ra.rewritten) {
+      staleVox += ra.rewritten;
+      if (worst.empty())
+        worst = stem + " needs " + std::to_string(ra.rewritten) + " rewritten";
+    }
+
+    // ---- B ----
+    // Strip the INTERIOR back to the first layer's material and re-derive it.
+    //
+    // The SURFACE is left exactly as drawn, and that is not a softening of the
+    // test — it is what the recipe says. Depth 0 is the painted character (the
+    // eyes, the shading rows, the linen shorts) and the surface layer is
+    // `keep`, so the bake never writes it and a resolve that reproduced it
+    // would be reproducing something nobody computed. Stripping it as well
+    // deletes the garments, which is a different body: the shorts stop being
+    // shorts, "skin under the shorts" stops firing, and 1,763 voxels disagree
+    // for a reason that has nothing to do with either implementation.
+    const std::string surfaceName =
+        j["anatomy"].contains("layers") && j["anatomy"]["layers"].is_array() &&
+                !j["anatomy"]["layers"].empty()
+            ? j["anatomy"]["layers"][0].value("material", std::string())
+            : std::string();
+    // By name, the way every loader does it, and locally: `FindMaterialId` is
+    // a file-scope function in two other TUs rather than anything declared in
+    // a header, and a third reference to it is not the fix for that.
+    int surfaceId = 0;
+    for (size_t i = 0; i < c.mats.size(); i++)
+      if (c.mats[i].name == surfaceName) surfaceId = (int)i;
+    if (surfaceId <= 0) continue;
+    Prefab bare = disk;
+    {
+      const std::vector<uint8_t> d = anatomy::UnionDepth(bare);
+      const IVec3 dim = bare.size;
+      for (PrefabModel& m : bare.models)
+        for (PrefabVoxel& v : m.voxels) {
+          const int px = v.x + m.offset.x, py = v.y + m.offset.y,
+                    pz = v.z + m.offset.z;
+          if (px < 0 || py < 0 || pz < 0 || px >= dim.x || py >= dim.y ||
+              pz >= dim.z)
+            continue;
+          const size_t i = (size_t)px + (size_t)py * dim.x +
+                           (size_t)pz * dim.x * dim.y;
+          if (d[i] != 0 && d[i] != anatomy::kDepthEmpty)
+            v.material = (uint16_t)surfaceId;
+        }
+    }
+    // Into a THROWAWAY log: Resolve reports a non-zero rewrite count as news,
+    // and here a non-zero count is the entire point of the arm.
+    std::string stripLog;
+    const anatomy::Report rb =
+        anatomy::Resolve(bare, j["anatomy"], c.mats, stem, stripLog);
+    rebuilt += rb.rewritten;
+    for (size_t mi = 0; mi < bare.models.size(); mi++)
+      for (size_t vi = 0; vi < bare.models[mi].voxels.size(); vi++) {
+        const PrefabVoxel& a = bare.models[mi].voxels[vi];
+        const PrefabVoxel& b = disk.models[mi].voxels[vi];
+        if (a.material == b.material) continue;
+        mismatch++;
+        if (worst.empty())
+          worst = stem + "/" + bare.models[mi].name + " (" +
+                  std::to_string(a.x) + "," + std::to_string(a.y) + "," +
+                  std::to_string(a.z) + "): rebuilt " +
+                  std::to_string((int)a.material) + ", baked " +
+                  std::to_string((int)b.material);
+      }
+  }
+
+  const bool ok = checked > 0 && staleVox == 0 && mismatch == 0 && rebuilt > 0;
+  detail = "checked " + std::to_string(checked) + " baked bod(ies); on baked " +
+           "art the resolve rewrote " + std::to_string(staleVox) +
+           " (want 0); stripped to bare surface it rebuilt " +
+           std::to_string(rebuilt) + " interior voxel(s) with " +
+           std::to_string(mismatch) + " disagreeing with the bake (want 0)" +
+           (worst.empty() ? "" : "; first: " + worst);
+  std::printf("anatomy-parity: %s (%s)\n", ok ? "PASS" : "FAIL", detail.c_str());
   if (!log.empty()) std::printf("%s", log.c_str());
   return ok ? Status::Pass : Status::Fail;
 }
@@ -8423,6 +8555,9 @@ const std::vector<Gate>& MobGates() {
       // that no longer resolves takes every later mob gate down with it, so it
       // should be the first thing a mob run says.
       {"sidecar-resolve", "mob", {}, false, GateSidecarResolve,
+       /*needsRender=*/false},
+      // With it, and for the same reasons: files and arithmetic, no world.
+      {"anatomy-parity", "mob", {}, false, GateAnatomyParity,
        /*needsRender=*/false},
       {"mob", "mob", {}, false, GateMob, /*needsRender=*/true},
       // Per-voxel body reactivity. No render: every claim is a count.

@@ -1828,11 +1828,16 @@ const LIMB_BASE = {
   foot:  { hp: 36, severable: true, tag: 'foot', sever: 12.0 },
 };
 
-/** The anatomy recipe, baked into the .vox by assets/editor/anatomy.js (or
- *  `node scripts/anatomize_mob.mjs <mob>`). Every generated body needs it and
- *  the peel needs a SOLID volume, which these builders produce. Head override
- *  is keyed by the limb NAME `head`. */
+/** The anatomy recipe a generated sidecar carries.
+ *
+ * THE RECIPE ITSELF IS `ANA.DEFAULT_ANATOMY`, and is not restated here. It was
+ * restated here until 2026-09-20, and the two copies had disagreed about what
+ * is inside the skull for long enough that the test pinned the wrong one. What
+ * this adds is the AUTHORING NOTES — the `//` keys a human reading
+ * assets/mobs/*.json wants and a module constant should not carry.
+ */
 export function anatomyRecipe() {
+  const r = JSON.parse(JSON.stringify(ANA.DEFAULT_ANATOMY));
   return {
     '//': 'What is under the skin, by depth from the surface, baked into the ' +
           '.vox by `node scripts/anatomize_mob.mjs <mob>` or the tuner\'s ' +
@@ -1841,32 +1846,18 @@ export function anatomyRecipe() {
           'alone; `garments` are surface voxels that are clothes, so the ' +
           'voxel under them is skin. Head override: a bone skull two deep ' +
           'around a `brain` core.',
-    layers: [
-      { material: 'skin', depth: 1, keep: true },
-      { material: 'flesh', depth: 1 },
-      { material: 'muscle', depth: 1, speckle: { material: 'blood', fraction: 0.06 } },
-      { material: 'bone' },
-    ],
-    garments: ['linen'],
+    ...r,
     limbs: {
-      // THE SKULL IS THE SHIPPED HUMAN'S: skin / FLESH / bone 2 / brain. The
-      // flesh ring is not decoration — it is the scalp, and dropping it (as
-      // this recipe did) puts bone one voxel under the paint, so a graze that
-      // should have opened a scalp rings off the skull instead and the wound
-      // model's depth weights (skin/flesh 1, muscle 2, bone 3) start at 3 for
-      // every head hit. The bone is two deep because the rot chews it at half
-      // rate (bone.rotRate), so breaching takes time and what is behind goes
-      // fast; `brain` is open-ended, so it is by definition everything the
-      // shell encloses — there is no geometric brain test anywhere in the
-      // engine and this recipe is the only thing that decides what is one.
-      head: {
-        layers: [
-          { material: 'skin', depth: 1, keep: true },
-          { material: 'flesh', depth: 1 },
-          { material: 'bone', depth: 2 },
-          { material: 'brain' },
-        ],
-      },
+      '//head': 'A bone skull two deep around a BRAIN. The core layer is ' +
+                'open-ended, so `brain` is by definition everything the shell ' +
+                'encloses -- there is no geometric brain test anywhere in the ' +
+                'engine, and this recipe is the only thing that decides what ' +
+                'is one. Losing a voxel of it costs gore.brainHpPerVoxel flat ' +
+                'on top of the ordinary volume damage (materials.json ' +
+                '`brain`), which is why the skull in front of it matters: the ' +
+                'rot chews bone at half rate (bone.rotRate), so breaching ' +
+                'takes time and what is behind goes fast.',
+      ...r.limbs,
     },
   };
 }

@@ -5,7 +5,7 @@
  * Node-only; anatomy.js and vox.js are pure.
  *   node scripts/test_anatomy.mjs
  */
-import { readFileSync } from 'fs';
+import { readFileSync, readdirSync, existsSync } from 'fs';
 import { fileURLToPath, pathToFileURL } from 'url';
 import { dirname, join } from 'path';
 
@@ -13,6 +13,7 @@ const ROOT = join(dirname(fileURLToPath(import.meta.url)), '..');
 const load = rel => import(pathToFileURL(join(ROOT, rel)).href);
 const VOX = await load('assets/editor/vox.js');
 const ANA = await load('assets/editor/anatomy.js');
+const SC = await load('assets/editor/sidecar.js');
 
 let fails = 0;
 const ok = (cond, what) => {
@@ -63,7 +64,7 @@ console.log('layers');
   const head = ANA.layersFor(ANA.DEFAULT_ANATOMY, 'head');
   ok(ANA.layerIndexAt(head, 2) === 2 && ANA.layerIndexAt(head, 3) === 2 &&
      head[2].material === 'bone', 'head override: skull at depth 2..3');
-  ok(ANA.layerIndexAt(head, 4) === 3 && head[3].material === 'flesh', 'brain inside the skull');
+  ok(ANA.layerIndexAt(head, 4) === 3 && head[3].material === 'brain', 'brain inside the skull');
 }
 
 /* ---- 3. plan on the synthetic block -------------------------------------- */
@@ -145,6 +146,60 @@ console.log('human.vox');
   }
   ok(limbsWithBone === parsed.prefab.models.length, `every limb has a bone core (${limbsWithBone}/${parsed.prefab.models.length})`);
   ok(painted > 0 && paintedDeep === 0, `paint lives on the surface only (${painted} painted, ${paintedDeep} buried)`);
+}
+
+/* ---- 5. AND EVERY OTHER BAKED BODY ---------------------------------------
+ *
+ * Section 4 pins the human, which is the body the recipe was written for and
+ * the one least likely to go stale. What goes stale is a CHARACTER: it carries
+ * its own 200 KB of art, its recipe now arrives through `extends`, and editing
+ * the human's recipe therefore changes what its interior SHOULD be without
+ * touching a byte of what it IS.
+ *
+ * The engine resolves that at load now (src/game/anatomy_resolve.cpp), so a
+ * stale body is no longer a wrong body in the GAME — but it is still a wrong
+ * body in the Models tab's peel, in any census read off disk, and in this file.
+ * Running the planner over every .vox is ~20 ms a body and says exactly which
+ * one and by how much; a stored hash would say only that something moved.
+ */
+console.log('every baked body');
+{
+  const mobsDir = join(ROOT, 'assets/mobs');
+  const materials = JSON.parse(
+    readFileSync(join(ROOT, 'assets/materials/materials.json'), 'utf8')).materials;
+  const matId = ANA.materialIds(materials);
+  const readStem = stem =>
+    JSON.parse(readFileSync(join(mobsDir, stem + '.json'), 'utf8'));
+  const readEffect = name => {
+    const p = join(mobsDir, 'effects', name + '.json');
+    return existsSync(p) ? JSON.parse(readFileSync(p, 'utf8')) : null;
+  };
+  let bodies = 0;
+  for (const f of readdirSync(mobsDir).sort()) {
+    if (!f.endsWith('.vox')) continue;
+    const stem = f.slice(0, -4);
+    // THE RESOLVED SIDECAR, not the file on disk: a character's recipe is
+    // inherited and an effect may override it, so asking the raw file would
+    // compare the art against a recipe the engine does not use.
+    let side;
+    try { side = SC.resolveSidecar(readStem, stem, readEffect); }
+    catch (e) { ok(false, `${stem}.json resolves: ${e.message}`); continue; }
+    if (!side.anatomy) continue;      // no recipe, no claim (critter, dummy)
+    bodies++;
+    const buf = readFileSync(join(mobsDir, f));
+    const parsed = VOX.readVox(
+      buf.buffer.slice(buf.byteOffset, buf.byteOffset + buf.byteLength));
+    const plan = ANA.planAnatomy(parsed.prefab, side.anatomy, matId);
+    ok(plan.report.unresolved.length === 0,
+       `${stem}: every material its recipe names exists` +
+       (plan.report.unresolved.length
+          ? ': MISSING ' + plan.report.unresolved.join(', ') : ''));
+    ok(plan.report.total === 0,
+       `${stem}.vox is in sync with its resolved recipe ` +
+       `(${plan.report.total} voxels differ; re-bake with ` +
+       `\`node scripts/anatomize_mob.mjs ${stem}\`)`);
+  }
+  ok(bodies > 1, `there is more than one baked body to check (${bodies})`);
 }
 
 console.log(fails ? `\n${fails} FAILED` : '\nall ok');

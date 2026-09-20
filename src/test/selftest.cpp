@@ -226,7 +226,8 @@ const char* const kOrder[] = {
     // milliseconds. Placed immediately before `mob` because a sidecar that no
     // longer resolves takes every mob gate after it down, and the run should
     // say which one it was.
-    "prefab",      "sidecar-resolve", "mob", "settle-back", "player-body",
+    "prefab",      "sidecar-resolve", "anatomy-parity", "mob",
+    "settle-back", "player-body",
     // Wearing things. After `mob` because it spawns the avatar def on real
     // terrain and carves a shell, which wants the same standing world the
     // body gates run in; before `ragdoll-joints` because it leaves the rig
