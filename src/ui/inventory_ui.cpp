@@ -593,6 +593,31 @@ void Portrait(UIState& s, ImVec2 at, ImVec2 size) {
   }
 }
 
+// ---- the limb overlays, and why they all clip -------------------------------
+//
+// THE PORTRAIT IS A WINDOW ONTO THE RIG, AND A LIMB'S PROJECTED BOX IS NOT
+// BOUNDED BY IT. main.cpp projects all eight corners of every limb box and
+// keeps the result whenever all eight are in FRONT of the portrait camera
+// (ProjectToPortrait) — which says nothing about whether they landed inside
+// the picture. Zoom in on the head and the hands project a long way past the
+// frame; their callouts were then drawn at that position, i.e. across the
+// armour slots and the panel beside them, with nothing on screen to explain
+// what they were pointing at.
+//
+// So every overlay here clips to the portrait rect. Drawing is cut at the
+// frame (a limb half out of shot shows half its ticks, which is correct — it
+// IS half out of shot), and anything with a hit box clamps the box too, so a
+// click can never land on a limb that is not visible under the cursor.
+bool ClipToPortrait(ImVec2 at, ImVec2 size, ImVec2& p0, ImVec2& p1) {
+  const ImVec2 lo = at, hi(at.x + size.x, at.y + size.y);
+  if (p1.x <= lo.x || p0.x >= hi.x || p1.y <= lo.y || p0.y >= hi.y) return false;
+  p0.x = std::max(p0.x, lo.x);
+  p0.y = std::max(p0.y, lo.y);
+  p1.x = std::min(p1.x, hi.x);
+  p1.y = std::min(p1.y, hi.y);
+  return p1.x - p0.x > 1.0f && p1.y - p0.y > 1.0f;
+}
+
 // ---- the health inspector ---------------------------------------------------
 //
 // The same portrait, with the damaged limbs called out on it and a sorted
@@ -602,6 +627,9 @@ void Portrait(UIState& s, ImVec2 at, ImVec2 size) {
 void InspectOverlay(const UIState& s, ImVec2 at, ImVec2 size) {
   ImDrawList* dl = ImGui::GetWindowDrawList();
   if (!s.bodyValid) return;
+  // Clipped to the picture, not to the panel: see ClipToPortrait above.
+  dl->PushClipRect(at, ImVec2(at.x + size.x, at.y + size.y), true);
+  struct Pop { ImDrawList* d; ~Pop() { d->PopClipRect(); } } pop{dl};
   // One wall-clock phase for the whole body, so wounds pulse together and read
   // as one alarm — the same choice DrawBodyFigure makes, for the same reason.
   const float flash = 0.5f + 0.5f * (float)std::sin(ImGui::GetTime() * 4.5);
@@ -663,8 +691,11 @@ void InspectCastPicks(UIState& s, ImVec2 at, ImVec2 size) {
   for (int i = 0; i < UIState::kSlotCount; i++) {
     const UIState::BodyPartUI& b = s.body[i];
     if (!b.present || b.severed || !b.projValid) continue;
-    const ImVec2 p0(at.x + b.projMin[0] * size.x, at.y + b.projMin[1] * size.y);
-    const ImVec2 p1(at.x + b.projMax[0] * size.x, at.y + b.projMax[1] * size.y);
+    ImVec2 p0(at.x + b.projMin[0] * size.x, at.y + b.projMin[1] * size.y);
+    ImVec2 p1(at.x + b.projMax[0] * size.x, at.y + b.projMax[1] * size.y);
+    // CLAMPED, not merely clipped: this one has a hit box on it, and a target
+    // you cannot see is a target you cannot have meant to click.
+    if (!ClipToPortrait(at, size, p0, p1)) continue;
     if (p1.x - p0.x < 2.0f || p1.y - p0.y < 2.0f) continue;
     ImGui::SetCursorScreenPos(p0);
     ImGui::PushID(1000 + i);
@@ -690,154 +721,124 @@ void InspectCastPicks(UIState& s, ImVec2 at, ImVec2 size) {
   }
 }
 
-// One row of the injury list. Ordered worst-first by the caller.
+// WHICH WORN PIECE COVERS WHICH LIMB. The one place health and gear meet: a
+// selected limb lights the slot that is protecting it, and a hovered slot
+// outlines what it protects on the portrait. Indices are the EquipSlotId order
+// from game/equipment.h, the same order the armour columns are laid out in.
 //
-// LAID OUT WITH THE CURSOR, not with hand-computed y offsets. The first
-// version drew both bars and their labels at p.y + a constant, which put two
-// captions and the limb's own name on top of each other the moment any of them
-// was wider than guessed — a whole column of "9% i34/60ct". ImGui already
-// knows how tall a line is; asking it is both shorter and correct at any font.
-// `stainMin` is UIState::stainHudMin, threaded in rather than reached for:
-// this file has no sim header and the row must use the SAME cut-off the HUD
-// and the portrait callout use, or a limb would be listed with no chip on it.
-void InjuryRow(UIState& s, int slot, float stainMin) {
-  const UIState::BodyPartUI& b = s.body[slot];
+// -1 is an honest answer and the common one: the lower arms have no piece in
+// the set (pauldrons do not reach a forearm), and neither does anything below
+// the belt line that boots do not already own.
+int ArmorSlotForLimb(int slot) {
+  switch (slot) {
+    case UIState::kSlotHead:  return 0;  // head
+    case UIState::kSlotTorso: return 1;  // chest
+    case UIState::kSlotHips:  return 6;  // belt
+    case UIState::kSlotArmUL:
+    case UIState::kSlotArmUR: return 4;  // shoulders
+    case UIState::kSlotHandL:
+    case UIState::kSlotHandR: return 5;  // hands
+    case UIState::kSlotLegUL:
+    case UIState::kSlotLegLL:
+    case UIState::kSlotLegUR:
+    case UIState::kSlotLegLR: return 2;  // legs
+    case UIState::kSlotFootL:
+    case UIState::kSlotFootR: return 3;  // boots
+    default: return -1;
+  }
+}
+
+// WHAT THIS PIECE IS STANDING IN FRONT OF. Every limb the hovered armour slot
+// covers, shaded on the portrait in steel. Deliberately NOT in the wound
+// palette and deliberately not flashing: this is an answer to a question you
+// asked with the cursor, not an alarm.
+void CoverHighlight(const UIState& s, ImVec2 at, ImVec2 size, int equipIdx) {
+  if (equipIdx < 0) return;
   ImDrawList* dl = ImGui::GetWindowDrawList();
-  const float kBarX = 190.0f;
-  const float kBarW = 130.0f;
-  const bool selected = s.inspectSelected == slot;
-
-  {
-    ImGui::PushID(5000 + slot);
-    const ImVec2 p = ImGui::GetCursorScreenPos();
-    const float lh = ImGui::GetTextLineHeight();
-    ImGui::InvisibleButton("##lbl", ImVec2(kBarX - 8, lh));
-    if (ImGui::IsItemClicked()) s.inspectSelected = slot;
-    if (selected)
-      dl->AddRectFilled(ImVec2(p.x - 4, p.y - 1), ImVec2(p.x + kBarX - 10, p.y + lh + 1),
-                        Fade(ui::ColGold(), 0.15f));
-    else if (ImGui::IsItemHovered())
-      dl->AddRectFilled(ImVec2(p.x - 4, p.y - 1), ImVec2(p.x + kBarX - 10, p.y + lh + 1),
-                        Fade(ui::ColGold(), 0.08f));
-    ui::ShadowText(dl, p, b.severed ? ui::ColBloodHi() :
-                   (selected ? ui::ColGoldHi() : ui::ColParch()), b.label);
-    ImGui::PopID();
+  dl->PushClipRect(at, ImVec2(at.x + size.x, at.y + size.y), true);
+  struct Pop { ImDrawList* d; ~Pop() { d->PopClipRect(); } } pop{dl};
+  for (int i = 0; i < UIState::kSlotCount; i++) {
+    const UIState::BodyPartUI& b = s.body[i];
+    if (!b.present || b.severed || !b.projValid) continue;
+    if (ArmorSlotForLimb(i) != equipIdx) continue;
+    ImVec2 p0(at.x + b.projMin[0] * size.x, at.y + b.projMin[1] * size.y);
+    ImVec2 p1(at.x + b.projMax[0] * size.x, at.y + b.projMax[1] * size.y);
+    if (!ClipToPortrait(at, size, p0, p1)) continue;
+    if (p1.x - p0.x < 3.0f || p1.y - p0.y < 3.0f) continue;
+    dl->AddRectFilled(p0, p1, Fade(ui::ColSteel(), 0.22f));
+    // A 2 px pixel border rather than AddRect's stroke — see InspectOverlay.
+    const ImU32 e = Fade(ui::ColSteel(), 0.75f);
+    dl->AddRectFilled(p0, ImVec2(p1.x, p0.y + 2), e);
+    dl->AddRectFilled(ImVec2(p0.x, p1.y - 2), p1, e);
+    dl->AddRectFilled(p0, ImVec2(p0.x + 2, p1.y), e);
+    dl->AddRectFilled(ImVec2(p1.x - 2, p0.y), p1, e);
   }
+}
 
-  if (b.severed) {
-    ImGui::SameLine(kBarX);
-    ImGui::PushStyleColor(ImGuiCol_Text,
-                          ImGui::ColorConvertU32ToFloat4(ui::ColBloodHi()));
-    ImGui::TextUnformatted("SEVERED");
-    ImGui::PopStyleColor();
-    ImGui::Dummy(ImVec2(0, 4));
-    return;
-  }
-
-  // TWO BARS, because they are two different measurements and reporting one
-  // would be a lie: hp says how HURT the limb is, intactness says how much of
-  // it is still THERE. A laser can bore a limb hollow at almost full hp, and a
-  // blast can take hp off a limb that has lost no geometry at all.
-  auto bar = [&](float frac, ImU32 fill, const char* caption) {
-    ImGui::Indent(12.0f);
-    ImGui::TextDisabled("%s", caption);
-    ImGui::Unindent(12.0f);
-    ImGui::SameLine(kBarX);
-    const ImVec2 a = ImGui::GetCursorScreenPos();
-    const float h = ImGui::GetTextLineHeight();
-    const ImVec2 p0(a.x, std::floor(a.y + (h - 10.0f) * 0.5f));
-    const ImVec2 p1(p0.x + kBarW, p0.y + 10.0f);
-    ui::ValueBar(dl, p0, p1, frac, fill, false);
-    ImGui::Dummy(ImVec2(kBarW, h));
-  };
-  char cap[48];
-  std::snprintf(cap, sizeof cap, "%.0f / %.0f hp", b.hp, b.hpMax);
-  bar(b.hpFrac, ui::ColBloodHi(), cap);
-  std::snprintf(cap, sizeof cap, "%.0f%% intact", b.voxelFrac * 100.0f);
-  bar(b.voxelFrac, ui::ColSteel(), cap);
-
-  // State chips, in the order they matter to somebody deciding what to do next.
-  //
-  // WRAPPED, not run out in one line. ImGui::SameLine() will happily lay the
-  // next chip past the panel's right edge, where the injury child's clip rect
-  // eats it — which is exactly what a coat chip did the day it was added, on a
-  // limb that was already BLEEDING and BURNING 134 ("BLOOD 2" with the % and
-  // the panel border sliced off). The running x is tracked here rather than
-  // read back off the cursor because the trailing Dummy has already moved the
-  // cursor down a line, so GetCursorPosX() would answer for the wrong row.
-  bool any = false;
-  const float chipL = 12.0f;                                 // the indent
-  const float chipR = ImGui::GetContentRegionMax().x - 4.0f;  // the clip edge
-  float chipX = chipL;
-  auto chip = [&](ImU32 col, const char* fmt, ...) {
-    char buf[64];
-    va_list ap;
-    va_start(ap, fmt);
-    std::vsnprintf(buf, sizeof buf, fmt, ap);
-    va_end(ap);
-    const ImVec2 ts = ImGui::CalcTextSize(buf);
-    const float need = ts.x + 12.0f;  // 4 px of tab either side + a 4 px gap
-    if (!any) {
-      ImGui::Indent(chipL);
-    } else if (chipX + need <= chipR) {
-      ImGui::SameLine();
-    } else {
-      // Fall through onto the fresh line the previous chip's Dummy began.
-      chipX = chipL;
+// THE LIMB THE COLUMN SHOULD OPEN ON: the one in the most trouble. A health
+// view whose detail section opens empty asks the player to go hunting for the
+// thing it exists to tell them about; opening on the worst part means the
+// first thing the column says is the answer. Falls back to the torso (then to
+// whatever is present) on a body with nothing wrong at all.
+int WorstLimb(const UIState& s) {
+  int best = -1, fallback = -1;
+  float bestScore = 1e9f;
+  for (int i = 0; i < UIState::kSlotCount; i++) {
+    const UIState::BodyPartUI& b = s.body[i];
+    if (!b.present) continue;
+    if (fallback < 0 || i == UIState::kSlotTorso) {
+      if (fallback < 0 || fallback != UIState::kSlotTorso) fallback = i;
     }
-    any = true;
-    chipX += need;
-    // A chip: the word in its colour on a dark tab with a coloured underline.
-    const ImVec2 p = ImGui::GetCursorScreenPos();
-    dl->AddRectFilled(ImVec2(p.x - 4, p.y), ImVec2(p.x + ts.x + 4, p.y + ts.y),
-                      Fade(ui::ColInk(), 0.7f));
-    dl->AddRectFilled(ImVec2(p.x - 4, p.y + ts.y - 2),
-                      ImVec2(p.x + ts.x + 4, p.y + ts.y), Fade(col, 0.8f));
-    ImGui::PushStyleColor(ImGuiCol_Text, ImGui::ColorConvertU32ToFloat4(col));
-    ImGui::TextUnformatted(buf);
-    ImGui::PopStyleColor();
-    ImGui::SameLine();
-    ImGui::Dummy(ImVec2(4, 0));
-  };
-  if (b.bleeding) chip(ui::ColBloodHi(), "BLEEDING");
-  if (b.burningVoxels > 0) chip(ui::ColEmber(), "BURNING %u", b.burningVoxels);
-  if (b.charredFrac > 0.02f)
-    chip(ui::ColEmber(), "CHARRED %.0f%%", b.charredFrac * 100.0f);
-  if (any) {
-    ImGui::NewLine();
-    ImGui::Unindent(12.0f);
+    float score = b.severed ? -2.0f : std::min(b.hpFrac, b.voxelFrac);
+    if (b.burningVoxels > 0) score -= 1.0f;
+    if (b.bleeding) score -= 0.5f;
+    if (score < bestScore) { bestScore = score; best = i; }
   }
-  // SURFACE: stains on a separate line with a "surface:" label so they
-  // cannot be misread as damage.
-  if (b.stainFrac >= stainMin && b.stainColor != 0) {
-    char up[sizeof b.stainLabel];
-    size_t k = 0;
-    for (; k + 1 < sizeof up && b.stainLabel[k]; k++)
-      up[k] = (char)std::toupper((unsigned char)b.stainLabel[k]);
-    up[k] = '\0';
-    ImGui::Indent(12.0f);
-    ImGui::PushFont(ui::FontSmall());
-    ImGui::TextDisabled("surface:");
-    ImGui::PopFont();
-    ImGui::SameLine();
-    {
-      char buf[48];
-      std::snprintf(buf, sizeof buf, "%s %.0f%%", k ? up : "COATED",
-                    b.stainFrac * 100.0f);
-      const ImU32 sc = ui::Mix(b.stainColor, IM_COL32_WHITE, 0.35f);
-      const ImVec2 ts = ImGui::CalcTextSize(buf);
-      const ImVec2 p = ImGui::GetCursorScreenPos();
-      dl->AddRectFilled(ImVec2(p.x - 4, p.y), ImVec2(p.x + ts.x + 4, p.y + ts.y),
-                        Fade(ui::ColInk(), 0.7f));
-      dl->AddRectFilled(ImVec2(p.x - 4, p.y + ts.y - 2),
-                        ImVec2(p.x + ts.x + 4, p.y + ts.y), Fade(sc, 0.8f));
-      ImGui::PushStyleColor(ImGuiCol_Text, ImGui::ColorConvertU32ToFloat4(sc));
-      ImGui::TextUnformatted(buf);
-      ImGui::PopStyleColor();
-    }
-    ImGui::Unindent(12.0f);
+  return bestScore < 0.999f && best >= 0 ? best : fallback;
+}
+
+// ONE wall-clock phase for everything urgent on this screen, so the portrait
+// callouts, the triage rows and the status chips pulse together and read as a
+// single alarm rather than as four things blinking at each other.
+float AlarmPulse() {
+  return 0.5f + 0.5f * (float)std::sin(ImGui::GetTime() * 4.5);
+}
+
+// A hero pool bar (health, mana): the recessed track, the burn cap drawn
+// charred off past `cap`, the name tracked into the left end and the numbers
+// at the right. Returns the height it used.
+//
+// FACTORED OUT because both the character column and the vitals column draw
+// one, and a pool whose two drawings disagreed about where the cap line goes
+// would be worse than either.
+float PoolBar(ImDrawList* dl, ImVec2 at, float w, int32_t cur, int32_t max,
+              int32_t cap, ImU32 fill, const char* name, float h = 22.0f,
+              bool compact = false) {
+  const ImVec2 a = at, b(at.x + w, at.y + h);
+  const float f = max > 0 ? std::clamp((float)cur / (float)max, 0.0f, 1.0f) : 0.0f;
+  ui::ValueBar(dl, a, b, f, fill, true);
+  if (max > 0 && cap >= 0 && cap < max) {
+    const float cf = std::clamp((float)cap / (float)max, 0.0f, 1.0f);
+    const float cx = std::floor(a.x + (b.x - a.x) * cf);
+    dl->AddRectFilled(ImVec2(cx, a.y), b, IM_COL32(40, 30, 26, 235));
+    dl->AddLine(ImVec2(cx, a.y), ImVec2(cx, b.y), IM_COL32(120, 60, 40, 255));
   }
-  ImGui::Dummy(ImVec2(0, 6));
+  // A short bar gets the 13 px face: the screen's 26 px display font is taller
+  // than a 16 px track and would hang out of both ends of it. `compact` asks
+  // for the same face on a full-height bar, which is what a 256 px column
+  // needs — "HEALTH" and "1014 / 1273" set in the display face come to 270 px
+  // between them and print straight through each other.
+  const bool tiny = compact || h < 20.0f;
+  if (tiny) ImGui::PushFont(ui::FontSmall());
+  char buf[64];
+  std::snprintf(buf, sizeof buf, "%d / %d", cur < 0 ? 0 : cur, max);
+  const ImVec2 ts = ImGui::CalcTextSize(buf);
+  const float ty = std::floor(a.y + (h - ts.y) * 0.5f);
+  ui::TrackedText(dl, ImVec2(a.x + 9, ty + 1), Fade(ui::ColInk(), 0.9f), name, 2.0f);
+  ui::TrackedText(dl, ImVec2(a.x + 8, ty), ui::ColGoldPale(), name, 2.0f);
+  ui::ShadowText(dl, ImVec2(b.x - ts.x - 8, ty), ui::ColParch(), buf);
+  if (tiny) ImGui::PopFont();
+  return h;
 }
 
 // ---- the arsenal's pieces ----------------------------------------------------
@@ -1685,181 +1686,435 @@ void LootPanel(UIState& s, ImVec2 pos, ImVec2 size, const ui::PanelStyle& st,
   ImGui::End();
 }
 
-// ---- the DETAIL COLUMN for a selected limb ---------------------------------
+// ---- THE VITALS COLUMN ------------------------------------------------------
 //
-// Drawn beside the injury list when a limb is clicked in the portrait or in
-// the injury row. Shows tissue composition, condition and surface state in
-// explicit sections so the player can tell what the limb IS (tissue), what
-// happened TO it (damage) and what is ON it (surface).
-void LimbDetail(const UIState& s, ImVec2 at, ImVec2 size) {
-  if (s.inspectSelected < 0 || s.inspectSelected >= UIState::kSlotCount) return;
-  const UIState::BodyPartUI& b = s.body[s.inspectSelected];
+// The right-hand column of the character panel, live for as long as the health
+// view is on. It is a WHOLE COLUMN and not a footnote under the portrait:
+//
+//   POOLS    health, mana, and how much of this body is still physically here
+//   TRIAGE   everything currently wrong, worst first, every row clickable
+//   THE LIMB the selected part in full — what it is made of, what happened to
+//            it, what is on it, and what is worn over it
+//
+// AND THE GEAR STAYS ON SCREEN BESIDE IT. Health used to be a separate page
+// behind a toggle, so reading "what is hurt" meant losing sight of "what is
+// protecting it" — the one comparison a character screen exists to make. The
+// toggle now only adds this column and the portrait's callouts; it takes
+// nothing away.
+//
+// The old INJURIES list is gone with it. It was a second, worse rendering of
+// what TRIAGE and THE LIMB now say between them: every limb listed whether or
+// not anything was wrong, two bars each, and the detail column repeating all
+// of it the moment you clicked one.
+void VitalsColumn(UIState& s, ImVec2 at, ImVec2 size) {
   ImGui::SetCursorScreenPos(at);
-  ImGui::BeginChild("##limbdetail", size, ImGuiChildFlags_None,
+  ImGui::BeginChild("##vitals", size, ImGuiChildFlags_None,
                     ImGuiWindowFlags_NoBackground);
   ImDrawList* dl = ImGui::GetWindowDrawList();
+  // Taken AFTER BeginChild, so it already carries the child's scroll offset:
+  // everything below is laid out from `base`, which is what lets a column of
+  // absolutely-positioned drawing scroll at all.
   const ImVec2 base = ImGui::GetCursorScreenPos();
-  const float w = ImGui::GetContentRegionAvail().x;
+  const float w = std::max(140.0f, ImGui::GetContentRegionAvail().x);
+  const float pulse = AlarmPulse();
   float y = base.y;
-  const float kBarW = std::min(w - 80, 120.0f);
 
-  // Limb name as a heading.
+  // The small font is this column's body face: it is a 260 px column and the
+  // screen's 26 px display face fits about three words across it.
+  auto small = [&](ImU32 col, ImVec2 p, const char* text) {
+    ImGui::PushFont(ui::FontSmall());
+    ui::ShadowText(dl, p, col, text);
+    ImGui::PopFont();
+  };
+
+  // ======================= POOLS ==============================================
+  y = ui::Subheading(dl, ImVec2(base.x, y), w, "VITALS") + 4;
+  y += PoolBar(dl, ImVec2(base.x, y), w, s.health, s.healthMax, s.healthCap,
+               ui::ColBloodHi(), "HEALTH", 22.0f, true) + 6;
+  y += PoolBar(dl, ImVec2(base.x, y), w, s.mana, s.manaMax, -1,
+               ui::ColMana(), "MANA", 22.0f, true) + 6;
+
+  // WHAT IS STILL THERE. Integrity is live voxels over voxels at spawn, summed
+  // across the body. The spawn count is not mirrored per limb — but voxelFrac
+  // IS that ratio, so the denominator comes back out of it. A limb with no
+  // fraction contributes to neither side rather than dividing by zero, and a
+  // SEVERED limb is counted in its own tally below instead: its spawn size is
+  // not knowable from a part that no longer exists.
+  float liveVox = 0.0f, bornVox = 0.0f;
+  int bleeders = 0, severedN = 0;
+  uint32_t burningVox = 0;
+  for (int i = 0; i < UIState::kSlotCount; i++) {
+    const UIState::BodyPartUI& b = s.body[i];
+    if (!b.present) continue;
+    if (b.severed) { severedN++; continue; }
+    if (b.bleeding) bleeders++;
+    burningVox += b.burningVoxels;
+    if (b.voxelTotal > 0 && b.voxelFrac > 0.01f) {
+      liveVox += (float)b.voxelTotal;
+      bornVox += (float)b.voxelTotal / b.voxelFrac;
+    }
+  }
+  const float integrity = bornVox > 0.0f ? std::clamp(liveVox / bornVox, 0.0f, 1.0f)
+                                         : 1.0f;
   {
-    ImGui::PushStyleColor(ImGuiCol_Text, ImGui::ColorConvertU32ToFloat4(
-                                             ui::ColGoldHi()));
-    ImGui::SetCursorScreenPos(ImVec2(base.x, y));
-    ImGui::TextUnformatted(b.label);
-    ImGui::PopStyleColor();
-    y += ImGui::GetTextLineHeight() + 4;
+    char buf[48];
+    std::snprintf(buf, sizeof buf, "BODY INTACT  %.0f%%", integrity * 100.0f);
+    const ImVec2 a(base.x, y), b2(base.x + w, y + 16);
+    ui::ValueBar(dl, a, b2, integrity, ui::ColSteel(), false);
+    ImGui::PushFont(ui::FontSmall());
+    const ImVec2 ts = ImGui::CalcTextSize(buf);
+    ui::ShadowText(dl, ImVec2(a.x + 8, std::floor(a.y + (16 - ts.y) * 0.5f)),
+                   ui::ColGoldPale(), buf);
+    ImGui::PopFont();
+    y += 16 + 6;
   }
 
-  if (b.severed) {
-    ImGui::SetCursorScreenPos(ImVec2(base.x, y));
-    ImGui::PushStyleColor(ImGuiCol_Text, ImGui::ColorConvertU32ToFloat4(
-                                             ui::ColBloodHi()));
-    ImGui::TextUnformatted("SEVERED");
+  // ---- the status ribbon: every word that changes what you would do next ----
+  {
+    ImGui::PushFont(ui::FontSmall());
+    float cx = base.x, cy = y;
+    float lineH = ImGui::GetTextLineHeight();
+    bool anyChip = false;
+    auto chip = [&](ImU32 col, bool flash, const char* fmt, ...) {
+      char buf[64];
+      va_list ap;
+      va_start(ap, fmt);
+      std::vsnprintf(buf, sizeof buf, fmt, ap);
+      va_end(ap);
+      const ImVec2 ts = ImGui::CalcTextSize(buf);
+      if (anyChip && cx + ts.x + 8 > base.x + w) {
+        cx = base.x;
+        cy += ts.y + 6;
+      }
+      anyChip = true;
+      const ImU32 c = flash ? Fade(col, 0.55f + 0.45f * pulse) : col;
+      dl->AddRectFilled(ImVec2(cx, cy), ImVec2(cx + ts.x + 8, cy + ts.y),
+                        Fade(ui::ColInk(), 0.72f));
+      dl->AddRectFilled(ImVec2(cx, cy + ts.y - 2),
+                        ImVec2(cx + ts.x + 8, cy + ts.y), Fade(c, 0.85f));
+      ui::ShadowText(dl, ImVec2(cx + 4, cy), c, buf);
+      cx += ts.x + 14;
+      lineH = ts.y;
+    };
+    if (!s.playerAlive) chip(ui::ColBloodHi(), true, "DEAD");
+    if (bleeders > 0) chip(ui::ColBloodHi(), true, "BLEEDING x%d", bleeders);
+    if (burningVox > 0) chip(ui::ColEmber(), true, "ON FIRE %u", burningVox);
+    if (severedN > 0) chip(ui::ColBloodHi(), false, "LOST x%d", severedN);
+    if (s.healthCap > 0 && s.healthCap < s.healthMax)
+      chip(ui::ColChar(), false, "BURNT CAP %d", s.healthCap);
+    if (s.stainFrac >= s.stainHudMin && s.stainColor != 0) {
+      char up[sizeof s.stainLabel];
+      size_t k = 0;
+      for (; k + 1 < sizeof up && s.stainLabel[k]; k++)
+        up[k] = (char)std::toupper((unsigned char)s.stainLabel[k]);
+      up[k] = '\0';
+      chip(ui::Mix(s.stainColor, IM_COL32_WHITE, 0.35f), false, "%s %.0f%%",
+           k ? up : "COATED", s.stainFrac * 100.0f);
+    }
+    if (!s.locoState.empty())
+      chip(ui::ColParchDim(), false, "%s", s.locoState.c_str());
+    if (!anyChip) chip(ui::ColParchDim(), false, "steady");
+    ImGui::PopFont();
+    y = cy + lineH + 10;
+  }
+
+  // ======================= TRIAGE =============================================
+  //
+  // WHAT IS WRONG, WORST FIRST, AND NOTHING ELSE. A limb with nothing to
+  // report does not appear — the portrait already says it is there. Each row
+  // is a button: clicking it selects the limb, which lights its callout on the
+  // portrait, lights the piece of armour covering it, and fills the section
+  // below. That is the whole navigation model of this column.
+  y = ui::Subheading(dl, ImVec2(base.x, y), w, "TRIAGE") + 4;
+  {
+    struct Alarm { int slot; int sev; ImU32 col; char text[40]; };
+    Alarm alarms[UIState::kSlotCount * 3];
+    int na = 0;
+    auto push = [&](int slot, int sev, ImU32 col, const char* fmt, ...) {
+      if (na >= (int)(sizeof alarms / sizeof alarms[0])) return;
+      Alarm& a = alarms[na++];
+      a.slot = slot;
+      a.sev = sev;
+      a.col = col;
+      va_list ap;
+      va_start(ap, fmt);
+      std::vsnprintf(a.text, sizeof a.text, fmt, ap);
+      va_end(ap);
+    };
+    for (int i = 0; i < UIState::kSlotCount; i++) {
+      const UIState::BodyPartUI& b = s.body[i];
+      if (!b.present) continue;
+      if (b.severed) { push(i, 0, ui::ColBloodHi(), "SEVERED"); continue; }
+      if (b.burningVoxels > 0)
+        push(i, 1, ui::ColEmber(), "BURNING %u", b.burningVoxels);
+      if (b.bleeding) push(i, 2, ui::ColBloodHi(), "BLEEDING");
+      if (b.hpFrac < 0.35f)
+        push(i, 3, ui::ColBloodHi(), "CRITICAL  %.0f%% hp", b.hpFrac * 100.0f);
+      else if (b.hpFrac < 0.8f)
+        push(i, 5, ui::ColBlood(), "hurt  %.0f%% hp", b.hpFrac * 100.0f);
+      if (b.voxelFrac < 0.6f)
+        push(i, 4, ui::ColSteel(), "HOLLOW  %.0f%% left", b.voxelFrac * 100.0f);
+      if (b.charredFrac > 0.25f)
+        push(i, 6, ui::ColEmber(), "charred  %.0f%%", b.charredFrac * 100.0f);
+    }
+    std::stable_sort(alarms, alarms + na,
+                     [](const Alarm& a, const Alarm& b) { return a.sev < b.sev; });
+    if (na == 0) {
+      small(Fade(ui::ColParchDim(), 0.85f), ImVec2(base.x + 4, y),
+            s.bodyValid ? "Not a scratch." : "No body to inspect.");
+      ImGui::PushFont(ui::FontSmall());
+      y += ImGui::GetTextLineHeight() + 8;
+      ImGui::PopFont();
+    }
+    ImGui::PushFont(ui::FontSmall());
+    const float rowH = ImGui::GetTextLineHeight() + 4;
+    for (int i = 0; i < na; i++) {
+      const Alarm& a = alarms[i];
+      const bool sel = s.inspectSelected == a.slot;
+      ImGui::SetCursorScreenPos(ImVec2(base.x, y));
+      ImGui::PushID(6000 + i);
+      ImGui::InvisibleButton("##alarm", ImVec2(w, rowH));
+      const bool hot = ImGui::IsItemHovered();
+      if (ImGui::IsItemClicked()) s.inspectSelected = a.slot;
+      ImGui::PopID();
+      if (sel || hot)
+        dl->AddRectFilled(ImVec2(base.x, y), ImVec2(base.x + w, y + rowH),
+                          Fade(ui::ColGold(), sel ? 0.16f : 0.08f));
+      // A 3 px severity stripe down the left edge: the column can be read for
+      // "how bad is this body" without reading a word of it.
+      dl->AddRectFilled(ImVec2(base.x, y), ImVec2(base.x + 3, y + rowH),
+                        a.sev <= 2 ? Fade(a.col, 0.55f + 0.45f * pulse)
+                                   : Fade(a.col, 0.75f));
+      ui::ShadowText(dl, ImVec2(base.x + 9, y + 2),
+                     sel ? ui::ColGoldHi() : ui::ColParch(),
+                     s.body[a.slot].label);
+      const ImVec2 ts = ImGui::CalcTextSize(a.text);
+      ui::ShadowText(dl, ImVec2(base.x + w - ts.x - 4, y + 2), a.col, a.text);
+      y += rowH;
+    }
+    ImGui::PopFont();
+    y += 8;
+  }
+
+  // ======================= THE SELECTED LIMB ==================================
+  const bool haveLimb = s.inspectSelected >= 0 &&
+                        s.inspectSelected < UIState::kSlotCount &&
+                        s.body[s.inspectSelected].present;
+  if (!haveLimb) {
+    y = ui::Subheading(dl, ImVec2(base.x, y), w, "A PART") + 4;
+    ImGui::PushFont(ui::FontSmall());
+    ImGui::SetCursorScreenPos(ImVec2(base.x + 4, y));
+    ImGui::PushStyleColor(ImGuiCol_Text,
+                          ImGui::ColorConvertU32ToFloat4(Fade(ui::ColParchDim(), 0.85f)));
+    ImGui::PushTextWrapPos(ImGui::GetCursorPosX() + w - 8);
+    ImGui::TextUnformatted("Click a limb on the portrait, or a line above, to open it: "
+                           "what it is made of, what happened to it, and what you have "
+                           "on over it.");
+    ImGui::PopTextWrapPos();
     ImGui::PopStyleColor();
+    y = ImGui::GetItemRectMax().y + 6;
+    ImGui::PopFont();
+    ImGui::SetCursorScreenPos(base);
+    ImGui::Dummy(ImVec2(w, y - base.y));
     ImGui::EndChild();
     return;
   }
 
-  // ---- TISSUE COMPOSITION ----------------------------------------------------
-  y = ui::Subheading(dl, ImVec2(base.x, y), w, "TISSUE") + 2;
+  const UIState::BodyPartUI& b = s.body[s.inspectSelected];
+  const float kBarW = std::min(w - 120.0f, 120.0f);
 
-  auto tissueBar = [&](const char* name, uint32_t count, uint32_t total,
-                       ImU32 col) {
-    if (count == 0 && total == 0) return;
-    ImGui::PushFont(ui::FontSmall());
-    ImGui::SetCursorScreenPos(ImVec2(base.x + 4, y));
-    ImGui::TextDisabled("%-8s", name);
-    ImGui::SameLine(72);
-    char buf[16];
-    std::snprintf(buf, sizeof buf, "%u", count);
-    ImGui::TextUnformatted(buf);
-    ImGui::SameLine(108);
-    if (total > 0 && kBarW > 20) {
-      const ImVec2 a(base.x + 108, std::floor(y + 2));
-      const ImVec2 b(a.x + kBarW, a.y + 8);
-      const float frac = std::min(1.0f, (float)count / (float)total);
-      dl->AddRectFilled(a, b, Fade(ui::ColInk(), 0.5f));
-      if (frac > 0.001f)
-        dl->AddRectFilled(a, ImVec2(a.x + (b.x - a.x) * frac, b.y), Fade(col, 0.8f));
-      dl->AddRect(a, b, Fade(IM_COL32_WHITE, 0.12f));
-    }
-    ImGui::PopFont();
-    y += 14;
-  };
-  const uint32_t total = b.voxelTotal > 0 ? b.voxelTotal : 1;
-  tissueBar("skin",   b.voxelSkin,   total, IM_COL32(210, 185, 155, 255));
-  tissueBar("flesh",  b.voxelFlesh,  total, IM_COL32(180, 90,  90,  255));
-  tissueBar("muscle", b.voxelMuscle, total, IM_COL32(160, 70,  80,  255));
-  tissueBar("bone",   b.voxelBone,   total, IM_COL32(220, 215, 200, 255));
-  if (b.voxelBrain > 0 || b.voxelBrainMax > 0) {
-    tissueBar("brain", b.voxelBrain, total, IM_COL32(225, 190, 195, 255));
-    if (b.voxelBrainMax > 0 && b.voxelBrain < b.voxelBrainMax) {
-      ImGui::PushFont(ui::FontSmall());
-      ImGui::SetCursorScreenPos(ImVec2(base.x + 8, y));
-      ImGui::PushStyleColor(ImGuiCol_Text, ImGui::ColorConvertU32ToFloat4(
-                                               ui::ColBloodHi()));
-      char miss[48];
-      std::snprintf(miss, sizeof miss, "%u / %u missing",
-                    b.voxelBrainMax - b.voxelBrain, b.voxelBrainMax);
-      ImGui::TextUnformatted(miss);
-      ImGui::PopStyleColor();
-      ImGui::PopFont();
-      y += 14;
-    }
-  }
-  y += 4;
-
-  // ---- CONDITION --------------------------------------------------------------
-  y = ui::Subheading(dl, ImVec2(base.x, y), w, "CONDITION") + 2;
-
-  auto condBar = [&](const char* label, float frac, ImU32 fill) {
-    ImGui::PushFont(ui::FontSmall());
-    ImGui::SetCursorScreenPos(ImVec2(base.x + 4, y));
-    ImGui::TextDisabled("%s", label);
-    ImGui::SameLine(108);
-    if (kBarW > 20) {
-      const ImVec2 a(base.x + 108, std::floor(y + 2));
-      const ImVec2 bv(a.x + kBarW, a.y + 8);
-      ui::ValueBar(dl, a, bv, frac, fill, false);
-    }
-    ImGui::PopFont();
-    y += 14;
-  };
+  // The limb's own header: its name in small caps on a bronze rule, so the
+  // section reads as part of the same column rather than as a popup that
+  // happened to land in it.
   {
-    char hpCap[48];
-    std::snprintf(hpCap, sizeof hpCap, "hp  %.0f / %.0f", b.hp, b.hpMax);
-    condBar(hpCap, b.hpFrac, ui::ColBloodHi());
-  }
-  {
-    char intCap[32];
-    std::snprintf(intCap, sizeof intCap, "intact  %.0f%%", b.voxelFrac * 100.0f);
-    condBar(intCap, b.voxelFrac, ui::ColSteel());
+    char up[40];
+    size_t k = 0;
+    for (; k + 1 < sizeof up && b.label[k]; k++)
+      up[k] = (char)std::toupper((unsigned char)b.label[k]);
+    up[k] = '\0';
+    y = ui::Subheading(dl, ImVec2(base.x, y), w, up) + 4;
   }
 
-  // Active damage states.
-  if (b.bleeding || b.burningVoxels > 0 || b.charredFrac > 0.02f) {
+  if (b.severed) {
     ImGui::PushFont(ui::FontSmall());
-    if (b.bleeding) {
-      ImGui::SetCursorScreenPos(ImVec2(base.x + 8, y));
-      ImGui::PushStyleColor(ImGuiCol_Text, ImGui::ColorConvertU32ToFloat4(
-                                               ui::ColBloodHi()));
-      ImGui::TextUnformatted("BLEEDING");
-      ImGui::PopStyleColor();
-      y += 14;
-    }
-    if (b.burningVoxels > 0) {
-      ImGui::SetCursorScreenPos(ImVec2(base.x + 8, y));
-      ImGui::PushStyleColor(ImGuiCol_Text, ImGui::ColorConvertU32ToFloat4(
-                                               ui::ColEmber()));
-      char buf[32];
-      std::snprintf(buf, sizeof buf, "BURNING %u voxels", b.burningVoxels);
-      ImGui::TextUnformatted(buf);
-      ImGui::PopStyleColor();
-      y += 14;
-    }
-    if (b.charredFrac > 0.02f) {
-      ImGui::SetCursorScreenPos(ImVec2(base.x + 8, y));
-      ImGui::PushStyleColor(ImGuiCol_Text, ImGui::ColorConvertU32ToFloat4(
-                                               ui::ColEmber()));
-      char buf[32];
-      std::snprintf(buf, sizeof buf, "CHARRED %.0f%%", b.charredFrac * 100.0f);
-      ImGui::TextUnformatted(buf);
-      ImGui::PopStyleColor();
-      y += 14;
-    }
+    ui::ShadowText(dl, ImVec2(base.x + 4, y),
+                   Fade(ui::ColBloodHi(), 0.6f + 0.4f * pulse),
+                   "SEVERED - this part is gone.");
+    y += ImGui::GetTextLineHeight() + 6;
     ImGui::PopFont();
-  }
-  y += 4;
-
-  // ---- SURFACE ----------------------------------------------------------------
-  y = ui::Subheading(dl, ImVec2(base.x, y), w, "SURFACE") + 2;
-  ImGui::PushFont(ui::FontSmall());
-  if (b.stainFrac >= s.stainHudMin && b.stainColor != 0) {
-    ImGui::SetCursorScreenPos(ImVec2(base.x + 4, y));
-    ImVec4 sc = ImGui::ColorConvertU32ToFloat4(b.stainColor);
-    sc.w = 1.0f;
-    ImGui::ColorButton("##stc", sc, ImGuiColorEditFlags_NoTooltip |
-                                    ImGuiColorEditFlags_NoPicker,
-                       ImVec2(10, 10));
-    ImGui::SameLine();
-    char buf[48];
-    std::snprintf(buf, sizeof buf, "%s  %.0f%%",
-                  b.stainLabel[0] ? b.stainLabel : "coated",
-                  b.stainFrac * 100.0f);
-    ImGui::TextUnformatted(buf);
-    y += 16;
   } else {
-    ImGui::SetCursorScreenPos(ImVec2(base.x + 4, y));
-    ImGui::TextDisabled("clean");
-    y += 14;
-  }
-  ImGui::PopFont();
+    // ---- TISSUE: what the limb IS right now --------------------------------
+    //
+    // NO PRINTF PADDING ON THE NAME. This read "%-8s" once, which padded
+    // "skin" out with four trailing spaces — and the 13 px pixel face has no
+    // glyph for them, so the atlas's fallback box got drawn four times and
+    // every tissue row grew a little row of hieroglyphs. The column offsets
+    // below already do the aligning; the padding was never load-bearing.
+    auto tissueBar = [&](const char* name, uint32_t count, uint32_t total,
+                         ImU32 col) {
+      if (count == 0 && total == 0) return;
+      ImGui::PushFont(ui::FontSmall());
+      ui::ShadowText(dl, ImVec2(base.x + 4, y), Fade(ui::ColParchDim(), 0.9f), name);
+      char buf[16];
+      std::snprintf(buf, sizeof buf, "%u", count);
+      const ImVec2 ts = ImGui::CalcTextSize(buf);
+      ui::ShadowText(dl, ImVec2(base.x + 104 - ts.x, y), ui::ColParch(), buf);
+      if (total > 0 && kBarW > 20) {
+        const ImVec2 a(base.x + 112, std::floor(y + 3));
+        const ImVec2 b2(a.x + kBarW, a.y + 8);
+        const float frac = std::min(1.0f, (float)count / (float)total);
+        dl->AddRectFilled(a, b2, Fade(ui::ColInk(), 0.5f));
+        if (frac > 0.001f)
+          dl->AddRectFilled(a, ImVec2(a.x + (b2.x - a.x) * frac, b2.y),
+                            Fade(col, 0.85f));
+        dl->AddRect(a, b2, Fade(IM_COL32_WHITE, 0.12f));
+      }
+      y += ImGui::GetTextLineHeight() + 2;
+      ImGui::PopFont();
+    };
+    const uint32_t total = b.voxelTotal > 0 ? b.voxelTotal : 1;
+    tissueBar("skin",   b.voxelSkin,   total, IM_COL32(210, 185, 155, 255));
+    tissueBar("flesh",  b.voxelFlesh,  total, IM_COL32(180, 90,  90,  255));
+    tissueBar("muscle", b.voxelMuscle, total, IM_COL32(160, 70,  80,  255));
+    tissueBar("bone",   b.voxelBone,   total, IM_COL32(220, 215, 200, 255));
+    if (b.voxelBrain > 0 || b.voxelBrainMax > 0) {
+      tissueBar("brain", b.voxelBrain, total, IM_COL32(225, 190, 195, 255));
+      if (b.voxelBrainMax > 0 && b.voxelBrain < b.voxelBrainMax) {
+        char miss[48];
+        std::snprintf(miss, sizeof miss, "%u / %u brain missing",
+                      b.voxelBrainMax - b.voxelBrain, b.voxelBrainMax);
+        ImGui::PushFont(ui::FontSmall());
+        ui::ShadowText(dl, ImVec2(base.x + 12, y), ui::ColBloodHi(), miss);
+        y += ImGui::GetTextLineHeight() + 2;
+        ImGui::PopFont();
+      }
+    }
+    y += 6;
 
-  ImGui::SetCursorScreenPos(ImVec2(base.x, y));
-  ImGui::Dummy(ImVec2(w, 4));
+    // ---- CONDITION: hp and intactness, which are NOT the same number -------
+    auto condBar = [&](const char* label, float frac, ImU32 fill) {
+      ImGui::PushFont(ui::FontSmall());
+      ui::ShadowText(dl, ImVec2(base.x + 4, y), Fade(ui::ColParchDim(), 0.9f), label);
+      if (kBarW > 20) {
+        const ImVec2 a(base.x + 112, std::floor(y + 3));
+        const ImVec2 bv(a.x + kBarW, a.y + 8);
+        ui::ValueBar(dl, a, bv, frac, fill, false);
+      }
+      y += ImGui::GetTextLineHeight() + 2;
+      ImGui::PopFont();
+    };
+    {
+      char cap[48];
+      std::snprintf(cap, sizeof cap, "hp  %.0f / %.0f", b.hp, b.hpMax);
+      condBar(cap, b.hpFrac, ui::ColBloodHi());
+      std::snprintf(cap, sizeof cap, "intact  %.0f%%", b.voxelFrac * 100.0f);
+      condBar(cap, b.voxelFrac, ui::ColSteel());
+    }
+    if (b.bleeding || b.burningVoxels > 0 || b.charredFrac > 0.02f) {
+      ImGui::PushFont(ui::FontSmall());
+      if (b.bleeding) {
+        ui::ShadowText(dl, ImVec2(base.x + 12, y),
+                       Fade(ui::ColBloodHi(), 0.6f + 0.4f * pulse), "BLEEDING");
+        y += ImGui::GetTextLineHeight() + 2;
+      }
+      if (b.burningVoxels > 0) {
+        char buf[40];
+        std::snprintf(buf, sizeof buf, "BURNING %u voxels", b.burningVoxels);
+        ui::ShadowText(dl, ImVec2(base.x + 12, y),
+                       Fade(ui::ColEmber(), 0.6f + 0.4f * pulse), buf);
+        y += ImGui::GetTextLineHeight() + 2;
+      }
+      if (b.charredFrac > 0.02f) {
+        char buf[40];
+        std::snprintf(buf, sizeof buf, "CHARRED %.0f%%", b.charredFrac * 100.0f);
+        ui::ShadowText(dl, ImVec2(base.x + 12, y), ui::ColEmber(), buf);
+        y += ImGui::GetTextLineHeight() + 2;
+      }
+      ImGui::PopFont();
+    }
+    y += 6;
+  }
+
+  // ---- COVER: the piece of gear standing between this limb and the world ---
+  //
+  // The reason the two views are one screen now. The slot itself is lit in the
+  // armour column at the same time, so the sentence and the object agree.
+  {
+    y = ui::Subheading(dl, ImVec2(base.x, y), w, "COVER") + 4;
+    const int eq = ArmorSlotForLimb(s.inspectSelected);
+    ImGui::PushFont(ui::FontSmall());
+    if (eq < 0) {
+      small(Fade(ui::ColParchDim(), 0.8f), ImVec2(base.x + 4, y),
+            "nothing in the set covers this");
+      y += ImGui::GetTextLineHeight() + 2;
+    } else if (eq < (int)s.equipSlots.size() && !s.equipSlots[eq].name.empty()) {
+      const UIState::KitSlotUI& it = s.equipSlots[eq];
+      if (it.dyeSwatch) {
+        dl->AddRectFilled(ImVec2(base.x + 4, y + 3), ImVec2(base.x + 12, y + 11),
+                          it.dyeSwatch);
+        dl->AddRect(ImVec2(base.x + 4, y + 3), ImVec2(base.x + 12, y + 11),
+                    Fade(ui::ColInk(), 0.8f));
+      }
+      ui::ShadowText(dl, ImVec2(base.x + (it.dyeSwatch ? 18.0f : 4.0f), y),
+                     it.ruined ? ui::ColBloodHi() : ui::ColGoldHi(),
+                     it.name.c_str());
+      y += ImGui::GetTextLineHeight() + 2;
+      if (it.wearable) {
+        char cap[40];
+        std::snprintf(cap, sizeof cap, "%s  %.0f%%",
+                      it.ruined ? "RUINED" : "condition", it.condition * 100.0f);
+        ui::ShadowText(dl, ImVec2(base.x + 12, y),
+                       it.ruined ? ui::ColBloodHi() : Fade(ui::ColParchDim(), 0.9f),
+                       cap);
+        const ImVec2 a(base.x + 112, std::floor(y + 3));
+        if (kBarW > 20)
+          ui::ValueBar(dl, a, ImVec2(a.x + kBarW, a.y + 8), it.condition,
+                       it.ruined ? ui::ColBlood() : ui::ColSteel(), false);
+        y += ImGui::GetTextLineHeight() + 2;
+      }
+    } else {
+      small(Fade(ui::ColBloodHi(), 0.85f), ImVec2(base.x + 4, y),
+            "BARE - nothing worn here");
+      y += ImGui::GetTextLineHeight() + 2;
+      if (eq < (int)s.equipDefs.size() && !s.equipDefs[eq].label.empty()) {
+        char cap[64];
+        std::snprintf(cap, sizeof cap, "(%s slot is empty)",
+                      s.equipDefs[eq].label.c_str());
+        small(Fade(ui::ColParchDim(), 0.7f), ImVec2(base.x + 12, y), cap);
+        y += ImGui::GetTextLineHeight() + 2;
+      }
+    }
+    ImGui::PopFont();
+    y += 6;
+  }
+
+  // ---- SURFACE: what is ON it, which is not damage -------------------------
+  {
+    y = ui::Subheading(dl, ImVec2(base.x, y), w, "SURFACE") + 4;
+    ImGui::PushFont(ui::FontSmall());
+    if (b.stainFrac >= s.stainHudMin && b.stainColor != 0) {
+      dl->AddRectFilled(ImVec2(base.x + 4, y + 3), ImVec2(base.x + 12, y + 11),
+                        b.stainColor | IM_COL32(0, 0, 0, 255));
+      dl->AddRect(ImVec2(base.x + 4, y + 3), ImVec2(base.x + 12, y + 11),
+                  Fade(ui::ColInk(), 0.8f));
+      char buf[48];
+      std::snprintf(buf, sizeof buf, "%s  %.0f%%",
+                    b.stainLabel[0] ? b.stainLabel : "coated",
+                    b.stainFrac * 100.0f);
+      ui::ShadowText(dl, ImVec2(base.x + 18, y),
+                     ui::Mix(b.stainColor, IM_COL32_WHITE, 0.35f), buf);
+    } else {
+      ui::ShadowText(dl, ImVec2(base.x + 4, y), Fade(ui::ColParchDim(), 0.8f),
+                     "clean");
+    }
+    y += ImGui::GetTextLineHeight() + 4;
+    ImGui::PopFont();
+  }
+
+  // The child's content extent, so a body with a long triage list scrolls
+  // instead of running off the bottom of the panel.
+  ImGui::SetCursorScreenPos(base);
+  ImGui::Dummy(ImVec2(w, y - base.y));
   ImGui::EndChild();
 }
 
@@ -1881,10 +2136,13 @@ void DrawInventoryScreen(UIState& s) {
       s.portraitW > 0 ? (float)s.portraitW : kPortraitWFallback;
   const float kPortraitH =
       s.portraitH > 0 ? (float)s.portraitH : kPortraitHFallback;
-  const float kDetailW = 260.0f;
-  const bool showDetail = s.inspectMode && s.inspectSelected >= 0 &&
-                          s.inspectSelected < UIState::kSlotCount &&
-                          s.body[s.inspectSelected].present;
+  const float kDetailW = 272.0f;
+  // THE WHOLE COLUMN, for as long as the health view is on — not only once a
+  // limb is picked. The column leads with the body's pools and its triage,
+  // which are worth reading before you have chosen anything, and a panel that
+  // changed width on every limb click would shove the arsenal and the pack
+  // sideways twice a second.
+  const bool showDetail = s.inspectMode;
   const float leftBase = kPad * 2 + kSlot * 2 + kSlotGap * 2 + kPortraitW + 8;
   const float leftW = leftBase + (showDetail ? kDetailW + kColGap : 0.0f);
   const float top = 28.0f;
@@ -1900,14 +2158,23 @@ void DrawInventoryScreen(UIState& s) {
   const float lineH = ImGui::GetTextLineHeight();
   const float packH = kFrame + ui::kHeaderH + 14 + s.bagRows * (kSlot + kSlotGap) + 10 +
                       (lineH + 6) + 2 + kSlot + 12 + kFrame;
-  // The third column holds the grimoire over the pack, ten cells wide (the
-  // eight-column bag fits inside), and exists only when the window has room
-  // for it beside the other two and height for a composer above the pack.
-  const float grimX = midX + arsenalW + kColGap;
-  const float grimWant = kPad * 2 + (kKeyCols - 1) * kCell + kSlot;
-  const float grimRoom = disp.x - 28.0f - grimX;
-  const bool wide = grimRoom >= grimWant && (bottom - top) >= packH + kColGap + 300.0f;
-  const float grimW = std::min(grimRoom, grimWant + 40.0f);
+  // COLUMN ORDER, left to right: character | grimoire over pack | arsenal.
+  //
+  // The PACK is next to the body that wears what is in it, which is the drag
+  // everyone makes and makes constantly — bag to armour slot, corpse to bag —
+  // and it used to be the longest line on the screen, across a whole column of
+  // glyph table. The ARSENAL goes to the far edge: it is a READ surface most
+  // of the time (every word you know, in one table) and the drags that start
+  // in it end one column over in the grimoire, which is still adjacent.
+  //
+  // The grimoire column is ten cells wide (the eight-column bag fits inside);
+  // the third column exists only when the window has room for the arsenal
+  // beside the other two and height for a composer above the pack.
+  const float grimX = midX;
+  const float grimW = kPad * 2 + (kKeyCols - 1) * kCell + kSlot;
+  const float arsX = midX + grimW + kColGap;
+  const float arsRoom = disp.x - 28.0f - arsX;
+  const bool wide = arsRoom >= arsenalW && (bottom - top) >= packH + kColGap + 300.0f;
   const float grimH = bottom - top - packH - kColGap;
 
   const ImGuiWindowFlags kPanelFlags =
@@ -1945,11 +2212,15 @@ void DrawInventoryScreen(UIState& s) {
     ImDrawList* dl = ImGui::GetWindowDrawList();
     const ImVec2 wp = ImGui::GetWindowPos();
     const ImVec2 ws = ImGui::GetWindowSize();
-    float y = PanelChrome(dl, wp, ws, s.inspectMode ? "CONDITION" : "CHARACTER",
-                          nullptr, stChar);
-    // The toggle sits on the header bar, right-aligned.
+    // No right-hand caption on this header: the toggle button already lives at
+    // that end of the bar and a subtitle behind it is a subtitle sliced in
+    // half ("co|health").
+    float y = PanelChrome(dl, wp, ws, "CHARACTER", nullptr, stChar);
+    // The toggle sits on the header bar, right-aligned. It ADDS the health
+    // column and the portrait's callouts; it no longer swaps the panel for a
+    // different page, so the gear never leaves the screen (see VitalsColumn).
     {
-      const char* label = s.inspectMode ? "gear" : "health";
+      const char* label = "health";
       const ImVec2 ts = ImGui::CalcTextSize(label);
       const float bw = std::max(96.0f, ts.x + 24);
       if (ui::Button("##mode",
@@ -1957,15 +2228,15 @@ void DrawInventoryScreen(UIState& s) {
                             wp.y + kFrame + std::floor((ui::kHeaderH - ts.y - 8) * 0.5f)),
                      label, s.inspectMode, bw)) {
         s.inspectMode = !s.inspectMode;
-        s.inspectSelected = -1;
+        s.inspectSelected = s.inspectMode ? WorstLimb(s) : -1;
       }
       if (ImGui::IsItemHovered())
         Tip(s.inspectMode
-                ? "Back to equipment."
-                : "What is actually wrong with this body: per-limb hp, how much of "
-                  "each limb is still THERE, what is on fire, and what came off. The "
-                  "two are different measurements - a laser can bore a limb hollow "
-                  "without hurting it much.");
+                ? "Close the health column. The gear stays either way."
+                : "Open the health column beside your gear: the body's pools, "
+                  "everything currently wrong with it worst-first, and - when you "
+                  "click a limb on the portrait - what that limb is made of, what "
+                  "happened to it, and what you have on over it.");
     }
 
     // The portrait, with a column of slots on each side.
@@ -1974,132 +2245,138 @@ void DrawInventoryScreen(UIState& s) {
     const float colR = portX + kPortraitW + kSlotGap;
     const float portY = y;
 
+    // WHICH ARMOUR SLOT IS THE CURSOR OVER — asked GEOMETRICALLY and asked
+    // BEFORE anything is drawn, because the answer is needed by the portrait,
+    // which is drawn first. The rects below are the same ones the loop uses a
+    // few lines down; there is no way to hover one of them and not the other.
+    const int armourL[4] = {0, 1, 2, 3};   // head, chest, legs, boots
+    const int armourR[4] = {4, 5, 6, 7};   // shoulders, hands, belt, trinket
+    int hoverEquip = -1;
+    {
+      const ImVec2 m = ImGui::GetMousePos();
+      for (int r = 0; r < 4 && hoverEquip < 0; r++) {
+        const float sy = portY + r * (kSlot + kSlotGap);
+        if (m.y < sy || m.y > sy + kSlot) continue;
+        if (m.x >= colL && m.x <= colL + kSlot) hoverEquip = armourL[r];
+        else if (m.x >= colR && m.x <= colR + kSlot) hoverEquip = armourR[r];
+      }
+    }
+
     ImGui::SetCursorScreenPos(ImVec2(portX, portY));
     Portrait(s, ImVec2(portX, portY), ImVec2(kPortraitW, kPortraitH));
     if (s.inspectMode) {
       InspectOverlay(s, ImVec2(portX, portY), ImVec2(kPortraitW, kPortraitH));
       InspectCastPicks(s, ImVec2(portX, portY), ImVec2(kPortraitW, kPortraitH));
     }
+    // A hovered armour slot shades the limbs it is standing in front of. This
+    // is the other half of the COVER section in the health column and the same
+    // fact from the other end: "what does this piece protect" answered by
+    // pointing at the body instead of by a list of part names.
+    if (hoverEquip >= 0 && s.bodyValid)
+      CoverHighlight(s, ImVec2(portX, portY), ImVec2(kPortraitW, kPortraitH),
+                     hoverEquip);
 
-    if (!s.inspectMode) {
-      // Armour columns. Indices are the EquipSlotId order from
-      // game/equipment.h; the labels and refusal reasons come from that same
-      // table through equipDefs, never restated here.
-      const int leftCol[4] = {0, 1, 2, 3};   // head, chest, legs, boots
-      const int rightCol[4] = {4, 5, 6, 7};  // shoulders, hands, belt, trinket
-      for (int r = 0; r < 4; r++) {
-        const float sy = portY + r * (kSlot + kSlotGap);
-        for (int side = 0; side < 2; side++) {
-          const int idx = side ? rightCol[r] : leftCol[r];
-          const UIState::EquipSlotUI& d =
-              idx < (int)s.equipDefs.size() ? s.equipDefs[idx]
-                                            : UIState::EquipSlotUI{};
-          char id[32];
-          std::snprintf(id, sizeof id, "eq%d", idx);
-          ItemSlot(s, id, ImVec2(side ? colR : colL, sy),
-                   SlotOr(s.equipSlots, idx),
-                   KitRef{KitSpace::Equip, idx}, d.icon.c_str(),
-                   d.acceptsAnything, d.why.c_str(), false, &d.accepts);
-        }
-      }
-    }
-    y = portY + kPortraitH + 16;
-
-    if (s.inspectMode) {
-      const float injuryW = showDetail ? (leftBase - kPad * 2) : (ws.x - kPad * 2);
-      y = ui::Subheading(dl, ImVec2(wp.x + kPad, y), injuryW, "INJURIES");
-      y += 4;
-      const float injuryY = y;
-      ImGui::SetCursorScreenPos(ImVec2(wp.x + kPad, y));
-      ImGui::PushClipRect(ImVec2(wp.x + kPad, y),
-                          ImVec2(wp.x + kPad + injuryW, wp.y + ws.y - kPad), true);
-      ImGui::BeginChild("##injuries",
-                        ImVec2(injuryW, wp.y + ws.y - kPad - y - 6),
-                        ImGuiChildFlags_None, ImGuiWindowFlags_NoBackground);
-      int order[UIState::kSlotCount];
-      int n = 0;
-      for (int i = 0; i < UIState::kSlotCount; i++)
-        if (s.body[i].present) order[n++] = i;
-      std::stable_sort(order, order + n, [&](int a, int bb) {
-        auto score = [&](int i) {
-          const UIState::BodyPartUI& p = s.body[i];
-          if (p.severed) return -1.0f;
-          return std::min(p.hpFrac, p.voxelFrac);
-        };
-        return score(a) < score(bb);
-      });
-      bool anyHurt = false;
-      for (int i = 0; i < n; i++) {
-        const UIState::BodyPartUI& bi = s.body[order[i]];
-        const bool hurt = bi.severed || bi.bleeding || bi.burningVoxels > 0 ||
-                          bi.hpFrac < 0.999f || bi.voxelFrac < 0.999f ||
-                          (bi.stainFrac >= s.stainHudMin && bi.stainColor != 0);
-        if (!hurt) continue;
-        anyHurt = true;
-        InjuryRow(s, order[i], s.stainHudMin);
-      }
-      if (!anyHurt) {
-        ImGui::TextDisabled(s.bodyValid ? "Not a scratch."
-                                        : "No body to inspect.");
-      }
-      ImGui::EndChild();
-      ImGui::PopClipRect();
-      if (showDetail) {
-        const float detailX = wp.x + kPad + leftBase - kPad + kColGap;
-        LimbDetail(s, ImVec2(detailX, injuryY),
-                   ImVec2(wp.x + ws.x - kPad - detailX,
-                          wp.y + ws.y - kPad - injuryY));
-      }
-    } else {
-      // Sheath + quick slots: what is on your person but not in your hand.
-      y = ui::Subheading(dl, ImVec2(wp.x + kPad, y), ws.x - kPad * 2,
-                         "ON YOUR PERSON");
-      y += 2;
-      for (int k = 0; k < 5; k++) {
-        const int idx = 8 + k;  // Sheath, Quick0..3
+    // Armour columns. Indices are the EquipSlotId order from game/equipment.h;
+    // the labels and refusal reasons come from that same table through
+    // equipDefs, never restated here.
+    //
+    // ALWAYS DRAWN, in both views. Health was a separate page until now and
+    // opening it took the armour off the screen, which is exactly the moment
+    // you most want to see it.
+    for (int r = 0; r < 4; r++) {
+      const float sy = portY + r * (kSlot + kSlotGap);
+      for (int side = 0; side < 2; side++) {
+        const int idx = side ? armourR[r] : armourL[r];
         const UIState::EquipSlotUI& d =
             idx < (int)s.equipDefs.size() ? s.equipDefs[idx]
                                           : UIState::EquipSlotUI{};
         char id[32];
         std::snprintf(id, sizeof id, "eq%d", idx);
-        ItemSlot(s, id,
-                 ImVec2(wp.x + kPad + k * (kSlot + kSlotGap), y),
-                 SlotOr(s.equipSlots, idx), KitRef{KitSpace::Equip, idx},
-                 d.icon.c_str(), d.acceptsAnything, d.why.c_str(), false,
-                 &d.accepts);
+        // The slot covering the SELECTED limb is lit as selected: the health
+        // column names the piece, and this is the piece.
+        const bool covers = s.inspectMode && s.inspectSelected >= 0 &&
+                            ArmorSlotForLimb(s.inspectSelected) == idx;
+        ItemSlot(s, id, ImVec2(side ? colR : colL, sy),
+                 SlotOr(s.equipSlots, idx),
+                 KitRef{KitSpace::Equip, idx}, d.icon.c_str(),
+                 d.acceptsAnything, d.why.c_str(), covers, &d.accepts);
       }
-      y += kSlot + 18;
+    }
+    y = portY + kPortraitH + 16;
 
+    // Sheath + quick slots: what is on your person but not in your hand.
+    y = ui::Subheading(dl, ImVec2(wp.x + kPad, y), leftBase - kPad * 2,
+                       "ON YOUR PERSON");
+    y += 2;
+    for (int k = 0; k < 5; k++) {
+      const int idx = 8 + k;  // Sheath, Quick0..3
+      const UIState::EquipSlotUI& d =
+          idx < (int)s.equipDefs.size() ? s.equipDefs[idx]
+                                        : UIState::EquipSlotUI{};
+      char id[32];
+      std::snprintf(id, sizeof id, "eq%d", idx);
+      ItemSlot(s, id,
+               ImVec2(wp.x + kPad + k * (kSlot + kSlotGap), y),
+               SlotOr(s.equipSlots, idx), KitRef{KitSpace::Equip, idx},
+               d.icon.c_str(), d.acceptsAnything, d.why.c_str(), false,
+               &d.accepts);
+    }
+    y += kSlot + 18;
+
+    if (showDetail) {
+      // The pools have moved into the health column (see below), so the foot
+      // of this one answers the question the column cannot: how much of this
+      // body is behind metal at all, and what state that metal is in.
+      y = ui::Subheading(dl, ImVec2(wp.x + kPad, y), leftBase - kPad * 2,
+                         "PROTECTION") + 4;
+      {
+        int worn = 0, wornMax = 0;
+        float condSum = 0.0f, condN = 0.0f;
+        for (int idx = 0; idx < 8; idx++) {
+          if (idx >= (int)s.equipDefs.size()) continue;
+          wornMax++;
+          if (idx >= (int)s.equipSlots.size() || s.equipSlots[idx].name.empty())
+            continue;
+          worn++;
+          if (s.equipSlots[idx].wearable) {
+            condSum += s.equipSlots[idx].condition;
+            condN += 1.0f;
+          }
+        }
+        const float barW = leftBase - kPad * 2;
+        char buf[64];
+        y += PoolBar(dl, ImVec2(wp.x + kPad, y), barW, worn, wornMax, -1,
+                     ui::ColSteel(), "WORN", 16.0f) + 4;
+        if (condN > 0.0f) {
+          const float avg = condSum / condN;
+          std::snprintf(buf, sizeof buf, "GEAR  %.0f%%", avg * 100.0f);
+          const ImVec2 a(wp.x + kPad, y);
+          ui::ValueBar(dl, a, ImVec2(a.x + barW, a.y + 16), avg,
+                       avg < 0.35f ? ui::ColBlood() : ui::ColGoldDim(), false);
+          ImGui::PushFont(ui::FontSmall());
+          const ImVec2 ts = ImGui::CalcTextSize(buf);
+          ui::ShadowText(dl, ImVec2(a.x + 8, std::floor(a.y + (16 - ts.y) * 0.5f)),
+                         ui::ColGoldPale(), buf);
+          ImGui::PopFont();
+          y += 20;
+        }
+      }
+      // THE HEALTH COLUMN OWNS THE POOLS while it is open — it leads with
+      // them, and one screen saying "142 / 200" in two places invites the two
+      // to disagree the day one of them is changed. The column runs the FULL
+      // height of the panel, from the top of the portrait to the bottom rule.
+      const float detailX = wp.x + leftBase + kColGap;
+      VitalsColumn(s, ImVec2(detailX, portY),
+                   ImVec2(wp.x + ws.x - kPad - detailX,
+                          wp.y + ws.y - kPad - portY));
+    } else {
       // Health + mana, the same two pools the HUD shows, so the screen and the
       // corner never disagree about how close you are to dead.
       const float barW = ws.x - kPad * 2;
-      // `cap` < max is the burn cap (UIState::healthCap): the span past it is
-      // drawn charred off. -1 = no cap for this pool.
-      auto pool = [&](int32_t cur, int32_t max, ImU32 fill, const char* name,
-                      int32_t cap) {
-        const ImVec2 a(wp.x + kPad, y), b(a.x + barW, y + 22);
-        const float f =
-            max > 0 ? std::clamp((float)cur / (float)max, 0.0f, 1.0f) : 0.0f;
-        ui::ValueBar(dl, a, b, f, fill, true);
-        if (max > 0 && cap >= 0 && cap < max) {
-          const float cf = std::clamp((float)cap / (float)max, 0.0f, 1.0f);
-          const float cx = std::floor(a.x + (b.x - a.x) * cf);
-          dl->AddRectFilled(ImVec2(cx, a.y), b, IM_COL32(40, 30, 26, 235));
-          dl->AddLine(ImVec2(cx, a.y), ImVec2(cx, b.y),
-                      IM_COL32(120, 60, 40, 255));
-        }
-        char buf[64];
-        std::snprintf(buf, sizeof buf, "%d / %d", cur < 0 ? 0 : cur, max);
-        const ImVec2 ts = ImGui::CalcTextSize(buf);
-        const float ty = std::floor(a.y + (22 - ts.y) * 0.5f);
-        ui::TrackedText(dl, ImVec2(a.x + 9, ty + 1), Fade(ui::ColInk(), 0.9f),
-                        name, 2.0f);
-        ui::TrackedText(dl, ImVec2(a.x + 8, ty), ui::ColGoldPale(), name, 2.0f);
-        ui::ShadowText(dl, ImVec2(b.x - ts.x - 8, ty), ui::ColParch(), buf);
-        y += 30;
-      };
-      pool(s.health, s.healthMax, ui::ColBloodHi(), "HEALTH", s.healthCap);
-      pool(s.mana, s.manaMax, ui::ColMana(), "MANA", -1);
+      y += PoolBar(dl, ImVec2(wp.x + kPad, y), barW, s.health, s.healthMax,
+                   s.healthCap, ui::ColBloodHi(), "HEALTH") + 8;
+      y += PoolBar(dl, ImVec2(wp.x + kPad, y), barW, s.mana, s.manaMax, -1,
+                   ui::ColMana(), "MANA") + 8;
       // The locomotion state is the one-line answer to "what is this damage
       // actually costing me", which no bar can give: "crawling" says more
       // about a pair of lost legs than two empty hp bars do.
@@ -2115,18 +2392,19 @@ void DrawInventoryScreen(UIState& s) {
   ImGui::End();
 
   // ==========================================================================
-  // THE RIGHT TWO COLUMNS: arsenal | grimoire over pack (plan §12a, §12b)
+  // THE RIGHT TWO COLUMNS: grimoire over pack | arsenal (plan §12a, §12b)
   // ==========================================================================
   // The ARSENAL is a full column of its own: the twenty bound keys, then every
   // word in the library in a table with one row-band per sort. That table is
   // the drag SOURCE for both of the other panels, and a source you cannot see
   // while you compose is no source — the first version put the grimoire
   // behind a mode toggle on the arsenal, and the grid it needed vanished the
-  // moment the toggle was pressed. The GRIMOIRE sits above the PACK in a third
-  // column, so a page drags onto a key and a glyph drags into a page along one
-  // short horizontal line each. When the window has no room for a third
-  // column the old arrangement returns: the arsenal toggles between its table
-  // and the grimoire, over the pack.
+  // moment the toggle was pressed. The GRIMOIRE sits above the PACK in the
+  // middle column, so a page drags onto a key and a glyph drags into a page
+  // along one short horizontal line each, and a garment drags onto the body
+  // along another. When the window has no room for a third column the old
+  // arrangement returns: the arsenal toggles between its table and the
+  // grimoire, over the pack.
   const float arsenalH = wide ? (bottom - top) : (bottom - top - packH - kColGap);
   ui::PanelStyle stLoot;
   stLoot.darkMix = 0.40f;
@@ -2137,10 +2415,14 @@ void DrawInventoryScreen(UIState& s) {
   // the arsenal's beside it when it is not. Looting is a moment, the arsenal is
   // not going anywhere, and a fourth column would not fit on most screens.
   const bool lootHere = s.lootOpen && !wide;
+  // Wide: the arsenal is the OUTER column. Narrow: it is the only one on the
+  // right, and it takes the middle slot with the pack under it.
+  const float arsenalX = wide ? arsX : midX;
   if (lootHere) {
-    LootPanel(s, ImVec2(midX, top), ImVec2(arsenalW, arsenalH), stLoot, kPanelFlags);
+    LootPanel(s, ImVec2(arsenalX, top), ImVec2(arsenalW, arsenalH), stLoot,
+              kPanelFlags);
   } else {
-  ImGui::SetNextWindowPos(ImVec2(midX, top));
+  ImGui::SetNextWindowPos(ImVec2(arsenalX, top));
   ImGui::SetNextWindowSize(ImVec2(arsenalW, arsenalH));
   ImGui::Begin("##arsenal", nullptr, kPanelFlags);
   {
