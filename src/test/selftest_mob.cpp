@@ -5089,6 +5089,75 @@ Status GateUndead(Ctx& c, std::string& detail) {
   const bool mishmash = wall >= 200 && dryWallFrac >= dryWallMin &&
                         dryWallFrac <= dryWallMax;
 
+  // ---- F: THE EFFECT COMPOSES WITH A BODY THAT IS NOT THE HUMAN ------------
+  //
+  // Everything above is one creature, and a variant of one specific body is
+  // what `zombie` used to be — so none of it can tell whether zombification is
+  // a property of the undead or a property of human.vox. `jujunud_zombie.json`
+  // is three lines (`extends: jujunud`, `effects: ["zombie"]`), and this arm is
+  // the claim those three lines make: the rot, the palette, the behaviour and
+  // the gait arrive, AND jujunud's own derived numbers survive them.
+  //
+  // The second half is the one worth stating twice. An effect that flattened
+  // the body onto the human's proportions would pass every claim above — same
+  // paleness, same holes, same slower walk — while silently putting a 1.675 m
+  // character on a 1.7 m character's rideHeight and clock. So the assertions
+  // are that the effect's numbers are the human zombie's and the BODY's
+  // numbers are jujunud's, in one breath.
+  int ji = -1, jzi = -1;
+  for (int i = 0; i < (int)c.mobs.Defs().size(); i++) {
+    if (c.mobs.Defs()[i].name == "jujunud") ji = i;
+    if (c.mobs.Defs()[i].name == "jujunud_zombie") jzi = i;
+  }
+  bool composes = ji >= 0 && jzi >= 0;
+  std::string composeWhy = composes ? "" : "no jujunud/jujunud_zombie def";
+  float jSpeed = 0.0f, jzSpeed = 0.0f;
+  double jzChroma = 0.0, jChroma = 0.0;
+  float lossJZ = 0.0f;
+  if (composes) {
+    const MobDef& jd = c.mobs.Defs()[ji];
+    const MobDef& jz = c.mobs.Defs()[jzi];
+    jSpeed = jd.speed;
+    jzSpeed = jz.speed;
+    jChroma = meanOf(jd.prefab.artColors, true);
+    jzChroma = meanOf(jz.prefab.artColors, true);
+    // THE EFFECT LANDED...
+    const bool fx = jz.undead && !jz.woundHeals && jz.rot.enabled &&
+                    jz.behavior == "zombie" && jz.chaseClip == "reach" &&
+                    jChroma > 0.0 && jzChroma < jChroma * chromaMax;
+    // `speed` is a SCALE in the effect file, not a number: three quarters of
+    // whatever this body walks at. Against the human zombie's absolute 23.5
+    // this is the difference between a modifier and a copy.
+    const bool scaled = std::abs(jzSpeed - jSpeed * 0.746f) < 0.05f;
+    // ...AND THE BODY IS STILL JUJUNUD. It wears jujunud.vox (not human.vox),
+    // keeps its own rig size, and walks on its own clock.
+    const int jw = jd.skel.FindClip("walk"), jzw = jz.skel.FindClip("walk");
+    const bool sameBody = jz.prefab.size.x == jd.prefab.size.x &&
+                      jz.prefab.size.y == jd.prefab.size.y &&
+                      jz.prefab.size.z == jd.prefab.size.z &&
+                      jz.limbs.size() == jd.limbs.size() &&
+                      jw >= 0 && jzw >= 0 &&
+                      jz.skel.clips[jzw].durationMs ==
+                          jd.skel.clips[jw].durationMs &&
+                      std::abs(jz.skel.gait.rideHeight - jd.skel.gait.rideHeight) < 1e-6f;
+    // ...and it really is bitten, which is the only claim here that needs a
+    // spawn rather than a def read.
+    const uint64_t jzId =
+        c.mobs.Spawn(jzi, {spot.x + 3 * step, spot.y + 1, spot.z});
+    const Mob* mjz = c.mobs.FindMobById(jzId);
+    uint32_t jzAt0 = 0, jzNow = 0, jzSpur = 0;
+    std::vector<uint32_t> jzPer;
+    if (mjz) tally(jzId, mjz, jzPer, jzAt0, jzNow, jzSpur);
+    lossJZ = jzAt0 ? (float)(jzAt0 - jzNow) / (float)jzAt0 : 0.0f;
+    const bool rotted = mjz && c.mobs.IsAlive(jzId) && lossJZ >= (float)lossMin &&
+                        lossJZ <= (float)lossMax;
+    composes = fx && scaled && sameBody && rotted;
+    if (!composes)
+      composeWhy = Format("fx=%d scaled=%d sameBody=%d rotted=%d", fx ? 1 : 0,
+                          scaled ? 1 : 0, sameBody ? 1 : 0, rotted ? 1 : 0);
+  }
+  RecordObserved("undeadJujunudLossFrac", lossJZ);
+
   RecordObserved("undeadLossFrac", lossA);
   RecordObserved("undeadSpurPerLost", spurPerLost);
   RecordObserved("undeadChromaFrac", hChroma > 0 ? zChroma / hChroma : 0.0);
@@ -5100,7 +5169,7 @@ Status GateUndead(Ctx& c, std::string& detail) {
 
   const bool ok = sameArt && overrides && paler && humanWhole && bitten &&
                   hurt && intact && dry && chunky && varies && bloody &&
-                  mishmash;
+                  mishmash && composes;
   detail = Format(
       "art/rig shared %d, overrides %d, palette chroma %.2f -> %.2f luma %.1f "
       "-> %.1f (%d), human whole %u/%u (%d), zombie %u/%u lost %.3f (%.2f..%.2f"
@@ -5108,7 +5177,8 @@ Status GateUndead(Ctx& c, std::string& detail) {
       "(blood lost %.1f vox), spurs/lost %.3f <= %.3f "
       "(%d), varies %d, blood: wound %.3f (>= %.3f and >= %.1fx anatomy "
       "%.3f) stain %.3f (>= %.3f), human wound/stain %u/%u (%d), dry hole "
-      "walls %u/%u = %.3f (%.2f..%.2f, %d)",
+      "walls %u/%u = %.3f (%.2f..%.2f, %d); jujunud_zombie composes %d%s "
+      "(speed %.2f vs jujunud %.2f, chroma %.1f -> %.1f, lost %.3f)",
       sameArt ? 1 : 0, overrides ? 1 : 0, hChroma, zChroma, hLuma, zLuma,
       paler ? 1 : 0, hNow, hAt0, humanWhole ? 1 : 0, aNow, aAt0, lossA, lossMin,
       lossMax, bitten ? 1 : 0, hpH, hpA, hurt ? 1 : 0, intact ? 1 : 0,
@@ -5116,7 +5186,9 @@ Status GateUndead(Ctx& c, std::string& detail) {
       chunky ? 1 : 0, varies ? 1 : 0,
       woundFrac, woundMin, woundOverBase, hWoundFrac, stainFrac, stainMin,
       hWound, hStain, bloody ? 1 : 0, wallClean, wall, dryWallFrac, dryWallMin,
-      dryWallMax, mishmash ? 1 : 0);
+      dryWallMax, mishmash ? 1 : 0, composes ? 1 : 0,
+      composeWhy.empty() ? "" : (" [" + composeWhy + "]").c_str(), jzSpeed,
+      jSpeed, jChroma, jzChroma, lossJZ);
 
   c.debris.Reset();
   c.mobs.Reset();

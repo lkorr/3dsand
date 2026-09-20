@@ -1,57 +1,7 @@
 {
-  "//": "THE WALKING DEAD. A human that is paler, slower, already bitten, and whose cuts do not close. There is no zombie.vox and there should not be one: `extends` pulls in human.json's whole rig (limbs, chains, clips, states, sockets, anatomy) and `model` follows it to human.vox, so this creature keeps tracking the human as the human is edited — including what is under its skin, which is BAKED into the .vox by scripts/anatomize_mob.mjs and would silently diverge in a copy. Everything below is an override; RFC 7396 merge-patch, so an array or a number replaces and an object merges key by key (see the note above LoadMobDefs in src/game/mob.cpp).",
-
+  "//": "THE WALKING DEAD, and by now it is three lines. Everything that makes a zombie a zombie moved to assets/mobs/effects/zombie.json, where it can be applied to any body; what is left here is the one sentence that was ever specific to this def — a zombie of the stock human. The name survives because six gates, the NPC spawn panel and behaviors.json all find this creature by it. There is no zombie.vox and there should not be one: `extends` follows human.json to human.vox, so this creature keeps tracking the human including what is baked under its skin.",
   "extends": "human",
-
-  "//undead": "Two consequences and no more (MobDef::undead): `bleed.woundHeals` defaults to false here, and the `rot` block below is honoured at spawn. Everything else that makes a zombie a zombie is an ordinary sidecar number, on purpose.",
-  "undead": true,
-
-  "//palette": "A FILTER over human.vox's art palette, not a colour table -- restating the colours would be a copy of the art by another route, which is the thing `extends` exists to avoid. Applied before the merged palette dedupes by RGB, so the human is untouched. Chroma down to a bit under half, a touch lighter, and a fifth of the way toward a sickly grey-green.",
-  "palette": {
-    "saturation": 0.45,
-    "brightness": 1.05,
-    "tint": "#B9C3AE",
-    "tintAmount": 0.18
-  },
-
-  "//rot": "WHAT IT ARRIVED MISSING, AND HOW OLD EACH HOLE IS. A handful of bites per limb, each a correlated-noise blob so the loss comes off in groups rather than as speckle, rolled per (mob, limb) so no two are alike. Radii are FRACTIONS of each limb's own extent, so a hand and a torso read the same. THE BITES ARE DRAWN GENEROUSLY AND THEN FITTED TO `maxLoss`, which is what makes maxLoss the knob to turn: it is the ceiling on one limb's volume, enforced by shrinking every bite by a common factor rather than by dropping any (a bite abandoned part-way leaves a lopsided hole, and the total would depend on the order the draws came out). Each bite then rolls its OWN wetness (dryFraction + wet), which is what makes the body a mishmash of old dry holes and fresher bloody ones rather than a creature with one blood level -- see the notes on those two fields.",
-  "rot": {
-    "//bites": "0..5, mean 2.5 -- raised from 0..4 (mean 2.0) on 2026-09-15, +25% holes, TO PAY FOR THE BLOOD THAT CAME OFF. Half the holes are now dry (see dryFraction), so the same body read as less damaged than it did when every hole was bloody; more holes is the owner's own compensation for it, and it is the right one, because what was removed was the BLOOD and not the damage. 0 stays in the range on purpose, so roughly a sixth of the limbs are untouched and the damage reads as random rather than as a uniform coating.",
-    "bites": [0, 5],
-    "radius": [0.35, 0.62],
-    "//maxLoss": "0.18 -> 0.234 (+30%) with the bite count, and for the same reason. It has to move WITH the count: the bites are drawn generously and then fitted to this budget, so raising the count alone would have bought 25% more holes each 20% smaller and left the body looking exactly as chewed as before. Still far under Mob::kLimbCollapseFraction, which severs at 0.25 REMAINING -- so rot is never what takes a part off at spawn. Vital limbs (head, torso) get vitalScale on both the radius and the budget: a chunk out of the skull is the look, losing it before the first step is a corpse that never walked.",
-    "maxLoss": 0.234,
-    "blob": 3.0,
-    "vitalScale": 0.55,
-    "//stainScale": "HOW BLOODY THE HOLE IS. A multiple of gore.craterStainRim -- how far past the removed cells the wound soak reaches -- so retuning blood globally still reaches the undead. Above 1 because these wounds are OLD: one that has been open a while has bled around itself, where a fresh blade's kerf has not. It buys BOTH halves of what a wound looks like, which are different mechanisms: the REWRITE turns a mottled fraction of the exposed tissue into the creature's wound material (the blood voxels underneath), and the SMEAR lays a stain over everything the hole exposed including bone, which the rewrite refuses on purpose (the blood staining, and what stops a bite through the skull reading as clean bone). 0 would be a dry, bloodless rot -- for a husk or a bone creature that never had blood in it.",
-    "stainScale": 2.0,
-
-    "//dryFraction": "...AND HOW MANY OF THE HOLES ARE BLOODY AT ALL. Wetness is rolled PER BITE, not per creature and not per limb: staining the whole limb in one pass gave every hole on a body the same amount of blood, which reads as uniform however right any single hole looks. Half the bites now roll dry and take NO soak -- the hole is skin, flesh, muscle and bone as the anatomy baked them, which is the decayed open wound -- and the other half ramp across `wet` from a trace to a fresh one, so the bloody half is itself a gradient rather than a second uniform. 1 is the bloodless rot stainScale 0 also gives; 0 is the every-hole-bleeds behaviour this replaced (2026-09-15).",
-    "dryFraction": 0.5,
-    "//wet": "The spectrum a bleeding bite's wetness is drawn from, ramping linearly over the non-dry half of the roll. Both halves of the soak thin together with it -- the fraction of tissue rewritten to blood, the tint over the hole, and the floor that shows bone bloodied -- while the REACH comes in as its square root, i.e. more slowly, because a smear that fades to nothing within one cell is invisible at this resolution: a trace of blood has to stay narrow rather than stay faint everywhere. 0.12 is the minute-amount end and is floored at 0.07 by the loader, below which the smear rounds to nothing and the bite may as well have rolled dry.",
-    "wet": [0.12, 1.0]
-  },
-
-  "//bleed": "Merged over human's block, so `material` and `perDamage` are inherited. woundHeals is stated rather than left to the `undead` default because THIS is the behaviour the owner asked for by name: a cut goes on rotting outward until the part drops off, which is what every body did before 2026-09-14 and what looked right on the undead and wrong on everything else.",
-  "bleed": {
-    "woundHeals": false
-  },
-
-  "//bite": "WHAT ITS TEETH CARRY (MobDef::bite, docs/PLAN_impact_unarmed.md §6). The jaws themselves are the HUMAN'S -- `extends` pulls human.json's whole `natural` array in untouched, and a merge-patch array REPLACES, so restating it here to change one thing would be a copy of the anatomy by another route. What makes this bite different is that THIS CREATURE is rotten, not that its teeth are a different shape: `infect` is the material the tear rewrites exposed FLESH to (armour in the way means no rewrite -- that is the whole reason the struck slot is classified before anything is applied), and `stain` is the liquid whose stain gets smeared over the hole. Both by name, resolved at load like `bleed.material`, because a material id is its row number in materials.json and renumbers the moment somebody inserts one. A human bite has no block here and so just tears.",
-  "bite": { "infect": "rotflesh", "stain": "ichor" },
-
-  "//behavior": "THE WALKING DEAD FIGHT LIKE THE DEAD (assets/mobs/behaviors.json `zombie`). Slower cadence, a reckless band it never backs out of, faction monster, and an attack list that is all natural weapons -- a lunging bite, a standing bite and three punches -- so a zombie with nothing in its hands is as dangerous as one that found a sword. It keeps `reach` 9 for the punches; the lunge states its own 22 and MobSystem::AttackReachOf is what lets the AI stand off at the longer of the two without the profile having to choose.",
-  "behavior": "zombie",
-
-  "//chaseClip": "ARMS OUT WHEN IT IS COMING FOR YOU (assets/anims/reach.json, MobDef::chaseClip). An additive hold on the shoulders, elbows and wrists, weight-ramped on whenever the brain has a target and off for the duration of a strike, so the walk still swings underneath it and a punch is still the punch that was authored. It is named here rather than switched on by `undead` because it is an ANIMATION, not a consequence of being dead: anything else that should stalk in a held pose names its own clip.",
-  "chaseClip": "reach",
-
-  "//speed": "31.5 -> 23.5 world voxels/sec. The gait cadence comes down with it (8 -> 6.4) so the STRIDE shortens a little rather than the legs spinning faster to cover less ground -- stride length is speed/cadence, 3.94 for a human and 3.67 here.",
-  "speed": 23.5,
-  "gait": {
-    "cadence": 6.4,
-    "stepHeight": 0.06,
-    "leadTime": 0.14,
-    "stepDuration": 0.14
-  }
+  "effects": [
+    "zombie"
+  ]
 }
