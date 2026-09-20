@@ -32,6 +32,7 @@
 #include "game/worlditems.h"
 #include "game/corpses.h"
 #include "game/dye.h"
+#include "game/grab.h"
 #include "game/item.h"
 #include "game/melee.h"
 #include "game/mob.h"
@@ -5734,8 +5735,9 @@ int main(int argc, char** argv) {
   float lookSensNow = 1.0f;
 
   KeyEdge eP, eN, eV, eF1, eF3, eF4, eF5, eF6, eF7, eF9, eF10, eR, eEsc, eLBracket, eRBracket, eJump,
-      eG, eX, eB, eT, eO, eM, eK, eTab, eC, eH, eZ, eBack, eDel, eEq, eU, eL, eI, eQ,
-      eE;
+      eG, eX, eB, eT, eO, eM, eK, eTab, eC, eH, eZ, eBack, eDel, eEq, eU, eL, eI, eQ;
+  // (E has no KeyEdge: it is a hold-aware binding now — see the tap/hold
+  // block by `takeE` — and an edge tracker would only be half of it.)
   KeyEdge eGlyph[kGlyphSlots];
   bool prevMouseL = false;
   bool prevMouseR = false;
@@ -5752,6 +5754,17 @@ int main(int argc, char** argv) {
   uint64_t lookBody = 0;
   uint64_t lootCorpse = 0;
   bool lootOpenedScreen = false;
+  // ---- the physics grab (game/grab.h) -------------------------------------
+  // E IS TWO BINDINGS ON ONE KEY. Tapped it is the pickup/loot it has always
+  // been; held past player.grabHoldTime it lifts whatever the reach ray is on
+  // and carries it. That works only because the tap now fires on RELEASE and
+  // only when the hold never latched — `eHeld` is how long the key has been
+  // down, `eGrabbed` remembers that this press was spent on a grab (or on
+  // dropping one) so letting go does not also pick something up.
+  GrabHold grab;
+  float eHeld = 0.0f;
+  bool eGrabbed = false;
+  bool ePrevDown = false;
   std::vector<uint64_t> lookIgnore;   // the avatar's own limbs, per frame
   // ...and the same list for the STRIKE aim ray (the melee tick's, below).
   // Its own vector rather than a share of `lookIgnore`: that one is filled in
@@ -6794,8 +6807,37 @@ int main(int argc, char** argv) {
         ui.lookPrompt = c->gear.empty() ? c->def + "  -  nothing left on it"
                                         : "E  loot " + c->def;
       }
+      // ...and the second half of the same prompt: anything the grab would
+      // accept says so, whether or not it is also an item. The prompt is how
+      // the player finds out the key does two things at all.
+      if (CurrentTuning().player.grabHoldTime > 0.0f) {
+        if (const uint64_t g = GrabHold::Grabbable(debris, lookBody)) {
+          const float kg = phys.BodyMass(g);
+          const float cap = CurrentTuning().player.grabMaxMass;
+          char buf[96];
+          if (cap > 0.0f && kg > cap)
+            std::snprintf(buf, sizeof buf, "too heavy to lift  (%.0f kg)", kg);
+          else
+            std::snprintf(buf, sizeof buf, "hold E  move  (%.0f kg)", kg);
+          if (!ui.lookPrompt.empty()) ui.lookPrompt += "   -   ";
+          ui.lookPrompt += buf;
+        }
+      }
     }
-    if (captured && eE.Pressed(key(GLFW_KEY_E))) {
+    // While something is held the prompt is what is IN YOUR HANDS, not what
+    // is behind it: the reach ray is still running (it has to, for the frame
+    // after you let go) but the weight you are carrying is the useful readout.
+    if (grab.Active()) {
+      char buf[96];
+      std::snprintf(buf, sizeof buf, "release E  -  carrying %.0f kg",
+                    grab.MassKg());
+      ui.lookPrompt = buf;
+    }
+    // WHAT A TAP OF E DOES — unchanged from when E was a plain press binding,
+    // but now a lambda, because the key grew a second meaning (the hold-to-
+    // drag block below) and the tap has to fire on the key-UP of a press that
+    // was not spent grabbing.
+    auto takeE = [&]() {
       const uint64_t hit = lookBody;
       const WorldItem* w = hit ? ground.Find(hit) : nullptr;
       const CorpseReport* corpse = w ? nullptr : corpses.FindByBody(hit);
@@ -6836,6 +6878,52 @@ int main(int argc, char** argv) {
         }
         ui.kitMessageAge = 0.0f;
       }
+    };
+    // ---- E: TAP TO TAKE, HOLD TO DRAG (game/grab.h) ------------------------
+    //
+    // The ORDER here is the whole design. `eHeld` accumulates while the key is
+    // down; the grab latches mid-hold; the TAP fires on release and only if
+    // the hold never latched. A press spent on a grab (or on dropping one) is
+    // marked `eGrabbed`, so letting go of a carried crate does not also pocket
+    // whatever has drifted under the crosshair.
+    //
+    // A press while already carrying is a DROP, and it is taken on the PRESS
+    // rather than the release: waiting for the key-up would hold the thing
+    // through the whole press and read as a stuck grab.
+    //
+    // Losing the mouse (Esc, the character screen) drops what is carried
+    // rather than freezing it in mid-air — the key-up that would have released
+    // it is never going to arrive.
+    {
+      const Tuning::Player& tp = CurrentTuning().player;
+      const bool eDown = captured && key(GLFW_KEY_E);
+      if (eDown && !ePrevDown) {
+        eHeld = 0.0f;
+        eGrabbed = false;
+      }
+      if (eDown) eHeld += dt;
+      if (!captured && grab.Active()) grab.Release(phys);
+      // `> 0` and not `>= 0`: at a hold time of zero the grab would latch on
+      // the first frame the key is down and the TAP could never fire, so zero
+      // is the off switch (tuning.h says so) rather than a hair trigger.
+      if (eDown && !eGrabbed && tp.grabHoldTime > 0.0f &&
+          eHeld >= tp.grabHoldTime) {
+        if (grab.Active()) {
+          grab.Release(phys);
+          eGrabbed = true;
+        } else if (const uint64_t g = GrabHold::Grabbable(debris, lookBody)) {
+          if (grab.Begin(phys, g, tp, player.EyePos())) {
+            eGrabbed = true;
+          } else if (grab.RefusedTooHeavy()) {
+            ui.kitMessage = "too heavy to lift";
+            ui.kitMessageAge = 0.0f;
+            eGrabbed = true;  // the refusal IS the answer; do not also take it
+          }
+        }
+      }
+      if (!eDown && ePrevDown && !eGrabbed && captured) takeE();
+      if (!eDown) eHeld = 0.0f;
+      ePrevDown = eDown;
     }
     if (captured && eTab.Pressed(key(GLFW_KEY_TAB))) {
       ui.tool = (ui.tool + 1) % UIState::kToolCount;
@@ -7479,6 +7567,15 @@ int main(int argc, char** argv) {
       player.speedScale = couple ? loco.speedScale : 1.0f;
       player.jumpScale = couple ? loco.jumpScale : 1.0f;
       player.canJump = couple ? loco.canJump : true;
+      // ...and what you are DRAGGING multiplies the same scale (game/grab.h):
+      // a light crate costs nothing, a corpse walks you at half pace, and the
+      // heaviest thing the grab will accept is close to the tuned floor. It
+      // stacks with the injury scale on purpose — a one-legged man carrying an
+      // anvil is slower than either.
+      //
+      // Fly mode is exempt for the same reason the injuries are: the debug
+      // camera should not be encumbered.
+      if (!player.fly) player.speedScale *= grab.SpeedScale(CurrentTuning().player);
     }
     // ---- component 9: impact ripples -------------------------------------
     // The event source, and it is a RISING EDGE rather than a per-frame test:
@@ -9934,6 +10031,20 @@ int main(int argc, char** argv) {
         WorldEditLayer().Drain(world, cellOps,
                                kMaxCellOpsPerTick - (uint32_t)cellOps.size());
       phys.MovePlayerBody(playerBody, player.pos, kTickDt);
+      // ---- the physics grab's servo (game/grab.h) -------------------------
+      // HERE, on the tick, and immediately before the Step it is setting up:
+      // it writes a VELOCITY, which is only meaningful for the step that then
+      // integrates it. Per-frame would write two or three velocities for one
+      // step at 100 fps and make how hard you can drag a crate depend on the
+      // frame rate.
+      //
+      // The carry point is the player's own eye and the CAMERA's forward — the
+      // same pair the reach ray uses, so a thing picked up under the crosshair
+      // stays under the crosshair. Nothing here can reach the hashed grid: it
+      // sets rigid-body velocities, and bodies only re-enter the world through
+      // the op stream.
+      grab.Tick(phys, debris, CurrentTuning().player, player.EyePos(),
+                cam.Forward(), kTickDt);
       // WARDS, AT THE SPLICE (DESIGN.md §8): a live filter refuses ops of its
       // word's kind within its radius, whoever produced them — the brush, a
       // mob, a spell. The op stream, never the CA: acid already flowing still

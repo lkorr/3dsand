@@ -223,6 +223,21 @@ class DebrisSystem {
   bool BodyLatticeOf(uint64_t handle, std::vector<PrefabVoxel>& out,
                      uint32_t& outScale) const;
 
+  // IS THIS BODY ONE OF MINE? The ownership question, asked positively.
+  //
+  // A Jolt handle off a ray cast says nothing about who is driving it: a
+  // living creature's limbs are MobSystem's and are posed kinematically every
+  // tick, while everything here is free matter. The physics grab
+  // (game/grab.h) is the caller — it must refuse a limb that still belongs to
+  // somebody — and a handle that fails this may also simply be DEAD, since
+  // damage REPLACES a body's handle (see BodyHandle above).
+  bool HasBody(uint64_t handle) const {
+    if (!handle) return false;
+    for (const Body& b : bodies_)
+      if (b.handle == handle) return true;
+    return false;
+  }
+
   // Per-material density, as every body-creating call here already takes it.
   // Exposed so a caller that builds a body and hands it straight over (a
   // dropped item — game/worlditems.h) uses the SAME table this system does,

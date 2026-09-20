@@ -228,6 +228,48 @@ struct Tuning {
     // than teleported so a two-voxel lift is a glide, not a pop; the climb is
     // banked into the same view offset a step-up uses.
     float unstickSpeed = 3.0f;
+    // ---- the physics grab (game/grab.h) ----
+    // Hold E on a loose rigid body and it comes off the floor and rides in
+    // front of the face until you let go. Tap E is unchanged (pick up / loot),
+    // so these two live on the same key: the pickup fires on RELEASE, and only
+    // when the hold never latched.
+    //
+    // How long E must be down before the grab takes over. Long enough that a
+    // deliberate tap never lifts anything, short enough that holding the key
+    // is not a chore. 0 disables the physics grab entirely (E stays a tap).
+    float grabHoldTime = 0.22f;
+    // Farthest (metres) a body can ride from the eye. A grab KEEPS the
+    // distance the thing was already at, clamped to this, so the carry range
+    // is a ceiling rather than a snap target — see GrabHold::Begin.
+    float grabDistance = 2.0f;
+    // WEIGHT, in three numbers. Anything at or under `grabFreeMass` is carried
+    // as if it weighed nothing; past that both the player's speed and the
+    // speed the body can follow the crosshair fall off as
+    // 1/(1 + excess/grabSlowMass) — half at free+slow, a third at free+2*slow.
+    // Nothing above `grabMaxMass` can be picked up at all (0 = no ceiling).
+    // One curve for both so a thing that walks you at half speed is also the
+    // thing that swings a beat behind where you are looking.
+    float grabFreeMass = 12.0f;   // kg
+    float grabSlowMass = 45.0f;   // kg of excess that halves you
+    float grabMaxMass = 400.0f;   // kg
+    // Floor under the carry speed penalty. Being unable to move while holding
+    // something the game let you pick up is a softlock, not a weight.
+    float grabMinSpeedScale = 0.30f;
+    // Servo gain (per second) and its speed cap (m/s, before the weight curve
+    // scales it). Gain decides how tightly the body tracks the carry point;
+    // the cap is what turns mass into lag. Very high gain with a low cap is a
+    // thing that snaps to the crosshair then crawls; the defaults are a
+    // followed-with-effort feel.
+    float grabStiffness = 9.0f;
+    float grabCarrySpeed = 9.0f;
+    // How far the body may fall behind the carry point before the grab lets
+    // go (metres). This is what drops a crate caught on a doorframe instead of
+    // dragging it through the frame on the next servo step.
+    float grabBreakDistance = 2.5f;
+    // Per-tick multiplier on the held body's spin. 1 keeps whatever tumble it
+    // had (it windmills, since nothing it touches can slow it while the servo
+    // owns its linear velocity); 0 welds it to one orientation.
+    float grabSpinDamp = 0.80f;
   } player;
 
   // ---- camera ----

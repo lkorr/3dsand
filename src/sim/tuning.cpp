@@ -471,6 +471,29 @@ bool LoadTuning(const std::string& path, Tuning& out) {
     ReadF(*g, "viewSmoothHalflife", p.viewSmoothHalflife, out, at);
     ReadF(*g, "unstickMaxDepth", p.unstickMaxDepth, out, at);
     ReadF(*g, "unstickSpeed", p.unstickSpeed, out, at);
+    ReadF(*g, "grabHoldTime", p.grabHoldTime, out, at);
+    ReadF(*g, "grabDistance", p.grabDistance, out, at);
+    ReadF(*g, "grabFreeMass", p.grabFreeMass, out, at);
+    ReadF(*g, "grabSlowMass", p.grabSlowMass, out, at);
+    ReadF(*g, "grabMaxMass", p.grabMaxMass, out, at);
+    ReadF(*g, "grabMinSpeedScale", p.grabMinSpeedScale, out, at);
+    ReadF(*g, "grabStiffness", p.grabStiffness, out, at);
+    ReadF(*g, "grabCarrySpeed", p.grabCarrySpeed, out, at);
+    ReadF(*g, "grabBreakDistance", p.grabBreakDistance, out, at);
+    ReadF(*g, "grabSpinDamp", p.grabSpinDamp, out, at);
+    // The grab's own clamps. `grabSlowMass` is a divisor (GrabHold::Weight)
+    // and `grabMinSpeedScale` is the floor that keeps a carry from becoming a
+    // standstill; both at zero is a division by zero and a softlock
+    // respectively, and neither is a value anyone means to author.
+    if (p.grabSlowMass < 0.1f) {
+      out.warnings.push_back(at + ".grabSlowMass < 0.1, clamped");
+      p.grabSlowMass = 0.1f;
+    }
+    if (p.grabMinSpeedScale < 0.01f) {
+      out.warnings.push_back(at + ".grabMinSpeedScale < 0.01, clamped");
+      p.grabMinSpeedScale = 0.01f;
+    }
+    p.grabSpinDamp = std::clamp(p.grabSpinDamp, 0.0f, 1.0f);
   }
 
   if (const json* g = Find(j, "camera")) {
