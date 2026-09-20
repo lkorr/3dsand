@@ -5033,7 +5033,7 @@ two ticks a level, a value an author can set -- it falls to 62 in 47 ticks; a
 direct deposit on a stone cell of the room reads blood's slot at amount 5 and
 the cell is still stone.
 
-### A creature is a variant of another creature (2026-09-15; sidecar `extends`/`model`/`palette`, `MobDef::undead`, `MobRotDef`, `Mob::RotAtSpawn`, gate `undead`)
+### A creature is a variant of another creature (2026-09-15, inheritance 2026-09-20; `src/game/sidecar.*` + `assets/editor/sidecar.js`, sidecar `extends`/`model`/`effects`/`palette`, `assets/mobs/effects/`, `MobDef::undead`, `MobRotDef`, `Mob::RotAtSpawn`, gates `sidecar-resolve` + `undead`)
 
 A zombie is a human who walks slower, is paler, does not heal, and arrives
 already bitten. Four differences, none of them geometry — and the first design
@@ -5057,19 +5057,76 @@ So a def is now named for its SIDECAR, and the sidecar says what it wears:
 | `"model": "<stem>"` | use `<stem>.vox` instead of my own |
 | `"extends": "<stem>"` | ...and start from `<stem>.json`'s contents |
 
-`extends` implies `model`, and is resolved by RFC 7396 merge-patch: objects
-merge key by key, an array or scalar REPLACES wholesale, and an explicit `null`
-deletes. That is what a rig override actually wants — `"speed": 22` replaces a
-number, `"limbs": [...]` replaces the whole list rather than merging fifteen
-entries positionally, and `"clips": {"walk": {"durationMs": 900}}` reaches one
-field of one clip without restating its tracks. Depth-bounded at 8 (the bound is
-the diagnostic; a cycle and an eight-deep chain are the same content mistake).
-A `.json` with neither key and no `.vox` of its own is **not a mob** and is
-passed over in silence — that is what `attack_styles.json` and `behaviors.json`
-are, and keying on the field rather than on a filename blocklist means the next
-shared table in that directory needs no code change.
+`extends` implies `model`. A `.json` with neither key and no `.vox` of its own
+is **not a mob** and is passed over in silence — that is what
+`attack_styles.json` and `behaviors.json` are, and keying on the field rather
+than on a filename blocklist means the next shared table in that directory
+needs no code change. A file that HAS its own `.vox` keeps it: the pairing
+happens before `model` is read, which is exactly the shape a generated
+character wants (inherit the rig, keep the body) and is now said out loud in
+the log when a `model` key is thereby ignored.
 
-`assets/mobs/zombie.json` is 30 lines and there is no `zombie.vox`.
+**The merge is three rules, and they live in `src/game/sidecar.cpp` with a
+line-for-line mirror in `assets/editor/sidecar.js`** (the Models tab, the
+Characters page, `gen_mobs.mjs` and `test_mobgen.mjs` all resolve through the
+JS; `--gate sidecar-resolve` dumps what the engine resolved and
+`test_mobgen.mjs` section N diffs the two, which is what keeps them one
+implementation).
+
+1. **RFC 7396 merge-patch.** Objects merge key by key, a scalar or array
+   REPLACES wholesale, an explicit `null` deletes.
+2. **Named-array merge.** An array whose elements ALL carry a string `name`
+   merges BY NAME instead: a child element patches the base element of the same
+   name, base order is preserved, unmatched names append. This is what lets a
+   character say `"limbs": [{"name": "legL.L", "hp": 50}]` instead of restating
+   fifteen entries — the difference between inheriting a rig and copying one by
+   a slower route. `mask`, `groups`, `parts` and every coordinate triple have
+   unnamed elements and keep rule 1, so everything that is a VALUE still
+   replaces. Order preservation is load-bearing rather than tidy:
+   `TopoSortLimbs`' output indexes the save file's positional limb records, so
+   a merge that reordered limbs would misplace every saved mob's damage.
+3. **Clip retime.** A clip patch carrying `durationMs` and NO `tracks` scales
+   every inherited key time by new/old. Without it the two-line override a thin
+   character wants — `{"clips": {"walk": {"durationMs": 638}}}` — changes the
+   clock and leaves the keys where the base put them, which is a walk cycle
+   that ends in the middle of its own stride.
+
+Depth-bounded at 8 (the bound is the diagnostic; a cycle and an eight-deep
+chain are the same content mistake).
+
+**An EFFECT is a modifier you apply to a body, not a body.** `assets/mobs/
+effects/<name>.json` is `{patch, scale}`, applied after the `extends` chain
+resolves and so to whatever creature it lands on; a sidecar names its effects
+in `"effects": [...]`, which accumulates down an `extends` chain (a creature
+that extends a zombie is a zombie) and is cleared by an explicit `null`.
+
+`patch` is the same three-rule merge. `scale` multiplies a numeric leaf by
+dotted path, and it is the reason an effect is not simply a patch: the zombie's
+`speed: 23.5` and `cadence: 6.4` are the HUMAN's 31.5 and 8 three quarters and
+four fifths of the way down, and poured onto a shorter character they would set
+that character's stride to a human's fraction of a human's speed. Stride is
+speed/cadence, so both have to come down together or the legs spin faster to
+cover less ground. As ratios — `{"speed": 0.746, "gait.cadence": 0.8}` — they
+say the thing that was meant: three quarters of whatever THIS body walks at,
+whoever it is. Numbers that are already body-independent stay absolute in
+`patch`: `leadTime` and `stepDuration` are seconds and `stepHeight` is a
+fraction of the leg.
+
+An effect may not rename or remove a part. The rig vocabulary is the contract
+every other system binds to by name.
+
+**Effects are LOAD-TIME, producing derived defs, and that is forced rather than
+chosen.** `palette` is a per-def filter applied before `MicroBodyMergeArt`
+dedupes by RGB, and the per-instance GPU struct has no spare word — so a
+per-mob "is a zombie" bit could not recolour anything. A spawn-time API (a
+player's corpse turning) therefore wants a LAZY derived def synthesised through
+the same resolver, which is designed for and not yet built.
+
+`assets/mobs/zombie.json` is three lines: `extends: human`, `effects:
+["zombie"]`. There is no `zombie.vox`, and `jujunud_zombie.json` is the same
+three lines over another body — which is the whole point, and what the
+`undead` gate's arm F asserts (the effect arrives AND jujunud's own rideHeight,
+clip period and 1.675 m frame survive it).
 
 **The recolour is a FILTER, not a colour table.** `palette` takes
 `saturation`, `brightness`, `tint` + `tintAmount` and is applied to the def's
@@ -5309,6 +5366,213 @@ idempotence, an unknown material refused; then the committed `human.vox`
 must match its own recipe, every limb must have a bone core, and no paint
 may sit below depth 0) and by the existing `mob-burn` / wound / armour gates
 running over the baked model.
+
+### Characters are generated and bred (2026-09-19, thinned to a diff 2026-09-20; `assets/editor/mobgen.js`, `assets/editor/sidecar.js`, `assets/editor/breed.js`, `scripts/gen_mobs.mjs`, gate `node scripts/test_mobgen.mjs`)
+
+A character used to be a Python script. `scripts/gen_human.py` is 1,588 lines
+that run by hand and write one file, and a second character meant a second copy
+of the whole thing — there were three (`gen_mina`, `gen_wizard`, `gen_asha`),
+all subtly diverged, all since deleted. Nothing else could call any of them: the
+tuner could not preview a body it was about to make, and the only way to see a
+proportion change was to run a script and open the result in the model editor.
+
+So the generator is now `assets/editor/mobgen.js`: a pure zero-dependency ES
+module with no DOM and no fetch, imported by the browser (the tuner's
+**Characters** tab) and by `node` (`scripts/gen_mobs.mjs` bakes, and
+`scripts/test_mobgen.mjs` gates) from one source. That is exactly the shape
+`treegen.js` / `biomegen.js` / `watergen.js` already have, and it is the fourth
+instance of the same argument: **there is one implementation of what a thing
+looks like, it runs in JavaScript, and the tuner shows its output byte for
+byte.** A C++ or WGSL copy would be the drift the arrangement exists to prevent.
+
+**The genome carries SHAPE ONLY.** This is the one design rule in the feature
+that is not about aesthetics. A human eye on a thumbnail grid filters *ugly*
+perfectly well and filters *broken* not at all, because the breakage is
+invisible in a static preview: a body whose ride height does not match its leg
+length looks fine standing still, then hovers, sinks or foot-slides the moment it
+walks, and a shoulder anchor slightly outside the shoulder is invisible until the
+arm swings. So the rolled genes are height (inside a band), the box widths, the
+vertical stack *weights*, silhouette multipliers, the skull's jaw/cheek/crown,
+the hair function's two numbers, and one palette row per feature — and
+everything that must AGREE with the shape is computed from it: all fifteen limb
+anchors, the held socket, the fist and jaws edge segments, the IK poles,
+per-limb `hp` (by volume), `gait.rideHeight`, the walk and run arm-swing clip
+periods, `speed`, and the eye row. That is *less* work, not more: a derived
+value needs no mutation range and cannot drift wrong.
+
+Two genes are leashed rather than free. `HEIGHT_M` and `EYE_M` are contracts —
+the eye row IS the first-person camera row, and reach, melee range and several
+gate fixtures bet on a 1.7 m figure — so height varies inside ±10% with every
+derived quantity following. The height budget itself is spent, not scaled:
+segment weights are normalised against `MICRO_H` plus the archetype's joint
+overlaps and the residual is handed out one micro at a time, so "longer legs"
+can never also mean "taller".
+
+**The port is pinned to its SOURCE, not to the shipped human.**
+`generateMob(defaultGenome())` with the shoulder round off reproduces
+`gen_human.py`'s output cell for cell, slot for slot and anchor for anchor,
+against a digest in `tests/mobgen_human_ref.json`. It does *not* reproduce
+`assets/mobs/human.vox` — and neither does `gen_human.py`, any more. Measured:
+thirteen of the fifteen limbs are identical to the cell, and the torso and the
+two upper arms differ by 130 cells, every one of them a REMOVAL, all in the
+shoulder, because **the shipped human's shoulders were rounded by hand in the
+model editor**. That sculpting is the entire geometric divergence and is now a
+generator rule (see below). Beyond geometry the shipped human also has an
+anatomized interior, clothing dye in art slots the script never knew about, and
+seven hand-extended sidecar blocks. Pinning to it would pin to a body the
+generator cannot make, so the reference is the generator, and regenerating the
+human is explicitly not part of this (it would move the world hash for nothing). Keeping
+the equality exact needed two things worth writing down: `pyRound` reproduces
+Python's half-to-even rounding of the exact binary value (`Math.round` is
+half-up, and the difference shows up in the ear row and in an arm cycle that
+lands on a whole half-millisecond), and every shape parameter that scales with a
+box is authored as an ABSOLUTE micro length at the DEFAULT box and multiplied by
+`thisBox / defaultBox`, so the ratio is bit-exactly 1.0 at the default genome.
+
+**ONE ARCHETYPE, and the reason is the name vocabulary.** Every downstream
+system binds by limb NAME: `gait.groups`, the four IK chains, the dismemberment
+state table, ~15 KB of clips masked by name, the natural weapons, the anatomy
+head override, `attack_styles.json`. A quadruped has no `armU.L`, so idle /
+bite / crawl / limp / onearm all fail to bind at once, the chains dangle and the
+gait has nothing to group — a non-humanoid is a different project, not a bigger
+genome. So the vocabulary lives in one table (`ARCHETYPE`) and no builder
+contains the string, which makes a future `quadruped` a second table with its
+own clip set rather than a grep through nine builders.
+
+**Interactive evolution, and that is the whole algorithm.** A human is the
+fitness function: `mutate(genome, sigma, rng, locks)`, `cross(parents, rng)` and
+`randomGenome(rng)` are a page of code between them, with no scoring, no
+tournament and no generation counter. Numeric genes blend across a random
+simplex weight (a plain mean of two parents gives one child N times);
+categorical and colour genes are inherited WHOLE from a parent picked per gene,
+because a blend of two hairstyles is a third that is neither and a blend of
+three hair colours is mud. Colours roll as SETS (complexion / hair / cloth) and
+then jitter inside the set, since the failure mode of independent colour genes
+is slate skin with orange hair. Every gene's range, step and mutation sigma live
+in ONE table, `GENE_SPECS`, which drives the sliders, the mutation and the
+clamping in `normalizeGenome` — three consumers that must agree or the UI lies
+about what a roll can produce.
+
+**Rounded shoulders are a RULE, not a sculpt.** The 130 cells the shipped human
+is missing relative to its generator are two distinct artefacts, and naming them
+is what makes them fixable rather than re-sculptable. One is a *fin*: along the
+torso rows where the silhouette widens toward the shoulder line, the ellipse
+reaches the outermost column at mid-depth only, leaving a one-column-wide blade
+standing out of the shoulder over a third of the body's depth. (gen_human.py's
+own comment claims its radii were chosen to avoid exactly this — "a single
+2x2x2 pimple on the shoulder line at ship scale" — and measurably they are not.
+It is not an upscale artefact either: the ellipse genuinely reaches that column,
+so removing it removes real geometry, on the grounds that a silhouette coming to
+a one-cell point does not read as a shoulder.) The other is a *square cap*: the
+upper arm's tube grows to radius 2.2, and on the 4-wide AUTHORED lattice every
+radius from 1.06 up is the same full 4×4 square, so the arm ends in a flat slab
+whose four corners the 2× upscale faithfully turns into 2×2 blocks.
+
+Both are corrected after the upscale, because that is the only lattice fine
+enough to round on — the authored one steps 4 cells to 12 to 16 with nothing in
+between, which `limbTube`'s own note already says. The cap correction is not even
+a new parameter: the cross-section is re-derived at the shipped lattice from the
+radius the limb actually has, measured off the rows below the cap, so it knows
+nothing about how any particular limb chose its radii. What is deliberately NOT
+copied is that the hand edit is asymmetric (armU.L lost 23 cells over five rows,
+armU.R 20 over two) and stops four rows short of the torso crest: this generator
+asserts left/right mirroring on every body it makes, so copying the asymmetry
+would mean breaking an invariant to reproduce where a hand happened to stop. The
+rules are symmetric and cover the whole shoulder, which halves the cell gap to
+the shipped human (130 → 66), the residual accounted for by exactly that choice.
+
+`roundShoulders: false` returns the Python's geometry, which is what the port pin
+builds with — the pin proves the TRANSLATION, and the round is a deliberate
+improvement layered on top of it rather than part of it.
+
+**Distinctness at a 20×12×20 head** is carried, in order of yield, by the hair
+SILHOUETTE (`hair_line(y)`: the z at or above which a depth row is hair, at the
+nape and at the forehead — seven styles, each a *preset of those two numbers*
+rather than a code path), then colour, then body proportion, then the skull
+profile. An eye is one or two voxels and is not identity.
+
+**A GENERATED CHARACTER IS A DIFF, NOT A BODY.** The generator derives a whole
+creature — it has to, the numbers are per-body — but what is WRITTEN is the
+difference between that creature and the resolved base, plus its genome and the
+two lines saying where it came from. `jujunud.json` was 63,557 bytes of frozen
+copy; it is 4,414, of which 2,363 is the difference. Everything else arrives
+through `extends` at load, so editing the human's crawl, or its jaws, or its
+anatomy recipe reaches every character with no re-bake of anything.
+
+This is the half of the feature that could not be tested into existence. Four
+commits changed how a human fights and falls apart, none of them reached the
+pool, and characters shipped with a bounce-on-two-stumps loco state and a third
+of the standard's limb hp (`2c4f29b`). That commit added gates that DETECT the
+drift; it could not make the drift impossible, because the copies were still
+copies.
+
+**The difference is computed by DIFFING, not by listing the per-body keys.**
+Such a list goes stale the first time a derived field is added to the generator,
+and the symptom is invisible: the character silently wears the human's number
+where it should wear its own, and the thin file's whole job is to not mention
+what it inherits. So `sidecar.js` carries `diffAgainst`, the exact inverse of
+the merge, and it CHECKS ITSELF — re-applies its own output to the base and
+throws rather than write a file that would load as a different creature. It also
+refuses a body whose difference is not expressible (a reordered or shortened
+limb list), because the named-array merge preserves base order and cannot
+reproduce either. `//`-prefixed keys are never a difference: a note is for a
+human reader and no loader reads one.
+
+**Two ways to save, and the choice is not cosmetic.** A new BODY is a `.vox`
+plus a thin sidecar: 200 KB of art, and the art is the only thing that stops
+tracking the base (its INTERIOR does not — the anatomy recipe is inherited and
+re-derived at load). A COLOUR VARIANT is a ~20-line sidecar with `extends` + a
+`palette` filter and no art at all, and keeps tracking its base for ever. The
+variant path is correct whenever the SHAPE is unchanged, and it is limited to
+what the engine can do: `palette` is a GLOBAL filter, so it cannot say "red
+hair, unchanged skin". Per-feature colour lives in the `.col` models INSIDE the
+`.vox` and a def cannot override only those, so a per-feature recolour is a new
+body. Both the page and `gen_mobs.mjs` say this rather than pretending otherwise.
+
+**The clips a character owns are the two derived from its own leg.** `walk` and
+`run` carry a period computed from this figure's leg length (a short character
+does not walk on the human's clock); `idle jump fall land hang cast limp hop
+crawl squirm onearm headless` live in `assets/anims/`, the shared library
+`LoadMobDefs` compiles onto every rig whose part names fit. They were emitted
+byte-identical into every sidecar until 2026-09-20, which is 45 KB of copy per
+character and the reason a crawl could not be edited once.
+
+**The save still bakes the anatomy, and the bake is now a CACHE.** Since
+2026-09-20 the engine re-derives a body's interior from its resolved recipe at
+load (`src/game/anatomy_resolve.cpp`), so what is baked into the `.vox` is a
+preview for the Models tab's peel and a copy for anything reading a census off
+disk — authoritative no longer. `--gate anatomy-parity` is what keeps the two
+implementations one rule: re-deriving over committed art must rewrite nothing,
+and stripping a body's interior back to bare surface and re-deriving must
+reproduce the bake voxel for voxel. A generated body is solid `skin`
+at every depth before either runs: it walks and it burns, but a sword through it finds skin all the
+way down and every wound material the gore system is authored against is absent,
+so an un-baked body is not a finished character. `anatomy.js` is a pure module
+and the Models tab's Apply-recipe button already runs it in the browser, so
+there was never anything CLI-only about the step: `mobgen.bakeAnatomy` is one
+call shared by the Characters page, `scripts/gen_mobs.mjs` and the gate, and
+**nothing on the page needs a terminal** — what lands in `assets/mobs/` is an
+asset the game spawns as it is. In a bake only MATERIALS may change and paint
+may only be CLEARED (an interior flesh voxel has no business carrying skin
+paint); both are asserted, and a tight rebase that would move content is refused
+outright, because every anchor, socket and natural-weapon edge in the sidecar is
+expressed against the art's own boxes and a bake that moved a voxel would drift
+the whole rig with nothing to say so. `scripts/anatomize_mob.mjs` remains the way
+to re-bake a mob already on disk, including hand-authored ones.
+
+**Verified** by `node scripts/test_mobgen.mjs` (the cell-for-cell pin, genome
+normalisation, mutate/cross reproducibility and bounds, and ~100 rolled bodies
+each asserted sound: anchors inside their own limbs, the eye row on the face,
+one material ≤ 127, art slots only, and every limb ONE CONNECTED PIECE) and by
+`bash scripts/check_characters.sh` (the real module in real headless Chrome: the
+tuner wiring, the mount, inked pixels on the painter's canvas, a slider reaching
+the preview, a lock surviving a randomize, and both save routes round-tripping
+through `/api/model`). The connectivity assert earns its keep: it caught three
+defects no preview would show — an arm budget handed the span instead of the
+span plus its joint overlaps, ears placed at the box edge instead of one cell
+proud of the widest FILLED column, and a thumb at an absolute row instead of
+proud of the front-most filled cell. The anatomy peel needs a solid volume, and
+a detached speckle becomes a floating scrap of flesh in the world.
 
 ---
 
