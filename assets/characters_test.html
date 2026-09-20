@@ -1,0 +1,352 @@
+<!doctype html>
+<!-- Headless harness for the Characters tab. Loaded by
+     scripts/check_characters.sh through Chrome; it prints PASS/FAIL lines into
+     #out for --dump-dom.
+
+     WHAT IT COVERS THAT `node scripts/test_mobgen.mjs` DOES NOT. The Node gate
+     asserts the DATA: that the generator reproduces gen_human.py cell for cell,
+     that every rolled genome is structurally sound, that mutate/cross are
+     reproducible and bounded. What cannot be asserted from Node is whether the
+     PAGE mounts — whether the module bridge hands it the palette, whether the
+     software voxel painter puts anything on a canvas, whether a slider actually
+     changes the preview, and whether the two save buttons produce files the
+     server accepts. Every one of those can break without touching a line of
+     mobgen.js.
+
+     IT DRIVES THE MODULE DIRECTLY rather than iframing tuner.html, copied from
+     assets/trees_test.html for the reason recorded there: an iframe under
+     --virtual-time-budget does not reliably reach `complete`, and a harness
+     that flakes is worse than no harness. The tuner's own WIRING is checked
+     separately by fetching the page and asserting the six edits are present.
+
+     NEEDS NO BUILT EXE AND NO WebGL. That is a property of this page worth
+     asserting rather than assuming: the thumbnails are a 2D-canvas painter
+     precisely so a litter of thirty does not need thirty GL contexts, and if
+     something in here ever starts needing a context, this harness fails on a
+     machine that has none. -->
+<meta charset="utf-8">
+<title>characters harness</title>
+<body style="background:#111;color:#ddd;font:12px monospace">
+<!-- THE HOST CARRIES THE REAL ID. breed.js scopes every one of its CSS
+     rules under #view-characters, so a host div called anything else is a
+     harness that exercises the module with none of its layout -- the three
+     columns stack, the hint rows never collapse, and a screenshot taken
+     here looks nothing like the tab. Same id as the section in
+     tuner.html, for that reason. -->
+<div id="view-characters" style="width:1340px"></div>
+<pre id="out">running</pre>
+<script type="module">
+var log = [], fail = 0;
+// EVERY LINE GOES INTO #out AS IT HAPPENS, not in one write at the end. The
+// run is ~40 assertions and some of them build 25 bodies; when one of them
+// stops finishing, a harness that only prints at the end prints nothing, and
+// "the page did not run" is indistinguishable from "the page ran and hung on
+// assertion 19". Cost this a bisect once. --dump-dom reads whatever is in the
+// DOM when the virtual-time budget expires, so an incremental write turns a
+// hang into a log that names its own last line.
+function say(ok, msg, detail){
+  log.push((ok ? 'PASS  ' : 'FAIL  ') + msg + (ok || !detail ? '' : '\n        ' + detail));
+  if (!ok) fail++;
+  document.getElementById('out').textContent = log.join('\n') + '\n\n(running)';
+  return ok;
+}
+function mark(what){            // progress between assertions, same reason
+  document.getElementById('out').textContent =
+    log.join('\n') + '\n\n(running: ' + what + ')';
+}
+function done(){
+  document.getElementById('out').textContent =
+    log.join('\n') + '\n\nRESULT ' + (fail ? ('FAIL(' + fail + ')') : 'OK');
+  document.title = fail ? 'FAIL' : 'OK';
+}
+// THE POLL IS A FETCH, DELIBERATELY. Chrome's --virtual-time-budget
+// fast-forwards setTimeout to zero, so a timer poll spins thousands of times
+// and burns the whole budget in under a second of real work. Virtual time
+// PAUSES while a network fetch is outstanding, so polling through one makes
+// each iteration cost real time. (Hard-won in scripts/check_worldview.sh.)
+async function waitFor(pred, ms){
+  var t0 = performance.now();
+  while (performance.now() - t0 < (ms || 30000)) {
+    try { if (pred()) return true; } catch (e) {}
+    await fetch('/api/status').catch(function(){});
+  }
+  return false;
+}
+
+// The host hooks, the same four the Models and Environment tabs are given. A
+// minimal `el` rather than the tuner's: this harness is checking the MODULE,
+// and borrowing the page's helper would mean a bug in either one fails here.
+function el(tag, attrs, ...kids){
+  var e = document.createElement(tag);
+  for (var k in (attrs || {})) {
+    var v = attrs[k];
+    if (k === 'class') e.className = v;
+    else if (k.slice(0, 2) === 'on') e.addEventListener(k.slice(2), v);
+    else if (v !== false && v != null) e.setAttribute(k, v === true ? '' : v);
+  }
+  kids.flat(9).forEach(function(c){
+    if (c != null) e.append(c.nodeType ? c : document.createTextNode(c));
+  });
+  return e;
+}
+var toasts = [], dirt = [];
+
+(async function(){
+  try {
+    // ---- 1. tuner.html is actually wired to this module -------------------
+    // A module that loads perfectly into a page with no button and no section
+    // is a tab nobody can open, and nothing else in the repo would notice.
+    var page = await (await fetch('/', { cache: 'no-store' })).text();
+    var wiring = [
+      ['nav button',      /data-tab="characters"/],
+      ['section',         /id="view-characters"/],
+      ['tab allowlist',   /\[[^\]]*'characters'[^\]]*\]\.includes\(activeTab\)/],
+      ['renderAll case',  /activeTab==='characters'\)\{charsActivate\(\)/],
+      ['host hooks',      /__tunerCharsHooks/],
+      ['module import',   /import\('\.\/editor\/breed\.js'\)/],
+    ];
+    wiring.forEach(function(w){
+      say(w[1].test(page), 'tuner.html wiring: ' + w[0]);
+    });
+
+    mark('2. the module mounts');
+    // ---- 2. the module mounts --------------------------------------------
+    var mg = await import('./editor/mobgen.js');
+    var breed = await import('./editor/breed.js');
+    // /api/files is the tuner's own bulk load: every writable + readable JSON
+    // as raw text, keyed by file name. Same call the page itself makes.
+    var files = await (await fetch('/api/files', { cache: 'no-store' })).json();
+    var materials = JSON.parse(files.materials).materials;
+    var tuning = JSON.parse(files.tuning);
+    say(materials.length > 0, 'materials.json reached the harness');
+
+    breed.attach({
+      el: el,
+      toast: function(m, bad){ toasts.push((bad ? 'ERR ' : '') + m); },
+      materials: function(){ return materials; },
+      onDirty: function(d){ dirt.push(!!d); },
+      section: document.getElementById('view-characters'),
+      tuning: function(){ return tuning; },
+    });
+    await breed.activate();
+    var host = document.getElementById('view-characters');
+    say(!!host.querySelector('.bwrap'), 'the page built its three panes');
+    say(host.querySelectorAll('.bcol').length === 3,
+        'pool, tweak and litter are all present',
+        host.querySelectorAll('.bcol').length + ' columns');
+
+    mark('3. the pool read the real assets/mobs');
+    // ---- 3. the pool read the real assets/mobs ---------------------------
+    var st = breed.__test.state;
+    say(st.pool.length >= 1, 'the pool listed at least one mob def',
+        'pool: ' + st.pool.map(function(p){ return p.name; }).join(','));
+    say(st.pool.some(function(p){ return p.name === 'human'; }),
+        'the shipped human is in the pool');
+    say(st.pool.some(function(p){ return p.extendsName === 'human'; }),
+        'the zombie is listed as a variant of human');
+    // The human predates the generator and has no genome block, so it must be
+    // shown as un-breedable rather than silently loaded as a default body.
+    var human = st.pool.find(function(p){ return p.name === 'human'; });
+    say(human && !human.genome,
+        'the hand-authored human offers no genome to breed from');
+
+    mark('4. the painter actually paints');
+    // ---- 4. the painter actually paints ----------------------------------
+    // A thumbnail that renders as an empty canvas is the single failure this
+    // harness exists for: everything upstream of it is asserted by the Node
+    // gate, and nothing downstream of it is visible to anything but an eye.
+    function inked(canvas){
+      var d = canvas.getContext('2d').getImageData(0, 0, canvas.width,
+                                                   canvas.height).data;
+      var n = 0;
+      for (var i = 3; i < d.length; i += 4) if (d[i] > 8) n++;
+      return n;
+    }
+    var big = host.querySelector('.prev canvas');
+    say(!!big && inked(big) > 400, 'the tweak preview has voxels on it',
+        big ? inked(big) + ' inked pixels' : 'no canvas');
+    var side = host.querySelectorAll('.prev canvas')[1];
+    say(!!side && inked(side) > 300, 'the profile view has voxels on it',
+        side ? inked(side) + ' inked pixels' : 'no canvas');
+
+    mark('4b. THE SHOULDER ROUND IS VISIBLE');
+    // ---- 4b. THE SHOULDER ROUND IS VISIBLE -------------------------------
+    // The one thing the Node gate structurally cannot see. mobgen removes 160
+    // voxels from the default figure's shoulders (test_mobgen.mjs section K
+    // pins that, cell for cell, against the hand-sculpted shipped human), but
+    // this page is where a person looks at them -- and the painter it shipped
+    // with halved every coordinate back to the authored lattice first, which
+    // put every removed voxel back under a surviving sibling. Rounded and
+    // unrounded came out as the SAME PICTURE: 3,102 cells either way, not one
+    // pixel different. So the assertion here is not "the round ran", it is
+    // "the round reaches the glass".
+    var gOpts = { materials: materials, player: tuning.player, name: 'human' };
+    var gen = mg.defaultGenome();
+    var cRound = document.createElement('canvas');
+    cRound.width = 300; cRound.height = 460;
+    var cRaw = document.createElement('canvas');
+    cRaw.width = 300; cRaw.height = 460;
+    breed.drawBody(cRound, mg.generateMob(gen, 0, gOpts));
+    breed.drawBody(cRaw, mg.generateMob(gen, 0,
+      Object.assign({ roundShoulders: false }, gOpts)));
+    var pr = cRound.getContext('2d').getImageData(0, 0, 300, 460).data;
+    var pw = cRaw.getContext('2d').getImageData(0, 0, 300, 460).data;
+    var moved = 0;
+    for (var pi = 0; pi < pr.length; pi += 4)
+      if (pr[pi] !== pw[pi] || pr[pi + 1] !== pw[pi + 1] ||
+          pr[pi + 2] !== pw[pi + 2] || pr[pi + 3] !== pw[pi + 3]) moved++;
+    say(moved > 60, 'the shoulder round changes what the preview draws',
+        moved + ' pixels differ between rounded and unrounded');
+    // ...and it takes material OFF. A round that painted MORE ink than the
+    // square shoulder would mean the painter, not the rule, invented it.
+    say(inked(cRound) < inked(cRaw),
+        'and it draws a smaller figure, because the round only ever removes',
+        inked(cRaw) + ' -> ' + inked(cRound) + ' inked pixels');
+    // The count belongs on screen too: a number you have to diff two canvases
+    // to discover is not a thing the page told you.
+    say(/shoulders rounded: \d+ voxels/.test(host.textContent),
+        'and the pane says how many voxels it took off');
+
+    mark('5. a litter renders');
+    // ---- 5. a litter renders, and every cell differs ----------------------
+    st.source = 'random';
+    st.seed = 4;
+    st.litterCount = 8;
+    breed.__test.rollLitter();
+    breed.__test.render();
+    var cells = host.querySelectorAll('.lcell canvas');
+    say(cells.length === 8, 'eight litter cells rendered',
+        cells.length + ' cells');
+    var sigs = [], blank = 0;
+    cells.forEach(function(c){
+      if (inked(c) < 150) blank++;
+      sigs.push(c.toDataURL().length + ':' + inked(c));
+    });
+    say(blank === 0, 'no litter cell is blank', blank + ' blank');
+    say(new Set(sigs).size >= 7, 'the litter is not eight copies of one body',
+        new Set(sigs).size + ' distinct of 8');
+    say(host.querySelectorAll('.lcell.bad').length === 0,
+        'no litter cell failed the structural asserts');
+
+    mark('6. a slider edit reaches the preview');
+    // ---- 6. a slider edit reaches the preview ----------------------------
+    var before = inked(host.querySelector('.prev canvas'));
+    breed.__test.set('body.shoulderWidth', 18);
+    breed.__test.set('shape.chest', 1.25);
+    var after = inked(host.querySelector('.prev canvas'));
+    say(after !== before, 'widening the shoulders redraws the body',
+        before + ' -> ' + after);
+    // ...and a LOCK holds it through a roll, which is the whole point of the
+    // per-gene locks (§5: vary hair and face while holding the body fixed).
+    st.locks = new Set(['body.shoulderWidth']);
+    st.source = 'random';
+    breed.__test.rollLitter();
+    var held = st.litter.every(function(k){ return k.genome.body.shoulderWidth === 18; });
+    say(held, 'a locked gene survives a randomize',
+        st.litter.map(function(k){ return k.genome.body.shoulderWidth; }).join(','));
+    st.locks = new Set();
+
+    mark('7. saving round-trips through the real server');
+    // ---- 7. saving round-trips through the real server -------------------
+    // Writes a scratch mob; check_characters.sh removes it on exit.
+    st.name = '_harness';
+    breed.__test.preset('stocky');
+    st.name = '_harness';
+    await breed.saveFromHost();
+    var okToast = toasts.some(function(t){ return /saved _harness\.vox/.test(t); });
+    say(okToast, 'the save reported success',
+        toasts.slice(-2).join(' | '));
+    var vox = await fetch('/api/model?path=mobs/_harness.vox', { cache: 'no-store' });
+    say(vox.ok, 'the .vox is on disk');
+    var bytes = new Uint8Array(await vox.arrayBuffer());
+    say(bytes[0] === 86 && bytes[1] === 79 && bytes[2] === 88,
+        'it is a real .vox (VOX magic)');
+    // THE SAVED BODY MUST BE FINISHED. A generated body is solid `skin` at every
+    // depth until the anatomy recipe is baked in, and the whole point of doing
+    // that in the browser is that the file the page writes is the file the game
+    // can spawn. So this reads the bytes back off disk and counts materials.
+    var vox2 = await import('./editor/vox.js');
+    var savedPrefab = vox2.readVox(bytes).prefab;
+    var savedMats = new Set();
+    savedPrefab.models.forEach(function(m){
+      m.grid.data.forEach(function(v){ if (v) savedMats.add(v); });
+    });
+    say(savedMats.size > 1,
+        'the saved .vox is ANATOMIZED, not solid skin',
+        savedMats.size + ' material id(s): ' + [...savedMats].join(','));
+    say([...savedMats].every(function(v){ return v <= 127; }),
+        'every material in it is <= 127 (128..255 is the art palette)');
+    var names = [...savedMats].map(function(v){
+      return (materials[v - 1] || {}).id;
+    });
+    say(names.indexOf('bone') >= 0 && names.indexOf('brain') >= 0,
+        'it has bone and a brain, so the head override ran too',
+        names.join(','));
+    var side2 = await (await fetch('/api/model?path=mobs/_harness.json',
+                                   { cache: 'no-store' })).json();
+    say(Array.isArray(side2.limbs) && side2.limbs.length === 15,
+        'the sidecar has the 15-limb rig', 'limbs: ' +
+        (side2.limbs ? side2.limbs.length : 'none'));
+    say(!!side2.anatomy && !!side2.anatomy.limbs.head,
+        'the sidecar carries the anatomy recipe, head override and all');
+    say(!!side2.genome,
+        'the sidecar carries its own genome, so it can be bred from later');
+    say(side2.artVoxelsPerMetre === 80,
+        'artVoxelsPerMetre is declared (not the legacy skinScale)');
+    // The saved genome must round-trip: load it back and get the same body.
+    var reloaded = mg.generateMob(side2.genome, 0,
+                                 { materials: materials, player: tuning.player });
+    var direct = mg.generateMob(st.genome, 0,
+                               { materials: materials, player: tuning.player });
+    say(reloaded.vox.length === direct.vox.length &&
+        reloaded.stats.painted === direct.stats.painted,
+        'the saved genome rebuilds the same body',
+        reloaded.stats.painted + ' vs ' + direct.stats.painted);
+
+    mark('8. the colour-variant path writes NO art');
+    // ---- 8. the colour-variant path writes NO art ------------------------
+    st.name = '_harness_pale';
+    st.baseFor = '_harness';
+    st.variant = { saturation: 0.5, brightness: 1.05, tint: '#b9c3ae',
+                   tintAmount: 0.2 };
+    var poolBefore = st.pool.length;
+    // saveVariant is only reachable through the button, which is the point:
+    // the harness clicks it rather than calling past the UI.
+    var btn = [...host.querySelectorAll('button')].find(function(b){
+      return /save recolour/.test(b.textContent);
+    });
+    say(!!btn, 'the save-recolour button exists');
+    if (btn) {
+      btn.click();
+      await waitFor(function(){
+        return toasts.some(function(t){ return /_harness_pale/.test(t); });
+      }, 15000);
+      var vdoc = await fetch('/api/model?path=mobs/_harness_pale.json',
+                             { cache: 'no-store' });
+      say(vdoc.ok, 'the variant sidecar is on disk');
+      if (vdoc.ok) {
+        var v = await vdoc.json();
+        say(v.extends === '_harness', 'it extends its base');
+        say(!!v.palette && v.palette.saturation === 0.5,
+            'it carries the palette filter');
+        say(!v.limbs && !v.genome,
+            'it restates nothing: no rig, no genome, no art');
+      }
+      var noVox = await fetch('/api/model?path=mobs/_harness_pale.vox',
+                              { cache: 'no-store' });
+      say(!noVox.ok, 'and it wrote no .vox at all');
+    }
+
+    mark('9. the unsaved-work flag');
+    // ---- 9. the unsaved-work flag ---------------------------------------
+    say(dirt.includes(true) && dirt[dirt.length - 1] === false,
+        'editing marks the page dirty and saving clears it',
+        dirt.join(','));
+  } catch (e) {
+    say(false, 'harness threw: ' + (e && e.message || e),
+        e && e.stack ? String(e.stack).split('\n')[1] : '');
+  }
+  done();
+})();
+</script>
+</body>
