@@ -4142,6 +4142,27 @@ void MobSystem::StepStroke(Mob& mob, uint32_t tick, World& world,
     // not per slot: a lunging zombie's head passes a shoulder, a chest and an
     // arm on the way in, and it may tear a hole in exactly one of them.
     sw.bitten = &st.bitten;
+    // ...and WHICH limb that one bite is trying to close on (melee.h
+    // EdgeSweep::bitePrefer). The draw already happened, once, at the start of
+    // the stroke (StartStroke) and the aim already moved onto that limb; this is
+    // the third and last half of the same decision — the jaws may not spend
+    // their bite on the chest they passed on the way to the arm they were sent
+    // at. Re-resolved every tick rather than captured at the draw because a
+    // carve REBUILDS a limb's body and the handle changes under us
+    // (Mob::RebuildLimbBody), and a stale handle would match nothing and read
+    // as "the drawn limb was never reached".
+    //
+    // The victim is looked up through FindCombatantById, so the PLAYER is a
+    // victim like any other — that lookup is the whole reason the authored
+    // target tables stopped being dead against you.
+    if (st.targetLimb >= 0) {
+      if (const Mob* victim = FindCombatantById(st.targetId))
+        if (st.targetLimb < (int)victim->limbs_.size())
+          sw.bitePrefer = victim->limbs_[(size_t)st.targetLimb].body;
+    }
+    // THE DEADLINE ON THAT PREFERENCE: every cut tick but the last. A limb the
+    // jaws cannot reach must not cost the bite (melee.h EdgeSweep::biteHoldout).
+    sw.biteHoldout = st.phaseTick + 1 < st.cutTicks;
     // A FIST IS PART OF THE ARM THAT THROWS IT (melee.h selfMounted), and
     // probes along its TRAVEL. A set of JAWS does not: its edge already points
     // out of the face -- that is what the Aim effector spends the whole stroke
@@ -8616,27 +8637,9 @@ bool Mob::CutLimb(uint64_t bodyHandle, const BladeCut& cut, World& world,
     // the flat of the blade (v). Two of them are MEASURED — the item's
     // authored edge segment through its live pose, and how far the tip really
     // moved this tick — so the wound's orientation cannot drift from the art
-    // or from the swing.
+    // or from the swing. Built by phys/kerf.h, which is also what a corpse's
+    // cut is built from: one slot shape, two populations.
     const Vec3 cLocal = RotateInv(q, cut.at - limb.xf.pos);
-    Vec3 u = RotateInv(q, cut.edgeAxis);
-    Vec3 w = RotateInv(q, cut.cutDir);
-    const float ul = u.len(), wl = w.len();
-    u = ul > 1e-4f ? u * (1.0f / ul) : Vec3{1, 0, 0};
-    w = wl > 1e-4f ? w * (1.0f / wl) : Vec3{0, -1, 0};
-    Vec3 v = u.cross(w);
-    if (v.len() < 0.15f) {
-      // A THRUST, NOT A CUT: the edge is travelling along its own length, so
-      // "the flat of the blade" is undefined and the cross product is noise.
-      // Any perpendicular will do — the slot is then a round-ish bore, which
-      // is what a thrust actually makes.
-      v = u.cross(Vec3{0, 1, 0});
-      if (v.len() < 0.15f) v = u.cross(Vec3{1, 0, 0});
-    }
-    v = v.normalized();
-    // Re-derive the travel axis from the two exact ones, so the frame is
-    // orthonormal by construction instead of by however square the inputs
-    // happened to be.
-    w = v.cross(u).normalized();
 
     const auto& gt = CurrentTuning().gore;
     float depth = std::max(cut.depth, 0.0f);
@@ -8684,90 +8687,32 @@ bool Mob::CutLimb(uint64_t bodyHandle, const BladeCut& cut, World& world,
         halfW = std::max(halfW, oneCell);
       }
     }
-    // HOW FAR BACK THE SLOT STARTS. `cut.at` is a ray hit on the JOLT
-    // COLLIDER, which is a greedy box merge inflated by a convex radius — it
-    // is near the surface, not on it, and at skinScale 8 "near" is several
-    // skin voxels. A slot that started exactly at the hit point would
-    // sometimes float clear of the art and remove nothing at all, which reads
-    // as the blade passing through the body. Backing it off by a fraction of
-    // its own depth costs a little over-reach on the entry face and buys the
-    // cut always landing.
+    // ---- THE SLOT, AND WHERE ITS ENTRY FACE REALLY IS --------------------
     //
-    // Small, and it only has to cover the last fraction of a lattice cell:
-    // the slot's entry is SNAPPED TO FLESH just below, so it is not absorbing
-    // a collider inflation any more. The world is 10 voxels to the metre and a
-    // human upper leg is about 1.2 world voxels thick, so half a voxel of
-    // backoff would put most of a chip outside the limb.
-    const float back = 0.15f * depth + 0.10f;
+    // Both come from phys/kerf.h. KerfFrame builds the orthonormal (u, v, w)
+    // and the backoff; KerfEntry walks this limb's AUTHORITATIVE lattice and
+    // snaps the slot to the first matter under the edge, which is the single
+    // line that makes "sustained hits dismember" work (a fixed slot at a fixed
+    // point saturates -- see that header). The walk is the one part that
+    // cannot be shared: only the owner of a voxel list can iterate it.
     const uint32_t seed =
         (uint32_t)id_ * 2654435761u + (uint32_t)i * 40503u + cut.seed;
     const float jitterScale = (float)std::max(1u, SkinScaleOf(limb));
-
-    // ---- WHERE THE EDGE MEETS FLESH ------------------------------------------
-    //
-    // THE SLOT STARTS AT THE SURFACE, NOT AT THE HIT POINT, and this one line
-    // is what makes the whole "sustained hits dismember" mechanic work.
-    //
-    // A kerf of fixed depth placed at a fixed point SATURATES: the first blow
-    // empties the slot, and every blow after it finds that space already gone
-    // and removes nothing. Measured before this existed — 46 identical cuts to
-    // one cross-section of a human thigh took 2.6% each and never severed,
-    // because they were all the same 2.6%. A player hacking at one spot would
-    // have watched the wound stop getting deeper.
-    //
-    // The physical statement is "the edge bites `depth` into whatever it first
-    // meets", so the entry plane is found rather than assumed: the smallest
-    // projection onto the travel axis over the voxels inside the slot's own
-    // cross-section. A second blow then starts at the bottom of the first
-    // one's gash and goes `depth` further, which is what cutting is.
-    //
-    // It also removes the collider's inflation from the arithmetic. `cut.at`
-    // is a ray hit on a greedy box merge padded by a convex radius, i.e. near
-    // the surface rather than on it, and at skinScale 8 "near" is several skin
-    // voxels of guesswork that the backoff constant above used to absorb.
-    //
-    // COST: one pass over the authoritative lattice, on a hit tick, with a
-    // rejection test before any arithmetic — the same bound as the stain pass
-    // and the spall pass, and for the same reason (only the owner of the voxel
-    // list can answer a question about occupancy).
-    float entry = 0.0f;
-    {
-      const bool fine = limb.HasFineSkin();
-      const float sc =
-          (float)std::max(1u, fine ? SkinScaleOf(limb) : PhysScaleOf(limb));
-      const Vec3 c = cLocal * sc;
-      // THE CORE OF THE SLOT, NOT ALL OF IT. The edge is at the middle of the
-      // kerf; the rest of the footprint is the wedge behind it, and the ragged
-      // rim deliberately leaves stragglers out there. Probing the whole
-      // footprint lets one surviving rim voxel pin the entry plane at the
-      // original surface, so the groove stops advancing while the blade goes
-      // on shaving its own rim — measured at 31 blows to part a thigh instead
-      // of four, which reads as a blunt sword rather than as a probe reading
-      // the wrong voxel.
-      const float hw = halfW * sc * 0.35f, hl = halfL * sc * 0.35f;
-      float best = 1e30f;
-      auto probe = [&](float x, float y, float z) {
-        const Vec3 d{x + 0.5f - c.x, y + 0.5f - c.y, z + 0.5f - c.z};
-        if (std::fabs(d.dot(u)) > hl || std::fabs(d.dot(v)) > hw) return;
-        best = std::min(best, d.dot(w));
-      };
-      if (fine)
-        for (const PrefabVoxel& pv : limb.skinVoxels)
-          probe((float)pv.x, (float)pv.y, (float)pv.z);
-      else
-        for (const DebrisVoxel& dv : limb.voxels)
-          probe((float)dv.x, (float)dv.y, (float)dv.z);
-      if (best < 1e29f) {
-        const float e = best / sc;
-        // CLAMPED, because "the nearest flesh in this column" is not always
-        // "the surface the blade met": a limb bent back on itself can put a
-        // hand's worth of voxels a long way up the travel axis, and an
-        // unclamped snap would teleport the slot there and cut something the
-        // edge never touched. Beyond a cut's own reach, keep the hit point.
-        const float lim = depth + 1.0f;
-        if (e > -lim && e < lim) entry = e;
-      }
-    }
+    const KerfSlot slot =
+        KerfFrame(cLocal, RotateInv(q, cut.edgeAxis), RotateInv(q, cut.cutDir),
+                  depth, halfW, halfL, jitterScale, seed);
+    const Vec3 u = slot.u, v = slot.v, w = slot.w;
+    const bool fineSkin = limb.HasFineSkin();
+    const float entry = KerfEntry(
+        slot, (float)std::max(1u, fineSkin ? SkinScaleOf(limb) : PhysScaleOf(limb)),
+        [&](auto&& probe) {
+          if (fineSkin)
+            for (const PrefabVoxel& pv : limb.skinVoxels)
+              probe((float)pv.x, (float)pv.y, (float)pv.z);
+          else
+            for (const DebrisVoxel& dv : limb.voxels)
+              probe((float)dv.x, (float)dv.y, (float)dv.z);
+        });
     const Vec3 slotAt = cLocal + w * entry;
 
     // A LITTLE SPALL, and only a little. This is the mechanism that makes
@@ -8803,52 +8748,17 @@ bool Mob::CutLimb(uint64_t bodyHandle, const BladeCut& cut, World& world,
 
     const bool alive = CarveLimb(
         (int)i, world, spawns, /*eject=*/true,
-        [=](float scale) -> LimbCarveKeep {
-          // ONE world-space slot, re-expressed per lattice — the same
+        [slotAt, slot](float scale) -> LimbCarveKeep {
+          // ONE world-space slot, re-expressed per lattice -- the same
           // contract CarveLimbRadial's factory has, so a fine-skinned limb
-          // loses the same physical volume from both of its lattices.
-          const Vec3 c = slotAt * scale;
-          const float dep = depth * scale;
-          const float hw = halfW * scale;
-          const float hl = halfL * scale;
-          const float bk = back * scale;
-          const float toSkin = jitterScale / scale;
-          return [=](int x, int y, int z) -> bool {  // true = KEEP
-            const Vec3 p{(float)x + 0.5f, (float)y + 0.5f, (float)z + 0.5f};
-            const Vec3 d = p - c;
-            const float dw = d.dot(w);
-            if (dw < -bk || dw > dep) return true;
-            const float du = d.dot(u), dv = d.dot(v);
-            // A BLADE IS A WEDGE. The slot narrows toward its bottom, in both
-            // of the axes that are not the travel direction: that is what
-            // makes a shallow contact a chip and a deep one a gash, from one
-            // shape, with no second case. `t` is 0 at the entry face.
-            const float t =
-                dep > 1e-4f ? std::clamp(dw / dep, 0.0f, 1.0f) : 0.0f;
-            const float wAt = hw * (1.0f - 0.55f * t);
-            const float lAt = hl * (1.0f - 0.35f * t);
-            const float fu = std::fabs(du), fv = std::fabs(dv);
-            if (fu > lAt || fv > wAt) return true;
-            // RAGGED RIM, on the same terms the blast crater's is: certain
-            // removal in the core of the slot, thinning to nothing at its
-            // edge, quantised onto the SKIN lattice so both passes tear the
-            // same way and the wound's shape is a property of the art rather
-            // than of whichever collider resolution the def derived.
-            //
-            // CPU gameplay state — limbs are outside the hashed domain — so a
-            // float hash is fine here; rule 1 governs the grid, and everything
-            // this cut puts INTO the grid goes through the ordinary
-            // ParticleSpawn/BrushOp streams.
-            const float e = std::max(fu / std::max(lAt, 1e-3f),
-                                     std::max(fv / std::max(wAt, 1e-3f), t));
-            const float chance = 1.0f - e * e;
-            const int sx = (int)std::floor((float)x * toSkin);
-            const int sy = (int)std::floor((float)y * toSkin);
-            const int sz = (int)std::floor((float)z * toSkin);
-            const uint32_t h = Hash3(seed, (uint32_t)sx * 73856093u,
-                                     (uint32_t)sy * 19349663u ^
-                                         (uint32_t)sz * 83492791u);
-            return (float)(h & 0xFFFFu) / 65535.0f >= chance;
+          // loses the same physical volume from both of its lattices. The
+          // wedge, the ragged rim and the skin-quantized draw key all live in
+          // phys/kerf.h now, shared with the cut a corpse takes.
+          KerfSlot at = slot;
+          at.c = slotAt;  // the entry-snapped origin, not the hit point
+          const KerfKeep keep = KerfKeepAt(at, scale);
+          return [keep](int x, int y, int z) -> bool {
+            return keep((float)x, (float)y, (float)z);
           };
         },
         wantSpall ? &spall : nullptr);
@@ -12130,6 +12040,45 @@ bool Mob::InfectStep(int li, uint32_t tick, uint32_t nSpread, uint32_t nRot,
     }
   };
 
+  // ---- AN INFECTION MAY NOT EAT ITSELF TO DEATH (2026-09-19) ---------------
+  //
+  // A bite's rot is a BIRTH-DEATH PROCESS and the seed is small. Both phases
+  // are independent Bernoulli draws on the same tick (InfectDraw), spread ahead
+  // of rot only in the MEAN (0.2 against 0.1 vox/min), and `InfectStep` clears
+  // `infectMat` outright the moment nothing rotten is left — so a seed of three
+  // voxels is a coin flip between an infection and nothing at all, and the whole
+  // wound quietly reverts to "a torn hole with green stain around it".
+  //
+  // MEASURED, and this is the second half of the owner's report: a zombie's
+  // lunge onto a bare upper arm exposed 3 cells of flesh and rewrote all three
+  // (SANDVOX_BITE_DEBUG=1 on `--shot-strike zombie bite_lunge human`), and 20
+  // ticks later the limb held ZERO rotflesh. The same shot with
+  // `gore.infectRotRate` at 0 — nothing else changed — held NINE. The rot was
+  // eating its own seed before the spread could compound it. A chest or a head
+  // bite exposes several times as much flesh, which is why those infections
+  // visibly took hold and an arm's never did: the process was surviving on seed
+  // size alone.
+  //
+  // So the rot leaves a floor of infected voxels standing. This is not "rot is
+  // slower": the RATE is untouched and a limb with a real infection in it is
+  // eaten at exactly the authored speed. It says that eating the last of
+  // yourself is extinction by bookkeeping rather than by biology — the same
+  // reason the spread phase is allowed to run first and see the seed. A
+  // CONSTANT and not a tuning row on purpose: one `TUNE_` row costs every
+  // shader a prelude cache miss, and this is a structural floor on a process,
+  // not a number anyone should be tuning by feel.
+  //
+  // Sized at four, which is what an infection needs on the ground to have any
+  // neighbours to spread into at all: at 1 the survivor can be a voxel whose
+  // six neighbours are bone, air and garment, and the infection is alive on
+  // paper and frozen forever.
+  constexpr uint32_t kInfectFloor = 4;
+  {
+    const uint32_t living = (uint32_t)rotten.size() + grown;
+    const uint32_t spare = living > kInfectFloor ? living - kInfectFloor : 0u;
+    nRot = std::min(nRot, spare);
+  }
+
   // ---- ROT: what the infection takes away ----------------------------------
   if (nRot > 0) {
     // PREFER THE EXPOSED. A rotten voxel with an empty six-neighbour is on the
@@ -13944,11 +13893,102 @@ bool Mob::BiteHit(uint64_t bodyHandle, const ::BiteHit& hit, World& world,
                limbs_[li].xf.quat[2], limbs_[li].xf.quat[3]};
   const Vec3 local = RotateInv(q, hit.at - limbs_[li].xf.pos);
 
+  // ---- THE HOLE GOES UNDER THE SKIN THE TEETH CLOSED ON (2026-09-19) -------
+  //
+  // `hit.at` is where the PROBE STOPPED, and a probe stops at the first surface
+  // it met — so the bite's blob was centred ON the skin with half its volume out
+  // in the air. On a torso that costs a little; on a forearm it is nearly the
+  // whole bite.
+  //
+  // MEASURED, by the `bite-limbs` gate written for this report: same creature,
+  // same 4 hp, one bite per limb, the arms differing only in where the teeth
+  // land. At a limb's MIDDLE a bite took 17–44 voxels and left 7–31 rot; at the
+  // SURFACE of the same limb it took 1–8 and left 0–2, and on BOTH forearms it
+  // left none at all. That is the owner's report in one line — "bites on the arm
+  // just leave the green stain, the ones on the chest and head infect" — and the
+  // reason the two halves disagree is that the smear is a radius round the hole
+  // and does not care how big it is, while the infection is a fraction of the
+  // FLESH THE HOLE EXPOSED, and there was no hole.
+  //
+  // Teeth do not scrape tangentially: jaws close AROUND something, and the wound
+  // is under the contact. So the blob's centre is pushed in along the line to
+  // the limb's own lattice middle — by its own radius, so the ball sits tangent
+  // to the surface from the inside, and never more than halfway to the middle so
+  // a finger cannot be bitten from the far side. No authored field and no
+  // per-limb table: it moves a thigh's hole half a voxel and changes nothing
+  // there, and it is the entire bite on a hand.
+  const float biteR = gt.biteRadius * (0.4f + 0.6f * power);
+  Vec3 centre = local;
+  {
+    const MobLimb& lb = limbs_[li];
+    const float scale =
+        (float)std::max(1u, lb.HasFineSkin() ? SkinScaleOf(lb) : PhysScaleOf(lb));
+    int lo[3] = {INT_MAX, INT_MAX, INT_MAX};
+    int hi[3] = {INT_MIN, INT_MIN, INT_MIN};
+    auto grow = [&](int x, int y, int z) {
+      lo[0] = std::min(lo[0], x); hi[0] = std::max(hi[0], x);
+      lo[1] = std::min(lo[1], y); hi[1] = std::max(hi[1], y);
+      lo[2] = std::min(lo[2], z); hi[2] = std::max(hi[2], z);
+    };
+    // Tombstones excluded (material 0 is a voxel the burn or the rot already
+    // took): a limb eaten hollow from one end must not aim the next bite at the
+    // middle of the hole.
+    if (lb.HasFineSkin()) {
+      for (const PrefabVoxel& v : lb.skinVoxels)
+        if (v.material != 0) grow(v.x, v.y, v.z);
+    } else {
+      for (const DebrisVoxel& v : lb.voxels)
+        if (v.payload != 0) grow(v.x, v.y, v.z);
+    }
+    if (lo[0] <= hi[0]) {
+      const Vec3 mid{((float)lo[0] + (float)hi[0] + 1.0f) * 0.5f / scale,
+                     ((float)lo[1] + (float)hi[1] + 1.0f) * 0.5f / scale,
+                     ((float)lo[2] + (float)hi[2] + 1.0f) * 0.5f / scale};
+      const Vec3 inward = mid - local;
+      const float d = inward.len();
+      if (d > 1e-3f)
+        centre += inward * (std::min(biteR, d * 0.5f) / d);
+    }
+  }
+
+  // ---- SANDVOX_BITE_DEBUG=1 (CLAUDE.md rule 6) -----------------------------
+  //
+  // "The bite left no rot" has five causes and from outside they are one zero:
+  // the limb did not survive the carve, the carve took nothing, the rim is off,
+  // the hole exposed no FLESH (all bone or all garment), or the rewrite drew
+  // against it. One line names which, and it is the line that found the last two
+  // of them — a `--shot-strike` reporting `armU.L -6 voxels, rot +0` looks
+  // exactly like a carve that worked and a rewrite that is broken, and it was
+  // neither.
+  //
+  // Printed at the point of the DECISION and not at the refusal, which is the
+  // lesson `voxStore`'s own probe cost two runs to learn: a bite that never
+  // reached the flesh branch has to say so from inside that branch.
+  static const bool kBiteDebug = [] {
+    const char* e = std::getenv("SANDVOX_BITE_DEBUG");
+    return e != nullptr && e[0] != '0';
+  }();
+
   CarveReport rep{};
   const uint32_t seed = (uint32_t)id_ * 2654435761u + (uint32_t)li * 40503u +
                         hit.seed;
-  if (!CarveBlob(li, local, gt.biteRadius * (0.4f + 0.6f * power), gt.biteBlob,
-                 seed, world, spawns, &rep))
+  const bool survived =
+      CarveBlob(li, centre, biteR, gt.biteBlob, seed, world, spawns, &rep);
+  if (kBiteDebug)
+    std::printf(
+        "bite %s: hp %.2f power %.2f | at (%.2f,%.2f,%.2f) local "
+        "(%.2f,%.2f,%.2f) -> centre (%.2f,%.2f,%.2f) r %.2f | %s, carve %u "
+        "cells (%zu listed) | rim %.2f | infect %u/%u\n",
+        li < (int)limbDefs_.size() ? limbDefs_[(size_t)li].name.c_str() : "?",
+        (double)hit.hp, (double)power, (double)hit.at.x, (double)hit.at.y,
+        (double)hit.at.z, (double)local.x, (double)local.y, (double)local.z,
+        (double)centre.x, (double)centre.y, (double)centre.z, (double)biteR,
+        survived ? "limb survived" : "LIMB DID NOT SURVIVE", rep.count,
+        rep.cells.size(),
+        (double)(CurrentTuning().gore.craterStainRim *
+                 CurrentTuning().gore.biteStainScale),
+        (unsigned)hit.infectMat, (unsigned)hit.infectStain);
+  if (!survived)
     return true;  // the limb did not survive: CarveLimb's contract applies
   if (rep.count == 0 || rep.cells.empty()) return true;
 
@@ -13975,6 +14015,9 @@ bool Mob::BiteHit(uint64_t bodyHandle, const ::BiteHit& hit, World& world,
     const uint32_t took =
         StainWoundAs(li, rep.centreLocal, 0.0f, seed ^ 0x120FEC7u,
                      hit.infectMat, hit.infectStain, &rep.cells, rim);
+    if (kBiteDebug)
+      std::printf("     ...the hole exposed %u cells of FLESH (rewritten)%s\n",
+                  took, took == 0 ? " — NOTHING: all bone, garment or air" : "");
     if (took > 0) {
       limbs_[li].infectMat = hit.infectMat;
       // ...and the liquid it came in, which is what the rot will paint the
@@ -14868,7 +14911,8 @@ void Mob::DetachLimb(int limbIndex, bool adopt) {
     // would visibly coarsen at the moment it came off.
     debris_->AdoptBody(limb.body, limb.voxels, limb.xf,
                        limb.MicroRef(SkinScaleOf(limb)), PhysScaleOf(limb),
-                       std::move(limb.skinVoxels), def.bleedMat, WoundOf(limb));
+                       std::move(limb.skinVoxels), def.bleedMat, WoundOf(limb),
+                       /*dead=*/true);
     limb.skinVoxels.clear();
     limb.carved = false;
     // ...AND THE SLOT FORGETS THE INDEX, not just the ownership. `carved =
@@ -15083,7 +15127,7 @@ void Mob::Die() {
     debris_->AdoptBody(limb.body, limb.voxels, limb.xf,
                        limb.MicroRef(SkinScaleOf(limb)), PhysScaleOf(limb),
                        std::move(limb.skinVoxels), def_->bleedMat,
-                       WoundOf(limb));
+                       WoundOf(limb), /*dead=*/true);
     // A CORPSE FALLS WHERE IT STOOD, which for the avatar is entirely inside
     // the player's capsule proxy, and for an NPC killed at sword's reach is
     // often half inside it. Handing those limbs to the plain MOVING layer in

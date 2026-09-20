@@ -929,12 +929,72 @@ EdgeSweepResult MeleeSweepDamage(const EdgeSweep& s, const MeleeTuning& t,
         out.hasHitAt = true;
       }
 
-      // LIVE FLESH CARVES; DEBRIS MELTS. The same two populations the laser
-      // splits on — but a loose body has no wound model to speak of, so
-      // EVERYTHING that can hurt melts it in one call (StrikeProfile::Total),
-      // which is exactly what the single `damage` float used to do here.
+      // ---- A CORPSE IS CUT THE WAY A BODY IS CUT (2026-09-19) -------------
+      //
+      // This used to read "LIVE FLESH CARVES; DEBRIS MELTS... a loose body has
+      // no wound model to speak of, so EVERYTHING that can hurt melts it in
+      // one call" — `MeltBodyAt`, the LASER's carve: a sphere of the blade's
+      // half-width bored out per swing tick, vaporizing (eject=false, so no
+      // gobbets) and incapable of severing anything, because a sphere is not a
+      // cut. Three owner reports on the same day came out of that one line:
+      //
+      //   "swords shouldn't delete so many voxels off of corpses"  — the
+      //     sphere, which is exactly the shape mob.h's BladeCut was written to
+      //     stop using on the living ("at any radius large enough to feel like
+      //     a sword, most of the arm").
+      //   "no blood comes out"                                     — eject
+      //     false, and a drip where a wound should gout.
+      //   "you can sever the entire bottom half of a head but the top half
+      //     stays"                                                 — a bore
+      //     that never disconnects anything, into a connectivity split that
+      //     was measured on the majority-filled collider (debris.cpp
+      //     ShatterBody, and that is fixed there).
+      //
+      // So the three parts of a strike are resolved for a loose body exactly
+      // as they are for a limb, from the SAME numbers: the kerf below is built
+      // by the identical six lines the live path builds it from — deliberately,
+      // because a corpse is a creature one function call later and a sword does
+      // not know the difference. What a corpse does NOT have is hp, a flinch,
+      // an infection or a cry, and none of those appear here.
       if (kind == StruckKind::Debris) {
-        debris.MeltBodyAt(hb, at, radius, world, spawns);
+        const uint32_t hitSeed =
+            s.tick * 2654435761u + (uint32_t)hitBodies.size() * 40503u;
+        // First contact, asked once and consumed by both impulses — the same
+        // question and the same reason as the live path below.
+        bool firstContact = true;
+        if (s.struck != nullptr &&
+            (s.strike.blunt > 0.0f || s.strike.bite > 0.0f)) {
+          for (uint64_t h : *s.struck) firstContact &= (h != hb);
+          if (firstContact) s.struck->push_back(hb);
+        }
+        if (s.strike.cut > 0.0f) {
+          BladeCut cut;
+          cut.at = at;
+          cut.edgeAxis = seg.normalized();
+          cut.cutDir = sweepDir.len() > 1e-4f ? sweepDir : seg.normalized();
+          cut.halfWidth = std::max(radius * goreT.cutWidth, 0.08f);
+          cut.depth = (goreT.cutDepth + goreT.cutDepthPower * power) * s.heft;
+          cut.length = goreT.cutLength * (0.4f + 0.6f * power) * s.heft;
+          cut.power = power;
+          cut.seed = hitSeed;
+          debris.CutBody(hb, cut, world, spawns);
+        }
+        // Trauma on a thing that cannot feel it is a DENT and nothing else:
+        // no hp, no bruise clock, just the matter a hammer caves in. Only a
+        // profile that carves at all leaves one, which is the same gate
+        // Mob::BluntHit applies (`carve` > 0).
+        if (s.strike.blunt > 0.0f && firstContact && s.strike.bluntCarve > 0.0f)
+          debris.BluntBody(hb, at,
+                           goreT.bluntCarveRadius * s.strike.bluntCarve * power,
+                           hitSeed ^ 0xB1u, world, spawns);
+        // A bite is a TEAR, and on a corpse that is all it is — the infection
+        // it would leave in living tissue has nothing to progress through.
+        if (s.strike.bite > 0.0f && firstContact &&
+            !(s.bitten != nullptr && *s.bitten)) {
+          debris.BluntBody(hb, at, goreT.biteRadius * power,
+                           hitSeed ^ 0xB17Eu, world, spawns);
+          if (s.bitten != nullptr) *s.bitten = true;
+        }
         continue;
       }
 
@@ -1060,7 +1120,15 @@ EdgeSweepResult MeleeSweepDamage(const EdgeSweep& s, const MeleeTuning& t,
       // ...and at most ONE bite for the whole stroke (melee.h EdgeSweep::
       // bitten). `firstContact` alone is per BODY, which lets one lunge tear
       // the head, the chest and an arm as the jaws sweep past all three.
-      if (s.strike.bite > 0.0f && firstContact &&
+      // ...and on the LIMB THE STROKE DREW, while it still can (melee.h
+      // EdgeSweep::bitePrefer). The jaws pass the chest on their way to an arm,
+      // and spending the stroke's one bite on the first thing touched made every
+      // authored `target` weight a lie about where wounds ended up. Held only
+      // while `biteHoldout` says there are cut ticks left to find the drawn limb
+      // in; on the last one this test is off and first contact wins.
+      const bool wrongTarget = s.bitePrefer != 0 && hb != s.bitePrefer &&
+                               s.biteHoldout;
+      if (s.strike.bite > 0.0f && firstContact && !wrongTarget &&
           !(s.bitten != nullptr && *s.bitten)) {
         BiteHit bt;
         bt.at = at;

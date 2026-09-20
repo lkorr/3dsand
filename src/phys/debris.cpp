@@ -268,6 +268,16 @@ constexpr uint32_t kBurnRebuildVoxels = 12;
 // Connectivity re-check after burning is O(n) per body; run it only when
 // enough matter has actually left to plausibly disconnect the remainder.
 constexpr uint32_t kShatterCheckVoxels = 6;
+// How often a body with something eatable on it asks the world whether a
+// SOLVENT is sitting against it (BurnBodies' willScan, DebrisSystem::ThreatNear).
+// A settled pool of acid leaves no dirty chunk, so this is the only thing that
+// ever wakes a corpse lying in one. Staggered by body serial, so 8 means one
+// eighth of the bodies pay a handful of cached reads on any given tick.
+constexpr uint32_t kInboundProbeTicks = 8;
+// Lattice-box corners plus the centre, in the units of whichever lattice is
+// being probed. Nine reads is enough to find a pool a body is lying in and
+// cheap enough to run on every corpse on the field.
+constexpr int kThreatProbePoints = 9;
 
 // ---- impact cue budgets (DESIGN.md §12b) ------------------------------------
 // The fixed sim rate, which is also the rate PostStep runs at, so the per-body
@@ -414,6 +424,8 @@ void DebrisSystem::OnMaterialsReloaded(const std::vector<MaterialDef>& mats,
   matSelfScaled_.clear();
   matHasPair_.clear();
   matHasScaled_.clear();
+  matRewritesNbr_.clear();
+  matInboundTarget_.clear();
   reactions_ = reactions;
   uint32_t selfIdx = 0;
   for (const auto& m : mats) {
@@ -432,7 +444,7 @@ void DebrisSystem::OnMaterialsReloaded(const std::vector<MaterialDef>& mats,
     // the rest of the session -- the light-gated-rules-never-sleep trap
     // (CLAUDE.md rule 2) wearing a different condition. Gated self rules go
     // in their own column and wake a body only with fire nearby.
-    uint8_t selfActive = 0, selfScaled = 0, hasPair = 0;
+    uint8_t selfActive = 0, selfScaled = 0, hasPair = 0, rewrites = 0;
     for (uint32_t ri = 0; ri < m.gpu.reactCount; ri++) {
       const ReactionGpu& r = reactions_[m.gpu.reactOffset + ri];
       uint32_t kind = r.packed & 3u;
@@ -440,11 +452,19 @@ void DebrisSystem::OnMaterialsReloaded(const std::vector<MaterialDef>& mats,
         if (ReactScaleArmed(r)) selfScaled = 1;
         else selfActive = 1;
       }
-      if (kind == kReactPair) hasPair = 1;
+      if (kind == kReactPair) {
+        hasPair = 1;
+        // ...and can it act on whatever is next to it? That is the rule shape
+        // the inbound pass runs, and it is the only shape that matters when
+        // the neighbour is a BODY: a rule that keeps its neighbour has nothing
+        // to say to one.
+        if (r.prodNbr != kProdKeep) rewrites = 1;
+      }
     }
     matSelfActive_.push_back(selfActive);
     matSelfScaled_.push_back(selfScaled);
     matHasPair_.push_back(hasPair);
+    matRewritesNbr_.push_back(rewrites);
     // Does ANY of this material's rules use the neighbour-count ramp? The burn
     // pass needs the body-local occupancy map to count neighbours, and an
     // inactive body normally skips building it — so without this flag a scaled
@@ -467,6 +487,25 @@ void DebrisSystem::OnMaterialsReloaded(const std::vector<MaterialDef>& mats,
     for (const auto& t : m.tags)
       if (t == "foliage") foliage = 1;
     foliageOf_.push_back(foliage);
+  }
+  // ---- WHICH MATERIALS THE GRID CAN EAT ------------------------------------
+  // A second pass, because the predicate test needs the whole material table
+  // and the loop above is still building it. Every rewrite rule is asked, once,
+  // which of the materials it would match — so a body can later answer "is
+  // there anything on me the world could act on?" with one array read per
+  // voxel instead of a rule walk. Nothing is hardcoded: adding a new solvent to
+  // reactions.json extends this table on the next reload, exactly as it
+  // extends the GPU's.
+  matInboundTarget_.assign(matGpu_.size(), 0);
+  for (size_t sm = 1; sm < matGpu_.size(); sm++) {
+    if (!matRewritesNbr_[sm]) continue;
+    const MaterialGpu& g = matGpu_[sm];
+    for (uint32_t ri = 0; ri < g.reactCount; ri++) {
+      const ReactionGpu& r = reactions_[g.reactOffset + ri];
+      if ((r.packed & 3u) != kReactPair || r.prodNbr == kProdKeep) continue;
+      for (size_t tm = 1; tm < matGpu_.size(); tm++)
+        if (ReactNbrMatches(r, (uint32_t)tm, matGpu_)) matInboundTarget_[tm] = 1;
+    }
   }
   for (Body& b : bodies_) RecountBurn(b);  // hot-reload can change rule sets
 }
@@ -514,6 +553,15 @@ void DebrisSystem::RecountBurn(Body& b) const {
   b.activeCount = 0;
   b.pairCount = 0;
   b.scaledCount = 0;
+  b.inboundCount = 0;
+  b.internalPair = false;
+  // WHICH MATERIALS ARE ON THIS BODY, for the internal-pair test below. Reused
+  // across calls and cleared by the same walk that fills it, so a recount stays
+  // one pass over the lattice plus one over the materials it actually found.
+  if (presentScratch_.size() < matGpu_.size())
+    presentScratch_.assign(matGpu_.size(), 0);
+  std::vector<uint32_t>& found = foundScratch_;
+  found.clear();
   // Counted on the AUTHORITATIVE lattice. On a fine-skinned body `voxels` is a
   // majority-filled derivation, so a handful of burning skin voxels can vanish
   // from it entirely — and a body whose activeCount reads 0 is a body this pass
@@ -523,12 +571,34 @@ void DebrisSystem::RecountBurn(Body& b) const {
     if (matSelfActive_[m]) b.activeCount++;
     if (matSelfScaled_[m]) b.scaledCount++;
     if (matHasPair_[m]) b.pairCount++;
+    if (m < matInboundTarget_.size() && matInboundTarget_[m]) b.inboundCount++;
+    if (!presentScratch_[m]) {
+      presentScratch_[m] = 1;
+      found.push_back(m);
+    }
   };
   if (b.HasFineSkin()) {
     for (const PrefabVoxel& v : b.skinVoxels) tally(v.material & 0xFFFu);
   } else {
     for (const DebrisVoxel& v : b.voxels) tally(v.payload & 0xFFFu);
   }
+  // ---- CAN IT REACT WITH ITSELF? (Body::internalPair) ----------------------
+  // Every material present, against every pair rule every material present
+  // authors. Bounded by the number of DISTINCT materials on one body — four or
+  // five on a limb, a dozen on a dressed corpse — not by its voxel count, so a
+  // 14k-voxel torso pays the same as a hand.
+  for (uint32_t sm : found) {
+    if (b.internalPair) break;
+    if (!matHasPair_[sm]) continue;
+    const MaterialGpu& g = matGpu_[sm];
+    for (uint32_t ri = 0; ri < g.reactCount && !b.internalPair; ri++) {
+      const ReactionGpu& r = reactions_[g.reactOffset + ri];
+      if ((r.packed & 3u) != kReactPair) continue;
+      for (uint32_t tm : found)
+        if (ReactNbrMatches(r, tm, matGpu_)) { b.internalPair = true; break; }
+    }
+  }
+  for (uint32_t sm : found) presentScratch_[sm] = 0;
   // Cached identity for the impact cue, refreshed here because this is already
   // the one function every site that rewrites a body's voxel lattice calls —
   // adoption, split, shatter fragment, damage, materials hot-reload. A body
@@ -2649,6 +2719,9 @@ void DebrisSystem::BurnBodies(uint32_t tick, World& world,
   // bodies that burned below body-worthiness, erased after the loop: the
   // rotated visit order below cannot survive a mid-loop swap-remove
   std::vector<size_t> dead;
+  // Per body: is a solvent in contact with it right now? Filled below, read by
+  // `willScan` and by the inbound pass. See the note where it is filled.
+  std::vector<uint8_t> threat;
 
   // FAIR SHARE OF THE SCAN BUDGET, or the tail of the list never burns.
   //
@@ -2682,15 +2755,48 @@ void DebrisSystem::BurnBodies(uint32_t tick, World& world,
                                                   : b.voxels.size());
     if (n == 0) return false;
     if (b.activeCount > 0) return true;
+    // A BODY THAT REACTS WITH ITSELF NEEDS NOTHING OUTSIDE IT. Rot creeping
+    // out of a bite through a corpse's own tissue is the case: it is a pair
+    // rule between two materials both ON the body, so the world can be
+    // perfectly settled and the process is still live. Demanding a dirty chunk
+    // for it is what stopped rot the moment the fight ended (Body::internalPair
+    // carries the rule-2 argument for why this still sleeps).
+    if (b.internalPair) return true;
     // Nothing alight on it: only fire in the world can change it, through a
     // pair rule (skin + hot) or a gated self rule (char relighting), and the
     // world's fire shows as a dirty chunk. A body that is all char, lying in
     // a settled world, costs these two reads and nothing else.
-    return (b.pairCount > 0 || b.scaledCount > 0) &&
-           AnyDirtyNear(b, snap, world);
+    if ((b.pairCount > 0 || b.scaledCount > 0) && AnyDirtyNear(b, snap, world))
+      return true;
+    // ...and the SOLVENT case, which is `threat[]` below: asked once per body
+    // per tick and cached, because this predicate runs twice.
+    return threat[&b - bodies_.data()] != 0;
   };
   const size_t nb = bodies_.size();
   const size_t startBody = (size_t)(tick % (uint32_t)nb);
+  // ---- ...AND THE THING EATING IT MAY BE HOLDING PERFECTLY STILL -----------
+  // A pool of acid with a corpse in it settles: nothing in the grid changes,
+  // the chunk sleeps, and `AnyDirtyNear` says no forever — while the acid is
+  // still right there. Dirtiness is a proxy for "something is happening
+  // nearby", and for a solvent it is the wrong proxy, because the solvent
+  // doing its job is the body's business and not the grid's.
+  //
+  // So a body with something eatable on it asks the world DIRECTLY: nine
+  // cached chunk reads (ThreatNear), and only for bodies that have an inbound
+  // target at all — organics, i.e. corpses and dropped cloth, never a rock.
+  //
+  // THE ANSWER IS ALSO A BUDGET GATE, and that is the more important half. The
+  // inbound pass needs the body-local occupancy map to tell "outside me" from
+  // "inside me", and building that map is O(lattice) with a hash entry per
+  // voxel — 14k of them on a human torso. Keyed on `inboundCount` alone it
+  // would be built every tick for every corpse on the field whether or not
+  // anything was eating it, which measured as a 25x slowdown of the whole
+  // selftest suite. Keyed on a solvent actually being in contact, it costs
+  // nine reads and is paid only while a body is genuinely dissolving.
+  threat.assign(nb, 0);
+  for (size_t i = 0; i < nb; i++)
+    if (bodies_[i].inboundCount > 0 && ThreatNear(bodies_[i], world))
+      threat[i] = 1;
   uint32_t scanners = 0;
   for (const Body& b : bodies_)
     if (willScan(b)) scanners++;
@@ -2813,7 +2919,18 @@ void DebrisSystem::BurnBodies(uint32_t tick, World& world,
     }
     // local occupancy for internal spread; values are voxel indices, entries
     // whose payload was zeroed this pass read as absent
-    const bool haveLocal = active || anyScaled;
+    //
+    // THE INBOUND PASS NEEDS IT TOO, and needs it for a reason worth stating:
+    // without the map every direction reads as "world", so an INTERIOR voxel
+    // of a body lying in acid would find acid on all six faces and the whole
+    // torso would dissolve at once instead of from its surface inward. The map
+    // is what makes "outside me" mean outside me.
+    //
+    // ...but ONLY while something is actually eating it (`threat`), never
+    // merely because it is edible. See where `threat` is filled: the
+    // difference between those two conditions was a 25x suite slowdown.
+    const bool inbound = threat[bi] != 0;
+    const bool haveLocal = active || anyScaled || inbound;
     std::unordered_map<uint32_t, uint32_t> local;
     if (haveLocal) {
       local.reserve(n * 2);
@@ -2889,8 +3006,32 @@ void DebrisSystem::BurnBodies(uint32_t tick, World& world,
     auto countMatches = [&](IVec3 v, const ReactionGpu& r) {
       const bool invert = ReactScaleInverted(r);
       uint32_t count = 0;
+      // ---- ...AND HOW WIDE THE FIRE OUTSIDE IS (2026-09-19) ---------------
+      // The widest single WORLD-pitch face found below. A corpse is the same
+      // scale-8 lattice a live limb is, and the whole argument
+      // MobSystem::BurnOneLimb makes about this applies here word for word:
+      // five of a skin sub-voxel's six faces are its own flesh however large
+      // the fire outside it is, so a lattice count reaches flesh's authored
+      // minCount 3 only on a convex CORNER. Measured on the live creature
+      // before the same fix: 92% of every ignition roll refused, 11 of 22,775
+      // flesh voxels lost over a 90-tick immersion. A CORPSE HAD NOTHING
+      // EQUIVALENT — which is the owner report that corpses do not really
+      // burn, and it is the same bug one population later.
+      //
+      // So a face pointing into matter the rule reacts to counts for as much
+      // as that matter is WIDE across the face (1..5), taken as a MAX against
+      // the lattice count rather than a sum: the two are the same quantity
+      // measured at two pitches and adding them would double-count the cell
+      // that produced the face in the first place. One cell of flame is still
+      // 1 and still gutters out; a wall of flame is 5 and takes hold. Direct
+      // ramps only, for the reason the live pass gives: an INVERTED ramp is
+      // counting what is NOT there and the wide reading is a different
+      // question.
+      uint32_t widest = 0;
       for (const IVec3& d : kDirs) {
         uint32_t nm = localMatAt(v.x + d.x, v.y + d.y, v.z + d.z);
+        bool fromWorld = false;
+        IVec3 wc{};
         if (nm == 0) {
           // ONE LATTICE STEP, not one world cell: on a scale-8 body a whole
           // cell steps over eight of the body's own voxels and reads a
@@ -2898,11 +3039,27 @@ void DebrisSystem::BurnBodies(uint32_t tick, World& world,
           const Vec3 wv = worldOfLocal(v) + rotQ(Vec3{(float)d.x * latInv,
                                                       (float)d.y * latInv,
                                                       (float)d.z * latInv});
-          nm = worldMatAt({ifloor(wv.x), ifloor(wv.y), ifloor(wv.z)});
+          wc = IVec3{ifloor(wv.x), ifloor(wv.y), ifloor(wv.z)};
+          nm = worldMatAt(wc);
+          fromWorld = nm != 0;
         }
-        if (ReactNbrMatches(r, nm, matGpu_) != invert) count++;
+        const bool match = ReactNbrMatches(r, nm, matGpu_);
+        if (match != invert) count++;
+        if (invert || !fromWorld || !match) continue;
+        // The tangential ring around that world cell, at WORLD pitch. The
+        // direction the face points is `d` in LATTICE space; the ring is the
+        // four world axes perpendicular to where that points in the world.
+        const IVec3 wd = worldDirOf(d);
+        uint32_t w = 1;  // the face's own cell, already known to match
+        for (const IVec3& e : kDirs) {
+          if (e.x * wd.x + e.y * wd.y + e.z * wd.z != 0) continue;  // parallel
+          if (ReactNbrMatches(r, worldMatAt({wc.x + e.x, wc.y + e.y,
+                                             wc.z + e.z}), matGpu_))
+            w++;
+        }
+        widest = std::max(widest, w);
       }
-      return count;
+      return std::max(count, widest);
     };
     uint32_t steps = std::min(n, std::min(share, scanBudget));
     scanBudget -= steps;
@@ -2912,10 +3069,16 @@ void DebrisSystem::BurnBodies(uint32_t tick, World& world,
       uint32_t m = lat.Mat(vi);
       if (m == 0 || m >= matGpu_.size()) continue;
       const MaterialGpu& mg = matGpu_[m];
-      if (mg.reactCount == 0) continue;
-      if (!active && !matHasPair_[m] && !matSelfScaled_[m]) continue;
+      // WHETHER THE SELF PASS RUNS AT ALL is a separate question from whether
+      // the INBOUND pass below does, and conflating them is what made bone
+      // (which authors no rules whatsoever, on purpose) immune to acid on a
+      // corpse while dissolving on the creature it came off. A voxel with
+      // nothing to say still has something that can be said to it.
+      bool fired = false;
+      const bool runSelf = mg.reactCount != 0 &&
+                           (active || matHasPair_[m] || matSelfScaled_[m]);
 
-      for (uint32_t ri = 0; ri < mg.reactCount; ri++) {
+      for (uint32_t ri = 0; runSelf && ri < mg.reactCount; ri++) {
         const ReactionGpu& r = reactions_[mg.reactOffset + ri];
         uint32_t kind = r.packed & 3u;
         uint32_t dmask = (r.packed >> 2u) & 7u;
@@ -2936,7 +3099,7 @@ void DebrisSystem::BurnBodies(uint32_t tick, World& world,
         // one roll per rule, GPU-style — chance is in 1/kReactChanceDen units,
         // so this must use the same denominator sim_step.wgsl rolls against
         if (rr % kReactChanceDen >= chance) continue;
-        bool fired = false;
+        fired = false;
 
         if (kind == kReactDecay) {
           applyProduct(vi, r.prodSelf, rr);
@@ -3015,6 +3178,61 @@ void DebrisSystem::BurnBodies(uint32_t tick, World& world,
         if (fired) {
           changed = true;
           break;  // at most one rule per voxel per tick, file order
+        }
+      }
+
+      // ---- 2. INBOUND: a world neighbour's rule that rewrites ME -----------
+      //
+      // THE DIRECTION A RIGIDBODY COULD NOT BE ACTED ON FROM, until now. Acid
+      // is authored as `acid + tag:organic -> neighborBecomes air`, i.e. from
+      // the ACID's side, which is the direction the GPU evaluates it over the
+      // grid and the direction MobSystem::BurnOneLimb evaluates it over a live
+      // limb. The pair branch above can only ever match a world cell whose
+      // rule KEEPS its neighbour — a body may not rewrite grid content — so
+      // every rule shaped like acid's fell straight through it.
+      //
+      // The consequence was the owner report of 2026-09-19 in one line: a
+      // creature standing in acid dissolved and its corpse, which is the same
+      // fifteen limbs one function call later, did not. Mirroring the rules
+      // per body material would be an N x M table whose two halves drift, so
+      // this is the same shape mob.cpp uses — evaluate the neighbour's own
+      // rule, in the neighbour's own direction, from the one table.
+      //
+      // WORLD NEIGHBOURS ONLY. A body-internal neighbour was already offered
+      // its rewrite by the pair branch above (`matched >= 0`), and running it
+      // again here would give one voxel two chances at the same rule.
+      if (!fired && inbound && m < matInboundTarget_.size() &&
+          matInboundTarget_[m]) {
+        const Vec3 wp = worldOfLocal(v);
+        for (const IVec3& d : kDirs) {
+          if (fired) break;
+          // ONE LATTICE STEP, for the reason countMatches gives.
+          if (localMatAt(v.x + d.x, v.y + d.y, v.z + d.z) != 0) continue;
+          const Vec3 wn = wp + rotQ(Vec3{(float)d.x * latInv,
+                                         (float)d.y * latInv,
+                                         (float)d.z * latInv});
+          const uint32_t wm =
+              worldMatAt({ifloor(wn.x), ifloor(wn.y), ifloor(wn.z)});
+          if (wm == 0 || wm >= matRewritesNbr_.size() || !matRewritesNbr_[wm])
+            continue;
+          const MaterialGpu& wg = matGpu_[wm];
+          for (uint32_t rj = 0; rj < wg.reactCount; rj++) {
+            const ReactionGpu& r = reactions_[wg.reactOffset + rj];
+            if ((r.packed & 3u) != kReactPair || r.prodNbr == kProdKeep)
+              continue;
+            if (!ReactNbrMatches(r, m, matGpu_)) continue;
+            if (!ReactLightMatches(r, dayPhase_, /*seesSky=*/true)) continue;
+            // A distinct rule-index space (+64) from the self pass, the same
+            // separation BurnOneLimb draws: a voxel that is both burning and
+            // dissolving must not roll one stream twice and correlate them.
+            const uint32_t rr =
+                Hash3(b.serial * 668265263u + vi, tick, 64u + rj);
+            if (rr % kReactChanceDen >= r.chance) continue;
+            applyProduct(vi, r.prodNbr, rr);
+            fired = true;
+            changed = true;
+            break;
+          }
         }
       }
     }
@@ -3134,72 +3352,173 @@ void DebrisSystem::BurnBodies(uint32_t tick, World& world,
 
 void DebrisSystem::ShatterBody(Body& b, World& world, std::vector<Body>& fragments,
                                std::vector<ParticleSpawn>& spawns,
-                               uint32_t minFragment, uint32_t& budget) {
-  const uint32_t n = (uint32_t)b.voxels.size();
-  if (n < 2) return;
-  std::unordered_map<uint32_t, uint32_t> map;
-  map.reserve(n * 2);
-  for (uint32_t i = 0; i < n; i++)
-    map[LocalKey(b.voxels[i].x, b.voxels[i].y, b.voxels[i].z)] = i;
-
-  // 6-connected components in body-local space
-  std::vector<int32_t> comp(n, -1);
+                               uint32_t minFragment, uint32_t& budget,
+                               bool fineConnectivity) {
+  // ---- CONNECTIVITY IS DECIDED ON THE AUTHORITATIVE LATTICE (2026-09-19) ---
+  //
+  // It used to be decided on the COLLIDER, always, with a fine skin joining
+  // whichever collider block each of its voxels sat in — "running a second
+  // connectivity pass on the skin would be both slower and wrong", on the
+  // grounds that the two could disagree about how many pieces there are.
+  //
+  // They can disagree, and when they do the SKIN is the one that is right,
+  // because the skin is what carving edits and what the player sees. The
+  // collider is a majority-fill of it: at skinScale 8 over physScale 2, a
+  // block reads as solid when 32 of its 64 skin cells are, so a kerf four skin
+  // voxels wide — a sword's cut, all the way through a neck — leaves every
+  // collider block along the cut still filled and the body still one
+  // component. That is the owner report of 2026-09-19, exactly: "you can sever
+  // the entire bottom half of a head but the top half stays and it doesn't
+  // actually detach". The art was cut through; the lattice the split was
+  // measured on was not.
+  //
+  // So the flood runs on the skin when there is one, and each fragment's
+  // COLLIDER is derived from its own skin part (DownsampleSkin) rather than
+  // partitioned alongside it. The two cannot disagree about how many pieces
+  // there are, because only one of them is asked — the same skin-is-
+  // authoritative rule DamageBody and DeriveColliderFromSkin already follow.
+  //
+  // COST: one flood over the fine lattice instead of the coarse one, on a
+  // carve or every kShatterCheckVoxels burned away, never per tick.
+  const uint32_t ratio =
+      b.HasFineSkin() ? std::max(1u, b.micro.skinScale / b.physScale) : 1u;
+  // 21 bits per axis, like DownsampleSkin's: the coarse lattice fits in
+  // LocalKey's byte per axis but a skin one does not (a human torso is ~240
+  // skin voxels tall), and a packed-byte key would silently alias two ends of
+  // it into one component.
+  auto key64 = [](int x, int y, int z) -> uint64_t {
+    return ((uint64_t)(uint32_t)(x + 1024) << 42) |
+           ((uint64_t)(uint32_t)(y + 1024) << 21) |
+           (uint64_t)(uint32_t)(z + 1024);
+  };
+  // 6-connected components over whichever lattice is being asked. Returns the
+  // component count; `comp` is per-voxel and `compSize` per component.
+  std::vector<int32_t> comp;
   std::vector<uint32_t> compSize;
   std::vector<uint32_t> stack;
-  for (uint32_t seed = 0; seed < n; seed++) {
-    if (comp[seed] != -1) continue;
-    int32_t c = (int32_t)compSize.size();
-    uint32_t size = 0;
-    stack.assign(1, seed);
-    comp[seed] = c;
-    while (!stack.empty()) {
-      uint32_t i = stack.back();
-      stack.pop_back();
-      size++;
-      const DebrisVoxel& v = b.voxels[i];
-      const int d[6][3] = {{1, 0, 0}, {-1, 0, 0}, {0, 1, 0},
-                           {0, -1, 0}, {0, 0, 1}, {0, 0, -1}};
-      for (auto& dd : d) {
-        auto it = map.find(LocalKey(v.x + dd[0], v.y + dd[1], v.z + dd[2]));
-        if (it != map.end() && comp[it->second] == -1) {
-          comp[it->second] = c;
-          stack.push_back(it->second);
+  auto flood = [&](uint32_t count, auto posAt) {
+    comp.assign(count, -1);
+    compSize.clear();
+    std::unordered_map<uint64_t, uint32_t> map;
+    map.reserve(count * 2);
+    for (uint32_t i = 0; i < count; i++) {
+      const IVec3 p = posAt(i);
+      map[key64(p.x, p.y, p.z)] = i;
+    }
+    for (uint32_t seed = 0; seed < count; seed++) {
+      if (comp[seed] != -1) continue;
+      int32_t c = (int32_t)compSize.size();
+      uint32_t size = 0;
+      stack.assign(1, seed);
+      comp[seed] = c;
+      while (!stack.empty()) {
+        uint32_t i = stack.back();
+        stack.pop_back();
+        size++;
+        const IVec3 v = posAt(i);
+        const int d[6][3] = {{1, 0, 0}, {-1, 0, 0}, {0, 1, 0},
+                             {0, -1, 0}, {0, 0, 1}, {0, 0, -1}};
+        for (auto& dd : d) {
+          auto it = map.find(key64(v.x + dd[0], v.y + dd[1], v.z + dd[2]));
+          if (it != map.end() && comp[it->second] == -1) {
+            comp[it->second] = c;
+            stack.push_back(it->second);
+          }
         }
       }
+      compSize.push_back(size);
     }
-    compSize.push_back(size);
+    return (uint32_t)compSize.size();
+  };
+
+  // THE COLLIDER FIRST, because it is the cheap one and it is usually right:
+  // anything that erodes a body (fire, acid, a blast) removes matter at every
+  // scale and parts the coarse lattice too.
+  if (b.voxels.size() >= 2)
+    flood((uint32_t)b.voxels.size(), [&](uint32_t i) {
+      return IVec3{b.voxels[i].x, b.voxels[i].y, b.voxels[i].z};
+    });
+  bool fine = false;
+  if (compSize.size() <= 1 && fineConnectivity && b.HasFineSkin() &&
+      b.skinVoxels.size() >= 2) {
+    // ...AND THE SKIN WHEN A BLADE WENT THROUGH IT. The collider is a
+    // majority-fill of the skin: at skinScale 8 over physScale 4 a block reads
+    // as solid when 32 of its 64 skin cells are, so a kerf a few skin voxels
+    // wide — a sword's cut, all the way through a neck — leaves every block
+    // along the cut still filled and the body still one component. That is the
+    // owner report of 2026-09-19 exactly: "you can sever the entire bottom
+    // half of a head but the top half stays and it doesn't actually detach".
+    // The art was cut through; the lattice the split was measured on was not.
+    //
+    // When the skin disagrees, the SKIN is right — it is what carving edits
+    // and what the player sees — so the partition is taken from it and each
+    // fragment's collider is DERIVED from its own skin part below. The two
+    // cannot then disagree about how many pieces there are, because only one
+    // of them is asked.
+    fine = true;
+    flood((uint32_t)b.skinVoxels.size(), [&](uint32_t i) {
+      return IVec3{b.skinVoxels[i].x, b.skinVoxels[i].y, b.skinVoxels[i].z};
+    });
   }
   if (compSize.size() <= 1) return;
+  const uint32_t n = (uint32_t)(fine ? b.skinVoxels.size() : b.voxels.size());
 
   uint32_t keep = 0;
   for (uint32_t c = 1; c < compSize.size(); c++)
     if (compSize[c] > compSize[keep]) keep = c;
 
-  std::vector<std::vector<DebrisVoxel>> parts(compSize.size());
-  for (uint32_t c = 0; c < compSize.size(); c++) parts[c].reserve(compSize[c]);
-  for (uint32_t i = 0; i < n; i++) parts[comp[i]].push_back(b.voxels[i]);
-
-  // A fine skin follows the COARSE partition: connectivity is decided once, on
-  // the collider lattice, and each skin voxel joins whichever component owns
-  // the collider block it sits in. Running a second connectivity pass on the
-  // skin would be both slower and wrong — the two could disagree about how many
-  // pieces there are, and then a fragment's art would not match its collider.
+  // The partition, on whichever lattice answered. `parts` is always the
+  // collider one — every consumer below (the fragment's Jolt shape, the
+  // particle handoff, the size floor) speaks in collider voxels — so on a fine
+  // body it is DERIVED from the skin part, component by component.
   std::vector<std::vector<PrefabVoxel>> skinParts;
-  if (b.HasFineSkin()) {
-    const int ratio = (int)std::max(1u, b.micro.skinScale / b.physScale);
-    std::unordered_map<uint32_t, uint32_t> compOf;
-    compOf.reserve(n * 2);
-    for (uint32_t i = 0; i < n; i++)
-      compOf[LocalKey(b.voxels[i].x, b.voxels[i].y, b.voxels[i].z)] = comp[i];
+  std::vector<std::vector<DebrisVoxel>> parts(compSize.size());
+  if (fine) {
     skinParts.resize(compSize.size());
-    for (const PrefabVoxel& sv : b.skinVoxels) {
-      auto it = compOf.find(LocalKey((int)sv.x / ratio, (int)sv.y / ratio,
-                                     (int)sv.z / ratio));
-      // A skin voxel whose collider block did not survive majority-fill has no
-      // component to join; it is interior detail of a block that reads as air,
-      // and dropping it keeps skin and collider describing the same object.
-      if (it != compOf.end()) skinParts[it->second].push_back(sv);
+    for (uint32_t c = 0; c < compSize.size(); c++)
+      skinParts[c].reserve(compSize[c]);
+    for (uint32_t i = 0; i < n; i++)
+      skinParts[comp[i]].push_back(b.skinVoxels[i]);
+    bool overflow = false;
+    for (uint32_t c = 0; c < compSize.size(); c++)
+      parts[c] = DownsampleSkin(skinParts[c], ratio, &overflow);
+  } else {
+    for (uint32_t c = 0; c < compSize.size(); c++) parts[c].reserve(compSize[c]);
+    for (uint32_t i = 0; i < n; i++) parts[comp[i]].push_back(b.voxels[i]);
+    // THE COLLIDER ANSWERED, so a fine skin follows its partition: each skin
+    // voxel joins whichever collider block it sits in. Unchanged from before
+    // the escalation above existed, and it is the right shape for the case it
+    // still serves — the coarse lattice really did come apart, so the two
+    // cannot disagree about the piece count and the cheap mapping is exact.
+    if (b.HasFineSkin()) {
+      std::unordered_map<uint64_t, uint32_t> compOf;
+      compOf.reserve(n * 2);
+      for (uint32_t i = 0; i < n; i++)
+        compOf[key64(b.voxels[i].x, b.voxels[i].y, b.voxels[i].z)] = comp[i];
+      skinParts.resize(compSize.size());
+      for (const PrefabVoxel& sv : b.skinVoxels) {
+        auto it = compOf.find(key64((int)sv.x / (int)ratio,
+                                    (int)sv.y / (int)ratio,
+                                    (int)sv.z / (int)ratio));
+        // A skin voxel whose collider block did not survive majority-fill has
+        // no component to join; it is interior detail of a block that reads as
+        // air, and dropping it keeps skin and collider describing one object.
+        if (it != compOf.end()) skinParts[it->second].push_back(sv);
+      }
     }
+  }
+  // A SKIN COMPONENT CAN MAJORITY-FILL TO NOTHING: a four-voxel splinter of a
+  // scale-8 skin is far short of half a collider block, so its derived lattice
+  // is empty. It still has to GO somewhere — leaving it on the parent would
+  // put art on a body whose collider does not cover it — so the skin follows
+  // whatever its own component became, and an empty one becomes particles
+  // below like any under-floor piece.
+  if (fine && parts[keep].empty()) {
+    // ...and if the largest piece is the one that vanished, there is nothing
+    // to split: leave the body exactly as it was rather than dissolving it.
+    for (uint32_t c = 0; c < parts.size(); c++)
+      if (!parts[c].empty()) { keep = c; break; }
+    if (parts[keep].empty()) return;
   }
 
   Vec3 lin{}, ang{};
@@ -3242,6 +3561,7 @@ void DebrisSystem::ShatterBody(Body& b, World& world, std::vector<Body>& fragmen
       nb.micro = b.micro;
       nb.physScale = b.physScale;  // MUST precede the pitch below
       nb.bleedMat = b.bleedMat;
+      nb.dead = b.dead;  // half a corpse is still a corpse
       // The fragment's skin rebases by the SAME corner, expressed in skin
       // units. Both lattices must land on one origin or the art slides off the
       // collider — the same agreement ReskinMicro maintains after a carve.
@@ -3254,7 +3574,17 @@ void DebrisSystem::ShatterBody(Body& b, World& world, std::vector<Body>& fragmen
           sv.z = (int16_t)(sv.z - mn.z * ratio);
         }
       }
-      nb.xf.pos += QuatRot(b.xf.quat, Vec3{(float)mn.x, (float)mn.y, (float)mn.z});
+      // IN WORLD VOXELS, WHICH `mn` IS NOT. The rebase moved the fragment's
+      // origin by `mn` COLLIDER voxels, and a collider voxel is 1/physScale of
+      // a world one — so a scale-2 fragment used to be teleported twice as far
+      // as its lattice actually moved. Latent until this commit because a
+      // fine-skinned body's collider never came apart (see the connectivity
+      // note above): the only bodies that reached here were physScale 1, where
+      // the divisor is 1 and the two readings coincide.
+      const float mnInv = 1.0f / (float)std::max(1u, nb.physScale);
+      nb.xf.pos += QuatRot(b.xf.quat, Vec3{(float)mn.x * mnInv,
+                                           (float)mn.y * mnInv,
+                                           (float)mn.z * mnInv});
       const float pitch = 1.0f / (float)std::max(1u, nb.physScale);
       nb.handle =
           phys_->CreateDebrisBodyXf(parts[c], nb.xf, densityOf_, false, pitch);
@@ -3411,6 +3741,42 @@ bool DebrisSystem::AnyDirtyNear(const Body& b, const WorldSnapshot& snap,
   return false;
 }
 
+// ---- IS SOMETHING SITTING AGAINST THIS BODY THAT COULD EAT IT? -------------
+//
+// The still-pool answer to AnyDirtyNear (see willScan). Nine world cells —
+// the body's own centre and the eight corners of its local lattice box, all
+// transformed into world space — read through the chunk cache and tested
+// against matRewritesNbr_. Not a containment test and not meant to be: it is a
+// WAKE signal, and the per-voxel pass that follows is what decides where the
+// acid actually touches. A miss costs a tick of probe cadence, never a wrong
+// dissolve.
+bool DebrisSystem::ThreatNear(const Body& b, World& world) const {
+  RefreshLocalBounds(const_cast<Body&>(b));
+  const float inv = 1.0f / (float)std::max(1u, b.physScale);
+  const float lo[3] = {(float)b.lmin[0], (float)b.lmin[1], (float)b.lmin[2]};
+  const float hi[3] = {(float)b.lmax[0] + 1.0f, (float)b.lmax[1] + 1.0f,
+                       (float)b.lmax[2] + 1.0f};
+  Vec3 pts[kThreatProbePoints];
+  int np = 0;
+  for (int c = 0; c < 8; c++)
+    pts[np++] = Vec3{(c & 1 ? hi[0] : lo[0]) * inv, (c & 2 ? hi[1] : lo[1]) * inv,
+                     (c & 4 ? hi[2] : lo[2]) * inv};
+  pts[np++] = Vec3{(lo[0] + hi[0]) * 0.5f * inv, (lo[1] + hi[1]) * 0.5f * inv,
+                   (lo[2] + hi[2]) * 0.5f * inv};
+  for (int i = 0; i < np; i++) {
+    const Vec3 wp = b.xf.pos + QuatRot(b.xf.quat, pts[i]);
+    const IVec3 c{ifloor(wp.x), ifloor(wp.y), ifloor(wp.z)};
+    if (!world.CellInWindow(c)) continue;
+    const CachedChunk* cc = world.Cached(ChunkOfCell(c.x, c.y, c.z));
+    if (!cc || cc->voxels.size() != kChunkVol) continue;
+    const uint32_t m =
+        cc->voxels[(((uint32_t)c.z & 15u) * kChunk + ((uint32_t)c.y & 15u)) *
+                       kChunk + ((uint32_t)c.x & 15u)] & 0xFFFu;
+    if (m != 0 && m < matRewritesNbr_.size() && matRewritesNbr_[m]) return true;
+  }
+  return false;
+}
+
 void DebrisSystem::AddTerrainAnchor(Vec3 posVoxel, float radiusVoxels,
                                     Vec3 velVoxPerSec, float horizonVoxels) {
   extraAnchors_.push_back({posVoxel, radiusVoxels, velVoxPerSec, horizonVoxels});
@@ -3420,7 +3786,7 @@ void DebrisSystem::AdoptBody(uint64_t handle, std::vector<DebrisVoxel> voxels,
                              const BodyTransform& xf, MicroBodyRef micro,
                              uint32_t physScale,
                              std::vector<PrefabVoxel> skinVoxels,
-                             uint32_t bleedMat, BodyWound wound) {
+                             uint32_t bleedMat, BodyWound wound, bool dead) {
   if (handle == 0 || voxels.empty()) return;
   Body body;
   body.handle = handle;
@@ -3459,6 +3825,7 @@ void DebrisSystem::AdoptBody(uint64_t handle, std::vector<DebrisVoxel> voxels,
                       2.0f;
   body.serial = nextSerial_++;
   body.bleedMat = bleedMat;
+  body.dead = dead;
   RecountBurn(body);
   bodies_.push_back(std::move(body));
   instancesDirty_ = true;
@@ -3891,7 +4258,10 @@ bool DebrisSystem::DamageBody(size_t bi, World& world,
   // burn-fragment floor — a body blown apart by an explosion is a one-off
   // event, not the every-few-ticks re-fragmentation that forced burn's bar up.
   const size_t fragmentsBefore = fragments.size();
-  ShatterBody(b, world, fragments, spawns, kMinBodyVoxels, newBodyBudget);
+  // fineConnectivity: a CARVE is the one cause whose cut can be narrower than
+  // a collider block, so it is the one that may escalate to the skin lattice.
+  ShatterBody(b, world, fragments, spawns, kMinBodyVoxels, newBodyBudget,
+              /*fineConnectivity=*/true);
 
   // Rebase AFTER shatter (which rebases fragments itself) so the surviving
   // body's coords stay tight in int8 range, then rebuild the collider.
@@ -3925,14 +4295,42 @@ bool DebrisSystem::DamageBody(size_t bi, World& world,
     const bool amputation = fragments.size() > fragmentsBefore;
     const float drip = carvedWorldVox * gore.corpseBleedPerVoxel +
                        (amputation ? gore.severStumpBudget : 0.0f);
-    const int gush = amputation ? std::max(1, gore.severDecayTicks) : 0;
+    // ---- A CUT GOUTS, NOT ONLY AN AMPUTATION (2026-09-19) -----------------
+    //
+    // The gout — gore.severSpray droplets front-loaded over severDecayTicks,
+    // BleedBodies' arterial branch — used to be armed ONLY when the carve
+    // happened to split a piece off. Everything short of that got the drip:
+    // one whole blood voxel every gore.bleedDripTicks, three droplets with it.
+    // So opening a corpse's skull with a mace produced a bead of blood every
+    // eighth of a second and nothing else, which is the owner report of
+    // 2026-09-19 ("no blood comes out; there should be tons of blood") almost
+    // word for word.
+    //
+    // A wound that takes flesh bleeds in proportion to the flesh it took, so
+    // the gout's LENGTH is that proportion of a dismemberment's — measured
+    // against `severStumpBudget`, which is already this file's number for "a
+    // whole limb's worth of blood". No new knob: the two dials that set how
+    // wet this is (corpseBleedPerVoxel, severStumpBudget) are the same two
+    // that set the drip, so they cannot drift apart.
+    const float goutFrac =
+        amputation
+            ? 1.0f
+            : std::clamp(carvedWorldVox * gore.corpseBleedPerVoxel /
+                             std::max(1.0f, gore.severStumpBudget),
+                         0.0f, 1.0f);
+    const int gush =
+        (int)std::lround(goutFrac * (float)std::max(1, gore.severDecayTicks));
     ArmWound(b, woundW, Vec3{0, 1, 0}, drip, gush);
     for (size_t fi = fragmentsBefore; fi < fragments.size(); fi++)
       ArmWound(fragments[fi], woundW, Vec3{0, 1, 0}, drip, gush);
-    if (amputation) {
+    // ...and the whole VOXELS a wound throws scale with it too. These are the
+    // lasting mess (the droplets above are sub-voxel and expire), so a deep
+    // cut into a corpse leaves a real spatter and a scratch leaves none.
+    if (amputation || goutFrac > 0.0f) {
       // The conserved voxels a dismemberment throws (gore.severVoxels): few,
       // and they are the lasting mess. Thrown from the cut, up and outward.
-      const int nVox = std::max(0, gore.severVoxels);
+      const int nVox =
+          (int)std::lround(goutFrac * (float)std::max(0, gore.severVoxels));
       const float sprd = gore.severGobbetSpread;
       for (int k = 0; k < nVox; k++) {
         if (spawns.size() >= kMaxParticleSpawnsPerTick) break;
@@ -4179,6 +4577,115 @@ bool DebrisSystem::MeltBodyAt(uint64_t handle, Vec3 pointVoxel,
   return true;
 }
 
+bool DebrisSystem::CutBody(uint64_t handle, const KerfCut& cut, World& world,
+                           std::vector<ParticleSpawn>& spawns) {
+  if (!phys_) return false;
+  size_t bi = 0;
+  for (; bi < bodies_.size(); bi++)
+    if (bodies_[bi].handle == handle) break;
+  if (bi == bodies_.size()) return false;
+
+  Body& b = bodies_[bi];
+  phys_->GetTransform(b.handle, b.xf);
+  // Into the body's own frame. The conjugate sandwich, the same one
+  // DamageBodiesRadial uses to put a blast centre in body space.
+  const float qi[4] = {-b.xf.quat[0], -b.xf.quat[1], -b.xf.quat[2],
+                       b.xf.quat[3]};
+  const Vec3 cLocal = QuatRot(qi, cut.at - b.xf.pos);
+  const bool fine = b.HasFineSkin();
+  const float latScale =
+      (float)std::max(1u, fine ? b.micro.skinScale : b.physScale);
+  // The rim is quantized onto the SKIN lattice on both populations, so a cut
+  // tears the same way whatever collider resolution this body derived.
+  const float jitter = (float)std::max(1u, b.micro.skinScale);
+  // Keyed on the body rather than on the tick, so the same stroke replayed
+  // against the same corpse tears identically (KerfCut::seed).
+  const uint32_t seed = b.serial * 2654435761u + cut.seed;
+  const KerfSlot frame =
+      KerfFrame(cLocal, QuatRot(qi, cut.edgeAxis), QuatRot(qi, cut.cutDir),
+                cut.depth, cut.halfWidth, cut.length, jitter, seed);
+  // WHERE THE EDGE MEETS MEAT, on the authoritative lattice. Without this a
+  // second blow into an existing gash finds the space already gone and takes
+  // nothing — "the wound stops getting deeper", which on a corpse reads as a
+  // sword bouncing off it.
+  const float entry = KerfEntry(frame, latScale, [&](auto&& probe) {
+    if (fine)
+      for (const PrefabVoxel& pv : b.skinVoxels)
+        probe((float)pv.x, (float)pv.y, (float)pv.z);
+    else
+      for (const DebrisVoxel& dv : b.voxels)
+        probe((float)dv.x, (float)dv.y, (float)dv.z);
+  });
+  KerfSlot slot = frame;
+  slot.c = cLocal + frame.w * entry;
+
+  std::vector<Body> fragments;
+  uint32_t budget = kMaxNewBodiesPerTick;
+  // eject=true, unlike the beam: a blade takes matter OFF and that matter is
+  // the gore. The beam vaporizes and is the only carve here that should not.
+  DamageBody(bi, world, spawns, fragments, budget, /*eject=*/true,
+             [slot](float lat) -> CarveKeep {
+               const KerfKeep k = KerfKeepAt(slot, lat);
+               return [k](float x, float y, float z) { return k(x, y, z); };
+             });
+  for (Body& f : fragments) {
+    bodies_.push_back(std::move(f));
+    instancesDirty_ = true;
+  }
+  return true;
+}
+
+bool DebrisSystem::BluntBody(uint64_t handle, Vec3 atVoxel, float radiusVoxels,
+                             uint32_t seed, World& world,
+                             std::vector<ParticleSpawn>& spawns) {
+  if (!phys_ || radiusVoxels <= 0.0f) return false;
+  size_t bi = 0;
+  for (; bi < bodies_.size(); bi++)
+    if (bodies_[bi].handle == handle) break;
+  if (bi == bodies_.size()) return false;
+
+  Body& b = bodies_[bi];
+  phys_->GetTransform(b.handle, b.xf);
+  const float qi[4] = {-b.xf.quat[0], -b.xf.quat[1], -b.xf.quat[2],
+                       b.xf.quat[3]};
+  const Vec3 cBody = QuatRot(qi, atVoxel - b.xf.pos);
+  const float r2 = radiusVoxels * radiusVoxels;
+  const uint32_t jScale = std::max(1u, b.micro.skinScale);
+  const uint32_t key = b.serial * 40503u + seed;
+
+  // The blast crater's shape at a mace's scale: certain removal in the core,
+  // thinning toward the rim, quantized onto the skin so the dent is a property
+  // of the art. Shared with DamageBodiesRadial in everything but its size,
+  // which is the only thing that distinguishes a hammer from a grenade.
+  auto carve = [&](float lat) -> CarveKeep {
+    const float sc = lat;
+    const Vec3 cLocal = cBody * sc;
+    const float rLocal2 = r2 * sc * sc;
+    const float jMul = (float)jScale / sc;
+    return [=](float vx, float vy, float vz) {
+      Vec3 c{vx + 0.5f, vy + 0.5f, vz + 0.5f};
+      Vec3 dv = c - cLocal;
+      float d2 = dv.dot(dv);
+      if (d2 >= rLocal2) return true;
+      float t = std::sqrt(d2 / rLocal2);
+      float chance = 1.0f - t * t;
+      int jx = (int)(vx * jMul), jy = (int)(vy * jMul), jz = (int)(vz * jMul);
+      uint32_t h = Hash3(key, (uint32_t)jx * 73856093u,
+                         (uint32_t)jy * 19349663u ^ (uint32_t)jz * 83492791u);
+      return (float)(h & 0xFFFFu) / 65535.0f >= chance;
+    };
+  };
+
+  std::vector<Body> fragments;
+  uint32_t budget = kMaxNewBodiesPerTick;
+  DamageBody(bi, world, spawns, fragments, budget, /*eject=*/true, carve);
+  for (Body& f : fragments) {
+    bodies_.push_back(std::move(f));
+    instancesDirty_ = true;
+  }
+  return true;
+}
+
 bool DebrisSystem::MicroDirty() const {
   return microSet_ && microSet_->dirty;
 }
@@ -4255,6 +4762,7 @@ bool DebrisSystem::SplitBody(uint64_t handle, Vec3 planePointVoxel,
     newBodies[h].radiusVoxels = r + 2.0f;
     newBodies[h].serial = nextSerial_++;
     newBodies[h].bleedMat = b.bleedMat;
+    newBodies[h].dead = b.dead;
     RecountBurn(newBodies[h]);
     phys_->SetBodyVelocities(newBodies[h].handle, lin, ang);
   }

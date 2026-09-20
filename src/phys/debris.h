@@ -11,6 +11,7 @@
 #include <vector>
 
 #include "math3d.h"
+#include "phys/kerf.h"   // KerfCut/KerfSlot: the shape a blade takes out
 #include "phys/physics.h"
 #include "sim/materials.h"
 #include "sim/microbody.h"
@@ -149,11 +150,43 @@ class DebrisSystem {
                  const BodyTransform& xf, MicroBodyRef micro = {},
                  uint32_t physScale = 0,
                  std::vector<PrefabVoxel> skinVoxels = {},
-                 uint32_t bleedMat = 0, BodyWound wound = {});
+                 uint32_t bleedMat = 0, BodyWound wound = {},
+                 bool dead = false);
   // Open a wound on an adopted body at its voxel nearest `woundW` (world),
   // owing `budget` blood voxels, with `gushTicks` of dismemberment gout.
   // False when no such body, or it has no blood.
   bool WoundBody(uint64_t handle, Vec3 woundW, float budget, int gushTicks);
+
+  // ---- A BLADE ON A LOOSE BODY (2026-09-19) --------------------------------
+  //
+  // The debris twin of Mob::CutLimb, and it exists because the melee sweep's
+  // old answer for anything without an owner was `MeltBodyAt` — a SPHERE of
+  // the blade's half-width, bored out per swing tick, with the beam's
+  // eject=false so not one gobbet came off it. Three owner reports, one cause:
+  // "swords shouldn't delete so many voxels off of corpses", "no blood comes
+  // out", and a sphere that cannot sever anything because it is not a cut.
+  //
+  // Same KerfCut a live limb takes, same slot shape out of phys/kerf.h, same
+  // entry snap (so repeated blows to one place DEEPEN instead of saturating),
+  // and the ordinary DamageBody tail — which already soaks the cut faces, arms
+  // the wound, splits the connectivity and throws the pieces. False when the
+  // handle is not an adopted body.
+  bool CutBody(uint64_t handle, const KerfCut& cut, World& world,
+               std::vector<ParticleSpawn>& spawns);
+  // ...and the mace. A POINT with a magnitude, where a kerf is a slot with a
+  // direction (game/mob.h BluntHit draws the same distinction for the living):
+  // a shallow ragged dent at `radiusVoxels`, which is what caves a corpse's
+  // skull in. `seed` keys the rim so a replayed blow dents identically.
+  bool BluntBody(uint64_t handle, Vec3 atVoxel, float radiusVoxels,
+                 uint32_t seed, World& world,
+                 std::vector<ParticleSpawn>& spawns);
+  // Was this body once alive (Body::dead)? False for a handle that is not an
+  // adopted body, which reads the same way as "not a corpse".
+  bool BodyDead(uint64_t handle) const {
+    for (const Body& b : bodies_)
+      if (b.handle == handle) return b.dead;
+    return false;
+  }
 
   // ---- A GARMENT ON A CORPSE IS A FOLLOWER, NOT A JOINTED BODY -------------
   //
@@ -972,6 +1005,36 @@ class DebrisSystem {
     // the world's fire (a dirty chunk). Counted apart so a body that is
     // nothing but char sleeps -- see BurnBodies' willScan.
     uint16_t scaledCount = 0;
+    // voxels the GRID can act on through somebody else's rule (acid eating
+    // flesh). Counted apart from pairCount because it answers a different
+    // question: pairCount asks what this body can do, this asks what can be
+    // done TO it, and only the second one justifies the threat probe below.
+    uint16_t inboundCount = 0;
+    // ---- CAN THIS BODY REACT WITH ITSELF? ----------------------------------
+    // True when some material present in the lattice authors a pair rule whose
+    // neighbour predicate matches another material that is ALSO present. That
+    // is rot on a corpse: `rotflesh + skin -> rotflesh` needs no fire, no
+    // dirty chunk and nothing outside the body at all, and because `willScan`
+    // demanded a dirty chunk nearby for every non-alight body, a corpse lying
+    // in a settled world stopped rotting the moment the world went quiet.
+    //
+    // It is what keeps that fix inside rule 2. A body of plain skin, flesh and
+    // bone sets this FALSE (skin's only pair rule wants tag:hot, and no bone
+    // is hot), so an ordinary corpse still sleeps; a rotting one scans until
+    // the front runs out of tissue, at which point the next RecountBurn clears
+    // the flag and it sleeps too. Recomputed wherever the lattice is rewritten.
+    bool internalPair = false;
+    // ---- THIS BODY WAS ALIVE (2026-09-19) ----------------------------------
+    // Set by the adopting caller for anything that came off a creature: a
+    // severed limb, and every piece of a corpse. Inherited by fragments, so
+    // half a head cut off a corpse is still dead flesh rather than debris.
+    //
+    // Nothing gates on it today, deliberately. It exists so the rules that
+    // WILL want to know ("rot spreads on the dead and not on the living",
+    // "the dead do not flinch") have a fact to ask rather than having to
+    // infer one from `bleedMat` — which means "bleeds when cut" and is
+    // already true of a live limb.
+    bool dead = false;
     uint32_t burnCursor = 0;      // rotating scan window into voxels
     uint32_t burnedSinceRebuild = 0;  // batched collider refresh threshold
     uint32_t burnedSinceShatter = 0;  // batched connectivity re-check
@@ -1070,6 +1133,11 @@ class DebrisSystem {
   void ArmWound(Body& b, Vec3 woundW, Vec3 dirW, float budget,
                 int gushTicks) const;
   bool AnyDirtyNear(const Body& b, const WorldSnapshot& snap, World& world) const;
+  // Is a material that REWRITES ITS NEIGHBOUR (acid, a solvent) sitting in one
+  // of the world cells this body occupies? The still-pool companion to
+  // AnyDirtyNear — see the implementation for why dirtiness is the wrong proxy
+  // for a solvent and why this is a wake signal rather than a containment test.
+  bool ThreatNear(const Body& b, World& world) const;
   // Break a body whose voxels no longer form one 6-connected component: the
   // largest piece keeps the body, fragments >= `minFragment` voxels become
   // bodies of their own while `budget` allows (parent collider rebuilt
@@ -1078,9 +1146,16 @@ class DebrisSystem {
   // back into loose voxels. `budget` is decremented per body created and is
   // shared across all bodies in a tick, so a disintegrating object cannot
   // spawn an unbounded fleet of fragments.
+  // `fineConnectivity` lets the split ESCALATE to the skin lattice when the
+  // collider says the body is still in one piece. Only a CARVE passes it: a
+  // blade's kerf is narrower than a collider block and can cut clean through
+  // the art without ever emptying one (see the note in ShatterBody), while
+  // burning erodes at every scale at once and disconnects the collider on its
+  // own. The distinction is a budget one — the fine flood is `skinScale^3`
+  // times the nodes, and the burn path runs the check every few voxels lost.
   void ShatterBody(Body& b, World& world, std::vector<Body>& fragments,
                    std::vector<ParticleSpawn>& spawns, uint32_t minFragment,
-                   uint32_t& budget);
+                   uint32_t& budget, bool fineConnectivity = false);
   void VoxelsToParticles(const Body& b, const std::vector<DebrisVoxel>& voxels,
                          Vec3 lin, Vec3 ang, World& world,
                          std::vector<ParticleSpawn>& spawns) const;
@@ -1178,6 +1253,27 @@ class DebrisSystem {
   std::vector<uint8_t> matSelfScaled_;  // ...or only neighbour-count gated ones
   std::vector<uint8_t> matHasPair_;     // material has pair rules
   std::vector<uint8_t> matHasScaled_;   // material has scaleByNeighbors rules
+  // ---- THE INBOUND DIRECTION (2026-09-19) ---------------------------------
+  // A rigidbody used to evaluate only the rules its OWN materials author. Acid
+  // is authored from the acid's side (`acid + tag:organic -> neighborBecomes
+  // air`), which is the direction the GPU evaluates it and the direction
+  // MobSystem::BurnOneLimb's second pass evaluates it on a live limb — so a
+  // corpse, whose limbs are these bodies, sat in a pool of acid untouched
+  // while the creature it had been a second earlier dissolved in it. These two
+  // columns are what let BurnBodies run the same pass; they are the debris
+  // twins of mob.h's matRewritesNbr_ and its attack table.
+  //
+  //   matRewritesNbr_  this material has a pair rule that REWRITES its
+  //                    neighbour — i.e. it can act on a body from the grid.
+  //   matInboundTarget_ some material's rewrite rule matches THIS one — i.e. a
+  //                    voxel of it is something the grid can eat, which is what
+  //                    decides whether a body needs the threat probe at all.
+  std::vector<uint8_t> matRewritesNbr_;
+  std::vector<uint8_t> matInboundTarget_;
+  // Scratch for RecountBurn's internal-pair test, one byte per material id.
+  // A member rather than a local so a per-carve recount does not allocate.
+  mutable std::vector<uint8_t> presentScratch_;
+  mutable std::vector<uint32_t> foundScratch_;
   // Authored GRID tints per material id, 0x00RRGGBB (MaterialDef::tints).
   // Empty for everything that is not MATF_TINTED, which is almost everything.
   std::vector<std::vector<uint32_t>> matTints_;

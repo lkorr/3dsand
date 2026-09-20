@@ -1284,22 +1284,11 @@ struct MobLimb {
 // for it is what made a sword's touch remove a spherical bite out of an arm —
 // which, at any radius large enough to feel like a sword, is most of the arm.
 //
-// The three axes are independent and all three are measured rather than tuned:
-// `edgeAxis` comes from the item's authored edge segment through its live pose,
-// `cutDir` from how far the tip actually travelled this tick, and `halfWidth`
-// from the blade's own authored thickness. Only the DEPTH is a tuning
-// question, because only the depth depends on how hard you swung.
-struct BladeCut {
-  Vec3 at{};          // contact point, world voxels
-  Vec3 edgeAxis{};    // unit, along the blade's edge (the slot's long axis)
-  Vec3 cutDir{};      // unit, the direction the edge is travelling
-  float halfWidth = 0.25f;  // kerf half-thickness, world voxels
-  float depth = 0.5f;       // how far in the edge bit, world voxels
-  float length = 1.0f;      // half-length of the slot along the edge
-  float power = 1.0f;       // 0..1 swing commitment, for the audio severity
-  uint32_t seed = 0;        // ragged-rim / stain draw key; see the note in
-                            // Mob::CutLimb about why this is not a tick
-};
+// THE SHAPE ITSELF MOVED OUT (2026-09-19, phys/kerf.h). It is not a fact about
+// living flesh: a corpse is a DebrisSystem body and a sword meeting one used to
+// bore the sphere this type exists to replace. Both carves now build the slot
+// from one place, and this stays the name every call site here already uses.
+using BladeCut = KerfCut;
 
 // ---- ONE BLUNT HIT ----------------------------------------------------------
 //
