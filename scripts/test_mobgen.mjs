@@ -1213,24 +1213,36 @@ section('L. the rig contract matches assets/mobs/human.json, the standard');
 // 6. and every character ALREADY ON DISK carries it too
 // =============================================================================
 
-section('M. the characters in assets/mobs carry the current rig');
+section('M. every character on disk RESOLVES to the body its genome describes');
 {
-  // A generator that is right and a pool that is stale is the same bug with an
-  // extra step. Every sidecar carrying a `genome` block was written by this
-  // generator and can be REGENERATED from it (`node scripts/gen_mobs.mjs
-  // <name> --rebake`), so "is this file current?" is a question with an exact
-  // answer: rebuild it from its own genome and compare.
+  // WHAT THIS SECTION IS NOW FOR, AND WHAT IT USED TO BE FOR.
   //
-  // The two things that are NOT compared are the two that legitimately differ:
-  // the `.vox` (the art is on disk and this section does not re-bake anatomy,
-  // which is what gen_mobs.mjs is for) and the `genome` block itself (it is
-  // the input). Everything else is the rig, and the rig is not allowed to
-  // drift from the generator OR from the human the generator now matches.
+  // It used to ask "is this 63 KB copy of the human still current?", because
+  // every character was a copy and copies go stale (2c4f29b: four commits
+  // changed how a human fights and falls apart, none of them reached the pool).
+  // That question is gone: a character is a DIFF against the human now, the
+  // rig reaches it at load, and there is no copy left to rot.
   //
-  // A `extends` sidecar (a colour variant, zombie.json's shape) has no genome
-  // and no rig of its own — it inherits its base's, so there is nothing here
-  // to check and nothing that can rot.
+  // What can still be wrong is one seam narrower and one step further along:
+  // the generator derives a body, the emitter turns it into a difference, and
+  // the loader turns that difference back into a body. If those three do not
+  // compose to the identity, a character silently wears one of the human's
+  // numbers where it should wear its own — and THAT is invisible in the file,
+  // because the file's whole job is to not mention the fields it inherits.
+  //
+  // So both halves are asserted, against the real files:
+  //
+  //   1. the file on disk is the difference this genome produces today, and
+  //   2. RESOLVING the file on disk reproduces the generator's whole body,
+  //      field for field — the claim the thin file cannot make by inspection.
   const mobsDir = path.join(ROOT, 'assets/mobs');
+  const readStem = stem => readJson(path.join(mobsDir, stem + '.json'));
+  const readEffect = name => {
+    const p = path.join(mobsDir, 'effects', name + '.json');
+    return fs.existsSync(p) ? readJson(p) : null;
+  };
+  const base = sc.resolveSidecar(readStem, mg.BASE_MOB, readEffect);
+
   const pool = fs.readdirSync(mobsDir).filter(f => f.endsWith('.json'))
     .map(f => [f.replace(/\.json$/, ''), readJson(path.join(mobsDir, f))])
     .filter(([, d]) => d && d.genome);
@@ -1248,20 +1260,52 @@ section('M. the characters in assets/mobs carry the current rig');
       ok(false, `${name}: regenerates from its own genome`, e.message);
       continue;
     }
+    // 1. THE FILE IS THE DIFFERENCE THIS GENOME PRODUCES TODAY. The `genome`
+    //    block is the input and is not compared; everything else is.
+    let thin;
+    try {
+      thin = mg.thinSidecar(fresh, base, name);
+    } catch (e) {
+      ok(false, `${name}: its body is expressible as a difference from ` +
+         `${mg.BASE_MOB}`, e.message);
+      continue;
+    }
     const strip = o => {
-      const r = JSON.parse(JSON.stringify(o));
+      const r = JSON.parse(JSON.stringify(noNotes(o)));
       delete r.genome;
       return r;
     };
-    const d = diff(strip(onDisk), strip(fresh), name);
-    ok(!d, `${name}.json is what its genome generates today`,
+    const d = diff(strip(onDisk), strip(thin), name);
+    ok(!d, `${name}.json is the difference its genome produces today`,
        `${d}\n        re-bake it: node scripts/gen_mobs.mjs ${name} --rebake`);
-    // Stated separately because it is the one that shows up as a BUG IN THE
-    // GAME rather than as a stale file: a body with no feet that bounces, or
-    // one whose head has a third of the standard's hp.
-    const ds = diff(noNotes(onDisk.states).map(fillState),
+
+    // 2. AND RESOLVING IT GIVES BACK THE WHOLE BODY. Field by field against
+    //    the generator's own output, so a failure names the thing that got
+    //    lost rather than printing a path into a 9 KB document. This is what
+    //    the thin file cannot show by inspection: an anchor the emitter
+    //    dropped by mistake reads as "inherited" and is silently the human's.
+    let resolved;
+    try {
+      resolved = sc.resolveSidecar(readStem, name, readEffect);
+    } catch (e) {
+      ok(false, `${name}.json resolves`, e.message);
+      continue;
+    }
+    for (const k of Object.keys(fresh)) {
+      if (k === 'genome') continue;
+      const dr = diff(noNotes(resolved[k]), noNotes(fresh[k]), `${name}.${k}`);
+      ok(!dr, `${name}: resolved \`${k}\` is what this genome derives`, dr);
+    }
+    // ...and the things the base contributes and the generator no longer
+    // emits at all: the clip library is compiled by the loader, not by the
+    // file, so `states` naming `crawl` has to keep meaning something.
+    const ds = diff(noNotes(resolved.states).map(fillState),
                     noNotes(shippedStates).map(fillState), `${name}.states`);
-    ok(!ds, `${name} uses the shipped human’s locomotion ladder`, ds);
+    ok(!ds, `${name} inherits the shipped human’s locomotion ladder`, ds);
+    const reachable = { ...clipLibrary(), ...resolved.clips };
+    for (const st of resolved.states)
+      ok(reachable[st.clip] != null,
+         `${name}: state "${st.name}" can still reach clip "${st.clip}"`);
   }
 }
 

@@ -66,6 +66,7 @@
 'use strict';
 
 import * as mg from './mobgen.js';
+import * as SC from './sidecar.js';
 
 let H = null;              // host hooks
 let root = null;           // our section element
@@ -397,6 +398,36 @@ async function loadPool() {
 
 const NAME_OK = /^[a-z0-9_]{1,40}$/;
 
+/** The base every character extends, resolved off the server. Fetched fresh on
+ *  each save rather than cached for the session: the Models tab may have edited
+ *  the human in another window, and a diff against a stale base writes
+ *  overrides for numbers that are no longer different. */
+async function resolvedBase() {
+  const fetched = new Map();
+  const get = async (dir, stem) => {
+    const key = dir + '/' + stem;
+    if (fetched.has(key)) return fetched.get(key);
+    const r = await fetch('/api/model?path=' + encodeURIComponent(key + '.json'),
+                          { cache: 'no-store' });
+    fetched.set(key, r.ok ? JSON.parse(await r.text()) : null);
+    return fetched.get(key);
+  };
+  const walk = async (stem, depth) => {
+    if (depth > SC.MAX_EXTENDS) return;
+    const j = await get('mobs', stem);
+    if (!j) throw new Error(`assets/mobs/${stem}.json did not load — a ` +
+                            'character is a diff against its base, so the ' +
+                            'base has to be there to diff against');
+    for (const nm of Array.isArray(j.effects) ? j.effects : [])
+      if (typeof nm === 'string') await get('mobs/effects', nm);
+    if (typeof j.extends === 'string' && j.extends)
+      await walk(j.extends, depth + 1);
+  };
+  await walk(mg.BASE_MOB, 0);
+  return SC.resolveSidecar(stem => fetched.get('mobs/' + stem), mg.BASE_MOB,
+                           nm => fetched.get('mobs/effects/' + nm) ?? null);
+}
+
 async function postModel(rel, body, isJson) {
   const r = await fetch('/api/model?path=' + encodeURIComponent(rel), {
     method: 'POST',
@@ -433,10 +464,23 @@ async function saveCharacter() {
   } catch (e) {
     return toast('anatomy bake refused: ' + e.message, true);
   }
+  // THE SIDECAR THAT IS WRITTEN IS THE DIFFERENCE, not the body. `b.sidecar`
+  // is the whole resolved creature; the file states only what this character
+  // makes different from the base it extends, so the rig keeps tracking the
+  // human instead of freezing a copy of it on the day the character was born
+  // (mobgen.thinSidecar, and src/game/sidecar.h for what "different" means).
+  // The base is fetched rather than assumed, because the diff is against what
+  // is on disk right now.
+  let doc;
+  try {
+    doc = mg.thinSidecar(b.sidecar, await resolvedBase(), name);
+  } catch (e) {
+    return toast('refused: ' + e.message, true);
+  }
   try {
     await postModel('mobs/' + name + '.vox', b.vox, false);
     await postModel('mobs/' + name + '.json',
-                    JSON.stringify(b.sidecar, null, 2) + '\n', true);
+                    JSON.stringify(doc, null, 2) + '\n', true);
   } catch (e) {
     return toast('save failed: ' + e.message, true);
   }

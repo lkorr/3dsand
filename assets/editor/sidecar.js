@@ -205,3 +205,129 @@ export function resolveSidecar(read, stem, readEffect = () => null, log = []) {
   }
   return doc;
 }
+
+/* ===========================================================================
+ * THE OTHER DIRECTION: what does this body say that its base does not?
+ *
+ * A thin character is not written by picking the keys somebody believed were
+ * per-body. That list goes stale the first commit a derived field is added to
+ * the generator, and "the generator forgot to emit a field, so the character
+ * silently inherited the human's" is the exact failure this whole seam exists
+ * to end. So the emitter DIFFS: generate the whole body, diff it against the
+ * resolved base, write the difference. Whatever the generator derives that
+ * equals the base is dropped — including the fields nobody has thought about
+ * yet.
+ *
+ * The diff is the inverse of the merge above, rule for rule, and it CHECKS
+ * ITSELF: `diffAgainst` re-applies its own output to the base and throws if
+ * the result is not the document it was given. That is what makes the thin
+ * file safe to write without a second gate watching it.
+ * ======================================================================== */
+
+const deepEqual = (a, b) => JSON.stringify(canonical(a)) === JSON.stringify(canonical(b));
+const clone = o => JSON.parse(JSON.stringify(o));
+
+/** `//`-prefixed keys are authoring notes, never read by any loader, and so
+ *  never a difference between two bodies. */
+function noNotes(o) {
+  if (Array.isArray(o)) return o.map(noNotes);
+  if (o && typeof o === 'object') {
+    const r = {};
+    for (const k of Object.keys(o)) if (!k.startsWith('//')) r[k] = noNotes(o[k]);
+    return r;
+  }
+  return o;
+}
+
+/** Key order is JSON punctuation, not content. Sorting before comparing keeps
+ *  a re-ordered emitter from looking like a changed body. */
+function canonical(o) {
+  if (Array.isArray(o)) return o.map(canonical);
+  if (o && typeof o === 'object') {
+    const r = {};
+    for (const k of Object.keys(o).sort()) r[k] = canonical(o[k]);
+    return r;
+  }
+  return o;
+}
+
+function diffNamedArray(base, target, path) {
+  const baseNames = base.map(e => e.name);
+  const targetNames = target.map(e => e.name);
+  // The merge appends unmatched names after the base's own order and can
+  // neither reorder nor remove. A body that needs either is not a variant of
+  // this base, and saying so here is better than writing a file that resolves
+  // into a different rig.
+  for (const n of baseNames)
+    if (!targetNames.includes(n))
+      throw new Error(`${path}: "${n}" is in the base and not in this body; ` +
+                      'the named-array merge cannot remove an element');
+  const kept = targetNames.filter(n => baseNames.includes(n));
+  if (kept.join(',') !== baseNames.join(','))
+    throw new Error(`${path}: this body reorders the base's elements ` +
+                    `(${kept.join(',')} vs ${baseNames.join(',')}); the ` +
+                    'named-array merge preserves base order and cannot');
+  const out = [];
+  for (const el of target) {
+    const b = base.find(e => e.name === el.name);
+    if (!b) { out.push(clone(el)); continue; }        // appended: emit whole
+    const d = diffAgainst(b, el, `${path}/${el.name}`);
+    if (d !== undefined) out.push({ name: el.name, ...d });
+  }
+  return out.length ? out : undefined;
+}
+
+/** The merge-patch that turns `base` into `target`, or undefined if they are
+ *  already the same document. Throws if the difference is not expressible. */
+export function diffAgainst(base, target, path = '') {
+  if (deepEqual(noNotes(base), noNotes(target))) return undefined;
+  if (target === null || typeof target !== 'object' || Array.isArray(target) ||
+      base === null || typeof base !== 'object' || Array.isArray(base))
+    return clone(target);                             // a scalar or array replaces
+  const patch = {};
+  for (const k of Object.keys(target)) {
+    // AUTHORING NOTES ARE NOT CONTENT. `//`-prefixed keys are for a human
+    // reader and no loader reads them (mob.cpp, and test_mobgen's noNotes); a
+    // derived file that restated or deleted its base's notes would be adding
+    // punctuation to a document whose whole point is to be short.
+    if (k.startsWith('//')) continue;
+    const sub = `${path}/${k}`;
+    if (!(k in base)) { patch[k] = clone(target[k]); continue; }
+    if (deepEqual(noNotes(base[k]), noNotes(target[k]))) continue;
+    // A CLIP THAT IS ONLY THE BASE'S CLIP ON ANOTHER CLOCK costs two words
+    // instead of five kilobytes. Tried first, and only accepted if the retime
+    // actually reproduces this clip key for key — a clip whose shape changed
+    // as well is emitted in full.
+    if (isClipSlot(sub) && typeof target[k].durationMs === 'number' &&
+        typeof base[k].durationMs === 'number') {
+      const trial = retimeClip(clone(base[k]), base[k].durationMs,
+                               target[k].durationMs);
+      trial.durationMs = target[k].durationMs;
+      if (deepEqual(trial, target[k])) {
+        patch[k] = { durationMs: target[k].durationMs };
+        continue;
+      }
+    }
+    if (allNamed(base[k]) && allNamed(target[k])) {
+      const d = diffNamedArray(base[k], target[k], sub);
+      if (d !== undefined) patch[k] = d;
+      continue;
+    }
+    const d = diffAgainst(base[k], target[k], sub);
+    if (d !== undefined) patch[k] = d;
+  }
+  // A key the base has and this body does not is an explicit null (RFC 7396).
+  for (const k of Object.keys(base))
+    if (!k.startsWith('//') && !(k in target)) patch[k] = null;
+  if (!Object.keys(patch).length) return undefined;
+  // SELF-CHECK. The diff is only worth writing if re-applying it reproduces
+  // the body exactly, and at the root that is a claim about the whole file.
+  if (path === '') {
+    const back = mergePatch(clone(base), clone(patch), '');
+    if (!deepEqual(noNotes(back), noNotes(target)))
+      throw new Error('the diff does not resolve back to the body it came ' +
+                      'from — refusing to write a thin sidecar that would ' +
+                      'load as a different creature');
+  }
+  return patch;
+}

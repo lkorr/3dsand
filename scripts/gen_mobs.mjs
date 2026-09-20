@@ -53,9 +53,14 @@ import { dirname, join } from 'path';
 const ROOT = join(dirname(fileURLToPath(import.meta.url)), '..');
 const load = rel => import(pathToFileURL(join(ROOT, rel)).href);
 const mg = await load('assets/editor/mobgen.js');
+const sc = await load('assets/editor/sidecar.js');
 
 const MOBS = join(ROOT, 'assets/mobs');
 const readJson = p => JSON.parse(readFileSync(p, 'utf8'));
+// Declared up here rather than beside resolvedBase(): the writes below run at
+// module top level, before the helper section, and a `let` down there is in
+// its temporal dead zone by the time the first character is written.
+let baseCache = null;
 
 // ---- arguments --------------------------------------------------------------
 const argv = process.argv.slice(2);
@@ -223,6 +228,24 @@ function loadGenomeByName(name) {
   return mg.normalizeGenome(j.genome);
 }
 
+/** The base every character extends, resolved — read from the SAME directory
+ *  the character is written to, so a `--out` sandbox diffs against the base
+ *  that will actually sit beside it. Cached: a litter of thirty asks thirty
+ *  times and the answer cannot change mid-run. */
+function resolvedBase() {
+  if (baseCache) return baseCache;
+  if (!existsSync(join(outDir, mg.BASE_MOB + '.json')))
+    die(`no ${mg.BASE_MOB}.json in ${rel(outDir)} — a character is a diff ` +
+        'against its base, so the base has to be there to diff against');
+  const read = stem => readJson(join(outDir, stem + '.json'));
+  const readEffect = name => {
+    const p = join(outDir, 'effects', name + '.json');
+    return existsSync(p) ? readJson(p) : null;
+  };
+  baseCache = sc.resolveSidecar(read, mg.BASE_MOB, readEffect);
+  return baseCache;
+}
+
 function write(name, genome) {
   const built = mg.generateMob(genome, seed, { ...GEN_OPTS, name });
   const complaints = mg.validateMob(built);
@@ -255,9 +278,16 @@ function write(name, genome) {
   }
   if (dry) { console.log('  (--dry: wrote nothing)'); return; }
   const vp = join(outDir, name + '.vox'), jp = join(outDir, name + '.json');
+  // THE FILE IS THE DIFF. `built.sidecar` is the whole creature; what is
+  // written is only what this body makes different from the base it extends,
+  // so the rig keeps tracking the human instead of freezing a copy of it (see
+  // mobgen.thinSidecar). The .vox is still the whole body: art is art.
+  const doc = mg.thinSidecar(built.sidecar, resolvedBase(), name);
   writeFileSync(vp, built.vox);
-  writeFileSync(jp, JSON.stringify(built.sidecar, null, 2) + '\n');
-  console.log(`  wrote ${rel(vp)} (${built.vox.length} bytes) and ${rel(jp)}`);
+  writeFileSync(jp, JSON.stringify(doc, null, 2) + '\n');
+  console.log(`  wrote ${rel(vp)} (${built.vox.length} bytes) and ${rel(jp)} ` +
+              `(${JSON.stringify(doc).length} B of difference against ` +
+              `${JSON.stringify(built.sidecar).length} B of resolved rig)`);
   if (flag('no-anatomy'))
     console.log('  --no-anatomy: the body is solid skin at every depth. Run ' +
                 `\`node scripts/anatomize_mob.mjs ${name}\` before shipping it.`);

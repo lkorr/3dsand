@@ -79,6 +79,7 @@
 import { writeVox, readVox, tightenPrefab, prefabToVoxModels,
          prefabRoundTripTest } from './vox.js';
 import * as ANA from './anatomy.js';
+import * as SC from './sidecar.js';
 
 // =============================================================================
 // Python parity
@@ -2635,6 +2636,60 @@ export const PRESET_ORDER = ['human', 'lanky', 'stocky', 'waif', 'elder', 'brute
 /** A preset as a full genome. Presets are PARTIAL on purpose: a preset that
  *  restated every gene would silently freeze at whatever the defaults were the
  *  day it was written. */
+/** The creature every generated character inherits from. A stem, not a path:
+ *  it is `extends` in the file and the file lives beside the base. */
+export const BASE_MOB = 'human';
+
+/**
+ * A GENERATED CHARACTER IS A DIFF, NOT A BODY.
+ *
+ * `generateMob` derives a whole creature, and for two years the whole creature
+ * was what got written: fifteen limbs, four chains, seven loco states, three
+ * natural weapons, an anatomy recipe and fifteen clips, 63 KB of it, frozen on
+ * the day the character was born. Four commits then changed how a human fights
+ * and falls apart, none of them reached the pool, and characters shipped with a
+ * bounce-on-two-stumps loco state and a third of the standard's limb hp
+ * (2c4f29b). The copies were the bug.
+ *
+ * So the file that is written is the DIFFERENCE between this body and the
+ * resolved base, plus its genome and the two lines that say where it came from.
+ * Everything the generator derived that equals the base is dropped and reaches
+ * this character at load instead, which means editing the human's crawl, or its
+ * jaws, or its anatomy recipe, reaches every character with no re-bake.
+ *
+ * It is computed by DIFFING rather than by listing the keys somebody believed
+ * were per-body, because that list goes stale the first time a derived field is
+ * added and the symptom — a character silently wearing the human's number — is
+ * invisible. sidecar.js's `diffAgainst` re-applies its own output and throws if
+ * it does not reproduce this body exactly, so a file that would load as a
+ * different creature is never written.
+ *
+ * @param {object} full   a `generateMob(...).sidecar`
+ * @param {object} base   the RESOLVED base sidecar (assets/mobs/human.json)
+ * @param {string} name   the asset stem this will be saved under
+ */
+export function thinSidecar(full, base, name) {
+  const body = { ...full };
+  delete body.genome;                       // the input, never inherited
+  const patch = SC.diffAgainst(base, body) || {};
+  return {
+    '//': `A CHARACTER, not a creature: ${name} inherits ${BASE_MOB}'s rig — ` +
+          'limb names and tags, chains, loco states, natural weapons, sockets, ' +
+          'the anatomy recipe and the shared clip library — and states only ' +
+          'what its own body makes different. Written by the Characters page ' +
+          `or by \`node scripts/gen_mobs.mjs ${name} --rebake\`, from the ` +
+          '`genome` block at the bottom. Do not hand-edit: re-roll it.',
+    extends: BASE_MOB,
+    // IGNORED BY THE LOADER, and said anyway: a file's own .vox wins over any
+    // `model` (mob.cpp, CollectMobSources), so this is documentation that the
+    // body is this character's own art and not the base's, which is the one
+    // thing `extends` would otherwise imply and get wrong.
+    model: name,
+    ...patch,
+    genome: full.genome,
+  };
+}
+
 export function presetGenome(key) {
   const p = PRESETS[key];
   if (!p) return defaultGenome();
