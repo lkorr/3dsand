@@ -415,6 +415,9 @@
     "whooshPan": 1,
     "fleshVolume": 0.899999976,
     "clangVolume": 0.850000024,
+    "strikeEdgeVolume": 0.65,
+    "strikeBluntVolume": 0.7,
+    "cutVolume": 0.5,
     "cueRadius": 22
   },
   "grenade": {

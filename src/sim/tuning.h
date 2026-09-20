@@ -1623,7 +1623,7 @@ struct Tuning {
     float commitSpeed = 900.0f;      // mouse px/s that commits a guard to a cut
     float slashTime = 0.17f;         // seconds the committed slash takes
     float recoverTime = 0.22f;       // seconds of follow-through
-    float fullSpeedMps = 3.4f;       // tip speed for full damage
+    float fullSpeedMps = 20.0f;      // tip speed for full damage
     float minSpeedMps = 0.9f;        // tip speed below which a hit does nothing
     float aimGainX = 0.0050f;        // radians of tip azimuth per mouse pixel
     float aimGainY = 0.0067f;        // radians of tip elevation per mouse pixel
@@ -1815,7 +1815,7 @@ struct Tuning {
     float hitStopFleshScale = 0.22f;
     float hitStopFleshMs = 95.0f;
     float hitStopSeverScale = 0.10f;
-    float hitStopSeverMs = 140.0f;
+    float hitStopSeverMs = 33.0f;
     // ---- hit flash ----------------------------------------------------------
     // Peak additive intensity per tier, in LINEAR HDR before the tonemap (the
     // micro-body pass tonemaps to match the cube path exactly, so the flash has

@@ -138,7 +138,12 @@ constexpr uint32_t kMatAir = 0, kMatStone = 1, kMatWood = 2, kMatSand = 3,
                    kMatFlowerButtercup = 67, kMatFern = 88,
                    kMatMushroomCluster = 89, kMatToadstoolPale = 90,
                    kMatTallGrass = 95, kMatTallGrassHead = 96,
-                   kMatMushroomLarge = 122;
+                   // 123, not 122: `brain` was inserted at 122 on 2026-09-17
+                   // (6b8623f) and this row went unmoved, so the --shot flora
+                   // painter drew two toadstools out of brain until the
+                   // `plants` gate caught it. The gate now resolves every
+                   // plant id by NAME and prints when one of these drifts.
+                   kMatMushroomLarge = 123;
 
 // ---- day/night cycle (DESIGN.md §12) ----------------------------------------
 // The cycle phase is an INTEGER derived from the sim tick, never from wall

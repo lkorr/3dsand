@@ -547,7 +547,22 @@ Status GateArmorWear(Ctx& c, std::string& detail) {
                   lostSteel * 100.0f, lostCloth * 100.0f);
       check(lostSteel > 0.0f, "the blade still costs steel something");
       check(lostSteel < 0.02f, "but a chip, not a slot: under 2% of the plate");
-      check(lostCloth > 5.0f * lostSteel,
+      // The cloth-over-steel RATIO is a tuning-shaped number, so it is read
+      // from baseline.json rather than pinned here (2026-09-19). The kerf
+      // this fixture cuts is sized from gore.cutDepth/cutDepthPower/
+      // cutLength/cutWidth, and the cloth side scales with all four (cloth at
+      // hardness 5 takes the full slot, k = 1); the steel side does NOT — at
+      // hardness 200 the slot is at gear.cutHardnessMin and every dimension
+      // is floored to ONE lattice cell, so the chip is a constant ~0.05% of
+      // the cube whatever the blade is tuned to. The owner's gore retune
+      // (cutDepthPower 0.32 -> 0.15, cutLength 0.9 -> 0.64) shrank the cloth
+      // kerf from 0.54% to 0.22% and the old 5x floor read 4.4x as "cloth is
+      // cut like steel". The claim is the hardness scaling EXISTS: lose the
+      // gear.cutHardnessRef branch and both cubes take the same slot (ratio
+      // 1), lose the floor and steel takes nothing (the > 0 check above).
+      const float clothOverSteelMin =
+          (float)BaselineNumber("armorWearClothOverSteelMin", 2.5);
+      check(lostCloth > clothOverSteelMin * lostSteel,
             "while the same kerf takes cloth like flesh");
       check(mob->WornItem(plateSlot) == "fixture_plate_cube" &&
                 mobs.LimbBody(id, ps) != 0,

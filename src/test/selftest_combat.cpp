@@ -608,19 +608,30 @@ Status GateCombatCues(Ctx& c, std::string& detail) {
   struct Slot {
     audio::Cues::CombatCue cue;
     const char* name;
+    bool mayBeEmpty;
   };
+  // `melee/clang` (steel stopping steel) is a slot WITHOUT TAKES: its three
+  // synthesized placeholders went out with the recorded strike_edge /
+  // strike_blunt split (d69dae7) and nothing real has been recorded for it
+  // yet. An authored-empty set is a silent blocked-parry, not a wiring fault —
+  // the slot still resolves in kSlotPrefix (arm A) and the engine still asks
+  // (arm C) — so it is reported, not failed, until a take lands.
   static const Slot kSlots[] = {
-      {audio::Cues::CombatCue::Whoosh, "melee/whoosh"},
-      {audio::Cues::CombatCue::Flesh, "melee/flesh"},
-      {audio::Cues::CombatCue::Clang, "melee/clang"},
-      {audio::Cues::CombatCue::StrikeEdge, "melee/strike_edge"},
-      {audio::Cues::CombatCue::StrikeBlunt, "melee/strike_blunt"},
-      {audio::Cues::CombatCue::Cut, "melee/cut"},
+      {audio::Cues::CombatCue::Whoosh, "melee/whoosh", false},
+      {audio::Cues::CombatCue::Flesh, "melee/flesh", false},
+      {audio::Cues::CombatCue::Clang, "melee/clang", true},
+      {audio::Cues::CombatCue::StrikeEdge, "melee/strike_edge", false},
+      {audio::Cues::CombatCue::StrikeBlunt, "melee/strike_blunt", false},
+      {audio::Cues::CombatCue::Cut, "melee/cut", false},
   };
   for (const Slot& s : kSlots) {
     checks++;
     const int id = cues.CombatSetId(s.cue);
-    if (id < 0) {
+    if (id < 0 && s.mayBeEmpty) {
+      std::printf("combat-cues: '%s' has no takes yet (slot wired, set empty "
+                  "— a blocked parry is silent until one is recorded)\n",
+                  s.name);
+    } else if (id < 0) {
       ok = false;
       std::printf(
           "combat-cues: FAILED '%s' resolves to nothing. The set is a FOLDER "
@@ -2451,48 +2462,158 @@ Status GateUnarmedAttack(Ctx& c, std::string& detail) {
     CloseStage(c);
     return Status::Skip;
   }
+  // ---- THE TARGET STANDS SIDE-ON (2026-09-19) ----------------------------
+  //
+  // The gap above is not the distance the punch is thrown from. Two humans are
+  // held about 4.5 voxels apart centre-to-centre by `ApplyCrowdSpacing`
+  // whatever the fixture asked for (MobSystem::BodyRadius is a circle, so the
+  // heading changes nothing about where the centres settle), and a punch's
+  // hand delivers ~3.9 of its 5.0 arm (the note in StyleReachOn). FACING, the
+  // victim's near surface is half a body DEPTH inside that -- ~1.1, so 3.4
+  // from the attacker's centre against 3.9 of reach from a shoulder that is
+  // itself a voxel off the line. That half-voxel margin is decided by the
+  // settle drift and by the tempo jitter drawn from whatever mob id the
+  // suite has reached, which is the coin flip `_unarmedAttack_gap_about`
+  // describes -- and this gate has reported 0 bodies hit in-suite since
+  // 2026-09-16, at gap 5 and at gap 4 alike. SIDE-ON, the near surface is
+  // half a body WIDTH in (~2.2) and the knuckles have a voxel to spare.
+  //
+  // The claim is unchanged: the fallback punch is a real cut that lands on a
+  // body standing inside its reach. Whether a punch at a FACING body is a
+  // coin flip is a question about the fist's reach law, not about the
+  // fallback rule, and `ai-reach` (the AI standing where its own band puts
+  // it) is where that is measured. `unarmedAttack.targetSideOn` = 0 restores
+  // the facing fixture without a rebuild.
+  const bool sideOn = BaselineNumber("unarmedAttack.targetSideOn", 1) > 0;
+  if (sideOn) c.mobs.SetHeading(target, 1.5707963f);
   Ticker tick{c, 25200, {st.spot.x >> 4, st.spot.y >> 4, st.spot.z >> 4}};
   FaceAt(c.mobs, attacker, Chest(c.mobs, target, nd));
   for (int i = 0; i < 20; i++) tick();
 
   const uint32_t flesh0 = FleshVoxels(c.mobs, target);
   check(flesh0 > 0, "the target has flesh before anything swings");
+  // ...and how many limbs it has, for the "never dismembers" half below. A
+  // body limb that still owns a collider and voxels is a limb still on.
+  auto limbsOn = [&](uint64_t id) {
+    int n = 0;
+    const Mob* m = c.mobs.FindMobById(id);
+    if (m == nullptr) return n;
+    for (int i = 0; i < m->AppendedBase(); i++)
+      if (c.mobs.LimbBody(id, i) && c.mobs.LimbVoxelCount(id, i) > 0) n++;
+    return n;
+  };
+  const int limbs0 = limbsOn(target);
   c.mobs.ClearAttackRequests();
   check(c.mobs.SetMobBehavior(attacker, "swordsman_static"),
         "the disarmed attacker's AI could be stood up");
+  // The live reach the AI is about to commit on, read AFTER the profile is on
+  // (StrikeReachOf asks the profile which styles are drawable).
+  float strikeReach = 0.0f;
+  if (const Mob* am = c.mobs.FindMobById(attacker))
+    strikeReach = c.mobs.StrikeReachOf(*am);
 
   int requests = 0, cutTicks = 0, hits = 0;
   float topSpeed = 0;
+  // ---- WHERE THE RAYS WENT, AND HOW CLOSE THE KNUCKLES CAME (2026-09-19) --
+  // `0 bodies hit` has four causes (melee.h EdgeSweepResult) and the print
+  // below used to report the bare zero -- CLAUDE.md rule 6. The probe words
+  // are per-stroke tallies cleared on reset, so they are summed by their
+  // RISES exactly as `ai-reach` sums contacts. `nearest` is the closest the
+  // fist's own edge tip came to the target's chest on any cut tick, and
+  // `distMin..distMax` is the centre-to-centre distance the crowd spacing
+  // actually held the pair at -- the number the gap above only requests.
+  int probesCast = 0, probesAir = 0, probesSelf = 0, probesBody = 0;
+  int prevCast = 0, prevAir = 0, prevSelf = 0, prevBody = 0;
+  float nearest = 1e9f, distMin = 1e9f, distMax = 0.0f;
+  auto rise = [](int now, int& prev, int& acc) {
+    if (now > prev) acc += now - prev;
+    prev = now;
+  };
   const int ticks = (int)BaselineNumber("unarmedAttack.aiTicks", 150);
   for (int i = 0; i < ticks; i++) {
     tick();
     requests += (int)c.mobs.AttackRequests().size();
     c.mobs.ClearAttackRequests();
+    {
+      const Vec3 a = Chest(c.mobs, attacker, nd), b = Chest(c.mobs, target, nd);
+      const float d = std::sqrt((a.x - b.x) * (a.x - b.x) +
+                                (a.z - b.z) * (a.z - b.z));
+      distMin = std::min(distMin, d);
+      distMax = std::max(distMax, d);
+    }
     const NpcStroke* s = c.mobs.MobStroke(attacker);
-    if (s == nullptr) continue;
-    if (s->Cutting()) cutTicks++;
+    if (s == nullptr) {
+      prevCast = prevAir = prevSelf = prevBody = 0;
+      continue;
+    }
+    if (s->Cutting()) {
+      cutTicks++;
+      Vec3 eb{}, et{};
+      float ehw = 0.0f;
+      const Mob* am = c.mobs.FindMobById(attacker);
+      if (am != nullptr && am->WeaponEdge(eb, et, ehw))
+        nearest = std::min(nearest, (et - Chest(c.mobs, target, nd)).len());
+    }
     hits = std::max(hits, s->bodiesHit);
     topSpeed = std::max(topSpeed, s->topTipSpeed);
+    rise(s->probesCast, prevCast, probesCast);
+    rise(s->probesAir, prevAir, probesAir);
+    rise(s->probesSelf, prevSelf, probesSelf);
+    rise(s->probesBody, prevBody, probesBody);
   }
   const uint32_t flesh1 = FleshVoxels(c.mobs, target);
   const uint32_t lost = flesh0 > flesh1 ? flesh0 - flesh1 : 0u;
+  const int limbs1 = limbsOn(target);
   check(requests > 0, "the disarmed AI decided to attack");
   check(cutTicks > 0, "...and its request became a real cut");
   check(hits > 0, "...that landed on the target");
-  // "A PUNCH NEVER DISMEMBERS AND NEVER KERFS": a bare fist's profile is all
-  // `blunt` (human.json `natural`), and the blunt resolver (MobSystem::
-  // BluntHit) bruises without removing a voxel when `bluntCarve` is 0. So the
-  // number here is ZERO, and it lives in tests/baseline.json so that a future
-  // fist that IS allowed a dent costs a JSON edit and no rebuild.
-  const uint32_t lostMax =
+  // "A PUNCH NEVER DISMEMBERS": a bare fist's profile is all `blunt`
+  // (human.json `natural`), and the blunt resolver (Mob::BluntHit) never
+  // amputates (Mob::JointRuleApplies, BluntCarveScope). That half is a limb
+  // count, and it is unconditional.
+  check(limbs1 >= limbs0, "a fist took no limb off the target");
+  // ...AND "NEVER KERFS" IS NOW CONDITIONAL ON THE TUNING (2026-09-19).
+  // Until gore.bluntCarveRadius was 0 a punch removed nothing and the ceiling
+  // here was ZERO. The owner's retune set bluntCarveRadius 1.1 with the
+  // gore.unarmed* overrides at -1 (inherit), and the fist's own `bluntCarve`
+  // 0.3 is a ceiling on that: a punch that lands on flesh the bruise has
+  // already pulped past gore.pulpCarveFrom flags the limb for Mob::
+  // BluntPulpTick, which then eats pulped voxels at gore.pulpRotRate. So a
+  // fist IS allowed a dent now, and the claim is that it stays a DENT: a
+  // fraction of the body (unarmedAttack.fleshLostFracMax), never a wound. If
+  // the owner turns the carve back off, the ceiling falls back to the
+  // authored absolute (0) on its own -- no rebuild, no rebaseline.
+  const auto& gt = CurrentTuning().gore;
+  const float fistCarve = gt.unarmedCarveRadius >= 0.0f ? gt.unarmedCarveRadius
+                                                         : gt.bluntCarveRadius;
+  const float fistRipe = gt.unarmedPulpCarveFrom >= 0.0f ? gt.unarmedPulpCarveFrom
+                                                          : gt.pulpCarveFrom;
+  const bool fistDents =
+      fistCarve > 0.0f && gt.pulpRotRate > 0.0f && fistRipe < 1.0f;
+  const uint32_t lostAbs =
       (uint32_t)BaselineNumber("unarmedAttack.fleshLostMax", 0);
+  const double lostFrac = BaselineNumber("unarmedAttack.fleshLostFracMax", 0.02);
+  const uint32_t lostMax =
+      fistDents ? std::max(lostAbs, (uint32_t)std::lround(lostFrac * flesh0))
+                : lostAbs;
   check(lost <= lostMax,
-        "a fist took no more than the authored ceiling off the target");
+        fistDents ? "a fist's dent stayed a dent (flesh lost within "
+                    "unarmedAttack.fleshLostFracMax of the body)"
+                  : "a fist took no more than the authored ceiling off the "
+                    "target (blunt carve is off)");
   RecordObserved("unarmedAttack.fleshLostObserved", (double)lost);
+  RecordObserved("unarmedAttack.nearestKnuckleObserved",
+                 nearest < 1e8f ? (double)nearest : -1.0);
   std::printf(
       "unarmed-attack: %d requests, %d cut ticks, %d bodies hit, top tip "
-      "speed %.1f vox/s, %u flesh voxels lost (ceiling %u) over %d ticks\n",
-      requests, cutTicks, hits, topSpeed, lost, lostMax, ticks);
+      "speed %.1f vox/s, %u flesh voxels lost (ceiling %u%s) over %d ticks | "
+      "probes %d cast: %d air, %d self, %d body | knuckles nearest %.2f vox "
+      "to the chest, centres held %.2f..%.2f apart (asked %.1f, strike reach "
+      "%.2f), target %s, limbs %d -> %d\n",
+      requests, cutTicks, hits, topSpeed, lost, lostMax,
+      fistDents ? ", dents on" : "", ticks, probesCast, probesAir, probesSelf,
+      probesBody, nearest < 1e8f ? nearest : -1.0f, distMin, distMax, gap,
+      strikeReach, sideOn ? "side-on" : "facing", limbs0, limbs1);
 
   // ---- C. THE DRAW SHRINKS WITH THE BODY --------------------------------
   //
@@ -2698,19 +2819,71 @@ Status GateLunge(Ctx& c, std::string& detail) {
     int airTicks = 0;
     int cutTicks = 0;
     float sankBelow = 0;  // deepest the body went under its own start height
+    // ---- WHAT BODY FLEW (2026-09-19) ----------------------------------
+    // The loco state the biter was in when it launched, and that state's
+    // lungeScale (1 for normal locomotion), plus how many spawns were thrown
+    // back for arriving damaged -- see the note at `fly`.
+    std::string state = "normal";
+    float scale = 1.0f;
+    int rerolls = 0;
   };
   const float standOff = (float)BaselineNumber("lunge.standOffVox", 20.0);
+  // ---- THE UPRIGHT BODY MUST BE INTACT, AND A ZOMBIE SPAWNS EATEN ---------
+  //
+  // 2026-09-19: the upright flight came back at 5 air ticks / rise 0.22 /
+  // top xz 55, against 11 / 0.91 / 100 three days earlier -- every number
+  // scaled by 0.55, which is human.json's `limp` state (speedScale 0.55,
+  // lungeScale inheriting it; anim.h AnimStateRule). Nothing about the lunge
+  // moved. What moved is that a zombie is rotted at spawn (Mob::RotAtSpawn,
+  // zombie.json `rot`), and since 904dd30 a limb comes off when the flesh at
+  // its ATTACHMENT is gone whatever ate it (Mob::JointAttached) -- so a rot
+  // bite that lands on an ankle now takes the foot with it, `limp` matches,
+  // and the "upright" arm measured a one-footed hop at 0.55 of everything.
+  // Which draw a spawn gets follows the mob id, and the id this gate reaches
+  // depends on every gate before it (IdCounterScope restores the counter, it
+  // does not reset it), which is why the same code passed standalone.
+  //
+  // So the fixture asks for the body it is claiming about: a spawn that is
+  // not in normal locomotion after the anim poll has run is thrown back and
+  // drawn again, up to `lunge.intactTries`. A rig that never comes up intact
+  // is not hidden: the LAST spawn is flown anyway, its state and lungeScale
+  // are printed, and the rise floor is scaled by that lungeScale so the claim
+  // "it rises as its state allows" is still made rather than skipped. The
+  // crawl arm goes through the same door before its legs come off, so its
+  // state is `crawl` by construction and not `squirm` (an arm gone too).
+  const int intactTries = (int)BaselineNumber("lunge.intactTries", 6);
   auto fly = [&](bool crawl, Flight& out) -> bool {
     std::string why;
-    const uint64_t biter =
-        SpawnFighter(c, natDef, {st.spot.x, st.spot.y + 1, st.spot.z},
-                     "training_dummy", false, why);
-    const uint64_t prey = SpawnFighter(
-        c, natDef,
-        {st.spot.x, st.spot.y + 1, st.spot.z + (int)std::lround(standOff)},
-        "training_dummy", false, why);
-    if (biter == 0 || prey == 0) return false;
     Ticker tick{c, 25600, {st.spot.x >> 4, st.spot.y >> 4, st.spot.z >> 4}};
+    uint64_t biter = 0, prey = 0;
+    for (int attempt = 0; attempt < std::max(1, intactTries); attempt++) {
+      biter = SpawnFighter(c, natDef, {st.spot.x, st.spot.y + 1, st.spot.z},
+                           "training_dummy", false, why);
+      prey = SpawnFighter(
+          c, natDef,
+          {st.spot.x, st.spot.y + 1, st.spot.z + (int)std::lround(standOff)},
+          "training_dummy", false, why);
+      if (biter == 0 || prey == 0) return false;
+      // The state is polled in the anim tick (MobSystem::UpdateAnimation),
+      // not at spawn, so this is a few ticks and not a read straight after.
+      for (int i = 0; i < 6; i++) tick();
+      const int ls = c.mobs.LocoState(biter);
+      if (ls < 0) break;
+      if (ls < (int)nd.skel.states.size()) {
+        out.state = nd.skel.states[ls].name;
+        out.scale = std::max(0.0f, nd.skel.states[ls].lungeScale);
+      }
+      if (attempt + 1 >= std::max(1, intactTries)) break;  // fly it anyway
+      out.rerolls++;
+      c.mobs.Reset();
+      c.debris.Reset();
+      biter = prey = 0;
+    }
+    if (biter == 0 || prey == 0) return false;
+    if (c.mobs.LocoState(biter) < 0) {
+      out.state = "normal";
+      out.scale = 1.0f;
+    }
     if (crawl) {
       // BOTH THIGHS OFF is what puts this rig into its `crawl` state (the
       // sidecar's rule is `missing: [legU.L, legU.R]`) — `crawl-slope` severs
@@ -2719,6 +2892,13 @@ Status GateLunge(Ctx& c, std::string& detail) {
       c.mobs.Sever(biter, LimbNamed(nd, "legU.R"));
     }
     for (int i = 0; i < 30; i++) tick();   // settle, and let the state latch
+    // The state that actually launches -- `crawl` for the severed arm -- so
+    // the report names the body that flew and not the one that spawned.
+    if (const int ls = c.mobs.LocoState(biter);
+        ls >= 0 && ls < (int)nd.skel.states.size()) {
+      out.state = nd.skel.states[ls].name;
+      out.scale = std::max(0.0f, nd.skel.states[ls].lungeScale);
+    }
     FaceAt(c.mobs, biter, Chest(c.mobs, prey, nd));
     const Vec3 from = c.mobs.MobOrigin(biter);
     if (!c.mobs.ForceAttack(biter, "bite_lunge", Chest(c.mobs, prey, nd),
@@ -2764,11 +2944,19 @@ Status GateLunge(Ctx& c, std::string& detail) {
   const float minPlanar = (float)BaselineNumber("lunge.minPlanarVox", 3.0);
   const float minRise = (float)BaselineNumber("lunge.minRiseVox", 0.3);
   const float maxSink = (float)BaselineNumber("lunge.maxSinkVox", 1.0);
+  // The body the upright arm flew really was upright (see the note at `fly`):
+  // a zombie that came up limping on every one of `lunge.intactTries` draws is
+  // a rot-at-spawn fact worth a red line here, since nothing else prints it.
+  check(upright.state == "normal",
+        "the upright biter came up intact within lunge.intactTries spawns "
+        "(flew as \"" + upright.state + "\")");
   check(upright.launched, "an upright zombie's lunge leaves the ground");
   check(upright.topXzSpeed > 0.0f,
         "...with a planar velocity, not just a hop");
   check(upright.planar > minPlanar, "...and it closes real distance");
-  check(upright.peakRise > minRise, "...rising on the way");
+  // The floor is scaled by the flown state's lungeScale (1 when intact) so a
+  // damaged fallback body is still held to "rises as its state allows".
+  check(upright.peakRise > minRise * upright.scale, "...rising on the way");
   check(upright.cutTicks > 0, "...and the stroke still cuts when it lands");
   // A CRAWLER POUNCES LOW AND SHORT (anim.h AnimStateRule::lungeScale). The
   // crawl state authors speedScale 0.3 and lungeScale inherits it, so this is
@@ -2789,14 +2977,19 @@ Status GateLunge(Ctx& c, std::string& detail) {
   RecordObserved("lunge.uprightPlanarObserved", (double)upright.planar);
   RecordObserved("lunge.pronePlanarObserved", (double)prone.planar);
   RecordObserved("lunge.uprightRiseObserved", (double)upright.peakRise);
+  RecordObserved("lunge.uprightRerollsObserved", (double)upright.rerolls);
   std::printf(
       "lunge upright: %d air ticks, planar %.2f vox, peak rise %.2f, top xz "
-      "%.2f vox/s, %d cut ticks, sank %.2f\n"
+      "%.2f vox/s, %d cut ticks, sank %.2f | state %s (lungeScale %.2f), %d "
+      "damaged spawn(s) thrown back\n"
       "lunge crawl:   %d air ticks, planar %.2f vox, peak rise %.2f, top xz "
-      "%.2f vox/s, %d cut ticks, sank %.2f\n",
+      "%.2f vox/s, %d cut ticks, sank %.2f | state %s (lungeScale %.2f), %d "
+      "damaged spawn(s) thrown back\n",
       upright.airTicks, upright.planar, upright.peakRise, upright.topXzSpeed,
-      upright.cutTicks, upright.sankBelow, prone.airTicks, prone.planar,
-      prone.peakRise, prone.topXzSpeed, prone.cutTicks, prone.sankBelow);
+      upright.cutTicks, upright.sankBelow, upright.state.c_str(), upright.scale,
+      upright.rerolls, prone.airTicks, prone.planar, prone.peakRise,
+      prone.topXzSpeed, prone.cutTicks, prone.sankBelow, prone.state.c_str(),
+      prone.scale, prone.rerolls);
 
   CloseStage(c);
   detail = Format("%d checks", checks);

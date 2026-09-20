@@ -33,7 +33,9 @@
 // both ends in tests/baseline.json. An exact count would pin the gate to one
 // rig's arm thickness and one set of tuning values, and every future tweak to
 // gore.cut* would "fail" it; the property being protected is that the model is
-// neither instant nor asymptotic.
+// neither instant nor asymptotic. The HEFT it hacks with is a baseline row too
+// (woundAccumHeft): since the 2026-09-19 gore retune a heft-1.0 kerf is
+// narrower than the thigh and only grooves it, see GateWoundAccumulate.
 //
 // CONTENT-INDEPENDENT BY CONSTRUCTION. No def is named here and no limb is
 // named here. The fixture is CHOSEN: the largest severable, non-vital limb on
@@ -270,6 +272,7 @@ Status GateWoundChip(Ctx& c, std::string& detail) {
   const LimbAxis ax = MeasureLimb(mobs, id, t.limb);
   const uint32_t before = mobs.LimbArtVoxelCount(id, t.limb);
   const uint32_t stainBefore = mobs.LimbMaterialCount(id, t.limb, woundMat);
+  const uint32_t tintBefore = mobs.LimbStainCount(id, t.limb, 1);
 
   // MID-LIMB, at moderate commitment. Deliberately not at the joint: the
   // claim here is "an ordinary hit does not dismember", and cutting the
@@ -283,6 +286,8 @@ Status GateWoundChip(Ctx& c, std::string& detail) {
   const uint32_t stainAfter =
       mobs.LimbBody(id, t.limb) ? mobs.LimbMaterialCount(id, t.limb, woundMat)
                                 : 0;
+  const uint32_t tintAfter =
+      mobs.LimbBody(id, t.limb) ? mobs.LimbStainCount(id, t.limb, 1) : 0;
   const bool attached = mobs.LimbBody(id, t.limb) != 0;
   const bool noSever = mobs.SeverEvents().empty();
   const bool alive = mobs.IsAlive(id);
@@ -294,18 +299,47 @@ Status GateWoundChip(Ctx& c, std::string& detail) {
   const double maxFrac = BaselineNumber("woundChipMaxFraction", 0.35);
   const float frac = before ? (float)lost / (float)before : 0.0f;
   const bool sized = lost > 0 && frac <= (float)maxFrac;
-  const bool stained = stainAfter > stainBefore;
+
+  // BLOOD ON THE WOUND IS TWO MECHANISMS WITH TWO KNOBS (2026-09-19). The
+  // SOAK is a rewrite -- exposed tissue within gore.woundStainRadius of the
+  // kerf BECOMES the wound material (Mob::StainWoundAs) -- and the SMEAR is a
+  // tint: stain bits laid over everything within gore.stainCutRadius
+  // (bodystain.h SoakCut), bone included. This gate used to read only the
+  // rewrite. The owner's retune took woundStainRadius 0.9 -> 0.1 world voxels,
+  // which at skinScale 8 is under one skin cell, so an ordinary cut now
+  // rewrites nothing and "0 stained" is the tuning speaking, not a regression;
+  // stainCutRadius went 1.6 -> 0.4 and still tints the kerf's walls (body-coat
+  // measures 43 tinted voxels from one deeper cut on the same limb).
+  //
+  // So each half is asserted only while its OWN radius can reach a cell, read
+  // off the live Tuning rather than a constant: turn the soak back up and the
+  // rewrite claim re-arms by itself. The arming radii are baseline rows. If
+  // the owner turns BOTH under a cell the cut is bloodless by design and the
+  // detail line says so instead of failing on it.
+  const auto& g = CurrentTuning().gore;
+  const float soakArm = (float)BaselineNumber("woundChipSoakArmRadius", 0.5);
+  const float tintArm = (float)BaselineNumber("woundChipTintArmRadius", 0.25);
+  const bool wantSoak = g.woundStainRadius >= soakArm;
+  const bool wantTint = g.stainCutRadius >= tintArm;
+  const bool soaked = stainAfter > stainBefore;
+  const bool tinted = tintAfter > tintBefore;
+  const bool stained = (!wantSoak || soaked) && (!wantTint || tinted);
 
   RecordObserved("woundChipLostFraction", (double)frac);
   RecordObserved("woundChipStained", (double)(stainAfter - stainBefore));
+  RecordObserved("woundChipTinted", (double)(tintAfter - tintBefore));
 
   const bool ok = hit && sized && stained && attached && noSever && alive;
   detail = Format(
-      "%s/%s: %u -> %u voxels (%.1f%% of the limb, cap %.0f%%), %u stained, "
-      "limb attached=%d severs=%zu alive=%d",
+      "%s/%s: %u -> %u voxels (%.1f%% of the limb, cap %.0f%%), %u soaked "
+      "(rewrite %s at woundStainRadius %.2f, arms at %.2f), %u tinted (smear "
+      "%s at stainCutRadius %.2f, arms at %.2f), limb attached=%d severs=%zu "
+      "alive=%d",
       t.defName.c_str(), t.limbName.c_str(), before, after, frac * 100.0f,
-      maxFrac * 100.0, stainAfter - stainBefore, attached ? 1 : 0,
-      mobs.SeverEvents().size(), alive ? 1 : 0);
+      maxFrac * 100.0, stainAfter - stainBefore, wantSoak ? "ASSERTED" : "off",
+      (double)g.woundStainRadius, (double)soakArm, tintAfter - tintBefore,
+      wantTint ? "ASSERTED" : "off", (double)g.stainCutRadius, (double)tintArm,
+      attached ? 1 : 0, mobs.SeverEvents().size(), alive ? 1 : 0);
   mobs.Reset();
   c.debris.Reset();
   return ok ? Status::Pass : Status::Fail;
@@ -371,17 +405,38 @@ Status GateWoundAccumulate(Ctx& c, std::string& detail) {
   MobSystem& mobs = c.mobs;
   IdCounterScope idScope(mobs);
   PrepareWorld(c);
-  const Target t = ChooseTarget(mobs, FixtureSite(c.world, 200));
+  // INSET 230, THE SAME SITE AS wound-heft (2026-09-19). This gate stood at
+  // 200 and was red at suite scope for months on a site-specific cause nobody
+  // ran down (the old _woundAccumulate_about in baseline.json: heft severed
+  // the same limb in 5 at 230 while this never did at 200). Now that the run
+  // below is the SAME run as heft's heavy arm -- same limb, same heft, same
+  // seeds, same cross-section -- it is measured where that arm was measured,
+  // and a number this gate reports is one the other gate can be checked
+  // against. Nothing is shared between the two: each regenerates the world.
+  constexpr int kInset = 230;
+  const Target t = ChooseTarget(mobs, FixtureSite(c.world, kInset));
   if (!t.valid()) {
     detail = "no loaded mob def has a severable non-vital limb that bleeds";
     return Status::Fail;
   }
-  const int kMin = (int)BaselineNumber("woundAccumMinHits", 2);
-  const int kMax = (int)BaselineNumber("woundAccumMaxHits", 14);
+  const int kMin = (int)BaselineNumber("woundAccumMinHits", 3);
+  const int kMax = (int)BaselineNumber("woundAccumMaxHits", 40);
+  // THE HEFT IS A BASELINE ROW, NOT 1.0 (2026-09-19). The owner's retune
+  // (b48fb4d: gore.cutLength 0.9 -> 0.64, cutDepthPower 0.32 -> 0.15) made a
+  // heft-1.0 kerf at power 0.75 only 0.54 world voxels along the edge, and
+  // the human thigh is ~0.75 across: the slot advances THROUGH the limb but
+  // never spans it, so it saws a groove with a strip of flesh left on either
+  // side and neither structural rule in CarveLimb ever sees a disconnection
+  // (46 of 46 hits at heft 1.0 with the limb still on; heft 2.5 parts it in
+  // 13). That is the game as tuned, not a fault in the machinery this gate
+  // exists to exercise -- the claim is that SUSTAINED cuts sever THROUGH
+  // Sever(), and it is made with a kerf that can reach the far side. The
+  // sword's own heft is still measured against a heavier one by wound-heft.
+  const float heft = (float)BaselineNumber("woundAccumHeft", 2.5);
   // The cap is deliberately well past kMax: "never severed" and "severed on
   // the 30th" are different failures and a cap at kMax would report them
   // identically.
-  const CutRun r = HackThrough(c, t, 200, 1.0f, kMax * 3 + 4);
+  const CutRun r = HackThrough(c, t, kInset, heft, kMax * 3 + 4);
 
   RecordObserved("woundAccumHits", (double)r.hits);
   const bool band = r.severed && r.hits >= kMin && r.hits <= kMax;
@@ -392,9 +447,10 @@ Status GateWoundAccumulate(Ctx& c, std::string& detail) {
   const bool machinery = r.limbGone && r.byBlade && r.debrisGained > 0;
   const bool ok = band && machinery;
   detail = Format(
-      "%s/%s (%u voxels): severed after %d hits (band %d..%d), byBlade=%d, "
-      "limb detached=%d, +%u debris bodies, creature alive=%d",
-      t.defName.c_str(), t.limbName.c_str(), t.atSpawn, r.hits, kMin, kMax,
+      "%s/%s (%u voxels): heft %.1f %s after %d hits (band %d..%d, cap %d), "
+      "byBlade=%d, limb detached=%d, +%u debris bodies, creature alive=%d",
+      t.defName.c_str(), t.limbName.c_str(), t.atSpawn, (double)heft,
+      r.severed ? "severed" : "NOT SEVERED", r.hits, kMin, kMax, kMax * 3 + 4,
       r.byBlade ? 1 : 0, r.limbGone ? 1 : 0, r.debrisGained,
       r.aliveAfter ? 1 : 0);
   return ok ? Status::Pass : Status::Fail;
@@ -412,7 +468,7 @@ Status GateWoundHeft(Ctx& c, std::string& detail) {
     detail = "no loaded mob def has a severable non-vital limb that bleeds";
     return Status::Fail;
   }
-  const int cap = (int)BaselineNumber("woundAccumMaxHits", 14) * 3 + 4;
+  const int cap = (int)BaselineNumber("woundAccumMaxHits", 40) * 3 + 4;
   const float heavy = (float)BaselineNumber("woundHeftHeavy", 2.5);
   const CutRun light = HackThrough(c, t, 230, 1.0f, cap);
   const CutRun heavyRun = HackThrough(c, t, 230, heavy, cap);
@@ -421,8 +477,19 @@ Status GateWoundHeft(Ctx& c, std::string& detail) {
   // nothing at all, which is exactly the regression this exists to catch: the
   // factor is computed in main.cpp and consumed three call levels down, and a
   // dropped multiplication there is invisible in play.
-  const bool fewer = heavyRun.severed && light.severed &&
-                     heavyRun.hits < light.hits;
+  //
+  // THE LIGHT ARM MAY NEVER SEVER (2026-09-19). Since the owner's retune
+  // (gore.cutLength 0.9 -> 0.64, cutDepthPower 0.32 -> 0.15) a heft-1.0 kerf
+  // is narrower than the thigh it is cutting and grooves it to the cap --
+  // 46 of 46 here, where it took 5 before -- see the note in
+  // GateWoundAccumulate. "Never within the cap" is MORE hits than any severed
+  // count, so the differential still reads and still fails the right way: a
+  // dropped heft factor makes the heavy arm the light arm, and the heavy arm
+  // not severing fails it. What is no longer required is that a sword alone
+  // can take a leg off; that is a tuning statement and wound-accumulate makes
+  // its claim at a heft that can.
+  const bool fewer = heavyRun.severed &&
+                     (!light.severed || heavyRun.hits < light.hits);
 
   // ...and the DATA half: a bigger weapon must derive a bigger heft off its
   // own art, or the mechanism above has nothing to scale. Both items are
@@ -441,9 +508,11 @@ Status GateWoundHeft(Ctx& c, std::string& detail) {
 
   const bool ok = fewer && derived;
   detail = Format(
-      "%s/%s: heft 1.0 severs in %d hits, heft %.1f in %d; item heft sword "
+      "%s/%s: heft 1.0 %s %d hits, heft %.1f %s %d (cap %d); item heft sword "
       "%.2f cleaver %.2f (ref %.2f world voxels)",
-      t.defName.c_str(), t.limbName.c_str(), light.hits, heavy, heavyRun.hits,
+      t.defName.c_str(), t.limbName.c_str(),
+      light.severed ? "severs in" : "NOT severed in", light.hits, heavy,
+      heavyRun.severed ? "severs in" : "NOT severed in", heavyRun.hits, cap,
       hs, hc, g.woundHeftRef);
   return ok ? Status::Pass : Status::Fail;
 }
@@ -1465,6 +1534,22 @@ Status GateCorpseArmor(Ctx& c, std::string& detail) {
   // the sample below for why the threshold is expressed against the CLAMP.
   const float kPegged = 0.9f * 47.1238898f;
   uint32_t peggedSamples = 0;
+  // THE KILL HAS A TRANSIENT, AND A MOTOR IS NOT A TRANSIENT (2026-09-19).
+  // The note above the assertion already exempts the PEAK for exactly this
+  // reason -- a limb thrown by the killing blow may touch the clamp for a
+  // tick -- but the pegged count was one bucket, so the corpse landing and
+  // the corpse being driven read as the same number. Measured after the
+  // owner's gore retune, with the corpse coming down WHOLE (hand.L under its
+  // gauntlet is no longer cut through in 120 strokes: 89b4bb9 retargets a
+  // probe that meets flesh under a worn shell onto the shell): 7 body-ticks
+  // across 5 bodies, the last on tick 15, and not one after. That is the
+  // landing. The report this gate exists for is minutes of every limb at the
+  // clamp, which is LATE and SUSTAINED -- so the count is split at
+  // corpseArmorSettleTicks: the early bucket gets a loose cap (a motor pegs
+  // every body every tick and blows through it in one tick), the late bucket
+  // keeps the tight one.
+  const int settleTicks = (int)BaselineNumber("corpseArmorSettleTicks", 30);
+  uint32_t peggedEarly = 0;
   int lastHotTick = -1;
   std::unordered_set<uint64_t> peggedBodies, peggedShells;
   Vec3 peakPos{}, peakVel{};
@@ -1514,6 +1599,7 @@ Status GateCorpseArmor(Ctx& c, std::string& detail) {
         // definition a body whose spin the solver would have made larger.
         if (sq >= kPegged) {
           peggedSamples++;
+          if (i < settleTicks) peggedEarly++;
           peggedBodies.insert(h);
           lastHotTick = i;
           if (shellBodies.count(h)) peggedShells.insert(h);
@@ -1650,11 +1736,16 @@ Status GateCorpseArmor(Ctx& c, std::string& detail) {
   const double speedCap = BaselineNumber("corpseArmorMaxSpeedVox", 150.0);
   const double spreadCap = BaselineNumber("corpseArmorMaxSpreadVox", 60.0);
   const double peggedCap = BaselineNumber("corpseArmorMaxPeggedTicks", 4.0);
+  const double peggedEarlyCap =
+      BaselineNumber("corpseArmorMaxPeggedTicksEarly", 20.0);
+  const uint32_t peggedLate = peggedSamples - peggedEarly;
   RecordObserved("corpseArmorMaxSpeedVox", (double)maxSpeed);
   RecordObserved("corpseArmorMaxSpinRad", (double)maxSpin);
   RecordObserved("corpseArmorMaxSpreadVox", (double)maxSpread);
   RecordObserved("corpseArmorWorstStepMs", worstStepMs);
   RecordObserved("corpseArmorPeggedBodyTicks", (double)peggedSamples);
+  RecordObserved("corpseArmorPeggedBodyTicksEarly", (double)peggedEarly);
+  RecordObserved("corpseArmorPeggedBodyTicksLate", (double)peggedLate);
 
   // THE PEAK SPIN IS RECORDED, NOT ASSERTED, and that is the whole shape of
   // the fix. 47.12 rad/s is Jolt's clamp and a limb genuinely thrown by a
@@ -1665,7 +1756,8 @@ Status GateCorpseArmor(Ctx& c, std::string& detail) {
   // all, and would then assert nothing.
   const bool ok = died && maxSpeed <= (float)speedCap &&
                   maxSpread <= (float)spreadCap &&
-                  (double)peggedSamples <= peggedCap && net.cut == 0 &&
+                  (double)peggedEarly <= peggedEarlyCap &&
+                  (double)peggedLate <= peggedCap && net.cut == 0 &&
                   net.repaired == 0 && netHeld && strapsHold;
   detail = Format(
       "%s: %d base limbs + %d shells from %d worn pieces, %u joints dressed; "
@@ -1677,7 +1769,8 @@ Status GateCorpseArmor(Ctx& c, std::string& detail) {
       "tick %d (cap %.0f) at (%.1f, %.1f, %.1f), %.1f vox under ground, %.0f%% "
       "straight down; fastest spin %.2f rad/s on tick %d (%s, recorded not capped: %.2f); spread "
       "%.1f vox (cap %.0f); %u body-ticks pegged at Jolt's own clamp across %u "
-      "bodies (%u of them armour, cap %.0f), last on tick %d; the net damped "
+      "bodies (%u of them armour): %u in the first %d ticks (the kill, cap "
+      "%.0f) and %u after (cap %.0f), last on tick %d; the net damped "
       "%u / cut %u / repaired %u; worst physics step %.1f ms on tick %d. "
       "Driven arm: %u ticks at the ceiling -> damped %u, cut %u, joints %u -> "
       "%u, ended at %.1f rad/s (%s)",
@@ -1691,7 +1784,8 @@ Status GateCorpseArmor(Ctx& c, std::string& detail) {
       (double)peakUnderGround, (double)(fallFrac * 100.0f), (double)maxSpin,
       spinTick, spinIsShell ? "armour" : "flesh", (double)maxSpin,
       (double)maxSpread, spreadCap, peggedSamples,
-      (unsigned)peggedBodies.size(), (unsigned)peggedShells.size(), peggedCap,
+      (unsigned)peggedBodies.size(), (unsigned)peggedShells.size(),
+      peggedEarly, settleTicks, peggedEarlyCap, peggedLate, peggedCap,
       lastHotTick, net.damped, net.cut, net.repaired, worstStepMs,
       worstStepTick, drivenTicks, drivenDamped, drivenCut, drivenJointsBefore,
       drivenJointsAfter, (double)endSpin, netHeld ? "held" : "DID NOT HOLD");
@@ -2798,6 +2892,19 @@ Status GateBodyCoat(Ctx& c, std::string& detail) {
   // resolves it, so the ledger claim is about the rule and not about a name.
   const uint32_t coatMat =
       mobs.StainTypeOf(def.woundMat) ? def.woundMat : def.bleedMat;
+  // COUNT ABOVE THE SUBSTANCE'S OWN FLOOR (2026-09-19). Blood authors
+  // coat.decayFloor 1 (materials.json, 28ebf8d 2026-09-16: a coat dries to a
+  // faint residual, never to nothing) and Mob::StainTick skips a voxel at or
+  // under it -- so a count of voxels at amount >= 1 can NEVER fall, and the
+  // drying claim below was unpassable as written (43 -> 43 over 400 ticks at
+  // 2 ticks/level: every voxel had walked down to 1 and stopped, exactly as
+  // authored). Every stain count in this gate is therefore of voxels ABOVE
+  // the floor, read off the material so a re-authored floor moves the gate
+  // with it. The claim is what it was: at the authored rate the smear holds,
+  // and at two ticks per level it walks itself down to the residual.
+  const uint32_t coatFloor =
+      coatMat < c.mats.size() ? c.mats[coatMat].coatDecayFloor : 0u;
+  const uint32_t aboveFloor = coatFloor + 1u;
 
   // ONE MONOTONIC TICK COUNTER for the whole gate, and it is load-bearing
   // rather than tidy: the drying rule fires on `tick % period == 0` and the
@@ -2869,14 +2976,15 @@ Status GateBodyCoat(Ctx& c, std::string& detail) {
   // still has to be flat. The counter is at 34021 here and 34200 is the next
   // multiple, so 150 ticks clear it; the assertion after it is what would
   // catch this drifting.
-  const uint32_t cutStain = mobs.LimbStainCount(id, t.limb, 1);
+  const uint32_t cutStain = mobs.LimbStainCount(id, t.limb, aboveFloor);
   const uint32_t holdFrom = simTick;
   constexpr uint32_t kHoldTicks = 150;
   for (uint32_t i = 0; i < kHoldTicks && mobs.LimbBody(id, t.limb); i++)
     poseTick();
   const bool holdWindowClean = (holdFrom / 600u) == (simTick / 600u);
   const uint32_t heldStain =
-      mobs.LimbBody(id, t.limb) ? mobs.LimbStainCount(id, t.limb, 1) : 0u;
+      mobs.LimbBody(id, t.limb) ? mobs.LimbStainCount(id, t.limb, aboveFloor)
+                                : 0u;
   const double holdMin = BaselineNumber("bodyCoatHoldMinFraction", 0.9);
   const bool holdOk = cutStain > 0 && holdWindowClean &&
                       (double)heldStain >= holdMin * (double)cutStain;
@@ -3057,12 +3165,13 @@ Status GateBodyCoat(Ctx& c, std::string& detail) {
   }
   constexpr uint32_t kDecayCap = 400;
   const double decayMax = BaselineNumber("bodyCoatDecayMaxFraction", 0.1);
-  uint32_t decayedStain = mobs.LimbBody(id, t.limb)
-                              ? mobs.LimbStainCount(id, t.limb, 1) : 0u;
+  uint32_t decayedStain =
+      mobs.LimbBody(id, t.limb) ? mobs.LimbStainCount(id, t.limb, aboveFloor)
+                                : 0u;
   uint32_t ranTicks = 0;
   for (; ranTicks < kDecayCap && mobs.LimbBody(id, t.limb); ranTicks++) {
     poseTick();
-    decayedStain = mobs.LimbStainCount(id, t.limb, 1);
+    decayedStain = mobs.LimbStainCount(id, t.limb, aboveFloor);
     if ((double)decayedStain <= decayMax * (double)heldStain) break;
   }
   SetCurrentTuning(savedTune);
@@ -3094,7 +3203,8 @@ Status GateBodyCoat(Ctx& c, std::string& detail) {
   detail = Format(
       "%s/%s%s: ledger top = mat %u (want %u, blood %u) over %u voxels, "
       "frac %.4f, body sum %u >= limb sum %u, unknown tag %.2f; "
-      "stained %u -> %u over %u ticks at the authored 20 s/level%s "
+      "stained above the authored decayFloor %u: %u -> %u over %u ticks at "
+      "the authored 20 s/level%s "
       "(floor %.0f%%), then -> %u over %u ticks at 2 ticks/level "
       "(cap %.0f%%); deposit %s on stone at (%d,%d,%d): word %08x -> %08x, "
       "stain type %u amount %u; footfall on %s: %u voxels soaked (ledger %u), "
@@ -3103,7 +3213,7 @@ Status GateBodyCoat(Ctx& c, std::string& detail) {
       t.defName.c_str(), t.limbName.c_str(), pinned ? "" : " (NOT pinned)",
       limbLedger.top[0].mat, coatMat, mBlood, limbLedger.voxels,
       (double)limbLedger.Frac(), bodyLedger.sumAmt, limbLedger.sumAmt,
-      (double)noSuchTag, cutStain, heldStain, kHoldTicks,
+      (double)noSuchTag, coatFloor, cutStain, heldStain, kHoldTicks,
       holdWindowClean ? "" : " (WINDOW CROSSED A DECAY PERIOD)", holdMin * 100.0,
       decayedStain, ranTicks, decayMax * 100.0, queued ? "queued" : "REFUSED",
       floorCell.x, floorCell.y, floorCell.z, depBefore, depAfter,

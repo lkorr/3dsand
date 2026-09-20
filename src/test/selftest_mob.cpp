@@ -4796,12 +4796,32 @@ Status GateUndead(Ctx& c, std::string& detail) {
   const float hpH = c.mobs.TotalHp(hId), hpA = c.mobs.TotalHp(zA);
   const bool hurt = hpA > 0.0f && hpH > 0.0f && hpA < hpH;
   // Rot must never be what takes a limb off: no sever, no death, same rig.
+  //
+  // "SAME RIG" IS COUNTED IN BODIES, NOT IN SLOTS (2026-09-19). LimbCount() is
+  // limbDefs_.size(), and a sever does not shrink it: DetachLimb hands the
+  // lattice to DebrisSystem and leaves the slot behind with `body` 0 (it holds
+  // the kinematic piece for kSeverHoldSeconds). So the slot count was blind to
+  // the one thing this claim exists to refuse. What CAN see it is a base limb
+  // with no body the instant after Spawn -- and it matters now, because the
+  // joint-attachment rule that landed today (Mob::JointRuleApplies /
+  // DropDisconnectedChildren, reached from CarveLimb) is not excluded under
+  // inSpawnRot_: a rot bite that eats a socket out of the torso severs the arm
+  // seated in it, and Sever() charges gore.severVoxels through DrainBlood --
+  // which is the only way `dry` below can be false with no tick run. Both are
+  // therefore printed side by side so a red here names its cause.
+  int severedAtSpawn = 0;
+  for (int i = 0; i < ma->AppendedBase(); i++)
+    if (c.mobs.LimbBody(zA, i) == 0) severedAtSpawn++;
+  for (int i = 0; i < mb->AppendedBase(); i++)
+    if (c.mobs.LimbBody(zB, i) == 0) severedAtSpawn++;
   const bool intact = c.mobs.IsAlive(zA) && c.mobs.IsAlive(zB) &&
                       ma->LimbCount() == mh->LimbCount() &&
-                      mb->LimbCount() == mh->LimbCount();
+                      mb->LimbCount() == mh->LimbCount() &&
+                      severedAtSpawn == 0;
   // THE HOLES ARE OLD. Without Mob::inSpawnRot_ every bite tops up a drip
   // budget and the creature arrives haemorrhaging.
-  const bool dry = c.mobs.BloodLost(zA) <= 0.0f;
+  const float bloodLostA = c.mobs.BloodLost(zA);
+  const bool dry = bloodLostA <= 0.0f;
   // Chunks, not speckle: spurs per voxel lost, against the same body's own
   // baseline roughness (the human's spur count is what the ART already has).
   const uint32_t lostA = aAt0 - aNow;
@@ -4936,7 +4956,15 @@ Status GateUndead(Ctx& c, std::string& detail) {
   skinMats.erase(std::unique(skinMats.begin(), skinMats.end()), skinMats.end());
   exposedInner(zA, ma, nullptr, wall, wallClean);
   const double dryWallFrac = wall ? (double)wallClean / (double)wall : 0.0;
-  const double dryWallMin = BaselineNumber("undeadDryWallFracMin", 0.20);
+  // THE FLOOR FOLLOWS THE SMEAR'S REACH (2026-09-19). A wet bite's tint spreads
+  // `stainCutRadius / woundStainRadius` times further than its rewrite
+  // (Mob::StainWoundAs `tintRatio`), and the owner's retune took that ratio
+  // from 1.6/0.9 = 1.8 to 0.4/0.1 = 4.0: the smear from the wet half of the
+  // holes now reaches across the dry half, and the same dryFraction 0.5 that
+  // measured 0.378 clean walls on 2026-09-15 measures 0.110 today. The rot did
+  // not change; the reach of the blood around it did. tests/baseline.json
+  // carries the 0.05 floor and the reasoning; the default here only mirrors it.
+  const double dryWallMin = BaselineNumber("undeadDryWallFracMin", 0.05);
   const double dryWallMax = BaselineNumber("undeadDryWallFracMax", 0.85);
   // The floor on `wall` is the vacuity guard: "0 of 0 wall voxels are clean"
   // would otherwise pass or fail on a division rather than on the feature.
@@ -4949,6 +4977,8 @@ Status GateUndead(Ctx& c, std::string& detail) {
   RecordObserved("undeadWoundFrac", woundFrac);
   RecordObserved("undeadStainFrac", stainFrac);
   RecordObserved("undeadDryWallFrac", dryWallFrac);
+  RecordObserved("undeadSeveredAtSpawn", (double)severedAtSpawn);
+  RecordObserved("undeadBloodLostVox", (double)bloodLostA);
 
   const bool ok = sameArt && overrides && paler && humanWhole && bitten &&
                   hurt && intact && dry && chunky && varies && bloody &&
@@ -4956,14 +4986,16 @@ Status GateUndead(Ctx& c, std::string& detail) {
   detail = Format(
       "art/rig shared %d, overrides %d, palette chroma %.2f -> %.2f luma %.1f "
       "-> %.1f (%d), human whole %u/%u (%d), zombie %u/%u lost %.3f (%.2f..%.2f"
-      ", %d), hp %.1f -> %.1f (%d), intact %d, dry %d, spurs/lost %.3f <= %.3f "
+      ", %d), hp %.1f -> %.1f (%d), intact %d (severed at spawn %d), dry %d "
+      "(blood lost %.1f vox), spurs/lost %.3f <= %.3f "
       "(%d), varies %d, blood: wound %.3f (>= %.3f and >= %.1fx anatomy "
       "%.3f) stain %.3f (>= %.3f), human wound/stain %u/%u (%d), dry hole "
       "walls %u/%u = %.3f (%.2f..%.2f, %d)",
       sameArt ? 1 : 0, overrides ? 1 : 0, hChroma, zChroma, hLuma, zLuma,
       paler ? 1 : 0, hNow, hAt0, humanWhole ? 1 : 0, aNow, aAt0, lossA, lossMin,
       lossMax, bitten ? 1 : 0, hpH, hpA, hurt ? 1 : 0, intact ? 1 : 0,
-      dry ? 1 : 0, spurPerLost, spurMax, chunky ? 1 : 0, varies ? 1 : 0,
+      severedAtSpawn, dry ? 1 : 0, bloodLostA, spurPerLost, spurMax,
+      chunky ? 1 : 0, varies ? 1 : 0,
       woundFrac, woundMin, woundOverBase, hWoundFrac, stainFrac, stainMin,
       hWound, hStain, bloody ? 1 : 0, wallClean, wall, dryWallFrac, dryWallMin,
       dryWallMax, mishmash ? 1 : 0);
@@ -5229,6 +5261,12 @@ Status GateAiReach(Ctx& c, std::string& detail) {
     uint32_t lost = 0;  // flesh voxels taken off the dummy
     float hp0 = 0, hp1 = 0;
     int killTick = -1;  // >= 0 = the quarry died and the run stopped there
+    // WHERE THE PROBE RAYS WENT, summed over every stroke (NpcStroke's own
+    // counters, melee.h EdgeSweepResult). `0 hit` has four causes -- no sweep,
+    // no ray, all air, all eaten by the wielder's own body -- and the fists
+    // arm reported exactly that bare zero on 2026-09-19 with 44 cut ticks;
+    // these four words are what turn it into a diagnosis (CLAUDE.md rule 6).
+    int probesCast = 0, probesAir = 0, probesSelf = 0, probesBody = 0;
   };
   // Longest to shortest, which is also most-likely-to-work to least: the
   // ordering is not load-bearing but it makes the printed line read as a ramp.
@@ -5322,6 +5360,7 @@ Status GateAiReach(Ctx& c, std::string& detail) {
     std::vector<float> dists;
     dists.reserve((size_t)ticks);
     int prevHit = 0;
+    int prevCast = 0, prevAir = 0, prevSelf = 0, prevBody = 0;
     for (int i = 0; i < ticks; i++) {
       tick();
       a.requests += (int)c.mobs.AttackRequests().size();
@@ -5332,12 +5371,23 @@ Status GateAiReach(Ctx& c, std::string& detail) {
       // a torso, 1 for a punch — and comparing that number between weapons
       // measures the shape of the sweep rather than how often the creature
       // connected. Counting the RISES totals the contacts across every stroke.
+      // The probe counters are per-stroke in the same way and ride the same
+      // rise-counting (2026-09-19).
       if (const NpcStroke* s = c.mobs.MobStroke(att)) {
         if (s->Cutting()) a.cutTicks++;
         if (s->bodiesHit > prevHit) a.hits += s->bodiesHit - prevHit;
         prevHit = s->bodiesHit;
+        auto rise = [](int now, int& prev, int& total) {
+          if (now > prev) total += now - prev;
+          prev = now;
+        };
+        rise(s->probesCast, prevCast, a.probesCast);
+        rise(s->probesAir, prevAir, a.probesAir);
+        rise(s->probesSelf, prevSelf, a.probesSelf);
+        rise(s->probesBody, prevBody, a.probesBody);
       } else {
         prevHit = 0;
+        prevCast = prevAir = prevSelf = prevBody = 0;
       }
       if (!c.mobs.IsAlive(target)) {
         a.killTick = i;
@@ -5388,6 +5438,18 @@ Status GateAiReach(Ctx& c, std::string& detail) {
   // was still placed for a punch the armed creature would never throw
   // (MobSystem::StrikeReachOf). A fluke contact is exactly what a
   // marginally-too-far fighter produces, so the floor has to be above one.
+  //
+  // THE FLOOR IS A COUNT OF CONTACTS AND NOTHING ELSE (2026-09-19). The owner's
+  // retune took melee.fullSpeedMps from 3.4 to 20, so an NPC swing at its
+  // natural tip speed now lands a small fraction of its damage (melee.cpp ramps
+  // `power` linearly from minSpeedMps to fullSpeedMps) -- the dagger arm's 8
+  // hits took 33 hp where they used to take a limb. A contact still registers
+  // at any power above minSpeed, so this claim did not move with the ramp and
+  // it is deliberately NOT relaxed for it. What the same run did show is the
+  // fists arm at 0 hits from 44 cut ticks and a 5.5-voxel stand-off against a
+  // 5.0-voxel reach: that is a probe that never touched the dummy, not a blow
+  // too weak to count, and the per-arm probe split printed below is what says
+  // which of the four bare-zero causes it was.
   const int minHits = (int)BaselineNumber("aiReachMinHits", 3);
   bool allSwung = true, allLanded = true;
   for (const Arm& a : arms) {
@@ -5400,6 +5462,10 @@ Status GateAiReach(Ctx& c, std::string& detail) {
   // it was never going to") that 21 landed hits removed nothing measurable,
   // while the sword stripped the target's whole 3328. hp is what every one of
   // the four is trying to do, so hp is the claim they can all be held to.
+  // Under the 2026-09-19 ramp every arm that LANDED still hurt (dagger 33 hp
+  // off 8 hits, bite 78 off 27), so "hurt" is implied by "landed" and the only
+  // way to fail it alone is a hit whose power rounded to nothing -- worth
+  // keeping as its own line for exactly that case.
   bool allHurt = true;
   for (const Arm& a : arms)
     if (!(a.killTick >= 0 || a.hp1 < a.hp0)) allHurt = false;
@@ -5429,10 +5495,11 @@ Status GateAiReach(Ctx& c, std::string& detail) {
   for (const Arm& a : arms)
     per += Format(
         "%s(reach %.1f: %d req, %d cut, %d hit, hp %.0f->%.0f%s, %u vox, stood "
-        "%.1f) ",
+        "%.1f, probes %d cast/%d air/%d self/%d body) ",
         a.name, a.reach, a.requests, a.cutTicks, a.hits, a.hp0, a.hp1,
         a.killTick >= 0 ? Format(" KILLED t%d", a.killTick).c_str() : "",
-        a.lost, a.settled);
+        a.lost, a.settled, a.probesCast, a.probesAir, a.probesSelf,
+        a.probesBody);
   detail = Format(
       "%d ticks from %d vox, band [7,11]: %s| every arm swung=%d landed>=%d=%d, "
       "hurt it=%d, dagger closer than sword=%d, sword still in band=%d",
@@ -5857,8 +5924,20 @@ Status GateAiPursue(Ctx& c, std::string& detail) {
   //    state the size of the improvement. Damage is a lottery on this fixture
   //    (see Arm::SwingRate) and a tight threshold on it would make the gate
   //    flap.
+  //
+  //    THE RATE FLOOR FOLLOWS melee.fullSpeedMps (2026-09-19). The owner's
+  //    retune took it from 3.4 to 20 m/s, and melee.cpp ramps a blow's power
+  //    linearly from minSpeedMps to that, so the same landed hit now costs a
+  //    fraction of the hp it did: the pursuing arm measured 0.08%hp/t off 7.4
+  //    hits/100t, against a floor of 0.15 written when a hit was worth twice
+  //    as much. The HITS floor is the claim about pursuit and it did not move
+  //    (53 landed); the rate floor is only there so that "landed" cannot be
+  //    satisfied by contacts that cost nothing, and 0.03 still fails a
+  //    pursuer that stops connecting (0.00) while sitting under half of what
+  //    the ramp leaves. Both live in tests/baseline.json; the defaults here
+  //    mirror them.
   const int minHits = (int)BaselineNumber("aiPursueMinHits", 6);
-  const float minRate = (float)BaselineNumber("aiPursueMinRate", 0.15);
+  const float minRate = (float)BaselineNumber("aiPursueMinRate", 0.03);
   const bool landed = run.Sum(&Fight::hits) >= minHits && run.Rate() >= minRate;
   // 3. ...AND IT SWUNG FAR MORE OFTEN THAN THE CREATURE THAT COULD NOT. THE
   //    CLAIM. The same fight, the same quarry, the same tick budget, fought by

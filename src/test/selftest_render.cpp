@@ -3112,12 +3112,41 @@ Status GatePlants(Ctx& c, std::string& detail) {
     return id < ms.table.size() && ms.table[id].base != kMicroNoBrick &&
            (ms.table[id].flags & kMicroPlant) != 0;
   };
+  // THE CAST IS RESOLVED BY NAME, not by world.h's kMat* literals (2026-09-19,
+  // the 'gate hardcodes the cast' lesson). A material's id IS its position in
+  // materials.json plus one for air, so inserting one moves every id after it:
+  // 6b8623f (2026-09-17) put `brain` in at 122 and mushroom_large became 123,
+  // while world.h's kMatMushroomLarge still says 122 -- so this loader check
+  // was asking whether a BRAIN is a plant, and the picture below was painting
+  // a toadstool tile out of brain. The names are what materials.json and the
+  // micro loader agree on; a rename fails here as 0, which is the right
+  // failure (it names the asset) rather than a silent id swap.
+  auto matNamed = [&](const char* n) -> uint32_t {
+    for (size_t i = 0; i < c.mats.size(); i++)
+      if (c.mats[i].name == n) return (uint32_t)i;
+    return 0;
+  };
+  const uint32_t mTallGrass = matNamed("tall_grass"),
+                 mTallGrassHead = matNamed("tall_grass_head"),
+                 mFern = matNamed("fern"),
+                 mMushroomLarge = matNamed("mushroom_large"),
+                 mGrassTuft = matNamed("grass_tuft");
   const bool loaderOk = loaded && kinds[kPlantGrass] && kinds[kPlantFlower] &&
                         kinds[kPlantMushroom] && kinds[kPlantFern] &&
-                        isPlant(kMatTallGrass) && isPlant(kMatFern) &&
-                        isPlant(kMatMushroomLarge) && isPlant(kMatGrassTuft) &&
+                        mTallGrass && mTallGrassHead && mFern &&
+                        mMushroomLarge && mGrassTuft &&
+                        isPlant(mTallGrass) && isPlant(mFern) &&
+                        isPlant(mMushroomLarge) && isPlant(mGrassTuft) &&
                         plantMats >= 13;
   if (!log.empty()) std::printf("plants: micro loader said:\n%s", log.c_str());
+  if (mMushroomLarge != kMatMushroomLarge || mFern != kMatFern ||
+      mTallGrass != kMatTallGrass || mGrassTuft != kMatGrassTuft)
+    std::printf("plants: NOTE world.h kMat* is stale against materials.json: "
+                "mushroom_large %u (kMatMushroomLarge %u), fern %u (%u), "
+                "tall_grass %u (%u), grass_tuft %u (%u) -- main.cpp's flora "
+                "painter uses the constants\n",
+                mMushroomLarge, kMatMushroomLarge, mFern, kMatFern, mTallGrass,
+                kMatTallGrass, mGrassTuft, kMatGrassTuft);
 
   // ---- 2. the ring ----
   TrampleRing ring;
@@ -3152,7 +3181,7 @@ Status GatePlants(Ctx& c, std::string& detail) {
       const int height = 4 + (int)(r % 5u);
       for (int k = 1; k <= height; k++)
         put({gx - 9 + dx, gh + k, gz + 6 + dz},
-            k == height ? kMatTallGrassHead : kMatTallGrass);
+            k == height ? mTallGrassHead : mTallGrass);
     }
   // A fern tile and a toadstool tile beside it, exactly where the renderer
   // rebuilds them (sim/plants.h is plantTileAt's CPU twin).
@@ -3166,11 +3195,13 @@ Status GatePlants(Ctx& c, std::string& detail) {
       for (int dx = -half; dx <= half; dx++)
         for (int k = 1; k <= pt.h; k++) put({pt.cx + dx, hc + k, pt.cz + dz}, mat);
   };
+  // Name-resolved ids (see the loader note above): with kMatMushroomLarge
+  // stale this tile was a block of `brain`, and the picture still "drew".
   paintTile((gx + 2) / kPlantFernTile, (gz + 2) / kPlantFernTile, kPlantFernSalt,
-            kPlantFernTile, kPlantFernFoot, kPlantFernMinH, kPlantFernMaxH, kMatFern);
+            kPlantFernTile, kPlantFernFoot, kPlantFernMinH, kPlantFernMaxH, mFern);
   paintTile((gx + 10) / kPlantShroomTile, (gz + 3) / kPlantShroomTile, kPlantShroomSalt,
             kPlantShroomTile, kPlantShroomFoot, kPlantShroomMinH, kPlantShroomMaxH,
-            kMatMushroomLarge);
+            mMushroomLarge);
 
   Camera cam;
   cam.yaw = 1.5708f;   // +Z: the fern dead ahead, the stand and toadstool beside it

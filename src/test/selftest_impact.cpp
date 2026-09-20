@@ -15,7 +15,9 @@
 //   impact-blunt   a mace HURTS and does not DISMEMBER. Both halves, because
 //                  a model that only bruises is as wrong as one that severs:
 //                  hp falls, the limb stays attached past hp 0, voxels do
-//                  leave (a dent), and the blood is a fraction of a cut's.
+//                  leave (a dent -- over the ticks AFTER the blows, since
+//                  2026-09-19: see Dissolve), and the blood is a fraction of
+//                  a cut's.
 //   impact-armor   the other direction, against a plate. A sword takes a chip
 //                  and the wearer is untouched; a mace takes a great deal more
 //                  and the LIMB UNDER THE PLATE is hurt. That pair is the
@@ -309,6 +311,66 @@ bool MaceProfile(const ItemLibrary& items, StrikeProfile& out) {
   return true;
 }
 
+// ---- WHAT THE LIMB STILL HAS (2026-09-19) ---------------------------------
+//
+// Voxels the limb still HAS, tombstones excluded. A dissolved (or burnt, or
+// rotted) voxel is set to material 0 IN PLACE and only compacted out of the
+// lattice when Mob::FlushBurn's batch threshold fills (kBurnRebuildFloor, or a
+// 64th of the limb), so LimbArtVoxelCount alone lags the dissolution by up to
+// one flush and reads "nothing left" for a pulped patch too small to ever fill
+// one. The tombstones are counted as material 0 and taken off.
+uint32_t LiveVoxels(MobSystem& mobs, uint64_t id, int limb) {
+  const uint32_t art = mobs.LimbArtVoxelCount(id, limb);
+  const uint32_t dead = mobs.LimbMaterialCount(id, limb, 0u);
+  return art > dead ? art - dead : 0u;
+}
+
+// ---- THE DISSOLUTION PHASE (2026-09-19, gore.pulpRotRate) ------------------
+//
+// A dent is no longer carved by the blow that earns it. Since 54ba62b
+// Mob::BluntHit only FLAGS the limb (gore.bluntCarveRadius 0 -> 1.1,
+// pulpCarveFrom 0.3) and Mob::BluntPulpTick eats the pulped voxels one at a
+// time over the ticks that follow, so a fixture that is struck and read in the
+// same instant always reads "took 0 voxels" -- which is what impact-blunt and
+// impact-fist reported for a day. The fixture has to be TICKED before anything
+// can have left.
+//
+// The rate it is ticked at is an ARM of the gate, not a claim, exactly as
+// joint-rot cranks the infection: the shipped 1.5 vox/min makes a thigh's
+// crater a minute of sim, and a gate that waited that long for one number
+// would cost more than it tells. Both numbers come from tests/baseline.json.
+// Blood loss is switched off for the phase (gore.bleedHpPerVoxel 0) because a
+// fixture that bleeds white mid-measurement is measuring its own hp, not the
+// dent. Stops early when the limb leaves or the creature dies, and says which.
+struct DissolveResult {
+  bool attached = false;
+  bool alive = false;
+  int ticks = 0;
+};
+DissolveResult Dissolve(Ctx& c, uint64_t id, int limb, int ticks, float rate,
+                        uint32_t tick0) {
+  MobSystem& mobs = c.mobs;
+  const Tuning saved = CurrentTuning();
+  Tuning tt = saved;
+  tt.gore.pulpRotRate = rate;
+  tt.gore.bleedHpPerVoxel = 0.0f;
+  SetCurrentTuning(tt);
+  DissolveResult r;
+  std::vector<ParticleSpawn> spawns;
+  for (int i = 0; i < ticks; i++) {
+    if (!mobs.IsAlive(id) || !mobs.LimbBody(id, limb)) break;
+    std::vector<BrushOp> ops;
+    std::vector<CellOp> cellOps;
+    spawns.clear();
+    mobs.PreTick(tick0 + (uint32_t)i, c.world, ops, cellOps, spawns);
+    r.ticks = i + 1;
+  }
+  r.alive = mobs.IsAlive(id);
+  r.attached = mobs.LimbBody(id, limb) != 0;
+  SetCurrentTuning(saved);
+  return r;
+}
+
 // ---------------------------------------------------------------------------
 // impact-blunt — a mace hurts and does not dismember
 // ---------------------------------------------------------------------------
@@ -456,10 +518,21 @@ Status GateImpactBlunt(Ctx& c, std::string& detail) {
   }
 
   // ---- ARM B: THE WOUND MODEL ITSELF --------------------------------------
-  uint32_t before = 0, after = 0, bruise = 0, bruiseOne = 0, bruiseDeep = 0;
+  //
+  // `before` / `afterBlows` / `after` are LIVE counts (LiveVoxels): what the
+  // limb has at spawn, the instant the last blow lands, and after the
+  // dissolution phase has run. The middle reading is the one the mechanic's
+  // change is asserted on -- see `noInstantCarve` below.
+  uint32_t before = 0, afterBlows = 0, after = 0, bruise = 0, bruiseOne = 0,
+           bruiseDeep = 0;
   float hp0 = 0, hp1 = 0, bluntBleed = 0;
   bool attached = false, alive = false;
   size_t severs = 0;
+  // The dissolution ARM (see Dissolve): rate in world voxels/min and how many
+  // ticks it is given. 2026-09-19.
+  const float kPulpRot = (float)BaselineNumber("impactPulpRot", 30.0);
+  const int kPulpTicks = (int)BaselineNumber("impactPulpTicks", 60);
+  int dissolveTicks = 0;
   const uint32_t bruiseMat = c.mobs.MaterialIdNamed(CurrentTuning().gore.bruiseMat);
   // MORE THAN ONE BLOW'S WORTH, in coat levels — the threshold the "it deepens"
   // claim below is measured against.
@@ -494,7 +567,7 @@ Status GateImpactBlunt(Ctx& c, std::string& detail) {
       return Status::Fail;
     }
     const LimbAxis ax = MeasureLimb(mobs, id, t.limb);
-    before = mobs.LimbArtVoxelCount(id, t.limb);
+    before = LiveVoxels(mobs, id, t.limb);
     hp0 = mobs.LimbHp(id, t.limb);
     // ALWAYS THE SAME SPOT, a quarter of the limb's reach in — the same place
     // wound-accumulate hacks at, so "a mace at the place a sword parts a limb"
@@ -521,7 +594,7 @@ Status GateImpactBlunt(Ctx& c, std::string& detail) {
     alive = mobs.IsAlive(id);
     severs = mobs.SeverEvents().size();
     if (attached) {
-      after = mobs.LimbArtVoxelCount(id, t.limb);
+      afterBlows = LiveVoxels(mobs, id, t.limb);
       hp1 = mobs.LimbHp(id, t.limb);
       // THE COAT, NOT THE MATERIAL. Counting `skin_bruised` VOXELS was right
       // while a bruise was a material rewrite and is now always zero: the
@@ -535,6 +608,21 @@ Status GateImpactBlunt(Ctx& c, std::string& detail) {
                        : 0u;
       pulped = bloodMat ? mobs.LimbCoatMatCount(id, t.limb, bloodMat, pulpAt) : 0u;
       bluntBleed = mobs.LimbBleedBudget(id, t.limb);
+      // ---- ...AND THEN IT COMES APART (2026-09-19, gore.pulpRotRate) -------
+      //
+      // Every reading above is taken the instant the last blow lands, which is
+      // where this arm used to stop -- and where, since 54ba62b, nothing has
+      // left yet. The dent is now a DISSOLUTION: the ticks below are what let
+      // Mob::BluntPulpTick eat the pulped patch, and `after` is the limb once
+      // it has. Attachment is re-read afterwards because that is the claim:
+      // blunt never amputates, and "never" has to include the crater opening.
+      const DissolveResult d =
+          Dissolve(c, id, t.limb, kPulpTicks, kPulpRot, 8000u);
+      dissolveTicks = d.ticks;
+      attached = d.attached;
+      alive = d.alive;
+      severs = mobs.SeverEvents().size();
+      after = attached ? LiveVoxels(mobs, id, t.limb) : 0u;
     }
     mobs.Reset();
     c.debris.Reset();
@@ -570,13 +658,24 @@ Status GateImpactBlunt(Ctx& c, std::string& detail) {
     c.debris.Reset();
   }
 
+  const uint32_t lostAtBlows =
+      before > afterBlows ? before - afterBlows : 0u;
   const uint32_t lost = before > after ? before - after : 0u;
   const float frac = before ? (float)lost / (float)before : 0.0f;
   // THE BAND, NOT THE NUMBER. A dent must remove SOMETHING (a mace with
   // bluntCarve 0.6 that took nothing would be a fist) and must stay well short
   // of the collapse fraction that would have shed the limb — which is the
   // claim, since the sever is refused rather than merely unreached.
+  //
+  // ...AND NOT IN THE SWING (2026-09-19). `lost` is read AFTER the dissolution
+  // phase; `lostAtBlows` the instant the last blow lands, and it must be zero:
+  // pulped tissue dissolves over the ticks that follow (gore.pulpRotRate), it
+  // does not vanish in one swing. That is the whole of what 54ba62b changed,
+  // and the old instant CarveLimbRadial would fail exactly this line.
   const double dentMax = BaselineNumber("impactBluntDentMaxFraction", 0.60);
+  RecordObserved("impactBluntLostAtBlows", (double)lostAtBlows);
+  RecordObserved("impactBluntLost", (double)lost);
+  RecordObserved("impactBluntDissolveTicks", (double)dissolveTicks);
   RecordObserved("impactBluntLostFraction", (double)frac);
   RecordObserved("impactBluntHpDrop", (double)(hp0 - hp1));
   RecordObserved("impactBluntBruiseCells", (double)bruise);
@@ -589,6 +688,7 @@ Status GateImpactBlunt(Ctx& c, std::string& detail) {
   RecordObserved("impactBluntSweptLost", (double)sweptLost);
 
   const bool hurt = hp1 < hp0;
+  const bool noInstantCarve = lostAtBlows == 0;
   const bool sized = lost > 0 && frac <= (float)dentMax;
   // THE CLAIM. hp is at or below zero and the limb is STILL THERE — that is
   // "a blunt hit never takes a limb off", and nothing weaker states it: a
@@ -649,23 +749,25 @@ Status GateImpactBlunt(Ctx& c, std::string& detail) {
   const bool located =
       sweptHitReported && !sweptHitMissing && sweptHitOff < 4.0f;
 
-  const bool ok = hurt && sized && heldOn && pastZero && marked && deepened &&
-                  concentrated && openedNothingAtFirst && broke && spectrum &&
-                  drier && resolver && located;
+  const bool ok = hurt && noInstantCarve && sized && heldOn && pastZero &&
+                  marked && deepened && concentrated && openedNothingAtFirst &&
+                  broke && spectrum && drier && resolver && located;
   detail = Format(
-      "%s/%s x%d mace(blunt %.0f, dent %.2f): hp %.1f -> %.1f, %u -> %u voxels "
-      "(%.1f%%, cap %.0f%%), bruised %u after one blow -> %u after %d (%u past "
-      "%u/15, i.e. more than one blow), attached=%d severs=%zu alive=%d | "
-      "ladder: %u pulped (blood >= %u/15) after one blow -> %u after %d | "
-      "bleed budget %.2f vs %.2f for the same hp as cuts | through the real "
-      "sweep: hp -%.1f, %u voxels, attached=%d, contact reported=%d/%d, worst "
-      "%.2f vox off the limb axis",
+      "%s/%s x%d mace(blunt %.0f, dent %.2f): hp %.1f -> %.1f, %u voxels -> %u "
+      "the instant the blows end (%u gone in the swing, must be 0) -> %u after "
+      "%d ticks dissolving at %.0f vox/min (%.1f%% gone, cap %.0f%%), bruised "
+      "%u after one blow -> %u after %d (%u past %u/15, i.e. more than one "
+      "blow), attached=%d severs=%zu alive=%d | ladder: %u pulped (blood >= "
+      "%u/15) after one blow -> %u after %d | bleed budget %.2f vs %.2f for "
+      "the same hp as cuts | through the real sweep: hp -%.1f, %u voxels, "
+      "attached=%d, contact reported=%d/%d, worst %.2f vox off the limb axis",
       t.defName.c_str(), t.limbName.c_str(), kHits, mace.blunt,
-      mace.bluntCarve, hp0, hp1, before, after, frac * 100.0f,
-      dentMax * 100.0, bruiseOne, bruise, kHits, bruiseDeep, bruiseCap,
-      attached ? 1 : 0, severs, alive ? 1 : 0, pulpedOne, pulpAt, pulped, kHits,
-      bluntBleed, cutBleed, sweptHpDrop, sweptLost, sweptAttached ? 1 : 0,
-      sweptHitReported ? 1 : 0, sweptHitMissing ? 0 : 1, sweptHitOff);
+      mace.bluntCarve, hp0, hp1, before, afterBlows, lostAtBlows, after,
+      dissolveTicks, kPulpRot, frac * 100.0f, dentMax * 100.0, bruiseOne,
+      bruise, kHits, bruiseDeep, bruiseCap, attached ? 1 : 0, severs,
+      alive ? 1 : 0, pulpedOne, pulpAt, pulped, kHits, bluntBleed, cutBleed,
+      sweptHpDrop, sweptLost, sweptAttached ? 1 : 0, sweptHitReported ? 1 : 0,
+      sweptHitMissing ? 0 : 1, sweptHitOff);
   return ok ? Status::Pass : Status::Fail;
 }
 
@@ -1037,13 +1139,34 @@ Status GateImpactFist(Ctx& c, std::string& detail) {
       c.mobs.MaterialIdNamed(CurrentTuning().gore.bruiseMat);
   std::vector<ParticleSpawn> spawns;
 
-  struct Arm { uint32_t before = 0, after = 0, bruise = 0; bool attached = false; };
-  auto run = [&](int inset, const StrikeProfile& p, uint32_t salt) -> Arm {
+  // ---- THE DENT IS A DISSOLUTION NOW (2026-09-19, gore.pulpRotRate) --------
+  //
+  // Both arms are TICKED after their blows, at the same cranked rate for the
+  // same number of ticks (see Dissolve): a gauntlet's dent is a flag on the
+  // limb that Mob::BluntPulpTick then spends, so read the instant the blows
+  // end it is always zero, which is what this gate reported after 54ba62b. The
+  // bare fist is ticked too -- bluntCarve 0 means the flag is never raised, so
+  // the SAME ticks at the SAME rate must still take nothing from it, and that
+  // is a stronger statement of "a punch removes nothing" than the instant read
+  // was. Counts are LIVE counts (LiveVoxels), tombstones excluded.
+  const float kPulpRot = (float)BaselineNumber("impactPulpRot", 30.0);
+  const int kPulpTicks = (int)BaselineNumber("impactPulpTicks", 60);
+  const uint32_t bloodMat = mobs.Defs()[t.defIndex].bleedMat;
+  const uint32_t pulpAt = (uint32_t)std::lround(
+      std::clamp(CurrentTuning().gore.pulpAmt, 1.0f, 15.0f));
+
+  struct Arm {
+    uint32_t before = 0, afterBlows = 0, after = 0, bruise = 0, pulped = 0;
+    bool attached = false, alive = false;
+    int ticks = 0;
+  };
+  auto run = [&](int inset, const StrikeProfile& p, uint32_t salt,
+                 uint32_t tick0) -> Arm {
     Arm a;
     const uint64_t id = SpawnTarget(c, t, inset);
     if (!id) return a;
     const LimbAxis ax = MeasureLimb(mobs, id, t.limb);
-    a.before = mobs.LimbArtVoxelCount(id, t.limb);
+    a.before = LiveVoxels(mobs, id, t.limb);
     const Vec3 at = ax.anchor + ax.along * (ax.reach * 0.5f);
     const float spread = (float)BaselineNumber("impactFistSpread", 0.5);
     for (int k = 0; k < kHits; k++) {
@@ -1054,35 +1177,52 @@ Status GateImpactFist(Ctx& c, std::string& detail) {
                 salt + (uint32_t)k * 2654435761u, spawns);
     }
     a.attached = mobs.LimbBody(id, t.limb) != 0;
+    a.alive = mobs.IsAlive(id);
     if (a.attached) {
-      a.after = mobs.LimbArtVoxelCount(id, t.limb);
+      a.afterBlows = LiveVoxels(mobs, id, t.limb);
       // The COAT, not the material -- a bruise no longer rewrites the voxel it
       // marks (DESIGN.md, "A bruise is an alpha that deepens"), so the old
       // material count is always zero now. `minAmt` 1 is "marked at all", which
       // is the claim this arm makes: a bare fist bruises and takes nothing.
       a.bruise = bruiseMat ? mobs.LimbCoatMatCount(id, t.limb, bruiseMat, 1) : 0u;
+      // ...and how much of the patch the blows BROKE (blood at pulp depth),
+      // which is what the dissolution below has to work with. Reported, not
+      // asserted: the gauntlet's ladder is impact-blunt's claim, made there.
+      a.pulped =
+          bloodMat ? mobs.LimbCoatMatCount(id, t.limb, bloodMat, pulpAt) : 0u;
+      const DissolveResult d =
+          Dissolve(c, id, t.limb, kPulpTicks, kPulpRot, tick0);
+      a.ticks = d.ticks;
+      a.attached = d.attached;
+      a.alive = d.alive;
+      a.after = a.attached ? LiveVoxels(mobs, id, t.limb) : 0u;
     }
     mobs.Reset();
     c.debris.Reset();
     return a;
   };
 
-  const Arm bare = run(415, fist, 0xF15Du);
-  const Arm iron = run(425, gaunt->strike, 0x1207u);
+  const Arm bare = run(415, fist, 0xF15Du, 9000u);
+  const Arm iron = run(425, gaunt->strike, 0x1207u, 9500u);
 
   const uint32_t bareLost = bare.before > bare.after ? bare.before - bare.after : 0u;
   const uint32_t ironLost = iron.before > iron.after ? iron.before - iron.after : 0u;
+  const uint32_t ironAtBlows =
+      iron.before > iron.afterBlows ? iron.before - iron.afterBlows : 0u;
   const float ironPerHit =
       iron.before ? (float)ironLost / (float)iron.before / (float)kHits : 0.0f;
 
   RecordObserved("impactFistBareLost", (double)bareLost);
   RecordObserved("impactFistBareBruise", (double)bare.bruise);
   RecordObserved("impactFistIronLost", (double)ironLost);
+  RecordObserved("impactFistIronLostAtBlows", (double)ironAtBlows);
+  RecordObserved("impactFistIronPulped", (double)iron.pulped);
   RecordObserved("impactFistIronPerHitFraction", (double)ironPerHit);
 
   // "Punching never dismembers, it bloodies a spot if you hit it repeatedly."
   // Zero voxels is an ABSOLUTE claim and it is the right one here: bluntCarve
-  // 0 means CarveLimbRadial is never called at all, so anything above zero is
+  // 0 means the limb is never flagged for dissolution at all, so anything
+  // above zero -- after the same ticks that empty the gauntlet's crater -- is
   // a dispatch bug rather than a tuning question.
   const bool bareTookNothing = bareLost == 0 && bare.attached;
   const bool bareMarked = bruiseMat != 0 && bare.bruise > 0;
@@ -1090,18 +1230,28 @@ Status GateImpactFist(Ctx& c, std::string& detail) {
   // came off, and it came off SLOWLY — bounded above by the fraction ONE
   // sword cut takes, which is the wound gates' own observed number and is
   // what "slowly" has to mean if it is to mean anything.
+  //
+  // ...and none of it in the swing (2026-09-19): the instant read must still
+  // be zero, or the dent has gone back to being carved on contact.
   const double slowCap = BaselineNumber("woundChipMaxFraction", 0.35);
   const bool ironBit = ironLost > 0 && iron.attached;
+  const bool ironNoInstant = ironAtBlows == 0;
   const bool ironSlow = ironPerHit < (float)slowCap;
 
-  const bool ok = bareTookNothing && bareMarked && ironBit && ironSlow;
+  const bool ok = bareTookNothing && bareMarked && ironBit && ironNoInstant &&
+                  ironSlow;
   detail = Format(
-      "%s/%s x%d each: BARE FIST (blunt %.1f, dent 0) took %u voxels and "
-      "bruised %u | GAUNTLET (blunt %.1f, dent %.2f) took %u of %u, %.3f%% per "
-      "hit (cap %.1f%%), attached=%d",
-      t.defName.c_str(), t.limbName.c_str(), kHits, fist.blunt, bareLost,
-      bare.bruise, gaunt->strike.blunt, gaunt->strike.bluntCarve, ironLost,
-      iron.before, ironPerHit * 100.0f, slowCap * 100.0, iron.attached ? 1 : 0);
+      "%s/%s x%d each, then %d ticks dissolving at %.0f vox/min: BARE FIST "
+      "(blunt %.1f, dent 0) took %u voxels and bruised %u, attached=%d "
+      "alive=%d | GAUNTLET (blunt %.1f, dent %.2f) pulped %u, took %u in the "
+      "swing (must be 0) and %u of %u after %d ticks, %.3f%% per hit (cap "
+      "%.1f%%), attached=%d alive=%d",
+      t.defName.c_str(), t.limbName.c_str(), kHits, kPulpTicks, kPulpRot,
+      fist.blunt, bareLost, bare.bruise, bare.attached ? 1 : 0,
+      bare.alive ? 1 : 0, gaunt->strike.blunt, gaunt->strike.bluntCarve,
+      iron.pulped, ironAtBlows, ironLost, iron.before, iron.ticks,
+      ironPerHit * 100.0f, slowCap * 100.0, iron.attached ? 1 : 0,
+      iron.alive ? 1 : 0);
   return ok ? Status::Pass : Status::Fail;
 }
 
@@ -1766,6 +1916,219 @@ Status GateJointRot(Ctx& c, std::string& detail) {
   return Status::Fail;
 }
 
+// ---------------------------------------------------------------------------
+// bite-limbs — A BITE INFECTS WHATEVER IT LANDS ON (2026-09-19)
+// ---------------------------------------------------------------------------
+//
+// Owner report: "zombie bites on the arm most of the time do not create
+// infection voxels, just the green stained normal bite ones; the ones on the
+// chest and head tend to infect." That is a report about a DISTRIBUTION over
+// limbs, and every gate above it bites exactly one limb — the biggest severable
+// non-vital one `ChooseTarget` can find, i.e. a thigh. So the whole family of
+// bite gates was green while the feature only worked on slabs.
+//
+// A BARE COUNT BUYS ONE HYPOTHESIS (CLAUDE.md rule 6), and "the arm did not
+// infect" had at least four: the teeth carve nothing on a thin limb
+// (gore.biteRadius is 0.42 WORLD voxels), the carve collapse-severs it, the
+// rewrite finds no flesh-class cell inside the rim, or the contact point is
+// outside the limb's own lattice so none of the above ever runs. This gate
+// answers all of them at once by biting EVERY base limb and printing a row per
+// limb, in two arms that differ only in WHERE the teeth land:
+//
+//   CORE — the middle of the limb, which is where every existing bite gate
+//          aims (a rig anchor plus half the reach). Inside the meat.
+//   SKIN — the outermost voxel of the same cross-section, which is where teeth
+//          actually arrive: `MeleeSweepDamage` hands `BiteHit` the probe's
+//          contact point and a probe stops at the surface it met.
+//
+// So a limb that infects in CORE and not in SKIN is a CONTACT-POINT defect, and
+// one that fails both is a LIMB-SIZE defect. Two different fixes, told apart by
+// one run and no A/B.
+//
+// The claim is the SKIN arm: a bite that lands anywhere on a creature made of
+// flesh leaves rot in it. The core arm is reported, not asserted — it is the
+// diagnosis, and asserting a control twice is how a gate starts failing for
+// something it does not own.
+Status GateBiteLimbs(Ctx& c, std::string& detail) {
+  MobSystem& mobs = c.mobs;
+  IdCounterScope idScope(mobs);
+  PrepareWorld(c);
+  const uint32_t rotMat = mobs.MaterialIdNamed("rotflesh");
+  const uint32_t ichor = mobs.MaterialIdNamed("ichor");
+  if (!rotMat || !ichor) {
+    detail = "materials.json has no `rotflesh` / `ichor`";
+    return Status::Skip;
+  }
+  // WHICH CREATURE: the most-limbed thing in the library that bleeds and has an
+  // anatomy. By SHAPE and not by name, for the reason the cast-hardcoding
+  // gotcha gives: a gate that names `human` starts measuring nothing the day
+  // the cast changes, and this one is about limbs being SMALL, so the def with
+  // the most of them is the one that has small ones.
+  int defIndex = -1;
+  size_t most = 0;
+  for (size_t d = 0; d < mobs.Defs().size(); d++) {
+    const MobDef& def = mobs.Defs()[d];
+    if (def.bleedMat == 0 || def.tissue.empty()) continue;
+    if (def.limbs.size() > most) {
+      most = def.limbs.size();
+      defIndex = (int)d;
+    }
+  }
+  if (defIndex < 0) {
+    detail = "no loaded mob def both bleeds and has an anatomy";
+    return Status::Skip;
+  }
+
+  // One spawn, posed, at its own ground column. Every bite below gets a FRESH
+  // one: a bite carves, and a limb already torn is a different fixture.
+  auto spawn = [&](int inset) -> uint64_t {
+    mobs.Reset();
+    c.debris.Reset();
+    const uint64_t id = mobs.Spawn(defIndex, FixtureSite(c.world, inset));
+    if (!id) return 0;
+    for (int i = 0; i < 8; i++) {
+      std::vector<BrushOp> ops;
+      std::vector<ParticleSpawn> spawns;
+      std::vector<CellOp> cellOps;
+      mobs.PreTick(6000u + (uint32_t)i, c.world, ops, cellOps, spawns);
+      c.phys.Step(kTickDt);
+      mobs.PostStep();
+    }
+    mobs.ClearSeverEvents();
+    mobs.ClearSeverStats();
+    return id;
+  };
+
+  // The limb roster, read off a live rig rather than off the def: only the rig
+  // knows which limbs physics actually gave a body.
+  struct Row {
+    int limb = -1;
+    std::string name, tag;
+    uint32_t atSpawn = 0;
+    uint32_t core = 0, skin = 0;      // rot voxels left by the bite
+    uint32_t coreLost = 0, skinLost = 0;
+    bool coreOn = true, skinOn = true;
+  };
+  std::vector<Row> rows;
+  {
+    const uint64_t id = spawn(445);
+    if (!id) {
+      detail = "the fixture would not spawn";
+      return Status::Fail;
+    }
+    const Mob* m = mobs.FindMobById(id);
+    if (m == nullptr) {
+      detail = "the fixture spawned and could not be found";
+      return Status::Fail;
+    }
+    for (int li = 0; li < m->AppendedBase(); li++) {
+      if (!mobs.LimbBody(id, li)) continue;
+      Row r;
+      r.limb = li;
+      r.name = m->LimbDefAt(li).name;
+      r.tag = m->LimbDefAt(li).tag;
+      r.atSpawn = mobs.LimbVoxelsAtSpawn(id, li);
+      rows.push_back(r);
+    }
+    mobs.Reset();
+    c.debris.Reset();
+  }
+  if (rows.empty()) {
+    detail = "the fixture has no limbs with bodies";
+    return Status::Fail;
+  }
+
+  // The rot must not GROW inside the measurement: this gate is about the bite,
+  // and `bite-infect` owns the clock. Both rates to 0 and no ticks are run.
+  const Tuning saved = CurrentTuning();
+  {
+    Tuning tt = saved;
+    tt.gore.infectSpreadRate = 0.0f;
+    tt.gore.infectRotRate = 0.0f;
+    SetCurrentTuning(tt);
+  }
+
+  // WHERE THE TEETH LAND. `core` is the middle of the limb; `skin` is that same
+  // cross-section pushed out to the furthest voxel across the axis, which is
+  // the surface a probe would have stopped on. Measured off surviving voxels
+  // (MeasureLimb's own construction) so nothing here reads an authored box.
+  auto aimPoints = [&](uint64_t id, int li, Vec3& core, Vec3& skin) -> bool {
+    const LimbAxis ax = MeasureLimb(mobs, id, li);
+    if (!ax.valid) return false;
+    core = ax.anchor + ax.along * (ax.reach * 0.5f);
+    Vec3 bestDir{};
+    float bestLen = 0.0f;
+    for (uint32_t k = 0; k < 64; k++) {
+      const Vec3 p = mobs.LimbVoxelPos(id, li, k * 6151u);
+      const Vec3 rel = p - core;
+      const Vec3 perp = rel - ax.along * rel.dot(ax.along);
+      const float len = perp.len();
+      if (len > bestLen) {
+        bestLen = len;
+        bestDir = perp;
+      }
+    }
+    skin = bestLen > 1e-3f ? core + bestDir.normalized() * bestLen : core;
+    return true;
+  };
+
+  const float kHp = (float)BaselineNumber("biteLimbsHp", 4.0);
+  int inset = 445;
+  for (Row& r : rows) {
+    for (int arm = 0; arm < 2; arm++) {
+      const uint64_t id = spawn(inset);
+      inset = inset == 445 ? 455 : 445;   // alternate two columns, never share
+      if (!id) continue;
+      Vec3 core{}, skin{};
+      if (!aimPoints(id, r.limb, core, skin)) continue;
+      const uint32_t before = mobs.LimbArtVoxelCount(id, r.limb);
+      std::vector<ParticleSpawn> spawns;
+      BiteOnce(mobs, c.world, id, r.limb, arm == 0 ? core : skin, kHp,
+               (uint16_t)rotMat, (uint16_t)ichor, 0.85f, 0xB17Eu + (uint32_t)r.limb,
+               spawns);
+      const bool on = mobs.LimbBody(id, r.limb) != 0;
+      const uint32_t rot = on ? mobs.LimbMaterialCount(id, r.limb, rotMat) : 0;
+      const uint32_t after = on ? mobs.LimbArtVoxelCount(id, r.limb) : 0;
+      const uint32_t lost = before > after ? before - after : 0;
+      if (arm == 0) {
+        r.core = rot;
+        r.coreLost = lost;
+        r.coreOn = on;
+      } else {
+        r.skin = rot;
+        r.skinLost = lost;
+        r.skinOn = on;
+      }
+      mobs.Reset();
+      c.debris.Reset();
+    }
+  }
+  SetCurrentTuning(saved);
+
+  // ---- THE READOUT: one row per limb, both arms ----------------------------
+  std::string s = mobs.Defs()[defIndex].name + ":";
+  uint32_t skinDead = 0, coreDead = 0, sever = 0;
+  for (const Row& r : rows) {
+    s += " " + r.name + "[" + r.tag + "," + std::to_string(r.atSpawn) + "v skin " +
+         std::to_string(r.skin) + "rot/" + std::to_string(r.skinLost) +
+         "lost core " + std::to_string(r.core) + "rot/" +
+         std::to_string(r.coreLost) + "lost" + (r.skinOn && r.coreOn ? "" : " SEVERED") +
+         "]";
+    if (r.skin == 0) skinDead++;
+    if (r.core == 0) coreDead++;
+    if (!r.skinOn || !r.coreOn) sever++;
+  }
+  RecordObserved("biteLimbsLimbs", (double)rows.size());
+  RecordObserved("biteLimbsSkinNoRot", (double)skinDead);
+  RecordObserved("biteLimbsCoreNoRot", (double)coreDead);
+  RecordObserved("biteLimbsSevered", (double)sever);
+  detail = std::to_string(rows.size()) + " limbs, " + std::to_string(skinDead) +
+           " took NO infection from a surface bite (" + std::to_string(coreDead) +
+           " from a core bite, " + std::to_string(sever) + " severed); " + s;
+  if (skinDead == 0) return Status::Pass;
+  return Status::Fail;
+}
+
 }  // namespace
 
 const std::vector<Gate>& ImpactGates() {
@@ -1775,6 +2138,7 @@ const std::vector<Gate>& ImpactGates() {
       {"impact-fist", "mob", {}, false, GateImpactFist, false},
       {"bite-rot", "mob", {}, false, GateBiteRot, false},
       {"bite-infect", "mob", {}, false, GateBiteInfect, false},
+      {"bite-limbs", "mob", {}, false, GateBiteLimbs, false},
       {"joint-rot", "mob", {}, false, GateJointRot, false},
   };
   return g;

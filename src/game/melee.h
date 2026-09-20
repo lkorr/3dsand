@@ -165,7 +165,9 @@ struct MeleeTuning {
   // Blade tip speed (world voxels/sec) at and above which a hit does full
   // damage; below it damage falls off linearly to zero. This is what makes a
   // committed cut different from waving the weapon around.
-  float fullSpeed = MetresPerSecToCells(3.4f);
+  // Dead initialiser: melee.cpp fills this from Tuning::Melee (fullSpeedMps).
+  // Kept equal to the tuning.h default so nobody reads two truths.
+  float fullSpeed = MetresPerSecToCells(20.0f);
   float minSpeed = MetresPerSecToCells(0.9f);
   // HOW FAR THE TIP SWINGS PER CONTROL UNIT — RADIANS per mouse pixel, not
   // pixels/sec and not voxels. This is the whole control law now: the delta is

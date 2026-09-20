@@ -2016,6 +2016,44 @@ def check_gas_consts():
                     f"gas: {fname} defines its own struct {name}, shadowing "
                     f"common.wgsl's")
 
+# ------------------------------------------------------------- material ids
+# A material's id IS its position in materials.json (index + 1, air first --
+# materials.cpp LoadMaterials), and world.h names a few of those positions as
+# kMat* constants so C++ can paint without a lookup. Inserting a material
+# anywhere but the end shifts every row after it, and nothing in the build
+# notices: `brain` went in at 122 on 2026-09-17 and kMatMushroomLarge kept
+# saying 122, so the --shot flora painter drew two toadstools out of brain for
+# two days until the `plants` gate asked whether its "mushroom" was a plant.
+# Each constant's name is its material id in CamelCase (kMatTallGrassHead ->
+# tall_grass_head), which is what makes the pair checkable here.
+def check_material_ids():
+    world = read("src/sim/world.h")
+    raw = read("assets/materials/materials.json")
+    if not world or not raw:
+        return
+    try:
+        mats = json.loads(raw)["materials"]
+    except (ValueError, KeyError, TypeError):
+        return
+    ids = {m["id"]: i + 1 for i, m in enumerate(mats) if isinstance(m, dict)}
+    checked.append("material ids")
+    for name, val in re.findall(r"\b(kMat[A-Z][A-Za-z0-9]*)\s*=\s*(\d+)", world):
+        snake = re.sub(r"(?<!^)(?=[A-Z])", "_", name[4:]).lower()
+        if snake == "air":
+            continue
+        if snake not in ids:
+            problems.append(
+                f"world.h {name} = {val}: no material named '{snake}' in "
+                f"materials.json (renamed? the constant's name must be the id "
+                f"in CamelCase)")
+        elif ids[snake] != int(val):
+            problems.append(
+                f"world.h {name} = {val} but '{snake}' is at position "
+                f"{ids[snake]} in materials.json -- a material was inserted or "
+                f"removed above it; move the constant (and grep for the old "
+                f"literal)")
+
+
 ALL = {
     "envpred": check_env_predictions,
     "autofly": check_autofly_surface,
@@ -2043,6 +2081,7 @@ ALL = {
     "burntint": check_burn_tint_sites,
     "plants": check_plant_tiles,
     "gas": check_gas_consts,
+    "matids": check_material_ids,
 }
 
 # The hook passes the edited file; run only the checks that file can break.
@@ -2057,14 +2096,16 @@ RELEVANT = {
     "assets/perfview.js": ["perfscopes"],
     "src/measure/perfnodes.h": ["perfnodes", "perfscopes"],
     "src/sim/materials.cpp": ["render", "farbits"],
-    "assets/materials/materials.json": ["farbits", "plants"],
+    "assets/materials/materials.json": ["farbits", "plants", "matids"],
     "src/sim/plants.h": ["plants"],
     "src/gpu/resources.cpp": ["world"],
     "src/sim/farfield.cpp": ["farface"],
     "src/sim/farfield.h": ["farface"],
     "src/test/selftest.cpp": ["arch"],
+    # ONE entry per file: a duplicate key in a dict literal silently replaces
+    # the earlier one, and world.h / perfnodes.h each had two until 2026-09-19.
     "src/sim/world.h": ["world", "params", "substeps", "windprim",
-                        "curprim", "waterledger"],
+                        "curprim", "waterledger", "ringdepth", "matids"],
     "src/test/selftest_water.cpp": ["waterledger"],
     "src/sim/world.cpp": ["worldgen"],
     "assets/shaders/worldgen.wgsl": ["worldgen", "treeatlas"],
@@ -2075,9 +2116,7 @@ RELEVANT = {
     "src/gpu/vk_record.h": ["counts"],
     "src/gpu/rhi_vk.cpp": ["counts"],
     "src/gpu/rhi_vulkan.h": ["ringdepth"],
-    "src/sim/world.h": ["ringdepth"],
     "src/sim/pass_table.def": ["counts", "perfnodes"],
-    "src/measure/perfnodes.h": ["perfnodes"],
     "src/measure/perfsuite.cpp": ["autofly"],
     "src/main.cpp": ["arch", "autofly"],
     "assets/shaders/sim_gas.wgsl": ["gas"],
