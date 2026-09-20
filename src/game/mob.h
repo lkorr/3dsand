@@ -4703,10 +4703,58 @@ class MobSystem {
     std::vector<std::string> lost;     // limbs it had already lost
     std::vector<uint64_t> bodies;      // the remains, to take out of the world
     uint32_t atTick = 0;
+    // ---- WHAT HAPPENED TO IT, AS GEOMETRY ---------------------------------
+    //
+    // One entry per limb whose lattice is no longer the def's — the arm a
+    // sword opened, the shoulder a zombie tore at. Exactly the fields
+    // MobSystem::SaveState writes per limb, for exactly the same reason: the
+    // lattice is the truth and the collider, the brick and the rig offsets are
+    // derived from it, so restoring it is the whole restore (LoadState's carve
+    // pass, and ServiceRisings replays that pass verbatim).
+    //
+    // BY NAME, not by index, like `lost`: an effect may APPEND a limb even
+    // though it may not rename or remove one (sidecar.h), so index parity is a
+    // rule about this rig and not about every rig a later effect could
+    // describe.
+    struct RiseLimb {
+      std::string name;
+      float hp = 0;
+      Vec3 restOffset{}, anchorRoot{}, anchorLimb{};
+      IVec3 size{};
+      std::vector<DebrisVoxel> voxels;
+      std::vector<PrefabVoxel> skinVoxels;
+    };
+    std::vector<RiseLimb> limbs;
+    // ---- AND WHAT IT WAS WEARING ------------------------------------------
+    //
+    // The remains are DESTROYED by the rising (a corpse that got up is not
+    // still lying there), and its gear is part of the remains — so without
+    // this, turning is a way to delete a suit of armour. Re-equipped through
+    // the ordinary Mob::WearItem / Mob::EquipItem on the far side, by NAME
+    // (item.h's index hazard) with the damage the piece had at death, so a
+    // zombie rises in the same battered, dyed kit the villager fell in.
+    struct RiseGear {
+      std::string item;
+      int equipSlot = -1;      // -1 for the held item
+      bool held = false;
+      uint32_t dye = 0;
+      WornDamage damage;
+    };
+    std::vector<RiseGear> gear;
   };
   // Bounded like every other emergent queue here (CLAUDE.md rule 2): a crowd
   // dying at once books a crowd of risings, and the cost of one is a spawn.
   static constexpr size_t kMaxRisings = 32;
+  // ...and a rising is no longer a fixed-size booking now that it carries
+  // lattices: a human's skin lattice is ~27k voxels of 8 bytes, per limb. Only
+  // limbs that were actually damaged are captured (MobLimb::carved, the latch
+  // that fires the first time a limb loses a voxel to a carve OR a burn), and
+  // the whole capture is dropped past this ceiling — the body still gets up,
+  // it simply gets up with the freshly-rotted lattice it used to get up with.
+  // 256k voxels is ten times a whole human's skin, so a body reaches it only
+  // by being cut to pieces, which is the case where the geometry has stopped
+  // meaning anything anyway.
+  static constexpr size_t kRiseVoxelBudget = 256 * 1024;
   void BookRising(PendingRise r);
   void ServiceRisings(uint32_t tick);
   std::vector<PendingRise> rises_;

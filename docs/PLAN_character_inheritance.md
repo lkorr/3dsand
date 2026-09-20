@@ -1,12 +1,9 @@
 # PLAN: characters INHERIT the human; zombie is an EFFECT
 
-Status: **LANDED 2026-09-20, phases 1-5b.** Phase 6 (the player's corpse)
-is superseded in part: the avatar books a rising through the same
-`Mob::Die` path every NPC does, so a player who dies infected leaves an NPC
-zombie of themselves — what phase 6 still describes is carrying the player's
-own carved limb lattices onto it. See "What landed, and what did not" at the
-bottom of this file, including the two places the plan's own premises did not
-survive contact. The design below is otherwise as shipped. Brief:
+Status: **LANDED 2026-09-20, phases 1-6.** See "What landed, and what did not"
+at the bottom of this file, including the two places the plan's own premises
+did not survive contact and what phase 6 turned out to be once the avatar
+stopped needing any code of its own. The design below is otherwise as shipped. Brief:
 `docs/PROMPT_character_inheritance.md`. Ground truth below was read off the
 tree at `2c4f29b` by four read-only research passes (loader, generator,
 zombie/save, anatomy); every claim carries a `file:line`.
@@ -474,12 +471,38 @@ next inherited-only key is. `thinSidecar` now fills unmentioned keys from the
 base before diffing: a generated body describes a SHAPE, and absent means
 inherited.
 
-Phase 6 (the player's corpse) is HALF superseded. The avatar's limbs go to
-DebrisSystem through the same `Mob::Die` the NPCs use, so it books a rising
-through the same path and no player-specific code exists at all: you die of the
-bite, you respawn, and the thing wearing your face is an NPC zombie of you.
-What the phase still describes is the other half — carrying the player's OWN
-carved limb lattices onto that body, so the arm you lost in the fight is the
-arm the zombie is missing. Today it rises with a freshly-rotted body from its
-own `rot` block instead (and with the sever state, which the rising does
-carry). That is a `LoadState`-style lattice overlay and its own piece of work.
+Phase 6 (the player's corpse) was HALF superseded and the other half landed
+2026-09-20 (below). The avatar's limbs go to DebrisSystem through the same
+`Mob::Die` the NPCs use, so it books a rising through the same path and no
+player-specific code exists at all: you die of the bite, you respawn, and the
+thing wearing your face is an NPC zombie of you.
+
+### Phase 6, as landed (2026-09-20)
+
+What was left was that the risen body was a FRESH one: the rising carried where
+it stood, which way it faced and which limbs were gone, and then let
+`MobRotDef` roll a new set of holes, so every wound that actually happened was
+replaced by a wound that did not. It now carries what happened to it.
+
+| piece | where |
+|---|---|
+| `PendingRise::RiseLimb` + `RiseGear` | `mob.h` — one entry per DAMAGED limb (voxels, skinVoxels, size, the three rig offsets a carve shifts, hp) keyed by limb NAME, and one per worn piece / held item keyed by item name with its `WornDamage` and dye |
+| the capture | `Mob::Die`, inside the existing `if (rising)` block — the ONE moment it is readable: the adoption loop one statement later `std::move`s every `skinVoxels` into `DebrisSystem::AdoptBody`, and the husk is swept out of `mobs_` long before the rising is serviced |
+| the bound | `MobLimb::carved` (the latch that fires the first time a limb loses a voxel to a carve or a burn) selects what travels; `kRiseVoxelBudget` = 256k voxels drops the whole capture and the body rises freshly rotted, loudly |
+| the overlay | `MobSystem::ServiceRisings` — `LoadState`'s carve pass verbatim (assign lattice + offsets, `ReskinLimbMicro`, `RebuildLimbBody`), before the sever pass for the same reason it is there, under the same `loading_` guard so the effect's `rot` is not rolled on top of real wounds. Only when there IS a capture: a body that died unmarked still rots as it turns |
+| `RisenArtRemap` | the geometry travels and the COLOUR does not. A lattice's `color` is a MERGED art-palette index and recolouring is an effect's whole visual job, so an unchanged lattice would stand a zombie up in living skin. base-slot → risen-slot is read off the two defs' own prefabs, which are voxel-parallel because an effect may recolour art but may not rename, remove or reshape a part; the map is refused wholesale if they disagree about anything (11 slots repainted, human → zombie) |
+| the gear | re-equipped through the ordinary `Mob::WearItem` / `Mob::EquipItem` against `MobSystem::items_`, by NAME (item.h's index hazard), with the damage and dye the piece had at death. The rising DESTROYS the remains and the armour is part of them, so without this turning was a way to delete a suit of plate |
+| gate | `zombify` arm G: a limb carved to 57% of itself, bitten, killed, risen — and the risen limb holds the CARVED count (2,100), not the def's (3,712) |
+
+**The arm states its claim as a DIFFERENCE, not as a number.** It spawns a
+control zombie the ordinary way and measures the same limb on it: 2,854, with
+its own `rot` holes in it. That control IS what a rising produced before this
+phase, so "risen == carved AND control is nowhere near it" is an arm that
+cannot pass against the old behaviour and does not need a revert-and-rebuild to
+prove it. The harness has no item library (`SetItems` is a `main.cpp` call), so
+the arm sets one for its own duration and clears it again rather than leaving a
+lookup later gates were written without.
+
+Blast radius outside `zombify` is nil by construction: both new blocks are
+inside `if (rising)` / `ServiceRisings`, which need `turn.into` and
+`MobLimb::infectMat`, and no other gate kills an infected body.

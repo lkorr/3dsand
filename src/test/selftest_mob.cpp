@@ -5356,6 +5356,22 @@ Status GateUndead(Ctx& c, std::string& detail) {
 //      later standing again as a zombie of itself, with its remains taken out
 //      of the world rather than left lying under the thing that rose from
 //      them.
+//   F. A TURNED CREATURE SURVIVES A SAVE, with no format change: the recipe is
+//      spelled into the def name and the load composes it again.
+//   G. PHASE 6: IT GETS UP AS DAMAGED AS IT WENT DOWN. The arm you took off it
+//      in the fight is the arm its zombie is missing. Carve one limb hard,
+//      infect it, kill it, let it rise, and the risen limb must hold the
+//      CARVED voxel count -- not the def's, which is what it used to get
+//      (the body was rebuilt whole and freshly rotted from its own `rot`
+//      block, so every wound that actually happened was replaced by holes
+//      that did not). A CONTROL ZOMBIE spawned the ordinary way is measured
+//      beside it precisely so the arm cannot pass by accident: the control IS
+//      what a rising produced before this phase, so "risen == carved and
+//      control is nowhere near it" is the claim stated as a difference rather
+//      than as a number. The body is DRESSED and ARMED for the same run,
+//      because the rising destroys the remains and its gear is part of them:
+//      without the re-equip, turning would be a way to delete a suit of
+//      armour.
 //
 // No render and almost no ticks: the rising's clock is compared against the
 // tick PreTick is called with, so the six seconds are skipped by calling it
@@ -5593,19 +5609,149 @@ Status GateZombify(Ctx& c, std::string& detail) {
     }
   }
 
+  // ---- G: IT GETS UP AS DAMAGED AS IT WENT DOWN ----------------------------
+  //
+  // PHASE 6. The limb is cut about first and bitten second, in that order and
+  // both before the death, because the claim is about the geometry the body
+  // was ACTUALLY carrying — a hole a sword made is no different from a hole
+  // teeth made, and neither is a hole the effect's `rot` block rolled.
+  //
+  // Cut ABOUT, never OFF: a severed limb travels as a name in `lost` and is
+  // already asserted by D, so letting one come off here would quietly swap
+  // this arm for that one.
+  bool kept = false;
+  std::string keptWhy = "no spawn";
+  uint32_t fullVox = 0, carvedVox = 0, risenVox = 0, ctlVox = 0;
+  std::string gearWas, gearNow, heldWas, heldNow;
+  {
+    c.debris.Reset();
+    c.mobs.Reset();
+    c.mobs.ClearRisings();
+    // The rising re-equips BY NAME against the item library, which main.cpp
+    // hands the system and the harness never has. Cleared again at the end of
+    // the arm so no later gate inherits a lookup it was written without.
+    c.mobs.SetItems(&c.items);
+    const int h2 = c.mobs.FindDef("human"), z2 = c.mobs.FindDef("zombie");
+    const uint64_t id =
+        h2 >= 0 ? c.mobs.Spawn(h2, {spot.x + 2 * step, spot.y + 1, spot.z}) : 0;
+    const uint16_t rotMat = z2 >= 0 ? c.mobs.Defs()[z2].bite.infectMat : 0;
+    if (id != 0 && rotMat != 0) {
+      std::vector<BrushOp> ops;
+      std::vector<CellOp> cellOps;
+      std::vector<ParticleSpawn> spawns;
+      const uint32_t tick0 = 12000;
+      c.mobs.PreTick(tick0, c.world, ops, cellOps, spawns);
+      int limb = c.mobs.Defs()[h2].rootLimb;
+      for (size_t i = 0; i < c.mobs.Defs()[h2].limbs.size(); i++)
+        if (c.mobs.Defs()[h2].limbs[i].name.rfind("armR", 0) == 0) limb = (int)i;
+      const std::string limbName = c.mobs.Defs()[h2].limbs[limb].name;
+      // ---- DRESSED, because the remains are DESTROYED by the rising --------
+      //
+      // Its armour is part of those remains, so a rising that did not carry
+      // the kit would be a way to delete a suit of plate. Worn (and held)
+      // before the carving so the whole death path runs over a dressed body,
+      // which is also what puts the shells in `bodies`.
+      int homeSlot = -1;
+      for (const ItemDef& it : c.items.items) {
+        if (!ItemKindIsWorn(it.kind)) continue;
+        for (int s = 0; s < kEquipSlotCount; s++)
+          if (EquipSlotAccepts(s, it.kind)) { homeSlot = s; break; }
+        if (homeSlot < 0) continue;
+        if (c.mobs.WearItem(id, &it, homeSlot, /*dye=*/0x40u)) gearWas = it.name;
+        break;
+      }
+      for (const ItemDef& it : c.items.items)
+        if (!ItemKindIsWorn(it.kind) && c.mobs.EquipItem(id, &it)) {
+          heldWas = it.name;
+          break;
+        }
+      fullVox = c.mobs.LimbArtVoxelCount(id, limb);
+      for (int k = 0; k < 16; k++) {
+        const uint64_t lb = c.mobs.LimbBody(id, limb);
+        if (!lb) break;   // it came off after all; the check below catches it
+        if (c.mobs.LimbArtVoxelCount(id, limb) < fullVox * 6 / 10) break;
+        c.mobs.CarveLimbRadial(lb, c.mobs.LimbVoxelPos(id, limb, 1013u * (uint32_t)(k + 1)),
+                               1.1f, /*ragged=*/true, /*eject=*/false, c.world,
+                               spawns);
+      }
+      // ...and bitten, because what turns you is the rot in the flesh and not
+      // the cuts.
+      ::BiteHit bt;
+      bt.at = c.mobs.LimbVoxelPos(id, limb, 4441u);
+      bt.hp = 2.0f;
+      bt.power = 0.6f;
+      bt.infectMat = rotMat;
+      bt.infectStain = c.mobs.Defs()[z2].bite.infectStain;
+      bt.seed = 0x6017u;
+      if (c.mobs.LimbBody(id, limb))
+        c.mobs.BiteHit(c.mobs.LimbBody(id, limb), bt, c.world, spawns);
+      carvedVox = c.mobs.LimbArtVoxelCount(id, limb);
+      const bool stillOn = c.mobs.LimbBody(id, limb) != 0;
+      Mob* m = c.mobs.FindMobById(id);
+      if (m != nullptr) m->Die();
+      c.mobs.PreTick(tick0 + 400, c.world, ops, cellOps, spawns);
+      uint64_t risen = 0;
+      for (uint32_t i = 0; i < c.mobs.MobCount(); i++) {
+        const uint64_t oid = c.mobs.MobIdAt(i);
+        const Mob* om = c.mobs.FindMobById(oid);
+        if (om != nullptr && om->Def() != nullptr && om->Def()->undead)
+          risen = oid;
+      }
+      // BY NAME on the far side: the risen body is a different def, and an
+      // effect may append a limb even though it may not rename one.
+      int rl = -1;
+      if (risen != 0) {
+        const Mob* om = c.mobs.FindMobById(risen);
+        for (size_t i = 0; om != nullptr && om->Def() != nullptr &&
+                           i < om->Def()->limbs.size();
+             i++)
+          if (om->Def()->limbs[i].name == limbName) rl = (int)i;
+        if (rl >= 0) risenVox = c.mobs.LimbArtVoxelCount(risen, rl);
+        if (om != nullptr && homeSlot >= 0) gearNow = om->WornItem(homeSlot);
+        if (om != nullptr) heldNow = om->HeldItem();
+      }
+      // THE CONTROL, and the reason this arm cannot pass by accident: a zombie
+      // spawned the ordinary way is EXACTLY what a rising produced before this
+      // phase — the def's lattice with its own `rot` block's holes in it. If
+      // the restore above did nothing, `risenVox` would be this number.
+      const uint64_t ctl =
+          z2 >= 0 ? c.mobs.Spawn(z2, {spot.x + 3 * step, spot.y + 1, spot.z})
+                  : 0;
+      if (ctl != 0 && rl >= 0) ctlVox = c.mobs.LimbArtVoxelCount(ctl, rl);
+      kept = stillOn && risen != 0 && rl >= 0 && fullVox > 0 &&
+             carvedVox < fullVox * 6 / 10 && risenVox == carvedVox &&
+             ctlVox > carvedVox * 11 / 10 && gearNow == gearWas &&
+             heldNow == heldWas && !gearWas.empty() && !heldWas.empty();
+      if (!kept)
+        keptWhy = Format(
+            "limb=%s on=%d risen=%llu full=%u carved=%u back=%u ctl=%u "
+            "worn=%s/%s held=%s/%s",
+            limbName.c_str(), stillOn ? 1 : 0, (unsigned long long)risen,
+            fullVox, carvedVox, risenVox, ctlVox, gearWas.c_str(),
+            gearNow.c_str(), heldWas.c_str(), heldNow.c_str());
+    } else {
+      keptWhy = id == 0 ? "could not spawn a human" : "no bite.infectMat";
+    }
+    c.mobs.SetItems(nullptr);
+  }
+
   const bool ok = authored && idempotentZ && composed && cached && turned &&
-                  rose && saved;
+                  rose && saved && kept;
   detail = Format(
       "authored human+zombie=%d (def %d vs %d) jujunud=%d/%d, already-undead "
       "%d; composed %d%s (chroma %.1f -> %.1f, speed %.2f -> %.2f, defs %zu -> "
-      "%zu), cached %d; turned %d%s; rose %d%s; saved %d%s",
+      "%zu), cached %d; turned %d%s; rose %d%s; saved %d%s; kept %d%s (armR "
+      "%u -> %u carved, rose with %u, control %u, wearing %s holding %s)",
       authored ? 1 : 0, humanZ, zi, jujuZ, jzi, idempotentZ ? 1 : 0,
       composed ? 1 : 0,
       composeWhy.empty() ? "" : (" [" + composeWhy + "]").c_str(), baseChroma,
       newChroma, baseSpeed, newSpeed, defsBefore, afterFirst, cached ? 1 : 0,
       turned ? 1 : 0, turned ? "" : (" [" + turnWhy + "]").c_str(),
       rose ? 1 : 0, rose ? "" : (" [" + roseWhy + "]").c_str(), saved ? 1 : 0,
-      saved ? "" : (" [" + saveWhy + "]").c_str());
+      saved ? "" : (" [" + saveWhy + "]").c_str(), kept ? 1 : 0,
+      kept ? "" : (" [" + keptWhy + "]").c_str(), fullVox, carvedVox, risenVox,
+      ctlVox, gearNow.empty() ? "-" : gearNow.c_str(),
+      heldNow.empty() ? "-" : heldNow.c_str());
   RecordObserved("zombifyComposedDefs",
                  (double)(c.mobs.Defs().size() - defsBefore));
 

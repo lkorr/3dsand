@@ -5161,8 +5161,41 @@ killed you. `MobSystem::TurnMob` is the same thing without the death, for a
 live creature. The zombie effect deletes `turn` (`"turn": null`), because a
 world where corpses of zombies get up again is unbounded. THE AVATAR BOOKS ONE
 TOO, through exactly the same path — you respawn, and the thing wearing your
-face is an NPC. Gate: `zombify` (six arms, the last two a turn and a save
-round-trip).
+face is an NPC.
+
+**And it gets up as damaged as it went down** (phase 6, 2026-09-20). A rising
+used to rebuild the body whole and roll a fresh set of holes from the effect's
+own `rot` block, so every wound that actually happened was replaced by wounds
+that did not: you hacked an arm half off and what stood up had a tidy arm with
+different holes in it. `Mob::Die` now captures, in the one moment the rig is
+still whole, each limb whose lattice is no longer the def's — voxels, skin
+voxels, size, the three rig offsets a carve SHIFTS, and hp — by limb NAME, and
+`ServiceRisings` pours them back over the risen body with exactly the carve
+pass `MobSystem::LoadState` runs (`ReskinLimbMicro` then `RebuildLimbBody`; the
+lattice is the truth and the brick, collider and pose are derived from it),
+under the same `loading_` guard, which is what keeps `MobRotDef` from drawing
+over real wounds. A body that died without a mark on it still rots as it turns.
+
+Three things make that safe. **Only damaged limbs travel** (`MobLimb::carved`,
+the latch that fires the first time a limb loses a voxel to a carve or a burn),
+and the whole capture is dropped past `kRiseVoxelBudget` — a rising is a
+bounded booking (CLAUDE.md rule 2) and a lattice is not free. **The geometry
+travels and the COLOUR does not**: a lattice's `color` is a merged art-palette
+index and recolouring is an effect's whole visual job, so pouring a corpse's
+lattice on unchanged would stand a zombie up in living skin. `RisenArtRemap`
+reads base-slot → risen-slot off the two defs' own prefabs, which are
+voxel-parallel by construction because an effect may recolour art but may not
+rename, remove or reshape a part; it refuses the whole map rather than guess if
+they disagree about anything. **And the gear comes with it**: the rising
+destroys the remains, and its armour is part of them, so each worn piece and
+the held item are captured by NAME with the damage and dye they had at death
+and re-equipped through the ordinary `WearItem`/`EquipItem` on the far side.
+Without that, turning would be a way to delete a suit of plate.
+
+Gate: `zombify`, seven arms — the last is a limb carved to 57% of itself,
+infected, killed, and risen holding *that* count, measured against a control
+zombie spawned the ordinary way (2,100 against 2,854 of 3,712), which is
+precisely the number the arm used to report.
 
 `assets/mobs/zombie.json` is three lines: `extends: human`, `effects:
 ["zombie"]`. There is no `zombie.vox`, and `jujunud_zombie.json` is the same

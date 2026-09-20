@@ -2096,6 +2096,50 @@ void MobSystem::BookRising(PendingRise r) {
   rises_.push_back(std::move(r));
 }
 
+// ---- THE SAME BODY, IN THE NEW BODY'S COLOURS -------------------------------
+//
+// A captured lattice's `color` is a MERGED art-palette index — MicroBodyMergeArt
+// rewrites per-file .vox slots into shared ones at def build time — and
+// recolouring is an effect's whole visual job: `zombie` folds a pale copy of the
+// base's art into that shared palette, so the RISEN def's voxels index different
+// merged slots than the body that died did. Pouring a corpse's lattice on
+// unchanged would stand a zombie up in living skin: the geometry right and the
+// creature wrong.
+//
+// So the geometry travels and the colour does not. The map is read off the two
+// defs' own prefabs, which are voxel-parallel by construction (an effect may
+// recolour art but may not rename, remove or reshape a part — sidecar.h), so the
+// voxel at index n of model m is the same voxel in both and base->risen falls
+// straight out of the pair. Returned EMPTY when the prefabs disagree about
+// anything at all, or when the effect painted nothing; the caller then leaves
+// the captured colours alone, because a slightly wrong palette is a much better
+// failure than a guessed one.
+static std::vector<int16_t> RisenArtRemap(const Prefab& was, const Prefab& now) {
+  std::vector<int16_t> map;
+  if (was.models.empty() || was.models.size() != now.models.size()) return map;
+  map.assign(256, -1);
+  bool identity = true;
+  for (size_t m = 0; m < was.models.size(); m++) {
+    const std::vector<PrefabVoxel>& a = was.models[m].voxels;
+    const std::vector<PrefabVoxel>& b = now.models[m].voxels;
+    if (a.size() != b.size()) { map.clear(); return map; }
+    for (size_t n = 0; n < a.size(); n++) {
+      const uint8_t src = a[n].color;
+      if (!src) continue;   // unpainted: the material's own colour, both sides
+      // One source slot reaching two destinations means this is not a recolour
+      // of this art. Refuse the whole map rather than pick a winner.
+      if (map[src] >= 0 && map[src] != (int16_t)b[n].color) {
+        map.clear();
+        return map;
+      }
+      map[src] = (int16_t)b[n].color;
+      if (b[n].color != src) identity = false;
+    }
+  }
+  if (identity) map.clear();   // nothing to rewrite; say so cheaply
+  return map;
+}
+
 // THE CORPSE STANDS UP. Called once per tick from PreTick, after the husk
 // sweep, so a body that died this tick is already debris by the time its own
 // rising is due.
@@ -2113,14 +2157,80 @@ void MobSystem::ServiceRisings(uint32_t tick) {
       // ragdolls out of the player's capsule, Mob::Die).
       if (debris_ != nullptr)
         for (uint64_t b : r.bodies) debris_->DestroyBody(b);
+      // ---- WHAT HAPPENED TO IT IS NOT RE-ROLLED -----------------------------
+      //
+      // `loading_` is the flag that keeps spawn-time rot (MobRotDef) off a body
+      // whose damage is about to be restored, and it means exactly the same
+      // thing here as it does in LoadState: this body's holes are already
+      // known, so drawing a fresh set on top of them would bury the wound that
+      // killed it under noise that never happened.
+      //
+      // Only when there IS a capture. A body that died without a mark on it
+      // (an infected creature that starved, a fixture killed outright) still
+      // rots as it turns, which is the reading `rot` was authored for and the
+      // behaviour every arm of `undead` stands on.
+      const bool restoring = !r.limbs.empty();
+      const bool wasLoading = loading_;
+      if (restoring) loading_ = true;
       const uint64_t id = Spawn(at, {ifloor(r.at.x), ifloor(r.at.y),
                                      ifloor(r.at.z)});
+      loading_ = wasLoading;
       if (id != 0) {
         Mob& now = mobs_.back();
         now.origin_ = r.at;
         now.heading_ = now.desiredHeading_ = r.heading;
         now.bodyY_ = r.bodyY;
         now.anim_.lastPos = r.at;
+        // ---- IT GETS UP AS DAMAGED AS IT WENT DOWN -------------------------
+        //
+        // The carve pass of MobSystem::LoadState, replayed: the captured
+        // lattice and the rig offsets the carve shifted replace the authored
+        // ones, the micro brick is re-derived from the new lattice, and the
+        // Jolt body is rebuilt to the carved shape. Same three steps, same
+        // order, same reason — the lattice is the truth and everything else is
+        // derived from it.
+        //
+        // BEFORE the severs below, exactly as in LoadState: DetachLimb recurses
+        // into children, so doing it first would operate on limbs this loop
+        // still needs.
+        size_t restored = 0, repainted = 0;
+        if (restoring) {
+          const int wasDef = FindDef(r.def);
+          const std::vector<int16_t> recolour =
+              wasDef >= 0 ? RisenArtRemap(defs_[wasDef].prefab,
+                                          defs_[at].prefab)
+                          : std::vector<int16_t>();
+          for (size_t s = 1; s < recolour.size(); s++)
+            if (recolour[s] >= 0 && recolour[s] != (int16_t)s) repainted++;
+          for (PendingRise::RiseLimb& rl : r.limbs) {
+            int slot = -1;
+            for (size_t k = 0;
+                 k < now.limbs_.size() && k < defs_[at].limbs.size(); k++)
+              if (defs_[at].limbs[k].name == rl.name) { slot = (int)k; break; }
+            if (slot < 0 || !now.limbs_[slot].body) continue;
+            if (rl.voxels.empty()) continue;   // nothing left to stand up
+            if (!recolour.empty()) {
+              for (DebrisVoxel& v : rl.voxels)
+                if (v.color && recolour[v.color] >= 0)
+                  v.color = (uint8_t)recolour[v.color];
+              for (PrefabVoxel& v : rl.skinVoxels)
+                if (v.color && recolour[v.color] >= 0)
+                  v.color = (uint8_t)recolour[v.color];
+            }
+            MobLimb& L = now.limbs_[slot];
+            L.hp = rl.hp;
+            L.voxels = std::move(rl.voxels);
+            L.skinVoxels = std::move(rl.skinVoxels);
+            L.size = rl.size;
+            L.restOffset = rl.restOffset;
+            L.anchorRoot = rl.anchorRoot;
+            L.anchorLimb = rl.anchorLimb;
+            if (L.microModel >= 0)
+              now.ReskinLimbMicro(L, now.SkinScaleOf(L), now.PhysScaleOf(L));
+            now.RebuildLimbBody(slot);
+            restored++;
+          }
+        }
         // What it was already missing stays missing — by NAME, as in TurnMob,
         // and adopt=false because those pieces are lying where they fell.
         for (size_t k = 0; k < now.limbs_.size() && k < defs_[at].limbs.size();
@@ -2128,8 +2238,36 @@ void MobSystem::ServiceRisings(uint32_t tick) {
           if (std::find(r.lost.begin(), r.lost.end(), defs_[at].limbs[k].name) !=
               r.lost.end())
             if (now.limbs_[k].body) now.DetachLimb((int)k, false);
-        std::printf("mob: '%s' got up as '%s'\n", r.def.c_str(),
-                    defs_[at].name.c_str());
+        // ---- AND IN THE KIT IT FELL IN -------------------------------------
+        //
+        // The remains — its armour among them — were destroyed above, so a
+        // rising that did not re-dress would be a way to delete a suit of
+        // plate. Re-equipped by NAME through the ordinary wear/hold path
+        // (item.h's index hazard: an ItemLibrary index is file order and dies
+        // on an R reload), with the damage the piece carried at death and the
+        // colour it was dyed, so what gets up is wearing the same battered
+        // tunic the villager was buried in rather than a new one.
+        //
+        // Shells appended AFTER the limb restore above on purpose: WearItem
+        // appends rig slots past the base limbs, and the restore addresses
+        // base limbs by def index. Doing it the other way round would be
+        // correct too, but only by accident.
+        size_t dressed = 0;
+        for (const PendingRise::RiseGear& g : r.gear) {
+          const ItemDef* item =
+              items_ != nullptr ? items_->At(items_->Find(g.item)) : nullptr;
+          if (item == nullptr) continue;   // retired item: it rises without it
+          const bool ok =
+              g.held ? now.EquipItem(item)
+                     : now.WearItem(item, g.equipSlot,
+                                    g.damage.Empty() ? nullptr : &g.damage,
+                                    g.dye);
+          if (ok) dressed++;
+        }
+        std::printf("mob: '%s' got up as '%s' (%zu/%zu limbs as they were over "
+                    "%zu repainted art slots, %zu/%zu pieces of kit)\n",
+                    r.def.c_str(), defs_[at].name.c_str(), restored,
+                    r.limbs.size(), repainted, dressed, r.gear.size());
       }
     }
     rises_[i] = std::move(rises_.back());
@@ -15486,6 +15624,69 @@ void Mob::Die() {
     // What it had already lost, read before the loop below zeroes the rest.
     for (size_t i = 0; i < limbs_.size() && i < def_->limbs.size(); i++)
       if (limbs_[i].body == 0) rise.lost.push_back(def_->limbs[i].name);
+    // ---- AND WHAT IT STILL HAS, AS GEOMETRY --------------------------------
+    //
+    // THIS IS THE ONE MOMENT IT CAN BE READ. The loop below MOVES every
+    // limb's skinVoxels into DebrisSystem::AdoptBody, so a capture one
+    // statement later would copy empty vectors and the zombie would rise
+    // whole; and the rising is serviced ticks after the husk has been swept
+    // out of mobs_, so there is nobody left to ask.
+    //
+    // Only limbs the body actually LOST SOMETHING from travel — `carved` is
+    // the latch that fires the first time a carve or a burn takes a voxel, so
+    // an untouched arm is rebuilt from the def for free on the far side and
+    // costs the booking nothing. That is also the bound (kRiseVoxelBudget):
+    // an intact villager books a rising the size it always was.
+    size_t vox = 0;
+    for (size_t i = 0; i < limbs_.size() && i < def_->limbs.size(); i++) {
+      const MobLimb& L = limbs_[i];
+      if (!L.body || !L.carved) continue;
+      vox += L.voxels.size() + L.skinVoxels.size();
+      if (vox > MobSystem::kRiseVoxelBudget) {
+        std::printf(
+            "mob: '%s' is cut past %zu voxels; it gets up freshly rotted\n",
+            def_->name.c_str(), MobSystem::kRiseVoxelBudget);
+        rise.limbs.clear();
+        break;
+      }
+      MobSystem::PendingRise::RiseLimb rl;
+      rl.name = def_->limbs[i].name;
+      rl.hp = L.hp;
+      rl.restOffset = L.restOffset;
+      rl.anchorRoot = L.anchorRoot;
+      rl.anchorLimb = L.anchorLimb;
+      rl.size = L.size;
+      rl.voxels = L.voxels;            // COPIED: the originals go to debris
+      rl.skinVoxels = L.skinVoxels;
+      rise.limbs.push_back(std::move(rl));
+    }
+    // ---- AND ITS KIT -------------------------------------------------------
+    //
+    // Read the same way CorpseReport reads it a few lines up, and deliberately
+    // NOT read off that report: the report is only built when somebody is
+    // listening (SetOnCorpse) and never for the avatar, while a rising happens
+    // either way. The two walks agree on what a piece IS — the identity shell
+    // carries the dye, CaptureWorn carries the damage — they disagree only on
+    // what they hand back (bodies to loot vs. names to re-equip).
+    for (size_t pi = 0; pi < worn_.size(); pi++) {
+      const WornPiece& p = worn_[pi];
+      const int idSlot = IdentityShellOf((int)pi);
+      if (idSlot < 0 || idSlot >= (int)limbs_.size() || !limbs_[idSlot].body)
+        continue;   // the panel that IS the piece is gone: it stays gone
+      MobSystem::PendingRise::RiseGear g;
+      g.item = p.item;
+      g.equipSlot = p.equipSlot;
+      g.dye = limbs_[idSlot].dye;
+      CaptureWorn(p.equipSlot, g.damage);
+      rise.gear.push_back(std::move(g));
+    }
+    if (heldSlot_ >= 0 && heldSlot_ < (int)limbs_.size() &&
+        limbs_[heldSlot_].body && !heldItem_.empty()) {
+      MobSystem::PendingRise::RiseGear g;
+      g.item = heldItem_;
+      g.held = true;
+      rise.gear.push_back(std::move(g));
+    }
   }
   // whole-body ragdoll: every limb goes dynamic and becomes debris; joints
   // stay so the corpse hangs together until pieces get culled or settle
