@@ -471,6 +471,12 @@ void Portrait(UIState& s, ImVec2 at, ImVec2 size) {
                          ImGuiButtonFlags_MouseButtonLeft |
                          ImGuiButtonFlags_MouseButtonRight);
   const bool hovered = ImGui::IsItemHovered();
+  // DEAD IS NOT STILL. The portrait keeps rendering after a death and keeps
+  // orbiting with it — what is frozen is the body's POSE, not the picture
+  // (main.cpp's DeathBody) — so every control below works on a corpse exactly
+  // as it does on a living body. The one exception is the head look at the
+  // bottom: there is no rig left to turn a head.
+  const bool dead = s.deathScreen;
   const bool dragL = ImGui::IsItemActive() &&
                      ImGui::IsMouseDragging(ImGuiMouseButton_Left, 0.0f);
   const bool dragR = ImGui::IsItemActive() &&
@@ -561,8 +567,10 @@ void Portrait(UIState& s, ImVec2 at, ImVec2 size) {
     s.inspectSelected = best;
   }
 
-  // HEAD LOOK: only while not dragging at all.
-  s.portraitLookValid = hovered && !dragL && !dragR;
+  // HEAD LOOK: only while not dragging at all, and never on a corpse — the
+  // head is not going to follow the cursor, and main.cpp would be feeding a
+  // look target to a rig that no longer exists.
+  s.portraitLookValid = hovered && !dragL && !dragR && !dead;
   if (s.portraitLookValid) {
     const ImVec2 m = ImGui::GetMousePos();
     s.portraitLook[0] = std::clamp((m.x - at.x) / size.x * 2.0f - 1.0f, -1.0f,
@@ -584,7 +592,12 @@ void Portrait(UIState& s, ImVec2 at, ImVec2 size) {
                    false, 48))
       s.portraitReset = true;
   } else if (hovered && !dragL && !dragR) {
-    const char* hint = "drag to turn  .  scroll to zoom  .  right-drag to pan";
+    // On a corpse the hint says WHAT is being turned, because a body that
+    // orbits normally while everything else about it is frozen invites the
+    // reading that it is still live.
+    const char* hint =
+        dead ? "as you fell  .  drag to turn  .  scroll to zoom"
+             : "drag to turn  .  scroll to zoom  .  right-drag to pan";
     ImGui::PushFont(ui::FontSmall());
     const ImVec2 ts = ImGui::CalcTextSize(hint);
     ui::ShadowText(dl, ImVec2(br.x - ts.x - 8, br.y - ts.y - 8),

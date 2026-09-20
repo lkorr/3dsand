@@ -7177,12 +7177,54 @@ observer `main.cpp` registers, which runs the ordinary HUD mirror
 question is answerable — one statement later every limb is `DebrisSystem`'s,
 `anim_.partAlive` is zeroed and every per-limb readout in the engine says
 "severed, no voxels, no hp" whatever actually happened. `main.cpp` then stops
-refilling the mirror (`deathFrozen`), opens the character screen and lets the
-health column draw the photograph: the cause in `Mob::DeathCause`'s own words,
-the pools, triage worst-first, and the selected limb's tissue/condition/cover.
-`tune.avatar.respawnDelay` is no longer a countdown to a rebuild — it is the
-minimum the body lies there before the column's **respawn** button will take a
-press. Pressing it thaws the mirror and calls `Revive`.
+refilling the mirror (`deathFrozen`), so the health column is a photograph: the
+cause in `Mob::DeathCause`'s own words, the pools, triage worst-first, and the
+selected limb's tissue/condition/cover. `tune.avatar.respawnDelay` is no longer
+a countdown to a rebuild — it is the minimum the body lies there before the
+column's **respawn** button will take a press. Pressing it thaws the mirror and
+calls `Revive`.
+
+**The POSE is part of the photograph — and it is a pose, not a picture.** The
+portrait is a live second camera pointed at the rig (`MakePortraitCam`), so it
+dies with the readouts and for the same reason: after `Die()` every `PartBody()`
+is 0, the camera is invalid, the pass is skipped, and the panel keeps sampling
+whatever was last rendered into `portraitTexture` — a frame of a *living* body
+from the last time the screen happened to be open. Freezing the **texture**
+would fix what is on screen and nothing else, and a death you cannot turn round
+is a death you cannot read. So what the dying observer freezes is the body's
+pose: every part's world transform at the instant it died (`DeathBody::limbs`),
+plus the collider boxes for framing and outlining (`DeathBody::boxes`, and the
+body's facing so the orbit keeps a front). The portrait then goes on rendering
+every frame — orbit, pan, zoom, double-click-a-limb and the inspector outlines
+all work on a corpse exactly as on a living body — and the pass simply
+**overwrites the corpse's GPU transforms with the frozen ones before it draws
+and puts the live ones back after**, the same borrow-and-return the hide mask
+already does one array over. Matched by *physics handle*, because `AdoptBody`
+carries a limb's handle into `DebrisSystem` unchanged while a slot index does
+not survive the next cull. What you orbit is the body as it fell, however long
+it has since been burning, sinking or rolling downhill.
+
+The live rig and the death snapshot reach the camera through **one type**
+(`LimbBoxes`: one oriented box per limb, tagged with its figure slot), so
+framing, limb focus and the outlines cannot behave differently on the two. Its
+fit margin is 1.45, not the 1.28 it was: these are *collider* boxes and the
+micro skin is drawn outside them, which an intact body hides (the head's box
+carries the error) and a decapitated one does not — the first death portraits
+came out with the torso cut off at the frame edge.
+
+`--shot-inventory` photographs the death screen as its fifth and sixth pictures:
+the player is decapitated, the screen is opened by hand (a death does not open
+it), and the portrait is captured, turned ~80°, and captured again 60 frames
+later. The second picture is the one that matters — by then the real corpse has
+been ragdolling for a second, so "still the body that died, from a new angle" is
+a claim only the turn can make.
+
+**Nothing opens a menu over the death.** The screen comes up when the player
+presses `I` for it and not before — a panel that snaps open the instant you die
+takes the view away at the one moment you want to look — and it lands on the
+health column with the worst limb selected whenever `deathScreen` is set
+(`deathScreenOpened`). The HUD carries the only thing that has to be said
+immediately: `DEAD - I to respawn`.
 
 Four gates (`selftest_combat.cpp`, at the end of the mob group):
 `npc-strike` (the AI's own request becomes a windup, a cut and lost voxels; then

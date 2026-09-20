@@ -173,8 +173,23 @@ constexpr uint64_t kShotInvGearFrame = 220;    // -> screenshot_inventory.bmp
 constexpr uint64_t kShotInvCaptureFrame = 240;  // -> ..._health.bmp
 constexpr uint64_t kShotInvGrimoireFrame = 260; // -> ..._grimoire.bmp
 // Fourth: a dressed human killed in front of the player and its corpse opened
-// — the loot panel where the grimoire was (game/corpses.h). Last frame.
-constexpr uint64_t kShotInvLootFrame = 280;     // -> ..._loot.bmp; last frame
+// — the loot panel where the grimoire was (game/corpses.h).
+constexpr uint64_t kShotInvLootFrame = 280;     // -> ..._loot.bmp
+// Fifth and sixth: THE DEATH SCREEN, which nothing else can photograph. The
+// player is decapitated — the case that motivated the whole death hold, and
+// the one a bare hp readout cannot express — and the screen is opened by hand,
+// because a death no longer opens it (main.cpp's death-hold block).
+//
+// TWO pictures and a TURN between them, because one picture cannot tell the
+// difference between the two implementations. What is frozen at a death is the
+// body's POSE, not the image: the corpse in the world goes on ragdolling,
+// settling and rolling, so a second capture 60 frames later at a different
+// orbit is the only thing that says "still the body that died, from a new
+// angle" rather than "a heap, or a still that does not turn".
+constexpr uint64_t kShotInvDeathFrame = 310;
+constexpr uint64_t kShotInvDeathShot = 350;      // -> ..._death.bmp
+constexpr uint64_t kShotInvDeathTurnAt = 360;    // orbit ~80 degrees
+constexpr uint64_t kShotInvDeathTurnShot = 420;  // -> ..._death_turn.bmp; last
 
 // ---- --shot-jump: the AIRBORNE POSE's look-iteration harness ---------------
 //
@@ -986,26 +1001,57 @@ bool LimbBoxCorners(const PlayerAvatar& av, Physics& phys, int part,
   return true;
 }
 
+// ---- A BODY REDUCED TO WHAT THE PANEL NEEDS ---------------------------------
+//
+// One oriented collider box per limb, tagged with the figure slot it belongs
+// to, in world voxels. Framing the portrait, framing ONE limb, and outlining
+// limbs on the image are three readings of this same list — and it is a plain
+// list of boxes rather than three walks of the rig for one reason: THE DEAD
+// HAVE NO RIG. After Mob::Die() every PartBody() is 0, so a walk answers
+// nothing, while a list of boxes captured at the instant of death goes on
+// answering all three questions for as long as the death screen holds it. The
+// live rig and the death snapshot therefore reach the camera through one type,
+// and the panel cannot behave differently on the two.
+struct LimbBoxes {
+  struct Box {
+    int slot = -1;   // BodySlotFor(); -1 = a part with no figure slot
+    Vec3 c[8];
+  };
+  std::vector<Box> boxes;
+  bool Empty() const { return boxes.empty(); }
+};
+
+// The LIVE rig's boxes. Limb parts only (`Def()->limbs`): a held weapon lives
+// in an appended part slot, and framing the portrait on the sword would push
+// the body itself out of shot every time it is drawn.
+void CollectLimbBoxes(const PlayerAvatar& av, Physics& phys, LimbBoxes& out) {
+  out.boxes.clear();
+  if (!av.Spawned() || !av.Def()) return;
+  const int limbCount = (int)av.Def()->limbs.size();
+  for (int i = 0; i < limbCount; i++) {
+    LimbBoxes::Box b;
+    if (!LimbBoxCorners(av, phys, i, b.c)) continue;
+    b.slot = BodySlotFor(av.PartName(i), av.PartTag(i));
+    out.boxes.push_back(b);
+  }
+}
+
 // Frame the LIVE body, not the def's box. A def-sized frame is wrong twice
 // over: a rig that has lost both legs is half the height it was authored at,
 // and the origin of a heavily dismembered body is nowhere near the part of it
 // you can still see (the same lesson --shot-mob learned about corpses).
-PortraitCam MakePortraitCam(const PlayerAvatar& av, Physics& phys, float yaw,
+PortraitCam MakePortraitCam(const LimbBoxes& lb, float yaw,
                             float pitch, float aspect, float zoom,
                             float panX, float panY, int pivotSlot = -1) {
   PortraitCam pc;
-  if (!av.Spawned() || !av.Def()) return pc;
   Vec3 lo{1e9f, 1e9f, 1e9f}, hi{-1e9f, -1e9f, -1e9f};
   Vec3 pivotLo{1e9f,1e9f,1e9f}, pivotHi{-1e9f,-1e9f,-1e9f};
   bool anyPivot = false;
-  const int limbCount = (int)av.Def()->limbs.size();
   bool any = false;
-  for (int i = 0; i < limbCount; i++) {
-    Vec3 c[8];
-    if (!LimbBoxCorners(av, phys, i, c)) continue;
+  for (const LimbBoxes::Box& box : lb.boxes) {
     any = true;
-    const int s = BodySlotFor(av.PartName(i), av.PartTag(i));
-    for (const Vec3& p : c) {
+    const int s = box.slot;
+    for (const Vec3& p : box.c) {
       lo = Vec3{std::min(lo.x, p.x), std::min(lo.y, p.y), std::min(lo.z, p.z)};
       hi = Vec3{std::max(hi.x, p.x), std::max(hi.y, p.y), std::max(hi.z, p.z)};
       if (s == pivotSlot) {
@@ -1025,7 +1071,14 @@ PortraitCam MakePortraitCam(const PlayerAvatar& av, Physics& phys, float yaw,
   const float radiusXZ = std::max(0.5f, std::max(half.x, half.z));
   const float fitV = halfH / pc.tanHalf;
   const float fitH = radiusXZ / (pc.tanHalf * std::max(aspect, 1e-3f));
-  const float dist = std::max(fitV, fitH) * 1.28f / std::max(zoom, 0.1f);
+  // THE MARGIN IS PAYING FOR THE SKIN, not for taste. These are COLLIDER
+  // boxes and the micro skin is drawn outside them — pauldrons, boots, a hat —
+  // so a frame fitted to the boxes clips the body. 1.28 was exactly enough for
+  // an intact human, where the head's box carries the error, and not nearly
+  // enough for a decapitated one, where the shoulders are the top of the box
+  // list and their armour stands above it: the death portrait came out with
+  // the torso cut off at the frame edge.
+  const float dist = std::max(fitV, fitH) * 1.45f / std::max(zoom, 0.1f);
 
   pc.cam.yaw = yaw;
   pc.cam.pitch = pitch;
@@ -1062,19 +1115,15 @@ bool ProjectToPortrait(const PortraitCam& pc, const Vec3& p, float out[2]) {
 // Fill each figure slot's projected outline. Runs after FillBodyUI, and only
 // while the inspector is showing — projecting 15 boxes is cheap but it is not
 // free, and nothing reads the result otherwise.
-void ProjectBodyUI(const PlayerAvatar& av, Physics& phys, const PortraitCam& pc,
-                   UIState& ui) {
+void ProjectBodyUI(const LimbBoxes& lb, const PortraitCam& pc, UIState& ui) {
   for (int i = 0; i < UIState::kSlotCount; i++) ui.body[i].projValid = false;
-  if (!pc.valid || !av.Def()) return;
-  const int limbCount = (int)av.Def()->limbs.size();
-  for (int i = 0; i < limbCount; i++) {
-    const int slot = BodySlotFor(av.PartName(i), av.PartTag(i));
+  if (!pc.valid) return;
+  for (const LimbBoxes::Box& box : lb.boxes) {
+    const int slot = box.slot;
     if (slot < 0) continue;
-    Vec3 c[8];
-    if (!LimbBoxCorners(av, phys, i, c)) continue;
     float mn[2] = {1e9f, 1e9f}, mx[2] = {-1e9f, -1e9f};
     int hits = 0;
-    for (const Vec3& p : c) {
+    for (const Vec3& p : box.c) {
       float uv[2];
       if (!ProjectToPortrait(pc, p, uv)) continue;
       hits++;
@@ -4290,7 +4339,7 @@ int main(int argc, char** argv) {
     // g_shotInventory.
     else if (a == "--shot-inventory") {
       g_shotInventory = true;
-      g_harnessFrames = kShotInvLootFrame;
+      g_harnessFrames = kShotInvDeathTurnShot;
     }
     // `--shot-jump` is the AIRBORNE POSE's look-iteration harness: walk the
     // avatar in third person, jump it, and write one picture per phase of the
@@ -5938,6 +5987,41 @@ int main(int argc, char** argv) {
   // `deathFrozen` below then stops the per-frame mirror from overwriting this,
   // so what is on the death screen stays the body that died rather than the
   // corpse as it burns, rots and gets eaten.
+  //
+  // THE POSE IS PART OF THE PHOTOGRAPH TOO — AND IT IS A POSE, NOT A PICTURE.
+  //
+  // The portrait is a live second camera pointed at the rig (MakePortraitCam),
+  // so it dies with the readouts and for the same reason: after Die() every
+  // PartBody() is 0, the camera is invalid, the pass is skipped, and the panel
+  // goes on sampling whatever was last rendered into portraitTexture — a frame
+  // of a LIVING body from the last time the screen happened to be open.
+  //
+  // Freezing the TEXTURE would fix what is on screen and nothing else: a death
+  // you cannot turn round is a death you cannot read, and "which arm" or "how
+  // deep" is usually not answerable from one angle. So what is frozen is the
+  // body's POSE — every limb's world transform at the instant it died, plus its
+  // collider box for framing and outlining — and the portrait goes on rendering
+  // every frame, live, orbit and zoom and limb focus all working. The limbs are
+  // DebrisSystem's by then and still drawn; the pass simply overwrites their
+  // GPU transforms with these before it draws and puts the real ones back
+  // after (see the portrait pass). What you orbit is the body as it fell,
+  // however long it has since been burning, sinking or rolling downhill.
+  struct DeathBody {
+    // One frozen limb: the physics handle it will be carrying as debris
+    // (AdoptBody keeps the handle, which is the whole reason this can be
+    // matched up again) and the transform it had when it was still yours.
+    struct Limb {
+      uint64_t body = 0;
+      BodyXformGpu xf{};
+    };
+    bool have = false;
+    float yaw = 0.0f;          // the body's facing, so the orbit keeps a front
+    std::vector<Limb> limbs;   // the GPU transform override
+    LimbBoxes boxes;           // framing, limb focus and the outlines
+  } deathBody;
+  // The living rig's boxes, hoisted so an open screen reuses the capacity
+  // rather than allocating fifteen boxes a frame.
+  LimbBoxes liveLimbBoxes;
   bool deathFrozen = false;
   avatar.SetDyingObserver([&] {
     ui.health = playerHealth.Get();
@@ -5947,6 +6031,37 @@ int main(int argc, char** argv) {
     ui.locoState = avatar.Spawned() ? avatar.Locomotion().stateName : "";
     FillBodyUI(avatar, burnMats, tissueMats, mobs, mats, ui);
     ui.deathCause = avatar.DeathCause();
+    // Front-on and un-zoomed, whatever the orbit was left at the last time the
+    // screen was open: a death framed by a half-finished drag from a previous
+    // inspection is not a readable one. The player can turn it from there.
+    ui.portraitYaw = 0.0f;  ui.portraitPitch = -0.08f;
+    ui.portraitZoom = 1.0f; ui.portraitZoomTarget = 1.0f;
+    ui.portraitPanX = 0.0f; ui.portraitPanXTarget = 0.0f;
+    ui.portraitPanY = 0.0f; ui.portraitPanYTarget = 0.0f;
+    ui.portraitPivotSlot = -1;
+    ui.portraitReset = false;
+    ui.portraitFocusSlot = -1;
+    deathBody.yaw = avatarHeading;
+    CollectLimbBoxes(avatar, phys, deathBody.boxes);
+    // EVERY PART, not just the def's limbs: the box list above is deliberately
+    // limbs-only so the framing is not thrown off by a held sword, but the
+    // transform override has the opposite requirement — a garment shell or a
+    // weapon left at its live transform would be the one thing in the picture
+    // still moving, sliding off a body that is standing still.
+    deathBody.limbs.clear();
+    const int parts = (int)avatar.PartCount();
+    for (int i = 0; i < parts; i++) {
+      DeathBody::Limb fl;
+      fl.body = avatar.PartBody(i);
+      if (!fl.body) continue;
+      Vec3 pos; Quat rot;
+      if (!avatar.PartWorldTransform(i, pos, rot)) continue;
+      fl.xf.pos[0] = pos.x; fl.xf.pos[1] = pos.y; fl.xf.pos[2] = pos.z;
+      fl.xf.quat[0] = rot.x; fl.xf.quat[1] = rot.y;
+      fl.xf.quat[2] = rot.z; fl.xf.quat[3] = rot.w;
+      deathBody.limbs.push_back(fl);
+    }
+    deathBody.have = !deathBody.boxes.Empty() && !deathBody.limbs.empty();
     deathFrozen = true;
   });
   // The blade's position last tick, so the sweep has something to sweep FROM.
@@ -6335,7 +6450,14 @@ int main(int argc, char** argv) {
       }
       // Swap to the inspector between the two captures, so the second picture
       // is the half the first cannot show.
-      if (frameCounter == kShotInvGearFrame + 1) ui.inspectMode = true;
+      // ...with the bored torso already open in the health column, since that
+      // is the limb this harness went to the trouble of damaging. The panel
+      // itself opens on the worst limb when you press the button; setting it
+      // here is how a scripted capture gets the same picture.
+      if (frameCounter == kShotInvGearFrame + 1) {
+        ui.inspectMode = true;
+        ui.inspectSelected = UIState::kSlotTorso;
+      }
       // Third picture: the grimoire with a page selected and its word row
       // populated — the panel's job is to be looked at (plan §12c).
       if (frameCounter == kShotInvCaptureFrame + 1) {
@@ -6399,6 +6521,38 @@ int main(int argc, char** argv) {
           std::fprintf(stderr, "--shot-inventory: no \"human\" mob def\n");
         }
       }
+      // Fifth: THE DEATH SCREEN. The head comes off, which kills by
+      // "vital limb destroyed" — the one death a number cannot describe and
+      // the reason the portrait freezes a POSE rather than a picture.
+      if (frameCounter == kShotInvDeathFrame && avatar.Spawned()) {
+        ui.lootClose = true;
+        ui.inspectMode = true;
+        ui.grimoireMode = false;
+        // THE PORTRAIT DRAWS EVERY BODY IN THE WORLD, and the loot corpse the
+        // previous picture needed is standing two metres in front of the
+        // player — which is exactly where this camera is. It photographed as a
+        // second, hazy body laid over the first. Clearing debris first also
+        // takes the hand severed at frame 170, so the only thing left for the
+        // player's own limbs to be is the corpse this picture is about.
+        debris.Reset();
+        avatar.SeverByName("head");
+        std::printf("--shot-inventory: took the player's head off "
+                    "(health %d/%d, alive=%d)\n",
+                    avatar.TotalHealth(), avatar.HealthMax(),
+                    avatar.IsAlive() ? 1 : 0);
+      }
+      // A death does not open the screen any more, so the harness presses I
+      // the way a player would — one frame later, so the death has been seen
+      // by the tick loop and `ui.deathScreen` is set (which is what makes the
+      // screen land on the health column).
+      if (frameCounter == kShotInvDeathFrame + 2) {
+        ui.inventoryOpen = true;
+        ui.deathScreenOpened = false;
+      }
+      // Sixth: the same corpse, turned. If the pose override ever stops
+      // working this picture is the one that says so — by then the real
+      // corpse has been ragdolling for a second and is nowhere near this.
+      if (frameCounter == kShotInvDeathTurnAt) ui.portraitYaw = 1.4f;
     }
     glfwPollEvents();
     double now = NowSeconds();
@@ -9143,15 +9297,20 @@ int main(int argc, char** argv) {
                          cellOps,
                          spawns);
         // DEAD AVATAR: HOLD, AND WAIT TO BE ASKED. Nothing rebuilds the body
-        // on a timer any more. The corpse lies where it fell (its parts are
-        // DebrisSystem's and settle like any other debris), the character
-        // screen opens on the health column, and every readout there is the
-        // photograph the dying observer took — so a death can be READ: which
-        // limb was gone, what was alight, what was still worn, and what the
-        // engine says killed you. `respawnDelay` is now the minimum the body
-        // lies there before the button will take the press, which keeps a
-        // fumbled click from erasing the evidence in the same second it
-        // appeared (0 in the tuner disables the wait).
+        // on a timer any more, and NOTHING OPENS A MENU OVER THE DEATH either:
+        // the corpse lies where it fell (its parts are DebrisSystem's and
+        // settle like any other debris) and the screen comes up when — and
+        // only when — you press I for it. A panel that snaps open the instant
+        // you die takes the view away at the one moment you want to look at it,
+        // and the readout it holds is not going anywhere: every value on it is
+        // the photograph the dying observer took, so a death can still be READ
+        // ten seconds later — which limb was gone, what was alight, what was
+        // still worn, and what the engine says killed you. The HUD carries the
+        // only thing that has to be said immediately (overlay.cpp: "DEAD - I to
+        // respawn"). `respawnDelay` is the minimum the body lies there before
+        // the button will take the press, which keeps a fumbled click from
+        // erasing the evidence in the same second it appeared (0 in the tuner
+        // disables the wait).
         if (avatar.Spawned() && !avatar.IsAlive()) {
           if (!ui.deathScreen) {
             ui.deathScreen = true;
@@ -9159,16 +9318,6 @@ int main(int argc, char** argv) {
             ui.respawnRequest = false;
             ui.deathRespawnAfter = av.respawnDelay;
             respawnTimer = 0;
-            // Open the screen and free the cursor exactly as I does, through
-            // the same two variables, so closing it afterwards restores what
-            // capture WAS rather than assuming it was captured.
-            if (!ui.inventoryOpen) {
-              ui.inventoryOpen = true;
-              captureBeforeUi = captured;
-              captured = false;
-              glfwSetInputMode(window, GLFW_CURSOR, GLFW_CURSOR_NORMAL);
-              glfwGetCursorPos(window, &mx0, &my0);
-            }
           }
           respawnTimer += kTickDt;
           ui.deathHoldSec = respawnTimer;
@@ -9178,6 +9327,9 @@ int main(int argc, char** argv) {
             ui.deathScreenOpened = false;
             ui.deathCause.clear();
             deathFrozen = false;   // the mirror is live again from here
+            deathBody.have = false;
+            deathBody.limbs.clear();
+            deathBody.boxes.boxes.clear();
             respawnTimer = 0;
             avatar.Revive(player, avatarHeading);
             tpRig.Snap();
@@ -9201,6 +9353,9 @@ int main(int argc, char** argv) {
             ui.deathScreenOpened = false;
             ui.deathCause.clear();
             deathFrozen = false;
+            deathBody.have = false;
+            deathBody.limbs.clear();
+            deathBody.boxes.boxes.clear();
           }
         }
         // Drain the impact latch on the FIRST tick of the frame batch that
@@ -11040,6 +11195,20 @@ int main(int argc, char** argv) {
       // Cheap and skipped entirely when the screen is closed.
       PortraitCam portraitCam;
       if (ui.inventoryOpen) {
+        // WHOSE BOXES. Alive, the live rig's, rebuilt every frame. Dead, the
+        // ones the dying observer froze — same type, same code below, so orbit,
+        // pan, zoom, limb focus and the outlines all work on a corpse exactly
+        // as they do on a living body, and there is no second path to keep in
+        // step with this one. The FACING is frozen with them: `avatarHeading`
+        // belongs to a rig that is not being driven any more, and a portrait
+        // that swung because the player turned the free camera would be turning
+        // the picture out from under their own drag.
+        LimbBoxes& lb = (deathFrozen && deathBody.have) ? deathBody.boxes
+                                                        : liveLimbBoxes;
+        if (!(deathFrozen && deathBody.have))
+          CollectLimbBoxes(avatar, phys, lb);
+        const float bodyYaw =
+            (deathFrozen && deathBody.have) ? deathBody.yaw : avatarHeading;
         // THE ORBIT IS RELATIVE TO THE CHARACTER'S OWN FACING, so opening the
         // screen always shows their FRONT and turning the body does not spin
         // the portrait out from under the player's drag.
@@ -11061,22 +11230,13 @@ int main(int argc, char** argv) {
         if (ui.portraitFocusSlot >= 0) {
           const int slot = ui.portraitFocusSlot;
           ui.portraitFocusSlot = -1;
-          if (slot < UIState::kSlotCount && avatar.Def()) {
-            // Need a temporary camera at the current orbit to get right/up.
-            Camera tmpCam;
-            const float fy = std::atan2(-std::cos(avatarHeading),
-                                        -std::sin(avatarHeading));
-            tmpCam.yaw = fy + ui.portraitYaw;
-            tmpCam.pitch = ui.portraitPitch;
+          if (slot < UIState::kSlotCount && !lb.Empty()) {
             Vec3 bodyLo{1e9f,1e9f,1e9f}, bodyHi{-1e9f,-1e9f,-1e9f};
             Vec3 limbLo{1e9f,1e9f,1e9f}, limbHi{-1e9f,-1e9f,-1e9f};
             bool anyBody = false, anyLimb = false;
-            const int lc = (int)avatar.Def()->limbs.size();
-            for (int p = 0; p < lc; p++) {
-              Vec3 c[8];
-              if (!LimbBoxCorners(avatar, phys, p, c)) continue;
-              const int s = BodySlotFor(avatar.PartName(p), avatar.PartTag(p));
-              for (const Vec3& v : c) {
+            for (const LimbBoxes::Box& box : lb.boxes) {
+              const int s = box.slot;
+              for (const Vec3& v : box.c) {
                 bodyLo = Vec3{std::min(bodyLo.x,v.x),std::min(bodyLo.y,v.y),std::min(bodyLo.z,v.z)};
                 bodyHi = Vec3{std::max(bodyHi.x,v.x),std::max(bodyHi.y,v.y),std::max(bodyHi.z,v.z)};
                 anyBody = true;
@@ -11113,13 +11273,13 @@ int main(int argc, char** argv) {
           ease(ui.portraitPanY, ui.portraitPanYTarget);
         }
         const float frontYaw =
-            std::atan2(-std::cos(avatarHeading), -std::sin(avatarHeading));
-        portraitCam = MakePortraitCam(avatar, phys, frontYaw + ui.portraitYaw,
+            std::atan2(-std::cos(bodyYaw), -std::sin(bodyYaw));
+        portraitCam = MakePortraitCam(lb, frontYaw + ui.portraitYaw,
                                       ui.portraitPitch,
                                       (float)kPortraitW / (float)kPortraitH,
                                       ui.portraitZoom, ui.portraitPanX,
                                       ui.portraitPanY, ui.portraitPivotSlot);
-        ProjectBodyUI(avatar, phys, portraitCam, ui);
+        ProjectBodyUI(lb, portraitCam, ui);
       }
 
       // ======================================================================
@@ -12288,6 +12448,16 @@ int main(int argc, char** argv) {
       // No DrawWorld: the clear colour IS the backdrop, and a raymarch of the
       // whole residency window to fill 320x448 pixels behind a character is
       // the most expensive possible way to draw a background.
+      //
+      // THE DEATH POSE IS A THIRD RE-UPLOAD OF THE SAME SHAPE. A dead player's
+      // limbs are DebrisSystem's and go on ragdolling, settling, burning and
+      // rolling downhill; the death screen must show the body as it FELL, and
+      // must still be turnable while it does. So the portrait overwrites those
+      // bodies' transforms with the ones the dying observer froze, draws, and
+      // hands the live ones back — the same borrow-and-return the hide mask
+      // above does, one array over. Matched by PHYSICS HANDLE, because
+      // AdoptBody carries the limb's handle into debris unchanged and a slot
+      // index does not survive the next cull.
       if (ui.inventoryOpen && portraitCam.valid && portraitView) {
         avatar.SetHiddenParts({});               // the WHOLE body, always
         std::vector<BodyVoxInst> pInst;
@@ -12295,10 +12465,29 @@ int main(int argc, char** argv) {
         if (!pInst.empty())
           ctx.queue.WriteBuffer(world.bodyInstances, 0, pInst.data(),
                                 pInst.size() * sizeof(BodyVoxInst));
-        // The TRANSFORMS need no re-upload: a hidden limb still consumes its
-        // slot (game/mob.cpp's walk advances for every part with a body,
-        // drawn or not), so the transform array is mask-independent by
-        // construction. Only the instance lists change.
+        // The TRANSFORMS need no re-upload FOR THE MASK: a hidden limb still
+        // consumes its slot (game/mob.cpp's walk advances for every part with
+        // a body, drawn or not), so the transform array is mask-independent by
+        // construction. Only the instance lists change. The death pose is the
+        // one thing that does re-upload them, and it puts them back below.
+        bool posedDead = false;
+        if (deathFrozen && deathBody.have && !bodyXf.empty()) {
+          const uint32_t debrisSlots =
+              std::min<uint32_t>(debris.SlotCount(), (uint32_t)bodyXf.size());
+          for (uint32_t s = 0; s < debrisSlots; s++) {
+            const uint64_t h = debris.BodyHandle(s);
+            if (!h) continue;
+            for (const auto& fl : deathBody.limbs) {
+              if (fl.body != h) continue;
+              bodyXf[s] = fl.xf;
+              posedDead = true;
+              break;
+            }
+          }
+          if (posedDead)
+            ctx.queue.WriteBuffer(world.bodyXforms, 0, bodyXf.data(),
+                                  bodyXf.size() * sizeof(BodyXformGpu));
+        }
         microInsts.clear();
         bodyReg.BuildMicroInsts(microInsts);
         const uint32_t pMicro = sim.UploadMicroBodyInsts(ctx.queue, microInsts);
@@ -12326,17 +12515,26 @@ int main(int argc, char** argv) {
         if (g_shotInventory && (frameCounter == kShotInvGearFrame ||
                                 frameCounter == kShotInvCaptureFrame ||
                                 frameCounter == kShotInvGrimoireFrame ||
-                                frameCounter == kShotInvLootFrame))
+                                frameCounter == kShotInvLootFrame ||
+                                frameCounter == kShotInvDeathShot ||
+                                frameCounter == kShotInvDeathTurnShot))
           std::printf("--shot-inventory: portrait cube=%zu micro=%u "
-                      "eye=(%.1f %.1f %.1f) target=(%.1f %.1f %.1f)\n",
+                      "eye=(%.1f %.1f %.1f) target=(%.1f %.1f %.1f)%s\n",
                       pInst.size(), pMicro, portraitCam.eye.x, portraitCam.eye.y,
                       portraitCam.eye.z, portraitCam.target.x,
-                      portraitCam.target.y, portraitCam.target.z);
+                      portraitCam.target.y, portraitCam.target.z,
+                      posedDead ? "  [death pose]" : "");
         ctx.queue.Submit(pEnc.Finish());
 
-        // Put the world back: the real hide mask, its instances, and the
-        // player's own camera. The mask change re-dirties the avatar, so the
-        // rebuild below is a genuine requirement rather than a precaution.
+        // Put the world back: the real hide mask, its instances, the corpse's
+        // LIVE transforms, and the player's own camera. The mask change
+        // re-dirties the avatar, so the rebuild below is a genuine requirement
+        // rather than a precaution.
+        if (posedDead) {
+          bodyReg.BuildXforms(bodyXf);
+          ctx.queue.WriteBuffer(world.bodyXforms, 0, bodyXf.data(),
+                                bodyXf.size() * sizeof(BodyXformGpu));
+        }
         avatar.SetHiddenParts(hide);
         std::vector<BodyVoxInst> mInst;
         bodyReg.BuildInstances(mInst);
@@ -12543,7 +12741,9 @@ int main(int argc, char** argv) {
       if ((g_shotInventory && (frameCounter == kShotInvGearFrame ||
                                frameCounter == kShotInvCaptureFrame ||
                                frameCounter == kShotInvGrimoireFrame ||
-                               frameCounter == kShotInvLootFrame)) ||
+                               frameCounter == kShotInvLootFrame ||
+                               frameCounter == kShotInvDeathShot ||
+                               frameCounter == kShotInvDeathTurnShot)) ||
           g_shotJumpPath) {
         const char* shotPath =
             g_shotJumpPath                       ? g_shotJumpPath
@@ -12552,7 +12752,11 @@ int main(int argc, char** argv) {
                 ? "screenshot_inventory_health.bmp"
             : frameCounter == kShotInvGrimoireFrame
                 ? "screenshot_inventory_grimoire.bmp"
-                : "screenshot_inventory_loot.bmp";
+            : frameCounter == kShotInvLootFrame
+                ? "screenshot_inventory_loot.bmp"
+            : frameCounter == kShotInvDeathShot
+                ? "screenshot_inventory_death.bmp"
+                : "screenshot_inventory_death_turn.bmp";
         const uint32_t W = ctx.width, H = ctx.height;
         rhi::Texture shotTex = ctx.device.CreateTexture(
             {W, H, 1}, ctx.surfaceFormat,
