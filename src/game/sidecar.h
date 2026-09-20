@@ -102,7 +102,23 @@ bool ReadJsonDoc(const std::string& path, json& out, std::string& log);
 
 // THE ONE ENTRY POINT. Resolve `<dir>/<path>`'s `extends` chain, then apply its
 // accumulated `effects` from `<dir>/effects/<name>.json`, into `out`.
+//
+// `baseOut`, when given, receives the file's OWN `extends` (empty at the root
+// of a chain). The resolver erases the key as it goes — a resolved document
+// must not invite a second reader to resolve it again — so this is the only
+// place that can still answer "whose body did this start from", and
+// MobSystem::DefWithEffects needs the answer to recognise a composition it has
+// already built.
 bool Load(const std::string& dir, const std::string& path, json& out,
-          std::string& log);
+          std::string& log, std::string* baseOut = nullptr);
+
+// THE SAME THING, WITH MODIFIERS THE FILE DOES NOT CARRY. `extra` is appended
+// to whatever `effects` the chain accumulated (deduplicated, file's own first)
+// before any of them are applied, which is what makes "this creature, plus the
+// zombie effect" expressible without a file saying so. An effect already on
+// the body is not applied twice — biting a zombie does not make it more dead.
+bool LoadWithEffects(const std::string& dir, const std::string& path,
+                     const std::vector<std::string>& extra, json& out,
+                     std::string& log, std::string* baseOut = nullptr);
 
 }  // namespace sidecar

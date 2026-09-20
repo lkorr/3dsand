@@ -265,6 +265,17 @@ const char* const kOrder[] = {
     // wants, and it leaves nothing behind: no ticks, no fire, and it resets
     // mobs and debris on both exits.
     "undead",
+    // ...and becoming one at runtime, straight after it: same fixture shape
+    // (regenerates worldgen on the way in, resets mobs and debris on both
+    // exits) and it wants `undead` to have already proved the authored
+    // composition, since its first claim is that the authored one still wins.
+    //
+    // IT APPENDS DEFS THAT DO NOT GO AWAY. `newcomer+zombie` stays in the def
+    // list for the rest of the run — composed defs are cached for the session
+    // on purpose — so a later gate that walks Defs() by index sees one extra
+    // creature at the end. Nothing before it moves (the append is an append),
+    // which is the property that makes this safe to run in-suite at all.
+    "zombify",
     // Mob-vs-mob spacing. Next to `undead` and for the same reasons: it
     // regenerates worldgen on the way in, ticks no fire and pours no acid,
     // and resets mobs and debris on every exit. It also RESTORES the mob defs
@@ -410,6 +421,11 @@ const char* const kOrder[] = {
     // ...and the corpse stays in one piece when the stroke keeps going
     // through it (same report, the half one-hit could not see; CPU only).
     "corpse-intact",
+    // ...and the blade that keeps going TAKES SOMETHING: a corpse is carved by
+    // the same kerf a living limb is, on the art rather than on the collider
+    // derived from it (owner report 2026-09-20). Same fixture, same pristine
+    // ground, CPU only.
+    "corpse-cut",
     // Right after it, and for the same reason it exists: `corpse-armor` is
     // `corpse-intact` with a wardrobe on and the head off first. It needs the
     // same pristine ground and leaves the same nothing behind.

@@ -444,6 +444,40 @@ struct MobDef {
   // ordinary sidecar numbers so that "undead" does not quietly become the name
   // of a second creature pipeline. A ghoul that sprints is then one file.
   bool undead = false;
+  // ---- WHAT THIS BODY GETS UP AS (sidecar `turn`) --------------------------
+  //
+  // The content half of "killed by a zombie, rises as one". A creature that
+  // dies with the rot in it does not stay a corpse: after `afterSec` its
+  // remains are taken out of the world and it stands up as
+  // DefWithEffects(itself, {into}) — ITSELF, not a stock zombie, so a turned
+  // villager keeps the villager's proportions, art and rig.
+  //
+  // `into` is an EFFECT name, not a creature name, and that is the whole
+  // reason this is three fields instead of a subsystem: what a bite makes of
+  // you is the same modifier the zombie in the file is already made of.
+  // Empty `into` (or `"turn": null` in a patch, which is how the zombie effect
+  // opts its own bodies out) means this creature never turns.
+  struct Turn {
+    std::string into;         // effect to pour on, "" = never turns
+    float afterSec = 0.0f;    // how long the corpse lies there first
+    int infectedLimbs = 1;    // how much of it has to be rotten to count
+  } turn;
+  // ---- WHAT THIS CREATURE IS A COMPOSITION OF ------------------------------
+  //
+  // The two keys a def keeps from its own sidecar after the resolver has
+  // finished with it: whose body this started from, and which modifiers were
+  // poured on it. `name` is the identity; these two are the RECIPE, and they
+  // are what lets the engine answer "is the zombie of jujunud already here?"
+  // without a filename convention doing the reasoning.
+  //
+  // A creature read off disk fills them from its own file (`extends`,
+  // `effects`). A creature MobSystem::DefWithEffects composed at runtime fills
+  // them from the request, and is named `<base>+<effect>` — the one place a
+  // name carries structure, and the reason a turned mob round-trips through a
+  // save with no format change: LoadState reads the name back, does not find a
+  // file, and composes exactly the same def again.
+  std::string extendsName;             // sidecar `extends`, "" at the root
+  std::vector<std::string> effects;    // resolved+accumulated `effects`
   MobRotDef rot;
   float speed = 4.0f;          // voxels/sec walk speed
   // Micro-voxel AUTHORING scale (docs/PLAN_voxel_editor.md §C): 1 = the legacy
@@ -946,12 +980,24 @@ struct SplatterEvent {
   bool doneAvatar = false;  // applied to the player's avatar
 };
 
+// Everything BuildMobDef reads that is not the sidecar in front of it: the mob
+// directory, the material table and the shared clip library. Defined in
+// mob.cpp, because a MobSource and a clip-library entry are the loader's own
+// vocabulary; held here only as a handle, so MobSystem can build ONE more def
+// after the load without re-reading the directory (MobSystem::DefWithEffects).
+struct MobDefFactory;
+
 // Loads assets/mobs/*.vox + matching .json sidecars. Appends problems to log;
 // defs that fail validation are skipped. Limb models of defs with "skinScale" > 1
 // are packed into `micro` (which the caller uploads); `micro` is CLEARED first,
 // so a hot reload rebuilds the whole pool rather than growing it forever.
+//
+// `factoryOut`, when given, receives the handle above. Hand it to
+// MobSystem::SetDefFactory beside SetDefs: without it the system can spawn only
+// the creatures that have files, and nobody can BECOME anything.
 bool LoadMobDefs(const std::string& dir, const std::vector<MaterialDef>& mats,
-                 std::vector<MobDef>& out, MicroBodySet& micro, std::string& log);
+                 std::vector<MobDef>& out, MicroBodySet& micro, std::string& log,
+                 std::shared_ptr<MobDefFactory>* factoryOut = nullptr);
 
 // Per-creature gore profile: the entity-scoped variance draws, resolved ONCE
 // when the creature is created and then held for its whole life — one NPC can
@@ -3408,6 +3454,80 @@ class MobSystem {
   void SetDayPhase(uint32_t phase) { dayPhase_ = phase; }
   void SetDefs(std::vector<MobDef> defs);           // hot reload
   const std::vector<MobDef>& Defs() const { return defs_; }
+  // The loader's leftovers, so this system can build one more creature after
+  // the load (see DefWithEffects). Handed over beside SetDefs; without it
+  // every call below that would COMPOSE a def fails loudly instead.
+  void SetDefFactory(std::shared_ptr<MobDefFactory> fac) {
+    defFactory_ = std::move(fac);
+  }
+  int FindDef(const std::string& name) const;
+  // The same lookup, except that a name of the form `<base>+<fx>+<fx>` that
+  // matches no file is COMPOSED (DefWithEffects). This is the whole of the
+  // save story for a creature that turned: SaveState writes the def name it
+  // always wrote, and a name is enough to rebuild the recipe, so a world full
+  // of zombies-of-somebody round-trips with no version bump and no field that
+  // only one producer can set.
+  int FindOrComposeDef(const std::string& name);
+
+  // ---- BECOMING SOMETHING ELSE ---------------------------------------------
+  //
+  // `base`, with `fx` poured on it — the runtime form of what
+  // `assets/mobs/jujunud_zombie.json` says on disk. Returns a def index, or -1.
+  //
+  // THE ORDER OF PREFERENCE IS THE WHOLE DESIGN:
+  //
+  //   1. `base` already carries every effect asked for -> `base` itself. A
+  //      zombie bitten by a zombie is the same zombie.
+  //   2. A def already loaded whose recipe IS this one (`extendsName` == base,
+  //      same effect set) -> that def. An AUTHORED combination wins over a
+  //      composed one, so a hand-tuned `jujunud_zombie.json` is what a turning
+  //      jujunud becomes, and the content author keeps the last word.
+  //   3. Otherwise compose it: resolve base's sidecar with the extra effects
+  //      (sidecar::LoadWithEffects), build it through the same BuildMobDef
+  //      every file goes through, and append it as `<base>+<fx>`.
+  //
+  // A composed def costs one entry in the shared micro pool per limb and never
+  // goes away, so the number of them in a session is CAPPED (kDerivedDefs);
+  // past the cap the call fails and says so rather than growing the pool
+  // without bound. Deduplication by recipe is what keeps the cap generous: a
+  // hundred villagers turning cost one def, not a hundred.
+  int DefWithEffects(const std::string& base,
+                     const std::vector<std::string>& fx, std::string* log);
+
+  // A LIVE MOB BECOMES ITS OWN VARIANT. Same place, same facing, same limbs
+  // gone, new def — the creature is respawned onto DefWithEffects(its def, fx)
+  // and its sever state is carried across, which is exactly what LoadState
+  // does for a saved mob and for the same reason: everything else about a body
+  // is derived from the def, and this body's def just changed.
+  //
+  // Returns the NEW mob id (0 = nothing turned; the old mob is untouched).
+  // The old mob leaves without a corpse: it did not die, it got up.
+  uint64_t TurnMob(uint64_t mobId, const std::vector<std::string>& fx);
+
+  // ---- THE CORPSES THAT ARE GOING TO GET UP --------------------------------
+  //
+  // A body that died with the rot in it (MobDef::Turn) books a rising here on
+  // its way out, and PreTick services it when the clock comes round: the
+  // remains are taken out of the world and the creature stands up as a variant
+  // of ITSELF. The queue exists because a corpse is not a mob — its limbs
+  // belong to DebrisSystem the moment it dies — and because nothing may spawn
+  // a mob from inside Mob::Die, which is running on a Mob that lives in the
+  // vector the spawn would push to.
+  //
+  // THE AVATAR BOOKS ONE TOO. The player's body goes to DebrisSystem through
+  // exactly the same path, so "you die of the bite and your own corpse gets up
+  // as a zombie of you" needs no player-specific code at all — you respawn,
+  // and the thing wearing your face is an NPC.
+  //
+  // NOT SAVED, deliberately. A rising names debris handles, and the corpse it
+  // names travels in the 'DBRS' section as the debris it already is — so a
+  // save taken in the six seconds between the death and the rising loads back
+  // as a world with a corpse in it and nothing pending. That is the reading
+  // this queue is worth: the alternative is a save format for a body's
+  // intentions, and the whole point of the design above is that a creature's
+  // recipe lives in its NAME and not in a format.
+  size_t PendingRisings() const { return rises_.size(); }
+  void ClearRisings() { rises_.clear(); }  // test fixtures (Reset does it too)
   // Tear down every mob. `rewindIds` also restarts the id counter, which is a
   // TEST-ONLY seam: mob ids seed gore variance and the blast crater's noise, so
   // rewinding them changes how the next creature bleeds and tears. See the note
@@ -4565,7 +4685,34 @@ class MobSystem {
   // mat -> what it becomes when it catches (see IgnitedForm).
   std::vector<uint32_t> ignitedForm_;
   uint32_t dayPhase_ = 0;
+  // EVERY LIVE BODY POINTS INTO THIS VECTOR (Mob::def_, and the avatar's too,
+  // which this system cannot reach). So it is never allowed to reallocate
+  // after a load: SetDefs reserves room for kDerivedDefs compositions up
+  // front, and DefWithEffects refuses once that room is gone. A composed def
+  // is therefore an append that moves nothing — which is also what lets one
+  // turn mid-tick while the creature turning is standing in the middle of it.
+  static constexpr size_t kDerivedDefs = 64;
+  // One booked rising. Everything a body has to say on its way out for the
+  // creature that gets up to be recognisably the same one, and nothing that
+  // needs the rig to still exist.
+  struct PendingRise {
+    std::string def;                   // whose body it was
+    std::vector<std::string> fx;       // what it rises as
+    Vec3 at{};
+    float heading = 0.0f, bodyY = 0.0f;
+    std::vector<std::string> lost;     // limbs it had already lost
+    std::vector<uint64_t> bodies;      // the remains, to take out of the world
+    uint32_t atTick = 0;
+  };
+  // Bounded like every other emergent queue here (CLAUDE.md rule 2): a crowd
+  // dying at once books a crowd of risings, and the cost of one is a spawn.
+  static constexpr size_t kMaxRisings = 32;
+  void BookRising(PendingRise r);
+  void ServiceRisings(uint32_t tick);
+  std::vector<PendingRise> rises_;
+  uint32_t tick_ = 0;                  // this tick, for booking a rising
   std::vector<MobDef> defs_;
+  std::shared_ptr<MobDefFactory> defFactory_;
   std::vector<Mob> mobs_;
   // ---- behaviour layer ------------------------------------------------------
   ai::Library behaviors_;

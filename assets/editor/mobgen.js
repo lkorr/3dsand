@@ -2662,6 +2662,19 @@ export const BASE_MOB = 'human';
 export function thinSidecar(full, base, name) {
   const body = { ...full };
   delete body.genome;                       // the input, never inherited
+  // WHAT THE GENERATOR DOES NOT MODEL IS INHERITED, NOT DELETED.
+  //
+  // diffAgainst turns a key the base has and the target does not into an
+  // explicit null, which is the RFC rule and is right for a variant somebody
+  // wrote by hand. It is wrong here: a generated body is a description of a
+  // SHAPE — proportions, anchors, the two clip periods its leg implies — and
+  // not a whole creature, so a key it has no opinion about would be STRIPPED
+  // FROM EVERY CHARACTER IN THE POOL the day it was added to the human.
+  // `turn` (what a body gets up as) was the first one and cost this comment;
+  // whatever the next one is, absent means inherited.
+  for (const k of Object.keys(base))
+    if (!k.startsWith('//') && !(k in body))
+      body[k] = JSON.parse(JSON.stringify(base[k]));
   const patch = SC.diffAgainst(base, body) || {};
   return {
     '//': `A CHARACTER, not a creature: ${name} inherits ${BASE_MOB}'s rig — ` +

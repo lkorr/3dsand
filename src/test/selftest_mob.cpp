@@ -5327,6 +5327,294 @@ Status GateUndead(Ctx& c, std::string& detail) {
   return ok ? Status::Pass : Status::Fail;
 }
 
+// ---- zombify ---------------------------------------------------------------
+//
+// PHASE 5b: a creature becomes a zombie WITHOUT a file saying it can.
+//
+// `undead` above proves the effect composes when somebody authored the
+// composition (`jujunud_zombie.json`, three lines). This gate is about the
+// case nobody can author: the villager the player let get bitten, whose
+// zombie has to be built while the world is running. Five claims, and the
+// first is the one that keeps content in charge:
+//
+//   A. AN AUTHORED COMPOSITION WINS. `human` + zombie must resolve to the
+//      `zombie` def that exists on disk, not to a second one built beside it.
+//      Without this, every hand-tuned variant in the repo would be shadowed by
+//      a composition the moment somebody turned one, and the author's numbers
+//      would quietly stop being what the game used.
+//   B. A COMPOSITION NOBODY AUTHORED IS BUILT, and is a real creature: the
+//      base's body, the effect's numbers, its own art palette. Not a flag on
+//      an existing def -- the paleness is a recolour folded into the shared
+//      palette at build time, so a def that skipped BuildMobDef would walk
+//      around in living colours.
+//   C. IT IS BUILT ONCE. Asking twice returns the same def, and a name that
+//      spells out the recipe (`<base>+<effect>`) finds it again -- which is
+//      the whole save story, since SaveState already writes a def NAME.
+//   D. A LIVE MOB TURNS: same place, same facing, and the arm it had already
+//      lost stays lost.
+//   E. A CORPSE GETS UP. The end-to-end rule: bitten, dead, and some seconds
+//      later standing again as a zombie of itself, with its remains taken out
+//      of the world rather than left lying under the thing that rose from
+//      them.
+//
+// No render and almost no ticks: the rising's clock is compared against the
+// tick PreTick is called with, so the six seconds are skipped by calling it
+// with a later number rather than by simulating 180 of them.
+Status GateZombify(Ctx& c, std::string& detail) {
+  c.debris.Reset();
+  c.mobs.Reset();
+  c.mobs.ClearRisings();
+  SubmitWorldgen(c.ctx, c.world, c.sim, kDefaultSeed);
+  c.ctx.WaitIdle();
+
+  const int hi = c.mobs.FindDef("human"), zi = c.mobs.FindDef("zombie");
+  const int ji = c.mobs.FindDef("jujunud");
+  const int jzi = c.mobs.FindDef("jujunud_zombie");
+  const int ni = c.mobs.FindDef("newcomer");
+  if (hi < 0 || zi < 0 || ni < 0) {
+    detail = "need human, zombie and newcomer defs";
+    return Status::Fail;
+  }
+  const std::vector<std::string> fx{"zombie"};
+
+  // ---- A: the file wins ----------------------------------------------------
+  const int humanZ = c.mobs.DefWithEffects("human", fx, nullptr);
+  const int jujuZ = ji >= 0 ? c.mobs.DefWithEffects("jujunud", fx, nullptr) : -1;
+  const bool authored = humanZ == zi && (ji < 0 || jujuZ == jzi);
+  // ...and a zombie asked to become a zombie is already one.
+  const bool idempotentZ = c.mobs.DefWithEffects("zombie", fx, nullptr) == zi;
+
+  // ---- B: the one nobody wrote ---------------------------------------------
+  auto chromaOf = [](const std::vector<uint32_t>& cs) {
+    double sum = 0;
+    uint32_t n = 0;
+    for (uint32_t w : cs) {
+      if (!w) continue;
+      const double r = (double)((w >> 16) & 0xFF), g = (double)((w >> 8) & 0xFF),
+                   b = (double)(w & 0xFF);
+      sum += std::max(r, std::max(g, b)) - std::min(r, std::min(g, b));
+      n++;
+    }
+    return n ? sum / n : 0.0;
+  };
+  const size_t defsBefore = c.mobs.Defs().size();
+  const int made = c.mobs.DefWithEffects("newcomer", fx, nullptr);
+  const bool grew = made >= 0 && c.mobs.Defs().size() == defsBefore + 1;
+  bool composed = false;
+  std::string composeWhy = "not built";
+  double baseChroma = 0, newChroma = 0;
+  float baseSpeed = 0, newSpeed = 0;
+  if (made >= 0) {
+    const MobDef& nb = c.mobs.Defs()[ni];
+    const MobDef& nz = c.mobs.Defs()[made];
+    baseChroma = chromaOf(nb.prefab.artColors);
+    newChroma = chromaOf(nz.prefab.artColors);
+    baseSpeed = nb.speed;
+    newSpeed = nz.speed;
+    // THE EFFECT LANDED...
+    const bool effect = nz.undead && !nz.woundHeals && nz.rot.enabled &&
+                        nz.behavior == "zombie" && baseChroma > 0.0 &&
+                        newChroma < baseChroma * 0.75 &&
+                        std::abs(newSpeed - baseSpeed * 0.746f) < 0.05f;
+    // ...ON THIS BODY. Same rig, same art, same walk clock as newcomer: a
+    // composition that quietly rebuilt the human would pass every claim above
+    // while putting the wrong body in the world.
+    const int bw = nb.skel.FindClip("walk"), zw = nz.skel.FindClip("walk");
+    const bool body =
+        nz.limbs.size() == nb.limbs.size() &&
+        nz.prefab.size.x == nb.prefab.size.x &&
+        nz.prefab.size.y == nb.prefab.size.y &&
+        nz.prefab.size.z == nb.prefab.size.z && bw >= 0 && zw >= 0 &&
+        nz.skel.clips[zw].durationMs == nb.skel.clips[bw].durationMs;
+    // ...and it says what it is made of, which is what C and the save read.
+    const bool recipe = nz.name == "newcomer+zombie" &&
+                        nz.extendsName == "newcomer" && nz.effects.size() == 1 &&
+                        nz.effects[0] == "zombie" &&
+                        // the effect deletes `turn`: the dead stay dead.
+                        nz.turn.into.empty() && !nb.turn.into.empty();
+    composed = grew && effect && body && recipe;
+    composeWhy = composed ? "" : Format("effect=%d body=%d recipe=%d grew=%d",
+                                        effect ? 1 : 0, body ? 1 : 0,
+                                        recipe ? 1 : 0, grew ? 1 : 0);
+  }
+
+  // ---- C: once, and findable by name ---------------------------------------
+  const size_t afterFirst = c.mobs.Defs().size();
+  const bool cached = c.mobs.DefWithEffects("newcomer", fx, nullptr) == made &&
+                      c.mobs.Defs().size() == afterFirst &&
+                      c.mobs.FindOrComposeDef("newcomer+zombie") == made &&
+                      c.mobs.Defs().size() == afterFirst;
+
+  // ---- D: a live one turns -------------------------------------------------
+  int relief = 0;
+  const IVec3 anchor = AiFixtureCentre(c.world);
+  const IVec3 spot = AiFlatSpot(anchor.x, anchor.z, 96, 16, kDefaultSeed, relief);
+  const int step = std::max(8, (int)c.mobs.Defs()[ni].worldSize.x * 3);
+  bool turned = false;
+  std::string turnWhy = "no spawn";
+  {
+    const uint64_t id = c.mobs.Spawn(ni, {spot.x, spot.y + 1, spot.z});
+    if (c.mobs.FindMobById(id) != nullptr) {
+      // An arm off BEFORE the turn, because "it kept what it had lost" is the
+      // claim that separates a turn from a fresh spawn on the same square.
+      int arm = -1;
+      for (size_t i = 0; i < c.mobs.Defs()[ni].limbs.size(); i++)
+        if (c.mobs.Defs()[ni].limbs[i].name.rfind("armL", 0) == 0) arm = (int)i;
+      if (arm >= 0) c.mobs.Sever(id, arm);
+      const Vec3 was = c.mobs.MobOrigin(id);
+      const uint32_t before = c.mobs.MobCount();
+      const uint64_t now = c.mobs.TurnMob(id, fx);
+      const Mob* mz = now ? c.mobs.FindMobById(now) : nullptr;
+      const Vec3 at = now ? c.mobs.MobOrigin(now) : Vec3{};
+      const bool armGone = arm < 0 || c.mobs.LimbBody(now, arm) == 0;
+      turned = now != 0 && c.mobs.FindMobById(id) == nullptr &&
+               c.mobs.MobCount() == before && mz != nullptr &&
+               mz->Def() != nullptr && mz->Def()->name == "newcomer+zombie" &&
+               (at - was).len() < 1.0f && armGone;
+      if (!turned)
+        turnWhy = Format("id=%llu gone=%d count=%u/%u name=%s move=%.2f arm=%d",
+                         (unsigned long long)now,
+                         c.mobs.FindMobById(id) == nullptr ? 1 : 0,
+                         c.mobs.MobCount(), before,
+                         mz && mz->Def() ? mz->Def()->name.c_str() : "-",
+                         (at - was).len(), armGone ? 1 : 0);
+    }
+  }
+
+  // ---- E: a corpse gets up -------------------------------------------------
+  //
+  // The whole rule end to end: the rot a zombie's bite leaves in the flesh is
+  // still in it when it dies (MobLimb::infectMat), so the body books a rising
+  // on its way out and stands up again as a zombie of itself.
+  bool rose = false;
+  std::string roseWhy = "no spawn";
+  uint32_t bookings = 0;
+  {
+    c.mobs.ClearRisings();
+    const uint64_t id = c.mobs.Spawn(hi, {spot.x + step, spot.y + 1, spot.z});
+    const uint16_t rotMat = c.mobs.Defs()[zi].bite.infectMat;
+    if (c.mobs.FindMobById(id) != nullptr && rotMat != 0) {
+      std::vector<BrushOp> ops;
+      std::vector<CellOp> cellOps;
+      std::vector<ParticleSpawn> spawns;
+      const uint32_t tick0 = 9000;
+      c.mobs.PreTick(tick0, c.world, ops, cellOps, spawns);
+      // Bitten, on a limb, with the rot the zombie carries.
+      int limb = c.mobs.Defs()[hi].rootLimb;
+      for (size_t i = 0; i < c.mobs.Defs()[hi].limbs.size(); i++)
+        if (c.mobs.Defs()[hi].limbs[i].name.rfind("armR", 0) == 0) limb = (int)i;
+      const uint64_t body = c.mobs.LimbBody(id, limb);
+      ::BiteHit bt;
+      bt.at = c.mobs.LimbVoxelPos(id, limb, 7919u);
+      bt.hp = 4.0f;
+      bt.power = 1.0f;
+      bt.infectMat = rotMat;
+      bt.infectStain = c.mobs.Defs()[zi].bite.infectStain;
+      bt.seed = 0xB17Eu;
+      if (body) c.mobs.BiteHit(body, bt, c.world, spawns);
+      const uint32_t rotVox = c.mobs.LimbMaterialCount(id, limb, rotMat);
+      // ...and then killed by something else entirely, which is the point:
+      // what turns you is having the disease in you when you die.
+      const uint32_t before = c.mobs.MobCount();
+      Mob* m = c.mobs.FindMobById(id);
+      if (m != nullptr) m->Die();
+      bookings = (uint32_t)c.mobs.PendingRisings();
+      // Not yet: the corpse lies there for `turn.afterSec` first.
+      c.mobs.PreTick(tick0 + 1, c.world, ops, cellOps, spawns);
+      const bool waited = c.mobs.PendingRisings() == 1;
+      // ...and then it is time. One PreTick with a later tick rather than 180
+      // real ones: the clock is a comparison, not an accumulator.
+      c.mobs.PreTick(tick0 + 400, c.world, ops, cellOps, spawns);
+      uint64_t risen = 0;
+      for (uint32_t i = 0; i < c.mobs.MobCount(); i++) {
+        const uint64_t oid = c.mobs.MobIdAt(i);
+        const Mob* om = c.mobs.FindMobById(oid);
+        if (om != nullptr && om->Def() != nullptr && om->Def()->undead &&
+            oid != id)
+          risen = oid;
+      }
+      rose = rotVox > 0 && bookings == 1 && waited && risen != 0 &&
+             c.mobs.PendingRisings() == 0 && c.mobs.IsAlive(risen) &&
+             c.mobs.FindMobById(id) == nullptr;
+      if (!rose)
+        roseWhy = Format(
+            "rot=%u booked=%u waited=%d risen=%llu left=%zu count=%u/%u", rotVox,
+            bookings, waited ? 1 : 0, (unsigned long long)risen,
+            c.mobs.PendingRisings(), c.mobs.MobCount(), before);
+    } else {
+      roseWhy = rotMat == 0 ? "the zombie def carries no bite.infectMat"
+                            : "could not spawn a human";
+    }
+  }
+
+  // ---- F: A TURNED CREATURE SURVIVES A SAVE --------------------------------
+  //
+  // With no format change at all, which is the point of spelling the recipe
+  // into the name: SaveState writes the def NAME it has always written, and
+  // the reload composes `newcomer+zombie` again because nothing on disk
+  // answers to that name. A save format that carried an `effects` list would
+  // have needed a version bump, a migration and a producer — this needs a
+  // string split.
+  bool saved = false;
+  std::string saveWhy = "no spawn";
+  {
+    c.mobs.Reset();
+    const uint64_t id = c.mobs.Spawn(ni, {spot.x, spot.y + 1, spot.z});
+    const uint64_t turnedId = id ? c.mobs.TurnMob(id, fx) : 0;
+    if (turnedId != 0) {
+      std::vector<uint8_t> blob;
+      c.mobs.SaveState(blob);
+      // The composed def is dropped along with everything else, so the load
+      // has nothing but the name to work from — which is the claim.
+      c.mobs.Reset();
+      // ...and the composed def is thrown away with the mobs, the way a
+      // restart throws it away: the def list goes back to what the directory
+      // holds. Without this the load would simply find the def still sitting
+      // there and the arm would assert nothing (the composed defs are cached
+      // for the session on purpose, so dropping them takes a deliberate act).
+      {
+        std::vector<MobDef> onDisk;
+        for (const MobDef& d : c.mobs.Defs())
+          if (d.name.find('+') == std::string::npos) onDisk.push_back(d);
+        c.mobs.SetDefs(std::move(onDisk));
+      }
+      const bool gone = c.mobs.FindDef("newcomer+zombie") < 0;
+      const bool read =
+          c.mobs.LoadState(blob.data(), blob.size(), MobSystem::kSaveVersion);
+      uint64_t back = 0;
+      for (uint32_t i = 0; i < c.mobs.MobCount(); i++) back = c.mobs.MobIdAt(i);
+      const Mob* mb = back ? c.mobs.FindMobById(back) : nullptr;
+      saved = gone && read && mb != nullptr && mb->Def() != nullptr &&
+              mb->Def()->name == "newcomer+zombie" && mb->Def()->undead;
+      if (!saved)
+        saveWhy = Format("read=%d dropped=%d back=%llu name=%s", read ? 1 : 0,
+                         gone ? 1 : 0, (unsigned long long)back,
+                         mb && mb->Def() ? mb->Def()->name.c_str() : "-");
+    }
+  }
+
+  const bool ok = authored && idempotentZ && composed && cached && turned &&
+                  rose && saved;
+  detail = Format(
+      "authored human+zombie=%d (def %d vs %d) jujunud=%d/%d, already-undead "
+      "%d; composed %d%s (chroma %.1f -> %.1f, speed %.2f -> %.2f, defs %zu -> "
+      "%zu), cached %d; turned %d%s; rose %d%s; saved %d%s",
+      authored ? 1 : 0, humanZ, zi, jujuZ, jzi, idempotentZ ? 1 : 0,
+      composed ? 1 : 0,
+      composeWhy.empty() ? "" : (" [" + composeWhy + "]").c_str(), baseChroma,
+      newChroma, baseSpeed, newSpeed, defsBefore, afterFirst, cached ? 1 : 0,
+      turned ? 1 : 0, turned ? "" : (" [" + turnWhy + "]").c_str(),
+      rose ? 1 : 0, rose ? "" : (" [" + roseWhy + "]").c_str(), saved ? 1 : 0,
+      saved ? "" : (" [" + saveWhy + "]").c_str());
+  RecordObserved("zombifyComposedDefs",
+                 (double)(c.mobs.Defs().size() - defsBefore));
+
+  c.debris.Reset();
+  c.mobs.Reset();
+  c.mobs.ClearRisings();
+  return ok ? Status::Pass : Status::Fail;
+}
+
 // ---- ai-dummy --------------------------------------------------------------
 Status GateAiDummy(Ctx& c, std::string& detail) {
   c.debris.Reset();
@@ -8566,6 +8854,11 @@ const std::vector<Gate>& MobGates() {
       // whose cuts do not close. Counts only, and no ticks at all — rot
       // happens inside Spawn.
       {"undead", "mob", {}, false, GateUndead, /*needsRender=*/false},
+      // ...and the same thing with nobody having authored it: a creature
+      // becomes a zombie of ITSELF at runtime, and a corpse with the rot still
+      // in it gets back up. Counts and def reads; the six-second wait is
+      // skipped by calling PreTick with a later tick.
+      {"zombify", "mob", {}, false, GateZombify, /*needsRender=*/false},
       // Creatures give each other room instead of piling into one point.
       // Two arms in one gate, the second with spacing zeroed IN THE DEF, so
       // the fixture has to prove it crowds before "they did not overlap"

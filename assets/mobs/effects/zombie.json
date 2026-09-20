@@ -4,6 +4,8 @@
   "patch": {
     "//undead": "Two consequences and no more (MobDef::undead): `bleed.woundHeals` defaults to false here, and the `rot` block below is honoured at spawn. Everything else that makes a zombie a zombie is an ordinary sidecar number, on purpose.",
     "undead": true,
+    "//turn": "AND THE DEAD STAY DEAD THE SECOND TIME. An explicit null is the RFC 7396 delete, so this drops the `turn` block the body inherited from the human: a zombie that dies has nothing left to become, and without this every corpse in a fight between zombies would get back up forever -- an unbounded process, which is the thing rule 2 forbids. Deleting the key is also how any other creature opts out.",
+    "turn": null,
     "//palette": "A FILTER over human.vox's art palette, not a colour table -- restating the colours would be a copy of the art by another route, which is the thing `extends` exists to avoid. Applied before the merged palette dedupes by RGB, so the human is untouched. Chroma down to a bit under half, a touch lighter, and a fifth of the way toward a sickly grey-green.",
     "palette": {
       "saturation": 0.45,

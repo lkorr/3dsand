@@ -199,7 +199,7 @@ bool ReadJsonDoc(const std::string& path, json& out, std::string& log) {
 namespace {
 
 bool ResolveExtends(const std::string& dir, const std::string& path, json& out,
-                    std::string& log, int depth) {
+                    std::string& log, int depth, std::string* baseOut) {
   if (depth > kMaxExtends) {
     log += path + ": `extends` nested more than " + std::to_string(kMaxExtends) +
            " deep (a cycle?) — skipped\n";
@@ -208,6 +208,7 @@ bool ResolveExtends(const std::string& dir, const std::string& path, json& out,
   json child;
   if (!ReadJsonDoc(path, child, log)) return false;
   const std::string base = child.value("extends", std::string());
+  if (baseOut != nullptr && depth == 0) *baseOut = base;
   if (base.empty()) {
     out = std::move(child);
     return true;
@@ -215,7 +216,7 @@ bool ResolveExtends(const std::string& dir, const std::string& path, json& out,
   json parent;
   const std::string bp =
       (std::filesystem::path(dir) / (base + ".json")).string();
-  if (!ResolveExtends(dir, bp, parent, log, depth + 1)) {
+  if (!ResolveExtends(dir, bp, parent, log, depth + 1, nullptr)) {
     log += path + ": extends \"" + base + "\", which did not load — skipped\n";
     return false;
   }
@@ -246,8 +247,28 @@ bool ResolveExtends(const std::string& dir, const std::string& path, json& out,
 }  // namespace
 
 bool Load(const std::string& dir, const std::string& path, json& out,
-          std::string& log) {
-  if (!ResolveExtends(dir, path, out, log, 0)) return false;
+          std::string& log, std::string* baseOut) {
+  return LoadWithEffects(dir, path, {}, out, log, baseOut);
+}
+
+bool LoadWithEffects(const std::string& dir, const std::string& path,
+                     const std::vector<std::string>& extra, json& out,
+                     std::string& log, std::string* baseOut) {
+  if (!ResolveExtends(dir, path, out, log, 0, baseOut)) return false;
+  // The caller's modifiers join the file's own, in that order and without
+  // repeats. Order matters: an effect is a patch, and the last patch wins, so
+  // "what this creature is" is applied before "what has happened to it".
+  if (!extra.empty()) {
+    json list = out.contains("effects") && out["effects"].is_array()
+                    ? out["effects"]
+                    : json::array();
+    for (const std::string& e : extra) {
+      bool seen = false;
+      for (const json& c : list) seen = seen || (c.is_string() && c == e);
+      if (!seen) list.push_back(e);
+    }
+    out["effects"] = std::move(list);
+  }
   if (!out.contains("effects")) return true;
   if (!out["effects"].is_array()) {
     log += path + ": `effects` is not an array of names — ignored\n";

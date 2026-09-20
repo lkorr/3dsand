@@ -445,6 +445,11 @@ struct MobSource {
   std::string name;      // def name = the SIDECAR's stem
   std::string voxPath;
   std::string jsonPath;
+  // Whose body this one starts from, straight off the file and BEFORE the
+  // resolver spends the key (sidecar::Load's `baseOut`). Filled at the two
+  // places a source is made: the directory scan, and DefWithEffects' virtual
+  // source. See MobDef::extendsName for what reads it.
+  std::string extendsName;
 };
 
 // `extends` (and `effects`) are resolved by src/game/sidecar.cpp — the three
@@ -611,9 +616,1109 @@ static void ApplyPaletteRecolour(const json& p, std::vector<uint32_t>& colors,
   }
 }
 
+// ---- BUILDING ONE CREATURE -------------------------------------------------
+//
+// Everything that turns one (art, sidecar) pair into a MobDef, in ONE callable
+// place. This used to be the body of LoadMobDefs' loop, which meant the engine
+// could build every creature in the mob directory and nothing else — and that
+// is the whole reason a zombie of somebody had to exist as a FILE before
+// anybody could become one. MobSystem::DefWithEffects calls this at runtime
+// with a sidecar document that nothing on disk ever held.
+//
+// `j` is the RESOLVED sidecar (sidecar::Load has already walked `extends` and
+// applied `effects`); the caller resolves it, because the caller is the one
+// that knows whether this creature is a file or a composition.
+//
+// Appends to `micro`: art colours are deduplicated into the shared palette and
+// each limb's brick is packed into the shared pool. Both APPEND, so building a
+// def mid-session cannot renumber a model index or a palette slot a live body
+// already points at — and the frame loop's `if (mbSet.dirty)` upload publishes
+// the new bricks in the same tick.
+struct MobDefFactory {
+  std::string dir;                        // assets/mobs
+  std::vector<MaterialDef> mats;          // by value: a def outlives one load
+  std::vector<ClipLibraryEntry> clipLib;  // assets/anims, compiled per rig
+  std::vector<MobSource> sources;         // which art each name wears
+};
+
+bool BuildMobDef(const MobDefFactory& fac, const MobSource& src, const json& j,
+                 MicroBodySet& micro, MobDef& defOut, std::string& log) {
+  const std::vector<MaterialDef>& mats = fac.mats;
+  const std::vector<ClipLibraryEntry>& clipLib = fac.clipLib;
+  const std::string& jp = src.jsonPath;
+
+  MobDef def;
+  std::string err, warn;
+  if (!LoadVoxFile(src.voxPath, mats.size(), def.prefab, err, warn)) {
+    log += src.voxPath + ": " + err;
+    return false;
+  }
+  log += warn;
+  // Named for the SIDECAR, not for the art: two creatures may wear one .vox
+  // and they are not the same creature. Identical to the old behaviour for
+  // every def that owns its own file, which is all of them but the variants.
+  def.name = src.name;
+  // THE RECIPE, KEPT (MobDef::extendsName/effects). The resolver has already
+  // spent these — the body in front of us IS the merge — but keeping them is
+  // what lets the engine recognise a composition later instead of re-deriving
+  // it: `jujunud_zombie.json` and a zombie MobSystem composed at runtime are
+  // the same creature, and only these two fields say so.
+  def.extendsName = src.extendsName;
+  if (j.contains("effects") && j["effects"].is_array())
+    for (const json& e : j["effects"])
+      if (e.is_string()) def.effects.push_back(e.get<std::string>());
+
+  if (j.contains("palette"))
+    ApplyPaletteRecolour(j["palette"], def.prefab.artColors, jp, log);
+
+  // Fold this file's art colours into the one palette every def resolves
+  // against, and rewrite its voxels' slots to the merged numbering NOW —
+  // before anything copies them into a limb, a flipbook frame or a micro
+  // brick. Doing it here means exactly one place understands the remap.
+  if (!def.prefab.artColors.empty()) {
+    const std::vector<uint8_t> remap =
+        MicroBodyMergeArt(micro, def.prefab.artColors, def.name, log);
+    for (PrefabModel& pm : def.prefab.models)
+      for (PrefabVoxel& v : pm.voxels)
+        if (v.color) v.color = remap[v.color];
+  }
+
+  std::string root = j.value("root", "");
+  // ---- UNDEAD (MobDef::undead) -------------------------------------------
+  // Read BEFORE `bleed`, because it moves the default `bleed.woundHeals`
+  // lands on and an explicit key in the block below must still win.
+  if (j.contains("undead")) {
+    if (j["undead"].is_boolean()) def.undead = j["undead"].get<bool>();
+    else log += jp + ": undead: expected true or false\n";
+  }
+  if (def.undead) def.woundHeals = false;
+  // ---- AND WHAT IT GETS UP AS (MobDef::Turn) ------------------------------
+  // Absent, or `null` in a patch (which is how the zombie effect opts its own
+  // bodies out of turning again), leaves `into` empty: this creature stays
+  // dead. The rule that reads it is Mob::Die.
+  if (j.contains("turn")) {
+    const json& t = j["turn"];
+    if (!t.is_object()) {
+      log += jp + ": `turn` is not an object — ignored\n";
+    } else {
+      def.turn.into = t.value("into", std::string());
+      def.turn.afterSec = std::max(0.0f, t.value("afterSec", 0.0f));
+      def.turn.infectedLimbs = std::max(1, t.value("infectedLimbs", 1));
+    }
+  }
+  // ---- BORN BITTEN (MobRotDef) -------------------------------------------
+  if (j.contains("rot")) {
+    const json& r = j["rot"];
+    if (!r.is_object()) {
+      log += jp + ": `rot` is not an object — ignored\n";
+    } else {
+      MobRotDef& rd = def.rot;
+      rd.enabled = r.value("enabled", true);
+      // A [min, max] pair, because a rig whose every limb lost the same
+      // amount reads as a design rather than as damage. A bare number is
+      // accepted and means "exactly this".
+      auto range = [&](const char* key, float& lo, float& hi) {
+        if (!r.contains(key)) return;
+        const json& v = r[key];
+        if (v.is_number()) {
+          lo = hi = v.get<float>();
+        } else if (v.is_array() && v.size() == 2 && v[0].is_number() &&
+                   v[1].is_number()) {
+          lo = v[0].get<float>();
+          hi = v[1].get<float>();
+        } else {
+          log += jp + ": rot." + key +
+                 ": expected a number or [min, max]\n";
+          return;
+        }
+        if (hi < lo) std::swap(lo, hi);
+      };
+      float bl = (float)rd.bitesMin, bh = (float)rd.bitesMax;
+      range("bites", bl, bh);
+      rd.bitesMin = std::max(0, (int)std::lround(bl));
+      rd.bitesMax = std::max(rd.bitesMin, (int)std::lround(bh));
+      range("radius", rd.radiusMin, rd.radiusMax);
+      rd.radiusMin = std::clamp(rd.radiusMin, 0.0f, 2.0f);
+      rd.radiusMax = std::clamp(rd.radiusMax, rd.radiusMin, 2.0f);
+      // Hard-capped at kLimbCollapseFraction's complement with room to
+      // spare: rot must never be the thing that takes a limb off at spawn,
+      // or a zombie's head could roll before it had taken a step.
+      rd.maxLoss = std::clamp(r.value("maxLoss", rd.maxLoss), 0.0f, 0.5f);
+      rd.blob = std::max(0.5f, r.value("blob", rd.blob));
+      rd.vitalScale = std::clamp(r.value("vitalScale", rd.vitalScale), 0.0f,
+                                 1.0f);
+      rd.stainScale = std::clamp(r.value("stainScale", rd.stainScale), 0.0f,
+                                 8.0f);
+      // How many holes bleed at all, and how hard the ones that do. `wet` is
+      // a [min, max] range like every other spread in this block, so it is
+      // authored the same way `radius` is; the floor on wetMin is what keeps
+      // "a trace" from rounding to "dry" and duplicating dryFraction by
+      // accident (MobRotDef).
+      rd.dryFraction = std::clamp(r.value("dryFraction", rd.dryFraction),
+                                  0.0f, 1.0f);
+      range("wet", rd.wetMin, rd.wetMax);
+      rd.wetMin = std::clamp(rd.wetMin, 0.07f, 1.0f);
+      rd.wetMax = std::clamp(rd.wetMax, rd.wetMin, 1.0f);
+      if (r.contains("skip") && r["skip"].is_array())
+        for (const auto& s : r["skip"])
+          if (s.is_string()) rd.skip.push_back(s.get<std::string>());
+    }
+  }
+  if (j.contains("bleed")) {
+    std::string bm = j["bleed"].value("material", "");
+    int id = FindMaterialId(mats, bm);
+    if (id < 0) log += jp + ": unknown bleed material \"" + bm + "\"\n";
+    else def.bleedMat = (uint32_t)id;
+    // WHAT A CUT LEAVES ON THE MEAT, as opposed to what runs out of it.
+    // Optional, and defaulting to the bleed material rather than to nothing:
+    // a creature's own blood is already the right colour for flesh it is
+    // losing, so every mob in the repo gets a soaked wound with no content
+    // edit, and one that wants a different answer (sap, ichor, oil) says so
+    // in one key. See MobDef::woundMat for why this is a MATERIAL.
+    const std::string wm = j["bleed"].value("woundMaterial", "");
+    if (!wm.empty()) {
+      const int wid = FindMaterialId(mats, wm);
+      if (wid < 0)
+        log += jp + ": unknown bleed woundMaterial \"" + wm + "\"\n";
+      else
+        def.woundMat = (uint32_t)wid;
+    }
+    if (def.woundMat == 0) def.woundMat = def.bleedMat;
+    // DOES THE CUT CLOSE? Default true (living flesh); false is the undead
+    // setting and restores the pre-2026-09-14 behaviour for this creature
+    // alone — its wounds go on drying to air, widening, and shedding parts.
+    // See MobDef::woundHeals.
+    if (j["bleed"].contains("woundHeals")) {
+      if (j["bleed"]["woundHeals"].is_boolean())
+        def.woundHeals = j["bleed"]["woundHeals"].get<bool>();
+      else
+        log += jp + ": bleed.woundHeals: expected true or false\n";
+    }
+    // Tissue = crumbles to this creature's blood (see MobDef::tissue).
+    if (def.bleedMat != 0) {
+      def.tissue.assign(mats.size(), 0);
+      bool any = false;
+      for (size_t mi = 0; mi < mats.size(); mi++) {
+        const bool crumblesToBlood =
+            !mats[mi].rubble.empty() &&
+            FindMaterialId(mats, mats[mi].rubble) == (int)def.bleedMat;
+        if (crumblesToBlood || mi == def.woundMat) {
+          def.tissue[mi] = 1;
+          any = true;
+        }
+      }
+      if (!any) def.tissue.clear();
+    }
+    // ---- THE GORE WEIGHTS, FLATTENED (mob.h MobDef::woundHp) -------------
+    // Built here rather than read from `mats` at every voxel because the
+    // damage and infection passes are per-voxel hot paths. `rotRate` is the
+    // only one that needs `tissue`: an unauthored (negative) rate means "do
+    // what tissue already said", which is 1 for tissue and 0 for the rest --
+    // so bone, which crumbles to dust and is therefore not tissue, is
+    // invisible to the rot until materials.json gives it a rate.
+    def.woundHp.assign(mats.size(), 1.0f);
+    def.brainMat.assign(mats.size(), 0);
+    def.rotRate.assign(mats.size(), 0.0f);
+    for (size_t mi = 0; mi < mats.size(); mi++) {
+      def.woundHp[mi] = mats[mi].woundHp;
+      def.brainMat[mi] = mats[mi].brainHp ? 1 : 0;
+      const bool isTissue =
+          def.tissue.empty() || (mi < def.tissue.size() && def.tissue[mi]);
+      def.rotRate[mi] = mats[mi].rotRate >= 0.0f ? mats[mi].rotRate
+                                                 : (isTissue ? 1.0f : 0.0f);
+    }
+    // NOT rescaled: this is a COUNT of voxels a wound may still owe, i.e.
+    // a volume budget, and volume goes as the cube of the voxel scale. It
+    // is gore rate rather than size or shape, so it is left as authored
+    // and flagged here instead of being silently cubed.
+    def.bleedPerDamage = j["bleed"].value("perDamage", 1.5f);
+  }
+  // ---- WHAT THIS CREATURE'S BITE CARRIES (mob.h MobBiteDef; plan §6) -----
+  // By NAME, through the same FindMaterialId `bleed.material` just used, and
+  // for the same reason: a material id is its index in materials.json, which
+  // renumbers the moment somebody inserts a row. Missing is not an error —
+  // a creature with no `bite` block simply tears — but an UNKNOWN name is,
+  // because the only other symptom would be a zombie whose bite is clean.
+  if (j.contains("bite")) {
+    if (!j["bite"].is_object()) {
+      log += jp + ": `bite` is not an object — ignored\n";
+    } else {
+      auto mat = [&](const char* key, uint16_t& out) {
+        const std::string nm = j["bite"].value(key, "");
+        if (nm.empty()) return;
+        const int id = FindMaterialId(mats, nm);
+        if (id < 0)
+          log += jp + ": unknown bite " + key + " material \"" + nm + "\"\n";
+        else
+          out = (uint16_t)id;
+      };
+      mat("infect", def.bite.infectMat);
+      mat("stain", def.bite.infectStain);
+    }
+  }
+  // How much of an AIM effector's yaw the spine takes (mob.h).
+  def.aimSpineShare = std::clamp(j.value("aimSpineShare", 0.35f), 0.0f, 1.0f);
+  // ---- WORLD-SPACE SIDECAR LENGTHS (DESIGN.md §3b) --------------------
+  // `speed`, `severImpactSpeed`, `gait.rideHeight`, `states[].bodyYOffset`
+  // and clip position keys are WORLD VOXELS (or voxels/sec), not art
+  // units -- so `artVoxelsPerMetre` does not describe them and the art
+  // upsample must not touch them. They still have a scale, though: every
+  // one was authored when the world was 10 voxels/metre, which is what
+  // `sidecarVoxelsPerMetre` writes down.
+  //
+  // Without this, a correctly-sized 1.7 m human walked at half its
+  // authored speed in m/s the moment kVoxelMeters halved -- the body the
+  // right size, moving through the world at the wrong one, against a
+  // stride budget that avatar.cpp:54 already documents as barely
+  // positive.
+  const int sidecarVpm =
+      j.value("sidecarVoxelsPerMetre", kLegacyAuthoringVoxelsPerMetre);
+  const float worldLen =
+      (float)kVoxelsPerMetre / (float)(sidecarVpm > 0 ? sidecarVpm
+                                                     : kVoxelsPerMetre);
+  def.speed = j.value("speed", 4.0f) * worldLen;
+  // Optional AI profile, BY NAME (assets/mobs/behaviors.json). Absent means
+  // "no AI": the creature keeps the wander-and-avoid DecideIntent has always
+  // had, so adding this system changed nothing about any existing sidecar.
+  def.behavior = j.value("behavior", std::string());
+  // The pose held while pursuing, BY NAME, resolved against this rig's own
+  // clips below (MobDef::chaseClip). Absent = the creature chases in
+  // whatever pose it walks in, which is every def but the undead.
+  def.chaseClip = j.value("chaseClip", std::string());
+
+  // Sound slots (assets/sound_schema.js). Presentation only, so a bad entry
+  // is skipped rather than failing the def — a mob with a typo'd sound name
+  // should still walk into the world, silently.
+  def.sounds.clear();
+  if (j.contains("sounds") && j["sounds"].is_object())
+    for (auto& [slot, name] : j["sounds"].items())
+      if (name.is_string() && !name.get<std::string>().empty())
+        def.sounds[slot] = name.get<std::string>();
+
+  // Declared here rather than below the limb loop: the art-scale block that
+  // follows can fail a def outright (a scale that admits no integer
+  // skinScale), and that has to reach the same `ok` the limb checks use.
+  bool ok = true;
+
+  // ---- ART SCALE (DESIGN.md §3b) ------------------------------------------
+  //
+  // `artVoxelsPerMetre` is the authored fact; `skinScale` is DERIVED from it
+  // and the engine's kVoxelsPerMetre. See MobDef::artVoxelsPerMetre for why
+  // the direction matters — authoring skinScale directly encoded "and the
+  // world is 10 cm" into every sidecar, so the human halved in metres the
+  // moment kVoxelMeters did.
+  //
+  // "skinScale"/"scale" survive as LEGACY: they said art voxels per WORLD
+  // voxel, and every asset that used them was authored at 10 voxels/metre, so
+  // that is the reading they get. Loud, because a modded asset silently
+  // assumed to be 10 vox/m is exactly the failure this replaces.
+  if (j.contains("artVoxelsPerMetre")) {
+    def.artVoxelsPerMetre = j.value("artVoxelsPerMetre", 0);
+  } else {
+    const bool authoredSkin = j.contains("skinScale");
+    const uint32_t legacy = j.value("skinScale", j.value("scale", 1u));
+    def.artVoxelsPerMetre = (int)legacy * kLegacyAuthoringVoxelsPerMetre;
+    log += jp + ": no \"artVoxelsPerMetre\"; reading legacy " +
+           std::string(authoredSkin ? "skinScale" : "scale") + " " +
+           std::to_string(legacy) + " as " +
+           std::to_string(def.artVoxelsPerMetre) +
+           " art voxels/metre (authored at " +
+           std::to_string(kLegacyAuthoringVoxelsPerMetre) +
+           " voxels/metre). Declare artVoxelsPerMetre to be explicit.\n";
+  }
+
+  if (def.artVoxelsPerMetre <= 0) {
+    log += jp + ": artVoxelsPerMetre must be positive (got " +
+           std::to_string(def.artVoxelsPerMetre) + ") — using " +
+           std::to_string(kVoxelsPerMetre) + " (art is 1:1 with world)\n";
+    def.artVoxelsPerMetre = kVoxelsPerMetre;
+    ok = false;
+  }
+
+  // Art coarser than the world has no integer skinScale, so replicate the
+  // grid until it does. Lossless, and it costs u^3 voxels — but it is the
+  // only way a 10 vox/m asset can hold its metre size in a 20 vox/m world
+  // without being redrawn.
+  def.artUpsample = NeededArtUpsample(def.artVoxelsPerMetre);
+  def.skinScale =
+      SkinScaleFor(def.artVoxelsPerMetre * (int)def.artUpsample);
+  if (def.skinScale != 1 && def.skinScale != 2 && def.skinScale != 4 &&
+      def.skinScale != 8) {
+    log += jp + ": artVoxelsPerMetre " +
+           std::to_string(def.artVoxelsPerMetre) + " gives skinScale " +
+           std::to_string(def.skinScale) + " at " +
+           std::to_string(kVoxelsPerMetre) +
+           " world voxels/metre, which must be 1, 2, 4 or 8 — the art scale "
+           "has to be a power-of-two multiple of the world scale. Using 1; "
+           "this mob will be the wrong physical size.\n";
+    def.skinScale = 1;
+    def.artUpsample = 1;
+    ok = false;
+  }
+  // ---- WHAT IS UNDER THE SKIN (game/anatomy_resolve.h) -------------------
+  // From the RESOLVED sidecar, so `extends` and `effects` reach it: a
+  // character inherits the human's recipe the way it inherits the human's
+  // clips, and a `skeletal` effect is a patch rather than a second body.
+  //
+  // HERE, and not below the upsample: depth is counted in ART voxels, and a
+  // block-replicated 2x body would measure every layer twice as thick. After
+  // the palette merge, because that renumbers `color` and this clears it.
+  if (j.contains("anatomy"))
+    anatomy::Resolve(def.prefab, j["anatomy"], mats, jp, log);
+
+  if (def.artUpsample > 1) {
+    UpsamplePrefab(def.prefab, def.artUpsample);
+    log += def.name + ": art is " + std::to_string(def.artVoxelsPerMetre) +
+           " vox/m in a " + std::to_string(kVoxelsPerMetre) +
+           " vox/m world — block-replicated " +
+           std::to_string(def.artUpsample) + "x to skinScale " +
+           std::to_string(def.skinScale) + " (same size, no new detail)\n";
+  }
+
+  for (auto& l : j.value("limbs", json::array())) {
+    MobLimbDef ld;
+    ld.name = l.value("name", "");
+    ld.parent = l.value("parent", "");
+    std::string jt = l.value("joint", "ball");
+    ld.joint = jt == "fixed" ? Physics::JointType::Fixed
+               : jt == "hinge" ? Physics::JointType::Hinge
+                               : Physics::JointType::Ball;
+    ld.hp = l.value("hp", 20.0f);
+    ld.severable = l.value("severable", true);
+    ld.vital = l.value("vital", false);
+    ld.swingAmp = l.value("swingAmp", 0.0f);
+    ld.swingPhase = l.value("swingPhase", 0.0f);
+    ld.tag = l.value("tag", "");
+    // absent severImpactSpeed = "never severs on impact alone"
+    ld.severImpactSpeed = l.value("severImpactSpeed", 0.0f) * worldLen;
+    // A cutting edge: the segment this part cuts along, in its own local
+    // frame. Authored in MICRO units along an axis of the part's model box;
+    // converted to world voxels below, with the anchors.
+    if (l.contains("edge") && l["edge"].is_object()) {
+      const json& e = l["edge"];
+      Vec3 ax{0, 0, 1};
+      if (e.contains("axis") && e["axis"].size() == 3)
+        ax = {e["axis"][0].get<float>(), e["axis"][1].get<float>(),
+              e["axis"][2].get<float>()};
+      // The .vox scene is Z-up and the engine is Y-up (voxload.cpp), so an
+      // axis authored up the model's +Z is the engine's +Y. Mapping it here
+      // means the sidecar can speak the art's coordinates, which is what the
+      // generator that wrote them was thinking in.
+      Vec3 axEngine{ax.x, ax.z, -ax.y};
+      ld.hasEdge = true;
+      ld.edgeFrom = axEngine * e.value("from", 0.0f);
+      ld.edgeTo = axEngine * e.value("to", 0.0f);
+      ld.edgeHalfWidth = e.value("halfWidth", 1.0f);
+      // The flat, through the same axis map. A DIRECTION, so it takes no
+      // art-to-world scaling below; orthogonalized against the edge so two
+      // nearly-perpendicular authored axes cannot shear the roll.
+      if (e.contains("flat") && e["flat"].size() == 3) {
+        Vec3 fl{e["flat"][0].get<float>(), e["flat"][1].get<float>(),
+                e["flat"][2].get<float>()};
+        Vec3 flEngine{fl.x, fl.z, -fl.y};
+        const Vec3 along = axEngine.normalized();
+        flEngine = flEngine - along * along.dot(flEngine);
+        if (flEngine.len() > 1e-4f) {
+          ld.edgeFlat = flEngine.normalized();
+          ld.hasEdgeFlat = true;
+        }
+      }
+    }
+    if (l.contains("spring") && l["spring"].is_object()) {
+      ld.hasSpring = true;
+      ld.spring.halflife = l["spring"].value("halflife", 0.15f);
+      ld.spring.gain = l["spring"].value("gain", 1.0f);
+      ld.spring.maxAngle = l["spring"].value("maxAngle", 0.7f);
+    }
+    if (l.contains("axis") && l["axis"].size() == 3)
+      ld.axis = {l["axis"][0].get<float>(), l["axis"][1].get<float>(),
+                 l["axis"][2].get<float>()};
+    ld.minAngle = l.value("minAngle", -1.2f);
+    ld.maxAngle = l.value("maxAngle", 1.2f);
+    // Ball-joint cone, by TAG. Every rig in the tree already tags its parts
+    // ("spine", "leg", "arm", ...) for the gait and the IK chains, so the
+    // tag is the authoring surface that already exists — a per-limb angle in
+    // every sidecar would be five files restating the same anatomy. A limb
+    // that wants something else says so and overrides.
+    {
+      const JointLimits jl = DefaultJointLimits(ld.tag);
+      const float cone = l.value("cone", jl.fwd);
+      ld.coneFwd = cone;
+      // "coneSide" defaults to "cone" when only the one number is authored,
+      // so `"cone": 0.5` means a plain symmetric cone and nothing surprising
+      // leaks in from the tag table.
+      ld.coneSide = l.value("coneSide", l.contains("cone") ? cone : jl.side);
+      ld.twistLimit = l.value("twist", jl.twist);
+      ld.jointFriction = l.value("jointFriction", jl.friction);
+    }
+    // Pose-space range of motion. Deliberately NOT folded into the "cone"
+    // block above: that one is a Jolt constraint on a dynamic body and this
+    // one bounds the animated pose, and conflating them is exactly the
+    // confusion that let an IK-driven thigh swing to any angle it liked while
+    // a perfectly good-looking ragdoll limit sat in the same sidecar. Degrees
+    // in, radians out, like `edge` converts its units at the same point.
+    if (l.contains("poseLimit") && l["poseLimit"].is_object()) {
+      const json& pl = l["poseLimit"];
+      const float kDeg = 3.14159265f / 180.0f;
+      auto vec3 = [&](const char* key, Vec3 dflt) {
+        if (!pl.contains(key) || pl[key].size() != 3) return dflt;
+        return Vec3{pl[key][0].get<float>(), pl[key][1].get<float>(),
+                    pl[key][2].get<float>()};
+      };
+      // BALL FORM (a shoulder): bounded by where the bone may POINT, not by
+      // one rotation component. Selected by the presence of `bone`, because
+      // the bone direction is the thing the axis form has no use for and the
+      // ball form cannot work without.
+      if (pl.contains("bone")) {
+        PoseBallLimit& b = ld.poseBall;
+        b.has = true;
+        b.bone = vec3("bone", {0, -1, 0});
+        if (b.bone.len() < 1e-5f) {
+          log += jp + ": limb \"" + ld.name + "\" poseLimit.bone is zero\n";
+          ok = false;
+        } else {
+          b.bone = b.bone.normalized();
+        }
+        if (pl.contains("reach") && pl["reach"].is_array()) {
+          for (const json& r : pl["reach"]) {
+            if (b.reachCount >= 2) {
+              log += jp + ": limb \"" + ld.name +
+                     "\" poseLimit.reach takes at most 2 planes (see "
+                     "PoseBallLimit in anim.h)\n";
+              ok = false;
+              break;
+            }
+            Vec3 nrm{0, 0, 1};
+            if (r.contains("normal") && r["normal"].size() == 3)
+              nrm = {r["normal"][0].get<float>(), r["normal"][1].get<float>(),
+                     r["normal"][2].get<float>()};
+            if (nrm.len() < 1e-5f) {
+              log += jp + ": limb \"" + ld.name +
+                     "\" poseLimit.reach normal is zero\n";
+              ok = false;
+              continue;
+            }
+            nrm = nrm.normalized();
+            // The closed-form projection is only the NEAREST legal direction
+            // when the planes are perpendicular; a tilted pair would be
+            // solved wrong and look almost right, so it is a load error.
+            if (b.reachCount == 1 &&
+                std::fabs(nrm.dot(b.reachNormal[0])) > 1e-3f) {
+              log += jp + ": limb \"" + ld.name +
+                     "\" poseLimit.reach normals must be perpendicular\n";
+              ok = false;
+            }
+            b.reachNormal[b.reachCount] = nrm;
+            // "at most N degrees past this plane" — the plane itself is 0.
+            b.reachSin[b.reachCount] =
+                std::sin(std::clamp(r.value("max", 0.0f), -90.0f, 90.0f) *
+                         kDeg);
+            b.reachCount++;
+          }
+        }
+        if (pl.contains("twist") && pl["twist"].is_object()) {
+          b.hasTwist = true;
+          b.twistMin = pl["twist"].value("min", -180.0f) * kDeg;
+          b.twistMax = pl["twist"].value("max", 180.0f) * kDeg;
+          if (b.twistMin > b.twistMax) std::swap(b.twistMin, b.twistMax);
+        }
+      } else {
+        ld.hasPoseLimit = true;
+        ld.poseAxis = vec3("axis", ld.poseAxis);
+        ld.poseMin = pl.value("min", -180.0f) * kDeg;
+        ld.poseMax = pl.value("max", 180.0f) * kDeg;
+        if (ld.poseMin > ld.poseMax) std::swap(ld.poseMin, ld.poseMax);
+        // A hinge is one DOF, not one bounded DOF: it also discards the
+        // off-axis swing (anim.h, AnimPart::poseHinge).
+        ld.poseHinge = pl.value("hinge", false);
+      }
+    }
+    if (l.contains("anchor") && l["anchor"].size() == 3) {
+      ld.anchor = {l["anchor"][0].get<float>(), l["anchor"][1].get<float>(),
+                   l["anchor"][2].get<float>()};
+      ld.anchorAuto = false;
+    }
+    if (FindModel(def.prefab, ld.name) < 0) {
+      log += jp + ": limb \"" + ld.name + "\" has no .vox model of that name\n";
+      ok = false;
+    }
+    if (ld.name == root) def.rootLimb = (int)def.limbs.size();
+    def.limbs.push_back(std::move(ld));
+  }
+  if (def.rootLimb < 0) {
+    log += jp + ": root \"" + root + "\" is not a limb\n";
+    ok = false;
+  }
+  for (auto& ld : def.limbs) {
+    if ((int)(&ld - def.limbs.data()) == def.rootLimb) continue;
+    bool found = false;
+    for (auto& p : def.limbs) found |= p.name == ld.parent;
+    if (!found) {
+      log += jp + ": limb \"" + ld.name + "\" parent \"" + ld.parent +
+             "\" not found\n";
+      ok = false;
+    }
+  }
+  // Derive the COLLIDER resolution from the art (mob.h MobDef::physScale).
+  //
+  // DebrisVoxel is int8, so a limb's collider box must fit ±120 on every
+  // axis. The skin has no such bound (PrefabVoxel is int16), which is the
+  // whole point of the split: pick the finest collider that fits BOTH the
+  // int8 bound and the kMaxPhysScale cost ceiling (mob.h), and let the skin
+  // stay as fine as it was authored. Mina at skinScale 8 lands on physScale
+  // 4: her 68-skin-voxel hips would fit ±120 at 8, but an 8× collider is 8×
+  // the boxes for no gain a player can feel.
+  //
+  // Measured on the largest limb, not the whole rig: each limb is its own
+  // body with its own origin, so the bound applies per limb.
+  {
+    int32_t maxExtent = 0;
+    for (const PrefabModel& m : def.prefab.models)
+      maxExtent = std::max(
+          {maxExtent, m.size.x, m.size.y, m.size.z});
+    def.physScale = 1;
+    for (uint32_t cand : {8u, 4u, 2u, 1u}) {
+      if (cand > def.skinScale) continue;  // never finer than the art
+      if (cand > kMaxPhysScale) continue;  // physics cost ceiling, below
+      // Extents are in skin units; a collider voxel spans skinScale/cand of
+      // them, so the collider box is maxExtent * cand / skinScale.
+      if ((int64_t)maxExtent * cand / def.skinScale <= 120) {
+        def.physScale = cand;
+        break;
+      }
+    }
+    // Even physScale 1 can overflow if a limb is over 120 WORLD voxels —
+    // that is a genuine authoring error, not something to derive around.
+    if ((int64_t)maxExtent * def.physScale / def.skinScale > 120) {
+      for (const PrefabModel& m : def.prefab.models)
+        if (m.size.x > 120 || m.size.y > 120 || m.size.z > 120) {
+          log += def.name + ": limb model \"" + m.name + "\" is " +
+                 std::to_string(m.size.x) + "x" + std::to_string(m.size.y) +
+                 "x" + std::to_string(m.size.z) +
+                 (def.skinScale > 1
+                      ? " SKIN voxels (= " +
+                            std::to_string(m.size.y / def.skinScale) +
+                            " world voxels tall at skinScale " +
+                            std::to_string(def.skinScale) +
+                            "); even a 1:1 collider exceeds the DebrisVoxel "
+                            "int8 bound of 120 world voxels\n"
+                      : " voxels, exceeding the int8 bound of 120\n");
+          ok = false;
+        }
+    }
+    // Log the pick ALWAYS, not only when it is surprising. Collider
+    // resolution is emergent from art size, and an emergent value that
+    // changes mass, contacts and ground probes must never move silently —
+    // this line is the record that it did.
+    if (ok && def.skinScale > 1)
+      log += def.name + ": skinScale " + std::to_string(def.skinScale) +
+             ", derived physScale " + std::to_string(def.physScale) +
+             " (largest limb " + std::to_string(maxExtent) +
+             " skin voxels -> " +
+             std::to_string(maxExtent * def.physScale / def.skinScale) +
+             " collider voxels, bound 120)\n";
+  }
+
+  // ---- rig for the animation runtime (all of this is optional data) ----
+  if (ok && !TopoSortLimbs(def.limbs, def.rootLimb)) {
+    log += jp + ": limb hierarchy has a cycle\n";
+    ok = false;
+  }
+  if (ok) {
+    AnimSkeleton& sk = def.skel;
+    sk.parts.resize(def.limbs.size());
+    for (size_t i = 0; i < def.limbs.size(); i++) {
+      const MobLimbDef& ld = def.limbs[i];
+      AnimPart& p = sk.parts[i];
+      p.name = ld.name;
+      p.tag = ld.tag;
+      p.parent = -1;
+      if ((int)i != def.rootLimb)
+        for (size_t k = 0; k < def.limbs.size(); k++)
+          if (def.limbs[k].name == ld.parent) p.parent = (int)k;
+      p.axis = ld.axis;
+      p.swingAmp = ld.swingAmp;
+      p.swingPhase = ld.swingPhase;
+      p.hasSpring = ld.hasSpring;
+      p.spring = ld.spring;
+      p.hasPoseLimit = ld.hasPoseLimit;
+      p.poseAxis = ld.poseAxis;
+      p.poseMin = ld.poseMin;
+      p.poseMax = ld.poseMax;
+      p.poseHinge = ld.poseHinge;
+      p.poseBall = ld.poseBall;
+    }
+    // rest transforms come from the .vox layout: a part's local rest
+    // position is its joint anchor relative to the parent's anchor.
+    for (size_t i = 0; i < def.limbs.size(); i++) {
+      const MobLimbDef& ld = def.limbs[i];
+      int mi = FindModel(def.prefab, ld.name);
+      // TWO LATTICES MEET HERE, and they are not the same one after an art
+      // upsample (DESIGN.md §3b). `ld.anchor` is AUTHORED, so it is in the
+      // sidecar's original art grid; AutoAnchor and the root fallback are
+      // DERIVED FROM def.prefab, which UpsamplePrefab may have multiplied by
+      // artUpsample. Dividing both by skinScale would put every authored
+      // joint of an upsampled rig at 1/artUpsample of its intended offset —
+      // a rig that collapses toward its own origin, with the art still
+      // looking perfectly correct.
+      //
+      // ArtToWorld() divides the upsample back out; the derived branches take
+      // the plain skin->world divisor. They agree exactly when artUpsample
+      // is 1, which is every asset that has not been redrawn coarser than
+      // the world.
+      Vec3 anchor = ld.anchor;
+      float aInv = def.ArtToWorld();
+      const float prefabInv = 1.0f / (float)def.skinScale;
+      if (ld.anchorAuto && (int)i != def.rootLimb) {
+        int pmi = FindModel(def.prefab, ld.parent);
+        if (mi >= 0 && pmi >= 0) {
+          anchor = AutoAnchor(def.prefab.models[mi], def.prefab.models[pmi]);
+          aInv = prefabInv;
+        }
+      } else if ((int)i == def.rootLimb && mi >= 0) {
+        const PrefabModel& m = def.prefab.models[mi];
+        anchor = Vec3{(float)m.offset.x + m.size.x * 0.5f, (float)m.offset.y,
+                      (float)m.offset.z + m.size.z * 0.5f};
+        aInv = prefabInv;
+      }
+      // SKIN -> WORLD. Anchors are authored in .vox coordinates, which at
+      // skinScale>1 are SKIN units — this is the ART's lattice, so it is
+      // skinScale here and NOT physScale. (The collider frame conversion is
+      // the one in CarveLimb, which multiplies by physScale; confusing the
+      // two shifts every joint in the rig without changing anything visible
+      // about the art, which is why they are commented at both ends.)
+      //
+      // The rig, the gait and the physics all work in world voxels.
+      // Converting HERE, once, is what keeps every downstream stage
+      // (AnimFlatten, IK, GroundHeightAt, the joint anchors in Spawn)
+      // completely scale-unaware.
+      sk.parts[i].anchorLocal = anchor * aInv;
+      // The cutting edge rides the same conversion, for the same reason: it
+      // is rig geometry, and every consumer downstream works in world
+      // voxels. Its offsets are measured from the part's own ORIGIN (the
+      // model's min corner), so they need no anchor rebasing here — the
+      // melee sweep composes them with the part transform, which already
+      // carries the origin.
+      MobLimbDef& mld = def.limbs[i];
+      if (mld.hasEdge) {
+        // Always authored, so always the art-frame divisor.
+        const float eInv = def.ArtToWorld();
+        mld.edgeFrom = mld.edgeFrom * eInv;
+        mld.edgeTo = mld.edgeTo * eInv;
+        mld.edgeHalfWidth *= eInv;
+      }
+      // THE BONE: from the joint anchor to the limb's own centre, in the
+      // rest pose. This is the centre line of the ball joint's swing cone
+      // (mob.h MobLimbDef::boneAxis), and it is derived from the same two
+      // pieces of rig geometry the pose pipeline uses rather than authored,
+      // for the same reason the anchor is not restated per consumer: a cone
+      // centred anywhere but the rest direction parks the limb against its
+      // own limit while it is still standing.
+      //
+      // It is normalised, so a common scale would cancel — but the two terms
+      // do NOT share one after an art upsample: `centre` is measured off the
+      // (possibly replicated) prefab and `anchor` may be authored in the
+      // original grid. Convert each with its own divisor first; when
+      // artUpsample is 1 they are the same number and this is the old
+      // expression exactly.
+      if ((int)i != def.rootLimb && mi >= 0) {
+        const PrefabModel& m = def.prefab.models[mi];
+        const Vec3 centre{(float)m.offset.x + m.size.x * 0.5f,
+                          (float)m.offset.y + m.size.y * 0.5f,
+                          (float)m.offset.z + m.size.z * 0.5f};
+        const Vec3 bone = centre * prefabInv - anchor * aInv;
+        // A limb whose centre IS its anchor (a ball-shaped head sat exactly
+        // on the neck) has no direction to speak of; straight down is the
+        // rig-neutral guess and the cone stays symmetric about it.
+        mld.boneAxis = bone.len() > 1e-4f ? bone.normalized() : Vec3{0, -1, 0};
+      }
+    }
+    for (size_t i = 0; i < def.limbs.size(); i++) {
+      int par = sk.parts[i].parent;
+      sk.parts[i].rest.pos =
+          par >= 0 ? sk.parts[i].anchorLocal - sk.parts[par].anchorLocal
+                   : sk.parts[i].anchorLocal;
+    }
+
+    // ---- sockets: where a held ITEM attaches (mob.h MobSocketDef) --------
+    //
+    // Parsed after the limbs because a socket names the part it rides and is
+    // resolved to an index here — a socket on a part that does not exist is
+    // a loud diagnostic, never a silent no-op, since the failure mode it
+    // guards against is an item that renders at the origin instead of in the
+    // hand.
+    //
+    // Offsets take the SAME skin -> world conversion the anchors just did,
+    // and for the same reason: everything downstream works in world voxels.
+    // Authored, so it is the art-frame divisor (ArtToWorld), not the raw
+    // 1/skinScale — see the two-lattices note at the anchors above.
+    {
+      const float inv = def.ArtToWorld();
+      for (const auto& s : j.value("sockets", json::array())) {
+        MobSocketDef sd;
+        sd.name = s.value("name", "");
+        sd.part = s.value("part", "");
+        if (sd.name.empty() || sd.part.empty()) {
+          log += jp + ": socket needs both \"name\" and \"part\"\n";
+          continue;
+        }
+        sd.partIndex = sk.FindPart(sd.part);
+        if (sd.partIndex < 0) {
+          log += jp + ": socket \"" + sd.name + "\" names part \"" + sd.part +
+                 "\", which is not a limb of this rig\n";
+          continue;
+        }
+        if (s.contains("offset") && s["offset"].size() == 3)
+          sd.offset = Vec3{s["offset"][0].get<float>(),
+                           s["offset"][1].get<float>(),
+                           s["offset"][2].get<float>()} * inv;
+        if (s.contains("rotation") && s["rotation"].size() == 3)
+          sd.rotation = QuatFromEulerDeg({s["rotation"][0].get<float>(),
+                                          s["rotation"][1].get<float>(),
+                                          s["rotation"][2].get<float>()});
+        def.sockets.push_back(std::move(sd));
+      }
+    }
+
+    // ---- NATURAL WEAPONS: the parts that ARE weapons (mob.h; plan §3) ----
+    //
+    // Beside the sockets, and parsed the same way and for the same reasons:
+    // both name a rig part and resolve it to an index HERE, so a block
+    // naming a part this rig does not have is a loud diagnostic rather than
+    // a creature that swings nothing.
+    //
+    // THE EDGE IS TWO POINTS IN THE PART'S OWN ART FRAME — the Y-up,
+    // origin-at-the-model's-min-corner frame `MobLimbDef::edgeFrom/edgeTo`
+    // are stored in, converted by `ArtToWorld()` on the line below exactly
+    // as those are. It does NOT take MobLimbDef's scene-axis map (`axis`
+    // with its (x, z, -y) swizzle), because that block authors an OFFSET
+    // ALONG ONE MODEL AXIS from a hilt, and a part has no hilt: a fist's
+    // edge runs from the wrist down and forward to the knuckles, which is
+    // not a multiple of any one axis. Two points is the honest shape, and it
+    // is the frame the Models tab already draws an item edge in.
+    {
+      const float inv = def.ArtToWorld();
+      auto point = [&](const json& v, Vec3 dflt) {
+        if (v.is_array() && v.size() == 3 && v[0].is_number() &&
+            v[1].is_number() && v[2].is_number())
+          return Vec3{v[0].get<float>(), v[1].get<float>(),
+                      v[2].get<float>()};
+        return dflt;
+      };
+      for (const auto& w : j.value("natural", json::array())) {
+        if (!w.is_object()) continue;
+        MobNaturalWeaponDef nw;
+        nw.name = w.value("name", "");
+        nw.part = w.value("part", "");
+        if (nw.name.empty() || nw.part.empty()) {
+          log += jp + ": a natural weapon needs both \"name\" and \"part\"\n";
+          continue;
+        }
+        nw.partIndex = sk.FindPart(nw.part);
+        if (nw.partIndex < 0) {
+          log += jp + ": natural weapon \"" + nw.name + "\" names part \"" +
+                 nw.part + "\", which is not a limb of this rig\n";
+          continue;
+        }
+        const json e = w.contains("edge") && w["edge"].is_object()
+                           ? w["edge"]
+                           : json::object();
+        nw.edgeFrom = point(e.contains("from") ? e["from"] : json(), {}) * inv;
+        nw.edgeTo = point(e.contains("to") ? e["to"] : json(), {}) * inv;
+        nw.edgeHalfWidth = e.value("halfWidth", 1.0f) * inv;
+        // A ZERO-LENGTH EDGE IS NOT A WEAPON. The sweep is a segment from
+        // last tick's position to this one; with from == to there is no
+        // blade to sweep, the melee driver's blade direction is undefined,
+        // and the only symptom would be a creature that punches and never
+        // connects. Same refusal `LoadAttackStyles` gives a cut that travels
+        // nowhere, and the `mob` gate asserts it independently.
+        if ((nw.edgeTo - nw.edgeFrom).len() < 1e-4f) {
+          log += jp + ": natural weapon \"" + nw.name +
+                 "\" has a degenerate edge (from == to) — skipped\n";
+          continue;
+        }
+        if (const json& s2 = w.contains("strike") ? w["strike"] : json();
+            s2.is_object()) {
+          nw.strike.cut = s2.value("cut", 0.0f);
+          nw.strike.blunt = s2.value("blunt", 0.0f);
+          nw.strike.bluntCarve = s2.value("bluntCarve", 0.0f);
+          nw.strike.armorBreak = s2.value("armorBreak", 0.0f);
+          nw.strike.bite = s2.value("bite", 0.0f);
+        }
+        if (!nw.strike.Any())
+          log += jp + ": natural weapon \"" + nw.name +
+                 "\" has no cut, blunt or bite — it will hit for nothing\n";
+        if (def.FindNatural(nw.name) >= 0)
+          log += jp + ": duplicate natural weapon \"" + nw.name +
+                 "\" — last wins\n";
+        def.natural.push_back(std::move(nw));
+      }
+    }
+
+    if (j.contains("gait") && j["gait"].is_object()) {
+      const json& g = j["gait"];
+      GaitDef& gd = sk.gait;
+      gd.present = true;
+      gd.cadence = g.value("cadence", 2.2f);
+      gd.strideBias = g.value("strideBias", 0.35f);
+      gd.leadTime = g.value("leadTime", 0.2f);
+      gd.stepThreshold = g.value("stepThreshold", 0.6f);
+      gd.stepDuration = g.value("stepDuration", 0.22f);
+      gd.stepHeight = g.value("stepHeight", 0.25f);
+      // World voxels: a per-rig trim of about one cell at the authored
+      // scale, so it has to follow the scale or the rig sinks.
+      gd.rideHeight = g.value("rideHeight", 0.9f) * worldLen;
+      gd.bobAmp = g.value("bobAmp", 0.06f);
+      gd.bobFreqMul = g.value("bobFreqMul", 2.0f);
+      gd.swayAmp = g.value("swayAmp", 0.05f);
+      gd.rollAmp = g.value("rollAmp", 0.09f);
+      gd.spineCounter = g.value("spineCounter", 0.7f);
+      gd.phaseLag = g.value("phaseLag", 0.05f);
+      for (const auto& grp : g.value("groups", json::array())) {
+        std::vector<int> members;
+        for (const auto& nm : grp) {
+          int pi = sk.FindPart(nm.get<std::string>());
+          if (pi >= 0) members.push_back(pi);
+          else log += jp + ": gait group names unknown part \"" +
+                      nm.get<std::string>() + "\"\n";
+        }
+        if (!members.empty()) gd.groups.push_back(std::move(members));
+      }
+    }
+
+    // Steering limits (anim.h LocomotionDef). Absent = the defaults, which
+    // are tuned for a humanoid; every field is optional so an existing
+    // sidecar keeps working untouched.
+    if (j.contains("locomotion") && j["locomotion"].is_object()) {
+      const json& l = j["locomotion"];
+      LocomotionDef& ld = sk.loco;
+      ld.turnRate = l.value("turnRate", ld.turnRate);
+      ld.turnAccel = l.value("turnAccel", ld.turnAccel);
+      ld.driveAlignFull = l.value("driveAlignFull", ld.driveAlignFull);
+      ld.driveAlignZero = l.value("driveAlignZero", ld.driveAlignZero);
+      ld.turnRateMoving = l.value("turnRateMoving", ld.turnRateMoving);
+      // Terrain budgets, authored in metres (anim.h). Absent = the player's
+      // own numbers, which is the point: a creature that cannot walk what the
+      // player walks reads as broken rather than as different.
+      ld.stepUpM = l.value("stepUpM", ld.stepUpM);
+      ld.stepDownM = l.value("stepDownM", ld.stepDownM);
+      ld.headroomM = l.value("headroomM", ld.headroomM);
+      ld.tiltMaxDeg = l.value("tiltMaxDeg", ld.tiltMaxDeg);
+      // Personal space. A MULTIPLE of the two bodies' own footprint radii,
+      // not metres — see the note in anim.h for why this one budget is not
+      // authored the way the terrain ones above it are.
+      ld.spacingMul = l.value("spacingMul", ld.spacingMul);
+      ld.crowdPush = l.value("crowdPush", ld.crowdPush);
+      if (ld.spacingMul < 0) ld.spacingMul = 0;
+      ld.crowdPush = std::clamp(ld.crowdPush, 0.0f, 1.0f);
+      // A zero-width align band would divide by zero in the drive scale.
+      if (ld.driveAlignZero <= ld.driveAlignFull)
+        ld.driveAlignZero = ld.driveAlignFull + 1e-3f;
+      if (ld.turnRate < 0) ld.turnRate = 0;
+      if (ld.stepUpM < 0) ld.stepUpM = 0;
+      if (ld.stepDownM < 0) ld.stepDownM = 0;
+      if (ld.tiltMaxDeg < 0) ld.tiltMaxDeg = 0;
+    }
+
+    for (const auto& c : j.value("chains", json::array())) {
+      IkChain ch;
+      ch.tag = c.value("tag", "");
+      ch.pole = JsonVec3(c.contains("pole") ? c["pole"] : json(), {0, 0, 1});
+      std::string solver = c.value("solver", "twobone");
+      ch.solver = IkSolver::TwoBone;
+      if (solver != "twobone")
+        log += jp + ": chain solver \"" + solver +
+               "\" unsupported, using twobone\n";
+      for (const auto& nm : c.value("parts", json::array())) {
+        int pi = sk.FindPart(nm.get<std::string>());
+        if (pi >= 0) ch.parts.push_back(pi);
+        else log += jp + ": chain names unknown part \"" +
+                    nm.get<std::string>() + "\"\n";
+      }
+      std::string eff = c.value("effector", "");
+      ch.effector = eff.empty() ? (ch.parts.empty() ? -1 : ch.parts.back())
+                                : sk.FindPart(eff);
+      if (ch.parts.size() >= 2 && ch.effector >= 0) sk.chains.push_back(std::move(ch));
+      else log += jp + ": chain \"" + ch.tag + "\" needs >=2 parts + effector\n";
+    }
+
+    // Dismemberment locomotion states. Authored order IS the priority
+    // order (first match wins), so the array form is deliberate — an object
+    // would let the JSON library reorder the rules.
+    for (const auto& s : j.value("states", json::array())) {
+      AnimStateRule rule;
+      rule.name = s.value("name", "");
+      auto partList = [&](const char* key, std::vector<int>& out) {
+        for (const auto& nm : s.value(key, json::array())) {
+          int pi = sk.FindPart(nm.get<std::string>());
+          if (pi >= 0) out.push_back(pi);
+          else log += jp + ": state \"" + rule.name +
+                      "\" names unknown part \"" + nm.get<std::string>() + "\"\n";
+        }
+      };
+      partList("missing", rule.missingAll);
+      partList("missingAny", rule.missingAnyOf);
+      rule.minChainsLost = s.value("minChainsLost", 0);
+      rule.clip = s.value("clip", "");
+      rule.speedScale = s.value("speedScale", 1.0f);
+      // Read AFTER speedScale so its default can BE speedScale (anim.h).
+      rule.lungeScale = s.value("lungeScale", rule.speedScale);
+      rule.disableGait = s.value("disableGait", false);
+      rule.bodyYOffset = s.value("bodyYOffset", 0.0f) * worldLen;
+      rule.groundAlign =
+          std::clamp(s.value("groundAlign", 0.0f), 0.0f, 1.0f);
+      // A prone state that still lets the gait run would have the foot plane
+      // and the ground plane both claiming the body height. Say so rather
+      // than letting whichever ran last win.
+      if (rule.groundAlign > 0.0f && !rule.disableGait)
+        log += jp + ": state \"" + rule.name +
+               "\" sets groundAlign without disableGait; the gait's foot "
+               "plane will fight the ground fit\n";
+      if (rule.missingAll.empty() && rule.missingAnyOf.empty() &&
+          rule.minChainsLost <= 0)
+        log += jp + ": state \"" + rule.name +
+               "\" has an empty predicate and will never match\n";
+      sk.states.push_back(std::move(rule));
+    }
+
+    // NB: bind the object to a named local. `j.value(k, json::object())`
+    // returns a TEMPORARY; iterating begin()/end() off two separate
+    // temporaries yields iterators into different destroyed objects.
+    const json clipsJson =
+        j.contains("clips") && j["clips"].is_object() ? j["clips"] : json::object();
+    for (auto it = clipsJson.begin(); it != clipsJson.end(); ++it) {
+      AnimClip clip;
+      // The sidecar's own clips: a track for a part this rig does not have
+      // is a content error and says so.
+      ParseClipJson(sk, jp, it.key(), it.value(), worldLen, &log, clip);
+      sk.clips.push_back(std::move(clip));
+    }
+
+    // ---- THE SHARED CLIP LIBRARY (assets/anims/*.json) -------------------
+    // Clips authored in the tuner's clip lane and saved OUT of a sidecar so
+    // an attack style can name one (strokes.h AttackStyle::clip) and every
+    // rig with the right part names plays it. Compiled per rig, exactly as
+    // a sidecar clip is, against THIS skeleton's parts; a sidecar clip of
+    // the same name wins, so a rig can still override the library. A
+    // library clip with no track this rig can use is skipped silently — the
+    // library is shared across every creature and a critter has no
+    // "armU.R" — but a clip that fits PARTLY is kept, because that is what
+    // a mask is for.
+    for (const ClipLibraryEntry& le : clipLib) {
+      if (sk.FindClip(le.name) >= 0) continue;
+      AnimClip clip;
+      ParseClipJson(sk, le.path, le.name, le.doc, le.worldLen, nullptr,
+                    clip);
+      if (clip.tracks.empty()) continue;
+      sk.clips.push_back(std::move(clip));
+    }
+
+    // States name clips by string and PlayClip silently no-ops on a miss, so
+    // a typo'd crawl clip would otherwise fail as "the mob just slides".
+    for (const AnimStateRule& rule : sk.states)
+      if (!rule.clip.empty() && sk.FindClip(rule.clip) < 0)
+        log += jp + ": state \"" + rule.name + "\" names unknown clip \"" +
+               rule.clip + "\"\n";
+    // Same reason, one field over: a typo'd chaseClip would present as "the
+    // zombie chases with its arms down", which looks like a decision rather
+    // than a miss. Checked HERE and not at the loader line that reads it,
+    // because the library clips are only on the rig by this point.
+    if (!def.chaseClip.empty() && sk.FindClip(def.chaseClip) < 0)
+      log += jp + ": chaseClip names unknown clip \"" + def.chaseClip +
+             "\"\n";
+
+    const json fbJson = j.contains("flipbooks") && j["flipbooks"].is_object()
+                            ? j["flipbooks"]
+                            : json::object();
+    for (auto it = fbJson.begin(); it != fbJson.end(); ++it) {
+      Flipbook fb;
+      fb.name = it.key();
+      fb.loop = it.value().value("loop", true);
+      for (const auto& f : it.value().value("frames", json::array())) {
+        FlipbookFrame ff;
+        ff.part = sk.FindPart(f.value("part", ""));
+        ff.model = f.value("model", 0);
+        ff.durationMs = f.value("durationMs", 100);
+        if (ff.part >= 0) fb.frames.push_back(ff);
+      }
+      if (!fb.frames.empty()) sk.flipbooks.push_back(std::move(fb));
+    }
+
+    if (!sk.ParentsFirst()) {  // belt and braces: AnimFlatten depends on it
+      log += jp + ": internal error, parts are not parent-before-child\n";
+      ok = false;
+    }
+  }
+
+  // Prefab box in WORLD voxels — the one number the gait/terrain code reads.
+  //
+  // HELD PROPS ARE EXCLUDED. This box is the CREATURE's, not its luggage:
+  // the gait pivot, the avatar's origin, its standing height and the terrain
+  // anchor radius all derive from it (avatar.cpp, and the pivot uses below).
+  // A sword lying in the hand reaches well outside the body, so counting it
+  // here silently re-centres the rig on the weapon — which showed up as the
+  // avatar's walk widening until its legs failed their own upright
+  // assertion, a "leg bug" whose actual cause was the thing it was holding.
+  //
+  // Anything tagged "prop" is therefore measured out. Props still render,
+  // still collide and are still severable; they simply do not define how big
+  // the creature is.
+  {
+    IVec3 lo{INT32_MAX, INT32_MAX, INT32_MAX};
+    IVec3 hi{INT32_MIN, INT32_MIN, INT32_MIN};
+    bool any = false;
+    for (const MobLimbDef& ld : def.limbs) {
+      if (ld.tag == "prop") continue;
+      int mi = FindModel(def.prefab, ld.name);
+      if (mi < 0) continue;
+      const PrefabModel& m = def.prefab.models[mi];
+      lo.x = std::min(lo.x, m.offset.x);
+      lo.y = std::min(lo.y, m.offset.y);
+      lo.z = std::min(lo.z, m.offset.z);
+      hi.x = std::max(hi.x, m.offset.x + m.size.x);
+      hi.y = std::max(hi.y, m.offset.y + m.size.y);
+      hi.z = std::max(hi.z, m.offset.z + m.size.z);
+      any = true;
+    }
+    const Vec3 box =
+        any ? Vec3{(float)(hi.x - lo.x), (float)(hi.y - lo.y),
+                   (float)(hi.z - lo.z)}
+            : Vec3{(float)def.prefab.size.x, (float)def.prefab.size.y,
+                   (float)def.prefab.size.z};
+    // The prefab box is measured in the .vox's own units, which are SKIN
+    // units — so it divides by skinScale to reach world voxels.
+    def.worldSize = box * (1.0f / (float)def.skinScale);
+  }
+
+  // ---- micro brick upload (PLAN §C, sim/microbody.h) ----
+  // Packed once per DEF, shared by every instance: a limb's voxels never
+  // change after load in v1, so there is no per-instance storage at all.
+  // Done last so a def that failed validation never enters the pool.
+  if (ok && def.skinScale > 1) {
+    for (MobLimbDef& ld : def.limbs) {
+      int mi = FindModel(def.prefab, ld.name);
+      if (mi < 0) continue;
+      const PrefabModel& m = def.prefab.models[mi];
+      // The one PURE RENDER read in the loader: the brick is the art, so it
+      // is packed at the authored skin resolution and never at physScale.
+      ld.microModel = MicroBodyPack(micro, m.voxels, m.size, def.skinScale,
+                                    def.name + "/" + ld.name, log,
+                                    MicroBodyCutFaces(def.prefab, mi));
+      if (ld.microModel < 0)
+        log += def.name + ": limb \"" + ld.name +
+               "\" has no micro brick and will not render (the cube path "
+               "would draw it at the wrong scale)\n";
+    }
+  }
+  if (!ok) return false;
+  defOut = std::move(def);
+  return true;
+}
+
 bool LoadMobDefs(const std::string& dir, const std::vector<MaterialDef>& mats,
                  std::vector<MobDef>& out, MicroBodySet& micro,
-                 std::string& log) {
+                 std::string& log,
+                 std::shared_ptr<MobDefFactory>* factoryOut) {
   out.clear();
   // The pool is rebuilt wholesale on every load: model indices are positions in
   // it, so growing an existing pool across a hot reload would leave stale defs
@@ -638,1063 +1743,32 @@ bool LoadMobDefs(const std::string& dir, const std::vector<MaterialDef>& mats,
   std::error_code ec;
   const std::vector<MobSource> sources = CollectMobSources(dir, log, ec);
   if (ec) return true;  // no mob dir: nothing to load
+  auto fac = std::make_shared<MobDefFactory>();
+  fac->dir = dir;
+  fac->mats = mats;
+  fac->sources = sources;
   // The shared clip library lives BESIDE the mob dir (assets/anims/), not in
   // it: it is authored per clip, not per creature, and the tuner writes it
   // through its own /api/model route.
-  const std::vector<ClipLibraryEntry> clipLib = LoadClipLibrary(
+  fac->clipLib = LoadClipLibrary(
       (std::filesystem::path(dir).parent_path() / "anims").string(), log);
 
-  for (const MobSource& src : sources) {
-    // THE SIDECAR IS READ FIRST, because the art merge below is no longer
-    // unconditional: `palette` recolours this def's copy of the art, and the
-    // merge deduplicates by RGB, so the recolour has to be in place before the
-    // fold or the two defs would share the original's slots.
-    const std::string& jp = src.jsonPath;
+  for (const MobSource& src : fac->sources) {
+    // THE SIDECAR IS RESOLVED FIRST, because the art merge inside BuildMobDef
+    // is not unconditional: `palette` recolours this def's copy of the art and
+    // the merge deduplicates by RGB, so the recolour has to be in place before
+    // the fold or two defs would share one set of slots.
     json j;
-    if (!sidecar::Load(dir, jp, j, log)) continue;
-
+    MobSource one = src;
+    if (!sidecar::Load(dir, one.jsonPath, j, log, &one.extendsName)) continue;
     MobDef def;
-    std::string err, warn;
-    if (!LoadVoxFile(src.voxPath, mats.size(), def.prefab, err, warn)) {
-      log += src.voxPath + ": " + err;
-      continue;
-    }
-    log += warn;
-    // Named for the SIDECAR, not for the art: two creatures may wear one .vox
-    // and they are not the same creature. Identical to the old behaviour for
-    // every def that owns its own file, which is all of them but the variants.
-    def.name = src.name;
-
-    if (j.contains("palette"))
-      ApplyPaletteRecolour(j["palette"], def.prefab.artColors, jp, log);
-
-    // Fold this file's art colours into the one palette every def resolves
-    // against, and rewrite its voxels' slots to the merged numbering NOW —
-    // before anything copies them into a limb, a flipbook frame or a micro
-    // brick. Doing it here means exactly one place understands the remap.
-    if (!def.prefab.artColors.empty()) {
-      const std::vector<uint8_t> remap =
-          MicroBodyMergeArt(micro, def.prefab.artColors, def.name, log);
-      for (PrefabModel& pm : def.prefab.models)
-        for (PrefabVoxel& v : pm.voxels)
-          if (v.color) v.color = remap[v.color];
-    }
-
-    std::string root = j.value("root", "");
-    // ---- UNDEAD (MobDef::undead) -------------------------------------------
-    // Read BEFORE `bleed`, because it moves the default `bleed.woundHeals`
-    // lands on and an explicit key in the block below must still win.
-    if (j.contains("undead")) {
-      if (j["undead"].is_boolean()) def.undead = j["undead"].get<bool>();
-      else log += jp + ": undead: expected true or false\n";
-    }
-    if (def.undead) def.woundHeals = false;
-    // ---- BORN BITTEN (MobRotDef) -------------------------------------------
-    if (j.contains("rot")) {
-      const json& r = j["rot"];
-      if (!r.is_object()) {
-        log += jp + ": `rot` is not an object — ignored\n";
-      } else {
-        MobRotDef& rd = def.rot;
-        rd.enabled = r.value("enabled", true);
-        // A [min, max] pair, because a rig whose every limb lost the same
-        // amount reads as a design rather than as damage. A bare number is
-        // accepted and means "exactly this".
-        auto range = [&](const char* key, float& lo, float& hi) {
-          if (!r.contains(key)) return;
-          const json& v = r[key];
-          if (v.is_number()) {
-            lo = hi = v.get<float>();
-          } else if (v.is_array() && v.size() == 2 && v[0].is_number() &&
-                     v[1].is_number()) {
-            lo = v[0].get<float>();
-            hi = v[1].get<float>();
-          } else {
-            log += jp + ": rot." + key +
-                   ": expected a number or [min, max]\n";
-            return;
-          }
-          if (hi < lo) std::swap(lo, hi);
-        };
-        float bl = (float)rd.bitesMin, bh = (float)rd.bitesMax;
-        range("bites", bl, bh);
-        rd.bitesMin = std::max(0, (int)std::lround(bl));
-        rd.bitesMax = std::max(rd.bitesMin, (int)std::lround(bh));
-        range("radius", rd.radiusMin, rd.radiusMax);
-        rd.radiusMin = std::clamp(rd.radiusMin, 0.0f, 2.0f);
-        rd.radiusMax = std::clamp(rd.radiusMax, rd.radiusMin, 2.0f);
-        // Hard-capped at kLimbCollapseFraction's complement with room to
-        // spare: rot must never be the thing that takes a limb off at spawn,
-        // or a zombie's head could roll before it had taken a step.
-        rd.maxLoss = std::clamp(r.value("maxLoss", rd.maxLoss), 0.0f, 0.5f);
-        rd.blob = std::max(0.5f, r.value("blob", rd.blob));
-        rd.vitalScale = std::clamp(r.value("vitalScale", rd.vitalScale), 0.0f,
-                                   1.0f);
-        rd.stainScale = std::clamp(r.value("stainScale", rd.stainScale), 0.0f,
-                                   8.0f);
-        // How many holes bleed at all, and how hard the ones that do. `wet` is
-        // a [min, max] range like every other spread in this block, so it is
-        // authored the same way `radius` is; the floor on wetMin is what keeps
-        // "a trace" from rounding to "dry" and duplicating dryFraction by
-        // accident (MobRotDef).
-        rd.dryFraction = std::clamp(r.value("dryFraction", rd.dryFraction),
-                                    0.0f, 1.0f);
-        range("wet", rd.wetMin, rd.wetMax);
-        rd.wetMin = std::clamp(rd.wetMin, 0.07f, 1.0f);
-        rd.wetMax = std::clamp(rd.wetMax, rd.wetMin, 1.0f);
-        if (r.contains("skip") && r["skip"].is_array())
-          for (const auto& s : r["skip"])
-            if (s.is_string()) rd.skip.push_back(s.get<std::string>());
-      }
-    }
-    if (j.contains("bleed")) {
-      std::string bm = j["bleed"].value("material", "");
-      int id = FindMaterialId(mats, bm);
-      if (id < 0) log += jp + ": unknown bleed material \"" + bm + "\"\n";
-      else def.bleedMat = (uint32_t)id;
-      // WHAT A CUT LEAVES ON THE MEAT, as opposed to what runs out of it.
-      // Optional, and defaulting to the bleed material rather than to nothing:
-      // a creature's own blood is already the right colour for flesh it is
-      // losing, so every mob in the repo gets a soaked wound with no content
-      // edit, and one that wants a different answer (sap, ichor, oil) says so
-      // in one key. See MobDef::woundMat for why this is a MATERIAL.
-      const std::string wm = j["bleed"].value("woundMaterial", "");
-      if (!wm.empty()) {
-        const int wid = FindMaterialId(mats, wm);
-        if (wid < 0)
-          log += jp + ": unknown bleed woundMaterial \"" + wm + "\"\n";
-        else
-          def.woundMat = (uint32_t)wid;
-      }
-      if (def.woundMat == 0) def.woundMat = def.bleedMat;
-      // DOES THE CUT CLOSE? Default true (living flesh); false is the undead
-      // setting and restores the pre-2026-09-14 behaviour for this creature
-      // alone — its wounds go on drying to air, widening, and shedding parts.
-      // See MobDef::woundHeals.
-      if (j["bleed"].contains("woundHeals")) {
-        if (j["bleed"]["woundHeals"].is_boolean())
-          def.woundHeals = j["bleed"]["woundHeals"].get<bool>();
-        else
-          log += jp + ": bleed.woundHeals: expected true or false\n";
-      }
-      // Tissue = crumbles to this creature's blood (see MobDef::tissue).
-      if (def.bleedMat != 0) {
-        def.tissue.assign(mats.size(), 0);
-        bool any = false;
-        for (size_t mi = 0; mi < mats.size(); mi++) {
-          const bool crumblesToBlood =
-              !mats[mi].rubble.empty() &&
-              FindMaterialId(mats, mats[mi].rubble) == (int)def.bleedMat;
-          if (crumblesToBlood || mi == def.woundMat) {
-            def.tissue[mi] = 1;
-            any = true;
-          }
-        }
-        if (!any) def.tissue.clear();
-      }
-      // ---- THE GORE WEIGHTS, FLATTENED (mob.h MobDef::woundHp) -------------
-      // Built here rather than read from `mats` at every voxel because the
-      // damage and infection passes are per-voxel hot paths. `rotRate` is the
-      // only one that needs `tissue`: an unauthored (negative) rate means "do
-      // what tissue already said", which is 1 for tissue and 0 for the rest --
-      // so bone, which crumbles to dust and is therefore not tissue, is
-      // invisible to the rot until materials.json gives it a rate.
-      def.woundHp.assign(mats.size(), 1.0f);
-      def.brainMat.assign(mats.size(), 0);
-      def.rotRate.assign(mats.size(), 0.0f);
-      for (size_t mi = 0; mi < mats.size(); mi++) {
-        def.woundHp[mi] = mats[mi].woundHp;
-        def.brainMat[mi] = mats[mi].brainHp ? 1 : 0;
-        const bool isTissue =
-            def.tissue.empty() || (mi < def.tissue.size() && def.tissue[mi]);
-        def.rotRate[mi] = mats[mi].rotRate >= 0.0f ? mats[mi].rotRate
-                                                   : (isTissue ? 1.0f : 0.0f);
-      }
-      // NOT rescaled: this is a COUNT of voxels a wound may still owe, i.e.
-      // a volume budget, and volume goes as the cube of the voxel scale. It
-      // is gore rate rather than size or shape, so it is left as authored
-      // and flagged here instead of being silently cubed.
-      def.bleedPerDamage = j["bleed"].value("perDamage", 1.5f);
-    }
-    // ---- WHAT THIS CREATURE'S BITE CARRIES (mob.h MobBiteDef; plan §6) -----
-    // By NAME, through the same FindMaterialId `bleed.material` just used, and
-    // for the same reason: a material id is its index in materials.json, which
-    // renumbers the moment somebody inserts a row. Missing is not an error —
-    // a creature with no `bite` block simply tears — but an UNKNOWN name is,
-    // because the only other symptom would be a zombie whose bite is clean.
-    if (j.contains("bite")) {
-      if (!j["bite"].is_object()) {
-        log += jp + ": `bite` is not an object — ignored\n";
-      } else {
-        auto mat = [&](const char* key, uint16_t& out) {
-          const std::string nm = j["bite"].value(key, "");
-          if (nm.empty()) return;
-          const int id = FindMaterialId(mats, nm);
-          if (id < 0)
-            log += jp + ": unknown bite " + key + " material \"" + nm + "\"\n";
-          else
-            out = (uint16_t)id;
-        };
-        mat("infect", def.bite.infectMat);
-        mat("stain", def.bite.infectStain);
-      }
-    }
-    // How much of an AIM effector's yaw the spine takes (mob.h).
-    def.aimSpineShare = std::clamp(j.value("aimSpineShare", 0.35f), 0.0f, 1.0f);
-    // ---- WORLD-SPACE SIDECAR LENGTHS (DESIGN.md §3b) --------------------
-    // `speed`, `severImpactSpeed`, `gait.rideHeight`, `states[].bodyYOffset`
-    // and clip position keys are WORLD VOXELS (or voxels/sec), not art
-    // units -- so `artVoxelsPerMetre` does not describe them and the art
-    // upsample must not touch them. They still have a scale, though: every
-    // one was authored when the world was 10 voxels/metre, which is what
-    // `sidecarVoxelsPerMetre` writes down.
-    //
-    // Without this, a correctly-sized 1.7 m human walked at half its
-    // authored speed in m/s the moment kVoxelMeters halved -- the body the
-    // right size, moving through the world at the wrong one, against a
-    // stride budget that avatar.cpp:54 already documents as barely
-    // positive.
-    const int sidecarVpm =
-        j.value("sidecarVoxelsPerMetre", kLegacyAuthoringVoxelsPerMetre);
-    const float worldLen =
-        (float)kVoxelsPerMetre / (float)(sidecarVpm > 0 ? sidecarVpm
-                                                       : kVoxelsPerMetre);
-    def.speed = j.value("speed", 4.0f) * worldLen;
-    // Optional AI profile, BY NAME (assets/mobs/behaviors.json). Absent means
-    // "no AI": the creature keeps the wander-and-avoid DecideIntent has always
-    // had, so adding this system changed nothing about any existing sidecar.
-    def.behavior = j.value("behavior", std::string());
-    // The pose held while pursuing, BY NAME, resolved against this rig's own
-    // clips below (MobDef::chaseClip). Absent = the creature chases in
-    // whatever pose it walks in, which is every def but the undead.
-    def.chaseClip = j.value("chaseClip", std::string());
-
-    // Sound slots (assets/sound_schema.js). Presentation only, so a bad entry
-    // is skipped rather than failing the def — a mob with a typo'd sound name
-    // should still walk into the world, silently.
-    def.sounds.clear();
-    if (j.contains("sounds") && j["sounds"].is_object())
-      for (auto& [slot, name] : j["sounds"].items())
-        if (name.is_string() && !name.get<std::string>().empty())
-          def.sounds[slot] = name.get<std::string>();
-
-    // Declared here rather than below the limb loop: the art-scale block that
-    // follows can fail a def outright (a scale that admits no integer
-    // skinScale), and that has to reach the same `ok` the limb checks use.
-    bool ok = true;
-
-    // ---- ART SCALE (DESIGN.md §3b) ------------------------------------------
-    //
-    // `artVoxelsPerMetre` is the authored fact; `skinScale` is DERIVED from it
-    // and the engine's kVoxelsPerMetre. See MobDef::artVoxelsPerMetre for why
-    // the direction matters — authoring skinScale directly encoded "and the
-    // world is 10 cm" into every sidecar, so the human halved in metres the
-    // moment kVoxelMeters did.
-    //
-    // "skinScale"/"scale" survive as LEGACY: they said art voxels per WORLD
-    // voxel, and every asset that used them was authored at 10 voxels/metre, so
-    // that is the reading they get. Loud, because a modded asset silently
-    // assumed to be 10 vox/m is exactly the failure this replaces.
-    if (j.contains("artVoxelsPerMetre")) {
-      def.artVoxelsPerMetre = j.value("artVoxelsPerMetre", 0);
-    } else {
-      const bool authoredSkin = j.contains("skinScale");
-      const uint32_t legacy = j.value("skinScale", j.value("scale", 1u));
-      def.artVoxelsPerMetre = (int)legacy * kLegacyAuthoringVoxelsPerMetre;
-      log += jp + ": no \"artVoxelsPerMetre\"; reading legacy " +
-             std::string(authoredSkin ? "skinScale" : "scale") + " " +
-             std::to_string(legacy) + " as " +
-             std::to_string(def.artVoxelsPerMetre) +
-             " art voxels/metre (authored at " +
-             std::to_string(kLegacyAuthoringVoxelsPerMetre) +
-             " voxels/metre). Declare artVoxelsPerMetre to be explicit.\n";
-    }
-
-    if (def.artVoxelsPerMetre <= 0) {
-      log += jp + ": artVoxelsPerMetre must be positive (got " +
-             std::to_string(def.artVoxelsPerMetre) + ") — using " +
-             std::to_string(kVoxelsPerMetre) + " (art is 1:1 with world)\n";
-      def.artVoxelsPerMetre = kVoxelsPerMetre;
-      ok = false;
-    }
-
-    // Art coarser than the world has no integer skinScale, so replicate the
-    // grid until it does. Lossless, and it costs u^3 voxels — but it is the
-    // only way a 10 vox/m asset can hold its metre size in a 20 vox/m world
-    // without being redrawn.
-    def.artUpsample = NeededArtUpsample(def.artVoxelsPerMetre);
-    def.skinScale =
-        SkinScaleFor(def.artVoxelsPerMetre * (int)def.artUpsample);
-    if (def.skinScale != 1 && def.skinScale != 2 && def.skinScale != 4 &&
-        def.skinScale != 8) {
-      log += jp + ": artVoxelsPerMetre " +
-             std::to_string(def.artVoxelsPerMetre) + " gives skinScale " +
-             std::to_string(def.skinScale) + " at " +
-             std::to_string(kVoxelsPerMetre) +
-             " world voxels/metre, which must be 1, 2, 4 or 8 — the art scale "
-             "has to be a power-of-two multiple of the world scale. Using 1; "
-             "this mob will be the wrong physical size.\n";
-      def.skinScale = 1;
-      def.artUpsample = 1;
-      ok = false;
-    }
-    // ---- WHAT IS UNDER THE SKIN (game/anatomy_resolve.h) -------------------
-    // From the RESOLVED sidecar, so `extends` and `effects` reach it: a
-    // character inherits the human's recipe the way it inherits the human's
-    // clips, and a `skeletal` effect is a patch rather than a second body.
-    //
-    // HERE, and not below the upsample: depth is counted in ART voxels, and a
-    // block-replicated 2x body would measure every layer twice as thick. After
-    // the palette merge, because that renumbers `color` and this clears it.
-    if (j.contains("anatomy"))
-      anatomy::Resolve(def.prefab, j["anatomy"], mats, jp, log);
-
-    if (def.artUpsample > 1) {
-      UpsamplePrefab(def.prefab, def.artUpsample);
-      log += def.name + ": art is " + std::to_string(def.artVoxelsPerMetre) +
-             " vox/m in a " + std::to_string(kVoxelsPerMetre) +
-             " vox/m world — block-replicated " +
-             std::to_string(def.artUpsample) + "x to skinScale " +
-             std::to_string(def.skinScale) + " (same size, no new detail)\n";
-    }
-
-    for (auto& l : j.value("limbs", json::array())) {
-      MobLimbDef ld;
-      ld.name = l.value("name", "");
-      ld.parent = l.value("parent", "");
-      std::string jt = l.value("joint", "ball");
-      ld.joint = jt == "fixed" ? Physics::JointType::Fixed
-                 : jt == "hinge" ? Physics::JointType::Hinge
-                                 : Physics::JointType::Ball;
-      ld.hp = l.value("hp", 20.0f);
-      ld.severable = l.value("severable", true);
-      ld.vital = l.value("vital", false);
-      ld.swingAmp = l.value("swingAmp", 0.0f);
-      ld.swingPhase = l.value("swingPhase", 0.0f);
-      ld.tag = l.value("tag", "");
-      // absent severImpactSpeed = "never severs on impact alone"
-      ld.severImpactSpeed = l.value("severImpactSpeed", 0.0f) * worldLen;
-      // A cutting edge: the segment this part cuts along, in its own local
-      // frame. Authored in MICRO units along an axis of the part's model box;
-      // converted to world voxels below, with the anchors.
-      if (l.contains("edge") && l["edge"].is_object()) {
-        const json& e = l["edge"];
-        Vec3 ax{0, 0, 1};
-        if (e.contains("axis") && e["axis"].size() == 3)
-          ax = {e["axis"][0].get<float>(), e["axis"][1].get<float>(),
-                e["axis"][2].get<float>()};
-        // The .vox scene is Z-up and the engine is Y-up (voxload.cpp), so an
-        // axis authored up the model's +Z is the engine's +Y. Mapping it here
-        // means the sidecar can speak the art's coordinates, which is what the
-        // generator that wrote them was thinking in.
-        Vec3 axEngine{ax.x, ax.z, -ax.y};
-        ld.hasEdge = true;
-        ld.edgeFrom = axEngine * e.value("from", 0.0f);
-        ld.edgeTo = axEngine * e.value("to", 0.0f);
-        ld.edgeHalfWidth = e.value("halfWidth", 1.0f);
-        // The flat, through the same axis map. A DIRECTION, so it takes no
-        // art-to-world scaling below; orthogonalized against the edge so two
-        // nearly-perpendicular authored axes cannot shear the roll.
-        if (e.contains("flat") && e["flat"].size() == 3) {
-          Vec3 fl{e["flat"][0].get<float>(), e["flat"][1].get<float>(),
-                  e["flat"][2].get<float>()};
-          Vec3 flEngine{fl.x, fl.z, -fl.y};
-          const Vec3 along = axEngine.normalized();
-          flEngine = flEngine - along * along.dot(flEngine);
-          if (flEngine.len() > 1e-4f) {
-            ld.edgeFlat = flEngine.normalized();
-            ld.hasEdgeFlat = true;
-          }
-        }
-      }
-      if (l.contains("spring") && l["spring"].is_object()) {
-        ld.hasSpring = true;
-        ld.spring.halflife = l["spring"].value("halflife", 0.15f);
-        ld.spring.gain = l["spring"].value("gain", 1.0f);
-        ld.spring.maxAngle = l["spring"].value("maxAngle", 0.7f);
-      }
-      if (l.contains("axis") && l["axis"].size() == 3)
-        ld.axis = {l["axis"][0].get<float>(), l["axis"][1].get<float>(),
-                   l["axis"][2].get<float>()};
-      ld.minAngle = l.value("minAngle", -1.2f);
-      ld.maxAngle = l.value("maxAngle", 1.2f);
-      // Ball-joint cone, by TAG. Every rig in the tree already tags its parts
-      // ("spine", "leg", "arm", ...) for the gait and the IK chains, so the
-      // tag is the authoring surface that already exists — a per-limb angle in
-      // every sidecar would be five files restating the same anatomy. A limb
-      // that wants something else says so and overrides.
-      {
-        const JointLimits jl = DefaultJointLimits(ld.tag);
-        const float cone = l.value("cone", jl.fwd);
-        ld.coneFwd = cone;
-        // "coneSide" defaults to "cone" when only the one number is authored,
-        // so `"cone": 0.5` means a plain symmetric cone and nothing surprising
-        // leaks in from the tag table.
-        ld.coneSide = l.value("coneSide", l.contains("cone") ? cone : jl.side);
-        ld.twistLimit = l.value("twist", jl.twist);
-        ld.jointFriction = l.value("jointFriction", jl.friction);
-      }
-      // Pose-space range of motion. Deliberately NOT folded into the "cone"
-      // block above: that one is a Jolt constraint on a dynamic body and this
-      // one bounds the animated pose, and conflating them is exactly the
-      // confusion that let an IK-driven thigh swing to any angle it liked while
-      // a perfectly good-looking ragdoll limit sat in the same sidecar. Degrees
-      // in, radians out, like `edge` converts its units at the same point.
-      if (l.contains("poseLimit") && l["poseLimit"].is_object()) {
-        const json& pl = l["poseLimit"];
-        const float kDeg = 3.14159265f / 180.0f;
-        auto vec3 = [&](const char* key, Vec3 dflt) {
-          if (!pl.contains(key) || pl[key].size() != 3) return dflt;
-          return Vec3{pl[key][0].get<float>(), pl[key][1].get<float>(),
-                      pl[key][2].get<float>()};
-        };
-        // BALL FORM (a shoulder): bounded by where the bone may POINT, not by
-        // one rotation component. Selected by the presence of `bone`, because
-        // the bone direction is the thing the axis form has no use for and the
-        // ball form cannot work without.
-        if (pl.contains("bone")) {
-          PoseBallLimit& b = ld.poseBall;
-          b.has = true;
-          b.bone = vec3("bone", {0, -1, 0});
-          if (b.bone.len() < 1e-5f) {
-            log += jp + ": limb \"" + ld.name + "\" poseLimit.bone is zero\n";
-            ok = false;
-          } else {
-            b.bone = b.bone.normalized();
-          }
-          if (pl.contains("reach") && pl["reach"].is_array()) {
-            for (const json& r : pl["reach"]) {
-              if (b.reachCount >= 2) {
-                log += jp + ": limb \"" + ld.name +
-                       "\" poseLimit.reach takes at most 2 planes (see "
-                       "PoseBallLimit in anim.h)\n";
-                ok = false;
-                break;
-              }
-              Vec3 nrm{0, 0, 1};
-              if (r.contains("normal") && r["normal"].size() == 3)
-                nrm = {r["normal"][0].get<float>(), r["normal"][1].get<float>(),
-                       r["normal"][2].get<float>()};
-              if (nrm.len() < 1e-5f) {
-                log += jp + ": limb \"" + ld.name +
-                       "\" poseLimit.reach normal is zero\n";
-                ok = false;
-                continue;
-              }
-              nrm = nrm.normalized();
-              // The closed-form projection is only the NEAREST legal direction
-              // when the planes are perpendicular; a tilted pair would be
-              // solved wrong and look almost right, so it is a load error.
-              if (b.reachCount == 1 &&
-                  std::fabs(nrm.dot(b.reachNormal[0])) > 1e-3f) {
-                log += jp + ": limb \"" + ld.name +
-                       "\" poseLimit.reach normals must be perpendicular\n";
-                ok = false;
-              }
-              b.reachNormal[b.reachCount] = nrm;
-              // "at most N degrees past this plane" — the plane itself is 0.
-              b.reachSin[b.reachCount] =
-                  std::sin(std::clamp(r.value("max", 0.0f), -90.0f, 90.0f) *
-                           kDeg);
-              b.reachCount++;
-            }
-          }
-          if (pl.contains("twist") && pl["twist"].is_object()) {
-            b.hasTwist = true;
-            b.twistMin = pl["twist"].value("min", -180.0f) * kDeg;
-            b.twistMax = pl["twist"].value("max", 180.0f) * kDeg;
-            if (b.twistMin > b.twistMax) std::swap(b.twistMin, b.twistMax);
-          }
-        } else {
-          ld.hasPoseLimit = true;
-          ld.poseAxis = vec3("axis", ld.poseAxis);
-          ld.poseMin = pl.value("min", -180.0f) * kDeg;
-          ld.poseMax = pl.value("max", 180.0f) * kDeg;
-          if (ld.poseMin > ld.poseMax) std::swap(ld.poseMin, ld.poseMax);
-          // A hinge is one DOF, not one bounded DOF: it also discards the
-          // off-axis swing (anim.h, AnimPart::poseHinge).
-          ld.poseHinge = pl.value("hinge", false);
-        }
-      }
-      if (l.contains("anchor") && l["anchor"].size() == 3) {
-        ld.anchor = {l["anchor"][0].get<float>(), l["anchor"][1].get<float>(),
-                     l["anchor"][2].get<float>()};
-        ld.anchorAuto = false;
-      }
-      if (FindModel(def.prefab, ld.name) < 0) {
-        log += jp + ": limb \"" + ld.name + "\" has no .vox model of that name\n";
-        ok = false;
-      }
-      if (ld.name == root) def.rootLimb = (int)def.limbs.size();
-      def.limbs.push_back(std::move(ld));
-    }
-    if (def.rootLimb < 0) {
-      log += jp + ": root \"" + root + "\" is not a limb\n";
-      ok = false;
-    }
-    for (auto& ld : def.limbs) {
-      if ((int)(&ld - def.limbs.data()) == def.rootLimb) continue;
-      bool found = false;
-      for (auto& p : def.limbs) found |= p.name == ld.parent;
-      if (!found) {
-        log += jp + ": limb \"" + ld.name + "\" parent \"" + ld.parent +
-               "\" not found\n";
-        ok = false;
-      }
-    }
-    // Derive the COLLIDER resolution from the art (mob.h MobDef::physScale).
-    //
-    // DebrisVoxel is int8, so a limb's collider box must fit ±120 on every
-    // axis. The skin has no such bound (PrefabVoxel is int16), which is the
-    // whole point of the split: pick the finest collider that fits BOTH the
-    // int8 bound and the kMaxPhysScale cost ceiling (mob.h), and let the skin
-    // stay as fine as it was authored. Mina at skinScale 8 lands on physScale
-    // 4: her 68-skin-voxel hips would fit ±120 at 8, but an 8× collider is 8×
-    // the boxes for no gain a player can feel.
-    //
-    // Measured on the largest limb, not the whole rig: each limb is its own
-    // body with its own origin, so the bound applies per limb.
-    {
-      int32_t maxExtent = 0;
-      for (const PrefabModel& m : def.prefab.models)
-        maxExtent = std::max(
-            {maxExtent, m.size.x, m.size.y, m.size.z});
-      def.physScale = 1;
-      for (uint32_t cand : {8u, 4u, 2u, 1u}) {
-        if (cand > def.skinScale) continue;  // never finer than the art
-        if (cand > kMaxPhysScale) continue;  // physics cost ceiling, below
-        // Extents are in skin units; a collider voxel spans skinScale/cand of
-        // them, so the collider box is maxExtent * cand / skinScale.
-        if ((int64_t)maxExtent * cand / def.skinScale <= 120) {
-          def.physScale = cand;
-          break;
-        }
-      }
-      // Even physScale 1 can overflow if a limb is over 120 WORLD voxels —
-      // that is a genuine authoring error, not something to derive around.
-      if ((int64_t)maxExtent * def.physScale / def.skinScale > 120) {
-        for (const PrefabModel& m : def.prefab.models)
-          if (m.size.x > 120 || m.size.y > 120 || m.size.z > 120) {
-            log += def.name + ": limb model \"" + m.name + "\" is " +
-                   std::to_string(m.size.x) + "x" + std::to_string(m.size.y) +
-                   "x" + std::to_string(m.size.z) +
-                   (def.skinScale > 1
-                        ? " SKIN voxels (= " +
-                              std::to_string(m.size.y / def.skinScale) +
-                              " world voxels tall at skinScale " +
-                              std::to_string(def.skinScale) +
-                              "); even a 1:1 collider exceeds the DebrisVoxel "
-                              "int8 bound of 120 world voxels\n"
-                        : " voxels, exceeding the int8 bound of 120\n");
-            ok = false;
-          }
-      }
-      // Log the pick ALWAYS, not only when it is surprising. Collider
-      // resolution is emergent from art size, and an emergent value that
-      // changes mass, contacts and ground probes must never move silently —
-      // this line is the record that it did.
-      if (ok && def.skinScale > 1)
-        log += def.name + ": skinScale " + std::to_string(def.skinScale) +
-               ", derived physScale " + std::to_string(def.physScale) +
-               " (largest limb " + std::to_string(maxExtent) +
-               " skin voxels -> " +
-               std::to_string(maxExtent * def.physScale / def.skinScale) +
-               " collider voxels, bound 120)\n";
-    }
-
-    // ---- rig for the animation runtime (all of this is optional data) ----
-    if (ok && !TopoSortLimbs(def.limbs, def.rootLimb)) {
-      log += jp + ": limb hierarchy has a cycle\n";
-      ok = false;
-    }
-    if (ok) {
-      AnimSkeleton& sk = def.skel;
-      sk.parts.resize(def.limbs.size());
-      for (size_t i = 0; i < def.limbs.size(); i++) {
-        const MobLimbDef& ld = def.limbs[i];
-        AnimPart& p = sk.parts[i];
-        p.name = ld.name;
-        p.tag = ld.tag;
-        p.parent = -1;
-        if ((int)i != def.rootLimb)
-          for (size_t k = 0; k < def.limbs.size(); k++)
-            if (def.limbs[k].name == ld.parent) p.parent = (int)k;
-        p.axis = ld.axis;
-        p.swingAmp = ld.swingAmp;
-        p.swingPhase = ld.swingPhase;
-        p.hasSpring = ld.hasSpring;
-        p.spring = ld.spring;
-        p.hasPoseLimit = ld.hasPoseLimit;
-        p.poseAxis = ld.poseAxis;
-        p.poseMin = ld.poseMin;
-        p.poseMax = ld.poseMax;
-        p.poseHinge = ld.poseHinge;
-        p.poseBall = ld.poseBall;
-      }
-      // rest transforms come from the .vox layout: a part's local rest
-      // position is its joint anchor relative to the parent's anchor.
-      for (size_t i = 0; i < def.limbs.size(); i++) {
-        const MobLimbDef& ld = def.limbs[i];
-        int mi = FindModel(def.prefab, ld.name);
-        // TWO LATTICES MEET HERE, and they are not the same one after an art
-        // upsample (DESIGN.md §3b). `ld.anchor` is AUTHORED, so it is in the
-        // sidecar's original art grid; AutoAnchor and the root fallback are
-        // DERIVED FROM def.prefab, which UpsamplePrefab may have multiplied by
-        // artUpsample. Dividing both by skinScale would put every authored
-        // joint of an upsampled rig at 1/artUpsample of its intended offset —
-        // a rig that collapses toward its own origin, with the art still
-        // looking perfectly correct.
-        //
-        // ArtToWorld() divides the upsample back out; the derived branches take
-        // the plain skin->world divisor. They agree exactly when artUpsample
-        // is 1, which is every asset that has not been redrawn coarser than
-        // the world.
-        Vec3 anchor = ld.anchor;
-        float aInv = def.ArtToWorld();
-        const float prefabInv = 1.0f / (float)def.skinScale;
-        if (ld.anchorAuto && (int)i != def.rootLimb) {
-          int pmi = FindModel(def.prefab, ld.parent);
-          if (mi >= 0 && pmi >= 0) {
-            anchor = AutoAnchor(def.prefab.models[mi], def.prefab.models[pmi]);
-            aInv = prefabInv;
-          }
-        } else if ((int)i == def.rootLimb && mi >= 0) {
-          const PrefabModel& m = def.prefab.models[mi];
-          anchor = Vec3{(float)m.offset.x + m.size.x * 0.5f, (float)m.offset.y,
-                        (float)m.offset.z + m.size.z * 0.5f};
-          aInv = prefabInv;
-        }
-        // SKIN -> WORLD. Anchors are authored in .vox coordinates, which at
-        // skinScale>1 are SKIN units — this is the ART's lattice, so it is
-        // skinScale here and NOT physScale. (The collider frame conversion is
-        // the one in CarveLimb, which multiplies by physScale; confusing the
-        // two shifts every joint in the rig without changing anything visible
-        // about the art, which is why they are commented at both ends.)
-        //
-        // The rig, the gait and the physics all work in world voxels.
-        // Converting HERE, once, is what keeps every downstream stage
-        // (AnimFlatten, IK, GroundHeightAt, the joint anchors in Spawn)
-        // completely scale-unaware.
-        sk.parts[i].anchorLocal = anchor * aInv;
-        // The cutting edge rides the same conversion, for the same reason: it
-        // is rig geometry, and every consumer downstream works in world
-        // voxels. Its offsets are measured from the part's own ORIGIN (the
-        // model's min corner), so they need no anchor rebasing here — the
-        // melee sweep composes them with the part transform, which already
-        // carries the origin.
-        MobLimbDef& mld = def.limbs[i];
-        if (mld.hasEdge) {
-          // Always authored, so always the art-frame divisor.
-          const float eInv = def.ArtToWorld();
-          mld.edgeFrom = mld.edgeFrom * eInv;
-          mld.edgeTo = mld.edgeTo * eInv;
-          mld.edgeHalfWidth *= eInv;
-        }
-        // THE BONE: from the joint anchor to the limb's own centre, in the
-        // rest pose. This is the centre line of the ball joint's swing cone
-        // (mob.h MobLimbDef::boneAxis), and it is derived from the same two
-        // pieces of rig geometry the pose pipeline uses rather than authored,
-        // for the same reason the anchor is not restated per consumer: a cone
-        // centred anywhere but the rest direction parks the limb against its
-        // own limit while it is still standing.
-        //
-        // It is normalised, so a common scale would cancel — but the two terms
-        // do NOT share one after an art upsample: `centre` is measured off the
-        // (possibly replicated) prefab and `anchor` may be authored in the
-        // original grid. Convert each with its own divisor first; when
-        // artUpsample is 1 they are the same number and this is the old
-        // expression exactly.
-        if ((int)i != def.rootLimb && mi >= 0) {
-          const PrefabModel& m = def.prefab.models[mi];
-          const Vec3 centre{(float)m.offset.x + m.size.x * 0.5f,
-                            (float)m.offset.y + m.size.y * 0.5f,
-                            (float)m.offset.z + m.size.z * 0.5f};
-          const Vec3 bone = centre * prefabInv - anchor * aInv;
-          // A limb whose centre IS its anchor (a ball-shaped head sat exactly
-          // on the neck) has no direction to speak of; straight down is the
-          // rig-neutral guess and the cone stays symmetric about it.
-          mld.boneAxis = bone.len() > 1e-4f ? bone.normalized() : Vec3{0, -1, 0};
-        }
-      }
-      for (size_t i = 0; i < def.limbs.size(); i++) {
-        int par = sk.parts[i].parent;
-        sk.parts[i].rest.pos =
-            par >= 0 ? sk.parts[i].anchorLocal - sk.parts[par].anchorLocal
-                     : sk.parts[i].anchorLocal;
-      }
-
-      // ---- sockets: where a held ITEM attaches (mob.h MobSocketDef) --------
-      //
-      // Parsed after the limbs because a socket names the part it rides and is
-      // resolved to an index here — a socket on a part that does not exist is
-      // a loud diagnostic, never a silent no-op, since the failure mode it
-      // guards against is an item that renders at the origin instead of in the
-      // hand.
-      //
-      // Offsets take the SAME skin -> world conversion the anchors just did,
-      // and for the same reason: everything downstream works in world voxels.
-      // Authored, so it is the art-frame divisor (ArtToWorld), not the raw
-      // 1/skinScale — see the two-lattices note at the anchors above.
-      {
-        const float inv = def.ArtToWorld();
-        for (const auto& s : j.value("sockets", json::array())) {
-          MobSocketDef sd;
-          sd.name = s.value("name", "");
-          sd.part = s.value("part", "");
-          if (sd.name.empty() || sd.part.empty()) {
-            log += jp + ": socket needs both \"name\" and \"part\"\n";
-            continue;
-          }
-          sd.partIndex = sk.FindPart(sd.part);
-          if (sd.partIndex < 0) {
-            log += jp + ": socket \"" + sd.name + "\" names part \"" + sd.part +
-                   "\", which is not a limb of this rig\n";
-            continue;
-          }
-          if (s.contains("offset") && s["offset"].size() == 3)
-            sd.offset = Vec3{s["offset"][0].get<float>(),
-                             s["offset"][1].get<float>(),
-                             s["offset"][2].get<float>()} * inv;
-          if (s.contains("rotation") && s["rotation"].size() == 3)
-            sd.rotation = QuatFromEulerDeg({s["rotation"][0].get<float>(),
-                                            s["rotation"][1].get<float>(),
-                                            s["rotation"][2].get<float>()});
-          def.sockets.push_back(std::move(sd));
-        }
-      }
-
-      // ---- NATURAL WEAPONS: the parts that ARE weapons (mob.h; plan §3) ----
-      //
-      // Beside the sockets, and parsed the same way and for the same reasons:
-      // both name a rig part and resolve it to an index HERE, so a block
-      // naming a part this rig does not have is a loud diagnostic rather than
-      // a creature that swings nothing.
-      //
-      // THE EDGE IS TWO POINTS IN THE PART'S OWN ART FRAME — the Y-up,
-      // origin-at-the-model's-min-corner frame `MobLimbDef::edgeFrom/edgeTo`
-      // are stored in, converted by `ArtToWorld()` on the line below exactly
-      // as those are. It does NOT take MobLimbDef's scene-axis map (`axis`
-      // with its (x, z, -y) swizzle), because that block authors an OFFSET
-      // ALONG ONE MODEL AXIS from a hilt, and a part has no hilt: a fist's
-      // edge runs from the wrist down and forward to the knuckles, which is
-      // not a multiple of any one axis. Two points is the honest shape, and it
-      // is the frame the Models tab already draws an item edge in.
-      {
-        const float inv = def.ArtToWorld();
-        auto point = [&](const json& v, Vec3 dflt) {
-          if (v.is_array() && v.size() == 3 && v[0].is_number() &&
-              v[1].is_number() && v[2].is_number())
-            return Vec3{v[0].get<float>(), v[1].get<float>(),
-                        v[2].get<float>()};
-          return dflt;
-        };
-        for (const auto& w : j.value("natural", json::array())) {
-          if (!w.is_object()) continue;
-          MobNaturalWeaponDef nw;
-          nw.name = w.value("name", "");
-          nw.part = w.value("part", "");
-          if (nw.name.empty() || nw.part.empty()) {
-            log += jp + ": a natural weapon needs both \"name\" and \"part\"\n";
-            continue;
-          }
-          nw.partIndex = sk.FindPart(nw.part);
-          if (nw.partIndex < 0) {
-            log += jp + ": natural weapon \"" + nw.name + "\" names part \"" +
-                   nw.part + "\", which is not a limb of this rig\n";
-            continue;
-          }
-          const json e = w.contains("edge") && w["edge"].is_object()
-                             ? w["edge"]
-                             : json::object();
-          nw.edgeFrom = point(e.contains("from") ? e["from"] : json(), {}) * inv;
-          nw.edgeTo = point(e.contains("to") ? e["to"] : json(), {}) * inv;
-          nw.edgeHalfWidth = e.value("halfWidth", 1.0f) * inv;
-          // A ZERO-LENGTH EDGE IS NOT A WEAPON. The sweep is a segment from
-          // last tick's position to this one; with from == to there is no
-          // blade to sweep, the melee driver's blade direction is undefined,
-          // and the only symptom would be a creature that punches and never
-          // connects. Same refusal `LoadAttackStyles` gives a cut that travels
-          // nowhere, and the `mob` gate asserts it independently.
-          if ((nw.edgeTo - nw.edgeFrom).len() < 1e-4f) {
-            log += jp + ": natural weapon \"" + nw.name +
-                   "\" has a degenerate edge (from == to) — skipped\n";
-            continue;
-          }
-          if (const json& s2 = w.contains("strike") ? w["strike"] : json();
-              s2.is_object()) {
-            nw.strike.cut = s2.value("cut", 0.0f);
-            nw.strike.blunt = s2.value("blunt", 0.0f);
-            nw.strike.bluntCarve = s2.value("bluntCarve", 0.0f);
-            nw.strike.armorBreak = s2.value("armorBreak", 0.0f);
-            nw.strike.bite = s2.value("bite", 0.0f);
-          }
-          if (!nw.strike.Any())
-            log += jp + ": natural weapon \"" + nw.name +
-                   "\" has no cut, blunt or bite — it will hit for nothing\n";
-          if (def.FindNatural(nw.name) >= 0)
-            log += jp + ": duplicate natural weapon \"" + nw.name +
-                   "\" — last wins\n";
-          def.natural.push_back(std::move(nw));
-        }
-      }
-
-      if (j.contains("gait") && j["gait"].is_object()) {
-        const json& g = j["gait"];
-        GaitDef& gd = sk.gait;
-        gd.present = true;
-        gd.cadence = g.value("cadence", 2.2f);
-        gd.strideBias = g.value("strideBias", 0.35f);
-        gd.leadTime = g.value("leadTime", 0.2f);
-        gd.stepThreshold = g.value("stepThreshold", 0.6f);
-        gd.stepDuration = g.value("stepDuration", 0.22f);
-        gd.stepHeight = g.value("stepHeight", 0.25f);
-        // World voxels: a per-rig trim of about one cell at the authored
-        // scale, so it has to follow the scale or the rig sinks.
-        gd.rideHeight = g.value("rideHeight", 0.9f) * worldLen;
-        gd.bobAmp = g.value("bobAmp", 0.06f);
-        gd.bobFreqMul = g.value("bobFreqMul", 2.0f);
-        gd.swayAmp = g.value("swayAmp", 0.05f);
-        gd.rollAmp = g.value("rollAmp", 0.09f);
-        gd.spineCounter = g.value("spineCounter", 0.7f);
-        gd.phaseLag = g.value("phaseLag", 0.05f);
-        for (const auto& grp : g.value("groups", json::array())) {
-          std::vector<int> members;
-          for (const auto& nm : grp) {
-            int pi = sk.FindPart(nm.get<std::string>());
-            if (pi >= 0) members.push_back(pi);
-            else log += jp + ": gait group names unknown part \"" +
-                        nm.get<std::string>() + "\"\n";
-          }
-          if (!members.empty()) gd.groups.push_back(std::move(members));
-        }
-      }
-
-      // Steering limits (anim.h LocomotionDef). Absent = the defaults, which
-      // are tuned for a humanoid; every field is optional so an existing
-      // sidecar keeps working untouched.
-      if (j.contains("locomotion") && j["locomotion"].is_object()) {
-        const json& l = j["locomotion"];
-        LocomotionDef& ld = sk.loco;
-        ld.turnRate = l.value("turnRate", ld.turnRate);
-        ld.turnAccel = l.value("turnAccel", ld.turnAccel);
-        ld.driveAlignFull = l.value("driveAlignFull", ld.driveAlignFull);
-        ld.driveAlignZero = l.value("driveAlignZero", ld.driveAlignZero);
-        ld.turnRateMoving = l.value("turnRateMoving", ld.turnRateMoving);
-        // Terrain budgets, authored in metres (anim.h). Absent = the player's
-        // own numbers, which is the point: a creature that cannot walk what the
-        // player walks reads as broken rather than as different.
-        ld.stepUpM = l.value("stepUpM", ld.stepUpM);
-        ld.stepDownM = l.value("stepDownM", ld.stepDownM);
-        ld.headroomM = l.value("headroomM", ld.headroomM);
-        ld.tiltMaxDeg = l.value("tiltMaxDeg", ld.tiltMaxDeg);
-        // Personal space. A MULTIPLE of the two bodies' own footprint radii,
-        // not metres — see the note in anim.h for why this one budget is not
-        // authored the way the terrain ones above it are.
-        ld.spacingMul = l.value("spacingMul", ld.spacingMul);
-        ld.crowdPush = l.value("crowdPush", ld.crowdPush);
-        if (ld.spacingMul < 0) ld.spacingMul = 0;
-        ld.crowdPush = std::clamp(ld.crowdPush, 0.0f, 1.0f);
-        // A zero-width align band would divide by zero in the drive scale.
-        if (ld.driveAlignZero <= ld.driveAlignFull)
-          ld.driveAlignZero = ld.driveAlignFull + 1e-3f;
-        if (ld.turnRate < 0) ld.turnRate = 0;
-        if (ld.stepUpM < 0) ld.stepUpM = 0;
-        if (ld.stepDownM < 0) ld.stepDownM = 0;
-        if (ld.tiltMaxDeg < 0) ld.tiltMaxDeg = 0;
-      }
-
-      for (const auto& c : j.value("chains", json::array())) {
-        IkChain ch;
-        ch.tag = c.value("tag", "");
-        ch.pole = JsonVec3(c.contains("pole") ? c["pole"] : json(), {0, 0, 1});
-        std::string solver = c.value("solver", "twobone");
-        ch.solver = IkSolver::TwoBone;
-        if (solver != "twobone")
-          log += jp + ": chain solver \"" + solver +
-                 "\" unsupported, using twobone\n";
-        for (const auto& nm : c.value("parts", json::array())) {
-          int pi = sk.FindPart(nm.get<std::string>());
-          if (pi >= 0) ch.parts.push_back(pi);
-          else log += jp + ": chain names unknown part \"" +
-                      nm.get<std::string>() + "\"\n";
-        }
-        std::string eff = c.value("effector", "");
-        ch.effector = eff.empty() ? (ch.parts.empty() ? -1 : ch.parts.back())
-                                  : sk.FindPart(eff);
-        if (ch.parts.size() >= 2 && ch.effector >= 0) sk.chains.push_back(std::move(ch));
-        else log += jp + ": chain \"" + ch.tag + "\" needs >=2 parts + effector\n";
-      }
-
-      // Dismemberment locomotion states. Authored order IS the priority
-      // order (first match wins), so the array form is deliberate — an object
-      // would let the JSON library reorder the rules.
-      for (const auto& s : j.value("states", json::array())) {
-        AnimStateRule rule;
-        rule.name = s.value("name", "");
-        auto partList = [&](const char* key, std::vector<int>& out) {
-          for (const auto& nm : s.value(key, json::array())) {
-            int pi = sk.FindPart(nm.get<std::string>());
-            if (pi >= 0) out.push_back(pi);
-            else log += jp + ": state \"" + rule.name +
-                        "\" names unknown part \"" + nm.get<std::string>() + "\"\n";
-          }
-        };
-        partList("missing", rule.missingAll);
-        partList("missingAny", rule.missingAnyOf);
-        rule.minChainsLost = s.value("minChainsLost", 0);
-        rule.clip = s.value("clip", "");
-        rule.speedScale = s.value("speedScale", 1.0f);
-        // Read AFTER speedScale so its default can BE speedScale (anim.h).
-        rule.lungeScale = s.value("lungeScale", rule.speedScale);
-        rule.disableGait = s.value("disableGait", false);
-        rule.bodyYOffset = s.value("bodyYOffset", 0.0f) * worldLen;
-        rule.groundAlign =
-            std::clamp(s.value("groundAlign", 0.0f), 0.0f, 1.0f);
-        // A prone state that still lets the gait run would have the foot plane
-        // and the ground plane both claiming the body height. Say so rather
-        // than letting whichever ran last win.
-        if (rule.groundAlign > 0.0f && !rule.disableGait)
-          log += jp + ": state \"" + rule.name +
-                 "\" sets groundAlign without disableGait; the gait's foot "
-                 "plane will fight the ground fit\n";
-        if (rule.missingAll.empty() && rule.missingAnyOf.empty() &&
-            rule.minChainsLost <= 0)
-          log += jp + ": state \"" + rule.name +
-                 "\" has an empty predicate and will never match\n";
-        sk.states.push_back(std::move(rule));
-      }
-
-      // NB: bind the object to a named local. `j.value(k, json::object())`
-      // returns a TEMPORARY; iterating begin()/end() off two separate
-      // temporaries yields iterators into different destroyed objects.
-      const json clipsJson =
-          j.contains("clips") && j["clips"].is_object() ? j["clips"] : json::object();
-      for (auto it = clipsJson.begin(); it != clipsJson.end(); ++it) {
-        AnimClip clip;
-        // The sidecar's own clips: a track for a part this rig does not have
-        // is a content error and says so.
-        ParseClipJson(sk, jp, it.key(), it.value(), worldLen, &log, clip);
-        sk.clips.push_back(std::move(clip));
-      }
-
-      // ---- THE SHARED CLIP LIBRARY (assets/anims/*.json) -------------------
-      // Clips authored in the tuner's clip lane and saved OUT of a sidecar so
-      // an attack style can name one (strokes.h AttackStyle::clip) and every
-      // rig with the right part names plays it. Compiled per rig, exactly as
-      // a sidecar clip is, against THIS skeleton's parts; a sidecar clip of
-      // the same name wins, so a rig can still override the library. A
-      // library clip with no track this rig can use is skipped silently — the
-      // library is shared across every creature and a critter has no
-      // "armU.R" — but a clip that fits PARTLY is kept, because that is what
-      // a mask is for.
-      for (const ClipLibraryEntry& le : clipLib) {
-        if (sk.FindClip(le.name) >= 0) continue;
-        AnimClip clip;
-        ParseClipJson(sk, le.path, le.name, le.doc, le.worldLen, nullptr,
-                      clip);
-        if (clip.tracks.empty()) continue;
-        sk.clips.push_back(std::move(clip));
-      }
-
-      // States name clips by string and PlayClip silently no-ops on a miss, so
-      // a typo'd crawl clip would otherwise fail as "the mob just slides".
-      for (const AnimStateRule& rule : sk.states)
-        if (!rule.clip.empty() && sk.FindClip(rule.clip) < 0)
-          log += jp + ": state \"" + rule.name + "\" names unknown clip \"" +
-                 rule.clip + "\"\n";
-      // Same reason, one field over: a typo'd chaseClip would present as "the
-      // zombie chases with its arms down", which looks like a decision rather
-      // than a miss. Checked HERE and not at the loader line that reads it,
-      // because the library clips are only on the rig by this point.
-      if (!def.chaseClip.empty() && sk.FindClip(def.chaseClip) < 0)
-        log += jp + ": chaseClip names unknown clip \"" + def.chaseClip +
-               "\"\n";
-
-      const json fbJson = j.contains("flipbooks") && j["flipbooks"].is_object()
-                              ? j["flipbooks"]
-                              : json::object();
-      for (auto it = fbJson.begin(); it != fbJson.end(); ++it) {
-        Flipbook fb;
-        fb.name = it.key();
-        fb.loop = it.value().value("loop", true);
-        for (const auto& f : it.value().value("frames", json::array())) {
-          FlipbookFrame ff;
-          ff.part = sk.FindPart(f.value("part", ""));
-          ff.model = f.value("model", 0);
-          ff.durationMs = f.value("durationMs", 100);
-          if (ff.part >= 0) fb.frames.push_back(ff);
-        }
-        if (!fb.frames.empty()) sk.flipbooks.push_back(std::move(fb));
-      }
-
-      if (!sk.ParentsFirst()) {  // belt and braces: AnimFlatten depends on it
-        log += jp + ": internal error, parts are not parent-before-child\n";
-        ok = false;
-      }
-    }
-
-    // Prefab box in WORLD voxels — the one number the gait/terrain code reads.
-    //
-    // HELD PROPS ARE EXCLUDED. This box is the CREATURE's, not its luggage:
-    // the gait pivot, the avatar's origin, its standing height and the terrain
-    // anchor radius all derive from it (avatar.cpp, and the pivot uses below).
-    // A sword lying in the hand reaches well outside the body, so counting it
-    // here silently re-centres the rig on the weapon — which showed up as the
-    // avatar's walk widening until its legs failed their own upright
-    // assertion, a "leg bug" whose actual cause was the thing it was holding.
-    //
-    // Anything tagged "prop" is therefore measured out. Props still render,
-    // still collide and are still severable; they simply do not define how big
-    // the creature is.
-    {
-      IVec3 lo{INT32_MAX, INT32_MAX, INT32_MAX};
-      IVec3 hi{INT32_MIN, INT32_MIN, INT32_MIN};
-      bool any = false;
-      for (const MobLimbDef& ld : def.limbs) {
-        if (ld.tag == "prop") continue;
-        int mi = FindModel(def.prefab, ld.name);
-        if (mi < 0) continue;
-        const PrefabModel& m = def.prefab.models[mi];
-        lo.x = std::min(lo.x, m.offset.x);
-        lo.y = std::min(lo.y, m.offset.y);
-        lo.z = std::min(lo.z, m.offset.z);
-        hi.x = std::max(hi.x, m.offset.x + m.size.x);
-        hi.y = std::max(hi.y, m.offset.y + m.size.y);
-        hi.z = std::max(hi.z, m.offset.z + m.size.z);
-        any = true;
-      }
-      const Vec3 box =
-          any ? Vec3{(float)(hi.x - lo.x), (float)(hi.y - lo.y),
-                     (float)(hi.z - lo.z)}
-              : Vec3{(float)def.prefab.size.x, (float)def.prefab.size.y,
-                     (float)def.prefab.size.z};
-      // The prefab box is measured in the .vox's own units, which are SKIN
-      // units — so it divides by skinScale to reach world voxels.
-      def.worldSize = box * (1.0f / (float)def.skinScale);
-    }
-
-    // ---- micro brick upload (PLAN §C, sim/microbody.h) ----
-    // Packed once per DEF, shared by every instance: a limb's voxels never
-    // change after load in v1, so there is no per-instance storage at all.
-    // Done last so a def that failed validation never enters the pool.
-    if (ok && def.skinScale > 1) {
-      for (MobLimbDef& ld : def.limbs) {
-        int mi = FindModel(def.prefab, ld.name);
-        if (mi < 0) continue;
-        const PrefabModel& m = def.prefab.models[mi];
-        // The one PURE RENDER read in the loader: the brick is the art, so it
-        // is packed at the authored skin resolution and never at physScale.
-        ld.microModel = MicroBodyPack(micro, m.voxels, m.size, def.skinScale,
-                                      def.name + "/" + ld.name, log,
-                                      MicroBodyCutFaces(def.prefab, mi));
-        if (ld.microModel < 0)
-          log += def.name + ": limb \"" + ld.name +
-                 "\" has no micro brick and will not render (the cube path "
-                 "would draw it at the wrong scale)\n";
-      }
-    }
-    if (ok) out.push_back(std::move(def));
+    if (BuildMobDef(*fac, one, j, micro, def, log))
+      out.push_back(std::move(def));
   }
+  // Handed to MobSystem::SetDefFactory so a def can still be built AFTER the
+  // load: the dir, the materials and the clip library are everything
+  // BuildMobDef reads that does not come out of the sidecar itself.
+  if (factoryOut) *factoryOut = std::move(fac);
   return true;
 }
 
@@ -1849,16 +1923,292 @@ void MobSystem::OnMaterialsReloaded(const std::vector<MaterialDef>& mats,
 }
 
 void MobSystem::SetDefs(std::vector<MobDef> defs) {
+  // Captured BEFORE the move, because the old vector's contents die with it.
+  // RE-SEATING IS BY NAME, not by index: index order is whatever the directory
+  // listing was a moment ago, and a reload that added, removed or renamed a
+  // creature slides every mob after it onto somebody else's body — silently,
+  // because an index is always "valid". It was safe only because a hot reload
+  // despawns everything first, and a def composed at runtime (DefWithEffects)
+  // is an append that happens while creatures are standing in the world.
+  std::vector<std::string> was(mobs_.size());
+  for (size_t i = 0; i < mobs_.size(); i++)
+    if (mobs_[i].def_ != nullptr) was[i] = mobs_[i].def_->name;
   defs_ = std::move(defs);
-  // A live mob's `def_` points into this vector, so a hot reload has to re-seat
-  // it before anything reads a stale pointer. Profiles are re-resolved with it,
-  // since a def may have gained or lost its "behavior" key in the same edit.
-  for (Mob& m : mobs_) {
-    if (m.defIndex_ >= 0 && m.defIndex_ < (int)defs_.size()) {
-      m.def_ = &defs_[m.defIndex_];
-      m.ai_ = ai::Brain(behaviors_.Find(defs_[m.defIndex_].behavior));
+  // Room for the compositions, once, so no later append can move a MobDef the
+  // avatar or a live limb is pointing at. See kDerivedDefs.
+  defs_.reserve(defs_.size() + kDerivedDefs);
+  for (size_t i = 0; i < mobs_.size(); i++) {
+    Mob& m = mobs_[i];
+    // FindOrComposeDef, not FindDef: a creature that TURNED is standing there
+    // under a name no file answers to, and a reload that rebuilt the def list
+    // from the directory would otherwise lose exactly the bodies this whole
+    // mechanism exists to make. The name carries the recipe, so it is rebuilt.
+    int at = was[i].empty() ? -1 : FindOrComposeDef(was[i]);
+    if (at < 0 && m.defIndex_ >= 0 && m.defIndex_ < (int)defs_.size()) {
+      // The creature it was is gone from the directory. Nothing here can
+      // rebuild a body, so it keeps the slot it had rather than reading a
+      // pointer into a vector that no longer has that many defs — loudly,
+      // because a creature wearing the wrong def is a content bug that
+      // otherwise presents as a physics one.
+      std::printf("mob: def '%s' is gone; '%s' keeps slot %d ('%s')\n",
+                  was[i].c_str(), was[i].c_str(), m.defIndex_,
+                  defs_[m.defIndex_].name.c_str());
+      at = m.defIndex_;
     }
+    if (at < 0) continue;
+    m.defIndex_ = at;
+    m.def_ = &defs_[at];
+    // Profiles are re-resolved with it, since a def may have gained or lost
+    // its "behavior" key in the same edit.
+    m.ai_ = ai::Brain(behaviors_.Find(defs_[at].behavior));
   }
+}
+
+int MobSystem::FindDef(const std::string& name) const {
+  for (size_t i = 0; i < defs_.size(); i++)
+    if (defs_[i].name == name) return (int)i;
+  return -1;
+}
+
+int MobSystem::FindOrComposeDef(const std::string& name) {
+  const int at = FindDef(name);
+  if (at >= 0) return at;
+  const size_t plus = name.find('+');
+  if (plus == std::string::npos || plus == 0) return -1;
+  std::vector<std::string> fx;
+  for (size_t i = plus + 1; i < name.size();) {
+    const size_t nx = name.find('+', i);
+    const std::string one =
+        name.substr(i, nx == std::string::npos ? std::string::npos : nx - i);
+    if (!one.empty()) fx.push_back(one);
+    if (nx == std::string::npos) break;
+    i = nx + 1;
+  }
+  if (fx.empty()) return -1;
+  return DefWithEffects(name.substr(0, plus), fx, nullptr);
+}
+
+// ---- COMPOSING A CREATURE AT RUNTIME ---------------------------------------
+// The header carries the three-step preference and why it is in that order.
+int MobSystem::DefWithEffects(const std::string& base,
+                              const std::vector<std::string>& fx,
+                              std::string* log) {
+  auto say = [&](const std::string& s) {
+    if (log != nullptr) *log += s;
+    else std::printf("%s", s.c_str());
+  };
+  const int baseAt = FindDef(base);
+  if (baseAt < 0) {
+    say("mob: cannot compose from '" + base + "': no such creature\n");
+    return -1;
+  }
+  if (fx.empty()) return baseAt;
+  auto carries = [](const MobDef& d, const std::vector<std::string>& list) {
+    for (const std::string& e : list)
+      if (std::find(d.effects.begin(), d.effects.end(), e) == d.effects.end())
+        return false;
+    return true;
+  };
+  // 1. it already is.
+  if (carries(defs_[baseAt], fx)) return baseAt;
+  // 2. somebody authored this exact composition (or we built it earlier).
+  // The recipe is base's own effects PLUS the ones asked for, deduplicated —
+  // the same list sidecar::LoadWithEffects will accumulate below, so step 2
+  // recognises exactly what step 3 would have produced.
+  std::vector<std::string> want = defs_[baseAt].effects;
+  for (const std::string& e : fx)
+    if (std::find(want.begin(), want.end(), e) == want.end())
+      want.push_back(e);
+  for (size_t i = 0; i < defs_.size(); i++) {
+    if ((int)i == baseAt) continue;
+    if (defs_[i].extendsName != base) continue;
+    // Set equality, not a subset: "jujunud plus zombie" is not satisfied by
+    // "jujunud plus zombie plus on fire".
+    if (defs_[i].effects.size() != want.size()) continue;
+    if (!carries(defs_[i], want)) continue;
+    return (int)i;
+  }
+  // 3. compose it.
+  if (defFactory_ == nullptr) {
+    say("mob: cannot compose '" + base + "' + effects: the loader's factory "
+        "was never handed over (MobSystem::SetDefFactory)\n");
+    return -1;
+  }
+  if (microSet_ == nullptr) {
+    say("mob: cannot compose '" + base +
+        "' + effects: no micro pool to pack the new body's bricks into\n");
+    return -1;
+  }
+  if (defs_.size() >= defs_.capacity()) {
+    say("mob: refusing to compose from '" + base + "': all " +
+        std::to_string(kDerivedDefs) +
+        " composed-def slots are spent. Every distinct (creature, effects) "
+        "pair costs one for the session; something is asking for new ones "
+        "without repeating.\n");
+    return -1;
+  }
+  const MobDefFactory& fac = *defFactory_;
+  const MobSource* baseSrc = nullptr;
+  for (const MobSource& s : fac.sources)
+    if (s.name == base) baseSrc = &s;
+  if (baseSrc == nullptr) {
+    say("mob: cannot compose from '" + base +
+        "': it has no source file (composed creatures cannot be composed "
+        "from — ask for the base and the full effect list instead)\n");
+    return -1;
+  }
+  MobSource virt = *baseSrc;
+  virt.name = base;
+  for (const std::string& e : fx) virt.name += "+" + e;
+  virt.extendsName = base;
+  std::string buildLog;
+  json j;
+  if (!sidecar::LoadWithEffects(fac.dir, virt.jsonPath, fx, j, buildLog,
+                                nullptr)) {
+    say(buildLog + "mob: '" + virt.name + "' did not resolve\n");
+    return -1;
+  }
+  MobDef def;
+  if (!BuildMobDef(fac, virt, j, *microSet_, def, buildLog)) {
+    say(buildLog + "mob: '" + virt.name + "' did not build\n");
+    return -1;
+  }
+  if (!buildLog.empty()) say(buildLog);
+  say("mob: composed '" + def.name + "' (" + std::to_string(def.limbs.size()) +
+      " limbs, def " + std::to_string(defs_.size()) + ", " +
+      std::to_string(defs_.capacity() - defs_.size() - 1) + " slots left)\n");
+  defs_.push_back(std::move(def));
+  // The reserve in SetDefs is what makes this an append and not a move, so
+  // nothing needs re-seating here — but say so if it ever stops being true.
+  return (int)defs_.size() - 1;
+}
+
+void MobSystem::BookRising(PendingRise r) {
+  if (rises_.size() >= kMaxRisings) {
+    // A massacre is not a licence to grow a queue. The corpses that did not
+    // fit stay corpses, which is the same answer every other bounded queue in
+    // this file gives and the only one that keeps a bad tick from costing the
+    // rest of the session.
+    std::printf("mob: %zu risings already booked; '%s' stays dead\n",
+                rises_.size(), r.def.c_str());
+    return;
+  }
+  rises_.push_back(std::move(r));
+}
+
+// THE CORPSE STANDS UP. Called once per tick from PreTick, after the husk
+// sweep, so a body that died this tick is already debris by the time its own
+// rising is due.
+void MobSystem::ServiceRisings(uint32_t tick) {
+  for (size_t i = 0; i < rises_.size();) {
+    PendingRise& r = rises_[i];
+    // Unsigned wrap is not a hazard here: a rising is booked from the same
+    // clock it is compared against, ticks apart.
+    if (tick < r.atTick) { i++; continue; }
+    const int at = DefWithEffects(r.def, r.fx, nullptr);
+    if (at >= 0) {
+      // THE REMAINS COME OUT OF THE WORLD FIRST. A corpse that got up is not
+      // still lying there, and spawning a rig inside its own flesh hands Jolt
+      // a dozen deep overlaps at once (the same penetration that used to fire
+      // ragdolls out of the player's capsule, Mob::Die).
+      if (debris_ != nullptr)
+        for (uint64_t b : r.bodies) debris_->DestroyBody(b);
+      const uint64_t id = Spawn(at, {ifloor(r.at.x), ifloor(r.at.y),
+                                     ifloor(r.at.z)});
+      if (id != 0) {
+        Mob& now = mobs_.back();
+        now.origin_ = r.at;
+        now.heading_ = now.desiredHeading_ = r.heading;
+        now.bodyY_ = r.bodyY;
+        now.anim_.lastPos = r.at;
+        // What it was already missing stays missing — by NAME, as in TurnMob,
+        // and adopt=false because those pieces are lying where they fell.
+        for (size_t k = 0; k < now.limbs_.size() && k < defs_[at].limbs.size();
+             k++)
+          if (std::find(r.lost.begin(), r.lost.end(), defs_[at].limbs[k].name) !=
+              r.lost.end())
+            if (now.limbs_[k].body) now.DetachLimb((int)k, false);
+        std::printf("mob: '%s' got up as '%s'\n", r.def.c_str(),
+                    defs_[at].name.c_str());
+      }
+    }
+    rises_[i] = std::move(rises_.back());
+    rises_.pop_back();
+  }
+  instancesDirty_ = true;
+}
+
+// ---- A CREATURE GETS UP AS SOMETHING ELSE ----------------------------------
+//
+// Respawn, not mutate. A body is DERIVED from its def — limb boxes, bricks,
+// masses, joints, gait, gore profile, gore materials, the gait's rest sole —
+// and there is exactly one piece of code that derives all of that correctly,
+// which is Spawn. Re-seating `def_` on a live rig would leave every one of
+// those quantities belonging to the creature it used to be, and the one that
+// matters most cannot be re-seated at all: the pale skin is a recolour of THIS
+// def's copy of the art, folded into the shared palette at build time, so the
+// limbs already standing there are painted with the living body's slots.
+//
+// So the turn is: read off what the world can see (where it is, which way it
+// faces, what it has already lost), build the new body there, and drop the old
+// rig without a corpse. It did not die — it got up.
+//
+// WHAT DOES NOT TRAVEL, deliberately, and what it would cost to carry:
+//   * carve damage short of a sever. The new body is freshly rotted by its own
+//     `rot` block instead (MobRotDef, honoured because this is a real spawn),
+//     which is the reading the effect authors: it came apart as it turned.
+//   * a held weapon and worn armour. Both are item-library lookups this system
+//     does not have — Mob keeps the item's NAME, not its def. A turned body
+//     drops what it was carrying the way the rest of the rig does.
+uint64_t MobSystem::TurnMob(uint64_t mobId, const std::vector<std::string>& fx) {
+  Mob* was = FindMobById(mobId);
+  if (was == nullptr || was->def_ == nullptr || !was->alive_) return 0;
+  const int at = DefWithEffects(was->def_->name, fx, nullptr);
+  if (at < 0 || at == was->defIndex_) return 0;
+
+  // Captured BEFORE the spawn below, because that push_back can move `was`.
+  const Vec3 origin = was->origin_;
+  const float heading = was->heading_;
+  const float bodyY = was->bodyY_;
+  std::vector<std::string> lost;   // limbs this creature no longer has
+  for (size_t i = 0; i < was->limbs_.size(); i++)
+    if (was->limbs_[i].body == 0 && i < was->def_->limbs.size())
+      lost.push_back(was->def_->limbs[i].name);
+
+  const uint64_t id = Spawn(at, {ifloor(origin.x), ifloor(origin.y),
+                                 ifloor(origin.z)});
+  if (id == 0) return 0;   // the mob cap or physics refused; leave it living
+  {
+    Mob& now = mobs_.back();
+    now.origin_ = origin;
+    now.heading_ = now.desiredHeading_ = heading;
+    now.bodyY_ = bodyY;
+    now.anim_.lastPos = origin;
+    // BY NAME, because an effect is allowed to append a limb even though it
+    // may not rename or remove one (sidecar.h), so index parity is a rule
+    // about this rig and not about every rig a later effect could describe.
+    // adopt=false: the arm that came off is already lying on the ground as
+    // debris, exactly as in LoadState.
+    for (size_t i = 0; i < now.limbs_.size() && i < defs_[at].limbs.size(); i++)
+      if (std::find(lost.begin(), lost.end(), defs_[at].limbs[i].name) !=
+          lost.end())
+        if (now.limbs_[i].body) now.DetachLimb((int)i, false);
+  }
+  // ...and the creature it was leaves. ReleaseRig is the no-corpse teardown
+  // (Reset uses it): the bodies go, nothing is handed to DebrisSystem. The
+  // swap-with-back is the same erase the husk sweep in PreTick does, and it is
+  // safe against the new mob being `back()` — it simply moves there.
+  for (size_t mi = 0; mi < mobs_.size(); mi++) {
+    if (mobs_[mi].id_ != mobId) continue;
+    mobs_[mi].ReleaseRig();
+    mobs_[mi] = std::move(mobs_.back());
+    mobs_.pop_back();
+    break;
+  }
+  // Every `def_` in the vector is still correct (the defs did not move), but
+  // the swap above moved one Mob, and a Mob holds no back-pointer to itself.
+  instancesDirty_ = true;
+  return id;
 }
 
 void MobSystem::SetBehaviors(ai::Library lib) {
@@ -1906,6 +2256,10 @@ void MobSystem::SetPlayerActor(Vec3 centreVox, float radius, float height,
 void MobSystem::Reset(bool rewindIds) {
   for (Mob& m : mobs_) m.ReleaseRig();
   mobs_.clear();
+  // ...and the corpses that were going to get up do not, because the world
+  // they were lying in is gone: a booked rising names a place and a handful of
+  // debris handles, and both belong to the world that is being torn down.
+  rises_.clear();
   // The AI's two derived mirrors: the per-tick actor list PreTick rebuilds and
   // the attack requests nobody has drained yet. Both are pure derived state, so
   // a Reset simply drops them (game/mob.h AttackRequests).
@@ -5724,6 +6078,9 @@ void MobSystem::PreTick(uint32_t tick, World& world, std::vector<BrushOp>& ops,
                         std::vector<CellOp>& cellOps,
                         std::vector<ParticleSpawn>& spawns) {
   const float dt = 1.0f / 30.0f;
+  // The clock a rising is booked against (Mob::Die runs from inside a damage
+  // path, which has no tick to hand).
+  tick_ = tick;
   // Per-voxel burning and dissolution, once per TICK — never per frame. The
   // pass writes fire into the hashed grid, so running it off the render clock
   // would make the world a function of frame rate.
@@ -5908,6 +6265,10 @@ void MobSystem::PreTick(uint32_t tick, World& world, std::vector<BrushOp>& ops,
   // bursts (splatter). After every wound has bled, so a gout reaches the
   // creature beside it on the tick it happens.
   StainLimbs(tick, world);
+  // ...and the corpses whose clock came round stand up. LAST, and outside the
+  // loop above: this spawns, and a spawn pushes to the vector that loop is
+  // walking by index.
+  ServiceRisings(tick);
 }
 
 void Mob::DrainPendingSpawns(World& world, std::vector<ParticleSpawn>& spawns) {
@@ -15096,11 +15457,44 @@ void Mob::Die() {
     if (hi >= (int)limbs_.size() || !limbs_[(size_t)hi].body) continue;
     dyingStraps.push_back(DyingStrap{shell.body, limbs_[(size_t)hi].body});
   }
+  // ---- IS THIS ONE GOING TO GET UP AGAIN (MobDef::Turn) --------------------
+  //
+  // Booked HERE, in the one place the rig is still whole and the cause is
+  // still readable, and serviced ticks later by MobSystem::PreTick — nothing
+  // may spawn a mob from inside Die(), which is running on a Mob that lives in
+  // the vector a spawn pushes to.
+  //
+  // The test is the rot the bite left in the flesh (MobLimb::infectMat), not a
+  // death-cause enum: what turns you is having the disease in you when you
+  // die, so a creature that crawls away from the fight and bleeds out in a
+  // ditch still gets up, and one killed cleanly by a sword does not.
+  MobSystem::PendingRise rise;
+  bool rising = false;
+  if (sys_ != nullptr && def_ != nullptr && !def_->turn.into.empty()) {
+    int rotten = 0;
+    for (const MobLimb& l : limbs_)
+      if (l.infectMat != 0) rotten++;
+    rising = rotten >= def_->turn.infectedLimbs;
+  }
+  if (rising) {
+    rise.def = def_->name;
+    rise.fx.push_back(def_->turn.into);
+    rise.at = origin_;
+    rise.heading = heading_;
+    rise.bodyY = bodyY_;
+    rise.atTick = sys_->tick_ + (uint32_t)std::lround(def_->turn.afterSec * 30.0);
+    // What it had already lost, read before the loop below zeroes the rest.
+    for (size_t i = 0; i < limbs_.size() && i < def_->limbs.size(); i++)
+      if (limbs_[i].body == 0) rise.lost.push_back(def_->limbs[i].name);
+  }
   // whole-body ragdoll: every limb goes dynamic and becomes debris; joints
   // stay so the corpse hangs together until pieces get culled or settle
   for (size_t i = 0; i < limbs_.size(); i++) {
     MobLimb& limb = limbs_[i];
     if (!limb.body) continue;
+    // The remains, so the rising can take them out of the world rather than
+    // stand a second body up inside them.
+    if (rising) rise.bodies.push_back(limb.body);
     // Same reason as DetachLimb: the lattice is handed to DebrisSystem here,
     // and an unflushed burn tombstone must not travel with it.
     StripBurnTombstones(limb);
@@ -15148,6 +15542,9 @@ void Mob::Die() {
   if (debris_)
     for (const DyingStrap& ds : dyingStraps)
       debris_->StrapBody(ds.shell, ds.host);
+  // ...and the rising goes on the books now that the remains are debris and
+  // the handles in it name things somebody else owns.
+  if (rising) sys_->BookRising(std::move(rise));
   MarkInstancesDirty();
   if (reportCorpse) sys_->onCorpse_(corpse);
   // Death goes straight to ragdoll (no hold): the whole body flips at once,
@@ -16025,9 +16422,11 @@ bool MobSystem::LoadState(const uint8_t* data, size_t len, uint32_t version) {
     // was the day the save was written. A missing def skips the mob (the save
     // stays loadable when a creature is retired) — loudly, so retired art
     // silently eating saved mobs cannot masquerade as a load bug.
-    int defIndex = -1;
-    for (size_t d = 0; d < defs_.size(); d++)
-      if (defs_[d].name == defName) defIndex = (int)d;
+    // ...and a name that no file answers to may still be a COMPOSITION this
+    // session can rebuild — `jujunud+zombie` is a villager that turned, and it
+    // is spelled out in the name precisely so that the save needs to know
+    // nothing about effects (FindOrComposeDef).
+    const int defIndex = FindOrComposeDef(defName);
     if (defIndex < 0) {
       std::printf("mob: saved def '%s' no longer exists; skipping\n",
                   defName.c_str());

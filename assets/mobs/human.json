@@ -56,6 +56,14 @@
       }
     }
   },
+  "//turn": "WHAT A PERSON GETS UP AS. A body that dies with the rot still in it (MobLimb::infectMat, which is what a zombie's bite leaves in the flesh) is not finished: its remains are taken out of the world after `afterSec` and it stands up as ITSELF plus the `into` EFFECT -- a turned villager keeps the villager's proportions, art and rig, because MobSystem::DefWithEffects composes the variant from the body that died rather than swapping in a stock zombie. `into` names an effect and not a creature for exactly that reason. Inherited by every character through `extends`, which is the point: anybody the disease reaches turns. The zombie effect deletes this key on its own bodies (`\"turn\": null`), so the dead stay dead the second time.",
+  "turn": {
+    "into": "zombie",
+    "//afterSec": "How long the corpse lies there first. Six seconds is long enough to read as a corpse -- to fall, settle and be looked at -- and short enough that the player who killed it is still nearby when it moves.",
+    "afterSec": 6.0,
+    "//infectedLimbs": "How much of the body has to carry the rot. One limb: a single bite that got through is enough, which is the rule the bite already implies (armour that stops the tear stops the infection outright, melee.h).",
+    "infectedLimbs": 1
+  },
   "speed": 31.5,
   "gait": {
     "groups": [

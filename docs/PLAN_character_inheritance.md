@@ -1,10 +1,12 @@
 # PLAN: characters INHERIT the human; zombie is an EFFECT
 
-Status: **LANDED 2026-09-20, phases 1-5a.** Phase 5b (lazy `DefWithEffects` at
-spawn + per-mob `effects` in the save) and phase 6 (the player's corpse) are
-NOT implemented; see "What landed, and what did not" at the bottom of this file
-for the reason and for the two places the plan's own premises did not survive
-contact. The design below is otherwise as shipped. Brief:
+Status: **LANDED 2026-09-20, phases 1-5b.** Phase 6 (the player's corpse)
+is superseded in part: the avatar books a rising through the same
+`Mob::Die` path every NPC does, so a player who dies infected leaves an NPC
+zombie of themselves — what phase 6 still describes is carrying the player's
+own carved limb lattices onto it. See "What landed, and what did not" at the
+bottom of this file, including the two places the plan's own premises did not
+survive contact. The design below is otherwise as shipped. Brief:
 `docs/PROMPT_character_inheritance.md`. Ground truth below was read off the
 tree at `2c4f29b` by four read-only research passes (loader, generator,
 zombie/save, anatomy); every claim carries a `file:line`.
@@ -432,38 +434,52 @@ rather than `test_mobgen.mjs`, and the `model`-ignored warning fires only on an
 EXPLICIT `model` key, not on one implied by `extends` — otherwise every thin
 character would warn about its own art.
 
-### Not landed: phase 5b, and why
+### Phase 5b, as landed (2026-09-20)
 
-`MobSystem::DefWithEffects` cannot be built without the LOADER. §1.4 already
-establishes why an effect cannot be a per-instance flag: `palette` is applied
-before `MicroBodyMergeArt` dedupes by RGB, so a per-mob bit could not recolour
-anything, and a field-by-field copy of an existing `MobDef` would give an
-unrecoloured zombie. So a derived def has to be built the way every other def
-is — which means `LoadMobDefs` has to be able to build ONE def from a virtual
-source, which means extracting its ~1,080-line per-source loop body into a
-function.
+| piece | where |
+|---|---|
+| `BuildMobDef` + `MobDefFactory` | `mob.cpp` — the per-source loop body of `LoadMobDefs`, extracted (a 1,048-line dedent, no logic moved). `LoadMobDefs` is now the loop that calls it; `factoryOut` hands the dir + materials + clip library to `MobSystem::SetDefFactory` |
+| `MobSystem::DefWithEffects(base, fx)` | authored-wins -> already-carries -> compose as `<base>+<fx>`, capped at `kDerivedDefs` = 64 |
+| `sidecar::LoadWithEffects` | resolve a chain and pour extra effects on it; `Load` is it with an empty list. `baseOut` reports the file's own `extends`, which the resolver otherwise erases |
+| `MobDef::extendsName` / `effects` | the recipe, kept, so a composition can be RECOGNISED instead of re-derived |
+| `SetDefs` re-seats BY NAME | and composes a name no file answers to, so a turned creature survives an R |
+| save | NO format change. `SaveState` already wrote the def NAME; `FindOrComposeDef` splits `base+fx` and rebuilds it |
+| `MobDef::Turn` + `Mob::Die` booking + `MobSystem::ServiceRisings` | a body that dies with `MobLimb::infectMat` in it gets up `afterSec` later as a zombie of itself, its remains destroyed rather than left under it |
+| `MobSystem::TurnMob` | the same, without the death, for a live creature |
+| gate `zombify` | six arms: authored-wins, composed-is-real, built-once, turn, rise, save round-trip. PASS |
 
-That refactor re-indents the largest function in the most contended file in the
-repo. `src/game/mob.cpp` is held by two live claims (`agent-6b01a8`, ~11 hours
-old at the time of writing; `agent-830b5e`), and §6 of this plan already says to
-rebase the one-line `LoadMobDefs` edits after they land. A re-indent of a
-thousand lines is not a rebase.
+**Both blockers this section used to claim were smaller than they looked.**
 
-There is a second, independent blocker: even with the extraction, synthesising a
-def mid-session means rebuilding the shared micro-body pool and re-uploading it,
-which is `main.cpp`'s job. `MobSystem` cannot trigger that itself.
+The `main.cpp`-only reload was not needed at all: the micro pool and the shared
+art palette both APPEND (`MicroBodyPack` / `MicroBodyMergeArt` dedupe into the
+existing tables, so no live index moves), and the frame loop already calls
+`UploadMicroBodies` whenever `mbSet.dirty` — which `MicroBodyPack` sets. A
+composed def's bricks reach the GPU on the tick they are packed, with no new
+plumbing.
 
-The per-mob `effects` half of the save was deliberately NOT landed on its own.
-Without `DefWithEffects` there is no producer for the field, and a save format
-that carries a value nothing can set is the "unasked mechanic to keep a gate
-green" this repo has a rule about.
+The extraction did re-indent a thousand lines of the most contended file in the
+repo, and the thing that made it safe was checking rather than assuming:
+`mob.cpp` was CLEAN at `HEAD` when this landed (`git status`), both holders'
+uncommitted work was in `melee.*`/`selftest_impact.cpp`, and the transform was
+mechanical — a two-space dedent of `655..1695`, two `continue`s turned into
+`return false`, the `out` parameter renamed `defOut` because two lambdas inside
+the body already bind that name.
 
-Nothing in phases 1-5a needs changing for 5b: the resolver already accepts an
-accumulated `effects` list, `MobSystem::LoadState` already resolves a def BY
-NAME (so a derived def round-trips by name with no format change at all), and
-`assets/mobs/jujunud_zombie.json` is the file form of exactly what
-`DefWithEffects` would synthesise. What is left is the extraction and the
-reload path.
+**One content trap, found by `test_mobgen.mjs` §M and worth carrying
+forward.** `mobgen.thinSidecar` diffs a generated body against the resolved
+base, and `diffAgainst` turns a key the base has and the body does not into an
+explicit `null`. Adding `turn` to `human.json` therefore DELETED it from every
+generated character — a rule that would have silently stripped whatever the
+next inherited-only key is. `thinSidecar` now fills unmentioned keys from the
+base before diffing: a generated body describes a SHAPE, and absent means
+inherited.
 
-Phase 6 (the player's corpse) is unchanged: the plan already declares it a
-sketch and its own plan.
+Phase 6 (the player's corpse) is HALF superseded. The avatar's limbs go to
+DebrisSystem through the same `Mob::Die` the NPCs use, so it books a rising
+through the same path and no player-specific code exists at all: you die of the
+bite, you respawn, and the thing wearing your face is an NPC zombie of you.
+What the phase still describes is the other half — carrying the player's OWN
+carved limb lattices onto that body, so the arm you lost in the fight is the
+arm the zombie is missing. Today it rises with a freshly-rotted body from its
+own `rot` block instead (and with the sever state, which the rising does
+carry). That is a `LoadState`-style lattice overlay and its own piece of work.

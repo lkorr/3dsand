@@ -5033,7 +5033,7 @@ two ticks a level, a value an author can set -- it falls to 62 in 47 ticks; a
 direct deposit on a stone cell of the room reads blood's slot at amount 5 and
 the cell is still stone.
 
-### A creature is a variant of another creature (2026-09-15, inheritance 2026-09-20; `src/game/sidecar.*` + `assets/editor/sidecar.js`, sidecar `extends`/`model`/`effects`/`palette`, `assets/mobs/effects/`, `MobDef::undead`, `MobRotDef`, `Mob::RotAtSpawn`, gates `sidecar-resolve` + `undead`)
+### A creature is a variant of another creature (2026-09-15, inheritance + becoming one at runtime 2026-09-20; `src/game/sidecar.*` + `assets/editor/sidecar.js`, sidecar `extends`/`model`/`effects`/`palette`/`turn`, `assets/mobs/effects/`, `BuildMobDef` + `MobDefFactory`, `MobSystem::DefWithEffects`/`TurnMob`, `MobDef::undead`, `MobRotDef`, `Mob::RotAtSpawn`, gates `sidecar-resolve` + `undead` + `zombify`)
 
 A zombie is a human who walks slower, is paler, does not heal, and arrives
 already bitten. Four differences, none of them geometry — and the first design
@@ -5115,12 +5115,54 @@ fraction of the leg.
 An effect may not rename or remove a part. The rig vocabulary is the contract
 every other system binds to by name.
 
-**Effects are LOAD-TIME, producing derived defs, and that is forced rather than
-chosen.** `palette` is a per-def filter applied before `MicroBodyMergeArt`
-dedupes by RGB, and the per-instance GPU struct has no spare word — so a
-per-mob "is a zombie" bit could not recolour anything. A spawn-time API (a
-player's corpse turning) therefore wants a LAZY derived def synthesised through
-the same resolver, which is designed for and not yet built.
+**An effect produces a DERIVED DEF, and that is forced rather than chosen.**
+`palette` is a per-def filter applied before `MicroBodyMergeArt` dedupes by
+RGB, and the per-instance GPU struct has no spare word — so a per-mob "is a
+zombie" bit could not recolour anything, and a field-by-field copy of an
+existing `MobDef` would give an unrecoloured zombie. A creature that becomes
+something else has to be BUILT, by the loader, from a sidecar.
+
+**...which is why the loader can build ONE (2026-09-20).** `BuildMobDef`
+(`mob.cpp`) is everything that turns one (art, resolved sidecar) pair into a
+`MobDef`; `LoadMobDefs` is now a loop over the directory that calls it, and
+`MobDefFactory` is the leftovers it needs — the mob dir, the material table,
+the clip library — handed to `MobSystem::SetDefFactory` beside the defs.
+`MobSystem::DefWithEffects(base, fx)` then composes a creature while the world
+is running: **an authored composition wins** (`human` + zombie resolves to the
+`zombie` def on disk, `jujunud` + zombie to `jujunud_zombie.json`), a base that
+already carries the effect answers for itself, and only otherwise is a def
+composed and appended as `<base>+<fx>`.
+
+Three properties make that safe, and all three are load-time facts rather than
+runtime machinery. The micro pool and the shared art palette both APPEND
+(`MicroBodyPack` / `MicroBodyMergeArt` dedupe into the existing tables), so no
+live body's model index or palette slot moves, and the frame loop's
+`if (mbSet.dirty) UploadMicroBodies` publishes the new bricks the same tick —
+no reload path was needed. `SetDefs` reserves room for `kDerivedDefs` (64)
+compositions up front, so the append never reallocates the vector every
+`Mob::def_` and the avatar's `def_` point into, and `DefWithEffects` refuses
+once that room is gone (rule 2: the cap is on distinct recipes, so a hundred
+villagers turning cost one def). `SetDefs` re-seats live mobs **by name**, not
+by index, and composes a name nothing on disk answers to.
+
+**The name carries the recipe, and that is the whole save story.** `SaveState`
+writes the def NAME it always wrote; `FindOrComposeDef` splits `base+fx` and
+rebuilds it. No version bump, no `effects` field, no migration.
+
+**And a body that dies with the rot in it gets up.** Sidecar `turn`
+(`{into, afterSec, infectedLimbs}`, on the human and inherited by every
+character) is read by `Mob::Die`, which books a rising — where it was, which
+way it faced, which limbs it had already lost, and the debris handles its
+remains became — and `MobSystem::PreTick` services it: the remains are
+destroyed and the creature stands up as `DefWithEffects(itself, {into})`. The
+test is `MobLimb::infectMat`, the rot a zombie's bite leaves in the flesh, so
+what turns you is having the disease in you when you die and not what finally
+killed you. `MobSystem::TurnMob` is the same thing without the death, for a
+live creature. The zombie effect deletes `turn` (`"turn": null`), because a
+world where corpses of zombies get up again is unbounded. THE AVATAR BOOKS ONE
+TOO, through exactly the same path — you respawn, and the thing wearing your
+face is an NPC. Gate: `zombify` (six arms, the last two a turn and a save
+round-trip).
 
 `assets/mobs/zombie.json` is three lines: `extends: human`, `effects:
 ["zombie"]`. There is no `zombie.vox`, and `jujunud_zombie.json` is the same

@@ -4792,7 +4792,9 @@ int main(int argc, char** argv) {
       {
         std::vector<MobDef> defs;
         std::string ml;
-        LoadMobDefs(ad + "/mobs", m, defs, stMbSet, ml);
+        std::shared_ptr<MobDefFactory> stFac;
+        LoadMobDefs(ad + "/mobs", m, defs, stMbSet, ml, &stFac);
+        stMobs.SetDefFactory(std::move(stFac));
         ItemLibrary stItems;
         std::string ie;
         LoadItems(ad + "/items", m.size(), stMbSet, stItems, ie);
@@ -5166,7 +5168,11 @@ int main(int argc, char** argv) {
   {
     std::vector<MobDef> mobDefs;
     std::string mlog;
-    LoadMobDefs(assetDir + "/mobs", mats, mobDefs, mbSet, mlog);
+    std::shared_ptr<MobDefFactory> mobFac;
+    LoadMobDefs(assetDir + "/mobs", mats, mobDefs, mbSet, mlog, &mobFac);
+    // Beside the defs, and for the same lifetime: this is what lets a creature
+    // become a variant of itself later (MobSystem::DefWithEffects).
+    mobs.SetDefFactory(std::move(mobFac));
     if (!mlog.empty()) std::fprintf(stderr, "%s", mlog.c_str());
     std::printf("loaded %zu mob defs (%zu micro-body limb models, %zu pool words)\n",
                 mobDefs.size(), mbSet.models.size(), mbSet.pool.size());
@@ -7527,7 +7533,13 @@ int main(int argc, char** argv) {
         // so the cached sphere models die with them (material ids can remap)
         mbSet = MicroBodySet{};
         sphereModels.clear();
-        LoadMobDefs(assetDir + "/mobs", mats, mobDefs, mbSet, mlog);
+        {
+          std::shared_ptr<MobDefFactory> rFac;
+          LoadMobDefs(assetDir + "/mobs", mats, mobDefs, mbSet, mlog, &rFac);
+          // The factory reloads with the defs: it carries the material table
+          // and the clip library, both of which this R may have changed.
+          mobs.SetDefFactory(std::move(rFac));
+        }
         if (!mlog.empty()) std::fprintf(stderr, "%s", mlog.c_str());
         // Items MUST reload here too: their bricks live in the pool that was
         // just thrown away, so a stale ItemDef would hold a model index into
