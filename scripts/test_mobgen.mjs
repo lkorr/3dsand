@@ -177,6 +177,30 @@ function rebaseline() {
 
 if (process.argv.includes('--rebaseline')) { rebaseline(); process.exit(0); }
 
+/** `//`-prefixed keys are authoring notes for a human reader (human.json
+ *  carries several), never read by the loader, and not something a generator
+ *  should be asked to reproduce word for word. */
+function noNotes(o) {
+  if (Array.isArray(o)) return o.map(noNotes);
+  if (o && typeof o === 'object') {
+    const r = {};
+    for (const k of Object.keys(o)) if (!k.startsWith('//')) r[k] = noNotes(o[k]);
+    return r;
+  }
+  return o;
+}
+
+/** An omitted loco-rule field is its DEFAULT, so two rule tables have to be
+ *  compared against the loader's defaults rather than against the files'
+ *  punctuation: mob.cpp reads `s.value("bodyYOffset", 0.0f)`, and human.json
+ *  writes a 0 on three prone rules where the generator leaves it out. Same
+ *  fact, and a comparison that called it a difference would be reporting JSON
+ *  style. The defaults here are mob.cpp's own (LoadMobDefs), not guesses. */
+const fillState = s => ({
+  bodyYOffset: 0, groundAlign: 0, disableGait: false, speedScale: 1,
+  missing: [], missingAny: [], minChainsLost: 0, ...noNotes(s),
+});
+
 // =============================================================================
 // 1. the port is faithful
 // =============================================================================
@@ -1076,27 +1100,6 @@ section('L. the rig contract matches assets/mobs/human.json, the standard');
     { materials, player: tuning.player, avatar: avatarConstants(),
       name: 'human' }).sidecar;
 
-  // `//`-prefixed keys are authoring notes for a human reader (human.json
-  // carries several), never read by the loader, and not something a generator
-  // should be asked to reproduce word for word.
-  const noNotes = o => {
-    if (Array.isArray(o)) return o.map(noNotes);
-    if (o && typeof o === 'object') {
-      const r = {};
-      for (const k of Object.keys(o)) if (!k.startsWith('//')) r[k] = noNotes(o[k]);
-      return r;
-    }
-    return o;
-  };
-  // An omitted rule field is its default, so the comparison has to be made
-  // against the loader's defaults rather than against the file's punctuation:
-  // mob.cpp reads `s.value("bodyYOffset", 0.0f)`, and human.json states a 0 on
-  // three prone rules where this generator simply leaves it out. Same fact.
-  const fillState = s => ({
-    bodyYOffset: 0, groundAlign: 0, disableGait: false, speedScale: 1,
-    missing: [], missingAny: [], minChainsLost: 0, ...noNotes(s),
-  });
-
   for (const [k, what] of [
     ['limbs', 'the limb table — hp, sever speeds, joints, pose limits, anchors'],
     ['chains', 'the IK chains'],
@@ -1141,6 +1144,62 @@ section('L. the rig contract matches assets/mobs/human.json, the standard');
   const da = diff(noNotes(mine.anatomy), noNotes(shipped.anatomy), 'anatomy');
   ok(!da, 'the anatomy recipe is the shipped human’s, head override and all',
      da);
+}
+
+// =============================================================================
+// 6. and every character ALREADY ON DISK carries it too
+// =============================================================================
+
+section('M. the characters in assets/mobs carry the current rig');
+{
+  // A generator that is right and a pool that is stale is the same bug with an
+  // extra step. Every sidecar carrying a `genome` block was written by this
+  // generator and can be REGENERATED from it (`node scripts/gen_mobs.mjs
+  // <name> --rebake`), so "is this file current?" is a question with an exact
+  // answer: rebuild it from its own genome and compare.
+  //
+  // The two things that are NOT compared are the two that legitimately differ:
+  // the `.vox` (the art is on disk and this section does not re-bake anatomy,
+  // which is what gen_mobs.mjs is for) and the `genome` block itself (it is
+  // the input). Everything else is the rig, and the rig is not allowed to
+  // drift from the generator OR from the human the generator now matches.
+  //
+  // A `extends` sidecar (a colour variant, zombie.json's shape) has no genome
+  // and no rig of its own — it inherits its base's, so there is nothing here
+  // to check and nothing that can rot.
+  const mobsDir = path.join(ROOT, 'assets/mobs');
+  const pool = fs.readdirSync(mobsDir).filter(f => f.endsWith('.json'))
+    .map(f => [f.replace(/\.json$/, ''), readJson(path.join(mobsDir, f))])
+    .filter(([, d]) => d && d.genome);
+  ok(pool.length > 0, 'there is at least one generated character to check',
+     'none found in assets/mobs — has the pool moved?');
+
+  const shippedStates = readJson(path.join(ROOT, 'assets/mobs/human.json')).states;
+  for (const [name, onDisk] of pool) {
+    let fresh;
+    try {
+      fresh = mg.generateMob(mg.normalizeGenome(onDisk.genome), 0,
+        { materials, player: tuning.player, avatar: avatarConstants(), name })
+        .sidecar;
+    } catch (e) {
+      ok(false, `${name}: regenerates from its own genome`, e.message);
+      continue;
+    }
+    const strip = o => {
+      const r = JSON.parse(JSON.stringify(o));
+      delete r.genome;
+      return r;
+    };
+    const d = diff(strip(onDisk), strip(fresh), name);
+    ok(!d, `${name}.json is what its genome generates today`,
+       `${d}\n        re-bake it: node scripts/gen_mobs.mjs ${name} --rebake`);
+    // Stated separately because it is the one that shows up as a BUG IN THE
+    // GAME rather than as a stale file: a body with no feet that bounces, or
+    // one whose head has a third of the standard's hp.
+    const ds = diff(noNotes(onDisk.states).map(fillState),
+                    noNotes(shippedStates).map(fillState), `${name}.states`);
+    ok(!ds, `${name} uses the shipped human’s locomotion ladder`, ds);
+  }
 }
 
 // =============================================================================

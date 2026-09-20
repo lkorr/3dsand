@@ -62,6 +62,7 @@ import math
 import os
 import re
 import struct
+import sys
 
 # ---- material ---------------------------------------------------------------
 # PALETTE CONVENTION (PLAN_voxel_art_and_mobs.md A1): .vox palette index i+1 ==
@@ -637,7 +638,17 @@ def to_engine(scene_xyz, min_x, max_y):
 
 def main():
     root = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+    # `--out <dir>` writes somewhere else. It exists so this generator can be
+    # run as a REFERENCE without clobbering the shipped asset: assets/mobs/
+    # human.{vox,json} have been hand-extended well past this file (anatomy
+    # baked into the interior, clothing dye in the art palette, extra clips, a
+    # shallower torso), so a bare run here is a REGRESSION, not a regeneration.
+    # scripts/test_mobgen.mjs --rebaseline uses this to pin assets/editor/
+    # mobgen.js, the port that replaces this script.
     out_dir = os.path.join(root, "assets", "mobs")
+    argv = sys.argv[1:]
+    if "--out" in argv:
+        out_dir = argv[argv.index("--out") + 1]
     os.makedirs(out_dir, exist_ok=True)
 
     # ---- the contracts, asserted against the files that declare them --------
@@ -812,18 +823,25 @@ def main():
                        mn[1] + size[1] * 0.5 + dy * U, z))
 
     # ---- limbs --------------------------------------------------------------
-    # hp / severImpactSpeed carried over from mina unchanged: extremities come
-    # off easily and the spine does not.
+    # hp: extremities come off easily and the spine does not. The absolute
+    # scale is NOT arbitrary and is not this file's to choose — it is the one
+    # the wound model was calibrated against in 6b8623f, which made damage
+    # depth-weighted (materials.json `woundHp`) and gave the head a `brain`
+    # core costing gore.brainHpPerVoxel flat per voxel lost. At head 135 that
+    # is roughly "five voxels of brain is fatal"; at a third of it, a nick is.
+    # These are the SHIPPED human's numbers (assets/mobs/human.json), and a
+    # generated character that does not carry them is a paper doll next to the
+    # standard. severImpactSpeed is unchanged — severing is still geometric.
     hips_sz, hips_mn = LIMBS["hips"]
     waist_z = hips_mn[2] + hips_sz[2]
     limbs = [
-        {"name": "hips", "hp": 60, "severable": False, "tag": "spine"},
-        {"name": "torso", "parent": "hips", "joint": "ball", "hp": 60,
+        {"name": "hips", "hp": 180, "severable": False, "tag": "spine"},
+        {"name": "torso", "parent": "hips", "joint": "ball", "hp": 180,
          "severable": False, "vital": True, "tag": "spine",
          "anchor": joint_at("hips", waist_z - 2 * U)},
         # neck: the top of the torso. This head model's origin IS its base (the
         # neck stub is the bottom three rows), so this is the seam.
-        {"name": "head", "parent": "torso", "joint": "ball", "hp": 22,
+        {"name": "head", "parent": "torso", "joint": "ball", "hp": 135,
          "severable": True, "vital": True, "tag": "head",
          "anchor": joint_top("torso", inset=1), "severImpactSpeed": 20.0,
          # `gain` is read against velocity NORMALIZED by `speed` (kSpringVelScale
@@ -840,7 +858,7 @@ def main():
         inward = [-1, 0, 0] if side == "L" else [1, 0, 0]
         limbs.append({
             "name": f"armU.{side}", "parent": "torso", "joint": "ball",
-            "hp": 16, "severable": True, "tag": "arm",
+            "hp": 48, "severable": True, "tag": "arm",
             "anchor": joint_top(f"armU.{side}"),      # shoulder
             # THE SHOULDER, and the reason the one-axis form used by the hip and
             # knee below is not enough for it. That form bounds one component of
@@ -880,7 +898,7 @@ def main():
             "severImpactSpeed": 15.0})
         limbs.append({
             "name": f"armL.{side}", "parent": f"armU.{side}", "joint": "hinge",
-            "hp": 13, "severable": True, "tag": "arm", "axis": [1, 0, 0],
+            "hp": 39, "severable": True, "tag": "arm", "axis": [1, 0, 0],
             "minAngle": -2.4, "maxAngle": 0.05,
             "anchor": joint_top(f"armL.{side}"),      # elbow
             # AN ELBOW IS A HINGE, and `hinge: true` is what makes that true of
@@ -905,13 +923,13 @@ def main():
             "severImpactSpeed": 13.0})
         limbs.append({
             "name": f"hand.{side}", "parent": f"armL.{side}", "joint": "ball",
-            "hp": 9, "severable": True, "tag": "hand",
+            "hp": 27, "severable": True, "tag": "hand",
             "anchor": joint_top(f"hand.{side}"),      # wrist
             "severImpactSpeed": 9.0})
     for side in ("L", "R"):
         limbs.append({
             "name": f"legU.{side}", "parent": "hips", "joint": "ball",
-            "hp": 22, "severable": True, "tag": "leg",
+            "hp": 66, "severable": True, "tag": "leg",
             "anchor": joint_top(f"legU.{side}"),      # hip
             # RANGE OF MOTION FOR THE ANIMATION, which the minAngle/cone limits
             # elsewhere in this sidecar do NOT provide: those are Jolt
@@ -938,7 +956,7 @@ def main():
             "severImpactSpeed": 18.0})
         limbs.append({
             "name": f"legL.{side}", "parent": f"legU.{side}", "joint": "hinge",
-            "hp": 18, "severable": True, "tag": "leg", "axis": [1, 0, 0],
+            "hp": 54, "severable": True, "tag": "leg", "axis": [1, 0, 0],
             "minAngle": -2.4, "maxAngle": 0.05,
             "anchor": joint_top(f"legL.{side}"),      # knee
             # A knee flexes one way and does not hyperextend. Flexion swings the
@@ -953,7 +971,7 @@ def main():
             "severImpactSpeed": 16.0})
         limbs.append({
             "name": f"foot.{side}", "parent": f"legL.{side}", "joint": "hinge",
-            "hp": 12, "severable": True, "tag": "foot", "axis": [1, 0, 0],
+            "hp": 36, "severable": True, "tag": "foot", "axis": [1, 0, 0],
             "minAngle": -0.6, "maxAngle": 0.6,
             # ankle: above the sole, at the BACK of the foot (the toes reach
             # forward from here) so it pivots the way an ankle does
@@ -1017,19 +1035,31 @@ def main():
             "name": f"fist.{side}",
             "part": f"hand.{side}",
             "edge": {
-                "from": part_local(f"hand.{side}", 0.50, 0.90, 0.50),
-                "to": part_local(f"hand.{side}", 0.50, 0.15, 1.05),
+                # THE SEGMENT IS THE HAND, NOT A SPIKE OUT OF IT. It used to
+                # end at 1.05 of the box depth so the tip stood a hair proud of
+                # the knuckles, which mattered while the probe rays were cast
+                # along the EDGE's own axis. They are not any more: a fist is
+                # `EdgeSweep::selfMounted` and probes along its TRAVEL, because
+                # a natural weapon is not wrist-steered and its axis runs back
+                # up the arm swinging it (d4ecbfa). With the direction coming
+                # from somewhere else, the only job left for these two points
+                # is to SPAN the striking part, so they run down the middle of
+                # the hand from just under the wrist to just under the fist.
+                "from": part_local(f"hand.{side}", 0.50, 0.95, 0.50),
+                "to": part_local(f"hand.{side}", 0.50, 0.05, 0.50),
                 # About 0.5 world voxels at 10 cm: a fist is ~10 cm across and
                 # the half-width is a carve RADIUS, so the full width is the
                 # hand. Authored in skin units like the points, and divided by
                 # the same ArtToWorld.
                 "halfWidth": 4.0,
             },
-            # PURE TRAUMA. A bare fist takes no voxels off anybody (impact.h:
-            # `bluntCarve` 0 is "bruise, never dent") — an iron gauntlet worn
-            # over this same fist REPLACES the profile and does, which is why
-            # the number lives on the item and not here.
-            "strike": {"blunt": 4.0},
+            # MOSTLY TRAUMA. `bluntCarve` 0 is "bruise, never dent" and that
+            # was the fist's profile until 96c86d5: a bare punch left a mark
+            # and never a mark in the SURFACE, so a fistfight could not scrape
+            # a knuckle or split a lip. 0.3 is a token dent — an iron gauntlet
+            # worn over this same fist REPLACES the profile with a real one,
+            # which is why the large number still lives on the item.
+            "strike": {"blunt": 4.0, "bluntCarve": 0.3},
         })
     # THE FRONT OF THE FACE. From inside the skull, level with the mouth (the
     # head box runs z 52..67 with EYE_Z at 60, so the mouth sits around 0.37 of
@@ -1050,7 +1080,16 @@ def main():
             # not the wound. Measured: 4.3 voxels short of the victim at 1.05,
             # landing at 1.70 with halfWidth 12.
             "to": part_local("head", 0.50, 0.28, 1.70),
-            "halfWidth": 12.0,
+            # HOW WIDE A MOUTH IS, and it is the size of the BITE rather than
+            # the size of the teeth: the sweep probes a capsule of this radius
+            # about the edge segment, so it is the one number that says how
+            # close the jaws have to come to count as closing on something.
+            # 12 (1.5 world voxels) was narrower than the head it is on and
+            # made a bite a needle threaded at arm's length -- against a moving
+            # leg, most swings that looked like contact were not. 19 is 2.4
+            # voxels, about the width of the skull, which is the honest answer
+            # to "what did the mouth cover".
+            "halfWidth": 19.0,
         },
         # A BITE IS MOSTLY A TEAR. The small blunt part is the head-butt a set
         # of jaws arrives attached to. What the tear CARRIES — rot, ichor — is
@@ -1136,27 +1175,34 @@ def main():
     clips = {}
 
     # idle: a slow breath in the spine and a drifting head. Small amplitudes.
+    # A BREATH IS 8 SECONDS, NOT 3.2. The amplitudes here are already tiny
+    # (1.4 degrees of spine, 5 of head yaw) and at the old period they read as
+    # a fidget rather than as breathing — the smaller the excursion, the slower
+    # it has to be to look like anything but a twitch. The shipped human was
+    # retimed by 2.5x in commit 96c86d5 and this is that retime, so a generated
+    # figure idles at the same rate the standard does. Every key scales; the
+    # quaternions do not move.
     clips["idle"] = {
-        "durationMs": 3200, "loop": True, "mode": "additive",
+        "durationMs": 8000, "loop": True, "mode": "additive",
         "blendInMs": 400, "blendOutMs": 400,
         "mask": ["torso", "head", "armU.L", "armU.R"],
         "tracks": {
             "torso": {"rot": [{"t": 0, "q": qx(0), "ease": "quadInOut"},
-                              {"t": 1600, "q": qx(-1.4), "ease": "quadInOut"},
-                              {"t": 3200, "q": qx(0)}],
+                              {"t": 4000, "q": qx(-1.4), "ease": "quadInOut"},
+                              {"t": 8000, "q": qx(0)}],
                       "pos": [{"t": 0, "v": [0, 0, 0], "ease": "quadInOut"},
-                              {"t": 1600, "v": [0, 0.08, 0], "ease": "quadInOut"},
-                              {"t": 3200, "v": [0, 0, 0]}]},
+                              {"t": 4000, "v": [0, 0.08, 0], "ease": "quadInOut"},
+                              {"t": 8000, "v": [0, 0, 0]}]},
             "head": {"rot": [{"t": 0, "q": qy(0), "ease": "quadInOut"},
-                             {"t": 1100, "q": qy(5), "ease": "quadInOut"},
-                             {"t": 2300, "q": qy(-4), "ease": "quadInOut"},
-                             {"t": 3200, "q": qy(0)}]},
+                             {"t": 2750, "q": qy(5), "ease": "quadInOut"},
+                             {"t": 5750, "q": qy(-4), "ease": "quadInOut"},
+                             {"t": 8000, "q": qy(0)}]},
             "armU.L": {"rot": [{"t": 0, "q": qz(0), "ease": "quadInOut"},
-                               {"t": 1600, "q": qz(2.0), "ease": "quadInOut"},
-                               {"t": 3200, "q": qz(0)}]},
+                               {"t": 4000, "q": qz(2.0), "ease": "quadInOut"},
+                               {"t": 8000, "q": qz(0)}]},
             "armU.R": {"rot": [{"t": 0, "q": qz(0), "ease": "quadInOut"},
-                               {"t": 1600, "q": qz(-2.0), "ease": "quadInOut"},
-                               {"t": 3200, "q": qz(0)}]},
+                               {"t": 4000, "q": qz(-2.0), "ease": "quadInOut"},
+                               {"t": 8000, "q": qz(0)}]},
         },
     }
 
@@ -1503,10 +1549,24 @@ def main():
          "missing": ["legL.L", "legL.R"],
          "clip": "crawl", "speedScale": 0.3,
          "disableGait": True, "groundAlign": 1.0},
-        {"name": "hop",
+        # BOTH FEET GONE IS A CRAWL, NOT A HOP. There used to be a "hop" state
+        # here that kept the body UPRIGHT on two ankle stumps and bounced it,
+        # and it looked exactly as silly as that reads (96c86d5). A body with
+        # no feet has nothing to stand on and pulls itself along by its arms,
+        # so it takes the crawl clip with `groundAlign` like the other prone
+        # states -- slightly faster than a legless crawl because the shins are
+        # still there to push with. The `hop` CLIP is kept in the library: it
+        # is no longer selected by damage, and something else may yet want it.
+        #
+        # ONE foot gone is deliberately NOT here. That case is the derived
+        # stump-drag layer (AnimFindStumpLeg / AnimApplyStumpDrag), which needs
+        # exactly one stump and one whole leg and would be shadowed by an
+        # authored state; this rule requires BOTH feet so the two never
+        # overlap. Do not widen it to `missingAny`.
+        {"name": "crawl.feet",
          "missing": ["foot.L", "foot.R"],
-         "clip": "hop", "speedScale": 0.45,
-         "disableGait": True, "bodyYOffset": -0.1},
+         "clip": "crawl", "speedScale": 0.35,
+         "disableGait": True, "bodyYOffset": 0.0, "groundAlign": 1.0},
         {"name": "limp",
          "missingAny": ["legU.L", "legL.L", "foot.L",
                         "legU.R", "legL.R", "foot.R"],
