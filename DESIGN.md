@@ -7166,8 +7166,23 @@ sweep melted the player's limbs as debris instead of wounding them.
 `MobSystem::SetAvatar` registers it, and `FindLimb`/`FindOwner`/`Damage`/
 `CutLimb`/`CarveLimbRadial` consult it **after** the mob list — every existing
 caller that already checked the avatar first is bit-identical. Death is what it
-already was: the parts are handed to `DebrisSystem`, the corpse settles like any
-other debris, and `main.cpp` revives after `player.respawnDelay`.
+already was: the parts are handed to `DebrisSystem` and the corpse settles like
+any other debris.
+
+**Death holds, and is read before it is undone.** Nothing rebuilds the player
+on a timer. `Mob::Die()` calls a new virtual `OnDying()` after recording the
+cause and **before** the teardown loop; `PlayerAvatar` forwards it to an
+observer `main.cpp` registers, which runs the ordinary HUD mirror
+(`FillBodyUI`) one last time. That instant is the only one at which the
+question is answerable — one statement later every limb is `DebrisSystem`'s,
+`anim_.partAlive` is zeroed and every per-limb readout in the engine says
+"severed, no voxels, no hp" whatever actually happened. `main.cpp` then stops
+refilling the mirror (`deathFrozen`), opens the character screen and lets the
+health column draw the photograph: the cause in `Mob::DeathCause`'s own words,
+the pools, triage worst-first, and the selected limb's tissue/condition/cover.
+`tune.avatar.respawnDelay` is no longer a countdown to a rebuild — it is the
+minimum the body lies there before the column's **respawn** button will take a
+press. Pressing it thaws the mirror and calls `Revive`.
 
 Four gates (`selftest_combat.cpp`, at the end of the mob group):
 `npc-strike` (the AI's own request becomes a windup, a cut and lost voxels; then

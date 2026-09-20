@@ -514,6 +514,27 @@ struct UIState {
   int32_t healthCap = 0;
   bool playerAlive = true;
 
+  // ---- THE DEATH HOLD -------------------------------------------------------
+  // A dead player is no longer rebuilt on a timer. The body stays where it
+  // fell, the character screen opens on the health column, and every readout
+  // below is FROZEN at the moment of death — main.cpp stops refilling it, so
+  // what is on screen is the state the body was in when it died rather than
+  // the state the corpse has decayed into since. Nothing comes back until the
+  // column's respawn button is pressed.
+  //
+  // This exists to make a death diagnosable: "which limb ran out, what was on
+  // fire, what was still worn" is unanswerable if the answer is overwritten
+  // three seconds later by a fresh body.
+  bool deathScreen = false;      // dead and holding; the readout is frozen
+  float deathHoldSec = 0.0f;     // how long the body has lain there, seconds
+  float deathRespawnAfter = 0.0f;  // tune.avatar.respawnDelay: button waits it out
+  bool respawnRequest = false;   // the button was pressed; main.cpp consumes it
+  bool deathScreenOpened = false;  // this death has already opened the column
+  // What the engine says killed you (Mob::DeathCause) — "blood loss", "vital
+  // limb destroyed", "burnt past the death knot". Empty when nothing claimed
+  // it, which is itself worth seeing: it means the body simply ran out.
+  std::string deathCause;
+
   // ---- body condition, drawn as a stick figure above the health bar -------
   // The hp bar answers "how much life is left"; this answers "what part of me
   // is broken", which is a different question the moment a limb can be severed

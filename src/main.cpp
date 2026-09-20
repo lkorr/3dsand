@@ -5927,6 +5927,28 @@ int main(int argc, char** argv) {
   // and again after every materials reload — never per frame (see ResolveBurnMats).
   BurnMats burnMats = ResolveBurnMats(mats);
   TissueMats tissueMats = ResolveTissueMats(mobs);
+  // ---- THE DEATH SCREEN'S PHOTOGRAPH ---------------------------------------
+  // Registered once, called from inside Die() while the rig is still whole
+  // (PlayerAvatar::SetDyingObserver). It runs the SAME mirror the frame loop
+  // runs, which is the only reason the death screen can show a real body: a
+  // frame-loop mirror taken after the tick that killed you reads a husk, since
+  // Die() hands every limb to DebrisSystem and zeroes `partAlive` — every
+  // limb would report SEVERED with no voxels and no hp, whatever happened.
+  //
+  // `deathFrozen` below then stops the per-frame mirror from overwriting this,
+  // so what is on the death screen stays the body that died rather than the
+  // corpse as it burns, rots and gets eaten.
+  bool deathFrozen = false;
+  avatar.SetDyingObserver([&] {
+    ui.health = playerHealth.Get();
+    ui.healthMax = avatar.HealthMax();
+    ui.healthCap = avatar.HealthCap();
+    ui.playerAlive = false;
+    ui.locoState = avatar.Spawned() ? avatar.Locomotion().stateName : "";
+    FillBodyUI(avatar, burnMats, tissueMats, mobs, mats, ui);
+    ui.deathCause = avatar.DeathCause();
+    deathFrozen = true;
+  });
   // The blade's position last tick, so the sweep has something to sweep FROM.
   // Invalid until the first tick with a weapon drawn — a swing that started
   // from an unknown pose would carve a segment the blade never travelled.
@@ -6511,6 +6533,10 @@ int main(int argc, char** argv) {
         ui.portraitPanY = 0.0f; ui.portraitPanYTarget = 0.0f;
         ui.portraitPivotSlot = -1;
         ui.inspectSelected = -1;
+        // Re-opening while dead lands on the health column again (see
+        // DrawInventoryScreen): the frozen readout is the reason the screen
+        // is up at all, and it is the wrong thing to have to re-find.
+        ui.deathScreenOpened = false;
       }
       glfwSetInputMode(window, GLFW_CURSOR,
                        captured ? GLFW_CURSOR_DISABLED : GLFW_CURSOR_NORMAL);
@@ -6530,6 +6556,10 @@ int main(int argc, char** argv) {
         ui.portraitPanY = 0.0f; ui.portraitPanYTarget = 0.0f;
         ui.portraitPivotSlot = -1;
         ui.inspectSelected = -1;
+        // Re-opening while dead lands on the health column again (see
+        // DrawInventoryScreen): the frozen readout is the reason the screen
+        // is up at all, and it is the wrong thing to have to re-find.
+        ui.deathScreenOpened = false;
       } else {
         captured = !captured;
       }
@@ -9112,18 +9142,66 @@ int main(int argc, char** argv) {
           avatar.PreTick(tick, player, avatarHeading, kTickDt, world, ops,
                          cellOps,
                          spawns);
-        // Dead avatar: hold the corpse for respawnDelay, then rebuild it.
-        // The parts are already DebrisSystem's by then, so the corpse stays
-        // in the world and settles like any other debris.
+        // DEAD AVATAR: HOLD, AND WAIT TO BE ASKED. Nothing rebuilds the body
+        // on a timer any more. The corpse lies where it fell (its parts are
+        // DebrisSystem's and settle like any other debris), the character
+        // screen opens on the health column, and every readout there is the
+        // photograph the dying observer took — so a death can be READ: which
+        // limb was gone, what was alight, what was still worn, and what the
+        // engine says killed you. `respawnDelay` is now the minimum the body
+        // lies there before the button will take the press, which keeps a
+        // fumbled click from erasing the evidence in the same second it
+        // appeared (0 in the tuner disables the wait).
         if (avatar.Spawned() && !avatar.IsAlive()) {
+          if (!ui.deathScreen) {
+            ui.deathScreen = true;
+            ui.deathScreenOpened = false;
+            ui.respawnRequest = false;
+            ui.deathRespawnAfter = av.respawnDelay;
+            respawnTimer = 0;
+            // Open the screen and free the cursor exactly as I does, through
+            // the same two variables, so closing it afterwards restores what
+            // capture WAS rather than assuming it was captured.
+            if (!ui.inventoryOpen) {
+              ui.inventoryOpen = true;
+              captureBeforeUi = captured;
+              captured = false;
+              glfwSetInputMode(window, GLFW_CURSOR, GLFW_CURSOR_NORMAL);
+              glfwGetCursorPos(window, &mx0, &my0);
+            }
+          }
           respawnTimer += kTickDt;
-          if (respawnTimer >= av.respawnDelay) {
+          ui.deathHoldSec = respawnTimer;
+          if (ui.respawnRequest && respawnTimer >= av.respawnDelay) {
+            ui.respawnRequest = false;
+            ui.deathScreen = false;
+            ui.deathScreenOpened = false;
+            ui.deathCause.clear();
+            deathFrozen = false;   // the mirror is live again from here
             respawnTimer = 0;
             avatar.Revive(player, avatarHeading);
             tpRig.Snap();
+            // Put the player back where the body is, not in a menu.
+            if (ui.inventoryOpen) {
+              ui.inventoryOpen = false;
+              ui.inspectSelected = -1;
+              captured = captureBeforeUi;
+              glfwSetInputMode(window, GLFW_CURSOR,
+                               captured ? GLFW_CURSOR_DISABLED : GLFW_CURSOR_NORMAL);
+              glfwGetCursorPos(window, &mx0, &my0);
+            }
           }
         } else {
           respawnTimer = 0;
+          ui.respawnRequest = false;
+          // Revived by any other route (a reload, a loaded save, the avatar
+          // being switched off): the hold has nothing left to hold.
+          if (ui.deathScreen && avatar.IsAlive()) {
+            ui.deathScreen = false;
+            ui.deathScreenOpened = false;
+            ui.deathCause.clear();
+            deathFrozen = false;
+          }
         }
         // Drain the impact latch on the FIRST tick of the frame batch that
         // sees it — the same consume-and-clear every other one-shot here uses
@@ -10841,16 +10919,22 @@ int main(int argc, char** argv) {
       for (const SpellBeam& bm : spells.Beams())
         if (bm.casterId == 0x9134A5EEu)
           ui.spellStatuses.push_back("beam  " + std::to_string(bm.perTick) + "/tick");
-      ui.health = playerHealth.Get();
-      ui.healthMax = avatar.HealthMax();
-      ui.healthCap = avatar.HealthCap();
-      ui.playerAlive = avatar.IsAlive();
-      // Body-condition readout: one figure slot per limb, keyed by the limb's
-      // authored TAG and side suffix rather than by part name, so any humanoid
-      // rig fills the same figure. A limb the rig does not have stays absent
-      // and simply is not drawn.
-      FillBodyUI(avatar, burnMats, tissueMats, mobs, mats, ui);
-      ui.locoState = avatar.Spawned() ? avatar.Locomotion().stateName : "";
+      // FROZEN ONCE DEAD. The dying observer above took this same mirror at
+      // the instant of death; from here on the rig is a pile of debris
+      // handles, so refilling it would replace the readout of the body that
+      // died with a readout of nothing. Thawed by the respawn below.
+      if (!deathFrozen) {
+        ui.health = playerHealth.Get();
+        ui.healthMax = avatar.HealthMax();
+        ui.healthCap = avatar.HealthCap();
+        ui.playerAlive = avatar.IsAlive();
+        // Body-condition readout: one figure slot per limb, keyed by the
+        // limb's authored TAG and side suffix rather than by part name, so any
+        // humanoid rig fills the same figure. A limb the rig does not have
+        // stays absent and simply is not drawn.
+        FillBodyUI(avatar, burnMats, tissueMats, mobs, mats, ui);
+        ui.locoState = avatar.Spawned() ? avatar.Locomotion().stateName : "";
+      }
       ui.spellCost = caster.compiled.manaCost;
       ui.spellWord = caster.compiled.wordCost;
       ui.spellTariff = caster.compiled.tariff;

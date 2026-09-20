@@ -1691,6 +1691,17 @@ class Mob {
   // Detach a limb now. Root/vital kills instead.
   void Sever(int limbIndex);
   void Die();
+  // LAST LOOK AT A LIVING RIG. Called from Die() after the cause is recorded
+  // and before a single limb is handed to DebrisSystem — the only instant at
+  // which "what state was this body in when it died" is still answerable, and
+  // it lasts one statement: the loop below zeroes `anim_.partAlive`, moves the
+  // skin voxels out and drops every body handle, after which every per-limb
+  // readout in the engine reports a severed, empty, zero-hp limb.
+  //
+  // Default does nothing (an NPC corpse is read through CorpseReport instead).
+  // PlayerAvatar overrides it to photograph the HUD mirror for the death
+  // screen (game/avatar.h).
+  virtual void OnDying() {}
   // Per-voxel carving: remove real voxels from a live limb (docs/DESIGN.md §7).
   bool CarveLimbRadial(uint64_t bodyHandle, Vec3 centerWorldVoxel,
                        float radiusVoxels, bool ragged, bool eject, World& world,

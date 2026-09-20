@@ -287,7 +287,10 @@ void Overlay::DrawHUD(const UIState& s) {
   const float yTop = yStack - figureH;
 
   if (!s.playerAlive) {
-    const char* dead = "DEAD";
+    // Nothing respawns you on a timer any more (UIState::deathScreen), so the
+    // HUD has to say where the way back is — a player staring at a corpse with
+    // no prompt has no reason to believe the game is still waiting for them.
+    const char* dead = s.deathScreen ? "DEAD  -  I  to respawn" : "DEAD";
     const ImVec2 ts = ImGui::CalcTextSize(dead);
     const ImVec2 tp(x, yTop - ts.y - 6);
     d->AddText(ImVec2(tp.x + 1, tp.y + 1), IM_COL32(0, 0, 0, 190), dead);

@@ -14975,6 +14975,8 @@ void Mob::Die() {
     sys_->lastDeathId_ = id_;
     sys_->lastDeathCause_ = deathCause_;
   }
+  // The rig is still whole HERE and nowhere after here (see Mob::OnDying).
+  OnDying();
   // The death cry, BEFORE the limb list is dismantled below — the root limb's
   // live transform is where the creature actually is, and `mob.origin_` is only
   // the spawn corner (the trap called out in Sever()). Reported even if the

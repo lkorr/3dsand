@@ -1,5 +1,6 @@
 #pragma once
 #include <cstdint>
+#include <functional>
 #include <string>
 #include <vector>
 
@@ -200,6 +201,21 @@ class PlayerAvatar : public Mob {
   // name or an already-severed part.
   bool SeverByName(const std::string& name);
   void Revive(const Player& player, float heading);  // heal + respawn all parts
+
+  // ---- the death screen's photograph --------------------------------------
+  // Whoever mirrors this body into the HUD registers here, and is called back
+  // ONCE, from inside Die(), while the rig is still whole (Mob::OnDying).
+  // That instant is the whole point: one statement later every limb is
+  // DebrisSystem's, `anim_.partAlive` is zeroed and the per-limb readouts all
+  // answer "severed, empty, zero hp" — so a mirror taken after the fact can
+  // only ever describe a husk, whatever killed it.
+  //
+  // A callback rather than a snapshot struct here because the thing worth
+  // photographing is the UI mirror main.cpp already knows how to build
+  // (FillBodyUI), and a second per-limb copy in this header would be a second
+  // thing to keep in step with it.
+  void SetDyingObserver(std::function<void()> fn) { onDying_ = std::move(fn); }
+  void OnDying() override { if (onDying_) onDying_(); }
 
   // ---- health, as the caster VM sees it (game/spell.h) --------------------
   // The player has no single hp field, and deliberately gains none here:
@@ -447,6 +463,8 @@ class PlayerAvatar : public Mob {
     std::vector<P> parts;
   };
   SavedState restore_;
+  // Called once from Die(), before the rig comes apart (SetDyingObserver).
+  std::function<void()> onDying_;
 
   // ---- the PLAYER DRIVER's animation pass ----------------------------------
   // These are the avatar's own: a player-driven body needs its gait fed by

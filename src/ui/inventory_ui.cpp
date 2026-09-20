@@ -1727,6 +1727,76 @@ void VitalsColumn(UIState& s, ImVec2 at, ImVec2 size) {
     ImGui::PopFont();
   };
 
+  // ======================= THE DEATH HOLD =====================================
+  // Above VITALS, because when it is up it is the only thing on this column
+  // that is about the present tense: everything below it is a photograph of
+  // the body at the instant it died (UIState::deathScreen). The button is the
+  // ONLY way back — there is no respawn timer running behind this panel — so
+  // it is drawn full width and cannot be mistaken for a chip.
+  if (s.deathScreen) {
+    const float bannerH = 42.0f;
+    dl->AddRectFilled(ImVec2(base.x, y), ImVec2(base.x + w, y + bannerH),
+                      Fade(ui::ColBloodHi(), 0.18f));
+    dl->AddRectFilled(ImVec2(base.x, y), ImVec2(base.x + w, y + 2),
+                      Fade(ui::ColBloodHi(), 0.85f));
+    dl->AddRectFilled(ImVec2(base.x, y + bannerH - 2),
+                      ImVec2(base.x + w, y + bannerH),
+                      Fade(ui::ColBloodHi(), 0.85f));
+    {
+      const char* dead = "YOU DIED";
+      const ImVec2 ts = ImGui::CalcTextSize(dead);
+      ui::ShadowText(dl,
+                     ImVec2(std::floor(base.x + (w - ts.x) * 0.5f),
+                            std::floor(y + (bannerH - ts.y) * 0.5f)),
+                     Fade(ui::ColBloodHi(), 0.55f + 0.45f * pulse), dead);
+    }
+    y += bannerH + 4;
+    // THE CAUSE, in the engine's own words, on its own line. It is the one
+    // thing on this column that is not derivable from the limbs below it: four
+    // mechanisms (blood loss, a vital limb gone, the burn cap, a limb burnt
+    // away) all end in the same corpse, and only Die() knows which fired.
+    ImGui::PushFont(ui::FontSmall());
+    {
+      char buf[96];
+      if (!s.deathCause.empty())
+        std::snprintf(buf, sizeof buf, "%s", s.deathCause.c_str());
+      else
+        std::snprintf(buf, sizeof buf, "cause unrecorded");
+      small(ui::ColBloodHi(), ImVec2(base.x, y), buf);
+      y += ImGui::GetTextLineHeight() + 2;
+      std::snprintf(buf, sizeof buf,
+                    "everything below is this body %.1f s ago, at death",
+                    s.deathHoldSec);
+      small(Fade(ui::ColParchDim(), 0.85f), ImVec2(base.x, y), buf);
+      y += ImGui::GetTextLineHeight() + 6;
+    }
+    ImGui::PopFont();
+    // The wait is tune.avatar.respawnDelay, and it is drawn as a disabled
+    // button counting down rather than as no button at all — a control that
+    // appears out of nowhere is a control you press by accident.
+    const float wait = s.deathRespawnAfter - s.deathHoldSec;
+    const bool ready = wait <= 0.0f;
+    char blabel[32];
+    if (ready) std::snprintf(blabel, sizeof blabel, "respawn");
+    else std::snprintf(blabel, sizeof blabel, "respawn  %.0f", std::ceil(wait));
+    if (!ready) ImGui::BeginDisabled();
+    if (ui::Button("##respawn", ImVec2(base.x, y), blabel, false, w) && ready)
+      s.respawnRequest = true;
+    if (!ready) {
+      ImGui::EndDisabled();
+      dl->AddRectFilled(ImGui::GetItemRectMin(), ImGui::GetItemRectMax(),
+                        Fade(ui::ColInk(), 0.45f));
+    }
+    if (ImGui::IsItemHovered()) {
+      Tip("Build a new body and put it back in the world. Nothing here is\n"
+          "kept: this is the last state of the body that died, and it is\n"
+          "replaced the moment a new one exists.\n"
+          "Nothing is on a timer: close this screen and look the body over\n"
+          "first if you want. The readout is frozen and will still be here.");
+    }
+    y = ImGui::GetItemRectMax().y + 10;
+  }
+
   // ======================= POOLS ==============================================
   y = ui::Subheading(dl, ImVec2(base.x, y), w, "VITALS") + 4;
   y += PoolBar(dl, ImVec2(base.x, y), w, s.health, s.healthMax, s.healthCap,
@@ -2130,6 +2200,18 @@ void DrawInventoryScreen(UIState& s) {
   // are the thing being read, and vignetted so the eye is pulled in off the
   // edges of the screen onto them.
   ui::ScreenDim(bg, disp, 0.5f, 0.55f);
+
+  // A DEATH OPENS THE HEALTH COLUMN, on the limb in the most trouble. main.cpp
+  // opens the screen; which page of it you land on is this file's business,
+  // and there is exactly one page worth landing on when the body is a corpse.
+  // Done once per death (the column is free to be closed again afterwards)
+  // because the frozen readout is a thing to READ, and a panel that reopened
+  // itself every frame could not be closed at all.
+  if (s.deathScreen && !s.deathScreenOpened) {
+    s.deathScreenOpened = true;
+    s.inspectMode = true;
+    s.inspectSelected = WorstLimb(s);
+  }
 
   // ---- layout ---------------------------------------------------------------
   const float kPortraitW =
