@@ -10,6 +10,7 @@
 #include <cstdio>
 #include <cstring>
 #include <filesystem>
+#include <fstream>
 #include <unordered_set>
 #include <string>
 #include <vector>
@@ -20,6 +21,7 @@
 #include "game/item.h"
 #include "game/thirdperson.h"
 #include "game/brush.h"
+#include "game/sidecar.h"
 #include "game/camera.h"
 #include "game/player.h"
 #include "gpu/resources.h"
@@ -32,6 +34,122 @@ using namespace sandvox;
 
 namespace selftest {
 namespace {
+
+// ---- sidecar-resolve --------------------------------------------------------
+//
+// THE RESOLVER, AND THE PROOF THAT BOTH LANGUAGES RUN IT THE SAME WAY.
+//
+// src/game/sidecar.cpp and assets/editor/sidecar.js implement one set of rules
+// twice — the engine loads through the C++, and the Characters page, the Models
+// tab, gen_mobs.mjs and test_mobgen.mjs all resolve through the JS. Two
+// implementations of "what a character actually is" is the divergence the whole
+// inheritance design exists to remove, so it has to be asserted, not assumed.
+//
+// It is asserted by DUMPING rather than by comparing here: this gate writes
+// `build/sidecar_resolved.json` — every sidecar in assets/mobs/ as the loader
+// resolved it — and test_mobgen.mjs section N diffs that file against its own
+// resolution of the same inputs. That way the expensive half (a device boot)
+// runs once per C++ change and the cheap half runs on every JSON edit, which is
+// the split the verification budget in CLAUDE.md asks for.
+//
+// What the gate itself checks is what only C++ can see: that every sidecar on
+// disk resolves at all, and that the rules do what they say on a fixture the
+// pool cannot accidentally satisfy.
+Status GateSidecarResolve(Ctx& c, std::string& detail) {
+  const std::string dir = AssetDir() + "/mobs";
+  std::string log;
+  nlohmann::json dump = nlohmann::json::object();
+  int resolved = 0, failed = 0;
+  std::string failedNames;
+  std::error_code ec;
+  std::vector<std::string> stems;
+  for (auto& e : std::filesystem::directory_iterator(dir, ec))
+    if (e.is_regular_file() && e.path().extension() == ".json")
+      stems.push_back(e.path().stem().string());
+  std::sort(stems.begin(), stems.end());
+  for (const std::string& stem : stems) {
+    nlohmann::json j;
+    const std::string jp = (std::filesystem::path(dir) / (stem + ".json")).string();
+    if (!sidecar::Load(dir, jp, j, log)) {
+      // attack_styles.json and behaviors.json are shared tables, not mobs, and
+      // they parse fine — a failure here is a real one.
+      failed++;
+      failedNames += (failedNames.empty() ? "" : ", ") + stem;
+      continue;
+    }
+    resolved++;
+    dump[stem] = std::move(j);
+  }
+
+  // ---- the three rules, on a fixture ---------------------------------------
+  // Written here and not only in the JS section so a C++-side regression is
+  // caught by the gate that owns the code, and so the failure names the rule.
+  const nlohmann::json base = nlohmann::json::parse(R"({
+    "limbs": [{"name": "a", "hp": 10, "tag": "x"},
+              {"name": "b", "hp": 20},
+              {"name": "c", "hp": 30}],
+    "mask": ["a", "b"],
+    "clips": {"walk": {"durationMs": 1000,
+                       "tracks": {"a": {"rot": [{"t": 0}, {"t": 500},
+                                                {"t": 1000}]}}}}
+  })");
+  const nlohmann::json patch = nlohmann::json::parse(R"({
+    "limbs": [{"name": "b", "hp": 99}, {"name": "d", "hp": 1}],
+    "mask": ["c"],
+    "clips": {"walk": {"durationMs": 600}}
+  })");
+  nlohmann::json got = base;
+  sidecar::MergePatch(got, patch, "");
+  const bool byName = got["limbs"].size() == 4 &&
+                      got["limbs"][0]["name"] == "a" &&
+                      got["limbs"][1]["name"] == "b" &&
+                      got["limbs"][2]["name"] == "c" &&
+                      got["limbs"][3]["name"] == "d";
+  const bool patched = got["limbs"][1]["hp"] == 99;
+  // The base's OTHER fields survive a partial override, which is the whole
+  // point: `{"name": "b", "hp": 99}` must not delete b's tag.
+  const bool kept = got["limbs"][0]["hp"] == 10 && got["limbs"][0]["tag"] == "x";
+  // An unnamed array is still RFC 7396.
+  const bool maskReplaced = got["mask"].size() == 1 && got["mask"][0] == "c";
+  const auto& keys = got["clips"]["walk"]["tracks"]["a"]["rot"];
+  const bool retimed = got["clips"]["walk"]["durationMs"] == 600 &&
+                       keys[0]["t"] == 0 && keys[1]["t"] == 300 &&
+                       keys[2]["t"] == 600;
+
+  // ---- `scale`, which is what makes an effect portable --------------------
+  nlohmann::json body = nlohmann::json::parse(
+      R"({"speed": 31.5, "gait": {"cadence": 8}})");
+  std::string fxLog;
+  sidecar::ApplyEffect(
+      body, nlohmann::json::parse(R"({"scale": {"speed": 0.5,
+                                                "gait.cadence": 0.8,
+                                                "nope.nothing": 2}})"),
+      "fixture", fxLog);
+  const bool scaled = std::abs(body["speed"].get<double>() - 15.75) < 1e-9 &&
+                      std::abs(body["gait"]["cadence"].get<double>() - 6.4) < 1e-9;
+  // A path that reaches nothing is LOUD. A silent miss is a zombie that walks
+  // at the human's speed and no line anywhere saying why.
+  const bool loud = fxLog.find("nope.nothing") != std::string::npos;
+
+  std::filesystem::create_directories("build", ec);
+  std::ofstream f("build/sidecar_resolved.json");
+  if (f) f << dump.dump(2) << "\n";
+
+  const bool ok = failed == 0 && resolved > 0 && byName && patched && kept &&
+                  maskReplaced && retimed && scaled && loud && f.good();
+  detail = "resolved " + std::to_string(resolved) + " sidecar(s), " +
+           std::to_string(failed) + " failed" +
+           (failed ? (": " + failedNames) : "") + "; byName=" +
+           std::to_string(byName) + " patch=" + std::to_string(patched) +
+           " keptBase=" + std::to_string(kept) + " maskReplaced=" +
+           std::to_string(maskReplaced) + " retimed=" + std::to_string(retimed) +
+           " scaled=" + std::to_string(scaled) + " loudMiss=" +
+           std::to_string(loud) + "; wrote build/sidecar_resolved.json";
+  std::printf("sidecar-resolve: %s (%s)\n", ok ? "PASS" : "FAIL",
+              detail.c_str());
+  if (!log.empty()) std::printf("%s", log.c_str());
+  return ok ? Status::Pass : Status::Fail;
+}
 
 // ---- mob ---------------------------------------------------------------
 Status GateMob(Ctx& c, std::string& detail) {
@@ -8228,6 +8346,12 @@ const std::vector<Gate>& MobGates() {
       //
       // Draws: the micro-body view sweep renders the critter from 14 angles
       // into the shared offscreen target.
+      // BEFORE `mob`, and cheap enough to be free: it reads the mob directory
+      // off disk and merges JSON — no world, no GPU, no fixtures. A sidecar
+      // that no longer resolves takes every later mob gate down with it, so it
+      // should be the first thing a mob run says.
+      {"sidecar-resolve", "mob", {}, false, GateSidecarResolve,
+       /*needsRender=*/false},
       {"mob", "mob", {}, false, GateMob, /*needsRender=*/true},
       // Per-voxel body reactivity. No render: every claim is a count.
       {"mob-burn", "mob", {}, false, GateMobBurn, /*needsRender=*/false},

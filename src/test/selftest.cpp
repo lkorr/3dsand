@@ -221,7 +221,12 @@ const char* const kOrder[] = {
     // The position matters: gates share one World and several depend on what
     // an earlier one left behind, so re-adding it anywhere else would be a
     // different test.
-    "prefab",      "mob",            "settle-back", "player-body",
+    // `sidecar-resolve` reads assets/mobs/ off disk and merges JSON — no
+    // World, no GPU, no fixtures — so it is order-independent and costs
+    // milliseconds. Placed immediately before `mob` because a sidecar that no
+    // longer resolves takes every mob gate after it down, and the run should
+    // say which one it was.
+    "prefab",      "sidecar-resolve", "mob", "settle-back", "player-body",
     // Wearing things. After `mob` because it spawns the avatar def on real
     // terrain and carves a shell, which wants the same standing world the
     // body gates run in; before `ragdoll-joints` because it leaves the rig
@@ -453,6 +458,10 @@ const char* const kOrder[] = {
     // ...and the structural consequence the rot had none of until 2026-09-19:
     // a limb whose ATTACHMENT has been eaten comes off, whatever ate it.
     "joint-rot",
+    // ...and the DISTRIBUTION over limbs, which every gate above it is blind to
+    // because they all bite the one biggest severable limb: a bite has to infect
+    // a forearm and a hand as well as a thigh (owner report 2026-09-19).
+    "bite-limbs",
     // ...and a corpse that died alight keeps burning: every piece advances
     // its embers, keeps emitting fire, and its brick agrees with its lattice
     // (owner report 2026-09-02: the corpse pulsed at its death colour for

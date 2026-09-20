@@ -463,6 +463,10 @@ add_library(sandvox_core OBJECT
   src/game/brush.cpp
   src/game/prefab.cpp
   src/game/mob.cpp
+  # How a creature inherits another creature: the `extends` chain, the
+  # named-array merge, the clip retime and the effect overlay. Mirrored rule
+  # for rule by assets/editor/sidecar.js.
+  src/game/sidecar.cpp
   # NPC AI: the utility arbiter over named intents (behaviors.json is its
   # content) and the local combat navigator it steers with.
   src/game/ai_behavior.cpp

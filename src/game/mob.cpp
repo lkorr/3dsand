@@ -14,6 +14,7 @@
 
 #include "game/item.h"
 #include "game/rigrender.h"
+#include "game/sidecar.h"
 #include "phys/bodystain.h"
 #include "phys/lattice.h"
 #include "sim/bytestream.h"
@@ -445,67 +446,12 @@ struct MobSource {
   std::string jsonPath;
 };
 
-// `extends` is resolved by RFC 7396 merge-patch (nlohmann's `merge_patch`):
-// objects merge key by key, an ARRAY OR SCALAR REPLACES WHOLESALE, and an
-// explicit `null` DELETES the inherited key. That is exactly the behaviour a
-// rig override wants — `"speed": 22` replaces a number, `"limbs": [...]`
-// replaces the whole limb list rather than merging fifteen entries positionally
-// (which would be meaningless), and `"clips": {"walk": {"durationMs": 900}}`
-// reaches one field of one clip without restating its tracks.
-constexpr int kMaxSidecarExtends = 8;
-
-static bool ReadSidecarJson(const std::string& path, json& out,
-                            std::string& log) {
-  std::ifstream f(path);
-  if (!f) {
-    log += path + ": missing sidecar\n";
-    return false;
-  }
-  try {
-    out = json::parse(f);
-  } catch (const std::exception& e) {
-    log += path + ": JSON parse error: " + std::string(e.what()) + "\n";
-    return false;
-  }
-  if (!out.is_object()) {
-    log += path + ": sidecar is not a JSON object — skipped\n";
-    return false;
-  }
-  return true;
-}
-
-// Depth-bounded rather than cycle-detected: the bound is the diagnostic. A rig
-// eight deep is already a content mistake and a cycle is the same mistake with
-// a hang attached, so one check answers both.
-static bool ResolveSidecar(const std::string& dir, const std::string& path,
-                           json& out, std::string& log, int depth) {
-  if (depth > kMaxSidecarExtends) {
-    log += path + ": `extends` nested more than " +
-           std::to_string(kMaxSidecarExtends) + " deep (a cycle?) — skipped\n";
-    return false;
-  }
-  json child;
-  if (!ReadSidecarJson(path, child, log)) return false;
-  const std::string base = child.value("extends", std::string());
-  if (base.empty()) {
-    out = std::move(child);
-    return true;
-  }
-  json parent;
-  const std::string bp =
-      (std::filesystem::path(dir) / (base + ".json")).string();
-  if (!ResolveSidecar(dir, bp, parent, log, depth + 1)) {
-    log += path + ": extends \"" + base + "\", which did not load — skipped\n";
-    return false;
-  }
-  // Not inherited: an `extends` chain is resolved here, once, and a def that
-  // carried the key downstream would invite a second reader to resolve it
-  // again against a different base.
-  child.erase("extends");
-  parent.merge_patch(child);
-  out = std::move(parent);
-  return true;
-}
+// `extends` (and `effects`) are resolved by src/game/sidecar.cpp — the three
+// rules, why they are those three, and the JS mirror all live in its header.
+// It is a separate TU because a resolver has no reason to share nineteen
+// thousand lines with the creature it resolves, and because the Characters
+// page, gen_mobs.mjs and the Models tab need the same rules in JavaScript.
+constexpr int kMaxSidecarExtends = sidecar::kMaxExtends;
 
 // Which .vox a sidecar wears: its own `model`, else the art of whatever it
 // extends (transitively), else the file beside it. Returns the STEM.
@@ -553,8 +499,34 @@ static std::vector<MobSource> CollectMobSources(const std::string& dir,
   };
   // Own-art defs first, in name order, so adding a derived creature cannot
   // renumber the ones that were already there.
-  for (const std::string& s : voxStems)
+  //
+  // A FILE'S OWN .vox WINS OVER ITS `model`, AND THAT IS NOW SAID OUT LOUD.
+  // The pairing happens here, before `model` is ever read, which is exactly the
+  // shape a character wants — `extends: "human"` plus its own art means inherit
+  // the rig and keep the body. But it also means a sidecar that asks for
+  // somebody else's art while a .vox of its own name sits beside it is quietly
+  // ignored, and the only symptom is a creature wearing the wrong body. A
+  // `model` that names the file's own stem is the honest self-description a
+  // thin character writes and is not worth a line.
+  for (const std::string& s : voxStems) {
+    std::ifstream jf(path(s, ".json"));
+    if (jf) {
+      json probe;
+      try {
+        probe = json::parse(jf);
+      } catch (const std::exception&) {
+        probe = json::object();  // the real parse below reports it
+      }
+      const std::string model = probe.is_object()
+                                    ? probe.value("model", std::string())
+                                    : std::string();
+      if (!model.empty() && model != s)
+        log += path(s, ".json") + ": `model`: \"" + model + "\" is IGNORED — " +
+               s + ".vox sits beside it and a file's own art wins. Delete " + s +
+               ".vox, or drop the `model` key.\n";
+    }
     src.push_back({s, path(s, ".vox"), path(s, ".json")});
+  }
   for (const std::string& s : jsonStems) {
     if (hasVox(s)) continue;  // already paired above
     const std::string model = ModelStemFor(dir, s, 0);
@@ -678,7 +650,7 @@ bool LoadMobDefs(const std::string& dir, const std::vector<MaterialDef>& mats,
     // fold or the two defs would share the original's slots.
     const std::string& jp = src.jsonPath;
     json j;
-    if (!ResolveSidecar(dir, jp, j, log, 0)) continue;
+    if (!sidecar::Load(dir, jp, j, log)) continue;
 
     MobDef def;
     std::string err, warn;

@@ -45,6 +45,7 @@ import {
   ArtPalette, ART_SLOTS, isArtIndex, paletteColor,
 } from './vox.js';
 import * as ANA from './anatomy.js';
+import * as SIDECAR from './sidecar.js';
 
 // Editable box cap, matching what the .vox format allows.
 //
@@ -4275,19 +4276,6 @@ let derivedScan = null;
 // Set while such a document is open. Null for an ordinary model.
 let derivedFrom = null;
 
-/** RFC 7396 merge-patch, the same rule nlohmann's merge_patch applies. */
-function mergePatch(target, patch) {
-  if (patch === null || typeof patch !== 'object' || Array.isArray(patch))
-    return patch;
-  const out = (target && typeof target === 'object' && !Array.isArray(target))
-    ? target : {};
-  for (const k of Object.keys(patch)) {
-    if (patch[k] === null) delete out[k];
-    else out[k] = mergePatch(out[k], patch[k]);
-  }
-  return out;
-}
-
 const readJson = async (path) => {
   const r = await fetch('/api/model?path=' + encodeURIComponent(path),
     { cache: 'no-store' });
@@ -4296,22 +4284,50 @@ const readJson = async (path) => {
 };
 
 /**
- * Resolve a sidecar's `extends` chain into one document, and say which .vox it
- * wears — mob.cpp's ResolveSidecar and ModelStemFor, in that order and with
- * the same depth bound (a rig eight deep is a content mistake and a cycle is
- * the same mistake with a hang attached, so one check answers both).
+ * Resolve a sidecar's `extends` chain and `effects` into one document, and say
+ * which .vox it wears — src/game/sidecar.cpp's `Load` and mob.cpp's
+ * ModelStemFor, in that order.
+ *
+ * The MERGE RULES are not restated here. They live in sidecar.js, which is the
+ * mirror the `sidecar-resolve` gate diffs the engine against; a fourth copy of
+ * "how a creature inherits another creature" in the editor is exactly the
+ * unowned-diverging-representation this whole seam exists to remove.
+ *
+ * What is left here is the FETCHING, because sidecar.js takes a synchronous
+ * reader (a browser has /api/model, the scripts have fs, and neither belongs in
+ * a merge rule). So the chain is walked once to collect every document it
+ * touches, and the resolve then runs against that map.
  */
 async function resolveSidecarChain(dir, stem, depth = 0) {
-  if (depth > 8) throw new Error('`extends` nested more than 8 deep (a cycle?)');
-  const j = await readJson(dir + '/' + stem + '.json');
-  const base = typeof j.extends === 'string' ? j.extends : '';
-  const model = typeof j.model === 'string' ? j.model : '';
-  if (!base) return { doc: j, vox: (model || stem) };
-  const parent = await resolveSidecarChain(dir, base, depth + 1);
-  // `extends` is not inherited: the chain is resolved here, once.
-  const child = { ...j };
-  delete child.extends;
-  return { doc: mergePatch(parent.doc, child), vox: (model || parent.vox) };
+  const docs = new Map(), fx = new Map();
+  const fetchChain = async (s, d) => {
+    if (d > SIDECAR.MAX_EXTENDS)
+      throw new Error('`extends` nested more than 8 deep (a cycle?)');
+    if (docs.has(s)) return;
+    const j = await readJson(dir + '/' + s + '.json');
+    docs.set(s, j);
+    for (const name of Array.isArray(j.effects) ? j.effects : [])
+      if (typeof name === 'string' && !fx.has(name)) {
+        try { fx.set(name, await readJson(dir + '/effects/' + name + '.json')); }
+        catch { fx.set(name, null); }
+      }
+    if (typeof j.extends === 'string' && j.extends)
+      await fetchChain(j.extends, d + 1);
+  };
+  await fetchChain(stem, depth);
+  const doc = SIDECAR.resolveSidecar(
+    s => { if (!docs.has(s)) throw new Error(s + ': not fetched'); return docs.get(s); },
+    stem, name => fx.get(name) ?? null);
+  // Which .vox: this file's own `model`, else whatever it extends wears.
+  let vox = stem, at = stem;
+  for (let i = 0; i <= SIDECAR.MAX_EXTENDS; i++) {
+    const j = docs.get(at);
+    if (!j) break;
+    if (typeof j.model === 'string' && j.model) { vox = j.model; break; }
+    if (typeof j.extends !== 'string' || !j.extends) { vox = at; break; }
+    at = j.extends;
+  }
+  return { doc, vox };
 }
 
 async function scanDerived(files) {

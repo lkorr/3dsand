@@ -50,6 +50,7 @@ import { spawnSync } from 'child_process';
 import { fileURLToPath } from 'url';
 import { readVox } from '../assets/editor/vox.js';
 import * as mg from '../assets/editor/mobgen.js';
+import * as sc from '../assets/editor/sidecar.js';
 
 const ROOT = path.resolve(path.dirname(fileURLToPath(import.meta.url)), '..');
 const REF_PATH = path.join(ROOT, 'tests', 'mobgen_human_ref.json');
@@ -1261,6 +1262,140 @@ section('M. the characters in assets/mobs carry the current rig');
     const ds = diff(noNotes(onDisk.states).map(fillState),
                     noNotes(shippedStates).map(fillState), `${name}.states`);
     ok(!ds, `${name} uses the shipped human’s locomotion ladder`, ds);
+  }
+}
+
+// =============================================================================
+// 7. the resolver — one set of rules, implemented twice, asserted equal
+// =============================================================================
+
+section('N. the sidecar resolver, and both languages running it the same way');
+{
+  // THE RULES, ON A FIXTURE. A pool that happens to satisfy a rule is not a
+  // test of the rule: every claim here is against a base and a patch built for
+  // it, so a failure names the rule that broke rather than the character it
+  // showed up on.
+  const base = () => ({
+    limbs: [{ name: 'a', hp: 10, tag: 'x' },
+            { name: 'b', hp: 20 },
+            { name: 'c', hp: 30 }],
+    mask: ['a', 'b'],
+    speed: 30,
+    gait: { cadence: 8, stepHeight: 0.08 },
+    clips: { walk: { durationMs: 1000, blendInMs: 180,
+                     tracks: { a: { rot: [{ t: 0 }, { t: 500 }, { t: 1000 }],
+                                    pos: [{ t: 250, v: [0, 1, 0] }] } } } },
+  });
+
+  const named = sc.mergePatch(base(), {
+    limbs: [{ name: 'b', hp: 99 }, { name: 'd', hp: 1 }],
+  });
+  ok(named.limbs.map(l => l.name).join(',') === 'a,b,c,d',
+     'a named array merges by name, base order first, unmatched names appended',
+     named.limbs.map(l => l.name).join(','));
+  ok(named.limbs[1].hp === 99, 'the named element is patched');
+  ok(named.limbs[0].hp === 10 && named.limbs[0].tag === 'x',
+     'a partial override does not delete the base element’s other fields');
+  // Order preservation is not tidiness: TopoSortLimbs' output indexes the save
+  // file's positional limb records, so a reorder misplaces saved damage.
+  const reordered = sc.mergePatch(base(), {
+    limbs: [{ name: 'c', hp: 1 }, { name: 'a', hp: 2 }],
+  });
+  ok(reordered.limbs.map(l => l.name).join(',') === 'a,b,c',
+     'a patch listing limbs in another order does NOT reorder the base');
+
+  ok(sc.mergePatch(base(), { mask: ['c'] }).mask.join(',') === 'c',
+     'an array with unnamed elements still REPLACES (RFC 7396)');
+  ok(!('cadence' in sc.mergePatch(base(), { gait: { cadence: null } }).gait),
+     'an explicit null still deletes');
+  ok(sc.mergePatch(base(), { gait: { stepHeight: 0.06 } }).gait.cadence === 8,
+     'an object patch still merges key by key');
+
+  const retimed = sc.mergePatch(base(), { clips: { walk: { durationMs: 600 } } });
+  ok(retimed.clips.walk.durationMs === 600 &&
+     retimed.clips.walk.tracks.a.rot.map(k => k.t).join(',') === '0,300,600' &&
+     retimed.clips.walk.tracks.a.pos[0].t === 150,
+     'a duration-only clip patch RETIMES the inherited keys, rot and pos',
+     JSON.stringify(retimed.clips.walk.tracks.a));
+  ok(retimed.clips.walk.blendInMs === 180,
+     'the retime leaves the BLENDS alone — a blend is the transition, not the ' +
+     'stride');
+  const restated = sc.mergePatch(base(), {
+    clips: { walk: { durationMs: 600, tracks: { a: { rot: [{ t: 0 }] } } } },
+  });
+  ok(restated.clips.walk.tracks.a.rot.length === 1 &&
+     restated.clips.walk.tracks.a.rot[0].t === 0,
+     'a clip patch that DOES carry tracks replaces them, un-retimed');
+  // The rule must not fire on a limb that happens to carry a durationMs: it is
+  // keyed on the path, not on the shape.
+  const notAClip = sc.mergePatch(
+    { spring: { durationMs: 1000, tracks: { a: { rot: [{ t: 500 }] } } } },
+    { spring: { durationMs: 500 } });
+  ok(notAClip.spring.tracks.a.rot[0].t === 500,
+     'the retime fires on clips/<name> and nowhere else');
+
+  const eff = sc.applyEffect(base(),
+    { patch: { undead: true, limbs: [{ name: 'a', hp: 5 }] },
+      scale: { speed: 0.746, 'gait.cadence': 0.8 } }, 'fixture');
+  ok(eff.undead === true && eff.limbs[0].hp === 5 && eff.limbs.length === 3,
+     'an effect’s `patch` is the same merge, named arrays and all');
+  ok(Math.abs(eff.speed - 30 * 0.746) < 1e-12 &&
+     Math.abs(eff.gait.cadence - 6.4) < 1e-12,
+     'an effect’s `scale` multiplies a numeric leaf by dotted path — and an ' +
+     'integer leaf becomes a fraction rather than being re-rounded',
+     `${eff.speed}, ${eff.gait.cadence}`);
+  const missLog = [];
+  sc.applyEffect(base(), { scale: { 'nope.nothing': 2 } }, 'fixture', missLog);
+  ok(missLog.length === 1 && missLog[0].includes('nope.nothing'),
+     'a scale path that reaches nothing is LOUD',
+     'a silent miss is a zombie at the human’s speed with nothing saying why');
+
+  // A bad override must drop the whole def loudly rather than half of it — the
+  // loader is all-or-nothing (mob.cpp), so the resolver has to be too.
+  let threw = false;
+  try { sc.resolveExtends(() => ({ extends: 'self' }), 'self'); }
+  catch { threw = true; }
+  ok(threw, 'an `extends` cycle throws rather than hanging');
+
+  // ---- and the pool, resolved the same way in both languages ---------------
+  const mobsDir = path.join(ROOT, 'assets/mobs');
+  const readStem = stem => readJson(path.join(mobsDir, stem + '.json'));
+  const readEffect = name => {
+    const p = path.join(mobsDir, 'effects', name + '.json');
+    return fs.existsSync(p) ? readJson(p) : null;
+  };
+  const mine = {};
+  for (const f of fs.readdirSync(mobsDir).sort()) {
+    if (!f.endsWith('.json')) continue;
+    const stem = f.replace(/\.json$/, '');
+    try {
+      mine[stem] = sc.resolveSidecar(readStem, stem, readEffect);
+    } catch (e) {
+      ok(false, `${stem}.json resolves`, e.message);
+    }
+  }
+  ok(Object.keys(mine).length > 0, 'there are sidecars to resolve');
+
+  // THE CROSS-LANGUAGE CLAIM, and the whole reason `--gate sidecar-resolve`
+  // dumps a file: the engine's resolution and this one must be the same
+  // document. Skipped with a note rather than failed when the dump is absent —
+  // a JSON-only edit should not need a device boot, and the gate that writes
+  // the file runs once per C++ change.
+  const dumpPath = path.join(ROOT, 'build/sidecar_resolved.json');
+  if (!fs.existsSync(dumpPath)) {
+    console.log('  SKIP  cross-language resolution (no build/sidecar_' +
+                'resolved.json; run `--selftest --gate sidecar-resolve`)');
+  } else {
+    const theirs = readJson(dumpPath);
+    for (const stem of Object.keys(theirs)) {
+      if (!mine[stem]) { ok(false, `${stem}: the engine resolved it, we did not`); continue; }
+      const d = diff(mine[stem], theirs[stem], stem);
+      ok(!d, `${stem} resolves identically in C++ and in sidecar.js`, d);
+    }
+    for (const stem of Object.keys(mine))
+      ok(theirs[stem] !== undefined,
+         `${stem}: the engine resolved it too`,
+         'src/game/sidecar.cpp skipped a sidecar assets/editor/sidecar.js did not');
   }
 }
 
