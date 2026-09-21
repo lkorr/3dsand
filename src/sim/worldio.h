@@ -14,14 +14,35 @@
 // Region-directory world persistence (M2 + region files, DESIGN.md §3).
 // `path` is a DIRECTORY (e.g. "world.svd") holding:
 //
-//   meta.svm       magic 'SVM4', world constants (kWorldN, kChunk, the exact
-//                  bit pattern of kVoxelMeters), the window origin, and the
-//                  full material NAME table. Written LAST: its presence marks
+//   meta.svm       magic 'SVM5', world constants (kWorldN, kChunk, the exact
+//                  bit pattern of kVoxelMeters), the window origin, the full
+//                  material NAME table, and (SVM5) the SIM TICK and the SEED
+//                  the world was saved at. Written LAST: its presence marks
 //                  a completed save. A load refuses any mismatch and says
 //                  exactly which field disagreed — material IDs are baked into
 //                  every chunk (world.h "never reorder"), and a world saved at
 //                  one voxel size loaded into a build with another would
 //                  silently change physical scale.
+//
+//                  'SVM4' STILL LOADS, and reports tick/seed as UNKNOWN (0).
+//                  That is not politeness to old files: the two fields are
+//                  APPENDED at the end of the record, so an SVM4 reader's
+//                  view of an SVM5 file is identical up to the point it stops
+//                  reading, and the only thing a pre-M9.5 save genuinely
+//                  lacks is the pair. Refusing it would throw away a world to
+//                  gain two numbers nobody had.
+//
+//                  WHY THE TICK AND THE SEED ARE HERE AT ALL (M9.5-B). The
+//                  tick is what `ChunkStore`'s per-chunk tick tags are
+//                  measured against: a host that saves, quits and reloads has
+//                  to resume its clock ABOVE every tag it persisted, or the
+//                  first eviction after the load carries a tick older than
+//                  the chunk it replaces and a peer's `ChunkPut` arbitration
+//                  ("newer wins") starts answering backwards. The seed is the
+//                  other half of the same identity: a world dir and a build
+//                  that disagree on the seed regenerate different terrain for
+//                  every chunk the store does NOT hold, which is most of
+//                  them, and today nothing in the file would catch it.
 //   r_x_y_z.svr    the chunk store's voxel region files (chunkstore.cpp).
 //   entities.sve   OPTIONAL entity state — everything that lives OUTSIDE the
 //                  voxel grid (rigidbodies, mobs, the avatar). See below.
@@ -90,9 +111,28 @@ struct EntityIO {
   std::vector<EntitySection> sections;
 };
 
+// The two facts meta.svm gained in SVM5 (M9.5-B). A VALUE TYPE with a
+// `known` flag rather than a pair of magic zeros, because tick 0 and seed 0
+// are both legal and "the file did not say" has to be distinguishable from
+// "the file said zero" — that distinction is the whole reason an SVM4 file is
+// allowed to load at all.
+struct WorldStamp {
+  uint32_t tick = 0;
+  uint32_t seed = 0;
+  bool known = false;
+};
+
+// `stamp` is what to WRITE (pass {} and the file records tick 0 / seed 0 with
+// `known` true — which is honest for a caller that genuinely has no clock).
+// Defaulted so every existing call site is untouched and byte-compatible
+// apart from the two appended words.
 bool SaveWorld(GpuContext& ctx, World& world, Stream& stream,
                const std::string& path, const std::vector<MaterialDef>& mats,
-               const EntityIO* entities = nullptr);
+               const EntityIO* entities = nullptr, WorldStamp stamp = {});
+// `stampOut`, when non-null, receives what the file carried. `known` is false
+// for an SVM4 file; the two numbers are then 0 and MUST NOT be used to set a
+// clock (see the SVM4 paragraph at the top).
 bool LoadWorld(GpuContext& ctx, World& world, Simulation& sim, Stream& stream,
                const std::string& path, const std::vector<MaterialDef>& mats,
-               const EntityIO* entities = nullptr);
+               const EntityIO* entities = nullptr,
+               WorldStamp* stampOut = nullptr);
