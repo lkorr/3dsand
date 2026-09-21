@@ -13140,6 +13140,47 @@ for 300 ticks twice. What is still one-of: the window origin and every per-slot
 buffer, the slot-keyed world hash (S3), `main()`'s alias references, and
 `WaterBodies()` keyed on the window origin (rule 1 below).
 
+**M9.2 — two exes talk (2026-09-21; `src/net/link.*`, `src/net/protocol.*`,
+`src/game/remoteplayer.*`, `main.cpp` `--host`/`--join`).** `net::Link` is an
+interface with two implementations sharing one frame reassembler: `TcpLink`
+(non-blocking Winsock, `TCP_NODELAY`, polled once per frame, no thread — the
+telemetry server's shape) and an in-memory loopback pair for gates. A frame is
+`{u32 len, u16 type, u16 ver}` + payload; a `Hello` compares ONE table of 17
+build/asset identity words (world constants, seed, material table hash, tuning
+and environment stamps, record and input versions) and refuses by field name.
+Pacing is delayed lockstep over ONE `TickBatch` per direction per tick, D = 4:
+the batch labelled T+D leaves at T (send-before-wait), a batch is sent every
+tick empty or not, and the same `while (ShouldSend())` loop emits the D-deep
+pre-send at connect — there is no separate pre-send path to drift. A tick runs
+only when the peer's batch for it has arrived; a stall skips the tick and keeps
+rendering. `TickInput` never crosses the wire: each machine owns its own
+controller and sends the OUTCOME, a 108-byte `PlayerState`, from which the peer
+drives a `RemotePlayer` ghost — a `PlayerAvatar` fed a `Player` struct that is
+never `Update()`d, targetable, solid, and authoring NOTHING (its throw-away op
+vectors are asserted empty of leaks by gate `remote-ghost`). Measured smoke on
+one machine: 272/276 paced ticks, `late = 0` both ways, max lag 8 = 2D. Two
+lessons recorded for M9.3: a multi-second foreground stall (pipeline compile,
+worldgen) trips a wall-clock silence rule, so silence must be measured in
+POLLED time; and the local machine's own `--frames` budget must start at join.
+
+**Landed ahead of their stages (2026-09-21):** the per-chunk content digest
+(`chunkHash`, a SECOND accumulator in the occupancy pass keyed chunk-locally so
+it is a pure function of a chunk's 4096 words at any window origin — the world
+hash keys on the SLOT and stays byte-identical; gate `chunk-hash`), the
+per-slot quiet streak (`World::QuietTicks`), `net::Authority` (chunk and entity
+ownership = nearest RESIDENT player with margin, ties to the lower id, 2-chunk
+hysteresis in caller-owned memory; a counted, never-refusing producer audit at
+`SubmitTick`; gate `authority`), mob ownership (a ghost mob is posed from
+`MobPose` and never stepped, bled, burned, stained or raised, but is a target
+and an obstacle; `Mob::SaveOne`/`MobSystem::LoadOne` extract the per-mob
+record without changing the save format; `MobHandoff` carries record + brain
++ gear by name; gate `mob-handoff`), and debris/item ownership (a ghost body is
+kinematic, driven by the same `DriveKinematicTo` the straps use, skipped by
+every emitter and by the island scan of chunks the machine does not own;
+`ItemTake`/`ItemGrant` make pickup one path on both machines; gate
+`debris-ghost`). None of it is wired to the wire yet; that is M9.3-B/C and
+M9.4-D.
+
 **M9 proper (`docs/PLAN_multiplayer_m9.md`, plan of record 2026-09-20).** The
 audit under-stated one number: the residency window is `kWorldN` ×
 `kVoxelMeters` = a **51.2 m cube**, so two players walking independently leave
