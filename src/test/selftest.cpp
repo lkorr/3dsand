@@ -62,6 +62,8 @@ const std::vector<Gate>& ImpactGates();
 // though kOrder splits them to opposite ends of the run: the registry is a
 // pool of every gate a TU offers and the ORDER is kOrder's business alone.
 const std::vector<Gate>& CombatGates();
+// The network layer (src/net/*). CPU-only: no world, no GPU, no assets.
+const std::vector<Gate>& NetGates();
 
 // THE EXECUTION ORDER, and it is load-bearing.
 //
@@ -126,6 +128,14 @@ const char* const kOrder[] = {
     // the same reason `swing` is: a controller that has drifted back onto the
     // frame clock makes every later movement gate measure something else.
     "tick-input",
+    // AND WITH THEM, for the fourth time and the same reason: `net-loopback`
+    // is src/net alone — two in-memory Links, one loopback TCP pair, a Hello
+    // table and a pure-value pacer. No world, no GPU, no assets, nothing left
+    // behind, and it runs in milliseconds. It belongs beside `tick-input`
+    // because it asserts the other half of the same contract: N2 pinned that
+    // the controller is a function of the command stream, this pins that the
+    // stream can cross a wire and be refused when the two builds disagree.
+    "net-loopback",
     // AND WITH THEM, for the third time and the same reason: `combat-tuning`
     // and `combat-cues` are pure CPU over tuning.json and the sound library —
     // no world, no GPU, no fixtures, nothing left behind (the one temp file
@@ -607,7 +617,8 @@ const std::vector<Gate>& Registry() {
                           &VoxRegionGates(),
                           &SpellGates(), &PlayerKitGates(), &GrimoireGates(), &SwingGates(),
                           &EquipmentGates(), &DyeGates(), &WoundGates(), &ImpactGates(),
-                          &CombatGates()})
+                          &CombatGates(),
+                          &NetGates()})
       pool.insert(pool.end(), g->begin(), g->end());
 
     std::vector<Gate> v;
