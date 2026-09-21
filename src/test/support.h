@@ -125,6 +125,15 @@ void ApplyTaaJitter(const Camera& cam, const Vec3& eye, float aspect,
 // CPU-owned (docs/PLAN_mpm_fluids.md prototype; world.h fluid block). The
 // caller owns the running count and must add fluidSpawns.size() to it after
 // this returns. Both default to nothing, which records zero fluid work.
+//
+// SINGLE-PRODUCER AUDIT (M9.4-A). When `net::Hook()` is non-null — i.e. a
+// connected multiplayer game installed one via `net::SetAuthorityHook` — this
+// function additionally walks every brush op, explosion op and cell op and
+// counts the ones emitted into a chunk another machine owns, into the
+// `opstream` block of build/last_run.json. It never refuses an op; only
+// SANDVOX_NET_STRICT=1 turns a violation into an abort. With no hook it is
+// one null test and the uploaded bytes are unchanged, which is why installing
+// this cost the determinismHash nothing.
 void SubmitTick(GpuContext& ctx, World& world, Simulation& sim, uint32_t tick,
                 uint32_t seed, const std::vector<BrushOp>& ops,
                 const std::vector<ExplosionOp>& exps,

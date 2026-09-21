@@ -60,6 +60,17 @@ enum class Producer : uint8_t {
   EditLayer,  // sim/worldedit.cpp authored layers
   Worldgen,   // stream refill patch-ups
   Lab,        // harness / gate fixtures
+  // An op that arrived from a PEER and was replayed here (M9.3-B's merge).
+  // It is its own producer and not the producer the sender used, because the
+  // question the receiver asks about it is different: the sender's ownership
+  // was already checked on the sender, and the ONE thing the receiver must
+  // never do is re-emit it as if it were local (net::Owns returns false for
+  // Remote, and that is the whole point of the value existing).
+  //
+  // APPENDED, never inserted: every earlier enumerator keeps its numeric
+  // value, so a record written before this line still decodes to the same
+  // producers and OpMeta's layout is untouched (it stores a uint8_t).
+  Remote,
   Count
 };
 const char* ProducerName(uint8_t p);
@@ -173,6 +184,32 @@ struct StreamCounts {
   uint32_t ticksWithDupes = 0;
   uint32_t firstDupeCell = 0xFFFFFFFFu;  // a cell that lost a duplicate
   uint32_t firstDupeTick = 0;
+  // ---- M9.4-A: the SINGLE-PRODUCER ledger --------------------------------
+  //
+  // Counted only on a CONNECTED run (net::Hook() is null otherwise), so every
+  // gate, both smokes and single-player leave these at zero and nothing about
+  // the uploaded stream changes.
+  //
+  // TWO counters, not one, because they are two different bugs:
+  //   authorityViolations  a system emitted a world-authored op into a chunk
+  //                        another machine owns — a DUPLICATED op, the thing
+  //                        §4 finding 4's single-producer rule exists to stop.
+  //   unknownProducers     an op carried Producer::Unknown, i.e. some producer
+  //                        never adopted an author scope. Not a trespass; a
+  //                        missing annotation, and fixable in a different file.
+  // Folding them together would make "we shipped a new emitter without a
+  // scope" indistinguishable from "we double-stepped a chunk".
+  uint32_t authorityViolations = 0;
+  uint32_t unknownProducers = 0;
+  // ATTRIBUTION FOR THE FIRST VIOLATION (CLAUDE.md rule 6: a bare count is not
+  // a measurement). Producer, world chunk, and who DID own it — enough to name
+  // the emitter and the boundary on one line without a second run.
+  // firstViolProducer == Producer::Count means "a CellOp", which carries no
+  // OpMeta and so has no producer to name.
+  uint32_t firstViolProducer = 0xFFFFFFFFu;
+  uint32_t firstViolOwner = 0xFFFFFFFFu;  // net::kNoAuthority = nobody
+  uint32_t firstViolTick = 0;
+  int32_t firstViolChunk[3] = {0, 0, 0};
   uint32_t Total() const {
     return brushTrunc + expTrunc + cellTrunc + spawnTrunc + fluidTrunc +
            gasTrunc;
@@ -183,6 +220,13 @@ void ResetCounts();
 void NoteTruncation(uint32_t brush, uint32_t exp, uint32_t cell, uint32_t spawn,
                     uint32_t fluid, uint32_t gas);
 void NoteCellDupes(uint32_t tick, uint32_t dropped, uint32_t firstCellIdx);
+// One op emitted into a chunk this machine does not own. `producer` is a
+// Producer, or Producer::Count for a CellOp (which has no OpMeta). Only the
+// FIRST call fills the attribution fields; the rest only bump the count.
+void NoteAuthorityViolation(uint32_t tick, uint32_t producer, int32_t wcx,
+                            int32_t wcy, int32_t wcz, uint32_t owner);
+// One op whose producer never adopted an author scope.
+void NoteUnknownProducer();
 
 // ---- 2. THE RECORD --------------------------------------------------------
 

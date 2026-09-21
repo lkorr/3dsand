@@ -136,6 +136,13 @@ const char* const kOrder[] = {
     // the controller is a function of the command stream, this pins that the
     // stream can cross a wire and be refused when the two builds disagree.
     "net-loopback",
+    // AND BESIDE IT, `authority` (M9.4-A): pure arithmetic over two peers'
+    // positions and window origins, no Ctx, no world, no GPU, milliseconds.
+    // It belongs immediately after `net-loopback` because it answers the
+    // question the transport raises next — the wire can carry a stream, and
+    // this says WHOSE stream it is. Every later mob/debris ownership gate
+    // (M9.4-B/C) is measuring behaviour that only makes sense if this passed.
+    "authority",
     // AND WITH THEM, for the third time and the same reason: `combat-tuning`
     // and `combat-cues` are pure CPU over tuning.json and the sound library —
     // no world, no GPU, no fixtures, nothing left behind (the one temp file
@@ -792,6 +799,17 @@ void WriteJson(const std::string& path, const std::vector<Result>& results) {
       << ", \"ticksWithDupes\": " << oc.ticksWithDupes
       << ", \"firstDupeTick\": " << oc.firstDupeTick
       << ", \"firstDupeCell\": " << (int64_t)(int32_t)oc.firstDupeCell
+      // M9.4-A's single-producer ledger. Zero on every single-player run —
+      // the SubmitTick walk only happens when net::Hook() is non-null — so a
+      // non-zero here is by itself the statement "two machines were emitting
+      // into one chunk", with the first offender named beside it.
+      << ", \"authorityViolations\": " << oc.authorityViolations
+      << ", \"unknownProducers\": " << oc.unknownProducers
+      << ", \"firstViolTick\": " << oc.firstViolTick
+      << ", \"firstViolProducer\": " << (int64_t)(int32_t)oc.firstViolProducer
+      << ", \"firstViolOwner\": " << (int64_t)(int32_t)oc.firstViolOwner
+      << ", \"firstViolChunk\": [" << oc.firstViolChunk[0] << ", "
+      << oc.firstViolChunk[1] << ", " << oc.firstViolChunk[2] << "]"
       << "},\n";
   }
   // ---- WHAT THIS RUN'S SIM CONSTANTS WERE (PLAN_multiplayer_now N6) -------
