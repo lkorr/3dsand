@@ -60,6 +60,10 @@
 // includes game/remoteplayer.h.
 #include "net/link.h"
 #include "net/chunksync.h"
+// M9.4-D: the per-tick ENTITY traffic — interest, handoffs, the one envelope
+// the ten record kinds ride in. Pure decision layer; this file does the
+// sending, the same split chunksync.h keeps.
+#include "net/entitysync.h"
 #include "net/opsync.h"
 #include "net/protocol.h"
 #include "phys/debris.h"
@@ -345,6 +349,28 @@ bool NetSmokePaint() {
 // one voxel it was asked to be.
 bool NetSmokeDrift() {
   static const bool on = std::getenv("SANDVOX_NET_SMOKE_DRIFT") != nullptr;
+  return on;
+}
+// ---- SANDVOX_NET_SMOKE_MOBS=1: SOMETHING TO OWN (M9.4-D) ----------------
+//
+// Fifth of the family, and the reason is the one NetSmokePaint gives about
+// ops, applied to entities: --autofly-hard flies, and an empty world contains
+// no creature and no loose body, so the entity exchange would be exercised by
+// ZERO announces, ZERO poses and ZERO handoffs and the smoke would be green
+// because nothing happened. A "fixture that cannot fail" (CLAUDE.md).
+//
+// Set, a --frames run spawns three of the `crowd` gate's humanoid def eight
+// voxels in front of the player at tick 30 — through MobSystem::Spawn, the
+// same single call the AI panel makes, so they are ordinary creatures with
+// ordinary brains and nothing about them is a test object. Tick 30 rather
+// than tick 0 because the window has to have shifted onto the player and the
+// terrain under their feet has to exist.
+//
+// The HOST is the one that sets it in the smoke recipe: the host stands still
+// and owns them, the client flies through and sees ghosts, which is exactly
+// the asymmetry the `entities:` report line is read for.
+bool NetSmokeMobs() {
+  static const bool on = std::getenv("SANDVOX_NET_SMOKE_MOBS") != nullptr;
   return on;
 }
 bool g_autofly = false;
@@ -6804,6 +6830,28 @@ int main(int argc, char** argv) {
   // Connected() is false until the handshake completes, and while it is false
   // nothing here sends a byte or touches a chunk.
   net::ChunkSync chunksync;
+  // ---- THE ENTITY HALF (M9.4-D, net/entitysync.h) ----------------------
+  //
+  // NOT borrowed by TickAuthorityCtx, and that is deliberate: everything it
+  // does happens at the FRAME layer, around the tick rather than inside it.
+  // The handoff scan must run before `MobSystem::PreTick` (which is where
+  // `RefreshOwnership` turns a creature into a ghost and after which
+  // `TakeHandoff` would refuse it), the apply must run before the tick that
+  // carries the label, and the build must run after that tick — three points
+  // the frame loop already stands at, and none of which is inside a phase.
+  //
+  // What DOES reach the tick is the pair of ownership CLOSURES it hands to
+  // MobSystem and DebrisSystem at connect. Those are null until then, which
+  // is this package's whole hash argument: with no function bound both
+  // systems' RefreshOwnership returns on its first line and the tick is
+  // byte-for-byte the one the `--record-ops` oracle recorded.
+  net::EntitySync entities;
+  // Entity telemetry for the exit report, accumulated HERE and not read off
+  // the object at exit — `Disconnect()` clears its counters, so a host that
+  // outlives its peer would report zeroes for work it really did. Same
+  // harvest-first discipline as the op and chunk-sync totals below.
+  net::EntitySync::Counters netEnt{};
+  uint32_t netGhostsMax = 0;
   // Chunk-sync telemetry for the exit report, accumulated HERE for the same
   // reason the op counters are: Disconnect() clears the state machine, so a
   // host that outlives its peer would report zeroes for work it really did.
@@ -6895,6 +6943,102 @@ int main(int argc, char** argv) {
     uint32_t vizActive = 0;
   };
   std::map<uint32_t, NetPending> netQueue;
+
+  // ---- THE PEER'S LATEST APPLIED STATE, AS THE AUTHORITY SEES IT (M9.4-D)
+  //
+  // `net::PeerView` needs two facts about the peer that only its
+  // `PlayerState` carries: its feet chunk and its window origin. This is that
+  // state, copied at the moment it is APPLIED (not at the moment it arrives),
+  // so the authority arithmetic runs on the same snapshot of the peer the
+  // local ghost body is standing at. Applying it on arrival would compute
+  // ownership from a peer four ticks in its own future, which on a walking
+  // player is a different set of chunks and would re-home entities early.
+  PlayerState netPeerLast{};
+  bool netHavePeerLast = false;
+
+  // ---- ...AND MY OWN, AT THE SAME TICK. THE PAIR MUST BE SYMMETRIC -----
+  //
+  // MEASURED, the first two-process smoke of this package: the host reported
+  // `handoffs out=6` while the client reported `handoffs in=3` and
+  // `misses=144` — 144 poses for creatures the client believed were already
+  // its own. Both machines were simulating the same three humans at once,
+  // which is the single-producer rule (§4 finding 4) broken in the open.
+  //
+  // THE CAUSE WAS NOT THE AUTHORITY ARITHMETIC. It was what the two machines
+  // fed it. A peer's `PlayerState` is D+1 ticks stale by construction (that
+  // is what D BUYS), so at local tick N the host was computing from
+  //   (host NOW, client at N-D-1)
+  // and the client, symmetrically, from
+  //   (client NOW, host at N-D-1).
+  // Those are different question, and "ownership is DERIVED, so both
+  // machines get the same answer and there is no claim message anywhere in
+  // the protocol" (authority.h) is simply FALSE under them. The 2-chunk
+  // hysteresis absorbs it while both players walk; `--autofly-hard` crosses
+  // 32 voxels in well under five ticks, so the smoke flew straight through
+  // the margin and the disagreement became visible.
+  //
+  // THE FIX IS TO AGE MY OWN VIEW TO MATCH. This ring holds what this
+  // machine's `PeerView` WAS at each recent tick; the lookup key is the
+  // peer's `st.tick`, which is the tick the peer's state describes. Both
+  // machines then compute from
+  //   (host at N-D-1, client at N-D-1)
+  // — the same two facts, in the same order, and the answers are identical
+  // by arithmetic rather than by luck. A stale pair is not a problem here:
+  // authority is about WHICH MACHINE STEPS A THING, and agreeing on a
+  // five-tick-old answer is strictly better than disagreeing on a fresh one.
+  //
+  // std::map and not a deque: it is looked up by tick, it never holds more
+  // than the prune below leaves in it, and the ordered erase-up-to is one
+  // call. The depth is generous (four times D+1) because the peer's state
+  // can be older than D+1 when a batch was late.
+  std::map<uint32_t, net::PeerView> netMyRing;
+  constexpr uint32_t kNetMyRingDepth = 4 * (net::kOpDelayTicks + 1);
+  auto netNoteMyView = [&](uint32_t t) {
+    net::PeerView v{};
+    v.playerId = netMyId;
+    v.chunk = {ifloor(session.player.pos.x) >> 4,
+               ifloor(session.player.pos.y) >> 4,
+               ifloor(session.player.pos.z) >> 4};
+    v.windowOrigin = world.WindowOrigin();
+    v.connected = true;
+    netMyRing[t] = v;
+    while (netMyRing.size() > kNetMyRingDepth)
+      netMyRing.erase(netMyRing.begin());
+  };
+
+  // Rebuilt every tick from the ring + `netPeerLast` and handed to the
+  // EntitySync, which is the only thing that reads it.
+  auto netRefreshPeerViews = [&]() {
+    net::PeerView mine{};
+    mine.playerId = netMyId;
+    mine.chunk = {ifloor(session.player.pos.x) >> 4,
+                  ifloor(session.player.pos.y) >> 4,
+                  ifloor(session.player.pos.z) >> 4};
+    mine.windowOrigin = world.WindowOrigin();
+    mine.connected = true;
+    // The ring entry for the tick the peer's state describes. Absent only in
+    // the first few ticks after connect (nothing has been recorded yet), when
+    // the fresh view above is the only thing there is and the peer has not
+    // spoken either — so nothing is decided from the mismatched pair.
+    if (netHavePeerLast) {
+      const auto ri = netMyRing.find(netPeerLast.tick);
+      if (ri != netMyRing.end()) mine = ri->second;
+    }
+    if (!netHavePeerLast) {
+      entities.SetPeers(mine, nullptr);
+      return;
+    }
+    net::PeerView theirs{};
+    theirs.playerId = netPeerId;
+    theirs.chunk = {ifloor(netPeerLast.pos.x) >> 4,
+                    ifloor(netPeerLast.pos.y) >> 4,
+                    ifloor(netPeerLast.pos.z) >> 4};
+    theirs.windowOrigin = {netPeerLast.windowOrigin[0],
+                           netPeerLast.windowOrigin[1],
+                           netPeerLast.windowOrigin[2]};
+    theirs.connected = true;
+    entities.SetPeers(mine, &theirs);
+  };
 
   // Counters for the HUD and for the `--frames` exit report.
   uint64_t netBatchesSent = 0, netBatchesRecv = 0, netStalls = 0;
@@ -6989,6 +7133,36 @@ int main(int argc, char** argv) {
     link->Send((uint16_t)net::MsgType::TickBatch, net::kProtocolVersion,
                buf.data(), buf.size());
     netBatchesSent++;
+    // ---- M9.4-D: AND THE ENTITIES FOR THE SAME LABEL -------------------
+    //
+    // A SEPARATE MESSAGE, SENT AFTER THE BATCH, carrying the SAME label. Two
+    // reasons it is not a third blob inside `TickBatchWire`:
+    //
+    //  1. SIZE. A `TickBatch` is ~150 B and the pacer blocks on it; an
+    //     entity batch carrying a handoff carries a whole per-mob save
+    //     record (kilobytes) and two voxel lattices. Putting them in one
+    //     frame would make the peer's tick gate wait on a payload that has
+    //     nothing to do with whether the tick may run — §4 finding 8's
+    //     head-of-line argument, applied to the one message that must never
+    //     be delayed.
+    //  2. ABSENCE IS FINE. Invariant 2 ("a batch every tick, empty or not")
+    //     is about the PACER: "no ops" and "not arrived" must differ. No such
+    //     rule binds entities — nothing waits on them — so an empty entity
+    //     batch is simply not sent, which is most ticks of most games.
+    //
+    // Built here rather than in the tick loop because the pre-send at connect
+    // calls this D+1 times before the first tick runs, and the send site is
+    // the one place that knows the label each of those carries.
+    {
+      net::EntityBatch eb;
+      entities.Build(mobs, debris, label, eb);
+      if (!eb.Empty()) {
+        std::vector<uint8_t> ebuf;
+        eb.Encode(ebuf);
+        link->Send((uint16_t)net::MsgType::EntityBatch, net::kProtocolVersion,
+                   ebuf.data(), ebuf.size());
+      }
+    }
   };
 
   // ---- CONNECT: RESET THE PACER AND LET IT DO THE PRE-SEND ---------------
@@ -7001,6 +7175,9 @@ int main(int argc, char** argv) {
   auto netStartPacing = [&](uint32_t startTick) {
     pacer.Reset(startTick);
     netQueue.clear();
+    netMyRing.clear();   // M9.4-D: a tick label from a previous session
+                         // names a different moment; see netMyRing.
+    netHavePeerLast = false;
     // The op exchange starts with the pacer and on the same tick numbering: a
     // label from a previous session means nothing in this one.
     opsync.Connect(netMyId, netPeerId);
@@ -7008,6 +7185,50 @@ int main(int argc, char** argv) {
     // an origin-ring entry or a half-reassembled chunk from a previous
     // connection names a tick that no longer exists.
     chunksync.Connect(netMyId, netPeerId);
+    // ---- M9.4-D: AND THE ENTITY HALF -----------------------------------
+    //
+    // THE ORDER IN THIS BLOCK IS LOAD-BEARING, top to bottom:
+    //
+    //  1. `SetIdBand` / `SetLocalPlayerId` FIRST, before anything can spawn.
+    //     A mob id and a debris global id are the keys every record below is
+    //     addressed to, and both machines mint them from a monotonic counter
+    //     that starts at 1 — so without the band the client's first creature
+    //     and the host's first creature are the same creature as far as the
+    //     wire is concerned. The host is player 0 and keeps today's
+    //     numbering, which is why a single-player save is unchanged.
+    //
+    //     HONEST LIMIT: bodies that existed BEFORE the join keep
+    //     `ownerAtCreate = 0` (debris.h says SetLocalPlayerId does not
+    //     re-mint them, and cannot — those ids may already be out on the
+    //     wire from a previous connection). On a client that joins a world it
+    //     has been playing alone in, those bodies sit in the host's band. It
+    //     is a real collision hazard and the fix is M9.5's late-join reset,
+    //     not a re-mint here; the smoke joins at boot, so nothing predates it.
+    //
+    //  2. The ownership closures, which are what make `RefreshOwnership` in
+    //     both systems stop being a no-op. From this line on, a mob or a body
+    //     can be somebody else's.
+    //
+    //  3. The item callbacks, which let a peer's `ItemTake` be answered out
+    //     of THIS machine's ground registry (worlditems.h says why they are
+    //     handed down rather than the layering being inverted).
+    entities.Connect(netMyId, netPeerId);
+    mobs.SetIdBand(netMyId);
+    mobs.SetLocalPlayerId(netMyId);
+    debris.SetLocalPlayerId(netMyId);
+    mobs.SetOwnershipFn([&entities](uint64_t id, Vec3 feet) {
+      return entities.MobOwner(id, feet);
+    });
+    debris.SetOwnershipFn(
+        [&entities](Vec3 pos) { return entities.BodyOwner(pos); });
+    debris.SetChunkOwnedFn(
+        [&entities](IVec3 wc) { return entities.ChunkOwned(wc); });
+    debris.SetItemLookupFn(ground.LookupFn());
+    debris.SetItemTakeFn([&debris](uint64_t h) {
+      // The same call the local E key makes. The registry entry is dropped by
+      // the release hook when the body goes, so this is one call, not two.
+      return debris.DestroyBody(h);
+    });
     netSilence = 0.0;
     netSilenceLastPoll = 0.0;
     netPacedAt = net::NowSeconds();
@@ -7034,7 +7255,72 @@ int main(int argc, char** argv) {
     remotes.Clear(phys);
     mobs.SetAvatar(&session.avatar);
     netQueue.clear();
+    netMyRing.clear();
+    netHavePeerLast = false;
     netPaced = false;
+    // ---- M9.4-D: NOTHING MAY FREEZE WHEN THE PEER GOES ------------------
+    //
+    // Every ghost in this world is a creature or a body that ANOTHER machine
+    // was stepping. With the peer gone nothing poses them, and a ghost mob is
+    // a fourth PreTick branch that runs no AI and a ghost body is a KINEMATIC
+    // Jolt body — so left alone they stand and hang exactly where they were,
+    // forever, un-fightable and un-pushable. That is the worst possible
+    // outcome of a disconnect: the world looks intact and half of it is
+    // furniture.
+    //
+    // So every ghost is PROMOTED TO LOCAL at its last pose, which the plan
+    // describes as "a handoff to self from the announce + last pose" and
+    // which is spelled here as an ownership function that answers `me` for
+    // everything. That is not a shortcut around the handoff path — it IS the
+    // handoff path: `RefreshOwnership` is what both systems consult, it runs
+    // at the top of the very next PreTick, and `MakeOwned` / the local branch
+    // do exactly what a received handoff's tail does (flip to dynamic, drop
+    // the pose latch, resume stepping from where the body stands).
+    //
+    // WHY NOT JUST CLEAR THE FUNCTIONS. A null `ownershipFn_` makes
+    // `RefreshOwnership` return on its FIRST LINE (mob.cpp, debris.cpp), so
+    // every existing ghost keeps `owner_ != local` forever and the freeze is
+    // exactly the bug above. The always-me function costs one call per entity
+    // per tick in a process that has already lost its peer, and it is the
+    // only form of "everything is mine again" that the two systems can act
+    // on. It stays bound for the life of the process rather than being
+    // cleared a tick later: a one-tick state machine here would be a second
+    // rule to get wrong, and the two functions are behaviourally identical to
+    // null once every entity is local.
+    {
+      const uint32_t me = netMyId;
+      mobs.SetOwnershipFn([me](uint64_t, Vec3) { return me; });
+      debris.SetOwnershipFn([me](Vec3) { return me; });
+      debris.SetChunkOwnedFn(nullptr);   // every chunk is mine to scan again
+    }
+    netEnt = [&] {
+      // Harvest FIRST, then Disconnect: it clears the counters, and a listen
+      // server that loses one player and gains another would otherwise report
+      // only the second one's work.
+      const net::EntitySync::Counters& s = entities.Stats();
+      net::EntitySync::Counters t = netEnt;
+      t.announcesOut += s.announcesOut;   t.announcesIn += s.announcesIn;
+      t.posesOut += s.posesOut;           t.posesIn += s.posesIn;
+      t.handoffsOut += s.handoffsOut;     t.handoffsIn += s.handoffsIn;
+      t.gonesOut += s.gonesOut;           t.gonesIn += s.gonesIn;
+      t.takesOut += s.takesOut;           t.takesIn += s.takesIn;
+      t.grantsOut += s.grantsOut;         t.grantsIn += s.grantsIn;
+      t.batchesOut += s.batchesOut;       t.batchesIn += s.batchesIn;
+      t.applyMisses += s.applyMisses;     t.expired += s.expired;
+      t.ghostsMax = std::max(t.ghostsMax, s.ghostsMax);
+      return t;
+    }();
+    netGhostsMax = std::max(netGhostsMax, netEnt.ghostsMax);
+    // RESET AFTER HARVESTING, and this line is not optional bookkeeping.
+    // `Disconnect()` deliberately does NOT clear the counters (they are
+    // diagnostics, not connection state), so without this the exit report's
+    // `netEnt + Stats()` adds the same work twice. MEASURED: the first smoke
+    // of this package printed the host's every entity number at exactly 2x
+    // the client's matching number — announces 6/3, poses 288/144, batches
+    // 98/49 — and the perfect 2:1 across five unrelated fields was the only
+    // clue that it was a reporting defect and not a protocol one.
+    entities.ResetStats();
+    entities.Disconnect();
     // The op exchange goes with the peer. Its counters are harvested FIRST:
     // Disconnect() clears the queue, and the delay queue's labels are this
     // session's and no other -- a rejoin restarts the host's clock, and a
@@ -7234,6 +7520,26 @@ int main(int argc, char** argv) {
         case net::MsgType::HashChunks:
         case net::MsgType::ChunkRequest:
         case net::MsgType::ChunkBusy:
+        // ---- M9.4-D: THE ENTITY ENVELOPE --------------------------------
+        //
+        // QUEUED BY LABEL, applied by the tick loop when that label runs —
+        // the same rule the `PlayerState` above obeys and for the same
+        // reason: a record applied on arrival would move a creature D ticks
+        // ahead of every local body it can be hit by. There is no "late"
+        // counter here because `ApplyForTick` deliberately applies a batch
+        // whose label has already passed rather than dropping it (see the
+        // note there): a stale pose is the freshest thing anybody has said
+        // about that entity, and discarding it freezes a ghost.
+        case net::MsgType::EntityBatch: {
+          if (!netPaced) break;
+          net::EntityBatch eb;
+          if (!eb.Decode(m.payload.data(), m.payload.size())) {
+            netLate++;   // a half-applied entity batch is worse than none
+            break;
+          }
+          entities.NoteRemote(std::move(eb));
+          break;
+        }
         case net::MsgType::ChunkSync: {
           if (!netPaced) break;
           std::vector<net::ChunkSync::Out> reply;
@@ -8217,6 +8523,40 @@ int main(int argc, char** argv) {
     // but now a lambda, because the key grew a second meaning (the hold-to-
     // drag block below) and the tap has to fire on the key-UP of a press that
     // was not spent grabbing.
+    // ---- M9.4-D: THE ANSWER TO AN E ON SOMEBODY ELSE'S ITEM ------------
+    //
+    // A ghost item belongs to the peer: only the owner's copy of a body is
+    // real, so taking one here would be inventing a sword out of a render
+    // proxy and both machines would end up holding it. The E below therefore
+    // SENDS A REQUEST for a ghost, and this is where the reply lands.
+    //
+    // `granted == 0` is a real and necessary answer, not an error: the owner
+    // may have picked the thing up half a second before you asked. Without a
+    // refusal the requester could never tell "you have it" from "there was
+    // nothing there", and a ghost item nobody could ever take again would sit
+    // on the ground for the rest of the session (debris.h, net::ItemGrant).
+    //
+    // The bag/hotbar code below is the SAME code the local branch of `takeE`
+    // runs — deliberately duplicated rather than factored out, because the
+    // two differ in what they must NOT do: the local branch destroys the body
+    // (it owns it), this one must not (the owner already did, and its own
+    // `BodyGone` removes the ghost).
+    if (netPaced) {
+      net::ItemGrant g;
+      while (entities.PopLocalGrant(g)) {
+        if (!g.granted) {
+          ui.kitMessage = "somebody else got there first";
+          ui.kitMessageAge = 0.0f;
+          continue;
+        }
+        const int di = items.Find(g.item);
+        int where = di >= 0 ? kit.bag.Add(di, 1, g.dye) : -1;
+        if (where < 0 && di >= 0) where = hotbar.Add(di, 1, g.dye);
+        ui.kitMessage =
+            where >= 0 ? "picked up " + g.item : "you have no room for that";
+        ui.kitMessageAge = 0.0f;
+      }
+    }
     auto takeE = [&]() {
       const uint64_t hit = lookBody;
       const WorldItem* w = hit ? ground.Find(hit) : nullptr;
@@ -8235,6 +8575,16 @@ int main(int argc, char** argv) {
           captured = false;
           glfwSetInputMode(window, GLFW_CURSOR, GLFW_CURSOR_NORMAL);
           glfwGetCursorPos(window, &mx0, &my0);
+        }
+      } else if (w && netPaced && debris.IsGhost(hit)) {
+        // M9.4-D: NOT MINE — ASK. The ghost is deliberately NOT removed here:
+        // removing it optimistically would leave a refused request with a
+        // sword that exists on one machine and not the other, and no message
+        // that would ever put it back. The reply is drained above.
+        const uint64_t gid = debris.GlobalIdOf(hit);
+        if (gid != 0 && debris.RequestItemTake(gid)) {
+          ui.kitMessage = "reaching for " + w->item;
+          ui.kitMessageAge = 0.0f;
         }
       } else if (w) {
         const int di = items.Find(w->item);
@@ -9368,6 +9718,11 @@ int main(int argc, char** argv) {
             PlayerState st = it->second.st;
             st.playerId = netPeerId;
             remotes.Upsert(netPeerId).Apply(st);
+            // M9.4-D: the authority's view of the peer, captured at the
+            // moment the ghost body is placed from the same state. See the
+            // note on netPeerLast for why it is not captured on arrival.
+            netPeerLast = st;
+            netHavePeerLast = true;
           }
           // THE HOST WINS ON THE TWO HASHED PRESENTATION INPUTS (session.cpp
           // phase L11: `timeScale` reaches Celestial and `vizActive` reaches
@@ -9382,6 +9737,70 @@ int main(int argc, char** argv) {
         // Prune everything at or before the tick about to run. The map never
         // holds more than D+1 entries, so this is the whole memory management.
         netQueue.erase(netQueue.begin(), netQueue.upper_bound(tick));
+
+        // ---- M9.4-D: THE ENTITY TICK, AND ITS ORDER IS THE DESIGN -------
+        //
+        // Four steps, all of them BEFORE TickAuthority and all of them in
+        // this order for a reason that a comment is the only place to record:
+        //
+        //  1. REBUILD THE PEER VIEWS. Both machines' authority arithmetic
+        //     reads the same two facts (each player's feet chunk and window
+        //     origin) and gets the same answer; that is what makes ownership
+        //     derived rather than negotiated. Rebuilt every tick because a
+        //     walking player moves the boundary.
+        //  2. APPLY WHAT ARRIVED FOR THIS LABEL. Handoffs, announces, poses,
+        //     gones, item traffic — in the envelope's field order. Before the
+        //     handoff scan, so a creature the peer has just given me is not
+        //     immediately considered for giving back.
+        //  3. SCAN FOR HANDOFFS. Before the tick, because
+        //     `MobSystem::PreTick` starts with `RefreshOwnership`, which
+        //     turns a creature whose authority has flipped into a ghost — and
+        //     `TakeHandoff` refuses a ghost. This is the ONLY window in which
+        //     the losing side can still describe what it is losing.
+        //  4. EXPIRE. The 3 s backstop for a ghost whose owner stopped
+        //     talking about it because I left ITS window (see
+        //     kGhostExpiryTicks) — the one case no message can cover.
+        //
+        // The batch that carries the results goes out after the tick, from
+        // the same `netSendBatch` the `TickBatch` rides.
+        netRefreshPeerViews();
+        entities.ApplyForTick(tick, mobs, debris, &ground);
+        entities.ScanHandoffs(mobs, debris, tick);
+        entities.ExpireGhosts(tick, mobs, debris);
+        netGhostsMax = std::max(netGhostsMax, entities.Stats().ghostsNow);
+      }
+
+      // ---- M9.4-D: SOMETHING FOR THE SMOKE TO OWN --------------------
+      //
+      // SANDVOX_NET_SMOKE_MOBS only (see the switch). Three creatures of the
+      // `crowd` gate's humanoid def, eight voxels ahead of the player, once,
+      // at tick 30. `MobSystem::Spawn` is the same call the AI panel makes —
+      // nothing here is a test-only object, and nothing here is a second
+      // spawn path.
+      if (NetSmokeMobs() && g_harnessFrames > 0 && tick == 30) {
+        int humanDef = -1;
+        for (size_t i = 0; i < mobs.Defs().size(); i++) {
+          if (mobs.Defs()[i].FindSocket("held_right") < 0) continue;
+          if (humanDef < 0 || mobs.Defs()[i].name == "human")
+            humanDef = (int)i;
+        }
+        if (humanDef >= 0) {
+          const Vec3 fwd = cam.FlatForward();
+          int spawned = 0;
+          for (int k = 0; k < 3; k++) {
+            // Spread ACROSS the look direction so all three are in front and
+            // none is inside another: a crowd spawned on one cell would spend
+            // its first ticks resolving overlap instead of standing there.
+            const int sx = ifloor(session.player.pos.x + fwd.x * 8.0f) +
+                           (k - 1) * 3;
+            const int sz = ifloor(session.player.pos.z + fwd.z * 8.0f);
+            const int sy = World::TerrainHeight(sx, sz, kDefaultSeed) + 1;
+            if (mobs.Spawn(humanDef, {sx, sy, sz}) != 0) spawned++;
+          }
+          std::printf("net smoke: spawned %d mob(s) of '%s' at tick %u\n",
+                      spawned, mobs.Defs()[humanDef].name.c_str(), tick);
+          std::fflush(stdout);
+        }
       }
 
       TickAuthority(tickCtx, session,
@@ -9416,6 +9835,13 @@ int main(int argc, char** argv) {
       // samples for its own ring. Two rings sampled at different points of
       // the tick would disagree by one shift on a walking player and the
       // comparable set would stop being symmetric.
+      // M9.4-D: and MY OWN authority view for this tick, sampled at exactly
+      // the point `MakePlayerState` samples the state the peer will pair it
+      // with (after the tick, `world.WindowOrigin()` as phase B left it). A
+      // ring sampled at a different point of the tick would be off by one
+      // window shift on a walking player, which is the whole bug it exists
+      // to fix — see netMyRing.
+      if (netPaced) netNoteMyView(tick);
       if (netPaced) {
         chunksync.NoteOwnTick(tick, world.WindowOrigin(),
                               {ifloor(session.player.pos.x) >> 4,
@@ -12250,6 +12676,55 @@ int main(int argc, char** argv) {
       for (const net::ChunkSync::MismatchPoint& mp : ser)
         std::printf(" %u:%u/%u", mp.hashTick, mp.blocks, mp.compared);
       std::printf("\n");
+    }
+    // ---- M9.4-D: THE ENTITY LINE ----------------------------------------
+    //
+    // A THIRD line, because it answers the third question: "was anything in
+    // this world simulated on exactly one machine and seen on both?"
+    //
+    // THE ACCEPTANCE IS ASYMMETRIC AND THAT IS THE POINT. The machine that
+    // OWNS the creatures reports announces > 0 and poses > 0 (it is the only
+    // one that can describe them); the machine that walks past them reports
+    // ghosts > 0 (it is the only one that can hold one). A run where both
+    // sides report the same numbers has not tested ownership at all — it has
+    // tested two machines doing the same work, which is the exact failure
+    // mode the single-producer rule exists to prevent.
+    //
+    // `handoffs` may legitimately be 0: a flyby that never lingers long
+    // enough for the 2-chunk hysteresis to release a creature does not flip
+    // authority, and forcing it to would mean tuning the hysteresis to a
+    // smoke rather than to the game. The NUMBER is reported either way.
+    //
+    // `misses` is the diagnostic that distinguishes the two ways "poses > 0,
+    // ghosts == 0" can happen: a pose for an id this machine does not hold is
+    // an announce that never arrived (a real bug), while zero misses and zero
+    // ghosts means nothing was ever in range (a fixture that measured
+    // nothing). A bare ghost count cannot tell those apart.
+    {
+      const net::EntitySync::Counters& s = entities.Stats();
+      std::printf(
+          "net: entities: announces out=%llu in=%llu | poses out=%llu in=%llu "
+          "| handoffs out=%llu in=%llu | gones out=%llu in=%llu | ghosts "
+          "now=%u max=%u expired=%llu | items takes=%llu/%llu grants=%llu/%llu "
+          "| misses=%llu | entityBatches out=%llu in=%llu\n",
+          (unsigned long long)(netEnt.announcesOut + s.announcesOut),
+          (unsigned long long)(netEnt.announcesIn + s.announcesIn),
+          (unsigned long long)(netEnt.posesOut + s.posesOut),
+          (unsigned long long)(netEnt.posesIn + s.posesIn),
+          (unsigned long long)(netEnt.handoffsOut + s.handoffsOut),
+          (unsigned long long)(netEnt.handoffsIn + s.handoffsIn),
+          (unsigned long long)(netEnt.gonesOut + s.gonesOut),
+          (unsigned long long)(netEnt.gonesIn + s.gonesIn),
+          (unsigned)s.ghostsNow,
+          (unsigned)std::max(netGhostsMax, s.ghostsMax),
+          (unsigned long long)(netEnt.expired + s.expired),
+          (unsigned long long)(netEnt.takesOut + s.takesOut),
+          (unsigned long long)(netEnt.takesIn + s.takesIn),
+          (unsigned long long)(netEnt.grantsOut + s.grantsOut),
+          (unsigned long long)(netEnt.grantsIn + s.grantsIn),
+          (unsigned long long)(netEnt.applyMisses + s.applyMisses),
+          (unsigned long long)(netEnt.batchesOut + s.batchesOut),
+          (unsigned long long)(netEnt.batchesIn + s.batchesIn));
     }
     std::fflush(stdout);
   }

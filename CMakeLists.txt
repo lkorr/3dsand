@@ -577,6 +577,11 @@ add_library(sandvox_core OBJECT
   # PlayerStates (M9.4-A) and is here only because it lives in src/net.
   src/net/authority.cpp
   src/net/chunksync.cpp
+  # entitysync.cpp is the per-tick ENTITY traffic (M9.4-D): the interest set,
+  # the handoff scan and the one envelope they all ride in. It reaches
+  # MobSystem and DebrisSystem (it has to build their records) but opens no
+  # socket -- main.cpp does the sending, the same split ChunkSync keeps.
+  src/net/entitysync.cpp
   src/net/link.cpp
   # opsync.cpp is the op exchange (M9.3-B): the delay queue, the wire blob and
   # the canonical merge. Pure too — the only engine type it touches is World,

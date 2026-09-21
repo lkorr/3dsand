@@ -43,6 +43,24 @@ enum class MsgType : uint16_t {
   HashChunks,      // the 64 chunk digests of one block
   ChunkRequest,    // "send me your copy of this chunk" (to its authority)
   ChunkBusy,       // "not now" - not resident, or not quiet enough to ship
+  // ---- M9.4 package D, the entity half (net/entitysync.h) ---------------
+  //
+  // ONE envelope, not ten. The plan's D section lists ten record kinds
+  // (MobAnnounce/MobPose/MobHandoff/MobGone/BodyAnnounce/BodyPose/
+  // BodyHandoff/BodyGone/ItemTake/ItemGrant) and they all exist — as TAGGED
+  // RECORDS INSIDE this one message, because every one of them is produced
+  // by the same per-tick pass, is addressed to the same LABEL, and must be
+  // applied in one atomic step when that label runs. Ten MsgTypes would be
+  // ten framings, ten dispatch cases and ten chances for an announce to be
+  // applied a frame after the pose that needs it; one envelope makes
+  // "announce before pose, handoff before either" a property of the
+  // encoder's field order rather than of the network's arrival order.
+  //
+  // Appended rather than slotted beside `EntityState`, for the reason the
+  // M9.3 block above gives: the enumerator VALUES are on the wire.
+  // `EntityState` is left reserved and unused — renumbering it out would
+  // change what every later number means on a half-updated pair of builds.
+  EntityBatch,
 };
 
 // Bumped when any message's layout or meaning changes. It is the FIRST field
