@@ -53,6 +53,9 @@ const std::vector<Gate>& VoxRegionGates();
 const std::vector<Gate>& SpellGates();
 const std::vector<Gate>& PlayerKitGates();
 const std::vector<Gate>& GrimoireGates();
+// The spell GRAPH (PLAN_spell_graph phase 2): layout, the linearizer, the tree
+// edit ops. CPU-only over glyphs.json and the generated oracle.
+const std::vector<Gate>& SpellGraphGates();
 const std::vector<Gate>& SwingGates();
 const std::vector<Gate>& EquipmentGates();
 const std::vector<Gate>& DyeGates();
@@ -115,6 +118,13 @@ const char* const kOrder[] = {
     // And `grimoire`: CPU-only over its own fixtures, beside `player-kit`
     // for the same reasons (plan §12c).
     "grimoire",
+    // And beside it `spell-graph` (PLAN_spell_graph phase 2), for the third
+    // time and the same reason: CPU-only over glyphs.json, the generated
+    // oracle and its own fixtures, milliseconds, nothing left behind. It
+    // belongs next to `spells-oracle` because it asserts the other half of the
+    // same contract -- that parser agrees with the reference script, this that
+    // every tree the parser builds can be SAID again as words.
+    "spell-graph",
     // And with them, for the same reason: `swing` is MeleeState alone — no
     // world, no GPU, no assets, its own fixtures — so it costs milliseconds
     // and disturbs nothing. It asserts the swing's INPUT MAPPING, which is the
@@ -705,7 +715,8 @@ const std::vector<Gate>& Registry() {
                           &MobGates(), &BodyGates(), &FloaterGates(),
                           &WorldIoGates(), &AudioGates(),
                           &VoxRegionGates(),
-                          &SpellGates(), &PlayerKitGates(), &GrimoireGates(), &SwingGates(),
+                          &SpellGates(), &PlayerKitGates(), &GrimoireGates(), &SpellGraphGates(),
+                          &SwingGates(),
                           &EquipmentGates(), &DyeGates(), &WoundGates(), &ImpactGates(),
                           &CombatGates(),
                           &NetGates()})

@@ -6485,12 +6485,68 @@ page from the sentence. `--shot-inventory` writes a third frame,
 `screenshot_inventory_grimoire.bmp`, with a page selected and its word row
 populated.
 
+**THE SPELL AS A DRAWING, AND THE DRAWING AS A SENTENCE (2026-09-21;
+`game/spellgraph.h/.cpp`, gate `spell-graph`, docs/PLAN_spell_graph.md §4–§6
+phase 2).** The parse tree IS the skill tree the page will draw, so
+`spellgraph` is a VIEW over it and a set of TREE OPS that write back as words
+— imgui-free and VM-side, which is why a CPU-only gate can assert all of it in
+milliseconds. Three pieces. `BuildGraph(lib, castList)` lays the tree out as a
+rooted, layered drawing in integer chrome pixels: the hand bar is the root at
+the MAXIMUM y and the tree grows upward, leaves take slots left to right in
+canonical pile order, a parent is centred over its children, and a join draws
+its `instances` sockets in a row above its bar with the shared items feeding a
+BUS across them, each lane's subtree standing over its own socket, the pending
+Mods hanging off the bar's left end with their composed edit (`count x9`) and
+the `wastedMods` ones marked, and `CastList::boxPrice` copied onto every bar so
+the multiplicative price is legible at every level. Instance 0 takes the CENTRE
+slot of the socket row, because rule 4 promises the first lane you open is the
+middle bolt. `Linearize(lib, tree)` says a tree back as words, post-order, with
+a canonical order within each segment of a pile. The edit ops (`InsertItem`,
+`AttachMod`, `FillSlot`, `WrapInBox`, `Unbox`, `Remove`, `Move`) are TOTAL:
+each works on a copy, re-merges the piles the way the parser would, checks the
+word cap and the instance cap, and then PROVES itself by re-parsing its own
+output and comparing the span-agnostic tree key — an op that cannot write
+itself back as words is REFUSED with a reason rather than returned, so the
+editor can never save words that mean something else.
+
+**THE ROUND-TRIP LAW, and the two trees that break it.**
+`Parse(Linearize(Parse(s)))` is `Parse(s)` node for node and lowers to an
+identical cast, for every sentence in the oracle corpus and every generated
+sequence of length ≤ 3 — that is what makes the drawing and the sentence one
+truth rather than two. Ordering a segment is therefore not a sort: a group with
+an EMPTY LEFT slot must come first (anything before it would fill the slot),
+the one item that speaks a delivery of its own must come next (that delivery
+boxes whatever is already in the pile), a group with an empty RIGHT slot must
+come last, and no item may start with the word the previous one ended with
+(they would merge into one item of multiplicity 2). And the grammar already
+has a WALL word for the last two of those, which the linearizer spends: an
+`end` with no lane open is a charged no-op of word cost 0, and a sentence uses
+one exactly this way — `transmute end fire` says "transmute's right slot stays
+empty and the fire is beside it", `null end null` says one `null` took another
+rather than `null` twice. The first two rules are about the PILE, which a no-op
+does not touch, so nothing saves those but a different order; and a wall is
+only spoken where no lane is open, because inside one an `end` would close it.
+Two trees the rules can
+hold that no word order rebuilds: TWO ITEMS CONTAINING A DELIVERY in one
+segment — the second box would swallow the first, and two independent
+deliveries are two LANES, which is what rule 4 is for — and two incomplete
+unary operators in one segment where either accepts the other's result sort
+(`(_ echo)` beside `(_ null)`), since whichever is spoken second binds the
+first. `Speakable()` names both, in those words, and every op refuses on it.
+
 Selftest gates `spells` (the trail's voxel budget respected exactly and the
 projectile dead with it; an overcast resolving Fatal, emitting its own payload
 and asking for the caster to be carved; `fire`×N throwing exactly N times the
 matter of `fire` at exactly N times the price; the cast latch; the laws; the
 bomb, the sustained things, the mend), `spells-oracle` (the parser against the
-reference script, every entry) and `grimoire`.
+reference script, every entry), `grimoire`, and `spell-graph` (the round trip
+and the lowering over the whole corpus plus every generated sequence of length
+≤ 3; linearizing is a fixed point; a few hundred generated (tree, op, target,
+glyph) cases each either applied or refused with a reason; the two unspeakable
+trees refused by name; the plan's §2 worked sentences BUILT from a blank page
+one gesture at a time; and the layout's own sanity — no two nodes of a layer
+overlap, every child sits inside its parent's span, a join has exactly
+`instances` sockets, each lane feeds exactly one, the root is at the bottom).
 
 ### Items, and mouse-directed melee (2026-08-20; `game/item.h`, `game/melee.*`)
 
