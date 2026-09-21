@@ -9,10 +9,11 @@
 //                   fails breaks a CLASS of spells, which is what the line
 //                   says; a change that moves one spell's numbers is a
 //                   rebaseline.
-//                   L1 totality, L2 pile commutativity, L3 multiplicity,
-//                   L4 `also` additivity, L5 delivery invariance, L6 locality,
-//                   L7 tariff monotonicity, L8 budgets, L9 nesting,
-//                   L10 mod placement, L11 flattening.
+//                   L1 totality, L2 segment commutativity, L3 multiplicity,
+//                   L4 root-lane additivity, L5 delivery invariance,
+//                   L6 locality, L7 tariff monotonicity, L8 budgets,
+//                   L9 nesting, L10 mod placement, L11 flattening,
+//                   L12 lanes (rule 4).
 //   spells-oracle — the C++ parser against scripts/magic_grammar.py, which is
 //                   the executable reference: every sentence in the brief and
 //                   every ordered pair over the 19-word alphabet, as canonical
@@ -47,7 +48,7 @@ namespace {
 const char* const kAlphabet[] = {
     "fire", "gold",  "air",        "anything", "explosive", "gust",       "transmute",
     "mend", "trail", "null",       "aura",     "echo",      "shotgun",    "float",
-    "also", "projectile", "bomb",  "self",     "beam",
+    "lane", "projectile", "bomb",  "self",     "beam",      "twin",       "end",
 };
 
 struct FakeHealth {
@@ -90,6 +91,15 @@ void SigRecord(const GlyphLibrary& lib, const DeliveryRec& d, std::string& s) {
                 d.trailBudget, d.trailEvery);
   s += buf;
   for (const EffectInst& e : d.trail) SigEffect(lib, e, s);
+  // RULE 4: the lanes are part of the record's identity. Without them two
+  // casts that fire the same fan carrying different things would compare
+  // equal and L2/L12 would be asserting nothing. A lane's own record is
+  // laneless by construction, so this recursion is one level deep.
+  for (const SpellLane& ln : d.lanes) {
+    s += "/";
+    SigRecord(lib, ln.rec, s);
+    for (const EffectInst& e : ln.extra) SigEffect(lib, e, s);
+  }
   s += ">";
 }
 std::string CastsSignature(const GlyphLibrary& lib, const CastList& l) {
@@ -129,7 +139,14 @@ std::string CanonNode(const GlyphLibrary& lib, const SpellTree& t, int node) {
   std::sort(items.begin(), items.end());
   std::string s = "[";
   for (const std::string& i : items) s += i + ",";
-  return s + "|" + lib.Delivery(n.glyph).id + "]";
+  // The LANE COUNT is part of the shape (rule 4): a box with an empty trailing
+  // lane fires one more instance than one without it. And so is the box's OWN
+  // lane — a box sitting in a socket is not the same item as the same box
+  // sitting in the shared pile, and without this L2 compared two sentences
+  // that lower differently and called the difference a failure.
+  return s + "|" + lib.Delivery(n.glyph).id + "|" +
+         std::to_string(n.laneAt.size() / 2) + "]" +
+         (n.lane > 0 ? "@" + std::to_string(n.lane) : std::string());
 }
 std::string Canon(const GlyphLibrary& lib, const SpellTree& t) {
   std::string s;
@@ -521,13 +538,22 @@ Status GateSpells(Ctx& c, std::string& detail) {
         // Every item of the parse carries n == min(N, cap) - EXCEPT a
         // delivery, which does not merge at all: each one boxes what is in
         // front of it, so N of them are N nested boxes under the hand (rule
-        // 2). And `also` is N+1 sentences, not one word said N times.
+        // 2). And `lane` does not merge either: N of them open N segments.
         if (gd.sort == GlyphSort::Delivery) {
           ok = ok && l.tree.clauses.size() == 1 &&
                BoxDepth(l.tree, l.tree.clauses[0].root) == (int)N + 1 &&
                l.casts[0].depth == (int)N;
         } else if (gd.sort == GlyphSort::Separator) {
-          ok = ok && (int)l.tree.clauses.size() == (int)N + 1;
+          // RULE 4: a mark does not merge either, and marks NEST rather than
+          // enumerate - N `lane` words in a row open N scopes inside each
+          // other, and the inner ones (never boxed) flatten into the outer
+          // when the sentence runs out, so the hand box has exactly ONE lane
+          // however many were spoken. N `end` words with nothing open are N
+          // charged no-ops and the hand has none.
+          const int32_t wantLanes = gd.scopeClose ? 0 : 1;
+          ok = ok && l.tree.clauses.size() == 1 &&
+               (int)l.tree.nodes[l.tree.clauses[0].root].laneAt.size() == 2 * wantLanes &&
+               l.casts[0].instances == std::max(1, wantLanes);
         } else {
           ok = ok && l.tree.clauses.size() == 1 && l.tree.clauses[0].bag.size() == 1 &&
                l.tree.nodes[l.tree.clauses[0].bag[0]].n == want;
@@ -561,8 +587,12 @@ Status GateSpells(Ctx& c, std::string& detail) {
               case ModOp::Div: once = prevField / gd.amount; break;
               case ModOp::Add: once = prevField + gd.amount; break;
             }
-            // Either the exact composition or the clamp held the value.
-            ok = ok && (v == once || v == prevField);
+            // Either the exact composition, or the field's own clamp cut it
+            // short — in which case the value lies between what it was and
+            // what the edit asked for. (`twin` five times asks for 32
+            // instances and gets the 27 the budget allows, which is neither
+            // the old value nor the new one.)
+            ok = ok && v >= std::min(prevField, once) && v <= std::max(prevField, once);
           }
           prevField = v;
         }
@@ -625,39 +655,205 @@ Status GateSpells(Ctx& c, std::string& detail) {
     }
   }
 
-  // L4 sentence independence - `A also B` costs cost(A) + cost(B) and its
-  // casts are the union. THE BOUNDARY IS `also` NOW, not a delivery: a
-  // delivery no longer ends anything, it boxes what came before it and the
-  // sentence carries on (rule 2), so the only additive seam left is the one
-  // word whose whole job is to be a seam.
+  // L4 ROOT-LANE INDEPENDENCE - `lane A end lane B end` costs cost(A) +
+  // cost(B) and fires two instances, the first carrying exactly what `A` alone
+  // lowers to and the second exactly what `B` does. THE SEAM IS A ROOT LANE
+  // NOW: `also` was dropped with rule 4, and two unrelated spells in one cast
+  // are two columns of the hand box (PLAN_spell_graph section 0b). A DELIVERY
+  // in an arm is fine and is the point - `end` closes the lane, so the arm's
+  // own box stays inside its column. The only exclusions are another mark
+  // (which would re-scope the arm) and a COUNT mod, which rule 4 makes
+  // record-wide on purpose and which would therefore fan the other arm too.
   int l4 = 0, l4cases = 0;
   {
-    const int gAlso = lib.Find("also");
+    const int gLane = lib.Find("lane"), gEnd = lib.Find("end");
+    auto laneClean = [&](const std::vector<int>& q) {
+      for (int g : q) {
+        const GlyphDef& gd = lib.glyphs[g];
+        if (gd.sort == GlyphSort::Separator) return false;
+        if (gd.sort == GlyphSort::Mod && gd.field == ModField::Count) return false;
+      }
+      return true;
+    };
     std::vector<std::vector<int>> shortSeqs;
     std::vector<CastList> lowered;
     for (const auto& s : seqs) {
-      if (s.size() > 2) continue;
+      if (s.size() > 2 || !laneClean(s)) continue;
       shortSeqs.push_back(s);
       lowered.push_back(CompileSpell(lib, stackOf(s)));
     }
-    for (size_t ai = 0; gAlso >= 0 && ai < shortSeqs.size(); ai++) {
+    for (size_t ai = 0; gLane >= 0 && gEnd >= 0 && ai < shortSeqs.size(); ai++) {
       const CastList& la = lowered[ai];
-      const std::string ca = Canon(lib, la.tree);
-      const std::string sa = CastsSignature(lib, la);
+      std::string pa;
+      for (const EffectInst& e : la.casts[0].payload) SigEffect(lib, e, pa);
       for (size_t bi = 0; bi < shortSeqs.size(); bi++) {
         const CastList& lb = lowered[bi];
-        std::vector<int> ab = shortSeqs[ai];
-        ab.push_back(gAlso);
+        std::vector<int> ab = {gLane};
+        ab.insert(ab.end(), shortSeqs[ai].begin(), shortSeqs[ai].end());
+        ab.push_back(gEnd);
+        ab.push_back(gLane);
         ab.insert(ab.end(), shortSeqs[bi].begin(), shortSeqs[bi].end());
+        ab.push_back(gEnd);
         const CastList lab = CompileSpell(lib, stackOf(ab));
-        if (Canon(lib, lab.tree) != ca + Canon(lib, lb.tree)) continue;
         l4cases++;
-        const bool ok = lab.manaCost == la.manaCost + lb.manaCost &&
+        std::string pb, g0, g1;
+        for (const EffectInst& e : lb.casts[0].payload) SigEffect(lib, e, pb);
+        const SpellCast i0 = InstanceCast(lab.casts[0], 0);
+        const SpellCast i1 = InstanceCast(lab.casts[0], 1);
+        for (const EffectInst& e : i0.payload) SigEffect(lib, e, g0);
+        for (const EffectInst& e : i1.payload) SigEffect(lib, e, g1);
+        const bool ok = lab.casts.size() == 1 && lab.casts[0].instances == 2 &&
+                        (int)lab.casts[0].delivery.lanes.size() == 2 &&
+                        lab.manaCost == la.manaCost + lb.manaCost &&
                         lab.priceUnknown == (la.priceUnknown || lb.priceUnknown) &&
-                        CastsSignature(lib, lab) == sa + CastsSignature(lib, lb);
-        if (!ok) fail("L4", spell(shortSeqs[ai]) + " also " + spell(shortSeqs[bi]));
+                        g0 == pa && g1 == pb;
+        if (!ok)
+          fail("L4", "lane " + spell(shortSeqs[ai]) + " end lane " + spell(shortSeqs[bi]) +
+                         " end");
         else l4++;
       }
+    }
+  }
+
+  // L12 LANES (rule 4), over the same generated alphabet. Four claims, and
+  // (d) is the one the whole scope rule exists for:
+  //
+  //  (a) a lane is a SCOPE, not a second pile: `E lane F end D` lowers to one
+  //      instance carrying exactly what `E F D` carries, at exactly the same
+  //      price - the compatibility claim that makes rule 4 free;
+  //  (b) a lane BELONGS TO ONE INSTANCE: in `E lane F end twin D` the first
+  //      instance is `E F D`'s payload and the second is `E D`'s, and the
+  //      tariff is their sum rather than either one doubled;
+  //  (c) a sentence with NO mark lowers with no lanes at all, which is why
+  //      every pinned price in this repo is unmoved;
+  //  (d) A LANE MAY HOLD A BOX OF ITS OWN. `lane E D end lane F end D` is an
+  //      outer carrier with two sockets: socket 0 carries exactly the box that
+  //      `E D` lowers to, socket 1 exactly what `F` lowers to. Under the old
+  //      "a delivery boxes the whole pile" reading the trailing D swallowed
+  //      the earlier lane and this sentence could not be said at all.
+  int l12 = 0, l12cases = 0;
+  {
+    const int gLane = lib.Find("lane"), gTwin = lib.Find("twin"), gEnd = lib.Find("end");
+    std::vector<int> nouns, flights;
+    for (int g : alpha) {
+      const GlyphDef& gd = lib.glyphs[g];
+      if (gd.sort == GlyphSort::Effect || gd.sort == GlyphSort::Matter) nouns.push_back(g);
+      if (gd.sort == GlyphSort::Delivery && gd.mech == DeliveryMech::Flight)
+        flights.push_back(g);
+    }
+    // A payload as a SET of effect signatures. Rule 1 says a pile is a set,
+    // and a lane's nouns are appended after the shared ones rather than
+    // re-sorted with them — so the claim "instance 0 carries what `E F D`
+    // carries" is about the multiset, not about the order it was built in.
+    auto sigSet = [&](const std::vector<EffectInst>& es) {
+      std::vector<std::string> v;
+      for (const EffectInst& e : es) {
+        std::string one;
+        SigEffect(lib, e, one);
+        v.push_back(one);
+      }
+      std::sort(v.begin(), v.end());
+      std::string s2;
+      for (const std::string& one : v) s2 += one;
+      return s2;
+    };
+    // The payload of the ONE box a `... D` sentence lowers to.
+    auto boxSig = [&](const CastList& l) {
+      std::string s2;
+      if (l.casts.size() != 1 || l.casts[0].payload.size() != 1) return s2;
+      const EffectInst& bx = l.casts[0].payload[0];
+      if (bx.verb != SpellVerb::Launch || bx.launch.empty()) return s2;
+      return sigSet(bx.inner);
+    };
+    // The same, for instance `i` of that box (rule 4).
+    auto instSig = [&](const CastList& l, int32_t i, int32_t& instances) {
+      std::string s2;
+      instances = 0;
+      if (l.casts.size() != 1 || l.casts[0].payload.size() != 1) return s2;
+      const EffectInst& bx = l.casts[0].payload[0];
+      if (bx.verb != SpellVerb::Launch || bx.launch.empty()) return s2;
+      SpellCast c;
+      c.delivery = bx.launch[0];
+      c.payload = bx.inner;
+      instances = RecInstances(lib, c.delivery);
+      const SpellCast ic = InstanceCast(c, i);
+      return sigSet(ic.payload);
+    };
+    for (int e : nouns) {
+      for (int f : nouns) {
+        if (f == e) continue;
+        for (int d : flights) {
+          const CastList both = CompileSpell(lib, stackOf({e, f, d}));
+          const CastList base = CompileSpell(lib, stackOf({e, d}));
+          const std::string wantBoth = boxSig(both), wantBase = boxSig(base);
+          if (wantBoth.empty() || wantBase.empty()) continue;
+          // (a) one lane, one instance: the same cast as saying them together.
+          const CastList one = CompileSpell(lib, stackOf({e, gLane, f, gEnd, d}));
+          int32_t n1 = 0;
+          const std::string got1 = instSig(one, 0, n1);
+          l12cases++;
+          if (n1 != 1 || got1 != wantBoth || one.manaCost != both.manaCost)
+            fail("L12a", spell({e, gLane, f, gEnd, d}) + " is not " + spell({e, f, d}));
+          else
+            l12++;
+          // (b) the lane belongs to instance 0; instance 1 is the shared copy.
+          if (gTwin < 0) continue;
+          const CastList two = CompileSpell(lib, stackOf({e, gLane, f, gEnd, gTwin, d}));
+          int32_t n2 = 0;
+          const std::string g0 = instSig(two, 0, n2);
+          int32_t n2b = 0;
+          const std::string g1 = instSig(two, 1, n2b);
+          l12cases++;
+          const int32_t wantTariff = both.tariff + base.tariff;
+          if (n2 != 2 || g0 != wantBoth || g1 != wantBase ||
+              two.casts[0].tariff != wantTariff)
+            fail("L12b", spell({e, gLane, f, gEnd, gTwin, d}) + ": instances " +
+                             std::to_string(n2) + ", tariff " +
+                             std::to_string(two.casts[0].tariff) + " want " +
+                             std::to_string(wantTariff));
+          else
+            l12++;
+          // (d) a socket holding a whole spell of its own: `lane E D end lane
+          // F end D`. Socket 0 is the box `E D` makes, socket 1 is `F`.
+          const CastList sock =
+              CompileSpell(lib, stackOf({gLane, e, d, gEnd, gLane, f, gEnd, d}));
+          const CastList justE = CompileSpell(lib, stackOf({e, d}));
+          const CastList justF = CompileSpell(lib, stackOf({f}));
+          int32_t n3 = 0, n3b = 0;
+          const std::string s0 = instSig(sock, 0, n3);
+          const std::string s1 = instSig(sock, 1, n3b);
+          l12cases++;
+          if (n3 != 2 || s0 != sigSet(justE.casts[0].payload) ||
+              s1 != sigSet(justF.casts[0].payload))
+            fail("L12d", spell({gLane, e, d, gEnd, gLane, f, gEnd, d}) +
+                             ": sockets do not hold [" + spell({e, d}) + "] and [" +
+                             spell({f}) + "] (instances " + std::to_string(n3) + ")");
+          else
+            l12++;
+        }
+      }
+    }
+    // (c) no `lane` word, no lanes anywhere in the lowering.
+    std::function<bool(const std::vector<EffectInst>&)> anyLane =
+        [&](const std::vector<EffectInst>& es) {
+          for (const EffectInst& x : es) {
+            for (const DeliveryRec& r : x.launch)
+              if (!r.lanes.empty()) return true;
+            if (anyLane(x.inner)) return true;
+          }
+          return false;
+        };
+    for (const auto& sq : seqs) {
+      bool spoke = false;
+      for (int g : sq) spoke = spoke || lib.glyphs[g].sort == GlyphSort::Separator;
+      if (spoke) continue;   // (c) is about sentences with no mark at all
+      const CastList l = CompileSpell(lib, stackOf(sq));
+      l12cases++;
+      bool clean = true;
+      for (const SpellCast& c : l.casts)
+        clean = clean && c.delivery.lanes.empty() && !anyLane(c.payload);
+      if (!clean) fail("L12c", spell(sq) + " grew a lane nobody spoke");
+      else l12++;
     }
   }
 
@@ -1363,9 +1559,107 @@ Status GateSpells(Ctx& c, std::string& detail) {
                 lib.budgets.maxGeneration);
   }
 
+  // ---- (9) LANES AT RUNTIME (rule 4) ---------------------------------------
+  // The laws above are about the lowering; these two are about what leaves.
+  //   (a) `explosive lane fire twin projectile` fires TWO bolts and exactly
+  //       ONE of them carries the fire - the fan is not a copy machine any
+  //       more.
+  //   (b) `lane explosive projectile lane blood mend self` is two unrelated
+  //       spells in one cast: a bolt leaves, and the mend resolves on the
+  //       caster, from one utterance.
+  bool laneRunOk = false;
+  int laneBolts = 0, laneWithFire = 0, laneWithSand = 0;
+  int laneLive = 0, laneRestores = 0, sockBolts = 0, sockChild = 0, sockFire = 0;
+  {
+    SpellSystem lsys;
+    lsys.SetLibrary(&lib);
+    CasterState cs;
+    cs.mana = 1 << 28;
+    cs.manaMax = 1 << 28;
+    FakeHealth hp(1 << 28);
+    const IVec3 worg = world.WindowOrigin();
+    const SpellFxVec origin{SpellFxFromFloat((float)(worg.x * (int)kChunk + 8)),
+                            SpellFxFromFloat((float)(worg.y * (int)kChunk + (int)kWorldN / 2)),
+                            SpellFxFromFloat((float)(worg.z * (int)kChunk + (int)kWorldN / 2))};
+    uint32_t mFire = 0, mSand = 0;
+    for (size_t m = 0; m < mats.size(); m++) {
+      if (mats[m].name == "fire") mFire = (uint32_t)m;
+      if (mats[m].name == "sand") mSand = (uint32_t)m;
+    }
+    auto sprays = [&](const std::vector<EffectInst>& es, uint32_t mat) {
+      for (const EffectInst& x : es)
+        if (x.verb == SpellVerb::Spray && x.matA == mat) return true;
+      return false;
+    };
+    auto launches = [&](const std::vector<EffectInst>& es) {
+      for (const EffectInst& x : es)
+        if (x.verb == SpellVerb::Launch) return true;
+      return false;
+    };
+
+    // (a) `explosive lane sand end lane fire end twin projectile`: two bolts,
+    // both exploding, one carrying sand and the other fire. The fan is not a
+    // copy machine any more.
+    SpellEmission e0;
+    lsys.Cast(CompileSpell(lib, speak({"explosive", "lane", "sand", "end", "lane", "fire",
+                                       "end", "twin", "projectile"})),
+              cs, hp.cb, 88, origin, {kSpellFxOne, 0, 0}, 1, e0);
+    laneBolts = lsys.LiveCount();
+    for (const SpellProjectile& pr : lsys.Live()) {
+      if (sprays(pr.cast.payload, mFire)) laneWithFire++;
+      if (sprays(pr.cast.payload, mSand)) laneWithSand++;
+    }
+    lsys.Clear();
+
+    // (b) `lane explosive projectile end lane blood mend self end`: two
+    // unrelated spells in one cast — a bolt leaves, and the graft resolves on
+    // the caster. The mend needs something to draw on, so the mirror is blood.
+    struct Patch {
+      uint32_t blood;
+    } patch{0};
+    for (size_t i = 0; i < mats.size(); i++)
+      if (mats[i].name == "blood") patch.blood = (uint32_t)i;
+    SpellProbe probe2;
+    probe2.ctx = &patch;
+    probe2.matAt = [](void* c, int32_t, int32_t, int32_t, bool& known) -> uint32_t {
+      known = true;
+      return ((Patch*)c)->blood;
+    };
+    SpellEmission e1;
+    lsys.Cast(CompileSpell(lib, speak({"lane", "explosive", "projectile", "end", "lane",
+                                       "blood", "mend", "self", "end"})),
+              cs, hp.cb, 89, origin, {kSpellFxOne, 0, 0}, 2, e1, &probe2);
+    laneLive = lsys.LiveCount();
+    laneRestores = (int)e1.restores.size();
+    lsys.Clear();
+
+    // (c) `lane explosive projectile end lane fire end projectile`: ONE outer
+    // carrier with two sockets — socket 0 fires a child bolt that explodes,
+    // socket 1 sprays fire. This is the sentence the scope rule exists for.
+    SpellEmission e2;
+    lsys.Cast(CompileSpell(lib, speak({"lane", "explosive", "projectile", "end", "lane",
+                                       "fire", "end", "projectile"})),
+              cs, hp.cb, 90, origin, {kSpellFxOne, 0, 0}, 3, e2);
+    sockBolts = lsys.LiveCount();
+    for (const SpellProjectile& pr : lsys.Live()) {
+      if (launches(pr.cast.payload)) sockChild++;
+      if (sprays(pr.cast.payload, mFire)) sockFire++;
+    }
+    lsys.Clear();
+
+    laneRunOk = laneBolts == 2 && laneWithFire == 1 && laneWithSand == 1 &&
+                laneLive == 1 && laneRestores == 1 && sockBolts == 2 &&
+                sockChild == 1 && sockFire == 1;
+    std::printf("spell lanes: %s (twin+lanes: %d bolts, %d with fire, %d with sand; root "
+                "lanes: %d bolt(s) + %d restore(s) from one cast; sockets: %d bolts, %d "
+                "carrying a child box, %d carrying fire)\n",
+                laneRunOk ? "PASS" : "FAIL", laneBolts, laneWithFire, laneWithSand, laneLive,
+                laneRestores, sockBolts, sockChild, sockFire);
+  }
+
   const bool lawsOk = alphaOk && lawFail == 0 && l1 > 0 && l2pairs > 0 && l3 > 0 &&
                       l6cases > 0 && l4cases > 0 && l7 > 0 && l5 > 0 && l8 > 0 &&
-                      l9cases > 0 && l10cases > 0 && l11 > 0;
+                      l9cases > 0 && l10cases > 0 && l11 > 0 && l12cases > 0 && laneRunOk;
   const bool spellOk = budgetOk && deliverOk && fatalOk && carveAsked && fatalEmitted &&
                        sprayOk && latchOk && lawsOk && bombOk && sustainOk && mendOk &&
                        nestOk;
@@ -1375,7 +1669,7 @@ Status GateSpells(Ctx& c, std::string& detail) {
       "overcast fatal=%d carve=%d payload=%d; spray %d/%d/%d voxels for "
       "%d/%d/%d mana; bomb=%d sustain=%d mend=%d nest=%d; laws over %zu sequences: "
       "L1 %d, L2 %d/%d, L3 %d, L4 %d/%d, L5 %d, L6 %d/%d, L7 %d, L8 %d, L9 %d/%d, "
-      "L10 %d/%d, L11 %d, %d failures)\n",
+      "L10 %d/%d, L11 %d, L12 %d/%d, %d failures)\n",
       spellOk ? "PASS" : "FAIL", (long long)trailVolume, authoredBudget, flownTicks,
       diedWithBudget ? 1 : 0, deliverOk ? 1 : 0, deliverY, deliverGround, deliverSx, deliverSz,
       deliverColumn ? 1 : 0, deliverMirrored ? 1 : 0, deliverTicks,
@@ -1383,7 +1677,7 @@ Status GateSpells(Ctx& c, std::string& detail) {
       sprayN[0], sprayN[1], sprayN[2], sprayCost[0], sprayCost[1], sprayCost[2],
       bombOk ? 1 : 0, sustainOk ? 1 : 0, mendOk ? 1 : 0, nestOk ? 1 : 0, seqs.size(), l1,
       l2, l2pairs, l3, l4, l4cases, l5, l6, l6cases, l7, l8, l9, l9cases, l10, l10cases,
-      l11, lawFail);
+      l11, l12, l12cases, lawFail);
   detail = Format("laws %zu seq, %d failures", seqs.size(), lawFail);
   return spellOk ? Status::Pass : Status::Fail;
 }

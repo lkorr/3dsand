@@ -21,8 +21,8 @@ Two findings drive everything below:
    `SpellTree` whose shape IS this picture. Rule 1's pile is an unordered SET,
    which is what "parallel" means: `fire trail` and `explosive` in one pile
    are two lanes that meet at the box. Rule 2's box is the join node. An
-   operator group is a serial link (it takes the one item before it). `also`
-   is two roots side by side. Mods are tags on the join. Law L2 (pile
+   operator group is a serial link (it takes the one item before it). A root
+   lane is two columns side by side. Mods are tags on the join. Law L2 (pile
    commutativity) is the formal statement that lane order does not matter.
    The graph is a **view** of that tree, and the editor is a set of tree
    operations that write back as words.
@@ -74,7 +74,7 @@ of effects, which is the direction the user asked for):
           [  o    o    o ]  <- 3 sockets     children: they edit its record
           [  PROJECTILE  ]  word 6 + tariff 71 -> x3 carry x3 = 639
                  |
-               hand                   the implicit root; `also` = more roots
+               hand                   the implicit root; a root lane = a column
 ```
 
 | Grammar | Graph |
@@ -85,58 +85,73 @@ of effects, which is the direction the user asked for):
 | pending Mod (rule 3) | a tag hanging off the join it stuck to, showing its edit (`speed x2`) |
 | `count` > 1 (shotgun) | N sockets on the join, fanned; `xN` beside the tag |
 | nested box | a join node above another join node (a bolt that fires a bolt) |
-| `also` | a second root beside the first |
+| `lane` … `end` (rule 4) | a SOCKET on the join above it: one instance's own subtree. On the hand, a second column beside the first |
 | hand | the root bar, drawn bare (as the HUD brackets already do) |
 
 Nothing in the runtime changes for this table. Sections 4–6 are the view and
 the editor; only §2–3 touch the VM.
 
-## 2. Rule 4: `lane` — a segment of the pile that belongs to one instance
+## 2. Rule 4: `lane` / `end` — a scope of the pile that belongs to one instance
 
-**Word.** `lane`, sort `separator`, word cost 0, scope `pile` (where `also`'s
-scope is `sentence`). Appended AFTER `also` in `glyphs.json` so the twenty
-bound slots (`GrantAllAndBind` binds library order) do not shift.
+*(Rewritten 2026-09-21 while package A landed: the first draft of this section
+made a lane a SEGMENT and had a delivery box the whole pile, which meant a lane
+could never hold a spell with its own trailing delivery — the trailing word
+swallowed the earlier lanes. "Socket 1 = a bolt that fires a bolt, socket 2 =
+fire" could not be said at all, and the page must be able to say every tree it
+can draw. The rule below is explicit SCOPES, and it is what shipped.)*
 
-**Rule 4. `lane` OPENS A SEGMENT OF THE PILE. The first segment is SHARED;
-every `lane` word opens a segment that belongs to ONE instance of the box that
-closes the pile.** When the delivery closes the pile it has a shared segment
-and L lane segments. The box fires `instances = max(count, L)` instances
-(count is what `shotgun` edits, as today). Instance i < L carries
-`shared ∪ lane[i]`; instance i ≥ L carries `shared` alone. Lane segments keep
-their SPOKEN order (like deliveries, they do not commute); lane 1 is instance
-0, which `SpellFan` puts on the aim itself — so the first lane you speak is the
-centre bolt, and the page draws that socket on the aim line.
+**Words.** `lane` and `end`, sort `separator`, word cost 0, appended after the
+existing glyphs in `glyphs.json` so the twenty bound slots (`GrantAllAndBind`
+binds library order) do not shift. Which of the two a separator is, is content:
+`"scope": "open" | "close"`.
 
-**What a lane segment may hold.** Anything the pile may hold: Matter, Effect
-words, operator groups (`fire trail` in a lane is a trail on that bolt only),
-boxes (`explosive projectile` in a lane is a child that only that bolt
-fires), and Mods. A Mod in a lane segment edits THAT instance's record
-(`swift` in lane 2 = the second bolt is fast) — with one exception: **a
-`count` Mod is always record-wide**, wherever it is spoken, because count is
-the fan and a lane is one instance. A `lane` word with nothing after it is an
+**Rule 4. `lane` OPENS a lane scope on the current pile; `end` CLOSES the
+innermost open one, back to the scope around it. A DELIVERY BOXES THE INNERMOST
+OPEN SCOPE** — inside an open lane, only that lane's items (the box lands *in*
+the lane, the lane stays open, and more items may follow in it); outside any
+open lane, the shared items plus all the closed lanes, which is the
+multi-socket box. An unclosed lane at the end of the sentence is closed
+implicitly. Lanes are ordered as spoken; lane *i* belongs to instance *i*. The
+box fires `instances = max(count, L)` (count is what `shotgun` and `twin`
+edit); instance *i* < L carries `shared ∪ lane[i]`, and instance *i* ≥ L
+carries `shared` alone. Lane 1 is instance 0, which fires on the aim itself —
+so the first lane you speak is the centre bolt, and the page draws that socket
+on the aim line.
+
+**What a lane may hold.** Anything the pile may hold: Matter, Effect words,
+operator groups (`fire trail` in a lane is a trail on that bolt only), whole
+BOXES with their own deliveries (`lane explosive projectile end` is a socket
+holding a bolt), and Mods. A Mod inside a lane edits THAT instance's record
+(`swift` in lane 2 = the second bolt is fast) — with one exception: **a `count`
+Mod is always record-wide**, wherever it is spoken, because count is the fan
+and a lane is one instance of it. A `lane end` with nothing between them is an
 empty lane: the instance exists and carries the shared payload (it is how you
-say "three bolts, only the middle one burns" without `shotgun`).
+say "three bolts, only the middle one burns" without `shotgun`). Marks NEST
+rather than enumerate — `lane lane fire end end` is one lane holding one lane,
+and an inner lane nobody boxed flattens into the outer when it closes, because
+there is no record for it to be a column of.
 
-**Walls.** A `lane` mark walls operator binding: in `fire lane trail` the item
-under `trail` is the mark, not `fire`, so `trail` is incomplete (charged,
-`_`), exactly as if nothing were spoken before it. Runs merge only within a
-segment: `fire lane fire` is two items in two lanes, not `fire×2`.
+**Walls.** A mark walls operator binding: an operator binds only within its own
+scope, so in `fire lane trail` the item under `trail` is the wall, not `fire`,
+and `trail` is incomplete (charged, `_`). Runs merge only within a scope:
+`fire lane fire end` is two items in two scopes, not `fire×2`.
 
-**Examples.**
+**Examples** (all of these are the gate's worked sentences):
 
 | Sentence | Instances | What each carries |
 |---|---|---|
 | `explosive shotgun projectile` | 3 | all: explosive (unchanged from today) |
-| `gunpowder lane fire projectile` | 2 | bolt 0: gunpowder; bolt 1: fire (no shared) |
-| `explosive lane gunpowder lane fire projectile` | 2 | bolt 0: explosive+gunpowder; bolt 1: explosive+fire |
-| `explosive lane fire shotgun projectile` | 3 | bolt 0: explosive+fire; bolts 1,2: explosive |
-| `lane swift explosive lane heavy explosive projectile` | 2 | bolt 0: fast; bolt 1: falls hard; both explode |
-| `explosive projectile lane fire projectile` | 2 | bolt 0: fires a child that explodes; bolt 1: the same child + fire |
-| `explosive lane fire projectile also water self` | 2 + 1 | two bolts, and water at your own body |
+| `explosive twin projectile` | 2 | both: explosive, fanned |
+| `explosive lane sand end lane fire end twin projectile` | 2 | bolt 0: explosive+sand; bolt 1: explosive+fire |
+| `explosive lane fire end twin projectile` | 2 | bolt 0: explosive+fire; bolt 1: explosive |
+| `explosive lane fire end projectile` | 1 | the one bolt: explosive+fire (≡ `explosive fire projectile`) |
+| `lane explosive projectile end lane fire end projectile` | 2 | bolt 0: fires a child that explodes; bolt 1: sprays fire |
+| `lane explosive projectile fire end projectile` | 1 | the one bolt: a child that explodes, and fire |
+| `lane explosive projectile end lane blood mend self end` | 2 | a bolt at the aim, and a graft on your own body |
 
-The first row is the compatibility claim: **a sentence with no `lane` word
-lowers bit-for-bit as it does today**, so the pinned world hash of every
-gate is expected not to move.
+The first two rows are the compatibility claim: **a sentence with no mark
+lowers bit-for-bit as it does today**, so the pinned world hash of every gate is
+expected not to move.
 
 **Price.** Today `tariff = tariff(shared) × instances`. With lanes,
 `tariff = Σ_i tariff(shared ∪ lane[i])`, which reduces to the old product when
@@ -144,26 +159,34 @@ L = 0. Carry and word costs as before; the leaf cap (`maxInstances`) applies
 to `max(count, L)` exactly as it applies to `count` now, and a lane past the
 cap is clamped with the same "the fan was cut back" line.
 
-**What rule 4 does NOT do.** A lane is not a clause: `also` stays the only
-sentence separator and L4 (cost additivity) stays on `also`. There is no
-per-lane count (a lane cannot itself fan; put a `shotgun projectile` box in
-the lane if you want that, and the leaf cap prices it). A lane on the `hand`
-box behaves like `shotgun` on the hand: fanned resolve points at reach, each
-with its own payload.
+**What rule 4 does NOT do.** There is no per-lane count (a lane cannot itself
+fan; put a `twin projectile` box in the lane if you want that, and the leaf cap
+prices it). A lane on the `hand` box behaves like `shotgun` on the hand: fanned
+resolve points at reach, each with its own payload — except that a lane-carrying
+instance is not a copy, so it resolves on the aim rather than beside it. And
+there is no sentence separator: **`also` is gone**, and two unrelated spells in
+one cast are two root lanes (`lane … end lane … end`), which is where law L4
+now attaches.
 
 **`twin`.** One JSON entry, sort `mod`, field `count`, `mul` 2. The "double
 spell" the user named; `shotgun` already is the triple. Nothing in C++.
+
+**The cost of a socket is two words**, so `kSpellStackMax` and
+`budgets.maxMacroWords` are 32.
 
 ## 3. Lowering and runtime, concretely
 
 Every change is a small extension of a struct or a loop that already exists.
 
 - `SpellNode` gains `int32_t lane = 0` (0 = shared, 1..L) on every item of a
-  box, and a box node gains `std::vector<int> laneAt` (the spoken position of
-  each `lane` word, for the HUD highlight and the linearizer). `ParseSpell`
-  keeps a `curLane` counter that a `lane` word increments and a closing
-  delivery / `also` resets; `CloseBox` stamps it onto the items. `NodeKey`
-  suffixes `@lane` so identical items in different lanes never merge.
+  box, and a box node gains `std::vector<int> laneAt` — TWO spoken positions
+  per lane, the `lane` word then the `end` word (-1 when the lane was closed
+  implicitly), for the HUD highlight and the linearizer, so `laneAt.size() ==
+  2 * L`. `ParseSpell` keeps a SCOPE STACK rather than a counter: `lane` pushes
+  a scope, `end` pops it into its parent's lane list, a delivery boxes the
+  innermost open one, and `CloseBox` stamps the lane onto the items before it
+  merges them. `NodeKey` suffixes `@lane` so identical items in different lanes
+  never merge.
 - `DeliveryRec` gains `std::vector<SpellLane> lanes` with
   `struct SpellLane { DeliveryRec rec; std::vector<EffectInst> extra; }` —
   the same "record holds effects holds records" knot `EffectInst::launch`
@@ -182,29 +205,38 @@ Every change is a small extension of a struct or a loop that already exists.
   instances), `Launch()` / `RequestBody()`, and `AdoptLaunches` (nested boxes,
   which carry the record and therefore the lanes inside their `SpellLaunchReq`).
   `ApplySpellEffect` is untouched: it never sees a lane, only a payload.
-- `ShowNode` draws a lane as `/`: `[explosive / gunpowder / fire PROJECTILE]`
-  (Oracle style `∕`), which is also the HUD bracket string and the oracle
-  comparison string. `DescribeCast` adds one sentence per lane ("The first
-  bolt also sprays gunpowder; the second also sprays fire.").
+- `ShowNode` draws each lane as `/ … /`: `[explosive twin / sand / / fire /
+  PROJECTILE]` — one mark per word the sentence contains, the same string in
+  both bracket styles, so the HUD readout, the oracle comparison and the
+  linearizer all agree. `DescribeCast` adds one sentence per lane ("The first
+  bolt also sprays sand. The second bolt also sprays fire.").
 - `scripts/magic_grammar.py` gets the same rule (segments on the pile, keyed
   by lane), `lane` enters the 19-word pair alphabet, `MAGIC_PERMUTATIONS.md`
   and `grammar_oracle.json` are regenerated (never hand-edited).
 - Persistence: nothing. A page is still a word list and `lane` is a word.
 
-**Laws.** L2 is restated as: permuting items WITHIN a segment lowers to an
-identical cast list. New **L12 lanes**: for any E, F and flight delivery D,
-`E lane F D` lowers to instances = 2 whose instance casts are exactly
-`Lower(E D)` and `Lower(E F D)`'s payloads respectively; instances beyond L
-equal `Lower(shared D)`; and a lane inside a nested box reaches the runtime
-(`explosive lane fire projectile` launches two bolts and exactly one sprays
-fire). The `spells` gate asserts L12 over the same generated alphabet; L1, L3,
-L4, L6–L11 hold unchanged and are re-run.
+**Laws.** L2 is restated as: permuting items WITHIN a scope lowers to an
+identical cast list. L4 moves from `also` to ROOT LANES: `lane A end lane B
+end` costs cost(A) + cost(B) and fires two instances carrying exactly what `A`
+and `B` lower to. New **L12 lanes**, over the generated alphabet: (a) `E lane F
+end D` lowers to ONE instance carrying exactly what `E F D` carries, at the
+same price; (b) `E lane F end twin D` fires two, instance 0 = `E F D`'s
+payload, instance 1 = `E D`'s, tariff = their sum; (c) a sentence with no mark
+grows no lane anywhere in its lowering; (d) **a lane may hold a box of its
+own** — in `lane E D end lane F end D` socket 0 holds exactly the box `E D`
+lowers to and socket 1 holds `F`, which is the sentence the scope rule exists
+for. The runtime half is check (9): `explosive lane sand end lane fire end twin
+projectile` fires two bolts, one with sand and one with fire; `lane explosive
+projectile end lane blood mend self end` leaves a bolt AND a graft; `lane
+explosive projectile end lane fire end projectile` is one carrier with two
+sockets. L1, L3, L5–L11 hold unchanged and are re-run.
 
 ## 4. The graph: layout and what each node draws
 
 Lives VM-side, imgui-free, so it is testable: `src/game/spellgraph.h/.cpp`.
 
-**Layout.** The tree is rooted (the hand box; several roots under `also`) and
+**Layout.** The tree is rooted (the hand box, whose root lanes are its
+columns) and
 the drawing is layered: a node's layer is its depth from the root, root at the
 bottom, layers stacked upward at a fixed pitch. Within a layer, the classic
 tidy-tree rule (leaves take slots left to right in canonical pile order, a
@@ -300,7 +332,9 @@ will land, a red ring and a reason where it is refused.
 - a box: the shared segment's items, then for each lane `lane` + its items,
   then the delivery word `n` times — items ordered so that any group with an
   empty left slot comes first, then the rest in canonical key order;
-- a clause: its root's items; clauses joined by `also`.
+- a box: its shared items, then for each lane `lane` + that lane's items +
+  `end`, then the delivery word ×n (`end` is emitted even for the last lane, so
+  a box spoken after it closes the outer scope and not the lane).
 
 Round trip is the gate (§7): for every sentence in the oracle corpus,
 `Parse(Linearize(Parse(s)))` equals `Parse(s)` node for node, and
@@ -310,11 +344,10 @@ accepts the other's result sort (`(_ echo)` and `(_ null)`: `null` takes
 `any`, `echo` takes an Effect, which `null`'s result is) — is refused by
 `InsertItem` with "an empty `echo` beside an empty `null` cannot be spoken;
 fill one first". Incomplete operators are charged no-ops, so nothing
-castable is lost. The 16-word bounds stay: `kSpellStackMax` (C++) and
-`budgets.maxMacroWords` (JSON) are the graph's size cap, and a lane-heavy
-page will want them raised together (24 is enough for three lanes of two
-effects, a fan, a delivery and a mod); that is one constexpr and one JSON
-row, done in the phase that lands lanes.
+castable is lost. The word bound is the graph's size cap: `kSpellStackMax` (C++) and
+`budgets.maxMacroWords` (JSON), raised together to **32** in the phase that
+landed lanes, because a socket costs two words (`lane` … `end`) and three
+sockets of two effects, a fan, a delivery and a mod do not fit in fewer.
 
 **Speaking a graph page** is unchanged: it expands to words on the stack.
 There is nothing a page can hold that the number row cannot speak.
@@ -323,7 +356,7 @@ There is nothing a page can hold that the number row cannot speak.
 
 | Piece | Where | Needs a build? |
 |---|---|---|
-| `lane` word, `twin` | `assets/spells/glyphs.json` (appended after `also`) | no |
+| `lane` / `end` words, `twin` | `assets/spells/glyphs.json` (appended; `also` removed) | no |
 | rule 4 in the parser, lanes on records, `InstanceCast`, per-lane pricing, describe, `/` brackets, `boxPrice` | `src/game/spell.h/.cpp` | yes |
 | rule 4 in the reference, regenerated tables | `scripts/magic_grammar.py`, `docs/MAGIC_PERMUTATIONS.md`, `assets/spells/grammar_oracle.json` | no |
 | L2', L12 in the laws; lane runtime checks | `src/test/selftest_spell.cpp` | yes |
@@ -349,7 +382,7 @@ the oracle.
 
 - `--gate spells` once after phase 1: the laws over the alphabet with `lane`
   in it, plus L12's runtime check. Expected hash: unmoved (no existing
-  sentence contains `lane`; new glyphs appended after `also`; word costs of
+  sentence contains a mark; new glyphs appended; word costs of
   existing glyphs untouched). If it moves, that is a notification and
   `--rebaseline` is the whole response.
 - `--gate spells-oracle` once after regenerating the tables.

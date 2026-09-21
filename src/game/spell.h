@@ -52,9 +52,10 @@
 // Six SORTS: Matter (a material by name), Effect (something that happens at a
 // point), Delivery (how an Effect reaches a point), Mod (a field edit on a
 // delivery record), Operator (a word with argument slots that produces one of
-// the others), Separator (`also`: ends one sentence and starts the next).
+// the others), Separator (`lane` opens a lane scope of the pile, `end` closes
+// it; a lane belongs to one instance of the box that closes the pile).
 //
-// THREE RULES, and everything else is a consequence of them:
+// FOUR RULES, and everything else is a consequence of them:
 //
 //   1. A NOUN GOES INTO THE PILE. A Matter word, an Effect word, or an
 //      operator group whose result sort is Effect is pushed onto the PILE.
@@ -62,10 +63,11 @@
 //      capped) and the lowering rebuilds the pile in a CANONICAL order.
 //
 //   2. A DELIVERY BOXES THE PILE, AND SPEAKING CONTINUES. The Delivery word
-//      takes the WHOLE pile and wraps it into ONE Effect value of verb
-//      `launch`: {that delivery's DeliveryRec, the pile's Effects as its
-//      payload, the pile's pending Mods stuck to its record}. The pile becomes
-//      exactly that one value. So deliveries NEST and word order matters:
+//      takes the pile — all of it, or, under rule 4, the innermost OPEN scope
+//      of it — and wraps it into ONE Effect value of verb `launch`: {that
+//      delivery's DeliveryRec, the pile's Effects as its payload, the pile's
+//      pending Mods stuck to its record}. That scope's pile becomes exactly
+//      that one value. So deliveries NEST and word order matters:
 //      `explosive projectile projectile` is a bolt that fires a bolt that
 //      explodes.
 //
@@ -77,9 +79,29 @@
 //      the hop; every other mod on the hand is a charged no-op and the
 //      describe line says so.
 //
-// The outermost box is always `hand`, so the whole sentence lowers to ONE cast
-// — unless `also` is spoken, which closes the current pile as a finished
-// cast and starts a new one (law L4 attaches to `also`, not to a delivery).
+//   4. `lane` OPENS A LANE SCOPE, `end` CLOSES IT, AND A LANE BELONGS TO ONE
+//      INSTANCE. `lane` pushes a scope onto the current pile and `end` pops
+//      the innermost open one back into the scope around it. **A delivery
+//      boxes the innermost OPEN scope**: inside an open lane it takes only
+//      that lane's items (the box lands IN the lane, which stays open, so more
+//      may follow in it), and outside any lane it takes the shared items plus
+//      every closed lane — the multi-socket box. An unclosed lane is closed
+//      when the sentence runs out. Lanes are ordered as spoken; the box fires
+//      `instances = max(count, L)`, instance i < L carries shared ∪ lane[i+1],
+//      and instance i >= L carries the shared items alone. A `lane` / `end`
+//      mark is a WALL: an operator binds only within its own scope, and runs
+//      merge only within a scope (`fire lane fire end` is two items in two
+//      scopes, not `fire×2`) — but a `count` Mod is record-wide wherever it
+//      was spoken, because count IS the fan and a lane is one instance of it,
+//      while any other mod inside a lane edits that instance's record.
+//      COPIES FAN, COLUMNS DO NOT: `SpellFan` spreads only the shared-only
+//      instances; an instance that carries a lane fires on the aim itself.
+//
+// The outermost box is always `hand`, so the whole sentence lowers to ONE cast.
+// Lanes on the hand are how two unrelated spells are said at once (`lane
+// explosive projectile end lane blood mend self end` is a bolt AND a graft),
+// and law L4 (cost additivity) attaches to those root lanes. There is no
+// sentence separator any more: `also` was dropped when rule 4 landed.
 //
 // Unary operators (`trail`, `aura`, `echo`, `null`, `mend`) take the ONE item
 // immediately before them, which may itself be a launch box (`explosive
@@ -122,7 +144,10 @@ enum class GlyphSort : uint8_t {
   Delivery,
   Mod,
   Operator,
-  Separator,   // `also`: closes the pile as a finished cast, starts a new one
+  // `lane` (rule 4): opens a segment of the pile that belongs to ONE instance
+  // of the box that closes it. The enum value kept its name; the word it
+  // names changed when `also` was dropped.
+  Separator,
 };
 constexpr int kGlyphSortCount = 6;
 const char* GlyphSortName(GlyphSort s);   // "matter" | "effect" | ...
@@ -281,6 +306,11 @@ struct GlyphDef {
   // so a modder's new carrier reads as itself; defaults to the glyph id.
   std::string noun;
 
+  // ---- separator (rule 4) ----
+  // false = `lane`, opens a lane scope; true = `end`, closes the innermost
+  // open one. Content, from the glyph's "scope" field.
+  bool scopeClose = false;
+
   // ---- mod ----
   ModField field = ModField::None;
   ModOp op = ModOp::Mul;
@@ -324,7 +354,7 @@ struct SpellBudgets {
   int32_t maxStatusPerCaster = 4;
   // ---- the grimoire (plan §12b), P5 -----------------------------------------
   int32_t maxGrimoirePages = 32;
-  int32_t maxMacroWords = 16;
+  int32_t maxMacroWords = 32;
   int32_t maxMacroDepth = 4;
 };
 
@@ -374,8 +404,11 @@ struct SpellStack {
   bool Empty() const { return spoken.empty(); }
 };
 // Bound so a stuck key cannot grow the stack without limit (rule 2 applies to
-// UI state too — an unbounded stack is an unbounded mana cost).
-constexpr int kSpellStackMax = 16;
+// UI state too — an unbounded stack is an unbounded mana cost). 32 since rule
+// 4: a socket costs TWO words (`lane` … `end`), and three sockets holding two
+// effects each, a fan, a delivery and a mod is a sentence a player will want
+// to say.
+constexpr int kSpellStackMax = 32;
 
 // ---- the parse tree (the three rules) ----------------------------------------
 
@@ -392,6 +425,16 @@ struct SpellNode {
   int left = -1;         // operator child, -1 = empty slot (or no slot)
   int right = -1;
   std::vector<int> items;   // box: the closed pile, first-seen order, merged
+  // RULE 4: which segment of the pile this item was spoken in. 0 = the shared
+  // segment; 1..L = the segment opened by the Nth `lane` word, which belongs
+  // to instance N-1 of the box that closes the pile. Part of NodeKey, so two
+  // identical words in different lanes never merge.
+  int32_t lane = 0;
+  // Box only: TWO spoken positions per lane it closed, in lane order — the
+  // `lane` word, then the `end` word (-1 when the sentence ended and the lane
+  // was closed implicitly). So `laneAt.size() == 2 * L`, and the HUD highlight
+  // and the linearizer both have the marks they need.
+  std::vector<int> laneAt;
   bool complete = true;  // false: a required slot is empty
   // Spoken span [first, last] of this item and everything under it, for the
   // HUD highlight and the L6 law; `at` is the operator/delivery word's own
@@ -400,9 +443,12 @@ struct SpellNode {
   int at = -1;
 };
 
-// One sentence: everything up to an `also`, or up to the end. Its root is
-// ALWAYS the implicit `hand` box (rule 3), so `delivery`/`weight` below are
-// the hand's and the nesting lives inside `bag`.
+// THE sentence. Since `also` was dropped for rule 4, a spoken sequence is
+// exactly ONE clause (`clauses` holds 0 entries for silence, 1 otherwise) —
+// the vector survives so the UI and the gates keep their shape, and so that a
+// future second root is a change of one number rather than of every loop. Its
+// root is ALWAYS the implicit `hand` box (rule 3), so `delivery`/`weight`
+// below are the hand's and the nesting lives inside `bag`.
 struct SpellClause {
   int root = -1;         // the outermost box node
   int delivery = -1;     // == nodes[root].glyph; -1 = hand, and always is
@@ -432,10 +478,13 @@ enum class BracketStyle : uint8_t {
   Hud,          // ASCII for the pixel font: x2, |, ><, <, DELIVERY in caps
 };
 // An item with its brackets: `fire×2`, `(dirt ⋈ water)`, `(_ ◂trail)`, and a
-// box as `[ ... **projectile**]`.
+// box as `[ ... **projectile**]`. A lane prints as `/ ... /` in BOTH styles
+// (`[explosive / sand / / fire / **projectile**]`), one mark per word the
+// sentence actually contains — one spelling, because the oracle JSON and this
+// parser compare strings.
 std::string ShowNode(const GlyphLibrary& lib, const SpellTree& t, int node,
                      BracketStyle style = BracketStyle::Oracle);
-// The whole sentence: the hand box's items, clauses (`also`) joined by ‖.
+// The whole sentence: the hand box's items, each lane wrapped in ` / `.
 std::string BracketSpell(const GlyphLibrary& lib, const SpellTree& t,
                          BracketStyle style = BracketStyle::Oracle);
 
@@ -471,6 +520,8 @@ struct EffectInst {
   int node = -1;             // tree node, for the readout
 };
 
+struct SpellLane;
+
 // The delivery record a live cast carries. Mods are field edits on it.
 struct DeliveryRec {
   int glyph = -1;            // -1 = hand
@@ -493,6 +544,21 @@ struct DeliveryRec {
   std::vector<EffectInst> trail;
   int32_t trailBudget = 0;
   int32_t trailEvery = 1;    // mark every Nth voxel of travel
+  // RULE 4: one entry per `lane` segment of the pile this record's box closed,
+  // in SPOKEN order. Lane i belongs to instance i. A vector rather than a
+  // by-value member for the same reason `EffectInst::launch` is one: a lane
+  // holds a record, and a record holds effects that hold records.
+  // INVARIANT: a lane's own `rec.lanes` is always empty (one level only).
+  std::vector<SpellLane> lanes;
+};
+
+// One instance's private segment of the pile (rule 4): the shared record with
+// this lane's Mods applied on top and this lane's trail merged in, plus the
+// nouns only this instance carries. `InstanceCast` is the one place that puts
+// the two halves back together.
+struct SpellLane {
+  DeliveryRec rec;
+  std::vector<EffectInst> extra;
 };
 
 // One clause, lowered: what Cast() runs, what a projectile carries, what
@@ -525,9 +591,26 @@ struct SpellCast {
   int32_t Cost() const { return wordCost + tariff + carryCost; }
 };
 
+// THE PRICE OF ONE BOX, kept beside the cast list so the graph page can draw
+// a subtotal under every join (PLAN_spell_graph §4). Derived data: filled by
+// `LowerBox` on the way out, never read by the VM.
+struct BoxPrice {
+  int node = -1;             // the SpellTree node of the box
+  int32_t wordCost = 0, tariff = 0, carryCost = 0;
+  int32_t instances = 1, leaves = 1;
+  bool instancesClamped = false;
+};
+
 struct CastList {
   SpellTree tree;
   std::vector<SpellCast> casts;
+  // One entry per box in `tree`, the hand root included, in lowering order.
+  std::vector<BoxPrice> boxPrice;
+  const BoxPrice* PriceOf(int node) const {
+    for (const BoxPrice& p : boxPrice)
+      if (p.node == node) return &p;
+    return nullptr;
+  }
   int32_t wordCost = 0, tariff = 0, carryCost = 0;
   int32_t manaCost = 0;      // the total the HUD shows and ResolveCast charges
   bool priceUnknown = false;
@@ -547,8 +630,20 @@ int32_t EffectVolume(const GlyphLibrary& lib, const EffectInst& e);
 // the material's arcane value and the budgets' rates. `anything` prices as 0
 // here and is billed when it resolves (SpellEmission::billOnResolve).
 int32_t EffectTariff(const GlyphLibrary& lib, const EffectInst& e);
-// Fills a cast's tariff and carry from its payload, trail and instances.
+// Fills a cast's tariff and carry from its payload, trail and instances. With
+// lanes (rule 4) the tariff is the SUM over instances of tariff(shared ∪
+// lane_i) rather than tariff(shared) × instances, which is the same number
+// when there are no lanes.
 void PriceCast(const GlyphLibrary& lib, SpellCast& cast);
+// HOW MANY INSTANCES a record fires: max(count, lanes), clamped. One place,
+// because the fan loops, the pricing and the volume bound must agree.
+int32_t RecInstances(const GlyphLibrary& lib, const DeliveryRec& d);
+// THE CAST INSTANCE i ACTUALLY FLIES WITH (rule 4): the shared cast for
+// i >= L, and for i < L the lane's record with the lane's nouns appended to
+// the shared payload. Called in every fan loop; returns `cast` unchanged when
+// the cast has no lanes, so a sentence without `lane` behaves bit-for-bit as
+// it did.
+SpellCast InstanceCast(const SpellCast& cast, int32_t i);
 // The first material a cast carries (a spray, a convert's product, a trail
 // mark), for drawing the bolt; 0 when it carries none.
 uint32_t CastTintMaterial(const SpellCast& cast);
@@ -992,6 +1087,8 @@ class SpellSystem {
 SpellFxVec SpellWobble(SpellFxVec dirFx, int32_t instabilityMille,
                        uint32_t tick, uint64_t casterId);
 // A fanned copy of `dir` for instance `i` of `count` (shotgun). Instance 0 is
-// the aim itself.
+// the aim itself. COPIES FAN, COLUMNS DO NOT (rule 4): the callers only fan an
+// instance whose payload is the shared-only copy, so a projectile in its own
+// lane flies at the crosshair rather than a few degrees off it.
 SpellFxVec SpellFan(SpellFxVec dirFx, int32_t i, int32_t count, uint32_t tick,
                     uint64_t casterId);
