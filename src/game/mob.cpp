@@ -4652,6 +4652,11 @@ void MobSystem::ClearGuard(uint64_t mobId) {
   m->stroke_.phase = NpcStroke::Phase::Recover;
   m->stroke_.phaseTick = 0;
   m->stroke_.recoverTicks = 8;
+  // A DROPPED GUARD IS NOT A STYLE'S RETURN. There is no stroke program behind
+  // this recover — no style, and therefore no authored stance to be driven
+  // back to — so it releases on the first tick and fades, which is what
+  // lowering a guard is (strokes.h StrokeRecover).
+  m->stroke_.settleTicks = 0;
 }
 
 // The mob's own frame, which is the BASIS the stroke is expressed in (melee.h

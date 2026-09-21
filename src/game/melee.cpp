@@ -1451,8 +1451,11 @@ float MeleeState::PoseWeight() const {
       // mid-combination would drop the blade to the walk pose for a fifth of a
       // second. `recoverHold_` is what the phase was entered for.
       if (recoverHold_) return 1.0f;
-      float t =
-          tuning.recoverTime > 1e-4f ? phaseTime_ / tuning.recoverTime : 1.0f;
+      // RecoverTime(), not tuning.recoverTime: an authored stroke may own its
+      // own hand-back clock (melee.h SetRecoverTime, strokes.h
+      // StrokeRecover::fade). Unset, this IS tuning.recoverTime.
+      const float rt = RecoverTime();
+      float t = rt > 1e-4f ? phaseTime_ / rt : 1.0f;
       return std::clamp(1.0f - t, 0.0f, 1.0f);
     }
     default:
@@ -1544,6 +1547,11 @@ void MeleeState::Reset() {
   steerLive_ = std::clamp(tuning.steerFloor, 0.0f, 1.0f);
   framePrimed_ = false;
   recoverHold_ = false;
+  // A fresh stroke inherits no previous style's hand-back clock (melee.h
+  // SetRecoverTime). StepStrokeProgram pushes one every tick anyway, so this
+  // is belt and braces for the callers that Reset() and then do not run a
+  // program at all.
+  recoverOverride_ = 0.0f;
 }
 
 // ---- the derived half -------------------------------------------------------
@@ -2431,7 +2439,7 @@ void MeleeState::Update(float dt, bool held, bool armed, const Vec3& right,
         recoverHold_ = false;
         phaseTime_ = 0;
       }
-      if (phaseTime_ >= tuning.recoverTime) {
+      if (phaseTime_ >= RecoverTime()) {
         phase_ = (armed && held) ? SwingPhase::Guard : SwingPhase::Idle;
         phaseTime_ = 0;
         swingAz_ = swingEl_ = swingOut_ = 0;

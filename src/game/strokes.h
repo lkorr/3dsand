@@ -29,7 +29,8 @@
 //     "label":   "Horizontal cut, weapon side across",
 //     "windup":  { "ticks": 12, "az":  0.30, "el": 0.10, "reach": -0.05 },
 //     "cut":     { "ticks":  7, "az": -2.30, "el": 0.00, "reach":  0.10 },
-//     "recover": { "ticks": 10 },
+//     "recover": { "ticks": 10, "az": 0.25, "el": 0.10, "reach": -0.10,
+//                  "settle": 7, "fade": 5 },
 //     "jitter":  { "az": 0.20, "el": 0.08, "tempo": 0.25 }
 //   }
 //
@@ -46,8 +47,13 @@
 // implies, which is what commits the driver's own Slash and gives the sweep the
 // tip speed that scales the damage (melee.h note 2, "SPEED IS THE DAMAGE").
 //
-// RECOVER is a hold with no input: the driver's own follow-through unwinds and
-// the arm is handed back to the walk cycle over `PoseWeight`'s ramp.
+// RECOVER is a RETURN, and it is an absolute pose rather than an aim-relative
+// one: the arm is DRIVEN back to a stance over `settle` ticks (closed-loop and
+// under commitSpeed, the windup's own drive, so no cut can fire out of one) and
+// only then is the claim handed back over `fade`. A style that authors no pose
+// gets the historical behaviour — release on the first tick, freeze wherever
+// the cut ended, crossfade. See `StrokeRecover` below for why that was not good
+// enough.
 //
 // ---------------------------------------------------------------------------
 // THE CUT IS CENTRED ON THE AIM, AND THE AIM IS TAKEN ONCE
@@ -133,12 +139,73 @@ struct StyleTargetWeight {
   float weight = 0;
 };
 
+// ---- HOW THE ARM COMES BACK (AttackStyle::recover; 2026-09-21) ------------
+//
+// THE RECOVER USED TO BE FOUR LINES AND NONE OF THEM WAS A MOTION. The runner
+// set `held = false` and stepped the driver, and everything after that was out
+// of the style's hands: the STORED stroke froze wherever the cut ended (only
+// the follow-through arc decayed), `PoseWeight` ramped 1 -> 0 over the ONE
+// global `melee.recoverTime` shared by every attack in the game, and
+// Mob::ApplyWeaponArm handed that number to AnimSolveTwoBone as a BLEND
+// WEIGHT. So the path from the end of a cut back to the walk cycle was a
+// rotation-space crossfade with nothing in it that knows about anatomy — and a
+// cut that ends with the blade across the body blends THROUGH the torso to get
+// home. That is the "limbs move in impossible ways" report, and no amount of
+// tuning the windup or the cut could reach it, because the recover was not
+// being authored at all.
+//
+// So a recover is now a SEGMENT like the other two, and the arm is DRIVEN
+// through it:
+//
+//   "recover": { "ticks": 10, "az": 0.25, "el": 0.10, "reach": -0.10,
+//                "settle": 7, "fade": 5 }
+//
+// THE POSE IS ABSOLUTE, in the mob's own facing basis — the same vocabulary
+// `StrokeCursor::Phase::Guard` already uses, and deliberately NOT the windup's
+// aim-relative one. A recover is a return to STANCE, not a second aim: an
+// arm that recovered relative to the target would end every swing pointed back
+// at whatever it just hit, which reads as re-chambering rather than as
+// finishing. `reach` is an offset from the neutral band position, exactly as
+// `windup.reach` and `cut.reach` are, so it means the same thing on any rig.
+//
+// SETTLE is how many of the `ticks` are DRIVEN before the hand-back begins.
+// Those ticks steer closed-loop and under `commitSpeed` (the windup's own
+// drive, so no cut can fire out of a recover) with the button still down, so
+// `PoseWeight` stays at 1 and the arm really travels. Only afterwards is the
+// button released and the claim faded — from a pose that is already near the
+// one being blended to, which is what makes the crossfade short enough to be
+// invisible instead of long enough to go through the chest.
+//
+// FADE overrides `melee.recoverTime` FOR THIS STYLE, in ticks (0 = the global
+// value). A jab and an overhead chop have no business handing the arm back on
+// the same clock, and before this they had no choice: one number in tuning.json
+// owned every recover in the game.
+//
+// EVERY FIELD DEFAULTS TO THE OLD BEHAVIOUR. `posed` is false unless the style
+// authored an az/el/reach, and an unposed recover releases on tick 0 with the
+// global fade — which is, line for line, what the four lines used to do. A
+// style written before this loads and swings identically.
+struct StrokeRecover {
+  int ticks = 10;
+  // Did the author state a return pose at all? False = freeze where the cut
+  // ended and crossfade, the pre-2026-09-21 behaviour.
+  bool posed = false;
+  float az = 0;      // ABSOLUTE, mob's facing basis: + is the mob's right
+  float el = 0;      // ABSOLUTE, 0 is level
+  float reach = 0;   // offset from the neutral band position, like the others
+  // Ticks DRIVEN to that pose before the button is released. Clamped to
+  // `ticks` at load. Meaningless without a pose, and ignored without one.
+  int settle = 0;
+  // Ticks the hand-back fade takes, overriding melee.recoverTime; 0 = global.
+  int fade = 0;
+};
+
 struct AttackStyle {
   std::string name;    // the id a behaviour profile refers to
   std::string label;   // human text for the dev readout
   StrokeSegment windup;
   StrokeSegment cut;
-  int recoverTicks = 10;
+  StrokeRecover recover;
   StrokeJitter jitter;
   // ---- WHAT SWINGS IT (plan §4/§5) ---------------------------------------
   // "held" (the default, and every style authored before this existed) or the
@@ -269,6 +336,10 @@ struct StrokeCursor {
   int windupTicks = 0;       // after tempo jitter
   int cutTicks = 0;
   int recoverTicks = 0;
+  // How many of `recoverTicks` are DRIVEN to the style's return pose before
+  // the button is released (StrokeRecover::settle, resolved and clamped at
+  // BeginStrokeProgram). 0 = release immediately, the historical recover.
+  int settleTicks = 0;
   uint32_t seed = 0;         // wielder ^ salt ^ startTick; every draw keys off it
   // The aim, resolved ONCE at the end of the windup and never refreshed.
   float aimAz = 0, aimEl = 0;

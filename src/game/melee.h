@@ -1064,6 +1064,26 @@ class MeleeState {
   // recover instead of being switched off. Coming IN needs no fade — control
   // starts at the arm's own current pose, so weight 1 changes nothing visible.
   float PoseWeight() const;
+  // ---- ONE STROKE'S OWN HAND-BACK CLOCK (2026-09-21) ---------------------
+  //
+  // `tuning.recoverTime` is ONE NUMBER SHARED BY EVERY ATTACK IN THE GAME, and
+  // for a held-button stroke that is right: it is the feel of releasing the
+  // mouse, and there is one of those. For an AUTHORED stroke it is not — a jab
+  // and an overhead chop have no business handing the arm back on the same
+  // clock, and until this existed they had no choice.
+  //
+  // Seconds; 0 restores the global value, which is what every caller that
+  // never touches it gets. Pushed by StepStrokeProgram from the style's
+  // `recover.fade` (strokes.cpp says why it is pushed every tick), and cleared
+  // by Reset() so a fresh stroke never inherits one. It deliberately does NOT
+  // live on `tuning`: that struct is copied wholesale from tuning.json on every
+  // F5 and per-swing state written into it would be silently reverted.
+  void SetRecoverTime(float seconds) {
+    recoverOverride_ = seconds > 1e-4f ? seconds : 0.0f;
+  }
+  float RecoverTime() const {
+    return recoverOverride_ > 1e-4f ? recoverOverride_ : tuning.recoverTime;
+  }
   // HOW COMMITTED THIS STROKE IS, 0..1, and therefore how much of the blade's
   // commanded orientation the wrist should actually apply (WeaponPose::
   // steerAmount). Smoothed inside RebuildFrame on the blade's own halflife, so
@@ -1220,4 +1240,6 @@ class MeleeState {
   // Was the button still down when this recover started? A recover between two
   // cuts keeps the arm; a recover after the release hands it back (PoseWeight).
   bool recoverHold_ = false;
+  // Seconds, 0 = use tuning.recoverTime. See SetRecoverTime.
+  float recoverOverride_ = 0.0f;
 };

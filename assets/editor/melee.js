@@ -278,6 +278,10 @@ export class MeleeState {
     this.steerLive_ = clamp(this.tuning.steerFloor, 0, 1);
     this.framePrimed_ = false;
     this.recoverHold_ = false;
+    // melee.h SetRecoverTime: seconds, 0 = use tuning.recoverTime. An
+    // authored stroke may own its own hand-back clock (strokes.h
+    // StrokeRecover::fade).
+    this.recoverOverride_ = 0;
     // ---- world-frame outputs (Pose reads these) ----
     this.tip_ = v3(); this.hand_ = v3();
     this.bladeDir_ = v3(); this.bladeFlat_ = v3();
@@ -334,6 +338,15 @@ export class MeleeState {
   // what the stroke's asymmetric azimuth limits want (mob.cpp:8123 HandSign).
   setHandSign(s) { this.handSign_ = s < 0 ? -1.0 : 1.0; }
 
+  // melee.h SetRecoverTime / RecoverTime
+  setRecoverTime(seconds) {
+    this.recoverOverride_ = seconds > 1e-4 ? seconds : 0;
+  }
+  recoverTime() {
+    return this.recoverOverride_ > 1e-4
+      ? this.recoverOverride_ : this.tuning.recoverTime;
+  }
+
   // melee.cpp:864 PoseWeight
   poseWeight() {
     switch (this.phase_) {
@@ -342,8 +355,8 @@ export class MeleeState {
         // Only the RELEASING recover fades: a recover between two cuts is
         // still the player's arm.
         if (this.recoverHold_) return 1.0;
-        const t = this.tuning.recoverTime > 1e-4
-          ? this.phaseTime_ / this.tuning.recoverTime : 1.0;
+        const rt = this.recoverTime();
+        const t = rt > 1e-4 ? this.phaseTime_ / rt : 1.0;
         return clamp(1.0 - t, 0, 1);
       }
       default: return 1.0;
@@ -396,6 +409,7 @@ export class MeleeState {
     this.steerLive_ = clamp(this.tuning.steerFloor, 0, 1);
     this.framePrimed_ = false;
     this.recoverHold_ = false;
+    this.recoverOverride_ = 0;
   }
 
   /**
@@ -825,7 +839,20 @@ export class MeleeState {
         break;
 
       case PHASE.Recover:
-        if (this.phaseTime_ >= t.recoverTime) {
+        // ---- THE BUTTON WENT UP MID-FOLLOW-THROUGH (melee.cpp:2430) -------
+        // `recoverHold_` is latched at the Slash -> Recover transition and
+        // until 2026-09-21 there was NO PATH THAT EVER CLEARED IT, in the
+        // engine or here: a stroke that committed a cut and then released held
+        // poseWeight at 1 for the whole recover and dropped it to 0 on the one
+        // tick the phase ended. That is the "the sword teleports at the end"
+        // report, and THIS PORT WENT ON SHOWING IT after the engine stopped —
+        // a preview whose whole job is to be the engine was lying about the
+        // one thing being authored.
+        if (this.recoverHold_ && !(armed && held)) {
+          this.recoverHold_ = false;
+          this.phaseTime_ = 0;
+        }
+        if (this.phaseTime_ >= this.recoverTime()) {
           this.phase_ = (armed && held) ? PHASE.Guard : PHASE.Idle;
           this.phaseTime_ = 0;
           this.swingAz_ = 0; this.swingEl_ = 0; this.swingOut_ = 0;
@@ -918,7 +945,7 @@ export function newStrokeCursor() {
     phase: STROKE_PHASE.Idle,
     style: -1,
     phaseTick: 0,
-    windupTicks: 0, cutTicks: 0, recoverTicks: 0,
+    windupTicks: 0, cutTicks: 0, recoverTicks: 0, settleTicks: 0,
     seed: 0,
     aimAz: 0, aimEl: 0, aimed: false,
     wantAz: 0, wantEl: 0, wantReach: 0,
@@ -935,7 +962,12 @@ export function beginStrokeProgram(cur, sty, styleIndex, seed) {
   const tempo = 1.0 + sty.jitter.tempo * signedUnit(hash3(cur.seed, 1, 0));
   cur.windupTicks = Math.max(2, Math.round(sty.windup.ticks * tempo));
   cur.cutTicks = Math.max(2, Math.round(sty.cut.ticks * tempo));
-  cur.recoverTicks = Math.max(1, sty.recoverTicks);
+  // THE RECOVER IS NOT TEMPO-JITTERED (strokes.cpp says why): tempo exists so
+  // two duelists do not beat time together, and what carries that is the
+  // telegraph and the travel — the two segments an opponent reads.
+  cur.recoverTicks = Math.max(1, sty.recover.ticks);
+  cur.settleTicks = clamp(sty.recover.posed ? sty.recover.settle : 0,
+                          0, cur.recoverTicks);
   cur.phase = STROKE_PHASE.Windup;
   cur.phaseTick = 0;
 }
@@ -967,6 +999,12 @@ export function stepStrokeProgram(cur, sty, m, liveAz, liveEl, dt, right, up, fw
                        -18, 18);
     m.step(smp, dt, true, right, up, fwd);
   };
+
+  // THIS STYLE'S OWN HAND-BACK CLOCK (strokes.cpp; StrokeRecover::fade).
+  // Pushed every tick and unconditionally: a MeleeState is reused across
+  // strokes, so a previous style's override would otherwise outlive it. Zero
+  // restores the global melee.recoverTime.
+  m.setRecoverTime(sty && sty.recover.fade > 0 ? sty.recover.fade * dt : 0);
 
   switch (cur.phase) {
     case STROKE_PHASE.Guard: {
@@ -1017,9 +1055,23 @@ export function stepStrokeProgram(cur, sty, m, liveAz, liveEl, dt, right, up, fw
       break;
     }
     case STROKE_PHASE.Recover: {
-      // Button RELEASED: the driver's own recover ramps PoseWeight down.
-      smp.held = false;
-      m.step(smp, dt, true, right, up, fwd);
+      // ---- THE RETURN, IN TWO PARTS (strokes.h StrokeRecover) ------------
+      // SETTLE: the button is still DOWN and the arm is STEERED from wherever
+      // the cut left it to the style's ABSOLUTE return stance — closed-loop
+      // and under commitSpeed, the windup's own drive, so no cut can fire out
+      // of a recover. poseWeight stays 1 for every one of these ticks, so the
+      // arm really travels instead of a weight fading on a frozen pose.
+      // Then RELEASE: the old two lines, and the driver's own clock (restarted
+      // at the release by the melee.cpp:2430 path above) owns the fade.
+      if (sty && cur.phaseTick < cur.settleTicks) {
+        cur.wantAz = sty.recover.az;
+        cur.wantEl = sty.recover.el;
+        cur.wantReach = strokeReachIn(m, sty.recover.reach);
+        steerTo(cur.wantAz, cur.wantEl, cur.wantReach);
+      } else {
+        smp.held = false;
+        m.step(smp, dt, true, right, up, fwd);
+      }
       if (++cur.phaseTick >= cur.recoverTicks) return STEP.Finished;
       break;
     }
@@ -1048,6 +1100,49 @@ function readSegment(j, dflt) {
     el: n('el', dflt.el),
     reach: n('reach', dflt.reach),
   };
+}
+
+/**
+ * strokes.cpp the `recover` block (strokes.h StrokeRecover).
+ *
+ * `posed` is DERIVED, not authored: stating an az, an el or a reach is what
+ * asks for a driven return, so there is no second switch to forget. A recover
+ * of `{ ticks: 10 }` is the pre-2026-09-21 hand-back, byte for byte.
+ */
+function readRecover(j, styleName, log) {
+  const out = { ticks: 10, posed: false, az: 0, el: 0, reach: 0,
+                settle: 0, fade: 0 };
+  if (!j || typeof j !== 'object') return out;
+  const n = (k, d) => (Number.isFinite(+j[k]) ? +j[k] : d);
+  out.ticks = Math.max(1, Math.round(n('ticks', 10)));
+  out.posed = j.az !== undefined || j.el !== undefined || j.reach !== undefined;
+  out.az = n('az', 0);
+  out.el = n('el', 0);
+  out.reach = n('reach', 0);
+  out.settle = Math.max(0, Math.round(n('settle', 0)));
+  out.fade = Math.max(0, Math.round(n('fade', 0)));
+  if (out.settle > 0 && !out.posed) {
+    log.push(`style "${styleName}" has \`recover.settle\` but no return pose `
+             + '(az/el/reach) - the arm has nowhere to be driven, so the '
+             + 'settle is ignored');
+    out.settle = 0;
+  }
+  if (out.settle > out.ticks) {
+    log.push(`style "${styleName}" settles for ${out.settle} of ${out.ticks} `
+             + 'recover ticks - clamped to the segment');
+    out.settle = out.ticks;
+  }
+  // ...AND THE FADE HAS TO FIT IN WHAT IS LEFT, or the claim is dropped
+  // mid-fade and poseWeight steps to 0 in one tick - the very snap this
+  // block exists to remove, arrived at from the content side.
+  if (out.fade > 0 && out.settle + out.fade > out.ticks) {
+    const want = out.settle + out.fade;
+    log.push(`style "${styleName}" settles ${out.settle} + fades ${out.fade} `
+             + `= ${want} ticks in a ${out.ticks}-tick recover - extended to `
+             + `${want} so the claim is not dropped mid-fade`);
+    out.ticks = want;
+  }
+  return out;
 }
 
 // strokes.cpp:80 the `lunge` block (strokes.h StyleLunge). m/s, converted to
@@ -1096,8 +1191,7 @@ export function parseStyleLibrary(json) {
       label: typeof s.label === 'string' ? s.label : name,
       windup: readSegment(s.windup, { ticks: 12, az: 0, el: 0, reach: 0 }),
       cut: readSegment(s.cut, { ticks: 7, az: 0, el: 0, reach: 0 }),
-      recoverTicks: Math.max(1, Math.round(
-        Number.isFinite(+(s.recover && s.recover.ticks)) ? +s.recover.ticks : 10)),
+      recover: readRecover(s.recover, name, log),
       jitter: {
         az: Number.isFinite(+jt.az) ? +jt.az : 0,
         el: Number.isFinite(+jt.el) ? +jt.el : 0,

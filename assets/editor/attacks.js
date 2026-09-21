@@ -77,6 +77,17 @@ let aim = { az: 0, el: 0 }; // the target's bearing about the shoulder, radians
 let loop = true;
 let swingNo = 0;
 let trailOn = true;
+// DOES THE LOOP RE-ROLL THE JITTER EVERY CYCLE? Off by default, and that is a
+// change: it used to, unconditionally. `jitter.az` runs to 0.24 rad and
+// `jitter.tempo` to 0.28 on the shipped NPC styles, so every replay was a
+// visibly different swing and the recover you were trying to author moved
+// under you once every second and a half. That is the reported "trying to solo
+// certain animations gives different animations randomly" — it was the
+// deterministic sequence being walked, one draw per loop, with nothing saying
+// so. Authoring wants ONE swing repeated; `reroll` still steps the sequence
+// deliberately, and this chip puts the old behaviour back for watching the
+// spread.
+let vary = false;
 let flick = { x: 1, y: 0 }; // the compass pad's test flick
 const folds = { limbs: false, compass: false, help: false };
 // SOLO: which segment the preview isolates — 'all' runs the program as the
@@ -89,6 +100,7 @@ let solo = 'all';
 // The shared clip library (assets/anims/*.json), for the program card's clip
 // picker. null until fetched; [] when the server has none.
 let libClips = null;
+let itemListFetched = false;
 
 const num = (v, d = 0) => (Number.isFinite(+v) ? +v : d);
 const clamp = (v, lo, hi) => Math.max(lo, Math.min(hi, v));
@@ -112,6 +124,7 @@ export const currentAim = () => aim;
 export const looping = () => loop;
 export const trailEnabled = () => trailOn;
 export const swingNumber = () => swingNo;
+export const varying = () => vary;
 export const isDirty = () => dirty;
 export const soloSegment = () => solo;
 export function nextSwing() { swingNo = (swingNo + 1) >>> 0; }
@@ -124,10 +137,26 @@ async function refreshLibClips() {
       .map(f => f.name.replace(/\.json$/i, ''));
   } catch { libClips = []; }
 }
-/** Select a style by index — for the test seam, so it can drive a real box. */
-export function selectStyle(i) {
+/**
+ * Select a style by index. THE ONE PATH — the chips in the style bar call this
+ * too, and that is the fix rather than an accident of refactoring.
+ *
+ * Clicking a chip used to be `selected = i; render()` and nothing else. The
+ * preview loop, meanwhile, holds its OWN index (`strokeStyle` in rig.js) and
+ * re-begins THAT one at the end of every cycle — so selecting a different
+ * attack while the preview was running repainted the panel around a rig that
+ * went on swinging the old style forever. That is the reported "clicking on
+ * different animations doesn't switch them". The solo chips had the restart
+ * line from the start; the style chips never did.
+ */
+export async function selectStyle(i) {
   if (!lib || i < 0 || i >= lib.styles.length || i === selected) return;
   selected = i;
+  // Restart on the NEW style if something is swinging, so the viewport agrees
+  // with the panel. Not `nextSwing()`: switching attacks is not asking for a
+  // different draw of the jitter, and re-rolling here would make comparing two
+  // styles a comparison of two random swings.
+  if (host?.state?.().live) await host.begin(selected);
   render();
 }
 
@@ -351,7 +380,7 @@ function renderStyleBar() {
       label));
     for (const [s, i] of list)
       bar.append(chip(s.name.replace(/^player_/, ''), i === selected,
-        () => { selected = i; render(); }, s.label));
+        () => selectStyle(i), s.label));
   }
 
   bar.append(el('span', { class: 'spacer' }));
@@ -513,17 +542,124 @@ function programCard(sty) {
     }));
   }
 
+  // ---- THE RECOVER, WHICH IS NOW A SEGMENT LIKE THE OTHER TWO -----------
+  //
+  // It used to be one tick box, because there was nothing else to author: the
+  // runner set held=false and everything after that belonged to one global
+  // melee.recoverTime and to a rotation-space crossfade that knows no anatomy
+  // (strokes.h StrokeRecover says what that cost). It now has a POSE, and the
+  // pose is ABSOLUTE rather than aim-relative — which is why its az/el column
+  // headers mean something different from the two rows above it, and why the
+  // tooltip says so rather than leaving the author to find out.
   if (!r.recover || typeof r.recover !== 'object') r.recover = { ticks: 10 };
-  seg.append(el('div', { class: 'lbl',
-    title: 'a hold with no input: the follow-through unwinds and the arm is ' +
-           'handed back to the walk cycle' }, 'recover'));
+  const rv = r.recover;
+  // `posed` is DERIVED FROM KEY PRESENCE in both loaders, so the toggle
+  // adds and deletes keys rather than writing a flag. That keeps one fact in
+  // one place — and it is why the pose boxes are hidden rather than zeroed
+  // when it is off: a box that wrote 0 would silently turn the pose ON.
+  const posed = rv.az !== undefined || rv.el !== undefined ||
+                rv.reach !== undefined;
+  const rvTip = posed
+    ? 'A RETURN, driven. The arm is STEERED from wherever the cut left it to ' +
+      'the stance below — closed-loop and under melee.commitSpeed, the ' +
+      'windup\'s own drive, so no cut can fire out of a recover — and only ' +
+      'then is the claim handed back. THE POSE IS ABSOLUTE, in the mob\'s own ' +
+      'facing basis, NOT relative to the aim like the windup: a recover is a ' +
+      'return to stance, not a second aim.'
+    : 'A hold with no input: the follow-through unwinds and the arm is ' +
+      'handed back over melee.recoverTime. The arm is NOT steered anywhere — ' +
+      'the stroke freezes where the cut ended and the rig crossfades to the ' +
+      'walk pose, which is what makes a deep cut blend home through the ' +
+      'torso. Turn on "return pose" to drive it back instead.';
+  seg.append(el('div', { class: 'lbl', title: rvTip }, 'recover'));
   seg.append(numCell({
-    int: true, step: 1, min: 1, max: 120, dflt: 10,
-    get: () => Math.max(1, Math.round(num(r.recover.ticks, 10))),
-    sub: fmt(Math.max(1, Math.round(num(r.recover.ticks, 10))) * TICK_MS / 1000, 2) + ' s',
-    set: v => editStyles('recover ticks', () => { r.recover.ticks = v; }),
+    int: true, step: 1, min: 1, max: 120, dflt: 10, title: rvTip,
+    get: () => Math.max(1, Math.round(num(rv.ticks, 10))),
+    sub: fmt(Math.max(1, Math.round(num(rv.ticks, 10))) * TICK_MS / 1000, 2) + ' s',
+    set: v => editStyles('recover ticks', () => { rv.ticks = v; }),
   }));
-  seg.append(el('div', {}), el('div', {}), el('div', {}));
+  if (posed) {
+    seg.append(degCell(rv, 'az', 'return azimuth (ABSOLUTE)', 'recover'));
+    seg.append(degCell(rv, 'el', 'return elevation (ABSOLUTE)', 'recover'));
+    seg.append(numCell({
+      step: 0.01, min: -1, max: 1,
+      title: 'the stance\'s BAND POSITION offset, read exactly as the windup ' +
+        'and cut reach are: 0 is the neutral 0.60 of this arm\'s annulus.',
+      get: () => num(rv.reach, 0),
+      sub: reachSub(rv.reach),
+      subTitle: 'where that lands on the arm currently previewing',
+      set: v => editStyles('recover reach', () => { rv.reach = v; }),
+    }));
+  } else {
+    seg.append(el('div', {}), el('div', {}), el('div', {}));
+  }
+
+  // ---- settle / fade, the two halves of the `ticks` above ---------------
+  const settle = Math.max(0, Math.round(num(rv.settle, 0)));
+  const fade = Math.max(0, Math.round(num(rv.fade, 0)));
+  seg.append(el('div', { class: 'lbl',
+    title: 'HOW THE ' + Math.max(1, Math.round(num(rv.ticks, 10))) +
+      ' RECOVER TICKS ARE SPENT. settle = driven to the return pose with the ' +
+      'claim at full weight; fade = the hand-back. settle + fade must fit in ' +
+      'the segment or the loader extends it — a claim dropped mid-fade is a ' +
+      'PoseWeight stepping to 0 in one tick, which is the snap all of this ' +
+      'exists to remove.' },
+    el('span', { class: 'hint', style: 'text-transform:none;letter-spacing:0' },
+      '↳ split')));
+  seg.append(numCell({
+    int: true, step: 1, min: 0, max: 120, dflt: 0,
+    title: posed
+      ? 'SETTLE: ticks DRIVEN to the return pose before the button is ' +
+        'released. The button is still down for every one of them, so ' +
+        'PoseWeight stays at 1 and the arm really travels — it is not a ' +
+        'weight fading on a frozen pose. 0 = release immediately (the ' +
+        'pre-2026-09-21 recover).'
+      : 'SETTLE needs a return pose to drive to — turn "return pose" on. ' +
+        'Both loaders warn and ignore a settle without one.',
+    get: () => settle,
+    sub: settle > 0 ? fmt(settle * TICK_MS / 1000, 2) + ' s' : 'settle',
+    set: v => editStyles('recover settle', () => {
+      if (v > 0) rv.settle = v; else delete rv.settle;
+    }),
+  }));
+  seg.append(numCell({
+    int: true, step: 1, min: 0, max: 120, dflt: 0,
+    title: 'FADE: ticks the hand-back takes, overriding melee.recoverTime FOR ' +
+      'THIS STYLE (0 = the global value, ' +
+      fmt(num(host?.meleeTuning?.().recoverTime, 0.22), 2) + ' s = ' +
+      Math.round(num(host?.meleeTuning?.().recoverTime, 0.22) * 1000 / TICK_MS) +
+      ' ticks). A jab and an overhead chop have no business handing the arm ' +
+      'back on the same clock, and before this they had no choice.',
+    get: () => fade,
+    sub: fade > 0 ? fmt(fade * TICK_MS / 1000, 2) + ' s' : 'fade',
+    set: v => editStyles('recover fade', () => {
+      if (v > 0) rv.fade = v; else delete rv.fade;
+    }),
+  }));
+  seg.append(el('div', { style: 'grid-column:span 2' },
+    chip(posed ? 'return pose ✓' : '+ return pose', posed, () => {
+      editStyles(posed ? 'plain recover' : 'driven recover', () => {
+        if (posed) {
+          delete rv.az; delete rv.el; delete rv.reach; delete rv.settle;
+        } else {
+          // SEEDED FROM THE WINDUP'S OWN STANCE, not from zeros. A style's
+          // windup az/el is the side it chambers on, and coming back to that
+          // side is what "recover" means for nearly every stroke — an all-zero
+          // return would drive every attack in the game home to dead centre
+          // and read as the editor picking a pose for you.
+          const w = r.windup || {};
+          rv.az = num(w.az, 0);
+          rv.el = num(w.el, 0);
+          rv.reach = num(w.reach, 0);
+          rv.settle = Math.max(1, Math.round(num(rv.ticks, 10) * 0.6));
+        }
+      });
+      render();
+    }, posed
+      ? 'drop the return pose: the arm freezes where the cut ended and the rig ' +
+        'crossfades home (the pre-2026-09-21 recover)'
+      : 'drive the arm back to a stance instead of crossfading out of the ' +
+        'cut pose — seeded from this style\'s own windup stance')));
 
   if (!r.jitter || typeof r.jitter !== 'object') r.jitter = { az: 0, el: 0, tempo: 0 };
   const jTip = 'VARIATION IS DETERMINISTIC (CLAUDE.md rule 1): every draw is ' +
@@ -823,7 +959,7 @@ function reachSub(offset) {
  * cut travel far enough fast enough.
  */
 function derivedLine(sty) {
-  const w = sty.windup.ticks, c = sty.cut.ticks, rc = sty.recoverTicks;
+  const w = sty.windup.ticks, c = sty.cut.ticks, rc = sty.recover.ticks;
   const total = w + c + rc;
   const cutDeg = Math.round(Math.hypot(sty.cut.az, sty.cut.el) * DEG);
   const cutS = c * TICK_MS / 1000;
@@ -838,6 +974,17 @@ function derivedLine(sty) {
     const hi = Math.max(2, Math.round(w * (1 + sty.jitter.tempo)));
     d.append(el('span', {}, ` · windup varies ${lo}–${hi} ticks`));
   }
+  // HOW THE RECOVER IS SPENT, because "10 ticks of recover" says nothing about
+  // the thing that is actually being authored: whether the arm is DRIVEN home
+  // or crossfaded out of the cut pose.
+  const rv = sty.recover;
+  const globalFade = Math.round(
+    num(host?.meleeTuning?.().recoverTime, 0.22) * 1000 / TICK_MS);
+  d.append(el('span', {}, rv.posed
+    ? ` · recover drives ${rv.settle} then fades ` +
+      `${rv.fade || globalFade}${rv.fade ? '' : ' (global)'}`
+    : ` · recover CROSSFADES from the cut pose over ` +
+      `${rv.fade || globalFade}${rv.fade ? '' : ' (global)'} ticks`));
   return d;
 }
 
@@ -856,20 +1003,27 @@ function previewCard(sty) {
     el('button', {
       class: 'small primary',
       title: 'run this stroke program through the REAL driver on the rig',
-      onclick: () => {
+      onclick: async () => {
         if (selected < 0) return toast('pick an attack first', true);
         const arm = host?.armInfo?.();
         if (!arm || arm.chain < 0)
           return toast('this rig has no arm chain tagged "arm" whose effector ' +
             'is the weapon socket\'s part — the driver has nothing to steer', true);
         nextSwing();
-        host.begin(selected);
+        await host.begin(selected);
         render();
       },
     }, '▶ swing'),
     el('button', { class: 'small', onclick: () => { host?.stop?.(); render(); } }, '■'),
     chip('loop', loop, () => { loop = !loop; render(); },
       'replay the program forever — the authoring mode'),
+    chip('vary', vary, () => { vary = !vary; render(); },
+      'RE-ROLL THE JITTER ON EVERY LOOP, the pre-2026-09-21 behaviour. Off, ' +
+      'the loop replays the SAME swing, which is what authoring a recover ' +
+      'needs — with the shipped NPC jitter (up to 0.24 rad of start bow and ' +
+      '±0.28 of tempo) every cycle was a different swing and nothing said so. ' +
+      'On, you see the spread the game will actually produce. `reroll` steps ' +
+      'the sequence one draw either way.'),
     chip('trail', trailOn, () => {
       trailOn = !trailOn; host?.onTrailToggled?.(); render();
     }, 'draw the blade\'s swept edge, coloured by phase'),
@@ -905,26 +1059,49 @@ function previewCard(sty) {
     }, soloTips[k]));
   card.append(t3);
 
-  // ---- THE SWORD BUTTON. A blade is not decoration here: the driver MEASURES
+  // ---- WEAPON PICKER. A blade is not decoration here: the driver MEASURES
   // hand-to-point and solves the whole reach band against it, so an empty hand
   // is a different set of numbers rather than the same swing without a prop.
   const t2 = el('div', { class: 'atkrow' });
   const armed = host?.weaponEquipped?.();
-  t2.append(el('button', {
-    class: 'small' + (armed ? '' : ' primary'),
-    title: armed
-      ? 'swap the weapon in the rig\'s hand (Held item panel has the full list)'
-      : 'put a sword in this rig\'s hand. The stroke driver MEASURES the blade ' +
-        'and solves its reach band against it — with an empty fist the point IS ' +
-        'the hand and the band is the bare arm, so the preview is a different ' +
-        'swing, not the same one undressed.',
-    onclick: async () => { await host?.equipWeapon?.(); render(); },
-  }, armed ? '◆ ' + (host?.weaponName?.() || 'armed') : '+ sword'));
-  if (armed)
+  const curWeapon = host?.weaponName?.() || '';
+  const melee = host?.meleeItems?.() || [];
+  if (melee.length) {
+    const sel = el('select', { class: 'small',
+      title: 'which weapon is in the fist — the driver measures the blade and ' +
+        'solves its reach band against it, so each weapon is a different swing' });
+    sel.append(el('option', { value: '' }, '(unarmed)'));
+    for (const it of melee) {
+      const o = el('option', { value: it.id }, it.name || it.id);
+      if (it.id === curWeapon) o.selected = true;
+      sel.append(o);
+    }
+    sel.addEventListener('change', async () => {
+      const v = sel.value;
+      if (v) await host?.equipWeapon?.(v);
+      else await host?.equipWeapon?.(null, true);
+      render();
+    });
+    t2.append(el('label', { title: 'the held weapon the stroke preview uses' }, 'weapon'), sel);
+  } else {
     t2.append(el('button', {
-      class: 'small', title: 'empty the hand',
-      onclick: async () => { await host?.equipWeapon?.(null, true); render(); },
-    }, 'disarm'));
+      class: 'small' + (armed ? '' : ' primary'),
+      title: armed
+        ? 'swap the weapon in the rig\'s hand'
+        : 'put a sword in this rig\'s hand — the stroke driver MEASURES the ' +
+          'blade, so an empty fist is a different swing, not the same one undressed',
+      onclick: async () => { await host?.equipWeapon?.(); render(); },
+    }, armed ? '◆ ' + (curWeapon || 'armed') : '+ sword'));
+    if (armed)
+      t2.append(el('button', {
+        class: 'small', title: 'empty the hand',
+        onclick: async () => { await host?.equipWeapon?.(null, true); render(); },
+      }, 'disarm'));
+    if (!itemListFetched) {
+      itemListFetched = true;
+      host?.ensureItemList?.().then(() => render());
+    }
+  }
   t2.append(el('span', { class: 'spacer' }),
     el('label', { title: 'the target\'s BEARING about the shoulder; the cut is ' +
       'CENTRED on it, so the windup lands half a cut short and the blade passes ' +
@@ -1005,7 +1182,7 @@ function aimSlider(key) {
 /** windup | cut | recover as one proportional bar, with the live phase cursor. */
 function strokeBar(sty) {
   const st = host?.state?.() || {};
-  const w = sty.windup.ticks, c = sty.cut.ticks, rc = sty.recoverTicks;
+  const w = sty.windup.ticks, c = sty.cut.ticks, rc = sty.recover.ticks;
   const total = Math.max(1, w + c + rc);
   const bar = el('div', {
     class: 'cliplane', id: 'atkStrokeBar',

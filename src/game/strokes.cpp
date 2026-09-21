@@ -57,8 +57,58 @@ bool LoadAttackStyles(const std::string& path, StyleLibrary& out,
                             StrokeSegment{12, 0.30f, 0.10f, -0.05f});
     st.cut = ReadSegment(s.value("cut", json::object()),
                          StrokeSegment{7, -2.0f, 0.0f, 0.10f});
-    if (s.contains("recover") && s["recover"].is_object())
-      st.recoverTicks = std::max(1, s["recover"].value("ticks", 10));
+    // ---- THE RETURN (strokes.h StrokeRecover) ------------------------------
+    // Every field defaults to what a style written before this existed already
+    // did, and `posed` is derived rather than authored: stating an az, an el or
+    // a reach is what asks for a driven return, so there is no second switch to
+    // forget. A recover of `{ "ticks": 10 }` is the old four-line hand-back,
+    // byte for byte.
+    if (s.contains("recover") && s["recover"].is_object()) {
+      const auto& rv = s["recover"];
+      st.recover.ticks = std::max(1, rv.value("ticks", 10));
+      st.recover.posed =
+          rv.contains("az") || rv.contains("el") || rv.contains("reach");
+      st.recover.az = rv.value("az", 0.0f);
+      st.recover.el = rv.value("el", 0.0f);
+      st.recover.reach = rv.value("reach", 0.0f);
+      st.recover.settle = std::max(0, rv.value("settle", 0));
+      st.recover.fade = std::max(0, rv.value("fade", 0));
+      // A SETTLE WITH NOTHING TO SETTLE TO holds the arm at the end of the cut
+      // with the button still down and then drops it, which is the crossfade
+      // this whole block exists to remove, arrived at the long way round.
+      if (st.recover.settle > 0 && !st.recover.posed) {
+        log += path + ": style \"" + st.name +
+               "\" has `recover.settle` but no return pose (az/el/reach) — the "
+               "arm has nowhere to be driven, so the settle is ignored\n";
+        st.recover.settle = 0;
+      }
+      if (st.recover.settle > st.recover.ticks) {
+        log += path + ": style \"" + st.name + "\" settles for " +
+               std::to_string(st.recover.settle) + " of " +
+               std::to_string(st.recover.ticks) +
+               " recover ticks — clamped to the segment\n";
+        st.recover.settle = st.recover.ticks;
+      }
+      // ...AND THE FADE HAS TO FIT IN WHAT IS LEFT. The program ENDS at
+      // `ticks`, and the NPC drops its pose claim on that tick (mob.cpp pushes
+      // an empty WeaponPose). A fade still running when that happens is a
+      // PoseWeight stepping from whatever it had reached straight to 0 in one
+      // tick — which is exactly the snap melee.cpp:2430 was just fixed to
+      // remove, reintroduced from the content side. Extend the segment rather
+      // than shortening the fade: the author asked for that return, and the
+      // cost of honouring it is ticks, not a visible snap.
+      if (st.recover.fade > 0 &&
+          st.recover.settle + st.recover.fade > st.recover.ticks) {
+        const int want = st.recover.settle + st.recover.fade;
+        log += path + ": style \"" + st.name + "\" settles " +
+               std::to_string(st.recover.settle) + " + fades " +
+               std::to_string(st.recover.fade) + " = " + std::to_string(want) +
+               " ticks in a " + std::to_string(st.recover.ticks) +
+               "-tick recover — extended to " + std::to_string(want) +
+               " so the claim is not dropped mid-fade\n";
+        st.recover.ticks = want;
+      }
+    }
     if (s.contains("jitter") && s["jitter"].is_object()) {
       const auto& q = s["jitter"];
       st.jitter.az = q.value("az", 0.0f);
@@ -262,7 +312,15 @@ void BeginStrokeProgram(StrokeCursor& cur, const AttackStyle& sty,
       1.0f + sty.jitter.tempo * rng::SignedUnit(rng::Hash3(seed, 1, 0));
   cur.windupTicks = std::max(2, (int)std::lround(sty.windup.ticks * tempo));
   cur.cutTicks = std::max(2, (int)std::lround(sty.cut.ticks * tempo));
-  cur.recoverTicks = std::max(1, sty.recoverTicks);
+  // THE RECOVER IS NOT TEMPO-JITTERED, and that is deliberate rather than an
+  // omission. `tempo` exists so two duelists do not beat time together, and
+  // what carries that is the TELEGRAPH and the travel — the two segments an
+  // opponent reads. Scaling the return as well would make the settle and the
+  // fade drift out of the relationship the author set them in (settle + fade
+  // <= ticks, enforced at load), and buy nothing an onlooker can see.
+  cur.recoverTicks = std::max(1, sty.recover.ticks);
+  cur.settleTicks = std::clamp(sty.recover.posed ? sty.recover.settle : 0, 0,
+                               cur.recoverTicks);
   cur.phase = StrokeCursor::Phase::Windup;
   cur.phaseTick = 0;
 }
@@ -286,6 +344,22 @@ StrokeStepResult StepStrokeProgram(StrokeCursor& cur, const AttackStyle* sty,
       sty ? sty->jitter.az * rng::SignedUnit(rng::Hash3(cur.seed, 2, 0)) : 0.0f;
   const float bowEl =
       sty ? sty->jitter.el * rng::SignedUnit(rng::Hash3(cur.seed, 3, 0)) : 0.0f;
+  // ---- THIS STYLE'S OWN HAND-BACK CLOCK (StrokeRecover::fade) --------------
+  //
+  // Pushed every tick rather than once at the release, and from HERE rather
+  // than from BeginStrokeProgram, because this is the only function that holds
+  // both the style and the MeleeState — the program fields live on a cursor
+  // that has never seen a driver. It is idempotent (a float assignment), it
+  // costs nothing, and pushing it unconditionally is what guarantees a style
+  // that authors no fade RESTORES the global one: a MeleeState is reused
+  // across strokes (the player's is reused for the whole session), so a
+  // previous style's override would otherwise outlive it.
+  //
+  // Zero means "the global melee.recoverTime", which is what every style
+  // authored before `fade` existed asks for.
+  m.SetRecoverTime(sty != nullptr && sty->recover.fade > 0
+                       ? sty->recover.fade * dt
+                       : 0.0f);
   StrokeSample smp;
   smp.held = true;
   // THE CLOSED-LOOP, UNDER-COMMIT DRIVE, shared by Guard and Windup because
@@ -373,11 +447,33 @@ StrokeStepResult StepStrokeProgram(StrokeCursor& cur, const AttackStyle* sty,
       break;
     }
     case StrokeCursor::Phase::Recover: {
-      // Button RELEASED: the driver's own recover ramps PoseWeight down and
-      // hands the arm back to the walk cycle, which is the same hand-back the
-      // player gets and the reason nothing snaps here.
-      smp.held = false;
-      m.Step(smp, dt, true, right, up, fwd);
+      // ---- THE RETURN, IN TWO PARTS (strokes.h StrokeRecover) -------------
+      //
+      // SETTLE: the button is still DOWN and the arm is steered — closed-loop,
+      // under commitSpeed, the windup's own drive — from wherever the cut left
+      // it to the style's ABSOLUTE return stance. PoseWeight stays at 1 for
+      // every one of these ticks, so what the rig sees is an arm travelling a
+      // path an arm can travel, not a weight fading on a frozen pose.
+      //
+      // The pose is absolute for the reason the header states: a recover is a
+      // return to stance and not a second aim. `cur.wantAz`/`wantEl`/
+      // `wantReach` are written the same way the other two phases write them,
+      // so the tuner's readout and the gates report the return target in the
+      // same three fields they already read.
+      //
+      // Then RELEASE: exactly the old four lines. The driver clears
+      // `recoverHold_` and restarts its own clock at the release
+      // (melee.cpp:2430), so the fade is a full one measured from HERE rather
+      // than whatever was left of one that began back in the cut.
+      if (sty != nullptr && cur.phaseTick < cur.settleTicks) {
+        cur.wantAz = sty->recover.az;
+        cur.wantEl = sty->recover.el;
+        cur.wantReach = StrokeReachIn(m, sty->recover.reach);
+        steerTo(cur.wantAz, cur.wantEl, cur.wantReach);
+      } else {
+        smp.held = false;
+        m.Step(smp, dt, true, right, up, fwd);
+      }
       if (++cur.phaseTick >= cur.recoverTicks) return StrokeStepResult::Finished;
       break;
     }
