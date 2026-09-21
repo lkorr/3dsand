@@ -82,6 +82,7 @@
 #include "game/persist.h"
 #include "game/player.h"
 #include "game/prefab.h"
+#include "game/remoteplayer.h"
 #include "game/spell.h"
 #include "game/strike_pick.h"
 #include "game/thirdperson.h"
@@ -569,6 +570,18 @@ struct TickAuthorityCtx {
   std::function<void()> restoreCursorAfterUi;
   // --duel-dummy: spawn one armed target three metres ahead, once.
   bool duelDummy = false;
+
+  // ---- F. THE PEERS' BODIES (M9.2 package B, game/remoteplayer.h).
+  //
+  // Per-WORLD, not per-player: a ghost is somebody else's body standing in
+  // THIS world, and both local sessions of a split screen would see the same
+  // one. Owned by main() (the frame loop is what polls the socket), borrowed
+  // here, and NULL IN EVERY HARNESS — which is the point. Zero ghosts means
+  // phases B, H, I and O make no call they did not make before this package,
+  // and the one-session `--record-ops` stream is byte-identical to the
+  // pre-package oracle. That identity is the acceptance criterion; the
+  // guards at each of the four call sites are what buys it.
+  RemotePlayers* remotes = nullptr;
 };
 
 // ---- one tick of authority, for N players ---------------------------------
@@ -600,9 +613,14 @@ struct TickAuthorityCtx {
 // op stream — and the op stream's order is the tick's identity (CLAUDE.md rule
 // 3: the lowest op index owns the cell).
 //
-// WHERE A REMOTE GHOST PLUGS IN (M9.2): phase B (the interest set learns its
-// chunk, SetPlayerActors lists it) and phase I (its avatar's PreTick). NOT as
-// a SessionTick: no TickInput crosses the wire in the model of record
+// WHERE A REMOTE GHOST PLUGS IN (M9.2 package B — LANDED): phase B (the
+// interest set learns its chunk), phase H (SetPlayerActors lists it and the
+// avatar list is re-registered beside it), phase I (its avatar's PreTick) and
+// phase O (PostStep). Four guarded call sites on `TickAuthorityCtx::remotes`,
+// all no-ops when it is null or empty — see game/remoteplayer.h. The package
+// text said phase B for the actor list; the actor list has been phase H's
+// since P1 and the code is the truth. NOT as a
+// SessionTick: no TickInput crosses the wire in the model of record
 // (docs/PLAN_multiplayer_m9.md) — the peer is authoritative for its own
 // controller and sends the OUTCOME, a PlayerState, from which a ghost's
 // `Player` fields are filled and its PlayerAvatar driven. A ghost is a

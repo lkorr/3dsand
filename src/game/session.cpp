@@ -205,6 +205,10 @@ struct WorldScratch {
   // The NPC targeting layer's player list, rebuilt each tick in phase H. Held
   // here rather than declared there so the per-tick rebuild does not allocate.
   std::vector<MobSystem::PlayerActorDesc> actors;
+  // The sessions' avatars, for the M9.2 ghost re-registration in phase H.
+  // Same reason as `actors`: held here so the rebuild does not allocate. Only
+  // ever filled when there is at least one ghost AND its membership changed.
+  std::vector<Mob*> sessionAvatars;
 };
 
 // PER-SESSION TICK SCRATCH, same rule: a local whose live range crossed a
@@ -558,6 +562,15 @@ static void PhaseB(TickAuthorityCtx& w, WorldScratch& ws,
         interest.chunks.push_back(
             {ifloor(pp.x) >> 4, ifloor(pp.y) >> 4, ifloor(pp.z) >> 4});
       }
+      // ...AND THE PEERS' BODIES (M9.2 package B). Appended after every local
+      // session, so `primary = 0` still names session 0 and the window still
+      // follows the window's own player. Information only: nothing downstream
+      // consumes an entry past `primary` yet, which is exactly why adding
+      // them cannot move a byte. Guarded on non-empty so a single-player
+      // process makes no call here at all — the oracle op record is the
+      // proof and the guard is what earns it.
+      if (w.remotes != nullptr && !w.remotes->list.empty())
+        RemotePlayersAppendInterest(*w.remotes, interest);
       interest.primary = 0;
       farCount = 0;
       {
@@ -1393,6 +1406,26 @@ static void PhaseH(TickAuthorityCtx& w, WorldScratch& ws,
                                : (!pl.avatar.Spawned() || pl.avatar.IsAlive());
         ws.actors.push_back({pl.player.pos, Player::kHalfXZ,
                              Player::kHalfY * 2.0f, alive});
+      }
+      // THE PEERS' BODIES ARE TARGETS TOO (M9.2 package B). Appended AFTER
+      // every local session because the actor id band is POSITIONAL: entry i
+      // of this list is `ai::kPlayerActorBase + i`, so a ghost appended at
+      // index `sessions + j` is what an NPC names when it targets that id.
+      // The avatar list MobSystem::FindCombatantById resolves that index
+      // through is rebuilt in the same breath, and only on a membership
+      // change — the two lists agreeing is what keeps an NPC that targets a
+      // ghost from resolving to the local player's body.
+      if (w.remotes != nullptr && !w.remotes->list.empty()) {
+        RemotePlayersAppendActors(*w.remotes, ws.actors);
+        if (w.remotes->dirty) {
+          ws.sessionAvatars.clear();
+          for (SessionTick& p : players)
+            ws.sessionAvatars.push_back(static_cast<Mob*>(&p.s->avatar));
+          RemotePlayersSyncAvatars(
+              *w.remotes, mobs,
+              std::span<Mob* const>(ws.sessionAvatars.data(),
+                                    ws.sessionAvatars.size()));
+        }
       }
       mobs.SetPlayerActors(ws.actors);
 
@@ -3012,6 +3045,17 @@ void TickAuthority(TickAuthorityCtx& w, std::span<SessionTick> players,
   PhaseH(w, ws, players, scratch, tick, out);
   for (size_t i = 0; i < players.size(); i++)
     PhaseI(w, ws, players[i], scratch[i], tick, out);
+  // THE PEERS' AVATARS, IN PHASE I's SLOT, AFTER THE LOCAL SESSIONS'
+  // (M9.2 package B). Here rather than inside PhaseI because a ghost is not a
+  // session — it has no TickInput, no camera and no presentation seam — but
+  // its AVATAR is an avatar, and an avatar's rig has to be driven before
+  // debris.PreTick (phase J) consumes the terrain anchors and before the
+  // physics step. The ops it authors are thrown away; game/remoteplayer.h's
+  // header says why, and the short version is that its owner is authoring
+  // the same ones on its own machine.
+  if (w.remotes != nullptr && !w.remotes->list.empty())
+    RemotePlayersPreTick(*w.remotes, tick, kTickDt, w.world, w.phys, w.mobs,
+                         w.debris, w.mats, players[0].s->avatarDefName);
   PhaseJ(w, ws, players, scratch, tick, out);
   for (size_t i = 0; i < players.size(); i++)
     PhaseK(w, ws, players[i], scratch[i], tick, out);
@@ -3021,6 +3065,11 @@ void TickAuthority(TickAuthorityCtx& w, std::span<SessionTick> players,
   PhaseN(w, ws, players, scratch, tick, out);
   for (size_t i = 0; i < players.size(); i++)
     PhaseO(w, ws, players[i], scratch[i], tick, out);
+  // The ghosts' post-solver settle, in phase O's slot. No ragdoll follow and
+  // no push-out: those write a position, and a ghost's position is the
+  // wire's (game/remoteplayer.h, RemotePlayersPostStep).
+  if (w.remotes != nullptr && !w.remotes->list.empty())
+    RemotePlayersPostStep(*w.remotes);
   PhaseP(w, ws, players, scratch, tick, out);
 
   // The span is billed by phase L's Close(); releasing it here keeps the

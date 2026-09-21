@@ -489,6 +489,10 @@ add_library(sandvox_core OBJECT
   # PlayerSession is one player; TickAuthority is one tick of gameplay, moved
   # out of the middle of main()'s frame loop. See src/game/session.h.
   src/game/session.cpp
+  # THE PEERS' BODIES (docs/PLAN_multiplayer_m9.md M9.2 package B). A ghost is
+  # a PlayerAvatar driven from a peer's PlayerState OUTCOME, not a re-simulated
+  # controller. See src/game/remoteplayer.h.
+  src/game/remoteplayer.cpp
   # The acceptance gate. support.cpp holds the sim/render plumbing that main.cpp
   # and the gates share; each selftest_*.cpp is one domain's gates. Split out of
   # main.cpp so `--gate <name>` can run one in seconds and so two agents editing

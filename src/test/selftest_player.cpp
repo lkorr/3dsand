@@ -18,6 +18,8 @@
 #include "game/avatar.h"
 #include "game/mob.h"
 #include "game/player.h"
+#include "game/remoteplayer.h"  // the ghost seams: `remote-ghost` calls the
+                               // SAME free functions session.cpp's phases do
 #include "game/session.h"   // PrefetchChunksAround -- the gate and the real
                             // tick must call ONE definition of it
 #include "sim/materials.h"
@@ -1584,6 +1586,425 @@ Status GateTwoPlayers(Ctx& c, std::string& detail) {
   return ok ? Status::Pass : Status::Fail;
 }
 
+// ---- remote-ghost -----------------------------------------------------------
+//
+// A PEER'S BODY, DRIVEN FROM ITS OUTCOME, AUTHORING NOTHING.
+//
+// This is M9.2 package B's proof (docs/PLAN_multiplayer_m9.md). `two-players`
+// above asserted that two LOCAL bodies can share one world; this asserts the
+// other shape — a body whose controller ran on another machine, which arrives
+// here as a `PlayerState` and is never re-simulated. The claims, in order:
+//
+//   1. A ghost fed a state stream SPAWNS, and does so on the first state
+//      (by tick 2, since the stream starts at tick 0).
+//   2. IT GOES WHERE IT IS TOLD, every tick it is alive: the rig's root,
+//      reconstructed from `Mob::Origin()` and the def's box, is within half a
+//      voxel of the state's `pos`. A ghost that lagged, drifted or hovered
+//      moves this number, and the WORST over all ticks is kept rather than an
+//      end-of-run sample — a body that drifted and was corrected later reads
+//      perfectly at tick 300.
+//   3. THE WIRE OWNS ITS LIFE. `alive=false` in the stream despawns it and
+//      `alive=true` brings it back. Local damage does not decide this.
+//   4. IT IS A TARGET, by its BANDED actor id. The band is positional
+//      (`ai::kPlayerActorBase + i` is entry i of the actor list), so a ghost
+//      appended after one session is `+ 1`; a hostile creature standing beside
+//      it must name that id, and `FindCombatantById` must resolve the id to
+//      the GHOST's avatar and not to the local player's.
+//   5. IT AUTHORS NOTHING. Two claims, and both are needed: the ghost's avatar
+//      DID try to author (the throw-away vectors were non-empty at least once
+//      — without that half the next line is a fixture that cannot fail), and
+//      NONE of it reached the real batch (the real op vectors do not grow
+//      across `RemotePlayersPreTick`, checked every tick).
+//   6. The twice-run contract, as `two-players` states it.
+//
+// EVERY ONE OF THOSE RUNS THROUGH THE FREE FUNCTIONS session.cpp's PHASES CALL
+// (game/remoteplayer.h). The gate does not reimplement the per-ghost sequence:
+// a fixture carrying its own copy would keep passing while the real phase
+// drifted out from under it, which is the "fixture that measures itself" trap.
+//
+// THE WINDOW IS PART OF THE FIXTURE, for the reason `two-players` spells out
+// at length: anchoring to `world.WindowOrigin()` makes every pinned number a
+// function of which gates ran first, and that is CLAUDE.md rule 7 arriving as
+// a pinned value instead of as a verdict. It reuses `kTwoPlayerOrigin` and
+// `TwoPlayerFlatSpot` above — same TU, same anonymous namespace, so this is
+// one definition and not the third copy that note warns about.
+constexpr int kGhostTicks = 300;
+constexpr int kGhostWalkStart = 8;     // first tick the ghost is walking
+constexpr int kGhostWalkEnd = 88;      // last; 80 ticks x 2 vox = 160 voxels
+constexpr int kGhostStepVox = 2;       // the stream's walk speed, vox/tick
+constexpr int kGhostJumpTick = 60;     // the one jump edge
+constexpr int kGhostCrouchFrom = 100;
+constexpr int kGhostCrouchTo = 140;
+// ONE HARD LANDING, AND IT IS NOT DECORATION. A healthy walking avatar
+// authors NOTHING — footfalls are events, not ops, and bleeding needs a
+// wound — so without this the gate's claim 5 has no first half and the
+// "leaked 0" half becomes a fixture that cannot fail. Measured: 300 ticks of
+// a walking, jumping, crouching ghost produced 0 ops. `impactDeltaV` is the
+// wire's one-tick edge for exactly this, so the script delivers one landing
+// and the avatar's fall-damage path wounds it and bleeds for the rest of the
+// run. 120 vox/s at kVoxelMeters = 0.10 is 12 m/s: over player.fallDamageSpeed
+// (8) so it wounds, well under player.fallSplatSpeed (25) so it does not kill
+// — killing it here would make claim 3 ("the wire owns its life") a lie.
+constexpr int kGhostLandTick = 150;
+constexpr float kGhostLandDeltaV = 120.0f;  // voxels/s, downward
+constexpr int kGhostDieTick = 200;     // alive=false from here...
+constexpr int kGhostReviveTick = 240;  // ...alive again from here
+// Read the creature's target BEFORE the scripted death: a despawned actor is
+// not a target and the creature correctly drops it, so sampling at tick 300
+// would be asserting the re-acquisition timer rather than the band.
+constexpr int kGhostTargetProbeTick = 190;
+
+// What one arm measured.
+struct GhostArm {
+  int spawnTick = -1;         // first tick the ghost's avatar was spawned
+  float worstPosErr = 0;      // rig root vs state pos, voxels, over all ticks
+  int worstPosErrTick = -1;
+  // How many ticks the comparison above actually RAN on. A perfectly placed
+  // rig reports 0.0000 vox forever, which is indistinguishable from a
+  // comparison that never executed — the gate asserts this instead of the
+  // worst-case tick index, which is -1 in the healthy case.
+  int posSamples = 0;
+  bool deadWhileDead = true;  // despawned for the whole scripted death
+  bool aliveAfterRevive = false;
+  uint64_t discarded = 0;     // ops the ghost authored and we threw away
+  int firstDiscardTick = -1;
+  uint64_t leaked = 0;        // ops that reached the REAL batch. Must be 0.
+  uint64_t mobId = 0, mobTarget = 0;
+  bool mobBrain = false;
+  bool combatantOk = false;
+  float mobToGhost = 0, mobToLocal = 0;
+  std::vector<uint32_t> hashes;
+  std::string why;
+};
+
+// The scripted outcome for one tick, as it would have arrived off the wire.
+// A pure function of the tick: the whole point of `PlayerState` is that it is
+// a RESULT, so the fixture writes results rather than driving a controller.
+PlayerState GhostScript(int tick, const IVec3& site, uint32_t seed) {
+  PlayerState st;
+  st.tick = (uint32_t)tick;
+  st.playerId = 7;  // the id is the WIRE's, not an index: deliberately not 0/1
+  const int walked = kGhostStepVox * std::clamp(tick - kGhostWalkStart, 0,
+                                                kGhostWalkEnd - kGhostWalkStart);
+  const int x = site.x + walked;
+  // The ground under the ghost, analytically. The OWNER resolved this against
+  // its own mirror; here it is just a number that arrived, which is exactly
+  // the fiction `PlayerState` encodes.
+  const int h = World::TerrainHeight(x, site.z, seed);
+  st.pos = Vec3{(float)x + 0.5f, (float)(h + 1) + Player::kHalfY,
+                (float)site.z + 0.5f};
+  const bool walking = tick >= kGhostWalkStart && tick < kGhostWalkEnd;
+  st.vel = Vec3{walking ? (float)kGhostStepVox / kTickDt : 0.0f, 0, 0};
+  st.heading = 1.5707963f;  // facing +X: a mob's forward is (sin h, ., cos h)
+  st.lookYaw = 0;
+  st.lookPitch = 0;
+  st.Set(PlayerState::kGrounded, true);
+  st.Set(PlayerState::kAlive, tick < kGhostDieTick || tick >= kGhostReviveTick);
+  // ONE TICK, not a block: `jumped` is an EDGE and the avatar's jump clip keys
+  // on its rising edge, so a flag held for two ticks would be testing the
+  // script rather than the drain.
+  st.Set(PlayerState::kJumped, tick == kGhostJumpTick);
+  st.Set(PlayerState::kCrouching,
+         tick >= kGhostCrouchFrom && tick < kGhostCrouchTo);
+  // The other one-tick edge, same rule: one tick only.
+  if (tick == kGhostLandTick) st.impactDeltaV = Vec3{0, -kGhostLandDeltaV, 0};
+  st.health = 100;
+  return st;
+}
+
+void RunGhostArm(Ctx& c, GhostArm& a) {
+  c.debris.Reset();
+  // rewindIds: mob ids seed gore variance and blast noise, so the second arm
+  // must start its id counter where the first did or the two runs are not the
+  // same experiment.
+  c.mobs.Reset(true);
+  c.mobs.ClearRisings();
+  c.world.SetWindowOrigin(kTwoPlayerOrigin);
+  SubmitWorldgen(c.ctx, c.world, c.sim, kDefaultSeed);
+  c.ctx.WaitIdle();
+
+  const std::vector<uint32_t> classOf = BuildCollisionClasses(c.mats);
+  const int cx = (kTwoPlayerOrigin.x + (int)kNChunk / 2) * (int)kChunk;
+  const int cz = (kTwoPlayerOrigin.z + (int)kNChunk / 2) * (int)kChunk;
+  int reliefL = 0, reliefG = 0;
+  // The LOCAL player stands well clear in +X and never moves. The only thing
+  // it has to be is unambiguously the FARTHER of the two actors, so that "the
+  // creature named the ghost" is a claim about the band and not a coin flip.
+  const IVec3 siteLocal =
+      TwoPlayerFlatSpot(cx + 176, cz, 24, kDefaultSeed, reliefL);
+  // The ghost's path starts here and runs +X for 160 voxels, ending ~112
+  // voxels short of the local player and comfortably inside the window.
+  const IVec3 siteGhost =
+      TwoPlayerFlatSpot(cx - 96, cz, 24, kDefaultSeed, reliefG);
+
+  Player local;
+  local.fly = false;
+  local.pos = Vec3{(float)siteLocal.x + 0.5f,
+                   (float)(siteLocal.y + 1) + Player::kHalfY,
+                   (float)siteLocal.z + 0.5f};
+  local.SnapRender();
+  auto kindLocal = [&](IVec3 cell) { return c.world.KindAt(cell, classOf); };
+
+  PlayerAvatar av0(0x5A11EDU);
+  av0.Init(&c.phys, &c.world, &c.debris, c.mats, &c.mobs);
+  av0.SetDefs(&c.mobs.Defs(), kAvatarDefName);
+  if (!av0.HasDef()) {
+    a.why = std::string("no mob def named \"") + kAvatarDefName + "\"";
+    return;
+  }
+  av0.Spawn(local, 0.0f);
+  const uint64_t pb0 = c.phys.CreatePlayerBody(Player::kHalfXZ, Player::kHalfY);
+
+  // ---- the ghost ---------------------------------------------------------
+  // `Upsert` only allocates. The first `Apply` + `RemotePlayersPreTick` pair
+  // inside the loop is what spawns it, which is claim 1.
+  RemotePlayers remotes;
+  RemotePlayer& ghost = remotes.Upsert(7);
+
+  // ---- one hostile creature, beside the ghost's path ---------------------
+  // The same "crowder" fixture `two-players` uses and for the same reason:
+  // mobile, hostile, wants a target, carries no attack intent and no styles,
+  // so it is a targeting probe with none of a duelist's knife-fight noise.
+  int defIndex = -1;
+  for (size_t i = 0; i < c.mobs.Defs().size(); i++) {
+    if (c.mobs.Defs()[i].FindSocket("held_right") < 0) continue;
+    if (defIndex < 0 || c.mobs.Defs()[i].name == "human") defIndex = (int)i;
+  }
+  if (defIndex < 0) {
+    a.why = "no mob def publishes a held_right socket";
+    return;
+  }
+  const int mx = siteGhost.x + 14, mz = siteGhost.z;
+  a.mobId = c.mobs.Spawn(
+      defIndex, {mx, World::TerrainHeight(mx, mz, kDefaultSeed) + 1, mz});
+  if (a.mobId == 0) {
+    a.why = "Spawn refused for the hostile fixture";
+    return;
+  }
+  if (!c.mobs.SetMobBehavior(a.mobId, "crowder")) {
+    a.why = "no behaviour profile \"crowder\" in assets/mobs/behaviors.json";
+    return;
+  }
+
+  // The local player holds nothing down for the whole run: this gate is about
+  // the ghost, and a walking local body would only add noise to "which actor
+  // is nearer".
+  TickInput idle;
+  idle.flatFwd = Vec3{1, 0, 0};
+  idle.right = Vec3{0, 0, 1};
+  idle.lookFwd = idle.flatFwd;
+
+  uint32_t tick = 9000;
+  for (int i = 0; i < kGhostTicks; i++) {
+    // ---- the wire delivers one state ----------------------------------
+    // Before the local tick, as the model requires: the batch labelled tick T
+    // is applied before tick T runs, so every phase below sees ONE consistent
+    // outcome for the peer.
+    ghost.Apply(GhostScript(i, siteGhost, c.world.WorldSeed()));
+
+    // ---- PHASE A / B (the local session, then the interest set) --------
+    local.Update(kTickDt, idle, kindLocal);
+    InterestSet interest;
+    interest.chunks.push_back({ifloor(local.pos.x) >> 4,
+                               ifloor(local.pos.y) >> 4,
+                               ifloor(local.pos.z) >> 4});
+    RemotePlayersAppendInterest(remotes, interest);
+    interest.primary = 0;
+    if (interest.chunks.size() != 2 && a.why.empty())
+      a.why = "RemotePlayersAppendInterest did not add the ghost's chunk";
+
+    // ---- PHASE H: the actor list, the avatar list, then the NPCs -------
+    std::vector<MobSystem::PlayerActorDesc> actors;
+    actors.push_back({local.pos, Player::kHalfXZ, Player::kHalfY * 2.0f, true});
+    RemotePlayersAppendActors(remotes, actors);
+    if (remotes.dirty) {
+      Mob* sessionAvatars[1] = {&av0};
+      RemotePlayersSyncAvatars(remotes, c.mobs,
+                               std::span<Mob* const>(sessionAvatars, 1));
+    }
+    c.mobs.SetPlayerActors(std::span<const MobSystem::PlayerActorDesc>(
+        actors.data(), actors.size()));
+
+    // THE REAL BATCH. Everything the local session and the world author goes
+    // here; the ghost's goes into `remotes.scratch*` and is counted, never
+    // appended. Sizes are snapshotted around the ghost call below so a leak is
+    // caught on the tick it happens rather than at the end of 300 of them.
+    std::vector<BrushOp> ops;
+    std::vector<CellOp> cellOps;
+    std::vector<ParticleSpawn> spawns;
+    c.mobs.PreTick(tick + 1, c.world, ops, cellOps, spawns);
+
+    // ---- PHASE I: the local avatar, then the ghosts --------------------
+    av0.PreTick(tick + 1, local, 0.0f, kTickDt, c.world, ops, cellOps, spawns);
+    const size_t realBefore = ops.size() + cellOps.size() + spawns.size();
+    const uint64_t discardBefore = remotes.discardedOps;
+    RemotePlayersPreTick(remotes, tick + 1, kTickDt, c.world, c.phys, c.mobs,
+                         c.debris, c.mats, kAvatarDefName);
+    const size_t realAfter = ops.size() + cellOps.size() + spawns.size();
+    a.leaked += (uint64_t)(realAfter - realBefore);
+    if (remotes.discardedOps > discardBefore && a.firstDiscardTick < 0)
+      a.firstDiscardTick = i;
+
+    // ---- PHASE J (world).
+    c.debris.QueueSupportEvents(c.world.Snap());
+    c.debris.PreTick(tick + 1, c.world, cellOps, spawns);
+
+    ++tick;
+    c.phys.MovePlayerBody(pb0, local.pos, kTickDt);
+    // The mirror is centred on the LOCAL player, as in the game: the ghost
+    // does not move the window (RemotePlayersAppendInterest is information
+    // only until M9.3 decides chunk authority).
+    const IVec3 pc{ifloor(local.pos.x) >> 4, ifloor(local.pos.y) >> 4,
+                   ifloor(local.pos.z) >> 4};
+    // Six hash reads per arm rather than 300: a blocking readback, and a
+    // divergence does not heal (CLAUDE.md's verification budget).
+    const bool wantHash = (i % 60) == 59 || i == kGhostTicks - 1;
+    SubmitTick(c.ctx, c.world, c.sim, tick, kDefaultSeed, ops, {}, cellOps,
+               wantHash, pc, true, false, spawns);
+    c.ctx.WaitIdle();
+    c.ctx.ProcessEvents();
+    if (wantHash) a.hashes.push_back(ReadHashSync(c.ctx, c.world));
+    c.phys.Step(kTickDt);
+    c.debris.PostStep();
+    c.mobs.PostStep();
+    av0.PostStep();
+    // ---- PHASE O: the ghosts' settle.
+    RemotePlayersPostStep(remotes);
+
+    // ---- the assertions that have to be made EVERY tick ----------------
+    const bool wantAlive = ghost.last.Has(PlayerState::kAlive);
+    if (ghost.spawned && a.spawnTick < 0) a.spawnTick = i;
+    if (i >= kGhostDieTick && i < kGhostReviveTick && ghost.spawned)
+      a.deadWhileDead = false;
+    if (i == kGhostTicks - 1) a.aliveAfterRevive = ghost.spawned;
+    // WHERE THE RIG ACTUALLY IS. `Mob::Origin()` is the low corner of the
+    // def's box (avatar.cpp's PreTick sets it from the player's pos), so the
+    // root is recovered by adding back half the box in x/z and kHalfY in y.
+    // Reconstructed from the RIG rather than read back off `ghost.ghost.pos`,
+    // which would be comparing the fixture's own input against itself.
+    if (wantAlive && ghost.spawned) {
+      if (const MobDef* def = ghost.avatar.Def()) {
+        const Vec3 o = ghost.avatar.Origin();
+        const Vec3 root{o.x + def->worldSize.x * 0.5f, o.y + Player::kHalfY,
+                        o.z + def->worldSize.z * 0.5f};
+        const Vec3 d = root - ghost.last.pos;
+        const float err = d.len();
+        a.posSamples++;
+        if (err > a.worstPosErr) {
+          a.worstPosErr = err;
+          a.worstPosErrTick = i;
+        }
+      }
+    }
+    if (i == kGhostTargetProbeTick) {
+      const ai::Brain* br = c.mobs.MobBrain(a.mobId);
+      a.mobBrain = br != nullptr;
+      if (br != nullptr) a.mobTarget = br->hasTarget ? br->targetId : 0;
+      // The band resolves to the RIGHT body: base+1 is the GHOST and base+0 is
+      // still the local session. Two claims, checked separately — a band that
+      // resolved both to the same avatar would satisfy the first alone.
+      a.combatantOk = c.mobs.FindCombatantById(ai::kPlayerActorBase + 1) ==
+                          (Mob*)&ghost.avatar &&
+                      c.mobs.FindCombatantById(ai::kPlayerActorBase + 0) ==
+                          (Mob*)&av0;
+      const Vec3 mo = c.mobs.MobOrigin(a.mobId);
+      const float dgx = mo.x - ghost.last.pos.x, dgz = mo.z - ghost.last.pos.z;
+      const float dlx = mo.x - local.pos.x, dlz = mo.z - local.pos.z;
+      a.mobToGhost = std::sqrt(dgx * dgx + dgz * dgz);
+      a.mobToLocal = std::sqrt(dlx * dlx + dlz * dlz);
+    }
+  }
+  a.discarded = remotes.discardedOps;
+
+  // Leave nothing behind: the avatars own limb bodies, the proxies are Jolt
+  // bodies, and the mob list is shared with every later gate.
+  remotes.Clear(c.phys);
+  av0.Despawn();
+  c.mobs.SetAvatars({});
+  c.mobs.ClearPlayerActors();
+  c.phys.RemoveBody(pb0);
+  c.debris.Reset();
+  c.mobs.Reset(true);
+  c.mobs.ClearRisings();
+}
+
+Status GateRemoteGhost(Ctx& c, std::string& detail) {
+  const IVec3 savedOrigin = c.world.WindowOrigin();
+  GhostArm a, b;
+  RunGhostArm(c, a);
+  if (a.why.empty()) RunGhostArm(c, b);
+  // Put the window back and regenerate: this gate moved the origin and
+  // regenerated the world twice, and every gate after it in kOrder assumes
+  // worldgen it did not move (selftest.h's ordering note).
+  c.world.SetWindowOrigin(savedOrigin);
+  SubmitWorldgen(c.ctx, c.world, c.sim, kDefaultSeed);
+  c.ctx.WaitIdle();
+  if (!a.why.empty()) {
+    detail = a.why;
+    std::printf("remote ghost: FAIL (%s)\n", detail.c_str());
+    return Status::Fail;
+  }
+
+  // (1) SPAWNED ON THE FIRST STATE.
+  const bool spawnOk = a.spawnTick >= 0 && a.spawnTick <= 2;
+  // (2) WHERE IT WAS TOLD TO BE. Half a voxel: the rig's root is placed from
+  // `pos` directly, so the only slack is the box reconstruction's rounding.
+  const double posTol = BaselineNumber("remoteGhost.posTolVox", 0.5);
+  // The sample count is half the claim: a tolerance test over zero samples
+  // passes, and a rig placed exactly reports 0.0000 forever. Most of the 300
+  // ticks are alive+spawned, so anything under 200 means the ghost spent the
+  // run despawned and the position was never actually compared.
+  const bool posOk = a.worstPosErr <= (float)posTol && a.posSamples >= 200;
+  // (3) THE WIRE OWNS ITS LIFE.
+  const bool lifeOk = a.deadWhileDead && a.aliveAfterRevive;
+  // (4) THE BAND, and the creature that uses it.
+  const bool nearer = a.mobToGhost < a.mobToLocal;
+  const bool targetOk = a.mobBrain && a.combatantOk && nearer &&
+                        a.mobTarget == ai::kPlayerActorBase + 1;
+  // (5) IT TRIED TO AUTHOR, AND NOTHING GOT OUT. Both halves, or this is a
+  // fixture that cannot fail.
+  const bool triedOk = a.discarded > 0 && a.firstDiscardTick >= 0;
+  const bool noLeakOk = a.leaked == 0;
+  // (6) THE TWICE-RUN CONTRACT. Not a pin — a reproduction. This is the only
+  // claim here whose failure is a stop-and-report bug rather than a number.
+  const bool detOk = !a.hashes.empty() && a.hashes == b.hashes &&
+                     a.discarded == b.discarded &&
+                     a.posSamples == b.posSamples &&
+                     a.worstPosErrTick == b.worstPosErrTick;
+
+  // Recorded so a future failure can say WHICH WAY the fixture moved rather
+  // than only that it did (CLAUDE.md rule 6).
+  RecordObserved("remoteGhost.spawnTick", (double)a.spawnTick);
+  RecordObserved("remoteGhost.worstPosErrVox", (double)a.worstPosErr);
+  RecordObserved("remoteGhost.posSamples", (double)a.posSamples);
+  RecordObserved("remoteGhost.discardedOps", (double)a.discarded);
+  RecordObserved("remoteGhost.firstDiscardTick", (double)a.firstDiscardTick);
+  RecordObserved("remoteGhost.leakedOps", (double)a.leaked);
+
+  const bool ok =
+      spawnOk && posOk && lifeOk && targetOk && triedOk && noLeakOk && detOk;
+  char buf[760];
+  std::snprintf(
+      buf, sizeof buf,
+      "%d ticks x2: spawned tick %d (want <= 2) | worst root-vs-state %.4f vox "
+      "at tick %d over %d samples (tol %.2f) | dead %d..%d held %d, revived %d "
+      "| authored %llu ops, ALL discarded (first at tick %d), leaked %llu | "
+      "mob %llu targets %llx (want %llx) at tick %d, d(ghost)=%.1f "
+      "d(local)=%.1f, band resolves %d | hashes %zu %s",
+      kGhostTicks, a.spawnTick, a.worstPosErr, a.worstPosErrTick, a.posSamples,
+      posTol,
+      kGhostDieTick, kGhostReviveTick, a.deadWhileDead ? 1 : 0,
+      a.aliveAfterRevive ? 1 : 0, (unsigned long long)a.discarded,
+      a.firstDiscardTick, (unsigned long long)a.leaked,
+      (unsigned long long)a.mobId, (unsigned long long)a.mobTarget,
+      (unsigned long long)(ai::kPlayerActorBase + 1), kGhostTargetProbeTick,
+      a.mobToGhost, a.mobToLocal, a.combatantOk ? 1 : 0, a.hashes.size(),
+      detOk ? "reproduced" : "DIVERGED between the two runs");
+  detail = buf;
+  std::printf("remote ghost: %s (%s)\n", ok ? "PASS" : "FAIL", buf);
+  return ok ? Status::Pass : Status::Fail;
+}
+
 }  // namespace
 
 const std::vector<Gate>& PlayerGates() {
@@ -1596,6 +2017,7 @@ const std::vector<Gate>& PlayerGates() {
       {"player-fastfall", "player", {}, false, GatePlayerFastFall},
       {"tick-input", "player", {}, false, GateTickInput},
       {"two-players", "player", {}, false, GateTwoPlayers},
+      {"remote-ghost", "player", {}, false, GateRemoteGhost},
   };
   return g;
 }
