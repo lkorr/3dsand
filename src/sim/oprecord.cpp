@@ -35,6 +35,12 @@ uint64_t g_recBytes = 0;
 uint32_t g_recFrames = 0;
 const Log* g_replay = nullptr;
 uint32_t g_replayMismatch = 0, g_replayFirstTick = 0, g_replayFirstWord = 0;
+// The two VALUES behind that word index, and how many DISTINCT words ever
+// differed. CLAUDE.md rule 6: "416 words rebuilt differently" is a bare count
+// and buys one hypothesis per run; "word 8 was 1714 in the record and 1712 on
+// replay, 6 distinct words in all" names the field.
+uint32_t g_replayFirstRec = 0, g_replayFirstNow = 0;
+std::vector<uint32_t> g_replayWords;
 // The gen list Stream reported for a tick that has not been framed yet.
 uint32_t g_genTick = 0xFFFFFFFFu;
 std::vector<uint32_t> g_genSlots;
@@ -293,7 +299,12 @@ void RecordFrame(const TickInputs& in, const TickParams& tp,
         if (g_replayMismatch == 0) {
           g_replayFirstTick = in.tick;
           g_replayFirstWord = (uint32_t)i;
+          g_replayFirstRec = a[i];
+          g_replayFirstNow = c[i];
         }
+        if (std::find(g_replayWords.begin(), g_replayWords.end(),
+                      (uint32_t)i) == g_replayWords.end())
+          g_replayWords.push_back((uint32_t)i);
         g_replayMismatch++;
       }
       break;
@@ -357,10 +368,16 @@ const Log* Replay() { return g_replay; }
 uint32_t ReplayParamMismatches() { return g_replayMismatch; }
 uint32_t ReplayFirstMismatchTick() { return g_replayFirstTick; }
 uint32_t ReplayFirstMismatchWord() { return g_replayFirstWord; }
+uint32_t ReplayFirstMismatchRecorded() { return g_replayFirstRec; }
+uint32_t ReplayFirstMismatchRebuilt() { return g_replayFirstNow; }
+const std::vector<uint32_t>& ReplayMismatchWords() { return g_replayWords; }
 void ResetReplayStats() {
   g_replayMismatch = 0;
   g_replayFirstTick = 0;
   g_replayFirstWord = 0;
+  g_replayFirstRec = 0;
+  g_replayFirstNow = 0;
+  g_replayWords.clear();
 }
 
 void ReplaceGasIfReplaying(uint32_t tick, std::vector<GasSpawnOp>& gas) {

@@ -13043,6 +13043,40 @@ tool the day it lands rather than netcode nobody exercises.
   to move the residency window or the far cascades. One point today, and one
   place for the second point to be declared.
 
+**The authority / presentation boundary (package N5).** A tick of gameplay is
+now `TickAuthority(...)` in `src/game/session.cpp`, and one player is
+`PlayerSession` in `src/game/session.h`. Before this the two were the same
+thing: per-player state was forty-odd locals in `main()` and the tick body was
+2,400 lines in the middle of the frame loop, so "a second player" had no shape
+and no line in the file said which of the ninety names the tick touched were
+the player's, the world's or the window's. `TickAuthorityCtx` now says it in
+five labelled sections — the engine, the content, the PRESENTATION seam
+(`UIState`, the hit-stop dip, the death-screen photograph, the live timers:
+what a headless server would pass a dummy for), the per-world tick scratch it
+owns, and the argv-owned harness hooks — and the frame loop keeps only what is
+genuinely the frame's: the accumulator and the GPU-lag throttle, the readback
+pump, the park probe, and the handover of one `TickInput` from
+`TickInputFeeder`. That handover IS the boundary. `MobSystem` took the same
+shape: `SetAvatars(span)` and `SetPlayerActors(span)` replace the single avatar
+pointer and the single player-actor slot, and every handle- or id-keyed lookup
+walks the list instead of falling through one pointer; actor id `i` is
+`avatars_[i]`, so 0 is still the local player. **Nothing about a tick changed**,
+and that is a measurement rather than an intention: a recorded 600-tick
+`--frames 600 --autofly-hard` op stream is byte-identical across the move
+(8,738,460 bytes, 600 frames, `cmp` clean). The control arm — two runs of the
+same binary — needed `SANDVOX_TICKS_PER_FRAME`, because the frame loop's tick
+schedule and the OS cursor are both wall-clock inputs and an unattended
+`--autofly-hard` run had never been quite reproducible without it.
+
+What this does NOT yet do is give the session an id, a transport or a second
+instance. `main()` still holds one alias reference per `PlayerSession` member so
+the presentation half of the file keeps its names; the reserved player id band
+in `MobSystem::nextId_` does not exist, so a second session's actor id would
+collide with mob id 1; and `WaterBodies()` is still keyed on the residency
+window origin. That last one is rule 1 below, and it is restated at the top of
+`session.h` and over the `WaterBodies()` accessor, where the next person to add
+one will read it.
+
 **What M9 still needs** (the audit's "later" column, against the tree above):
 transport and lobby (Steam / WebRTC; browser builds have no raw UDP, and both
 an ordered op stream and a chunk re-send survive a WebSocket or DataChannel

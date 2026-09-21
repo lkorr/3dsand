@@ -820,6 +820,20 @@ bool WaterBodyNoteSwimmer(WaterBodySystem& wb, int cellX, int cellZ,
 // Every path leaves it EMPTY at `sim.waterBodyMode` 0, and empty is an exact
 // identity all the way down: the pinned world hash is untouched by the
 // existence of this file.
+//
+// ---- AND IT IS THE ONE SIM-AFFECTING GLOBAL KEYED ON THE WINDOW -----------
+//
+// game/session.h states the rule that comes out of package N5: per-player state
+// lives in PlayerSession, and a sim-affecting process global must not be keyed
+// on the RESIDENCY WINDOW ORIGIN. This one is (Adopt/Relabel work in window
+// slot space and the labelling is redone on a shift), so it answers a different
+// question for a second player standing 600 voxels away — the window is one
+// player's, and a lake is not.
+//
+// It is the GRANDFATHERED exception, tracked in
+// docs/RESEARCH_multiplayer_readiness.md S4. It is also not urgent: at
+// `waterBodyMode` 0 the system is empty, so today the divergence it would cause
+// is exactly zero. Do not add a second one.
 WaterBodySystem& WaterBodies();
 
 }  // namespace sandvox

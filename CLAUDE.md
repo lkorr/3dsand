@@ -418,5 +418,6 @@ Allocation must agree in: `common.wgsl` (`voxMat`), `world.h`, and this table. S
 - Materials/reactions are data (JSON+tags), not code. Don't hardcode material IDs in shaders.
 - 2-space indent, `snake_case` WGSL, `CamelCase` C++. High comment density in sim shaders (non-obvious invariants).
 - Don't grow the 32-bit voxel. Extra state → sparse auxiliary layer.
+- **Per-player state lives in `PlayerSession` (`src/game/session.h`), not in `main()`; sim-affecting process globals must not be keyed on the residency window origin.** `WaterBodies()` is the grandfathered exception (`docs/RESEARCH_multiplayer_readiness.md` S4). One tick of authority is `TickAuthority(...)` in `session.cpp` — the frame loop keeps only pacing, the readback pump, the park probe and the handover of one `TickInput`.
 - Rotations: Y-up, quats `(x,y,z,w)`, Euler X→Y→Z, heading 0=+Z, `.vox` is Z-up. Use `python scripts/geometry.py`.
 - Tuner: `./sandvox_tuner.exe` or `python scripts/tuner_server.py`. Build/Play buttons run build+selftest.
