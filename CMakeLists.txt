@@ -526,6 +526,7 @@ add_library(sandvox_core OBJECT
   src/test/selftest_wound.cpp
   src/test/selftest_impact.cpp
   src/test/selftest_audio.cpp
+  src/test/selftest_net.cpp
   src/audio/device.cpp
   src/audio/library.cpp
   src/audio/voice.cpp
@@ -558,6 +559,11 @@ add_library(sandvox_core OBJECT
   src/ui/theme.cpp
   src/ui/inventory_ui.cpp
   src/telemetry.cpp
+  # The network layer (docs/PLAN_multiplayer_m9.md M9.2). Beside telemetry.cpp
+  # because they are the only two TUs that open a socket, and ws2_32 is already
+  # in SANDVOX_LINK_LIBS below for exactly that reason.
+  src/net/link.cpp
+  src/net/protocol.cpp
 )
 # src/audio is on the path so the VENDORED engine's own `#include "xyzpan/..."`
 # resolves unmodified — the sandvox-side audio code uses "audio/xyzpan/..."
