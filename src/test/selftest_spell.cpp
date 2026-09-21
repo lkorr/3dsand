@@ -48,7 +48,7 @@ namespace {
 const char* const kAlphabet[] = {
     "fire", "gold",  "air",        "anything", "explosive", "gust",       "transmute",
     "mend", "trail", "null",       "aura",     "echo",      "shotgun",    "float",
-    "lane", "projectile", "bomb",  "self",     "beam",      "twin",
+    "lane", "projectile", "bomb",  "self",     "beam",      "twin",       "end",
 };
 
 struct FakeHealth {
@@ -139,10 +139,14 @@ std::string CanonNode(const GlyphLibrary& lib, const SpellTree& t, int node) {
   std::sort(items.begin(), items.end());
   std::string s = "[";
   for (const std::string& i : items) s += i + ",";
-  // The SEGMENT COUNT is part of the shape (rule 4): a box with an empty
-  // trailing lane fires one more instance than one without it.
+  // The LANE COUNT is part of the shape (rule 4): a box with an empty trailing
+  // lane fires one more instance than one without it. And so is the box's OWN
+  // lane — a box sitting in a socket is not the same item as the same box
+  // sitting in the shared pile, and without this L2 compared two sentences
+  // that lower differently and called the difference a failure.
   return s + "|" + lib.Delivery(n.glyph).id + "|" +
-         std::to_string(n.laneAt.size()) + "]";
+         std::to_string(n.laneAt.size() / 2) + "]" +
+         (n.lane > 0 ? "@" + std::to_string(n.lane) : std::string());
 }
 std::string Canon(const GlyphLibrary& lib, const SpellTree& t) {
   std::string s;
@@ -540,12 +544,16 @@ Status GateSpells(Ctx& c, std::string& detail) {
                BoxDepth(l.tree, l.tree.clauses[0].root) == (int)N + 1 &&
                l.casts[0].depth == (int)N;
         } else if (gd.sort == GlyphSort::Separator) {
-          // RULE 4: `lane` does not merge either, and N of them open N empty
-          // segments on the hand box - so the sentence is still ONE cast, and
-          // it fires one instance per segment.
+          // RULE 4: a mark does not merge either, and marks NEST rather than
+          // enumerate - N `lane` words in a row open N scopes inside each
+          // other, and the inner ones (never boxed) flatten into the outer
+          // when the sentence runs out, so the hand box has exactly ONE lane
+          // however many were spoken. N `end` words with nothing open are N
+          // charged no-ops and the hand has none.
+          const int32_t wantLanes = gd.scopeClose ? 0 : 1;
           ok = ok && l.tree.clauses.size() == 1 &&
-               (int)l.tree.nodes[l.tree.clauses[0].root].laneAt.size() == (int)N &&
-               l.casts[0].instances == std::min((int32_t)N, lib.budgets.maxInstances);
+               (int)l.tree.nodes[l.tree.clauses[0].root].laneAt.size() == 2 * wantLanes &&
+               l.casts[0].instances == std::max(1, wantLanes);
         } else {
           ok = ok && l.tree.clauses.size() == 1 && l.tree.clauses[0].bag.size() == 1 &&
                l.tree.nodes[l.tree.clauses[0].bag[0]].n == want;
@@ -647,23 +655,22 @@ Status GateSpells(Ctx& c, std::string& detail) {
     }
   }
 
-  // L4 ROOT-LANE INDEPENDENCE - `lane A lane B` costs cost(A) + cost(B) and
-  // fires two instances, the first carrying exactly what `A` alone lowers to
-  // and the second exactly what `B` does. THE SEAM IS A ROOT LANE NOW: `also`
-  // was dropped with rule 4, and two unrelated spells in one cast are two
-  // columns of the hand box (PLAN_spell_graph section 0b). The guard is the
-  // one place the additivity can fail on purpose: a DELIVERY in either arm
-  // would box both columns into one (a delivery closes the whole pile,
-  // lanes included), and a COUNT mod is record-wide by rule 4, so it would
-  // fan the other arm too. Both are real rules, so both are excluded from the
-  // law rather than papered over.
+  // L4 ROOT-LANE INDEPENDENCE - `lane A end lane B end` costs cost(A) +
+  // cost(B) and fires two instances, the first carrying exactly what `A` alone
+  // lowers to and the second exactly what `B` does. THE SEAM IS A ROOT LANE
+  // NOW: `also` was dropped with rule 4, and two unrelated spells in one cast
+  // are two columns of the hand box (PLAN_spell_graph section 0b). A DELIVERY
+  // in an arm is fine and is the point - `end` closes the lane, so the arm's
+  // own box stays inside its column. The only exclusions are another mark
+  // (which would re-scope the arm) and a COUNT mod, which rule 4 makes
+  // record-wide on purpose and which would therefore fan the other arm too.
   int l4 = 0, l4cases = 0;
   {
-    const int gLane = lib.Find("lane");
+    const int gLane = lib.Find("lane"), gEnd = lib.Find("end");
     auto laneClean = [&](const std::vector<int>& q) {
       for (int g : q) {
         const GlyphDef& gd = lib.glyphs[g];
-        if (gd.sort == GlyphSort::Delivery || gd.sort == GlyphSort::Separator) return false;
+        if (gd.sort == GlyphSort::Separator) return false;
         if (gd.sort == GlyphSort::Mod && gd.field == ModField::Count) return false;
       }
       return true;
@@ -675,7 +682,7 @@ Status GateSpells(Ctx& c, std::string& detail) {
       shortSeqs.push_back(s);
       lowered.push_back(CompileSpell(lib, stackOf(s)));
     }
-    for (size_t ai = 0; gLane >= 0 && ai < shortSeqs.size(); ai++) {
+    for (size_t ai = 0; gLane >= 0 && gEnd >= 0 && ai < shortSeqs.size(); ai++) {
       const CastList& la = lowered[ai];
       std::string pa;
       for (const EffectInst& e : la.casts[0].payload) SigEffect(lib, e, pa);
@@ -683,8 +690,10 @@ Status GateSpells(Ctx& c, std::string& detail) {
         const CastList& lb = lowered[bi];
         std::vector<int> ab = {gLane};
         ab.insert(ab.end(), shortSeqs[ai].begin(), shortSeqs[ai].end());
+        ab.push_back(gEnd);
         ab.push_back(gLane);
         ab.insert(ab.end(), shortSeqs[bi].begin(), shortSeqs[bi].end());
+        ab.push_back(gEnd);
         const CastList lab = CompileSpell(lib, stackOf(ab));
         l4cases++;
         std::string pb, g0, g1;
@@ -699,25 +708,32 @@ Status GateSpells(Ctx& c, std::string& detail) {
                         lab.priceUnknown == (la.priceUnknown || lb.priceUnknown) &&
                         g0 == pa && g1 == pb;
         if (!ok)
-          fail("L4", "lane " + spell(shortSeqs[ai]) + " lane " + spell(shortSeqs[bi]));
+          fail("L4", "lane " + spell(shortSeqs[ai]) + " end lane " + spell(shortSeqs[bi]) +
+                         " end");
         else l4++;
       }
     }
   }
 
-  // L12 LANES (rule 4). Three claims, over the same generated alphabet:
+  // L12 LANES (rule 4), over the same generated alphabet. Four claims, and
+  // (d) is the one the whole scope rule exists for:
   //
-  //  (a) a lane is a SEGMENT, not a second pile: `E lane F D` lowers to one
+  //  (a) a lane is a SCOPE, not a second pile: `E lane F end D` lowers to one
   //      instance carrying exactly what `E F D` carries, at exactly the same
   //      price - the compatibility claim that makes rule 4 free;
-  //  (b) a lane BELONGS TO ONE INSTANCE: in `E lane F twin D` the first
+  //  (b) a lane BELONGS TO ONE INSTANCE: in `E lane F end twin D` the first
   //      instance is `E F D`'s payload and the second is `E D`'s, and the
   //      tariff is their sum rather than either one doubled;
-  //  (c) a sentence with NO lane word lowers with no lanes at all, which is
-  //      why every pinned price in this repo is unmoved.
+  //  (c) a sentence with NO mark lowers with no lanes at all, which is why
+  //      every pinned price in this repo is unmoved;
+  //  (d) A LANE MAY HOLD A BOX OF ITS OWN. `lane E D end lane F end D` is an
+  //      outer carrier with two sockets: socket 0 carries exactly the box that
+  //      `E D` lowers to, socket 1 exactly what `F` lowers to. Under the old
+  //      "a delivery boxes the whole pile" reading the trailing D swallowed
+  //      the earlier lane and this sentence could not be said at all.
   int l12 = 0, l12cases = 0;
   {
-    const int gLane = lib.Find("lane"), gTwin = lib.Find("twin");
+    const int gLane = lib.Find("lane"), gTwin = lib.Find("twin"), gEnd = lib.Find("end");
     std::vector<int> nouns, flights;
     for (int g : alpha) {
       const GlyphDef& gd = lib.glyphs[g];
@@ -772,17 +788,17 @@ Status GateSpells(Ctx& c, std::string& detail) {
           const std::string wantBoth = boxSig(both), wantBase = boxSig(base);
           if (wantBoth.empty() || wantBase.empty()) continue;
           // (a) one lane, one instance: the same cast as saying them together.
-          const CastList one = CompileSpell(lib, stackOf({e, gLane, f, d}));
+          const CastList one = CompileSpell(lib, stackOf({e, gLane, f, gEnd, d}));
           int32_t n1 = 0;
           const std::string got1 = instSig(one, 0, n1);
           l12cases++;
           if (n1 != 1 || got1 != wantBoth || one.manaCost != both.manaCost)
-            fail("L12a", spell({e, gLane, f, d}) + " is not " + spell({e, f, d}));
+            fail("L12a", spell({e, gLane, f, gEnd, d}) + " is not " + spell({e, f, d}));
           else
             l12++;
           // (b) the lane belongs to instance 0; instance 1 is the shared copy.
           if (gTwin < 0) continue;
-          const CastList two = CompileSpell(lib, stackOf({e, gLane, f, gTwin, d}));
+          const CastList two = CompileSpell(lib, stackOf({e, gLane, f, gEnd, gTwin, d}));
           int32_t n2 = 0;
           const std::string g0 = instSig(two, 0, n2);
           int32_t n2b = 0;
@@ -791,10 +807,27 @@ Status GateSpells(Ctx& c, std::string& detail) {
           const int32_t wantTariff = both.tariff + base.tariff;
           if (n2 != 2 || g0 != wantBoth || g1 != wantBase ||
               two.casts[0].tariff != wantTariff)
-            fail("L12b", spell({e, gLane, f, gTwin, d}) + ": instances " +
+            fail("L12b", spell({e, gLane, f, gEnd, gTwin, d}) + ": instances " +
                              std::to_string(n2) + ", tariff " +
                              std::to_string(two.casts[0].tariff) + " want " +
                              std::to_string(wantTariff));
+          else
+            l12++;
+          // (d) a socket holding a whole spell of its own: `lane E D end lane
+          // F end D`. Socket 0 is the box `E D` makes, socket 1 is `F`.
+          const CastList sock =
+              CompileSpell(lib, stackOf({gLane, e, d, gEnd, gLane, f, gEnd, d}));
+          const CastList justE = CompileSpell(lib, stackOf({e, d}));
+          const CastList justF = CompileSpell(lib, stackOf({f}));
+          int32_t n3 = 0, n3b = 0;
+          const std::string s0 = instSig(sock, 0, n3);
+          const std::string s1 = instSig(sock, 1, n3b);
+          l12cases++;
+          if (n3 != 2 || s0 != sigSet(justE.casts[0].payload) ||
+              s1 != sigSet(justF.casts[0].payload))
+            fail("L12d", spell({gLane, e, d, gEnd, gLane, f, gEnd, d}) +
+                             ": sockets do not hold [" + spell({e, d}) + "] and [" +
+                             spell({f}) + "] (instances " + std::to_string(n3) + ")");
           else
             l12++;
         }
@@ -813,7 +846,7 @@ Status GateSpells(Ctx& c, std::string& detail) {
     for (const auto& sq : seqs) {
       bool spoke = false;
       for (int g : sq) spoke = spoke || lib.glyphs[g].sort == GlyphSort::Separator;
-      if (spoke) continue;
+      if (spoke) continue;   // (c) is about sentences with no mark at all
       const CastList l = CompileSpell(lib, stackOf(sq));
       l12cases++;
       bool clean = true;
@@ -1535,7 +1568,8 @@ Status GateSpells(Ctx& c, std::string& detail) {
   //       spells in one cast: a bolt leaves, and the mend resolves on the
   //       caster, from one utterance.
   bool laneRunOk = false;
-  int laneBolts = 0, laneWithFire = 0, laneRestores = 0, laneLive = 0;
+  int laneBolts = 0, laneWithFire = 0, laneWithSand = 0;
+  int laneLive = 0, laneRestores = 0, sockBolts = 0, sockChild = 0, sockFire = 0;
   {
     SpellSystem lsys;
     lsys.SetLibrary(&lib);
@@ -1547,22 +1581,39 @@ Status GateSpells(Ctx& c, std::string& detail) {
     const SpellFxVec origin{SpellFxFromFloat((float)(worg.x * (int)kChunk + 8)),
                             SpellFxFromFloat((float)(worg.y * (int)kChunk + (int)kWorldN / 2)),
                             SpellFxFromFloat((float)(worg.z * (int)kChunk + (int)kWorldN / 2))};
-    uint32_t mFire = 0;
-    for (size_t m = 0; m < mats.size(); m++)
+    uint32_t mFire = 0, mSand = 0;
+    for (size_t m = 0; m < mats.size(); m++) {
       if (mats[m].name == "fire") mFire = (uint32_t)m;
+      if (mats[m].name == "sand") mSand = (uint32_t)m;
+    }
+    auto sprays = [&](const std::vector<EffectInst>& es, uint32_t mat) {
+      for (const EffectInst& x : es)
+        if (x.verb == SpellVerb::Spray && x.matA == mat) return true;
+      return false;
+    };
+    auto launches = [&](const std::vector<EffectInst>& es) {
+      for (const EffectInst& x : es)
+        if (x.verb == SpellVerb::Launch) return true;
+      return false;
+    };
+
+    // (a) `explosive lane sand end lane fire end twin projectile`: two bolts,
+    // both exploding, one carrying sand and the other fire. The fan is not a
+    // copy machine any more.
     SpellEmission e0;
-    lsys.Cast(CompileSpell(lib, speak({"explosive", "lane", "fire", "twin", "projectile"})),
+    lsys.Cast(CompileSpell(lib, speak({"explosive", "lane", "sand", "end", "lane", "fire",
+                                       "end", "twin", "projectile"})),
               cs, hp.cb, 88, origin, {kSpellFxOne, 0, 0}, 1, e0);
     laneBolts = lsys.LiveCount();
     for (const SpellProjectile& pr : lsys.Live()) {
-      bool fire = false;
-      for (const EffectInst& x : pr.cast.payload)
-        fire = fire || (x.verb == SpellVerb::Spray && x.matA == mFire);
-      if (fire) laneWithFire++;
+      if (sprays(pr.cast.payload, mFire)) laneWithFire++;
+      if (sprays(pr.cast.payload, mSand)) laneWithSand++;
     }
     lsys.Clear();
-    // The mend needs something to draw on: a mirror that is blood everywhere
-    // near the caster, so the world half of the graft has a source.
+
+    // (b) `lane explosive projectile end lane blood mend self end`: two
+    // unrelated spells in one cast — a bolt leaves, and the graft resolves on
+    // the caster. The mend needs something to draw on, so the mirror is blood.
     struct Patch {
       uint32_t blood;
     } patch{0};
@@ -1575,16 +1626,35 @@ Status GateSpells(Ctx& c, std::string& detail) {
       return ((Patch*)c)->blood;
     };
     SpellEmission e1;
-    lsys.Cast(CompileSpell(lib, speak({"lane", "explosive", "projectile", "lane", "blood",
-                                       "mend", "self"})),
+    lsys.Cast(CompileSpell(lib, speak({"lane", "explosive", "projectile", "end", "lane",
+                                       "blood", "mend", "self", "end"})),
               cs, hp.cb, 89, origin, {kSpellFxOne, 0, 0}, 2, e1, &probe2);
     laneLive = lsys.LiveCount();
     laneRestores = (int)e1.restores.size();
-    laneRunOk = laneBolts == 2 && laneWithFire == 1 && laneLive == 1 && laneRestores == 1;
     lsys.Clear();
-    std::printf("spell lanes: %s (twin+lane: %d bolts, %d carrying fire; root lanes: %d bolt(s) "
-                "and %d restore(s) from one cast)\n",
-                laneRunOk ? "PASS" : "FAIL", laneBolts, laneWithFire, laneLive, laneRestores);
+
+    // (c) `lane explosive projectile end lane fire end projectile`: ONE outer
+    // carrier with two sockets — socket 0 fires a child bolt that explodes,
+    // socket 1 sprays fire. This is the sentence the scope rule exists for.
+    SpellEmission e2;
+    lsys.Cast(CompileSpell(lib, speak({"lane", "explosive", "projectile", "end", "lane",
+                                       "fire", "end", "projectile"})),
+              cs, hp.cb, 90, origin, {kSpellFxOne, 0, 0}, 3, e2);
+    sockBolts = lsys.LiveCount();
+    for (const SpellProjectile& pr : lsys.Live()) {
+      if (launches(pr.cast.payload)) sockChild++;
+      if (sprays(pr.cast.payload, mFire)) sockFire++;
+    }
+    lsys.Clear();
+
+    laneRunOk = laneBolts == 2 && laneWithFire == 1 && laneWithSand == 1 &&
+                laneLive == 1 && laneRestores == 1 && sockBolts == 2 &&
+                sockChild == 1 && sockFire == 1;
+    std::printf("spell lanes: %s (twin+lanes: %d bolts, %d with fire, %d with sand; root "
+                "lanes: %d bolt(s) + %d restore(s) from one cast; sockets: %d bolts, %d "
+                "carrying a child box, %d carrying fire)\n",
+                laneRunOk ? "PASS" : "FAIL", laneBolts, laneWithFire, laneWithSand, laneLive,
+                laneRestores, sockBolts, sockChild, sockFire);
   }
 
   const bool lawsOk = alphaOk && lawFail == 0 && l1 > 0 && l2pairs > 0 && l3 > 0 &&

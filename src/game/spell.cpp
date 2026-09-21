@@ -542,11 +542,19 @@ bool LoadGlyphs(const std::string& path, const std::vector<MaterialDef>& mats,
         d.noun = g.value("noun", d.id);
         break;
       }
-      case GlyphSort::Separator:
-        // `lane`: no fields at all. It opens a segment of the pile that
-        // belongs to one instance of the box that closes it (rule 4), which is
-        // the whole of its behaviour; it is a MARK, never an item.
+      case GlyphSort::Separator: {
+        // RULE 4's two marks. `lane` OPENS a lane scope on the current pile,
+        // `end` CLOSES the innermost open one. Which of the two a word is is
+        // CONTENT ("scope": "open" | "close"), so a modder's synonym needs no
+        // C++; nothing else about a separator is a field.
+        const std::string sc = g.value("scope", std::string("open"));
+        if (sc != "open" && sc != "close") {
+          errors += where + "has scope \"" + sc + "\" (want \"open\" or \"close\")\n";
+          return false;
+        }
+        d.scopeClose = sc == "close";
         break;
+      }
       case GlyphSort::Mod: {
         const std::string fld = g.value("field", std::string());
         if (!ParseModField(fld, d.field)) {
@@ -656,28 +664,54 @@ std::vector<int> MergePile(const GlyphLibrary& lib, SpellTree& t,
   return outItems;
 }
 
-// RULE 2: box the whole pile under `deliveryGlyph` (-1 = the implicit hand).
-// Returns the new node index. `at` is the delivery word's spoken position, -1
-// for the hand. RULE 4: `laneAt` is where each `lane` word that opened a
-// segment of this pile was spoken; the items already carry the lane index the
-// parser stamped on them when it pushed them.
-int CloseBox(const GlyphLibrary& lib, SpellTree& t, const std::vector<int>& pile,
-             int deliveryGlyph, int at, int spokenEnd,
-             const std::vector<int>& laneAt = {}) {
+// ONE SCOPE of the pile while parsing (rule 4). The root scope is the pile the
+// hand box closes; a `lane` word pushes a new one and `end` pops it back into
+// its parent's `lanes`. A scope holds its own shared items AND the lane
+// segments already closed inside it, because a delivery spoken here boxes
+// exactly that: the innermost OPEN scope, lanes and all.
+struct ParseScope {
+  std::vector<int> pile;                 // the shared segment of this scope
+  std::vector<std::vector<int>> lanes;   // segments closed inside it, in order
+  std::vector<int> laneAt;               // two per lane: the `lane`, then `end`
+  int openAt = -1;                       // the `lane` word that opened it
+  int startPos = 0;                      // where its first item could be spoken
+};
+
+// RULE 2 + RULE 4: box a whole SCOPE under `deliveryGlyph` (-1 = the implicit
+// hand) — its shared items first, then one segment per closed lane. Returns
+// the new node index. `at` is the delivery word's spoken position, -1 for the
+// hand. The items are stamped with their lane HERE, before the merge, because
+// the lane is part of NodeKey and the merge must not join two segments.
+int CloseBox(const GlyphLibrary& lib, SpellTree& t, const ParseScope& sc,
+             int deliveryGlyph, int at, int spokenEnd) {
   SpellNode b;
   b.box = true;
   b.glyph = deliveryGlyph;
   b.n = 1;
   b.at = at;
-  b.laneAt = laneAt;
-  b.items = MergePile(lib, t, pile);
+  b.laneAt = sc.laneAt;
+  std::vector<int> all;
+  for (int ni : sc.pile) {
+    t.nodes[ni].lane = 0;
+    all.push_back(ni);
+  }
+  for (size_t k = 0; k < sc.lanes.size(); k++)
+    for (int ni : sc.lanes[k]) {
+      t.nodes[ni].lane = (int32_t)k + 1;
+      all.push_back(ni);
+    }
+  b.items = MergePile(lib, t, all);
   b.first = at >= 0 ? at : spokenEnd;
   b.last = at >= 0 ? at : spokenEnd;
-  // A `lane` mark BELONGS to the box it opened a segment of, so it is inside
-  // the box's spoken span even when that segment ended up empty. Without this
-  // `lane projectile` reads as spanning only the delivery word, and law L6
-  // would call a word inserted onto its pile "far away".
-  for (int la : laneAt) {
+  // A BOX SPANS ITS WHOLE SCOPE, from where the scope's first word could have
+  // been spoken: anything said there would have been in the pile this box
+  // closed, so it is inside the box even when the pile ended up empty. (Law
+  // L6 reads the span to decide what "far away" means, and `end projectile`
+  // is a box whose delivery word is not where its pile began.)
+  b.first = std::min(b.first, sc.startPos);
+  // The `lane` / `end` marks belong to it for the same reason.
+  for (int la : sc.laneAt) {
+    if (la < 0) continue;
     b.first = std::min(b.first, la);
     b.last = std::max(b.last, la);
   }
@@ -695,9 +729,11 @@ SpellTree ParseSpell(const GlyphLibrary& lib, const SpellStack& stack) {
   SpellTree t;
   const int32_t cap = lib.budgets.maxMultiplicity;
 
-  // RUNS MERGE first, and NOT for deliveries: `shotgun shotgun` is one item
-  // ×2, but `projectile projectile` is two boxes, because each delivery boxes
-  // what is in front of it and a merged pair would silently drop a nesting.
+  // RUNS MERGE first, and NOT for deliveries or the scope marks: `shotgun
+  // shotgun` is one item ×2, but `projectile projectile` is two boxes, because
+  // each delivery boxes what is in front of it and a merged pair would
+  // silently drop a nesting. (A mark between two identical words is what makes
+  // `fire lane fire end` two items in two segments rather than `fire×2`.)
   std::vector<int> items;
   for (size_t i = 0; i < stack.spoken.size(); i++) {
     const int gi = stack.spoken[i];
@@ -722,35 +758,41 @@ SpellTree ParseSpell(const GlyphLibrary& lib, const SpellStack& stack) {
 
   // ONE left-to-right pass over the merged words. Operators bind (they must
   // run here, not in a separate pass, because the item to an operator's left
-  // may be a BOX a delivery just made); deliveries box; `lane` opens a segment
-  // of the pile; everything else falls into the pile.
-  std::vector<int> pile;
+  // may be a BOX a delivery just made); deliveries box the innermost OPEN
+  // scope; `lane` opens a scope and `end` closes one; everything else falls
+  // into the current scope's pile.
+  std::vector<ParseScope> scopes(1);
   const int spokenEnd = (int)stack.spoken.size();
-  // RULE 4 state. `curLane` is the segment every item pushed from here on
-  // belongs to; `laneFloor` is how far down the pile an operator may reach —
-  // a `lane` mark WALLS binding, so an operator whose left item would be in an
-  // earlier segment gets an empty slot instead. Both are reset by a delivery,
-  // because the box it made is one item in the shared segment of a fresh pile.
-  int32_t curLane = 0;
-  size_t laneFloor = 0;
-  std::vector<int> laneAt;
-  auto push = [&](int ni) {
-    t.nodes[ni].lane = curLane;
-    pile.push_back(ni);
+
+  // RULE 4: close the innermost open lane back into its parent. `endPos` is
+  // the `end` word, or -1 when the sentence simply ran out and the lane is
+  // closed implicitly. A lane that itself opened lanes and never boxed them
+  // has no record to make them columns OF, so they flatten into it — the one
+  // place a scope is not a column.
+  auto closeLane = [&](int endPos) {
+    ParseScope sc = std::move(scopes.back());
+    scopes.pop_back();
+    for (const std::vector<int>& sub : sc.lanes)
+      for (int ni : sub) sc.pile.push_back(ni);
+    ParseScope& parent = scopes.back();
+    parent.lanes.push_back(std::move(sc.pile));
+    parent.laneAt.push_back(sc.openAt);
+    parent.laneAt.push_back(endPos);
   };
   auto finishClause = [&](int at) {
     SpellClause c;
-    c.root = CloseBox(lib, t, pile, -1, -1, at, laneAt);
+    c.root = CloseBox(lib, t, scopes[0], -1, -1, at);
     c.delivery = -1;
     c.weight = 1;
     c.bag = t.nodes[c.root].items;
     t.clauses.push_back(std::move(c));
-    pile.clear();
+    scopes[0] = ParseScope{};
   };
 
   for (size_t i = 0; i < items.size(); i++) {
     const int ni = items[i];
     const GlyphDef& g = lib.glyphs[t.nodes[ni].glyph];
+    ParseScope* sc = &scopes.back();
     switch (g.sort) {
       case GlyphSort::Operator: {
         SpellNode grp;
@@ -760,16 +802,26 @@ SpellTree ParseSpell(const GlyphLibrary& lib, const SpellStack& stack) {
         grp.first = t.nodes[ni].first;
         grp.last = t.nodes[ni].last;
         grp.at = t.nodes[ni].first;
-        // THE ONE ITEM TO ITS LEFT — which is the top of the pile, and may be
-        // a box (`explosive projectile echo` is a turret). Never below the
-        // lane floor: in `fire lane trail` there is nothing in this segment
-        // for `trail` to take, so it is incomplete, exactly as if nothing had
-        // been spoken at all (rule 4).
-        if (g.hasLeft && pile.size() > laneFloor &&
-            SlotAccepts(lib, t, g.leftMask, pile.back())) {
-          grp.left = pile.back();
-          pile.pop_back();
+        // THE ONE ITEM TO ITS LEFT — the top of THIS SCOPE's pile, which may
+        // be a box (`explosive projectile echo` is a turret). A `lane` / `end`
+        // boundary is a wall: an operator can never reach past it, because the
+        // items on the other side are in another scope entirely.
+        if (g.hasLeft && !sc->pile.empty() &&
+            SlotAccepts(lib, t, g.leftMask, sc->pile.back())) {
+          grp.left = sc->pile.back();
+          sc->pile.pop_back();
           grp.first = std::min(grp.first, t.nodes[grp.left].first);
+        } else if (g.hasLeft) {
+          // AN EMPTY SLOT REACHES BACK TO THE TOP OF ITS SCOPE'S PILE. Any
+          // word spoken between that item and here would become the new top
+          // and could fill the slot, so that stretch is part of this group's
+          // neighbourhood — which is what law L6 reads the span for. With an
+          // empty pile the stretch is the whole scope (`lane` … here), and
+          // with a word in the way it is whatever separates them, which is how
+          // `explosive end transmute` is honest about the `end` between them.
+          grp.first = std::min(grp.first, sc->pile.empty()
+                                              ? sc->startPos
+                                              : t.nodes[sc->pile.back()].last + 1);
         }
         if (g.hasRight && i + 1 < items.size() &&
             SlotAccepts(lib, t, g.rightMask, items[i + 1])) {
@@ -779,39 +831,45 @@ SpellTree ParseSpell(const GlyphLibrary& lib, const SpellStack& stack) {
         }
         grp.complete = (!g.hasLeft || grp.left >= 0) && (!g.hasRight || grp.right >= 0);
         t.nodes.push_back(std::move(grp));
-        push((int)t.nodes.size() - 1);
+        scopes.back().pile.push_back((int)t.nodes.size() - 1);
         break;
       }
       case GlyphSort::Delivery: {
-        // RULE 2. The pile becomes exactly one value: this box — and the box
-        // carries the lanes it closed, so the fresh pile starts shared again.
-        const int b =
-            CloseBox(lib, t, pile, t.nodes[ni].glyph, t.nodes[ni].first, spokenEnd, laneAt);
-        pile.clear();
-        laneAt.clear();
-        curLane = 0;
-        laneFloor = 0;
-        push(b);
+        // RULE 2, scoped by RULE 4. Inside an open lane the box takes only
+        // that lane's items and the lane STAYS OPEN, so more may follow in it;
+        // outside any lane it takes the shared items and every closed lane,
+        // which is the multi-socket box.
+        const int b = CloseBox(lib, t, *sc, t.nodes[ni].glyph, t.nodes[ni].first, spokenEnd);
+        sc->pile.clear();
+        sc->lanes.clear();
+        sc->laneAt.clear();
+        sc->pile.push_back(b);
         break;
       }
       case GlyphSort::Separator:
-        // RULE 4. `lane` opens the next segment. It is a MARK, not an item:
-        // nothing goes on the pile, but everything spoken after it belongs to
-        // one instance and nothing under the mark can be bound or merged
-        // across it. A `lane` with nothing after it is an empty lane — the
-        // instance exists and carries the shared segment alone.
-        curLane++;
-        laneFloor = pile.size();
-        laneAt.push_back(t.nodes[ni].first);
+        if (!g.scopeClose) {
+          ParseScope inner;
+          inner.openAt = t.nodes[ni].first;
+          inner.startPos = t.nodes[ni].first + 1;
+          scopes.push_back(std::move(inner));
+        } else if (scopes.size() > 1) {
+          closeLane(t.nodes[ni].first);
+        }
+        // An `end` with nothing open is a charged no-op, like every other word
+        // the grammar has no work for: total in, total out.
         break;
       default:
-        push(ni);
+        sc->pile.push_back(ni);
         break;
     }
   }
   // Silence is the one thing that is not a spell: an empty stack lowers to no
-  // clauses at all, not to an empty hand cast.
-  if (!stack.spoken.empty()) finishClause(spokenEnd);
+  // clauses at all, not to an empty hand cast. Everything still open is closed
+  // implicitly, innermost first.
+  if (!stack.spoken.empty()) {
+    while (scopes.size() > 1) closeLane(-1);
+    finishClause(spokenEnd);
+  }
   return t;
 }
 
@@ -840,39 +898,28 @@ std::string NodeKey(const GlyphLibrary& lib, const SpellTree& t, int node) {
          "|" + (n.right >= 0 ? NodeKey(lib, t, n.right) : std::string()) + ")" + lane;
 }
 
-// A list of pile items, lanes marked. Items are stored in SPOKEN order and a
-// lane index never decreases along it, so a segment is a contiguous run and
-// the boundary is one comparison. ` / ` in BOTH bracket styles, because the
-// oracle compares these strings verbatim and two spellings would be two
-// truths.
+// A list of pile items with its LANE SCOPES marked (rule 4). Items are stored
+// with the lane they belong to and the shared segment is lane 0, so each
+// segment is a contiguous run; a lane is drawn `/ ... /` — the two marks the
+// sentence actually contains, so the readout round-trips back to words. ` / `
+// in BOTH bracket styles, because the oracle compares these strings verbatim
+// and two spellings would be two truths.
 static std::string ShowItems(const GlyphLibrary& lib, const SpellTree& t,
                              const std::vector<int>& items, BracketStyle style,
                              int32_t laneCount) {
-  std::string s;
-  int32_t lane = 0;
-  bool first = true;
-  auto sep = [&]() {
-    if (!first) s += " ";
-    first = false;
-  };
-  for (int ii : items) {
-    const int32_t l = t.nodes[ii].lane;
-    // One mark per segment CROSSED, so an empty lane is visible as `/ /`.
-    for (int32_t k = lane; k < l; k++) {
-      sep();
-      s += "/";
-      first = false;
-    }
-    lane = l;
-    sep();
-    s += ShowNode(lib, t, ii, style);
+  std::vector<std::string> parts;
+  for (int ii : items)
+    if (t.nodes[ii].lane == 0) parts.push_back(ShowNode(lib, t, ii, style));
+  for (int32_t k = 1; k <= laneCount; k++) {
+    parts.push_back("/");
+    for (int ii : items)
+      if (t.nodes[ii].lane == k) parts.push_back(ShowNode(lib, t, ii, style));
+    parts.push_back("/");
   }
-  // Lanes opened after the last item: `fire lane` is one bolt with an empty
-  // second segment, and the readout has to say so or it is not the sentence.
-  for (int32_t k = lane; k < laneCount; k++) {
-    sep();
-    s += "/";
-    first = false;
+  std::string s;
+  for (const std::string& one : parts) {
+    if (!s.empty()) s += " ";
+    s += one;
   }
   return s;
 }
@@ -884,7 +931,7 @@ std::string ShowNode(const GlyphLibrary& lib, const SpellTree& t, int node,
   if (n.box) {
     // `[ ... DELIVERY]`: the brackets ARE the nesting, so the HUD shows the
     // fold the way the sentence built it, with ` / ` where a lane opened.
-    std::string s = ShowItems(lib, t, n.items, style, (int32_t)n.laneAt.size());
+    std::string s = ShowItems(lib, t, n.items, style, (int32_t)n.laneAt.size() / 2);
     const std::string id = lib.Delivery(n.glyph).id;
     if (!s.empty()) s += " ";
     if (style == BracketStyle::Oracle) {
@@ -929,7 +976,7 @@ std::string BracketSpell(const GlyphLibrary& lib, const SpellTree& t,
     // the brackets are reserved for the deliveries you actually spoke. Its
     // lanes (rule 4) are drawn the same way as any other box's.
     const int32_t lanes =
-        c.root >= 0 ? (int32_t)t.nodes[c.root].laneAt.size() : 0;
+        c.root >= 0 ? (int32_t)t.nodes[c.root].laneAt.size() / 2 : 0;
     std::string s = ShowItems(lib, t, c.bag, style, lanes);
     if (s.empty()) s = "(empty)";
     if (!out.empty()) out += " ";
@@ -1478,9 +1525,10 @@ SpellCast LowerBox(const GlyphLibrary& lib, const SpellTree& tree, int node,
   const SpellBudgets& b = lib.budgets;
   const SpellNode& bn = tree.nodes[node];
   const bool isHand = bn.glyph < 0;
-  // RULE 4: how many segments this box closed. L may be cut back below by the
-  // leaf cap, so it is not final until the clamp.
-  int32_t L = (int32_t)bn.laneAt.size();
+  // RULE 4: how many segments this box closed (`laneAt` holds the `lane` and
+  // the `end` position of each). L may be cut back below by the leaf cap, so
+  // it is not final until the clamp.
+  int32_t L = (int32_t)bn.laneAt.size() / 2;
   SpellCast cast;
   cast.delivery = RecordFor(lib, bn.glyph, bn.n);
   cast.wordCost = SatMul(lib.Delivery(bn.glyph).word, bn.n);

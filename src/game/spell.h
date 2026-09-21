@@ -52,8 +52,8 @@
 // Six SORTS: Matter (a material by name), Effect (something that happens at a
 // point), Delivery (how an Effect reaches a point), Mod (a field edit on a
 // delivery record), Operator (a word with argument slots that produces one of
-// the others), Separator (`lane`: opens a segment of the pile that belongs to
-// one instance of the box that closes it).
+// the others), Separator (`lane` opens a lane scope of the pile, `end` closes
+// it; a lane belongs to one instance of the box that closes the pile).
 //
 // FOUR RULES, and everything else is a consequence of them:
 //
@@ -63,10 +63,11 @@
 //      capped) and the lowering rebuilds the pile in a CANONICAL order.
 //
 //   2. A DELIVERY BOXES THE PILE, AND SPEAKING CONTINUES. The Delivery word
-//      takes the WHOLE pile and wraps it into ONE Effect value of verb
-//      `launch`: {that delivery's DeliveryRec, the pile's Effects as its
-//      payload, the pile's pending Mods stuck to its record}. The pile becomes
-//      exactly that one value. So deliveries NEST and word order matters:
+//      takes the pile — all of it, or, under rule 4, the innermost OPEN scope
+//      of it — and wraps it into ONE Effect value of verb `launch`: {that
+//      delivery's DeliveryRec, the pile's Effects as its payload, the pile's
+//      pending Mods stuck to its record}. That scope's pile becomes exactly
+//      that one value. So deliveries NEST and word order matters:
 //      `explosive projectile projectile` is a bolt that fires a bolt that
 //      explodes.
 //
@@ -78,23 +79,29 @@
 //      the hop; every other mod on the hand is a charged no-op and the
 //      describe line says so.
 //
-//   4. `lane` OPENS A SEGMENT OF THE PILE THAT BELONGS TO ONE INSTANCE. The
-//      first segment is SHARED by every instance of the box that closes the
-//      pile; each `lane` word opens a segment that belongs to exactly one of
-//      them. The box fires `instances = max(count, L)`: instance i < L carries
-//      shared ∪ lane[i+1], instance i >= L carries the shared segment alone.
-//      A lane walls binding (an operator after a `lane` cannot take a word
-//      spoken before it) and walls merging (`fire lane fire` is two items in
-//      two lanes, not `fire×2`) — but a `count` Mod is record-wide wherever it
-//      was spoken, because count IS the fan and a lane is one instance of it.
+//   4. `lane` OPENS A LANE SCOPE, `end` CLOSES IT, AND A LANE BELONGS TO ONE
+//      INSTANCE. `lane` pushes a scope onto the current pile and `end` pops
+//      the innermost open one back into the scope around it. **A delivery
+//      boxes the innermost OPEN scope**: inside an open lane it takes only
+//      that lane's items (the box lands IN the lane, which stays open, so more
+//      may follow in it), and outside any lane it takes the shared items plus
+//      every closed lane — the multi-socket box. An unclosed lane is closed
+//      when the sentence runs out. Lanes are ordered as spoken; the box fires
+//      `instances = max(count, L)`, instance i < L carries shared ∪ lane[i+1],
+//      and instance i >= L carries the shared items alone. A `lane` / `end`
+//      mark is a WALL: an operator binds only within its own scope, and runs
+//      merge only within a scope (`fire lane fire end` is two items in two
+//      scopes, not `fire×2`) — but a `count` Mod is record-wide wherever it
+//      was spoken, because count IS the fan and a lane is one instance of it,
+//      while any other mod inside a lane edits that instance's record.
 //      COPIES FAN, COLUMNS DO NOT: `SpellFan` spreads only the shared-only
 //      instances; an instance that carries a lane fires on the aim itself.
 //
 // The outermost box is always `hand`, so the whole sentence lowers to ONE cast.
 // Lanes on the hand are how two unrelated spells are said at once (`lane
-// explosive projectile lane blood mend self`), and law L4 (cost additivity)
-// attaches to those root lanes. There is no sentence separator any more:
-// `also` was dropped when rule 4 landed.
+// explosive projectile end lane blood mend self end` is a bolt AND a graft),
+// and law L4 (cost additivity) attaches to those root lanes. There is no
+// sentence separator any more: `also` was dropped when rule 4 landed.
 //
 // Unary operators (`trail`, `aura`, `echo`, `null`, `mend`) take the ONE item
 // immediately before them, which may itself be a launch box (`explosive
@@ -299,6 +306,11 @@ struct GlyphDef {
   // so a modder's new carrier reads as itself; defaults to the glyph id.
   std::string noun;
 
+  // ---- separator (rule 4) ----
+  // false = `lane`, opens a lane scope; true = `end`, closes the innermost
+  // open one. Content, from the glyph's "scope" field.
+  bool scopeClose = false;
+
   // ---- mod ----
   ModField field = ModField::None;
   ModOp op = ModOp::Mul;
@@ -342,7 +354,7 @@ struct SpellBudgets {
   int32_t maxStatusPerCaster = 4;
   // ---- the grimoire (plan §12b), P5 -----------------------------------------
   int32_t maxGrimoirePages = 32;
-  int32_t maxMacroWords = 24;
+  int32_t maxMacroWords = 32;
   int32_t maxMacroDepth = 4;
 };
 
@@ -392,10 +404,11 @@ struct SpellStack {
   bool Empty() const { return spoken.empty(); }
 };
 // Bound so a stuck key cannot grow the stack without limit (rule 2 applies to
-// UI state too — an unbounded stack is an unbounded mana cost). 24 since rule
-// 4: three lanes of two effects, a fan, a delivery and a mod is a sentence a
-// player will want to say, and 16 could not hold one.
-constexpr int kSpellStackMax = 24;
+// UI state too — an unbounded stack is an unbounded mana cost). 32 since rule
+// 4: a socket costs TWO words (`lane` … `end`), and three sockets holding two
+// effects each, a fan, a delivery and a mod is a sentence a player will want
+// to say.
+constexpr int kSpellStackMax = 32;
 
 // ---- the parse tree (the three rules) ----------------------------------------
 
@@ -417,8 +430,10 @@ struct SpellNode {
   // to instance N-1 of the box that closes the pile. Part of NodeKey, so two
   // identical words in different lanes never merge.
   int32_t lane = 0;
-  // Box only: the spoken position of each `lane` word this box closed, in
-  // order, for the HUD highlight and the linearizer. Size == L.
+  // Box only: TWO spoken positions per lane it closed, in lane order — the
+  // `lane` word, then the `end` word (-1 when the sentence ended and the lane
+  // was closed implicitly). So `laneAt.size() == 2 * L`, and the HUD highlight
+  // and the linearizer both have the marks they need.
   std::vector<int> laneAt;
   bool complete = true;  // false: a required slot is empty
   // Spoken span [first, last] of this item and everything under it, for the
@@ -463,12 +478,13 @@ enum class BracketStyle : uint8_t {
   Hud,          // ASCII for the pixel font: x2, |, ><, <, DELIVERY in caps
 };
 // An item with its brackets: `fire×2`, `(dirt ⋈ water)`, `(_ ◂trail)`, and a
-// box as `[ ... **projectile**]`. A lane boundary inside a box prints as
-// ` / ` in BOTH styles (`[explosive / gunpowder / fire **projectile**]`) —
-// one spelling, because the oracle JSON and this parser compare strings.
+// box as `[ ... **projectile**]`. A lane prints as `/ ... /` in BOTH styles
+// (`[explosive / sand / / fire / **projectile**]`), one mark per word the
+// sentence actually contains — one spelling, because the oracle JSON and this
+// parser compare strings.
 std::string ShowNode(const GlyphLibrary& lib, const SpellTree& t, int node,
                      BracketStyle style = BracketStyle::Oracle);
-// The whole sentence: the hand box's items, lanes separated by ` / `.
+// The whole sentence: the hand box's items, each lane wrapped in ` / `.
 std::string BracketSpell(const GlyphLibrary& lib, const SpellTree& t,
                          BracketStyle style = BracketStyle::Oracle);
 

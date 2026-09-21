@@ -15,12 +15,14 @@ It is also the oracle the C++ `spells-oracle` gate compares against.
      delivery spoken; with no delivery it sticks to `hand`, where `shotgun` is
      three fanned resolve points and `float` is the hop and everything else is
      a charged no-op.
-  4. `lane` OPENS A SEGMENT OF THE PILE THAT BELONGS TO ONE INSTANCE of the box
-     that closes it. The first segment is SHARED; the box fires
-     max(count, lanes) instances, instance i carries shared + lane i+1, and an
-     instance past the last lane carries the shared segment alone. A lane walls
-     operator binding and run merging; a `count` mod is record-wide wherever it
-     was spoken.
+  4. `lane` OPENS A LANE SCOPE and `end` CLOSES the innermost open one. A
+     DELIVERY boxes the innermost OPEN scope: inside an open lane only that
+     lane's items (the box lands in the lane, which stays open), outside any
+     lane the shared items plus every closed lane. Lanes are ordered as spoken;
+     the box fires max(count, lanes) instances, instance i carries shared +
+     lane i+1, and an instance past the last lane carries the shared items
+     alone. A mark is a wall for binding and for run merging; a `count` mod is
+     record-wide wherever it was spoken.
 
   python scripts/magic_grammar.py                 # regenerate the doc
   python scripts/magic_grammar.py --oracle        # assets/spells/grammar_oracle.json for the C++ gate
@@ -147,14 +149,19 @@ for mid, word, field, axis, desc in MODS:
 
 # ---- the separator (rule 4) ---------------------------------------------------
 glyph('lane', 'Sep', 0,
-      'Opens a SEGMENT of the pile that belongs to ONE instance of the box that closes it. '
-      'The first segment is shared by every instance; the first `lane` word opens the segment '
-      'instance 0 carries on top of it, the second the segment instance 1 carries, and so on. '
-      'The box fires max(count, lanes) instances; an instance past the last lane carries the '
-      'shared segment alone. A lane walls binding and merging, and a `count` mod is record-wide '
-      'wherever it is spoken. With no delivery the lanes are the hand\'s, which is how two '
-      'unrelated spells are said at once.',
-      axis='segments (one instance each)')
+      'Opens a LANE: a scope of the pile that belongs to ONE instance of the box that closes it; `end` '
+      'closes it again. The first lane you open is what instance 0 carries on top of the shared '
+      'items, the second what instance 1 carries, and so on; the box fires max(count, lanes) '
+      'instances and an instance past the last lane carries the shared items alone. A delivery '
+      'spoken INSIDE an open lane boxes only that lane, and the lane stays open - which is how a '
+      'socket holds a bolt that fires a bolt. A mark is a wall for binding and for merging; a '
+      '`count` mod is record-wide wherever it is spoken.',
+      scope='open', axis='lanes (one instance each)')
+glyph('end', 'Sep', 0,
+      'Closes the innermost open `lane`, back to the scope around it. A lane left open when '
+      'the sentence runs out is closed for you; an `end` with nothing open is charged and '
+      'does nothing.',
+      scope='close', axis='closes a lane')
 glyph('twin', 'X', 3, 'Two of it, fanned. Said again: four. The double of `shotgun`\'s triple; '
       'everything behind it is paid that many times.',
       field='count', repeat='compose', axis='count x2 (2, 4, 8 ...), fanned')
@@ -231,8 +238,21 @@ def merge_pile(pile):
     return list(merged.values())
 
 
-def box(pile, delivery, nlanes=0):
-    return dict(kind='box', d=delivery, n=1, items=merge_pile(pile), nlanes=nlanes)
+def box(sc, delivery):
+    """RULE 2 + RULE 4: box a whole SCOPE - its shared items first, then one
+    segment per closed lane. The items are stamped with their lane HERE, before
+    the merge, because the lane is part of key() and the merge must not join
+    two segments."""
+    allitems = []
+    for it in sc['pile']:
+        it['lane'] = 0
+        allitems.append(it)
+    for k, ln in enumerate(sc['lanes']):
+        for it in ln:
+            it['lane'] = k + 1
+            allitems.append(it)
+    return dict(kind='box', d=delivery, n=1, items=merge_pile(allitems),
+                nlanes=len(sc['lanes']))
 
 
 def merge_runs(ids):
@@ -250,54 +270,65 @@ def merge_runs(ids):
 
 
 def parse(ids):
-    """Returns a list of clauses — since `also` was dropped for rule 4 there is
+    """Returns a list of clauses - since `also` was dropped for rule 4 there is
     exactly one (or none, for silence). Each is the ROOT hand box plus the
-    payload/mods split of its pile."""
+    payload/mods split of its pile.
+
+    RULE 4 is a SCOPE STACK: `lane` pushes a scope on the current pile, `end`
+    pops the innermost open one into its parent's lane list, and a DELIVERY
+    boxes the innermost OPEN scope - so a delivery inside a lane boxes that
+    lane alone and leaves the lane open."""
     clauses = []
-    pile = []
     items = merge_runs(ids)
+    scopes = [dict(pile=[], lanes=[])]
     i = 0
-    # RULE 4 state: the segment everything pushed from here belongs to, how far
-    # down the pile an operator may reach (a lane mark WALLS binding), and how
-    # many segments the box that closes this pile will have.
-    cur_lane = 0
-    lane_floor = 0
-    nlanes = 0
     while i < len(items):
         it = items[i]
         g = G[it['g']] if it['kind'] == 'raw' else None
         s = g['sort'] if g else None
+        sc = scopes[-1]
         if s == 'Op':
             left = right = None
-            # THE ONE ITEM TO ITS LEFT — the top of the pile, which may be a box
-            # — but never below the lane floor.
-            if g['left'] and len(pile) > lane_floor and accepts(g['left'], pile[-1]):
-                left = pile.pop()
+            # THE ONE ITEM TO ITS LEFT - the top of THIS SCOPE's pile, which may
+            # be a box. A mark is a wall: an operator never reaches past one.
+            if g['left'] and sc['pile'] and accepts(g['left'], sc['pile'][-1]):
+                left = sc['pile'].pop()
             if g['right'] and i + 1 < len(items) and accepts(g['right'], items[i + 1]):
                 right = items[i + 1]
                 i += 1
             complete = (g['left'] is None or left is not None) and \
                        (g['right'] is None or right is not None)
-            pile.append(dict(kind='group', op=it['g'], n=it['n'], left=left,
-                             right=right, complete=complete, lane=cur_lane))
+            sc['pile'].append(dict(kind='group', op=it['g'], n=it['n'], left=left,
+                                   right=right, complete=complete))
         elif s == 'D':
-            b = box(pile, it['g'], nlanes)  # RULE 2
-            b['lane'] = 0
-            pile = [b]
-            cur_lane = 0
-            lane_floor = 0
-            nlanes = 0
+            b = box(sc, it['g'])            # RULE 2, scoped by RULE 4
+            sc['pile'] = [b]
+            sc['lanes'] = []
         elif s == 'Sep':
-            cur_lane += 1                   # RULE 4: a MARK, not an item
-            nlanes = cur_lane
-            lane_floor = len(pile)
+            if g.get('scope', 'open') == 'open':
+                scopes.append(dict(pile=[], lanes=[]))
+            elif len(scopes) > 1:
+                close_lane(scopes)
+            # An `end` with nothing open is a charged no-op.
         else:
-            it['lane'] = cur_lane
-            pile.append(it)                 # RULE 1
+            sc['pile'].append(it)           # RULE 1
         i += 1
     if ids:
-        clauses.append(clause_of(box(pile, 'hand', nlanes)))
+        while len(scopes) > 1:
+            close_lane(scopes)              # an unclosed lane closes implicitly
+        clauses.append(clause_of(box(scopes[0], 'hand')))
     return clauses
+
+
+def close_lane(scopes):
+    """Pop the innermost open lane into its parent. A lane that itself opened
+    lanes and never boxed them has no record to make them columns OF, so they
+    flatten into it - the one place a scope is not a column."""
+    sc = scopes.pop()
+    pile = sc['pile']
+    for sub in sc['lanes']:
+        pile.extend(sub)
+    scopes[-1]['lanes'].append(pile)
 
 
 def clause_of(root):
@@ -333,17 +364,15 @@ def x(n):
 
 
 def show_items(items, nlanes):
-    """A list of pile items, lanes marked. Items are in spoken order and a lane
-    index never decreases along it, so a segment is a contiguous run. ` / ` in
-    both bracket styles, because the C++ compares these strings verbatim."""
-    parts = []
-    lane = 0
-    for it in items:
-        l = lane_of(it)
-        parts += ['/'] * (l - lane)
-        lane = l
-        parts.append(show(it))
-    parts += ['/'] * (nlanes - lane)
+    """A list of pile items with its LANE SCOPES marked: the shared items, then
+    each lane as `/ ... /` - the two marks the sentence actually contains, so
+    the readout round-trips back to words. ` / ` in both bracket styles,
+    because the C++ compares these strings verbatim."""
+    parts = [show(it) for it in items if lane_of(it) == 0]
+    for k in range(1, nlanes + 1):
+        parts.append('/')
+        parts += [show(it) for it in items if lane_of(it) == k]
+        parts.append('/')
     return ' '.join(parts)
 
 
@@ -680,7 +709,7 @@ def glyph_table():
         elif g['sort'] == 'X':
             takes = g['field']
         elif g['sort'] == 'Sep':
-            takes = 'opens a segment'
+            takes = 'closes a lane' if g.get('scope') == 'close' else 'opens a lane'
         sortname = {'M': 'matter', 'E': 'effect', 'D': 'delivery', 'X': 'mod',
                     'Op': 'operator', 'Sep': 'separator'}[g['sort']]
         rows.append('| `%s` | %s | %d | %s | %s | %s | %s |' % (
@@ -740,10 +769,12 @@ WORKED = [
         'explosive projectile swift projectile', 'explosive swift projectile projectile',
         'explosive projectile projectile swift', 'explosive projectile fire']),
     ('A lane is one instance of the box that closes the pile', [
-        'explosive lane fire projectile', 'explosive lane fire lane water projectile',
-        'explosive lane fire shotgun projectile', 'explosive lane fire lane water',
-        'lane explosive projectile lane blood mend self',
-        'fire lane trail projectile', 'fire lane fire projectile']),
+        'lane explosive projectile end lane blood mend self end',
+        'explosive lane sand end lane fire end twin projectile',
+        'lane explosive projectile end lane fire end projectile',
+        'lane explosive projectile fire end projectile',
+        'explosive twin projectile',
+        'fire lane trail end projectile', 'fire lane fire end projectile']),
 ]
 
 
@@ -804,25 +835,30 @@ NAMED = [
     'explosive projectile fire bomb',
     'explosive projectile projectile',
     'explosive projectile shotgun projectile',
-    'explosive lane fire projectile',
-    'explosive lane fire lane water projectile',
+    'explosive lane fire end projectile',
+    'explosive lane sand end lane fire end twin projectile',
     'explosive twin projectile',
     'explosive twin twin projectile',
-    'lane explosive projectile lane blood mend self',
-    'gold lane fire trail projectile',
-    'fire lane fire',
+    'lane explosive projectile end lane blood mend self end',
+    'lane explosive projectile end lane fire end projectile',
+    'lane explosive projectile fire end projectile',
+    'gold lane fire trail end projectile',
+    'fire lane fire end',
+    'lane lane fire end end',
     'fire fire fire',
     'anything projectile',
     'anything',
     'air',
     'lane',
-    'lane lane',
+    'end',
+    'lane lane end end',
+    'lane end lane end',
 ]
 
 
 ALPHA2 = ['fire', 'gold', 'air', 'anything', 'explosive', 'gust', 'transmute', 'mend',
           'trail', 'null', 'aura', 'echo', 'shotgun', 'float', 'lane', 'projectile',
-          'bomb', 'self', 'beam', 'twin']
+          'bomb', 'self', 'beam', 'twin', 'end']
 ALPHA3 = ['fire', 'gold', 'anything', 'transmute', 'trail', 'explosive', 'shotgun',
           'projectile', 'bomb', 'self']
 
@@ -905,14 +941,17 @@ delivery's record, the pile's effects as its payload, the pile's pending mods
 stuck to its record — and speaking CONTINUES, so deliveries NEST. (3) A Mod is
 PENDING and sticks to the box that closes the pile; with no delivery it sticks
 to `hand`, where `shotgun` is three fanned resolve points and `float` is the
-hop and everything else is a charged no-op. (4) `lane` OPENS A SEGMENT OF THE
-PILE THAT BELONGS TO ONE INSTANCE of the box that closes it: the first segment
-is shared, the box fires max(count, lanes) instances, instance i carries
-shared + lane i+1, and an instance past the last lane carries the shared
-segment alone. A lane walls binding and merging; a `count` mod is record-wide
-wherever it is spoken. The outermost box is always `hand`, so the whole
-utterance is ONE cast — lanes on the hand are how two unrelated spells are
-said at once, and `also` is gone.
+hop and everything else is a charged no-op. (4) `lane` OPENS A LANE SCOPE and
+`end` CLOSES the innermost open one, and **a delivery boxes the innermost OPEN
+scope**: inside an open lane only that lane's items (the box lands in the lane,
+which stays open), outside any lane the shared items plus every closed lane —
+the multi-socket box. Lanes are ordered as spoken, lane *i* belongs to instance
+*i*, the box fires max(count, lanes) instances, and an instance past the last
+lane carries the shared items alone. A mark is a wall for binding and for
+merging; a `count` mod is record-wide wherever it is spoken. The outermost box
+is always `hand`, so the whole utterance is ONE cast — lanes on the hand are
+how two unrelated spells are said at once (`lane explosive projectile end lane
+blood mend self end`), and `also` is gone.
 
 **How much order buys.** Orderings, the distinct spells they lower to, and how
 many of those do anything at all (a sentence of nothing but mods is charged and
@@ -926,7 +965,7 @@ fizzles):
 Notation: `⋈` transmute (A ⋈ B); `◂` the operator took the word on its
 left; `▸` on its right; `_` a required word that was missing (the operator
 fizzles, charged); `×N` a merged run; `[ … **delivery**]` a BOX — the pile that
-delivery closed; `/` a lane boundary inside a pile (`lane`). The outermost
+delivery closed; `/ … /` a LANE inside a pile (`lane` … `end`). The outermost
 `hand` box is drawn bare.
 Cost shape: `N×[payload]·carry(delivery)` — N instances, each paying the
 payload tariff, times the delivery's carry premium, plus the word costs; with
