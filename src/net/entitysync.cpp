@@ -125,7 +125,11 @@ void EntitySync::Connect(uint32_t me, uint32_t peer) {
   // a label the host's restarted clock will reuse for a different tick.
   mobMem_.clear();
   bodyMem_.clear();
+  bodyChunkMem_.clear();
   chunkMem_.clear();
+  // The closures capture `this` and name THIS connection's ids, so they are
+  // re-installed rather than inherited from the last one.
+  ownershipBound_ = false;
   announcedMobs_.clear();
   announcedBodies_.clear();
   ghostMobSeen_.clear();
@@ -149,7 +153,12 @@ void EntitySync::Disconnect() {
   ghostBodySeen_.clear();
   mobMem_.clear();
   bodyMem_.clear();
+  bodyChunkMem_.clear();
   chunkMem_.clear();
+  // NOT unbound here: the caller replaces the two closures with an
+  // "everything is mine" pair (main.cpp's netDrop), and clearing the flag is
+  // what lets a later Connect install ours again.
+  ownershipBound_ = false;
   // `localGrants_` is deliberately KEPT: a grant that arrived before the peer
   // dropped is an item that is already gone from the peer's world, and
   // throwing it away here would destroy the sword on both machines.
@@ -191,27 +200,53 @@ uint32_t EntitySync::MobOwner(uint64_t mobId, Vec3 feetVox) {
   return who;
 }
 
-uint32_t EntitySync::BodyOwner(Vec3 posVox) {
-  if (peerCount_ < 2) return me_;
-  // ---- CHUNK-KEYED, NOT BODY-KEYED, AND THAT IS AN API LIMIT ------------
-  //
-  // `DebrisSystem::SetOwnershipFn` is `uint32_t(Vec3)`: the body's identity
-  // is not passed, so there is no id to key the hysteresis memory on and this
-  // has to fall back to `ChunkAuthority` with a chunk-keyed incumbent. The
-  // consequence is authority.h's stated flapping case — a body sitting
-  // exactly on a chunk boundary re-homes as it jitters across it — bounded by
-  // the same 2-chunk hysteresis, so it costs a handoff rather than a
-  // divergence. Fixing it properly means widening that signature to carry the
-  // global id, which is debris.h's to change and not this package's.
-  const IVec3 wc = ChunkOfFeet(posVox);
-  const uint64_t key = World::PackChunkKey(wc);
-  const uint32_t who = ChunkAuthority(wc, Peers(), bodyMem_);
+// ---- A BODY, KEYED ON THE BODY (M9.4-E) ------------------------------------
+//
+// M9.4-C's `SetOwnershipFn` passed a position and nothing else, so this had to
+// key its incumbent on the CHUNK — and a chunk-keyed incumbent is ONE memory
+// slot shared by every body standing in that chunk, which is not hysteresis
+// for any of them: a sword jittering across a boundary moved the crate beside
+// it as well, and two bodies crossing in opposite directions overwrote each
+// other's incumbent every tick (the flapping case authority.h names). With the
+// global id in hand this is exactly `MobOwner` with a different table.
+uint32_t EntitySync::BodyOwner(uint64_t globalBodyId, Vec3 posVox) {
+  if (peerCount_ < 2) return me_;   // no second candidate: everything is mine
+  if (globalBodyId == 0) return BodyOwner(posVox);   // no identity to key on
+  const uint32_t who = EntityAuthority(globalBodyId, posVox, Peers(), bodyMem_);
+  // kNoAuthority: nobody's window holds it with margin. Unlike a chunk (which
+  // is simply not scanned), a body has to be stepped by SOMEBODY or it freezes
+  // in mid-air, so the machine that currently holds it keeps it and the
+  // incumbent is left alone — `MobOwner`'s rule, for the same reason.
   if (who == kNoAuthority) {
-    const auto it = bodyMem_.find(key);
+    const auto it = bodyMem_.find(globalBodyId);
     return it != bodyMem_.end() ? it->second : me_;
   }
-  Remember(bodyMem_, key, who);
+  Remember(bodyMem_, globalBodyId, who);
   return who;
+}
+
+uint32_t EntitySync::BodyOwner(Vec3 posVox) {
+  if (peerCount_ < 2) return me_;
+  const IVec3 wc = ChunkOfFeet(posVox);
+  const uint64_t key = World::PackChunkKey(wc);
+  const uint32_t who = ChunkAuthority(wc, Peers(), bodyChunkMem_);
+  if (who == kNoAuthority) {
+    const auto it = bodyChunkMem_.find(key);
+    return it != bodyChunkMem_.end() ? it->second : me_;
+  }
+  Remember(bodyChunkMem_, key, who);
+  return who;
+}
+
+// ---- and the one place both closures are installed --------------------------
+void EntitySync::BindOwnership(MobSystem& mobs, DebrisSystem& debris) {
+  if (ownershipBound_) return;
+  mobs.SetOwnershipFn(
+      [this](uint64_t id, Vec3 feet) { return MobOwner(id, feet); });
+  debris.SetOwnershipFn(
+      [this](uint64_t id, Vec3 pos) { return BodyOwner(id, pos); });
+  debris.SetChunkOwnedFn([this](IVec3 wc) { return ChunkOwned(wc); });
+  ownershipBound_ = true;
 }
 
 bool EntitySync::ChunkOwned(IVec3 wc) {
@@ -256,6 +291,11 @@ void EntitySync::ScanHandoffs(MobSystem& mobs, DebrisSystem& debris,
                               uint32_t tick) {
   (void)tick;
   if (!connected_ || peerCount_ < 2) return;
+  // Once per connection, and free after that. It is here rather than only at
+  // connect time so that a caller which installed the older position-only
+  // debris closure still ends up with the body-keyed hysteresis M9.4-E added
+  // — one binding site, whoever called it.
+  BindOwnership(mobs, debris);
 
   // ---- creatures ---------------------------------------------------------
   //
@@ -295,7 +335,11 @@ void EntitySync::ScanHandoffs(MobSystem& mobs, DebrisSystem& debris,
   for (uint32_t i = 0; i < debris.BodyCount(); i++) {
     const uint64_t h = debris.BodyHandle(i);
     if (h == 0 || debris.IsGhost(h)) continue;
-    if (BodyOwner(debris.BodyPosition(i)) != me_) handles.push_back(h);
+    // BY THE BODY'S OWN ID, the same question `RefreshOwnership` asks a tick
+    // later: a chunk-keyed answer here and a body-keyed one there would name
+    // two different machines for one crate.
+    if (BodyOwner(debris.GlobalIdOf(h), debris.BodyPosition(i)) != me_)
+      handles.push_back(h);
   }
   for (uint64_t h : handles) {
     BodyHandoff bh;
@@ -492,14 +536,21 @@ void EntitySync::ApplyForTick(uint32_t tick, MobSystem& mobs,
     // ---- announces ------------------------------------------------------
     //
     // A mob announce with no handoff behind it means "I own this creature and
-    // you have never seen it". There is no `MobSystem::ApplyAnnounce`: a
-    // creature cannot be built from an announce alone (it carries no rig
-    // state), so the pose that follows is what creates nothing and the
-    // HANDOFF is the only thing that spawns. What the announce buys on the
-    // mob side is the id -> expiry-clock entry below, which is what stops a
-    // creature the peer stopped talking about from standing forever.
+    // you have never seen it" — a creature the peer has ALWAYS owned, which
+    // until M9.4-E had nowhere to land: only `ApplyHandoff` spawned, and it
+    // spawns a mob this machine then owns, so every pose for a creature the
+    // peer merely KEPT was refused for an unknown id (the two-process smoke
+    // counted `misses=144`). `MobSystem::ApplyAnnounce` builds it as a GHOST
+    // from the def name and the gear, and the pose two fields down — same
+    // batch, applied after this loop by the envelope's field order — is what
+    // places it.
+    //
+    // The expiry-clock entry is set whether or not the spawn succeeded: an
+    // announce for a def this build does not have is still the peer telling
+    // us the id exists, and `ExpireGhosts` is what forgets it.
     for (const MobAnnounce& a : b.mobAnnounces) {
       c_.announcesIn++;
+      mobs.ApplyAnnounce(a);
       ghostMobSeen_[a.id] = tick;
     }
     for (const BodyAnnounce& a : b.bodyAnnounces) {
@@ -516,12 +567,36 @@ void EntitySync::ApplyForTick(uint32_t tick, MobSystem& mobs,
     }
 
     // ---- poses ----------------------------------------------------------
+    // ---- WHY A POSE WAS REFUSED, not just that one was (M9.4-E) ----------
+    //
+    // `applyMisses` is documented as "poses for an id we do not hold" and
+    // that is the only defect it can name: a creature the peer is drawing
+    // that does not exist here. It used to count TWO other things as well,
+    // and both of them are the system working:
+    //
+    //   MINE NOW. The receiving machine promotes a ghost to local the tick
+    //   the derived authority flips (`ScanHandoffs`' long note) and does not
+    //   wait for the handoff record, so the D+1 poses already in flight
+    //   arrive for a creature this machine has correctly started stepping.
+    //   `ApplyPose` refuses them, which is right, and counting the refusal
+    //   as a miss made the fixed-latency window look like a lost entity.
+    //
+    //   STALE. A pose older than the one already latched, dropped rather
+    //   than applied so a body cannot be rewound.
+    //
+    // Split at the point of failure rather than inferred later (CLAUDE.md
+    // rule 6): the id is in hand here and `FindMobById` / `HandleOfGlobalId`
+    // answer "do I hold it" exactly.
     for (const MobPose& p : b.mobPoses) {
       if (mobs.ApplyPose(p)) {
         c_.posesIn++;
         ghostMobSeen_[p.id] = tick;
-      } else {
+      } else if (mobs.FindMobById(p.id) == nullptr) {
         c_.applyMisses++;
+      } else if (mobs.MobOwner(p.id) == mobs.LocalPlayerId()) {
+        c_.posesMine++;
+      } else {
+        c_.posesStale++;
       }
     }
     for (const BodyPose& p : b.bodyPoses) {
@@ -529,7 +604,13 @@ void EntitySync::ApplyForTick(uint32_t tick, MobSystem& mobs,
         c_.posesIn++;
         ghostBodySeen_[p.globalId] = tick;
       } else {
-        c_.applyMisses++;
+        const uint64_t h = debris.HandleOfGlobalId(p.globalId);
+        if (h == 0)
+          c_.applyMisses++;
+        else if (!debris.IsGhost(h))
+          c_.posesMine++;
+        else
+          c_.posesStale++;
       }
     }
 

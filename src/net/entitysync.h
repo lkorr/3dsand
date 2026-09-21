@@ -177,7 +177,26 @@ class EntitySync {
   // They capture `this`, so the EntitySync must outlive the two systems'
   // bindings — main.cpp unbinds in `netDrop` before anything is destroyed.
   uint32_t MobOwner(uint64_t mobId, Vec3 feetVox);
+  // BY BODY ID (M9.4-E). The id is the body's global id
+  // (`net::MakeGlobalBodyId`), the same identity every `BodyAnnounce`,
+  // `BodyPose` and `BodyHandoff` carries, and it is what the hysteresis
+  // incumbent is keyed on — one memory slot per BODY, exactly as mobs get one
+  // per creature.
+  uint32_t BodyOwner(uint64_t globalBodyId, Vec3 posVox);
+  // THE OLD POSITION-ONLY FORM, kept because a caller that has no id in hand
+  // still needs an answer. It falls back to a CHUNK-keyed incumbent, which is
+  // the flapping case M9.4-C's comment described: one incumbent shared by
+  // every body in the chunk. Its memory is a separate map from the id-keyed
+  // one — two key spaces in one table would collide a chunk key with a body
+  // id sooner or later, and the symptom would be a crate that answers a
+  // sword's question.
   uint32_t BodyOwner(Vec3 posVox);
+  // INSTALL BOTH OWNERSHIP CLOSURES on the two systems, with the id-carrying
+  // signatures. Idempotent, and called from `ScanHandoffs` so that a caller
+  // that bound the older position-only closure still gets the body-keyed
+  // hysteresis; call it explicitly at connect time and the guard makes the
+  // per-tick call free.
+  void BindOwnership(MobSystem& mobs, DebrisSystem& debris);
   // ...and the chunk question, which is NOT the body question: the island
   // scan is about a region of grid, not about anything standing in it.
   bool ChunkOwned(IVec3 wc);
@@ -218,6 +237,11 @@ class EntitySync {
     uint64_t takesOut = 0, takesIn = 0, grantsOut = 0, grantsIn = 0;
     uint64_t batchesOut = 0, batchesIn = 0, bytesOut = 0;
     uint64_t applyMisses = 0;   // poses for an id we do not hold
+    // ...and the two refusals that are NOT defects, split out of it by
+    // M9.4-E so that `misses` means what its comment says. See the note at
+    // the pose loop in ApplyForTick.
+    uint64_t posesMine = 0;     // for an entity this machine now owns
+    uint64_t posesStale = 0;    // older than the pose already latched
     uint32_t ghostsNow = 0;     // ghost mobs + ghost bodies at the last apply
     uint32_t ghostsMax = 0;
     uint64_t expired = 0;       // ghosts dropped by the 3 s rule
@@ -238,6 +262,11 @@ class EntitySync {
   // The incumbent tables authority.h's hysteresis needs. Keyed by ENTITY id
   // (mob id / body global id) and by chunk key respectively — never mixed.
   AuthorityMemory mobMem_, bodyMem_, chunkMem_;
+  // The legacy position-only `BodyOwner`'s incumbent table, keyed by CHUNK.
+  // Separate from `bodyMem_` so the two key spaces cannot meet.
+  AuthorityMemory bodyChunkMem_;
+  // Set once the two ownership closures have been installed this connection.
+  bool ownershipBound_ = false;
 
   // Which of my entities the peer has been told about. An id leaves these by
   // exactly three doors: it left the interest set (Gone/despawn), it stopped

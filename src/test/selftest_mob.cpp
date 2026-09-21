@@ -9538,6 +9538,197 @@ Status GateMobHandoff(Ctx& c, std::string& detail) {
                      runEnd[0].x == runEnd[1].x && runEnd[0].y == runEnd[1].y &&
                      runEnd[0].z == runEnd[1].z;
 
+  // ======== ARM E: a creature the peer has ALWAYS owned (M9.4-E) ==========
+  //
+  // THE GAP THIS CLOSES, stated as the measurement it failed. Before
+  // `MobSystem::ApplyAnnounce` existed, the only thing that spawned was
+  // `ApplyHandoff` -- and that spawns a mob THIS machine then owns. So a
+  // creature the peer never gave away had no body here to address, every pose
+  // for it was refused for an unknown id, and the two-process smoke counted
+  // `misses=144`. Arms A-C all start from a creature this machine spawned; not
+  // one of them could have caught it.
+  //
+  // WHAT IT ASSERTS, in the order the network does it: announce -> the ghost
+  // exists and is a ghost BEFORE any tick can look at it -> 60 ticks of poses
+  // author nothing and step nothing -> its gear came across by name ->
+  // a handoff promotes THAT body rather than making a second one ->
+  // `MobGone` releases it.
+  bool eExists = false, eGhost = false, eGearSame = false, eIdKept = false;
+  bool ePromoted = false, eGoneRefusedWhileMine = false, eReleased = false;
+  bool ePinned = false;
+  int eGearSent = 0, eGearBack = 0, eOps = 0;
+  uint64_t eAi = 0;
+  double ePosJump = 0;
+  uint32_t eCountGhost = 0, eCountPromoted = 0;
+  const int announceTicks = (int)BaselineNumber("mobAnnounceGhostTicks", 60);
+  {
+    c.debris.Reset();
+    c.mobs.Reset();
+    c.mobs.SetNextIdCounter(1);
+    c.mobs.SetItems(&c.items);
+    const uint64_t id =
+        AiSpawn(c, defIndex, {spot.x, spot.y + 1, spot.z}, "duelist", why);
+    if (id == 0) {
+      detail = why;
+      restore();
+      return Status::Fail;
+    }
+    // ARMED AND ARMOURED: the announce carries gear and nothing else, so a
+    // creature with neither would make "gear 0/0" pass by having nothing to
+    // lose. One worn piece and one held weapon = the two kinds of WireGear.
+    for (const ItemDef& it : c.items.items) {
+      if (!ItemKindIsWorn(it.kind)) continue;
+      int homeSlot = -1;
+      for (int sl = 0; sl < kEquipSlotCount; sl++)
+        if (EquipSlotAccepts(sl, it.kind)) { homeSlot = sl; break; }
+      if (homeSlot < 0) continue;
+      if (c.mobs.WearItem(id, &it, homeSlot, /*dye=*/0x40u)) break;
+    }
+    for (const ItemDef& it : c.items.items)
+      if (!ItemKindIsWorn(it.kind) && c.mobs.EquipItem(id, &it)) break;
+
+    ::net::MobAnnounce ann{};
+    if (!c.mobs.BuildAnnounce(id, ann)) {
+      detail = "BuildAnnounce refused a dressed mob";
+      restore();
+      return Status::Fail;
+    }
+    // The peer keeps it. This is the whole difference from arm B: nobody is
+    // giving it away, so nothing but the announce ever arrives.
+    ann.owner = kPeer;
+    eGearSent = (int)ann.gear.size();
+    // Through the wire, because a record that only works in memory is not a
+    // record (the same round trip arm B makes the handoff take).
+    std::vector<uint8_t> bytes;
+    { ByteWriter w{bytes}; ::net::Encode(w, ann); }
+    ByteReader ar{bytes.data(), bytes.size()};
+    ::net::MobAnnounce got{};
+    if (!::net::Decode(ar, got)) {
+      detail = "MobAnnounce did not survive Encode/Decode";
+      restore();
+      return Status::Fail;
+    }
+
+    MobSystem far;
+    far.Init(&c.phys, &c.world, &c.debris, c.mats, c.reactions);
+    far.SetMicroSet(c.mobs.MicroSet());
+    far.SetDefFactory(c.mobs.DefFactory());
+    far.SetDefs(std::vector<MobDef>(c.mobs.Defs()));
+    far.SetBehaviors(ai::Library(c.mobs.Behaviors()));
+    far.SetAttackStyles(StyleLibrary(c.mobs.AttackStyles()));
+    far.SetItems(&c.items);
+
+    Mob* gm = far.ApplyAnnounce(got);
+    eExists = gm != nullptr;
+    // GHOST BEFORE THE FIRST TICK, not after the first ownership refresh: the
+    // owner arrives IN the announce precisely so that no PreTick can ever see
+    // this creature as local (mob.cpp's note on the assignment).
+    eGhost = eExists && gm->IsGhost();
+    eIdKept = far.FindMobById(got.id) != nullptr;
+    eCountGhost = far.MobCount();
+
+    // ---- the pose stream, and what it must NOT do ------------------------
+    //
+    // A STANDING stream, not a walking one. Arm A already measures that a
+    // ghost TRACKS a moving feed; what this arm measures is that the promotion
+    // below is continuous, and a walked ghost would be compared against a
+    // handoff record written from a creature that never moved -- a fixture
+    // teleport reported as a position jump.
+    ::net::MobPose base{};
+    if (!c.mobs.BuildPose(id, tick, base)) {
+      detail = "BuildPose refused the announced mob";
+      restore();
+      return Status::Fail;
+    }
+    const uint64_t ai0 = far.AiSteps();
+    for (int t = 0; t < announceTicks; t++) {
+      ::net::MobPose p = base;
+      p.tick = tick + (uint32_t)t;
+      far.ApplyPose(p);
+      std::vector<ParticleSpawn> spawns;
+      std::vector<CellOp> cellOps;
+      std::vector<BrushOp> ops;
+      far.PreTick(tick + (uint32_t)t + 1, c.world, ops, cellOps, spawns);
+      eOps += (int)ops.size() + (int)cellOps.size();
+    }
+    eAi = far.AiSteps() - ai0;
+
+    // ---- AND AN OWNERSHIP FUNCTION MAY NOT TAKE IT --------------------
+    //
+    // The regression this pins, measured in the two-process smoke of
+    // 2026-09-21: once an announce gave the client a body, the derived
+    // authority promoted it the moment the client's player was nearer -- so
+    // the host posed three humans for 187 ticks (`handoffs out=0`: its own
+    // authority had never flipped) while the client stepped a PRISTINE copy
+    // of the same three for 157. A creature whose record has never arrived is
+    // not this machine's to claim; only a MobHandoff can make it so
+    // (mob.h, `announceOnly_`).
+    //
+    // Driven with the most aggressive possible function -- "everything is
+    // mine" -- so the claim is about the pin and not about the arithmetic.
+    far.SetOwnershipFn([](uint64_t, Vec3) { return MobSystem::kLocalOwner; });
+    {
+      std::vector<ParticleSpawn> spawns;
+      std::vector<CellOp> cellOps;
+      std::vector<BrushOp> ops;
+      far.PreTick(tick + (uint32_t)announceTicks + 1, c.world, ops, cellOps,
+                  spawns);
+      const Mob* still = far.FindMobById(got.id);
+      ePinned = still != nullptr && still->IsGhost() && ops.empty() &&
+                cellOps.empty();
+    }
+    far.SetOwnershipFn(nullptr);
+
+    // ---- the gear came across BY NAME ------------------------------------
+    ::net::MobAnnounce back{};
+    if (far.BuildAnnounce(got.id, back)) {
+      eGearBack = (int)back.gear.size();
+      eGearSame = eGearBack == eGearSent && eGearSent > 0;
+      for (int k = 0; k < eGearBack && eGearSame; k++)
+        eGearSame = back.gear[k].item == got.gear[k].item &&
+                    back.gear[k].held == got.gear[k].held &&
+                    back.gear[k].dye == got.gear[k].dye;
+    }
+
+    // ---- and now it changes hands: THE SAME BODY, promoted ---------------
+    const Vec3 ghostAt = far.MobOrigin(got.id);
+    ::net::MobHandoff h{};
+    if (c.mobs.TakeHandoff(id, kPeer, h)) {
+      Mob* nm = far.ApplyHandoff(h);
+      eCountPromoted = far.MobCount();
+      if (nm != nullptr) {
+        const Vec3 nowAt = far.MobOrigin(got.id);
+        const float dx = nowAt.x - ghostAt.x, dy = nowAt.y - ghostAt.y,
+                    dz = nowAt.z - ghostAt.z;
+        ePosJump = (double)std::sqrt(dx * dx + dy * dy + dz * dz);
+        // IN PLACE means three things at once: it is no longer a ghost, the
+        // id did not change, and NO SECOND CREATURE appeared. The count is
+        // what catches a "despawn and respawn" implementation, which would
+        // satisfy the other two and flicker the body on screen.
+        ePromoted = !nm->IsGhost() && far.FindMobById(got.id) != nullptr &&
+                    eCountPromoted == eCountGhost;
+      }
+    }
+
+    // ---- released ---------------------------------------------------------
+    //
+    // A MOB I OWN IS NOT KILLED BY SOMEBODY ELSE'S SAY-SO, which is why the
+    // gone has to be aimed at a ghost: the handoff above made this creature
+    // MINE, and `ApplyGone` refuses it on purpose (mob.h). Both halves are
+    // asserted -- the refusal while it is mine, then the release once it is a
+    // ghost again, which is the state every announce-spawned creature is in.
+    ::net::MobGone gone{got.id, ::net::kGoneDespawn};
+    eGoneRefusedWhileMine = !far.ApplyGone(gone);
+    far.SetMobOwner(got.id, kPeer);
+    eReleased = far.ApplyGone(gone) && far.FindMobById(got.id) == nullptr;
+    far.Reset();
+    c.mobs.ClearPlayerActor();
+    c.mobs.ClearAttackRequests();
+  }
+  const bool armE = eExists && eGhost && eIdKept && eOps == 0 && eAi == 0 &&
+                    ePinned && eGearSame && ePromoted && ePosJump < 0.001 &&
+                    eGoneRefusedWhileMine && eReleased;
+
   RecordObserved("mobGhostTrackErrVox", trackErr);
   RecordObserved("mobHandoffRecordBytes", (double)recordBytes);
 
@@ -9557,7 +9748,7 @@ Status GateMobHandoff(Ctx& c, std::string& detail) {
                     aiDuring == 0 && opsAfter > 0 && aiAfter > 0 &&
                     jumpIn < 0.001 && jumpOut < 1.0 && walkedBefore > 0.5 &&
                     walkedAfter > 0.5;
-  const bool ok = armA && armB && armC && inert;
+  const bool ok = armA && armB && armC && inert && armE;
 
   detail = Format(
       "A local %d ops / %llu ai vs ghost %d ops / %llu ai, track %.4f <= %.4f "
@@ -9567,7 +9758,10 @@ Status GateMobHandoff(Ctx& c, std::string& detail) {
       "%s), targetable %d, solid %d->%d | B record %zu B "
       "identical %d (%s), brain %d, gear %d/%d %d | C ops %d->%d->%d, ai "
       "%llu->%llu->%llu, jump in %.4f out %.4f, walked %.2f/%.2f | D ops %d/%d,"
-      " inert %d",
+      " inert %d | E ghost %d/%d id %d, %d ops / %llu ai over %d pose ticks, "
+      "pinned %d, gear %d/%d %d, promoted %d (jump %.4f, mobs %u->%u), "
+      "gone refused %d "
+      "released %d",
       localOps.brush + localOps.cell, (unsigned long long)aiLocal,
       ghostOps.brush + ghostOps.cell, (unsigned long long)aiGhost, trackErr,
       trackTol, ghostTicks, trackErrBySlot, badSlot, badLimbGot, badLimbNow,
@@ -9578,7 +9772,12 @@ Status GateMobHandoff(Ctx& c, std::string& detail) {
       recordWhy.empty() ? "-" : recordWhy.c_str(), brainSame ? 1 : 0, gearBack, gearSent, gearSame ? 1 : 0, opsBefore,
       opsDuring, opsAfter, (unsigned long long)aiBefore,
       (unsigned long long)aiDuring, (unsigned long long)aiAfter, jumpIn,
-      jumpOut, walkedBefore, walkedAfter, runOps[0], runOps[1], inert ? 1 : 0);
+      jumpOut, walkedBefore, walkedAfter, runOps[0], runOps[1], inert ? 1 : 0,
+      eExists ? 1 : 0, eGhost ? 1 : 0, eIdKept ? 1 : 0, eOps,
+      (unsigned long long)eAi, announceTicks, ePinned ? 1 : 0, eGearBack,
+      eGearSent,
+      eGearSame ? 1 : 0, ePromoted ? 1 : 0, ePosJump, eCountGhost,
+      eCountPromoted, eGoneRefusedWhileMine ? 1 : 0, eReleased ? 1 : 0);
 
   restore();
   return ok ? Status::Pass : Status::Fail;

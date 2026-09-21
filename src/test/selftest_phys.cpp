@@ -1326,7 +1326,16 @@ Status GateDebrisGhost(Ctx& c, std::string& detail) {
   // as net::EntityAuthority will be, so nothing about how the gate drives it
   // differs from how the game will.
   constexpr uint32_t kPeer = 1;
-  debris.SetOwnershipFn([](Vec3 p) -> uint32_t {
+  // THE BODY'S GLOBAL ID TRAVELS WITH THE QUESTION (M9.4-E widened this
+  // signature so `net::EntitySync` could key its hysteresis per BODY instead
+  // of per chunk). The split here is still positional -- that is what makes
+  // the seam a straight line the fixture can drive a body across -- but the
+  // id is taken and checked, so a build that stopped passing one would fail
+  // here rather than silently reverting to chunk-keyed hysteresis.
+  uint32_t idsSeen = 0, idsZero = 0;
+  debris.SetOwnershipFn([&](uint64_t gid, Vec3 p) -> uint32_t {
+    idsSeen++;
+    if (gid == 0) idsZero++;
     return p.x < 140.0f ? kPeer : DebrisSystem::kLocalOwner;
   });
   // The chunk half of the same split, for subtest (b).
@@ -1568,7 +1577,7 @@ Status GateDebrisGhost(Ctx& c, std::string& detail) {
     //    resolves it. The body must be MINE for that, so the ownership fn is
     //    dropped for the length of the exchange and the body reclaimed --
     //    which is also, exactly, what a handoff would have done.
-    debris.SetOwnershipFn(nullptr);
+    debris.ClearOwnershipFn();
     net::BodyHandoff toMe;
     toMe.announce.globalId = ghostId;
     toMe.announce.owner = DebrisSystem::kLocalOwner;
@@ -1594,6 +1603,13 @@ Status GateDebrisGhost(Ctx& c, std::string& detail) {
   }
   note(itemOk, "item");
 
+  // THE WIDENED SIGNATURE IS ACTUALLY CARRYING AN IDENTITY (M9.4-E). A build
+  // that passed 0 for every body would look exactly like this gate passing:
+  // the positional split still answers correctly, and the hysteresis would
+  // have quietly gone back to being chunk-keyed. So the id is asserted, not
+  // just accepted.
+  note(idsSeen > 0 && idsZero == 0, "bodyid");
+
   // THE NUMBERS COME OUT BEFORE THE TEARDOWN. Reset() clears the probe along
   // with the bodies it counted, and the first run of this gate reported
   // `poses driven 0 refused 0, emitters skipped 0, (out 0 in 0)` for exactly
@@ -1607,7 +1623,7 @@ Status GateDebrisGhost(Ctx& c, std::string& detail) {
   // DebrisSystem (see kOrder's note), so an ownership function left installed
   // would turn every later gate's bodies into ghosts that emit nothing, and
   // the failures would be attributed to those gates. The callbacks go too.
-  debris.SetOwnershipFn(nullptr);
+  debris.ClearOwnershipFn();
   debris.SetChunkOwnedFn(nullptr);
   debris.SetItemLookupFn(nullptr);
   debris.SetItemTakeFn(nullptr);
@@ -1618,12 +1634,13 @@ Status GateDebrisGhost(Ctx& c, std::string& detail) {
       "ghost: kinematic=%d track err %.4f vox, ops authored %u cell / %u spawn "
       "(owned control settled %u); scan skipped %u peer chunk(s), %u of mine; "
       "handoff pos jump %.4f vel jump %.4f (out %u in %u); item grant '%s'; "
-      "poses driven %u refused %u, emitters skipped %u%s%s",
+      "poses driven %u refused %u, emitters skipped %u; owner fn asked %u "
+      "time(s), %u without an id%s%s",
       ghostKinematic ? 1 : 0, trackErr, ghostCellOps, ghostSpawns, ownedSettled,
       skippedPeerChunk, skippedOwnChunk, posJump, velJump,
       probe.handoffsOut, probe.handoffsIn,
       grantedName.c_str(), probe.ghostsDriven, probe.posesRefused,
-      probe.emittersSkipped,
+      probe.emittersSkipped, idsSeen, idsZero,
       failed.empty() ? "" : "; FAILED: ", failed.c_str());
   std::printf("debris ghost: %s (%s)\n", ok ? "PASS" : "FAIL", detail.c_str());
   return ok ? Status::Pass : Status::Fail;
