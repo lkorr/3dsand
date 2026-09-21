@@ -13109,14 +13109,49 @@ same binary — needed `SANDVOX_TICKS_PER_FRAME`, because the frame loop's tick
 schedule and the OS cursor are both wall-clock inputs and an unattended
 `--autofly-hard` run had never been quite reproducible without it.
 
-What this does NOT yet do is give the session an id, a transport or a second
-instance. `main()` still holds one alias reference per `PlayerSession` member so
-the presentation half of the file keeps its names; the reserved player id band
-in `MobSystem::nextId_` does not exist, so a second session's actor id would
-collide with mob id 1; and `WaterBodies()` is still keyed on the residency
-window origin. That last one is rule 1 below, and it is restated at the top of
-`session.h` and over the `WaterBodies()` accessor, where the next person to add
-one will read it.
+**N players in one tick (M9.1, 2026-09-21; `docs/PLAN_multiplayer_m9.md` §2).**
+`TickAuthority` takes a `std::span<SessionTick>` — one `PlayerSession` plus its
+`FrameIntent` and `TickInput` per player — and is the alternation of sixteen
+phases, `A* B C* D E* F G* H I* J K* L M* N O* P` (`*` = once per session in
+index order), cut at the old body's real segment boundaries. The order is the
+design constraint, not a tidiness choice: the controller runs before the window
+recentres on it, the window shifts before the laser ray reads the grid, the dev
+panel spawns before the brush writes, `mobs.PreTick` sees the avatar's bleed
+ops, the submit comes after every producer; merging the player runs would
+reorder the op stream, and op order is the tick's identity (rule 3, lowest op
+index owns the cell). One `OpBatch` per tick; sessions append in index order.
+Session 0 is the PRIMARY: the window, the 3×3×3 mirror, the far-plume eye and
+the submit's `playerChunk` follow it, and only it (`localView`) reaches the
+presentation seam — a session without a view binds those names to a
+`PresentationSink` and auto-revives. Every non-primary session reads the world
+through `World::KindAtCached` (the on-demand chunk cache, kept one chunk ahead
+by `PrefetchChunksAround` at one fetch per tick in steady state, with the
+analytic terrain column as the miss fallback — an out-of-mirror body used to
+HOVER, because `Collides` treats `Unknown` as air on purpose and `KnownDrop`
+clamps the descent). The three one-player singletons are plural: the avatar's
+mob id is a constructor argument (session 0 keeps `0x5A11ED`, the gore seed),
+`Physics` holds every player proxy, and player actor ids live in a high band
+(`ai::kPlayerActorBase = 1<<62`, `IsPlayerActorId`) disjoint from mob ids and
+from `targetId 0` = nobody — the old `id < avatars_.size()` had made "no
+target" resolve to the player's limb. Proof: the one-session op record is
+byte-identical to the pre-refactor oracle (8,738,460 B), the hash is unmoved
+(`ffa84539`), and gate `two-players` walks two scripted players 12 chunks apart
+for 300 ticks twice. What is still one-of: the window origin and every per-slot
+buffer, the slot-keyed world hash (S3), `main()`'s alias references, and
+`WaterBodies()` keyed on the window origin (rule 1 below).
+
+**M9 proper (`docs/PLAN_multiplayer_m9.md`, plan of record 2026-09-20).** The
+audit under-stated one number: the residency window is `kWorldN` ×
+`kVoxelMeters` = a **51.2 m cube**, so two players walking independently leave
+each other's window in seconds and the host cannot simulate the remote player's
+surroundings. Therefore each machine is authoritative for its own player's
+controller and for the chunks and entities nearest it — the "nearest player
+under distributed authority, later" above, and later is now; the host is tick
+pacing, relay, persistence and lobby, and no second host window or ticket slot
+is needed for two players. `TickInput` never goes on the wire; outcomes do
+(`PlayerState` per tick, ops applied at T+D under delayed lockstep, D=4). The
+plan's §4 records the adversarial review of that protocol and its rejected
+alternative (one shared window with a leash).
 
 **What M9 still needs** (the audit's "later" column, against the tree above):
 transport and lobby (Steam / WebRTC; browser builds have no raw UDP, and both

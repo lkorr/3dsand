@@ -125,7 +125,7 @@ Wave 1 (parallel, disjoint files)                                       STATUS 2
   P1  TickAuthority phase split          session.h/.cpp, main.cpp (tiny)    LANDED 108f82d: oracle cmp identical, hash unmoved
   P2  per-player singletons              physics.*, avatar.h, mob.h/.cpp,
                                          ai_behavior.h                      LANDED be0814b: hash unmoved (no tie-break saw the band)
-Wave 2 (after P1+P2 merged into mp-two, 56a9f87)
+Wave 2 (after P1+P2 merged into mp-two, 56a9f87)               P3 LANDED 452e77e: gate green, hash unmoved, fallback retires at tick 0
   P3  KindAtCached + gate two-players    world.h/.cpp, selftest_player.cpp,
                                          selftest.cpp (kOrder), baseline.json   hash UNMOVED
 Endgame: build mp-two once; --verify determinism,two-players,tick-input,mob-burn,ops-replay;
