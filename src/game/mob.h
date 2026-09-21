@@ -17,6 +17,8 @@
 #include "phys/debris.h"
 #include "phys/physics.h"
 #include "sim/materials.h"
+#include "net/mobsync.h"    // the four records mob ownership exchanges
+#include "sim/bytestream.h"  // ByteWriter/ByteReader: the per-mob record
 #include "sim/microbody.h"
 #include "sim/voxload.h"
 #include "sim/world.h"
@@ -1517,6 +1519,41 @@ class Mob {
   MobSystem* Sys() const { return sys_; }
   Vec3 Origin() const { return origin_; }
   float BodyY() const { return bodyY_; }
+
+  // ---- WHO STEPS THIS CREATURE (docs/PLAN_multiplayer_m9.md M9.4-B) --------
+  //
+  // A playerId. `kLocalOwner` (0) is session 0's id and the default, so a
+  // single-player process is every mob owned by the only player there is and
+  // the whole of this feature is inert — which is what keeps the world hash
+  // where it was: with no ownership function set (MobSystem::SetOwnershipFn),
+  // `IsGhost()` is false everywhere and PreTick runs exactly the branches it
+  // ran before.
+  //
+  // A GHOST is a mob somebody else steps. It keeps its rig, its bodies and
+  // its place in the crowd, and it is posed from received transforms alone —
+  // no AI, no locomotion, no animation, no bleeding, no burning, no staining,
+  // and above all NO OPS. Two machines both stepping one creature would
+  // author two sets of blood ops for one wound, which is the entity half of
+  // "one producer per cell" (net::Authority, M9.4-A).
+  uint32_t Owner() const { return owner_; }
+  // Out-of-line: the answer is `owner_ != sys_->LocalPlayerId()` and MobSystem
+  // is not complete yet here. An unparented mob (no `sys_`) is never a ghost —
+  // the fixtures that build a Mob by hand have nobody to be a ghost of.
+  bool IsGhost() const;
+
+  // ---- THE PER-MOB RECORD --------------------------------------------------
+  //
+  // One creature's damage, carve state and rig geometry, in the bytes
+  // `MobSystem::SaveState` has always written — this IS the body of that
+  // loop, lifted out so the handoff and the save file cannot drift apart
+  // (`save-entities` gates the format; `mob-handoff` gates the round trip).
+  //
+  // What it does NOT carry, on purpose: the id, the brain, the gear. The id
+  // because a save re-spawns into a fresh counter; the other two because a
+  // save has no use for them and widening the format would move the world
+  // hash for a network feature. The handoff carries all three beside the
+  // record (net/mobsync.h).
+  void SaveOne(ByteWriter& w) const;
 
   // ---- LIVE RAGDOLL: limp, then back on its feet (sim/tuning.h Ragdoll) -----
   //
@@ -3118,6 +3155,22 @@ class Mob {
   // The behaviour layer's per-creature memory (game/ai_behavior.h). Pure
   // gameplay state: never hashed, never saved, rebuilt from the def on spawn.
   ai::Brain ai_;
+  // ---- ownership (M9.4-B) --------------------------------------------------
+  // The playerId that STEPS this creature. Default 0 = session 0 = the only
+  // player a single-player process has, so nothing below ever fires until
+  // MobSystem::SetOwnershipFn is set by the network layer.
+  uint32_t owner_ = 0;
+  // The last MobPose received for this creature, and whether one ever was.
+  // A ghost with no pose yet is left exactly where the announce/handoff put
+  // it rather than being snapped to the origin — the first stream packet may
+  // be a tick or two behind the announce and a creature that teleports to
+  // (0,0,0) for two frames is a worse answer than one that stands still.
+  ::net::MobPose ghostPose_;
+  bool haveGhostPose_ = false;
+  // ONE tick of a creature somebody else owns: place the limbs where the
+  // owner says they are and stop. The fourth branch of PreTick's loop, beside
+  // Limp / GetUp / live.
+  void TickGhost(float dt);
   float phase_ = 0;            // walk cycle (legacy swing fallback)
   uint32_t lastTurnTick_ = 0;
 
@@ -3479,6 +3532,14 @@ class MobSystem {
   // does for DebrisSystem). Not owned. Without it, micro limbs still take real
   // damage — they just cannot show it.
   void SetMicroSet(MicroBodySet* set) { microSet_ = set; }
+  // ...and the readers, so a SECOND MobSystem can be stood up against the same
+  // shared pools. Only the `mob-handoff` gate does that today, and it has to:
+  // "the record is self-contained" is not a claim you can make against the
+  // system that wrote it, which still holds the live creature.
+  MicroBodySet* MicroSet() const { return microSet_; }
+  const std::shared_ptr<MobDefFactory>& DefFactory() const {
+    return defFactory_;
+  }
   void OnMaterialsReloaded(const std::vector<MaterialDef>& mats,
                            const std::vector<ReactionGpu>& reactions);
   // This tick's integer day phase, so a day/night-gated reaction behaves the
@@ -3997,6 +4058,95 @@ class MobSystem {
   void SaveState(std::vector<uint8_t>& out) const;
   // Contract (worldio LoadEntities): Reset() has already run.
   bool LoadState(const uint8_t* data, size_t len, uint32_t version);
+  // ONE creature out of such a section: spawn it from its def name and overlay
+  // the saved damage, exactly as LoadState's loop body did (it IS that loop
+  // body). Returns the live mob, or null if the def is gone or the spawn was
+  // refused — both of which it reports the way LoadState always has.
+  //
+  // Public because the handoff reads one record out of a wire packet rather
+  // than a count-prefixed section: `SaveState`/`LoadState` are now loops over
+  // this pair, and the network path is the same pair called once.
+  Mob* LoadOne(ByteReader& r, uint32_t version);
+
+  // ==== OWNERSHIP: who steps which creature (M9.4-B) ========================
+  //
+  // Default: every mob is local and nothing here is reachable. The network
+  // layer (M9.4-D) sets the local id at join and installs an ownership
+  // function computed from net::Authority; until then `ownershipFn_` is null,
+  // `RefreshOwnership` is a no-op, and PreTick runs today's three branches for
+  // every creature — which is why this package does not move the world hash.
+  static constexpr uint32_t kLocalOwner = 0;
+  void SetLocalPlayerId(uint32_t id) { localPlayerId_ = id; }
+  uint32_t LocalPlayerId() const { return localPlayerId_; }
+  // (mobId, feet position in world voxels) -> the playerId that should own it.
+  // Evaluated once per creature at the top of PreTick, so a mob's ownership
+  // cannot change underneath the tick that is stepping it.
+  void SetOwnershipFn(std::function<uint32_t(uint64_t, Vec3)> fn) {
+    ownershipFn_ = std::move(fn);
+  }
+  bool HasOwnershipFn() const { return (bool)ownershipFn_; }
+  uint32_t MobOwner(uint64_t mobId) const;
+  // Set one creature's owner directly. The handoff path and the gate use it;
+  // the ownership function overrules it on the next PreTick, which is correct
+  // — the function IS the shared answer both machines compute.
+  bool SetMobOwner(uint64_t mobId, uint32_t owner);
+  uint32_t GhostCount() const;
+  // WOULD ANOTHER BODY STOP `mobId` STANDING AT (cx, cz)? The drive's own
+  // hard test (`BlockedByMob`), asked from outside. An introspection surface
+  // in the same sense `MobBrain` is one: it decides nothing, it reports what
+  // the drive would decide, and it is the only way to ask "is that creature
+  // SOLID" without walking something into it for forty ticks. The ghost gate
+  // needs exactly that — a body somebody else drives must still be something
+  // you cannot walk through.
+  bool BlockedByMobAt(uint64_t mobId, float cx, float cz) const;
+  // HOW MANY TIMES THE AI ARBITER HAS RUN, over the life of this system. A
+  // diagnostic, and the one a ghost gate cannot do without: "the ghost did not
+  // move" has a dozen causes and only one of them is "nothing stepped it", so
+  // the gate asserts on the counter rather than on a position (CLAUDE.md rule
+  // 6 — record it at the point of the decision, do not infer it later).
+  uint64_t AiSteps() const { return aiSteps_; }
+
+  // ---- MOB IDS ARE A PER-PLAYER BAND --------------------------------------
+  //
+  // `nextId_` is a monotonic counter from 1 and mob ids are in the SAVE
+  // format, so two machines each spawning from 1 hand two different creatures
+  // the same identity — and every wire record here is keyed by id. The client
+  // starts its counter at `playerId << 40 | 1`: 2^40 ids per player, the host
+  // (id 0) keeps today's numbering so a single-player save is unchanged, and
+  // `ai::kPlayerActorBase` (1<<62) is above every band.
+  //
+  // max(), never assignment: a LoadState that restored a higher counter (a
+  // long-lived host world) must not be pulled back into a range it has
+  // already issued.
+  void SetIdBand(uint32_t playerId);
+
+  // ---- THE FOUR WIRE RECORDS (net/mobsync.h) ------------------------------
+  //
+  // Build on the owner, apply on the ghost. None of these touch a socket:
+  // M9.4-D owns the sending, and keeping that out of here is what lets the
+  // `mob-handoff` gate drive the whole feature with two MobSystems and a
+  // vector of bytes.
+  bool BuildAnnounce(uint64_t mobId, ::net::MobAnnounce& out) const;
+  // `tick` is stamped on the record so the receiver can drop an out-of-order
+  // pose rather than rewinding a creature.
+  bool BuildPose(uint64_t mobId, uint32_t tick, ::net::MobPose& out) const;
+  // Latches the pose on the ghost; it is applied in PreTick (TickGhost), not
+  // here, so a packet that arrives mid-frame cannot move a body between the
+  // physics step and the draw. Returns false for an unknown id, a pose OLDER
+  // than the one already latched, or a mob this machine owns.
+  bool ApplyPose(const ::net::MobPose& p);
+  // I own it and I am giving it away: fills `out` with everything the new
+  // owner needs (record + brain + gear) and makes it a ghost held at its last
+  // pose. False if I do not own it or it does not exist.
+  bool TakeHandoff(uint64_t mobId, uint32_t newOwner, ::net::MobHandoff& out);
+  // The other end. An id I already hold as a ghost is overlaid IN PLACE (the
+  // rig, bricks and Jolt bodies are kept — a handoff must not flicker); an id
+  // I have never seen is spawned from the record. Returns the live mob.
+  Mob* ApplyHandoff(const ::net::MobHandoff& h);
+  // The owner says it is over. Drops the ghost and releases its rig; a mob I
+  // own is NOT removed by this (the owner of a creature is the only one who
+  // may kill it) and the call reports false.
+  bool ApplyGone(const ::net::MobGone& g);
 
   // ---- sever events -------------------------------------------------------
   // One entry per limb that came off, reported rather than voiced here: this
@@ -4790,6 +4940,13 @@ class MobSystem {
     std::vector<std::string> lost;     // limbs it had already lost
     std::vector<uint64_t> bodies;      // the remains, to take out of the world
     uint32_t atTick = 0;
+    // WHOSE CORPSE IT WAS (M9.4-B). A rising SPAWNS a creature, which is an
+    // authoring act: two machines servicing the same booking would stand two
+    // zombies up in one grave. Captured at the booking rather than tested at
+    // the service so that a body handed over between dying and rising rises
+    // for the machine that owned it when it died — the one whose op stream
+    // carried the wounds that killed it.
+    uint32_t owner = 0;
     // ---- WHAT HAPPENED TO IT, AS GEOMETRY ---------------------------------
     //
     // One entry per limb whose lattice is no longer the def's — the arm a
@@ -4873,6 +5030,31 @@ class MobSystem {
   // lookups can find them. NOT owned and NOT in `mobs_` — see SetAvatars.
   std::vector<Mob*> avatars_;
   uint64_t nextId_ = 1;
+  // ---- ownership state (M9.4-B) -------------------------------------------
+  // All three are PROCESS state, not world state: none is hashed, none is
+  // saved, and with `ownershipFn_` null the first two are never read.
+  // ---- one creature's record, parsed --------------------------------------
+  // Defined in mob.cpp. The read and the overlay are separate because a save
+  // load SPAWNS and then overlays, while a handoff of a creature this machine
+  // already holds as a ghost overlays onto the rig that is already standing
+  // there — rebuilding it would throw away its Jolt bodies and bricks and
+  // flicker the body for nothing.
+  struct MobRecord;
+  static bool ReadMobRecord(ByteReader& r, MobRecord& out);
+  // `placeLimbs` puts each limb back on the TRANSFORM the record carries
+  // (and moves its Jolt body to match). The handoff wants it — a creature
+  // that changed hands must not visibly snap to a rest pose for one tick —
+  // and a save load must NOT have it: a loaded creature has always stood up
+  // in its rest pose, and where its limbs are is where it bleeds from, which
+  // is hashed state.
+  void OverlayMobRecord(Mob& m, MobRecord& rec, bool placeLimbs = false);
+
+  uint32_t localPlayerId_ = kLocalOwner;
+  std::function<uint32_t(uint64_t, Vec3)> ownershipFn_;
+  uint64_t aiSteps_ = 0;
+  // Evaluated at the top of PreTick, before anything steps: one creature's
+  // owner may not change halfway through its own tick.
+  void RefreshOwnership();
   bool instancesDirty_ = false;
   // Particles authored outside PreTick — Sever() is reached from damage
   // handling at several points in the frame, and appending straight to the

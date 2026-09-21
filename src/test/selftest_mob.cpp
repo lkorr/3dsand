@@ -8974,6 +8974,514 @@ Status GateRagdollFallDamage(Ctx& c, std::string& detail) {
   return ok ? Status::Pass : Status::Fail;
 }
 
+// ---- mob-handoff -----------------------------------------------------------
+//
+// ONE CREATURE, ONE SIMULATOR (docs/PLAN_multiplayer_m9.md M9.4-B).
+//
+// The feature is "a mob is stepped on exactly one machine, posed on the other,
+// and moves between them with its wounds, gear and target intact". Four arms,
+// and each one is built so that the thing it claims cannot be true by accident:
+//
+//   A. A GHOST IS POSED, NOT STEPPED. The same creature, same wound, same
+//      ticks, twice: once owned locally (it must bleed — ops > 0, the arbiter
+//      must run — AI steps > 0) and once as a ghost (ops EXACTLY 0, AI steps
+//      EXACTLY 0) while a scripted pose stream walks it. The local arm is the
+//      control and it is the whole point: "the ghost authored nothing" is
+//      vacuous for a creature that had nothing to author.
+//      Plus the two properties a ghost must KEEP: it answers to FindMobById
+//      (you can target it) and another creature is still blocked by its body
+//      (you cannot walk through it) — asserted against the same query after
+//      the ghost is gone, so "blocked" is not just what this fixture always
+//      says.
+//   B. THE RECORD IS SELF-CONTAINED. An armoured, armed, carved creature is
+//      handed off; the packet goes through Encode/Decode; a SECOND MobSystem
+//      (its own creature list, sharing only the loaders' pools) applies it.
+//      Byte-identical re-save, brain target preserved, gear back on by name.
+//      A second system rather than the same one, because "the record carries
+//      everything" cannot be tested against the system that still holds the
+//      original.
+//   C. OWNERSHIP FLIPS MID-WALK. One creature, one continuous run, the
+//      ownership function flipped to a peer at tick T and back at T2: the op
+//      authoring stops on the tick it becomes a ghost and resumes on the tick
+//      it returns, and it does not teleport at either edge.
+//   D. IT IS INERT WITHOUT AN OWNERSHIP FUNCTION. The same fixture run twice
+//      from the same counter with no ownership function set produces the same
+//      ops and the same positions. That is the mob-layer restatement of "this
+//      package does not move the world hash" — the hash itself is
+//      `determinism`'s claim and is not re-measured here.
+//
+// LEAVES THE SUITE AS IT FOUND IT: the id counter is saved and put back
+// (mob.h's note on NextIdCounter — a gate that spawns shifts every later
+// gate's randomness), the ownership function is cleared and the local player
+// id is restored.
+Status GateMobHandoff(Ctx& c, std::string& detail) {
+  const uint64_t idCounterWas = c.mobs.NextIdCounter();
+  const uint32_t localWas = c.mobs.LocalPlayerId();
+  c.debris.Reset();
+  c.mobs.Reset();
+  SubmitWorldgen(c.ctx, c.world, c.sim, kDefaultSeed);
+  c.ctx.WaitIdle();
+
+  auto restore = [&]() {
+    c.mobs.SetOwnershipFn(nullptr);
+    c.mobs.SetLocalPlayerId(localWas);
+    c.mobs.ClearPlayerActor();
+    c.mobs.ClearAttackRequests();
+    c.debris.Reset();
+    c.mobs.Reset();
+    c.mobs.SetNextIdCounter(idCounterWas);
+  };
+
+  const int defIndex = AiHumanoidDef(c.mobs);
+  if (defIndex < 0) {
+    detail = "no mob def publishes a held_right socket";
+    restore();
+    return Status::Fail;
+  }
+  int relief = 0;
+  const IVec3 anchor = AiFixtureCentre(c.world);
+  const IVec3 spot =
+      AiFlatSpot(anchor.x, anchor.z, 96, 16, kDefaultSeed, relief);
+  // The peer this fixture hands creatures to. Any id but 0 (the local player)
+  // will do; 7 is a reminder that nothing here is 0/1 magic.
+  const uint32_t kPeer = 7;
+
+  // One tick of the mob+debris pair, with the MOB's op authoring counted
+  // BEFORE debris runs — that separation is the author-scope check itself.
+  uint32_t tick = 7000;
+  struct Step {
+    int brush = 0;   // BrushOps authored by MobSystem::PreTick
+    int cell = 0;    // CellOps authored by MobSystem::PreTick
+  };
+  auto step = [&](Step& acc) {
+    std::vector<ParticleSpawn> spawns;
+    std::vector<CellOp> cellOps;
+    std::vector<BrushOp> ops;
+    c.mobs.PreTick(tick + 1, c.world, ops, cellOps, spawns);
+    acc.brush += (int)ops.size();
+    acc.cell += (int)cellOps.size();
+    c.debris.QueueSupportEvents(c.world.Snap());
+    c.debris.PreTick(tick + 1, c.world, cellOps, spawns);
+    ++tick;
+    SubmitTick(c.ctx, c.world, c.sim, tick, kDefaultSeed, ops, {}, cellOps,
+               false, IVec3{spot.x >> 4, spot.y >> 4, spot.z >> 4}, true, false,
+               spawns);
+    c.ctx.WaitIdle();
+    c.ctx.ProcessEvents();
+    c.phys.Step(kTickDt);
+    c.debris.PostStep();
+    c.mobs.PostStep();
+  };
+
+  // Open a wound that goes on bleeding: the ops arm needs a creature that has
+  // something to author. Radial carves on one limb, stopped well short of the
+  // sever floor so no limb comes off (a sever would change the rig shape that
+  // arm B compares byte for byte).
+  auto wound = [&](uint64_t id) {
+    std::vector<ParticleSpawn> spawns;
+    const int limb = 0;
+    const uint32_t full = c.mobs.LimbArtVoxelCount(id, limb);
+    for (int k = 0; k < 6; k++) {
+      const uint64_t lb = c.mobs.LimbBody(id, limb);
+      if (!lb) break;
+      if (c.mobs.LimbArtVoxelCount(id, limb) < full * 7 / 10) break;
+      c.mobs.CarveLimbRadial(lb, c.mobs.LimbVoxelPos(id, limb, 977u * (uint32_t)(k + 1)),
+                             1.0f, /*ragged=*/true, /*eject=*/false, c.world,
+                             spawns);
+    }
+  };
+
+  // WHAT DIFFERS, not just THAT it differs (CLAUDE.md rule 6). "The re-saved
+  // record is not byte-identical" is a bare bool with a dozen causes — a limb
+  // count, a transform, one carved lattice, the def name — and eliminating
+  // them one rebuild at a time is the ladder that rule forbids. This walks the
+  // format (Mob::SaveOne's writes, in order) on both sides and names the first
+  // field that disagrees.
+  auto recordDiff = [](const std::vector<uint8_t>& a,
+                       const std::vector<uint8_t>& b) -> std::string {
+    if (a.size() == b.size() && std::memcmp(a.data(), b.data(), a.size()) == 0)
+      return "";
+    ByteReader ra{a.data(), a.size()}, rb{b.data(), b.size()};
+    std::string na, nb;
+    Vec3 oa{}, ob{};
+    float ha = 0, hb = 0, ya = 0, yb = 0;
+    uint32_t la = 0, lb = 0;
+    ra.Str(na); ra.Pod(oa); ra.F32(ha); ra.F32(ya); ra.U32(la);
+    rb.Str(nb); rb.Pod(ob); rb.F32(hb); rb.F32(yb); rb.U32(lb);
+    if (na != nb) return Format("def '%s' vs '%s'", na.c_str(), nb.c_str());
+    if (oa.x != ob.x || oa.y != ob.y || oa.z != ob.z) return "origin";
+    if (ha != hb) return "heading";
+    if (ya != yb) return "bodyY";
+    if (la != lb) return Format("limb count %u vs %u", la, lb);
+    for (uint32_t i = 0; i < la && ra.ok && rb.ok; i++) {
+      uint32_t aliveA = 0, aliveB = 0;
+      float hpA = 0, hpB = 0;
+      Vec3 v3a[3]{}, v3b[3]{};
+      BodyTransform xfA{}, xfB{};
+      IVec3 szA{}, szB{};
+      std::vector<DebrisVoxel> vA, vB;
+      std::vector<PrefabVoxel> sA, sB;
+      ra.U32(aliveA); ra.F32(hpA);
+      for (int k = 0; k < 3; k++) ra.Pod(v3a[k]);
+      ra.Pod(xfA); ra.Pod(szA); ra.PodVec(vA); ra.PodVec(sA);
+      rb.U32(aliveB); rb.F32(hpB);
+      for (int k = 0; k < 3; k++) rb.Pod(v3b[k]);
+      rb.Pod(xfB); rb.Pod(szB); rb.PodVec(vB); rb.PodVec(sB);
+      if (aliveA != aliveB) return Format("limb %u attached %u vs %u", i, aliveA, aliveB);
+      if (hpA != hpB) return Format("limb %u hp %.3f vs %.3f", i, hpA, hpB);
+      for (int k = 0; k < 3; k++)
+        if (v3a[k].x != v3b[k].x || v3a[k].y != v3b[k].y || v3a[k].z != v3b[k].z)
+          return Format("limb %u anchor %d", i, k);
+      if (xfA.pos.x != xfB.pos.x || xfA.pos.y != xfB.pos.y ||
+          xfA.pos.z != xfB.pos.z)
+        return Format("limb %u xf.pos by %.4f", i,
+                      std::sqrt((xfA.pos.x - xfB.pos.x) * (xfA.pos.x - xfB.pos.x) +
+                                (xfA.pos.y - xfB.pos.y) * (xfA.pos.y - xfB.pos.y) +
+                                (xfA.pos.z - xfB.pos.z) * (xfA.pos.z - xfB.pos.z)));
+      for (int k = 0; k < 4; k++)
+        if (xfA.quat[k] != xfB.quat[k]) return Format("limb %u xf.quat", i);
+      if (szA.x != szB.x || szA.y != szB.y || szA.z != szB.z)
+        return Format("limb %u size", i);
+      if (vA.size() != vB.size())
+        return Format("limb %u voxels %zu vs %zu", i, vA.size(), vB.size());
+      if (!vA.empty() &&
+          std::memcmp(vA.data(), vB.data(), vA.size() * sizeof(DebrisVoxel)) != 0)
+        return Format("limb %u voxel contents", i);
+      if (sA.size() != sB.size())
+        return Format("limb %u skin %zu vs %zu", i, sA.size(), sB.size());
+      if (!sA.empty() &&
+          std::memcmp(sA.data(), sB.data(), sA.size() * sizeof(PrefabVoxel)) != 0)
+        return Format("limb %u skin contents", i);
+    }
+    return Format("tail (%zu vs %zu bytes)", a.size(), b.size());
+  };
+
+  const double trackTol = BaselineNumber("mobGhostTrackVox", 0.05);
+  const int ghostTicks = (int)BaselineNumber("mobGhostTicks", 120);
+  std::string why;
+
+  // ======== ARM A: a ghost is posed, not stepped ==========================
+  Step localOps{}, ghostOps{};
+  uint64_t aiLocal = 0, aiGhost = 0;
+  double trackErr = 0;
+  bool targetable = false, solidWhileGhost = false, solidAfterGone = true;
+  uint64_t ghostId = 0;
+  {
+    ghostId = AiSpawn(c, defIndex, {spot.x, spot.y + 1, spot.z}, "duelist", why);
+    if (ghostId == 0) {
+      detail = why;
+      restore();
+      return Status::Fail;
+    }
+    wound(ghostId);
+    // A target, so the arbiter has something to decide about: the control arm
+    // must measure a creature that is genuinely being stepped.
+    c.mobs.SetPlayerActor(Vec3{(float)spot.x + 6.0f, (float)spot.y + 2.0f,
+                               (float)spot.z},
+                          3.0f, 17.0f, true);
+    // ---- control: the SAME creature, local ----
+    const uint64_t ai0 = c.mobs.AiSteps();
+    for (int t = 0; t < 30; t++) step(localOps);
+    aiLocal = c.mobs.AiSteps() - ai0;
+
+    // ---- and now it belongs to the peer ----
+    c.mobs.SetOwnershipFn([&](uint64_t id, Vec3) {
+      return id == ghostId ? kPeer : MobSystem::kLocalOwner;
+    });
+    // ...and applied NOW rather than at the next PreTick. The function is
+    // evaluated once per tick at the top of PreTick (it must be: a creature's
+    // owner may not move mid-tick), so between installing it and the next tick
+    // the mob is still local and `ApplyPose` would rightly refuse a pose for a
+    // creature this machine owns. The network layer has the same seam and the
+    // same answer — an announce carries the owner, it is not inferred.
+    c.mobs.SetMobOwner(ghostId, kPeer);
+    // The scripted stream: the pose it has right now, walked +0.1 vox/tick
+    // along +X. Built from BuildPose so the fixture drives the same record the
+    // network would, not a shape invented here.
+    ::net::MobPose base{};
+    if (!c.mobs.BuildPose(ghostId, tick, base)) {
+      detail = "BuildPose refused a live mob";
+      restore();
+      return Status::Fail;
+    }
+    wound(ghostId);   // top the bleed budget back up: it must WANT to author
+    const uint64_t ai1 = c.mobs.AiSteps();
+    for (int t = 0; t < ghostTicks; t++) {
+      ::net::MobPose p = base;
+      p.tick = tick + 1;
+      const float dx = 0.1f * (float)(t + 1);
+      p.origin.x += dx;
+      for (::net::WireLimbPose& lp : p.limbs) lp.pos.x += dx;
+      // Through the wire, not by hand: encode/decode is on the path this arm
+      // exercises, so a symmetry bug in mobsync.cpp fails here too.
+      std::vector<uint8_t> bytes;
+      { ByteWriter w{bytes}; ::net::Encode(w, p); }
+      ByteReader r{bytes.data(), bytes.size()};
+      ::net::MobPose got;
+      if (!::net::Decode(r, got)) {
+        detail = "MobPose did not survive Encode/Decode";
+        restore();
+        return Status::Fail;
+      }
+      if (!c.mobs.ApplyPose(got)) {
+        detail = "ApplyPose refused a ghost's pose";
+        restore();
+        return Status::Fail;
+      }
+      step(ghostOps);
+      // Where the limbs ACTUALLY are, read back through the same record.
+      ::net::MobPose now{};
+      if (c.mobs.BuildPose(ghostId, tick, now)) {
+        for (size_t i = 0; i < now.limbs.size() && i < got.limbs.size(); i++) {
+          const Vec3 d{now.limbs[i].pos.x - got.limbs[i].pos.x,
+                       now.limbs[i].pos.y - got.limbs[i].pos.y,
+                       now.limbs[i].pos.z - got.limbs[i].pos.z};
+          trackErr = std::max(trackErr, (double)std::sqrt(d.x * d.x + d.y * d.y +
+                                                          d.z * d.z));
+        }
+      }
+    }
+    aiGhost = c.mobs.AiSteps() - ai1;
+    targetable = c.mobs.FindMobById(ghostId) != nullptr;
+
+    // Still SOLID: a second creature, asked the drive's own question about
+    // standing where the ghost stands — and asked again once the ghost is
+    // gone, so "blocked" means the ghost and not the fixture.
+    const Vec3 gp = c.mobs.MobOrigin(ghostId);
+    const uint64_t other =
+        c.mobs.Spawn(defIndex, {spot.x + 6, spot.y + 1, spot.z});
+    if (other != 0) {
+      solidWhileGhost = c.mobs.BlockedByMobAt(other, gp.x, gp.z);
+      ::net::MobGone gone{};
+      gone.id = ghostId;
+      gone.reason = ::net::kGoneDespawn;
+      c.mobs.ApplyGone(gone);
+      solidAfterGone = c.mobs.BlockedByMobAt(other, gp.x, gp.z);
+    }
+    c.mobs.SetOwnershipFn(nullptr);
+    c.mobs.ClearPlayerActor();
+    c.mobs.ClearAttackRequests();
+  }
+
+  // ======== ARM B: the record is self-contained ===========================
+  bool recordSame = false, brainSame = false, gearSame = false;
+  std::string recordWhy;
+  size_t recordBytes = 0;
+  int gearSent = 0, gearBack = 0;
+  {
+    c.debris.Reset();
+    c.mobs.Reset();
+    const uint64_t id =
+        AiSpawn(c, defIndex, {spot.x, spot.y + 1, spot.z}, "duelist", why);
+    if (id == 0) {
+      detail = why;
+      restore();
+      return Status::Fail;
+    }
+    // Dress it: an armoured, armed creature is the case where the announce has
+    // to carry anything at all.
+    c.mobs.SetItems(&c.items);
+    for (const ItemDef& it : c.items.items) {
+      if (!ItemKindIsWorn(it.kind)) continue;
+      int homeSlot = -1;
+      for (int s = 0; s < kEquipSlotCount; s++)
+        if (EquipSlotAccepts(s, it.kind)) { homeSlot = s; break; }
+      if (homeSlot < 0) continue;
+      if (c.mobs.WearItem(id, &it, homeSlot, /*dye=*/0x40u)) break;
+    }
+    wound(id);
+    // Give it a target the honest way: let it look at a player for a while.
+    c.mobs.SetPlayerActor(Vec3{(float)spot.x + 6.0f, (float)spot.y + 2.0f,
+                               (float)spot.z},
+                          3.0f, 17.0f, true);
+    Step ignored{};
+    for (int t = 0; t < 20; t++) step(ignored);
+    const ai::Brain* brainWas = c.mobs.MobBrain(id);
+    const uint64_t targetWas = brainWas != nullptr ? brainWas->targetId : 0;
+
+    ::net::MobHandoff h{};
+    if (!c.mobs.TakeHandoff(id, kPeer, h)) {
+      detail = "TakeHandoff refused a locally owned mob";
+      restore();
+      return Status::Fail;
+    }
+    recordBytes = h.record.size();
+    gearSent = (int)h.announce.gear.size();
+    // Through the wire.
+    std::vector<uint8_t> bytes;
+    { ByteWriter w{bytes}; ::net::Encode(w, h); }
+    ByteReader r{bytes.data(), bytes.size()};
+    ::net::MobHandoff got{};
+    if (!::net::Decode(r, got)) {
+      detail = "MobHandoff did not survive Encode/Decode";
+      restore();
+      return Status::Fail;
+    }
+
+    // A SECOND MobSystem: its own creature list, sharing only what the loaders
+    // own (the brick pool, the defs, the behaviour library, the items).
+    {
+      MobSystem far;
+      far.Init(&c.phys, &c.world, &c.debris, c.mats, c.reactions);
+      far.SetMicroSet(c.mobs.MicroSet());
+      far.SetDefFactory(c.mobs.DefFactory());
+      far.SetDefs(std::vector<MobDef>(c.mobs.Defs()));
+      far.SetBehaviors(ai::Library(c.mobs.Behaviors()));
+      far.SetAttackStyles(StyleLibrary(c.mobs.AttackStyles()));
+      far.SetItems(&c.items);
+      Mob* nm = far.ApplyHandoff(got);
+      if (nm == nullptr) {
+        detail = "ApplyHandoff built nothing on the far side";
+        restore();
+        return Status::Fail;
+      }
+      std::vector<uint8_t> resaved;
+      { ByteWriter w{resaved}; nm->SaveOne(w); }
+      recordWhy = recordDiff(h.record, resaved);
+      recordSame = recordWhy.empty();
+      const ai::Brain* nb = far.MobBrain(h.announce.id);
+      brainSame = nb != nullptr && nb->targetId == targetWas &&
+                  nb->profile == (brainWas != nullptr ? brainWas->profile : -1);
+      ::net::MobAnnounce back{};
+      if (far.BuildAnnounce(h.announce.id, back)) {
+        gearBack = (int)back.gear.size();
+        gearSame = gearBack == gearSent;
+        for (int k = 0; k < gearBack && gearSame; k++)
+          gearSame = back.gear[k].item == h.announce.gear[k].item &&
+                     back.gear[k].held == h.announce.gear[k].held &&
+                     back.gear[k].dye == h.announce.gear[k].dye;
+      }
+      far.Reset();
+    }
+    c.mobs.ClearPlayerActor();
+    c.mobs.ClearAttackRequests();
+  }
+
+  // ======== ARM C: ownership flips mid-walk ===============================
+  int opsBefore = 0, opsDuring = 0, opsAfter = 0;
+  uint64_t aiBefore = 0, aiDuring = 0, aiAfter = 0;
+  double jumpIn = 0, jumpOut = 0, walkedBefore = 0, walkedAfter = 0;
+  {
+    c.debris.Reset();
+    c.mobs.Reset();
+    const uint64_t id =
+        AiSpawn(c, defIndex, {spot.x, spot.y + 1, spot.z}, "duelist", why);
+    if (id == 0) {
+      detail = why;
+      restore();
+      return Status::Fail;
+    }
+    c.mobs.SetPlayerActor(Vec3{(float)spot.x + 20.0f, (float)spot.y + 2.0f,
+                               (float)spot.z},
+                          3.0f, 17.0f, true);
+    uint32_t owner = MobSystem::kLocalOwner;
+    c.mobs.SetOwnershipFn([&](uint64_t, Vec3) { return owner; });
+    auto planar = [](Vec3 a, Vec3 b) {
+      const float dx = a.x - b.x, dz = a.z - b.z;
+      return (double)std::sqrt(dx * dx + dz * dz);
+    };
+    const int win = 20;
+    Step s{};
+    Vec3 p0 = c.mobs.MobOrigin(id);
+    uint64_t ai0 = c.mobs.AiSteps();
+    wound(id);
+    for (int t = 0; t < win; t++) step(s);
+    opsBefore = s.brush + s.cell;
+    aiBefore = c.mobs.AiSteps() - ai0;
+    walkedBefore = planar(c.mobs.MobOrigin(id), p0);
+
+    // --- it becomes somebody else's ---
+    const Vec3 atFlip = c.mobs.MobOrigin(id);
+    owner = kPeer;
+    s = Step{};
+    ai0 = c.mobs.AiSteps();
+    step(s);
+    jumpIn = planar(c.mobs.MobOrigin(id), atFlip);
+    for (int t = 1; t < win; t++) step(s);
+    opsDuring = s.brush + s.cell;
+    aiDuring = c.mobs.AiSteps() - ai0;
+
+    // --- and it comes back ---
+    const Vec3 atReturn = c.mobs.MobOrigin(id);
+    owner = MobSystem::kLocalOwner;
+    s = Step{};
+    ai0 = c.mobs.AiSteps();
+    wound(id);
+    step(s);
+    jumpOut = planar(c.mobs.MobOrigin(id), atReturn);
+    for (int t = 1; t < win; t++) step(s);
+    opsAfter = s.brush + s.cell;
+    aiAfter = c.mobs.AiSteps() - ai0;
+    walkedAfter = planar(c.mobs.MobOrigin(id), atReturn);
+
+    c.mobs.SetOwnershipFn(nullptr);
+    c.mobs.ClearPlayerActor();
+    c.mobs.ClearAttackRequests();
+  }
+
+  // ======== ARM D: inert with no ownership function =======================
+  int runOps[2] = {0, 0};
+  Vec3 runEnd[2] = {};
+  {
+    for (int run = 0; run < 2; run++) {
+      c.debris.Reset();
+      c.mobs.Reset();
+      // The SAME id counter for both runs: a mob id seeds its gore profile and
+      // its RNG key, so two runs from different counters are two different
+      // creatures and would prove nothing (mob.h, NextIdCounter).
+      c.mobs.SetNextIdCounter(idCounterWas);
+      const uint64_t id =
+          AiSpawn(c, defIndex, {spot.x, spot.y + 1, spot.z}, "duelist", why);
+      if (id == 0) break;
+      c.mobs.SetPlayerActor(Vec3{(float)spot.x + 20.0f, (float)spot.y + 2.0f,
+                                 (float)spot.z},
+                            3.0f, 17.0f, true);
+      wound(id);
+      Step s{};
+      for (int t = 0; t < 20; t++) step(s);
+      runOps[run] = s.brush + s.cell;
+      runEnd[run] = c.mobs.MobOrigin(id);
+      c.mobs.ClearPlayerActor();
+      c.mobs.ClearAttackRequests();
+    }
+  }
+  const bool inert = runOps[0] == runOps[1] && runOps[0] > 0 &&
+                     runEnd[0].x == runEnd[1].x && runEnd[0].y == runEnd[1].y &&
+                     runEnd[0].z == runEnd[1].z;
+
+  RecordObserved("mobGhostTrackErrVox", trackErr);
+  RecordObserved("mobHandoffRecordBytes", (double)recordBytes);
+
+  const bool armA = localOps.brush + localOps.cell > 0 && aiLocal > 0 &&
+                    ghostOps.brush == 0 && ghostOps.cell == 0 &&
+                    aiGhost == 0 && trackErr <= trackTol && targetable &&
+                    solidWhileGhost && !solidAfterGone;
+  const bool armB = recordSame && brainSame && gearSame && gearSent > 0;
+  const bool armC = opsBefore > 0 && aiBefore > 0 && opsDuring == 0 &&
+                    aiDuring == 0 && opsAfter > 0 && aiAfter > 0 &&
+                    jumpIn < 0.001 && jumpOut < 1.0 && walkedBefore > 0.5 &&
+                    walkedAfter > 0.5;
+  const bool ok = armA && armB && armC && inert;
+
+  detail = Format(
+      "A local %d ops / %llu ai vs ghost %d ops / %llu ai, track %.4f <= %.4f "
+      "vox over %d ticks, targetable %d, solid %d->%d | B record %zu B "
+      "identical %d (%s), brain %d, gear %d/%d %d | C ops %d->%d->%d, ai "
+      "%llu->%llu->%llu, jump in %.4f out %.4f, walked %.2f/%.2f | D ops %d/%d,"
+      " inert %d",
+      localOps.brush + localOps.cell, (unsigned long long)aiLocal,
+      ghostOps.brush + ghostOps.cell, (unsigned long long)aiGhost, trackErr,
+      trackTol, ghostTicks, targetable ? 1 : 0, solidWhileGhost ? 1 : 0,
+      solidAfterGone ? 1 : 0, recordBytes, recordSame ? 1 : 0,
+      recordWhy.empty() ? "-" : recordWhy.c_str(), brainSame ? 1 : 0, gearBack, gearSent, gearSame ? 1 : 0, opsBefore,
+      opsDuring, opsAfter, (unsigned long long)aiBefore,
+      (unsigned long long)aiDuring, (unsigned long long)aiAfter, jumpIn,
+      jumpOut, walkedBefore, walkedAfter, runOps[0], runOps[1], inert ? 1 : 0);
+
+  restore();
+  return ok ? Status::Pass : Status::Fail;
+}
+
 }  // namespace
 
 const std::vector<Gate>& MobGates() {
@@ -9015,6 +9523,11 @@ const std::vector<Gate>& MobGates() {
       // the fixture has to prove it crowds before "they did not overlap"
       // means anything.
       {"crowd", "mob", {}, false, GateCrowd, /*needsRender=*/false},
+      // One creature, one simulator: ownership, ghosts, the per-mob record
+      // and the handoff (docs/PLAN_multiplayer_m9.md M9.4-B). No render —
+      // every claim is an op count, an AI-step count, a distance or a byte
+      // comparison.
+      {"mob-handoff", "mob", {}, false, GateMobHandoff, /*needsRender=*/false},
       // NPC AI. No render either: every claim is a distance, an angle or a
       // count, which is what makes them iterable with `--gate` alone.
       {"ai-dummy", "mob", {}, false, GateAiDummy, /*needsRender=*/false},

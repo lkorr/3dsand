@@ -464,6 +464,10 @@ add_library(sandvox_core OBJECT
   src/game/brush.cpp
   src/game/prefab.cpp
   src/game/mob.cpp
+  # What one creature looks like on the wire: the four records mob ownership
+  # exchanges (docs/PLAN_multiplayer_m9.md M9.4-B). Data and encode/decode
+  # only — no sockets, no tick.
+  src/net/mobsync.cpp
   # What is under the skin, by depth from the surface: the recipe in a resolved
   # sidecar, applied to the .vox interior at load. assets/editor/anatomy.js is
   # the same rule, and the bake it drives is now a preview and a cache.

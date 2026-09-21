@@ -335,6 +335,13 @@ const char* const kOrder[] = {
     // gates share one MobSystem, so a def left modified would retune every
     // NPC gate after it.
     "crowd",
+    // Right after it, for the same reasons and one more: `mob-handoff`
+    // regenerates worldgen on the way in, resets mobs and debris on the way
+    // out, and — because it SPAWNS — saves and restores the mob id counter,
+    // which is the perturbation mob.h's NextIdCounter note is about. It also
+    // installs an ownership function and clears it again; a gate after it
+    // that found one still installed would be measuring ghosts.
+    "mob-handoff",
     // Armour reactivity, right after `mob-burn` and for the same reasons: it
     // lights real fires and pours real acid at absolute coordinates, and it
     // regenerates the world on the way out so the gates after it still find
