@@ -230,7 +230,23 @@ const char* const kOrder[] = {
     "body-shade",
     "player-walk", "player-waterjump", "player-ledgegrab", "player-crouch",
     "player-fastfall",
-    "player-plants", "debris",
+    "player-plants",
+    // TWO PLAYERS IN ONE WORLD (M9.1 P3). Here, with the other player gates,
+    // and NOT beside `tick-input` at the front of the list even though they are
+    // the same group in PlayerGates(): `tick-input` is pure CPU over a
+    // synthetic ground lambda, while this one runs its own worldgen twice, ticks
+    // the GPU 600 times, spawns two avatars and a creature, and reads the world
+    // hash. It therefore has to be AFTER `determinism` (whose pinned hash must
+    // not be measured downstream of a gate that regenerated the world) and it
+    // belongs with the gates that cost seconds rather than milliseconds.
+    //
+    // Self-contained in both directions: it resets debris and mobs and rewinds
+    // the mob id counter on the way into EVERY arm, and it regenerates pristine
+    // worldgen at kDefaultSeed on the way out — the same discipline `mob-burn`
+    // and `undead` use, and what lets it sit between two gates that know
+    // nothing about it.
+    "two-players",
+    "debris",
     // `audio-spatial` touches no World at all (it is the mixer and a Camera),
     // so its slot is free; it sits with the other audio gates.
     "audio-impact", "audio-mob-voice", "audio-ambience", "audio-spatial",
