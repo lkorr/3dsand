@@ -4135,9 +4135,24 @@ bool DebrisSystem::DriveKinematicTo(Body& b, Vec3 pos, const float quat[4],
 
 void DebrisSystem::SetLocalPlayerId(uint32_t id) { localPlayerId_ = id; }
 
-void DebrisSystem::SetOwnershipFn(std::function<uint32_t(Vec3)> fn) {
+void DebrisSystem::SetOwnershipFn(
+    std::function<uint32_t(uint64_t, Vec3)> fn) {
   ownershipFn_ = std::move(fn);
 }
+
+// The position-only binding, ADAPTED rather than stored in a second member:
+// one function pointer answers "who owns this body" whatever shape the caller
+// had, so `RefreshOwnership` has one call site and there is no "which of the
+// two is set" question anywhere below this line.
+void DebrisSystem::SetOwnershipFn(std::function<uint32_t(Vec3)> fn) {
+  if (!fn) {
+    ownershipFn_ = nullptr;
+    return;
+  }
+  ownershipFn_ = [f = std::move(fn)](uint64_t, Vec3 p) { return f(p); };
+}
+
+void DebrisSystem::ClearOwnershipFn() { ownershipFn_ = nullptr; }
 
 void DebrisSystem::SetChunkOwnedFn(std::function<bool(IVec3)> fn) {
   chunkOwnedFn_ = std::move(fn);
@@ -4229,7 +4244,11 @@ void DebrisSystem::RefreshOwnership() {
     // and the shell's pose is DERIVED from the host's, so the answer would be
     // unusable anyway.
     if (b.Follower()) continue;
-    const uint32_t want = ownershipFn_(b.xf.pos);
+    // THE BODY'S OWN IDENTITY GOES WITH THE QUESTION (M9.4-E). The global id
+    // is what lets the answerer keep ONE incumbent per body instead of one
+    // per chunk -- see SetOwnershipFn's note and net::EntitySync::BodyOwner.
+    const uint32_t want =
+        ownershipFn_(net::MakeGlobalBodyId(b.ownerAtCreate, b.serial), b.xf.pos);
     if (want == b.owner) continue;
     if (want == localPlayerId_)
       MakeOwned(b);
