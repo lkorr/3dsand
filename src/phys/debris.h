@@ -18,6 +18,15 @@
 #include "phys/physics.h"
 #include "sim/materials.h"
 #include "sim/microbody.h"
+// THE WIRE RECORDS the ownership seam below names in its signatures.
+// The arrow points ONE WAY: debrissync.h describes bodies out of
+// phys/physics.h and sim/voxload.h and knows nothing about this file, so
+// including it here costs a header of PODs and no cycle. It is included
+// rather than forward-declared because DebrisSystem holds QUEUES of two of
+// the records, and a std::deque of an incomplete type is not a thing C++
+// promises (only vector/list/forward_list are, and even those would push
+// the completeness requirement onto every TU that destroys a DebrisSystem).
+#include "net/debrissync.h"
 #include "sim/world.h"
 
 // Debris pipeline (DESIGN.md §7, Grimorium devlog mWdlTZ_FoBc):
@@ -318,6 +327,174 @@ class DebrisSystem {
   // Followers currently being driven. A cheap standing assertion that the
   // count matches what was dressed, and a probe for the corpse gates.
   uint32_t StrappedCount() const;
+
+  // ======= OWNERSHIP AND GHOST BODIES (PLAN_multiplayer_m9.md M9.4-C) =======
+  //
+  // EVERY LOOSE BODY IS SIMULATED ONCE AND SEEN TWICE. One machine owns a
+  // body: it steps it in Jolt, burns it, bleeds it, settles it back into the
+  // grid and is the only machine that authors an op about it. Every other
+  // machine holds a GHOST of the same body -- a kinematic collider posed from
+  // the wire, solid to walk into, which emits nothing at all.
+  //
+  // WHY KINEMATIC RATHER THAN "SKIP THE SIMULATION". A body that is not
+  // stepped is not a body: it falls through the floor of the far machine's
+  // solver, or worse, is stepped there TOO and the two copies diverge within a
+  // second (a rigid body's trajectory is not a function of its inputs the way
+  // the CA's is -- Jolt's solver is order- and contact-manifold-dependent). A
+  // kinematic body has no gravity, no mass in any contact and no depenetration
+  // response, so its pose is exactly what was sent and nothing else. That is
+  // the SAME argument StrapBody makes for a garment following a limb, and the
+  // two paths share one implementation (DriveKinematicTo) for that reason.
+  //
+  // A GHOST IS NOT A FOLLOWER. The strap derives a pose from ANOTHER LOCAL
+  // BODY every PostStep; a ghost's pose comes off the wire and has no host
+  // here at all. They are the same mechanism below the pose and different
+  // questions above it, which is why `wornHost` stays 0 on a ghost -- a ghost
+  // whose "host" went missing must not be released into dynamic debris the
+  // way DriveStraps releases an orphaned garment.
+  //
+  // WHAT HAPPENS WITH NO OWNERSHIP FUNCTION SET, which is every single-player
+  // run and every gate but `debris-ghost`: `ownershipFn_` is null, every body
+  // is owned by `localPlayerId_` (0), every owner test passes, and the tick is
+  // byte-for-byte today's. That is the property the unmoved world hash proves.
+
+  // Session 0's player id, and the default owner of everything. A
+  // single-player process never changes it.
+  static constexpr uint32_t kLocalOwner = 0;
+
+  // WHICH PLAYER THIS PROCESS IS. Set once at join (M9.4-D). Changing it does
+  // NOT retroactively re-mint existing bodies' `ownerAtCreate` -- those ids are
+  // already out on the wire -- so it is called before any body exists.
+  void SetLocalPlayerId(uint32_t id);
+  uint32_t LocalPlayerId() const { return localPlayerId_; }
+
+  // WHO OWNS A BODY AT THIS POSITION (net::EntityAuthority over the peer list,
+  // wired by M9.4-D). Null = every body is mine, which is today's behaviour.
+  //
+  // Asked per body per tick from PreTick, with the body's own position. It
+  // must be a PURE function of the peer views both machines hold, or the two
+  // would disagree about who is stepping what -- M9.4-A's hysteresis is what
+  // keeps a body straddling a chunk edge from flapping between them.
+  void SetOwnershipFn(std::function<uint32_t(Vec3 posVoxel)> fn);
+
+  // WHO OWNS A CHUNK (net::ChunkAuthority). Null = every chunk is mine.
+  //
+  // Separate from the body question because the island scan is not about a
+  // body at all: it is about WHICH MACHINE LOOKS AT A REGION OF GRID for
+  // matter that has lost its support. A peer's explosion in my chunk needs MY
+  // scan (the plan's M9.4-D note), so this is keyed on the region and not on
+  // whoever caused it.
+  void SetChunkOwnedFn(std::function<bool(IVec3 wc)> fn);
+
+  // The global id of a body by handle, or 0 if the handle is not one of ours.
+  // `(ownerAtCreate << 48) | serial` -- see net::MakeGlobalBodyId.
+  uint64_t GlobalIdOf(uint64_t handle) const;
+  // ...and back. 0 when no body here carries that id.
+  uint64_t HandleOfGlobalId(uint64_t globalId) const;
+  // The current owner of a body by handle, or kLocalOwner for an unknown one
+  // (an unknown handle is not a thing this machine has to stop stepping).
+  uint32_t OwnerOfBody(uint64_t handle) const;
+  // Is this body posed from the wire rather than stepped here?
+  bool IsGhost(uint64_t handle) const;
+  // How many ghosts exist. For the `--frames` net report and for the gate.
+  uint32_t GhostCount() const;
+
+  // ---- receiving ----------------------------------------------------------
+
+  // Apply a received pose to the ghost it names. False when no body carries
+  // that id (an announce has not arrived yet, or the body is gone), or when
+  // the pose is OLDER than the one already held, or when the named body is one
+  // of MINE -- a peer does not get to move a body I am stepping, and silently
+  // accepting one would be a desync with no symptom until the next settle.
+  bool ApplyBodyPose(const net::BodyPose& pose);
+
+  // Create (or refresh) the ghost an announce describes and return its handle,
+  // 0 on failure. Idempotent by global id: a re-announce of a body we already
+  // hold updates its pose rather than making a second copy.
+  uint64_t ApplyBodyAnnounce(const net::BodyAnnounce& a);
+
+  // Take ownership of a body a peer has handed to me. The body is recreated
+  // DYNAMIC at the announce's pose, given the handed-over velocities, and
+  // adopted. Returns the new handle, 0 on failure.
+  uint64_t ApplyBodyHandoff(const net::BodyHandoff& h);
+
+  // The owner let go of it. Destroys the ghost; false if we did not hold one.
+  bool ApplyBodyGone(const net::BodyGone& g);
+
+  // ---- sending ------------------------------------------------------------
+
+  // Fill an announce/pose/handoff for one of MY bodies. False for a handle I
+  // do not own (there is nothing truthful to say about a body I am not
+  // stepping). `BuildHandoff` ALSO flips my copy to a ghost -- a handoff is not
+  // a query, it is the moment authority moves, and leaving the old owner
+  // stepping it until an ack came back is how both machines end up simulating
+  // the same sword.
+  bool BuildAnnounce(uint64_t handle, net::BodyAnnounce& out) const;
+  bool BuildPose(uint64_t handle, uint32_t tick, net::BodyPose& out) const;
+  bool BuildHandoff(uint64_t handle, uint32_t newOwner, net::BodyHandoff& out);
+
+  // INTEREST: the global ids of my bodies inside a peer's residency window,
+  // grown by `marginChunks`. What M9.4-D sends a pose for this tick.
+  //
+  // A SLEEPING BODY IS SENT ONCE AND THEN NOT AGAIN. `Body::inactiveTicks` is
+  // already the settle countdown and it is reset the moment anything moves, so
+  // it is exactly the right signal: a battlefield of two hundred settled
+  // corpses costs no bandwidth, and the first one somebody kicks resumes at
+  // full rate. That is rule 2 applied to the wire.
+  void OwnedBodiesNear(IVec3 peerWindowOrigin, int marginChunks,
+                       std::vector<uint64_t>& outGlobalIds) const;
+
+  // ---- ground items -------------------------------------------------------
+  //
+  // THE ITEM REGISTRY IS NOT MINE (game/worlditems.h lives a layer up and
+  // includes this header), so the two facts this system needs about a
+  // body-as-item arrive as callbacks. That keeps the layering one-way and
+  // keeps "which item is this" in the one place that owns it.
+  //
+  // `lookup` fills name/dye/damage for a body handle and returns false if the
+  // body is not an item. `take` removes the body from the world exactly as the
+  // local E key does and returns true if it really was taken.
+  void SetItemLookupFn(std::function<bool(uint64_t handle, std::string& name,
+                                          uint32_t& dye, uint32_t& damage)> fn);
+  void SetItemTakeFn(std::function<bool(uint64_t handle)> fn);
+
+  // PICK UP THE BODY NAMED BY A GLOBAL ID -- the ONE entry point for E, on both
+  // machines. If I own it, the pickup happens now and a grant appears on the
+  // grant queue this tick. If I do not, an ItemTake is queued for the
+  // transport to send and the grant arrives when the owner replies. Either
+  // way the caller's code is `RequestItemTake(id)` then drain `PopItemGrant`,
+  // which is what stops "the owner's pickup" and "the peer's pickup" from
+  // being two code paths that drift.
+  //
+  // Returns false only when there is nothing to ask about (unknown id).
+  bool RequestItemTake(uint64_t globalId);
+
+  // Drain one pending outgoing request (M9.4-D sends it). False when empty.
+  bool PopItemTake(net::ItemTake& out);
+  // A peer asked me for one of my items: perform the pickup and queue the
+  // reply. The reply is a REFUSAL (`granted == 0`) when the body is gone, is
+  // not an item, or is not mine -- see the note on ItemGrant.
+  void ApplyItemTake(const net::ItemTake& t);
+  // Drain one grant addressed to this machine. Both the owner's own pickups
+  // and a peer's replies (fed in through ApplyItemGrant) come out here.
+  bool PopItemGrant(net::ItemGrant& out);
+  void ApplyItemGrant(const net::ItemGrant& g);
+
+  // ---- probe (gate `debris-ghost`) ----------------------------------------
+  //
+  // Counters, not booleans: "the island scan skipped N chunks" is a number a
+  // gate can assert a DIFFERENTIAL on, while "it skipped some" is not.
+  struct OwnerProbe {
+    uint32_t ghostBodies = 0;      // ghosts alive at the last PreTick
+    uint32_t ghostsDriven = 0;     // poses applied to colliders, cumulative
+    uint32_t posesRefused = 0;     // stale / not-a-ghost / unknown id
+    uint32_t chunksSkipped = 0;    // island-scan regions another machine owns
+    uint32_t emittersSkipped = 0;  // per-body emitter entries a ghost skipped
+    uint32_t handoffsOut = 0, handoffsIn = 0;
+    uint32_t itemsGranted = 0, itemsRefused = 0;
+  };
+  const OwnerProbe& Owner() const { return ownerProbe_; }
+  void ResetOwnerProbe() { ownerProbe_ = OwnerProbe{}; }
 
   // TAKE A BODY OUT OF THE WORLD. Not damage and not a cull: the thing has
   // been picked up, and it stops existing as matter. Goes through the same
@@ -1116,6 +1293,30 @@ class DebrisSystem {
     uint32_t lastImpactStep = 0;  // rate limit, in PostStep counts (30 Hz)
     // body burn (fire continuity on rigidbodies):
     uint32_t serial = 0;          // stable RNG stream id (bodies_ reshuffles)
+    // ---- WHO STEPS THIS BODY (M9.4-C) -------------------------------------
+    //
+    // `owner` is the player id whose machine simulates it RIGHT NOW; every
+    // other machine holds a kinematic GHOST at the same global id, posed from
+    // the wire and authoring nothing. `ownerAtCreate` is who MINTED it and
+    // never changes, because it is half of the global id: `(ownerAtCreate <<
+    // 48) | serial` names this body on both machines with no handshake and no
+    // allocator (net/debrissync.h MakeGlobalBodyId). Handing a body over moves
+    // `owner` and leaves `ownerAtCreate` alone — a sword you threw is still a
+    // sword you threw whoever is stepping it this second.
+    //
+    // Both default to kLocalOwner, so a single-player process has every body
+    // owned by the one player and takes exactly today's path: the ownership
+    // function is null, nothing ever flips, and the world hash does not move.
+    uint32_t owner = kLocalOwner;
+    uint32_t ownerAtCreate = kLocalOwner;
+    // The newest pose received for a ghost, and the tick it was stamped with.
+    // `poseTick` is what makes an out-of-order datagram harmless: a pose older
+    // than the one already held is dropped rather than dragging the body
+    // backwards. Meaningless on an owned body and never read there.
+    BodyTransform ghostXf{};
+    Vec3 ghostVel{};
+    uint32_t poseTick = 0;
+    bool hasPose = false;
     uint16_t activeCount = 0;     // voxels with UNCONDITIONAL self rules: alight
     uint16_t pairCount = 0;       // voxels with pair rules (ignitable/dousable)
     // voxels whose only self rules are neighbour-count gated (charred flesh
@@ -1360,6 +1561,54 @@ class DebrisSystem {
   // unstraps instead of being driven off a dead handle, and after the readback,
   // so the host transform it derives from is this tick's final one.
   void DriveStraps();
+  // ---- THE ONE KINEMATIC DRIVE -------------------------------------------
+  //
+  // Put a kinematic body EXACTLY on a pose and give it the rigid-body velocity
+  // that pose implies. Both callers are "this body's pose is decided
+  // elsewhere": DriveStraps derives it from a local host limb, DriveGhosts
+  // takes it off the wire. Factored because the two must agree about the three
+  // non-obvious parts, each of which was a bug on the strap path first:
+  //   - SetBodyTransform, not MoveKinematicBody: the latter aims a body at a
+  //     pose it reaches at the END of the next step, and one tick of lag on a
+  //     body falling at 40 m/s is four voxels of daylight.
+  //   - the velocity must be written too, or a kinematic body integrates away
+  //     from where it was just put and reports every contact as a standing hit.
+  //   - Body::xf must be updated to match, because the render instance, the
+  //     terrain sweep and every world-space query read it rather than Jolt.
+  // False when physics refused the handle (it is dead); the caller decides
+  // what that means, which is the ONE thing the two paths do differently.
+  bool DriveKinematicTo(Body& b, Vec3 pos, const float quat[4], Vec3 lin,
+                        Vec3 ang);
+  // Pose every ghost from its newest received pose. Called from PreTick,
+  // before anything reads a body position this tick.
+  void DriveGhosts();
+  // Re-ask the ownership function for every body and act on the answers:
+  // a body that became someone else's is flipped to a kinematic ghost, one
+  // that came back is released to dynamic. No-op when no function is set,
+  // which is what keeps a single-player tick identical to today's.
+  void RefreshOwnership();
+  // Turn a body into a ghost / back into simulated matter, in place.
+  void MakeGhost(Body& b, uint32_t newOwner);
+  void MakeOwned(Body& b);
+  // IS THIS BODY STEPPED BY THIS MACHINE? The one question every emitter
+  // asks. Inline and branch-free-cheap on purpose: it is in five per-body
+  // loops and a single-player run must not pay for it.
+  bool OwnedLocally(const Body& b) const { return b.owner == localPlayerId_; }
+  // IS THIS REGION OF GRID MINE TO SCAN? Null function = yes, always.
+  bool ChunkOwned(IVec3 wc) const {
+    return !chunkOwnedFn_ || chunkOwnedFn_(wc);
+  }
+  // The world chunk an event's SEED box sits in -- the box that actually
+  // changed, not the margin-grown region, because the margin can reach across
+  // an authority seam while the change itself did not.
+  IVec3 EventChunk(const Event& e) const {
+    // `>> 5` is (lo+hi)/2 then /kChunk in one step -- the same expression the
+    // stuck-event path below already uses. kChunk is 16, so the halving and
+    // the divide are four bits each.
+    return IVec3{(e.seedLo.x + e.seedHi.x) >> 5,
+                 (e.seedLo.y + e.seedHi.y) >> 5,
+                 (e.seedLo.z + e.seedHi.z) >> 5};
+  }
   // Cut one strap: the body becomes ordinary dynamic debris carrying the
   // velocity it had as a follower (the rigid-body velocity at its own origin,
   // so a pauldron whose shoulder was spinning leaves along the tangent). Called
@@ -1444,6 +1693,21 @@ class DebrisSystem {
   // phase-gated today, so that default changes nothing it can reach.
   uint32_t dayPhase_ = 0;
   uint32_t nextSerial_ = 1;
+  // ---- ownership (M9.4-C) -------------------------------------------------
+  // All defaulted so that a process that never calls the setters behaves
+  // exactly as it did before this landed: one player, id 0, owning everything.
+  uint32_t localPlayerId_ = kLocalOwner;
+  std::function<uint32_t(Vec3 posVoxel)> ownershipFn_;
+  std::function<bool(IVec3 wc)> chunkOwnedFn_;
+  std::function<bool(uint64_t, std::string&, uint32_t&, uint32_t&)> itemLookupFn_;
+  std::function<bool(uint64_t)> itemTakeFn_;
+  // Requests this machine has to SEND (E pressed on a ghost item) and grants
+  // it has to CONSUME (its own pickups plus peers' replies). Plain deques:
+  // both are drained to empty every tick by the caller, and a request that is
+  // never drained is a transport that is not running, not a leak.
+  std::deque<net::ItemTake> itemTakeOut_;
+  std::deque<net::ItemGrant> itemGrantIn_;
+  OwnerProbe ownerProbe_;
   std::deque<Event> events_;
   // support-loss plumbing: flagged chunks wait here until the event queue has
   // room (never dropped — a missed final event is a floating island forever).

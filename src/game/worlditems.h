@@ -1,5 +1,6 @@
 #pragma once
 #include <cstdint>
+#include <functional>
 #include <string>
 #include <vector>
 
@@ -45,14 +46,26 @@ struct WorldItem {
   // otherwise. The body carries the same word for RENDERING
   // (MicroBodyRef::dye); this is the copy that survives into an ItemStack.
   uint32_t dye = 0;
+  // HOW BEATEN IT IS. Carried for the same reason `dye` is: it is identity
+  // that the body cannot reproduce. A body's LATTICE records the holes fire
+  // burned in a robe, but "this sword is at 40 durability" is a number on the
+  // ItemStack and nothing about a pile of voxels implies it, so a sword
+  // dropped at 40 came back as new.
+  //
+  // It is also the third field net::ItemGrant carries (net/debrissync.h): the
+  // whole of what a remote pickup has to hand the asking machine is name, dye
+  // and damage, and that is not a coincidence -- those are exactly the three
+  // facts that are identity rather than matter.
+  uint32_t damage = 0;
 };
 
 class WorldItems {
  public:
-  void Add(uint64_t body, std::string name, uint32_t dye = 0) {
+  void Add(uint64_t body, std::string name, uint32_t dye = 0,
+            uint32_t damage = 0) {
     if (!body || name.empty()) return;
     Remove(body);   // a reused handle must not resolve to the old item
-    items_.push_back(WorldItem{body, std::move(name), {}, dye});
+    items_.push_back(WorldItem{body, std::move(name), {}, dye, damage});
   }
   const WorldItem* Find(uint64_t body) const {
     for (const WorldItem& w : items_)
@@ -71,6 +84,34 @@ class WorldItems {
   // the physics side has let go of is not a thing you can pick up.
   void OnBodyGone(uint64_t body) { Remove(body); }
   void Clear() { items_.clear(); }
+
+  // ---- THE DEBRIS SYSTEM'S VIEW OF THIS REGISTRY (M9.4-C) -----------------
+  //
+  // A ghost item on the far machine is an ordinary ghost body, and E on it
+  // sends an ItemTake to whoever owns it. The owner has to answer "which item
+  // is that, and take it" -- two questions this registry alone can answer and
+  // which DebrisSystem, a layer below, must not learn to answer itself.
+  //
+  // So they are handed DOWN as callbacks rather than the layering being
+  // inverted. Bind once, next to SetOnBodyGone:
+  //
+  //   debris.SetItemLookupFn(reg.LookupFn());
+  //   debris.SetItemTakeFn([&](uint64_t h) { return debris.DestroyBody(h); });
+  //
+  // (the take function is the CALLER's, because "picked up" means putting the
+  // thing in somebody's inventory and only the session knows whose.)
+  std::function<bool(uint64_t, std::string&, uint32_t&, uint32_t&)> LookupFn()
+      const {
+    return [this](uint64_t body, std::string& name, uint32_t& dye,
+                  uint32_t& damage) {
+      const WorldItem* w = Find(body);
+      if (!w) return false;
+      name = w->item;
+      dye = w->dye;
+      damage = w->damage;
+      return true;
+    };
+  }
   const std::vector<WorldItem>& All() const { return items_; }
   std::vector<WorldItem>& All() { return items_; }
   size_t Count() const { return items_.size(); }
