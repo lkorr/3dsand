@@ -13243,6 +13243,34 @@ at T; M9.4-D moves the crater's island scan to the chunk authority. Gas
 spawns are not exchanged (they never enter `OpBatch`). Single-player is D = 0
 and byte-identical to the oracle.
 
+**M9.4 — entities are owned by the nearest resident player (2026-09-21;
+`src/net/authority.*`, `src/net/entitysync.*`, `mob.*`, `debris.*`).** Ownership is
+DERIVED, never negotiated: both machines evaluate `net::EntityAuthority` over
+the same two `PeerView`s (player chunk + window origin, aged to the SAME tick —
+the first cut computed from "me now, peer at T−D−1" and two fast-moving
+players disagreed in motion), nearest RESIDENT player with margin, ties to
+the lower id, 2-chunk hysteresis in caller-owned memory keyed by entity id.
+Only the owner steps a creature or a body; the other machine holds a GHOST —
+a mob posed from `MobPose` (limb transforms straight into `limbs_[i].xf`, no
+animation, no AI, no bleed/burn/stain/rise, but a target and an obstacle) or
+a kinematic body driven by `BodyPose` through the same `DriveKinematicTo` the
+straps use, skipped by every op emitter and by the island scan of chunks the
+machine does not own. Entities are announced on first entering the peer's
+window plus a chunk, posed every tick while inside, handed off when the
+authority flips (`MobHandoff` = the per-mob save record + brain + gear by
+name, promoted in place; `BodyHandoff` re-creates the body dynamic with its
+velocity), and `Gone` on death or release; a ghost whose owner stops posing
+for 3 s is dropped, and on disconnect every ghost is promoted to local at its
+last pose so nothing freezes. Explosion craters are scanned by the CHUNK
+authority from the merged batch, so a peer's blast in my chunk becomes my
+island scan. Pickup of a ghost item is a request the owner resolves
+(`ItemTake` → `ItemGrant`, which may refuse), so both machines run one pickup
+path. The producer audit at `SubmitTick` counts, never drops, ops a machine
+submitted for a chunk it does not own (`SANDVOX_NET_STRICT=1` aborts). Smoke
+on one machine: three creatures announced, 144 poses, three handoffs, both
+reports mirror field for field. Known limit (M9.4-E): a creature the peer has
+ALWAYS owned needs a ghost spawned from its announce.
+
 **M9 proper (`docs/PLAN_multiplayer_m9.md`, plan of record 2026-09-20).** The
 audit under-stated one number: the residency window is `kWorldN` ×
 `kVoxelMeters` = a **51.2 m cube**, so two players walking independently leave
