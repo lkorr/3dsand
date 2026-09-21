@@ -191,6 +191,10 @@ void Stream::Init(GpuContext* ctx, World* world, Simulation* sim, uint32_t seed)
   // emitter list from (world.h's `farPlumes`).
   world_->farPlumes = &farPlumes_;
   modified_.assign(kNumSlots, 0);
+  // Sized once beside modified_ so every later path can index it without a
+  // bounds dance (M9.5-A). All-zero is "no slot is waiting on anybody",
+  // which is the only state a single-player run ever reaches.
+  awaitingRemote_.assign(kNumSlots, 0);
 }
 
 void Stream::OnMaterialsReloaded(const std::vector<MaterialDef>& mats) {
@@ -280,6 +284,28 @@ void Stream::Update(const InterestSet& interest, uint32_t tick) {
   // so the woken chunks' 26-neighbourhoods get pages in the SAME tick the CA
   // first dispatches them.
   CompleteDueShifts(tick);
+
+  // ---- slots a DeliverMiss released (M9.5-A) ------------------------------
+  //
+  // AFTER CompleteDueShifts and BEFORE the shift below, which is the same
+  // slot the deferred wake occupies and for the same reason: this is a refill
+  // that submits, so it must run where a submit is legal and where a shift
+  // cannot then invalidate it in the same call.
+  //
+  // deferWake=false, like ReloadWindow and unlike a shift. These are a
+  // handful of scattered slots rather than a plane, genAct is sized to one
+  // plane, and there is no frame-time cliff to protect here - the cost the
+  // deferral buys back is a shift's, and a miss is not a shift.
+  if (!genAfterMiss_.empty()) {
+    std::vector<uint32_t> miss;
+    miss.swap(genAfterMiss_);
+    // See fillIgnoresExchange_ in stream.h: the exchange has already answered
+    // "miss" for these chunks and must not be asked again, or the hold and
+    // the miss would ping-pong.
+    fillIgnoresExchange_ = true;
+    FillSlots(miss, /*deferWake=*/false);
+    fillIgnoresExchange_ = false;
+  }
 
   // R4: at most one shift per FRAME (see BeginFrame in stream.h). Ungated for
   // callers with no frame loop, where one Update is one tick anyway.
@@ -435,6 +461,13 @@ void Stream::EvictSlots(const std::vector<uint32_t>& slots, bool filter) {
       // — RleEncodeSentinelChunk clear()s and refills `out` on every call, so
       // the next iteration never reads the moved-from state. The trade is one
       // copy for one regrow, and the regrow is the cheaper half.
+      // THE FIRST OF THE TWO EVICTION HOOKS (M9.5-A). BEFORE the Put, because
+      // the Put MOVES the RLE out of `sentRle` - and before rather than after
+      // for the stronger reason too: the exchange is handed the exact bytes
+      // the store is about to keep, so a forwarded chunk and a re-entered one
+      // can never disagree. `lastTick_` is the tick this eviction was decided
+      // on, which for the sentinel path is also now.
+      if (exchange_) exchange_->OnEvicted(wc, lastTick_, sentRle);
       store_.Put(wc, std::move(sentRle));
       // ...and into the far-field edit index. A sentinel is ONE material
       // everywhere (JITTER varies only the palette nibble, which the far field
@@ -471,6 +504,7 @@ void Stream::EvictSlots(const std::vector<uint32_t>& slots, bool filter) {
     size_t n = std::min(kEvictBatch, toSave.size() - off);
     PendingEvict p;
     p.staging = AcquireStaging();
+    p.tick = lastTick_;  // see PendingEvict::tick (M9.5-A)
     p.items.reserve(n);
     rhi::CommandEncoder enc = ctx_->device.CreateCommandEncoder();
     for (size_t i = 0; i < n; i++) {
@@ -601,6 +635,14 @@ void Stream::CompleteOldest(bool discard) {
           // one whose RLE does not compress (PLAN_surface_flight_perf.md B5).
           // Both encoders clear() their `out` first, so the scratch buffer is
           // safe to move from inside the loop.
+          // THE SECOND EVICTION HOOK (M9.5-A). Same ordering rule as the
+          // sentinel one (the Put moves `rle` away), and the tick is
+          // `p.tick` - the tick EvictSlots ran on, not `lastTick_`. The
+          // readback that produced these bytes is several ticks latent, and
+          // a peer comparing tags has to see when the chunk LEFT, or a busy
+          // machine would appear to hold newer data than the one that
+          // actually edited the chunk.
+          if (exchange_) exchange_->OnEvicted(p.items[i].wc, p.tick, rle);
           store_.Put(p.items[i].wc, std::move(rle));
           // The far-field edit index takes the SAME words, from the same
           // harvest — this is the one place the CPU ever sees an edited
@@ -804,6 +846,96 @@ bool Stream::ReplaceChunk(IVec3 wc, const uint32_t* words) {
   return true;
 }
 
+// ---- THE INERT HOLD (M9.5-A) ---------------------------------------------
+//
+// Everything a refill does, MINUS the two things that would be wrong here:
+// it installs no content (the content is somebody else's and has not arrived)
+// and it does not wake (the CA must not run on air that is about to be
+// replaced, and a chunk of pure sky has nothing to act anyway - the same
+// act-set argument InstallChunkWords makes for its PT_EMPTY case).
+//
+// Both residency modes, because `--residency dense` is the only live
+// differential oracle this engine has and a hold that showed different
+// contents in the two modes would poison it. Paged installs the PT_EMPTY
+// sentinel and frees the page; dense has no sentinel to install - its table
+// is the identity map - so the air has to be real words.
+void Stream::HoldSlotInert(uint32_t s, IVec3 wc) {
+  (void)wc;
+  if (awaitingRemote_.size() != kNumSlots) awaitingRemote_.assign(kNumSlots, 0);
+  if (world_->residency == World::Residency::Paged) {
+    world_->pages->SetSentinel(s, kPtEmpty);
+    world_->pages->FlushTableWrites(ctx_->queue);
+  } else {
+    static const std::vector<uint32_t> kAir(kChunkVol, 0u);
+    const uint64_t off = world_->PageOffsetOfSlot(s);
+    if (off != World::kNoPage)
+      ctx_->queue.WriteBuffer(world_->voxels, off, kAir.data(), kChunkBytes);
+  }
+  // Occupancy AND the sub-chunk mask, for the reason InstallChunkWords states
+  // at the same two writes: a bit left set over a slot that holds nothing is
+  // a chunk the raymarcher thinks is solid, and the demote classifier reads
+  // the same word.
+  const uint32_t zero = 0;
+  ctx_->queue.WriteBuffer(world_->occupancy, (uint64_t)s * 4, &zero, 4);
+  uint32_t sub[kSubOccStride] = {};
+  ctx_->queue.WriteBuffer(world_->occupancy,
+                          ((uint64_t)kNumSlots + (uint64_t)s * kSubOccStride) * 4,
+                          sub, sizeof(sub));
+  // ...and CLEAR both dirty pages rather than leaving whatever the chunk that
+  // just left had. This is the "does not wake" half, and it has to be an
+  // explicit clear: eviction does not clear dirty flags (the gen path relies
+  // on genChunk doing it), so a held slot would otherwise inherit the departed
+  // chunk's wake and dispatch the CA over air.
+  ctx_->queue.WriteBuffer(world_->dirty[0], (uint64_t)s * 4, &zero, 4);
+  ctx_->queue.WriteBuffer(world_->dirty[1], (uint64_t)s * 4, &zero, 4);
+}
+
+bool Stream::DeliverRemote(IVec3 wc, uint32_t tick,
+                           const std::vector<uint32_t>& rle) {
+  std::vector<uint32_t> words(kChunkVol);
+  if (rle.size() < 2 || (rle.size() & 1u) ||
+      !RleDecodeChunk(rle.data(), rle.size() / 2, words.data())) {
+    // A malformed payload is a WIRE bug, not a world bug: refuse it and leave
+    // the hold standing, so the slot stays air rather than becoming garbage.
+    exchangeStats_.rejected++;
+    return false;
+  }
+  // The store FIRST, and tagged. The point of the tag is that the next time
+  // this chunk leaves and re-enters the window it comes back from the store
+  // with no round trip at all, and that a later ChunkPut carrying an older
+  // tick can be refused rather than applied (chunkstore.h).
+  store_.Put(wc, rle, tick);
+  // ...then the words, through the ONE install door. ReplaceChunk refuses a
+  // chunk the window no longer holds and counts it; that is the race where
+  // the reply lost to a shift, and it is why the store write above happens
+  // unconditionally - the bytes are still worth keeping.
+  if (!ReplaceChunk(wc, words.data())) {
+    exchangeStats_.rejected++;
+    if (world_->ChunkInWindow(wc)) {
+      const uint32_t s = World::SlotChunkIndex(wc);
+      if (s < awaitingRemote_.size()) awaitingRemote_[s] = 0;
+    }
+    return false;
+  }
+  const uint32_t s = World::SlotChunkIndex(wc);
+  if (s < awaitingRemote_.size()) awaitingRemote_[s] = 0;
+  exchangeStats_.delivered++;
+  return true;
+}
+
+bool Stream::DeliverMiss(IVec3 wc) {
+  if (!world_->ChunkInWindow(wc)) return false;  // the window outran the ask
+  const uint32_t s = World::SlotChunkIndex(wc);
+  if (s >= awaitingRemote_.size() || !awaitingRemote_[s]) return false;
+  awaitingRemote_[s] = 0;
+  // Queued, not generated here: procgen is a buffer write plus a dispatch
+  // plus a submit, and this is called from whatever pumps the socket. Update
+  // is the between-ticks point where a submit is already legal.
+  genAfterMiss_.push_back(s);
+  exchangeStats_.missed++;
+  return true;
+}
+
 void Stream::FillSlots(const std::vector<uint32_t>& slots, bool deferWake) {
   const double fT0 = PtNowMs();
   if (world_->residency == World::Residency::Paged)
@@ -811,6 +943,16 @@ void Stream::FillSlots(const std::vector<uint32_t>& slots, bool deferWake) {
   std::vector<uint32_t> data(kChunkVol);
   std::vector<uint32_t> genSlots;
   for (uint32_t s : slots) {
+    // A HOLD THE WINDOW OUTRAN (M9.5-A). This slot was waiting for a peer's
+    // copy of the chunk it used to hold, and the shift has just given it a
+    // different chunk: there is nothing left to install into, so the hold is
+    // dropped here and counted. It is not an error - the reply, if it comes,
+    // is refused by ReplaceChunk's residency test and counted there - but it
+    // is the number that separates "the peer never answered" from "we moved".
+    if (s < awaitingRemote_.size() && awaitingRemote_[s]) {
+      awaitingRemote_[s] = 0;
+      exchangeStats_.forgotten++;
+    }
     modified_[s] = 0;
     // The slot is about to hold a DIFFERENT world chunk, so whatever quiet
     // streak it had belonged to the chunk that left (M9.3-A). Reset by SLOT
@@ -836,6 +978,20 @@ void Stream::FillSlots(const std::vector<uint32_t>& slots, bool deferWake) {
     const std::vector<uint32_t>* rle = store_.Get(wc);
     if (rle && RleDecodeChunk(rle->data(), rle->size() / 2, data.data())) {
       InstallChunkWords(s, wc, data.data());
+    } else if (exchange_ && !fillIgnoresExchange_ && exchange_->Wanted(wc)) {
+      // THE REFILL HOOK (M9.5-A). My store has never seen this chunk, but the
+      // exchange knows somebody else has a MODIFIED copy of it - so procgen
+      // would be the wrong answer, not merely a slow one: it would paint
+      // pristine terrain over another player's edit and then, when the reply
+      // arrived, visibly undo it.
+      //
+      // So the slot is held INERT instead of generated. It is NOT pushed to
+      // genSlots, which is the whole point: no genChunk dispatch, no wake,
+      // and a PT_EMPTY sentinel that costs no page.
+      HoldSlotInert(s, wc);
+      awaitingRemote_[s] = 1;
+      exchangeStats_.held++;
+      exchange_->Request(wc);
     } else {
       genSlots.push_back(s);
     }
@@ -1444,6 +1600,12 @@ void Stream::ReloadWindow(IVec3 origin) {
   DiscardPendingShifts();  // and so do any un-enacted shift verdicts
   world_->SetWindowOrigin(origin);
   modified_.assign(kNumSlots, 0);
+  // Holds and miss-requeues belong to the window being replaced (M9.5-A). The
+  // refill below re-asks the exchange for every slot under the NEW origin, so
+  // any chunk still genuinely wanted is held again on the way through; not
+  // clearing here would leave a stale hold on a slot the refill then fills.
+  awaitingRemote_.assign(kNumSlots, 0);
+  genAfterMiss_.clear();
   std::vector<uint32_t> slots(kNumChunks);
   for (uint32_t i = 0; i < kNumChunks; i++) slots[i] = i;
   // deferWake=false: this is the WHOLE window (32,768 slots, far past genAct's

@@ -28,7 +28,31 @@ class ChunkStore {
   static constexpr int kRegionShift = 4;  // 16 chunks (256 voxels) per axis
   static constexpr size_t kMaxRamRegions = 64;
 
-  void Put(IVec3 wc, std::vector<uint32_t> rle);
+  // ---- THE TICK TAG (M9.5-A) ---------------------------------------------
+  //
+  // `tick` is the sim tick the stored bytes were DECIDED at, not the tick they
+  // were written at, and it exists for exactly one question: when two machines
+  // both hold a copy of a chunk, whose is newer? The host's store is the
+  // truth and a `ChunkPut` that carries an older tick than `TickOf(wc)` is
+  // refused rather than applied (PLAN_multiplayer_m9.md M9.5-B).
+  //
+  // ZERO MEANS UNKNOWN, and that is the single-player default: every existing
+  // caller passes no tick, no tag is recorded, `manifest.svt` is never
+  // written, and the `.svr` region format is untouched — which is why
+  // `save-load` and `region-store` see no change at all. A tagged Put
+  // followed by an untagged one DROPS the tag: the untagged bytes are newer
+  // and "unknown" is the honest answer for them, where keeping the stale
+  // number would claim a freshness the content does not have.
+  void Put(IVec3 wc, std::vector<uint32_t> rle, uint32_t tick = 0);
+  // The tag, or 0 for an untagged/absent chunk. Deliberately does NOT go
+  // through Get(): asking "how old is this?" must not pull the region into
+  // RAM and LRU-spill something else out (the ForEachStored argument, applied
+  // to a lookup a manifest walk makes thousands of times).
+  uint32_t TickOf(IVec3 wc) const;
+  // Every stored chunk with its tag, in one pass: the payload of the
+  // `ChunkManifest` a late join receives. Built on ForEachStored for the same
+  // no-thrash reason; O(store), join-time only.
+  void Manifest(std::vector<std::pair<IVec3, uint32_t>>& out);
   // Pointer is valid only until the next Put/Get/Clear: either may LRU-spill
   // the region that owns it. Use immediately.
   const std::vector<uint32_t>* Get(IVec3 wc);
@@ -38,6 +62,7 @@ class ChunkStore {
   // the next BindSave overwrites them).
   void Clear() {
     regions_.clear();
+    tickTags_.clear();
     chunkCount_ = 0;
     dir_.clear();
   }
@@ -89,8 +114,31 @@ class ChunkStore {
   bool WriteRegion(IVec3 rc, Region& r, uint64_t* bytesOut);
   void SpillOverBudget();
 
+  // manifest.svt: the tick tags, as a flat (wc, tick) list beside the region
+  // files. A SIDE MAP rather than a field on Entry, for two reasons that are
+  // both about not paying for it in single player: the `.svr` format stays
+  // byte-identical (no save-format change, §M9.5-A), and reading a tag costs
+  // no region load — which is what lets a manifest of a disk-resident world
+  // be answered without dragging every region through RAM. Only NON-ZERO tags
+  // are held, so an untagged world's map is empty and its file is never
+  // written.
+  static constexpr uint32_t kManifestMagic = 0x31545653;  // 'SVT1'
+  std::string ManifestPath() const { return dir_ + "/manifest.svt"; }
+  void LoadManifest();
+  bool WriteManifest();
+
   std::string dir_;
   std::unordered_map<uint64_t, Region> regions_;  // packed region key
+  // Value carries the COORDINATE as well as the tick, because the manifest
+  // writer has to emit (wc, tick) and World::PackChunkKey has no inverse —
+  // writing one here would be a second copy of that packing to keep in step
+  // with the original, which is the "two places must agree" bug this repo
+  // keeps paying for. Twelve bytes per tagged chunk, and only tagged ones.
+  struct Tag {
+    IVec3 wc;
+    uint32_t tick = 0;
+  };
+  std::unordered_map<uint64_t, Tag> tickTags_;  // packed chunk key -> tag
   size_t chunkCount_ = 0;
   uint64_t useCounter_ = 0;
 };

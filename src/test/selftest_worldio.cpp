@@ -21,6 +21,7 @@
 #include "game/player.h"
 #include "gpu/rhi.h"
 #include "sim/chunkstore.h"
+#include "sim/stream.h"
 #include "sim/pagetable.h"
 #include "sim/worldio.h"
 #include "test/selftest.h"
@@ -682,6 +683,457 @@ bool streamOk = false;
   return streamOk ? Status::Pass : Status::Fail;
 }
 
+
+// ---- chunk-exchange ----------------------------------------------------
+//
+// M9.5-A: streaming's two openings onto the network (sim/stream.h's
+// ChunkExchange) plus the ChunkStore tick tag that tells two machines whose
+// copy of a chunk is newer.
+//
+// THE FAKE END. Everything here is in-process: there is no socket, no peer
+// and no protocol, because none of those are what this gate is about. What
+// it is about is the four claims Stream now makes to whoever IS on the other
+// end, and each of them is a claim a wire implementation would otherwise only
+// discover under two running processes:
+//
+//   (a) an eviction is REPORTED, once, with the right coordinate, the right
+//       tick and the right bytes - at BOTH Put sites, which are a
+//       synchronous one (sentinel chunks) and an asynchronous one (real
+//       pages, ticks later through the readback);
+//   (b) a refill the exchange claims is HELD INERT - no procgen, no wake,
+//       reads as air - and a DeliverRemote afterwards lands the peer's words
+//       so exactly that the world hash equals a control that streamed the
+//       same chunk out of the store instead;
+//   (c) a DeliverMiss falls back to procgen;
+//   (d) the whole of (b) is reproducible, and the tick tag survives a
+//       Flush/BindLoad round trip.
+//
+// Arm (b) is the load-bearing one and its CONTROL is the point: "the hash did
+// not move" would be satisfied by doing nothing at all, so the control has
+// the chunk arriving by the ORDINARY path (a store hit) and the subject has
+// it arriving by the new one, with the same bytes, at the same tick, into the
+// same world. Equal hashes then mean the new door installs a chunk exactly
+// the way the old door does - which is the property M9.5-B's wire needs and
+// cannot itself test.
+struct FakeExchange : ChunkExchange {
+  struct Ev {
+    IVec3 wc{};
+    uint32_t tick = 0;
+    std::vector<uint32_t> rle;
+  };
+  std::vector<Ev> evicted;
+  std::map<uint64_t, uint32_t> evictCount;  // packed chunk key -> times seen
+  std::map<uint64_t, uint32_t> want;        // chunks to claim a peer holds
+  std::vector<IVec3> requested;
+
+  void OnEvicted(IVec3 wc, uint32_t tick,
+                 const std::vector<uint32_t>& rle) override {
+    const uint64_t k = World::PackChunkKey(wc);
+    evictCount[k]++;
+    // Only the chunks under test are kept whole: a shift plane is 1,024
+    // chunks and a surface one RLEs to 32 KiB, so keeping them all would be
+    // tens of megabytes for two assertions.
+    if (want.count(k) || keep.count(k)) evicted.push_back({wc, tick, rle});
+  }
+  bool Wanted(IVec3 wc) override {
+    return want.count(World::PackChunkKey(wc)) != 0;
+  }
+  void Request(IVec3 wc) override { requested.push_back(wc); }
+
+  std::map<uint64_t, uint32_t> keep;  // chunks whose bytes to record
+  const Ev* Find(IVec3 wc) const {
+    for (const Ev& e : evicted)
+      if (e.wc.x == wc.x && e.wc.y == wc.y && e.wc.z == wc.z) return &e;
+    return nullptr;
+  }
+};
+
+Status GateChunkExchange(Ctx& c, std::string& detail) {
+  GpuContext& ctx = c.ctx;
+  World& world = c.world;
+  Simulation& sim = c.sim;
+  Stream& stream = c.stream;
+  const bool paged = world.residency == World::Residency::Paged;
+
+  std::string fails;
+  auto fail = [&](const std::string& m) {
+    if (!fails.empty()) fails += "; ";
+    fails += m;
+  };
+  // Whatever happens below, the Stream must not be left pointing at a
+  // stack object of this function.
+  struct Unbind {
+    Stream& s;
+    ~Unbind() { s.SetChunkExchange(nullptr); }
+  } unbind{stream};
+
+  uint32_t t = 9000;
+  const IVec3 pc{16, 16, 16};  // the window centre: Update here never shifts
+  auto tickAt = [&](const std::vector<BrushOp>& ops, IVec3 who) {
+    SubmitTick(ctx, world, sim, ++t, kDefaultSeed, ops, {}, {},
+               /*hashEnable=*/true, who, /*wantReadback=*/true,
+               /*particlesActive=*/false);
+    ctx.WaitIdle();
+    ctx.ProcessEvents();
+  };
+  auto regen = [&]() {
+    stream.OnRegen();
+    world.SetWindowOrigin({0, 0, 0});
+    SubmitWorldgen(ctx, world, sim, kDefaultSeed);
+    ctx.WaitIdle();
+  };
+  // A buried chunk, MEASURED rather than assumed (the chunk-resync gate's
+  // rule): two chunks under the surface, where the CA has nothing to do, so
+  // the arms below compare a quiet world and not a landslide. `cx` picks the
+  // column band; arm (a) needs chunk-x 0 because that plane is what the first
+  // +X shift evicts.
+  auto buriedChunk = [&](int cx, int& outH) {
+    int bestH = -1, bestZ = 0;
+    for (int cz = 4; cz <= 12; cz++) {
+      const int h = World::TerrainHeight(cx * (int)kChunk + 8,
+                                         cz * (int)kChunk + 8, kDefaultSeed);
+      if (h > bestH) { bestH = h; bestZ = cz; }
+    }
+    outH = bestH;
+    return IVec3{cx, (bestH >> 4) - 2, bestZ};
+  };
+  auto markBox = [&](IVec3 wc) {
+    const IVec3 lo{wc.x * (int)kChunk, wc.y * (int)kChunk, wc.z * (int)kChunk};
+    stream.MarkModifiedBox(
+        lo, {lo.x + (int)kChunk - 1, lo.y + (int)kChunk - 1,
+             lo.z + (int)kChunk - 1});
+  };
+  // The marker: a glass ball at the chunk's centre, sealed inside stone. It
+  // is what separates "the peer's copy" from "procgen ran" in every arm -
+  // worldgen never puts glass underground, so one non-zero count answers the
+  // question without trusting a hash to do it.
+  auto glassOp = [&](IVec3 wc) {
+    return BrushOp{wc.x * (int)kChunk + 8, wc.y * (int)kChunk + 8,
+                   wc.z * (int)kChunk + 8, 3, (uint32_t)kMatGlass, 1, 0, 0};
+  };
+  auto countMat = [&](const std::vector<uint32_t>& w, uint32_t mat) {
+    uint32_t n = 0;
+    for (uint32_t v : w)
+      if ((v & 0xFFFu) == mat) n++;
+    return n;
+  };
+  auto nonAir = [&](const std::vector<uint32_t>& w) {
+    uint32_t n = 0;
+    for (uint32_t v : w)
+      if ((v & 0xFFFu) != 0u) n++;
+    return n;
+  };
+
+  // ======== ARM A: both eviction hooks ===================================
+  uint32_t evTickSent = 0, evTickReal = 0, evGlass = 0;
+  uint32_t sentCount = 0, realCount = 0, skyPairs = 0;
+  {
+    int h0 = 0;
+    const IVec3 evictChunk = buriedChunk(0, h0);
+    // A chunk of open sky in the SAME plane. It has no page at all, so it
+    // leaves by the synchronous sentinel path while the buried chunk leaves
+    // by the asynchronous readback one - the two Put sites, in one shift.
+    const IVec3 skyChunk{0, 28, evictChunk.z};
+    if (evictChunk.y < 2) {
+      detail = Format("no buried chunk in plane x=0 (terrain height %d)", h0);
+      std::printf("chunk-exchange: FAIL (%s)\n", detail.c_str());
+      return Status::Fail;
+    }
+    regen();
+    tickAt({glassOp(evictChunk)}, pc);
+    markBox(evictChunk);
+    markBox(skyChunk);
+    for (int k = 0; k < 4; k++) tickAt({}, pc);
+
+    FakeExchange ex;
+    ex.keep[World::PackChunkKey(evictChunk)] = 1;
+    ex.keep[World::PackChunkKey(skyChunk)] = 1;
+    stream.SetChunkExchange(&ex);
+    // ONE +X shift: the interest is 3 chunks past centre, which is past the
+    // 2-chunk hysteresis on x and nothing on y/z. The leaving plane is
+    // x = origin.x = 0, which is where both subjects live.
+    const uint32_t shiftTick = ++t;
+    stream.Update(IVec3{19, 16, 16}, shiftTick);
+    // ...then run until the asynchronous half lands. The real page's bytes
+    // come back through a mapped readback several ticks later, which is the
+    // entire reason OnEvicted carries the eviction's OWN tick rather than the
+    // clock at completion.
+    for (int k = 0; k < 40 && stream.PendingEvictions() > 0; k++) {
+      tickAt({}, IVec3{17, 16, 16});
+      stream.Update(IVec3{17, 16, 16}, t);  // centre of the shifted window
+    }
+    stream.SetChunkExchange(nullptr);
+
+    sentCount = ex.evictCount[World::PackChunkKey(skyChunk)];
+    realCount = ex.evictCount[World::PackChunkKey(evictChunk)];
+    const FakeExchange::Ev* sentEv = ex.Find(skyChunk);
+    const FakeExchange::Ev* realEv = ex.Find(evictChunk);
+    if (paged) {
+      // Dense has no sentinels at all - every slot owns a page - so the
+      // synchronous arm cannot exist there and asserting it would fail the
+      // `--residency dense` differential for a reason that is not a bug.
+      if (sentCount != 1)
+        fail(Format("sentinel eviction fired %u times, want 1", sentCount));
+      if (sentEv) {
+        evTickSent = sentEv->tick;
+        skyPairs = (uint32_t)(sentEv->rle.size() / 2);
+        if (sentEv->tick != shiftTick)
+          fail(Format("sentinel eviction tick %u, want %u", sentEv->tick,
+                      shiftTick));
+        // Open sky RLEs to a single {kChunkVol, air} run.
+        if (skyPairs != 1 || sentEv->rle[0] != (uint32_t)kChunkVol ||
+            (sentEv->rle[1] & 0xFFFu) != 0u)
+          fail("sentinel eviction did not carry the sky chunk's RLE");
+      } else {
+        fail("sentinel eviction never fired");
+      }
+    }
+    if (realCount != 1)
+      fail(Format("real-page eviction fired %u times, want 1", realCount));
+    if (realEv) {
+      evTickReal = realEv->tick;
+      if (realEv->tick != shiftTick)
+        fail(Format("real-page eviction tick %u, want %u (the tick the "
+                    "eviction was DECIDED at, not the harvest tick)",
+                    realEv->tick, shiftTick));
+      std::vector<uint32_t> w(kChunkVol, 0u);
+      if (RleDecodeChunk(realEv->rle.data(), realEv->rle.size() / 2, w.data()))
+        evGlass = countMat(w, (uint32_t)kMatGlass);
+      if (evGlass == 0)
+        fail("the evicted RLE did not carry the chunk's edit");
+    } else {
+      fail("real-page eviction never fired");
+    }
+  }
+
+  // ======== ARMS B/C/D: the hold, the delivery and the miss ==============
+  //
+  // ONE SCENE, THREE MODES, identical in every respect that reaches the
+  // world: the same worldgen, the same edit, the same authority bytes, the
+  // same tick schedule. The only difference is HOW the chunk gets back into
+  // the window (CLAUDE.md rule 7's "run both arms at the same scope").
+  enum Mode { kControl = 0, kDeliver = 1, kMiss = 2 };
+  struct ArmOut {
+    uint32_t hash = 0;
+    uint32_t glass = 0;      // marker voxels in the subject at the end
+    uint32_t heldNonAir = 0; // non-air in the subject WHILE held
+    uint32_t heldEntry = 0;  // its page-table entry while held
+    uint32_t requested = 0;
+    Stream::ExchangeStats stats;
+  };
+  int hB = 0;
+  const IVec3 subject = buriedChunk(8, hB);
+  if (subject.y < 2) {
+    detail = Format("no buried chunk in plane x=8 (terrain height %d)", hB);
+    std::printf("chunk-exchange: FAIL (%s)\n", detail.c_str());
+    return Status::Fail;
+  }
+  const uint32_t slot = World::SlotChunkIndex(subject);
+  const uint32_t kArmTicks = 24;
+  const uint32_t kDeliverTick = 4242;  // an arbitrary tag, checked below
+
+  auto runArm = [&](Mode mode, ArmOut& o) {
+    // ---- phase 1: build the authority's copy ----------------------------
+    stream.SetChunkExchange(nullptr);
+    regen();
+    t = 9000;
+    tickAt({glassOp(subject)}, pc);
+    markBox(subject);
+    for (int k = 0; k < 4; k++) tickAt({}, pc);
+    std::vector<uint32_t> words(kChunkVol, 0u);
+    ReadVoxelsSync(ctx, world, slot, 1, words.data(), "xchgCap");
+    std::vector<uint32_t> rle;
+    RleEncodeChunk(words.data(), rle);
+
+    // ---- phase 2: a world with no memory of that edit -------------------
+    // OnRegen empties the store, so the refill below is a genuine MISS for
+    // every chunk. The control then puts the authority copy in the store
+    // (the ordinary door); the other two leave the store empty and let the
+    // exchange claim it (the new door).
+    regen();
+    FakeExchange ex;
+    if (mode == kControl) {
+      stream.Store().Put(subject, rle);
+    } else {
+      ex.want[World::PackChunkKey(subject)] = 1;
+      stream.SetChunkExchange(&ex);
+    }
+    stream.ReloadWindow({0, 0, 0});
+    if (mode != kControl) {
+      o.requested = (uint32_t)ex.requested.size();
+      o.heldEntry = world.PageEntryOfSlot(slot);
+      std::vector<uint32_t> held(kChunkVol, 0u);
+      ReadVoxelsSync(ctx, world, slot, 1, held.data(), "xchgHeld");
+      o.heldNonAir = nonAir(held);
+      o.stats = stream.Exchange();
+    }
+
+    // ---- phase 3: the answer, at the phase-B position -------------------
+    // Before the first tick's submit, which is where session.cpp installs a
+    // live sync - so the CA of tick 1 runs on the answered chunk in every
+    // arm and the tick schedules stay comparable.
+    if (mode == kDeliver) {
+      if (!stream.DeliverRemote(subject, kDeliverTick, rle))
+        fail("DeliverRemote refused a resident, held chunk");
+      if (stream.Store().TickOf(subject) != kDeliverTick)
+        fail("DeliverRemote did not tag the store with the delivered tick");
+    } else if (mode == kMiss) {
+      if (!stream.DeliverMiss(subject))
+        fail("DeliverMiss did not recognise the held slot");
+      // The requeued slot is generated by the NEXT Update, not by the call
+      // above (a network pump may not submit). The interest is the window
+      // centre, so this Update shifts nothing.
+      stream.Update(pc, t);
+    }
+    for (uint32_t i = 0; i < kArmTicks; i++) tickAt({}, pc);
+    o.hash = ReadHashSync(ctx, world);
+    std::vector<uint32_t> fin(kChunkVol, 0u);
+    ReadVoxelsSync(ctx, world, slot, 1, fin.data(), "xchgFin");
+    o.glass = countMat(fin, (uint32_t)kMatGlass);
+    if (mode != kControl) o.stats = stream.Exchange();
+    stream.SetChunkExchange(nullptr);
+  };
+
+  ArmOut ctrl, deliv, deliv2, miss;
+  runArm(kControl, ctrl);
+  runArm(kDeliver, deliv);
+  runArm(kDeliver, deliv2);  // (d): the whole of arm B, twice
+  runArm(kMiss, miss);
+
+  // (b) the hold: inert, and unmistakably not procgen.
+  if (deliv.requested != 1)
+    fail(Format("the hold requested %u chunks, want 1", deliv.requested));
+  if (deliv.heldNonAir != 0)
+    fail(Format("a held slot is not air (%u non-air voxels) - procgen ran, "
+                "or the hold did not clear the slot",
+                deliv.heldNonAir));
+  if (paged && deliv.heldEntry != kPtEmpty)
+    fail(Format("a held slot is not a PT_EMPTY sentinel (entry 0x%08x)",
+                deliv.heldEntry));
+  if (deliv.stats.held != 1 || deliv.stats.delivered != 1)
+    fail(Format("hold/deliver counters read %llu/%llu, want 1/1",
+                (unsigned long long)deliv.stats.held,
+                (unsigned long long)deliv.stats.delivered));
+  if (ctrl.glass == 0) fail("the control lost its own marker");
+  if (deliv.glass != ctrl.glass)
+    fail(Format("delivered chunk has %u marker voxels, control has %u",
+                deliv.glass, ctrl.glass));
+  // THE CLAIM THE WIRE NEEDS: the new door and the old door leave the same
+  // world. Not "the hash did not move" - a hash that never moves is also
+  // what doing nothing produces - but "the hash equals the control's".
+  if (deliv.hash != ctrl.hash)
+    fail(Format("delivered world hash %08x != store-streamed control %08x",
+                deliv.hash, ctrl.hash));
+  // (d) twice-run.
+  if (deliv2.hash != deliv.hash)
+    fail(Format("two runs of the delivery arm disagree: %08x vs %08x",
+                deliv.hash, deliv2.hash));
+  // (c) the miss regenerates: real terrain back, and NOT the peer's edit.
+  if (miss.stats.missed != 1)
+    fail(Format("miss counter read %llu, want 1",
+                (unsigned long long)miss.stats.missed));
+  if (miss.glass != 0)
+    fail(Format("a missed chunk kept %u marker voxels - it was not "
+                "regenerated", miss.glass));
+  uint32_t missNonAir = 0;
+  {
+    // Re-read rather than trust the arm's own count: the claim here is that
+    // procgen RAN, which is "the chunk is full of terrain again", not "the
+    // marker is gone" (an empty chunk satisfies the second and not the first).
+    std::vector<uint32_t> w(kChunkVol, 0u);
+    ReadVoxelsSync(ctx, world, slot, 1, w.data(), "xchgMiss");
+    missNonAir = nonAir(w);
+    if (missNonAir == 0)
+      fail("a missed chunk is still air - DeliverMiss never regenerated it");
+  }
+
+  // ======== ARM E: the tick tag round-trips ==============================
+  //
+  // A pure ChunkStore test beside `region-store`, because that is the scope
+  // the claim lives at: the tag is persisted as manifest.svt beside the
+  // regions, the `.svr` format is untouched, and an absent manifest reads as
+  // tag 0 for everything.
+  bool tagOk = false;
+  {
+    const char* kDir = "selftest_xchg.svd";
+    std::filesystem::remove_all(kDir);
+    const IVec3 a{3, 4, 5}, b{-9, 0, 2};
+    std::vector<uint32_t> rleA = {(uint32_t)kChunkVol, (uint32_t)kMatStone};
+    std::vector<uint32_t> rleB = {(uint32_t)kChunkVol, (uint32_t)kMatGlass};
+    ChunkStore cs;
+    tagOk = cs.BindSave(kDir);
+    cs.Put(a, rleA, 7777);
+    cs.Put(b, rleB);  // untagged: the single-player signature, still legal
+    tagOk = tagOk && cs.TickOf(a) == 7777u && cs.TickOf(b) == 0u;
+    std::vector<std::pair<IVec3, uint32_t>> man;
+    cs.Manifest(man);
+    tagOk = tagOk && man.size() == 2;
+    tagOk = tagOk && cs.Flush();
+    ChunkStore cs2;
+    tagOk = tagOk && cs2.BindLoad(kDir);
+    // Read through the tag map, which BindLoad filled from manifest.svt -
+    // no region was touched to answer this, which is the point of the side
+    // map (chunkstore.h).
+    tagOk = tagOk && cs2.TickOf(a) == 7777u && cs2.TickOf(b) == 0u;
+    std::vector<std::pair<IVec3, uint32_t>> man2;
+    cs2.Manifest(man2);
+    tagOk = tagOk && man2.size() == 2;
+    uint32_t tagA = 0, tagB = 1;
+    for (const auto& e : man2) {
+      if (e.first.x == a.x && e.first.y == a.y && e.first.z == a.z)
+        tagA = e.second;
+      if (e.first.x == b.x && e.first.y == b.y && e.first.z == b.z)
+        tagB = e.second;
+    }
+    tagOk = tagOk && tagA == 7777u && tagB == 0u;
+    // ...and the region bytes still read back, which is the "no save-format
+    // change" half of the claim.
+    const std::vector<uint32_t>* got = cs2.Get(a);
+    tagOk = tagOk && got && got->size() == 2 &&
+            (*got)[1] == (uint32_t)kMatStone;
+    // An ABSENT manifest is tag 0 for everything, not a load failure.
+    std::filesystem::remove(std::string(kDir) + "/manifest.svt");
+    ChunkStore cs3;
+    tagOk = tagOk && cs3.BindLoad(kDir) && cs3.TickOf(a) == 0u;
+    const std::vector<uint32_t>* got3 = cs3.Get(a);
+    tagOk = tagOk && got3 && got3->size() == 2;
+    cs.Unbind();
+    cs2.Unbind();
+    cs3.Unbind();
+    std::filesystem::remove_all(kDir);
+    if (!tagOk) fail("the tick tag did not survive Flush/BindLoad");
+  }
+
+  // Leave the world pristine at the origin: the gates after this one build
+  // their own worlds, but none of them should inherit a shifted window.
+  stream.SetChunkExchange(nullptr);
+  regen();
+
+  const bool ok = fails.empty();
+  detail = Format(
+      "evict sent=%u@t%u(%u pairs) real=%u@t%u(%u glass) | hold entry=%08x "
+      "air=%u req=%u | hash deliver=%08x control=%08x twice=%08x | "
+      // CUMULATIVE over the whole gate, not per arm: ExchangeStats lives on
+      // the Stream and the arms share one, so the expected reading here is
+      // h=3 (the three arms that hold) d=2 (the two delivery arms) m=1. The
+      // per-arm assertions above snapshot it at the end of each arm instead.
+      "miss nonair=%u glass=%u | counters(cumulative) "
+      "h=%llu d=%llu m=%llu f=%llu r=%llu "
+      "| tag=%d%s%s",
+      sentCount, evTickSent, skyPairs, realCount, evTickReal, evGlass,
+      deliv.heldEntry, deliv.heldNonAir, deliv.requested, deliv.hash,
+      ctrl.hash, deliv2.hash, missNonAir, miss.glass,
+      (unsigned long long)miss.stats.held,
+      (unsigned long long)miss.stats.delivered,
+      (unsigned long long)miss.stats.missed,
+      (unsigned long long)miss.stats.forgotten,
+      (unsigned long long)miss.stats.rejected, tagOk ? 1 : 0,
+      ok ? "" : " | ", ok ? "" : fails.c_str());
+  std::printf("chunk-exchange: %s (%s)\n", ok ? "PASS" : "FAIL",
+              detail.c_str());
+  return ok ? Status::Pass : Status::Fail;
+}
+
 }  // namespace
 
 const std::vector<Gate>& WorldIoGates() {
@@ -690,6 +1142,7 @@ const std::vector<Gate>& WorldIoGates() {
       {"save-entities", "worldio", {}, false, GateSaveEntities},
       {"region-store", "worldio", {}, false, GateRegionStore},
       {"streaming", "worldio", {}, false, GateStreaming},
+      {"chunk-exchange", "worldio", {}, false, GateChunkExchange},
   };
   return g;
 }
