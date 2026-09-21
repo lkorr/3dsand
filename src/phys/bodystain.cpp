@@ -193,3 +193,163 @@ uint32_t SoakCut(const StainLattice& L, Vec3 centre, const CutSoak& p,
   }
   return changed;
 }
+
+uint32_t SoakBruise(const StainLattice& L, const BruiseSoak& p,
+                    BruiseTally* out, MicroBodySet* micro, int model) {
+  if (out) *out = BruiseTally{};
+  if (p.bruiseMat == 0 || p.radius <= 0.0f || p.cap == 0 || p.step <= 0.0f)
+    return 0;
+  const size_t n = L.Size();
+  if (n == 0) return 0;
+  // The brick only takes pokes when it is this body's own (COW), exactly as
+  // SoakCut above: a shared model is left alone and the caller re-skins.
+  const bool poke = micro && model >= 0 &&
+                    (size_t)model < micro->owned.size() &&
+                    micro->owned[(size_t)model];
+  static const std::vector<uint8_t> kNoTissue;
+  const std::vector<uint8_t>& tissue = p.tissue ? *p.tissue : kNoTissue;
+  const float r2 = p.radius * p.radius;
+  // The inner half-radius, in the squared metric the sweep already works in.
+  const float core2 = r2 * 0.25f;
+
+  // ---- SKIN BREAKS AT THE SURFACE (2026-09-20) ----------------------------
+  //
+  // Rung 2 turns a saturated bruise into blood and rung 3 eats whatever is
+  // bloody AT DEPTH. Applied to every cell in the radius, that makes the
+  // INTERIOR of a beaten limb one solid reservoir of pulp: each voxel the
+  // dissolution takes exposes more of it, the front never runs out, and a
+  // beating eats the entire limb. Measured on both populations the same day -
+  // the living gate `impact-blunt` reporting "1344 voxels -> 0 after 3 ticks
+  // dissolving (100.0% gone, cap 60%)", and a corpse beaten with a mace
+  // vanishing inside four seconds.
+  //
+  // A contusion breaks where there IS a surface to break. Gating the rung on
+  // exposure bounds the reservoir to the skin the blow actually landed on,
+  // which is both the physical statement and the thing that makes a mace cave
+  // a body IN instead of deleting it. The occupancy map is the one SoakCut
+  // already builds, for the same O(voxels) this loop pays anyway.
+  IVec3 blo{INT32_MAX, INT32_MAX, INT32_MAX};
+  IVec3 bhi{INT32_MIN, INT32_MIN, INT32_MIN};
+  for (size_t i = 0; i < n; i++) {
+    const IVec3 v = L.At(i);
+    blo.x = std::min(blo.x, v.x); bhi.x = std::max(bhi.x, v.x);
+    blo.y = std::min(blo.y, v.y); bhi.y = std::max(bhi.y, v.y);
+    blo.z = std::min(blo.z, v.z); bhi.z = std::max(bhi.z, v.z);
+  }
+  const int bdx = bhi.x - blo.x + 1;
+  const int bdy = bhi.y - blo.y + 1;
+  const int bdz = bhi.z - blo.z + 1;
+  const bool haveOcc = bdx > 0 && bdy > 0 && bdz > 0 &&
+                       (uint64_t)bdx * bdy * bdz <= (1u << 22);
+  std::vector<uint8_t> occ;
+  if (haveOcc) {
+    occ.assign((size_t)bdx * bdy * bdz, 0);
+    for (size_t i = 0; i < n; i++) {
+      if (L.Mat(i) == 0) continue;
+      const IVec3 v = L.At(i);
+      occ[(size_t)(v.x - blo.x) + (size_t)(v.y - blo.y) * bdx +
+          (size_t)(v.z - blo.z) * bdx * bdy] = 1;
+    }
+  }
+  auto occAt = [&](int x, int y, int z) -> bool {
+    if (!haveOcc) return true;
+    x -= blo.x; y -= blo.y; z -= blo.z;
+    if (x < 0 || y < 0 || z < 0 || x >= bdx || y >= bdy || z >= bdz)
+      return false;
+    return occ[(size_t)x + (size_t)y * bdx + (size_t)z * bdx * bdy] != 0;
+  };
+  auto exposedAt = [&](IVec3 v) -> bool {
+    return !occAt(v.x - 1, v.y, v.z) || !occAt(v.x + 1, v.y, v.z) ||
+           !occAt(v.x, v.y - 1, v.z) || !occAt(v.x, v.y + 1, v.z) ||
+           !occAt(v.x, v.y, v.z - 1) || !occAt(v.x, v.y, v.z + 1);
+  };
+  uint32_t marked = 0, coreCells = 0, pulpedCells = 0;
+  for (size_t i = 0; i < n; i++) {
+    const uint32_t mat = L.Mat(i);
+    if (mat == 0) continue;   // tombstone
+    // Bone does not bruise: a contusion is a burst capillary bed, and the
+    // hole-shows-bone rule (MobDef::tissue) is the same one that governs here.
+    if (!tissue.empty() && (mat >= tissue.size() || !tissue[mat])) continue;
+    const IVec3 v = L.At(i);
+    const Vec3 d{(float)v.x + 0.5f - p.centre.x, (float)v.y + 0.5f - p.centre.y,
+                 (float)v.z + 0.5f - p.centre.z};
+    const float d2 = d.dot(d);
+    if (d2 >= r2) continue;
+    const float t = std::sqrt(d2 / r2);
+    const uint16_t curStain = L.Stain(i);
+    const uint32_t h = rng::Hash3(p.seed, (uint32_t)(v.x * 73856093),
+                                  (uint32_t)(v.y * 19349663) ^
+                                      (uint32_t)(v.z * 83492791));
+    // ---- THE READING FOR RUNG 3, taken BEFORE this blow changes anything ---
+    //
+    // OVER THE CORE'S SURFACE, not its volume. Rung 2 only breaks skin that is
+    // exposed (see above), so pulp can only ever exist on the surface — and a
+    // fraction whose denominator counts buried cells that are structurally
+    // incapable of being pulped can never reach a threshold. Measured: with
+    // the volume denominator the ripeness stalled under gore.pulpCarveFrom
+    // forever and a beating stopped taking anything at all, which is the exact
+    // opposite failure to the one the exposure gate fixed.
+    if (d2 < core2 && exposedAt(v)) {
+      coreCells++;
+      if (p.bloodMat != 0 && BodyStainMat(curStain) == p.bloodMat &&
+          BodyStainAmt(curStain) >= p.pulpAt)
+        pulpedCells++;
+    }
+    // ---- THE FULL STEP AT THE CONTACT, AND A SPECTRUM OUT TO THE RIM -------
+    //
+    // ONE multiplier below 1, not three: the taper, plus a narrow jitter to
+    // break the patch up, plus `blowScale` (the difference between a fist and
+    // a mace, floored so it cannot vanish). Power is deliberately NOT here —
+    // it already scales the radius at the call site, and charging it twice
+    // made a glancing blow both smaller AND fainter.
+    const float jitter = 0.85f + 0.15f * (float)((h >> 16) & 0xFFu) / 255.0f;
+    const float taper = 1.0f - t * t;
+    const uint32_t add = (uint32_t)std::lround(p.step * taper * jitter *
+                                               p.blowScale);
+    if (add == 0) continue;
+    // ---- AND THE RIM HAS ITS OWN CEILING ----------------------------------
+    //
+    // The taper is a CEILING as well as a rate: a cell at the rim cannot be
+    // driven past a light mark by this blow however many land, and only the
+    // middle can reach the depth that breaks. Without it, enough blows on one
+    // spot crawl every cell in the radius to the global ceiling and the whole
+    // mark goes wet — a patch of blood with a hard edge and no bruise around
+    // it, which is not what a beating looks like. PER BLOW, not per voxel
+    // forever: a second blow landing closer legitimately raises this cell's
+    // ceiling, which is how a beating walks across a limb.
+    const uint32_t voxCap = (uint32_t)std::lround((float)p.cap * taper);
+    if (voxCap == 0) continue;
+    const uint32_t curAmt = BodyStainAmt(curStain);
+    const uint32_t curMat = BodyStainMat(curStain);
+    uint16_t next = curStain;
+    // ---- RUNG 2: where it has already gone as dark as a bruise gets -------
+    bool broke = false;
+    if (p.bloodMat != 0 && p.bleedChance > 0.0f && curMat == p.bruiseMat &&
+        curAmt >= p.bleedFrom && exposedAt(v)) {
+      const float roll = (float)(h & 0xFFFFu) / 65535.0f;
+      if (roll < p.bleedChance) {
+        // Blood goes on at the bruise's own depth, not at a cut's: a deep
+        // contusion has broken the skin, and it should read as continuous with
+        // the mark around it rather than as a splash. A DELIBERATE OVERWRITE
+        // rather than a raise — Raise's cross-material rule ("only a strictly
+        // larger amount repaints") can never fire here by construction, which
+        // is how this rung once shipped disabled.
+        next = PackBodyStain(
+            p.bloodMat, std::min(std::max(curAmt, add), (uint32_t)kBodyStainAmtMax));
+        broke = true;
+      }
+    }
+    if (!broke) next = AddBodyStain(curStain, p.bruiseMat, add, voxCap);
+    if (next == curStain) continue;
+    L.SetStain(i, next);
+    if (poke)
+      MicroBodyPokeStain(*micro, (uint32_t)model, v.x, v.y, v.z, next);
+    marked++;
+  }
+  if (out) {
+    out->marked = marked;
+    out->core = coreCells;
+    out->pulped = pulpedCells;
+  }
+  return marked;
+}

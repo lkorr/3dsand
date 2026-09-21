@@ -10063,6 +10063,9 @@ int main(int argc, char** argv) {
             // chip. One blow, one cue, whichever way it ended.
             const size_t sev0 = mobs.SeverEvents().size();
             const size_t voi0 = mobs.VoiceEvents().size();
+            // The third queue, for the population the other two cannot see:
+            // dead flesh (DebrisSystem::GoreEvent).
+            const size_t gore0 = debris.GoreEvents().size();
             const EdgeSweepResult res = MeleeSweepDamage(
                 sw, melee.tuning, avatar, phys, mobs, debris, world, spawns);
             // PARRIED BY AN NPC'S BLADE. The sweep reports; ending the stroke
@@ -10081,8 +10084,21 @@ int main(int argc, char** argv) {
               }
             }
             if (res.bodiesHit > 0) {
-              const bool severed = mobs.SeverEvents().size() > sev0;
-              const bool flesh = mobs.VoiceEvents().size() > voi0;
+              const bool severedLive = mobs.SeverEvents().size() > sev0;
+              // ---- ...AND DEAD FLESH IS STILL FLESH (2026-09-20) ---------
+              //
+              // This differencing trick has a blind spot and it is a whole
+              // population: a CORPSE fills neither queue — it has no voice to
+              // cry and its pieces are DebrisSystem's, not MobSystem's — so
+              // every blow on one fell through to the `chip` tier and a body
+              // being hacked apart on the ground sounded like a crate. The
+              // sweep now answers the question directly for that case
+              // (EdgeSweepResult::hitDeadFlesh), and the corpse's own sever
+              // rides the debris gore queue drained beside the mob one below.
+              const bool flesh =
+                  mobs.VoiceEvents().size() > voi0 || res.hitDeadFlesh;
+              const bool severed =
+                  severedLive || debris.GoreEvents().size() > gore0;
               const Tuning::CombatFx& fx = CurrentTuning().combatfx;
               // LATCHED, not acted on. This is inside the tick loop, which
               // runs 0..4 times a frame; the frame loop drains it at the top
@@ -10705,6 +10721,32 @@ int main(int argc, char** argv) {
                                se.posVoxel, se.severity, se.mobId);
         }
 
+        // ---- WHAT A CORPSE SAYS (2026-09-20) ------------------------------
+        //
+        // The same two takes a living creature's dismemberment makes, minus
+        // the cry: a corpse does not scream, but flesh parting is flesh
+        // parting and a body being hacked apart used to make the noise a
+        // CRATE makes (main.cpp's tier logic infers the cue from the mob
+        // queues, and dead flesh fills neither). The def rides on the event
+        // because the mob that owned this flesh is long despawned, so a
+        // corpse still makes its OWN species' wet sounds.
+        //
+        // `Sever` is the creature's take for a limb coming off and is voiced
+        // here only when a piece actually came off; `Dismember` is the wet
+        // tearing layer and, exactly as for the living, only a BLADE arms it
+        // (a mace that caves a corpse in did not saw through anything).
+        for (const DebrisSystem::GoreEvent& ge : debris.GoreEvents()) {
+          if (ge.defIndex < 0 || ge.defIndex >= (int)mobs.Defs().size())
+            continue;
+          const MobDef& md = mobs.Defs()[(size_t)ge.defIndex];
+          if (ge.severed)
+            audioCues.MobSound(md, audio::Cues::MobEvent::Sever, ge.posVoxel,
+                               ge.severity, 0);
+          if (ge.severed && ge.byBlade)
+            audioCues.MobSound(md, audio::Cues::MobEvent::Dismember,
+                               ge.posVoxel, ge.severity, 0);
+        }
+
         // Creatures hurt and killed this frame. Same shape as the severs
         // above; the def index rides on the event because a killing blow
         // despawns the mob before this drains. `mobId` is the rate-limiter
@@ -10773,6 +10815,7 @@ int main(int argc, char** argv) {
       debris.ClearImpactEvents();
       mobs.ClearSeverEvents();
       mobs.ClearVoiceEvents();
+      debris.ClearGoreEvents();
       // OUTSIDE the audio block, exactly like the queues above and for the
       // same reason stated there: a request that only clears when audio
       // happens to be on is a stuck flag on a silent machine, and the next

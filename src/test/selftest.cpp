@@ -426,6 +426,19 @@ const char* const kOrder[] = {
     // derived from it (owner report 2026-09-20). Same fixture, same pristine
     // ground, CPU only.
     "corpse-cut",
+    // ...and the blow MOVES what it lands on, in all three drive states —
+    // standing (a pose spring), limp and dead (an impulse into Jolt). Same
+    // fixture and the same two-creature sweep, CPU only.
+    "hit-drive",
+    // ...and a corpse COMES APART where you cut it, and the room hears it:
+    // the joints Die() leaves are cut by the same rule the living sever by,
+    // and dead flesh reports its own gore (owner report 2026-09-20). Same
+    // fixture, CPU only.
+    "corpse-dismember",
+    // ...and a mace MARKS a corpse and leaves it crumbling, instead of boring
+    // an instant sphere out of it: the same three-rung ladder the living
+    // climb (owner report 2026-09-20). Ticks the debris system only.
+    "corpse-blunt",
     // Right after it, and for the same reason it exists: `corpse-armor` is
     // `corpse-intact` with a wardrobe on and the head off first. It needs the
     // same pristine ground and leaves the same nothing behind.

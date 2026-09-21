@@ -236,11 +236,52 @@ class Physics {
   // Joints currently attached to one body / alive in the whole system.
   uint32_t JointCount(uint64_t handle) const;
   uint32_t JointCount() const;
+  // ---- WHERE A BODY IS HELD, SO A CUT CAN DECIDE TO LET GO (2026-09-20) ---
+  //
+  // A corpse is a set of bodies that `Mob::Die` left JOINTED, and until now
+  // nothing could take one apart: severing on the loose side is connectivity
+  // INSIDE a single body, so a blade could part a corpse's neck completely and
+  // the head stayed on. Deciding that needs two things this class already
+  // knows and never published — which joints are on a body, and WHERE on that
+  // body each one is anchored — so that the flesh at the anchor can be asked
+  // whether there is anything left to hold.
+  //
+  // `anchorLocalVox` is in the body's OWN frame, world voxels (the lattice
+  // scale is the caller's business). `other` is the body at the far end.
+  struct BodyJoint {
+    uint64_t joint = 0;
+    uint64_t other = 0;
+    Vec3 anchorLocalVox{};
+  };
+  void JointsOn(uint64_t handle, std::vector<BodyJoint>& out) const;
   // How far body B currently sits from the REST direction its ball joint was
   // built around, in radians (0 when the joint is not a ball joint or is
   // dead). The limit test in selftest_mob.cpp asks this rather than
   // re-deriving the cone frame, which would be a second implementation of it.
   bool JointSwingAngle(uint64_t joint, float& outRadians) const;
+
+  // ---- WHO IS DRIVING THIS BODY (docs/PLAN_struck_matter.md) --------------
+  //
+  // RIG-POSED (kinematic) or SOLVER-OWNED (dynamic). This is the question that
+  // decides what a body does when something hits it — a pose spring for the
+  // first, an impulse for the second — and it is asked HERE rather than of
+  // `Mob` on purpose: a limp living limb and a corpse limb give the same
+  // answer, and neither the melee sweep nor anything else should have to
+  // recognise which of the two it is holding. False for a dead handle.
+  bool IsBodyDynamic(uint64_t handle) const;
+  // ONE BLOW, AT A POINT. `impulse` is kg*m/s along `dir` (need not be unit —
+  // it is normalised here), applied at `atVoxel` in world voxels, so a hit off
+  // the centre of mass SPINS the body as well as shoving it. That is the whole
+  // reason this is not SetBodyVelocity: a sword across a corpse's shoulder
+  // should turn it over.
+  //
+  // Speed-capped by mass exactly as ApplyRadialImpulse is, and for the same
+  // reason stated there: impulse/mass on a 0.3 kg hand is a rocket. Silently
+  // does nothing to a body that is not dynamic — a kinematic body's transform
+  // is written by whoever poses it, so an impulse on one is not merely
+  // ineffective, it is a claim about ownership that is false.
+  // Returns true if an impulse actually landed.
+  bool ApplyImpulseAt(uint64_t handle, Vec3 dir, float impulse, Vec3 atVoxel);
 
   // ---- mob locomotion plumbing (PLAN §B4) ----
   // Requires the body to have been created with allowKinematic.

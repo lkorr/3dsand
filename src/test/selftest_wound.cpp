@@ -60,6 +60,8 @@
 #include "game/equipment.h"
 #include "game/player.h"
 #include "game/mob.h"
+#include "game/melee.h"  // hit-drive swings the real sweep
+#include "game/anim.h"   // QuatRotate: a joint anchor is body-local
 #include "sim/microbody.h"
 #include "sim/tuning.h"
 #include "test/selftest.h"
@@ -1268,6 +1270,788 @@ Status GateCorpseIntact(Ctx& c, std::string& detail) {
   return ok ? Status::Pass : Status::Fail;
 }
 
+// corpse-cut: a sword takes flesh off a corpse, and keeps taking it
+// ---------------------------------------------------------------------------
+//
+// Owner report, 2026-09-20: "swords and weapons doing damage to corpses and
+// rigid bodies appears to be gone... it does nothing. Physics and body
+// interaction remain."
+//
+// THE PROPERTY, AND THE REASON IT COULD GO MISSING WITHOUT A GATE NOTICING.
+// `DebrisSystem::DamageBody` carves TWO lattices: the SKIN (the art, and what
+// the player sees) and the COLLIDER derived from it by a majority downsample.
+// It used to decide "nothing in range" from the collider predicate alone and
+// return before the skin was touched — and a blade's kerf is a sliver about a
+// tenth of a world voxel across, while one collider cell of a human corpse is
+// eight skin cells that only flip when half of them go. So every sword blow on
+// a corpse took nothing, bled nothing and left no gore, while the corpse still
+// shoved around exactly as before: damage gone, physics intact, which is the
+// report word for word. `Mob::CarveLimb` has refused to make that decision on
+// the collider since the fine skin existed; this is the same carve on the same
+// art one function later, and nothing exercised it — every corpse gate until
+// now went through `MeltBodyAt` (the laser's sphere), which is coarse enough
+// to move the collider on its own.
+//
+// So the claim is the smallest one that the failure breaks: ONE sword-shaped
+// kerf against a corpse removes voxels from the authoritative lattice, and the
+// next two keep removing them (the entry snap must find the new surface, or
+// the wound saturates and a corpse becomes uncuttable after one blow). The
+// mace arm is the control: a blunt carve is a radius of voxels rather than a
+// slot, it moves the collider by itself, and it was WORKING throughout — so a
+// run where the blade takes nothing and the mace takes plenty is exactly the
+// signature of the bug, and the two numbers are printed side by side.
+//
+// CPU ONLY: no tick is submitted, so this leaves the world as it found it.
+Status GateCorpseCut(Ctx& c, std::string& detail) {
+  MobSystem& mobs = c.mobs;
+  IdCounterScope idScope(mobs);
+  PrepareWorld(c);
+  const Target t = ChooseTarget(mobs, FixtureSite(c.world, 380));
+  if (!t.valid()) {
+    detail = "no loaded mob def has a severable non-vital limb that bleeds";
+    return Status::Fail;
+  }
+  IVec3 pchunk{};
+  const uint64_t id = SpawnTarget(c, t, 380, pchunk);
+  if (!id) {
+    detail = "spawn refused";
+    return Status::Fail;
+  }
+  const MobDef& def = mobs.Defs()[t.defIndex];
+  const int root = def.rootLimb;
+  const uint64_t torso = root >= 0 ? mobs.LimbBody(id, root) : 0;
+  // The blade goes through the LIMB the fixture chose, not the torso: the
+  // torso is the root and its cut has to survive being the thing every joint
+  // hangs off (that is corpse-intact's claim). Measured on the live rig,
+  // because a corpse has no limbs left to measure.
+  const LimbAxis ax = MeasureLimb(mobs, id, t.limb);
+  const uint64_t limbBody = mobs.LimbBody(id, t.limb);
+  if (!torso || !limbBody || !ax.valid) {
+    detail = Format("%s: fixture has no root/limb body to cut",
+                    t.defName.c_str());
+    mobs.Reset();
+    c.debris.Reset();
+    return Status::Fail;
+  }
+  const Vec3 at = ax.anchor + ax.along * (ax.reach * 0.5f);
+
+  // Killed the way the sword kills: the root limb at zero hp is a death, and
+  // Die() hands every limb to DebrisSystem with its joints on.
+  {
+    MobSystem::BladeCutScope blade(mobs, 1.0f);
+    mobs.Damage(torso, 1.0e6f, at, 45.0f);
+  }
+  if (mobs.IsAlive(id)) {
+    detail = Format("%s: root limb at zero hp did not kill", t.defName.c_str());
+    mobs.Reset();
+    c.debris.Reset();
+    return Status::Fail;
+  }
+
+  auto indexOf = [&](uint64_t h) -> int {
+    for (uint32_t i = 0; i < c.debris.BodyCount(); i++)
+      if (c.debris.BodyHandle(i) == h) return (int)i;
+    return -1;
+  };
+  int idx = indexOf(limbBody);
+  if (idx < 0) {
+    detail = Format("%s: the limb was not adopted as debris on death",
+                    t.defName.c_str());
+    mobs.Reset();
+    c.debris.Reset();
+    return Status::Fail;
+  }
+
+  // THE SAME SIX LINES MELEE BUILDS THE KERF FROM (game/melee.cpp's debris
+  // branch, which builds it from the same tuning rows the live path does), so
+  // a gore retune moves this gate and the game together.
+  const auto& g = CurrentTuning().gore;
+  const float kPower = 1.0f, kHeft = 1.0f, kRadius = 0.9f;
+  std::vector<ParticleSpawn> spawns;
+  uint64_t cur = c.debris.BodyHandle((uint32_t)idx);
+  const uint32_t vox0 = c.debris.BodyVoxelCount((uint32_t)idx);
+  uint32_t voxAfter[3] = {vox0, vox0, vox0};
+  int cuts = 0;
+  for (int i = 0; i < 3 && idx >= 0; i++) {
+    KerfCut cut;
+    cut.at = at;
+    cut.edgeAxis = ax.edge;
+    cut.cutDir = ax.travel;
+    cut.halfWidth = std::max(kRadius * g.cutWidth, 0.08f);
+    cut.depth = (g.cutDepth + g.cutDepthPower * kPower) * kHeft;
+    cut.length = g.cutLength * (0.4f + 0.6f * kPower) * kHeft;
+    cut.power = kPower;
+    cut.seed = 0x50D5u + (uint32_t)i * 40503u;
+    if (c.debris.CutBody(cur, cut, c.world, spawns)) cuts++;
+    spawns.clear();
+    // THE INDEX IS THE IDENTITY, NOT THE HANDLE. A carve that moved the
+    // collider rebuilds it, and a rebuild REPLACES the Jolt handle — so the
+    // handle recorded before the cut names nothing afterwards, while the slot
+    // in DebrisSystem's own list is untouched (fragments are appended past the
+    // end). This is corpse-intact's rule for the same reason.
+    const uint32_t now = c.debris.BodyVoxelCount((uint32_t)idx);
+    const uint32_t prev = i == 0 ? vox0 : voxAfter[i - 1];
+    if (now > prev) break;   // the body was destroyed and something took its slot
+    voxAfter[i] = now;
+    cur = c.debris.BodyHandle((uint32_t)idx);
+  }
+  const uint32_t bladeTook = vox0 > voxAfter[2] ? vox0 - voxAfter[2] : 0u;
+  const bool firstCut = voxAfter[0] < vox0;
+  const bool deepens = voxAfter[2] < voxAfter[0];
+  // The wound the cut armed: a corpse that is cut must BLEED from where it was
+  // cut (DamageBody::ArmWound), which is the second half of the same report
+  // ("no blood comes out").
+  const bool bleeds = idx >= 0 && c.debris.BodyWoundOpen((uint32_t)idx);
+
+  // ---- THE CONTROL ARM: a mace, on a second body of the same corpse --------
+  // A blunt carve is a radius, not a slot, so it moves the collider on its own
+  // and was never affected. If the blade takes nothing and this takes plenty,
+  // the lattice the blade carves is the thing that is broken.
+  uint32_t maceTook = 0;
+  int tidx = indexOf(torso);
+  if (tidx >= 0) {
+    const uint32_t before = c.debris.BodyVoxelCount((uint32_t)tidx);
+    const Vec3 tAt = c.debris.BodyPosition((uint32_t)tidx);
+    c.debris.BluntBody(c.debris.BodyHandle((uint32_t)tidx), tAt,
+                       std::max(g.bluntCarveRadius, 0.5f), 0xB1U, c.world,
+                       spawns);
+    spawns.clear();
+    // The torso's handle may have been replaced too; find it by position.
+    int best = -1;
+    float bestD = 1e9f;
+    for (uint32_t k = 0; k < c.debris.BodyCount(); k++) {
+      const float d = (c.debris.BodyPosition(k) - tAt).len();
+      if (d < bestD) { bestD = d; best = (int)k; }
+    }
+    if (best >= 0) {
+      const uint32_t after = c.debris.BodyVoxelCount((uint32_t)best);
+      maceTook = before > after ? before - after : 0u;
+    }
+  }
+
+  RecordObserved("corpseCutVoxels", (double)bladeTook);
+  const bool ok = cuts == 3 && firstCut && deepens && bladeTook > 0 && bleeds &&
+                  maceTook > 0;
+  mobs.Reset();
+  c.debris.Reset();
+  detail = Format(
+      "%s limb '%s': 3 sword kerfs on the corpse took %u of %u voxels "
+      "(%u -> %u -> %u -> %u, cuts accepted %d, deepens=%d, wound open=%d); "
+      "the mace's control carve took %u",
+      t.defName.c_str(), t.limbName.c_str(), bladeTook, vox0, vox0, voxAfter[0],
+      voxAfter[1], voxAfter[2], cuts, deepens ? 1 : 0, bleeds ? 1 : 0,
+      maceTook);
+  return ok ? Status::Pass : Status::Fail;
+}
+
+// corpse-blunt: a mace marks a corpse, and what it pulps crumbles
+// ---------------------------------------------------------------------------
+//
+// Owner, 2026-09-20: "mutilation etc" should work on corpses "just like with
+// living bodies".
+//
+// THE LADDER, NOT THE CRATER. A blunt blow on a living creature climbs three
+// rungs (Mob::BluntHit): the flesh MARKS, a saturated mark BREAKS and goes
+// bloody, and tissue that is bloody at depth is PULPED and crumbles over the
+// next few seconds. A corpse got none of that - it went straight to an instant
+// sphere, which is the exact shape the living path was given a bruise to stop
+// using. Dead tissue still marks and still crumbles; what it lacks is hp and a
+// voice.
+//
+// The claim, in the order the rungs fire: sustained mace blows on one spot of
+// a corpse (1) lay a bruise coat that was not there before, (2) arm the
+// dissolution, and (3) go on taking voxels AFTER the blows stop, through
+// DebrisSystem::PulpTick, without being touched again. A first blow on clean
+// flesh must take nothing: the carve is EARNED by pulp, exactly as it is on
+// the living.
+Status GateCorpseBlunt(Ctx& c, std::string& detail) {
+  MobSystem& mobs = c.mobs;
+  IdCounterScope idScope(mobs);
+  PrepareWorld(c);
+  const Target t = ChooseTarget(mobs, FixtureSite(c.world, 380));
+  if (!t.valid()) {
+    detail = "no loaded mob def has a severable non-vital limb that bleeds";
+    return Status::Fail;
+  }
+  const auto& gt = CurrentTuning().gore;
+  const uint32_t bruiseMat = mobs.MaterialIdNamed(gt.bruiseMat);
+  if (bruiseMat == 0 || gt.bruiseStep <= 0.0f) {
+    detail = Format("gore.bruiseMat '%s' resolves to nothing: no ladder to test",
+                    gt.bruiseMat.c_str());
+    return Status::Skip;
+  }
+  IVec3 pchunk{};
+  const uint64_t id = SpawnTarget(c, t, 380, pchunk);
+  if (!id) {
+    detail = "spawn refused";
+    return Status::Fail;
+  }
+  const LimbAxis ax = MeasureLimb(mobs, id, t.limb);
+  const uint64_t limbBody = mobs.LimbBody(id, t.limb);
+  const int root = mobs.Defs()[t.defIndex].rootLimb;
+  const uint64_t torso = root >= 0 ? mobs.LimbBody(id, root) : 0;
+  if (!limbBody || !torso || !ax.valid) {
+    detail = Format("%s: no limb to beat", t.defName.c_str());
+    mobs.Reset();
+    c.debris.Reset();
+    return Status::Fail;
+  }
+  const Vec3 at = ax.anchor + ax.along * (ax.reach * 0.5f);
+  {
+    MobSystem::BladeCutScope blade(mobs, 1.0f);
+    mobs.Damage(torso, 1.0e6f, at, 45.0f);
+  }
+  if (mobs.IsAlive(id)) {
+    detail = Format("%s: root limb at zero hp did not kill", t.defName.c_str());
+    mobs.Reset();
+    c.debris.Reset();
+    return Status::Fail;
+  }
+  auto indexOf = [&](uint64_t h) -> int {
+    for (uint32_t i = 0; i < c.debris.BodyCount(); i++)
+      if (c.debris.BodyHandle(i) == h) return (int)i;
+    return -1;
+  };
+  int idx = indexOf(limbBody);
+  if (idx < 0) {
+    detail = Format("%s: the limb was not adopted as debris on death",
+                    t.defName.c_str());
+    mobs.Reset();
+    c.debris.Reset();
+    return Status::Fail;
+  }
+
+  // A MACE, resolved exactly as melee resolves it on loose matter: the bruise
+  // first, the carve only as far as the pulp earns it.
+  const uint32_t vox0 = c.debris.BodyVoxelCount((uint32_t)idx);
+  const uint32_t coat0 = c.debris.BodyCoatCount((uint32_t)idx, bruiseMat);
+  std::vector<ParticleSpawn> spawns;
+  const float kHp = 16.0f;
+  uint32_t voxAfterFirst = vox0;
+  uint32_t coatAfterFirst = coat0;
+  const int kBlows = 24;
+  for (int i = 0; i < kBlows && idx >= 0; i++) {
+    const uint64_t h = c.debris.BodyHandle((uint32_t)idx);
+    const float ripe =
+        c.debris.BruiseBody(h, at, gt.bruiseRadius, 0xB1u + (uint32_t)i * 977u,
+                            1.0f, kHp, false);
+    const float ripeFrom = std::clamp(gt.pulpCarveFrom, 0.0f, 1.0f);
+    const float earned =
+        ripeFrom >= 1.0f
+            ? 0.0f
+            : std::clamp((ripe - ripeFrom) / (1.0f - ripeFrom), 0.0f, 1.0f);
+    if (earned > 0.0f && gt.bluntCarveRadius > 0.0f)
+      c.debris.BluntBody(h, at, gt.bluntCarveRadius * 0.6f * earned,
+                         0xB2u + (uint32_t)i * 977u, c.world, spawns);
+    spawns.clear();
+    if (i == 0) {
+      voxAfterFirst = c.debris.BodyVoxelCount((uint32_t)idx);
+      coatAfterFirst = c.debris.BodyCoatCount((uint32_t)idx, bruiseMat);
+    }
+  }
+  const uint32_t vox1 = c.debris.BodyVoxelCount((uint32_t)idx);
+  const uint32_t coat1 = c.debris.BodyCoatCount((uint32_t)idx, bruiseMat);
+  const bool pulping = c.debris.BodyPulping((uint32_t)idx);
+
+  // ...AND IT KEEPS GOING WITH NOBODY TOUCHING IT. The blows have stopped;
+  // only DebrisSystem::PulpTick runs from here.
+  // WHICH BODY IT IS, by the one identity that survives: neither the index nor
+  // the handle does. The handle is replaced by the carve PulpTick
+  // expresses itself as, and the INDEX is shuffled by the corpse's other
+  // pieces settling back into the grid (DebrisSystem::SettleBodies swap-pops
+  // them), which is what made the first two versions of this gate report a
+  // limb that had dissolved to nothing when it had lost 98 voxels.
+  const uint32_t serial = c.debris.BodySerial((uint32_t)idx);
+  // Short of debris.settleAfterTicks, so the piece under test is still a body
+  // at the end of the window rather than a patch of world voxels.
+  uint32_t tick = 61000;
+  for (int i = 0; i < 45; i++) {
+    std::vector<BrushOp> ops;
+    std::vector<ParticleSpawn> st;
+    std::vector<CellOp> cellOps;
+    mobs.PreTick(tick, c.world, ops, cellOps, st);
+    c.debris.PreTick(tick, c.world, cellOps, st);
+    c.phys.Step(kTickDt);
+    mobs.PostStep();
+    c.debris.PostStep();
+    tick++;
+  }
+  // BY INDEX, NOT BY HANDLE. PulpTick expresses itself as a carve, a carve
+  // rebuilds the collider, and a rebuild REPLACES the Jolt handle — so the
+  // handle recorded before the ticks names nothing afterwards and a
+  // handle-keyed lookup reads "0 voxels left" for a body that is simply
+  // wearing a new number. That artifact made the first version of this gate
+  // report a limb dissolving to nothing when it had lost 98 voxels.
+  const int idx2 = c.debris.FindBodySerial(serial);
+  const uint32_t vox2 =
+      idx2 >= 0 ? c.debris.BodyVoxelCount((uint32_t)idx2) : 0;
+
+  RecordObserved("corpseBluntCoat", (double)(coat1 - coat0));
+  RecordObserved("corpseBluntDissolved", (double)(vox1 > vox2 ? vox1 - vox2 : 0));
+  const bool marked = coat1 > coat0;
+  const bool firstBlowTookNothing = voxAfterFirst == vox0;
+  const bool firstBlowMarked = coatAfterFirst > coat0;
+  const bool dissolved = vox2 < vox1;
+  const bool ok = marked && firstBlowMarked && firstBlowTookNothing &&
+                  (pulping || dissolved) && dissolved;
+  mobs.Reset();
+  c.debris.Reset();
+  detail = Format(
+      "%s limb '%s' as a corpse, %d mace blows (%.0f hp) on one spot: bruise "
+      "coat %u -> %u (first blow %u, took %u voxels), lattice %u -> %u, then "
+      "45 ticks untouched -> %u (pulping=%d)",
+      t.defName.c_str(), t.limbName.c_str(), kBlows, (double)kHp, coat0, coat1,
+      coatAfterFirst, vox0 - voxAfterFirst, vox0, vox1, vox2, pulping ? 1 : 0);
+  return ok ? Status::Pass : Status::Fail;
+}
+
+// corpse-dismember: a corpse comes apart where you cut it, and it is heard
+// ---------------------------------------------------------------------------
+//
+// Owner, 2026-09-20: "need audio cues for gore with corpses just like with
+// living bodies, mutilation etc."
+//
+// TWO THINGS A CORPSE COULD NOT DO. It could not be TAKEN APART: severing on
+// the debris side is connectivity inside ONE body, and a corpse is a dozen
+// bodies held together by the joints Mob::Die deliberately leaves on, which
+// nothing ever cut — so a blade could part a neck completely and the head
+// stayed attached. And it could not be HEARD: main.cpp picks the cue for a
+// blow by differencing the sever and voice queues, dead flesh fills neither,
+// so hacking a body apart made the noise a crate makes.
+//
+// Both are the same fix from the same direction — dead flesh reports what
+// happens to it the way living flesh does — so they are one gate. The claim:
+// sustained blade cuts at a corpse's NECK part the joint within a sane number
+// of blows, both ends bleed, and the blow that did it pushes a GoreEvent that
+// names the creature, says a piece came off, and says an edge did it.
+//
+// THE BOUND MATTERS AS MUCH AS THE EVENT. Unbounded, this passes on a model
+// that needs four hundred blows, which is the same as not working — that is
+// what it looked like before the corpse carve got the SPALL the living carve
+// has always had (phys/lattice.h SpallGrow). `corpseDismemberMaxCuts` is the
+// ceiling and `corpse-intact` is the other side of the bet: a cut in the
+// MIDDLE of a limb must not part anything.
+Status GateCorpseDismember(Ctx& c, std::string& detail) {
+  MobSystem& mobs = c.mobs;
+  IdCounterScope idScope(mobs);
+  PrepareWorld(c);
+  const Target t = ChooseTarget(mobs, FixtureSite(c.world, 380));
+  if (!t.valid()) {
+    detail = "no loaded mob def has a severable non-vital limb that bleeds";
+    return Status::Fail;
+  }
+  const MobDef& def = mobs.Defs()[t.defIndex];
+  // The head and the limb it hangs off, the same discovery `corpse-bleed`
+  // makes: a VITAL severable limb that is not the root, and its parent.
+  int head = -1, neck = -1;
+  for (size_t li = 0; li < def.limbs.size(); li++)
+    if (def.limbs[li].vital && def.limbs[li].severable &&
+        (int)li != def.rootLimb) {
+      head = (int)li;
+      break;
+    }
+  if (head >= 0)
+    for (size_t li = 0; li < def.limbs.size(); li++)
+      if (def.limbs[li].name == def.limbs[head].parent) neck = (int)li;
+  if (head < 0 || neck < 0) {
+    detail = Format("%s has no vital severable limb with a parent",
+                    t.defName.c_str());
+    return Status::Skip;
+  }
+  IVec3 pchunk{};
+  const uint64_t id = SpawnTarget(c, t, 380, pchunk);
+  if (!id) {
+    detail = "spawn refused";
+    return Status::Fail;
+  }
+  const uint64_t headBody0 = mobs.LimbBody(id, head);
+  const uint64_t neckBody0 = mobs.LimbBody(id, neck);
+  const int root = def.rootLimb;
+  const uint64_t torso = root >= 0 ? mobs.LimbBody(id, root) : 0;
+  if (!headBody0 || !neckBody0 || !torso) {
+    detail = Format("%s: no head/neck/torso body to cut", t.defName.c_str());
+    mobs.Reset();
+    c.debris.Reset();
+    return Status::Fail;
+  }
+  // Killed the way the sword kills. Handles do not change across adoption.
+  {
+    MobSystem::BladeCutScope blade(mobs, 1.0f);
+    mobs.Damage(torso, 1.0e6f, mobs.LimbAnchorPos(id, head), 45.0f);
+  }
+  if (mobs.IsAlive(id)) {
+    detail = Format("%s: root limb at zero hp did not kill", t.defName.c_str());
+    mobs.Reset();
+    c.debris.Reset();
+    return Status::Fail;
+  }
+  c.debris.ClearGoreEvents();
+
+  auto indexOf = [&](uint64_t h) -> int {
+    for (uint32_t i = 0; i < c.debris.BodyCount(); i++)
+      if (c.debris.BodyHandle(i) == h) return (int)i;
+    return -1;
+  };
+  int hidx = indexOf(headBody0);
+  if (hidx < 0) {
+    detail = Format("%s: the head was not adopted as debris on death",
+                    t.defName.c_str());
+    mobs.Reset();
+    c.debris.Reset();
+    return Status::Fail;
+  }
+  // WHERE THE NECK JOINT IS, asked of physics rather than of the rig: the rig
+  // is gone, and the joint knows its own anchor (Physics::JointsOn).
+  std::vector<Physics::BodyJoint> js;
+  c.phys.JointsOn(c.debris.BodyHandle((uint32_t)hidx), js);
+  uint64_t neckJoint = 0;
+  Vec3 anchorW{};
+  for (const Physics::BodyJoint& j : js)
+    if (j.other == neckBody0) {
+      neckJoint = j.joint;
+      // THROUGH THE BODY'S OWN ROTATION. The anchor is body-local and a corpse
+      // has just fallen over; adding it to the position alone puts the blow
+      // somewhere off in the air, which is how this gate first measured 60
+      // cuts that removed 17 voxels between them.
+      BodyTransform hx{};
+      c.phys.GetTransform(c.debris.BodyHandle((uint32_t)hidx), hx);
+      const Quat hq{hx.quat[0], hx.quat[1], hx.quat[2], hx.quat[3]};
+      anchorW = hx.pos + QuatRotate(hq, j.anchorLocalVox);
+      break;
+    }
+  if (!neckJoint) {
+    detail = Format("%s: the head kept no joint to '%s' after death",
+                    t.defName.c_str(), def.limbs[neck].name.c_str());
+    mobs.Reset();
+    c.debris.Reset();
+    return Status::Fail;
+  }
+  const uint32_t jointsAtDeath = c.phys.JointCount();
+
+  // Cuts at the joint, with the sword's own kerf (the six lines melee builds).
+  const auto& g = CurrentTuning().gore;
+  const int kCap = (int)BaselineNumber("corpseDismemberMaxCuts", 60);
+  const float kPower = 1.0f, kHeft = 1.5f, kRadius = 0.9f;
+  std::vector<ParticleSpawn> spawns;
+  const uint32_t vox0 = c.debris.BodyVoxelCount((uint32_t)hidx);
+  // THE NUMBER THAT ACTUALLY DECIDES (DebrisSystem::PartJointsAt): how much
+  // flesh is within the hold radius of the anchor. Reported at both ends, so a
+  // gate that fails says WHY instead of saying the head stayed on.
+  const float hold = CurrentTuning().gore.corpseJointHold;
+  const uint32_t held0 = c.debris.VoxelsNearWorld(
+      c.debris.BodyHandle((uint32_t)hidx), anchorW, hold);
+  int cuts = 0;
+  bool parted = false;
+  for (int i = 0; i < kCap && !parted && hidx >= 0; i++) {
+    // ---- A CHOP LANDS ON MATTER, NOT ON A COORDINATE --------------------
+    //
+    // The blade meets the body at its SURFACE nearest the joint and travels
+    // INTO the joint from there. Aiming at the anchor itself put 56 of 60
+    // blows in the air (the anchor sits at the boundary between two bodies,
+    // which is exactly where neither one's lattice is), and the kerf's entry
+    // snap only reaches about a voxel. Re-derived every blow, so a second
+    // chop lands in the groove the first one opened — which is what makes
+    // this a repeated chop at one place rather than a stipple.
+    const uint64_t hNow0 = c.debris.BodyHandle((uint32_t)hidx);
+    const Vec3 surf = c.debris.NearestVoxelWorld(hNow0, anchorW);
+    Vec3 into = anchorW - surf;
+    if (into.len() < 1e-3f) into = Vec3{0, -1, 0};
+    into = into.normalized();
+    KerfCut cut;
+    cut.at = surf;
+    // The edge across the travel: any perpendicular will do for a chop.
+    Vec3 edge = into.cross(Vec3{0, 1, 0});
+    if (edge.len() < 0.15f) edge = into.cross(Vec3{1, 0, 0});
+    cut.edgeAxis = edge.normalized();
+    cut.cutDir = into;
+    cut.halfWidth = std::max(kRadius * g.cutWidth, 0.08f);
+    cut.depth = (g.cutDepth + g.cutDepthPower * kPower) * kHeft;
+    cut.length = g.cutLength * (0.4f + 0.6f * kPower) * kHeft;
+    cut.power = kPower;
+    cut.seed = 0xBEEFu + (uint32_t)i * 40503u;
+    c.debris.CutBody(c.debris.BodyHandle((uint32_t)hidx), cut, c.world, spawns);
+    spawns.clear();
+    cuts++;
+    // The joint is gone when nothing on the head answers to it any more.
+    const uint64_t hNow = c.debris.BodyHandle((uint32_t)hidx);
+    c.phys.JointsOn(hNow, js);
+    parted = true;
+    for (const Physics::BodyJoint& j : js)
+      if (j.joint == neckJoint) parted = false;
+    if (c.debris.BodyVoxelCount((uint32_t)hidx) == 0) break;
+  }
+  const uint32_t vox1 = hidx >= 0 ? c.debris.BodyVoxelCount((uint32_t)hidx) : 0;
+  const uint32_t held1 =
+      hidx >= 0 ? c.debris.VoxelsNearWorld(
+                      c.debris.BodyHandle((uint32_t)hidx), anchorW, hold)
+                : 0;
+  const uint32_t jointsAfter = c.phys.JointCount();
+
+  // ---- WHAT THE ROOM HEARD -------------------------------------------------
+  int goreEvents = 0, severEvents = 0, bladeEvents = 0, named = 0;
+  for (const DebrisSystem::GoreEvent& ge : c.debris.GoreEvents()) {
+    goreEvents++;
+    if (ge.severed) severEvents++;
+    if (ge.severed && ge.byBlade) bladeEvents++;
+    if (ge.defIndex >= 0 && ge.defIndex < (int)mobs.Defs().size()) named++;
+  }
+  const bool headBleeds = hidx >= 0 && c.debris.BodyWoundOpen((uint32_t)hidx);
+  const int nidx = indexOf(neckBody0);
+  const bool neckBleeds = nidx >= 0 && c.debris.BodyWoundOpen((uint32_t)nidx);
+
+  RecordObserved("corpseDismemberCuts", (double)cuts);
+  const bool ok = parted && cuts <= kCap && jointsAfter < jointsAtDeath &&
+                  severEvents > 0 && bladeEvents > 0 && named == goreEvents &&
+                  goreEvents > 0 && headBleeds && neckBleeds;
+  mobs.Reset();
+  c.debris.Reset();
+  detail = Format(
+      "%s: %d sword cuts at the '%s' joint of a corpse -> parted=%d (cap %d), "
+      "head %u -> %u voxels, flesh holding the joint %u -> %u (within %.2f "
+      "vox), joints %u -> %u; %d gore events (%d severed, %d "
+      "of those by a blade, %d named their species), head bleeds=%d neck "
+      "bleeds=%d",
+      t.defName.c_str(), cuts, def.limbs[neck].name.c_str(), parted ? 1 : 0,
+      kCap, vox0, vox1, held0, held1, (double)hold, jointsAtDeath, jointsAfter,
+      goreEvents, severEvents, bladeEvents, named, headBleeds ? 1 : 0,
+      neckBleeds ? 1 : 0);
+  return ok ? Status::Pass : Status::Fail;
+}
+
+// hit-drive: a blow rocks what it lands on, whoever is driving it
+// ---------------------------------------------------------------------------
+//
+// Owner, 2026-09-20: "every time we switch behavior for a living mob that has
+// to then be rewritten for corpse behavior? like right now mobs can ragdoll
+// and when ragdolling they essentially behave just like corpses; so all the
+// parts are practically there."
+//
+// THE AXIS IS HOW A BODY IS DRIVEN, NOT WHETHER IT IS ALIVE
+// (docs/PLAN_struck_matter.md). A rig-posed limb answers a blow with a pose
+// spring, because the pose pipeline is what writes its transform; a
+// solver-owned one answers with an impulse, because Jolt is. A LIMP LIVING
+// LIMB and a CORPSE LIMB are the same case, and `Mob::HitReact` has said so
+// since it was written — it refuses both and names the impulse as what it
+// defers to. That impulse did not exist, so until today the third of those
+// three arms and the second one both got NOTHING: a ragdolling creature and a
+// corpse took a mace without moving.
+//
+// THE CLAIM, in one fixture and three arms: the same blow, on the same limb of
+// the same def, standing / limp / dead. `Physics::IsBodyDynamic` must say
+// kinematic, dynamic, dynamic — that is the drive itself — and the change in
+// the struck body's VELOCITY across the sweep must be nil for the first and
+// real for the other two. Velocity across the call rather than position over
+// time, because an impulse is instantaneous and a limp body is also falling:
+// no physics step runs between the two samples, so gravity cannot contribute.
+//
+// The profile is a mace with NO carve (bluntCarve 0, cut 0): the reaction is
+// the only thing under test, and a carve would rebuild the collider and
+// replace the handle being measured.
+Status GateHitDrive(Ctx& c, std::string& detail) {
+  MobSystem& mobs = c.mobs;
+  IdCounterScope idScope(mobs);
+  PrepareWorld(c);
+  const Target t = ChooseTarget(mobs, FixtureSite(c.world, 380));
+  if (!t.valid()) {
+    detail = "no loaded mob def has a severable non-vital limb that bleeds";
+    return Status::Fail;
+  }
+  const Tuning::CombatFx& fx = CurrentTuning().combatfx;
+  if (!fx.hitReact || fx.hitReactImpulse <= 0.0f) {
+    detail = Format(
+        "combatfx.hitReact=%d / hitReactImpulse=%.1f: the reaction is turned "
+        "off in tuning, so there is nothing to assert",
+        fx.hitReact ? 1 : 0, (double)fx.hitReactImpulse);
+    return Status::Skip;
+  }
+
+  // A MACE THAT DENTS NOTHING. Blunt hp only, so `StrikeProfile::Total()` is
+  // nonzero (the reaction scales on it) while no resolver touches a lattice.
+  StrikeProfile mace;
+  mace.blunt = 18.0f;
+  mace.bluntCarve = 0.0f;
+
+  MeleeTuning mt;
+  ApplyMeleeTuning(mt);
+  std::vector<ParticleSpawn> spawns;
+
+  struct Arm {
+    const char* name;
+    bool dynamic = false;
+    float dv = 0.0f, dw = 0.0f;
+    bool struck = false;
+    // ---- ...AND THE HALF THAT IS NOT SHARED ------------------------------
+    // A LIMP BODY IS STILL A LIVING ONE. It has hp, it can be hurt, it cries,
+    // it can die of the blow; a corpse answers none of those. Recorded and
+    // asserted because the first version of this gate reported that limp and
+    // dead were "identical", which is true of the REACTION and false of the
+    // blow — and a gate that asserts a false thing teaches it.
+    float hpDrop = 0.0f;
+    bool owned = false;    // the mob still holds this body
+    bool voiced = false;   // the creature had something to say about it
+  };
+  Arm arms[3] = {{"standing"}, {"limp"}, {"dead"}};
+
+  bool fixtureOk = true;
+  std::string why;
+  for (int a = 0; a < 3 && fixtureOk; a++) {
+    mobs.Reset();
+    c.debris.Reset();
+    // Two creatures, for MeleeSweepDamage's reason: it refuses to cut the
+    // wielder, so the victim cannot be its own attacker (selftest_impact.cpp).
+    const uint64_t wid = mobs.Spawn(t.defIndex, FixtureSite(c.world, 405));
+    const uint64_t id = mobs.Spawn(t.defIndex, FixtureSite(c.world, 460));
+    if (!wid || !id) {
+      fixtureOk = false;
+      why = "spawn refused";
+      break;
+    }
+    auto step = [&](uint32_t tick) {
+      std::vector<BrushOp> ops;
+      std::vector<ParticleSpawn> st;
+      std::vector<CellOp> cellOps;
+      mobs.PreTick(tick, c.world, ops, cellOps, st);
+      c.phys.Step(kTickDt);
+      mobs.PostStep();
+      c.debris.PostStep();
+    };
+    for (int i = 0; i < 8; i++) step(3000u + (uint32_t)i);
+
+    // Where the blow goes, measured while the rig still has limbs to measure.
+    const LimbAxis ax = MeasureLimb(mobs, id, t.limb);
+    const Vec3 mid = ax.anchor + ax.along * (ax.reach * 0.5f);
+    uint64_t body = mobs.LimbBody(id, t.limb);
+    if (!body || !ax.valid) {
+      fixtureOk = false;
+      why = "the fixture has no limb to hit";
+      break;
+    }
+
+    // ---- put the victim in this arm's DRIVE state ------------------------
+    if (a == 1) {
+      Mob* victim = mobs.FindMobById(id);
+      if (victim) victim->StartRagdoll(2.0f, "hit-drive gate");
+      for (int i = 0; i < 4; i++) step(3100u + (uint32_t)i);
+      body = mobs.LimbBody(id, t.limb);   // still the mob's, now dynamic
+    } else if (a == 2) {
+      const int root = mobs.Defs()[t.defIndex].rootLimb;
+      const uint64_t torso = root >= 0 ? mobs.LimbBody(id, root) : 0;
+      {
+        MobSystem::BladeCutScope blade(mobs, 1.0f);
+        if (torso) mobs.Damage(torso, 1.0e6f, mid, 45.0f);
+      }
+      // Die() hands every limb to DebrisSystem WITHOUT changing its handle,
+      // so the one measured above is still the body that was just adopted.
+      for (int i = 0; i < 2; i++) step(3200u + (uint32_t)i);
+    }
+    if (!body) {
+      fixtureOk = false;
+      why = "the limb body was gone before the blow";
+      break;
+    }
+    arms[a].dynamic = c.phys.IsBodyDynamic(body);
+
+    Mob* wielder = mobs.FindMobById(wid);
+    if (!wielder) {
+      fixtureOk = false;
+      why = "the wielder vanished before it could swing";
+      break;
+    }
+    // The same swept quad `impact-blunt` builds: across the limb, fast enough
+    // to sit at the top of the speed ramp.
+    const Vec3 cand[3] = {{1, 0, 0}, {0, 1, 0}, {0, 0, 1}};
+    int bi = 0;
+    float bd = 2.0f;
+    for (int i = 0; i < 3; i++) {
+      const float d = std::fabs(ax.along.dot(cand[i]));
+      if (d < bd) { bd = d; bi = i; }
+    }
+    const Vec3 travel = ax.along.cross(cand[bi]).normalized();
+    const Vec3 edge = travel.cross(ax.along).normalized();
+    const float stepLen = mt.fullSpeed * kTickDt * 1.2f;
+    EdgeSweep sw;
+    sw.aPrev = mid - edge * 1.5f - travel * stepLen;
+    sw.bPrev = mid + edge * 1.5f - travel * stepLen;
+    sw.aNow = mid - edge * 1.5f;
+    sw.bNow = mid + edge * 1.5f;
+    sw.flatNow = Vec3{};
+    sw.dt = kTickDt;
+    sw.halfWidth = 0.4f;
+    sw.strike = mace;
+    sw.heft = 1.0f;
+    sw.tick = 7400u + (uint32_t)a;
+    sw.valid = true;
+
+    // NO STEP BETWEEN THESE TWO SAMPLES. An impulse is instantaneous and a
+    // limp body is also in freefall; sampling across a physics step would mix
+    // the blow with gravity and the arms would differ for the wrong reason.
+    Vec3 v0{}, w0{}, v1{}, w1{};
+    c.phys.GetBodyVelocities(body, v0, w0);
+    const float hp0 = mobs.LimbBody(id, t.limb) ? mobs.LimbHp(id, t.limb) : 0.0f;
+    const size_t voi0 = mobs.VoiceEvents().size();
+    const EdgeSweepResult r = MeleeSweepDamage(sw, mt, *wielder, c.phys, mobs,
+                                               c.debris, c.world, spawns);
+    spawns.clear();
+    c.phys.GetBodyVelocities(body, v1, w1);
+    arms[a].struck = r.bodiesHit > 0;
+    arms[a].dv = (v1 - v0).len();
+    arms[a].dw = (w1 - w0).len();
+    arms[a].owned = mobs.LimbBody(id, t.limb) == body;
+    const float hp1 = arms[a].owned ? mobs.LimbHp(id, t.limb) : 0.0f;
+    arms[a].hpDrop = arms[a].owned ? std::max(0.0f, hp0 - hp1) : 0.0f;
+    arms[a].voiced = mobs.VoiceEvents().size() > voi0;
+    mobs.ClearVoiceEvents();
+  }
+  mobs.Reset();
+  c.debris.Reset();
+  if (!fixtureOk) {
+    detail = Format("%s: %s", t.defName.c_str(), why.c_str());
+    return Status::Fail;
+  }
+
+  // voxels/s. A floor rather than a band: the claim is "it moved", and how far
+  // is `hitReactImpulse`'s business, which the owner is free to retune.
+  const float kMin = (float)BaselineNumber("hitDriveMinDeltaVox", 1.0);
+  const bool drivesOk = !arms[0].dynamic && arms[1].dynamic && arms[2].dynamic;
+  const bool struckAll =
+      arms[0].struck && arms[1].struck && arms[2].struck;
+  const bool stillOk = arms[0].dv < kMin;   // rig-posed: the spring, not a shove
+  const bool movedOk = arms[1].dv >= kMin && arms[2].dv >= kMin;
+  // ---- AND LIMP IS NOT DEAD ----------------------------------------------
+  //
+  // The REACTION is shared because it is a fact about drive; the BLOW is not,
+  // because physiology is a fact about being alive. A limp creature is still
+  // a creature: the mob still owns the body, the blow still costs hp, and it
+  // still has something to say. A corpse's limb belongs to DebrisSystem, has
+  // no hp to lose and says nothing. Asserting both halves is what keeps the
+  // unification honest — it would otherwise be one short step from "the dead
+  // and the merely knocked-down are the same thing", which they are not.
+  const bool livingHurt = arms[0].hpDrop > 0.0f && arms[1].hpDrop > 0.0f &&
+                          arms[0].owned && arms[1].owned;
+  const bool deadIsNot = !arms[2].owned && arms[2].hpDrop <= 0.0f &&
+                         !arms[2].voiced;
+  RecordObserved("hitDriveLimpDeltaVox", (double)arms[1].dv);
+  RecordObserved("hitDriveDeadDeltaVox", (double)arms[2].dv);
+  const bool ok = drivesOk && struckAll && stillOk && movedOk && livingHurt &&
+                  deadIsNot;
+  detail = Format(
+      "%s limb '%s', one mace blow (%.0f hp, no carve) in three drive states. "
+      "REACTION (shared, by drive): standing dynamic=%d dv=%.2f dw=%.2f | limp "
+      "dynamic=%d dv=%.2f dw=%.2f | dead dynamic=%d dv=%.2f dw=%.2f. "
+      "PHYSIOLOGY (not shared): standing owned=%d hp-%.1f voice=%d | limp "
+      "owned=%d hp-%.1f voice=%d | dead owned=%d hp-%.1f voice=%d "
+      "(floor %.2f vox/s, impulse %.0f kg*m/s)",
+      t.defName.c_str(), t.limbName.c_str(), (double)mace.blunt,
+      arms[0].dynamic ? 1 : 0, (double)arms[0].dv, (double)arms[0].dw,
+      arms[1].dynamic ? 1 : 0, (double)arms[1].dv, (double)arms[1].dw,
+      arms[2].dynamic ? 1 : 0, (double)arms[2].dv, (double)arms[2].dw,
+      arms[0].owned ? 1 : 0, (double)arms[0].hpDrop, arms[0].voiced ? 1 : 0,
+      arms[1].owned ? 1 : 0, (double)arms[1].hpDrop, arms[1].voiced ? 1 : 0,
+      arms[2].owned ? 1 : 0, (double)arms[2].hpDrop, arms[2].voiced ? 1 : 0,
+      (double)kMin, (double)fx.hitReactImpulse);
+  return ok ? Status::Pass : Status::Fail;
+}
+
 // ---- corpse-armor ----------------------------------------------------------
 //
 // A CORPSE IN ARMOUR MUST NOT BECOME A MOTOR.
@@ -1878,8 +2662,20 @@ Status GateCorpseBleed(Ctx& c, std::string& detail) {
   }
   const double rateExposed = nExposed ? (double)stainedExposed / nExposed : 0.0;
   const double rateBuried = nBuried ? (double)stainedBuried / nBuried : 0.0;
-  const bool soakOk = hit && stainedExposed > 0 && rateExposed > rateBuried &&
-                      nonTissueStained == 0 && mobs.IsAlive(id);
+  // ARMED BY ITS OWN RADIUS, exactly as `wound-chip` arms the same claim
+  // (woundChipSoakArmRadius, and the long note beside it). The owner's gore
+  // retune took gore.woundStainRadius to 0.1 world voxels — under one skin
+  // cell at skinScale 8 — so an ordinary cut REWRITES NOTHING into the wound
+  // material and "0 exposed" is the tuning speaking, not a regression. The
+  // rest of the claim (never on bone, and the creature survives the cut) holds
+  // whatever the radius is, so only the "something was stained, and more of it
+  // on the surface than inside" half is gated. Turn the soak back up and this
+  // re-arms by itself.
+  const float soakArm = (float)BaselineNumber("woundChipSoakArmRadius", 0.5);
+  const bool wantSoak = CurrentTuning().gore.woundStainRadius >= soakArm;
+  const bool soakOk = hit && nonTissueStained == 0 && mobs.IsAlive(id) &&
+                      (!wantSoak ||
+                       (stainedExposed > 0 && rateExposed > rateBuried));
   RecordObserved("corpseBleedSoakExposedRate", rateExposed);
   RecordObserved("corpseBleedSoakBuriedRate", rateBuried);
 
@@ -1993,14 +2789,15 @@ Status GateCorpseBleed(Ctx& c, std::string& detail) {
   SubmitWorldgen(c.ctx, c.world, c.sim, kDefaultSeed);
   c.ctx.WaitIdle();
   detail = Format(
-      "%s: soak on %s: %u exposed (rate %.3f) vs %u buried (rate %.3f), %u "
+      "%s: soak on %s (armed=%d): %u exposed (rate %.3f) vs %u buried "
+      "(rate %.3f), %u "
       "non-tissue stained; died of '%s', head off=%d, head wound=%d (%.0f vox) "
       "neck wound=%d (%.0f vox), %u wounded bodies; over %d ticks the head "
       "shed %.0f blood spawns and the neck %.0f, wounds closed at t+%d; corpse "
       "cut %s, closed again at t+%d; neck body gone at t+%d (budget %.0f left, "
       "moved %.1f vox, last y %.1f), head body gone at t+%d, %u bodies at end",
-      t.defName.c_str(), t.limbName.c_str(), stainedExposed, rateExposed,
-      stainedBuried, rateBuried, nonTissueStained, cause.c_str(),
+      t.defName.c_str(), t.limbName.c_str(), wantSoak ? 1 : 0, stainedExposed,
+      rateExposed, stainedBuried, rateBuried, nonTissueStained, cause.c_str(),
       headOff ? 1 : 0, hi0 >= 0 ? 1 : 0,
       headBudget0, ni0 >= 0 ? 1 : 0, neckBudget0, wounded0, window, bloodHead,
       bloodNeck, closedTick,
@@ -3555,6 +4352,10 @@ const std::vector<Gate>& WoundGates() {
       {"burn-cap", "mob", {}, false, GateBurnCap, false},
       {"one-hit", "mob", {}, false, GateOneHit, false},
       {"corpse-intact", "mob", {}, false, GateCorpseIntact, false},
+      {"corpse-cut", "mob", {}, false, GateCorpseCut, false},
+      {"hit-drive", "mob", {}, false, GateHitDrive, false},
+      {"corpse-dismember", "mob", {}, false, GateCorpseDismember, false},
+      {"corpse-blunt", "mob", {}, false, GateCorpseBlunt, false},
       {"corpse-armor", "mob", {}, false, GateCorpseArmor, false},
       {"corpse-bleed", "mob", {}, false, GateCorpseBleed, false},
       {"body-stain", "mob", {}, false, GateBodyStain, false},

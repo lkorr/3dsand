@@ -8615,148 +8615,38 @@ uint32_t Mob::BruiseLimb(int limbIndex, Vec3 centreLocal, float radiusWorld,
     }
   }
 
-  uint32_t marked = 0;
-  auto bruise = [&](int vx, int vy, int vz, uint32_t mat, uint16_t curStain,
-                    auto&& setStain) {
-    if (mat == 0) return;
-    // Bone does not bruise: a contusion is a burst capillary bed, and the
-    // hole-shows-bone rule (MobDef::tissue) is the same one that governs here.
-    if (!tissue.empty() && (mat >= tissue.size() || !tissue[mat])) return;
-    const Vec3 d{(float)vx + 0.5f - c.x, (float)vy + 0.5f - c.y,
-                 (float)vz + 0.5f - c.z};
-    const float d2 = d.dot(d);
-    if (d2 >= r2) return;
-    const float t = std::sqrt(d2 / r2);
-    const uint32_t h = Hash3(seed, (uint32_t)(vx * 73856093),
-                             (uint32_t)(vy * 19349663) ^ (uint32_t)(vz * 83492791));
-    // ---- THE READING FOR RUNG 3, taken BEFORE this blow changes anything ---
-    //
-    // Before, not after, and that matters: a blow must be scored against the
-    // damage it ARRIVED at, or the first blow that breaks the skin would also
-    // be the first blow that carves, and the ladder would have two rungs
-    // instead of three. The count is over the core only (mob.h BruiseReport).
-    if (d2 < core2) {
-      coreCells++;
-      if (bloodMat != 0 && BodyStainMat(curStain) == bloodMat &&
-          BodyStainAmt(curStain) >= pulpAt)
-        pulpedCells++;
-    }
-    // ---- THE FULL STEP AT THE CONTACT, AND A SPECTRUM OUT TO THE RIM -------
-    //
-    // ONE multiplier below 1, not three. The first version was
-    //     step * (1 - t*t) * jitter(0.55..1.0) * (0.5 + 0.5*power)
-    // which is the classic way to author a number that never arrives: each
-    // factor is individually defensible and together they delivered under half
-    // the authored step even at dead centre, so `bruiseStep` never meant what
-    // it said and the coat sat below the renderer's mottle threshold (see
-    // Tuning::Gore::bruiseStep for that arithmetic). POWER IS GONE FROM HERE
-    // ENTIRELY -- it already scales the RADIUS at the call site, and charging
-    // it twice made a glancing blow both smaller AND fainter. Jitter is
-    // narrowed to 0.85..1.0: enough to break the patch up, not enough to eat
-    // the blow.
-    //
-    // What is left is the taper, and it is the one the owner asked for by
-    // name: a mace lands "a spectrum of bruise/wound applied in a circle
-    // radiating outwards in how weakly applied each is". `1 - t*t` is that
-    // circle -- full step at the middle, about three quarters at half the
-    // radius, a fifth at the edge.
-    //
-    // `blowScale` is the ONE factor added to that pair since, and it is the
-    // one thing the two-multiplier rule above does not forbid: it is not a
-    // second opinion about the same falloff, it is the difference between a
-    // fist and a mace, and it has a floor under it so it cannot vanish.
-    const float jitter = 0.85f + 0.15f * (float)((h >> 16) & 0xFFu) / 255.0f;
-    const float taper = 1.0f - t * t;
-    const float want = effStep * taper * jitter * blowScale;
-    const uint32_t add = (uint32_t)std::lround(want);
-    if (add == 0) return;
+  // ---- ONE LADDER, BOTH POPULATIONS (phys/bodystain.h SoakBruise) --------
+  //
+  // The rungs used to be written out here, which is why a mace marked a living
+  // body and did NOTHING to a corpse: the loose-matter path had an instant
+  // crater and no bruise at all, because the bruise was a member of Mob. It is
+  // per-voxel arithmetic over one lattice and nothing else, so it now lives
+  // beside the cut's soak and DebrisSystem::BruiseBody calls the same one.
+  // Everything this function resolved above — the unarmed overrides, the power
+  // ramp on the radius, the blow scale, the lattice — is passed in, because
+  // those are the parts only a creature knows.
+  BruiseSoak bs;
+  bs.centre = c;
+  bs.radius = r;
+  bs.bruiseMat = bruiseMat;
+  bs.bloodMat = bloodMat;
+  bs.step = effStep;
+  bs.cap = cap;
+  bs.bleedFrom = bleedFrom;
+  bs.bleedChance = bleedChance;
+  bs.pulpAt = pulpAt;
+  bs.blowScale = blowScale;
+  bs.tissue = &tissue;
+  bs.seed = seed;
+  StainLattice L;
+  if (fine) L.skin = &limb.skinVoxels; else L.coll = &limb.voxels;
+  BruiseTally tally;
+  const uint32_t marked =
+      SoakBruise(L, bs, &tally, poke ? micro : nullptr,
+                 poke ? limb.microModel : -1);
+  coreCells = tally.core;
+  pulpedCells = tally.pulped;
 
-    // ---- AND THE RIM HAS ITS OWN CEILING (2026-09-19) ---------------------
-    //
-    // The taper used to live ONLY in the step, which means it decided how FAST
-    // a voxel darkened and not how far. Over enough blows on one spot every
-    // cell in the radius therefore crawled to the same global ceiling, and
-    // with the bleed rung working (it never had been, see below) that made two
-    // dozen mace blows turn the ENTIRE mark wet: measured 431 bruised voxels
-    // down to 4, with 538 bloodied. A patch of blood with a hard edge and no
-    // bruise around it is not what a beating looks like, and it is not the
-    // "spectrum radiating outwards" the step's own note claims to produce.
-    //
-    // So the taper is a CEILING as well as a rate: a cell at the rim of a blow
-    // cannot be driven past a light mark by that blow however many land, and
-    // only the middle can reach the depth that breaks. What this buys is the
-    // shape the whole feature is for -- blood at the contact, deep purple
-    // around it, fading out -- and it is what keeps the bulk of a mace kill
-    // bruises rather than gore.
-    //
-    // PER BLOW, not per voxel-forever: `t` is this blow's distance, so a
-    // second blow landing closer legitimately raises the ceiling for that
-    // cell. That is how a beating walks across a limb.
-    const uint32_t voxCap = (uint32_t)std::lround((float)cap * taper);
-    if (voxCap == 0) return;
-
-    // ---- ...AND WHERE IT HAS ALREADY GONE AS DARK AS A BRUISE GETS --------
-    const uint32_t curAmt = BodyStainAmt(curStain);
-    const uint32_t curMat = BodyStainMat(curStain);
-    if (bloodMat != 0 && bleedChance > 0.0f && curMat == bruiseMat &&
-        curAmt >= bleedFrom) {
-      const float roll = (float)(h & 0xFFFFu) / 65535.0f;
-      if (roll < bleedChance) {
-        // Blood goes on at the bruise's own depth, not at a cut's: what has
-        // happened is that a deep contusion has broken the skin, and it should
-        // read as continuous with the mark around it rather than as a splash.
-        //
-        // ---- AND IT IS A DELIBERATE OVERWRITE, NOT A RAISE (2026-09-19) ----
-        //
-        // This was `RaiseBodyStain(curStain, bloodMat, max(curAmt, add))` and
-        // IT COULD NEVER FIRE. Raise's cross-material rule is "only a STRICTLY
-        // larger amount repaints", and the amount offered here is the voxel's
-        // own current one by construction -- the branch is gated on the bruise
-        // being AT the ceiling, so `max(curAmt, add)` IS `curAmt`, and
-        // `curAmt > curAmt` is false for every voxel, every blow, forever. The
-        // rung shipped disabled (`bruiseBleedChance` 0 in tuning.json), which
-        // is what you would tune it to after watching it do nothing.
-        //
-        // Raise is the wrong instrument regardless. Its rule protects a coat
-        // from being casually repainted by an unrelated splash; this is not a
-        // splash arriving, it is the SAME injury changing state, and the
-        // decision that it changes has already been made two lines up by the
-        // roll. So the coat is packed outright.
-        const uint16_t next = PackBodyStain(
-            bloodMat, std::min(std::max(curAmt, add), kBodyStainAmtMax));
-        if (next != curStain) {
-          setStain(next);
-          marked++;
-        }
-        return;
-      }
-    }
-
-    const uint16_t next = AddBodyStain(curStain, bruiseMat, add, voxCap);
-    if (next == curStain) return;
-    setStain(next);
-    marked++;
-  };
-
-  if (fine) {
-    for (PrefabVoxel& v : limb.skinVoxels)
-      bruise(v.x, v.y, v.z, (uint32_t)(v.material & 0xFFFu), v.stain,
-             [&](uint16_t s) {
-               v.stain = s;
-               if (poke)
-                 MicroBodyPokeStain(*micro, (uint32_t)limb.microModel, v.x, v.y,
-                                    v.z, s);
-             });
-  } else {
-    for (DebrisVoxel& v : limb.voxels)
-      bruise(v.x, v.y, v.z, (uint32_t)(v.payload & 0xFFFu), v.stain,
-             [&](uint16_t s) {
-               v.stain = s;
-               if (poke)
-                 MicroBodyPokeStain(*micro, (uint32_t)limb.microModel, v.x, v.y,
-                                    v.z, s);
-             });
-  }
   // THE LEDGER OWES A RECOUNT (mob.h LimbCoat). Without this the bruise is
   // invisible to everything that reads "what is on this creature" — including
   // the coat DECAY sweep, which walks the ledger's materials and would
@@ -10191,8 +10081,11 @@ void Mob::EmitCarvedFragment(const MobLimb& src, uint32_t physScale,
   phys_->SetBodyVelocities(h, away * 2.5f + Vec3{0, 1.5f, 0}, Vec3{});
   const float partWorldVox =
       (float)part.size() / (float)(physScale * physScale * physScale);
+  // ...and WHICH CREATURE this came off, so a gobbet cut again later still
+  // makes that species' wet noises (DebrisSystem::GoreEvent). `dead` because a
+  // lump carved out of a living body is no longer part of a living body.
   debris_->AdoptBody(h, std::move(part), xf, micro, 0, {},
-                     def_->bleedMat);
+                     def_->bleedMat, {}, /*dead=*/true, defIndex_);
   // A lump of live flesh oozes from the face it was cut on: the wound sits on
   // the gobbet's voxel nearest the limb it came off, budgeted like a corpse
   // carve of the same volume. No gout; a gobbet is not an amputation.
@@ -10328,94 +10221,38 @@ bool Mob::CarveLimb(int limbIndex, World& world,
   // the collider re-derive below picks the result up for free.
   if (spall != nullptr && spall->rounds > 0 && spall->strength > 0.0f &&
       spall->radius > 0.0f) {
+    // ONE IMPLEMENTATION, BOTH POPULATIONS (phys/lattice.h SpallGrow). This
+    // pass used to live here in full, which made it one of the two reasons a
+    // corpse was a different substance from the creature it had been a second
+    // earlier: a blade on loose matter left a groove that never widened,
+    // because the growth that makes sustained hits dismember was a Mob
+    // member. It is pure lattice arithmetic and now sits beside the other
+    // function that relates a body's two lattices; DebrisSystem::DamageBody
+    // calls the same one.
     const float scale =
         (float)std::max(1u, fine ? SkinScaleOf(limb) : PhysScaleOf(limb));
-    const Vec3 cLocal = spall->centerLocal * scale;
-    const float rLocal = spall->radius * scale;
-    const float r2 = rLocal * rLocal;
-    // Packed key over the lattice. int16 skin coords, so 21 bits per axis with
-    // a bias is ample and collision-free (unlike hashing the position, which
-    // would make occupancy probabilistic — the one thing this pass must not be).
-    auto key = [](int x, int y, int z) -> uint64_t {
-      return ((uint64_t)(uint32_t)(x + 32768) << 42) |
-             ((uint64_t)(uint32_t)(y + 32768) << 21) |
-             (uint64_t)(uint32_t)(z + 32768);
-    };
-    std::unordered_set<uint64_t> live;
-    auto rebuild = [&] {
-      live.clear();
-      if (fine) {
-        live.reserve(limb.skinVoxels.size() * 2);
-        for (const PrefabVoxel& v : limb.skinVoxels) live.insert(key(v.x, v.y, v.z));
-      } else {
-        live.reserve(limb.voxels.size() * 2);
-        for (const DebrisVoxel& v : limb.voxels) live.insert(key(v.x, v.y, v.z));
-      }
-    };
-    rebuild();
-    // A voxel on an intact surface already has one open face, so "eroded"
-    // starts at three: fewer and this eats the whole skin from the outside in
-    // rather than widening the crater.
-    constexpr int kMinOpenFaces = 3;
-    for (int round = 0; round < spall->rounds; round++) {
-      size_t took = 0;
-      auto doomed = [&](int x, int y, int z) {
-        const Vec3 d{(float)x + 0.5f - cLocal.x, (float)y + 0.5f - cLocal.y,
-                     (float)z + 0.5f - cLocal.z};
-        const float d2 = d.dot(d);
-        if (d2 >= r2) return false;               // outside the blast
-        int open = 0;
-        static const int kN[6][3] = {{1, 0, 0}, {-1, 0, 0}, {0, 1, 0},
-                                     {0, -1, 0}, {0, 0, 1}, {0, 0, -1}};
-        for (const auto& n : kN)
-          if (!live.count(key(x + n[0], y + n[1], z + n[2]))) open++;
-        if (open < kMinOpenFaces) return false;
-        // Proximity-weighted, so the tearing is concentrated at the blast and
-        // fades out rather than eroding the rim uniformly. Keyed on the same
-        // (mob, limb) seed plus the round, so a replay spalls identically.
-        const float t = std::sqrt(d2 / r2);
-        const float chance = spall->strength * (1.0f - t) *
-                             ((float)open / 6.0f);
-        const uint32_t h =
-            Hash3(spall->seed + 0x5BF03635u * (uint32_t)(round + 1),
-                  (uint32_t)(x * 73856093) ^ (uint32_t)(y * 19349663),
-                  (uint32_t)(z * 83492791));
-        return (float)(h & 0xFFFFu) / 65535.0f < chance;
-      };
-      if (fine) {
-        const size_t before = limb.skinVoxels.size();
-        limb.skinVoxels.erase(
-            std::remove_if(limb.skinVoxels.begin(), limb.skinVoxels.end(),
-                           [&](const PrefabVoxel& v) {
-                             if (!doomed(v.x, v.y, v.z)) return false;
-                             const Vec3 p{(float)v.x, (float)v.y, (float)v.z};
-                             skinLostSum += p;
-                             skinLostSq += p.dot(p);
-                             skinLostN++;
-                             if (report) skinLostCells.push_back({v.x, v.y, v.z});
-                             return true;
-                           }),
-            limb.skinVoxels.end());
-        took = before - limb.skinVoxels.size();
-        if (took) skinRemoved = true;
-      } else {
-        const size_t before = limb.voxels.size();
-        limb.voxels.erase(
-            std::remove_if(limb.voxels.begin(), limb.voxels.end(),
-                           [&](const DebrisVoxel& v) {
-                             if (!doomed(v.x, v.y, v.z)) return false;
-                             removed.push_back(v);
-                             return true;
-                           }),
-            limb.voxels.end());
-        took = before - limb.voxels.size();
-      }
-      // Nothing left to grow into: stop rather than paying for empty passes.
-      if (took == 0) break;
-      // The NEXT round must see the hole this one opened, or every round tests
-      // the same rim and the growth is one round wide however many are asked
-      // for. This is the whole mechanism.
-      rebuild();
+    SpallParams sp;
+    sp.centre = spall->centerLocal * scale;
+    sp.radius = spall->radius * scale;
+    sp.strength = spall->strength;
+    sp.rounds = spall->rounds;
+    sp.seed = spall->seed;
+    if (fine) {
+      const size_t took =
+          SpallGrow(limb.skinVoxels, sp, [&](const PrefabVoxel& v) {
+            const Vec3 p{(float)v.x, (float)v.y, (float)v.z};
+            skinLostSum += p;
+            skinLostSq += p.dot(p);
+            skinLostN++;
+            if (report) skinLostCells.push_back({v.x, v.y, v.z});
+          });
+      if (took) skinRemoved = true;
+    } else {
+      // The collider IS the authoritative lattice here, so the spalled cells
+      // are the particles: recorded WHOLE, because a gobbet needs the material
+      // it was made of and the erase is about to throw the cell away.
+      SpallGrow(limb.voxels, sp,
+                [&](const DebrisVoxel& v) { removed.push_back(v); });
     }
   }
 
@@ -15395,7 +15232,7 @@ void Mob::DetachLimb(int limbIndex, bool adopt) {
     debris_->AdoptBody(limb.body, limb.voxels, limb.xf,
                        limb.MicroRef(SkinScaleOf(limb)), PhysScaleOf(limb),
                        std::move(limb.skinVoxels), def.bleedMat, WoundOf(limb),
-                       /*dead=*/true);
+                       /*dead=*/true, defIndex_);
     limb.skinVoxels.clear();
     limb.carved = false;
     // ...AND THE SLOT FORGETS THE INDEX, not just the ownership. `carved =
@@ -15706,7 +15543,7 @@ void Mob::Die() {
     debris_->AdoptBody(limb.body, limb.voxels, limb.xf,
                        limb.MicroRef(SkinScaleOf(limb)), PhysScaleOf(limb),
                        std::move(limb.skinVoxels), def_->bleedMat,
-                       WoundOf(limb), /*dead=*/true);
+                       WoundOf(limb), /*dead=*/true, defIndex_);
     // A CORPSE FALLS WHERE IT STOOD, which for the avatar is entirely inside
     // the player's capsule proxy, and for an NPC killed at sword's reach is
     // often half inside it. Handing those limbs to the plain MOVING layer in

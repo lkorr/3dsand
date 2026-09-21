@@ -560,6 +560,204 @@ Vec3 AnyPerp(const Vec3& d) {
   return p.len() > 1e-5f ? p.normalized() : Vec3{1, 0, 0};
 }
 
+// ---- THE BODY ANSWERS, AND WHO IS DRIVING IT DECIDES HOW (2026-09-20) -------
+//
+// ONE CALL FOR EVERY POPULATION A BLOW CAN LAND ON: a standing creature, a
+// creature whose ragdoll has taken the rig, a corpse, a crate, a dropped
+// sword. That is the whole point — the axis that predicts what a struck body
+// does is not ALIVE vs DEAD, it is RIG-POSED vs SOLVER-OWNED
+// (docs/PLAN_struck_matter.md), and a limp living limb is on the same side of
+// it as a corpse. Splitting on death is what made every behaviour have to be
+// written twice, and the owner said so: "right now mobs can ragdoll and when
+// ragdolling they essentially behave just like corpses".
+//
+//   RIG-POSED   -> the pose spring (Mob::HitReact). The transform is written
+//                  by the pose pipeline, so a reaction has to be expressed as
+//                  a pose or it is not visible.
+//   SOLVER-OWNED-> an impulse at the contact point. Jolt writes the transform,
+//                  so a pose spring would be a write nobody reads — which is
+//                  exactly why Mob::HitReact REFUSES a limp or dead body, and
+//                  it has always named this as the thing it defers to: "a
+//                  corpse being hit already has an answer for where it goes,
+//                  and it is a better one than this: the impulse goes into
+//                  Jolt". Until now that impulse did not exist, so a ragdoll
+//                  and a corpse got no reaction at all.
+//
+// The DRIVE QUESTION IS ASKED OF PHYSICS, not of MobSystem, because physics is
+// the system that owns the answer and because asking it there means neither
+// this function nor anything downstream has to recognise which population it
+// is holding. `Physics::ApplyImpulseAt` refuses a kinematic body by itself.
+//
+// AT THE CONTACT POINT, so the blow turns a body over rather than sliding it;
+// along the blade's own TRAVEL, which is the same vector the kerf bores along
+// and the same one the pose spring leans away from.
+//
+// A STRAPPED GARMENT PASSES THE BLOW THROUGH TO WHAT IT IS ON. A corpse's
+// armour is a kinematic FOLLOWER (DebrisSystem::StrapBody) with no motion of
+// its own, so an impulse on the plate is dropped; the body inside it is what
+// the blow actually moves. One hop, not a walk: a follower's host is never
+// itself a follower.
+// ---- ONE BLOW, BUILT ONCE, WHATEVER IT LANDED ON (2026-09-20) --------------
+//
+// A strike is three parts (game/impact.h) and every population takes all
+// three. They used to be BUILT TWICE — once in the loose-matter branch and
+// once, two hundred lines later, in the creature branch — from the same six
+// tuning rows, with a comment admitting it: "deliberately, because a corpse is
+// a creature one function call later and a sword does not know the
+// difference". Two copies of "a sword does not know the difference" is how the
+// difference gets in: the owner's report of 2026-09-20 is that corpses stopped
+// taking damage at all, and the fix for it had to be made on one side only
+// because only one side had the rule.
+//
+// So the PARTS are built here, once, and what differs between populations is
+// only who resolves them. `StrikeParts` is the vocabulary of a blow; `Mob` and
+// `DebrisSystem` own their own matter and neither has to know about the other.
+struct StrikeParts {
+  KerfCut cut;      // the kerf, in world voxels (phys/kerf.h)
+  ::BluntHit blunt; // trauma
+  ::BiteHit bite;   // a tear, and whatever it leaves behind
+};
+
+// `seg` is the blade's edge at this sub-step, `sweepDir` its travel, `radius`
+// its carve half-width, `power` speed x edge-alignment, `hitSeed` the draw key
+// every part shares so a replay of the same tick tears identically.
+StrikeParts BuildStrikeParts(const EdgeSweep& s, const Vec3& at,
+                             const Vec3& seg, const Vec3& sweepDir,
+                             float radius, float power, float tipSpeed,
+                             uint32_t hitSeed) {
+  const Tuning::Gore& goreT = CurrentTuning().gore;
+  StrikeParts p;
+  // ---- THE CUT PART -------------------------------------------------------
+  p.cut.at = at;
+  p.cut.edgeAxis = seg.normalized();
+  // A stationary blade has no travel direction to speak of; fall back to
+  // boring along its own length, which is what a press with no swing behind it
+  // does.
+  p.cut.cutDir = sweepDir.len() > 1e-4f ? sweepDir : seg.normalized();
+  // The blade's OWN thickness decides the kerf's width; the tuning knob only
+  // scales it, because the geometry is supposed to be what decides the wound
+  // (items.json says so about carveBonus for the same reason).
+  p.cut.halfWidth = std::max(radius * goreT.cutWidth, 0.08f);
+  // `power` is speed x edge-alignment and `s.heft` is the weapon's own volume,
+  // so how deep the wound goes is: how fast, how well-angled, how much sword.
+  p.cut.depth = (goreT.cutDepth + goreT.cutDepthPower * power) * s.heft;
+  p.cut.length = goreT.cutLength * (0.4f + 0.6f * power) * s.heft;
+  p.cut.power = power;
+  p.cut.seed = hitSeed;
+  // ---- THE BLUNT PART -----------------------------------------------------
+  p.blunt.at = at;
+  p.blunt.hp = s.strike.blunt * power;
+  p.blunt.power = power;
+  p.blunt.carve = s.strike.bluntCarve;
+  p.blunt.armorBreak = s.strike.armorBreak;
+  p.blunt.impactSpeed = tipSpeed;
+  p.blunt.seed = hitSeed ^ 0xB1u;
+  // A FIST IS PART OF THE ARM THAT THROWS IT (melee.h selfMounted): the
+  // unarmed overrides in the gore block are keyed on this.
+  p.blunt.unarmed = s.selfMounted;
+  // ---- THE BITE PART ------------------------------------------------------
+  p.bite.at = at;
+  p.bite.hp = s.strike.bite * power;
+  p.bite.power = power;
+  // THE STRUCK KIND IS NOT HANDED DOWN (2026-09-16): whether teeth REACH flesh
+  // depends on what the garment in the way is made of and which limb is under
+  // it, and only the thing that was struck knows either.
+  p.bite.infectMat = s.strike.infectMat;
+  p.bite.infectStain = s.strike.infectStain;
+  p.bite.seed = hitSeed ^ 0xB17Eu;
+  return p;
+}
+
+// ---- ...AND RESOLVED ON LOOSE MATTER ---------------------------------------
+//
+// A corpse piece, a crate, a dropped sword. The three parts arrive exactly as
+// they arrive at a creature; what a corpse does not have is hp, a flinch, an
+// infection to progress or a voice, and NONE OF THOSE APPEAR HERE — they are
+// absent because loose matter does not answer them, not because the sweep
+// decided not to ask.
+//
+// KNOWN GAPS, listed so they are not mistaken for decisions
+// (docs/PLAN_struck_matter.md §B/§D): the blunt part is a crater rather than
+// the bruise-and-pulp the living get, and the bite is the same crater at the
+// tooth radius rather than the tear's own shape. Both want the geometry beside
+// the kerf in phys/ first.
+void ResolveOnLooseMatter(uint64_t body, const StrikeParts& p,
+                          const StrikeProfile& profile, float power,
+                          bool firstContact, bool biteAllowed,
+                          DebrisSystem& debris, World& world,
+                          std::vector<ParticleSpawn>& spawns, bool* bitten) {
+  const Tuning::Gore& goreT = CurrentTuning().gore;
+  if (profile.cut > 0.0f) debris.CutBody(body, p.cut, world, spawns);
+  // ---- TRAUMA, AND IT CLIMBS THE SAME LADDER (2026-09-20) ----------------
+  //
+  // This read "trauma on a thing that cannot feel it is a DENT and nothing
+  // else" and went straight to an instant crater — the very shape the LIVING
+  // path was given a bruise to stop using. Dead tissue still marks, still
+  // breaks when it is beaten to saturation, and still crumbles once pulped;
+  // what it does not have is hp to lose and a clock in its head. So a corpse
+  // now takes exactly the three rungs a creature takes (Mob::BluntHit):
+  //
+  //   1. THE BRUISE, widest and first, on whatever skin is still there.
+  //   2. ...which BREAKS and goes bloody where it saturates.
+  //   3. ...and what is already pulped CRUMBLES, over the next few seconds
+  //      (DebrisSystem::PulpTick), not in one swing.
+  //
+  // The carve is EARNED the same way it is on the living: `BruiseBody` returns
+  // how much of the contact core it found already pulped, and only that share
+  // of the dent is taken now. A first blow on unmarked flesh marks it and
+  // takes nothing.
+  if (profile.blunt > 0.0f && firstContact) {
+    const float ripe =
+        debris.BruiseBody(body, p.blunt.at,
+                          goreT.bruiseRadius * (0.5f + 0.5f * power),
+                          p.blunt.seed, power, p.blunt.hp, p.blunt.unarmed);
+    const float ripeFrom = std::clamp(goreT.pulpCarveFrom, 0.0f, 1.0f);
+    const float earned =
+        ripeFrom >= 1.0f
+            ? 0.0f
+            : std::clamp((ripe - ripeFrom) / (1.0f - ripeFrom), 0.0f, 1.0f);
+    if (earned > 0.0f && profile.bluntCarve > 0.0f)
+      debris.BluntBody(body, p.blunt.at,
+                       goreT.bluntCarveRadius * profile.bluntCarve * power *
+                           earned,
+                       p.blunt.seed, world, spawns,
+                       DebrisSystem::DamageCause::Blunt);
+  }
+  // A bite is a TEAR, and on a corpse that is all it is — the infection it
+  // would leave in living tissue has nothing to progress through.
+  if (profile.bite > 0.0f && firstContact && biteAllowed &&
+      !(bitten != nullptr && *bitten)) {
+    debris.BluntBody(body, p.bite.at, goreT.biteRadius * power, p.bite.seed,
+                     world, spawns, DebrisSystem::DamageCause::Bite);
+    if (bitten != nullptr) *bitten = true;
+  }
+}
+
+void StrikeReact(uint64_t body, const Vec3& dirWorld, const Vec3& atWorld,
+                 float hp, float power, Physics& phys, MobSystem& mobs,
+                 DebrisSystem& debris) {
+  const Tuning::CombatFx& fx = CurrentTuning().combatfx;
+  if (!fx.hitReact || body == 0 || dirWorld.len() < 1e-4f) return;
+  // RIG-POSED: the spring, exactly as before. HitReact self-refuses for a limp
+  // or dead owner, and returns false for a body no creature owns.
+  if (!phys.IsBodyDynamic(body)) {
+    if (mobs.HitReact(body, dirWorld, hp, power)) return;
+    // Not a mob's, and not dynamic: a strapped garment, or a kinematic prop.
+    const uint64_t host = debris.WornHostOf(body);
+    if (host == 0) return;
+    body = host;
+  }
+  // SOLVER-OWNED: the same ramp the spring is scaled by, so one reference blow
+  // moves both halves of the reaction and a tuning change cannot drift them
+  // apart (Tuning::CombatFx::hitReactImpulse).
+  const float scale =
+      std::clamp(hp * std::clamp(power, 0.0f, 1.0f) /
+                     std::max(fx.hitReactRefDamage, 0.1f),
+                 0.0f, std::max(fx.hitReactMaxScale, 1.0f));
+  if (scale <= 1e-3f) return;
+  phys.ApplyImpulseAt(body, dirWorld, fx.hitReactImpulse * scale, atWorld);
+}
+
 }  // namespace
 
 // =============================================================================
@@ -625,7 +823,9 @@ EdgeSweepResult MeleeSweepDamage(const EdgeSweep& s, const MeleeTuning& t,
   // radius has no way to express. The mid-blade rather than the tip because a
   // cut near the hilt is going where the hilt is going. A per-sweep constant,
   // so it is lifted clear of the sample loops below.
-  const auto& goreT = CurrentTuning().gore;
+  //
+  // (The gore block itself is read by `BuildStrikeParts`, which is where every
+  // number a blow is made of now comes from.)
   const Vec3 sweepDir =
       ((s.aNow + s.bNow) - (s.aPrev + s.bPrev)).normalized();
 
@@ -929,76 +1129,14 @@ EdgeSweepResult MeleeSweepDamage(const EdgeSweep& s, const MeleeTuning& t,
         out.hasHitAt = true;
       }
 
-      // ---- A CORPSE IS CUT THE WAY A BODY IS CUT (2026-09-19) -------------
+      // ---- 0. THE BODY ANSWERS — EVERY BODY, THE SAME WAY -----------------
       //
-      // This used to read "LIVE FLESH CARVES; DEBRIS MELTS... a loose body has
-      // no wound model to speak of, so EVERYTHING that can hurt melts it in
-      // one call" — `MeltBodyAt`, the LASER's carve: a sphere of the blade's
-      // half-width bored out per swing tick, vaporizing (eject=false, so no
-      // gobbets) and incapable of severing anything, because a sphere is not a
-      // cut. Three owner reports on the same day came out of that one line:
-      //
-      //   "swords shouldn't delete so many voxels off of corpses"  — the
-      //     sphere, which is exactly the shape mob.h's BladeCut was written to
-      //     stop using on the living ("at any radius large enough to feel like
-      //     a sword, most of the arm").
-      //   "no blood comes out"                                     — eject
-      //     false, and a drip where a wound should gout.
-      //   "you can sever the entire bottom half of a head but the top half
-      //     stays"                                                 — a bore
-      //     that never disconnects anything, into a connectivity split that
-      //     was measured on the majority-filled collider (debris.cpp
-      //     ShatterBody, and that is fixed there).
-      //
-      // So the three parts of a strike are resolved for a loose body exactly
-      // as they are for a limb, from the SAME numbers: the kerf below is built
-      // by the identical six lines the live path builds it from — deliberately,
-      // because a corpse is a creature one function call later and a sword does
-      // not know the difference. What a corpse does NOT have is hp, a flinch,
-      // an infection or a cry, and none of those appear here.
-      if (kind == StruckKind::Debris) {
-        const uint32_t hitSeed =
-            s.tick * 2654435761u + (uint32_t)hitBodies.size() * 40503u;
-        // First contact, asked once and consumed by both impulses — the same
-        // question and the same reason as the live path below.
-        bool firstContact = true;
-        if (s.struck != nullptr &&
-            (s.strike.blunt > 0.0f || s.strike.bite > 0.0f)) {
-          for (uint64_t h : *s.struck) firstContact &= (h != hb);
-          if (firstContact) s.struck->push_back(hb);
-        }
-        if (s.strike.cut > 0.0f) {
-          BladeCut cut;
-          cut.at = at;
-          cut.edgeAxis = seg.normalized();
-          cut.cutDir = sweepDir.len() > 1e-4f ? sweepDir : seg.normalized();
-          cut.halfWidth = std::max(radius * goreT.cutWidth, 0.08f);
-          cut.depth = (goreT.cutDepth + goreT.cutDepthPower * power) * s.heft;
-          cut.length = goreT.cutLength * (0.4f + 0.6f * power) * s.heft;
-          cut.power = power;
-          cut.seed = hitSeed;
-          debris.CutBody(hb, cut, world, spawns);
-        }
-        // Trauma on a thing that cannot feel it is a DENT and nothing else:
-        // no hp, no bruise clock, just the matter a hammer caves in. Only a
-        // profile that carves at all leaves one, which is the same gate
-        // Mob::BluntHit applies (`carve` > 0).
-        if (s.strike.blunt > 0.0f && firstContact && s.strike.bluntCarve > 0.0f)
-          debris.BluntBody(hb, at,
-                           goreT.bluntCarveRadius * s.strike.bluntCarve * power,
-                           hitSeed ^ 0xB1u, world, spawns);
-        // A bite is a TEAR, and on a corpse that is all it is — the infection
-        // it would leave in living tissue has nothing to progress through.
-        if (s.strike.bite > 0.0f && firstContact &&
-            !(s.bitten != nullptr && *s.bitten)) {
-          debris.BluntBody(hb, at, goreT.biteRadius * power,
-                           hitSeed ^ 0xB17Eu, world, spawns);
-          if (s.bitten != nullptr) *s.bitten = true;
-        }
-        continue;
-      }
-
-      // ---- 0. THE BODY ANSWERS, AND IT ANSWERS DIRECTIONALLY --------------
+      // ABOVE THE POPULATION BRANCH, and that is the point of it being here
+      // rather than twice below. A blow rocks what it lands on whether that is
+      // a creature on its feet, a creature whose ragdoll has the rig, or a
+      // corpse; `StrikeReact` picks the pose spring or the impulse off HOW THE
+      // BODY IS DRIVEN, so this behaviour is authored once and cannot fall out
+      // of step between the living and the dead (docs/PLAN_struck_matter.md).
       //
       // BEFORE the three resolvers, not after, because any of them can take
       // the struck limb OFF: `Damage` severs past the impact threshold and
@@ -1015,18 +1153,116 @@ EdgeSweepResult MeleeSweepDamage(const EdgeSweep& s, const MeleeTuning& t,
       // read as a push rather than as a cut. Whole profile, because a mace
       // that never breaks the skin still moves you (game/impact.h).
       //
-      // ONE LINE, THREE POPULATIONS: an NPC hit by the player, the player hit
-      // by an NPC, and an NPC hit by an NPC all arrive here, because all three
-      // swing through this function.
-      mobs.HitReact(struckBody, sweepDir, s.strike.Total(), power);
+      // ONE LINE, FOUR POPULATIONS: an NPC hit by the player, the player hit
+      // by an NPC, an NPC hit by an NPC, and anything loose hit by any of
+      // them. The first three arrive because all of them swing through this
+      // function; the fourth is new and is the reason the call moved.
+      //
+      // The FLESH handle, not the shell's: the body reacts where it was hit,
+      // and a follower shell (MobLimb::wornHost, DebrisSystem::StrapBody) has
+      // neither a spring nor a motion of its own — StrikeReact hops to the
+      // host for the loose case and Mob::HitReact redirects for the worn one.
+      StrikeReact(struckBody, sweepDir, at, s.strike.Total(), power, phys, mobs,
+                  debris);
 
-      // The draw key every part below shares, so a replay of the same tick
-      // against the same probe cuts, bruises and tears identically. One
-      // counter, three salts: nothing here may key on a Jolt float.
+      // ---- THE BLOW, BUILT ONCE (2026-09-20) ------------------------------
+      //
+      // The three parts (game/impact.h) are assembled here, for every
+      // population, and only their RESOLUTION differs below. They used to be
+      // built twice — once in a loose-matter branch and once, seventy lines
+      // later, in the creature branch — from the same six tuning rows, and the
+      // second copy carried a comment saying the two were the same on purpose.
+      // Two copies of "these are the same" is how they stop being the same:
+      // the corpse copy silently stopped doing anything at all
+      // (docs/PLAN_struck_matter.md), and the fix landed on one side because
+      // only one side had the rule.
+      //
+      // The draw key every part shares, so a replay of the same tick against
+      // the same probe cuts, bruises and tears identically. One counter, three
+      // salts: nothing here may key on a Jolt float.
       const uint32_t hitSeed =
           s.tick * 2654435761u + (uint32_t)hitBodies.size() * 40503u;
 
-      // ---- 1. THE CUT PART — today's whole wound model, unchanged ----------
+      // ---- IS THIS THE FIRST TIME THIS STROKE HAS TOUCHED THIS SLOT? ------
+      //
+      // Asked ONCE, before either impulse, and consumed by both: a mace that
+      // bruises and a set of jaws that tears are the same event arriving, and
+      // asking separately would let a profile carrying both spend two first
+      // contacts on one meeting. See EdgeSweep::struck for why an impulse is
+      // not a kerf. ONE COPY, BOTH POPULATIONS — a corpse's dent is once per
+      // stroke for the same reason a bruise is.
+      bool firstContact = true;
+      if (s.struck != nullptr && (s.strike.blunt > 0.0f || s.strike.bite > 0.0f)) {
+        for (uint64_t h : *s.struck)
+          if (h == hb) firstContact = false;
+        if (firstContact) s.struck->push_back(hb);
+      }
+
+      // ...and at most ONE bite for the whole stroke, landed on the limb the
+      // stroke DREW while it still can (melee.h EdgeSweep::bitePrefer /
+      // biteHoldout). The jaws pass the chest on their way to an arm, and
+      // spending the stroke's one bite on the first thing touched made every
+      // authored `target` weight a lie about where wounds ended up. Held only
+      // while there are cut ticks left to find the drawn limb in; on the last
+      // one this test is off and first contact wins.
+      const bool wrongTarget = s.bitePrefer != 0 && hb != s.bitePrefer &&
+                               s.biteHoldout;
+
+      const StrikeParts parts = BuildStrikeParts(s, at, seg, sweepDir, radius,
+                                                 power, out.tipSpeed, hitSeed);
+
+      // ---- LOOSE MATTER RESOLVES IT AND THE PROBE MOVES ON ----------------
+      //
+      // A corpse piece, a crate, a dropped sword: the same three parts, minus
+      // the four things loose matter cannot answer (hp, a flinch, an infection,
+      // a cry). The reaction has already happened ABOVE this branch, for every
+      // population at once, which is the whole point of it being there.
+      if (kind == StruckKind::Debris) {
+        // ---- A CORPSE'S ARMOUR IS IN THE WAY TOO (2026-09-20) ------------
+        //
+        // The march-back retarget above runs only for LIVING flesh, because it
+        // asks the creature's rig which shells cover which limb. A corpse has
+        // no rig — its garments are STRAPPED FOLLOWER BODIES
+        // (DebrisSystem::StrapBody) — so a blade that started inside the body
+        // carved the flesh straight through the plate, and killing a knight
+        // made his cuirass stop working. Same question, asked of physics: from
+        // where the blade met this body, back along its own travel, is the
+        // first thing out there a garment strapped to THIS body? Then the blow
+        // belongs to the garment.
+        //
+        // ONE CAST, not the five-ray bundle the live path uses: that bundle
+        // exists to stop a blade slipping through its own previous scratch in
+        // a shell index, and this test is a real collider query that cannot
+        // see a one-cell slit in the first place.
+        if (!debris.WornHostOf(hb)) {   // not already the garment
+          const Vec3 back = (sweepDir.len() > 1e-4f ? sweepDir * -1.0f
+                                                    : dir * -1.0f)
+                                .normalized();
+          constexpr float kCoverReach = 6.0f;   // world voxels
+          float cf = 1.0f;
+          const uint64_t cover = phys.CastRayBody(at + back * kCoverReach,
+                                                  back * -1.0f, kCoverReach, cf);
+          if (cover != 0ull && cover != hb &&
+              debris.WornHostOf(cover) == hb) {
+            bool coverSeen = false;
+            for (uint64_t h : hitBodies) coverSeen |= (h == cover);
+            if (coverSeen) continue;   // the plate already took this swing
+            out.probesCovered++;
+            hitBodies.back() = cover;
+            hb = cover;
+            at = at + back * (kCoverReach * (1.0f - cf));
+          }
+        }
+        // ...and SAY whether it was flesh, because nothing downstream can tell
+        // by looking: a corpse fills neither the sever queue nor the voice
+        // queue, which is what main.cpp infers the cue from.
+        out.hitDeadFlesh |= debris.BodyIsDeadFlesh(hb);
+        ResolveOnLooseMatter(hb, parts, s.strike, power, firstContact,
+                             !wrongTarget, debris, world, spawns, s.bitten);
+        continue;
+      }
+
+      // ---- 1. THE CUT PART — a creature's whole wound model ---------------
       //
       // A weapon with no edge at all (a fist; a mace, very nearly) skips the
       // kerf outright rather than building a zero-depth slot and asking the
@@ -1044,119 +1280,37 @@ EdgeSweepResult MeleeSweepDamage(const EdgeSweep& s, const MeleeTuning& t,
         // deliberately OUTSIDE it: a mace caving a skull in is not a
         // dismemberment and must not arm the wet cue.
         MobSystem::BladeCutScope blade(mobs, power);
-        if (mobs.Damage(hb, dmg, at, out.tipSpeed)) {
-          // A KERF, NOT A BITE. The radial carve this replaced took a sphere
-          // out of the limb, which at any radius that felt like a sword was
-          // most of an arm — and Damage() severed on contact anyway, so the
-          // shape never got to matter. Now it is the only thing that decides
-          // dismemberment: the slot follows the blade's own edge and the
-          // direction the swing is going, and a limb comes off when the lattice
-          // has been cut through (game/mob.h BladeCut).
-          //
-          // THIS IS THE ONLY PLACE THE KERF IS BUILT. It lives inside the sweep
-          // rather than at the player's call site precisely because there are
-          // three callers — the player's tick, an attacking NPC's tick, and the
-          // gate — and a second copy of these six lines is how the player's cut
-          // and the NPC's quietly stop being the same cut.
-          BladeCut cut;
-          cut.at = at;
-          cut.edgeAxis = seg.normalized();
-          // A stationary blade has no travel direction to speak of; fall back
-          // to boring along its own length, which is what a press with no swing
-          // behind it does.
-          cut.cutDir = sweepDir.len() > 1e-4f ? sweepDir : seg.normalized();
-          // The blade's OWN thickness decides the kerf's width; the tuning knob
-          // only scales it, because the geometry is supposed to be what decides
-          // the wound (items.json says so about carveBonus for the same reason).
-          cut.halfWidth = std::max(radius * goreT.cutWidth, 0.08f);
-          // `power` here is speed x edge-alignment (see the note where it is
-          // formed) and `s.heft` is the weapon's own volume, so how deep the
-          // wound goes is: how fast, how well-angled, and how much sword.
-          cut.depth = (goreT.cutDepth + goreT.cutDepthPower * power) * s.heft;
-          cut.length = goreT.cutLength * (0.4f + 0.6f * power) * s.heft;
-          cut.power = power;
-          // Counter-based, off the tick and the probe index: the ragged rim and
-          // the blood soak must replay identically.
-          cut.seed = hitSeed;
-          mobs.CutLimb(hb, cut, world, spawns);
-        }
+        // A KERF, NOT A BITE, and it is the only thing that decides
+        // dismemberment: the slot follows the blade's own edge and the
+        // direction the swing is going, and a limb comes off when the lattice
+        // has been cut through (game/mob.h BladeCut). The slot itself is
+        // `parts.cut`, which a corpse is cut by too.
+        if (mobs.Damage(hb, dmg, at, out.tipSpeed))
+          mobs.CutLimb(hb, parts.cut, world, spawns);
       }
 
-      // ---- IS THIS THE FIRST TIME THIS STROKE HAS TOUCHED THIS SLOT? ------
-      //
-      // Asked ONCE, before either impulse, and consumed by both: a mace that
-      // bruises and a set of jaws that tears are the same event arriving, and
-      // asking separately would let a profile carrying both spend two first
-      // contacts on one meeting. See EdgeSweep::struck for why an impulse is
-      // not a kerf.
-      bool firstContact = true;
-      if (s.struck != nullptr && (s.strike.blunt > 0.0f || s.strike.bite > 0.0f)) {
-        for (uint64_t h : *s.struck)
-          if (h == hb) firstContact = false;
-        if (firstContact) s.struck->push_back(hb);
-      }
-
-      // ---- 2. THE BLUNT PART — trauma, a bruise, and never a sever ---------
+      // ---- 2. THE BLUNT PART — trauma, a bruise, and never a sever --------
       //
       // The struck kind is deliberately NOT handed down: Mob::BluntHit asks
       // IsWornSlot for itself, because it also has to find the limb UNDERNEATH
       // a shell to transmit through, and only the creature knows that.
-      if (s.strike.blunt > 0.0f && firstContact) {
-        BluntHit bh;
-        bh.at = at;
-        bh.hp = s.strike.blunt * power;
-        bh.power = power;
-        bh.carve = s.strike.bluntCarve;
-        bh.armorBreak = s.strike.armorBreak;
-        bh.impactSpeed = out.tipSpeed;
-        bh.seed = hitSeed ^ 0xB1u;
-        bh.unarmed = s.selfMounted;
-        mobs.BluntHit(hb, bh, world, spawns);
-      }
+      if (s.strike.blunt > 0.0f && firstContact)
+        mobs.BluntHit(hb, parts.blunt, world, spawns);
 
-      // ---- 3. THE BITE PART — a tear, and an infection armour refuses ------
+      // ---- 3. THE BITE PART — a tear, and an infection armour refuses -----
+      //
       // Once per slot per stroke, like the blunt part above and for the same
-      // reason: teeth close once.
-      // ...and at most ONE bite for the whole stroke (melee.h EdgeSweep::
-      // bitten). `firstContact` alone is per BODY, which lets one lunge tear
-      // the head, the chest and an arm as the jaws sweep past all three.
-      // ...and on the LIMB THE STROKE DREW, while it still can (melee.h
-      // EdgeSweep::bitePrefer). The jaws pass the chest on their way to an arm,
-      // and spending the stroke's one bite on the first thing touched made every
-      // authored `target` weight a lie about where wounds ended up. Held only
-      // while `biteHoldout` says there are cut ticks left to find the drawn limb
-      // in; on the last one this test is off and first contact wins.
-      const bool wrongTarget = s.bitePrefer != 0 && hb != s.bitePrefer &&
-                               s.biteHoldout;
+      // reason: teeth close once. `Mob::BiteHit` asks `IsWornSlot` for itself,
+      // exactly as BluntHit does — whether teeth REACH flesh depends on what
+      // the garment in the way is made of, and only the creature knows.
+      //
+      // Latched on a LANDED bite, not on an attempted one: `BiteHit` returns
+      // false when the handle no longer resolves to a limb (it was severed by
+      // the cut part a few lines up, say), and spending the stroke's one bite
+      // on that would make a zombie miss for reasons nobody can see.
       if (s.strike.bite > 0.0f && firstContact && !wrongTarget &&
           !(s.bitten != nullptr && *s.bitten)) {
-        BiteHit bt;
-        bt.at = at;
-        bt.hp = s.strike.bite * power;
-        bt.power = power;
-        // ---- THE STRUCK KIND IS NOT HANDED DOWN (2026-09-16) --------------
-        //
-        // It used to be: the infection was attached only `if (kind ==
-        // StruckKind::Flesh)`, on the theory that "a bite that touches flesh"
-        // is a fact about what this sweep met. It is not. Whether teeth REACH
-        // flesh depends on what the garment in the way is MADE OF -- linen is
-        // hardness 4 and steel 200 -- and on which limb is strapped under it,
-        // and only the creature knows either. Deciding it here made a tunic as
-        // bite-proof as a cuirass, which is why a clothed victim saw nothing
-        // but bruises.
-        //
-        // So the profile arrives whole and `Mob::BiteHit` asks `IsWornSlot`
-        // for itself, exactly as `Mob::BluntHit` already did and for the
-        // reason stated six lines above this: only the rig can find the limb
-        // underneath a shell to transmit through.
-        bt.infectMat = s.strike.infectMat;
-        bt.infectStain = s.strike.infectStain;
-        bt.seed = hitSeed ^ 0xB17Eu;
-        // Latched on a LANDED bite, not on an attempted one: `BiteHit` returns
-        // false when the handle no longer resolves to a limb (it was severed
-        // by the cut part a few lines up, say), and spending the stroke's one
-        // bite on that would make a zombie miss for reasons nobody can see.
-        if (mobs.BiteHit(hb, bt, world, spawns) && s.bitten != nullptr)
+        if (mobs.BiteHit(hb, parts.bite, world, spawns) && s.bitten != nullptr)
           *s.bitten = true;
       }
     }

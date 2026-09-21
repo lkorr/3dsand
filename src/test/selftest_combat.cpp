@@ -205,6 +205,10 @@ Status GateCombatTuning(Ctx& c, std::string& detail) {
       {"combatfx", "hitReactPushFrac", 0.041f, [](const Tuning& t) { return t.combatfx.hitReactPushFrac; }},
       {"combatfx", "hitReactLimbDeg", 21.0f, [](const Tuning& t) { return t.combatfx.hitReactLimbDeg; }},
       {"combatfx", "hitReactHalflife", 0.121f, [](const Tuning& t) { return t.combatfx.hitReactHalflife; }},
+      // ...and the same reaction on a body Jolt owns (docs/PLAN_struck_matter.md):
+      // a limp living limb and a corpse take an impulse where a standing one
+      // takes the spring, and this is the dial both halves share.
+      {"combatfx", "hitReactImpulse", 7.5f, [](const Tuning& t) { return t.combatfx.hitReactImpulse; }},
       {"combatfx", "whooshVolume", 0.71f, [](const Tuning& t) { return t.combatfx.whooshVolume; }},
       {"combatfx", "whooshMinSpeed", 411.0f, [](const Tuning& t) { return t.combatfx.whooshMinSpeed; }},
       {"combatfx", "whooshRateSlow", 0.71f, [](const Tuning& t) { return t.combatfx.whooshRateSlow; }},

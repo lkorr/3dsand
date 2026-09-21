@@ -8,10 +8,13 @@
 #include <functional>
 #include <string>
 #include <unordered_map>
+#include <utility>
 #include <vector>
 
 #include "math3d.h"
+#include "phys/bodystain.h"  // BodyStainMat/Amt: coats a blow leaves
 #include "phys/kerf.h"   // KerfCut/KerfSlot: the shape a blade takes out
+#include "phys/lattice.h"
 #include "phys/physics.h"
 #include "sim/materials.h"
 #include "sim/microbody.h"
@@ -151,7 +154,56 @@ class DebrisSystem {
                  uint32_t physScale = 0,
                  std::vector<PrefabVoxel> skinVoxels = {},
                  uint32_t bleedMat = 0, BodyWound wound = {},
-                 bool dead = false);
+                 bool dead = false, int defIndex = -1);
+
+  // ---- WHAT A CORPSE SAYS WHEN YOU CUT IT (2026-09-20) --------------------
+  //
+  // THE SAME NOISES A LIVING BODY MAKES, MINUS THE VOICE. A blow on a corpse
+  // used to read as "a chip" — main.cpp's tier logic infers what was hit from
+  // the sever and voice queues, a corpse fills neither, and the fallback is
+  // the cue a crate gets. So hacking a body apart on the ground sounded like
+  // hitting a box, which is the one thing it is not.
+  //
+  // This is the debris twin of MobSystem::SeverEvent and it exists for the
+  // identical reason, stated there: the event happens inside the tick loop
+  // (0..4 times a frame) and audio is a per-frame job, and the DEF INDEX rides
+  // on the event because the mob that owned this flesh is long despawned — the
+  // def outlives it, so a corpse can still make its own species' wet
+  // dismemberment sound rather than a generic one.
+  //
+  // `severed` separates the two things a blade does to a corpse: opening it
+  // (flesh + the wet cut) and taking a piece OFF (the dismember take as well).
+  struct GoreEvent {
+    Vec3 posVoxel;         // where, world voxels
+    int defIndex = -1;     // the creature this was part of, or -1
+    float severity = 1.0f; // 0..1, the blow's own power
+    bool severed = false;  // a piece came off, not merely a wound
+    bool byBlade = false;  // an edge did it, not a blast or a fire
+  };
+  const std::vector<GoreEvent>& GoreEvents() const { return gore_; }
+  void ClearGoreEvents() { gore_.clear(); }
+  // ---- WHERE THIS BODY'S MATTER ACTUALLY IS, NEAREST A POINT ---------------
+  //
+  // A body's transform says where its ORIGIN is; a joint anchor, a blow aimed
+  // at a joint, or anything else expressed in world space needs to know where
+  // the nearest real voxel is, and a lattice is not a sphere. Used by the
+  // dismemberment gate to chop AT a corpse's neck rather than at the empty
+  // space the anchor sits in — aiming at the anchor itself put 56 of 60 blows
+  // in the air. Returns `worldPoint` unchanged when the handle is not a body.
+  Vec3 NearestVoxelWorld(uint64_t handle, Vec3 worldPoint) const;
+  // How much of this body's matter is within `radiusVox` WORLD voxels of a
+  // world point, on its authoritative lattice. The joint rule's own question
+  // (PartJointsAt), exposed so a gate can report the number that decides
+  // instead of reporting that nothing happened.
+  uint32_t VoxelsNearWorld(uint64_t handle, Vec3 worldPoint,
+                           float radiusVox) const;
+  // True when this body came off a creature (Body::dead). The melee sweep asks
+  // so a blow can be reported as FLESH rather than as a chip.
+  bool BodyIsDeadFlesh(uint64_t handle) const {
+    for (const Body& b : bodies_)
+      if (b.handle == handle) return b.dead && b.bleedMat != 0;
+    return false;
+  }
   // Open a wound on an adopted body at its voxel nearest `woundW` (world),
   // owing `budget` blood voxels, with `gushTicks` of dismemberment gout.
   // False when no such body, or it has no blood.
@@ -173,13 +225,42 @@ class DebrisSystem {
   // handle is not an adopted body.
   bool CutBody(uint64_t handle, const KerfCut& cut, World& world,
                std::vector<ParticleSpawn>& spawns);
+  // WHAT DID THIS. Carried through the carve so the noise at the far end can
+  // tell a sword from a fire: only a blade makes the wet dismemberment sound
+  // (an explosion that takes the same arm off did not saw through anything),
+  // and only a blow makes any of them at all.
+  enum class DamageCause : uint8_t { Other = 0, Blade, Blunt, Bite, Beam, Blast };
+  // ---- ...AND THE MARK A BLOW LEAVES BEFORE IT TAKES ANYTHING -------------
+  //
+  // THE BRUISE LADDER ON DEAD TISSUE (phys/bodystain.h SoakBruise), which is
+  // the same ladder the living climb: a cell darkens, a saturated cell breaks
+  // and goes bloody, a cell bloody at depth is PULPED and will crumble over
+  // the next few seconds (PulpTick). Until 2026-09-20 a mace on a corpse went
+  // straight to an instant crater — the very shape the living path was given a
+  // bruise to stop using — so a beating marked a creature and did nothing
+  // visible to its corpse.
+  //
+  // Returns the RIPENESS of the contact core (0..1): how much of what this
+  // blow landed on was ALREADY pulped when it arrived, which is what decides
+  // whether it takes matter as well as marking it. `hp` scales the coat the
+  // way it does for the living, `unarmed` picks up the gore block's unarmed
+  // overrides.
+  float BruiseBody(uint64_t handle, Vec3 atVoxel, float radiusVoxels,
+                   uint32_t seed, float power, float hp, bool unarmed);
+  // One tick of the dissolution the third rung arms. Pulped voxels crumble at
+  // gore.pulpRotRate, surface first, so a caved-in corpse keeps coming apart
+  // after the blows stop instead of vanishing in one swing. A body nothing has
+  // beaten pays one bool test.
+  void PulpTick(uint32_t tick, World& world,
+                std::vector<ParticleSpawn>& spawns);
   // ...and the mace. A POINT with a magnitude, where a kerf is a slot with a
   // direction (game/mob.h BluntHit draws the same distinction for the living):
   // a shallow ragged dent at `radiusVoxels`, which is what caves a corpse's
   // skull in. `seed` keys the rim so a replayed blow dents identically.
   bool BluntBody(uint64_t handle, Vec3 atVoxel, float radiusVoxels,
                  uint32_t seed, World& world,
-                 std::vector<ParticleSpawn>& spawns);
+                 std::vector<ParticleSpawn>& spawns,
+                 DamageCause cause = DamageCause::Blunt);
   // Was this body once alive (Body::dead)? False for a handle that is not an
   // adopted body, which reads the same way as "not a corpse".
   bool BodyDead(uint64_t handle) const {
@@ -461,6 +542,44 @@ class DebrisSystem {
     return i < bodies_.size() ? bodies_[i].wound.budget : 0.0f;
   }
   Vec3 BodyWoundWorld(uint32_t i) const;  // the wound, in world voxels
+  // Voxels of one body wearing a COAT of `mat` (phys/bodystain.h), at or above
+  // `minAmt`. The bruise ladder writes coats, not materials, so a gate that
+  // asks "did the mace mark this corpse" has to ask this and not the material
+  // census above.
+  uint32_t BodyCoatCount(uint32_t i, uint32_t mat, uint32_t minAmt = 1) const {
+    if (i >= bodies_.size()) return 0;
+    const Body& b = bodies_[i];
+    uint32_t n = 0;
+    auto tally = [&](uint16_t st) {
+      if (BodyStainMat(st) == mat && BodyStainAmt(st) >= minAmt) n++;
+    };
+    if (b.HasFineSkin())
+      for (const PrefabVoxel& v : b.skinVoxels) tally(v.stain);
+    else
+      for (const DebrisVoxel& v : b.voxels) tally(v.stain);
+    return n;
+  }
+  // ---- THE ONE IDENTITY THAT SURVIVES EVERYTHING --------------------------
+  //
+  // A body's HANDLE is replaced whenever its collider is rebuilt, and its
+  // INDEX is shuffled whenever another body settles back into the grid
+  // (swap-and-pop). `Body::serial` is neither: it is assigned at adoption,
+  // carried through every rebuild, and exists precisely because the RNG
+  // streams could not key on the other two. Anything that has to follow ONE
+  // piece across time — a gate watching a corpse dissolve, a future save —
+  // should hold this.
+  uint32_t BodySerial(uint32_t i) const {
+    return i < bodies_.size() ? bodies_[i].serial : 0u;
+  }
+  int FindBodySerial(uint32_t serial) const {
+    for (size_t i = 0; i < bodies_.size(); i++)
+      if (bodies_[i].serial == serial) return (int)i;
+    return -1;
+  }
+  // Is this body being eaten by the dissolution a beating armed (Body::pulp)?
+  bool BodyPulping(uint32_t i) const {
+    return i < bodies_.size() && bodies_[i].pulp;
+  }
   uint32_t BodyVoxelCount(uint32_t i) const {
     if (i >= bodies_.size()) return 0;
     const Body& b = bodies_[i];
@@ -1034,7 +1153,27 @@ class DebrisSystem {
     // "the dead do not flinch") have a fact to ask rather than having to
     // infer one from `bleedMat` — which means "bleeds when cut" and is
     // already true of a live limb.
+    //
+    // 2026-09-20: two rules ask now — the melee sweep reports a blow on dead
+    // flesh as FLESH rather than as a chip, and `GoreEvent` gives a corpse its
+    // own species' wet noises.
     bool dead = false;
+    // ---- WHAT WAS HOLDING EACH JOINT WHEN THE BLOWS STARTED ---------------
+    // One entry per joint on this body (joint handle -> flesh count within
+    // gore.corpseJointHold of its anchor), captured the first time a carve
+    // asks and never re-raised. The denominator of the parting rule, and the
+    // debris twin of MobLimb::neckAtSpawn — taken lazily for the same reason
+    // that one is: at spawn there is nothing to measure against yet.
+    std::vector<std::pair<uint64_t, uint32_t>> jointHold;
+    // Something beat this body hard enough to pulp tissue: PulpTick is eating
+    // it. Cleared when nothing pulped is left (the same self-clearing flag
+    // Mob::BluntPulpTick uses, and for the same rule-2 reason).
+    bool pulp = false;
+    // WHICH CREATURE THIS WAS, an index into MobSystem::Defs(), or -1 for
+    // matter that was never alive. Carried for the same reason the sever event
+    // carries one: the mob is despawned long before anything asks, and a
+    // corpse being hacked apart should make ITS OWN species' sounds.
+    int defIndex = -1;
     uint32_t burnCursor = 0;      // rotating scan window into voxels
     uint32_t burnedSinceRebuild = 0;  // batched collider refresh threshold
     uint32_t burnedSinceShatter = 0;  // batched connectivity re-check
@@ -1181,7 +1320,19 @@ class DebrisSystem {
   // (swap-and-pop) and the caller must not advance.
   bool DamageBody(size_t bi, World& world, std::vector<ParticleSpawn>& spawns,
                   std::vector<Body>& fragments, uint32_t& newBodyBudget,
-                  bool eject, const CarveFactory& carveAt);
+                  bool eject, const CarveFactory& carveAt,
+                  DamageCause cause = DamageCause::Other,
+                  float severity = 1.0f, const SpallParams* spall = nullptr);
+  // ---- A CORPSE COMES APART WHERE IT WAS CUT (2026-09-20) -----------------
+  //
+  // Severing on this side used to be connectivity INSIDE one body, so a blade
+  // could part a corpse's neck completely and the head stayed on: the joints
+  // Mob::Die leaves are what hold a corpse together and nothing ever cut one.
+  // This is the same rule the living sever by, one population later — the
+  // flesh AT the joint is gone, so there is nothing left to hold — asked of
+  // every joint on a body that was just carved. Returns how many let go, and
+  // pushes a GoreEvent for each.
+  uint32_t PartJointsAt(Body& b, DamageCause cause, float severity);
   // Rebuild a body's Jolt collider from its current voxels, preserving pose and
   // velocity. Micro bodies pass voxelPitch = 1/scale — a scale-2 body's voxels
   // are half-size, and building it at pitch 1 would double its physical volume
@@ -1244,6 +1395,7 @@ class DebrisSystem {
   std::vector<uint32_t> classOf_;
   std::vector<float> densityOf_;
   std::vector<uint32_t> rubbleOf_;
+  std::vector<std::string> matNames_;   // id -> name, for authored-by-name coats
   std::vector<uint8_t> foliageOf_;  // tag:foliage — sub-8 floaters vanish, no rubble
   // body burn tables (rebuilt on materials hot-reload; data-driven, no
   // hardcoded material IDs — the JSON stays the single source of behavior)
@@ -1444,6 +1596,7 @@ class DebrisSystem {
     PhaseSwitch& operator=(const PhaseSwitch&) = delete;
   };
   bool instancesDirty_ = false;
+  std::vector<GoreEvent> gore_;   // drained per frame by main.cpp
   uint32_t instanceCount_ = 0;
   uint32_t settledBack_ = 0;
   SettleProbe settle_{};

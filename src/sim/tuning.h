@@ -931,6 +931,27 @@ struct Tuning {
     // arms the sever gout and the stump budget above on BOTH pieces, so a
     // dismembered corpse bleeds like a dismembered creature, minus the hp.
     float corpseBleedPerVoxel = 1.5f;
+    // ---- WHAT STILL HOLDS A CORPSE TOGETHER (2026-09-20) -------------------
+    //
+    // A corpse is a dozen bodies held by the joints Mob::Die leaves on, and
+    // until now nothing could cut one: a blade could part a neck completely
+    // and the head stayed attached, because severing on the debris side is
+    // connectivity INSIDE one body. This is the living rule's radius, one
+    // population later (Mob::CutLimb's "the flesh AT the joint is gone"): if
+    // no voxel survives within this many WORLD voxels of a joint's anchor,
+    // the joint has nothing left to hold and lets go. 0 disables corpse
+    // dismemberment entirely and puts the heads back on.
+    float corpseJointHold = 1.1f;
+    // ...AND HOW LITTLE OF IT IS TOO LITTLE. A binary "no voxel at all within
+    // the radius" test is the trap phys/kerf.h already names in another form:
+    // ONE surviving straggler keeps a head on forever. Measured — 60 chops at
+    // a corpse's neck took the flesh holding that joint from 476 voxels to 4
+    // and the head stayed attached, because 4 is not 0. So the rule is the
+    // living one's shape: a FRACTION of what was there when the blows started
+    // (Mob::CarveLimb measures its neck against `neckAtSpawn` for exactly this
+    // reason). 1.0 parts a joint the moment anything is taken; 0 restores the
+    // all-or-nothing rule and puts the heads back on.
+    float corpseJointCut = 0.12f;
 
     // ---- B2. how fast that budget leaves the wound, and in what size lumps ----
     // Rate is a PERIOD, not a chance, because bleeding must stay bounded per
@@ -1923,6 +1944,23 @@ struct Tuning {
     // Seconds to halve. The whole reaction is over in about 4x this; past
     // ~0.2 s it stops reading as a flinch and starts reading as a wobble.
     float hitReactHalflife = 0.110f;
+    // ---- ...AND THE SAME BLOW ON A BODY JOLT OWNS (2026-09-20) --------------
+    //
+    // THE OTHER HALF OF THE SAME REACTION, not a second feature. Everything
+    // above is a POSE SPRING, and a pose spring is a write nobody reads once
+    // the ragdoll owns the rig — which is true of a LIMP LIVING LIMB and of a
+    // CORPSE alike (docs/PLAN_struck_matter.md: the axis is how a body is
+    // DRIVEN, not whether it is alive). Mob::HitReact has said so since it was
+    // written — "a corpse being hit already has an answer for where it goes,
+    // and it is a better one than this: the impulse goes into Jolt" — and this
+    // is that impulse.
+    //
+    // kg*m/s at hitReactRefDamage, scaled by the SAME hp x power ramp the
+    // flinch uses, so one reference blow moves both halves and a mace shoves
+    // harder than a fist because it is harder. Applied at the contact POINT,
+    // so a blow off the centre of mass turns a body over instead of sliding
+    // it. A human limb is ~3-8 kg, so 12 is roughly a 2-4 m/s kick.
+    float hitReactImpulse = 5.0f;
     // ---- combat cues --------------------------------------------------------
     // Volumes are the same 0..N trim every other cue group uses; radius is the
     // audible radius in METRES, matching Tuning::Audio.

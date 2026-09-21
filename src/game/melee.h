@@ -713,6 +713,15 @@ struct EdgeSweepResult {
   // ...that found flesh with a worn shell between it and the blade's travel,
   // and were redirected onto the shell ("armour defends from cuts").
   int probesCovered = 0;
+  // ---- WAS ANY OF IT DEAD FLESH? (2026-09-20) ------------------------------
+  //
+  // main.cpp picks the cue for a landed blow by DIFFERENCING the sever and
+  // voice queues across the call: severs grew -> a limb came off; voices grew
+  // -> a live creature was hurt; neither -> a chip. A corpse fills neither
+  // queue, so hacking a body apart on the ground got the cue a CRATE gets.
+  // This is the missing third answer, and it is a fact only the sweep has:
+  // the body it met said `DebrisSystem::BodyIsDeadFlesh`.
+  bool hitDeadFlesh = false;
   BlockEvent block{};
 };
 

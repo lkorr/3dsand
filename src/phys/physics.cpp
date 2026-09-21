@@ -1625,6 +1625,29 @@ uint32_t Physics::JointCount() const {
   return joints_ ? (uint32_t)joints_->joints.size() : 0u;
 }
 
+void Physics::JointsOn(uint64_t handle, std::vector<BodyJoint>& out) const {
+  out.clear();
+  if (!joints_ || handle == 0) return;
+  auto it = joints_->byBody.find(handle);
+  if (it == joints_->byBody.end()) return;
+  const float inv = 1.0f / kVoxelMeters;
+  for (uint64_t j : it->second) {
+    auto e = joints_->joints.find(j);
+    if (e == joints_->joints.end()) continue;
+    const bool isA = e->second.bodyA == handle;
+    // The anchor in the frame of the body being ASKED ABOUT: each entry keeps
+    // both, captured when the joint was built, which is what makes this exact
+    // rather than a re-fit against a pose that has since moved.
+    const JPH::Vec3 a =
+        isA ? e->second.anchorLocalA : e->second.anchorLocalB;
+    BodyJoint bj;
+    bj.joint = j;
+    bj.other = isA ? e->second.bodyB : e->second.bodyA;
+    bj.anchorLocalVox = Vec3{a.GetX() * inv, a.GetY() * inv, a.GetZ() * inv};
+    out.push_back(bj);
+  }
+}
+
 bool Physics::JointSwingAngle(uint64_t joint, float& outRadians) const {
   outRadians = 0;
   if (!system_ || !joints_) return false;
@@ -1674,6 +1697,69 @@ void Physics::SetBodyKinematic(uint64_t handle, bool kinematic) {
   bi.SetMotionType(id, kinematic ? JPH::EMotionType::Kinematic
                                  : JPH::EMotionType::Dynamic,
                    JPH::EActivation::Activate);
+}
+
+bool Physics::IsBodyDynamic(uint64_t handle) const {
+  if (!system_ || handle == 0) return false;
+  const JPH::BodyInterface& bi = system_->GetBodyInterface();
+  const JPH::BodyID id = ToBodyID(handle);
+  if (!bi.IsAdded(id)) return false;
+  return bi.GetMotionType(id) == JPH::EMotionType::Dynamic;
+}
+
+bool Physics::ApplyImpulseAt(uint64_t handle, Vec3 dir, float impulse,
+                             Vec3 atVoxel) {
+  if (!system_ || handle == 0 || impulse <= 0.0f) return false;
+  const float dl = dir.len();
+  if (dl < 1e-6f) return false;
+  JPH::BodyInterface& bi = system_->GetBodyInterface();
+  const JPH::BodyID id = ToBodyID(handle);
+  if (!bi.IsAdded(id)) return false;
+  // A KINEMATIC BODY IS POSED BY SOMEBODY ELSE. See the header: refusing here
+  // is what lets one call site serve a rig-posed limb and a corpse without
+  // deciding which it has.
+  if (bi.GetMotionType(id) != JPH::EMotionType::Dynamic) return false;
+  float mag = impulse;
+  const float mass = BodyMass(handle);
+  const float maxSpeed = std::max(CurrentTuning().physics.explosionMaxSpeed, 0.0f);
+  if (mass > 0.0f && mag > mass * maxSpeed) mag = mass * maxSpeed;
+  const JPH::Vec3 d(dir.x / dl, dir.y / dl, dir.z / dl);
+  // ---- A BLOW MAY TURN A BODY OVER; IT MAY NOT MAKE IT A TOP ---------------
+  //
+  // THE LEVER IS CLAMPED, not the torque. Jolt turns an off-centre impulse
+  // into spin through `r x J` with the body's own inverse inertia, and a limb
+  // is small: measured on a human thigh, a mace's impulse at the contact point
+  // put the body at 47.12 rad/s — which is Jolt's OWN angular clamp, i.e. the
+  // solver refusing the number rather than simulating it. A body that sits at
+  // that clamp is the armoured-corpse runaway `corpse-armor` was written to
+  // catch, and arriving there by hand would be no better.
+  //
+  // So the impulse keeps its direction and its magnitude — the SHOVE is
+  // untouched, and that is the part the player reads as force — and only the
+  // arm it acts on is shortened, toward the centre of mass. The blow still
+  // spins the body the way the blade went, just not like a rotor.
+  // THE LEVER IS SHORTENED so that spin still SCALES with the blow instead of
+  // saturating on every one of them...
+  constexpr float kMaxLeverM = 0.12f;   // ~1.2 world voxels at 0.1 m/voxel
+  const JPH::RVec3 com = bi.GetCenterOfMassPosition(id);
+  JPH::Vec3 r(JPH::RVec3(VoxToM(atVoxel.x), VoxToM(atVoxel.y),
+                         VoxToM(atVoxel.z)) -
+              com);
+  const float rl = r.Length();
+  if (rl > kMaxLeverM) r = r * (kMaxLeverM / rl);
+  bi.ActivateBody(id);
+  bi.AddImpulse(id, d * mag, com + JPH::RVec3(r));
+  // ...and the RESULT is capped, which is the actual guarantee. A limb's
+  // inverse inertia is large (2.4 kg over a third of a metre), so even a short
+  // lever can land past Jolt's own 47.12 rad/s clamp — and a body sitting at
+  // that clamp is the armoured-corpse runaway, arrived at politely. Capping
+  // the outcome needs no inertia math and cannot be defeated by a heavier
+  // weapon or a second blow in the same tick.
+  constexpr float kMaxSpinRad = 12.0f;   // ~2 turns/s
+  const JPH::Vec3 w = bi.GetAngularVelocity(id);
+  const float wl = w.Length();
+  if (wl > kMaxSpinRad) bi.SetAngularVelocity(id, w * (kMaxSpinRad / wl));
+  return true;
 }
 
 void Physics::MoveKinematicBody(uint64_t handle, Vec3 posVoxel,

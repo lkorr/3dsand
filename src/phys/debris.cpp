@@ -428,10 +428,15 @@ void DebrisSystem::OnMaterialsReloaded(const std::vector<MaterialDef>& mats,
   matInboundTarget_.clear();
   reactions_ = reactions;
   uint32_t selfIdx = 0;
+  matNames_.clear();
   for (const auto& m : mats) {
     classOf_.push_back(m.gpu.klass);
     densityOf_.push_back((float)m.gpu.density);
     matGpu_.push_back(m.gpu);
+    // Name -> id, for the one thing on this side that is authored BY NAME: the
+    // bruise coat (gore.bruiseMat). MobSystem has its own lookup for the same
+    // string; this is the loose-matter half of it.
+    matNames_.push_back(m.name);
     matTints_.push_back(m.tints);
     // which rule shapes this material owns (drives the burn-pass gates).
     //
@@ -613,6 +618,7 @@ void DebrisSystem::Reset() {
     if (t.handle) phys_->RemoveBody(t.handle);
   terrain_.clear();
   events_.clear();
+  gore_.clear();
   pendingSupport_.clear();
   supportPending_.clear();
   supportCooldown_.clear();
@@ -2141,6 +2147,11 @@ void DebrisSystem::PreTick(uint32_t tick, World& world, std::vector<CellOp>& cel
       it = it->second.tick + 600 < tick ? pendingVacate_.erase(it) : std::next(it);
   }
   { PhaseTimer pt(prof_, Phase::Burn); BurnBodies(tick, world, cellOps, spawns); }
+  // ...and the third rung of a beating, on the same clock as the burn: pulped
+  // tissue crumbling out of a body somebody caved in (PulpTick). Charged to
+  // the burn phase because it is the same shape of work on the same bodies,
+  // and because a body nothing has beaten pays one bool for it.
+  { PhaseTimer pt(prof_, Phase::Burn); PulpTick(tick, world, spawns); }
   { PhaseTimer pt(prof_, Phase::Bleed); BleedBodies(tick, world, spawns); }
   // Before the settle test, not after: buoyancy is what decides whether a body
   // is still moving this tick, and SettleBodies counts inactive ticks.
@@ -3562,6 +3573,7 @@ void DebrisSystem::ShatterBody(Body& b, World& world, std::vector<Body>& fragmen
       nb.physScale = b.physScale;  // MUST precede the pitch below
       nb.bleedMat = b.bleedMat;
       nb.dead = b.dead;  // half a corpse is still a corpse
+      nb.defIndex = b.defIndex;   // ...and still that creature's flesh
       // The fragment's skin rebases by the SAME corner, expressed in skin
       // units. Both lattices must land on one origin or the art slides off the
       // collider — the same agreement ReskinMicro maintains after a carve.
@@ -3786,7 +3798,8 @@ void DebrisSystem::AdoptBody(uint64_t handle, std::vector<DebrisVoxel> voxels,
                              const BodyTransform& xf, MicroBodyRef micro,
                              uint32_t physScale,
                              std::vector<PrefabVoxel> skinVoxels,
-                             uint32_t bleedMat, BodyWound wound, bool dead) {
+                             uint32_t bleedMat, BodyWound wound, bool dead,
+                             int defIndex) {
   if (handle == 0 || voxels.empty()) return;
   Body body;
   body.handle = handle;
@@ -3826,6 +3839,7 @@ void DebrisSystem::AdoptBody(uint64_t handle, std::vector<DebrisVoxel> voxels,
   body.serial = nextSerial_++;
   body.bleedMat = bleedMat;
   body.dead = dead;
+  body.defIndex = defIndex;
   RecountBurn(body);
   bodies_.push_back(std::move(body));
   instancesDirty_ = true;
@@ -4141,7 +4155,8 @@ bool DebrisSystem::DamageBody(size_t bi, World& world,
                               std::vector<ParticleSpawn>& spawns,
                               std::vector<Body>& fragments,
                               uint32_t& newBodyBudget, bool eject,
-                              const CarveFactory& carveAt) {
+                              const CarveFactory& carveAt, DamageCause cause,
+                              float severity, const SpallParams* spall) {
   Body& b = bodies_[bi];
   phys_->GetTransform(b.handle, b.xf);
 
@@ -4150,14 +4165,117 @@ bool DebrisSystem::DamageBody(size_t bi, World& world,
   // separate lattice. Both describe the SAME world-space volume.
   const auto keep = carveAt((float)std::max(1u, b.physScale));
 
-  std::vector<DebrisVoxel> removed;
-  for (const DebrisVoxel& v : b.voxels)
-    if (!keep((float)v.x, (float)v.y, (float)v.z)) removed.push_back(v);
-  if (removed.empty()) return true;  // nothing in range
+  // ---- THE SKIN DECIDES WHETHER ANYTHING HAPPENED (2026-09-20) -------------
+  //
+  // A SWORD DID NOTHING TO A CORPSE, and this line is why: the whole function
+  // used to test the COLLIDER predicate first and `return true` on an empty
+  // set, so the carve never reached the skin. A corpse's collider is a
+  // majority downsample of the art (DeriveColliderFromSkin) — a human dies at
+  // skinScale 8 over physScale 4, so one collider cell is 8 skin cells and
+  // flips only when half of them go — and a blade's kerf is a SLIVER:
+  // `gore.cutWidth` x the blade's half-thickness is about a tenth of a world
+  // voxel across (phys/kerf.h; tuning.json cutDepth 0.08 + 0.15 x power).
+  // Nothing that thin removes a collider cell on the first blow, so a sword
+  // swung at a body on the ground took nothing off it, left no blood and no
+  // gore, and the corpse only shoved — physics with no damage behind it, which
+  // is the owner report of 2026-09-20.
+  //
+  // `Mob::CarveLimb` has said the same thing since the fine skin existed
+  // ("deciding 'nothing in range' on the collider would silently make fine
+  // tools no-ops on exactly the detailed art the skin exists to serve"), and
+  // the corpse path is the same carve on the same lattice one function later.
+  // So the order is the live path's order now: carve the AUTHORITATIVE lattice
+  // first, derive the collider from what survived, and let the collider's loss
+  // be a DIFFERENCE rather than a prediction — which is also the honest set to
+  // bill the gore and the physics rebuild from.
+  std::vector<DebrisVoxel> removed;   // what the COLLIDER lost
+  Vec3 skinLostSum{};                 // centroid accumulator, skin units
+  size_t skinLostN = 0;
+  if (fine) {
+    // The SKIN is authoritative: carve it at its own resolution, then re-derive
+    // the collider from what survived. Carving the two independently would let
+    // them disagree about the shape; deriving one from the other cannot.
+    const auto keepSkin = carveAt((float)std::max(1u, b.micro.skinScale));
+    std::vector<DebrisVoxel> colliderBefore;
+    if (!b.voxels.empty()) colliderBefore = b.voxels;
+    b.skinVoxels.erase(
+        std::remove_if(b.skinVoxels.begin(), b.skinVoxels.end(),
+                       [&](const PrefabVoxel& v) {
+                         if (keepSkin((float)v.x, (float)v.y, (float)v.z))
+                           return false;
+                         skinLostSum += Vec3{(float)v.x + 0.5f,
+                                             (float)v.y + 0.5f,
+                                             (float)v.z + 0.5f};
+                         skinLostN++;
+                         return true;
+                       }),
+        b.skinVoxels.end());
+    if (skinLostN == 0 && !(spall && spall->rounds > 0)) {
+      return true;  // nothing in range, on either lattice
+    }
+    // ---- THE HOLE GROWS INTO ITS OWN RIM, ON THE LATTICE THAT MATTERS -----
+    //
+    // Between the predicate and the derive, exactly where Mob::CarveLimb runs
+    // it and for the reason stated there: the spall must run on the
+    // AUTHORITATIVE lattice so the collider re-derive picks the result up for
+    // free. One implementation (phys/lattice.h), both populations.
+    if (spall != nullptr && spall->rounds > 0) {
+      SpallParams sp = *spall;
+      const float sk = (float)std::max(1u, b.micro.skinScale);
+      sp.centre = spall->centre * sk;
+      sp.radius = spall->radius * sk;
+      SpallGrow(b.skinVoxels, sp, [&](const PrefabVoxel& v) {
+        skinLostSum += Vec3{(float)v.x + 0.5f, (float)v.y + 0.5f,
+                            (float)v.z + 0.5f};
+        skinLostN++;
+      });
+      if (skinLostN == 0) return true;
+    }
+    DeriveColliderFromSkin(b);
+    // What the collider actually lost, by differencing the two lists. The
+    // predicate-built set this replaces was only ever an approximation of it,
+    // and on a kerf it was empty while whole skin voxels left.
+    std::unordered_set<uint64_t> after;
+    after.reserve(b.voxels.size() * 2);
+    auto ck = [](const DebrisVoxel& v) -> uint64_t {
+      return ((uint64_t)(uint32_t)(v.x + 32768) << 42) |
+             ((uint64_t)(uint32_t)(v.y + 32768) << 21) |
+             (uint64_t)(uint32_t)(v.z + 32768);
+    };
+    for (const DebrisVoxel& v : b.voxels) after.insert(ck(v));
+    for (const DebrisVoxel& v : colliderBefore)
+      if (!after.count(ck(v))) removed.push_back(v);
+  } else {
+    for (const DebrisVoxel& v : b.voxels)
+      if (!keep((float)v.x, (float)v.y, (float)v.z)) removed.push_back(v);
+    if (removed.empty() && !(spall && spall->rounds > 0)) {
+      return true;  // nothing in range
+    }
+    b.voxels.erase(
+        std::remove_if(b.voxels.begin(), b.voxels.end(),
+                       [&](const DebrisVoxel& v) {
+                         return !keep((float)v.x, (float)v.y, (float)v.z);
+                       }),
+        b.voxels.end());
+    // The collider IS the authoritative lattice here, so the spalled cells are
+    // the gore: recorded whole, because a gobbet needs the material it was
+    // made of (same as the limb path).
+    if (spall != nullptr && spall->rounds > 0) {
+      SpallParams sp = *spall;
+      const float ps = (float)std::max(1u, b.physScale);
+      sp.centre = spall->centre * ps;
+      sp.radius = spall->radius * ps;
+      SpallGrow(b.voxels, sp,
+                [&](const DebrisVoxel& v) { removed.push_back(v); });
+      if (removed.empty()) return true;
+    }
+  }
+  instancesDirty_ = true;
 
   Vec3 lin{}, ang{};
   phys_->GetBodyVelocities(b.handle, lin, ang);
-  if (eject) VoxelsToParticles(b, removed, lin, ang, world, spawns);
+  if (eject && !removed.empty())
+    VoxelsToParticles(b, removed, lin, ang, world, spawns);
 
   // CORPSE BLEEDING is a WOUND, not a puff: the cut is remembered on every
   // piece it leaves (the surviving body and each fragment ShatterBody splits
@@ -4165,39 +4283,71 @@ bool DebrisSystem::DamageBody(size_t bi, World& world,
   // bottom of this function, after the rebase, because a wound is a body-
   // local point and the frame is about to move. The world position of the
   // cut and how much came off are what survive to that point.
+  //
+  // MEASURED ON THE LATTICE THAT WAS CARVED, which is the skin whenever there
+  // is one: a kerf that takes 40 skin voxels and no collider cell is still a
+  // wound, and billing it from the collider would say a cut bled nothing at
+  // all until the blow that happened to flip a block.
   Vec3 woundW{};
   float carvedWorldVox = 0.0f;
-  if (b.bleedMat != 0) {
-    const float ps = (float)std::max(1u, b.physScale);
-    Vec3 centroid{};
+  const float lostScale =
+      (float)std::max(1u, fine ? b.micro.skinScale : b.physScale);
+  Vec3 lostCentroid{};   // in the carved lattice's own units
+  if (fine) {
+    lostCentroid = skinLostSum * (1.0f / (float)skinLostN);
+  } else if (!removed.empty()) {
     for (const DebrisVoxel& v : removed)
-      centroid += Vec3{(float)v.x + 0.5f, (float)v.y + 0.5f, (float)v.z + 0.5f};
-    centroid = centroid * (1.0f / (float)removed.size());
-    woundW = b.xf.pos + QuatRot(b.xf.quat, centroid * (1.0f / ps));
-    carvedWorldVox = (float)removed.size() / (ps * ps * ps);
+      lostCentroid +=
+          Vec3{(float)v.x + 0.5f, (float)v.y + 0.5f, (float)v.z + 0.5f};
+    lostCentroid = lostCentroid * (1.0f / (float)removed.size());
+  }
+  const size_t lostN = fine ? skinLostN : removed.size();
+  if (b.bleedMat != 0 && lostN > 0) {
+    woundW = b.xf.pos + QuatRot(b.xf.quat, lostCentroid * (1.0f / lostScale));
+    carvedWorldVox =
+        (float)lostN / (lostScale * lostScale * lostScale);
   }
 
-  if (fine) {
-    // The SKIN is authoritative: carve it at its own resolution, then re-derive
-    // the collider from what survived. Carving the two independently would let
-    // them disagree about the shape; deriving one from the other cannot.
-    const auto keepSkin = carveAt((float)std::max(1u, b.micro.skinScale));
-    b.skinVoxels.erase(
-        std::remove_if(b.skinVoxels.begin(), b.skinVoxels.end(),
-                       [&](const PrefabVoxel& v) {
-                         return !keepSkin((float)v.x, (float)v.y, (float)v.z);
-                       }),
-        b.skinVoxels.end());
-    DeriveColliderFromSkin(b);
-  } else {
-    b.voxels.erase(
-        std::remove_if(b.voxels.begin(), b.voxels.end(),
-                       [&](const DebrisVoxel& v) {
-                         return !keep((float)v.x, (float)v.y, (float)v.z);
-                       }),
-        b.voxels.end());
+  // THE SMEAR on a corpse's cut (bodystain.h SoakCut): the same rule the live
+  // limb's kerf and crater get, so a limb cut off and cut again is bloodied
+  // both times. Applied to the authoritative lattice AFTER the carve (so the
+  // hole's walls count as exposed) and BEFORE the shatter (so every fragment
+  // carries its share); the re-skin below writes it into the brick. Until
+  // 2026-09-13 a corpse cut showed clean flesh and clean bone.
+  if (b.bleedMat != 0 && lostN > 0 && b.bleedMat < matGpu_.size()) {
+    const uint32_t stainType = matGpu_[b.bleedMat].stainPack & kStainPackTypeMask;
+    const auto& gt = CurrentTuning().gore;
+    if (stainType != 0 && gt.stainCutRadius > 0.0f) {
+      // Tissue = what crumbles to this body's blood (MobDef::tissue's rule);
+      // everything else (bone) takes the floor and nothing more.
+      std::vector<uint8_t> tissue(rubbleOf_.size(), 0);
+      bool any = false;
+      for (size_t m = 0; m < rubbleOf_.size(); m++)
+        if (rubbleOf_[m] == b.bleedMat || m == b.bleedMat) { tissue[m] = 1; any = true; }
+      if (!any) tissue.clear();
+      const float sk = (float)std::max(1u, fine ? b.micro.skinScale : b.physScale);
+      // The centroid is already on the lattice this soaks (the skin when there
+      // is one), so it needs no conversion.
+      const Vec3 centroid = lostCentroid;
+      CutSoak soak;
+      // The coat names the SUBSTANCE, not its palette slot: a corpse's cut is
+      // smeared with whatever that body bled. `stainType` above is still what
+      // decides the cut smears at all -- a bleed material with no stain block
+      // has nothing to draw.
+      soak.mat = b.bleedMat;
+      soak.radius = gt.stainCutRadius * sk;
+      soak.amountExposed = gt.stainCutAmount;
+      soak.amountBuried = gt.stainCutBuried;
+      soak.buriedChance = gt.stainCutBuriedChance;
+      soak.boneMin = gt.stainBoneMin;
+      soak.tissue = &tissue;
+      StainLattice L;
+      if (fine) L.skin = &b.skinVoxels; else L.coll = &b.voxels;
+      SoakCut(L, centroid, soak, (uint32_t)b.serial * 2654435761u ^ 0xC0125Eu,
+              nullptr, -1);
+      if (fine) DeriveColliderFromSkin(b);  // the coarse lattice carries it too
+    }
   }
-  instancesDirty_ = true;
 
   // THE SMEAR on a corpse's cut (bodystain.h SoakCut): the same rule the live
   // limb's kerf and crater get, so a limb cut off and cut again is bloodied
@@ -4258,6 +4408,7 @@ bool DebrisSystem::DamageBody(size_t bi, World& world,
   // burn-fragment floor — a body blown apart by an explosion is a one-off
   // event, not the every-few-ticks re-fragmentation that forced burn's bar up.
   const size_t fragmentsBefore = fragments.size();
+  const size_t collBefore = b.voxels.size();
   // fineConnectivity: a CARVE is the one cause whose cut can be narrower than
   // a collider block, so it is the one that may escalate to the skin lattice.
   ShatterBody(b, world, fragments, spawns, kMinBodyVoxels, newBodyBudget,
@@ -4272,11 +4423,23 @@ bool DebrisSystem::DamageBody(size_t bi, World& world,
   // its voxels actually moved. ReskinMicro divides by the scale and takes the
   // corner MicroBodyEdit really chose, so art, collider and voxels stay in one
   // frame. Exactly one of these two runs for any body.
+  const Vec3 posBeforeRebase = b.xf.pos;
   if (b.micro.Valid())
     ReskinMicro(b);
   else
     RebaseVoxels(b.voxels, b.xf);
-  RebuildCollider(b);
+  // ...AND ONLY WHEN THERE IS A NEW COLLIDER TO BUILD. A kerf that reached the
+  // skin and not the derived collider leaves the physics shape bit-identical,
+  // and RebuildCollider is not free: it is a fresh Jolt compound plus a
+  // ReplaceBody that re-ties every joint on a corpse. Blades now land here on
+  // every swing tick (that is the fix above), so rebuilding unconditionally
+  // would pay a rig-wide body swap per tick for a shape nobody changed. A
+  // derived collider can only LOSE cells to a carve, so a count that did not
+  // move means a lattice that did not move; the rebase is asked separately
+  // because it moves the frame without changing the count.
+  if (!removed.empty() || b.voxels.size() != collBefore ||
+      (b.xf.pos - posBeforeRebase).len() > 1e-6f)
+    RebuildCollider(b);
   float r = 0;
   for (const DebrisVoxel& v : b.voxels)
     r = std::max(r, Vec3{(float)v.x, (float)v.y, (float)v.z}.len());
@@ -4347,7 +4510,183 @@ bool DebrisSystem::DamageBody(size_t bi, World& world,
       }
     }
   }
+
+  // ---- AND A CORPSE COMES APART WHERE IT WAS CUT (2026-09-20) -------------
+  //
+  // The connectivity split above can only part ONE body; a corpse is a dozen
+  // of them, held together by the joints Mob::Die deliberately leaves on. So
+  // the same question the living sever by is asked of each of those joints:
+  // is there any flesh left at the anchor? A neck cut through now takes the
+  // head off, which is what "you can sever the entire bottom half of a head
+  // but the top half stays" was only half of.
+  const uint32_t partedHere = PartJointsAt(b, cause, severity);
+
+  // ---- WHAT THE ROOM HEARD (2026-09-20) -----------------------------------
+  //
+  // A corpse used to be silent under a blade. main.cpp infers what a blow hit
+  // from the sever and voice queues; dead flesh fills neither, so hacking a
+  // body apart on the ground made the cue a CRATE gets. It is the one thing it
+  // is not, and the fix is not a special case in the audio code: dead flesh
+  // reports what happened to it the same way living flesh does, and the frame
+  // drains both lists side by side.
+  //
+  // Only for a body that was ALIVE (Body::dead), only for a cause that is a
+  // blow, and only when something actually came off: a fire eating a corpse is
+  // its own sound elsewhere, and a probe that removed nothing is not an event.
+  if (b.dead && lostN > 0 && cause != DamageCause::Other &&
+      cause != DamageCause::Beam) {
+    GoreEvent ge;
+    ge.posVoxel = b.bleedMat != 0 ? woundW
+                                  : b.xf.pos + QuatRot(b.xf.quat, lostCentroid *
+                                                                      (1.0f / lostScale));
+    ge.defIndex = b.defIndex;
+    ge.severity = std::clamp(severity, 0.0f, 1.0f);
+    // A PIECE CAME OFF: the body split (a fragment), or a joint let go.
+    ge.severed = fragments.size() > fragmentsBefore || partedHere > 0;
+    ge.byBlade = cause == DamageCause::Blade;
+    gore_.push_back(ge);
+  }
   return true;
+}
+
+// ---- THE JOINT RULE, AND IT IS THE LIVING ONE ------------------------------
+//
+// `Mob::CutLimb` severs when "the flesh AT the joint is gone" — a count of
+// voxels in a sphere about the anchor, taken against what was there at spawn.
+// A corpse has no spawn count to measure against and no rig to ask, but it has
+// the same physical fact available in a simpler form: the anchor is a place on
+// this body's own lattice, and either there is matter within a hold radius of
+// it or there is not. Nothing to tune per creature, nothing authored, and it
+// cannot disagree with the geometry because it IS the geometry.
+//
+// `gore.corpseJointHold` is that radius in world voxels. The joint is asked
+// from THIS body's side only: the other end asks for itself when it is carved,
+// which is what makes a neck cut from either direction part the same way.
+uint32_t DebrisSystem::PartJointsAt(Body& b, DamageCause cause,
+                                    float severity) {
+  if (!phys_ || b.handle == 0) return 0;
+  const auto& gtune = CurrentTuning().gore;
+  const float hold = std::max(gtune.corpseJointHold, 0.0f);
+  const float cutFrac = std::clamp(gtune.corpseJointCut, 0.0f, 1.0f);
+  if (hold <= 0.0f) return 0;
+  if (phys_->JointCount(b.handle) == 0) return 0;
+  std::vector<Physics::BodyJoint> js;
+  phys_->JointsOn(b.handle, js);
+  if (js.empty()) return 0;
+  const bool fine = b.HasFineSkin();
+  const float scale = (float)std::max(1u, fine ? b.micro.skinScale : b.physScale);
+  const float r = hold * scale;
+  const float r2 = r * r;
+  uint32_t parted = 0;
+  for (const Physics::BodyJoint& j : js) {
+    // The anchor on the lattice this body is actually made of.
+    const Vec3 c = j.anchorLocalVox * scale;
+    uint32_t now = 0;
+    if (fine) {
+      for (const PrefabVoxel& v : b.skinVoxels) {
+        const Vec3 d{(float)v.x + 0.5f - c.x, (float)v.y + 0.5f - c.y,
+                     (float)v.z + 0.5f - c.z};
+        if (d.dot(d) < r2) now++;
+      }
+    } else {
+      for (const DebrisVoxel& v : b.voxels) {
+        const Vec3 d{(float)v.x + 0.5f - c.x, (float)v.y + 0.5f - c.y,
+                     (float)v.z + 0.5f - c.z};
+        if (d.dot(d) < r2) now++;
+      }
+    }
+    // THE DENOMINATOR, taken the first time anything asks about this joint.
+    uint32_t base = 0;
+    bool known = false;
+    for (auto& e : b.jointHold)
+      if (e.first == j.joint) { base = e.second; known = true; break; }
+    if (!known) {
+      b.jointHold.emplace_back(j.joint, now);
+      base = now;
+    }
+    // A FRACTION, NOT A ZERO. One straggler inside the radius kept a head on
+    // forever: measured 476 -> 4 voxels over 60 chops with the joint intact.
+    const uint32_t floorCount =
+        base == 0 ? 0u : (uint32_t)std::lround((float)base * cutFrac);
+    if (now > floorCount) continue;
+    // NOTHING LEFT TO HOLD. The joint goes, and both ends bleed from where it
+    // was: an amputation's worth on each, exactly as the split above pays a
+    // fragment and its parent (Mob::Sever's rule, one population later).
+    phys_->DestroyJoint(j.joint);
+    parted++;
+    const Vec3 anchorW = b.xf.pos + QuatRot(b.xf.quat, j.anchorLocalVox);
+    const auto& gore = CurrentTuning().gore;
+    if (b.bleedMat != 0)
+      ArmWound(b, anchorW, Vec3{0, 1, 0}, gore.severStumpBudget,
+               gore.severDecayTicks);
+    for (Body& o : bodies_)
+      if (o.handle == j.other && o.bleedMat != 0) {
+        phys_->GetTransform(o.handle, o.xf);
+        ArmWound(o, anchorW, Vec3{0, 1, 0}, gore.severStumpBudget,
+                 gore.severDecayTicks);
+        break;
+      }
+    // A piece that let go of its host is nobody's follower any more: a strap
+    // is a garment riding a limb, and the limb it was riding has left.
+    for (Body& o : bodies_)
+      if (o.wornHost == b.handle && o.handle == j.other) o.wornHost = 0;
+  }
+  if (parted > 0) instancesDirty_ = true;
+  return parted;
+}
+
+Vec3 DebrisSystem::NearestVoxelWorld(uint64_t handle, Vec3 worldPoint) const {
+  for (const Body& b : bodies_) {
+    if (b.handle != handle) continue;
+    const bool fine = b.HasFineSkin();
+    const float sc = (float)std::max(1u, fine ? b.micro.skinScale : b.physScale);
+    const float qi[4] = {-b.xf.quat[0], -b.xf.quat[1], -b.xf.quat[2],
+                         b.xf.quat[3]};
+    const Vec3 pl = QuatRot(qi, worldPoint - b.xf.pos) * sc;
+    float best = 1e30f;
+    Vec3 bestC = pl;
+    auto probe = [&](float x, float y, float z) {
+      const Vec3 cc{x + 0.5f, y + 0.5f, z + 0.5f};
+      const Vec3 d = cc - pl;
+      const float d2 = d.dot(d);
+      if (d2 < best) { best = d2; bestC = cc; }
+    };
+    if (fine)
+      for (const PrefabVoxel& v : b.skinVoxels)
+        probe((float)v.x, (float)v.y, (float)v.z);
+    else
+      for (const DebrisVoxel& v : b.voxels)
+        probe((float)v.x, (float)v.y, (float)v.z);
+    if (best > 1e29f) return worldPoint;
+    return b.xf.pos + QuatRot(b.xf.quat, bestC * (1.0f / sc));
+  }
+  return worldPoint;
+}
+
+uint32_t DebrisSystem::VoxelsNearWorld(uint64_t handle, Vec3 worldPoint,
+                                      float radiusVox) const {
+  for (const Body& b : bodies_) {
+    if (b.handle != handle) continue;
+    const bool fine = b.HasFineSkin();
+    const float sc = (float)std::max(1u, fine ? b.micro.skinScale : b.physScale);
+    const float qi[4] = {-b.xf.quat[0], -b.xf.quat[1], -b.xf.quat[2],
+                         b.xf.quat[3]};
+    const Vec3 pl = QuatRot(qi, worldPoint - b.xf.pos) * sc;
+    const float r = radiusVox * sc, r2 = r * r;
+    uint32_t n = 0;
+    auto probe = [&](float x, float y, float z) {
+      const Vec3 d{x + 0.5f - pl.x, y + 0.5f - pl.y, z + 0.5f - pl.z};
+      if (d.dot(d) < r2) n++;
+    };
+    if (fine)
+      for (const PrefabVoxel& v : b.skinVoxels)
+        probe((float)v.x, (float)v.y, (float)v.z);
+    else
+      for (const DebrisVoxel& v : b.voxels)
+        probe((float)v.x, (float)v.y, (float)v.z);
+    return n;
+  }
+  return 0;
 }
 
 Vec3 DebrisSystem::BodyWoundWorld(uint32_t i) const {
@@ -4528,7 +4867,8 @@ void DebrisSystem::DamageBodiesRadial(Vec3 centerVoxel, float radiusVoxels,
       };
     };
 
-    bool alive = DamageBody(bi, world, spawns, fragments, budget, true, carve);
+    bool alive = DamageBody(bi, world, spawns, fragments, budget, true, carve,
+                            DamageCause::Blast, 1.0f);
     if (alive) bi++;
   }
   for (Body& f : fragments) {
@@ -4569,7 +4909,8 @@ bool DebrisSystem::MeltBodyAt(uint64_t handle, Vec3 pointVoxel,
   // spraying particles from each one would drain the spawn ring in a second.
   // The return says whether the body survived; either way the hit landed, and
   // fragments still have to be adopted below.
-  DamageBody(bi, world, spawns, fragments, budget, false, carve);
+  DamageBody(bi, world, spawns, fragments, budget, false, carve,
+             DamageCause::Beam, 0.5f);
   for (Body& f : fragments) {
     bodies_.push_back(std::move(f));
     instancesDirty_ = true;
@@ -4619,6 +4960,29 @@ bool DebrisSystem::CutBody(uint64_t handle, const KerfCut& cut, World& world,
   KerfSlot slot = frame;
   slot.c = cLocal + frame.w * entry;
 
+  // ---- AND THE HOLE GROWS INTO ITS OWN RIM (2026-09-20) -------------------
+  //
+  // THE SAME SPALL THE LIVING GET, from the same two knobs, built by the same
+  // four lines Mob::CutLimb builds it from (phys/lattice.h SpallGrow). Without
+  // it a kerf on a corpse SATURATES: the next identical blow tests the same
+  // slot, finds the space already gone and takes almost nothing, so a wound
+  // stipples instead of deepening and nothing ever comes apart. That is what
+  // made "sustained hits dismember" true of a creature and false of its own
+  // corpse one function call later.
+  //
+  // Centred on the cut and sized to the SLOT, not to a blast radius: the spall
+  // pass is a sphere test, and one sized to the depth is the volume the edge
+  // actually disturbed.
+  const auto& gt = CurrentTuning().gore;
+  SpallParams spall;
+  if (gt.cutSpallRounds > 0 && gt.cutSpallStrength > 0.0f && cut.depth > 0.0f) {
+    spall.centre = slot.c + slot.w * (cut.depth * 0.5f);   // scaled below
+    spall.radius = std::max(cut.depth, slot.halfW * 2.0f);
+    spall.strength = std::clamp(gt.cutSpallStrength, 0.0f, 1.0f);
+    spall.rounds = gt.cutSpallRounds;
+    spall.seed = seed;
+  }
+
   std::vector<Body> fragments;
   uint32_t budget = kMaxNewBodiesPerTick;
   // eject=true, unlike the beam: a blade takes matter OFF and that matter is
@@ -4627,7 +4991,8 @@ bool DebrisSystem::CutBody(uint64_t handle, const KerfCut& cut, World& world,
              [slot](float lat) -> CarveKeep {
                const KerfKeep k = KerfKeepAt(slot, lat);
                return [k](float x, float y, float z) { return k(x, y, z); };
-             });
+             },
+             DamageCause::Blade, std::clamp(cut.power, 0.0f, 1.0f), &spall);
   for (Body& f : fragments) {
     bodies_.push_back(std::move(f));
     instancesDirty_ = true;
@@ -4635,9 +5000,201 @@ bool DebrisSystem::CutBody(uint64_t handle, const KerfCut& cut, World& world,
   return true;
 }
 
+float DebrisSystem::BruiseBody(uint64_t handle, Vec3 atVoxel,
+                               float radiusVoxels, uint32_t seed, float power,
+                               float hp, bool unarmed) {
+  if (!phys_ || radiusVoxels <= 0.0f) return 0.0f;
+  size_t bi = 0;
+  for (; bi < bodies_.size(); bi++)
+    if (bodies_[bi].handle == handle) break;
+  if (bi == bodies_.size()) return 0.0f;
+  Body& b = bodies_[bi];
+  if (b.bleedMat == 0) return 0.0f;   // matter that was never flesh
+  const auto& gt = CurrentTuning().gore;
+  uint32_t bruiseMat = 0;
+  for (size_t m = 0; m < matNames_.size(); m++)
+    if (matNames_[m] == gt.bruiseMat) { bruiseMat = (uint32_t)m; break; }
+  if (bruiseMat == 0) return 0.0f;
+  // The same unarmed overrides the living take (Mob::BluntHit): a negative
+  // override means "same as the base".
+  const float effStep = (unarmed && gt.unarmedBruiseStep >= 0.0f)
+                            ? gt.unarmedBruiseStep
+                            : gt.bruiseStep;
+  const float effBleedChance = (unarmed && gt.unarmedBleedChance >= 0.0f)
+                                   ? gt.unarmedBleedChance
+                                   : gt.bruiseBleedChance;
+  const uint32_t cap =
+      (uint32_t)std::lround(std::clamp(gt.bruiseMax, 0.0f, 15.0f));
+  if (cap == 0 || effStep <= 0.0f) return 0.0f;
+
+  phys_->GetTransform(b.handle, b.xf);
+  const float qi[4] = {-b.xf.quat[0], -b.xf.quat[1], -b.xf.quat[2],
+                       b.xf.quat[3]};
+  const bool fine = b.HasFineSkin();
+  const float scale =
+      (float)std::max(1u, fine ? b.micro.skinScale : b.physScale);
+  const Vec3 cLocal = QuatRot(qi, atVoxel - b.xf.pos) * scale;
+  const float pw = std::clamp(power, 0.0f, 1.0f);
+  float blowScale = 1.0f;
+  if (hp > 0.0f && gt.bruiseHpRef > 0.0f)
+    blowScale = std::clamp(std::sqrt(hp / gt.bruiseHpRef),
+                           std::clamp(gt.bruiseHpFloor, 0.0f, 1.0f), 1.0f);
+
+  // Tissue = what crumbles to this body own blood, the same census the cut
+  // soak takes: bone is not bruised, it is uncovered.
+  std::vector<uint8_t> tissue(rubbleOf_.size(), 0);
+  bool any = false;
+  for (size_t m = 0; m < rubbleOf_.size(); m++)
+    if (rubbleOf_[m] == b.bleedMat || m == b.bleedMat) {
+      tissue[m] = 1;
+      any = true;
+    }
+  if (!any) tissue.clear();
+
+  BruiseSoak bs;
+  bs.centre = cLocal;
+  bs.radius = radiusVoxels * scale;
+  bs.bruiseMat = bruiseMat;
+  bs.bloodMat = b.bleedMat;
+  bs.step = effStep;
+  bs.cap = cap;
+  bs.bleedFrom = (uint32_t)std::lround(
+      (float)cap * std::clamp(gt.bruiseBleedFrom, 0.0f, 1.0f));
+  bs.bleedChance = std::clamp(effBleedChance, 0.0f, 1.0f) * pw * blowScale;
+  bs.pulpAt = (uint32_t)std::lround(std::clamp(gt.pulpAmt, 1.0f, 15.0f));
+  bs.blowScale = blowScale;
+  bs.tissue = tissue.empty() ? nullptr : &tissue;
+  bs.seed = b.serial * 2654435761u + seed;
+  StainLattice L;
+  if (fine)
+    L.skin = &b.skinVoxels;
+  else
+    L.coll = &b.voxels;
+  BruiseTally tally;
+  SoakBruise(L, bs, &tally, nullptr, -1);
+  if (tally.marked) {
+    // The coarse lattice carries the mark too, and the brick is what the
+    // player sees: re-skin so the bruise actually appears.
+    if (fine) DeriveColliderFromSkin(b);
+    if (b.micro.Valid()) ReskinMicro(b);
+    instancesDirty_ = true;
+  }
+  // RUNG 3 ARMS THE CLOCK, it does not carve. Same as the living: what the
+  // blow found already pulped is what crumbles, and it crumbles over the next
+  // few seconds rather than in one swing (PulpTick).
+  if (tally.pulped > 0) b.pulp = true;
+  return tally.Ripeness();
+}
+
+// ---- THE THIRD RUNG, OVER TIME ---------------------------------------------
+//
+// Pulped tissue crumbles at gore.pulpRotRate, surface first so the hole opens
+// outward rather than hollowing the body invisibly. Expressed as an ordinary
+// carve so it inherits everything DamageBody does - the re-skin, the collider
+// rebuild, the connectivity split, the wound - and BATCHED for the same
+// reason: a carve per voxel per tick would rebuild a Jolt compound sixty times
+// a second.
+//
+// COST (rule 2): a body nothing has beaten pays one bool. A flagged body that
+// draws zero this tick pays one hash and a compare.
+void DebrisSystem::PulpTick(uint32_t tick, World& world,
+                            std::vector<ParticleSpawn>& spawns) {
+  const auto& gt = CurrentTuning().gore;
+  if (gt.pulpRotRate <= 0.0f) return;
+  const float perTick = 1.0f / (60.0f * 30.0f);   // per minute -> per tick
+  const uint32_t pulpAt =
+      (uint32_t)std::lround(std::clamp(gt.pulpAmt, 1.0f, 15.0f));
+  auto key = [](int x, int y, int z) -> uint64_t {
+    return ((uint64_t)(uint32_t)(x + 32768) << 42) |
+           ((uint64_t)(uint32_t)(y + 32768) << 21) |
+           (uint64_t)(uint32_t)(z + 32768);
+  };
+  for (size_t bi = 0; bi < bodies_.size(); bi++) {
+    Body& b = bodies_[bi];
+    if (!b.pulp || b.bleedMat == 0) continue;
+    const bool fine = b.HasFineSkin();
+    const float sc =
+        (float)std::max(1u, fine ? b.micro.skinScale : b.physScale);
+    const float lat = sc * sc * sc;
+    // How many cells this tick: the integer part plus a Bernoulli remainder,
+    // keyed on the body and the tick so a replay dissolves identically.
+    const float want = gt.pulpRotRate * lat * perTick;
+    uint32_t n = (uint32_t)want;
+    const uint32_t h = rng::Hash3(b.serial * 0x9E3779B9u, tick, 0xD1550u);
+    if ((float)(h & 0xFFFFu) / 65535.0f < want - (float)n) n++;
+    if (n == 0) continue;
+
+    // WHO IS PULPED, and prefer a surface cell so the cave-in opens outward.
+    StainLattice L;
+    if (fine)
+      L.skin = &b.skinVoxels;
+    else
+      L.coll = &b.voxels;
+    const size_t cells = L.Size();
+    std::unordered_set<uint64_t> live;
+    live.reserve(cells * 2);
+    for (size_t i = 0; i < cells; i++) {
+      const IVec3 v = L.At(i);
+      live.insert(key(v.x, v.y, v.z));
+    }
+    std::vector<IVec3> face, buried;
+    for (size_t i = 0; i < cells; i++) {
+      if (L.Mat(i) == 0) continue;
+      const uint16_t st = L.Stain(i);
+      if (BodyStainMat(st) != b.bleedMat || BodyStainAmt(st) < pulpAt) continue;
+      const IVec3 v = L.At(i);
+      static constexpr int kN[6][3] = {{1, 0, 0},  {-1, 0, 0}, {0, 1, 0},
+                                       {0, -1, 0}, {0, 0, 1},  {0, 0, -1}};
+      bool open = false;
+      for (const auto& d : kN)
+        if (!live.count(key(v.x + d[0], v.y + d[1], v.z + d[2]))) {
+          open = true;
+          break;
+        }
+      (open ? face : buried).push_back(v);
+    }
+    if (face.empty() && buried.empty()) {
+      b.pulp = false;   // nothing left to eat
+      continue;
+    }
+    std::vector<IVec3>& pool = face.empty() ? buried : face;
+    std::unordered_set<uint64_t> doomed;
+    for (uint32_t k = 0; k < n && !pool.empty(); k++) {
+      const uint32_t pick =
+          rng::Hash3(b.serial, tick * 2654435761u, k * 40503u) %
+          (uint32_t)pool.size();
+      doomed.insert(key(pool[pick].x, pool[pick].y, pool[pick].z));
+      pool[pick] = pool.back();
+      pool.pop_back();
+    }
+    if (doomed.empty()) continue;
+    // As a carve, at the AUTHORITATIVE lattice only: the collider is derived
+    // from what survives, which is the one direction data flows.
+    const float authScale = sc;
+    std::vector<Body> fragments;
+    uint32_t budget = kMaxNewBodiesPerTick;
+    const bool alive = DamageBody(
+        bi, world, spawns, fragments, budget, /*eject=*/true,
+        [doomed, key, authScale](float lattice) -> CarveKeep {
+          const bool auth = std::fabs(lattice - authScale) < 0.5f;
+          return [doomed, key, auth](float x, float y, float z) {
+            if (!auth) return true;
+            return doomed.count(key((int)x, (int)y, (int)z)) == 0;
+          };
+        },
+        DamageCause::Blunt, 0.2f);
+    for (Body& f : fragments) {
+      bodies_.push_back(std::move(f));
+      instancesDirty_ = true;
+    }
+    if (!alive) bi--;   // swap-and-pop moved another body into this slot
+  }
+}
+
 bool DebrisSystem::BluntBody(uint64_t handle, Vec3 atVoxel, float radiusVoxels,
                              uint32_t seed, World& world,
-                             std::vector<ParticleSpawn>& spawns) {
+                             std::vector<ParticleSpawn>& spawns,
+                             DamageCause cause) {
   if (!phys_ || radiusVoxels <= 0.0f) return false;
   size_t bi = 0;
   for (; bi < bodies_.size(); bi++)
@@ -4678,7 +5235,8 @@ bool DebrisSystem::BluntBody(uint64_t handle, Vec3 atVoxel, float radiusVoxels,
 
   std::vector<Body> fragments;
   uint32_t budget = kMaxNewBodiesPerTick;
-  DamageBody(bi, world, spawns, fragments, budget, /*eject=*/true, carve);
+  DamageBody(bi, world, spawns, fragments, budget, /*eject=*/true, carve,
+             cause, 1.0f);
   for (Body& f : fragments) {
     bodies_.push_back(std::move(f));
     instancesDirty_ = true;
@@ -4763,6 +5321,7 @@ bool DebrisSystem::SplitBody(uint64_t handle, Vec3 planePointVoxel,
     newBodies[h].serial = nextSerial_++;
     newBodies[h].bleedMat = b.bleedMat;
     newBodies[h].dead = b.dead;
+    newBodies[h].defIndex = b.defIndex;
     RecountBurn(newBodies[h]);
     phys_->SetBodyVelocities(newBodies[h].handle, lin, ang);
   }

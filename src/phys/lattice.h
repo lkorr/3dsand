@@ -2,9 +2,11 @@
 #include <algorithm>
 #include <cstdint>
 #include <unordered_map>
+#include <unordered_set>
 #include <vector>
 
 #include "phys/physics.h"
+#include "sim/rng.h"
 #include "sim/voxload.h"
 
 // The bridge between a body's two voxel lattices (DESIGN.md §9).
@@ -98,4 +100,104 @@ inline std::vector<DebrisVoxel> DownsampleSkin(
                    (uint16_t)(blk.pair[best] & 0xFFFFu), blk.stain});
   }
   return out;
+}
+
+// ---- THE HOLE GROWS INTO ITS OWN RIM ---------------------------------------
+//
+// SPALL, and it is the mechanism that makes "sustained hits dismember" work at
+// all. A carve predicate is a fixed shape: a second cut into an existing gash
+// tests the same volume, finds the space already gone, and takes nothing — so
+// a wound stipples fresh matter beside itself instead of DEEPENING, and
+// nothing ever comes apart. Spall fixes that by removing surviving cells that
+// already have enough missing face-neighbours, weighted toward the centre,
+// which turns a rim of isolated survivors into a torn edge.
+//
+// WHY IT LIVES HERE. It was written inside `Mob::CarveLimb` and was one of the
+// two behaviours that made a corpse a different substance from the creature it
+// was a second ago: the same blade, on the same lattice, one function call
+// later, left a groove that never widened (docs/PLAN_struck_matter.md). It is
+// pure lattice arithmetic — no rig, no joints, no hp — so it belongs next to
+// the other function that relates a body's two lattices, and both populations
+// call it.
+//
+// TEMPLATED ON THE CELL rather than on a lattice view, because the two callers
+// hold different vectors (`PrefabVoxel` skin, `DebrisVoxel` collider) and both
+// want the erase to happen in place. `onLost(cell)` is called with every cell
+// taken — the CELL, not its coordinates, because the collider path turns what
+// it lost into particles and a gobbet needs the material it was made of.
+// Returns the number removed.
+struct SpallParams {
+  Vec3 centre{};        // in LATTICE units, already scaled by the caller
+  float radius = 0.0f;  // ditto
+  float strength = 0.0f;  // 0..1, 0 disables
+  int rounds = 0;
+  uint32_t seed = 0;
+};
+
+template <class Vox, class OnLost>
+inline size_t SpallGrow(std::vector<Vox>& cells, const SpallParams& p,
+                        OnLost onLost) {
+  if (p.rounds <= 0 || p.strength <= 0.0f || p.radius <= 0.0f) return 0;
+  const float r2 = p.radius * p.radius;
+  // Packed key over the lattice. int16 skin coords, so 21 bits per axis with a
+  // bias is ample and collision-free (unlike hashing the position, which would
+  // make occupancy probabilistic — the one thing this pass must not be).
+  auto key = [](int x, int y, int z) -> uint64_t {
+    return ((uint64_t)(uint32_t)(x + 32768) << 42) |
+           ((uint64_t)(uint32_t)(y + 32768) << 21) |
+           (uint64_t)(uint32_t)(z + 32768);
+  };
+  std::unordered_set<uint64_t> live;
+  auto rebuild = [&] {
+    live.clear();
+    live.reserve(cells.size() * 2);
+    for (const Vox& v : cells) live.insert(key(v.x, v.y, v.z));
+  };
+  rebuild();
+  // A voxel on an intact surface already has one open face, so "eroded" starts
+  // at three: fewer and this eats the whole skin from the outside in rather
+  // than widening the crater.
+  constexpr int kMinOpenFaces = 3;
+  size_t total = 0;
+  for (int round = 0; round < p.rounds; round++) {
+    auto doomed = [&](int x, int y, int z) {
+      const Vec3 d{(float)x + 0.5f - p.centre.x, (float)y + 0.5f - p.centre.y,
+                   (float)z + 0.5f - p.centre.z};
+      const float d2 = d.dot(d);
+      if (d2 >= r2) return false;   // outside the blast
+      int open = 0;
+      static const int kN[6][3] = {{1, 0, 0},  {-1, 0, 0}, {0, 1, 0},
+                                   {0, -1, 0}, {0, 0, 1},  {0, 0, -1}};
+      for (const auto& n : kN)
+        if (!live.count(key(x + n[0], y + n[1], z + n[2]))) open++;
+      if (open < kMinOpenFaces) return false;
+      // Proximity-weighted, so the tearing is concentrated at the blow and
+      // fades out rather than eroding the rim uniformly. Keyed on the caller's
+      // seed plus the round, so a replay spalls identically.
+      const float t = std::sqrt(d2 / r2);
+      const float chance = p.strength * (1.0f - t) * ((float)open / 6.0f);
+      const uint32_t h =
+          rng::Hash3(p.seed + 0x5BF03635u * (uint32_t)(round + 1),
+                     (uint32_t)(x * 73856093) ^ (uint32_t)(y * 19349663),
+                     (uint32_t)(z * 83492791));
+      return (float)(h & 0xFFFFu) / 65535.0f < chance;
+    };
+    const size_t before = cells.size();
+    cells.erase(std::remove_if(cells.begin(), cells.end(),
+                               [&](const Vox& v) {
+                                 if (!doomed(v.x, v.y, v.z)) return false;
+                                 onLost(v);
+                                 return true;
+                               }),
+                cells.end());
+    const size_t took = before - cells.size();
+    total += took;
+    // Nothing left to grow into: stop rather than paying for empty passes.
+    if (took == 0) break;
+    // The NEXT round must see the hole this one opened, or every round tests
+    // the same rim and the growth is one round wide however many are asked
+    // for. This is the whole mechanism.
+    rebuild();
+  }
+  return total;
 }

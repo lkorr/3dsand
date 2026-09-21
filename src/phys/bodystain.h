@@ -136,3 +136,51 @@ struct CutSoak {
 };
 uint32_t SoakCut(const StainLattice& L, Vec3 centre, const CutSoak& p,
                  uint32_t seed, MicroBodySet* micro, int model);
+
+
+// ---- A BLOW THAT DOES NOT BREAK THE SKIN -----------------------------------
+//
+// THE BRUISE LADDER, and it is three rungs: a cell DARKENS toward a ceiling, a
+// cell already at that ceiling can BREAK and go bloody, and a cell that is
+// bloody at depth is PULPED and will crumble. All of it is per-voxel
+// arithmetic over one lattice, which is why it belongs beside the cut's soak
+// rather than inside the creature that used to own it.
+//
+// WHY IT MOVED (2026-09-20). It was `Mob::BruiseLimb`, so a mace marked a
+// living body and did nothing whatever to a corpse: the loose-matter path had
+// only an instant crater, which is the shape the living path was given a
+// bruise to stop using. A corpse is the same tissue one function call later —
+// what it lacks is hp and a voice, not the capacity of flesh to discolour.
+// One implementation, two callers (Mob::BruiseLimb, DebrisSystem::BruiseBody).
+//
+// Everything here is in LATTICE units and pre-resolved: the caller has already
+// applied its own unarmed overrides, its power ramp and its scale, because
+// only the caller knows which of those it has.
+struct BruiseSoak {
+  Vec3 centre{};            // lattice units
+  float radius = 0.0f;      // lattice units
+  uint32_t bruiseMat = 0;   // the coat this lays (gore.bruiseMat)
+  uint32_t bloodMat = 0;    // what a broken bruise becomes (0 = never breaks)
+  float step = 0.0f;        // coat added at the contact, before the taper
+  uint32_t cap = 0;         // gore.bruiseMax, the global ceiling
+  uint32_t bleedFrom = 0;   // coat depth at which a cell may break
+  float bleedChance = 0.0f; // ...and how often it does
+  uint32_t pulpAt = 0;      // blood depth that counts as PULPED (rung 3)
+  float blowScale = 1.0f;   // how hard this blow was, 0..1
+  const std::vector<uint8_t>* tissue = nullptr;  // bone does not bruise
+  uint32_t seed = 0;
+};
+// What the blow found and what it left. `core`/`pulped` are the reading rung 3
+// is scored against, taken BEFORE this blow changes anything — a blow must be
+// scored against the damage it ARRIVED at, or the first blow that breaks the
+// skin would also be the first that carves.
+struct BruiseTally {
+  uint32_t marked = 0;   // voxels whose coat changed
+  uint32_t core = 0;     // voxels in the inner half-radius
+  uint32_t pulped = 0;   // ...of those, already bloody at `pulpAt`
+  float Ripeness() const {
+    return core == 0 ? 0.0f : (float)pulped / (float)core;
+  }
+};
+uint32_t SoakBruise(const StainLattice& L, const BruiseSoak& p, BruiseTally* out,
+                    MicroBodySet* micro, int model);

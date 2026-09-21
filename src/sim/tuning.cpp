@@ -795,6 +795,8 @@ bool LoadTuning(const std::string& path, Tuning& out) {
     ReadF(*g, "bleedBudgetCap", e.bleedBudgetCap, out, at);
     ReadF(*g, "severStumpBudget", e.severStumpBudget, out, at);
     ReadF(*g, "corpseBleedPerVoxel", e.corpseBleedPerVoxel, out, at);
+    ReadF(*g, "corpseJointHold", e.corpseJointHold, out, at);
+    ReadF(*g, "corpseJointCut", e.corpseJointCut, out, at);
     ReadI(*g, "bleedDripTicks", e.bleedDripTicks, out, at);
     ReadI(*g, "bleedOpsPerTick", e.bleedOpsPerTick, out, at);
     ReadI(*g, "bleedClumpRadius", e.bleedClumpRadius, out, at);
@@ -1055,6 +1057,8 @@ bool LoadTuning(const std::string& path, Tuning& out) {
       e.bleedBudgetCap = 0.0f;
     }
     if (e.corpseBleedPerVoxel < 0.0f) e.corpseBleedPerVoxel = 0.0f;
+    e.corpseJointHold = std::clamp(e.corpseJointHold, 0.0f, 8.0f);
+    e.corpseJointCut = std::clamp(e.corpseJointCut, 0.0f, 1.0f);
     if (e.severStumpBudget < 0.0f) {
       out.warnings.push_back(at + ".severStumpBudget < 0; clamped to 0");
       e.severStumpBudget = 0.0f;
@@ -1334,6 +1338,7 @@ bool LoadTuning(const std::string& path, Tuning& out) {
     ReadF(*g, "hitReactPushFrac", e.hitReactPushFrac, out, at);
     ReadF(*g, "hitReactLimbDeg", e.hitReactLimbDeg, out, at);
     ReadF(*g, "hitReactHalflife", e.hitReactHalflife, out, at);
+    ReadF(*g, "hitReactImpulse", e.hitReactImpulse, out, at);
     ReadF(*g, "whooshVolume", e.whooshVolume, out, at);
     ReadF(*g, "whooshMinSpeed", e.whooshMinSpeed, out, at);
     ReadF(*g, "whooshRateSlow", e.whooshRateSlow, out, at);
@@ -1383,6 +1388,7 @@ bool LoadTuning(const std::string& path, Tuning& out) {
     e.hitReactPushFrac = std::clamp(e.hitReactPushFrac, 0.0f, 0.2f);
     e.hitReactLimbDeg = std::clamp(e.hitReactLimbDeg, 0.0f, 45.0f);
     e.hitReactHalflife = std::clamp(e.hitReactHalflife, 0.01f, 0.6f);
+    e.hitReactImpulse = std::clamp(e.hitReactImpulse, 0.0f, 200.0f);
     e.whooshVolume = std::clamp(e.whooshVolume, 0.0f, 4.0f);
     e.whooshMinSpeed = std::max(e.whooshMinSpeed, 0.0f);
     e.whooshRateSlow = std::clamp(e.whooshRateSlow, 0.25f, 4.0f);
@@ -3106,6 +3112,7 @@ bool SaveCombatTuning(const std::string& path, const Tuning& t,
     put("hitReactPushFrac", f.hitReactPushFrac);
     put("hitReactLimbDeg", f.hitReactLimbDeg);
     put("hitReactHalflife", f.hitReactHalflife);
+    put("hitReactImpulse", f.hitReactImpulse);
     put("whooshVolume", f.whooshVolume);
     put("whooshMinSpeed", f.whooshMinSpeed);
     put("whooshRateSlow", f.whooshRateSlow);
@@ -3146,6 +3153,8 @@ bool SaveCombatTuning(const std::string& path, const Tuning& t,
     putB("woundHeals", g.woundHeals);
     put("woundHealSlow", g.woundHealSlow);
     put("corpseBleedPerVoxel", g.corpseBleedPerVoxel);
+    put("corpseJointHold", g.corpseJointHold);
+    put("corpseJointCut", g.corpseJointCut);
     put("bleedGain", g.bleedGain);
     put("bleedHpPerVoxel", g.bleedHpPerVoxel);
     putB("stumpBleedsOpen", g.stumpBleedsOpen);
