@@ -2167,6 +2167,19 @@ void MobSystem::ServiceRisings(uint32_t tick) {
     // Unsigned wrap is not a hazard here: a rising is booked from the same
     // clock it is compared against, ticks apart.
     if (tick < r.atTick) { i++; continue; }
+    // ---- A RISING IS AN AUTHORING ACT (M9.4-B) ----------------------------
+    //
+    // It SPAWNS a creature and destroys the remains. Both machines servicing
+    // one booking would stand two zombies up in one grave and each destroy
+    // the bodies the other was about to. So the machine that owned the corpse
+    // when it died is the one that raises it; every other machine DROPS the
+    // booking (it will meet the new creature as an announce). Test the
+    // captured owner, not the corpse — the corpse is gone by now.
+    if (r.owner != localPlayerId_) {
+      rises_[i] = std::move(rises_.back());
+      rises_.pop_back();
+      continue;
+    }
     const int at = DefWithEffects(r.def, r.fx, nullptr);
     if (at >= 0) {
       // THE REMAINS COME OUT OF THE WORLD FIRST. A corpse that got up is not
@@ -6260,6 +6273,13 @@ void MobSystem::PreTick(uint32_t tick, World& world, std::vector<BrushOp>& ops,
   // The clock a rising is booked against (Mob::Die runs from inside a damage
   // path, which has no tick to hand).
   tick_ = tick;
+  // WHO OWNS WHAT, ONCE, BEFORE ANYTHING STEPS (M9.4-B). A creature's owner
+  // may not change halfway through its own tick: burning is a pre-pass, the
+  // drive is mid-loop and staining is a post-pass, and an ownership answer
+  // that moved between them would let one machine burn a limb it does not
+  // drive. No-op (one null check) until the network layer installs a
+  // function, which is why this package does not move the world hash.
+  RefreshOwnership();
   // Per-voxel burning and dissolution, once per TICK — never per frame. The
   // pass writes fire into the hashed grid, so running it off the render clock
   // would make the world a function of frame rate.
@@ -6362,6 +6382,28 @@ void MobSystem::PreTick(uint32_t tick, World& world, std::vector<BrushOp>& ops,
       continue;
     }
 
+    // ---- A GHOST: SOMEBODY ELSE'S CREATURE, HELD AT ITS LAST POSE --------
+    //
+    // The fourth branch, and it is FIRST because it replaces all three of the
+    // ones below plus everything around them. A ghost gets no AI, no
+    // locomotion, no animation, no stroke, no bleed, no terrain anchor and
+    // above all NO OPS: its owner is authoring the blood, the fire and the
+    // stains for this body into ITS op stream, and a second machine doing the
+    // same would write one wound twice (CLAUDE.md rule 3's "one defined
+    // winner" is about two ops on one cell; two SIMULATORS of one creature is
+    // the entity-level version and no arbitration can repair it).
+    //
+    // The terrain anchor goes with the rest: an anchor exists so ManageTerrain
+    // builds static colliders where a creature's limbs are about to be
+    // resolved against the ground, and a ghost's limbs are never resolved
+    // against anything — they are placed. Paying for a collider sweep around
+    // a body nobody simulates is exactly the idle cost rule 2 forbids.
+    if (mob.IsGhost()) {
+      mob.TickGhost(dt);
+      mi++;
+      continue;
+    }
+
     // terrain collision anchors for every live limb (ManageTerrain sweep)
     mob.RegisterTerrainAnchor();
 
@@ -6391,6 +6433,11 @@ void MobSystem::PreTick(uint32_t tick, World& world, std::vector<BrushOp>& ops,
       // THIS is the NPC driver — the block the avatar replaces with player
       // input; everything else in this loop is shared Mob mechanics.
       GroundSense sense = SenseGround(mob, def, world);
+      // THE ARBITER RAN. Counted here and nowhere else: a ghost gate that
+      // measured "it did not move" would pass on a creature whose AI ran and
+      // decided to stand still, and this is the only branch that decides
+      // anything. Not hashed, not saved — a process diagnostic.
+      aiSteps_++;
       const size_t attacksBefore = attacks_.size();
       DecideIntent(mob, def, sense, tick, dt);
       // PERSONAL SPACE, between the intent and the steer. The AI has had its
@@ -11961,6 +12008,12 @@ void Mob::BurnTick(uint32_t tick, World& world, std::vector<CellOp>& cellOps,
   // A corpse's limbs belong to DebrisSystem the moment Die() adopts them;
   // limb.body is cleared there, so this is belt and braces.
   if (!sys_ || !sys_->BurnTablesReady() || !alive_) return;
+  // A GHOST DOES NOT BURN HERE. Its owner is running this same pass on the
+  // same creature and authoring the fire ops; running it on both machines
+  // would consume the limb's lattice twice and charge two sets of cell ops
+  // for one fire. Returns BEFORE spending any of the shared front budget, so
+  // a crowd of ghosts cannot starve the bodies this machine does own.
+  if (IsGhost()) return;
   // Counter-based RNG stream. NO FLOAT TERM, deliberately: a limb's world
   // position and velocity are Jolt floats, and keying a roll on one would
   // inject physics float state into a HASHED grid write and make the world
@@ -12888,7 +12941,10 @@ void MobSystem::StainLimbs(uint32_t tick, World& world) {
   for (SplatterEvent& e : splatters_) {
     if (e.doneMobs) continue;
     e.doneMobs = true;
-    for (Mob& mob : mobs_) mob.ApplySplatter(e);
+    // Ghosts excluded, with the contact pass above: a splatter lands on SKIN,
+    // and a ghost's skin is owned elsewhere (see Mob::StainTick).
+    for (Mob& mob : mobs_)
+      if (!mob.IsGhost()) mob.ApplySplatter(e);
   }
 }
 
@@ -12909,6 +12965,14 @@ bool OwnForStain(BurnLimbView& v, MicroBodySet* micro) {
 
 void Mob::StainTick(uint32_t tick, World& world, uint32_t& budget) {
   if (!sys_ || sys_->matGpu_.empty()) return;
+  // Same rule as BurnTick, and before the budget for the same reason: the
+  // coat on a ghost's skin is its owner's business. A ghost's coat is
+  // therefore STALE until it is handed over — a known gap, recorded rather
+  // than papered over: neither the pose stream nor the save record carries
+  // per-voxel coat, so what the far machine sees is the coat the creature had
+  // when it was announced. Blood that lands on a ghost locally would be a
+  // SECOND opinion about the same skin, which is worse.
+  if (IsGhost()) return;
   const auto& ct = CurrentTuning().coat;
   const uint32_t mobKey = (uint32_t)id_ * 0x9E3779B9u ^ 0x57A1Eu;
   const int nl = (int)limbs_.size();
@@ -15572,6 +15636,8 @@ void Mob::Die() {
   }
   if (rising) {
     rise.def = def_->name;
+    // Whose corpse this was, captured at the BOOKING (mob.h PendingRise).
+    rise.owner = owner_;
     rise.fx.push_back(def_->turn.into);
     rise.at = origin_;
     rise.heading = heading_;
@@ -16496,6 +16562,34 @@ uint32_t Mob::LimbBodyCount() const {
 
 // ---- persistence (entities.sve section 'MOBS') ------------------------------
 
+// ONE creature's bytes. Was the body of SaveState's loop and is byte-for-byte
+// the same writes in the same order — the format did NOT move when this was
+// lifted out (M9.4-B), which is what `save-entities` asserts and what lets a
+// handoff packet carry a save record instead of a second serializer.
+void Mob::SaveOne(ByteWriter& w) const {
+  // The def NAME out of the system's table rather than `def_->name`: the two
+  // are the same pointer today, and writing it the way the loop always wrote
+  // it is worth more than the indirection saved.
+  w.Str(sys_->Defs()[defIndex_].name);
+  w.Pod(origin_);
+  w.F32(heading_);
+  w.F32(bodyY_);
+  w.U32((uint32_t)limbs_.size());
+  for (const MobLimb& L : limbs_) {
+    w.U32(L.body ? 1u : 0u);  // 0 = severed (sever state IS this flag)
+    w.F32(L.hp);
+    // The rig offsets travel because a carve SHIFTS them (ReskinLimbMicro):
+    // restoring def values under carved art would slide the wound.
+    w.Pod(L.restOffset);
+    w.Pod(L.anchorRoot);
+    w.Pod(L.anchorLimb);
+    w.Pod(L.xf);
+    w.Pod(L.size);
+    w.PodVec(L.voxels);
+    w.PodVec(L.skinVoxels);
+  }
+}
+
 void MobSystem::SaveState(std::vector<uint8_t>& out) const {
   ByteWriter w{out};
   uint32_t count = 0;
@@ -16505,24 +16599,12 @@ void MobSystem::SaveState(std::vector<uint8_t>& out) const {
   for (const Mob& m : mobs_) {
     if (!(m.alive_ && m.defIndex_ >= 0 && m.defIndex_ < (int)defs_.size()))
       continue;  // dead mobs are debris already (see mob.h)
-    w.Str(defs_[m.defIndex_].name);
-    w.Pod(m.origin_);
-    w.F32(m.heading_);
-    w.F32(m.bodyY_);
-    w.U32((uint32_t)m.limbs_.size());
-    for (const MobLimb& L : m.limbs_) {
-      w.U32(L.body ? 1u : 0u);  // 0 = severed (sever state IS this flag)
-      w.F32(L.hp);
-      // The rig offsets travel because a carve SHIFTS them (ReskinLimbMicro):
-      // restoring def values under carved art would slide the wound.
-      w.Pod(L.restOffset);
-      w.Pod(L.anchorRoot);
-      w.Pod(L.anchorLimb);
-      w.Pod(L.xf);
-      w.Pod(L.size);
-      w.PodVec(L.voxels);
-      w.PodVec(L.skinVoxels);
-    }
+    // A GHOST IS SAVED LIKE ANY OTHER CREATURE, deliberately. Ownership is
+    // process state — who is connected right now — and a save file that
+    // remembered it would load a world full of creatures nobody steps. A
+    // loaded mob is local, which is the same thing a single-player load has
+    // always produced.
+    m.SaveOne(w);
   }
 }
 
@@ -16531,114 +16613,595 @@ bool MobSystem::LoadState(const uint8_t* data, size_t len, uint32_t version) {
     std::printf("mob: unknown MOBS section version %u\n", version);
     return false;
   }
-  // Scoped rather than set-and-clear: every `return` below is an early exit on
-  // a malformed section, and a flag left true would silently stop every later
-  // spawn in the session from rotting.
+  ByteReader r{data, len};
+  uint32_t count = 0;
+  r.U32(count);
+  for (uint32_t mi = 0; mi < count && r.ok; mi++) LoadOne(r, version);
+  instancesDirty_ = true;
+  return r.ok;
+}
+
+// ONE creature out of a save section or a handoff packet: the body of
+// LoadState's loop, lifted out (M9.4-B). Spawn from the def name, overlay the
+// saved carve state, then the severs. Null on a def that no longer exists, a
+// refused spawn, or a short read — all three of which it reports exactly as
+// the loop always did.
+// ---- ONE CREATURE'S RECORD, PARSED -----------------------------------------
+//
+// The save section and a handoff packet carry the same bytes, and they want
+// two different things done with them: a load SPAWNS a creature and overlays
+// the damage; a handoff of a mob this machine already holds as a ghost
+// overlays the damage onto the rig THAT IS ALREADY STANDING THERE (rebuilding
+// it would flicker the body and throw away its Jolt bodies and bricks for
+// nothing). So the read and the overlay are two functions and `LoadOne` is the
+// pair with a Spawn between them.
+struct MobSystem::MobRecord {
+  std::string defName;
+  Vec3 origin{};
+  float heading = 0, bodyY = 0;
+  struct LimbState {
+    uint32_t alive = 1;
+    float hp = 0;
+    Vec3 restOffset{}, anchorRoot{}, anchorLimb{};
+    BodyTransform xf{};
+    IVec3 size{};
+    std::vector<DebrisVoxel> voxels;
+    std::vector<PrefabVoxel> skinVoxels;
+  };
+  std::vector<LimbState> limbs;
+};
+
+bool MobSystem::ReadMobRecord(ByteReader& r, MobRecord& out) {
+  uint32_t nLimbs = 0;
+  r.Str(out.defName);
+  r.Pod(out.origin);
+  r.F32(out.heading);
+  r.F32(out.bodyY);
+  r.U32(nLimbs);
+  // resize() after the count is read and before the fields are: the reader is
+  // bounds-checked and sticky, so a truncated record simply leaves the tail
+  // default-constructed and `ok` false.
+  out.limbs.assign(nLimbs, MobRecord::LimbState{});
+  for (MobRecord::LimbState& s : out.limbs) {
+    r.U32(s.alive);
+    r.F32(s.hp);
+    r.Pod(s.restOffset);
+    r.Pod(s.anchorRoot);
+    r.Pod(s.anchorLimb);
+    r.Pod(s.xf);
+    r.Pod(s.size);
+    r.PodVec(s.voxels);
+    r.PodVec(s.skinVoxels);
+  }
+  return r.ok;
+}
+
+// The overlay half, onto a rig that already exists. Moves `rec`'s lattices.
+void MobSystem::OverlayMobRecord(Mob& m, MobRecord& rec, bool placeLimbs) {
+  m.origin_ = rec.origin;
+  m.heading_ = m.desiredHeading_ = rec.heading;
+  m.bodyY_ = rec.bodyY;
+  m.anim_.lastPos = rec.origin;
+  const uint32_t nApply =
+      std::min<uint32_t>((uint32_t)rec.limbs.size(), (uint32_t)m.limbs_.size());
+
+  // Carve state first, on limbs that are still attached: a lattice that
+  // differs from the def's means the limb was carved, so the saved lattice
+  // (and the rig offsets the carve shifted) replace the authored ones, the
+  // brick is re-derived, and the Jolt body is rebuilt to the carved shape.
+  for (uint32_t i = 0; i < nApply; i++) {
+    if (!rec.limbs[i].alive) continue;
+    MobLimb& L = m.limbs_[i];
+    L.hp = rec.limbs[i].hp;
+    bool differs = rec.limbs[i].voxels.size() != L.voxels.size() ||
+                   rec.limbs[i].skinVoxels.size() != L.skinVoxels.size();
+    // ---- A HANDOFF COMPARES THE CONTENTS, A SAVE LOAD COMPARES THE COUNT --
+    //
+    // Counts are what a load has always compared, and for a load that is the
+    // right question: "was this limb carved". But a PrefabVoxel carries the
+    // body coat in its `stain` word, so a limb that was bled on without being
+    // cut has the same count and different bytes — and a creature that
+    // changed hands mid-fight would arrive with its blood wiped off. The
+    // comparison is only widened on the handoff path because widening it for
+    // a save load would change what a loaded world looks like, and that is
+    // hashed ground this package must not move (`save-entities` pins the
+    // format, not the overlay rule).
+    if (!differs && placeLimbs && !rec.limbs[i].voxels.empty())
+      differs =
+          (rec.limbs[i].voxels.size() &&
+           std::memcmp(rec.limbs[i].voxels.data(), L.voxels.data(),
+                       L.voxels.size() * sizeof(DebrisVoxel)) != 0) ||
+          (rec.limbs[i].skinVoxels.size() &&
+           std::memcmp(rec.limbs[i].skinVoxels.data(), L.skinVoxels.data(),
+                       L.skinVoxels.size() * sizeof(PrefabVoxel)) != 0);
+    if (!differs || rec.limbs[i].voxels.empty()) continue;
+    L.voxels = std::move(rec.limbs[i].voxels);
+    L.skinVoxels = std::move(rec.limbs[i].skinVoxels);
+    L.size = rec.limbs[i].size;
+    L.restOffset = rec.limbs[i].restOffset;
+    L.anchorRoot = rec.limbs[i].anchorRoot;
+    L.anchorLimb = rec.limbs[i].anchorLimb;
+    if (L.microModel >= 0)
+      m.ReskinLimbMicro(L, m.SkinScaleOf(L), m.PhysScaleOf(L));
+    m.RebuildLimbBody((int)i);
+  }
+  // Severs second: DetachLimb recurses into children, and doing it after
+  // the carve pass means it never operates on a limb the loop still needs.
+  // adopt=false — the severed piece is not re-created here, it already
+  // travels in the 'DBRS' section as the debris it became.
+  for (uint32_t i = 0; i < nApply; i++)
+    if (!rec.limbs[i].alive && m.limbs_[i].body) m.DetachLimb((int)i, false);
+
+  // ---- ...and, for a handoff, WHERE EACH LIMB WAS STANDING ----------------
+  //
+  // LAST, after the severs: a limb that came off is DebrisSystem's and must
+  // not be put back on the rig's pose. Both the CPU transform and the Jolt
+  // body, because the two disagreeing is a limb that draws in one place and
+  // collides in another until the next driven tick.
+  if (placeLimbs) {
+    for (uint32_t i = 0; i < nApply; i++) {
+      MobLimb& L = m.limbs_[i];
+      if (!L.body) continue;
+      L.xf = rec.limbs[i].xf;
+      if (m.phys_ != nullptr)
+        m.phys_->SetBodyTransform(L.body, L.xf.pos, L.xf.quat);
+    }
+  }
+  instancesDirty_ = true;
+}
+
+// ONE creature out of a save section or a handoff packet: the body of
+// LoadState's loop, lifted out (M9.4-B). Spawn from the def name, overlay the
+// saved carve state, then the severs. Null on a def that no longer exists, a
+// refused spawn, or a short read — all three of which it reports exactly as
+// the loop always did.
+Mob* MobSystem::LoadOne(ByteReader& r, uint32_t version) {
+  if (version != kSaveVersion) {
+    std::printf("mob: unknown mob record version %u\n", version);
+    return nullptr;
+  }
+  MobRecord rec;
+  if (!ReadMobRecord(r, rec)) return nullptr;
+
+  // Resolve the def BY NAME: index order is whatever the directory listing
+  // was the day the save was written. A missing def skips the mob (the save
+  // stays loadable when a creature is retired) — loudly, so retired art
+  // silently eating saved mobs cannot masquerade as a load bug.
+  // ...and a name that no file answers to may still be a COMPOSITION this
+  // session can rebuild — `jujunud+zombie` is a villager that turned, and it
+  // is spelled out in the name precisely so that the save needs to know
+  // nothing about effects (FindOrComposeDef).
+  const int defIndex = FindOrComposeDef(rec.defName);
+  if (defIndex < 0) {
+    std::printf("mob: saved def '%s' no longer exists; skipping\n",
+                rec.defName.c_str());
+    return nullptr;
+  }
+  // Scoped rather than set-and-clear: `loading_` is what keeps spawn-time rot
+  // (MobRotDef) out of a body whose holes are about to be restored, and a flag
+  // left true would silently stop every later spawn in the session from
+  // rotting.
+  //
+  // PER RECORD rather than per section since the extraction: the flag is only
+  // read inside the Spawn() below, so one guard around one spawn is the same
+  // behaviour a save load always had and the right behaviour for a handoff,
+  // which has no section around it to scope.
   struct LoadGuard {
     bool& f;
     explicit LoadGuard(bool& b) : f(b) { f = true; }
     ~LoadGuard() { f = false; }
   } loadGuard(loading_);
-  ByteReader r{data, len};
-  uint32_t count = 0;
-  r.U32(count);
-  for (uint32_t mi = 0; mi < count && r.ok; mi++) {
-    std::string defName;
-    Vec3 origin{};
-    float heading = 0, bodyY = 0;
-    uint32_t nLimbs = 0;
-    r.Str(defName);
-    r.Pod(origin);
-    r.F32(heading);
-    r.F32(bodyY);
-    r.U32(nLimbs);
-    struct LimbState {
-      uint32_t alive = 1;
-      float hp = 0;
-      Vec3 restOffset{}, anchorRoot{}, anchorLimb{};
-      BodyTransform xf{};
-      IVec3 size{};
-      std::vector<DebrisVoxel> voxels;
-      std::vector<PrefabVoxel> skinVoxels;
-    };
-    std::vector<LimbState> ls(nLimbs);
-    for (LimbState& s : ls) {
-      r.U32(s.alive);
-      r.F32(s.hp);
-      r.Pod(s.restOffset);
-      r.Pod(s.anchorRoot);
-      r.Pod(s.anchorLimb);
-      r.Pod(s.xf);
-      r.Pod(s.size);
-      r.PodVec(s.voxels);
-      r.PodVec(s.skinVoxels);
-    }
-    if (!r.ok) break;
-
-    // Resolve the def BY NAME: index order is whatever the directory listing
-    // was the day the save was written. A missing def skips the mob (the save
-    // stays loadable when a creature is retired) — loudly, so retired art
-    // silently eating saved mobs cannot masquerade as a load bug.
-    // ...and a name that no file answers to may still be a COMPOSITION this
-    // session can rebuild — `jujunud+zombie` is a villager that turned, and it
-    // is spelled out in the name precisely so that the save needs to know
-    // nothing about effects (FindOrComposeDef).
-    const int defIndex = FindOrComposeDef(defName);
-    if (defIndex < 0) {
-      std::printf("mob: saved def '%s' no longer exists; skipping\n",
-                  defName.c_str());
-      continue;
-    }
-    // Spawn() first: it derives everything the save deliberately does not
-    // carry (anim state, joints, rest sole, flipbooks, gore profile) from the
-    // def, exactly as a fresh mob would. The saved damage overlays that.
-    // `loading_` is what keeps spawn-time rot (MobRotDef) out of it — see the
-    // note at that call.
-    uint64_t id = Spawn(defIndex, {ifloor(origin.x), ifloor(origin.y),
-                                   ifloor(origin.z)});
-    if (id == 0) {
-      std::printf("mob: could not respawn saved '%s' (limit or physics)\n",
-                  defName.c_str());
-      continue;
-    }
-    Mob& m = mobs_.back();
-    m.origin_ = origin;
-    m.heading_ = m.desiredHeading_ = heading;
-    m.bodyY_ = bodyY;
-    m.anim_.lastPos = origin;
-    const MobDef& def = defs_[defIndex];
-    const uint32_t nApply = std::min<uint32_t>(nLimbs, (uint32_t)m.limbs_.size());
-
-    // Carve state first, on limbs that are still attached: a lattice that
-    // differs from the def's means the limb was carved, so the saved lattice
-    // (and the rig offsets the carve shifted) replace the authored ones, the
-    // brick is re-derived, and the Jolt body is rebuilt to the carved shape.
-    for (uint32_t i = 0; i < nApply; i++) {
-      if (!ls[i].alive) continue;
-      MobLimb& L = m.limbs_[i];
-      L.hp = ls[i].hp;
-      const bool differs = ls[i].voxels.size() != L.voxels.size() ||
-                           ls[i].skinVoxels.size() != L.skinVoxels.size();
-      if (!differs || ls[i].voxels.empty()) continue;
-      L.voxels = std::move(ls[i].voxels);
-      L.skinVoxels = std::move(ls[i].skinVoxels);
-      L.size = ls[i].size;
-      L.restOffset = ls[i].restOffset;
-      L.anchorRoot = ls[i].anchorRoot;
-      L.anchorLimb = ls[i].anchorLimb;
-      if (L.microModel >= 0)
-        m.ReskinLimbMicro(L, m.SkinScaleOf(L), m.PhysScaleOf(L));
-      m.RebuildLimbBody((int)i);
-    }
-    // Severs second: DetachLimb recurses into children, and doing it after
-    // the carve pass means it never operates on a limb the loop still needs.
-    // adopt=false — the severed piece is not re-created here, it already
-    // travels in the 'DBRS' section as the debris it became.
-    for (uint32_t i = 0; i < nApply; i++)
-      if (!ls[i].alive && m.limbs_[i].body) m.DetachLimb((int)i, false);
+  // Spawn() first: it derives everything the record deliberately does not
+  // carry (anim state, joints, rest sole, flipbooks, gore profile) from the
+  // def, exactly as a fresh mob would. The saved damage overlays that.
+  const uint64_t id = Spawn(defIndex, {ifloor(rec.origin.x),
+                                       ifloor(rec.origin.y),
+                                       ifloor(rec.origin.z)});
+  if (id == 0) {
+    std::printf("mob: could not respawn saved '%s' (limit or physics)\n",
+                rec.defName.c_str());
+    return nullptr;
   }
+  OverlayMobRecord(mobs_.back(), rec);
+  // BY ID, not by the reference above: the overlay can sever, and a sever is
+  // one of the paths that may re-enter this system. The id is the identity
+  // (mob.h's note on NextIdCounter).
+  return FindMobById(id);
+}
+
+// ============================================================================
+// OWNERSHIP — ONE CREATURE IS STEPPED ON EXACTLY ONE MACHINE
+// (docs/PLAN_multiplayer_m9.md M9.4-B)
+//
+// The rule, in one line: the machine whose player is nearest owns the mob,
+// steps it, and authors every op it makes; every other machine holds a GHOST
+// — the same rig, the same bodies, the same place in the crowd — and poses it
+// from the owner's MobPose stream.
+//
+// WHAT A GHOST STILL IS, and why. It stays in `actors_` (the AI can target
+// it: a creature that cannot be fought because its owner is the other player
+// would be a worse bug than any duplication this avoids) and it stays solid
+// to `CrowdPush` and `BlockedByMob` (you cannot walk through a body just
+// because somebody else is driving it, and both of those are READS of a
+// position — neither authors an op nor moves the ghost).
+//
+// WHAT IT IS NOT: it is not stepped (no sense / intent / steer / drive), not
+// animated, not swung, not bled (`BleedTick`), not burnt (`Mob::BurnTick`),
+// not stained (`Mob::StainTick`, `ApplySplatter`), not terrain-anchored, and
+// it never raises a corpse (`ServiceRisings`). Every one of those authors
+// something — ops, particles, or a new entity — and authoring it twice for
+// one creature is the entity-level version of two producers writing one cell.
+//
+// ALL OF IT IS INERT UNTIL THE NETWORK LAYER SETS AN OWNERSHIP FUNCTION.
+// `ownershipFn_` null means `RefreshOwnership` returns immediately, every
+// `owner_` stays 0, `IsGhost()` is false everywhere and PreTick runs exactly
+// the branches it ran before this package. That is the whole reason the world
+// hash does not move here, and the `mob-handoff` gate's arm (d) re-states it
+// as a measurement.
+// ============================================================================
+
+bool Mob::IsGhost() const {
+  // An unparented Mob (the CPU-only fixtures build them) is nobody's ghost.
+  return sys_ != nullptr && owner_ != sys_->LocalPlayerId();
+}
+
+void MobSystem::RefreshOwnership() {
+  if (!ownershipFn_) return;
+  for (Mob& m : mobs_) {
+    if (m.def_ == nullptr) continue;
+    // THE FEET, not the origin corner and not the centre: net::Authority keys
+    // an entity on the chunk it stands in, and a tall creature's centre is up
+    // to a chunk above the ground it is standing on.
+    const Vec3 feet{m.origin_.x + m.def_->worldSize.x * 0.5f, m.origin_.y,
+                    m.origin_.z + m.def_->worldSize.z * 0.5f};
+    m.owner_ = ownershipFn_(m.id_, feet);
+  }
+}
+
+uint32_t MobSystem::MobOwner(uint64_t mobId) const {
+  for (const Mob& m : mobs_)
+    if (m.id_ == mobId) return m.owner_;
+  return kLocalOwner;
+}
+
+bool MobSystem::SetMobOwner(uint64_t mobId, uint32_t owner) {
+  Mob* m = FindMobById(mobId);
+  if (m == nullptr) return false;
+  m->owner_ = owner;
+  return true;
+}
+
+bool MobSystem::BlockedByMobAt(uint64_t mobId, float cx, float cz) const {
+  for (const Mob& m : mobs_) {
+    if (m.id_ != mobId) continue;
+    if (m.defIndex_ < 0 || m.defIndex_ >= (int)defs_.size()) return false;
+    return BlockedByMob(m, defs_[m.defIndex_], cx, cz);
+  }
+  return false;
+}
+
+uint32_t MobSystem::GhostCount() const {
+  uint32_t n = 0;
+  for (const Mob& m : mobs_)
+    if (m.IsGhost()) n++;
+  return n;
+}
+
+void MobSystem::SetIdBand(uint32_t playerId) {
+  const uint64_t base = ((uint64_t)playerId << 40) | 1ull;
+  // max(), never assignment — see the note on the declaration. A host that has
+  // already issued a million ids keeps them.
+  if (nextId_ < base) nextId_ = base;
+}
+
+// ---- ONE TICK OF A CREATURE SOMEBODY ELSE OWNS -----------------------------
+//
+// Placed, not simulated. `MoveKinematicBody` rather than a bare transform
+// write for the reason DriveWornShells gives about velocities: a kinematic
+// body put somewhere with no velocity reports every contact as a standing hit,
+// and the ghost has to feel right to walk into. PostStep reads the same
+// transforms straight back, so `limb.xf` and Jolt agree at the end of the tick
+// exactly as they do for a driven rig.
+void Mob::TickGhost(float dt) {
+  // No pose yet (the announce beat the stream): stand where you were put.
+  // Snapping to the origin for two frames is a worse answer than standing
+  // still for two frames.
+  if (!haveGhostPose_) return;
+  origin_ = ghostPose_.origin;
+  heading_ = desiredHeading_ = ghostPose_.heading;
+  for (const ::net::WireLimbPose& lp : ghostPose_.limbs) {
+    if (lp.index >= limbs_.size()) continue;   // rig shrank under the stream
+    MobLimb& L = limbs_[(size_t)lp.index];
+    if (!L.body || L.holdSeconds > 0) continue;
+    // A WORN SHELL IS NOT PLACED HERE, for the same reason SubmitPose does not
+    // place one: DriveWornShells derives it from its host in PostStep, and two
+    // places deriving one garment is how a pauldron ends up floating off a
+    // shoulder by a rounding difference.
+    if (L.wornHost >= 0) continue;
+    float q[4] = {lp.quat[0], lp.quat[1], lp.quat[2], lp.quat[3]};
+    if (phys_ != nullptr) phys_->MoveKinematicBody(L.body, lp.pos, q, dt);
+    L.xf.pos = lp.pos;
+    L.xf.quat[0] = q[0];
+    L.xf.quat[1] = q[1];
+    L.xf.quat[2] = q[2];
+    L.xf.quat[3] = q[3];
+  }
+  // The GPU instance list is rebuilt from limb transforms (AppendXforms), so
+  // this is the whole of "a ghost draws where its owner says it is".
+  if (sys_ != nullptr) sys_->instancesDirty_ = true;
+}
+
+// ---- THE FOUR RECORDS ------------------------------------------------------
+
+bool MobSystem::BuildAnnounce(uint64_t mobId, ::net::MobAnnounce& out) const {
+  const Mob* m = nullptr;
+  for (const Mob& c : mobs_)
+    if (c.id_ == mobId) { m = &c; break; }
+  if (m == nullptr || m->defIndex_ < 0 || m->defIndex_ >= (int)defs_.size())
+    return false;
+  out = ::net::MobAnnounce{};
+  out.id = m->id_;
+  out.defName = defs_[m->defIndex_].name;
+  out.owner = m->owner_;
+  // ---- ITS KIT, read exactly the way a rising reads it ---------------------
+  //
+  // The identity shell carries the dye, CaptureWorn carries the damage (the
+  // walk in Mob::Die, and the comment there explains why there are two walks
+  // and not one). A piece whose identity shell is gone stays gone: the panel
+  // that IS the piece came off with the arm it was on.
+  //
+  // IN RIG-SLOT ORDER, which is what makes the far side's replay line up.
+  // Wearing and holding APPEND rig slots, so the limb indices in the per-mob
+  // record only mean the same thing on both machines if the pieces are
+  // re-applied in the order their slots were appended. Sorting by the
+  // identity shell's slot index reproduces that order whatever sequence the
+  // creature was dressed in — a duelist handed a sword at spawn and a
+  // breastplate an hour later must not arrive with the two transposed.
+  std::vector<std::pair<int, ::net::WireGear>> bySlot;
+  for (size_t pi = 0; pi < m->worn_.size(); pi++) {
+    const Mob::WornPiece& p = m->worn_[pi];
+    const int idSlot = m->IdentityShellOf((int)pi);
+    if (idSlot < 0 || idSlot >= (int)m->limbs_.size() || !m->limbs_[idSlot].body)
+      continue;
+    ::net::WireGear g;
+    g.item = p.item;
+    g.equipSlot = p.equipSlot;
+    g.dye = m->limbs_[idSlot].dye;
+    m->CaptureWorn(p.equipSlot, g.damage);
+    bySlot.emplace_back(idSlot, std::move(g));
+  }
+  if (m->heldSlot_ >= 0 && m->heldSlot_ < (int)m->limbs_.size() &&
+      m->limbs_[m->heldSlot_].body && !m->heldItem_.empty()) {
+    ::net::WireGear g;
+    g.item = m->heldItem_;
+    g.held = 1;
+    bySlot.emplace_back(m->heldSlot_, std::move(g));
+  }
+  std::stable_sort(bySlot.begin(), bySlot.end(),
+                   [](const auto& a, const auto& b) { return a.first < b.first; });
+  for (auto& e : bySlot) out.gear.push_back(std::move(e.second));
+  return true;
+}
+
+bool MobSystem::BuildPose(uint64_t mobId, uint32_t tick,
+                          ::net::MobPose& out) const {
+  const Mob* m = nullptr;
+  for (const Mob& c : mobs_)
+    if (c.id_ == mobId) { m = &c; break; }
+  if (m == nullptr) return false;
+  out = ::net::MobPose{};
+  out.id = m->id_;
+  out.tick = tick;
+  out.origin = m->origin_;
+  out.heading = m->heading_;
+  out.alive = m->alive_ ? 1u : 0u;
+  // ONLY LIMBS WITH A BODY. A severed limb is DebrisSystem's by now and a
+  // worn shell is derived from its host on the far side (DriveWornShells), so
+  // neither belongs in the stream — which is also most of why the per-tick
+  // record is small enough to send every tick.
+  for (size_t i = 0; i < m->limbs_.size(); i++) {
+    const MobLimb& L = m->limbs_[i];
+    if (!L.body || L.wornHost >= 0) continue;
+    ::net::WireLimbPose lp;
+    lp.index = (uint32_t)i;
+    lp.pos = L.xf.pos;
+    for (int k = 0; k < 4; k++) lp.quat[k] = L.xf.quat[k];
+    out.limbs.push_back(lp);
+  }
+  return true;
+}
+
+bool MobSystem::ApplyPose(const ::net::MobPose& p) {
+  Mob* m = FindMobById(p.id);
+  if (m == nullptr) return false;
+  // A POSE FOR A CREATURE I OWN IS REFUSED, not applied. It means the two
+  // machines disagree about who owns it, and applying it would fight this
+  // machine's own drive tick by tick — a body that visibly stutters, with the
+  // cause two hops away. Refusing it leaves the disagreement to show up where
+  // it can be counted (net::Authority's violation counter, M9.4-A).
+  if (!m->IsGhost()) return false;
+  // Out-of-order packets are DROPPED rather than applied: a pose from an
+  // earlier tick would rewind the body. `haveGhostPose_` guards the first one,
+  // whose tick may legitimately be anything.
+  if (m->haveGhostPose_ && p.tick < m->ghostPose_.tick) return false;
+  m->ghostPose_ = p;
+  m->haveGhostPose_ = true;
+  return true;
+}
+
+bool MobSystem::TakeHandoff(uint64_t mobId, uint32_t newOwner,
+                            ::net::MobHandoff& out) {
+  Mob* m = FindMobById(mobId);
+  if (m == nullptr || m->IsGhost()) return false;   // not mine to give away
+  out = ::net::MobHandoff{};
+  if (!BuildAnnounce(mobId, out.announce)) return false;
+  out.announce.owner = newOwner;
+  // The brain, by NAME (net/mobsync.h says why an index would not survive).
+  const ai::Profile* pr = behaviors_.At(m->ai_.profile);
+  out.brain.profile = pr != nullptr ? pr->name : std::string();
+  out.brain.targetId = m->ai_.targetId;
+  out.brain.hasTarget = m->ai_.hasTarget ? 1u : 0u;
+  out.brain.targetPos = m->ai_.targetPos;
+  out.brain.lastSeenPos = m->ai_.lastSeenPos;
+  out.brain.lastSeenTick = m->ai_.lastSeenTick;
+  out.recordVersion = kSaveVersion;
+  {
+    ByteWriter w{out.record};
+    m->SaveOne(w);
+  }
+  // ---- AND IT BECOMES A GHOST, HELD WHERE IT STANDS ----------------------
+  //
+  // Immediately, on the sending side, rather than when the far end
+  // acknowledges: from this instant the other machine is stepping it, and a
+  // creature stepped on two machines for the length of one round trip is
+  // exactly the duplication this whole package exists to prevent. The pose is
+  // latched from its CURRENT limbs, so it does not move at all until the new
+  // owner's first MobPose arrives — the handoff is invisible.
+  m->owner_ = newOwner;
+  if (BuildPose(mobId, tick_, m->ghostPose_)) m->haveGhostPose_ = true;
+  return true;
+}
+
+Mob* MobSystem::ApplyHandoff(const ::net::MobHandoff& h) {
+  if (h.recordVersion != kSaveVersion) {
+    std::printf("mob: handoff record version %u, this build speaks %u\n",
+                h.recordVersion, kSaveVersion);
+    return nullptr;
+  }
+  ByteReader r{h.record.data(), h.record.size()};
+  MobRecord rec;
+  if (!ReadMobRecord(r, rec)) {
+    std::printf("mob: handoff record for id %llu is short\n",
+                (unsigned long long)h.announce.id);
+    return nullptr;
+  }
+  Mob* m = FindMobById(h.announce.id);
+  // ---- THE RIG IS KEPT WHEN THERE IS ONE ---------------------------------
+  //
+  // A creature I already hold as a ghost of the same def is OVERLAID in
+  // place: same limbs, same Jolt bodies, same micro bricks, same instance
+  // slots. Despawning and respawning it would be simpler and would flicker
+  // the body for a frame, drop whatever was standing on it, and re-roll the
+  // gore profile that is keyed on the id.
+  const bool reuse = m != nullptr && m->defIndex_ >= 0 &&
+                     m->defIndex_ < (int)defs_.size() &&
+                     defs_[m->defIndex_].name == rec.defName;
+  if (m != nullptr && !reuse) {
+    // Same id, different creature: it TURNED while the other machine had it
+    // (`jujunud+zombie` is a different def from `jujunud`). The old body goes
+    // and the record builds the new one.
+    m->ReleaseRig();
+    for (size_t i = 0; i < mobs_.size(); i++)
+      if (mobs_[i].id_ == h.announce.id) {
+        mobs_[i] = std::move(mobs_.back());
+        mobs_.pop_back();
+        break;
+      }
+    m = nullptr;
+  }
+  if (!reuse) {
+    const int defIndex = FindOrComposeDef(rec.defName);
+    if (defIndex < 0) {
+      std::printf("mob: handoff def '%s' does not exist here\n",
+                  rec.defName.c_str());
+      return nullptr;
+    }
+    uint64_t spawned = 0;
+    {
+      // Scoped exactly around the spawn, for LoadOne's reason: a creature
+      // whose holes are about to be restored must not be freshly rotted.
+      struct LoadGuard {
+        bool& f;
+        explicit LoadGuard(bool& b) : f(b) { f = true; }
+        ~LoadGuard() { f = false; }
+      } loadGuard(loading_);
+      spawned = Spawn(defIndex, {ifloor(rec.origin.x), ifloor(rec.origin.y),
+                                 ifloor(rec.origin.z)});
+    }
+    if (spawned == 0) {
+      std::printf("mob: could not spawn handed-over '%s'\n",
+                  rec.defName.c_str());
+      return nullptr;
+    }
+    m = &mobs_.back();
+    // THE SENDER'S ID WINS. It is the key every later MobPose, MobHandoff and
+    // MobGone for this creature is addressed to, and the id bands (SetIdBand)
+    // are what make adopting it safe — the counter this machine just spent is
+    // in its own band and can never collide with the one arriving.
+    m->id_ = h.announce.id;
+    m->gore_ = Mob::MakeGoreProfile(m->id_);
+
+    // ---- DRESSED BEFORE THE OVERLAY, and that order is load-bearing ------
+    //
+    // Worn pieces and a held weapon APPEND rig slots past the base limbs, and
+    // the record's limb array was written from a rig that already had them.
+    // Overlay first and the record's gear limbs would fall off the end of a
+    // bare rig — a knight would arrive with a pristine breastplate and the
+    // damage to it silently dropped. The announce lists gear in RIG-SLOT
+    // ORDER (BuildAnnounce sorts it), so replaying it appends the same slots
+    // in the same places and limb index i means the same limb on both
+    // machines.
+    if (items_ != nullptr) {
+      for (const ::net::WireGear& g : h.announce.gear) {
+        const ItemDef* item = items_->At(items_->Find(g.item));
+        if (item == nullptr) continue;   // retired item: it arrives without it
+        if (g.held)
+          m->EquipItem(item);
+        else
+          m->WearItem(item, g.equipSlot,
+                      g.damage.Empty() ? nullptr : &g.damage, g.dye);
+      }
+    }
+  }
+  // PLACED, not just overlaid (the `true`): a handed-over creature arrives
+  // standing exactly where it was, down to each limb's transform, so the
+  // handoff is invisible until the new owner's first driven tick. A save load
+  // passes false and keeps its rest pose — changing that would move where a
+  // loaded creature bleeds from, which is hashed state this package must not
+  // touch.
+  OverlayMobRecord(*m, rec, /*placeLimbs=*/true);
+  // BY ID: the overlay can sever, and a sever is one of the paths that may
+  // re-enter this system.
+  m = FindMobById(h.announce.id);
+  if (m == nullptr) return nullptr;
+
+  // ---- IT IS MINE NOW -----------------------------------------------------
+  m->owner_ = localPlayerId_;
+  m->haveGhostPose_ = false;
+  m->ghostPose_ = ::net::MobPose{};
+
+  // The brain: a fresh Brain on the resolved profile (SetMobBehavior's reason
+  // — timers and half-walked paths belong to the run that made them), then the
+  // one thing the far side cannot re-derive put back on top.
+  const int profile =
+      h.brain.profile.empty() ? -1 : behaviors_.Find(h.brain.profile);
+  m->ai_ = ai::Brain(profile);
+  m->ai_.targetId = h.brain.targetId;
+  m->ai_.hasTarget = h.brain.hasTarget != 0;
+  m->ai_.targetPos = h.brain.targetPos;
+  m->ai_.lastSeenPos = h.brain.lastSeenPos;
+  m->ai_.lastSeenTick = h.brain.lastSeenTick;
   instancesDirty_ = true;
-  return r.ok;
+  return m;
+}
+
+bool MobSystem::ApplyGone(const ::net::MobGone& g) {
+  for (size_t i = 0; i < mobs_.size(); i++) {
+    if (mobs_[i].id_ != g.id) continue;
+    // A creature I OWN is not removed by somebody else's say-so: only its
+    // owner may end it, and a peer sending this about my mob is a disagreement
+    // to count, not an instruction to obey.
+    if (!mobs_[i].IsGhost()) return false;
+    // ReleaseRig, not Die: a ghost's death threw its corpse debris on the
+    // OWNER's machine, and those bodies arrive as M9.4-C's ghost bodies. A
+    // second corpse from this side would be one skeleton too many.
+    mobs_[i].ReleaseRig();
+    mobs_[i] = std::move(mobs_.back());
+    mobs_.pop_back();
+    instancesDirty_ = true;
+    return true;
+  }
+  return false;
 }
 
 // ============================================================================
