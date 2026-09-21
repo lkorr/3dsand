@@ -208,6 +208,13 @@ const char* const kOrder[] = {
     // a gate that churns the world. It never touches the world hash: the
     // digest is a SECOND accumulator with a chunk-local key (M9.3-A).
     "chunk-hash",
+    // ...and `ops-exchange` beside them, for the third time the same argument:
+    // it worldgens three times and runs 200 ticks per arm (two seats plus a
+    // replay), and `determinism` below regenerates and proves its hash
+    // independent of whatever it inherited. It is the op stream's OTHER half:
+    // `ops-replay` says the stream describes the tick, this says two machines
+    // build the same stream (M9.3-B).
+    "ops-exchange",
     "determinism", "sleep",       "ca-skip",
     // Per-material angle of repose. It runs its own worldgen per arm, builds a
     // sealed stone room and pours into it, and it PATCHES ONE MATERIAL'S GPU

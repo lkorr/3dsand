@@ -43,8 +43,18 @@
 
 #include "net/authority.h"
 #include "net/link.h"
+#include "net/opsync.h"
 #include "net/protocol.h"
+#include "sim/oprecord.h"
 #include "test/selftest.h"
+// ops-exchange submits real ticks, so it needs the harness's sim plumbing
+// (SubmitWorldgen / SubmitTick / ReadHashSync / FixtureY). The two CPU-only
+// gates above still touch none of it.
+#include "test/support.h"
+
+// Same as every other gate TU that submits ticks (selftest_sim.cpp line 28):
+// the harness plumbing lives in namespace sandvox and is called unqualified.
+using namespace sandvox;
 
 namespace selftest {
 namespace {
@@ -916,6 +926,448 @@ Status GateAuthority(Ctx& c, std::string& detail) {
   return pinOk ? Status::Pass : Status::Fail;
 }
 
+// ---- ops-exchange: two machines submit the SAME ops (M9.3-B) -------------
+//
+// docs/PLAN_multiplayer_m9.md M9.3-B. The claim this gate exists to make is
+// one sentence: TWO MACHINES THAT AUTHOR DIFFERENT EDITS SUBMIT THE SAME OP
+// VECTORS UNDER THE SAME TICK LABEL. Everything below is that claim split
+// into pieces that can each fail on their own.
+//
+//  (A) THE MERGE IS CANONICAL. The same script is played twice against the
+//      same world: once from the HOST's seat (local player 0, the client's
+//      ops arriving over a loopback link) and once from the CLIENT's seat
+//      (local player 1, the host's ops arriving). The merged batch of every
+//      tick is serialized and compared BYTE FOR BYTE between the two arms,
+//      and the world hashes must match at every probe. The two arms differ in
+//      which batch is "mine", so a merge with any notion of "mine first"
+//      fails here — which is the single thing that makes the exchange sound.
+//  (B) THE ORDER IS AUTHOR-MAJOR. Player 0's ops lead on both machines. Read
+//      off the merged indices of the REMOTE brush ops: from the host's seat
+//      they sit AFTER the local ones, from the client's seat they start at 0.
+//      (A) would catch a swap too, but not say which way round it went.
+//  (C) DELAY. Ops authored at T are submitted at T + D by both sides. The
+//      first D ticks therefore submit NOTHING, and the queue says so: D
+//      merges with no local batch and D with no remote one.
+//  (D) RESIDENCY. A remote CellOp carries a SLOT index, which is global, so
+//      the chunk it means depends on the SENDER's window origin. Fed a peer
+//      whose window is four chunks along, the cells that land in a chunk this
+//      machine also holds are kept and the ones that do not are dropped — and
+//      the first drop names its chunk, because "8 cells dropped" on its own
+//      is the bare count CLAUDE.md rule 6 is about.
+//  (E) THE COPIED ARITHMETIC AGREES. net::SlotChunkUnderOrigin duplicates
+//      World::SlotToWorldChunk (the World member reads the LOCAL origin and
+//      there is no World holding the peer's). A copy that drifts paints the
+//      wrong chunk silently, so the two are compared over a spread of slots.
+//  (F) THE WIRE BLOB ROUND-TRIPS, all five vectors, and REFUSES a truncated
+//      or wrong-version one whole rather than half-decoding it.
+//  (G) THE RECORD REPLAYS. The host arm is recorded and replayed through the
+//      same drive loop `ops-replay` uses; same hash series. That is what says
+//      the merged stream is still a complete description of the tick.
+//
+// IT NEEDS THE GPU (it submits) and it re-worldgens between arms, exactly as
+// `ops-replay` does, so `--gate ops-exchange` alone is a complete run.
+namespace opsexch {
+
+constexpr int kTicks = 200;
+constexpr uint32_t kProbeEvery = 25;
+
+// THE SCRIPT, A PURE FUNCTION OF THE TICK. Both arms play the same one, so
+// the only difference between them is which seat the merge is done from —
+// which is the whole point of (A). Two authors, both of them editing.
+struct Script {
+  uint32_t seed = 0;
+  int ox = 0, oz = 0;       // window origin in world CELLS
+  IVec3 origin{0, 0, 0};    // window origin in world CHUNKS
+  int hx = 0, hy = 0, hz = 0;  // the host's stroke
+  IVec3 cellBase{0, 0, 0};     // the client's cell box, in a resident chunk
+
+  // PLAYER 0. A stone stroke every 10 ticks and one blast at tick 100.
+  OpBatch Host(uint32_t t) const {
+    OpBatch b;
+    if (t % 10 == 0)
+      b.ops.push_back({hx, hy, hz, 5, kMatStone, 1u, 0, 0});
+    if (t == 100)
+      b.exps.push_back({hx, hy, hz, 10, 300, 0, 0, 0});
+    return b;
+  }
+
+  // PLAYER 1. A 4^3 box of exact cells every 7 ticks, plus its own brush op
+  // every 13 — the second brush author is what makes (B) readable: with only
+  // one brush author the merged vector would be the same whatever the order.
+  OpBatch Client(uint32_t t) const {
+    OpBatch b;
+    if (t % 7 == 0) {
+      for (int dz = 0; dz < 4; dz++)
+        for (int dy = 0; dy < 4; dy++)
+          for (int dx = 0; dx < 4; dx++)
+            b.cells.push_back(
+                {World::SlotCellIndex({cellBase.x + dx, cellBase.y + dy,
+                                       cellBase.z + dz}),
+                 PackVoxNew(kMatWood, 0)});
+    }
+    if (t % 13 == 0)
+      b.ops.push_back({hx + 40, hy, hz + 40, 4, kMatSand, 1u, 0, 0});
+    return b;
+  }
+};
+
+// ONE MESSAGE ACROSS A REAL LOOPBACK LINK, not a direct call into the queue.
+// The loopback pair hands bytes over 1,500 at a time through the same
+// reassembler TcpLink uses (net/link.h), so the 2 KiB cell batches genuinely
+// cross several Poll()s and this arm covers the framing as well as the merge.
+// False if the frame never arrives or the blob is refused.
+bool ExchangeOne(net::Link& tx, net::Link& rx, const OpBatch& b, IVec3 origin,
+                 uint32_t label, uint32_t author, net::OpDelayQueue& q) {
+  std::vector<uint8_t> buf;
+  net::OpsWire::Encode(b, origin, label, buf);
+  if (!tx.Send((uint16_t)net::MsgType::TickBatch, net::kProtocolVersion,
+               buf.data(), buf.size()))
+    return false;
+  net::Msg m;
+  for (int i = 0; i < 8192; i++) {
+    tx.Poll();
+    rx.Poll();
+    if (rx.Recv(m)) break;
+    if (i == 8191) return false;
+  }
+  OpBatch rb;
+  IVec3 rorigin{0, 0, 0};
+  uint32_t rlabel = 0;
+  if (!net::OpsWire::Decode(m.payload.data(), m.payload.size(), rb, rorigin,
+                            rlabel) ||
+      rlabel != label)
+    return false;
+  q.NoteRemote(rlabel, author, rorigin, std::move(rb));
+  return true;
+}
+
+// The merged batch of one tick, as bytes, for the arm-to-arm memcmp. Reusing
+// OpsWire is deliberate: it is one encoder, it covers every field of every op
+// struct, and a comparison that walked the vectors by hand would be a second
+// definition of "the same batch".
+void BlobOf(const OpBatch& b, std::vector<uint8_t>& out) {
+  net::OpsWire::Encode(b, IVec3{0, 0, 0}, 0, out);
+}
+
+// THE TICK ON WHICH BOTH AUTHORS HAVE A BRUSH OP, which is the only tick that
+// can tell the two orderings apart. The script gives player 0 a stroke every
+// 10 script-ticks and player 1 one every 13, so they coincide at script tick
+// 130 — and a merge at tick T carries what was authored at T - D, so the
+// merged tick to look at is 130 + D.
+constexpr uint32_t kBothAuthorsTick = 130 + net::kOpLabelAhead;
+
+struct ArmResult {
+  std::vector<uint32_t> hashes;
+  std::vector<std::vector<uint8_t>> blobs;   // one per tick
+  // At kBothAuthorsTick: how many brush ops the merge produced, and the
+  // merged index of the first REMOTE one. Together they say who led.
+  int bothOps = -1;
+  int bothRemoteIdx = -1;
+  uint64_t missingLocal = 0, missingRemote = 0, mergedMax = 0;
+  bool wireOk = true;
+};
+
+// Play the script from ONE seat. `localId` is which player this machine is.
+void RunArm(Ctx& c, const Script& sc, uint32_t localId, ArmResult& r) {
+  SubmitWorldgen(c.ctx, c.world, c.sim, sc.seed);
+  c.ctx.WaitIdle();
+
+  net::LoopbackPair lb = net::MakeLoopback();
+  net::OpDelayQueue q;
+  q.SetLocalId(localId);
+  const uint32_t D = q.D();
+
+  for (uint32_t t = 1; t <= (uint32_t)kTicks; t++) {
+    const OpBatch host = sc.Host(t), client = sc.Client(t);
+    const uint32_t label = t + D;
+    // The peer's batch travels; ours is pushed straight in, which is exactly
+    // what session.cpp phase N does on a real machine.
+    if (localId == 0) {
+      q.PushLocal(t, host, sc.origin);
+      if (!ExchangeOne(*lb.b, *lb.a, client, sc.origin, label, 1, q))
+        r.wireOk = false;
+    } else {
+      q.PushLocal(t, client, sc.origin);
+      if (!ExchangeOne(*lb.b, *lb.a, host, sc.origin, label, 0, q))
+        r.wireOk = false;
+    }
+
+    net::MergeStats ms;
+    std::vector<uint32_t> remoteBrush;
+    OpBatch merged = q.Merge(t, c.world, ms, &remoteBrush);
+    if (t == kBothAuthorsTick) {
+      r.bothOps = (int)merged.ops.size();
+      r.bothRemoteIdx = remoteBrush.empty() ? -1 : (int)remoteBrush[0];
+    }
+    r.blobs.emplace_back();
+    BlobOf(merged, r.blobs.back());
+
+    SubmitTick(c.ctx, c.world, c.sim, t, sc.seed, merged.ops, merged.exps,
+               merged.cells, true, {8, 3, 8}, false, t >= 100, merged.spawns,
+               0, merged.fluid);
+    if (t % kProbeEvery == 0 || t == (uint32_t)kTicks)
+      r.hashes.push_back(ReadHashSync(c.ctx, c.world));
+  }
+  r.missingLocal = q.missingLocal;
+  r.missingRemote = q.missingRemote;
+  r.mergedMax = q.mergedMax;
+}
+
+}  // namespace opsexch
+
+Status GateOpsExchange(Ctx& c, std::string& detail) {
+  using namespace opsexch;
+  namespace ops = sandvox::opstream;
+  Table t;
+
+  const uint32_t seed = kDefaultSeed;
+  const IVec3 wo = c.world.WindowOrigin();
+  Script sc;
+  sc.seed = seed;
+  sc.origin = wo;
+  sc.ox = wo.x * (int)kChunk;
+  sc.oz = wo.z * (int)kChunk;
+  sc.hx = sc.ox + 120;
+  sc.hz = sc.oz + 120;
+  sc.hy = FixtureY(sc.hx, sc.hz, seed, 30);
+  // The client's cell box, in a chunk well inside the window so both peers
+  // hold it (arm (D) below is where non-residency is tested, deliberately, so
+  // that (A)'s two arms compare like with like).
+  sc.cellBase = {sc.ox + 70, FixtureY(sc.ox + 70, sc.oz + 70, seed, 30),
+                 sc.oz + 70};
+
+  // ---- (F) the wire blob, before anything expensive ----------------------
+  {
+    OpBatch b;
+    b.ops.push_back({1, 2, 3, 4, kMatStone, 1u, 0, 0});
+    b.exps.push_back({5, 6, 7, 8, 99, 3, 0, 0});
+    b.cells.push_back({1234u, PackVoxNew(kMatWood, 2)});
+    b.spawns.push_back({1, 2, 3, 4, 5, 6, 7u, 1u});
+    b.fluid.push_back({1, 2, 3, 4, 5, 6, 2u, kMatWater});
+    std::vector<uint8_t> buf;
+    net::OpsWire::Encode(b, IVec3{9, -8, 7}, 4242u, buf);
+    OpBatch out;
+    IVec3 origin{0, 0, 0};
+    uint32_t label = 0;
+    t.True("wire: a full batch decodes",
+           net::OpsWire::Decode(buf.data(), buf.size(), out, origin, label));
+    t.Eq("wire: label survives", (long long)label, 4242ll);
+    t.Eq("wire: origin survives",
+         (long long)(origin.x * 100 + origin.y * 10 + origin.z), 827ll);
+    t.Eq("wire: the five vectors keep their sizes",
+         (long long)(out.ops.size() + out.exps.size() * 10 +
+                     out.cells.size() * 100 + out.spawns.size() * 1000 +
+                     out.fluid.size() * 10000),
+         11111ll);
+    t.Eq("wire: a brush op survives field for field",
+         std::memcmp(&out.ops[0], &b.ops[0], sizeof(BrushOp)), 0);
+    t.Eq("wire: an explosion keeps its author",
+         (long long)out.exps[0].author, 3ll);
+    t.Eq("wire: a cell op survives",
+         std::memcmp(&out.cells[0], &b.cells[0], sizeof(CellOp)), 0);
+    // A TRUNCATED BLOB IS REFUSED WHOLE. Half a peer's tick is worse than
+    // none of it: the pacer would run the tick believing everything arrived.
+    OpBatch half;
+    t.False("wire: a truncated blob is refused",
+            net::OpsWire::Decode(buf.data(), buf.size() / 2, half, origin,
+                                 label));
+    t.Eq("wire: ...and leaves nothing behind", (long long)half.ops.size(), 0ll);
+    std::vector<uint8_t> bad = buf;
+    bad[0] ^= 0xFFu;   // the version word
+    t.False("wire: a wrong version is refused",
+            net::OpsWire::Decode(bad.data(), bad.size(), half, origin, label));
+  }
+
+  // ---- (E) the copied slot arithmetic ------------------------------------
+  {
+    int agree = 0;
+    for (uint32_t s = 0; s < kNumChunks; s += 977u) {
+      const IVec3 a = net::SlotChunkUnderOrigin(s, wo);
+      const IVec3 b = c.world.SlotToWorldChunk(s);
+      if (a.x == b.x && a.y == b.y && a.z == b.z) agree++;
+    }
+    t.Eq("slot arithmetic: the copy agrees with World over every probed slot",
+         agree, (int)((kNumChunks + 976u) / 977u));
+  }
+
+  // ---- (D) residency: a peer whose window is four chunks along -----------
+  //
+  // Two CellOp boxes from the peer: one in a chunk both windows hold, one in
+  // a chunk only the PEER holds (x = origin + 33, past this window's 32). The
+  // slot index is the same arithmetic either way — what separates them is the
+  // origin the peer computed them under, which is the whole reason that
+  // origin is on the wire.
+  {
+    const IVec3 peerOrigin{wo.x + 4, wo.y, wo.z};
+    const IVec3 shared{wo.x + 8, wo.y + 1, wo.z + 1};
+    const IVec3 peerOnly{wo.x + 33, wo.y + 1, wo.z + 1};
+    t.True("residency fixture: the shared chunk IS resident here",
+           c.world.ChunkInWindow(shared));
+    t.False("residency fixture: the peer-only chunk is NOT",
+            c.world.ChunkInWindow(peerOnly));
+    OpBatch peer;
+    auto box = [&](IVec3 wc) {
+      for (int k = 0; k < 8; k++)
+        peer.cells.push_back({World::SlotChunkIndex(wc) * kChunkVol + (uint32_t)k,
+                              PackVoxNew(kMatStone, 0)});
+    };
+    box(shared);
+    box(peerOnly);
+    net::OpDelayQueue q;
+    q.SetLocalId(0);
+    OpBatch mine;   // the local side authors nothing this tick
+    q.PushLocal(0, mine, wo);
+    q.NoteRemote(q.D(), 1, peerOrigin, peer);
+    net::MergeStats ms;
+    OpBatch merged = q.Merge(q.D(), c.world, ms);
+    t.Eq("residency: the shared chunk's cells are kept",
+         (long long)ms.remoteCells, 8ll);
+    t.Eq("residency: the peer-only chunk's cells are dropped",
+         (long long)ms.remoteCellsDropped, 8ll);
+    t.Eq("residency: ...and the merged batch carries only the kept ones",
+         (long long)merged.cells.size(), 8ll);
+    t.True("residency: the drop names its chunk", ms.haveFirstDrop);
+    t.Eq("residency: ...and it is the peer-only one",
+         (long long)(ms.firstDropChunk[0] - wo.x), 33ll);
+  }
+
+  // ---- (A)(B)(C)(G) the two seats ----------------------------------------
+  const std::string path = "build/ops_exchange.svops";
+  std::string err;
+  const bool rec = ops::StartRecording(path, seed, c.mats, err);
+  if (!rec) std::printf("ops-exchange: not recording (%s)\n", err.c_str());
+
+  ArmResult host;
+  RunArm(c, sc, 0, host);
+  const uint32_t frames = ops::RecordedFrames();
+  if (rec) ops::StopRecording();
+
+  ArmResult client;
+  RunArm(c, sc, 1, client);
+
+  t.True("wire: every batch crossed the loopback link (host seat)",
+         host.wireOk);
+  t.True("wire: every batch crossed the loopback link (client seat)",
+         client.wireOk);
+
+  // (A) the merged vectors, byte for byte, every tick.
+  size_t firstBlobDiff = (size_t)-1;
+  for (size_t i = 0; i < host.blobs.size() && i < client.blobs.size(); i++) {
+    if (host.blobs[i].size() != client.blobs[i].size() ||
+        std::memcmp(host.blobs[i].data(), client.blobs[i].data(),
+                    host.blobs[i].size()) != 0) {
+      firstBlobDiff = i;
+      break;
+    }
+  }
+  t.Eq("canonical: both seats merged the same number of ticks",
+       (long long)host.blobs.size(), (long long)client.blobs.size());
+  t.Eq("canonical: the merged batch is byte-identical on both seats "
+       "(first differing tick, or -1)",
+       (long long)(firstBlobDiff == (size_t)-1 ? -1 : (long long)firstBlobDiff + 1),
+       -1ll);
+  // ...and therefore the two worlds are the same world.
+  size_t firstHashDiff = (size_t)-1;
+  for (size_t i = 0; i < host.hashes.size() && i < client.hashes.size(); i++)
+    if (host.hashes[i] != client.hashes[i]) { firstHashDiff = i; break; }
+  t.Eq("canonical: the world hash agrees at every probe",
+       (long long)(firstHashDiff == (size_t)-1 ? -1
+                                               : (long long)firstHashDiff),
+       -1ll);
+  t.True("canonical: the arms actually did something (a non-empty merge)",
+         host.mergedMax > 0);
+
+  // (B) author-major order, on the one tick that can tell it apart: both
+  // players authored a brush op, so the merge has two and the question is
+  // which is at index 0. Player 0's, on BOTH seats — so the REMOTE op is at
+  // index 1 from the host's seat and at index 0 from the client's. A merge
+  // that put "mine" first would swap exactly these two numbers.
+  t.Eq("order: the both-authors tick merged two brush ops (host seat)",
+       (long long)host.bothOps, 2ll);
+  t.Eq("order: the both-authors tick merged two brush ops (client seat)",
+       (long long)client.bothOps, 2ll);
+  t.Eq("order: from the HOST's seat the peer's op is second",
+       (long long)host.bothRemoteIdx, 1ll);
+  t.Eq("order: from the CLIENT's seat the peer's (player 0's) op is first",
+       (long long)client.bothRemoteIdx, 0ll);
+
+  // (C) the delay's warm-up: D merges with no local batch and D with no
+  // remote one, because nothing was labelled for the first D ticks.
+  t.Eq("delay: the first D+1 ticks merged no local batch",
+       (long long)host.missingLocal, (long long)net::kOpLabelAhead);
+  t.Eq("delay: ...and no remote one either",
+       (long long)host.missingRemote, (long long)net::kOpLabelAhead);
+
+  // (G) the record of the host seat replays to the same hash series.
+  std::vector<uint32_t> replay;
+  bool replayRan = false;
+  if (rec) {
+    ops::Log log;
+    if (log.Load(path, c.mats, err)) {
+      struct ReplayArm {
+        explicit ReplayArm(const ops::Log* l) {
+          ops::ResetReplayStats();
+          ops::SetReplay(l);
+        }
+        ~ReplayArm() { ops::SetReplay(nullptr); }
+      } arm(&log);
+      SubmitWorldgen(c.ctx, c.world, c.sim, log.header.seed);
+      c.ctx.WaitIdle();
+      for (const ops::Frame& f : log.frames) {
+        SubmitTick(c.ctx, c.world, c.sim, f.in.tick, f.in.seed, f.ops, f.exps,
+                   f.cells, f.in.hashEnable != 0,
+                   {f.in.playerChunk[0], f.in.playerChunk[1],
+                    f.in.playerChunk[2]},
+                   f.in.wantReadback != 0, f.in.particlesActive != 0, f.spawns,
+                   f.in.farCount, f.fluid, f.in.fluidLive,
+                   f.in.hasSplashMat ? f.in.fluidSplashMat : nullptr,
+                   f.in.vizActive != 0);
+        if (f.in.tick % kProbeEvery == 0 || f.in.tick == (uint32_t)kTicks)
+          replay.push_back(ReadHashSync(c.ctx, c.world));
+      }
+      replayRan = true;
+      t.Eq("replay: the record has one frame per tick",
+           (long long)log.frames.size(), (long long)kTicks);
+      size_t d = (size_t)-1;
+      for (size_t i = 0; i < host.hashes.size() && i < replay.size(); i++)
+        if (host.hashes[i] != replay[i]) { d = i; break; }
+      t.Eq("replay: the merged stream reproduces the hash series",
+           (long long)(d == (size_t)-1 ? -1 : (long long)d), -1ll);
+    } else {
+      t.True("replay: the record loads", false);
+    }
+  }
+
+  if (t.bad) {
+    char b[448];
+    std::snprintf(b, sizeof b, "%d/%d rows FAILED; first: %s", t.bad, t.rows,
+                  t.why.c_str());
+    detail = b;
+    std::printf("ops-exchange: FAIL (%s)\n", b);
+    return Status::Fail;
+  }
+
+  RecordObserved("net.opsExchangeRows", (double)t.rows);
+  RecordObserved("net.opsExchangeMergedMax", (double)host.mergedMax);
+  const double pin = BaselineNumber("net.opsExchangeRows", (double)t.rows);
+  const bool pinOk = (double)t.rows == pin;
+  if (!pinOk) MarkPinnedOnly();
+
+  char b[640];
+  std::snprintf(b, sizeof b,
+                "%d/%.0f rows: %d ticks merged from BOTH seats, byte-identical "
+                "batches and equal hashes at %zu probes; largest merge %llu "
+                "ops; delay warm-up %llu ticks; residency dropped 8 of 16 peer "
+                "cells (chunk x+33); record %u frames %s",
+                t.rows, pin, kTicks, host.hashes.size(),
+                (unsigned long long)host.mergedMax,
+                (unsigned long long)host.missingLocal, frames,
+                replayRan ? "replayed to the same hashes" : "NOT replayed");
+  detail = b;
+  std::printf("ops-exchange: %s\n", b);
+  return pinOk ? Status::Pass : Status::Fail;
+}
+
 }  // namespace
 
 const std::vector<Gate>& NetGates() {
@@ -924,6 +1376,10 @@ const std::vector<Gate>& NetGates() {
       // M9.4-A. No deps and no Ctx use: it reads net/authority.h and nothing
       // else, so it cannot be affected by what an earlier gate left behind.
       {"authority", "net", {}, false, GateAuthority},
+      // M9.3-B. Unlike the two above this one SUBMITS: it worldgens three
+      // times and runs 200 ticks per arm, which is why it is last in the
+      // file and last in the group. No deps -- it builds its own world.
+      {"ops-exchange", "net", {}, false, GateOpsExchange},
   };
   return g;
 }

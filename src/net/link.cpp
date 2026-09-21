@@ -213,6 +213,19 @@ void LinkBase::Ingest(const uint8_t* p, size_t n) {
   }
 }
 
+void LinkBase::Reset() {
+  failed_ = false;
+  err_.clear();
+  // Every byte of the dead peer's conversation goes with it: a half-received
+  // frame reassembled against the NEXT peer's bytes is a protocol error at
+  // best and a silently mis-typed message at worst.
+  out_.clear();
+  outSent_ = 0;
+  in_.clear();
+  inOff_ = 0;
+  rx_.clear();
+}
+
 void LinkBase::Fail(const std::string& why) {
   if (failed_) return;   // FIRST reason wins: it is the one with a cause
   failed_ = true;

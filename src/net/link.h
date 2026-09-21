@@ -93,6 +93,25 @@ class LinkBase : public Link {
   const LinkStats& Stats() const override { return stats_; }
   const std::string& Error() const override { return err_; }
 
+  // UN-LATCH THE FAILURE (M9.3-B; the hole M9.2-C reported).
+  //
+  // `Fail` latches for the life of the object — deliberately, because the
+  // FIRST reason is the one with a cause and a link that keeps re-failing
+  // would report the last symptom instead. The consequence was that a listen
+  // server whose player quit could not go back to listening on its own
+  // socket: `Poll()` returns immediately while `failed_` is set, so the
+  // caller had to throw the whole TcpLink away and re-bind the port. Re-bind
+  // is not free of risk here — there is no SO_REUSEADDR (see Listen), so the
+  // re-listen can legitimately fail and the host then has no port at all.
+  //
+  // Reset clears the latch and the STREAM state. The stream state is the part
+  // that matters and the reason this is not a one-liner: a dead peer can
+  // leave half a frame in `in_`, and re-using the link without dropping it
+  // would parse the next peer's first bytes as the tail of the last peer's
+  // message. Stats are KEPT — they are a run total, and a host that has
+  // served two players has still sent everything it sent.
+  void Reset();
+
  protected:
   // Feed bytes that arrived from the transport; cuts complete frames off the
   // front and queues them. Latches a protocol error on an oversized frame.
