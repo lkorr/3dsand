@@ -3930,37 +3930,6 @@ struct Tuning {
     // tuning.json on 2026-09-19; this struct default was left behind, and a
     // struct default matters whenever the key is missing from the JSON.
     float farPlumeRange = 3276.8f;
-    // ---- FAR FIRE LOD, part 1: the frozen ember's BREATH -----------------
-    // Amplitude of raymarch.wgsl's farEmberPlasma over the emission of far
-    // cascade cells — the slow crawling + pulsing field that makes a fire the
-    // window has left behind read as burning rather than as a static orange
-    // smear. FADED IN with distance from the window face (FAR_EMBER_FADE_VOX),
-    // so the near field's own per-cell flicker is never argued with.
-    //
-    // 0 is an EXACT off switch: farEmberPlasma returns 1.0 on its first line
-    // and the two fbm calls are never made, so the `noplasma` A/B arm is this
-    // knob at zero rather than a second code path. Render-only on render-only
-    // data — nothing here can move the world hash.
-    float farEmberPlasma = 0.55f;
-    // ---- FAR FIRE LOD, part 2: the synthesized FLAME VOLUME --------------
-    // `fire` is CLASS_GAS and is never written to the far cascade at all, so
-    // outside the window a fire has embers and NO FLAME — which is why flame
-    // pops into existence when a burning chunk streams back in. These shape
-    // the short emissive column the GPU synthesizes from the same FarPlumes
-    // emitter list the smoke comes from, deposited into the flame box and
-    // folded into the renderer's ONE fire-glow accumulator (so it takes the
-    // same temperature ramp and the same breath as CA fire, and the seam at
-    // the window face is a crossfade rather than a switch).
-    //
-    // farFlameStrength: emissive density multiplier. 0 is the exact off
-    // switch on the plume knob's terms — no row recorded, no box written.
-    float farFlameStrength = 1.0f;
-    // How far the flame licks above the fire, in METRES. SHORT on purpose:
-    // flame sits on its fuel and hands off to the smoke column above it, and a
-    // tall glowing column reads as a pyre rather than as a burning tree. The
-    // value is for a one-column fire; a wide emitter standing for many columns
-    // scales it by the same sqrt(cols) the plume height uses.
-    float farFlameHeight = 4.0f;
     float lodHandoffDist = 24.0f;
     // ---- frame pacing and internal resolution (CPU-only: no .def row, no
     // TUNE_* constant — nothing here reaches a shader) ----------------------

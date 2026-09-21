@@ -697,75 +697,6 @@ static_assert(kGasFarBlendVox % (int32_t)(1u << kGasFarOuterShift) == 0,
 static_assert(kGasFarOuterShift > kGasOuterShift,
               "the long-range box must be COARSER than gasOuter");
 
-// ---- THE FLAME BOX: what a fire outside the window is MISSING -------------
-//
-// The plume system above gives a frozen fire its SMOKE back. It does not give
-// it back its FLAME, and the reason is structural rather than an oversight:
-// `fire` is CLASS_GAS, and a gas is never written to the far cascade at all.
-// So outside the residency window a fire is a bed of frozen ember/lava voxels
-// with nothing above it, and the flame VOLUME — the thing that actually reads
-// as fire — springs into existence the moment the chunk streams back in. That
-// is the "fire voxels pop in when you get close enough" report.
-//
-// This box is the flame, synthesized from the SAME FarPlumes emitter list the
-// smoke comes from, by the same two kernels' worth of code one LOD apart. Its
-// contents are an EMISSIVE density, folded by the raymarcher into the one
-// fire-glow accumulator CA fire already uses — so the far flame takes the same
-// temperature ramp, the same breath and the same tonemap as the near one, and
-// the seam at the window face is a crossfade rather than a switch.
-//
-// ONE BUFFER, TWO GRIDS, and that is a deliberate saving rather than a packing
-// trick. A grid per LOD would be two more storage bindings in BOTH the gas
-// group and the render group, two clear rows and two pass-table buffer ids,
-// for two arrays that are always written together and always read together.
-// Concatenating them costs one offset constant, and the offset is a whole
-// number of words so neither grid's u16 pairing is disturbed.
-//
-//   [0, kGasFlameFineWords)                 the FINE grid  — gasOuter's
-//                                           geometry EXACTLY (origin, cell,
-//                                           index), so the sampler is the same
-//                                           expression with a different base
-//   [kGasFlameWideBase, kGasFlameWords)     the WIDE grid  — gasFarOuter's
-//                                           geometry exactly, same argument
-//
-// "Exactly" is load-bearing: the splatter and the sampler agreeing on where
-// cell (0,0,0) is IS the interface, and reusing a geometry that two kernels
-// and two sampler functions already agree on is how this feature avoids
-// inventing a third lattice that could drift from the other two.
-constexpr uint32_t kGasFlameFineWords = kGasOuterWords;      // 1 Mi u32 = 4 MiB
-constexpr uint32_t kGasFlameWideBase = kGasFlameFineWords;
-constexpr uint32_t kGasFlameWideWords = kGasFarOuterWords;   // 1 Mi u32 = 4 MiB
-constexpr uint32_t kGasFlameWords = kGasFlameFineWords + kGasFlameWideWords;
-static_assert(kGasFlameWideBase * 2u % 2u == 0,
-              "the wide grid must start on a WORD boundary or its two-u16 "
-              "packing would be half a cell out of phase with its index");
-
-// The flame column is SHORT — render.farFlameHeight defaults to 4 m against
-// the plume's 28 — so it needs far fewer height steps than FAR_PLUME_STEPS,
-// and the workgroup is sized to it. One thread per height cell, as the plume
-// kernels are.
-constexpr uint32_t kGasFlameSteps = 16;
-
-// THE ANTI-CARRY PROOF, and it is this box's version of the one at
-// FAR_PLUME_ADD_MAX rather than a copy of it. Two u16 counts share a word, so
-// a count that overflows 0xFFFF carries into its neighbour and paints a cell
-// that has no fire anywhere near it. The bound is the same shape: one emitter
-// reaches a given cell at most once per height step (the kernels merge
-// same-cell puffs before they add, exactly as the plume kernels do), so the
-// worst case is every emitter in a section landing on one cell.
-//
-// Deliberately TIGHTER than the plume's. A flame is a small, bright, local
-// thing: its whole job is to saturate at its core and be gone a few metres
-// away, so it needs neither the plume's 240-per-add headroom nor its 4,096
-// ceiling, and a lower ceiling buys a bigger safety margin under the same u16.
-constexpr uint32_t kGasFlameAddMax = 160;
-constexpr uint32_t kGasFlameCeil = 2048;
-static_assert(kGasFlameCeil + (kGasFarEmitMax - 1u) * kGasFlameAddMax <= 0xFFFFu,
-              "fine flame counts must not carry into the neighbouring u16");
-static_assert(kGasFlameCeil + (kGasFarEmitMaxWide - 1u) * kGasFlameAddMax <=
-                  0xFFFFu,
-              "wide flame counts must not carry into the neighbouring u16");
-
 // gasSpawn / gasSpawnOps header words. The buffer is an 8-word header followed
 // by Particle-shaped records; the header doubles as this tick's gas counters,
 // which is free because the whole buffer is cleared before the CA runs.
@@ -4028,12 +3959,6 @@ class World {
   // re-splatted on every tick that has a wide emitter — and differing only in
   // its cell size. CopySrc so a gate can read it back.
   rhi::Buffer gasFarOuter;      // kGasFarOuterWords u32 (two u16 counts each)
-  // The FLAME box (see kGasFlameWords): both LODs of the synthesized emissive
-  // flame in one allocation, fine grid first, wide grid at kGasFlameWideBase.
-  // Exactly the standing of the two boxes above — render-only derived data,
-  // not hashed, not saved, cleared and re-splatted on the ticks it is written
-  // — and, like them, CopySrc so a gate can read it back.
-  rhi::Buffer gasFlame;         // kGasFlameWords u32 (two u16 counts each)
 
   // ---- MLS-MPM fluid (see the fluid block above kFluidCap) ----
   // fluidGrid, fluidBlockMap and fluidBlockList are per-substep scratch,

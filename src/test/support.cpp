@@ -2144,44 +2144,6 @@ void ReadGasOuterBoxSync(GpuContext& ctx, World& world, IVec3 loVox,
   if (outSum) *outSum = sum;
 }
 
-// The FLAME box (world.h kGasFlameWords), fine grid, folded over a world-voxel
-// box. The fine grid IS gasOuter's geometry -- same origin rule, same cell
-// shift, same index -- so this is the reader above against a different buffer,
-// which is exactly the property the shared lattice was chosen for. A gate that
-// had to describe a third mapping here would be a gate that could disagree
-// with the splat about where a flame is.
-void ReadGasFlameBoxSync(GpuContext& ctx, World& world, IVec3 loVox,
-                         IVec3 hiVox, uint32_t* outMax, uint64_t* outSum) {
-  std::vector<uint32_t> g(kGasFlameFineWords, 0u);
-  rhi::ReadbackBlocking(ctx.device, ctx.queue, world.gasFlame, 0, g.data(),
-                        (size_t)kGasFlameFineWords * 4, "gasFlameBoxRead");
-  const IVec3 wo = world.WindowOrigin();
-  const int32_t h = (int32_t)(kWorldN / 2);
-  const int32_t o[3] = {wo.x * (int32_t)kChunk - h, wo.y * (int32_t)kChunk - h,
-                        wo.z * (int32_t)kChunk - h};
-  const int32_t lv[3] = {loVox.x, loVox.y, loVox.z};
-  const int32_t hv[3] = {hiVox.x, hiVox.y, hiVox.z};
-  int32_t lo[3], hi[3];
-  for (int a = 0; a < 3; a++) {
-    lo[a] = std::max((lv[a] - o[a]) >> (int32_t)kGasOuterShift, 0);
-    hi[a] = std::min((hv[a] - o[a]) >> (int32_t)kGasOuterShift,
-                     (int32_t)kGasOuterN - 1);
-  }
-  uint32_t mx = 0;
-  uint64_t sum = 0;
-  const uint16_t* b = (const uint16_t*)g.data();
-  for (int32_t cz = lo[2]; cz <= hi[2]; cz++)
-    for (int32_t cy = lo[1]; cy <= hi[1]; cy++)
-      for (int32_t cx = lo[0]; cx <= hi[0]; cx++) {
-        const uint32_t v = b[((uint32_t)cz * kGasOuterN + (uint32_t)cy) *
-                                 kGasOuterN + (uint32_t)cx];
-        if (v > mx) mx = v;
-        sum += v;
-      }
-  if (outMax) *outMax = mx;
-  if (outSum) *outSum = sum;
-}
-
 // The LONG-RANGE box (world.h kGasFarOuterN), folded over a world-voxel box.
 // Same shape as the reader above; the two differ only in the buffer, the cell
 // shift and the ORIGIN RULE, and the third is the one that matters — this box's

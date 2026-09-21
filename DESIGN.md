@@ -5322,6 +5322,27 @@ Four properties worth stating because each cost something to get right:
   functions. The hp charge stays outside both, for the reason the burn exclusion
   gives: the damage is real, only the bleeding is refused.
 
+  **...and DISMEMBERMENT** (2026-09-20). `maxLoss` is hard-capped at
+  `kLimbCollapseFraction`'s complement so "rot must never be the thing that
+  takes a limb off at spawn" — but that cap is about VOLUME, and
+  `Mob::JointRuleApplies` is not. A bite is centred on the SURFACE, a joint is
+  on the surface, and the neck sample is a handful of cells, so a spawn roll at
+  a tenth of its authored budget could still hollow out a shoulder socket and
+  drop the arm — and `Sever` arms an arterial gout, charges `gore.severVoxels`
+  through `DrainBlood`, and calls `Die()` outright if the limb was `vital`.
+  Zombies arrived dismembered, haemorrhaging and dead. `inSpawnRot_` is
+  therefore the third exclusion in `JointRuleApplies` too, beside blunt and
+  fire.
+  `Mob::RebaseJointCounts` is the other half and is not optional: `neckAtSpawn`
+  and `socketAtSpawn` are taken at the top of a limb's FIRST carve, which for a
+  rotted body is the rot, so refusing the verdict alone would leave every joint
+  measured against geometry the creature never had and move the sever to the
+  first blow instead. The baselines are re-taken once the rot finishes, off the
+  body that actually walked in. Deliberately the opposite choice from
+  `voxelsAtSpawn`: a volume baseline answers "how much of this creature is
+  left" and the honest answer for the undead is "not much"; a joint baseline
+  answers "is this limb still held on as well as it was".
+
 Gate `undead` asserts all of it against a **living control arm** — the same
 measurement on a human must come back zero, or "voxels are missing" is not a
 result — plus two spawns of the same def differing per-limb (a per-def seed
@@ -5351,6 +5372,26 @@ silently — the panel arms what it spawns). The undead appear there with no UI
 edit, because a zombie extends the human sidecar and inherits the socket; the
 gate asserts that socket survives the merge, since losing it would drop the
 variant out of that list with nothing else going wrong.
+
+**...and then that dropdown stopped being a catalogue of combinations
+(2026-09-20; `UIState::aiEffectNames`, `MobEffectNames`).** Once a zombie was an
+EFFECT rather than a creature, a picker listing `zombie` and `jujunud_zombie`
+beside `human` and `jujunud` was writing down one composition per row of exactly
+the product the inheritance work exists to compute — and a def
+`MobSystem::DefWithEffects` composed during the session (`human+zombie`, appended
+to the live defs and never removed) turned up in it looking authored. So the
+combo lists **bodies only** — a def whose `effects` is non-empty is some body in
+that list with a modifier already on it — and the modifiers are a row of
+CHECKBOXES built from `assets/mobs/effects/*.json` (`MobEffectNames`, the
+directory being the only honest answer to "which effects exist", since an effect
+is a file poured on a body and is not held on any def). Whatever is ticked is
+handed to `DefWithEffects` at spawn, which is the same call a bitten villager
+gets up through: so `jujunud` + [zombie] resolves to the authored
+`jujunud_zombie.json`, `human` + [zombie] resolves to `zombie.json`, a body with
+no authored combination composes one, and the panel knows the word "zombie"
+nowhere — `effects/burning.json` gets a box the moment somebody writes it. A
+refusal (the derived-def cap, a missing factory) spawns the plain body and logs,
+rather than spawning nothing.
 
 One bug found on the way out, and it was not in this feature: `--shot-mob`
 renders its own frames and so never ran the frame loop's `if (mbSet.dirty)

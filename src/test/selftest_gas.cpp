@@ -774,12 +774,6 @@ struct PlumeRun {
   // It is the one the nearest-first fine cap must have rejected, so the fine
   // box must be empty over it and the wide box must not be.
   uint64_t farColFineSum = 0, farColWideSum = 0;
-  // ARM G, the FLAME box (world.h kGasFlameWords), fine grid, over the same
-  // two columns. `fire` is CLASS_GAS and never reaches the far cascade, so
-  // this box is the only place a fire outside the window HAS a flame; a zero
-  // here with emitters present means the flame splat is not running.
-  uint32_t flameMax = 0;
-  uint64_t flameSum = 0, flameCtrlSum = 0;
   uint32_t renderFlagTicks = 0;
 };
 
@@ -938,7 +932,6 @@ Status GateGasFarPlume(Ctx& c, std::string& detail) {
       // running on the far-emitter half of the union alone.
       t.sim.gasMode = (int)kGasModeWall;
       t.render.farPlumeStrength = 1.0f;
-      t.render.farFlameStrength = 1.0f;
       t.sim.windMode = windEast ? (int)kWindModeDrift : (int)kWindModeOff;
       t.wind.weatherAuto = false;
       t.wind.windDirDeg = 90.0f;     // +x, as the `wind-gas` gate establishes
@@ -973,8 +966,6 @@ Status GateGasFarPlume(Ctx& c, std::string& detail) {
                         nullptr, &r.hiSum);
     ReadGasFarOuterBoxSync(ctx, world, colLo, colHi, &r.wideMax, &r.wideSum);
     ReadGasFarOuterBoxSync(ctx, world, ctlLo, ctlHi, nullptr, &r.wideCtrlSum);
-    ReadGasFlameBoxSync(ctx, world, colLo, colHi, &r.flameMax, &r.flameSum);
-    ReadGasFlameBoxSync(ctx, world, ctlLo, ctlHi, nullptr, &r.flameCtrlSum);
     if (mode == 2) {
       ReadGasOuterBoxSync(ctx, world, farLo, farHi, nullptr, &r.farColFineSum);
       ReadGasFarOuterBoxSync(ctx, world, farLo, farHi, nullptr, &r.farColWideSum);
@@ -994,20 +985,9 @@ Status GateGasFarPlume(Ctx& c, std::string& detail) {
   // arm A's plume. With gasMode 0 already and farPlumeStrength now 0, the
   // emitter count goes to zero, C_GASOUT is false, and the clear is not
   // recorded — so four more ticks must leave the box exactly as it was.
-  //
-  // render.farFlameStrength GOES OFF TOO, and it is not a broadening of the
-  // arm's claim — it is what keeps the claim the one the arm was written to
-  // make. The far fire LOD grew a second half (world.h kGasFlameWords): the
-  // flame splats run over the SAME two emitter lists under their own knob, and
-  // SetGasRenderActive is their render flag as well as the plume's. With the
-  // flame still on, `offFlagTicks` counts the flame's ticks and the arm reads
-  // as "the plume off switch leaks" when nothing of the sort has happened.
-  // What this arm measures is "with every far-fire condition false, is any gas
-  // row recorded at all", so every far-fire condition is what it must set.
   {
     Tuning t = CurrentTuning();
     t.render.farPlumeStrength = 0.0f;
-    t.render.farFlameStrength = 0.0f;
     SetCurrentTuning(t);
   }
   uint32_t offFlagTicks = 0;
@@ -1067,22 +1047,6 @@ Status GateGasFarPlume(Ctx& c, std::string& detail) {
   // plume rather than anyone's leftovers is that it is over the FIRE and the
   // control column a quarter of the box away is exactly zero.
   const bool faded = a.wideSum > 0 && a.wideCtrlSum == 0;
-  // ARM G, THE FLAME. The other half of the far fire LOD (world.h
-  // kGasFlameWords), and the half that exists because `fire` is CLASS_GAS and
-  // is therefore never written to the far cascade at ALL -- so outside the
-  // window a fire has embers and no flame until this box supplies one.
-  //
-  // PAIRED WITH THE CONTROL COLUMN for arm E's reason, restated because it is
-  // the mistake this file has made before: with no emitters there is no flame
-  // row, so nothing clears the flame box and arm B would read arm A's flame
-  // still sitting in it. "Empty with no emitters" is a claim the feature is
-  // designed to make false. What makes this arm A's own flame is that it is
-  // over the FIRE while the control column a quarter of the box away is zero.
-  //
-  // Non-zero rather than a floor, for arm E's reason as well: the deposit is
-  // a smoothstepped crossfade weight times a per-fire pulse times a per-puff
-  // billow, and pinning a number here would re-pin the gate to the look.
-  const bool flamed = a.flameSum > 0 && a.flameMax > 0 && a.flameCtrlSum == 0;
   // ARM F. Three claims that only mean something together: the cap really was
   // the bound (a fixture that fits proves nothing), the surplus was PROMOTED
   // rather than dropped, and the promotion is visible as DENSITY -- over the
@@ -1151,10 +1115,6 @@ Status GateGasFarPlume(Ctx& c, std::string& detail) {
       (unsigned long long)w.hiSum, (unsigned long long)w.loSum,
       (unsigned long long)offSum, offMax, (unsigned long long)a.colSum,
       a.colMax, offCount, offFlagTicks);
-  detail += Format(" | FLAME box over the same column: max %u, sum %llu, "
-                   "control %llu",
-                   a.flameMax, (unsigned long long)a.flameSum,
-                   (unsigned long long)a.flameCtrlSum);
 
   if (!noted)
     detail += " -- the fixture never reached the index: the paint or the "
@@ -1168,11 +1128,6 @@ Status GateGasFarPlume(Ctx& c, std::string& detail) {
   if (!flagged)
     detail += " -- the gas RENDER flag did not arm on every tick, so the "
               "raymarcher skips the box the splat just filled";
-  if (!flamed)
-    detail += " -- NO FLAME over the frozen fire: the flame box is empty (or "
-              "the control column is not), so a fire outside the window still "
-              "has embers and nothing above them -- which is the pop this "
-              "feature exists to remove";
   if (!quiet)
     detail += " -- the box is not empty with NO emitters: something else is "
               "writing it and arm A measured that instead";
@@ -1212,8 +1167,7 @@ Status GateGasFarPlume(Ctx& c, std::string& detail) {
                   : " -- the farthest chunk is in the FINE box, so the cap did "
                     "not reject it and the promotion is untested";
   const bool ok = noted && drawn && placed && flagged && quiet && inert &&
-                  drifted && offExact && faded && capBound && capDrawn &&
-                  flamed;
+                  drifted && offExact && faded && capBound && capDrawn;
   std::printf("gas-farplume: %s (%s)\n", ok ? "PASS" : "FAIL", detail.c_str());
 
   // Leave the world as it was found (rule 7), index included: an emitter left

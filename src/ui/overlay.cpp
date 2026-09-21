@@ -1383,10 +1383,10 @@ void Overlay::Draw(UIState& s) {
         if (ImGui::BeginTabItem("Spawn")) {
           ImGui::TextDisabled("spawns a creature, a few metres ahead of you");
           ImGui::TextDisabled("(or at the crosshair hit):");
-          // WHICH CREATURE. Every mob def that can hold a weapon, mirrored by
-          // main.cpp off the live defs — so a new creature (or a variant
-          // sidecar like zombie.json) appears here on the next R with no list
-          // to keep in step by hand.
+          // WHICH BODY. Every mob def that can hold a weapon and is not itself
+          // a variant of one, mirrored by main.cpp off the live defs — so a new
+          // creature appears here on the next R with no list to keep in step by
+          // hand. What is WRONG with the body is the checkbox row below.
           if (!s.aiCreatureNames.empty()) {
             if (s.aiCreaturePick >= (int)s.aiCreatureNames.size())
               s.aiCreaturePick = 0;
@@ -1402,8 +1402,29 @@ void Overlay::Draw(UIState& s) {
               }
               ImGui::EndCombo();
             }
-            ImGui::TextDisabled("the undead walk slower, come apart when");
-            ImGui::TextDisabled("cut, and spawn already bitten");
+          }
+          // WHAT IS WRONG WITH IT. One box per published effect
+          // (UIState::aiEffectNames): the panel no longer has a creature called
+          // "zombie" in it, it has a body and a tick. Ticking one hands it to
+          // MobSystem::DefWithEffects, which prefers an authored combination
+          // (jujunud_zombie.json) and composes one when there is none — so
+          // `jujunud` + zombie and `human` + zombie are both one click and
+          // neither needs a def of its own.
+          if (!s.aiEffectNames.empty()) {
+            ImGui::TextDisabled("...and what is wrong with it:");
+            for (int i = 0; i < (int)s.aiEffectNames.size(); i++) {
+              if (i >= (int)s.aiEffectOn.size()) break;
+              // Two per row: the list is short and a column of lone checkboxes
+              // wastes the panel's height on the tab that has the most in it.
+              if (i > 0 && (i & 1) != 0) ImGui::SameLine(190);
+              ImGui::PushID(i);
+              bool on = s.aiEffectOn[i] != 0;
+              if (ImGui::Checkbox(s.aiEffectNames[i].c_str(), &on))
+                s.aiEffectOn[i] = on ? 1 : 0;
+              ImGui::PopID();
+            }
+            ImGui::TextDisabled("zombie: walks slower, comes apart when cut,");
+            ImGui::TextDisabled("spawns already bitten, bites back");
           }
           ImGui::TextDisabled("armed with:");
           // WHICH WEAPON. Every melee item in the library plus "(unarmed)",

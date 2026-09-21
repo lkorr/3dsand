@@ -339,11 +339,6 @@ SPEC = [
     ("render", "farPlumeHeight", "TUNE_FAR_PLUME_HEIGHT", "f", 28.0),
     ("render", "farPlumeRange", "TUNE_FAR_PLUME_RANGE", "f", 3276.8),
 
-    # far FIRE LOD: the frozen ember's breath, and the synthesized flame
-    ("render", "farEmberPlasma", "TUNE_FAR_EMBER_PLASMA", "f", 0.55),
-    ("render", "farFlameStrength", "TUNE_FAR_FLAME_STRENGTH", "f", 1.0),
-    ("render", "farFlameHeight", "TUNE_FAR_FLAME_HEIGHT", "f", 4.0),
-
     # in-window LOD handoff (PLAN_surface_flight_perf.md A1)
     ("render", "lodHandoffDist", "TUNE_LOD_HANDOFF_DIST", "f", 24.0),
     ("render", "shadowMaxDist", "TUNE_SHADOW_MAX_DIST", "f", 999.0),

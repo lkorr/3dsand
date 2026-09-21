@@ -62,7 +62,7 @@ function readLit(wv, cv){
     var page = await (await fetch('/', {cache: 'no-store'})).text();
     [['nav button',      /data-tab="environment"/],
      ['section',         /id="view-environment"/],
-     ['tab allowlist',   /'models','environment'/],
+     ['tab allowlist',   /\[[^\]]*'environment'[^\]]*\]\.includes\(activeTab\)/],
      ['renderAll hook',  /activeTab==='environment'\)\{envActivate/],
      ['host bridge',     /__tunerRegisterEnv/],
      ['tuning hook',     /tuning:\(\)=>\(\{schema/],

@@ -5053,12 +5053,17 @@ Status GateUndead(Ctx& c, std::string& detail) {
   // the kinematic piece for kSeverHoldSeconds). So the slot count was blind to
   // the one thing this claim exists to refuse. What CAN see it is a base limb
   // with no body the instant after Spawn -- and it matters now, because the
-  // joint-attachment rule that landed today (Mob::JointRuleApplies /
-  // DropDisconnectedChildren, reached from CarveLimb) is not excluded under
-  // inSpawnRot_: a rot bite that eats a socket out of the torso severs the arm
-  // seated in it, and Sever() charges gore.severVoxels through DrainBlood --
-  // which is the only way `dry` below can be false with no tick run. Both are
-  // therefore printed side by side so a red here names its cause.
+  // joint-attachment rule (Mob::JointRuleApplies / DropDisconnectedChildren,
+  // reached from CarveLimb) WAS not excluded under inSpawnRot_: a rot bite that
+  // eats a socket out of the torso severed the arm seated in it, and Sever()
+  // charges gore.severVoxels through DrainBlood -- which is the only way `dry`
+  // below can be false with no tick run. So the two reds always arrived
+  // together, and the owner saw the whole chain: zombies that spawned missing
+  // limbs, bleeding hard, dead before they took a step (vital limbs route
+  // Sever straight to Die). Fixed 2026-09-20 by the third inSpawnRot_
+  // exclusion, and by re-taking the joint baselines once the rot is done so
+  // the refusal does not just move the sever to the first blow instead.
+  // Both numbers stay printed side by side so a red here names its cause.
   int severedAtSpawn = 0;
   for (int i = 0; i < ma->AppendedBase(); i++)
     if (c.mobs.LimbBody(zA, i) == 0) severedAtSpawn++;

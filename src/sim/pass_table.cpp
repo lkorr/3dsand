@@ -104,8 +104,6 @@ namespace {
 #define PIPE_GAS_RESOLVE     Pipe::GasResolve
 #define PIPE_GAS_FARPLUME    Pipe::GasFarPlume
 #define PIPE_GAS_FARPLUMEW   Pipe::GasFarPlumeWide
-#define PIPE_GAS_FARFLAME    Pipe::GasFarFlame
-#define PIPE_GAS_FARFLAMEW   Pipe::GasFarFlameWide
 
 #define K_COMPUTE  Kind::Compute
 #define K_INDIRECT Kind::ComputeIndirect
@@ -150,9 +148,6 @@ namespace {
 #define C_GASFAR    Cond::GasFarEmit
 #define C_GASOUT    Cond::GasOuter
 #define C_GASWIDE   Cond::GasFarWide
-#define C_GASFLAMEF Cond::GasFlameFine
-#define C_GASFLAMEW Cond::GasFlameWide
-#define C_GASFLAME  Cond::GasFlame
 #define C_REPOSE    Cond::ReposeActive
 
 #define D_WINDWAKE  (uint32_t)DispatchSel::WindWakeSel
@@ -180,8 +175,6 @@ namespace {
 #define IND_GASARGS       (uint32_t)DispatchSel::IndGasDispatchArgs
 #define D_GASFAREMIT      (uint32_t)DispatchSel::GasFarEmitSel
 #define D_GASFARWIDE      (uint32_t)DispatchSel::GasFarWideSel
-#define D_GASFLAME        (uint32_t)DispatchSel::GasFlameSel
-#define D_GASFLAMEWIDE    (uint32_t)DispatchSel::GasFlameWideSel
 
 // ---- expansion 1: the rows -----------------------------------------------
 #define R(b)  Use{Buf::b, Acc::StorageRead},

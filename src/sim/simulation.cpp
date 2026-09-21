@@ -365,10 +365,6 @@ bool Simulation::Init(const rhi::Device& device, World& world,
         // entry against a whole extra layout to bind.
         entry(11, T::ReadOnlyStorage), // gasFarEmit
         entry(12, T::Storage),         // gasFarOuter (the long-range box)
-        // The FLAME box (world.h kGasFlameWords): both LODs in ONE
-        // allocation, so the two flame splats add one binding between
-        // them rather than one each.
-        entry(13, T::Storage),         // gasFlame
     };
     gasBGL_ = device.CreateBindGroupLayout(gentries, std::size(gentries));
 
@@ -541,17 +537,6 @@ bool Simulation::Init(const rhi::Device& device, World& world,
         // the pipeline will not build, and that is the one thing a
         // renderer edit cannot add for itself.
         entry(23, T::ReadOnlyStorage, S::Fragment),               // gasFarOuter
-        // The FLAME box (world.h kGasFlameWords). Same standing and the
-        // same arrow as the two density boxes above: the two splat
-        // kernels are its sole writers, on the TICK command buffer, and
-        // the raymarcher reads it in the FRAGMENT stage of the same
-        // frame. Declared HERE for gasOuter's stated reason -- a binding
-        // a shader names must exist in the layout or the pipeline will
-        // not build, and that is the one thing a renderer edit cannot add
-        // for itself. At render.farFlameStrength 0 the shader never reads
-        // it and the block const-folds away; the entry costs one
-        // descriptor.
-        entry(24, T::ReadOnlyStorage, S::Fragment),               // gasFlame
     };
     renderBGL_ = device.CreateBindGroupLayout(entries, std::size(entries));
 
@@ -670,7 +655,6 @@ bool Simulation::Init(const rhi::Device& device, World& world,
         b(10, world_->gasSpawnOps),
         b(11, world_->gasFarEmit),
         b(12, world_->gasFarOuter),
-        b(13, world_->gasFlame),
     };
     gasBG_[page] =
         device.CreateBindGroup(gasBGL_, gentries, std::size(gentries), "gasBG");
@@ -714,7 +698,6 @@ bool Simulation::Init(const rhi::Device& device, World& world,
         b(21, world_->gasOuter),
         b(22, world_->waterFlux),
         b(23, world_->gasFarOuter),
-        b(24, world_->gasFlame),
     };
     renderBG_ = device.CreateBindGroup(renderBGL_, entries, std::size(entries), "renderBG");
   }
@@ -1548,8 +1531,6 @@ bool Simulation::BuildPipelines(const rhi::Device& device, std::string* err) {
   pool.Add([&] { gResolve_ = MakeComputePipeline(device, gasPL_, mGas, "gasResolve", "gasResolve"); });
   pool.Add([&] { gFarPlume_ = MakeComputePipeline(device, gasPL_, mGas, "gasFarPlume", "gasFarPlume"); });
   pool.Add([&] { gFarPlumeW_ = MakeComputePipeline(device, gasPL_, mGas, "gasFarPlumeWide", "gasFarPlumeWide"); });
-  pool.Add([&] { gFarFlame_ = MakeComputePipeline(device, gasPL_, mGas, "gasFarFlame", "gasFarFlame"); });
-  pool.Add([&] { gFarFlameW_ = MakeComputePipeline(device, gasPL_, mGas, "gasFarFlameWide", "gasFarFlameWide"); });
 
   pool.Add([&] { fluidMark_ = MakeComputePipeline(device, fluidPL_, mFluid, "mark", "fluidMark"); });
   pool.Add([&] { fluidAlloc_ = MakeComputePipeline(device, fluidPL_, mFluid, "alloc", "fluidAlloc"); });
@@ -1886,12 +1867,6 @@ struct RecordCtx {
   // clear falls back to the parcel latch alone, exactly as before.
   uint32_t gasFarEmitCount = 0;
   uint32_t gasFarWideCount = 0;
-  // The FLAME half (world.h kGasFlameWords), counted under its OWN knob so the
-  // two halves of the far fire LOD are independently switchable. Mirrors
-  // rhi::TableCtx / vk::RecordCtx -- three structs that must agree, which is
-  // why the field is named identically in all three.
-  uint32_t gasFlameCount = 0;
-  uint32_t gasFlameWideCount = 0;
   // Angle of repose (world.h kReposeSnap*). See the latch in EncodeTick.
   bool reposeActive = false;
 };
@@ -1993,7 +1968,6 @@ const rhi::Buffer& Simulation::PassBuffer(pass::Buf b) const {
     case B::GasOuter:            return world_->gasOuter;
     case B::GasFarEmit:          return world_->gasFarEmit;
     case B::GasFarOuter:         return world_->gasFarOuter;
-    case B::GasFlame:            return world_->gasFlame;
     case B::ReposeSnap:          return world_->reposeSnap;
     default:                return world_->voxels;
   }
@@ -2024,8 +1998,6 @@ const rhi::ComputePipeline& Simulation::PassPipeline(pass::Pipe p) const {
     case P::GasResolve:     return gResolve_;
     case P::GasFarPlume:    return gFarPlume_;
     case P::GasFarPlumeWide: return gFarPlumeW_;
-    case P::GasFarFlame:    return gFarFlame_;
-    case P::GasFarFlameWide: return gFarFlameW_;
     case P::PArgs1:         return pArgs1_;
     case P::PSpawn:         return pSpawn_;
     case P::PIntegrate:     return pIntegrate_;
@@ -2125,8 +2097,6 @@ void Simulation::RecordTable(const rhi::CommandEncoder& enc, pass::Table which,
   tc.gasActive = cx.gasActive;
   tc.gasFarEmitCount = cx.gasFarEmitCount;
   tc.gasFarWideCount = cx.gasFarWideCount;
-  tc.gasFlameCount = cx.gasFlameCount;
-  tc.gasFlameWideCount = cx.gasFlameWideCount;
   tc.reposeActive = cx.reposeActive;
 
   rhi::TableBindings tb{};
@@ -2598,17 +2568,6 @@ void Simulation::EncodeTick(const rhi::CommandEncoder& enc, uint32_t opsCount,
   cx.gasFarWideCount =
       CurrentTuning().render.farPlumeStrength > 0.0f ? farPlumeWideCount_ : 0u;
 
-  // ---- C_GASFLAMEF / C_GASFLAMEW: the FLAME half of the far fire LOD -------
-  // The same two emitter lists, counted again under the flame's OWN knob.
-  // render.farFlameStrength 0 is an exact off switch on farPlumeStrength's
-  // terms — the counts go to zero, neither splat row is recorded, and the
-  // flame box's clear (their union) is not recorded either, so the 8 MiB is
-  // never touched. Separate from the plume's counts so "smoke, no flame" and
-  // "flame, no smoke" are both reachable from tuning.json with F5.
-  const bool flameOn = CurrentTuning().render.farFlameStrength > 0.0f;
-  cx.gasFlameCount = flameOn ? farPlumeCount_ : 0u;
-  cx.gasFlameWideCount = flameOn ? farPlumeWideCount_ : 0u;
-
   // ---- the repose snapshot prepass ----------------------------------------
   // `anyRepose_` is a property of the MATERIAL TABLE, latched in UploadTables,
   // so a world whose materials.json carries no `repose` line never records the
@@ -2638,14 +2597,8 @@ void Simulation::EncodeTick(const rhi::CommandEncoder& enc, uint32_t opsCount,
   // frame on which the box holds a plume the renderer is told to ignore, and
   // none on which it is told to read a box nobody cleared.
   if (gasSeenHold_ > 0) gasSeenHold_--;
-  //
-  // THE FLAME ARMS IT TOO, and it has to: the flame is sampled INSIDE the
-  // gas march (that is the whole reason it is not a second volumetric walk —
-  // see gotcha-raymarch-register-cliff), so a frame whose gas flag is down
-  // walks neither box. Without this, render.farPlumeStrength 0 with the flame
-  // on would leave the flame written and never read.
   sandvox::SetGasRenderActive((gasOn && gasSeenHold_ > 0) ||
-                              cx.gasFarEmitCount > 0 || cx.gasFlameCount > 0);
+                              cx.gasFarEmitCount > 0);
   // The LONG-RANGE box gets its OWN render flag rather than sharing that one.
   // Sharing would put a 16-sample walk of a second 4 MiB volume on every
   // terrain pixel of every frame in which a campfire smokes ten metres away,
@@ -2653,8 +2606,7 @@ void Simulation::EncodeTick(const rhi::CommandEncoder& enc, uint32_t opsCount,
   // correctness gate on the same terms: the long-range box is only cleared on
   // ticks its own row is recorded, so with the flag off it is stale and must
   // not be sampled.
-  sandvox::SetGasFarRenderActive(cx.gasFarWideCount > 0 ||
-                                 cx.gasFlameWideCount > 0);
+  sandvox::SetGasFarRenderActive(cx.gasFarWideCount > 0);
 
   RecordTable(enc, pass::Table::Tick, &cx);
 

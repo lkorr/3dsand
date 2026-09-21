@@ -481,6 +481,24 @@ static std::string ModelStemFor(const std::string& dir, const std::string& stem,
   return stem;
 }
 
+// Declared in mob.h. Same shape as the source scan below and for the same
+// reason: sorted, so an authoring list built off it is stable, and silent when
+// the directory is missing — a build with no effects is a build where nobody can
+// become anything, not an error.
+std::vector<std::string> MobEffectNames(const std::string& dir) {
+  std::vector<std::string> names;
+  std::error_code ec;
+  const std::filesystem::path fxDir = std::filesystem::path(dir) / "effects";
+  for (auto& e : std::filesystem::directory_iterator(fxDir, ec)) {
+    if (!e.is_regular_file()) continue;
+    if (e.path().extension() != ".json") continue;
+    names.push_back(e.path().stem().string());
+  }
+  if (ec) names.clear();
+  std::sort(names.begin(), names.end());
+  return names;
+}
+
 static std::vector<MobSource> CollectMobSources(const std::string& dir,
                                                 std::string& log,
                                                 std::error_code& ec) {
@@ -8402,10 +8420,66 @@ void Mob::EnsureJointCounts(int limbIndex) {
   }
 }
 
+// ---- WHAT "AT SPAWN" MEANS FOR A BODY THAT ARRIVED DAMAGED -----------------
+//
+// Drop every joint baseline back to "not yet measured", so EnsureJointCounts
+// re-takes it lazily at the next carve — off the lattice the creature is
+// ACTUALLY standing there with.
+//
+// Called once, at the end of RotAtSpawn, and this is the other half of that
+// function's exclusion in JointRuleApplies. Refusing the verdict at spawn
+// without this would leave a hair-trigger instead of a bug: `neckAtSpawn` and
+// `socketAtSpawn` are taken at the top of the FIRST carve a limb ever sees,
+// which for a rotted body is the rot itself, so every one of them would record
+// the PRISTINE geometry the creature never had. The first light blow anywhere
+// near a rotted shoulder would then measure a neck already sitting at half of
+// a number that was never true and take the arm off in one hit.
+//
+// Deliberately NOT the same choice MobLimb::voxelsAtSpawn makes, which stays
+// pristine on purpose (RotAtSpawn's note: the HUD, the burn fraction and the
+// collapse rule all want to read a zombie as three-quarters of a body rather
+// than as a small whole one). The difference is what the number is FOR: a
+// volume baseline answers "how much of this creature is left", and the honest
+// answer for the undead is "not much"; a joint baseline answers "is this limb
+// still held on as well as it was", and the honest reference for that is the
+// body that walked in, not the corpse it was cut from.
+void Mob::RebaseJointCounts() {
+  for (MobLimb& limb : limbs_) {
+    limb.neckAtSpawn = 0;
+    limb.socketAtSpawn = 0;
+  }
+}
+
 bool Mob::JointRuleApplies(int limbIndex) const {
   // BLUNT NEVER AMPUTATES. The owner's spec, and the one exclusion here that is
   // about the weapon rather than about the physics (Mob::BluntCarveScope).
   if (inBluntCarve_) return false;
+  // ---- A CREATURE BORN BITTEN DOES NOT COME APART ON ARRIVAL ---------------
+  //
+  // The third exclusion of the same family as CarveLimb's bleed and brain
+  // refusals (Mob::inSpawnRot_), and the one that was missed when this rule
+  // stopped being about blades. RotAtSpawn's holes are the damage a zombie
+  // ARRIVED with, not damage it is taking now — so they may not be the thing
+  // that takes a limb off, and MobRotDef's own loader says so in as many
+  // words: `maxLoss` is hard-capped at kLimbCollapseFraction's complement
+  // precisely so "rot must never be the thing that takes a limb off at spawn".
+  //
+  // That cap could not reach this rule, because this rule is not about VOLUME.
+  // A bite is a ball centred on the SURFACE, a joint is on the surface, and
+  // the neck sample is a handful of cells: a spawn roll that ate 12% of a
+  // torso — a tenth of its authored budget — could still hollow out a shoulder
+  // socket and drop the arm. And a severed limb is not a cosmetic difference:
+  // Sever arms an arterial gout, throws conserved blood through DrainBlood,
+  // and calls Die() outright if the limb was `vital`. So the observable bug
+  // was the whole chain at once — "spawned zombies lose limbs, bleed heavily
+  // and die before they take a step" — from one rule that had no idea it was
+  // being run against a body's birth state.
+  //
+  // The joint baselines are RE-TAKEN when the rot finishes (RotAtSpawn's tail),
+  // so what this refuses is only the verdict at spawn: the rotted shoulder
+  // becomes this creature's normal, and the next blade to land there is judged
+  // against the body that actually walked in.
+  if (inSpawnRot_) return false;
   // FIRE KEEPS ITS OWN ACCOUNT — the same carve-out HpZeroSevers makes, for a
   // sharper reason than "the gate says so". A joint measure is taken at a point
   // CLAMPED to the limb's surface (the anchor is a rig point and usually sits
@@ -14868,11 +14942,13 @@ uint32_t Mob::RotAtSpawn(World& world) {
       // that rots itself apart at spawn is a content bug and there is no other
       // moment at which anybody would notice.
       inSpawnRot_ = false;
+      RebaseJointCounts();
       return removedTotal;
     }
   }
 
   inSpawnRot_ = false;
+  RebaseJointCounts();
   if (RotDebug()) {
     // EVERY limb's brick record after the whole rot, in one place. A per-carve
     // line cannot see the failure this is looking for: "two limbs share one

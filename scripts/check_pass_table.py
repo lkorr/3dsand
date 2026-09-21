@@ -112,8 +112,6 @@ PIPE_TO_MEMBER = {
     "PIPE_GAS_RESOLVE": "gResolve_",
     "PIPE_GAS_FARPLUME": "gFarPlume_",
     "PIPE_GAS_FARPLUMEW": "gFarPlumeW_",
-    "PIPE_GAS_FARFLAME": "gFarFlame_",
-    "PIPE_GAS_FARFLAMEW": "gFarFlameW_",
     "PIPE_FAR_FILL": "farFill_",
     # The edit-patch half `far` was split into (PLAN_shader_compile package C).
     "PIPE_FAR_PATCH_FILL": "farPatchFill_",
@@ -210,11 +208,6 @@ BUF_TO_WGSL = {
     # group and 23 of the render group. Two independent declarations, two legal
     # numbers, same buffer -- exactly gasOuter's situation one LOD out.
     "GasFarOuter": {"gasFarOuter"},
-    # The FLAME box (world.h kGasFlameWords), binding 13 of the GAS group and
-    # 24 of the render group. BOTH LODs live in this one buffer -- fine grid
-    # first, wide grid at kGasFlameWideBase -- so the two flame splats name the
-    # same id and the box has one clear row between them.
-    "GasFlame": {"gasFlame"},
     "RenderUBO": {"R"},
     "Reactions": {"reactions"},
     "DirtyList": {"dirtyList", "farDirty"},
@@ -396,9 +389,7 @@ _GAS_GROUP1 = {"gasRead", "gasWrite", "gasCounts", "gasSpawn", "gasClaim",
                # writes gasOuter, which is already here.
                "gasFarEmit",
                # ...and the long-range box the wide splat writes, binding 12.
-               "gasFarOuter",
-               # ...and the FLAME box both flame splats write, binding 13.
-               "gasFlame"}
+               "gasFarOuter"}
 _FLUID_GROUP1 = {"fluidParticles", "fluidSpawnOps", "fluidBlockMap",
                  "fluidBlockList", "fluidGrid", "fluidArgs",
                  # splash coupling: particle write page + counts (bindings 6/7)

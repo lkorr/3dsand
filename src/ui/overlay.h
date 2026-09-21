@@ -373,10 +373,33 @@ struct UIState {
   //
   // The list is every def that publishes a `held_right` socket — the same
   // eligibility test the spawn already applied, now surfaced instead of
-  // silently picking for you. That is also why the undead appear here with no
-  // UI edit: a zombie extends the human sidecar, so it inherits the socket.
+  // silently picking for you.
+  //
+  // IT IS BODIES ONLY (2026-09-20). A def that carries `effects` is a VARIANT
+  // of a body that is already in this list — `zombie` is human+zombie,
+  // `jujunud_zombie` is jujunud+zombie — and listing those beside their own
+  // bases made the panel a catalogue of every combination anybody had bothered
+  // to author, which is the thing the inheritance work exists to delete. The
+  // combinations live in `aiEffectNames` below instead: a body, plus boxes.
   std::vector<std::string> aiCreatureNames;
   int aiCreaturePick = 0;
+  // ---- ...AND WHAT IS WRONG WITH IT (2026-09-20) --------------------------
+  //
+  // One checkbox per `assets/mobs/effects/*.json` (game/mob.h MobEffectNames),
+  // rebuilt off the directory on every R like every other list here. Whatever
+  // is ticked is handed to MobSystem::DefWithEffects as `fx` at spawn, so
+  // `jujunud` + [zombie] spawns the zombie of jujunud — resolving to the
+  // AUTHORED `jujunud_zombie.json` if there is one and composing it if there
+  // is not, which is the preference order that call already implements.
+  //
+  // Nothing here knows the word "zombie", and that is the point: the panel
+  // offers exactly the modifiers the content publishes, so `effects/burning.json`
+  // gets a box the moment it exists.
+  //
+  // `int` rather than `bool` because std::vector<bool> has no addressable
+  // element to hand ImGui::Checkbox.
+  std::vector<std::string> aiEffectNames;
+  std::vector<int> aiEffectOn;
   // ---- WHAT THE SPAWN WEARS (2026-09-19) ----------------------------------
   //
   // Until this the panel spawned every creature naked, and the only way to

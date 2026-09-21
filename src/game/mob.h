@@ -1014,6 +1014,17 @@ bool LoadMobDefs(const std::string& dir, const std::vector<MaterialDef>& mats,
                  std::vector<MobDef>& out, MicroBodySet& micro, std::string& log,
                  std::shared_ptr<MobDefFactory>* factoryOut = nullptr);
 
+// EVERY MODIFIER THE CONTENT PUBLISHES: the stems of `<dir>/effects/*.json`,
+// sorted, which is the vocabulary MobSystem::DefWithEffects' `fx` is drawn from.
+// Not part of a def and not held anywhere — an effect is a file that gets poured
+// on a body, so the only honest answer to "which ones exist" is the directory.
+//
+// It exists for the AUTHORING surfaces (the F1 NPC panel's effect checkboxes):
+// a creature is a body plus modifiers now, so the thing that offers you a body
+// has to be able to offer you the modifiers too, without a hand-kept list that
+// goes stale the first time somebody writes `effects/burning.json`.
+std::vector<std::string> MobEffectNames(const std::string& dir);
+
 // Per-creature gore profile: the entity-scoped variance draws, resolved ONCE
 // when the creature is created and then held for its whole life — one NPC can
 // be a heavy bleeder from spawn to corpse while its neighbour bleeds normally,
@@ -2757,9 +2768,15 @@ class Mob {
   // THIS limb, so they have to be recorded before this limb is the one being
   // eaten.
   void EnsureJointCounts(int limbIndex);
+  // Forget every joint baseline, so the next carve re-takes it off the lattice
+  // the creature is actually standing there with. Called once, at the end of
+  // RotAtSpawn: a body born bitten did not arrive with the pristine sockets
+  // EnsureJointCounts would otherwise have recorded on the way in.
+  void RebaseJointCounts();
   // May the joint-attachment rule take a limb off for the carve in progress?
-  // Blunt never amputates; fire keeps its own account; everything else — blade,
-  // blast, and rot even though rot rides the burn flush — may.
+  // Blunt never amputates; fire keeps its own account; spawn rot is the damage
+  // the creature ARRIVED with and may not dismember it; everything else —
+  // blade, blast, and live rot even though rot rides the burn flush — may.
   bool JointRuleApplies(int limbIndex) const;
   // Is `limbIndex` still held on by flesh — on BOTH sides of its joint? False
   // when either side has fallen below gore.woundNeckFraction of what it had.

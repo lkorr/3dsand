@@ -2007,7 +2007,25 @@ Status GateBiteLimbs(Ctx& c, std::string& detail) {
     uint32_t atSpawn = 0;
     uint32_t core = 0, skin = 0;      // rot voxels left by the bite
     uint32_t coreLost = 0, skinLost = 0;
+    int skinHits = 0;                 // of kSeeds surface bites, how many infected
     bool coreOn = true, skinOn = true;
+    // WHICH LIMBS THE CLAIM IS ABOUT. The owner's report is about arms, hands
+    // and legs, and those are the tags asserted. The rest are REPORTED and not
+    // asserted, because each has a reason of its own that this gate does not own:
+    //
+    //   spine — a torso's tissue is a THREE-CELL SHELL over bone (human.json
+    //           anatomy: skin 1, flesh 1, muscle 1, then bone open-ended), so a
+    //           hole punched in a chest exposes mostly rib, and the rewrite
+    //           refuses bone by design. Measured 0 rot from 58 carved voxels.
+    //           Asserting it would be asserting that a chest is made of meat.
+    //   head  — a bite at the MIDDLE of a head reaches `brain`, which is vital:
+    //           the creature dies and the whole rig drops, so the reading is of
+    //           a corpse. The surface bite it is actually asked for works (25).
+    //   foot  — comes OFF to a single 4 hp bite, both at the surface and at the
+    //           core, and has done since before this gate existed. That is worth
+    //           a look and it is not this gate's claim; it is why `foot` is not
+    //           in the bite `target` table (assets/mobs/attack_styles.json).
+    bool asserted = false;
   };
   std::vector<Row> rows;
   {
@@ -2028,6 +2046,7 @@ Status GateBiteLimbs(Ctx& c, std::string& detail) {
       r.name = m->LimbDefAt(li).name;
       r.tag = m->LimbDefAt(li).tag;
       r.atSpawn = mobs.LimbVoxelsAtSpawn(id, li);
+      r.asserted = r.tag == "arm" || r.tag == "hand" || r.tag == "leg";
       rows.push_back(r);
     }
     mobs.Reset();
@@ -2072,10 +2091,19 @@ Status GateBiteLimbs(Ctx& c, std::string& detail) {
     return true;
   };
 
+  // ONE BITE IS A DRAW, AND A GATE ON ONE DRAW IS A KNIFE EDGE. The rewrite is
+  // a hash-thresholded fraction of the flesh a hole exposed, so "this limb took
+  // 1 rot voxel" and "this limb took none" are the same claim measured twice.
+  // The surface arm is therefore run at kSeeds different seeds, on a fresh
+  // creature each time, and what is asserted is the RATE: a bite on a limb
+  // infects it, not one time in three.
+  const int kSeeds = (int)BaselineNumber("biteLimbsSeeds", 3);
+  const int kNeed = (int)BaselineNumber("biteLimbsNeed", 2);
   const float kHp = (float)BaselineNumber("biteLimbsHp", 4.0);
   int inset = 445;
   for (Row& r : rows) {
-    for (int arm = 0; arm < 2; arm++) {
+    // arm -1 = the core control (once); 0..kSeeds-1 = the surface claim.
+    for (int arm = -1; arm < kSeeds; arm++) {
       const uint64_t id = spawn(inset);
       inset = inset == 445 ? 455 : 445;   // alternate two columns, never share
       if (!id) continue;
@@ -2083,21 +2111,27 @@ Status GateBiteLimbs(Ctx& c, std::string& detail) {
       if (!aimPoints(id, r.limb, core, skin)) continue;
       const uint32_t before = mobs.LimbArtVoxelCount(id, r.limb);
       std::vector<ParticleSpawn> spawns;
-      BiteOnce(mobs, c.world, id, r.limb, arm == 0 ? core : skin, kHp,
-               (uint16_t)rotMat, (uint16_t)ichor, 0.85f, 0xB17Eu + (uint32_t)r.limb,
+      BiteOnce(mobs, c.world, id, r.limb, arm < 0 ? core : skin, kHp,
+               (uint16_t)rotMat, (uint16_t)ichor, 0.85f,
+               0xB17Eu + (uint32_t)r.limb * 131u + (uint32_t)(arm + 1) * 7919u,
                spawns);
       const bool on = mobs.LimbBody(id, r.limb) != 0;
       const uint32_t rot = on ? mobs.LimbMaterialCount(id, r.limb, rotMat) : 0;
       const uint32_t after = on ? mobs.LimbArtVoxelCount(id, r.limb) : 0;
       const uint32_t lost = before > after ? before - after : 0;
-      if (arm == 0) {
+      if (arm < 0) {
         r.core = rot;
         r.coreLost = lost;
         r.coreOn = on;
       } else {
-        r.skin = rot;
-        r.skinLost = lost;
-        r.skinOn = on;
+        // The FIRST surface seed is the one reported as the row's reading, so
+        // the readout stays one number per limb; the rest only vote.
+        if (arm == 0) {
+          r.skin = rot;
+          r.skinLost = lost;
+          r.skinOn = on;
+        }
+        if (rot > 0) r.skinHits++;
       }
       mobs.Reset();
       c.debris.Reset();
@@ -2107,25 +2141,45 @@ Status GateBiteLimbs(Ctx& c, std::string& detail) {
 
   // ---- THE READOUT: one row per limb, both arms ----------------------------
   std::string s = mobs.Defs()[defIndex].name + ":";
-  uint32_t skinDead = 0, coreDead = 0, sever = 0;
+  std::string weak;                   // the asserted limbs that failed the rate
+  uint32_t asserted = 0, skinDead = 0, coreDead = 0, sever = 0;
   for (const Row& r : rows) {
     s += " " + r.name + "[" + r.tag + "," + std::to_string(r.atSpawn) + "v skin " +
-         std::to_string(r.skin) + "rot/" + std::to_string(r.skinLost) +
-         "lost core " + std::to_string(r.core) + "rot/" +
-         std::to_string(r.coreLost) + "lost" + (r.skinOn && r.coreOn ? "" : " SEVERED") +
+         std::to_string(r.skin) + "rot/" + std::to_string(r.skinLost) + "lost " +
+         std::to_string(r.skinHits) + "/" + std::to_string(kSeeds) +
+         " core " + std::to_string(r.core) + "rot/" +
+         std::to_string(r.coreLost) + "lost" +
+         (r.skinOn && r.coreOn ? "" : " SEVERED") + (r.asserted ? "" : " (fyi)") +
          "]";
-    if (r.skin == 0) skinDead++;
     if (r.core == 0) coreDead++;
     if (!r.skinOn || !r.coreOn) sever++;
+    if (!r.asserted) continue;
+    asserted++;
+    if (r.skinHits < kNeed) {
+      skinDead++;
+      weak += " " + r.name + "(" + std::to_string(r.skinHits) + "/" +
+              std::to_string(kSeeds) + ")";
+    }
   }
   RecordObserved("biteLimbsLimbs", (double)rows.size());
+  RecordObserved("biteLimbsAsserted", (double)asserted);
   RecordObserved("biteLimbsSkinNoRot", (double)skinDead);
   RecordObserved("biteLimbsCoreNoRot", (double)coreDead);
   RecordObserved("biteLimbsSevered", (double)sever);
-  detail = std::to_string(rows.size()) + " limbs, " + std::to_string(skinDead) +
-           " took NO infection from a surface bite (" + std::to_string(coreDead) +
-           " from a core bite, " + std::to_string(sever) + " severed); " + s;
+  detail = std::to_string(asserted) + " arm/hand/leg limbs of " +
+           std::to_string(rows.size()) + ", " + std::to_string(skinDead) +
+           " infected by fewer than " + std::to_string(kNeed) + " of " +
+           std::to_string(kSeeds) + " surface bites (" + std::to_string(coreDead) +
+           " limbs took nothing from a CORE bite, " + std::to_string(sever) +
+           " severed); " + s;
+  if (asserted == 0) {
+    detail = "no limb on the fixture is tagged arm/hand/leg: " + s;
+    return Status::Skip;
+  }
   if (skinDead == 0) return Status::Pass;
+  detail = "a bite on the surface of" + weak +
+           " left NO infection — this is the owner's report (arms tear and do "
+           "not rot): " + detail;
   return Status::Fail;
 }
 

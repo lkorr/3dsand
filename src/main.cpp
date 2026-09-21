@@ -5715,9 +5715,15 @@ int main(int argc, char** argv) {
   //
   // Eligibility is "publishes a held_right socket", which is the test the spawn
   // ALREADY applied silently — the panel arms what it spawns, and a creature
-  // with no fist cannot be armed. Surfacing it as a list rather than resolving
-  // it to one def is the whole change; a variant sidecar (zombie.json extends
-  // human, so it inherits the socket) therefore appears with no UI edit.
+  // with no fist cannot be armed.
+  //
+  // AND IT IS BODIES ONLY: a def carrying `effects` is some body in this list
+  // with a modifier already poured on it, and it is reachable as that body plus
+  // the box (see the effect list below). Filtering them out is what stops the
+  // combo from growing a row per authored combination — and it is also what
+  // keeps a def MobSystem::DefWithEffects COMPOSED this session (`human+zombie`,
+  // appended to the live defs and never removed) from turning up in the picker
+  // as if somebody had authored it.
   auto rebuildAiCreatures = [&ui, &mobs, &avatarDefName]() {
     const std::string was = (ui.aiCreaturePick >= 0 &&
                              ui.aiCreaturePick < (int)ui.aiCreatureNames.size())
@@ -5725,7 +5731,8 @@ int main(int argc, char** argv) {
                                 : std::string();
     ui.aiCreatureNames.clear();
     for (const MobDef& d : mobs.Defs())
-      if (d.FindSocket("held_right") >= 0) ui.aiCreatureNames.push_back(d.name);
+      if (d.FindSocket("held_right") >= 0 && d.effects.empty())
+        ui.aiCreatureNames.push_back(d.name);
     // First build defaults to the avatar's own species, which is the def the
     // old code preferred when it picked for you — so the panel's behaviour is
     // unchanged until somebody touches the combo.
@@ -5735,6 +5742,23 @@ int main(int argc, char** argv) {
       if (ui.aiCreatureNames[i] == want) ui.aiCreaturePick = i;
   };
   rebuildAiCreatures();
+  // ...AND WHICH MODIFIERS IT CAN POUR ON THAT BODY. The effects directory is
+  // the list (MobEffectNames), re-read on every R for the same reason the two
+  // lists above are rebuilt there: a file somebody just wrote should get its box
+  // without a restart. Ticks are carried across BY NAME, so adding an effect
+  // cannot silently move a tick onto its alphabetical neighbour.
+  auto rebuildAiEffects = [&ui, &assetDir]() {
+    std::vector<std::string> on;
+    for (int i = 0; i < (int)ui.aiEffectNames.size(); i++)
+      if (i < (int)ui.aiEffectOn.size() && ui.aiEffectOn[i] != 0)
+        on.push_back(ui.aiEffectNames[i]);
+    ui.aiEffectNames = MobEffectNames(assetDir + "/mobs");
+    ui.aiEffectOn.assign(ui.aiEffectNames.size(), 0);
+    for (int i = 0; i < (int)ui.aiEffectNames.size(); i++)
+      if (std::find(on.begin(), on.end(), ui.aiEffectNames[i]) != on.end())
+        ui.aiEffectOn[i] = 1;
+  };
+  rebuildAiEffects();
   // Creatures the AI panel put in the world, so its "kill all spawned" button
   // reaps exactly those and leaves content-placed mobs alone.
   std::vector<uint64_t> aiSpawnedMobs;
@@ -7609,6 +7633,7 @@ int main(int argc, char** argv) {
         // After SetDefs, not before: the creature list is the LIVE defs, so a
         // sidecar added or renamed on this R has to be in place first.
         rebuildAiCreatures();
+        rebuildAiEffects();
         // Behaviour profiles reload with the rest of the content. SetBehaviors
         // re-resolves every LIVE mob's profile by name, so retuning a duelist
         // and hitting R is visible on the duelists already fighting you rather
@@ -8439,6 +8464,34 @@ int main(int argc, char** argv) {
           // under an R reload. Never spawn nothing because a name went stale.
           if (aiDef < 0 || mobs.Defs()[i].name == avatarDefName) aiDef = (int)i;
           if (mobs.Defs()[i].name == creature) { aiDef = (int)i; break; }
+        }
+        // ...PLUS WHATEVER IS WRONG WITH IT. The ticked effects go through the
+        // same MobSystem::DefWithEffects a bitten villager gets up as, so the
+        // panel spawns the creature the GAME makes and not a dev-only object:
+        // an authored `jujunud_zombie.json` wins if it exists, an identical
+        // request the session already composed is reused, and otherwise the
+        // recipe is built once. That is why `zombie` stopped being a row in the
+        // creature combo — it was one composition of many, written down.
+        if (aiDef >= 0 && !ui.aiEffectNames.empty()) {
+          std::vector<std::string> fx;
+          for (int i = 0; i < (int)ui.aiEffectNames.size(); i++)
+            if (i < (int)ui.aiEffectOn.size() && ui.aiEffectOn[i] != 0)
+              fx.push_back(ui.aiEffectNames[i]);
+          if (!fx.empty()) {
+            // By name, because composing appends to the def vector and any
+            // index (or reference into it) taken above is stale afterwards.
+            const std::string base = mobs.Defs()[aiDef].name;
+            std::string flog;
+            const int composed = mobs.DefWithEffects(base, fx, &flog);
+            // A refusal is the derived-def cap or a missing factory, neither of
+            // which is a reason to spawn nothing: the plain body is still the
+            // creature you asked for, minus the modifier, and the log says so.
+            if (composed >= 0) aiDef = composed;
+            if (!flog.empty()) std::printf("%s", flog.c_str());
+            if (composed < 0)
+              std::printf("ai panel: could not compose %s + effects\n",
+                          base.c_str());
+          }
         }
         if (aiDef >= 0) {
           // Crosshair hit when there is one, otherwise a few metres ahead on

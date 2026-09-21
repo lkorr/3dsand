@@ -1665,10 +1665,6 @@ def check_burn_tint_sites():
             "shadeMolten: lava, an OPAQUE liquid, which can never be foliage",
         ("raymarch.wgsl", "(f32(materials[mat].emission) / 255.0) * fl"):
             "the media march: gases only, and no gas carries the flag",
-        ("raymarch.wgsl", "gasFlameFill * (f32(materials[fireMat].emission)"):
-            "the far flame box: fireMat is resolved by gasFlameMat() to an "
-            "EMISSIVE GAS, and burnTint is a foliage-palette feature that no "
-            "gas carries -- same argument as the media march above",
     }
 
     pat = re.compile(r"emission\s*\)\s*/\s*255\.0")

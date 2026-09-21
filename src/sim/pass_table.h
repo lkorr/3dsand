@@ -86,14 +86,6 @@ enum class Buf : uint8_t {
   // standing -- render-only derived data written on the tick command buffer and
   // read by the raymarcher in the fragment stage -- at eight times the cell.
   GasFarOuter,
-  // The FLAME box (world.h kGasFlameWords): the synthesized emissive flame of
-  // the fires the window has left behind, BOTH LODs in one allocation. Exactly
-  // GasOuter's standing and exactly its hazard — written by two splat kernels
-  // on the tick command buffer, read by the raymarcher in the fragment stage.
-  // One id rather than two because the two grids are always written together
-  // and always read together, and a second id would buy nothing but a second
-  // clear row.
-  GasFlame,
   // Render-only derived data, on the table for the shadow cache's reason: the
   // splat WRITES it on the tick command buffer and the raymarcher READS it in
   // the fragment stage, and a hazard the table does not know about generates
@@ -273,13 +265,6 @@ enum class Pipe : uint8_t {
   // the fires past gasOuter's reach. A seventh gas entry point on the same
   // layout, writing only the long-range box.
   GasFarPlumeWide,
-  // ---- the FLAME splats (sim_gas.wgsl gasFarFlame / gasFarFlameWide) ------
-  // The other half of the far fire LOD: `fire` is CLASS_GAS and never reaches
-  // the far cascade, so a fire outside the window has embers and no flame.
-  // Two more entry points of the SAME module on the SAME layout, writing only
-  // GasFlame (world.h kGasFlameWords), under their own conditions.
-  GasFarFlame,
-  GasFarFlameWide,
   // The angle-of-repose occupancy snapshot: a second entry point of
   // sim_step.wgsl, not a new module, so it costs no bind-group layout and
   // cannot drift from the kernel that reads it.
@@ -469,16 +454,6 @@ enum class Cond : uint8_t {
   // are the same predicate and there is nothing to union. render.farPlumeRange
   // 0 makes it false and nothing about the long-range box is recorded at all.
   GasFarWide,
-  // ---- the FLAME box's three conditions (world.h kGasFlameWords) -----------
-  // Exactly the shape of the three above, one LOD structure out: the fine and
-  // wide splats each gate on their own emitter count under
-  // render.farFlameStrength, and the box's single clear is their union because
-  // the two grids share one allocation. The flame's counts are SEPARATE from
-  // the plume's so the two halves of the far fire LOD are independently
-  // switchable — see RecordCtx::gasFlameCount for why that matters.
-  GasFlameFine,
-  GasFlameWide,
-  GasFlame,
   // Any LOADED material authors a non-default `repose` AND the CA has work.
   // The first half is a property of materials.json, latched once at
   // UploadTables rather than recomputed per tick; the second is CaActive,
@@ -565,11 +540,6 @@ enum class DispatchSel : uint32_t {
   GasFarEmitSel,
   // One workgroup per LONG-RANGE emitter, same argument as the line above.
   GasFarWideSel,
-  // The FLAME splats, over the same two lists under their own knob. Their own
-  // selectors rather than a reuse of the two above because the counts differ
-  // whenever render.farFlameStrength and render.farPlumeStrength do.
-  GasFlameSel,
-  GasFlameWideSel,
 };
 
 // Max `uses` entries on any row. Asserted against the widest row at compile

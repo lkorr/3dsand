@@ -67,7 +67,7 @@ async function waitFor(pred, ms){
     var wiring = [
       ['nav button',      /data-tab="environment"/],
       ['section',         /id="view-environment"/],
-      ['tab allowlist',   /'models','environment'/],
+      ['tab allowlist',   /\[[^\]]*'environment'[^\]]*\]\.includes\(activeTab\)/],
       ['renderAll hook',  /activeTab==='environment'\)\{envActivate/],
       ['host bridge',     /__tunerRegisterEnv/],
       ['module import',   /editor\/environment\.js/]

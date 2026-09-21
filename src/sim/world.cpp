@@ -232,12 +232,6 @@ void World::Init(const rhi::Device& device) {
   // CopyDst for the per-tick clear, exactly like gasOuter.
   gasFarOuter = CreateBuffer(device, (uint64_t)kGasFarOuterWords * 4,
                              U::Storage | U::CopySrc | U::CopyDst, "gasFarOuter");
-  // The FLAME box (world.h kGasFlameWords): both LODs in one allocation, fine
-  // grid then wide grid. Same usage flags as the two density boxes for the
-  // same two reasons — CopySrc so a gate can read a column back, CopyDst for
-  // the per-tick clear.
-  gasFlame = CreateBuffer(device, (uint64_t)kGasFlameWords * 4,
-                          U::Storage | U::CopySrc | U::CopyDst, "gasFlame");
 
   // MLS-MPM fluid (world.h fluid block). CopySrc on the particle pair is for
   // the fluid gates' mass audits; the frame path reads back only the small
