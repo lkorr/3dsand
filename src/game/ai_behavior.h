@@ -87,7 +87,8 @@
 //
 //     style        — an authored id from the profile ("slash", "thrust", ...)
 //     targetPoint  — where the blow is aimed, world voxels
-//     targetId     — who it is aimed at (0 = the player)
+//     targetId     — who it is aimed at (0 = nobody; a player is in the
+//                    kPlayerActorBase band, an NPC is its mob id)
 //     tick         — when it was issued
 //     commitTicks  — how long the AI has promised to hold still for it
 //
@@ -358,16 +359,43 @@ bool SaveBehaviors(const std::string& path, const Library& lib, std::string& err
 // are both actors, which is the entire reason mob-vs-mob combat is a data
 // change later rather than a second code path: target selection scans this list
 // and never asks what KIND of thing an entry is.
-// THE PLAYER'S RESERVED ACTOR ID. Mob ids start at 1 (MobSystem::nextId_), so
-// 0 can mean "you" with no collision -- but it also means `FindMobById(0)`
-// comes back empty, because the avatar is a Mob that lives OUTSIDE `mobs_`
-// (MobSystem::SetAvatar). Anything that resolves a target id to a CREATURE has
-// to say so explicitly; `MobSystem::FindCombatantById` is that function, and
-// this constant is why it has to exist.
-constexpr uint64_t kPlayerActorId = 0;
+// THE PLAYERS' RESERVED ACTOR ID BAND. Player i is `kPlayerActorBase + i`.
+//
+// WHY A HIGH BAND AND NOT THE LOW INDICES (M9.1 P2, 2026-09-20). Until now the
+// player's actor id was literally 0 and the list index WAS the id, which broke
+// twice over the moment a second session existed:
+//
+//   * mob ids start at 1 (MobSystem::nextId_) and are restored from saves by
+//     SetNextIdCounter, so player 1 collided with the first mob ever spawned in
+//     the world. Reserving a LOW band would have meant moving mob id
+//     allocation, and mob ids are in the save format.
+//   * 0 was doing two jobs. `Brain::targetId = 0` is how "I have no target" is
+//     written (ai_behavior.cpp Perceive) and `ForceAttack`'s `targetId`
+//     defaults to 0 meaning "no victim in mind" -- yet `FindCombatantById(0)`
+//     resolved to avatars_[0], the player. A scripted swing that named nobody
+//     drew the player's limb. See the memory note "targetId 0 resolves to
+//     nobody".
+//
+// 1<<62 is above every id either space can reach (mob ids are a monotonic
+// counter; a world would have to spawn 4.6e18 creatures) and below the sign
+// bit, so an accidental signed compare still orders sanely. The band is NOT
+// saved: player actor ids are rebuilt every tick by SetPlayerActors and the AI
+// brain is not in SaveState, so changing it costs no migration.
+//
+// A band member still means "a creature that is not in `mobs_`": the avatar is
+// a Mob owned by a PlayerSession, so `FindMobById` comes back empty for it.
+// Anything resolving a target id to a CREATURE must say so explicitly;
+// `MobSystem::FindCombatantById` is that function, and this band is why it has
+// to exist.
+constexpr uint64_t kPlayerActorBase = 1ull << 62;
+// Player 0 -- the symbol every one-player comparison keeps using, so nothing
+// that means "the local player" has to know the band arithmetic.
+constexpr uint64_t kPlayerActorId = kPlayerActorBase;
+// Is this actor id a player's? The ONE test; do not open-code the band.
+constexpr bool IsPlayerActorId(uint64_t id) { return id >= kPlayerActorBase; }
 
 struct Actor {
-  uint64_t id = 0;          // mob id; kPlayerActorId (0) is reserved for the player
+  uint64_t id = 0;          // mob id, or kPlayerActorBase + player index
   Vec3 centre{};            // world voxels, body centre
   float radius = 1.0f;      // horizontal half-extent, for stand-off distance
   float height = 2.0f;

@@ -119,7 +119,19 @@ struct AvatarLocomotion {
 
 class PlayerAvatar : public Mob {
  public:
-  PlayerAvatar() { id_ = 0x5A11EDU; }  // stable seed for gore variance
+  // THE ID IS A SEED, NOT A SLOT. `id_` keys every per-creature RNG draw the
+  // body makes (`Hash3(id ^ salt, tick, i)` — gore variance, wound placement,
+  // tempo jitter), so two avatars sharing it would bleed in lockstep. Session 0
+  // keeps 0x5A11ED exactly, because that constant is baked into every pinned
+  // world hash and every gate's expected gore spread; session i passes
+  // 0x5A11ED + i (M9.1, docs/PLAN_multiplayer_m9.md §2 P2). The default
+  // argument is what keeps the ~30 existing one-player construction sites
+  // byte-identical.
+  //
+  // NOT the ACTOR id — that is ai::kPlayerActorId + index, a different space
+  // (see ai_behavior.h). This one is a MOB id, the key MobSystem::AvatarById
+  // and every handle-keyed lookup use.
+  explicit PlayerAvatar(uint64_t id = 0x5A11EDU) { id_ = id; }
 
   // `mobs` is the shared-services system (Mob::sys_): the def list, the one
   // compiled reaction table, the micro brick pool and the event sinks. The

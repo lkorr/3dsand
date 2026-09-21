@@ -326,7 +326,7 @@ bool Physics::Init() {
 
 void Physics::Shutdown() {
   pendingRelease_.clear();
-  playerBody_ = 0;
+  playerBodies_.clear();
   joints_.reset();  // constraint refs drop before the system that owns bodies
   system_.reset();  // ...and the system drops before the listener it points at
   contacts_.reset();
@@ -1255,10 +1255,13 @@ uint64_t Physics::CreatePlayerBody(float halfXZVox, float halfYVox) {
   // NOT in dynamicBodies_: the proxy never despawns and must not receive
   // explosion impulses or WakeNear — the player controller owns its motion.
   if (id.IsInvalid()) return 0;
-  // The newest proxy is THE player for ReleaseToWorldWhenClear. A selftest
-  // that makes and removes several is served by the one it is using now.
-  playerBody_ = FromBodyID(id);
-  return playerBody_;
+  // EVERY live proxy is A player for ReleaseToWorldWhenClear (see the member's
+  // note): a piece leaves the AVATAR layer only once it is clear of all of
+  // them. RemoveBody erases, so the selftests that make and drop several
+  // proxies do not accumulate stale handles here.
+  const uint64_t h = FromBodyID(id);
+  playerBodies_.push_back(h);
+  return h;
 }
 
 void Physics::MovePlayerBody(uint64_t handle, Vec3 centerVoxel, float dt) {
@@ -1971,8 +1974,13 @@ void Physics::ReleaseToWorldWhenClear(uint64_t handle) {
   JPH::BodyInterface& bi = system_->GetBodyInterface();
   const JPH::BodyID id = ToBodyID(handle);
   if (!bi.IsAdded(id)) return;
-  // Nobody to protect: straight to the ordinary layer.
-  if (playerBody_ == 0 || !bi.IsAdded(ToBodyID(playerBody_))) {
+  // Nobody to protect: straight to the ordinary layer. "Nobody" is now "not one
+  // live proxy among them" -- a dead handle that RemoveBody never saw (Shutdown
+  // order, a Jolt-side destroy) must not count as a player to hide behind.
+  bool anyPlayer = false;
+  for (uint64_t p : playerBodies_)
+    if (p != 0 && bi.IsAdded(ToBodyID(p))) { anyPlayer = true; break; }
+  if (!anyPlayer) {
     bi.SetObjectLayer(id, Layers::MOVING);
     return;
   }
@@ -1992,9 +2000,18 @@ void Physics::ReleaseToWorldWhenClear(uint64_t handle) {
 void Physics::TickPendingReleases() {
   if (pendingRelease_.empty() || !system_) return;
   JPH::BodyInterface& bi = system_->GetBodyInterface();
-  float pmin[3], pmax[3];
-  const bool havePlayer =
-      playerBody_ != 0 && WorldBounds(playerBody_, pmin, pmax);
+  // One AABB per live proxy, gathered once for the whole sweep rather than per
+  // pending body: this runs every physics tick over up to kMaxPendingRelease
+  // (256) entries, and a body lock per (piece x player) would be the cost of
+  // the whole function. Players are a handful; pieces are not.
+  float pmin[kMaxPlayerProxies][3], pmax[kMaxPlayerProxies][3];
+  int nPlayers = 0;
+  for (uint64_t p : playerBodies_) {
+    if (nPlayers >= kMaxPlayerProxies) break;
+    if (p == 0) continue;
+    if (!WorldBounds(p, pmin[nPlayers], pmax[nPlayers])) continue;
+    nPlayers++;
+  }
   // A hand's breadth of clearance, so a body resting AGAINST the capsule does
   // not flip layers on the tick it touches and shove on the next. Metres.
   constexpr float kMargin = 0.05f;
@@ -2005,11 +2022,17 @@ void Physics::TickPendingReleases() {
     if (!bi.IsAdded(id)) continue;  // dead: forget it
     float bmin[3], bmax[3];
     bool overlaps = false;
-    if (havePlayer && WorldBounds(h, bmin, bmax)) {
-      overlaps = true;
-      for (int a = 0; a < 3; a++)
-        if (bmax[a] + kMargin < pmin[a] || bmin[a] - kMargin > pmax[a])
-          overlaps = false;
+    if (nPlayers > 0 && WorldBounds(h, bmin, bmax)) {
+      // INSIDE ANY player holds the piece. A piece released the moment it left
+      // player 0 while still buried in player 1 would be shoved out of them at
+      // full contact force; the AVATAR layer exists precisely to stop that.
+      for (int pi = 0; pi < nPlayers && !overlaps; pi++) {
+        bool hit = true;
+        for (int a = 0; a < 3; a++)
+          if (bmax[a] + kMargin < pmin[pi][a] || bmin[a] - kMargin > pmax[pi][a])
+            hit = false;
+        overlaps = hit;
+      }
     }
     if (overlaps) {
       pendingRelease_[w++] = h;
@@ -2105,7 +2128,12 @@ void Physics::RemoveBody(uint64_t handle) {
   hotSteps_.erase(id.GetIndex());
   bi.RemoveBody(id);
   bi.DestroyBody(id);
-  if (handle == playerBody_) playerBody_ = 0;
+  for (size_t i = 0; i < playerBodies_.size(); i++) {
+    if (playerBodies_[i] == handle) {
+      playerBodies_.erase(playerBodies_.begin() + (ptrdiff_t)i);
+      break;
+    }
+  }
   for (size_t i = 0; i < pendingRelease_.size(); i++) {
     if (pendingRelease_[i] == handle) {
       pendingRelease_.erase(pendingRelease_.begin() + (ptrdiff_t)i);
