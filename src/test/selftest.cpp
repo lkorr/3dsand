@@ -121,6 +121,12 @@ const char* const kOrder[] = {
     // one part of melee no other gate can see (`mob`'s melee subtests drive
     // SetWeaponPose directly and never touch the mouse).
     "swing",
+    // ...and its derivative, immediately after it. `swing-smooth` replays
+    // every authored HELD style through the same driver and asserts that
+    // nothing — hand, point, blade direction, blade roll, arm claim — steps
+    // in one tick. Same cost, same independence: it reads
+    // attack_styles.json and builds its own MeleeState, and touches no world.
+    "swing-smooth",
     // AND WITH THEM: `tick-input` is Player alone over a synthetic ground
     // lambda — no world, no GPU, no assets — and it asserts that the
     // controller's trajectory is a function of the COMMAND STREAM and not of
@@ -531,7 +537,11 @@ const char* const kOrder[] = {
     // up, which is about as large a perturbation as this suite has, so they go
     // after even the wound gates. Each restores the id counter and regenerates
     // worldgen on the way out.
-    "npc-strike", "npc-block", "npc-styles", "duel",
+    "npc-strike", "npc-block", "npc-styles",
+    // The same replay, asking what the pose went THROUGH rather than where it
+    // went (game/selfclip.h). Directly after npc-styles because it builds the
+    // identical fixture and restores the world the same way.
+    "rig-clip", "duel",
     // ---- BLOOD IS HEALTH; BURNS CAP IT (Gore §F/§G, 2026-09-02) -----------
     // Appended after the combat gates by the same rule again. Each spawns one
     // creature inside the window and restores the id counter. bleed-out is

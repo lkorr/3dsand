@@ -4857,6 +4857,15 @@ void MobSystem::StepStroke(Mob& mob, uint32_t tick, World& world,
       st.melee.SetKeepOut(kc, kr);
     else
       st.melee.ClearKeepOut();
+    // ...and where its own CHEST is, so no authored cut drags the arm through
+    // it (melee.h SetBodyKeepOut; the clamp lives in RebuildFrame beside the
+    // head one, for both drivers).
+    Vec3 ba, bb;
+    float bw = 0, bd = 0;
+    if (mob.BodyKeepOut(ba, bb, bw, bd))
+      st.melee.SetBodyKeepOut(ba, bb, bw, bd);
+    else
+      st.melee.ClearBodyKeepOut();
   }
   const float armReach = reach > 1e-3f ? reach : MetresToCells(0.60f);
 
@@ -20265,6 +20274,198 @@ bool Mob::HeadKeepOut(Vec3& outCenterFromShoulder, float& outRadius) const {
     return true;
   }
   return false;
+}
+
+bool Mob::BodyKeepOut(Vec3& outA, Vec3& outB, float& outWide,
+                      float& outDeep) const {
+  // THE SPINE, BY TAG, off the same live anim pose and through the same yaw
+  // HeadKeepOut and WeaponStrokePose use — see the note on this in mob.h. A
+  // capsule rather than a sphere because a torso is long and an arm is
+  // legitimately beside it for most of its travel.
+  int lo = -1, hi = -1;   // lowest and highest spine part, by model y
+  float loY = 0, hiY = 0;
+  float halfW = 0, halfD = 0;
+  for (size_t i = 0; i < limbDefs_.size(); i++) {
+    if (limbDefs_[i].tag != "spine") continue;
+    if (i >= anim_.model.size() || i >= limbs_.size()) continue;
+    if (!LimbAlive((int)i)) continue;
+    const MobLimb& l = limbs_[i];
+    const float ss = std::max((float)SkinScaleOf(l), 1.0f);
+    const Vec3 half = Vec3{(float)l.size.x, (float)l.size.y, (float)l.size.z} *
+                      (0.5f / ss);
+    const Vec3 c =
+        anim_.model[i].pos + QuatRotate(anim_.model[i].rot, half);
+    // THE HALF-WIDTH AND THE HALF-DEPTH, NEVER THE HALF-HEIGHT, and the two
+    // are reported SEPARATELY. A torso box is roughly 6 x 10 x 3 world
+    // voxels: a radius taken off its longest axis would put the keep-out
+    // surface past the wielder's own reach and forbid every pose the stroke
+    // exists to make, and a single radius taken off the WIDTH inflates the
+    // keep-out to a cylinder half a body deep in front of the chest -- which
+    // is where a guard is held. A chest is an ellipse seen from above, so the
+    // clamp is given an ellipse (melee.h SetBodyKeepOut).
+    halfW = std::max(halfW, half.x);
+    halfD = std::max(halfD, half.z);
+    if (lo < 0 || c.y < loY) { lo = (int)i; loY = c.y; }
+    if (hi < 0 || c.y > hiY) { hi = (int)i; hiY = c.y; }
+  }
+  if (lo < 0 || halfW <= 0.0f || halfD <= 0.0f) return false;
+
+  int effPart = -1, effNatural = -1;
+  StrikeEffectorMode effMode = StrikeEffectorMode::None;
+  if (!ResolveEffector(effPart, effMode, effNatural)) return false;
+  // ---- AND IT APPLIES TO EVERY EFFECTOR, unlike the head sphere ----------
+  //
+  // HeadKeepOut deliberately returns false for anything but a held blade, and
+  // its own note says why: that sphere is sized off the head model and is
+  // wider than a whole fist, so it shoved a chambered punch -- which
+  // legitimately sits beside the chin -- out and up.
+  //
+  // THIS IS A DIFFERENT CONSTRAINT AND THE ARGUMENT DOES NOT CARRY. What it
+  // bounds is not the fist's distance from a small sphere, it is the ARM's
+  // chord against the trunk, and an arm inside the trunk is wrong whatever is
+  // on the end of it: `--gate rig-clip` measured 42 voxels of upper arm inside
+  // the torso on the FIRST tick of `player_punch_r`, which is the chamber, and
+  // the chamber is not improved by being inside the ribs.
+  if ((size_t)effPart >= skel_.parts.size()) return false;
+  int handPart = -1;
+  if (ChainForEffector(skel_, effPart, handPart) == nullptr) return false;
+  if (handPart < 0) return false;
+  for (const IkChain& ch : skel_.chains) {
+    if (ch.effector != handPart) continue;
+    if (ch.parts.size() < 2) continue;
+    const int i0 = ch.parts[0];
+    if (i0 < 0 || (size_t)i0 >= anim_.model.size()) continue;
+    const MobLimb& la = limbs_[(size_t)lo];
+    const MobLimb& lb = limbs_[(size_t)hi];
+    auto centre = [&](size_t i, const MobLimb& l) {
+      const float ss = std::max((float)SkinScaleOf(l), 1.0f);
+      const Vec3 half =
+          Vec3{(float)l.size.x, (float)l.size.y, (float)l.size.z} * (0.5f / ss);
+      return anim_.model[i].pos + QuatRotate(anim_.model[i].rot, half);
+    };
+    const Quat yaw = AxisAngle({0, 1, 0}, heading_);
+    const Vec3 sh = anim_.model[i0].pos;
+    outA = Rotate(yaw, centre((size_t)lo, la) - sh);
+    outB = Rotate(yaw, centre((size_t)hi, lb) - sh);
+    // ---- THE ARM HAS THICKNESS, AND THE CLAMP TREATS IT AS A LINE ---------
+    //
+    // The driver bounds the shoulder-to-hand CHORD against this capsule, and a
+    // chord is a line with no radius while the thing it stands for is a limb
+    // two voxels across. So a forearm laid exactly tangent to the surface has
+    // half of itself inside the chest, and `--gate rig-clip` — which counts
+    // VOXELS, not lines — reports it, correctly, as clipping.
+    //
+    // Inflating the capsule by the swinging arm's OWN half-thickness closes
+    // the gap at its source and keeps `melee.bodyClear` meaning what it says:
+    // clearance, not a fudge sized by hand against one rig's proportions. The
+    // measurement is the limb's own box, so re-proportioning the art
+    // re-derives it. `ch.parts[1]` is the forearm — the segment that actually
+    // crosses the body — and its x/z half-extents are its thickness.
+    float armHalf = 0;
+    if (ch.parts.size() >= 2) {
+      const size_t fore = (size_t)ch.parts[1];
+      if (fore < limbs_.size()) {
+        const MobLimb& fl = limbs_[fore];
+        const float fs = std::max((float)SkinScaleOf(fl), 1.0f);
+        armHalf = std::min((float)fl.size.x, (float)fl.size.z) * (0.5f / fs);
+      }
+    }
+    outWide = halfW + armHalf;
+    outDeep = halfD + armHalf;
+    return true;
+  }
+  return false;
+}
+
+bool Mob::SelfClipCheck(ClipReport& out) const {
+  out = ClipReport{};
+  if (def_ == nullptr || anim_.model.empty()) return false;
+  const size_t n = std::min(limbs_.size(), anim_.model.size());
+  if (n == 0) return false;
+
+  // ---- the shapes, once (mob.h clipShapes_) -------------------------------
+  if (clipShapeGen_ != n || clipShapes_.size() != n) {
+    clipShapes_.assign(n, ClipShape{});
+    for (size_t i = 0; i < n; i++) {
+      const MobLimb& l = limbs_[i];
+      if (l.voxels.empty()) continue;
+      const float ps = std::max((float)PhysScaleOf(l), 1.0f);
+      clipShapes_[i].Alloc(l.size, ps);
+      for (const DebrisVoxel& v : l.voxels)
+        clipShapes_[i].Set((int)v.x, (int)v.y, (int)v.z);
+    }
+    clipShapeGen_ = n;
+    clipRest_.clear();
+    clipRestOrder_.clear();
+  }
+
+  // Shared by the posed pass and the bind-pose baseline: which slots take part
+  // at all. A severed limb is not on the body, and a WORN SHELL is strapped to
+  // the limb it covers and interpenetrates it by construction — reporting a
+  // cuirass inside the chest it is buckled to would bury every real finding.
+  auto participates = [&](size_t i) {
+    if (clipShapes_[i].Empty()) return false;
+    if (!limbs_[i].body) return false;
+    if (limbs_[i].wornHost >= 0) return false;
+    if (!LimbAlive((int)i)) return false;
+    return true;
+  };
+
+  std::vector<ClipLimb> posed;
+  posed.reserve(n);
+  std::vector<int> order;
+  order.reserve(n);
+  for (size_t i = 0; i < n; i++) {
+    if (!participates(i)) continue;
+    ClipLimb c;
+    c.slot = (int)i;
+    c.parent = skel_.parts.size() > i ? skel_.parts[i].parent : -1;
+    c.rot = anim_.model[i].rot;
+    // The lattice's (0,0,0) corner, exactly as Mob::LimbTargetFor states it.
+    c.corner = anim_.model[i].pos - QuatRotate(c.rot, limbs_[i].anchorLimb);
+    c.shape = &clipShapes_[i];
+    posed.push_back(c);
+    order.push_back((int)i);
+  }
+  if (posed.size() < 2) return true;
+
+  // ---- the bind pose, once (mob.h clipRest_) ------------------------------
+  //
+  // Flattened HERE rather than through an AnimState, because the bind pose is
+  // exactly `model[i] = model[parent] * rest[i]` and parts are stored
+  // parents-before-children (anim.h AnimPart::parent "MUST be < own index").
+  // Building a whole AnimState to say that would be a second copy of the
+  // flatten, and a second copy is a second thing to drift.
+  if (clipRestOrder_ != order) {
+    std::vector<Transform> rest(skel_.parts.size());
+    for (size_t i = 0; i < skel_.parts.size(); i++) {
+      const int par = skel_.parts[i].parent;
+      if (par < 0 || (size_t)par >= i) {
+        rest[i] = skel_.parts[i].rest;
+        continue;
+      }
+      rest[i].rot = QuatNormalize(
+          QuatMul(rest[(size_t)par].rot, skel_.parts[i].rest.rot));
+      rest[i].pos = rest[(size_t)par].pos +
+                    QuatRotate(rest[(size_t)par].rot, skel_.parts[i].rest.pos);
+    }
+    std::vector<ClipLimb> restLimbs;
+    restLimbs.reserve(posed.size());
+    for (size_t k = 0; k < posed.size(); k++) {
+      const size_t i = (size_t)order[k];
+      ClipLimb c = posed[k];
+      if (i < rest.size()) {
+        c.rot = rest[i].rot;
+        c.corner = rest[i].pos - QuatRotate(c.rot, limbs_[i].anchorLimb);
+      }
+      restLimbs.push_back(c);
+    }
+    RigClipRestBaseline(restLimbs, clipRest_);
+    clipRestOrder_ = order;
+  }
+
+  RigSelfClip(posed, &clipRest_, out);
+  return true;
 }
 
 bool Mob::WeaponEdge(Vec3& outBase, Vec3& outTip, float& outHalfWidth,

@@ -1631,6 +1631,16 @@ static void PhaseI(TickAuthorityCtx& w, WorldScratch& ws,
                 melee.SetKeepOut(kc, kr);
               else
                 melee.ClearKeepOut();
+              // ...and the avatar's own CHEST, so no cut across the body drags
+              // the arm through it (melee.h SetBodyKeepOut). Same seam, same
+              // clamp site, same reason the head sphere is composed by the rig
+              // rather than guessed by the driver.
+              Vec3 ba, bb;
+              float bw = 0, bd = 0;
+              if (avatar.BodyKeepOut(ba, bb, bw, bd))
+                melee.SetBodyKeepOut(ba, bb, bw, bd);
+              else
+                melee.ClearBodyKeepOut();
             }
             // The NPC driver always did this and the player's never had —
             // without it the asymmetric azimuth window (azOut on the weapon

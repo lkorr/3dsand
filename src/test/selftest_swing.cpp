@@ -2847,6 +2847,320 @@ Status GatePlayerUnarmed(Ctx& c, std::string& detail) {
   return ok ? Status::Pass : Status::Fail;
 }
 
+// =============================================================================
+// swing-smooth — THE WEAPON MOVES SMOOTHLY AT EVERY POINT OF EVERY STYLE
+// =============================================================================
+//
+// THE REPORT THIS EXISTS FOR, in the owner's words: "many of them will look
+// good for like 60% of the animation and then the sword will spin / clip
+// through things / teleport around super crazy fast."
+//
+// Every gate in this file before it asserts on where a stroke ENDS UP — the
+// arc it swept, the channel it travelled in, the pose it started from. None of
+// them could see a stroke that arrives in the right place by a route with a
+// step in it, and all three of the faults behind that report were exactly
+// that: a one-tick discontinuity somewhere in the middle or at the very end.
+//
+// So this one asserts on the DERIVATIVE, per tick, over every authored style
+// replayed through the shared runner:
+//
+//   * the HAND's travel may not CHANGE much from one tick to the next
+//   * nor the TIP's
+//   * the blade's DIRECTION may not turn more than so far in one tick
+//   * the blade's ROLL may not either — this is the one that caught the flat's
+//     sign flip, which is invisible in position and is the whole "spin"
+//   * the arm CLAIM may not step — PoseWeight, which the rig blends the entire
+//     IK solve by, so a 1 -> 0 step is the arm teleporting to the walk cycle
+//
+// The ceilings are in tests/baseline.json so tuning them costs no rebuild, and
+// each failure prints the STYLE, the TICK, the PHASE and the measurement, so
+// a red line says where to look rather than that something is wrong.
+//
+// CPU-ONLY AND ASSET-LIGHT: it loads attack_styles.json (the styles ARE the
+// subject) and nothing else — no world, no rig, no GPU. Milliseconds.
+//
+// SMOOTHING STAYS AT ITS AUTHORED VALUES here, unlike every fixture above.
+// The other blocks turn it off because they assert on the mapping and the
+// easing is lag; this one asserts on CONTINUITY, and the easing is half of
+// what delivers it. Measuring the shipped feel means measuring the shipped
+// knobs.
+Status GateSwingSmooth(Ctx& c, std::string& detail) {
+  (void)c;
+  bool ok = true;
+  int checks = 0;
+  auto check = [&](bool cond, const std::string& what) {
+    checks++;
+    if (!cond) {
+      ok = false;
+      std::printf("swing-smooth: FAILED %s\n", what.c_str());
+    }
+  };
+
+  StyleLibrary lib;
+  std::string log;
+  if (!LoadAttackStyles(AssetDir() + "/mobs/attack_styles.json", lib, log) ||
+      lib.empty()) {
+    detail = "attack_styles.json did not load";
+    std::printf("swing-smooth: SKIP (%s)\n%s", detail.c_str(), log.c_str());
+    return Status::Skip;
+  }
+
+  // The ceilings. Per TICK at 30 Hz, which is the rate both live feeders run
+  // the runner at (MobSystem::StepStroke's fixed 1/30, session.cpp's kTickDt).
+  //
+  // ---- WHY POSITION IS MEASURED AS AN ACCELERATION AND ANGLE IS NOT -------
+  //
+  // A committed cut legitimately moves the point six voxels in a thirtieth of
+  // a second — that is 180 vox/s, and `melee.fullSpeedMps` says full damage
+  // starts at 200. So a ceiling on a SINGLE tick's travel cannot separate "a
+  // fast sword" from "a teleport", and one tight enough to catch the second
+  // forbids the first. What distinguishes them is whether the speed ARRIVED:
+  // a real swing accelerates over several ticks, a discontinuity changes the
+  // travel-per-tick by the whole of it in one. So hand and point are bounded
+  // on the SECOND difference.
+  //
+  // The two ANGLES are not, and the asymmetry is real rather than an
+  // inconsistency. A blade's direction and roll have no equivalent of a
+  // committed cut's speed: the stroke only ever turns the blade as fast as the
+  // arm carries it, so a large first difference there IS the defect — it is
+  // the lean plane spinning about a stalled point, or the flat's sign
+  // flipping, both of which arrive at full size on one tick and leave on the
+  // next. Bounding their acceleration would let a 180-degree roll through as
+  // long as it took two ticks to do it.
+  const float maxHand =
+      (float)BaselineNumber("swingSmooth.maxHandAccelVox", 1.30);
+  const float maxTip =
+      (float)BaselineNumber("swingSmooth.maxTipAccelVox", 2.60);
+  const float maxDir = (float)BaselineNumber("swingSmooth.maxDirStepRad", 0.90);
+  const float maxRoll =
+      (float)BaselineNumber("swingSmooth.maxRollStepRad", 0.90);
+  const float maxWeight =
+      (float)BaselineNumber("swingSmooth.maxWeightStep", 0.20);
+  // ---- AND THE ROLL'S WHOLE JOURNEY, not just its worst step -------------
+  //
+  // A per-tick ceiling cannot see the defect this gate was written for. The
+  // blade's flat is `bladeDir x travel`, whose SIGN reverses when the travel
+  // does — every cut, at its end — and the rig then rolls the sword through
+  // 180 degrees to follow it. Smoothed on `bladeSmoothing`, that flip takes
+  // three or four ticks, so no single tick's step is remarkable and the total
+  // is a whole pi of roll the stroke never asked for. Summing the per-tick
+  // turn is what catches it: a cut that keeps its edge spends well under a
+  // radian of roll over the whole swing, and one that flips spends pi more.
+  const float maxRollArc =
+      (float)BaselineNumber("swingSmooth.maxRollArcRad", 1.60);
+
+  const float dt = 1.0f / 30.0f;
+  // A HELD BLADE'S GEOMETRY, not a bare arm: the lean machinery — which is
+  // where two of the three faults lived — only exists when `bladeLen_` is
+  // non-zero, and a fixture reporting its tip at its hand would exercise none
+  // of it. 5.5 voxels is the shipped sword (assets/items/sword.json's edge at
+  // 10 cm voxels), stated here rather than loaded because the claim is about
+  // the DRIVER and not about this week's art.
+  const Vec3 fixtureHand{-0.4f, -3.0f, -0.3f};   // x mirrored with the basis
+  const Vec3 fixtureTip = fixtureHand + Vec3{0, 5.5f, 0};
+
+  auto angleBetween = [](const Vec3& a, const Vec3& b) {
+    if (a.len() < 1e-5f || b.len() < 1e-5f) return 0.0f;
+    return std::acos(
+        std::clamp(a.normalized().dot(b.normalized()), -1.0f, 1.0f));
+  };
+  const char* kPhase[] = {"idle", "guard", "windup", "cut", "recover"};
+
+  int styles = 0;
+  float worstHand = 0, worstTip = 0, worstDir = 0, worstRoll = 0, worstW = 0;
+  float worstRollArc = 0;
+  int totalFlips = 0;
+  for (const AttackStyle& sty : lib.styles) {
+    // ONLY THE STYLES THE DRIVER CAN REPLAY WITHOUT A RIG. `StyleUsable` needs
+    // a Mob; here the question is narrower and is answered by the style: a
+    // natural weapon's stroke is driven through a part the fixture does not
+    // have, and a bite is an AIM effector whose whole motion happens in a
+    // channel this bladeless fixture cannot express. The held styles are the
+    // ones the owner's report is about and the ones with a blade to spin.
+    if (!(sty.weapon.empty() || sty.weapon == "held")) continue;
+    styles++;
+
+    MeleeState m;
+    ApplyMeleeTuning(m.tuning);
+    m.SetStroke(fixtureHand, fixtureTip, Vec3{0, 0, 1}, kRestReach);
+    m.SetHandSign(1.0f);
+
+    StrokeCursor cur;
+    // A FIXED SEED off the style's NAME, for the reason npc-styles pins its
+    // own: the tempo jitter scales the tick counts, so an unpinned seed makes
+    // "the same style" a different number of ticks from run to run.
+    BeginStrokeProgram(cur, sty, lib.Find(sty.name),
+                       (uint32_t)std::hash<std::string>{}(sty.name) | 1u);
+
+    Vec3 prevHand{}, prevTip{}, prevDir{}, prevFlat{};
+    float prevW = 0;
+    float lastHandStep = 0, lastTipStep = 0;
+    bool have = false, haveStep = false;
+    bool hitHand = false, hitTip = false, hitDir = false, hitRoll = false,
+         hitW = false;
+    float rollArc = 0, dirArc = 0;
+    int rollFlips = 0;
+    for (int i = 0; i < 200; i++) {
+      const StrokeCursor::Phase ph = cur.phase;
+      const StrokeStepResult r =
+          StepStrokeProgram(cur, &sty, m, 0.0f, 0.0f, 0.0f, dt, kRight, kUp,
+                            kFwd);
+      if (r == StrokeStepResult::Idle) break;
+      const WeaponPose p = m.Pose();
+      if (have) {
+        const float dHand = (p.hand - prevHand).len();
+        const float dTip = (m.TipOffset() - prevTip).len();
+        const float dDir = angleBetween(p.bladeDir, prevDir);
+        // ---- ROLL IS ROTATION ABOUT THE BLADE, NOT THE FLAT'S TRAVEL ----
+        //
+        // The naive angle between consecutive flats is dominated by the blade
+        // TURNING: the flat is perpendicular to the blade by construction, so
+        // a 2.5-radian sweep carries it 2.5 radians whether or not the sword
+        // rolled at all in the wielder's fist. Measured that way every style
+        // reported ~2.3 rad of "roll" and the number said nothing.
+        //
+        // PARALLEL-TRANSPORT the previous flat along the blade's own turn
+        // first — the minimal rotation taking the old direction to the new one
+        // — and what is left is the rotation about the blade axis, which is
+        // the only thing a wrist is doing and the only thing a sign flip
+        // shows up in.
+        const Vec3 carried =
+            QuatRotate(QuatFromTo(prevDir, p.bladeDir), prevFlat);
+        const float dRoll = angleBetween(p.bladeFlat, carried);
+        const float dW = std::fabs(p.weight - prevW);
+        // The SECOND difference: how much the travel-per-tick changed. Zero on
+        // a constant-speed sweep however fast, and the whole of the step on a
+        // discontinuity.
+        const float aHand = haveStep ? std::fabs(dHand - lastHandStep) : 0.0f;
+        const float aTip = haveStep ? std::fabs(dTip - lastTipStep) : 0.0f;
+        lastHandStep = dHand;
+        lastTipStep = dTip;
+        haveStep = true;
+        worstHand = std::max(worstHand, aHand);
+        worstTip = std::max(worstTip, aTip);
+        worstDir = std::max(worstDir, dDir);
+        worstRoll = std::max(worstRoll, dRoll);
+        worstW = std::max(worstW, dW);
+        rollArc += dRoll;
+        dirArc += dDir;
+        // ---- AND THE SHARP ONE: DID THE FLAT REVERSE? --------------------
+        //
+        // Roll ARC is a blunt instrument — a cut legitimately rolls the edge
+        // round to lead its travel, and on these styles that is two radians of
+        // honest wrist. What is never legitimate is the flat pointing out of
+        // the OTHER FACE of the blade from one tick to the next, because a
+        // flat normal names a plane and its sign carries no information at
+        // all (MeleeEdgeAlign takes fabs of it). A reversal is the commanded
+        // normal having jumped to its own negative, which the rig then spends
+        // several ticks rolling the sword through 180 degrees to follow.
+        //
+        // COUNTED AGAINST THE PARALLEL-TRANSPORTED flat, so the blade turning
+        // through a right angle is not mistaken for one.
+        if (carried.dot(p.bladeFlat) < 0.0f) rollFlips++;
+        // ---- AND WHAT ELSE WAS TRUE ON THAT TICK (CLAUDE.md rule 6) -------
+        //
+        // "The hand jumped by 2.3 voxels" has at least three causes and from
+        // outside they are one number: the POINT jumped and the hand followed
+        // it, the blade TURNED and swung the hand round the point (hand = tip
+        // minus a blade, so 0.5 rad on a 5.5-voxel blade is 2.75 voxels of
+        // hand with the point perfectly still), or the lean angle moved
+        // because the RADIUS did and the law of cosines is steep near the ends
+        // of the reach band. Printing the co-measurements is one line and
+        // saves an elimination run per hypothesis.
+        auto where = [&](const char* what, float got, float lim) {
+          return Format(
+              "%s: %s %.3f (limit %.3f) at tick %d, phase %s | point step "
+              "%.3f, dir turn %.3f rad, roll %.3f rad, radius %.2f, steer "
+              "%.2f",
+              sty.name.c_str(), what, got, lim, i,
+              kPhase[(int)ph <= 4 ? (int)ph : 0], dTip, dDir, dRoll,
+              m.StrokeRadius(), m.SteerAmount());
+        };
+        // ONE CHECK PER STYLE PER CHANNEL, not one per tick: a broken style
+        // breaks on many ticks and five hundred identical FAILED lines bury
+        // the one that says which style it was. `firstHand`/... latch that.
+        if (aHand > maxHand && !hitHand) {
+          hitHand = true;
+          check(false, where("the hand's travel jumped by", aHand, maxHand));
+        }
+        if (aTip > maxTip && !hitTip) {
+          hitTip = true;
+          check(false, where("the point's travel jumped by", aTip, maxTip));
+        }
+        if (dDir > maxDir && !hitDir) {
+          hitDir = true;
+          check(false, where("the blade direction turned", dDir, maxDir));
+        }
+        if (dRoll > maxRoll && !hitRoll) {
+          hitRoll = true;
+          check(false, where("the blade rolled", dRoll, maxRoll));
+        }
+        if (dW > maxWeight && !hitW) {
+          hitW = true;
+          check(false, where("the arm claim stepped", dW, maxWeight));
+        }
+      }
+      prevHand = p.hand;
+      prevTip = m.TipOffset();
+      prevDir = p.bladeDir;
+      prevFlat = p.bladeFlat;
+      prevW = p.weight;
+      have = true;
+      if (r == StrokeStepResult::Finished) {
+        // ---- AND THE LAST TICK IS NOT A CLIFF -----------------------------
+        //
+        // `Finished` is the one tick where the CALLER drops the pose claim
+        // outright (MobSystem::StepStroke pushes an empty WeaponPose), so
+        // whatever weight the driver still had at that instant is a step the
+        // rig takes in a single frame. Checked separately from the per-tick
+        // ceiling above because the step happens OUTSIDE the driver and no
+        // amount of smoothing inside it can cover one.
+        checks++;
+        if (p.weight > maxWeight) {
+          ok = false;
+          std::printf(
+              "swing-smooth: FAILED %s: the program finished while the arm "
+              "was still claimed at %.3f (limit %.3f) — the caller drops the "
+              "claim on this tick, so that is a one-frame snap to the walk "
+              "pose\n",
+              sty.name.c_str(), p.weight, maxWeight);
+        }
+        break;
+      }
+    }
+    check(have, sty.name + ": the program stepped at all");
+    // THE ROLL IS NOT A SECOND SWING. Stated against the DIRECTION's own arc
+    // as well as an absolute ceiling, because the two failures are different:
+    // an absolute bound catches a flip on a short stroke, and the ratio
+    // catches one on a long sweep whose direction legitimately travels two
+    // radians. A blade that keeps its edge rolls a fraction of what it swings.
+    worstRollArc = std::max(worstRollArc, rollArc);
+    totalFlips += rollFlips;
+    check(rollFlips == 0,
+          Format("%s: the blade's flat reversed %d time(s) — the commanded "
+                 "normal jumped to its own negative, which is a 180-degree "
+                 "roll of the sword that no part of the stroke asked for",
+                 sty.name.c_str(), rollFlips));
+    check(rollArc <= maxRollArc,
+          Format("%s: the blade rolled %.3f rad over the whole stroke (limit "
+                 "%.3f) while its direction turned %.3f — a roll that large "
+                 "beside a swing that size is the flat's sign having reversed, "
+                 "not the edge leading the cut",
+                 sty.name.c_str(), rollArc, maxRollArc, dirArc));
+  }
+  check(styles >= 5, "the library ships held styles to measure");
+
+  std::printf(
+      "swing-smooth: %d styles | worst: hand accel %.3f/%.2f vox, point accel "
+      "%.3f/%.2f vox, dir %.3f/%.2f rad/tick, roll %.3f/%.2f rad/tick, claim "
+      "step %.3f/%.2f\n",
+      styles, worstHand, maxHand, worstTip, maxTip, worstDir, maxDir,
+      worstRoll, maxRoll, worstW, maxWeight);
+  detail = Format("%d styles, %d checks", styles, checks);
+  std::printf("swing-smooth: %s (%d checks)\n", ok ? "PASS" : "FAIL", checks);
+  return ok ? Status::Pass : Status::Fail;
+}
+
 }  // namespace
 
 const std::vector<Gate>& SwingGates() {
@@ -2854,6 +3168,11 @@ const std::vector<Gate>& SwingGates() {
       // No deps and no world: it builds its own MeleeState fixtures, so it can
       // neither disturb pristine worldgen nor be disturbed by anything.
       {"swing", "player", {}, false, GateSwing},
+      // The derivative of the same driver, over every authored held style:
+      // nothing may step in one tick. Asset-light and world-free like `swing`,
+      // so it sits beside it in kOrder and is the whole verification loop for
+      // a continuity change.
+      {"swing-smooth", "player", {}, false, GateSwingSmooth},
       // The opposite: the whole pipeline, on real terrain, against a real body.
       // Expensive, so it runs LATE in kOrder with the other world-touching
       // gates and regenerates worldgen on the way out (CLAUDE.md rule 7).

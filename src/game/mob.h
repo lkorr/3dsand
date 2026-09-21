@@ -12,6 +12,7 @@
 #include "game/equipment.h"
 #include "game/impact.h"    // StrikeProfile / StrikeEffectorMode: what a blow IS
 #include "game/melee.h"     // WeaponPose: the stroke driver's command to the rig
+#include "game/selfclip.h"  // ClipReport: is this pose inside itself
 #include "game/strokes.h"   // NpcStroke: one authored swing, live
 #include "math3d.h"
 #include "phys/debris.h"
@@ -2291,6 +2292,42 @@ class Mob {
   // rig's protected facts. False when there is no head to clear (severed, no
   // tag, no weapon arm) — the caller Clears rather than clamping stale.
   bool HeadKeepOut(Vec3& outCenterFromShoulder, float& outRadius) const;
+  // ...AND THE WIELDER'S OWN TORSO, as a keep-out CAPSULE (2026-09-21).
+  //
+  // The head sphere above stops an authored windup laying the blade through
+  // the skull, and nothing whatsoever stopped it laying the ARM through the
+  // chest. A cut across the body drives the commanded point to the far
+  // azimuth stop, and the hand is that point minus a WHOLE BLADE — which puts
+  // it inside the ribcage, with the forearm following it there. Reported as
+  // arms clipping through the body, and the self-clip detector
+  // (game/selfclip.h) is what turned it from a report into a number.
+  //
+  // A CAPSULE WITH AN ELLIPTICAL CROSS-SECTION, not a sphere and not a round
+  // cylinder: `outA`/`outB` are the spine's two ends, `outWide` is the body's
+  // half-width across and `outDeep` its half-depth front-to-back. Never its
+  // height — a radius off a torso's longest axis would forbid every pose a
+  // human arm has — and never one number for both, because a chest is half as
+  // deep as it is wide and a round keep-out sized off the width reaches out
+  // to where a guard is held. Same frame as HeadKeepOut: relative
+  // to the weapon arm's live chain root, in the yawed anim_.model frame, so
+  // the two clamps and the stroke seed cannot disagree by a leaning spine.
+  //
+  // False when the rig has no spine-tagged part, or no weapon arm — the
+  // caller Clears rather than clamping against a stale capsule.
+  bool BodyKeepOut(Vec3& outA, Vec3& outB, float& outWide,
+                   float& outDeep) const;
+
+  // ---- IS THIS POSE INSIDE ITSELF? (game/selfclip.h) -----------------------
+  //
+  // Counts solid collider voxels of each limb standing inside another limb,
+  // differenced against the bind pose so the shoulder ball that is ALWAYS in
+  // the chest is not a finding and a forearm swung through the ribs is.
+  // Model space, so the numbers read the same wherever the creature stands.
+  //
+  // Gate-grade, not frame-grade: the shapes are cached but the pair walk is
+  // voxels, and nothing in the frame loop calls it. False = the rig could not
+  // be read (no def, no anim pose).
+  bool SelfClipCheck(ClipReport& out) const;
 
   // WHY THE SWORD IS NOT WHERE THE STROKE ASKED, in four numbers.
   //
@@ -3490,6 +3527,20 @@ class Mob {
   mutable Quat weaponHandPreClamp_{}, weaponUpPreClamp_{}, weaponLoPreClamp_{};
   mutable Vec3 weaponHandPosPreClamp_{};
   mutable int weaponHandPart_ = -1, weaponUpPart_ = -1, weaponLoPart_ = -1;
+  // ---- THE SELF-CLIP DETECTOR'S CACHE (game/selfclip.h) -------------------
+  // Occupancy bitsets per limb and the bind pose's own pair overlaps. Both are
+  // facts about the ART, so they are built on the first check and reused; a
+  // carve changes a limb's voxels but not by enough to matter to "is this arm
+  // in the chest", and `clipShapeGen_` is the limb count the cache was built
+  // at, so a severed or appended slot rebuilds it rather than reading past it.
+  mutable std::vector<ClipShape> clipShapes_;
+  mutable std::vector<int> clipRest_;
+  // WHICH SLOTS THE CACHED BASELINE IS FOR. The table is indexed by position
+  // in the participating list, not by slot, so a severed limb renumbers every
+  // entry after it: keying the cache on the list itself is what stops a stale
+  // baseline being subtracted from the wrong pair.
+  mutable std::vector<int> clipRestOrder_;
+  mutable size_t clipShapeGen_ = (size_t)-1;
 
   // Particles authored outside the tick (Sever is reached from damage handling
   // all over the frame); drained by the driver's PreTick.

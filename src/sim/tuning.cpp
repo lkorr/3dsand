@@ -1187,6 +1187,10 @@ bool LoadTuning(const std::string& path, Tuning& out) {
     ReadF(*g, "torsoShare", e.torsoShare, out, at);
     ReadF(*g, "torsoPitch", e.torsoPitch, out, at);
     ReadF(*g, "headClearM", e.headClearM, out, at);
+    ReadF(*g, "bodyClearM", e.bodyClearM, out, at);
+    ReadF(*g, "leanFlipHold", e.leanFlipHold, out, at);
+    ReadF(*g, "leanMinSpeed", e.leanMinSpeed, out, at);
+    ReadF(*g, "flatMinSin", e.flatMinSin, out, at);
 
     // ---- BOUNDS, not taste ---------------------------------------------------
     // Every clamp here protects a STRUCTURAL property of the stroke rather than
@@ -1314,6 +1318,16 @@ bool LoadTuning(const std::string& path, Tuning& out) {
     e.torsoShare = std::clamp(e.torsoShare, 0.0f, 1.0f);
     e.torsoPitch = std::clamp(e.torsoPitch, 0.0f, 1.0f);
     e.headClearM = std::clamp(e.headClearM, 0.0f, 0.5f);
+    // Past half a metre the capsule is wider than the arm can reach round and
+    // the stroke is pinned at the stop; 0 is the off switch and is legal.
+    e.bodyClearM = std::clamp(e.bodyClearM, 0.0f, 0.5f);
+    // 0 pins the lean plane outright; pi is "never treat a turn as a
+    // reversal", which is the old behaviour and the one-JSON-edit A/B.
+    e.leanFlipHold = std::clamp(e.leanFlipHold, 0.0f, 3.15f);
+    e.leanMinSpeed = std::clamp(e.leanMinSpeed, 0.0f, 5.0f);
+    // Past ~0.95 the roll would never be recomputed at all, which is a blade
+    // whose edge stops leading the cut.
+    e.flatMinSin = std::clamp(e.flatMinSin, 0.0f, 0.95f);
   }
 
   // ---- combat feel: hit-stop, hit flash, combat cues ------------------------
@@ -3071,6 +3085,10 @@ bool SaveCombatTuning(const std::string& path, const Tuning& t,
     put("torsoShare", m.torsoShare);
     put("torsoPitch", m.torsoPitch);
     put("headClearM", m.headClearM);
+    put("bodyClearM", m.bodyClearM);
+    put("leanFlipHold", m.leanFlipHold);
+    put("leanMinSpeed", m.leanMinSpeed);
+    put("flatMinSin", m.flatMinSin);
     put("aimYaw", m.aimYaw);
     put("aimReleaseYaw", m.aimReleaseYaw);
   }

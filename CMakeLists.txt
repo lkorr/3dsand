@@ -489,6 +489,9 @@ add_library(sandvox_core OBJECT
   src/game/caster.cpp
   src/game/melee.cpp
   src/game/strokes.cpp
+  # Is this pose inside itself? (game/selfclip.h) — voxel-level limb
+  # interpenetration, differenced against the bind pose.
+  src/game/selfclip.cpp
   # THE AUTHORITY / PRESENTATION BOUNDARY (docs/PLAN_multiplayer_now.md N5).
   # PlayerSession is one player; TickAuthority is one tick of gameplay, moved
   # out of the middle of main()'s frame loop. See src/game/session.h.

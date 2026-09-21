@@ -1846,6 +1846,27 @@ struct Tuning {
     // frontal-plane clamp). 0 = clamp OFF — the A/B, same convention as
     // elbowAxisCone's pi.
     float headClearM = 0.06f;
+    // ---- ...and the ARM stays out of the wielder's own chest (2026-09-21) --
+    // Metres of clearance beyond the torso capsule's own half-width the HAND
+    // is pushed out to. The head sphere covered the one body part a BLADE
+    // could be swept through and left the one an ARM goes through untouched.
+    // 0 = clamp OFF, the same A/B convention.
+    float bodyClearM = 0.05f;
+    // ---- and the lean plane does not chase a reversal (game/melee.h) ------
+    // Radians. A commanded turn of the blade's lean plane larger than this is
+    // a REVERSAL, not a turn: the travel flipped, and a real blade keeps its
+    // lean rather than swapping which side the hilt leads on. The plane holds
+    // instead. pi disables it, which is the A/B.
+    float leanFlipHold = 3.14f;
+    // Metres/sec of TANGENTIAL tip travel below which there is nothing to
+    // chase and the lean plane and the roll simply hold. Under it the tangent
+    // is numerical dust.
+    float leanMinSpeed = 0.05f;
+    // Sine of the angle between the blade and its travel below which the
+    // blade's ROLL is held rather than recomputed. The flat is their cross
+    // product, so its direction is noise as they approach parallel — every
+    // thrust and every stall. 0.20 is 11.5 degrees.
+    float flatMinSin = 0.20f;
   } melee;
 
   // ---- combat feel: hit-stop, hit flash, combat cues --------------------------

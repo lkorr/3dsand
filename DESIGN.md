@@ -6633,9 +6633,133 @@ Multiplying `edgeAlign` in a second time when the kerf is built would square it.
 gate that only wants the geometry needs no item) and `EdgeSweep::tick` seeds the
 wound's counter-based RNG.
 
+### A SWING IS ALSO A DERIVATIVE, AND A POSE IS ALSO A SOLID (2026-09-21)
+
+Owner report: *"many of them will look good for like 60% of the animation and
+then the sword will spin / clip through things / teleport around super crazy
+fast"*, and *"many of the animations cause the character's arm to clip through
+their own body"*. Two complaints, and **neither was a thing any gate could
+see** — every swing gate above asserts on where a stroke ENDS UP (the arc it
+swept, the channel it travelled in, the pose it started from), so a stroke that
+arrives in the right place by a route with a step in it passes all of them.
+
+Two instruments were built, and they are the durable part of this:
+
+- **`--gate swing-smooth`** (CPU-only, milliseconds, `test/selftest_swing.cpp`)
+  replays every authored HELD style through the shared runner and asserts on
+  the PER-TICK CHANGE: the hand's and the point's travel bounded on the SECOND
+  difference (a committed cut legitimately moves the point six voxels in a
+  thirtieth of a second — what distinguishes a swing from a teleport is whether
+  the speed ARRIVED), the blade's direction and roll on the first (they have no
+  equivalent of a cut's speed, so a large step there IS the defect), the arm
+  CLAIM on the first, and the flat's SIGN REVERSALS on a count. Roll is measured
+  against the PARALLEL-TRANSPORTED previous flat — the naive angle between
+  consecutive flats is dominated by the blade turning, and measured that way
+  every style reported ~2.3 rad of "roll" and the number said nothing.
+- **`game/selfclip.h` + `--gate rig-clip`** answer *is this pose inside
+  itself*, which nothing in the engine could. A mob's limbs are deliberately
+  excluded from colliding with each other and a live limb is KINEMATIC, so Jolt
+  is never consulted about a pose; `AnimClampPoseLimits` bounds one joint at a
+  time and says nothing about where the shape on the end of it ends up. The
+  detector counts SOLID COLLIDER VOXELS of one limb standing inside another —
+  art-level, not box-level, because every limb's box overlaps its parent's at
+  the joint by construction — **differenced against the BIND POSE**, so the
+  shoulder ball that is always in the chest is not a finding and a forearm
+  swung through the ribs is. Pairs that share a joint are reported against
+  their own looser number, because a shared pivot buries more of one in the
+  other on every rotation and the bind-pose baseline cannot subtract that.
+
+**What the instruments then found, in order of how load-bearing it is:**
+
+1. **THE ARM CLAIM STEPPED FROM 1.0 TO 0 IN ONE TICK at the end of a swing**,
+   and that is the "teleport". `MeleeState::recoverHold_` is latched at the
+   Slash -> Recover transition ("the button is still down, so the arm is kept")
+   and **had no path that ever cleared it**, so a stroke that committed a cut
+   and then released held `PoseWeight()` at a full 1.0 for the whole recover
+   and dropped it to zero on the single tick the phase ended — and the rig
+   blends the ENTIRE two-bone solve and the wrist by that number. Fixed in two
+   places, because the authored `recover` ticks and the driver's own
+   `melee.recoverTime` are independent numbers that nothing made agree: the
+   latch is cleared on release (and the fade clock restarted, so it is a full
+   `recoverTime` FROM the release), and `StepStrokeProgram` will not report
+   `Finished` — the tick its caller drops the pose claim outright — while
+   `PoseWeight()` is still high. Measured on `swing-smooth`: worst claim step
+   **1.000 -> 0.152**.
+2. **THE ARM GOES THROUGH THE CHEST, and the head sphere was the only keep-out
+   there was.** `melee.headClear` covered the one body part a BLADE could be
+   swept through and left the one an ARM actually goes through untouched: a
+   backhand's windup drives the commanded point to the far azimuth stop and the
+   hand is that point minus a WHOLE BLADE, so it lands inside the ribs with the
+   forearm trailing through them. `Mob::BodyKeepOut` reports the trunk as a
+   capsule with an **elliptical** cross-section (a chest is half as deep as it
+   is wide; one radius off the width reaches out to where a guard is held),
+   inflated by the swinging arm's own half-thickness — the clamp bounds a LINE
+   and the detector counts a SOLID, and that gap is the arm's radius. The clamp
+   bounds the whole **shoulder-to-hand chord**, not the hand: a chord with both
+   endpoints outside a capsule passes straight through the middle of it, which
+   is exactly a backhand's chamber, and pushing only the hand left the forearm
+   84-105 voxels deep. Near the spine the radial direction is meaningless, so a
+   crossing arm resolves to passing IN FRONT — anatomy, not a tie-break, and
+   picking the radial there made `horizontal_r` worse rather than better.
+   Measured, summed over the ten held styles' driven phases: **476 -> 361
+   voxels**, better on six, worse on one.
+3. **AND THE RIG UNDOES PART OF IT, which is why `rig-clip` lands RED.** The
+   gate prints `ikMiss 0.00` on every style — the two-bone solve lands the hand
+   exactly where the driver asked — beside `shoulderClamp` up to 1.74 rad and
+   `roundTrip` up to 3.83 voxels. `AnimClampPoseLimits` runs AFTER the driver's
+   keep-out and takes the shoulder's authored ball limit off the result, so the
+   arm that ends up in the ribs is the CLAMPED pose and not the commanded one,
+   and **no further work inside `melee.cpp` can move it**. The fix is at the
+   pose seam — re-apply the keep-out after the clamp (it is a pose
+   post-process, like the IK it sits beside), or teach the clamp to project
+   onto the keep-out surface rather than onto the cone alone. Recorded rather
+   than bolted on: both are changes to the pose pipeline with their own hash
+   consequences.
+
+**Two fixes were measured, found real, and NOT LANDED, with their costs.** Both
+are one JSON edit away and both are recorded here because "we tried it" is the
+expensive half of the knowledge:
+
+- **Bounding the lean plane's turn.** `perpL_` chases the tip's TRAVEL, and
+  travel reverses at the end of every cut — asking the plane to turn by pi,
+  which carries the HAND through `pi * bladeLen * sin(lean)` of arc about the
+  shoulder-to-point line. That is the whole arm whipping round a blade that has
+  nearly stopped, and `leanTurnRate` does not prevent it, it only makes it take
+  0.17 s. Two formulations were tried — hold the plane to the arc the tip is
+  actually covering (`leanChaseRatio`), and refuse to chase a near-antipodal
+  target at all (`melee.leanFlipHold`, which is what ships, defaulted to pi =
+  off). Both measure well on the blade (a radian per swing of unasked-for
+  rotation gone) and **both move the arm enough to fail `swing-plane` and
+  `player-styles`**: the joint bulges 0.674 rad in front of its own
+  shoulder-to-wrist line against an authored 0.50, and a thrust loses its posed
+  travel. Sweeping `leanChaseRatio` found exactly one value (4) that threaded
+  between the two gates, with 2 and 8 each failing a different one — a knob
+  tuned to thread a needle between two thresholds is a flake, not a fix.
+- **A smoothstep velocity profile on the cut.** `StepStrokeProgram` closes the
+  remaining gap in equal shares, which is a deadline controller with a FLAT
+  velocity profile: the blade goes from still to full speed on the tick the
+  windup ends and from full speed to nothing on the tick the cut does. In
+  between it is perfectly smooth, which is why every gate passed it. Shaping
+  the closure on `S(u) = 3u^2 - 2u^3` gives `S'(0) = S'(1) = 0` and would also
+  read the damage speed at the MIDDLE of the travel, where the cut is centred
+  on the aim. It costs `npc-block`: `melee.blockGap` is sized to the shipped
+  geometry by 1% (its own note says so), and any change to when the blade is
+  where stops two swinging edges closing inside it.
+
+What DID land beside the two above: the blade's flat is chosen with the sign
+that agrees with the roll it already has (a flat normal names a PLANE — the
+damage model takes `fabs` of it — and `tangent_` reversing made the commanded
+normal jump to its own negative, which `Lerp` then carries THROUGH ZERO into an
+arbitrary `AnyPerp`), and `melee.flatMinSin` / `melee.leanMinSpeed` stop the
+roll and the lean plane being decided by numerical dust when the travel is
+nearly parallel to the blade or has stopped — the old guards were `1e-3`, three
+hundredths of a degree and a thousandth of a voxel per second.
+
 `--gate swing` covers the mapping (CPU-only, milliseconds, its own fixtures);
+`--gate swing-smooth` covers its derivative over every authored style;
 `--gate swing-plane` drives the same driver through the real rig and asserts on
-the sword's own world trajectory; `arm-readback` inside `--gate mob` covers the
+the sword's own world trajectory; `--gate rig-clip` asks what the pose went
+THROUGH rather than where it went; `arm-readback` inside `--gate mob` covers the
 inverse against a target the test chose, since a dropped yaw or a flipped x is
 invisible on a rig standing at heading 0 and mirrors the answer.
 
