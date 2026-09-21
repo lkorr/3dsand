@@ -3,18 +3,20 @@
 #include <functional>
 
 #include "math3d.h"
+#include "sim/tickinput.h"
 #include "sim/world.h"
 
-// Per-frame movement intent, filled from GLFW polling in main.cpp.
-struct PlayerInput {
-  float forward = 0;  // -1..1
-  float strafe = 0;   // -1..1
-  bool up = false;    // space
-  bool down = false;  // ctrl
-  bool sprint = false;
-  bool jumpPressed = false;
-};
-
+// THE CONTROLLER IS ON THE FIXED TICK (docs/PLAN_multiplayer_now.md N2).
+//
+// `PlayerInput` — a per-FRAME movement intent filled from GLFW polling — is
+// gone. Its replacement is `TickInput` (sim/tickinput.h), one command per
+// TICK, and Update() is called once per tick at kTickDt from inside the
+// fixed-tick loop rather than once per frame with a frame dt. Everything the
+// controller integrates (exp/pow smoothing, the coyote/buffer/hang timers, the
+// mantle drive) therefore advances on the sim clock and produces the same
+// trajectory at any frame rate — which is what the `tick-input` gate asserts
+// and what a networked client will have to reproduce from a command stream.
+//
 // AABB character vs the one-tick-latent voxel mirror (DESIGN.md v0 note).
 // All units are voxels; sizes below are stated in meters and converted via
 // kVoxelMeters so voxel size can be tuned in one place (world.h).
@@ -22,8 +24,20 @@ class Player {
  public:
   using KindFn = std::function<CellKind(IVec3)>;
 
-  void Update(float dt, const PlayerInput& in, const Vec3& flatFwd,
-              const Vec3& right, const Vec3& lookFwd, const KindFn& kindAt);
+  // ONE TICK of the controller. `dt` is kTickDt from every live caller; it
+  // stays a parameter because the fixtures drive shorter and longer steps to
+  // probe the integrators.
+  void Update(float dt, const TickInput& in, const KindFn& kindAt);
+  // The same call for fixtures that build an intent without a camera: the
+  // basis is passed alongside instead of inside the command. A convenience,
+  // not a second code path — it fills the three basis fields and forwards.
+  void Update(float dt, TickInput in, const Vec3& flatFwd, const Vec3& right,
+              const Vec3& lookFwd, const KindFn& kindAt) {
+    in.flatFwd = flatFwd;
+    in.right = right;
+    in.lookFwd = lookFwd;
+    Update(dt, in, kindAt);
+  }
 
   // Positional shove from debris rigidbodies (Physics::PlayerPushOut), applied
   // through the same voxel sweeps as movement so a body can never push the
@@ -82,7 +96,35 @@ class Player {
     return pos + Vec3{0, EyeOffsetNow() + viewYOffset, 0};
   }
 
+  // ---- RENDER INTERPOLATION (docs/PLAN_multiplayer_now.md N2) -------------
+  //
+  // The body now moves ONLY on the 30 Hz tick, so at 144 fps four frames in
+  // five would draw the eye at the identical position and the fifth would jump
+  // — a visible 30 Hz stutter that no amount of view smoothing hides. `alpha`
+  // is the frame loop's leftover accumulator as a fraction of a tick, exactly
+  // as Celestial::RenderTickInterp already uses it for the sky, and the camera
+  // rides prevPos -> pos by it.
+  //
+  // RENDER ONLY, and that is a hard rule rather than a preference: the sim
+  // must never read a value derived from a frame quantity or the world stops
+  // being a function of the tick stream. Every picking ray, the brush, the
+  // laser, the grenade, physics and the audio LISTENER's own logic keep using
+  // pos/EyePos(). The only consumers are the raymarch camera, the third-person
+  // boom's focus and the ear position — all presentation.
+  Vec3 RenderPos(float alpha) const {
+    return prevPos + (pos - prevPos) * alpha;
+  }
+  Vec3 RenderEyePos(float alpha) const {
+    return RenderPos(alpha) + Vec3{0, EyeOffsetNow() + viewYOffset, 0};
+  }
+  // Kill the interpolation for one frame: a teleport (world load, lab scene
+  // placement, the autofly park pin) must not be smeared across a tick.
+  void SnapRender() { prevPos = pos; }
+
   Vec3 pos{128, 100, 140};  // centre of the nominal figure box (see Box)
+  // `pos` at the START of the tick Update() is running, for RenderPos above.
+  // Written by Update and by SnapRender, read by nothing that feeds the sim.
+  Vec3 prevPos{128, 100, 140};
   Vec3 vel{0, 0, 0};
   bool fly = true;          // start in fly mode until the first mirror arrives
   bool grounded = false;
@@ -208,30 +250,26 @@ class Player {
   // The avatar reads it for impact damage instead of relying on landing
   // detection, so one code path covers both.
   //
-  // A LATCH, not a per-frame value, and that distinction IS the feature.
-  // Update() runs once per FRAME; the avatar consumes this inside the fixed-tick
-  // loop, which runs ZERO times on any frame where the accumulator has not
-  // reached a whole tick — at 60+ fps against the 30 Hz tick that is most
-  // frames. An impact is a single-frame event, so a plain per-frame assignment
-  // is overwritten by the next frame's ~0 (the body is grounded by then) before
-  // any tick ever reads it, and fall damage never fires at all. This is the same
-  // trap the RMB cast latch documents in main.cpp, and every other one-shot here
-  // (prefab stamp, mob spawn, detonate) is sticky for exactly this reason.
+  // A PEAK-HOLD OVER THE TICK. Update() and the avatar's consumer now run in
+  // the same tick (N2 moved the controller inside the loop), so this no longer
+  // has to survive a frame batch — but it is still a peak and not the last
+  // value written, because ONE tick can arrest the body more than once: the
+  // unstick lift, the vertical sweep and the horizontal sweep each cancel
+  // velocity, and the largest single arrest is the impact.
   //
-  // PEAK-HOLD, not accumulate: gravity contributes ~1.6 vox/s of cancelled
-  // velocity on every grounded frame, so summing would reach a lethal total
-  // just standing still. The largest single arrest is the impact.
+  // NOT AN ACCUMULATION: gravity contributes ~1.6 vox/s of cancelled velocity
+  // on every grounded tick, so summing would reach a lethal total just
+  // standing still.
   //
-  // Cleared by main.cpp on the first tick of the frame batch that sees it —
-  // which is also what stops a multi-tick frame applying the same hit 4 times.
+  // Cleared by main.cpp at the end of the tick that produced it, whether or
+  // not an avatar consumed it. A peak-hold that is never drained only ratchets
+  // upward, and the next avatar to spawn would inherit the hardest hit of the
+  // session and die on its first tick.
   Vec3 impactDeltaV{0, 0, 0};
 
-  // A JUMP WAS ACTUALLY LAUNCHED since this was last drained. Sticky, and
-  // cleared by main.cpp after the tick batch, for exactly the reason
-  // impactDeltaV above is: Update() runs once per FRAME and the avatar consumes
-  // this inside the fixed-tick loop, which runs zero times on most frames at
-  // 60+ fps against a 30 Hz tick. A plain per-frame bool would be false again
-  // before any tick ever read it.
+  // A JUMP WAS ACTUALLY LAUNCHED THIS TICK. Set by Update, read by the
+  // avatar's `jump` clip later in the same tick, cleared by main.cpp at the
+  // end of it — the same one-tick lifetime impactDeltaV above has.
   //
   // The avatar's `jump` clip keys on THIS rather than on losing ground contact.
   // Contact loss is not a jump: stepping off a kerb at 16 voxels/s clears the

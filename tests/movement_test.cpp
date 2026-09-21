@@ -105,7 +105,7 @@ Result Run(const NoisyFloor& floor, int frames, int jumpEvery) {
 
   // Settle onto the ground first so the run starts from rest.
   for (int i = 0; i < 60; i++)
-    p.Update(dt, PlayerInput{}, Vec3{1, 0, 0}, Vec3{0, 0, 1}, Vec3{1, 0, 0}, kindAt);
+    p.Update(dt, TickInput{}, Vec3{1, 0, 0}, Vec3{0, 0, 1}, Vec3{1, 0, 0}, kindAt);
   if (!p.grounded) std::printf("  [warn] body never settled before the run\n");
 
   Result r;
@@ -117,9 +117,9 @@ Result Run(const NoisyFloor& floor, int frames, int jumpEvery) {
   float yMin = p.pos.y, yMax = p.pos.y;
 
   for (int i = 0; i < frames; i++) {
-    PlayerInput in{};
+    TickInput in{};
     in.forward = 1.0f;
-    if (jumpEvery > 0 && i % jumpEvery == 0) in.jumpPressed = true;
+    if (jumpEvery > 0 && i % jumpEvery == 0) in.SetPressed(TB_JUMP, true);
 
     float beforeY = p.pos.y;
     p.Update(dt, in, Vec3{1, 0, 0}, Vec3{0, 0, 1}, Vec3{1, 0, 0}, kindAt);
@@ -193,7 +193,7 @@ ImpactRun DropImpact(const Floor& floor, float dropVox, float phase,
   double acc = (double)phase * (double)kSimTickDt;
   int after = 0;
   for (int i = 0; i < 4000; i++) {
-    PlayerInput in{};
+    TickInput in{};
     p.Update(dt, in, Vec3{1, 0, 0}, Vec3{0, 0, 1}, Vec3{1, 0, 0}, kindAt);
     const bool airborneNow = !p.grounded;
     // The fixed-tick loop, verbatim: consume-and-clear on the first tick of the
@@ -237,7 +237,7 @@ float IdleMaxImpactMs(const NoisyFloor& floor, int frames) {
   double acc = 0;
   float worst = 0;
   for (int i = 0; i < frames; i++) {
-    p.Update(dt, PlayerInput{}, Vec3{1, 0, 0}, Vec3{0, 0, 1}, Vec3{1, 0, 0}, kindAt);
+    p.Update(dt, TickInput{}, Vec3{1, 0, 0}, Vec3{0, 0, 1}, Vec3{1, 0, 0}, kindAt);
     acc += (double)dt;
     while (acc >= (double)kSimTickDt) {
       acc -= (double)kSimTickDt;

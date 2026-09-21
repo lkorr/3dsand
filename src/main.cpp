@@ -55,6 +55,7 @@
 #include "sim/farfield.h"
 #include "sim/celestial.h"
 #include "sim/materials.h"
+#include "sim/oprecord.h"  // the op record carries the tick command (N2/N3)
 #include "sim/microbody.h"
 #include "sim/microvox.h"
 #include "sim/pagetable.h"  // PagesHighWater for the --frames pool-margin line
@@ -5776,6 +5777,10 @@ int main(int argc, char** argv) {
     player.fly = true;
     ui.fly = true;
   }
+  // The render camera interpolates prevPos -> pos across a tick (N2), and
+  // every placement above is a TELEPORT: without this the first frames would
+  // lerp the eye in from the constructor's default position.
+  player.SnapRender();
   // seed the far-field cascades around spawn (coarsest first; the queue
   // drains at kFarListCap level-chunks per tick through SubmitTick)
   far.FullRefill(IVec3{ifloor(player.pos.x) >> 4, ifloor(player.pos.y) >> 4,
@@ -5805,10 +5810,27 @@ int main(int argc, char** argv) {
   KeyEdge eGlyph[kGlyphSlots];
   bool prevMouseL = false;
   bool prevMouseR = false;
-  // RMB cast, latched until a tick actually runs (see the cast site below).
-  bool castQueued = false;
+  // ---- THE FRAME LAYER'S COMMAND ACCUMULATOR (PLAN_multiplayer_now N2) ----
+  //
+  // This replaces the ad-hoc sticky latches that used to live here —
+  // `castQueued`, `strikeQueued`, `ui.placePrefab`, `ui.spawnMob`,
+  // `dropStatusQueued` — each of which was a hand-rolled instance of the same
+  // rule: the tick loop below runs ZERO times on most frames at 60+ fps
+  // against a 30 Hz tick, so a frame-local one-shot is discarded unread eight
+  // tries out of nine (that is the bug that made RMB casting fire one try in
+  // nine, and the note it left behind is now this type's docstring).
+  //
+  // The frame layer WRITES held state and the axes wholesale every frame, ORs
+  // in every pressed edge it sees, and adds the frame's raw mouse pixels. Each
+  // tick CONSUMES one TickInput: held state is broadcast to every tick of a
+  // multi-tick frame, an edge is delivered to exactly one tick. That contract
+  // is what the `tick-input` gate pins, and it is the message a networked
+  // client will send.
+  TickInputFeeder feeder;
   // A body part clicked in the inspector with a sentence on the stack, latched
-  // the same way: the slot, or -1.
+  // the same way: the slot, or -1. NOT a TickInput field — it is a click in an
+  // ImGui panel on a specific rig part, which is a UI transaction rather than
+  // a player command, and it has no meaning on a remote peer.
   int castAtPartQueued = -1;
   // ---- looking at things, and looting them (game/corpses.h) ----------------
   // What the reach ray found this frame (a debris body handle or 0), the
@@ -5835,10 +5857,6 @@ int main(int argc, char** argv) {
   // the frame block and read by the E prompt, and the melee ray runs inside
   // the tick loop, where overwriting it would silently change what E offers.
   std::vector<uint64_t> strikeIgnore;
-  // RMB held (a beam stays lit while it is), and Delete pressed in magic mode
-  // (drop the newest status), both read on the frame and consumed by the tick.
-  bool beamHeld = false;
-  bool dropStatusQueued = false;
   std::vector<Grenade> grenades;
   // Where a spell resolved, for the renderer: a short-lived burst of sprites
   // (SpellEmission::impacts). Render-only, counted down per TICK so the flash
@@ -6798,10 +6816,12 @@ int main(int argc, char** argv) {
     // above. MeleeTuning::commitSpeed is calibrated in true mouse pixels per
     // second, so damping the input here would move the commit threshold every
     // time somebody retunes the camera, and it would also shrink the cut the
-    // player physically made. Fed per FRAME, because that is the rate the
-    // mouse is sampled at; the tick loop below runs 0..4 times per frame and
-    // integrating it there would multiply-count a fast flick into a much
-    // faster one.
+    // player physically made. ACCUMULATED into the tick command rather than
+    // delivered to a consumer here (N2): the mouse is sampled per frame, but
+    // both consumers — the swing driver and the strike picker — now integrate
+    // one whole tick's pixels at kTickDt inside the loop below. Total pixels
+    // are preserved either way, which is the property the `swing` gate states
+    // ("a displacement, not a rate").
     //
     // UNDER HIT-STOP THE STROKE INTEGRATES IN SIM TIME, and that is the
     // decision rather than an oversight. During a dip the tick loop runs less
@@ -6829,13 +6849,10 @@ int main(int argc, char** argv) {
     // MODE SPLIT (D10 of the discrete-strikes plan): in discrete mode the
     // driver is fed by the stroke program in the tick loop, so raw pixels go
     // to the PICKER instead — feeding both would double-integrate the same
-    // motion into the accumulator and bend every authored cut.
-    if (captured) {
-      if (CurrentTuning().melee.controlMode == 1)
-        melee.Feed((float)(mx - mx0), (float)(my - my0));
-      else
-        strikePicker.Feed((float)(mx - mx0), (float)(my - my0), dt);
-    }
+    // motion into the accumulator and bend every authored cut. The SPLIT now
+    // happens at the tick, not here: one look delta goes into the command and
+    // the tick body routes it by mode.
+    if (captured) feeder.Look((float)(mx - mx0), (float)(my - my0));
     mx0 = mx;
     my0 = my;
 
@@ -7129,8 +7146,8 @@ int main(int argc, char** argv) {
       if (ui.tool == UIState::kToolFluid && fluidCueMat != 0)
         ui.brushMaterial = (int)fluidCueMat;
     }
-    if (captured && eM.Pressed(key(GLFW_KEY_M))) ui.spawnMob = true;
-    if (captured && eB.Pressed(key(GLFW_KEY_B))) ui.placePrefab = true;
+    if (captured && eM.Pressed(key(GLFW_KEY_M))) feeder.Press(TB_SPAWN);
+    if (captured && eB.Pressed(key(GLFW_KEY_B))) feeder.Press(TB_PLACE);
     if (captured && eK.Pressed(key(GLFW_KEY_K))) ui.spawnSphere = true;
     // U clears the experimental MLS-MPM fluid (sticky flag, consumed in the
     // tick loop like every other one-shot input — see the cast-key note).
@@ -7175,14 +7192,20 @@ int main(int argc, char** argv) {
     // screen. `gameKeys` is the fix, and the axes are left at zero rather than
     // frozen so the controller decelerates properly instead of holding the
     // last input.
-    PlayerInput pin;
+    //
+    // THE ONE PLACE THE KEYBOARD IS READ FOR MOVEMENT. `pin` is this FRAME's
+    // sample; it is pushed into the feeder at the bottom of this block and the
+    // tick loop takes it from there. Nothing below the input span calls
+    // glfwGetKey (N2: `grep glfwGet src/game/` is empty and the frame layer is
+    // the only reader).
+    TickInput pin;
     if (gameKeys) {
       pin.forward = (key(GLFW_KEY_W) ? 1.f : 0.f) - (key(GLFW_KEY_S) ? 1.f : 0.f);
       pin.strafe = (key(GLFW_KEY_D) ? 1.f : 0.f) - (key(GLFW_KEY_A) ? 1.f : 0.f);
-      pin.up = key(GLFW_KEY_SPACE);
-      pin.down = key(GLFW_KEY_LEFT_CONTROL);
-      pin.sprint = key(GLFW_KEY_LEFT_SHIFT);
-      pin.jumpPressed = eJump.Pressed(key(GLFW_KEY_SPACE));
+      pin.SetHeld(TB_JUMP, key(GLFW_KEY_SPACE));
+      pin.SetHeld(TB_CROUCH, key(GLFW_KEY_LEFT_CONTROL));
+      pin.SetHeld(TB_SPRINT, key(GLFW_KEY_LEFT_SHIFT));
+      pin.SetPressed(TB_JUMP, eJump.Pressed(key(GLFW_KEY_SPACE)));
     } else {
       // Keep the jump edge fed with `false` so a space held THROUGH a menu
       // does not read as a fresh press the instant it closes.
@@ -7233,10 +7256,10 @@ int main(int argc, char** argv) {
       // those is a depth the camera flattens from behind.
       pin.forward = 0.4f;
       pin.strafe = 1.f;
-      pin.sprint = false;
+      pin.SetHeld(TB_SPRINT, false);
       cam.yaw = 0.6f;
       cam.pitch = -0.12f;
-      pin.jumpPressed = (frameCounter == kShotJumpAtFrame);
+      pin.SetPressed(TB_JUMP, frameCounter == kShotJumpAtFrame);
     }
     // --autofly: hold W+sprint in fly mode, no human at the keyboard. Exists to
     // reproduce the streaming-shift stutter, which only appears when the window
@@ -7246,10 +7269,10 @@ int main(int argc, char** argv) {
       ui.fly = false;
       pin.forward = 1.f;
       pin.strafe = 0.f;
-      pin.sprint = false;
+      pin.SetHeld(TB_SPRINT, false);
       static uint32_t lastHopTick = ~0u;
       if (tick % 45u == 0u && lastHopTick != tick) {
-        pin.jumpPressed = true;
+        pin.SetPressed(TB_JUMP, true);
         lastHopTick = tick;
       }
       // A fixed tick schedule, like the autofly phases: reproducible run to run.
@@ -7260,7 +7283,7 @@ int main(int argc, char** argv) {
       ui.fly = true;
       pin.forward = 1.f;
       pin.strafe = 0.f;
-      pin.sprint = true;
+      pin.SetHeld(TB_SPRINT, true);
       // --autofly-hard: the ADVERSARIAL traversal, which is what actually sizes
       // the pool (production streaming guidance is explicit that teleports,
       // 180-degree turns and fast diagonal traversal define a pool, not steady
@@ -7273,14 +7296,15 @@ int main(int argc, char** argv) {
         // reproducible run to run.
         const uint32_t phase = (uint32_t)(tick / 90u) & 3u;
         pin.strafe = (phase == 1) ? 1.f : (phase == 3) ? -1.f : 0.f;
-        pin.down = true;   // descend into solid rock: worst case for residency
+        // descend into solid rock: worst case for residency
+        pin.SetHeld(TB_CROUCH, true);
       }
       // --autofly-surface: the RENDERER's worst case. Fly forward over the
       // terrain at two altitudes on the same fixed `tick/90` phase form the
       // hard descent uses, so the two harnesses are directly comparable and
       // both are reproducible run to run.
       //
-      // WHY THE ALTITUDE IS HELD ANALYTICALLY, not by pin.up/pin.down: the
+      // WHY THE ALTITUDE IS HELD ANALYTICALLY, not by the space/ctrl bits: the
       // quantity under test is RAY LENGTH THROUGH UNSKIPPED CHUNKS, which is a
       // function of height above the terrain, and a fly-mode climb driven by an
       // input axis wanders with frame time. World::TerrainHeight is the exact
@@ -7298,19 +7322,26 @@ int main(int argc, char** argv) {
       //                and the altitude term is the whole cost.
       if (g_autoflySurface) {
         const uint32_t phase = (uint32_t)(tick / 90u) & 1u;
-        pin.up = false;
-        pin.down = false;
+        pin.SetHeld(TB_JUMP | TB_CROUCH, false);
         g_autoflySurfaceHigh = (phase == 1u);
         // Park: hold ONE regime and stop the forward axis. The regime hop is
         // 115 voxels, i.e. a 7-chunk vertical shift, so leaving it alternating
         // would keep the streaming wake this probe exists to remove.
         if (g_autoflyPark && tick >= ParkFlyTicks()) {
           pin.forward = 0.f;
-          pin.sprint = false;
+          pin.SetHeld(TB_SPRINT, false);
           g_autoflySurfaceHigh = false;
         }
       }
     }
+    // ---- THIS FRAME'S SAMPLE, INTO THE COMMAND -----------------------------
+    // Held state and the axes REPLACE what is pending (the newest keyboard
+    // sample wins, so a key released between two ticks reads as released);
+    // the jump EDGE is OR-ed in and waits for a tick to take it. Every other
+    // edge is pressed at its own binding further down this block.
+    feeder.SetAxes(pin.forward, pin.strafe);
+    feeder.SetHeldMask(pin.held);
+    if (pin.Pressed(TB_JUMP)) feeder.Press(TB_JUMP);
 
     if (ui.reloadShaders) {
       ui.reloadShaders = false;
@@ -7707,6 +7738,7 @@ int main(int argc, char** argv) {
         cam.pitch = labPitch;
       }
       player.viewYOffset = 0.0f;  // teleport: never smooth across it
+      player.SnapRender();        // ...and never interpolate across it either
       tick = 0;
       grenades.clear();
       everExploded = false;
@@ -7747,11 +7779,16 @@ int main(int argc, char** argv) {
         fluidCount = 0;  // MPM fluid is not in the save format: saves
         fluidPendingSpawns.clear();  // force-settle (loadReset zeroes the
                                      // GPU count + calm state)
+        player.SnapRender();  // the load moved the body: do not lerp into it
         tpRig.Snap();
       }
     }
 
-    // ---- player (per frame, against the latest one-tick-latent mirror) ----
+    // ---- player: the FRAME half (PLAN_multiplayer_now N2) ----------------
+    // The controller itself no longer runs here. What is left is the two
+    // things that are genuinely per-frame: the fly-mode mirror of the dev
+    // toggle, and the `kindAt` closure the tick body and the third-person
+    // boom both call. Player::Update moved into the fixed-tick loop below.
     player.fly = ui.fly;
     // Excited MPM water folds into the liquid answer BEFORE the voxel
     // mirror: swimming, buoyancy and the waterline frame work identically
@@ -7761,58 +7798,6 @@ int main(int argc, char** argv) {
       if (world.FluidEighthsAt(c) >= 2) return CellKind::Liquid;
       return world.KindAt(c, classOf);
     };
-    // Dismemberment drives movement: the active AnimStateRule's speedScale and
-    // the leg-liveness-derived jump scale come straight from the avatar, so
-    // losing a leg slows the player down and losing both stops them jumping.
-    // Fly mode deliberately ignores all of it — a debug camera should not be
-    // crippled by the character's injuries.
-    {
-      const AvatarLocomotion loco = avatar.Locomotion();
-      const bool couple = avatar.Spawned() && !player.fly;
-      player.speedScale = couple ? loco.speedScale : 1.0f;
-      player.jumpScale = couple ? loco.jumpScale : 1.0f;
-      player.canJump = couple ? loco.canJump : true;
-      // ...and what you are DRAGGING multiplies the same scale (game/grab.h):
-      // a light crate costs nothing, a corpse walks you at half pace, and the
-      // heaviest thing the grab will accept is close to the tuned floor. It
-      // stacks with the injury scale on purpose — a one-legged man carrying an
-      // anvil is slower than either.
-      //
-      // Fly mode is exempt for the same reason the injuries are: the debug
-      // camera should not be encumbered.
-      if (!player.fly) player.speedScale *= grab.SpeedScale(CurrentTuning().player);
-    }
-    // ---- component 9: impact ripples -------------------------------------
-    // The event source, and it is a RISING EDGE rather than a per-frame test:
-    // an impact happens once. Sampled around player.Update because the entry
-    // speed is what sizes the splash and it is gone a frame later.
-    //
-    // Render-only, bounded by the ring, and it is deliberately NOT an audio
-    // cue's twin — a cue fires on the same event but through a different
-    // system, and coupling them would make one of them the other's trigger.
-    {
-      static bool wasInLiquid = false;
-      const float enterSpeed = -player.vel.y;
-      // A limp or rising body owns the player, not the controller: no
-      // input, no gravity, no sweeps. The capsule is moved onto the body
-      // after each physics step (PlayerAvatar::RagdollFollow, below).
-      if (avatar.Spawned() && avatar.Ragdolled()) {
-        player.vel = {};
-      } else {
-        player.Update(dt, pin, cam.FlatForward(), cam.Right(), cam.Forward(),
-                      kindAt);
-      }
-      if (player.inLiquid && !wasInLiquid && enterSpeed > 2.0f) {
-        // Crest height in metres, from the entry speed, capped: a splash from
-        // a great fall is bigger, but not without limit — an unbounded
-        // amplitude here would tilt the surface normal past the shore and the
-        // whole lake would go black (the ripple steepness note in
-        // raymarch.wgsl is the same trap).
-        const float amp = std::min(0.02f + enterSpeed * 0.004f, 0.12f);
-        WaveImpacts().Add(player.pos.x, player.pos.z, (float)now, amp);
-      }
-      wasInLiquid = player.inLiquid;
-    }
     // ---- the trample ring: feet on the plants ------------------------------
     // Every grounded presser lays or refreshes a footprint stamp under itself
     // each frame (sim/trample.h); the plants read the ring at their base and
@@ -7844,39 +7829,6 @@ int main(int argc, char** argv) {
                  std::min(1.0f, 0.5f + half * 0.15f), (float)now);
       }
       tr.Expire((float)now, trTun.render.trampleRecover);
-    }
-    // --autofly-surface altitude pin. Held analytically against the worldgen
-    // heightfield rather than flown, so the measured quantity (ray length
-    // through unskipped chunks) depends only on the tick schedule — see the
-    // block beside g_autoflyHard for why. Fly mode has no terrain collision, so
-    // assigning the position outright is legal here; vel.y is zeroed so the
-    // integrator does not carry an accumulated climb into the next frame and
-    // fight this every step.
-    if (g_autoflySurface) {
-      const int gh = World::TerrainHeight((int)std::floor(player.pos.x),
-                                          (int)std::floor(player.pos.z),
-                                          kDefaultSeed);
-      player.pos.y = (float)gh + (g_autoflySurfaceHigh ? kAutoflySurfaceHighVox
-                                                       : kAutoflySurfaceLowVox);
-      player.vel.y = 0.0f;
-      // Park: latch the pose once and re-assign it every frame. Zeroing the
-      // input axis is not enough on its own — fly mode integrates velocity, so
-      // a coast of even a few voxels crosses a chunk boundary and shifts the
-      // window, which is precisely the stimulus under test.
-      if (g_autoflyPark && tick >= ParkFlyTicks()) {
-        if (!g_parkPosSet) {
-          // SANDVOX_PARK_AT wins over the route's endpoint, and it is read
-          // AFTER the surface-follow above rewrote pos.y: the whole point of
-          // naming a place is that the probe holds THAT altitude, which over a
-          // lake is not TerrainHeight's.
-          if (!ParkAtPos(g_parkPos)) g_parkPos = player.pos;
-          g_parkPosSet = true;
-          std::printf("park: stopped at (%.1f, %.1f, %.1f) on tick %u\n",
-                      g_parkPos.x, g_parkPos.y, g_parkPos.z, tick);
-        }
-        player.pos = g_parkPos;
-        player.vel = Vec3{0, 0, 0};
-      }
     }
     ui.fly = player.fly;
 
@@ -7959,37 +7911,59 @@ int main(int argc, char** argv) {
     bool mouseRClick = mouseR && !prevMouseR;
     prevMouseL = mouseL;
     prevMouseR = mouseR;
-    if (mouseLClick && ui.tool == UIState::kToolPrefab) ui.placePrefab = true;
-    if (mouseLClick && ui.tool == UIState::kToolMob) ui.spawnMob = true;
-    // THE CAST KEY is RMB, and only while magic mode is on.
+    // ---- EVERY ONE-SHOT, INTO THE COMMAND'S PRESSED MASK ------------------
     //
-    // Chosen over Enter, which the brief suggested against for the right
-    // reason: the left hand lives on WASD and the right hand is already on the
-    // mouse for aiming, so Enter would mean leaving the number row to reach
-    // across the keyboard mid-fight. A spell is AIMED, so the cast belongs on
-    // the aiming hand. Magic mode is what keeps this from stealing brush-erase.
-    // LATCHED, not frame-local. The cast is consumed inside the fixed-tick
-    // loop below, which runs ZERO times on any frame where the accumulator has
-    // not reached a whole tick — at 50 fps against a 30 Hz tick that is most
-    // frames. A frame-local bool is therefore discarded unread most of the
-    // time, which reads as "RMB does nothing 8 tries out of 9".
+    // These five used to be five hand-rolled sticky booleans (`castQueued`,
+    // `strikeQueued`, `ui.placePrefab`, `ui.spawnMob`, `dropStatusQueued`),
+    // each latched here and consumed-and-cleared somewhere in the tick body,
+    // because the tick loop runs ZERO times on most frames at 60+ fps against
+    // a 30 Hz tick and a frame-local bool is discarded unread eight tries out
+    // of nine — the bug that made RMB casting fire one try in nine. The feeder
+    // does that for all of them at once, and guarantees the half nobody wrote
+    // by hand: an edge reaches EXACTLY ONE tick, never zero and never two.
     //
-    // Every other one-shot input here (prefab stamp, mob spawn, detonate) is
-    // already a sticky flag consumed-and-cleared inside the loop for exactly
-    // this reason; casting was the one that was not.
-    if (captured && ui.magicMode && mouseRClick) castQueued = true;
-    beamHeld = captured && mouseR;
-    if (captured && ui.magicMode && eDel.Pressed(key(GLFW_KEY_DELETE))) dropStatusQueued = true;
-    beamHeld = captured && mouseR;
-    if (captured && ui.magicMode && eDel.Pressed(key(GLFW_KEY_DELETE))) dropStatusQueued = true;
+    // THE CAST KEY is RMB, and only while magic mode is on. Chosen over Enter
+    // for the right reason: the left hand lives on WASD and the right hand is
+    // already on the mouse for aiming. A spell is AIMED, so the cast belongs
+    // on the aiming hand; magic mode is what keeps this from stealing
+    // brush-erase.
+    if (mouseLClick && ui.tool == UIState::kToolPrefab) feeder.Press(TB_PLACE);
+    if (mouseLClick && ui.tool == UIState::kToolMob) feeder.Press(TB_SPAWN);
+    if (mouseLClick) feeder.Press(TB_ATTACK);
+    if (captured && ui.magicMode && mouseRClick) feeder.Press(TB_CAST);
+    if (captured && ui.magicMode && eDel.Pressed(key(GLFW_KEY_DELETE)))
+      feeder.Press(TB_DROP);
+    // The DEV PANEL asks for the same two things through UIState, so its
+    // buttons funnel into the same edges rather than through a second door.
+    // The flag is cleared as it is converted: it is a request, not state.
+    if (ui.placePrefab) { ui.placePrefab = false; feeder.Press(TB_PLACE); }
+    if (ui.spawnMob) { ui.spawnMob = false; feeder.Press(TB_SPAWN); }
+    // The held mouse bits, and the laser's OR of F-from-any-tool with
+    // LMB-with-the-laser-tool. Re-sampled every frame, so a button released
+    // between two ticks reads as released on the second one.
+    feeder.Hold(TB_ATTACK, mouseL);
+    feeder.Hold(TB_ALT, mouseR);
+    feeder.Hold(TB_LASER,
+                captured && (glfwGetKey(window, GLFW_KEY_F) == GLFW_PRESS ||
+                             (ui.tool == UIState::kToolLaser && mouseL)));
+    // The RENDER layer draws the beam sprites and has no TickInput (it runs on
+    // frames the tick loop did not). It reads the same bit off the pending
+    // command rather than re-deriving the expression, so what is DRAWN and
+    // what CUTS can never come from two different reads of the mouse.
+    const bool laserHeldFrame = feeder.pend.Held(TB_LASER);
     // A click made while paused is DROPPED rather than held: the tick loop
-    // breaks before the cast site while paused, so a latched click would sit
-    // there and discharge the instant you unpause, at whatever you happen to
-    // be aiming at then.
-    if (ui.paused && !ui.stepOnce) castQueued = false;
-    bool laserHeld =
-        captured && (glfwGetKey(window, GLFW_KEY_F) == GLFW_PRESS ||
-                     (ui.tool == UIState::kToolLaser && mouseL));
+    // breaks before the cast and strike sites while paused, so a latched click
+    // would sit there and discharge the instant you unpause, at whatever you
+    // happen to be aiming at then.
+    if (ui.paused && !ui.stepOnce) {
+      feeder.Cancel(TB_CAST | TB_ATTACK);
+      // ...and the strike style a tick already picked, for the same reason.
+      // Cancel() only reaches edges that have not been consumed yet; a press
+      // taken on the last tick before the pause has already become a style
+      // index sitting in `strikeQueued`, and that one has to be dropped here
+      // or it fires the instant the world resumes.
+      strikeQueued = -1;
+    }
     bool brushActive = ui.tool == UIState::kToolBrush && !ui.magicMode;
     // MELEE: hold LMB with the melee tool to arm the weapon, then flick.
     // Magic mode wins the mouse, so guarding and casting can never both be
@@ -8065,45 +8039,24 @@ int main(int argc, char** argv) {
     // is the one the driver, the program and the sweep gate on, because a fist
     // is as live as a sword.
     const bool meleeReady = meleeArmed || meleeUnarmed;
-    const bool meleeHeld = meleeReady && mouseL;
-    // DISCRETE STRIKES (melee.controlMode 0): the click is the whole input,
-    // LATCHED like castQueued above and for the same reason. The direction is
-    // read HERE, at the press edge, because the flick is freshest at the
-    // instant of intent — a strike fired from the buffer later still cuts the
-    // direction that was flicked, aimed wherever the camera is THEN (the
-    // aim is resolved at the windup's end, like every stroke).
-    if (mouseLClick && meleeReady && CurrentTuning().melee.controlMode == 0) {
-      const StyleLibrary& styleLib = mobs.AttackStyles();
-      // WHICH COMPASS: the sword's, or the fists'. Two maps rather than one
-      // filtered set, because the two are different SHAPES (strokes.h
-      // StyleLibrary::playerUnarmed) — a punch compass has a jab and a cross
-      // where a sword's has an overhead and a thrust.
-      const PlayerStrikeMap& map =
-          meleeArmed ? styleLib.player : styleLib.playerUnarmed;
-      float fx = 0, fy = 0;
-      int si = -1;
-      if (strikePicker.Pick(CurrentTuning().melee.pickMinSpeed, fx, fy))
-        si = QuantizeStrike(map, fx, fy);
-      if (si < 0) {
-        // No flick: alternate the two horizontals so plain clicking is a
-        // usable L/R rhythm rather than the same cut stamped.
-        si = NeutralStrike(map, strikePicker.altRight);
-        strikePicker.altRight = !strikePicker.altRight;
-      }
-      if (si >= 0) strikeQueued = si;
-    }
-    // Same pause rule as the cast: a click made while paused is dropped, not
-    // banked to fire at whatever is under the crosshair on unpause.
-    if (ui.paused && !ui.stepOnce) strikeQueued = -1;
+    // THE DISCRETE STRIKE'S PICK MOVED INTO THE TICK. It used to be read here,
+    // at the click edge, off a frame-smoothed picker; the picker now
+    // integrates one tick's pixels at kTickDt and the pick happens on the tick
+    // that consumes TB_ATTACK. The same instant of intent, on one clock.
+    //
     // Scroll and the number row pick a hotbar slot while the melee tool is up,
     // which is the one context where the number row is otherwise unclaimed
-    // (the brush owns it normally, glyphs own it in magic mode).
+    // (the brush owns it normally, glyphs own it in magic mode). A UI
+    // transaction, so it stays on the frame; the command merely CARRIES the
+    // resulting selection, so a record or a remote peer knows what was in hand
+    // when a tick's ops were authored.
     if (ui.tool == UIState::kToolMelee && !ui.magicMode) {
       for (int i = 0; i < kItemSlots; i++) {
         int k = (i == 9) ? GLFW_KEY_0 : (GLFW_KEY_1 + i);
         if (captured && eGlyph[i].Pressed(key(k))) hotbar.Select(i);
       }
     }
+    feeder.SetSelection(ui.tool, hotbar.selected);
     spanInput.Close();
     // R4 (docs/RESEARCH_streaming_hitch.md): one residency shift per FRAME.
     // Stream::Update is a per-TICK call and the clamp below runs up to four of
@@ -8192,6 +8145,153 @@ int main(int argc, char** argv) {
         ctx.ProcessEvents();
       }
       if (g_autoflyPark) ParkProbe(world, mats, tick);
+
+      // ================= THE PLAYER, ON THE TICK (N2) =====================
+      //
+      // Package N2 of docs/PLAN_multiplayer_now.md moved the controller from
+      // the frame loop into here. It runs at kTickDt with ONE TickInput, so
+      // the trajectory is a function of the command stream and nothing else —
+      // which is the property a networked client has to reproduce, and the
+      // one the `tick-input` gate asserts (identical position to the bit at
+      // 1 and 4 ticks per frame).
+      //
+      // FIRST IN THE TICK BODY, and the order is load-bearing three ways:
+      //   * AFTER the ProcessEvents pump above, so the sweeps read the mirror
+      //     this tick delivered rather than last frame's.
+      //   * BEFORE `playerChunkNow` below, so the residency window recenters
+      //     on where the body IS, not where it was a tick ago.
+      //   * BEFORE mobs.PreTick, because SetPlayerActor pushes this position
+      //     to the NPCs and the avatar poses to it.
+      const TickInput ti =
+          feeder.Consume(cam.FlatForward(), cam.Right(), cam.Forward());
+      // Dismemberment drives movement: the active AnimStateRule's speedScale and
+      // the leg-liveness-derived jump scale come straight from the avatar, so
+      // losing a leg slows the player down and losing both stops them jumping.
+      // Fly mode deliberately ignores all of it — a debug camera should not be
+      // crippled by the character's injuries.
+      {
+        const AvatarLocomotion loco = avatar.Locomotion();
+        const bool couple = avatar.Spawned() && !player.fly;
+        player.speedScale = couple ? loco.speedScale : 1.0f;
+        player.jumpScale = couple ? loco.jumpScale : 1.0f;
+        player.canJump = couple ? loco.canJump : true;
+        // ...and what you are DRAGGING multiplies the same scale (game/grab.h):
+        // a light crate costs nothing, a corpse walks you at half pace, and the
+        // heaviest thing the grab will accept is close to the tuned floor. It
+        // stacks with the injury scale on purpose — a one-legged man carrying an
+        // anvil is slower than either.
+        //
+        // Fly mode is exempt for the same reason the injuries are: the debug
+        // camera should not be encumbered.
+        if (!player.fly) player.speedScale *= grab.SpeedScale(CurrentTuning().player);
+      }
+      // ---- component 9: impact ripples -------------------------------------
+      // The event source, and it is a RISING EDGE rather than a per-tick test:
+      // an impact happens once. Sampled around player.Update because the entry
+      // speed is what sizes the splash and it is gone a tick later.
+      //
+      // Render-only, bounded by the ring, and it is deliberately NOT an audio
+      // cue's twin — a cue fires on the same event but through a different
+      // system, and coupling them would make one of them the other's trigger.
+      {
+        static bool wasInLiquid = false;
+        const float enterSpeed = -player.vel.y;
+        // A limp or rising body owns the player, not the controller: no
+        // input, no gravity, no sweeps. The capsule is moved onto the body
+        // after each physics step (PlayerAvatar::RagdollFollow, below).
+        if (avatar.Spawned() && avatar.Ragdolled()) {
+          player.vel = {};
+          player.SnapRender();   // the rig owns the body: nothing to lerp
+        } else {
+          player.Update(kTickDt, ti, kindAt);
+        }
+        if (player.inLiquid && !wasInLiquid && enterSpeed > 2.0f) {
+          // Crest height in metres, from the entry speed, capped: a splash from
+          // a great fall is bigger, but not without limit — an unbounded
+          // amplitude here would tilt the surface normal past the shore and the
+          // whole lake would go black (the ripple steepness note in
+          // raymarch.wgsl is the same trap).
+          const float amp = std::min(0.02f + enterSpeed * 0.004f, 0.12f);
+          WaveImpacts().Add(player.pos.x, player.pos.z, (float)now, amp);
+        }
+        wasInLiquid = player.inLiquid;
+      }
+      // --autofly-surface altitude pin. Held analytically against the worldgen
+      // heightfield rather than flown, so the measured quantity (ray length
+      // through unskipped chunks) depends only on the tick schedule — see the
+      // block beside g_autoflyHard for why. Fly mode has no terrain collision, so
+      // assigning the position outright is legal here; vel.y is zeroed so the
+      // integrator does not carry an accumulated climb into the next frame and
+      // fight this every step.
+      if (g_autoflySurface) {
+        const int gh = World::TerrainHeight((int)std::floor(player.pos.x),
+                                            (int)std::floor(player.pos.z),
+                                            kDefaultSeed);
+        player.pos.y = (float)gh + (g_autoflySurfaceHigh ? kAutoflySurfaceHighVox
+                                                         : kAutoflySurfaceLowVox);
+        player.vel.y = 0.0f;
+        // Park: latch the pose once and re-assign it every frame. Zeroing the
+        // input axis is not enough on its own — fly mode integrates velocity, so
+        // a coast of even a few voxels crosses a chunk boundary and shifts the
+        // window, which is precisely the stimulus under test.
+        if (g_autoflyPark && tick >= ParkFlyTicks()) {
+          if (!g_parkPosSet) {
+            // SANDVOX_PARK_AT wins over the route's endpoint, and it is read
+            // AFTER the surface-follow above rewrote pos.y: the whole point of
+            // naming a place is that the probe holds THAT altitude, which over a
+            // lake is not TerrainHeight's.
+            if (!ParkAtPos(g_parkPos)) g_parkPos = player.pos;
+            g_parkPosSet = true;
+            std::printf("park: stopped at (%.1f, %.1f, %.1f) on tick %u\n",
+                        g_parkPos.x, g_parkPos.y, g_parkPos.z, tick);
+          }
+          player.pos = g_parkPos;
+          player.vel = Vec3{0, 0, 0};
+          player.SnapRender();   // a pin is a teleport: do not lerp into it
+        }
+      }
+      // THE COMMAND JOINS THE RECORD (package N3, sim/oprecord.h). Stashed
+      // here rather than passed to SubmitTick at the bottom of the tick: the
+      // command is decided at the TOP of the body and threading it through a
+      // signature four harnesses share to carry a value only the game has is
+      // the worse trade — the gen list is stashed for the same reason.
+      sandvox::opstream::NoteTickInput(tick, ti);
+      // ---- THE LOOK DELTA, ROUTED BY MODE, ONCE PER TICK ------------------
+      // Both consumers integrate a whole tick's raw pixels at kTickDt now.
+      // Feeding both would double-integrate the same motion into the swing
+      // accumulator and bend every authored cut (D10 of the discrete-strikes
+      // plan), so this is still an either/or — it simply happens on the tick
+      // clock instead of the frame clock.
+      if (CurrentTuning().melee.controlMode == 1) {
+        melee.Feed(ti.lookDx, ti.lookDy);
+      } else {
+        strikePicker.Feed(ti.lookDx, ti.lookDy, kTickDt);
+        // DISCRETE STRIKES: the click is the whole input, and the flick is
+        // read at the tick that consumes the press edge — the freshest read
+        // available, since the delta above is every pixel moved since the
+        // previous tick. A strike fired from the buffer later still cuts the
+        // direction that was flicked, aimed wherever the camera is THEN.
+        if (ti.Pressed(TB_ATTACK) && meleeReady) {
+          const StyleLibrary& styleLib = mobs.AttackStyles();
+          // WHICH COMPASS: the sword's, or the fists'. Two maps rather than one
+          // filtered set, because the two are different SHAPES (strokes.h
+          // StyleLibrary::playerUnarmed) — a punch compass has a jab and a
+          // cross where a sword's has an overhead and a thrust.
+          const PlayerStrikeMap& map =
+              meleeArmed ? styleLib.player : styleLib.playerUnarmed;
+          float fx = 0, fy = 0;
+          int si = -1;
+          if (strikePicker.Pick(CurrentTuning().melee.pickMinSpeed, fx, fy))
+            si = QuantizeStrike(map, fx, fy);
+          if (si < 0) {
+            // No flick: alternate the two horizontals so plain clicking is a
+            // usable L/R rhythm rather than the same cut stamped.
+            si = NeutralStrike(map, strikePicker.altRight);
+            strikePicker.altRight = !strikePicker.altRight;
+          }
+          if (si >= 0) strikeQueued = si;
+        }
+      }
 
       // recenter the residency window on the player (between ticks only; at
       // most one 1-chunk shift per axis)
@@ -8282,7 +8382,7 @@ int main(int argc, char** argv) {
         float radius = 0;
         bool limb = false;  // a live mob limb carves; plain debris melts
       } laserCut;
-      if (laserHeld) {
+      if (ti.Held(TB_LASER)) {
         const WorldSnapshot& lsnap = world.Snap();
         Vec3 fwd = cam.Forward();
         // MUZZLE, NOT EYE. The avatar's own head occupies the eye position, so
@@ -8373,7 +8473,8 @@ int main(int argc, char** argv) {
       // The lab is mob-free by design (plan §4.1): a wandering mob is exactly
       // the confounding load the lab exists to exclude. Consume the request
       // so it cannot latch across a mode where it would fire.
-      if (labScene >= 0) ui.spawnMob = false;
+      bool spawnMobNow = ti.Pressed(TB_SPAWN);
+      if (labScene >= 0) spawnMobNow = false;
       // ---- --duel-dummy: one target, once, three metres ahead ---------------
       // Deferred to the tick loop rather than done at load because the player's
       // position and the terrain height under it are only settled here, and a
@@ -8405,8 +8506,7 @@ int main(int argc, char** argv) {
           std::fprintf(stderr, "--duel-dummy: no \"human\" mob def\n");
         }
       }
-      if (ui.spawnMob) {
-        ui.spawnMob = false;
+      if (spawnMobNow) {
         const WorldSnapshot& msnap = world.Snap();
         if (msnap.valid && msnap.pick[0] != 0 && !mobs.Defs().empty()) {
           if (ui.mobSelected >= (int)mobs.Defs().size()) ui.mobSelected = 0;
@@ -8820,7 +8920,8 @@ int main(int argc, char** argv) {
         fluidCount = 0;
         fluidPendingSpawns.clear();
       }
-      if (ui.tool == UIState::kToolFluid && !ui.magicMode && mouseL) {
+      if (ui.tool == UIState::kToolFluid && !ui.magicMode &&
+          ti.Held(TB_ATTACK)) {
         const WorldSnapshot& fsnap = world.Snap();
         IVec3 at;
         if (fsnap.valid && fsnap.pick[0] != 0) {
@@ -8862,10 +8963,10 @@ int main(int argc, char** argv) {
       }
 
       BrushOp op;
-      if (brushActive && mouseL &&
+      if (brushActive && ti.Held(TB_ATTACK) &&
           brush.BuildOp(world.Snap(), player.EyePos(), cam.Forward(), false, op))
         ops.push_back(op);
-      if (brushActive && mouseR &&
+      if (brushActive && ti.Held(TB_ALT) &&
           brush.BuildOp(world.Snap(), player.EyePos(), cam.Forward(), true, op)) {
         ops.push_back(op);
         // erasing can cut supports: queue an island check around the hole
@@ -8875,8 +8976,7 @@ int main(int argc, char** argv) {
 
       // prefab placement: stamp at the last-empty pick cell, anchored at the
       // rotated footprint's bottom center
-      if (ui.placePrefab) {
-        ui.placePrefab = false;
+      if (ti.Pressed(TB_PLACE)) {
         const WorldSnapshot& snap = world.Snap();
         if (snap.valid && snap.pick[0] != 0 && !prefabs.empty() &&
             ui.prefabSelected < (int)prefabs.size()) {
@@ -9037,7 +9137,8 @@ int main(int argc, char** argv) {
             // (F5) drops any live program rather than leaving it half-run.
             playerStrike.Reset();
             strikeQueued = strikeBuffered = -1;
-            melee.Update(kTickDt, meleeHeld, meleeReady, swRight, swUp, swFwd);
+            melee.Update(kTickDt, meleeReady && ti.Held(TB_ATTACK),
+                         meleeReady, swRight, swUp, swFwd);
           } else {
             // DISCRETE: consume the press latch, then step the program. Begin
             // and first step land on the SAME tick, exactly as the NPC's
@@ -9391,12 +9492,13 @@ int main(int argc, char** argv) {
             deathBody.boxes.boxes.clear();
           }
         }
-        // Drain the impact latch on the FIRST tick of the frame batch that
-        // sees it — the same consume-and-clear every other one-shot here uses
-        // (cast, prefab stamp, mob spawn). Player::Update writes it per FRAME
-        // and peak-holds because this loop runs zero times on most frames at
-        // 60+ fps against a 30 Hz tick; without the hold a landing is
-        // overwritten unread and fall damage never fires.
+        // Drain the impact peak at the END of the tick that produced it (N2:
+        // Player::Update now runs at the top of this same tick body, so this
+        // is a one-tick lifetime rather than a latch that had to survive a
+        // frame batch). It is still a PEAK and not the last value written,
+        // because one tick can arrest the body more than once — the unstick
+        // lift, the vertical sweep and the horizontal sweep each cancel
+        // velocity, and the largest single arrest is the impact.
         //
         // Cleared even when no avatar consumed it (fly mode, avatar disabled,
         // dead and awaiting respawn). A peak-hold that is never drained only
@@ -9404,8 +9506,8 @@ int main(int argc, char** argv) {
         // hardest hit the session ever recorded and die on its first tick.
         player.impactDeltaV = Vec3{0, 0, 0};
         // Same drain, same reason (see Player::jumped): the avatar's `jump`
-        // clip is edge-triggered off this latch, and Player::Update sets it
-        // per FRAME while this loop runs 0..4 times per frame.
+        // clip is edge-triggered off this flag, and Player::Update set it
+        // earlier in THIS tick.
         player.jumped = false;
       }
 
@@ -9531,8 +9633,7 @@ int main(int argc, char** argv) {
         // empty stack stays queued and fires the next spell the moment one is
         // spoken. Clearing outside the inner test is what makes this a one-shot
         // rather than a pending intent.
-        const bool castNow = castQueued;
-        castQueued = false;
+        const bool castNow = ti.Pressed(TB_CAST);
         // The inspector's "cast it on this part": `self` resolves at the
         // clicked limb's centre, with the effect radii clamped to the part.
         // Same Cast(), one extra argument (plan §7); the VM never learns what
@@ -9605,10 +9706,9 @@ int main(int argc, char** argv) {
                            SpellFxFromFloat(muzzle.z)},
                           {SpellFxFromFloat(fwd.x), SpellFxFromFloat(fwd.y),
                            SpellFxFromFloat(fwd.z)},
-                          beamHeld);
+                          ti.Held(TB_ALT));
         }
-        if (dropStatusQueued) {
-          dropStatusQueued = false;
+        if (ti.Pressed(TB_DROP)) {
           spells.DropNewestStatus(0x9134A5EEu);
         }
         spells.Tick(tick, world, classOf, emit, &bodyProbe);
@@ -10473,10 +10573,21 @@ int main(int argc, char** argv) {
     rhi::TextureView target = ctx.AcquireFrame();
     double tRender0 = NowSeconds();
     if (target) {
-      // ViewEyePos, not EyePos: the render camera rides the step-smoothing
-      // offset so voxel steps glide instead of popping. Everything that can
-      // feed the sim (brush/laser/grenade rays, physics) stays on EyePos.
-      Vec3 eye = player.ViewEyePos();
+      // RenderEyePos, not EyePos, and the difference is now TWO corrections
+      // rather than one:
+      //   * the step-smoothing offset, so voxel steps glide instead of popping
+      //     (Player::ViewEyePos's original job), and
+      //   * the TICK INTERPOLATION (package N2). The body moves only on the
+      //     30 Hz tick now, so at 144 fps four frames in five would draw the
+      //     eye at the identical position and the fifth would jump. `alpha` is
+      //     the leftover accumulator as a fraction of a tick — exactly what
+      //     Celestial::RenderTickInterp already uses for the sky — and the
+      //     camera rides prevPos -> pos by it.
+      // Everything that can feed the sim (brush/laser/grenade rays, physics,
+      // the pick, the NPCs' idea of where you are) stays on pos/EyePos().
+      const float tickAlpha =
+          std::min(1.0f, std::max(0.0f, (float)(accumulator / kTickDt)));
+      Vec3 eye = player.RenderEyePos(tickAlpha);
       // First-person part-hiding mask, hoisted so the portrait pass below can
       // restore it after drawing the whole body. See the note at its fill.
       std::vector<uint8_t> hide;
@@ -10599,7 +10710,9 @@ int main(int argc, char** argv) {
       // that loop runs up to 4 times per frame; firing from inside it would
       // put several steps at the same instant.
       sandvox::PerfSpan spanAudio(sandvox::PerfScope::Audio);
-      const Vec3 earPos = player.ViewEyePos();
+      // Interpolated for the same reason the camera above is: a listener
+      // that teleports 30 times a second doppler-shifts every loop.
+      const Vec3 earPos = player.RenderEyePos(tickAlpha);
       if (audioCues.Enabled()) {
         // THE LISTENER IS PUBLISHED FIRST, BEFORE ANY CUE IS FIRED (2026-09-19).
         // Every trigger below is placed relative to the pose AudioWorld is
@@ -11117,7 +11230,7 @@ int main(int argc, char** argv) {
               lg, sizeof lg,
               "lip(%d,%d,%d) IN REACH — air=%d space=%d velOk=%d%s",
               player.ledgeLip.x, player.ledgeLip.y, player.ledgeLip.z,
-              player.grounded ? 0 : 1, pin.up ? 1 : 0,
+              player.grounded ? 0 : 1, pin.Held(TB_JUMP) ? 1 : 0,
               player.vel.y <= nonJump ? 1 : 0,
               player.grounded ? "  (jump at it holding space)" : "");
         } else {
@@ -12130,7 +12243,7 @@ int main(int argc, char** argv) {
       }
       // laser beam: emissive sprite dashes from the muzzle to the picked
       // surface + an impact glow (render-only; the cut is the mode-2 ops)
-      if (laserHeld && world.Snap().valid && world.Snap().pick[0] != 0) {
+      if (laserHeldFrame && world.Snap().valid && world.Snap().pick[0] != 0) {
         const WorldSnapshot& snap = world.Snap();
         Vec3 hit{(float)(int)snap.pick[2] + 0.5f, (float)(int)snap.pick[3] + 0.5f,
                  (float)(int)snap.pick[4] + 0.5f};

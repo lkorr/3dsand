@@ -39,6 +39,7 @@
 #include <vector>
 
 #include "sim/materials.h"
+#include "sim/tickinput.h"
 #include "sim/world.h"
 
 namespace sandvox {
@@ -204,6 +205,15 @@ struct TickInputs {
 // One tick, as it reached the GPU.
 struct Frame {
   TickInputs in;
+  // THE PLAYER'S COMMAND FOR THIS TICK (package N2, sim/tickinput.h). The
+  // other half of "the whole tick input": `in` above is what SubmitTick was
+  // told, this is what the HUMAN asked for, and a replay that has the first
+  // without the second can reproduce the world but not the player. Zeroed
+  // (version 0) on any tick nobody called NoteTickInput for -- the gates, the
+  // smokes and the lab all drive SubmitTick with no controller attached, and
+  // "there was no command" has to be distinguishable from "the command was
+  // all zeroes".
+  TickInput cmd{};
   TickParams tp{};
   std::vector<BrushOp> ops;
   std::vector<ExplosionOp> exps;
@@ -230,7 +240,8 @@ struct Header {
   uint32_t matHash = 0;
   uint32_t tickParamsBytes = 0;
 };
-constexpr uint32_t kRecordVersion = 1;
+// 2: Frame carries the player's TickInput (package N2).
+constexpr uint32_t kRecordVersion = 2;
 
 // ---- recording ----
 // Start appending frames to `path`. `mats` is the loaded material table: its
@@ -262,6 +273,14 @@ void RecordFrame(const TickInputs& in, const TickParams& tp,
 // submit, and a replay that did not know which planes were regenerated cannot
 // reproduce them.
 void NoteGenList(uint32_t tick, const std::vector<uint32_t>& slots);
+
+// The player's command for this tick (main.cpp's frame layer, package N2).
+// Stashed the same way the gen list is and for the same reason: it is produced
+// at the TOP of the tick body and SubmitTick runs at the bottom, so threading
+// it through the submit signature would widen a call four harnesses share to
+// carry a value only the game has. A tick nobody calls this for records a
+// zeroed command with version 0.
+void NoteTickInput(uint32_t tick, const TickInput& cmd);
 
 // ---- replay ----
 // A loaded record. Parsing lives here; the DRIVE LOOP lives in the caller

@@ -526,8 +526,17 @@ Player::Box Player::BoxFor(bool crouched) const {
              -kHalfY + std::max(h, 1.0f)};
 }
 
-void Player::Update(float dt, const PlayerInput& in, const Vec3& flatFwd,
-                    const Vec3& right, const Vec3& lookFwd, const KindFn& kindAt) {
+void Player::Update(float dt, const TickInput& in, const KindFn& kindAt) {
+  const Vec3& flatFwd = in.flatFwd;
+  const Vec3& right = in.right;
+  const Vec3& lookFwd = in.lookFwd;
+  // Where the body was when this tick started, for the render camera's
+  // interpolation (Player::RenderPos). Taken before ANYTHING moves, including
+  // the unstick lift and the mantle drive, so a frame drawn mid-tick is always
+  // on the segment the body actually travelled.
+  prevPos = pos;
+  // kTickDt from every live caller; the clamp survives for the fixtures, which
+  // drive longer steps on purpose.
   dt = std::min(dt, 0.05f);
   blindFall = false;  // set again below if the walk path holds a descent
   swimming = false;   // decided in the walk path; fly and the scripted climbs
@@ -551,7 +560,7 @@ void Player::Update(float dt, const PlayerInput& in, const Vec3& flatFwd,
   // down and up over viewSmoothHalflife instead of stepping.
   {
     const bool wantCrouch =
-        in.down && !fly && !inLiquid && !hanging && mantleTimer <= 0.0f;
+        in.Held(TB_CROUCH) && !fly && !inLiquid && !hanging && mantleTimer <= 0.0f;
     const float eyeBefore = EyeOffsetNow();
     if (fly) {
       crouching = false;
@@ -679,7 +688,7 @@ void Player::Update(float dt, const PlayerInput& in, const Vec3& flatFwd,
   // Timers run every frame regardless of mode so they never go stale in fly.
   if (coyoteTimer > 0.0f) coyoteTimer -= dt;
   if (jumpBuffer > 0.0f) jumpBuffer -= dt;
-  if (in.jumpPressed) jumpBuffer = T().jumpBufferTime;
+  if (in.Pressed(TB_JUMP)) jumpBuffer = T().jumpBufferTime;
 
   // ---- water-edge mantle: drive the body onto the ledge it committed to ----
   //
@@ -713,7 +722,7 @@ void Player::Update(float dt, const PlayerInput& in, const Vec3& flatFwd,
       const bool lipOk =
           kindAt(hangLip) == CellKind::Solid &&
           kindAt({hangLip.x, hangLip.y + 1, hangLip.z}) != CellKind::Solid;
-      if (in.up && !in.down && lipOk && !inLiquid) {
+      if (in.Held(TB_JUMP) && !in.Held(TB_CROUCH) && lipOk && !inLiquid) {
         hanging = true;
         hangTime = T().ledgePullDelay;
       } else {
@@ -775,7 +784,7 @@ void Player::Update(float dt, const PlayerInput& in, const Vec3& flatFwd,
     const bool lipOk =
         kindAt(hangLip) == CellKind::Solid &&
         kindAt({hangLip.x, hangLip.y + 1, hangLip.z}) != CellKind::Solid;
-    if (!in.up || in.down || !lipOk || inLiquid) {
+    if (!in.Held(TB_JUMP) || in.Held(TB_CROUCH) || !lipOk || inLiquid) {
       hanging = false;  // let go: fall through, gravity resumes this frame
       // The parkour seam: letting go grants the same jump grace walking off
       // an edge does, so releasing space and tapping it again inside the
@@ -879,10 +888,10 @@ void Player::Update(float dt, const PlayerInput& in, const Vec3& flatFwd,
   }
 
   if (fly) {
-    float speed = (in.sprint ? T().flySprint : T().flySpeed) / kVoxelMeters;
+    float speed = (in.Held(TB_SPRINT) ? T().flySprint : T().flySpeed) / kVoxelMeters;
     Vec3 wish = lookFwd * in.forward + right * in.strafe;
-    if (in.up) wish += Vec3{0, 1, 0};
-    if (in.down) wish += Vec3{0, -1, 0};
+    if (in.Held(TB_JUMP)) wish += Vec3{0, 1, 0};
+    if (in.Held(TB_CROUCH)) wish += Vec3{0, -1, 0};
     vel = wish.len() > 1e-3f ? wish.normalized() * speed : Vec3{0, 0, 0};
     pos += vel * dt;
     grounded = false;
@@ -949,7 +958,7 @@ void Player::Update(float dt, const PlayerInput& in, const Vec3& flatFwd,
     // Crouched: no sprint, and the walk scaled down. A crouch is a deliberate
     // slow-and-low, and letting Shift sprint through it would make the box
     // shrink for free.
-    const bool sprint = in.sprint && !crouching;
+    const bool sprint = in.Held(TB_SPRINT) && !crouching;
     float speed = ((sprint ? T().sprintSpeed : T().walkSpeed) / kVoxelMeters) *
                   wade * (speedScale > 0.0f ? speedScale : 0.0f) *
                   (crouching ? T().crouchSpeedScale : 1.0f);
@@ -968,8 +977,8 @@ void Player::Update(float dt, const PlayerInput& in, const Vec3& flatFwd,
 
     // ---- jump: buffered press + coyote window, both consumed on use ----
     // Frame-local: "did we launch on THIS frame", read by the ground snap
-    // below. Distinct from the sticky Player::jumped latch the avatar reads,
-    // which survives until main.cpp drains it — see the note there.
+    // below. Distinct from the Player::jumped flag the avatar reads, which
+    // survives to the end of the tick — see the note there.
     bool launched = false;
     waterJumped = false;
     if (inLiquid) {
@@ -1049,8 +1058,8 @@ void Player::Update(float dt, const PlayerInput& in, const Vec3& flatFwd,
         // hovering with only its feet wet. Scaled, thrust and buoyancy fall off
         // together and the body settles AT the waterline, which is what
         // floating is.
-        if (in.up) vel.y += (T().swimUp / kVoxelMeters) * submersion * dt;
-        if (in.down) vel.y -= (T().swimDown / kVoxelMeters) * submersion * dt;
+        if (in.Held(TB_JUMP)) vel.y += (T().swimUp / kVoxelMeters) * submersion * dt;
+        if (in.Held(TB_CROUCH)) vel.y -= (T().swimDown / kVoxelMeters) * submersion * dt;
       }
     }
 
@@ -1071,7 +1080,7 @@ void Player::Update(float dt, const PlayerInput& in, const Vec3& flatFwd,
       // The LATCH the avatar's jump clip reads (see Player::jumped). Set where
       // the impulse is actually applied, so nothing that merely leaves the
       // ground — a step-down, a bump crest, a ledge release — can claim to be
-      // a jump. Never cleared here: main.cpp drains it after the tick batch.
+      // a jump. Never cleared here: main.cpp drains it at the end of the tick.
       jumped = true;
     }
     const float vmax = T().maxFall / kVoxelMeters;
@@ -1166,7 +1175,7 @@ void Player::Update(float dt, const PlayerInput& in, const Vec3& flatFwd,
         if (LedgeGrabAhead(pos, dir, b, kindAt, &hit)) {
           ledgeInReach = true;
           ledgeLip = hit.lip;
-          if (!grounded && !inLiquid && in.up && !in.down &&
+          if (!grounded && !inLiquid && in.Held(TB_JUMP) && !in.Held(TB_CROUCH) &&
               vel.y <= nonJumpSpeed) {
             hanging = true;
             ledgeGrabbed = true;
