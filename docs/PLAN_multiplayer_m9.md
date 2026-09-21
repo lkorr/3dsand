@@ -893,27 +893,288 @@ authority's copy without a full-world resend, and a replay reproduces it.
 
 **Verification:** oracle cmp; `--verify determinism,chunk-hash,chunk-resync,ops-replay,streaming`.
 
-### M9.4 — entity ownership (mobs, debris)
-- Chunk authority = nearest among machines whose SENT window contains C with
-  margin ≥1, at T−D, ties → lower id, 2-chunk hysteresis (finding 6); a pure
-  function of both `PlayerState`s. Gate `QueueSupportEvents`
-  (`debris.cpp:743-747`) and `MobSystem::PreTick` STEPPING by `IsMine(wc)`.
-- `EntityState` per owned mob/body within the peer's interest radius; ghost
-  mobs = `Mob` with no brain, kinematic follow. Handoff payload = the per-mob
-  record inside `MobSystem::SaveState` (`mob.cpp:16494-16513`) extracted as
-  `Mob::SaveOne/LoadOne` + equipment by name + brain target.
-- Needs items keyed on game ids (A2) for held/ground items.
+### M9.4 — entity ownership: mobs and debris are owned by the nearest resident player (packages A, B, C, D)
 
-### M9.5 — persistence through the host, late join, disconnect
-- `ChunkPut` on `Stream::EvictSlots` of a modified chunk (`stream.cpp:394-397`
-  is where "modified" is known) by the AUTHORITY only, tick-tagged, acked,
-  re-offered on rejoin (finding 7); host publishes a stored-chunk MANIFEST; a
-  refill consults it before regenerating; a slot awaiting a `ChunkGet` stays
-  inert until the answer lands; the host answers from `ChunkStore` or
-  forwards to the machine that has it resident (the fetch cache).
-- Late join = handshake + `ChunkGet` for the joiner's window; disconnect =
-  host keeps the peer's last pushed chunks; peer-owned entities revert to host
-  authority (M9.4's handoff without a reply). `meta.svm` gains tick + seed (L8).
+```
+  A  Authority (chunk + entity) with hysteresis; producer   src/net/authority.*, support.cpp (debug assert),
+     assert at SubmitTick; gate authority                    selftest_net.cpp                         hash UNMOVED
+  B  Mob ownership, ghost mobs, per-mob record, handoff;     mob.h/.cpp, src/net/mobsync.*, selftest_mob.cpp   hash UNMOVED
+     gate mob-handoff                                        (parallel with A and C)
+  C  Debris/item ownership, ghost bodies, owner-only ops;    debris.h/.cpp, worlditems.h, src/net/debrissync.*,
+     gate debris-ghost                                       selftest_phys.cpp                        hash UNMOVED
+  D  Integration: EntityState/announce/handoff on the wire,  main.cpp, session.cpp (phases B, I, N), protocol.h   hash UNMOVED, oracle cmp
+     interest radius, explosion craters by chunk authority   (after A, B, C)
+Endgame: build; oracle cmp; --verify determinism,authority,mob-handoff,debris-ghost,two-players,ops-exchange;
+         two-process smoke: host spawns mobs, client walks into them (orchestrator); ff main; docs.
+```
+
+Facts that bind (verified 2026-09-21):
+- `MobSystem::PreTick` (`mob.cpp:6255`): per-mob loop at `:6322`; the three-way
+  branch at `:6370-6437` (`RagdollPhase::Limp` = no AI, no anim, no submit —
+  the closest existing "posed from elsewhere" shape); `BleedTick` at `:6439`
+  unconditionally; `BurnLimbs` pre-loop at `:6264`; `StainLimbs` after.
+- A mob's GPU pose is `Mob::AppendXforms` (`mob.cpp:15760`) reading
+  `limbs_[i].xf` and nothing else — a ghost posed from received per-limb
+  transforms needs no animation call (`DriveWornShells`, `mob.h:1569`, is the
+  precedent for placing limbs by transform).
+- Per-mob record: the write loop `mob.cpp:16499-16525` (`defName, origin_,
+  heading_, bodyY_, limbs{body?, hp, restOffset, anchorRoot, anchorLimb, xf,
+  size, voxels, skinVoxels}`) and the read overlay `:16590-16617`
+  (`FindOrComposeDef`, `Spawn`, then overlay). Brain: `ai::Brain ai_`
+  (`mob.h:3120`, fields `ai_behavior.h:525+`, `targetId` at `:529`), accessor
+  `MobBrain(id)` (`mob.h:3589`). Equipment is NOT in the record; re-apply by
+  NAME: `Mob::EquipItem(item, context)` (`mob.h:1815`), `WearItem(item, slot,
+  damage, dye)` (`mob.h:1841`), and the seam comment at `mob.h:4820`.
+- Mob ids are `nextId_` monotonic per process (`mob.h:4871`) and SAVED, so
+  two machines collide: the client's counter must start in its own band
+  (`SetNextIdCounter((uint64_t)playerId << 40 | 1)` at join; u64, no format
+  change). `ai::kPlayerActorBase = 1<<62` is above both bands.
+- Debris: `struct Body` (`debris.h:1060-1120`, `serial` at `:1118` is the
+  stable identity); `Physics::CreateDebrisBodyXf(voxels, xf, density,
+  allowKinematic, pitch)` (`physics.h:105`), `SetBodyKinematic` (`:288`),
+  `MoveKinematicBody` (`:290`); the strap path (`StrapBody` `debris.cpp:3887`,
+  `DriveStraps` `:3980`, `UnstrapBody` `:3961/3970`) IS "kinematic body
+  driven by a transform, released to dynamic" — the handoff primitive.
+  `AdoptBody` (`debris.h:152`), `SaveState` record `debris.cpp:6501-6530`,
+  `LoadState` `:6533` (`allowKinematic = hostIdx < count` at `:6580`).
+  Owner-only op emitters, all inside `DebrisSystem::PreTick` (`:2004`):
+  `RunIslandDetection` (`:929`; ops at `:1560, 1588-1593, 1714-1753`),
+  `SettleBodies` (`:2513`; `:2658`), `BurnBodies` (`:2715`; `:2991, 3138`),
+  `VoxelsToParticles` (`:3694`; `:3733`), `BleedBodies` (`:4746`).
+  `QueueSupportEvents` (`:735-787`) derives `wc` at `:743-747`.
+- Ground items: `WorldItem{body, item (NAME), voxels, dye}` (`worlditems.h:33-48`),
+  `WorldItems::Add/Find/Remove/OnBodyGone`, `DropItemToWorld` (`:113`).
+- Explosion craters: after M9.3-B, `AddDestructionEvent(tick + D, ...)` is
+  raised by the LOCAL explosion path. Under ownership it must be raised by the
+  CHUNK AUTHORITY from the MERGED batch (a peer's explosion in my chunk needs
+  MY island scan), so D moves that call into phase N after the merge.
+
+#### A · `net::Authority`: chunk and entity ownership with hysteresis, the producer assert, gate `authority` — C++ only, hash UNMOVED
+
+**Owner scope:** new `src/net/authority.h/.cpp` (absorbs `ChunkAuthority`/
+`Comparable` from M9.3-C's `chunksync.h` — move them, leave forwarding
+`using`s), `src/test/support.cpp` (`SubmitTick`: the debug assert), `src/sim/
+oprecord.h` (`OpMeta.producer` required: `Producer::Unknown` on a connected
+run is a counted violation), `src/test/selftest_net.cpp` (gate), `kOrder`, keys.
+
+**Build:**
+1. `struct PeerView { uint32_t playerId; IVec3 chunk; IVec3 windowOrigin; bool connected; };`
+   `uint32_t ChunkAuthority(IVec3 wc, span<const PeerView>, const AuthorityMemory&)`:
+   candidates = peers whose window contains `wc` with margin ≥ 1; nearest by
+   Chebyshev chunk distance; ties → lower id; HYSTERESIS: the incumbent (from
+   `AuthorityMemory`, a `unordered_map<chunkKey, playerId>` the caller keeps)
+   keeps the chunk unless a challenger is ≥ 2 chunks nearer. `uint32_t
+   EntityAuthority(Vec3 feetVox, ...)` = `ChunkAuthority(feet >> 4, ...)` with
+   the entity's own memory slot (keyed by entity id) so a mob straddling a
+   chunk edge does not flap. Pure; no I/O.
+2. `Authority::Owns(uint8_t producer, IVec3 wc, uint32_t me)`: Brush/Spell/
+   Avatar/Lab/EditLayer → always (player-authored, gated by author); Mob/
+   Debris/Worldgen → `ChunkAuthority(wc) == me`; Remote → never (it is the
+   peer's). `SubmitTick` (connected only: a `net::AuthorityHook*` set by main)
+   walks every brush/explosion op (world coords → wc) and every CellOp (slot →
+   wc under MY origin) and counts `authorityViolations` into the `opstream`
+   block of `last_run.json`; a violation aborts only under `SANDVOX_NET_STRICT=1`.
+3. Gate `authority` (pure): truth tables — nearest wins; non-resident nearest
+   loses to resident farther (§4 finding 6); tie → lower id; hysteresis holds
+   the incumbent within 2 chunks and releases beyond; entity memory keyed per
+   entity; `Owns` per producer.
+
+**Done means:** every "who steps this" question has one pure answer both
+machines compute identically from the two `PlayerState`s.
+
+**Verification:** `--verify determinism,authority,ops-exchange`.
+
+#### B · Mob ownership, ghost mobs, per-mob record and handoff, gate `mob-handoff` — C++ only, hash UNMOVED
+
+**Owner scope:** `src/game/mob.h/.cpp`, new `src/net/mobsync.h/.cpp` (wire
+structs + encode/decode only; no sockets), `src/test/selftest_mob.cpp` (gate),
+`kOrder`, keys. READ-ONLY `session.*`, `main.cpp`, `debris.*` (D wires).
+
+**Build:**
+1. `Mob::owner_` (playerId, default `kLocalOwner = 0` — session 0's id;
+   `MobSystem::SetLocalPlayerId(id)` and `SetOwnershipFn(std::function<uint32_t(uint64_t mobId, Vec3 feet)>)`;
+   null fn = every mob local = today's tick (the oracle proves it).
+2. In `PreTick`'s loop: `owner_ != local` → a fourth branch `TickGhost`: apply
+   the latest received `MobPose` (per-limb `xf` + `origin_`/`heading_`),
+   `instancesDirty_`, NO AI/loco/anim/stroke, NO `BleedTick`, skipped by
+   `BurnLimbs`/`StainLimbs`/`ServiceRisings` (each gets the owner test; list
+   every site you gated). Ghosts still register as `actors_` (targetable) and
+   in `CrowdPush` (solid to walk into) — say which you kept and why.
+3. Records (`mobsync.h`, versioned PODs + vectors via `ByteWriter`):
+   `MobAnnounce{id, defName, owner, held item name, worn {slot, name, dye,
+   damage}}`; `MobPose{id, tick, origin, heading, alive, limbs[{pos, quat}]}`
+   (only limbs with a body); `MobHandoff{id, record = the per-mob SaveState
+   record extracted as Mob::SaveOne(ByteWriter&)/MobSystem::LoadOne(ByteReader&)
+   + brain{profile name, targetId, hasTarget, targetPos, lastSeenTick} +
+   announce}`; `MobGone{id, reason}`.
+4. `MobSystem::TakeHandoff(id, newOwner)` — if I own it: emit `MobHandoff`,
+   set `owner_ = newOwner` (it becomes a ghost held at its last pose). On
+   receive: existing ghost → `LoadOne` overlays it in place (rig kept), `owner_
+   = me`, brain restored; unknown id → spawn from record. `MobGone` on death
+   from the owner → the ghost `ReleaseRig`s (its corpse debris arrive as C's
+   ghost bodies).
+5. Id bands: `SetNextIdCounter((uint64_t)localPlayerId << 40 | 1)` on join
+   (D calls it); `LoadState` must not pull the counter below the band.
+6. Gate `mob-handoff`: (a) a ghost mob fed a scripted `MobPose` stream for
+   120 ticks: limbs track (≤ 0.01 vox), an AI-step counter stays 0, no ops
+   authored by it (author scope check), it is targetable (`FindMobById`) and
+   solid (`BlockedByMob`); (b) `SaveOne` → fresh `MobSystem` → `LoadOne` →
+   `SaveOne` byte-identical, brain target equal, equipment re-applied by name
+   (an armoured, armed mob); (c) ownership flip mid-walk via the ownership fn:
+   the mob's op authoring stops the tick it becomes a ghost and resumes on the
+   tick it returns, position continuous; (d) twice-run hash equal.
+
+**Done means:** a mob is stepped on exactly one machine, posed on the other,
+and moves between them with its wounds, gear and target intact.
+
+**Verification:** `--verify determinism,mob-handoff,mob-burn,crowd,npc-strike`.
+
+#### C · Debris and item ownership, ghost bodies, owner-only ops, gate `debris-ghost` — C++ only, hash UNMOVED
+
+**Owner scope:** `src/phys/debris.h/.cpp`, `src/game/worlditems.h`, new
+`src/net/debrissync.h/.cpp` (wire structs only), `src/test/selftest_phys.cpp`,
+`kOrder`, keys. READ-ONLY `mob.*`, `session.*`, `main.cpp`.
+
+**Build:**
+1. `Body::owner` (playerId; default local) + global body id `(ownerAtCreate
+   << 48) | serial`; `DebrisSystem::SetLocalPlayerId`, `SetOwnershipFn(feet →
+   playerId)` (null = today), `SetChunkOwnedFn(wc → bool)` for the island scan.
+2. Owner-only gates (per body, at the five emitter sites, and the per-chunk
+   test in `QueueSupportEvents` after `:747` + in the `AddDestructionEvent`
+   drain): a non-owned body is a KINEMATIC ghost (`SetBodyKinematic(h, true)`
+   + `MoveKinematicBody` from the latest `BodyPose`; the strap path is the
+   template) and emits nothing; its chunk's islands are not scanned here.
+3. Records: `BodyAnnounce{id, xf, voxels, skinVoxels, micro (skinScale, dye),
+   physScale, bleedMat, dead, item name + dye if a ground item}`; `BodyPose{id,
+   tick, xf, vel}`; `BodyHandoff{id, announce + vel + angVel}` (new owner
+   recreates dynamic via `CreateDebrisBodyXf(..., allowKinematic=false)` +
+   `AdoptBody`; old owner flips its copy kinematic); `BodyGone{id}`;
+   `ItemTake{id, byPlayer}` → owner removes and replies `ItemGrant{id, name,
+   dye, damage}` (the non-owner's E on a ghost item sends the request instead
+   of taking; the grant path calls the same pickup code the owner uses).
+4. Interest: `DebrisSystem::OwnedBodiesNear(IVec3 peerOrigin, margin) ->
+   ids` for D's per-tick pose send (bodies inside the peer's window + 1 chunk;
+   asleep bodies (`inactiveTicks`) send a pose only when they move).
+5. Gate `debris-ghost`: (a) a ghost body fed a scripted `BodyPose` stream is
+   kinematic (`Physics` reports it), tracks, never appears in `cellOps`/`spawns`
+   over 200 ticks while a same-shaped OWNED body does settle; (b) island scan
+   skips a chunk the fn says is not mine (count) and scans it when it is;
+   (c) handoff: owned → ghost → owned, position/velocity continuous within
+   one tick of Jolt drift; (d) item: `ItemTake` on a ghost item yields an
+   `ItemGrant` naming the item; (e) twice-run hash equal.
+
+**Done means:** every loose body is simulated once, seen twice, and only the
+owner's copy writes the world.
+
+**Verification:** `--verify determinism,debris-ghost,corpse-armor,ragdoll-dress,ops-exchange`.
+
+#### D · Integration: entities on the wire, interest, craters by authority — `main.cpp`, `session.cpp`, `protocol.h`; hash UNMOVED, oracle cmp
+
+**Build:** message types `MobAnnounce/MobPose/MobHandoff/MobGone/BodyAnnounce/
+BodyPose/BodyHandoff/BodyGone/ItemTake/ItemGrant` (additive); per tick in
+phase N after the merge: for each explosion op in the MERGED batch whose
+centre chunk I own → `debris.AddDestructionEvent(tick, ...)` (replaces M9.3-B's
+local `tick + D` call; a non-owned crater is the peer's scan); `MobSystem`/
+`DebrisSystem` ownership fns bound to `net::EntityAuthority` over the two
+`PlayerState`s; announces on first sight (a mob/body entering the peer's
+interest set), poses per tick for owned entities in the peer's interest set
+(the `TickBatch` gains an `entities` blob), handoffs when authority flips,
+`MobGone`/`BodyGone` on death/release; `SetNextIdCounter` band at join; ghost
+lists purged on disconnect (promote to local: the ghost becomes owned at its
+last pose — a `MobHandoff` to self from the announce + last pose). `--frames`
+net report gains `entities: announced, poses/s, handoffs, ghosts`.
+
+**Verification:** oracle cmp; `--verify determinism,authority,mob-handoff,debris-ghost,two-players,ops-exchange`;
+then the ORCHESTRATOR's two-process smoke (host `--host --frames 900` with
+`ui`-less spawns via `--duel-dummy`-style argv the packages expose, client
+walking in).
+
+### M9.5 — persistence through the host, late join, disconnect (packages A, B)
+
+Facts that bind (verified 2026-09-21):
+- The two "a modified chunk was evicted, here is its RLE" hook points:
+  sentinel slots `store_.Put` at `stream.cpp:432` (synchronous) and real pages
+  in `CompleteOldest` at `stream.cpp:591`. The refill miss is `store_.Get(wc)`
+  at `stream.cpp:676` → `genSlots.push_back(s)` at `:783`. An inert
+  placeholder is `pages->SetSentinel(s, kPtEmpty)` (`:727`, `:1175`: pure sky,
+  creates no frontier, does not wake). The async gen path (`PendingShift`,
+  `ApplyGenVerdict` `:1059`, `DiscardPendingShifts`) is the shape for a
+  deferred verdict. `ChunkStore::ForEachStored` (`chunkstore.h:72`) builds a
+  manifest without LRU thrash; `Count()` `:47`.
+- `SaveWorld` (`worldio.cpp:112`, `FlushResident` `:124`, `meta.svm` `:145-171`
+  is written LAST), `LoadWorld` `:177`; saving is UI-only (`ui.saveWorld`,
+  `main.cpp:8080-8096`, hardcoded `world.svd`); no autosave, no `--save/--load`.
+- `Stream::ReloadWindow(origin)` (`stream.cpp:1383-1396`) = the whole-window
+  re-pull a late join uses. `MobSystem::Reset` keeps the id counter (`mob.cpp:2435-2447`).
+
+#### A · `Stream` chunk-exchange hooks, gate `chunk-exchange` — C++ only, hash UNMOVED
+
+**Owner scope:** `src/sim/stream.h/.cpp`, `src/sim/chunkstore.h/.cpp` (tick tag
+side map + `manifest.svt`), `src/test/selftest_stream*.cpp`/`selftest_sim.cpp`
+(gate), `kOrder`, keys.
+
+**Build:**
+1. `struct ChunkExchange { virtual void OnEvicted(IVec3 wc, uint32_t tick, const std::vector<uint32_t>& rle) = 0;
+   virtual bool Wanted(IVec3 wc) = 0; /* manifest hit: hold and ask */ virtual void Request(IVec3 wc) = 0; };`
+   `Stream::SetChunkExchange(ChunkExchange*)` (null = today). `OnEvicted` fires
+   at both Put sites with the current tick (the exchange decides "am I the
+   authority" — Stream does not know); `Wanted`/`Request` at the store miss:
+   the slot is held INERT (`SetSentinel(kPtEmpty)`, `awaitingRemote_[s] = 1`,
+   not in `genSlots`) until `Stream::DeliverRemote(wc, tick, rle)` (fills via
+   the store-hit branch — `Put` then the M9.3-C `ReplaceChunk` path) or
+   `DeliverMiss(wc)` (→ `genSlots` on the next `Update`). A held slot that the
+   window evicts before an answer is simply forgotten (counted).
+2. `ChunkStore` gains a per-chunk tick tag (`Put(wc, rle, tick)`, `TickOf(wc)`,
+   persisted as `manifest.svt` beside the regions; absent file = tag 0 for
+   everything) and `Manifest(std::vector<std::pair<IVec3,uint32_t>>&)`.
+3. Gate `chunk-exchange`: an in-process fake exchange: (a) evicting a modified
+   chunk fires `OnEvicted` with the right `wc`/tick/RLE exactly once (sentinel
+   and real-page arms); (b) a refill of a `Wanted` chunk holds the slot inert
+   (reads as air, no worldgen dispatched, no wake) until `DeliverRemote`, after
+   which the chunk's words are the delivered ones and the world hash equals a
+   control that streamed the same chunk from the store; (c) `DeliverMiss`
+   regenerates; (d) twice-run hash equal; the tick tag survives `Flush`/`BindLoad`.
+
+**Verification:** `--verify determinism,chunk-exchange,streaming,save-load,region-store`.
+
+#### B · Host store on the wire, late join, disconnect, `meta.svm` tick+seed — C++ only, hash UNMOVED, oracle cmp
+
+**Owner scope:** new `src/net/storesync.h/.cpp`, `src/net/protocol.h`
+(message types additive), `src/main.cpp`, `src/sim/worldio.cpp` (`meta.svm`),
+`src/test/selftest_net.cpp` (gate), `kOrder`, keys. After A and M9.4-D.
+
+**Build:**
+1. Messages: `ChunkPut{wc, tick, rle}` / `ChunkPutAck{wc, tick}`,
+   `ChunkManifest{count, (wc, tick)...}` (full, on join; ≤ 64 KiB slices) /
+   `ManifestDelta{wc, tick}`, `ChunkGet{wc}` → `ChunkData{wc, tick, rle}` |
+   `ChunkMiss{wc}`.
+2. Host: `OnEvicted` (when I am authority: `net::ChunkAuthority`) → `Put` into
+   MY store with the tick tag (host store is the truth) and `ManifestDelta` to
+   the client. Client: `OnEvicted` when authority → `ChunkPut` to the host,
+   kept in an unacked list re-offered on reconnect; the host stores if `tick
+   >= TickOf(wc)` and acks. Client `Wanted(wc)` = manifest hit with a tag newer
+   than my store's → `ChunkGet`; host answers from its store, or forwards to
+   the machine that has it resident (M9.3-C's fetch-cache path) and relays.
+   Host `Wanted(wc)` = the client is authority for it and has it resident →
+   `ChunkGet` to the client. Both consult the manifest BEFORE regenerating.
+3. Late join: after `HelloAck`, the client receives the full manifest, then
+   `stream.ReloadWindow(SpawnWindowOrigin())` runs with the exchange bound, so
+   modified chunks come from the host and pristine ones regenerate.
+   Disconnect: the host keeps everything it was sent; each side promotes
+   ownership to local (M9.4-D); the client's unacked puts persist in RAM for
+   a rejoin in the same process.
+4. `meta.svm`: append `tick` and `seed` (new magic `SVM5`; the loader accepts
+   `SVM4` and reports tick/seed unknown); `SaveWorld` on the host also flushes
+   the client-put chunks (they are in the store).
+5. Gate `store-sync`: two fake ends over `MakeLoopback()`: client evicts a
+   modified chunk → host store has it with the tag; host manifest → client
+   `Wanted` → `ChunkGet` → `DeliverRemote`; unacked put re-offered after a
+   simulated drop; `meta.svm` round-trips tick+seed; a `SVM4` file still loads.
+
+**Verification:** oracle cmp; `--verify determinism,store-sync,chunk-exchange,save-load,net-loopback`;
+then the ORCHESTRATOR's two-process smoke: client paints, walks away, host
+walks there and sees the paint; host saves; a fresh host loads `world.svd` and
+the paint is there.
 
 ---
 
