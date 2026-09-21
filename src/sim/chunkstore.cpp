@@ -15,8 +15,12 @@ constexpr uint32_t kRegionMagic = 0x32525653;  // 'SVR2'
 // region files and the save meta are the only files this code ever deletes
 bool IsOurFile(const fs::path& p) {
   std::string name = p.filename().string();
+  // manifest.svt joins the list for the reason the wipe exists at all: a
+  // BindSave means "this RAM store is the whole world", and a tick manifest
+  // left behind by an earlier session would claim freshness for chunks that
+  // are no longer there (M9.5-A).
   return (name.rfind("r_", 0) == 0 && p.extension() == ".svr") ||
-         name == "meta.svm";
+         name == "meta.svm" || name == "manifest.svt";
 }
 }  // namespace
 
@@ -132,9 +136,15 @@ void ChunkStore::SpillOverBudget() {
   }
 }
 
-void ChunkStore::Put(IVec3 wc, std::vector<uint32_t> rle) {
+void ChunkStore::Put(IVec3 wc, std::vector<uint32_t> rle, uint32_t tick) {
   Region& r = Touch(RegionOf(wc));
   uint64_t key = World::PackChunkKey(wc);
+  // See the tag contract in the header: 0 is "unknown", and an untagged write
+  // over a tagged one ERASES the tag rather than inheriting it.
+  if (tick != 0)
+    tickTags_[key] = {wc, tick};
+  else
+    tickTags_.erase(key);
   auto [it, inserted] = r.chunks.try_emplace(key);
   if (inserted) chunkCount_++;
   it->second.wc = wc;
@@ -150,6 +160,90 @@ const std::vector<uint32_t>* ChunkStore::Get(IVec3 wc) {
   auto it = r.chunks.find(World::PackChunkKey(wc));
   if (it == r.chunks.end()) return nullptr;
   return &it->second.rle;
+}
+
+uint32_t ChunkStore::TickOf(IVec3 wc) const {
+  auto it = tickTags_.find(World::PackChunkKey(wc));
+  return it == tickTags_.end() ? 0u : it->second.tick;
+}
+
+void ChunkStore::Manifest(std::vector<std::pair<IVec3, uint32_t>>& out) {
+  out.clear();
+  out.reserve(chunkCount_);
+  // ForEachStored visits RAM then disk and de-duplicates by chunk key, which
+  // is exactly the "every stored chunk exactly once" a manifest needs — and it
+  // never touches the LRU. A chunk with no entry in tickTags_ (a pre-M9.5
+  // world, or a world whose manifest.svt is absent) reports 0, per the header.
+  ForEachStored([&](IVec3 wc, const uint32_t*, size_t) {
+    out.push_back({wc, TickOf(wc)});
+  });
+}
+
+void ChunkStore::LoadManifest() {
+  tickTags_.clear();
+  if (dir_.empty()) return;
+  FILE* fp = std::fopen(ManifestPath().c_str(), "rb");
+  if (!fp) return;  // absent file = tag 0 for everything (M9.5-A)
+  uint32_t hdr[2] = {};
+  if (std::fread(hdr, 4, 2, fp) != 2 || hdr[0] != kManifestMagic) {
+    std::fprintf(stderr, "chunkstore: %s is not a tick manifest\n",
+                 ManifestPath().c_str());
+    std::fclose(fp);
+    return;
+  }
+  for (uint32_t i = 0; i < hdr[1]; i++) {
+    int32_t wc[3];
+    uint32_t tick = 0;
+    if (std::fread(wc, 4, 3, fp) != 3 || std::fread(&tick, 4, 1, fp) != 1) {
+      // Truncation is survivable here in a way it is not for a region file:
+      // the tags are metadata over content that is still intact, so the
+      // entries that DID read are kept and the rest fall back to "unknown".
+      std::fprintf(stderr, "chunkstore: %s truncated at entry %u\n",
+                   ManifestPath().c_str(), i);
+      break;
+    }
+    const IVec3 cc{wc[0], wc[1], wc[2]};
+    if (tick != 0) tickTags_[World::PackChunkKey(cc)] = {cc, tick};
+  }
+  std::fclose(fp);
+}
+
+bool ChunkStore::WriteManifest() {
+  if (dir_.empty()) return true;
+  std::error_code ec;
+  if (tickTags_.empty()) {
+    // Nothing tagged: remove any file from a previous session rather than
+    // writing a zero-entry one, so a single-player save leaves the directory
+    // exactly as it was before M9.5-A.
+    fs::remove(ManifestPath(), ec);
+    return true;
+  }
+  const std::string tmp = ManifestPath() + ".tmp";
+  FILE* fp = std::fopen(tmp.c_str(), "wb");
+  if (!fp) {
+    std::fprintf(stderr, "chunkstore: cannot write %s\n", tmp.c_str());
+    return false;
+  }
+  uint32_t hdr[2] = {kManifestMagic, (uint32_t)tickTags_.size()};
+  bool ok = std::fwrite(hdr, 4, 2, fp) == 2;
+  for (const auto& [key, tag] : tickTags_) {
+    int32_t c[3] = {tag.wc.x, tag.wc.y, tag.wc.z};
+    const uint32_t tick = tag.tick;
+    ok = ok && std::fwrite(c, 4, 3, fp) == 3 &&
+         std::fwrite(&tick, 4, 1, fp) == 1;
+  }
+  std::fclose(fp);
+  if (ok) {
+    fs::remove(ManifestPath(), ec);
+    fs::rename(tmp, ManifestPath(), ec);
+    ok = !ec;
+  }
+  if (!ok) {
+    std::fprintf(stderr, "chunkstore: failed writing %s\n",
+                 ManifestPath().c_str());
+    fs::remove(tmp, ec);
+  }
+  return ok;
 }
 
 void ChunkStore::ForEachStored(const Visitor& fn) {
@@ -219,6 +313,7 @@ bool ChunkStore::BindLoad(const std::string& dir) {
   regions_.clear();  // the disk's copy wins wholesale
   chunkCount_ = 0;
   dir_ = dir;
+  LoadManifest();  // ...and so does its manifest; absent file = all tags 0
   return true;
 }
 
@@ -235,5 +330,11 @@ bool ChunkStore::Flush(size_t* regionsOut, uint64_t* bytesOut) {
       ok = false;
     }
   }
+  // LAST, and unconditionally (not gated on any region being dirty): the tags
+  // can move without any region moving — a re-Put of identical bytes with a
+  // newer tick is a legal thing for the host to do — and a manifest written
+  // before the regions could name content a failed region write never
+  // persisted. Same ordering argument meta.svm uses in worldio.cpp.
+  if (!WriteManifest()) ok = false;
   return ok;
 }

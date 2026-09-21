@@ -340,7 +340,17 @@ const char* const kOrder[] = {
     // SettledBack() for the same reason `body-fastfall` above does, and it
     // regenerates the world on the way in so it inherits nothing either.
     "debris-ghost",
-    "save-load",   "save-entities", "region-store", "streaming",     "spells",
+    "save-load",   "save-entities", "region-store",
+    // BETWEEN region-store and streaming, and the slot is chosen rather than
+    // convenient. It regenerates the world several times (four arms, each
+    // with its own worldgen and its own ReloadWindow) and it SHIFTS the
+    // window in arm A — so it has to sit before a gate that regenerates on
+    // the way in and inherits nothing, which `streaming` does in its first
+    // three lines. `region-store` ahead of it is pure CPU ChunkStore and
+    // leaves nothing at all. It also regenerates at the origin on the way
+    // out, so `streaming` starts where it always did (M9.5-A).
+    "chunk-exchange",
+    "streaming",     "spells",
     "page-roundtrip", "daylight-boundary",
     // Support-loss flagging from the MUTATION path. Cheap and
     // self-contained (its own worldgen, an all-stone fixture the CA

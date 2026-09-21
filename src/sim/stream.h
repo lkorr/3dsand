@@ -46,6 +46,43 @@ void RleEncodeSentinelChunk(uint32_t entry, IVec3 wc, uint32_t seed,
 // Decoded voxels get kStampNever ("hasn't acted"): everything may move.
 bool RleDecodeChunk(const uint32_t* rle, size_t pairs, uint32_t* out);
 
+// ---- THE CHUNK EXCHANGE (M9.5-A) -----------------------------------------
+//
+// Streaming's two openings onto the network, and nothing more than openings:
+// this interface is ABSTRACT and owned by the caller, `Stream` holds a bare
+// pointer, and a null pointer is today's behaviour exactly (every call site
+// is one null test). Nothing in src/sim knows what a peer is.
+//
+//   OnEvicted  - "this chunk's bytes are leaving my window; here they are."
+//                Fires at BOTH of the store's Put sites: synchronously in
+//                EvictSlots for a sentinel chunk, and in CompleteOldest when
+//                a real page's readback lands. `tick` is the tick the
+//                EVICTION WAS DECIDED AT, not the tick the bytes arrived on
+//                the CPU - the two differ by the readback latency at the
+//                second site, and it is the decision tick a peer must compare
+//                against its own copy's tag.
+//                Stream does NOT know who the authority for the chunk is and
+//                must not guess: it reports every eviction and the exchange
+//                decides whether to forward one (net::ChunkAuthority).
+//   Wanted     - asked ONLY at a store miss, before procgen: "does somebody
+//                else have a modified copy of this chunk?" A true answer
+//                costs the slot a hold (below), so an implementation that
+//                cannot answer without a round trip must answer from a
+//                MANIFEST it already holds, never by blocking.
+//   Request    - "then ask for it." Fire-and-forget; the answer comes back
+//                through Stream::DeliverRemote or Stream::DeliverMiss.
+//
+// The RLE handed to OnEvicted is the same encoding the store keeps and the
+// save format uses (RleEncodeChunk above), so a forwarded chunk needs no
+// second serialization anywhere.
+struct ChunkExchange {
+  virtual ~ChunkExchange() = default;
+  virtual void OnEvicted(IVec3 wc, uint32_t tick,
+                         const std::vector<uint32_t>& rle) = 0;
+  virtual bool Wanted(IVec3 wc) = 0;
+  virtual void Request(IVec3 wc) = 0;
+};
+
 // Toroidal residency manager (M2/M7): recenters the resident cube on the
 // player one chunk at a time. A shift reads the leaving plane back
 // ASYNCHRONOUSLY (save-worthy chunks only): the copy into a pooled staging
@@ -165,6 +202,50 @@ class Stream {
   uint64_t ChunkReplacesApplied() const { return replacesApplied_; }
   uint64_t ChunkReplacesRefused() const { return replacesRefused_; }
 
+  // ---- THE EXCHANGE, BOUND (M9.5-A) --------------------------------------
+  //
+  // Null (the default, and every single-player run) is the v1 behaviour, byte
+  // for byte: no OnEvicted, no Wanted test, no hold. Set it BETWEEN ticks,
+  // like everything else on this class, and clear it before the object it
+  // points at dies.
+  void SetChunkExchange(ChunkExchange* ex) { exchange_ = ex; }
+  ChunkExchange* GetChunkExchange() const { return exchange_; }
+
+  // ---- A HELD SLOT'S TWO ANSWERS -----------------------------------------
+  //
+  // A refill that hit `Wanted` did not generate the chunk and did not fill it
+  // from the store: the slot holds a PT_EMPTY sentinel (pure sky - it reads
+  // as air, creates no CA frontier and is not woken) and is recorded in
+  // `awaitingRemote_`. It stays that way, indefinitely, until one of these
+  // lands. THAT IS DELIBERATE: a slot showing air for a few ticks is a
+  // cosmetic hole 6+ chunks from the player, and generating procgen first and
+  // then overwriting it would show the peer's edit being UNDONE and redone.
+  //
+  // DeliverRemote: the authority's bytes arrived. The store is updated first
+  // (tagged, so a later re-entry needs no second round trip) and the words go
+  // in through ReplaceChunk - the M9.3-C install door, which is FillSlots'
+  // store-hit branch factored, so nothing here re-implements a refill.
+  // Returns false if the RLE is malformed or the window no longer holds the
+  // chunk; both are counted.
+  bool DeliverRemote(IVec3 wc, uint32_t tick, const std::vector<uint32_t>& rle);
+  // DeliverMiss: nobody has it after all. The slot joins the gen list on the
+  // NEXT Update - not here, because generating is a submit and this may be
+  // called from a network pump in the middle of a frame - and procgen fills
+  // it there.
+  bool DeliverMiss(IVec3 wc);
+
+  // Run counters, in the shape the other net counters on this class take: not
+  // hashed, not saved, and they exist so a chunk that never arrived is a
+  // NUMBER rather than a hole in the world (CLAUDE.md rule 6).
+  struct ExchangeStats {
+    uint64_t held = 0;       // refills that took the inert hold
+    uint64_t delivered = 0;  // DeliverRemote calls that installed words
+    uint64_t missed = 0;     // DeliverMiss calls that re-queued a gen
+    uint64_t forgotten = 0;  // holds the window evicted before any answer
+    uint64_t rejected = 0;   // deliveries refused (bad RLE, or not resident)
+  };
+  const ExchangeStats& Exchange() const { return exchangeStats_; }
+
   // Save every resident chunk (air included — no snapshot trust needed) into
   // the store. Used by SaveWorld before serializing the store.
   void FlushResident();
@@ -184,6 +265,11 @@ class Stream {
     farEdits_.Clear();
     farPlumes_.Clear();
     modified_.assign(kNumSlots, 0);
+    // The holds describe chunks of the REPLACED world - the DiscardDemotes
+    // argument, verbatim. Not counted as `forgotten`: nothing was lost, the
+    // world they belonged to is gone.
+    awaitingRemote_.assign(kNumSlots, 0);
+    genAfterMiss_.clear();
   }
 
   ChunkStore& Store() { return store_; }
@@ -259,6 +345,12 @@ class Stream {
       bool edited = false;
     };
     std::vector<Item> items;
+    // The tick EvictSlots ran on. The bytes in this batch land on the CPU
+    // several ticks later (that is the whole point of the async eviction), so
+    // "when did this chunk leave the window" cannot be read off the clock at
+    // completion time - and it is exactly what the chunk exchange hands a
+    // peer as the copy's age (M9.5-A, ChunkExchange::OnEvicted in this file).
+    uint32_t tick = 0;
     // Parallel to `items`: the page-table entry of a slot that was a SENTINEL
     // at eviction time and therefore had NO copy issued (§2.1a / §4.2). 0 means
     // a real copy landed in the staging buffer for that index.
@@ -349,6 +441,30 @@ class Stream {
   // net report can say "4 applied, 1 refused" instead of a chunk quietly not
   // arriving (CLAUDE.md rule 6).
   uint64_t replacesApplied_ = 0, replacesRefused_ = 0;
+  // ---- the chunk exchange's state (M9.5-A) --------------------------------
+  ChunkExchange* exchange_ = nullptr;
+  ExchangeStats exchangeStats_;
+  // Per SLOT, not per chunk key: the hold is a claim on a piece of the
+  // residency window, and the window is what releases it. When a shift refills
+  // a slot that was still awaiting an answer the hold is dropped and counted
+  // as `forgotten` - the chunk is out of the window, so there is nothing left
+  // to install into, and a reply that arrives afterwards is refused by
+  // ReplaceChunk's residency test.
+  std::vector<uint8_t> awaitingRemote_;
+  // Slots DeliverMiss has released, waiting for the next Update to generate
+  // them. See the flag below for why the refill of these must not ask the
+  // exchange a second time.
+  std::vector<uint32_t> genAfterMiss_;
+  // Set for the duration of that one FillSlots call. Without it the refill
+  // would hit `Wanted` again for a chunk the exchange has ALREADY answered
+  // "miss" for, re-hold the slot, and the two would ping-pong forever. The
+  // store is still consulted (it may legitimately have gained the chunk since
+  // the request went out); only the exchange is skipped.
+  bool fillIgnoresExchange_ = false;
+  // Hold one slot inert: PT_EMPTY under paged, real zero words under dense,
+  // zeroed occupancy and CLEARED dirty flags in both. Not a refill - it must
+  // not wake, or the CA would run on air that is about to be replaced.
+  void HoldSlotInert(uint32_t s, IVec3 wc);
   std::deque<PendingEvict> pending_;
   std::vector<rhi::Buffer> stagingPool_;
   std::unordered_map<uint64_t, uint32_t> pendingChunks_;  // packed wc -> count
