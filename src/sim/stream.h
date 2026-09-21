@@ -127,6 +127,44 @@ class Stream {
   // lo/hi are world VOXEL coords (inclusive box).
   void MarkModifiedBox(IVec3 lo, IVec3 hi);
 
+  // ---- REPLACE ONE RESIDENT CHUNK'S 4,096 WORDS (M9.3-C) -----------------
+  //
+  // The chunk-resync's install door: a peer that is the AUTHORITY for a chunk
+  // whose digest diverged sends its copy, and this is what puts it in the
+  // world (net/chunksync.h explains when and why that happens).
+  //
+  // IT IS FillSlots' STORE-HIT BRANCH, FACTORED — not a reimplementation of
+  // it. That branch is eleven side effects long (classify / page / upload /
+  // table flush / far-edit index / far-plume index / RefilledSlot / occupancy
+  // / sub-occupancy / both dirty pages / NoteWakeAll) and every one of them is
+  // load-bearing: miss the sub-occupancy write and the raymarcher skips
+  // through the new matter, miss NoteWakeAll and the refilled chunk sits
+  // frozen in a settled world. So there is ONE implementation
+  // (InstallChunkWords) and both callers use it, which is what makes the
+  // plan's kill criterion ("if ReplaceChunk cannot restore the world hash to
+  // the control's, the replace path is missing one of FillSlots's side
+  // effects") impossible to hit by omission.
+  //
+  // WHAT IT ADDS ON TOP of the refill: `modified_[s] = 1` (a resynced chunk
+  // is by definition not what procgen would make, so it must be saved rather
+  // than regenerated) and `World::NoteChunkTouched` (the quiet streak belongs
+  // to the contents, and the contents just changed).
+  //
+  // CALL IT ONLY FROM THE PHASE-B POSITION, before `stream.Update` and
+  // therefore before the tick's submit. Its WriteBuffers are deferred and
+  // ordered before the next submit (the same guarantee FillSlots relies on),
+  // so the tick that follows sees the corrected chunk.
+  //
+  // KNOWN GAP, stated in net/chunksync.h and DESIGN.md §10: the chunk's
+  // in-flight particles, gas and MPM matter are NOT flushed. The QUIET
+  // requirement on both ends is the argument that there are none.
+  //
+  // Returns false (and counts) if the chunk is not resident — the window can
+  // shift between the request and the reply.
+  bool ReplaceChunk(IVec3 wc, const uint32_t* words);
+  uint64_t ChunkReplacesApplied() const { return replacesApplied_; }
+  uint64_t ChunkReplacesRefused() const { return replacesRefused_; }
+
   // Save every resident chunk (air included — no snapshot trust needed) into
   // the store. Used by SaveWorld before serializing the store.
   void FlushResident();
@@ -274,6 +312,12 @@ class Stream {
   // true. ReloadWindow passes false — it fills the WHOLE window (32,768 slots,
   // far past genAct's one-plane size) and a load has no frame to protect.
   void FillSlots(const std::vector<uint32_t>& slots, bool deferWake);
+  // THE STORE-HIT BRANCH, ONCE (see ReplaceChunk above for why it is one
+  // function). `s` must be `World::SlotChunkIndex(wc)` and `words` must hold
+  // kChunkVol entries. Everything it does is a deferred queue write or a CPU
+  // index update; it never submits, so both callers keep their own submit
+  // discipline.
+  void InstallChunkWords(uint32_t s, IVec3 wc, const uint32_t* words);
   // Grab a pooled staging buffer, recycling the oldest pending batch if the
   // ring is full (bounds staging memory to kMaxPendingEvicts batches).
   rhi::Buffer AcquireStaging();
@@ -301,6 +345,10 @@ class Stream {
   FarPlumes farPlumes_;
   std::vector<uint8_t> blockerOf_;  // per material: stops a ray (occ high 16)
   std::vector<uint8_t> modified_;   // per slot, sticky since last recycle
+  // M9.3-C run counters. Not hashed, not saved: they exist so the --frames
+  // net report can say "4 applied, 1 refused" instead of a chunk quietly not
+  // arriving (CLAUDE.md rule 6).
+  uint64_t replacesApplied_ = 0, replacesRefused_ = 0;
   std::deque<PendingEvict> pending_;
   std::vector<rhi::Buffer> stagingPool_;
   std::unordered_map<uint64_t, uint32_t> pendingChunks_;  // packed wc -> count

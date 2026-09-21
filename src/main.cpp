@@ -59,6 +59,7 @@
 // RemotePlayer ghost (package B), reached through game/session.h which already
 // includes game/remoteplayer.h.
 #include "net/link.h"
+#include "net/chunksync.h"
 #include "net/opsync.h"
 #include "net/protocol.h"
 #include "phys/debris.h"
@@ -318,6 +319,32 @@ bool NetSmokeExitOnPeerDone() {
 // to do the painting.
 bool NetSmokePaint() {
   static const bool on = std::getenv("SANDVOX_NET_SMOKE_PAINT") != nullptr;
+  return on;
+}
+// ---- SANDVOX_NET_SMOKE_DRIFT=1: A DELIBERATE DIVERGENCE (M9.3-C) ---------
+//
+// Fourth of the family, and the one with the most uncomfortable job: the
+// chunk resync repairs a divergence, so a smoke that cannot MANUFACTURE one
+// tests the publish path and nothing else. Every natural divergence is either
+// a defect (so it cannot be summoned on demand) or a window-edge case the
+// comparable rule deliberately excludes.
+//
+// Set, a --frames run submits ONE local-only CellOp every 90 ticks into a
+// quiet chunk four chunks below the player's feet — deep buried stone under a
+// standing host, which is the QUIET case the resync schedule is built for. It
+// is appended AFTER the op merge (session.cpp phase N, via
+// TickAuthorityCtx::driftCells), so it reaches this machine's GPU and never
+// the peer's. Ninety ticks is three seconds: long enough for the chunk to go
+// quiet again, be published, be drilled into, be requested and be repaired
+// before the next one lands, so the mismatch series shows a spike and a
+// return to zero rather than a permanent offset.
+//
+// It writes a PALETTE VARIANT of stone, not a new material: the state nibble
+// is hashed (world.h's word layout) so the digest moves, while no reaction can
+// fire and no neighbour can be woken into moving — the divergence stays the
+// one voxel it was asked to be.
+bool NetSmokeDrift() {
+  static const bool on = std::getenv("SANDVOX_NET_SMOKE_DRIFT") != nullptr;
   return on;
 }
 bool g_autofly = false;
@@ -5398,8 +5425,18 @@ int main(int argc, char** argv) {
     ctx.WaitIdle();
     constexpr uint32_t kProbeEvery = 15;
     uint32_t played = 0, lastHash = 0;
+    // M9.3-C: how many recorded chunk resyncs this replay re-applied. Reported
+    // beside the TickParams mismatch count, because a replay that reproduced
+    // the hash means something different when the record contained syncs and
+    // the replay silently applied none of them.
+    uint32_t replayReplaces = 0;
     for (const ops::Frame& f : log.frames) {
       if (replayTicks && played >= replayTicks) break;
+      // M9.3-C: the phase-B position of THIS drive loop. A chunk resync is a
+      // per-tick input that is not an op (oprecord.h Frame::chunkReplaces);
+      // applied here, before the submit, so the tick's CA runs on the
+      // corrected chunk exactly as it did during the recording.
+      replayReplaces += sandvox::opstream::ReplaceChunksIfReplaying(f.in.tick, stream);
       SubmitTick(ctx, world, sim, f.in.tick, f.in.seed, f.ops, f.exps, f.cells,
                  f.in.hashEnable != 0,
                  {f.in.playerChunk[0], f.in.playerChunk[1], f.in.playerChunk[2]},
@@ -5416,8 +5453,9 @@ int main(int argc, char** argv) {
     ops::SetReplay(nullptr);
     const uint32_t miss = ops::ReplayParamMismatches();
     std::printf("replay: %u ticks, final hash %08x, TickParams words rebuilt "
-                "differently: %u\n",
-                played, lastHash, miss);
+                "differently: %u, chunk resyncs re-applied: %u (refused %u)\n",
+                played, lastHash, miss, replayReplaces,
+                sandvox::opstream::ReplayChunkReplaceRefusals());
     if (miss) {
       // Rule 6: name the WORD, not the count. The word index is a u32 offset
       // into TickParams, so `offsetof(TickParams, field) / 4` in world.h reads
@@ -6760,12 +6798,32 @@ int main(int argc, char** argv) {
   // is false phase N submits exactly the vectors the tick built — which is
   // why a plain --frames run's op record is byte-identical to the oracle.
   net::OpSync opsync;
+  // THE CONVERGENCE HALF (M9.3-C, net/chunksync.h). Borrowed by
+  // TickAuthorityCtx below so phase B can install what arrives; everything
+  // else it does is socket work and happens in `netPump` / `netChunkPump`.
+  // Connected() is false until the handshake completes, and while it is false
+  // nothing here sends a byte or touches a chunk.
+  net::ChunkSync chunksync;
+  // Chunk-sync telemetry for the exit report, accumulated HERE for the same
+  // reason the op counters are: Disconnect() clears the state machine, so a
+  // host that outlives its peer would report zeroes for work it really did.
+  // Folded in by netDrop.
+  struct NetSyncTotals {
+    uint64_t blocksSent = 0, blocksRecv = 0, mismatches = 0, drills = 0;
+    uint64_t requests = 0, applied = 0, busy = 0, notResident = 0;
+    uint64_t chunkMismatches = 0, bytes = 0;
+    std::vector<net::ChunkSync::MismatchPoint> series;
+  } netSync;
   // Op telemetry for the exit report, accumulated HERE and not read off the
   // queue at exit: Disconnect() resets the queue, so a host that outlives its
   // peer would report zeroes for work it really did (measured -- the first
   // smoke's host printed mergedMax=0 after a session that merged plenty).
   // The last two are folded in from the queue inside netDrop.
   uint64_t netOpsSent = 0, netOpsRecv = 0;
+  // M9.3-C: how many local-only divergences SANDVOX_NET_SMOKE_DRIFT injected.
+  // The denominator of the smoke's claim: "4 syncs applied" means nothing
+  // without "4 drifts injected" beside it.
+  uint64_t netDriftOps = 0;
   uint64_t netCellsDropped = 0, netMergedMax = 0;
   // ---- THE SILENCE TIMER MEASURES POLLED TIME, NOT WALL TIME -----------
   //
@@ -6863,6 +6921,19 @@ int main(int argc, char** argv) {
         envStamp.biomes, envStamp.trees, envStamp.mapName, myId);
   };
 
+  // ---- M9.3-C: THE ONLY PLACE A SYNC MESSAGE REACHES THE SOCKET ---------
+  //
+  // `net::ChunkSync` produces payloads and never sends them, for the same
+  // reason `LockstepPacer` never touches a clock: it keeps the whole
+  // convergence protocol drivable by a gate with no link at all. This is the
+  // three lines that close the gap.
+  auto netSendSync = [&](const std::vector<net::ChunkSync::Out>& msgs) {
+    if (!link) return;
+    for (const net::ChunkSync::Out& o : msgs)
+      link->Send((uint16_t)o.type, net::kProtocolVersion, o.payload.data(),
+                 o.payload.size());
+  };
+
   // ---- ONE OUTGOING BATCH -----------------------------------------------
   //
   // `label` is the tick the PEER will run when it consumes this; the
@@ -6933,6 +7004,10 @@ int main(int argc, char** argv) {
     // The op exchange starts with the pacer and on the same tick numbering: a
     // label from a previous session means nothing in this one.
     opsync.Connect(netMyId, netPeerId);
+    // ...and the convergence half, on the same clock and for the same reason:
+    // an origin-ring entry or a half-reassembled chunk from a previous
+    // connection names a tick that no longer exists.
+    chunksync.Connect(netMyId, netPeerId);
     netSilence = 0.0;
     netSilenceLastPoll = 0.0;
     netPacedAt = net::NowSeconds();
@@ -6968,6 +7043,25 @@ int main(int argc, char** argv) {
     netCellsDropped += opsync.Q().droppedCells;
     netMergedMax = std::max(netMergedMax, opsync.Q().mergedMax);
     opsync.Disconnect();
+    // M9.3-C: harvest FIRST, then clear. Same hazard the op counters hit —
+    // Disconnect() wipes the state machine, and a listen server that loses one
+    // player and gains another would otherwise report only the second one's
+    // work. The mismatch SERIES is concatenated rather than summed: it is the
+    // shape that says whether the repair converged, and a total cannot.
+    netSync.blocksSent += chunksync.hashBlocksSent;
+    netSync.blocksRecv += chunksync.hashBlocksRecv;
+    netSync.mismatches += chunksync.blockMismatches;
+    netSync.chunkMismatches += chunksync.chunkMismatches;
+    netSync.drills += chunksync.drillsSent;
+    netSync.requests += chunksync.requestsSent;
+    netSync.applied += chunksync.syncsApplied;
+    netSync.busy += chunksync.busyRecv;
+    netSync.notResident += chunksync.syncsRefusedNotResident;
+    netSync.bytes += chunksync.bytesShipped;
+    netSync.series.insert(netSync.series.end(), chunksync.series.begin(),
+                          chunksync.series.end());
+    chunksync.Disconnect();
+    chunksync.series.clear();
     netSilence = 0.0;
     netSilenceLastPoll = 0.0;
     pacer = net::LockstepPacer{};
@@ -7099,6 +7193,24 @@ int main(int argc, char** argv) {
           q.vizActive = w.h.vizActive;
           if (w.playerState.size() == sizeof(PlayerState)) {
             std::memcpy(&q.st, w.playerState.data(), sizeof(PlayerState));
+            // ---- M9.3-C: THE PEER'S ORIGIN RING ------------------------
+            //
+            // `st.tick` is the tick the peer had just FINISHED when it built
+            // this state, and `st.windowOrigin` is where its window was AT
+            // THAT TICK — the two are a matched pair by construction
+            // (MakePlayerState), which is exactly what a comparison at hash
+            // tick H needs. The batch LABEL is a different number (it is
+            // st.tick + D + 1) and using it here would compare the digests of
+            // tick H against a window origin from five ticks later, which on
+            // a walking peer is a different set of comparable chunks.
+            if (q.st.version == kPlayerStateVersion) {
+              chunksync.NotePeerState(
+                  q.st.tick,
+                  {q.st.windowOrigin[0], q.st.windowOrigin[1],
+                   q.st.windowOrigin[2]},
+                  {ifloor(q.st.pos.x) >> 4, ifloor(q.st.pos.y) >> 4,
+                   ifloor(q.st.pos.z) >> 4});
+            }
             // A version the handshake did not refuse but this struct cannot
             // read is still not readable. Better one motionless ghost than a
             // body standing at fields read at the wrong offsets.
@@ -7106,9 +7218,45 @@ int main(int argc, char** argv) {
           }
           break;
         }
+        // ---- M9.3-C: THE CONVERGENCE MESSAGES ---------------------------
+        //
+        // Five new types plus the ChunkSync slices, all handed straight to
+        // the state machine (net/chunksync.h), which is where every rule
+        // about them lives. This file's job is the socket and nothing else:
+        // the switch does not know what a block sum means and must not start
+        // to, or the pure half would stop being gate-drivable.
+        //
+        // They ride the SAME link as the tick batches and are sent AFTER them
+        // within a frame, so a repair can never delay the batch the peer's
+        // pacer is waiting on.
+        case net::MsgType::HashBlocks:
+        case net::MsgType::HashDrill:
+        case net::MsgType::HashChunks:
+        case net::MsgType::ChunkRequest:
+        case net::MsgType::ChunkBusy:
+        case net::MsgType::ChunkSync: {
+          if (!netPaced) break;
+          std::vector<net::ChunkSync::Out> reply;
+          chunksync.OnMessage((net::MsgType)m.type, m.payload.data(),
+                              m.payload.size(), world, tick, reply);
+          netSendSync(reply);
+          break;
+        }
         default:
           break;
       }
+    }
+    // ---- M9.3-C: PUBLISH, SERVICE, REQUEST ------------------------------
+    //
+    // Once per frame, after the inbox is drained so a request that arrived
+    // this frame can be answered this frame. `Pump` publishes a HashBlocks
+    // only when the DIGEST TABLE has advanced (the GPU's schedule, not the
+    // frame's), services fetches that have landed, expires stale requests and
+    // issues up to the in-flight cap.
+    if (netPaced) {
+      std::vector<net::ChunkSync::Out> outMsgs;
+      chunksync.Pump(world, tick, outMsgs);
+      netSendSync(outMsgs);
     }
     // ---- DISCONNECT (§4 finding 5: 3 s silence -> local authority) -------
     // Two doors: the socket itself failed (`Error()` is the latch `DropPeer`
@@ -7266,6 +7414,35 @@ int main(int argc, char** argv) {
   // ...and so does the op exchange. Null in every harness and in every
   // single-player frame; even here it does nothing until Connected().
   if (netRoleBoot != NetRole::None) tickCtx.opsync = &opsync;
+  // ...and the convergence half, which phase B drains before stream.Update.
+  if (netRoleBoot != NetRole::None) tickCtx.chunksync = &chunksync;
+  // ---- M9.3-C: THE SMOKE'S DELIBERATE DIVERGENCE (NetSmokeDrift) --------
+  //
+  // Bound only when the switch is set AND this is a --frames harness run, so
+  // it cannot be reached from a game. Phase N calls it after the merge, which
+  // is what makes the op local-only; see session.h section I.
+  if (netRoleBoot != NetRole::None && NetSmokeDrift() && g_harnessFrames > 0) {
+    tickCtx.driftCells = [&](uint32_t t, std::vector<CellOp>& cells) {
+      if (!netPaced || t % 90 != 0) return;
+      // Four chunks (64 voxels, 6.4 m) below the feet: buried stone under a
+      // standing host, and inside the window by a wide margin so the
+      // comparable rule (>= 2 chunks in) never excludes it.
+      const IVec3 pc{ifloor(session.player.pos.x) >> 4,
+                     ifloor(session.player.pos.y) >> 4,
+                     ifloor(session.player.pos.z) >> 4};
+      const IVec3 wc{pc.x, pc.y - 4, pc.z};
+      if (!world.ChunkInWindow(wc)) return;
+      const IVec3 cell{wc.x * (int)kChunk + 8, wc.y * (int)kChunk + 8,
+                       wc.z * (int)kChunk + 8};
+      // A palette variant that CHANGES every time, so the second drift is not
+      // silently the same word as the first and a repair that did nothing
+      // would still look repaired.
+      const uint32_t variant = 1u + ((t / 90u) & 7u);
+      cells.push_back({World::SlotCellIndex(cell),
+                       PackVoxNew(kMatStone, variant)});
+      netDriftOps++;
+    };
+  }
 
   uint64_t frameCounter = 0;
   StartupMark("frame loop entered");
@@ -9230,6 +9407,20 @@ int main(int argc, char** argv) {
                        // no-op and would prove nothing
         opsync.Q().AppendLocalBrush(tick + opsync.Q().D(), b,
                                     sandvox::opstream::Producer::Lab);
+      }
+
+      // ---- M9.3-C: OUR OWN ORIGIN RING ----------------------------------
+      //
+      // AFTER the tick, so the origin recorded for tick T is the one phase B
+      // left the window at — the same moment the peer's `MakePlayerState`
+      // samples for its own ring. Two rings sampled at different points of
+      // the tick would disagree by one shift on a walking player and the
+      // comparable set would stop being symmetric.
+      if (netPaced) {
+        chunksync.NoteOwnTick(tick, world.WindowOrigin(),
+                              {ifloor(session.player.pos.x) >> 4,
+                               ifloor(session.player.pos.y) >> 4,
+                               ifloor(session.player.pos.z) >> 4});
       }
 
       // ---- M9.2-C: AND THE BATCH FOR T+D GOES OUT ------------------------
@@ -12015,6 +12206,51 @@ int main(int argc, char** argv) {
                 (unsigned long long)std::max(netMergedMax,
                                              opsync.Q().mergedMax),
                 (unsigned long long)netPollStalls);
+    // ---- M9.3-C: THE CONVERGENCE LINE -----------------------------------
+    //
+    // A SECOND line rather than more fields on the first, because it answers
+    // a different question: the first says "did the two machines talk", this
+    // says "did they agree, and when they did not, did they converge".
+    //
+    // The acceptance is a SHAPE, not a total (CLAUDE.md rule 6): `applied` > 0
+    // on the side that drifted, `busy` counted separately from `notResident`
+    // (the first is normal back-off, the second is a window that moved), and
+    // the per-hash-tick mismatch series below, which must spike and return to
+    // zero. `drifts` is the denominator: without it, "0 syncs" and "nothing
+    // ever diverged" are the same number.
+    {
+      const uint64_t bs = netSync.blocksSent + chunksync.hashBlocksSent;
+      const uint64_t br = netSync.blocksRecv + chunksync.hashBlocksRecv;
+      const uint64_t mm = netSync.mismatches + chunksync.blockMismatches;
+      const uint64_t cm = netSync.chunkMismatches + chunksync.chunkMismatches;
+      const uint64_t dr = netSync.drills + chunksync.drillsSent;
+      const uint64_t rq = netSync.requests + chunksync.requestsSent;
+      const uint64_t ap = netSync.applied + chunksync.syncsApplied;
+      const uint64_t by = netSync.busy + chunksync.busyRecv;
+      const uint64_t nr = netSync.notResident + chunksync.syncsRefusedNotResident;
+      const uint64_t sb = netSync.bytes + chunksync.bytesShipped;
+      std::printf("net: hashBlocks sent=%llu recv=%llu | mismatches blocks=%llu "
+                  "chunks=%llu | drills=%llu | chunkRequests=%llu | chunkSyncs "
+                  "applied=%llu refused(busy)=%llu refused(notResident)=%llu | "
+                  "syncBytes=%llu | drifts=%llu\n",
+                  (unsigned long long)bs, (unsigned long long)br,
+                  (unsigned long long)mm, (unsigned long long)cm,
+                  (unsigned long long)dr, (unsigned long long)rq,
+                  (unsigned long long)ap, (unsigned long long)by,
+                  (unsigned long long)nr, (unsigned long long)sb,
+                  (unsigned long long)netDriftOps);
+      // THE SERIES, one entry per HashBlocks this machine received: the hash
+      // tick, how many blocks disagreed, and how many were compared at all.
+      // "3 of 40, then 0 of 40" is a repair; "3, 3, 3" is a repair that never
+      // landed, and no total can tell those apart.
+      std::vector<net::ChunkSync::MismatchPoint> ser = netSync.series;
+      ser.insert(ser.end(), chunksync.series.begin(), chunksync.series.end());
+      std::printf("net: mismatch series (hashTick:bad/compared):");
+      if (ser.empty()) std::printf(" (none — no publish was ever compared)");
+      for (const net::ChunkSync::MismatchPoint& mp : ser)
+        std::printf(" %u:%u/%u", mp.hashTick, mp.blocks, mp.compared);
+      std::printf("\n");
+    }
     std::fflush(stdout);
   }
   // A ghost owns real Jolt limb bodies and a kinematic capsule; drop them

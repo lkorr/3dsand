@@ -33,6 +33,16 @@ enum class MsgType : uint16_t {
   ChunkPut,        // M9.5
   ChunkGet,        // M9.5
   ChunkManifest,   // M9.5
+  // ---- M9.3 package C, the convergence half (net/chunksync.h) ------------
+  // ADDITIVE, and deliberately appended rather than slotted beside ChunkSync:
+  // the enumerator VALUES are on the wire, so inserting one in the middle
+  // would renumber every message after it and make two builds of this exe
+  // disagree about what a `5` means. Appending cannot.
+  HashBlocks,      // per-4^3-block digest sums, published on a hash tick
+  HashDrill,       // "your sum for this block differs; send me the 64"
+  HashChunks,      // the 64 chunk digests of one block
+  ChunkRequest,    // "send me your copy of this chunk" (to its authority)
+  ChunkBusy,       // "not now" - not resident, or not quiet enough to ship
 };
 
 // Bumped when any message's layout or meaning changes. It is the FIRST field

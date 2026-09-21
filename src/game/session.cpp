@@ -20,6 +20,7 @@
 #include "game/worlditems.h"
 #include "lab/lab.h"
 #include "measure/perfnodes.h"
+#include "net/chunksync.h"   // M9.3-C: the resync install at the phase-B position
 #include "net/opsync.h"
 #include "sim/celestial.h"
 #include "sim/currentprim.h"
@@ -554,6 +555,55 @@ static void PhaseB(TickAuthorityCtx& w, WorldScratch& ws,
   SV_OPS_REFS
   SV_PLAYER_REFS
   {
+      // ---- M9.3-C: INSTALL WHAT THE PEER SENT, BEFORE ANYTHING ELSE -------
+      //
+      // A chunk whose digest diverged from its AUTHORITY's has arrived whole
+      // (net/chunksync.h reassembled the slices) and this is where it goes in.
+      // THE POSITION IS THE POINT and there are three reasons for it, in
+      // descending order of how badly getting it wrong would hurt:
+      //
+      //  1. BEFORE THE TICK'S SUBMIT (phase N), so the CA that runs this tick
+      //     runs on the corrected chunk. One tick later would mean one more
+      //     tick of the wrong world propagating into its neighbours, and the
+      //     next hash comparison would still see a mismatch.
+      //  2. BEFORE `stream.Update` below, so a window shift on this tick
+      //     cannot recycle the slot between the residency test inside
+      //     ReplaceChunk and the upload it does.
+      //  3. INSIDE `tick`, so `NoteChunkReplace` files it under the frame the
+      //     op record is about to write. That is what makes a replay of a
+      //     networked session reproduce the sync (oprecord.h Frame).
+      //
+      // Null pointer in every harness and in every single-player frame, so
+      // nothing here runs that did not run before this package — the oracle
+      // op-record comparison is the proof.
+      if (w.chunksync != nullptr) {
+        for (net::ChunkSync::PendingReplace& pr : w.chunksync->TakePending()) {
+          if (stream.ReplaceChunk(pr.wc, pr.words.data())) {
+            w.chunksync->NoteApplied();
+            // RE-ENCODE RATHER THAN CARRY THE WIRE BYTES. The RLE that
+            // arrived is the authority's; what the record must reproduce is
+            // what was INSTALLED, and ReplaceChunk's decode/encode round trip
+            // is byte-exact (stream.h's kPersistMask note) so the two agree —
+            // but if they ever stopped agreeing, recording the installed
+            // words is the one that keeps a replay faithful.
+            std::vector<uint32_t> rle;
+            RleEncodeChunk(pr.words.data(), rle);
+            sandvox::opstream::NoteChunkReplace(tick, pr.wc, rle);
+          } else {
+            // The window shifted between the request and the reply. Counted,
+            // never silent: a chunk that did not arrive and a chunk that
+            // arrived for somewhere we no longer hold are different facts.
+            w.chunksync->NoteRefusedNotResident();
+          }
+        }
+      }
+      // ...and the REPLAY twin, at the identical point. Unconditional because
+      // it is one pointer test when nothing is replaying; the two drive loops
+      // that bypass TickAuthority entirely (selftest_sim's `ops-replay` and
+      // main's `--replay-ops`) call it themselves, at their own phase-B
+      // position, for the same reason.
+      sandvox::opstream::ReplaceChunksIfReplaying(tick, stream);
+
       // recenter the residency window on the player (between ticks only; at
       // most one 1-chunk shift per axis)
       IVec3 playerChunkNow{ifloor(player.pos.x) >> 4, ifloor(player.pos.y) >> 4,
@@ -2977,6 +3027,15 @@ static void PhaseN(TickAuthorityCtx& w, WorldScratch& ws,
         // change at all.
         out = std::move(merged);
       }
+      // ---- M9.3-C: THE SMOKE'S DELIBERATE DIVERGENCE --------------------
+      //
+      // AFTER the merge and before the submit, which is the only window in
+      // which a cell op can reach this machine's GPU without reaching the
+      // peer's: the outgoing batch was stored by PushLocal above, so appending
+      // here cannot change what goes on the wire. Null except under
+      // SANDVOX_NET_SMOKE_DRIFT=1 (session.h section I says why it exists at
+      // all), so single-player and every harness are untouched.
+      if (w.driftCells) w.driftCells(tick, cellOps);
       tSubmit0 = NowSeconds();
       SubmitTick(ctx, world, sim, tick, kDefaultSeed, ops, exps, cellOps,
                  tick % 15 == 0 /*hash occasionally*/, pc, true, particlesActive,

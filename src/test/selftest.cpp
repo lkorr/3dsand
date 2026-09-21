@@ -208,6 +208,14 @@ const char* const kOrder[] = {
     // a gate that churns the world. It never touches the world hash: the
     // digest is a SECOND accumulator with a chunk-local key (M9.3-A).
     "chunk-hash",
+    // ...then `chunk-resync`, which is what the digest is FOR: it runs the
+    // same 80-tick scene twice (a control and a drift-and-repair arm), replays
+    // the second, and regenerates on the way out. Same argument as its
+    // neighbours for sitting here; the extra reason is that it is the one gate
+    // that calls Stream::ReplaceChunk, and putting it next to the gate that
+    // pins the digest keeps the whole M9.3 convergence story in one place in
+    // the log (M9.3-C).
+    "chunk-resync",
     // ...and `ops-exchange` beside them, for the third time the same argument:
     // it worldgens three times and runs 200 ticks per arm (two seats plus a
     // replay), and `determinism` below regenerates and proves its hash

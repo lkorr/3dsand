@@ -654,13 +654,162 @@ void Stream::DrainEvictions(bool discard) {
   while (!pending_.empty()) CompleteOldest(discard);
 }
 
+// ---- THE STORE-HIT BRANCH, AS ONE FUNCTION (M9.3-C) -----------------------
+//
+// Verbatim the body FillSlots ran inline until 2026-09-21, lifted whole so
+// that Stream::ReplaceChunk (the chunk-resync install door, stream.h) and the
+// refill cannot drift apart. Eleven side effects, and the comments on each are
+// the originals because the reasons did not change; what changed is that there
+// is now a second caller and therefore exactly one copy.
+//
+// `words` is kChunkVol entries and `s` is World::SlotChunkIndex(wc). Nothing
+// here submits: every GPU touch is a deferred queue write, ordered before the
+// next submit, which is the guarantee both callers rely on.
+void Stream::InstallChunkWords(uint32_t s, IVec3 wc, const uint32_t* words) {
+  const uint32_t one = 1;
+    // ---- store-hit classification (PLAN_page_table.md §3.5d) ------------
+    //
+    // The CPU has the decoded 16 KiB in `words` before it uploads, so it
+    // knows for FREE — it is already looping over every word below to
+    // compute occ/blockers — whether the chunk is all-air or all-one-word.
+    // All-air or uniform => install the sentinel and SKIP THE 16 KiB UPLOAD
+    // ENTIRELY, which is a bandwidth win on top of the memory win.
+    //
+    // This is also the ONE place UNIFORM discovery lives (§3.6, with commit
+    // 0's measurement behind it): the paths that already hold the words get
+    // demotion, and the tick path does not get a GPU uniformity scan.
+    const uint32_t entry = world_->residency == World::Residency::Paged
+                               ? world_->pages->Classify(s, words)
+                               : PageTable::kNeedsPage;
+    if (entry != PageTable::kNeedsPage) {
+      world_->pages->SetSentinel(s, entry);
+    } else {
+      // THE CPU SEAM (§2.1a): without translation this writes the decoded
+      // RLE into ANOTHER chunk's page. EnsurePageForOverwrite allocates when
+      // the slot is a sentinel — the same branch that classifies is the one
+      // that allocates, so allocation and offset come from one place.
+      const uint64_t dstOff = world_->pages->EnsurePageForOverwrite(s);
+      ctx_->queue.WriteBuffer(world_->voxels, dstOff, words, kChunkBytes);
+    }
+    world_->pages->FlushTableWrites(ctx_->queue);
+    // A store hit is a chunk the store thought worth keeping, and its words
+    // are decoded right here — cheaper than waiting for it to be evicted
+    // again, and it is what re-seeds the index for chunks that were only
+    // ever loaded from disk in this session.
+    farEdits_.NoteChunk(wc, words);
+    // A store hit is a chunk coming BACK, so its plume entry is refreshed
+    // rather than dropped: Build() is what drops it while the chunk is
+    // resident, and refreshing here means the emitter is correct the moment
+    // the window leaves it again.
+    farPlumes_.NoteChunk(wc, words);
+    // Contributor (d) to the CPU dirty mirror (§3.1a): the two dirty writes
+    // below wake this slot on the next tick, in BOTH pages, decided by
+    // streaming rather than by the tick loop. Its own chunk is materialized
+    // by the branch above either way, but it must still enter cpuDirty or a
+    // tightening in the same tick would intersect the refilled chunk's
+    // NEIGHBOURS away and the CA frontier a stream-in creates would be
+    // invisible to the mirror.
+    //
+    // EXCEPT pure stainless sky (PT_EMPTY): nothing in it can act, so it
+    // creates no frontier — the act-set rule the gen branch applies below,
+    // in its cheapest form. A stained-air or unclassifiable chunk returns
+    // kNeedsPage and still wakes; a full UNIFORM/JITTER store hit is rare
+    // enough (doubled-back player) that it wakes conservatively rather than
+    // paying the neighbour test here without the occupancy buffer in hand.
+    if (entry != kPtEmpty) world_->pages->RefilledSlot(s);
+    uint32_t occ = 0, blockers = 0, anyStain = 0;
+    // Sub-chunk occupancy bitmask, built in the SAME sweep (world.h
+    // kSubOccShift; layout per common.wgsl subOccIndex): [0..1] TOTAL,
+    // [2..3] BLOCKERS. This is the third producer of the mask and it must
+    // agree with sim_occupancy and genChunk exactly — a bit this path leaves
+    // clear over matter is a chunk the raymarcher skips through.
+    uint32_t sub[kSubOccStride] = {};
+    // Indexed rather than range-for because the sub-chunk bit is a function
+    // of the CHUNK-LINEAR INDEX, which the `continue` below would desync from
+    // a counter incremented at the bottom of the loop.
+    for (uint32_t li = 0; li < kChunkVol; li++) {
+      const uint32_t w = words[li];
+      // OUTSIDE the air test, like sim_occupancy: a restored chunk can be
+      // entirely air and still carry stain, and that chunk must NOT be
+      // demotable. This path decodes REAL SAVED WORLDS, so unlike worldgen
+      // it genuinely can produce stain — getting this wrong would let the
+      // free path drop a stained chunk's page and lose hashed state on the
+      // first reload of a world that had ever bled or been soaked.
+      if ((w & kStainBits) != 0u) anyStain = 1;
+      uint32_t m = w & 0xFFFu;
+      if (m == 0) continue;
+      occ++;
+      // Mirror of common.wgsl subOccBitLocal: (bz * DIM + by) * DIM + bx over
+      // the chunk-linear layout (lz * CHUNK + ly) * CHUNK + lx.
+      const uint32_t bx = (li % kChunk) >> kSubOccShift;
+      const uint32_t by = ((li / kChunk) % kChunk) >> kSubOccShift;
+      const uint32_t bz = (li / (kChunk * kChunk)) >> kSubOccShift;
+      const uint32_t sbit = (bz * kSubOccDim + by) * kSubOccDim + bx;
+      const uint32_t sm = 1u << (sbit & 31u);
+      sub[sbit >> 5] |= sm;
+      if (m < blockerOf_.size() && blockerOf_[m]) {
+        blockers++;
+        sub[kSubOccWords + (sbit >> 5)] |= sm;
+      }
+    }
+    // packing per common.wgsl packOccStain
+    occ |= blockers << 16;
+    occ |= anyStain << 31;
+    ctx_->queue.WriteBuffer(world_->occupancy, (uint64_t)s * 4, &occ, 4);
+    // ...and the sub-chunk mask in the tail of the same buffer (world.h).
+    ctx_->queue.WriteBuffer(world_->occupancy,
+                            ((uint64_t)kNumSlots + (uint64_t)s * kSubOccStride) * 4,
+                            sub, sizeof(sub));
+    // wake once: neighbors may have changed since this chunk was saved
+    ctx_->queue.WriteBuffer(world_->dirty[0], (uint64_t)s * 4, &one, 4);
+    ctx_->queue.WriteBuffer(world_->dirty[1], (uint64_t)s * 4, &one, 4);
+    // This is the ONE waking path that writes dirtyIn without going through
+    // a Simulation::Encode* entry point, so it declares itself to the §3.4
+    // settled-skip latch here. Without it a store-hit refill into a settled
+    // world would wake chunks the CA had been skipped for, and the refilled
+    // terrain would sit frozen until something else happened to dirty the
+    // world — which is exactly the silent-state-loss failure the latch's
+    // conservative direction exists to prevent.
+    sim_->NoteWakeAll();
+}
+
+// ---- Stream::ReplaceChunk (M9.3-C) ----------------------------------------
+// The doc comment is in stream.h beside the declaration.
+bool Stream::ReplaceChunk(IVec3 wc, const uint32_t* words) {
+  if (!world_->ChunkInWindow(wc)) {
+    // The window shifted between the peer's ChunkRequest and its reply. NOT a
+    // silent drop: it is counted and the --frames net report names it, because
+    // "the sync never arrived" and "the sync arrived for a chunk we no longer
+    // hold" are different bugs and only the first one is a bug at all.
+    replacesRefused_++;
+    return false;
+  }
+  const uint32_t s = World::SlotChunkIndex(wc);
+  // The demotion streak is a claim about how long this slot has looked
+  // uniform, and the words are about to change. FillSlots resets it for the
+  // whole plane at its top for the same reason; here it is one slot.
+  if (world_->residency == World::Residency::Paged) {
+    const std::vector<uint32_t> justThis{s};
+    world_->pages->ResetStreaks(justThis);
+  }
+  InstallChunkWords(s, wc, words);
+  // ...and the two things a REFILL does not do, because a refill is installing
+  // what the store or procgen already agreed on and this is installing what
+  // the PEER decided. Sticky-modified so eviction saves it instead of letting
+  // procgen regenerate the pre-sync contents; quiet streak reset because the
+  // contents just changed and the streak describes the contents.
+  modified_[s] = 1;
+  world_->NoteChunkTouched(wc);
+  replacesApplied_++;
+  return true;
+}
+
 void Stream::FillSlots(const std::vector<uint32_t>& slots, bool deferWake) {
   const double fT0 = PtNowMs();
   if (world_->residency == World::Residency::Paged)
     world_->pages->ResetStreaks(slots);
   std::vector<uint32_t> data(kChunkVol);
   std::vector<uint32_t> genSlots;
-  const uint32_t one = 1;
   for (uint32_t s : slots) {
     modified_[s] = 0;
     // The slot is about to hold a DIFFERENT world chunk, so whatever quiet
@@ -686,110 +835,7 @@ void Stream::FillSlots(const std::vector<uint32_t>& slots, bool deferWake) {
         CompleteOldest(/*discard=*/false);
     const std::vector<uint32_t>* rle = store_.Get(wc);
     if (rle && RleDecodeChunk(rle->data(), rle->size() / 2, data.data())) {
-      // ---- store-hit classification (PLAN_page_table.md §3.5d) ------------
-      //
-      // The CPU has the decoded 16 KiB in `data` before it uploads, so it
-      // knows for FREE — it is already looping over every word below to
-      // compute occ/blockers — whether the chunk is all-air or all-one-word.
-      // All-air or uniform => install the sentinel and SKIP THE 16 KiB UPLOAD
-      // ENTIRELY, which is a bandwidth win on top of the memory win.
-      //
-      // This is also the ONE place UNIFORM discovery lives (§3.6, with commit
-      // 0's measurement behind it): the paths that already hold the words get
-      // demotion, and the tick path does not get a GPU uniformity scan.
-      const uint32_t entry = world_->residency == World::Residency::Paged
-                                 ? world_->pages->Classify(s, data.data())
-                                 : PageTable::kNeedsPage;
-      if (entry != PageTable::kNeedsPage) {
-        world_->pages->SetSentinel(s, entry);
-      } else {
-        // THE CPU SEAM (§2.1a): without translation this writes the decoded
-        // RLE into ANOTHER chunk's page. EnsurePageForOverwrite allocates when
-        // the slot is a sentinel — the same branch that classifies is the one
-        // that allocates, so allocation and offset come from one place.
-        const uint64_t dstOff = world_->pages->EnsurePageForOverwrite(s);
-        ctx_->queue.WriteBuffer(world_->voxels, dstOff, data.data(), kChunkBytes);
-      }
-      world_->pages->FlushTableWrites(ctx_->queue);
-      // A store hit is a chunk the store thought worth keeping, and its words
-      // are decoded right here — cheaper than waiting for it to be evicted
-      // again, and it is what re-seeds the index for chunks that were only
-      // ever loaded from disk in this session.
-      farEdits_.NoteChunk(wc, data.data());
-      // A store hit is a chunk coming BACK, so its plume entry is refreshed
-      // rather than dropped: Build() is what drops it while the chunk is
-      // resident, and refreshing here means the emitter is correct the moment
-      // the window leaves it again.
-      farPlumes_.NoteChunk(wc, data.data());
-      // Contributor (d) to the CPU dirty mirror (§3.1a): the two dirty writes
-      // below wake this slot on the next tick, in BOTH pages, decided by
-      // streaming rather than by the tick loop. Its own chunk is materialized
-      // by the branch above either way, but it must still enter cpuDirty or a
-      // tightening in the same tick would intersect the refilled chunk's
-      // NEIGHBOURS away and the CA frontier a stream-in creates would be
-      // invisible to the mirror.
-      //
-      // EXCEPT pure stainless sky (PT_EMPTY): nothing in it can act, so it
-      // creates no frontier — the act-set rule the gen branch applies below,
-      // in its cheapest form. A stained-air or unclassifiable chunk returns
-      // kNeedsPage and still wakes; a full UNIFORM/JITTER store hit is rare
-      // enough (doubled-back player) that it wakes conservatively rather than
-      // paying the neighbour test here without the occupancy buffer in hand.
-      if (entry != kPtEmpty) world_->pages->RefilledSlot(s);
-      uint32_t occ = 0, blockers = 0, anyStain = 0;
-      // Sub-chunk occupancy bitmask, built in the SAME sweep (world.h
-      // kSubOccShift; layout per common.wgsl subOccIndex): [0..1] TOTAL,
-      // [2..3] BLOCKERS. This is the third producer of the mask and it must
-      // agree with sim_occupancy and genChunk exactly — a bit this path leaves
-      // clear over matter is a chunk the raymarcher skips through.
-      uint32_t sub[kSubOccStride] = {};
-      // Indexed rather than range-for because the sub-chunk bit is a function
-      // of the CHUNK-LINEAR INDEX, which the `continue` below would desync from
-      // a counter incremented at the bottom of the loop.
-      for (uint32_t li = 0; li < kChunkVol; li++) {
-        const uint32_t w = data[li];
-        // OUTSIDE the air test, like sim_occupancy: a restored chunk can be
-        // entirely air and still carry stain, and that chunk must NOT be
-        // demotable. This path decodes REAL SAVED WORLDS, so unlike worldgen
-        // it genuinely can produce stain — getting this wrong would let the
-        // free path drop a stained chunk's page and lose hashed state on the
-        // first reload of a world that had ever bled or been soaked.
-        if ((w & kStainBits) != 0u) anyStain = 1;
-        uint32_t m = w & 0xFFFu;
-        if (m == 0) continue;
-        occ++;
-        // Mirror of common.wgsl subOccBitLocal: (bz * DIM + by) * DIM + bx over
-        // the chunk-linear layout (lz * CHUNK + ly) * CHUNK + lx.
-        const uint32_t bx = (li % kChunk) >> kSubOccShift;
-        const uint32_t by = ((li / kChunk) % kChunk) >> kSubOccShift;
-        const uint32_t bz = (li / (kChunk * kChunk)) >> kSubOccShift;
-        const uint32_t sbit = (bz * kSubOccDim + by) * kSubOccDim + bx;
-        const uint32_t sm = 1u << (sbit & 31u);
-        sub[sbit >> 5] |= sm;
-        if (m < blockerOf_.size() && blockerOf_[m]) {
-          blockers++;
-          sub[kSubOccWords + (sbit >> 5)] |= sm;
-        }
-      }
-      // packing per common.wgsl packOccStain
-      occ |= blockers << 16;
-      occ |= anyStain << 31;
-      ctx_->queue.WriteBuffer(world_->occupancy, (uint64_t)s * 4, &occ, 4);
-      // ...and the sub-chunk mask in the tail of the same buffer (world.h).
-      ctx_->queue.WriteBuffer(world_->occupancy,
-                              ((uint64_t)kNumSlots + (uint64_t)s * kSubOccStride) * 4,
-                              sub, sizeof(sub));
-      // wake once: neighbors may have changed since this chunk was saved
-      ctx_->queue.WriteBuffer(world_->dirty[0], (uint64_t)s * 4, &one, 4);
-      ctx_->queue.WriteBuffer(world_->dirty[1], (uint64_t)s * 4, &one, 4);
-      // This is the ONE waking path that writes dirtyIn without going through
-      // a Simulation::Encode* entry point, so it declares itself to the §3.4
-      // settled-skip latch here. Without it a store-hit refill into a settled
-      // world would wake chunks the CA had been skipped for, and the refilled
-      // terrain would sit frozen until something else happened to dirty the
-      // world — which is exactly the silent-state-loss failure the latch's
-      // conservative direction exists to prevent.
-      sim_->NoteWakeAll();
+      InstallChunkWords(s, wc, data.data());
     } else {
       genSlots.push_back(s);
     }

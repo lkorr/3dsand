@@ -107,6 +107,10 @@
 // actually call it include the real header.
 namespace net {
 class OpSync;
+// ...and the convergence half (M9.3-C, net/chunksync.h). By name only for the
+// same reason: chunksync.h reaches World and the op record, and session.cpp is
+// the only file here that calls into it.
+class ChunkSync;
 }
 
 // ---- small per-player value types, moved out of main() --------------------
@@ -612,6 +616,39 @@ struct TickAuthorityCtx {
   // for OpBatch, so including it here would be a cycle. session.cpp and
   // main.cpp include it.
   net::OpSync* opsync = nullptr;
+
+  // ---- H. THE CONVERGENCE HALF (M9.3 package C, net/chunksync.h).
+  //
+  // Per-WORLD and owned by main(), like the two above. NULL IN EVERY HARNESS
+  // except the `chunk-resync` gate, which drives ReplaceChunk directly.
+  //
+  // WHAT IT CHANGES WHEN IT IS NON-NULL: phase B, before `stream.Update`,
+  // drains whatever chunk copies arrived from the peer and installs them with
+  // `Stream::ReplaceChunk`. BEFORE Update and therefore before the tick's
+  // submit, so the tick's CA sees the corrected chunk rather than running once
+  // more on the wrong one — and so the replace is inside the same tick the op
+  // record attributes it to.
+  //
+  // Everything else it does (publishing digests, drilling, requesting,
+  // answering) is the FRAME layer's, because it is socket work; this pointer
+  // exists only so the install lands at the right point in the tick.
+  net::ChunkSync* chunksync = nullptr;
+
+  // ---- I. THE TWO-PROCESS SMOKE'S DELIBERATE DIVERGENCE (M9.3-C).
+  //
+  // Cell ops appended to the batch AFTER the op merge and immediately before
+  // the submit, so they reach THIS machine's GPU and never the wire. That is
+  // the entire point and it is why this cannot be the `fellTree` hook (phase
+  // D, before the merge): an op that travelled would be applied on both
+  // machines and there would be nothing to converge.
+  //
+  // It exists because a resync cannot be smoke-tested without a divergence,
+  // and every NATURAL divergence is either a bug (so it cannot be summoned on
+  // demand) or a window-edge case the comparable rule excludes on purpose.
+  // SANDVOX_NET_SMOKE_DRIFT=1 in main.cpp is the only thing that ever sets it;
+  // it is null in the game, on a server and in every harness, so the
+  // single-player op record is untouched.
+  std::function<void(uint32_t tick, std::vector<CellOp>& cells)> driftCells;
 };
 
 // ---- one tick of authority, for N players ---------------------------------
