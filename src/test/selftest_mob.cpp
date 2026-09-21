@@ -9017,8 +9017,43 @@ Status GateRagdollFallDamage(Ctx& c, std::string& detail) {
 Status GateMobHandoff(Ctx& c, std::string& detail) {
   const uint64_t idCounterWas = c.mobs.NextIdCounter();
   const uint32_t localWas = c.mobs.LocalPlayerId();
+  // WHAT THIS GATE INHERITED (CLAUDE.md rule 6: name the state, do not
+  // eliminate one hypothesis per run). Every number here is process state an
+  // earlier gate could have left set, and arm A's ghost tracking is a
+  // function of all of them.
+  const std::string inherited = Format(
+      "in: localPid %u, mobs %u/ghosts %u, debris %u bodies/pid %u/ghosts %u, "
+      "origin (%d,%d,%d), idc %llu",
+      localWas, c.mobs.MobCount(), c.mobs.GhostCount(), c.debris.BodyCount(),
+      c.debris.LocalPlayerId(), c.debris.GhostCount(),
+      c.world.WindowOrigin().x, c.world.WindowOrigin().y,
+      c.world.WindowOrigin().z, (unsigned long long)idCounterWas);
   c.debris.Reset();
   c.mobs.Reset();
+  // ---- THIS GATE'S OWN PRECONDITION, AND IT IS NOT OPTIONAL --------------
+  //
+  // A MOB ID IS AN RNG KEY, so pinning it is what makes this fixture a
+  // function of its own script rather than of how many creatures the gates
+  // before it happened to spawn. `MobSystem::Reset` deliberately does NOT
+  // rewind the counter (see the long note on it: rewinding by default moved
+  // `mob-burn`), so `NextIdCounter()` arrives here at whatever the run left
+  // it at -- 1 under `--gate mob-handoff`, 5 behind `save-entities` and the
+  // rest of the multiplayer block.
+  //
+  // That is not cosmetic. `Mob::CarveLimbRadial` keys its ragged noise on
+  // `id_ * 2654435761u` and `LimbVoxelPos` takes the id as well, so the
+  // `wound()` helper below tears a DIFFERENT set of voxels for every id --
+  // and it is deliberately carving close to the sever floor. At idc 5 the
+  // sixth carve took the arm off: three limbs (armU/armL/hand) left the rig
+  // between the pose the stream was built from and the pose it was compared
+  // against, and arm A reported it as a 10.79-vox "tracking error" that had
+  // nothing to do with tracking. Measured 2026-09-21: `by-id 0.0001` (the
+  // ghost was tracking perfectly) with `13/16 limbs`.
+  //
+  // Pinned to 1, which is what `--gate mob-handoff` already got and therefore
+  // the behaviour every number in this gate was authored against. Put back at
+  // exit by `restore()`, so nothing after this gate sees a rewound counter.
+  c.mobs.SetNextIdCounter(1);
   SubmitWorldgen(c.ctx, c.world, c.sim, kDefaultSeed);
   c.ctx.WaitIdle();
 
@@ -9163,7 +9198,27 @@ Status GateMobHandoff(Ctx& c, std::string& detail) {
   // ======== ARM A: a ghost is posed, not stepped ==========================
   Step localOps{}, ghostOps{};
   uint64_t aiLocal = 0, aiGhost = 0;
+  // THE CLAIM IS MATCHED BY `lp.index`, NOT BY VECTOR SLOT. `BuildPose` emits
+  // only the limbs that still have a body, so the slot a limb occupies in the
+  // list is a function of how many limbs are left -- and comparing two poses
+  // slot by slot turns "an arm came off mid-stream" into a large distance
+  // between two limbs that were never the same limb. That is what the
+  // order-dependent failure of 2026-09-21 actually was, and the by-slot number
+  // is kept below purely as the diagnostic that says so.
   double trackErr = 0;
+  double trackErrBySlot = 0;
+  // ---- WHAT the tracking error IS, not just that there is one -------------
+  // A bare "track 10.79 vox" has a dozen causes (the rig set changed under the
+  // stream, one limb is frozen, the whole body is frozen, the body went
+  // dynamic, a worn shell drifted). These name the first one that fires.
+  int badTick = -1;             // first tick the error exceeded the tolerance
+  int badSlot = -1;             // vector slot of the worst limb
+  int badLimbGot = -1, badLimbNow = -1;  // its lp.index on each side
+  size_t limbsGot = 0, limbsNow = 0;     // rig size in the stream vs the rig
+  int idxMismatch = 0;          // slots where the two lp.index lists disagree
+  double originErr = 0;         // Mob::origin_ vs the pose's origin
+  double badDx = 0;             // how far the stream had walked at badTick
+  int ragdollPhase = -1;
   bool targetable = false, solidWhileGhost = false, solidAfterGone = true;
   uint64_t ghostId = 0;
   {
@@ -9232,13 +9287,44 @@ Status GateMobHandoff(Ctx& c, std::string& detail) {
       // Where the limbs ACTUALLY are, read back through the same record.
       ::net::MobPose now{};
       if (c.mobs.BuildPose(ghostId, tick, now)) {
+        limbsGot = got.limbs.size();
+        limbsNow = now.limbs.size();
         for (size_t i = 0; i < now.limbs.size() && i < got.limbs.size(); i++) {
           const Vec3 d{now.limbs[i].pos.x - got.limbs[i].pos.x,
                        now.limbs[i].pos.y - got.limbs[i].pos.y,
                        now.limbs[i].pos.z - got.limbs[i].pos.z};
-          trackErr = std::max(trackErr, (double)std::sqrt(d.x * d.x + d.y * d.y +
-                                                          d.z * d.z));
+          const double e =
+              (double)std::sqrt(d.x * d.x + d.y * d.y + d.z * d.z);
+          trackErrBySlot = std::max(trackErrBySlot, e);
+          if (now.limbs[i].index != got.limbs[i].index) idxMismatch++;
         }
+        // THE MEASUREMENT: every limb the stream carried, found by its own
+        // index in the rig it arrived for.
+        for (const ::net::WireLimbPose& b : got.limbs)
+          for (const ::net::WireLimbPose& a : now.limbs) {
+            if (a.index != b.index) continue;
+            const Vec3 d{a.pos.x - b.pos.x, a.pos.y - b.pos.y,
+                         a.pos.z - b.pos.z};
+            const double e =
+                (double)std::sqrt(d.x * d.x + d.y * d.y + d.z * d.z);
+            if (e > trackErr) {
+              trackErr = e;
+              badSlot = (int)(&b - got.limbs.data());
+              badLimbGot = (int)b.index;
+              badLimbNow = (int)a.index;
+            }
+            if (e > trackTol && badTick < 0) {
+              badTick = t;
+              badDx = (double)dx;
+              ragdollPhase = c.mobs.RagdollPhaseOf(ghostId);
+              const Vec3 mo = c.mobs.MobOrigin(ghostId);
+              originErr = (double)std::sqrt(
+                  (mo.x - got.origin.x) * (mo.x - got.origin.x) +
+                  (mo.y - got.origin.y) * (mo.y - got.origin.y) +
+                  (mo.z - got.origin.z) * (mo.z - got.origin.z));
+            }
+            break;
+          }
       }
     }
     aiGhost = c.mobs.AiSteps() - ai1;
@@ -9426,10 +9512,13 @@ Status GateMobHandoff(Ctx& c, std::string& detail) {
     for (int run = 0; run < 2; run++) {
       c.debris.Reset();
       c.mobs.Reset();
-      // The SAME id counter for both runs: a mob id seeds its gore profile and
-      // its RNG key, so two runs from different counters are two different
-      // creatures and would prove nothing (mob.h, NextIdCounter).
-      c.mobs.SetNextIdCounter(idCounterWas);
+      // The SAME id counter for both runs, and the same one the arms above
+      // used: a mob id seeds its gore profile and its RNG key, so two runs
+      // from different counters are two different creatures and would prove
+      // nothing (mob.h, NextIdCounter). It is the gate's pinned base rather
+      // than the inherited counter for the reason given at the top -- an
+      // inherited value makes every number below a function of the run.
+      c.mobs.SetNextIdCounter(1);
       const uint64_t id =
           AiSpawn(c, defIndex, {spot.x, spot.y + 1, spot.z}, "duelist", why);
       if (id == 0) break;
@@ -9452,10 +9541,17 @@ Status GateMobHandoff(Ctx& c, std::string& detail) {
   RecordObserved("mobGhostTrackErrVox", trackErr);
   RecordObserved("mobHandoffRecordBytes", (double)recordBytes);
 
+  // THE RIG THE STREAM WAS BUILT FOR IS THE RIG IT WAS APPLIED TO. `wound()`
+  // carves close to the sever floor on purpose and a sever would change the
+  // limb set under the pose -- which is a defect in the FIXTURE, not a
+  // tracking error, and must be reported as itself rather than folded into a
+  // distance. Stated as its own term so a future fixture drift fails here
+  // with `16/13 limbs` on the line instead of a number nobody can place.
+  const bool rigStable = limbsNow == limbsGot && idxMismatch == 0;
   const bool armA = localOps.brush + localOps.cell > 0 && aiLocal > 0 &&
                     ghostOps.brush == 0 && ghostOps.cell == 0 &&
-                    aiGhost == 0 && trackErr <= trackTol && targetable &&
-                    solidWhileGhost && !solidAfterGone;
+                    aiGhost == 0 && rigStable && trackErr <= trackTol &&
+                    targetable && solidWhileGhost && !solidAfterGone;
   const bool armB = recordSame && brainSame && gearSame && gearSent > 0;
   const bool armC = opsBefore > 0 && aiBefore > 0 && opsDuring == 0 &&
                     aiDuring == 0 && opsAfter > 0 && aiAfter > 0 &&
@@ -9465,13 +9561,19 @@ Status GateMobHandoff(Ctx& c, std::string& detail) {
 
   detail = Format(
       "A local %d ops / %llu ai vs ghost %d ops / %llu ai, track %.4f <= %.4f "
-      "vox over %d ticks, targetable %d, solid %d->%d | B record %zu B "
+      "vox over %d ticks (by-slot %.4f, slot %d limb %d/%d, %zu/%zu limbs, "
+      "%d idx mismatch, rig stable %d, first over at tick %d dx %.2f "
+      "originErr %.4f rag %d; "
+      "%s), targetable %d, solid %d->%d | B record %zu B "
       "identical %d (%s), brain %d, gear %d/%d %d | C ops %d->%d->%d, ai "
       "%llu->%llu->%llu, jump in %.4f out %.4f, walked %.2f/%.2f | D ops %d/%d,"
       " inert %d",
       localOps.brush + localOps.cell, (unsigned long long)aiLocal,
       ghostOps.brush + ghostOps.cell, (unsigned long long)aiGhost, trackErr,
-      trackTol, ghostTicks, targetable ? 1 : 0, solidWhileGhost ? 1 : 0,
+      trackTol, ghostTicks, trackErrBySlot, badSlot, badLimbGot, badLimbNow,
+      limbsNow, limbsGot, idxMismatch, rigStable ? 1 : 0, badTick, badDx,
+      originErr, ragdollPhase,
+      inherited.c_str(), targetable ? 1 : 0, solidWhileGhost ? 1 : 0,
       solidAfterGone ? 1 : 0, recordBytes, recordSame ? 1 : 0,
       recordWhy.empty() ? "-" : recordWhy.c_str(), brainSame ? 1 : 0, gearBack, gearSent, gearSame ? 1 : 0, opsBefore,
       opsDuring, opsAfter, (unsigned long long)aiBefore,
