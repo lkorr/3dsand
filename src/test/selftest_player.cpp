@@ -12,7 +12,15 @@
 #include <string>
 #include <vector>
 
+#include <span>
+
+#include "game/ai_behavior.h"
+#include "game/avatar.h"
+#include "game/mob.h"
 #include "game/player.h"
+#include "game/session.h"   // PrefetchChunksAround -- the gate and the real
+                            // tick must call ONE definition of it
+#include "sim/materials.h"
 #include "sim/tuning.h"
 #include "test/selftest.h"
 #include "test/support.h"
@@ -1104,6 +1112,478 @@ Status GateTickInput(Ctx& c, std::string& detail) {
   return ok ? Status::Pass : Status::Fail;
 }
 
+
+// ---- two-players -----------------------------------------------------------
+//
+// TWO INDEPENDENT BODIES IN ONE WORLD, AND ONLY ONE OF THEM HAS A MIRROR.
+//
+// This is M9.1 package P3's proof (docs/PLAN_multiplayer_m9.md §2). What made a
+// second player impossible was not the tick — package P1 split that into
+// per-player phases — it was the COLLISION SOURCE. `World::KindAt` reads the
+// snapshot's 3x3x3 chunk mirror, and that cube is centred on ONE player's chunk
+// (phase H submits with session 0's). A second body twelve chunks away reads
+// Unknown for every cell; `Collides` treats Unknown as air on purpose and
+// `KnownDrop` clamps the descent to the last row the mirror vouches for, so
+// such a body does not fall through the world — IT HOVERS, indefinitely,
+// wherever it left the cube. (The engine map said Unknown cells are SOLID for
+// the player. They are not: the clamp is upstream of the sweep, not inside it.)
+//
+// So player 0 walks on `KindAt` with the mirror centred on it — the game's
+// arrangement, unchanged — and player 1 walks on `World::KindAtCached` with
+// `PrefetchChunksAround` keeping its chunk cache warm. Those two functions
+// are all of P3's engine change, and this is what asserts them. The claims, in
+// the order they are checked:
+//
+//   1. BOTH trajectories are pinned. A second player that hovers, sinks, stalls
+//      or teleports moves a pin.
+//   2. Player 1 never drops below its own analytic ground, checked EVERY TICK.
+//      At the end only, a body that fell and was caught later reads fine.
+//   3. The cache actually takes over. Player 1's answers are counted per tick
+//      and the analytic fallback has to stop being used and stay stopped — a
+//      `KindAtCached` that never read a fetched voxel would satisfy claims 1
+//      and 2 perfectly, which is the "fixture that cannot fail" trap.
+//   4. A hostile creature targets the NEARER of the two players BY ITS BANDED
+//      ACTOR ID (`ai::kPlayerActorBase + i`, package P2), and
+//      `MobSystem::FindCombatantById` resolves that id to the right avatar.
+//      With one player both of those are vacuous; with two they are the point.
+//   5. The twice-run contract: the whole 300 ticks run twice with a fresh
+//      worldgen between, and the world-hash sequences must agree. Determinism
+//      is the invariant (CLAUDE.md rule 1) and a second player is new input.
+//
+// FIXTURE PLACEMENT PINS THE WINDOW ITSELF, the way `pond-shore` does.
+//
+// The obvious thing — anchor to `world.WindowOrigin()` like the AI gates —
+// makes the end positions a function of WHICH GATES RAN FIRST: `streaming`
+// leaves the origin ~20 chunks out and `pond-shore` stands it somewhere else
+// entirely, so a pin measured under `--gate two-players` is a different number
+// from the same pin measured under `--selftest`. That is CLAUDE.md rule 7
+// ("a `--gate X` subset is not a small `--selftest`") arriving as a pinned
+// value instead of as a verdict, and it costs a wrong conclusion either way
+// round. So the gate SETS the origin to (0,0,0), regenerates, and restores the
+// caller's origin and pristine worldgen before it returns — the fixture is the
+// same world at every scope.
+//
+// Within that window both sites then move to the flattest patch nearby, because
+// the kill criterion for this package is "if player 1 falls through EVEN WITH
+// the analytic fallback, MOVE THE SITE" — an overhang, a cave roof or a ruin
+// floor is a column `TerrainHeight` cannot describe, and widening the tolerance
+// would hide exactly that.
+//
+// THE TWO BODIES WALK APART, NOT TOGETHER. The package text says "player 0
+// walks +X, player 1 walks −X"; player 0 is therefore the +X site and player 1
+// the −X one, so those headings INCREASE the separation. Placed the other way
+// round the two would converge — at ~30 Hz over 300 ticks a walking body covers
+// far more than the 192 voxels between them — and player 1 would spend the back
+// half of the run inside player 0's mirror, which is the one condition the gate
+// exists to avoid. Walking is also confined to ticks 8..128 so neither body
+// leaves the residency window; the rest of the run is standing and one jump.
+constexpr int kTwoPlayerTicks = 300;
+constexpr int kTwoPlayerChunkGap = 12;   // chunks between the bodies, in X
+constexpr int kTwoPlayerWalkEnd = 128;   // last tick with forward held
+constexpr int kTwoPlayerJumpTick = 160;  // the one jump, while standing
+// The window this fixture owns. (0,0,0) is where most of the suite sits, which
+// makes world and window-local chunk coordinates coincide and removes the
+// SlotChunkIndex trap `pond-shore` documents.
+constexpr IVec3 kTwoPlayerOrigin{0, 0, 0};
+
+// The flattest patch within `search` voxels of (cx,cz). Same shape as the AI
+// gates' AiFlatSpot (selftest_mob.cpp) and for the same reason: terrain is
+// procedural, so a hand-picked coordinate becomes a cliff the next time
+// worldgen is tuned and the failure reads as "the player broke". Restated here
+// rather than shared because the two live in different TUs' anonymous
+// namespaces; a third copy should move it to selftest.h.
+IVec3 TwoPlayerFlatSpot(int cx, int cz, int search, uint32_t seed,
+                        int& outRelief) {
+  int bestX = cx, bestZ = cz, bestRelief = INT32_MAX;
+  for (int oz = -search; oz <= search; oz += 8)
+    for (int ox = -search; ox <= search; ox += 8) {
+      int lo = INT32_MAX, hi = INT32_MIN;
+      for (int dz = -8; dz <= 8; dz += 4)
+        for (int dx = -8; dx <= 8; dx += 4) {
+          const int h = World::TerrainHeight(cx + ox + dx, cz + oz + dz, seed);
+          lo = std::min(lo, h);
+          hi = std::max(hi, h);
+        }
+      if (hi - lo < bestRelief) {
+        bestRelief = hi - lo;
+        bestX = cx + ox;
+        bestZ = cz + oz;
+      }
+    }
+  outRelief = bestRelief;
+  return IVec3{bestX, World::TerrainHeight(bestX, bestZ, seed), bestZ};
+}
+
+// The scripted command for one tick, in BLOCKS of kTicksPerBlock — the same
+// discipline `tick-input` uses above and for the same reason: held state is a
+// sample and an edge belongs to exactly one tick, so anything that changes
+// mid-block is testing the script rather than the controller. `dir` is +1 for
+// the body walking +X and -1 for the one walking -X.
+TickInput TwoPlayerScript(int tick, int dir) {
+  TickInput in;
+  const int firstTick = (tick / kTicksPerBlock) * kTicksPerBlock;
+  if (firstTick >= 8 && firstTick < kTwoPlayerWalkEnd) in.forward = 1.0f;
+  const bool jumpBlock = firstTick == kTwoPlayerJumpTick;
+  in.SetHeld(TB_JUMP, jumpBlock);
+  if (jumpBlock && tick == firstTick) in.SetPressed(TB_JUMP, true);
+  in.flatFwd = Vec3{(float)dir, 0, 0};
+  in.right = Vec3{0, 0, (float)dir};
+  in.lookFwd = in.flatFwd;
+  return in;
+}
+
+// What one arm of the gate measured. Two arms prove the twice-run contract;
+// arm 0 is what the pins are read against.
+struct TwoPlayerArm {
+  Vec3 start0{}, start1{}, end0{}, end1{};
+  std::vector<uint32_t> hashes;
+  int worstSinkTick = -1;        // first tick player 1 was below its ground
+  float worstSink = 0.0f;        // how far below, in voxels
+  int lastFallbackTick = -1;     // last tick answered from TerrainHeight
+  uint64_t fallbacks = 0;        // analytic answers for player 1, all ticks
+  uint64_t cacheHits = 0;        // answers that read a fetched voxel
+  uint64_t mobId = 0;
+  uint64_t mobTarget = 0;
+  bool mobBrain = false;
+  bool combatantOk = false;      // FindCombatantById(base+1) == &avatar 1
+  float mobToP0 = 0, mobToP1 = 0;
+  uint64_t fetchReq = 0, fetchCoalesced = 0;
+  std::string why;               // non-empty = the arm could not be built
+};
+
+// Run the whole 300-tick fixture once, from a fresh worldgen.
+void RunTwoPlayerArm(Ctx& c, TwoPlayerArm& a) {
+  c.debris.Reset();
+  // rewindIds: mob ids seed gore variance and blast noise, so the second arm
+  // must start its id counter where the first did or the two runs are not the
+  // same experiment.
+  c.mobs.Reset(true);
+  c.mobs.ClearRisings();
+  // THE WINDOW IS PART OF THE FIXTURE (see the note above). Set before the
+  // worldgen, because SubmitWorldgen generates the window that is there.
+  c.world.SetWindowOrigin(kTwoPlayerOrigin);
+  SubmitWorldgen(c.ctx, c.world, c.sim, kDefaultSeed);
+  c.ctx.WaitIdle();
+  c.world.ResetFetchProbe();
+
+  // The COLLISION table the game builds, not a copy of the material classes:
+  // passable vegetation reads as gas and a gate that forgot it would pass
+  // against collision the player does not have (sim/materials.h).
+  const std::vector<uint32_t> classOf = BuildCollisionClasses(c.mats);
+
+  const int cx = (kTwoPlayerOrigin.x + (int)kNChunk / 2) * (int)kChunk;
+  const int cz = (kTwoPlayerOrigin.z + (int)kNChunk / 2) * (int)kChunk;
+  const int half = kTwoPlayerChunkGap * (int)kChunk / 2;  // 96 voxels
+  int relief0 = 0, relief1 = 0;
+  const IVec3 site0 =
+      TwoPlayerFlatSpot(cx + half, cz, 24, kDefaultSeed, relief0);
+  const IVec3 site1 =
+      TwoPlayerFlatSpot(cx - half, cz, 24, kDefaultSeed, relief1);
+
+  Player p0, p1;
+  p0.fly = false;
+  p1.fly = false;
+  // Feet exactly one voxel above the ground column: pos.y − kHalfY is the sole
+  // (the `player-walk` gate uses the same arithmetic), and TerrainHeight names
+  // the topmost GROUND voxel, so h + 1 is the first free row.
+  p0.pos = Vec3{(float)site0.x + 0.5f, (float)(site0.y + 1) + Player::kHalfY,
+                (float)site0.z + 0.5f};
+  p1.pos = Vec3{(float)site1.x + 0.5f, (float)(site1.y + 1) + Player::kHalfY,
+                (float)site1.z + 0.5f};
+  p0.SnapRender();
+  p1.SnapRender();
+  a.start0 = p0.pos;
+  a.start1 = p1.pos;
+
+  // ---- the two collision sources, and the whole difference between them ----
+  auto kind0 = [&](IVec3 cell) { return c.world.KindAt(cell, classOf); };
+  // Player 1's, WITH A PROBE AROUND IT. `KindAtCached` does not report which
+  // arm it took, and "58 page faults" is the shape of report CLAUDE.md rule 6
+  // forbids: the gate therefore reproduces the function's own hit test here and
+  // counts the two arms, so a failure says "still answering from TerrainHeight
+  // at tick 240" rather than "player 1 is in the wrong place".
+  uint64_t hits = 0, misses = 0;
+  auto kind1 = [&](IVec3 cell) {
+    const IVec3 wc{cell.x >> 4, cell.y >> 4, cell.z >> 4};
+    if (c.world.ChunkInWindow(wc)) {
+      const CachedChunk* cc = c.world.Cached(wc);
+      if (cc != nullptr && cc->voxels.size() == kChunkVol)
+        hits++;
+      else
+        misses++;
+    }
+    return c.world.KindAtCached(cell, classOf);
+  };
+
+  // ---- two avatars with DISTINCT mob ids ----------------------------------
+  // 0x5A11ED is baked into every pinned world hash and every gate's expected
+  // gore spread, so session 0 keeps it exactly; session i is + i (P2).
+  PlayerAvatar av0(0x5A11EDU), av1(0x5A11EDU + 1);
+  av0.Init(&c.phys, &c.world, &c.debris, c.mats, &c.mobs);
+  av1.Init(&c.phys, &c.world, &c.debris, c.mats, &c.mobs);
+  av0.SetDefs(&c.mobs.Defs(), kAvatarDefName);
+  av1.SetDefs(&c.mobs.Defs(), kAvatarDefName);
+  if (!av0.HasDef() || !av1.HasDef()) {
+    a.why = std::string("no mob def named \"") + kAvatarDefName + "\"";
+    return;
+  }
+  av0.Spawn(p0, 0.0f);
+  av1.Spawn(p1, 3.14159265f);
+  Mob* avatars[2] = {&av0, &av1};
+  c.mobs.SetAvatars(std::span<Mob* const>(avatars, 2));
+
+  // Two kinematic proxies. `Physics::playerBodies_` is a LIST since P2; with
+  // one entry it was bit-identical to the single handle it replaced, and this
+  // is the first fixture that puts two in it.
+  const uint64_t pb0 = c.phys.CreatePlayerBody(Player::kHalfXZ, Player::kHalfY);
+  const uint64_t pb1 = c.phys.CreatePlayerBody(Player::kHalfXZ, Player::kHalfY);
+
+  // ---- one hostile creature, and it stands next to PLAYER ONE -------------
+  // "crowder" is mobile and hostile and WANTS a target, with no attack intent
+  // and no styles: exactly a targeting fixture, with none of the knife-fight
+  // noise an armed duelist brings (its profile comment in behaviors.json says
+  // so in as many words). Spawned beside player 1 so "the nearer actor" has an
+  // unambiguous answer — the other player is 192 voxels away.
+  int defIndex = -1;
+  for (size_t i = 0; i < c.mobs.Defs().size(); i++) {
+    if (c.mobs.Defs()[i].FindSocket("held_right") < 0) continue;
+    if (defIndex < 0 || c.mobs.Defs()[i].name == "human") defIndex = (int)i;
+  }
+  if (defIndex < 0) {
+    a.why = "no mob def publishes a held_right socket";
+    return;
+  }
+  const int mx = site1.x + 14, mz = site1.z;
+  a.mobId = c.mobs.Spawn(defIndex,
+                         {mx, World::TerrainHeight(mx, mz, kDefaultSeed) + 1, mz});
+  if (a.mobId == 0) {
+    a.why = "Spawn refused for the hostile fixture";
+    return;
+  }
+  if (!c.mobs.SetMobBehavior(a.mobId, "crowder")) {
+    a.why = "no behaviour profile \"crowder\" in assets/mobs/behaviors.json";
+    return;
+  }
+
+  uint32_t cursor1 = 0;   // player 1's prefetch round-robin (PlayerSession's)
+  uint32_t tick = 9000;
+  for (int i = 0; i < kTwoPlayerTicks; i++) {
+    // ---- PHASE A, per player. The prefetch is the one line P3 adds to the
+    // real tick, and it is gated there on `index > 0` — player 0 does not get
+    // one because the mirror follows it.
+    PrefetchChunksAround(c.world, p1.pos, cursor1);
+    const uint64_t hits0 = hits, misses0 = misses;
+    p0.Update(kTickDt, TwoPlayerScript(i, +1), kind0);
+    p1.Update(kTickDt, TwoPlayerScript(i, -1), kind1);
+    if (misses > misses0) a.lastFallbackTick = i;
+    (void)hits0;
+
+    // ---- PHASE H (world): the actor list, then the NPCs. Order copied from
+    // session.cpp — SetPlayerActors publishes the positions mobs.PreTick then
+    // perceives, and an avatar posed before that would be perceived a tick
+    // late.
+    const MobSystem::PlayerActorDesc actors[2] = {
+        {Vec3{p0.pos.x, p0.pos.y, p0.pos.z}, Player::kHalfXZ,
+         2.0f * Player::kHalfY, true},
+        {Vec3{p1.pos.x, p1.pos.y, p1.pos.z}, Player::kHalfXZ,
+         2.0f * Player::kHalfY, true},
+    };
+    c.mobs.SetPlayerActors(std::span<const MobSystem::PlayerActorDesc>(actors, 2));
+
+    std::vector<BrushOp> ops;
+    std::vector<CellOp> cellOps;
+    std::vector<ParticleSpawn> spawns;
+    c.mobs.PreTick(tick + 1, c.world, ops, cellOps, spawns);
+    // ---- PHASE I, per player.
+    av0.PreTick(tick + 1, p0, 0.0f, kTickDt, c.world, ops, cellOps, spawns);
+    av1.PreTick(tick + 1, p1, 3.14159265f, kTickDt, c.world, ops, cellOps,
+                spawns);
+    // ---- PHASE J (world).
+    c.debris.QueueSupportEvents(c.world.Snap());
+    c.debris.PreTick(tick + 1, c.world, cellOps, spawns);
+
+    ++tick;
+    c.phys.MovePlayerBody(pb0, p0.pos, kTickDt);
+    c.phys.MovePlayerBody(pb1, p1.pos, kTickDt);
+    // The mirror is centred on PLAYER 0 — that is the whole asymmetry under
+    // test, and it is the same `playerChunk` phase H hands SubmitTick in the
+    // game. Arithmetic shift, not divide: a window streamed to negative world
+    // coordinates makes `/ 16` round toward zero and name the wrong chunk.
+    const IVec3 pc{ifloor(p0.pos.x) >> 4, ifloor(p0.pos.y) >> 4,
+                   ifloor(p0.pos.z) >> 4};
+    // The hash is read six times per arm rather than 300: it is a blocking
+    // readback, and a divergence does not heal, so a sparse sequence catches
+    // the same failure for a fiftieth of the stalls (CLAUDE.md's budget).
+    const bool wantHash = (i % 60) == 59 || i == kTwoPlayerTicks - 1;
+    SubmitTick(c.ctx, c.world, c.sim, tick, kDefaultSeed, ops, {}, cellOps,
+               wantHash, pc, true, false, spawns);
+    c.ctx.WaitIdle();
+    c.ctx.ProcessEvents();
+    if (wantHash) a.hashes.push_back(ReadHashSync(c.ctx, c.world));
+    c.phys.Step(kTickDt);
+    c.debris.PostStep();
+    c.mobs.PostStep();
+    av0.PostStep();
+    av1.PostStep();
+
+    // ---- THE FALL-THROUGH ASSERTION, every tick. A body caught on the way
+    // down reads perfectly at tick 300, so the worst moment is what is kept.
+    // The bar is player 1's OWN analytic ground minus one voxel: below that it
+    // is inside terrain the fallback claims is solid, which is the failure the
+    // whole package exists to prevent.
+    const int gh = World::TerrainHeight(ifloor(p1.pos.x), ifloor(p1.pos.z),
+                                        c.world.WorldSeed());
+    const float sole = p1.pos.y - Player::kHalfY;
+    const float sink = (float)(gh - 1) - sole;
+    if (sink > 0.0f && sink > a.worstSink) {
+      a.worstSink = sink;
+      if (a.worstSinkTick < 0) a.worstSinkTick = i;
+    }
+  }
+
+  a.end0 = p0.pos;
+  a.end1 = p1.pos;
+  a.fallbacks = misses;
+  a.cacheHits = hits;
+
+  const ai::Brain* br = c.mobs.MobBrain(a.mobId);
+  a.mobBrain = br != nullptr;
+  if (br != nullptr) a.mobTarget = br->hasTarget ? br->targetId : 0;
+  // The band resolves to the RIGHT avatar. Checked separately from the target
+  // id: "the mob named player 1" and "player 1's id resolves to player 1's
+  // body" are two claims, and P2's band only works if both hold.
+  a.combatantOk =
+      c.mobs.FindCombatantById(ai::kPlayerActorBase + 1) == (Mob*)&av1 &&
+      c.mobs.FindCombatantById(ai::kPlayerActorBase + 0) == (Mob*)&av0;
+  const Vec3 mo = c.mobs.MobOrigin(a.mobId);
+  a.mobToP0 = std::sqrt((mo.x - a.end0.x) * (mo.x - a.end0.x) +
+                        (mo.z - a.end0.z) * (mo.z - a.end0.z));
+  a.mobToP1 = std::sqrt((mo.x - a.end1.x) * (mo.x - a.end1.x) +
+                        (mo.z - a.end1.z) * (mo.z - a.end1.z));
+
+  const World::FetchProbe& fp = c.world.Fetches();
+  for (int i = 0; i < World::FetchProbe::kSources; i++) {
+    a.fetchReq += fp.requests[i];
+    a.fetchCoalesced += fp.coalesced[i];
+  }
+
+  // Leave nothing behind: the avatars own limb bodies, the proxies are Jolt
+  // bodies, and the mob list is shared with every later gate.
+  av0.Despawn();
+  av1.Despawn();
+  c.mobs.SetAvatars({});
+  c.mobs.ClearPlayerActors();
+  c.phys.RemoveBody(pb0);
+  c.phys.RemoveBody(pb1);
+  c.debris.Reset();
+  c.mobs.Reset(true);
+  c.mobs.ClearRisings();
+}
+
+Status GateTwoPlayers(Ctx& c, std::string& detail) {
+  const IVec3 savedOrigin = c.world.WindowOrigin();
+  TwoPlayerArm a, b;
+  RunTwoPlayerArm(c, a);
+  if (a.why.empty()) RunTwoPlayerArm(c, b);
+  // Put the window back where the caller had it and regenerate: this gate moved
+  // the origin and regenerated the world twice, and every gate after it in
+  // kOrder assumes worldgen it did not move (selftest.h's ordering note).
+  c.world.SetWindowOrigin(savedOrigin);
+  SubmitWorldgen(c.ctx, c.world, c.sim, kDefaultSeed);
+  c.ctx.WaitIdle();
+  if (!a.why.empty()) {
+    detail = a.why;
+    std::printf("two players: FAIL (%s)\n", detail.c_str());
+    return Status::Fail;
+  }
+
+  // (1) BOTH BODIES WENT SOMEWHERE. Stated first because every assertion below
+  // is vacuously true of two players that never moved — "absolute zero is a
+  // rate claim".
+  const float moved0 =
+      (Vec3{a.end0.x, 0, a.end0.z} - Vec3{a.start0.x, 0, a.start0.z}).len();
+  const float moved1 =
+      (Vec3{a.end1.x, 0, a.end1.z} - Vec3{a.start1.x, 0, a.start1.z}).len();
+  const bool movedOk = moved0 > 10.0f && moved1 > 10.0f;
+
+  // (2) NO FALL-THROUGH, at any tick.
+  const bool sinkOk = a.worstSinkTick < 0;
+
+  // (3) THE CACHE TOOK OVER, and stayed taken over. `lastFallbackTick` is the
+  // last tick that answered from TerrainHeight; it must be early (the fetch is
+  // 1-2 ticks plus kSnapshotLatency, so a handful of ticks is expected) and
+  // there must be real cache reads to have taken over WITH.
+  const int settleBy = (int)BaselineNumber("twoPlayers.fallbackSettledBy", 60);
+  const bool cacheOk =
+      a.cacheHits > 0 && a.lastFallbackTick >= 0 && a.lastFallbackTick < settleBy;
+
+  // (4) THE BAND. The creature stands beside player 1 and names player 1, and
+  // both banded ids resolve to the right avatar.
+  const bool nearer = a.mobToP1 < a.mobToP0;
+  const bool targetOk = a.mobBrain && a.combatantOk && nearer &&
+                        a.mobTarget == ai::kPlayerActorBase + 1;
+
+  // (5) THE TWICE-RUN CONTRACT. Not a pin — a reproduction. Both arms ran the
+  // same 300 ticks from the same worldgen and must agree bit for bit; this is
+  // the only claim in the file whose failure is a stop-and-report bug rather
+  // than a rebaselinable number.
+  const bool detOk = !a.hashes.empty() && a.hashes == b.hashes &&
+                     std::abs(a.end1.x - b.end1.x) == 0.0f &&
+                     std::abs(a.end0.x - b.end0.x) == 0.0f;
+
+  // (6) THE PINS.
+  RecordObserved("twoPlayers.p0EndX", (double)a.end0.x);
+  RecordObserved("twoPlayers.p0EndY", (double)a.end0.y);
+  RecordObserved("twoPlayers.p0EndZ", (double)a.end0.z);
+  RecordObserved("twoPlayers.p1EndX", (double)a.end1.x);
+  RecordObserved("twoPlayers.p1EndY", (double)a.end1.y);
+  RecordObserved("twoPlayers.p1EndZ", (double)a.end1.z);
+  // Informational, recorded so a future failure can say which way the fixture
+  // moved rather than only that it did (CLAUDE.md rule 6).
+  RecordObserved("twoPlayers.lastFallbackTick", (double)a.lastFallbackTick);
+  RecordObserved("twoPlayers.fallbackAnswers", (double)a.fallbacks);
+  RecordObserved("twoPlayers.cacheAnswers", (double)a.cacheHits);
+  RecordObserved("twoPlayers.fetchRequests", (double)a.fetchReq);
+  RecordObserved("twoPlayers.fetchCoalesced", (double)a.fetchCoalesced);
+  const double tol = BaselineNumber("twoPlayers.endTolVox", 0.05);
+  const double pin[6] = {BaselineNumber("twoPlayers.p0EndX", (double)a.end0.x),
+                         BaselineNumber("twoPlayers.p0EndY", (double)a.end0.y),
+                         BaselineNumber("twoPlayers.p0EndZ", (double)a.end0.z),
+                         BaselineNumber("twoPlayers.p1EndX", (double)a.end1.x),
+                         BaselineNumber("twoPlayers.p1EndY", (double)a.end1.y),
+                         BaselineNumber("twoPlayers.p1EndZ", (double)a.end1.z)};
+  const double got[6] = {a.end0.x, a.end0.y, a.end0.z,
+                         a.end1.x, a.end1.y, a.end1.z};
+  bool pinOk = true;
+  for (int i = 0; i < 6; i++)
+    if (std::abs(pin[i] - got[i]) > tol) pinOk = false;
+
+  const bool core = movedOk && sinkOk && cacheOk && targetOk && detOk;
+  if (core && !pinOk) MarkPinnedOnly();
+  const bool ok = core && pinOk;
+  char buf[720];
+  std::snprintf(
+      buf, sizeof buf,
+      "%d ticks x2, %d chunks apart: p0 (%.3f, %.3f, %.3f) moved %.1f | p1 "
+      "(%.3f, %.3f, %.3f) moved %.1f | pin tol %.3f %s | sink worst %.2f vox "
+      "at tick %d | p1 answers %llu cached / %llu analytic, last analytic tick "
+      "%d (want < %d) | fetches %llu req %llu coalesced | mob %llu targets "
+      "%llx (want %llx), d(p1)=%.1f d(p0)=%.1f, band resolves %d | hashes "
+      "%zu %s",
+      kTwoPlayerTicks, kTwoPlayerChunkGap, a.end0.x, a.end0.y, a.end0.z, moved0,
+      a.end1.x, a.end1.y, a.end1.z, moved1, tol, pinOk ? "ok" : "MOVED",
+      a.worstSink, a.worstSinkTick, (unsigned long long)a.cacheHits,
+      (unsigned long long)a.fallbacks, a.lastFallbackTick, settleBy,
+      (unsigned long long)a.fetchReq, (unsigned long long)a.fetchCoalesced,
+      (unsigned long long)a.mobId, (unsigned long long)a.mobTarget,
+      (unsigned long long)(ai::kPlayerActorBase + 1), a.mobToP1, a.mobToP0,
+      a.combatantOk ? 1 : 0, a.hashes.size(),
+      detOk ? "reproduced" : "DIVERGED between the two runs");
+  detail = buf;
+  std::printf("two players: %s (%s)\n", ok ? "PASS" : "FAIL", buf);
+  return ok ? Status::Pass : Status::Fail;
+}
+
 }  // namespace
 
 const std::vector<Gate>& PlayerGates() {
@@ -1115,6 +1595,7 @@ const std::vector<Gate>& PlayerGates() {
       {"player-plants", "player", {}, false, GatePlayerPlants},
       {"player-fastfall", "player", {}, false, GatePlayerFastFall},
       {"tick-input", "player", {}, false, GateTickInput},
+      {"two-players", "player", {}, false, GateTwoPlayers},
   };
   return g;
 }

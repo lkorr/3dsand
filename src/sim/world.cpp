@@ -1011,14 +1011,39 @@ CellKind World::KindAt(IVec3 cell, const std::vector<uint32_t>& classOf) const {
   int lx = cell.x & 15, ly = cell.y & 15, lz = cell.z & 15;
   uint32_t w = snap_.mirror[(size_t)((cz * 3 + cy) * 3 + cx) * kChunkVol +
                             (lz * (int)kChunk + ly) * (int)kChunk + lx];
-  uint32_t mat = w & 0xFFF;
-  if (mat == 0) return CellKind::Air;
-  if (mat >= classOf.size()) return CellKind::Air;
-  switch (classOf[mat]) {
-    case 0: case 1: return CellKind::Solid;  // solid + powder both carry weight
-    case 2: return CellKind::Liquid;
-    default: return CellKind::Gas;
+  // The word -> class arms are World::KindOfWord (world.h). KindAtCached reads
+  // a different store and has to answer identically for the same word; two
+  // copies of this switch is how the two would stop agreeing.
+  return KindOfWord(w, classOf);
+}
+
+// ---- M9.1 P3: the same question, for a body the mirror is not centred on ---
+// world.h carries the whole argument (why the analytic fallback, why fluid is
+// not answered, why this is not const). This is only the three cases.
+CellKind World::KindAtCached(IVec3 cell,
+                             const std::vector<uint32_t>& classOf) {
+  const IVec3 wc{cell.x >> 4, cell.y >> 4, cell.z >> 4};
+  // Outside the residency window: solid and inert. Bit-identical to KindAt's
+  // first test, and the same rule the sim enforces at the window edge.
+  if (!ChunkInWindow(wc)) return CellKind::Solid;
+  const CachedChunk* cc = Cached(wc);
+  // A chunk whose fetch is queued but not landed has an entry with no voxels
+  // in some paths; MobSystem's probe checks the size for the same reason.
+  if (cc != nullptr && cc->voxels.size() == kChunkVol) {
+    const size_t li = (size_t)(((cell.z & 15) * (int)kChunk + (cell.y & 15)) *
+                                   (int)kChunk +
+                               (cell.x & 15));
+    return KindOfWord(cc->voxels[li], classOf);
   }
+  // Miss. Ask for the chunk (coalesced against anything already queued, and
+  // refused outright if it is not resident -- which ChunkInWindow above has
+  // already ruled out) and answer from worldgen's own height contract.
+  RequestChunkFetch(wc, FetchSource::Mob);
+  // `<=` because TerrainHeight names the TOPMOST GROUND VOXEL, not the first
+  // air cell above it: a body standing on pristine terrain has its sole at
+  // h + 1 (the `player-walk` gate asserts exactly that).
+  return cell.y <= TerrainHeight(cell.x, cell.z, WorldSeed()) ? CellKind::Solid
+                                                              : CellKind::Air;
 }
 
 // ---- exact CPU mirror of worldgen.wgsl (integer-only, keep in sync) ----

@@ -283,6 +283,34 @@ struct PresentationSink {
 
 // ---- one player -----------------------------------------------------------
 
+// The body of PlayerSession::PrefetchAround, as a free function over a
+// POSITION and a CURSOR rather than over a session.
+//
+// Split out because the `two-players` gate drives two bare `Player`s and two
+// `PlayerAvatar`s with explicit ids (a PlayerSession's avatar is constructed
+// with the default id and the gate needs 0x5A11ED and 0x5A11ED+1), so it has
+// no PlayerSession to call the member on. A gate that re-implemented the
+// prefetch would be asserting on its own copy of it, which is the "a fixture
+// that measures itself" trap; one definition, two callers.
+inline void PrefetchChunksAround(World& world, Vec3 posVox,
+                                 uint32_t& cursor) {
+  const IVec3 c{ifloor(posVox.x) >> 4, ifloor(posVox.y) >> 4,
+                ifloor(posVox.z) >> 4};
+  const uint32_t refresh = cursor % 27u;
+  cursor++;
+  uint32_t i = 0;
+  for (int dz = -1; dz <= 1; dz++)
+    for (int dy = -1; dy <= 1; dy++)
+      for (int dx = -1; dx <= 1; dx++, i++) {
+        const IVec3 wc{c.x + dx, c.y + dy, c.z + dz};
+        // Already in the cache and not this tick's refresh slot: nothing to
+        // ask for. This is the line that keeps the steady-state cost at ONE
+        // fetch per tick instead of 27 (inviolable rule 2).
+        if (i != refresh && world.Cached(wc) != nullptr) continue;
+        world.RequestChunkFetch(wc, World::FetchSource::Mob);
+      }
+}
+
 struct PlayerSession {
   // ---- who this player is, to the tick ----
   // Index in the span TickAuthority is given. 0 is the PRIMARY: every world
@@ -392,6 +420,36 @@ struct PlayerSession {
   // tick CONSUMES one TickInput.
   TickInputFeeder feeder;
   bool captured = true;  // is the cursor grabbed for this session's window
+
+  // ---- M9.1 P3: KEEPING A NON-PRIMARY PLAYER'S GROUND IN THE CACHE --------
+  //
+  // Only session 0 gets the snapshot's 3x3x3 mirror (the window follows the
+  // primary — see `index` above). Every other session reads the world through
+  // `World::KindAtCached`, which answers from the on-demand chunk cache and
+  // falls back to the analytic terrain column on a miss. The fallback is
+  // correct-ish and cheap-ish, but it is only correct where the world still
+  // looks like worldgen made it, so the cache has to be kept warm AHEAD of the
+  // body rather than filled by the misses the body is already suffering.
+  //
+  // WHY NOT JUST REQUEST ALL 27 EVERY TICK. `World::RequestChunkFetch`
+  // coalesces a chunk that is ALREADY QUEUED, but a chunk that has already
+  // landed is dropped from the queue, so a blind 27-per-tick prefetch costs 27
+  // of the 64-chunk-per-tick fetch budget forever — it would scale with world
+  // residency rather than with activity, which is inviolable rule 2. So:
+  //
+  //   * every chunk of the 3x3x3 cube that is NOT cached is requested (the
+  //     body needs it NOW and the miss path is already paying for it);
+  //   * exactly ONE cached chunk is re-requested per tick, round-robin, so the
+  //     whole cube refreshes every 27 ticks (0.9 s at 30 Hz) and a cell another
+  //     player dug stops being a ghost floor within a second.
+  //
+  // Steady state on flat ground is therefore ONE fetch per tick per non-primary
+  // session, and a session that is standing still costs the same one. The
+  // cursor is per-session state, not a process global (DESIGN.md §10).
+  uint32_t prefetchCursor = 0;
+  void PrefetchAround(World& world) {
+    PrefetchChunksAround(world, player.pos, prefetchCursor);
+  }
 };
 
 // The 'PLYR' save section, built from ONE PLAYER plus the two content

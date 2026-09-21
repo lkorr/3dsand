@@ -366,6 +366,15 @@ static void PhaseA(TickAuthorityCtx& w, WorldScratch& ws,
   SV_OPS_REFS
   SV_PLAYER_REFS
   SV_SEAM_REFS_PLAYER
+  // M9.1 P3, AND IT IS THE WHOLE PACKAGE'S ONE LINE IN THIS FILE. Session 0
+  // reads the world through the snapshot's 3x3x3 mirror, which is centred on
+  // IT (phase H submits with session 0's chunk); every other session reads it
+  // through World::KindAtCached, whose cache this keeps warm one chunk ahead of
+  // the body. Gated on `index > 0` so session 0's tick — and therefore the
+  // one-session op record P1 pinned byte-for-byte — is untouched by
+  // construction: the primary never enters here, so no fetch is queued that
+  // was not queued before and the fetch FIFO's order is unchanged.
+  if (s.index > 0) s.PrefetchAround(w.world);
   {
       // ================= THE PLAYER, ON THE TICK (N2) =====================
       //

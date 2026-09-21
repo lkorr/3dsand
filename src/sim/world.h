@@ -3814,6 +3814,75 @@ class World {
   // bodies move through them while staying ordinary solids everywhere else.
   CellKind KindAt(IVec3 cell, const std::vector<uint32_t>& classOf) const;
 
+  // THE WORD -> COLLISION CLASS MAPPING, in ONE place.
+  //
+  // KindAt and KindAtCached read two different stores (the 3x3x3 snapshot
+  // mirror and the on-demand chunk cache) and must answer identically for the
+  // same voxel word, or a second player's sweeps disagree with the first's
+  // about the same cell. Copying four switch arms was how they would stop
+  // agreeing, so neither owns them.
+  static CellKind KindOfWord(uint32_t word,
+                             const std::vector<uint32_t>& classOf) {
+    const uint32_t mat = word & 0xFFF;
+    if (mat == 0) return CellKind::Air;
+    if (mat >= classOf.size()) return CellKind::Air;
+    switch (classOf[mat]) {
+      case 0: case 1: return CellKind::Solid;  // solid + powder both carry weight
+      case 2: return CellKind::Liquid;
+      default: return CellKind::Gas;
+    }
+  }
+
+  // ---- A COLLISION SOURCE FOR A BODY OUTSIDE THE MIRROR (M9.1 P3) ---------
+  //
+  // KindAt can only answer for the 3x3x3 chunk cube the snapshot mirrors
+  // around ONE player's chunk, and `kWorldN = 512` at `kVoxelMeters = 0.10` is
+  // a 51.2 m residency window: a second player walks out of the first's mirror
+  // in seconds. Every cell then reads Unknown, and Unknown is PASSABLE for the
+  // player controller (player.cpp `Collides` treats it as air on purpose — an
+  // unfetched cell must not become an invisible wall). What stops the body
+  // falling through is `KnownDrop`, which clamps the descent to the last row
+  // the mirror vouches for — so a mirror-less player does not fall through the
+  // world, it HOVERS, indefinitely, wherever it left the cube. (The engine map
+  // said "Unknown mirror cells are SOLID for the player". They are not; the
+  // clamp is upstream of the sweep, not inside it.)
+  //
+  // This is the answer for every body the mirror is not centred on. In order:
+  //
+  //   * outside the residency window -> Solid, the same conservative answer
+  //     KindAt gives and the same rule the sim uses;
+  //   * a chunk in the on-demand fetch cache (World::Cached, the store
+  //     MobSystem's ground probe already walks) -> the REAL voxel, through
+  //     KindOfWord above;
+  //   * a cache miss -> queue the chunk (FetchSource::Mob; the request is
+  //     coalesced if it is already queued) and answer from the ANALYTIC
+  //     column, `TerrainHeight(x, z, WorldSeed())`: Solid at or below the
+  //     ground height, Air above it.
+  //
+  // WHY THE ANALYTIC FALLBACK AND NOT Unknown. Unknown would re-create the
+  // hover: the fetch lands 1-2 ticks plus kSnapshotLatency later, and a walking
+  // body crosses a chunk boundary far more often than that. TerrainHeight is
+  // worldgen's own height contract, so the fallback is the ground the world was
+  // BUILT with — wrong only where the world has since been changed (a dug
+  // tunnel, a collapsed cliff) or where worldgen put something the column does
+  // not describe (a cave roof, an overhang, a ruin floor). Those are exactly
+  // the cells the fetch then corrects, one to two ticks later.
+  //
+  // FLUID IS NOT ANSWERED HERE, deliberately. The game's `kindAt` folds
+  // `FluidEighthsAt(c) >= 2 -> Liquid` in front of KindAt (main.cpp), and
+  // FluidEighthsAt is MIRROR-BOUNDED: it returns 0 for any cell outside the
+  // same 3x3x3 cube, so it already answers "no excited fluid" for a remote
+  // player whether or not this function exists. The CA's own liquid voxels DO
+  // come through, because those are ordinary words in the fetched chunk. What
+  // a remote player cannot see for M9.1 is MLS-MPM fluid in flight, which is
+  // render- and splash-facing, not footing. M9.2's ghost players carry their
+  // own machine's answer across the wire, which is where this stops mattering.
+  //
+  // NOT const: a cache miss enqueues a fetch. ~25 hash3 per missed cell
+  // (TerrainHeight's note), which is why the miss path must stay rare — see
+  // PlayerSession::PrefetchAround, the one call site that keeps it that way.
+  CellKind KindAtCached(IVec3 cell, const std::vector<uint32_t>& classOf);
+
   // THE HEIGHT CONTRACT (DESIGN.md; landColumn in worldgen.wgsl):
   //
   //     World::TerrainHeight(x, z, seed)  ==  genColumn(x, z, seed).h,
