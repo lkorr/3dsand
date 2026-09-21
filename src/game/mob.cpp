@@ -9546,6 +9546,7 @@ void MobSystem::BuildBurnIndex(BurnLimbView& v) {
   }
   // Seed the front from whatever is ALREADY alight — the index can be rebuilt
   // mid-fire (a carve drops it), and losing the front would put the fire out.
+  uint32_t hot = 0;
   for (size_t i = 0; i < n; i++) {
     const uint32_t m = v.Mat(i);
     if (m == 0 || m >= matSelfActive_.size() || !matSelfActive_[m]) continue;
@@ -9553,12 +9554,18 @@ void MobSystem::BuildBurnIndex(BurnLimbView& v) {
     st.front.push_back(
         (uint32_t)(((size_t)(p.z - mn.z) * dims.y + (p.y - mn.y)) * dims.x +
                    (p.x - mn.x)));
+    if (m < matHot_.size() && matHot_[m]) hot++;
   }
   // This sweep is the ONLY authority that may CLEAR `alight`: it is the one
   // place that looks at every voxel of the limb rather than at a candidate set.
   // The flag exists so that the cheap gate in BurnOneLimb keeps rebuilding this
   // index until the sweep says the fire really is out (see BodyBurnState).
   st.alight = !st.front.empty();
+  // ...and the only authority that may clear `hotVox`, for the same reason: it
+  // is the only pass that has looked at every voxel. A limb whose last flame
+  // went out on a tick the candidate rebuild never reached stops reading ON
+  // FIRE here, one index rebuild later, and not before.
+  st.hotVox = hot;
 }
 
 void Mob::ReleaseLimbMicro(MobLimb& limb) {
@@ -11801,12 +11808,14 @@ bool MobSystem::BurnOneLimb(BurnLimbView& v, uint32_t tick, uint32_t rngKey,
   // alight now. Candidates skipped for budget keep their material, so an
   // exhausted budget slows the fire down rather than putting it out.
   st.front.clear();
+  uint32_t hot = 0;
   for (uint32_t c : cand) {
     uint32_t& e = st.idx[c];
     e &= ~kBurnQueued;
     if (e == 0) continue;
     const uint32_t m = v.Mat(e - 1);
     if (m && m < matSelfActive_.size() && matSelfActive_[m]) st.front.push_back(c);
+    if (m && m < matHot_.size() && matHot_[m]) hot++;
   }
   // Only the CANDIDATES were re-tested, so an empty front here does not by
   // itself mean the limb is out — a budget-starved tick or a fire on the far
@@ -11816,6 +11825,16 @@ bool MobSystem::BurnOneLimb(BurnLimbView& v, uint32_t tick, uint32_t rngKey,
   // rebuilt; until then a non-empty front is the only positive evidence there
   // is, and it may only ADD to the flag, never clear it.
   if (!st.front.empty()) st.alight = true;
+  // `hotVox` CAN fall here, where `alight` may not, and the difference is not
+  // an inconsistency. `cand` is a superset of the old front — every front cell
+  // is queued unconditionally above, and the loop that just ran walked ALL of
+  // cand, including the tail an exhausted budget refused to evaluate — so every
+  // voxel that was hot a tick ago was re-read just now. `alight`'s caution is
+  // about cells that were never candidates AT ALL, and a voxel can only become
+  // hot by being written by this pass or by Ignite, both of which put it in the
+  // front. This is the count the health screen reads, and a fire that is out
+  // has to stop saying ON FIRE on the tick it goes out.
+  st.hotVox = hot;
   return changed;
 }
 
@@ -16011,7 +16030,9 @@ uint32_t MobSystem::LimbOpenFaceCount(uint64_t mobId, int limbIndex,
 uint32_t MobSystem::LimbBurningCount(uint64_t mobId, int limbIndex) const {
   for (const Mob& mob : mobs_)
     if (mob.id_ == mobId && limbIndex >= 0 && limbIndex < (int)mob.limbs_.size())
-      return (uint32_t)mob.limbs_[limbIndex].burn.front.size();
+      // hotVox, NOT front.size(): the front is every self-reacting voxel, and
+      // drying blood and crumbling char are on it (see BodyBurnState::hotVox).
+      return mob.limbs_[limbIndex].burn.hotVox;
   return 0;
 }
 

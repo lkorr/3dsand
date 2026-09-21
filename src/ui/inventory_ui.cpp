@@ -1910,39 +1910,63 @@ void VitalsColumn(UIState& s, ImVec2 at, ImVec2 size) {
   // below. That is the whole navigation model of this column.
   y = ui::Subheading(dl, ImVec2(base.x, y), w, "TRIAGE") + 4;
   {
-    struct Alarm { int slot; int sev; ImU32 col; char text[40]; };
-    Alarm alarms[UIState::kSlotCount * 3];
-    int na = 0;
-    auto push = [&](int slot, int sev, ImU32 col, const char* fmt, ...) {
-      if (na >= (int)(sizeof alarms / sizeof alarms[0])) return;
-      Alarm& a = alarms[na++];
-      a.slot = slot;
-      a.sev = sev;
-      a.col = col;
+    // ONE ROW PER LIMB, AND THE ROW IS A LIST.
+    //
+    // This pushed one row per (limb, effect) PAIR and sorted the whole lot by
+    // severity, so a burning, bleeding, critical arm appeared three separate
+    // times — its name repeated down the column, its three lines split apart by
+    // other limbs' rows, and no single place in the readout that answered "what
+    // is wrong with my arm". The limb is the SUBJECT and the effects are its
+    // predicate; sorting symptoms shredded the subject. Now each limb appears
+    // once, carrying every effect on it, and the LIMBS are what the severity
+    // sort orders — by the worst thing on each.
+    struct Effect { int sev; ImU32 col; char text[28]; };
+    struct Row { int slot; int sev; int n; Effect eff[6]; };
+    Row rows[UIState::kSlotCount];
+    int nr = 0;
+    auto add = [&](Row& r, int sev, ImU32 col, const char* fmt, ...) {
+      if (r.n >= (int)(sizeof r.eff / sizeof r.eff[0])) return;
+      Effect& e = r.eff[r.n++];
+      e.sev = sev;
+      e.col = col;
       va_list ap;
       va_start(ap, fmt);
-      std::vsnprintf(a.text, sizeof a.text, fmt, ap);
+      std::vsnprintf(e.text, sizeof e.text, fmt, ap);
       va_end(ap);
+      if (sev < r.sev) r.sev = sev;
     };
     for (int i = 0; i < UIState::kSlotCount; i++) {
       const UIState::BodyPartUI& b = s.body[i];
       if (!b.present) continue;
-      if (b.severed) { push(i, 0, ui::ColBloodHi(), "SEVERED"); continue; }
-      if (b.burningVoxels > 0)
-        push(i, 1, ui::ColEmber(), "BURNING %u", b.burningVoxels);
-      if (b.bleeding) push(i, 2, ui::ColBloodHi(), "BLEEDING");
-      if (b.hpFrac < 0.35f)
-        push(i, 3, ui::ColBloodHi(), "CRITICAL  %.0f%% hp", b.hpFrac * 100.0f);
-      else if (b.hpFrac < 0.8f)
-        push(i, 5, ui::ColBlood(), "hurt  %.0f%% hp", b.hpFrac * 100.0f);
-      if (b.voxelFrac < 0.6f)
-        push(i, 4, ui::ColSteel(), "HOLLOW  %.0f%% left", b.voxelFrac * 100.0f);
-      if (b.charredFrac > 0.25f)
-        push(i, 6, ui::ColEmber(), "charred  %.0f%%", b.charredFrac * 100.0f);
+      Row& r = rows[nr];
+      r.slot = i;
+      r.sev = 99;
+      r.n = 0;
+      // Severity is the ORDER WITHIN the row as well as the row's own rank, so
+      // the first words on a line are always the worst news about that limb.
+      if (b.severed) {
+        add(r, 0, ui::ColBloodHi(), "SEVERED");
+      } else {
+        if (b.burningVoxels > 0)
+          add(r, 1, ui::ColEmber(), "BURNING %u", b.burningVoxels);
+        if (b.bleeding) add(r, 2, ui::ColBloodHi(), "BLEEDING");
+        if (b.hpFrac < 0.35f)
+          add(r, 3, ui::ColBloodHi(), "CRITICAL %.0f%%", b.hpFrac * 100.0f);
+        else if (b.hpFrac < 0.8f)
+          add(r, 5, ui::ColBlood(), "hurt %.0f%%", b.hpFrac * 100.0f);
+        if (b.voxelFrac < 0.6f)
+          add(r, 4, ui::ColSteel(), "HOLLOW %.0f%%", b.voxelFrac * 100.0f);
+        if (b.charredFrac > 0.25f)
+          add(r, 6, ui::ColEmber(), "charred %.0f%%", b.charredFrac * 100.0f);
+      }
+      if (r.n == 0) continue;  // nothing to report: the portrait says it is there
+      std::stable_sort(r.eff, r.eff + r.n,
+                       [](const Effect& a, const Effect& b) { return a.sev < b.sev; });
+      nr++;
     }
-    std::stable_sort(alarms, alarms + na,
-                     [](const Alarm& a, const Alarm& b) { return a.sev < b.sev; });
-    if (na == 0) {
+    std::stable_sort(rows, rows + nr,
+                     [](const Row& a, const Row& b) { return a.sev < b.sev; });
+    if (nr == 0) {
       small(Fade(ui::ColParchDim(), 0.85f), ImVec2(base.x + 4, y),
             s.bodyValid ? "Not a scratch." : "No body to inspect.");
       ImGui::PushFont(ui::FontSmall());
@@ -1950,29 +1974,74 @@ void VitalsColumn(UIState& s, ImVec2 at, ImVec2 size) {
       ImGui::PopFont();
     }
     ImGui::PushFont(ui::FontSmall());
-    const float rowH = ImGui::GetTextLineHeight() + 4;
-    for (int i = 0; i < na; i++) {
-      const Alarm& a = alarms[i];
-      const bool sel = s.inspectSelected == a.slot;
+    const float lineH = ImGui::GetTextLineHeight();
+    // The separator is DRAWN, not typed: the 13 px pixel face has no middle
+    // dot, and a fallback box between every effect is exactly the row of
+    // hieroglyphs the tissue table above already had to be rid of once.
+    const float sepW = 9.0f;
+    // The name column, sized to the longest name actually being shown and
+    // capped so a long label cannot squeeze the effects into one word a line.
+    float labelW = 0.0f;
+    for (int i = 0; i < nr; i++)
+      labelW = std::max(labelW, ImGui::CalcTextSize(s.body[rows[i].slot].label).x);
+    labelW = std::min(labelW, w * 0.42f);
+    const float tx0 = base.x + 9 + labelW + 8;
+    const float right = base.x + w - 4;
+    // Flow the effects left to right and wrap onto a continuation line that
+    // hangs under the first one, never back under the name: the indent is what
+    // keeps a three-line limb reading as one entry.
+    auto flow = [&](const Row& r, float top, ImDrawList* out) {
+      float cx = tx0, cy = top;
+      for (int k = 0; k < r.n; k++) {
+        const float tw = ImGui::CalcTextSize(r.eff[k].text).x;
+        const float lead = k ? sepW : 0.0f;
+        if (cx > tx0 && cx + lead + tw > right) {
+          cx = tx0;
+          cy += lineH;
+        } else if (k) {
+          if (out) {
+            const float dy = std::floor(cy + lineH * 0.5f) - 1.0f;
+            out->AddRectFilled(ImVec2(cx + 3.0f, dy), ImVec2(cx + 5.0f, dy + 2.0f),
+                               Fade(ui::ColParchDim(), 0.55f));
+          }
+          cx += sepW;
+        }
+        if (out) {
+          const ImU32 c = r.eff[k].sev <= 2
+                              ? Fade(r.eff[k].col, 0.55f + 0.45f * pulse)
+                              : r.eff[k].col;
+          ui::ShadowText(out, ImVec2(cx, cy), c, r.eff[k].text);
+        }
+        cx += tw;
+      }
+      return cy - top + lineH;
+    };
+    for (int i = 0; i < nr; i++) {
+      const Row& r = rows[i];
+      const UIState::BodyPartUI& b = s.body[r.slot];
+      const float rowH = flow(r, y + 2, nullptr) + 4;
       ImGui::SetCursorScreenPos(ImVec2(base.x, y));
       ImGui::PushID(6000 + i);
       ImGui::InvisibleButton("##alarm", ImVec2(w, rowH));
-      const bool hot = ImGui::IsItemHovered();
-      if (ImGui::IsItemClicked()) s.inspectSelected = a.slot;
+      const bool sel = s.inspectSelected == r.slot;
+      const bool hover = ImGui::IsItemHovered();
+      if (ImGui::IsItemClicked()) s.inspectSelected = r.slot;
       ImGui::PopID();
-      if (sel || hot)
+      if (sel || hover)
         dl->AddRectFilled(ImVec2(base.x, y), ImVec2(base.x + w, y + rowH),
                           Fade(ui::ColGold(), sel ? 0.16f : 0.08f));
       // A 3 px severity stripe down the left edge: the column can be read for
-      // "how bad is this body" without reading a word of it.
+      // "how bad is this body" without reading a word of it. It runs the WHOLE
+      // row, so a limb with three effects reads as one taller alarm.
+      const ImU32 sc = r.eff[0].col;
       dl->AddRectFilled(ImVec2(base.x, y), ImVec2(base.x + 3, y + rowH),
-                        a.sev <= 2 ? Fade(a.col, 0.55f + 0.45f * pulse)
-                                   : Fade(a.col, 0.75f));
+                        r.sev <= 2 ? Fade(sc, 0.55f + 0.45f * pulse)
+                                   : Fade(sc, 0.75f));
+      dl->PushClipRect(ImVec2(base.x + 9, y), ImVec2(tx0 - 4, y + rowH), true);
       ui::ShadowText(dl, ImVec2(base.x + 9, y + 2),
-                     sel ? ui::ColGoldHi() : ui::ColParch(),
-                     s.body[a.slot].label);
-      const ImVec2 ts = ImGui::CalcTextSize(a.text);
-      ui::ShadowText(dl, ImVec2(base.x + w - ts.x - 4, y + 2), a.col, a.text);
+                     sel ? ui::ColGoldHi() : ui::ColParch(), b.label);
+      dl->PopClipRect();
+      flow(r, y + 2, dl);
       y += rowH;
     }
     ImGui::PopFont();

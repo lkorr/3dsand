@@ -160,11 +160,14 @@ class PlayerAvatar : public Mob {
   // Set fire to up to `count` of a part's surface voxels; returns how many
   // took. Thin wrapper over Mob::Ignite, kept for API stability.
   uint32_t IgnitePart(int partIndex, uint32_t count, uint32_t onlyMat = 0);
-  // Voxels of `part` currently alight, for the burn gate and the debug overlay.
+  // Voxels of `part` currently ON FIRE, for the burn gate, the debug overlay
+  // and the health screen. The burn FRONT is a wider set — every voxel with a
+  // self decay/emit rule, which includes drying blood and crumbling char — and
+  // reporting it here is what made a charred, long-extinguished limb read
+  // BURNING for the rest of the session. See BodyBurnState::hotVox.
   uint32_t PartBurningCount(int part) const {
-    return part >= 0 && part < (int)limbs_.size()
-               ? (uint32_t)limbs_[part].burn.front.size()
-               : 0u;
+    return part >= 0 && part < (int)limbs_.size() ? limbs_[part].burn.hotVox
+                                                  : 0u;
   }
   uint32_t PartMaterialCount(int part, uint32_t mat) const;
   // Cells in a part's dense burn index; 0 = the index does not exist, i.e.

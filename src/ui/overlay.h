@@ -570,7 +570,12 @@ struct UIState {
     // all — the answer was already in the voxels.
     float voxelFrac = 1.0f;      // live voxels / voxels at spawn
     float charredFrac = 0.0f;    // share of the limb cooked/charred through
-    uint32_t burningVoxels = 0;  // voxels alight RIGHT NOW
+    // Voxels whose material is tagged `hot` RIGHT NOW, and specifically NOT
+    // the size of the limb's burn front: the front carries every voxel with a
+    // self-reaction, which includes drying blood and crumbling char, and
+    // reporting that as "burning" left a limb reading ON FIRE long after the
+    // fire was out. See BodyBurnState::hotVox in game/mob.h.
+    uint32_t burningVoxels = 0;
     // ---- WHAT IS ON THE OUTSIDE OF IT (docs/PLAN_body_coat.md) -----------
     // The coat ledger's verdict for this limb (game/mob.h LimbCoat): how
     // soaked it is, and by what. A different question again from hpFrac /

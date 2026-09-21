@@ -689,6 +689,21 @@ struct BodyBurnState {
   // character left permanently coated in flame that has nothing left to burn.
   bool alight = false;
   bool Burning() const { return !front.empty() || alight; }
+  // ON FIRE, which is NARROWER than `front`. The front is every voxel whose
+  // material carries a self decay/emit rule, and fire is only one of the things
+  // that puts a voxel there: blood dries, charred flesh crumbles, cooked flesh
+  // rots, ice melts. So `front.size()` is "how much of this limb is chemically
+  // busy", and reporting it as "burning" is what left a bled-on, long since
+  // extinguished limb reading BURNING forever in the health screen. This is the
+  // subset whose material is tagged `hot` — the voxels that are actually
+  // alight. Recomputed wherever `front` is (the full sweep in BuildBurnIndex is
+  // the exact authority; BurnOneLimb's candidate rebuild is as approximate as
+  // `front` itself is there), and it SURVIVES DropBurnIndex for the reason
+  // `alight` does: it is a fact about the lattice, not an index into it, and a
+  // burning limb carves constantly, so a count that reset on every drop would
+  // flicker the alarm off and on for the whole fire.
+  uint32_t hotVox = 0;
+  bool OnFire() const { return hotVox > 0; }
 };
 
 // One limb or part, described in the terms the burn pass needs.
