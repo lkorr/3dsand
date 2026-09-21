@@ -16849,6 +16849,12 @@ void MobSystem::RefreshOwnership() {
   if (!ownershipFn_) return;
   for (Mob& m : mobs_) {
     if (m.def_ == nullptr) continue;
+    // A CREATURE I HAVE NEVER HELD IS NOT MINE TO CLAIM (mob.h's note on
+    // `announceOnly_`). The announce carries no record, so promoting it here
+    // would step a pristine copy of a creature the peer is also stepping --
+    // measured as 187 + 157 poses for the same three humans with zero
+    // handoffs between them.
+    if (m.announceOnly_) continue;
     // THE FEET, not the origin corner and not the centre: net::Authority keys
     // an entity on the chunk it stands in, and a tall creature's centre is up
     // to a chunk above the ground it is standing on.
@@ -17024,6 +17030,17 @@ bool MobSystem::ApplyPose(const ::net::MobPose& p) {
   // earlier tick would rewind the body. `haveGhostPose_` guards the first one,
   // whose tick may legitimately be anything.
   if (m->haveGhostPose_ && p.tick < m->ghostPose_.tick) return false;
+  // ---- THE FIRST POSE ALSO PLACES IT, before any tick runs (M9.4-E) -------
+  //
+  // Latching alone would leave `origin_` where `ApplyAnnounce` had to put a
+  // ghost it was given no position for — the world origin. `TickGhost` fixes
+  // that inside the NEXT PreTick, but `MobSystem::RefreshOwnership` and
+  // `EntitySync`'s interest scan both read the feet at the TOP of that same
+  // tick, so for one tick a creature standing in the peer's window would look
+  // like a creature standing at (0,0,0): outside every window, `kNoAuthority`,
+  // and (by MobOwner's fallback) mine to step. Placing the origin the instant
+  // the first pose arrives closes that window without moving a limb.
+  if (!m->haveGhostPose_) m->origin_ = p.origin;
   m->ghostPose_ = p;
   m->haveGhostPose_ = true;
   return true;
@@ -17060,6 +17077,131 @@ bool MobSystem::TakeHandoff(uint64_t mobId, uint32_t newOwner,
   m->owner_ = newOwner;
   if (BuildPose(mobId, tick_, m->ghostPose_)) m->haveGhostPose_ = true;
   return true;
+}
+
+// ---- dressing a creature from the wire, in ONE place ------------------------
+//
+// Both spawn paths (`ApplyAnnounce`, `ApplyHandoff`) call exactly this, in the
+// list's own order. `WearItem` already takes off whatever was in the slot
+// first, so replaying a list onto a creature that is already wearing it is a
+// swap rather than a duplicate — which is what makes the "gear changed" branch
+// of `ApplyAnnounce` a re-run of this function and not a second teardown path.
+//
+// A retired item is SKIPPED, not an error: the creature arrives without it and
+// the far side keeps drawing, which is the same answer `ApplyHandoff` has
+// always given and the same one a save load gives a retired def.
+void MobSystem::ApplyWireGear(Mob& m, const std::vector<::net::WireGear>& gear) {
+  if (items_ == nullptr) return;
+  for (const ::net::WireGear& g : gear) {
+    const ItemDef* item = items_->At(items_->Find(g.item));
+    if (item == nullptr) continue;   // retired item: it arrives without it
+    if (g.held)
+      m.EquipItem(item);
+    else
+      m.WearItem(item, g.equipSlot, g.damage.Empty() ? nullptr : &g.damage,
+                 g.dye);
+  }
+}
+
+// ---- A CREATURE THE PEER HAS ALWAYS OWNED (M9.4-E) --------------------------
+//
+// The gap M9.4-D reported: only `ApplyHandoff` spawned, and it spawns a LOCAL
+// mob, so a creature the peer never gave away had nothing on this machine to
+// address. The long argument is on the declaration (mob.h); what is here is
+// the mechanism and its three refusals.
+Mob* MobSystem::ApplyAnnounce(const ::net::MobAnnounce& a) {
+  if (a.id == 0) return nullptr;
+  // AN ANNOUNCE NAMING ME IS A DISAGREEMENT, not an instruction. Spawning a
+  // creature I would then have to STEP out of a record that carries no rig
+  // state, no wound and no position would be a duelist standing at the world
+  // origin with full health, authoring ops — the exact duplication ownership
+  // exists to prevent. `ApplyPose` refuses the mirror case for the same
+  // reason and leaves the disagreement to be counted, not papered over.
+  if (a.owner == localPlayerId_) return nullptr;
+
+  if (Mob* have = FindMobById(a.id)) {
+    // Already here. A re-announce is the peer restating the shape (it left my
+    // interest set and came back), and the only thing in it that can have
+    // CHANGED is the gear — the def cannot, and the pose stream owns
+    // everything else.
+    if (!have->IsGhost()) return nullptr;   // mine; see above
+    // Only when it actually differs. Re-wearing appends fresh rig slots and
+    // the pose stream indexes limbs BY SLOT, so a needless re-dress would
+    // renumber the rig under a stream built against the old numbering — one
+    // tick of limbs landing on the wrong limb, every time the peer re-sent an
+    // announce it did not have to.
+    ::net::MobAnnounce now{};
+    bool same = BuildAnnounce(a.id, now) && now.gear.size() == a.gear.size();
+    for (size_t k = 0; k < a.gear.size() && same; k++)
+      same = now.gear[k].item == a.gear[k].item &&
+             now.gear[k].equipSlot == a.gear[k].equipSlot &&
+             now.gear[k].held == a.gear[k].held &&
+             now.gear[k].dye == a.gear[k].dye;
+    if (!same) {
+      ApplyWireGear(*have, a.gear);
+      instancesDirty_ = true;
+    }
+    // NOT re-pinned: an id we hold may have arrived by HANDOFF, in which case
+    // the record is here and the ownership function is entitled to it. Only a
+    // creature born from an announce carries the pin.
+    have->owner_ = a.owner;   // it may have changed hands between two peers
+    return have;
+  }
+
+  const int defIndex = FindOrComposeDef(a.defName);
+  if (defIndex < 0) {
+    std::printf("mob: announced def '%s' does not exist here\n",
+                a.defName.c_str());
+    return nullptr;
+  }
+  uint64_t spawned = 0;
+  {
+    // `loading_`, for LoadOne's reason turned around: a ghost must NOT be
+    // rotted at spawn. Spawn-time rot (MobRotDef) is a carve keyed on the mob
+    // id, and the owner's copy already rotted on ITS machine — rotting here
+    // too would give the two machines two different bodies for one creature,
+    // and the first `MobHandoff` would overlay the owner's lattice on top of
+    // ours anyway. The ghost is a shape to pose, and its damage arrives with
+    // the record that makes it ours.
+    struct LoadGuard {
+      bool& f;
+      explicit LoadGuard(bool& b) : f(b) { f = true; }
+      ~LoadGuard() { f = false; }
+    } loadGuard(loading_);
+    // AT THE ORIGIN, UNPLACED. The announce carries no position (mobsync.h:
+    // the pose is the only record that repeats, and widening the announce to
+    // carry one would duplicate a fact the very next record states). The pose
+    // in the same batch places it, `TickGhost` returns early until then, and
+    // a creature standing still at (0,0,0) for one tick is a better answer
+    // than a creature standing at a guess.
+    spawned = Spawn(defIndex, IVec3{0, 0, 0});
+  }
+  if (spawned == 0) {
+    std::printf("mob: could not spawn announced '%s'\n", a.defName.c_str());
+    return nullptr;
+  }
+  Mob* m = &mobs_.back();
+  // THE SENDER'S ID WINS, exactly as it does for a handoff: it is the key
+  // every later MobPose, MobHandoff and MobGone is addressed to, and the id
+  // bands (SetIdBand) are what make adopting it safe.
+  m->id_ = a.id;
+  m->gore_ = Mob::MakeGoreProfile(m->id_);
+  // ---- AND IT IS A GHOST BEFORE ANYTHING CAN STEP IT ---------------------
+  //
+  // Set here rather than being left to `RefreshOwnership`: the ownership
+  // function reads the creature's FEET, and an unposed ghost's feet are at
+  // the world origin, which is not where it is. One PreTick with the wrong
+  // answer is one PreTick of AI, locomotion and blood ops authored for a
+  // creature the peer is also stepping.
+  m->owner_ = a.owner;
+  m->haveGhostPose_ = false;
+  // ...and PINNED there until a handoff arrives (mob.h).
+  m->announceOnly_ = true;
+  ApplyWireGear(*m, a.gear);
+  instancesDirty_ = true;
+  // BY ID, not the pointer above: dressing appends rig slots and can, on a
+  // creature with no room for a piece, re-enter this system.
+  return FindMobById(a.id);
 }
 
 Mob* MobSystem::ApplyHandoff(const ::net::MobHandoff& h) {
@@ -17141,17 +17283,7 @@ Mob* MobSystem::ApplyHandoff(const ::net::MobHandoff& h) {
     // ORDER (BuildAnnounce sorts it), so replaying it appends the same slots
     // in the same places and limb index i means the same limb on both
     // machines.
-    if (items_ != nullptr) {
-      for (const ::net::WireGear& g : h.announce.gear) {
-        const ItemDef* item = items_->At(items_->Find(g.item));
-        if (item == nullptr) continue;   // retired item: it arrives without it
-        if (g.held)
-          m->EquipItem(item);
-        else
-          m->WearItem(item, g.equipSlot,
-                      g.damage.Empty() ? nullptr : &g.damage, g.dye);
-      }
-    }
+    ApplyWireGear(*m, h.announce.gear);
   }
   // PLACED, not just overlaid (the `true`): a handed-over creature arrives
   // standing exactly where it was, down to each limb's transform, so the
@@ -17167,6 +17299,9 @@ Mob* MobSystem::ApplyHandoff(const ::net::MobHandoff& h) {
 
   // ---- IT IS MINE NOW -----------------------------------------------------
   m->owner_ = localPlayerId_;
+  // The record has arrived, so the ownership function may have it back: this
+  // creature is no longer a shape somebody described to us (mob.h).
+  m->announceOnly_ = false;
   m->haveGhostPose_ = false;
   m->ghostPose_ = ::net::MobPose{};
 

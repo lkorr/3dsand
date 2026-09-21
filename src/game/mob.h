@@ -3167,6 +3167,30 @@ class Mob {
   // (0,0,0) for two frames is a worse answer than one that stands still.
   ::net::MobPose ghostPose_;
   bool haveGhostPose_ = false;
+  // ---- A CREATURE THIS MACHINE HAS NEVER HELD (M9.4-E) --------------------
+  //
+  // Set by `MobSystem::ApplyAnnounce`, cleared by `ApplyHandoff`. While it is
+  // set, `RefreshOwnership` leaves `owner_` ALONE: the ownership function may
+  // not promote this creature to local, and only an explicit `MobHandoff` --
+  // which carries the record -- can.
+  //
+  // WHY, MEASURED. An announce carries the SHAPE and nothing else: no wounds,
+  // no carve state, no brain, no target. Before this flag, a ghost spawned
+  // from an announce was an ordinary ghost, so the derived authority promoted
+  // it the first tick this machine's player was nearer -- and the two-process
+  // smoke of 2026-09-21 then showed the host posing those three humans for
+  // 187 ticks (`handoffs out=0`: its own authority had never flipped) while
+  // the client posed the same three for 157. Both machines stepping one
+  // creature is the single-producer rule broken in the open, and the client's
+  // copy was a PRISTINE one -- it had never been told what the creature's
+  // wounds were.
+  //
+  // The handoff is what makes a creature you have never held yours, because
+  // the handoff is the only record that says what it IS. Until it arrives the
+  // safe answer is "the peer's", and a ghost held one extra beat costs a
+  // creature that is drawn but not stepped -- which is exactly what a ghost is
+  // for.
+  bool announceOnly_ = false;
   // ONE tick of a creature somebody else owns: place the limbs where the
   // owner says they are and stop. The fourth branch of PreTick's loop, beside
   // Limp / GetUp / live.
@@ -4143,10 +4167,44 @@ class MobSystem {
   // rig, bricks and Jolt bodies are kept — a handoff must not flicker); an id
   // I have never seen is spawned from the record. Returns the live mob.
   Mob* ApplyHandoff(const ::net::MobHandoff& h);
+  // A CREATURE THE PEER HAS ALWAYS OWNED (M9.4-E).
+  //
+  // `ApplyHandoff` is the only other thing that spawns, and it spawns a mob
+  // this machine then OWNS — so before this existed the only creature a peer
+  // could show you was one it had given away. Everything it merely kept was a
+  // stream of poses addressed to an id nobody held: the two-process smoke
+  // counted 144 refused poses (`misses=144`) for exactly that.
+  //
+  // What an announce carries is the SHAPE — a def name and the gear by name —
+  // and deliberately not a position, not a rig state and not a wound: the
+  // pose that follows it in the SAME batch (net::EntitySync's field order is
+  // the apply order) is what places it, and a `MobHandoff` is what later
+  // fills in the damage if the creature ever changes hands. So the ghost is
+  // born at the origin, unplaced and unposed, and `TickGhost` leaves it
+  // exactly there until the first `ApplyPose` lands.
+  //
+  // IT IS A GHOST FROM BIRTH: `owner_` is the announce's owner, so `IsGhost()`
+  // is true before the first PreTick can look at it and no AI step, no
+  // locomotion and above all no op is ever authored for a creature this
+  // machine does not own. An announce naming ME as the owner is REFUSED
+  // (null) rather than spawning a local mob out of a message that carries no
+  // state to step — the same disagreement `ApplyPose` refuses.
+  //
+  // An id I already hold re-applies the GEAR and nothing else (the ghost is
+  // already there and re-spawning it would flicker the body); an id I hold
+  // and OWN is refused.
+  Mob* ApplyAnnounce(const ::net::MobAnnounce& a);
   // The owner says it is over. Drops the ghost and releases its rig; a mob I
   // own is NOT removed by this (the owner of a creature is the only one who
   // may kill it) and the call reports false.
   bool ApplyGone(const ::net::MobGone& g);
+  // DRESS A CREATURE FROM AN ANNOUNCE'S GEAR LIST, by name, through the
+  // ordinary WearItem/EquipItem. Factored out because `ApplyHandoff` and
+  // `ApplyAnnounce` must dress identically — the announce lists gear in
+  // RIG-SLOT ORDER (BuildAnnounce sorts it) precisely so that replaying it
+  // appends the same slots in the same places on both machines, and two
+  // copies of that replay would be two chances to get the order wrong.
+  void ApplyWireGear(Mob& m, const std::vector<::net::WireGear>& gear);
 
   // ---- sever events -------------------------------------------------------
   // One entry per limb that came off, reported rather than voiced here: this

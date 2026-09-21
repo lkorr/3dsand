@@ -371,11 +371,31 @@ class DebrisSystem {
   // WHO OWNS A BODY AT THIS POSITION (net::EntityAuthority over the peer list,
   // wired by M9.4-D). Null = every body is mine, which is today's behaviour.
   //
-  // Asked per body per tick from PreTick, with the body's own position. It
-  // must be a PURE function of the peer views both machines hold, or the two
-  // would disagree about who is stepping what -- M9.4-A's hysteresis is what
-  // keeps a body straddling a chunk edge from flapping between them.
+  // Asked per body per tick from PreTick, with the body's GLOBAL ID and its
+  // own position. It must be a PURE function of the peer views both machines
+  // hold, or the two would disagree about who is stepping what -- M9.4-A's
+  // hysteresis is what keeps a body straddling a chunk edge from flapping
+  // between them.
+  //
+  // THE ID IS THERE SO THE HYSTERESIS CAN BE KEYED ON THE BODY (M9.4-E).
+  // M9.4-C passed a position and nothing else, which left `net::EntitySync`
+  // no choice but to key its incumbent table on the CHUNK -- and a chunk-keyed
+  // memory is one incumbent shared by every body in the chunk, so a sword
+  // jittering across a boundary re-homed the crate beside it as well. The id
+  // is `(ownerAtCreate << 48) | serial` (net::MakeGlobalBodyId), the same
+  // identity every wire record for the body carries, and it is stable across
+  // a handoff.
+  void SetOwnershipFn(std::function<uint32_t(uint64_t globalBodyId,
+                                             Vec3 posVoxel)> fn);
+  // POSITION-ONLY, for a caller that has no use for the identity. Kept as its
+  // own overload rather than making everybody write an ignored parameter: a
+  // "put everything back on this machine" binding (main.cpp's disconnect path)
+  // genuinely does not care which body it is being asked about.
   void SetOwnershipFn(std::function<uint32_t(Vec3 posVoxel)> fn);
+  // ...and the null case, which is a NAMED call because `nullptr` would be
+  // ambiguous between the two overloads above. Single player, and every gate
+  // but `debris-ghost`, ends here.
+  void ClearOwnershipFn();
 
   // WHO OWNS A CHUNK (net::ChunkAuthority). Null = every chunk is mine.
   //
@@ -1697,7 +1717,7 @@ class DebrisSystem {
   // All defaulted so that a process that never calls the setters behaves
   // exactly as it did before this landed: one player, id 0, owning everything.
   uint32_t localPlayerId_ = kLocalOwner;
-  std::function<uint32_t(Vec3 posVoxel)> ownershipFn_;
+  std::function<uint32_t(uint64_t globalBodyId, Vec3 posVoxel)> ownershipFn_;
   std::function<bool(IVec3 wc)> chunkOwnedFn_;
   std::function<bool(uint64_t, std::string&, uint32_t&, uint32_t&)> itemLookupFn_;
   std::function<bool(uint64_t)> itemTakeFn_;
