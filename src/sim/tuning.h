@@ -785,7 +785,7 @@ struct Tuning {
   struct Ragdoll {
     // Continuous freefall before a creature goes limp mid-air. NPCs fall under
     // the same gravity as the player since this landed (they used to hang).
-    float fallSeconds = 3.0f;
+    float fallSeconds = 1.5f;
     // A blast within radius * blastRadiusScale of a body launches it. The
     // impulse at the centre is power * blastImpulseScale (kg*m/s), falling
     // off linearly to zero at that reach; launch speed is impulse / body mass,

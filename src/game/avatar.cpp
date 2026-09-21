@@ -1386,9 +1386,10 @@ void PlayerAvatar::UpdateAnimation(float dt, World& world, bool grounded,
 
   AnimSampleAndBlend(sk, st, dt);
 
-  // pelvis bob / sway / spine counter-rotation, suppressed while an authored
-  // clip owns the pose (a crawl keys the same limbs_ these drive)
-  if (g.present && !clipOwnsPose && def_->rootLimb >= 0 &&
+  // pelvis bob / sway / spine counter-rotation, suppressed while airborne
+  // (the sway is a walk rhythm and has no meaning in the air) or while an
+  // authored clip owns the pose (a crawl keys the same limbs_ these drive)
+  if (g.present && !clipOwnsPose && grounded && def_->rootLimb >= 0 &&
       def_->rootLimb < (int)sk.parts.size()) {
     Transform& root = st.local[def_->rootLimb];
     root.pos.y += g.bobAmp * std::sin(g.bobFreqMul * 6.2831853f * st.gaitPhase) *

@@ -197,7 +197,7 @@
     "sphereAngularDamping": 0.05
   },
   "ragdoll": {
-    "fallSeconds": 3,
+    "fallSeconds": 1.5,
     "blastRadiusScale": 3,
     "blastImpulseScale": 1,
     "blastMinSpeed": 1.5,
