@@ -371,6 +371,8 @@ in `kOrder` — confirm placement).
 
 ### M9.2 — transport, handshake, tick pacing, ghost players (packages A, B, C)
 
+> **LANDED 2026-09-21** (A `8c6fc64`, B `01042b3`, C `2742172`; on main via `7aed7c7`). Smoke: 272/276 paced ticks, late = 0, max lag 8 = 2D. Two corrections: the actor list is phase H (not B); `crouchKneeDrop`/`fallDamageSpeed` are tuning, not player fields. A cold client's 30-50 s pipeline compile after the handshake and a standing host's frame budget were the smoke's real enemies (see the memory note's recipe).
+
 ```
 Wave 1 (parallel, disjoint files)
   A  net::Link + protocol + handshake + pacer    src/net/*, src/test/selftest_net.cpp,
@@ -619,6 +621,8 @@ on the host; both exit 0; both logs show `net:` reports with batches in both
 directions and 0 disconnects before the client's own exit.
 
 ### M9.3 — op exchange, per-chunk hash, chunk resync (packages A, B, C) — the "play together" milestone
+
+> **LANDED 2026-09-21** (A `af6e7ab`, B `0746137`, C `1b236b8`; on main via `2b8a5ec`). Corrections: the op label is `kOpLabelAhead = D+1` (the pacer pre-sends D+1 — measured by a smoke that paced 276 perfect ticks carrying zero ops); author ranges must travel with the deferred batch; `Comparable`/`ChunkAuthority` came from M9.4-A, not from C. The record is version 3 and the oracle is `build/pre_v3_a.svops` (8,740,860 B).
 
 ```
   A  per-chunk hash + quiet counter + gate chunk-hash     world.h/.cpp, sim_occupancy.wgsl, pass_table.def,
