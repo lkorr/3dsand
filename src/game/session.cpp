@@ -2752,9 +2752,20 @@ static void PhaseK(TickAuthorityCtx& w, WorldScratch& ws,
         lastExplosionTick = tick;
         for (size_t ei = expBegin; ei < exps.size(); ei++) {
           const ExplosionOp& e = exps[ei];
-          debris.AddDestructionEvent(OpLandingTick(w, tick),
-                                     {e.x - e.radius, e.y - e.radius, e.z - e.radius},
-                                     {e.x + e.radius, e.y + e.radius, e.z + e.radius});
+          // ---- THE CRATER SCAN IS NOT RAISED HERE ANY MORE (M9.4-D) ------
+          //
+          // It moved to phase N, after the op merge, and it is raised from the
+          // MERGED batch instead of from this machine's own explosions. The
+          // reason is ownership: under M9.4 a peer's grenade going off in a
+          // chunk I hold needs MY island scan (I am the only machine that will
+          // step the matter it cuts loose), and this loop can only see the
+          // explosions THIS machine authored. Raising it here would scan the
+          // author's chunks and nobody would scan the owner's.
+          //
+          // SINGLE-PLAYER IS UNCHANGED, exactly: with no peer the merged batch
+          // IS this vector, `OpLandingTick` is `tick`, phase N is after phase
+          // J (the only other producer of destruction events in a tick), so
+          // the same boxes are queued at the same tick in the same order.
           // Blow voxels OFF the bodies in range before shoving what survives:
           // an explosion next to a rigidbody now craters it, and splits it into
           // separate bodies when the crater severs it. Runs first so the
@@ -3036,6 +3047,36 @@ static void PhaseN(TickAuthorityCtx& w, WorldScratch& ws,
       // SANDVOX_NET_SMOKE_DRIFT=1 (session.h section I says why it exists at
       // all), so single-player and every harness are untouched.
       if (w.driftCells) w.driftCells(tick, cellOps);
+      // ---- M9.4-D: CRATERS BY CHUNK AUTHORITY, FROM THE MERGED BATCH ----
+      //
+      // Every explosion that is about to be SUBMITTED this tick — mine and the
+      // peer's, in the canonical order the merge produced — queues an island
+      // scan over its blast box. Three properties, in the order they matter:
+      //
+      //  1. IT IS THE LANDING TICK BY CONSTRUCTION. `tick` here is the tick
+      //     the op actually reaches the GPU, so there is no `OpLandingTick`
+      //     shift to get wrong: the crater exists in the grid the scan will
+      //     read. Phase K's version had to add D by hand and would have been
+      //     wrong the day the delay changed.
+      //  2. THE PEER'S EXPLOSIONS GET A SCAN, on the machine that owns the
+      //     rock they cut. That is the whole point of the move (M9.4's note):
+      //     a grenade thrown by the other player used to crater my chunk and
+      //     leave the overhang hanging, because only its author queued a scan
+      //     and the author does not step my matter.
+      //  3. AUTHORITY IS TESTED ONCE, INSIDE THE DRAIN, not here.
+      //     `DebrisSystem::SetChunkOwnedFn` already gates every event at the
+      //     point it is consumed (debris.cpp's ChunkOwned test in the event
+      //     drain), per-event-chunk rather than per-explosion-centre — which
+      //     is strictly better for a blast that straddles a boundary. A second
+      //     test on the centre chunk here would be a duplicate rule that could
+      //     drift from it, and design guideline 3 is about exactly that.
+      //
+      // Unconnected this is byte-identical to what phase K did: same vector,
+      // same boxes, same tick, and still after phase J's events.
+      for (const ExplosionOp& e : exps)
+        debris.AddDestructionEvent(
+            tick, {e.x - e.radius, e.y - e.radius, e.z - e.radius},
+            {e.x + e.radius, e.y + e.radius, e.z + e.radius});
       tSubmit0 = NowSeconds();
       SubmitTick(ctx, world, sim, tick, kDefaultSeed, ops, exps, cellOps,
                  tick % 15 == 0 /*hash occasionally*/, pc, true, particlesActive,
