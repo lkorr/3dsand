@@ -251,6 +251,10 @@ BUF_TO_WGSL = {
     # The deferred streaming wake's act verdict, binding 30.
     "GenAct": {"genAct"},
     "PageFaults": {"pageFaults"},
+    # The per-chunk digest table, binding 37 of simBGL_ (M9.3-A). Written by
+    # sim_occupancy.wgsl's FULL entry point only; `mainDirty` never names it,
+    # which is exactly the rooted-walk case this checker's header describes.
+    "ChunkHash": {"chunkHash"},
     # MLS-MPM fluid (sim_fluid.wgsl + sim_fluid_seam.wgsl). The particle pair
     # is symbolic: the solver and every seam pass except the compaction source
     # bind the WRITE (working) buffer as `fluidParticles`; the seam's
@@ -316,6 +320,9 @@ _SIM_GROUP0 = {
     "actVoxViz",
     # The water-body drain ledger, binding 24 (docs/PLAN_water_master.md M2).
     "waterBodyState",
+    # The per-chunk digest table, binding 37 (docs/PLAN_multiplayer_m9.md
+    # M9.3-A). simBGL_ only: sim_occupancy runs on the full sim group.
+    "chunkHash",
     # The baked tree atlas, binding 26.
     "treeAtlas",
     # The discharge's emission seam, binding 25 (M3).

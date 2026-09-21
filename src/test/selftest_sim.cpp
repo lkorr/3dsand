@@ -20,6 +20,7 @@
 
 #include "sim/oprecord.h"  // the op record + replay (ops-replay gate)
 #include "sim/pagetable.h"
+#include "sim/rng.h"       // rng::Pcg — the CPU twin of the digest fold
 #include "sim/rng_simd.h"  // rng::Pcg8 / JitterStateInRow8 (the simd gate)
 #include "sim/scan.h"      // scan::FirstIndexWhereMasked   (the simd gate)
 #include "sim/stream.h"  // RleEncodeChunk / RleEncodeSentinelChunk (fusion gate)
@@ -4103,6 +4104,335 @@ Status GateOpsReplay(Ctx& c, std::string& detail) {
   return fails.empty() ? Status::Pass : Status::Fail;
 }
 
+// ---- chunk-hash: the per-chunk digest and the quiet streak (M9.3-A) -----
+//
+// docs/PLAN_multiplayer_m9.md M9.3-A. Two machines cannot compare 16 KiB per
+// chunk to find out whose world drifted, so every chunk carries a DIGEST of
+// its 4,096 words, written by sim_occupancy.wgsl's full entry point beside the
+// world hash. The world hash keys each cell on its SLOT-GLOBAL index and is
+// therefore a fold of "this window"; the digest keys on the CHUNK-LOCAL index,
+// so it is a pure function of the chunk's contents and of nothing else. Four
+// claims, and each is a way the digest could be useless while looking fine:
+//
+//   A  TWICE-RUN. Two identical worlds produce identical digest tables. If
+//      this fails the fold itself is non-deterministic and nothing below
+//      means anything.
+//   B  ONE VOXEL, ONE SLOT. Flipping one cell's palette nibble moves exactly
+//      ONE slot's digest, and it is that cell's. A digest that moved for
+//      other chunks would make a resync ship the whole world; one that did
+//      not move for this chunk would make it ship nothing.
+//   C  CONTENT-KEYED, AND SENTINEL == MATERIALIZED. Un-painting the cell
+//      returns the digest to the value it had while the chunk was still a
+//      JITTER sentinel with no page at all — the page table is derived data
+//      (PLAN_page_table.md), so a digest that could tell a sentinel from its
+//      materialized twin would report a difference every time a peer happened
+//      to allocate a page. And the digest the GPU produced equals one this
+//      gate folds on the CPU from the chunk's words with the chunk-local key,
+//      which is what "content-keyed" means as a measurement rather than as a
+//      claim: a slot-keyed fold would disagree with it for every slot but 0.
+//   D  THE QUIET STREAK. World::QuietTicks grows by one per published tick on
+//      an untouched chunk, resets to 0 when Stream::MarkModifiedBox names it,
+//      and resets when the chunk is edited through the op stream.
+//
+// The whole gate runs with hashEnable on every tick: the full occupancy pass
+// is what writes the table, and a gate that had to guess which ticks ran it
+// would be measuring the tick schedule instead of the digest.
+Status GateChunkHash(Ctx& c, std::string& detail) {
+  GpuContext& ctx = c.ctx;
+  World& world = c.world;
+  Simulation& sim = c.sim;
+  Stream& stream = c.stream;
+
+  // Tunable without a rebuild (CLAUDE.md "put thresholds in baseline.json").
+  const uint32_t kSettle = (uint32_t)BaselineNumber("chunkHashSettleTicks", 30);
+  const uint32_t kQuietCap = (uint32_t)BaselineNumber("chunkHashQuietCap", 60);
+  const IVec3 pc{8, 3, 8};
+
+  std::string fails;
+  auto fail = [&](const std::string& m) {
+    if (!fails.empty()) fails += "; ";
+    fails += m;
+  };
+
+  uint32_t t = 0;
+  auto tick = [&](const std::vector<CellOp>& cells) {
+    SubmitTick(ctx, world, sim, ++t, kDefaultSeed, {}, {}, cells,
+               /*hashEnable=*/true, pc, /*wantReadback=*/false,
+               /*particlesActive=*/false);
+  };
+  auto readTable = [&](std::vector<uint32_t>& out) {
+    out.assign(kChunkHashWords, 0u);
+    ctx.WaitIdle();
+    rhi::ReadbackBlocking(ctx.device, ctx.queue, world.chunkHash, 0, out.data(),
+                          kChunkHashBytes, "chunkhash");
+  };
+  auto diffSlots = [](const std::vector<uint32_t>& a,
+                      const std::vector<uint32_t>& b,
+                      std::vector<uint32_t>& out) {
+    out.clear();
+    for (uint32_t i = 0; i < kNumSlots; i++)
+      if (a[i] != b[i]) out.push_back(i);
+  };
+
+  // ---- A: twice-run ------------------------------------------------------
+  std::vector<uint32_t> run[2];
+  for (int r = 0; r < 2; r++) {
+    stream.OnRegen();
+    world.SetWindowOrigin({0, 0, 0});
+    SubmitWorldgen(ctx, world, sim, kDefaultSeed);
+    ctx.WaitIdle();
+    t = 0;
+    for (uint32_t i = 0; i < kSettle; i++) tick({});
+    readTable(run[r]);
+  }
+  std::vector<uint32_t> twiceDiff;
+  diffSlots(run[0], run[1], twiceDiff);
+  if (!twiceDiff.empty())
+    fail(Format("twice-run: %zu of %u slots disagree (first slot %u: %08x vs "
+                "%08x)",
+                twiceDiff.size(), kNumSlots, twiceDiff[0],
+                run[0][twiceDiff[0]], run[1][twiceDiff[0]]));
+  // The freshness stamp is the table's own answer to "which pass wrote this",
+  // and a consumer that trusted a stale table would compare a peer's tick-30
+  // world against its own tick-90 one and call the difference a desync.
+  if (run[1][kChunkHashTickWord] != t)
+    fail(Format("table stamp is tick %u, last full pass was tick %u",
+                run[1][kChunkHashTickWord], t));
+
+  // ---- quiesce, so B's "exactly one slot" is a claim about the paint ------
+  // A world still settling moves digests on its own, and "exactly 1 changed"
+  // measured against a moving background is not a measurement. Tick until two
+  // consecutive full passes agree everywhere, and REPORT how long that took
+  // rather than asserting a settle time this gate does not own.
+  std::vector<uint32_t> prev = run[1], cur;
+  uint32_t quiesceTicks = 0;
+  std::vector<uint32_t> moved;
+  for (; quiesceTicks < kQuietCap; quiesceTicks++) {
+    tick({});
+    readTable(cur);
+    diffSlots(prev, cur, moved);
+    prev.swap(cur);
+    if (moved.empty()) break;
+  }
+  if (!moved.empty())
+    fail(Format("world never quiesced: %zu slots still moving after %u ticks",
+                moved.size(), kQuietCap));
+
+  // ---- the subject chunk: a JITTER SENTINEL, FOUND not assumed ------------
+  // Claim C needs a chunk that has no page at all, and the gate must not
+  // assume where one is: the first cut picked "deep stone under the harness
+  // player chunk" by TerrainHeight and drew slot 8520, which the mirror's
+  // materialization ring had already made a real page — so the round trip
+  // measured nothing and said so. Ask the page table instead, and take the
+  // first slot (ascending, so the choice is deterministic) that is a JITTER
+  // sentinel of non-air matter: that is exactly the buried-bulk case §9 of
+  // PLAN_page_table.md compresses, and the one a resync will meet most.
+  IVec3 cell{0, 0, 0};
+  uint32_t slot = 0;
+  bool foundSentinel = false;
+  // SLOT 0 IS EXCLUDED, and that is the difference between a measurement and a
+  // fixture that cannot fail. The world hash keys on `wg.x * CHUNK_VOL + i`;
+  // at slot 0 that IS `i`, so C2's CPU fold would agree with a slot-keyed
+  // digest too and the one claim the whole package rests on would be
+  // untestable. The first run picked slot 0 and passed for that reason.
+  for (uint32_t s = 1; s < kNumSlots && !foundSentinel; s++) {
+    const uint32_t e = world.PageEntryOfSlot(s);
+    if ((e & kPtSentinelBit) == 0u) continue;
+    if ((e & kPtJitterBit) == 0u) continue;       // uniform: no palette to flip
+    if ((e & kPtMatMask) == kMatAir) continue;    // air hashes to nothing
+    const IVec3 wc = world.SlotToWorldChunk(s);
+    if (!world.ChunkInWindow(wc)) continue;
+    slot = s;
+    cell = {wc.x * (int)kChunk + 8, wc.y * (int)kChunk + 8,
+            wc.z * (int)kChunk + 8};
+    foundSentinel = true;
+  }
+  if (!foundSentinel)
+    fail("no JITTER sentinel chunk in the window to round-trip");
+  const uint32_t localIdx = World::SlotCellIndex(cell) % kChunkVol;
+  const uint32_t entryBefore = world.PageEntryOfSlot(slot);
+  const bool sentinelBefore = (entryBefore & kPtSentinelBit) != 0u;
+  const uint32_t digBefore = prev[slot];
+  if (!world.CellInWindow(cell))
+    fail(Format("subject cell (%d,%d,%d) is outside the window", cell.x, cell.y,
+                cell.z));
+  // The word that is there NOW, whichever form the chunk is in. A sentinel has
+  // no page to read, so its word comes from the same synthesis the CPU mirror
+  // and the eviction encoder use; a real page is read back verbatim.
+  uint32_t origWord = 0;
+  if (sentinelBefore) {
+    origWord = SynthWordAt(entryBefore, cell.x, cell.y, cell.z,
+                           world.pages->WorldSeed());
+  } else {
+    const uint64_t off = world.PageOffsetOfSlot(slot);
+    rhi::ReadbackBlocking(ctx.device, ctx.queue, world.voxels,
+                          off + (uint64_t)localIdx * 4, &origWord, 4, "chword");
+  }
+  // Flip ONE bit of the palette-jitter nibble. It changes the hashed value
+  // (bits 0..15 are in `v`) and changes nothing else: same material, same
+  // stain, so no reaction can fire and no neighbour can be woken into moving.
+  // Painting air here would also work and would additionally move occupancy,
+  // which is not this gate's subject and would add a second cause for a digest
+  // to move.
+  const uint32_t paintWord = origWord ^ (1u << 12);
+
+  // ---- B: one voxel moves exactly one slot's digest -----------------------
+  tick({CellOp{World::SlotCellIndex(cell), paintWord}});
+  readTable(cur);
+  std::vector<uint32_t> painted;
+  diffSlots(prev, cur, painted);
+  const size_t changedSlots = painted.size();
+  if (changedSlots != 1 || painted[0] != slot) {
+    std::string got;
+    for (size_t i = 0; i < painted.size() && i < 6; i++)
+      got += Format("%s%u", i ? "," : "", painted[i]);
+    fail(Format("paint moved %zu slot(s) [%s], wanted exactly slot %u",
+                changedSlots, got.c_str(), slot));
+  }
+  const uint32_t digPainted = cur[slot];
+  const bool materialized =
+      (world.PageEntryOfSlot(slot) & kPtSentinelBit) == 0u;
+
+  // ---- C: un-paint returns the SENTINEL-ERA digest ------------------------
+  prev.swap(cur);
+  tick({CellOp{World::SlotCellIndex(cell), origWord}});
+  readTable(cur);
+  if (cur[slot] != digBefore)
+    fail(Format("un-paint left digest %08x, sentinel-era value was %08x "
+                "(sentinel before: %s, materialized after: %s)",
+                cur[slot], digBefore, sentinelBefore ? "yes" : "no",
+                materialized ? "yes" : "no"));
+  // The gate is only worth its runtime if the round trip actually crossed the
+  // sentinel boundary. Say so rather than passing quietly on a chunk that was
+  // a real page the whole time.
+  if (!sentinelBefore)
+    fail(Format("slot %u was already a real page (entry %08x); the "
+                "sentinel-vs-materialized round trip was not exercised",
+                slot, entryBefore));
+  if (!materialized)
+    fail(Format("slot %u never materialized under the paint (entry %08x)",
+                slot, world.PageEntryOfSlot(slot)));
+
+  // ---- C2: the digest is the CPU's content fold, not a slot fold ----------
+  // The discriminating measurement for "chunk-local key". A slot-keyed fold
+  // (what the world hash does) would disagree with this for every slot but 0.
+  uint32_t cpuDigest = 0;
+  bool readWords = false;
+  {
+    std::vector<uint32_t> words(kChunkVol, 0u);
+    const uint64_t off = world.PageOffsetOfSlot(slot);
+    if (off != World::kNoPage)
+      readWords =
+          rhi::ReadbackBlocking(ctx.device, ctx.queue, world.voxels, off,
+                                words.data(), (size_t)kChunkVol * 4, "chwords");
+    if (readWords) {
+      for (uint32_t i = 0; i < kChunkVol; i++) {
+        const uint32_t w = words[i];
+        if ((w & 0xFFFu) == 0u) continue;  // air contributes nothing, as in WGSL
+        const uint32_t v = (w & 0xFFFFu) | ((w & kStainBits) >> 8u);
+        cpuDigest += rng::Pcg(i ^ (v * 0x9E3779B9u));
+      }
+      if (cpuDigest != cur[slot])
+        fail(Format("CPU content fold %08x != GPU digest %08x for slot %u "
+                    "(the key is not chunk-local)",
+                    cpuDigest, cur[slot], slot));
+    } else {
+      fail("could not read the slot's words back for the CPU content fold");
+    }
+  }
+
+  // ---- D: the quiet streak -----------------------------------------------
+  // The paint above was two ticks ago and the snapshot is K ticks latent, so
+  // walk the streak forward from wherever it is now and assert the SHAPE: one
+  // per published tick, zero on an explicit touch, zero after an edit.
+  const uint32_t q0 = world.QuietTicks(slot);
+  tick({});
+  const uint32_t q1 = world.QuietTicks(slot);
+  tick({});
+  const uint32_t q2 = world.QuietTicks(slot);
+  if (!(q1 == q0 + 1 && q2 == q1 + 1))
+    fail(Format("quiet streak on an untouched chunk went %u -> %u -> %u, "
+                "wanted +1 per tick",
+                q0, q1, q2));
+  // Stream::MarkModifiedBox is the CPU-edit path: it must break the streak
+  // IMMEDIATELY, not kSnapshotLatency ticks later, because a CPU edit is
+  // activity the dirty flags have not reported yet.
+  const IVec3 lo{cell.x, cell.y, cell.z};
+  stream.MarkModifiedBox(lo, lo);
+  const uint32_t qTouched = world.QuietTicks(slot);
+  if (qTouched != 0)
+    fail(Format("MarkModifiedBox left the quiet streak at %u, wanted 0",
+                qTouched));
+  // ...and an edit through the op stream breaks it too, by way of the dirty
+  // flags, which is the path every GPU-side change takes. Give it the publish
+  // latency plus one and require that it was reset somewhere in there.
+  for (uint32_t i = 0; i < World::kSnapshotLatency + 2; i++) tick({});
+  const uint32_t qGrown = world.QuietTicks(slot);
+  tick({CellOp{World::SlotCellIndex(cell), paintWord}});
+  uint32_t qMin = 0xFFFFFFFFu;
+  for (uint32_t i = 0; i <= World::kSnapshotLatency + 1; i++) {
+    tick({});
+    qMin = std::min(qMin, world.QuietTicks(slot));
+  }
+  if (qMin != 0)
+    fail(Format("an op-stream edit never reset the quiet streak (min %u over "
+                "K+2 ticks; it had grown to %u)",
+                qMin, qGrown));
+
+  // ---- the published table matches the GPU's, through the readback ring ---
+  // The accessors are the product, not the buffer: M9.3-C will read
+  // World::ChunkHashOfSlot, not world.chunkHash. Settle first, so the ring's
+  // latency cannot be mistaken for a parse bug.
+  tick({CellOp{World::SlotCellIndex(cell), origWord}});
+  for (uint32_t i = 0; i < World::kSnapshotLatency + 3; i++) tick({});
+  readTable(cur);
+  uint32_t ringDiff = 0, firstRingSlot = 0;
+  for (uint32_t i = 0; i < kNumSlots; i++)
+    if (world.ChunkHashOfSlot(i) != cur[i]) {
+      if (ringDiff == 0) firstRingSlot = i;
+      ringDiff++;
+    }
+  if (ringDiff)
+    fail(Format("snapshot digest table differs from the GPU's in %u slots "
+                "(first %u: %08x vs %08x, snapshot tick %u / table tick %u)",
+                ringDiff, firstRingSlot, world.ChunkHashOfSlot(firstRingSlot),
+                cur[firstRingSlot], world.ChunkHashTick(),
+                cur[kChunkHashTickWord]));
+  if (world.ChunkHashTick() == 0)
+    fail("the snapshot never carried a digest-table tick");
+  // A page fault is a DROPPED STORE, which would silently make every digest
+  // above a description of the wrong world.
+  if (world.Snap().valid && world.Snap().pageFaults != 0)
+    fail(Format("%u page faults", world.Snap().pageFaults));
+
+  const uint32_t pinnedChanged =
+      (uint32_t)BaselineNumber("chunkHashChangedSlots", 1);
+  if (changedSlots != pinnedChanged)
+    fail(Format("changedSlots %zu, baseline pins %u", changedSlots,
+                pinnedChanged));
+
+  // Leave the world regenerated: this gate painted, un-painted and ran ~110
+  // ticks, and the gates after it inherit whatever it leaves (selftest.h's
+  // ordering note).
+  stream.OnRegen();
+  world.SetWindowOrigin({0, 0, 0});
+  SubmitWorldgen(ctx, world, sim, kDefaultSeed);
+  ctx.WaitIdle();
+
+  char buf[768];
+  std::snprintf(buf, sizeof(buf),
+                "%s (%u slots hashed, twice-run identical | quiesced in %u "
+                "ticks | paint moved %zu slot (%u) %08x -> %08x -> %08x | "
+                "sentinel round trip %s | CPU fold %08x | quiet %u -> %u%s%s)",
+                fails.empty() ? "PASS" : "FAIL", kNumSlots, quiesceTicks,
+                changedSlots, slot, digBefore, digPainted, cur[slot],
+                (sentinelBefore && materialized) ? "yes" : "NO", cpuDigest, q0,
+                qGrown, fails.empty() ? "" : " | ", fails.c_str());
+  detail = buf;
+  std::printf("chunk-hash: %s\n", buf);
+  return fails.empty() ? Status::Pass : Status::Fail;
+}
+
 }  // namespace
 
 const std::vector<Gate>& SimGates() {
@@ -4111,6 +4441,7 @@ const std::vector<Gate>& SimGates() {
       {"weak-flame", "sim", {}, false, GateWeakFlame},
       {"determinism", "sim", {}, false, GateDeterminism},
       {"ops-replay", "sim", {}, false, GateOpsReplay},
+      {"chunk-hash", "sim", {}, false, GateChunkHash},
       {"sleep", "sim", {}, false, GateSleep},
       {"evaporation", "sim", {}, false, GateEvaporation},
       {"blood-stain", "sim", {}, false, GateBloodStain},

@@ -296,6 +296,12 @@ void Stream::MarkModifiedBox(IVec3 lo, IVec3 hi) {
       for (int cx = lo.x >> 4; cx <= (hi.x >> 4); cx++) {
         IVec3 wc{cx, cy, cz};
         if (world_->ChunkInWindow(wc)) modified_[World::SlotChunkIndex(wc)] = 1;
+        // ...and break the chunk's QUIET STREAK (M9.3-A). `modified_` is
+        // sticky-ever ("this chunk has been edited since it was generated")
+        // and is the wrong signal for "settled enough to compare digests
+        // with a peer". The streak is the right one, and a CPU edit is
+        // activity the snapshot's dirty flags only report K ticks later.
+        world_->NoteChunkTouched(wc);
       }
 }
 
@@ -657,6 +663,11 @@ void Stream::FillSlots(const std::vector<uint32_t>& slots, bool deferWake) {
   const uint32_t one = 1;
   for (uint32_t s : slots) {
     modified_[s] = 0;
+    // The slot is about to hold a DIFFERENT world chunk, so whatever quiet
+    // streak it had belonged to the chunk that left (M9.3-A). Reset by SLOT
+    // and not by world chunk: SlotToWorldChunk below still reports the new
+    // one, but the streak is a property of the memory, not of the coordinate.
+    world_->NoteSlotTouched(s);
     IVec3 wc = world_->SlotToWorldChunk(s);
     // The chunk's own eviction may still be in flight (player doubled back
     // within the map latency): complete it so the store lookup below sees it.

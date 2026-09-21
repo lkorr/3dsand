@@ -601,8 +601,14 @@ PASS(gasFarPlumeWide, "gasFarPlume", PT_TICK, PIPE_GAS_FARPLUMEW, K_COMPUTE, D_G
      USES(U(TickUBO) R(GasFarEmit) A(GasFarOuter)))
 
 // ---- phase 5a: hash tick (whole-world scan; also refreshes occupancy) ------
+// W(ChunkHash) and not A(ChunkHash): the digest is a PLAIN STORE per slot (one
+// workgroup owns one slot for the whole dispatch), unlike the world hash which
+// every workgroup atomically adds into one word. Only the FULL entry point
+// writes it — `occupancyDirty` below runs `mainDirty`, which never names the
+// binding, so it gets no use and no barrier.
 PASS(occupancyFull, "occupancyFull+pick(hashTick)", PT_TICK, PIPE_OCCUPANCY, K_COMPUTE, D_CHUNKS,1,1, GRP_SIM, DYN_ZERO, C_HASH, 1,
-     USES(R(Voxels) R(Materials) U(TickUBO) W(Occupancy) A(Hash) R(PageTable)))
+     USES(R(Voxels) R(Materials) U(TickUBO) W(Occupancy) A(Hash) W(ChunkHash)
+          R(PageTable)))
 PASS(pick_hash, "occupancyFull+pick(hashTick)", PT_TICK, PIPE_PICK,      K_COMPUTE, 1,1,1,       GRP_SIM, DYN_ZERO, C_HASH, 1,
      USES(R(Voxels) R(Materials) U(RenderUBO) W(Pick) R(PageTable)))
 
@@ -754,6 +760,12 @@ PASS(wg_fill_dirty1, nullptr, PT_WORLDGEN, PIPE_NONE, K_FILL, 0,0,0, GRP_NONE, D
      USES(TW(Dirty1)))
 PASS(wg_fill_hash, nullptr, PT_WORLDGEN, PIPE_NONE, K_FILL, 0,0,0, GRP_NONE, DYN_NONE, C_ALWAYS, 1,
      USES(TW(Hash)))
+// The per-chunk digest table (M9.3-A). Zeroed with the world hash and for the
+// same reason: a slot nobody has hashed yet should answer 0, not whatever the
+// previous world left in it. Worldgen writes no digests itself — the first
+// full occupancy pass after it does.
+PASS(wg_fill_chunkHash, nullptr, PT_WORLDGEN, PIPE_NONE, K_FILL, 0,0,0, GRP_NONE, DYN_NONE, C_ALWAYS, 1,
+     USES(TW(ChunkHash)))
 PASS(wg_fill_support, nullptr, PT_WORLDGEN, PIPE_NONE, K_FILL, 0,0,0, GRP_NONE, DYN_NONE, C_ALWAYS, 1,
      USES(TW(Support)))
 PASS(wg_fill_pCounts, nullptr, PT_WORLDGEN, PIPE_NONE, K_FILL, 0,0,0, GRP_NONE, DYN_NONE, C_ALWAYS, 1,
@@ -883,7 +895,8 @@ PASS(lr_fill_glow, nullptr, PT_LOADRESET, PIPE_NONE, K_FILL, 0,0,0, GRP_NONE, DY
      USES(TW(Glow)))
 PASS(lr_occupancyFull, "occupancyFull(loadReset)", PT_LOADRESET, PIPE_OCCUPANCY, K_COMPUTE, D_CHUNKS,1,1,
      GRP_SIM, DYN_ZERO, C_ALWAYS, 1,
-     USES(R(Voxels) R(Materials) U(TickUBO) W(Occupancy) A(Hash) R(PageTable)))
+     USES(R(Voxels) R(Materials) U(TickUBO) W(Occupancy) A(Hash) W(ChunkHash)
+          R(PageTable)))
 
 // ========================================================= PT_HASHONLY =====
 // Simulation::EncodeHashOnly — standalone whole-world hash pass (save/load
@@ -892,7 +905,8 @@ PASS(ho_fill_hash, nullptr, PT_HASHONLY, PIPE_NONE, K_FILL, 0,0,0, GRP_NONE, DYN
      USES(TW(Hash)))
 PASS(ho_occupancyFull, "occupancyFull(hashOnly)", PT_HASHONLY, PIPE_OCCUPANCY, K_COMPUTE, D_CHUNKS,1,1,
      GRP_SIM, DYN_ZERO, C_ALWAYS, 1,
-     USES(R(Voxels) R(Materials) U(TickUBO) W(Occupancy) A(Hash) R(PageTable)))
+     USES(R(Voxels) R(Materials) U(TickUBO) W(Occupancy) A(Hash) W(ChunkHash)
+          R(PageTable)))
 
 // ========================================================== PT_FARFILL =====
 // Simulation::EncodeFarFill. Encoded into the tick's command buffer AFTER

@@ -212,6 +212,12 @@ enum class Buf : uint8_t {
   // words and the `field` row reads them back, so the RW -> RW edge between the
   // two rows IS the barrier that makes the two-stage split correct.
   Glow,
+  // ---- the per-chunk digest table (world.h kChunkHashWords, M9.3-A) ----
+  // Written by sim_occupancy.wgsl's FULL entry point and by nothing else, and
+  // READ BACK through CopyTracked every tick — which is the hazard the table
+  // has to know about: a compute write followed by a transfer read in the same
+  // command buffer, exactly Hash's situation one array wider.
+  ChunkHash,
   kCount,
 };
 

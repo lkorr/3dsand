@@ -201,6 +201,13 @@ const char* const kOrder[] = {
     // is invisible downstream, and a break in the op stream is reported in the
     // first seconds of a full run instead of the last.
     "ops-replay",
+    // Right after it, and for the same reason it sits here: `chunk-hash` runs
+    // its own worldgen twice and ~110 ticks, and it REGENERATES on the way
+    // out — so `determinism` below, which regenerates anyway and proves its
+    // own hash independent of what it inherited, is the correct neighbour for
+    // a gate that churns the world. It never touches the world hash: the
+    // digest is a SECOND accumulator with a chunk-local key (M9.3-A).
+    "chunk-hash",
     "determinism", "sleep",       "ca-skip",
     // Per-material angle of repose. It runs its own worldgen per arm, builds a
     // sealed stone room and pours into it, and it PATCHES ONE MATERIAL'S GPU
