@@ -542,11 +542,15 @@ struct TickAuthorityCtx {
 // op stream — and the op stream's order is the tick's identity (CLAUDE.md rule
 // 3: the lowest op index owns the cell).
 //
-// WHERE A REMOTE GHOST PLUGS IN (M9.2): phases B and C of the plan's lettering
-// — here, phase B (the interest set learns its chunk) and phase I (its avatar
-// is driven from the TickInput that arrived off the wire). A ghost needs no
-// new phase and no new call; it needs an entry in the span, `localView =
-// false`, and a TickInput from somewhere other than a TickInputFeeder.
+// WHERE A REMOTE GHOST PLUGS IN (M9.2): phase B (the interest set learns its
+// chunk, SetPlayerActors lists it) and phase I (its avatar's PreTick). NOT as
+// a SessionTick: no TickInput crosses the wire in the model of record
+// (docs/PLAN_multiplayer_m9.md) — the peer is authoritative for its own
+// controller and sends the OUTCOME, a PlayerState, from which a ghost's
+// `Player` fields are filled and its PlayerAvatar driven. A ghost is a
+// RemotePlayer entry on TickAuthorityCtx that those two phases walk beside
+// the span, with `localView = false` semantics (nothing it does reaches the
+// window's presentation seam).
 
 // ONE PLAYER'S INPUT TO ONE TICK. The session, what the frame layer settled
 // for it, and the command it consumes. By pointer rather than reference so the
