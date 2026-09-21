@@ -59,6 +59,7 @@
 // RemotePlayer ghost (package B), reached through game/session.h which already
 // includes game/remoteplayer.h.
 #include "net/link.h"
+#include "net/opsync.h"
 #include "net/protocol.h"
 #include "phys/debris.h"
 #include "phys/physics.h"
@@ -296,6 +297,27 @@ int HarnessTicksPerFrame() {
 // harness wants a peer's departure to be terminal.
 bool NetSmokeExitOnPeerDone() {
   static const bool on = std::getenv("SANDVOX_NET_SMOKE_EXIT_ON_PEER_DONE") != nullptr;
+  return on;
+}
+// ---- SANDVOX_NET_SMOKE_PAINT=1: AN AUTHOR IN A HARNESS RUN (M9.3-B) -------
+//
+// Third of the same family, and it exists because the two-process smoke could
+// otherwise prove nothing about the op exchange: --autofly-hard flies, and a
+// flying camera authors NO world ops at all. The exchange would be exercised
+// by zero ops in both directions and the run would be green for the wrong
+// reason — a "fixture that cannot fail".
+//
+// Set, a --frames run pushes ONE small brush op into its own outgoing batch
+// every 30 ticks, at the player's feet. It goes in through the delay queue
+// like any other local op (net/opsync.h), so it carries the same label, it
+// crosses the wire, and both machines submit it on the same tick: exactly the
+// path a human's brush stroke takes. It is NOT a second mutation path -- the
+// op reaches the world through SubmitTick and nothing else.
+//
+// Only under --frames, and only while connected: a windowed game has a player
+// to do the painting.
+bool NetSmokePaint() {
+  static const bool on = std::getenv("SANDVOX_NET_SMOKE_PAINT") != nullptr;
   return on;
 }
 bool g_autofly = false;
@@ -6733,6 +6755,55 @@ int main(int argc, char** argv) {
   // The peers' bodies. Borrowed by TickAuthorityCtx below; cleared on
   // disconnect and at shutdown, because a ghost owns real Jolt bodies.
   RemotePlayers remotes;
+  // THE OP EXCHANGE (M9.3-B, net/opsync.h). Borrowed by TickAuthorityCtx
+  // below. Connected() is false until the handshake completes, and while it
+  // is false phase N submits exactly the vectors the tick built — which is
+  // why a plain --frames run's op record is byte-identical to the oracle.
+  net::OpSync opsync;
+  // Op telemetry for the exit report, accumulated HERE and not read off the
+  // queue at exit: Disconnect() resets the queue, so a host that outlives its
+  // peer would report zeroes for work it really did (measured -- the first
+  // smoke's host printed mergedMax=0 after a session that merged plenty).
+  // The last two are folded in from the queue inside netDrop.
+  uint64_t netOpsSent = 0, netOpsRecv = 0;
+  uint64_t netCellsDropped = 0, netMergedMax = 0;
+  // ---- THE SILENCE TIMER MEASURES POLLED TIME, NOT WALL TIME -----------
+  //
+  // M9.2-C measured `NowSeconds() - Stats().lastRecvSeconds > 3 s` and that
+  // is wrong across a FOREGROUND STALL: a pipeline compile, a worldgen, a
+  // save or an F5 reload can hold this thread for many seconds, during which
+  // wall time passes, nothing polls the socket, and the peer's batches sit
+  // unread in the kernel buffer. The link is perfectly healthy and the timer
+  // declares it dead the instant the stall ends — the smoke's mid-run shader
+  // reload is exactly such a stall.
+  //
+  // So silence is accumulated ACROSS FRAMES THAT POLLED, and a frame whose
+  // own duration exceeded kNetPollStallSeconds contributes NOTHING: this
+  // machine was not listening, so its silence says nothing about the peer.
+  // The 3 s budget then means "three seconds of a running frame loop with
+  // nothing arriving", which is the condition the rule was always about.
+  double netSilence = 0.0;          // polled seconds since the last byte
+  double netSilenceLastPoll = 0.0;  // NowSeconds() at the previous netPump
+  uint64_t netPollStalls = 0;       // frames excluded as foreground stalls
+  // ---- ...AND THE PEER'S STALL IS NOT VISIBLE AT ALL -------------------
+  //
+  // The polled-time rule above fixes the half of the bug this machine can
+  // see. The other half it cannot: a peer that is inside a multi-second
+  // foreground operation is not sending, and from here that is
+  // indistinguishable from a peer that died. MEASURED, first two-process
+  // smoke of M9.3-B: the client printed `render pipelines built in 48.21 s`
+  // on its first frame (a cold pipeline set for a ground-level view; the host
+  // had been rendering for a minute and had them all), during which it polled
+  // nothing -- and the host dropped it four ticks after the handshake with
+  // "3 s silence" while both processes were perfectly healthy.
+  //
+  // So the silence RULE does not run until the connection has had time to get
+  // through both machines' first frame. 90 s is twice the measured worst
+  // compile and far below the 120 s the host already waits for a peer to
+  // arrive at all. A broken SOCKET still drops instantly inside the grace --
+  // that is an answer from the OS, not an inference from silence.
+  constexpr double kNetConnectGraceSeconds = 90.0;
+  double netPacedAt = 0.0;          // NowSeconds() at the handshake
   // Handshake complete and the pacer owns the tick gate. Distinct from
   // `link->Connected()`: a TCP connection with no HelloAck behind it must not
   // stall the world, and a host is playing normally long before anyone joins.
@@ -6819,6 +6890,29 @@ int main(int argc, char** argv) {
     st.playerId = netMyId;
     w.playerState.resize(sizeof(PlayerState));
     std::memcpy(w.playerState.data(), &st, sizeof st);
+    // ---- M9.3-B: AND THE OPS FOR THAT LABEL -------------------------
+    //
+    // The batch this machine authored at `label - kOpLabelAhead` and stored
+    // under `label` (session.cpp phase N). Empty for the first few ticks
+    // after connect, and empty on most ticks of a normal game — which is fine
+    // and is the point of invariant 2: a batch goes out every tick either
+    // way, so "no ops" and "not arrived" stay different observations.
+    //
+    // THE ORIGIN INSIDE THE BLOB IS NOT THE HEADER'S. The header carries the
+    // sender's window origin NOW; the blob carries the origin the ops were
+    // PRODUCED under, five ticks ago, because a CellOp's slot index is only
+    // interpretable under that one (net/opsync.h point 3). A fly-through can
+    // shift the window inside D ticks, so the two genuinely differ and using
+    // the header's would paint the wrong chunk.
+    {
+      IVec3 opsOrigin{0, 0, 0};
+      const OpBatch& ob = opsync.Q().Outgoing(label, &opsOrigin);
+      const size_t n = ob.ops.size() + ob.exps.size() + ob.cells.size() +
+                       ob.spawns.size() + ob.fluid.size();
+      if (n == 0) opsOrigin = wo;   // nothing to interpret; say something sane
+      netOpsSent += n;
+      net::OpsWire::Encode(ob, opsOrigin, label, w.ops);
+    }
     std::vector<uint8_t> buf;
     w.Encode(buf);
     link->Send((uint16_t)net::MsgType::TickBatch, net::kProtocolVersion,
@@ -6836,6 +6930,12 @@ int main(int argc, char** argv) {
   auto netStartPacing = [&](uint32_t startTick) {
     pacer.Reset(startTick);
     netQueue.clear();
+    // The op exchange starts with the pacer and on the same tick numbering: a
+    // label from a previous session means nothing in this one.
+    opsync.Connect(netMyId, netPeerId);
+    netSilence = 0.0;
+    netSilenceLastPoll = 0.0;
+    netPacedAt = net::NowSeconds();
     netPaced = true;
     netEverPaced = true;
     while (pacer.ShouldSend()) {
@@ -6849,8 +6949,6 @@ int main(int argc, char** argv) {
   // ---- LOSE THE PEER: FREE-RUN, AND KEEP NOTHING OF IT -------------------
   auto netDrop = [&](const char* why) {
     netDisconnects++;
-    netBytesInPrev += link->Stats().bytesIn;
-    netBytesOutPrev += link->Stats().bytesOut;
     std::printf("net: peer lost at tick %u (%s) -- free-running\n", tick, why);
     std::fflush(stdout);
     // The avatar list MobSystem resolves an actor id through is INDEX-ALIGNED
@@ -6862,20 +6960,38 @@ int main(int argc, char** argv) {
     mobs.SetAvatar(&session.avatar);
     netQueue.clear();
     netPaced = false;
+    // The op exchange goes with the peer. Its counters are harvested FIRST:
+    // Disconnect() clears the queue, and the delay queue's labels are this
+    // session's and no other -- a rejoin restarts the host's clock, and a
+    // stale label would merge a batch from the previous connection into a
+    // tick of the new one.
+    netCellsDropped += opsync.Q().droppedCells;
+    netMergedMax = std::max(netMergedMax, opsync.Q().mergedMax);
+    opsync.Disconnect();
+    netSilence = 0.0;
+    netSilenceLastPoll = 0.0;
     pacer = net::LockstepPacer{};
     if (netRoleBoot == NetRole::Host) {
-      // Back to listening on the same port with a fresh link (see the
-      // unique_ptr note above: the failure latch has no reset).
-      link = std::make_unique<net::TcpLink>();
-      if (!link->Listen(netPort)) {
-        std::printf("net: re-listen failed: %s\n", link->Error().c_str());
-        link.reset();
-      } else {
-        std::printf("net: listening again on 127.0.0.1:%u\n",
-                    (unsigned)link->ListenPort());
-      }
+      // BACK TO LISTENING ON THE SAME SOCKET (M9.3-B). M9.2-C had to throw
+      // the whole TcpLink away here because `Fail` latched with no reset,
+      // and re-binding is the one part of that which can genuinely fail --
+      // there is no SO_REUSEADDR (net/link.cpp Listen says why), so a host
+      // that lost a player could end up with no port at all. `Reset()`
+      // un-latches the failure and drops the dead peer's half-received
+      // bytes; the listen socket was never closed, so accepting resumes with
+      // no re-bind and the port cannot be lost. The stats keep accumulating
+      // across peers, which is why the exit report no longer carries a
+      // per-connection carry-over on this path.
+      link->Reset();
+      std::printf("net: listening again on 127.0.0.1:%u\n",
+                  (unsigned)link->ListenPort());
     } else {
-      link.reset();   // a client has nothing to re-listen for
+      // A client has nothing to re-listen for. Its byte totals are folded
+      // into the carry-over before the link goes, or the exit report would
+      // lose them.
+      netBytesInPrev += link->Stats().bytesIn;
+      netBytesOutPrev += link->Stats().bytesOut;
+      link.reset();
     }
     // The two-process smoke's full stop; see NetSmokeExitOnPeerDone().
     if (NetSmokeExitOnPeerDone() && g_harnessFrames > 0 && window)
@@ -6952,6 +7068,32 @@ int main(int argc, char** argv) {
             netLate++;
             break;
           }
+          // ---- M9.3-B: THE PEER'S OPS FOR THIS LABEL --------------------
+          //
+          // Straight into the delay queue, which is keyed by the SAME label
+          // the PlayerState below is queued under -- but consumed one layer
+          // deeper: the state is applied by this loop before the tick, the
+          // ops by phase N inside it. `origin` comes out of the blob (the
+          // origin they were PRODUCED under), never out of the header.
+          //
+          // A blob that fails to decode is dropped whole and counted as a
+          // late batch: applying half a peer's tick would be a divergence
+          // with no symptom until the next hash comparison.
+          if (!w.ops.empty()) {
+            OpBatch rb;
+            IVec3 rorigin{0, 0, 0};
+            uint32_t rlabel = 0;
+            if (net::OpsWire::Decode(w.ops.data(), w.ops.size(), rb, rorigin,
+                                     rlabel) &&
+                rlabel == w.h.tick) {
+              netOpsRecv += rb.ops.size() + rb.exps.size() + rb.cells.size() +
+                            rb.spawns.size() + rb.fluid.size();
+              opsync.Q().NoteRemote(w.h.tick, w.h.playerId, rorigin,
+                                    std::move(rb));
+            } else {
+              netLate++;
+            }
+          }
           NetPending& q = netQueue[w.h.tick];
           q.timeScale = w.h.timeScale;
           q.vizActive = w.h.vizActive;
@@ -6975,12 +7117,27 @@ int main(int argc, char** argv) {
     // through a large transfer is not declared dead; it only runs while paced,
     // because a listening host with no peer has been silent since boot.
     if (link) {
+      // POLLED TIME, NOT WALL TIME (M9.3-B; see netSilence's declaration for
+      // the bug). A frame longer than kNetPollStallSeconds was this machine
+      // not listening, so it contributes nothing to the peer's silence.
+      constexpr double kNetPollStallSeconds = 1.0;
+      constexpr double kNetSilenceLimit = 3.0;
+      const double nowSec = net::NowSeconds();
+      const double gap =
+          netSilenceLastPoll > 0.0 ? nowSec - netSilenceLastPoll : 0.0;
+      netSilenceLastPoll = nowSec;
+      if (link->Stats().lastRecvSeconds >= nowSec - gap) {
+        netSilence = 0.0;   // something arrived during this frame
+      } else if (gap > kNetPollStallSeconds) {
+        netPollStalls++;    // a foreground stall: not the peer's fault
+      } else {
+        netSilence += gap;
+      }
       const bool broken = !link->Error().empty();
-      const bool silent =
-          netPaced &&
-          net::NowSeconds() - link->Stats().lastRecvSeconds > 3.0;
+      const bool silent = netPaced && netSilence > kNetSilenceLimit &&
+                          nowSec - netPacedAt > kNetConnectGraceSeconds;
       if (broken || silent)
-        netDrop(broken ? link->Error().c_str() : "3 s silence");
+        netDrop(broken ? link->Error().c_str() : "3 s of polled silence");
     }
   };
 
@@ -7106,6 +7263,9 @@ int main(int argc, char** argv) {
   // otherwise, which is what keeps phases B / H / I / O making exactly the
   // calls they made before package B landed.
   if (netRoleBoot != NetRole::None) tickCtx.remotes = &remotes;
+  // ...and so does the op exchange. Null in every harness and in every
+  // single-player frame; even here it does nothing until Connected().
+  if (netRoleBoot != NetRole::None) tickCtx.opsync = &opsync;
 
   uint64_t frameCounter = 0;
   StartupMark("frame loop entered");
@@ -9050,6 +9210,27 @@ int main(int argc, char** argv) {
       TickAuthority(tickCtx, session,
                     FrameIntent{brushActive, meleeArmed, meleeReady, heldItem},
                     ti, tick, opBatch);
+
+      // ---- M9.3-B: THE SMOKE'S AUTHOR ------------------------------------
+      //
+      // SANDVOX_NET_SMOKE_PAINT only (see the switch's note). One small brush
+      // op every 30 ticks at the player's feet, appended to the LOCAL batch
+      // phase N has just stored under `tick + kOpLabelAhead` -- i.e. before
+      // the send loop below reads that label, and into the same vector a
+      // human's stroke would have gone into. It is not a second mutation path: the op is merged,
+      // submitted and recorded exactly like any other.
+      if (netPaced && NetSmokePaint() && tick % 30 == 0) {
+        BrushOp b{};
+        b.x = ifloor(session.player.pos.x);
+        b.y = ifloor(session.player.pos.y) - 2;   // at the feet, not in them
+        b.z = ifloor(session.player.pos.z);
+        b.radius = 2;
+        b.material = kMatStone;
+        b.mode = 1u;   // overwrite: a paint-into-air op in solid ground is a
+                       // no-op and would prove nothing
+        opsync.Q().AppendLocalBrush(tick + opsync.Q().D(), b,
+                                    sandvox::opstream::Producer::Lab);
+      }
 
       // ---- M9.2-C: AND THE BATCH FOR T+D GOES OUT ------------------------
       //
@@ -11811,16 +11992,29 @@ int main(int argc, char** argv) {
         netBytesInPrev + (link ? link->Stats().bytesIn : 0);
     const uint64_t bOut =
         netBytesOutPrev + (link ? link->Stats().bytesOut : 0);
+    // M9.3-B adds the op fields. `opsSent`/`opsRecv` > 0 in BOTH directions
+    // is the two-process smoke's proof that the exchange ran at all;
+    // `cellsDropped` is the residency filter doing its job (a peer editing a
+    // chunk this machine does not hold), and `pollStalls` counts the frames
+    // the silence timer refused to blame on the peer.
     std::printf("net: role=%s batchesSent=%llu batchesRecv=%llu stalls=%llu "
                 "maxLag=%d late=%llu disconnects=%llu bytesIn=%llu "
-                "bytesOut=%llu\n",
+                "bytesOut=%llu opsSent=%llu opsRecv=%llu cellsDropped=%llu "
+                "mergedMax=%llu pollStalls=%llu\n",
                 netRoleBoot == NetRole::Host ? "host" : "client",
                 (unsigned long long)netBatchesSent,
                 (unsigned long long)netBatchesRecv,
                 (unsigned long long)netStalls, netMaxLag,
                 (unsigned long long)netLate,
                 (unsigned long long)netDisconnects,
-                (unsigned long long)bIn, (unsigned long long)bOut);
+                (unsigned long long)bIn, (unsigned long long)bOut,
+                (unsigned long long)netOpsSent,
+                (unsigned long long)netOpsRecv,
+                (unsigned long long)(netCellsDropped +
+                                     opsync.Q().droppedCells),
+                (unsigned long long)std::max(netMergedMax,
+                                             opsync.Q().mergedMax),
+                (unsigned long long)netPollStalls);
     std::fflush(stdout);
   }
   // A ghost owns real Jolt limb bodies and a kinematic capsule; drop them

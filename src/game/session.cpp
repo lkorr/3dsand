@@ -20,6 +20,7 @@
 #include "game/worlditems.h"
 #include "lab/lab.h"
 #include "measure/perfnodes.h"
+#include "net/opsync.h"
 #include "sim/celestial.h"
 #include "sim/currentprim.h"
 #include "sim/microvox.h"
@@ -358,6 +359,31 @@ struct PlayerScratch {
   HitStop& hitStop = s.sink ? s.sink->hitStop : w.hitStop; \
   DeathBody& deathBody = s.sink ? s.sink->deathBody : w.deathBody; \
   bool& deathFrozen = s.sink ? s.sink->deathFrozen : w.deathFrozen;
+
+// ---- WHEN THIS TICK'S OPS ACTUALLY LAND (M9.3-B) --------------------------
+//
+// Single-player: now. Connected: T + net::kOpLabelAhead, because the ops this
+// tick authored are labelled that far ahead, cross the wire inside that tick's
+// TickBatch, and are submitted by BOTH machines under that label
+// (net/opsync.h, which explains why the number is D + 1 and not D).
+//
+// Everything that asks "which tick should I rescan / re-settle after this
+// edit?" has to be told the LANDING tick, not the authoring tick. Told T, the
+// debris island scan runs five ticks before the crater exists, finds the rock
+// intact, and the overhang that the blast just cut free never falls — a bug
+// that would look like "explosions stopped dropping things over the network"
+// and have nothing to do with explosions.
+//
+// Three call sites read it, all of them debris.AddDestructionEvent: the laser
+// kerf (phase C), the brush's erase mode (phase G) and the explosion loop
+// (phase K). They were found by grepping AddDestructionEvent|lastExplosionTick
+// across this file; `lastExplosionTick` is deliberately NOT shifted — it only
+// feeds `particlesActive`'s 400-tick keep-awake window, where four ticks of
+// slack is inside the noise and shifting it would keep the particle passes
+// awake five ticks longer for no observable gain.
+static inline uint32_t OpLandingTick(const TickAuthorityCtx& w, uint32_t tick) {
+  return tick + (w.opsync ? w.opsync->Delay() : 0u);
+}
 
 // ---- PHASE A (PLAYER) - the controller, the look delta and the strike quantize
 // Verbatim from the single-body TickAuthority, lines 246-361 at 54fe241.
@@ -726,7 +752,8 @@ static void PhaseC(TickAuthorityCtx& w, WorldScratch& ws,
           // cutting through a support must drop the far side: rate-limited
           // island checks over the cut (support-loss flags catch the rest)
           if (tick % 8 == 0)
-            debris.AddDestructionEvent(tick, {hit.x - r, hit.y - r, hit.z - r},
+            debris.AddDestructionEvent(OpLandingTick(w, tick),
+                                       {hit.x - r, hit.y - r, hit.z - r},
                                        {hit.x + r, hit.y + r, hit.z + r});
         }
       }
@@ -1331,7 +1358,8 @@ static void PhaseG(TickAuthorityCtx& w, WorldScratch& ws,
           brush.BuildOp(world.Snap(), player.EyePos(), cam.Forward(), true, op)) {
         ops.push_back(op);
         // erasing can cut supports: queue an island check around the hole
-        debris.AddDestructionEvent(tick, {op.x - op.radius, op.y - op.radius, op.z - op.radius},
+        debris.AddDestructionEvent(OpLandingTick(w, tick),
+                                   {op.x - op.radius, op.y - op.radius, op.z - op.radius},
                                    {op.x + op.radius, op.y + op.radius, op.z + op.radius});
       }
 
@@ -2674,7 +2702,8 @@ static void PhaseK(TickAuthorityCtx& w, WorldScratch& ws,
         lastExplosionTick = tick;
         for (size_t ei = expBegin; ei < exps.size(); ei++) {
           const ExplosionOp& e = exps[ei];
-          debris.AddDestructionEvent(tick, {e.x - e.radius, e.y - e.radius, e.z - e.radius},
+          debris.AddDestructionEvent(OpLandingTick(w, tick),
+                                     {e.x - e.radius, e.y - e.radius, e.z - e.radius},
                                      {e.x + e.radius, e.y + e.radius, e.z + e.radius});
           // Blow voxels OFF the bodies in range before shoving what survives:
           // an explosion next to a rigidbody now craters it, and splits it into
@@ -2883,6 +2912,71 @@ static void PhaseN(TickAuthorityCtx& w, WorldScratch& ws,
   SV_OPS_REFS
   SV_PLAYER_REFS
   {
+      // ---- M9.3-B: THE OP EXCHANGE, AND IT IS ALL OF IT -----------------
+      //
+      // Everything above built THIS MACHINE's batch for tick `tick`. When a
+      // peer is connected that batch is not what gets submitted: it is
+      // labelled `tick + kOpLabelAhead` and stored, and what is submitted
+      // instead is the MERGE of the batches both machines labelled `tick` —
+      // which they authored that many ticks ago and exchanged in the
+      // meantime.
+      //
+      // THE ORDER IS AUTHOR-MAJOR, PUSH-ORDER-MINOR (net/opsync.h), so the
+      // two machines submit the same vector and CLAUDE.md rule 3's "the
+      // lowest op index owns the cell" names the same cell on both. If the
+      // merge ever had to reorder a LOCAL op relative to its push order to be
+      // canonical, that would mean a producer pushed after this point and the
+      // rule would be unenforceable — the plan's kill criterion. It cannot
+      // happen here: phase N is after every producer in the tick.
+      //
+      // THE METADATA HAS TO TRAVEL WITH THE BATCH. Author ranges
+      // (oprecord.h's scopes) are recorded against the vector the PRODUCING
+      // tick built and are consumed by the tick that SUBMITS it — the same
+      // tick, until the delay put them five ticks apart. So the ranges are resolved to a flat
+      // side table here, cleared, and re-noted at the merged indices inside
+      // Merge. Without it the record would attribute a client's own brush
+      // strokes to the host, whose ops precede them in the canonical order.
+      //
+      // SINGLE-PLAYER IS THE `else` AND IT IS NOT AN `else`: the whole block
+      // is behind one bool. Nothing is stored, nothing is copied, and the
+      // submitted vectors are the ones the tick built, in the order it built
+      // them — which is what the `--record-ops` oracle comparison proves.
+      if (w.opsync && w.opsync->Connected()) {
+        namespace opstream = sandvox::opstream;
+        net::OpDelayQueue& q = w.opsync->Q();
+        const uint32_t label = tick + q.D();
+        q.PushLocal(tick, out, world.WindowOrigin());
+        q.NoteLocalMeta(
+            label, opstream::ResolveAuthors(opstream::Stream::Brush,
+                                            (uint32_t)ops.size()),
+            opstream::ResolveAuthors(opstream::Stream::Explosion,
+                                     (uint32_t)exps.size()));
+        // The ranges belong to the batch that has just been stored; leaving
+        // them would let them claim indices in the MERGED vector, which is a
+        // different vector with different ops in it.
+        opstream::ClearAuthorRanges();
+
+        net::MergeStats ms;
+        std::vector<uint32_t> remoteBrush;
+        OpBatch merged = q.Merge(tick, world, ms, &remoteBrush);
+        // The local ops were marked modified at their own tick (phase L, by
+        // the machine that authored them); a REMOTE brush op touches chunks
+        // this machine never marked, and an unmarked chunk can be evicted
+        // with the edit still in it. Sticky and cheap, so marking here — one
+        // tick later than a local op would — is correct rather than merely
+        // close enough.
+        for (uint32_t i : remoteBrush) {
+          const BrushOp& b = merged.ops[i];
+          stream.MarkModifiedBox(
+              {b.x - b.radius, b.y - b.radius, b.z - b.radius},
+              {b.x + b.radius, b.y + b.radius, b.z + b.radius});
+        }
+        // `ops`, `exps`, `cellOps`, `spawns` and `fluidSpawns` are references
+        // to out's members (SV_OPS_REFS), so assigning `out` re-points every
+        // one of them at the merged vectors and the submit below needs no
+        // change at all.
+        out = std::move(merged);
+      }
       tSubmit0 = NowSeconds();
       SubmitTick(ctx, world, sim, tick, kDefaultSeed, ops, exps, cellOps,
                  tick % 15 == 0 /*hash occasionally*/, pc, true, particlesActive,

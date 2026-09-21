@@ -577,6 +577,10 @@ add_library(sandvox_core OBJECT
   # PlayerStates (M9.4-A) and is here only because it lives in src/net.
   src/net/authority.cpp
   src/net/link.cpp
+  # opsync.cpp is the op exchange (M9.3-B): the delay queue, the wire blob and
+  # the canonical merge. Pure too — the only engine type it touches is World,
+  # and only to ask whether a chunk is resident.
+  src/net/opsync.cpp
   src/net/protocol.cpp
 )
 # src/audio is on the path so the VENDORED engine's own `#include "xyzpan/..."`

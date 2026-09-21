@@ -101,6 +101,14 @@
 #include "sim/world.h"
 #include "ui/overlay.h"
 
+// THE OP EXCHANGE, BY NAME ONLY (M9.3-B). net/opsync.h includes this header
+// for OpBatch, so the dependency has to point one way: a pointer to an
+// incomplete type is all TickAuthorityCtx needs, and the two .cpp files that
+// actually call it include the real header.
+namespace net {
+class OpSync;
+}
+
 // ---- small per-player value types, moved out of main() --------------------
 
 // Thrown bouncing bomb — the first CPU gameplay projectile (DESIGN.md §8).
@@ -582,6 +590,28 @@ struct TickAuthorityCtx {
   // pre-package oracle. That identity is the acceptance criterion; the
   // guards at each of the four call sites are what buys it.
   RemotePlayers* remotes = nullptr;
+
+  // ---- G. THE OP EXCHANGE (M9.3 package B, net/opsync.h).
+  //
+  // Per-WORLD, like the ghosts, and owned by main() for the same reason (the
+  // frame loop is what polls the socket). NULL IN EVERY HARNESS and in every
+  // single-player frame, and even when it is non-null it does nothing until
+  // `Connected()`.
+  //
+  // WHAT IT CHANGES WHEN IT IS CONNECTED, in one sentence: the batch this tick
+  // produces is not the batch this tick SUBMITS. Ops authored at T are labelled
+  // T + D, travel to the peer inside that tick's TickBatch, and both machines
+  // submit the merged (local + peer) batch for label T at tick T — in author
+  // order, so the two op vectors are identical and rule 3's "lowest op index
+  // owns the cell" means the same thing on both. Phase N is the only phase
+  // that merges; phases C, G and K read `Delay()` because the CPU-side
+  // consumers they raise (debris.AddDestructionEvent) are tick-LABELLED and the
+  // crater they are about to be told to rescan does not exist for D ticks yet.
+  //
+  // Forward-declared rather than included: net/opsync.h includes THIS header
+  // for OpBatch, so including it here would be a cycle. session.cpp and
+  // main.cpp include it.
+  net::OpSync* opsync = nullptr;
 };
 
 // ---- one tick of authority, for N players ---------------------------------
