@@ -1256,9 +1256,19 @@ struct Hit {
   hit      : bool,
   saturated: bool,    // media absorbed the ray before any surface hit
   t        : f32,
-  tExit    : f32,     // where the ray leaves the window box (0 if it misses):
-                      // the far-field march starts here, never inside the
-                      // window, so coarse data can't occlude fine data
+  tExit    : f32,     // where the FINE REPRESENTATION stops (0 if the ray
+                      // misses the window): the far-field march starts here,
+                      // never inside marched space, so coarse data can't
+                      // occlude fine data.
+                      //
+                      // NOT necessarily the window face. The in-window LOD
+                      // handoff shortens this to render.lodHandoffDist, so a
+                      // consumer that wants the extent of SIM-RESIDENT DATA
+                      // rather than the extent of the fine march must call
+                      // windowExitT() instead — the MPM fluid does, and got
+                      // silently clipped by the handoff for as long as it
+                      // didn't. Anything else that lives on window slots and
+                      // has no cascade representation has the same problem.
 
   cell     : vec3<i32>,
   axis     : i32,     // axis stepped into the hit cell
@@ -8828,6 +8838,51 @@ fn fluidThickness(ro : vec3f, rd : vec3f, tHit : f32, tEnd : f32,
 // tExit <= 0 means the ray misses the box. The empty box (lo > hi, the no-fluid
 // state) makes tEnter > tExit on every ray by construction, so "no fluid" and
 // "ray points away from the fluid" take the same early-out.
+// The residency window's FAR FACE along the ray, or 0 if the ray misses the
+// window box entirely. Same six-multiply slab test trace() opens with, against
+// the same box (R.origin * CHUNK, WORLD_N on a side).
+//
+// WHY THIS IS RECOMPUTED AND NOT CARRIED OUT OF trace() IN `Hit`: it is a
+// handful of ALU, and this shader has no register headroom — `Hit` is live
+// across the whole trace call and across every shading system after it, so one
+// more f32 in it is paid by every pixel on every path, while this is paid only
+// by the fluid branch on the pixels that take it.
+//
+// WHY IT IS NOT h.tExit, which is the bug it exists to fix: h.tExit is where
+// the FINE MARCH stopped, and the in-window LOD handoff shortens that to
+// render.lodHandoffDist (see the long note in trace()). The MPM fluid lives on
+// residency-window slots and has NO far-field representation at all — the
+// cascade cannot draw it, so nothing picks it up past the handoff. Bounding it
+// by the fine march therefore deleted it: with the handoff enabled, every ray
+// that hit nothing clipped water at lodHandoffDist instead of the window face,
+// a pool between the two stopped rendering, and turning a PERF knob moved the
+// water's edge. The fluid's bound must track the WINDOW, not the fine march.
+//
+// The same reasoning covers the case where the handoff collapses the fine
+// march to nothing (camera outside the window, so tEnter >= the handoff):
+// trace() returns tExit = 0 there, which would skip the fluid on a ray that
+// does cross the window and does have water in it.
+fn windowExitT(ro : vec3f, rdIn : vec3f) -> f32 {
+  // Nudged off the axes exactly as fluidMarch does: an exact 0 component makes
+  // inv infinite, and (face - ro) * inf is NaN when the ray starts on that
+  // face, which would poison the min() into returning "no window".
+  var rd = rdIn;
+  if (abs(rd.x) < 1e-6) { rd.x = select(-1e-6, 1e-6, rd.x >= 0.0); }
+  if (abs(rd.y) < 1e-6) { rd.y = select(-1e-6, 1e-6, rd.y >= 0.0); }
+  if (abs(rd.z) < 1e-6) { rd.z = select(-1e-6, 1e-6, rd.z >= 0.0); }
+  let inv = 1.0 / rd;
+  let wlo = vec3f(R.origin * i32(CHUNK));
+  let t0 = (wlo - ro) * inv;
+  let t1 = (wlo + vec3f(f32(WORLD_N)) - ro) * inv;
+  let tn = min(t0, t1);
+  let tf = max(t0, t1);
+  let tEnter = max(max(tn.x, tn.y), max(tn.z, 0.0));
+  let tExit  = min(tf.x, min(tf.y, tf.z));
+  // Miss (or wholly behind the camera) reports 0, which is what every fluid
+  // march treats as "nothing to do" (tMax <= 0 early-out).
+  return select(0.0, tExit, tExit > tEnter);
+}
+
 fn fluidBoundsSpan(ro : vec3f, inv : vec3f) -> vec2f {
   let lo = vec3f(R.fluidLo);
   let hi = vec3f(R.fluidHi) + vec3f(1.0);   // inclusive cell -> its far face
@@ -9635,7 +9690,9 @@ fn fs(in : VSOut) -> FSOut {
   mf.hit = false;
   mf.blocky = false;
   if (SPEC_FLUID && R.fluidCount > 0u) {
-    let sceneT = select(h.tExit, h.t, h.hit || h.saturated);
+    // windowExitT, NOT h.tExit — the fine march's stop is not the extent of
+    // the sim-resident data the fluid lives in. See windowExitT's note.
+    let sceneT = select(windowExitT(R.camPos, rd), h.t, h.hit || h.saturated);
     let mode = i32(round(TUNE_FLUID_SURFACE));
     if (mode == 1) {
       mf = fluidMarch(R.camPos, rd, sceneT);
