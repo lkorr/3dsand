@@ -246,6 +246,14 @@ const char* const kOrder[] = {
     // and `undead` use, and what lets it sit between two gates that know
     // nothing about it.
     "two-players",
+    // A PEER'S BODY IN THE SAME WORLD (M9.2 package B). Immediately after
+    // `two-players` and for the same reasons, plus one of its own: it reuses
+    // that gate's window origin, its flat-spot search and its "crowder"
+    // targeting fixture, so the two share a shape a reader can check side by
+    // side. Self-contained in both directions in the same way — it resets
+    // debris and mobs into every arm and regenerates pristine worldgen at
+    // kDefaultSeed on the way out.
+    "remote-ghost",
     "debris",
     // `audio-spatial` touches no World at all (it is the mixer and a Camera),
     // so its slot is free; it sits with the other audio gates.
