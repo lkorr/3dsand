@@ -98,7 +98,8 @@ bool WriteAll(const std::vector<uint8_t>& b) {
 const char* ProducerName(uint8_t p) {
   static const char* kNames[] = {"unknown", "brush",     "spell",
                                  "mob",     "avatar",    "debris",
-                                 "editlayer", "worldgen", "lab"};
+                                 "editlayer", "worldgen", "lab",
+                                 "remote"};
   return p < (uint8_t)Producer::Count ? kNames[p] : "?";
 }
 
@@ -208,6 +209,25 @@ void NoteCellDupes(uint32_t tick, uint32_t dropped, uint32_t firstCellIdx) {
   g_counts.cellDupes += dropped;
   g_counts.ticksWithDupes++;
 }
+
+void NoteAuthorityViolation(uint32_t tick, uint32_t producer, int32_t wcx,
+                            int32_t wcy, int32_t wcz, uint32_t owner) {
+  // FIRST one only for the attribution, so a tick that trespasses a thousand
+  // times still names the chunk it started in rather than the last one it
+  // touched. The first is the one with a cause; the thousandth is a
+  // consequence.
+  if (g_counts.authorityViolations == 0) {
+    g_counts.firstViolTick = tick;
+    g_counts.firstViolProducer = producer;
+    g_counts.firstViolOwner = owner;
+    g_counts.firstViolChunk[0] = wcx;
+    g_counts.firstViolChunk[1] = wcy;
+    g_counts.firstViolChunk[2] = wcz;
+  }
+  g_counts.authorityViolations++;
+}
+
+void NoteUnknownProducer() { g_counts.unknownProducers++; }
 
 // ---- recording ------------------------------------------------------------
 

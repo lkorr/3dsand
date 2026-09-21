@@ -14,6 +14,7 @@
 #include <cstdlib>
 
 #include "gpu/resources.h"
+#include "net/authority.h"
 #include "measure/perfscope.h"
 #include "sim/biomes.h"
 #include "sim/farfield.h"
@@ -615,6 +616,85 @@ void SubmitTick(GpuContext& ctx, World& world, Simulation& sim, uint32_t tick,
       brushTrunc, expTrunc, (uint32_t)cells.size() - cellCount,
       (uint32_t)spawns.size() - spawnCount,
       (uint32_t)fluidSpawns.size() - fluidSpawnCount, 0);
+  // ---- THE SINGLE-PRODUCER CHECK (PLAN_multiplayer_m9 §4 finding 4) -------
+  //
+  // Under M9 every world-authored system (mobs, debris, worldgen patch-ups)
+  // must run over a chunk on EXACTLY ONE machine, or the chunk gets the op
+  // twice and the two worlds diverge in a way no hash comparison can
+  // attribute. That rule is enforced by construction in the systems
+  // themselves (M9.4-B/C); this is the AUDIT that says whether they did it,
+  // placed at the one choke point every op passes through.
+  //
+  // It OBSERVES. It never refuses an op, because dropping one would turn a
+  // plumbing bug into a missing voxel — CLAUDE.md rule 6's exact failure
+  // mode. The counts and the first offender's attribution go to
+  // build/last_run.json's `opstream` block; only SANDVOX_NET_STRICT=1 aborts.
+  //
+  // COST WHEN SINGLE-PLAYER: one null pointer test. `net::Hook()` is null
+  // unless a connected game installs a hook (M9.4-D), so no gate, no smoke
+  // and no single-player frame executes a line of this, and the bytes that
+  // reach the GPU are unchanged. That is why this package may not move the
+  // determinismHash.
+  if (const net::AuthorityHook* hook = net::Hook()) {
+    const std::vector<opstream::OpMeta> opMeta =
+        opstream::ResolveAuthors(opstream::Stream::Brush, (uint32_t)ops.size());
+    const std::vector<opstream::OpMeta> expMeta = opstream::ResolveAuthors(
+        opstream::Stream::Explosion, (uint32_t)exps.size());
+    const net::AuthorityMemory kNoMemory;
+    const net::AuthorityMemory& mem =
+        hook->chunkMemory ? *hook->chunkMemory : kNoMemory;
+    uint32_t viol = 0;
+    auto check = [&](uint32_t producer, IVec3 wc) {
+      if (producer == (uint32_t)opstream::Producer::Unknown) {
+        opstream::NoteUnknownProducer();
+        return;
+      }
+      // Only the chunk-gated producers can trespass. A brush stroke is
+      // author-gated and legal anywhere the player's arm reaches, so asking
+      // ChunkAuthority about it would report a violation every time a player
+      // painted near the boundary — which is the behaviour the game is FOR.
+      if (producer != (uint32_t)opstream::Producer::Count &&
+          !net::ProducerNeedsChunkAuthority((uint8_t)producer))
+        return;
+      const uint32_t owner = net::ChunkAuthority(wc, hook->peers, mem);
+      if (owner == hook->me) return;
+      opstream::NoteAuthorityViolation(tick, producer, wc.x, wc.y, wc.z, owner);
+      viol++;
+    };
+    for (size_t i = 0; i < ops.size(); i++)
+      check(opMeta[i].producer,
+            net::ChunkOfVoxel({ops[i].x, ops[i].y, ops[i].z}));
+    for (size_t i = 0; i < exps.size(); i++)
+      check(expMeta[i].producer,
+            net::ChunkOfVoxel({exps[i].x, exps[i].y, exps[i].z}));
+    // CELL OPS carry a SLOT index, not world coords (sim_mutate.wgsl:184 and
+    // §4 finding 3), so the chunk they name is only knowable under MY window
+    // origin — an aliased slot (wc + 32k) reads as the local chunk and that is
+    // precisely why a remote CellOp may never be applied. Decoded here through
+    // the same World helper the sim uses, and skipped for a slot the window's
+    // arithmetic cannot produce (a ticket slot; kTicketSlots is 0 at P0).
+    // Producer::Count marks "a CellOp" in the attribution: a CellOp has no
+    // OpMeta, so there is no producer name to give.
+    for (uint32_t i = 0; i < cellCount; i++) {
+      const uint32_t slot = cells[i].cellIdx / kChunkVol;
+      if (!World::IsWindowSlot(slot)) continue;
+      check((uint32_t)opstream::Producer::Count, world.SlotToWorldChunk(slot));
+    }
+    if (viol && hook->strict) {
+      const opstream::StreamCounts& c = opstream::Counts();
+      std::fprintf(stderr,
+                   "FATAL SANDVOX_NET_STRICT: tick %u emitted %u op(s) into "
+                   "chunks player %u does not own; first was producer %s at "
+                   "chunk (%d,%d,%d), owned by %d\n",
+                   tick, viol, hook->me,
+                   c.firstViolProducer == (uint32_t)opstream::Producer::Count
+                       ? "cellop"
+                       : opstream::ProducerName((uint8_t)c.firstViolProducer),
+                   c.firstViolChunk[0], c.firstViolChunk[1],
+                   c.firstViolChunk[2], (int32_t)c.firstViolOwner);
+      std::abort();
+    }
+  }
   TickParams tp{tick, seed, (uint32_t)ops.size(), hashEnable ? 1u : 0u,
                 (uint32_t)exps.size(), sim.Page(), cellCount, 0};
   tp.spawnCount = spawnCount;

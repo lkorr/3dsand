@@ -570,6 +570,9 @@ add_library(sandvox_core OBJECT
   # The network layer (docs/PLAN_multiplayer_m9.md M9.2). Beside telemetry.cpp
   # because they are the only two TUs that open a socket, and ws2_32 is already
   # in SANDVOX_LINK_LIBS below for exactly that reason.
+  # authority.cpp opens nothing at all — it is pure arithmetic over two
+  # PlayerStates (M9.4-A) and is here only because it lives in src/net.
+  src/net/authority.cpp
   src/net/link.cpp
   src/net/protocol.cpp
 )
