@@ -5906,7 +5906,7 @@ and the projectile dies when it is spent; lifetimes, live projectile counts,
 multiplicity, fan count and generation are capped in `glyphs.json` and clamped
 against engine ceilings at load.
 
-#### The grammar (three rules; `ParseSpell`, `LowerBox`, `LowerSpell`)
+#### The grammar (four rules; `ParseSpell`, `LowerBox`, `LowerSpell`)
 
 Hundreds of glyphs, uncountably many sequences, every one does the predictable
 literal thing, and nobody ever writes a rule for a specific combination. The
@@ -5923,16 +5923,19 @@ record fields), **Mod** (a field edit on the delivery record: `field`, `op`,
 `amount`), **Operator** (a verb with argument slots — `left`/`right` list the
 sorts each accepts, `result` the sort produced; every unary operator takes the
 one item BEFORE it, only `transmute` is infix), and
-**Separator** (`also`, which ends one sentence and starts the next). Nothing
+**Separator** (`lane`, which opens a segment of the pile belonging to one
+instance of the box that closes it; the enum value kept the name after `also`
+was dropped for rule 4). Nothing
 in C++ knows which words exist. The C++ vocabulary is the sort names, the verb
 names (`spray`, `place`, `convert`, `explode`, `wind`, `mend`, `trail`,
 `sustain`, `filter`, `repeat`, `launch`) and the record field names — each verb
 maps to ONE op type or ONE engine seam, and `ApplySpellEffect` switches on the
 verb and nothing else.
 
-**Three rules, and they are the whole grammar** (rewritten 2026-09-10; the
-2026-09-04 six-rule version is superseded, and `docs/PLAN_magic_grammar.md` §2
-R4/R6 and §11.4 are marked as such):
+**Four rules, and they are the whole grammar** (rewritten 2026-09-10, rule 4
+added 2026-09-21 from `docs/PLAN_spell_graph.md` §2–3; the 2026-09-04 six-rule
+version is superseded, and `docs/PLAN_magic_grammar.md` §2 R4/R6 and §11.4 are
+marked as such):
 
 - **1. A NOUN GOES INTO THE PILE.** A Matter word, an Effect word, or an
   operator group whose result sort is Effect is pushed onto the PILE. Order
@@ -5964,12 +5967,58 @@ R4/R6 and §11.4 are marked as such):
   wasted: it landed on your hand, which has no speed") rather than quietly
   editing a field nobody reads.
 
-The outermost box is ALWAYS `hand`, so the whole utterance lowers to ONE cast —
-unless **`also`** is spoken. `also` is a new sort (`separator`, word cost 0):
-it closes the current pile as a finished cast, hand-delivered if no delivery
-closed it, and starts a new one. **Law L4 (cost additivity, union of emissions)
-attaches to `also`**, not to a delivery, because a delivery no longer ends
-anything.
+- **4. `lane` OPENS A SEGMENT OF THE PILE THAT BELONGS TO ONE INSTANCE.** The
+  first segment of a pile is SHARED by every instance of the box that closes
+  it; each `lane` word (sort `separator`, word cost 0) opens a segment that
+  belongs to exactly one of them. The box fires
+  `instances = max(count, L)`: instance *i* < L carries shared ∪ lane[*i*+1],
+  instance *i* ≥ L carries the shared segment alone. So `explosive lane
+  gunpowder lane fire projectile` is two exploding bolts, one spraying
+  gunpowder and the other fire, from one utterance — the thing the first three
+  rules could not say, because a fan was a copy machine. A lane WALLS binding
+  (in `fire lane trail` the item under `trail` is the mark, not `fire`, so the
+  operator is incomplete) and WALLS merging (`fire lane fire` is two items in
+  two lanes, not `fire×2`) — `NodeKey` carries the lane, which is what makes
+  both true at once. The one exception is `count`: a `shotgun` or `twin`
+  anywhere in the pile is RECORD-WIDE, because count *is* the fan and a lane is
+  one instance of it. A `lane` with nothing after it is an empty lane: the
+  instance exists and carries the shared segment. **A delivery closes the whole
+  pile, lanes included, and resets the segment counter** — the box it makes is
+  one item in the shared segment of a fresh pile, which is what keeps nesting
+  from inheriting a parent's columns.
+
+The outermost box is ALWAYS `hand`, so the whole utterance lowers to ONE cast.
+**`also` is gone** (2026-09-21): two unrelated spells in one cast are two
+columns of the hand box (`lane explosive projectile lane blood mend self`), and
+**law L4 (cost additivity, union of emissions) attaches to ROOT LANES**. There
+is no sentence separator left; `SpellTree::clauses` survives as a vector that
+holds one clause, so the UI and the gates keep their shape.
+
+**COPIES FAN, COLUMNS DO NOT.** `SpellFan` spreads only the instances whose
+payload is the shared-only copy; an instance that carries a lane fires ON THE
+AIM, with no fanned resolve offset, because it is not a copy of anything — it
+is a second spell the player asked for, and a projectile in the right-hand
+column should fly at the crosshair. With no lanes the fan behaves exactly as it
+always did.
+
+**One helper carries rule 4 into the runtime: `InstanceCast(cast, i)`.**
+`DeliveryRec` gains `std::vector<SpellLane> lanes`, where a `SpellLane` is
+`{DeliveryRec rec, std::vector<EffectInst> extra}` — the lane's record is the
+shared one with that lane's Mods applied on top and its trail merged in, and
+`extra` is the nouns only that instance carries (a lane's own `rec.lanes` is
+always empty, so the knot is one level deep, tied the way
+`EffectInst::launch` ties it). `InstanceCast` returns the cast instance *i*
+actually flies with, and returns the cast UNCHANGED when there are no lanes.
+Every fan loop calls it — `Cast()` for the hand's instances, `AdoptLaunches`
+for a nested box (which carries its lanes inside the `SpellLaunchReq`'s
+record), and from there `Launch()` / `RequestBody()`. `ApplySpellEffect` never
+sees a lane: it is handed one instance's payload, which is what thesis 2 wants.
+Pricing follows the same shape — the tariff is Σ over instances of
+tariff(shared ∪ lane_i), which is the old `tariff(shared) × instances` exactly
+when L = 0, and `EffectVolume` / the rule-2 tick bound take the widest and
+longest-lived lane. The stack bound went 16 → 24 (`kSpellStackMax`,
+`budgets.maxMacroWords`) because three lanes of two effects, a fan, a delivery
+and a mod do not fit in sixteen words.
 
 Unary operators (`trail`, `aura`, `echo`, `null`, `mend`) take the ONE item
 immediately before them, which may now be a launch box: `explosive projectile
@@ -6061,8 +6110,11 @@ alphabet, generated in the test: L1 totality (non-empty cast list, finite
 cost, non-empty description), L2 pile commutativity (permuting nouns and
 pending mods within one pile lowers to an IDENTICAL cast list, compared field
 by field), L3 multiplicity (`g g` ≡ `g×2` exactly until the cap — except a
-delivery, which nests N deep, and `also`, which is N+1 sentences), L4 `also`
-additivity (`cost(A also B) = cost(A) + cost(B)` and the casts are the union),
+delivery, which nests N deep, and `lane`, which opens N segments and so fires
+N instances), L4 ROOT-LANE additivity (`cost(lane A lane B) = cost(A) +
+cost(B)`, two instances, the first carrying exactly what `A` lowers to and the
+second what `B` does — excluding a delivery or a `count` mod in either arm,
+since both are rules that deliberately reach across a lane),
 L5 delivery invariance (the payload INSIDE the box of `E… D` is identical for
 every flight D; only the record differs), L6 locality (a unary operator's
 operand is exactly the item to its left, and inserting a word anywhere outside
@@ -6074,7 +6126,16 @@ runtime, since a sentence may legally SAY more than the engine will do),
 `E D1 D2` box is exactly one Launch whose payload is bit-for-bit the lowering
 of `E D1`), **L10 mod placement** (`E μ D` ≡ `μ E D`, and in `E D μ` the mod is
 on the hand record and never reaches inside the box), **L11 flattening** (a
-Fatal cast of any sequence emits no launches). A change that breaks a law
+Fatal cast of any sequence emits no launches), and **L12 lanes** — (a) `E lane
+F D` lowers to ONE instance carrying exactly what `E F D` carries at exactly
+the same price, the compatibility claim that makes rule 4 free; (b) in `E lane
+F twin D` instance 0 is `E F D`'s payload, instance 1 is `E D`'s, and the
+tariff is their sum; (c) a sentence with no `lane` word grows no lane anywhere
+in its lowering, which is why every pinned price in the repo is unmoved. Check
+(9) is rule 4 at runtime: `explosive lane fire twin projectile` fires two bolts
+of which exactly one carries the fire, and `lane explosive projectile lane
+blood mend self` leaves a bolt AND a graft from one utterance. A change that
+breaks a law
 breaks a *class* of spells, which is what the line says; a change that moves one
 spell's numbers is a rebaseline.
 

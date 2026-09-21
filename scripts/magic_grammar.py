@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 """Reference interpreter for the magic grammar (DESIGN.md §8, docs/PLAN_magic_grammar.md).
 
-Executable spec: the THREE parse rules and the lowering are written here once,
+Executable spec: the FOUR parse rules and the lowering are written here once,
 and docs/MAGIC_PERMUTATIONS.md is GENERATED from it, so every row of the
 permutation tables is derived from the same rules rather than hand-written.
 It is also the oracle the C++ `spells-oracle` gate compares against.
@@ -15,6 +15,12 @@ It is also the oracle the C++ `spells-oracle` gate compares against.
      delivery spoken; with no delivery it sticks to `hand`, where `shotgun` is
      three fanned resolve points and `float` is the hop and everything else is
      a charged no-op.
+  4. `lane` OPENS A SEGMENT OF THE PILE THAT BELONGS TO ONE INSTANCE of the box
+     that closes it. The first segment is SHARED; the box fires
+     max(count, lanes) instances, instance i carries shared + lane i+1, and an
+     instance past the last lane carries the shared segment alone. A lane walls
+     operator binding and run merging; a `count` mod is record-wide wherever it
+     was spoken.
 
   python scripts/magic_grammar.py                 # regenerate the doc
   python scripts/magic_grammar.py --oracle        # assets/spells/grammar_oracle.json for the C++ gate
@@ -139,13 +145,24 @@ MODS = [
 for mid, word, field, axis, desc in MODS:
     glyph(mid, 'X', word, desc, field=field, repeat='compose', axis=axis)
 
-# ---- the separator ------------------------------------------------------------
-glyph('also', 'Sep', 0,
-      'Ends this sentence and starts the next. Everything spoken before it is one finished '
-      'cast, delivered by hand if no delivery closed it; everything after is a second. Costs '
-      'add and both go off together. Without it a whole utterance is ONE cast, however many '
-      'deliveries nest inside it.',
-      axis='sentences')
+# ---- the separator (rule 4) ---------------------------------------------------
+glyph('lane', 'Sep', 0,
+      'Opens a SEGMENT of the pile that belongs to ONE instance of the box that closes it. '
+      'The first segment is shared by every instance; the first `lane` word opens the segment '
+      'instance 0 carries on top of it, the second the segment instance 1 carries, and so on. '
+      'The box fires max(count, lanes) instances; an instance past the last lane carries the '
+      'shared segment alone. A lane walls binding and merging, and a `count` mod is record-wide '
+      'wherever it is spoken. With no delivery the lanes are the hand\'s, which is how two '
+      'unrelated spells are said at once.',
+      axis='segments (one instance each)')
+glyph('twin', 'X', 3, 'Two of it, fanned. Said again: four. The double of `shotgun`\'s triple; '
+      'everything behind it is paid that many times.',
+      field='count', repeat='compose', axis='count x2 (2, 4, 8 ...), fanned')
+
+# What one utterance of a `count` mod multiplies the fan by. Content, so
+# `twin` is a row and not a branch.
+G['shotgun']['amount'] = 3
+G['twin']['amount'] = 2
 
 MAX_MULT = 6
 
@@ -182,14 +199,22 @@ def accepts(slot, item):
     return sort_of(item) in slot
 
 
+def lane_of(item):
+    return item.get('lane', 0)
+
+
 def key(item):
+    # RULE 4: the segment is part of the identity, so `fire lane fire` is two
+    # items in two lanes and not `fire x2`. Only a non-shared lane is spelled,
+    # so every sentence without a `lane` word keys exactly as it always did.
+    ln = '@%d' % lane_of(item) if lane_of(item) else ''
     if item['kind'] == 'box':
-        return '[%s|%s]' % (','.join('%s#%d' % (key(i), i['n']) for i in item['items']),
-                            item['d'])
+        return '[%s|%s]%s' % (','.join('%s#%d' % (key(i), i['n']) for i in item['items']),
+                              item['d'], ln)
     if item['kind'] == 'raw':
-        return item['g']
-    return '(%s|%s|%s)' % (key(item['left']) if item['left'] else '',
-                           item['op'], key(item['right']) if item['right'] else '')
+        return item['g'] + ln
+    return '(%s|%s|%s)%s' % (key(item['left']) if item['left'] else '',
+                             item['op'], key(item['right']) if item['right'] else '', ln)
 
 
 def merge_pile(pile):
@@ -206,8 +231,8 @@ def merge_pile(pile):
     return list(merged.values())
 
 
-def box(pile, delivery):
-    return dict(kind='box', d=delivery, n=1, items=merge_pile(pile))
+def box(pile, delivery, nlanes=0):
+    return dict(kind='box', d=delivery, n=1, items=merge_pile(pile), nlanes=nlanes)
 
 
 def merge_runs(ids):
@@ -225,20 +250,28 @@ def merge_runs(ids):
 
 
 def parse(ids):
-    """Returns a list of clauses, one per sentence. Each is the ROOT hand box
-    plus the payload/mods split of its pile."""
+    """Returns a list of clauses — since `also` was dropped for rule 4 there is
+    exactly one (or none, for silence). Each is the ROOT hand box plus the
+    payload/mods split of its pile."""
     clauses = []
     pile = []
     items = merge_runs(ids)
     i = 0
+    # RULE 4 state: the segment everything pushed from here belongs to, how far
+    # down the pile an operator may reach (a lane mark WALLS binding), and how
+    # many segments the box that closes this pile will have.
+    cur_lane = 0
+    lane_floor = 0
+    nlanes = 0
     while i < len(items):
         it = items[i]
         g = G[it['g']] if it['kind'] == 'raw' else None
         s = g['sort'] if g else None
         if s == 'Op':
             left = right = None
-            # THE ONE ITEM TO ITS LEFT — the top of the pile, which may be a box.
-            if g['left'] and pile and accepts(g['left'], pile[-1]):
+            # THE ONE ITEM TO ITS LEFT — the top of the pile, which may be a box
+            # — but never below the lane floor.
+            if g['left'] and len(pile) > lane_floor and accepts(g['left'], pile[-1]):
                 left = pile.pop()
             if g['right'] and i + 1 < len(items) and accepts(g['right'], items[i + 1]):
                 right = items[i + 1]
@@ -246,17 +279,24 @@ def parse(ids):
             complete = (g['left'] is None or left is not None) and \
                        (g['right'] is None or right is not None)
             pile.append(dict(kind='group', op=it['g'], n=it['n'], left=left,
-                             right=right, complete=complete))
+                             right=right, complete=complete, lane=cur_lane))
         elif s == 'D':
-            pile = [box(pile, it['g'])]     # RULE 2
+            b = box(pile, it['g'], nlanes)  # RULE 2
+            b['lane'] = 0
+            pile = [b]
+            cur_lane = 0
+            lane_floor = 0
+            nlanes = 0
         elif s == 'Sep':
-            clauses.append(clause_of(box(pile, 'hand')))
-            pile = []
+            cur_lane += 1                   # RULE 4: a MARK, not an item
+            nlanes = cur_lane
+            lane_floor = len(pile)
         else:
+            it['lane'] = cur_lane
             pile.append(it)                 # RULE 1
         i += 1
     if ids:
-        clauses.append(clause_of(box(pile, 'hand')))
+        clauses.append(clause_of(box(pile, 'hand', nlanes)))
     return clauses
 
 
@@ -292,9 +332,24 @@ def x(n):
     return '' if n == 1 else '×%d' % n
 
 
+def show_items(items, nlanes):
+    """A list of pile items, lanes marked. Items are in spoken order and a lane
+    index never decreases along it, so a segment is a contiguous run. ` / ` in
+    both bracket styles, because the C++ compares these strings verbatim."""
+    parts = []
+    lane = 0
+    for it in items:
+        l = lane_of(it)
+        parts += ['/'] * (l - lane)
+        lane = l
+        parts.append(show(it))
+    parts += ['/'] * (nlanes - lane)
+    return ' '.join(parts)
+
+
 def show(item):
     if item['kind'] == 'box':
-        s = ' '.join(show(i) for i in item['items'])
+        s = show_items(item['items'], item.get('nlanes', 0))
         if s:
             s += ' '
         return '[%s**%s%s**]' % (s, item['d'], x(item['n']))
@@ -311,9 +366,9 @@ def show(item):
 def bracket(ids):
     parts = []
     for c in parse(ids):
-        s = ' '.join(show(i) for i in c['bag'])
+        s = show_items(c['bag'], c['root'].get('nlanes', 0))
         parts.append(s or '(empty)')
-    return ' ‖ '.join(parts)
+    return ' '.join(parts)
 
 # --------------------------------------------------------------------------
 # Describe: one recursive sentence per cast
@@ -341,7 +396,7 @@ def record_words(d, mods):
             continue
         n = m['n']
         if g['field'] == 'count':
-            fan *= 3 ** n
+            fan *= g.get('amount', 3) ** n
         elif m['g'] == 'swift':
             adj.append('fast')
         elif m['g'] == 'slow':
@@ -412,11 +467,41 @@ def phrase(item):
     return '?'
 
 
+def lane_items(b, lane):
+    return [i for i in b['items'] if lane_of(i) == lane]
+
+
+def lane_clause(b, lane, noun):
+    """WHAT ONE LANE CHANGES, as a fragment: only the difference from what
+    every instance carries (rule 4)."""
+    parts = []
+    mine = lane_items(b, lane)
+    mods = [i for i in mine if sort_of(i) == 'X']
+    adj, _post, _fan, _w, _waits = record_words(b['d'], mods)
+    if adj:
+        parts.append('is ' + adj)
+    for it in mine:
+        if sort_of(it) in ('E', 'M'):
+            parts.append('also ' + phrase(it))
+    head = 'the %s %s ' % (ORDINAL[lane - 1] if lane <= len(ORDINAL) else 'next', noun)
+    if not parts:
+        return head + 'carries only what they all carry'
+    return head + ' and '.join(parts)
+
+
+ORDINAL = ['first', 'second', 'third', 'fourth', 'fifth', 'sixth', 'seventh', 'eighth']
+
+
+def instances_of(b, fan):
+    return min(max(fan, b.get('nlanes', 0)), 27)
+
+
 def launch_sentence(b, that):
     d = b['d']
     g = G[d]
     payload, mods = split_pile(b)
     adj, post, fan, wasted, waits = record_words(d, mods)
+    fan = instances_of(b, fan)
     noun = g['noun']
     if fan > 1:
         head = '%d fanned %s%ss' % (fan, adj + ' ' if adj else '', noun)
@@ -433,12 +518,15 @@ def launch_sentence(b, that):
     if waits:
         trig += ' it waits %d ticks, then' % waits
         join = ' '
-    parts = [phrase(p) for p in payload]
+    parts = [phrase(p) for p in lane_items(b, 0) if sort_of(p) in ('E', 'M')]
     if not parts:
         parts = ['does nothing but knock what it hit' if mech_of(d) == 'flight'
                  else 'does nothing']
-    return '%s; %s%s%s %s' % (head, trig, join, 'each' if fan > 1 else 'it',
-                              ' and '.join(parts))
+    out = '%s; %s%s%s %s' % (head, trig, join, 'each' if fan > 1 else 'it',
+                             ' and '.join(parts))
+    for k in range(1, b.get('nlanes', 0) + 1):
+        out += '; ' + lane_clause(b, k, noun)
+    return out
 
 
 MISSING_ON = {'count': 'count', 'gravity': 'weight', 'speed': 'speed',
@@ -451,20 +539,25 @@ def describe_clause(c):
     root = c['root']
     payload, mods = split_pile(root)
     adj, post, fan, wasted, waits = record_words('hand', mods)
+    fan = instances_of(root, fan)
     out = []
     # Nouns first, then the carriers spoken beside them: the sentence reads
     # outward from the caster, the way the spell happens.
-    for p in payload:
+    shared = [p for p in lane_items(root, 0) if sort_of(p) in ('E', 'M')]
+    for p in shared:
         if p['kind'] != 'box':
             s = phrase(p)
             out.append((s[0].upper() + s[1:]) + ' right in front of you' +
                        (' at %d fanned points' % fan if fan > 1 else '') + '.')
-    for p in payload:
+    for p in shared:
         if p['kind'] == 'box':
             out.append(('From %d fanned points in front of you, ' % fan if fan > 1
                         else 'You fire ') + launch_sentence(p, 'it') + '.')
     if not payload:
         out.append('Nothing happens; the words are charged.')
+    for k in range(1, root.get('nlanes', 0) + 1):
+        s = lane_clause(root, k, 'resolve')
+        out.append(s[0].upper() + s[1:] + '.')
     for m in mods:
         if m['kind'] == 'raw' and G[m['g']]['field'] == 'gravity':
             out.append('You hop.' if m['g'] == 'float' else 'You are shoved down.')
@@ -478,7 +571,7 @@ def describe_clause(c):
 
 
 def describe(ids):
-    return ' ‖ '.join(describe_clause(c) for c in parse(ids))
+    return ' '.join(describe_clause(c) for c in parse(ids))
 
 # --------------------------------------------------------------------------
 # Cost shape (recursive: carry composes multiplicatively down the tree)
@@ -489,29 +582,48 @@ def cost_shape_box(b):
     payload, mods = split_pile(b)
     _, _, fan, _, _ = record_words(b['d'], mods)
     d = G.get(b['d'], HAND)
+    nlanes = b.get('nlanes', 0)
+    inst = instances_of(b, fan)
     terms = []
     for m in mods:
         if m['kind'] == 'group' and m['complete']:
             terms.append('trail[%s]' % key(m['left']))
         elif m['kind'] == 'raw' and m['g'] == 'wide':
             terms.append('vol×%d' % 8 ** m['n'])
-    pay = []
-    for p in payload:
-        if p['kind'] == 'box':
-            pay.append(cost_shape_box(p))
-        else:
+
+    def items_shape(lane):
+        pay = []
+        for p in b['items']:
+            if lane_of(p) != lane or sort_of(p) not in ('E', 'M'):
+                continue
+            if p['kind'] == 'box':
+                pay.append(cost_shape_box(p))
+                continue
             k = key(p) + x(p['n'])
             if 'anything' in k:
                 k += '(actual value×surcharge, billed on resolve)'
             if p['kind'] == 'group' and p['op'] == 'aura' and p['complete']:
                 k += ' per tick, sustained'
             pay.append(k)
+        return pay
+
     empty = 'kinetic' if d['mech'] == 'flight' else 'nothing'
-    s = '[%s]' % (' + '.join(pay) or empty)
+    sharedPay = items_shape(0)
+    # RULE 4: the tariff is the SUM over instances of the shared segment plus
+    # that instance's lane, which is the old product exactly when L = 0.
+    if nlanes:
+        arms = []
+        for k in range(1, min(nlanes, inst) + 1):
+            arms.append('[%s]' % (' + '.join(sharedPay + items_shape(k)) or empty))
+        if inst > nlanes:
+            arms.append('%d×[%s]' % (inst - nlanes, ' + '.join(sharedPay) or empty))
+        s = ' + '.join(arms)
+    else:
+        s = '[%s]' % (' + '.join(sharedPay) or empty)
+        if inst > 1:
+            s = '%d×%s' % (inst, s)
     if terms:
         s += '·' + '·'.join(terms)
-    if fan > 1:
-        s = '%d×%s' % (fan, s)
     if d['carry'] != 1000:
         s += '·carry(%s %.1f)' % (b['d'], d['carry'] / 1000)
     if d['mech'] == 'continuous':
@@ -531,8 +643,11 @@ def canon(ids):
 
 
 def canon_box(b):
-    return '[%s|%s]' % (','.join(sorted('%s#%d' % (canon_item(i), i['n'])
-                                        for i in b['items'])), b['d'])
+    # RULE 4: the lane is part of an item's key, so two sentences are the same
+    # cast only if each SEGMENT holds the same multiset.
+    return '[%s|%s|%d]' % (','.join(sorted('%s#%d' % (canon_item(i), i['n'])
+                                           for i in b['items'])), b['d'],
+                           b.get('nlanes', 0))
 
 
 def canon_item(it):
@@ -565,7 +680,7 @@ def glyph_table():
         elif g['sort'] == 'X':
             takes = g['field']
         elif g['sort'] == 'Sep':
-            takes = 'ends a sentence'
+            takes = 'opens a segment'
         sortname = {'M': 'matter', 'E': 'effect', 'D': 'delivery', 'X': 'mod',
                     'Op': 'operator', 'Sep': 'separator'}[g['sort']]
         rows.append('| `%s` | %s | %d | %s | %s | %s | %s |' % (
@@ -623,7 +738,12 @@ WORKED = [
         'explosive projectile echo', 'explosive projectile aura self']),
     ('A mod sticks to the box that closes the pile', [
         'explosive projectile swift projectile', 'explosive swift projectile projectile',
-        'explosive projectile projectile swift', 'explosive projectile also fire']),
+        'explosive projectile projectile swift', 'explosive projectile fire']),
+    ('A lane is one instance of the box that closes the pile', [
+        'explosive lane fire projectile', 'explosive lane fire lane water projectile',
+        'explosive lane fire shotgun projectile', 'explosive lane fire lane water',
+        'lane explosive projectile lane blood mend self',
+        'fire lane trail projectile', 'fire lane fire projectile']),
 ]
 
 
@@ -684,18 +804,25 @@ NAMED = [
     'explosive projectile fire bomb',
     'explosive projectile projectile',
     'explosive projectile shotgun projectile',
-    'explosive projectile also fire projectile',
+    'explosive lane fire projectile',
+    'explosive lane fire lane water projectile',
+    'explosive twin projectile',
+    'explosive twin twin projectile',
+    'lane explosive projectile lane blood mend self',
+    'gold lane fire trail projectile',
+    'fire lane fire',
     'fire fire fire',
     'anything projectile',
     'anything',
     'air',
-    'also',
+    'lane',
+    'lane lane',
 ]
 
 
 ALPHA2 = ['fire', 'gold', 'air', 'anything', 'explosive', 'gust', 'transmute', 'mend',
-          'trail', 'null', 'aura', 'echo', 'shotgun', 'float', 'also', 'projectile',
-          'bomb', 'self', 'beam']
+          'trail', 'null', 'aura', 'echo', 'shotgun', 'float', 'lane', 'projectile',
+          'bomb', 'self', 'beam', 'twin']
 ALPHA3 = ['fire', 'gold', 'anything', 'transmute', 'trail', 'explosive', 'shotgun',
           'projectile', 'bomb', 'self']
 
@@ -768,18 +895,24 @@ def main():
 
 GENERATED by `python scripts/magic_grammar.py` from the rules in DESIGN.md §8.
 Do not hand-edit; change the script (the rules) or the glyph table in it and
-regenerate. Every row below is *derived* from the same three parse rules, so a
+regenerate. Every row below is *derived* from the same four parse rules, so a
 row that reads wrong is a rule that is wrong, not a row to patch.
 
-**The three rules.** (1) A noun — matter, an effect, or an operator result of
-sort Effect — goes into the PILE, and order inside the pile does not matter.
-(2) A Delivery BOXES the whole pile into one Effect value: that delivery's
-record, the pile's effects as its payload, the pile's pending mods stuck to its
-record — and speaking CONTINUES, so deliveries NEST. (3) A Mod is PENDING and
-sticks to the box that closes the pile; with no delivery it sticks to `hand`,
-where `shotgun` is three fanned resolve points and `float` is the hop and
-everything else is a charged no-op. The outermost box is always `hand`, so the
-whole utterance is ONE cast unless `also` is spoken.
+**The four rules.** (1) A noun — matter, an effect, or an operator result of
+sort Effect — goes into the PILE, and order inside a SEGMENT of the pile does
+not matter. (2) A Delivery BOXES the whole pile into one Effect value: that
+delivery's record, the pile's effects as its payload, the pile's pending mods
+stuck to its record — and speaking CONTINUES, so deliveries NEST. (3) A Mod is
+PENDING and sticks to the box that closes the pile; with no delivery it sticks
+to `hand`, where `shotgun` is three fanned resolve points and `float` is the
+hop and everything else is a charged no-op. (4) `lane` OPENS A SEGMENT OF THE
+PILE THAT BELONGS TO ONE INSTANCE of the box that closes it: the first segment
+is shared, the box fires max(count, lanes) instances, instance i carries
+shared + lane i+1, and an instance past the last lane carries the shared
+segment alone. A lane walls binding and merging; a `count` mod is record-wide
+wherever it is spoken. The outermost box is always `hand`, so the whole
+utterance is ONE cast — lanes on the hand are how two unrelated spells are
+said at once, and `also` is gone.
 
 **How much order buys.** Orderings, the distinct spells they lower to, and how
 many of those do anything at all (a sentence of nothing but mods is charged and
@@ -793,18 +926,20 @@ fizzles):
 Notation: `⋈` transmute (A ⋈ B); `◂` the operator took the word on its
 left; `▸` on its right; `_` a required word that was missing (the operator
 fizzles, charged); `×N` a merged run; `[ … **delivery**]` a BOX — the pile that
-delivery closed; `‖` a sentence boundary (`also`). The outermost `hand` box is
-drawn bare.
+delivery closed; `/` a lane boundary inside a pile (`lane`). The outermost
+`hand` box is drawn bare.
 Cost shape: `N×[payload]·carry(delivery)` — N instances, each paying the
-payload tariff, times the delivery's carry premium, plus the word costs. Carry
-composes multiplicatively down a nest.
+payload tariff, times the delivery's carry premium, plus the word costs; with
+lanes it is a SUM of one bracket per instance instead. Carry composes
+multiplicatively down a nest.
 
 ## 1. The glyph table ({len(G)} glyphs)
 
 Sorts: **matter** names a material; **effect** happens at a point; **delivery**
 boxes the pile and decides where and when; **mod** edits the record of the box
 that closes the pile; **operator** takes the one item beside it and produces one
-of the others; **separator** ends a sentence. `repeat`: `add` = saying it again
+of the others; **separator** (`lane`) opens a segment of the pile that belongs
+to one instance. `repeat`: `add` = saying it again
 adds one more of its axis (fire×2 throws twice the voxels, explosive×2 is twice
 the power); `compose` = applying the mod again (shotgun×2 is 3·3 = 9, swift×2 is
 ×4, float×2 is gravity reversed). Deliveries do NOT merge on repeat: each one

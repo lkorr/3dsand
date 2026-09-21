@@ -44,7 +44,8 @@
   "pierce",
   "seek",
   "fuse",
-  "also"
+  "lane",
+  "twin"
  ],
  "entries": [
   {
@@ -833,22 +834,99 @@
    ]
   },
   {
-   "spoken": "explosive projectile also fire projectile",
-   "parse": "[explosive **projectile**] ‖ [fire **projectile**]",
+   "spoken": "explosive lane fire projectile",
+   "parse": "[explosive / fire **projectile**]",
    "clauses": [
     {
      "delivery": "hand",
      "weight": 1,
      "payload": [
-      "[explosive#1|projectile]"
+      "[explosive#1,fire@1#1|projectile]"
      ],
      "mods": []
-    },
+    }
+   ]
+  },
+  {
+   "spoken": "explosive lane fire lane water projectile",
+   "parse": "[explosive / fire / water **projectile**]",
+   "clauses": [
     {
      "delivery": "hand",
      "weight": 1,
      "payload": [
-      "[fire#1|projectile]"
+      "[explosive#1,fire@1#1,water@2#1|projectile]"
+     ],
+     "mods": []
+    }
+   ]
+  },
+  {
+   "spoken": "explosive twin projectile",
+   "parse": "[explosive twin **projectile**]",
+   "clauses": [
+    {
+     "delivery": "hand",
+     "weight": 1,
+     "payload": [
+      "[explosive#1,twin#1|projectile]"
+     ],
+     "mods": []
+    }
+   ]
+  },
+  {
+   "spoken": "explosive twin twin projectile",
+   "parse": "[explosive twin×2 **projectile**]",
+   "clauses": [
+    {
+     "delivery": "hand",
+     "weight": 1,
+     "payload": [
+      "[explosive#1,twin#2|projectile]"
+     ],
+     "mods": []
+    }
+   ]
+  },
+  {
+   "spoken": "lane explosive projectile lane blood mend self",
+   "parse": "[[/ explosive **projectile**] / (blood ◂mend) **self**]",
+   "clauses": [
+    {
+     "delivery": "hand",
+     "weight": 1,
+     "payload": [
+      "[[explosive@1#1|projectile]#1,(blood@1|mend|)@1#1|self]"
+     ],
+     "mods": []
+    }
+   ]
+  },
+  {
+   "spoken": "gold lane fire trail projectile",
+   "parse": "[gold / (fire ◂trail) **projectile**]",
+   "clauses": [
+    {
+     "delivery": "hand",
+     "weight": 1,
+     "payload": [
+      "[gold#1,(fire@1|trail|)@1#1|projectile]"
+     ],
+     "mods": []
+    }
+   ]
+  },
+  {
+   "spoken": "fire lane fire",
+   "parse": "fire / fire",
+   "clauses": [
+    {
+     "delivery": "hand",
+     "weight": 1,
+     "payload": [
+      "fire",
+      "fire@1"
      ],
      "mods": []
     }
@@ -911,15 +989,21 @@
    ]
   },
   {
-   "spoken": "also",
-   "parse": "(empty) ‖ (empty)",
+   "spoken": "lane",
+   "parse": "/",
    "clauses": [
     {
      "delivery": "hand",
      "weight": 1,
      "payload": [],
      "mods": []
-    },
+    }
+   ]
+  },
+  {
+   "spoken": "lane lane",
+   "parse": "/ /",
+   "clauses": [
     {
      "delivery": "hand",
      "weight": 1,
@@ -1236,22 +1320,73 @@
    ]
   },
   {
-   "spoken": "explosive projectile also fire",
-   "parse": "[explosive **projectile**] ‖ fire",
+   "spoken": "explosive projectile fire",
+   "parse": "[explosive **projectile**] fire",
    "clauses": [
     {
      "delivery": "hand",
      "weight": 1,
      "payload": [
-      "[explosive#1|projectile]"
+      "[explosive#1|projectile]",
+      "fire"
      ],
      "mods": []
-    },
+    }
+   ]
+  },
+  {
+   "spoken": "explosive lane fire shotgun projectile",
+   "parse": "[explosive / fire shotgun **projectile**]",
+   "clauses": [
     {
      "delivery": "hand",
      "weight": 1,
      "payload": [
-      "fire"
+      "[explosive#1,fire@1#1,shotgun@1#1|projectile]"
+     ],
+     "mods": []
+    }
+   ]
+  },
+  {
+   "spoken": "explosive lane fire lane water",
+   "parse": "explosive / fire / water",
+   "clauses": [
+    {
+     "delivery": "hand",
+     "weight": 1,
+     "payload": [
+      "explosive",
+      "fire@1",
+      "water@2"
+     ],
+     "mods": []
+    }
+   ]
+  },
+  {
+   "spoken": "fire lane trail projectile",
+   "parse": "[fire / (_ ◂trail) **projectile**]",
+   "clauses": [
+    {
+     "delivery": "hand",
+     "weight": 1,
+     "payload": [
+      "[fire#1,(|trail|)@1#1|projectile]"
+     ],
+     "mods": []
+    }
+   ]
+  },
+  {
+   "spoken": "fire lane fire projectile",
+   "parse": "[fire / fire **projectile**]",
+   "clauses": [
+    {
+     "delivery": "hand",
+     "weight": 1,
+     "payload": [
+      "[fire#1,fire@1#1|projectile]"
      ],
      "mods": []
     }
@@ -1463,8 +1598,8 @@
    ]
   },
   {
-   "spoken": "fire also",
-   "parse": "fire ‖ (empty)",
+   "spoken": "fire lane",
+   "parse": "fire /",
    "clauses": [
     {
      "delivery": "hand",
@@ -1472,12 +1607,6 @@
      "payload": [
       "fire"
      ],
-     "mods": []
-    },
-    {
-     "delivery": "hand",
-     "weight": 1,
-     "payload": [],
      "mods": []
     }
    ]
@@ -1521,6 +1650,22 @@
       "[fire#1|beam]"
      ],
      "mods": []
+    }
+   ]
+  },
+  {
+   "spoken": "fire twin",
+   "parse": "fire twin",
+   "clauses": [
+    {
+     "delivery": "hand",
+     "weight": 1,
+     "payload": [
+      "fire"
+     ],
+     "mods": [
+      "twin"
+     ]
     }
    ]
   },
@@ -1730,8 +1875,8 @@
    ]
   },
   {
-   "spoken": "gold also",
-   "parse": "gold ‖ (empty)",
+   "spoken": "gold lane",
+   "parse": "gold /",
    "clauses": [
     {
      "delivery": "hand",
@@ -1739,12 +1884,6 @@
      "payload": [
       "gold"
      ],
-     "mods": []
-    },
-    {
-     "delivery": "hand",
-     "weight": 1,
-     "payload": [],
      "mods": []
     }
    ]
@@ -1802,6 +1941,22 @@
       "[gold#1|beam]"
      ],
      "mods": []
+    }
+   ]
+  },
+  {
+   "spoken": "gold twin",
+   "parse": "gold twin",
+   "clauses": [
+    {
+     "delivery": "hand",
+     "weight": 1,
+     "payload": [
+      "gold"
+     ],
+     "mods": [
+      "twin"
+     ]
     }
    ]
   },
@@ -2011,8 +2166,8 @@
    ]
   },
   {
-   "spoken": "air also",
-   "parse": "air ‖ (empty)",
+   "spoken": "air lane",
+   "parse": "air /",
    "clauses": [
     {
      "delivery": "hand",
@@ -2020,12 +2175,6 @@
      "payload": [
       "air"
      ],
-     "mods": []
-    },
-    {
-     "delivery": "hand",
-     "weight": 1,
-     "payload": [],
      "mods": []
     }
    ]
@@ -2083,6 +2232,22 @@
       "[air#1|beam]"
      ],
      "mods": []
+    }
+   ]
+  },
+  {
+   "spoken": "air twin",
+   "parse": "air twin",
+   "clauses": [
+    {
+     "delivery": "hand",
+     "weight": 1,
+     "payload": [
+      "air"
+     ],
+     "mods": [
+      "twin"
+     ]
     }
    ]
   },
@@ -2278,8 +2443,8 @@
    ]
   },
   {
-   "spoken": "anything also",
-   "parse": "anything ‖ (empty)",
+   "spoken": "anything lane",
+   "parse": "anything /",
    "clauses": [
     {
      "delivery": "hand",
@@ -2287,12 +2452,6 @@
      "payload": [
       "anything"
      ],
-     "mods": []
-    },
-    {
-     "delivery": "hand",
-     "weight": 1,
-     "payload": [],
      "mods": []
     }
    ]
@@ -2336,6 +2495,22 @@
       "[anything#1|beam]"
      ],
      "mods": []
+    }
+   ]
+  },
+  {
+   "spoken": "anything twin",
+   "parse": "anything twin",
+   "clauses": [
+    {
+     "delivery": "hand",
+     "weight": 1,
+     "payload": [
+      "anything"
+     ],
+     "mods": [
+      "twin"
+     ]
     }
    ]
   },
@@ -2547,8 +2722,8 @@
    ]
   },
   {
-   "spoken": "explosive also",
-   "parse": "explosive ‖ (empty)",
+   "spoken": "explosive lane",
+   "parse": "explosive /",
    "clauses": [
     {
      "delivery": "hand",
@@ -2556,12 +2731,6 @@
      "payload": [
       "explosive"
      ],
-     "mods": []
-    },
-    {
-     "delivery": "hand",
-     "weight": 1,
-     "payload": [],
      "mods": []
     }
    ]
@@ -2577,6 +2746,22 @@
       "[explosive#1|beam]"
      ],
      "mods": []
+    }
+   ]
+  },
+  {
+   "spoken": "explosive twin",
+   "parse": "explosive twin",
+   "clauses": [
+    {
+     "delivery": "hand",
+     "weight": 1,
+     "payload": [
+      "explosive"
+     ],
+     "mods": [
+      "twin"
+     ]
     }
    ]
   },
@@ -2788,8 +2973,8 @@
    ]
   },
   {
-   "spoken": "gust also",
-   "parse": "gust ‖ (empty)",
+   "spoken": "gust lane",
+   "parse": "gust /",
    "clauses": [
     {
      "delivery": "hand",
@@ -2797,12 +2982,6 @@
      "payload": [
       "gust"
      ],
-     "mods": []
-    },
-    {
-     "delivery": "hand",
-     "weight": 1,
-     "payload": [],
      "mods": []
     }
    ]
@@ -2860,6 +3039,22 @@
       "[gust#1|beam]"
      ],
      "mods": []
+    }
+   ]
+  },
+  {
+   "spoken": "gust twin",
+   "parse": "gust twin",
+   "clauses": [
+    {
+     "delivery": "hand",
+     "weight": 1,
+     "payload": [
+      "gust"
+     ],
+     "mods": [
+      "twin"
+     ]
     }
    ]
   },
@@ -3067,8 +3262,8 @@
    ]
   },
   {
-   "spoken": "transmute also",
-   "parse": "(_ ⋈ _) ‖ (empty)",
+   "spoken": "transmute lane",
+   "parse": "(_ ⋈ _) /",
    "clauses": [
     {
      "delivery": "hand",
@@ -3076,12 +3271,6 @@
      "payload": [
       "(|transmute|)"
      ],
-     "mods": []
-    },
-    {
-     "delivery": "hand",
-     "weight": 1,
-     "payload": [],
      "mods": []
     }
    ]
@@ -3139,6 +3328,22 @@
       "[(|transmute|)#1|beam]"
      ],
      "mods": []
+    }
+   ]
+  },
+  {
+   "spoken": "transmute twin",
+   "parse": "(_ ⋈ _) twin",
+   "clauses": [
+    {
+     "delivery": "hand",
+     "weight": 1,
+     "payload": [
+      "(|transmute|)"
+     ],
+     "mods": [
+      "twin"
+     ]
     }
    ]
   },
@@ -3350,8 +3555,8 @@
    ]
   },
   {
-   "spoken": "mend also",
-   "parse": "(_ ◂mend) ‖ (empty)",
+   "spoken": "mend lane",
+   "parse": "(_ ◂mend) /",
    "clauses": [
     {
      "delivery": "hand",
@@ -3359,12 +3564,6 @@
      "payload": [
       "(|mend|)"
      ],
-     "mods": []
-    },
-    {
-     "delivery": "hand",
-     "weight": 1,
-     "payload": [],
      "mods": []
     }
    ]
@@ -3422,6 +3621,22 @@
       "[(|mend|)#1|beam]"
      ],
      "mods": []
+    }
+   ]
+  },
+  {
+   "spoken": "mend twin",
+   "parse": "(_ ◂mend) twin",
+   "clauses": [
+    {
+     "delivery": "hand",
+     "weight": 1,
+     "payload": [
+      "(|mend|)"
+     ],
+     "mods": [
+      "twin"
+     ]
     }
    ]
   },
@@ -3642,8 +3857,8 @@
    ]
   },
   {
-   "spoken": "trail also",
-   "parse": "(_ ◂trail) ‖ (empty)",
+   "spoken": "trail lane",
+   "parse": "(_ ◂trail) /",
    "clauses": [
     {
      "delivery": "hand",
@@ -3652,12 +3867,6 @@
      "mods": [
       "(|trail|)"
      ]
-    },
-    {
-     "delivery": "hand",
-     "weight": 1,
-     "payload": [],
-     "mods": []
     }
    ]
   },
@@ -3714,6 +3923,21 @@
       "[(|trail|)#1|beam]"
      ],
      "mods": []
+    }
+   ]
+  },
+  {
+   "spoken": "trail twin",
+   "parse": "(_ ◂trail) twin",
+   "clauses": [
+    {
+     "delivery": "hand",
+     "weight": 1,
+     "payload": [],
+     "mods": [
+      "(|trail|)",
+      "twin"
+     ]
     }
    ]
   },
@@ -3926,8 +4150,8 @@
    ]
   },
   {
-   "spoken": "null also",
-   "parse": "(_ ◂null) ‖ (empty)",
+   "spoken": "null lane",
+   "parse": "(_ ◂null) /",
    "clauses": [
     {
      "delivery": "hand",
@@ -3935,12 +4159,6 @@
      "payload": [
       "(|null|)"
      ],
-     "mods": []
-    },
-    {
-     "delivery": "hand",
-     "weight": 1,
-     "payload": [],
      "mods": []
     }
    ]
@@ -3998,6 +4216,22 @@
       "[(|null|)#1|beam]"
      ],
      "mods": []
+    }
+   ]
+  },
+  {
+   "spoken": "null twin",
+   "parse": "(_ ◂null) twin",
+   "clauses": [
+    {
+     "delivery": "hand",
+     "weight": 1,
+     "payload": [
+      "(|null|)"
+     ],
+     "mods": [
+      "twin"
+     ]
     }
    ]
   },
@@ -4210,8 +4444,8 @@
    ]
   },
   {
-   "spoken": "aura also",
-   "parse": "(_ ◂aura) ‖ (empty)",
+   "spoken": "aura lane",
+   "parse": "(_ ◂aura) /",
    "clauses": [
     {
      "delivery": "hand",
@@ -4219,12 +4453,6 @@
      "payload": [
       "(|aura|)"
      ],
-     "mods": []
-    },
-    {
-     "delivery": "hand",
-     "weight": 1,
-     "payload": [],
      "mods": []
     }
    ]
@@ -4268,6 +4496,22 @@
       "[(|aura|)#1|beam]"
      ],
      "mods": []
+    }
+   ]
+  },
+  {
+   "spoken": "aura twin",
+   "parse": "(_ ◂aura) twin",
+   "clauses": [
+    {
+     "delivery": "hand",
+     "weight": 1,
+     "payload": [
+      "(|aura|)"
+     ],
+     "mods": [
+      "twin"
+     ]
     }
    ]
   },
@@ -4480,8 +4724,8 @@
    ]
   },
   {
-   "spoken": "echo also",
-   "parse": "(_ ◂echo) ‖ (empty)",
+   "spoken": "echo lane",
+   "parse": "(_ ◂echo) /",
    "clauses": [
     {
      "delivery": "hand",
@@ -4489,12 +4733,6 @@
      "payload": [
       "(|echo|)"
      ],
-     "mods": []
-    },
-    {
-     "delivery": "hand",
-     "weight": 1,
-     "payload": [],
      "mods": []
     }
    ]
@@ -4552,6 +4790,22 @@
       "[(|echo|)#1|beam]"
      ],
      "mods": []
+    }
+   ]
+  },
+  {
+   "spoken": "echo twin",
+   "parse": "(_ ◂echo) twin",
+   "clauses": [
+    {
+     "delivery": "hand",
+     "weight": 1,
+     "payload": [
+      "(|echo|)"
+     ],
+     "mods": [
+      "twin"
+     ]
     }
    ]
   },
@@ -4772,8 +5026,8 @@
    ]
   },
   {
-   "spoken": "shotgun also",
-   "parse": "shotgun ‖ (empty)",
+   "spoken": "shotgun lane",
+   "parse": "shotgun /",
    "clauses": [
     {
      "delivery": "hand",
@@ -4782,12 +5036,6 @@
      "mods": [
       "shotgun"
      ]
-    },
-    {
-     "delivery": "hand",
-     "weight": 1,
-     "payload": [],
-     "mods": []
     }
    ]
   },
@@ -4830,6 +5078,21 @@
       "[shotgun#1|beam]"
      ],
      "mods": []
+    }
+   ]
+  },
+  {
+   "spoken": "shotgun twin",
+   "parse": "shotgun twin",
+   "clauses": [
+    {
+     "delivery": "hand",
+     "weight": 1,
+     "payload": [],
+     "mods": [
+      "shotgun",
+      "twin"
+     ]
     }
    ]
   },
@@ -5036,8 +5299,8 @@
    ]
   },
   {
-   "spoken": "float also",
-   "parse": "float ‖ (empty)",
+   "spoken": "float lane",
+   "parse": "float /",
    "clauses": [
     {
      "delivery": "hand",
@@ -5046,12 +5309,6 @@
      "mods": [
       "float"
      ]
-    },
-    {
-     "delivery": "hand",
-     "weight": 1,
-     "payload": [],
-     "mods": []
     }
    ]
   },
@@ -5098,319 +5355,220 @@
    ]
   },
   {
-   "spoken": "also fire",
-   "parse": "(empty) ‖ fire",
+   "spoken": "float twin",
+   "parse": "float twin",
    "clauses": [
-    {
-     "delivery": "hand",
-     "weight": 1,
-     "payload": [],
-     "mods": []
-    },
-    {
-     "delivery": "hand",
-     "weight": 1,
-     "payload": [
-      "fire"
-     ],
-     "mods": []
-    }
-   ]
-  },
-  {
-   "spoken": "also gold",
-   "parse": "(empty) ‖ gold",
-   "clauses": [
-    {
-     "delivery": "hand",
-     "weight": 1,
-     "payload": [],
-     "mods": []
-    },
-    {
-     "delivery": "hand",
-     "weight": 1,
-     "payload": [
-      "gold"
-     ],
-     "mods": []
-    }
-   ]
-  },
-  {
-   "spoken": "also air",
-   "parse": "(empty) ‖ air",
-   "clauses": [
-    {
-     "delivery": "hand",
-     "weight": 1,
-     "payload": [],
-     "mods": []
-    },
-    {
-     "delivery": "hand",
-     "weight": 1,
-     "payload": [
-      "air"
-     ],
-     "mods": []
-    }
-   ]
-  },
-  {
-   "spoken": "also anything",
-   "parse": "(empty) ‖ anything",
-   "clauses": [
-    {
-     "delivery": "hand",
-     "weight": 1,
-     "payload": [],
-     "mods": []
-    },
-    {
-     "delivery": "hand",
-     "weight": 1,
-     "payload": [
-      "anything"
-     ],
-     "mods": []
-    }
-   ]
-  },
-  {
-   "spoken": "also explosive",
-   "parse": "(empty) ‖ explosive",
-   "clauses": [
-    {
-     "delivery": "hand",
-     "weight": 1,
-     "payload": [],
-     "mods": []
-    },
-    {
-     "delivery": "hand",
-     "weight": 1,
-     "payload": [
-      "explosive"
-     ],
-     "mods": []
-    }
-   ]
-  },
-  {
-   "spoken": "also gust",
-   "parse": "(empty) ‖ gust",
-   "clauses": [
-    {
-     "delivery": "hand",
-     "weight": 1,
-     "payload": [],
-     "mods": []
-    },
-    {
-     "delivery": "hand",
-     "weight": 1,
-     "payload": [
-      "gust"
-     ],
-     "mods": []
-    }
-   ]
-  },
-  {
-   "spoken": "also transmute",
-   "parse": "(empty) ‖ (_ ⋈ _)",
-   "clauses": [
-    {
-     "delivery": "hand",
-     "weight": 1,
-     "payload": [],
-     "mods": []
-    },
-    {
-     "delivery": "hand",
-     "weight": 1,
-     "payload": [
-      "(|transmute|)"
-     ],
-     "mods": []
-    }
-   ]
-  },
-  {
-   "spoken": "also mend",
-   "parse": "(empty) ‖ (_ ◂mend)",
-   "clauses": [
-    {
-     "delivery": "hand",
-     "weight": 1,
-     "payload": [],
-     "mods": []
-    },
-    {
-     "delivery": "hand",
-     "weight": 1,
-     "payload": [
-      "(|mend|)"
-     ],
-     "mods": []
-    }
-   ]
-  },
-  {
-   "spoken": "also trail",
-   "parse": "(empty) ‖ (_ ◂trail)",
-   "clauses": [
-    {
-     "delivery": "hand",
-     "weight": 1,
-     "payload": [],
-     "mods": []
-    },
     {
      "delivery": "hand",
      "weight": 1,
      "payload": [],
      "mods": [
-      "(|trail|)"
+      "float",
+      "twin"
      ]
     }
    ]
   },
   {
-   "spoken": "also null",
-   "parse": "(empty) ‖ (_ ◂null)",
+   "spoken": "lane fire",
+   "parse": "/ fire",
    "clauses": [
     {
      "delivery": "hand",
      "weight": 1,
-     "payload": [],
-     "mods": []
-    },
-    {
-     "delivery": "hand",
-     "weight": 1,
      "payload": [
-      "(|null|)"
+      "fire@1"
      ],
      "mods": []
     }
    ]
   },
   {
-   "spoken": "also aura",
-   "parse": "(empty) ‖ (_ ◂aura)",
+   "spoken": "lane gold",
+   "parse": "/ gold",
    "clauses": [
     {
      "delivery": "hand",
      "weight": 1,
-     "payload": [],
-     "mods": []
-    },
-    {
-     "delivery": "hand",
-     "weight": 1,
      "payload": [
-      "(|aura|)"
+      "gold@1"
      ],
      "mods": []
     }
    ]
   },
   {
-   "spoken": "also echo",
-   "parse": "(empty) ‖ (_ ◂echo)",
+   "spoken": "lane air",
+   "parse": "/ air",
    "clauses": [
     {
      "delivery": "hand",
      "weight": 1,
-     "payload": [],
-     "mods": []
-    },
-    {
-     "delivery": "hand",
-     "weight": 1,
      "payload": [
-      "(|echo|)"
+      "air@1"
      ],
      "mods": []
     }
    ]
   },
   {
-   "spoken": "also shotgun",
-   "parse": "(empty) ‖ shotgun",
+   "spoken": "lane anything",
+   "parse": "/ anything",
    "clauses": [
     {
      "delivery": "hand",
      "weight": 1,
-     "payload": [],
+     "payload": [
+      "anything@1"
+     ],
      "mods": []
-    },
+    }
+   ]
+  },
+  {
+   "spoken": "lane explosive",
+   "parse": "/ explosive",
+   "clauses": [
+    {
+     "delivery": "hand",
+     "weight": 1,
+     "payload": [
+      "explosive@1"
+     ],
+     "mods": []
+    }
+   ]
+  },
+  {
+   "spoken": "lane gust",
+   "parse": "/ gust",
+   "clauses": [
+    {
+     "delivery": "hand",
+     "weight": 1,
+     "payload": [
+      "gust@1"
+     ],
+     "mods": []
+    }
+   ]
+  },
+  {
+   "spoken": "lane transmute",
+   "parse": "/ (_ ⋈ _)",
+   "clauses": [
+    {
+     "delivery": "hand",
+     "weight": 1,
+     "payload": [
+      "(|transmute|)@1"
+     ],
+     "mods": []
+    }
+   ]
+  },
+  {
+   "spoken": "lane mend",
+   "parse": "/ (_ ◂mend)",
+   "clauses": [
+    {
+     "delivery": "hand",
+     "weight": 1,
+     "payload": [
+      "(|mend|)@1"
+     ],
+     "mods": []
+    }
+   ]
+  },
+  {
+   "spoken": "lane trail",
+   "parse": "/ (_ ◂trail)",
+   "clauses": [
     {
      "delivery": "hand",
      "weight": 1,
      "payload": [],
      "mods": [
-      "shotgun"
+      "(|trail|)@1"
      ]
     }
    ]
   },
   {
-   "spoken": "also float",
-   "parse": "(empty) ‖ float",
+   "spoken": "lane null",
+   "parse": "/ (_ ◂null)",
    "clauses": [
     {
      "delivery": "hand",
      "weight": 1,
-     "payload": [],
+     "payload": [
+      "(|null|)@1"
+     ],
      "mods": []
-    },
+    }
+   ]
+  },
+  {
+   "spoken": "lane aura",
+   "parse": "/ (_ ◂aura)",
+   "clauses": [
+    {
+     "delivery": "hand",
+     "weight": 1,
+     "payload": [
+      "(|aura|)@1"
+     ],
+     "mods": []
+    }
+   ]
+  },
+  {
+   "spoken": "lane echo",
+   "parse": "/ (_ ◂echo)",
+   "clauses": [
+    {
+     "delivery": "hand",
+     "weight": 1,
+     "payload": [
+      "(|echo|)@1"
+     ],
+     "mods": []
+    }
+   ]
+  },
+  {
+   "spoken": "lane shotgun",
+   "parse": "/ shotgun",
+   "clauses": [
     {
      "delivery": "hand",
      "weight": 1,
      "payload": [],
      "mods": [
-      "float"
+      "shotgun@1"
      ]
     }
    ]
   },
   {
-   "spoken": "also also",
-   "parse": "(empty) ‖ (empty) ‖ (empty)",
+   "spoken": "lane float",
+   "parse": "/ float",
    "clauses": [
     {
      "delivery": "hand",
      "weight": 1,
      "payload": [],
-     "mods": []
-    },
-    {
-     "delivery": "hand",
-     "weight": 1,
-     "payload": [],
-     "mods": []
-    },
-    {
-     "delivery": "hand",
-     "weight": 1,
-     "payload": [],
-     "mods": []
+     "mods": [
+      "float@1"
+     ]
     }
    ]
   },
   {
-   "spoken": "also projectile",
-   "parse": "(empty) ‖ [**projectile**]",
+   "spoken": "lane projectile",
+   "parse": "[/ **projectile**]",
    "clauses": [
-    {
-     "delivery": "hand",
-     "weight": 1,
-     "payload": [],
-     "mods": []
-    },
     {
      "delivery": "hand",
      "weight": 1,
@@ -5422,15 +5580,9 @@
    ]
   },
   {
-   "spoken": "also bomb",
-   "parse": "(empty) ‖ [**bomb**]",
+   "spoken": "lane bomb",
+   "parse": "[/ **bomb**]",
    "clauses": [
-    {
-     "delivery": "hand",
-     "weight": 1,
-     "payload": [],
-     "mods": []
-    },
     {
      "delivery": "hand",
      "weight": 1,
@@ -5442,15 +5594,9 @@
    ]
   },
   {
-   "spoken": "also self",
-   "parse": "(empty) ‖ [**self**]",
+   "spoken": "lane self",
+   "parse": "[/ **self**]",
    "clauses": [
-    {
-     "delivery": "hand",
-     "weight": 1,
-     "payload": [],
-     "mods": []
-    },
     {
      "delivery": "hand",
      "weight": 1,
@@ -5462,15 +5608,9 @@
    ]
   },
   {
-   "spoken": "also beam",
-   "parse": "(empty) ‖ [**beam**]",
+   "spoken": "lane beam",
+   "parse": "[/ **beam**]",
    "clauses": [
-    {
-     "delivery": "hand",
-     "weight": 1,
-     "payload": [],
-     "mods": []
-    },
     {
      "delivery": "hand",
      "weight": 1,
@@ -5478,6 +5618,20 @@
       "[|beam]"
      ],
      "mods": []
+    }
+   ]
+  },
+  {
+   "spoken": "lane twin",
+   "parse": "/ twin",
+   "clauses": [
+    {
+     "delivery": "hand",
+     "weight": 1,
+     "payload": [],
+     "mods": [
+      "twin@1"
+     ]
     }
    ]
   },
@@ -5675,8 +5829,8 @@
    ]
   },
   {
-   "spoken": "projectile also",
-   "parse": "[**projectile**] ‖ (empty)",
+   "spoken": "projectile lane",
+   "parse": "[**projectile**] /",
    "clauses": [
     {
      "delivery": "hand",
@@ -5684,12 +5838,6 @@
      "payload": [
       "[|projectile]"
      ],
-     "mods": []
-    },
-    {
-     "delivery": "hand",
-     "weight": 1,
-     "payload": [],
      "mods": []
     }
    ]
@@ -5747,6 +5895,22 @@
       "[[|projectile]#1|beam]"
      ],
      "mods": []
+    }
+   ]
+  },
+  {
+   "spoken": "projectile twin",
+   "parse": "[**projectile**] twin",
+   "clauses": [
+    {
+     "delivery": "hand",
+     "weight": 1,
+     "payload": [
+      "[|projectile]"
+     ],
+     "mods": [
+      "twin"
+     ]
     }
    ]
   },
@@ -5959,8 +6123,8 @@
    ]
   },
   {
-   "spoken": "bomb also",
-   "parse": "[**bomb**] ‖ (empty)",
+   "spoken": "bomb lane",
+   "parse": "[**bomb**] /",
    "clauses": [
     {
      "delivery": "hand",
@@ -5968,12 +6132,6 @@
      "payload": [
       "[|bomb]"
      ],
-     "mods": []
-    },
-    {
-     "delivery": "hand",
-     "weight": 1,
-     "payload": [],
      "mods": []
     }
    ]
@@ -6031,6 +6189,22 @@
       "[[|bomb]#1|beam]"
      ],
      "mods": []
+    }
+   ]
+  },
+  {
+   "spoken": "bomb twin",
+   "parse": "[**bomb**] twin",
+   "clauses": [
+    {
+     "delivery": "hand",
+     "weight": 1,
+     "payload": [
+      "[|bomb]"
+     ],
+     "mods": [
+      "twin"
+     ]
     }
    ]
   },
@@ -6243,8 +6417,8 @@
    ]
   },
   {
-   "spoken": "self also",
-   "parse": "[**self**] ‖ (empty)",
+   "spoken": "self lane",
+   "parse": "[**self**] /",
    "clauses": [
     {
      "delivery": "hand",
@@ -6252,12 +6426,6 @@
      "payload": [
       "[|self]"
      ],
-     "mods": []
-    },
-    {
-     "delivery": "hand",
-     "weight": 1,
-     "payload": [],
      "mods": []
     }
    ]
@@ -6315,6 +6483,22 @@
       "[[|self]#1|beam]"
      ],
      "mods": []
+    }
+   ]
+  },
+  {
+   "spoken": "self twin",
+   "parse": "[**self**] twin",
+   "clauses": [
+    {
+     "delivery": "hand",
+     "weight": 1,
+     "payload": [
+      "[|self]"
+     ],
+     "mods": [
+      "twin"
+     ]
     }
    ]
   },
@@ -6527,8 +6711,8 @@
    ]
   },
   {
-   "spoken": "beam also",
-   "parse": "[**beam**] ‖ (empty)",
+   "spoken": "beam lane",
+   "parse": "[**beam**] /",
    "clauses": [
     {
      "delivery": "hand",
@@ -6536,12 +6720,6 @@
      "payload": [
       "[|beam]"
      ],
-     "mods": []
-    },
-    {
-     "delivery": "hand",
-     "weight": 1,
-     "payload": [],
      "mods": []
     }
    ]
@@ -6599,6 +6777,323 @@
       "[[|beam]#1|beam]"
      ],
      "mods": []
+    }
+   ]
+  },
+  {
+   "spoken": "beam twin",
+   "parse": "[**beam**] twin",
+   "clauses": [
+    {
+     "delivery": "hand",
+     "weight": 1,
+     "payload": [
+      "[|beam]"
+     ],
+     "mods": [
+      "twin"
+     ]
+    }
+   ]
+  },
+  {
+   "spoken": "twin fire",
+   "parse": "twin fire",
+   "clauses": [
+    {
+     "delivery": "hand",
+     "weight": 1,
+     "payload": [
+      "fire"
+     ],
+     "mods": [
+      "twin"
+     ]
+    }
+   ]
+  },
+  {
+   "spoken": "twin gold",
+   "parse": "twin gold",
+   "clauses": [
+    {
+     "delivery": "hand",
+     "weight": 1,
+     "payload": [
+      "gold"
+     ],
+     "mods": [
+      "twin"
+     ]
+    }
+   ]
+  },
+  {
+   "spoken": "twin air",
+   "parse": "twin air",
+   "clauses": [
+    {
+     "delivery": "hand",
+     "weight": 1,
+     "payload": [
+      "air"
+     ],
+     "mods": [
+      "twin"
+     ]
+    }
+   ]
+  },
+  {
+   "spoken": "twin anything",
+   "parse": "twin anything",
+   "clauses": [
+    {
+     "delivery": "hand",
+     "weight": 1,
+     "payload": [
+      "anything"
+     ],
+     "mods": [
+      "twin"
+     ]
+    }
+   ]
+  },
+  {
+   "spoken": "twin explosive",
+   "parse": "twin explosive",
+   "clauses": [
+    {
+     "delivery": "hand",
+     "weight": 1,
+     "payload": [
+      "explosive"
+     ],
+     "mods": [
+      "twin"
+     ]
+    }
+   ]
+  },
+  {
+   "spoken": "twin gust",
+   "parse": "twin gust",
+   "clauses": [
+    {
+     "delivery": "hand",
+     "weight": 1,
+     "payload": [
+      "gust"
+     ],
+     "mods": [
+      "twin"
+     ]
+    }
+   ]
+  },
+  {
+   "spoken": "twin transmute",
+   "parse": "twin (_ ⋈ _)",
+   "clauses": [
+    {
+     "delivery": "hand",
+     "weight": 1,
+     "payload": [
+      "(|transmute|)"
+     ],
+     "mods": [
+      "twin"
+     ]
+    }
+   ]
+  },
+  {
+   "spoken": "twin mend",
+   "parse": "twin (_ ◂mend)",
+   "clauses": [
+    {
+     "delivery": "hand",
+     "weight": 1,
+     "payload": [
+      "(|mend|)"
+     ],
+     "mods": [
+      "twin"
+     ]
+    }
+   ]
+  },
+  {
+   "spoken": "twin trail",
+   "parse": "twin (_ ◂trail)",
+   "clauses": [
+    {
+     "delivery": "hand",
+     "weight": 1,
+     "payload": [],
+     "mods": [
+      "twin",
+      "(|trail|)"
+     ]
+    }
+   ]
+  },
+  {
+   "spoken": "twin null",
+   "parse": "(twin ◂null)",
+   "clauses": [
+    {
+     "delivery": "hand",
+     "weight": 1,
+     "payload": [
+      "(twin|null|)"
+     ],
+     "mods": []
+    }
+   ]
+  },
+  {
+   "spoken": "twin aura",
+   "parse": "(twin ◂aura)",
+   "clauses": [
+    {
+     "delivery": "hand",
+     "weight": 1,
+     "payload": [
+      "(twin|aura|)"
+     ],
+     "mods": []
+    }
+   ]
+  },
+  {
+   "spoken": "twin echo",
+   "parse": "twin (_ ◂echo)",
+   "clauses": [
+    {
+     "delivery": "hand",
+     "weight": 1,
+     "payload": [
+      "(|echo|)"
+     ],
+     "mods": [
+      "twin"
+     ]
+    }
+   ]
+  },
+  {
+   "spoken": "twin shotgun",
+   "parse": "twin shotgun",
+   "clauses": [
+    {
+     "delivery": "hand",
+     "weight": 1,
+     "payload": [],
+     "mods": [
+      "twin",
+      "shotgun"
+     ]
+    }
+   ]
+  },
+  {
+   "spoken": "twin float",
+   "parse": "twin float",
+   "clauses": [
+    {
+     "delivery": "hand",
+     "weight": 1,
+     "payload": [],
+     "mods": [
+      "twin",
+      "float"
+     ]
+    }
+   ]
+  },
+  {
+   "spoken": "twin lane",
+   "parse": "twin /",
+   "clauses": [
+    {
+     "delivery": "hand",
+     "weight": 1,
+     "payload": [],
+     "mods": [
+      "twin"
+     ]
+    }
+   ]
+  },
+  {
+   "spoken": "twin projectile",
+   "parse": "[twin **projectile**]",
+   "clauses": [
+    {
+     "delivery": "hand",
+     "weight": 1,
+     "payload": [
+      "[twin#1|projectile]"
+     ],
+     "mods": []
+    }
+   ]
+  },
+  {
+   "spoken": "twin bomb",
+   "parse": "[twin **bomb**]",
+   "clauses": [
+    {
+     "delivery": "hand",
+     "weight": 1,
+     "payload": [
+      "[twin#1|bomb]"
+     ],
+     "mods": []
+    }
+   ]
+  },
+  {
+   "spoken": "twin self",
+   "parse": "[twin **self**]",
+   "clauses": [
+    {
+     "delivery": "hand",
+     "weight": 1,
+     "payload": [
+      "[twin#1|self]"
+     ],
+     "mods": []
+    }
+   ]
+  },
+  {
+   "spoken": "twin beam",
+   "parse": "[twin **beam**]",
+   "clauses": [
+    {
+     "delivery": "hand",
+     "weight": 1,
+     "payload": [
+      "[twin#1|beam]"
+     ],
+     "mods": []
+    }
+   ]
+  },
+  {
+   "spoken": "twin twin",
+   "parse": "twin×2",
+   "clauses": [
+    {
+     "delivery": "hand",
+     "weight": 1,
+     "payload": [],
+     "mods": [
+      "twin×2"
+     ]
     }
    ]
   }

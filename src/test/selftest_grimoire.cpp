@@ -152,7 +152,9 @@ Status GateGrimoire(Ctx& c, std::string& detail) {
   // ---- 4. the overflow cap ------------------------------------------------------
   {
     Grimoire big;
-    std::vector<std::string> twenty(20, "kit_fire");
+    // Longer than kSpellStackMax, whatever it is this week (24 since rule 4's
+    // lanes needed the room): the claim is the OVERFLOW, not the number.
+    std::vector<std::string> twenty((size_t)kSpellStackMax + 6, "kit_fire");
     big.pages.push_back({"twenty", twenty});
     const GrimoireExpansion ex = ExpandWords(lib, big, {"twenty"}, kSpellStackMax);
     check(ex.truncated && (int)ex.spoken.size() == kSpellStackMax,
