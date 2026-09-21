@@ -18,6 +18,7 @@
 #include "sim/biomes.h"
 #include "sim/farfield.h"
 #include "sim/farplumes.h"
+#include "sim/oprecord.h"
 #include "sim/treeatlas.h"
 #include "sim/worldmap.h"
 #include "sim/wind.h"
@@ -475,9 +476,9 @@ void WriteRenderParams(const rhi::Queue& queue, const World& world,
 // derived only from tick-deterministic inputs (explosion history + a settled
 // particle count), never from frame timing — see DESIGN.md §2/§4.
 void SubmitTick(GpuContext& ctx, World& world, Simulation& sim, uint32_t tick,
-                uint32_t seed, const std::vector<BrushOp>& ops,
-                const std::vector<ExplosionOp>& exps,
-                const std::vector<CellOp>& cells, bool hashEnable,
+                uint32_t seed, const std::vector<BrushOp>& opsIn,
+                const std::vector<ExplosionOp>& expsIn,
+                const std::vector<CellOp>& cellsIn, bool hashEnable,
                 IVec3 playerChunk, bool wantReadback, bool particlesActive,
                 const std::vector<ParticleSpawn>& spawns,
                 uint32_t farCount,
@@ -485,6 +486,49 @@ void SubmitTick(GpuContext& ctx, World& world, Simulation& sim, uint32_t tick,
                 uint32_t fluidLive,
                 const uint32_t* fluidSplashMat,
                 bool vizActive) {
+  // ---- THE CHOKE POINT, AND WHAT IT NOW OWES THE STREAM -------------------
+  //
+  // Three of the six op vectors were clamped here and three were not: `cells`,
+  // `spawns` and `fluid` were min()'d against their caps and SILENTLY
+  // truncated, while `ops` and `exps` were uploaded at whatever size the
+  // producers had built — into buffers sized kMaxOpsPerTick * 32 and
+  // kMaxExplosionsPerTick * 32 (world.cpp). Two producers push BrushOps in a
+  // loop without consulting the cap at all (mob.cpp's bleed drip,
+  // avatar.cpp's sever stain), so the overrun was one busy tick away.
+  //
+  // So every stream is clamped HERE, at the one place all of them pass
+  // through, and every refusal is COUNTED (sim/oprecord.h). A truncation that
+  // is only a missing voxel is the bare-count failure CLAUDE.md rule 6 is
+  // about; a truncation with a number beside it in build/last_run.json is a
+  // measurement. The producer-side checks stay as the belt to this brace.
+  //
+  // The parameters are renamed rather than the body rewritten: rebinding the
+  // three names here means the four hundred lines below keep reading `ops`,
+  // `exps` and `cells` and go on describing what actually reached the GPU.
+  std::vector<BrushOp> opsClamp;
+  std::vector<ExplosionOp> expsClamp;
+  std::vector<CellOp> cellsCanon;
+  uint32_t brushTrunc = 0, expTrunc = 0;
+  if (opsIn.size() > kMaxOpsPerTick) {
+    brushTrunc = (uint32_t)opsIn.size() - kMaxOpsPerTick;
+    opsClamp.assign(opsIn.begin(), opsIn.begin() + kMaxOpsPerTick);
+  }
+  if (expsIn.size() > kMaxExplosionsPerTick) {
+    expTrunc = (uint32_t)expsIn.size() - kMaxExplosionsPerTick;
+    expsClamp.assign(expsIn.begin(), expsIn.begin() + kMaxExplosionsPerTick);
+  }
+  // Cell ops: DEDUPE before the cap, so a stream that only overflows because
+  // it repeats itself is not truncated for it. Keep-first in push order; a
+  // tick with no duplicates leaves `cellsIn` untouched and allocates nothing.
+  {
+    uint32_t dupeCell = 0xFFFFFFFFu;
+    const uint32_t dropped =
+        opstream::CanonicalizeCells(cellsIn, cellsCanon, &dupeCell);
+    if (dropped) opstream::NoteCellDupes(tick, dropped, dupeCell);
+  }
+  const std::vector<BrushOp>& ops = brushTrunc ? opsClamp : opsIn;
+  const std::vector<ExplosionOp>& exps = expTrunc ? expsClamp : expsIn;
+  const std::vector<CellOp>& cells = cellsCanon.empty() ? cellsIn : cellsCanon;
   // ---- HOW THIS FUNCTION IS BILLED ---------------------------------------
   //
   // SubmitTick used to be ONE bar on the Performance tab, called "submit", with
@@ -500,6 +544,56 @@ void SubmitTick(GpuContext& ctx, World& world, Simulation& sim, uint32_t tick,
   // pair would double-count. Where a span has to yield to an inner one it is
   // Close()d and a fresh one opened after.
   //
+  // ---- N1: PUBLISH THE SNAPSHOT THIS TICK IS OWED ------------------------
+  //
+  // From here until the head of the next SubmitTick, `World::Snap()` is the
+  // snapshot of tick - World::kSnapshotLatency, EXACTLY -- not the freshest one
+  // that happened to land. See the block comment on that constant for why the
+  // difference is the whole of finding L1: every consumer below (the wind wake,
+  // the page table's tightening and occupancy fold, the fluid render bounds)
+  // and every gameplay decision the caller made for this tick used to read a
+  // world whose AGE depended on how fast this machine's GPU came back.
+  //
+  // WHERE THE +1 IS. The frame loop assembles a tick's ops BEFORE calling this,
+  // so a decision made for tick T reads the snapshot published at the head of
+  // SubmitTick(T-1), i.e. tick T - kSnapshotLatency - 1. Still a constant, and
+  // still a pure function of (inputs, tick) -- which is the property that
+  // matters. Closing the one-tick gap means publishing between `tick++` and the
+  // op assembly, which is a line in main.cpp's frame loop and not this file's
+  // to move.
+  //
+  // The wait is the price of the constant and it is COUNTED, never skipped:
+  // World::SnapshotPipe().waits is package N1's kill criterion.
+  if (tick >= World::kSnapshotLatency) {
+    const uint32_t target = tick - World::kSnapshotLatency;
+    // Free first: a fence that retired during the frame's render costs a poll.
+    ctx.ProcessEvents();
+    // Then block, on the ONE submit that owes the oldest snapshot -- not
+    // WaitIdle, which would additionally wait on the render of the frame in
+    // front and every tick queued behind (measured ~93 ms when the old
+    // staleness fallback did that). Bounded by the ring depth: each iteration
+    // retires at least one slot and nothing re-arms one from in here.
+    for (int i = 0; i < World::kReadbackSlots &&
+                    world.ReadbackPendingAtOrBefore(target);
+         i++) {
+      const auto w0 = std::chrono::steady_clock::now();
+      sandvox::PerfSpan spanWait(PerfScope::ReadbackStall);
+      if (!ctx.WaitOldestPendingMap()) break;
+      world.NoteSnapshotWait();
+      g_snapshotStalls++;
+      g_stallStats.stalls++;
+      g_stallStats.issuedArm++;  // a copy WAS encoded; it has not landed yet
+      g_stallStats.mapWaits++;
+      g_stallStats.gapHist[std::min(World::kSnapshotLatency, 8u)]++;
+      g_stallStats.gapMax =
+          std::max(g_stallStats.gapMax, World::kSnapshotLatency);
+      g_stallStats.mapArmMs +=
+          std::chrono::duration<double, std::milli>(
+              std::chrono::steady_clock::now() - w0)
+              .count();
+    }
+    if (world.PublishSnapshotsUpTo(target)) g_stallStats.mapArm++;
+  }
   // Every span is a branch on a bool unless --telemetry or --perf is live.
   sandvox::PerfSpan spanHead(PerfScope::Upload);
   particlesActive = particlesActive || !exps.empty() || !spawns.empty();
@@ -514,6 +608,13 @@ void SubmitTick(GpuContext& ctx, World& world, Simulation& sim, uint32_t tick,
   fluidLive = std::min(fluidLive, kFluidCap);
   if (fluidSpawnCount > kFluidCap - fluidLive)
     fluidSpawnCount = kFluidCap - fluidLive;
+  // Every refusal in one ledger. `cells` is charged against the CANONICAL
+  // stream, so a duplicate that was already dropped is not counted twice --
+  // it is reported as a dupe, which is a different fault from an overflow.
+  opstream::NoteTruncation(
+      brushTrunc, expTrunc, (uint32_t)cells.size() - cellCount,
+      (uint32_t)spawns.size() - spawnCount,
+      (uint32_t)fluidSpawns.size() - fluidSpawnCount, 0);
   TickParams tp{tick, seed, (uint32_t)ops.size(), hashEnable ? 1u : 0u,
                 (uint32_t)exps.size(), sim.Page(), cellCount, 0};
   tp.spawnCount = spawnCount;
@@ -920,9 +1021,15 @@ void SubmitTick(GpuContext& ctx, World& world, Simulation& sim, uint32_t tick,
   //
   // Simulation is told the count BEFORE EncodeTick because the C_GAS latch
   // decides there whether the pass that drains this list is recorded at all.
+  std::vector<GasSpawnOp> gas;
   {
-    std::vector<GasSpawnOp> gas;
     world.TakeGasSpawns(gas);
+    // REPLAY takes this list from the record instead. Gas spawns are the one
+    // op stream SubmitTick does not receive as an argument -- it drains a CPU
+    // queue that the fire/reaction systems filled earlier in the tick -- so a
+    // replay that only re-fed the arguments would silently drop them. No-op
+    // unless a Log is armed.
+    opstream::ReplaceGasIfReplaying(tick, gas);
     std::vector<uint32_t> hdr(kGasSpHdr + gas.size() * kGasSpStride, 0u);
     hdr[kGasSpCount] = (uint32_t)gas.size();
     if (!gas.empty())
@@ -959,6 +1066,38 @@ void SubmitTick(GpuContext& ctx, World& world, Simulation& sim, uint32_t tick,
     if (plumes.TakeUpload(&pw, &pn))
       ctx.queue.WriteBuffer(world.gasFarEmit, 0, pw, (size_t)pn * 4);
     sim.NoteFarPlumes(plumes.Count(), plumes.CountWide());
+  }
+
+  // ---- THE TICK, AS A RECORD (docs/PLAN_multiplayer_now.md N3) ------------
+  //
+  // HERE and not at function entry, because what a replay has to reproduce is
+  // what REACHED THE GPU: the clamped, canonical op vectors and the completed
+  // TickParams, not what the producers hoped to send. TickParams specifically:
+  // world.h says many sim.* words ride it per tick "so a replay reproduces the
+  // stream", and a record that carried only the op payloads would replay a
+  // different wind, a different day phase and a different fluid gate.
+  //
+  // Under replay this COMPARES instead of writing -- see RecordFrame. One bool
+  // test when neither is armed.
+  {
+    opstream::TickInputs in;
+    in.tick = tick;
+    in.seed = seed;
+    in.hashEnable = hashEnable ? 1u : 0u;
+    in.wantReadback = wantReadback ? 1u : 0u;
+    in.particlesActive = particlesActive ? 1u : 0u;
+    in.vizActive = vizActive ? 1u : 0u;
+    in.playerChunk[0] = playerChunk.x;
+    in.playerChunk[1] = playerChunk.y;
+    in.playerChunk[2] = playerChunk.z;
+    in.farCount = farCount;
+    in.fluidLive = fluidLive;
+    in.hasSplashMat = fluidSplashMat ? 1u : 0u;
+    if (fluidSplashMat)
+      for (int i = 0; i < 4; i++) in.fluidSplashMat[i] = fluidSplashMat[i];
+    opstream::RecordFrame(in, tp, ops, exps, cells.data(), cellCount,
+                          spawns.data(), spawnCount, fluidSpawns.data(),
+                          fluidSpawnCount, gas);
   }
 
   // Day/night sleep handshake. The daylight-gated reactions deliberately do
@@ -1168,11 +1307,16 @@ void SubmitTick(GpuContext& ctx, World& world, Simulation& sim, uint32_t tick,
   }
   {
     // fluidChunks(N): every chunk the MLS-MPM seam may write a voxel into —
-    // the active block slots from the one-tick-latent snapshot readback plus
+    // the active block slots from the latest DELIVERED snapshot readback plus
     // this tick's CPU-known fluid spawn cells, dilated one ring inside
     // UpdateFluidChunks. The settle converter's >= 8 calm-tick floor is what
     // makes the readback latency safe (world.h fluid block).
-    const WorldSnapshot& sn = world.Snap();
+    //
+    // LatestDelivered(), not Snap(): this materializes pages, which is page
+    // TABLE work — derived data that wants the freshest thing the GPU has
+    // handed back, not the fixed-age view gameplay decisions read. See the
+    // block comment on World::LatestDelivered.
+    const WorldSnapshot& sn = world.LatestDelivered();
     std::vector<uint32_t> blockSlots;
     if (sn.valid && sn.fluidBlockCount > 0) {
       blockSlots.assign(sn.fluidBlocks.begin(),
@@ -1186,7 +1330,12 @@ void SubmitTick(GpuContext& ctx, World& world, Simulation& sim, uint32_t tick,
     pt.UpdateFluidChunks(blockSlots, fluidCells, world);
   }
   {
-    const WorldSnapshot& sn = world.Snap();
+    // LatestDelivered(), not Snap(), and the freshness is load-bearing rather
+    // than nice: the tightening is the ONLY thing that shrinks cpuDirty, and
+    // it rolls a stale snapshot forward one N26 ring per tick of gap. Pointing
+    // it at the fixed T-K view is what produced page faults and a mass leak in
+    // N1's first cut. Derived data, so this may be timing-dependent.
+    const WorldSnapshot& sn = world.LatestDelivered();
     if (sn.valid) pt.TightenFromSnapshot(sn.dirtyFlags, sn.tick, tick);
     // Contributor (e), the particle flight shell — strictly AFTER the
     // tightening, like (c)/(d): a union applied after an intersection cannot
@@ -1205,8 +1354,12 @@ void SubmitTick(GpuContext& ctx, World& world, Simulation& sim, uint32_t tick,
   //
   // Both steps read data the CPU already has: the occupancy the snapshot
   // already carries, and a tick counter. No new readback, no new scan.
-  if (world.Snap().valid)
-    pt.ConsumeOccupancy(world.Snap().occupancy, world.Snap().occStain, tick);
+  // LatestDelivered() for the same reason the tightening uses it: the free
+  // path is page-table bookkeeping, and freeing against a K-tick-old occupancy
+  // reading is how a chunk that just gained matter gets demoted under it.
+  if (world.LatestDelivered().valid)
+    pt.ConsumeOccupancy(world.LatestDelivered().occupancy,
+                        world.LatestDelivered().occStain, tick);
   pt.RetirePages(tick);
 
   // ---- the §3.4 settled-skip latch ----------------------------------------
@@ -1311,152 +1464,48 @@ void SubmitTick(GpuContext& ctx, World& world, Simulation& sim, uint32_t tick,
                  drainBodies,
                  waterGpu ? waterGpu->sweepSlot : kWaterBodyCap);
   sim.EncodeFarFill(enc, farCount);
-  // PAGED RESIDENCY MAKES THE SNAPSHOT LOAD-BEARING, so the harness must ask
-  // for one even when the caller did not. §3.2 step (2)'s intersection is the
-  // ONLY thing that tightens cpuDirty; without a snapshot the mirror is only
-  // ever the step-(1) recurrence, which dilates by a ring every tick and walks
-  // the materialization set through the whole window in ~10 ticks — the pool
-  // then exhausts and §3.8 aborts. Most selftest gates pass wantReadback=false
-  // (they read the world through blocking hash/occupancy reads, not through
-  // Snap()), so under --residency paged every gate hit that abort.
+  // ---- N1: THE READBACK IS UNCONDITIONAL ---------------------------------
   //
-  // PRE-EXISTING and independent of phase 7's two fixes: proven by stashing
-  // them and rebuilding. The condition is narrow on purpose:
-  //   - HarnessSnapshotDrain() — main.cpp's frame loop shares SubmitTick and
-  //     already requests readbacks on its own schedule; it must not be touched.
-  //   - Residency::Paged — under dense the page table is the identity map,
-  //     nothing is ever materialized or freed, and cpuDirty is inert. Forcing
-  //     a readback there would change dense timing for no reason, so the dense
-  //     path stays byte-identical (verified: world hash 7cfa2420 unchanged).
-  // A readback is a pure copy out plus a map — it mutates no world state — so
-  // the only thing a gate can observe from this is Snap() becoming valid in
-  // paged mode, which is exactly what it needs to be.
-  // PAGED SELF-DEFENSE AGAINST SNAPSHOT STARVATION. §3.2's tightening is the
-  // ONLY thing that shrinks cpuDirty; without a snapshot the mirror dilates a
-  // ring per tick and the materialization set walks toward the whole window —
-  // measured at game startup: the worldgen-sized dirty set went 8,379 →
-  // 20,601 chunks over the four ticks the first frame runs before any
-  // snapshot fence can retire, and hysteresis stacked the materialized pages
-  // straight through the 16,384-page pool (§3.8 abort on the FIRST windowed
-  // paged run). The same starvation kills every headless path that ticks
-  // without readbacks (--shot settles worldgen over hundreds of such ticks).
+  // `wantReadback` used to gate this and no longer does (docs/PLAN_multiplayer_now.md
+  // N1). A FIXED latency needs a copy on EVERY tick: the publish at
+  // T + World::kSnapshotLatency has nothing to hand over otherwise, and
+  // "did this tick get a snapshot" would go back to being a property of which
+  // caller ran the tick rather than of the tick number. It costs nothing new --
+  // the harness arm already forced one on every tick (HarnessSnapshotDrain, and
+  // P5-I made that residency-independent) and the game path passes true.
   //
-  // So paged mode enforces its own snapshot cadence: when no snapshot exists,
-  // or the one in hand is older than the tick can tolerate, request the
-  // readback and DRAIN it exactly like the harness does. Two thresholds:
-  //   - the SETTLE WINDOW (PageTable::InSettleWindow — the first ticks after
-  //     ANY world reset, anchored by the page table itself, because --shot's
-  //     scenes re-worldgen at arbitrary tick values and an absolute-tick
-  //     predicate missed every scene after the first) drains per-tick
-  //     (gap 0): the dirty set is at its lifetime maximum, and even a 2-4
-  //     tick lag — each stale snapshot dilated one ring per tick of lag —
-  //     measured 16,347 pages in use by tick 8, vs 9,396 peak for the same
-  //     settle under the harness's strict per-tick drain;
-  //   - after it, kPagedSnapshotMaxGap: the settled world's dirty set is
-  //     small, a few rings of it are cheap, and in steady play the game's own
-  //     readbacks keep the snapshot 1-3 ticks fresh so this never triggers —
-  //     it exists for hitches and for headless tick loops.
-  // Shot paths WaitIdle every tick anyway, so the added pump costs nothing
-  // there. Dense mode takes none of this — the identity map has no mirror to
-  // starve.
-  //
-  // RAISING THIS TO BUY FEWER STALLS IS A TRAP, and it was the first half of a
-  // plan that got as far as being approved before the arithmetic was checked.
-  // The reasoning was "the pool is window-sized now, so a bigger mirror is
-  // survivable" — true about the ABORT, and irrelevant to the COST. The
-  // tightening at pagetable.cpp's TightenFromSnapshot ends in
-  //     cpuDirty.IntersectWith(snap); cpuDirty.UnionWith(snap);
-  // which is (A n S) u S == S: after a tighten the mirror IS the snapshot's
-  // dirty set dilated one N26 ring per tick of gap. So this constant is the
-  // EXPONENT on the materialization set, not a latency knob. At the measured
-  // ~2.3x/ring that makes gap 8 order-100x the pages of gap 4, and the fatal
-  // precedent (main.cpp's pump note: 23.4k of 24,576 pages while sprint-flying)
-  // is that exact shape. A bigger pool turns that from an abort into tens of
-  // thousands of page fills plus an O(window) walk every tick — a far worse
-  // spike than the stall it was meant to remove.
-  //
-  // The honest way to raise it is to measure first: SANDVOX_PT_DEBUG=1 prints
-  // `cpuDirty=` per tick, so run a hitch-heavy flight and look at what the
-  // mirror actually reaches at gap 4 before granting it more rings.
-  //
-  // ---- P2-D: IT IS A COST BOUND, SO IT IS MEASURABLE WITHOUT A REBUILD -----
-  // Everything above is about what the gap COSTS, and none of it is about
-  // correctness: step (1)'s recurrence is a valid superset at every gap, and
-  // TightenFromSnapshot refuses outright once `rolls` outruns the C ring, so a
-  // stale snapshot makes the mirror EXPENSIVE, never wrong. That makes the
-  // right way to argue about the value a sweep rather than a paragraph, and
-  // the note above says so in as many words ("the honest way to raise it is to
-  // measure first"). SANDVOX_SNAP_MAXGAP is that measurement, permanently: it
-  // costs one run per candidate instead of one rebuild per candidate. The
-  // ceiling is PageTable::kCRing + 1 — past it the tightening skips entirely
-  // and the mirror is on step (1) alone, which is the runaway the note warns
-  // about with no fixed point to fall back to.
-  static const uint32_t kPagedSnapshotMaxGap = [] {
-    constexpr uint32_t kDefault = 4;
-    if (const char* e = std::getenv("SANDVOX_SNAP_MAXGAP")) {
-      const long n = std::strtol(e, nullptr, 10);
-      if (n >= 1 && n <= 13) {
-        std::printf("[snap] SANDVOX_SNAP_MAXGAP=%ld (default %u)\n", n,
-                    kDefault);
-        return (uint32_t)n;
-      }
-    }
-    return kDefault;
-  }();
-  const bool paged = world.residency == World::Residency::Paged;
-  const uint32_t maxGap =
-      world.pages->InSettleWindow(tick) ? 0u : kPagedSnapshotMaxGap;
-  const bool snapshotStale =
-      paged &&
-      (!world.Snap().valid || (tick > world.Snap().tick + maxGap));
-  // ---- P5-I: THE HARNESS ARM IS RESIDENCY-INDEPENDENT --------------------
-  //
-  // It used to be `paged && (HarnessSnapshotDrain() || snapshotStale)`, and
-  // the `paged &&` on the FIRST disjunct is what broke the paged/dense oracle
-  // for streaming (PLAN_page_table.md §6, RESEARCH_streaming_hitch.md P5-I).
-  //
-  // A headless harness never gets a snapshot on its own (see the block comment
-  // on SetHarnessSnapshotDrain in support.h), so with that conjunct the two
-  // residency modes ran with DIFFERENT `World::Snap()` availability:
-  // `Snap().valid` was true on every tick under paged and false on every tick
-  // under dense. `Stream::EvictSlots`'s re-derivability filter reads exactly
-  // that flag — `if (filter && snap.valid && modified_[s] == 0) continue;` —
-  // so dense stored all 1,024 slots of every leaving plane and paged stored
-  // ~30. On re-entry a stored chunk takes FillSlots' store-hit branch (which
-  // wakes it in the same tick) and an unstored one takes the gen branch (which
-  // under R1 wakes it kWakeLatency ticks later), so the two modes started the
-  // same plane's CA four ticks apart and the world hash sequences diverged at
-  // the first re-entering plane. Measured on the `streaming` gate: identical
-  // words, dirty flags and occupancy at tick 5040; at 5041 (the first shift
-  // that re-enters a plane the window had already left) 930 of the plane's
-  // slots are awake under dense and none under paged, and five grass cells
-  // creep in one mode and not the other.
-  //
-  // The oracle is only an oracle if both arms are driven the same way. The
-  // dense arm now takes the same drain the paged arm always did; the game path
-  // is untouched (this whole branch is behind HarnessSnapshotDrain(), which
-  // main.cpp's frame loop never sets), and the paged arm is bit-unchanged, so
-  // no pinned hash moves.
-  //
-  // This repairs the ORACLE. It does not remove the underlying hazard, which
-  // is that snapshot AVAILABILITY — a readback-timing property — decides what
-  // enters the chunk store and therefore when a re-entering plane starts
-  // acting. See the P5-I section of docs/RESEARCH_streaming_hitch.md.
-  const bool needSnapshotForPaging =
-      HarnessSnapshotDrain() || snapshotStale;
+  // A readback is a pure copy out plus a map; it mutates no world state.
+  (void)wantReadback;
+  // THE RING MAY NEVER DECLINE ON THE SIM PATH. A tick that finds every slot in
+  // flight gets no copy, so the publish K ticks later has nothing to give and
+  // the latency stops being a constant. `return false` at World::EncodeReadbacks
+  // is now unreachable-by-construction rather than merely rare: wait for a slot
+  // instead. Bounded by the ring depth -- each iteration retires at least one
+  // slot and nothing re-arms one from inside the loop.
+  for (int i = 0; i < World::kReadbackSlots && !world.ReadbackSlotFree(); i++) {
+    sandvox::PerfSpan spanWait(PerfScope::ReadbackStall);
+    if (!ctx.WaitOldestPendingMap()) break;
+    world.NoteSnapshotSlotWait();
+  }
   bool doCopy = false;
-  if (wantReadback || needSnapshotForPaging) {
-    // TIMED (P3-F): ~1.9 MiB of copies out per requested tick, recorded as raw
+  {
+    // TIMED (P3-F): ~1.9 MiB of copies out per tick, recorded as raw
     // CopyBufferToBuffer rather than as pass rows. `readback` was a CPU-only
     // row on the Performance page; this is the GPU side of the same system.
     TickGpuSpan spanRb(enc, "readbackCopy");
     doCopy = world.EncodeReadbacks(ctx.device, enc,
                                    {playerChunk.x - 1, playerChunk.y - 1, playerChunk.z - 1},
                                    1 - sim.Page(), tick);
-    if (doCopy) world.EncodeDirtyCopy(enc, sim.DirtyNext());
-    // A refusal is the ring reporting that the GPU still owes every slot a
-    // delivery. Counted so the stall above has its denominator on the page.
-    if (!doCopy) g_readbackDeclines++;
+    if (doCopy) {
+      world.EncodeDirtyCopy(enc, sim.DirtyNext());
+    } else {
+      // Structurally impossible after the wait above unless the ring had
+      // nothing outstanding to wait FOR. Counted at both ends: here for the
+      // Performance page, and in World::SnapshotPipe().declines, which the
+      // snapshot-latency gate asserts is zero.
+      g_readbackDeclines++;
+      g_stallStats.refusedArm++;
+    }
   }
   spanEnc.Close();
   {
@@ -1469,132 +1518,94 @@ void SubmitTick(GpuContext& ctx, World& world, Simulation& sim, uint32_t tick,
     sim.FlipPage();
     if (doCopy) world.KickReadback();
   }
-  // Wait for the submit's fence, then pump — which is what a game frame does
-  // for free by having real time elapse between the two. Taken by the harness
-  // drain (SetHarnessSnapshotDrain, off by default) and by paged mode's
-  // staleness fallback above; the game's frame loop only pays it in the
-  // startup/hitch cases the fallback exists for.
+  // ---- THE HARNESS DRAIN IS NO LONGER A LATENCY, ONLY AN ORDERING ---------
   //
-  // The pump runs EVEN WHEN NO COPY WAS ENCODED, and that is load-bearing:
-  // EncodeReadbacks DECLINES while all three ring slots are in flight, and in
-  // a headless tick loop only this pump ever retires them. Gating the pump on
-  // doCopy deadlocks the whole cadence — request declined, so no pump, so the
-  // slots never retire, so every later request is declined too — measured on
-  // --shot's oil-slick scene as a snapshot-starved mirror dilating a ring per
-  // tick straight through the pool (materialize allocations 35 → 3,447/tick
-  // over 13 ticks, no tighten ever running).
+  // It used to be the thing that gave the harness a snapshot at all, and it
+  // gave it a ONE-TICK-LATENT one -- a latency the game never ran at, which is
+  // finding L1' of docs/RESEARCH_multiplayer_readiness.md. The publish at the
+  // head of SubmitTick is now the only thing that decides what Snap() holds,
+  // and it holds tick - kSnapshotLatency under the harness and under the game
+  // alike. So --selftest tests the SHIPPED latency.
+  //
+  // What is left here is a TEST-ORDERING requirement and nothing else: gates
+  // read the world through blocking hash/occupancy reads either side of this
+  // and several depend on every submit having retired before they look
+  // (selftest.h's ordering note). It cannot change what Snap() reports, only
+  // how long the publish has to wait for it -- which is why the harness pays
+  // zero snapshot waits and the game pays a measured few.
   if (HarnessSnapshotDrain()) {
-    // THE HARNESS ARM IS UNCHANGED AND STAYS A FULL DRAIN. Gates read the world
-    // through blocking hash/occupancy reads either side of this, and several
-    // depend on every submit having retired before they look (selftest.h's
-    // ordering note). Narrowing it would be a behaviour change to the test
-    // harness in a commit whose entire point is that the harness must NOT move.
     sandvox::PerfSpan spanWait(PerfScope::ReadbackStall);
     ctx.WaitIdle();
     ctx.ProcessEvents();
-  } else if (snapshotStale) {
-    // ---- THE GAME-PATH HITCH FALLBACK, AND WHY IT IS NO LONGER A WaitIdle ---
-    //
-    // Billed to Readback, and it is the one place on this path that BLOCKS. A
-    // spike here is the frame paying for a snapshot cadence it let slip.
-    // Counted, because only this arm is a surprise. See TakeSnapshotStalls.
-    //
-    // What is needed is ONE snapshot, fresh enough for §3.2's tightening. What
-    // ctx.WaitIdle() waited for was the whole device: the render of the frame
-    // in front, its present, and every tick queued behind — none of which
-    // produce a snapshot. Measured at ~93 ms on the frame it fired, which is
-    // why the row read as "async readback" spiking with nothing happening.
-    //
-    // WaitOldestPendingMap blocks on the single submit that owes the oldest
-    // in-flight snapshot and then delivers it. Looping re-checks the ACTUAL
-    // predicate — freshness — after each delivery, so it stops the moment the
-    // gap is covered instead of over-waiting: with a copy kicked for `tick`
-    // just above, the worst case is draining the whole ring, and the common
-    // case is one wait on a readback that was already nearly done. Measured
-    // 2026-09-03 (P2-D): 157 stalls, 157 resolved by exactly ONE fence.
-    g_snapshotStalls++;
-    // ---- ATTRIBUTION, recorded BEFORE the wait (rule 6) ------------------
-    // `doCopy` is the whole refused/issued split: false means EncodeReadbacks
-    // found every ring slot in flight and declined, so no snapshot exists for
-    // this tick and the newest one the ring can deliver is strictly older.
-    g_stallStats.stalls++;
-    if (doCopy) g_stallStats.issuedArm++; else g_stallStats.refusedArm++;
-    {
-      const uint32_t gapNow =
-          world.Snap().valid
-              ? (tick > world.Snap().tick ? tick - world.Snap().tick : 0u)
-              : 9u;
-      const uint32_t bucket = world.Snap().valid ? std::min(gapNow, 8u) : 9u;
-      g_stallStats.gapHist[bucket]++;
-      if (world.Snap().valid && gapNow > g_stallStats.gapMax)
-        g_stallStats.gapMax = gapNow;
-    }
-    const auto stallT0 = std::chrono::steady_clock::now();
-    // ReadbackStall, NOT Readback: this is the one blocking wait on the path,
-    // and it shared a row with the non-blocking pump until the row read as
-    // "async readback spiked" after a lake was disturbed. The pump is a poll
-    // and a memcpy; this is a fence wait on a GPU that is behind. Separate
-    // rows, because they need opposite fixes (perfnodes.h says the same).
-    sandvox::PerfSpan spanWait(PerfScope::ReadbackStall);
-    auto fresh = [&] {
-      return world.Snap().valid && tick <= world.Snap().tick + maxGap;
-    };
-    // Bounded by the ring depth: each iteration retires one slot, and a slot
-    // cannot be re-armed from here (no submit happens inside the loop), so this
-    // terminates on WaitOldestPendingMap returning false at the latest.
-    // MAPS EXHAUSTED vs LOOP EXHAUSTED, and the difference decides whether the
-    // drain below can possibly help. WaitOldestPendingMap returns false only
-    // when nothing is outstanding; if that happens, every snapshot the ring
-    // ever encoded has already been delivered and no amount of further waiting
-    // will produce a fresher one.
-    bool mapsExhausted = false;
-    for (int i = 0; i < World::kReadbackSlots && !fresh(); i++) {
-      if (!ctx.WaitOldestPendingMap()) {
-        mapsExhausted = true;
-        break;
+  }
+  // ---- THE PAGE TABLE'S OWN SNAPSHOT CADENCE, AND WHY IT SURVIVED N1 ------
+  //
+  // This is the paged self-defence that predates N1, restored deliberately
+  // after N1's first cut deleted it. The reasoning that deleted it was: "with
+  // an exact latency the staleness predicate is a compile-time constant, so
+  // the fallback is dead code". That was true of the predicate and false of
+  // the NEED. §3.2's intersection is the only thing that shrinks cpuDirty, and
+  // TightenFromSnapshot dilates one N26 ring per tick of gap — so pinning the
+  // page table to a K-tick-old snapshot does not make it stale-but-fine, it
+  // makes the materialization set the wrong SHAPE. Chunks the GPU is about to
+  // write stop being materialized, and a store into an unmaterialized chunk is
+  // a PAGE FAULT: a lost voxel. Measured on that first cut: `daylight-boundary`
+  // pageFaults 1 and `ca-level-pond` leaking two eighths of water, in a suite
+  // that had neither before.
+  //
+  // WHAT CHANGED, and it is the whole reason both customers can be served: the
+  // drain now waits for DELIVERY and not for PUBLICATION. Snap() is advanced
+  // by PublishSnapshotsUpTo at the head of the tick and by nothing else, so
+  // draining here cannot move it a single tick — the fixed latency is
+  // untouched, and the page table gets the fresh readback it has always
+  // needed. Before N1 these were the same act, which is why the conflict was
+  // invisible.
+  //
+  // Two thresholds, unchanged: gap 0 inside PageTable::InSettleWindow (a
+  // freshly generated world's dirty set is at its lifetime maximum and even a
+  // 2-4 tick lag measured 16,347 pages in use by tick 8 against 9,396 for the
+  // same settle at gap 0), and kPagedSnapshotMaxGap after it. Dense takes none
+  // of this: the identity map has no mirror to starve.
+  //
+  // RAISING kPagedSnapshotMaxGap TO BUY FEWER STALLS IS STILL A TRAP. The
+  // tightening ends in `IntersectWith(snap); UnionWith(snap)`, which is
+  // (A n S) u S == S, so this constant is the EXPONENT on the materialization
+  // set and not a latency knob. Measure with SANDVOX_PT_DEBUG=1 before
+  // granting it more rings; SANDVOX_SNAP_MAXGAP makes that one run per
+  // candidate instead of one rebuild per candidate.
+  static const uint32_t kPagedSnapshotMaxGap = [] {
+    constexpr uint32_t kDefault = 4;
+    if (const char* e = std::getenv("SANDVOX_SNAP_MAXGAP")) {
+      const long n = std::strtol(e, nullptr, 10);
+      if (n >= 1 && n <= 13) {
+        std::printf("[snap] SANDVOX_SNAP_MAXGAP=%ld (default %u)\n", n,
+                    kDefault);
+        return (uint32_t)n;
       }
+    }
+    return kDefault;
+  }();
+  if (world.residency == World::Residency::Paged) {
+    const uint32_t maxGap =
+        world.pages->InSettleWindow(tick) ? 0u : kPagedSnapshotMaxGap;
+    auto delivered = [&] {
+      const WorldSnapshot& ld = world.LatestDelivered();
+      return ld.valid && tick <= ld.tick + maxGap;
+    };
+    if (!delivered()) ctx.ProcessEvents();  // free: a fence that already fired
+    // Bounded by the ring depth — each iteration retires at least one slot and
+    // nothing re-arms one from in here. One targeted fence per iteration, never
+    // a device drain: WaitIdle waits for WORK, and work is not what is missing.
+    for (int i = 0; i < World::kReadbackSlots && !delivered(); i++) {
+      sandvox::PerfSpan spanWait(PerfScope::ReadbackStall);
+      if (!ctx.WaitOldestPendingMap()) break;
+      world.NoteSnapshotSlotWait();
+      g_snapshotStalls++;
+      g_stallStats.stalls++;
+      g_stallStats.issuedArm++;
       g_stallStats.mapWaits++;
     }
-    // Still stale means no in-flight map could supply it — every slot the ring
-    // ever armed has now been delivered and the newest is still too old.
-    const auto idleT0 = std::chrono::steady_clock::now();
-    double idleMs = 0;
-    if (!fresh() && !mapsExhausted) {
-      // ---- THE DRAIN IS NOW UNREACHABLE-BY-CONSTRUCTION, NOT JUST RARE -----
-      // The loop above is bounded by the ring depth and the ring is the only
-      // producer of these maps, so it cannot exit on the bound with maps still
-      // outstanding — `mapsExhausted` is the only way out that leaves the
-      // snapshot stale. In that state WaitIdle waits for WORK, and work is not
-      // what is missing: no readback was ever encoded for a tick inside the
-      // gap, so draining the device delivers nothing new. Measured over
-      // `--frames 600 --autofly-surface` on the 3-slot ring: 157 stalls, 157
-      // resolved by a single targeted fence, ZERO reaching here. Keeping the
-      // arm but gating it on "maps remain" turns a 93 ms futile device drain
-      // into a correctly-attributed no-op, and the g_stallStats.proceedStale
-      // counter names the case that used to hide inside it.
-      g_stallStats.idleArm++;
-      ctx.WaitIdle();
-      ctx.ProcessEvents();
-      // THE FUTILITY CHECK. WaitIdle waits for work; it does not ENCODE a
-      // readback. If the loop above already retired every pending map and the
-      // newest of them is still older than maxGap, draining the device cannot
-      // change that — the count here is device drains that bought nothing.
-      if (!fresh()) g_stallStats.idleFutile++;
-      idleMs = std::chrono::duration<double, std::milli>(
-                   std::chrono::steady_clock::now() - idleT0)
-                   .count();
-      g_stallStats.idleArmMs += idleMs;
-    } else if (fresh()) {
-      g_stallStats.mapArm++;
-    } else {
-      // Still stale with nothing left to wait for. SAFE — §3.2 step (1)'s
-      // dilation carries the mirror and the tightening either rolls the old
-      // snapshot forward or skips — but expensive, so it is counted rather
-      // than hidden behind a device drain that cannot fix it.
-      g_stallStats.proceedStale++;
-    }
-    g_stallStats.mapArmMs +=
-        std::chrono::duration<double, std::milli>(idleT0 - stallT0).count();
+    if (!delivered()) g_stallStats.proceedStale++;
   }
 }
 

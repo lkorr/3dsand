@@ -47,7 +47,7 @@ bool walkOk = false;
     SubmitTick(ctx, world, sim, ++t, kDefaultSeed, {}, {}, {}, false, pc, true, false);
     ctx.WaitIdle();
     ctx.ProcessEvents();  // deliver the mirror
-    player.Update(1.0f / 30.0f, PlayerInput{}, Vec3{1, 0, 0}, Vec3{0, 0, 1},
+    player.Update(1.0f / 30.0f, TickInput{}, Vec3{1, 0, 0}, Vec3{0, 0, 1},
                   Vec3{1, 0, 0}, kindAt);
     if (player.grounded) break;
   }
@@ -79,7 +79,7 @@ bool walkOk = false;
     player.pos.y = standing.y - 2.0f;
     player.vel = Vec3{0, 0, 0};
     for (int i = 0; i < 30; i++)
-      player.Update(1.0f / 30.0f, PlayerInput{}, Vec3{1, 0, 0}, Vec3{0, 0, 1},
+      player.Update(1.0f / 30.0f, TickInput{}, Vec3{1, 0, 0}, Vec3{0, 0, 1},
                     Vec3{1, 0, 0}, kindAt);
     // Clear means the AABB no longer overlaps: the surest statement of that
     // from out here is that the body got back to roughly where it was
@@ -137,7 +137,7 @@ bool walkOk = false;
     // too-deep body stays put BECAUSE it is too deep.
     bool reallyBuried = solidAround > 0;
     for (int i = 0; i < 30; i++)
-      player.Update(1.0f / 30.0f, PlayerInput{}, Vec3{1, 0, 0}, Vec3{0, 0, 1},
+      player.Update(1.0f / 30.0f, TickInput{}, Vec3{1, 0, 0}, Vec3{0, 0, 1},
                     Vec3{1, 0, 0}, kindAt);
     float buriedDrift = std::abs(player.pos.y - buriedAt);
     bool deepStaysBuried = buriedDrift < 2.0f;
@@ -234,9 +234,9 @@ Status GatePlayerWaterJump(Ctx&, std::string& detail) {
     // reads as "the mechanic did nothing" when really nothing was ever able to
     // move. Two body-widths back is comfortably clear.
     p.pos = Vec3{140.0f - 3.0f * Player::kHalfXZ, kWater - 1.0f, 140.5f};
-    PlayerInput swim;
+    TickInput swim;
     swim.forward = 1.0f;  // press into the rim the whole time
-    swim.up = true;       // tread water, or buoyancy alone sinks us
+    swim.SetHeld(TB_JUMP, true);       // tread water, or buoyancy alone sinks us
     for (int i = 0; i < 120; i++) p.Update(dt, swim, fwd, right, fwd, kindAt);
     return p;
   };
@@ -255,10 +255,10 @@ Status GatePlayerWaterJump(Ctx&, std::string& detail) {
   // step of the bottom, so nothing would fire regardless of the mechanic).
   bool wasSwimming = pool.inLiquid && floatFeet > 105.0f;
   {
-    PlayerInput jump;
+    TickInput jump;
     jump.forward = 1.0f;
-    jump.jumpPressed = true;
-    jump.up = true;
+    jump.SetPressed(TB_JUMP, true);
+    jump.SetHeld(TB_JUMP, true);
     pool.Update(dt, jump, fwd, right, fwd, poolFn);
   }
   bool fired = pool.waterJumped;
@@ -268,7 +268,7 @@ Status GatePlayerWaterJump(Ctx&, std::string& detail) {
   // reaches the lip and then slides back into the pool, which is the failure
   // this whole mechanic exists to prevent.
   {
-    PlayerInput hold;
+    TickInput hold;
     hold.forward = 1.0f;
     for (int i = 0; i < 180; i++) pool.Update(dt, hold, fwd, right, fwd, poolFn);
   }
@@ -286,10 +286,10 @@ Status GatePlayerWaterJump(Ctx&, std::string& detail) {
   Player::KindFn cliffFn = cliffKind;
   Player cliff = settleAtRim(cliffFn);
   {
-    PlayerInput jump;
+    TickInput jump;
     jump.forward = 1.0f;
-    jump.jumpPressed = true;
-    jump.up = true;
+    jump.SetPressed(TB_JUMP, true);
+    jump.SetHeld(TB_JUMP, true);
     cliff.Update(dt, jump, fwd, right, fwd, cliffFn);
   }
   bool cliffFired = cliff.waterJumped;
@@ -299,10 +299,10 @@ Status GatePlayerWaterJump(Ctx&, std::string& detail) {
   Player open = settleAtRim(poolFn);
   bool openFired = false;
   {
-    PlayerInput jump;
+    TickInput jump;
     jump.forward = -1.0f;  // away from the rim
-    jump.jumpPressed = true;
-    jump.up = true;
+    jump.SetPressed(TB_JUMP, true);
+    jump.SetHeld(TB_JUMP, true);
     open.Update(dt, jump, fwd, right, fwd, poolFn);
     openFired = open.waterJumped;
   }
@@ -330,7 +330,7 @@ Status GatePlayerWaterJump(Ctx&, std::string& detail) {
   wade.fly = false;
   wade.pos = Vec3{128.0f, kFloor + Player::kHalfY, 140.5f};
   for (int i = 0; i < 60; i++)
-    wade.Update(dt, PlayerInput{}, fwd, right, fwd, wadeFn);
+    wade.Update(dt, TickInput{}, fwd, right, fwd, wadeFn);
   // Preconditions, asserted not assumed: actually in the water, and actually
   // read as standing in it rather than swimming in it. Without the first, the
   // jump below would prove nothing; without the second, it would be testing
@@ -338,13 +338,13 @@ Status GatePlayerWaterJump(Ctx&, std::string& detail) {
   bool wadeWet = wade.inLiquid && !wade.swimming && wade.grounded;
   float wadeFeet0 = wade.pos.y - Player::kHalfY;
   {
-    PlayerInput jump;
-    jump.jumpPressed = true;
+    TickInput jump;
+    jump.SetPressed(TB_JUMP, true);
     wade.Update(dt, jump, fwd, right, fwd, wadeFn);
   }
   float wadePeak = wadeFeet0;
   for (int i = 0; i < 90; i++) {
-    wade.Update(dt, PlayerInput{}, fwd, right, fwd, wadeFn);
+    wade.Update(dt, TickInput{}, fwd, right, fwd, wadeFn);
     wadePeak = std::max(wadePeak, wade.pos.y - Player::kHalfY);
   }
   // A real jump clears ~14 voxels from a dry floor; ankle-deep drag trims that
@@ -461,27 +461,27 @@ Status GatePlayerLedgeGrab(Ctx&, std::string& detail) {
         if (r.p.hanging) r.firstHangFrames++;
         else r.firstHangEnded = true;
       }
-      PlayerInput in;
-      in.sprint = true;
+      TickInput in;
+      in.SetHeld(TB_SPRINT, true);
       if (stage == 0) {  // run-up
         in.forward = 1.0f;
         if (r.p.grounded && r.p.pos.x > 135.0f) {
-          in.jumpPressed = true;
-          in.up = space;
+          in.SetPressed(TB_JUMP, true);
+          in.SetHeld(TB_JUMP, space);
           stage = 1;
         }
       } else if (stage == 1) {  // flight, pressed into the wall
         in.forward = 1.0f;
-        in.up = space;
+        in.SetHeld(TB_JUMP, space);
       } else if (stage == 2) {  // dangle: hands only, W released
-        in.up = space;
+        in.SetHeld(TB_JUMP, space);
         // Shimmy while dangling: D held the whole half-second. The wall runs
         // forever in z here, so the traverse must actually travel — the
         // assertion below is what proves the hands slide AND the grip holds.
         in.strafe = 1.0f;
       } else {  // pull up and keep walking over the top
         in.forward = 1.0f;
-        in.up = space;
+        in.SetHeld(TB_JUMP, space);
       }
       r.p.Update(dt, in, fwd, right, fwd, kindAt);
     }
@@ -536,28 +536,28 @@ Status GatePlayerLedgeGrab(Ctx&, std::string& detail) {
     p.fly = false;
     p.pos = Vec3{132.0f, 100.0f + Player::kHalfY, 200.5f};
     Player::KindFn kf = plateauKind;
-    auto frames = [&](PlayerInput in, int n) {
+    auto frames = [&](TickInput in, int n) {
       for (int i = 0; i < n; i++) p.Update(dt, in, fwd, right, fwd, kf);
     };
     {  // run-up and jump at the wall, space held from the jump on
-      PlayerInput in;
-      in.sprint = true;
+      TickInput in;
+      in.SetHeld(TB_SPRINT, true);
       in.forward = 1.0f;
       int guard = 0;
       while (!(p.grounded && p.pos.x > 135.0f) && ++guard < 400)
         p.Update(dt, in, fwd, right, fwd, kf);
-      in.jumpPressed = true;
-      in.up = true;
+      in.SetPressed(TB_JUMP, true);
+      in.SetHeld(TB_JUMP, true);
       p.Update(dt, in, fwd, right, fwd, kf);
-      in.jumpPressed = false;
+      in.SetPressed(TB_JUMP, false);
       guard = 0;
       while (!p.hanging && ++guard < 400)
         p.Update(dt, in, fwd, right, fwd, kf);
       eLatched = p.hanging;
     }
     {  // serve the pull delay, then tap W for 8 frames
-      PlayerInput in;
-      in.up = true;
+      TickInput in;
+      in.SetHeld(TB_JUMP, true);
       frames(in, 30);
       in.forward = 1.0f;
       frames(in, 8);
@@ -568,10 +568,10 @@ Status GatePlayerLedgeGrab(Ctx&, std::string& detail) {
                     p.pos.y - Player::kHalfY < 110.0f;
     }
     {  // parkour: release space one frame, re-press the next
-      PlayerInput in;
+      TickInput in;
       frames(in, 1);
-      in.jumpPressed = true;
-      in.up = true;
+      in.SetPressed(TB_JUMP, true);
+      in.SetHeld(TB_JUMP, true);
       frames(in, 1);
       eJumped = p.vel.y > 0.8f * (5.25f / kVoxelMeters);
     }
@@ -656,7 +656,7 @@ Status GatePlayerPlants(Ctx& c, std::string& detail) {
     Player p;
     p.fly = false;
     p.pos = Vec3{130.0f, 100.0f + Player::kHalfY, 130.5f};
-    PlayerInput in{};
+    TickInput in{};
     in.forward = 1.0f;  // +x, straight at the slab
     const Vec3 fwd{1, 0, 0}, right{0, 0, 1};
     for (int i = 0; i < 200; i++) p.Update(1.0f / 30.0f, in, fwd, right, fwd, kindAt);
@@ -717,17 +717,17 @@ Status GatePlayerCrouch(Ctx&, std::string& detail) {
     p.pos = Vec3{140.0f, 100.0f + Player::kHalfY, 200.5f};
     return p;
   };
-  auto frames = [&](Player& p, const Player::KindFn& k, PlayerInput in,
+  auto frames = [&](Player& p, const Player::KindFn& k, TickInput in,
                     int n) {
     for (int i = 0; i < n; i++) p.Update(dt, in, fwd, right, fwd, k);
   };
-  PlayerInput walk;
+  TickInput walk;
   walk.forward = 1.0f;
-  PlayerInput crawl = walk;
-  crawl.down = true;
-  PlayerInput back;
+  TickInput crawl = walk;
+  crawl.SetHeld(TB_CROUCH, true);
+  TickInput back;
   back.forward = -1.0f;
-  PlayerInput rest;
+  TickInput rest;
 
   // (a) a corridor exactly standRows tall admits the standing body.
   const Player::KindFn tall = corridor(standRows);
@@ -838,7 +838,7 @@ Status GatePlayerFastFall(Ctx&, std::string& detail) {
   thin.pos = Vec3{140.5f, kStart, 140.5f};
   float thinPeak = 0.0f;
   for (int i = 0; i < 400 && !thin.grounded; i++) {
-    thin.Update(dt, PlayerInput{}, fwd, right, fwd, slab);
+    thin.Update(dt, TickInput{}, fwd, right, fwd, slab);
     thinPeak = std::max(thinPeak, -thin.vel.y);
   }
   const float thinFeet = thin.pos.y + thin.CurrentBox().yLo;
@@ -867,7 +867,7 @@ Status GatePlayerFastFall(Ctx&, std::string& detail) {
     // The snapshot delivered THIS frame was encoded kLatency frames ago.
     mirrorCentre = centreHist[frames % kLatency];
     centreHist[frames % kLatency] = blind.pos.y;
-    blind.Update(dt, PlayerInput{}, fwd, right, fwd, staleMirror);
+    blind.Update(dt, TickInput{}, fwd, right, fwd, staleMirror);
     if (blind.blindFall) heldFrames++;
   }
   const float blindFeet = blind.pos.y + blind.CurrentBox().yLo;
@@ -888,6 +888,222 @@ Status GatePlayerFastFall(Ctx&, std::string& detail) {
   return ok ? Status::Pass : Status::Fail;
 }
 
+// ---- tick-input --------------------------------------------------------
+//
+// THE CONTROLLER IS A FUNCTION OF THE COMMAND STREAM, AND OF NOTHING ELSE.
+//
+// This is package N2's proof (docs/PLAN_multiplayer_now.md). Before it, the
+// player integrated on the FRAME clock: Player::Update ran once per frame with
+// a frame dt, exp/pow-smoothed everything it owned by that dt, and aged the
+// coyote/buffer/hang timers by it — while every other gameplay system stepped
+// at kTickDt inside the fixed-tick loop. Two players at 30 and 144 fps
+// therefore walked different distances from the same keys, and no gate could
+// see it because --selftest never runs the game loop.
+//
+// The claim, stated so it can fail: FEED THE SAME PER-TICK COMMANDS THROUGH A
+// DIFFERENT FRAME SCHEDULE AND GET THE SAME TRAJECTORY TO THE BIT. Arm A runs
+// one tick per frame; arm B runs four. Same 300 ticks, same commands, and the
+// position/velocity/state stream must be bit-identical, not close.
+//
+// HOW THE SCRIPT IS WRITTEN, AND WHY IT IS WRITTEN THAT WAY. The frame layer's
+// contract (sim/tickinput.h TickInputFeeder) is asymmetric on purpose: HELD
+// state is a sample, broadcast to every tick of a multi-tick frame, while a
+// pressed EDGE and the accumulated look delta go to exactly ONE tick. So a
+// script that changed a held bit or pressed a key at an arbitrary tick index
+// would deliver DIFFERENT commands under the two schedules and the comparison
+// would be meaningless — it would be testing the script, not the controller.
+// The script is therefore authored in BLOCKS of kTicksPerBlock ticks: held
+// state and the camera basis change only on a block boundary, and every edge
+// and every pixel of look is scheduled on the block's first tick. Under both
+// schedules tick i then consumes an identical TickInput, which is checked
+// directly (test 2) rather than assumed.
+//
+// WHAT IT DOES NOT TEST: ops. The plan asks for "identical op vectors per
+// tick", but the controller in this fixture authors no ops at all — the ops a
+// player produces come from the brush, the spells and the strike runner, none
+// of which exist without a World, a GPU and an avatar. The COMMAND stream is
+// the honest analogue and the one the network layer actually ships, so that is
+// what is compared; `player-styles` and `swing` cover the strike side.
+constexpr int kTickInputTicks = 300;
+constexpr int kTicksPerBlock = 4;   // = the deep arm's ticks per frame
+
+// One tick, as it came out of the controller. Compared with memcmp: "to the
+// bit" is the claim, so a tolerance would silently pass the exact bug this
+// gate exists to catch.
+struct TickInputSample {
+  Vec3 pos, vel;
+  float viewYOffset;
+  uint32_t flags;   // grounded | crouching<<1 | jumped<<2 | inLiquid<<3
+};
+
+// The scripted command for the block a tick belongs to. Held state and the
+// basis are functions of the BLOCK; edges and look pixels are returned
+// separately and are delivered only on the block's first tick.
+TickInput TickInputScriptBlock(int block, uint32_t& edges, float& lookDx) {
+  TickInput in;
+  edges = 0;
+  lookDx = 0.0f;
+  const int firstTick = block * kTicksPerBlock;
+  // WALK: forward from the third block, so the body has landed first.
+  if (firstTick >= 8) in.forward = 1.0f;
+  // STRAFE: a right-hand arc through the middle of the run.
+  if (firstTick >= 120 && firstTick < 200) in.strafe = 1.0f;
+  // SPRINT: held across a stretch, so the speed law changes mid-trajectory.
+  in.SetHeld(TB_SPRINT, firstTick >= 40 && firstTick < 120);
+  // CROUCH: held near the end, which also moves the collision box and the eye.
+  in.SetHeld(TB_CROUCH, firstTick >= 240 && firstTick < 280);
+  // JUMP: three presses, plus space HELD around each one (the ledge and swim
+  // paths read the held bit, the buffer reads the edge).
+  const bool jumpBlock = firstTick == 48 || firstTick == 96 || firstTick == 144;
+  in.SetHeld(TB_JUMP, jumpBlock);
+  if (jumpBlock) edges |= TB_JUMP;
+  // STRIKE: one attack press, and a flick of mouse travel to pick its
+  // direction with. Neither reaches the controller — they ride along to prove
+  // the edge and the look delta are delivered to exactly one tick.
+  if (firstTick == 200) {
+    edges |= TB_ATTACK;
+    lookDx = 240.0f;
+  }
+  // TURN: the camera basis yaws by a fixed amount per block, so the walk
+  // direction is a different vector on almost every block and a controller
+  // that had cached a basis would drift apart between the arms.
+  const float yaw = (float)block * 0.02f;
+  in.flatFwd = Vec3{std::cos(yaw), 0.0f, std::sin(yaw)};
+  in.right = Vec3{-std::sin(yaw), 0.0f, std::cos(yaw)};
+  in.lookFwd = in.flatFwd;
+  return in;
+}
+
+// Run `kTickInputTicks` ticks with `ticksPerFrame` of them per frame, through
+// the REAL frame-layer accumulator (TickInputFeeder), and record both what the
+// controller did and what command each tick actually consumed.
+void RunTickInputArm(int ticksPerFrame, std::vector<TickInputSample>& out,
+                     std::vector<TickInput>& cmds, int& jumpEdgesSeen) {
+  // Flat ground at y=100 with a step up at x>=150, so the run crosses a ledge
+  // and exercises the step-up sweep and the view-smoothing decay too.
+  auto kindAt = [](IVec3 c) {
+    const int ground = c.x >= 150 ? 101 : 100;
+    return c.y < ground ? CellKind::Solid : CellKind::Air;
+  };
+  Player p;
+  p.fly = false;
+  p.pos = Vec3{140.0f, 100.0f + Player::kHalfY + 2.0f, 140.0f};
+  p.SnapRender();
+  TickInputFeeder feeder;
+  out.clear();
+  cmds.clear();
+  jumpEdgesSeen = 0;
+  int tickIdx = 0;
+  while (tickIdx < kTickInputTicks) {
+    // ---- the FRAME half: one sample of the keyboard, then N ticks --------
+    const int block = tickIdx / kTicksPerBlock;
+    uint32_t edges = 0;
+    float lookDx = 0.0f;
+    const TickInput blk = TickInputScriptBlock(block, edges, lookDx);
+    feeder.SetAxes(blk.forward, blk.strafe);
+    feeder.SetHeldMask(blk.held);
+    // Edges and look pixels only on the block's first tick — see the note
+    // above on why the script is written in blocks.
+    if (tickIdx % kTicksPerBlock == 0) {
+      feeder.Press(edges);
+      feeder.Look(lookDx, 0.0f);
+    }
+    for (int k = 0; k < ticksPerFrame && tickIdx < kTickInputTicks; k++) {
+      const TickInput ti = feeder.Consume(blk.flatFwd, blk.right, blk.lookFwd);
+      if (ti.Pressed(TB_JUMP)) jumpEdgesSeen++;
+      cmds.push_back(ti);
+      p.Update(kTickDt, ti, kindAt);
+      TickInputSample s{};
+      s.pos = p.pos;
+      s.vel = p.vel;
+      s.viewYOffset = p.viewYOffset;
+      s.flags = (p.grounded ? 1u : 0u) | (p.crouching ? 2u : 0u) |
+                (p.jumped ? 4u : 0u) | (p.inLiquid ? 8u : 0u);
+      out.push_back(s);
+      p.jumped = false;   // main.cpp drains it at the end of every tick
+      tickIdx++;
+    }
+  }
+}
+
+Status GateTickInput(Ctx& c, std::string& detail) {
+  (void)c;
+  std::vector<TickInputSample> a, b;
+  std::vector<TickInput> ca, cb;
+  int jumpsA = 0, jumpsB = 0;
+  RunTickInputArm(1, a, ca, jumpsA);
+  RunTickInputArm(kTicksPerBlock, b, cb, jumpsB);
+
+  // (1) THE COMMAND STREAM. If the two schedules did not deliver identical
+  // commands, nothing below means anything — so this is checked first and
+  // reported separately, and it is also the assertion on the feeder's own
+  // contract (held broadcast, edge to exactly one tick).
+  int cmdDiff = 0, firstCmdDiff = -1;
+  for (size_t i = 0; i < ca.size() && i < cb.size(); i++) {
+    if (std::memcmp(&ca[i], &cb[i], sizeof(TickInput)) == 0) continue;
+    if (firstCmdDiff < 0) firstCmdDiff = (int)i;
+    cmdDiff++;
+  }
+  const bool cmdOk = ca.size() == cb.size() &&
+                     ca.size() == (size_t)kTickInputTicks && cmdDiff == 0;
+
+  // (2) THE EDGE LAW: exactly one tick per scheduled press, under either
+  // schedule. Zero would mean an edge was dropped, two would mean a tick batch
+  // re-delivered it — the two failures the ad-hoc latches could not tell apart.
+  const int jumpsScripted = 3;
+  const bool edgeOk = jumpsA == jumpsScripted && jumpsB == jumpsScripted;
+
+  // (3) THE TRAJECTORY, to the bit.
+  int diff = 0, firstDiff = -1;
+  float worst = 0.0f;
+  for (size_t i = 0; i < a.size() && i < b.size(); i++) {
+    if (std::memcmp(&a[i], &b[i], sizeof(TickInputSample)) == 0) continue;
+    if (firstDiff < 0) firstDiff = (int)i;
+    diff++;
+    worst = std::max(worst, (a[i].pos - b[i].pos).len());
+  }
+  const bool trajOk = a.size() == b.size() && diff == 0;
+
+  // (4) THE BODY ACTUALLY WENT SOMEWHERE. A controller that refused every
+  // input would pass (1)-(3) perfectly, which is the "absolute zero is a rate
+  // claim" trap: the arms agreeing is only interesting if there was motion.
+  const Vec3 start{140.0f, 100.0f + Player::kHalfY + 2.0f, 140.0f};
+  const Vec3 end = a.empty() ? start : a.back().pos;
+  const float travelled = (Vec3{end.x, 0, end.z} - Vec3{start.x, 0, start.z}).len();
+  const bool movedOk = travelled > 20.0f;
+
+  // (5) THE PIN. The final position, recorded so --rebaseline can move it in
+  // one step when a player.* tuning value legitimately changes the walk. A
+  // pin that differs while (1)-(4) hold is a rebaselinable difference, not a
+  // regression — MarkPinnedOnly is what says so.
+  RecordObserved("tickInput.endX", (double)end.x);
+  RecordObserved("tickInput.endY", (double)end.y);
+  RecordObserved("tickInput.endZ", (double)end.z);
+  const double pinX = BaselineNumber("tickInput.endX", (double)end.x);
+  const double pinY = BaselineNumber("tickInput.endY", (double)end.y);
+  const double pinZ = BaselineNumber("tickInput.endZ", (double)end.z);
+  const double pinTol = BaselineNumber("tickInput.endTolVox", 0.05);
+  const bool pinOk = std::abs(pinX - (double)end.x) <= pinTol &&
+                     std::abs(pinY - (double)end.y) <= pinTol &&
+                     std::abs(pinZ - (double)end.z) <= pinTol;
+
+  const bool core = cmdOk && edgeOk && trajOk && movedOk;
+  if (core && !pinOk) MarkPinnedOnly();
+  const bool ok = core && pinOk;
+  char buf[400];
+  std::snprintf(buf, sizeof(buf),
+                "%d ticks at 1/frame vs %d/frame: cmds differ %d (first %d), "
+                "traj differ %d (first %d, worst %.6f vox), jump edges %d/%d "
+                "(want %d), travelled %.2f vox, end (%.4f, %.4f, %.4f) pin "
+                "(%.4f, %.4f, %.4f) tol %.3f",
+                kTickInputTicks, kTicksPerBlock, cmdDiff, firstCmdDiff, diff,
+                firstDiff, worst, jumpsA, jumpsB, jumpsScripted, travelled,
+                end.x, end.y, end.z, pinX, pinY, pinZ, pinTol);
+  detail = buf;
+  std::printf("tick input: %s (%s)\n", ok ? "PASS" : "FAIL", buf);
+  return ok ? Status::Pass : Status::Fail;
+}
+
 }  // namespace
 
 const std::vector<Gate>& PlayerGates() {
@@ -898,6 +1114,7 @@ const std::vector<Gate>& PlayerGates() {
       {"player-crouch", "player", {}, false, GatePlayerCrouch},
       {"player-plants", "player", {}, false, GatePlayerPlants},
       {"player-fastfall", "player", {}, false, GatePlayerFastFall},
+      {"tick-input", "player", {}, false, GateTickInput},
   };
   return g;
 }

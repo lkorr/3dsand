@@ -1,6 +1,7 @@
 #include "sim/world.h"
 
 #include <algorithm>
+#include <utility>
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
@@ -61,6 +62,20 @@ constexpr uint64_t kFluidMirrorOff = kFluidBlocksOff + kFluidBlocksBytes;
 constexpr uint64_t kFluidMirrorBytes = 27ull * kChunkVol;
 constexpr uint64_t kFetchOff = kFluidMirrorOff + kFluidMirrorBytes;
 constexpr uint64_t kSlotBytes = kFetchOff + (uint64_t)World::kFetchPerTick * kChunkBytes;
+
+// Every WorldSnapshot the pipeline hands around is pre-sized: the readback
+// callback memcpys straight into these arrays. One definition, so the published
+// snapshot and the pooled ones cannot disagree about a length.
+static void SizeSnapshot(WorldSnapshot& s) {
+  if (s.mirror.size() == 27 * (size_t)kChunkVol) return;  // already sized
+  s.mirror.assign(27 * kChunkVol, 0);
+  s.dirtyFlags.assign(kNumSlots, 0);
+  s.supportFlags.assign(kNumSlots, 0);
+  s.occupancy.assign(kNumSlots, 0);
+  s.occStain.assign(kNumSlots, 0);
+  s.fluidBlocks.assign(kFluidBlocks, 0);
+  s.fluidMirror.assign(27ull * kChunkVol, 0);
+}
 
 void World::Init(const rhi::Device& device) {
   using U = rhi::BufferUsage;
@@ -340,13 +355,7 @@ void World::Init(const rhi::Device& device) {
     s.buf = CreateBuffer(device, kSlotBytes, U::MapRead | U::CopyDst, "readback");
     s.inFlight = false;
   }
-  snap_.mirror.assign(27 * kChunkVol, 0);
-  snap_.dirtyFlags.assign(kNumSlots, 0);
-  snap_.supportFlags.assign(kNumSlots, 0);
-  snap_.occupancy.assign(kNumSlots, 0);
-  snap_.occStain.assign(kNumSlots, 0);
-  snap_.fluidBlocks.assign(kFluidBlocks, 0);
-  snap_.fluidMirror.assign(27ull * kChunkVol, 0);
+  SizeSnapshot(snap_);
 
   // SANDVOX_GPUMEM=1 prints the buffer budget. Here rather than at exit because
   // this is where every window- and cascade-sized allocation has just happened
@@ -459,12 +468,31 @@ static int ActiveReadbackSlots() {
 bool World::EncodeReadbacks(const rhi::Device&, const rhi::CommandEncoder& enc,
                             IVec3 playerChunkBase, uint32_t particleLivePage,
                             uint32_t tick) {
+  // A TICK REWIND FLUSHES THE PIPELINE. The harness runs many scenes through
+  // one World and each restarts its own tick base (kOrder, test/selftest.cpp),
+  // so `tick` is monotonic WITHIN a scene and not across them. Unsigned
+  // arithmetic would read a leftover snapshot stamped 5040 against a new base
+  // of 3 as "four billion ticks in the future" and never publish again -- and
+  // that snapshot describes a world the new scene has usually re-generated
+  // anyway. Bumping the epoch drops it, which is exactly what a reset does.
+  if (haveEncodeTick_ && tick < lastEncodeTick_) InvalidateSnapshot();
+  lastEncodeTick_ = tick;
+  haveEncodeTick_ = true;
   int slot = -1;
   const int active = ActiveReadbackSlots();
   for (int i = 0; i < active; i++) {
     if (!slots_[i].inFlight) { slot = i; break; }
   }
-  if (slot < 0) return false;
+  // A DECLINE BREAKS THE CONSTANT. The tick that finds no free slot gets no
+  // copy, so the publish at T + kSnapshotLatency has nothing to hand over and
+  // the latency stops being a property of the build. SubmitTick waits on
+  // ReadbackSlotFree() before it calls this, so reaching here means the ring
+  // is genuinely exhausted with nothing outstanding to wait for -- counted,
+  // and asserted zero by the snapshot-latency gate.
+  if (slot < 0) {
+    snapPipe_.declines++;
+    return false;
+  }
   Slot& s = slots_[slot];
   s.particleLivePage = particleLivePage;
   s.tick = tick;
@@ -597,260 +625,373 @@ void World::KickReadback() {
   if (lastSlot_ < 0) return;
   Slot& s = slots_[lastSlot_];
   s.inFlight = true;
+  s.epoch = snapEpoch_;
   int slot = lastSlot_;
+  const uint32_t epoch = snapEpoch_;
   lastSlot_ = -1;
   rhi::MapReadAsync(
-      s.buf, 0, kSlotBytes, [this, slot](const void* mapped) {
+      s.buf, 0, kSlotBytes, [this, slot, epoch](const void* mapped) {
         Slot& sl = slots_[slot];
+        // The slot is free the moment its bytes are in hand, and it is released
+        // BEFORE any early return below: the fixed-latency pipeline may never
+        // decline a readback (World::ReadbackSlotFree), so a slot that a failed
+        // map or a dead epoch left marked in-flight would eventually stall a
+        // tick that is contractually owed a snapshot.
+        sl.inFlight = false;
+        // A world reset -- or a harness scene restarting its tick counter --
+        // since this copy was encoded makes these bytes a description of a DEAD
+        // WORLD, whose stamp can read as newer than the new world's early
+        // ticks. The epoch is what says so; see World::InvalidateSnapshot.
+        if (epoch != snapEpoch_) {
+          snapPipe_.dropped++;
+          return;
+        }
+        const uint8_t* p = (const uint8_t*)mapped;
+        if (!p) return;
+        // ---- PARSE INTO A HOLDING SNAPSHOT, NEVER STRAIGHT INTO snap_ ------
+        //
+        // This callback fires whenever a fence retires, and ProcessEvents fires
+        // every ready map at once, so on a fast GPU several ticks' snapshots
+        // land in one pump. Writing them into snap_ as they arrive is exactly
+        // what made the CPU's world view a function of GPU timing (finding L1).
+        // They queue here in tick order instead and SubmitTick publishes the
+        // one tick T is owed -- T - kSnapshotLatency, exactly.
+        WorldSnapshot out;
+        if (!snapPool_.empty()) {
+          out = std::move(snapPool_.back());
+          snapPool_.pop_back();
+        }
+        SizeSnapshot(out);
+        // Set before the parse: the SANDVOX_DIRTY_REASONS diagnostic below
+        // stamps its line with it.
+        out.tick = sl.tick;
+        std::memcpy(out.mirror.data(), p, kMirrorBytes);
+        // Sentinel chunks were never copied (§2.1a); synthesize their words
+        // now, through the SAME rule the shader uses. SynthWord (world.h)
+        // and synthWord (common.wgsl) are the two halves of one contract —
+        // the page-roundtrip gate asserts they agree.
+        //
+        // A JITTER sentinel is POSITIONAL, so its cells cannot be one
+        // repeated word: each takes the palette variant for its own world
+        // coordinate. The mirror knows the world chunk of every one of its
+        // 27 slots from sl.base, which is what makes that reconstructible
+        // here. Getting this wrong would be invisible to the world hash and
+        // would show up only as the player colliding with the wrong thing —
+        // the mirror is CPU-only collision data.
+        for (size_t m = 0; m < sl.mirrorSentinel.size(); m++) {
+          const uint32_t e = sl.mirrorSentinel[m];
+          if (e == 0u) continue;  // a real copy landed for this cell
+          uint32_t* dst = out.mirror.data() + m * kChunkVol;
+          const int mx = (int)(m % 3), my = (int)((m / 3) % 3),
+                    mz = (int)(m / 9);
+          const IVec3 wc{sl.base.x + mx, sl.base.y + my, sl.base.z + mz};
+          // SynthWordAt returns 0 for air whatever the JITTER bit says
+          // (world.h), so an air-tagged JITTER sentinel must NOT take the
+          // row branch below — it would produce 0 | (state << 12). Classify
+          // refuses to mint JITTER(air), so this cannot arise today; the
+          // branch makes the equivalence unconditional instead of argued.
+          if ((e & kPtMatMask) == kMatAir) {
+            std::fill_n(dst, kChunkVol, 0u);
+          } else if ((e & kPtJitterBit) == 0u) {
+            std::fill_n(dst, kChunkVol, SynthWord(e));
+          } else {
+            // ROW ORDER, as pagetable.cpp's JITTER verify and
+            // RleEncodeSentinelChunk already do it: Pcg(y) and the z term
+            // are loop-invariant across a row, so JitterRowSeed removes
+            // one of three PCG rounds per cell. Strictly derived from
+            // SynthWordAt (world.h says so, and page-roundtrip compares
+            // them) — this is a strength reduction, not a second rule.
+            const int bx = wc.x * (int)kChunk, by = wc.y * (int)kChunk,
+                      bz = wc.z * (int)kChunk;
+            const uint32_t mat = e & kPtMatMask;
+            const uint32_t stampBits = kStampNever << kStampShift;
+            uint32_t i = 0;
+            for (int lz = 0; lz < (int)kChunk; lz++)
+              for (int ly = 0; ly < (int)kChunk; ly++) {
+                const uint32_t rowSeed =
+                    JitterRowSeed(by + ly, bz + lz, mirrorSeed_);
+                for (int lx = 0; lx < (int)kChunk; lx++, i++)
+                  dst[i] = mat |
+                           (JitterStateInRow(rowSeed, bx + lx, mirrorSeed_)
+                            << 12) |
+                           stampBits;
+              }
+          }
+        }
+        out.mirrorBase = sl.base;
+        out.windowOrigin = sl.origin;
+        // ---- ONE sequential copy of the per-chunk arrays -------------
+        // `p` is the persistently mapped readback slot. The mirror above
+        // is already memcpy'd out before it is touched; dirty/occ/support
+        // never were, and were scanned a word at a time (3 x 32,768 words
+        // = 384 KiB) straight out of mapped host memory, with occW[i]
+        // re-loaded three times per iteration. That is the exact consumer
+        // Stream::HarvestEvict warns about ("One sequential copy out of
+        // write-combined map memory; Classify then reads cached RAM").
+        //
+        // dirty, occ, the hash/pick/pcount block and support are
+        // contiguous in the slot layout at the top of this file, so ONE
+        // copy covers all of them. Rebasing by kDirtyOff lets every reader
+        // below keep its original `+ kXxxOff` form.
+        constexpr uint64_t kBounceBytes =
+            (kSupportOff + kSupportBytes) - kDirtyOff;
+        if (snapBounce_.size() < kBounceBytes) snapBounce_.resize(kBounceBytes);
+        std::memcpy(snapBounce_.data(), p + kDirtyOff, kBounceBytes);
+        const uint8_t* b = snapBounce_.data() - kDirtyOff;
+
+        const uint32_t* dirtyW = (const uint32_t*)(b + kDirtyOff);
+        const uint32_t* occW = (const uint32_t*)(b + kOccOff);
+        const uint32_t* supW = (const uint32_t*)(b + kSupportOff);
+        uint32_t active = 0;
+        uint32_t reasonOr = 0;
+        uint64_t total = 0;
+        for (uint32_t i = 0; i < kNumSlots; i++) {
+          out.dirtyFlags[i] = dirtyW[i] != 0 ? 1 : 0;
+          active += out.dirtyFlags[i];
+          reasonOr |= dirtyW[i];
+          // GPU word packs [31] anyStain | [30..16] blockers | [15..0]
+          // nonAir (packOccStain, common.wgsl). Existing CPU consumers
+          // (streaming evict, voxelTotal) want the non-air COUNT, so that
+          // stays the stored value — but the STAIN FLAG is carried across
+          // in its own array rather than masked away, because the page
+          // table's free path needs it and reading it back per candidate
+          // was costing a blocking WaitIdle + 16 KiB per chunk.
+          const uint32_t o = occW[i];          // ONE load, was three
+          const uint32_t nonAir = o & 0xFFFFu;
+          out.occupancy[i] = nonAir;
+          out.occStain[i] = (o >> 31) & 1u;
+          total += nonAir;
+          // Folded in from its own second pass over the same 32,768
+          // chunks — safe now that all three streams are cached RAM.
+          out.supportFlags[i] = supW[i] != 0 ? 1 : 0;
+        }
+        out.activeChunks = active;
+        out.dirtyReasonOr = reasonOr;
+        out.voxelTotal = total;
+        // ---- SANDVOX_DIRTY_REASONS=<n>: WHY are these chunks awake? ----
+        //
+        // The dirty word is a DIRTY_R_* bitmask now (common.wgsl), not the
+        // literal 1, and this is the one place the whole per-chunk array is
+        // already in cached RAM. CLAUDE.md rule 6: "58 page faults" and
+        // "108 chunks awake" are the same shape of non-measurement, and the
+        // answer is attribution at the reporter, not a fortnight of A/B
+        // arms. `active 219, water in 98% of them` says nothing about which
+        // RULE asked; `flow 214 | react 5` says all of it.
+        //
+        // Printed every <n> snapshots and gated on an env var because it is
+        // a diagnostic, not telemetry: the fold above stays one pass and
+        // costs nothing when the var is unset.
+        if (kDirtyReasonEvery != 0 &&
+            (out.tick % kDirtyReasonEvery) == 0 && active != 0) {
+          uint32_t hist[kDirtyReasonBits] = {0};
+          uint32_t multi = 0;
+          for (uint32_t i = 0; i < kNumSlots; i++) {
+            const uint32_t d = dirtyW[i];
+            if (d == 0) continue;
+            if ((d & (d - 1)) != 0) multi++;
+            for (int bit = 0; bit < kDirtyReasonBits; bit++)
+              if (d & (1u << bit)) hist[bit]++;
+          }
+          std::printf("dirty-reasons t%u: active %u (%u multi-cause)",
+                      out.tick, active, multi);
+          for (int bit = 0; bit < kDirtyReasonBits; bit++)
+            if (hist[bit]) std::printf(" | %s %u", kDirtyReasonName[bit], hist[bit]);
+          std::printf("\n");
+          std::fflush(stdout);
+        }
+        std::memcpy(&out.worldHash, b + kHashOff, 4);
+        std::memcpy(&out.pageFaults, p + kPageFaultOff, 4);
+        std::memcpy(out.pick, b + kPickOff, 32);
+        uint32_t pcounts[2];
+        std::memcpy(pcounts, b + kPCountOff, 8);
+        out.particleCount =
+            std::min(pcounts[sl.particleLivePage & 1], kParticleCap);
         {
-          const uint8_t* p = (const uint8_t*)mapped;
-          if (p) {
-            std::memcpy(snap_.mirror.data(), p, kMirrorBytes);
-            // Sentinel chunks were never copied (§2.1a); synthesize their words
-            // now, through the SAME rule the shader uses. SynthWord (world.h)
-            // and synthWord (common.wgsl) are the two halves of one contract —
-            // the page-roundtrip gate asserts they agree.
-            //
-            // A JITTER sentinel is POSITIONAL, so its cells cannot be one
-            // repeated word: each takes the palette variant for its own world
-            // coordinate. The mirror knows the world chunk of every one of its
-            // 27 slots from sl.base, which is what makes that reconstructible
-            // here. Getting this wrong would be invisible to the world hash and
-            // would show up only as the player colliding with the wrong thing —
-            // the mirror is CPU-only collision data.
-            for (size_t m = 0; m < sl.mirrorSentinel.size(); m++) {
-              const uint32_t e = sl.mirrorSentinel[m];
-              if (e == 0u) continue;  // a real copy landed for this cell
-              uint32_t* dst = snap_.mirror.data() + m * kChunkVol;
-              const int mx = (int)(m % 3), my = (int)((m / 3) % 3),
-                        mz = (int)(m / 9);
-              const IVec3 wc{sl.base.x + mx, sl.base.y + my, sl.base.z + mz};
-              // SynthWordAt returns 0 for air whatever the JITTER bit says
-              // (world.h), so an air-tagged JITTER sentinel must NOT take the
-              // row branch below — it would produce 0 | (state << 12). Classify
-              // refuses to mint JITTER(air), so this cannot arise today; the
-              // branch makes the equivalence unconditional instead of argued.
+          uint32_t gcounts[4];
+          std::memcpy(gcounts, b + kGasCountOff, 16);
+          // Same parity as the ballistic count: the page the tick just
+          // wrote is the one `resolve` ran over.
+          out.gasCount =
+              std::min(gcounts[sl.particleLivePage & 1], kGasParticleCap);
+          uint32_t g[kGasSpHdr];
+          std::memcpy(g, b + kGasStatOff, kGasSpHdrBytes);
+          out.gasLeaveAccepted = std::min(g[kGasSpCount], kGasSpawnPerTick);
+          out.gasLeaveRefused = g[kGasSpRefused];
+          out.gasEdgeHits = g[kGasSpEdge];
+          out.gasPoolRefused = g[kGasSpPoolFull];
+          out.gasReentered = g[kGasSpReenter];
+          out.gasDied = g[kGasSpDied];
+          out.gasAboveWindow = g[kGasSpAbove];
+        }
+        // MLS-MPM fluid seam: live count, event counters, block list.
+        {
+          uint32_t fa[kFluidArgsWords];
+          std::memcpy(fa, p + kFluidArgsOff, kFluidArgsBytes);
+          out.fluidLive = std::min(fa[7], kFluidCap);
+          out.fluidSettledEighths = fa[10];
+          out.fluidExcitedEighths = fa[11];
+          out.fluidExciteRefused = fa[12];
+          out.fluidLastSlot = fa[14];
+          out.fluidExciteSeen = fa[27];        // FA_EXSEEN
+          out.fluidExciteCandidates = fa[28];  // FA_EXCANDID
+          out.fluidBlockCount = std::min(fa[3], kFluidBlocks);
+          std::memcpy(out.fluidBlocks.data(), p + kFluidBlocksOff,
+                      kFluidBlocksBytes);
+          // The occupancy fold is only meaningful while fluid is live —
+          // the seam stops recording (and refreshing the buffer) at
+          // zero, so a stale fold must read as no water.
+          if (out.fluidLive > 0) {
+            std::memcpy(out.fluidMirror.data(), p + kFluidMirrorOff,
+                        kFluidMirrorBytes);
+          } else {
+            std::fill(out.fluidMirror.begin(), out.fluidMirror.end(),
+                      (uint8_t)0);
+          }
+        }
+        out.tick = sl.tick;
+        out.valid = true;
+        // BOUNDED, and it is one line rather than an argument. SubmitTick
+        // publishes on every tick from kSnapshotLatency onward, so the queue
+        // holds at most K + 1 entries in every path this engine has -- but a
+        // caller that submitted only ticks BELOW K would never publish, and
+        // "the queue is bounded because nobody does that" is not a bound. The
+        // oldest goes back to the pool; it is older than anything a publish
+        // could still be owed.
+        if (ready_.size() >= (size_t)kReadbackSlots) {
+          snapPipe_.dropped++;
+          snapPool_.push_back(std::move(ready_.front()));
+          ready_.pop_front();
+        }
+        ready_.push_back(std::move(out));
+
+        // fetched chunks land in the CPU cache keyed by WORLD chunk,
+        // stamped with their tick
+        for (size_t i = 0; i < sl.fetchIds.size(); i++) {
+          CachedChunk& cc = cache_[PackChunkKey(sl.fetchIds[i])];
+          if (cc.version <= sl.tick) {
+            cc.version = sl.tick;
+            const uint32_t e =
+                i < sl.fetchSentinel.size() ? sl.fetchSentinel[i] : 0u;
+            if (e != 0u) {
+              // resize, not assign: every branch below writes all 4,096
+              // words, so assign's zero-fill was 16 KiB of memset thrown
+              // away immediately. (§2.1a)
+              cc.voxels.resize(kChunkVol);
+              uint32_t* dst = cc.voxels.data();
+              const IVec3 wc = sl.fetchIds[i];
+              // Same three cases, and for the same reasons, as the mirror
+              // synthesis above: air is one word whatever the JITTER bit
+              // says, non-JITTER is one word by definition, and JITTER
+              // walks rows so JitterRowSeed can hoist the y/z half of the
+              // hash out of the inner loop.
               if ((e & kPtMatMask) == kMatAir) {
                 std::fill_n(dst, kChunkVol, 0u);
               } else if ((e & kPtJitterBit) == 0u) {
                 std::fill_n(dst, kChunkVol, SynthWord(e));
               } else {
-                // ROW ORDER, as pagetable.cpp's JITTER verify and
-                // RleEncodeSentinelChunk already do it: Pcg(y) and the z term
-                // are loop-invariant across a row, so JitterRowSeed removes
-                // one of three PCG rounds per cell. Strictly derived from
-                // SynthWordAt (world.h says so, and page-roundtrip compares
-                // them) — this is a strength reduction, not a second rule.
                 const int bx = wc.x * (int)kChunk, by = wc.y * (int)kChunk,
                           bz = wc.z * (int)kChunk;
                 const uint32_t mat = e & kPtMatMask;
                 const uint32_t stampBits = kStampNever << kStampShift;
-                uint32_t i = 0;
+                uint32_t k = 0;
                 for (int lz = 0; lz < (int)kChunk; lz++)
                   for (int ly = 0; ly < (int)kChunk; ly++) {
                     const uint32_t rowSeed =
                         JitterRowSeed(by + ly, bz + lz, mirrorSeed_);
-                    for (int lx = 0; lx < (int)kChunk; lx++, i++)
-                      dst[i] = mat |
-                               (JitterStateInRow(rowSeed, bx + lx, mirrorSeed_)
+                    for (int lx = 0; lx < (int)kChunk; lx++, k++)
+                      dst[k] = mat |
+                               (JitterStateInRow(rowSeed, bx + lx,
+                                                 mirrorSeed_)
                                 << 12) |
                                stampBits;
                   }
               }
-            }
-            snap_.mirrorBase = sl.base;
-            snap_.windowOrigin = sl.origin;
-            // ---- ONE sequential copy of the per-chunk arrays -------------
-            // `p` is the persistently mapped readback slot. The mirror above
-            // is already memcpy'd out before it is touched; dirty/occ/support
-            // never were, and were scanned a word at a time (3 x 32,768 words
-            // = 384 KiB) straight out of mapped host memory, with occW[i]
-            // re-loaded three times per iteration. That is the exact consumer
-            // Stream::HarvestEvict warns about ("One sequential copy out of
-            // write-combined map memory; Classify then reads cached RAM").
-            //
-            // dirty, occ, the hash/pick/pcount block and support are
-            // contiguous in the slot layout at the top of this file, so ONE
-            // copy covers all of them. Rebasing by kDirtyOff lets every reader
-            // below keep its original `+ kXxxOff` form.
-            constexpr uint64_t kBounceBytes =
-                (kSupportOff + kSupportBytes) - kDirtyOff;
-            if (snapBounce_.size() < kBounceBytes) snapBounce_.resize(kBounceBytes);
-            std::memcpy(snapBounce_.data(), p + kDirtyOff, kBounceBytes);
-            const uint8_t* b = snapBounce_.data() - kDirtyOff;
-
-            const uint32_t* dirtyW = (const uint32_t*)(b + kDirtyOff);
-            const uint32_t* occW = (const uint32_t*)(b + kOccOff);
-            const uint32_t* supW = (const uint32_t*)(b + kSupportOff);
-            uint32_t active = 0;
-            uint32_t reasonOr = 0;
-            uint64_t total = 0;
-            for (uint32_t i = 0; i < kNumSlots; i++) {
-              snap_.dirtyFlags[i] = dirtyW[i] != 0 ? 1 : 0;
-              active += snap_.dirtyFlags[i];
-              reasonOr |= dirtyW[i];
-              // GPU word packs [31] anyStain | [30..16] blockers | [15..0]
-              // nonAir (packOccStain, common.wgsl). Existing CPU consumers
-              // (streaming evict, voxelTotal) want the non-air COUNT, so that
-              // stays the stored value — but the STAIN FLAG is carried across
-              // in its own array rather than masked away, because the page
-              // table's free path needs it and reading it back per candidate
-              // was costing a blocking WaitIdle + 16 KiB per chunk.
-              const uint32_t o = occW[i];          // ONE load, was three
-              const uint32_t nonAir = o & 0xFFFFu;
-              snap_.occupancy[i] = nonAir;
-              snap_.occStain[i] = (o >> 31) & 1u;
-              total += nonAir;
-              // Folded in from its own second pass over the same 32,768
-              // chunks — safe now that all three streams are cached RAM.
-              snap_.supportFlags[i] = supW[i] != 0 ? 1 : 0;
-            }
-            snap_.activeChunks = active;
-            snap_.dirtyReasonOr = reasonOr;
-            snap_.voxelTotal = total;
-            // ---- SANDVOX_DIRTY_REASONS=<n>: WHY are these chunks awake? ----
-            //
-            // The dirty word is a DIRTY_R_* bitmask now (common.wgsl), not the
-            // literal 1, and this is the one place the whole per-chunk array is
-            // already in cached RAM. CLAUDE.md rule 6: "58 page faults" and
-            // "108 chunks awake" are the same shape of non-measurement, and the
-            // answer is attribution at the reporter, not a fortnight of A/B
-            // arms. `active 219, water in 98% of them` says nothing about which
-            // RULE asked; `flow 214 | react 5` says all of it.
-            //
-            // Printed every <n> snapshots and gated on an env var because it is
-            // a diagnostic, not telemetry: the fold above stays one pass and
-            // costs nothing when the var is unset.
-            if (kDirtyReasonEvery != 0 &&
-                (snap_.tick % kDirtyReasonEvery) == 0 && active != 0) {
-              uint32_t hist[kDirtyReasonBits] = {0};
-              uint32_t multi = 0;
-              for (uint32_t i = 0; i < kNumSlots; i++) {
-                const uint32_t d = dirtyW[i];
-                if (d == 0) continue;
-                if ((d & (d - 1)) != 0) multi++;
-                for (int bit = 0; bit < kDirtyReasonBits; bit++)
-                  if (d & (1u << bit)) hist[bit]++;
-              }
-              std::printf("dirty-reasons t%u: active %u (%u multi-cause)",
-                          snap_.tick, active, multi);
-              for (int bit = 0; bit < kDirtyReasonBits; bit++)
-                if (hist[bit]) std::printf(" | %s %u", kDirtyReasonName[bit], hist[bit]);
-              std::printf("\n");
-              std::fflush(stdout);
-            }
-            std::memcpy(&snap_.worldHash, b + kHashOff, 4);
-            std::memcpy(&snap_.pageFaults, p + kPageFaultOff, 4);
-            std::memcpy(snap_.pick, b + kPickOff, 32);
-            uint32_t pcounts[2];
-            std::memcpy(pcounts, b + kPCountOff, 8);
-            snap_.particleCount =
-                std::min(pcounts[sl.particleLivePage & 1], kParticleCap);
-            {
-              uint32_t gcounts[4];
-              std::memcpy(gcounts, b + kGasCountOff, 16);
-              // Same parity as the ballistic count: the page the tick just
-              // wrote is the one `resolve` ran over.
-              snap_.gasCount =
-                  std::min(gcounts[sl.particleLivePage & 1], kGasParticleCap);
-              uint32_t g[kGasSpHdr];
-              std::memcpy(g, b + kGasStatOff, kGasSpHdrBytes);
-              snap_.gasLeaveAccepted = std::min(g[kGasSpCount], kGasSpawnPerTick);
-              snap_.gasLeaveRefused = g[kGasSpRefused];
-              snap_.gasEdgeHits = g[kGasSpEdge];
-              snap_.gasPoolRefused = g[kGasSpPoolFull];
-              snap_.gasReentered = g[kGasSpReenter];
-              snap_.gasDied = g[kGasSpDied];
-              snap_.gasAboveWindow = g[kGasSpAbove];
-            }
-            // MLS-MPM fluid seam: live count, event counters, block list.
-            {
-              uint32_t fa[kFluidArgsWords];
-              std::memcpy(fa, p + kFluidArgsOff, kFluidArgsBytes);
-              snap_.fluidLive = std::min(fa[7], kFluidCap);
-              snap_.fluidSettledEighths = fa[10];
-              snap_.fluidExcitedEighths = fa[11];
-              snap_.fluidExciteRefused = fa[12];
-              snap_.fluidLastSlot = fa[14];
-              snap_.fluidExciteSeen = fa[27];        // FA_EXSEEN
-              snap_.fluidExciteCandidates = fa[28];  // FA_EXCANDID
-              snap_.fluidBlockCount = std::min(fa[3], kFluidBlocks);
-              std::memcpy(snap_.fluidBlocks.data(), p + kFluidBlocksOff,
-                          kFluidBlocksBytes);
-              // The occupancy fold is only meaningful while fluid is live —
-              // the seam stops recording (and refreshing the buffer) at
-              // zero, so a stale fold must read as no water.
-              if (snap_.fluidLive > 0) {
-                std::memcpy(snap_.fluidMirror.data(), p + kFluidMirrorOff,
-                            kFluidMirrorBytes);
-              } else {
-                std::fill(snap_.fluidMirror.begin(), snap_.fluidMirror.end(),
-                          (uint8_t)0);
-              }
-            }
-            snap_.tick = sl.tick;
-            snap_.valid = true;
-
-            // fetched chunks land in the CPU cache keyed by WORLD chunk,
-            // stamped with their tick
-            for (size_t i = 0; i < sl.fetchIds.size(); i++) {
-              CachedChunk& cc = cache_[PackChunkKey(sl.fetchIds[i])];
-              if (cc.version <= sl.tick) {
-                cc.version = sl.tick;
-                const uint32_t e =
-                    i < sl.fetchSentinel.size() ? sl.fetchSentinel[i] : 0u;
-                if (e != 0u) {
-                  // resize, not assign: every branch below writes all 4,096
-                  // words, so assign's zero-fill was 16 KiB of memset thrown
-                  // away immediately. (§2.1a)
-                  cc.voxels.resize(kChunkVol);
-                  uint32_t* dst = cc.voxels.data();
-                  const IVec3 wc = sl.fetchIds[i];
-                  // Same three cases, and for the same reasons, as the mirror
-                  // synthesis above: air is one word whatever the JITTER bit
-                  // says, non-JITTER is one word by definition, and JITTER
-                  // walks rows so JitterRowSeed can hoist the y/z half of the
-                  // hash out of the inner loop.
-                  if ((e & kPtMatMask) == kMatAir) {
-                    std::fill_n(dst, kChunkVol, 0u);
-                  } else if ((e & kPtJitterBit) == 0u) {
-                    std::fill_n(dst, kChunkVol, SynthWord(e));
-                  } else {
-                    const int bx = wc.x * (int)kChunk, by = wc.y * (int)kChunk,
-                              bz = wc.z * (int)kChunk;
-                    const uint32_t mat = e & kPtMatMask;
-                    const uint32_t stampBits = kStampNever << kStampShift;
-                    uint32_t k = 0;
-                    for (int lz = 0; lz < (int)kChunk; lz++)
-                      for (int ly = 0; ly < (int)kChunk; ly++) {
-                        const uint32_t rowSeed =
-                            JitterRowSeed(by + ly, bz + lz, mirrorSeed_);
-                        for (int lx = 0; lx < (int)kChunk; lx++, k++)
-                          dst[k] = mat |
-                                   (JitterStateInRow(rowSeed, bx + lx,
-                                                     mirrorSeed_)
-                                    << 12) |
-                                   stampBits;
-                      }
-                  }
-                } else {
-                  cc.voxels.assign(
-                      (const uint32_t*)(p + kFetchOff + i * kChunkBytes),
-                      (const uint32_t*)(p + kFetchOff + (i + 1) * kChunkBytes));
-                }
-              }
-            }
-            // bound the cache (drop chunks far in the past)
-            if (cache_.size() > 1024) {
-              for (auto it = cache_.begin(); it != cache_.end();) {
-                if (it->second.version + 600 < sl.tick) it = cache_.erase(it);
-                else ++it;
-              }
+            } else {
+              cc.voxels.assign(
+                  (const uint32_t*)(p + kFetchOff + i * kChunkBytes),
+                  (const uint32_t*)(p + kFetchOff + (i + 1) * kChunkBytes));
             }
           }
         }
-        sl.inFlight = false;
+        // bound the cache (drop chunks far in the past)
+        if (cache_.size() > 1024) {
+          for (auto it = cache_.begin(); it != cache_.end();) {
+            if (it->second.version + 600 < sl.tick) it = cache_.erase(it);
+            else ++it;
+          }
+        }
       });
+}
+
+// ---- THE FIXED-LATENCY PIPELINE (docs/PLAN_multiplayer_now.md N1) ---------
+
+void World::InvalidateSnapshot() {
+  snap_.valid = false;
+  // A regenerated window makes every cached chunk stale too: the fetch path's
+  // version guard (`cc.version <= sl.tick`) would otherwise keep dead-world
+  // contents for any later reader whose tick numbers are LOWER than the gate
+  // that filled the entry (2026-09-13, see the header).
+  cache_.clear();
+  // Everything parsed but unpublished describes the dead world too. Recycle
+  // the storage rather than freeing it: the pool is what keeps the steady
+  // state at kSnapshotLatency + 1 WorldSnapshots instead of a fresh 780 KiB
+  // allocation per tick.
+  while (!ready_.empty()) {
+    snapPipe_.dropped++;
+    snapPool_.push_back(std::move(ready_.front()));
+    ready_.pop_front();
+  }
+  // Readbacks still in flight were encoded against the dead world. They cannot
+  // be cancelled, so they are DISOWNED: the callback compares the epoch it
+  // captured against this one and drops the bytes.
+  snapEpoch_++;
+  haveEncodeTick_ = false;
+}
+
+bool World::ReadbackSlotFree() const {
+  const int active = ActiveReadbackSlots();
+  for (int i = 0; i < active; i++)
+    if (!slots_[i].inFlight) return true;
+  return false;
+}
+
+bool World::ReadbackPendingAtOrBefore(uint32_t tick) const {
+  const int active = ActiveReadbackSlots();
+  for (int i = 0; i < active; i++) {
+    const Slot& s = slots_[i];
+    // Only this epoch's slots are owed to anybody; a disowned one will free
+    // itself without ever producing a snapshot, so waiting on it is waiting
+    // for something that is not coming.
+    if (!s.inFlight || s.epoch != snapEpoch_) continue;
+    if (s.tick <= tick) return true;
+  }
+  return false;
+}
+
+bool World::PublishSnapshotsUpTo(uint32_t target) {
+  snapPipe_.ticks++;
+  // ready_ is in tick order (the backend fires pending maps in submission
+  // order), so this walks forward and stops at the first snapshot that belongs
+  // to a LATER tick. Publishing means a swap, not a copy: `snap_` keeps its
+  // 780 KiB of arrays and the outgoing one goes back to the pool with its
+  // allocations intact.
+  bool got = false;
+  while (!ready_.empty() && ready_.front().tick <= target) {
+    std::swap(snap_, ready_.front());
+    snapPool_.push_back(std::move(ready_.front()));
+    ready_.pop_front();
+    got = true;
+  }
+  if (got && snap_.valid && snap_.tick == target) {
+    snapPipe_.published++;
+    return true;
+  }
+  // No snapshot AT the target. This is not a stall: it is the first
+  // kSnapshotLatency ticks after a world reset, when the readback for
+  // `target` was never encoded because the world did not exist yet. Snap()
+  // stays as it was (invalid after a reset), which is a constant too.
+  snapPipe_.missing++;
+  return false;
 }
 
 CellKind World::KindAt(IVec3 cell, const std::vector<uint32_t>& classOf) const {

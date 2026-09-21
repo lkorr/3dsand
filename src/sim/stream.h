@@ -9,6 +9,7 @@
 #include "sim/chunkstore.h"
 #include "sim/faredits.h"
 #include "sim/farplumes.h"
+#include "sim/interest.h"
 #include "sim/materials.h"
 #include "sim/world.h"
 
@@ -72,17 +73,30 @@ class Stream {
   // see common.wgsl). Call after Init and again on material hot-reload.
   void OnMaterialsReloaded(const std::vector<MaterialDef>& mats);
 
-  // Recenter toward playerChunk: at most one 1-chunk shift per axis per call,
-  // 2-chunk hysteresis. Call BETWEEN ticks only — a shift must complete before
-  // the next tick sees the new origin. Also folds the latest snapshot's dirty
-  // flags into the sticky per-slot modified set, and harvests completed
-  // shift-demote batches (see PendingDemote).
+  // Recenter toward the interest set's PRIMARY point: at most one 1-chunk
+  // shift per axis per call, 2-chunk hysteresis. Call BETWEEN ticks only — a
+  // shift must complete before the next tick sees the new origin. Also folds
+  // the latest snapshot's dirty flags into the sticky per-slot modified set,
+  // and harvests completed shift-demote batches (see PendingDemote).
+  //
+  // THE INTEREST SET IS THE ONLY WAY TO MOVE THE WINDOW (src/sim/interest.h).
+  // An `IVec3` still converts — one player is a one-element set — so this is
+  // behaviour-identical to the old `Update(IVec3, tick)`; what changed is that
+  // a second point of interest now has a place to be declared instead of a
+  // second parameter grown onto this call. There is ONE window, so only
+  // `Primary()` moves it; the rest of the set is what a chunk-ticket or a
+  // second host window would consume (docs/PLAN_chunk_tickets.md), and it is
+  // deliberately IGNORED here until that decision is made.
+  //
+  // An EMPTY set does not shift. That is not a defensive default: chunk
+  // (0,0,0) is a real place, so "no point of interest" must mean "leave the
+  // window where it is", never "recentre on the origin".
   //
   // `tick` is the sim tick about to be encoded. The demote harvest needs it
   // for its staleness bound — a copied chunk may only be classified while the
   // copy is provably younger than the mirror's write→settle→tighten-out
   // latency (see HarvestDemotes) — so it must be the REAL tick, not 0.
-  void Update(IVec3 playerChunk, uint32_t tick);
+  void Update(const InterestSet& interest, uint32_t tick);
 
   // ---- R4: AT MOST ONE WINDOW SHIFT PER FRAME -----------------------------
   //

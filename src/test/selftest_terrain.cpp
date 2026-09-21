@@ -806,10 +806,30 @@ Status GateTerrain(Ctx& c, std::string& detail) {
   if (cc.liquidFaces)
     std::printf("terrain:   C3: %s\n", cc.liquidWhy.c_str());
 
-  // One tick with readback, purely to get the occupancy snapshot delivered
-  // CPU-side (SetHarnessSnapshotDrain is on for the harness). Cheap, and pass B
-  // is free once it lands.
-  SubmitTick(ctx, world, sim, 1, seed, {}, {}, {}, false, {0, 0, 0}, true, false);
+  // ---- PASS B NEEDS A PUBLISHED SNAPSHOT, AND THE PUBLISH HAS A LATENCY ----
+  //
+  // This was ONE tick, because the harness drain used to make World::Snap()
+  // arrive on the very tick that asked for it. It does not any more: the
+  // snapshot is published at a FIXED World::kSnapshotLatency
+  // (docs/PLAN_multiplayer_now.md N1), so for the first K ticks after a
+  // worldgen reset there is no published snapshot AT ALL and pass B read an
+  // invalid one and reported "-1 / no snapshot".
+  //
+  // THE FIXTURE IS WHAT WAS WRONG, not the pipeline. "Read the world one tick
+  // after worldgen" is a statement about readback latency that this file had
+  // baked in from the side that does not own it -- the same class of mistake
+  // as hardcoding a fixture's world position instead of anchoring it to
+  // WindowOrigin(). Ticking K + 1 times publishes the snapshot OF TICK 1: the
+  // same single tick of CA pass B has always measured, with byte-identical
+  // content. The pass asserts exactly what it did before and only sees it
+  // later, which is why this cannot move a hash.
+  //
+  // The K + 1 ticks are taken OUT of pass D's budget below, so the world still
+  // sees exactly 121 ticks between worldgen and the settle count.
+  constexpr uint32_t kSnapWarmup = World::kSnapshotLatency + 1;
+  for (uint32_t t = 1; t <= kSnapWarmup; t++)
+    SubmitTick(ctx, world, sim, t, seed, {}, {}, {}, false, {0, 0, 0}, true,
+               false);
   ctx.WaitIdle();
   ctx.ProcessEvents();
 
@@ -818,10 +838,24 @@ Status GateTerrain(Ctx& c, std::string& detail) {
   const int bBad = PassB(world, seed, bSlack, &bWorst);
   const int bCap = (int)BaselineNumber("terrain.chunkColBadMax", 0);
   const bool bOk = bBad >= 0 && bBad <= bCap;
-  std::printf("terrain: pass B %d/%u chunk-columns disagree with the mirror "
-              "(slack +%d, cap %d)%s%s\n",
-              bBad, kNChunk * kNChunk, bSlack, bCap,
-              bWorst.empty() ? "" : " | worst ", bWorst.c_str());
+  // A COUNT OF -1 IS NOT A MEASUREMENT (CLAUDE.md rule 6). The pass has two
+  // distinct failures -- columns that genuinely disagree, and "I could not
+  // look" -- and reporting the second as "-1/1024 chunk-columns disagree"
+  // sends the reader hunting for a worldgen bug that is not there. Both still
+  // FAIL; only one of them is about terrain.
+  if (bBad < 0)
+    std::printf("terrain: pass B COULD NOT RUN (%s) -- it reads World::Snap(), "
+                "which is published at a FIXED latency of %u ticks "
+                "(World::kSnapshotLatency), so a fixture must tick at least "
+                "that many times after a world reset before it looks. This is "
+                "a fixture bug, not a terrain one.\n",
+                bWorst.empty() ? "no snapshot" : bWorst.c_str(),
+                World::kSnapshotLatency);
+  else
+    std::printf("terrain: pass B %d/%u chunk-columns disagree with the mirror "
+                "(slack +%d, cap %d)%s%s\n",
+                bBad, kNChunk * kNChunk, bSlack, bCap,
+                bWorst.empty() ? "" : " | worst ", bWorst.c_str());
 
   // Pass D — settle proxy. Advisory bound: `sleep` is the real gate, this is
   // the two-second version of the same question so a bad fill rule is caught
@@ -829,7 +863,12 @@ Status GateTerrain(Ctx& c, std::string& detail) {
   uint32_t awake = 0;
   std::string awakeAt;
   {
-    for (uint32_t t = 2; t < 122; t++)
+    // FROM kSnapWarmup + 1, not from 2: pass B's warm-up above already spent
+    // the first kSnapWarmup ticks on this world. The world still reaches tick
+    // 121 with 121 ticks of CA behind it, which is what "settled after 120
+    // ticks" has always meant here and what keeps this pass comparable with
+    // every number recorded before the snapshot pipeline existed.
+    for (uint32_t t = kSnapWarmup + 1; t < 122; t++)
       SubmitTick(ctx, world, sim, t, seed, {}, {}, {}, false, {0, 0, 0},
                  t == 121, false);
     ctx.WaitIdle();

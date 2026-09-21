@@ -18,7 +18,9 @@
 #include <unordered_set>
 
 #include "gpu/resources.h"
+#include "sim/oprecord.h"   // op-stream clamp counters + SANDVOX_RECORD_OPS
 #include "sim/pagetable.h"  // PagesHighWater for the pool-margin report
+#include "sim/tuningstamp.h"  // the tuning/materials/reactions desync stamp
 #include "test/support.h"
 
 using namespace sandvox;
@@ -117,6 +119,13 @@ const char* const kOrder[] = {
     // one part of melee no other gate can see (`mob`'s melee subtests drive
     // SetWeaponPose directly and never touch the mouse).
     "swing",
+    // AND WITH THEM: `tick-input` is Player alone over a synthetic ground
+    // lambda — no world, no GPU, no assets — and it asserts that the
+    // controller's trajectory is a function of the COMMAND STREAM and not of
+    // the frame schedule (docs/PLAN_multiplayer_now.md N2). Front-loaded for
+    // the same reason `swing` is: a controller that has drifted back onto the
+    // frame clock makes every later movement gate measure something else.
+    "tick-input",
     // AND WITH THEM, for the third time and the same reason: `combat-tuning`
     // and `combat-cues` are pure CPU over tuning.json and the sound library —
     // no world, no GPU, no fixtures, nothing left behind (the one temp file
@@ -166,6 +175,15 @@ const char* const kOrder[] = {
     // arms - which makes it a poor neighbour for anything that wanted the
     // world left alone. It restores pristine worldgen on the way out.
     "current",
+    // IMMEDIATELY BEFORE `determinism`, and the slot is chosen rather than
+    // convenient. `ops-replay` runs its own worldgen and 200 ticks, so it
+    // leaves the world in a state the gates after it would otherwise inherit —
+    // except that `determinism` regenerates and its OWN two runs prove the
+    // hash it pins is independent of whatever it inherited (run 2 starts from
+    // run 1's leavings and agrees with run 1 bit for bit). So inserting here
+    // is invisible downstream, and a break in the op stream is reported in the
+    // first seconds of a full run instead of the last.
+    "ops-replay",
     "determinism", "sleep",       "ca-skip",
     // Per-material angle of repose. It runs its own worldgen per arm, builds a
     // sealed stone room and pours into it, and it PATCHES ONE MATERIAL'S GPU
@@ -544,6 +562,14 @@ const char* const kOrder[] = {
     // against the rig's own idle wobble — so it goes where nothing else can
     // leave a body standing in its fixture.
     "hit-react",
+    // ---- THE SNAPSHOT LATENCY IS A CONSTANT (PLAN_multiplayer_now N1) ----
+    // As late as it can go, by the rule the `floaters` block above spells out.
+    // It regenerates worldgen three times (once per pacing arm and once on the
+    // way out) and runs 64 ticks of the selftest op stream, so it disturbs the
+    // shared World about as much as `determinism` does -- and from here there
+    // is nothing left for it to disturb but `voxregion`, which resets the
+    // window and the page table itself.
+    "snapshot-latency",
     // LAST of the world-touching gates, and it must be: BuildVoxRegion moves
     // the residency window and resets the page table, which is the state every
     // other gate's fixture placement assumes. It restores both before it
@@ -721,6 +747,34 @@ void WriteJson(const std::string& path, const std::vector<Result>& results) {
       << (i + 1 < results.size() ? "," : "") << "\n";
   }
   f << "  },\n";
+  // ---- THE OP STREAM'S REFUSALS, ALWAYS (docs/PLAN_multiplayer_now.md N3) --
+  //
+  // An op that does not fit its per-tick cap is dropped at the choke point,
+  // and until this line the only evidence was a voxel that never appeared. A
+  // count per stream turns "the blood stopped showing up" into a number a
+  // later reader can find without re-running anything, which is the whole
+  // argument for build/last_run.json.
+  {
+    const sandvox::opstream::StreamCounts& oc = sandvox::opstream::Counts();
+    f << "  \"opstream\": {\"brushTrunc\": " << oc.brushTrunc
+      << ", \"expTrunc\": " << oc.expTrunc
+      << ", \"cellTrunc\": " << oc.cellTrunc
+      << ", \"spawnTrunc\": " << oc.spawnTrunc
+      << ", \"fluidTrunc\": " << oc.fluidTrunc
+      << ", \"cellDupes\": " << oc.cellDupes
+      << ", \"ticksWithDupes\": " << oc.ticksWithDupes
+      << ", \"firstDupeTick\": " << oc.firstDupeTick
+      << ", \"firstDupeCell\": " << (int64_t)(int32_t)oc.firstDupeCell
+      << "},\n";
+  }
+  // ---- WHAT THIS RUN'S SIM CONSTANTS WERE (PLAN_multiplayer_now N6) -------
+  //
+  // tuning.json / materials.json / reactions.json all hot-reload and none is
+  // in the save, so a hash that differs between two machines "on the same
+  // build" is most cheaply explained by one of these three. Recorded next to
+  // the result rather than printed only at boot, so the explanation is still
+  // there when somebody reads last_run.json a day later.
+  f << "  \"tuningStamp\": " << sandvox::StampTuning(AssetDir()).Json() << ",\n";
   // What the driver charged for each pipeline this run, always
   // (docs/PLAN_shader_compile.md package A item 4). A cold worldgen compile is
   // minutes and the entry point that took them is not otherwise recorded
@@ -948,6 +1002,22 @@ int Run(Ctx& c, const Options& opt) {
   // block comment on SetHarnessSnapshotDrain (test/support.h) for why the
   // harnesses need this and the game does not.
   SetHarnessSnapshotDrain(true);
+  // SANDVOX_RECORD_OPS=<file>: record every tick this run submits
+  // (docs/PLAN_multiplayer_now.md N3). Here rather than in main.cpp because
+  // this is the harness that owns both a material table and a tick loop; the
+  // --record-ops flag will call the same function from argv when main.cpp is
+  // free to edit. The `ops-replay` gate takes the recorder over for its own
+  // scene, so the two do not compose — the gate says so when it does.
+  sandvox::opstream::ResetCounts();
+  if (!sandvox::opstream::EnvRecordPath().empty()) {
+    std::string err;
+    if (sandvox::opstream::StartRecording(sandvox::opstream::EnvRecordPath(),
+                                          sandvox::kDefaultSeed, c.mats, err))
+      std::printf("op record: writing %s\n",
+                  sandvox::opstream::EnvRecordPath().c_str());
+    else
+      std::fprintf(stderr, "op record: %s\n", err.c_str());
+  }
   std::vector<const Gate*> plan = Plan(opt.only);
   if (plan.empty()) {
     std::fprintf(stderr, "selftest: nothing to run\n");
@@ -1027,6 +1097,12 @@ int Run(Ctx& c, const Options& opt) {
     results.push_back(std::move(r));
   }
 
+  if (sandvox::opstream::Recording()) {
+    std::printf("op record: %u frames, %llu bytes\n",
+                sandvox::opstream::RecordedFrames(),
+                (unsigned long long)sandvox::opstream::RecordedBytes());
+    sandvox::opstream::StopRecording();
+  }
   if (!opt.jsonPath.empty()) WriteJson(opt.jsonPath, results);
   WriteJson("build/last_run.json", results);
 

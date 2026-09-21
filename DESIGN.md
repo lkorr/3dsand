@@ -59,12 +59,40 @@ controller and physics need to know what voxels are where) without stalls:
   has-liquid, boundary-face occupancy bits) read back asynchronously each tick —
   kilobytes, not megabytes.
 - For precise queries (player capsule, rigidbody contacts), read back **only the
-  16³ chunks intersecting active colliders**, one tick latent, double-buffered.
-  At 30 Hz sim, one tick of latency on terrain collision is invisible.
+  16³ chunks intersecting active colliders**, double-buffered, at a **FIXED
+  latency K = `World::kSnapshotLatency` = 4 ticks**. `World::Snap()` at tick T is
+  the snapshot of tick T−K, exactly, on every machine and at every frame rate —
+  not "whatever the readback ring last delivered". The distinction is the whole
+  point: a gameplay decision whose input age depends on how fast this GPU came
+  back is not reproducible, so it could not be replicated (§10). K is a constant
+  for the same reason `Stream::kWakeLatency` is, and it is the same number. At
+  30 Hz sim, four ticks of latency on terrain collision is still invisible; the
+  readback callbacks queue and `SubmitTick` publishes exactly one per tick,
+  blocking (counted) rather than skipping if the one it is owed has not landed.
 - All CPU→GPU writes (spells, explosions, brush edits, worldgen) are accumulated
   into a per-frame **MutationQueue** and uploaded as one batched transfer.
-  This queue is a load-bearing design element: it is also the serialization format
-  for saves, the replication stream for networking, and the replay log for debugging.
+  This queue is a load-bearing design element — and as of `sim/oprecord.h`
+  (docs/PLAN_multiplayer_now.md N3) it is *implemented* as exactly one of the
+  three things that sentence used to promise:
+  - **Replay log: yes, and gated.** A run records one framed record per tick —
+    the whole `TickParams` struct (many `sim.*` knobs ride it per tick precisely
+    so a replay reproduces the stream), all six op vectors, the streamer's gen
+    list, and a CPU-side author side table — and replaying that file into the
+    same `SubmitTick` reproduces the world hash probe for probe. The
+    `ops-replay` gate asserts it; the header refuses a record made by a build
+    with a different window size, chunk size, voxel scale or material name
+    table, the way `meta.svm` does.
+  - **Serialization format for saves: no, and not planned here.** Saves are
+    still chunk snapshots (`sim/worldio.cpp` + `ChunkStore`); a record replays
+    only from the worldgen seed its header names, so it is a debugging and
+    validation artifact, not a save file.
+  - **Replication stream: not yet, but the gaps are closed.** Ops now have a
+    defined winner when two land on one cell in one tick (lowest op index that
+    would write it — `sim_mutate.wgsl` for brushes, a keep-first CPU
+    canonicalization for cell ops), every stream is clamped at the choke point
+    with the refusals counted into `build/last_run.json`, and every op can
+    carry an author. What is still missing is transport, host authority and
+    the input struct — see docs/PLAN_multiplayer_now.md.
 
 **Second GPU consequence — determinism is a choice, not a casualty.** A naive GPU
 sim (scheduling-dependent atomics, float math, stateful RNG) is non-reproducible
@@ -2103,7 +2131,15 @@ const-eval block at the top of `sim_fluid.wgsl` (IEEE-exact folding, so
 identical JSON yields identical solver constants everywhere; the kernel never
 sees a runtime float). This is the one documented exception to "sim.* is
 integer-only"; LoadTuning clamps the human values to ranges whose conversions
-satisfy the kernel's i32 overflow audit. All fixed-point multiplies truncate
+satisfy the kernel's i32 overflow audit. **"IEEE-exact" means `+ - * / sqrt
+round` and nothing else, and it was not literally true until 2026-09-10**:
+`FLUID_FOAM_DECAY` took the substep-th root of the per-tick survival with
+`exp(log(x)/N)`, and a const block folds on the HOST's libm, which is not
+specified to be correctly rounded. It is now the per-substep Euler rate
+`1 - 1/(life*30*SUBSTEPS)` — the same first order as the per-tick form it was
+rooting, 65426 against 65425 in Q16 at the shipped 2.2 s and 9 substeps — and
+no transcendental remains in any const block in the engine
+(`docs/PLAN_multiplayer_now.md` L6). All fixed-point multiplies truncate
 on the MAGNITUDE (round toward zero): flooring negative products biased every
 force toward -x/-y/-z and the whole fluid crept along that diagonal on a flat
 floor.
@@ -2891,6 +2927,32 @@ an elongated cone at a heading, a sunk cone, a flat top ramped out, in
 landform units of `landformRangeVox / 256` voxels each), so the shader reads
 the plane exactly as before and nothing new enters the mirror. Tier A: no
 seed anywhere near it. The shipped map declares `east_range`.
+
+**The bake is INTEGER (2026-09-10, `docs/PLAN_multiplayer_now.md` L6).** It ran
+in doubles with libm cos/sin on the ridge rotation until then, and the plane it
+writes is read by both worldgen mirrors — so one byte that differed between two
+machines was a terrain that differed between two machines, which no gate on a
+single box can see. `OverlayLandformSites` now converts whole degrees to an
+exact BAM (`imath::BamFromDegreesI`, so `rotation: 90` really is a quarter
+turn), takes its sine from `src/sim/intmath.h`'s Q30 BAM polynomial, its
+distances from an exact integer sqrt, and accumulates in Q16.16 landform units
+rounded half-up at the end. `+ - * / sqrt` on floats would have been safe — IEEE
+specifies them exactly, which is why the water-preset `ProfileAt` sampling still
+uses `std::sqrt` — but cos and sin are not specified to be correctly rounded and
+are not bit-identical across platforms. Measured on the shipped map the change
+is the identity (0 of 38,416 bytes move); over 40 randomised site sets (all four
+shapes, radii 3..30,000, rotations ±720°) the worst case is 4 bytes moving by
+exactly 1, and over 40 more at radii 50,000..1<<20 it is 59 bytes, still none by
+more than 1.
+
+**The distance has two branches and the split is load-bearing.** The exact form
+is `sqrt(d2 << 32)`, which is a Q16.16 distance with nothing rounded on the way;
+it is only valid while `d2 < 2^32`, i.e. under 65,536 voxels. Past that it wraps
+the u64 and bakes garbage — and it IS reachable, because the site loader clamps
+`radius` to `1 << 20`. So beyond that distance the root is taken first and the
+shift applied after, dropping under one voxel out of at least 65,536, which is
+below the Q16.16 LSB and far below the byte the plane stores. The ridge branch
+needs no guard: `dx * ca` peaks at 2^50 and its `ru*ru + rv*rv` sits near 2^36.
 
 **The ground flora is rows.** The shader's hard-coded undergrowth / flower
 chain (mushrooms under crowns, brambles, moss, saplings, litter; flowers, tall
@@ -5711,6 +5773,37 @@ a detached speckle becomes a floating scrap of flesh in the world.
   latches into a dead hang, and W pulls up (a committed mantle when the lip is
   standable, an arm boost to the next grab when it is not, which chains up
   rough walls).
+- **The controller runs on the FIXED TICK, driven by one command per tick**
+  (2026-09-20, `sim/tickinput.h`, docs/PLAN_multiplayer_now.md N2). `Player::Update`
+  used to run once per FRAME with a frame `dt`: it exp/pow-smoothed acceleration,
+  drag and the view offset by that `dt` and aged the coyote/jump-buffer/hang
+  timers by it, while every other gameplay system (mobs, the avatar, melee,
+  spells, physics) already stepped at `kTickDt` inside the fixed-tick loop. Two
+  players at 30 and 144 fps therefore walked measurably different distances from
+  the same keys, and `--selftest` could not see it because it never runs the
+  frame loop. `Update(kTickDt, const TickInput&, KindFn)` is now called once per
+  tick, first in the tick body — after the readback pump that delivers the
+  mirror, before the residency recentre and before `mobs.PreTick`.
+  **`TickInput` is the command**: movement axes, HELD button bits, PRESSED-edge
+  bits, the look delta in raw pixels accumulated since the previous tick, the
+  tool/hotbar selection and the camera basis as it stood at tick time. It is a
+  72-byte versioned POD in `sim/` (not `game/`) because `sim/oprecord.h`'s
+  replay frame carries it and `sim/` may not include `game/`. The frame layer
+  owns one `TickInputFeeder`: it replaces the held sample every frame, ORs in
+  every pressed edge, accumulates the pixels, and each tick's `Consume()` clears
+  exactly the one-shots — so **held state is broadcast to every tick of a
+  multi-tick frame and an edge reaches exactly one tick**. That contract retires
+  the five ad-hoc sticky latches (`castQueued`, `strikeQueued`,
+  `ui.placePrefab`, `ui.spawnMob`, `dropStatusQueued`), which existed only
+  because the tick loop runs zero times on most frames at 60+ fps.
+  **The render camera interpolates**: `Player::prevPos` holds the position at
+  the start of the running tick and `RenderPos/RenderEyePos(alpha)` lerp by the
+  leftover accumulator, exactly as `Celestial::RenderTickInterp` does for the
+  sky. That value is RENDER-ONLY — the raymarch eye, the third-person boom's
+  focus and the audio ear — and the sim, the picking rays and physics keep using
+  `pos`/`EyePos()`, or the world would stop being a function of the tick stream.
+  Gate: `tick-input` runs 300 scripted ticks at 1 and at 4 ticks per frame and
+  asserts a bit-identical trajectory and a bit-identical command stream.
 - **The collision box is not the figure** (2026-09-02, `Player::Box`).
   `Player::pos` stays the centre of the NOMINAL 1.7 m figure box
   (`kHalfXZ`/`kHalfY`: the art contract, the Jolt proxy, the mob sense actor,
@@ -10378,13 +10471,30 @@ the same wind with bigger gusts.
 
 `windSampleAt` / `windAt` live in **`assets/shaders/common.wgsl`**, which is
 prepended to every shader, so the field is in scope everywhere without being
-copied anywhere. The evolving weather comes from **`WindWeather`
+copied anywhere. The evolving weather comes from **`WindWeatherQ`
 (`src/sim/wind.h`)** — a pure function of (tuning, seed, tick) that holds no
 state and integrates nothing, so asking for tick 90,000 costs the same as tick
-1 and gives the same answer on every machine. Its three outputs ride
-`RenderParams` today and will also ride `TickParams` in phase 4 (the `dayPhase`
-precedent: CPU-computed inputs that replay and the determinism gates must
-capture belong on the tick input stream).
+1 and gives the same answer on every machine. Its four outputs ride
+`TickParams` (phase 4) and `RenderParams` (the `dayPhase` precedent:
+CPU-computed inputs that replay and the determinism gates must capture belong
+on the tick input stream).
+
+**That weather is INTEGER end to end as of 2026-09-10
+(`docs/PLAN_multiplayer_now.md` L6), and the direction of the dependency is now
+the other way round.** It used to be computed in floats — libm cos, sin and
+atan2 — and quantised to Q16.16 at the end, on the argument that quantisation
+made libm's cross-platform wobble harmless. That argument was probabilistic,
+and once `sim.windMode` shipped at 1 the four words became a per-tick INPUT to
+the CA: one machine rounding one of them differently desyncs a session
+silently, for as long as it runs. So `WindWeatherQ` is now the producer —
+Q24 draws off the same `hash3` stream, headings as BAM32 angles, the epoch
+blend as a vector lerp normalised with an exact integer sqrt, `intmath.h`'s Q30
+sine in place of libm's — and `WindWeather` is a VIEW of it that divides the
+integers out into the floats `RenderParams` wants. Nothing derives the weather
+twice. The draw MASK was kept at `h & 0x00FFFFFF`, the one `rng::Unit01` used,
+so this is a change of arithmetic and not of weather: the same seed draws the
+same headings and the same storms, and the four Q16.16 words differ from the
+float ones by at most 1 LSB (3 on gust) over 30,770 sampled ticks.
 
 ### Invariants
 
@@ -12916,52 +13026,152 @@ links, save routes), `--selftest --gate biomes` (the engine's side),
 `check_trees.sh` still pass: the tree editor mounts into a `div#view-trees`
 inside the Environment section, without class `view`.
 
-## 10. Networking (design now, build later)
+## 10. Networking — the model of record (decided 2026-09-10)
 
-With the determinism discipline of §2/§4, **both** classic models are viable, and
-we defer the final choice to M9. What we do *now* is keep both doors open — which
-turns out to be nearly the same set of day-one rules either way.
+Until 2026-09-10 this section said "both classic models are viable, decide at
+M9, keep both doors open". That is no longer the position: the audit
+`docs/RESEARCH_multiplayer_readiness.md` costed both against the tree as built
+and §5 of it is now the **decision of record**, confirmed by the user and
+being implemented by `docs/PLAN_multiplayer_now.md`.
 
-**Option A — Lockstep (deterministic sim, inputs-only on the wire):**
-- Every machine runs the identical sim; only player commands are exchanged.
-  Bandwidth is tiny and independent of how much chaos is on screen — a huge win
-  for a simulation game where chunk deltas would spike exactly when the fun peaks.
-- Requirements: bit-deterministic GPU kernels (checkerboard/two-phase, integer
-  math, counter RNG — §4), deterministic CPU physics (Jolt supports a
-  cross-platform-deterministic build flag), fixed tick, per-tick state hash for
-  desync detection.
-- Costs to respect: late join needs a full state snapshot (resident region is
-  ~hundreds of MB — needs streaming join or joins at checkpoints); every client
-  simulates the full active set (min-spec bound by the slowest GPU; interest
-  management can't reduce sim cost, only render cost); a single determinism bug
-  desyncs everyone, so the per-tick hash check must exist from the first
-  multiplayer build; all clients hold full world state (cheat visibility).
+**The decision: host-authoritative op stream + deterministic client-side CA +
+chunk authority + hash-triggered per-chunk resync. Singleplayer is the host,
+talking to itself over a loopback.**
 
-**Option B — Server-authoritative (chunk-delta replication):**
-- One machine runs the real sim; clients render + predict. Each tick the server
-  already knows exactly which chunks changed (the dirty system computes this).
-  Compress deltas (XOR vs. last acked + RLE + LZ4), send only chunks within each
-  client's **interest radius**.
-- Tolerant of nondeterminism and client heterogeneity; drop-in join is trivial
-  (stream the interest region). Cost: bandwidth scales with visible chaos, and
-  the server GPU carries everyone's simulation.
-- Client prediction: player movement reconciled (standard); cosmetic particles
-  and purely visual CA effects run client-side without authority — divergence in
-  a splash pattern self-corrects on the next delta.
+**The model in one paragraph.** One machine is the authority for each chunk —
+the host for all of them by default, the nearest player under distributed
+authority later. Only the authority runs the op-emitting gameplay for its
+chunks (mobs, debris, spells, brush, explosions). The resulting per-tick op
+records go over a reliable ordered stream. Every client runs the identical
+integer CA (§4) on its own residency window from those same records, so the
+wire carries **ops plus corrections, never voxel deltas** — bandwidth is flat
+in how much chaos is on screen, which is the one property a falling-sand game
+cannot buy any other way. Entities (players, mobs, bodies) are state-synced
+with an interest radius and prediction, as Teardown does. Per-chunk hashes
+detect drift; on mismatch the authority re-sends that chunk, at chunk
+granularity rather than Factorio's whole-world re-download. Late join streams
+chunks from the `ChunkStore`, which is already the right shape.
 
-**Do now, cheaply (serves both options):**
-- Determinism-first kernels and integer sim math (§4) — cheap now, near-impossible
-  to retrofit. This also buys bit-exact replay debugging in single-player.
-- **All world mutations flow through the MutationQueue** (§2) — locally it feeds
-  the GPU; under lockstep it's the command stream; under server-auth it feeds
-  replication. Building every tool, spell, and explosion against this API from
-  day one is the whole anti-tech-debt play.
+**Why not the alternatives.** Pure lockstep needs every client to simulate the
+same active set: impossible with per-client residency windows and a min-spec
+GPU bound, and interest management cannot reduce sim cost under it, only render
+cost. Pure server-authority with voxel deltas is the model Teardown measured
+and abandoned for bandwidth, and it throws away the determinism this engine has
+already paid for. The chosen model spends the determinism and keeps the
+interest management.
+
+**Singleplayer is the host.** There is no second code path to rot: the local
+game is a one-client session whose transport is a loopback, so every gate that
+runs today is running the multiplayer host's code with one player in the
+interest set. That is also why the op recorder is a single-player debugging
+tool the day it lands rather than netcode nobody exercises.
+
+**What is built (wave 1, 2026-09-10):**
+- **Fixed-latency snapshot.** `World::kSnapshotLatency = 4`; `Snap()` on tick T
+  is the snapshot of tick T−K exactly, never "whatever the fence delivered".
+  Gate: `snapshot-latency`. This is what makes an authority's decisions a
+  function of tick instead of of GPU timing.
+- **Op-stream hygiene.** `src/sim/oprecord.h`: a per-tick record of the six op
+  vectors plus replay, an author side table, lowest-op-index-wins dedupe in
+  `sim_mutate.wgsl` (matching what `sim_explode.wgsl` always did), and counted
+  clamps at every choke point. Gate: `ops-replay`. Recording is
+  `SANDVOX_RECORD_OPS=<file>`.
+- **Integer wind weather and integer landform bake.** No libm on the hashed
+  tick input stream, so the CA is the same integers on another machine's
+  toolchain and not only on another copy of this binary.
+- **The interest set.** `src/sim/interest.h` — `Stream::Update` and
+  `FarField::Update`/`FullRefill` take an `InterestSet`, and it is the ONLY way
+  to move the residency window or the far cascades. One point today, and one
+  place for the second point to be declared.
+
+**The authority / presentation boundary (package N5).** A tick of gameplay is
+now `TickAuthority(...)` in `src/game/session.cpp`, and one player is
+`PlayerSession` in `src/game/session.h`. Before this the two were the same
+thing: per-player state was forty-odd locals in `main()` and the tick body was
+2,400 lines in the middle of the frame loop, so "a second player" had no shape
+and no line in the file said which of the ninety names the tick touched were
+the player's, the world's or the window's. `TickAuthorityCtx` now says it in
+five labelled sections — the engine, the content, the PRESENTATION seam
+(`UIState`, the hit-stop dip, the death-screen photograph, the live timers:
+what a headless server would pass a dummy for), the per-world tick scratch it
+owns, and the argv-owned harness hooks — and the frame loop keeps only what is
+genuinely the frame's: the accumulator and the GPU-lag throttle, the readback
+pump, the park probe, and the handover of one `TickInput` from
+`TickInputFeeder`. That handover IS the boundary. `MobSystem` took the same
+shape: `SetAvatars(span)` and `SetPlayerActors(span)` replace the single avatar
+pointer and the single player-actor slot, and every handle- or id-keyed lookup
+walks the list instead of falling through one pointer; actor id `i` is
+`avatars_[i]`, so 0 is still the local player. **Nothing about a tick changed**,
+and that is a measurement rather than an intention: a recorded 600-tick
+`--frames 600 --autofly-hard` op stream is byte-identical across the move
+(8,738,460 bytes, 600 frames, `cmp` clean). The control arm — two runs of the
+same binary — needed `SANDVOX_TICKS_PER_FRAME`, because the frame loop's tick
+schedule and the OS cursor are both wall-clock inputs and an unattended
+`--autofly-hard` run had never been quite reproducible without it.
+
+What this does NOT yet do is give the session an id, a transport or a second
+instance. `main()` still holds one alias reference per `PlayerSession` member so
+the presentation half of the file keeps its names; the reserved player id band
+in `MobSystem::nextId_` does not exist, so a second session's actor id would
+collide with mob id 1; and `WaterBodies()` is still keyed on the residency
+window origin. That last one is rule 1 below, and it is restated at the top of
+`session.h` and over the `WaterBodies()` accessor, where the next person to add
+one will read it.
+
+**What M9 still needs** (the audit's "later" column, against the tree above):
+transport and lobby (Steam / WebRTC; browser builds have no raw UDP, and both
+an ordered op stream and a chunk re-send survive a WebSocket or DataChannel
+fine); entity state sync with interest radius and prediction, which first needs
+items keyed on game ids rather than Jolt body handles; late-join chunk
+streaming; the tuning / materials / reactions hashes and tick+seed in the join
+handshake and in `meta.svm` — the numbers now exist (`src/sim/tuningstamp.h`,
+printed at boot beside the environment stamp and written into
+`build/last_run.json`) but nothing refuses a mismatch yet; a per-chunk hash
+keyed on world coord plus the chunk re-send path; hash coverage over the
+particle / fluid / gas buffers, without which a divergence is invisible until
+it lands; ticket slots or a second host window IF the chunk-authority decision
+makes the host simulate near remote players (`docs/PLAN_chunk_tickets.md`, P0
+landed with `kTicketMax = 0`, and its non-goals bound what such a region could
+be); container-order and comparator hardening for a client on a different
+binary or STL; a particle-cap refusal gate; a Tint const-eval check; local
+pacing under network pacing; `Stream`'s second `tickUBO` write folded into the
+tick record; dev-UI sim inputs made client-local or replicated.
+
+**Two rules, in force from today, for every system built before M9:**
+
+1. **No sim-affecting process global keyed on the window origin.** A global
+   that is a pure function of `(seed, window origin, tuning)` and rebuilds on
+   every shift — `WaterBodies()` is the live example — is correct for exactly
+   one window. Two windows on one host, or a host and a client whose windows
+   are centred differently, make it two different answers to the same question,
+   and the divergence is silent. Key such state on the CHUNK, or derive it per
+   query from world coords.
+2. **No new gameplay decision reads the snapshot outside the fixed-latency
+   path.** Anything that authors or gates a mutation — pick cells, ground
+   probes, collision fallbacks, island detection, activity counters — reads
+   `Snap()` at T−K or does not read it at all. "Skip this tick, the readback
+   was not ready" is a decision made by fence timing, and under this model an
+   authority's decisions must be reproducible by every client from the tick
+   number.
+
+**Do now, cheaply (unchanged by the decision):**
+- Determinism-first kernels and integer sim math (§4) — cheap now,
+  near-impossible to retrofit. This also buys bit-exact replay debugging in
+  single-player.
+- **All world mutations flow through the MutationQueue** (§2) — locally it
+  feeds the GPU; on the wire it IS the op stream. Building every tool, spell
+  and explosion against this API from day one is the whole anti-tech-debt play.
 - Fixed tick, versioned chunk serialization, entity IDs never raw pointers,
   gameplay separated from render, a headless build target, per-tick world hash.
-- Punt entirely: netcode library choice, final model selection, anti-cheat.
-- Browser note: web builds network via WebSocket/WebRTC (no raw UDP). Both
-  options survive this — lockstep needs only ordered command delivery; server-
-  authoritative streams chunk deltas over a DataChannel/WebSocket fine.
+  **The player controller is inside that fixed tick as of 2026-09-20** (§8,
+  package N2): it takes one versioned `TickInput` command per tick, so the
+  trajectory is a function of the command stream alone and the render camera
+  interpolates between ticks rather than the sim reading a frame value. That is
+  the shape both netcode options need — under lockstep the command IS what is
+  exchanged, under server authority it is what a client sends and what the host
+  validates — and it is the half of "gameplay separated from render" that was
+  still outstanding.
+- Punt entirely: netcode library choice, anti-cheat.
 
 ## 11. Performance Budget & Principles
 
@@ -12977,7 +13187,8 @@ Targets (mid-range desktop GPU, e.g. RTX 3060-class):
     never a timer — a 400-tick post-explosion timer disabled that skip for 13.3
     seconds after every blast (ROADMAP_scale.md §3.2d).
 - Per-tick CPU↔GPU traffic: metadata mirror + collider-region readbacks + mutation
-  uploads, target < 1 MB/tick, always batched, always async (one tick latent).
+  uploads, target < 1 MB/tick, always batched, always async (a FIXED
+  `World::kSnapshotLatency` ticks latent — see §2).
 - Instrument from day one: dirty-chunk count, particles alive, sim/render GPU ms,
   readback stalls. On-screen debug overlay. Burkelbear couldn't hold 30 FPS while
   screen-recording in early builds — expect the same wall, profile before adding.

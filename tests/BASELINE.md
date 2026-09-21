@@ -624,3 +624,69 @@ throughout — the sim reproduces itself; only the recorded number is behind.
 Do not chase `ee34787c`, and do not hand-edit it in to silence the line: the
 refusal is the guard that stops a real regression being rebaselined away, and
 routing around it by hand is the one thing it cannot defend against.
+
+## 2026-09-10 — `determinismHash` eb284643 -> 6a5a1468 (N4: the CPU's wind weather and the landform bake go integer)
+
+`docs/PLAN_multiplayer_now.md` L6. Three libm calls sat between the seed and
+hashed state, on the CPU side of the determinism boundary, where nothing that
+runs twice on one machine can see them:
+
+- `WindWeather` (`src/sim/wind.h`) computed the per-tick weather with cos, sin
+  and atan2 and quantised four scalars to Q16.16. `sim.windMode` ships at 1, so
+  those four words are a per-tick INPUT to the CA.
+- `OverlayLandformSites` (`src/sim/worldmap.cpp`) baked the declared landforms
+  into the map's byte plane with cos and sin on the ridge rotation.
+- `FLUID_FOAM_DECAY` (`sim_fluid.wgsl`) took an Nth root with `exp(log(x)/N)`
+  in a const block, which folds on the host's libm. Foam reaches stain, which
+  is hashed.
+
+All three are now integer (`src/sim/intmath.h`, new: a Q30 BAM sine, an exact
+`Sqrt64`, and sign-symmetric rounding helpers). The hash moved because the
+arithmetic did, by design.
+
+**How far it moved, measured before the run rather than guessed:**
+
+| what | delta |
+|---|---|
+| landform bytes, shipped map | **0 of 38,416** — the integer bake is the identity here |
+| landform bytes, 40 randomised site sets (all 4 shapes, radii 3..30,000, rotations +-720 deg) | worst case **4 of 38,416, all by exactly 1** |
+| landform bytes, 40 more at radii 50,000..1<<20 (the loader's clamp) | worst case **59 of 38,416, none by more than 1** |
+| the four wind words vs the float ones, 30,770 sampled ticks | **<= 1 Q16.16 LSB** (3 on gust) |
+| `FLUID_FOAM_DECAY` at the shipped 2.2 s / 9 substeps | 65425 -> **65426** |
+
+The draw mask stayed `h & 0x00FFFFFF` — the one `rng::Unit01` used — so the
+same seed still draws the same headings and the same storm epochs. This is a
+change of arithmetic, not a change of weather.
+
+The twice-run comparison PASSED throughout (`determinism: ... sim reproduces
+itself`); only the recorded number moved. `--gate determinism --rebaseline`
+wrote the pin: 0 gates changed status, 0 page faults over the suite.
+
+## 2026-09-20 — `54d80b57` → `ffa84539` (PLAN_multiplayer_now N1 + N4)
+
+Two packages moved hashed state on purpose, on branch `mp-land`:
+
+- **N1** made the snapshot latency a constant. Every snapshot consumer now
+  reads tick T−4 instead of "whatever the last callback delivered", and the
+  harness drains through the same path the game does, so `--selftest` finally
+  runs at the shipped latency. Every gate that reads `Snap()` therefore sees a
+  different — and now reproducible — world.
+- **N4** put the sim's tick inputs on integer math: BAM heading + Q15 sine
+  table for `WindWeather`, an integer landform bake, an integer foam decay.
+  The landform bake is worldgen content, so the smoke probe tables move with
+  it (`smokeQuiet` 5 probes, `smokeLoud` 19 probes, both re-pinned by
+  `--rebaseline`). `--gate terrain` passes unchanged: relief 100 vox, mirror
+  9409/9409 columns sound, 0 fixture columns blocked.
+
+Determinism itself was never in question: the twice-run comparison passed on
+every run, and `ffa84539` reproduced across three independent launches.
+
+**Pinned BY HAND rather than by `--selftest --rebaseline`, which refused.** The
+refusal is correct and is not about this work: a clean detached control at
+`58780dc` with zero edits reports **11 unrecorded regressions of its own**
+(`determinism`, `undead`, `swing-plane`, `ai-reach`, `ai-pursue`, `npc-strike`,
+`body-coat`, `impact-fist`, `joint-rot`, `bite-limbs`, `lunge`), and
+`--rebaseline` will not write while any unrecorded failure is present. The six
+packages introduce none of them — the failing set on `mp-land` is a strict
+SUBSET of the control's, measured at the same full-suite scope. Same precedent
+and same reasoning as 4097d71.

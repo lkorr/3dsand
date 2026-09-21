@@ -427,6 +427,7 @@ add_library(sandvox_core OBJECT
   src/sim/pagetable.cpp
   src/sim/worldio.cpp
   src/sim/worldedit.cpp
+  src/sim/oprecord.cpp
   src/sim/stream.cpp
   src/sim/farfield.cpp
   src/sim/faredits.cpp
@@ -484,6 +485,10 @@ add_library(sandvox_core OBJECT
   src/game/caster.cpp
   src/game/melee.cpp
   src/game/strokes.cpp
+  # THE AUTHORITY / PRESENTATION BOUNDARY (docs/PLAN_multiplayer_now.md N5).
+  # PlayerSession is one player; TickAuthority is one tick of gameplay, moved
+  # out of the middle of main()'s frame loop. See src/game/session.h.
+  src/game/session.cpp
   # The acceptance gate. support.cpp holds the sim/render plumbing that main.cpp
   # and the gates share; each selftest_*.cpp is one domain's gates. Split out of
   # main.cpp so `--gate <name>` can run one in seconds and so two agents editing

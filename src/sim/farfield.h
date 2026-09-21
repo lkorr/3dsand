@@ -4,6 +4,7 @@
 #include <vector>
 
 #include "math3d.h"
+#include "sim/interest.h"
 #include "sim/world.h"
 
 // Far-field cascade manager (render-only LOD — DESIGN.md §9,
@@ -31,10 +32,18 @@ class FarField {
  public:
   void Init(World* world) { world_ = world; }
 
-  // Recenter toward the player's FINE-chunk coord. Call between ticks (after
-  // Stream::Update), before PrepareTick. A level whose window has gone
-  // entirely stale (teleport, load) resets and refills wholesale.
-  void Update(IVec3 playerChunk);
+  // Recenter toward the interest set's PRIMARY point (a FINE-chunk coord).
+  // Call between ticks (after Stream::Update), before PrepareTick. A level
+  // whose window has gone entirely stale (teleport, load) resets and refills
+  // wholesale.
+  //
+  // Same seam and same rule as Stream::Update (src/sim/interest.h): an IVec3
+  // converts, only Primary() moves the cascades, an empty set moves nothing.
+  // The cascades are RENDER-ONLY, so a second point here is a question about
+  // what a remote player SEES rather than what they simulate — cheaper to
+  // answer than Stream's, and the reason both take the same type is so it can
+  // only ever be answered once.
+  void Update(const InterestSet& interest);
 
   // Pop up to the current cap of queued fills, upload farList + farPatch
   // (+ farUBO when origins changed), and return the dispatch count for this
@@ -92,9 +101,10 @@ class FarField {
   // Patch words uploaded by the last PrepareTick (diagnostics / selftest).
   uint32_t LastPatchWords() const { return lastPatchWords_; }
 
-  // Re-derive every origin around the player and refill all levels, FINEST
-  // first (startup, load, regen). See the order note in farfield.cpp.
-  void FullRefill(IVec3 playerChunk);
+  // Re-derive every origin around the interest set's primary point and refill
+  // all levels, FINEST first (startup, load, regen). See the order note in
+  // farfield.cpp. An empty set is a no-op for the same reason Update's is.
+  void FullRefill(const InterestSet& interest);
 
   size_t PendingFills() const { return queue_.size(); }
 

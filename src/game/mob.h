@@ -3,6 +3,7 @@
 #include <cstdint>
 #include <functional>
 #include <map>
+#include <span>
 #include <string>
 #include <vector>
 
@@ -3592,8 +3593,28 @@ class MobSystem {
   // is why this is a real seam and not a test hook. Mob-vs-mob targeting needs
   // no further API: PreTick already adds every live mob to the same actor list,
   // so two factions fight the moment two profiles disagree about `faction`.
-  void SetPlayerActor(Vec3 centreVox, float radius, float height, bool alive);
-  void ClearPlayerActor() { playerActorValid_ = false; }
+  //
+  // A LIST, NOT A SLOT (docs/PLAN_multiplayer_now.md N5). One capsule per
+  // player: `players[i].id` is `i`, which keeps 0 as the local player and
+  // reserves the low band for the rest, and mob ids still start at kMaxPlayers.
+  // Nothing downstream asks what KIND of thing an actor entry is, so the whole
+  // targeting layer is already multi-player; only the plumbing was singular.
+  struct PlayerActorDesc {
+    Vec3 centreVox;
+    float radius = 0;
+    float height = 0;
+    bool alive = false;
+  };
+  void SetPlayerActors(std::span<const PlayerActorDesc> players);
+  void ClearPlayerActors() { playerActors_.clear(); }
+  // One player is a span of one. Kept because the harness fixtures and the
+  // single-session frame loop read better this way, not because the storage
+  // is singular.
+  void SetPlayerActor(Vec3 centreVox, float radius, float height, bool alive) {
+    const PlayerActorDesc one{centreVox, radius, height, alive};
+    SetPlayerActors(std::span<const PlayerActorDesc>(&one, 1));
+  }
+  void ClearPlayerActor() { ClearPlayerActors(); }
 
   // ---- THE PLAYER AS A TARGET ---------------------------------------------
   //
@@ -3614,8 +3635,38 @@ class MobSystem {
   // Deliberately NOT extended to CarveMobsRadial: that one is position-keyed
   // (the explosion path) and the avatar already has its own CarveRadial call
   // beside it. Routing it here as well would carve the player twice.
-  void SetAvatar(Mob* avatar) { avatar_ = avatar; }
-  Mob* Avatar() const { return avatar_; }
+  //
+  // A LIST, NOT A SLOT (N5), for the same reason the actor list is: every one
+  // of the five lookups below already walks `mobs_` and then falls through, so
+  // "and then every registered avatar" is the same loop with a different
+  // container. With one entry it is bit-identical to the single pointer it
+  // replaces. The avatars are NOT owned: each is a member of a PlayerSession.
+  void SetAvatars(std::span<Mob* const> avatars) {
+    avatars_.assign(avatars.begin(), avatars.end());
+  }
+  void SetAvatar(Mob* avatar) {
+    avatars_.clear();
+    if (avatar) avatars_.push_back(avatar);
+  }
+  // The LOCAL player's avatar, or null. Still singular on purpose: the render
+  // path and the character screen draw one body, and that body is this one.
+  Mob* Avatar() const { return avatars_.empty() ? nullptr : avatars_[0]; }
+  const std::vector<Mob*>& Avatars() const { return avatars_; }
+  // The registered avatar carrying this mob id, or null. The id-keyed half of
+  // the same "and then every registered avatar" fall-through the handle-keyed
+  // lookups do; one function so the twelve callers cannot drift.
+  Mob* AvatarById(uint64_t mobId) const {
+    for (Mob* av : avatars_)
+      if (av && av->Id() == mobId) return av;
+    return nullptr;
+  }
+  // Is this body a PLAYER's rather than an NPC's? Asked where a rule must not
+  // fire for the player (the corpse report, so far).
+  bool IsAvatar(const Mob* m) const {
+    for (Mob* av : avatars_)
+      if (av == m) return true;
+    return false;
+  }
   // WHICH CREATURE OWNS THIS BODY, and which of its rig slots it is. The
   // three-way flesh/garment/weapon classification the parry needs is then the
   // rig's own: `< owner->AppendedBase()` is flesh, `== owner->HeldSlot()` is
@@ -4800,8 +4851,9 @@ class MobSystem {
   // mob. Cheap (kMaxMobs + 1 entries) and it is what makes target selection a
   // scan over "things" rather than a special case for the player.
   std::vector<ai::Actor> actors_;
-  ai::Actor playerActor_;
-  bool playerActorValid_ = false;
+  // One entry per player pushed in by the frame layer (empty = no player on
+  // the field, which is what the mob-vs-mob fixtures want).
+  std::vector<ai::Actor> playerActors_;
   std::vector<ai::AttackRequest> attacks_;
   // ---- phase C: executing an attack ---------------------------------------
   // The authored style library, and the item library the swings resolve their
@@ -4813,9 +4865,9 @@ class MobSystem {
   std::function<void(uint64_t, const std::string&, uint32_t)> onItemShed_;
   std::function<void(const CorpseReport&)> onCorpse_;
   std::vector<BlockEvent> blocks_;
-  // The player's body, registered by main.cpp so the handle-keyed lookups can
-  // find it. NOT owned and NOT in `mobs_` — see SetAvatar.
-  Mob* avatar_ = nullptr;
+  // The players' bodies, registered by the frame layer so the handle-keyed
+  // lookups can find them. NOT owned and NOT in `mobs_` — see SetAvatars.
+  std::vector<Mob*> avatars_;
   uint64_t nextId_ = 1;
   bool instancesDirty_ = false;
   // Particles authored outside PreTick — Sever() is reached from damage

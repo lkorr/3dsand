@@ -85,7 +85,9 @@ void FarField::ResetLevel(uint32_t k, IVec3 desired) {
   recs_.push_back({k, -1, 0, kFarNumChunks, epoch_[k]});
 }
 
-void FarField::FullRefill(IVec3 playerChunk) {
+void FarField::FullRefill(const InterestSet& interest) {
+  if (interest.Empty()) return;
+  const IVec3 playerChunk = interest.Primary();
   refills_++;
   queue_.clear();
   recs_.clear();
@@ -196,7 +198,9 @@ uint32_t FarField::FaceWord(uint32_t k) const {
   return w;
 }
 
-void FarField::Update(IVec3 playerChunk) {
+void FarField::Update(const InterestSet& interest) {
+  if (interest.Empty()) return;  // no centre => leave the cascades put
+  const IVec3 playerChunk = interest.Primary();
   for (uint32_t k = 0; k < kFarLevels; k++) {
     IVec3 desired = DesiredOrigin(playerChunk, k);
     int d[3] = {desired.x - origins_[k].x, desired.y - origins_[k].y,

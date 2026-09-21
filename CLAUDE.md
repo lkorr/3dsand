@@ -36,7 +36,15 @@ New numbers are fine. Reproducible numbers are mandatory. History of past moves 
 Every system sleeps when idle. Dispatch over compacted dirty-chunk list via `DispatchWorkgroupsIndirect`, never full world. Chunks clear dirty flags and sleep when settled. Reaction growth must be subcritical (expected offspring/tick < 1). Selftest asserts ≤32 active chunks at rest. Bound every emergent process.
 
 ### 3. All mutations flow through MutationQueue
-Brush edits, spells, explosions, worldgen — everything CPU→GPU via `sim_mutate.wgsl`/`sim_explode.wgsl`. No direct voxel buffer writes. Exceptions: snapshot restores (worldgen, `LoadWorld`). The queue is also save format, replay log, and future network stream. Keep CPU↔GPU traffic <1 MB/tick, async, one-tick latent. Never add synchronous readback to frame path.
+Brush edits, spells, explosions, worldgen — everything CPU→GPU via `sim_mutate.wgsl`/`sim_explode.wgsl`. No direct voxel buffer writes. Keep CPU↔GPU traffic <1 MB/tick, async, one-tick latent. Never add synchronous readback to frame path.
+
+**Two ops on one cell in one tick have a defined winner** since 2026-09-10 (`sim/oprecord.h`): the LOWEST op index that would write the cell owns it — enforced in `sim_mutate.wgsl`'s `main` for brush ops (the rule `sim_explode.wgsl`'s `apply` already used) and by a keep-first CPU canonicalization for cell ops. Op index is push order and push order is deterministic, so the outcome is a pure function of the op list. Every stream is clamped to its cap at the one choke point (`SubmitTick`) and the refusals are counted into `build/last_run.json`'s `opstream` block — an op that did not fit is a number, not a missing voxel.
+
+**The queue is the replay log, and that is now implemented and gated** (`--gate ops-replay`): one framed record per tick carrying the whole `TickParams`, all six op vectors and the streamer's gen list; replaying it reproduces the world hash. `SANDVOX_RECORD_OPS=<file>` records any `--selftest` run. It is NOT the save format — saves are still chunk snapshots — and it is not yet a network stream.
+
+**Exceptions to "everything through the queue", in full:**
+- snapshot restores (worldgen, `LoadWorld`) — they replace the grid wholesale, not a cell at a time;
+- the dev panel's "clear fluid" button (`main.cpp:6392`), which zeroes the GPU-owned MLS-MPM live count (`world.fluidArgsStage[7]`) directly. It is a debug control with no gameplay path to it, it writes no voxel, and the count it clears is GPU-owned so there is no op that could express it. If the fluid clear ever becomes a gameplay action it needs a `TickParams` flag the fluid kernel honours, not a buffer write.
 
 ## Build and verify
 
@@ -410,5 +418,6 @@ Allocation must agree in: `common.wgsl` (`voxMat`), `world.h`, and this table. S
 - Materials/reactions are data (JSON+tags), not code. Don't hardcode material IDs in shaders.
 - 2-space indent, `snake_case` WGSL, `CamelCase` C++. High comment density in sim shaders (non-obvious invariants).
 - Don't grow the 32-bit voxel. Extra state → sparse auxiliary layer.
+- **Per-player state lives in `PlayerSession` (`src/game/session.h`), not in `main()`; sim-affecting process globals must not be keyed on the residency window origin.** `WaterBodies()` is the grandfathered exception (`docs/RESEARCH_multiplayer_readiness.md` S4). One tick of authority is `TickAuthority(...)` in `session.cpp` — the frame loop keeps only pacing, the readback pump, the park probe and the handover of one `TickInput`.
 - Rotations: Y-up, quats `(x,y,z,w)`, Euler X→Y→Z, heading 0=+Z, `.vox` is Z-up. Use `python scripts/geometry.py`.
 - Tuner: `./sandvox_tuner.exe` or `python scripts/tuner_server.py`. Build/Play buttons run build+selftest.
