@@ -5732,6 +5732,37 @@ a detached speckle becomes a floating scrap of flesh in the world.
   latches into a dead hang, and W pulls up (a committed mantle when the lip is
   standable, an arm boost to the next grab when it is not, which chains up
   rough walls).
+- **The controller runs on the FIXED TICK, driven by one command per tick**
+  (2026-09-20, `sim/tickinput.h`, docs/PLAN_multiplayer_now.md N2). `Player::Update`
+  used to run once per FRAME with a frame `dt`: it exp/pow-smoothed acceleration,
+  drag and the view offset by that `dt` and aged the coyote/jump-buffer/hang
+  timers by it, while every other gameplay system (mobs, the avatar, melee,
+  spells, physics) already stepped at `kTickDt` inside the fixed-tick loop. Two
+  players at 30 and 144 fps therefore walked measurably different distances from
+  the same keys, and `--selftest` could not see it because it never runs the
+  frame loop. `Update(kTickDt, const TickInput&, KindFn)` is now called once per
+  tick, first in the tick body — after the readback pump that delivers the
+  mirror, before the residency recentre and before `mobs.PreTick`.
+  **`TickInput` is the command**: movement axes, HELD button bits, PRESSED-edge
+  bits, the look delta in raw pixels accumulated since the previous tick, the
+  tool/hotbar selection and the camera basis as it stood at tick time. It is a
+  72-byte versioned POD in `sim/` (not `game/`) because `sim/oprecord.h`'s
+  replay frame carries it and `sim/` may not include `game/`. The frame layer
+  owns one `TickInputFeeder`: it replaces the held sample every frame, ORs in
+  every pressed edge, accumulates the pixels, and each tick's `Consume()` clears
+  exactly the one-shots — so **held state is broadcast to every tick of a
+  multi-tick frame and an edge reaches exactly one tick**. That contract retires
+  the five ad-hoc sticky latches (`castQueued`, `strikeQueued`,
+  `ui.placePrefab`, `ui.spawnMob`, `dropStatusQueued`), which existed only
+  because the tick loop runs zero times on most frames at 60+ fps.
+  **The render camera interpolates**: `Player::prevPos` holds the position at
+  the start of the running tick and `RenderPos/RenderEyePos(alpha)` lerp by the
+  leftover accumulator, exactly as `Celestial::RenderTickInterp` does for the
+  sky. That value is RENDER-ONLY — the raymarch eye, the third-person boom's
+  focus and the audio ear — and the sim, the picking rays and physics keep using
+  `pos`/`EyePos()`, or the world would stop being a function of the tick stream.
+  Gate: `tick-input` runs 300 scripted ticks at 1 and at 4 ticks per frame and
+  asserts a bit-identical trajectory and a bit-identical command stream.
 - **The collision box is not the figure** (2026-09-02, `Player::Box`).
   `Player::pos` stays the centre of the NOMINAL 1.7 m figure box
   (`kHalfXZ`/`kHalfY`: the art contract, the Jolt proxy, the mob sense actor,
@@ -13057,6 +13088,14 @@ tick record; dev-UI sim inputs made client-local or replicated.
   and explosion against this API from day one is the whole anti-tech-debt play.
 - Fixed tick, versioned chunk serialization, entity IDs never raw pointers,
   gameplay separated from render, a headless build target, per-tick world hash.
+  **The player controller is inside that fixed tick as of 2026-09-20** (§8,
+  package N2): it takes one versioned `TickInput` command per tick, so the
+  trajectory is a function of the command stream alone and the render camera
+  interpolates between ticks rather than the sim reading a frame value. That is
+  the shape both netcode options need — under lockstep the command IS what is
+  exchanged, under server authority it is what a client sends and what the host
+  validates — and it is the half of "gameplay separated from render" that was
+  still outstanding.
 - Punt entirely: netcode library choice, anti-cheat.
 
 ## 11. Performance Budget & Principles

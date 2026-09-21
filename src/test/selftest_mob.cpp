@@ -2320,7 +2320,7 @@ bool mobOk = false;
           pl.vel = Vec3{};
           pl.grounded = true;
           for (int i = 0; i < 20; i++) {
-            PlayerInput idle{};
+            TickInput idle{};
             pl.Update(kTickDt, idle, Vec3{0, 0, 1}, Vec3{1, 0, 0},
                       Vec3{0, 0, 1}, kindAt);
             avTick();
@@ -2362,7 +2362,7 @@ bool mobOk = false;
           // the gait's ground probe reads it, so walking before it arrives
           // measures the gait against terrain that is not there yet.
           for (int i = 0; i < 10; i++) {
-            PlayerInput idle{};
+            TickInput idle{};
             pl.Update(kTickDt, idle, Vec3{0, 0, 1}, Vec3{1, 0, 0},
                       Vec3{0, 0, 1}, kindAt);
             avTick();

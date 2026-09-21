@@ -119,6 +119,13 @@ const char* const kOrder[] = {
     // one part of melee no other gate can see (`mob`'s melee subtests drive
     // SetWeaponPose directly and never touch the mouse).
     "swing",
+    // AND WITH THEM: `tick-input` is Player alone over a synthetic ground
+    // lambda — no world, no GPU, no assets — and it asserts that the
+    // controller's trajectory is a function of the COMMAND STREAM and not of
+    // the frame schedule (docs/PLAN_multiplayer_now.md N2). Front-loaded for
+    // the same reason `swing` is: a controller that has drifted back onto the
+    // frame clock makes every later movement gate measure something else.
+    "tick-input",
     // AND WITH THEM, for the third time and the same reason: `combat-tuning`
     // and `combat-cues` are pure CPU over tuning.json and the sound library —
     // no world, no GPU, no fixtures, nothing left behind (the one temp file

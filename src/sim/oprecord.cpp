@@ -38,6 +38,9 @@ uint32_t g_replayMismatch = 0, g_replayFirstTick = 0, g_replayFirstWord = 0;
 // The gen list Stream reported for a tick that has not been framed yet.
 uint32_t g_genTick = 0xFFFFFFFFu;
 std::vector<uint32_t> g_genSlots;
+// The player's command for the tick named by g_cmdTick (package N2).
+uint32_t g_cmdTick = 0xFFFFFFFFu;
+TickInput g_cmd{};
 // SANDVOX_RECORD_OPS, resolved once.
 bool g_envChecked = false;
 std::string g_envPath;
@@ -246,6 +249,14 @@ void NoteGenList(uint32_t tick, const std::vector<uint32_t>& slots) {
   g_genSlots = slots;
 }
 
+void NoteTickInput(uint32_t tick, const TickInput& cmd) {
+  // Unlike NoteGenList this is NOT gated on a live recorder: the caller is the
+  // frame loop's tick body and the cost is a 72-byte copy, while gating it
+  // would make `--record-ops` mid-session start with one blank command.
+  g_cmdTick = tick;
+  g_cmd = cmd;
+}
+
 void RecordFrame(const TickInputs& in, const TickParams& tp,
                  const std::vector<BrushOp>& ops,
                  const std::vector<ExplosionOp>& exps, const CellOp* cells,
@@ -299,6 +310,13 @@ void RecordFrame(const TickInputs& in, const TickParams& tp,
   std::vector<uint8_t> body;
   ByteWriter w{body};
   w.Pod(in);
+  // The player's command, or a zeroed one (version 0) when this tick had no
+  // controller attached -- every gate, both smokes and the lab are in that
+  // case, and a stale command from an earlier tick would be a lie.
+  TickInput cmd{};
+  if (g_cmdTick == in.tick) cmd = g_cmd;
+  else cmd.version = 0;
+  w.Pod(cmd);
   w.Bytes(&tp, sizeof(TickParams));
   w.PodVec(ops);
   w.PodVec(exps);
@@ -451,6 +469,7 @@ bool Log::Load(const std::string& path, const std::vector<MaterialDef>& mats,
     r.off += flen;
     Frame f;
     fr.Pod(f.in);
+    fr.Pod(f.cmd);
     fr.Bytes(&f.tp, sizeof(TickParams));
     fr.PodVec(f.ops);
     fr.PodVec(f.exps);

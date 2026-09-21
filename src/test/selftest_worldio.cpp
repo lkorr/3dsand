@@ -649,9 +649,9 @@ bool streamOk = false;
                   (float)(World::TerrainHeight(140, 140, kDefaultSeed) + 26),
                   140.5f};
     auto kindAt = [&](IVec3 c) { return world.KindAt(c, classOf); };
-    PlayerInput in{};
+    TickInput in{};
     in.forward = 1.0f;
-    in.sprint = true;
+    in.SetHeld(TB_SPRINT, true);
     for (int i = 0; i < 1200 && !crossed; i++) {
       IVec3 pc{ifloor(p2.pos.x) >> 4, ifloor(p2.pos.y) >> 4,
                ifloor(p2.pos.z) >> 4};
