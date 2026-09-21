@@ -13223,6 +13223,26 @@ in-flight particles, gas and MPM matter are NOT flushed, and what says there
 are none is that nothing has been dirty there for K + D ticks. A future package
 that ships a BUSY chunk (a late-join bulk transfer) owes a flush of all three.
 
+**M9.3-B — ops cross the wire (2026-09-21; `src/net/opsync.*`, phase N).**
+Under lockstep every machine DEFERS its own ops: the batch it authors at tick
+T travels labelled `T + kOpLabelAhead` (= D+1, because the pacer pre-sends
+D+1 batches — the first smoke ran 276 perfect ticks carrying zero ops at D,
+which is how that constant was measured) and is submitted at that label on
+both machines merged with the peer's batch in CANONICAL order: author id
+ascending (host first), push order within. Both seats therefore hand
+`SubmitTick` byte-identical vectors, which gate `ops-exchange` pins across 200
+ticks and 8 hash probes. Remote CellOps are kept only where the chunk is
+resident here (a slot number is global, so no translation — only the
+sender's origin is needed to recover the world chunk for the residency test);
+brush/explosion/particle/fluid ops are world coordinates and need nothing.
+Author ranges are resolved to a flat side table by the producing tick and
+re-noted at the merged indices, so the record still names every op's author
+(`Producer::Remote` + the peer id). Consequence accepted for now: a remote
+explosion's CRATER lands at T+5 while its CPU-side mob and limb damage lands
+at T; M9.4-D moves the crater's island scan to the chunk authority. Gas
+spawns are not exchanged (they never enter `OpBatch`). Single-player is D = 0
+and byte-identical to the oracle.
+
 **M9 proper (`docs/PLAN_multiplayer_m9.md`, plan of record 2026-09-20).** The
 audit under-stated one number: the residency window is `kWorldN` ×
 `kVoxelMeters` = a **51.2 m cube**, so two players walking independently leave
