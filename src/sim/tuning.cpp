@@ -620,6 +620,7 @@ bool LoadTuning(const std::string& path, Tuning& out) {
     ReadF(*g, "airPoseLean", a.airPoseLean, out, at);
     a.airPoseLean = std::clamp(a.airPoseLean, 0.0f, 60.0f);
     ReadB(*g, "firstPersonArms", a.firstPersonArms, out, at);
+    ReadF(*g, "firstPersonForward", a.firstPersonForward, out, at);
     ReadF(*g, "footTrim", a.footTrim, out, at);
     ReadF(*g, "severImpulse", a.severImpulse, out, at);
     ReadF(*g, "respawnDelay", a.respawnDelay, out, at);

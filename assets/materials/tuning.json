@@ -122,6 +122,7 @@
     "airPoseLandHeight": 1.1,
     "airPoseLean": 16,
     "firstPersonArms": true,
+    "firstPersonForward": 0.255,
     "footTrim": 0,
     "severImpulse": 6,
     "respawnDelay": 3

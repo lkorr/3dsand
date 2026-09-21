@@ -1573,6 +1573,8 @@ static void PhaseI(TickAuthorityCtx& w, WorldScratch& ws,
         const bool wantAvatar = av.enabled && !player.fly;
         if (wantAvatar && avatar.HasDef() && !avatar.Spawned()) {
           avatar.Spawn(player, avatarHeading);
+          if (avatar.HasEyeLocal())
+            player.SetModelEyeHeight(avatar.EyeRestHeight());
           // A new rig wears nothing (Mob::BuildRig clears its shells), so the
           // armour sync below has to be offered every slot again.
           for (std::string& w : wearTried) w.clear();

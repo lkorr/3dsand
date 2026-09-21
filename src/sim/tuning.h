@@ -432,6 +432,10 @@ struct Tuning {
     // In first person the body is hidden, but the ARMS are kept so the player
     // can see their own hands and staff. Turning this off hides everything.
     bool firstPersonArms = true;
+    // How far forward (metres) the first-person eye sits from the body centre.
+    // Pushes the camera in front of the arms so looking down shows hands behind
+    // you rather than surrounding you.
+    float firstPersonForward = 0.255f;
     // Vertical offset applied to the whole avatar relative to the player AABB,
     // in meters. The rig's own feet should land on the box's bottom face; this
     // is the trim for art whose contact point is not exactly at its origin.

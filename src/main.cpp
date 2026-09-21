@@ -10262,6 +10262,11 @@ int main(int argc, char** argv) {
       const float tickAlpha =
           std::min(1.0f, std::max(0.0f, (float)(accumulator / kTickDt)));
       Vec3 eye = player.RenderEyePos(tickAlpha);
+      if (camMode == CameraMode::First) {
+        const float fpFwd =
+            CurrentTuning().avatar.firstPersonForward / kVoxelMeters;
+        eye = eye + cam.FlatForward() * fpFwd;
+      }
       // ...and the BODY gets the same two corrections, or the art and the
       // camera disagree. The avatar is posed once per 30 Hz tick around
       // `player.pos`, so before this the figure stair-stepped at the tick rate
@@ -10317,29 +10322,13 @@ int main(int argc, char** argv) {
           hide.assign(avatar.PartCount(), 0);
           const int heldPart = avatar.HeldSlot();
           if (camMode == CameraMode::First) {
-            for (size_t i = 0; i < hide.size(); i++) hide[i] = 1;
-            if (CurrentTuning().avatar.firstPersonArms) {
-              // THE WHOLE ARM, not just its ends. The forearms have to be in
-              // here explicitly: the rig is armU -> armL -> hand, so keeping
-              // only the upper arm and the hand left a floating fist with a
-              // gap where the forearm should be — the arm you see in first
-              // person is mostly forearm, so it is the one part that cannot be
-              // omitted.
-              const int keep[9] = {p.armUL, p.armUR, p.armLL, p.armLR,
-                                   p.handL, p.handR, p.staff, heldPart, -1};
-              for (int k : keep)
-                if (k >= 0 && k < (int)hide.size()) hide[k] = 0;
-              // ...AND WHATEVER IS WORN OVER THEM. The keep list names BODY
-              // parts, so with a robe on, the arms you see in first person
-              // would be bare while the sleeves stayed behind with the hidden
-              // torso. A shell is kept exactly when the part it covers is —
-              // read off the rig's parent link rather than from a second list
-              // of sleeve names that would have to be maintained per item.
-              for (int i = avatar.AppendedBase(); i < (int)hide.size(); i++) {
-                const int par = avatar.PartParent(i);
-                if (par >= 0 && par < (int)hide.size() && hide[par] == 0)
-                  hide[i] = 0;
-              }
+            // Show the whole body except the head (its inside would fill the
+            // view). Worn shells over the head are hidden too.
+            if (p.head >= 0 && p.head < (int)hide.size()) hide[p.head] = 1;
+            for (int i = avatar.AppendedBase(); i < (int)hide.size(); i++) {
+              const int par = avatar.PartParent(i);
+              if (par >= 0 && par < (int)hide.size() && hide[par] == 1)
+                hide[i] = 1;
             }
           }
           // NOTHING TO HIDE FOR UNHELD ITEMS ANY MORE. The rig used to carry

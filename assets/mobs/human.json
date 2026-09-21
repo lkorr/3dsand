@@ -1,6 +1,7 @@
 {
   "root": "hips",
   "artVoxelsPerMetre": 80,
+  "eyeLocal": [0, 16, 0],
   "bleed": {
     "material": "blood",
     "perDamage": 2.5

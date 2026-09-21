@@ -75,14 +75,22 @@ class Player {
     return b.yHi - b.yLo;
   }
 
-  // The first-person eye rides at the FIGURE's face row (kEyeOffset) or just
-  // under the top of the live collision box, whichever is lower. The box is
-  // what is guaranteed to be clear of terrain; the face row is not, and a
-  // camera inside a ceiling voxel is the one thing the head-clip must not
-  // buy. Crouching drops it with the box.
+  // Set the eye offset from the avatar's model data. Called once when the
+  // avatar spawns or changes def. eyeFromFeet is in world voxels from the
+  // creature's bottom; converted to an offset from pos (the AABB centre).
+  void SetModelEyeHeight(float eyeFromFeet) {
+    modelEyeOffset_ = eyeFromFeet - kHalfY;
+  }
+
+  // The first-person eye rides at the FIGURE's face row or just under the top
+  // of the live collision box, whichever is lower. The box is what is
+  // guaranteed to be clear of terrain; the face row is not, and a camera inside
+  // a ceiling voxel is the one thing the head-clip must not buy. Crouching
+  // drops it with the box.
   float EyeOffsetNow() const {
+    const float base = modelEyeOffset_ > 0 ? modelEyeOffset_ : kEyeOffset;
     const Box b = CurrentBox();
-    return std::min(kEyeOffset, b.yHi - kEyeBelowTopM / kVoxelMeters);
+    return std::min(base, b.yHi - kEyeBelowTopM / kVoxelMeters);
   }
   Vec3 EyePos() const { return pos + Vec3{0, EyeOffsetNow(), 0}; }
 
@@ -343,6 +351,8 @@ class Player {
   // a whole tick's worth at the boundary. Render-only; 1.0 means "nothing
   // has been aged yet", which is the correct no-op.
   float viewDecayPerTick = 1.0f;
+
+  float modelEyeOffset_ = 0;
 
   // ---- avatar damage coupling ----
   // Multipliers the PlayerAvatar's dismemberment state feeds in (see
