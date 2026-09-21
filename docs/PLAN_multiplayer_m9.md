@@ -369,35 +369,254 @@ in `kOrder` — confirm placement).
 
 ## 3. Stages M9.2–M9.5 (package sections written when each stage starts)
 
-### M9.2 — transport, handshake, tick pacing, ghost players
-- `src/net/link.h/.cpp`: `class Link { Listen(port) / Connect(ip,port), Poll(),
-  Send(type, bytes), bool Recv(Msg&) }` over non-blocking Winsock TCP polled
-  once per frame before the tick loop — `src/telemetry.cpp`'s pattern
-  (ws2_32 already linked, `CMakeLists.txt:587`) plus `TCP_NODELAY`. Frame
-  `{u32 len, u16 type, u16 ver, payload}` via `ByteWriter/ByteReader`
-  (`src/sim/bytestream.h`). `LoopbackLink` pair for gates.
-- Handshake `Hello`: `opstream::Header` fields + `StampTuning` +
-  `EnvironmentStamp` + `kTickInputVersion` + protocol version + seed
-  (`kDefaultSeed` today — becomes a value the host sends). Mismatch refuses
-  naming the field (worldio's style).
-- Pacing: ONE `TickBatch{tick, PlayerState, windowOrigin, ops (empty until
-  M9.3), timeScale, vizActive}` per direction per tick: sent BEFORE waiting,
-  empty every tick, D=4 pre-sent at connect (§4 finding 5). Frame loop gains
-  a third pacing case beside `HarnessTicksPerFrame()` (`main.cpp:8216`): a
-  tick runs only when the peer's batch for it has arrived; while stalled skip
-  the tick, keep rendering, poll every frame; 3 s silence → free-run. The
-  host's `timeScale`/`vizActive` win (L11).
-- `RemotePlayer { id, PlayerState last, Player ghostCtl, PlayerAvatar avatar,
-  uint64_t proxyBody }` list on `TickAuthorityCtx`; phase B registers
-  `SetAvatars(sessions + ghosts)` / `SetPlayerActors(…)`; phase C runs
-  `ghost.avatar.PreTick(tick, ghost.ghostCtl, heading, …)` with the one-tick
-  edges (`jumped`, `impactDeltaV`) drained as `session.cpp:1599-1603` does.
-  `PreTick` reads ~15 plain `Player` fields and no `Camera` (verified).
-  Ghosts add a chunk to the `InterestSet` as INFORMATION.
-- argv `--host [port]`, `--join ip[:port]`. Gate `net-loopback`: link
-  round-trip, handshake refusal matrix, pacing catch-up. The live check is two
-  exes on one machine (they share the GPU; the frame rate halves; that is a
-  smoke, not a number to quote).
+### M9.2 — transport, handshake, tick pacing, ghost players (packages A, B, C)
+
+```
+Wave 1 (parallel, disjoint files)
+  A  net::Link + protocol + handshake + pacer    src/net/*, src/test/selftest_net.cpp,
+                                                 CMakeLists.txt, selftest.cpp (registry)   hash UNMOVED
+  B  RemotePlayer ghosts in the tick             src/game/remoteplayer.h, session.h/.cpp,
+                                                 selftest_player.cpp, baseline.json        hash UNMOVED, oracle cmp
+Wave 2 (after A+B merge)
+  C  --host / --join in main.cpp                 src/main.cpp only                         hash UNMOVED
+Endgame: build; oracle cmp; --verify determinism,net-loopback,remote-ghost,two-players,tick-input;
+         the two-process smoke (orchestrator); ff main; ARCH_NODES; DESIGN §10.
+```
+
+Decisions that bind all three (from §4 finding 5 and the model table):
+- ONE message per direction per tick, `TickBatch`, sent BEFORE the local tick
+  waits for the peer's. It carries the sender's `PlayerState` (incl. window
+  origin), `timeScale`, `vizActive`, and (M9.3) the ops for tick T+D. It is
+  sent EVERY tick, empty or not.
+- Delayed lockstep with D = `net::kOpDelayTicks = 4`: at local tick T the
+  batch labelled T+D goes out; local tick T runs only once the peer's batch
+  labelled T has arrived. On connect both sides pre-send batches T0..T0+D−1.
+  The HOST's tick counter is the clock: `HelloAck.startTick` tells the client
+  where to begin.
+- `TickInput` never crosses the wire. A ghost is a `RemotePlayer` driven from
+  the peer's `PlayerState` outcome; it authors NO ops locally.
+- TCP, `TCP_NODELAY`, non-blocking, polled from the frame loop; 3 s silence
+  or a socket error is a disconnect → free-run (pacer off, ghost removed).
+- Nothing here may change the one-session op record: the oracle cmp is part of
+  B's and C's verification.
+
+#### A · `net::Link`, protocol framing, handshake, lockstep pacer, gate `net-loopback` — C++ only, hash UNMOVED
+
+**Owner scope:** new `src/net/link.h`, `src/net/link.cpp`, `src/net/protocol.h`,
+`src/net/protocol.cpp`; `CMakeLists.txt` (add the two `.cpp`s to the explicit
+source list beside `src/telemetry.cpp` at `:560`; `ws2_32` is already in
+`SANDVOX_LINK_LIBS` at `:587`); new `src/test/selftest_net.cpp`;
+`src/test/selftest.cpp` (`NetGates()` decl + `Registry()` list at `:598-602` +
+`kOrder`); `tests/baseline.json` (new keys only). Nothing in `src/game/`,
+`src/main.cpp` or `src/sim/`.
+
+**Verified facts:**
+- `src/telemetry.h:38-73` / `src/telemetry.cpp` is the precedent: `WSAStartup`
+  at `:19`, `ioctlsocket(FIONBIO)` at `:24`, `socket(AF_INET, SOCK_STREAM)` at
+  `:124`, accept/read/drop, polled once per frame, no thread. It does NOT set
+  `TCP_NODELAY`; you must (`setsockopt(IPPROTO_TCP, TCP_NODELAY)`), or 100-byte
+  ticks Nagle-coalesce into 200 ms stalls.
+- `src/sim/bytestream.h`: `ByteWriter{out}.Pod/U32/F32/Str/PodVec`,
+  `ByteReader{p,n}.Pod/U32/...` with a sticky `ok`. Header comment says it is
+  "not a wire format" — that is about endianness/ABI; two builds of this exe on
+  x64 Windows agree, and `Hello` refuses anything else.
+- Identity that must match: `opstream::Header{version, worldN, chunk,
+  voxelMetersBits, seed, matCount, matHash, tickParamsBytes}` (`oprecord.h:233-244`,
+  `kRecordVersion`), `sandvox::TuningStamp{tuning, materials, reactions}`
+  (`tuningstamp.h:50-76`, `StampTuning(assetDir)`), `biomes::EnvironmentStamp{
+  mapName, map, biomes, trees}` (`biomes.h:264-273`, `StampEnvironment`),
+  `kTickInputVersion` (`tickinput.h`). The seed is `kDefaultSeed = 1337`
+  (`support.h:30`) — carry it anyway.
+- Gate registration: `struct Gate{name, group, deps, advisory, fn, needsRender}`
+  (`selftest.h:142-161`); a new TU exposes `const std::vector<Gate>& NetGates()`
+  and is added to `Registry()`; the name goes into `kOrder` (`selftest.cpp:77+`).
+  `tick-input` (`selftest_player.cpp:891+`) is the template for a CPU-only gate
+  that ignores `Ctx`.
+
+**Build:**
+1. `src/net/link.h`:
+   ```cpp
+   namespace net {
+   struct Msg { uint16_t type; uint16_t ver; std::vector<uint8_t> payload; };
+   struct LinkStats { uint64_t bytesIn, bytesOut, msgsIn, msgsOut; double lastRecvSeconds; };
+   class Link { public: virtual ~Link(); virtual bool Send(uint16_t type, uint16_t ver, const uint8_t*, size_t) = 0;
+                virtual bool Recv(Msg&) = 0; /* non-blocking pop */ virtual void Poll() = 0;
+                virtual bool Connected() const = 0; virtual void Close() = 0; virtual const LinkStats& Stats() const = 0; };
+   class TcpLink : public Link { bool Listen(uint16_t port); /* accepts ONE peer */ bool Connect(const std::string& ip, uint16_t port); ... };
+   struct LoopbackPair { std::unique_ptr<Link> a, b; }; LoopbackPair MakeLoopback();
+   }
+   ```
+   Frame on the wire: `{u32 len, u16 type, u16 ver}` then `len` payload
+   bytes; reassembly across partial reads; a frame > 4 MiB is a protocol error
+   (close). `Poll()` does accept/connect-completion/read/write-flush. Errors set
+   `Connected() = false` with a reason string.
+2. `src/net/protocol.h/.cpp`: `enum MsgType : uint16_t { Hello = 1, HelloAck, HelloRefuse, TickBatch, ChunkSync /*M9.3*/, EntityState /*M9.4*/, ChunkPut, ChunkGet, ChunkManifest /*M9.5*/ }`,
+   `kProtocolVersion = 1`, `kOpDelayTicks = 4`;
+   `struct Hello { uint32_t protocolVersion; opstream-header fields; uint32_t tuningHash, materialsHash, reactionsHash, envMap, envBiomes, envTrees; uint32_t tickInputVersion; uint32_t playerId; std::string mapName; }`
+   with `Encode/Decode` and `const char* FirstMismatch(const Hello& mine, const Hello& theirs)` (returns the FIELD NAME or null);
+   `struct HelloAck { uint32_t startTick; uint32_t yourPlayerId; }`; `HelloRefuse { std::string field; }`;
+   `struct TickBatchHeader { uint32_t tick; uint32_t playerId; int32_t windowOrigin[3]; float timeScale; uint32_t vizActive; uint32_t flags; }` and
+   `struct TickBatchWire { TickBatchHeader h; std::vector<uint8_t> playerState; std::vector<uint8_t> ops; }` with `Encode/Decode` — the two blobs are OPAQUE here (B owns `PlayerState`; M9.3 owns ops).
+3. `net::LockstepPacer` (header-only or in protocol.cpp): `D`, `uint32_t localTick`, `uint32_t peerBatchUpTo` (highest CONTIGUOUS peer batch tick received), `bool CanRun(uint32_t t) const { return t <= peerBatchUpTo; }`, `void NotePeerBatch(uint32_t t)` (tracks contiguity; out-of-order is a protocol error), `uint32_t NextToSend() const` (= localTick + D), `void NoteSent(t)`, `int Lag() const`, counters `stalls, ticksRun`. The invariants as comments: send-before-wait; a batch every tick; pre-send D at connect.
+4. Gate `net-loopback` (CPU only): (a) 1,000 messages of mixed sizes 0..70 KiB through `MakeLoopback()`, in order, byte-exact; (b) `TcpLink` listen on 127.0.0.1 port 0 / ephemeral (read it back) + connect in the same process, poll both until connected, 200 messages incl. one 300 KiB, in order, byte-exact, `TCP_NODELAY` verified via `getsockopt`; (c) handshake matrix: for each field of `Hello`, perturb it and assert `FirstMismatch` names exactly that field, and an unperturbed pair returns null; (d) pacer: peer pre-sends 0..D−1, local runs ticks while `CanRun`, peer stalls for 10 ticks → local stalls (count), resumes; assert no tick ran without its batch and `stalls == 10`. Pin `net.loopbackMsgs`, `net.tcpMsgs`, `net.helloFields` as observed.
+
+**Kill criterion:** if a `TcpLink` listen+connect within one process cannot be
+made to work on this machine (firewall prompt), report it and keep (b) as
+advisory — the loopback pair covers the framing; the two-process smoke covers
+the socket.
+
+**Done means:** two processes could exchange framed messages and refuse a
+mismatched build by field name; the pacer's rules are pinned by a gate.
+
+**Verification, ONE launch:** `--verify determinism,net-loopback`. Hash: UNMOVED.
+
+#### B · `RemotePlayer` ghosts in the tick, gate `remote-ghost` — C++ only, hash UNMOVED, oracle cmp
+
+**Owner scope:** new `src/game/remoteplayer.h` (+ `.cpp` if needed; add to
+`CMakeLists.txt` source list), `src/game/session.h/.cpp` (phases B, I, O and
+`TickAuthorityCtx`), `src/test/selftest_player.cpp`, `src/test/selftest.cpp`
+(`kOrder` only), `tests/baseline.json` (new keys). READ-ONLY: `avatar.*`,
+`player.*`, `mob.*`, `physics.*`, `main.cpp`. If a change there is unavoidable,
+report it for C instead of making it.
+
+**Verified facts:**
+- `PlayerAvatar::PreTick(tick, const Player&, heading, dt, world, ops, cellOps, spawns)`
+  (`avatar.h:156-159`) reads only these `Player` fields: `pos, vel, jumped,
+  hanging, mantleTimer, inLiquid, grounded, fly, crouchKneeDrop, impactDeltaV,
+  hangLip, hangDir, fallDamageSpeed, crouching, blindFall`, plus `SetLook(yawRel,
+  pitch)` (`avatar.h:187`) from the caller; no `Camera`. `jumped` and
+  `impactDeltaV` are one-tick edges drained after PreTick (`session.cpp`, the
+  block ending phase I today — grep `player.jumped = false`).
+- `explicit PlayerAvatar(uint64_t id)`; `Init(phys, world, debris, mats, &mobs)`,
+  `SetDefs(&mobs.Defs(), name)`, `Spawn(player, heading)`, `Despawn`, `Revive`,
+  `Spawned()`, `IsAlive()`, `PostStep()`, `RagdollFollow`.
+- `MobSystem::SetAvatars(std::span<Mob* const>)` (`mob.h:3644`) — registered once
+  from `main.cpp:5672`; `SetPlayerActors(span<PlayerActorDesc>)`; player i's actor
+  id is `ai::kPlayerActorBase + i` and `FindCombatantById` maps the band to
+  `avatars_[i]` — so ghosts must be appended AFTER the sessions in BOTH lists,
+  index-aligned.
+- `Physics::CreatePlayerBody(halfXZ, halfY)` / `MovePlayerBody(handle, pos, dt)` /
+  `RemoveBody`; `playerBodies_` holds every proxy (P2).
+- Phase B today: builds the `InterestSet` from every session, `SetPlayerActors`
+  over sessions, `mobs.PreTick`. Phase I: the avatar block per session. Phase O:
+  `avatar.PostStep`, ragdoll follow, push-out. `TickAuthorityCtx` section A/D
+  (`session.h`).
+- The oracle: `C:/Users/Luke/Desktop/programming/3d sand voxel/build/pre_a.svops`
+  (main checkout), 8,738,460 B; the recording command is in §0.3 (argv
+  `--record-ops`).
+
+**Build:**
+1. `src/game/remoteplayer.h`:
+   ```cpp
+   constexpr uint32_t kPlayerStateVersion = 1;
+   struct PlayerState {   // POD, versioned, static_assert(sizeof) — the OUTCOME of one tick of somebody's controller
+     uint32_t version, tick, playerId;
+     Vec3 pos, vel; float heading, lookYaw, lookPitch;
+     uint32_t flags;      // grounded, crouching, jumped, inLiquid, swimming, fly, hanging, alive, blindFall
+     float crouchKneeDrop, submersion, fallDamageSpeed, mantleTimer;
+     Vec3 hangLip, hangDir; float impactDeltaV;
+     int32_t health;
+     int32_t windowOrigin[3];
+   };
+   PlayerState MakePlayerState(const PlayerSession&, uint32_t tick, IVec3 windowOrigin);  // sender side
+   struct RemotePlayer {  // one peer's ghost on THIS machine
+     uint32_t playerId; PlayerState last; bool haveState = false;
+     Player ghost;        // the ~15 fields PreTick reads, filled from `last`; never Update()d
+     float heading = 0; PlayerAvatar avatar; uint64_t proxyBody = 0; uint32_t lastStateTick = 0;
+     void Apply(const PlayerState&);   // fills `ghost` + heading; edges (jumped, impactDeltaV) set for ONE tick
+   };
+   struct RemotePlayers { std::vector<std::unique_ptr<RemotePlayer>> list; bool dirty = false;  // dirty => re-register avatars/actors
+     RemotePlayer& Upsert(uint32_t id); void Remove(uint32_t id); RemotePlayer* Find(uint32_t id); };
+   ```
+   `PlayerAvatar` construction id: `0x5A11EDU + 64 + playerId` (a band above any local session index).
+2. `TickAuthorityCtx` gains `RemotePlayers* remotes = nullptr;` (section D-ish: per-world, owned by `main()`; null in every harness = zero ghosts = today's tick). Phase B: after the sessions, append each ghost's chunk to the `InterestSet` (information only), append a `PlayerActorDesc` per ghost (alive from flags), and when `remotes->dirty` rebuild `mobs.SetAvatars(sessions' avatars + ghosts' avatars)` then clear dirty. With zero ghosts NOTHING is called that was not called before (the oracle proves it). Phase I, after the sessions: for each ghost with `haveState`: spawn its avatar on first state (`Init/SetDefs/Spawn` with the local player's def name, `CreatePlayerBody`), `avatar.SetLook`, `avatar.PreTick(tick, ghost, heading, kTickDt, world, scratchOps, scratchCells, scratchSpawns)` into THROW-AWAY vectors (a ghost authors nothing — its owner's ops arrive on the wire in M9.3; say so in a comment), drain the one-tick edges, `MovePlayerBody(proxy, pos)`; `alive` false → `Despawn`, true again → `Revive`. Phase O: `avatar.PostStep()` per ghost. On `Remove`: `Despawn`, `RemoveBody`, dirty.
+3. Gate `remote-ghost` in `selftest_player.cpp` (after `two-players` in `kOrder`): one local `Player`+`PlayerAvatar` as in `two-players`, plus a `RemotePlayers` with one ghost fed a scripted `PlayerState` stream for 300 ticks (walk +X 2 vox/tick, one jump edge at tick 60, crouch 100..140, alive=false at 200, alive at 240); drive the same per-tick sequence `two-players` uses but call your phase-B/I/O helper functions directly if you factor them as free functions (preferred: `RemotePlayersPreTick(ctx-ish args)` so the gate and `session.cpp` share one definition). Asserts: avatar spawned by tick 2; rig root within 0.5 vox of `last.pos` every tick it is alive; despawned at 200..239 and back after; a hostile mob spawned near the ghost targets `ai::kPlayerActorBase + 1` (ghost index after the one session); the throw-away op vectors are non-empty at least once (proves the ghost body did try to author — footfall/bleed — and that nothing reached the batch: assert the real batch has no op authored by the ghost); twice-run hash equal.
+
+**Kill criterion:** if `PreTick` needs a `Player` field that is not a plain
+value (a pointer, a std::function), report it; do not add a callback to
+`PlayerState`.
+
+**Done means:** a ghost fed a `PlayerState` stream animates as a player, is a
+target, collides as a capsule, authors no ops; zero ghosts = the same tick.
+
+**Verification, ONE launch after the oracle:** record
+`SANDVOX_TICKS_PER_FRAME=1 SANDVOX_FRAMES_NO_RELOAD=1 ... --frames 600 --autofly-hard --record-ops build/post_b.svops`,
+`cmp` against the oracle; then `--verify determinism,remote-ghost,two-players,tick-input`. Hash: UNMOVED.
+
+#### C · `--host` / `--join`: the game talks to one peer — `src/main.cpp` only, hash UNMOVED, oracle cmp
+
+**Owner scope:** `src/main.cpp` (argv, boot handshake, frame-loop pacing, the
+`TickBatch` build/apply, the HUD line, the `--frames` report), and ONLY if A/B
+left a hole, one-line fixes in `src/net/*` / `src/game/remoteplayer.h` reported
+as such. Branch from `mp-two` after A and B have merged.
+
+**Verified facts:**
+- `Telemetry telemetry;` at `main.cpp:4991`, `.Start` `:4992`, `.Poll()` `:11015`,
+  `.Shutdown()` `:11543` — the lifecycle shape to copy for a `net::TcpLink`.
+- The tick counter is `uint32_t tick = 0;` (`main.cpp:6223`, grep it), `tick++`
+  inside the accumulator `while` (`:8428`). Pacing switches: `fixedTicksPerFrame`
+  (`:8225-8227`, `HarnessTicksPerFrame()` at `:270`), the GPU-lag throttle
+  (`:8425`). `TickAuthority(tickCtx, session, FrameIntent{...}, ti, tick, opBatch)`
+  at `:8481+` (one-player wrapper). `stream.BeginFrame()` / `far.BeginFrame()` once
+  per frame before the loop.
+- `ui.timeScale` → `Celestial().SetScale(ui.timeScale, tick)` inside phase L
+  (`session.cpp`); `ui.showDirtyVoxels` → `SubmitTick`'s `vizActive`; both are
+  hashed sim inputs (L11).
+- `envStamp` / `tuneStamp` are computed at boot `main.cpp:4939-4949`; `mats` and
+  `kDefaultSeed` are in scope there. `opstream::Header` fields: see `oprecord.h`.
+- `--frames` report at exit `main.cpp:11216+` (grep `--frames harness:`), and
+  the HUD debug text block (grep `SnapshotStallStats` / `snapshot stall` for the
+  line N1 added — put the net line beside it).
+
+**Build:**
+1. argv: `--host [port]` (default 7777) and `--join <ip[:port]>`; `netRole`
+   enum {None, Host, Client}. `--host` opens `TcpLink::Listen` at boot and keeps
+   running single-player until a client connects (a listen server); `--join`
+   connects and BLOCKS at boot (poll loop, 10 s timeout) until `HelloAck` or
+   `HelloRefuse` (print `net: refused: <field>` and exit 2).
+2. Handshake: client sends `Hello` (built from `opstream::Header`-equivalent
+   values, `tuneStamp`, `envStamp`, `kTickInputVersion`, `kProtocolVersion`,
+   requested playerId 1); host compares with `FirstMismatch`, replies
+   `HelloRefuse{field}` or `HelloAck{startTick = tick + 1, yourPlayerId = 1}`;
+   both then pre-send batches `startTick .. startTick + D − 1` (the client's
+   `tick` is set to `startTick − 1`). The host's `PlayerSession` is player 0.
+3. Frame loop: `link.Poll()` at the top of the frame (beside `telemetry.Poll()`
+   is fine, but BEFORE the tick loop); decode every `TickBatch` into the pacer
+   (`NotePeerBatch`) and into `RemotePlayers::Upsert(peerId).Apply(state)` (keep
+   the LATEST state per tick label; states for ticks ahead of the local tick
+   are queued and applied when that tick runs — a ghost must not jump ahead).
+   Pacing, a third case beside `fixedTicksPerFrame`: while connected, before
+   running tick T: `if (!pacer.CanRun(T)) { stalls++; break; }` (skip the tick,
+   keep rendering); after running it: build `TickBatch{tick = T + D, PlayerState
+   (MakePlayerState(session, T, world.WindowOrigin())), timeScale, vizActive}`
+   and `Send` it — send-before-wait holds because the batch for T+D is sent at
+   T, before the wait at T+1. Never drop accumulator debt while connected (cap
+   the catch-up at `kMaxTicksPerFrame` and otherwise lag).
+   Client: before each tick, `ui.timeScale = batch.timeScale; ui.showDirtyVoxels = batch.vizActive` from the host's batch for that tick (host wins).
+4. Disconnect: `!link.Connected()` or `Stats().lastRecvSeconds` older than 3 s →
+   `remotes.Remove(peer)`, pacer off, `netRole = None`, print once. Host goes
+   back to listening.
+5. HUD: one line `net: host|client  peer tick +N/-N  stalls S  in/out KB/s`
+   beside the snapshot-stall line; `--frames` exit report: `net: role, batches
+   sent/recv, stalls, max lag, disconnects, bytes in/out`.
+6. `SANDVOX_NET_SMOKE_EXIT_ON_PEER_DONE=1` (env): a host in `--frames` mode
+   exits when the client disconnects (so the two-process smoke ends cleanly);
+   document it beside `HarnessTicksPerFrame()`.
+
+**Kill criterion:** if the pacer stalls the host for more than ~1 s at connect
+on 127.0.0.1, the pre-send is wrong; report the sequence, do not raise D.
+
+**Done means:** two exes on one machine handshake, exchange a batch per tick,
+each shows the other's avatar walking, and either can quit without the other
+crashing. The one-session record without `--host/--join` is byte-identical.
+
+**Verification:** build; oracle cmp (no `--host`); `--verify determinism,tick-input,remote-ghost,net-loopback`.
+Then the two-process smoke — the ORCHESTRATOR runs it (both exes on one GPU;
+no numbers to quote): host `--host 7777 --frames 900 --autofly-hard` under
+`run.sh`, client `--join 127.0.0.1:7777 --frames 600` launched directly (the
+one sanctioned direct launch: concurrency is the point), `SANDVOX_NET_SMOKE_EXIT_ON_PEER_DONE=1`
+on the host; both exit 0; both logs show `net:` reports with batches in both
+directions and 0 disconnects before the client's own exit.
 
 ### M9.3 — op exchange, per-chunk hash, chunk resync (the "play together" milestone)
 - `sim_occupancy.wgsl:281-300` also stores `wgHash` into a new
