@@ -576,6 +576,7 @@ add_library(sandvox_core OBJECT
   # authority.cpp opens nothing at all — it is pure arithmetic over two
   # PlayerStates (M9.4-A) and is here only because it lives in src/net.
   src/net/authority.cpp
+  src/net/chunksync.cpp
   src/net/link.cpp
   # opsync.cpp is the op exchange (M9.3-B): the delay queue, the wire blob and
   # the canonical merge. Pure too — the only engine type it touches is World,

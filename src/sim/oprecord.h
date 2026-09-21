@@ -42,6 +42,12 @@
 #include "sim/tickinput.h"
 #include "sim/world.h"
 
+// ReplaceChunksIfReplaying hands a recorded chunk-replace back to the ONE
+// function allowed to install it (Stream::ReplaceChunk, sim/stream.h). By name
+// only: stream.cpp already includes THIS header for NoteGenList, so including
+// stream.h here would be a cycle. oprecord.cpp includes the real one.
+class Stream;
+
 namespace sandvox {
 namespace opstream {
 
@@ -268,6 +274,26 @@ struct Frame {
   std::vector<uint32_t> genList;  // slots worldgen refilled on this tick
   std::vector<OpMeta> opMeta;     // parallel to `ops`
   std::vector<OpMeta> expMeta;    // parallel to `exps`
+  // ---- THE THIRD PER-TICK INPUT THAT IS NOT AN OP (M9.3-C) ---------------
+  //
+  // A chunk resync replaces 4,096 voxel words wholesale (net/chunksync.h). It
+  // belongs with CLAUDE.md rule 3's snapshot-restore exceptions — it does not
+  // go through the MutationQueue, because "the peer's copy of this chunk" is
+  // not expressible as a cell at a time — and it is therefore INVISIBLE to a
+  // replay that only feeds ops back. A record of a networked session that did
+  // not carry it would diverge at the first sync with nothing in the file to
+  // say why.
+  //
+  // Same shape and same reason as `genList`: stashed by the producer through
+  // NoteChunkReplace, folded into this tick's frame by RecordFrame, applied on
+  // replay by ReplaceChunksIfReplaying at the phase-B position. The payload is
+  // the SAME RLE the store and the wire use (sim/stream.h), so the record
+  // costs what the wire cost and decodes through one function.
+  struct ChunkReplace {
+    int32_t wc[3] = {0, 0, 0};
+    std::vector<uint32_t> rle;  // (word, runLength) pairs, kPersistMask'd
+  };
+  std::vector<ChunkReplace> chunkReplaces;
 };
 
 // The header, checked on load the way worldio's meta.svm is: a record made by
@@ -285,7 +311,12 @@ struct Header {
   uint32_t tickParamsBytes = 0;
 };
 // 2: Frame carries the player's TickInput (package N2).
-constexpr uint32_t kRecordVersion = 2;
+// 3: Frame carries chunkReplaces, the chunk resyncs installed on that tick
+//    (M9.3-C). A version-2 record has none, and could in principle be read
+//    with a default-empty vector — but a frame body is a flat byte run with no
+//    per-field tags, so a reader that expected the field would run off the end
+//    of every old frame. The bump turns that into one clear refusal.
+constexpr uint32_t kRecordVersion = 3;
 
 // ---- recording ----
 // Start appending frames to `path`. `mats` is the loaded material table: its
@@ -318,6 +349,14 @@ void RecordFrame(const TickInputs& in, const TickParams& tp,
 // reproduce them.
 void NoteGenList(uint32_t tick, const std::vector<uint32_t>& slots);
 
+// ONE CHUNK RESYNC, stashed into this tick's frame (M9.3-C). Called by phase B
+// immediately AFTER Stream::ReplaceChunk succeeds — after, so a refused
+// replace (the window shifted between the request and the reply) does not put
+// a replace in the record that a replay would then apply. Several per tick
+// accumulate; the stash is cleared when the tick number moves, exactly the way
+// the gen list's is, so a stale one cannot land in the wrong frame.
+void NoteChunkReplace(uint32_t tick, IVec3 wc, const std::vector<uint32_t>& rle);
+
 // The player's command for this tick (main.cpp's frame layer, package N2).
 // Stashed the same way the gen list is and for the same reason: it is produced
 // at the TOP of the tick body and SubmitTick runs at the bottom, so threading
@@ -348,6 +387,27 @@ void SetReplay(const Log* log);
 const Log* Replay();
 // While replaying, swap `gas` for the recorded tick's list. No-op otherwise.
 void ReplaceGasIfReplaying(uint32_t tick, std::vector<GasSpawnOp>& gas);
+
+// While replaying, re-apply this tick's recorded chunk replaces through
+// `stream`. A no-op (one pointer test) otherwise, so the drive loops call it
+// unconditionally and single-player pays nothing.
+//
+// WHERE: THE PHASE-B POSITION — before Stream::Update and before the tick's
+// submit, the same point session.cpp installs a live sync at. A replace
+// applied after the submit would land one tick late and every hash probe from
+// there on would describe a world one tick of CA away from the recording's.
+//
+// Returns how many it applied, so a drive loop can report "3 replaces"
+// instead of leaving a silent difference between record and replay.
+// ::Stream, GLOBALLY QUALIFIED.  is this namespace's op-kind
+// enum (Brush / Explosion / ...) and would win the lookup, which is a compile
+// error that reads like a missing include.
+uint32_t ReplaceChunksIfReplaying(uint32_t tick, ::Stream& stream);
+// ...and how many the replay REFUSED (chunk not resident), since the last
+// ResetReplayStats. Must be 0 on a faithful replay: the recording's window was
+// in the same place at the same tick, so a refusal means the replay's
+// streaming diverged before the replace did.
+uint32_t ReplayChunkReplaceRefusals();
 // TickParams words that differed from the record since the last reset, and the
 // first tick at which one did.
 uint32_t ReplayParamMismatches();

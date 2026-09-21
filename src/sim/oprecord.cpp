@@ -9,6 +9,7 @@
 #include <cstring>
 
 #include "sim/bytestream.h"
+#include "sim/stream.h"  // RleDecodeChunk + Stream::ReplaceChunk (M9.3-C)
 
 namespace sandvox {
 namespace opstream {
@@ -44,6 +45,12 @@ std::vector<uint32_t> g_replayWords;
 // The gen list Stream reported for a tick that has not been framed yet.
 uint32_t g_genTick = 0xFFFFFFFFu;
 std::vector<uint32_t> g_genSlots;
+// This tick's chunk resyncs (M9.3-C), stashed the same way the gen list is.
+// A VECTOR and not a single entry: the rate limit is four chunks in flight
+// (net/chunksync.h) and all four can complete on one frame.
+uint32_t g_replaceTick = 0xFFFFFFFFu;
+std::vector<Frame::ChunkReplace> g_replaces;
+uint32_t g_replayReplaceRefusals = 0;
 // The player's command for the tick named by g_cmdTick (package N2).
 uint32_t g_cmdTick = 0xFFFFFFFFu;
 TickInput g_cmd{};
@@ -275,6 +282,28 @@ void NoteGenList(uint32_t tick, const std::vector<uint32_t>& slots) {
   g_genSlots = slots;
 }
 
+void NoteChunkReplace(uint32_t tick, IVec3 wc,
+                      const std::vector<uint32_t>& rle) {
+  // Gated on a live recorder (or a replay, which compares) exactly like
+  // NoteGenList: the payload is a ~32 KiB copy and a game that is not
+  // recording must not pay it on every resync.
+  if (!g_rec && !g_replay) return;
+  // A NEW TICK CLEARS THE STASH. Without this, a replace from tick 900 would
+  // still be sitting here at tick 901 and would be folded into that frame too
+  // — the gen list's identical hazard, and the reason both are keyed by tick
+  // rather than cleared by the consumer.
+  if (g_replaceTick != tick) {
+    g_replaceTick = tick;
+    g_replaces.clear();
+  }
+  Frame::ChunkReplace cr;
+  cr.wc[0] = wc.x;
+  cr.wc[1] = wc.y;
+  cr.wc[2] = wc.z;
+  cr.rle = rle;
+  g_replaces.push_back(std::move(cr));
+}
+
 void NoteTickInput(uint32_t tick, const TickInput& cmd) {
   // Unlike NoteGenList this is NOT gated on a live recorder: the caller is the
   // frame loop's tick body and the cost is a 72-byte copy, while gating it
@@ -372,6 +401,21 @@ void RecordFrame(const TickInputs& in, const TickParams& tp,
       ResolveAuthors(Stream::Explosion, (uint32_t)exps.size());
   w.PodVec(opMeta);
   w.PodVec(expMeta);
+  // ---- the chunk resyncs of this tick (M9.3-C) ---------------------------
+  // Hand-written rather than PodVec because a ChunkReplace holds a vector and
+  // PodVec is a flat memcpy of trivially-copyable elements. Count, then
+  // (wc, rle) per entry. Same "belongs to THIS tick only" rule as the gen
+  // list above, for the same reason.
+  {
+    const std::vector<Frame::ChunkReplace> empty;
+    const std::vector<Frame::ChunkReplace>& reps =
+        (g_replaceTick == in.tick) ? g_replaces : empty;
+    w.U32((uint32_t)reps.size());
+    for (const Frame::ChunkReplace& cr : reps) {
+      w.Bytes(cr.wc, sizeof(cr.wc));
+      w.PodVec(cr.rle);
+    }
+  }
 
   std::vector<uint8_t> frame;
   ByteWriter fw{frame};
@@ -398,7 +442,33 @@ void ResetReplayStats() {
   g_replayFirstRec = 0;
   g_replayFirstNow = 0;
   g_replayWords.clear();
+  g_replayReplaceRefusals = 0;
 }
+
+uint32_t ReplaceChunksIfReplaying(uint32_t tick, ::Stream& stream) {
+  if (!g_replay) return 0;
+  uint32_t applied = 0;
+  for (const Frame& f : g_replay->frames) {
+    if (f.in.tick != tick) continue;
+    std::vector<uint32_t> words(kChunkVol, 0u);
+    for (const Frame::ChunkReplace& cr : f.chunkReplaces) {
+      // THE SAME DECODER THE STORE AND THE WIRE USE (sim/stream.h). One
+      // encoding, one decoding: a replay that decoded differently from the
+      // recording would be a second implementation of the chunk format and
+      // would drift from it silently.
+      if (!RleDecodeChunk(cr.rle.data(), cr.rle.size() / 2, words.data()))
+        continue;
+      if (stream.ReplaceChunk({cr.wc[0], cr.wc[1], cr.wc[2]}, words.data()))
+        applied++;
+      else
+        g_replayReplaceRefusals++;
+    }
+    return applied;
+  }
+  return 0;
+}
+
+uint32_t ReplayChunkReplaceRefusals() { return g_replayReplaceRefusals; }
 
 void ReplaceGasIfReplaying(uint32_t tick, std::vector<GasSpawnOp>& gas) {
   if (!g_replay) return;
@@ -517,6 +587,24 @@ bool Log::Load(const std::string& path, const std::vector<MaterialDef>& mats,
     fr.PodVec(f.genList);
     fr.PodVec(f.opMeta);
     fr.PodVec(f.expMeta);
+    {
+      uint32_t nrep = 0;
+      fr.U32(nrep);
+      // A corrupt count would make this resize to gigabytes before the sticky
+      // `ok` had a chance to fire, so bound it by what the sender could
+      // possibly have written: the in-flight cap (net/chunksync.h) is 4, and
+      // 64 is generous headroom for a future bulk transfer without being a
+      // denial of service.
+      if (fr.ok && nrep <= 64u) {
+        f.chunkReplaces.resize(nrep);
+        for (Frame::ChunkReplace& cr : f.chunkReplaces) {
+          fr.Bytes(cr.wc, sizeof(cr.wc));
+          fr.PodVec(cr.rle);
+        }
+      } else if (nrep > 64u) {
+        fr.ok = false;
+      }
+    }
     if (!fr.ok) {
       err = "malformed frame payload";
       return false;

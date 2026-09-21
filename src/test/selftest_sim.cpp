@@ -18,6 +18,7 @@
 #include "test/selftest.h"
 #include "test/support.h"
 
+#include "net/chunksync.h"  // HashTree + Comparable/ChunkAuthority (chunk-resync)
 #include "sim/oprecord.h"  // the op record + replay (ops-replay gate)
 #include "sim/pagetable.h"
 #include "sim/rng.h"       // rng::Pcg — the CPU twin of the digest fold
@@ -4018,6 +4019,15 @@ Status GateOpsReplay(Ctx& c, std::string& detail) {
   c.ctx.WaitIdle();
   std::vector<uint32_t> hashB;
   for (const ops::Frame& f : log.frames) {
+    // ---- M9.3-C: THE PHASE-B POSITION OF THIS DRIVE LOOP ----------------
+    //
+    // A chunk resync is a per-tick INPUT that is not an op (oprecord.h's
+    // Frame::chunkReplaces), so a replay that only fed ops back would diverge
+    // at the first sync. It goes here for the same reason session.cpp phase B
+    // puts it before stream.Update: before the tick's submit, so the CA of
+    // THIS tick runs on the corrected chunk. A no-op — one pointer test — for
+    // every record this gate itself makes, since the scene never syncs.
+    ops::ReplaceChunksIfReplaying(f.in.tick, c.stream);
     SubmitTick(c.ctx, c.world, c.sim, f.in.tick, f.in.seed, f.ops, f.exps,
                f.cells, f.in.hashEnable != 0,
                {f.in.playerChunk[0], f.in.playerChunk[1], f.in.playerChunk[2]},
@@ -4433,6 +4443,406 @@ Status GateChunkHash(Ctx& c, std::string& detail) {
   return fails.empty() ? Status::Pass : Status::Fail;
 }
 
+// ---- chunk-resync: the hash tree, the authority rule, and the repair -----
+//
+// docs/PLAN_multiplayer_m9.md M9.3-C. Package A gave every chunk a digest;
+// this gate is about what two machines DO with the digests when they differ.
+// Three arms, and each one tests a claim the others cannot:
+//
+//   A  PURE. `net::Comparable`, `net::ChunkAuthority` and `net::HashTree`'s
+//      block arithmetic are functions of two window origins and two player
+//      chunks and nothing else — which is the whole reason ownership can be a
+//      DERIVED fact rather than a negotiated one (net/authority.h). They are
+//      testable with no World at all, so they are tested with no World at all:
+//      a truth table, including the two cases that cost a review finding (a
+//      nearest machine that does not HOLD the chunk must lose, and a chunk on
+//      the window's outermost plane is not comparable at any distance).
+//   B  THE REPAIR. Two arms of the SAME 80-tick scene. The control never
+//      drifts. The subject paints five cells of a buried chunk (a divergence
+//      manufactured exactly the way a dropped op would leave one), watches the
+//      digest move, then installs the control's copy of that chunk through
+//      `Stream::ReplaceChunk` at the phase-B position — and both arms must end
+//      on the SAME WORLD HASH and the same digest.
+//
+//      THE WORLD HASH IS THE CLAIM, not the digest. A digest that came back
+//      would only prove the 4,096 words were restored; the world hash proves
+//      that every side effect a refill has — occupancy, sub-occupancy, the far
+//      indices, the dirty wake, the settled-skip latch — was reproduced too,
+//      which is the plan's kill criterion in one number.
+//   C  THE RECORD. The drift-and-repair run is recorded and replayed. A chunk
+//      replace is a per-tick input that is NOT an op (oprecord.h), so a replay
+//      that did not carry it would diverge at the replace; that this one does
+//      not is what makes a networked session's record worth keeping.
+//
+// The subject chunk is FOUND, not assumed: the gate scans for the deepest
+// buried column at the harness site and reports the chunk's air fraction, so a
+// fixture that stopped being buried says so instead of passing quietly.
+namespace resync {
+
+constexpr uint32_t kSettle = 40;    // ticks before anything happens
+constexpr uint32_t kDriftAt = 41;   // the five drifting cells land here
+constexpr uint32_t kReplaceAt = 56; // ...and the repair here
+constexpr uint32_t kTotal = 80;     // both arms run exactly this many ticks
+constexpr uint32_t kDriftCells = 5;
+
+struct ArmResult {
+  uint32_t finalHash = 0;
+  std::vector<uint32_t> tableAfterSettle;  // digest table at kSettle
+  std::vector<uint32_t> tableBeforeFix;    // ...just before kReplaceAt
+  std::vector<uint32_t> tableFinal;        // ...at kTotal
+  std::vector<uint32_t> capturedWords;     // the chunk's words at kSettle
+};
+
+// The five cells the drift writes, and the palette variant each gets. A
+// PALETTE VARIANT and not a new material: the state nibble is hashed (world.h
+// word layout), so the digest moves, while the material is unchanged so no
+// reaction can fire and no neighbour can be woken into moving. The divergence
+// stays the five voxels it was asked to be, which is what lets arm B's world
+// hash be an equality rather than a tolerance.
+std::vector<CellOp> DriftCells(IVec3 wc, const std::vector<uint32_t>& base) {
+  std::vector<CellOp> out;
+  for (uint32_t i = 0; i < kDriftCells; i++) {
+    const uint32_t li = 1000u + i * 137u;  // scattered, deterministic
+    const IVec3 cell{wc.x * (int)kChunk + (int)(li % kChunk),
+                     wc.y * (int)kChunk + (int)((li / kChunk) % kChunk),
+                     wc.z * (int)kChunk + (int)(li / (kChunk * kChunk))};
+    const uint32_t w = base[li];
+    // XOR one bit of the state nibble: guaranteed to differ from whatever is
+    // there, whichever palette variant worldgen chose, so the fixture cannot
+    // accidentally write the word that was already present.
+    out.push_back({World::SlotCellIndex(cell), w ^ (1u << 13)});
+  }
+  return out;
+}
+
+}  // namespace resync
+
+Status GateChunkResync(Ctx& c, std::string& detail) {
+  using namespace resync;
+  namespace ops = sandvox::opstream;
+  GpuContext& ctx = c.ctx;
+  World& world = c.world;
+  Simulation& sim = c.sim;
+  Stream& stream = c.stream;
+  const IVec3 pc{8, 3, 8};
+
+  std::string fails;
+  auto fail = [&](const std::string& m) {
+    if (!fails.empty()) fails += "; ";
+    fails += m;
+  };
+
+  // ======== ARM A: the pure rules ========================================
+  //
+  // No World, no GPU, no fixture. Every one of these is a claim about the
+  // arithmetic two machines must agree on without talking.
+  {
+    const int n = (int)kNChunk;
+    const IVec3 o0{0, 0, 0};
+    const IVec3 o1{1, 0, 0};  // a peer one chunk to the +x
+    // Comparable: kComparableMargin (2) inside BOTH windows.
+    if (!net::Comparable({10, 10, 10}, o0, o1))
+      fail("Comparable said no for a chunk deep inside both windows");
+    // The outermost plane of MY window. Not comparable at any distance —
+    // §4 finding 1: its CA sees SOLID on one side and real neighbours on the
+    // other, so the two machines are not even SUPPOSED to agree there.
+    if (net::Comparable({0, 10, 10}, o0, o1))
+      fail("Comparable said yes on my window's outermost plane");
+    if (net::Comparable({1, 10, 10}, o0, o1))
+      fail("Comparable said yes one chunk inside the plane (margin is 2)");
+    // Inside mine with margin, but on the PEER's edge.
+    if (net::Comparable({2, 10, 10}, o0, o1))
+      fail("Comparable ignored the peer's margin");
+    if (!net::Comparable({3, 10, 10}, o0, o1))
+      fail("Comparable said no two chunks inside both windows");
+    // ...and past the far face of the peer's window.
+    if (net::Comparable({n - 1, 10, 10}, o0, o1))
+      fail("Comparable said yes past the peer's far face");
+
+    // ChunkAuthority: nearest RESIDENT wins. Peer 1 is nearer in chunks but
+    // does NOT hold the chunk (its window is 40 chunks away), so peer 0 —
+    // farther, but resident — must own it. This is §4 finding 6 and it is the
+    // case plain nearest-player gets wrong.
+    net::AuthorityMemory mem;
+    std::vector<net::PeerView> peers = {
+        {0, {16, 16, 16}, {0, 0, 0}, true},
+        {1, {60, 16, 16}, {40, 0, 0}, true},
+    };
+    if (net::ChunkAuthority({26, 16, 16}, peers, mem) != 0)
+      fail("ChunkAuthority gave a chunk to a peer that does not hold it");
+    // Both resident: nearest wins.
+    peers[1].windowOrigin = {0, 0, 0};
+    peers[1].chunk = {20, 16, 16};
+    if (net::ChunkAuthority({21, 16, 16}, peers, mem) != 1)
+      fail("ChunkAuthority did not pick the nearer resident peer");
+    // A tie goes to the lower id, on BOTH machines, which is what makes the
+    // answer symmetric without a message.
+    peers[1].chunk = {16, 16, 16};
+    if (net::ChunkAuthority({18, 16, 16}, peers, mem) != 0)
+      fail("ChunkAuthority broke a tie against the lower id");
+    // Nobody can reach it -> kNoAuthority, and that is a real answer: a chunk
+    // between two distant players is nobody's and nothing steps it.
+    peers[0].windowOrigin = {0, 0, 0};
+    peers[1].windowOrigin = {0, 0, 0};
+    if (net::ChunkAuthority({500, 16, 16}, peers, mem) != net::kNoAuthority)
+      fail("ChunkAuthority named an owner for a chunk nobody holds");
+
+    // HashTree block arithmetic. The negative case is the whole reason it is a
+    // SHIFT: -1 / 4 is 0 in C++ and would put chunk -1 in block 0, beside
+    // chunk 0, so two blocks would overlap and their sums would be meaningless.
+    if (net::HashTree::BlockOfChunk({-1, -4, 7}).x != -1 ||
+        net::HashTree::BlockOfChunk({-1, -4, 7}).y != -1 ||
+        net::HashTree::BlockOfChunk({-1, -4, 7}).z != 1)
+      fail("HashTree::BlockOfChunk is not an arithmetic shift");
+    // ...and BlockChunk is its inverse over the 64, in the canonical order
+    // (x fastest) both ends index HashChunksMsg::digest with.
+    uint32_t seen = 0;
+    bool roundTrip = true;
+    for (uint32_t i = 0; i < net::kChunksPerBlock; i++) {
+      const IVec3 wc = net::HashTree::BlockChunk({-1, 2, 0}, i);
+      const IVec3 b = net::HashTree::BlockOfChunk(wc);
+      if (b.x != -1 || b.y != 2 || b.z != 0) roundTrip = false;
+      seen++;
+    }
+    if (!roundTrip || seen != net::kChunksPerBlock)
+      fail("HashTree::BlockChunk left its own block");
+    if (net::HashTree::BlockChunk({0, 0, 0}, 1).x != 1 ||
+        net::HashTree::BlockChunk({0, 0, 0}, 4).y != 1 ||
+        net::HashTree::BlockChunk({0, 0, 0}, 16).z != 1)
+      fail("HashTree::BlockChunk is not x-fastest");
+  }
+
+  // ======== find the subject chunk (measured, not assumed) ===============
+  //
+  // The deepest column at the harness site, two chunks under its surface. Two
+  // chunks and not one: the chunk the surface is IN is where the CA still has
+  // work to do, and the resync's whole premise is quiet matter.
+  int bestH = -1, bestX = 0, bestZ = 0;
+  for (int cz = 6; cz <= 12; cz++)
+    for (int cx = 6; cx <= 12; cx++) {
+      const int wx = cx * (int)kChunk + 8, wz = cz * (int)kChunk + 8;
+      const int h = World::TerrainHeight(wx, wz, kDefaultSeed);
+      if (h > bestH) { bestH = h; bestX = wx; bestZ = wz; }
+    }
+  const IVec3 subject{bestX >> 4, (bestH >> 4) - 2, bestZ >> 4};
+  if (subject.y < 2) {
+    detail = Format("no buried chunk at the harness site (best terrain height "
+                    "%d -> chunk y %d)", bestH, subject.y);
+    std::printf("chunk-resync: FAIL (%s)\n", detail.c_str());
+    return Status::Fail;
+  }
+  const uint32_t slot = World::SlotChunkIndex(subject);
+
+  // ======== ARM B: the repair ============================================
+
+  auto readTable = [&](std::vector<uint32_t>& out) {
+    out.assign(kChunkHashWords, 0u);
+    ctx.WaitIdle();
+    rhi::ReadbackBlocking(ctx.device, ctx.queue, world.chunkHash, 0, out.data(),
+                          kChunkHashBytes, "resyncHash");
+  };
+
+  // ONE SCENE, TWO ARMS. `replaceWith` null = the control (no drift, no
+  // repair); non-null = the subject, which drifts at kDriftAt and installs
+  // those words at kReplaceAt. Identical tick counts, identical hash schedule,
+  // identical everything else — which is what makes the final hashes
+  // comparable at all (CLAUDE.md rule 7's "run both arms at the same scope").
+  auto runArm = [&](const std::vector<uint32_t>* replaceWith,
+                    ArmResult& r) {
+    stream.OnRegen();
+    world.SetWindowOrigin({0, 0, 0});
+    SubmitWorldgen(ctx, world, sim, kDefaultSeed);
+    ctx.WaitIdle();
+    std::vector<CellOp> drift;
+    for (uint32_t t = 1; t <= kTotal; t++) {
+      // THE PHASE-B POSITION: before this tick's submit, exactly where
+      // session.cpp installs a live sync, so the CA of tick kReplaceAt runs on
+      // the repaired chunk. Recorded the way phase B records it, which is what
+      // arm C replays.
+      if (replaceWith && t == kReplaceAt) {
+        if (!stream.ReplaceChunk(subject, replaceWith->data())) {
+          fail("ReplaceChunk refused a resident chunk");
+        } else {
+          std::vector<uint32_t> rle;
+          RleEncodeChunk(replaceWith->data(), rle);
+          ops::NoteChunkReplace(t, subject, rle);
+        }
+      }
+      std::vector<CellOp> cells;
+      if (replaceWith && t == kDriftAt) cells = drift;
+      SubmitTick(ctx, world, sim, t, kDefaultSeed, {}, {}, cells,
+                 /*hashEnable=*/true, pc, /*wantReadback=*/false,
+                 /*particlesActive=*/false);
+      if (t == kSettle) {
+        readTable(r.tableAfterSettle);
+        // The authority's copy: the chunk as the control has it, read through
+        // the same synthesis path a sentinel chunk needs (support.h), so a
+        // chunk with no page at all is captured correctly.
+        r.capturedWords.assign(kChunkVol, 0u);
+        ReadVoxelsSync(ctx, world, slot, 1, r.capturedWords.data(), "resyncCap");
+        if (replaceWith == nullptr) drift.clear();
+      }
+      if (t == kDriftAt - 1 && replaceWith != nullptr)
+        drift = DriftCells(subject, r.capturedWords);
+      if (t == kReplaceAt - 1) readTable(r.tableBeforeFix);
+    }
+    readTable(r.tableFinal);
+    r.finalHash = ReadHashSync(ctx, world);
+  };
+
+  // Control first: it is what supplies the "authority copy" the subject arm
+  // installs, and running it first means the subject arm cannot have tainted
+  // the words it is repaired with.
+  ArmResult ctrl;
+  runArm(nullptr, ctrl);
+
+  // How buried is the subject, really? A number, not an assumption — a
+  // fixture that stopped being deep matter would still pass arm B and would
+  // be testing a quiet AIR chunk, which is not the case the resync is for.
+  uint32_t solid = 0;
+  for (uint32_t i = 0; i < kChunkVol; i++)
+    if ((ctrl.capturedWords[i] & 0xFFFu) != 0u) solid++;
+  if (solid * 100u < kChunkVol * 90u)
+    fail(Format("subject chunk (%d,%d,%d) is only %.0f%% solid; the fixture is "
+                "not buried matter",
+                subject.x, subject.y, subject.z,
+                100.0 * solid / (double)kChunkVol));
+
+  // ...and the subject arm, recorded, so arm C has a file.
+  const std::string path = "build/chunk_resync.svops";
+  std::string err;
+  const bool recording = ops::StartRecording(path, kDefaultSeed, c.mats, err);
+  if (!recording)
+    fail("cannot record the repair run: " + err);
+  ArmResult subj;
+  subj.capturedWords = ctrl.capturedWords;  // the authority's copy
+  runArm(&ctrl.capturedWords, subj);
+  const uint32_t recFrames = ops::RecordedFrames();
+  ops::StopRecording();
+
+  // B1: the drift MOVED the digest, and moved exactly the subject's slot.
+  // Without this the repair below could be repairing nothing.
+  std::vector<uint32_t> moved;
+  for (uint32_t i = 0; i < kNumSlots; i++)
+    if (subj.tableBeforeFix[i] != ctrl.tableBeforeFix[i]) moved.push_back(i);
+  if (moved.size() != 1 || moved[0] != slot) {
+    std::string got;
+    for (size_t i = 0; i < moved.size() && i < 6; i++)
+      got += Format("%s%u", i ? "," : "", moved[i]);
+    fail(Format("before the repair the two arms differed in %zu slot(s) [%s]; "
+                "wanted exactly the subject's slot %u",
+                moved.size(), got.c_str(), slot));
+  }
+  // B2: THE REPAIR. The digest is back...
+  if (subj.tableFinal[slot] != ctrl.tableFinal[slot])
+    fail(Format("after the repair the subject's digest is %08x, the control's "
+                "is %08x",
+                subj.tableFinal[slot], ctrl.tableFinal[slot]));
+  // ...and so is every other slot, which is the claim that ReplaceChunk did
+  // not wake something into moving that the control never moved.
+  uint32_t stillDiff = 0, firstDiff = 0;
+  for (uint32_t i = 0; i < kNumSlots; i++)
+    if (subj.tableFinal[i] != ctrl.tableFinal[i]) {
+      if (stillDiff == 0) firstDiff = i;
+      stillDiff++;
+    }
+  if (stillDiff)
+    fail(Format("%u slots still differ after the repair (first %u: %08x vs "
+                "%08x)",
+                stillDiff, firstDiff, subj.tableFinal[firstDiff],
+                ctrl.tableFinal[firstDiff]));
+  // B3: THE KILL CRITERION. The whole world hash, not just the chunk: if this
+  // fails while B2 passes, the replace path is missing one of FillSlots's side
+  // effects (occupancy, sub-occupancy, the wake, the far indices) and the
+  // plan says find which, not widen the test.
+  if (subj.finalHash != ctrl.finalHash)
+    fail(Format("world hash after the repair %08x != control %08x — a "
+                "FillSlots side effect is missing from ReplaceChunk",
+                subj.finalHash, ctrl.finalHash));
+  if (stream.ChunkReplacesApplied() == 0)
+    fail("Stream reported no chunk replaces at all");
+
+  // ======== ARM C: the record replays ====================================
+  //
+  // A chunk replace is a per-tick input that is not an op. Feed the record
+  // back and require the same final hash — which can only happen if
+  // ReplaceChunksIfReplaying re-applied the replace at the same point, since
+  // without it the replay runs the drift and never repairs it.
+  uint32_t replayHash = 0, replayReplaces = 0;
+  uint32_t replayFrames = 0;
+  if (recording) {
+    ops::Log log;
+    if (!log.Load(path, c.mats, err)) {
+      fail("the repair record refused on load: " + err);
+    } else {
+      struct ReplayArm {
+        explicit ReplayArm(const ops::Log* l) {
+          ops::ResetReplayStats();
+          ops::SetReplay(l);
+        }
+        ~ReplayArm() { ops::SetReplay(nullptr); }
+      } arm(&log);
+      stream.OnRegen();
+      world.SetWindowOrigin({0, 0, 0});
+      SubmitWorldgen(ctx, world, sim, log.header.seed);
+      ctx.WaitIdle();
+      for (const ops::Frame& f : log.frames) {
+        replayReplaces += ops::ReplaceChunksIfReplaying(f.in.tick, stream);
+        SubmitTick(ctx, world, sim, f.in.tick, f.in.seed, f.ops, f.exps,
+                   f.cells, f.in.hashEnable != 0,
+                   {f.in.playerChunk[0], f.in.playerChunk[1],
+                    f.in.playerChunk[2]},
+                   f.in.wantReadback != 0, f.in.particlesActive != 0, f.spawns,
+                   f.in.farCount, f.fluid, f.in.fluidLive,
+                   f.in.hasSplashMat ? f.in.fluidSplashMat : nullptr,
+                   f.in.vizActive != 0);
+      }
+      replayFrames = (uint32_t)log.frames.size();
+      replayHash = ReadHashSync(ctx, world);
+      if (replayReplaces != 1)
+        fail(Format("the replay applied %u chunk replaces, the record has 1",
+                    replayReplaces));
+      if (ops::ReplayChunkReplaceRefusals() != 0)
+        fail(Format("the replay refused %u chunk replaces as non-resident",
+                    ops::ReplayChunkReplaceRefusals()));
+      if (replayHash != subj.finalHash)
+        fail(Format("replay hash %08x != the run it recorded %08x", replayHash,
+                    subj.finalHash));
+    }
+  }
+
+  // Informational pins, the way ops-replay treats its byte size: they REPORT
+  // rather than fail, because a block count moves with the window's contents.
+  RecordObserved("chunkResyncSolidPct",
+                 100.0 * solid / (double)kChunkVol);
+  RecordObserved("chunkResyncFrames", (double)recFrames);
+
+  // Leave the world regenerated: this gate ran 240 ticks over three arms and
+  // the gates after it inherit whatever it leaves (selftest.h's ordering note).
+  stream.OnRegen();
+  world.SetWindowOrigin({0, 0, 0});
+  SubmitWorldgen(ctx, world, sim, kDefaultSeed);
+  ctx.WaitIdle();
+
+  char buf[832];
+  std::snprintf(buf, sizeof(buf),
+                "%s (subject chunk (%d,%d,%d) slot %u, %.0f%% solid | drift "
+                "moved %zu slot | repaired: digest %08x -> %08x (control "
+                "%08x), world hash %08x == control | replay %u frames, %u "
+                "replace, hash %08x | Stream applied %llu refused %llu%s%s)",
+                fails.empty() ? "PASS" : "FAIL", subject.x, subject.y,
+                subject.z, slot, 100.0 * solid / (double)kChunkVol,
+                moved.size(), subj.tableBeforeFix[slot], subj.tableFinal[slot],
+                ctrl.tableFinal[slot], subj.finalHash, replayFrames,
+                replayReplaces, replayHash,
+                (unsigned long long)stream.ChunkReplacesApplied(),
+                (unsigned long long)stream.ChunkReplacesRefused(),
+                fails.empty() ? "" : " | ", fails.c_str());
+  detail = buf;
+  std::printf("chunk-resync: %s\n", buf);
+  return fails.empty() ? Status::Pass : Status::Fail;
+}
+
 }  // namespace
 
 const std::vector<Gate>& SimGates() {
@@ -4442,6 +4852,7 @@ const std::vector<Gate>& SimGates() {
       {"determinism", "sim", {}, false, GateDeterminism},
       {"ops-replay", "sim", {}, false, GateOpsReplay},
       {"chunk-hash", "sim", {}, false, GateChunkHash},
+      {"chunk-resync", "sim", {}, false, GateChunkResync},
       {"sleep", "sim", {}, false, GateSleep},
       {"evaporation", "sim", {}, false, GateEvaporation},
       {"blood-stain", "sim", {}, false, GateBloodStain},

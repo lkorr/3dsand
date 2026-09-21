@@ -13181,6 +13181,48 @@ every emitter and by the island scan of chunks the machine does not own;
 `debris-ghost`). None of it is wired to the wire yet; that is M9.3-B/C and
 M9.4-D.
 
+**M9.3-C — the convergence half (`src/net/chunksync.*`, landed 2026-09-21).**
+Determinism keeps two machines equal only for chunks BOTH hold and only while
+nothing is dropped; the divergences that remain are real (a chunk one machine
+does not hold, an op stream whose caps bit at different points, a window edge
+where the CA is not supposed to agree, and any future defect). So there is now
+an alarm and a repair. Every hash tick each machine publishes `HashBlocks`: one
+wrapping sum per **4×4×4 block of chunks**, emitted only for blocks whose 64
+chunks are all `net::Comparable` under BOTH window origins **as of that hash
+tick** (each side keeps a tick-keyed ring of its own origin and of the peer's,
+the peer's read off `PlayerState.windowOrigin`, because a comparison at tick H
+run against the origins of tick H+20 compares chunks that were never
+comparable). A differing sum draws a `HashDrill`, which returns the block's 64
+digests; a differing digest whose `net::ChunkAuthority` is the peer draws a
+`ChunkRequest`; the authority answers `ChunkSync` slices of the same RLE the
+store and the eviction path use, and the receiver installs them through
+`Stream::ReplaceChunk` at the **phase-B position** of the next tick — before
+`stream.Update`, so that tick's CA runs on the corrected chunk. When the local
+machine is the authority the local copy wins and nothing is asked for: both
+sides compute the same pure function, so exactly one of them asks. ≤ 4 chunks
+in flight, nearest to the local player first.
+
+`Stream::ReplaceChunk` is `FillSlots`'s store-hit branch FACTORED
+(`InstallChunkWords`), not a reimplementation — that branch has eleven side
+effects (classify / page / upload / table flush / far-edit and far-plume
+indices / `RefilledSlot` / occupancy / sub-occupancy / both dirty pages /
+`NoteWakeAll`) and the `chunk-resync` gate's kill criterion is the whole WORLD
+HASH returning to a control arm's, which only happens if every one of them
+runs. A replace is also the third per-tick input that is not an op
+(`Frame::chunkReplaces`, `kRecordVersion` 3), applied on replay by
+`ReplaceChunksIfReplaying` at the same position in both drive loops.
+
+**ONLY QUIET CHUNKS ARE COMPARED OR SHIPPED**: `QuietTicks(slot) >=
+kSnapshotLatency + kOpDelayTicks`, checked by the AUTHORITY when it receives a
+request (a `ChunkBusy` reply is a back-off, and the requester re-detects next
+hash tick). That rule is load-bearing three times over: it makes the two
+machines' differently-timed digest tables comparable without either keeping a
+history; it keeps the alarm from ringing for matter that is still settling;
+and it is **the argument behind the one KNOWN GAP** — a replaced chunk's
+in-flight particles, gas and MPM matter are NOT flushed, and what says there
+are none is that nothing has been dirty there for K + D ticks. A future package
+that ships a BUSY chunk (a late-join bulk transfer) owes a flush of all three.
+
 **M9 proper (`docs/PLAN_multiplayer_m9.md`, plan of record 2026-09-20).** The
 audit under-stated one number: the residency window is `kWorldN` ×
 `kVoxelMeters` = a **51.2 m cube**, so two players walking independently leave
