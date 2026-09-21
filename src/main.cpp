@@ -54,6 +54,12 @@
 #include "gpu/vk_smoke.h"
 #include "lab/lab.h"
 #include "math3d.h"
+// M9.2-C: the game talks to ONE peer. net/link.h is the transport (package A),
+// net/protocol.h the message set and the lockstep pacer; the peer's BODY is a
+// RemotePlayer ghost (package B), reached through game/session.h which already
+// includes game/remoteplayer.h.
+#include "net/link.h"
+#include "net/protocol.h"
 #include "phys/debris.h"
 #include "phys/physics.h"
 #include "sim/farfield.h"
@@ -274,6 +280,23 @@ int HarnessTicksPerFrame() {
     return std::max(0, std::min(std::atoi(s), World::kMaxTicksPerFrame));
   }();
   return n;
+}
+// ---- SANDVOX_NET_SMOKE_EXIT_ON_PEER_DONE=1: THE TWO-PROCESS SMOKE'S FULL STOP
+//
+// Same family as the switch above, and it exists for the same reason: a
+// harness has to be able to END. The M9.2 smoke runs a host at --frames 900
+// and a client at --frames 600 so the CLIENT is the one that finishes first;
+// with lockstep pacing the host is then stalled forever on batches that will
+// never arrive, and the run has to be killed rather than exiting 0. Set, a
+// --frames host closes the window the moment its peer disconnects, so the
+// smoke ends on its own and both processes reach their exit report.
+//
+// Deliberately NOT the default: a listen server whose player quits for a
+// moment should go back to listening, not shut the world down. Only the
+// harness wants a peer's departure to be terminal.
+bool NetSmokeExitOnPeerDone() {
+  static const bool on = std::getenv("SANDVOX_NET_SMOKE_EXIT_ON_PEER_DONE") != nullptr;
+  return on;
 }
 bool g_autofly = false;
 bool g_autoflyHard = false;  // --autofly-hard: adversarial traversal for pool sizing
@@ -4153,6 +4176,19 @@ int main(int argc, char** argv) {
   // loop pointed at a file the game wrote instead of a scene the gate scripted.
   std::string recordOpsPath;
   std::string replayOpsPath;
+  // ---- M9.2-C: --host [port] / --join <ip[:port]> ------------------------
+  // Two exes, one world. --host is a LISTEN SERVER: it opens the port at boot
+  // and keeps playing single-player until somebody connects, so a host is a
+  // normal game that happens to be joinable. --join BLOCKS at boot until the
+  // handshake answers, because there is nothing sensible to do with a world
+  // the host may be about to refuse (a different tuning.json, a different
+  // seed) — see the boot block below "THE GAME TALKS TO ONE PEER".
+  //
+  // netPort 0 with hosting on means "the OS picks", which TcpLink::Listen
+  // supports and ListenPort() reads back; the default is 7777.
+  bool netHost = false;
+  std::string netJoinIp;
+  uint16_t netPort = 7777;
   uint32_t replayTicks = 0;  // --ticks N: stop the replay after N frames
   selftest::Options stOpt;
   for (int i = 1; i < argc; i++) {
@@ -4230,6 +4266,9 @@ int main(int argc, char** argv) {
           "  --vk-validation       Enable VK_LAYER_KHRONOS_validation + sync\n"
           "  --barriers=sledgehammer  Full barrier oracle (§6.2)\n"
           "  --barriers=precise    Precise barriers (default)\n\n"
+          "Multiplayer (M9.2 — two players, one world):\n"
+          "  --host [port]         Listen for one peer (default 7777); play meanwhile\n"
+          "  --join <ip[:port]>    Connect to a host and share its tick clock\n\n"
           "Misc:\n"
           "  --adapter low         Select low-power (iGPU) adapter\n"
           "  --noaudio             Disable audio\n"
@@ -4280,6 +4319,28 @@ int main(int argc, char** argv) {
     else if (a == "--frames") {
       if (i + 1 >= argc) { std::fprintf(stderr, "--frames requires a count\n"); return 1; }
       g_harnessFrames = (uint64_t)std::atoll(argv[++i]);
+    }
+    // ---- MULTIPLAYER (docs/PLAN_multiplayer_m9.md M9.2) -------------------
+    // `--host` takes an OPTIONAL port, so the `argv[i+1][0] != '-'` guard is
+    // the same one --lab and --fluid-bench use: `--host --frames 900` has to
+    // mean "default port", not "port --frames".
+    else if (a == "--host") {
+      netHost = true;
+      if (i + 1 < argc && argv[i + 1][0] != '-')
+        netPort = (uint16_t)std::atoi(argv[++i]);
+    }
+    // `--join <ip>` or `--join <ip>:<port>`. The port rides in the one
+    // argument because that is how a person copies an address out of a chat
+    // window; a separate --join-port would be a second thing to get wrong.
+    else if (a == "--join") {
+      if (i + 1 >= argc) { std::fprintf(stderr, "--join requires <ip[:port]>\n"); return 1; }
+      std::string addr = argv[++i];
+      const size_t colon = addr.rfind(':');
+      if (colon != std::string::npos) {
+        netPort = (uint16_t)std::atoi(addr.c_str() + colon + 1);
+        addr.resize(colon);
+      }
+      netJoinIp = addr;
     }
     // `--shot-inventory` is the character screen's look-iteration harness: run
     // the windowed game, spawn and damage the avatar on a fixed schedule, open
@@ -6626,10 +6687,400 @@ int main(int argc, char** argv) {
   // so the vectors keep their capacity across ticks.
   OpBatch opBatch;
 
+  // ================== THE GAME TALKS TO ONE PEER (M9.2-C) ===================
+  //
+  // docs/PLAN_multiplayer_m9.md M9.2, package C. Packages A and B built the
+  // two halves this block joins: `net::TcpLink` + the message set + the
+  // `LockstepPacer` (src/net/), and the `RemotePlayer` ghost the four guarded
+  // seams of `TickAuthority` already know how to walk (game/remoteplayer.h).
+  // Nothing here is new mechanism; it is the WIRING, and the wiring is where
+  // the three rules of the model get honoured or broken:
+  //
+  //  1. NO `TickInput` CROSSES THE WIRE. What goes out is the OUTCOME of a
+  //     tick — one `PlayerState` — because the peer is authoritative for its
+  //     own controller and this machine has no collision source for a body
+  //     twelve chunks away (M9.1 P3 proved exactly that).
+  //  2. SEND BEFORE WAIT. At local tick T the batch labelled T+D goes out, and
+  //     only then does T+1 wait for the peer's batch labelled T+1. Both sides
+  //     doing the reverse is the deadlock of §4 finding 5. The pacer states
+  //     this as three invariants and the ONLY send site below is the
+  //     `while (pacer.ShouldSend())` loop, so the pre-send at connect and the
+  //     steady state are literally the same code.
+  //  3. A BATCH EVERY TICK, EMPTY OR NOT. "No ops" and "not arrived" have to
+  //     be different observations. There are no ops until M9.3, so today every
+  //     batch is a header plus 108 bytes of `PlayerState` — and it still goes
+  //     out on every single tick.
+  //
+  // ZERO COST WHEN NOBODY IS NETWORKED. Every line below is behind
+  // `netRoleBoot != NetRole::None`, `tickCtx.remotes` stays null, and the one
+  // in-loop test on the tick path is a `bool`. That is the package's
+  // acceptance criterion, not a micro-optimisation: the `--record-ops` stream
+  // of a plain `--frames 600 --autofly-hard` run has to be BYTE-IDENTICAL to
+  // the pre-package oracle, and a single extra op or a single reordered one
+  // would show up as a differing byte.
+  enum class NetRole { None, Host, Client };
+  const NetRole netRoleBoot = netHost      ? NetRole::Host
+                              : !netJoinIp.empty() ? NetRole::Client
+                                                   : NetRole::None;
+  // BY POINTER, and that is load-bearing. `LinkBase::Fail` LATCHES: once a
+  // peer drops, `failed_` is set for the life of the object, `Poll()` returns
+  // immediately and `Send` refuses — there is no Reset in package A's API. A
+  // listen server that goes back to listening after its player quits
+  // therefore needs a FRESH TcpLink, and re-seating a unique_ptr is how a
+  // caller gets one without a one-line addition to net/link.h.
+  std::unique_ptr<net::TcpLink> link;
+  net::LockstepPacer pacer;
+  // The peers' bodies. Borrowed by TickAuthorityCtx below; cleared on
+  // disconnect and at shutdown, because a ghost owns real Jolt bodies.
+  RemotePlayers remotes;
+  // Handshake complete and the pacer owns the tick gate. Distinct from
+  // `link->Connected()`: a TCP connection with no HelloAck behind it must not
+  // stall the world, and a host is playing normally long before anyone joins.
+  bool netPaced = false;
+  // The host is player 0 and the client player 1, assigned by the HelloAck.
+  // `MakePlayerState` fills `playerId` from the SESSION INDEX, which is 0 on
+  // both machines, so the wire id is stamped over it at send time — otherwise
+  // both ghosts would key on 0 and the client would upsert a ghost for itself.
+  uint32_t netMyId = 0, netPeerId = 1;
+
+  // ---- WHAT ARRIVED, BY LABEL, NOT YET CONSUMED -------------------------
+  //
+  // A GHOST MUST NOT JUMP AHEAD. Batches run D ticks in front of the tick
+  // being simulated (that is what D buys), so the `PlayerState` in the batch
+  // labelled T+D describes a body D ticks in the peer's future relative to
+  // the world this machine is about to step. Applying it on arrival would put
+  // the ghost four ticks ahead of every local body it can collide with and
+  // make it visibly rubber-band. So states are QUEUED by label and applied in
+  // the tick whose label they carry, and the map is pruned as ticks run.
+  //
+  // std::map and not unordered_map: it never holds more than D+1 entries, and
+  // the ordered erase-up-to-and-including-T below is one call on a map and a
+  // scan on a hash table.
+  struct NetPending {
+    PlayerState st{};
+    bool haveState = false;
+    float timeScale = 1.0f;   // the SENDER's, applied on the client only
+    uint32_t vizActive = 0;
+  };
+  std::map<uint32_t, NetPending> netQueue;
+
+  // Counters for the HUD and for the `--frames` exit report.
+  uint64_t netBatchesSent = 0, netBatchesRecv = 0, netStalls = 0;
+  uint64_t netLate = 0, netDisconnects = 0;
+  int netMaxLag = 0;
+  // Byte totals SURVIVE the link. A disconnect re-seats the unique_ptr with a
+  // fresh TcpLink whose stats start at zero, so the exit report would
+  // otherwise only ever describe the last connection.
+  uint64_t netBytesInPrev = 0, netBytesOutPrev = 0;
+
+  // THE HANDSHAKE'S IDENTITY: every fact that must be identical for two
+  // machines to simulate the same world. Built from what this file already
+  // printed at boot — the environment stamp, the tuning stamp — plus the seed
+  // and the material table's hash, which is the SAME hash the op record's
+  // header refuses a replay on. Everything else (kWorldN, kChunk,
+  // kVoxelMeters, sizeof(TickParams), the protocol/record/tickinput versions)
+  // is compiled in by `net::LocalHello`, which is the point: those are exactly
+  // the fields a hand-filled Hello gets subtly wrong on one side.
+  auto netLocalHello = [&](uint32_t myId) {
+    return net::LocalHello(
+        (uint32_t)kDefaultSeed, (uint32_t)mats.size(),
+        sandvox::opstream::MaterialTableHash(mats), tuneStamp.tuning,
+        tuneStamp.materials, tuneStamp.reactions, envStamp.map,
+        envStamp.biomes, envStamp.trees, envStamp.mapName, myId);
+  };
+
+  // ---- ONE OUTGOING BATCH -----------------------------------------------
+  //
+  // `label` is the tick the PEER will run when it consumes this; the
+  // `PlayerState` inside is the FRESHEST outcome this machine has, i.e. the
+  // tick it just finished. Those are deliberately different numbers. Sending
+  // a state stamped with the label would be inventing a position four ticks
+  // into our own future; sending the newest state under a future label is the
+  // honest statement "by the time you run T+D, this is where I was at T", and
+  // it is what makes D a JITTER BUDGET rather than a prediction.
+  auto netSendBatch = [&](uint32_t label) {
+    if (!link) return;
+    net::TickBatchWire w;
+    w.h.tick = label;
+    w.h.playerId = netMyId;
+    const IVec3 wo = world.WindowOrigin();
+    w.h.windowOrigin[0] = wo.x;
+    w.h.windowOrigin[1] = wo.y;
+    w.h.windowOrigin[2] = wo.z;
+    // The two HASHED presentation inputs (session.cpp phase L11): the
+    // celestial time scale and the dirty-voxel viz. They ride the batch so the
+    // host's clock is the world's clock — see the client-side apply below.
+    w.h.timeScale = ui.timeScale;
+    w.h.vizActive = ui.showDirtyVoxels ? 1u : 0u;
+    PlayerState st = MakePlayerState(session, tick, wo);
+    st.playerId = netMyId;
+    w.playerState.resize(sizeof(PlayerState));
+    std::memcpy(w.playerState.data(), &st, sizeof st);
+    std::vector<uint8_t> buf;
+    w.Encode(buf);
+    link->Send((uint16_t)net::MsgType::TickBatch, net::kProtocolVersion,
+               buf.data(), buf.size());
+    netBatchesSent++;
+  };
+
+  // ---- CONNECT: RESET THE PACER AND LET IT DO THE PRE-SEND ---------------
+  //
+  // There is NO separate pre-send path, by design (protocol.h invariant 3):
+  // `Reset` puts `sent` behind by D+1 and the same `while (ShouldSend())` loop
+  // the tick path uses emits T0..T0+D. A hand-written "send D batches" here
+  // would be a second implementation of the send rule and would drift from it
+  // the first time D moved.
+  auto netStartPacing = [&](uint32_t startTick) {
+    pacer.Reset(startTick);
+    netQueue.clear();
+    netPaced = true;
+    while (pacer.ShouldSend()) {
+      const uint32_t t = pacer.NextToSend();
+      netSendBatch(t);
+      pacer.NoteSent(t);
+    }
+    link->Poll();   // push the pre-send out now, not a frame from now
+  };
+
+  // ---- LOSE THE PEER: FREE-RUN, AND KEEP NOTHING OF IT -------------------
+  auto netDrop = [&](const char* why) {
+    netDisconnects++;
+    netBytesInPrev += link->Stats().bytesIn;
+    netBytesOutPrev += link->Stats().bytesOut;
+    std::printf("net: peer lost at tick %u (%s) -- free-running\n", tick, why);
+    std::fflush(stdout);
+    // The avatar list MobSystem resolves an actor id through is INDEX-ALIGNED
+    // with the ghost list, and `RemotePlayers::Clear` cannot fix it: phase H's
+    // re-sync is guarded on a NON-EMPTY ghost list, so clearing to empty would
+    // leave MobSystem holding a pointer to a PlayerAvatar that no longer
+    // exists. Restore the single-avatar registration this file made at boot.
+    remotes.Clear(phys);
+    mobs.SetAvatar(&session.avatar);
+    netQueue.clear();
+    netPaced = false;
+    pacer = net::LockstepPacer{};
+    if (netRoleBoot == NetRole::Host) {
+      // Back to listening on the same port with a fresh link (see the
+      // unique_ptr note above: the failure latch has no reset).
+      link = std::make_unique<net::TcpLink>();
+      if (!link->Listen(netPort)) {
+        std::printf("net: re-listen failed: %s\n", link->Error().c_str());
+        link.reset();
+      } else {
+        std::printf("net: listening again on 127.0.0.1:%u\n",
+                    (unsigned)link->ListenPort());
+      }
+    } else {
+      link.reset();   // a client has nothing to re-listen for
+    }
+    // The two-process smoke's full stop; see NetSmokeExitOnPeerDone().
+    if (NetSmokeExitOnPeerDone() && g_harnessFrames > 0 && window)
+      glfwSetWindowShouldClose(window, 1);
+  };
+
+  // ---- THE ONE SOCKET TOUCH OF THE FRAME --------------------------------
+  //
+  // Accept / read / flush, then drain every fully framed message. Called ONCE
+  // per frame and BEFORE the tick loop, so a batch that arrived while we were
+  // rendering unblocks this frame's ticks instead of next frame's — with D=4
+  // at 30 Hz there is only ~133 ms of slack and a frame of added latency eats
+  // a quarter of it.
+  auto netPump = [&]() {
+    if (!link) return;
+    link->Poll();
+    net::Msg m;
+    while (link->Recv(m)) {
+      switch ((net::MsgType)m.type) {
+        // ---- HOST SIDE OF THE HANDSHAKE ---------------------------------
+        case net::MsgType::Hello: {
+          if (netRoleBoot != NetRole::Host || netPaced) break;
+          net::Hello theirs;
+          if (!theirs.Decode(m.payload.data(), m.payload.size())) break;
+          const net::Hello mine = netLocalHello(0);
+          if (const char* bad = net::Hello::FirstMismatch(mine, theirs)) {
+            // NAME THE FIELD. A refusal carrying only "incompatible" is what
+            // makes a user re-copy their whole assets directory to fix a
+            // tuning.json. Flush it before the peer goes away.
+            net::HelloRefuse r{bad};
+            std::vector<uint8_t> b;
+            r.Encode(b);
+            link->Send((uint16_t)net::MsgType::HelloRefuse,
+                       net::kProtocolVersion, b.data(), b.size());
+            link->Poll();
+            std::printf("net: refusing peer: %s\n", bad);
+            std::fflush(stdout);
+            break;
+          }
+          // THE HOST'S TICK COUNTER IS THE CLOCK. `startTick` is the next tick
+          // this loop will run, so both machines' first paced tick has the
+          // same number and every batch label means the same thing on both.
+          netMyId = 0;
+          netPeerId = 1;
+          net::HelloAck ack;
+          ack.startTick = tick + 1;
+          ack.yourPlayerId = netPeerId;
+          std::vector<uint8_t> b;
+          ack.Encode(b);
+          link->Send((uint16_t)net::MsgType::HelloAck, net::kProtocolVersion,
+                     b.data(), b.size());
+          netStartPacing(ack.startTick);
+          std::printf("net: peer joined as player %u, start tick %u\n",
+                      netPeerId, ack.startTick);
+          std::fflush(stdout);
+          break;
+        }
+        // ---- THE STEADY STATE -------------------------------------------
+        case net::MsgType::TickBatch: {
+          if (!netPaced) break;
+          net::TickBatchWire w;
+          if (!w.Decode(m.payload.data(), m.payload.size())) break;
+          netBatchesRecv++;
+          pacer.NotePeerBatch(w.h.tick);
+          netMaxLag = std::max(netMaxLag, pacer.Lag());
+          // A LABEL WE HAVE ALREADY RUN CANNOT BE APPLIED. `pacer.localTick`
+          // is the tick about to run, so anything below it describes a world
+          // state this machine has already stepped past; applying it would
+          // teleport the ghost backwards. Counted rather than silently
+          // dropped: with TCP and a correct pre-send this number must stay 0,
+          // and a non-zero `late=` in the exit report is the pacing bug's
+          // first symptom.
+          if (w.h.tick < pacer.localTick) {
+            netLate++;
+            break;
+          }
+          NetPending& q = netQueue[w.h.tick];
+          q.timeScale = w.h.timeScale;
+          q.vizActive = w.h.vizActive;
+          if (w.playerState.size() == sizeof(PlayerState)) {
+            std::memcpy(&q.st, w.playerState.data(), sizeof(PlayerState));
+            // A version the handshake did not refuse but this struct cannot
+            // read is still not readable. Better one motionless ghost than a
+            // body standing at fields read at the wrong offsets.
+            q.haveState = (q.st.version == kPlayerStateVersion);
+          }
+          break;
+        }
+        default:
+          break;
+      }
+    }
+    // ---- DISCONNECT (§4 finding 5: 3 s silence -> local authority) -------
+    // Two doors: the socket itself failed (`Error()` is the latch `DropPeer`
+    // set, and it covers a clean FIN as "peer closed" too), or the peer went
+    // quiet. The silence test measures BYTES, not messages, so a peer part-way
+    // through a large transfer is not declared dead; it only runs while paced,
+    // because a listening host with no peer has been silent since boot.
+    if (link) {
+      const bool broken = !link->Error().empty();
+      const bool silent =
+          netPaced &&
+          net::NowSeconds() - link->Stats().lastRecvSeconds > 3.0;
+      if (broken || silent)
+        netDrop(broken ? link->Error().c_str() : "3 s silence");
+    }
+  };
+
+  // ---- BOOT: OPEN THE PORT, OR JOIN AND BLOCK ---------------------------
+  if (netRoleBoot == NetRole::Host) {
+    // A LISTEN SERVER. The world is already generated and the frame loop is
+    // about to start; hosting adds a socket and nothing else, so a host plays
+    // a completely normal single-player game until somebody arrives.
+    link = std::make_unique<net::TcpLink>();
+    if (!link->Listen(netPort)) {
+      std::fprintf(stderr, "net: cannot listen on %u: %s\n", (unsigned)netPort,
+                   link->Error().c_str());
+      return 2;
+    }
+    std::printf("net: hosting on 127.0.0.1:%u (player 0), waiting for a peer\n",
+                (unsigned)link->ListenPort());
+    std::fflush(stdout);
+  } else if (netRoleBoot == NetRole::Client) {
+    // AND A CLIENT BLOCKS. There is nothing sensible to do with a world the
+    // host may be about to refuse — a different seed, a different
+    // tuning.json — and the alternative (start playing, then jump the tick
+    // counter when the ack lands) is a visible world discontinuity for
+    // exactly the case where the join succeeds.
+    link = std::make_unique<net::TcpLink>();
+    if (!link->Connect(netJoinIp, netPort)) {
+      std::fprintf(stderr, "net: cannot connect to %s:%u: %s\n",
+                   netJoinIp.c_str(), (unsigned)netPort,
+                   link->Error().c_str());
+      return 2;
+    }
+    const net::Hello mine = netLocalHello(1);
+    bool sentHello = false, acked = false;
+    const double tJoin0 = NowSeconds();
+    while (!acked) {
+      link->Poll();
+      if (!link->Error().empty()) {
+        std::fprintf(stderr, "net: join failed: %s\n", link->Error().c_str());
+        return 2;
+      }
+      if (link->Connected() && !sentHello) {
+        std::vector<uint8_t> b;
+        mine.Encode(b);
+        link->Send((uint16_t)net::MsgType::Hello, net::kProtocolVersion,
+                   b.data(), b.size());
+        link->Poll();
+        sentHello = true;
+      }
+      net::Msg m;
+      while (link->Recv(m)) {
+        if ((net::MsgType)m.type == net::MsgType::HelloRefuse) {
+          net::HelloRefuse r;
+          r.Decode(m.payload.data(), m.payload.size());
+          // THE FIELD, NOT "incompatible". This is the line a user acts on.
+          std::printf("net: refused: %s\n", r.field.c_str());
+          std::fflush(stdout);
+          return 2;
+        }
+        if ((net::MsgType)m.type == net::MsgType::HelloAck) {
+          net::HelloAck ack;
+          if (!ack.Decode(m.payload.data(), m.payload.size())) {
+            std::fprintf(stderr, "net: malformed HelloAck\n");
+            return 2;
+          }
+          netMyId = ack.yourPlayerId;
+          netPeerId = 0;   // the host is always player 0
+          // THE HOST'S COUNTER IS THE CLOCK. `tick` is set one BELOW the start
+          // tick because the accumulator loop increments before it runs, so
+          // the first paced tick on this machine is exactly `startTick`.
+          tick = ack.startTick - 1;
+          netStartPacing(ack.startTick);
+          acked = true;
+          break;
+        }
+      }
+      if (acked) break;
+      if (NowSeconds() - tJoin0 > 10.0) {
+        std::fprintf(stderr, "net: join timed out after 10 s (no HelloAck from "
+                             "%s:%u)\n",
+                     netJoinIp.c_str(), (unsigned)netPort);
+        return 2;
+      }
+      // 2 ms, not a spin: the host may still be booting its device and this
+      // loop has nothing else to do with the CPU.
+      std::this_thread::sleep_for(std::chrono::milliseconds(2));
+    }
+    std::printf("net: joined %s:%u as player %u, start tick %u\n",
+                netJoinIp.c_str(), (unsigned)netPort, netMyId, tick + 1);
+    std::fflush(stdout);
+  }
+  // THE GHOST LIST REACHES THE TICK ONLY WHEN THERE IS A NETWORK. Null
+  // otherwise, which is what keeps phases B / H / I / O making exactly the
+  // calls they made before package B landed.
+  if (netRoleBoot != NetRole::None) tickCtx.remotes = &remotes;
+
   uint64_t frameCounter = 0;
   StartupMark("frame loop entered");
   uint64_t startupFrame = 0;
   while (!glfwWindowShouldClose(window)) {
+    // M9.2-C: THE FRAME'S ONE SOCKET TOUCH, and it is before the tick loop
+    // (and before the harness's own exit check, so a peer that quit is
+    // observed on the frame it quit). Accepts, reads, flushes, decodes every
+    // arrived batch into the pacer and the label queue, and handles the
+    // disconnect. No-op when nothing is networked: `link` is null.
+    if (link) netPump();
     if (g_harnessFrames > 0) {
       frameCounter++;
       // The mid-run reload verifies the F5 path, but it also recompiles every
@@ -8431,6 +8882,27 @@ int main(int argc, char** argv) {
           break;
         }
       }
+      // ---- M9.2-C: THE LOCKSTEP GATE --------------------------------
+      //
+      // The third pacing case, beside `fixedTicksPerFrame` and the GPU-lag
+      // throttle above. `pacer.localTick` is the tick about to run and equals
+      // `tick + 1` (the increment is three lines down), so this asks exactly
+      // "has the peer's batch for the tick I am about to simulate arrived?".
+      //
+      // BREAK, NOT BLOCK, and the accumulator is NOT touched: the world owes
+      // this tick and will run it as soon as the batch lands, while the frame
+      // keeps rendering, keeps polling and keeps the window responsive. The
+      // 4-tick cap at the top of the frame already bounds how much debt can
+      // accrue, so a slow peer makes this machine LAG rather than fast-forward
+      // through a burst when it catches up.
+      //
+      // It cannot deadlock: our own batch for T+D went out at T, before this
+      // wait at T+1 (protocol.h invariant 1), and a batch goes out every tick
+      // whether or not it carries anything.
+      if (netPaced && !pacer.CanRun(tick + 1)) {
+        netStalls++;
+        break;
+      }
       accumulator -= kTickDt;
       if (ui.paused && !ui.stepOnce) break;
       ui.stepOnce = false;
@@ -8487,9 +8959,59 @@ int main(int argc, char** argv) {
       const TickInput ti =
           feeder.Consume(cam.FlatForward(), cam.Right(), cam.Forward());
       tickCtx.frameTime = now;
+
+      // ---- M9.2-C: WHAT THE PEER SAID ABOUT *THIS* TICK ------------------
+      //
+      // Applied HERE, immediately before the tick that carries the label, and
+      // never on arrival — a batch labelled T lands up to D ticks early and
+      // applying it then would run the ghost four ticks ahead of every local
+      // body it can stand on or be hit by.
+      if (netPaced) {
+        const auto it = netQueue.find(tick);
+        if (it != netQueue.end()) {
+          if (it->second.haveState) {
+            // Upsert, not Find: the ghost is CREATED by its first state, so
+            // the spawn happens on the tick that first has somewhere to put
+            // it. `playerId` is re-stamped with the handshake's id because
+            // MakePlayerState fills it from the sender's session index, which
+            // is 0 on both machines.
+            PlayerState st = it->second.st;
+            st.playerId = netPeerId;
+            remotes.Upsert(netPeerId).Apply(st);
+          }
+          // THE HOST WINS ON THE TWO HASHED PRESENTATION INPUTS (session.cpp
+          // phase L11: `timeScale` reaches Celestial and `vizActive` reaches
+          // SubmitTick). They are sim inputs, so two machines disagreeing
+          // about them is two different worlds; one of them has to be the
+          // authority and the host's clock is already the tick clock.
+          if (netRoleBoot == NetRole::Client) {
+            ui.timeScale = it->second.timeScale;
+            ui.showDirtyVoxels = it->second.vizActive != 0;
+          }
+        }
+        // Prune everything at or before the tick about to run. The map never
+        // holds more than D+1 entries, so this is the whole memory management.
+        netQueue.erase(netQueue.begin(), netQueue.upper_bound(tick));
+      }
+
       TickAuthority(tickCtx, session,
                     FrameIntent{brushActive, meleeArmed, meleeReady, heldItem},
                     ti, tick, opBatch);
+
+      // ---- M9.2-C: AND THE BATCH FOR T+D GOES OUT ------------------------
+      //
+      // After the tick, so the `PlayerState` inside is this tick's outcome
+      // rather than the previous one's, and before the next tick's wait, which
+      // is invariant 1. In the steady state `ShouldSend()` is true exactly
+      // once here; at connect the same loop already emitted T0..T0+D.
+      if (netPaced) {
+        pacer.NoteRan();
+        while (pacer.ShouldSend()) {
+          const uint32_t label = pacer.NextToSend();
+          netSendBatch(label);
+          pacer.NoteSent(label);
+        }
+      }
     }
     if (ui.paused) accumulator = std::min(accumulator, (double)kTickDt);
 
@@ -11220,6 +11742,42 @@ int main(int argc, char** argv) {
       livePending.clear();   // browser went away; do not hoard frames
     }
     liveFrameNo++;
+  }
+
+  // ---- M9.2-C: THE NET REPORT -------------------------------------------
+  //
+  // ONE LINE, fixed field order, printed whenever this process was networked
+  // at all (not only under --frames, so a windowed session that quits also
+  // says what happened). It is the two-process smoke's whole acceptance:
+  // batches in BOTH directions proves the link and the pacer ran, `stalls`
+  // says how often the peer was late, `maxLag` should sit at D in the steady
+  // state (that is what D buys), and `late` must be 0 — a batch arriving for
+  // a tick already run means the pre-send or the label arithmetic is wrong.
+  if (netRoleBoot != NetRole::None) {
+    const uint64_t bIn =
+        netBytesInPrev + (link ? link->Stats().bytesIn : 0);
+    const uint64_t bOut =
+        netBytesOutPrev + (link ? link->Stats().bytesOut : 0);
+    std::printf("net: role=%s batchesSent=%llu batchesRecv=%llu stalls=%llu "
+                "maxLag=%d late=%llu disconnects=%llu bytesIn=%llu "
+                "bytesOut=%llu\n",
+                netRoleBoot == NetRole::Host ? "host" : "client",
+                (unsigned long long)netBatchesSent,
+                (unsigned long long)netBatchesRecv,
+                (unsigned long long)netStalls, netMaxLag,
+                (unsigned long long)netLate,
+                (unsigned long long)netDisconnects,
+                (unsigned long long)bIn, (unsigned long long)bOut);
+    std::fflush(stdout);
+  }
+  // A ghost owns real Jolt limb bodies and a kinematic capsule; drop them
+  // while `phys` is still alive rather than at the end of main's scope.
+  // Guarded, like everything else in this package, so a single-player exit
+  // executes not one line of it.
+  if (netRoleBoot != NetRole::None) {
+    remotes.Clear(phys);
+    mobs.SetAvatar(&session.avatar);
+    if (link) link->Close();
   }
 
   if (g_harnessFrames > 0 && frameCounter > 0) {
