@@ -618,28 +618,280 @@ one sanctioned direct launch: concurrency is the point), `SANDVOX_NET_SMOKE_EXIT
 on the host; both exit 0; both logs show `net:` reports with batches in both
 directions and 0 disconnects before the client's own exit.
 
-### M9.3 — op exchange, per-chunk hash, chunk resync (the "play together" milestone)
-- `sim_occupancy.wgsl:281-300` also stores `wgHash` into a new
-  `chunkHash[kNumChunks]` buffer; rides the snapshot ring at the `hashEnable`
-  cadence; `World::ChunkHash(slot)`. Pass table + `check_pass_table.py`. World
-  hash unchanged. On the wire a two-level Merkle (512 block hashes of 4³
-  chunks ≈ 2 KiB; drill down on mismatch), finding 8.
-- Op exchange: phase H submits `own(T) ∪ remote(T)` merged in canonical order
-  (author id, then push order) at T; every machine defers its own batch by
-  D=4. The batch carries the sender's window origin; the receiver
-  reconstructs wc per op (CellOps are SLOT-indexed, finding 3) and drops ops
-  for chunks it does not hold. `OpMeta.producer` becomes mandatory with a
-  debug gate at `SubmitTick` asserting `Authority::Owns(producer, wcOf(op))`
-  (finding 4).
-- Comparability + resync (findings 1–2): compare only chunks resident on both
-  AND ≥2 chunks inside both windows (origins as of T−K from a K-deep ring)
-  AND dirty-clear ≥ K+D ticks on the authority. Mismatch → the authority
-  sends `ChunkSync{tick, wc, rle}` in ≤4 KiB slices; the receiver applies it
-  through `Stream`'s RLE→slot refill upload inside the tick, flushing
-  fluid/gas/particles in the chunk's bounds, recorded as a new `oprecord`
-  frame kind so `ops-replay` still reproduces. Rate-limited, nearest first.
-- Gate `ops-exchange`: two op streams merged through `LoopbackLink` replay to
-  the same hash as one merged record (`ops-replay` fixture reused).
+### M9.3 — op exchange, per-chunk hash, chunk resync (packages A, B, C) — the "play together" milestone
+
+```
+  A  per-chunk hash + quiet counter + gate chunk-hash     world.h/.cpp, sim_occupancy.wgsl, pass_table.def,
+                                                          selftest_sim.cpp, one line in stream.cpp   hash UNMOVED
+     (may run in parallel with M9.2-C: disjoint files)
+  B  op exchange: OpDelayQueue + OpsWire + phase N merge  src/net/opsync.*, session.h/.cpp (phase N, explosions),
+     + gate ops-exchange                                   oprecord.h (Producer::Remote), main.cpp (batch ops)   hash UNMOVED, oracle cmp
+     (after M9.2-C merges: both touch main.cpp)
+  C  hash publish + resync: HashTree, ChunkSync,          src/net/chunksync.*, stream.h/.cpp (ReplaceChunk),
+     Stream::ReplaceChunk, record kind, gate chunk-resync  oprecord.*, session.cpp (phase B), main.cpp   hash UNMOVED, oracle cmp
+     (after A and B merge)
+Endgame: build; oracle cmp; --verify determinism,chunk-hash,ops-exchange,chunk-resync,ops-replay,net-loopback;
+         two-process smoke with both players in ONE window painting (orchestrator); ff main; docs.
+```
+
+Facts that bind all three (verified 2026-09-21):
+- `sim_occupancy.wgsl:243-245` keys the world hash on the SLOT index
+  (`hashBase = wg.x * CHUNK_VOL`), so the existing per-workgroup `wgHash` is
+  origin-DEPENDENT and cannot be compared across machines. The per-chunk
+  digest must use a CHUNK-LOCAL key (`i` in 0..4095) — a second accumulator,
+  on hash ticks only — and the world hash must stay bit-identical.
+- Slot = `wc & mask` is GLOBAL, so a `CellOp.cellIdx` (slot-relative,
+  `sim_mutate.wgsl:187-191`) is valid on the receiver unchanged IF the chunk
+  is resident there; the sender's `windowOrigin` is needed only to recover
+  `wc` for the residency test (`World::SlotToWorldChunk` under the sender's
+  origin, then local `ChunkInWindow`). Brush/Explosion/ParticleSpawn/Fluid
+  ops are absolute world coords and need no translation; cells outside the
+  receiver's window are refused by the kernel already.
+- Chunk refill upload lives in the private `Stream::FillSlots`
+  (`stream.cpp:651-781`): classify → `EnsurePageForOverwrite` → `WriteBuffer`
+  → `FlushTableWrites` → `RefilledSlot` → occupancy + sub-occupancy write →
+  `dirty[0]/[1]` wake → `sim_->NoteWakeAll()`. A public `ReplaceChunk(wc,
+  words)` is that branch, plus `modified_[s] = 1`. Legal anywhere before
+  `SubmitTick` in the same tick (deferred `WriteBuffer`s are ordered before
+  the next submit).
+- Quiescence: `snap.dirtyFlags[slot]` (next-tick dirty, K ticks latent,
+  `world.cpp:749`) is the only per-slot activity signal; there is no
+  "quiet for N ticks" counter yet. `Stream::modified_` is sticky-ever, not
+  activity.
+- `oprecord`: `Frame` is serialized in field order (`oprecord.cpp:~490-500`);
+  `NoteGenList` (`oprecord.cpp:252-257`, stash-then-fold in `RecordFrame`) is
+  the precedent for a new per-frame field; replay does NOT re-drive gen lists
+  or fills — a chunk-replace record needs an apply twin like
+  `ReplaceGasIfReplaying` (`oprecord.h:305`) called from the drive loops
+  (`selftest_sim.cpp` `ops-replay`, `main.cpp --replay-ops`). Bump
+  `kRecordVersion`.
+- Phase N's submit: `session.cpp:2838+` `SubmitTick(ctx, world, sim, tick,
+  kDefaultSeed, ops, exps, cellOps, tick % 15 == 0, pc, true, particlesActive,
+  spawns, farCount, fluidSpawns, fluidCount, fluidSpeciesMat, ui.showDirtyVoxels)`;
+  the vectors are `OpBatch& out` aliased by `SV_OPS_REFS`. Authors: RAII
+  `BrushAuthorScope`/`ExpAuthorScope` (`oprecord.h:105-135`), resolved in
+  `RecordFrame`; `Producer` enum `oprecord.h:52-64`.
+- The delayed-lockstep consequence for LOCAL ops: when connected, the ops a
+  machine authors at T are SUBMITTED at T+D (they travel labelled T+D and the
+  peer submits them at T+D too). CPU-side consumers that assume the op landed
+  at T: `debris.AddDestructionEvent(tick, lo, hi)` (explosions; the island
+  scan's readiness is tick-based) → pass `tick + D` when connected;
+  `MarkModifiedBox` is sticky and stays at T; mob/limb damage from an
+  explosion is CPU-side and lands at T (133 ms before the crater — accepted
+  for M9.3, noted in DESIGN). Single-player is D = 0 and byte-identical.
+
+#### A · Per-chunk hash, quiet counter, gate `chunk-hash` — WGSL + C++, hash UNMOVED
+
+**Owner scope:** `assets/shaders/sim_occupancy.wgsl`, `src/sim/pass_table.def`
+(+ `scripts/check_pass_table.py` if the binding needs a name), `src/sim/world.h`,
+`src/sim/world.cpp` (buffer, readback ring, snapshot parse, accessors),
+`src/sim/stream.cpp` (ONE line: `MarkModifiedBox` also calls
+`world_->NoteChunkTouched(wc)`; and `FillSlots` resets the counter for the
+slot — grep `ResetStreaks` for where), `src/test/selftest_sim.cpp` (gate),
+`src/test/selftest.cpp` (`kOrder`), `tests/baseline.json` (new keys),
+`scripts/check_invariants.py` only if a layout check trips.
+
+**Verified facts:** §"Facts that bind" above, plus: bindings of the occupancy
+shader `sim_occupancy.wgsl:11-19` (`@binding(8) worldHash`, 7 occupancy, 12
+dirtyList, 17 pageTable, 18 pageFaults); pass rows `pass_table.def:604-607`
+(`occupancyFull`, `USES(... A(Hash) ...)`) and `:622-625` (`occupancyDirty`,
+no hash); `world.cpp:118` hash buffer (16 B); readback slot layout
+`world.cpp:28-64` (`kHashOff = kOccOff + kOccBytes`, `kFetchOff`, `kSlotBytes`);
+`EncodeReadbacks` copies at `world.cpp:580` (Hash→kHashOff); parse at
+`world.cpp:802`; `snap.dirtyFlags` filled at `world.cpp:749`. Every
+`pass_table.def` R/W set must match the WGSL bindings (`check_pass_table.py`).
+
+**Build:**
+1. New storage buffer `chunkHash` (`kNumSlots * 4` B) bound in the occupancy
+   shader (pick a free binding; add the `pass::Buf` entry and `W(ChunkHash)`
+   to `occupancyFull` ONLY — `occupancyDirty` does not hash). In the full
+   entry: a second per-workgroup accumulator `hc` with a CHUNK-LOCAL key,
+   `hc += pcg(i ^ (v * 0x9E3779B9u))` for the same cells `h` counts (i =
+   0..4095), `atomicAdd` into a second workgroup atomic, and at the end
+   `chunkHash[wg.x] = hcTotal` (a plain store, not an add: one workgroup per
+   slot). Uniform-sentinel chunks (`:231-236`) write the digest of their
+   uniform word the same way (a sentinel and its materialized twin must hash
+   identically — say so in the shader comment and test it). The world hash
+   accumulation is UNTOUCHED.
+2. Readback: copy `chunkHash` into the ring after the hash word (`kChunkHashOff`,
+   `kNumSlots*4` B; bump `kSlotBytes`), every tick is fine (the mirror is
+   already 432 KiB). Parse into `WorldSnapshot::chunkHash` (vector<uint32_t>,
+   kNumSlots) and `chunkHashTick` (the tick of the snapshot; consumers know
+   the hash is meaningful only when that tick had `hashEnable`). Accessors
+   `World::ChunkHashOfSlot(slot)` / `ChunkHashTick()`.
+3. Quiet counter: `std::vector<uint16_t> quietTicks_` (per slot) in `World`,
+   updated where the snapshot is published: `dirtyFlags[i] ? 0 : min(65535,
+   +1)`; `World::NoteChunkTouched(IVec3 wc)` zeroes it (called from
+   `Stream::MarkModifiedBox`), refill zeroes it (the `FillSlots` slot loop);
+   accessor `World::QuietTicks(slot)`. Not hashed, not saved, derived.
+4. Gate `chunk-hash` in `selftest_sim.cpp` (after `ops-replay` in `kOrder`):
+   (a) worldgen, 30 ticks, read the snapshot on a hash tick; run again after
+   re-worldgen; every slot's `chunkHash` identical (twice-run); (b) paint ONE
+   voxel in chunk X via a `CellOp`, hash tick: exactly ONE slot's digest
+   changed and it is X's; (c) ORIGIN INDEPENDENCE: `SetWindowOrigin(origin +
+   (1,0,0))` + `stream.ReloadWindow(...)` (or whatever the `streaming` gate
+   uses to shift), settle, hash tick: for every world chunk resident in both
+   windows the digest is identical although its slot… is the same slot (slot
+   is global) — so ALSO test a chunk whose page moved from sentinel to real
+   (a JITTER chunk materialized by the paint) hashes the same before/after
+   materialization; (d) `QuietTicks` on an untouched stone chunk grows by one
+   per tick and resets to 0 on the paint and on refill. Pin
+   `chunkHash.changedSlots` = 1, `chunkHash.quietAfter30` etc. as observed.
+
+**Kill criterion:** if the extra accumulator costs more than ~0.2 ms on a hash
+tick in `--perf` terms, make it conditional on a new `TickParams` bit
+(`chunkHashEnable`) that the harness sets on hash ticks only — do not drop
+it. World hash MUST NOT move; if it does, you touched `h`.
+
+**Done means:** every resident chunk has an origin-independent digest readable
+K ticks later, a per-slot quiet counter exists, and `chunk-hash` pins both.
+
+**Verification, ONE launch:** `python scripts/check_pass_table.py`,
+`bash scripts/check_shaders.sh`, then `--verify determinism,chunk-hash,ops-replay,streaming`.
+
+#### B · Op exchange: `OpDelayQueue`, `OpsWire`, the phase-N merge, gate `ops-exchange` — C++ only, hash UNMOVED, oracle cmp
+
+**Owner scope:** new `src/net/opsync.h/.cpp` (CMake source list),
+`src/sim/oprecord.h` (`Producer::Remote` only), `src/game/session.h/.cpp`
+(`TickAuthorityCtx::opsync` pointer; phase N merge; the explosion phase's
+`AddDestructionEvent` tick), `src/main.cpp` (fill `TickBatchWire.ops` from
+`opsync->TakeOutgoing`, feed received ops into `opsync->NoteRemote`),
+`src/test/selftest_net.cpp` (gate), `selftest.cpp` (`kOrder`), baseline keys.
+Branch after M9.2-C has merged.
+
+**Verified facts:** §"Facts that bind"; `OpBatch` (`session.h:243-257`: ops,
+exps, cells, spawns, fluid; gas is NOT in the batch — it is queued in World
+and joins at `SubmitTick`; a remote's gas spawns are therefore NOT exchanged
+in M9.3: note it); op structs and their coordinate spaces (`world.h:358-365`
+Brush world coords; `:377-384` Explosion world coords + `author`; `:872-875`
+CellOp slot index; `:2849-2856` ParticleSpawn 24.8 world; `:821-830`
+FluidSpawnOp Q16.16 world); caps `kMaxOpsPerTick` etc. in `world.h`;
+`SubmitTick` clamps and counts (`support.cpp`); `net::TickBatchWire.ops` is an
+opaque blob (M9.2-A); `net::kOpDelayTicks = 4`.
+
+**Build:**
+1. `net::OpsWire`: `Encode(const OpBatch&, IVec3 origin, uint32_t label, std::vector<uint8_t>&)`
+   / `Decode(...)` — five `PodVec`s + origin + label + `kOpsWireVersion`.
+2. `net::OpDelayQueue` (pure, no I/O): `D`; `Push(uint32_t producedAt, OpBatch local)`
+   stores under label `producedAt + D`; `NoteRemote(uint32_t label, uint32_t author, OpBatch)`;
+   `bool Ready(uint32_t label)` (local present AND remote present — the pacer
+   already guarantees the remote batch for T arrived before T runs, so this is
+   an assert, not a wait); `OpBatch Merge(uint32_t label, const World&, IVec3 remoteOrigin, MergeStats&)`:
+   batches ordered by author id ascending (host = 0 first), push order within;
+   remote CellOps kept only if `ChunkInWindow(SlotToWorldChunk_underRemoteOrigin(slot))`
+   (dropped count in stats); other kinds kept as-is; the merged vectors are
+   what `SubmitTick` receives. Remote ops are wrapped in `BrushAuthorScope` /
+   `ExpAuthorScope` with `Producer::Remote`, author = peer id, so the record
+   names them. `TakeOutgoing(label) -> const OpBatch&` for the send side.
+3. Phase N: `if (w.opsync && w.opsync->Connected())` → `out` is pushed as
+   local for label `tick + D`, and the batch SUBMITTED is `Merge(tick, ...)`;
+   else today's path untouched (the oracle proves it). `MarkModifiedBox`
+   already ran at T for the local ops; run it again over the merged batch's
+   remote brush ops (they touch chunks the local side did not mark).
+   Explosions: `debris.AddDestructionEvent(tick + (connected ? D : 0), ...)`
+   in the explosion phase; likewise any other tick-labelled consumer you find
+   by grepping `AddDestructionEvent|lastExplosionTick` in `session.cpp` —
+   list what you changed and why in the report.
+4. `main.cpp`: after the tick, `TickBatchWire.ops = OpsWire::Encode(opsync->TakeOutgoing(T + D), origin, T + D)`;
+   on receive, `opsync->NoteRemote(label, peerId, Decode(...))` with the
+   sender's origin from the batch header. The `--frames` net report gains
+   `ops sent/recv, cells dropped (non-resident), merged per tick max`.
+5. Gate `ops-exchange` in `selftest_net.cpp` (needs the GPU; after
+   `net-loopback`): two scripted producers — "host" paints a brush stroke in
+   chunk X every 10 ticks and one explosion at tick 100; "client" paints
+   CellOps in chunk Y every 7 ticks plus CellOps in a chunk OUTSIDE the
+   window (must be dropped) — pushed through two `OpDelayQueue`s connected
+   by `MakeLoopback()` + `OpsWire`. Arm H: submit host-view merges for 200
+   ticks (worldgen first); arm C: re-worldgen, submit client-view merges. Per
+   tick, the merged vectors must be `memcmp`-identical between arms (record
+   them), final hashes equal, dropped count = the outside-window count, and
+   the record (`SANDVOX_RECORD_OPS` or `StartRecording`) of arm H replays to
+   the same hash (reuse the `ops-replay` drive loop).
+
+**Kill criterion:** if `Merge` must reorder LOCAL ops relative to their push
+order to be canonical, stop: the order rule is author-major, push-order-minor,
+and a violation means a producer pushed after phase N.
+
+**Done means:** two machines submit the same merged op vectors at the same
+tick label; single-player is byte-identical; the record names remote ops.
+
+**Verification:** oracle cmp (no `--host`); `--verify determinism,ops-exchange,ops-replay,net-loopback,tick-input`.
+
+#### C · Hash publish and chunk resync: `HashTree`, `ChunkSync`, `Stream::ReplaceChunk`, record kind, gate `chunk-resync` — C++ only, hash UNMOVED, oracle cmp
+
+**Owner scope:** new `src/net/chunksync.h/.cpp`, `src/sim/stream.h/.cpp`
+(`ReplaceChunk` public, factored from `FillSlots`'s store-hit branch),
+`src/sim/oprecord.h/.cpp` (`Frame.chunkReplaces` + `NoteChunkReplace` +
+`ReplaceChunksIfReplaying` + `kRecordVersion` bump), `src/game/session.h/.cpp`
+(phase B: apply pending replaces before `stream.Update`; `TickAuthorityCtx::chunksync`),
+`src/main.cpp` (hash publish on hash ticks, the drill/request/sync messages,
+`--replay-ops` drive loop applies the record's replaces), `src/test/selftest_sim.cpp`
+(`ops-replay` drive loop applies replaces) + gate `chunk-resync`,
+`selftest.cpp` (`kOrder`), baseline keys, `src/net/protocol.h` (message types
+`HashBlocks`, `HashDrill`, `ChunkRequest`, `ChunkSync` — additive).
+Branch after A and B have merged.
+
+**Verified facts:** §"Facts that bind"; A's `ChunkHashOfSlot/ChunkHashTick/
+QuietTicks`; M9.2's `PlayerState.windowOrigin` per tick from the peer (keep a
+`kSnapshotLatency`-deep ring of the peer's origins and of your own, so a
+comparison at hash tick H uses both origins AS OF H); `RleEncodeChunk`/
+`RleDecodeChunk` (`stream.h:37,47`), `kPersistMask`; a mixed surface chunk
+RLEs to ~32 KiB (`stream.cpp:381-384`); the fetch cache gives the authority a
+chunk's words (`RequestChunkFetch`/`Cached`).
+
+**Build:**
+1. `net::ChunkAuthority(wc, const std::vector<PeerView>&) -> playerId`:
+   nearest player (Chebyshev chunk distance) among peers whose window contains
+   `wc` with margin ≥ 1, ties → lower id; 2-chunk hysteresis is M9.4's (leave
+   a hook). `net::Comparable(wc, myOrigin, peerOrigin, M = 2)`: inside both
+   inner windows.
+2. `net::HashTree`: blocks = world chunk coords `>> 2` (4³ chunks); block hash
+   = wrapping sum of its 64 chunk digests; `Build(world, myOrigin, peerOrigin)`
+   emits only blocks whose 64 chunks are ALL comparable; message `HashBlocks{
+   hashTick, origin, {blockKey, sum}...}` (≤ 2 KiB); on mismatch the receiver
+   sends `HashDrill{blockKey}` and gets `HashChunks{blockKey, 64 digests}`.
+3. Resync: for each mismatched chunk where the PEER is authority and its
+   `QuietTicks(slot) >= kSnapshotLatency + kOpDelayTicks` (the peer checks
+   this when it receives `ChunkRequest{wc}`; if not quiet it replies
+   `ChunkBusy{wc}` and the requester retries next hash tick), the authority
+   replies `ChunkSync{tick, wc, rle}` from its fetch cache (request the fetch,
+   answer when `Cached`), split into ≤ 4 KiB slices reassembled by the
+   receiver. Rate limit: ≤ 4 chunks in flight, nearest to the local player
+   first. When the LOCAL machine is the authority, the local copy wins and
+   nothing is requested (the peer will ask).
+4. `Stream::ReplaceChunk(IVec3 wc, const uint32_t* words)`: the store-hit
+   branch of `FillSlots` for one slot (classify, page, upload, table flush,
+   `RefilledSlot`, occupancy + sub-occupancy, wake, `NoteWakeAll`), plus
+   `modified_[s] = 1`, `world_->NoteChunkTouched(wc)`, `farEdits_/farPlumes_
+   .NoteChunk`. Refuses (returns false, counted) if `!ChunkInWindow(wc)`.
+   Called ONLY from phase B before `stream.Update`, from a per-tick pending
+   list on `chunksync`, and recorded via `opstream::NoteChunkReplace(tick, wc,
+   rle)` so `Frame.chunkReplaces` carries it; `ReplaceChunksIfReplaying(tick,
+   stream)` applies the record's replaces at the same point in both drive
+   loops.
+5. Known gap, stated in DESIGN: a replaced chunk's in-flight particles/gas/MPM
+   are not flushed; the quiet requirement (no dirty flag for K+D ticks) is the
+   argument that there are none.
+6. Gate `chunk-resync` in `selftest_sim.cpp`: (a) pure: `Comparable` and
+   `ChunkAuthority` truth tables incl. the margin and the non-resident
+   nearest case (§4 finding 6); `HashTree` block keys and comparable-block
+   selection for two offset origins; (b) GPU: worldgen, settle 40 ticks,
+   capture chunk X's words (fetch cache) as the "authority copy"; drift it
+   with 5 CellOps; hash tick shows X's digest changed; apply
+   `ReplaceChunk(X, captured)` in the phase-B position; hash tick shows X's
+   digest back to the captured value and the WORLD hash equal to a control
+   arm that never drifted (re-worldgen control, same tick count); (c) record
+   the drift+replace run and replay it: same hash series (the record kind
+   works).
+
+**Kill criterion:** if `ReplaceChunk` cannot restore the world hash to the
+control's (b), the replace path is missing one of `FillSlots`'s side effects
+(occupancy, sub-occupancy, wake, far indices) — find which, do not widen (b).
+
+**Done means:** two machines whose comparable chunks drift converge to the
+authority's copy without a full-world resend, and a replay reproduces it.
+
+**Verification:** oracle cmp; `--verify determinism,chunk-hash,chunk-resync,ops-replay,streaming`.
 
 ### M9.4 — entity ownership (mobs, debris)
 - Chunk authority = nearest among machines whose SENT window contains C with
