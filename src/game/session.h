@@ -62,6 +62,9 @@
 #include <algorithm>
 #include <cstdint>
 #include <functional>
+#include <memory>
+#include <optional>
+#include <span>
 #include <string>
 #include <unordered_map>
 #include <vector>
@@ -254,9 +257,53 @@ struct OpBatch {
   }
 };
 
+// WHERE A SESSION THAT OWNS NO WINDOW PUTS ITS PRESENTATION (M9.1 P1).
+//
+// The tick body writes a death screen, a hit-stop dip, a frozen death pose, a
+// refused-spell counter and five combat cue requests. Every one of them is ONE
+// WINDOW'S readout, and every one of them used to be written unconditionally
+// because there was only ever one player and it was the window's.
+//
+// A second session on this machine — a peer's ghost (M9.2), a scripted second
+// player in a gate — must not reach any of them: its death would black out
+// YOUR screen and its sword would dip YOUR frame clock. Rather than guard
+// forty call sites, the tick BINDS THE NAMES somewhere harmless for such a
+// session (session.cpp, SV_SEAM_REFS_PLAYER). Nothing reads what lands here;
+// it exists so the writes have a legal address.
+//
+// It has to PERSIST, which is why it hangs off the session rather than off the
+// tick's scratch: the death/respawn block reads back the `deathScreen` flag it
+// set on an earlier tick to decide whether the respawn hold has started.
+struct PresentationSink {
+  UIState ui;
+  HitStop hitStop;
+  DeathBody deathBody;
+  bool deathFrozen = false;
+};
+
 // ---- one player -----------------------------------------------------------
 
 struct PlayerSession {
+  // ---- who this player is, to the tick ----
+  // Index in the span TickAuthority is given. 0 is the PRIMARY: every world
+  // phase that needs a player at all (the dev panel's ray, the far-plume eye,
+  // the chunk the submit centres on, the tick record's one command) takes
+  // session 0, because those are the WINDOW's questions and the window follows
+  // the primary.
+  int index = 0;
+  // Does this player own the window this process is drawing? True for the one
+  // session the game constructs. False for a peer's ghost and for a second
+  // scripted player in a gate — see PresentationSink above for what that
+  // changes, plus one behaviour: a session with no view cannot be asked to
+  // respawn, so it revives itself once `avatar.respawnDelay` has elapsed.
+  bool localView = true;
+  std::unique_ptr<PresentationSink> sink;  // allocated iff !localView
+  // The splash edge detector. It was `static bool wasInLiquid` inside the tick
+  // body until M9.1 — the one function static in session.cpp, and the exact
+  // shape of defect the rule at the top of this file names: two players in two
+  // lakes shared one edge and the second one never splashed.
+  bool wasInLiquid = false;
+
   // ---- body and view ----
   Camera cam;
   Player player;
@@ -466,14 +513,59 @@ struct TickAuthorityCtx {
   bool duelDummy = false;
 };
 
-// ---- one tick of authority ------------------------------------------------
+// ---- one tick of authority, for N players ---------------------------------
 //
 // Everything between the accumulator loop's braces, minus the pacing, the
-// readback pump and the park probe the frame layer owns. Takes ONE command,
-// produces ONE OpBatch, and submits it. No behaviour change from the version
-// that lived in main(): the acceptance for that claim is a
-// `--frames 600 --autofly-hard` op record that is byte-identical before and
-// after (N5 step 5).
-void TickAuthority(TickAuthorityCtx& w, PlayerSession& s,
-                   const FrameIntent& intent, const TickInput& ti,
+// readback pump and the park probe the frame layer owns. Takes ONE command PER
+// PLAYER, produces ONE OpBatch for the whole tick, and submits it. No
+// behaviour change from the version that lived in main(): the acceptance for
+// that claim is a `--frames 600 --autofly-hard` op record that is
+// byte-identical before and after (N5 step 5, re-run for M9.1 P1).
+//
+// ---- WHAT A PHASE IS, AND WHY THE ORDER IS WHAT IT IS ---------------------
+//
+// The body is cut into sixteen PHASES (session.cpp, PhaseA..PhaseP). A phase
+// is a maximal run of the old single-player body with ONE scope: a PLAYER
+// phase touches one PlayerSession and runs once per session in index order; a
+// WORLD phase touches the world, the engine systems and the per-tick world
+// scratch and runs once. TickAuthority is nothing but their alternation,
+//
+//     A* B C* D E* F G* H I* J K* L M* N O* P      (* = once per session)
+//
+// and that alternation IS the old body's order, segment for segment. That is
+// the whole design constraint: the tick was never "all the player's work then
+// all the world's". The controller has to run before the residency window
+// recentres on it; the window has to shift before the laser ray reads the
+// grid; the dev panel spawns before the brush writes; mobs.PreTick has to see
+// the avatar's bleed ops; the submit has to come after every producer. Merging
+// the four player runs into one, or the four world runs into one, reorders the
+// op stream — and the op stream's order is the tick's identity (CLAUDE.md rule
+// 3: the lowest op index owns the cell).
+//
+// WHERE A REMOTE GHOST PLUGS IN (M9.2): phases B and C of the plan's lettering
+// — here, phase B (the interest set learns its chunk) and phase I (its avatar
+// is driven from the TickInput that arrived off the wire). A ghost needs no
+// new phase and no new call; it needs an entry in the span, `localView =
+// false`, and a TickInput from somewhere other than a TickInputFeeder.
+
+// ONE PLAYER'S INPUT TO ONE TICK. The session, what the frame layer settled
+// for it, and the command it consumes. By pointer rather than reference so the
+// span is assignable and a caller can build it in a vector.
+struct SessionTick {
+  PlayerSession* s;
+  FrameIntent intent;
+  TickInput ti;
+};
+
+void TickAuthority(TickAuthorityCtx& w, std::span<SessionTick> players,
                    uint32_t tick, OpBatch& out);
+
+// ONE PLAYER IS A SPAN OF ONE. Kept because the frame loop and every harness
+// fixture read better this way, not because the authority is singular — the
+// same reason MobSystem::SetPlayerActor is kept beside SetPlayerActors.
+inline void TickAuthority(TickAuthorityCtx& w, PlayerSession& s,
+                          const FrameIntent& intent, const TickInput& ti,
+                          uint32_t tick, OpBatch& out) {
+  SessionTick one{&s, intent, ti};
+  TickAuthority(w, std::span<SessionTick>(&one, 1), tick, out);
+}

@@ -127,121 +127,245 @@ int BodySlotFor(const char* name, const char* tag) {
   return -1;  // props, held items, anything the figure has no place for
 }
 
-void TickAuthority(TickAuthorityCtx& w, PlayerSession& s,
-                   const FrameIntent& intent, const TickInput& ti,
-                   uint32_t tick, OpBatch& out) {
-  // ---- THE UNPACK, AND WHY IT IS A WALL OF ALIASES ------------------------
-  //
-  // The body below is a BYTE-FOR-BYTE MOVE of what used to sit between the
-  // accumulator loop's braces in main(). That is deliberate and it is the
-  // whole reason this block exists: the acceptance for this package is a
-  // recorded session that is byte-identical before and after, and a proof like
-  // that is only worth something if the thing it is run against is provably a
-  // move rather than a rewrite. `diff` can check a move; it cannot check 2,400
-  // lines of renaming.
-  //
-  // So every name the body closed over is bound here, once, and the body is
-  // untouched. Turning `player` into `s.player` at a hundred sites is the next
-  // package's mechanical rename, with a compiler and a green record behind it.
-  GpuContext& ctx = w.ctx;
-  World& world = w.world;
-  Simulation& sim = w.sim;
-  Stream& stream = w.stream;
-  FarField& far = w.far;
-  Physics& phys = w.phys;
-  MobSystem& mobs = w.mobs;
-  DebrisSystem& debris = w.debris;
-  MicroBodySet& mbSet = w.mbSet;
-  const std::vector<MaterialDef>& mats = w.mats;
-  const GlyphLibrary& glyphs = w.glyphs;
-  const ItemLibrary& items = w.items;
-  const std::vector<Prefab>& prefabs = w.prefabs;
-  const std::vector<uint32_t>& classOf = w.classOf;
+// ===========================================================================
+// THE TICK, CUT INTO PHASES (M9.1 package P1)
+// ===========================================================================
+//
+// TickAuthority used to be ONE 2,270-line body closed over one player's
+// aliases. It ran the world's work and that player's work interleaved, which
+// was correct and unremarkable while there was exactly one player — and
+// impossible to run twice, which is what a second session needs.
+//
+// The body is now SIXTEEN functions and NOT ONE LINE OF IT MOVED RELATIVE TO
+// ANY OTHER. A phase is a maximal run of the old body with a single scope:
+//
+//   PLAYER phase — reads and writes ONE PlayerSession. Runs once per session,
+//                  in index order.
+//   WORLD  phase — reads and writes the world, the engine systems and the
+//                  per-tick world scratch. Runs ONCE. Where it needs a player
+//                  at all (the dev panel's ray, the far-plume eye, the chunk
+//                  the submit centres on) it takes THE PRIMARY, session 0.
+//
+// and TickAuthority is the alternation:
+//
+//   A* B C* D E* F G* H I* J K* L M* N O* P        (* = once per session)
+//
+// WHY SIXTEEN AND NOT NINE. The plan (docs/PLAN_multiplayer_m9.md §2, P1)
+// tabulates nine phases and merges four separate player runs into its "A" and
+// four separate world runs into its "B". THE FILE DISAGREES, and the file
+// wins: at 54fe241 the body alternates player/world thirteen times before the
+// submit, so running all of the plan's A and then all of its B would have put
+// the laser ray BEFORE the window shift and the dev panel's mob spawn AFTER
+// the brush — a reordering of the op stream, which is the one thing this
+// package is not allowed to do. The mapping is:
+//
+//   plan A = A, C, E, G   plan D = J   plan G = M
+//   plan B = B, D, H      plan E = K   plan H = N
+//   plan C = I            plan F = L   plan I = O
+//
+// plus phase F (the AI panel's "apply behaviour", old :895-903, a world block
+// sitting between the wardrobe and the sphere) which the plan's table does not
+// mention at all, and phase P (the perf accounting the plan leaves "at the
+// end"). For ONE session the concatenation A..P is the old body, line for
+// line, which is why the op record is byte-identical by construction rather
+// than by measurement.
+//
+// WHERE A REMOTE GHOST PLUGS IN (M9.2). A peer-driven player is a
+// PlayerSession with `localView = false` whose TickInput arrives off the wire
+// instead of out of a TickInputFeeder. It needs no new phase: it joins the
+// span, phase B puts its chunk in the interest set and phase H puts its body
+// in the NPC actor list — those two are the whole of "the world knows another
+// player is standing there".
+//
+// THE ALIAS WALL IS NOW SIX MACROS. Same names, same bindings, same reason as
+// the note the old unpack carried: the bodies below are a MOVE, and a move is
+// only checkable if the names it closed over are unchanged. Expanding an
+// unused alias costs nothing (MSVC bills it C4189, level 4; this build is
+// /W3) and buys a diff a reviewer can read.
+
+// ---- what one TICK needs that is not in any of the two structs -------------
+
+// PER-WORLD TICK SCRATCH. Every one of these was a local in the old body whose
+// live range crossed a phase boundary. Fields of a per-call struct rather than
+// statics, on purpose: a static here is the exact defect N5 removed and
+// DESIGN.md §10 forbids.
+struct WorldScratch {
+  uint32_t farCount = 0;        // phase B -> phase N (SubmitTick)
+  bool particlesActive = false; // phase L -> phase N
+  IVec3 pc{};                   // phase L -> phase N: the submit's centre chunk
+  double t0 = 0;                // phase L -> phase P
+  double tSubmit0 = 0;          // phase N -> phase P
+  double tSubmit1 = 0;
+  double tPhys1 = 0;
+  // The GameLogic span. Opened ONCE, between phase B and the first session's
+  // phase C (exactly where the old body declared it), closed in phase L. An
+  // optional because PerfSpan starts its clock in its constructor and is
+  // neither copyable nor movable.
+  std::optional<sandvox::PerfSpan> spanGame;
+  // The NPC targeting layer's player list, rebuilt each tick in phase H. Held
+  // here rather than declared there so the per-tick rebuild does not allocate.
+  std::vector<MobSystem::PlayerActorDesc> actors;
+};
+
+// PER-SESSION TICK SCRATCH, same rule: a local whose live range crossed a
+// phase boundary, and which is ONE PLAYER'S.
+struct LaserCut {
+  uint64_t body = 0;
+  Vec3 at{};
+  float radius = 0;
+  bool limb = false;  // a live mob limb carves; plain debris melts
+};
+struct PlayerScratch {
+  LaserCut laserCut;                   // phase C -> phase K
+  std::vector<ExplosionOp> spellExps;  // phase I -> phase K
+};
+
+#define SV_ENGINE_REFS                                     \
+  GpuContext& ctx = w.ctx;                                 \
+  World& world = w.world;                                  \
+  Simulation& sim = w.sim;                                 \
+  Stream& stream = w.stream;                               \
+  FarField& far = w.far;                                   \
+  Physics& phys = w.phys;                                  \
+  MobSystem& mobs = w.mobs;                                \
+  DebrisSystem& debris = w.debris;                         \
+  MicroBodySet& mbSet = w.mbSet;                           \
+  const std::vector<MaterialDef>& mats = w.mats;           \
+  const GlyphLibrary& glyphs = w.glyphs;                   \
+  const ItemLibrary& items = w.items;                      \
+  const std::vector<Prefab>& prefabs = w.prefabs;          \
+  const std::vector<uint32_t>& classOf = w.classOf;        \
   const int labScene = w.labScene;
-  // per-world tick scratch (section D of TickAuthorityCtx)
-  auto& sphereModels = w.sphereModels;
-  auto& aiSpawnedMobs = w.aiSpawnedMobs;
-  bool& everExploded = w.everExploded;
-  uint32_t& lastExplosionTick = w.lastExplosionTick;
-  uint32_t& fluidCount = w.fluidCount;
-  auto& fluidPendingSpawns = w.fluidPendingSpawns;
-  uint32_t& fluidCueMat = w.fluidCueMat;
-  uint32_t& lastFluidTick = w.lastFluidTick;
-  uint32_t* fluidSpeciesMat = w.fluidSpeciesMat;
-  uint32_t& labTick = w.labTick;
-  bool& duelDummySpawned = w.duelDummySpawned;
-  // the presentation seam (section C)
-  UIState& ui = w.ui;
-  const double now = w.frameTime;
-  HitStop& hitStop = w.hitStop;
-  DeathBody& deathBody = w.deathBody;
-  bool& deathFrozen = w.deathFrozen;
-  const bool liveTimed = w.liveTimed;
-  PassTimer& liveTimer = w.liveTimer;
-  sandvox::PerfSample& liveSample = w.liveSample;
-  const uint32_t liveFrameNo = w.liveFrameNo;
-  float& tickMsSmooth = w.tickMsSmooth;
-  uint64_t& g_farEntries = w.farEntries;
-  uint64_t& g_farTicks = w.farTicks;
+
+#define SV_SCRATCH_REFS                                    \
+  auto& sphereModels = w.sphereModels;                     \
+  auto& aiSpawnedMobs = w.aiSpawnedMobs;                   \
+  bool& everExploded = w.everExploded;                     \
+  uint32_t& lastExplosionTick = w.lastExplosionTick;       \
+  uint32_t& fluidCount = w.fluidCount;                     \
+  auto& fluidPendingSpawns = w.fluidPendingSpawns;         \
+  uint32_t& fluidCueMat = w.fluidCueMat;                   \
+  uint32_t& lastFluidTick = w.lastFluidTick;               \
+  uint32_t* fluidSpeciesMat = w.fluidSpeciesMat;           \
+  uint32_t& labTick = w.labTick;                           \
+  bool& duelDummySpawned = w.duelDummySpawned;             \
+  const double now = w.frameTime;                          \
+  uint32_t& farCount = ws.farCount;                        \
+  bool& particlesActive = ws.particlesActive;              \
+  IVec3& pc = ws.pc;                                       \
+  double& t0 = ws.t0;                                      \
+  double& tSubmit0 = ws.tSubmit0;                          \
+  double& tSubmit1 = ws.tSubmit1;                          \
+  double& tPhys1 = ws.tPhys1;
+
+#define SV_TELEMETRY_REFS                                  \
+  const bool liveTimed = w.liveTimed;                      \
+  PassTimer& liveTimer = w.liveTimer;                      \
+  sandvox::PerfSample& liveSample = w.liveSample;          \
+  const uint32_t liveFrameNo = w.liveFrameNo;              \
+  float& tickMsSmooth = w.tickMsSmooth;                    \
+  uint64_t& g_farEntries = w.farEntries;                   \
+  uint64_t& g_farTicks = w.farTicks;                       \
   uint64_t& g_farBiggest = w.farBiggest;
-  // the player (session.h)
-  Camera& cam = s.cam;
-  Player& player = s.player;
-  PlayerAvatar& avatar = s.avatar;
-  std::string& avatarDefName = s.avatarDefName;
-  ThirdPersonRig& tpRig = s.tpRig;
-  CameraMode& camMode = s.camMode;
-  float& avatarHeading = s.avatarHeading;
-  float& respawnTimer = s.respawnTimer;
-  const uint64_t playerBody = s.playerBody;
-  const Player::KindFn& kindAt = s.kindAt;
-  Brush& brush = s.brush;
-  PrefabPlacer& placer = s.placer;
-  Inventory& hotbar = s.hotbar;
-  PlayerKit& kit = s.kit;
-  std::string (&wearTried)[kEquipSlotCount] = s.wearTried;
-  uint32_t (&wearDye)[kEquipSlotCount] = s.wearDye;
-  GrabHold& grab = s.grab;
-  SpellSystem& spells = s.spells;
-  PlayerCaster& caster = s.caster;
-  CasterHealth& playerHealth = s.playerHealth;
-  auto& spellFlashes = s.spellFlashes;
-  int& castAtPartQueued = s.castAtPartQueued;
-  MeleeState& melee = s.melee;
-  SwingPhase& meleePhasePrev = s.meleePhasePrev;
-  StrikePicker& strikePicker = s.strikePicker;
-  StrokeCursor& playerStrike = s.playerStrike;
-  int& strikeQueued = s.strikeQueued;
-  int& strikeBuffered = s.strikeBuffered;
-  Vec3& lastEdgeBase = s.lastEdgeBase;
-  Vec3& lastEdgeTip = s.lastEdgeTip;
-  bool& lastEdgeValid = s.lastEdgeValid;
-  auto& strikeIgnore = s.strikeIgnore;
-  auto& playerStruck = s.playerStruck;
-  bool& playerBitten = s.playerBitten;
-  CombatCueRequest& combatWhooshCue = s.combatWhooshCue;
-  CombatCueRequest& combatFleshCue = s.combatFleshCue;
-  CombatCueRequest& combatClangCue = s.combatClangCue;
-  CombatCueRequest& combatStrikeCue = s.combatStrikeCue;
-  CombatCueRequest& combatCutCue = s.combatCutCue;
-  bool& combatStrikeEdged = s.combatStrikeEdged;
-  auto& grenades = s.grenades;
-  bool& captured = s.captured;
-  // what the frame layer decided (FrameIntent)
-  const bool brushActive = intent.brushActive;
-  const bool meleeArmed = intent.meleeArmed;
-  const bool meleeReady = intent.meleeReady;
-  const ItemDef* heldItem = intent.heldItem;
-  // THE TICK'S OPS. Aliased out of the caller's batch instead of declared in
-  // the body, which is the one structural change the move makes: the batch is
-  // what a server would forward. Cleared rather than reconstructed, so the
-  // values are identical and the capacity survives the tick.
-  out.Clear();
-  std::vector<BrushOp>& ops = out.ops;
-  std::vector<ExplosionOp>& exps = out.exps;
-  std::vector<CellOp>& cellOps = out.cells;
-  std::vector<ParticleSpawn>& spawns = out.spawns;
+
+#define SV_OPS_REFS                                        \
+  std::vector<BrushOp>& ops = out.ops;                     \
+  std::vector<ExplosionOp>& exps = out.exps;               \
+  std::vector<CellOp>& cellOps = out.cells;                \
+  std::vector<ParticleSpawn>& spawns = out.spawns;         \
   std::vector<FluidSpawnOp>& fluidSpawns = out.fluid;
+
+#define SV_PLAYER_REFS                                     \
+  PlayerSession& s = *st.s;                                \
+  const TickInput& ti = st.ti;                             \
+  Camera& cam = s.cam;                                     \
+  Player& player = s.player;                               \
+  PlayerAvatar& avatar = s.avatar;                         \
+  std::string& avatarDefName = s.avatarDefName;            \
+  ThirdPersonRig& tpRig = s.tpRig;                         \
+  CameraMode& camMode = s.camMode;                         \
+  float& avatarHeading = s.avatarHeading;                  \
+  float& respawnTimer = s.respawnTimer;                    \
+  const uint64_t playerBody = s.playerBody;                \
+  const Player::KindFn& kindAt = s.kindAt;                 \
+  bool& wasInLiquid = s.wasInLiquid;                       \
+  Brush& brush = s.brush;                                  \
+  PrefabPlacer& placer = s.placer;                         \
+  Inventory& hotbar = s.hotbar;                            \
+  PlayerKit& kit = s.kit;                                  \
+  std::string(&wearTried)[kEquipSlotCount] = s.wearTried;  \
+  uint32_t(&wearDye)[kEquipSlotCount] = s.wearDye;         \
+  GrabHold& grab = s.grab;                                 \
+  SpellSystem& spells = s.spells;                          \
+  PlayerCaster& caster = s.caster;                         \
+  CasterHealth& playerHealth = s.playerHealth;             \
+  auto& spellFlashes = s.spellFlashes;                     \
+  int& castAtPartQueued = s.castAtPartQueued;              \
+  MeleeState& melee = s.melee;                             \
+  SwingPhase& meleePhasePrev = s.meleePhasePrev;           \
+  StrikePicker& strikePicker = s.strikePicker;             \
+  StrokeCursor& playerStrike = s.playerStrike;             \
+  int& strikeQueued = s.strikeQueued;                      \
+  int& strikeBuffered = s.strikeBuffered;                  \
+  Vec3& lastEdgeBase = s.lastEdgeBase;                     \
+  Vec3& lastEdgeTip = s.lastEdgeTip;                       \
+  bool& lastEdgeValid = s.lastEdgeValid;                   \
+  auto& strikeIgnore = s.strikeIgnore;                     \
+  auto& playerStruck = s.playerStruck;                     \
+  bool& playerBitten = s.playerBitten;                     \
+  CombatCueRequest& combatWhooshCue = s.combatWhooshCue;   \
+  CombatCueRequest& combatFleshCue = s.combatFleshCue;     \
+  CombatCueRequest& combatClangCue = s.combatClangCue;     \
+  CombatCueRequest& combatStrikeCue = s.combatStrikeCue;   \
+  CombatCueRequest& combatCutCue = s.combatCutCue;         \
+  bool& combatStrikeEdged = s.combatStrikeEdged;           \
+  auto& grenades = s.grenades;                             \
+  bool& captured = s.captured;                             \
+  const bool brushActive = st.intent.brushActive;          \
+  const bool meleeArmed = st.intent.meleeArmed;            \
+  const bool meleeReady = st.intent.meleeReady;            \
+  const ItemDef* heldItem = st.intent.heldItem;            \
+  LaserCut& laserCut = ps.laserCut;                        \
+  std::vector<ExplosionOp>& spellExps = ps.spellExps;
+
+// THE PRESENTATION SEAM, BOUND TWO WAYS.
+//
+// A world phase writes the real window's UIState, HitStop and DeathBody — it
+// IS the window's tick. A PLAYER phase writes them only when that player owns
+// the view; a session whose window is on another machine writes into its own
+// throw-away PresentationSink instead. Binding the sink once, here, rather
+// than guarding forty call sites, is what makes the rule checkable: there is
+// no path from a non-view session to the window's death screen, its hit-stop
+// dip, its refused-spell counter or its combat cues, because the NAMES those
+// sites use do not reach it.
+//
+// The sink PERSISTS on the session (it is not per-tick scratch) because the
+// death block reads back what it wrote last tick: `if (!ui.deathScreen)` is
+// what starts the respawn hold, and a sink rebuilt every tick would restart
+// that hold forever.
+#define SV_SEAM_REFS_WORLD                                 \
+  UIState& ui = w.ui;                                      \
+  HitStop& hitStop = w.hitStop;                            \
+  DeathBody& deathBody = w.deathBody;                      \
+  bool& deathFrozen = w.deathFrozen;
+
+#define SV_SEAM_REFS_PLAYER                                \
+  UIState& ui = s.sink ? s.sink->ui : w.ui;                \
+  HitStop& hitStop = s.sink ? s.sink->hitStop : w.hitStop; \
+  DeathBody& deathBody = s.sink ? s.sink->deathBody : w.deathBody; \
+  bool& deathFrozen = s.sink ? s.sink->deathFrozen : w.deathFrozen;
+
+// ---- PHASE A (PLAYER) - the controller, the look delta and the strike quantize
+// Verbatim from the single-body TickAuthority, lines 246-361 at 54fe241.
+static void PhaseA(TickAuthorityCtx& w, WorldScratch& ws,
+                    SessionTick& st, PlayerScratch& ps, uint32_t tick,
+                    OpBatch& out) {
+  SV_ENGINE_REFS
+  SV_SCRATCH_REFS
+  SV_TELEMETRY_REFS
+  SV_OPS_REFS
+  SV_PLAYER_REFS
+  SV_SEAM_REFS_PLAYER
   {
       // ================= THE PLAYER, ON THE TICK (N2) =====================
       //
@@ -289,7 +413,11 @@ void TickAuthority(TickAuthorityCtx& w, PlayerSession& s,
       // cue's twin — a cue fires on the same event but through a different
       // system, and coupling them would make one of them the other's trigger.
       {
-        static bool wasInLiquid = false;
+        // `wasInLiquid` IS THE SESSION'S (M9.1 P1). It was the one
+        // function static in this file, which is exactly the shape
+        // DESIGN.md S10 forbids: two players wading into two lakes would
+        // have shared one edge detector and the second splash would never
+        // have fired.
         const float enterSpeed = -player.vel.y;
         // A limp or rising body owns the player, not the controller: no
         // input, no gravity, no sweeps. The capsule is moved onto the body
@@ -315,13 +443,21 @@ void TickAuthority(TickAuthorityCtx& w, PlayerSession& s,
       // The altitude pin and the park latch are argv state the FRAME layer
       // owns, and both have to apply BETWEEN player.Update and everything
       // that reads the position -- which is exactly here. Null in the game.
-      if (w.afterPlayerUpdate) w.afterPlayerUpdate(player, tick);
+      // ...FOR THE PRIMARY ONLY. --autofly-surface pins an altitude and
+      // --autofly-park latches a stop; both are the FRAME layer's script
+      // for the window's own player, and running them for every session
+      // would fly a remote body on this machine's argv.
+      if (s.index == 0 && w.afterPlayerUpdate) w.afterPlayerUpdate(player, tick);
       // THE COMMAND JOINS THE RECORD (package N3, sim/oprecord.h). Stashed
       // here rather than passed to SubmitTick at the bottom of the tick: the
       // command is decided at the TOP of the body and threading it through a
       // signature four harnesses share to carry a value only the game has is
       // the worse trade — the gen list is stashed for the same reason.
-      sandvox::opstream::NoteTickInput(tick, ti);
+      // ONE COMMAND PER TICK IN THE RECORD, and it is the primary's: a
+      // Frame carries a single `cmd` (sim/oprecord.h), so a second session
+      // calling this would overwrite the first. The format that carries one
+      // command per player is M9.2's wire, not this file's record.
+      if (s.index == 0) sandvox::opstream::NoteTickInput(tick, ti);
       // ---- THE LOOK DELTA, ROUTED BY MODE, ONCE PER TICK ------------------
       // Both consumers integrate a whole tick's raw pixels at kTickDt now.
       // Feeding both would double-integrate the same motion into the swing
@@ -359,6 +495,26 @@ void TickAuthority(TickAuthorityCtx& w, PlayerSession& s,
         }
       }
 
+  }
+}
+
+// ---- PHASE B (WORLD) - the interest set, the window shift and the far cascades
+// Verbatim from the single-body TickAuthority, lines 362-432 at 54fe241.
+static void PhaseB(TickAuthorityCtx& w, WorldScratch& ws,
+                    std::span<SessionTick> players,
+                    std::span<PlayerScratch> scratch, uint32_t tick,
+                    OpBatch& out) {
+  // A world phase that needs A player needs THE PRIMARY: the dev panel,
+  // the far-plume eye and the submit chunk are all the window's.
+  SessionTick& st = players[0];
+  PlayerScratch& ps = scratch[0];
+  SV_ENGINE_REFS
+  SV_SCRATCH_REFS
+  SV_TELEMETRY_REFS
+  SV_SEAM_REFS_WORLD
+  SV_OPS_REFS
+  SV_PLAYER_REFS
+  {
       // recenter the residency window on the player (between ticks only; at
       // most one 1-chunk shift per axis)
       IVec3 playerChunkNow{ifloor(player.pos.x) >> 4, ifloor(player.pos.y) >> 4,
@@ -381,9 +537,20 @@ void TickAuthority(TickAuthorityCtx& w, PlayerSession& s,
       // changes shape (what the window then DOES about it is the chunk
       // authority decision, DESIGN.md §10).
       InterestSet interest;
+      // ONE ENTRY PER SESSION, THE PRIMARY FIRST. `primary = 0` is the only
+      // entry Stream::Update and FarField::Update consume, and session 0 is
+      // the window's: THE WINDOW FOLLOWS THE PRIMARY. The rest are
+      // information for a residency policy that does not exist yet (M9.3),
+      // so adding them cannot move a byte today - and for one session this
+      // list is the same single entry it has always been.
       interest.chunks.push_back(playerChunkNow);
+      for (size_t pi = 1; pi < players.size(); pi++) {
+        const Vec3& pp = players[pi].s->player.pos;
+        interest.chunks.push_back(
+            {ifloor(pp.x) >> 4, ifloor(pp.y) >> 4, ifloor(pp.z) >> 4});
+      }
       interest.primary = 0;
-      uint32_t farCount = 0;
+      farCount = 0;
       {
         // ---- STREAM: the row that flying lights up --------------------
         // The toroidal window shift, chunk fetch/evict and the far-field
@@ -430,10 +597,21 @@ void TickAuthority(TickAuthorityCtx& w, PlayerSession& s,
           g_farBiggest = std::max<uint64_t>(g_farBiggest, farCount);
         }
       }
-      // ---- GAME LOGIC: the rest of the tick body up to the submit ---------
-      // Brush, laser, melee, spells, mob/avatar/debris PreTick, explosions.
-      // Closed at `t0` below, where the submit sequence starts.
-      sandvox::PerfSpan spanGame(sandvox::PerfScope::GameLogic);
+  }
+}
+
+// ---- PHASE C (PLAYER) - brush size/material and the laser ray
+// Verbatim from the single-body TickAuthority, lines 437-535 at 54fe241.
+static void PhaseC(TickAuthorityCtx& w, WorldScratch& ws,
+                    SessionTick& st, PlayerScratch& ps, uint32_t tick,
+                    OpBatch& out) {
+  SV_ENGINE_REFS
+  SV_SCRATCH_REFS
+  SV_TELEMETRY_REFS
+  SV_OPS_REFS
+  SV_PLAYER_REFS
+  SV_SEAM_REFS_PLAYER
+  {
 
       // (`ops` is aliased out of the caller's OpBatch at the top.)
       brush.radius = ui.brushRadius;
@@ -442,12 +620,9 @@ void TickAuthority(TickAuthorityCtx& w, PlayerSession& s,
       // laser (PLAN §C1/C2): laser tool + LMB, or hold F from any tool.
       // Bodies are tested first — a mob limb or debris chunk in the beam
       // takes the hit instead of the wall behind it.
-      struct LaserCut {
-        uint64_t body = 0;
-        Vec3 at{};
-        float radius = 0;
-        bool limb = false;  // a live mob limb carves; plain debris melts
-      } laserCut;
+      // `laserCut` is the SESSION'S tick scratch (PlayerScratch, top of
+      // this file): the cut is decided HERE, where this tick's camera and
+      // physics are current, and applied in phase K where `spawns` exists.
       if (ti.Held(TB_LASER)) {
         const WorldSnapshot& lsnap = world.Snap();
         Vec3 fwd = cam.Forward();
@@ -533,6 +708,26 @@ void TickAuthority(TickAuthorityCtx& w, PlayerSession& s,
                                        {hit.x + r, hit.y + r, hit.z + r});
         }
       }
+  }
+}
+
+// ---- PHASE D (WORLD) - the mob-spawn key, --duel-dummy and the dev/AI panel
+// Verbatim from the single-body TickAuthority, lines 536-794 at 54fe241.
+static void PhaseD(TickAuthorityCtx& w, WorldScratch& ws,
+                    std::span<SessionTick> players,
+                    std::span<PlayerScratch> scratch, uint32_t tick,
+                    OpBatch& out) {
+  // A world phase that needs A player needs THE PRIMARY: the dev panel,
+  // the far-plume eye and the submit chunk are all the window's.
+  SessionTick& st = players[0];
+  PlayerScratch& ps = scratch[0];
+  SV_ENGINE_REFS
+  SV_SCRATCH_REFS
+  SV_TELEMETRY_REFS
+  SV_SEAM_REFS_WORLD
+  SV_OPS_REFS
+  SV_PLAYER_REFS
+  {
 
       // mob spawn (mob tool LMB, or M): drop the selected def at the picked
       // surface, feet on the last empty cell
@@ -792,6 +987,21 @@ void TickAuthority(TickAuthorityCtx& w, PlayerSession& s,
           avatar.SetLimbVelocities(back.normalized() * MetresToCells(1.5f));
         }
       }
+  }
+}
+
+// ---- PHASE E (PLAYER) - the wardrobe panel
+// Verbatim from the single-body TickAuthority, lines 795-894 at 54fe241.
+static void PhaseE(TickAuthorityCtx& w, WorldScratch& ws,
+                    SessionTick& st, PlayerScratch& ps, uint32_t tick,
+                    OpBatch& out) {
+  SV_ENGINE_REFS
+  SV_SCRATCH_REFS
+  SV_TELEMETRY_REFS
+  SV_OPS_REFS
+  SV_PLAYER_REFS
+  SV_SEAM_REFS_PLAYER
+  {
       // ---- WARDROBE panel: make a set of clothes in a colour --------------
       //
       // Producers on the SAME paths the game uses: PlayerKit's own containers
@@ -892,6 +1102,26 @@ void TickAuthority(TickAuthorityCtx& w, PlayerSession& s,
         ui.kitMessageAge = 0.0f;
       }
 
+  }
+}
+
+// ---- PHASE F (WORLD) - the AI panel's behaviour apply
+// Verbatim from the single-body TickAuthority, lines 895-904 at 54fe241.
+static void PhaseF(TickAuthorityCtx& w, WorldScratch& ws,
+                    std::span<SessionTick> players,
+                    std::span<PlayerScratch> scratch, uint32_t tick,
+                    OpBatch& out) {
+  // A world phase that needs A player needs THE PRIMARY: the dev panel,
+  // the far-plume eye and the submit chunk are all the window's.
+  SessionTick& st = players[0];
+  PlayerScratch& ps = scratch[0];
+  SV_ENGINE_REFS
+  SV_SCRATCH_REFS
+  SV_TELEMETRY_REFS
+  SV_SEAM_REFS_WORLD
+  SV_OPS_REFS
+  SV_PLAYER_REFS
+  {
       if (ui.aiApplyBehavior) {
         ui.aiApplyBehavior = false;
         if (ui.aiMobSelected >= 0 &&
@@ -902,6 +1132,21 @@ void TickAuthority(TickAuthorityCtx& w, PlayerSession& s,
                               ui.aiProfileNames[ui.aiBehaviorPick]);
       }
 
+  }
+}
+
+// ---- PHASE G (PLAYER) - sphere, fluid pour, brush op and prefab stamp
+// Verbatim from the single-body TickAuthority, lines 905-1085 at 54fe241.
+static void PhaseG(TickAuthorityCtx& w, WorldScratch& ws,
+                    SessionTick& st, PlayerScratch& ps, uint32_t tick,
+                    OpBatch& out) {
+  SV_ENGINE_REFS
+  SV_SCRATCH_REFS
+  SV_TELEMETRY_REFS
+  SV_OPS_REFS
+  SV_PLAYER_REFS
+  SV_SEAM_REFS_PLAYER
+  {
       // rolling sphere (K): a rigidbody ball, half the player's height in
       // diameter, made of the current brush material. The collider is a true
       // Jolt sphere (CreateSphereBody) so it rolls smoothly; rendering is a
@@ -1083,6 +1328,26 @@ void TickAuthority(TickAuthorityCtx& w, PlayerSession& s,
           stream.MarkModifiedBox(blo, bhi);
         }
       }
+  }
+}
+
+// ---- PHASE H (WORLD) - day phase, the player actor list and mobs.PreTick
+// Verbatim from the single-body TickAuthority, lines 1086-1114 at 54fe241.
+static void PhaseH(TickAuthorityCtx& w, WorldScratch& ws,
+                    std::span<SessionTick> players,
+                    std::span<PlayerScratch> scratch, uint32_t tick,
+                    OpBatch& out) {
+  // A world phase that needs A player needs THE PRIMARY: the dev panel,
+  // the far-plume eye and the submit chunk are all the window's.
+  SessionTick& st = players[0];
+  PlayerScratch& ps = scratch[0];
+  SV_ENGINE_REFS
+  SV_SCRATCH_REFS
+  SV_TELEMETRY_REFS
+  SV_SEAM_REFS_WORLD
+  SV_OPS_REFS
+  SV_PLAYER_REFS
+  {
 
       // Declared before mobs.PreTick so bleed spray and dismemberment gore
       // share the one per-tick spawn stream with debris shatter — the ring and
@@ -1105,13 +1370,42 @@ void TickAuthority(TickAuthorityCtx& w, PlayerSession& s,
       // rate — the same reason the burn pass and the gait live in here.
       // Deliberately the capsule, not the avatar rig: the capsule is what the
       // player actually occupies, and it exists even before the avatar spawns.
-      mobs.SetPlayerActor(player.pos, Player::kHalfXZ, Player::kHalfY * 2.0f,
-                          ui.playerAlive);
+      // A LIST, IN SESSION ORDER (M9.1 P1). SetPlayerActor was the
+      // span-of-one wrapper; the NPC targeting layer has taken a list since
+      // N5, so this is the plumbing catching up and not a new mechanic.
+      // `alive` is the window's HUD mirror for the primary (byte-identical
+      // to what this line always passed) and the avatar's own answer for a
+      // session whose window is somewhere else.
+      ws.actors.clear();
+      for (SessionTick& p : players) {
+        const PlayerSession& pl = *p.s;
+        const bool alive = pl.localView
+                               ? ui.playerAlive
+                               : (!pl.avatar.Spawned() || pl.avatar.IsAlive());
+        ws.actors.push_back({pl.player.pos, Player::kHalfXZ,
+                             Player::kHalfY * 2.0f, alive});
+      }
+      mobs.SetPlayerActors(ws.actors);
 
       // mobs: kinematic walk drive, terrain anchors for ManageTerrain,
       // bleeding ops, per-voxel burning — must run before debris.PreTick
       // consumes the anchors
       mobs.PreTick(tick, world, ops, cellOps, spawns);
+  }
+}
+
+// ---- PHASE I (PLAYER) - the avatar (incl. death/respawn) and magic
+// Verbatim from the single-body TickAuthority, lines 1115-2006 at 54fe241.
+static void PhaseI(TickAuthorityCtx& w, WorldScratch& ws,
+                    SessionTick& st, PlayerScratch& ps, uint32_t tick,
+                    OpBatch& out) {
+  SV_ENGINE_REFS
+  SV_SCRATCH_REFS
+  SV_TELEMETRY_REFS
+  SV_OPS_REFS
+  SV_PLAYER_REFS
+  SV_SEAM_REFS_PLAYER
+  {
 
       // ---- player avatar ----
       // Same slot in the tick order as mobs, and for the same reason: it
@@ -1549,6 +1843,13 @@ void TickAuthority(TickAuthorityCtx& w, PlayerSession& s,
           }
           respawnTimer += kTickDt;
           ui.deathHoldSec = respawnTimer;
+          // A SESSION WITH NO WINDOW HAS NOBODY TO PRESS THE BUTTON. Its
+          // `ui` is the throw-away sink bound at the top of this phase, so
+          // the request the death screen would raise is raised for it once
+          // the same hold has elapsed. The primary never runs this line:
+          // localView is true there.
+          if (!s.localView && respawnTimer >= av.respawnDelay)
+            ui.respawnRequest = true;
           if (ui.respawnRequest && respawnTimer >= av.respawnDelay) {
             ui.respawnRequest = false;
             ui.deathScreen = false;
@@ -1566,7 +1867,9 @@ void TickAuthority(TickAuthorityCtx& w, PlayerSession& s,
               ui.inventoryOpen = false;
               ui.inspectSelected = -1;
               // The cursor is the WINDOW's, and there is no window here.
-              if (w.restoreCursorAfterUi) w.restoreCursorAfterUi();
+              // ...and only for the window that owns the cursor.
+              if (s.localView && w.restoreCursorAfterUi)
+                w.restoreCursorAfterUi();
             }
           }
         } else {
@@ -1607,7 +1910,8 @@ void TickAuthority(TickAuthorityCtx& w, PlayerSession& s,
       // Same slot in the tick order as mobs and the avatar, and for the same
       // reason: everything a spell does leaves as ops on the streams assembled
       // below. The VM never touches a voxel buffer (thesis 1 / rule 3).
-      std::vector<ExplosionOp> spellExps;
+      // `spellExps` is the SESSION'S tick scratch (PlayerScratch): filled
+      // here, drained into `exps` in phase K.
       {
         caster.mana.Tick();
         // Dev-panel overrides of the pool (ui/overlay.h devMana*). Applied
@@ -2004,6 +2308,26 @@ void TickAuthority(TickAuthorityCtx& w, PlayerSession& s,
           ui.windPrimsDropped = 0;
         }
       }
+  }
+}
+
+// ---- PHASE J (WORLD) - --fell-tree, debris PreTick and the fluid lab
+// Verbatim from the single-body TickAuthority, lines 2007-2033 at 54fe241.
+static void PhaseJ(TickAuthorityCtx& w, WorldScratch& ws,
+                    std::span<SessionTick> players,
+                    std::span<PlayerScratch> scratch, uint32_t tick,
+                    OpBatch& out) {
+  // A world phase that needs A player needs THE PRIMARY: the dev panel,
+  // the far-plume eye and the submit chunk are all the window's.
+  SessionTick& st = players[0];
+  PlayerScratch& ps = scratch[0];
+  SV_ENGINE_REFS
+  SV_SCRATCH_REFS
+  SV_TELEMETRY_REFS
+  SV_SEAM_REFS_WORLD
+  SV_OPS_REFS
+  SV_PLAYER_REFS
+  {
 
       // ---- --fell-tree: the tree-fell gate's cut, in the live frame loop ----
       // A HOOK (session.h section E): it reads g_frameMs, the frame layer's
@@ -2031,6 +2355,21 @@ void TickAuthority(TickAuthorityCtx& w, PlayerSession& s,
           LabScenePlugOps(labScene, cellOps);
         LabScenePour(labScene, labTick, fluidCount, fluidCueMat, fluidSpawns);
       }
+  }
+}
+
+// ---- PHASE K (PLAYER) - laser kerf, the sword bite, prefab drain, explosions
+// Verbatim from the single-body TickAuthority, lines 2034-2334 at 54fe241.
+static void PhaseK(TickAuthorityCtx& w, WorldScratch& ws,
+                    SessionTick& st, PlayerScratch& ps, uint32_t tick,
+                    OpBatch& out) {
+  SV_ENGINE_REFS
+  SV_SCRATCH_REFS
+  SV_TELEMETRY_REFS
+  SV_OPS_REFS
+  SV_PLAYER_REFS
+  SV_SEAM_REFS_PLAYER
+  {
       // laser kerf into a body, deferred from the input block above so it can
       // reach `spawns` (a cut that severs the body sheds the loose bits)
       if (laserCut.body) {
@@ -2256,9 +2595,16 @@ void TickAuthority(TickAuthorityCtx& w, PlayerSession& s,
       // Spell blasts join here rather than getting their own path, so a
       // firebolt's detonation gets the island checks, body damage, mob carving
       // and impulse a grenade already gets — for free, and consistently.
+      // WHERE THIS SESSION'S BLASTS START. Everything below acts on the
+      // explosions THIS session added, never on the whole batch - with two
+      // players the second pass would otherwise re-crater, re-carve and
+      // re-shove every body the first player's grenade already hit. For one
+      // session expBegin is 0 and every test below is the one it replaces.
+      const size_t expBegin = exps.size();
       for (const ExplosionOp& e : spellExps)
         if (exps.size() < kMaxExplosionsPerTick) exps.push_back(e);
-      if (ui.pendingDetonate) {
+      // X-detonate is the DEV PANEL's, so it fires once, with the primary.
+      if (s.index == 0 && ui.pendingDetonate) {
         ui.pendingDetonate = false;
         const WorldSnapshot& snap = world.Snap();
         if (snap.valid && snap.pick[0] != 0) {
@@ -2281,10 +2627,11 @@ void TickAuthority(TickAuthorityCtx& w, PlayerSession& s,
           i++;
         }
       }
-      if (!exps.empty()) {
+      if (exps.size() > expBegin) {
         everExploded = true;
         lastExplosionTick = tick;
-        for (const ExplosionOp& e : exps) {
+        for (size_t ei = expBegin; ei < exps.size(); ei++) {
+          const ExplosionOp& e = exps[ei];
           debris.AddDestructionEvent(tick, {e.x - e.radius, e.y - e.radius, e.z - e.radius},
                                      {e.x + e.radius, e.y + e.radius, e.z + e.radius});
           // Blow voxels OFF the bodies in range before shoving what survives:
@@ -2332,6 +2679,30 @@ void TickAuthority(TickAuthorityCtx& w, PlayerSession& s,
                                  {e.x + e.radius, e.y + e.radius, e.z + e.radius});
         }
       }
+  }
+}
+
+// ---- PHASE L (WORLD) - dirty marks, the celestial clock and the edit layer
+// Verbatim from the single-body TickAuthority, lines 2335-2384 at 54fe241.
+static void PhaseL(TickAuthorityCtx& w, WorldScratch& ws,
+                    std::span<SessionTick> players,
+                    std::span<PlayerScratch> scratch, uint32_t tick,
+                    OpBatch& out) {
+  // A world phase that needs A player needs THE PRIMARY: the dev panel,
+  // the far-plume eye and the submit chunk are all the window's.
+  SessionTick& st = players[0];
+  PlayerScratch& ps = scratch[0];
+  SV_ENGINE_REFS
+  SV_SCRATCH_REFS
+  SV_TELEMETRY_REFS
+  SV_SEAM_REFS_WORLD
+  SV_OPS_REFS
+  SV_PLAYER_REFS
+  // The GameLogic span is the WORLD's (it is opened once, before the
+  // first session's phase C) and it is closed here, where the submit
+  // sequence starts. Aliased so the body below reads as it always did.
+  sandvox::PerfSpan& spanGame = *ws.spanGame;
+  {
       // CPU-known writes mark chunks modified now — eviction can't wait for
       // the latent dirty-flag snapshot
       for (const BrushOp& b : ops)
@@ -2343,7 +2714,7 @@ void TickAuthority(TickAuthorityCtx& w, PlayerSession& s,
         everExploded = true;
         lastExplosionTick = tick;
       }
-      bool particlesActive =
+      particlesActive =
           everExploded &&
           (tick - lastExplosionTick < 400 || world.Snap().particleCount > 0);
       // MPM fluid sheds micro droplets into the particle system (sim_fluid
@@ -2355,9 +2726,10 @@ void TickAuthority(TickAuthorityCtx& w, PlayerSession& s,
       particlesActive = particlesActive ||
           (lastFluidTick != 0 && tick - lastFluidTick < 300);
 
-      IVec3 pc{ifloor(player.pos.x) / (int)kChunk, ifloor(player.pos.y) / (int)kChunk,
-               ifloor(player.pos.z) / (int)kChunk};
-      double t0 = NowSeconds();
+      pc = IVec3{ifloor(player.pos.x) / (int)kChunk,
+                 ifloor(player.pos.y) / (int)kChunk,
+                 ifloor(player.pos.z) / (int)kChunk};
+      t0 = NowSeconds();
       spanGame.Close();
       // ---- the celestial clock (sim/world.h) -----------------------------
       // Advanced exactly ONCE per sim tick, here, immediately before the
@@ -2382,6 +2754,21 @@ void TickAuthority(TickAuthorityCtx& w, PlayerSession& s,
       if (WorldEditLayer().HasPending() && cellOps.size() < kMaxCellOpsPerTick)
         WorldEditLayer().Drain(world, cellOps,
                                kMaxCellOpsPerTick - (uint32_t)cellOps.size());
+  }
+}
+
+// ---- PHASE M (PLAYER) - the capsule, the grab servo, wards and the swimmer wake
+// Verbatim from the single-body TickAuthority, lines 2385-2436 at 54fe241.
+static void PhaseM(TickAuthorityCtx& w, WorldScratch& ws,
+                    SessionTick& st, PlayerScratch& ps, uint32_t tick,
+                    OpBatch& out) {
+  SV_ENGINE_REFS
+  SV_SCRATCH_REFS
+  SV_TELEMETRY_REFS
+  SV_OPS_REFS
+  SV_PLAYER_REFS
+  SV_SEAM_REFS_PLAYER
+  {
       phys.MovePlayerBody(playerBody, player.pos, kTickDt);
       // ---- the physics grab's servo (game/grab.h) -------------------------
       // HERE, on the tick, and immediately before the Step it is setting up:
@@ -2434,7 +2821,27 @@ void TickAuthority(TickAuthorityCtx& w, PlayerSession& s,
                              player.vel.z * kTickDt, player.submersion,
                              CurrentTuning().sim.waveSwimWake);
       }
-      double tSubmit0 = NowSeconds();
+  }
+}
+
+// ---- PHASE N (WORLD) - SubmitTick and the physics step
+// Verbatim from the single-body TickAuthority, lines 2437-2468 at 54fe241.
+static void PhaseN(TickAuthorityCtx& w, WorldScratch& ws,
+                    std::span<SessionTick> players,
+                    std::span<PlayerScratch> scratch, uint32_t tick,
+                    OpBatch& out) {
+  // A world phase that needs A player needs THE PRIMARY: the dev panel,
+  // the far-plume eye and the submit chunk are all the window's.
+  SessionTick& st = players[0];
+  PlayerScratch& ps = scratch[0];
+  SV_ENGINE_REFS
+  SV_SCRATCH_REFS
+  SV_TELEMETRY_REFS
+  SV_SEAM_REFS_WORLD
+  SV_OPS_REFS
+  SV_PLAYER_REFS
+  {
+      tSubmit0 = NowSeconds();
       SubmitTick(ctx, world, sim, tick, kDefaultSeed, ops, exps, cellOps,
                  tick % 15 == 0 /*hash occasionally*/, pc, true, particlesActive,
                  spawns, farCount, fluidSpawns, fluidCount, fluidSpeciesMat,
@@ -2461,11 +2868,26 @@ void TickAuthority(TickAuthorityCtx& w, PlayerSession& s,
         }
       }
       ui.fluidCount = fluidCount;
-      double tSubmit1 = NowSeconds();
+      tSubmit1 = NowSeconds();
       phys.Step(kTickDt);   // CPU physics overlaps the GPU tick
-      double tPhys1 = NowSeconds();
+      tPhys1 = NowSeconds();
       debris.PostStep();
       mobs.PostStep();
+  }
+}
+
+// ---- PHASE O (PLAYER) - avatar PostStep, the ragdoll follow and the push-out
+// Verbatim from the single-body TickAuthority, lines 2469-2490 at 54fe241.
+static void PhaseO(TickAuthorityCtx& w, WorldScratch& ws,
+                    SessionTick& st, PlayerScratch& ps, uint32_t tick,
+                    OpBatch& out) {
+  SV_ENGINE_REFS
+  SV_SCRATCH_REFS
+  SV_TELEMETRY_REFS
+  SV_OPS_REFS
+  SV_PLAYER_REFS
+  SV_SEAM_REFS_PLAYER
+  {
       avatar.PostStep();
       // ---- the player follows a ragdolled body ----
       // Limp: the capsule rides the pelvis wherever Jolt threw it, so the
@@ -2488,6 +2910,26 @@ void TickAuthority(TickAuthorityCtx& w, PlayerSession& s,
       // a ragdolled player is being placed by the body, not the solver)
       if (!player.fly && !avatarRagdolled)
         player.ApplyPush(phys.PlayerPushOut(playerBody, player.pos), kindAt);
+  }
+}
+
+// ---- PHASE P (WORLD) - the tick's perf accounting
+// Verbatim from the single-body TickAuthority, lines 2491-2515 at 54fe241.
+static void PhaseP(TickAuthorityCtx& w, WorldScratch& ws,
+                    std::span<SessionTick> players,
+                    std::span<PlayerScratch> scratch, uint32_t tick,
+                    OpBatch& out) {
+  // A world phase that needs A player needs THE PRIMARY: the dev panel,
+  // the far-plume eye and the submit chunk are all the window's.
+  SessionTick& st = players[0];
+  PlayerScratch& ps = scratch[0];
+  SV_ENGINE_REFS
+  SV_SCRATCH_REFS
+  SV_TELEMETRY_REFS
+  SV_SEAM_REFS_WORLD
+  SV_OPS_REFS
+  SV_PLAYER_REFS
+  {
       double tEnd = NowSeconds();
       tickMsSmooth += ((float)((tEnd - t0) * 1000.0) - tickMsSmooth) * 0.1f;
       // Accumulate this tick into the frame's sample rather than sending it.
@@ -2514,4 +2956,65 @@ void TickAuthority(TickAuthorityCtx& w, PlayerSession& s,
       if (liveTimed) liveTimer.KickDeferred(ctx, liveFrameNo);
 
   }
+}
+
+// ---- one tick of authority, for N players ---------------------------------
+//
+// The alternation, and nothing else. Read it beside the phase comments above:
+// a starred line is per session, in index order; an unstarred one runs once.
+void TickAuthority(TickAuthorityCtx& w, std::span<SessionTick> players,
+                   uint32_t tick, OpBatch& out) {
+  // A tick with nobody in it is not a tick. Every world phase below reads the
+  // primary for the window's questions, so there has to be one.
+  if (players.empty()) return;
+
+  // ONE BATCH FOR THE WHOLE TICK, cleared once. Every session appends to the
+  // same five vectors in index order, so "op index is push order and push
+  // order is deterministic" (CLAUDE.md rule 3) still holds with two players:
+  // the order is (session 0's ops in phase order), then session 1's.
+  out.Clear();
+
+  WorldScratch ws;
+  std::vector<PlayerScratch> scratch(players.size());
+  // A session with no window of its own gets its presentation sink now, once,
+  // and keeps it: see SV_SEAM_REFS_PLAYER. The primary never allocates one.
+  for (SessionTick& p : players)
+    if (!p.s->localView && !p.s->sink)
+      p.s->sink = std::make_unique<PresentationSink>();
+
+  for (size_t i = 0; i < players.size(); i++)
+    PhaseA(w, ws, players[i], scratch[i], tick, out);
+  PhaseB(w, ws, players, scratch, tick, out);
+  // ---- GAME LOGIC: the rest of the tick body up to the submit ---------
+  // Brush, laser, melee, spells, mob/avatar/debris PreTick, explosions.
+  // Closed at `t0` in phase L, where the submit sequence starts. Opened HERE
+  // — where the old body declared it, between the stream block and the brush
+  // — and opened ONCE: it is the world's row on the Performance tab, not one
+  // player's, and N sessions opening N spans would bill the row N times.
+  ws.spanGame.emplace(sandvox::PerfScope::GameLogic);
+  for (size_t i = 0; i < players.size(); i++)
+    PhaseC(w, ws, players[i], scratch[i], tick, out);
+  PhaseD(w, ws, players, scratch, tick, out);
+  for (size_t i = 0; i < players.size(); i++)
+    PhaseE(w, ws, players[i], scratch[i], tick, out);
+  PhaseF(w, ws, players, scratch, tick, out);
+  for (size_t i = 0; i < players.size(); i++)
+    PhaseG(w, ws, players[i], scratch[i], tick, out);
+  PhaseH(w, ws, players, scratch, tick, out);
+  for (size_t i = 0; i < players.size(); i++)
+    PhaseI(w, ws, players[i], scratch[i], tick, out);
+  PhaseJ(w, ws, players, scratch, tick, out);
+  for (size_t i = 0; i < players.size(); i++)
+    PhaseK(w, ws, players[i], scratch[i], tick, out);
+  PhaseL(w, ws, players, scratch, tick, out);
+  for (size_t i = 0; i < players.size(); i++)
+    PhaseM(w, ws, players[i], scratch[i], tick, out);
+  PhaseN(w, ws, players, scratch, tick, out);
+  for (size_t i = 0; i < players.size(); i++)
+    PhaseO(w, ws, players[i], scratch[i], tick, out);
+  PhaseP(w, ws, players, scratch, tick, out);
+
+  // The span is billed by phase L's Close(); releasing it here keeps the
+  // optional's lifetime inside the tick that owns it.
+  ws.spanGame.reset();
 }

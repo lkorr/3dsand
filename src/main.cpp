@@ -5641,6 +5641,15 @@ int main(int argc, char** argv) {
   // the package's acceptance criterion, and the aliases are a migration seam
   // the next package renames away.
   PlayerSession session;
+  // THIS ONE OWNS THE WINDOW (M9.1 P1). Index 0 is the primary every world
+  // phase of the tick consults for a window question — the dev panel's ray,
+  // the far-plume eye, the chunk the submit centres on — and `localView` is
+  // what lets the tick write the death screen, the hit-stop dip and the combat
+  // cues to the real UIState instead of to a throw-away sink. Both are the
+  // defaults; they are spelled out here because a second session added beside
+  // this one must NOT take them.
+  session.index = 0;
+  session.localView = true;
   Camera& cam = session.cam;
   Player& player = session.player;
   Brush& brush = session.brush;
