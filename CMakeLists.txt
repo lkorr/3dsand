@@ -486,6 +486,7 @@ add_library(sandvox_core OBJECT
   src/game/avatar.cpp
   src/game/thirdperson.cpp
   src/game/spell.cpp
+  src/game/spellgraph.cpp
   src/game/caster.cpp
   src/game/melee.cpp
   src/game/strokes.cpp
@@ -529,6 +530,7 @@ add_library(sandvox_core OBJECT
   src/test/selftest_mob.cpp
   src/test/selftest_worldio.cpp
   src/test/selftest_spell.cpp
+  src/test/selftest_spellgraph.cpp
   src/test/selftest_playerkit.cpp
   src/test/selftest_swing.cpp
   src/test/selftest_combat.cpp

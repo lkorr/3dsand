@@ -1,0 +1,1322 @@
+#include "game/spellgraph.h"
+
+#include <algorithm>
+#include <cstdio>
+#include <functional>
+
+// See spellgraph.h for the three things this file owns and why they are
+// imgui-free. The comments below are about the NON-OBVIOUS half: why the
+// linearizer orders a segment the way it does, and which trees it refuses.
+
+namespace {
+
+// ---- small helpers -----------------------------------------------------------
+
+int RootOf(const SpellTree& t) {
+  return t.clauses.empty() ? -1 : t.clauses[0].root;
+}
+
+bool IsBox(const SpellTree& t, int n) {
+  return n >= 0 && n < (int)t.nodes.size() && t.nodes[n].box;
+}
+bool IsGroup(const SpellTree& t, int n) {
+  return n >= 0 && n < (int)t.nodes.size() && t.nodes[n].group;
+}
+
+// The two scope marks are CONTENT (glyphs.json), not constants: a library
+// without them cannot spell a lane, which is a refusal and not a crash.
+bool FindMarks(const GlyphLibrary& lib, int& laneG, int& endG) {
+  laneG = endG = -1;
+  for (size_t i = 0; i < lib.glyphs.size(); i++) {
+    if (lib.glyphs[i].sort != GlyphSort::Separator) continue;
+    if (lib.glyphs[i].scopeClose) {
+      if (endG < 0) endG = (int)i;
+    } else if (laneG < 0) {
+      laneG = (int)i;
+    }
+  }
+  return laneG >= 0 && endG >= 0;
+}
+
+// A word only merges with the one before it when the parser would merge them:
+// deliveries and scope marks never do (each boxes or opens something of its
+// own), so an adjacency between those is always safe.
+bool Mergeable(const GlyphLibrary& lib, int glyph) {
+  const GlyphDef* g = lib.At(glyph);
+  if (!g) return false;
+  return g->sort != GlyphSort::Delivery && g->sort != GlyphSort::Separator;
+}
+
+// DOES THIS ITEM SPEAK A DELIVERY IN ITS OWN SCOPE? A box's delivery word
+// boxes whatever is in the pile at that moment, so everything emitted before
+// it in the same segment would be swallowed into it. That is why a segment
+// holds at most one such item and it is emitted FIRST.
+bool ContainsBox(const SpellTree& t, int node) {
+  if (node < 0 || node >= (int)t.nodes.size()) return false;
+  const SpellNode& n = t.nodes[node];
+  if (n.box) return true;
+  if (!n.group) return false;
+  return ContainsBox(t, n.left) || ContainsBox(t, n.right);
+}
+
+bool EmptyLeft(const GlyphLibrary& lib, const SpellTree& t, int node) {
+  if (!IsGroup(t, node)) return false;
+  const GlyphDef* g = lib.At(t.nodes[node].glyph);
+  return g && g->hasLeft && t.nodes[node].left < 0;
+}
+bool EmptyRight(const GlyphLibrary& lib, const SpellTree& t, int node) {
+  if (!IsGroup(t, node)) return false;
+  const GlyphDef* g = lib.At(t.nodes[node].glyph);
+  return g && g->hasRight && t.nodes[node].right < 0;
+}
+
+// The sort a slot mask would see for a RAW WORD: the parser's right slot only
+// ever looks at the next merged word node, so this is the whole test.
+bool MaskAccepts(uint8_t mask, GlyphSort s) {
+  if (mask == kSortAny) return true;
+  return (mask & (uint8_t)(1u << (int)s)) != 0;
+}
+
+// ---- the linearizer ----------------------------------------------------------
+
+struct Lin {
+  const GlyphLibrary& lib;
+  const SpellTree& t;
+  int laneG = -1, endG = -1;
+  // How many lane scopes are open where we currently are. A wall word is an
+  // `end`, so it may only be spoken where there is no lane for it to close.
+  int laneDepth = 0;
+  // Set when an item NEEDED a wall where none could be spoken. The words are
+  // still produced (Linearize is total); `Speakable` reads this to refuse.
+  bool wallBlocked = false;
+  bool MayWall() const { return laneDepth == 0 && endG >= 0; }
+
+  std::vector<int> Item(int node);
+  std::vector<int> Scope(int boxNode);
+  std::vector<int> Segment(const std::vector<int>& items);
+};
+
+// The words of ONE item, in spoken order: a word is its id x n; a group is
+// left, the operator x n, right; a box is its whole scope then its delivery.
+std::vector<int> Lin::Item(int node) {
+  std::vector<int> out;
+  if (node < 0 || node >= (int)t.nodes.size()) return out;
+  const SpellNode& n = t.nodes[node];
+  if (n.box) {
+    out = Scope(node);
+    // A box with n > 1 cannot be spoken (saying the delivery twice NESTS it),
+    // so the delivery goes out once and `Speakable` is what refuses the tree.
+    if (n.glyph >= 0) out.push_back(n.glyph);
+    return out;
+  }
+  if (n.group) {
+    // THE RUN MERGE BITES INSIDE AN ITEM TOO. `null end null` is one `null`
+    // taking another; without the wall it says `null null`, which merges into
+    // ONE operator of multiplicity 2 with an empty slot — a different spell.
+    // Same wall, same rule, same reason it may only be spoken outside a lane.
+    auto wall = [&](int next) {
+      if (out.empty() || out.back() != next || !Mergeable(lib, next)) return;
+      if (MayWall()) out.push_back(endG);
+      else wallBlocked = true;
+    };
+    if (n.left >= 0) {
+      const std::vector<int> l = Item(n.left);
+      out.insert(out.end(), l.begin(), l.end());
+    }
+    wall(n.glyph);
+    for (int32_t k = 0; k < n.n; k++) out.push_back(n.glyph);
+    if (n.right >= 0) {
+      const std::vector<int> r = Item(n.right);
+      if (!r.empty()) wall(r.front());
+      out.insert(out.end(), r.begin(), r.end());
+    }
+    return out;
+  }
+  for (int32_t k = 0; k < n.n; k++) out.push_back(n.glyph);
+  return out;
+}
+
+// A box's PILE: the shared segment, then one `lane` ... `end` pair per lane,
+// in lane order. `end` is emitted even for the last lane, so a delivery spoken
+// after the box closes the scope AROUND the lanes and not the lane itself.
+std::vector<int> Lin::Scope(int boxNode) {
+  std::vector<int> out;
+  const SpellNode& b = t.nodes[boxNode];
+  const int32_t L = (int32_t)b.laneAt.size() / 2;
+  std::vector<int> shared;
+  for (int ii : b.items)
+    if (t.nodes[ii].lane == 0) shared.push_back(ii);
+  const std::vector<int> sw = Segment(shared);
+  out.insert(out.end(), sw.begin(), sw.end());
+  for (int32_t k = 1; k <= L; k++) {
+    std::vector<int> seg;
+    for (int ii : b.items)
+      if (t.nodes[ii].lane == k) seg.push_back(ii);
+    if (laneG < 0) continue;   // a library with no marks cannot say a lane
+    out.push_back(laneG);
+    laneDepth++;
+    const std::vector<int> lw = Segment(seg);
+    laneDepth--;
+    out.insert(out.end(), lw.begin(), lw.end());
+    out.push_back(endG);
+  }
+  return out;
+}
+
+// ONE SEGMENT OF A PILE, ordered so that re-speaking it rebuilds it.
+//
+// The pile is a SET (rule 1), so the order is ours to choose — and it is a
+// SEARCH, not a sort, because four rules constrain which item may follow
+// which. Getting this wrong is silent: `trail echo` and `echo trail` are two
+// different trees, and the second binds what the first leaves empty.
+//
+//   1. THE ITEM THAT SPEAKS A DELIVERY OF ITS OWN MUST BE FIRST. Its delivery
+//      word boxes whatever is in the pile at that moment, so anything already
+//      emitted in this segment would be swallowed into it.
+//   2. A GROUP WITH AN EMPTY LEFT SLOT may only follow an item its left mask
+//      REJECTS (or nothing at all). `echo` after `trail` takes it, because
+//      `trail`'s result is a Mod and `echo` wants an Effect — but `trail`
+//      after `echo` does not, so that pair has exactly one legal order.
+//   3. A GROUP WITH AN EMPTY RIGHT SLOT may only be followed by a word its
+//      right mask REJECTS, which in practice means last, or before a `lane` /
+//      `end` / delivery word.
+//   4. Two adjacent identical words MERGE into one item of multiplicity 2, so
+//      an item may not start with the word the previous one ended with.
+//
+// Candidates are tried in canonical `NodeKey` order and the FIRST complete
+// arrangement wins, so the answer is a pure function of the tree — two players
+// who built the same spell by different routes save the same words.
+
+struct SegEntry {
+  int node;
+  std::string key;
+  std::vector<int> words;
+  bool boxy = false;
+  bool emptyLeft = false;
+  uint8_t leftMask = 0;
+  bool emptyRight = false;
+  uint8_t rightMask = 0;
+  GlyphSort sort = GlyphSort::Effect;
+};
+
+// THE WALL. A stray `end` with no lane open is a charged no-op that changes
+// nothing — and the grammar already uses it as a wall: `transmute end fire`
+// is how a sentence says "transmute's right slot stays empty and the fire is
+// beside it, not inside it". The linearizer may therefore spend one (it costs
+// zero mana; `end`'s word cost is 0) to break a binding the order alone cannot
+// — but ONLY where no lane is open, because there an `end` would close it.
+enum class Follow : uint8_t { Ok = 0, NeedWall, No };
+
+// May `e` be spoken with `prev` on top of the pile? `prev == nullptr` is an
+// empty pile (the start of the segment). Rules 3 and 4 are about the word
+// LITERALLY next in the sentence, so a wall between them answers both; rules 1
+// and 2 are about the PILE, which a no-op does not touch, so nothing saves
+// them but a different order.
+Follow CanFollow(const GlyphLibrary& lib, const SegEntry* prev, const SegEntry& e) {
+  if (e.boxy && prev) return Follow::No;                     // rule 1
+  if (e.emptyLeft && prev && MaskAccepts(e.leftMask, prev->sort))
+    return Follow::No;                                       // rule 2
+  if (!prev) return Follow::Ok;
+  if (prev->emptyRight) {                                    // rule 3
+    const GlyphDef* g = lib.At(e.words.front());
+    if (g && MaskAccepts(prev->rightMask, g->sort)) return Follow::NeedWall;
+  }
+  const int w = e.words.front();
+  if (w == prev->words.back() && Mergeable(lib, w)) return Follow::NeedWall;  // rule 4
+  return Follow::Ok;
+}
+
+// Backtracking over the arrangement, lowest key first. `budget` bounds the
+// search so a pathological segment cannot cost more than a refusal. `walls`
+// comes back parallel to `out`: 1 where a wall word has to be spoken first.
+bool SearchOrder(const GlyphLibrary& lib, const std::vector<SegEntry>& es,
+                 std::vector<char>& used, std::vector<int>& out, std::vector<char>& walls,
+                 int prev, bool mayWall, int& budget) {
+  if (out.size() == es.size()) return true;
+  for (size_t i = 0; i < es.size(); i++) {
+    if (used[i]) continue;
+    if (--budget < 0) return false;
+    const Follow f = CanFollow(lib, prev < 0 ? nullptr : &es[(size_t)prev], es[i]);
+    if (f == Follow::No) continue;
+    if (f == Follow::NeedWall && !mayWall) continue;
+    used[i] = 1;
+    out.push_back((int)i);
+    walls.push_back(f == Follow::NeedWall ? 1 : 0);
+    if (SearchOrder(lib, es, used, out, walls, (int)i, mayWall, budget)) return true;
+    walls.pop_back();
+    out.pop_back();
+    used[i] = 0;
+  }
+  return false;
+}
+
+// Try it without spending a wall first, so the canonical form is the shortest
+// one: a wall is a real word on the page and two spells that differ only in
+// one would look different for no reason.
+bool ArrangeSegment(const GlyphLibrary& lib, const std::vector<SegEntry>& es,
+                    bool mayWall, std::vector<int>& order, std::vector<char>& walls) {
+  for (int pass = 0; pass < (mayWall ? 2 : 1); pass++) {
+    std::vector<char> used(es.size(), 0);
+    order.clear();
+    walls.clear();
+    int budget = 40000;
+    if (SearchOrder(lib, es, used, order, walls, -1, pass == 1, budget)) return true;
+  }
+  return false;
+}
+
+std::vector<SegEntry> SegEntries(const GlyphLibrary& lib, const SpellTree& t,
+                                 const std::vector<int>& items,
+                                 const std::function<std::vector<int>(int)>& wordsOf) {
+  std::vector<SegEntry> es;
+  for (int ii : items) {
+    SegEntry e;
+    e.node = ii;
+    e.key = NodeKey(lib, t, ii);
+    e.words = wordsOf(ii);
+    if (e.words.empty()) continue;
+    e.boxy = ContainsBox(t, ii);
+    e.emptyLeft = EmptyLeft(lib, t, ii);
+    e.emptyRight = EmptyRight(lib, t, ii);
+    const GlyphDef* g = lib.At(t.nodes[ii].glyph);
+    if (g) {
+      e.leftMask = g->leftMask;
+      e.rightMask = g->rightMask;
+    }
+    e.sort = NodeSort(lib, t, ii);
+    es.push_back(std::move(e));
+  }
+  std::sort(es.begin(), es.end(),
+            [](const SegEntry& a, const SegEntry& b) { return a.key < b.key; });
+  return es;
+}
+
+std::vector<int> Lin::Segment(const std::vector<int>& items) {
+  std::vector<int> out;
+  if (items.empty()) return out;
+  const std::vector<SegEntry> es =
+      SegEntries(lib, t, items, [this](int ii) { return Item(ii); });
+  std::vector<int> order;
+  std::vector<char> walls;
+  if (!ArrangeSegment(lib, es, MayWall(), order, walls)) {
+    // No arrangement rebuilds this segment. Linearize stays TOTAL: it says the
+    // canonical order anyway, and `Speakable` (which runs the same search) is
+    // what refuses the tree.
+    order.clear();
+    walls.assign(es.size(), 0);
+    for (size_t i = 0; i < es.size(); i++) order.push_back((int)i);
+  }
+  for (size_t k = 0; k < order.size(); k++) {
+    if (walls[k] && endG >= 0) out.push_back(endG);
+    for (int w : es[(size_t)order[k]].words) out.push_back(w);
+  }
+  return out;
+}
+
+// ---- canonical identity ------------------------------------------------------
+
+std::string CanonOf(const GlyphLibrary& lib, const SpellTree& t, int node) {
+  if (node < 0 || node >= (int)t.nodes.size()) return "";
+  const SpellNode& n = t.nodes[node];
+  if (!n.box) return NodeKey(lib, t, node);
+  std::vector<std::string> items;
+  for (int ii : n.items)
+    items.push_back(CanonOf(lib, t, ii) + "#" + std::to_string(t.nodes[ii].n));
+  std::sort(items.begin(), items.end());
+  std::string s = "[";
+  for (const std::string& i : items) s += i + ",";
+  return s + "|" + lib.Delivery(n.glyph).id + "|" + std::to_string(n.laneAt.size() / 2) +
+         "]" + (n.lane > 0 ? "@" + std::to_string(n.lane) : std::string()) + "#" +
+         std::to_string(n.n);
+}
+
+// ---- tree surgery ------------------------------------------------------------
+
+// Where every reachable node hangs: its parent and which slot of it.
+struct Nav {
+  std::vector<int> parent;
+  std::vector<int> slot;   // -1 = a box item, 0 = left, 1 = right
+};
+
+void NavWalk(const SpellTree& t, int node, int parent, int slot, Nav& nav) {
+  if (node < 0 || node >= (int)t.nodes.size()) return;
+  nav.parent[node] = parent;
+  nav.slot[node] = slot;
+  const SpellNode& n = t.nodes[node];
+  if (n.box)
+    for (int ii : n.items) NavWalk(t, ii, node, -1, nav);
+  if (n.group) {
+    NavWalk(t, n.left, node, 0, nav);
+    NavWalk(t, n.right, node, 1, nav);
+  }
+}
+
+Nav BuildNav(const SpellTree& t) {
+  Nav nav;
+  nav.parent.assign(t.nodes.size(), -1);
+  nav.slot.assign(t.nodes.size(), -1);
+  for (const SpellClause& c : t.clauses) NavWalk(t, c.root, -1, -1, nav);
+  return nav;
+}
+
+bool InSubtree(const SpellTree& t, int root, int needle) {
+  if (root < 0 || needle < 0) return false;
+  if (root == needle) return true;
+  const SpellNode& n = t.nodes[root];
+  if (n.box)
+    for (int ii : n.items)
+      if (InSubtree(t, ii, needle)) return true;
+  if (n.group)
+    return InSubtree(t, n.left, needle) || InSubtree(t, n.right, needle);
+  return false;
+}
+
+// Deep-copy a subtree into the same arena (for Move with `copy`).
+int CloneSubtree(SpellTree& t, int node) {
+  if (node < 0) return -1;
+  SpellNode n = t.nodes[node];
+  if (n.box) {
+    std::vector<int> items;
+    for (int ii : n.items) items.push_back(CloneSubtree(t, ii));
+    n.items = items;
+  }
+  if (n.group) {
+    n.left = CloneSubtree(t, n.left);
+    n.right = CloneSubtree(t, n.right);
+  }
+  t.nodes.push_back(n);
+  return (int)t.nodes.size() - 1;
+}
+
+// THE MERGE THE PARSER WOULD DO. `MergePile` collapses identical items of a
+// segment; an edited tree has to do the same or its own words would re-parse
+// to something with a different multiplicity. Bottom-up, because a box's key
+// depends on the items under it.
+void Recanonicalize(const GlyphLibrary& lib, SpellTree& t, int node) {
+  if (node < 0 || node >= (int)t.nodes.size()) return;
+  SpellNode& n = t.nodes[node];
+  if (n.group) {
+    Recanonicalize(lib, t, n.left);
+    Recanonicalize(lib, t, n.right);
+    return;
+  }
+  if (!n.box) return;
+  std::vector<int> items = n.items;
+  for (int ii : items) Recanonicalize(lib, t, ii);
+  const int32_t cap = lib.budgets.maxMultiplicity;
+  std::vector<int> kept;
+  std::vector<std::string> keys;
+  for (int ii : items) {
+    const std::string k = NodeKey(lib, t, ii);
+    bool merged = false;
+    for (size_t j = 0; j < keys.size(); j++) {
+      if (keys[j] != k) continue;
+      t.nodes[kept[j]].n = std::min(t.nodes[kept[j]].n + t.nodes[ii].n, cap);
+      merged = true;
+      break;
+    }
+    if (merged) continue;
+    keys.push_back(k);
+    kept.push_back(ii);
+  }
+  t.nodes[node].items = kept;
+}
+
+void RecanonicalizeTree(const GlyphLibrary& lib, SpellTree& t) {
+  for (SpellClause& c : t.clauses) {
+    Recanonicalize(lib, t, c.root);
+    if (c.root >= 0) c.bag = t.nodes[c.root].items;
+  }
+}
+
+// An edited tree's spoken positions are meaningless (the words move), so they
+// are cleared rather than left lying: only the lane COUNT survives an edit,
+// and it is what the linearizer reads.
+void ForgetSpans(SpellTree& t, int node) {
+  if (node < 0 || node >= (int)t.nodes.size()) return;
+  SpellNode& n = t.nodes[node];
+  n.first = n.last = n.at = -1;
+  if (n.box) {
+    for (int& la : n.laneAt) la = -1;
+    for (int ii : n.items) ForgetSpans(t, ii);
+  }
+  if (n.group) {
+    ForgetSpans(t, n.left);
+    ForgetSpans(t, n.right);
+  }
+}
+
+// ---- the caps ----------------------------------------------------------------
+
+bool ClampedAnywhere(const CastList& l) {
+  for (const SpellCast& c : l.casts)
+    if (c.instancesClamped) return true;
+  for (const BoxPrice& p : l.boxPrice)
+    if (p.instancesClamped) return true;
+  return false;
+}
+
+// THE ONE EXIT every op takes: canonicalize, check the caps, check the tree is
+// sayable, say it, and then PROVE the saying by parsing it back. An op that
+// cannot prove itself is refused, never returned.
+EditResult Finish(const GlyphLibrary& lib, const SpellTree& before, SpellTree& after,
+                  const char* intent) {
+  EditResult r;
+  RecanonicalizeTree(lib, after);
+  for (SpellClause& c : after.clauses) ForgetSpans(after, c.root);
+
+  std::string why;
+  if (!Speakable(lib, after, why)) {
+    r.why = why;
+    return r;
+  }
+  const std::vector<std::string> words = Linearize(lib, after);
+  if ((int)words.size() > kSpellStackMax) {
+    r.why = "that would take " + std::to_string(words.size()) + " words; a spell holds " +
+            std::to_string(kSpellStackMax);
+    return r;
+  }
+  const CastList lb = LowerSpell(lib, before);
+  const CastList la = LowerSpell(lib, after);
+  if (ClampedAnywhere(la) && !ClampedAnywhere(lb)) {
+    r.why = "that would fan past the instance cap (" +
+            std::to_string(lib.budgets.maxInstances) + ")";
+    return r;
+  }
+  // THE PROOF. Two trees are the same spell when their span-agnostic keys are.
+  // Silence is the one asymmetry: an empty word list parses to NO clause (a
+  // spell is never nothing), while the edited tree is still an empty hand.
+  const SpellTree re = words.empty() ? EmptyTree() : ParseWords(lib, words);
+  if (GraphTreeKey(lib, re) != GraphTreeKey(lib, after)) {
+    r.why = std::string(intent) + " cannot be written back as words; "
+            "say it with a lane of its own";
+    return r;
+  }
+  r.ok = true;
+  r.words = words;
+  return r;
+}
+
+// Put a node into a box's segment, merging it with an identical item the way
+// the parser's pile does.
+void PlaceItem(const GlyphLibrary& lib, SpellTree& t, int boxNode, int32_t lane,
+               int node) {
+  t.nodes[node].lane = lane;
+  t.nodes[boxNode].items.push_back(node);
+}
+
+// Detach a node from wherever it hangs. Returns false when it is a clause root.
+bool Detach(SpellTree& t, const Nav& nav, int node) {
+  const int p = nav.parent[node];
+  if (p < 0) return false;
+  if (nav.slot[node] < 0) {
+    std::vector<int>& items = t.nodes[p].items;
+    items.erase(std::remove(items.begin(), items.end(), node), items.end());
+    return true;
+  }
+  if (nav.slot[node] == 0) t.nodes[p].left = -1;
+  else t.nodes[p].right = -1;
+  t.nodes[p].complete = false;
+  return true;
+}
+
+// A lane index the caller may use: 0..L are existing, L+1 opens a new one.
+bool OpenLaneIfNeeded(SpellTree& t, int boxNode, int32_t lane, std::string& why) {
+  const int32_t L = (int32_t)t.nodes[boxNode].laneAt.size() / 2;
+  if (lane < 0) {
+    why = "there is no such lane";
+    return false;
+  }
+  if (lane <= L) return true;
+  if (lane == L + 1) {
+    t.nodes[boxNode].laneAt.push_back(-1);
+    t.nodes[boxNode].laneAt.push_back(-1);
+    return true;
+  }
+  why = "lanes open one at a time; this box has " + std::to_string(L);
+  return false;
+}
+
+SpellNode MakeWord(int glyph) {
+  SpellNode n;
+  n.glyph = glyph;
+  n.n = 1;
+  return n;
+}
+
+// A glyph as a pile ITEM: a noun is a word, an operator is a group with empty
+// pips, a delivery is an EMPTY BOX (the kinetic hit of plan §5).
+int MakeItemFor(const GlyphLibrary& lib, SpellTree& t, int glyphId, std::string& why) {
+  const GlyphDef* g = lib.At(glyphId);
+  if (!g) {
+    why = "that word is not in the library";
+    return -1;
+  }
+  if (g->sort == GlyphSort::Separator) {
+    why = "`" + g->id + "` is structure, not an item; open a lane instead";
+    return -1;
+  }
+  if (g->sort == GlyphSort::Delivery) {
+    SpellNode b;
+    b.box = true;
+    b.glyph = glyphId;
+    b.n = 1;
+    t.nodes.push_back(b);
+    return (int)t.nodes.size() - 1;
+  }
+  if (g->sort == GlyphSort::Operator) {
+    SpellNode grp;
+    grp.glyph = glyphId;
+    grp.n = 1;
+    grp.group = true;
+    grp.complete = !g->hasLeft && !g->hasRight;
+    t.nodes.push_back(grp);
+    return (int)t.nodes.size() - 1;
+  }
+  t.nodes.push_back(MakeWord(glyphId));
+  return (int)t.nodes.size() - 1;
+}
+
+// ---- layout ------------------------------------------------------------------
+
+// THE VISUAL SLOT OF EACH INSTANCE. Instance 0 is the aim, so it takes the
+// CENTRE slot of the socket row and the rest fan outward from it — which is
+// what rule 4 promises about the first lane you open being the middle bolt.
+std::vector<int32_t> SlotOrder(int32_t instances) {
+  std::vector<int32_t> slots((size_t)std::max<int32_t>(instances, 1), -1);
+  const int32_t n = (int32_t)slots.size();
+  const int32_t centre = n / 2;
+  slots[(size_t)centre] = 0;
+  int32_t r = centre + 1, l = centre - 1;
+  for (int32_t i = 1; i < n; i++) {
+    if (r < n) {
+      slots[(size_t)r] = i;
+      r++;
+    } else {
+      slots[(size_t)l] = i;
+      l--;
+    }
+  }
+  return slots;
+}
+
+struct Builder {
+  const GlyphLibrary& lib;
+  const CastList& list;
+  SpellGraph g;
+  int maxLayer = 0;
+
+  int Add(SpellGraphNode n) {
+    g.nodes.push_back(std::move(n));
+    return (int)g.nodes.size() - 1;
+  }
+  void Edge(int from, int to, GraphEdge k) { g.edges.push_back({from, to, k}); }
+
+  std::string ModEdit(const GlyphDef& gd, int32_t n) const;
+  bool IsWasted(int glyph) const;
+  // Places the subtree rooted at `node` with its left edge at `x` and the node
+  // itself on `layer`, and returns its width.
+  int Place(int node, int32_t lane, int layer, int x, int& outIdx);
+};
+
+std::string Builder::ModEdit(const GlyphDef& gd, int32_t n) const {
+  const char* f = ModFieldName(gd.field);
+  // COMPOSED, not per word: `shotgun shotgun` is count x9, and the tag says so.
+  int64_t amount = gd.amount;
+  if (gd.op == ModOp::Add) {
+    amount = (int64_t)gd.amount * n;
+  } else {
+    int64_t a = 1;
+    for (int32_t i = 0; i < n && a < (1 << 20); i++) a *= gd.amount;
+    amount = a;
+  }
+  char buf[96];
+  const char* sym = gd.op == ModOp::Mul ? "x" : (gd.op == ModOp::Div ? "/" : "");
+  if (gd.op == ModOp::Add)
+    std::snprintf(buf, sizeof buf, "%s %+lld", f, (long long)amount);
+  else
+    std::snprintf(buf, sizeof buf, "%s %s%lld", f, sym, (long long)amount);
+  return buf;
+}
+
+bool Builder::IsWasted(int glyph) const {
+  for (const SpellCast& c : list.casts)
+    for (int m : c.wastedMods)
+      if (m == glyph) return true;
+  return false;
+}
+
+int Builder::Place(int node, int32_t lane, int layer, int x, int& outIdx) {
+  const SpellTree& t = list.tree;
+  const SpellNode& n = t.nodes[node];
+  maxLayer = std::max(maxLayer, layer);
+
+  // ---- a plain word ----------------------------------------------------------
+  if (!n.box && !n.group) {
+    SpellGraphNode gn;
+    gn.kind = GraphKind::Word;
+    gn.treeNode = node;
+    gn.glyph = n.glyph;
+    gn.n = n.n;
+    gn.sort = NodeSort(lib, t, node);
+    gn.lane = lane;
+    const GlyphDef* wd = lib.At(n.glyph);
+    gn.label = (wd ? wd->id : "?") + (n.n > 1 ? "x" + std::to_string(n.n) : "");
+    gn.x = x;
+    gn.w = kGraphCell;
+    gn.h = kGraphCell;
+    gn.layer = layer;
+    gn.spanFirst = n.first;
+    gn.spanLast = n.last;
+    gn.subX = x;
+    gn.subW = kGraphCell;
+    outIdx = Add(gn);
+    return kGraphCell;
+  }
+
+  // ---- an operator group ------------------------------------------------------
+  if (n.group) {
+    const GlyphDef* gd = lib.At(n.glyph);
+    std::vector<int> kids;
+    int kidW = 0;
+    if (n.left >= 0) kids.push_back(n.left);
+    if (n.right >= 0) kids.push_back(n.right);
+    // Measure by placing into a scratch pass: the children are laid out first
+    // at a provisional origin and then shifted, which is exact because every
+    // width here is an integer.
+    std::vector<int> kidIdx(kids.size(), -1);
+    std::vector<int> kidWidth(kids.size(), 0);
+    const size_t markNodes = g.nodes.size(), markEdges = g.edges.size();
+    for (size_t i = 0; i < kids.size(); i++) {
+      int idx = -1;
+      kidWidth[i] = Place(kids[i], lane, layer + 1, 0, idx);
+      kidIdx[i] = idx;
+      kidW += kidWidth[i] + (i + 1 < kids.size() ? kGraphGap : 0);
+    }
+    g.nodes.resize(markNodes);
+    g.edges.resize(markEdges);
+    const int total = std::max(kGraphCell, kidW);
+    int cx = x + (total - kidW) / 2;
+    std::vector<int> placed;
+    for (size_t i = 0; i < kids.size(); i++) {
+      int idx = -1;
+      Place(kids[i], lane, layer + 1, cx, idx);
+      placed.push_back(idx);
+      cx += kidWidth[i] + kGraphGap;
+    }
+    SpellGraphNode gn;
+    gn.kind = GraphKind::Operator;
+    gn.treeNode = node;
+    gn.glyph = n.glyph;
+    gn.n = n.n;
+    gn.sort = NodeSort(lib, t, node);
+    gn.lane = lane;
+    gn.label = (gd ? gd->id : "?") + (n.n > 1 ? "x" + std::to_string(n.n) : "");
+    gn.hasLeft = gd && gd->hasLeft;
+    gn.hasRight = gd && gd->hasRight;
+    gn.leftFilled = n.left >= 0;
+    gn.rightFilled = n.right >= 0;
+    gn.complete = n.complete;
+    gn.x = x + (total - kGraphCell) / 2;
+    gn.w = kGraphCell;
+    gn.h = kGraphCell;
+    gn.layer = layer;
+    gn.spanFirst = n.first;
+    gn.spanLast = n.last;
+    gn.subX = x;
+    gn.subW = total;
+    outIdx = Add(gn);
+    for (int p : placed) Edge(p, outIdx, GraphEdge::Slot);
+    return total;
+  }
+
+  // ---- a box: the bar, its sockets, its bus, its tags -------------------------
+  const int32_t L = (int32_t)n.laneAt.size() / 2;
+  const BoxPrice* price = list.PriceOf(node);
+  int32_t instances = price ? price->instances : std::max<int32_t>(1, L);
+  if (instances < 1) instances = 1;
+
+  std::vector<int> mods, shared;
+  std::vector<std::vector<int>> laneItems((size_t)L + 1);
+  for (int ii : n.items) {
+    if (NodeSort(lib, t, ii) == GlyphSort::Mod) {
+      mods.push_back(ii);
+      continue;
+    }
+    const int32_t ln = t.nodes[ii].lane;
+    if (ln <= 0) shared.push_back(ii);
+    else if (ln <= L) laneItems[(size_t)ln].push_back(ii);
+    else shared.push_back(ii);
+  }
+
+  const int tagStripW = (int)mods.size() * (kGraphTagW + kGraphGap);
+  const int barLayer = layer, socketLayer = layer + 1, busLayer = layer + 2,
+            itemLayer = layer + 3;
+
+  // Measure every column by a scratch placement (exact, integers only).
+  auto measureRow = [&](const std::vector<int>& items) {
+    int w = 0;
+    const size_t mn = g.nodes.size(), me = g.edges.size();
+    for (size_t i = 0; i < items.size(); i++) {
+      int idx = -1;
+      w += Place(items[i], t.nodes[items[i]].lane, itemLayer, 0, idx);
+      if (i + 1 < items.size()) w += kGraphGap;
+    }
+    g.nodes.resize(mn);
+    g.edges.resize(me);
+    return w;
+  };
+  const int sharedW = measureRow(shared);
+
+  const std::vector<int32_t> slots = SlotOrder(instances);
+  std::vector<int> socketColW((size_t)instances, kGraphSocketW);
+  for (int32_t inst = 0; inst < instances; inst++) {
+    if (inst >= L) continue;
+    const int w = measureRow(laneItems[(size_t)inst + 1]);
+    socketColW[(size_t)inst] = std::max(kGraphSocketW, w);
+  }
+
+  // TWO SHAPES, because the common case deserves the plan's picture. With no
+  // lanes there is one column — the shared items — and the sockets fan out
+  // under it. With lanes the shared block sits to the LEFT and each lane gets
+  // its own socket column, because a lane's subtree has to stand over the
+  // socket it feeds and cannot share the space with the shared items.
+  int contentW = 0;
+  int sharedX = 0;
+  std::vector<int> colX((size_t)instances, 0);
+  if (L == 0) {
+    int socketsW = 0;
+    for (int32_t s = 0; s < instances; s++)
+      socketsW += socketColW[(size_t)slots[(size_t)s]] + (s + 1 < instances ? kGraphGap : 0);
+    contentW = std::max(std::max(sharedW, socketsW), kGraphSocketW);
+    sharedX = (contentW - sharedW) / 2;
+    // Tile the sockets evenly across the content width so the row is centred.
+    int cx = (contentW - socketsW) / 2;
+    for (int32_t s = 0; s < instances; s++) {
+      const int32_t inst = slots[(size_t)s];
+      colX[(size_t)inst] = cx;
+      cx += socketColW[(size_t)inst] + kGraphGap;
+    }
+  } else {
+    int cx = 0;
+    if (!shared.empty()) {
+      sharedX = 0;
+      cx = sharedW + kGraphGap;
+    }
+    for (int32_t s = 0; s < instances; s++) {
+      const int32_t inst = slots[(size_t)s];
+      colX[(size_t)inst] = cx;
+      cx += socketColW[(size_t)inst] + kGraphGap;
+    }
+    contentW = std::max(cx - kGraphGap, kGraphSocketW);
+  }
+
+  const int barW = std::max(contentW, kGraphMinBarW);
+  const int barX = x + tagStripW;
+  const int contentX = barX + (barW - contentW) / 2;
+
+  // The bar itself.
+  SpellGraphNode bar;
+  bar.kind = n.glyph < 0 ? GraphKind::Root : GraphKind::Join;
+  bar.treeNode = node;
+  bar.glyph = n.glyph;
+  bar.n = n.n;
+  bar.sort = GlyphSort::Delivery;
+  bar.lane = lane;
+  bar.label = lib.Delivery(n.glyph).id;
+  bar.instances = instances;
+  bar.laneCount = L;
+  bar.tagStripW = tagStripW;
+  bar.x = barX;
+  bar.w = barW;
+  bar.h = kGraphBarH;
+  bar.layer = barLayer;
+  bar.spanFirst = n.first;
+  bar.spanLast = n.last;
+  bar.subX = x;
+  bar.subW = tagStripW + barW;
+  if (price) {
+    bar.price = *price;
+    bar.hasPrice = true;
+    bar.subtotal = price->tariff + price->carryCost;
+  }
+  const int barIdx = Add(bar);
+  maxLayer = std::max(maxLayer, itemLayer);
+
+  // The sockets, one per instance, in instance order.
+  std::vector<int> socketIdx((size_t)instances, -1);
+  for (int32_t inst = 0; inst < instances; inst++) {
+    SpellGraphNode s;
+    s.kind = GraphKind::Socket;
+    s.treeNode = -1;
+    s.lane = inst < L ? inst + 1 : 0;
+    s.instance = inst;
+    s.x = contentX + colX[(size_t)inst];
+    s.w = socketColW[(size_t)inst];
+    s.h = kGraphSocketH;
+    s.pipW = kGraphSocketW;
+    s.layer = socketLayer;
+    s.label = "";
+    s.subX = s.x;
+    s.subW = s.w;
+    socketIdx[(size_t)inst] = Add(s);
+    Edge(socketIdx[(size_t)inst], barIdx, GraphEdge::Fan);
+  }
+  g.nodes[(size_t)barIdx].sockets = socketIdx;
+
+  // The bus: what the shared items feed, spanning every socket.
+  int busIdx = -1;
+  if (!shared.empty()) {
+    SpellGraphNode b;
+    b.kind = GraphKind::Bus;
+    b.treeNode = -1;
+    b.x = contentX;
+    b.w = contentW;
+    b.h = kGraphBusH;
+    b.layer = busLayer;
+    b.subX = b.x;
+    b.subW = b.w;
+    busIdx = Add(b);
+    Edge(busIdx, barIdx, GraphEdge::Trunk);
+    g.nodes[(size_t)barIdx].bus = busIdx;
+  }
+
+  // The shared items, above the bus.
+  {
+    int cx = contentX + sharedX;
+    for (size_t i = 0; i < shared.size(); i++) {
+      int idx = -1;
+      const int w = Place(shared[i], 0, itemLayer, cx, idx);
+      if (idx >= 0) Edge(idx, busIdx >= 0 ? busIdx : barIdx,
+                         busIdx >= 0 ? GraphEdge::Bus : GraphEdge::Trunk);
+      cx += w + kGraphGap;
+    }
+  }
+  // Each lane's items, above the socket they feed.
+  for (int32_t k = 1; k <= L && k <= instances; k++) {
+    const int32_t inst = k - 1;
+    const int colW = socketColW[(size_t)inst];
+    const int rowW = measureRow(laneItems[(size_t)k]);
+    int cx = contentX + colX[(size_t)inst] + (colW - rowW) / 2;
+    for (size_t i = 0; i < laneItems[(size_t)k].size(); i++) {
+      int idx = -1;
+      const int w = Place(laneItems[(size_t)k][i], k, itemLayer, cx, idx);
+      if (idx >= 0) Edge(idx, socketIdx[(size_t)inst], GraphEdge::Socket);
+      cx += w + kGraphGap;
+    }
+  }
+
+  // The mod tags, hanging off the bar's left end.
+  {
+    int cx = x;
+    for (int mi : mods) {
+      const SpellNode& mn = t.nodes[mi];
+      SpellGraphNode tg;
+      tg.kind = GraphKind::ModTag;
+      tg.treeNode = mi;
+      tg.glyph = mn.glyph;
+      tg.n = mn.n;
+      tg.sort = GlyphSort::Mod;
+      tg.lane = mn.lane;
+      const GlyphDef* gd = lib.At(mn.glyph);
+      tg.label = gd ? gd->id : "?";
+      // A `trail` GROUP is a Mod too, and it has no field to compose.
+      tg.edit = (gd && !mn.group && gd->field != ModField::None) ? ModEdit(*gd, mn.n)
+                                                                 : std::string();
+      tg.wasted = gd && IsWasted(mn.glyph);
+      tg.x = cx;
+      tg.w = kGraphTagW;
+      tg.h = kGraphTagH;
+      tg.layer = barLayer;
+      tg.spanFirst = mn.first;
+      tg.spanLast = mn.last;
+      tg.subX = tg.x;
+      tg.subW = tg.w;
+      const int idx = Add(tg);
+      Edge(idx, barIdx, GraphEdge::Trunk);
+      cx += kGraphTagW + kGraphGap;
+    }
+  }
+
+  outIdx = barIdx;
+  return tagStripW + barW;
+}
+
+}  // namespace
+
+// ---- public: words and trees --------------------------------------------------
+
+std::vector<int> WordsToGlyphs(const GlyphLibrary& lib,
+                               const std::vector<std::string>& words) {
+  std::vector<int> out;
+  for (const std::string& w : words) {
+    const int gi = lib.Find(w);
+    if (gi >= 0) out.push_back(gi);
+  }
+  return out;
+}
+
+std::vector<std::string> GlyphsToWords(const GlyphLibrary& lib,
+                                       const std::vector<int>& glyphs) {
+  std::vector<std::string> out;
+  for (int g : glyphs) {
+    const GlyphDef* d = lib.At(g);
+    out.push_back(d ? d->id : "?");
+  }
+  return out;
+}
+
+SpellTree ParseWords(const GlyphLibrary& lib, const std::vector<std::string>& words) {
+  SpellStack st;
+  st.spoken = WordsToGlyphs(lib, words);
+  return ParseSpell(lib, st);
+}
+
+SpellTree EmptyTree() {
+  SpellTree t;
+  SpellNode hand;
+  hand.box = true;
+  hand.glyph = -1;
+  hand.n = 1;
+  t.nodes.push_back(hand);
+  SpellClause c;
+  c.root = 0;
+  c.delivery = -1;
+  c.weight = 1;
+  t.clauses.push_back(c);
+  return t;
+}
+
+std::string GraphTreeKey(const GlyphLibrary& lib, const SpellTree& tree) {
+  std::string s;
+  for (const SpellClause& c : tree.clauses) s += "<" + CanonOf(lib, tree, c.root) + ">";
+  return s;
+}
+
+std::vector<std::string> Linearize(const GlyphLibrary& lib, const SpellTree& tree) {
+  const int root = RootOf(tree);
+  if (root < 0) return {};
+  Lin lin{lib, tree};
+  FindMarks(lib, lin.laneG, lin.endG);
+  // The hand root emits its items and NO delivery word: it is implicit.
+  return GlyphsToWords(lib, lin.Scope(root));
+}
+
+bool Speakable(const GlyphLibrary& lib, const SpellTree& tree, std::string& why) {
+  why.clear();
+  const int root = RootOf(tree);
+  if (root < 0) return true;
+  int laneG = -1, endG = -1;
+  const bool marks = FindMarks(lib, laneG, endG);
+
+  // EVERY BOX, EVERY SEGMENT OF IT, carrying the lane depth down — because a
+  // wall word is an `end` and whether one may be spoken here depends on
+  // whether a lane is open around us. Depth follows the linearizer exactly:
+  // a box's shared segment is at its own depth, each of its lanes one deeper.
+  std::function<bool(int, int)> walk = [&](int node, int depth) -> bool {
+    const SpellNode& n = tree.nodes[node];
+    if (n.group) {
+      if (n.left >= 0 && !walk(n.left, depth)) return false;
+      if (n.right >= 0 && !walk(n.right, depth)) return false;
+      return true;
+    }
+    if (!n.box) return true;
+    // A BOX SAID TWICE IS A BOX INSIDE A BOX. Multiplicity on a delivery has
+    // no spelling, so a merged pair of identical boxes is not a sentence.
+    if (n.n > 1 && n.glyph >= 0) {
+      why = "two identical `" + lib.Delivery(n.glyph).id +
+            "` boxes side by side cannot be spoken; give one its own lane";
+      return false;
+    }
+    const int32_t L = (int32_t)n.laneAt.size() / 2;
+    if (L > 0 && !marks) {
+      why = "this library has no `lane` word";
+      return false;
+    }
+    for (int32_t k = 0; k <= L; k++) {
+      const int inner = depth + (k == 0 ? 0 : 1);
+      std::vector<int> seg;
+      for (int ii : n.items)
+        if (tree.nodes[ii].lane == k) seg.push_back(ii);
+      for (int ii : seg)
+        if (!walk(ii, inner)) return false;
+      {
+        // An ITEM may need a wall of its own (`null end null`), and inside a
+        // lane there is none to spend.
+        Lin one{lib, tree, laneG, endG, inner};
+        for (int ii : seg) one.Item(ii);
+        if (one.wallBlocked) {
+          why = "that pile needs a wall word, and `end` inside a lane would "
+                "close the lane; say it outside the lane";
+          return false;
+        }
+      }
+      if (seg.size() < 2) continue;
+      // THE SAME SEARCH THE LINEARIZER RUNS. A segment is speakable exactly
+      // when some arrangement of it rebuilds it; anything else is a tree no
+      // sentence says, however the words are shuffled.
+      Lin lin{lib, tree, laneG, endG, inner};
+      const std::vector<SegEntry> es =
+          SegEntries(lib, tree, seg, [&lin](int ii) { return lin.Item(ii); });
+      std::vector<int> order;
+      std::vector<char> walls;
+      if (ArrangeSegment(lib, es, lin.MayWall(), order, walls)) continue;
+      // Name the collision rather than saying "no". These are the ones
+      // PLAN_spell_graph §5 calls out, and the ones a player meets.
+      std::vector<const SegEntry*> empties;
+      int boxy = 0;
+      for (const SegEntry& e : es) {
+        if (e.boxy) boxy++;
+        if (e.emptyLeft) empties.push_back(&e);
+      }
+      if (empties.size() >= 2) {
+        why = "an empty `" + lib.Delivery(tree.nodes[empties[0]->node].glyph).id +
+              "` beside an empty `" +
+              lib.Delivery(tree.nodes[empties[1]->node].glyph).id +
+              "` cannot be spoken; fill one first";
+      } else if (boxy > 1) {
+        why = "two deliveries in one lane would swallow each other; "
+              "give the second a lane of its own";
+      } else if (boxy > 0 && !empties.empty()) {
+        why = "an empty `" + lib.Delivery(tree.nodes[empties[0]->node].glyph).id +
+              "` beside a delivery cannot be spoken; fill it first";
+      } else {
+        why = "no word order says that pile; give one of its items a lane";
+      }
+      return false;
+    }
+    return true;
+  };
+  return walk(root, 0);
+}
+
+// ---- public: layout -----------------------------------------------------------
+
+SpellGraph BuildGraph(const GlyphLibrary& lib, const CastList& list) {
+  SpellGraph out;
+  const int root = RootOf(list.tree);
+  if (root < 0) return out;
+  Builder b{lib, list};
+  int idx = -1;
+  const int w = b.Place(root, 0, 0, 0, idx);
+  b.g.root = idx;
+  b.g.width = w;
+  b.g.layers = b.maxLayer + 1;
+  b.g.height = b.g.layers * kGraphPitch;
+  // LAYER -> Y, once, at the end: the root is at the maximum y and the tree
+  // grows upward, which is the direction the page draws.
+  for (SpellGraphNode& n : b.g.nodes) n.y = (b.maxLayer - n.layer) * kGraphPitch;
+  return std::move(b.g);
+}
+
+// ---- public: the edit ops -----------------------------------------------------
+
+EditResult InsertItem(const GlyphLibrary& lib, const SpellTree& tree, int boxNode,
+                      int32_t lane, int glyphId) {
+  EditResult r;
+  SpellTree t = tree;
+  if (!IsBox(t, boxNode)) {
+    r.why = "that is not a box";
+    return r;
+  }
+  if (!OpenLaneIfNeeded(t, boxNode, lane, r.why)) return r;
+  const int item = MakeItemFor(lib, t, glyphId, r.why);
+  if (item < 0) return r;
+  PlaceItem(lib, t, boxNode, lane, item);
+  return Finish(lib, tree, t, "that item");
+}
+
+EditResult AttachMod(const GlyphLibrary& lib, const SpellTree& tree, int boxNode,
+                     int32_t lane, int glyphId) {
+  EditResult r;
+  const GlyphDef* g = lib.At(glyphId);
+  if (!g) {
+    r.why = "that word is not in the library";
+    return r;
+  }
+  if (g->sort != GlyphSort::Mod) {
+    r.why = "`" + g->id + "` is not a mod";
+    return r;
+  }
+  return InsertItem(lib, tree, boxNode, lane, glyphId);
+}
+
+EditResult FillSlot(const GlyphLibrary& lib, const SpellTree& tree, int groupNode,
+                    SlotSide side, int glyphId) {
+  EditResult r;
+  SpellTree t = tree;
+  if (!IsGroup(t, groupNode)) {
+    r.why = "that is not an operator";
+    return r;
+  }
+  const GlyphDef* op = lib.At(t.nodes[groupNode].glyph);
+  const GlyphDef* g = lib.At(glyphId);
+  if (!op || !g) {
+    r.why = "that word is not in the library";
+    return r;
+  }
+  const bool left = side == SlotSide::Left;
+  if (!(left ? op->hasLeft : op->hasRight)) {
+    r.why = "`" + op->id + "` has no " + (left ? "left" : "right") + " slot";
+    return r;
+  }
+  if ((left ? t.nodes[groupNode].left : t.nodes[groupNode].right) >= 0) {
+    r.why = "that slot is already filled";
+    return r;
+  }
+  const int item = MakeItemFor(lib, t, glyphId, r.why);
+  if (item < 0) return r;
+  if (!MaskAccepts(left ? op->leftMask : op->rightMask, NodeSort(lib, t, item))) {
+    r.why = "`" + op->id + "` does not take a " +
+            GlyphSortName(NodeSort(lib, t, item)) + " there";
+    return r;
+  }
+  if (left) t.nodes[groupNode].left = item;
+  else t.nodes[groupNode].right = item;
+  // AN OPERAND IS NOT A PILE ITEM. The parser pops it off the pile before
+  // `CloseBox` stamps lanes, so it keeps lane 0 whatever lane its group sits
+  // in - and `NodeKey` spells the lane, so stamping it here would make the
+  // edited tree disagree with its own words.
+  t.nodes[item].lane = 0;
+  t.nodes[groupNode].complete =
+      (!op->hasLeft || t.nodes[groupNode].left >= 0) &&
+      (!op->hasRight || t.nodes[groupNode].right >= 0);
+  return Finish(lib, tree, t, "that slot");
+}
+
+EditResult WrapInBox(const GlyphLibrary& lib, const SpellTree& tree, int node,
+                     int deliveryGlyphId) {
+  EditResult r;
+  SpellTree t = tree;
+  if (node < 0 || node >= (int)t.nodes.size()) {
+    r.why = "there is nothing there to box";
+    return r;
+  }
+  const GlyphDef* d = lib.At(deliveryGlyphId);
+  if (!d || d->sort != GlyphSort::Delivery) {
+    r.why = "that is not a delivery";
+    return r;
+  }
+  const Nav nav = BuildNav(t);
+  const int parent = nav.parent[node];
+  if (parent < 0) {
+    // A DELIVERY DROPPED ON THE ROOT BOXES THE WHOLE PILE, which is what a
+    // delivery word at the end of a sentence does: the hand keeps exactly one
+    // item, the new box, and the lanes go with it because they were the pile's.
+    if (!IsBox(t, node)) {
+      r.why = "there is nothing there to box";
+      return r;
+    }
+    SpellNode b;
+    b.box = true;
+    b.glyph = deliveryGlyphId;
+    b.n = 1;
+    b.lane = 0;
+    b.items = t.nodes[node].items;
+    b.laneAt = t.nodes[node].laneAt;
+    t.nodes.push_back(b);
+    const int boxIdx = (int)t.nodes.size() - 1;
+    t.nodes[node].items.assign(1, boxIdx);
+    t.nodes[node].laneAt.clear();
+    return Finish(lib, tree, t, "that box");
+  }
+  const int32_t lane = t.nodes[node].lane;
+  SpellNode b;
+  b.box = true;
+  b.glyph = deliveryGlyphId;
+  b.n = 1;
+  b.lane = lane;
+  b.items.push_back(node);
+  t.nodes.push_back(b);
+  const int boxIdx = (int)t.nodes.size() - 1;
+  t.nodes[node].lane = 0;   // it is the new box's shared pile now
+  if (nav.slot[node] < 0) {
+    std::vector<int>& items = t.nodes[parent].items;
+    for (int& ii : items)
+      if (ii == node) ii = boxIdx;
+  } else if (nav.slot[node] == 0) {
+    t.nodes[parent].left = boxIdx;
+  } else {
+    t.nodes[parent].right = boxIdx;
+  }
+  return Finish(lib, tree, t, "that box");
+}
+
+EditResult Unbox(const GlyphLibrary& lib, const SpellTree& tree, int boxNode) {
+  EditResult r;
+  SpellTree t = tree;
+  if (!IsBox(t, boxNode)) {
+    r.why = "that is not a box";
+    return r;
+  }
+  const Nav nav = BuildNav(t);
+  const int parent = nav.parent[boxNode];
+  if (parent < 0) {
+    r.why = "the hand has no delivery to drop";
+    return r;
+  }
+  if (nav.slot[boxNode] >= 0) {
+    r.why = "that box is an operator's operand; remove it instead";
+    return r;
+  }
+  const int32_t lane = t.nodes[boxNode].lane;
+  const std::vector<int> lifted = t.nodes[boxNode].items;
+  std::vector<int>& items = t.nodes[parent].items;
+  items.erase(std::remove(items.begin(), items.end(), boxNode), items.end());
+  // Its own lanes flatten into the scope it is lifted into, exactly the way an
+  // unboxed lane flattens when it closes: there is no record left for them to
+  // be columns of.
+  for (int ii : lifted) {
+    t.nodes[ii].lane = lane;
+    items.push_back(ii);
+  }
+  return Finish(lib, tree, t, "unboxing that");
+}
+
+EditResult Remove(const GlyphLibrary& lib, const SpellTree& tree, int node) {
+  EditResult r;
+  SpellTree t = tree;
+  if (node < 0 || node >= (int)t.nodes.size()) {
+    r.why = "there is nothing there to remove";
+    return r;
+  }
+  const Nav nav = BuildNav(t);
+  if (nav.parent[node] < 0) {
+    r.why = "the hand cannot be removed";
+    return r;
+  }
+  Detach(t, nav, node);
+  return Finish(lib, tree, t, "removing that");
+}
+
+EditResult Move(const GlyphLibrary& lib, const SpellTree& tree, int node, int boxNode,
+                int32_t lane, bool copy) {
+  EditResult r;
+  SpellTree t = tree;
+  if (node < 0 || node >= (int)t.nodes.size()) {
+    r.why = "there is nothing there to move";
+    return r;
+  }
+  if (!IsBox(t, boxNode)) {
+    r.why = "that is not a box";
+    return r;
+  }
+  if (InSubtree(t, node, boxNode)) {
+    r.why = "a spell cannot be moved inside itself";
+    return r;
+  }
+  const Nav nav = BuildNav(t);
+  if (!copy && nav.parent[node] < 0) {
+    r.why = "the hand cannot be moved";
+    return r;
+  }
+  if (!OpenLaneIfNeeded(t, boxNode, lane, r.why)) return r;
+  int moved = node;
+  if (copy) {
+    moved = CloneSubtree(t, node);
+  } else {
+    Detach(t, nav, node);
+  }
+  PlaceItem(lib, t, boxNode, lane, moved);
+  return Finish(lib, tree, t, "that move");
+}
