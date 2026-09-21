@@ -26,12 +26,20 @@
 
 // THE PLAYER'S KIT ('PLYR'): what they are carrying, wearing and have bound.
 //
-// It is a BUNDLE OF REFERENCES rather than a system with its own SaveState,
-// because unlike debris/mobs/avatar there is no object that owns all of it:
-// the hotbar predates the pack, the caster is deliberately separate from the
-// player, and both libraries are needed to turn indices into names. Rather
-// than invent a container just to have something to call SaveState on, the
-// section is built from the pieces main.cpp already holds.
+// It is a BUNDLE OF REFERENCES rather than a system with its own SaveState.
+// It was written that way because unlike debris/mobs/avatar there WAS no
+// object that owned all of it: the hotbar predates the pack, the caster is
+// deliberately separate from the player, and the section was assembled from
+// whichever main() locals happened to be in scope.
+//
+// SINCE N5 THAT OBJECT EXISTS. `PlayerSession` (game/session.h) owns the
+// caster, the hotbar and the kit, and `PlayerKitOf(session, glyphs, items)`
+// builds this struct from it — so a caller names ONE player plus the two
+// CONTENT libraries, which are the world's and not the player's, instead of
+// naming five things and being trusted to pick five that belong together.
+// The struct stays a bundle of references on purpose: the two libraries are
+// genuinely not the session's, and a `PlayerSession&` here would put game/
+// session.h in every file that saves anything.
 //
 // EVERYTHING IS STORED BY NAME. Item and glyph slots hold indices into
 // ItemLibrary::items / GlyphLibrary::glyphs, both of which are FILE-ORDER

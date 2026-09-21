@@ -2380,15 +2380,25 @@ const ai::Brain* MobSystem::MobBrain(uint64_t mobId) const {
   return nullptr;
 }
 
-void MobSystem::SetPlayerActor(Vec3 centreVox, float radius, float height,
-                               bool alive) {
-  playerActor_.id = ai::kPlayerActorId;  // 0; mob ids start at 1
-  playerActor_.centre = centreVox;
-  playerActor_.radius = radius;
-  playerActor_.height = height;
-  playerActor_.faction = ai::FactionId("player");
-  playerActor_.alive = alive;
-  playerActorValid_ = true;
+void MobSystem::SetPlayerActors(std::span<const PlayerActorDesc> players) {
+  playerActors_.clear();
+  playerActors_.reserve(players.size());
+  for (size_t i = 0; i < players.size(); i++) {
+    ai::Actor a;
+    // The index IS the id. 0 is the local player (ai::kPlayerActorId) and mob
+    // ids start at 1, so a second session would collide TODAY -- that is a
+    // real limit, not a hypothetical one, and the fix is a reserved player
+    // band in nextId_ when a second session exists to need it. Recorded here
+    // rather than papered over, because an id an NPC targets by has to be
+    // stable.
+    a.id = (uint64_t)i;
+    a.centre = players[i].centreVox;
+    a.radius = players[i].radius;
+    a.height = players[i].height;
+    a.faction = ai::FactionId("player");
+    a.alive = players[i].alive;
+    playerActors_.push_back(a);
+  }
 }
 
 void MobSystem::Reset(bool rewindIds) {
@@ -2565,7 +2575,8 @@ Mob* MobSystem::FindMobById(uint64_t id) {
 // callers (EquipItem, the block drain, the dev overlay) that mean "a mob in my
 // list" and would start answering with the player if this were folded in.
 Mob* MobSystem::FindCombatantById(uint64_t id) {
-  if (id == ai::kPlayerActorId) return avatar_;   // null in a headless run
+  // Actor id i is avatars_[i] (SetPlayerActors); null in a headless run.
+  if (id < avatars_.size()) return avatars_[id];
   return FindMobById(id);
 }
 
@@ -6257,7 +6268,7 @@ void MobSystem::PreTick(uint32_t tick, World& world, std::vector<BrushOp>& ops,
   // Rebuilt every tick for the same reason `bleeds_` is — a despawned creature
   // stops being a target by not being here.
   actors_.clear();
-  if (playerActorValid_) actors_.push_back(playerActor_);
+  for (const ai::Actor& pa : playerActors_) actors_.push_back(pa);
   for (const Mob& m : mobs_) {
     if (!m.alive_ || m.def_ == nullptr) continue;
     const ai::Profile* pr = behaviors_.At(m.ai_.profile);
@@ -7953,10 +7964,10 @@ bool MobSystem::FindLimb(uint64_t bodyHandle, uint64_t& mobId,
         limbIndex = (int)i;
         return true;
       }
-  if (avatar_ != nullptr)
-    for (size_t i = 0; i < avatar_->limbs_.size(); i++)
-      if (avatar_->limbs_[i].body == bodyHandle) {
-        mobId = avatar_->id_;
+  for (Mob* av : avatars_)
+    for (size_t i = 0; i < av->limbs_.size(); i++)
+      if (av->limbs_[i].body == bodyHandle) {
+        mobId = av->id_;
         limbIndex = (int)i;
         return true;
       }
@@ -7974,7 +7985,8 @@ Mob* MobSystem::FindOwner(uint64_t bodyHandle, int* outLimbIndex) {
   };
   for (Mob& mob : mobs_)
     if (scan(mob)) return &mob;
-  if (avatar_ != nullptr && scan(*avatar_)) return avatar_;
+  for (Mob* av : avatars_)
+    if (scan(*av)) return av;
   if (outLimbIndex) *outLimbIndex = -1;
   return nullptr;
 }
@@ -7982,7 +7994,7 @@ Mob* MobSystem::FindOwner(uint64_t bodyHandle, int* outLimbIndex) {
 const NpcStroke* MobSystem::MobStroke(uint64_t mobId) const {
   for (const Mob& mob : mobs_)
     if (mob.id_ == mobId) return &mob.stroke_;
-  if (avatar_ != nullptr && avatar_->id_ == mobId) return &avatar_->stroke_;
+  if (const Mob* av = AvatarById(mobId)) return &av->stroke_;
   return nullptr;
 }
 
@@ -8049,7 +8061,7 @@ bool MobSystem::FindParry(const Mob& wielder, const Vec3& aPrev,
     }
   };
   for (Mob& m : mobs_) test(m);
-  if (avatar_ != nullptr) test(*avatar_);
+  for (Mob* av : avatars_) test(*av);
   return outBlocker != nullptr && outBody != 0;
 }
 
@@ -8077,9 +8089,8 @@ bool MobSystem::Damage(uint64_t bodyHandle, float amount, Vec3 hitWorldVoxel,
                        float impactSpeed) {
   for (Mob& mob : mobs_)
     if (mob.Damage(bodyHandle, amount, hitWorldVoxel, impactSpeed)) return true;
-  if (avatar_ != nullptr &&
-      avatar_->Damage(bodyHandle, amount, hitWorldVoxel, impactSpeed))
-    return true;
+  for (Mob* av : avatars_)
+    if (av->Damage(bodyHandle, amount, hitWorldVoxel, impactSpeed)) return true;
   return false;
 }
 
@@ -8987,8 +8998,8 @@ bool MobSystem::CutLimb(uint64_t bodyHandle, const BladeCut& cut, World& world,
   // avatar's arm, failed to recognise it as live flesh, and fell through to
   // DebrisSystem::MeltBodyAt — the player was hittable only in the sense that
   // their limbs quietly evaporated with no wound, no stain and no sever.
-  if (avatar_ != nullptr && avatar_->CutLimb(bodyHandle, cut, world, spawns))
-    return true;
+  for (Mob* av : avatars_)
+    if (av->CutLimb(bodyHandle, cut, world, spawns)) return true;
   return false;
 }
 
@@ -13682,10 +13693,10 @@ bool MobSystem::CarveLimbRadial(uint64_t bodyHandle, Vec3 centerWorldVoxel,
     if (mob.CarveLimbRadial(bodyHandle, centerWorldVoxel, radiusVoxels, ragged,
                             eject, world, spawns))
       return true;
-  if (avatar_ != nullptr &&
-      avatar_->CarveLimbRadial(bodyHandle, centerWorldVoxel, radiusVoxels,
-                               ragged, eject, world, spawns))
-    return true;
+  for (Mob* av : avatars_)
+    if (av->CarveLimbRadial(bodyHandle, centerWorldVoxel, radiusVoxels, ragged,
+                            eject, world, spawns))
+      return true;
   return false;
 }
 
@@ -13887,8 +13898,8 @@ bool MobSystem::BluntHit(uint64_t bodyHandle, const ::BluntHit& hit,
   // the top of MobSystem::CutLimb: the avatar is a Mob that does not live in
   // `mobs_`, and a handle-keyed entry point that forgot it would let an NPC's
   // mace pass through the player and melt their arm as debris instead.
-  if (avatar_ != nullptr && avatar_->BluntHit(bodyHandle, hit, world, spawns))
-    return true;
+  for (Mob* av : avatars_)
+    if (av->BluntHit(bodyHandle, hit, world, spawns)) return true;
   return false;
 }
 
@@ -13896,8 +13907,8 @@ bool MobSystem::BiteHit(uint64_t bodyHandle, const ::BiteHit& hit, World& world,
                         std::vector<ParticleSpawn>& spawns) {
   for (Mob& mob : mobs_)
     if (mob.BiteHit(bodyHandle, hit, world, spawns)) return true;
-  if (avatar_ != nullptr && avatar_->BiteHit(bodyHandle, hit, world, spawns))
-    return true;
+  for (Mob* av : avatars_)
+    if (av->BiteHit(bodyHandle, hit, world, spawns)) return true;
   return false;
 }
 
@@ -15379,7 +15390,7 @@ void Mob::Die() {
   // the receiver holds handles that are already debris. Not for the avatar
   // (see the struct's note) and not when nobody is listening.
   CorpseReport corpse;
-  const bool reportCorpse = sys_ && sys_->onCorpse_ && sys_->avatar_ != this;
+  const bool reportCorpse = sys_ && sys_->onCorpse_ && !sys_->IsAvatar(this);
   if (reportCorpse) {
     corpse.mobId = id_;
     corpse.def = def_ ? def_->name : std::string();
@@ -16066,7 +16077,7 @@ uint32_t MobSystem::LimbStainedMatCount(uint64_t mobId, int limbIndex,
   const Mob* mob = nullptr;
   for (const Mob& m : mobs_)
     if (m.id_ == mobId) { mob = &m; break; }
-  if (!mob && avatar_ && avatar_->id_ == mobId) mob = avatar_;
+  if (!mob) mob = AvatarById(mobId);
   if (!mob || limbIndex < 0 || limbIndex >= (int)mob->limbs_.size()) return 0;
   const MobLimb& l = mob->limbs_[limbIndex];
   const bool any = mat == 0xFFFFFFFFu;
@@ -16089,7 +16100,7 @@ uint32_t MobSystem::LimbInfectBoneCoated(uint64_t mobId, int limbIndex) const {
   const Mob* mob = nullptr;
   for (const Mob& m : mobs_)
     if (m.id_ == mobId) { mob = &m; break; }
-  if (!mob && avatar_ && avatar_->id_ == mobId) mob = avatar_;
+  if (!mob) mob = AvatarById(mobId);
   if (!mob || limbIndex < 0 || limbIndex >= (int)mob->limbs_.size()) return 0;
   return mob->limbs_[limbIndex].infectBoneCoated;
 }
@@ -16113,7 +16124,7 @@ uint32_t MobSystem::LimbCoatMatCount(uint64_t mobId, int limbIndex,
   const Mob* mob = nullptr;
   for (const Mob& m : mobs_)
     if (m.id_ == mobId) { mob = &m; break; }
-  if (!mob && avatar_ && avatar_->id_ == mobId) mob = avatar_;
+  if (!mob) mob = AvatarById(mobId);
   if (!mob || limbIndex < 0 || limbIndex >= (int)mob->limbs_.size()) return 0;
   const MobLimb& l = mob->limbs_[limbIndex];
   const bool any = coatMat == 0xFFFFFFFFu;
@@ -16147,7 +16158,7 @@ uint32_t MobSystem::StainTypeOf(uint32_t mat) const {
 const Mob* MobSystem::FindMob(uint64_t mobId) const {
   for (const Mob& m : mobs_)
     if (m.id_ == mobId) return &m;
-  if (avatar_ && avatar_->id_ == mobId) return avatar_;
+  if (const Mob* av = AvatarById(mobId)) return av;
   return nullptr;
 }
 
@@ -16196,8 +16207,7 @@ bool MobSystem::DepositCoatOn(uint64_t mobId, uint32_t mat, IVec3 groundCell,
                               uint32_t tick) {
   for (Mob& m : mobs_)
     if (m.id_ == mobId) return m.DepositCoat(mat, groundCell, tick);
-  if (avatar_ && avatar_->id_ == mobId)
-    return avatar_->DepositCoat(mat, groundCell, tick);
+  if (Mob* av = AvatarById(mobId)) return av->DepositCoat(mat, groundCell, tick);
   return false;
 }
 
@@ -16205,8 +16215,8 @@ uint32_t MobSystem::ShedCoatOn(uint64_t mobId, int footLimb, Vec3 footPosVox,
                                uint32_t tick, World& world) {
   for (Mob& m : mobs_)
     if (m.id_ == mobId) return m.ShedCoat(footLimb, footPosVox, tick, world);
-  if (avatar_ && avatar_->id_ == mobId)
-    return avatar_->ShedCoat(footLimb, footPosVox, tick, world);
+  if (Mob* av = AvatarById(mobId))
+    return av->ShedCoat(footLimb, footPosVox, tick, world);
   return 0;
 }
 
@@ -16215,7 +16225,7 @@ uint32_t MobSystem::SoakLimb(uint64_t mobId, int limb, uint32_t mat,
   Mob* mob = nullptr;
   for (Mob& m : mobs_)
     if (m.id_ == mobId) mob = &m;
-  if (!mob && avatar_ && avatar_->id_ == mobId) mob = avatar_;
+  if (!mob) mob = AvatarById(mobId);
   if (!mob || !mob->def_ || mat == 0) return 0;
   if (limb < 0 || limb >= (int)mob->limbs_.size()) return 0;
   MobLimb& l = mob->limbs_[limb];
@@ -16249,8 +16259,7 @@ void MobSystem::RecountCoatOn(uint64_t mobId, uint32_t tick) {
       m.RecountCoat(tick, /*force=*/true);
       return;
     }
-  if (avatar_ && avatar_->id_ == mobId)
-    avatar_->RecountCoat(tick, /*force=*/true);
+  if (Mob* av = AvatarById(mobId)) av->RecountCoat(tick, /*force=*/true);
 }
 
 void MobSystem::QueueSplatter(const SplatterEvent& e) {
@@ -16278,7 +16287,7 @@ bool MobSystem::LimbStainWorldYRange(uint64_t mobId, int limbIndex,
   const Mob* mob = nullptr;
   for (const Mob& m : mobs_)
     if (m.id_ == mobId) { mob = &m; break; }
-  if (!mob && avatar_ && avatar_->id_ == mobId) mob = avatar_;
+  if (!mob) mob = AvatarById(mobId);
   if (!mob || limbIndex < 0 || limbIndex >= (int)mob->limbs_.size()) return false;
   const MobLimb& l = mob->limbs_[limbIndex];
   const Quat q{l.xf.quat[0], l.xf.quat[1], l.xf.quat[2], l.xf.quat[3]};
