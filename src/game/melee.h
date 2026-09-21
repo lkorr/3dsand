@@ -650,6 +650,38 @@ struct EdgeSweep {
   // same reason: `bite-rot` fabricates ten separate sweeps on purpose and each
   // of them is its own bite.
   bool* bitten = nullptr;
+  // ---- ...AND THEY CLOSE ON THE THING THE STROKE AIMED AT (2026-09-19) ----
+  //
+  // THE DRAW CHOSE A LIMB AND THE JAWS BIT WHATEVER THEY MET FIRST. Those are
+  // two different decisions and until now only the second one mattered:
+  // `MobSystem::StartStroke` draws the style's `target` tag (zombie bites:
+  // arm 0.40, head 0.20, spine 0.18, leg 0.14, hand 0.08) and 2026-09-19 made
+  // the stroke AIM at the drawn limb — but the mouth is a capsule 2.4 world
+  // voxels wide swung at a body whose torso is directly behind its arms, so the
+  // probe walk met the chest on the way in and the stroke's one bite was spent
+  // there. Owner report: "19 in 20 zombie bites end up on the head or chest".
+  //
+  // `bitePrefer` is the drawn limb's BODY HANDLE, and it means: of everything
+  // these jaws touch, this is the one they are trying to close on. Zero = no
+  // preference, which is what a fabricated gate sweep and the player's own fist
+  // get (a player aims with the mouse and has no draw).
+  //
+  // A HANDLE RATHER THAN A SLOT, because that is the currency the probe walk
+  // already speaks: `hitBodies`, `struck` and the armour retarget are all body
+  // handles, and resolving a (mob, slot) pair per probe would mean a rig lookup
+  // inside the hot loop for a comparison that is one integer compare.
+  uint64_t bitePrefer = 0;
+  // ...AND A PREFERENCE THAT CANNOT BE SATISFIED MUST NOT COST THE BITE. A limb
+  // the jaws never reach would otherwise mean a zombie that chews air all fight
+  // — the exact failure the aim fix was supposed to end. So the preference is a
+  // HOLDOUT with a deadline: while this is true the bite waits for `bitePrefer`
+  // and lands on nothing else, and on the LAST tick of the cut phase the caller
+  // clears it and first contact wins as it always did. One stroke, one bite,
+  // aimed where it was drawn when that is possible and landed regardless.
+  //
+  // Set by the stroke runner, which is the only thing that knows how many cut
+  // ticks are left (strokes.h StrokeCursor::phaseTick / cutTicks).
+  bool biteHoldout = false;
   // ---- IS THE EDGE PART OF THE WIELDER? (2026-09-15) --------------------
   //
   // A HELD BLADE IS A THING YOU POINT; A FIST IS A THING YOU THROW, and the
