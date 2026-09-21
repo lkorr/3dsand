@@ -3,6 +3,7 @@
 #include "sim/oprecord.h"
 
 #include <algorithm>
+#include <cstddef>
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
@@ -259,13 +260,25 @@ void RecordFrame(const TickInputs& in, const TickParams& tp,
   // if the two ever differ, some per-tick knob is being read from somewhere
   // that is not the input stream, which is exactly the bug the record exists
   // to catch.
+  // ...with ONE exemption, and the bar for adding another is the paragraph
+  // world.h writes beside the field itself. `snapEpoch` is a monotone nonce
+  // from a process-global atomic (NextSnapEpoch), not an input and not hashed
+  // state: the repose prepass writes an epoch and the CA compares against the
+  // one it wrote, so the sim is invariant to the VALUE and only depends on a
+  // stamp from an earlier tick never reading as current. world.h says so in as
+  // many words, and the `determinism` gate PROVES it every run — its two runs
+  // sit at different epochs in the same process and agree bit for bit. A
+  // record that carried the epoch would therefore be pinning a number that is
+  // allowed to differ; comparing it would fail every replay for no defect.
+  // Anything else that differs here IS the bug this loop exists to catch.
+  const size_t kEpochWord = offsetof(TickParams, snapEpoch) / 4;
   if (g_replay) {
     for (const Frame& f : g_replay->frames) {
       if (f.in.tick != in.tick) continue;
       const uint32_t* a = (const uint32_t*)&f.tp;
       const uint32_t* c = (const uint32_t*)&tp;
       for (size_t i = 0; i < sizeof(TickParams) / 4; i++) {
-        if (a[i] == c[i]) continue;
+        if (a[i] == c[i] || i == kEpochWord) continue;
         if (g_replayMismatch == 0) {
           g_replayFirstTick = in.tick;
           g_replayFirstWord = (uint32_t)i;
