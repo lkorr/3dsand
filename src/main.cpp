@@ -6737,6 +6737,9 @@ int main(int argc, char** argv) {
   // `link->Connected()`: a TCP connection with no HelloAck behind it must not
   // stall the world, and a host is playing normally long before anyone joins.
   bool netPaced = false;
+  // Has a peer EVER completed the handshake? Distinct from `netPaced`, which
+  // goes back to false on a disconnect. Only the --frames budget reads it.
+  bool netEverPaced = false;
   // The host is player 0 and the client player 1, assigned by the HelloAck.
   // `MakePlayerState` fills `playerId` from the SESSION INDEX, which is 0 on
   // both machines, so the wire id is stamped over it at send time — otherwise
@@ -6834,6 +6837,7 @@ int main(int argc, char** argv) {
     pacer.Reset(startTick);
     netQueue.clear();
     netPaced = true;
+    netEverPaced = true;
     while (pacer.ShouldSend()) {
       const uint32_t t = pacer.NextToSend();
       netSendBatch(t);
@@ -7000,20 +7004,52 @@ int main(int argc, char** argv) {
     // tuning.json — and the alternative (start playing, then jump the tick
     // counter when the ack lands) is a visible world discontinuity for
     // exactly the case where the join succeeds.
-    link = std::make_unique<net::TcpLink>();
-    if (!link->Connect(netJoinIp, netPort)) {
+    const net::Hello mine = netLocalHello(1);
+    bool sentHello = false, acked = false;
+    const double tJoin0 = NowSeconds();
+    // THE 10 s IS A RETRY WINDOW, NOT A SINGLE ATTEMPT. A host that is still
+    // booting has no listen socket yet — device + SPIR-V + worldgen is ~20 s
+    // on this machine — and a non-blocking connect to a closed port comes back
+    // ECONNREFUSED in microseconds. Giving up on the first refusal makes the
+    // whole window worthless: "join failed" one second into a ten-second grace
+    // period is the answer nobody wants, and it is what made the two-process
+    // smoke a race between two boot times.
+    //
+    // A FRESH TcpLink PER ATTEMPT, because `LinkBase::Fail` latches: a link
+    // that has once reported "connect refused" refuses to Poll or Send for the
+    // rest of its life (see the unique_ptr note at the top of this block).
+    int netJoinAttempts = 0;
+    auto netTryConnect = [&]() -> bool {
+      link = std::make_unique<net::TcpLink>();
+      sentHello = false;
+      netJoinAttempts++;
+      return link->Connect(netJoinIp, netPort);
+    };
+    if (!netTryConnect()) {
       std::fprintf(stderr, "net: cannot connect to %s:%u: %s\n",
                    netJoinIp.c_str(), (unsigned)netPort,
                    link->Error().c_str());
       return 2;
     }
-    const net::Hello mine = netLocalHello(1);
-    bool sentHello = false, acked = false;
-    const double tJoin0 = NowSeconds();
     while (!acked) {
       link->Poll();
       if (!link->Error().empty()) {
-        std::fprintf(stderr, "net: join failed: %s\n", link->Error().c_str());
+        // A refusal DURING the window is "not up yet"; a refusal after it is
+        // the answer. The distinction is the elapsed time and nothing else —
+        // a refused connect and a host that never existed look identical on
+        // the wire.
+        if (NowSeconds() - tJoin0 <= 10.0) {
+          std::this_thread::sleep_for(std::chrono::milliseconds(250));
+          if (!netTryConnect()) {
+            std::fprintf(stderr, "net: cannot connect to %s:%u: %s\n",
+                         netJoinIp.c_str(), (unsigned)netPort,
+                         link->Error().c_str());
+            return 2;
+          }
+          continue;
+        }
+        std::fprintf(stderr, "net: join failed after %d attempt(s): %s\n",
+                     netJoinAttempts, link->Error().c_str());
         return 2;
       }
       if (link->Connected() && !sentHello) {
@@ -7054,8 +7090,8 @@ int main(int argc, char** argv) {
       if (acked) break;
       if (NowSeconds() - tJoin0 > 10.0) {
         std::fprintf(stderr, "net: join timed out after 10 s (no HelloAck from "
-                             "%s:%u)\n",
-                     netJoinIp.c_str(), (unsigned)netPort);
+                             "%s:%u, %d connect attempt(s))\n",
+                     netJoinIp.c_str(), (unsigned)netPort, netJoinAttempts);
         return 2;
       }
       // 2 ms, not a spin: the host may still be booting its device and this
@@ -7074,6 +7110,23 @@ int main(int argc, char** argv) {
   uint64_t frameCounter = 0;
   StartupMark("frame loop entered");
   uint64_t startupFrame = 0;
+  // A HOST'S --frames BUDGET STARTS WHEN THE PEER ARRIVES (M9.2-C).
+  //
+  // `--host 7777 --frames 900` means "900 frames of two-player play", not
+  // "900 frames, some of which may be spent alone". Without this the
+  // two-process smoke is a race between two boot times that the machine
+  // decides: device + SPIR-V + worldgen is ~24 s here and 900 frames at
+  // vsync-uncapped is ~11 s, so the host was reliably finished before the
+  // client's window even existed and the smoke measured nothing.
+  //
+  // The deadline is the safety catch: a `--host --frames N` run that nobody
+  // ever joins must still terminate, or a harness invocation becomes a hang.
+  // 120 s is far longer than any boot and far shorter than a CI timeout.
+  const double netHostWaitDeadline = NowSeconds() + 120.0;
+  auto netHostStillWaiting = [&]() {
+    return netRoleBoot == NetRole::Host && !netEverPaced &&
+           NowSeconds() < netHostWaitDeadline;
+  };
   while (!glfwWindowShouldClose(window)) {
     // M9.2-C: THE FRAME'S ONE SOCKET TOUCH, and it is before the tick loop
     // (and before the harness's own exit check, so a peer that quit is
@@ -7081,7 +7134,7 @@ int main(int argc, char** argv) {
     // arrived batch into the pacer and the label queue, and handles the
     // disconnect. No-op when nothing is networked: `link` is null.
     if (link) netPump();
-    if (g_harnessFrames > 0) {
+    if (g_harnessFrames > 0 && !netHostStillWaiting()) {
       frameCounter++;
       // The mid-run reload verifies the F5 path, but it also recompiles every
       // pipeline in the foreground and the far set on three background
