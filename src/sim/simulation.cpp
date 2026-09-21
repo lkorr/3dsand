@@ -289,6 +289,13 @@ bool Simulation::Init(const rhi::Device& device, World& world,
         // and it is NOT mirrored in simSlimBGL_: only sim_waterbody.wgsl
         // names it, and no slim-group pipeline does.
         entry(36, T::Storage),         // waterFlux (4 pipes + s + stamp)
+        // The per-chunk digest table (world.h kChunkHashWords,
+        // docs/PLAN_multiplayer_m9.md M9.3-A). Storage and not
+        // ReadOnlyStorage: sim_occupancy.wgsl's `main` is its only writer and
+        // nothing on the GPU reads it back. 37 is the first free slot in this
+        // dense 0..36 layout, and it is NOT mirrored in simSlimBGL_ -- only
+        // sim_occupancy names it, and no slim-group pipeline does.
+        entry(37, T::Storage),         // chunkHash (per-slot digest + tick)
     };
     simBGL_ = device.CreateBindGroupLayout(entries, std::size(entries));
 
@@ -958,6 +965,7 @@ void Simulation::BuildSimBindGroups(const rhi::Device& device) {
         b(34, world_->gasOuter),
         b(35, world_->reposeSnap),
         b(36, world_->waterFlux),
+        b(37, world_->chunkHash),
     };
     simBG_[page] = device.CreateBindGroup(simBGL_, entries, std::size(entries), "simBG");
 
@@ -1955,6 +1963,7 @@ const rhi::Buffer& Simulation::PassBuffer(pass::Buf b) const {
     case B::GenAct:              return world_->genAct;
     case B::WaterBodyState:      return world_->waterBodyState;
     case B::WaterFlux:           return world_->waterFlux;
+    case B::ChunkHash:           return world_->chunkHash;
     case B::TreeAtlas:           return treeAtlasBuf_;
     case B::WorldMap:            return worldMapBuf_;
     case B::GasParticlesRead:    return world_->gasParticles[page_];

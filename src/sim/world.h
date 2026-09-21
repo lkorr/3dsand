@@ -97,6 +97,15 @@ constexpr uint32_t kNumSlots = kNumChunks + kTicketSlots;      // 32768 at P0
 static_assert(kNumSlots % 64 == 0,
               "sim_compact dispatches kNumSlots/64 workgroups of 64");
 
+// ---- the per-chunk digest table (docs/PLAN_multiplayer_m9.md M9.3-A) ------
+// One word per slot, plus ONE trailing word carrying the `tick` of the pass
+// that wrote the table. The stamp rides the buffer rather than a C++ side
+// channel because the buffer is what the readback copies: a table and the tick
+// it describes that arrive in the same copy cannot disagree.
+constexpr uint32_t kChunkHashTickWord = kNumSlots;
+constexpr uint32_t kChunkHashWords = kNumSlots + 1;
+constexpr uint64_t kChunkHashBytes = (uint64_t)kChunkHashWords * 4;
+
 // ---- the fluid lab's flat-slab worldgen mode (docs/PLAN_fluid_overhaul.md §4)
 // The `--lab` / `--fluid-bench` test world: solid stone for y <= kLabSlabY,
 // air above, no biomes/trees/caves/ponds/POIs/flora. It is a MODE TAP through
@@ -3373,6 +3382,17 @@ struct WorldSnapshot {
   // cannot answer it, because a chunk can be all air and still carry hashed
   // stain state.
   std::vector<uint8_t> occStain;
+  // ---- the per-chunk digest (M9.3-A) ----
+  // Per-slot content digest as of `chunkHashTick`, which is NOT necessarily
+  // this snapshot's `tick`: only the FULL occupancy pass writes the table, and
+  // that runs on hash ticks (plus load-reset and the hash-only pass). A
+  // consumer that wants a digest it can compare with a peer must check
+  // `chunkHashTick` — a table from tick 30 is a perfectly good description of
+  // tick 30 and says nothing about tick 34.
+  //
+  // Empty until the first full pass has been read back.
+  std::vector<uint32_t> chunkHash;
+  uint32_t chunkHashTick = 0;
   // Page faults since process start — voxStore()'s sentinel no-op path
   // (PLAN_page_table.md §2.4). MONOTONIC and never cleared: a non-zero value is
   // a permanent "this build has a bug" latch. Every gate asserts it is zero,
@@ -3701,6 +3721,48 @@ class World {
   // it fall behind. `valid` is false only for the first kSnapshotLatency ticks
   // after a world reset, which is itself a constant.
   const WorldSnapshot& Snap() const { return snap_; }
+
+  // ---- the per-chunk digest and the quiet counter (M9.3-A) ---------------
+  //
+  // The digest of slot `slot` as of ChunkHashTick(), or 0 before any full
+  // occupancy pass has been read back. Content-keyed (chunk-local cell index),
+  // so the same 4,096 words digest the same on any machine, in any slot, under
+  // any window origin, and whether the chunk is a real page or a sentinel.
+  uint32_t ChunkHashOfSlot(uint32_t slot) const {
+    const WorldSnapshot& s = snap_;
+    return (s.valid && slot < s.chunkHash.size()) ? s.chunkHash[slot] : 0u;
+  }
+  // The tick the digest table above describes. Zero means "no full pass has
+  // been read back yet". Always <= Snap().tick.
+  uint32_t ChunkHashTick() const { return snap_.valid ? snap_.chunkHashTick : 0u; }
+
+  // Ticks this slot has been quiet for, capped at 65535 — "no voxel of this
+  // chunk was dirty for the last N published ticks". It is the only cheap
+  // answer to "has this chunk settled enough that its digest is worth
+  // comparing with a peer's", which is what M9.3-C's resync schedule needs:
+  // hashing a chunk the CA is still churning produces a mismatch that means
+  // nothing.
+  //
+  // DERIVED, NOT HASHED, NOT SAVED. It is folded out of the snapshot's dirty
+  // flags (so it is kSnapshotLatency ticks latent, like everything else on
+  // that ring), zeroed by Stream::MarkModifiedBox when a CPU edit touches the
+  // chunk, and zeroed when a refill puts different world content in the slot.
+  // Nothing that feeds the sim may read it: it counts PUBLISHED ticks, and a
+  // run that published a different number of them would still be the same
+  // world.
+  uint32_t QuietTicks(uint32_t slot) const {
+    return slot < quietTicks_.size() ? quietTicks_[slot] : 0u;
+  }
+  // "A CPU edit / a refill just changed this chunk" — reset the streak. The
+  // world-chunk form is what Stream::MarkModifiedBox calls; the slot form is
+  // what Stream::FillSlots calls, because a refilled slot's world chunk is the
+  // NEW one and the streak belonged to the old.
+  void NoteChunkTouched(IVec3 wc) {
+    if (ChunkInWindow(wc)) NoteSlotTouched(SlotChunkIndex(wc));
+  }
+  void NoteSlotTouched(uint32_t slot) {
+    if (slot < quietTicks_.size()) quietTicks_[slot] = 0;
+  }
   // A world RESET (worldgen, LoadWorld) makes the held snapshot a description
   // of a DEAD WORLD, and callers must not be able to consume it: harness
   // scenes restart their tick counters, so a leftover snapshot's stamp can
@@ -4043,6 +4105,18 @@ class World {
   rhi::Buffer support;     // kNumChunks u32 — support-loss flags (sim_step writes,
                             // readback consumes + clears; drives island checks)
   rhi::Buffer hash;        // 4 u32 (only [0] used)
+  // ---- the per-chunk digest (docs/PLAN_multiplayer_m9.md M9.3-A) ----
+  // kNumSlots digests + ONE trailing word holding the `tick` of the pass that
+  // wrote them. Written only by sim_occupancy.wgsl's FULL entry point (hash
+  // ticks, load-reset, the standalone hash-only pass); the dirty entry point
+  // leaves it alone, so between hash ticks the table describes the last full
+  // pass and the trailing word says which tick that was.
+  //
+  // DERIVED DATA, exactly like the page table: never hashed into the world
+  // hash, never saved, reconstructible by one full pass. It exists so two
+  // machines can ask "is your copy of world chunk C the same as mine?" without
+  // shipping 16 KiB, which is M9.3-C's resync.
+  rhi::Buffer chunkHash;   // kChunkHashWords u32
   rhi::Buffer tickUBO;     // TickParams
   rhi::Buffer passUBO;     // 27 slices * 256 B (3x3x3 color phases)
   rhi::Buffer opsBuf;      // kMaxOpsPerTick BrushOp
@@ -4378,5 +4452,9 @@ class World {
   // write-combined map memory"). The mirror memcpy at the top of the readback
   // callback already did this for its 432 KiB; these three arrays never got
   // the same treatment. Sized once, on first use.
+  // Per-slot quiet streak (see QuietTicks). uint16_t and saturating: 65535
+  // ticks is 18 minutes of quiet and every consumer's question is "at least
+  // N?", so the cap costs nothing and the array costs 64 KiB instead of 128.
+  std::vector<uint16_t> quietTicks_;
   std::vector<uint8_t> snapBounce_;
 };

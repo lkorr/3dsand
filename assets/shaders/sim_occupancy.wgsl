@@ -6,6 +6,10 @@
 // The hash is a wrapping sum of per-cell hashes: commutative, so the atomic
 // accumulation order cannot affect the result — deterministic by construction.
 //
+// The full entry point also writes the PER-CHUNK DIGEST (M9.3-A): the same
+// fold, keyed on the chunk-local cell index instead of the slot-global one, so
+// it describes the chunk's 4,096 words and nothing about where they live.
+//
 // Dispatch: (NUM_SLOTS, 1, 1) workgroups; each workgroup reduces one chunk.
 
 @group(0) @binding(0) var<storage, read_write> voxels    : array<u32>;
@@ -16,6 +20,21 @@
 @group(0) @binding(12) var<storage, read_write> dirtyList : array<u32>;
 @group(0) @binding(17) var<storage, read>       pageTable : array<u32>;
 @group(0) @binding(18) var<storage, read_write> pageFaults : array<atomic<u32>>;
+// ---- THE PER-CHUNK DIGEST (docs/PLAN_multiplayer_m9.md M9.3-A) -----------
+// One word per SLOT plus one trailing word. NUM_SLOTS entries are the digest
+// of that slot's 4,096 voxel words; entry NUM_SLOTS is the `T.tick` of the
+// pass that wrote them, so a reader can tell a fresh table from one left by an
+// earlier hash tick without the CPU having to remember which ticks ran the
+// full pass. `read_write` and not `write`: WGSL has no write-only storage
+// address space, and the trailing tick word is stored by exactly one thread.
+//
+// NOT the world hash and not a second copy of it. The world hash keys on the
+// SLOT index (`hashBase` below) and is therefore a fold of "this window",
+// which two machines with different residency windows cannot compare. This
+// keys on the CHUNK-LOCAL index `i` (0..4095), so the digest is a pure
+// function of the chunk's 4,096 words and nothing else — which is what lets
+// one machine ask another "is your copy of world chunk C the same as mine?".
+@group(0) @binding(37) var<storage, read_write> chunkHash : array<u32>;
 // This module's page-fault identity (common.wgsl's PT_K_* block). Every
 // shader that declares `read_write> voxels` must define this: gPtKernel's
 // initializer references it, so omitting it is a compile error rather than
@@ -45,6 +64,12 @@ var<workgroup> wgStain : atomic<u32>;
 // atomicOr per non-air voxel would be up to 4,096 workgroup atomics per chunk
 // on a loop whose whole job is to be cheap. Four atomics per thread instead.
 var<workgroup> wgSub : array<atomic<u32>, 4>;
+
+// The per-chunk digest's reduction, alongside wgHash. A second accumulator
+// rather than a second use of wgHash: the two fold DIFFERENT keys over the
+// same cells (world hash = slot-global index, digest = chunk-local index) and
+// the world hash must stay bit-identical to what it was before this landed.
+var<workgroup> wgChunkHash : atomic<u32>;
 
 // The mask store, so the three exits below (EMPTY sentinel, uniform sentinel,
 // resident) cannot drift apart on the layout. SUBOCC_WORDS is 2, and this is
@@ -167,11 +192,19 @@ fn mainDirty(@builtin(workgroup_id) wg : vec3<u32>,
 @compute @workgroup_size(64)
 fn main(@builtin(workgroup_id) wg : vec3<u32>,
         @builtin(local_invocation_index) li : u32) {
+  // The digest table's freshness stamp, written by exactly one thread of the
+  // whole dispatch. It rides the buffer rather than a C++ side channel because
+  // the buffer is what the readback copies: a table and the tick it describes
+  // that arrive in one copy cannot disagree, whereas a remembered tick and a
+  // copied table can (and would, the first time a pass ran the full entry
+  // point outside the tick path — loadReset and hashOnly both do).
+  if (wg.x == 0u && li == 0u) { chunkHash[NUM_SLOTS] = T.tick; }
   if (li == 0u) {
     atomicStore(&wgStain, 0u);
     atomicStore(&wgCount, 0u);
     atomicStore(&wgBlock, 0u);
     atomicStore(&wgHash, 0u);
+    atomicStore(&wgChunkHash, 0u);
     atomicStore(&wgSub[0], 0u);
     atomicStore(&wgSub[1], 0u);
     atomicStore(&wgSub[2], 0u);
@@ -193,6 +226,12 @@ fn main(@builtin(workgroup_id) wg : vec3<u32>,
       if (li == 0u) {
         occupancy[wg.x] = packOcc(0u, 0u);
         storeSubOcc(wg.x, 0u, 0u, 0u, 0u);
+        // EXACT, for the digest's reason as well as occupancy's: the resident
+        // loop only folds NON-AIR cells, so an all-air chunk's digest is the
+        // empty sum. Zero it rather than leaving the previous occupant's word
+        // behind — a slot that was stone last window and is sky now must not
+        // still answer "stone" to a resync query.
+        chunkHash[wg.x] = 0u;
       }
       return;
     }
@@ -207,21 +246,41 @@ fn main(@builtin(workgroup_id) wg : vec3<u32>,
     // only the VALUE is positional, never the key. Splitting the loop rather
     // than branching per iteration keeps the uniform case exactly as cheap as
     // it was.
+    //
+    // THE SENTINEL AND ITS MATERIALIZED TWIN MUST HASH IDENTICALLY. A page
+    // table entry is derived data (PLAN_page_table.md: not hashed, not saved),
+    // so whether a chunk is a sentinel here or a real page is a local
+    // allocation accident — and a resync that "found a difference" every time
+    // a peer happened to materialize a chunk would be worse than no resync.
+    // The digest is therefore folded over the SAME cells and the SAME `v`
+    // form the resident loop below uses, which is what makes the round trip
+    // (paint a JITTER chunk, un-paint it) return the digest it started with.
+    // The `chunk-hash` gate asserts exactly that.
     let sHashBase = wg.x * CHUNK_VOL;          // SLOT index — the hash key
     var sh = 0u;
+    var shc = 0u;                              // CHUNK-LOCAL key — the digest
     if ((e & PT_JITTER_BIT) != 0u) {
       for (var i = li; i < CHUNK_VOL; i += 64u) {
         let jw = synthWordAt(e, worldCellOfSlotLocal(wg.x, i), T.seed);
         let jv = (jw & 0xFFFFu) | ((jw & STAIN_BITS) >> 8u);
         sh += pcg((sHashBase + i) ^ (jv * 0x9E3779B9u));
+        shc += pcg(i ^ (jv * 0x9E3779B9u));
       }
     } else {
       let sv = (sw & 0xFFFFu) | ((sw & STAIN_BITS) >> 8u);
       for (var i = li; i < CHUNK_VOL; i += 64u) {
         sh += pcg((sHashBase + i) ^ (sv * 0x9E3779B9u));
+        shc += pcg(i ^ (sv * 0x9E3779B9u));
       }
     }
     if (T.hashEnable != 0u) { atomicAdd(&wgHash, sh); }
+    // UNCONDITIONAL, unlike the world hash: the full entry point is recorded
+    // on hash ticks (C_HASH), on load-reset and on the standalone hash-only
+    // pass, and the last two carry hashEnable = 0 while still being exactly
+    // the moments a fresh digest table is wanted. The sum is commutative, so
+    // the atomic order cannot affect the result — the same argument the world
+    // hash rests on.
+    atomicAdd(&wgChunkHash, shc);
     workgroupBarrier();
     if (li == 0u) {
       let sIsB = isRayBlocker(materials[smat]);
@@ -231,6 +290,10 @@ fn main(@builtin(workgroup_id) wg : vec3<u32>,
       if (T.hashEnable != 0u) {
         atomicAdd(&worldHash[0], atomicLoad(&wgHash));
       }
+      // A plain STORE, not an add: one workgroup owns one slot for the whole
+      // dispatch, so there is nothing to accumulate across and a stale value
+      // from a previous pass must not survive into this one.
+      chunkHash[wg.x] = atomicLoad(&wgChunkHash);
     }
     return;
   }
@@ -246,6 +309,11 @@ fn main(@builtin(workgroup_id) wg : vec3<u32>,
   var block = 0u;
   var stain = 0u;
   var h = 0u;
+  // The per-chunk digest, keyed on `i` alone — see the binding's note. It
+  // folds exactly the cells `h` folds and exactly the same `v`, so "the
+  // digests of two chunks agree" means "their hashed state agrees", with no
+  // second definition of what hashed state is.
+  var hc = 0u;
   var sm0 = 0u; var sm1 = 0u;   // sub-chunk TOTAL class
   var sb0 = 0u; var sb1 = 0u;   // sub-chunk BLOCKER class
   for (var i = li; i < CHUNK_VOL; i += 64u) {
@@ -280,6 +348,7 @@ fn main(@builtin(workgroup_id) wg : vec3<u32>,
       if (T.hashEnable != 0u) {
         h += pcg((hashBase + i) ^ (v * 0x9E3779B9u));
       }
+      hc += pcg(i ^ (v * 0x9E3779B9u));
     }
   }
   atomicAdd(&wgCount, count);
@@ -290,6 +359,7 @@ fn main(@builtin(workgroup_id) wg : vec3<u32>,
   atomicOr(&wgSub[2], sb0);
   atomicOr(&wgSub[3], sb1);
   if (T.hashEnable != 0u) { atomicAdd(&wgHash, h); }
+  atomicAdd(&wgChunkHash, hc);   // unconditional — see the sentinel path
   workgroupBarrier();
 
   if (li == 0u) {
@@ -300,5 +370,6 @@ fn main(@builtin(workgroup_id) wg : vec3<u32>,
     if (T.hashEnable != 0u) {
       atomicAdd(&worldHash[0], atomicLoad(&wgHash));
     }
+    chunkHash[wg.x] = atomicLoad(&wgChunkHash);
   }
 }

@@ -61,7 +61,16 @@ constexpr uint64_t kFluidBlocksBytes = kFluidBlocks * 4;
 constexpr uint64_t kFluidMirrorOff = kFluidBlocksOff + kFluidBlocksBytes;
 constexpr uint64_t kFluidMirrorBytes = 27ull * kChunkVol;
 constexpr uint64_t kFetchOff = kFluidMirrorOff + kFluidMirrorBytes;
-constexpr uint64_t kSlotBytes = kFetchOff + (uint64_t)World::kFetchPerTick * kChunkBytes;
+// The per-chunk digest table (M9.3-A): kNumSlots digests + the trailing tick
+// word. 128 KiB, which is why it sits at the END of the slot and not next to
+// the world hash where it logically belongs: the snapshot parse bounces the
+// dirty..support run (kDirtyOff..kSupportOff + kSupportBytes) through cached
+// RAM in ONE memcpy, and putting the digest inside that run would grow that
+// copy by 128 KiB per snapshot for a consumer that wants it on hash ticks
+// only. Out here it is one straight memcpy out of the mapped slot.
+constexpr uint64_t kChunkHashOff =
+    kFetchOff + (uint64_t)World::kFetchPerTick * kChunkBytes;
+constexpr uint64_t kSlotBytes = kChunkHashOff + kChunkHashBytes;
 
 // Every WorldSnapshot the pipeline hands around is pre-sized: the readback
 // callback memcpys straight into these arrays. One definition, so the published
@@ -73,6 +82,7 @@ static void SizeSnapshot(WorldSnapshot& s) {
   s.supportFlags.assign(kNumSlots, 0);
   s.occupancy.assign(kNumSlots, 0);
   s.occStain.assign(kNumSlots, 0);
+  s.chunkHash.assign(kChunkHashWords, 0);
   s.fluidBlocks.assign(kFluidBlocks, 0);
   s.fluidMirror.assign(27ull * kChunkVol, 0);
 }
@@ -116,6 +126,13 @@ void World::Init(const rhi::Device& device) {
   support = CreateBuffer(device, kSupportBytes, U::Storage | U::CopySrc | U::CopyDst,
                          "supportFlags");
   hash = CreateBuffer(device, 16, U::Storage | U::CopySrc | U::CopyDst, "worldHash");
+  // The per-chunk digest table (world.h kChunkHashWords). CopyDst so the
+  // worldgen fill can zero it: nothing reads it before the first full
+  // occupancy pass writes every slot, but a zeroed table makes "slot 7 has
+  // never been hashed" a value instead of whatever the allocator left.
+  chunkHash = CreateBuffer(device, kChunkHashBytes,
+                           U::Storage | U::CopySrc | U::CopyDst, "chunkHash");
+  quietTicks_.assign(kNumSlots, 0);
   tickUBO = CreateBuffer(device, sizeof(TickParams), U::Uniform | U::CopyDst, "tickUBO");
   passUBO = CreateBuffer(device, 54 * 256, U::Uniform | U::CopyDst, "passUBO");
   opsBuf = CreateBuffer(device, kMaxOpsPerTick * sizeof(BrushOp),
@@ -578,6 +595,13 @@ bool World::EncodeReadbacks(const rhi::Device&, const rhi::CommandEncoder& enc,
   // buffer reference at encode time via these explicit copies instead.
   enc.CopyTracked(pass::Buf::Occupancy, occupancy, 0, s.buf, kOccOff, kOccBytes);
   enc.CopyTracked(pass::Buf::Hash, hash, 0, s.buf, kHashOff, 16);
+  // The per-chunk digest table. Copied EVERY tick even though only the full
+  // occupancy pass writes it: the copy is 128 KiB of DMA out of a buffer the
+  // GPU is not touching on a dirty tick, and the trailing tick word tells the
+  // reader which pass it is looking at — which is cheaper and less fragile
+  // than teaching the ring which ticks were hash ticks.
+  enc.CopyTracked(pass::Buf::ChunkHash, chunkHash, 0, s.buf, kChunkHashOff,
+                  kChunkHashBytes);
   enc.CopyTracked(pass::Buf::Pick, pick, 0, s.buf, kPickOff, 32);
   enc.CopyTracked(pass::Buf::ParticleCounts, particleCounts, 0, s.buf, kPCountOff, 16);
   // Gas: the live per-page counts and the 8-word counter header. Async and one
@@ -800,6 +824,13 @@ void World::KickReadback() {
           std::fflush(stdout);
         }
         std::memcpy(&out.worldHash, b + kHashOff, 4);
+        // The digest table rides the tail of the slot, outside the bounce
+        // above, so it is read from the mapped pointer directly. The trailing
+        // word is the tick the FULL occupancy pass stamped it with; on a
+        // dirty tick that is an earlier tick, and saying so is the whole
+        // point of carrying it.
+        std::memcpy(out.chunkHash.data(), p + kChunkHashOff, kChunkHashBytes);
+        out.chunkHashTick = out.chunkHash[kChunkHashTickWord];
         std::memcpy(&out.pageFaults, p + kPageFaultOff, 4);
         std::memcpy(out.pick, b + kPickOff, 32);
         uint32_t pcounts[2];
@@ -927,6 +958,11 @@ void World::KickReadback() {
 
 void World::InvalidateSnapshot() {
   snap_.valid = false;
+  // The quiet streaks described the DEAD world's chunks (M9.3-A). A fresh
+  // worldgen makes every slot's history meaningless, and a stale streak here
+  // would read as "settled, safe to compare" for a chunk that has not been
+  // simulated once.
+  std::fill(quietTicks_.begin(), quietTicks_.end(), (uint16_t)0);
   // A regenerated window makes every cached chunk stale too: the fetch path's
   // version guard (`cc.version <= sl.tick`) would otherwise keep dead-world
   // contents for any later reader whose tick numbers are LOWER than the gate
@@ -981,6 +1017,24 @@ bool World::PublishSnapshotsUpTo(uint32_t target) {
     snapPool_.push_back(std::move(ready_.front()));
     ready_.pop_front();
     got = true;
+    // ---- the quiet streak (M9.3-A) -------------------------------------
+    // Here and not in the readback callback, because "quiet for N ticks" has
+    // to count the ticks the CPU world view actually advanced through. The
+    // callback fires on the GPU's schedule and can deliver two snapshots in
+    // one pump; the publish loop walks them in tick order, one per tick, which
+    // is exactly the sequence the counter is supposed to describe.
+    //
+    // dirtyFlags is the NEXT-TICK dirty flag the tick wrote, i.e. "something
+    // in this chunk is scheduled to act", which is the conservative direction:
+    // a chunk that woke and did nothing reads as busy for a tick, and a chunk
+    // that changed never reads as quiet.
+    const WorldSnapshot& sn = snap_;
+    if (sn.valid && sn.dirtyFlags.size() == quietTicks_.size()) {
+      for (size_t i = 0; i < quietTicks_.size(); i++) {
+        if (sn.dirtyFlags[i]) quietTicks_[i] = 0;
+        else if (quietTicks_[i] != 0xFFFFu) quietTicks_[i]++;
+      }
+    }
   }
   if (got && snap_.valid && snap_.tick == target) {
     snapPipe_.published++;
