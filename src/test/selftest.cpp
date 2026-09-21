@@ -307,6 +307,17 @@ const char* const kOrder[] = {
     // and patch they make. Neither reads the shared World, so the slot is free
     // — but it has to be AFTER the gates that assert over BodyCount().
     "body-fastfall",
+    // AFTER the debris gates and BEFORE anything that owns bodies of its own.
+    //
+    // It installs an ownership function on the SHARED DebrisSystem, which
+    // turns every body west of its seam into a ghost that emits nothing — so
+    // a gate running while that function was installed would measure silence
+    // and the failure would be attributed to it. The gate clears the function
+    // and Resets() on its way out, and the slot here is the belt to that
+    // braces: it comes after the gates that assert over BodyCount() and
+    // SettledBack() for the same reason `body-fastfall` above does, and it
+    // regenerates the world on the way in so it inherits nothing either.
+    "debris-ghost",
     "save-load",   "save-entities", "region-store", "streaming",     "spells",
     "page-roundtrip", "daylight-boundary",
     // Support-loss flagging from the MUTATION path. Cheap and

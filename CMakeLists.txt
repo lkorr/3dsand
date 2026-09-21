@@ -560,6 +560,9 @@ add_library(sandvox_core OBJECT
   src/phys/bodystain.cpp
   src/phys/debris.cpp
   src/phys/marching_cubes.cpp
+  # net/: the multiplayer seam. debrissync.cpp is wire PODs + their codecs and
+  # nothing else -- no sockets, no threads (PLAN_multiplayer_m9.md M9.4-C).
+  src/net/debrissync.cpp
   src/ui/overlay.cpp
   # The character screen (I): the panel armour, pickups and spell acquisition
   # land into. theme.cpp owns the ImGui style + the pixel-art chrome atlas;

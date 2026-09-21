@@ -18,7 +18,9 @@
 #include "game/camera.h"
 #include "game/player.h"
 #include "gpu/resources.h"
+#include "net/debrissync.h"
 #include "phys/marching_cubes.h"
+#include "sim/bytestream.h"  // ByteReader, for the wire-record round trip
 #include "test/selftest.h"
 #include "test/support.h"
 
@@ -1160,6 +1162,473 @@ Status GateBodyFastFall(Ctx& c, std::string& detail) {
   return ok ? Status::Pass : Status::Fail;
 }
 
+
+// ---- debris ownership and ghost bodies (PLAN_multiplayer_m9.md M9.4-C) -----
+//
+// FIVE SUBTESTS, one verdict, each naming itself on failure (the composite-
+// verdict instrument `settle-back` carries, and for the reason stated there):
+//
+//   (a) ghost   -- a body owned by another player is kinematic, tracks the
+//                  poses it is fed, and authors NOTHING over 200 ticks, while
+//                  an identical OWNED body beside it settles back into the
+//                  grid. The owned arm is what makes this a differential
+//                  rather than a claim that nothing happened.
+//   (b) scan    -- the island scan skips a region the chunk-authority function
+//                  says is not mine, and runs it when it is.
+//   (c) handoff -- owned -> ghost -> owned, with position and velocity
+//                  continuous across both flips.
+//   (d) item    -- RequestItemTake on a ghost item produces an ItemGrant
+//                  naming the item; the owner's own E takes the same path.
+//   (e) codec   -- every wire record survives encode -> decode byte-identical,
+//                  and a truncated payload is refused rather than read past.
+//
+// WHY IT IS CHEAP. Only (a) and (b) need the GPU at all, and both reuse the
+// world the phys gates before it already built. The ownership functions are
+// lambdas this gate installs and REMOVES -- the last thing it does is clear
+// them, because a gate that left an ownership function behind would turn every
+// later gate's bodies into ghosts and the failure would be attributed to them.
+Status GateDebrisGhost(Ctx& c, std::string& detail) {
+  GpuContext& ctx = c.ctx;
+  World& world = c.world;
+  Simulation& sim = c.sim;
+  Physics& phys = c.phys;
+  DebrisSystem& debris = c.debris;
+
+  std::string failed;
+  auto note = [&failed](bool ok, const char* name) {
+    if (!ok) failed += failed.empty() ? name : (std::string(", ") + name);
+    return ok;
+  };
+
+  // ---- (e) the codecs, first because they need nothing at all -------------
+  bool codecOk = true;
+  {
+    net::BodyAnnounce a;
+    a.globalId = net::MakeGlobalBodyId(7, 1234);
+    a.owner = 7;
+    a.xf.pos = Vec3{12.5f, -3.25f, 900.0f};
+    a.xf.quat[0] = 0.5f; a.xf.quat[1] = -0.5f;
+    a.xf.quat[2] = 0.5f; a.xf.quat[3] = 0.5f;
+    for (int i = 0; i < 5; i++)
+      a.voxels.push_back({(int8_t)i, (int8_t)-i, 3, (uint8_t)(i + 1),
+                          (uint16_t)(kMatStone | (i << 12)), (uint16_t)i});
+    a.physScale = 2;
+    a.skinScale = 4;
+    a.dye = 0xABCDEF;
+    a.hadMicro = 1;
+    a.bleedMat = 9;
+    a.dead = 1;
+    a.item = "iron sword";
+    a.itemDye = 3;
+    a.itemDamage = 41;
+    std::vector<uint8_t> buf;
+    net::Encode(buf, a);
+    // TWO RECORDS IN ONE BUFFER, on purpose: a datagram carries several, and
+    // "decode leaves the reader positioned for the next one" is the property
+    // that is easy to get wrong and impossible to see from a single-record
+    // round trip.
+    net::BodyPose pose;
+    pose.globalId = a.globalId;
+    pose.tick = 4242;
+    pose.xf = a.xf;
+    pose.vel = Vec3{1, 2, 3};
+    net::Encode(buf, pose);
+
+    ByteReader r{buf.data(), buf.size()};
+    net::BodyAnnounce a2;
+    net::BodyPose p2;
+    codecOk = net::Decode(r, a2) && net::Decode(r, p2) && r.off == buf.size();
+    codecOk = codecOk && a2.globalId == a.globalId && a2.owner == a.owner &&
+              a2.voxels.size() == a.voxels.size() &&
+              a2.physScale == a.physScale && a2.skinScale == a.skinScale &&
+              a2.dye == a.dye && a2.hadMicro == a.hadMicro &&
+              a2.bleedMat == a.bleedMat && a2.dead == a.dead &&
+              a2.item == a.item && a2.itemDamage == a.itemDamage &&
+              std::memcmp(a2.voxels.data(), a.voxels.data(),
+                          a.voxels.size() * sizeof(DebrisVoxel)) == 0;
+    codecOk = codecOk && p2.tick == pose.tick && p2.vel.y == pose.vel.y;
+    // A TRUNCATED PAYLOAD MUST BE REFUSED, not half-applied. This is the one
+    // assertion that is about hostility rather than about correctness, and it
+    // is here because the alternative failure mode is a read past the buffer.
+    ByteReader shortR{buf.data(), buf.size() / 3};
+    net::BodyAnnounce a3;
+    codecOk = codecOk && !net::Decode(shortR, a3) && !shortR.ok;
+    // ...and so must a record from a peer on a different wire version.
+    std::vector<uint8_t> bad = buf;
+    bad[0] = (uint8_t)(net::kDebrisWireVersion + 1);
+    ByteReader badR{bad.data(), bad.size()};
+    net::BodyAnnounce a4;
+    codecOk = codecOk && !net::Decode(badR, a4);
+    // The global id must survive a round trip through its two halves.
+    codecOk = codecOk && net::OwnerOfGlobalId(a.globalId) == 7 &&
+              net::SerialOfGlobalId(a.globalId) == 1234;
+  }
+  note(codecOk, "codec");
+
+  // ---- the fixture: flat ground and two identical blocks ------------------
+  //
+  // Built exactly as `settle-back` builds its pad, and for the identical
+  // reason recorded there: a body dropped on raw procedural terrain rolls
+  // downhill and comes to rest at an angle SettleBodies correctly refuses to
+  // snap, so the fixture would be measuring worldgen rather than ownership.
+  debris.Reset();
+  debris.ResetOwnerProbe();
+  SubmitWorldgen(ctx, world, sim, kDefaultSeed);
+  ctx.WaitIdle();
+  const int h = World::TerrainHeight(140, 140, kDefaultSeed);
+  const int padY = h + 2;
+  uint32_t t = 12000;
+  // TWO PADS, TWENTY VOXELS EITHER SIDE OF THE AUTHORITY SEAM AT x = 140, so
+  // every op either arm could author is separable by x alone. They are far
+  // apart on purpose: the ghost drifts a little under its scripted pose and a
+  // narrow gap would make "which arm wrote this" a question about the drift.
+  {
+    std::vector<CellOp> pad;
+    for (int cx : {120, 160})
+      for (int z = -6; z <= 6; z++)
+        for (int x = -6; x <= 6; x++)
+          for (int y = padY - 3; y <= padY; y++)
+            pad.push_back(
+                {World::SlotCellIndex({cx + x, y, 140 + z}), (uint32_t)kMatStone});
+    SubmitTick(ctx, world, sim, t, kDefaultSeed, {}, {}, pad, false,
+               {140 / (int)kChunk, h / (int)kChunk, 140 / (int)kChunk}, true, false, {});
+    ctx.WaitIdle();
+    ctx.ProcessEvents();
+    phys.Step(kTickDt);
+    debris.PostStep();
+  }
+
+  std::vector<DebrisVoxel> vox;
+  for (int z = 0; z < 3; z++)
+    for (int y = 0; y < 3; y++)
+      for (int x = 0; x < 3; x++)
+        vox.push_back({(int8_t)x, (int8_t)y, (int8_t)z, 1u, kMatStone});
+
+  auto drop = [&](int wx, int wz) -> uint64_t {
+    BodyTransform xf{};
+    xf.pos = Vec3{(float)wx, (float)(padY + 3), (float)wz};
+    xf.quat[3] = 1;
+    // allowKinematic: the ghost arm is flipped to kinematic by the ownership
+    // pass, and a body created without the allowance cannot be flipped.
+    const uint64_t bh =
+        phys.CreateDebrisBodyXf(vox, xf, debris.DensityOf(), true, 1.0f);
+    if (bh) debris.AdoptBody(bh, vox, xf);
+    return bh;
+  };
+  const uint64_t ghostH = drop(120, 140);
+  const uint64_t ownedH = drop(160, 140);
+  const uint64_t ghostId = debris.GlobalIdOf(ghostH);
+
+  // ---- install the ownership seam -----------------------------------------
+  //
+  // ONE PEER, WEST OF THE SEAM. Player 1 owns everything west of
+  // x = 140; this machine (player 0) owns the rest. Keyed on POSITION exactly
+  // as net::EntityAuthority will be, so nothing about how the gate drives it
+  // differs from how the game will.
+  constexpr uint32_t kPeer = 1;
+  debris.SetOwnershipFn([](Vec3 p) -> uint32_t {
+    return p.x < 140.0f ? kPeer : DebrisSystem::kLocalOwner;
+  });
+  // The chunk half of the same split, for subtest (b).
+  debris.SetChunkOwnedFn([](IVec3 wc) { return wc.x * (int)kChunk >= 140; });
+
+  // ---- (a) the ghost is kinematic, tracks, and emits nothing --------------
+  //
+  // THE SCRIPTED POSE STREAM. A straight fall at a fixed rate, which no
+  // physics here would produce (the pad is under it) -- so "it tracks" is a
+  // claim about the pose feed and not about gravity happening to agree.
+  bool ghostOk = true;
+  float trackErr = 0.0f;
+  uint32_t ghostCellOps = 0, ghostSpawns = 0;
+  uint32_t ownedSettled = 0;
+  const uint32_t settledBefore = debris.SettledBack();
+  Vec3 want{120.0f, (float)(padY + 3), 140.0f};
+  for (int i = 0; i < 200; i++) {
+    // Feed the pose BEFORE PreTick: PreTick drives the ghosts at its top.
+    want.y -= 0.02f;
+    want.x += 0.01f;
+    net::BodyPose pose;
+    pose.globalId = ghostId;
+    pose.tick = (uint32_t)i + 1;
+    pose.xf.pos = want;
+    pose.xf.quat[0] = pose.xf.quat[1] = pose.xf.quat[2] = 0.0f;
+    pose.xf.quat[3] = 1.0f;
+    pose.vel = Vec3{0.3f, -0.6f, 0.0f};
+    debris.ApplyBodyPose(pose);
+
+    debris.QueueSupportEvents(world.Snap());
+    std::vector<CellOp> cellOps;
+    std::vector<ParticleSpawn> spawns;
+    debris.PreTick(t + 1, world, cellOps, spawns);
+    // ---- WHICH BODY AUTHORED WHAT, not "were there any ops" ---------------
+    //
+    // The owned block settling back is SUPPOSED to fill cellOps, so a bare
+    // "cellOps stayed empty" would fail on the control arm. The two arms are
+    // eight voxels apart in x, so the ops each one could author are
+    // separable by position -- and that is what is counted. A bare count here
+    // would have been the "a count is not a measurement" trap in CLAUDE.md
+    // rule 6, one layer up.
+    for (const CellOp& op : cellOps) {
+      // World has SlotCellIndex but no inverse, and this is the only caller
+      // that wants one -- so it is unpacked here rather than grown into the
+      // header. The packing is (slotChunk * kChunkVol + (z*16+y)*16+x) and
+      // SlotToWorldChunk is the chunk half's inverse, which the streamer
+      // already relies on.
+      const IVec3 wc = world.SlotToWorldChunk(op.cellIdx / kChunkVol);
+      const uint32_t rem = op.cellIdx % kChunkVol;
+      const int cx = wc.x * (int)kChunk + (int)(rem % kChunk);
+      if (cx < 140) ghostCellOps++;
+    }
+    for (const ParticleSpawn& sp : spawns)
+      if (sp.px < 140 * 256) ghostSpawns++;
+    ++t;
+    SubmitTick(ctx, world, sim, t, kDefaultSeed, {}, {}, cellOps, false,
+               {140 / (int)kChunk, h / (int)kChunk, 140 / (int)kChunk}, true, false, spawns);
+    ctx.WaitIdle();
+    ctx.ProcessEvents();
+    phys.Step(kTickDt);
+    debris.PostStep();
+  }
+  ownedSettled = debris.SettledBack() - settledBefore;
+  {
+    BodyTransform now{};
+    if (phys.GetTransform(ghostH, now)) {
+      trackErr = (now.pos - want).len();
+    } else {
+      trackErr = 1e9f;  // the ghost stopped existing: a failure, loudly
+    }
+  }
+  // IS IT KINEMATIC? Asked through the accessor that already exists
+  // (Physics::IsBodyDynamic) rather than by inference from motion -- a body
+  // that happens not to be moving is not the same claim at all.
+  const bool ghostKinematic = !phys.IsBodyDynamic(ghostH);
+  // ---- WHAT "TRACKS" CAN MEAN, EXACTLY ----------------------------------
+  //
+  // A kinematic body is placed on the pose AND GIVEN THE POSE'S VELOCITY (see
+  // DriveKinematicTo: a kinematic body with a stale velocity reports every
+  // contact as a standing hit), and Jolt then integrates that velocity over
+  // the step. So the body is measured one tick AHEAD of the pose it was fed,
+  // by exactly |vel| * dt, and that is correct rather than drift -- it is the
+  // same one-tick lead DriveStraps gives a garment.
+  //
+  // Measured on this fixture: 0.0224 vox against a fed velocity of
+  // (0.3, -0.6, 0) vox/s at a 1/30 s step = 0.0224 vox. The tolerance is that
+  // number with room, and the claim is "it is on the pose, plus one step of
+  // the velocity the pose carried" -- NOT "it is somewhere near it". A real
+  // tracking failure (a dropped pose, a body falling under gravity) is
+  // hundreds of times larger: the scripted stream walks the body 4 voxels
+  // down and 2 across over the 200 ticks, against terrain it is standing on.
+  const float oneStep = Vec3{0.3f, -0.6f, 0.0f}.len() * kTickDt;
+  // The SLACK is data (CLAUDE.md: a threshold in source costs a rebuild to
+  // tune); the one-step lead above is arithmetic and stays here, because it is
+  // derived from the fixture's own numbers rather than chosen.
+  const float trackSlack =
+      (float)BaselineNumber("debrisGhost.trackSlackVox", 0.002);
+  ghostOk = ghostKinematic && trackErr < oneStep * 1.5f + trackSlack &&
+            ghostCellOps == 0 && ghostSpawns == 0 && debris.GhostCount() == 1;
+  // THE CONTROL ARM. Without it "the ghost emitted nothing" is satisfied by a
+  // fixture in which nothing could have emitted anything -- the
+  // fixture-that-cannot-fail trap. The owned block is identical matter on the
+  // identical pad and MUST settle back into the grid.
+  const bool ownedSettledOk = ownedSettled >= 1;
+  note(ghostOk, "ghost");
+  note(ownedSettledOk, "owned-control");
+
+  // ---- (b) the island scan skips a region another machine owns ------------
+  //
+  // Measured as a DIFFERENTIAL on one counter, with the fn flipped between the
+  // two arms and nothing else changed. Both arms queue the same event at the
+  // same place, so a difference can only be the authority test.
+  const uint32_t skipBefore = debris.Owner().chunksSkipped;
+  debris.AddDestructionEvent(t + 1, {114, padY - 4, 134}, {126, padY + 4, 146});
+  {
+    std::vector<CellOp> cellOps;
+    std::vector<ParticleSpawn> spawns;
+    debris.PreTick(t + 1, world, cellOps, spawns);
+    ++t;
+    SubmitTick(ctx, world, sim, t, kDefaultSeed, {}, {}, cellOps, false,
+               {140 / (int)kChunk, h / (int)kChunk, 140 / (int)kChunk}, true, false, spawns);
+    ctx.WaitIdle();
+    ctx.ProcessEvents();
+  }
+  const uint32_t skippedPeerChunk = debris.Owner().chunksSkipped - skipBefore;
+  // ...and the same event in a chunk that IS mine must not be skipped.
+  const uint32_t skipMid = debris.Owner().chunksSkipped;
+  debris.AddDestructionEvent(t + 1, {154, padY - 4, 134}, {166, padY + 4, 146});
+  {
+    std::vector<CellOp> cellOps;
+    std::vector<ParticleSpawn> spawns;
+    debris.PreTick(t + 1, world, cellOps, spawns);
+    ++t;
+    SubmitTick(ctx, world, sim, t, kDefaultSeed, {}, {}, cellOps, false,
+               {140 / (int)kChunk, h / (int)kChunk, 140 / (int)kChunk}, true, false, spawns);
+    ctx.WaitIdle();
+    ctx.ProcessEvents();
+  }
+  const uint32_t skippedOwnChunk = debris.Owner().chunksSkipped - skipMid;
+  const bool scanOk = skippedPeerChunk >= 1 && skippedOwnChunk == 0;
+  note(scanOk, "scan");
+
+  // ---- (c) handoff: owned -> ghost -> owned, continuous -------------------
+  //
+  // Driven through the REAL seam (BuildHandoff on one side, ApplyBodyHandoff
+  // on the other) rather than by poking `owner`, so the thing measured is the
+  // path the game will take. One process plays both machines, which is exactly
+  // what makes the continuity assertion meaningful: the same Jolt body is on
+  // both ends, so any discontinuity is the handoff's and not a second solver's.
+  bool handoffOk = false;
+  float posJump = 0.0f, velJump = 0.0f;
+  // "Within one tick of Jolt drift", as data. Nothing steps between the two
+  // flips here, so the honest number is zero and this is the allowance for a
+  // solver that is free to normalise a quaternion or clamp a velocity on the
+  // way through -- not a tolerance for a handoff that loses momentum.
+  const float handoffTol = (float)BaselineNumber("debrisGhost.handoffTolVox", 0.05);
+  {
+    // ---- ITS OWN BODY, AND THE FIRST RUN SAYS WHY -------------------------
+    //
+    // This started out reusing the owned block from (a) and reported
+    // `handoff pos jump 0.0000 vel jump 0.0000 (out 0 in 0)` -- three zeros
+    // that look like success and are the signature of a handle that no longer
+    // exists. The owned block's whole JOB in (a) is to settle back into the
+    // grid, and settling back FREES THE BODY (that is what `owned control
+    // settled 1` on the same line was reporting). So (c) was handing off a
+    // corpse of a handle and measuring the transform of nothing.
+    //
+    // A fresh body, in the air, east of the seam: (c) runs no ticks at all,
+    // so nothing can settle or fall out from under it.
+    const uint64_t hoH = drop(160, 160);
+    BodyTransform before{};
+    Vec3 linBefore{}, angBefore{};
+    phys.GetTransform(hoH, before);
+    phys.GetBodyVelocities(hoH, linBefore, angBefore);
+    // Give it a real velocity, or "velocity is continuous" is the trivial
+    // claim that zero equals zero (the fixture-that-cannot-fail trap again).
+    phys.SetBodyVelocities(hoH, Vec3{3.0f, 1.5f, -2.0f}, Vec3{});
+    phys.GetBodyVelocities(hoH, linBefore, angBefore);
+
+    net::BodyHandoff ho;
+    const bool built = debris.BuildHandoff(hoH, kPeer, ho);
+    const bool becameGhost = debris.IsGhost(hoH) && !phys.IsBodyDynamic(hoH);
+    // ...and back. The far machine would send this; here it is the same
+    // record fed straight back in, which is the tightest possible test of the
+    // round trip and needs no transport.
+    net::BodyHandoff back = ho;
+    back.newOwner = DebrisSystem::kLocalOwner;
+    back.announce.owner = DebrisSystem::kLocalOwner;
+    const uint64_t got = debris.ApplyBodyHandoff(back);
+    BodyTransform after{};
+    Vec3 linAfter{}, angAfter{};
+    phys.GetTransform(got, after);
+    phys.GetBodyVelocities(got, linAfter, angAfter);
+    posJump = (after.pos - before.pos).len();
+    velJump = (linAfter - linBefore).len();
+    handoffOk = built && becameGhost && got == hoH &&
+                !debris.IsGhost(hoH) && phys.IsBodyDynamic(hoH) &&
+                posJump < handoffTol && velJump < handoffTol &&
+                debris.Owner().handoffsOut >= 1 &&
+                debris.Owner().handoffsIn >= 1;
+  }
+  note(handoffOk, "handoff");
+
+  // ---- (d) ItemTake on a ghost item yields a named ItemGrant --------------
+  //
+  // The registry is a layer above debris, so the two callbacks are what the
+  // game binds and what this drives. The "take" here just destroys the body,
+  // which is what DropItemToWorld's inverse does.
+  bool itemOk = false;
+  std::string grantedName;
+  {
+    // The GHOST arm is the interesting one: E on a body another machine owns.
+    debris.SetItemLookupFn([&](uint64_t bh, std::string& name, uint32_t& dye,
+                               uint32_t& dmg) {
+      if (bh != ghostH) return false;
+      name = "iron sword";
+      dye = 5;
+      dmg = 12;
+      return true;
+    });
+    // A PICKUP TAKES THE THING OFF THE GROUND. The first version of this
+    // just returned true, and the refusal assertion below then measured
+    // nothing: asking a second time found the body still lying there and was
+    // granted again. DestroyBody is what DropItemToWorld's inverse does, and
+    // it is the seam that fires OnBodyGone and clears the registry.
+    debris.SetItemTakeFn(
+        [&](uint64_t bh) { return bh == ghostH && debris.DestroyBody(bh); });
+
+    // 1. E on the ghost queues a request and grants NOTHING yet -- the whole
+    //    point is that the non-owner may not invent the item.
+    const bool queued = debris.RequestItemTake(ghostId);
+    net::ItemGrant early;
+    const bool noEarlyGrant = !debris.PopItemGrant(early);
+    net::ItemTake out;
+    const bool sent = debris.PopItemTake(out) && out.globalId == ghostId &&
+                      out.byPlayer == DebrisSystem::kLocalOwner;
+
+    // 2. The owner's side of the same exchange, played here: ApplyItemTake
+    //    resolves it. The body must be MINE for that, so the ownership fn is
+    //    dropped for the length of the exchange and the body reclaimed --
+    //    which is also, exactly, what a handoff would have done.
+    debris.SetOwnershipFn(nullptr);
+    net::BodyHandoff toMe;
+    toMe.announce.globalId = ghostId;
+    toMe.announce.owner = DebrisSystem::kLocalOwner;
+    // The pose has to be real: ApplyBodyHandoff puts the body ON the
+    // announce's transform (that is the whole point of carrying one), so a
+    // default-constructed record would teleport the sword to the origin.
+    phys.GetTransform(ghostH, toMe.announce.xf);
+    debris.ApplyBodyHandoff(toMe);
+    debris.ApplyItemTake(out);
+    net::ItemGrant g{};
+    const bool gotGrant = debris.PopItemGrant(g);
+    grantedName = g.item;
+    itemOk = queued && noEarlyGrant && sent && gotGrant && g.granted == 1 &&
+             g.item == "iron sword" && g.dye == 5 && g.damage == 12 &&
+             g.globalId == ghostId;
+    // A REFUSAL IS A REPLY, and it has to be distinguishable. Asking again for
+    // the body that has now been taken must come back granted == 0 rather
+    // than silently producing nothing.
+    net::ItemTake again{ghostId, kPeer};
+    debris.ApplyItemTake(again);
+    net::ItemGrant g2{};
+    itemOk = itemOk && debris.PopItemGrant(g2) && g2.granted == 0;
+  }
+  note(itemOk, "item");
+
+  // THE NUMBERS COME OUT BEFORE THE TEARDOWN. Reset() clears the probe along
+  // with the bodies it counted, and the first run of this gate reported
+  // `poses driven 0 refused 0, emitters skipped 0, (out 0 in 0)` for exactly
+  // that reason -- five instruments reading zero because the detail string was
+  // built after the reset. A probe you zero before you print it is not a probe.
+  const DebrisSystem::OwnerProbe probe = debris.Owner();
+
+  // ---- PUT THE SEAM BACK ---------------------------------------------------
+  //
+  // THE LAST THING THIS GATE DOES, and it is load-bearing: gates share one
+  // DebrisSystem (see kOrder's note), so an ownership function left installed
+  // would turn every later gate's bodies into ghosts that emit nothing, and
+  // the failures would be attributed to those gates. The callbacks go too.
+  debris.SetOwnershipFn(nullptr);
+  debris.SetChunkOwnedFn(nullptr);
+  debris.SetItemLookupFn(nullptr);
+  debris.SetItemTakeFn(nullptr);
+  debris.Reset();
+
+  const bool ok = failed.empty();
+  detail = Format(
+      "ghost: kinematic=%d track err %.4f vox, ops authored %u cell / %u spawn "
+      "(owned control settled %u); scan skipped %u peer chunk(s), %u of mine; "
+      "handoff pos jump %.4f vel jump %.4f (out %u in %u); item grant '%s'; "
+      "poses driven %u refused %u, emitters skipped %u%s%s",
+      ghostKinematic ? 1 : 0, trackErr, ghostCellOps, ghostSpawns, ownedSettled,
+      skippedPeerChunk, skippedOwnChunk, posJump, velJump,
+      probe.handoffsOut, probe.handoffsIn,
+      grantedName.c_str(), probe.ghostsDriven, probe.posesRefused,
+      probe.emittersSkipped,
+      failed.empty() ? "" : "; FAILED: ", failed.c_str());
+  std::printf("debris ghost: %s (%s)\n", ok ? "PASS" : "FAIL", detail.c_str());
+  return ok ? Status::Pass : Status::Fail;
+}
+
 }  // namespace
 
 const std::vector<Gate>& BodyGates() {
@@ -1169,6 +1638,7 @@ const std::vector<Gate>& BodyGates() {
       {"player-body", "phys", {}, false, GatePlayerBody},
       {"ragdoll-joints", "phys", {}, false, GateRagdollJoints},
       {"body-fastfall", "phys", {}, false, GateBodyFastFall},
+      {"debris-ghost", "phys", {}, false, GateDebrisGhost},
   };
   return g;
 }
