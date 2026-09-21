@@ -13271,6 +13271,44 @@ on one machine: three creatures announced, 144 poses, three handoffs, both
 reports mirror field for field. Known limit (M9.4-E): a creature the peer has
 ALWAYS owned needs a ghost spawned from its announce.
 
+**M9.5 — the host's store is the truth (2026-09-21; `src/sim/stream.*`
+`ChunkExchange`, `src/sim/chunkstore.*` tick tags, `src/net/storesync.*`,
+`worldio.cpp` `SVM5`).** `Stream` fires `OnEvicted(wc, tick, rle)` at both of
+its `Put` sites with the tick the eviction was DECIDED at (the real-page
+readback lands later), and at a refill miss asks the exchange `Wanted(wc)`: a
+wanted chunk holds its slot INERT (sentinel, zeroed occupancy, dirty pages
+cleared — eviction does not clear them and a held slot would inherit the
+departed chunk's wake) until `DeliverRemote` installs it through
+`ReplaceChunk` or `DeliverMiss` regenerates it. `ChunkStore` carries a
+per-chunk tick tag in a side manifest (`manifest.svt`; the `.svr` regions are
+byte-identical, an untagged world writes no file). `StoreSync` is the
+exchange: the authority for an EVICTED chunk is the eviction form — mine
+unless the peer still holds it resident and is nearer — because
+`ChunkAuthority`'s resident-with-margin test is false for every evicted
+chunk by definition (the first cut would have made the whole package a
+silent no-op and its gate could not have seen it). Puts are tick-tagged and
+acked, unacked puts are re-offered on reconnect, the host keeps the newest
+tag, the manifest crosses on join in slices before the first batch, and
+either side answers a `ChunkGet` from its own store (with two peers "the
+machine that has it resident" is always the requester's peer, so symmetry
+replaces a relay; a third player is a second link and a relay table).
+`meta.svm` is `SVM5` with tick and seed; `SVM4` still loads. Two defects
+this package found on the way in: M9.3-C's five sync messages had fallen
+through into M9.4-D's `EntityBatch` case, so the convergence protocol was
+dead on the wire (`hashBlocks recv = 0`, `late = 38`) — the only symptom of
+a `switch` whose empty labels were separated from their target; and
+`SaveWorld`'s untagged resident flush erased the tags it existed to keep.
+Smoke: a flying, painting client put 2,163 chunks; the host received, saved
+and a fresh process loaded exactly 2,163 tagged chunks at the saved tick.
+
+**What is still not multiplayer, stated plainly.** Two players, one host,
+direct IP over TCP; no lobby, NAT traversal or third peer; gas spawns are
+not exchanged; a replaced chunk's in-flight particles are not flushed; a
+ghost's coat is stale until handoff; `WaterBodies()` is still keyed on the
+window origin (rule 1 below); the HUD has no net line (the `--frames` exit
+report is the readout). Every one of these is listed with its trigger in
+`docs/PLAN_multiplayer_m9.md`.
+
 **M9 proper (`docs/PLAN_multiplayer_m9.md`, plan of record 2026-09-20).** The
 audit under-stated one number: the residency window is `kWorldN` ×
 `kVoxelMeters` = a **51.2 m cube**, so two players walking independently leave

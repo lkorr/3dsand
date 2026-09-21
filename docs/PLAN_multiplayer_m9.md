@@ -899,6 +899,8 @@ authority's copy without a full-world resend, and a replay reproduces it.
 
 ### M9.4 — entity ownership: mobs and debris are owned by the nearest resident player (packages A, B, C, D)
 
+> **LANDED 2026-09-21** (A `b574b44`, B `1c38bb0`, C `546680a`, D `71be26b`, plus follow-up E `83f2f0d`: `MobSystem::ApplyAnnounce` spawns a ghost from an announce, `announceOnly_` forbids promotion without a handoff, debris ownership keyed by body id). Corrections: the two `PeerView`s must be aged to the SAME tick or ownership disagrees in motion; `DebrisSystem::SetOwnershipFn` needed the body id. Smoke: 3 creatures announced, 144 poses, 3 handoffs, `misses = 0` both sides.
+
 ```
   A  Authority (chunk + entity) with hysteresis; producer   src/net/authority.*, support.cpp (debug assert),
      assert at SubmitTick; gate authority                    selftest_net.cpp                         hash UNMOVED
@@ -1094,6 +1096,8 @@ then the ORCHESTRATOR's two-process smoke (host `--host --frames 900` with
 walking in).
 
 ### M9.5 — persistence through the host, late join, disconnect (packages A, B)
+
+> **LANDED 2026-09-21** (A `56e9615`, B `65a24a7`). Corrections: the eviction authority cannot be `ChunkAuthority` (resident-with-margin is false for an evicted chunk) — it is "mine unless the peer still holds it resident and nearer"; no relay is needed with two peers (either side answers a get from its own store); `SaveWorld`'s untagged flush erased tags (fixed); M9.3-C's sync messages had fallen through into M9.4-D's `EntityBatch` case (fixed — the convergence protocol was dead on the wire until then). Smoke: 2,163 puts = received = saved = loaded.
 
 Facts that bind (verified 2026-09-21):
 - The two "a modified chunk was evicted, here is its RLE" hook points:
