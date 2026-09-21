@@ -7314,6 +7314,17 @@ int main(int argc, char** argv) {
         [&entities](Vec3 pos) { return entities.BodyOwner(pos); });
     debris.SetChunkOwnedFn(
         [&entities](IVec3 wc) { return entities.ChunkOwned(wc); });
+    // ---- M9.4-E: THE ID-CARRYING CLOSURES, BOUND AT CONNECT -----------
+    //
+    // The two `SetOwnershipFn` calls above install the POSITION-ONLY forms,
+    // and `DebrisSystem`'s falls back to a CHUNK-keyed incumbent — one
+    // hysteresis slot shared by every body standing in the chunk, which is
+    // the flapping case entitysync.h describes. `BindOwnership` replaces
+    // both with the body-id-keyed versions. `ScanHandoffs` already calls it
+    // idempotently every tick, so this is the EARLY binding and not a
+    // behaviour change: it just means the first tick after the handshake
+    // gets the right closures instead of the second.
+    entities.BindOwnership(mobs, debris);
     debris.SetItemLookupFn(ground.LookupFn());
     debris.SetItemTakeFn([&debris](uint64_t h) {
       // The same call the local E key makes. The registry entry is dropped by
