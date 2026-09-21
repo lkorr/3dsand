@@ -713,6 +713,13 @@ struct UIState {
   bool inventoryOpen = false;   // I toggles; main.cpp owns the cursor/capture
   bool inspectMode = false;     // left panel: CHARACTER (gear) vs HEALTH
   int inspectSelected = -1;     // BodySlot of the limb whose detail is open, -1 = none
+  // WHICH TRIAGE GROUPS ARE EXPANDED, one bit per body group (head, torso,
+  // left arm, right arm, left leg, right leg — the table lives in the panel,
+  // which is the only thing that knows what a "group" is). Kept here rather
+  // than as a static in the drawing code because it is per-PLAYER UI state
+  // like the selection above it, and because a static would survive a body
+  // it has nothing to do with.
+  uint32_t triageOpen = 0;
 
   // ---- the live avatar portrait (main.cpp's second render pass) ------------
   // `portraitTex` is an ImTextureID (a VkDescriptorSet behind the scenes) that

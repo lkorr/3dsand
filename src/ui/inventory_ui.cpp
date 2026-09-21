@@ -1704,10 +1704,16 @@ void LootPanel(UIState& s, ImVec2 pos, ImVec2 size, const ui::PanelStyle& st,
 // The right-hand column of the character panel, live for as long as the health
 // view is on. It is a WHOLE COLUMN and not a footnote under the portrait:
 //
-//   POOLS    health, mana, and how much of this body is still physically here
-//   TRIAGE   everything currently wrong, worst first, every row clickable
+//   VITALS   how much of this body is still physically here, and every word
+//            that would change what you do next
+//   TRIAGE   the six parts of a person, worst first, each one summarising
+//            everything wrong inside it and opening onto its own segments
 //   THE LIMB the selected part in full — what it is made of, what happened to
 //            it, what is on it, and what is worn over it
+//
+// Health and mana are NOT in this column: they stay where they are in the
+// collapsed view, beside the gear, so opening the health column never moves
+// the two bars it is named after.
 //
 // AND THE GEAR STAYS ON SCREEN BESIDE IT. Health used to be a separate page
 // behind a toggle, so reading "what is hurt" meant losing sight of "what is
@@ -1810,12 +1816,13 @@ void VitalsColumn(UIState& s, ImVec2 at, ImVec2 size) {
     y = ImGui::GetItemRectMax().y + 10;
   }
 
-  // ======================= POOLS ==============================================
+  // ======================= THE BODY ITSELF ====================================
+  // Health and mana are NOT here: they stay in the character panel beside the
+  // gear, in the same place whether this column is open or shut. What this
+  // section adds is the thing a pool bar cannot say — how much of the body is
+  // physically still present, and every word that would change what you do
+  // next.
   y = ui::Subheading(dl, ImVec2(base.x, y), w, "VITALS") + 4;
-  y += PoolBar(dl, ImVec2(base.x, y), w, s.health, s.healthMax, s.healthCap,
-               ui::ColBloodHi(), "HEALTH", 22.0f, true) + 6;
-  y += PoolBar(dl, ImVec2(base.x, y), w, s.mana, s.manaMax, -1,
-               ui::ColMana(), "MANA", 22.0f, true) + 6;
 
   // WHAT IS STILL THERE. Integrity is live voxels over voxels at spawn, summed
   // across the body. The spawn count is not mirrored per limb — but voxelFrac
@@ -1903,28 +1910,50 @@ void VitalsColumn(UIState& s, ImVec2 at, ImVec2 size) {
 
   // ======================= TRIAGE =============================================
   //
-  // WHAT IS WRONG, WORST FIRST, AND NOTHING ELSE. A limb with nothing to
-  // report does not appear — the portrait already says it is there. Each row
-  // is a button: clicking it selects the limb, which lights its callout on the
-  // portrait, lights the piece of armour covering it, and fills the section
-  // below. That is the whole navigation model of this column.
+  // WHAT IS WRONG, WORST FIRST — BY THE PART OF THE BODY A PERSON ACTUALLY
+  // THINKS IN. Six rows: head, torso, left arm, right arm, left leg, right
+  // leg. Each one carries everything wrong anywhere inside it, and each one
+  // OPENS onto its own segments when the summary is not enough.
+  //
+  // Two regroupings got it here, and both were the same mistake at different
+  // scales. The first version pushed one row per (limb, effect) PAIR sorted by
+  // severity, so a burning, bleeding, critical arm appeared three separate
+  // times with its three lines split apart by other limbs' rows. The second
+  // fixed that — one row per limb — and still listed "Left forearm", "Left
+  // upper arm" and "Left hand" as three peers, which is not how a body is
+  // read: you decide the LEFT ARM is the problem first, and only then care
+  // which third of it. The group is the subject; the segment is a detail you
+  // ask for.
+  //
+  // Every row is a button. A segment row selects that limb — lighting its
+  // callout on the portrait, lighting the armour covering it, and filling the
+  // section below. A group row opens the group, and selects the worst segment
+  // in it if the selection is not already inside. That is the whole navigation
+  // model of this column.
   y = ui::Subheading(dl, ImVec2(base.x, y), w, "TRIAGE") + 4;
   {
-    // ONE ROW PER LIMB, AND THE ROW IS A LIST.
-    //
-    // This pushed one row per (limb, effect) PAIR and sorted the whole lot by
-    // severity, so a burning, bleeding, critical arm appeared three separate
-    // times — its name repeated down the column, its three lines split apart by
-    // other limbs' rows, and no single place in the readout that answered "what
-    // is wrong with my arm". The limb is the SUBJECT and the effects are its
-    // predicate; sorting symptoms shredded the subject. Now each limb appears
-    // once, carrying every effect on it, and the LIMBS are what the severity
-    // sort orders — by the worst thing on each.
+    // THE SIX PARTS OF A PERSON. Torso is chest + hips, because "the hips are
+    // at 60%" is a sentence about the torso; the segments are still one click
+    // away. Order is the anatomical one, used verbatim for groups that have
+    // nothing to report — the severity sort only has to move the hurt ones.
+    struct Group { const char* name; int n; int slot[3]; };
+    static const Group kGroups[] = {
+        {"HEAD", 1, {UIState::kSlotHead, -1, -1}},
+        {"TORSO", 2, {UIState::kSlotTorso, UIState::kSlotHips, -1}},
+        {"LEFT ARM", 3,
+         {UIState::kSlotArmUL, UIState::kSlotArmLL, UIState::kSlotHandL}},
+        {"RIGHT ARM", 3,
+         {UIState::kSlotArmUR, UIState::kSlotArmLR, UIState::kSlotHandR}},
+        {"LEFT LEG", 3,
+         {UIState::kSlotLegUL, UIState::kSlotLegLL, UIState::kSlotFootL}},
+        {"RIGHT LEG", 3,
+         {UIState::kSlotLegUR, UIState::kSlotLegLR, UIState::kSlotFootR}},
+    };
+    const int kGroupN = (int)(sizeof kGroups / sizeof kGroups[0]);
+
     struct Effect { int sev; ImU32 col; char text[28]; };
-    struct Row { int slot; int sev; int n; Effect eff[6]; };
-    Row rows[UIState::kSlotCount];
-    int nr = 0;
-    auto add = [&](Row& r, int sev, ImU32 col, const char* fmt, ...) {
+    struct Line { int n; int sev; Effect eff[6]; };
+    auto add = [](Line& r, int sev, ImU32 col, const char* fmt, ...) {
       if (r.n >= (int)(sizeof r.eff / sizeof r.eff[0])) return;
       Effect& e = r.eff[r.n++];
       e.sev = sev;
@@ -1935,62 +1964,124 @@ void VitalsColumn(UIState& s, ImVec2 at, ImVec2 size) {
       va_end(ap);
       if (sev < r.sev) r.sev = sev;
     };
-    for (int i = 0; i < UIState::kSlotCount; i++) {
-      const UIState::BodyPartUI& b = s.body[i];
-      if (!b.present) continue;
-      Row& r = rows[nr];
-      r.slot = i;
-      r.sev = 99;
+    // ONE SUMMARY SHAPE FOR A LIMB AND FOR A WHOLE GROUP. A group is summed
+    // and worst-cased into the same handful of numbers a single limb reports,
+    // so the group line and the segment lines under it are built by the same
+    // code and cannot drift into saying different things about the same arm.
+    struct Agg {
+      int present = 0, severed = 0, bleeders = 0;
+      uint32_t burning = 0;
+      float hp = 1.0f, vox = 1.0f, charred = 0.0f;
+    };
+    auto fold = [](Agg& a, const UIState::BodyPartUI& b) {
+      if (!b.present) return;
+      a.present++;
+      if (b.severed) { a.severed++; return; }
+      if (b.bleeding) a.bleeders++;
+      a.burning += b.burningVoxels;
+      a.hp = std::min(a.hp, b.hpFrac);
+      a.vox = std::min(a.vox, b.voxelFrac);
+      a.charred = std::max(a.charred, b.charredFrac);
+    };
+    // Severity is the ORDER WITHIN a line as well as the line's own rank, so
+    // the first words on it are always the worst news about that part.
+    auto build = [&](const Agg& a, Line& r) {
       r.n = 0;
-      // Severity is the ORDER WITHIN the row as well as the row's own rank, so
-      // the first words on a line are always the worst news about that limb.
-      if (b.severed) {
-        add(r, 0, ui::ColBloodHi(), "SEVERED");
+      r.sev = 99;
+      if (a.present == 0) return;
+      if (a.severed >= a.present) {
+        add(r, 0, ui::ColBloodHi(), a.present > 1 ? "ALL GONE" : "SEVERED");
       } else {
-        if (b.burningVoxels > 0)
-          add(r, 1, ui::ColEmber(), "BURNING %u", b.burningVoxels);
-        if (b.bleeding) add(r, 2, ui::ColBloodHi(), "BLEEDING");
-        if (b.hpFrac < 0.35f)
-          add(r, 3, ui::ColBloodHi(), "CRITICAL %.0f%%", b.hpFrac * 100.0f);
-        else if (b.hpFrac < 0.8f)
-          add(r, 5, ui::ColBlood(), "hurt %.0f%%", b.hpFrac * 100.0f);
-        if (b.voxelFrac < 0.6f)
-          add(r, 4, ui::ColSteel(), "HOLLOW %.0f%%", b.voxelFrac * 100.0f);
-        if (b.charredFrac > 0.25f)
-          add(r, 6, ui::ColEmber(), "charred %.0f%%", b.charredFrac * 100.0f);
+        if (a.severed > 0) add(r, 0, ui::ColBloodHi(), "SEVERED x%d", a.severed);
+        if (a.burning > 0) add(r, 1, ui::ColEmber(), "BURNING %u", a.burning);
+        if (a.bleeders > 1)
+          add(r, 2, ui::ColBloodHi(), "BLEEDING x%d", a.bleeders);
+        else if (a.bleeders == 1)
+          add(r, 2, ui::ColBloodHi(), "BLEEDING");
+        if (a.hp < 0.35f)
+          add(r, 3, ui::ColBloodHi(), "CRITICAL %.0f%%", a.hp * 100.0f);
+        else if (a.hp < 0.8f)
+          add(r, 5, ui::ColBlood(), "hurt %.0f%%", a.hp * 100.0f);
+        if (a.vox < 0.6f)
+          add(r, 4, ui::ColSteel(), "HOLLOW %.0f%%", a.vox * 100.0f);
+        if (a.charred > 0.25f)
+          add(r, 6, ui::ColEmber(), "charred %.0f%%", a.charred * 100.0f);
       }
-      if (r.n == 0) continue;  // nothing to report: the portrait says it is there
+      // A PART WITH NOTHING WRONG STILL GETS A LINE, and the line says so.
+      // The old column dropped healthy limbs entirely, which was right when it
+      // was a flat list of fifteen symptoms and is wrong now: the six groups
+      // are also the NAVIGATION, and an intact body has to be steerable too.
+      if (r.n == 0) add(r, 90, Fade(ui::ColParchDim(), 0.8f), "ok");
       std::stable_sort(r.eff, r.eff + r.n,
-                       [](const Effect& a, const Effect& b) { return a.sev < b.sev; });
-      nr++;
+                       [](const Effect& x, const Effect& z) { return x.sev < z.sev; });
+    };
+
+    struct GRow { int gi; Line line; int worst; int members; };
+    GRow groups[8];
+    int ng = 0;
+    for (int gi = 0; gi < kGroupN; gi++) {
+      Agg a;
+      int worst = -1;
+      float worstScore = 1e9f;
+      int members = 0;
+      for (int k = 0; k < kGroups[gi].n; k++) {
+        const int sl = kGroups[gi].slot[k];
+        if (sl < 0) continue;
+        const UIState::BodyPartUI& b = s.body[sl];
+        if (!b.present) continue;
+        members++;
+        fold(a, b);
+        float score = b.severed ? -2.0f : std::min(b.hpFrac, b.voxelFrac);
+        if (b.burningVoxels > 0) score -= 1.0f;
+        if (b.bleeding) score -= 0.5f;
+        if (score < worstScore) { worstScore = score; worst = sl; }
+      }
+      if (members == 0) continue;  // a rig without this part simply has none
+      GRow& g = groups[ng++];
+      g.gi = gi;
+      g.worst = worst;
+      g.members = members;
+      build(a, g.line);
     }
-    std::stable_sort(rows, rows + nr,
-                     [](const Row& a, const Row& b) { return a.sev < b.sev; });
-    if (nr == 0) {
+    std::stable_sort(groups, groups + ng, [](const GRow& a, const GRow& b) {
+      return a.line.sev < b.line.sev;
+    });
+    if (ng == 0) {
       small(Fade(ui::ColParchDim(), 0.85f), ImVec2(base.x + 4, y),
-            s.bodyValid ? "Not a scratch." : "No body to inspect.");
+            "No body to inspect.");
       ImGui::PushFont(ui::FontSmall());
       y += ImGui::GetTextLineHeight() + 8;
       ImGui::PopFont();
     }
+
     ImGui::PushFont(ui::FontSmall());
     const float lineH = ImGui::GetTextLineHeight();
     // The separator is DRAWN, not typed: the 13 px pixel face has no middle
     // dot, and a fallback box between every effect is exactly the row of
     // hieroglyphs the tissue table above already had to be rid of once.
     const float sepW = 9.0f;
-    // The name column, sized to the longest name actually being shown and
+    const float kCaretW = 11.0f;  // the disclosure triangle's gutter
+    const float kIndent = 10.0f;  // how far a segment hangs under its group
+    // The name column, sized to the longest name actually being shown — group
+    // names with their caret gutter, segment names with their indent — and
     // capped so a long label cannot squeeze the effects into one word a line.
     float labelW = 0.0f;
-    for (int i = 0; i < nr; i++)
-      labelW = std::max(labelW, ImGui::CalcTextSize(s.body[rows[i].slot].label).x);
-    labelW = std::min(labelW, w * 0.42f);
+    for (int i = 0; i < ng; i++) {
+      const Group& G = kGroups[groups[i].gi];
+      labelW = std::max(labelW, kCaretW + ImGui::CalcTextSize(G.name).x);
+      for (int k = 0; k < G.n; k++) {
+        if (G.slot[k] < 0 || !s.body[G.slot[k]].present) continue;
+        labelW = std::max(labelW,
+                          kIndent + ImGui::CalcTextSize(s.body[G.slot[k]].label).x);
+      }
+    }
+    labelW = std::min(labelW, w * 0.46f);
     const float tx0 = base.x + 9 + labelW + 8;
     const float right = base.x + w - 4;
     // Flow the effects left to right and wrap onto a continuation line that
     // hangs under the first one, never back under the name: the indent is what
-    // keeps a three-line limb reading as one entry.
-    auto flow = [&](const Row& r, float top, ImDrawList* out) {
+    // keeps a three-effect part reading as one entry.
+    auto flow = [&](const Line& r, float top, ImDrawList* out) {
       float cx = tx0, cy = top;
       for (int k = 0; k < r.n; k++) {
         const float tw = ImGui::CalcTextSize(r.eff[k].text).x;
@@ -2016,33 +2107,88 @@ void VitalsColumn(UIState& s, ImVec2 at, ImVec2 size) {
       }
       return cy - top + lineH;
     };
-    for (int i = 0; i < nr; i++) {
-      const Row& r = rows[i];
-      const UIState::BodyPartUI& b = s.body[r.slot];
+    // One row of the list, group or segment. `label` is drawn in the name
+    // column at `indent`, the effects flow in the text column, and the WHOLE
+    // width is the button — a row clickable only on its words is a row that
+    // gets missed.
+    auto drawRow = [&](const Line& r, const char* label, float indent, bool sel,
+                       bool dim, int id) {
       const float rowH = flow(r, y + 2, nullptr) + 4;
       ImGui::SetCursorScreenPos(ImVec2(base.x, y));
-      ImGui::PushID(6000 + i);
-      ImGui::InvisibleButton("##alarm", ImVec2(w, rowH));
-      const bool sel = s.inspectSelected == r.slot;
+      ImGui::PushID(id);
+      ImGui::InvisibleButton("##row", ImVec2(w, rowH));
+      const bool hit = ImGui::IsItemClicked();
       const bool hover = ImGui::IsItemHovered();
-      if (ImGui::IsItemClicked()) s.inspectSelected = r.slot;
       ImGui::PopID();
       if (sel || hover)
         dl->AddRectFilled(ImVec2(base.x, y), ImVec2(base.x + w, y + rowH),
                           Fade(ui::ColGold(), sel ? 0.16f : 0.08f));
       // A 3 px severity stripe down the left edge: the column can be read for
       // "how bad is this body" without reading a word of it. It runs the WHOLE
-      // row, so a limb with three effects reads as one taller alarm.
+      // row, so a part with three effects reads as one taller alarm.
       const ImU32 sc = r.eff[0].col;
       dl->AddRectFilled(ImVec2(base.x, y), ImVec2(base.x + 3, y + rowH),
                         r.sev <= 2 ? Fade(sc, 0.55f + 0.45f * pulse)
-                                   : Fade(sc, 0.75f));
-      dl->PushClipRect(ImVec2(base.x + 9, y), ImVec2(tx0 - 4, y + rowH), true);
-      ui::ShadowText(dl, ImVec2(base.x + 9, y + 2),
-                     sel ? ui::ColGoldHi() : ui::ColParch(), b.label);
+                                   : Fade(sc, r.sev >= 90 ? 0.35f : 0.75f));
+      const float lx = base.x + 9 + indent;
+      dl->PushClipRect(ImVec2(lx, y), ImVec2(tx0 - 4, y + rowH), true);
+      ui::ShadowText(dl, ImVec2(lx, y + 2),
+                     sel ? ui::ColGoldHi()
+                         : dim ? Fade(ui::ColParch(), 0.75f) : ui::ColParch(),
+                     label);
       dl->PopClipRect();
       flow(r, y + 2, dl);
       y += rowH;
+      return hit;
+    };
+
+    for (int i = 0; i < ng; i++) {
+      const GRow& g = groups[i];
+      const Group& G = kGroups[g.gi];
+      const bool splits = g.members > 1;
+      const bool open = !splits || ((s.triageOpen >> g.gi) & 1) != 0;
+      // The group is SELECTED when the selection is anywhere inside it, so the
+      // summary line stays lit while one of its segments is being read.
+      bool inside = false;
+      for (int k = 0; k < G.n; k++)
+        if (G.slot[k] >= 0 && G.slot[k] == s.inspectSelected) inside = true;
+      if (splits) {
+        // The disclosure triangle, drawn rather than typed for the same reason
+        // the separator is: this face has no glyph for it.
+        const float cx = base.x + 11, cy = y + 2 + std::floor(lineH * 0.5f);
+        const ImU32 cc = inside ? ui::ColGoldHi() : Fade(ui::ColParchDim(), 0.9f);
+        if (open)
+          dl->AddTriangleFilled(ImVec2(cx - 3, cy - 2), ImVec2(cx + 3, cy - 2),
+                                ImVec2(cx, cy + 3), cc);
+        else
+          dl->AddTriangleFilled(ImVec2(cx - 2, cy - 3), ImVec2(cx - 2, cy + 3),
+                                ImVec2(cx + 3, cy), cc);
+      }
+      if (drawRow(g.line, G.name, kCaretW, inside, false, 6000 + g.gi)) {
+        if (splits) s.triageOpen ^= 1u << g.gi;
+        // Clicking a group still has to PICK something — the portrait callout
+        // and the section below are both driven by the selection — but it must
+        // not yank the selection off a segment of this same group that the
+        // group was opened to read.
+        if (!inside && g.worst >= 0) s.inspectSelected = g.worst;
+      }
+      if (!open) continue;
+      // OPEN: every segment of the group, injured or not. A hand that is fine
+      // is still the thing to click to read what a hand is made of and what is
+      // worn over it. A one-part group (a head) is its own segment and is not
+      // listed twice.
+      if (!splits) continue;
+      for (int k = 0; k < G.n; k++) {
+        const int sl = G.slot[k];
+        if (sl < 0 || !s.body[sl].present) continue;
+        Agg a;
+        fold(a, s.body[sl]);
+        Line r;
+        build(a, r);
+        if (drawRow(r, s.body[sl].label, kIndent, s.inspectSelected == sl,
+                    r.sev >= 90, 6100 + sl))
+          s.inspectSelected = sl;
+      }
     }
     ImGui::PopFont();
     y += 8;
@@ -2293,6 +2439,10 @@ void DrawInventoryScreen(UIState& s) {
     s.deathScreenOpened = true;
     s.inspectMode = true;
     s.inspectSelected = WorstLimb(s);
+    // A corpse is a thing to READ, so the triage groups all start open: the
+    // question at a death is "what happened to this body", and that is the
+    // one time the segments are worth more than the summary.
+    s.triageOpen = 0xFFFFFFFFu;
   }
 
   // ---- layout ---------------------------------------------------------------
@@ -2487,10 +2637,37 @@ void DrawInventoryScreen(UIState& s) {
     }
     y += kSlot + 18;
 
+    // THE POOLS DO NOT MOVE. Health and mana are drawn here, at this width,
+    // in both views — the health column no longer takes them over. They used
+    // to migrate into that column when it opened, so pressing the one button
+    // whose whole job is "tell me more about my health" picked the health bar
+    // up and put it down 300 px to the right, and the eye had to go find it
+    // again. The column below leads with what it ALONE can say (how much of
+    // the body is physically still there, what is wrong with it, part by
+    // part); it does not restate these two numbers.
+    {
+      const float poolW = leftBase - kPad * 2;
+      y += PoolBar(dl, ImVec2(wp.x + kPad, y), poolW, s.health, s.healthMax,
+                   s.healthCap, ui::ColBloodHi(), "HEALTH") + 8;
+      y += PoolBar(dl, ImVec2(wp.x + kPad, y), poolW, s.mana, s.manaMax, -1,
+                   ui::ColMana(), "MANA") + 8;
+      // The locomotion state is the one-line answer to "what is this damage
+      // actually costing me", which no bar can give: "crawling" says more
+      // about a pair of lost legs than two empty hp bars do.
+      if (!s.playerAlive) {
+        ui::TrackedText(dl, ImVec2(wp.x + kPad, y + 2), ui::ColBloodHi(), "DEAD",
+                        2.0f);
+      } else if (!s.locoState.empty()) {
+        ui::ShadowText(dl, ImVec2(wp.x + kPad, y + 2),
+                       Fade(ui::ColParchDim(), 0.9f), s.locoState.c_str());
+      }
+      y += ImGui::GetTextLineHeight() + 10;
+    }
+
     if (showDetail) {
-      // The pools have moved into the health column (see below), so the foot
-      // of this one answers the question the column cannot: how much of this
-      // body is behind metal at all, and what state that metal is in.
+      // The foot of this column answers the question the health column cannot:
+      // how much of this body is behind metal at all, and what state that
+      // metal is in.
       y = ui::Subheading(dl, ImVec2(wp.x + kPad, y), leftBase - kPad * 2,
                          "PROTECTION") + 4;
       {
@@ -2525,32 +2702,14 @@ void DrawInventoryScreen(UIState& s) {
           y += 20;
         }
       }
-      // THE HEALTH COLUMN OWNS THE POOLS while it is open — it leads with
-      // them, and one screen saying "142 / 200" in two places invites the two
-      // to disagree the day one of them is changed. The column runs the FULL
-      // height of the panel, from the top of the portrait to the bottom rule.
+      // The column runs the FULL height of the panel, from the top of the
+      // portrait to the bottom rule. It never draws health or mana: those are
+      // above, in both views, and one screen saying "142 / 200" in two places
+      // invites the two to disagree the day one of them is changed.
       const float detailX = wp.x + leftBase + kColGap;
       VitalsColumn(s, ImVec2(detailX, portY),
                    ImVec2(wp.x + ws.x - kPad - detailX,
                           wp.y + ws.y - kPad - portY));
-    } else {
-      // Health + mana, the same two pools the HUD shows, so the screen and the
-      // corner never disagree about how close you are to dead.
-      const float barW = ws.x - kPad * 2;
-      y += PoolBar(dl, ImVec2(wp.x + kPad, y), barW, s.health, s.healthMax,
-                   s.healthCap, ui::ColBloodHi(), "HEALTH") + 8;
-      y += PoolBar(dl, ImVec2(wp.x + kPad, y), barW, s.mana, s.manaMax, -1,
-                   ui::ColMana(), "MANA") + 8;
-      // The locomotion state is the one-line answer to "what is this damage
-      // actually costing me", which no bar can give: "crawling" says more
-      // about a pair of lost legs than two empty hp bars do.
-      if (!s.playerAlive) {
-        ui::TrackedText(dl, ImVec2(wp.x + kPad, y + 2), ui::ColBloodHi(), "DEAD",
-                        2.0f);
-      } else if (!s.locoState.empty()) {
-        ui::ShadowText(dl, ImVec2(wp.x + kPad, y + 2),
-                       Fade(ui::ColParchDim(), 0.9f), s.locoState.c_str());
-      }
     }
   }
   ImGui::End();
