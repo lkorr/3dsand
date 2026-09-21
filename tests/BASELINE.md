@@ -661,3 +661,32 @@ change of arithmetic, not a change of weather.
 The twice-run comparison PASSED throughout (`determinism: ... sim reproduces
 itself`); only the recorded number moved. `--gate determinism --rebaseline`
 wrote the pin: 0 gates changed status, 0 page faults over the suite.
+
+## 2026-09-20 — `54d80b57` → `ffa84539` (PLAN_multiplayer_now N1 + N4)
+
+Two packages moved hashed state on purpose, on branch `mp-land`:
+
+- **N1** made the snapshot latency a constant. Every snapshot consumer now
+  reads tick T−4 instead of "whatever the last callback delivered", and the
+  harness drains through the same path the game does, so `--selftest` finally
+  runs at the shipped latency. Every gate that reads `Snap()` therefore sees a
+  different — and now reproducible — world.
+- **N4** put the sim's tick inputs on integer math: BAM heading + Q15 sine
+  table for `WindWeather`, an integer landform bake, an integer foam decay.
+  The landform bake is worldgen content, so the smoke probe tables move with
+  it (`smokeQuiet` 5 probes, `smokeLoud` 19 probes, both re-pinned by
+  `--rebaseline`). `--gate terrain` passes unchanged: relief 100 vox, mirror
+  9409/9409 columns sound, 0 fixture columns blocked.
+
+Determinism itself was never in question: the twice-run comparison passed on
+every run, and `ffa84539` reproduced across three independent launches.
+
+**Pinned BY HAND rather than by `--selftest --rebaseline`, which refused.** The
+refusal is correct and is not about this work: a clean detached control at
+`58780dc` with zero edits reports **11 unrecorded regressions of its own**
+(`determinism`, `undead`, `swing-plane`, `ai-reach`, `ai-pursue`, `npc-strike`,
+`body-coat`, `impact-fist`, `joint-rot`, `bite-limbs`, `lunge`), and
+`--rebaseline` will not write while any unrecorded failure is present. The six
+packages introduce none of them — the failing set on `mp-land` is a strict
+SUBSET of the control's, measured at the same full-suite scope. Same precedent
+and same reasoning as 4097d71.
