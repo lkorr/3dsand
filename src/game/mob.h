@@ -617,6 +617,17 @@ struct MobDef {
   // avatar's head-look keeps its own `avatar.headLookSpine` slider — a
   // player's idle glance is a FEEL question and belongs in tuning.json.
   float aimSpineShare = 0.35f;
+  // Where the eyes sit, as an offset from the head limb's ANCHOR (neck joint)
+  // in art voxels, engine frame. Authored in the sidecar's top-level "eyeLocal"
+  // array; converted to world voxels at load by ArtToWorld(). The camera rides
+  // the midpoint between the eyes, so this is the centroid of the two.
+  Vec3 eyeLocal{};
+  bool hasEyeLocal = false;
+  // DERIVED at load from eyeLocal + the head's rest-pose anchor position: the
+  // eye's height above the creature's bottom in world voxels. Replaces the
+  // hardcoded kEyeOffset for any creature that declares eyeLocal, so different
+  // characters get different camera heights automatically.
+  float eyeRestHeight = 0;
 
   int FindNatural(const std::string& n) const {
     for (size_t i = 0; i < natural.size(); i++)
@@ -3285,6 +3296,18 @@ class Mob {
   // GetUp: each limb's world pose the moment it was made kinematic again —
   // the "from" side of the get-up blend, parallel to limbs_.
   std::vector<BodyTransform> getUpFrom_;
+  // ---- gradual skin tint (the corpse-to-zombie palette transition) ----
+  // One entry per art colour that differs between the body it was and the
+  // body it rose as. Each names a dedicated slot in the shared art palette
+  // whose RGB is lerped from humanRgb to zombieRgb over 60 seconds; the
+  // voxels already reference these slots, so the brick data never changes.
+  struct TurnTintSlot {
+    size_t sharedIndex;
+    uint32_t fromRgb, toRgb;
+  };
+  std::vector<TurnTintSlot> turnTintSlots_;
+  float turnTintT_ = 0.0f;    // 0→1 over kTurnTintSeconds
+  static constexpr float kTurnTintSeconds = 60.0f;
   // PostStep scratch for DebrisSystem::UntunnelRig: the limp rig's dynamic
   // bodies and where each of them was before the step. Members rather than
   // locals so a limp creature does not allocate twice a tick; cleared and
@@ -5016,6 +5039,11 @@ class MobSystem {
     float heading = 0.0f, bodyY = 0.0f;
     std::vector<std::string> lost;     // limbs it had already lost
     std::vector<uint64_t> bodies;      // the remains, to take out of the world
+    // Limb name → debris handle, so ServiceRisings can read the debris's
+    // current transform right before destroying it and hand the zombie a
+    // ragdoll pose to rise from.
+    struct RiseBodyMap { std::string name; uint64_t body; };
+    std::vector<RiseBodyMap> bodyMap;
     uint32_t atTick = 0;
     // WHOSE CORPSE IT WAS (M9.4-B). A rising SPAWNS a creature, which is an
     // authoring act: two machines servicing the same booking would stand two

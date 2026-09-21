@@ -876,6 +876,12 @@ bool BuildMobDef(const MobDefFactory& fac, const MobSource& src, const json& j,
   }
   // How much of an AIM effector's yaw the spine takes (mob.h).
   def.aimSpineShare = std::clamp(j.value("aimSpineShare", 0.35f), 0.0f, 1.0f);
+  if (j.contains("eyeLocal") && j["eyeLocal"].size() == 3) {
+    def.eyeLocal = {j["eyeLocal"][0].get<float>(),
+                    j["eyeLocal"][1].get<float>(),
+                    j["eyeLocal"][2].get<float>()};
+    def.hasEyeLocal = true;
+  }
   // ---- WORLD-SPACE SIDECAR LENGTHS (DESIGN.md §3b) --------------------
   // `speed`, `severImpactSpeed`, `gait.rideHeight`, `states[].bodyYOffset`
   // and clip position keys are WORLD VOXELS (or voxels/sec), not art
@@ -1708,6 +1714,16 @@ bool BuildMobDef(const MobDefFactory& fac, const MobSource& src, const json& j,
     def.worldSize = box * (1.0f / (float)def.skinScale);
   }
 
+  // Derive the rest-pose eye height from eyeLocal + head anchor.
+  if (def.hasEyeLocal) {
+    int headPart = def.skel.FindPart("head");
+    if (headPart >= 0) {
+      const float aInv = def.ArtToWorld();
+      Vec3 eyeWorld = def.eyeLocal * aInv;
+      def.eyeRestHeight = def.skel.parts[headPart].anchorLocal.y + eyeWorld.y;
+    }
+  }
+
   // ---- micro brick upload (PLAN §C, sim/microbody.h) ----
   // Packed once per DEF, shared by every instance: a limb's voxels never
   // change after load in v1, so there is no per-instance storage at all.
@@ -2182,6 +2198,22 @@ void MobSystem::ServiceRisings(uint32_t tick) {
     }
     const int at = DefWithEffects(r.def, r.fx, nullptr);
     if (at >= 0) {
+      // ---- WHERE EACH LIMB SETTLED, READ WHILE THE DEBRIS STILL EXISTS -----
+      //
+      // The zombie rises from where the corpse lies, not from where it died.
+      // Read each debris body's current transform from Jolt BEFORE destroying
+      // it — after DestroyBody the handle is dead. Matched to the zombie's
+      // limbs by name (PendingRise::bodyMap) on the far side of the spawn.
+      struct RagPose { std::string name; BodyTransform xf; };
+      std::vector<RagPose> ragPose;
+      if (phys_ && !r.bodyMap.empty()) {
+        ragPose.reserve(r.bodyMap.size());
+        for (const auto& bm : r.bodyMap) {
+          BodyTransform xf;
+          if (phys_->GetTransform(bm.body, xf))
+            ragPose.push_back({bm.name, xf});
+        }
+      }
       // THE REMAINS COME OUT OF THE WORLD FIRST. A corpse that got up is not
       // still lying there, and spawning a rig inside its own flesh hands Jolt
       // a dozen deep overlaps at once (the same penetration that used to fire
@@ -2225,14 +2257,45 @@ void MobSystem::ServiceRisings(uint32_t tick) {
         // into children, so doing it first would operate on limbs this loop
         // still needs.
         size_t restored = 0, repainted = 0;
+        // Remap tables for the gradual skin tint: a voxel painted with
+        // human merged index H (or zombie merged index Z) is redirected to
+        // a DEDICATED shared palette entry whose RGB starts at the human
+        // colour and lerps to the zombie colour over 60 seconds.
+        uint8_t humanToTint[256] = {};
+        uint8_t zombieToTint[256] = {};
         if (restoring) {
           const int wasDef = FindDef(r.def);
           const std::vector<int16_t> recolour =
               wasDef >= 0 ? RisenArtRemap(defs_[wasDef].prefab,
                                           defs_[at].prefab)
                           : std::vector<int16_t>();
-          for (size_t s = 1; s < recolour.size(); s++)
-            if (recolour[s] >= 0 && recolour[s] != (int16_t)s) repainted++;
+          // ---- ALLOCATE DEDICATED PALETTE ENTRIES ----------------------------
+          //
+          // One per art colour that changed between the living body and the
+          // undead one. Initialised to the LIVING colour, so the creature
+          // rises looking like it did when it died; PreTick lerps the RGB
+          // toward the zombie colour over kTurnTintSeconds.
+          if (!recolour.empty() && microSet_) {
+            for (size_t s = 1; s < recolour.size(); s++) {
+              if (recolour[s] < 0 || recolour[s] == (int16_t)s) continue;
+              uint8_t hIdx = (uint8_t)s, zIdx = (uint8_t)recolour[s];
+              if (hIdx == 0 || zIdx == 0) continue;
+              if ((size_t)(hIdx - 1) >= microSet_->artColors.size() ||
+                  (size_t)(zIdx - 1) >= microSet_->artColors.size()) continue;
+              uint32_t hRgb = microSet_->artColors[hIdx - 1];
+              uint32_t zRgb = microSet_->artColors[zIdx - 1];
+              if (hRgb == zRgb) continue;
+              size_t slot = microSet_->artColors.size();
+              if (slot >= kArtPaletteSlotsGpu) break;
+              microSet_->artColors.push_back(hRgb);
+              uint8_t m = (uint8_t)(slot + 1);
+              humanToTint[hIdx] = m;
+              zombieToTint[zIdx] = m;
+              now.turnTintSlots_.push_back({slot, hRgb, zRgb});
+              repainted++;
+            }
+            now.turnTintT_ = 0.0f;
+          }
           for (PendingRise::RiseLimb& rl : r.limbs) {
             int slot = -1;
             for (size_t k = 0;
@@ -2240,14 +2303,14 @@ void MobSystem::ServiceRisings(uint32_t tick) {
               if (defs_[at].limbs[k].name == rl.name) { slot = (int)k; break; }
             if (slot < 0 || !now.limbs_[slot].body) continue;
             if (rl.voxels.empty()) continue;   // nothing left to stand up
-            if (!recolour.empty()) {
-              for (DebrisVoxel& v : rl.voxels)
-                if (v.color && recolour[v.color] >= 0)
-                  v.color = (uint8_t)recolour[v.color];
-              for (PrefabVoxel& v : rl.skinVoxels)
-                if (v.color && recolour[v.color] >= 0)
-                  v.color = (uint8_t)recolour[v.color];
-            }
+            // Captured limbs carry human merged indices — remap to the
+            // dedicated tint entries so they start at the living colour.
+            for (DebrisVoxel& v : rl.voxels)
+              if (v.color && humanToTint[v.color])
+                v.color = humanToTint[v.color];
+            for (PrefabVoxel& v : rl.skinVoxels)
+              if (v.color && humanToTint[v.color])
+                v.color = humanToTint[v.color];
             MobLimb& L = now.limbs_[slot];
             L.hp = rl.hp;
             L.voxels = std::move(rl.voxels);
@@ -2260,6 +2323,30 @@ void MobSystem::ServiceRisings(uint32_t tick) {
               now.ReskinLimbMicro(L, now.SkinScaleOf(L), now.PhysScaleOf(L));
             now.RebuildLimbBody(slot);
             restored++;
+          }
+          // ---- NON-CAPTURED LIMBS START HUMAN-COLOURED TOO ------------------
+          //
+          // Without this, pristine limbs spawn at the zombie palette (grey)
+          // while carved limbs start at the human palette (warm), which reads
+          // as a pop rather than a transition. Their voxels carry ZOMBIE
+          // merged indices — remap through zombieToTint.
+          if (!now.turnTintSlots_.empty()) {
+            for (size_t k = 0;
+                 k < now.limbs_.size() && k < defs_[at].limbs.size(); k++) {
+              MobLimb& L = now.limbs_[k];
+              if (!L.body || L.carved) continue;
+              bool changed = false;
+              for (PrefabVoxel& v : L.skinVoxels)
+                if (v.color && zombieToTint[v.color]) {
+                  v.color = zombieToTint[v.color]; changed = true;
+                }
+              for (DebrisVoxel& v : L.voxels)
+                if (v.color && zombieToTint[v.color]) {
+                  v.color = (uint8_t)zombieToTint[v.color]; changed = true;
+                }
+              if (changed && L.microModel >= 0)
+                now.ReskinLimbMicro(L, now.SkinScaleOf(L), now.PhysScaleOf(L));
+            }
           }
         }
         // What it was already missing stays missing — by NAME, as in TurnMob,
@@ -2294,6 +2381,30 @@ void MobSystem::ServiceRisings(uint32_t tick) {
                                     g.damage.Empty() ? nullptr : &g.damage,
                                     g.dye);
           if (ok) dressed++;
+        }
+        // ---- IT RISES FROM WHERE IT FELL, NOT FROM STANDING ----------------
+        //
+        // Teleport each of the zombie's limbs to the debris body's last
+        // settled position and start the get-up blend. Without this the
+        // corpse vanishes and the zombie pops in upright: a discontinuity
+        // on a creature the player is watching. BeginGetUp reads the limbs
+        // back from Jolt, derives heading from the chest, probes the ground
+        // and enters RagdollPhase::GetUp — the same path a blast knockdown
+        // follows.
+        if (!ragPose.empty() && phys_ && world_) {
+          for (const auto& rp : ragPose) {
+            for (size_t k = 0;
+                 k < now.limbs_.size() && k < defs_[at].limbs.size(); k++) {
+              if (defs_[at].limbs[k].name != rp.name) continue;
+              MobLimb& L = now.limbs_[k];
+              if (!L.body) continue;
+              float q[4] = {rp.xf.quat[0], rp.xf.quat[1],
+                            rp.xf.quat[2], rp.xf.quat[3]};
+              phys_->SetBodyTransform(L.body, rp.xf.pos, q);
+              break;
+            }
+          }
+          now.BeginGetUp(*world_);
         }
         std::printf("mob: '%s' got up as '%s' (%zu/%zu limbs as they were over "
                     "%zu repainted art slots, %zu/%zu pieces of kit)\n",
@@ -6495,6 +6606,38 @@ void MobSystem::PreTick(uint32_t tick, World& world, std::vector<BrushOp>& ops,
   // loop above: this spawns, and a spawn pushes to the vector that loop is
   // walking by index.
   ServiceRisings(tick);
+  // ---- GRADUAL SKIN TINT (the 60-second corpse-to-zombie palette fade) ----
+  //
+  // Each dedicated palette entry lerps from the living colour to the undead
+  // colour. The voxels already reference these entries, so no brick rebuild
+  // is needed — only the palette upload.
+  if (microSet_) {
+    bool paletteDirty = false;
+    for (Mob& mob : mobs_) {
+      if (mob.turnTintSlots_.empty()) continue;
+      mob.turnTintT_ += dt / Mob::kTurnTintSeconds;
+      if (mob.turnTintT_ >= 1.0f) mob.turnTintT_ = 1.0f;
+      const float t = mob.turnTintT_;
+      for (const auto& ts : mob.turnTintSlots_) {
+        if (ts.sharedIndex >= microSet_->artColors.size()) continue;
+        auto lerp8 = [](uint32_t a, uint32_t b, float t, int shift) {
+          float va = (float)((a >> shift) & 0xFF);
+          float vb = (float)((b >> shift) & 0xFF);
+          return (uint32_t)std::clamp((int)std::lround(va + (vb - va) * t),
+                                      0, 255);
+        };
+        uint32_t rgb = (lerp8(ts.fromRgb, ts.toRgb, t, 16) << 16) |
+                       (lerp8(ts.fromRgb, ts.toRgb, t, 8) << 8) |
+                       lerp8(ts.fromRgb, ts.toRgb, t, 0);
+        if (microSet_->artColors[ts.sharedIndex] != rgb) {
+          microSet_->artColors[ts.sharedIndex] = rgb;
+          paletteDirty = true;
+        }
+      }
+      if (t >= 1.0f) mob.turnTintSlots_.clear();
+    }
+    if (paletteDirty) microSet_->dirty = true;
+  }
 }
 
 void Mob::DrainPendingSpawns(World& world, std::vector<ParticleSpawn>& spawns) {
@@ -15717,7 +15860,11 @@ void Mob::Die() {
     if (!limb.body) continue;
     // The remains, so the rising can take them out of the world rather than
     // stand a second body up inside them.
-    if (rising) rise.bodies.push_back(limb.body);
+    if (rising) {
+      rise.bodies.push_back(limb.body);
+      if (i < def_->limbs.size())
+        rise.bodyMap.push_back({def_->limbs[i].name, limb.body});
+    }
     // Same reason as DetachLimb: the lattice is handed to DebrisSystem here,
     // and an unflushed burn tombstone must not travel with it.
     StripBurnTombstones(limb);
