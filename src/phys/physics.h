@@ -373,16 +373,23 @@ class Physics {
   // This puts the body on the no-player-contact layer (Layers::AVATAR, the
   // same one the player's own attached limbs live on) and remembers it. Every
   // Step, each remembered body whose world AABB no longer overlaps the proxy
-  // is moved back to MOVING and forgotten — so it never pushes the creature
+  // is moved back to MOVING and forgotten — clear of EVERY live proxy, not
+  // just one (M9.1 P2) — so it never pushes the creature
   // it came off, and the moment it has fallen clear it is ordinary debris
   // that can be stood on, kicked and picked up. The check is an AABB test
   // (one lock per body), bounded by kMaxPendingRelease; past that the oldest
   // is released unconditionally rather than the list growing.
   //
-  // With no player proxy in the world (a headless NPC-only run) the body goes
-  // straight to MOVING: there is nobody to protect.
+  // With no live player proxy in the world (a headless NPC-only run) the body
+  // goes straight to MOVING: there is nobody to protect.
   void ReleaseToWorldWhenClear(uint64_t handle);
   static constexpr size_t kMaxPendingRelease = 256;
+  // How many player proxies TickPendingReleases will test a piece against. A
+  // bound, not a player cap: it sizes the stack array of AABBs gathered once
+  // per tick (rule 2 — the per-piece loop must not grow with the world). LAN
+  // co-op is a handful of players; if a proxy past this ever exists, a piece
+  // inside it is released a tick early rather than the sweep getting slower.
+  static constexpr int kMaxPlayerProxies = 8;
   // How many bodies are still waiting to be released. For the selftest.
   size_t PendingReleaseCount() const { return pendingRelease_.size(); }
 
@@ -565,10 +572,20 @@ class Physics {
   std::unique_ptr<JointImpls> joints_;
   uint64_t nextJointId_ = 1;
   uint32_t nextCollisionGroup_ = 1;
-  // The player proxy (CreatePlayerBody), so ReleaseToWorldWhenClear can ask
-  // "is this body still inside the player" without the caller threading the
-  // handle through every mob. Zero in a world with no player.
-  uint64_t playerBody_ = 0;
+  // EVERY live player proxy (CreatePlayerBody), so ReleaseToWorldWhenClear can
+  // ask "is this body still inside A player" without the caller threading the
+  // handle through every mob. Empty in a world with no player.
+  //
+  // A LIST, NOT A SLOT (M9.1 P2). It was one handle, and the newest proxy won:
+  // a second session's capsule would have silently stolen the protection from
+  // the first, and a severed limb inside player 0 would have been dropped into
+  // the MOVING layer the instant player 1 spawned -- which reads as a piece of
+  // somebody shoving them across the room. With ONE entry the behaviour is
+  // bit-identical to the single handle it replaces: the two readers below tested
+  // one proxy and now test every proxy, and "every" over a list of one is the
+  // same test. RemoveBody erases, so a selftest that makes and removes several
+  // proxies (selftest_phys/selftest_mob do) does not grow this without bound.
+  std::vector<uint64_t> playerBodies_;
   std::vector<uint64_t> pendingRelease_;
   // World-space AABB of a live body, metres. False for a dead handle.
   bool WorldBounds(uint64_t handle, float outMin[3], float outMax[3]) const;

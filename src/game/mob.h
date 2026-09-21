@@ -3595,8 +3595,12 @@ class MobSystem {
   // so two factions fight the moment two profiles disagree about `faction`.
   //
   // A LIST, NOT A SLOT (docs/PLAN_multiplayer_now.md N5). One capsule per
-  // player: `players[i].id` is `i`, which keeps 0 as the local player and
-  // reserves the low band for the rest, and mob ids still start at kMaxPlayers.
+  // player: `players[i].id` is `ai::kPlayerActorBase + i`, a band disjoint from
+  // mob ids (which are a monotonic counter from 1 and are NOT moved -- they are
+  // in the save format). The line that used to stand here claimed "mob ids
+  // still start at kMaxPlayers"; there is no kMaxPlayers and there never was,
+  // and the low-band scheme it described collided player 1 with the first mob
+  // spawned. See ai::kPlayerActorBase for why the band is high instead.
   // Nothing downstream asks what KIND of thing an actor entry is, so the whole
   // targeting layer is already multi-player; only the plumbing was singular.
   struct PlayerActorDesc {
@@ -3868,8 +3872,8 @@ class MobSystem {
   // equip...) is the per-creature surface; the id-keyed wrappers below remain
   // for callers that only hold a body handle or an id.
   Mob* FindMobById(uint64_t id);
-  // A creature by TARGET id, which includes the player: the avatar is a Mob
-  // outside `mobs_` and its actor id is the reserved ai::kPlayerActorId. Use
+  // A creature by TARGET id, which includes the players: an avatar is a Mob
+  // outside `mobs_` and its actor id is in the ai::kPlayerActorBase band. Use
   // this wherever the id came from the AI; `FindMobById` where it did not.
   // See the note on the definition for what the missing case cost.
   Mob* FindCombatantById(uint64_t id);

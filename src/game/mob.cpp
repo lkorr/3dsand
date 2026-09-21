@@ -2403,13 +2403,13 @@ void MobSystem::SetPlayerActors(std::span<const PlayerActorDesc> players) {
   playerActors_.reserve(players.size());
   for (size_t i = 0; i < players.size(); i++) {
     ai::Actor a;
-    // The index IS the id. 0 is the local player (ai::kPlayerActorId) and mob
-    // ids start at 1, so a second session would collide TODAY -- that is a
-    // real limit, not a hypothetical one, and the fix is a reserved player
-    // band in nextId_ when a second session exists to need it. Recorded here
-    // rather than papered over, because an id an NPC targets by has to be
-    // stable.
-    a.id = (uint64_t)i;
+    // THE ID IS THE BAND, NOT THE INDEX (M9.1 P2). The index used to BE the id,
+    // which made player 1 collide with the first mob ever spawned (mob ids
+    // start at 1) and made player 0 indistinguishable from `targetId = 0` =
+    // "no target". `ai::kPlayerActorBase` is a disjoint high band; the note on
+    // the constant has the whole argument. Mob id allocation is untouched --
+    // it is in the save format.
+    a.id = ai::kPlayerActorBase + (uint64_t)i;
     a.centre = players[i].centreVox;
     a.radius = players[i].radius;
     a.height = players[i].height;
@@ -2572,9 +2572,10 @@ Mob* MobSystem::FindMobById(uint64_t id) {
 // ---- WHO A BLOW IS AIMED AT, AND THE PLAYER IS A WHO ------------------------
 //
 // `FindMobById` answers over `mobs_`, and the avatar is a Mob that is NOT in it
-// (MobSystem::SetAvatar says why). An AI's `targetId` is an ACTOR id, and the
-// player's is the reserved 0 (ai::kPlayerActorId) -- so every id-keyed lookup
-// on the attack path silently missed the one target the game is mostly about.
+// (MobSystem::SetAvatar says why). An AI's `targetId` is an ACTOR id, and a
+// player's lives in the reserved ai::kPlayerActorBase band -- so every id-keyed
+// lookup on the attack path silently missed the one target the game is mostly
+// about.
 //
 // WHAT THAT COST, because it is not obvious from the signature: `StartStroke`
 // draws WHICH LIMB a blow goes for with `if (const Mob* victim =
@@ -2593,8 +2594,19 @@ Mob* MobSystem::FindMobById(uint64_t id) {
 // callers (EquipItem, the block drain, the dev overlay) that mean "a mob in my
 // list" and would start answering with the player if this were folded in.
 Mob* MobSystem::FindCombatantById(uint64_t id) {
-  // Actor id i is avatars_[i] (SetPlayerActors); null in a headless run.
-  if (id < avatars_.size()) return avatars_[id];
+  // Player actor `kPlayerActorBase + i` is avatars_[i] (SetPlayerActors);
+  // null in a headless run, where nobody registered an avatar at all.
+  //
+  // THE BAND TEST IS AN EQUALITY ON THE TOP BITS, NOT AN ORDER ON THE VALUE.
+  // The previous form was `id < avatars_.size()`, an ORDER on ids, and that is
+  // the shape the audit's X3 warns about: any `<` that treats an id as a
+  // magnitude breaks the moment the id space is banded. It also swallowed
+  // `id == 0`, which is how "no target" is written -- so a scripted swing that
+  // named no victim drew the PLAYER's limb.
+  if (ai::IsPlayerActorId(id)) {
+    const uint64_t i = id - ai::kPlayerActorBase;
+    return i < avatars_.size() ? avatars_[(size_t)i] : nullptr;
+  }
   return FindMobById(id);
 }
 
