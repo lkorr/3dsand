@@ -9576,7 +9576,7 @@ int main(int argc, char** argv) {
         cam.yaw = labYaw;
         cam.pitch = labPitch;
       }
-      player.viewYOffset = 0.0f;  // teleport: never smooth across it
+      player.ResetViewSmooth();   // teleport: never smooth across it
       player.SnapRender();        // ...and never interpolate across it either
       tick = 0;
       grenades.clear();
@@ -10262,6 +10262,14 @@ int main(int argc, char** argv) {
       const float tickAlpha =
           std::min(1.0f, std::max(0.0f, (float)(accumulator / kTickDt)));
       Vec3 eye = player.RenderEyePos(tickAlpha);
+      // ...and the BODY gets the same two corrections, or the art and the
+      // camera disagree. The avatar is posed once per 30 Hz tick around
+      // `player.pos`, so before this the figure stair-stepped at the tick rate
+      // under a camera that glides, and a step-up put it a whole voxel higher
+      // in a single frame while the eye eased up over viewSmoothHalflife.
+      // Render-only, applied in ONE place (Mob::AppendXforms) — the colliders,
+      // the reach tests and every strike still read the posed transforms.
+      avatar.SetRenderOffset(player.RenderBodyOffset(tickAlpha));
       // First-person part-hiding mask, hoisted so the portrait pass below can
       // restore it after drawing the whole body. See the note at its fill.
       std::vector<uint8_t> hide;

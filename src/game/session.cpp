@@ -465,6 +465,12 @@ static void PhaseA(TickAuthorityCtx& w, WorldScratch& ws,
         if (avatar.Spawned() && avatar.Ragdolled()) {
           player.vel = {};
           player.SnapRender();   // the rig owns the body: nothing to lerp
+          // Update() is what normally ages the step-smoothing offsets, and it
+          // is not running. Left frozen they would hold the camera (and now
+          // the art, Player::RenderBodyOffset) a step off the ground for the
+          // whole ragdoll — so age them here on the same clock.
+          player.DecayViewSmooth(kTickDt,
+                                 CurrentTuning().player.viewSmoothHalflife);
         } else {
           player.Update(kTickDt, ti, kindAt);
         }

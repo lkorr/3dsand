@@ -128,6 +128,12 @@ const char* const kOrder[] = {
     // the same reason `swing` is: a controller that has drifted back onto the
     // frame clock makes every later movement gate measure something else.
     "tick-input",
+    // ...and immediately after it `view-smooth`, which is the same Player,
+    // the same synthetic ground lambda and the same milliseconds, asserting
+    // the RENDER half of what tick-input asserts about the sim half: the
+    // drawn eye and the drawn body are one continuous motion across a step
+    // the controller takes in a single tick.
+    "view-smooth",
     // AND WITH THEM, for the fourth time and the same reason: `net-loopback`
     // is src/net alone — two in-memory Links, one loopback TCP pair, a Hello
     // table and a pure-value pacer. No world, no GPU, no assets, nothing left

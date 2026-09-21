@@ -2348,6 +2348,22 @@ class Mob {
   void AppendXforms(std::vector<BodyXformGpu>& out) const;
   uint32_t AppendMicroInsts(std::vector<MicroBodyInstGpu>& out,
                             uint32_t slotBase) const;
+
+  // ---- render-only rigid offset --------------------------------------------
+  // Added to every limb transform this creature emits, and to NOTHING else:
+  // not to the colliders, not to the reach tests, not to a strike's geometry.
+  //
+  // It exists because a body is posed once per 30 Hz TICK while the frame loop
+  // draws at whatever the display does. The player's art used to stair-step at
+  // the tick rate while the camera glided (Player::RenderBodyOffset supplies
+  // the interpolation and the step-smoothing here), and a step-up moved the
+  // figure a whole voxel in one frame. Only the player avatar sets it today;
+  // an NPC or a remote player wanting the same treatment sets the same field.
+  //
+  // Set it every frame or not at all — it is not decayed here.
+  void SetRenderOffset(const Vec3& v) { renderOffset_ = v; }
+  const Vec3& RenderOffset() const { return renderOffset_; }
+
   // Every brick record this creature holds, DRAWN OR NOT (sim/microbody.h
   // MicroHolder). A limb keeps `microModel` after a sever hands the brick to
   // DebrisSystem and after Die() does, so the slots that no longer draw are
@@ -3445,6 +3461,9 @@ class Mob {
   float weaponWeight_ = 0;     // weapon_.weight, clamped once on the way in
   mutable WeaponArmDiag weaponDiag_{};
   mutable AimDiag aimDiag_{};
+  // Render-only rigid translation applied by AppendXforms — see
+  // SetRenderOffset. Never read by anything that can feed the sim.
+  Vec3 renderOffset_{0, 0, 0};
   mutable Quat weaponHandPreClamp_{}, weaponUpPreClamp_{}, weaponLoPreClamp_{};
   mutable Vec3 weaponHandPosPreClamp_{};
   mutable int weaponHandPart_ = -1, weaponUpPart_ = -1, weaponLoPart_ = -1;

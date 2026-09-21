@@ -5804,6 +5804,30 @@ a detached speckle becomes a floating scrap of flesh in the world.
   `pos`/`EyePos()`, or the world would stop being a function of the tick stream.
   Gate: `tick-input` runs 300 scripted ticks at 1 and at 4 ticks per frame and
   asserts a bit-identical trajectory and a bit-identical command stream.
+- **A step is ONE continuous motion, and three separate things had to agree
+  before it was** (2026-09-21, `view-smooth` gate). `StepSlide` climbs a ledge
+  in a single tick by design, so the render path hides it — and from N2 until
+  this change the two halves of that hiding fought each other and the art got
+  neither. (1) `Player::BankVerticalSnap` is now the ONLY way a vertical snap
+  is banked: it subtracts the jump from `viewYOffset` *and* adds it to
+  `prevPos.y`, because a snap is not travel along the tick's segment. Without
+  the second half the offset removed the whole step in one lump at the tick
+  boundary while `RenderPos` added it back linearly over the next 33 ms — a
+  full-step-height sawtooth at 30 Hz, which is "it teleports up a voxel at a
+  time" exactly as reported. (2) The offset is aged once per tick, so it was
+  itself a 30 Hz staircase releasing 20.6% of a voxel in one frame;
+  `Player::SmoothFade(alpha)` spreads that tick's decay factor across the
+  tick's frames. (3) The BODY gets both corrections too, through
+  `Player::RenderBodyOffset` → `Mob::SetRenderOffset` → `Mob::AppendXforms`,
+  which is the single place a render-only rigid translation is applied — the
+  colliders, the reach tests and every strike keep reading the posed
+  transforms. `bodyYOffset` is `viewYOffset` minus the crouch's eye-height
+  bank, since a crouch moves the eye inside a body that has not moved.
+  The gate walks a 1-in-4 staircase sampling five frames per tick and bounds
+  the largest single-FRAME change in drawn eye height, the largest downward
+  one, and the drift between the drawn eye and the drawn body (~0 by
+  construction). Measured: 1.0 → 0.26 → 0.056 voxels per frame across the
+  three fixes.
 - **The collision box is not the figure** (2026-09-02, `Player::Box`).
   `Player::pos` stays the centre of the NOMINAL 1.7 m figure box
   (`kHalfXZ`/`kHalfY`: the art contract, the Jolt proxy, the mob sense actor,

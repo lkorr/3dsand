@@ -15827,7 +15827,11 @@ void Mob::AppendXforms(std::vector<BodyXformGpu>& out) const {
   for (const MobLimb& limb : limbs_) {
     if (!limb.body) continue;
     if (out.size() >= kMaxBodySlots) return;
-    rigrender::AppendXform(out, limb.xf);
+    // renderOffset_ is a rigid, render-only translation of the whole creature
+    // (Mob::SetRenderOffset). This walk is the ONLY place it is applied, which
+    // is what keeps it presentation: the debug-box walk, every collider and
+    // every strike keep reading limb.xf itself.
+    rigrender::AppendXform(out, limb.xf, renderOffset_);
   }
 }
 
