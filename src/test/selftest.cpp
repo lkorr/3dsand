@@ -223,6 +223,15 @@ const char* const kOrder[] = {
     // `ops-replay` says the stream describes the tick, this says two machines
     // build the same stream (M9.3-B).
     "ops-exchange",
+    // ...and `store-sync` immediately after it (M9.5-B). Mostly CPU — two
+    // StoreSync ends over a loopback pair and two ChunkStores, no Stream —
+    // but its last two rows SAVE and LOAD a world to prove meta.svm's SVM5
+    // tick/seed pair round-trips and that an SVM4 file still loads. So it
+    // belongs with the gates that regenerate on the way out rather than with
+    // the streaming block: it leaves the ordinary worldgen at the origin
+    // behind it, and `determinism` below regenerates anyway and proves its
+    // hash independent of whatever it inherited.
+    "store-sync",
     "determinism", "sleep",       "ca-skip",
     // Per-material angle of repose. It runs its own worldgen per arm, builds a
     // sealed stone room and pours into it, and it PATCHES ONE MATERIAL'S GPU

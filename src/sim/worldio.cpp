@@ -4,10 +4,18 @@
 #include <cstdio>
 
 namespace {
-// 'SVM4': grew the voxel-size bit pattern + the material name table. Bumped
-// from SVM3 so an old build refuses a new save outright instead of misreading
-// the longer header.
-constexpr uint32_t kMetaMagic = 0x344D5653;  // 'SVM4'
+// 'SVM5': appended the sim TICK and the SEED (M9.5-B; worldio.h says why the
+// two are worth a magic bump). 'SVM4' before it grew the voxel-size bit
+// pattern + the material name table.
+//
+// UNLIKE THE SVM3 -> SVM4 BUMP, THIS ONE IS BACKWARD-READABLE. SVM4 changed
+// the meaning of bytes an SVM3 reader would have misread, so refusing was the
+// only safe answer; SVM5 only APPENDS, so every field an SVM4 file carries is
+// at the same offset with the same meaning, and reading one costs nothing but
+// leaving `tick`/`seed` unknown. The loader therefore accepts both magics and
+// records which it saw.
+constexpr uint32_t kMetaMagic = 0x354D5653;    // 'SVM5'
+constexpr uint32_t kMetaMagicV4 = 0x344D5653;  // 'SVM4' - still loads
 constexpr uint32_t kEntMagic = 0x31455653;   // 'SVE1'
 
 std::string MetaPath(const std::string& dir) { return dir + "/meta.svm"; }
@@ -111,7 +119,7 @@ uint32_t VoxelMetersBits() {
 
 bool SaveWorld(GpuContext& ctx, World& world, Stream& stream,
                const std::string& path, const std::vector<MaterialDef>& mats,
-               const EntityIO* entities) {
+               const EntityIO* entities, WorldStamp stamp) {
   ChunkStore& store = stream.Store();
   if (store.Bound() && store.Dir() != path) {
     std::fprintf(stderr, "save: store is bound to %s (one world dir per session)\n",
@@ -119,9 +127,58 @@ bool SaveWorld(GpuContext& ctx, World& world, Stream& stream,
     return false;
   }
 
+  // ---- KEEP THE TICK TAGS ACROSS THE FLUSH (M9.5-B) ---------------------
+  //
+  // `FlushResident` Puts every resident chunk UNTAGGED — it calls
+  // `ChunkStore::Put(wc, rle)` with no tick, because M9.5-A deliberately left
+  // every existing caller's signature alone and `Stream` has no clock to pass
+  // — and an untagged Put ERASES an existing tag (chunkstore.h: "unknown" is
+  // the honest answer for bytes nobody vouched for).
+  //
+  // For a single-player save that is harmless: there are no tags. For a HOST
+  // it silently deletes the persistence this whole package exists for. A
+  // chunk a peer sent with `ChunkPut` and that the host happens to still hold
+  // resident is exactly an edit somebody made, and after the flush it would
+  // be indistinguishable from procgen.
+  //
+  // MEASURED, the first M9.5-B two-process smoke: the client sent 2,193 puts
+  // and the saved store reported 2,161 tagged chunks. Thirty-two of them were
+  // the ones near the spawn that the standing host still had in its window.
+  //
+  // So the tags are snapshotted first and re-asserted after. The PREVIOUS
+  // tick is kept rather than `stamp.tick`, and that is the conservative
+  // choice on purpose: the flushed bytes really are newer than the old tag,
+  // but "this chunk is somebody's edit, at least this old" is a true
+  // statement, while stamping the save tick onto it would claim a freshness
+  // decided by when the player pressed F9. Chunks that had NO tag get none:
+  // inventing one for all 32,768 resident slots would put the entire
+  // pristine window into `manifest.svt` and into every late join's manifest
+  // message.
+  std::vector<std::pair<IVec3, uint32_t>> tagsBefore;
+  store.Manifest(tagsBefore);
+  tagsBefore.erase(std::remove_if(tagsBefore.begin(), tagsBefore.end(),
+                                  [](const std::pair<IVec3, uint32_t>& e) {
+                                    return e.second == 0;
+                                  }),
+                   tagsBefore.end());
+
   // resident window -> store (unfiltered: air chunks too, so a re-fill needs
   // no snapshot trust; drains in-flight async evictions)
   stream.FlushResident();
+
+  size_t retagged = 0;
+  for (const auto& [wc, tickTag] : tagsBefore) {
+    if (store.TickOf(wc) != 0) continue;  // survived; nothing to restore
+    const std::vector<uint32_t>* cur = store.Get(wc);
+    if (!cur) continue;                   // gone from the store entirely
+    // Copy first: `Put` may LRU-spill the region `cur` points into.
+    std::vector<uint32_t> copy = *cur;
+    store.Put(wc, std::move(copy), tickTag);
+    retagged++;
+  }
+  if (retagged)
+    std::printf("save: re-asserted %zu tick tags the resident flush cleared\n",
+                retagged);
 
   if (!store.BindSave(path)) return false;
   size_t regions = 0;
@@ -165,18 +222,46 @@ bool SaveWorld(GpuContext& ctx, World& world, Stream& stream,
     // of "hash mismatch". ~50 names is a few hundred bytes.
     w.U32((uint32_t)mats.size());
     for (const MaterialDef& m : mats) w.Str(m.name);
+    // ---- SVM5's two appended words (M9.5-B) -----------------------------
+    //
+    // LAST IN THE RECORD, AFTER THE VARIABLE-LENGTH MATERIAL TABLE, and that
+    // position is the whole compatibility argument: an SVM4 reader stops here
+    // having read every field it knows, at the offset it expects. Anywhere
+    // earlier would shift the table and make SVM4 unreadable, for no gain.
+    //
+    // The TICK is the clock a reload has to resume above — the per-chunk tick
+    // tags in manifest.svt are measured against it, and a host that reloads
+    // below its own tags would have every eviction refused as "older" by a
+    // peer's arbitration. The SEED is what regenerates every chunk the store
+    // does NOT hold, which on any real world is most of them.
+    w.U32(stamp.tick);
+    w.U32(stamp.seed);
     bool ok = std::fwrite(meta.data(), 1, meta.size(), fp) == meta.size();
     std::fclose(fp);
     if (!ok) return false;
   }
-  std::printf("saved %s (%.2f MB across %zu regions)\n", path.c_str(),
-              bytes / 1e6, regions);
+  // The TAGGED-chunk count is printed beside the byte total because the two
+  // answer different questions and M9.5-B's smoke reads the second: "how much
+  // of this world is somebody's EDIT, carried across the save". A tag is only
+  // ever written by an authority's eviction or an accepted `ChunkPut`, so this
+  // is exactly the persisted multiplayer state.
+  size_t tagged = 0;
+  {
+    std::vector<std::pair<IVec3, uint32_t>> rows;
+    store.Manifest(rows);
+    for (const auto& [wc, t] : rows)
+      if (t != 0) tagged++;
+    std::printf("save: store manifest %zu chunks, %zu tick-tagged\n",
+                rows.size(), tagged);
+  }
+  std::printf("saved %s (%.2f MB across %zu regions, tick %u seed %u)\n",
+              path.c_str(), bytes / 1e6, regions, stamp.tick, stamp.seed);
   return true;
 }
 
 bool LoadWorld(GpuContext& ctx, World& world, Simulation& sim, Stream& stream,
                const std::string& path, const std::vector<MaterialDef>& mats,
-               const EntityIO* entities) {
+               const EntityIO* entities, WorldStamp* stampOut) {
   std::vector<uint8_t> meta;
   if (!ReadFileBytes(MetaPath(path), meta)) {
     std::fprintf(stderr, "load: %s has no meta.svm\n", path.c_str());
@@ -192,14 +277,18 @@ bool LoadWorld(GpuContext& ctx, World& world, Simulation& sim, Stream& stream,
   r.Pod(origin[0]);
   r.Pod(origin[1]);
   r.Pod(origin[2]);
-  if (!r.ok || magic != kMetaMagic) {
-    // Includes SVM3-and-earlier saves: refusing beats guessing at a header we
-    // cannot verify (the old format recorded neither voxel size nor materials,
-    // exactly the two silent-corruption axes this header exists to close).
+  // BOTH MAGICS ARE ACCEPTED (M9.5-B). SVM5 only APPENDED, so an SVM4 file is
+  // an SVM5 file that stops two words early and every field below is at the
+  // offset this reader expects. SVM3-and-earlier is still refused: refusing
+  // beats guessing at a header we cannot verify (the old format recorded
+  // neither voxel size nor materials, exactly the two silent-corruption axes
+  // this header exists to close).
+  const bool haveStamp = (magic == kMetaMagic);
+  if (!r.ok || (magic != kMetaMagic && magic != kMetaMagicV4)) {
     std::fprintf(stderr,
                  "load: %s is not a compatible world dir (bad or pre-SVM4 "
-                 "meta.svm magic %08x, want %08x)\n",
-                 path.c_str(), magic, kMetaMagic);
+                 "meta.svm magic %08x, want %08x or %08x)\n",
+                 path.c_str(), magic, kMetaMagic, kMetaMagicV4);
     return false;
   }
   if (worldN != kWorldN || chunk != kChunk) {
@@ -258,6 +347,30 @@ bool LoadWorld(GpuContext& ctx, World& world, Simulation& sim, Stream& stream,
     // way to grow the table, and old saves simply never reference the new ids.
   }
 
+  // ---- SVM5's appended pair, read AFTER the material table (M9.5-B) ------
+  //
+  // An SVM4 file has nothing here and `known` stays false — which is the
+  // distinction a caller needs, because "the file said tick 0" and "the file
+  // did not say" both read as 0 and only the first may be used to set a
+  // clock. A TRUNCATED SVM5 pair is treated the same way rather than failing
+  // the load: the grid is already valid and two missing diagnostics are not
+  // worth throwing a world away for.
+  WorldStamp stamp{};
+  if (haveStamp) {
+    uint32_t savedTick = 0, savedSeed = 0;
+    if (r.U32(savedTick) && r.U32(savedSeed)) {
+      stamp.tick = savedTick;
+      stamp.seed = savedSeed;
+      stamp.known = true;
+    } else {
+      std::fprintf(stderr,
+                   "load: %s meta.svm claims SVM5 but its tick/seed pair is "
+                   "truncated; treating them as unknown\n",
+                   path.c_str());
+    }
+  }
+  if (stampOut) *stampOut = stamp;
+
   ChunkStore& store = stream.Store();
   if (!store.BindLoad(path)) {
     std::fprintf(stderr, "load: store is bound to %s (one world dir per session)\n",
@@ -302,7 +415,23 @@ bool LoadWorld(GpuContext& ctx, World& world, Simulation& sim, Stream& stream,
                 n, stream.Edits().Cells(), stream.Edits().LevelChunks());
   }
 
-  std::printf("loaded %s (%zu chunks in RAM after window fill)\n", path.c_str(),
-              stream.Store().Count());
+  // The same tagged-chunk count SaveWorld prints, on the way back in. It is
+  // the one number the M9.5-B smoke's third launch reads: the tick tags live
+  // in `manifest.svt` beside the region files, so "the host saved N tagged
+  // chunks, a fresh process loaded N tagged chunks" is the end-to-end claim
+  // that the persistence actually persists.
+  {
+    std::vector<std::pair<IVec3, uint32_t>> rows;
+    stream.Store().Manifest(rows);
+    size_t tagged = 0;
+    for (const auto& [wc, t] : rows)
+      if (t != 0) tagged++;
+    std::printf("load: store manifest %zu chunks, %zu tick-tagged\n",
+                rows.size(), tagged);
+  }
+  std::printf("loaded %s (%zu chunks in RAM after window fill, meta tick %u "
+              "seed %u%s)\n",
+              path.c_str(), stream.Store().Count(), stamp.tick, stamp.seed,
+              stamp.known ? "" : " [SVM4: unknown]");
   return true;
 }

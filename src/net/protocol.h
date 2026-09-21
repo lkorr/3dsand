@@ -61,6 +61,32 @@ enum class MsgType : uint16_t {
   // `EntityState` is left reserved and unused — renumbering it out would
   // change what every later number means on a half-updated pair of builds.
   EntityBatch,
+  // ---- M9.5 package B, the persistence half (net/storesync.h) -----------
+  //
+  // Four more, APPENDED for the third time and the third time for the reason
+  // the M9.3 block above states: the enumerator VALUES are on the wire.
+  //
+  // `ChunkPut`, `ChunkGet` and `ChunkManifest` were RESERVED above when the
+  // enum was first written and they keep their numbers — that is what a
+  // reservation is for. What was NOT reserved is their four answers, because
+  // M9.2 did not yet know the protocol would need them:
+  //
+  //   ChunkPutAck   — "your bytes are in my store (or mine were newer)".
+  //                   Either way the sender may forget the put; an unacked
+  //                   put is the only thing a reconnect re-offers.
+  //   ManifestDelta — one (wc, tick) row, the incremental form of the full
+  //                   `ChunkManifest` a late join receives. A whole manifest
+  //                   per eviction would be §4 finding 7's "1,024 ChunkGets
+  //                   per plane shift" wearing a different hat.
+  //   ChunkData     — the answer to a `ChunkGet` that hit.
+  //   ChunkMiss     — ...and the answer that did not. It is NOT silence:
+  //                   a held slot waits for an answer INDEFINITELY
+  //                   (sim/stream.h, `DeliverMiss`), so "I do not have it"
+  //                   has to be a message or the slot shows air forever.
+  ChunkPutAck,
+  ManifestDelta,
+  ChunkData,
+  ChunkMiss,
 };
 
 // Bumped when any message's layout or meaning changes. It is the FIRST field

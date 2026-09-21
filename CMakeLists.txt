@@ -588,6 +588,12 @@ add_library(sandvox_core OBJECT
   # and only to ask whether a chunk is resident.
   src/net/opsync.cpp
   src/net/protocol.cpp
+  # storesync.cpp is the PERSISTENCE half (M9.5-B): the host store on the
+  # wire, the manifest, the late join and the disconnect. It reaches
+  # ChunkStore (it has to put and answer) and implements Stream's
+  # ChunkExchange, but opens no socket and touches no voxel -- main.cpp does
+  # the sending, the same split ChunkSync and EntitySync keep.
+  src/net/storesync.cpp
 )
 # src/audio is on the path so the VENDORED engine's own `#include "xyzpan/..."`
 # resolves unmodified — the sandvox-side audio code uses "audio/xyzpan/..."

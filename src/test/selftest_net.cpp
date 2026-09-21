@@ -38,6 +38,7 @@
 
 #include <cstdio>
 #include <cstring>
+#include <filesystem>
 #include <string>
 #include <vector>
 
@@ -45,7 +46,9 @@
 #include "net/link.h"
 #include "net/opsync.h"
 #include "net/protocol.h"
+#include "net/storesync.h"
 #include "sim/oprecord.h"
+#include "sim/worldio.h"
 #include "test/selftest.h"
 // ops-exchange submits real ticks, so it needs the harness's sim plumbing
 // (SubmitWorldgen / SubmitTick / ReadHashSync / FixtureY). The two CPU-only
@@ -1368,6 +1371,408 @@ Status GateOpsExchange(Ctx& c, std::string& detail) {
   return pinOk ? Status::Pass : Status::Fail;
 }
 
+// ---- store-sync (M9.5 package B) -----------------------------------------
+//
+// THE HOST STORE ON THE WIRE. Two `net::StoreSync` ends over `MakeLoopback()`
+// and two `ChunkStore`s, driven directly: no `Stream`, no `World`, no GPU and
+// no assets for the whole protocol half. That is deliberate and it is the
+// cheap-to-verify rule from CLAUDE.md — `Stream`'s side of the exchange is
+// already covered by `chunk-exchange`, so re-driving it here would pay a
+// worldgen per arm to re-assert somebody else's claim.
+//
+// The `Stream` is faked by a RECORDING STUB: `StoreSync` reaches it through
+// two std::functions (`SetDelivery`) precisely so this is possible, and the
+// stub records what was delivered so the bytes can be compared rather than
+// merely counted.
+//
+// SEVEN CLAIMS, each stated so it can fail:
+//
+//  (A) THE CLIENT'S EVICTION LANDS IN THE HOST'S STORE, with its tick tag,
+//      and the put leaves the unacked list.
+//  (B) NEWER WINS AND OLDER IS STILL ACKED. An older `ChunkPut` must not
+//      overwrite, and must not stay unacked either — an unacked stale put is
+//      re-offered on every reconnect forever.
+//  (C) A NON-AUTHORITY SAYS NOTHING. The client evicting a chunk the host
+//      still holds resident and is nearer to emits no message at all. This
+//      is the arm that would catch the eviction-authority rule being written
+//      as `ChunkAuthority(wc) == me`, which is false for EVERY eviction
+//      (net/storesync.cpp says why at length).
+//  (D) MANIFEST -> WANTED -> GET -> DATA -> DELIVER, end to end, with the
+//      delivered BYTES compared against the host's copy. A chunk in no
+//      manifest is not wanted, which is the other half of the claim: a
+//      `Wanted` that always says yes would hold every slot in the world.
+//  (E) A MISS IS A MESSAGE. The host pulling a chunk the client does not
+//      have gets `ChunkMiss` and its miss hook fires — silence would leave
+//      the slot inert forever.
+//  (F) AN UNACKED PUT SURVIVES A DROP AND IS RE-OFFERED. Plan step 3.
+//  (G) A DISCONNECT ANSWERS EVERY OUTSTANDING REQUEST with a local miss.
+//
+// ...and then two FILE claims, which do need the GPU because `SaveWorld` is
+// the only writer of `meta.svm` and faking it would test a second
+// implementation:
+//
+//  (H) meta.svm ROUND-TRIPS tick+seed under SVM5.
+//  (I) AN SVM4 FILE STILL LOADS, and reports the pair as UNKNOWN rather than
+//      as zero. The fixture makes a real SVM4 file by rewriting the magic of
+//      a real SVM5 one and dropping its two appended words, which is exactly
+//      what an old build's writer would have produced.
+Status GateStoreSync(Ctx& c, std::string& detail) {
+  Table t;
+
+  // ---- the fixture's geography -----------------------------------------
+  //
+  // The host stands at chunk 16 with its window at the origin (covering
+  // chunks 0..31 per axis); the client stands at chunk 60 with its window at
+  // 44 (covering 44..75). The two windows do not overlap AT ALL, which is
+  // the M9 case: kWorldN = 512 is a 51.2 m cube and two players walking
+  // independently leave each other's window in seconds.
+  const net::PeerView hostView = Peer(0, {16, 16, 16}, {0, 0, 0});
+  const net::PeerView clientView = Peer(1, {60, 16, 16}, {44, 1, 1});
+  // Deep inside the CLIENT's window and nowhere near the host's.
+  const IVec3 wcClient{60, 16, 16};
+  const IVec3 wcClient2{58, 16, 16};
+  const IVec3 wcClient3{62, 20, 16};
+  const IVec3 wcClient4{63, 12, 20};
+  // Deep inside the HOST's window.
+  const IVec3 wcHost{10, 16, 16};
+  // In NEITHER window: nobody can be the authority for it.
+  const IVec3 wcNowhere{200, 16, 16};
+
+  // Chunk payloads. Legal RLE (pairs of word + run length summing to
+  // kChunkVol), and DIFFERENT per chunk so a delivery that arrived with the
+  // wrong bytes fails rather than passing on a length check.
+  auto MakeRle = [](uint32_t word) {
+    return std::vector<uint32_t>{word, (uint32_t)kChunkVol};
+  };
+  const std::vector<uint32_t> rleA = MakeRle(0x0000'1001u);
+  const std::vector<uint32_t> rleB = MakeRle(0x0000'2002u);
+  const std::vector<uint32_t> rleC = MakeRle(0x0000'3003u);
+
+  ChunkStore hostStore, clientStore;
+  net::StoreSync hostSync, clientSync;
+
+  // THE FAKE STREAM. Two recorders, one per end.
+  struct Recorder {
+    std::vector<std::pair<IVec3, uint32_t>> delivered;
+    std::vector<std::vector<uint32_t>> bytes;
+    std::vector<IVec3> missed;
+  };
+  Recorder hostRec, clientRec;
+  auto Bind = [](net::StoreSync& s, Recorder& r) {
+    s.SetDelivery(
+        [&r](IVec3 wc, uint32_t tick, const std::vector<uint32_t>& rle) {
+          r.delivered.push_back({wc, tick});
+          r.bytes.push_back(rle);
+        },
+        [&r](IVec3 wc) { r.missed.push_back(wc); });
+  };
+  Bind(hostSync, hostRec);
+  Bind(clientSync, clientRec);
+
+  // The pair is re-seated by claim (F), so the pump reads it through a
+  // pointer rather than capturing one link.
+  net::LoopbackPair lp = net::MakeLoopback();
+  auto Pump = [&](int rounds) {
+    for (int i = 0; i < rounds; i++) {
+      lp.a->Poll();
+      lp.b->Poll();
+      net::Msg m;
+      while (lp.a->Recv(m))
+        hostSync.OnMessage((net::MsgType)m.type, m.payload.data(),
+                           m.payload.size());
+      while (lp.b->Recv(m))
+        clientSync.OnMessage((net::MsgType)m.type, m.payload.data(),
+                             m.payload.size());
+      hostSync.Pump();
+      clientSync.Pump();
+    }
+  };
+  auto Wire = [&]() {
+    hostSync.Connect(lp.a.get(), /*host=*/true, &hostStore, 0, 1);
+    clientSync.Connect(lp.b.get(), /*host=*/false, &clientStore, 1, 0);
+    hostSync.SetPeers(hostView, &clientView);
+    clientSync.SetPeers(clientView, &hostView);
+  };
+  Wire();
+
+  // ---- (A) the client's eviction lands in the host's store --------------
+  clientSync.OnEvicted(wcClient, 4242, rleA);
+  t.Eq("A: the put is outstanding until the ack comes back",
+       (long long)clientSync.UnackedCount(), 1ll);
+  Pump(8);
+  {
+    const std::vector<uint32_t>* got = hostStore.Get(wcClient);
+    t.True("A: the host's store has the client's chunk", got != nullptr);
+    t.True("A: ...with the client's bytes", got && *got == rleA);
+    t.Eq("A: ...and the client's tick tag",
+         (long long)hostStore.TickOf(wcClient), 4242ll);
+    t.Eq("A: the ack cleared the unacked list",
+         (long long)clientSync.UnackedCount(), 0ll);
+    t.Eq("A: the host counted one accepted put",
+         (long long)hostSync.Stats().putsRecv, 1ll);
+  }
+
+  // ---- (B) newer wins; older is refused AND acked -----------------------
+  clientSync.OnEvicted(wcClient, 100, rleB);
+  Pump(8);
+  {
+    const std::vector<uint32_t>* got = hostStore.Get(wcClient);
+    t.True("B: an older put does not overwrite", got && *got == rleA);
+    t.Eq("B: ...and the tag does not move",
+         (long long)hostStore.TickOf(wcClient), 4242ll);
+    t.Eq("B: the refusal is counted",
+         (long long)hostSync.Stats().putsRefusedOld, 1ll);
+    // The point of the claim: a refused put must still be RESOLVED, or the
+    // client re-offers stale bytes on every reconnect for the rest of the
+    // session.
+    t.Eq("B: a refused put is still acked away",
+         (long long)clientSync.UnackedCount(), 0ll);
+  }
+  clientSync.OnEvicted(wcClient, 5000, rleB);
+  Pump(8);
+  {
+    const std::vector<uint32_t>* got = hostStore.Get(wcClient);
+    t.True("B: a newer put does overwrite", got && *got == rleB);
+    t.Eq("B: ...and carries the newer tag",
+         (long long)hostStore.TickOf(wcClient), 5000ll);
+  }
+
+  // ---- (C) a non-authority says nothing ---------------------------------
+  //
+  // `wcHost` is inside the host's window with margin and the host is 6
+  // chunks from it against the client's 50, so the host's copy is the live
+  // one and the client's is a cache. Nothing may go out.
+  {
+    const uint64_t before = clientSync.Stats().putsSent;
+    clientSync.OnEvicted(wcHost, 9000, rleC);
+    Pump(8);
+    t.Eq("C: evicting a chunk the peer still owns sends nothing",
+         (long long)(clientSync.Stats().putsSent - before), 0ll);
+    t.True("C: ...and the host's store never sees it",
+           hostStore.Get(wcHost) == nullptr);
+  }
+  // ...and the mirror image, which is what proves (C) is a rule and not a
+  // link that stopped working: a chunk in NOBODY's window is still the
+  // evictor's to speak for, because nobody else has a copy at all.
+  {
+    const uint64_t before = clientSync.Stats().putsSent;
+    clientSync.OnEvicted(wcNowhere, 9100, rleC);
+    Pump(8);
+    t.Eq("C: evicting a chunk nobody else holds DOES send",
+         (long long)(clientSync.Stats().putsSent - before), 1ll);
+    t.Eq("C: ...and the host stores it", (long long)hostStore.TickOf(wcNowhere),
+         9100ll);
+  }
+
+  // ---- (D) manifest -> wanted -> get -> data -> deliver ------------------
+  //
+  // A chunk that is in the HOST's store and has never been near the client.
+  // It sits in the host's window, so it is the host's to own — which is the
+  // realistic case: the host edited it, evicted it, and now the client walks
+  // over that ground for the first time.
+  hostStore.Put(wcHost, rleC, 777);
+  {
+    const size_t rows = hostSync.SendFullManifest();
+    Pump(16);
+    t.True("D: the client received a complete manifest",
+           clientSync.ManifestReady());
+    t.True("D: ...covering every row the host sent",
+           clientSync.ManifestSize() == rows);
+    t.Eq("D: ...with the host's tick tag on the edited chunk",
+         (long long)clientSync.ManifestTickOf(wcHost), 777ll);
+  }
+  t.True("D: a manifest hit is WANTED", clientSync.Wanted(wcHost));
+  // The other half. Without it, a `Wanted` hard-wired to `true` would pass
+  // every line above and hold every slot in the world.
+  t.False("D: a chunk in no manifest is not wanted",
+          clientSync.Wanted(wcClient3));
+  {
+    const size_t before = clientRec.delivered.size();
+    clientSync.Request(wcHost);
+    Pump(16);
+    t.Eq("D: exactly one chunk was delivered",
+         (long long)(clientRec.delivered.size() - before), 1ll);
+    if (clientRec.delivered.size() > before) {
+      const auto& d = clientRec.delivered.back();
+      t.True("D: ...for the chunk that was asked for",
+             d.first.x == wcHost.x && d.first.y == wcHost.y &&
+                 d.first.z == wcHost.z);
+      t.Eq("D: ...carrying the host's tag", (long long)d.second, 777ll);
+      t.True("D: ...and the host's BYTES", clientRec.bytes.back() == rleC);
+    }
+  }
+
+  // ---- (E) a miss is a message ------------------------------------------
+  //
+  // The host wants a chunk deep in the client's window (so the client is its
+  // authority by `ChunkAuthority` — the refill form of the rule, where
+  // residency IS the question). The client has never stored it, so the honest
+  // answer is `ChunkMiss`, and the host's slot must be released rather than
+  // held forever.
+  t.True("E: the host wants a chunk the client is the authority for",
+         hostSync.Wanted(wcClient2));
+  {
+    const size_t before = hostRec.missed.size();
+    hostSync.Request(wcClient2);
+    Pump(16);
+    t.Eq("E: the miss came back as a message, not as silence",
+         (long long)(hostRec.missed.size() - before), 1ll);
+    t.Eq("E: ...and nothing was delivered for it",
+         (long long)hostSync.Stats().dataRecv, 0ll);
+  }
+
+  // ---- (G) a disconnect answers every outstanding request ---------------
+  //
+  // Run BEFORE (F) because (F) re-seats the link and this claim is about the
+  // link that is currently up. `Request` only queues, so not pumping leaves
+  // it outstanding; `Disconnect` must miss it, or the slot behind it reads as
+  // air for the rest of the process.
+  {
+    const size_t before = clientRec.missed.size();
+    clientSync.Request(wcClient4);
+    clientSync.Disconnect();
+    t.Eq("G: a disconnect misses the request it cannot answer",
+         (long long)(clientRec.missed.size() - before), 1ll);
+    t.True("G: ...and counts it", clientSync.Stats().abandoned >= 1);
+  }
+  hostSync.Disconnect();
+
+  // ---- (F) an unacked put survives a drop and is re-offered -------------
+  //
+  // The put goes out onto a link that is then thrown away before anything
+  // could ack it, which is a dropped peer. The bytes are gone; the
+  // OBLIGATION is not, and it lives in RAM across the gap (plan step 3).
+  Wire();  // reconnect on the same (now reset) pair — nothing was in flight
+  clientSync.OnEvicted(wcClient3, 6000, rleC);
+  t.Eq("F: the put is outstanding", (long long)clientSync.UnackedCount(), 1ll);
+  clientSync.Disconnect();
+  hostSync.Disconnect();
+  t.Eq("F: a disconnect does NOT forget an unacked put",
+       (long long)clientSync.UnackedCount(), 1ll);
+  {
+    // A genuinely new connection: a fresh pair, so not one byte of the old
+    // one can be responsible for what follows.
+    lp = net::MakeLoopback();
+    const uint64_t before = clientSync.Stats().reoffered;
+    Wire();
+    t.Eq("F: reconnecting re-offers it",
+         (long long)(clientSync.Stats().reoffered - before), 1ll);
+    Pump(8);
+    t.Eq("F: ...and the host finally stores it",
+         (long long)hostStore.TickOf(wcClient3), 6000ll);
+    t.Eq("F: ...and the obligation is discharged",
+         (long long)clientSync.UnackedCount(), 0ll);
+  }
+
+  // ---- (H) + (I) meta.svm ------------------------------------------------
+  //
+  // The only part of this gate that touches the GPU, and only because
+  // `SaveWorld` is the sole writer of the file. Everything above ran in
+  // microseconds on the CPU.
+  const char* kDir = "selftest_storesync.svd";
+  bool svm5Ok = false, svm4Ok = false;
+  {
+    GpuContext& ctx = c.ctx;
+    std::filesystem::remove_all(kDir);
+    const WorldStamp wrote{123456u, (uint32_t)kDefaultSeed, true};
+    const bool saved =
+        SaveWorld(ctx, c.world, c.stream, kDir, c.mats, nullptr, wrote);
+    t.True("H: the world saved", saved);
+    WorldStamp read{};
+    const bool loaded =
+        LoadWorld(ctx, c.world, c.sim, c.stream, kDir, c.mats, nullptr, &read);
+    t.True("H: ...and loaded", loaded);
+    t.True("H: the SVM5 pair is reported as KNOWN", read.known);
+    t.Eq("H: the tick round-trips", (long long)read.tick, 123456ll);
+    t.Eq("H: the seed round-trips", (long long)read.seed,
+         (long long)kDefaultSeed);
+    svm5Ok = saved && loaded && read.known && read.tick == 123456u;
+
+    // ---- make a real SVM4 file out of the real SVM5 one -----------------
+    //
+    // Rewrite the magic and drop the two appended words: byte for byte, that
+    // is what a pre-M9.5 build's writer produced. Patching the file rather
+    // than hand-rolling one is what keeps this a test of the READER and not
+    // of a second writer that could drift from the shipped one.
+    const std::string metaPath = std::string(kDir) + "/meta.svm";
+    std::vector<uint8_t> meta;
+    if (FILE* fp = std::fopen(metaPath.c_str(), "rb")) {
+      std::fseek(fp, 0, SEEK_END);
+      const long len = std::ftell(fp);
+      std::fseek(fp, 0, SEEK_SET);
+      meta.resize(len > 0 ? (size_t)len : 0);
+      if (!meta.empty())
+        (void)std::fread(meta.data(), 1, meta.size(), fp);
+      std::fclose(fp);
+    }
+    t.True("I: the saved meta.svm is long enough to demote", meta.size() > 8);
+    if (meta.size() > 8) {
+      const uint32_t v4 = 0x344D5653u;  // 'SVM4'
+      std::memcpy(meta.data(), &v4, 4);
+      meta.resize(meta.size() - 8);     // drop the appended tick + seed
+      if (FILE* fp = std::fopen(metaPath.c_str(), "wb")) {
+        (void)std::fwrite(meta.data(), 1, meta.size(), fp);
+        std::fclose(fp);
+      }
+    }
+    WorldStamp old{123u, 456u, true};  // pre-poisoned: the reader must clear it
+    const bool loadedV4 =
+        LoadWorld(ctx, c.world, c.sim, c.stream, kDir, c.mats, nullptr, &old);
+    t.True("I: an SVM4 world still loads", loadedV4);
+    t.False("I: ...and reports its tick/seed as UNKNOWN, not as zero",
+            old.known);
+    t.Eq("I: ...with the out-param cleared rather than left stale",
+         (long long)old.tick, 0ll);
+    svm4Ok = loadedV4 && !old.known;
+
+    // Detach before deleting, exactly as `save-load` does: the store stays
+    // bound to a directory for its lifetime otherwise, and the next gate
+    // that saves would be refused ("one world dir per session").
+    c.stream.Store().Unbind();
+    std::filesystem::remove_all(kDir);
+    // ...and put the world back where the suite expects it. `LoadWorld` left
+    // the grid restored from a file; the gates after this one assume the
+    // ordinary worldgen at the origin (the same courtesy `chunk-exchange`
+    // pays, for the same reason).
+    SubmitWorldgen(ctx, c.world, c.sim, kDefaultSeed);
+    ctx.WaitIdle();
+  }
+
+  if (t.bad) {
+    char b[448];
+    std::snprintf(b, sizeof b, "%d/%d rows FAILED; first: %s", t.bad, t.rows,
+                  t.why.c_str());
+    detail = b;
+    std::printf("store-sync: FAIL (%s)\n", b);
+    return Status::Fail;
+  }
+
+  RecordObserved("net.storeSyncRows", (double)t.rows);
+  const double pin = BaselineNumber("net.storeSyncRows", (double)t.rows);
+  const bool pinOk = (double)t.rows == pin;
+  if (!pinOk) MarkPinnedOnly();
+
+  const net::StoreSync::Counters& hs = hostSync.Stats();
+  const net::StoreSync::Counters& cs = clientSync.Stats();
+  char b[640];
+  std::snprintf(b, sizeof b,
+                "%d/%.0f rows: puts sent %llu / recv %llu (1 refused as "
+                "older, 1 re-offered after a drop); manifest %llu rows "
+                "mirrored; gets %llu -> data %llu + misses %llu; meta.svm "
+                "SVM5 %s, SVM4 %s",
+                t.rows, pin, (unsigned long long)cs.putsSent,
+                (unsigned long long)hs.putsRecv,
+                (unsigned long long)clientSync.ManifestSize(),
+                (unsigned long long)(cs.getsSent + hs.getsSent),
+                (unsigned long long)(cs.dataRecv + hs.dataRecv),
+                (unsigned long long)(cs.missesRecv + hs.missesRecv),
+                svm5Ok ? "round-tripped" : "FAILED",
+                svm4Ok ? "still loads (unknown pair)" : "FAILED");
+  detail = b;
+  std::printf("store-sync: %s\n", b);
+  return pinOk ? Status::Pass : Status::Fail;
+}
+
 }  // namespace
 
 const std::vector<Gate>& NetGates() {
@@ -1380,6 +1785,12 @@ const std::vector<Gate>& NetGates() {
       // times and runs 200 ticks per arm, which is why it is last in the
       // file and last in the group. No deps -- it builds its own world.
       {"ops-exchange", "net", {}, false, GateOpsExchange},
+      // M9.5-B. Almost entirely CPU — two StoreSync ends over MakeLoopback,
+      // no Stream and no world — except for the two meta.svm claims at the
+      // end, which need SaveWorld because it is the only writer of the file.
+      // It regenerates at the origin on the way out, so the gate after it
+      // starts where it always did.
+      {"store-sync", "net", {}, false, GateStoreSync},
   };
   return g;
 }

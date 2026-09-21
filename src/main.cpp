@@ -66,6 +66,7 @@
 #include "net/entitysync.h"
 #include "net/opsync.h"
 #include "net/protocol.h"
+#include "net/storesync.h"
 #include "phys/debris.h"
 #include "phys/physics.h"
 #include "sim/farfield.h"
@@ -4264,6 +4265,34 @@ int main(int argc, char** argv) {
   bool netHost = false;
   std::string netJoinIp;
   uint16_t netPort = 7777;
+  // ---- M9.5-B: THE WORLD DIRECTORY IS NO LONGER A LITERAL ---------------
+  //
+  // Saving was UI-only and hardcoded to "world.svd" (F9/F10 and the dev
+  // panel). The M9.5-B smoke needs a THIRD process to load what the host
+  // saved, and a harness that has to press F10 is not a harness — so the
+  // directory is a variable and `--load-world <dir>` is the UI load path's
+  // twin: it sets `ui.loadWorld` before the first frame and the existing
+  // handler does every other line of the work. Deliberately NOT a second
+  // load implementation; the one at the F10 site is the only one.
+  std::string worldDir = "world.svd";
+  bool loadWorldAtBoot = false;
+  // ---- M9.5-B: --net-smoke-persist --------------------------------------
+  //
+  // The host half of the two-process smoke's acceptance. Set, the host saves
+  // the world to `build/smoke_world.svd` at the moment its peer disconnects
+  // (which under SANDVOX_NET_SMOKE_EXIT_ON_PEER_DONE is also the moment it
+  // decides to exit) and prints the store's chunk count and how many of them
+  // carry a non-zero tick tag. Those two numbers are the claim: a tag is only
+  // written by an authority's eviction or an accepted `ChunkPut`, so "N
+  // tagged" is exactly the shared world state that survived, and the third
+  // launch's `--load-world` must report the same N.
+  //
+  // A FLAG AND NOT AN ENV VAR, unlike the other five smoke switches, because
+  // it takes an ACTION (a save, to a path) rather than modifying behaviour
+  // the game already has — and because a stray save over somebody's world
+  // directory is the kind of thing that should be visible in the command
+  // line that caused it.
+  bool netSmokePersist = false;
   uint32_t replayTicks = 0;  // --ticks N: stop the replay after N frames
   selftest::Options stOpt;
   for (int i = 1; i < argc; i++) {
@@ -4343,6 +4372,8 @@ int main(int argc, char** argv) {
           "  --barriers=precise    Precise barriers (default)\n\n"
           "Multiplayer (M9.2 — two players, one world):\n"
           "  --host [port]         Listen for one peer (default 7777); play meanwhile\n"
+          "  --load-world <dir>    Load a saved world directory at boot (F10's twin)\n"
+          "  --net-smoke-persist   Host: save to build/smoke_world.svd when the peer quits\n"
           "  --join <ip[:port]>    Connect to a host and share its tick clock\n\n"
           "Misc:\n"
           "  --adapter low         Select low-power (iGPU) adapter\n"
@@ -4416,6 +4447,19 @@ int main(int argc, char** argv) {
         addr.resize(colon);
       }
       netJoinIp = addr;
+    }
+    // M9.5-B. `--load-world <dir>` is the F10 path with the directory named
+    // on the command line; `--net-smoke-persist` is the host's save-on-
+    // disconnect (see their declarations above).
+    else if (a == "--load-world") {
+      if (i + 1 >= argc) {
+        std::fprintf(stderr, "--load-world requires a directory\n");
+        return 1;
+      }
+      worldDir = argv[++i];
+      loadWorldAtBoot = true;
+    } else if (a == "--net-smoke-persist") {
+      netSmokePersist = true;
     }
     // `--shot-inventory` is the character screen's look-iteration harness: run
     // the windowed game, spawn and damage the avatar on a fixed schedule, open
@@ -6846,6 +6890,27 @@ int main(int argc, char** argv) {
   // systems' RefreshOwnership returns on its first line and the tick is
   // byte-for-byte the one the `--record-ops` oracle recorded.
   net::EntitySync entities;
+  // ---- THE PERSISTENCE HALF (M9.5-B, net/storesync.h) -------------------
+  //
+  // NOT borrowed by TickAuthorityCtx either, but for a different reason than
+  // EntitySync's: it is not called by the frame layer at all. It is a
+  // `Stream::ChunkExchange`, so `Stream` itself calls it — from inside the
+  // tick, at the eviction sites and at the refill miss — and it is reached by
+  // main only to bind it, to feed it the two peer views, to hand it messages
+  // and to pump it.
+  //
+  // THE HASH ARGUMENT IS THE BINDING AND NOTHING ELSE. `Stream`'s exchange
+  // pointer is null in every single-player run, every gate and both smokes,
+  // and with it null `Stream` makes exactly the calls it made before M9.5-A
+  // (sim/stream.h says so). The `netStoreBind` lambda below is the ONLY place
+  // it is ever set, and it is inside `netStartPacing`.
+  net::StoreSync storesync;
+  // Store telemetry for the exit report, harvested the same way the op, sync
+  // and entity totals are — `Disconnect()` keeps its counters (they are
+  // diagnostics), so `netDrop` does NOT fold them in and the exit report
+  // reads them live. Stated here because the three neighbours above do the
+  // opposite and the asymmetry would otherwise look like an oversight.
+  //
   // Entity telemetry for the exit report, accumulated HERE and not read off
   // the object at exit — `Disconnect()` clears its counters, so a host that
   // outlives its peer would report zeroes for work it really did. Same
@@ -6944,6 +7009,23 @@ int main(int argc, char** argv) {
   };
   std::map<uint32_t, NetPending> netQueue;
 
+  // ---- MESSAGES THE BOOT JOIN SAW BUT IS NOT ALLOWED TO EAT (M9.5-B) ----
+  //
+  // The client's late join drains the socket before the frame loop exists,
+  // waiting for the full `ChunkManifest`. TCP preserves order and the host
+  // sends that manifest before its pre-send batches, so in practice nothing
+  // else is in front of it — but "in practice" is not a guarantee, and the
+  // consequence of getting it wrong is silent: a dropped pre-send `TickBatch`
+  // is a hole in the pacer's contiguity that shows up as a stall and a
+  // non-zero `late=` in the exit report, which is the number that is supposed
+  // to mean "the label arithmetic is wrong".
+  //
+  // So anything the join loop pulls out that is not a store message is PARKED
+  // here and `netPump` drains it first, in arrival order, through the same
+  // switch it would have gone through. `Link::Recv` has no peek and no
+  // put-back; this deque is that put-back.
+  std::deque<net::Msg> netEarly;
+
   // ---- THE PEER'S LATEST APPLIED STATE, AS THE AUTHORITY SEES IT (M9.4-D)
   //
   // `net::PeerView` needs two facts about the peer that only its
@@ -7026,6 +7108,14 @@ int main(int argc, char** argv) {
     }
     if (!netHavePeerLast) {
       entities.SetPeers(mine, nullptr);
+      // M9.5-B: the SAME pair, to the same arithmetic. StoreSync asks
+      // `net::ChunkAuthority` "may I put this chunk" and "does the peer own
+      // it", and if it were fed a different (fresher, or staler) view than
+      // EntitySync then the two machines could disagree about who speaks for
+      // a chunk — the exact failure the netMyRing comment above documents
+      // measuring, transplanted from mobs to persistence. One call site, one
+      // pair, both consumers.
+      storesync.SetPeers(mine, nullptr);
       return;
     }
     net::PeerView theirs{};
@@ -7038,6 +7128,7 @@ int main(int argc, char** argv) {
                            netPeerLast.windowOrigin[2]};
     theirs.connected = true;
     entities.SetPeers(mine, &theirs);
+    storesync.SetPeers(mine, &theirs);  // M9.5-B; see the null branch above
   };
 
   // Counters for the HUD and for the `--frames` exit report.
@@ -7229,6 +7320,43 @@ int main(int argc, char** argv) {
       // the release hook when the body goes, so this is one call, not two.
       return debris.DestroyBody(h);
     });
+    // ---- M9.5-B: AND THE PERSISTENCE HALF ------------------------------
+    //
+    // `Connect` seats the link, the role and MY store, and re-offers every
+    // put the previous connection never got an ack for (net/storesync.h: the
+    // unacked list deliberately survives a disconnect). The delivery pair is
+    // `Stream`'s own two doors.
+    //
+    // WHERE `deliver_` FIRES, and why that is a legal place to install a
+    // chunk: it is called from inside `netPump`'s dispatch, which runs ONCE
+    // per frame BEFORE the tick loop. `Stream::ReplaceChunk`'s contract asks
+    // for "the phase-B position, before stream.Update and therefore before
+    // the tick's submit", and the top of the frame is strictly earlier than
+    // that — its deferred WriteBuffers are ordered before the next submit,
+    // which is the same guarantee FillSlots relies on.
+    storesync.Connect(link.get(), netRoleBoot == NetRole::Host,
+                      &stream.Store(), netMyId, netPeerId);
+    storesync.SetDelivery(
+        [&stream](IVec3 wc, uint32_t t, const std::vector<uint32_t>& rle) {
+          stream.DeliverRemote(wc, t, rle);
+        },
+        [&stream](IVec3 wc) { stream.DeliverMiss(wc); });
+    if (netRoleBoot == NetRole::Host) {
+      // THE HOST BINDS IMMEDIATELY: it needs no manifest (its own store IS
+      // the manifest) and its `Wanted` is arithmetic, not a table.
+      stream.SetChunkExchange(&storesync);
+      // ...and sends the whole thing, in <= 64 KiB slices, BEFORE the first
+      // TickBatch goes out below. Plan step 3: the client must know what the
+      // host holds before its own window is re-pulled, or it will regenerate
+      // pristine terrain over the other player's edits.
+      const size_t rows = storesync.SendFullManifest();
+      std::printf("net: sent chunk manifest: %zu rows\n", rows);
+      std::fflush(stdout);
+    }
+    // The CLIENT binds later, in the join block, once the manifest has
+    // actually arrived — see "THE LATE JOIN" there. Binding here would let a
+    // `Wanted` be answered from an empty mirror, which is the one wrong
+    // answer (it regenerates over an edit and cannot be undone).
     netSilence = 0.0;
     netSilenceLastPoll = 0.0;
     netPacedAt = net::NowSeconds();
@@ -7348,6 +7476,53 @@ int main(int argc, char** argv) {
                           chunksync.series.end());
     chunksync.Disconnect();
     chunksync.series.clear();
+    // ---- M9.5-B: THE STORE EXCHANGE GOES WITH THE PEER -----------------
+    //
+    // TWO STEPS, AND THE ORDER MATTERS. `Disconnect()` first, because it is
+    // what answers every outstanding `ChunkGet` with a local MISS — a held
+    // slot waits INDEFINITELY (sim/stream.h) and a disconnect is not an
+    // answer, so without this the chunks that were in flight when the peer
+    // vanished would read as air for the rest of the process and nothing
+    // would ever re-ask. Those misses go through `stream.DeliverMiss`, which
+    // needs the exchange to still be the bound one for its bookkeeping to
+    // line up, hence unbinding SECOND.
+    //
+    // Unlike the three counter blocks above, nothing is harvested here:
+    // `StoreSync::Disconnect` deliberately keeps its counters AND its unacked
+    // put list AND its manifest mirror, because a rejoin in the same process
+    // re-offers the first and re-receives the second.
+    storesync.Disconnect();
+    stream.SetChunkExchange(nullptr);
+    // ---- M9.5-B: --net-smoke-persist -----------------------------------
+    //
+    // THE SAVE HAPPENS HERE AND NOT AT EXIT, and that is the whole point of
+    // hanging it on the disconnect: under SANDVOX_NET_SMOKE_EXIT_ON_PEER_DONE
+    // this function also closes the window, so "the world as it was when the
+    // two players were done with it" and "the world at exit" are the same
+    // moment — but only this one is reachable before the frame loop starts
+    // tearing things down. `SaveWorld` flushes the resident window into the
+    // store and then flushes the store, so the client's `ChunkPut`s are
+    // already in it: they were put there by `StoreSync::OnMessage`, not by
+    // anything the save has to know about.
+    if (netSmokePersist) {
+      ctx.WaitIdle();
+      const PlayerKitRefs kitRefs = PlayerKitOf(session, glyphs, items);
+      WorldItemRefs groundRefs{&ground, &phys, &debris, &mbSet, &items};
+      EntityIO eio = MakeEntityIO(debris, mobs, &avatar, &kitRefs, &groundRefs);
+      WorldStamp stamp{tick, (uint32_t)kDefaultSeed, true};
+      if (SaveWorld(ctx, world, stream, "build/smoke_world.svd", mats, &eio,
+                    stamp)) {
+        std::vector<std::pair<IVec3, uint32_t>> rows;
+        stream.Store().Manifest(rows);
+        size_t tagged = 0;
+        for (const auto& [wc, tg] : rows)
+          if (tg != 0) tagged++;
+        std::printf("net-smoke-persist: saved build/smoke_world.svd at tick %u "
+                    "-- store %zu chunks, %zu tick-tagged\n",
+                    tick, rows.size(), tagged);
+        std::fflush(stdout);
+      }
+    }
     netSilence = 0.0;
     netSilenceLastPoll = 0.0;
     pacer = net::LockstepPacer{};
@@ -7389,7 +7564,17 @@ int main(int argc, char** argv) {
     if (!link) return;
     link->Poll();
     net::Msg m;
-    while (link->Recv(m)) {
+    // THE PARKED ONES FIRST, IN ARRIVAL ORDER (M9.5-B; see `netEarly`). The
+    // loop below pops from the deque until it is empty and only then starts
+    // reading the socket, so a pre-send batch the join loop had to pull out
+    // of the way is applied before anything that arrived after it.
+    for (;;) {
+      if (!netEarly.empty()) {
+        m = std::move(netEarly.front());
+        netEarly.pop_front();
+      } else if (!link->Recv(m)) {
+        break;
+      }
       switch ((net::MsgType)m.type) {
         // ---- HOST SIDE OF THE HANDSHAKE ---------------------------------
         case net::MsgType::Hello: {
@@ -7515,11 +7700,6 @@ int main(int argc, char** argv) {
         // They ride the SAME link as the tick batches and are sent AFTER them
         // within a frame, so a repair can never delay the batch the peer's
         // pacer is waiting on.
-        case net::MsgType::HashBlocks:
-        case net::MsgType::HashDrill:
-        case net::MsgType::HashChunks:
-        case net::MsgType::ChunkRequest:
-        case net::MsgType::ChunkBusy:
         // ---- M9.4-D: THE ENTITY ENVELOPE --------------------------------
         //
         // QUEUED BY LABEL, applied by the tick loop when that label runs —
@@ -7540,6 +7720,26 @@ int main(int argc, char** argv) {
           entities.NoteRemote(std::move(eb));
           break;
         }
+        // ---- FIXED HERE (found by M9.5-B's two-process smoke) -----------
+        //
+        // THESE FIVE USED TO FALL THROUGH INTO `EntityBatch`. The M9.3-C
+        // block listed them immediately above `case EntityBatch:` with no
+        // body of their own, intending to reach `ChunkSync` below — and
+        // M9.4-D then inserted the entity case BETWEEN them and their target.
+        // Every `HashBlocks`, `HashDrill`, `HashChunks`, `ChunkRequest` and
+        // `ChunkBusy` was therefore handed to `net::EntityBatch::Decode`,
+        // which correctly refused it and charged it to `netLate`.
+        //
+        // MEASURED, the first M9.5-B smoke: both processes reported
+        // `hashBlocks sent=38 recv=0` and `late=38`, and the mismatch series
+        // printed "(none - no publish was ever compared)". The whole M9.3-C
+        // convergence protocol was dead on the wire and the only symptom was
+        // a counter that reads as a pacing bug. One `break` is the fix.
+        case net::MsgType::HashBlocks:
+        case net::MsgType::HashDrill:
+        case net::MsgType::HashChunks:
+        case net::MsgType::ChunkRequest:
+        case net::MsgType::ChunkBusy:
         case net::MsgType::ChunkSync: {
           if (!netPaced) break;
           std::vector<net::ChunkSync::Out> reply;
@@ -7548,6 +7748,32 @@ int main(int argc, char** argv) {
           netSendSync(reply);
           break;
         }
+        // ---- M9.5-B: THE PERSISTENCE MESSAGES ---------------------------
+        //
+        // Seven types, all handed straight to the state machine, which is
+        // where every rule about them lives — the same split as ChunkSync
+        // above, and for the same reason: this file's job is the socket, and
+        // a switch that started to know what a manifest row MEANS would
+        // make the pure half stop being gate-drivable.
+        //
+        // NOT GUARDED ON `netPaced`, unlike every case above it, and that is
+        // deliberate: the host's full `ChunkManifest` is sent inside
+        // `netStartPacing` and therefore lands on the client while its own
+        // `netPaced` is being set in the same call. It is also the one thing
+        // that must arrive BEFORE the first tick runs (the late join binds
+        // the exchange on it), so dropping it for being "too early" would
+        // deadlock the join. `StoreSync` refuses on `!link_` instead, which
+        // is the condition that actually matters.
+        case net::MsgType::ChunkPut:
+        case net::MsgType::ChunkPutAck:
+        case net::MsgType::ChunkManifest:
+        case net::MsgType::ManifestDelta:
+        case net::MsgType::ChunkGet:
+        case net::MsgType::ChunkData:
+        case net::MsgType::ChunkMiss:
+          storesync.OnMessage((net::MsgType)m.type, m.payload.data(),
+                              m.payload.size());
+          break;
         default:
           break;
       }
@@ -7563,6 +7789,16 @@ int main(int argc, char** argv) {
       std::vector<net::ChunkSync::Out> outMsgs;
       chunksync.Pump(world, tick, outMsgs);
       netSendSync(outMsgs);
+      // ---- M9.5-B: ISSUE THE QUEUED CHUNK GETS ------------------------
+      //
+      // `Request` only QUEUES: it is called from inside `Stream::Update`,
+      // once per wanted slot, and a window shift refills a 1,024-chunk plane
+      // in a single call — so the send site has to be somewhere the
+      // in-flight cap can bound it. That is here, once a frame, after the
+      // inbox so an answer that arrived this frame has already freed its
+      // slot in the cap. It also re-asserts the host's tick tags, which
+      // `Stream`'s own untagged Put erases (net/storesync.h `Pump`).
+      storesync.Pump();
     }
     // ---- DISCONNECT (§4 finding 5: 3 s silence -> local authority) -------
     // Two doors: the socket itself failed (`Error()` is the latch `DropPeer`
@@ -7712,6 +7948,67 @@ int main(int argc, char** argv) {
     std::printf("net: joined %s:%u as player %u, start tick %u\n",
                 netJoinIp.c_str(), (unsigned)netPort, netMyId, tick + 1);
     std::fflush(stdout);
+
+    // ---- THE LATE JOIN (M9.5-B, plan step 3) -----------------------------
+    //
+    // This machine already has a world: worldgen ran at boot, before the
+    // socket existed, and every chunk in the window is PRISTINE procgen. The
+    // host's may not be — anything a previous session edited and evicted is
+    // in the host's store and in nothing else. So the join is not finished
+    // until this window has been re-pulled with the exchange bound.
+    //
+    // THE ORDER IS THE WHOLE CORRECTNESS ARGUMENT, and it is three steps:
+    //
+    //   1. WAIT FOR THE MANIFEST. `Wanted` must answer from a table already
+    //      in hand (sim/stream.h forbids a blocking answer), so the table
+    //      has to be complete before anything can ask. It is at most a few
+    //      64 KiB slices and the host sent them before its first TickBatch.
+    //   2. BIND, THEN RELOAD. Binding after the reload would re-pull the
+    //      whole window from procgen and then leave the peer's edits to
+    //      trickle in over the next few window shifts, which is both slower
+    //      and visibly wrong (an edit appearing minutes later).
+    //   3. BEFORE THE FIRST TICK. Everything here runs before the frame loop
+    //      is entered, so the first tick this machine simulates already sees
+    //      the held slots — no tick ever runs over a chunk that is about to
+    //      be replaced under it.
+    //
+    // THE WAIT IS BOUNDED AND A TIMEOUT IS NOT FATAL. A host that never
+    // sends a manifest is a host running an older build; the honest
+    // degradation is "play with procgen terrain", not "refuse to join". The
+    // exchange is bound either way, so a later ManifestDelta still lands.
+    {
+      const double tMan0 = NowSeconds();
+      while (!storesync.ManifestReady() && NowSeconds() - tMan0 < 10.0) {
+        link->Poll();
+        net::Msg mm;
+        while (link->Recv(mm)) {
+          // Only the manifest is interesting here. Anything else that beat
+          // it — the D+1 pre-sent TickBatches, an EntityBatch — is PARKED
+          // for netPump rather than consumed: dropping a pre-send would
+          // punch a hole in the pacer's contiguity and report itself as
+          // `late=`, which is the one number that is supposed to mean the
+          // label arithmetic is broken (see `netEarly`).
+          if (!storesync.OnMessage((net::MsgType)mm.type, mm.payload.data(),
+                                   mm.payload.size()))
+            netEarly.push_back(std::move(mm));
+        }
+        std::this_thread::sleep_for(std::chrono::milliseconds(2));
+      }
+      if (!storesync.ManifestReady())
+        std::printf("net: no chunk manifest after 10 s -- joining with "
+                    "procgen terrain (the host may be an older build)\n");
+      else
+        std::printf("net: chunk manifest received: %zu rows\n",
+                    storesync.ManifestSize());
+      stream.SetChunkExchange(&storesync);
+      // THE WHOLE-WINDOW RE-PULL. `ReloadWindow` is exactly what LoadWorld
+      // uses (sim/stream.h): every slot refilled from the store, misses to
+      // procgen — except that now a miss consults `Wanted` first, so a chunk
+      // the host holds is HELD INERT and arrives over the wire instead of
+      // being generated and then overwritten in front of the player.
+      stream.ReloadWindow(world.WindowOrigin());
+      std::fflush(stdout);
+    }
   }
   // THE GHOST LIST REACHES THE TICK ONLY WHEN THERE IS A NETWORK. Null
   // otherwise, which is what keeps phases B / H / I / O making exactly the
@@ -7748,6 +8045,22 @@ int main(int argc, char** argv) {
                        PackVoxNew(kMatStone, variant)});
       netDriftOps++;
     };
+  }
+
+  // ---- M9.5-B: --load-world IS THE F10 PATH, PRESSED FOR YOU ------------
+  //
+  // Not a second load implementation and deliberately so: the handler in the
+  // frame loop resets the transient state the grid restore invalidates
+  // (grenades, the MPM fluid count, the render interpolation), and a boot
+  // path that called `LoadWorld` directly would be a second list of those to
+  // keep in step. Setting the flag costs one frame of a pristine world nobody
+  // is looking at and inherits every line of the real path, including the
+  // SVM5 clock resume.
+  if (loadWorldAtBoot) {
+    std::printf("--load-world %s: loading on the first frame\n",
+                worldDir.c_str());
+    std::fflush(stdout);
+    ui.loadWorld = true;
   }
 
   uint64_t frameCounter = 0;
@@ -9276,7 +9589,13 @@ int main(int argc, char** argv) {
       const PlayerKitRefs kitRefs = PlayerKitOf(session, glyphs, items);
       WorldItemRefs groundRefs{&ground, &phys, &debris, &mbSet, &items};
       EntityIO eio = MakeEntityIO(debris, mobs, &avatar, &kitRefs, &groundRefs);
-      SaveWorld(ctx, world, stream, "world.svd", mats, &eio);
+      // M9.5-B: the directory is `--load-world`'s, and the save now carries
+      // the SIM TICK and the SEED (meta.svm's SVM5 pair). The tick is what a
+      // reload has to resume above so that the per-chunk tick tags this
+      // world's evictions wrote stay meaningful; the seed is what
+      // regenerates every chunk the store does not hold.
+      SaveWorld(ctx, world, stream, worldDir, mats, &eio,
+                WorldStamp{tick, (uint32_t)kDefaultSeed, true});
     }
     if (ui.loadWorld) {
       ui.loadWorld = false;
@@ -9284,7 +9603,30 @@ int main(int argc, char** argv) {
       const PlayerKitRefs kitRefs = PlayerKitOf(session, glyphs, items);
       WorldItemRefs groundRefs{&ground, &phys, &debris, &mbSet, &items};
       EntityIO eio = MakeEntityIO(debris, mobs, &avatar, &kitRefs, &groundRefs);
-      if (LoadWorld(ctx, world, sim, stream, "world.svd", mats, &eio)) {
+      WorldStamp loaded{};
+      if (LoadWorld(ctx, world, sim, stream, worldDir, mats, &eio, &loaded)) {
+        // ---- RESUME THE CLOCK ABOVE THE SAVE (M9.5-B) -----------------
+        //
+        // The per-chunk tick tags in `manifest.svt` were written against the
+        // tick this world was saved at. A process that loads it and keeps
+        // counting from ITS own tick — which after a fresh boot is a few
+        // hundred — would evict chunks tagged BELOW the tags already in the
+        // store, and a peer's "newer wins" arbitration would then refuse the
+        // live edits in favour of the saved ones. Resuming above the save is
+        // what keeps the tag a monotonic statement about freshness.
+        //
+        // ONLY WHEN THE FILE SAID SO. An SVM4 save reports `known == false`
+        // and the clock is left alone: "the file did not say" is not "the
+        // file said 0", and jumping to 0 would be strictly worse than
+        // staying where we are. Also only FORWARD — `tick` is the sim clock
+        // and moving it backwards would make the CA's stamp nibble
+        // (world.h's bits 16-18) cycle through values it has already used
+        // this session.
+        if (loaded.known && loaded.tick > tick) {
+          std::printf("load: resuming the sim clock at tick %u (was %u)\n",
+                      loaded.tick, tick);
+          tick = loaded.tick;
+        }
         // Debris/mobs were reset and reloaded by their sections; the avatar
         // was despawned by its reset and respawns on the next tick, applying
         // the saved damage state (avatar.h persistence note). Only main's own
@@ -12726,6 +13068,70 @@ int main(int argc, char** argv) {
           (unsigned long long)(netEnt.batchesOut + s.batchesOut),
           (unsigned long long)(netEnt.batchesIn + s.batchesIn));
     }
+    // ---- M9.5-B: THE STORE LINE -----------------------------------------
+    //
+    // A FOURTH line, answering the fourth question: "did an edit made by one
+    // machine survive the other machine walking away from it?"
+    //
+    // READ LIVE OFF THE OBJECT, unlike the three lines above, and that is not
+    // an inconsistency: `StoreSync::Disconnect` deliberately KEEPS its
+    // counters (as well as its unacked list and its manifest mirror, because
+    // a rejoin re-offers the first and re-receives the second), so there is
+    // nothing to harvest before it and a carry-over would double every
+    // number.
+    //
+    // THE ACCEPTANCE IS ASYMMETRIC, like the entity line's and for the same
+    // reason. The machine that flies and paints reports `puts sent > 0` (it
+    // is the authority for the chunks under its own feet and it is the one
+    // that evicts them); the host reports the matching `puts recv`, because
+    // its store is the truth. A run where both report the same numbers has
+    // not tested ownership.
+    //
+    // `misses` is the diagnostic that separates the two ways `gets sent > 0,
+    // data recv == 0` can happen: a miss is an honest "I do not have it"
+    // that regenerates the slot, while silence is a held slot that will read
+    // as air forever. A bare "0 chunks delivered" cannot tell those apart.
+    // `unacked` must be 0 at a clean exit: a put still in the list is an
+    // edit the host was never told about.
+    {
+      const net::StoreSync::Counters& sc = storesync.Stats();
+      std::printf("net: store: puts sent=%llu (distinct=%llu) recv=%llu acked=%llu "
+                  "refusedOld=%llu local=%llu | manifest entries=%llu "
+                  "sent=%llu recv=%llu | gets sent=%llu recv=%llu | data "
+                  "sent=%llu recv=%llu | misses sent=%llu recv=%llu | "
+                  "wanted=%llu unacked=%llu reoffered=%llu abandoned=%llu\n",
+                  (unsigned long long)sc.putsSent,
+                  (unsigned long long)sc.putsDistinct,
+                  (unsigned long long)sc.putsRecv,
+                  (unsigned long long)sc.putsAcked,
+                  (unsigned long long)sc.putsRefusedOld,
+                  (unsigned long long)sc.putsLocal,
+                  (unsigned long long)storesync.ManifestSize(),
+                  (unsigned long long)sc.manifestSent,
+                  (unsigned long long)sc.manifestRecv,
+                  (unsigned long long)sc.getsSent,
+                  (unsigned long long)sc.getsRecv,
+                  (unsigned long long)sc.dataSent,
+                  (unsigned long long)sc.dataRecv,
+                  (unsigned long long)sc.missesSent,
+                  (unsigned long long)sc.missesRecv,
+                  (unsigned long long)sc.wanted,
+                  (unsigned long long)storesync.UnackedCount(),
+                  (unsigned long long)sc.reoffered,
+                  (unsigned long long)sc.abandoned);
+      // ...and the Stream side of the same story, which is the half this
+      // object cannot see: how many refills took the inert hold, how many
+      // were filled by a delivery, and how many holds the window threw away
+      // before an answer came (M9.5-A's ExchangeStats).
+      const Stream::ExchangeStats& es = stream.Exchange();
+      std::printf("net: store: stream holds=%llu delivered=%llu missed=%llu "
+                  "forgotten=%llu rejected=%llu\n",
+                  (unsigned long long)es.held,
+                  (unsigned long long)es.delivered,
+                  (unsigned long long)es.missed,
+                  (unsigned long long)es.forgotten,
+                  (unsigned long long)es.rejected);
+    }
     std::fflush(stdout);
   }
   // A ghost owns real Jolt limb bodies and a kinematic capsule; drop them
@@ -12735,6 +13141,13 @@ int main(int argc, char** argv) {
   if (netRoleBoot != NetRole::None) {
     remotes.Clear(phys);
     mobs.SetAvatar(&session.avatar);
+    // M9.5-B: `storesync` is declared AFTER `stream` in this function, so it
+    // is destroyed FIRST — and a Stream holding a pointer to a dead exchange
+    // would call through it on the next eviction. Nothing evicts after this
+    // line today; unbinding anyway is one statement and removes the whole
+    // class of question (sim/stream.h: "clear it before the object it points
+    // at dies").
+    stream.SetChunkExchange(nullptr);
     if (link) link->Close();
   }
 
