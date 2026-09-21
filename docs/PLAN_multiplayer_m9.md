@@ -58,6 +58,25 @@ User decisions (2026-09-20): transport = LAN / direct-IP TCP, no library; first
 
 ---
 
+## Running two players (as of 2026-09-21, the whole plan landed)
+
+```bash
+# host (listen server; single-player until somebody joins)
+bash scripts/run.sh ./build/Release/sandvox.exe --host 7777
+# client, on the same LAN (or with a port forward); MUST share the wrapper's cache env if
+# launched directly, or it recompiles every shader in a cold CWD cache:
+SANDVOX_SHADER_CACHE=C:/sv-deps/shader_cache SANDVOX_PIPELINE_CACHE=C:/sv-deps/sandvox_pipeline_cache.bin   ./build/Release/sandvox.exe --join <host-ip>:7777
+```
+
+A refused join prints `net: refused: <field>` (build/asset identity mismatch). Harness
+switches for the two-process smoke: `--frames N` on both, `SANDVOX_FRAMES_NO_RELOAD=1`
+on both, host `SANDVOX_NET_SMOKE_EXIT_ON_PEER_DONE=1 SANDVOX_NET_SMOKE_MOBS=1 --net-smoke-persist`,
+client `SANDVOX_NET_SMOKE_PAINT=1 SANDVOX_NET_SMOKE_DRIFT=1 --autofly-hard`; a saved
+world reloads with `--load-world <dir>`. The final smoke on `main`: 710+ batches each
+way, `late = 0`, 3 drifts repaired, 3 mobs handed off, 2,152 chunks put = acked = saved
+= loaded. Launch the client only after the host log says `hosting on`; warm a cold
+machine's pipeline cache with a standalone `--frames 200` first.
+
 ## 0. Orders for the orchestrator
 
 1. Read this file, `CLAUDE.md` "Build and verify", `bash scripts/board.sh active`,
