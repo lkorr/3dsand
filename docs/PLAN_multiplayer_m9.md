@@ -121,11 +121,11 @@ session. Every singleton that assumed one player becomes per-player. A gate walk
 two scripted players in one window and pins both trajectories.
 
 ```
-Wave 1 (parallel, disjoint files)
-  P1  TickAuthority phase split          session.h/.cpp, main.cpp (tiny)    hash UNMOVED, oracle cmp
+Wave 1 (parallel, disjoint files)                                       STATUS 2026-09-21
+  P1  TickAuthority phase split          session.h/.cpp, main.cpp (tiny)    LANDED 108f82d: oracle cmp identical, hash unmoved
   P2  per-player singletons              physics.*, avatar.h, mob.h/.cpp,
-                                         ai_behavior.h                      hash MAY move (actor id band)
-Wave 2 (after P2 merges into mp-two)
+                                         ai_behavior.h                      LANDED be0814b: hash unmoved (no tie-break saw the band)
+Wave 2 (after P1+P2 merged into mp-two, 56a9f87)
   P3  KindAtCached + gate two-players    world.h/.cpp, selftest_player.cpp,
                                          selftest.cpp (kOrder), baseline.json   hash UNMOVED
 Endgame: build mp-two once; --verify determinism,two-players,tick-input,mob-burn,ops-replay;
@@ -133,6 +133,26 @@ Endgame: build mp-two once; --verify determinism,two-players,tick-input,mob-burn
 ```
 
 ### P1 · `TickAuthority` becomes N-player (phase split) — C++ only, hash UNMOVED, proven by the op-record oracle
+
+> **LANDED 2026-09-21 (`108f82d`, merged `2285920`) — with a correction to the
+> table below.** The nine-phase table was WRONG: at `54fe241` the body
+> alternates player/world work thirteen times before the submit (the laser ray
+> runs after the window shift; the dev panel's spawn runs before the brush;
+> `ui.aiApplyBehavior` → `mobs.SetMobBehavior` at `:895-903` was missing from
+> the table entirely), so merging the player runs would have reordered the op
+> stream. The agent split at the file's real segment boundaries instead:
+> **sixteen phases** `A* B C* D E* F G* H I* J K* L M* N O* P` (`*` = once per
+> session, in index order), and `TickAuthority` is exactly their alternation.
+> For one session the concatenation is the old body line for line, which is
+> why the oracle matched by construction. The mapping from the plan's letters:
+> plan A = A,C,E,G · plan B = B,D,H · plan C = I · plan D = J · plan E = K ·
+> plan F = L · plan G = M · plan H = N · plan I = O; F is the omitted world
+> block, P the perf tail. A session with `localView = false` binds the
+> presentation seam to a `PresentationSink` (bound once by name, not guarded at
+> forty sites) and auto-revives. `mobs.SetAvatars` is still the one-time
+> `main.cpp` registration — a second session's avatar enters the mob lookup
+> tables only when its constructor site registers it (P3's gate does; M9.2's
+> ghost list will). Keep the table below as the ORIGINAL spec for the record.
 
 **Owner scope:** `src/game/session.h`, `src/game/session.cpp`, `src/main.cpp`
 (only the `TickAuthority` call at `:8481` and the `session.index/localView`
