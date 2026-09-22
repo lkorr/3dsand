@@ -1,4 +1,5 @@
 #pragma once
+#include <cstddef>
 #include <cstdint>
 #include <functional>
 #include <string>
@@ -96,6 +97,48 @@ class ChunkStore {
   using Visitor = std::function<void(IVec3 wc, const uint32_t* rle, size_t pairs)>;
   void ForEachStored(const Visitor& fn);
 
+  // ---- THE ON-DISK CHUNK CODEC (SVR3, docs/PLAN_save_system.md S3) ---------
+  //
+  // Disk only. RAM keeps the (run, word) RLE above — Put/Get/ForEachStored,
+  // the M9.5 exchange and FarEdits all see exactly what they saw before; the
+  // codec runs at WriteRegion (encode) and at the two disk readers (decode).
+  //
+  // A record is the chunk's 4,096 persisted words split into four byte
+  // planes — material low byte, material high nibble, state nibble, stain
+  // byte (bits 24..31) — with the state nibble XOR'd against the palette
+  // variant worldgen would have given that cell (world.h JitterStateFor, the
+  // one CPU mirror of worldgen.wgsl's rule; row form, as the sentinel RLE
+  // uses). Untouched terrain then reads as all-zero state, and zstd takes the
+  // rest. Air is predicted as state 0 (worldgen never jitters air); nothing
+  // else is special-cased, because a predictor that consulted the MATERIAL
+  // TABLE (liquids are born full) would make a region file's meaning depend
+  // on materials.json — the save would decode differently after an edit to
+  // it. The predictor reads only the decoded material plane, the cell
+  // position and the seed.
+  //
+  // THE SEED IS IN THE FILE HEADER, and decode uses that one, never the
+  // store's. A wrong or stale SetSeed can therefore only cost compression
+  // (the residue stops being zero), never correctness.
+  //
+  // A record is the SMALLER of the plane codec and the raw RLE pairs, so a
+  // one-run chunk stays 8 bytes and anything the planes cannot represent
+  // (stamp bits set, an RLE that does not cover exactly kChunkVol) is kept
+  // verbatim rather than refused or silently altered.
+  enum class Codec : uint32_t { RawRle = 0, ZstdPlanes = 1 };
+  static constexpr int kZstdLevel = 3;  // measured 1/3/9 — see region-codec
+  // Seed used to ENCODE (recorded in each region header it writes). Set once
+  // by Stream::Init, next to PageTable::SetWorldSeed.
+  void SetSeed(uint32_t seed) { seed_ = seed; }
+  uint32_t Seed() const { return seed_; }
+  // One chunk's record payload (no wc/length framing). `level` is exposed for
+  // the gate's level sweep; the store always writes kZstdLevel.
+  static Codec EncodeRecord(const uint32_t* rle, size_t pairs, IVec3 wc,
+                            uint32_t seed, std::vector<uint8_t>& out,
+                            int level = kZstdLevel);
+  // Inverse. False on anything malformed — never a partial chunk.
+  static bool DecodeRecord(Codec codec, const uint8_t* data, size_t len,
+                           IVec3 wc, uint32_t seed, std::vector<uint32_t>& rle);
+
  private:
   struct Region {
     IVec3 rc{};                                  // region coord (file name)
@@ -127,7 +170,16 @@ class ChunkStore {
   void LoadManifest();
   bool WriteManifest();
 
+  // Reads one region file (SVR2 or SVR3) and hands every chunk to `fn`.
+  // The single reader both EnsureLoaded and ForEachStored use, so the two
+  // cannot disagree about the format. Returns false if the file is not a
+  // region file; a bad entry stops the walk (the entries before it stand).
+  static bool ReadRegionFile(
+      const std::string& path,
+      const std::function<void(IVec3 wc, std::vector<uint32_t>& rle)>& fn);
+
   std::string dir_;
+  uint32_t seed_ = 0;
   std::unordered_map<uint64_t, Region> regions_;  // packed region key
   // Value carries the COORDINATE as well as the tick, because the manifest
   // writer has to emit (wc, tick) and World::PackChunkKey has no inverse —

@@ -183,6 +183,9 @@ void Stream::Init(GpuContext* ctx, World* world, Simulation* sim, uint32_t seed)
   // established, so the page table cannot disagree with worldgen about which
   // world it is classifying.
   if (world_->pages) world_->pages->SetWorldSeed(seed);
+  // ...and so does the region codec's state predictor (SVR3). Compression
+  // only: each region file records the seed it was encoded with.
+  store_.SetSeed(seed);
   world_->SetMirrorSeed(seed);
   // Publish the far-field edit index so FarField can reach it through World
   // (world.h's `farEdits`, forward-declared exactly like `pages`).

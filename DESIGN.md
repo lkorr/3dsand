@@ -305,6 +305,29 @@ are deduplicated across mob defs, so 128 slots cover a whole cast.
   directory per session; regen detaches without deleting files, so the last
   explicit save survives until the next save overwrites it. The old
   monolithic `.svx` (SVX2) format is retired.
+- **Region files are compressed (`SVR3`, 2026-09-22, PLAN_save_system.md S3).**
+  RAM is unchanged — the store still holds `(run, word)` RLE, and `Get`,
+  `ForEachStored`, the M9.5 exchange and `FarEdits` see exactly that; only the
+  disk encoding moved. Each chunk is one independently decodable record
+  (`wc`, `len | codec<<28`, payload) in a region file whose header carries the
+  SEED the records were encoded against. The payload is the smaller of the raw
+  RLE pairs (a one-run chunk stays 8 bytes; anything with bits outside
+  `kPersistMask` or a malformed run structure is kept verbatim) and zstd
+  (level 3) over four byte planes: material low byte, material high nibble,
+  state nibble XOR the palette variant worldgen would have given the cell
+  (`JitterStateFor` via its row form; air predicts 0; no material-table
+  lookups, so a save's meaning cannot depend on `materials.json`), stain byte.
+  Untouched jittered terrain reads as zero state. Measured on the determinism
+  script's world (150 ticks of sand, water, lava, fire, seeds, melt laser,
+  crater and pool blast; 968 chunks read back, 200 of them modified vs fresh
+  worldgen): modified chunks 2.31 MB SVR2 -> 99.6 KB SVR3 (23x; ~500 B per
+  modified chunk), the whole box 10.2 MB -> 157 KB (64x); encode ~37 us and
+  decode ~33 us per multi-run chunk. zstd 1 was within 1% of 3 on bytes;
+  9 bought 14% for 2.5x the encode time. `SVR2` still loads and is rewritten
+  as `SVR3` region by region as regions go dirty; `SVR1` is still refused.
+  Gate: `region-codec` (round-trip at 1/3/9, store read back under a wrong
+  `SetSeed`, hand-written SVR2 load + upgrade, and
+  `regionCodec.modifiedRatioMin` in `tests/baseline.json`).
 - **Save-format hardening + entity persistence (2026-08-22, worldio.h):**
   `meta.svm` is `'SVM4'` and now records the exact BIT PATTERN of
   `kVoxelMeters` and the full material NAME table alongside `kWorldN`/`kChunk`;
