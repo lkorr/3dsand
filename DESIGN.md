@@ -3928,10 +3928,45 @@ neighbors, so this needs an explicit connectivity pass:
   232 KB — in the same order, so the box set, collider and resting pose are
   unchanged (fuzzed against a port of the old walk, and the debris /
   settle-back / audio-impact / body-fastfall detail lines are byte-identical):
-  **10.4 ms → 0.5 ms** on the birth tick. Still open: the 1,024-box cap covers
-  only 5,474 of the oak's 28,478 voxels (19%) in flood order, so a canopy's
-  collider is whichever fifth the island scan reached first; raising the cap
-  moves resting positions and is its own gate-measured change.
+  **10.4 ms → 0.5 ms** on the birth tick. The 1,024-box cap that covered only
+  a fifth of the oak's voxels is gone (next item).
+- **A felled tree cost 100+ ms a Jolt step (2026-09-22).** Owner report: "cut
+  a tree down, or split a big body into several, and it runs at 3 fps for a
+  few seconds". Reproduced with `--fell-tree` on the BAKED birch
+  (`SANDVOX_FELL_SPECIES=birch SANDVOX_FELL_SPLIT=90`, and
+  `SANDVOX_FRAMES_NO_RELOAD=1` — the harness's mid-run F5 otherwise wipes the
+  bodies seconds after the cut): after two splits ONE `Update` took 100-138 ms
+  over four bodies, i.e. 300-500 ms frames at 4 ticks a frame. The step was
+  never contact-bound — the watchdog line now counts manifolds, and a 100 ms
+  step had 17 of them, 44 points — and turning enhanced internal-edge removal
+  off changed nothing; `SANDVOX_NO_ANTITUNNEL=ccd` took it to 1.6 ms. The
+  LinearCast was paying twice: Jolt casts when a step exceeds 0.75 × the
+  shape's inner radius, which for a compound is its SMALLEST sub-shape's — one
+  loose leaf, so a 7 m tree cast on every step of its fall — and the cast
+  sweeps every sub-shape, 1,024 of them on a crown. Two rules in
+  `CreateDebrisBodyXf` (`physics.cpp`, beside `kDiscreteMinExtentVox`):
+  1. **A body at least 24 voxels thick on every axis steps Discrete.** To cross
+     a terrain sheet in one step it would have to move half that, 12 voxels, in
+     one 30 Hz tick — 36 m/s, over the 32 m/s terminal velocity of a fall the
+     height of the whole window. Everything thinner keeps `LinearCast`
+     (`body-fastfall` is unchanged).
+  2. **A box budget of 256.** Under it the greedy merge is untouched (same
+     boxes, same order, same resting pose). Over it, boxes at least 8 voxels and
+     2 thick on every side are KEPT EXACT (the trunk — what rests on the
+     ground), and every other voxel is re-merged on a doubling lattice (2, 4,
+     8…) where a cell is solid if any voxel in it is, clipped to the body's
+     bounds, until the total fits. The collider now covers EVERY voxel (the
+     birch: 242 boxes, 46 kept, rest on a 4-voxel lattice) where it covered a
+     sixth; the price is a crown that collides as a slightly fuller blob.
+  Same run after: worst `Update` 0.5 ms, frame p99 23 ms. The carve path paid
+  too — eight sword kerfs on that log were 56-119 ms (one of them 27 ms) — so
+  `ShatterBody`'s connectivity flood reads a dense index grid instead of a hash
+  map (same seed order, same component numbering), `SpallGrow` only hashes the
+  cells within reach of the blow instead of the whole lattice every round,
+  `DamageBody` evaluates the carve predicate once per voxel instead of twice,
+  and `DominantMaterial` tallies into a flat array: 3.7 ms for the eight. Gate
+  `big-body-collider` pins the budget, the full coverage, the exact trunk box,
+  and Discrete-for-thick / LinearCast-for-thin, with no timing in it.
 - **The body draw was overdraw × a shadow ray (2026-09-12).** Under
   `--fell-tree`, `BuildInstances` ran twice for the whole fall (0.3 ms), and
   the draw cost 1.14 ms a frame while the oak was a body: every voxel was an
@@ -4023,12 +4058,16 @@ neighbors, so this needs an explicit connectivity pass:
   17.8 voxels of travel in one 30 Hz tick at `player.maxFall`. Debris and limp
   rigs were going through the floor, and the guarantee needs THREE things,
   because each one covers a case the others cannot:
-  1. **Jolt CCD.** Every dynamic world body is created `LinearCast`, not the
-     default `Discrete` (which advances by v·dt and only then asks what it
-     overlaps). Jolt pays for the shape cast only when a step exceeds 0.75 ×
-     the collider's inner radius, so a settled or walking body costs what it
-     always did. `Physics::CreateDebrisBody`'s note has the arithmetic; the
-     `body-fastfall` gate pins it against a real `PolygonizeChunk` patch.
+  1. **Jolt CCD.** Every dynamic world body thinner than 24 voxels on some
+     axis is created `LinearCast`, not the default `Discrete` (which advances
+     by v·dt and only then asks what it overlaps). Jolt pays for the shape cast
+     only when a step exceeds 0.75 × the collider's inner radius, so a settled
+     or walking body costs what it always did. `Physics::CreateDebrisBody`'s
+     note has the arithmetic; the `body-fastfall` gate pins it against a real
+     `PolygonizeChunk` patch. A body thicker than that on every axis is
+     `Discrete`, because it cannot cross a sheet in one step and the cast on a
+     compound fires off its smallest box (2026-09-22, "A felled tree cost 100+
+     ms a Jolt step").
   2. **Patches requested ALONG the velocity.** A cast can only hit a triangle
      that exists, and the anchor box reaches about one chunk past a
      human-sized body while a patch costs a chunk fetch plus a slot in
@@ -4102,9 +4141,10 @@ still technically being attached" describes.
 > is gone.
 
 **Why it costs minutes rather than merely looking silly.** Two multipliers that
-this document already records elsewhere. Every dynamic body is
-`EMotionQuality::LinearCast`, so once the linear velocity is large each step is
-a swept compound-shape cast against marching-cubes terrain, per body, per step.
+this document already records elsewhere. Every dynamic body thinner than 24
+voxels is `EMotionQuality::LinearCast`, so once the linear velocity is large
+each step is a swept compound-shape cast against marching-cubes terrain, per
+body, per step.
 And the contact solve sees `v + ω × r` at every contact point — the same term
 that turned a 5-second gate into an eight-minute hang when 1e30 rad/s was
 injected past the sweep.

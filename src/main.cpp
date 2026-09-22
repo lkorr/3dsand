@@ -616,6 +616,13 @@ int g_fellTreeAt = 240;  // the plant tick; the cut is 120 ticks later
 // flood walked 54 voxels west and 40 down through another tree and correctly
 // refused). The harness pad (map.json site `harness`, x/z -128..640) has no
 // trees by construction; --fell-tree 240 200,200 plants there.
+//
+// The 2026-09-22 "3 fps after a tree falls or a big body splits" repro is
+//   SANDVOX_FRAMES_NO_RELOAD=1 SANDVOX_FELL_SPECIES=birch SANDVOX_FELL_SPLIT=90
+//     ./sandvox.exe --frames 2000 --fell-tree 240 200,200
+// (a BAKED tree, not the fixture; two splits; CutBody timed on the log). The
+// NO_RELOAD is not optional: the harness's mid-run F5 lands just after the
+// cut and wipes the bodies, which read as "the tree vanished".
 bool g_fellSiteSet = false;
 int g_fellSiteX = 0, g_fellSiteZ = 0;
 // SANDVOX_PARK_AT="x,y,z": park at a NAMED PLACE instead of wherever the
@@ -6852,7 +6859,7 @@ int main(int argc, char** argv) {
     // 300-tick profile window. What differs is that this loop RENDERS. Here
     // rather than in the tick body because it reads g_frameMs, which is the
     // frame layer's own whole-frame ring.
-    tickCtx.fellTree = [&world, &mats, &debris, &player, &cam](
+    tickCtx.fellTree = [&world, &mats, &debris, &player, &cam, &phys, &treeAtlas](
                            uint32_t tick, std::vector<CellOp>& cellOps) {
       static int fellPhase = 0;  // 0 waiting, 1 planted, 2 cut, 3 reported
       static uint32_t fellPlantTick = 0, fellCutTick = 0;
@@ -6860,17 +6867,100 @@ int main(int argc, char** argv) {
       static size_t fellFrame0 = 0;
       static bool fellBodySeen = false;
       static bool fellTreeSeen = false;
+      static uint32_t fellTreeTick = 0;
       static selftest::TreeFixture fellTree;
       auto matByName = [&](const char* n) -> uint32_t {
         for (size_t i = 0; i < mats.size(); i++)
           if (mats[i].name == n) return (uint32_t)i;
         return 0u;
       };
+      // SANDVOX_FELL_SPLIT=<ticks>: that long after the tree becomes a body,
+      // split the largest body across its longest axis, twice, 45 ticks
+      // apart -- the "one big body becomes several" half of the report --
+      // and profile the 300 ticks after the first split like the fall.
+      static const int splitAfter = [] {
+        const char* e = std::getenv("SANDVOX_FELL_SPLIT");
+        return e ? std::max(1, std::atoi(e)) : 0;
+      }();
       if ((tick % 60u) == 0u)
         std::printf("--fell-tree: tick %u player (%.1f,%.1f,%.1f) yaw %.2f fly %d\n",
                     tick, player.pos.x, player.pos.y, player.pos.z, cam.yaw,
                     player.fly ? 1 : 0);
-      if (fellPhase == 0 && tick >= (uint32_t)g_fellTreeAt) {
+      static bool fellCutWide = false;
+      static int fellCutR = 4;
+      if (fellPhase == 0 && tick >= (uint32_t)g_fellTreeAt &&
+          std::getenv("SANDVOX_FELL_SPECIES") != nullptr) {
+        // SANDVOX_FELL_SPECIES=<name>[:variant]: the BAKED tree instead of the
+        // fixture -- the atlas's own voxels (TreeAtlasCellAt, the shader's
+        // column/run path), stamped where the fixture would stand, over as
+        // many ticks as the op cap needs. What a player actually cuts down.
+        static std::vector<CellOp> stamp;
+        static size_t stampAt = 0;
+        static bool stampBuilt = false;
+        if (!stampBuilt) {
+          stampBuilt = true;
+          std::string want = std::getenv("SANDVOX_FELL_SPECIES");
+          int variant = 0;
+          if (const size_t colon = want.find(':'); colon != std::string::npos) {
+            variant = std::atoi(want.c_str() + colon + 1);
+            want.resize(colon);
+          }
+          int sp = -1;
+          for (int i = 0; i < (int)treeAtlas.species.size(); i++)
+            if (treeAtlas.species[i].name == want) sp = i;
+          if (sp < 0) {
+            std::printf("--fell-tree: no species '%s' in the atlas\n", want.c_str());
+            fellPhase = 3;
+            return;
+          }
+          using namespace treeatlas;
+          const uint32_t* W = treeAtlas.words.data();
+          const uint32_t* sd = W + W[kHSpeciesDir] + sp * kSpeciesWords;
+          variant = std::min(variant, (int)sd[kSVariantCount] - 1);
+          const uint32_t* d = W + sd[kSVariantDir] + variant * kVariantWords;
+          const int nx = (int)d[kVNx], ny = (int)d[kVNy], nz = (int)d[kVNz];
+          const int ax = (int)d[kVAnchorX], az = (int)d[kVAnchorZ];
+          const Vec3 fwd = cam.Forward();
+          const int bx = ifloor(player.pos.x + fwd.x * 48.0f);
+          const int bz = ifloor(player.pos.z + fwd.z * 48.0f);
+          fellGroundY = World::TerrainHeight(bx, bz, kDefaultSeed);
+          size_t wood = 0, other = 0;
+          int trunkR = 0;
+          for (int lz = 0; lz < nz; lz++)
+            for (int ly = 0; ly < ny; ly++)
+              for (int lx = 0; lx < nx; lx++) {
+                const uint32_t m = TreeAtlasCellAt(treeAtlas, sp, variant, lx, ly, lz);
+                if (m == 0) continue;
+                const IVec3 cc{bx + lx - ax, fellGroundY + 1 + ly, bz + lz - az};
+                if (!world.CellInWindow(cc)) continue;
+                stamp.push_back({World::SlotCellIndex(cc),
+                                 PackVoxNew(m, (uint32_t)(lx * 7 + ly * 3 + lz) % 3u)});
+                const bool isWood = m < mats.size() &&
+                    (mats[m].name.find("wood") != std::string::npos ||
+                     mats[m].name.find("bark") != std::string::npos);
+                (isWood ? wood : other)++;
+                if (isWood && ly == 11)
+                  trunkR = std::max(trunkR, std::max(std::abs(lx - ax), std::abs(lz - az)));
+              }
+          fellTree.base = IVec3{bx, fellGroundY + 1, bz};
+          fellTree.lo = IVec3{bx - ax, fellGroundY + 1, bz - az};
+          fellTree.hi = IVec3{bx - ax + nx - 1, fellGroundY + ny, bz - az + nz - 1};
+          fellTree.woodCells = (uint32_t)wood;
+          fellTree.leafCells = (uint32_t)other;
+          fellCutWide = true;
+          fellCutR = std::min(40, trunkR + 3);
+          std::printf("--fell-tree: SPECIES %s variant %d: %dx%dx%d, %zu wood + %zu "
+                      "other, trunk half-width %d at +11, stamped at (%d,%d,%d)\n",
+                      want.c_str(), variant, nx, ny, nz, wood, other, trunkR, bx,
+                      fellGroundY + 1, bz);
+        }
+        while (stampAt < stamp.size() && cellOps.size() < kMaxCellOpsPerTick)
+          cellOps.push_back(stamp[stampAt++]);
+        if (stampAt < stamp.size()) return;
+        fellPlantTick = tick;
+        fellPhase = 1;
+        std::fflush(stdout);
+      } else if (fellPhase == 0 && tick >= (uint32_t)g_fellTreeAt) {
         const Vec3 fwd = cam.Forward();
         const int bx = ifloor(player.pos.x + fwd.x * 48.0f);
         const int bz = ifloor(player.pos.z + fwd.z * 48.0f);
@@ -6898,16 +6988,17 @@ int main(int argc, char** argv) {
       } else if (fellPhase == 1 && tick >= fellPlantTick + 120) {
         const int fx = fellTree.base.x, fz = fellTree.base.z;
         const int cutY = fellGroundY + 11;
+        const int cr = fellCutWide ? fellCutR : 4;
         for (int y = cutY; y < cutY + 3; y++)
-          for (int dz = -4; dz <= 4; dz++)
-            for (int dx = -4; dx <= 4; dx++) {
+          for (int dz = -cr; dz <= cr; dz++)
+            for (int dx = -cr; dx <= cr; dx++) {
               const IVec3 cc{fx + dx, y, fz + dz};
               if (!world.CellInWindow(cc)) continue;
               if (cellOps.size() < kMaxCellOpsPerTick)
                 cellOps.push_back({World::SlotCellIndex(cc), 0u});
             }
-        debris.AddDestructionEvent(tick, {fx - 5, fellGroundY + 10, fz - 5},
-                                   {fx + 5, fellGroundY + 15, fz + 5});
+        debris.AddDestructionEvent(tick, {fx - cr - 1, fellGroundY + 10, fz - cr - 1},
+                                   {fx + cr + 1, fellGroundY + 15, fz + cr + 1});
         debris.SetProfiling(true);
         debris.ResetProfile();
         debris.ResetFloaterProbe();
@@ -6973,6 +7064,111 @@ int main(int argc, char** argv) {
                     world.FetchReport().c_str());
         std::fflush(stdout);
         if (!std::getenv("SANDVOX_DEBRIS_PROFILE")) debris.SetProfiling(false);
+      }
+      // THE WORST PHYSICS STEP, per 60 ticks while anything is a body: a
+      // whole-frame max says a frame was slow, this says Jolt was the reason.
+      if (fellPhase >= 2 && (tick % 60u) == 0u) {
+        std::printf("--fell-tree: tick %u (+%u) bodies %u, worst Jolt Update "
+                    "since last line %.1f ms\n",
+                    tick, tick - fellCutTick, debris.BodyCount(),
+                    phys.Runaway().worstStepMs);
+        phys.ResetRunawayProbe();
+      }
+      if (fellTreeSeen && fellTreeTick == 0) fellTreeTick = tick;
+      static int splits = 0;
+      static uint32_t splitTick0 = 0, lastSplitTick = 0;
+      static size_t splitFrame0 = 0;
+      if (splitAfter > 0 && fellTreeTick != 0 && splits < 2 &&
+          tick >= fellTreeTick + (uint32_t)splitAfter &&
+          (splits == 0 || tick >= lastSplitTick + 45)) {
+        uint32_t bi = UINT32_MAX, big = 0;
+        for (uint32_t b = 0; b < debris.BodyCount(); b++)
+          if (debris.BodyVoxelCount(b) > big) {
+            big = debris.BodyVoxelCount(b);
+            bi = b;
+          }
+        Vec3 lmn{}, lmx{};
+        BodyTransform bxf{};
+        const uint64_t h = bi != UINT32_MAX ? debris.BodyHandle(bi) : 0;
+        if (h != 0 && phys.GetLocalBounds(h, lmn, lmx) && phys.GetTransform(h, bxf)) {
+          // Across the body's own longest LOCAL axis, through its middle.
+          const float ext[3] = {lmx.x - lmn.x, lmx.y - lmn.y, lmx.z - lmn.z};
+          int ax = 0;
+          for (int a = 1; a < 3; a++)
+            if (ext[a] > ext[ax]) ax = a;
+          auto rot = [&](Vec3 v) {
+            const Vec3 u{bxf.quat[0], bxf.quat[1], bxf.quat[2]};
+            const Vec3 t = u.cross(v) * 2.0f;
+            return v + t * bxf.quat[3] + u.cross(t);
+          };
+          const Vec3 c = bxf.pos + rot(Vec3{0.5f * (lmn.x + lmx.x),
+                                            0.5f * (lmn.y + lmx.y),
+                                            0.5f * (lmn.z + lmx.z)});
+          const Vec3 n = rot(Vec3{ax == 0 ? 1.0f : 0.0f, ax == 1 ? 1.0f : 0.0f,
+                                  ax == 2 ? 1.0f : 0.0f});
+          // THE BLADE'S COST ON THIS BODY FIRST: eight kerfs across the
+          // split plane, each timed, the way a sword stroke's probes land on a
+          // log (melee.cpp ResolveOnLooseMatter -> CutBody). Shallow slots,
+          // so they carve without parting it and the split below still has
+          // the whole body to work on.
+          if (splits == 0) {
+            std::vector<ParticleSpawn> sp;
+            double worst = 0, tot = 0;
+            for (int k = 0; k < 8; k++) {
+              KerfCut kc;
+              kc.at = c + Vec3{0.0f, 0.5f * (float)k, 0.0f};
+              kc.edgeAxis = Vec3{n.z, 0.0f, -n.x}.len() > 0.1f
+                                ? Vec3{n.z, 0.0f, -n.x}.normalized()
+                                : Vec3{1.0f, 0.0f, 0.0f};
+              kc.cutDir = n;
+              kc.depth = 1.5f;
+              kc.halfWidth = 0.3f;
+              kc.length = 3.0f;
+              kc.seed = (uint32_t)k;
+              const auto tk = std::chrono::steady_clock::now();
+              debris.CutBody(debris.BodyHandle(bi), kc, world, sp);
+              const double ms = std::chrono::duration<double, std::milli>(
+                                    std::chrono::steady_clock::now() - tk).count();
+              worst = std::max(worst, ms);
+              tot += ms;
+            }
+            std::printf("--fell-tree: 8 CutBody kerfs on the %u-vox body: %.2f ms "
+                        "total, worst %.2f, bodies now %u\n", big, tot, worst,
+                        debris.BodyCount());
+          }
+          const auto t0 = std::chrono::steady_clock::now();
+          const bool ok = debris.SplitBody(debris.BodyHandle(bi), c, n);
+          const double ms = std::chrono::duration<double, std::milli>(
+                                std::chrono::steady_clock::now() - t0).count();
+          std::printf("--fell-tree: SPLIT %d of body %u (%u vox) across axis %d "
+                      "at tick %u: %s in %.2f ms, bodies now %u\n",
+                      splits, bi, big, ax, tick, ok ? "ok" : "REFUSED", ms,
+                      debris.BodyCount());
+          if (splits == 0) {
+            splitTick0 = tick;
+            splitFrame0 = g_frameMs.size();
+          }
+          lastSplitTick = tick;
+          splits++;
+          std::fflush(stdout);
+        } else {
+          splits = 2;  // nothing left to split
+        }
+      }
+      if (splitTick0 != 0 && tick == splitTick0 + 300) {
+        std::vector<double> win(g_frameMs.begin() + (ptrdiff_t)splitFrame0,
+                                g_frameMs.end());
+        std::sort(win.begin(), win.end());
+        auto pct = [&](double p) {
+          return win.empty() ? 0.0 : win[(size_t)(p * (win.size() - 1))];
+        };
+        size_t over33 = 0;
+        for (double m : win) if (m > 33.0) over33++;
+        std::printf("--fell-tree: SPLIT window 300 ticks / %zu frames: whole-frame "
+                    "ms p50 %.1f p95 %.1f p99 %.1f max %.1f, >33ms %zu; bodies %u\n",
+                    win.size(), pct(0.5), pct(0.95), pct(0.99),
+                    win.empty() ? 0.0 : win.back(), over33, debris.BodyCount());
+        std::fflush(stdout);
       }
     };
   }

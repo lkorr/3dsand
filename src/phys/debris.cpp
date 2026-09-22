@@ -3488,15 +3488,53 @@ void DebrisSystem::ShatterBody(Body& b, World& world, std::vector<Body>& fragmen
   std::vector<int32_t> comp;
   std::vector<uint32_t> compSize;
   std::vector<uint32_t> stack;
+  // THE LOOKUP IS A DENSE GRID over the lattice's bounding box whenever that
+  // box is a sane size, and the hash map only past it (a sparse fine skin can
+  // span far more cells than it holds). This runs on EVERY carve -- each probe
+  // of a sword stroke that lands on a body -- and on a felled 35k-voxel tree
+  // the hash map made it most of a 7-27 ms CutBody (2026-09-22, --fell-tree);
+  // an index grid is the same flood, the same seed order and therefore the
+  // same component numbering, at array speed.
+  constexpr int64_t kDenseFloodCells = 4 << 20;  // 16 MiB of int32
+  std::vector<int32_t> denseIdx;
   auto flood = [&](uint32_t count, auto posAt) {
     comp.assign(count, -1);
     compSize.clear();
-    std::unordered_map<uint64_t, uint32_t> map;
-    map.reserve(count * 2);
-    for (uint32_t i = 0; i < count; i++) {
+    if (count == 0) return 0u;
+    IVec3 mn = posAt(0), mx = mn;
+    for (uint32_t i = 1; i < count; i++) {
       const IVec3 p = posAt(i);
-      map[key64(p.x, p.y, p.z)] = i;
+      mn.x = std::min(mn.x, p.x); mn.y = std::min(mn.y, p.y); mn.z = std::min(mn.z, p.z);
+      mx.x = std::max(mx.x, p.x); mx.y = std::max(mx.y, p.y); mx.z = std::max(mx.z, p.z);
     }
+    const int64_t gx = (int64_t)mx.x - mn.x + 1, gy = (int64_t)mx.y - mn.y + 1,
+                  gz = (int64_t)mx.z - mn.z + 1;
+    const bool dense = gx * gy * gz <= kDenseFloodCells;
+    std::unordered_map<uint64_t, uint32_t> map;
+    if (dense) {
+      denseIdx.assign((size_t)(gx * gy * gz), -1);
+      for (uint32_t i = 0; i < count; i++) {
+        const IVec3 p = posAt(i);
+        denseIdx[(size_t)(((int64_t)(p.z - mn.z) * gy + (p.y - mn.y)) * gx +
+                          (p.x - mn.x))] = (int32_t)i;
+      }
+    } else {
+      map.reserve(count * 2);
+      for (uint32_t i = 0; i < count; i++) {
+        const IVec3 p = posAt(i);
+        map[key64(p.x, p.y, p.z)] = i;
+      }
+    }
+    auto indexAt = [&](int x, int y, int z) -> int32_t {
+      if (dense) {
+        if (x < mn.x || y < mn.y || z < mn.z || x > mx.x || y > mx.y || z > mx.z)
+          return -1;
+        return denseIdx[(size_t)(((int64_t)(z - mn.z) * gy + (y - mn.y)) * gx +
+                                 (x - mn.x))];
+      }
+      auto it = map.find(key64(x, y, z));
+      return it == map.end() ? -1 : (int32_t)it->second;
+    };
     for (uint32_t seed = 0; seed < count; seed++) {
       if (comp[seed] != -1) continue;
       int32_t c = (int32_t)compSize.size();
@@ -3511,10 +3549,10 @@ void DebrisSystem::ShatterBody(Body& b, World& world, std::vector<Body>& fragmen
         const int d[6][3] = {{1, 0, 0}, {-1, 0, 0}, {0, 1, 0},
                              {0, -1, 0}, {0, 0, 1}, {0, 0, -1}};
         for (auto& dd : d) {
-          auto it = map.find(key64(v.x + dd[0], v.y + dd[1], v.z + dd[2]));
-          if (it != map.end() && comp[it->second] == -1) {
-            comp[it->second] = c;
-            stack.push_back(it->second);
+          const int32_t j = indexAt(v.x + dd[0], v.y + dd[1], v.z + dd[2]);
+          if (j >= 0 && comp[(size_t)j] == -1) {
+            comp[(size_t)j] = c;
+            stack.push_back((uint32_t)j);
           }
         }
       }
@@ -4780,17 +4818,18 @@ bool DebrisSystem::DamageBody(size_t bi, World& world,
     for (const DebrisVoxel& v : colliderBefore)
       if (!after.count(ck(v))) removed.push_back(v);
   } else {
-    for (const DebrisVoxel& v : b.voxels)
-      if (!keep((float)v.x, (float)v.y, (float)v.z)) removed.push_back(v);
-    if (removed.empty() && !(spall && spall->rounds > 0)) {
-      return true;  // nothing in range
+    // One pass, one predicate call per voxel: the survivors compact in place
+    // (the order remove_if kept) and the losses go out in lattice order.
+    size_t w = 0;
+    for (size_t i = 0; i < b.voxels.size(); i++) {
+      const DebrisVoxel v = b.voxels[i];
+      if (keep((float)v.x, (float)v.y, (float)v.z)) b.voxels[w++] = v;
+      else removed.push_back(v);
     }
-    b.voxels.erase(
-        std::remove_if(b.voxels.begin(), b.voxels.end(),
-                       [&](const DebrisVoxel& v) {
-                         return !keep((float)v.x, (float)v.y, (float)v.z);
-                       }),
-        b.voxels.end());
+    b.voxels.resize(w);
+    if (removed.empty() && !(spall && spall->rounds > 0)) {
+      return true;  // nothing in range (and nothing moved: w == size)
+    }
     // The collider IS the authoritative lattice here, so the spalled cells are
     // the gore: recorded whole, because a gobbet needs the material it was
     // made of (same as the limb path).
@@ -6723,16 +6762,18 @@ bool DebrisSystem::UntunnelRig(const std::vector<uint64_t>& handles,
 // what the break or the impact sounds like. Counted over a small map rather
 // than a full histogram because the voxel count is bounded by the body cap.
 uint32_t DebrisSystem::DominantMaterial(const std::vector<DebrisVoxel>& voxels) {
-  std::unordered_map<uint32_t, uint32_t> tally;
+  // A flat tally over the 12-bit id space, not a hash map: this runs on every
+  // lattice rewrite (RecountBurn) and a felled tree is 35k voxels of it.
+  std::array<uint32_t, 4096> tally{};
   for (const DebrisVoxel& v : voxels) tally[v.payload & 0xFFFu]++;
   uint32_t domMat = 0, domCount = 0;
-  for (const auto& [mat, count] : tally) {
-    // Ties break toward the lower id for stability of the REPORT: the world
-    // hash never sees this, but an unstable pick would make the cue flip
-    // between runs and make a bug here hard to reproduce.
-    if (count > domCount || (count == domCount && mat < domMat)) {
+  // Ascending id with a strict `>`: ties break toward the lower id, for
+  // stability of the REPORT -- the world hash never sees this, but an unstable
+  // pick would make the cue flip between runs and a bug here hard to repeat.
+  for (uint32_t mat = 0; mat < 4096u; mat++) {
+    if (tally[mat] > domCount) {
       domMat = mat;
-      domCount = count;
+      domCount = tally[mat];
     }
   }
   return domMat;

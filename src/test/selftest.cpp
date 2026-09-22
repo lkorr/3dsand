@@ -366,6 +366,9 @@ const char* const kOrder[] = {
     // and patch they make. Neither reads the shared World, so the slot is free
     // — but it has to be AFTER the gates that assert over BodyCount().
     "body-fastfall",
+    // Same shape as `body-fastfall`: pure Jolt, its own bodies 900 voxels out,
+    // all removed before it returns.
+    "big-body-collider",
     // AFTER the debris gates and BEFORE anything that owns bodies of its own.
     //
     // It installs an ownership function on the SHARED DebrisSystem, which

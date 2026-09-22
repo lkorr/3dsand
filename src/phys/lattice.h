@@ -147,11 +147,25 @@ inline size_t SpallGrow(std::vector<Vox>& cells, const SpallParams& p,
            ((uint64_t)(uint32_t)(y + 32768) << 21) |
            (uint64_t)(uint32_t)(z + 32768);
   };
+  // ONLY THE CELLS NEAR THE BLOW. `live` is asked about the six neighbours of
+  // a cell inside the sphere, so nothing further than radius + 1 from the
+  // centre is ever looked up; the margin below is that plus a cell of slack.
+  // It used to hold the whole lattice, rebuilt every round, which on a felled
+  // tree was a 35k-entry hash set per round per sword probe for a crater a few
+  // voxels across. Same set of answers, so the same spall.
+  const float reach = p.radius + 2.0f;
+  const float reach2 = reach * reach;
+  auto nearBlow = [&](const Vox& v) {
+    const float dx = (float)v.x + 0.5f - p.centre.x,
+                dy = (float)v.y + 0.5f - p.centre.y,
+                dz = (float)v.z + 0.5f - p.centre.z;
+    return dx * dx + dy * dy + dz * dz < reach2;
+  };
   std::unordered_set<uint64_t> live;
   auto rebuild = [&] {
     live.clear();
-    live.reserve(cells.size() * 2);
-    for (const Vox& v : cells) live.insert(key(v.x, v.y, v.z));
+    for (const Vox& v : cells)
+      if (nearBlow(v)) live.insert(key(v.x, v.y, v.z));
   };
   rebuild();
   // A voxel on an intact surface already has one open face, so "eroded" starts
