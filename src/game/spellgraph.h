@@ -13,6 +13,28 @@
 //      drawing: nodes with integer chrome-pixel boxes and edges between them.
 //      The hand box is the root at the BOTTOM (largest y) and the tree grows
 //      upward, which is the direction the user asked for.
+//
+//      THE DRAWING READS IN WORD ORDER, BOTTOM TO TOP (2026-09-21). A box's
+//      bar sits ABOVE its contents, because that is where its word sits in the
+//      sentence: you say `fire projectile`, so `fire` is the lower cell and
+//      PROJECTILE is the one over it. Containment used to drive the stack, so
+//      the same sentence drew PROJECTILE underneath FIRE and the picture read
+//      backwards from the words that made it. Same for an operator: its
+//      operands are the row BELOW its cell.
+//
+//      THE HAND IS THE ONE EXCEPTION, AND IT IS NOT A SPECIAL CASE. `hand` is
+//      the implicit outermost box (spell.cpp rule 3) — the one delivery nobody
+//      ever speaks — so it has no place in a word-order stack. It is the
+//      PEDESTAL: its bar at layer 0, its sockets and bus just above it, and
+//      the whole spoken sentence standing on top. `flip` in `Place` is exactly
+//      "is this box a spoken delivery".
+//
+//      A BOX HANDS OFF TO ITS PARENT FROM THE BOTTOM OF ITS SPAN, not from its
+//      bar. `baseLayer` is that layer. The bar of a spoken box is at the TOP of
+//      its own span, so an edge drawn from the bar itself would fall the whole
+//      height of the subtree and cross every cell in it; anchored at
+//      `baseLayer` the stroke is the short one between two neighbouring bands,
+//      and the drawing reads as one spine running up the page.
 //   2. THE LINEARIZER. `Linearize` turns a `SpellTree` back into a word list.
 //      THE ROUND-TRIP LAW: for every sentence s the grammar can say,
 //      `Parse(Linearize(Parse(s)))` is `Parse(s)` node for node and lowers to
@@ -63,12 +85,17 @@
 constexpr int kGraphCell = 64;        // a word / operator cell, square
 constexpr int kGraphGap = 32;         // minimum gap between sibling subtrees
 constexpr int kGraphPitch = 96;       // vertical distance between layers
-constexpr int kGraphBarH = 64;        // a join bar's height
-constexpr int kGraphMinBarW = 128;    // a join bar is never narrower than this
+// A DELIVERY IS A CELL, NOT A SLAB (2026-09-21). The bar used to be 128x64 and
+// to stretch across its whole socket row, which made the two most common nodes
+// on the page — PROJECTILE and the hand — the only rectangles in a drawing
+// otherwise made of 64 px squares, and made them read as chrome rather than as
+// words. They are square cells now like every other glyph; the reach the slab
+// used to show is a thin rule the CANVAS draws behind the cell, spanning the
+// socket row (`SpellGraphNode::sockets` gives it the extent, so no field).
 constexpr int kGraphSocketW = 32;     // a socket column's minimum width
 constexpr int kGraphSocketH = 32;
 constexpr int kGraphBusH = 16;        // the shared bus stroke's box
-constexpr int kGraphTagW = 96;        // a mod tag hanging off a bar's left end
+constexpr int kGraphTagW = 96;        // a mod tag, a bead on the bar's trunk
 constexpr int kGraphTagH = 32;
 
 // ---- the graph ----------------------------------------------------------------
@@ -77,14 +104,14 @@ enum class GraphKind : uint8_t {
   Word = 0,   // a Matter / Effect leaf
   Operator,   // an operator cell with its pips
   Join,       // a spoken delivery box: a bar, its sockets, its bus
-  ModTag,     // a pending Mod, hanging off the join it stuck to
+  ModTag,     // a pending Mod, a bead on the trunk over the join it stuck to
   Root,       // the hand bar
   Socket,     // synthesized: one instance of a join (treeNode == -1)
   Bus,        // synthesized: what the shared items feed (treeNode == -1)
 };
 
 enum class GraphEdge : uint8_t {
-  Trunk = 0,  // child -> parent (a bus or a tag into its join)
+  Trunk = 0,  // child -> parent (a bus or a mod bead into its join)
   Bus,        // a shared item -> the bus
   Socket,     // a lane's subtree -> its socket
   Fan,        // a socket -> the bar
@@ -103,10 +130,16 @@ struct SpellGraphNode {
   // Box, in chrome pixels. y grows DOWNWARD: the root is at the maximum y.
   int x = 0, y = 0, w = 0, h = 0;
   int layer = 0;              // 0 = the root's layer, increasing upward
+  // THE LAYER THIS NODE HANDS OFF TO ITS PARENT ON: the LOWEST layer its whole
+  // subtree occupies. Equal to `layer` for anything a single band tall; for a
+  // spoken box (bar at the top of its span) and for an operator (cell above its
+  // operands) it is the bottom of the span, which is where the edge into the
+  // parent starts. See the header note.
+  int baseLayer = 0;
   // THE WHOLE SUBTREE's horizontal extent, which is what a drop test and the
   // parent-containment law want: an operator CELL is narrower than the row of
-  // operands above it, and a join's BAR does not cover the mod tags hanging
-  // off its left end, so `x`/`w` alone answers neither question.
+  // operands above it, and a join's BAR is narrower than a mod bead row wider
+  // than it, so `x`/`w` alone answers neither question.
   int subX = 0, subW = 0;
 
   // ---- Operator -------------------------------------------------------------
@@ -119,15 +152,14 @@ struct SpellGraphNode {
   int32_t laneCount = 0;      // how many lanes the box closed
   std::vector<int> sockets;   // graph indices, in INSTANCE order (0..instances-1)
   int bus = -1;               // graph index of the bus, -1 when nothing is shared
-  // The bar itself, which is narrower than the node when mod tags hang off its
-  // left end. `x`/`w` is the bar; the tags occupy [x - tagStripW, x).
-  int tagStripW = 0;
   BoxPrice price;             // copied from CastList::PriceOf(treeNode)
   bool hasPrice = false;
   int32_t subtotal = 0;       // price.tariff + price.carryCost
 
-  // ---- Socket ---------------------------------------------------------------
-  // Which instance this socket is. Instance 0 is the aim, and it is drawn in
+  // ---- Socket, and a lane's ModTag ------------------------------------------
+  // Which instance this socket is — or, on a ModTag, which instance the mod
+  // edits (-1 when it is record-wide, which every `count` mod is wherever it
+  // was spoken). Instance 0 is the aim, and it is drawn in
   // the CENTRE slot of the row (exactly on the bar's centre line when
   // `instances` is odd), so the first lane the player opened is the middle
   // bolt — which is what rule 4 promises.

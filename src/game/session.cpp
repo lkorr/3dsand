@@ -2104,26 +2104,50 @@ static void PhaseI(TickAuthorityCtx& w, WorldScratch& ws,
         // The body a status attaches to: the nearest mob origin within the
         // radius, else the player. Ids are the mob's own and the player's
         // caster id — opaque to the VM either way.
+        //
+        // MEASURED TO THE BODY'S BOX, NOT TO A POINT ON IT (2026-09-22). This
+        // used to compare `from` against `MobOrigin`, which is the collider's
+        // min corner in x/z and the FEET in y — i.e. the ground between a
+        // creature's ankles. A `float aura projectile` attaches its status
+        // within the effect's radius plus 2 (three voxels for a mod), so a
+        // bolt that struck a human anywhere above the shins found NO body,
+        // the status fell back to being a PLACE, and a sustained mod on a
+        // place does nothing at all: the spell worked on you and silently
+        // failed on everything else. The player's branch had the whole figure
+        // allowed for in a `+9.0f` for exactly this reason; the mobs' did not.
         bodyProbe.bodyIdAt = [](void* c, Vec3 from, float radius, uint64_t& id, Vec3& out) {
           SpellBodyCtx& bc = *(SpellBodyCtx*)c;
-          float best = radius * radius;
+          // Distance from the point to a box, zero inside it.
+          auto boxDist = [](const Vec3& p, const Vec3& lo, const Vec3& hi) {
+            const float dx = std::max(std::max(lo.x - p.x, 0.0f), p.x - hi.x);
+            const float dy = std::max(std::max(lo.y - p.y, 0.0f), p.y - hi.y);
+            const float dz = std::max(std::max(lo.z - p.z, 0.0f), p.z - hi.z);
+            return std::sqrt(dx * dx + dy * dy + dz * dz);
+          };
+          float best = radius;
           bool found = false;
           for (uint32_t i = 0; i < bc.mobs->MobCount(); i++) {
             const uint64_t mid = bc.mobs->MobIdAt(i);
-            const Vec3 p = bc.mobs->MobOrigin(mid);
-            const Vec3 d = p - from;
-            const float d2 = d.x * d.x + d.y * d.y + d.z * d.z;
-            if (d2 <= best) {
-              best = d2;
+            Vec3 lo, hi;
+            if (!bc.mobs->MobBodyBox(mid, lo, hi)) continue;
+            const float d = boxDist(from, lo, hi);
+            if (d <= best) {
+              best = d;
               id = mid;
-              out = p;
+              // The body's CENTRE, not its corner: this is the point the
+              // status rides and the one a place-status would resolve at.
+              out = Vec3{(lo.x + hi.x) * 0.5f, (lo.y + hi.y) * 0.5f,
+                         (lo.z + hi.z) * 0.5f};
               found = true;
             }
           }
+          // The player, as a figure box of her own (~1.7 m) around `pos`, and
+          // NEAREST WINS: a self-cast with an enemy standing on top of you
+          // still lands on you.
           const Vec3 dp = bc.player->pos - from;
-          // The figure box is ~1.7 m: a point anywhere on the body counts.
-          const float pr = radius + 9.0f;
-          if (!found && dp.x * dp.x + dp.y * dp.y + dp.z * dp.z <= pr * pr) {
+          const float dPlayer =
+              std::max(0.0f, std::sqrt(dp.x * dp.x + dp.y * dp.y + dp.z * dp.z) - 9.0f);
+          if (dPlayer <= radius && (!found || dPlayer < best)) {
             id = bc.playerId;
             out = bc.player->pos;
             found = true;
@@ -2288,9 +2312,17 @@ static void PhaseI(TickAuthorityCtx& w, WorldScratch& ws,
           }
           caster.mana.reserved = spells.ReservationFor(0x9134A5EEu);
         }
-        // A sustained gravity mod on the player's own body.
-        for (const SpellBodyImpulse& bi : emit.bodyImpulses)
+        // A sustained gravity mod on a body: the caster's own, or anyone
+        // else's. The second half was missing until 2026-09-22 — the VM has
+        // always emitted the impulse for whatever body the status attached to,
+        // and this loop dropped every one that was not the player's, so
+        // `float aura` lifted you and left an enemy standing. MobSystem knows
+        // which of its two velocity states the body is in (limp or walking);
+        // this only has to hand the number over.
+        for (const SpellBodyImpulse& bi : emit.bodyImpulses) {
           if (bi.target == 0x9134A5EEu) player.vel.y += bi.vps.y;
+          else mobs.LiftMob(bi.target, bi.vps);
+        }
         // GRAFTS: the world half already left as ops; the body half fills the
         // caster's missing anatomy cells with that matter, root-first. The VM
         // cannot reach a body (thesis 4); the owner does it.

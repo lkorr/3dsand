@@ -5683,9 +5683,24 @@ void DebrisSystem::PulpTick(uint32_t tick, World& world,
       const IVec3 v = L.At(i);
       live.insert(key(v.x, v.y, v.z));
     }
+    // BONE DOES NOT DISSOLVE — the corpse's half of the living rule (see
+    // Mob::BluntPulpTick). The census is the one BruiseBody above builds, and
+    // for the same reason it builds it: what crumbles to this body's own blood
+    // is tissue, and a skeleton is what is left when the tissue has gone.
+    std::vector<uint8_t> tissue(rubbleOf_.size(), 0);
+    bool anyTissue = false;
+    for (size_t m = 0; m < rubbleOf_.size(); m++)
+      if (rubbleOf_[m] == b.bleedMat || m == b.bleedMat) {
+        tissue[m] = 1;
+        anyTissue = true;
+      }
+    if (!anyTissue) tissue.clear();
+
     std::vector<IVec3> face, buried;
     for (size_t i = 0; i < cells; i++) {
-      if (L.Mat(i) == 0) continue;
+      const uint32_t mat = L.Mat(i) & 0xFFFu;
+      if (mat == 0) continue;
+      if (!tissue.empty() && (mat >= tissue.size() || !tissue[mat])) continue;
       const uint16_t st = L.Stain(i);
       if (BodyStainMat(st) != b.bleedMat || BodyStainAmt(st) < pulpAt) continue;
       const IVec3 v = L.At(i);

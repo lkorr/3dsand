@@ -3922,6 +3922,134 @@ Status GateHitReact(Ctx& c, std::string& detail) {
 
 }  // namespace
 
+// ---- levitate: a sustained gravity mod on a body that is NOT the caster ----
+//
+// (spell.h `SpellBodyImpulse` -> session.cpp's routing -> mob.h `Mob::AddLift`,
+// 2026-09-22, from the owner's report that `float aura` worked on himself, did
+// nothing to an enemy, and did nothing to a ragdoll.)
+//
+// Three claims, because those were three independent causes that look like the
+// same zero from outside (CLAUDE.md rule 6):
+//
+//   1. THE BODY CAN BE FOUND. A status attaches to whatever body lies within
+//      the effect's radius + 2 of the point the spell resolved at - three
+//      voxels for a bare mod. That search measured to `MobOrigin`, which is
+//      the collider's MIN CORNER in x/z and the FEET in y, so a bolt that
+//      struck a chest found no body at all, the status fell back to being a
+//      PLACE, and a sustained mod on a place does nothing. Both distances are
+//      printed; the box one is the claim.
+//   2. A LIVE BODY RISES when it is lifted, and does not when it is not. The
+//      control arm is the same creature over the same span with no lift, so
+//      the number is a differential and not a reading of the terrain.
+//   3. A LIMP BODY RISES TOO. That is a different velocity state entirely -
+//      the rig belongs to Jolt once it goes down - and it is the half the
+//      owner reported second.
+Status GateLevitate(Ctx& c, std::string& detail) {
+  IdCounterScope idScope(c.mobs);
+  bool ok = true;
+  int checks = 0;
+  auto check = [&](bool cond, const char* what) {
+    checks++;
+    if (!cond) {
+      ok = false;
+      std::printf("levitate: FAILED %s\n", what);
+    }
+  };
+
+  Stage st = OpenStage(c);
+  if (!st.ok) {
+    detail = st.why;
+    std::printf("levitate: SKIP (%s)\n", detail.c_str());
+    return Status::Skip;
+  }
+
+  // WHAT `float` IS WORTH, derived rather than guessed: glyphs.json gives the
+  // word `gravity add -1000`, and spell.cpp turns a sustained gravity mod into
+  // `-amount * 0.012` voxels/sec of velocity per tick. One `float` is +12.
+  const float kFloatVps = (float)BaselineNumber("levitate.floatVps", 12.0);
+  const int kSpan = (int)BaselineNumber("levitate.spanTicks", 24);
+  const float minRise = (float)BaselineNumber("levitate.minRiseVox", 3.0);
+
+  std::string why;
+  auto spawn = [&](int dz) {
+    return SpawnFighter(c, st.defIndex,
+                        {st.spot.x, st.spot.y + 1, st.spot.z + dz},
+                        "training_dummy", false, why);
+  };
+  const uint64_t live = spawn(0);
+  const uint64_t limp = spawn(24);
+  if (live == 0 || limp == 0) {
+    detail = why.empty() ? "fixture spawn failed" : why;
+    std::printf("levitate: SKIP (%s)\n", detail.c_str());
+    CloseStage(c);
+    return Status::Skip;
+  }
+  Ticker tick{c, 33000, {st.spot.x >> 4, st.spot.y >> 4, st.spot.z >> 4}};
+  for (int i = 0; i < 48; i++) tick();
+
+  // ---- (1) the body's box, and the point a bolt would resolve at -----------
+  Vec3 lo{}, hi{};
+  const bool haveBox = c.mobs.MobBodyBox(live, lo, hi);
+  check(haveBox, "a spawned mob reports a body box at all");
+  const Vec3 chest{(lo.x + hi.x) * 0.5f, (lo.y + hi.y) * 0.5f,
+                   (lo.z + hi.z) * 0.5f};
+  const Vec3 org = c.mobs.MobOrigin(live);
+  const float dOrigin = (chest - org).len();
+  const float dBox =
+      std::max({lo.x - chest.x, chest.x - hi.x, lo.y - chest.y, chest.y - hi.y,
+                lo.z - chest.z, chest.z - hi.z, 0.0f});
+  check(haveBox && hi.y - lo.y >= 4.0f,
+        "the box has the creature's HEIGHT in it (not a point at its feet)");
+  check(dBox <= 0.0f, "a strike at the middle of a body is ON that body");
+
+  // ---- (2) live: lifted vs not, same creature, same span -------------------
+  auto riseOf = [&](uint64_t who, bool lift) {
+    const float y0 = c.mobs.MobOrigin(who).y;
+    float peak = 0.0f;
+    for (int i = 0; i < kSpan; i++) {
+      if (lift) c.mobs.LiftMob(who, Vec3{0.0f, kFloatVps, 0.0f});
+      tick();
+      if (c.mobs.FindMobById(who) == nullptr) break;
+      peak = std::max(peak, c.mobs.MobOrigin(who).y - y0);
+    }
+    return peak;
+  };
+  const float idle = riseOf(live, false);
+  const float lifted = riseOf(live, true);
+  check(idle < 1.0f, "a creature nobody lifted stays on the ground");
+  check(lifted >= minRise, "`float aura` lifts a LIVE body off the ground");
+  const Mob* lm = c.mobs.FindMobById(live);
+  check(lm != nullptr && lm->Airborne(),
+        "...and it is airborne while it is held up, not standing in mid-air");
+
+  // ---- (3) limp: the same lift through Jolt --------------------------------
+  Mob* dead = c.mobs.FindMobById(limp);
+  if (dead != nullptr) dead->StartRagdoll(4.0f, "levitate gate");
+  for (int i = 0; i < 4; i++) tick();   // let the rig go dynamic
+  dead = c.mobs.FindMobById(limp);
+  const bool wentLimp = dead != nullptr && dead->Ragdolled();
+  const float limpIdle = riseOf(limp, false);
+  const float limpRise = riseOf(limp, true);
+  check(wentLimp, "the second fixture actually went limp");
+  check(limpIdle < 1.0f, "a corpse nobody lifted stays put");
+  check(limpRise >= minRise, "`float aura` lifts a LIMP body too");
+
+  std::printf(
+      "levitate: box %.1f tall | chest %.1f vox from the collider ORIGIN, "
+      "%.1f from the BOX | live rise %.2f (idle %.2f) | limp rise %.2f "
+      "(idle %.2f) | %d checks\n",
+      hi.y - lo.y, dOrigin, dBox, lifted, idle, limpRise, limpIdle, checks);
+
+  c.mobs.Reset();
+  c.debris.Reset();
+  CloseStage(c);
+  if (!ok) {
+    detail = "a sustained gravity mod did not move a body";
+    return Status::Fail;
+  }
+  return Status::Pass;
+}
+
 const std::vector<Gate>& CombatGates() {
   static const std::vector<Gate> g = {
       // No deps, no world, no GPU: both build their own inputs and neither
@@ -3957,6 +4085,10 @@ const std::vector<Gate>& CombatGates() {
       // MobSystem entry point. Same shape as the ones above — id scope in,
       // worldgen out — so `--gate hit-react` is the whole of iterating on it.
       {"hit-react", "mob", {}, false, GateHitReact},
+      // ---- a sustained gravity mod on somebody else's body ----------------
+      // Spawns two creatures and lays one of them down, so it goes with the
+      // group above and at the end of it.
+      {"levitate", "mob", {}, false, GateLevitate},
   };
   return g;
 }

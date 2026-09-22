@@ -71,6 +71,26 @@ inline ImU32 ColChar()     { return IM_COL32(56, 48, 48, 255); }
 inline ImU32 ColMana()     { return IM_COL32(76, 132, 200, 255); }
 inline ImU32 ColSteel()    { return IM_COL32(120, 132, 160, 255); }
 
+// ---- THE LEAF (2026-09-22) -------------------------------------------------
+// The spell page is not chrome: it is a sheet of VELLUM laid in the book, and
+// the diagram on it is drawn the way a 12th-century quadrivium manuscript
+// draws one - iron-gall brown for the figure, a rubricator's vermilion for
+// what matters, and the earth pigments an illuminator actually had for the
+// rest. Everything else on the character screen stays obsidian and gold: the
+// book is the binding, this is the page inside it, and the contrast between
+// them is the point.
+inline ImU32 ColVellum()    { return IM_COL32(197, 179, 145, 255); }  // the leaf
+inline ImU32 ColVellumHi()  { return IM_COL32(216, 201, 170, 255); }  // lit
+inline ImU32 ColVellumLo()  { return IM_COL32(163, 145, 113, 255); }  // rubbed
+inline ImU32 ColIronGall()  { return IM_COL32(46, 35, 26, 255); }     // the ink
+inline ImU32 ColIronSoft()  { return IM_COL32(96, 78, 56, 255); }     // its bleed
+inline ImU32 ColRubric()    { return IM_COL32(174, 66, 32, 255); }    // vermilion
+inline ImU32 ColRubricHi()  { return IM_COL32(208, 104, 48, 255); }   // minium
+inline ImU32 ColVerdigris() { return IM_COL32(62, 100, 74, 255); }    // matter
+inline ImU32 ColAzurite()   { return IM_COL32(44, 74, 126, 255); }    // delivery
+inline ImU32 ColOrpiment()  { return IM_COL32(140, 104, 36, 255); }   // mod
+
+
 // Colour arithmetic every panel needs. `Fade` scales the alpha; `Mix` lerps
 // all four channels.
 ImU32 Fade(ImU32 c, float a);
@@ -137,6 +157,12 @@ ImVec2 DrawSprite(ImDrawList* dl, const char* key, ImVec2 at,
 // Same, centred on `c`.
 void DrawSpriteCentered(ImDrawList* dl, const char* key, ImVec2 c,
                         ImU32 tint = IM_COL32_WHITE);
+
+// Same, at a whole multiple of kChromeScale picked from `mul` (0.5 -> the
+// sprite's authored 1x, 1.0 -> 2x, ...). What a surface drawn at a rung other
+// than 1x needs so its engravings shrink with it.
+void DrawSpriteCenteredAt(ImDrawList* dl, const char* key, ImVec2 c, float mul,
+                          ImU32 tint = IM_COL32_WHITE);
 
 // ---- surfaces --------------------------------------------------------------
 //
@@ -224,20 +250,70 @@ void BeginTip();
 void EndTip();
 void Tip(const char* text);
 
-// ---- the calligraphic stroke (PLAN_spell_graph §4) --------------------------
+// ---- the quill stroke (PLAN_spell_graph) ------------------------------------
 //
 // A cubic from `from` to `to` with the control points straight DOWN out of the
-// child and straight UP into the parent, flattened to ~12 segments and drawn as
-// a polyline WITHOUT anti-aliasing. Its width follows a brush profile — thin at
-// the tip, full at the belly, thin into the join — with every segment's width
-// quantised to a whole 2 px step, which is what makes it read as a calligraphic
-// stroke drawn with a pixel brush rather than as a vector spline.
+// child and straight UP into the parent, flattened and drawn as a RIBBON - a
+// strip of quads whose half-width follows a nib profile, thin at the tip, full
+// at the belly, thin into the join.
 //
-// `weight` is the belly width in screen pixels; anything under 2 draws as one
-// 2 px step, because a 1 px line beside 2x chrome is the one thing that says
-// "different program". The anti-aliasing flag is pushed off and restored here,
-// so the call site cannot forget.
+// IT USED TO BE A POLYLINE OF THICK SEGMENTS, and that is exactly what made it
+// look janky: `AddLine` with a 6 px width draws each segment as its own
+// unjoined rectangle, so every bend in the curve opened a notch on the outside
+// and doubled the ink on the inside, and quantising each segment's width to a
+// 2 px step turned the taper into a visible staircase of loose blocks. A
+// ribbon has no joins to open: consecutive quads share their two end vertices,
+// so the edge is continuous however hard the curve turns.
+//
+// AND IT WOBBLES. A quill held by a hand does not draw a mathematical cubic;
+// the stroke is displaced along its own normal by a couple of pixels of
+// deterministic tremor (seeded from the endpoints, so the same edge wobbles
+// the same way every frame), and laid down twice - a wider, paler pass that
+// reads as ink bleeding into the fibre, then the core over it. That, and not
+// the curve, is what makes it read as drawn.
 void InkStroke(ImDrawList* dl, ImVec2 from, ImVec2 to, ImU32 col, float weight);
+
+// ---- the sheet -------------------------------------------------------------
+//
+// A leaf of vellum filling [a,b): the warm base, the light falling from the
+// top-left, the rubbed edges, the fibre. Everything else drawn on a page -
+// the ruling, the marginalia, the figure - is the caller's, because it
+// belongs in the page's own coordinates and this does not.
+void VellumSheet(ImDrawList* dl, ImVec2 a, ImVec2 b);
+// The book's window onto it: the shadow of the binding round the opening and
+// a gold edge down the gutter. Drawn last, over everything on the sheet.
+void VellumFrame(ImDrawList* dl, ImVec2 a, ImVec2 b);
+// A rubricated VERSAL: the big coloured initial a scribe opens a passage with,
+// in a ruled box with corner serifs. Returns the box's width.
+float Versal(ImDrawList* dl, ImVec2 at, char letter, float size);
+
+// ---- compass-and-rule figures (the manuscript's own vocabulary) -------------
+//
+// A diagram in a book like this is drawn with a compass and a straight edge,
+// and every one of these is one of those two instruments. They are PIXEL
+// figures, not vector ones: every sample is snapped to the same 2 px lattice
+// the rest of the chrome lives on, so a circle here is a stepped circle drawn
+// by the same hand that drew the 9-slice frames - not an anti-aliased curve
+// sitting beside them saying "different program".
+
+// An arc of radius `r` about `c`, from `a0` to `a1` radians (y down, 0 = +x),
+// `thick` px of ink. Sampled at roughly one step per pixel of arc length and
+// de-duplicated, so the cost is the arc's length and not the caller's guess.
+void PixelArc(ImDrawList* dl, ImVec2 c, float r, float a0, float a1, ImU32 col,
+              float thick);
+// The whole circle.
+void PixelRing(ImDrawList* dl, ImVec2 c, float r, ImU32 col, float thick);
+// Filled, row by row: the wash inside a roundel.
+void PixelDisc(ImDrawList* dl, ImVec2 c, float r, ImU32 col);
+// A straight edge in dots rather than in line: the ruling a scribe pricks out
+// before writing, and the marginal dots down a manuscript's gutter.
+void DottedRule(ImDrawList* dl, ImVec2 a, ImVec2 b, ImU32 col, float step,
+                float dot);
+// A lozenge (a diamond on its point) inscribed in [c-r, c+r]: a bead on a
+// trunk, a junction on a bus.
+void PixelLozenge(ImDrawList* dl, ImVec2 c, float r, ImU32 col, bool filled,
+                  float thick);
+
 
 // The little key cap in a slot corner ("1".."0").
 void KeyBadge(ImDrawList* dl, ImVec2 at, const char* key);

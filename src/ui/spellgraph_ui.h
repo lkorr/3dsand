@@ -51,6 +51,18 @@ ImU32 SortColour(int sort);
 // The sort's name, as the grammar spells it.
 const char* SortLabel(int sort);
 
+// THE SAME FIGURE, ANYWHERE ON THE PAGE. The canvas draws a word as a roundel
+// - a wash of the glyph's own colour under two ruled rings and the sort's
+// engraving - and the spoken row under the canvas is on the same sheet, so it
+// draws the same figure at its own size. One picture for one word, wherever it
+// is written. `mul` is the rung the caller is drawing at (0.5 = the sprite's
+// authored size); `dim` is a word that is written but does nothing.
+void GlyphRoundel(ImDrawList* dl, ImVec2 a, ImVec2 b, uint32_t color, int sort,
+                  float mul, bool dim);
+// The reader's bracket: what a page says instead of a glow, because light does
+// not come out of ink.
+void PageHover(ImDrawList* dl, ImVec2 a, ImVec2 b);
+
 // THE INFO BOX (PLAN_magic_grammar §9). Every field is read from the glyph's
 // JSON entry through the mirror, so the box is never wrong about the glyph and
 // a modder's glyph gets one for free. Shared: the arsenal table, the word row

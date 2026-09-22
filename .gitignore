@@ -54,3 +54,5 @@ docs/refs/*/
 
 # --shot-strike frames, kept on disk for a human eye, never in the tree
 shots/
+shot_*.bmp
+shot_*.png

@@ -2082,6 +2082,27 @@ class Mob {
   // ground" branch zeroing the very velocity that put the body there.
   void Launch(Vec3 vel);
   bool Launched() const { return launched_; }
+  // ---- A SUSTAINED LIFT: what `float aura` does to a body that is NOT the
+  // caster (spell.h `SpellBodyImpulse`, 2026-09-22) ------------------------
+  //
+  // `vps` is the per-tick velocity change the status asks for, world
+  // voxels/sec, exactly the number the player's own controller adds to
+  // `player.vel`. The owner routes it here because the spell VM cannot reach a
+  // body (spell.h thesis 4) and because "add a velocity" means two different
+  // things to this class:
+  //
+  //   LIMP  the rig is Jolt's, so it is an impulse at each live limb's centre
+  //         of mass (mass x dv, so every limb gains the same speed and the
+  //         joints are not yanked; at the COM, so a lift does not spin it).
+  //   LIVE  the rig is ours, so it goes into the ballistic state `UpdateFall`
+  //         integrates - the same one `Launch` fills.
+  //
+  // A LIFT IS NOT A FALL, and that is the whole reason this is not `Launch`:
+  // it must not land the body on the ground it is rising off (the `launched_`
+  // latch) and it must not go limp after `ragdoll.fallSeconds` of being held
+  // up (`airTime_`). Both are reset only for an UPWARD lift, so `heavy aura`
+  // still drives a body down onto the floor and stops there.
+  void AddLift(Vec3 velVoxPerSec);
   Vec3 AirVelocity() const { return airVel_; }
   // Off the ground at all — walked off a ledge, blasted, or lunging. Public so
   // the `lunge` gate can state "it left the ground" as the fact it is rather
@@ -4479,6 +4500,19 @@ class MobSystem {
     worstSeverLimb_.clear();
   }
   Vec3 MobOrigin(uint64_t mobId) const;
+  // THE BODY'S BOX in world voxels (min corner, max corner) - `origin_` plus
+  // the def's `worldSize`. `MobOrigin` alone is the collider's MIN CORNER in
+  // x/z and its FEET in y, so a distance measured to it is a distance to the
+  // ground between a creature's ankles: that is what made `float aura
+  // projectile` do nothing to an enemy (session.cpp's status probe looked for
+  // a body within ~3 voxels of the point a bolt resolved at, which for a hit
+  // anywhere above the shins is no body at all). Ask for the box and measure
+  // to that.
+  bool MobBodyBox(uint64_t mobId, Vec3& lo, Vec3& hi) const;
+  // Per-tick sustained lift on one body by id (Mob::AddLift). False if no mob
+  // has that id - which is how the owner tells a mob impulse from the
+  // player's own.
+  bool LiftMob(uint64_t mobId, Vec3 velVoxPerSec);
   // The mob's facing direction — the SAME `fwd` the kinematic walk translates
   // along and the same yaw the limb submit applies, so a test written against
   // this cannot drift from the convention. A mob must move along +facing; if a

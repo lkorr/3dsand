@@ -694,6 +694,10 @@ const char* const kOrder[] = {
     // against the rig's own idle wobble — so it goes where nothing else can
     // leave a body standing in its fixture.
     "hit-react",
+    // ...and `levitate` after it, by that same rule: it spawns TWO creatures
+    // and lays one of them down, so it is the most disturbing member of the
+    // group rather than the most easily disturbed.
+    "levitate",
     // ---- THE SNAPSHOT LATENCY IS A CONSTANT (PLAN_multiplayer_now N1) ----
     // As late as it can go, by the rule the `floaters` block above spells out.
     // It regenerates worldgen three times (once per pacing arm and once on the

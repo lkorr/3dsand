@@ -415,11 +415,26 @@ Status GateSpellGraph(Ctx& c, std::string& detail) {
     }
   }
 
-  // ---- 4. a lane opens one at a time, and a refusal has a reason --------------
+  // ---- 4. a far lane opens the ones between, and a refusal has a reason -------
   {
     const SpellTree t = EmptyTree();
+    // EVERY SOCKET IS A TARGET (2026-09-21). Lanes used to open strictly one at
+    // a time, which is right when the sockets ARE the lanes — but a count mod
+    // gives a box more instances than lanes, so two of `shotgun`'s three
+    // sockets refused every drop. The lanes in between open EMPTY, which is
+    // what those instances already were, so nothing about the cast moves.
     const EditResult far = InsertItem(lib, t, 0, 3, lib.Find("fire"));
-    check(!far.ok && !far.why.empty(), "lane 3 on a laneless box is refused: '" + far.why + "'");
+    check(far.ok, "lane 3 on a laneless box opens the two before it: '" + far.why + "'");
+    if (far.ok) {
+      const SpellTree ft = ParseWords(lib, far.words);
+      const int fr = ft.clauses.empty() ? -1 : ft.clauses[0].root;
+      check(fr >= 0 && (int)ft.nodes[(size_t)fr].laneAt.size() / 2 == 3,
+            "...and the box has three lanes: [" + Join(far.words) + "]");
+    }
+    const EditResult past =
+        InsertItem(lib, t, 0, lib.budgets.maxInstances + 1, lib.Find("fire"));
+    check(!past.ok && !past.why.empty(),
+          "a lane past the instance cap is still refused: '" + past.why + "'");
     const EditResult mark = InsertItem(lib, t, 0, 0, lib.Find("lane"));
     check(!mark.ok && !mark.why.empty(), "`lane` is not an item: '" + mark.why + "'");
     const EditResult gone = InsertItem(lib, t, 0, 0, 4242);
@@ -435,6 +450,95 @@ Status GateSpellGraph(Ctx& c, std::string& detail) {
     const EditResult over = AttachMod(lib, fan, fan.clauses[0].root, 0, lib.Find("shotgun"));
     check(!over.ok || over.words.size() >= 4,
           "a fan past the instance cap is refused or stays within it: '" + over.why + "'");
+  }
+
+  // ---- 4b. THE SHOTGUN SOCKET WALK ---------------------------------------------
+  //
+  // The gesture the player actually makes, end to end, because two separate
+  // defects lived in exactly this shape until 2026-09-21 and the fuzz above
+  // reached neither:
+  //
+  //   * `shotgun` gives the bolt THREE sockets over ZERO lanes, and only the
+  //     socket for instance 0 took a drop. Instance 0 is the aim and the aim is
+  //     drawn in the MIDDLE of the row, so the working order was middle, right,
+  //     left, and nothing in the drawing said so.
+  //   * A mod that did land was stripped into the box's shared bead row
+  //     REGARDLESS of its lane, so two mods on two different instances drew as
+  //     one indistinguishable centred row.
+  //
+  // So: drop `heavy` on the LEFT socket first (instance 2, the one that always
+  // refused), then the middle, then the right; all three must land, and each
+  // bead must end up drawn inside the column of the socket it edits.
+  {
+    const int32_t order[3] = {2, 0, 1};
+    std::vector<std::string> words = Split("fire shotgun projectile");
+    bool walkOk = true;
+    std::string why;
+    auto barOf = [&](const SpellGraph& sg) {
+      int bar = -1;
+      for (size_t i = 0; i < sg.nodes.size(); i++)
+        if (sg.nodes[i].kind == GraphKind::Join) bar = (int)i;
+      return bar;
+    };
+    for (int step = 0; step < 3 && walkOk; step++) {
+      const CastList cl = LowerSpell(lib, ParseWords(lib, words));
+      const SpellGraph sg = BuildGraph(lib, cl);
+      const int bar = barOf(sg);
+      if (bar < 0 || sg.nodes[(size_t)bar].sockets.size() != 3) {
+        walkOk = false;
+        why = "the bolt does not have three sockets";
+        break;
+      }
+      // Exactly what the canvas computes for a socket drop.
+      const SpellGraphNode& sk =
+          sg.nodes[(size_t)sg.nodes[(size_t)bar].sockets[(size_t)order[step]]];
+      const int32_t lane = sk.lane > 0 ? sk.lane : sk.instance + 1;
+      const EditResult r =
+          AttachMod(lib, cl.tree, sg.nodes[(size_t)bar].treeNode, lane, lib.Find("heavy"));
+      if (!r.ok) {
+        walkOk = false;
+        why = "socket for instance " + std::to_string(order[step]) + ": " + r.why;
+        break;
+      }
+      words = r.words;
+    }
+    check(walkOk, "a mod lands on all three shotgun sockets, left one first (" + why + ")");
+    if (walkOk) {
+      const CastList cl = LowerSpell(lib, ParseWords(lib, words));
+      const SpellGraph sg = BuildGraph(lib, cl);
+      const int bar = barOf(sg);
+      int over = 0;
+      if (bar >= 0)
+        for (int si : sg.nodes[(size_t)bar].sockets) {
+          const SpellGraphNode& sk = sg.nodes[(size_t)si];
+          for (const SpellGraphNode& n : sg.nodes)
+            // BELOW the socket, not above it: since the inversion a spoken
+            // delivery's stack runs items / bus / lane items / lane beads /
+            // sockets / bar upward, so a lane's bead is on the neck UNDER the
+            // socket it edits.
+            if (n.kind == GraphKind::ModTag && n.instance == sk.instance &&
+                n.layer < sk.layer && n.x >= sk.x && n.x + n.w <= sk.x + sk.w)
+              over++;
+        }
+      check(over == 3, Format("%d of 3 lane beads are drawn over the socket they edit "
+                              "in [%s]", over, Join(words).c_str()));
+    }
+    // ...and `shotgun` itself is NEVER a lane's bead, however it was spoken:
+    // count is record-wide (spell.cpp's LowerBox applies it before the lanes
+    // copy the record), so a bead over one socket would be a lie.
+    {
+      const CastList cl = LowerSpell(lib, ParseWords(lib, Split("fire lane shotgun end projectile")));
+      const SpellGraph sg = BuildGraph(lib, cl);
+      int wide = 0, perLane = 0;
+      for (const SpellGraphNode& n : sg.nodes) {
+        if (n.kind != GraphKind::ModTag || n.label != "shotgun") continue;
+        if (n.instance < 0) wide++;
+        else perLane++;
+      }
+      check(wide >= 1 && perLane == 0,
+            Format("`shotgun` spoken inside a lane draws record-wide (%d wide, %d per-lane)",
+                   wide, perLane));
+    }
   }
 
   // ---- 5. every op is total, over generated cases -----------------------------
@@ -478,6 +582,11 @@ Status GateSpellGraph(Ctx& c, std::string& detail) {
                            InsertItem(lib, t, ni, (int32_t)t.nodes[ni].laneAt.size() / 2 + 1,
                                       drop)});
           cases.push_back({"AttachMod", AttachMod(lib, t, ni, 0, drop)});
+          // A mod on a lane PAST the last one, which is the socket gesture on a
+          // count-modded box and the one shape the fuzz never reached.
+          cases.push_back({"AttachMod/far-lane",
+                           AttachMod(lib, t, ni,
+                                     (int32_t)t.nodes[ni].laneAt.size() / 2 + 2, drop)});
           cases.push_back({"Unbox", Unbox(lib, t, ni)});
         }
         if (grp) {
@@ -537,6 +646,80 @@ Status GateSpellGraph(Ctx& c, std::string& detail) {
         Format("the op fuzz exercised both paths (%d ok, %d refused)", opOk, opRefused));
 
   // ---- 6. layout sanity ---------------------------------------------------------
+  //
+  // THE DRAWING READS IN WORD ORDER, BOTTOM TO TOP (2026-09-21). You type
+  // `fire projectile`, so `fire` is the lower cell and PROJECTILE stands over
+  // it; the implicit `hand` is the one delivery nobody speaks, so it is the
+  // pedestal underneath both. Until this day the stack was driven by
+  // CONTAINMENT and drew the same sentence exactly upside down.
+  {
+    const CastList cl = LowerSpell(lib, ParseWords(lib, Split("fire projectile")));
+    const SpellGraph sg = BuildGraph(lib, cl);
+    int hand = -1, proj = -1, fire = -1;
+    for (size_t i = 0; i < sg.nodes.size(); i++) {
+      const SpellGraphNode& gn = sg.nodes[i];
+      if (gn.kind == GraphKind::Root) hand = (int)i;
+      else if (gn.kind == GraphKind::Join) proj = (int)i;
+      else if (gn.kind == GraphKind::Word && gn.label == "fire") fire = (int)i;
+    }
+    // y grows DOWNWARD, so "lower on the page" is a larger y.
+    const bool order = hand >= 0 && proj >= 0 && fire >= 0 &&
+                       sg.nodes[(size_t)hand].y > sg.nodes[(size_t)fire].y &&
+                       sg.nodes[(size_t)fire].y > sg.nodes[(size_t)proj].y;
+    check(order, Format("`fire projectile` stacks hand / fire / PROJECTILE upward "
+                        "(y %d / %d / %d)",
+                        hand >= 0 ? sg.nodes[(size_t)hand].y : -1,
+                        fire >= 0 ? sg.nodes[(size_t)fire].y : -1,
+                        proj >= 0 ? sg.nodes[(size_t)proj].y : -1));
+    // ...and the box hands off to the hand from the FOOT of its own span, not
+    // from its cell at the top: `baseLayer` is what keeps that one edge from
+    // falling through every cell the box contains.
+    check(proj < 0 || fire < 0 ||
+              sg.nodes[(size_t)proj].baseLayer <= sg.nodes[(size_t)fire].layer,
+          "the projectile box hands off from the bottom of its span");
+    // The delivery cell is a CELL, the size of a word, not a slab.
+    check(proj < 0 || (sg.nodes[(size_t)proj].w == kGraphCell &&
+                       sg.nodes[(size_t)proj].h == kGraphCell),
+          Format("a delivery is a %dx%d cell",
+                 proj >= 0 ? sg.nodes[(size_t)proj].w : -1,
+                 proj >= 0 ? sg.nodes[(size_t)proj].h : -1));
+  }
+  // A GROUP WHOSE RESULT IS A MOD IS STILL A GROUP (2026-09-22). `fire trail`
+  // is one operator with `fire` in its left slot; because its result sort is
+  // `mod` it used to be flattened into a bead on the trunk and its operand was
+  // never placed, so the page drew `fire trail projectile` as a tag and a
+  // socket fan meeting at the bar - two strokes, and no `fire`. The line has to
+  // run fire -> trail -> the trunk, with one stroke out of each.
+  {
+    const CastList cl = LowerSpell(lib, ParseWords(lib, Split("fire trail projectile")));
+    const SpellGraph sg = BuildGraph(lib, cl);
+    int fire = -1, trail = -1, beads = 0;
+    for (size_t i = 0; i < sg.nodes.size(); i++) {
+      const SpellGraphNode& n = sg.nodes[i];
+      if (n.label == "trail") {
+        if (n.kind == GraphKind::ModTag) beads++;
+        else trail = (int)i;
+      } else if (n.kind == GraphKind::Word && n.label == "fire") {
+        fire = (int)i;
+      }
+    }
+    int slotIn = 0, outOfFire = 0, outOfTrail = 0;
+    for (const SpellGraphEdge& e : sg.edges) {
+      if (e.from == fire) outOfFire++;
+      if (e.from == trail) outOfTrail++;
+      if (e.from == fire && e.to == trail && e.kind == GraphEdge::Slot) slotIn++;
+    }
+    check(fire >= 0 && trail >= 0 && beads == 0,
+          Format("`fire trail projectile` draws fire and a trail CELL, not a bead "
+                 "(fire %d, trail %d, %d beads)", fire, trail, beads));
+    check(slotIn == 1 && outOfFire == 1 && outOfTrail == 1,
+          Format("fire -> trail -> the trunk is one line (%d slot strokes, %d out of "
+                 "fire, %d out of trail)", slotIn, outOfFire, outOfTrail));
+    // ...and it stands UNDER its operator, which is where the word it fills the
+    // slot with is spoken.
+    check(fire < 0 || trail < 0 || sg.nodes[(size_t)fire].y > sg.nodes[(size_t)trail].y,
+          "the operand sits under the operator cell it fills");
+  }
   int graphs = 0, gnodes = 0;
   {
     int overlap = 0, outside = 0, sockets = 0, lanes = 0, rooty = 0;
@@ -570,7 +753,7 @@ Status GateSpellGraph(Ctx& c, std::string& detail) {
       }
       // Every child sits inside its parent's SUBTREE span -- the cell is not
       // the span: an operator cell is narrower than the row of operands above
-      // it, and a bar does not cover the mod tags hanging off its left end.
+      // it, and a bar is narrower than a mod bead row wider than the bar.
       std::map<int, int> socketEdges;
       for (const SpellGraphEdge& e : g.edges) {
         const SpellGraphNode& ch = g.nodes[(size_t)e.from];

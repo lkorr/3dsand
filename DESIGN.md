@@ -6183,9 +6183,26 @@ health; when neither pays, `DropAll`), or at the hard tick cap
 (`budgets.maxStatusTicks`); a caster may hold `maxStatusPerCaster` at once
 and the aura beyond it is charged and attaches nothing (rule 2). A sustained
 Mod acts on the body as if the body were the delivery: gravity is a per-tick
-impulse the owner applies (`bodyImpulses`; the player's controller today,
-mobs have no impulse seam yet), the rest have no meaning on a body and were
-charged for the word.
+impulse the owner applies (`bodyImpulses`), the rest have no meaning on a body
+and were charged for the word. **The impulse reaches ANY body since
+2026-09-22** — `Mob::AddLift` is the mobs' seam, and it is two seams behind one
+name, because "add a velocity" means two different things to a creature: a LIMP
+rig belongs to Jolt (an impulse at each live limb's centre of mass, mass × dv,
+so the rig gains one uniform speed and a lift does not spin it) and a LIVE one
+belongs to us (the ballistic state `UpdateFall` integrates, the same one
+`Launch` fills). A lift is not a fall: an UPWARD one holds the `launched_`
+latch so the body does not land on the ground it is leaving, and keeps
+`airTime_` at zero so it does not go limp for having been held up past
+`ragdoll.fallSeconds`. A downward one (`heavy aura`) does neither, so it still
+lands. **And the status has to FIND the body first:** `bodyIdAt` measures to
+the body's BOX (`MobSystem::MobBodyBox`), not to `MobOrigin` — which is the
+collider's min corner in x/z and the FEET in y, i.e. ~9 voxels under a human's
+chest, while a bare mod's attach radius is 3. Measured to the origin, a bolt
+that struck a body found no body, the status fell back to being a PLACE, and a
+sustained mod on a place does nothing at all: `float aura` worked on the caster
+and silently failed on everything else. Gate: `--gate levitate` (box height,
+chest-to-origin vs chest-to-box, and a lifted-vs-idle differential on a live
+body and a limp one).
 
 **`null` is the op-stream filter, at the MutationQueue splice.** `W null`
 yields a filter entry (one tick, unless an aura re-issues it every tick) that
@@ -6611,6 +6628,105 @@ as the tallest node in it rather than a uniform pitch — a bus is 16 px and a
 uniform grid spent a 64 px band on it twice in every spell that shares anything
 (`duststorm-mine`: six layers, 252 px uniform and clipped, 198 px per-layer and
 whole).
+
+**THE BOOK OPENS AS A SPREAD OF VELLUM (2026-09-22; `ui/theme.*`,
+`ui/spellgraph_ui.cpp`).** The spell page is no longer chrome: it is a LEAF,
+and the drawing on it is an illuminated quadrivium diagram - iron-gall brown
+for the figure, a rubricator's vermilion for what governs it, and the earth
+pigments an illuminator had (verdigris / azurite / orpiment) for the five
+sorts, all of them new `Col*` entries beside the obsidian-and-gold family
+rather than replacing it. The binding stays dark; the page inside it does not.
+Three columns are on the same stock and read as one open book: the INDEX of
+pages (the verso, each name on a ruled red line with a marker at its place),
+the DIAGRAM (the recto), and under both the COLOPHON - what the page means,
+opened by a rubricated `ui::Versal`, the initial changing with the page. The
+spoken row and the price band between them are on the same sheet, and a word in
+the row is the same roundel the canvas draws, at the row's size
+(`ui::GlyphRoundel`).
+
+**THE GROUND IS DRAWN IN PAGE COORDINATES, which is the whole point.** The
+recess was painted in window coordinates with the tree sliding over it; a page
+is the opposite - what a drag moves is the SHEET. So `PaintLeaf` runs after the
+rung and the pan are resolved and draws everything in the drawing's own space:
+the ruling on the layout's 32 px module, the pricked margins, the foxing (one
+decision per 96 px page cell, hashed on the cell so a blemish belongs to the
+sheet), and the GREAT FIGURE - concentric rings, twelve ticked houses, two
+lesser circles in proportion - behind the tree. A pan moves all of it together,
+which is both the manuscript's look and the only landmark a pan has to move
+against.
+
+**THE VOCABULARY IS COMPASS AND RULE.** `PixelArc` / `PixelRing` / `PixelDisc`
+/ `PixelLozenge` / `DottedRule` in `ui/theme.*` draw stepped figures on the same
+2 px lattice as the rest of the chrome. A word is a ROUNDEL (wash of the glyph's
+own colour, the sort's pigment on the rim, the engraving in ink), an operator a
+TABLET with bracket serifs, a delivery a DOUBLE RING (the hand a triple one with
+twelve ticks), a mod a LOZENGE threaded on the trunk, a socket a pricked POINT
+(a donut, because a 2 px ring at r=4 quantises to a diamond), the bus a ruled
+line in minium closed by serifs. Hover is the reader's bracket, an accept is a
+pricked ring, a refusal is the corrector's hatching - a page has no backlight,
+so nothing here is said with a glow.
+
+**`ui::InkStroke` became a RIBBON.** It was a polyline of thick `AddLine`
+segments, which is why it looked broken: an unjoined 6 px segment opens a notch
+on the outside of every bend and doubles the ink on the inside, and quantising
+each segment's width to a 2 px step turned the taper into a staircase. It is a
+quad strip now - consecutive quads share their end vertices, so the edge is
+continuous however hard the curve turns - with a nib profile, a deterministic
+tremor along the normal seeded from the endpoints (a wobble reseeded per frame
+is a stroke that CRAWLS), a paler wider pass under it for the bleed into the
+fibre, and a blot where it leaves its parent. The tremor is a fraction of the
+stroke's LENGTH and a short stroke has none: the page is full of 10 px hops
+from a pip to its bus, and a fixed 2 px wobble made every one of them a
+squiggle.
+
+**IT FITS NOW, AND WHEN IT CANNOT IT SAYS SO.** Two-thirds of the drawing's
+height was furniture: a socket row (32) and a bus (16) were each given a band
+and a full gap, so `fire projectile` - the smallest spell there is - came to
+216 px in a band of 192 and was CUT at both ends, as was almost every page in
+the gallery. Bands are per-layer and squashed (a bus is a rule, a pip row is
+pips), furniture TOUCHES what it belongs to at the fit rungs and opens up from
+1x where you have zoomed in to read, and the fit may fall to the 0.25x overview
+rung rather than clip. That rung draws a DIFFERENT figure - a filled disc in
+the sort's pigment, no engraving, no tally, a solid bead - because at 16 px a
+wash, two rings and a 16 px sprite are four pictures in nine pixels. What still
+overflows fades into the binding's shadow with a pricked chevron pointing that
+way, instead of being sliced.
+
+**THE BOOK IS SHUT UNTIL YOU OPEN IT (2026-09-22; `UIState::spellbookOpen`).**
+The character screen is two things at once - a place you take stock (body,
+gear, pack) and a place you WRITE - and the second wants every pixel on the
+screen while the first wants none of them. So the spellbook lies CLOSED by
+default: a spine across the top of its column carrying the header, the ten
+BOUND keys (the only part of the book that matters while you are looking at
+something else - they are literally the number row the game is listening to)
+and an invitation. The whole cover is the button, not just the 96 px one on
+the header bar.
+
+Open, it takes the WHOLE column - full width (`bookRoom`, not the ideal width
+it is clamped to when shut) and top to bottom - and **the pack is not drawn at
+all**, which is what "the book covers the desk" means: a panel that is not
+drawn has no slots. Measured on a 1600x900 screen, the canvas goes from ~200 px
+to ~430, which is the difference between a five-word spell at the 0.5x fit and
+the same spell at 1x with its engravings legible. Shut, the pack takes the room
+back and shows every row it has, sized to its content rather than stretched to
+the bottom rule.
+
+Two things the shut book changed elsewhere, both structural: a CORPSE is
+measured against the column rather than against the book's rect (a loot panel
+clamped to a 190 px spine loses every row past the second), and the pack is
+placed under whatever the column above it actually came to (`colBottom`) rather
+than under `top + bookH`, because a corpse now STACKS on top of a shut book -
+the spine is short enough to survive beside one, so your bound keys stay on
+screen while you loot. The spell-graph mirror is built only while the book is
+open: shut, nothing reads it, and it is a parse and a lowering per frame.
+
+**`--shot-spellpage` is the gallery** (`main.cpp`): the composer, ten word
+lists chosen to put a different piece of the drawing under the lens (a minimal
+tree, the shipped example, an operator with a hole in it, nesting, lanes, a
+nine-socket fan, eighteen words that cannot fit, an empty page) and two shot at
+a DRIVEN view - panned and at 1x - because the ground moving with the drawing is
+a claim only a picture of it moved can make. One BMP per scene,
+`shot_spell_<scene>.bmp`, in one boot.
 
 Selftest gates `spells` (the trail's voxel budget respected exactly and the
 projectile dead with it; an overcast resolving Fatal, emitting its own payload

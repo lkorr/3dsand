@@ -630,6 +630,13 @@ struct UIState {
     uint32_t voxelBone = 0;
     uint32_t voxelBrain = 0;
     uint32_t voxelBrainMax = 0;  // brain voxels at spawn (for "X missing")
+    // Tissue a bite has already turned (materials tagged `infectious`, i.e.
+    // rotflesh). It is counted in voxelTotal like any other tissue, so it does
+    // NOT move voxelFrac — rot is a limb being the wrong thing, not a limb
+    // being smaller, and only the rot that eventually deletes voxels hollows
+    // it out. A separate number because it is the only tissue count that goes
+    // UP when things get worse.
+    uint32_t voxelRot = 0;
     // WHERE THE LIMB IS ON THE PORTRAIT, so the inspector can outline it.
     // Normalized to the portrait frame: (0,0) top-left, (1,1) bottom-right,
     // as the screen-space bounds of the limb's projected oriented box.
@@ -834,6 +841,8 @@ struct UIState {
     std::string example;
     std::string delivers; // which deliveries carry it
     std::string emptyNote;// "left empty: _" for operators
+    bool recordWide = false;  // a Mod whose field is `count`: edits the whole
+                              // record wherever it is spoken, lane or not
   };
   std::vector<GlyphUI> glyphsOwned;   // EVERY glyph, `owned` says which
   // ---- the grimoire (plan §12b) --------------------------------------------
@@ -852,6 +861,14 @@ struct UIState {
   // and price for the row every frame through the same DescribeSpell the live
   // sentence uses, so the panel can never disagree with the game.
   bool grimoireMode = false;                // vestigial: the old arsenal/grimoire toggle
+  // THE BOOK IS SHUT UNTIL YOU OPEN IT (2026-09-22). The character screen is
+  // two things at once: a place you take stock (body, gear, pack) and a place
+  // you WRITE (the spell page). The second wants every pixel on the screen and
+  // the first wants none of them, so the book lies closed on the desk - its
+  // spine, and the ten keys you actually cast with - and opening it takes the
+  // whole column, pack and all. Closed is the default because opening the
+  // character screen is usually about the body.
+  bool spellbookOpen = false;
   // THE SPELLBOOK'S LOWER HALF. The grimoire and the arsenal are one panel
   // (2026-09-21); this folds the EVERY WORD table away and leaves the bound
   // keys, which is the trade a short screen wants — the table is a reference
@@ -897,6 +914,11 @@ struct UIState {
       int lane = 0;
       int x = 0, y = 0, w = 0, h = 0;
       int layer = 0;
+      // The LOWEST layer this node's subtree occupies, which is the band its
+      // edge into its parent leaves from (SpellGraphNode::baseLayer). Equal to
+      // `layer` for everything a single band tall; lower on a spoken delivery,
+      // whose bar is the top of its own span.
+      int baseLayer = 0;
       int subX = 0, subW = 0;
       // Operator
       bool hasLeft = false, hasRight = false;
@@ -908,7 +930,6 @@ struct UIState {
       int instances = 1, laneCount = 0;
       std::vector<int> sockets;
       int bus = -1;
-      int tagStripW = 0;
       bool hasPrice = false;
       int wordCost = 0, tariff = 0, carryCost = 0, priceInstances = 1, leaves = 1;
       bool instancesClamped = false;
@@ -938,6 +959,22 @@ struct UIState {
     std::string expandedNote;
   };
   SpellGraphUI spellGraph;
+  // THE CANVAS'S VIEW (2026-09-22): drag to pan, wheel to zoom. UI-owned and
+  // persistent across frames, because a view is a thing you SET and then work
+  // in — it must survive the composer resizing under it, a word being typed,
+  // and the page's shape changing.
+  //
+  // `spellGraphZoom` is 0 for AUTO: the fit-or-halve rule the canvas always
+  // had, re-decided every frame, with the drawing centred and the pan ignored.
+  // Any other value is an explicit scale off the ladder in spellgraph_ui.cpp,
+  // set by the wheel, and it is the only state that turns the pan on. A
+  // double-click on the canvas's background puts it back to 0.
+  //
+  // THE LADDER IS THE PIXEL-ART RULE. Only 0.5 and whole numbers are ever
+  // stored here: a 2x sprite at 0.5x is its authored size and at 2x/3x/4x is
+  // whole pixels, and anything between would put chrome on half a pixel.
+  float spellGraphZoom = 0.0f;
+  float spellGraphPanX = 0.0f, spellGraphPanY = 0.0f;
   // `glyphSlots` above is already the bound strip (slot -> glyph id) and IS
   // the arsenal's bottom row — the panel and the live hotkeys read one mirror,
   // which is what makes binding in the panel provably the same thing as the

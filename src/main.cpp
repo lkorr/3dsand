@@ -219,6 +219,81 @@ constexpr uint64_t kShotInvDeathShot = 350;      // -> ..._death.bmp
 constexpr uint64_t kShotInvDeathTurnAt = 360;    // orbit ~80 degrees
 constexpr uint64_t kShotInvDeathTurnShot = 420;  // -> ..._death_turn.bmp; last
 
+// ---- --shot-spellpage: the SPELL PAGE's own look-iteration harness ---------
+//
+// `--shot-inventory` photographs the spell page once, on one five-word page.
+// One picture of one tree cannot say whether a stroke overlaps a cell, whether
+// a fan of nine sockets collides with its neighbour, or what a page too tall
+// for the band looks like when the fit gives up - and those are exactly the
+// questions a look pass asks. So this is the GALLERY: the same composer, the
+// same canvas, and one BMP per scene, each scene a word list chosen to put a
+// different piece of the drawing under the lens.
+//
+// Cheap on purpose: no damage, no dressing, no corpse, no death. It opens the
+// screen, writes the words straight into `grimoireEditWords` (the composer's
+// own field - the harness types, it does not reach into the tree), waits a few
+// frames for main.cpp's parse/lower/build to refill the mirror, and shoots.
+bool g_shotSpellPage = false;
+struct ShotSpellScene {
+  const char* name;
+  const char* words;  // space separated; "" is the empty page
+  // The view the scene is shot at. Zero zoom is the fit, which is what every
+  // ordinary scene wants; a scene that names a rung and a pan is photographing
+  // THE VIEW rather than the tree - the page's ground is drawn in page
+  // coordinates, and the only way to prove that is a picture of it moved.
+  float zoom = 0.0f;
+  float panX = 0.0f, panY = 0.0f;
+};
+// THE SCENES. Every one of them is a question about the picture:
+//   plain     - two words: does a minimal tree sit centred and whole?
+//   duststorm - the shipped example: a bus, three sockets, a mod, a fan
+//   operator  - `transmute` with a hole in it: the slash, the hollow pip
+//   nested    - a delivery inside a delivery: the deep tree
+//   lanes     - lane/end scoping: sockets with payloads of their own
+//   fan       - shotgun twice: nine instances, the widest row the page draws
+//   tall      - eighteen words of everything: the page that does not fit
+const ShotSpellScene kShotSpellScenes[] = {
+    {"plain", "fire projectile"},
+    {"duststorm", "sand gust gust shotgun projectile"},
+    {"operator", "water transmute swift bolt"},
+    {"nested", "fire explosive bomb orb long projectile"},
+    {"lanes", "stone lane acid wide end lane fire end shotgun lob"},
+    {"fan", "sand shotgun shotgun gust projectile"},
+    {"tall",
+     "water fire transmute twin seek heavy lane acid wide end lane stone "
+     "bounce end explosive long shotgun lob"},
+    {"empty", ""},
+    // The same page, dragged: every mark on the sheet - the ruling, the
+    // pricked margins, the foxing, the great figure - must have moved with it.
+    {"panned", "sand gust gust shotgun projectile", 0.5f, 90.0f, 34.0f},
+    // ...and read close, where the engravings come back.
+    {"zoomed", "sand gust gust shotgun projectile", 1.0f, 0.0f, -40.0f},
+};
+constexpr int kShotSpellSceneCount =
+    (int)(sizeof(kShotSpellScenes) / sizeof(kShotSpellScenes[0]));
+// Open late enough that the world is up and the avatar has spawned (the screen
+// draws a portrait either way, and an empty one is a distraction in a picture
+// of a page). Then one scene every `kShotSpellStride` frames: the words go in
+// on the scene's first frame and the shutter falls eight frames later, which
+// is several ticks of the graph rebuild.
+constexpr uint64_t kShotSpellOpen = 120;
+constexpr uint64_t kShotSpellFirst = 140;
+constexpr uint64_t kShotSpellStride = 12;
+constexpr uint64_t kShotSpellShutter = 8;
+constexpr uint64_t kShotSpellLast =
+    kShotSpellFirst + (uint64_t)(kShotSpellSceneCount - 1) * kShotSpellStride +
+    kShotSpellShutter;
+// Which scene a frame belongs to, or -1: `setup` asks about the frame the
+// words land on, otherwise about the frame the picture is taken on.
+inline int ShotSpellSceneAt(uint64_t frame, bool setup) {
+  const uint64_t base = kShotSpellFirst + (setup ? 0 : kShotSpellShutter);
+  if (frame < base) return -1;
+  const uint64_t d = frame - base;
+  if (d % kShotSpellStride != 0) return -1;
+  const int idx = (int)(d / kShotSpellStride);
+  return idx < kShotSpellSceneCount ? idx : -1;
+}
+
 // ---- --shot-jump: the AIRBORNE POSE's look-iteration harness ---------------
 //
 // The avatar's air pose is driven by `vel.y` (avatar.airPose, tuning.h), and
@@ -868,15 +943,30 @@ struct BurnMats {
 
 struct TissueMats {
   uint32_t skin = 0, flesh = 0, muscle = 0, bone = 0, brain = 0;
+  // ROT IS A LIST, not an id. The four tissues above are the ones a human rig
+  // is BUILT from, so each is one authored name; what a bite leaves behind is
+  // whatever the attacking effect named as its `infect` material
+  // (assets/mobs/effects/zombie.json: "rotflesh"), and a second undead with a
+  // second rot material would simply be a second entry here. The tag is the
+  // contract — `matInfectious_` in mob.cpp reads the same one to decide
+  // whether a graft latches an infection, so the readout and the mechanic
+  // cannot disagree about what counts as rot.
+  std::vector<uint32_t> rot;
 };
 
-TissueMats ResolveTissueMats(const MobSystem& mobs) {
+TissueMats ResolveTissueMats(const MobSystem& mobs,
+                             const std::vector<MaterialDef>& mats) {
   TissueMats t;
   t.skin   = mobs.MaterialIdNamed("skin");
   t.flesh  = mobs.MaterialIdNamed("flesh");
   t.muscle = mobs.MaterialIdNamed("muscle");
   t.bone   = mobs.MaterialIdNamed("bone");
   t.brain  = mobs.MaterialIdNamed("brain");
+  for (size_t i = 0; i < mats.size(); i++) {
+    for (const std::string& tag : mats[i].tags) {
+      if (tag == "infectious") { t.rot.push_back((uint32_t)i); break; }
+    }
+  }
   return t;
 };
 
@@ -1019,6 +1109,13 @@ void FillBodyUI(const PlayerAvatar& avatar, const BurnMats& burnMats,
     if (tissueMats.muscle) b.voxelMuscle = avatar.PartMaterialCount(i, tissueMats.muscle);
     if (tissueMats.bone)   b.voxelBone   = avatar.PartMaterialCount(i, tissueMats.bone);
     if (tissueMats.brain)  b.voxelBrain  = avatar.PartMaterialCount(i, tissueMats.brain);
+    // Rot is tissue the limb is made of NOW, exactly like the four above — a
+    // bitten arm's flesh bar shrinking with nothing taking its place was the
+    // whole defect: the voxels are still in voxelTotal, they had just stopped
+    // being anything the panel had a name for.
+    uint32_t rotted = 0;
+    for (uint32_t m : tissueMats.rot) rotted += avatar.PartMaterialCount(i, m);
+    b.voxelRot = rotted;
     b.voxelBrainMax = avatar.PartBrainAtSpawn(i);
 
     // What is ON the limb. The ledger is recounted by the creature itself at
@@ -4346,6 +4443,8 @@ int main(int argc, char** argv) {
           "                        --shot-strike zombie bite_lunge human+iron_cuirass\n"
           "  --shot-inventory      Character screen (I) with a damaged avatar,\n"
           "                        one frame to screenshot_inventory.bmp\n"
+          "  --shot-spellpage      The spell page, one BMP per word list:\n"
+          "                        shot_spell_<scene>.bmp (the look gallery)\n"
           "  --shot-jump           Airborne pose look iteration: third person,\n"
           "                        one BMP per phase of a jump (rise/apex/\n"
           "                        fall/land), triggered on the pose's own vy\n"
@@ -4479,6 +4578,12 @@ int main(int argc, char** argv) {
     else if (a == "--shot-inventory") {
       g_shotInventory = true;
       g_harnessFrames = kShotInvDeathTurnShot;
+    }
+    // `--shot-spellpage` is the SPELL PAGE's gallery: one BMP per word list,
+    // all of them on the same canvas. See the note at g_shotSpellPage.
+    else if (a == "--shot-spellpage") {
+      g_shotSpellPage = true;
+      g_harnessFrames = kShotSpellLast;
     }
     // `--shot-jump` is the AIRBORNE POSE's look-iteration harness: walk the
     // avatar in third person, jump it, and write one picture per phase of the
@@ -6298,7 +6403,7 @@ int main(int argc, char** argv) {
   // Burn-material ids for the inspector's charred readout, resolved ONCE here
   // and again after every materials reload — never per frame (see ResolveBurnMats).
   BurnMats burnMats = ResolveBurnMats(mats);
-  TissueMats tissueMats = ResolveTissueMats(mobs);
+  TissueMats tissueMats = ResolveTissueMats(mobs, mats);
   // ---- THE DEATH SCREEN'S PHOTOGRAPH ---------------------------------------
   // Registered once, called from inside Die() while the rig is still whole
   // (PlayerAvatar::SetDyingObserver). It runs the SAME mirror the frame loop
@@ -8216,6 +8321,61 @@ int main(int argc, char** argv) {
       if (g_shotJumpPath) g_shotJumpVy = vy;
     }
 
+    // --shot-spellpage's scripted schedule: open the screen on the grimoire,
+    // then one word list per scene. The words are written into the COMPOSER's
+    // field, which is the same thing typing them does; everything else (parse,
+    // lower, build, the mirror the canvas draws) happens on the ordinary path.
+    if (g_shotSpellPage) {
+      if (frameCounter == 1) {
+        ui.fly = false;
+        player.fly = false;
+      }
+      if (frameCounter == kShotSpellOpen) {
+        ui.inventoryOpen = true;
+        ui.grimoireMode = true;
+        // THE BOOK IS SHUT BY DEFAULT (2026-09-22). This harness photographs
+        // the page, so it opens the book the way the player does.
+        ui.spellbookOpen = true;
+        ui.visible = false;  // the dev panel sits on top of the thing we shoot
+        captured = false;
+        captureBeforeUi = false;
+        glfwSetInputMode(window, GLFW_CURSOR, GLFW_CURSOR_NORMAL);
+        // PARK THE POINTER. It lands wherever the window happened to put it,
+        // and one of the gallery's pictures came back with the page list's
+        // tooltip open across the canvas - a picture of a tooltip, not of a
+        // page. Bottom-centre is the one patch of this screen with nothing
+        // hoverable on it.
+        glfwSetCursorPos(window, 1200.0, 880.0);
+      }
+      const int sceneSetup = ShotSpellSceneAt(frameCounter, true);
+      if (sceneSetup >= 0) {
+        const ShotSpellScene& sc = kShotSpellScenes[sceneSetup];
+        GrimoirePage pg;
+        pg.name = std::string("shot-") + sc.name;
+        std::string w;
+        for (const char* c = sc.words;; c++) {
+          if (*c == ' ' || *c == 0) {
+            if (!w.empty()) pg.words.push_back(w);
+            w.clear();
+            if (*c == 0) break;
+          } else {
+            w.push_back(*c);
+          }
+        }
+        if (caster.grimoire.Find(pg.name) < 0) caster.grimoire.pages.push_back(pg);
+        ui.grimoireMode = true;
+        ui.grimoireSelected = pg.name;
+        ui.grimoireEditName = pg.name;
+        ui.grimoireEditWords = pg.words;
+        ui.grimoireEditDirty = false;
+        // A view driven by an earlier scene is not this scene's picture.
+        ui.spellGraphZoom = sc.zoom;
+        ui.spellGraphPanX = sc.panX;
+        ui.spellGraphPanY = sc.panY;
+        std::printf("--shot-spellpage: [%s] %d words\n", sc.name,
+                    (int)pg.words.size());
+      }
+    }
     // --shot-inventory's scripted schedule. Frame-counted rather than
     // wall-clocked so the same picture comes out on any machine.
     if (g_shotInventory) {
@@ -8293,6 +8453,7 @@ int main(int argc, char** argv) {
       if (frameCounter == kShotInvCaptureFrame + 1) {
         ui.inspectMode = false;
         ui.grimoireMode = true;
+        ui.spellbookOpen = true;
         if (!glyphs.conjoined.empty()) {
           const ConjoinedGlyph& cg = glyphs.conjoined[0];
           ui.grimoireSelected = cg.id;
@@ -8309,6 +8470,7 @@ int main(int argc, char** argv) {
       if (frameCounter == kShotInvGraphSetup) {
         ui.grimoireMode = true;
         ui.lootOpen = false;
+        ui.spellbookOpen = true;   // the book is shut by default; open it
         GrimoirePage p;
         p.name = "duststorm-mine";
         p.words = {"sand", "gust", "gust", "shotgun", "projectile"};
@@ -8330,16 +8492,28 @@ int main(int argc, char** argv) {
         for (const UIState::SpellGraphUI::Node& n : ui.spellGraph.nodes)
           if (n.kind == 2 /* Join */ && n.treeNode >= 0) { box = (int)(&n - ui.spellGraph.nodes.data()); break; }
         if (box >= 0) {
+          // THE SOCKET THAT USED TO REFUSE. `shotgun` gives this box three
+          // sockets over zero lanes, and the lane a socket drop asks for is
+          // `instance + 1` — so the LAST instance is the drop that was
+          // impossible until lanes learned to open in a run (2026-09-21), and
+          // it is the picture worth reviewing. Read off the mirror's socket
+          // list exactly as the canvas's drop target does.
           const UIState::SpellGraphUI::Node& bn = ui.spellGraph.nodes[box];
+          int32_t lane = bn.laneCount + 1;
+          if (!bn.sockets.empty()) {
+            const UIState::SpellGraphUI::Node& sk =
+                ui.spellGraph.nodes[(size_t)bn.sockets.back()];
+            lane = sk.lane > 0 ? sk.lane : sk.instance + 1;
+          }
           ui.graphEdit = {};
           ui.graphEdit.pending = true;
           ui.graphEdit.op = UIState::GraphEditIntent::Insert;
           ui.graphEdit.treeNode = bn.treeNode;
-          ui.graphEdit.lane = bn.laneCount + 1;
+          ui.graphEdit.lane = lane;
           ui.graphEdit.glyphId = "fire";
           std::printf("--shot-inventory: spell page edit -> lane %d of [%s] "
                       "takes `fire`\n",
-                      bn.laneCount + 1, bn.label.c_str());
+                      (int)lane, bn.label.c_str());
         } else {
           std::fprintf(stderr, "--shot-inventory: no join in the spell graph\n");
         }
@@ -8350,6 +8524,9 @@ int main(int argc, char** argv) {
       // produces — and the panel is opened on it as E would.
       if (frameCounter == kShotInvGraphFrame + 1) {
         ui.grimoireMode = false;
+        // Shut it again: the pictures after this one are about the corpse and
+        // the body, and an open book covers the pack they are drawn beside.
+        ui.spellbookOpen = false;
         int humanDef = -1;
         for (size_t i = 0; i < mobs.Defs().size(); i++)
           if (mobs.Defs()[i].name == "human") humanDef = (int)i;
@@ -9585,7 +9762,7 @@ int main(int argc, char** argv) {
         // removes or reorders flesh_charred/ash has to re-resolve here or the
         // inspector's charred readout counts the wrong material.
         burnMats = ResolveBurnMats(mats);
-        tissueMats = ResolveTissueMats(mobs);
+        tissueMats = ResolveTissueMats(mobs, mats);
         ui.materialNames.clear();
         ui.materialColors.clear();
         for (auto& m : mats) {
@@ -11757,6 +11934,9 @@ int main(int argc, char** argv) {
             const char* opn = g.op == ModOp::Mul ? "x" : g.op == ModOp::Div ? "/" : "+";
             u.valence = std::string("edits ") + ModFieldName(g.field) + " " + opn +
                         std::to_string(g.amount) + ", again per repeat";
+            // COUNT IS RECORD-WIDE wherever it is spoken (spell.cpp's LowerBox),
+            // so the canvas must not promise a socket drop edits one instance.
+            u.recordWide = g.field == ModField::Count;
           } else if (g.sort == GlyphSort::Delivery) {
             u.valence = std::string(g.mech == DeliveryMech::Flight ? "flight" :
                                     g.mech == DeliveryMech::Continuous ? "continuous" : "instant") +
@@ -11860,7 +12040,10 @@ int main(int argc, char** argv) {
         // toggle; the wide three-column layout draws the grimoire always with
         // the flag false, and gating on it left the canvas empty in the game
         // while `--shot-inventory` (which sets the flag by hand) showed a tree.
-        if (ui.inventoryOpen) {
+        // ...and only while the BOOK IS OPEN (2026-09-22). Shut, the panel is a
+        // spine with the bound keys on it and nothing reads the mirror at all,
+        // so a parse and a lowering every frame would be pure waste.
+        if (ui.inventoryOpen && ui.spellbookOpen) {
           ui.spellGraph = UIState::SpellGraphUI{};
           const GrimoireExpansion ex =
               ExpandWords(glyphs, caster.grimoire, ui.grimoireEditWords, kSpellStackMax);
@@ -11902,6 +12085,7 @@ int main(int argc, char** argv) {
             u.lane = n.lane;
             u.x = n.x; u.y = n.y; u.w = n.w; u.h = n.h;
             u.layer = n.layer;
+            u.baseLayer = n.baseLayer;
             u.subX = n.subX; u.subW = n.subW;
             u.hasLeft = n.hasLeft; u.hasRight = n.hasRight;
             u.leftFilled = n.leftFilled; u.rightFilled = n.rightFilled;
@@ -11910,7 +12094,6 @@ int main(int argc, char** argv) {
             u.laneCount = n.laneCount;
             u.sockets = n.sockets;
             u.bus = n.bus;
-            u.tagStripW = n.tagStripW;
             u.hasPrice = n.hasPrice;
             u.wordCost = n.price.wordCost;
             u.tariff = n.price.tariff;
@@ -12850,6 +13033,15 @@ int main(int argc, char** argv) {
       // cache, so nothing thrashes) and read back. The blocking readback is
       // legal here for the same reason it is in --shot: this is the last frame
       // of a harness run, not the frame path of a game.
+      // --shot-spellpage names its file after the SCENE, not after the frame:
+      // a gallery whose pictures are called shot_spell_148.bmp is a gallery
+      // nobody can diff against the last pass.
+      static char sSpellShotPath[64];
+      const int spellShot =
+          g_shotSpellPage ? ShotSpellSceneAt(frameCounter, false) : -1;
+      if (spellShot >= 0)
+        std::snprintf(sSpellShotPath, sizeof sSpellShotPath,
+                      "shot_spell_%s.bmp", kShotSpellScenes[spellShot].name);
       if ((g_shotInventory && (frameCounter == kShotInvGearFrame ||
                                frameCounter == kShotInvCaptureFrame ||
                                frameCounter == kShotInvGrimoireFrame ||
@@ -12857,8 +13049,10 @@ int main(int argc, char** argv) {
                                frameCounter == kShotInvLootFrame ||
                                frameCounter == kShotInvDeathShot ||
                                frameCounter == kShotInvDeathTurnShot)) ||
-          g_shotJumpPath) {
+          spellShot >= 0 || g_shotJumpPath) {
         const char* shotPath =
+            spellShot >= 0                       ? sSpellShotPath
+            :
             g_shotJumpPath                       ? g_shotJumpPath
             : frameCounter == kShotInvGearFrame  ? "screenshot_inventory.bmp"
             : frameCounter == kShotInvCaptureFrame

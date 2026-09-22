@@ -520,21 +520,40 @@ bool Detach(SpellTree& t, const Nav& nav, int node) {
   return true;
 }
 
-// A lane index the caller may use: 0..L are existing, L+1 opens a new one.
-bool OpenLaneIfNeeded(SpellTree& t, int boxNode, int32_t lane, std::string& why) {
+// A lane index the caller may use: 0..L exist, and anything past L OPENS every
+// lane up to it.
+//
+// EVERY SOCKET IS A TARGET (2026-09-21). Lanes used to open strictly one at a
+// time, which is fine when the sockets ARE the lanes — but a count mod gives a
+// box more instances than it has lanes, so `fire shotgun projectile` draws
+// THREE sockets over a box with no lanes at all. Two of those three refused
+// every drop with "give the sockets before this one a payload first", and
+// which one was "before" was invisible: instance 0 is the aim and the aim is
+// drawn in the CENTRE of the row, so the order was middle, then right, then
+// left. Nothing in the drawing said so, and the result was a panel that
+// behaved differently depending on which of three identical pips you aimed at.
+//
+// The lanes in between now open EMPTY, which is exactly what those sockets
+// already were — an instance carrying the shared payload alone. `instances` is
+// max(count, lanes), so filling lanes up to an existing socket cannot move it,
+// and the lowered cast is unchanged: this buys reachability and nothing else.
+bool OpenLaneIfNeeded(SpellTree& t, int boxNode, int32_t lane, int32_t cap,
+                      std::string& why) {
   const int32_t L = (int32_t)t.nodes[boxNode].laneAt.size() / 2;
   if (lane < 0) {
     why = "there is no such lane";
     return false;
   }
   if (lane <= L) return true;
-  if (lane == L + 1) {
-    t.nodes[boxNode].laneAt.push_back(-1);
-    t.nodes[boxNode].laneAt.push_back(-1);
-    return true;
+  if (cap > 0 && lane > cap) {
+    why = "a box fans to at most " + std::to_string(cap) + " instances";
+    return false;
   }
-  why = "lanes open one at a time; this box has " + std::to_string(L);
-  return false;
+  for (int32_t k = L; k < lane; k++) {
+    t.nodes[boxNode].laneAt.push_back(-1);
+    t.nodes[boxNode].laneAt.push_back(-1);
+  }
+  return true;
 }
 
 SpellNode MakeWord(int glyph) {
@@ -614,9 +633,15 @@ struct Builder {
 
   std::string ModEdit(const GlyphDef& gd, int32_t n) const;
   bool IsWasted(int glyph) const;
-  // Places the subtree rooted at `node` with its left edge at `x` and the node
-  // itself on `layer`, and returns its width.
-  int Place(int node, int32_t lane, int layer, int x, int& outIdx);
+  // Places the subtree rooted at `node` with its left edge at `x` and its
+  // BOTTOM band on `layer`, and returns its width. `outTop`, when given, gets
+  // the highest layer the subtree consumed — which is how a caller stacks the
+  // next thing directly on top of a subtree whose depth it cannot know in
+  // advance. (It used to not need one: every box put its bar on the layer it
+  // was handed and grew upward, so a parent could hand out fixed layers. Now a
+  // spoken box's bar is at the TOP of its span, so the parent has to be told.)
+  int Place(int node, int32_t lane, int layer, int x, int& outIdx,
+            int* outTop = nullptr);
 };
 
 std::string Builder::ModEdit(const GlyphDef& gd, int32_t n) const {
@@ -646,10 +671,12 @@ bool Builder::IsWasted(int glyph) const {
   return false;
 }
 
-int Builder::Place(int node, int32_t lane, int layer, int x, int& outIdx) {
+int Builder::Place(int node, int32_t lane, int layer, int x, int& outIdx,
+                   int* outTop) {
   const SpellTree& t = list.tree;
   const SpellNode& n = t.nodes[node];
   maxLayer = std::max(maxLayer, layer);
+  if (outTop) *outTop = layer;
 
   // ---- a plain word ----------------------------------------------------------
   if (!n.box && !n.group) {
@@ -666,6 +693,7 @@ int Builder::Place(int node, int32_t lane, int layer, int x, int& outIdx) {
     gn.w = kGraphCell;
     gn.h = kGraphCell;
     gn.layer = layer;
+    gn.baseLayer = layer;
     gn.spanFirst = n.first;
     gn.spanLast = n.last;
     gn.subX = x;
@@ -689,7 +717,7 @@ int Builder::Place(int node, int32_t lane, int layer, int x, int& outIdx) {
     const size_t markNodes = g.nodes.size(), markEdges = g.edges.size();
     for (size_t i = 0; i < kids.size(); i++) {
       int idx = -1;
-      kidWidth[i] = Place(kids[i], lane, layer + 1, 0, idx);
+      kidWidth[i] = Place(kids[i], lane, layer, 0, idx);
       kidIdx[i] = idx;
       kidW += kidWidth[i] + (i + 1 < kids.size() ? kGraphGap : 0);
     }
@@ -698,12 +726,19 @@ int Builder::Place(int node, int32_t lane, int layer, int x, int& outIdx) {
     const int total = std::max(kGraphCell, kidW);
     int cx = x + (total - kidW) / 2;
     std::vector<int> placed;
+    // THE OPERANDS ARE THE ROW BELOW, because that is where they are in the
+    // sentence: `fire transmute` fills transmute's left slot with the word
+    // SPOKEN BEFORE it. They used to sit above the cell, which drew every
+    // operator group upside down with respect to its own words.
+    int kidTop = layer - 1;
     for (size_t i = 0; i < kids.size(); i++) {
-      int idx = -1;
-      Place(kids[i], lane, layer + 1, cx, idx);
+      int idx = -1, top = layer;
+      Place(kids[i], lane, layer, cx, idx, &top);
+      kidTop = std::max(kidTop, top);
       placed.push_back(idx);
       cx += kidWidth[i] + kGraphGap;
     }
+    const int cellLayer = kids.empty() ? layer : kidTop + 1;
     SpellGraphNode gn;
     gn.kind = GraphKind::Operator;
     gn.treeNode = node;
@@ -720,12 +755,15 @@ int Builder::Place(int node, int32_t lane, int layer, int x, int& outIdx) {
     gn.x = x + (total - kGraphCell) / 2;
     gn.w = kGraphCell;
     gn.h = kGraphCell;
-    gn.layer = layer;
+    gn.layer = cellLayer;
+    gn.baseLayer = layer;
     gn.spanFirst = n.first;
     gn.spanLast = n.last;
     gn.subX = x;
     gn.subW = total;
     outIdx = Add(gn);
+    maxLayer = std::max(maxLayer, cellLayer);
+    if (outTop) *outTop = cellLayer;
     for (int p : placed) Edge(p, outIdx, GraphEdge::Slot);
     return total;
   }
@@ -736,30 +774,122 @@ int Builder::Place(int node, int32_t lane, int layer, int x, int& outIdx) {
   int32_t instances = price ? price->instances : std::max<int32_t>(1, L);
   if (instances < 1) instances = 1;
 
+  // A LANE THAT IS NOT DRAWN IS A WORD THAT VANISHED. Only lanes 1..instances
+  // get a socket, so anything in a lane past the last instance — which happens
+  // when the fan was clamped — would be placed nowhere and edged to nothing.
+  // Shown in the shared pile instead: misfiled beats invisible, and the bar
+  // already wears the clamp notch that explains it.
+  const int32_t drawnLanes = std::min<int32_t>(L, instances);
+
+  // WHICH MODS RIDE THE TRUNK AND WHICH RIDE A LANE. `count` is record-wide
+  // WHEREVER it was spoken — spell.cpp's `LowerBox` applies it before the lanes
+  // copy the record, so `shotgun` inside lane 2 still trebles the whole box —
+  // and drawing it over one socket would be a lie about what it does. Every
+  // other mod in a lane edits that instance's record alone, so it belongs over
+  // the socket it edits and NOT in the shared bead row, which is where all of
+  // them used to land regardless of lane: two mods on two different lanes drew
+  // as one indistinguishable centred row.
   std::vector<int> mods, shared;
   std::vector<std::vector<int>> laneItems((size_t)L + 1);
+  std::vector<std::vector<int>> laneMods((size_t)L + 1);
   for (int ii : n.items) {
+    const int32_t ln = t.nodes[ii].lane;
+    const bool inLane = ln > 0 && ln <= drawnLanes;
     if (NodeSort(lib, t, ii) == GlyphSort::Mod) {
-      mods.push_back(ii);
+      const GlyphDef* md = lib.At(t.nodes[ii].glyph);
+      const bool recordWide =
+          !t.nodes[ii].group && md && md->field == ModField::Count;
+      if (inLane && !recordWide) laneMods[(size_t)ln].push_back(ii);
+      else mods.push_back(ii);
       continue;
     }
-    const int32_t ln = t.nodes[ii].lane;
-    if (ln <= 0) shared.push_back(ii);
-    else if (ln <= L) laneItems[(size_t)ln].push_back(ii);
+    if (inLane) laneItems[(size_t)ln].push_back(ii);
     else shared.push_back(ii);
   }
 
-  const int tagStripW = (int)mods.size() * (kGraphTagW + kGraphGap);
-  const int barLayer = layer, socketLayer = layer + 1, busLayer = layer + 2,
-            itemLayer = layer + 3;
+  // A MOD IS A BEAD ON A STROKE, NOT A LABEL BESIDE IT (2026-09-21). The tags
+  // used to hang off the bar's LEFT end on the bar's own layer, which put
+  // `shotgun` out in the margin with a stroke running sideways-and-backwards
+  // into the bar, beside the thing it edits rather than on the line between the
+  // bar and the fan it modifies. A mod edits a record, so it belongs on the
+  // line that feeds that record: a record-wide mod on the trunk between the bar
+  // and its sockets, a lane's mod on the neck between that lane's items and the
+  // socket they feed. Several mods on one stroke share a layer as a centred row.
+  // A MOD THAT IS A GROUP IS A DRAWING, NOT A BEAD (2026-09-22). `fire trail`
+  // is ONE operator with `fire` in its left slot and a RESULT that is a mod, so
+  // it landed in the bead row — flattened to a lone `trail` tag whose operand
+  // was never placed at all. What the page drew for `fire trail projectile` was
+  // a bead hanging off the trunk beside the socket fan: two strokes into the
+  // bar, and no `fire` anywhere on the sheet. A group goes through `Place` like
+  // every other item now, which puts its operands under its cell with the slot
+  // strokes that say which pip each one fills, and only the CELL edges on to
+  // the trunk (or to its lane's socket). The sentence reads as one line again.
+  auto isGroup = [&](int mi) { return t.nodes[(size_t)mi].group; };
+  // A row entry's width: the tag's fixed width for a bead, the group's whole
+  // measured span for a group. Measured by a scratch placement thrown away
+  // again, exactly as `measureRow` does — a width never depends on the layer.
+  auto modW = [&](int mi) {
+    if (!isGroup(mi)) return kGraphTagW;
+    const size_t mn = g.nodes.size(), me = g.edges.size();
+    int idx = -1;
+    const int w = Place(mi, 0, layer, 0, idx);
+    g.nodes.resize(mn);
+    g.edges.resize(me);
+    return w;
+  };
+  auto modRowWOf = [&](const std::vector<int>& row) {
+    int w = 0;
+    for (size_t i = 0; i < row.size(); i++)
+      w += modW(row[i]) + (i + 1 < row.size() ? kGraphGap : 0);
+    return w;
+  };
+  const int modRowW = modRowWOf(mods);
+  bool anyLaneMod = false, anyLaneItem = false;
+  for (const std::vector<int>& lm : laneMods) anyLaneMod |= !lm.empty();
+  for (size_t k = 1; k < laneItems.size(); k++)
+    anyLaneItem |= (int32_t)k <= drawnLanes && !laneItems[k].empty();
 
-  // Measure every column by a scratch placement (exact, integers only).
+  // ONE SHAPE, ALWAYS. There used to be two — with no lanes the sockets fanned
+  // out CENTRED under the shared column, and with any lane at all the shared
+  // block was shoved to the LEFT and the socket row bunched to the right of it
+  // — so opening a single lane on a `shotgun` box teleported the whole drawing
+  // sideways and the fan stopped being centred under its own bar. The two
+  // shapes existed because the shared items and the lane items shared ONE
+  // layer, and two rows that both want the middle cannot both have it.
+  //
+  // They get a layer each now: the bar, the record-wide beads, the socket row,
+  // each lane's beads, each lane's items, the bus, and the shared pile. Every
+  // stroke in that stack is short and vertical — a lane's items reach their own
+  // socket without crossing the bus, the shared pile reaches the bus without
+  // crossing anything — and the one long stroke left is the bus's own trunk
+  // into the bar, which is the trunk.
+  //
+  // WHICH END THE BAR IS ON IS THE WHOLE INVERSION (2026-09-21). A SPOKEN
+  // delivery is a word, and its word comes after the pile it boxes, so its bar
+  // is the TOP of that stack and the pile is underneath: `fire projectile`
+  // draws fire with PROJECTILE over it, which is the order you typed. The
+  // implicit `hand` is the one box with no word to place, so it keeps the old
+  // order and is the pedestal the sentence stands on — bar at the bottom, its
+  // fan just above it, the spoken spell above that.
+  //
+  // And the layers are handed out by WALKING, not by counting: a stage asks the
+  // subtrees it just placed how tall they turned out and puts the next stage on
+  // top. Fixed layer arithmetic worked only while every box's bar was the
+  // bottom of its own span, and it was already fragile — a box sitting in a
+  // LANE grew upward through the layers its parent had reserved for the bus and
+  // the shared pile, which is a same-layer collision waiting for the sentence
+  // that triggers it.
+  const bool flip = n.glyph >= 0;
+
+  // Measure a row by a scratch placement (exact, integers only). A width does
+  // not depend on the layer, so the scratch runs at the box's base and is
+  // thrown away.
   auto measureRow = [&](const std::vector<int>& items) {
     int w = 0;
     const size_t mn = g.nodes.size(), me = g.edges.size();
     for (size_t i = 0; i < items.size(); i++) {
       int idx = -1;
-      w += Place(items[i], t.nodes[items[i]].lane, itemLayer, 0, idx);
+      w += Place(items[i], t.nodes[items[i]].lane, layer, 0, idx);
       if (i + 1 < items.size()) w += kGraphGap;
     }
     g.nodes.resize(mn);
@@ -771,175 +901,272 @@ int Builder::Place(int node, int32_t lane, int layer, int x, int& outIdx) {
   const std::vector<int32_t> slots = SlotOrder(instances);
   std::vector<int> socketColW((size_t)instances, kGraphSocketW);
   for (int32_t inst = 0; inst < instances; inst++) {
-    if (inst >= L) continue;
-    const int w = measureRow(laneItems[(size_t)inst + 1]);
+    if (inst >= drawnLanes) continue;
+    // The column has to hold the WIDER of its item row and its bead row: a
+    // bead is 96 and a cell 64, so a lane whose only content is one mod still
+    // needs more room than the 32 px pip.
+    const int w = std::max(measureRow(laneItems[(size_t)inst + 1]),
+                           modRowWOf(laneMods[(size_t)inst + 1]));
     socketColW[(size_t)inst] = std::max(kGraphSocketW, w);
   }
 
-  // TWO SHAPES, because the common case deserves the plan's picture. With no
-  // lanes there is one column — the shared items — and the sockets fan out
-  // under it. With lanes the shared block sits to the LEFT and each lane gets
-  // its own socket column, because a lane's subtree has to stand over the
-  // socket it feeds and cannot share the space with the shared items.
-  int contentW = 0;
-  int sharedX = 0;
+  // The socket row, tiled in SLOT order (instance 0 — the aim — in the middle)
+  // and centred in the content; the shared pile centred over it.
+  int socketsW = 0;
+  for (int32_t s = 0; s < instances; s++)
+    socketsW += socketColW[(size_t)slots[(size_t)s]] + (s + 1 < instances ? kGraphGap : 0);
+  const int contentW = std::max(std::max(sharedW, socketsW), kGraphSocketW);
+  const int sharedX = (contentW - sharedW) / 2;
   std::vector<int> colX((size_t)instances, 0);
-  if (L == 0) {
-    int socketsW = 0;
-    for (int32_t s = 0; s < instances; s++)
-      socketsW += socketColW[(size_t)slots[(size_t)s]] + (s + 1 < instances ? kGraphGap : 0);
-    contentW = std::max(std::max(sharedW, socketsW), kGraphSocketW);
-    sharedX = (contentW - sharedW) / 2;
-    // Tile the sockets evenly across the content width so the row is centred.
+  {
     int cx = (contentW - socketsW) / 2;
     for (int32_t s = 0; s < instances; s++) {
       const int32_t inst = slots[(size_t)s];
       colX[(size_t)inst] = cx;
       cx += socketColW[(size_t)inst] + kGraphGap;
     }
-  } else {
-    int cx = 0;
-    if (!shared.empty()) {
-      sharedX = 0;
-      cx = sharedW + kGraphGap;
-    }
-    for (int32_t s = 0; s < instances; s++) {
-      const int32_t inst = slots[(size_t)s];
-      colX[(size_t)inst] = cx;
-      cx += socketColW[(size_t)inst] + kGraphGap;
-    }
-    contentW = std::max(cx - kGraphGap, kGraphSocketW);
   }
 
-  const int barW = std::max(contentW, kGraphMinBarW);
-  const int barX = x + tagStripW;
-  const int contentX = barX + (barW - contentW) / 2;
+  // A DELIVERY IS A CELL. The bar used to be `max(contentW, 128)` wide and to
+  // stretch over its whole socket row; it is a 64 px square like every other
+  // glyph now, centred on the box's axis, and the REACH the slab used to show
+  // is a rule the canvas draws behind it across the socket row.
+  const int barW = kGraphCell;
+  // The box's own width is the widest of the content row, the bar and the bead
+  // row, and all three are centred in it, so the trunk, the beads and the fan
+  // share one axis.
+  const int boxW = std::max(std::max(contentW, barW), modRowW);
+  const int barX = x + (boxW - barW) / 2;
+  const int contentX = x + (boxW - contentW) / 2;
 
-  // The bar itself.
-  SpellGraphNode bar;
-  bar.kind = n.glyph < 0 ? GraphKind::Root : GraphKind::Join;
-  bar.treeNode = node;
-  bar.glyph = n.glyph;
-  bar.n = n.n;
-  bar.sort = GlyphSort::Delivery;
-  bar.lane = lane;
-  bar.label = lib.Delivery(n.glyph).id;
-  bar.instances = instances;
-  bar.laneCount = L;
-  bar.tagStripW = tagStripW;
-  bar.x = barX;
-  bar.w = barW;
-  bar.h = kGraphBarH;
-  bar.layer = barLayer;
-  bar.spanFirst = n.first;
-  bar.spanLast = n.last;
-  bar.subX = x;
-  bar.subW = tagStripW + barW;
-  if (price) {
-    bar.price = *price;
-    bar.hasPrice = true;
-    bar.subtotal = price->tariff + price->carryCost;
-  }
-  const int barIdx = Add(bar);
-  maxLayer = std::max(maxLayer, itemLayer);
-
-  // The sockets, one per instance, in instance order.
+  // ---- the stages -------------------------------------------------------------
+  //
+  // Each one puts its row on `cur` and leaves `cur` on the first free layer
+  // above whatever it placed. They are run bottom-up in one of two orders (see
+  // `flip`), and no stage knows which — that is the point.
+  int cur = layer;
+  int barIdx = -1, busIdx = -1;
   std::vector<int> socketIdx((size_t)instances, -1);
-  for (int32_t inst = 0; inst < instances; inst++) {
-    SpellGraphNode s;
-    s.kind = GraphKind::Socket;
-    s.treeNode = -1;
-    s.lane = inst < L ? inst + 1 : 0;
-    s.instance = inst;
-    s.x = contentX + colX[(size_t)inst];
-    s.w = socketColW[(size_t)inst];
-    s.h = kGraphSocketH;
-    s.pipW = kGraphSocketW;
-    s.layer = socketLayer;
-    s.label = "";
-    s.subX = s.x;
-    s.subW = s.w;
-    socketIdx[(size_t)inst] = Add(s);
-    Edge(socketIdx[(size_t)inst], barIdx, GraphEdge::Fan);
-  }
-  g.nodes[(size_t)barIdx].sockets = socketIdx;
+  std::vector<int> sharedPlaced;                     // shared item -> bus
+  std::vector<std::pair<int, int>> laneLinks;        // (node, instance) -> socket
 
+  // One bead. `instance` is which socket it edits, -1 for a record-wide one:
+  // the tip says "this instance alone" or "the whole record" off that, so the
+  // drawing and the words agree about a thing the picture alone cannot show.
+  auto Bead = [&](int mi, int lyr, int cx, int32_t instance) {
+    const SpellNode& mn = t.nodes[mi];
+    SpellGraphNode tg;
+    tg.kind = GraphKind::ModTag;
+    tg.treeNode = mi;
+    tg.glyph = mn.glyph;
+    tg.n = mn.n;
+    tg.sort = GlyphSort::Mod;
+    tg.lane = mn.lane;
+    tg.instance = instance;
+    const GlyphDef* gd = lib.At(mn.glyph);
+    tg.label = gd ? gd->id : "?";
+    // A `trail` GROUP is a Mod too, and it has no field to compose.
+    tg.edit = (gd && !mn.group && gd->field != ModField::None) ? ModEdit(*gd, mn.n)
+                                                              : std::string();
+    tg.wasted = gd && IsWasted(mn.glyph);
+    tg.x = cx;
+    tg.w = kGraphTagW;
+    tg.h = kGraphTagH;
+    tg.layer = lyr;
+    tg.baseLayer = lyr;
+    tg.spanFirst = mn.first;
+    tg.spanLast = mn.last;
+    tg.subX = tg.x;
+    tg.subW = tg.w;
+    return Add(tg);
+  };
+
+  // The shared pile: everything every instance carries.
+  auto stageItems = [&]() {
+    if (shared.empty()) return;
+    int top = cur, cx = contentX + sharedX;
+    for (size_t i = 0; i < shared.size(); i++) {
+      int idx = -1, itop = cur;
+      const int w = Place(shared[i], 0, cur, cx, idx, &itop);
+      if (idx >= 0) sharedPlaced.push_back(idx);
+      top = std::max(top, itop);
+      cx += w + kGraphGap;
+    }
+    cur = top + 1;
+  };
   // The bus: what the shared items feed, spanning every socket.
-  int busIdx = -1;
-  if (!shared.empty()) {
+  auto stageBus = [&]() {
+    if (shared.empty()) return;
     SpellGraphNode b;
     b.kind = GraphKind::Bus;
     b.treeNode = -1;
     b.x = contentX;
     b.w = contentW;
     b.h = kGraphBusH;
-    b.layer = busLayer;
+    b.layer = cur;
+    b.baseLayer = cur;
     b.subX = b.x;
     b.subW = b.w;
     busIdx = Add(b);
+    cur++;
+  };
+  // Each lane's own items, in that lane's column.
+  auto stageLaneItems = [&]() {
+    if (!anyLaneItem) return;
+    int top = cur;
+    for (int32_t k = 1; k <= drawnLanes; k++) {
+      const int32_t inst = k - 1;
+      const int colW = socketColW[(size_t)inst];
+      const int rowW = measureRow(laneItems[(size_t)k]);
+      int cx = contentX + colX[(size_t)inst] + (colW - rowW) / 2;
+      for (size_t i = 0; i < laneItems[(size_t)k].size(); i++) {
+        int idx = -1, itop = cur;
+        const int w = Place(laneItems[(size_t)k][i], k, cur, cx, idx, &itop);
+        if (idx >= 0) laneLinks.push_back({idx, (int)inst});
+        top = std::max(top, itop);
+        cx += w + kGraphGap;
+      }
+    }
+    cur = top + 1;
+  };
+  // A lane's beads, on the neck between that lane's items and its socket.
+  auto stageLaneMods = [&]() {
+    if (!anyLaneMod) return;
+    int top = cur;
+    for (int32_t k = 1; k <= drawnLanes; k++) {
+      const int32_t inst = k - 1;
+      const int colW = socketColW[(size_t)inst];
+      const int rowW = modRowWOf(laneMods[(size_t)k]);
+      int cx = contentX + colX[(size_t)inst] + (colW - rowW) / 2;
+      for (int mi : laneMods[(size_t)k]) {
+        const int w = modW(mi);
+        if (isGroup(mi)) {
+          int idx = -1, itop = cur;
+          Place(mi, k, cur, cx, idx, &itop);
+          if (idx >= 0) laneLinks.push_back({idx, (int)inst});
+          top = std::max(top, itop);
+        } else {
+          laneLinks.push_back({Bead(mi, cur, cx, inst), (int)inst});
+        }
+        cx += w + kGraphGap;
+      }
+    }
+    cur = top + 1;
+  };
+  // The socket row, one pip per instance, in instance order.
+  auto stageSockets = [&]() {
+    for (int32_t inst = 0; inst < instances; inst++) {
+      SpellGraphNode s;
+      s.kind = GraphKind::Socket;
+      s.treeNode = -1;
+      s.lane = inst < L ? inst + 1 : 0;
+      s.instance = inst;
+      s.x = contentX + colX[(size_t)inst];
+      s.w = socketColW[(size_t)inst];
+      s.h = kGraphSocketH;
+      s.pipW = kGraphSocketW;
+      s.layer = cur;
+      s.baseLayer = cur;
+      s.label = "";
+      s.subX = s.x;
+      s.subW = s.w;
+      socketIdx[(size_t)inst] = Add(s);
+    }
+    cur++;
+  };
+  // The record-wide beads, on the trunk between the bar and its sockets.
+  auto stageMods = [&]() {
+    if (mods.empty()) return;
+    int cx = x + (boxW - modRowW) / 2;
+    int top = cur;
+    for (int mi : mods) {
+      const int w = modW(mi);
+      // `to` is the bar, which in the flipped order does not exist yet; -1 is
+      // patched to `barIdx` once every stage has run.
+      if (isGroup(mi)) {
+        int idx = -1, itop = cur;
+        Place(mi, 0, cur, cx, idx, &itop);
+        if (idx >= 0) Edge(idx, -1, GraphEdge::Trunk);
+        top = std::max(top, itop);
+      } else {
+        Edge(Bead(mi, cur, cx, -1), -1, GraphEdge::Trunk);
+      }
+      cx += w + kGraphGap;
+    }
+    cur = top + 1;
+  };
+  auto stageBar = [&]() {
+    SpellGraphNode bar;
+    bar.kind = n.glyph < 0 ? GraphKind::Root : GraphKind::Join;
+    bar.treeNode = node;
+    bar.glyph = n.glyph;
+    bar.n = n.n;
+    bar.sort = GlyphSort::Delivery;
+    bar.lane = lane;
+    bar.label = lib.Delivery(n.glyph).id;
+    bar.instances = instances;
+    bar.laneCount = L;
+    bar.x = barX;
+    bar.w = barW;
+    bar.h = kGraphCell;
+    bar.layer = cur;
+    // THE BOX HANDS OFF FROM THE BOTTOM OF ITS SPAN, not from its bar: on a
+    // spoken delivery the bar is the TOP of the stack, and an edge leaving it
+    // would fall the whole height of the subtree through every cell in it.
+    bar.baseLayer = layer;
+    bar.spanFirst = n.first;
+    bar.spanLast = n.last;
+    bar.subX = x;
+    bar.subW = boxW;
+    if (price) {
+      bar.price = *price;
+      bar.hasPrice = true;
+      bar.subtotal = price->tariff + price->carryCost;
+    }
+    barIdx = Add(bar);
+    cur++;
+  };
+
+  if (flip) {
+    stageItems();
+    stageBus();
+    stageLaneItems();
+    stageLaneMods();
+    stageSockets();
+    stageMods();
+    stageBar();
+  } else {
+    stageBar();
+    stageMods();
+    stageSockets();
+    stageLaneMods();
+    stageLaneItems();
+    stageBus();
+    stageItems();
+  }
+  maxLayer = std::max(maxLayer, cur - 1);
+  if (outTop) *outTop = cur - 1;
+
+  // ---- the edges, once every node exists --------------------------------------
+  // Wired here rather than inside the stages because in the flipped order half
+  // of them are placed before the thing they connect to.
+  for (SpellGraphEdge& e : g.edges)
+    if (e.to == -1) e.to = barIdx;               // the record-wide beads
+  g.nodes[(size_t)barIdx].sockets = socketIdx;
+  for (int32_t inst = 0; inst < instances; inst++)
+    Edge(socketIdx[(size_t)inst], barIdx, GraphEdge::Fan);
+  if (busIdx >= 0) {
     Edge(busIdx, barIdx, GraphEdge::Trunk);
     g.nodes[(size_t)barIdx].bus = busIdx;
   }
-
-  // The shared items, above the bus.
-  {
-    int cx = contentX + sharedX;
-    for (size_t i = 0; i < shared.size(); i++) {
-      int idx = -1;
-      const int w = Place(shared[i], 0, itemLayer, cx, idx);
-      if (idx >= 0) Edge(idx, busIdx >= 0 ? busIdx : barIdx,
-                         busIdx >= 0 ? GraphEdge::Bus : GraphEdge::Trunk);
-      cx += w + kGraphGap;
-    }
-  }
-  // Each lane's items, above the socket they feed.
-  for (int32_t k = 1; k <= L && k <= instances; k++) {
-    const int32_t inst = k - 1;
-    const int colW = socketColW[(size_t)inst];
-    const int rowW = measureRow(laneItems[(size_t)k]);
-    int cx = contentX + colX[(size_t)inst] + (colW - rowW) / 2;
-    for (size_t i = 0; i < laneItems[(size_t)k].size(); i++) {
-      int idx = -1;
-      const int w = Place(laneItems[(size_t)k][i], k, itemLayer, cx, idx);
-      if (idx >= 0) Edge(idx, socketIdx[(size_t)inst], GraphEdge::Socket);
-      cx += w + kGraphGap;
-    }
-  }
-
-  // The mod tags, hanging off the bar's left end.
-  {
-    int cx = x;
-    for (int mi : mods) {
-      const SpellNode& mn = t.nodes[mi];
-      SpellGraphNode tg;
-      tg.kind = GraphKind::ModTag;
-      tg.treeNode = mi;
-      tg.glyph = mn.glyph;
-      tg.n = mn.n;
-      tg.sort = GlyphSort::Mod;
-      tg.lane = mn.lane;
-      const GlyphDef* gd = lib.At(mn.glyph);
-      tg.label = gd ? gd->id : "?";
-      // A `trail` GROUP is a Mod too, and it has no field to compose.
-      tg.edit = (gd && !mn.group && gd->field != ModField::None) ? ModEdit(*gd, mn.n)
-                                                                 : std::string();
-      tg.wasted = gd && IsWasted(mn.glyph);
-      tg.x = cx;
-      tg.w = kGraphTagW;
-      tg.h = kGraphTagH;
-      tg.layer = barLayer;
-      tg.spanFirst = mn.first;
-      tg.spanLast = mn.last;
-      tg.subX = tg.x;
-      tg.subW = tg.w;
-      const int idx = Add(tg);
-      Edge(idx, barIdx, GraphEdge::Trunk);
-      cx += kGraphTagW + kGraphGap;
-    }
-  }
+  for (int idx : sharedPlaced)
+    Edge(idx, busIdx >= 0 ? busIdx : barIdx,
+         busIdx >= 0 ? GraphEdge::Bus : GraphEdge::Trunk);
+  for (const std::pair<int, int>& lk : laneLinks)
+    Edge(lk.first, socketIdx[(size_t)lk.second], GraphEdge::Socket);
 
   outIdx = barIdx;
-  return tagStripW + barW;
+  return boxW;
 }
 
 }  // namespace
@@ -1119,7 +1346,7 @@ EditResult InsertItem(const GlyphLibrary& lib, const SpellTree& tree, int boxNod
     r.why = "that is not a box";
     return r;
   }
-  if (!OpenLaneIfNeeded(t, boxNode, lane, r.why)) return r;
+  if (!OpenLaneIfNeeded(t, boxNode, lane, lib.budgets.maxInstances, r.why)) return r;
   const int item = MakeItemFor(lib, t, glyphId, r.why);
   if (item < 0) return r;
   PlaceItem(lib, t, boxNode, lane, item);
@@ -1310,7 +1537,7 @@ EditResult Move(const GlyphLibrary& lib, const SpellTree& tree, int node, int bo
     r.why = "the hand cannot be moved";
     return r;
   }
-  if (!OpenLaneIfNeeded(t, boxNode, lane, r.why)) return r;
+  if (!OpenLaneIfNeeded(t, boxNode, lane, lib.budgets.maxInstances, r.why)) return r;
   int moved = node;
   if (copy) {
     moved = CloneSubtree(t, node);

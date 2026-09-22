@@ -6683,7 +6683,43 @@ fn mistAirAt(c : vec3<i32>) -> bool {
   return voxMat(voxWordAt(c)) == MAT_AIR;
 }
 
-// THREE voxel reads worst case, and only on a pixel that already resolved a CA
+// HOW MUCH FALLING LIQUID THIS CELL BELONGS TO: the count of its five
+// non-downward axis neighbours that are liquid too, 0..5.
+//
+// A plume is thrown by a FALL, and a fall has to be BIG. The cue below used to
+// ask one question — "is the cell above me liquid?" — and a two-voxel gout of
+// blood leaving a wound answers it exactly the way a river does, so every
+// droplet of blood in flight wore a waterfall's worth of vapour. That veil is
+// 65% white and blends at up to 0.92, so a dark red droplet came out a pale
+// grey-pink smudge: blood FLASHED WHITE the moment it left a body and went
+// back to blood the moment it landed. (Measured 2026-09-22 by returning black
+// from shadeViscous on a --shot-strike frame: the droplet's pixels still read
+// 175,164,162 — nearly all of what was on screen there was this overlay and
+// none of it was the liquid.)
+//
+// WHY THE MEASUREMENT IS SIDEWAYS AND NOT UPWARD. The obvious size test is
+// "how tall is the column above me", and it is the wrong one: a CA waterfall
+// in flight is vertically BROKEN — the cells separate as they accelerate, so
+// the column reads as stacked slabs with air between them, and a run-length
+// gate erases the mist from the very thing it exists for (tried first, and
+// --shot-waterfall came back a clear blue ribbon with no plume at all). What a
+// river has and a wound does not is WIDTH: the falling sheet is cells across
+// in x and z, while a gout is one or two cells alone in the air.
+//
+// Five reads on a pixel that already resolved a CA liquid surface, against the
+// three the cue paid before. Cheap beside the 48 the smooth liquid normal on
+// the same pixel already spends, and only ever reached on liquid.
+fn fallMassAt(cell : vec3<i32>) -> f32 {
+  var n = 0.0;
+  if (mistLiquidAt(cell + vec3<i32>(0, 1, 0))) { n += 1.0; }
+  if (mistLiquidAt(cell + vec3<i32>(1, 0, 0))) { n += 1.0; }
+  if (mistLiquidAt(cell + vec3<i32>(-1, 0, 0))) { n += 1.0; }
+  if (mistLiquidAt(cell + vec3<i32>(0, 0, 1))) { n += 1.0; }
+  if (mistLiquidAt(cell + vec3<i32>(0, 0, -1))) { n += 1.0; }
+  return n;
+}
+
+// SEVEN voxel reads worst case, and only on a pixel that already resolved a CA
 // liquid surface. The branches are exclusive because the second question is a
 // different question in each: a cell either has air under it or it does not.
 fn fallCueAt(cell : vec3<i32>) -> FallCue {
@@ -6691,18 +6727,22 @@ fn fallCueAt(cell : vec3<i32>) -> FallCue {
   cue.fall = 0.0;
   cue.impact = 0.0;
   if (mistAirAt(cell + vec3<i32>(0, -1, 0))) {
-    // In flight. Liquid directly above means a continuous column, which is the
-    // strong signal; a lone cell with air on both sides is one droplet and is
-    // worth proportionally less veil.
-    cue.fall = select(0.55, 1.0, mistLiquidAt(cell + vec3<i32>(0, 1, 0)));
+    // In flight, and how much of a fall this is comes off how much liquid is
+    // falling WITH it: nothing at all for a lone droplet or a pair, the full
+    // veil once it is part of a sheet.
+    cue.fall = smoothstep(1.5, 3.5, fallMassAt(cell));
     // And if something solid is within two cells under it, this cell IS the
-    // foot of the fall — the spray belongs here as much as at the pool.
-    cue.impact = select(1.0, 0.0, mistAirAt(cell + vec3<i32>(0, -2, 0)));
+    // foot of the fall — the spray belongs here as much as at the pool. Same
+    // gate: a droplet about to land is not a plunge basin.
+    cue.impact = select(cue.fall, 0.0, mistAirAt(cell + vec3<i32>(0, -2, 0)));
   } else {
     // At rest: a pool surface. It is a plunge site only if there is DETACHED
-    // liquid coming down onto it — an air gap, then water.
-    if (mistAirAt(cell + vec3<i32>(0, 1, 0))) {
-      cue.impact = select(0.0, 1.0, mistLiquidAt(cell + vec3<i32>(0, 2, 0)));
+    // liquid coming down onto it — an air gap, then water, and enough of it to
+    // be a fall by the same measure (taken up THERE, not here: a pool has five
+    // liquid neighbours of its own and would pass its own test every time).
+    let above = cell + vec3<i32>(0, 2, 0);
+    if (mistAirAt(cell + vec3<i32>(0, 1, 0)) && mistLiquidAt(above)) {
+      cue.impact = smoothstep(1.5, 3.5, fallMassAt(above));
     }
   }
   return cue;
@@ -6759,7 +6799,16 @@ fn waterfallMist(base : vec3f, hitP : vec3f, rd : vec3f, tHit : f32,
   // and aerated oil is brown foam; nothing here names a material.
   let lmc = (unpackColor(materials[mat].color0) +
              unpackColor(materials[mat].color1)) * 0.5;
-  let tint = mix(vec3f(1.0), lmc, 0.35);
+  // HOW WHITE AERATION GOES IS THE LIQUID'S OWN BUSINESS, and the axis is the
+  // authored opacity — the same one submergedProfile reads, so nothing here
+  // names a material. Foam is white because a cloud of bubbles scatters every
+  // wavelength before any of it is absorbed; that only holds for a liquid light
+  // gets THROUGH. Water (opacity 90) still goes to the 0.65 white this always
+  // used, while blood (200) and oil (235) keep their own colour and foam pink
+  // and brown, which is what they actually do.
+  let clarity = clamp((1.0 - f32(materials[mat].opacity) / 255.0) * 1.5,
+                      0.0, 1.0);
+  let tint = mix(lmc, vec3f(1.0), 0.65 * clarity);
   let col = (ambientAt(vec3f(0.0, 1.0, 0.0)) + keyLightColor() * lit)
             * (0.25 + 0.75 * lit) * tint * TUNE_MIST_BRIGHTNESS;
 

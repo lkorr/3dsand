@@ -8482,7 +8482,17 @@ bool Mob::HpZeroSevers(int limbIndex) const {
   // (the anchor component keeps the identity, a limb never leaves while it is
   // still mostly there). Changing what hp 0 means underneath that is a
   // different change with a different gate; this one is about blades.
-  if (inBurnFlush_) return true;
+  //
+  // ...BUT NOT WHEN THE FLUSH IS A BEATING (2026-09-22). Mob::BluntPulpTick
+  // expresses the blunt dissolution through the SAME FlushBurn tail the fire
+  // and the infection use, so `inBurnFlush_` is true there too -- and this line
+  // then handed a mace the one sever the whole blunt model refuses: an arm
+  // beaten to hp 0 (which Mob::Damage deliberately declines to take off) came
+  // off at the next tick of its own crater opening. The owner's report was
+  // exactly that, "my arms fell off after being hit by a mace". Under a
+  // BluntCarveScope the ordinary rule below applies instead, so a vital or root
+  // limb at zero still routes to death and a limb does not.
+  if (inBurnFlush_ && !inBluntCarve_) return true;
   if (!def_) return true;
   if (limbIndex < 0 || limbIndex >= (int)limbDefs_.size()) return true;
   // A VITAL OR ROOT LIMB AT ZERO IS A DEATH, NOT AN AMPUTATION — and Sever()
@@ -12933,6 +12943,25 @@ bool Mob::BluntPulpTick(uint32_t tick, World& world,
   if (bloodMat == 0) return true;
   const uint32_t pulpAt =
       (uint32_t)std::lround(std::clamp(gt.pulpAmt, 1.0f, 15.0f));
+  // WHAT CRUMBLES TO THIS CREATURE'S BLOOD, i.e. soft tissue. Empty means the
+  // creature authored no census and everything counts, which is the same
+  // convention SoakBruise takes.
+  const std::vector<uint8_t>& tissue = def_->tissue;
+
+  // ---- A BEATING IS STILL A BEATING WHEN IT IS THE CLOCK DOING IT ----------
+  //
+  // The dissolution is the SECOND half of a blunt blow, arriving on later ticks
+  // (Mob::BluntHit only raises the flag), and it reaches the lattice through
+  // FlushBurn -> CarveLimb: every structural sever rule in CarveLimb was
+  // therefore live against it while the blow that caused it was scoped and the
+  // crater it opens was not. That is a blunt amputation reached purely by the
+  // voxels going away a few ticks late -- the collapse fraction, the split's
+  // straggler fallback, and (through `inBurnFlush_`) hp zero. The scope belongs
+  // on the whole sweep for exactly the reason Mob::BluntCarveScope states: A
+  // BLUNT HIT NEVER TAKES A LIMB OFF, and "never" has to include the crater.
+  // `unarmed` is not carried on the flag and does not matter here -- the two
+  // rules it picks are bleed rates, and a burn flush refuses the bleed anyway.
+  BluntCarveScope blunt(*this);
 
   for (int li = 0; li < (int)limbs_.size(); li++) {
     MobLimb& limb = limbs_[li];
@@ -12965,10 +12994,21 @@ bool Mob::BluntPulpTick(uint32_t tick, World& world,
       return c == kNoBurnCell ? 0u : (bs.idx[c] & ~kBurnQueued);
     };
 
+    // BONE DOES NOT DISSOLVE (2026-09-22). Rung 2 lays its blood only on
+    // tissue (SoakBruise makes the same exclusion: a contusion is a burst
+    // capillary bed), but blood on a voxel is not the only way one gets there
+    // -- StainWoundAs floors every NON-tissue cell in a cut at `boneMin`
+    // precisely so a wound shows bone through the blood, and pulpAmt is below
+    // that floor. So a limb cut once and then beaten had its SKELETON eaten,
+    // which is the structure every sever rule in CarveLimb measures: take the
+    // bone out from under a forearm and what is left is a fraction and a split.
+    // A mace shatters bone, it does not delete it.
     std::vector<uint32_t> candidates;
     const size_t n = v.Size();
     for (size_t i = 0; i < n; i++) {
-      if ((v.Mat(i) & 0xFFFu) == 0) continue;
+      const uint32_t mat = v.Mat(i) & 0xFFFu;
+      if (mat == 0) continue;
+      if (!tissue.empty() && (mat >= tissue.size() || !tissue[mat])) continue;
       const uint16_t st = v.Stain(i);
       if (BodyStainMat(st) == bloodMat && BodyStainAmt(st) >= pulpAt)
         candidates.push_back((uint32_t)i);
@@ -16154,6 +16194,28 @@ Vec3 MobSystem::MobOrigin(uint64_t mobId) const {
   return {};
 }
 
+bool MobSystem::MobBodyBox(uint64_t mobId, Vec3& lo, Vec3& hi) const {
+  for (const Mob& mob : mobs_) {
+    if (mob.id_ != mobId) continue;
+    // `origin_` is the prefab MIN CORNER in x/z and the feet in y, which is
+    // exactly how BodyCentre reads it.
+    const Vec3 s = mob.def_ ? mob.def_->worldSize : Vec3{2.0f, 2.0f, 2.0f};
+    lo = mob.origin_;
+    hi = Vec3{mob.origin_.x + s.x, mob.origin_.y + s.y, mob.origin_.z + s.z};
+    return true;
+  }
+  return false;
+}
+
+bool MobSystem::LiftMob(uint64_t mobId, Vec3 vps) {
+  for (Mob& mob : mobs_)
+    if (mob.id_ == mobId) {
+      mob.AddLift(vps);
+      return true;
+    }
+  return false;
+}
+
 Vec3 MobSystem::MobFacing(uint64_t mobId) const {
   // Mob::Facing holds the formula; this is only the id-keyed lookup in front of
   // it. Two copies of "which way is forward" is exactly the sort of thing that
@@ -18671,6 +18733,46 @@ void Mob::Launch(Vec3 vel) {
   fallVel_ = vel.y;
   airVel_ = Vec3{vel.x, 0.0f, vel.z};
   airTime_ = 0.0f;
+}
+
+void Mob::AddLift(Vec3 vps) {
+  if (vps.x == 0.0f && vps.y == 0.0f && vps.z == 0.0f) return;
+  // ---- LIMP: the rig belongs to Jolt --------------------------------------
+  // One impulse per live limb, sized mass x dv so every limb gains the SAME
+  // speed (a uniform rig velocity, which is why SetLimbVelocities exists), and
+  // applied AT the centre of mass so a lift lifts instead of spinning. Worn
+  // shells and held limbs are excluded for the same reason they are there:
+  // their velocity is somebody else's this tick.
+  if (Ragdolled() && phys_) {
+    const float dvM = CellsToMetres(vps.len());
+    if (dvM <= 0.0f) return;
+    for (MobLimb& l : limbs_) {
+      if (!l.body || l.holdSeconds > 0 || l.wornHost >= 0) continue;
+      const float m = phys_->BodyMass(l.body);
+      if (m <= 0.0f) continue;
+      Vec3 com;
+      if (!phys_->BodyCenterOfMass(l.body, com)) continue;
+      phys_->ApplyImpulseAt(l.body, vps, m * dvM, com);
+    }
+    return;
+  }
+  if (!alive_) return;
+  // ---- LIVE: the ballistic state UpdateFall integrates --------------------
+  if (!airborne_) {
+    airborne_ = true;
+    fallVel_ = 0.0f;
+    airVel_ = Vec3{};
+    airTime_ = 0.0f;
+  }
+  fallVel_ += vps.y;
+  airVel_.x += vps.x;
+  airVel_.z += vps.z;
+  if (vps.y > 0.0f) {
+    // Held up, not falling: it does not land on the ground it is leaving this
+    // tick, and it does not go limp for having been off the ground a while.
+    launched_ = true;
+    airTime_ = 0.0f;
+  }
 }
 
 bool Mob::AimAnglesTo(const Vec3& dirWorld, float& outYaw,
