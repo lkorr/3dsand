@@ -18,6 +18,16 @@
     "neutralAlternate": ["horizontal_r", "horizontal_l"]
   },
 
+  "playerDagger": {
+    "sectors": [
+      { "dir": [1.0, 0.0], "style": "horizontal_r" },
+      { "dir": [-1.0, 0.0], "style": "horizontal_l" },
+      { "dir": [0.0, -1.0], "style": "overhead" },
+      { "dir": [0.0, 1.0], "style": "thrust" }
+    ],
+    "neutralAlternate": ["horizontal_r", "horizontal_l"]
+  },
+
   "playerUnarmed": {
     "sectors": [
       { "dir": [1.0, 0.0], "style": "punch_r" },

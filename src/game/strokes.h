@@ -392,6 +392,7 @@ struct StyleLibrary {
   // asking one set of sectors to mean both would make every punch a
   // re-labelled sword cut.
   PlayerStrikeMap playerUnarmed;
+  PlayerStrikeMap playerDagger;
   int Find(const std::string& n) const {
     for (size_t i = 0; i < styles.size(); i++)
       if (styles[i].name == n) return (int)i;

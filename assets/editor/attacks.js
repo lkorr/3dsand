@@ -88,6 +88,7 @@ let trailOn = true;
 // deliberately, and this chip puts the old behaviour back for watching the
 // spread.
 let vary = false;
+let weaponMode = 'long'; // 'unarmed' | 'dagger' | 'long'
 let flick = { x: 1, y: 0 }; // the compass pad's test flick
 const folds = { limbs: false, compass: false, help: false };
 // SOLO: which segment the preview isolates — 'all' runs the program as the
@@ -143,6 +144,7 @@ export const trailEnabled = () => trailOn;
 export const swingNumber = () => swingNo;
 export const varying = () => vary;
 export const isDirty = () => dirty;
+export const currentWeaponMode = () => weaponMode;
 export const soloSegment = () => solo;
 export function nextSwing() { swingNo = (swingNo + 1) >>> 0; }
 
@@ -364,6 +366,7 @@ export function render(container) {
     return;
   }
 
+  renderWeaponModeBar();
   renderStyleBar();
 
   const grid = el('div', { class: 'atk' });
@@ -379,6 +382,53 @@ export function render(container) {
   wrap.append(foldedCompass());
   wrap.append(foldedHelp());
   renderLoaderLog();
+}
+
+/* ---- weapon mode: unarmed / dagger / long ------------------------------ */
+
+function activeCompassMap() {
+  if (!lib) return null;
+  if (weaponMode === 'unarmed') return lib.playerUnarmed;
+  if (weaponMode === 'dagger') return lib.playerDagger;
+  return lib.player;
+}
+
+function activeCompassKey() {
+  if (weaponMode === 'unarmed') return 'playerUnarmed';
+  if (weaponMode === 'dagger') return 'playerDagger';
+  return 'player';
+}
+
+function activeCompassRaw() {
+  if (!raw) return null;
+  const key = activeCompassKey();
+  if (!raw[key] || typeof raw[key] !== 'object')
+    raw[key] = { sectors: [], neutralAlternate: [] };
+  return raw[key];
+}
+
+const WEAPON_MODES = [
+  { id: 'unarmed', label: 'Unarmed' },
+  { id: 'dagger',  label: 'Dagger' },
+  { id: 'long',    label: 'Sword / Mace' },
+];
+
+const WEAPON_FOR_MODE = { unarmed: null, dagger: 'dagger', long: 'sword' };
+
+function renderWeaponModeBar() {
+  const bar = el('div', { class: 'tagbar', style: 'margin-bottom:2px' });
+  for (const m of WEAPON_MODES)
+    bar.append(chip(m.label, weaponMode === m.id, async () => {
+      if (weaponMode === m.id) return;
+      weaponMode = m.id;
+      const want = WEAPON_FOR_MODE[m.id];
+      if (want) await host?.equipWeapon?.(want);
+      else await host?.equipWeapon?.(null, true);
+      render();
+    }, m.id === 'unarmed' ? 'empty hands — punches'
+     : m.id === 'dagger'  ? 'short blade — dagger compass'
+     :                       'long weapons — sword, shortsword, mace, cleaver'));
+  wrap.append(bar);
 }
 
 /* ---- the style list ---------------------------------------------------- */
@@ -448,9 +498,13 @@ function renameStyle() {
   editStyles('rename "' + old + '"', () => {
     const target = raw.styles.find(x => x.name === old);
     if (target) target.name = n;
-    for (const sec of (raw.player?.sectors || [])) if (sec.style === old) sec.style = n;
-    const na = raw.player?.neutralAlternate;
-    if (Array.isArray(na)) for (let k = 0; k < na.length; k++) if (na[k] === old) na[k] = n;
+    for (const mapKey of ['player', 'playerDagger', 'playerUnarmed']) {
+      const m = raw[mapKey];
+      if (!m) continue;
+      for (const sec of (m.sectors || [])) if (sec.style === old) sec.style = n;
+      const na = m.neutralAlternate;
+      if (Array.isArray(na)) for (let k = 0; k < na.length; k++) if (na[k] === old) na[k] = n;
+    }
   });
   toast(`renamed — check assets/mobs/behaviors.json for "${old}"`);
 }
@@ -470,18 +524,24 @@ function dupStyle() {
 
 function deleteStyle() {
   const s = lib.styles[selected];
-  const refs = (raw.player?.sectors || []).filter(x => x.style === s.name).length +
-    (raw.player?.neutralAlternate || []).filter(x => x === s.name).length;
+  let refs = 0;
+  for (const mapKey of ['player', 'playerDagger', 'playerUnarmed']) {
+    const m = raw[mapKey];
+    if (!m) continue;
+    refs += (m.sectors || []).filter(x => x.style === s.name).length;
+    refs += (m.neutralAlternate || []).filter(x => x === s.name).length;
+  }
   if (!confirm(`Delete "${s.name}"?` +
-    (refs ? `\n\n${refs} reference(s) in this file's player compass go with it.` : '') +
+    (refs ? `\n\n${refs} reference(s) in this file's player compasses go with it.` : '') +
     '\n\nUndo (Ctrl+Z) brings it back. A behaviour profile that still names it ' +
     'gets a loud skip and its first available style, never a crash.')) return;
   editStyles('delete "' + s.name + '"', () => {
     raw.styles.splice(raw.styles.findIndex(x => x.name === s.name), 1);
-    if (raw.player) {
-      raw.player.sectors = (raw.player.sectors || []).filter(x => x.style !== s.name);
-      raw.player.neutralAlternate =
-        (raw.player.neutralAlternate || []).filter(x => x !== s.name);
+    for (const mapKey of ['player', 'playerDagger', 'playerUnarmed']) {
+      const m = raw[mapKey];
+      if (!m) continue;
+      m.sectors = (m.sectors || []).filter(x => x.style !== s.name);
+      m.neutralAlternate = (m.neutralAlternate || []).filter(x => x !== s.name);
     }
   });
 }
@@ -1516,7 +1576,10 @@ function fold(key, title, build) {
 }
 
 const foldedLimbs = () => fold('limbs', 'per-limb — range of motion & body share', limbsBody);
-const foldedCompass = () => fold('compass', 'player flick compass', compassBody);
+const foldedCompass = () => {
+  const mode = WEAPON_MODES.find(m => m.id === weaponMode);
+  return fold('compass', (mode ? mode.label : 'player') + ' flick compass', compassBody);
+};
 const foldedHelp = () => fold('help', 'how a stroke works', helpBody);
 
 /**
@@ -1661,8 +1724,10 @@ function limbRow(p) {
 
 function compassBody() {
   const wrapEl = el('div', {});
-  const pj = raw.player || (raw.player = { sectors: [], neutralAlternate: [] });
+  const compassKey = activeCompassKey();
+  const pj = activeCompassRaw();
   if (!Array.isArray(pj.sectors)) pj.sectors = [];
+  const compassMap = activeCompassMap();
 
   const row = el('div', { style: 'display:flex;gap:12px;align-items:flex-start;flex-wrap:wrap' });
   const SZ = 150;
@@ -1673,17 +1738,17 @@ function compassBody() {
   const testLbl = el('div', { class: 'hint',
     style: 'font-family:var(--mono);max-width:150px' });
   const updateTest = () => {
-    const i = MELEE.quantizeStrike(lib, flick.x, flick.y);
+    const i = MELEE.quantizeStrike(compassMap, flick.x, flick.y);
     testLbl.textContent = `(${fmt(flick.x)}, ${fmt(flick.y)}) → ` +
       (i >= 0 ? lib.styles[i].name : 'no sector');
   };
-  drawCompass(pad, SZ); updateTest();
+  drawCompass(pad, SZ, compassMap); updateTest();
   const padPoint = ev => {
     const r = pad.getBoundingClientRect();
     const x = (ev.clientX - r.left) / SZ * 2 - 1, y = (ev.clientY - r.top) / SZ * 2 - 1;
     const l = Math.hypot(x, y);
     flick = l > 1e-4 ? { x: x / l, y: y / l } : { x: 1, y: 0 };
-    drawCompass(pad, SZ); updateTest();
+    drawCompass(pad, SZ, compassMap); updateTest();
   };
   pad.addEventListener('pointerdown', e => {
     padPoint(e);
@@ -1737,7 +1802,7 @@ function compassBody() {
     if (i < 0) return false;
     for (let k = 0; k < 720; k++) {
       const a = k / 720 * Math.PI * 2;
-      if (MELEE.quantizeStrike(lib, Math.cos(a), Math.sin(a)) === i) return false;
+      if (MELEE.quantizeStrike(compassMap, Math.cos(a), Math.sin(a)) === i) return false;
     }
     return true;
   });
@@ -1768,7 +1833,8 @@ function styleSelect(value, onChange) {
  * pictures differ, and the wedge picture is the one that hides an unreachable
  * sector.
  */
-function drawCompass(canvas, SZ) {
+function drawCompass(canvas, SZ, map) {
+  map = map || activeCompassMap() || lib.player;
   const g = canvas.getContext('2d');
   const R = SZ / 2 - 2;
   g.clearRect(0, 0, SZ, SZ);
@@ -1777,7 +1843,7 @@ function drawCompass(canvas, SZ) {
   const steps = 240;
   for (let k = 0; k < steps; k++) {
     const a0 = k / steps * Math.PI * 2, a1 = (k + 1) / steps * Math.PI * 2;
-    const i = MELEE.quantizeStrike(lib, Math.cos((a0 + a1) / 2), Math.sin((a0 + a1) / 2));
+    const i = MELEE.quantizeStrike(map, Math.cos((a0 + a1) / 2), Math.sin((a0 + a1) / 2));
     g.beginPath();
     g.moveTo(SZ / 2, SZ / 2);
     g.arc(SZ / 2, SZ / 2, R, a0, a1);
@@ -1786,7 +1852,7 @@ function drawCompass(canvas, SZ) {
     g.fill();
   }
   g.lineWidth = 2;
-  for (const s of lib.player.sectors) {
+  for (const s of map.sectors) {
     const l = Math.hypot(s.x, s.y) || 1;
     g.strokeStyle = '#dfe6f2';
     g.beginPath();

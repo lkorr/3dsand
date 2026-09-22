@@ -381,6 +381,7 @@ bool LoadAttackStyles(const std::string& path, StyleLibrary& out,
   };
   readMap("player", lib.player);
   readMap("playerUnarmed", lib.playerUnarmed);
+  readMap("playerDagger", lib.playerDagger);
   out = std::move(lib);
   return true;
 }

@@ -519,6 +519,7 @@ bool LoadItems(const std::string& dir, size_t materialCount,
     // baseline; rescale so the same number means the same distance.
     d.reach = it.value("reach", 9.0f) *
               ((float)kVoxelsPerMetre / (float)kLegacyAuthoringVoxelsPerMetre);
+    d.weaponClass = it.value("weaponClass", "");
     // A broken item is skipped, never fatal: one bad asset must not cost the
     // player their whole hotbar (DESIGN.md §6, the same rule mob defs follow).
     if (!LoadItemAsset(dir, materialCount, micro, d, errors)) continue;

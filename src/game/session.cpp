@@ -521,12 +521,15 @@ static void PhaseA(TickAuthorityCtx& w, WorldScratch& ws,
         // direction that was flicked, aimed wherever the camera is THEN.
         if (ti.Pressed(TB_ATTACK) && meleeReady) {
           const StyleLibrary& styleLib = mobs.AttackStyles();
-          // WHICH COMPASS: the sword's, or the fists'. Two maps rather than one
-          // filtered set, because the two are different SHAPES (strokes.h
-          // StyleLibrary::playerUnarmed) — a punch compass has a jab and a
-          // cross where a sword's has an overhead and a thrust.
+          // WHICH COMPASS: three maps keyed on what is in the fist.
+          // A dagger's short blade needs its own sectors, and unarmed
+          // is a different vocabulary entirely (punches vs cuts).
           const PlayerStrikeMap& map =
-              meleeArmed ? styleLib.player : styleLib.playerUnarmed;
+              !meleeArmed              ? styleLib.playerUnarmed
+            : (heldItem && heldItem->weaponClass == "dagger"
+                         && styleLib.playerDagger.Usable())
+                                       ? styleLib.playerDagger
+            :                            styleLib.player;
           float fx = 0, fy = 0;
           int si = -1;
           if (strikePicker.Pick(CurrentTuning().melee.pickMinSpeed, fx, fy))

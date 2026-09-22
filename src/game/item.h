@@ -406,6 +406,11 @@ struct ItemDef {
   // since the blade geometry is supposed to be what decides the wound.
   float carveBonus = 0.0f;
 
+  // Which player strike compass this weapon selects: "dagger" uses
+  // playerDagger, anything else (or empty) uses player. Authored in
+  // items.json; absent defaults to the armed compass.
+  std::string weaponClass;
+
   // ---- HEFT: how much weapon is behind the edge ---------------------------
   //
   // DERIVED FROM THE ART, because the art is right there. `heftVolume` is the

@@ -1451,8 +1451,9 @@ export function parseStyleLibrary(json) {
     return map;
   };
   const player = readMap('player');
+  const playerDagger = readMap('playerDagger');
   const playerUnarmed = readMap('playerUnarmed');
-  return { styles, player, playerUnarmed, log, raw: json };
+  return { styles, player, playerDagger, playerUnarmed, log, raw: json };
 }
 
 // strokes.h:118 PlayerStrikeMap::Usable. Takes a LIBRARY (meaning its armed

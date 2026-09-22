@@ -34,6 +34,7 @@
     {
       "id": "dagger",
       "kind": "melee",
+      "weaponClass": "dagger",
       "damage": 6.5,
       "carveBonus": 0.04,
       "reach": 6.5,
