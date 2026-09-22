@@ -50,8 +50,9 @@ graph can draw is a sentence; every sentence draws.
   root makes two columns; the left can end in a projectile, the right in a
   heal on self. That is the same split node used everywhere else in the tree,
   so **`also` is dropped**: a root split is what "two spells at once" means.
-  In words: `lane explosive projectile lane blood mend self`. Cost adds per
-  column exactly as L4 said it did for `also`; L4 moves to root lanes.
+  In words (the shipped `lane`/`end` form of §2): `lane explosive projectile
+  end lane blood mend self end`. Cost adds per column exactly as L4 said it
+  did for `also`; L4 moves to root lanes.
 - **Copies fan, columns do not.** `SpellFan` spreads only instances that
   carry the SAME payload (the shared-only copies). An instance with its own
   lane fires on the aim, so a projectile in the right-hand column flies at the
