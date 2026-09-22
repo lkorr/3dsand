@@ -60,7 +60,7 @@ namespace {
 
 // Graph node kinds, mirrored from game/spellgraph.h's GraphKind. The mirror
 // carries the enum as an int because ui/overlay.h is spell-free.
-enum Kind { kWord = 0, kOperator, kJoin, kModTag, kRoot, kSocket, kBus };
+enum Kind { kWord = 0, kOperator, kJoin, kModTag, kRoot, kSocket, kBus, kSplit };
 // Edge kinds, from GraphEdge.
 enum EKind { kTrunk = 0, kEBus, kESocket, kFan, kSlot };
 // Glyph sorts, from GlyphSort.
@@ -618,9 +618,23 @@ GraphCanvasResult SpellGraphCanvas(UIState& s, ImVec2 at, ImVec2 size, bool read
   // touched. The bus ends up hugging the bar it feeds, which is also what it
   // means.
   std::vector<float> layerH((size_t)std::max(1, g.layers), 0.0f);
-  for (const UIState::SpellGraphUI::Node& n : g.nodes)
-    if (n.layer >= 0 && n.layer < g.layers)
-      layerH[(size_t)n.layer] = std::max(layerH[(size_t)n.layer], (float)n.h);
+  // WHAT KIND OF ROW THIS LAYER IS, which is not deducible from its height:
+  // a socket row and a mod bead row are both 32 layout px and want completely
+  // different bands, and squashing them the same way is why a `shotgun` bead
+  // came out an 8 px sliver sitting on the aim pip's ring. Ordered by weight:
+  // a layer is as tall as the heaviest thing standing in it.
+  enum Band { kBRule = 0, kBSplit, kBSocket, kBBead, kBCell };
+  std::vector<int> layerB((size_t)std::max(1, g.layers), kBRule);
+  for (const UIState::SpellGraphUI::Node& n : g.nodes) {
+    if (n.layer < 0 || n.layer >= g.layers) continue;
+    layerH[(size_t)n.layer] = std::max(layerH[(size_t)n.layer], (float)n.h);
+    const int band = n.h >= 64.0f      ? kBCell
+                     : n.kind == kModTag ? kBBead
+                     : n.kind == kSocket ? kBSocket
+                     : n.kind == kSplit  ? kBSplit
+                                         : kBRule;
+    layerB[(size_t)n.layer] = std::max(layerB[(size_t)n.layer], band);
+  }
   // FURNITURE IS SQUASHED, AND IT HUGS WHAT IT BELONGS TO (2026-09-22). A cell
   // is 64 layout px and gets its full share; a socket row (32) is a row of
   // pips, a bus (16) is one rule, and a mod bead (32) is a lozenge - none of
@@ -633,10 +647,18 @@ GraphCanvasResult SpellGraphCanvas(UIState& s, ImVec2 at, ImVec2 size, bool read
   // words - the old uniform bands and gaps came to 216 px in a band of 192:
   // the two-word case was clipped at both ends on a 1600x900 screen, and every
   // picture in the gallery was cut. The same tree in squashed bands is 168.
-  auto bandFor = [](float h, float sc) {
-    if (h >= 64.0f) return std::floor(h * sc);           // a cell: its own size
-    if (h <= 16.0f) return std::max(4.0f, std::floor(h * sc));  // a bus: a rule
-    return std::max(8.0f, std::floor(h * sc * 0.55f));   // pips, beads
+  auto bandFor = [](int band, float h, float sc) {
+    switch (band) {
+      case kBCell: return std::floor(h * sc);                 // a cell: its size
+      // A BEAD IS A LOZENGE, AND A LOZENGE NEEDS A SHORT AXIS (2026-09-22). At
+      // 0.55 a 32 px bead came out 8 px tall against 48 px wide, which draws as
+      // a hairline with a 16 px engraving stamped over it - the `shotgun` on
+      // every fanned spell on the page. 0.75 with a 14 px floor keeps it a
+      // bead at every rung and costs six pixels.
+      case kBBead: return std::max(14.0f, std::floor(h * sc * 0.75f));
+      case kBSocket: return std::max(8.0f, std::floor(h * sc * 0.55f));
+      default: return std::max(4.0f, std::floor(h * sc));     // a bus, a junction
+    }
   };
   auto gapFor = [](float sc) {
     return std::max(kBandAir, std::floor((float)kPitchPx * sc * 0.22f * 0.5f) * 2.0f);
@@ -645,8 +667,21 @@ GraphCanvasResult SpellGraphCanvas(UIState& s, ImVec2 at, ImVec2 size, bool read
   auto gapAt = [&](int upper, float sc) {
     const float gFull = gapFor(sc);
     if (upper <= 0 || upper >= g.layers) return gFull;
-    const float ha = layerH[(size_t)upper], hb = layerH[(size_t)(upper - 1)];
-    if (ha >= 64.0f && hb >= 64.0f) return gFull;
+    const int ba = layerB[(size_t)upper], bb = layerB[(size_t)(upper - 1)];
+    if (ba == kBCell && bb == kBCell) return gFull;
+    // A FAN NEEDS ROOM TO BE A FAN. The one gap on the page that is not air is
+    // the one between a junction and the socket row it opens into: those
+    // strokes ARE the split, and at the 2 px hug below they come out a
+    // horizontal bar with two blobs on it. Everything else can touch.
+    // It gets exactly the gap two CELLS get - no more: measured on this scene,
+    // a gap of 42 at 1x put `sand gust shotgun projectile` five pixels over the
+    // band and dropped the whole page to the overview rung to buy a steeper V.
+    if ((ba == kBSocket && bb == kBSplit) || (ba == kBSplit && bb == kBSocket))
+      return gFull;
+    // ...and a bead may not land on a pip, which after the reorder is the layer
+    // next to it in both orders.
+    if ((ba == kBSocket && bb == kBBead) || (ba == kBBead && bb == kBSocket))
+      return std::max(6.0f, std::floor(10.0f * sc * 0.5f) * 2.0f);
     // Furniture TOUCHES what it belongs to: a pip two pixels off the bus it
     // feeds is a pip on the bus, which is what it means, and every 10 px of
     // air between two rows of marks is 10 px the cells above do not get. It
@@ -664,7 +699,7 @@ GraphCanvasResult SpellGraphCanvas(UIState& s, ImVec2 at, ImVec2 size, bool read
   auto heightFor = [&](float sc) {
     float h = 0.0f;
     for (int L = g.layers - 1; L >= 0; L--) {
-      h += bandFor(layerH[(size_t)L], sc);
+      h += bandFor(layerB[(size_t)L], layerH[(size_t)L], sc);
       if (L > 0) h += gapAt(L, sc);
     }
     return h;
@@ -782,7 +817,7 @@ GraphCanvasResult SpellGraphCanvas(UIState& s, ImVec2 at, ImVec2 size, bool read
     float t = 0.0f;
     for (int L = g.layers - 1; L >= 0; L--) {
       layerTop[(size_t)L] = t;
-      const float bh = bandFor(layerH[(size_t)L], scale);
+      const float bh = bandFor(layerB[(size_t)L], layerH[(size_t)L], scale);
       layerY[(size_t)L] =
           layerH[(size_t)L] > 0.0f ? bh / layerH[(size_t)L] : scale;
       t += bh + (L > 0 ? gapAt(L, scale) : 0.0f);
@@ -833,7 +868,7 @@ GraphCanvasResult SpellGraphCanvas(UIState& s, ImVec2 at, ImVec2 size, bool read
   // layers below the bar.
   auto BandBot = [&](int layer) {
     const size_t L = (size_t)std::clamp(layer, 0, g.layers - 1);
-    return std::floor(org.y + layerTop[L] + bandFor(layerH[L], scale));
+    return std::floor(org.y + layerTop[L] + bandFor(layerB[L], layerH[L], scale));
   };
 
   // ---- THE SHEET, under everything ------------------------------------------
@@ -855,12 +890,36 @@ GraphCanvasResult SpellGraphCanvas(UIState& s, ImVec2 at, ImVec2 size, bool read
   static std::string sNote;
   sNote.clear();
 
+  // THE BAR THAT OWNS A SYNTHESIZED NODE. A bus and a socket have no tree node
+  // of their own, so every gesture on one has to find the join that lists it.
+  // By search rather than by a stored back-pointer, because the mirror is a flat
+  // list and the search is over a handful of nodes.
+  auto boxOf = [&](int nodeIdx) {
+    for (size_t bi = 0; bi < g.nodes.size(); bi++) {
+      const UIState::SpellGraphUI::Node& bn = g.nodes[bi];
+      if (bn.kind != kJoin && bn.kind != kRoot) continue;
+      // ...and never a COPY: a split delivery is drawn once per branch and only
+      // the primary cell owns the bus, the junction and the socket list.
+      if (bn.primary >= 0) continue;
+      if (bn.bus == nodeIdx || bn.split == nodeIdx) return (int)bi;
+      for (int sk : bn.sockets)
+        if (sk == nodeIdx) return (int)bi;
+    }
+    return -1;
+  };
+  // A cell that is a copy answers for the cell that owns the record.
+  auto primaryOf = [&](int nodeIdx) {
+    if (nodeIdx < 0 || nodeIdx >= (int)g.nodes.size()) return nodeIdx;
+    const int p = g.nodes[(size_t)nodeIdx].primary;
+    return p >= 0 ? p : nodeIdx;
+  };
+
   // THE ONE DROP ROUTINE. Every target on the canvas calls it: it peeks at the
   // payload, decides which tree op the gesture means, describes it to the
   // marker layer, and only latches the intent on the actual release. The UI
   // never applies an op — main.cpp does, from game/spellgraph.h, and answers a
   // refusal on the status line.
-  enum class Tgt { Bar, Bus, Socket, Body, PipL, PipR, Cell };
+  enum class Tgt { Bar, Bus, Socket, Split, Body, PipL, PipR, Cell };
   auto offer = [&](Tgt tgt, int nodeIdx, ImVec2 a, ImVec2 b) {
     if (!ImGui::BeginDragDropTarget()) return;
     const ImGuiPayload* p = ImGui::AcceptDragDropPayload(kPayloadGraphNode, kPeekFlags);
@@ -973,28 +1032,28 @@ GraphCanvasResult SpellGraphCanvas(UIState& s, ImVec2 at, ImVec2 size, bool read
       }
       case Tgt::Bar:
       case Tgt::Bus:
+      case Tgt::Split:
       case Tgt::Socket: {
         // Which BOX, and which LANE of it. A bar and a bus are the box's shared
         // segment (lane 0); a socket is instance i's own lane, and a socket
         // with no lane yet OPENS the next one (spellgraph.h: lane ==
         // laneCount + 1 opens, anything past that is refused).
-        int boxIdx = nodeIdx;
+        int boxIdx = primaryOf(nodeIdx);
         int lane = 0;
-        if (tgt != Tgt::Bar) {
-          // A bus and a socket are synthesized: their box is the bar that owns
-          // them. Found by search rather than stored, because the mirror is a
-          // flat list and the search is over a handful of nodes.
-          boxIdx = -1;
-          for (size_t bi = 0; bi < g.nodes.size(); bi++) {
-            const UIState::SpellGraphUI::Node& bn = g.nodes[bi];
-            if (bn.kind != kJoin && bn.kind != kRoot) continue;
-            if (bn.bus == nodeIdx) { boxIdx = (int)bi; break; }
-            for (int sk : bn.sockets)
-              if (sk == nodeIdx) { boxIdx = (int)bi; break; }
-            if (boxIdx >= 0) break;
-          }
+        if (tgt == Tgt::Bar) {
+          // A SPLIT DELIVERY IS DRAWN ONCE PER BRANCH, and a drop on branch k's
+          // cell is a drop on branch k — which is a 64 px target for the
+          // gesture that used to need a 32 px pip. `instance` is -1 on the one
+          // cell an unsplit box has, and that is the shared segment as before.
+          const int32_t inst = g.nodes[(size_t)nodeIdx].instance;
+          if (inst >= 0) lane = inst + 1;
+        } else {
+          // A bus, a socket and the junction are synthesized: their box is the
+          // cell that owns them. The junction is a SHARED target (lane 0), like
+          // the bus - it is the one line every branch comes out of.
+          boxIdx = boxOf(nodeIdx);
           if (boxIdx < 0) {
-            refuse("that socket has no box");
+            refuse("that mark has no box");
             ImGui::EndDragDropTarget();
             return;
           }
@@ -1148,6 +1207,27 @@ GraphCanvasResult SpellGraphCanvas(UIState& s, ImVec2 at, ImVec2 size, bool read
     const ImVec2 a = NodeMin(n), b = NodeMax(n);
     ImGui::PushID(9000 + (int)i);
     switch (n.kind) {
+      case kSplit: {
+        // THE JUNCTION. One blot on the box's axis, where the trunk stops being
+        // one line and the fan starts being several. It is drawn rather than
+        // implied because the thing the player needs to see is WHERE the split
+        // happens - the fan used to leave the delivery cell, which said the
+        // delivery did it, and it does not: the mod bead sitting on this blot
+        // does.
+        const ImVec2 c(std::floor((a.x + b.x) * 0.5f),
+                       std::floor((a.y + b.y) * 0.5f));
+        const float r = scale < 1.0f ? 4.0f : 6.0f;
+        PixelDisc(dl, c, r, ColIronGall());
+        PixelRing(dl, c, r + 2.0f, Fade(ColIronSoft(), 0.5f), 2.0f);
+        ImGui::SetCursorScreenPos(ImVec2(c.x - r - 6, c.y - r - 6));
+        ImGui::InvisibleButton("##split", ImVec2(r * 2 + 12, r * 2 + 12));
+        if (ImGui::IsItemHovered() && !live)
+          Tip("THE SPLIT: one of it becomes several here. Drop a word on it and "
+              "every branch gets it.");
+        offer(Tgt::Split, (int)i, ImVec2(c.x - r - 6, c.y - r - 6),
+              ImVec2(c.x + r + 6, c.y + r + 6));
+        break;
+      }
       case kBus: {
         // A straight stroke spanning every socket. Drawn here rather than as an
         // edge because it is a NODE with a width, and its ends are what tell you
@@ -1236,7 +1316,27 @@ GraphCanvasResult SpellGraphCanvas(UIState& s, ImVec2 at, ImVec2 size, bool read
           ImGui::TextDisabled(own ? "this instance has a lane of its own"
                                   : "this instance carries the shared payload");
           ImGui::TextDisabled("drop a word here to give it a payload of its own");
+          if (own) ImGui::TextDisabled("right-click closes this lane and its words");
           EndTip();
+        }
+        // RIGHT-CLICK TAKES THE WHOLE LANE OUT, which is the only way to lose a
+        // socket that is not the last one: emptying a lane by deleting its words
+        // one at a time cannot drop it, because every lane above it is numbered
+        // from it (game/spellgraph.h, `CloseLane`). An instance a count mod made
+        // has no lane to close and the op says so on the status line.
+        if (!readOnly && ImGui::IsItemHovered() && !live &&
+            ImGui::IsMouseClicked(ImGuiMouseButton_Right)) {
+          const int boxIdx = boxOf((int)i);
+          if (boxIdx >= 0) {
+            PushGrimoireUndo(s);
+            s.graphEdit = {};
+            s.graphEdit.pending = true;
+            s.graphEdit.op = UIState::GraphEditIntent::CloseLane;
+            s.graphEdit.treeNode = g.nodes[(size_t)boxIdx].treeNode;
+            // A socket with no lane is one a count mod made, and its index is
+            // past the last lane — which is the case `CloseLane` names.
+            s.graphEdit.lane = n.lane > 0 ? n.lane : n.instance + 1;
+          }
         }
         offer(Tgt::Socket, (int)i, ha, hb);
         break;
@@ -1253,7 +1353,13 @@ GraphCanvasResult SpellGraphCanvas(UIState& s, ImVec2 at, ImVec2 size, bool read
         // What the slab's WIDTH said — how far this delivery reaches — is said
         // by a rule behind the cell instead, spanning the socket row. Drawn
         // FIRST so the cell sits on it.
-        if (!n.sockets.empty()) {
+        //
+        // ...ON THE HAND ONLY (2026-09-22). A spoken delivery with a fan is now
+        // drawn once per BRANCH, and those cells ARE the reach: standing over
+        // the whole row, they say what the rule said and say it in the
+        // drawing's own vocabulary. The rule behind them was a dotted line
+        // running through two cells to reach a third.
+        if (root && !n.sockets.empty()) {
           int lo = INT32_MAX, hi = INT32_MIN;
           for (int sk : n.sockets) {
             if (sk < 0 || sk >= (int)g.nodes.size()) continue;
@@ -1319,7 +1425,15 @@ GraphCanvasResult SpellGraphCanvas(UIState& s, ImVec2 at, ImVec2 size, bool read
         }
         // How MANY of it, as tally strokes rather than as "x3" - and not at
         // all at the overview rung, where a 4 px tally is a dirty pixel.
-        if (scale >= 0.5f) CountPips(dl, a, b, n.n, Fade(ColIronGall(), 0.9f));
+        //
+        // A BRANCH THAT SPLITS AGAIN IS DRAWN COLLAPSED, and the tally is how
+        // it says so (2026-09-22). A count mod inside a lane splits THAT
+        // branch, so the branch fires `bolts` of itself; until the page draws
+        // that sub-fan as a row of its own, one cell wearing its count is the
+        // honest drawing and an uncounted cell is a lie - the branch fires
+        // three and the picture showed one.
+        if (scale >= 0.5f)
+          CountPips(dl, a, b, std::max(n.n, n.bolts), Fade(ColIronGall(), 0.9f));
         // A fan the grammar had to cut is the one thing on a bar that is not
         // reversible by looking harder, so it keeps a mark of its own: a blood
         // notch at the bar's right end. What it was cut TO is in the tip.
@@ -1346,9 +1460,19 @@ GraphCanvasResult SpellGraphCanvas(UIState& s, ImVec2 at, ImVec2 size, bool read
                                 g.tariff, g.carryCost, g.priceUnknown ? " + ?" : "");
             ImGui::TextDisabled("%d / %d mana", g.manaCost, s.manaMax);
           } else {
+            // WHICH BRANCH THIS CELL IS, because there is one per branch now
+            // and they are otherwise identical marks.
+            if (n.instance >= 0)
+              ImGui::TextDisabled("branch %d of %d%s", n.instance + 1, n.instances,
+                                  n.instance == 0 ? "  (the aim)" : "");
             ImGui::TextDisabled("a delivery: %d instance%s, %d lane%s",
                                 n.instances, n.instances == 1 ? "" : "s",
                                 n.laneCount, n.laneCount == 1 ? "" : "s");
+            // ...and if this branch splits again, the tally over it is what
+            // that means. Said in words because the sub-fan is not drawn yet.
+            if (n.bolts > 1)
+              ImGui::TextDisabled("this branch splits again: %d bolts from it",
+                                  n.bolts);
             // THE PRICE AT THIS LEVEL, which is the whole of "the cost is
             // legible at every level" — said here, where it has a line of its
             // own, instead of under a 128 px bar where it never had one.
@@ -1433,11 +1557,17 @@ GraphCanvasResult SpellGraphCanvas(UIState& s, ImVec2 at, ImVec2 size, bool read
           // WHICH RECORD, always — it is the one thing a bead's position shows
           // and its picture does not, and `shotgun` spoken inside a lane is
           // record-wide anyway, so the answer is not guessable from the words.
+          // WHICH SCOPE, and for a count word, that a SPLIT is what it is:
+          // a count on the trunk fans the box, a count on a branch splits that
+          // branch, and one split per scope either way.
+          const bool isSplit = n.edit.rfind("count", 0) == 0;
           if (n.instance >= 0)
-            ImGui::TextDisabled("edits instance %d alone%s", n.instance,
-                                n.instance == 0 ? " (the aim)" : "");
+            ImGui::TextDisabled(isSplit ? "splits branch %d alone%s"
+                                        : "edits instance %d alone%s",
+                                n.instance, n.instance == 0 ? " (the aim)" : "");
           else
-            ImGui::TextDisabled("edits the whole record: every instance");
+            ImGui::TextDisabled(isSplit ? "splits the whole box into its branches"
+                                        : "edits the whole record: every instance");
           if (n.wasted)
             ImGui::TextDisabled("WASTED: this record has no such field. "
                                 "Charged, and it does nothing.");

@@ -1264,6 +1264,24 @@ int32_t RecInstances(const GlyphLibrary& lib, const DeliveryRec& d) {
   return ClampI(want, 1, lib.budgets.maxInstances);
 }
 
+int32_t LaneSplit(const GlyphLibrary& lib, const DeliveryRec& d, int32_t k) {
+  if (k < 0 || k >= (int32_t)d.lanes.size()) return 1;
+  return ClampI(d.lanes[(size_t)k].rec.count, 1, lib.budgets.maxInstances);
+}
+
+int32_t RecBolts(const GlyphLibrary& lib, const DeliveryRec& d) {
+  // THE NUMBER THAT ACTUALLY FLIES. `RecInstances` counts BRANCHES, which is
+  // what the socket row draws; a branch with a `shotgun` of its own fires
+  // three of itself, and every price, budget and cap has to be charged on the
+  // sum. With no count inside any lane every term is 1 and this is
+  // `RecInstances` EXACTLY - which is what keeps every laneless sentence,
+  // every pinned price and every recorded direction where it was.
+  const int32_t branches = RecInstances(lib, d);
+  int32_t total = 0;
+  for (int32_t k = 0; k < branches; k++) total = SatAdd(total, LaneSplit(lib, d, k));
+  return ClampI(total, 1, lib.budgets.maxInstances);
+}
+
 int32_t EffectVolume(const GlyphLibrary& lib, const EffectInst& e) {
   const SpellBudgets& b = lib.budgets;
   const GlyphDef* g = lib.At(e.glyph);
@@ -1312,7 +1330,7 @@ int32_t EffectVolume(const GlyphLibrary& lib, const EffectInst& e) {
         for (const EffectInst& i : ln.extra) lv = SatAdd(lv, EffectVolume(lib, i));
         v = std::max(v, SatAdd(lv, ln.rec.trailBudget));
       }
-      return SatMul(v, RecInstances(lib, e.launch[0]));
+      return SatMul(v, RecBolts(lib, e.launch[0]));
     }
     default: return 0;
   }
@@ -1407,7 +1425,11 @@ int32_t EffectTariffIn(const GlyphLibrary& lib, const EffectInst& e, bool withCa
         int32_t li = shared;
         for (const EffectInst& x : d.lanes[i].extra)
           li = SatAdd(li, EffectTariffIn(lib, x, withCarry));
-        t = SatAdd(t, SatAdd(li, TrailTariffOf(lib, d.lanes[i].rec, withCarry)));
+        // ...TIMES THAT BRANCH'S OWN SPLIT: a branch that fires three of itself
+        // is paid for three times. 1 when nothing inside the lane fans, which
+        // is every sentence that existed before per-branch splitting.
+        t = SatAdd(t, SatMul(SatAdd(li, TrailTariffOf(lib, d.lanes[i].rec, withCarry)),
+                             LaneSplit(lib, d, i)));
       }
       if (inst > L)
         t = SatAdd(t, SatMul(SatAdd(shared, TrailTariffOf(lib, d, withCarry)), inst - L));
@@ -1457,9 +1479,11 @@ void PriceCast(const GlyphLibrary& lib, SpellCast& cast) {
       lb = SatAdd(lb, EffectTariffIn(lib, e, false));
       lt = SatAdd(lt, EffectTariffIn(lib, e, true));
     }
-    // The lane's record already carries the shared trail merged with its own.
-    base = SatAdd(base, SatAdd(lb, TrailTariffOf(lib, ln.rec, false)));
-    total = SatAdd(total, SatAdd(lt, TrailTariffOf(lib, ln.rec, true)));
+    // The lane's record already carries the shared trail merged with its own,
+    // and a branch that splits is paid for once per bolt it makes.
+    const int32_t split = LaneSplit(lib, cast.delivery, i);
+    base = SatAdd(base, SatMul(SatAdd(lb, TrailTariffOf(lib, ln.rec, false)), split));
+    total = SatAdd(total, SatMul(SatAdd(lt, TrailTariffOf(lib, ln.rec, true)), split));
   }
   if (inst > L) {
     base = SatAdd(base, SatMul(SatAdd(shared, TrailTariffOf(lib, cast.delivery, false)),
@@ -1486,13 +1510,17 @@ SpellCast InstanceCast(const SpellCast& cast, int32_t i) {
   const int32_t L = (int32_t)cast.delivery.lanes.size();
   if (i < 0 || i >= L) {
     // A shared-only COPY: it fans, and it must not carry the lane list on to
-    // whatever it launches, or the fan would happen twice.
+    // whatever it launches, or the fan would happen twice. Nor its count: AN
+    // INSTANCE IS ONE OF IT, and leaving the box's fan on a record that has
+    // already been fanned is a squared fan waiting for the first reader.
     out.delivery.lanes.clear();
+    out.delivery.count = 1;
     return out;
   }
   const SpellLane& ln = cast.delivery.lanes[i];
   out.delivery = ln.rec;         // already laneless by construction
   out.delivery.lanes.clear();
+  out.delivery.count = 1;
   for (const EffectInst& e : ln.extra) out.payload.push_back(e);
   return out;
 }
@@ -1583,12 +1611,62 @@ SpellCast LowerBox(const GlyphLibrary& lib, const SpellTree& tree, int node,
     return !n.group && lib.glyphs[n.glyph].field == ModField::Count;
   };
 
-  // COUNT IS RECORD-WIDE, wherever it was spoken (rule 4): count IS the fan,
-  // and a lane is one instance of it, so `shotgun` inside a lane still trebles
-  // the whole box. Applied before the lanes copy the record, so every lane
-  // inherits the same fan.
-  for (int ni : bag)
-    if (isMod(ni) && isCount(ni)) applyMod(cast.delivery, ni);
+  // ONE SPLIT PER SCOPE, AND THE STRONGEST WORD WINS (2026-09-22).
+  //
+  // Count mods used to COMPOSE like every other field: `shotgun shotgun` was
+  // count x9 and `shotgun` three times was 27. That made the fan a number you
+  // stacked rather than a branch point you placed, and it is the opposite of
+  // what a split is for - if you want nine, you put a shotgun on each of the
+  // three branches, and the drawing shows you that you did.
+  //
+  // So: within one SCOPE - the shared segment, or one lane - at most one count
+  // word is effective, and it applies EXACTLY ONCE however many times it was
+  // said (`n` is ignored, which is why `ApplyMod` is called with 1 here). The
+  // winner is the word whose application yields the LARGEST count, ties broken
+  // by the lowest `NodeKey`.
+  //
+  // Largest-then-key rather than first-spoken, because `bag` is sorted by
+  // (lane, NodeKey) precisely so that lowering does not depend on spoken order
+  // - law L2 says the pile is a SET. A "first spoken" rule would put the order
+  // back. Largest-result is a property of the word, not of where it stands, it
+  // is total over any count glyph anybody adds later, and it reads in one
+  // sentence: the strongest count word in a scope wins. `shotgun twin` and
+  // `twin shotgun` both give three, and both waste the `twin`.
+  //
+  // Everything that loses is WASTED: charged, named in the readout, drawn
+  // slashed. By TREE NODE, not by glyph - `wastedMods` is a glyph list and
+  // slashing `shotgun` by glyph would slash the one that is working too.
+  auto applyCount = [&](DeliveryRec& rec, int32_t scopeLane) {
+    int win = -1;
+    int32_t best = rec.count;
+    for (int ni : bag) {
+      if (!isMod(ni) || !isCount(ni) || tree.nodes[ni].lane != scopeLane) continue;
+      if (!ModMeansAnything(ModField::Count, rec.mech, isHand)) {
+        cast.wastedMods.push_back(tree.nodes[ni].glyph);
+        continue;
+      }
+      DeliveryRec probe = rec;
+      ApplyMod(probe, lib.glyphs[tree.nodes[ni].glyph], 1, b);
+      if (win < 0 || probe.count > best) {
+        if (win >= 0) cast.wastedNodes.push_back(win);
+        win = ni;
+        best = probe.count;
+      } else {
+        cast.wastedNodes.push_back(ni);
+      }
+    }
+    if (win >= 0) ApplyMod(rec, lib.glyphs[tree.nodes[win].glyph], 1, b);
+  };
+
+  // A COUNT MOD SPLITS THE SCOPE IT WAS SPOKEN IN (2026-09-22). It used to be
+  // RECORD-WIDE wherever it was spoken - `shotgun` inside a lane trebled the
+  // whole box - which made a fan a property of the box and nothing else, and
+  // left no way to say "this branch splits and that one does not". A count in
+  // the shared segment is still the box's own fan; a count inside lane k is
+  // that BRANCH's split, applied to the lane record down in the lane loop. Put
+  // three shotguns on three branches and you get nine, because you put them
+  // there.
+  applyCount(cast.delivery, 0);
   // The shared segment's other mods.
   for (int ni : bag)
     if (isMod(ni) && !isCount(ni) && tree.nodes[ni].lane == 0) applyMod(cast.delivery, ni);
@@ -1616,6 +1694,16 @@ SpellCast LowerBox(const GlyphLibrary& lib, const SpellTree& tree, int node,
         depth = std::max(depth, child.depth);
         cast.priceUnknown = cast.priceUnknown || child.priceUnknown;
         cast.instancesClamped = cast.instancesClamped || child.instancesClamped;
+        // A CHILD BOX'S WASTED WORDS ARE THE SENTENCE'S WASTED WORDS. A nested
+        // box's cast becomes one Launch value and is otherwise dropped, so
+        // until 2026-09-22 a mod wasted inside a spoken delivery was never
+        // named in the readout and never slashed on the page - the two lists
+        // only ever carried what the HAND wasted. Both are per-sentence facts
+        // and both belong to the cast the player is looking at.
+        cast.wastedMods.insert(cast.wastedMods.end(), child.wastedMods.begin(),
+                               child.wastedMods.end());
+        cast.wastedNodes.insert(cast.wastedNodes.end(), child.wastedNodes.begin(),
+                                child.wastedNodes.end());
         into.push_back(std::move(e));
         continue;
       }
@@ -1644,8 +1732,18 @@ SpellCast LowerBox(const GlyphLibrary& lib, const SpellTree& tree, int node,
     SpellLane ln;
     ln.rec = cast.delivery;
     ln.rec.lanes.clear();
+    // A BRANCH DOES NOT INHERIT THE FAN IT IS A BRANCH OF. `count` on a lane
+    // record means that branch's own split, so the box's count has to be reset
+    // here or it would be counted twice - once as the branch, once as the
+    // branch's split. Nothing read a lane record's count before this day.
+    ln.rec.count = 1;
+    // This lane's own mods. A count among them is this BRANCH's split, and
+    // `ln.rec.count` was reset to 1 just above so it starts from "one of it"
+    // rather than from the box's fan; one of them wins and the rest are wasted,
+    // exactly as in the shared segment.
     for (int ni : bag)
       if (isMod(ni) && !isCount(ni) && tree.nodes[ni].lane == k) applyMod(ln.rec, ni);
+    applyCount(ln.rec, k);
     // Only the trail entries this lane added need the lane's own radius; the
     // shared ones were scaled above, by the shared record's.
     for (size_t ti = sharedTrail; ti < ln.rec.trail.size(); ti++) {
@@ -1671,7 +1769,27 @@ SpellCast LowerBox(const GlyphLibrary& lib, const SpellTree& tree, int node,
   // the clamp goes with it: an instance that cannot fire cannot carry a lane.
   if (childLeaves < 1) childLeaves = 1;
   cast.instances = RecInstances(lib, cast.delivery);
+  // `maxOwn` is a BOLT budget, not a branch budget: what has to stay bounded is
+  // what flies, and a branch that splits flies more than once.
   const int32_t maxOwn = std::max(1, b.maxInstances / childLeaves);
+  // (a) CUT THE SPLITS BACK FIRST, LAST BRANCH FIRST, one bolt at a time.
+  // Tail-first because lane 1 is instance 0 is the aim: dropping a bolt off the
+  // last branch moves nothing the player aimed, and cutting from the front
+  // would renumber every branch after it. One step at a time so the result is a
+  // pure function of the list - no division, no float, no ordering choice - and
+  // bounded, because `ApplyMod` already clamps each split to `maxInstances`.
+  {
+    int32_t bolts = RecBolts(lib, cast.delivery);
+    for (int32_t k = (int32_t)cast.delivery.lanes.size() - 1; bolts > maxOwn && k >= 0;
+         k--) {
+      while (bolts > maxOwn && cast.delivery.lanes[(size_t)k].rec.count > 1) {
+        cast.delivery.lanes[(size_t)k].rec.count--;
+        bolts--;
+        cast.instancesClamped = true;
+      }
+    }
+  }
+  // (b) ...and only then the BRANCH count, exactly as before.
   if (cast.instances > maxOwn) {
     cast.instances = maxOwn;
     cast.delivery.count = std::min(cast.delivery.count, maxOwn);
@@ -1683,7 +1801,8 @@ SpellCast LowerBox(const GlyphLibrary& lib, const SpellTree& tree, int node,
   }
   L = (int32_t)cast.delivery.lanes.size();
   (void)L;
-  cast.leaves = ClampI(SatMul(cast.instances, childLeaves), 1, b.maxInstances);
+  cast.bolts = RecBolts(lib, cast.delivery);
+  cast.leaves = ClampI(SatMul(cast.bolts, childLeaves), 1, b.maxInstances);
   cast.depth = childDepth + (isHand ? 0 : 1);
   cast.generation = 0;
   PriceCast(lib, cast);
@@ -1717,7 +1836,7 @@ SpellCast LowerBox(const GlyphLibrary& lib, const SpellTree& tree, int node,
   }
   if (cast.delivery.mech == DeliveryMech::Continuous)
     voxels = SatMul(voxels, cast.delivery.lifetimeTicks);
-  cast.voxels = SatMul(voxels, cast.instances);
+  cast.voxels = SatMul(voxels, cast.bolts);
   cast.ticks = ticks;
   if (prices) {
     BoxPrice bp;
@@ -1726,6 +1845,10 @@ SpellCast LowerBox(const GlyphLibrary& lib, const SpellTree& tree, int node,
     bp.tariff = cast.tariff;
     bp.carryCost = cast.carryCost;
     bp.instances = cast.instances;
+    bp.bolts = cast.bolts;
+    bp.laneSplits.clear();
+    for (int32_t k = 0; k < cast.instances; k++)
+      bp.laneSplits.push_back(LaneSplit(lib, cast.delivery, k));
     bp.leaves = cast.leaves;
     bp.instancesClamped = cast.instancesClamped;
     prices->push_back(bp);
@@ -2014,6 +2137,13 @@ std::string DescribeCast(const GlyphLibrary& lib, const SpellCast& cast) {
   // A gravity mod on an anchored delivery acts on the caster's body.
   if (d.gravityMille != g.gravityMille && d.mech == DeliveryMech::Instant)
     sentences.push_back(d.gravityMille < g.gravityMille ? "You hop." : "You are shoved down.");
+  // A COUNT WASTED BY POSITION, not by field: a second split word in a scope
+  // that already fans. Named once however many lost, because the sentence the
+  // player needs is "you already split this", not a list.
+  if (!cast.wastedNodes.empty())
+    sentences.push_back(
+        std::string("A second fan word is wasted: one split per scope, and the "
+                    "strongest wins. Put it on a branch instead."));
   for (int gi : cast.wastedMods) {
     const GlyphDef* w = lib.At(gi);
     if (!w) continue;
@@ -2597,40 +2727,55 @@ CastResult SpellSystem::Cast(const CastList& list, CasterState& caster,
   selfAtValid_ = selfAt != nullptr;
   for (size_t ci = 0; ci < list.casts.size(); ci++) {
     const SpellCast& c = list.casts[ci];
-    const int32_t inst = ClampI(c.instances, 1, lib_->budgets.maxInstances);
+    const int32_t branches = ClampI(c.instances, 1, lib_->budgets.maxInstances);
     const int32_t lanes = (int32_t)c.delivery.lanes.size();
-    for (int32_t i = 0; i < inst; i++) {
+    const int32_t bolts = RecBolts(*lib_, c.delivery);
+    // THE FAN IS TWO LEVELS DEEP (2026-09-22): the box's branches, and each
+    // branch's own split. `b` is the GLOBAL BOLT ORDINAL and it is what every
+    // key below is taken on - which is the whole reason it is global. With no
+    // split anywhere it counts 0,1,2..  exactly as `i` did and `bolts` is
+    // `branches`, so `SpellFan` is called with the arguments it has always been
+    // called with and no sentence that existed before this day moves a bit.
+    int32_t b = 0;
+    for (int32_t k = 0; k < branches; k++) {
       // RULE 4: COPIES FAN, COLUMNS DO NOT. An instance with its own lane is
       // not a copy of anything — it is a second spell the player asked for, so
-      // it resolves ON THE AIM. Only the shared-only copies spread.
-      const SpellCast ci2 = InstanceCast(c, i);
-      const bool column = i < lanes;
-      const SpellFxVec d =
-          column ? aim : SpellFan(aim, i, inst, tick + (uint32_t)ci * 131u, casterId);
-      SpellFxVec at = originFx;
-      const SpellFxVec u = Unit(d, (int64_t)ci2.delivery.reach * kSpellFxOne);
-      at = {originFx.x + u.x, originFx.y + u.y, originFx.z + u.z};
-      // Fanned resolve points around the anchor: instance i lands a voxel or
-      // two off (`shotgun` on the hand, rule 3).
-      if (i > 0 && !column) {
-        const SpellFxVec o = Unit(SpellFan({kSpellFxOne, 0, 0}, i, inst, tick, casterId),
-                                  2 * kSpellFxOne);
-        at = {at.x + o.x, at.y + o.y, at.z + o.z};
+      // it resolves ON THE AIM. Only the shared-only copies spread. ...And a
+      // branch that splits puts its FIRST bolt on the aim and fans the rest
+      // around it, which is the same sentence with one word added.
+      const SpellCast ci2 = InstanceCast(c, k);
+      const bool column = k < lanes;
+      const int32_t split = LaneSplit(*lib_, c.delivery, k);
+      for (int32_t j = 0; j < split; j++, b++) {
+        const bool onAim = column && j == 0;
+        const SpellFxVec d =
+            onAim ? aim : SpellFan(aim, b, bolts, tick + (uint32_t)ci * 131u, casterId);
+        SpellFxVec at = originFx;
+        const SpellFxVec u = Unit(d, (int64_t)ci2.delivery.reach * kSpellFxOne);
+        at = {originFx.x + u.x, originFx.y + u.y, originFx.z + u.z};
+        // Fanned resolve points around the anchor: bolt b lands a voxel or
+        // two off (`shotgun` on the hand, rule 3).
+        if (b > 0 && !onAim) {
+          const SpellFxVec o = Unit(SpellFan({kSpellFxOne, 0, 0}, b, bolts, tick, casterId),
+                                    2 * kSpellFxOne);
+          at = {at.x + o.x, at.y + o.y, at.z + o.z};
+        }
+        const size_t before = out.launches.size();
+        ApplySpellEffect(*lib_, ci2.payload, at, d, 1000, out, probe, r.instability,
+                         (uint32_t)b);
+        // A carrier the hand spoke starts AT THE CASTER, not at reach: the
+        // muzzle is where a bolt leaves from and where `self` resolves.
+        for (size_t kk = before; kk < out.launches.size(); kk++) {
+          out.launches[kk].at = originFx;
+          out.launches[kk].dir = d;
+          out.launches[kk].generation = 0;
+          out.launches[kk].casterId = casterId;
+        }
+        // A gravity Mod on the hand acts on the caster's body: `float` hops,
+        // `heavy` shoves down. Once, as an impulse; `aura` makes it a status.
+        if (b == 0 && ci2.delivery.gravityMille != 0)
+          out.casterImpulseVps.y += -(float)ci2.delivery.gravityMille * 0.012f;
       }
-      const size_t before = out.launches.size();
-      ApplySpellEffect(*lib_, ci2.payload, at, d, 1000, out, probe, r.instability, (uint32_t)i);
-      // A carrier the hand spoke starts AT THE CASTER, not at reach: the
-      // muzzle is where a bolt leaves from and where `self` resolves.
-      for (size_t k = before; k < out.launches.size(); k++) {
-        out.launches[k].at = originFx;
-        out.launches[k].dir = d;
-        out.launches[k].generation = 0;
-        out.launches[k].casterId = casterId;
-      }
-      // A gravity Mod on the hand acts on the caster's body: `float` hops,
-      // `heavy` shoves down. Once, as an impulse; `aura` makes it a status.
-      if (i == 0 && ci2.delivery.gravityMille != 0)
-        out.casterImpulseVps.y += -(float)ci2.delivery.gravityMille * 0.012f;
     }
   }
   // Statuses, echoes and filters the payload asked for become system state;
@@ -2673,20 +2818,28 @@ void SpellSystem::AdoptLaunches(SpellEmission& out, const SpellBodyProbe* bodies
       c.instances = RecInstances(*lib_, rq.delivery);
       c.generation = gen;
       PriceCast(*lib_, c);
-      const int32_t inst = c.instances;
+      const int32_t branches = c.instances;
       const int32_t lanes = (int32_t)c.delivery.lanes.size();
-      for (int32_t i = 0; i < inst; i++) {
-        // Copies fan, columns do not.
-        const SpellCast ic = InstanceCast(c, i);
-        const bool column = i < lanes;
+      const int32_t bolts = RecBolts(*lib_, c.delivery);
+      // Two levels, one GLOBAL bolt ordinal - see `Cast`. `b` and `bolts`
+      // reduce to the old `i` and `inst` whenever nothing inside a lane fans,
+      // which is what keeps every nested fan that existed bit-identical.
+      int32_t b2 = 0;
+      for (int32_t k = 0; k < branches; k++) {
+       const SpellCast ic = InstanceCast(c, k);
+       const bool column = k < lanes;
+       const int32_t split = LaneSplit(*lib_, c.delivery, k);
+       for (int32_t j = 0; j < split; j++, b2++) {
+        // Copies fan, columns do not - and a branch's FIRST bolt is its column.
+        const bool onAim = column && j == 0;
         const SpellFxVec d =
-            column ? rq.dir : SpellFan(rq.dir, i, inst, tick ^ rq.salt, rq.casterId);
+            onAim ? rq.dir : SpellFan(rq.dir, b2, bolts, tick ^ rq.salt, rq.casterId);
         switch (ic.delivery.mech) {
           case DeliveryMech::Flight:
             if (ic.delivery.body)
               RequestBody(ic, rq.at, d, rq.casterId, rq.instability, out);
             else
-              Launch(ic, rq.at, d, rq.casterId, tick, i, rq.instability, out, probe);
+              Launch(ic, rq.at, d, rq.casterId, tick, b2, rq.instability, out, probe);
             break;
           case DeliveryMech::Continuous: {
             // A beam the HAND spoke (generation 0) is the caster's own: they
@@ -2694,7 +2847,7 @@ void SpellSystem::AdoptLaunches(SpellEmission& out, const SpellBodyProbe* bodies
             // ANCHORED — it burns from where its parent resolved for its tick
             // cap, and nobody is holding anything, which is the only reading
             // of a nested beam that is bounded.
-            if (i > 0) break;   // one beam; a fan fans its resolve, not its ray
+            if (b2 > 0) break;  // one beam; a fan fans its resolve, not its ray
             SpellBeam bm;
             bm.cast = ic;
             bm.casterId = rq.casterId;
@@ -2726,26 +2879,27 @@ void SpellSystem::AdoptLaunches(SpellEmission& out, const SpellBodyProbe* bodies
               if (bodies->bodyPos(bodies->ctx, rq.casterId, cc))
                 at = {SpellFxFromFloat(cc.x), SpellFxFromFloat(cc.y), SpellFxFromFloat(cc.z)};
             }
-            if (i > 0 && !column) {
-              const SpellFxVec o = Unit(SpellFan({kSpellFxOne, 0, 0}, i, inst, tick,
+            if (b2 > 0 && !onAim) {
+              const SpellFxVec o = Unit(SpellFan({kSpellFxOne, 0, 0}, b2, bolts, tick,
                                                  rq.casterId),
                                         2 * kSpellFxOne);
               at = {at.x + o.x, at.y + o.y, at.z + o.z};
             }
             const size_t before = out.launches.size();
             ApplySpellEffect(*lib_, *payload, at, d, 1000, out, probe, rq.instability,
-                             rq.salt ^ (uint32_t)i);
-            for (size_t k = before; k < out.launches.size(); k++) {
-              out.launches[k].at = at;
-              out.launches[k].dir = {0, kSpellFxOne, 0};
-              out.launches[k].generation = gen + 1;
-              out.launches[k].casterId = rq.casterId;
+                             rq.salt ^ (uint32_t)b2);
+            for (size_t kk = before; kk < out.launches.size(); kk++) {
+              out.launches[kk].at = at;
+              out.launches[kk].dir = {0, kSpellFxOne, 0};
+              out.launches[kk].generation = gen + 1;
+              out.launches[kk].casterId = rq.casterId;
             }
-            if (i == 0 && ic.delivery.gravityMille != 0)
+            if (b2 == 0 && ic.delivery.gravityMille != 0)
               out.casterImpulseVps.y += -(float)ic.delivery.gravityMille * 0.012f;
             break;
           }
         }
+       }
       }
       for (SpellStatus& st : out.statuses)
         if (st.casterId == 0) st.casterId = rq.casterId;

@@ -5939,8 +5939,9 @@ marked as such):
 
 - **1. A NOUN GOES INTO THE PILE.** A Matter word, an Effect word, or an
   operator group whose result sort is Effect is pushed onto the PILE. Order
-  inside the pile does not matter: runs merge (`shotgun shotgun` is
-  `shotgun×2`, capped by `budgets.maxMultiplicity`), identical non-adjacent
+  inside the pile does not matter: runs merge (`swift swift` is `swift×2`,
+  capped by `budgets.maxMultiplicity`; a COUNT word merges too but its
+  multiplicity is ignored — see rule 4), identical non-adjacent
   items merge too, and the lowering rebuilds the pile in a CANONICAL order (by
   key) because mods compose through integer arithmetic that does not commute
   under clamping — 49 halved then doubled is 48. Matter and Effects ADD (×N of
@@ -5961,7 +5962,9 @@ marked as such):
   `explosive shotgun projectile` and `shotgun explosive projectile` are the
   same three fanned exploding bolts, while `explosive projectile shotgun` is
   one bolt fired from three fanned points and `explosive projectile shotgun
-  projectile` is three bolts that each fire one. With no delivery to close the
+  projectile` is three bolts that each fire one. A count word said TWICE in one
+  scope is not nine: one split per scope (rule 4), and the second is charged
+  and does nothing. With no delivery to close the
   pile a mod sticks to `hand`, the implicit outermost delivery, where `shotgun`
   is three fanned resolve points and `float` is the hop — and **every other mod
   on the hand is a charged no-op**, named in the describe line ("`swift` is
@@ -5991,10 +5994,27 @@ marked as such):
   `fire lane trail` the item under `trail` is the wall, not `fire`, and the
   operator is incomplete) and WALLS merging (`fire lane fire end` is two items
   in two scopes, not `fire×2`) — `NodeKey` carries the lane, which is what
-  makes both true at once. The one exception is `count`: a `shotgun` or `twin`
-  anywhere in the pile is RECORD-WIDE, because count *is* the fan and a lane is
-  one instance of it; every other mod inside a lane edits that instance's
-  record. `lane end` with nothing between is an empty lane: the instance exists
+  makes both true at once. A mod inside a lane edits that instance's record.
+
+  **A COUNT MOD SPLITS THE SCOPE IT WAS SPOKEN IN** (2026-09-22). Spoken in the
+  shared segment it is the box's own fan; spoken inside a lane it is THAT
+  BRANCH's split, and the branch does not inherit the box's fan on top of its
+  own. It used to be RECORD-WIDE wherever it was spoken — count *was* the fan
+  and a lane was one instance of it — which made a fan a property of the box
+  and left no way to say "this branch splits and that one does not". And **at
+  most one count word per scope is effective**: the one whose application
+  yields the largest count (ties by lowest `NodeKey` — largest-result rather
+  than first-spoken, because the pile is a SET and law L2 would be false
+  otherwise), applied EXACTLY ONCE however many times it was said. Every other
+  count word in that segment is wasted: charged, listed in
+  `SpellCast::wastedNodes`, drawn slashed, and refused outright if you try to
+  drop one. Nine bolts is a split on each of three branches — something you
+  build and can see you built — not `shotgun shotgun`. The number that FLIES is
+  therefore `RecBolts` (the sum of the branches' splits), not `RecInstances`
+  (the branch count, which is still what the socket row draws), and every
+  price, budget and cap is charged on `RecBolts`.
+
+  `lane end` with nothing between is an empty lane: the instance exists
   and carries the shared items. Marks NEST rather than enumerate — an inner
   lane nobody boxed flattens into its parent when it closes, because there is
   no record for it to be a column of.
@@ -6130,8 +6150,10 @@ delivery, which nests N deep, and a mark, which nests rather than enumerates —
 N `lane` words open one lane inside another, and N `end` words with nothing
 open are N charged no-ops), L4 ROOT-LANE additivity (`cost(lane A end lane B
 end) = cost(A) + cost(B)`, two instances, the first carrying exactly what `A`
-lowers to and the second what `B` does — excluding a `count` mod in either arm,
-which rule 4 makes record-wide on purpose),
+lowers to and the second what `B` does — a `count` mod in an arm used to be
+excluded, because rule 4 made it record-wide and it would have fanned the other
+arm too; a count is lane-local now, so the exclusion went away and the law's
+corpus grew from 93,636 cases to 144,400),
 L5 delivery invariance (the payload INSIDE the box of `E… D` is identical for
 every flight D; only the record differs), L6 locality (a unary operator's
 operand is exactly the item to its left, and inserting a word anywhere outside
@@ -6519,20 +6541,44 @@ milliseconds. Three pieces. `BuildGraph(lib, castList)` lays the tree out as a
 rooted, layered drawing in integer chrome pixels: the hand bar is the root at
 the MAXIMUM y and the tree grows upward, leaves take slots left to right in
 canonical pile order, a parent is centred over its children, and a join draws
-its `instances` sockets in a row above its bar with the shared items feeding a
-BUS across them, each lane's subtree standing over its own socket, the pending
-Mods hanging off the bar's left end with their composed edit (`count x9`) and
-the `wastedMods` ones marked, and `CastList::boxPrice` copied onto every bar so
+its `instances` sockets in a row that a SPLIT junction fans upward into — the
+junction sits immediately below the socket row in both orders, so a fan always
+opens forward and never back out of the delivery cell (2026-09-22) — with the
+shared items feeding a BUS below it, each branch's subtree standing over its
+own socket, a copy of the delivery cell capping EVERY branch (one word, one
+record, one primary cell that owns it; the rest carry `primary`), the pending
+Mods as beads on the trunk with their composed edit and the wasted ones
+marked, and `CastList::boxPrice` copied onto every bar so
 the multiplicative price is legible at every level. Instance 0 takes the CENTRE
 slot of the socket row, because rule 4 promises the first lane you open is the
 middle bolt. `Linearize(lib, tree)` says a tree back as words, post-order, with
 a canonical order within each segment of a pile. The edit ops (`InsertItem`,
-`AttachMod`, `FillSlot`, `WrapInBox`, `Unbox`, `Remove`, `Move`) are TOTAL:
+`AttachMod`, `FillSlot`, `WrapInBox`, `Unbox`, `Remove`, `Move`, `CloseLane`)
+are TOTAL:
 each works on a copy, re-merges the piles the way the parser would, checks the
 word cap and the instance cap, and then PROVES itself by re-parsing its own
 output and comparing the span-agnostic tree key — an op that cannot write
 itself back as words is REFUSED with a reason rather than returned, so the
 editor can never save words that mean something else.
+
+**A FAN COMES APART THE WAY IT WENT TOGETHER (2026-09-22).** A lane used to
+outlive its last item, always: the instance is real (it still carries the
+shared payload) and the lanes above it are NUMBERED FROM IT, so deleting one
+from the middle would move every bolt after it onto a different socket. The
+price was a fan that could not be taken down — build three lanes, delete the
+three payloads, and the box still spells `lane end lane end lane end`: three
+sockets of nothing and six words nobody asked for. Opening a lane is also a
+SIDE EFFECT (`OpenLaneIfNeeded` opens the ones before a far socket), so the
+leftovers accumulated from gestures never aimed at a lane at all. The rule is
+the asymmetry: a TRAILING empty lane holds nothing in place, so `Remove`,
+`Move` and `Unbox` drop the lane their subject vacated and cascade down through
+any bare lane under it; an INTERIOR empty lane stays, and gets a GESTURE
+instead — `CloseLane(lib, tree, box, lane)`, right-click on a socket — which
+takes the lane and everything in it out and slides the lanes above it down. It
+refuses lane 0 (the shared pile is not a lane) and an instance a `count` mod
+made (there is no `lane`/`end` pair to take out; what closes it is the mod),
+each with its own sentence. Everything still goes through the same `Finish`, so
+a pruned tree proves itself by re-parsing exactly like any other edit.
 
 **THE ROUND-TRIP LAW, and the two trees that break it.**
 `Parse(Linearize(Parse(s)))` is `Parse(s)` node for node and lowers to an

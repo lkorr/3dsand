@@ -580,7 +580,15 @@ Status GateSpells(Ctx& c, std::string& detail) {
           // Compose: the field is the previous value edited ONCE more (or held
           // at its clamp).
           const int32_t v = RecordField(l.casts[0].delivery, gd.field);
-          if (N > 1 && N <= cap) {
+          // ...EXCEPT A COUNT, WHICH DOES NOT COMPOSE (2026-09-22). One split
+          // per scope: the strongest count word wins and applies exactly once,
+          // so saying it again is a charged no-op and the field must not move
+          // at all. Asserted as an EQUALITY rather than left to the band below,
+          // which would have absorbed "never composes" silently - it did, on
+          // the day the rule changed, and L3 stayed green saying nothing.
+          if (gd.field == ModField::Count) {
+            if (N > 1 && N <= cap) ok = ok && v == prevField;
+          } else if (N > 1 && N <= cap) {
             int32_t once = prevField;
             switch (gd.op) {
               case ModOp::Mul: once = prevField * gd.amount; break;
@@ -661,9 +669,14 @@ Status GateSpells(Ctx& c, std::string& detail) {
   // NOW: `also` was dropped with rule 4, and two unrelated spells in one cast
   // are two columns of the hand box (PLAN_spell_graph section 0b). A DELIVERY
   // in an arm is fine and is the point - `end` closes the lane, so the arm's
-  // own box stays inside its column. The only exclusions are another mark
-  // (which would re-scope the arm) and a COUNT mod, which rule 4 makes
-  // record-wide on purpose and which would therefore fan the other arm too.
+  // own box stays inside its column. The only exclusion left is another mark,
+  // which would re-scope the arm.
+  //
+  // A COUNT MOD USED TO BE EXCLUDED TOO, because rule 4 made it record-wide on
+  // purpose and it would therefore have fanned the other arm as well. A count
+  // now splits the scope it was spoken in (2026-09-22), so a count inside an
+  // arm is exactly the locality this law is about and the exclusion went away -
+  // which WIDENS this law's corpus rather than narrowing it.
   int l4 = 0, l4cases = 0;
   {
     const int gLane = lib.Find("lane"), gEnd = lib.Find("end");
@@ -671,7 +684,6 @@ Status GateSpells(Ctx& c, std::string& detail) {
       for (int g : q) {
         const GlyphDef& gd = lib.glyphs[g];
         if (gd.sort == GlyphSort::Separator) return false;
-        if (gd.sort == GlyphSort::Mod && gd.field == ModField::Count) return false;
       }
       return true;
     };
@@ -1121,6 +1133,15 @@ Status GateSpells(Ctx& c, std::string& detail) {
              // asserted at runtime in check (8) - a sentence may SAY more than
              // the engine will do, and saying so is not an unbounded process.
              c.leaves >= 1 && c.leaves <= lib.budgets.maxInstances &&
+             // ...AND BOLTS, NOT BRANCHES, ARE WHAT IS BOUNDED (2026-09-22).
+             // A branch with a count of its own fires more than once, so
+             // `instances` stopped being the number that flies. `bolts` is at
+             // least the branch count (every branch fires at least once), never
+             // past the cap, and `leaves` - the product down the tree - is at
+             // least the bolts this box alone makes. That chain is what the
+             // tail-first split cutback in `LowerBox` exists to keep true.
+             c.bolts >= c.instances && c.bolts <= lib.budgets.maxInstances &&
+             c.leaves >= c.bolts &&
              c.depth >= 0 && c.depth <= kSpellStackMax;
       if (!ok) fail("L8", spell(s));
       else l8++;
@@ -1568,6 +1589,11 @@ Status GateSpells(Ctx& c, std::string& detail) {
   //       spells in one cast: a bolt leaves, and the mend resolves on the
   //       caster, from one utterance.
   bool laneRunOk = false;
+  // L13's flags: a branch that splits, three of them, the two levels together,
+  // no-compose, and the bolts that actually left the hand.
+  bool splitRunOk = false, splitBranch = false, splitThree = false, splitBoth = false,
+       splitOnce = false;
+  int splitLive = 0, splitDistinct = 0;
   int laneBolts = 0, laneWithFire = 0, laneWithSand = 0;
   int laneLive = 0, laneRestores = 0, sockBolts = 0, sockChild = 0, sockFire = 0;
   {
@@ -1647,6 +1673,91 @@ Status GateSpells(Ctx& c, std::string& detail) {
     }
     lsys.Clear();
 
+    // (d) L13 — THE SPLIT IS PER-BRANCH (2026-09-22).
+    //
+    // `shotgun` used to be a record-wide `count` that COMPOSED: it trebled the
+    // whole box wherever it was spoken, and saying it twice was x9. It splits
+    // the SCOPE it was spoken in now, and one split per scope, so nine bolts is
+    // something you BUILD - a shotgun on each of three branches - and not
+    // something you get by saying one word twice.
+    //
+    // Every number below is derived from a second compile of a smaller
+    // sentence or from the arithmetic of the sentence itself, so retuning
+    // `shotgun`'s amount in glyphs.json cannot break this law.
+    //
+    // THE RECORD UNDER TEST IS THE BOX'S, NOT THE HAND'S. `CompileSpell` hands
+    // back the hand cast and a spoken delivery is a Launch inside its payload -
+    // reading `casts[0].delivery` measures the pedestal and reports a split of
+    // 1 for a sentence that splits perfectly well. It cost one run.
+    auto boxOf = [&](const CastList& l) -> const DeliveryRec* {
+      if (l.casts.empty()) return nullptr;
+      for (const EffectInst& e : l.casts[0].payload)
+        if (e.verb == SpellVerb::Launch && !e.launch.empty()) return &e.launch[0];
+      return nullptr;
+    };
+    {
+      const CastList one = CompileSpell(lib, speak({"lane", "shotgun", "end", "projectile"}));
+      const DeliveryRec* d1 = boxOf(one);
+      const int32_t split = d1 ? LaneSplit(lib, *d1, 0) : 0;
+      // (1) A count inside a lane splits THAT BRANCH and nothing else: one
+      // branch, and that branch fires `split` bolts.
+      splitBranch = d1 && RecInstances(lib, *d1) == 1 && split > 1 &&
+                    RecBolts(lib, *d1) == split;
+      // (2) ...and one on each of three branches is the product, by
+      // construction. This is the nine the player builds.
+      const CastList three = CompileSpell(
+          lib, speak({"lane", "shotgun", "end", "lane", "shotgun", "end", "lane", "shotgun",
+                      "end", "projectile"}));
+      const DeliveryRec* d3 = boxOf(three);
+      splitThree = d3 && RecInstances(lib, *d3) == 3 && RecBolts(lib, *d3) == 3 * split;
+      // (3) THE TWO LEVELS ARE INDEPENDENT: a shared `shotgun` fans the box
+      // into `split` branches, a lane's own `shotgun` splits ONE of them, and
+      // that branch does not inherit the box's fan on top of its own. So the
+      // total is (split - 1) plain branches plus one that is `split` wide.
+      const CastList both =
+          CompileSpell(lib, speak({"shotgun", "lane", "shotgun", "end", "projectile"}));
+      const DeliveryRec* db = boxOf(both);
+      splitBoth = db && RecInstances(lib, *db) == split &&
+                  RecBolts(lib, *db) == split + (split - 1);
+      // (4) NO-COMPOSE, and the loser is named. Two DIFFERENT count words in
+      // one scope, because two of the same word merge into one node with n=2
+      // and there is nothing to waste - the `n` is simply ignored.
+      const CastList once = CompileSpell(lib, speak({"shotgun", "projectile"}));
+      const CastList twice = CompileSpell(lib, speak({"shotgun", "twin", "projectile"}));
+      const DeliveryRec *d4a = boxOf(once), *d4b = boxOf(twice);
+      splitOnce = d4a && d4b && RecInstances(lib, *d4b) == RecInstances(lib, *d4a) &&
+                  !twice.casts.empty() && !twice.casts[0].wastedNodes.empty();
+      // ...and it FLIES. Three branches, each firing its own split, and EVERY
+      // BOLT HAS ITS OWN DIRECTION except the one each branch puts on the aim:
+      // a lane is a spell the player aimed, so its first bolt goes where they
+      // pointed and its copies fan around it. If the fan were keyed on the
+      // per-branch index instead of the global bolt ordinal, branch 2's second
+      // bolt would fly exactly where branch 1's second bolt did and this count
+      // would collapse from 3*split-2 to split.
+      SpellEmission e3;
+      lsys.Cast(three, cs, hp.cb, 91, origin, {kSpellFxOne, 0, 0}, 4, e3);
+      splitLive = lsys.LiveCount();
+      std::vector<std::string> dirs;
+      for (const SpellProjectile& pr : lsys.Live()) {
+        char buf[64];
+        // VELOCITY, which is the direction times the record's speed: every bolt
+        // of one box carries the same speed, so two equal velocities are two
+        // equal directions and that is the collision this catches.
+        std::snprintf(buf, sizeof buf, "%lld,%lld,%lld", (long long)pr.vel.x,
+                      (long long)pr.vel.y, (long long)pr.vel.z);
+        dirs.push_back(buf);
+      }
+      std::sort(dirs.begin(), dirs.end());
+      splitDistinct = (int)(std::unique(dirs.begin(), dirs.end()) - dirs.begin());
+      lsys.Clear();
+      splitRunOk = splitBranch && splitThree && splitBoth && splitOnce &&
+                   splitLive == 3 * split && splitDistinct == 3 * split - 2;
+      std::printf("spell split: %s (a lane's shotgun splits that branch x%d; three of them "
+                  "fire %d bolts in %d directions, want %d; shared+lane %d, no-compose %d)\n",
+                  splitRunOk ? "PASS" : "FAIL", split, splitLive, splitDistinct,
+                  3 * split - 2, splitBoth ? 1 : 0, splitOnce ? 1 : 0);
+    }
+
     laneRunOk = laneBolts == 2 && laneWithFire == 1 && laneWithSand == 1 &&
                 laneLive == 1 && laneRestores == 1 && sockBolts == 2 &&
                 sockChild == 1 && sockFire == 1;
@@ -1659,7 +1770,8 @@ Status GateSpells(Ctx& c, std::string& detail) {
 
   const bool lawsOk = alphaOk && lawFail == 0 && l1 > 0 && l2pairs > 0 && l3 > 0 &&
                       l6cases > 0 && l4cases > 0 && l7 > 0 && l5 > 0 && l8 > 0 &&
-                      l9cases > 0 && l10cases > 0 && l11 > 0 && l12cases > 0 && laneRunOk;
+                      l9cases > 0 && l10cases > 0 && l11 > 0 && l12cases > 0 && laneRunOk &&
+                      splitRunOk;
   const bool spellOk = budgetOk && deliverOk && fatalOk && carveAsked && fatalEmitted &&
                        sprayOk && latchOk && lawsOk && bombOk && sustainOk && mendOk &&
                        nestOk;

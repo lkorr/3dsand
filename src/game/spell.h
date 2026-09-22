@@ -534,7 +534,16 @@ struct DeliveryRec {
   int32_t gravityMille = 0;  // per-mille of g (flight), or on the anchored body
   int32_t fuseTicks = 0;
   int32_t reach = 0;
-  int32_t count = 1;         // instances (shotgun)
+  // THE FAN, AND WHAT THE NUMBER MEANS DEPENDS ON WHERE THE RECORD IS
+  // (2026-09-22). On a TOP-LEVEL record `count` is the number of BRANCHES -
+  // the sockets the page draws, the columns the fan opens into. On a record
+  // inside `lanes[k]` it is that ONE branch's sub-bolt multiplier, which is
+  // how `shotgun` on a branch splits the branch instead of the box. A lane
+  // record's own `lanes` is empty by construction, so there is exactly one
+  // level of each reading and no ambiguity. `RecInstances` is the first,
+  // `LaneSplit` the second, and `RecBolts` - the SUM - is what every price,
+  // budget and cap must use.
+  int32_t count = 1;         // branches here, sub-bolts inside a lane
   int32_t bounces = 0, pierce = 0, seek = 0;
   int32_t radiusMille = 1000;   // wide: resolve radius multiplier
   bool body = false;         // rigid body flight (bomb)
@@ -566,7 +575,11 @@ struct SpellLane {
 struct SpellCast {
   DeliveryRec delivery;
   std::vector<EffectInst> payload;
-  int32_t instances = 1;     // == delivery.count, capped
+  int32_t instances = 1;     // BRANCHES: == delivery.count, capped
+  // BOLTS: the branches with each branch's own split counted, which is what
+  // actually flies and therefore what every price and budget is charged on.
+  // Equal to `instances` for every sentence with no count inside a lane.
+  int32_t bolts = 1;
   // Price, split the way the HUD shows it (plan §9).
   int32_t wordCost = 0;
   int32_t tariff = 0;        // payload tariff × instances (P1)
@@ -586,6 +599,11 @@ struct SpellCast {
   // Mod words that landed on a record with nothing to edit (rule 3: the hand
   // has no speed, no fuse, nothing to bounce). Charged; named in the readout.
   std::vector<int> wastedMods;
+  // ...and mod words wasted by their POSITION rather than by their field: a
+  // second count word in a scope that already fans. Tree node indices, not
+  // glyph ids, because the whole point is that one `shotgun` works and the
+  // other does not - slashing them by glyph would slash both.
+  std::vector<int> wastedNodes;
   int clause = -1;
 
   int32_t Cost() const { return wordCost + tariff + carryCost; }
@@ -598,6 +616,12 @@ struct BoxPrice {
   int node = -1;             // the SpellTree node of the box
   int32_t wordCost = 0, tariff = 0, carryCost = 0;
   int32_t instances = 1, leaves = 1;
+  int32_t bolts = 1;         // instances with each branch's own split counted
+  // How many bolts each BRANCH fires, in instance order - the per-branch half
+  // of `bolts`. Derived data for the page: a branch with a split of its own is
+  // drawn differently from one without, and the drawing may not re-derive it by
+  // reaching into the VM's records.
+  std::vector<int32_t> laneSplits;
   bool instancesClamped = false;
 };
 
@@ -638,6 +662,10 @@ void PriceCast(const GlyphLibrary& lib, SpellCast& cast);
 // HOW MANY INSTANCES a record fires: max(count, lanes), clamped. One place,
 // because the fan loops, the pricing and the volume bound must agree.
 int32_t RecInstances(const GlyphLibrary& lib, const DeliveryRec& d);
+// How many sub-bolts branch `k` of `d` fires (1 for a branch with no lane of
+// its own), and the total over every branch - the TRUE bolt count of the box.
+int32_t LaneSplit(const GlyphLibrary& lib, const DeliveryRec& d, int32_t k);
+int32_t RecBolts(const GlyphLibrary& lib, const DeliveryRec& d);
 // THE CAST INSTANCE i ACTUALLY FLIES WITH (rule 4): the shared cast for
 // i >= L, and for i < L the lane's record with the lane's nouns appended to
 // the shared payload. Called in every fan loop; returns `cast` unchanged when

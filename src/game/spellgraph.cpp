@@ -556,6 +556,52 @@ bool OpenLaneIfNeeded(SpellTree& t, int boxNode, int32_t lane, int32_t cap,
   return true;
 }
 
+// A LANE THE LAST ITEM LEFT IS NOT A LANE THE PLAYER ASKED FOR (2026-09-22).
+//
+// Lanes are POSITIONAL — lane k is instance k-1, and instance 0 is the aim — so
+// a lane cannot simply be deleted from the middle of a box without moving every
+// lane after it onto a different bolt. That is why a lane used to survive its
+// last item: keeping it was the only way to keep the lanes above it where the
+// player put them.
+//
+// The cost was that a fan, once built, could not be taken down. Open three
+// lanes, fill them, then delete the three payloads and the box still spells
+// `lane end lane end lane end`: three instances, no content, three pairs of
+// words on the page that nothing in the drawing asked for. Opening a lane is
+// also a SIDE EFFECT of dropping on a far socket (`OpenLaneIfNeeded` opens the
+// ones before it), so a player could accumulate lanes they never chose at all
+// and then find the sentence would not shrink back.
+//
+// The asymmetry is the answer: a TRAILING empty lane has nothing above it to
+// hold in place, so dropping it moves nothing. Cascading from the top, a fan
+// unwinds exactly the way it was wound — delete the last payload and the last
+// socket goes with it — while an INTERIOR empty lane stays, because it is a
+// real bare instance standing between two the player aimed at. `CloseLane` is
+// the explicit gesture for that one.
+void PruneTrailingEmptyLanes(SpellTree& t, int boxNode) {
+  if (boxNode < 0 || boxNode >= (int)t.nodes.size() || !t.nodes[boxNode].box) return;
+  SpellNode& b = t.nodes[boxNode];
+  for (int32_t L = (int32_t)b.laneAt.size() / 2; L > 0; L--) {
+    bool occupied = false;
+    for (int ii : b.items)
+      if (t.nodes[ii].lane == L) {
+        occupied = true;
+        break;
+      }
+    if (occupied) break;
+    b.laneAt.pop_back();
+    b.laneAt.pop_back();
+  }
+}
+
+// The box a node sits IN, which is the one whose lanes its departure can empty:
+// its parent when that is a box, and nothing when it is an operator's operand
+// (an operand keeps lane 0 and its group holds the lane).
+int OwningBox(const SpellTree& t, const Nav& nav, int node) {
+  const int p = node >= 0 ? nav.parent[node] : -1;
+  return IsBox(t, p) ? p : -1;
+}
+
 SpellNode MakeWord(int glyph) {
   SpellNode n;
   n.glyph = glyph;
@@ -633,6 +679,7 @@ struct Builder {
 
   std::string ModEdit(const GlyphDef& gd, int32_t n) const;
   bool IsWasted(int glyph) const;
+  bool IsWastedNode(int treeNode) const;
   // Places the subtree rooted at `node` with its left edge at `x` and its
   // BOTTOM band on `layer`, and returns its width. `outTop`, when given, gets
   // the highest layer the subtree consumed — which is how a caller stacks the
@@ -646,8 +693,14 @@ struct Builder {
 
 std::string Builder::ModEdit(const GlyphDef& gd, int32_t n) const {
   const char* f = ModFieldName(gd.field);
-  // COMPOSED, not per word: `shotgun shotgun` is count x9, and the tag says so.
+  // COMPOSED, not per word: `speed x2` said twice is x4, and the tag says so.
+  // A COUNT DOES NOT COMPOSE (2026-09-22): one split per scope, applied once
+  // however many times it was said, so a `shotgun x3` bead saying "count x27"
+  // would be describing a spell nobody can cast.
   int64_t amount = gd.amount;
+  if (gd.field == ModField::Count) {
+    n = 1;
+  }
   if (gd.op == ModOp::Add) {
     amount = (int64_t)gd.amount * n;
   } else {
@@ -662,6 +715,13 @@ std::string Builder::ModEdit(const GlyphDef& gd, int32_t n) const {
   else
     std::snprintf(buf, sizeof buf, "%s %s%lld", f, sym, (long long)amount);
   return buf;
+}
+
+bool Builder::IsWastedNode(int treeNode) const {
+  for (const SpellCast& c : list.casts)
+    for (int nd : c.wastedNodes)
+      if (nd == treeNode) return true;
+  return false;
 }
 
 bool Builder::IsWasted(int glyph) const {
@@ -781,14 +841,18 @@ int Builder::Place(int node, int32_t lane, int layer, int x, int& outIdx,
   // already wears the clamp notch that explains it.
   const int32_t drawnLanes = std::min<int32_t>(L, instances);
 
-  // WHICH MODS RIDE THE TRUNK AND WHICH RIDE A LANE. `count` is record-wide
-  // WHEREVER it was spoken — spell.cpp's `LowerBox` applies it before the lanes
-  // copy the record, so `shotgun` inside lane 2 still trebles the whole box —
-  // and drawing it over one socket would be a lie about what it does. Every
-  // other mod in a lane edits that instance's record alone, so it belongs over
-  // the socket it edits and NOT in the shared bead row, which is where all of
-  // them used to land regardless of lane: two mods on two different lanes drew
-  // as one indistinguishable centred row.
+  // WHICH MODS RIDE THE TRUNK AND WHICH RIDE A LANE. A mod in a lane edits that
+  // instance's record alone, so it belongs over the socket it edits and NOT in
+  // the shared bead row, which is where all of them used to land regardless of
+  // lane: two mods on two different lanes drew as one indistinguishable centred
+  // row.
+  //
+  // `count` USED TO BE THE EXCEPTION and is not any more (2026-09-22). It was
+  // record-wide wherever it was spoken, so a `shotgun` inside lane 2 trebled
+  // the whole box and drawing it over one socket would have been a lie. It now
+  // splits the scope it was spoken in, so it draws exactly where it was said:
+  // on the trunk when shared, on a branch's neck when that branch is the thing
+  // it splits.
   std::vector<int> mods, shared;
   std::vector<std::vector<int>> laneItems((size_t)L + 1);
   std::vector<std::vector<int>> laneMods((size_t)L + 1);
@@ -796,10 +860,7 @@ int Builder::Place(int node, int32_t lane, int layer, int x, int& outIdx,
     const int32_t ln = t.nodes[ii].lane;
     const bool inLane = ln > 0 && ln <= drawnLanes;
     if (NodeSort(lib, t, ii) == GlyphSort::Mod) {
-      const GlyphDef* md = lib.At(t.nodes[ii].glyph);
-      const bool recordWide =
-          !t.nodes[ii].group && md && md->field == ModField::Count;
-      if (inLane && !recordWide) laneMods[(size_t)ln].push_back(ii);
+      if (inLane) laneMods[(size_t)ln].push_back(ii);
       else mods.push_back(ii);
       continue;
     }
@@ -872,6 +933,25 @@ int Builder::Place(int node, int32_t lane, int layer, int x, int& outIdx,
   // order and is the pedestal the sentence stands on — bar at the bottom, its
   // fan just above it, the spoken spell above that.
   //
+  // ...AND A SPLIT OPENS FORWARD, WHICHEVER END THAT IS (2026-09-22). The fan
+  // used to be `socket -> bar`, with the socket row hard against the bar. On
+  // the `hand` that draws three strokes rising out of the pedestal and reads
+  // as "the hand makes three"; on a spoken delivery the same edge runs DOWN
+  // out of the cell and reads as "the projectile splits", pointing backwards.
+  // One construct, two pictures, and only one of them true — because the split
+  // point was FUSED to the delivery cell, so the geometry had to follow
+  // wherever the delivery word happened to sit.
+  //
+  // They are unfused. A box with more than one instance synthesizes a SPLIT
+  // junction, the fan is `socket -> split`, and the junction is placed
+  // immediately below the socket row in BOTH orders. Everything above the
+  // socket row then belongs to one branch each — which is why a spoken
+  // delivery is drawn ONCE PER BRANCH, a cell capping every column, instead of
+  // one bar with a row of pips under it. The `hand` needs no copies: it is the
+  // pedestal the branches have not diverged from yet, so its one cell stays at
+  // the bottom and its fan still rises out of the junction over it. One rule,
+  // and the hand's picture does not move.
+  //
   // And the layers are handed out by WALKING, not by counting: a stage asks the
   // subtrees it just placed how tall they turned out and puts the next stage on
   // top. Fixed layer arithmetic worked only while every box's bar was the
@@ -898,8 +978,14 @@ int Builder::Place(int node, int32_t lane, int layer, int x, int& outIdx,
   };
   const int sharedW = measureRow(shared);
 
+  // A BRANCH THAT ENDS IN A CELL NEEDS A CELL'S WIDTH. A spoken delivery with
+  // more than one instance caps every column with a copy of itself, so the
+  // column floor is the cell, not the pip. The `hand` and the unsplit box keep
+  // the 32 px floor and are laid out exactly as before.
+  const bool hasCopies = flip && instances > 1;
+  const int colFloor = hasCopies ? kGraphCell : kGraphSocketW;
   const std::vector<int32_t> slots = SlotOrder(instances);
-  std::vector<int> socketColW((size_t)instances, kGraphSocketW);
+  std::vector<int> socketColW((size_t)instances, colFloor);
   for (int32_t inst = 0; inst < instances; inst++) {
     if (inst >= drawnLanes) continue;
     // The column has to hold the WIDER of its item row and its bead row: a
@@ -907,7 +993,7 @@ int Builder::Place(int node, int32_t lane, int layer, int x, int& outIdx,
     // needs more room than the 32 px pip.
     const int w = std::max(measureRow(laneItems[(size_t)inst + 1]),
                            modRowWOf(laneMods[(size_t)inst + 1]));
-    socketColW[(size_t)inst] = std::max(kGraphSocketW, w);
+    socketColW[(size_t)inst] = std::max(colFloor, w);
   }
 
   // The socket row, tiled in SLOT order (instance 0 — the aim — in the middle)
@@ -915,7 +1001,7 @@ int Builder::Place(int node, int32_t lane, int layer, int x, int& outIdx,
   int socketsW = 0;
   for (int32_t s = 0; s < instances; s++)
     socketsW += socketColW[(size_t)slots[(size_t)s]] + (s + 1 < instances ? kGraphGap : 0);
-  const int contentW = std::max(std::max(sharedW, socketsW), kGraphSocketW);
+  const int contentW = std::max(std::max(sharedW, socketsW), colFloor);
   const int sharedX = (contentW - sharedW) / 2;
   std::vector<int> colX((size_t)instances, 0);
   {
@@ -949,6 +1035,25 @@ int Builder::Place(int node, int32_t lane, int layer, int x, int& outIdx,
   std::vector<int> socketIdx((size_t)instances, -1);
   std::vector<int> sharedPlaced;                     // shared item -> bus
   std::vector<std::pair<int, int>> laneLinks;        // (node, instance) -> socket
+  // A RECORD-WIDE BEAD EDGES TO *THIS* BAR, AND THE BAR MAY NOT EXIST YET
+  // (2026-09-22). These used to be pushed as edges with `to == -1` and patched
+  // by a sweep over the WHOLE edge list once `barIdx` was known - which is a
+  // global claim made from inside a recursive function. On the implicit `hand`
+  // box the stage order is bar-first, so its beads were already sitting in the
+  // list with `to == -1` while `stageItems` recursed into every box in the
+  // sentence, and the FIRST nested box to finish patched the hand's beads onto
+  // ITS bar. A `shotgun` on the hand then drew its bead hanging off a delivery
+  // several layers up, outside that bar's span, with the fan it opened left
+  // stranded at the foot of the page: the gate's "children outside their
+  // parent's span" law, 145 times over the op fuzz. The pending list is local,
+  // so a nested box cannot reach it.
+  std::vector<int> trunkPending;                     // record-wide bead -> anchor
+  int splitIdx = -1;                                 // the junction, -1 unsplit
+  // The cell per branch, and the top of each branch's own stack. `deliveryIdx`
+  // is empty on the `hand` (one pedestal, no copies) and on an unsplit box
+  // (one cell, which IS `barIdx`).
+  std::vector<int> deliveryIdx;
+  std::vector<int> branchTop((size_t)instances, -1);
 
   // One bead. `instance` is which socket it edits, -1 for a record-wide one:
   // the tip says "this instance alone" or "the whole record" off that, so the
@@ -968,7 +1073,7 @@ int Builder::Place(int node, int32_t lane, int layer, int x, int& outIdx,
     // A `trail` GROUP is a Mod too, and it has no field to compose.
     tg.edit = (gd && !mn.group && gd->field != ModField::None) ? ModEdit(*gd, mn.n)
                                                               : std::string();
-    tg.wasted = gd && IsWasted(mn.glyph);
+    tg.wasted = (gd && IsWasted(mn.glyph)) || IsWastedNode(mi);
     tg.x = cx;
     tg.w = kGraphTagW;
     tg.h = kGraphTagH;
@@ -1081,21 +1186,53 @@ int Builder::Place(int node, int32_t lane, int layer, int x, int& outIdx,
     int top = cur;
     for (int mi : mods) {
       const int w = modW(mi);
-      // `to` is the bar, which in the flipped order does not exist yet; -1 is
-      // patched to `barIdx` once every stage has run.
+      // The bar does not exist yet in the flipped order, so the bead is
+      // remembered and edged to `barIdx` once every stage has run.
       if (isGroup(mi)) {
         int idx = -1, itop = cur;
         Place(mi, 0, cur, cx, idx, &itop);
-        if (idx >= 0) Edge(idx, -1, GraphEdge::Trunk);
+        if (idx >= 0) trunkPending.push_back(idx);
         top = std::max(top, itop);
       } else {
-        Edge(Bead(mi, cur, cx, -1), -1, GraphEdge::Trunk);
+        trunkPending.push_back(Bead(mi, cur, cx, -1));
       }
       cx += w + kGraphGap;
     }
     cur = top + 1;
   };
-  auto stageBar = [&]() {
+  // THE JUNCTION. One synthesized node, on its own layer immediately below the
+  // socket row in BOTH orders, and the only thing a `Fan` edge ever points at.
+  // It exists exactly when the box has more than one instance — an unsplit box
+  // has nothing to diverge and gets no junction, which is what keeps its
+  // drawing byte-identical to what it was.
+  auto stageSplit = [&]() {
+    if (instances <= 1) return;
+    SpellGraphNode sp;
+    sp.kind = GraphKind::Split;
+    sp.treeNode = -1;
+    sp.instances = instances;
+    sp.x = x + (boxW - kGraphSplitW) / 2;   // ON THE BOX AXIS, always
+    sp.w = kGraphSplitW;
+    sp.h = kGraphSplitH;
+    sp.layer = cur;
+    sp.baseLayer = cur;
+    // The junction SPANS THE WHOLE BOX, so every socket AND every record-wide
+    // bead is inside its parent - a bead row is 96 wide and can be wider than
+    // the content it sits over. Rect and span are decoupled on purpose (see
+    // the header note): the drawn mark is 32 px on the axis.
+    sp.subX = x;
+    sp.subW = boxW;
+    sp.spanFirst = n.first;
+    sp.spanLast = n.last;
+    splitIdx = Add(sp);
+    cur++;
+  };
+
+  // ONE DELIVERY CELL. `inst` is which branch it caps, -1 when the box is not
+  // split; the PRIMARY (instance 0, or the only cell) owns the record — the
+  // price, the socket list, the bus, the junction and the whole box's span —
+  // and every copy carries `primary` and its own column's span.
+  auto Cell = [&](int32_t inst, int cx, int cw, bool primary, int32_t bolts = 1) {
     SpellGraphNode bar;
     bar.kind = n.glyph < 0 ? GraphKind::Root : GraphKind::Join;
     bar.treeNode = node;
@@ -1106,38 +1243,76 @@ int Builder::Place(int node, int32_t lane, int layer, int x, int& outIdx,
     bar.label = lib.Delivery(n.glyph).id;
     bar.instances = instances;
     bar.laneCount = L;
-    bar.x = barX;
-    bar.w = barW;
+    bar.instance = inst;
+    bar.bolts = bolts;
+    bar.x = cx + (cw - kGraphCell) / 2;
+    bar.w = kGraphCell;
     bar.h = kGraphCell;
     bar.layer = cur;
-    // THE BOX HANDS OFF FROM THE BOTTOM OF ITS SPAN, not from its bar: on a
-    // spoken delivery the bar is the TOP of the stack, and an edge leaving it
+    // THE BOX HANDS OFF FROM THE BOTTOM OF ITS SPAN, not from its cell: on a
+    // spoken delivery the cell is the TOP of the stack, and an edge leaving it
     // would fall the whole height of the subtree through every cell in it.
-    bar.baseLayer = layer;
+    // Only the primary hands off; a copy is not anybody's child.
+    bar.baseLayer = primary ? layer : cur;
     bar.spanFirst = n.first;
     bar.spanLast = n.last;
-    bar.subX = x;
-    bar.subW = boxW;
-    if (price) {
+    // The primary's span is the WHOLE BOX, so a parent's containment law sees
+    // the box and the trunk leaves on the box axis; a copy's span is its own
+    // column, so that branch's payload is inside the cell that caps it.
+    bar.subX = primary ? x : cx;
+    bar.subW = primary ? boxW : cw;
+    if (primary && price) {
       bar.price = *price;
       bar.hasPrice = true;
       bar.subtotal = price->tariff + price->carryCost;
     }
-    barIdx = Add(bar);
+    const int idx = Add(bar);
+    if (primary) barIdx = idx;
+    return idx;
+  };
+
+  // The `hand`, and any unsplit box: one cell, centred, exactly as before.
+  auto stageBar = [&]() {
+    Cell(-1, barX, barW, true);
+    cur++;
+  };
+  // A SPOKEN DELIVERY WITH A FAN IS DRAWN ONCE PER BRANCH. Three bolts are
+  // three cells, one capping each column, all on one layer so the drawing has
+  // a flat top edge. They are one word and one record: instance 0 is the
+  // primary and the rest carry `primary` pointing at it.
+  auto stageDeliveries = [&]() {
+    if (instances <= 1) {
+      stageBar();
+      return;
+    }
+    deliveryIdx.assign((size_t)instances, -1);
+    for (int32_t inst = 0; inst < instances; inst++)
+      deliveryIdx[(size_t)inst] =
+          Cell(inst, contentX + colX[(size_t)inst], socketColW[(size_t)inst],
+               inst == 0,
+               price && inst < (int32_t)price->laneSplits.size()
+                   ? price->laneSplits[(size_t)inst]
+                   : 1);
     cur++;
   };
 
+  // THE ORDER. Read either column downward and it is the same sentence: the
+  // shared pile, what it all rides on, the split, one column per branch, and
+  // the delivery word wherever the player said it. The two lists differ ONLY
+  // in where the delivery lands, which is the one thing word order decides.
   if (flip) {
     stageItems();
     stageBus();
-    stageLaneItems();
-    stageLaneMods();
-    stageSockets();
     stageMods();
-    stageBar();
+    stageSplit();
+    stageSockets();
+    stageLaneMods();
+    stageLaneItems();
+    stageDeliveries();
   } else {
     stageBar();
     stageMods();
+    stageSplit();
     stageSockets();
     stageLaneMods();
     stageLaneItems();
@@ -1149,21 +1324,47 @@ int Builder::Place(int node, int32_t lane, int layer, int x, int& outIdx,
 
   // ---- the edges, once every node exists --------------------------------------
   // Wired here rather than inside the stages because in the flipped order half
-  // of them are placed before the thing they connect to.
-  for (SpellGraphEdge& e : g.edges)
-    if (e.to == -1) e.to = barIdx;               // the record-wide beads
+  // of them are placed before the thing they connect to. Everything deferred is
+  // deferred in a LOCAL list; nothing about this box is left in the shared edge
+  // list for a recursive call to trip over.
+  // THE ANCHOR is what the shared trunk ends at: the junction when the box has
+  // one, the delivery cell when it has not. Everything shared — the bus, the
+  // record-wide beads, the fan itself — meets there, which is what makes the
+  // junction read as the place the one becomes many.
+  const int anchorIdx = splitIdx >= 0 ? splitIdx : barIdx;
+  for (int mi : trunkPending) Edge(mi, anchorIdx, GraphEdge::Trunk);
   g.nodes[(size_t)barIdx].sockets = socketIdx;
+  g.nodes[(size_t)barIdx].split = splitIdx;
   for (int32_t inst = 0; inst < instances; inst++)
-    Edge(socketIdx[(size_t)inst], barIdx, GraphEdge::Fan);
+    Edge(socketIdx[(size_t)inst], anchorIdx, GraphEdge::Fan);
+  // The `hand` is the pedestal everything stands on, so its junction hands off
+  // downward to it. A spoken delivery's junction does not: its cells are at the
+  // TOP of the branches, and the path to them already runs through the sockets.
+  if (splitIdx >= 0 && !flip) Edge(splitIdx, barIdx, GraphEdge::Trunk);
   if (busIdx >= 0) {
-    Edge(busIdx, barIdx, GraphEdge::Trunk);
+    Edge(busIdx, anchorIdx, GraphEdge::Trunk);
     g.nodes[(size_t)barIdx].bus = busIdx;
   }
   for (int idx : sharedPlaced)
-    Edge(idx, busIdx >= 0 ? busIdx : barIdx,
+    Edge(idx, busIdx >= 0 ? busIdx : anchorIdx,
          busIdx >= 0 ? GraphEdge::Bus : GraphEdge::Trunk);
-  for (const std::pair<int, int>& lk : laneLinks)
+  for (const std::pair<int, int>& lk : laneLinks) {
     Edge(lk.first, socketIdx[(size_t)lk.second], GraphEdge::Socket);
+    // ...and remember the HIGHEST thing in the column, because that is what
+    // hands the branch on to the cell that caps it.
+    int& top = branchTop[(size_t)lk.second];
+    if (top < 0 || g.nodes[(size_t)lk.first].layer > g.nodes[(size_t)top].layer)
+      top = lk.first;
+  }
+  // EVERY BRANCH ENDS IN ITS OWN CELL. The column runs socket -> its payload ->
+  // the delivery copy; a branch carrying nothing of its own runs straight from
+  // its pip into the cell.
+  for (size_t k = 0; k < deliveryIdx.size(); k++) {
+    const int from = branchTop[k] >= 0 ? branchTop[k] : socketIdx[k];
+    Edge(from, deliveryIdx[k], GraphEdge::Trunk);
+  }
+  for (size_t k = 0; k < deliveryIdx.size(); k++)
+    if ((int)k != 0) g.nodes[(size_t)deliveryIdx[k]].primary = barIdx;
 
   outIdx = barIdx;
   return boxW;
@@ -1365,6 +1566,22 @@ EditResult AttachMod(const GlyphLibrary& lib, const SpellTree& tree, int boxNode
     r.why = "`" + g->id + "` is not a mod";
     return r;
   }
+  // ONE SPLIT PER SCOPE, AND THE EDITOR WILL NOT BUILD A SECOND (2026-09-22).
+  // Lowering is total and marks the loser wasted - anything the player TYPES
+  // has to compile - but a drop is a gesture the editor can decline, and a
+  // gesture whose whole effect is "charged, does nothing" is one it should.
+  // Same precedent as `ClampedAnywhere`: the page does not help you write a
+  // word that cannot do anything.
+  if (g->field == ModField::Count && IsBox(tree, boxNode)) {
+    for (int ii : tree.nodes[boxNode].items) {
+      const GlyphDef* m = lib.At(tree.nodes[ii].glyph);
+      if (tree.nodes[ii].group || !m || m->field != ModField::Count) continue;
+      if (tree.nodes[ii].lane != lane) continue;
+      r.why = lane > 0 ? "that branch already splits; one split per branch"
+                       : "this already fans; put the next one on a branch";
+      return r;
+    }
+  }
   return InsertItem(lib, tree, boxNode, lane, glyphId);
 }
 
@@ -1497,6 +1714,8 @@ EditResult Unbox(const GlyphLibrary& lib, const SpellTree& tree, int boxNode) {
     t.nodes[ii].lane = lane;
     items.push_back(ii);
   }
+  // An EMPTY box lifted out of a lane leaves that lane with nothing in it.
+  PruneTrailingEmptyLanes(t, parent);
   return Finish(lib, tree, t, "unboxing that");
 }
 
@@ -1512,8 +1731,51 @@ EditResult Remove(const GlyphLibrary& lib, const SpellTree& tree, int node) {
     r.why = "the hand cannot be removed";
     return r;
   }
+  const int owner = OwningBox(t, nav, node);
   Detach(t, nav, node);
+  PruneTrailingEmptyLanes(t, owner);
   return Finish(lib, tree, t, "removing that");
+}
+
+EditResult CloseLane(const GlyphLibrary& lib, const SpellTree& tree, int boxNode,
+                     int32_t lane) {
+  EditResult r;
+  SpellTree t = tree;
+  if (!IsBox(t, boxNode)) {
+    r.why = "that is not a box";
+    return r;
+  }
+  const int32_t L = (int32_t)t.nodes[boxNode].laneAt.size() / 2;
+  if (lane < 1) {
+    r.why = "the shared pile is not a lane; take its words off instead";
+    return r;
+  }
+  if (lane > L) {
+    // The socket is real, but it is an instance a `count` mod made, not a lane:
+    // there is no `lane` / `end` pair to take out, and the thing that would
+    // close it is the mod.
+    r.why = "this instance has no lane of its own; it comes from a count mod";
+    return r;
+  }
+  // THE LANE AND WHAT IS IN IT, and then every lane above it slides down one —
+  // which is the whole reason this is a gesture and not a side effect. Closing
+  // lane 2 of three moves the third bolt onto the second socket, and only the
+  // player can say that is what they meant.
+  std::vector<int>& items = t.nodes[boxNode].items;
+  std::vector<int> kept;
+  for (int ii : items) {
+    const int32_t ln = t.nodes[ii].lane;
+    if (ln == lane) continue;
+    if (ln > lane) t.nodes[ii].lane = ln - 1;
+    kept.push_back(ii);
+  }
+  items = kept;
+  t.nodes[boxNode].laneAt.pop_back();
+  t.nodes[boxNode].laneAt.pop_back();
+  // Closing the last full lane can leave bare ones behind it with nothing left
+  // to hold them in place.
+  PruneTrailingEmptyLanes(t, boxNode);
+  return Finish(lib, tree, t, "closing that lane");
 }
 
 EditResult Move(const GlyphLibrary& lib, const SpellTree& tree, int node, int boxNode,
@@ -1539,11 +1801,16 @@ EditResult Move(const GlyphLibrary& lib, const SpellTree& tree, int node, int bo
   }
   if (!OpenLaneIfNeeded(t, boxNode, lane, lib.budgets.maxInstances, r.why)) return r;
   int moved = node;
+  const int owner = copy ? -1 : OwningBox(t, nav, node);
   if (copy) {
     moved = CloneSubtree(t, node);
   } else {
     Detach(t, nav, node);
   }
   PlaceItem(lib, t, boxNode, lane, moved);
+  // AFTER the placement, never before: dragging the last item of a box's top
+  // lane into another lane of the SAME box empties the one it left, and pruning
+  // first would renumber the destination out from under `lane`.
+  PruneTrailingEmptyLanes(t, owner);
   return Finish(lib, tree, t, "that move");
 }

@@ -841,8 +841,12 @@ struct UIState {
     std::string example;
     std::string delivers; // which deliveries carry it
     std::string emptyNote;// "left empty: _" for operators
-    bool recordWide = false;  // a Mod whose field is `count`: edits the whole
-                              // record wherever it is spoken, lane or not
+    // A Mod that edits the whole record WHEREVER it is spoken. `count` was the
+    // only one and is not any more (2026-09-22): a count splits the scope it
+    // was spoken in, so a mod dropped on a branch edits that branch. Kept as a
+    // field because the drop preview promises which it is, and the day a
+    // genuinely record-wide mod exists it has somewhere to say so.
+    bool recordWide = false;
   };
   std::vector<GlyphUI> glyphsOwned;   // EVERY glyph, `owned` says which
   // ---- the grimoire (plan §12b) --------------------------------------------
@@ -903,7 +907,7 @@ struct UIState {
   struct SpellGraphUI {
     struct Node {
       int kind = 0;            // GraphKind: 0 word 1 operator 2 join 3 modtag
-                               // 4 root 5 socket 6 bus
+                               // 4 root 5 socket 6 bus 7 split
       int treeNode = -1;       // index into the SpellTree; -1 = synthesized
       std::string glyphId;     // the word's NAME; "" on a synthesized node
       std::string label;       // what the cell says ("fire", "PROJECTILE")
@@ -934,7 +938,15 @@ struct UIState {
       int wordCost = 0, tariff = 0, carryCost = 0, priceInstances = 1, leaves = 1;
       bool instancesClamped = false;
       int subtotal = 0;
-      // Socket
+      // ONE RECORD, SEVERAL CELLS: a split delivery is drawn once per branch and
+      // exactly one of those cells - the PRIMARY - owns `sockets`, `bus`,
+      // `split`, the price and the box's whole span. `primary` is the primary's
+      // index on a copy and -1 on the primary itself, so an unsplit box reads
+      // exactly as it did before the field existed. See SpellGraphNode.
+      int primary = -1;
+      int split = -1;          // this box's Split junction, -1 when unsplit
+      int bolts = 1;           // how many bolts THIS branch fires (a sub-split)
+      // Socket, or WHICH BRANCH a Join cell caps
       int instance = -1;
       int pipW = 32;
       // ModTag
@@ -1060,9 +1072,11 @@ struct UIState {
   // the status line (`kitMessage`) rather than a malformed page.
   struct GraphEditIntent {
     bool pending = false;
-    enum Op { Insert = 0, FillSlot, Wrap, AttachMod, Remove, Unbox, Move } op = Insert;
-    int treeNode = -1;      // the box (Insert/AttachMod), the group (FillSlot),
-                            // or the subject (Wrap/Remove/Unbox/Move)
+    enum Op {
+      Insert = 0, FillSlot, Wrap, AttachMod, Remove, Unbox, Move, CloseLane
+    } op = Insert;
+    int treeNode = -1;      // the box (Insert/AttachMod/CloseLane), the group
+                            // (FillSlot), or the subject (Wrap/Remove/Unbox/Move)
     int boxTreeNode = -1;   // Move's destination box
     int lane = 0;
     int side = 0;           // SlotSide: 0 left, 1 right

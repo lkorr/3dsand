@@ -30,6 +30,7 @@
 //      lane feeds exactly one of them, and the root is at the maximum y.
 
 #include <algorithm>
+#include <cstdlib>
 #include <cstdio>
 #include <fstream>
 #include <map>
@@ -477,7 +478,8 @@ Status GateSpellGraph(Ctx& c, std::string& detail) {
     auto barOf = [&](const SpellGraph& sg) {
       int bar = -1;
       for (size_t i = 0; i < sg.nodes.size(); i++)
-        if (sg.nodes[i].kind == GraphKind::Join) bar = (int)i;
+        if (sg.nodes[i].kind == GraphKind::Join && sg.nodes[i].primary < 0)
+        bar = (int)i;
       return bar;
     };
     for (int step = 0; step < 3 && walkOk; step++) {
@@ -512,20 +514,24 @@ Status GateSpellGraph(Ctx& c, std::string& detail) {
         for (int si : sg.nodes[(size_t)bar].sockets) {
           const SpellGraphNode& sk = sg.nodes[(size_t)si];
           for (const SpellGraphNode& n : sg.nodes)
-            // BELOW the socket, not above it: since the inversion a spoken
-            // delivery's stack runs items / bus / lane items / lane beads /
-            // sockets / bar upward, so a lane's bead is on the neck UNDER the
-            // socket it edits.
+            // ABOVE the socket (2026-09-22). The stack used to run items / bus
+            // / lane items / lane beads / sockets / bar, which put a lane's
+            // bead UNDER the pip it edits. Now the split is below the socket
+            // row and everything above the row belongs to one branch each, so a
+            // lane's bead is on the neck the branch RISES through: items / bus
+            // / record-wide beads / split / sockets / lane beads / lane items /
+            // one delivery cell per branch.
             if (n.kind == GraphKind::ModTag && n.instance == sk.instance &&
-                n.layer < sk.layer && n.x >= sk.x && n.x + n.w <= sk.x + sk.w)
+                n.layer > sk.layer && n.x >= sk.x && n.x + n.w <= sk.x + sk.w)
               over++;
         }
       check(over == 3, Format("%d of 3 lane beads are drawn over the socket they edit "
                               "in [%s]", over, Join(words).c_str()));
     }
-    // ...and `shotgun` itself is NEVER a lane's bead, however it was spoken:
-    // count is record-wide (spell.cpp's LowerBox applies it before the lanes
-    // copy the record), so a bead over one socket would be a lie.
+    // ...and `shotgun` inside a lane is THAT LANE'S bead (2026-09-22). It used
+    // to be record-wide wherever it was spoken, so it drew on the trunk however
+    // it was said; a count now splits the scope it was spoken in, so the bead
+    // is over the branch it splits and the drawing and the cast agree again.
     {
       const CastList cl = LowerSpell(lib, ParseWords(lib, Split("fire lane shotgun end projectile")));
       const SpellGraph sg = BuildGraph(lib, cl);
@@ -535,8 +541,8 @@ Status GateSpellGraph(Ctx& c, std::string& detail) {
         if (n.instance < 0) wide++;
         else perLane++;
       }
-      check(wide >= 1 && perLane == 0,
-            Format("`shotgun` spoken inside a lane draws record-wide (%d wide, %d per-lane)",
+      check(perLane >= 1 && wide == 0,
+            Format("`shotgun` spoken inside a lane draws on that lane (%d wide, %d per-lane)",
                    wide, perLane));
     }
   }
@@ -555,9 +561,199 @@ Status GateSpellGraph(Ctx& c, std::string& detail) {
       "anything null beam",
       "explosive projectile projectile",
       "lane fire end lane end projectile",
+      // DEEP, AND FANNED DEEP. A `shotgun` on the INNERMOST box of a stack of
+      // boxes is the shape the hand-written bases above never reached: the fan
+      // it opens has to fit in layers the boxes above it have already spent.
+      "fire shotgun projectile projectile",
+      "fire shotgun projectile projectile projectile",
+      "fire projectile shotgun projectile projectile",
+      "fire projectile projectile shotgun projectile",
+      "explosive lane fire end lane gold end shotgun twin projectile projectile",
+      "gold transmute fire shotgun projectile bomb",
+      "fire trail explosive shotgun projectile echo projectile",
+      // THE REPORTED SENTENCE, and the target picture: a split whose branches
+      // each carry a shared payload, and one that carries its own as well.
+      "sand shotgun projectile",
+      "sand gust shotgun projectile",
   };
   const char* const kDrops[] = {"fire", "gold", "explosive", "shotgun", "echo",
                                 "projectile", "transmute", "self", "twin"};
+  // ---- the layout law, as a function --------------------------------------------
+  //
+  // Stated once and applied twice: to the hand-written bases of section 6, and
+  // to EVERY sentence the op fuzz below produces. The bases are shallow by
+  // construction - somebody had to type them - and the shape that broke the
+  // page (2026-09-22) only exists a few edits in: a `shotgun` attached to a box
+  // that is itself deep inside another box fans three sockets into layers its
+  // ancestors have already spent, and the fan lands UNDER the drawing instead
+  // of in front of it. A law only the shallow corpus is held to is a law that
+  // ends at the depth its author happened to type.
+  int graphs = 0, gnodes = 0;
+  int overlap = 0, outside = 0, sockets = 0, lanes = 0, rooty = 0, badEdge = 0;
+  int fanBad = 0, axisBad = 0, cellBad = 0, wideBad = 0;
+  int shownLayout = 0;
+  auto LayoutLaw = [&](const std::vector<std::string>& words, const std::string& what) {
+    if (words.empty()) return;
+    const CastList l = LowerSpell(lib, ParseWords(lib, words));
+    const SpellGraph g = BuildGraph(lib, l);
+    graphs++;
+    gnodes += (int)g.nodes.size();
+    if (g.root < 0) return;
+    // The root is the hand bar and it is at the maximum y.
+    int maxY = 0;
+    for (const SpellGraphNode& n : g.nodes) maxY = std::max(maxY, n.y);
+    if (g.nodes[(size_t)g.root].kind != GraphKind::Root ||
+        g.nodes[(size_t)g.root].y != maxY)
+      rooty++;
+    // No two nodes of one layer overlap.
+    for (size_t a = 0; a < g.nodes.size(); a++) {
+      for (size_t b = a + 1; b < g.nodes.size(); b++) {
+        if (g.nodes[a].layer != g.nodes[b].layer) continue;
+        const int ax = g.nodes[a].x, aw = g.nodes[a].w;
+        const int bx = g.nodes[b].x, bw2 = g.nodes[b].w;
+        if (ax < bx + bw2 && bx < ax + aw) {
+          if (overlap++ < 6 && shownLayout++ < 12)
+            std::printf("spell-graph: layer %d overlap in \"%s\": %s [%d,%d) vs %s [%d,%d)\n",
+                        g.nodes[a].layer, what.c_str(), g.nodes[a].label.c_str(), ax,
+                        ax + aw, g.nodes[b].label.c_str(), bx, bx + bw2);
+        }
+      }
+    }
+    // Every child sits inside its parent's SUBTREE span -- the cell is not
+    // the span: an operator cell is narrower than the row of operands above
+    // it, and a bar is narrower than a mod bead row wider than the bar.
+    std::map<int, int> socketEdges;
+    for (const SpellGraphEdge& e : g.edges) {
+      // AN EDGE THAT LEADS NOWHERE is the other half of the same bug: the
+      // stages leave `to == -1` on a bead until the bar exists, and the patch
+      // that fills it in has to reach that box's beads and no others.
+      if (e.from < 0 || e.from >= (int)g.nodes.size() || e.to < 0 ||
+          e.to >= (int)g.nodes.size()) {
+        if (badEdge++ < 6 && shownLayout++ < 12)
+          std::printf("spell-graph: \"%s\": edge %d -> %d leads nowhere\n", what.c_str(),
+                      e.from, e.to);
+        continue;
+      }
+      const SpellGraphNode& ch = g.nodes[(size_t)e.from];
+      const SpellGraphNode& pa = g.nodes[(size_t)e.to];
+      if (ch.subX < pa.subX || ch.subX + ch.subW > pa.subX + pa.subW) {
+        if (outside++ < 6 && shownLayout++ < 12)
+          std::printf("spell-graph: \"%s\": %s [%d,%d) outside %s [%d,%d)\n", what.c_str(),
+                      ch.label.c_str(), ch.subX, ch.subX + ch.subW, pa.label.c_str(),
+                      pa.subX, pa.subX + pa.subW);
+      }
+      if (e.kind == GraphEdge::Socket) socketEdges[e.from]++;
+    }
+    for (const auto& kv : socketEdges)
+      if (kv.second != 1) lanes++;
+    // A join has exactly `instances` sockets, and each socket names its own
+    // instance. SOCKETS ARE BRANCHES, NEVER BOLTS: a branch that splits again
+    // has its own junction and its own sockets one level in, and this row still
+    // counts the branches of THIS box. Scoped to the primary, because a split
+    // delivery is drawn once per branch and a copy owns no socket row.
+    for (const SpellGraphNode& n : g.nodes) {
+      if (n.kind != GraphKind::Join && n.kind != GraphKind::Root) continue;
+      if (n.primary >= 0) continue;
+      if ((int)n.sockets.size() != n.instances) {
+        sockets++;
+        continue;
+      }
+      for (size_t i = 0; i < n.sockets.size(); i++)
+        if (g.nodes[(size_t)n.sockets[i]].instance != (int32_t)i) sockets++;
+    }
+
+    // ---- THE SPLIT LAWS (2026-09-22) ------------------------------------------
+    //
+    // The fan used to run `socket -> bar` with the socket row hard against the
+    // bar, so on a spoken delivery - whose cell is the TOP of its span - the
+    // three strokes left the cell going DOWN and the drawing said "the
+    // projectile splits", pointing backwards. These four laws are the statement
+    // that a split is a thing of its own and that it opens forward in both
+    // orders, and they run over every graph the fuzz builds.
+
+    // (1) EVERY FAN DIVERGES UPWARD OUT OF A JUNCTION. A `Fan` edge runs from a
+    // socket to the Split one band below it, and the junction stands on the
+    // box's axis. One statement; it covers the `hand` and the spoken box.
+    for (const SpellGraphEdge& e : g.edges) {
+      if (e.kind != GraphEdge::Fan) continue;
+      if (e.from < 0 || e.to < 0 || e.from >= (int)g.nodes.size() ||
+          e.to >= (int)g.nodes.size())
+        continue;
+      const SpellGraphNode& sk = g.nodes[(size_t)e.from];
+      const SpellGraphNode& sp = g.nodes[(size_t)e.to];
+      const bool ok = sk.kind == GraphKind::Socket &&
+                      (sp.kind == GraphKind::Split
+                           ? sk.layer == sp.layer + 1
+                           // An unsplit box has no junction and one socket; its
+                           // pip still sits on the cell's own band.
+                           : sp.instances == 1);
+      if (!ok && fanBad++ < 6 && shownLayout++ < 12)
+        std::printf("spell-graph: \"%s\": fan %s(layer %d) -> %s(kind %d, layer %d)\n",
+                    what.c_str(), sk.label.c_str(), sk.layer, sp.label.c_str(),
+                    (int)sp.kind, sp.layer);
+    }
+    // (2) A JUNCTION IS ON THE AXIS OF THE BOX IT SPLITS.
+    for (const SpellGraphNode& sp : g.nodes) {
+      if (sp.kind != GraphKind::Split) continue;
+      if (std::abs((sp.subX + sp.subW / 2) - (sp.x + sp.w / 2)) > kGraphSplitW &&
+          axisBad++ < 6 && shownLayout++ < 12)
+        std::printf("spell-graph: \"%s\": junction at %d is off the axis of "
+                    "[%d,%d)\n", what.c_str(), sp.x + sp.w / 2, sp.subX,
+                    sp.subX + sp.subW);
+    }
+    // (3) ONE RECORD OWNER PER BOX, AND EVERY BRANCH ENDS IN A CELL. A split
+    // spoken delivery is drawn once per branch: N cells on ONE layer, their
+    // `instance`s a permutation of 0..N-1, exactly one of them the primary, and
+    // every copy pointing at it.
+    std::map<int, std::vector<int>> cells;
+    for (size_t i = 0; i < g.nodes.size(); i++) {
+      const SpellGraphNode& c = g.nodes[i];
+      if ((c.kind == GraphKind::Join || c.kind == GraphKind::Root) &&
+          c.treeNode >= 0)
+        cells[c.treeNode].push_back((int)i);
+    }
+    for (const auto& kv : cells) {
+      const std::vector<int>& cs = kv.second;
+      // The `hand` is the pedestal the branches have not diverged from yet, so
+      // it is ONE cell however wide its fan; a spoken delivery gets one per
+      // branch.
+      const bool hand = g.nodes[(size_t)cs[0]].kind == GraphKind::Root;
+      const int want = hand ? 1 : g.nodes[(size_t)cs[0]].instances;
+      int owners = 0;
+      const int lyr = g.nodes[(size_t)cs[0]].layer;
+      std::vector<int> seen;
+      bool ok = (int)cs.size() == want;
+      for (int ci : cs) {
+        const SpellGraphNode& c = g.nodes[(size_t)ci];
+        if (c.primary < 0) owners++;
+        else if (c.primary >= (int)g.nodes.size() ||
+                 g.nodes[(size_t)c.primary].primary >= 0 ||
+                 g.nodes[(size_t)c.primary].treeNode != c.treeNode)
+          ok = false;                       // a copy must point at THE owner
+        if (c.layer != lyr) ok = false;     // one flat top edge
+        if (c.hasPrice && c.primary >= 0) ok = false;   // the record is the owner's
+        seen.push_back((int)c.instance);
+      }
+      if (owners != 1) ok = false;
+      if (cs.size() > 1) {
+        // ...and the cells name branches 0..N-1, once each.
+        std::sort(seen.begin(), seen.end());
+        for (size_t i = 0; i < seen.size(); i++)
+          if (seen[i] != (int)i) ok = false;
+      }
+      if (!ok && cellBad++ < 6 && shownLayout++ < 12)
+        std::printf("spell-graph: \"%s\": tree node %d drew %d cells (%d owners), "
+                    "want %d\n", what.c_str(), kv.first, (int)cs.size(), owners,
+                    want);
+    }
+    // (4) THE DRAWING IS BOUNDED. A split branch ends in a cell, so columns are
+    // 64 wide now; nesting multiplies them and the page has to stay findable.
+    if (g.width > kGraphMaxColumns * (kGraphCell + kGraphGap) &&
+        wideBad++ < 6 && shownLayout++ < 12)
+      std::printf("spell-graph: \"%s\": the drawing is %d px wide\n", what.c_str(),
+                  g.width);
+  };
+
   int opCases = 0, opOk = 0, opRefused = 0, opBad = 0;
   for (const char* base : kBases) {
     const std::vector<std::string> bw = Split(base);
@@ -636,6 +832,10 @@ Status GateSpellGraph(Ctx& c, std::string& detail) {
               std::printf("spell-graph: %s(%s) on \"%s\" -> \"%s\" is not what it claimed\n",
                           cs.op, dropName, base, Join(cs.r.words).c_str());
           }
+          // ...and the page can DRAW what the op produced. This is where the
+          // deep shapes come from: every op result, at whatever depth the op
+          // left the tree at, goes through the layout law.
+          LayoutLaw(cs.r.words, std::string(cs.op) + "(" + dropName + ") on \"" + base + "\"");
         }
       }
     }
@@ -720,72 +920,152 @@ Status GateSpellGraph(Ctx& c, std::string& detail) {
     check(fire < 0 || trail < 0 || sg.nodes[(size_t)fire].y > sg.nodes[(size_t)trail].y,
           "the operand sits under the operator cell it fills");
   }
-  int graphs = 0, gnodes = 0;
   {
-    int overlap = 0, outside = 0, sockets = 0, lanes = 0, rooty = 0;
     for (const char* base : kBases) {
       const std::vector<std::string> bw = Split(base);
       if (bw.empty()) continue;
-      const CastList l = LowerSpell(lib, ParseWords(lib, bw));
-      const SpellGraph g = BuildGraph(lib, l);
-      graphs++;
-      gnodes += (int)g.nodes.size();
-      if (g.root < 0) continue;
-      // The root is the hand bar and it is at the maximum y.
-      int maxY = 0;
-      for (const SpellGraphNode& n : g.nodes) maxY = std::max(maxY, n.y);
-      if (g.nodes[(size_t)g.root].kind != GraphKind::Root ||
-          g.nodes[(size_t)g.root].y != maxY)
-        rooty++;
-      // No two nodes of one layer overlap.
-      for (size_t a = 0; a < g.nodes.size(); a++) {
-        for (size_t b = a + 1; b < g.nodes.size(); b++) {
-          if (g.nodes[a].layer != g.nodes[b].layer) continue;
-          const int ax = g.nodes[a].x, aw = g.nodes[a].w;
-          const int bx = g.nodes[b].x, bw2 = g.nodes[b].w;
-          if (ax < bx + bw2 && bx < ax + aw) {
-            if (overlap++ < 3)
-              std::printf("spell-graph: layer %d overlap in \"%s\": %s [%d,%d) vs %s [%d,%d)\n",
-                          g.nodes[a].layer, base, g.nodes[a].label.c_str(), ax, ax + aw,
-                          g.nodes[b].label.c_str(), bx, bx + bw2);
-          }
-        }
-      }
-      // Every child sits inside its parent's SUBTREE span -- the cell is not
-      // the span: an operator cell is narrower than the row of operands above
-      // it, and a bar is narrower than a mod bead row wider than the bar.
-      std::map<int, int> socketEdges;
-      for (const SpellGraphEdge& e : g.edges) {
-        const SpellGraphNode& ch = g.nodes[(size_t)e.from];
-        const SpellGraphNode& pa = g.nodes[(size_t)e.to];
-        if (ch.subX < pa.subX || ch.subX + ch.subW > pa.subX + pa.subW) {
-          if (outside++ < 3)
-            std::printf("spell-graph: \"%s\": %s [%d,%d) outside %s [%d,%d)\n", base,
-                        ch.label.c_str(), ch.subX, ch.subX + ch.subW, pa.label.c_str(),
-                        pa.subX, pa.subX + pa.subW);
-        }
-        if (e.kind == GraphEdge::Socket) socketEdges[e.from]++;
-      }
-      for (const auto& kv : socketEdges)
-        if (kv.second != 1) lanes++;
-      // A join has exactly `instances` sockets, and each socket names its own
-      // instance.
-      for (const SpellGraphNode& n : g.nodes) {
-        if (n.kind != GraphKind::Join && n.kind != GraphKind::Root) continue;
-        if ((int)n.sockets.size() != n.instances) {
-          sockets++;
-          continue;
-        }
-        for (size_t i = 0; i < n.sockets.size(); i++)
-          if (g.nodes[(size_t)n.sockets[i]].instance != (int32_t)i) sockets++;
-      }
+      LayoutLaw(bw, base);
     }
     check(overlap == 0, Format("%d same-layer overlaps", overlap));
     check(outside == 0, Format("%d children outside their parent's span", outside));
+    check(badEdge == 0, Format("%d edges that lead nowhere", badEdge));
     check(sockets == 0, Format("%d joins whose socket row does not match `instances`",
                                sockets));
     check(lanes == 0, Format("%d lane subtrees that do not feed exactly one socket", lanes));
     check(rooty == 0, Format("%d graphs whose root is not the bottom bar", rooty));
+    check(fanBad == 0, Format("%d fans that do not diverge out of a junction", fanBad));
+    check(axisBad == 0, Format("%d junctions off their box's axis", axisBad));
+    check(cellBad == 0, Format("%d boxes whose branches do not each end in a cell",
+                               cellBad));
+    check(wideBad == 0, Format("%d drawings past the column budget", wideBad));
+  }
+
+  // ---- 7. A FAN COMES APART THE WAY IT WENT TOGETHER (2026-09-22) ------------
+  //
+  // A lane used to outlive its last item, always — the instance was real and
+  // the lanes above it are numbered from it. The price was a fan that could not
+  // be taken down: build three lanes, delete the three payloads, and the box
+  // still spelt `lane end lane end lane end`, three sockets of nothing and six
+  // words nobody asked for. Opening a lane is also a SIDE EFFECT of dropping on
+  // a far socket, so the leftovers accumulated from gestures the player never
+  // made at a lane at all.
+  //
+  // The rule is the asymmetry: a TRAILING empty lane holds nothing in place, so
+  // it goes; an INTERIOR one stays, because closing it would move every bolt
+  // above it onto a different socket — and that is `CloseLane`, a gesture.
+  {
+    auto findNode = [&](const SpellTree& t, const char* name, bool box) {
+      std::vector<int> ns;
+      if (t.clauses.empty()) return -1;
+      Reach(t, t.clauses[0].root, ns);
+      for (int ni : ns)
+        if (t.nodes[(size_t)ni].box == box && t.nodes[(size_t)ni].glyph == lib.Find(name))
+          return ni;
+      return -1;
+    };
+    auto lanesOf = [&](const SpellTree& t, int b) {
+      return b < 0 ? -1 : (int)t.nodes[(size_t)b].laneAt.size() / 2;
+    };
+    // Two lanes on a `fire projectile`, built the way the canvas builds them.
+    std::vector<std::string> words;
+    SpellTree t = ParseWords(lib, Split("fire projectile"));
+    bool live = true;
+    auto step = [&](const EditResult& r, const char* what) {
+      if (!r.ok) {
+        check(false, std::string(what) + " was refused: " + r.why);
+        live = false;
+        return;
+      }
+      words = r.words;
+      t = ParseWords(lib, words);
+    };
+    step(InsertItem(lib, t, findNode(t, "projectile", true), 1, lib.Find("sand")),
+         "lane 1 sand");
+    if (live)
+      step(InsertItem(lib, t, findNode(t, "projectile", true), 2, lib.Find("gold")),
+           "lane 2 gold");
+    const SpellTree two = t;             // the two-lane fixture, reused below
+    const std::vector<std::string> twoW = words;
+    check(!live || lanesOf(t, findNode(t, "projectile", true)) == 2,
+          "the fixture has two lanes: [" + Join(words) + "]");
+    // Delete the TOP lane's word: the lane goes with it.
+    if (live) step(Remove(lib, t, findNode(t, "gold", false)), "remove the gold");
+    check(!live || lanesOf(t, findNode(t, "projectile", true)) == 1,
+          "deleting the last word of the top lane closes it: [" + Join(words) + "]");
+    // Delete the other one: no lanes left, and no marks left on the page.
+    if (live) step(Remove(lib, t, findNode(t, "sand", false)), "remove the sand");
+    if (live) {
+      check(lanesOf(t, findNode(t, "projectile", true)) == 0 &&
+                CountWord(words, "lane") == 0 && CountWord(words, "end") == 0,
+            "the fan unwinds to no lanes and no marks: [" + Join(words) + "]");
+      check(GraphTreeKey(lib, t) ==
+                GraphTreeKey(lib, ParseWords(lib, Split("fire projectile"))),
+            "...and what is left is the spell it was built from: [" + Join(words) + "]");
+    }
+    // AN INTERIOR LANE SURVIVES ITS LAST ITEM, because lane 2 is numbered from
+    // it: the bolt the player aimed at socket 1 must not slide onto socket 0.
+    {
+      const int gone = findNode(two, "sand", false);
+      const EditResult r = Remove(lib, two, gone);
+      check(r.ok, "the interior lane's word can be removed: " + r.why);
+      if (r.ok) {
+        const SpellTree after = ParseWords(lib, r.words);
+        const int b = findNode(after, "projectile", true);
+        const int gold = findNode(after, "gold", false);
+        check(lanesOf(after, b) == 2 && gold >= 0 &&
+                  after.nodes[(size_t)gold].lane == 2,
+              "emptying lane 1 of 2 keeps both lanes and leaves the gold in lane 2: [" +
+                  Join(r.words) + "]");
+        // ...and `CloseLane` is what takes it out, sliding lane 2 down.
+        const EditResult c = CloseLane(lib, after, b, 1);
+        check(c.ok, "closing the bare lane is allowed: " + c.why);
+        if (c.ok) {
+          const SpellTree ct = ParseWords(lib, c.words);
+          const int cg = findNode(ct, "gold", false);
+          check(lanesOf(ct, findNode(ct, "projectile", true)) == 1 && cg >= 0 &&
+                    ct.nodes[(size_t)cg].lane == 1,
+                "closing lane 1 slides the gold down into it: [" + Join(c.words) + "]");
+        }
+      }
+    }
+    // CLOSING A LANE TAKES ITS WORDS WITH IT.
+    {
+      const int b = findNode(two, "projectile", true);
+      const EditResult c = CloseLane(lib, two, b, 2);
+      check(c.ok, "a full lane can be closed: " + c.why);
+      if (c.ok)
+        check(CountWord(c.words, "gold") == 0 && CountWord(c.words, "sand") == 1 &&
+                  c.words.size() < twoW.size(),
+              "closing lane 2 takes the gold with it: [" + Join(c.words) + "]");
+    }
+    // The two refusals, each with a reason: the shared pile is not a lane, and
+    // an instance a count mod made has no lane to close.
+    {
+      const SpellTree ft = ParseWords(lib, Split("shotgun projectile"));
+      const int fb = findNode(ft, "projectile", true);
+      const EditResult zero = CloseLane(lib, ft, fb, 0);
+      const EditResult none = CloseLane(lib, ft, fb, 1);
+      check(!zero.ok && !zero.why.empty(),
+            "lane 0 is the shared pile and is refused: '" + zero.why + "'");
+      check(!none.ok && !none.why.empty(),
+            "a count mod's socket has no lane to close: '" + none.why + "'");
+    }
+    // THE SIDE-EFFECT LANES GO BACK TOO. Dropping on the third socket of a
+    // laneless box opens the two before it; removing that one word must leave
+    // the box exactly as it was found.
+    {
+      const EditResult far = InsertItem(lib, EmptyTree(), 0, 3, lib.Find("fire"));
+      check(far.ok, "the far socket still opens three lanes: " + far.why);
+      if (far.ok) {
+        const SpellTree ft = ParseWords(lib, far.words);
+        const EditResult back = Remove(lib, ft, findNode(ft, "fire", false));
+        check(back.ok, "and the word can be taken off again: " + back.why);
+        if (back.ok)
+          check(back.words.empty() ||
+                    (CountWord(back.words, "lane") == 0 && CountWord(back.words, "end") == 0),
+                "removing it closes all three: [" + Join(back.words) + "]");
+      }
+    }
   }
 
   detail = Format("%d sentences (%d oracle), %d op cases, %d graphs, %d checks",

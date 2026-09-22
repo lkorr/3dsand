@@ -252,6 +252,10 @@ struct ShotSpellScene {
 //   lanes     - lane/end scoping: sockets with payloads of their own
 //   fan       - shotgun twice: nine instances, the widest row the page draws
 //   tall      - eighteen words of everything: the page that does not fit
+//   split     - the shape the whole thing is for: one shotgun, three branches,
+//               each rising to its own copy of the delivery
+//   deepfan   - a shotgun on a box three boxes down, and a shotgun on the HAND:
+//               the two places a fan can open that are not the top of the tree
 const ShotSpellScene kShotSpellScenes[] = {
     {"plain", "fire projectile"},
     {"duststorm", "sand gust gust shotgun projectile"},
@@ -262,6 +266,19 @@ const ShotSpellScene kShotSpellScenes[] = {
     {"tall",
      "water fire transmute twin seek heavy lane acid wide end lane stone "
      "bounce end explosive long shotgun lob"},
+    // A FAN THAT IS NOT AT THE TOP. `shotgun` on the innermost box opens
+    // three sockets into layers the boxes above it have already spent, and
+    // `shotgun` spoken last edits the implicit `hand` - the one box drawn
+    // bar-downward, so its fan hangs at the FOOT of the page. Both drew wrong
+    // until 2026-09-22 (the bead's trunk stroke was patched onto whichever bar
+    // finished first, which on the hand is a delivery several layers up).
+    {"split", "sand gust shotgun projectile"},
+    // A SPLIT INSIDE A SPLIT: the box fans into three and one of those branches
+    // splits again. The grammar does it (`--gate spells`, L13); what this scene
+    // watches is whether the PAGE says so.
+    {"subfan", "sand shotgun lane gust shotgun end projectile"},
+    {"deepfan", "fire shotgun projectile projectile projectile"},
+    {"handfan", "explosive projectile projectile shotgun"},
     {"empty", ""},
     // The same page, dragged: every mark on the sheet - the ruling, the
     // pricked margins, the foxing, the great figure - must have moved with it.
@@ -8490,7 +8507,12 @@ int main(int argc, char** argv) {
       if (frameCounter == kShotInvGraphEdit) {
         int box = -1;
         for (const UIState::SpellGraphUI::Node& n : ui.spellGraph.nodes)
-          if (n.kind == 2 /* Join */ && n.treeNode >= 0) { box = (int)(&n - ui.spellGraph.nodes.data()); break; }
+          // `primary < 0`: a split delivery is drawn once per branch and only
+          // the primary cell owns the socket list this harness reads.
+          if (n.kind == 2 /* Join */ && n.treeNode >= 0 && n.primary < 0) {
+            box = (int)(&n - ui.spellGraph.nodes.data());
+            break;
+          }
         if (box >= 0) {
           // THE SOCKET THAT USED TO REFUSE. `shotgun` gives this box three
           // sockets over zero lanes, and the lane a socket drop asks for is
@@ -11795,6 +11817,9 @@ int main(int argc, char** argv) {
           case UIState::GraphEditIntent::Move:
             r = Move(glyphs, gtree, op.treeNode, op.boxTreeNode, op.lane, op.copy);
             break;
+          case UIState::GraphEditIntent::CloseLane:
+            r = CloseLane(glyphs, gtree, op.treeNode, op.lane);
+            break;
         }
         if (r.ok) {
           if ((int)r.words.size() > glyphs.budgets.maxMacroWords) {
@@ -11936,7 +11961,7 @@ int main(int argc, char** argv) {
                         std::to_string(g.amount) + ", again per repeat";
             // COUNT IS RECORD-WIDE wherever it is spoken (spell.cpp's LowerBox),
             // so the canvas must not promise a socket drop edits one instance.
-            u.recordWide = g.field == ModField::Count;
+            u.recordWide = false;   // nothing is record-wide wherever spoken now
           } else if (g.sort == GlyphSort::Delivery) {
             u.valence = std::string(g.mech == DeliveryMech::Flight ? "flight" :
                                     g.mech == DeliveryMech::Continuous ? "continuous" : "instant") +
@@ -12102,6 +12127,9 @@ int main(int argc, char** argv) {
             u.leaves = n.price.leaves;
             u.instancesClamped = n.price.instancesClamped;
             u.subtotal = n.subtotal;
+            u.primary = n.primary;
+            u.split = n.split;
+            u.bolts = n.bolts;
             u.instance = n.instance;
             u.pipW = n.pipW;
             u.edit = n.edit;

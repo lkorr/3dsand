@@ -29,6 +29,23 @@
 //      the whole spoken sentence standing on top. `flip` in `Place` is exactly
 //      "is this box a spoken delivery".
 //
+//      A SPLIT OPENS FORWARD, WHICHEVER END THAT IS (2026-09-22). A box with
+//      more than one instance synthesizes a SPLIT junction, placed immediately
+//      below its socket row in BOTH orders, and the fan is `socket -> split`.
+//      The fan used to be `socket -> bar` with the pips hard against the bar,
+//      which on the pedestal drew three strokes rising out of the hand and on
+//      a spoken delivery drew the same three LEAVING THE CELL going down - one
+//      construct, two pictures, and the second one said the projectile split.
+//      It did not: the shotgun did, and now the drawing says so.
+//
+//      ...AND A SPOKEN DELIVERY IS DRAWN ONCE PER BRANCH. Everything above the
+//      socket row belongs to one branch each, so each branch rises through its
+//      own payload to its own copy of the delivery cell. They are one word and
+//      one record: the instance-0 copy is the PRIMARY and owns `sockets`,
+//      `bus`, `split`, the price and the box's whole span; the rest carry
+//      `primary`. The `hand` needs no copies - it is the pedestal the branches
+//      have not diverged from yet - so its one cell stays at the bottom.
+//
 //      A BOX HANDS OFF TO ITS PARENT FROM THE BOTTOM OF ITS SPAN, not from its
 //      bar. `baseLayer` is that layer. The bar of a spoken box is at the TOP of
 //      its own span, so an edge drawn from the bar itself would fall the whole
@@ -97,6 +114,16 @@ constexpr int kGraphSocketH = 32;
 constexpr int kGraphBusH = 16;        // the shared bus stroke's box
 constexpr int kGraphTagW = 96;        // a mod tag, a bead on the bar's trunk
 constexpr int kGraphTagH = 32;
+constexpr int kGraphSplitW = 32;      // the junction a fan diverges out of
+constexpr int kGraphSplitH = 16;
+// THE WIDEST ROW THE PAGE WILL DRAW. `maxInstances` is 27, and a split branch
+// now ends in a 64 px cell rather than a 32 px pip, so 27 columns is 2560
+// layout px - readable at the 0.25x overview rung. What has to be bounded is
+// NESTING: a split inside a split inside a split multiplies columns, and a
+// 32-word sentence buys enough of them to make a drawing nobody can find the
+// spell in. A sub-fan that would push a box past this is drawn COLLAPSED - one
+// cell wearing its tally, no pips - and says so.
+constexpr int kGraphMaxColumns = 27;
 
 // ---- the graph ----------------------------------------------------------------
 
@@ -108,13 +135,14 @@ enum class GraphKind : uint8_t {
   Root,       // the hand bar
   Socket,     // synthesized: one instance of a join (treeNode == -1)
   Bus,        // synthesized: what the shared items feed (treeNode == -1)
+  Split,      // synthesized: the junction a fan diverges out of (treeNode == -1)
 };
 
 enum class GraphEdge : uint8_t {
   Trunk = 0,  // child -> parent (a bus or a mod bead into its join)
   Bus,        // a shared item -> the bus
   Socket,     // a lane's subtree -> its socket
-  Fan,        // a socket -> the bar
+  Fan,        // a socket -> the SPLIT it diverges out of
   Slot,       // an operand -> its operator's pip
 };
 
@@ -155,11 +183,27 @@ struct SpellGraphNode {
   BoxPrice price;             // copied from CastList::PriceOf(treeNode)
   bool hasPrice = false;
   int32_t subtotal = 0;       // price.tariff + price.carryCost
+  // ONE RECORD, SEVERAL CELLS (2026-09-22). A split delivery is drawn once per
+  // BRANCH - three bolts are three cells, each capping its own column - and all
+  // of those cells are one word, one `treeNode`, one record. Exactly one of
+  // them is the PRIMARY: it carries `sockets`, `bus`, `split`, `price` and the
+  // whole box's `subX`/`subW`, and it is the one a parent edges into. A copy
+  // carries `primary` = the primary's graph index and `instance` = which branch
+  // it caps; everything else on it is empty. An UNSPLIT box has one cell with
+  // `primary == -1` and `instance == -1`, which is byte-identical to what this
+  // struct held before the field existed.
+  int primary = -1;           // -1 = this cell owns the record
+  int split = -1;             // graph index of this box's Split junction, or -1
+  // HOW MANY BOLTS THIS BRANCH FIRES. A branch with a count mod of its own
+  // splits again, and until the page draws that sub-fan as its own row of
+  // cells the branch is drawn COLLAPSED: one cell wearing a tally. 1 on an
+  // unsplit branch, which is every cell in a sentence with no count in a lane.
+  int32_t bolts = 1;
 
   // ---- Socket, and a lane's ModTag ------------------------------------------
   // Which instance this socket is — or, on a ModTag, which instance the mod
-  // edits (-1 when it is record-wide, which every `count` mod is wherever it
-  // was spoken). Instance 0 is the aim, and it is drawn in
+  // edits (-1 when it is record-wide), or, on a Join, which branch this cell
+  // caps (-1 when the box is unsplit). Instance 0 is the aim, and it is drawn in
   // the CENTRE slot of the row (exactly on the bar's centre line when
   // `instances` is odd), so the first lane the player opened is the middle
   // bolt — which is what rule 4 promises.
@@ -168,7 +212,11 @@ struct SpellGraphNode {
 
   // ---- ModTag ---------------------------------------------------------------
   std::string edit;           // the field edit, composed: "speed x2", "count x9"
-  bool wasted = false;        // the cast listed it in wastedMods: charged no-op
+  // The cast listed this word as a charged no-op - either by GLYPH (its field
+  // means nothing on this record) or by NODE (a second count word in a scope
+  // that already fans, 2026-09-22). The second needs the node, because the
+  // whole point is that one `shotgun` works and its twin does not.
+  bool wasted = false;
 
   // The spoken span this node covers, for the HUD word highlight.
   int spanFirst = -1, spanLast = -1;
@@ -265,9 +313,19 @@ EditResult WrapInBox(const GlyphLibrary& lib, const SpellTree& tree, int node,
 // the box's own lane. Its lanes flatten into that scope the way an unboxed
 // lane flattens when it closes.
 EditResult Unbox(const GlyphLibrary& lib, const SpellTree& tree, int boxNode);
-// Remove a subtree. Removing the last item of a lane KEEPS the (now empty)
-// lane: the instance still exists and carries the shared payload.
+// Remove a subtree. Removing the last item of a lane drops the lane too WHEN IT
+// IS THE LAST ONE, cascading down through any bare lanes under it — a fan comes
+// apart the way it went together. An INTERIOR lane survives its last item,
+// because lanes are positional and closing one would move every bolt above it
+// onto a different socket; `CloseLane` is the gesture that says to do that.
 EditResult Remove(const GlyphLibrary& lib, const SpellTree& tree, int node);
-// Move (or, with `copy`, duplicate) a subtree into another box's lane.
+// Close one lane of a box, with whatever is in it, and slide the lanes above it
+// down. Refused on lane 0 (the shared pile is not a lane) and on an instance
+// that has no lane of its own — a `count` mod's extra sockets are not lanes and
+// what closes them is the mod.
+EditResult CloseLane(const GlyphLibrary& lib, const SpellTree& tree, int boxNode,
+                     int32_t lane);
+// Move (or, with `copy`, duplicate) a subtree into another box's lane. A move
+// that empties the lane it came from unwinds it exactly as `Remove` does.
 EditResult Move(const GlyphLibrary& lib, const SpellTree& tree, int node,
                 int boxNode, int32_t lane, bool copy);
