@@ -769,6 +769,58 @@ void ValueBar(ImDrawList* dl, ImVec2 a, ImVec2 b, float frac, ImU32 fill,
   Outline(dl, a, b, 1.0f, Fade(ColBronze(), 0.9f));
 }
 
+void BeginTip() {
+  ImGui::BeginTooltip();
+  ImGui::PushFont(FontSmall());
+  ImGui::PushTextWrapPos(320.0f);
+}
+void EndTip() {
+  ImGui::PopTextWrapPos();
+  ImGui::PopFont();
+  ImGui::EndTooltip();
+}
+void Tip(const char* text) {
+  BeginTip();
+  ImGui::TextUnformatted(text);
+  EndTip();
+}
+
+// THE CALLIGRAPHIC STROKE (PLAN_spell_graph §4). Twelve segments of a cubic,
+// each drawn as its own un-antialiased line at a width quantised to a whole
+// 2 px step. The quantisation is the whole trick: a smoothly tapering spline
+// beside nearest-sampled 2x sprites reads as two different programs, and a
+// stepped one reads as the same artist with a bigger brush.
+void InkStroke(ImDrawList* dl, ImVec2 from, ImVec2 to, ImU32 col, float weight) {
+  // Control points straight down out of the child and straight up into the
+  // parent, so the stroke leaves and arrives VERTICALLY however far apart the
+  // two nodes are horizontally — which is what makes a fan of them read as one
+  // hand's worth of strokes rather than as a wire diagram.
+  const float dy = to.y - from.y;
+  const float bend = std::max(8.0f, std::fabs(dy) * 0.55f);
+  const ImVec2 c0(from.x, from.y + bend), c1(to.x, to.y - bend);
+  constexpr int kSeg = 12;
+  ImVec2 pts[kSeg + 1];
+  for (int i = 0; i <= kSeg; i++) {
+    const float t = (float)i / (float)kSeg, u = 1.0f - t;
+    const float a = u * u * u, b = 3 * u * u * t, c = 3 * u * t * t, d = t * t * t;
+    pts[i] = ImVec2(std::floor(a * from.x + b * c0.x + c * c1.x + d * to.x) + 0.5f,
+                    std::floor(a * from.y + b * c0.y + c * c1.y + d * to.y) + 0.5f);
+  }
+  const bool wasAA = (dl->Flags & ImDrawListFlags_AntiAliasedLines) != 0;
+  if (wasAA) dl->Flags &= ~ImDrawListFlags_AntiAliasedLines;
+  for (int i = 0; i < kSeg; i++) {
+    // The brush profile: thin at the tip, full at the belly, thin into the
+    // join. Sampled at the segment's MIDPOINT so the two ends are symmetric.
+    const float t = ((float)i + 0.5f) / (float)kSeg;
+    const float prof = 0.34f + 0.66f * std::sin(t * 3.14159265f);
+    float w = weight * prof;
+    // Whole 2 px steps, never below one step.
+    w = std::max(2.0f, std::floor(w * 0.5f + 0.5f) * 2.0f);
+    dl->AddLine(pts[i], pts[i + 1], col, w);
+  }
+  if (wasAA) dl->Flags |= ImDrawListFlags_AntiAliasedLines;
+}
+
 // Both badges are set in the 13 px pixel font — the same face as the rest of
 // the screen at 1x. A 26 px digit in the corner of a 44 px slot sits on top of
 // the engraving; a 13 px one sits beside it.

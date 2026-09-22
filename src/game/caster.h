@@ -179,10 +179,33 @@ struct PlayerCaster {
     compiled = CompileSpell(lib, stack);
     readout = DescribeSpell(lib, compiled);
   }
-  // Speak the glyph or page bound to a slot. Pressing a number SPEAKS, it
-  // never casts. Bounded so a stuck key cannot grow the stack without limit
-  // (rule 2 applies to UI state too — an unbounded stack is an unbounded
-  // mana cost); a page speaks as much of its expansion as fits and says so.
+  // THE PAGE IS THE INTERFACE (docs/PLAN_spell_graph.md §0b). A number key
+  // SELECTS the spell bound to a slot: the stack becomes that page's whole
+  // expansion (or that one glyph), the HUD shows its readout and price, and
+  // right-click casts it. The selection PERSISTS across casts, so a bound
+  // spell fires repeatedly off one key; another key switches, Backspace
+  // clears. Building the sentence is the grimoire page's job now, not the
+  // number row's.
+  //
+  // `selected` is the slot the stack came from, for the HUD strip's highlight;
+  // -1 when the stack was built some other way.
+  int selected = -1;
+  bool SelectSlot(const GlyphLibrary& lib, int slot) {
+    stack.Clear();
+    selected = -1;
+    if (!SpeakSlot(lib, slot)) {
+      Recompile(lib);
+      return false;
+    }
+    selected = slot;
+    return true;
+  }
+  // Put the glyph or page bound to a slot ONTO the stack, on top of whatever is
+  // there. Bounded so a stuck key cannot grow the stack without limit (rule 2
+  // applies to UI state too — an unbounded stack is an unbounded mana cost); a
+  // page speaks as much of its expansion as fits and says so. The number row no
+  // longer calls this one word at a time (see `SelectSlot`); it is the
+  // primitive under it, and the `grimoire` gate's fixture.
   bool SpeakSlot(const GlyphLibrary& lib, int slot) {
     if (inventory.KindAt(slot) == SlotKind::Page) return SpeakPage(lib, inventory.PageAt(slot));
     const int gi = inventory.At(slot);
@@ -234,6 +257,7 @@ struct PlayerCaster {
   }
   void Clear(const GlyphLibrary& lib) {
     stack.Clear();
+    selected = -1;
     Recompile(lib);
   }
 };

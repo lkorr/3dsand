@@ -10,6 +10,7 @@
 
 #include <imgui.h>
 
+#include "ui/spellgraph_ui.h"
 #include "ui/theme.h"
 
 // HOW THIS IS DRAWN (2026-09-02). Every panel is three layers in a fixed
@@ -55,19 +56,23 @@ constexpr float kPortraitHFallback = 448.0f;
 // a name (glyph indices die on every R reload, so a payload holding one could
 // straddle a reload and bind the wrong spell).
 constexpr const char* kPayloadItem = "SVKIT";
-constexpr const char* kPayloadGlyph = "SVGLY";
-// A grimoire page by NAME (plan §12b), and a word's index inside the page
-// being composed (reordering within the row). A BOUND key travels as its slot
-// index: what is on it is already in a mirror both ends can read, and a slot is
-// the one thing a key-to-key move needs to name.
-constexpr const char* kPayloadPage = "SVPGE";
+// A GLYPH and a PAGE travel by NAME, and a GRAPH NODE by its mirror index.
+// Those three are declared in ui/spellgraph_ui.h because the canvas over the
+// word row offers the same drops the row does, and one copy of a payload id is
+// the only way two files can agree about what is in flight.
+using ui::kPayloadGlyph;
+using ui::kPayloadGraphNode;
+using ui::kPayloadPage;
+// A word's index inside the page being composed (reordering within the row). A
+// BOUND key travels as its slot index: what is on it is already in a mirror
+// both ends can read, and a slot is the one thing a key-to-key move needs to
+// name.
 constexpr const char* kPayloadWord = "SVWRD";
 constexpr const char* kPayloadBound = "SVBND";
 
 // Peeking at a payload BEFORE the button is released: what makes the row able
 // to draw the drop it is about to perform instead of performing it silently.
-constexpr ImGuiDragDropFlags kPeek = ImGuiDragDropFlags_AcceptBeforeDelivery |
-                                     ImGuiDragDropFlags_AcceptNoDrawDefaultRect;
+constexpr ImGuiDragDropFlags kPeek = ui::kPeekFlags;
 
 // Which chrome sprite carries an item of this kind. A worn piece borrows the
 // engraving its own slot uses when empty, so the thing in your pack and the
@@ -102,27 +107,11 @@ std::string KindOfRef(const UIState& s, const KitRef& r) {
   return (*v)[r.index].kind;
 }
 
-const char* GlyphIcon(int type) {
-  // GlyphSort: 0 matter, 1 effect, 2 delivery, 3 mod, 4 operator.
-  switch (type) {
-    case 2: return "glyph_form";
-    case 0: return "glyph_element";
-    default: return "glyph_modifier";
-  }
-}
-
 // The sort's colour (plan §12a): matter, effect, delivery, mod, operator. Used
-// on the arsenal's column rules, the cells' edge tags and the live readout,
-// so the sentence you are speaking and the panel you bound it from agree.
-ImU32 SortColour(int sort) {
-  switch (sort) {
-    case 0: return IM_COL32(120, 190, 120, 255);   // matter: green
-    case 1: return IM_COL32(232, 138, 46, 255);    // effect: ember
-    case 2: return IM_COL32(76, 132, 200, 255);    // delivery: mana blue
-    case 3: return IM_COL32(200, 184, 138, 255);   // mod: parchment
-    default: return IM_COL32(217, 190, 110, 255);  // operator: gold
-  }
-}
+// on the arsenal's column rules, the cells' edge tags, the live readout and the
+// composer's canvas, so the sentence you are speaking, the tree you drew it on
+// and the panel you bound it from all agree. One owner, in ui/spellgraph_ui.h.
+using ui::SortColour;
 
 // The frame sprite over a slot's recess, or a crisp outline when the atlas is
 // missing. The recess itself is ui::SlotSurface; this is the rim.
@@ -148,21 +137,11 @@ void SlotRim(ImDrawList* dl, ImVec2 at, ui::SlotLook look) {
 // covered a third of the panel it was describing; 13 px is the same pixel
 // font at its native size — half the height, four times the words per box.
 // Wrapped at 320 px so a long description is a block and not a banner.
-void BeginTip() {
-  ImGui::BeginTooltip();
-  ImGui::PushFont(ui::FontSmall());
-  ImGui::PushTextWrapPos(320.0f);
-}
-void EndTip() {
-  ImGui::PopTextWrapPos();
-  ImGui::PopFont();
-  ImGui::EndTooltip();
-}
-void Tip(const char* text) {
-  BeginTip();
-  ImGui::TextUnformatted(text);
-  EndTip();
-}
+// The tooltip vocabulary moved to ui/theme.h when the canvas needed the same
+// one: 13 px, wrapped at 320, one owner.
+using ui::BeginTip;
+using ui::EndTip;
+using ui::Tip;
 
 // A panel: body, frame, and the header bar inside it. Returns the y where
 // content starts (under the header, with a gap).
@@ -390,25 +369,11 @@ const UIState::KitSlotUI& SlotOr(const std::vector<UIState::KitSlotUI>& v,
 // A glyph in a cell: its colour as a pool of light under the engraving, not
 // as a flat swatch — the swatch was the one thing on the old screen that
 // looked like a debug readout.
+// The art is ui::GlyphArt, parameterised by cell size, because the canvas draws
+// the same cell at the graph's 64 px chrome pitch and two copies of this would
+// be two looks.
 void GlyphContents(ImDrawList* dl, ImVec2 at, const UIState::GlyphUI& g) {
-  const ImVec2 mid(at.x + kSlot * 0.5f, at.y + kSlot * 0.5f);
-  if (g.color) {
-    const ImU32 sw = IM_COL32((g.color) & 0xFF, (g.color >> 8) & 0xFF,
-                              (g.color >> 16) & 0xFF, 255);
-    // Three nested rects at rising alpha: a stepped radial glow.
-    dl->AddRectFilled(ImVec2(at.x + 4, at.y + 4), ImVec2(at.x + kSlot - 4, at.y + kSlot - 4),
-                      Fade(sw, 0.16f));
-    dl->AddRectFilled(ImVec2(at.x + 8, at.y + 8), ImVec2(at.x + kSlot - 8, at.y + kSlot - 8),
-                      Fade(sw, 0.22f));
-    dl->AddRectFilled(ImVec2(at.x + 12, at.y + 12), ImVec2(at.x + kSlot - 12, at.y + kSlot - 12),
-                      Fade(sw, 0.30f));
-    // And a 2 px strip of the pure colour along the bottom: the tag.
-    dl->AddRectFilled(ImVec2(at.x + 6, at.y + kSlot - 6), ImVec2(at.x + kSlot - 6, at.y + kSlot - 4),
-                      Fade(sw, 0.9f));
-  }
-  ui::DrawSpriteCentered(dl, GlyphIcon(g.type), ImVec2(mid.x + 1, mid.y + 1),
-                         Fade(ui::ColInk(), 0.7f));
-  ui::DrawSpriteCentered(dl, GlyphIcon(g.type), mid);
+  ui::GlyphArt(dl, at, kSlot, g.color, g.type);
 }
 
 // A grimoire page in a cell: the modifier engraving in gold over a ruled
@@ -425,34 +390,7 @@ void PageContents(ImDrawList* dl, ImVec2 at) {
 // THE INFO BOX (plan §9). Every field is read from the glyph's JSON entry
 // through the mirror, so the box is never wrong about the glyph and a
 // modder's glyph gets one for free.
-void GlyphInfoBox(const UIState::GlyphUI& g, const char* sortName) {
-  BeginTip();
-  ImGui::PushStyleColor(ImGuiCol_Text, ImGui::ColorConvertU32ToFloat4(ui::ColGoldHi()));
-  if (g.owned) {
-    std::string up = g.id;
-    for (char& c : up) c = (char)toupper((unsigned char)c);
-    ImGui::TextUnformatted(up.c_str());
-  } else {
-    ImGui::TextUnformatted("? ? ?");
-  }
-  ImGui::PopStyleColor();
-  ImGui::TextDisabled("%s . %s", sortName, g.valence.c_str());
-  if (!g.owned) {
-    ImGui::TextDisabled("a word you have not learned");
-    EndTip();
-    return;
-  }
-  if (!g.desc.empty()) ImGui::TextWrapped("\"%s\"", g.desc.c_str());
-  if (!g.emptyNote.empty()) ImGui::TextDisabled("%s", g.emptyNote.c_str());
-  ImGui::TextDisabled("word %d%s%s", g.mana, g.tariff.empty() ? "" : " . tariff: ",
-                      g.tariff.c_str());
-  if (!g.axis.empty()) ImGui::TextDisabled("again: %s", g.axis.c_str());
-  if (!g.delivers.empty()) ImGui::TextDisabled("delivers by: %s", g.delivers.c_str());
-  if (!g.example.empty()) ImGui::TextDisabled("example: %s", g.example.c_str());
-  ImGui::TextDisabled("drag onto a key to bind it, or into a page to write with it");
-  ImGui::TextDisabled("right-click to write it onto the end of the open page");
-  EndTip();
-}
+using ui::GlyphInfoBox;
 
 // ---- the live portrait ------------------------------------------------------
 //
@@ -896,13 +834,11 @@ const UIState::GrimoirePageUI* FindPageUI(const UIState& s, const std::string& n
 // a right-click, a drag out of the window. Deep enough to walk back a whole
 // session of fiddling with a sentence, shallow enough that the stack is a few
 // hundred bytes of short strings.
-constexpr int kUndoDepth = 32;
-void PushUndo(UIState& s) {
-  s.grimoireUndo.push_back(s.grimoireEditWords);
-  if ((int)s.grimoireUndo.size() > kUndoDepth) s.grimoireUndo.erase(s.grimoireUndo.begin());
-  // A new edit is a new future: whatever ctrl+Z had set aside is gone.
-  s.grimoireRedo.clear();
-}
+// The stack itself lives in ui/spellgraph_ui.cpp, because the CANVAS over this
+// row pushes onto the same one: an undo that walked back through half a history
+// would be worse than no undo at all.
+using ui::PushGrimoireUndo;
+void PushUndo(UIState& s) { PushGrimoireUndo(s); }
 // The open page changed under the stacks (list click, save-with-rename, delete,
 // duplicate — the last three happen in main.cpp, so this is checked every frame
 // rather than wired to the click).
@@ -1119,7 +1055,7 @@ float BoundKeys(UIState& s, ImDrawList* dl, ImVec2 at, float width) {
         ImGui::TextUnformatted(g->id.c_str());
         ImGui::PopStyleColor();
         if (!g->desc.empty()) ImGui::TextDisabled("%s", g->desc.c_str());
-        ImGui::TextDisabled("%s speaks it  .  right-click to unbind", key);
+        ImGui::TextDisabled("%s casts it  .  right-click to unbind", key);
         ImGui::TextDisabled("drag it onto another key to move or swap it  .  drag it out to unbind");
       } else if (isPage) {
         ImGui::PushStyleColor(ImGuiCol_Text, ImGui::ColorConvertU32ToFloat4(ui::ColGoldHi()));
@@ -1127,7 +1063,7 @@ float BoundKeys(UIState& s, ImDrawList* dl, ImVec2 at, float width) {
         ImGui::PopStyleColor();
         const std::string& ro = i < (int)s.glyphSlotReadouts.size() ? s.glyphSlotReadouts[i] : "";
         ImGui::TextDisabled("%s", ro.empty() ? "(a page that names nothing)" : ro.c_str());
-        ImGui::TextDisabled("%s speaks it  .  right-click to unbind", key);
+        ImGui::TextDisabled("%s casts it  .  right-click to unbind", key);
         ImGui::TextDisabled("drag it onto another key to move or swap it  .  drag it out to unbind");
       } else {
         ImGui::TextDisabled("%s: unbound", key);
@@ -1299,9 +1235,47 @@ void GrimoireBody(UIState& s, ImVec2 at, ImVec2 size) {
       ImGui::PopItemWidth();
       if (ImGui::IsItemHovered())
         Tip(readOnly ? "An authored page: copy it to edit."
-                     : "The page's name: what a bound key speaks.");
+                     : "The page's name. Bind it to a number key and that key casts it.");
       cy += ImGui::GetFrameHeight() + 8;
     }
+    // ---- THE CANVAS (docs/PLAN_spell_graph.md §4) ----
+    //
+    // The spell as a TREE, above the row that spells it. This is the surface
+    // the player builds on; the row under it is the spoken form — what a bound
+    // key will actually say — and stays because it is the honest view of the
+    // thing that gets saved. Every gesture up here latches a tree op that
+    // main.cpp applies and linearizes back into the row, so the two can never
+    // disagree about what the page means.
+    //
+    // It gets WHATEVER IS LEFT after the row and the footer under it, never a
+    // fixed band: the tree is the thing worth the space, and a fixed height
+    // either clips the buttons on a short screen or wastes a hand's width of
+    // page on a tall one. The row's shape has to be known first, so it is
+    // measured here and laid out below.
+    const int nWords = (int)s.grimoireEditWords.size();
+    // THE SPOKEN FORM IS A STRIP, not a grid. The row stopped being the
+    // authoring surface when the canvas landed above it: it is the honest view
+    // of what a bound key will say, so it is drawn in small cells that fit on
+    // one line and gives the space back to the tree.
+    constexpr float kWSlot = 26.0f, kWCell = 30.0f;
+    const int perRow = std::max(1, (int)((innerW + (kWCell - kWSlot)) / kWCell));
+    // THE ROW IS AS LONG AS THE SENTENCE plus a couple of empty cells to drop
+    // into, never the whole 32 the page can hold. It used to draw all of them,
+    // which since the cap went to 32 (rule 4: a socket costs two words) is four
+    // rows of mostly-empty slots standing where the canvas wants to be. The
+    // capacity is still said, in words, by the "n / 32 words" line below.
+    const int cells = std::min(s.grimoireMaxWords,
+                               std::max(nWords + 2, std::min(perRow, 8)));
+    const int rowLines = (cells + perRow - 1) / perRow;
+    const float footerH = rowLines * kWCell + 6 +                   // the row
+                          3 * 13.0f + 12 + 6 +                      // the readout box
+                          ImGui::GetTextLineHeight() + 14 +         // buttons + status
+                          6;
+    const float canvasH =
+        std::max(160.0f, std::floor(size.y - (cy - base.y) - footerH));
+    const ui::GraphCanvasResult canvas =
+        ui::SpellGraphCanvas(s, ImVec2(base.x, cy), ImVec2(innerW, canvasH), readOnly);
+    cy += canvasH + 6;
     // The word row: every cell the page can hold, drawn whether or not it is
     // filled, so the page's capacity is visible and the drop target is the
     // whole row and not one trailing cell. A drop on any empty cell appends.
@@ -1323,12 +1297,9 @@ void GrimoireBody(UIState& s, ImVec2 at, ImVec2 size) {
     // insert-before-its-old-right-neighbour, which lands it exactly where it
     // already was. (One place LEFT happened to work, which made it worse — the
     // same gesture answered in one direction and not the other.)
-    const int nWords = (int)s.grimoireEditWords.size();
-    const int cells = std::max(1, s.grimoireMaxWords);
-    const int perRow = std::max(1, (int)((innerW + (kCell - kSlot)) / kCell));
     const float rowY = cy;
     auto cellAt = [&](int i) {
-      return ImVec2(base.x + (i % perRow) * kCell, rowY + (i / perRow) * kCell);
+      return ImVec2(base.x + (i % perRow) * kWCell, rowY + (i / perRow) * kWCell);
     };
     auto insertWord = [&](int at, const char* name) {
       if (readOnly) return;
@@ -1355,7 +1326,7 @@ void GrimoireBody(UIState& s, ImVec2 at, ImVec2 size) {
       const ImVec2 p = cellAt(i);
       ImGui::SetCursorScreenPos(p);
       ImGui::PushID(4000 + i);
-      ImGui::InvisibleButton("##wd", ImVec2(kSlot, kSlot));
+      ImGui::InvisibleButton("##wd", ImVec2(kWSlot, kWSlot));
       const bool hov = ImGui::IsItemHovered();
       // The LIVE size, not `nWords`: a right-click below removes a word from
       // under the rest of this very loop, and the last cell would then index
@@ -1364,20 +1335,31 @@ void GrimoireBody(UIState& s, ImVec2 at, ImVec2 size) {
       const ui::SlotLook look = hov ? ui::SlotLook::Hover
                                 : has ? ui::SlotLook::Filled
                                       : ui::SlotLook::Empty;
-      ui::SlotSurface(cd, p, kSlot, look, false);
-      SlotRim(cd, p, look);
+      ui::SlotSurface(cd, p, kWSlot, look, false);
+      // A plain 2 px rim rather than the 22 px slot sprite: the sprite is
+      // authored for a 44 px cell and halving it would be the one thing the
+      // pixel-art rule forbids.
+      cd->AddRect(p, ImVec2(p.x + kWSlot, p.y + kWSlot),
+                  look == ui::SlotLook::Hover ? ui::ColGold() : Fade(ui::ColBronze(), 0.9f),
+                  0.0f, 0, 2.0f);
       if (has) {
         const std::string& w = s.grimoireEditWords[i];
         const UIState::GlyphUI* g = FindGlyph(s, w);
         const UIState::GrimoirePageUI* pg = g ? nullptr : FindPageUI(s, w);
         if (g) {
-          GlyphContents(cd, p, *g);
-          cd->AddRectFilled(ImVec2(p.x + 2, p.y + 4), ImVec2(p.x + 4, p.y + kSlot - 4),
+          ui::GlyphArt(cd, p, kWSlot, g->color, g->type);
+          cd->AddRectFilled(ImVec2(p.x + 2, p.y + 3), ImVec2(p.x + 4, p.y + kWSlot - 3),
                             Fade(SortColour(g->type), 0.9f));
         } else if (pg) {
-          PageContents(cd, p);
+          cd->AddRectFilled(ImVec2(p.x + 5, p.y + kWSlot - 9),
+                            ImVec2(p.x + kWSlot - 5, p.y + kWSlot - 7), Fade(ui::ColGold(), 0.5f));
+          ui::DrawSpriteCentered(cd, "glyph_modifier",
+                                 ImVec2(p.x + kWSlot * 0.5f, p.y + kWSlot * 0.5f - 2),
+                                 ui::ColGoldHi());
         } else {
-          cd->AddText(ImVec2(p.x + kSlot * 0.5f - 6, p.y + kSlot * 0.5f - 13), ui::ColBloodHi(), "?");
+          cd->AddText(ui::FontSmall(), 13.0f,
+                      ImVec2(p.x + kWSlot * 0.5f - 4, p.y + kWSlot * 0.5f - 7),
+                      ui::ColBloodHi(), "?");
         }
         // Reorder: drag a word onto another cell. Drag it out of every panel
         // and it leaves the page (the drop handler at the end of the screen).
@@ -1391,7 +1373,7 @@ void GrimoireBody(UIState& s, ImVec2 at, ImVec2 size) {
         // cursor is the word, so the row should read as having a hole in it
         // rather than as holding the word twice.
         if (dragFrom == i && !copyMod)
-          cd->AddRectFilled(p, ImVec2(p.x + kSlot, p.y + kSlot), Fade(ui::ColInk(), 0.55f));
+          cd->AddRectFilled(p, ImVec2(p.x + kWSlot, p.y + kWSlot), Fade(ui::ColInk(), 0.55f));
         if (hov) {
           BeginTip();
           ImGui::PushStyleColor(ImGuiCol_Text, ImGui::ColorConvertU32ToFloat4(ui::ColGoldHi()));
@@ -1492,16 +1474,16 @@ void GrimoireBody(UIState& s, ImVec2 at, ImVec2 size) {
       // In the first column the seam would fall outside the child's clip, so
       // it sits just inside the cell instead of just before it.
       const float x = std::floor(caretAt % perRow == 0 ? cp.x + 1 : cp.x - 3);
-      cd->AddRectFilled(ImVec2(x, cp.y - 2), ImVec2(x + 4, cp.y + kSlot + 2), ui::ColGoldHi());
+      cd->AddRectFilled(ImVec2(x, cp.y - 2), ImVec2(x + 4, cp.y + kWSlot + 2), ui::ColGoldHi());
       cd->AddRectFilled(ImVec2(x - 3, cp.y - 5), ImVec2(x + 7, cp.y - 1), ui::ColGoldHi());
-      cd->AddRectFilled(ImVec2(x - 3, cp.y + kSlot + 1), ImVec2(x + 7, cp.y + kSlot + 5),
+      cd->AddRectFilled(ImVec2(x - 3, cp.y + kWSlot + 1), ImVec2(x + 7, cp.y + kWSlot + 5),
                         ui::ColGoldHi());
     }
     if (swapA >= 0) {
       const int pair[2] = {swapA, swapB};
       for (int k : pair) {
         const ImVec2 cp = cellAt(k);
-        cd->AddRect(ImVec2(cp.x - 2, cp.y - 2), ImVec2(cp.x + kSlot + 2, cp.y + kSlot + 2),
+        cd->AddRect(ImVec2(cp.x - 2, cp.y - 2), ImVec2(cp.x + kWSlot + 2, cp.y + kWSlot + 2),
                     ui::ColGoldHi(), 0.0f, 0, 2.0f);
       }
       // Two arrowheads back to back in the gap, pointing at where each word is
@@ -1509,7 +1491,7 @@ void GrimoireBody(UIState& s, ImVec2 at, ImVec2 size) {
       // is no gap to put them in, and the two lit cells say it alone.
       if (swapA / perRow == swapB / perRow) {
         const ImVec2 cp = cellAt(std::min(swapA, swapB));
-        const float mx = cp.x + kSlot + (kCell - kSlot) * 0.5f, my = cp.y + kSlot * 0.5f;
+        const float mx = cp.x + kWSlot + (kWCell - kWSlot) * 0.5f, my = cp.y + kWSlot * 0.5f;
         cd->AddTriangleFilled(ImVec2(mx - 7, my), ImVec2(mx - 1, my - 5), ImVec2(mx - 1, my + 5),
                               ui::ColGoldHi());
         cd->AddTriangleFilled(ImVec2(mx + 7, my), ImVec2(mx + 1, my - 5), ImVec2(mx + 1, my + 5),
@@ -1518,10 +1500,10 @@ void GrimoireBody(UIState& s, ImVec2 at, ImVec2 size) {
     }
     if (refuseAt >= 0) {
       const ImVec2 cp = cellAt(refuseAt);
-      cd->AddRectFilled(cp, ImVec2(cp.x + kSlot, cp.y + kSlot), Fade(ui::ColBlood(), 0.35f));
-      SlotRim(cd, cp, ui::SlotLook::Refuse);
+      cd->AddRectFilled(cp, ImVec2(cp.x + kWSlot, cp.y + kWSlot), Fade(ui::ColBlood(), 0.35f));
+      cd->AddRect(cp, ImVec2(cp.x + kWSlot, cp.y + kWSlot), ui::ColBlood(), 0.0f, 0, 2.0f);
     }
-    cy += ((cells + perRow - 1) / perRow) * kCell + 4;
+    cy += rowLines * kWCell + 6;
 
     // The readout and the price, in small type on a dark page: this is what
     // the row MEANS, from main.cpp's DescribeSpell of it.
@@ -1532,35 +1514,35 @@ void GrimoireBody(UIState& s, ImVec2 at, ImVec2 size) {
                                                                    : s.grimoireEditReadout.c_str();
       const float wrapW = innerW - 20;
       const ImVec2 ts = ImGui::CalcTextSize(ro, nullptr, false, wrapW);
+      // THE PRICE RIDES IN THE BOX, on its last line at the right end. It used
+      // to have a line of its own under it; the tree above wants that line more
+      // than the price does, and the price belongs to the sentence anyway.
+      char price[96];
+      std::snprintf(price, sizeof price, "price %d%s   %d / %d words", s.grimoireEditPrice,
+                    s.grimoireEditPriceUnknown ? " + ?" : "", nWords, s.grimoireMaxWords);
+      const ImVec2 ps = ImGui::CalcTextSize(price);
       const float boxH = std::max(2 * 13.0f, ts.y) + 12;
       const ImVec2 a(base.x, cy), b(base.x + innerW, cy + boxH);
       cd->AddRectFilled(a, b, Fade(ui::ColInk(), 0.42f));
       cd->AddRectFilled(a, ImVec2(a.x + 2, b.y), Fade(ui::ColGoldDim(), 0.7f));
+      cd->PushClipRect(a, ImVec2(b.x - ps.x - 12, b.y), true);
       cd->AddText(ui::FontSmall(), 13.0f, ImVec2(a.x + 10, a.y + 6),
                   nWords == 0 ? Fade(ui::ColParchDim(), 0.8f) : ui::ColParch(), ro, nullptr,
                   wrapW);
+      cd->PopClipRect();
+      cd->AddText(ui::FontSmall(), 13.0f, ImVec2(b.x - ps.x - 6, b.y - 13 - 5),
+                  Fade(ui::ColParchDim(), 0.95f), price);
       cy += boxH + 6;
-      char price[96];
-      std::snprintf(price, sizeof price, "price %d%s      %d / %d words", s.grimoireEditPrice,
-                    s.grimoireEditPriceUnknown ? " + ?" : "", nWords, s.grimoireMaxWords);
-      cd->AddText(ImVec2(base.x + 2, cy), Fade(ui::ColParchDim(), 0.9f), price);
-      cy += 16;
-      // The row's gestures, said once where the row is. Four of the five are
-      // invisible otherwise: you find a swap by trying it.
-      if (!readOnly && nWords > 0) {
-        static const char* kGestures =
-            "drag to reorder  .  onto a neighbour to swap  .  ctrl+drag to copy  .  "
-            "right-click to remove  .  ctrl+z undo";
-        cd->AddText(ui::FontSmall(), 13.0f, ImVec2(base.x + 2, cy), Fade(ui::ColParchDim(), 0.75f),
-                    kGestures, nullptr, innerW - 4);
-        cy += ImGui::CalcTextSize(kGestures, nullptr, false, innerW - 4).y;
-      }
+      // The row's gestures used to be spelled out here in two lines of small
+      // type. The canvas above is the authoring surface now and it needs that
+      // band more than the row does; the gestures live in each cell's tooltip,
+      // which is where you are when you want them.
       ImGui::PopFont();
-      cy += 6;
     }
 
     // Save / Duplicate / Delete, in the screen's own button. A disabled one is
     // drawn and then dimmed: the row keeps its shape whichever page is open.
+    float statusX = base.x + 2, statusY = cy, statusW = innerW - 4;
     {
       float bx = base.x;
       auto button = [&](const char* id, const char* label, bool enabled) {
@@ -1597,6 +1579,11 @@ void GrimoireBody(UIState& s, ImVec2 at, ImVec2 size) {
       }
       if (ImGui::IsItemHovered())
         Tip("Tear the page out. Keys bound to it keep its name and speak nothing.");
+      // The status line shares the buttons' line, to the RIGHT of them: it is
+      // one short sentence and the band it used to own is the tree's now.
+      statusX = bx + 6;
+      statusW = std::max(80.0f, base.x + innerW - statusX);
+      statusY = cy + std::floor((ImGui::GetItemRectMax().y - ImGui::GetItemRectMin().y - 13.0f) * 0.5f);
       cy += ImGui::GetTextLineHeight() + 8 + 6;
     }
 
@@ -1608,9 +1595,18 @@ void GrimoireBody(UIState& s, ImVec2 at, ImVec2 size) {
       // A live drag speaks FIRST: "this page is full" while you are still
       // holding the word is a refusal you can act on, and the same sentence
       // after the release is only a report.
-      if (rowNote) {
+      if (canvas.note) {
+        // The CANVAS speaks first: it is where the gesture is happening, and
+        // its refusal ("give the sockets before this one a payload first") is
+        // the one you can act on without letting go.
+        msg = canvas.note;
+        col = canvas.refused ? ui::ColBloodHi() : ui::ColGoldHi();
+      } else if (rowNote) {
         msg = rowNote;
         col = refuseAt >= 0 ? ui::ColBloodHi() : ui::ColGoldHi();
+      } else if (!s.spellGraph.expandedNote.empty()) {
+        msg = s.spellGraph.expandedNote.c_str();
+        col = Fade(ui::ColParchDim(), 0.9f);
       } else if (!s.kitMessage.empty() && s.kitMessageAge < 4.0f) {
         msg = s.kitMessage.c_str();
         col = ui::ColEmber();
@@ -1620,11 +1616,15 @@ void GrimoireBody(UIState& s, ImVec2 at, ImVec2 size) {
         msg = "unsaved";
         col = ui::ColGoldHi();
       } else if (!sel && nWords == 0) {
-        msg = "drag words in from the arsenal, or press = in magic mode to capture the stack";
+        msg = "drag words onto the tree above, or into the row - then bind the "
+              "page to a number key and that key casts it";
       }
       if (msg) {
-        cd->AddText(ui::FontSmall(), 13.0f, ImVec2(base.x + 2, cy), col, msg, nullptr, innerW - 4);
-        cy += ImGui::CalcTextSize(msg, nullptr, false, innerW - 4).y + 4;
+        cd->PushClipRect(ImVec2(statusX, statusY - 2),
+                         ImVec2(statusX + statusW, statusY + 30), true);
+        cd->AddText(ui::FontSmall(), 13.0f, ImVec2(statusX, statusY), col, msg, nullptr,
+                    statusW);
+        cd->PopClipRect();
       }
       ImGui::PopFont();
     }
@@ -2900,6 +2900,21 @@ void DrawInventoryScreen(UIState& s) {
           PushUndo(s);
           s.grimoireEditWords.erase(s.grimoireEditWords.begin() + idx);
           s.grimoireEditDirty = true;
+        }
+      } else if (p->IsDataType(kPayloadGraphNode)) {
+        // And once more on the CANVAS: a branch dragged off the tree is
+        // removed, subtree and all (PLAN_spell_graph §5). The op goes through
+        // the intent latch like every other graph edit — the canvas never
+        // edits words, not even to delete one.
+        int idx = -1;
+        std::memcpy(&idx, p->Data, sizeof(idx));
+        if (idx >= 0 && idx < (int)s.spellGraph.nodes.size() &&
+            s.spellGraph.nodes[idx].treeNode >= 0) {
+          PushUndo(s);
+          s.graphEdit = {};
+          s.graphEdit.pending = true;
+          s.graphEdit.op = UIState::GraphEditIntent::Remove;
+          s.graphEdit.treeNode = s.spellGraph.nodes[idx].treeNode;
         }
       } else if (p->IsDataType(kPayloadBound)) {
         // The same gesture again, one level up: a key dragged off the row

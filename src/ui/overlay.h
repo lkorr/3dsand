@@ -691,6 +691,9 @@ struct UIState {
   std::vector<int> glyphSlotKinds;             // SlotKind: 0 none, 1 glyph, 2 page
   std::vector<std::string> glyphSlotReadouts;  // a page's bracket readout
   bool glyphBankB = false;                     // Shift held: the strip highlights bank B
+  // Which bound key's spell is SELECTED (PLAN_spell_graph §0b: a number key
+  // selects, right-click casts, the selection persists). -1 = nothing held.
+  int glyphSelected = -1;
   std::string spellNote;                       // "saved as ...", "the stack is full"
   float spellNoteAge = 99.0f;
 
@@ -866,6 +869,70 @@ struct UIState {
   // off is the mistake this panel makes most.
   std::vector<std::vector<std::string>> grimoireUndo, grimoireRedo;
   std::string grimoireUndoPage;
+  // ---- THE SPELL GRAPH (docs/PLAN_spell_graph.md §4-§6) ---------------------
+  //
+  // A PLAIN-STRUCT MIRROR of game/spellgraph.h's `SpellGraph`, field for field,
+  // in ints and strings. This header is included by main.cpp and stays both
+  // imgui-free AND spell-free on purpose, so it may not name `SpellGraphNode`,
+  // `GlyphSort` or `BoxPrice`; main.cpp copies across every frame the composer
+  // is open. A glyph crosses BY NAME (DESIGN §8b) — indices die on R reload —
+  // but a TREE NODE index is fine, because it is re-derived from the same word
+  // list in the same frame the intent is consumed.
+  struct SpellGraphUI {
+    struct Node {
+      int kind = 0;            // GraphKind: 0 word 1 operator 2 join 3 modtag
+                               // 4 root 5 socket 6 bus
+      int treeNode = -1;       // index into the SpellTree; -1 = synthesized
+      std::string glyphId;     // the word's NAME; "" on a synthesized node
+      std::string label;       // what the cell says ("fire", "PROJECTILE")
+      int n = 1;               // multiplicity
+      int sort = 0;            // GlyphSort: 0 matter 1 effect 2 delivery
+                               // 3 mod 4 operator 5 separator
+      uint32_t color = 0;      // the matter swatch, as GlyphUI carries it
+      int lane = 0;
+      int x = 0, y = 0, w = 0, h = 0;
+      int layer = 0;
+      int subX = 0, subW = 0;
+      // Operator
+      bool hasLeft = false, hasRight = false;
+      bool leftFilled = false, rightFilled = false;
+      bool complete = true;
+      int wordCostOf = 0;      // the glyph's word cost, for the struck-through
+                               // price on an incomplete operator
+      // Join / Root
+      int instances = 1, laneCount = 0;
+      std::vector<int> sockets;
+      int bus = -1;
+      int tagStripW = 0;
+      bool hasPrice = false;
+      int wordCost = 0, tariff = 0, carryCost = 0, priceInstances = 1, leaves = 1;
+      bool instancesClamped = false;
+      int subtotal = 0;
+      // Socket
+      int instance = -1;
+      int pipW = 32;
+      // ModTag
+      std::string edit;        // "speed x2"
+      bool wasted = false;
+      int spanFirst = -1, spanLast = -1;
+    };
+    struct Edge {
+      int from = -1, to = -1;
+      int kind = 0;            // GraphEdge: 0 trunk 1 bus 2 socket 3 fan 4 slot
+    };
+    std::vector<Node> nodes;
+    std::vector<Edge> edges;
+    int root = -1;
+    int width = 0, height = 0, layers = 0;
+    // The whole cast's total, the three parts the HUD shows, under the hand.
+    int wordCost = 0, tariff = 0, carryCost = 0, manaCost = 0;
+    bool priceUnknown = false;
+    // A page nested in the composed words was EXPANDED to draw the tree, so an
+    // edit rewrites it as its words. Said on the status line rather than
+    // silently.
+    std::string expandedNote;
+  };
+  SpellGraphUI spellGraph;
   // `glyphSlots` above is already the bound strip (slot -> glyph id) and IS
   // the arsenal's bottom row — the panel and the live hotkeys read one mirror,
   // which is what makes binding in the panel provably the same thing as the
@@ -944,6 +1011,22 @@ struct UIState {
     std::string name;
     std::vector<std::string> words;
   } grimoireOp;
+  // A GESTURE ON THE CANVAS (PLAN_spell_graph §5). The page never edits words:
+  // it names a TREE OP and main.cpp applies it to the tree of the current edit
+  // words, linearizes the result back and writes it into `grimoireEditWords`.
+  // Two views, one truth — and every op is total, so a refusal is a sentence on
+  // the status line (`kitMessage`) rather than a malformed page.
+  struct GraphEditIntent {
+    bool pending = false;
+    enum Op { Insert = 0, FillSlot, Wrap, AttachMod, Remove, Unbox, Move } op = Insert;
+    int treeNode = -1;      // the box (Insert/AttachMod), the group (FillSlot),
+                            // or the subject (Wrap/Remove/Unbox/Move)
+    int boxTreeNode = -1;   // Move's destination box
+    int lane = 0;
+    int side = 0;           // SlotSide: 0 left, 1 right
+    std::string glyphId;    // a word's NAME, or a page's (Insert/Fill/Wrap/Mod)
+    bool copy = false;      // ctrl held: Move duplicates instead
+  } graphEdit;
   // A body part clicked in the health inspector with a sentence on the
   // stack: cast it with `self` resolving AT that part (docs/
   // PLAN_magic_grammar.md §7 — `fire self` on a bleeding stump). The panel
