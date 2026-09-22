@@ -37,6 +37,7 @@
 #include "game/melee.h"
 #include "game/mob.h"
 #include "game/spell.h"
+#include "game/spellgraph.h"
 #include "game/strike_pick.h"
 #include "sim/rng.h"
 #include "game/player.h"
@@ -189,6 +190,16 @@ constexpr uint64_t kShotInvDamageFrame = 170;
 constexpr uint64_t kShotInvGearFrame = 220;    // -> screenshot_inventory.bmp
 constexpr uint64_t kShotInvCaptureFrame = 240;  // -> ..._health.bmp
 constexpr uint64_t kShotInvGrimoireFrame = 260; // -> ..._grimoire.bmp
+// The SPELL PAGE (docs/PLAN_spell_graph.md §7): the same composer with the
+// canvas in it, on a COPY of the `duststorm` starter (starters are read-only,
+// and a page you cannot edit cannot show an edit), with one lane added through
+// the intent path — which puts a socket, the bus, a mod tag and the per-level
+// prices in one picture. Three frames apart from the grimoire shot because the
+// edit is applied through main.cpp's intent consumer and has to be seen by a
+// tick before it is drawn.
+constexpr uint64_t kShotInvGraphSetup = 262;
+constexpr uint64_t kShotInvGraphEdit = 266;
+constexpr uint64_t kShotInvGraphFrame = 274;    // -> ..._inventory_graph.bmp
 // Fourth: a dressed human killed in front of the player and its corpse opened
 // — the loot panel where the grimoire was (game/corpses.h).
 constexpr uint64_t kShotInvLootFrame = 280;     // -> ..._loot.bmp
@@ -6087,7 +6098,7 @@ int main(int argc, char** argv) {
   float lookSensNow = 1.0f;
 
   KeyEdge eP, eN, eV, eF1, eF3, eF4, eF5, eF6, eF7, eF9, eF10, eR, eEsc, eLBracket, eRBracket, eJump,
-      eG, eX, eB, eT, eO, eM, eK, eTab, eC, eH, eZ, eBack, eDel, eEq, eU, eL, eI, eQ;
+      eG, eX, eB, eT, eO, eM, eK, eTab, eC, eH, eZ, eBack, eDel, eU, eL, eI, eQ;
   // (E has no KeyEdge: it is a hold-aware binding now — see the tap/hold
   // block by `takeE` — and an edge tracker would only be half of it.)
   KeyEdge eGlyph[kGlyphSlots];
@@ -8291,11 +8302,53 @@ int main(int argc, char** argv) {
             if (const GlyphDef* d = glyphs.At(gi)) ui.grimoireEditWords.push_back(d->id);
         }
       }
-      // Fourth picture: a corpse with its gear on, opened. A human is spawned
+      // Fourth picture: THE SPELL PAGE. A COPY of the `duststorm` starter —
+      // starters are read-only and a page you cannot edit cannot show an edit —
+      // with `shotgun` on it, so the tree has a bus (the shared sand and gusts),
+      // a mod tag (`count x3`), three sockets and a price under every bar.
+      if (frameCounter == kShotInvGraphSetup) {
+        ui.grimoireMode = true;
+        ui.lootOpen = false;
+        GrimoirePage p;
+        p.name = "duststorm-mine";
+        p.words = {"sand", "gust", "gust", "shotgun", "projectile"};
+        if (caster.grimoire.Find(p.name) < 0) caster.grimoire.pages.push_back(p);
+        ui.grimoireSelected = p.name;
+        ui.grimoireEditName = p.name;
+        ui.grimoireEditWords = p.words;
+        ui.grimoireEditDirty = false;
+        std::printf("--shot-inventory: composed [%s] for the spell page\n",
+                    p.name.c_str());
+      }
+      // ...and ONE edit, applied through the intent latch exactly as a drop
+      // would: a lane holding `fire` on the projectile. The box is found in the
+      // MIRROR the panel is about to draw, which is the same lookup the drop
+      // target does — the harness drives the player's path, it does not reach
+      // into the tree.
+      if (frameCounter == kShotInvGraphEdit) {
+        int box = -1;
+        for (const UIState::SpellGraphUI::Node& n : ui.spellGraph.nodes)
+          if (n.kind == 2 /* Join */ && n.treeNode >= 0) { box = (int)(&n - ui.spellGraph.nodes.data()); break; }
+        if (box >= 0) {
+          const UIState::SpellGraphUI::Node& bn = ui.spellGraph.nodes[box];
+          ui.graphEdit = {};
+          ui.graphEdit.pending = true;
+          ui.graphEdit.op = UIState::GraphEditIntent::Insert;
+          ui.graphEdit.treeNode = bn.treeNode;
+          ui.graphEdit.lane = bn.laneCount + 1;
+          ui.graphEdit.glyphId = "fire";
+          std::printf("--shot-inventory: spell page edit -> lane %d of [%s] "
+                      "takes `fire`\n",
+                      bn.laneCount + 1, bn.label.c_str());
+        } else {
+          std::fprintf(stderr, "--shot-inventory: no join in the spell graph\n");
+        }
+      }
+      // Fifth picture: a corpse with its gear on, opened. A human is spawned
       // a few paces ahead, dressed in every worn piece the library has and
       // handed a sword, and killed — the same CorpseReport path a fight
       // produces — and the panel is opened on it as E would.
-      if (frameCounter == kShotInvGrimoireFrame + 1) {
+      if (frameCounter == kShotInvGraphFrame + 1) {
         ui.grimoireMode = false;
         int humanDef = -1;
         for (size_t i = 0; i < mobs.Defs().size(); i++)
@@ -8705,22 +8758,26 @@ int main(int argc, char** argv) {
             ui.brushMaterial = i + 1;
         }
     } else {
-      // Pressing a number SPEAKS that glyph — it never casts. Edge-triggered:
-      // a held key must not stutter the same word onto the stack. TWO BANKS
-      // (plan §12a): `1`-`0` speak bank A, `Shift+1`-`0` bank B. Sprint is
-      // on Shift outside magic mode and magic mode captures the number row,
-      // so nothing collides.
+      // THE PAGE IS THE INTERFACE (PLAN_spell_graph §0b). Pressing a number
+      // SELECTS the spell bound to that key — a grimoire page, or a single
+      // glyph as a one-word spell — and right-click CASTS it. The selection
+      // persists across casts, so a bound spell fires as often as you click;
+      // another key switches, Backspace clears. Building the sentence happens
+      // on the page's tree, which is a surface with room for it; the number row
+      // used to be the only authoring tool there was, and it was a bad one.
+      //
+      // Edge-triggered still: a held key must not re-select every frame and
+      // wipe a half-drained mana readout. TWO BANKS (plan §12a): `1`-`0` is
+      // bank A, `Shift+1`-`0` bank B. Sprint is on Shift outside magic mode and
+      // magic mode captures the number row, so nothing collides.
       const bool bankB = key(GLFW_KEY_LEFT_SHIFT) || key(GLFW_KEY_RIGHT_SHIFT);
       for (int i = 0; i < kGlyphBank; i++) {
         // GLFW's number row is contiguous 1..9 then 0, and slot 10 is the 0
         // key, matching the strip the HUD prints.
         int k = (i == 9) ? GLFW_KEY_0 : (GLFW_KEY_1 + i);
         if (captured && eGlyph[i].Pressed(key(k)))
-          caster.SpeakSlot(glyphs, i + (bankB ? kGlyphBank : 0));
+          caster.SelectSlot(glyphs, i + (bankB ? kGlyphBank : 0));
       }
-      // `=` captures the sentence on the stack into the grimoire (§12b): the
-      // fast path for "that worked, make it one key".
-      if (captured && eEq.Pressed(key(GLFW_KEY_EQUAL))) caster.CaptureStack(glyphs);
     }
     if (captured && eZ.Pressed(key(GLFW_KEY_Z))) {
       ui.magicMode = !ui.magicMode;
@@ -10985,6 +11042,7 @@ int main(int argc, char** argv) {
             gi >= 0 && gi < (int)glyphs.glyphs.size() ? glyphs.glyphs[gi].id : "");
         ui.glyphSlotReadouts.push_back("");
       }
+      ui.glyphSelected = caster.selected;
       ui.glyphBankB = captured && ui.magicMode &&
                       (key(GLFW_KEY_LEFT_SHIFT) || key(GLFW_KEY_RIGHT_SHIFT));
       caster.noteAge += dt;
@@ -11482,6 +11540,100 @@ int main(int argc, char** argv) {
           }
         }
       }
+      // ---- A GESTURE ON THE CANVAS (docs/PLAN_spell_graph.md §5) -------------
+      //
+      // The page never edits words. It names a TREE OP; this applies it to the
+      // tree of the composed words, and on success writes the LINEARIZED result
+      // back into the row. Every op in game/spellgraph.h is total — it returns
+      // either the new word list or a reason — so a refusal is a sentence on the
+      // status line and never a malformed page.
+      //
+      // The tree is built from the EXPANSION, so a nested page is edited as its
+      // words. That is the v1 compromise §5 names, and the composer says so.
+      if (ui.graphEdit.pending) {
+        ui.graphEdit.pending = false;
+        const UIState::GraphEditIntent op = ui.graphEdit;
+        auto say = [&](const std::string& m) {
+          ui.kitMessage = m;
+          ui.kitMessageAge = 0.0f;
+        };
+        const GrimoireExpansion gex = ExpandWords(glyphs, caster.grimoire,
+                                                  ui.grimoireEditWords, kSpellStackMax);
+        SpellStack gst;
+        gst.spoken = gex.spoken;
+        SpellTree gtree = ParseSpell(glyphs, gst);
+        if (gtree.Empty()) gtree = EmptyTree();
+        EditResult r;
+        // A PAGE DROPPED ON THE TREE IS ITS WORDS, one InsertItem each, the
+        // tree re-parsed between: the tree has no node kind for "a page", and
+        // refusing the gesture outright would make the page list useless up
+        // here. The first refusal stops the run and keeps what landed.
+        std::vector<int> insert;
+        if ((op.op == UIState::GraphEditIntent::Insert ||
+             op.op == UIState::GraphEditIntent::AttachMod) &&
+            glyphs.Find(op.glyphId) < 0 && !op.glyphId.empty()) {
+          const GrimoireExpansion pe =
+              ExpandWords(glyphs, caster.grimoire, {op.glyphId}, kSpellStackMax);
+          insert = pe.spoken;
+          if (insert.empty()) say("[" + op.glyphId + "] says nothing");
+        } else if (!op.glyphId.empty()) {
+          insert.push_back(glyphs.Find(op.glyphId));
+        }
+        const int gi = insert.empty() ? -1 : insert[0];
+        switch (op.op) {
+          case UIState::GraphEditIntent::Insert:
+          case UIState::GraphEditIntent::AttachMod: {
+            SpellTree cur = gtree;
+            for (size_t k = 0; k < insert.size(); k++) {
+              r = op.op == UIState::GraphEditIntent::AttachMod
+                      ? AttachMod(glyphs, cur, op.treeNode, op.lane, insert[k])
+                      : InsertItem(glyphs, cur, op.treeNode, op.lane, insert[k]);
+              if (!r.ok) {
+                if (k > 0) r.ok = true;   // some of it landed; keep that
+                break;
+              }
+              // RE-PARSE BETWEEN WORDS, because the node indices the next
+              // InsertItem needs are the new tree's, not the old one's. The box
+              // is found again by its position in the same place: the root.
+              if (k + 1 < insert.size()) {
+                cur = ParseWords(glyphs, r.words);
+                if (cur.Empty()) break;
+              }
+            }
+            break;
+          }
+          case UIState::GraphEditIntent::FillSlot:
+            r = FillSlot(glyphs, gtree, op.treeNode,
+                         op.side ? SlotSide::Right : SlotSide::Left, gi);
+            break;
+          case UIState::GraphEditIntent::Wrap:
+            r = WrapInBox(glyphs, gtree, op.treeNode, gi);
+            break;
+          case UIState::GraphEditIntent::Unbox:
+            r = Unbox(glyphs, gtree, op.treeNode);
+            break;
+          case UIState::GraphEditIntent::Remove:
+            r = Remove(glyphs, gtree, op.treeNode);
+            break;
+          case UIState::GraphEditIntent::Move:
+            r = Move(glyphs, gtree, op.treeNode, op.boxTreeNode, op.lane, op.copy);
+            break;
+        }
+        if (r.ok) {
+          if ((int)r.words.size() > glyphs.budgets.maxMacroWords) {
+            say("that would not fit on the page");
+            if (!ui.grimoireUndo.empty()) ui.grimoireUndo.pop_back();
+          } else {
+            ui.grimoireEditWords = r.words;
+            ui.grimoireEditDirty = true;
+          }
+        } else {
+          say(r.why.empty() ? std::string("that cannot be said") : r.why);
+          // The panel pushed an undo before it latched; a refusal changed
+          // nothing, so the stack must not grow an identical entry.
+          if (!ui.grimoireUndo.empty()) ui.grimoireUndo.pop_back();
+        }
+      }
       ui.kitMessageAge += dt;
 
       // ---- the mirrors -------------------------------------------------------
@@ -11660,7 +11812,13 @@ int main(int argc, char** argv) {
           SpellStack st;
           st.spoken = ex.spoken;
           const CastList l = CompileSpell(glyphs, st);
-          readout = DescribeSpell(glyphs, l).text;
+          const SpellReadout r = DescribeSpell(glyphs, l);
+          readout = r.text;
+          // THE VERDICT ON ITS OWN LINE. It is the sentence that says what the
+          // page DOES ("a bolt that sprays sand and fire, three of them"),
+          // which the bracket string above deliberately does not; the composer
+          // wraps both rather than clipping either.
+          if (!r.verdict.empty()) readout += "\n" + r.verdict;
           if (ex.dropped > 0) readout += "   (? = a word that no longer exists)";
           if (ex.truncated) readout += "   (cut at the stack bound)";
           price = l.manaCost;
@@ -11687,6 +11845,95 @@ int main(int argc, char** argv) {
           int dropped = 0;
           describeWords(ui.grimoireEditWords, ui.grimoireEditReadout, ui.grimoireEditPrice,
                         ui.grimoireEditPriceUnknown, dropped);
+        }
+
+        // ---- THE SPELL GRAPH MIRROR (docs/PLAN_spell_graph.md §4) ----------
+        //
+        // The composer's words -> expansion -> parse -> lower -> BuildGraph,
+        // copied field by field into a plain-struct mirror. The same expansion
+        // the readout above is produced from, so the drawing and the sentence
+        // under it can never be of two different spells.
+        //
+        // Only while the page is actually open: it is a parse and a lowering
+        // per frame, and nothing looks at it otherwise.
+        if (ui.inventoryOpen && ui.grimoireMode) {
+          ui.spellGraph = UIState::SpellGraphUI{};
+          const GrimoireExpansion ex =
+              ExpandWords(glyphs, caster.grimoire, ui.grimoireEditWords, kSpellStackMax);
+          // A NESTED PAGE IS EXPANDED TO ITS WORDS to draw, and an edit writes
+          // the expansion back — the tree has no node for "a page". Said on the
+          // status line rather than silently (v1; PLAN §5 notes it).
+          for (const std::string& w : ui.grimoireEditWords)
+            if (glyphs.Find(w) < 0 && !w.empty()) {
+              ui.spellGraph.expandedNote =
+                  "page " + w + " is drawn expanded; an edit writes out its words";
+              break;
+            }
+          SpellStack gst;
+          gst.spoken = ex.spoken;
+          SpellTree tree = ParseSpell(glyphs, gst);
+          // A BLANK PAGE STILL HAS A HAND. `ParseSpell` of silence has no
+          // clause at all (silence is not a spell), and a canvas with no root
+          // has nothing to drop the first word onto.
+          if (tree.Empty()) tree = EmptyTree();
+          const CastList gl = LowerSpell(glyphs, tree);
+          const SpellGraph sg = BuildGraph(glyphs, gl);
+          ui.spellGraph.root = sg.root;
+          ui.spellGraph.width = sg.width;
+          ui.spellGraph.height = sg.height;
+          ui.spellGraph.layers = sg.layers;
+          ui.spellGraph.wordCost = gl.wordCost;
+          ui.spellGraph.tariff = gl.tariff;
+          ui.spellGraph.carryCost = gl.carryCost;
+          ui.spellGraph.manaCost = gl.manaCost;
+          ui.spellGraph.priceUnknown = gl.priceUnknown;
+          ui.spellGraph.nodes.reserve(sg.nodes.size());
+          for (const SpellGraphNode& n : sg.nodes) {
+            UIState::SpellGraphUI::Node u;
+            u.kind = (int)n.kind;
+            u.treeNode = n.treeNode;
+            u.label = n.label;
+            u.n = n.n;
+            u.sort = (int)n.sort;
+            u.lane = n.lane;
+            u.x = n.x; u.y = n.y; u.w = n.w; u.h = n.h;
+            u.layer = n.layer;
+            u.subX = n.subX; u.subW = n.subW;
+            u.hasLeft = n.hasLeft; u.hasRight = n.hasRight;
+            u.leftFilled = n.leftFilled; u.rightFilled = n.rightFilled;
+            u.complete = n.complete;
+            u.instances = n.instances;
+            u.laneCount = n.laneCount;
+            u.sockets = n.sockets;
+            u.bus = n.bus;
+            u.tagStripW = n.tagStripW;
+            u.hasPrice = n.hasPrice;
+            u.wordCost = n.price.wordCost;
+            u.tariff = n.price.tariff;
+            u.carryCost = n.price.carryCost;
+            u.priceInstances = n.price.instances;
+            u.leaves = n.price.leaves;
+            u.instancesClamped = n.price.instancesClamped;
+            u.subtotal = n.subtotal;
+            u.instance = n.instance;
+            u.pipW = n.pipW;
+            u.edit = n.edit;
+            u.wasted = n.wasted;
+            u.spanFirst = n.spanFirst;
+            u.spanLast = n.spanLast;
+            // BY NAME, not by index (DESIGN §8b): the panel holds this across
+            // a frame and an R reload renumbers every glyph.
+            if (const GlyphDef* gd = glyphs.At(n.glyph)) {
+              u.glyphId = gd->id;
+              u.wordCostOf = gd->word;
+              if (gd->sort == GlyphSort::Matter && !gd->wildcard && gd->material > 0 &&
+                  gd->material < mats.size())
+                u.color = mats[gd->material].gpu.color0;
+            }
+            ui.spellGraph.nodes.push_back(std::move(u));
+          }
+          for (const SpellGraphEdge& e : sg.edges)
+            ui.spellGraph.edges.push_back({e.from, e.to, (int)e.kind});
         }
       }
 
@@ -12375,6 +12622,7 @@ int main(int argc, char** argv) {
         if (g_shotInventory && (frameCounter == kShotInvGearFrame ||
                                 frameCounter == kShotInvCaptureFrame ||
                                 frameCounter == kShotInvGrimoireFrame ||
+                                frameCounter == kShotInvGraphFrame ||
                                 frameCounter == kShotInvLootFrame ||
                                 frameCounter == kShotInvDeathShot ||
                                 frameCounter == kShotInvDeathTurnShot))
@@ -12601,6 +12849,7 @@ int main(int argc, char** argv) {
       if ((g_shotInventory && (frameCounter == kShotInvGearFrame ||
                                frameCounter == kShotInvCaptureFrame ||
                                frameCounter == kShotInvGrimoireFrame ||
+                               frameCounter == kShotInvGraphFrame ||
                                frameCounter == kShotInvLootFrame ||
                                frameCounter == kShotInvDeathShot ||
                                frameCounter == kShotInvDeathTurnShot)) ||
@@ -12612,6 +12861,8 @@ int main(int argc, char** argv) {
                 ? "screenshot_inventory_health.bmp"
             : frameCounter == kShotInvGrimoireFrame
                 ? "screenshot_inventory_grimoire.bmp"
+            : frameCounter == kShotInvGraphFrame
+                ? "screenshot_inventory_graph.bmp"
             : frameCounter == kShotInvLootFrame
                 ? "screenshot_inventory_loot.bmp"
             : frameCounter == kShotInvDeathShot

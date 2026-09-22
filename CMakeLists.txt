@@ -574,6 +574,10 @@ add_library(sandvox_core OBJECT
   # inventory_ui.cpp is a pure drawing function over UIState.
   src/ui/theme.cpp
   src/ui/inventory_ui.cpp
+  # spellgraph_ui.cpp is the composer's CANVAS: it draws UIState::spellGraph
+  # (main.cpp's mirror of game/spellgraph.h) and turns a gesture into a
+  # GraphEditIntent. It applies no op itself.
+  src/ui/spellgraph_ui.cpp
   src/telemetry.cpp
   # The network layer (docs/PLAN_multiplayer_m9.md M9.2). Beside telemetry.cpp
   # because they are the only two TUs that open a socket, and ws2_32 is already

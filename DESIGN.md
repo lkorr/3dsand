@@ -6534,6 +6534,57 @@ unary operators in one segment where either accepts the other's result sort
 (`(_ echo)` beside `(_ null)`), since whichever is spoken second binds the
 first. `Speakable()` names both, in those words, and every op refuses on it.
 
+**THE PAGE IS THE INTERFACE (2026-09-21; `ui/spellgraph_ui.h/.cpp`, phase 3).**
+The grimoire composer gains a CANVAS above its word row, and the row stays under
+it as the spoken form — what a bound key will actually say. The canvas draws
+`UIState::spellGraph`, a plain-struct mirror main.cpp fills each frame by running
+the composed words through `ExpandWords → ParseSpell → LowerSpell → BuildGraph`
+(so the drawing and the readout under it are of the same spell, by
+construction); `overlay.h` stays imgui-free AND spell-free, so the mirror is
+ints and strings and every glyph crosses by NAME. Node chrome is the panel's
+own: the glyph cell for a word, pips for an operator with a hollow `_` ring
+where a required slot is empty, a bar with its delivery's noun in caps for a
+join, its `instances` sockets over it, a bus stroke across them, mod tags off
+its left end and `tariff + carry ×N = subtotal` under it, and the hand bar with
+the cast's three price parts and a mana `ValueBar`. Nodes are joined by
+`ui::InkStroke` — a cubic flattened to twelve segments and drawn with
+anti-aliasing OFF at a width quantised to whole 2 px steps, thin at the tip,
+full at the belly, thin into the join. The canvas picks an integer 1× or 0.5×
+scale of the layout's chrome pixels and scrolls when a tree still does not fit,
+framing the deepest join; the LAYER PITCH on screen is the canvas's own choice
+(tight enough to clear a cell) because spacing is a drawing decision while node
+SIZE is the layout's. **The canvas applies no op.** Every gesture — a word onto
+a bus or a socket, a word into a hollow pip, a delivery onto a branch, a mod
+onto a bar, right-click to unbox or remove, a branch dragged to another socket
+or out of the panel — pushes the composer's existing undo and latches a
+`UIState::GraphEditIntent` naming one of `spellgraph.h`'s total ops; main.cpp
+re-parses the composed words, applies it, and writes `Linearize`'s result back
+into `grimoireEditWords`, or puts the op's own refusal on the status line. Every
+target PEEKS at the payload, so a gold ring, a ghost and a reason are drawn
+before the release. **And the number row now CASTS**: in magic mode a number key
+SELECTS the spell bound to it (a page, or one glyph as a one-word spell), the
+stack becomes its expansion, right-click casts it, and the selection persists
+across casts. Speaking one word per key and `=` capturing the stack are gone —
+authoring happens on the page, which is a surface with room for it.
+`--shot-inventory` writes a fourth frame, `screenshot_inventory_graph.bmp`: a
+copy of the `duststorm` starter with `shotgun` on it and a lane holding `fire`
+added through the intent path.
+
+**The screen makes room for it.** The PACK is now as tall as what is in it —
+the row holding the last filled slot plus one empty row to drop into, keyed on
+the highest filled INDEX rather than on a count (nothing compacts the bag, so a
+boot at slot 30 would otherwise vanish), and nothing in it at all is the in-hand
+strip alone. Everything that frees goes to the grimoire above it, down to a
+floor below which the page stops being an interface and the pack gives way
+entirely. The composer's own band went the same way: the word row is a compact
+strip sized to the sentence rather than a grid of all 32 cells, and the READOUT
+moved out of the composer to span the whole body under both columns — at the
+composer's width `DescribeSpell`'s verdict wrapped to six lines and ate the
+canvas, at the body's width it is three. It wraps and is never clipped; the
+price and the word count take its last line at the right. Every word cell on
+the canvas carries its NAME under it in the 13 px font at both scales, because
+an engraving and a sort colour say which SORT a node is and not which word.
+
 Selftest gates `spells` (the trail's voxel budget respected exactly and the
 projectile dead with it; an overcast resolving Fatal, emitting its own payload
 and asking for the caster to be carved; `fire`×N throwing exactly N times the

@@ -550,7 +550,8 @@ void Overlay::Draw(UIState& s) {
   // It is drawn as one continuous bar with a hard break at that point, because
   // a pair of numbers does not communicate "this next glyph will cost you an
   // arm" the way a bar segment eating into red does.
-  ImGui::Text("magic %s   (M toggles)", s.magicMode ? "ON" : "off");
+  ImGui::Text("magic %s   (Z toggles; a number SELECTS a bound spell, RMB casts it)",
+              s.magicMode ? "ON" : "off");
   {
     const float w = ImGui::GetContentRegionAvail().x;
     const float h = 14.0f;
@@ -647,10 +648,15 @@ void Overlay::Draw(UIState& s) {
                        "unstable - %d from your body", s.spellCost - s.mana);
   }
   if (!s.spellText.empty()) {
-    ImGui::Text("speaking: %s", s.spellText.c_str());
+    // THE BRACKET TEXT STAYS. It is what the oracle compares and what the dev
+    // panel reads a tree off; the player-facing surface is the grimoire page's
+    // canvas. "held" rather than "speaking" because the stack is now the
+    // SELECTED spell, not a half-spoken one.
+    ImGui::Text("held: %s", s.spellText.c_str());
     ImGui::TextDisabled("%s", s.spellVerdict.c_str());
   } else {
-    ImGui::TextDisabled("speaking: (nothing)   RMB casts, C clears");
+    ImGui::TextDisabled("held: (nothing)   a number selects a bound spell, "
+                        "RMB casts it, Backspace clears");
   }
   if (!s.spellStatuses.empty()) {
     ImGui::Text("sustaining (%d reserved, Delete drops the newest):", s.manaReserved);
@@ -668,8 +674,11 @@ void Overlay::Draw(UIState& s) {
         if (s.glyphSlots[i].empty()) continue;
         any = true;
         const bool page = i < s.glyphSlotKinds.size() && s.glyphSlotKinds[i] == 2;
-        strip += std::to_string((i + 1) % 10) + ":" + (page ? "[" : "") + s.glyphSlots[i] +
-                 (page ? "]" : "") + "  ";
+        // The SELECTED key is starred: the stack is its spell, and right-click
+        // will fire that one until another key takes its place.
+        const bool sel = (int)i == s.glyphSelected;
+        strip += (sel ? "*" : "") + std::to_string((i + 1) % 10) + ":" +
+                 (page ? "[" : "") + s.glyphSlots[i] + (page ? "]" : "") + "  ";
       }
       if (!any) continue;
       if (s.glyphBankB == (bank == 1)) ImGui::Text("%s", strip.c_str());

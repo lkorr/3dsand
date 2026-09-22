@@ -217,6 +217,28 @@ void SlotSurface(ImDrawList* dl, ImVec2 a, float size, SlotLook look,
 void ValueBar(ImDrawList* dl, ImVec2 a, ImVec2 b, float frac, ImU32 fill,
               bool hero);
 
+// The screen's tooltip, always in the 13 px small font and wrapped at 320 px.
+// One owner, because a tooltip set in the 26 px chrome face is the panel's
+// worst clipped text and every surface here needs the same one.
+void BeginTip();
+void EndTip();
+void Tip(const char* text);
+
+// ---- the calligraphic stroke (PLAN_spell_graph §4) --------------------------
+//
+// A cubic from `from` to `to` with the control points straight DOWN out of the
+// child and straight UP into the parent, flattened to ~12 segments and drawn as
+// a polyline WITHOUT anti-aliasing. Its width follows a brush profile — thin at
+// the tip, full at the belly, thin into the join — with every segment's width
+// quantised to a whole 2 px step, which is what makes it read as a calligraphic
+// stroke drawn with a pixel brush rather than as a vector spline.
+//
+// `weight` is the belly width in screen pixels; anything under 2 draws as one
+// 2 px step, because a 1 px line beside 2x chrome is the one thing that says
+// "different program". The anti-aliasing flag is pushed off and restored here,
+// so the call site cannot forget.
+void InkStroke(ImDrawList* dl, ImVec2 from, ImVec2 to, ImU32 col, float weight);
+
 // The little key cap in a slot corner ("1".."0").
 void KeyBadge(ImDrawList* dl, ImVec2 at, const char* key);
 
