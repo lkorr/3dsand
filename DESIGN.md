@@ -485,6 +485,57 @@ are deduplicated across mob defs, so 128 slots cover a whole cast.
 - Overworld draw distance beyond the window is handled by the render-only
   far-field cascades (§9) — the streaming horizon is no longer visible from
   the surface. Underground, darkness still hides it.
+- **Settle-after-generation: what gets saved that nobody touched (2026-09-22,
+  gate `gen-settle`, docs/PLAN_save_system.md S2).** The save is a delta from
+  the seed only while `Stream::modified_` means "a player did something here".
+  It is fed by the CA's per-chunk NEXT-TICK dirty flag, so it also catches
+  worldgen output that is not born at rest, and every such chunk is stored.
+  The gate measures that with no input at all and attributes every modified
+  chunk (current words vs a regenerated window, under `kPersistMask`): SETTLE
+  = fresh worldgen + 300 ticks standing still; TRAVEL = +X flight, 1 chunk /
+  8 ticks, 48 shifts, per STREAMED plane evicted. Measured at the default
+  map and seed (the strip is all desert):
+  - settle: **1,485 modified chunks = 28% of the 5,254 real pages**; 1,289 have
+    changed words, 196 do not.
+  - travel: **45.4 modified chunks per streamed plane = 12.6% of its real
+    pages**, 39.9 changed. The chunks from the first worldgen come out almost
+    exactly like the settle arm (1,486), which cross-checks the two arms.
+  - Ranked causes:
+    1. **Desert sand on slopes past its angle of repose** — every departed
+       grain in both arms (8,574 settle, 4,179 travel) is desert, and every
+       one is the SURFACE cell. The ground there has a true local slope
+       (central difference of `World::TerrainHeight`) of 1–2x repose for 80%
+       of them and in the taper band for 18%; only 1% are on flat ground.
+       `looseCoverDepth` (worldgen.wgsl) already tapers the loose cap to zero
+       at repose, but on the ANALYTIC `Col.slope`, which does not see the
+       detail/grain octaves — so on rough near-repose faces one loose voxel
+       survives and slides on tick 1. 1,157 settle / 638 streamed chunks.
+       ("jitter" cells are the same grains landing on sand of another
+       palette variant: same material, different state nibble.)
+    2. **Neighbour wake with no persisted change** — 196 settle / 89 streamed
+       chunks (13%) whose words equal genChunk's, flagged only because a
+       sliding neighbour woke them. Pure save waste.
+    3. **Pond-bed stain** — 130 settle chunks change only their stain byte
+       (23,805 cells): water soaking into the sand bed it was generated on.
+       None on the streamed strip (no water on it).
+  - Measured as NOT causes: the latent-snapshot inheritance (a refilled slot
+    picking up its previous occupant's dirty flag from a snapshot older than
+    the refill) raised 0 flags; "woke and changed nothing" with no changed
+    neighbour is 0; nothing below one chunk under the surface except 19
+    settle chunks.
+  - Not fixed here, because none of it is a data-only change: (1) wants
+    `looseCoverDepth` to gate on the column's REAL neighbour heights (or
+    worldgen to shed the surface cell wherever a down-diagonal is free),
+    which is a worldgen.wgsl change and moves the hash — the data knob
+    (`sedSlope`) trades the dune look for it and also moves the sediment
+    wedge; (2) wants `modified_` fed by a "a cell was WRITTEN" chunk bit
+    rather than the "scheduled to act" dirty flag; (3) wants genChunk to
+    bake the at-rest bed stain. Caps in `tests/baseline.json` (`genSettle.*`,
+    measurement + ~5%) so it cannot get worse silently; lower them when a
+    fix lands. Caveat: the travel strip is one biome (desert). Only biomes
+    that author a POWDER cover (desert and ocean author `sand`) can produce
+    cause 1, so the per-plane number is biome-dependent and unmeasured
+    elsewhere.
 
 ---
 

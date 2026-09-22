@@ -330,6 +330,12 @@ class Stream {
   // Edits() above. Same standing: derived, disposable, never sim state.
   FarPlumes& Plumes() { return farPlumes_; }
   uint32_t ShiftCount() const { return shifts_; }
+  // The sticky per-slot modified set, READ-ONLY (kNumSlots entries, nonzero =
+  // "eviction will store this chunk rather than let procgen reproduce it").
+  // For the `gen-settle` gate, which attributes the chunks that come out
+  // modified with no player input (docs/PLAN_save_system.md S2). Nothing
+  // outside Stream may write it; every writer declares itself inside.
+  const std::vector<uint8_t>& ModifiedFlags() const { return modified_; }
   size_t PendingEvictions() const { return pending_.size(); }
 
   // ---- WHERE A WINDOW SHIFT'S TIME GOES ------------------------------------
