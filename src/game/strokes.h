@@ -3,6 +3,7 @@
 #include <string>
 #include <vector>
 
+#include "game/anim.h"    // Ease / ApplyEase — a cut's pacing IS a clip's easing
 #include "game/melee.h"
 #include "math3d.h"
 
@@ -256,9 +257,75 @@ struct StrokeRecover {
   int fade = 0;
 };
 
+// ---- HOW A CUT'S TRAVEL IS PACED (AttackStyle::ease; 2026-09-22) ----------
+//
+// The cut's per-tick delta is `gap / ticksLeftInThisLeg`, and that is a
+// CONSTANT RATE: the gap shrinks linearly and the point lands on the leg's end
+// exactly on its last tick (the derivation is in StepStrokeProgram). It is the
+// only pacing a cut has ever had, and on a long cut it is the wrong one to be
+// stuck with -- an author who wanted a blade that accelerates into the target,
+// or one that arrives early and settles, could only fake it by splitting the
+// path into legs with different tick counts.
+//
+// So the rate is a CURVE over the leg now. IT IS THE ENGINE'S EXISTING EASE
+// VOCABULARY (`anim.h` Ease / ParseEase / ApplyEase), not a second one: those
+// eight curves are already what a clip keyframe interpolates with, already
+// authored by name in assets/anims/*.json, and already ported to
+// editor/anim.js. A style saying `"ease": "quadOut"` therefore means exactly
+// what a keyframe saying it means, which is design guideline 4 ("author
+// content by name") and guideline 3 ("one authoritative source per fact")
+// applied to the one concept both systems needed. The first cut of this had
+// its own three-value `linear|exp|log` enum, and `exp`/`log` were literally
+// QuadOut and QuadIn respelled.
+//
+//   linear      f(p) = p            constant rate. THE DEFAULT, and
+//                                   algebraically the pre-2026-09-22 drive.
+//   quadOut     f(p) = 1-(1-p)^2    fast off the mark, decelerating in
+//   quadIn      f(p) = p^2          slow off the mark, accelerating in
+//   cubicIn/Out                     the same two, harder
+//   quadInOut / cubicInOut          slow at both ends, fast through the middle
+//   instant                         hold, then arrive on the last tick
+//
+// `f(p)` is the fraction of THE LEG'S TRAVEL that should be behind the point at
+// progress `p`. What the drive actually spends is the share of the REMAINING
+// gap the curve advances this tick (StrokeEaseStep) rather than an absolute
+// position, which is what keeps the property the Cut phase is built on: each
+// leg's target is an ABSOLUTE point on the path, so a leg that ran out of
+// ticks short of its corner does not displace the legs after it.
+//
+// THIS PACES THE CUT ONLY. The windup and the settle are a closed-loop chase
+// to a POSE under `commitSpeed` (`steerTo`), which is a different control law
+// with its own feel and no authored travel to distribute.
+
+// The share of the REMAINING gap to spend on the tick carrying progress
+// p0 -> p1.
+//
+// THE LAST TICK ALWAYS SPENDS EVERYTHING. Forced rather than derived, because
+// `Ease` contains curves that do not reach 1 -- `instant` is 0 for every t
+// including t=1 -- and a cut whose curve never completes would leave residue
+// for the next leg to absorb, or stop short of the path's end entirely. With
+// the force, all eight curves arrive exactly and `instant` is a legitimate
+// shape (hold, then snap home) rather than a way to freeze the blade.
+//
+// For `linear` over a leg of N ticks this is (1/N) / ((N-k)/N) = 1/(N-k),
+// which IS the old `gap / left` divisor. The Cut phase still spells that case
+// out longhand rather than calling this, so the default drive cannot move a
+// hash on float rounding; the identity is what makes that safe to do.
+inline float StrokeEaseStep(Ease e, float p0, float p1) {
+  if (p1 >= 1.0f) return 1.0f;
+  const float f0 = ApplyEase(e, p0), f1 = ApplyEase(e, p1);
+  const float room = 1.0f - f0;
+  if (room <= 1e-6f) return 1.0f;
+  const float s = (f1 - f0) / room;
+  return s < 0.0f ? 0.0f : (s > 1.0f ? 1.0f : s);
+}
+
 struct AttackStyle {
   std::string name;    // the id a behaviour profile refers to
   std::string label;   // human text for the dev readout
+  // How the cut's travel is paced over each leg, in the engine's shared ease
+  // vocabulary (anim.h). Linear is the historical drive; see above.
+  Ease ease = Ease::Linear;
   StrokeSegment windup;
   // THE CUT PATH, one leg or several ("A CUT IS A PATH" above). NEVER EMPTY
   // after `LoadAttackStyles` — a style whose whole path travels nowhere is

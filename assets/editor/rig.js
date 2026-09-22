@@ -3482,7 +3482,12 @@ function lungeOffsetModel() {
 // The preview runs whenever something wants a posed rig: the gait walk, clip
 // playback, simply having a clip open (so scrubbing and ring-dragging show
 // their result on a paused rig), or a live stroke.
-const previewActive = () => gaitOn || clipPlaying || !!activeClip || strokeLive();
+// ...or a held GOAL FRAME, which is a posed rig with nothing live on it: the
+// arm sits on one of the style's destinations and does not move, so none of
+// the other four predicates is true and without this the preview would not
+// run at all (and the goal would never be drawn).
+const previewActive = () =>
+  gaitOn || clipPlaying || !!activeClip || strokeLive() || !!ATK.goalFrame?.();
 
 /* ==========================================================================
    5b. THE WEAPON ARM — the real stroke driver, in the preview
@@ -4157,6 +4162,24 @@ function weaponTick() {
   const lib = ATK.library();
   const sty = (lib && strokeStyle >= 0) ? lib.styles[strokeStyle] : null;
   if (!sty) dbgNoStyle++;
+  // ---- 3a. THE GOAL FRAME, held still (attacks.js's goal chips) ----------
+  //
+  // No program runs and no time passes: the arm is put EXACTLY on the
+  // authored destination and left there. Re-resolved every tick rather than
+  // once on the click, so nudging the aim sliders or an az/el box moves the
+  // held frame under the cursor — which is the whole authoring loop this is
+  // for. It reads the SELECTED style, not `strokeStyle`: nothing is live, so
+  // there is no live style to read.
+  const goalKey = ATK.goalFrame?.();
+  if (goalKey) {
+    const gsty = lib ? lib.styles[ATK.styleIndex()] : null;
+    const gaim = ATK.currentAim();
+    const g = gsty
+      ? MELEE.strokeGoalPose(gsty, melee, goalKey, gaim.az, gaim.el) : null;
+    if (g) melee.snapToPose(g.az, g.el, g.reach, right, up, fwd);
+    else melee.update(kStrokeDt, false, !!gsty, right, up, fwd);
+    return;
+  }
   if (!strokeLive()) { melee.update(kStrokeDt, false, !!sty, right, up, fwd); return; }
   // SOLO HOLD: the segment under study has ended; keep the pose it ended in
   // on screen (no step, so the driver's pose is unchanged) for a beat, then
@@ -4528,6 +4551,17 @@ function bindAttacks() {
     // and one they have to go and look up.
     meleeTuning,
     onStylesChanged: () => { /* a live swing keeps running on the edited data */ },
+    // ONE GOAL FRAME, RESOLVED against the arm currently previewing, for the
+    // panel's own readout. The pose itself is applied in weaponTick; this is
+    // the same call with the same arguments, so what the readout prints is by
+    // construction the pose on screen rather than a second derivation of it.
+    goalPose: (key) => {
+      const lib = ATK.library();
+      const s = lib ? lib.styles[ATK.styleIndex()] : null;
+      const a = ATK.currentAim();
+      return (s && melee) ? MELEE.strokeGoalPose(s, melee, key, a.az, a.el)
+                          : null;
+    },
     onTrailToggled: () => { strokeTrail.length = 0; ed.setStrokeTrail?.(null); },
     rebuild: () => { rebuildSkeleton(); ed.invalidate(); },
     state: () => ({

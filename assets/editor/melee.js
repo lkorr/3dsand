@@ -41,6 +41,15 @@
    carrying a scale, so the constants here stay byte-identical to melee.h's.
    ========================================================================== */
 
+/* THE ONE IMPORT, and it mirrors an include rather than breaking the rule
+   below. `strokes.cpp` now includes `game/anim.h` for Ease/ApplyEase, because
+   a cut's pacing IS a clip keyframe's easing and the engine keeps one
+   implementation of it; anim.js is that function's line-cited port, so calling
+   it here is what keeps the JS side one implementation too. Redeclaring it
+   would be the duplication the shared vocabulary exists to avoid. Contrast the
+   vectors below, which are primitives and are redeclared on purpose. */
+import * as AN from './anim.js';
+
 /* ============================================================================
    Vectors. Same shapes anim.js uses, so the two ports interoperate without
    conversion; re-declared rather than imported so this file can be diffed
@@ -442,6 +451,49 @@ export class MeleeState {
 
   // melee.h:785 ReachBand
   reachBand() { const b = this.radiusBand(); return { lo: b.lo, hi: b.hi }; }
+
+  /* ------------------------------------------------------------------------
+     AN AUTHORING AFFORDANCE WITH NO ENGINE COUNTERPART, and the only one in
+     this file. Everything else here is a line-cited port of melee.cpp; this
+     is not, because the engine has no reason to want it — the game never
+     teleports a blade to a pose, it drives it there.
+
+     THE GOAL FRAME. Put the stroke exactly ON a stated (az, el, radius) with
+     no interpolation of any kind — the raw integrals AND their eased copies
+     are written together, so `armSmoothing` has nothing to lag and the pose
+     on screen is the number that was authored rather than a frame on the way
+     to it. That is the whole point: a windup or a cut leg is a DESTINATION,
+     and reading it off a moving preview means reading it off whatever the
+     smoothing had got to.
+
+     Phase is forced to Guard so poseWeight is 1 and the rig actually takes
+     the arm; the follow-through arc is zeroed because an arc is a motion and
+     there is no motion here.
+     ---------------------------------------------------------------------- */
+  snapToPose(az, el, radius, right, up, fwd) {
+    const t = this.tuning;
+    const { lo: rLo, hi: rHi } = this.radiusBand();
+    const azHi = this.handSign_ > 0 ? t.azOut : t.azAcross;
+    const azLo = this.handSign_ > 0 ? -t.azAcross : -t.azOut;
+    this.phase_ = PHASE.Guard;
+    this.phaseTime_ = 0;
+    this.recoverHold_ = false;
+    this.inputAccum_ = v3();
+    this.mouseVel_ = v3();
+    this.mouseSpeed_ = 0;
+    this.az_ = clamp(az, azLo, azHi);
+    this.el_ = clamp(el, t.elMin, t.elMax);
+    this.radius_ = clamp(radius, rLo, rHi);
+    this.swingAz_ = 0; this.swingEl_ = 0; this.swingOut_ = 0;
+    this.azLive_ = this.az_;
+    this.elLive_ = this.el_;
+    this.radLive_ = this.radius_;
+    // Unprimed, so rebuildFrame takes alpha = 1 on every eased channel it
+    // owns internally (the wrist, the pole, the extension) instead of
+    // chasing from wherever the last live swing left them.
+    this.framePrimed_ = false;
+    this.rebuildFrame(1 / 30, right, up, fwd);
+  }
 
   /* ------------------------------------------------------------------------
      melee.cpp:1003 RebuildFrame
@@ -1114,13 +1166,29 @@ export function stepStrokeProgram(cur, sty, m, liveAz, liveEl, dt, right, up, fw
       const toAz = cur.aimAz - aimOff.az + through.az;
       const toEl = cur.aimEl - aimOff.el + through.el;
       const toR = strokeReachIn(m, sty.windup.reach + through.reach);
-      // THE TICKS LEFT IN THIS LEG, not in the cut: this is what sets the
-      // leg's speed, and a short leg is a fast one.
-      const left = Math.max(1, legEnd - cur.phaseTick);
+      // HOW MUCH OF THE REMAINING GAP THIS TICK SPENDS (strokes.h StrokeEase).
+      // The tick counts are per LEG, so a short leg is a fast one; WITHIN the
+      // leg the split is the share the style's curve advances this tick.
+      //
+      // LINEAR KEEPS THE LITERAL OLD EXPRESSION, as the engine does: the two
+      // forms agree algebraically and not to the last bit, and every shipped
+      // style is linear.
       const t = m.tuning;
-      smp.dx = ((toAz - m.strokeAz()) / left) / t.aimGainX;
-      smp.dy = -((toEl - m.strokeEl()) / left) / t.aimGainY;
-      smp.dReach = ((toR - m.strokeRadius()) / left) / Math.max(t.reachGain, 1e-4);
+      const rg = Math.max(t.reachGain, 1e-4);
+      if ((sty.ease || 'linear') === 'linear') {
+        const left = Math.max(1, legEnd - cur.phaseTick);
+        smp.dx = ((toAz - m.strokeAz()) / left) / t.aimGainX;
+        smp.dy = -((toEl - m.strokeEl()) / left) / t.aimGainY;
+        smp.dReach = ((toR - m.strokeRadius()) / left) / rg;
+      } else {
+        const legLen = Math.max(1, cur.legTicks[leg] || cur.cutTicks);
+        const intoLeg = Math.max(0, cur.phaseTick - (legEnd - legLen));
+        const share = strokeEaseStep(sty.ease, intoLeg / legLen,
+                                     (intoLeg + 1) / legLen);
+        smp.dx = ((toAz - m.strokeAz()) * share) / t.aimGainX;
+        smp.dy = -((toEl - m.strokeEl()) * share) / t.aimGainY;
+        smp.dReach = ((toR - m.strokeRadius()) * share) / rg;
+      }
       m.step(smp, dt, true, right, up, fwd);
       if (++cur.phaseTick >= cur.cutTicks) {
         cur.phase = STROKE_PHASE.Recover;
@@ -1156,6 +1224,70 @@ export function stepStrokeProgram(cur, sty, m, liveAz, liveEl, dt, right, up, fw
 }
 
 /* ============================================================================
+   THE GOAL FRAMES OF A STYLE — an authoring view, not a driver path.
+
+   A stroke program is a list of DESTINATIONS with pacing between them, and
+   until now the only way to see a destination was to watch the arm travel to
+   it. These two functions name the destinations and resolve each one to the
+   (az, el, radius) the Cut/Windup/Recover phases above actually target, so the
+   preview can put the arm ON one and hold it.
+
+   THE TARGETS ARE THE SAME EXPRESSIONS THE PHASES USE, deliberately — the
+   windup's `aim - CutAimOffset + windup`, leg k's `aim - offset +
+   CutThrough(k)`, the recover's ABSOLUTE stance. If a goal pose and the pose
+   the program arrives at ever disagree, one of the two is wrong and the point
+   of sharing the arithmetic is that it is visible.
+
+   THE START BOW IS EXCLUDED. `jitter.az/el` is a per-swing DRAW, and a goal is
+   what was authored; including it would make the frame move every reroll and
+   make the author chase a number that is not in the file.
+   ========================================================================== */
+
+/** The destinations of `sty`, in the order the program reaches them. */
+export function strokeGoals(sty) {
+  if (!sty) return [];
+  const out = [{ key: 'windup', label: 'windup' }];
+  const legs = sty.cut.length;
+  for (let k = 0; k < legs; k++)
+    out.push({ key: 'cut' + k, leg: k,
+               label: legs > 1 ? `cut ${k + 1}` : 'cut' });
+  // Only a POSED recover is a destination. An unposed one freezes where the
+  // cut ended and crossfades (strokes.h StrokeRecover), so it has no pose of
+  // its own to show.
+  if (sty.recover.posed) out.push({ key: 'recover', label: 'recover' });
+  return out;
+}
+
+/**
+ * One goal resolved against the arm currently previewing. `null` for a key
+ * this style has no destination for.
+ */
+export function strokeGoalPose(sty, m, key, aimAz, aimEl) {
+  if (!sty || !m) return null;
+  const aimOff = cutAimOffset(sty);
+  if (key === 'windup')
+    return { az: aimAz - aimOff.az + sty.windup.az,
+             el: aimEl - aimOff.el + sty.windup.el,
+             reach: strokeReachIn(m, sty.windup.reach) };
+  if (key === 'recover') {
+    if (!sty.recover.posed) return null;
+    // ABSOLUTE, in the mob's own facing basis — NOT aim-relative like the
+    // other two. A recover is a return to stance, not a second aim.
+    return { az: sty.recover.az, el: sty.recover.el,
+             reach: strokeReachIn(m, sty.recover.reach) };
+  }
+  if (key.startsWith('cut')) {
+    const k = +key.slice(3);
+    if (!Number.isInteger(k) || k < 0 || k >= sty.cut.length) return null;
+    const through = cutThrough(sty, k);
+    return { az: aimAz - aimOff.az + through.az,
+             el: aimEl - aimOff.el + through.el,
+             reach: strokeReachIn(m, sty.windup.reach + through.reach) };
+  }
+  return null;
+}
+
+/* ============================================================================
    THE STYLE LIBRARY — strokes.cpp:20-160 LoadAttackStyles + the flick compass.
 
    The loader's convention is the whole file's: a bad entry is skipped LOUDLY
@@ -1174,6 +1306,35 @@ function readSegment(j, dflt) {
     el: n('el', dflt.el),
     reach: n('reach', dflt.reach),
   };
+}
+
+/* ---- HOW A CUT'S TRAVEL IS PACED (strokes.h, above AttackStyle) ----------
+ *
+ * THE VOCABULARY IS anim.js's, not a second one: a cut's pacing and a clip
+ * keyframe's interpolation are the same concept, so they are the same eight
+ * names and the same `applyEase`. `AN.EASES` is the list; a style says
+ * `"ease": "quadOut"` exactly as a keyframe does.
+ *
+ * `strokeEaseStep` is the share of the REMAINING gap one tick spends, which is
+ * what keeps each leg's target an ABSOLUTE point on the path. The last tick
+ * always spends everything, because `Ease` contains curves that never reach 1
+ * (`instant`) and a cut has to arrive.
+ *
+ * linear IS the historical `gap / ticksLeft` divisor (the identity is derived
+ * in strokes.h), and stepStrokeProgram below spells that case out longhand for
+ * the same reason the engine does.
+ * ------------------------------------------------------------------------ */
+
+// Re-exported so the Attacks panel does not need its own anim.js import just
+// to fill a dropdown: attacks.js talks to the driver through this module.
+export const EASES = AN.EASES;
+
+export function strokeEaseStep(ease, p0, p1) {
+  if (p1 >= 1) return 1;
+  const f0 = AN.applyEase(ease, p0), f1 = AN.applyEase(ease, p1);
+  const room = 1 - f0;
+  if (room <= 1e-6) return 1;
+  return clamp((f1 - f0) / room, 0, 1);
 }
 
 /**
@@ -1304,9 +1465,20 @@ export function parseStyleLibrary(json) {
     }
     const jt = s.jitter || {};
     const cutPath = readCutPath(s.cut, name, log);
+    // strokes.cpp: ParseEase is silent on an unknown name (right for a
+    // keyframe, wrong for a style), so the typo is reported here.
+    let ease = 'linear';
+    if (s.ease !== undefined) {
+      if (AN.EASES.includes(s.ease)) ease = s.ease;
+      else log.push(`style "${name}" has unknown ease "${s.ease}" — using `
+                    + 'linear (the names are anim.h\'s: ' + AN.EASES.join(', ')
+                    + ')');
+    }
     styles.push({
       name,
       label: typeof s.label === 'string' ? s.label : name,
+      // How the cut's travel is paced over each leg (strokes.h StrokeEase).
+      ease,
       windup: readSegment(s.windup, { ticks: 12, az: 0, el: 0, reach: 0 }),
       // THE CUT PATH: always a LIST, one leg or several (strokes.h "A CUT IS
       // A PATH"). Readers that want the old single segment want cutTravel().
@@ -1401,9 +1573,19 @@ export function parseStyleLibrary(json) {
     } else if (p.cut && typeof p.cut === 'object') {
       cut[0] = mergeSeg(cut[0], p.cut);
     }
+    // The player's copy may pace the cut differently from the NPC's — a click
+    // has to feel owned where an authored telegraph does not. Unstated
+    // inherits, via the spread below.
+    let pEase = base.ease;
+    if (p.ease !== undefined) {
+      if (AN.EASES.includes(p.ease)) pEase = p.ease;
+      else log.push(`style "${base.name}:player" has unknown ease `
+                    + `"${p.ease}" — inheriting the base's`);
+    }
     const derived = {
       ...base,
       name: base.name + ':player',
+      ease: pEase,
       windup: mergeSeg(base.windup, p.windup),
       cut,
       aimLeg,

@@ -98,6 +98,11 @@ const folds = { limbs: false, compass: false, help: false };
 // where the previous one left the arm, and watching all three at once is how
 // "windup az" gets blamed for what the seeded start pose did.
 let solo = 'all';
+// GOAL FRAME: null, or the key of the destination the preview is HOLDING
+// (melee.js strokeGoals). A held goal and a live program are mutually
+// exclusive — the arm is either being driven or being posed, and showing both
+// at once would mean neither number on screen was the one in the file.
+let goalKey = null;
 // The shared clip library (assets/anims/*.json), for the program card's clip
 // picker. null until fetched; [] when the server has none.
 let libClips = null;
@@ -146,6 +151,10 @@ export const varying = () => vary;
 export const isDirty = () => dirty;
 export const currentWeaponMode = () => weaponMode;
 export const soloSegment = () => solo;
+// The destination the preview is holding, or null. Read by rig.js's weaponTick
+// (which poses the arm on it instead of stepping the program) and by
+// previewActive (a held frame has nothing live on it).
+export const goalFrame = () => goalKey;
 export function nextSwing() { swingNo = (swingNo + 1) >>> 0; }
 
 async function refreshLibClips() {
@@ -846,6 +855,63 @@ function programCard(sty) {
   seg.append(el('div', {}));
   card.append(seg);
 
+  // ---- HOW THE CUT'S TRAVEL IS PACED (strokes.h StrokeEase) -------------
+  //
+  // The tick counts above set each leg's DURATION; this sets the shape of the
+  // rate WITHIN a leg. It is a separate control because the two answer
+  // different questions — "how long does this take" and "where in that time
+  // does the speed live" — and before this the second had only one answer.
+  {
+    const row = el('div', { class: 'atkrow' });
+    const EASES = MELEE.EASES;
+    const cur = EASES.includes(r.ease) ? r.ease : 'linear';
+    // WHAT EACH CURVE READS AS, because "cubicInOut" is a formula and not a
+    // description of a sword. Only the shapes worth reaching for are
+    // annotated; the rest are the same idea, harder.
+    const feel = {
+      linear: 'even speed throughout — the shipped pacing',
+      instant: 'holds, then arrives on the last tick',
+      quadIn: 'back-loaded: fastest AT the target',
+      quadOut: 'front-loaded: snaps, then settles',
+      quadInOut: 'slow at both ends, fast through the middle',
+      cubicIn: 'back-loaded, harder',
+      cubicOut: 'front-loaded, harder',
+      cubicInOut: 'slow ends, very fast middle',
+    };
+    row.append(el('label', {
+      title: 'HOW THE CUT\'S TRAVEL IS PACED over each leg. The leg\'s ticks ' +
+        'set how LONG it takes; this sets where in that time the speed lives. ' +
+        'These are anim.h\'s ease curves — the same eight a clip keyframe ' +
+        'interpolates with, so the name means one thing across the project.\n\n' +
+        'THE CUT ONLY: the windup and the settle are a closed-loop chase to a ' +
+        'pose under melee.commitSpeed, a different control law with no ' +
+        'authored travel to distribute.',
+    }, 'pacing'));
+    const sel = el('select', { class: 'small' });
+    for (const k of EASES)
+      sel.append(el('option', { value: k }, k + ' — ' + (feel[k] || '')));
+    sel.value = cur;
+    sel.addEventListener('change', () => {
+      const v = sel.value;
+      if (v === cur) return;
+      // Absent means linear, so the default writes no key — the same rule
+      // `settle`, `fade` and `weapon` follow in this panel.
+      editStyles('cut pacing', () => {
+        if (v === 'linear') delete r.ease; else r.ease = v;
+      });
+    });
+    row.append(sel);
+    // SPEED IS THE DAMAGE (melee.h), so which half of the cut is fast is not
+    // only a look — it decides whether the fast part is where the aim is.
+    if (cur === 'quadIn' || cur === 'cubicIn')
+      row.append(el('span', { class: 'hint' },
+        'tip speed peaks at the target — SPEED IS THE DAMAGE'));
+    else if (cur === 'quadOut' || cur === 'cubicOut')
+      row.append(el('span', { class: 'hint' },
+        'tip is slowest at the target — expect weaker hits'));
+    card.append(row);
+  }
+
   // ---- THE BODY ANIMATION (strokes.h AttackStyle::clip) -----------------
   // The program above drives the WEAPON ARM. Everything else the swing does
   // with the body — the step, the shoulder, the off hand — is a CLIP,
@@ -1188,6 +1254,7 @@ function previewCard(sty) {
         if (!arm || arm.chain < 0)
           return toast('this rig has no arm chain tagged "arm" whose effector ' +
             'is the weapon socket\'s part — the driver has nothing to steer', true);
+        goalKey = null;   // swinging means the program drives again
         nextSwing();
         await host.begin(selected);
         render();
@@ -1233,10 +1300,74 @@ function previewCard(sty) {
   for (const k of ['all', 'windup', 'cut', 'recover'])
     t3.append(chip(k, solo === k, () => {
       solo = k;
+      goalKey = null;   // solo PLAYS a segment; a goal HOLDS one
       if (host?.state?.().live) host?.begin?.(selected);
       render();
     }, soloTips[k]));
   card.append(t3);
+
+  // ---- GOAL FRAMES: the destinations, held still -------------------------
+  //
+  // A stroke program is a list of destinations with pacing between them, and
+  // watching the arm travel is the wrong way to author a destination: what is
+  // on screen at any instant is wherever the interpolation had got to. These
+  // chips put the arm EXACTLY on one authored target and leave it there, so
+  // the az/el/reach boxes in the program card can be set against the pose
+  // they actually produce. Set the goals first, then pick the pacing.
+  if (sty) {
+    const goals = MELEE.strokeGoals(sty);
+    const t5 = el('div', { class: 'atkrow' });
+    t5.append(el('label', {
+      title: 'HOLD one of this style\'s destinations, with no interpolation ' +
+        'and no time passing. The frame re-resolves as you edit, so nudging ' +
+        'an az box or an aim slider moves the held pose under you.',
+    }, 'goal'));
+    t5.append(chip('off', !goalKey, () => {
+      if (!goalKey) return;
+      goalKey = null;
+      host?.stop?.();
+      render();
+    }, 'back to the driven preview'));
+    for (const g of goals)
+      t5.append(chip(g.label, goalKey === g.key, () => {
+        goalKey = g.key;
+        // A held frame and a live program are exclusive — stop the driver
+        // rather than letting the next tick fight the snap.
+        host?.stop?.();
+        render();
+      }, g.key === 'windup'
+        ? 'the pose the cut STARTS from: aim − ½the cut\'s travel + windup. ' +
+          'The start bow is excluded — jitter is a per-swing draw and a goal ' +
+          'is what was authored.'
+        : g.key === 'recover'
+        ? 'the ABSOLUTE return stance, in the rig\'s own facing basis — not ' +
+          'relative to the aim like the other two.'
+        : `where the point stands when ${g.label} ends: aim − offset + the ` +
+          'travel through this leg. An absolute point on the path, which is ' +
+          'why a leg that fell short does not move the ones after it.'));
+    if (!sty.recover.posed)
+      t5.append(el('span', { class: 'hint' },
+        'recover has no pose to hold — turn on "return pose"'));
+    card.append(t5);
+    // The resolved numbers, because "hold the windup" is only useful if you
+    // can read what it resolved TO on this arm.
+    if (goalKey) {
+      const g = host?.goalPose?.(goalKey);
+      const line = el('div', { class: 'atkderived' });
+      if (g)
+        line.append(el('span', {},
+          el('b', {}, 'holding '), goalKey, ' — az ',
+          el('b', {}, String(Math.round(g.az * DEG)) + '°'), ' · el ',
+          el('b', {}, String(Math.round(g.el * DEG)) + '°'), ' · reach ',
+          el('b', {}, fmt(g.reach, 1) + ' vox'),
+          el('span', { class: 'hint' },
+            '  (absolute, in the rig\'s facing basis)')));
+      else
+        line.append(el('span', { class: 'hint' },
+          'this style has no "' + goalKey + '" destination on this arm'));
+      card.append(line);
+    }
+  }
 
   // ---- WEAPON PICKER. A blade is not decoration here: the driver MEASURES
   // hand-to-point and solves the whole reach band against it, so an empty hand

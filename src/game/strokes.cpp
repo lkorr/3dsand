@@ -115,6 +115,23 @@ bool LoadAttackStyles(const std::string& path, StyleLibrary& out,
       continue;
     }
     st.label = s.value("label", st.name);
+    // HOW THE CUT IS PACED (strokes.h, above AttackStyle). Absent is "linear",
+    // the drive every style shipped before this had, so an older file loads
+    // and swings identically.
+    //
+    // ParseEase is SILENT on a name it does not know (anim.cpp returns Linear,
+    // which is right for a keyframe: a clip must not fail to load over a
+    // typo). Here the typo is worth saying out loud, and the round-trip is how
+    // to tell "the author wrote linear" from "the author wrote quadOOut" —
+    // both parse to Linear, and only one of them is a mistake.
+    if (s.contains("ease")) {
+      const std::string en = s.value("ease", "linear");
+      st.ease = ParseEase(en);
+      if (st.ease == Ease::Linear && en != "linear")
+        log += path + ": style \"" + st.name + "\" has unknown ease \"" + en +
+               "\" — using linear (the names are anim.h's: linear, instant, "
+               "quadIn/Out/InOut, cubicIn/Out/InOut)\n";
+    }
     st.windup = ReadSegment(s.value("windup", json::object()),
                             StrokeSegment{12, 0.30f, 0.10f, -0.05f});
     ReadCutPath(s.contains("cut") ? s["cut"] : json(), path, st.name, st.cut,
@@ -285,6 +302,18 @@ bool LoadAttackStyles(const std::string& path, StyleLibrary& out,
     const auto& pj = sj["player"];
     AttackStyle ps = lib.styles[base];
     ps.name += ":player";
+    // The player's copy may pace the cut differently from the NPC's: a click
+    // has to feel owned and an authored NPC telegraph does not, which is the
+    // same reason the block already overrides windup ticks and zeroes jitter.
+    if (pj.contains("ease")) {
+      const std::string en = pj.value("ease", "linear");
+      const Ease pe = ParseEase(en);
+      if (pe == Ease::Linear && en != "linear")
+        log += path + ": style \"" + ps.name + "\" has unknown ease \"" + en +
+               "\" — inheriting the base's\n";
+      else
+        ps.ease = pe;
+    }
     if (pj.contains("windup") && pj["windup"].is_object()) {
       const auto& w = pj["windup"];
       ps.windup.ticks = std::max(1, w.value("ticks", ps.windup.ticks));
@@ -622,16 +651,37 @@ StrokeStepResult StepStrokeProgram(StrokeCursor& cur, const AttackStyle* sty,
       const float toEl = cur.aimEl - aimOffEl + through.el;
       const float toR =
           toTarget(StrokeReachIn(m, sty->windup.reach + through.reach));
-      // THE TICKS LEFT IN THIS LEG, not in the cut: the deltas are divided by
-      // them and delivered per tick, so this is what sets the leg's SPEED, and
-      // a short leg is a fast one. That is the whole of how a path varies its
-      // tempo.
-      const int left = std::max(1, legEnd - cur.phaseTick);
+      // HOW MUCH OF THE REMAINING GAP THIS TICK SPENDS (strokes.h, above
+      // AttackStyle).
+      //
+      // The tick counts are per LEG, not per cut: that is what sets a leg's
+      // SPEED, so a short leg is a fast one, and it is the whole of how a path
+      // varies its tempo. WITHIN the leg, the split is the share the style's
+      // own ease curve advances over this tick.
+      //
+      // LINEAR KEEPS THE LITERAL OLD EXPRESSION rather than going through
+      // StrokeEaseStep, which returns exactly `1 / left` for it. The two agree
+      // algebraically and NOT to the last bit — one divides the gap once, the
+      // other multiplies it by a quotient of two divisions — and every style
+      // in the game is linear, so routing the default through the general form
+      // would move the world hash for nothing but float rounding.
       const MeleeTuning& t = m.tuning;
-      smp.dx = ((toAz - m.StrokeAz()) / (float)left) / t.aimGainX;
-      smp.dy = -((toEl - m.StrokeEl()) / (float)left) / t.aimGainY;
-      smp.dReach = ((toR - m.StrokeRadius()) / (float)left) /
-                   std::max(t.reachGain, 1e-4f);
+      const float rg = std::max(t.reachGain, 1e-4f);
+      if (sty->ease == Ease::Linear) {
+        const int left = std::max(1, legEnd - cur.phaseTick);
+        smp.dx = ((toAz - m.StrokeAz()) / (float)left) / t.aimGainX;
+        smp.dy = -((toEl - m.StrokeEl()) / (float)left) / t.aimGainY;
+        smp.dReach = ((toR - m.StrokeRadius()) / (float)left) / rg;
+      } else {
+        const int legLen = std::max(1, cur.legTicks[leg]);
+        const int intoLeg = std::max(0, cur.phaseTick - (legEnd - legLen));
+        const float share =
+            StrokeEaseStep(sty->ease, (float)intoLeg / (float)legLen,
+                           (float)(intoLeg + 1) / (float)legLen);
+        smp.dx = ((toAz - m.StrokeAz()) * share) / t.aimGainX;
+        smp.dy = -((toEl - m.StrokeEl()) * share) / t.aimGainY;
+        smp.dReach = ((toR - m.StrokeRadius()) * share) / rg;
+      }
       m.Step(smp, dt, true, right, up, fwd);
       if (++cur.phaseTick >= cur.cutTicks) {
         cur.phase = StrokeCursor::Phase::Recover;
