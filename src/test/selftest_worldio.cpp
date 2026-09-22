@@ -13,6 +13,7 @@
 #include <filesystem>
 #include <map>
 #include <string>
+#include <tuple>
 #include <vector>
 
 #include "game/avatar.h"
@@ -1273,6 +1274,312 @@ Status GateChunkExchange(Ctx& c, std::string& detail) {
   return ok ? Status::Pass : Status::Fail;
 }
 
+// ---- region-codec ------------------------------------------------------
+// SVR3 (docs/PLAN_save_system.md S3): the region files' zstd plane codec.
+//
+// The chunk set is REAL: the determinism gate's own mutation script
+// (SelftestOps/SelftestExps — a sand pile, a water pool, lava into it, fire
+// on the wood platform, seeds, the melt laser, a terrain crater and a pool
+// blast) run for 150 ticks over fresh worldgen, and every chunk of the box it
+// touches read back. "Modified" = differs from the same chunk straight after
+// worldgen, under kPersistMask — the set S1's delta save would store. Plus
+// synthetic edge cases the terrain never produces: a chunk of 4,096 distinct
+// words (worst case), a JITTER-stone chunk at NEGATIVE coordinates built from
+// the definition JitterStateFor (the predictor must zero it: proof the codec's
+// row-form predictor is the worldgen rule), and a word with stamp bits (must
+// fall back to raw and survive verbatim).
+//
+// Claims, each its own check:
+//   A. codec round-trip is bit-exact for every chunk, at levels 1/3/9;
+//   B. a ChunkStore written as SVR3 reads back identical through Get AND
+//      ForEachStored — under a DIFFERENT SetSeed (the header's seed rules);
+//   C. SVR2 files (written here in the legacy layout) load under this build,
+//      and a dirtied SVR2 region is rewritten as SVR3 without losing chunks;
+//   D. modified-set SVR2/SVR3 bytes >= regionCodec.modifiedRatioMin.
+Status GateRegionCodec(Ctx& c, std::string& detail) {
+  GpuContext& ctx = c.ctx;
+  World& world = c.world;
+  Simulation& sim = c.sim;
+  constexpr uint32_t kSeed = kDefaultSeed;
+
+  // ---- the box the mutation script touches (x,z 48..223) ----
+  int gMin = 1 << 30, gMax = -(1 << 30);
+  for (int z = 48; z < 224; z += 4)
+    for (int x = 48; x < 224; x += 4) {
+      const int h = World::TerrainHeight(x, z, kSeed);
+      gMin = std::min(gMin, h);
+      gMax = std::max(gMax, h);
+    }
+  std::vector<IVec3> box;
+  for (int cz = 3; cz <= 13; cz++)
+    for (int cy = (gMin - 24) >> 4; cy <= (gMax + 40) >> 4; cy++)
+      for (int cx = 3; cx <= 13; cx++)
+        if (world.ChunkInWindow({cx, cy, cz})) box.push_back({cx, cy, cz});
+  auto readBox = [&](std::vector<std::vector<uint32_t>>& out) {
+    out.assign(box.size(), std::vector<uint32_t>(kChunkVol));
+    for (size_t i = 0; i < box.size(); i++)
+      ReadVoxelsSync(ctx, world, World::SlotChunkIndex(box[i]), 1,
+                     out[i].data(), "regionCodec");
+  };
+
+  SubmitWorldgen(ctx, world, sim, kSeed);
+  ctx.WaitIdle();
+  std::vector<std::vector<uint32_t>> pristine, after;
+  readBox(pristine);
+  for (uint32_t t = 1; t <= 150; t++)
+    SubmitTick(ctx, world, sim, t, kSeed, SelftestOps(t, kSeed),
+               SelftestExps(t, kSeed), {}, false, {8, 3, 8}, false,
+               SelftestParticlesActive(t));
+  ctx.WaitIdle();
+  readBox(after);
+
+  struct Chunk {
+    IVec3 wc;
+    std::vector<uint32_t> rle;
+    bool modified;
+  };
+  std::vector<Chunk> set;
+  for (size_t i = 0; i < box.size(); i++) {
+    bool mod = false;
+    for (uint32_t k = 0; k < kChunkVol && !mod; k++)
+      mod = (pristine[i][k] & kPersistMask) != (after[i][k] & kPersistMask);
+    Chunk ch{box[i], {}, mod};
+    RleEncodeChunk(after[i].data(), ch.rle);
+    set.push_back(std::move(ch));
+  }
+  size_t nModified = 0;
+  for (const Chunk& ch : set) nModified += ch.modified;
+
+  // ---- synthetic edge cases ----
+  {
+    std::vector<uint32_t> w(kChunkVol);
+    uint32_t s = 0x9E3779B9u;
+    for (uint32_t k = 0; k < kChunkVol; k++) {  // all distinct, masked
+      s = s * 1664525u + 1013904223u;
+      w[k] = ((k & 0xFFFu) | (s & 0xFF00F000u)) & kPersistMask;
+    }
+    Chunk ch{{-7, 2, 5}, {}, false};
+    RleEncodeChunk(w.data(), ch.rle);
+    set.push_back(std::move(ch));
+  }
+  const size_t jitterIdx = set.size();
+  {
+    const IVec3 wc{-5, -3, -9};
+    std::vector<uint32_t> w(kChunkVol);
+    for (uint32_t k = 0; k < kChunkVol; k++) {
+      const int x = wc.x * 16 + (int)(k % 16), y = wc.y * 16 + (int)((k / 16) % 16),
+                z = wc.z * 16 + (int)(k / 256);
+      w[k] = PackVoxNew(kMatStone, JitterStateFor(x, y, z, kSeed));
+    }
+    Chunk ch{wc, {}, false};
+    RleEncodeChunk(w.data(), ch.rle);
+    set.push_back(std::move(ch));
+  }
+  const size_t rawIdx = set.size();
+  set.push_back({{2, -1, 3}, {100u, 0x00050001u, kChunkVol - 100u, 1u}, false});
+
+  // ---- A: codec round-trip at 1/3/9, bytes and time ----
+  bool aOk = true;
+  std::string firstBad;
+  const int kLevels[3] = {1, 3, 9};
+  uint64_t v3Mod[3] = {}, v3All[3] = {}, v2Mod = 0, v2All = 0;
+  double encUs[3] = {}, decUs = 0;
+  size_t timedChunks = 0;
+  std::vector<uint8_t> rec;
+  std::vector<uint32_t> back;
+  size_t jitterBytes = 0;
+  ChunkStore::Codec rawCodec = ChunkStore::Codec::ZstdPlanes;
+  for (int li = 0; li < 3; li++) {
+    for (size_t i = 0; i < set.size(); i++) {
+      const Chunk& ch = set[i];
+      const size_t pairs = ch.rle.size() / 2;
+      const double t0 = NowSeconds();
+      const ChunkStore::Codec codec = ChunkStore::EncodeRecord(
+          ch.rle.data(), pairs, ch.wc, kSeed, rec, kLevels[li]);
+      const double t1 = NowSeconds();
+      const bool dec = ChunkStore::DecodeRecord(codec, rec.data(), rec.size(),
+                                                ch.wc, kSeed, back);
+      const double t2 = NowSeconds();
+      if (!dec || back != ch.rle) {
+        aOk = false;
+        if (firstBad.empty())
+          firstBad = Format(" A: chunk (%d,%d,%d) level %d codec %u %s",
+                            ch.wc.x, ch.wc.y, ch.wc.z, kLevels[li],
+                            (unsigned)codec, dec ? "differs" : "refused");
+      }
+      if (i < jitterIdx) {  // real terrain only
+        v3All[li] += 16 + rec.size();
+        if (ch.modified) v3Mod[li] += 16 + rec.size();
+        if (li == 0) {
+          v2All += 16 + pairs * 8;
+          if (ch.modified) v2Mod += 16 + pairs * 8;
+        }
+        if (pairs > 1) {  // the chunks that actually reach zstd
+          encUs[li] += (t1 - t0) * 1e6;
+          if (li == 1) {
+            decUs += (t2 - t1) * 1e6;
+            timedChunks++;
+          }
+        }
+      }
+      if (li == 1 && i == jitterIdx) jitterBytes = rec.size();
+      if (li == 1 && i == rawIdx) rawCodec = codec;
+    }
+  }
+  const size_t timedPerLevel = timedChunks ? timedChunks : 1;
+  // The predictor must turn definition-built jitter into all-zero state: a
+  // uniform-material, zero-residue chunk is a few dozen bytes of zstd frame.
+  const bool jitterOk = jitterBytes > 0 && jitterBytes <= 64;
+  const bool rawOk = rawCodec == ChunkStore::Codec::RawRle;
+
+  // ---- B: through the store, SVR3, read back under a different seed ----
+  namespace fs = std::filesystem;
+  const char* kDir3 = "selftest_codec3.svd";
+  const char* kDir2 = "selftest_codec2.svd";
+  auto sameAsSet = [&](ChunkStore& cs, const char* tag) {
+    bool ok = true;
+    for (const Chunk& ch : set) {
+      const std::vector<uint32_t>* got = cs.Get(ch.wc);
+      if (!got || *got != ch.rle) {
+        ok = false;
+        if (firstBad.empty())
+          firstBad = Format(" %s: Get(%d,%d,%d) %s", tag, ch.wc.x, ch.wc.y,
+                            ch.wc.z, got ? "differs" : "missing");
+      }
+    }
+    return ok;
+  };
+  auto walkSameAsSet = [&](ChunkStore& cs, const char* tag) {
+    std::map<std::tuple<int, int, int>, const std::vector<uint32_t>*> want;
+    for (const Chunk& ch : set) want[{ch.wc.x, ch.wc.y, ch.wc.z}] = &ch.rle;
+    size_t visited = 0;
+    bool ok = true;
+    cs.ForEachStored([&](IVec3 wc, const uint32_t* rle, size_t pairs) {
+      visited++;
+      auto it = want.find({wc.x, wc.y, wc.z});
+      if (it == want.end() || it->second->size() != pairs * 2 ||
+          !std::equal(rle, rle + pairs * 2, it->second->begin()))
+        ok = false;
+    });
+    ok = ok && visited == set.size();
+    if (!ok && firstBad.empty())
+      firstBad = Format(" %s: ForEachStored visited %zu of %zu or differed",
+                        tag, visited, set.size());
+    return ok;
+  };
+  bool bOk = false;
+  size_t regions3 = 0;
+  uint64_t bytes3 = 0;
+  {
+    fs::remove_all(kDir3);
+    ChunkStore cs;
+    cs.SetSeed(kSeed);
+    bOk = cs.BindSave(kDir3);
+    for (const Chunk& ch : set) cs.Put(ch.wc, ch.rle);
+    bOk = bOk && cs.Flush(&regions3, &bytes3);
+    cs.Unbind();
+    ChunkStore rd;
+    rd.SetSeed(kSeed ^ 0x5A5A5A5Au);  // wrong on purpose: header's seed rules
+    bOk = bOk && rd.BindLoad(kDir3) && sameAsSet(rd, "B") &&
+          walkSameAsSet(rd, "B");
+    ChunkStore walk;  // a fresh store: ForEachStored's disk-only branch
+    bOk = bOk && walk.BindLoad(kDir3) && walkSameAsSet(walk, "B-disk");
+    rd.Unbind();
+    walk.Unbind();
+    fs::remove_all(kDir3);
+  }
+
+  // ---- C: SVR2 (the pre-S3 layout, written by hand) loads, and upgrades ----
+  bool cOk = false;
+  uint64_t svr2FileBytes = 0;
+  {
+    fs::remove_all(kDir2);
+    fs::create_directories(kDir2);
+    std::map<std::tuple<int, int, int>, std::vector<const Chunk*>> byRegion;
+    for (const Chunk& ch : set)
+      byRegion[{ch.wc.x >> ChunkStore::kRegionShift,
+                ch.wc.y >> ChunkStore::kRegionShift,
+                ch.wc.z >> ChunkStore::kRegionShift}]
+          .push_back(&ch);
+    cOk = true;
+    for (const auto& [rc, chunks] : byRegion) {
+      const std::string path = Format("%s/r_%d_%d_%d.svr", kDir2, std::get<0>(rc),
+                                      std::get<1>(rc), std::get<2>(rc));
+      FILE* fp = std::fopen(path.c_str(), "wb");
+      if (!fp) { cOk = false; break; }
+      const uint32_t hdr[2] = {0x32525653u /* 'SVR2' */, (uint32_t)chunks.size()};
+      std::fwrite(hdr, 4, 2, fp);
+      for (const Chunk* ch : chunks) {
+        const int32_t wc[3] = {ch->wc.x, ch->wc.y, ch->wc.z};
+        const uint32_t pairs = (uint32_t)(ch->rle.size() / 2);
+        std::fwrite(wc, 4, 3, fp);
+        std::fwrite(&pairs, 4, 1, fp);
+        std::fwrite(ch->rle.data(), 4, ch->rle.size(), fp);
+      }
+      std::fclose(fp);
+      svr2FileBytes += fs::file_size(path);
+    }
+    ChunkStore rd;
+    rd.SetSeed(kSeed);
+    cOk = cOk && rd.BindLoad(kDir2) && sameAsSet(rd, "C-svr2") &&
+          walkSameAsSet(rd, "C-svr2");
+    // Dirty every region (re-Put one chunk of each) and flush: each file must
+    // come back as SVR3 carrying ALL its chunks, the disk-only ones included.
+    for (const auto& [rc, chunks] : byRegion)
+      rd.Put(chunks.front()->wc, chunks.front()->rle);
+    cOk = cOk && rd.Flush();
+    rd.Unbind();
+    for (const auto& de : fs::directory_iterator(kDir2)) {
+      if (de.path().extension() != ".svr") continue;
+      FILE* fp = std::fopen(de.path().string().c_str(), "rb");
+      uint32_t magic = 0;
+      if (!fp || std::fread(&magic, 4, 1, fp) != 1 || magic != 0x33525653u)
+        cOk = false;
+      if (fp) std::fclose(fp);
+    }
+    ChunkStore up;
+    cOk = cOk && up.BindLoad(kDir2) && sameAsSet(up, "C-upgraded") &&
+          walkSameAsSet(up, "C-upgraded");
+    up.Unbind();
+    fs::remove_all(kDir2);
+  }
+
+  // ---- D: the ratio floor ----
+  const double modRatio = v3Mod[1] ? (double)v2Mod / (double)v3Mod[1] : 0.0;
+  const double allRatio = v3All[1] ? (double)v2All / (double)v3All[1] : 0.0;
+  const double ratioMin = BaselineNumber("regionCodec.modifiedRatioMin", 0.0);
+  const bool dOk = nModified >= 8 && modRatio >= ratioMin;
+  RecordObserved("regionCodec.modifiedRatio", modRatio);
+  RecordObserved("regionCodec.encodeUsPerChunk", encUs[1] / timedPerLevel);
+  RecordObserved("regionCodec.decodeUsPerChunk", decUs / timedPerLevel);
+
+  const bool ok = aOk && jitterOk && rawOk && bOk && cOk && dOk;
+  std::printf(
+      "region codec: %s (%zu chunks, %zu modified; modified SVR2 %llu B -> "
+      "SVR3 %llu/%llu/%llu B at zstd 1/3/9 = %.1fx at %d (floor %.1fx); all "
+      "%llu -> %llu B = %.1fx; SVR3 store %llu B in %zu regions, SVR2 files "
+      "%llu B)\n",
+      ok ? "PASS" : "FAIL", set.size() - 3, nModified,
+      (unsigned long long)v2Mod, (unsigned long long)v3Mod[0],
+      (unsigned long long)v3Mod[1], (unsigned long long)v3Mod[2], modRatio,
+      ChunkStore::kZstdLevel, ratioMin, (unsigned long long)v2All,
+      (unsigned long long)v3All[1], allRatio, (unsigned long long)bytes3,
+      regions3, (unsigned long long)svr2FileBytes);
+  std::printf(
+      "region codec: encode us/chunk %.1f/%.1f/%.1f at 1/3/9, decode %.1f "
+      "(over %zu multi-run chunks)%s; jitter chunk %zu B %s, raw fallback %s; "
+      "A %s B %s C %s\n",
+      encUs[0] / timedPerLevel, encUs[1] / timedPerLevel,
+      encUs[2] / timedPerLevel, decUs / timedPerLevel, timedChunks,
+      encUs[1] / timedPerLevel > 200.0 ? " OVER the 200 us budget" : "",
+      jitterBytes, jitterOk ? "ok" : "NOT ZEROED", rawOk ? "ok" : "NOT TAKEN",
+      aOk ? "ok" : "FAIL", bOk ? "ok" : "FAIL", cOk ? "ok" : "FAIL");
+  detail = Format("modified %.1fx, all %.1fx, enc %.0f us, dec %.0f us%s",
+                  modRatio, allRatio, encUs[1] / timedPerLevel,
+                  decUs / timedPerLevel, firstBad.c_str());
+  return ok ? Status::Pass : Status::Fail;
+}
+
 }  // namespace
 
 const std::vector<Gate>& WorldIoGates() {
@@ -1280,6 +1587,7 @@ const std::vector<Gate>& WorldIoGates() {
       {"save-load", "worldio", {}, false, GateSaveLoad},
       {"save-entities", "worldio", {}, false, GateSaveEntities},
       {"region-store", "worldio", {}, false, GateRegionStore},
+      {"region-codec", "worldio", {}, false, GateRegionCodec},
       {"streaming", "worldio", {}, false, GateStreaming},
       {"chunk-exchange", "worldio", {}, false, GateChunkExchange},
   };

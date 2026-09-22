@@ -378,6 +378,9 @@ const char* const kOrder[] = {
     // regenerates the world on the way in so it inherits nothing either.
     "debris-ghost",
     "save-load",   "save-entities", "region-store",
+    // SVR3 codec (PLAN_save_system.md S3). Runs its own worldgen + 150 ticks
+    // and leaves that world behind; chunk-exchange next regenerates on entry.
+    "region-codec",
     // BETWEEN region-store and streaming, and the slot is chosen rather than
     // convenient. It regenerates the world several times (four arms, each
     // with its own worldgen and its own ReloadWindow) and it SHIFTS the
