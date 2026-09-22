@@ -249,6 +249,29 @@ def engraving(kind, size=16):
     elif kind == "modifier":      # a spiral tick: decoration
         fill([(4, 5, 10), (5, 5, 6), (6, 5, 6), (7, 5, 10), (8, 9, 10),
               (9, 9, 10), (10, 5, 10)])
+    # ---- the spell page's five SORTS -------------------------------------
+    # The canvas draws a tree of symbols and no words at all (the name is a
+    # hover away), so every sort needs a silhouette of its own. Matter reuses
+    # `element`, delivery reuses `form`, mod reuses `modifier`; these three are
+    # the ones that had nothing and were all falling back to `modifier`, which
+    # made an effect, an operator and a mod the same picture.
+    elif kind == "spark":         # a four-point star: an EFFECT, the verb
+        fill([(2, 7, 8), (3, 7, 8), (4, 6, 9), (5, 6, 9), (6, 5, 10),
+              (7, 2, 13), (8, 2, 13),
+              (9, 5, 10), (10, 6, 9), (11, 6, 9), (12, 7, 8), (13, 7, 8)])
+        fill([(7, 7, 8), (8, 7, 8)], GOLD_DIM)
+        stroke(im, [(7, 3), (8, 3), (6, 4), (9, 4)], h)
+    elif kind == "bond":          # two brackets round a bar: an OPERATOR
+        fill([(4, 3, 6), (11, 3, 6), (4, 9, 12), (11, 9, 12)])
+        for y in range(5, 11):
+            fill([(y, 3, 4), (y, 11, 12)])
+        fill([(7, 6, 9), (8, 6, 9)], GOLD_DIM)
+    elif kind == "ring":          # an open circle: the HAND you cast from
+        fill([(3, 6, 9), (12, 6, 9)])
+        fill([(4, 4, 5), (4, 10, 11), (11, 4, 5), (11, 10, 11)])
+        for y in range(5, 11):
+            fill([(y, 3, 4), (y, 11, 12)])
+        stroke(im, [(6, 3), (7, 3), (8, 3), (9, 3)], h)
     elif kind == "melee":         # a sword, point up: what a melee item IS
         fill([(1, 7, 8), (2, 7, 8), (3, 7, 8), (4, 7, 8), (5, 7, 8),
               (6, 7, 8), (7, 7, 8), (8, 7, 8), (9, 7, 8)])
@@ -294,7 +317,7 @@ def build():
     for k in ("head", "chest", "legs", "boots", "shoulders", "hands", "belt",
               "trinket", "sheath", "quick"):
         add("slot_" + k, engraving(k))
-    for k in ("element", "form", "modifier"):
+    for k in ("element", "form", "modifier", "spark", "bond", "ring"):
         add("glyph_" + k, engraving(k))
     # Item icons are keyed by ItemKind, not by item name: there is no
     # per-asset art here, and inventing a naming convention for art that does

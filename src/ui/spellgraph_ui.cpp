@@ -6,6 +6,7 @@
 #include <cstdio>
 #include <cstring>
 #include <string>
+#include <vector>
 
 #include "ui/theme.h"
 
@@ -21,6 +22,21 @@
 // THE SCALE IS 1x OR 0.5x AND NOTHING ELSE. A smooth zoom would put chrome on
 // half pixels, which is the one thing the pixel-art rule forbids; a graph that
 // does not fit at 0.5x SCROLLS.
+//
+// THE CANVAS CARRIES NO WORDS (2026-09-21). Every node is a SYMBOL — the sort's
+// engraving over the glyph's own colour — and every name, price, multiplicity
+// note and field edit is a HOVER away in the info box that already existed.
+// The tree used to spell each leaf under its cell, caps the delivery's noun
+// across every bar and hang a "tariff 441 + carry 882  x3 = 1323" line under
+// it, and at any width the panel actually gets, all three collided, clipped and
+// overlapped the strokes. The drawing is the SHAPE of the spell; the numbers
+// belong on the price bar under the canvas, where nothing can clip them, and
+// the names belong to the thing under the cursor.
+//
+// AND IT IS CENTRED. A drawing narrower than the band sits in the middle of it,
+// not hard against the left edge — the tree is a figure, and a figure hugging
+// one wall of its frame reads as a layout bug. Only a drawing too big to fit
+// scrolls, and only then does the view frame the deepest join.
 
 namespace ui {
 
@@ -44,17 +60,23 @@ const char* kSortLabels[6] = {"matter", "effect",   "delivery",
 // `kGraphCell` / `kGraphPitch` ever move, these move with them.
 constexpr int kCellPx = 64;
 constexpr int kPitchPx = 96;
-// The 13 px small font's line, which every band reserves under a cell for the
-// word's NAME. At 0.5x a cell is 32 px of engraving and the colour of a sort;
-// which sort is not which WORD, and the name is the difference between reading
-// the tree and guessing at it.
-constexpr float kLabelH = 13.0f;
+// The air under a cell inside its band. There used to be a 13 px line here for
+// the word's NAME; the names are in the info box now, and the band is tighter
+// by exactly that much — which is most of why a three-layer tree stands at 1x
+// in a composer that could only ever show two.
+constexpr float kBandAir = 10.0f;
 
+// ONE SILHOUETTE PER SORT. Three of the five used to fall back to
+// `glyph_modifier`, so an effect, an operator and a mod were the same picture
+// and only the rim colour told them apart — survivable while every cell was
+// captioned, fatal the moment the captions went.
 const char* GlyphIcon(int type) {
   switch (type) {
-    case kDelivery: return "glyph_form";
-    case kMatter: return "glyph_element";
-    default: return "glyph_modifier";
+    case kMatter: return "glyph_element";     // a droplet: the noun
+    case kEffect: return "glyph_spark";       // a four-point star: the verb
+    case kDelivery: return "glyph_form";      // an arrow: what it becomes
+    case kOpSort: return "glyph_bond";        // brackets round a bar
+    default: return "glyph_modifier";         // a spiral tick: mod, separator
   }
 }
 
@@ -82,13 +104,36 @@ void Ring(ImDrawList* dl, ImVec2 a, ImVec2 b, ImU32 col, int steps) {
   }
 }
 
-// Text struck through: an incomplete operator is CHARGED and does nothing, and
-// a number with a line through it says that in one glance.
-void StruckText(ImDrawList* dl, ImVec2 at, ImU32 col, const char* text) {
-  dl->AddText(FontSmall(), 13.0f, at, col, text);
-  const ImVec2 ts = ImGui::CalcTextSize(text);
-  const float y = std::floor(at.y + ts.y * 0.5f);
-  dl->AddRectFilled(ImVec2(at.x, y), ImVec2(at.x + ts.x, y + 2), col);
+// A 2 px stepped diagonal bar across a cell: an incomplete operator is CHARGED
+// and does nothing, and a slash through it says so without a word. Stepped
+// rather than a true diagonal, because an anti-aliased line beside 2x chrome is
+// the one thing that says "different program".
+void SlashOut(ImDrawList* dl, ImVec2 a, ImVec2 b, ImU32 col) {
+  const float w = b.x - a.x, h = b.y - a.y;
+  const int steps = (int)std::max(4.0f, std::floor(w / 4.0f));
+  for (int i = 0; i < steps; i++) {
+    const float x = std::floor(a.x + w * (float)i / (float)steps);
+    const float y = std::floor(b.y - h * (float)i / (float)steps);
+    dl->AddRectFilled(ImVec2(x, y - 4), ImVec2(x + 4, y), col);
+  }
+}
+
+// The multiplicity pip row: `n` as that many 4 px ticks along a node's top
+// edge, up to five, then a solid bar. "How many of this" without a numeral.
+void CountPips(ImDrawList* dl, ImVec2 a, ImVec2 b, int n, ImU32 col) {
+  if (n <= 1) return;
+  const float mid = std::floor((a.x + b.x) * 0.5f);
+  if (n <= 5) {
+    const float span = (float)n * 8.0f - 4.0f;
+    for (int i = 0; i < n; i++) {
+      const float x = std::floor(mid - span * 0.5f + (float)i * 8.0f);
+      dl->AddRectFilled(ImVec2(x, a.y - 6), ImVec2(x + 4, a.y - 2), col);
+    }
+    return;
+  }
+  dl->AddRectFilled(ImVec2(mid - 18, a.y - 6), ImVec2(mid + 18, a.y - 2), col);
+  dl->AddRectFilled(ImVec2(mid - 18, a.y - 10), ImVec2(mid - 14, a.y - 6), col);
+  dl->AddRectFilled(ImVec2(mid + 14, a.y - 10), ImVec2(mid + 18, a.y - 6), col);
 }
 
 }  // namespace
@@ -179,8 +224,7 @@ GraphCanvasResult SpellGraphCanvas(UIState& s, ImVec2 at, ImVec2 size, bool read
   ImGui::SetCursorScreenPos(at);
   ImGui::BeginChild("##spellcanvas", size, ImGuiChildFlags_None,
                     ImGuiWindowFlags_NoBackground |
-                        ImGuiWindowFlags_HorizontalScrollbar |
-                        ImGuiWindowFlags_AlwaysVerticalScrollbar);
+                        ImGuiWindowFlags_HorizontalScrollbar);
   ImDrawList* dl = ImGui::GetWindowDrawList();
   const ImVec2 viewMin = ImGui::GetWindowPos();
   const ImVec2 viewMax(viewMin.x + size.x, viewMin.y + size.y);
@@ -195,13 +239,34 @@ GraphCanvasResult SpellGraphCanvas(UIState& s, ImVec2 at, ImVec2 size, bool read
   }
 
   if (g.nodes.empty()) {
-    // Wrapped to the recess and clipped to it: the panel can be narrower than
-    // one line of this, and text running off the edge reads as a bug.
+    // CENTRED in the recess, wrapped to it and clipped to it: the empty state
+    // is the whole picture when there is nothing to draw, and a hint hard
+    // against the top-left corner of a big dark box reads as a stray label.
+    const char* hint = "an empty page - drag a word here";
+    ImGui::PushFont(FontSmall());
+    const ImVec2 ts = ImGui::CalcTextSize(hint);
+    ImGui::PopFont();
+    const ImVec2 c(std::floor((viewMin.x + viewMax.x) * 0.5f),
+                   std::floor((viewMin.y + viewMax.y) * 0.5f));
     dl->PushClipRect(viewMin, viewMax, true);
-    dl->AddText(FontSmall(), 13.0f, ImVec2(viewMin.x + 12, viewMin.y + 12),
-                Fade(ColParchDim(), 0.8f),
-                "an empty page: drag a word from the arsenal here",
-                nullptr, std::max(40.0f, size.x - 24.0f));
+    // A dotted frame the size of a cell, and the sentence under it: the shape
+    // of the thing that is missing, where it would go.
+    for (int i = 0; i < 8; i++) {
+      const float t = (float)i * 8.0f;
+      dl->AddRectFilled(ImVec2(c.x - 32 + t, c.y - 46), ImVec2(c.x - 28 + t, c.y - 44),
+                        Fade(ColBronze(), 0.8f));
+      dl->AddRectFilled(ImVec2(c.x - 32 + t, c.y + 14), ImVec2(c.x - 28 + t, c.y + 16),
+                        Fade(ColBronze(), 0.8f));
+      dl->AddRectFilled(ImVec2(c.x - 32, c.y - 46 + t), ImVec2(c.x - 30, c.y - 42 + t),
+                        Fade(ColBronze(), 0.8f));
+      dl->AddRectFilled(ImVec2(c.x + 30, c.y - 46 + t), ImVec2(c.x + 32, c.y - 42 + t),
+                        Fade(ColBronze(), 0.8f));
+    }
+    DrawSpriteCentered(dl, "glyph_ring", ImVec2(c.x, c.y - 15),
+                       Fade(ColBronze(), 0.9f));
+    dl->AddText(FontSmall(), 13.0f,
+                ImVec2(std::floor(c.x - ts.x * 0.5f), c.y + 26),
+                Fade(ColParchDim(), 0.8f), hint);
     dl->PopClipRect();
     ImGui::EndChild();
     return res;
@@ -210,21 +275,31 @@ GraphCanvasResult SpellGraphCanvas(UIState& s, ImVec2 at, ImVec2 size, bool read
   // INTEGER SCALE, 1x OR 0.5x. Nothing between, and never a fractional one:
   // 0.5 halves a 2x sprite back to its authored size, which is still exact.
   //
-  // THE LAYER PITCH IS THE UI'S TO CHOOSE, and it is not the layout's 96.
-  // `BuildGraph` spaces layers at `kGraphPitch` so a bar, its price line and
-  // the row above never collide at 1x; on screen the pitch only has to clear
-  // the TALLEST thing in a band, which is a 64 px cell (or a bar plus its
-  // 13 px price). Tightening it to that is what lets a two-box spell — leaves,
-  // bus, sockets, bar — stand in a composer band instead of scrolling. It is a
-  // spacing decision, not a rounding one: every pitch below is a whole even
-  // number of screen pixels, and no node's SIZE is touched.
-  // A band holds a 64 px cell plus a 13 px NAME under it, or a join's bar plus
-  // its 13 px price line. Even pixels only.
-  auto pitchFor = [](float sc) {
-    const float snug =
-        std::floor(((float)kCellPx * sc + kLabelH + 8.0f) * 0.5f) * 2.0f;
-    const float loose = std::floor((float)kPitchPx * sc * 0.42f) * 2.0f;
-    return std::max(snug, loose);
+  // THE LAYER PITCH IS THE UI'S TO CHOOSE, and it is not the layout's 96 — nor
+  // is it one number. `BuildGraph` spaces every layer at `kGraphPitch` because
+  // a uniform grid is the easy thing to lay out; on screen a layer only has to
+  // clear THE TALLEST THING IN IT, and the layers are not the same height at
+  // all. A cell is 64, a join's bar is 64, a socket row is 32 and a BUS is 16 —
+  // and a uniform pitch spends a 64 px band on a 16 px stroke, twice, in every
+  // spell that shares anything. Measured on `duststorm-mine`: six layers at a
+  // uniform 42 px (half scale) is 252 px and did not fit; the same six at their
+  // own heights is 198 and does.
+  //
+  // It is a spacing decision, not a rounding one: every height and every gap
+  // below is a whole even number of screen pixels, and no node's SIZE is
+  // touched. The bus ends up hugging the bar it feeds, which is also what it
+  // means.
+  std::vector<float> layerH((size_t)std::max(1, g.layers), 0.0f);
+  for (const UIState::SpellGraphUI::Node& n : g.nodes)
+    if (n.layer >= 0 && n.layer < g.layers)
+      layerH[(size_t)n.layer] = std::max(layerH[(size_t)n.layer], (float)n.h);
+  auto gapFor = [](float sc) {
+    return std::max(kBandAir, std::floor((float)kPitchPx * sc * 0.28f * 0.5f) * 2.0f);
+  };
+  auto heightFor = [&](float sc) {
+    float h = (float)(g.layers - 1) * gapFor(sc);
+    for (float lh : layerH) h += std::floor(lh * sc);
+    return h;
   };
   // FIT FIRST, THEN SCROLL. 1x if the whole drawing stands in the band, else
   // 0.5x, else 0.5x with the scrollbars the child already has. Never anything
@@ -232,55 +307,85 @@ GraphCanvasResult SpellGraphCanvas(UIState& s, ImVec2 at, ImVec2 size, bool read
   // one thing the pixel-art rule forbids. The margins subtracted here are the
   // drawing's own padding plus a scrollbar's width, so "it fits" means it fits
   // with nothing clipped rather than fits-until-a-bar-appears.
+  // The margin the drawing needs on every side: a mod tag hangs off a bar's
+  // LEFT end and the layout already counts it in `width`, but a node's hover
+  // glow, its count pips and an accept ring all bleed a few pixels past the
+  // box, and a figure touching its frame reads as a figure that has been cut.
+  constexpr float kMargin = 10.0f;
   const float sbar = ImGui::GetStyle().ScrollbarSize;
-  const float avail = size.x - 16.0f - sbar, availY = size.y - 8.0f - sbar;
+  const float avail = size.x - kMargin * 2 - sbar;
+  const float availY = size.y - kMargin * 2;
   float scale = 1.0f;
-  if ((float)g.width * 1.0f > avail || (float)g.layers * pitchFor(1.0f) > availY)
-    scale = 0.5f;
-  const float pitch = pitchFor(scale);
+  if ((float)g.width > avail || heightFor(1.0f) > availY) scale = 0.5f;
+  const float gap = gapFor(scale);
   const float gw = std::floor((float)g.width * scale);
-  const float gh = (float)g.layers * pitch;
+  const float gh = heightFor(scale);
+  // Where each layer's TOP sits inside the drawing, walking down from the
+  // topmost layer (the highest index; the root is layer 0 at the bottom).
+  std::vector<float> layerTop((size_t)std::max(1, g.layers), 0.0f);
+  {
+    float t = 0.0f;
+    for (int L = g.layers - 1; L >= 0; L--) {
+      layerTop[(size_t)L] = t;
+      t += std::floor(layerH[(size_t)L] * scale) + gap;
+    }
+  }
 
-  // A Dummy of the drawing's size gives the child its scroll range for free.
+  // CENTRED WHEN IT FITS, SCROLLED WHEN IT DOES NOT. The pad is the slack the
+  // drawing does not use, halved — so a two-cell spell stands in the middle of
+  // the band and a tree wider than the band still starts at the margin. The
+  // Dummy that follows is sized to pad + drawing + pad, which is what gives the
+  // child a scroll range that can actually reach the far edge.
+  const bool fits = gw + kMargin * 2 <= size.x - sbar && gh + kMargin * 2 <= size.y;
+  const float padX = std::max(kMargin, std::floor((size.x - sbar - gw) * 0.5f));
+  const float padY = std::max(kMargin, std::floor((size.y - gh) * 0.5f));
   const ImVec2 base = ImGui::GetCursorScreenPos();
-  ImGui::Dummy(ImVec2(gw + 16.0f, gh + 4.0f));
-  // FRAME THE DEEPEST JOIN, once, when the drawing changes shape.
-  //
-  // A tree that does not fit opened hard against its top-left corner, which put
-  // the hand off the side and the innermost delivery — the bar carrying the
-  // sockets, the bus and the price, which is what you are actually editing —
-  // off the bottom. So the view is centred horizontally and scrolled to put
-  // that bar's price line at the foot of the band, with its leaves above it.
-  // Set ONCE rather than every frame, or the wheel would fight it.
+  ImGui::Dummy(ImVec2(gw + padX * 2, gh + padY * 2));
+  // WHEN IT FITS, THE VIEW IS PINNED. The pad above already centres the
+  // drawing, so any scroll at all is a drawing pushed off its own frame — and a
+  // scroll offset SURVIVES the composer changing height under it, which is how
+  // a tree that fits ended up with its top row cut off by the band's top edge.
+  if (fits) {
+    ImGui::SetScrollX(0.0f);
+    ImGui::SetScrollY(0.0f);
+  }
+  // FRAME THE DEEPEST JOIN, once, when the drawing changes shape — and ONLY
+  // when it does not fit. A tree too tall for the band used to open hard
+  // against its top-left corner, which put the hand off the bottom and the
+  // innermost delivery — the bar carrying the sockets and the bus, which is
+  // what you are actually editing — out of sight. Set ONCE rather than every
+  // frame, or the wheel would fight it.
   {
     static int lastW = -1, lastH = -1;
-    if (g.width != lastW || g.height != lastH) {
+    if (!fits && (g.width != lastW || g.height != lastH)) {
       lastW = g.width;
       lastH = g.height;
-      int deep = -1, deepLayer = -1;
-      for (const UIState::SpellGraphUI::Node& n : g.nodes)
-        if (n.kind == kJoin && n.layer > deepLayer) {
-          deepLayer = n.layer;
-          deep = (int)(&n - g.nodes.data());
-        }
       float wantY = 0.0f;
-      if (deep >= 0) {
-        const UIState::SpellGraphUI::Node& dn = g.nodes[(size_t)deep];
-        wantY = ((float)(g.layers - 1 - dn.layer) * pitch + (float)dn.h * scale +
-                 20.0f) - (size.y - 4.0f);
+      {
+        int deep = -1, deepLayer = -1;
+        for (size_t di = 0; di < g.nodes.size(); di++)
+          if (g.nodes[di].kind == kJoin && g.nodes[di].layer > deepLayer) {
+            deepLayer = g.nodes[di].layer;
+            deep = (int)di;
+          }
+        if (deep >= 0) {
+          const UIState::SpellGraphUI::Node& dn = g.nodes[(size_t)deep];
+          wantY = (padY + layerTop[(size_t)dn.layer] + (float)dn.h * scale +
+                   kMargin) - size.y;
+        }
       }
-      ImGui::SetScrollX(std::max(0.0f, std::floor((gw + 16.0f - size.x) * 0.5f)));
+      ImGui::SetScrollX(std::max(0.0f, std::floor((gw + padX * 2 - size.x) * 0.5f)));
       ImGui::SetScrollY(std::max(0.0f, std::floor(wantY)));
     }
   }
-  const ImVec2 org(std::floor(base.x + 8.0f), std::floor(base.y + 2.0f));
+  const ImVec2 org(std::floor(base.x + padX), std::floor(base.y + padY));
   // X is the layout's, scaled. Y is the node's LAYER at the screen pitch, plus
   // an offset INSIDE the node (which is scaled): a node's own geometry is the
   // layout's, its band is the canvas's.
   auto X = [&](int gx) { return std::floor(org.x + (float)gx * scale); };
   auto Y = [&](const UIState::SpellGraphUI::Node& n, int off) {
-    return std::floor(org.y + (float)(g.layers - 1 - n.layer) * pitch +
-                      (float)off * scale);
+    const size_t L = (size_t)std::clamp(n.layer, 0, g.layers - 1);
+    return std::floor(org.y + layerTop[L] + (float)off * scale);
   };
   auto NodeMin = [&](const UIState::SpellGraphUI::Node& n) {
     return ImVec2(X(n.x), Y(n, 0));
@@ -593,8 +698,11 @@ GraphCanvasResult SpellGraphCanvas(UIState& s, ImVec2 at, ImVec2 size, bool read
       case kRoot:
       case kJoin: {
         const bool root = n.kind == kRoot;
-        // The bar: a lit slab with a gold underline, the delivery's noun in
-        // caps across it (the same caps the HUD brackets use).
+        // The bar: a lit slab with a gold underline and the delivery's own
+        // SYMBOL struck through the middle of it — the arrow for a form, the
+        // ring for the hand. It used to carry the noun in tracked caps
+        // ("PROJECTILE") and a price line under it; a bar is 128 px at its
+        // narrowest and neither ever fit.
         PanelStyle st;
         st.darkMix = root ? 0.42f : 0.62f;
         st.shadow = 0.0f;
@@ -603,72 +711,76 @@ GraphCanvasResult SpellGraphCanvas(UIState& s, ImVec2 at, ImVec2 size, bool read
         dl->AddRectFilled(ImVec2(a.x, b.y - 2), ImVec2(b.x, b.y),
                           Fade(root ? ColGoldPale() : ColGold(), 0.9f));
         dl->AddRect(a, b, Fade(ColBronze(), 0.9f), 0.0f, 0, 2.0f);
-        std::string caps = n.label;
-        for (char& c : caps) c = (char)toupper((unsigned char)c);
-        if (n.n > 1) caps += " x" + std::to_string(n.n);
-        const float tw = TrackedTextWidth(caps.c_str(), 2.0f);
-        TrackedText(dl, ImVec2(std::floor(a.x + ((b.x - a.x) - tw) * 0.5f),
-                               std::floor(a.y + ((b.y - a.y) - 13.0f) * 0.5f)),
-                    root ? ColGoldPale() : ColParch(), caps.c_str(), 2.0f);
-        // Under the bar: the price, at THIS level. `LowerBox` priced every box
-        // on the way out and `BoxPrice` carried it here, which is the whole of
-        // "the cost is legible at every level".
-        char line[160];
-        float ly = b.y + 4;
-        if (root) {
-          std::snprintf(line, sizeof line, "word %d   tariff %d   carry %d%s",
-                        g.wordCost, g.tariff, g.carryCost,
-                        g.priceUnknown ? " + ?" : "");
-          dl->AddText(FontSmall(), 13.0f, ImVec2(a.x, ly), ColParch(), line);
-          ly += 15;
-          // What it takes out of the pool, as the bar the HUD draws.
-          const float frac = s.manaMax > 0
-                                 ? std::min(1.0f, (float)g.manaCost / (float)s.manaMax)
-                                 : 0.0f;
-          const float bw = std::min(b.x - a.x, 160.0f);
-          ValueBar(dl, ImVec2(a.x, ly), ImVec2(a.x + bw, ly + 10), frac, ColMana(),
-                   true);
-          std::snprintf(line, sizeof line, " %d / %d mana", g.manaCost, s.manaMax);
-          dl->AddText(FontSmall(), 13.0f, ImVec2(a.x + bw + 4, ly - 2),
-                      g.manaCost > s.mana ? ColEmber() : ColParchDim(), line);
-        } else if (n.hasPrice) {
-          std::snprintf(line, sizeof line, "tariff %d + carry %d  x%d = %d",
-                        n.tariff, n.carryCost, n.priceInstances, n.subtotal);
-          // CENTRED UNDER ITS BAR, because it belongs to that bar and a
-          // left-aligned number under a narrow join reads as the neighbour's.
-          const ImVec2 ts = ImGui::CalcTextSize(line);
-          const float px = std::floor((a.x + b.x - ts.x) * 0.5f);
-          // On its own dark plate: the price hangs into the band below the bar,
-          // where a parent's bus stroke runs, and a number on a gold line is a
-          // number nobody reads.
-          dl->AddRectFilled(ImVec2(px - 4, ly - 1), ImVec2(px + ts.x + 4, ly + 14),
-                            Fade(ColInk(), 0.82f));
-          dl->AddText(FontSmall(), 13.0f, ImVec2(px, ly), Fade(ColParch(), 0.95f), line);
-          ly += 15;
-          if (n.instancesClamped) {
-            std::snprintf(line, sizeof line, "fan cut to %d", n.priceInstances);
-            const ImVec2 cs = ImGui::CalcTextSize(line);
-            dl->AddText(FontSmall(), 13.0f,
-                        ImVec2(std::floor((a.x + b.x - cs.x) * 0.5f), ly),
-                        ColBloodHi(), line);
-          }
-        }
+        const ImVec2 mid(std::floor((a.x + b.x) * 0.5f),
+                         std::floor((a.y + b.y) * 0.5f));
+        // The mark is inlaid rather than stamped: a dark rebate behind it, the
+        // engraving in its sort's colour, so a bar reads as metal with a sigil
+        // cut into it and not as a label pasted on.
+        const float mr = std::floor(16.0f * (scale < 1.0f ? 0.75f : 1.0f));
+        dl->AddRectFilled(ImVec2(mid.x - mr, mid.y - mr), ImVec2(mid.x + mr, mid.y + mr),
+                          Fade(ColInk(), 0.55f));
+        // The delivery's OWN colour when its JSON entry gives it one, so a
+        // projectile and a beam are not the same arrow in the same blue; the
+        // sort's blue otherwise.
+        const ImU32 markCol =
+            root ? ColGoldPale()
+                 : n.color ? IM_COL32(n.color & 0xFF, (n.color >> 8) & 0xFF,
+                                      (n.color >> 16) & 0xFF, 255)
+                           : SortColour(kDelivery);
+        DrawSpriteCentered(dl, root ? "glyph_ring" : GlyphIcon(kDelivery),
+                           ImVec2(mid.x + 1, mid.y + 1), Fade(ColInk(), 0.8f));
+        DrawSpriteCentered(dl, root ? "glyph_ring" : GlyphIcon(kDelivery), mid,
+                           markCol);
+        // Two gold rules running out of the mark to the bar's ends: the bar is
+        // a SPAN, and the eye needs to see how far this delivery reaches.
+        dl->AddRectFilled(ImVec2(a.x + 6, mid.y - 1), ImVec2(mid.x - mr - 4, mid.y + 1),
+                          Fade(markCol, 0.45f));
+        dl->AddRectFilled(ImVec2(mid.x + mr + 4, mid.y - 1), ImVec2(b.x - 6, mid.y + 1),
+                          Fade(markCol, 0.45f));
+        // How MANY of it, as pips along the top edge rather than as "x3".
+        CountPips(dl, a, b, n.n, Fade(ColGoldHi(), 0.9f));
+        // A fan the grammar had to cut is the one thing on a bar that is not
+        // reversible by looking harder, so it keeps a mark of its own: a blood
+        // notch at the bar's right end. What it was cut TO is in the tip.
+        if (!root && n.instancesClamped)
+          dl->AddRectFilled(ImVec2(b.x - 8, a.y + 4), ImVec2(b.x - 4, b.y - 4),
+                            ColBloodHi());
         ImGui::SetCursorScreenPos(a);
         ImGui::InvisibleButton("##bar", ImVec2(std::max(8.0f, b.x - a.x),
                                                std::max(8.0f, b.y - a.y)));
         const bool hov = ImGui::IsItemHovered();
+        if (hov) Glow(dl, a, b, ColGoldHi(), 8.0f, 0.5f);
         if (hov && !live) {
+          std::string caps = n.label;
+          for (char& c : caps) c = (char)toupper((unsigned char)c);
           BeginTip();
           ImGui::PushStyleColor(ImGuiCol_Text,
                                 ImGui::ColorConvertU32ToFloat4(ColGoldHi()));
-          ImGui::TextUnformatted(caps.c_str());
+          if (n.n > 1) ImGui::Text("%s  x%d", caps.c_str(), n.n);
+          else ImGui::TextUnformatted(caps.c_str());
           ImGui::PopStyleColor();
-          if (root)
+          if (root) {
             ImGui::TextDisabled("the hand: what you are holding when you cast");
-          else
+            ImGui::TextDisabled("word %d  .  tariff %d  .  carry %d%s", g.wordCost,
+                                g.tariff, g.carryCost, g.priceUnknown ? " + ?" : "");
+            ImGui::TextDisabled("%d / %d mana", g.manaCost, s.manaMax);
+          } else {
             ImGui::TextDisabled("a delivery: %d instance%s, %d lane%s",
                                 n.instances, n.instances == 1 ? "" : "s",
                                 n.laneCount, n.laneCount == 1 ? "" : "s");
+            // THE PRICE AT THIS LEVEL, which is the whole of "the cost is
+            // legible at every level" — said here, where it has a line of its
+            // own, instead of under a 128 px bar where it never had one.
+            if (n.hasPrice)
+              ImGui::TextDisabled("tariff %d + carry %d  x%d = %d", n.tariff,
+                                  n.carryCost, n.priceInstances, n.subtotal);
+            if (n.instancesClamped) {
+              ImGui::PushStyleColor(ImGuiCol_Text,
+                                    ImGui::ColorConvertU32ToFloat4(ColBloodHi()));
+              ImGui::Text("the fan was cut to %d", n.priceInstances);
+              ImGui::PopStyleColor();
+            }
+          }
           ImGui::TextDisabled("drop a word to share it, a mod to edit the record,");
           ImGui::TextDisabled("a delivery to nest this whole box inside it");
           if (!root) ImGui::TextDisabled("right-click drops this delivery (unbox)");
@@ -694,19 +806,26 @@ GraphCanvasResult SpellGraphCanvas(UIState& s, ImVec2 at, ImVec2 size, bool read
         break;
       }
       case kModTag: {
+        // A TAB, not a caption. The layout gives a tag 96x32 and the edit it
+        // carries ("speed x2", "count x9") never fit in it — so the tag is the
+        // mod's spiral in its own colour on a small plate, and what it edits is
+        // in the tip. A WASTED mod (the record has no such field) is drawn as
+        // an empty socket with a slash: charged, and it does nothing.
         const ImU32 col = n.wasted ? ColBronze() : SortColour(kMod);
         dl->AddRectFilled(a, b, Fade(ColDeep(), 0.92f));
         dl->AddRectFilled(a, ImVec2(a.x + 2, b.y), Fade(col, 0.9f));
         dl->AddRect(a, b, Fade(ColBronze(), 0.8f), 0.0f, 0, 2.0f);
-        const std::string txt = n.edit.empty() ? n.label : n.edit;
-        dl->PushClipRect(a, b, true);
-        dl->AddText(FontSmall(), 13.0f, ImVec2(a.x + 6, a.y + 4),
-                    n.wasted ? Fade(ColParchDim(), 0.55f) : ColParch(), txt.c_str());
-        dl->PopClipRect();
+        const ImVec2 tm(std::floor((a.x + b.x) * 0.5f), std::floor((a.y + b.y) * 0.5f));
+        DrawSpriteCentered(dl, GlyphIcon(kMod), ImVec2(tm.x + 1, tm.y + 1),
+                           Fade(ColInk(), 0.7f));
+        DrawSpriteCentered(dl, GlyphIcon(kMod), tm,
+                           n.wasted ? Fade(ColParchDim(), 0.5f) : col);
+        if (n.wasted) SlashOut(dl, a, b, Fade(ColBloodHi(), 0.85f));
         ImGui::SetCursorScreenPos(a);
         ImGui::InvisibleButton("##tag", ImVec2(std::max(8.0f, b.x - a.x),
                                                std::max(8.0f, b.y - a.y)));
         const bool hov = ImGui::IsItemHovered();
+        if (hov) Glow(dl, a, b, ColGoldHi(), 6.0f, 0.45f);
         if (hov && !live) {
           BeginTip();
           ImGui::PushStyleColor(ImGuiCol_Text,
@@ -741,40 +860,24 @@ GraphCanvasResult SpellGraphCanvas(UIState& s, ImVec2 at, ImVec2 size, bool read
         // The sort's colour on the RIM, 2 px, all the way round: on the canvas
         // a cell has no neighbours to read a left-edge tag against.
         dl->AddRect(a, b, Fade(SortColour(n.sort), 0.9f), 0.0f, 0, 2.0f);
-        if (n.n > 1) {
-          char badge[16];
-          std::snprintf(badge, sizeof badge, "x%d", n.n);
-          CountBadge(dl, b, badge);
-        }
-        if (dimNode) dl->AddRectFilled(a, b, Fade(ColInk(), 0.45f));
-        // The word cost, struck through when the operator is charged and does
-        // nothing.
-        if (dimNode && n.wordCostOf > 0) {
-          char c[16];
-          std::snprintf(c, sizeof c, "%d", n.wordCostOf);
-          StruckText(dl, ImVec2(a.x + 3, a.y + 2), ColBloodHi(), c);
-        }
-        // THE WORD'S NAME, under the cell, in the 13 px small font at every
-        // scale — the band reserves a line for it (`kLabelH`). A cell is an
-        // engraving and a sort colour, and neither of those is which WORD; at
-        // 0.5x the engraving is 32 px and the tree read as a row of diamonds.
-        // `label` already carries the multiplicity, so it says `gustx2`.
-        if (!n.label.empty()) {
-          const ImVec2 ls = ImGui::CalcTextSize(n.label.c_str());
-          const float lx = std::floor((a.x + b.x - ls.x) * 0.5f);
-          dl->PushClipRect(ImVec2(a.x - 10, b.y), ImVec2(b.x + 10, b.y + kLabelH + 2),
-                           true);
-          dl->AddText(FontSmall(), 13.0f, ImVec2(lx + 1, b.y + 2),
-                      Fade(ColInk(), 0.8f), n.label.c_str());
-          dl->AddText(FontSmall(), 13.0f, ImVec2(lx, b.y + 1),
-                      dimNode ? Fade(ColParchDim(), 0.6f) : ColParch(),
-                      n.label.c_str());
-          dl->PopClipRect();
+        // HOW MANY, as pips over the cell instead of an "x3" badge: the badge
+        // was 13 px type in the corner of a cell that is 32 px at half scale.
+        CountPips(dl, a, b, n.n, Fade(SortColour(n.sort), 0.95f));
+        if (dimNode) {
+          // An operator with an empty required slot is CHARGED and does
+          // nothing. Dimmed and slashed — no number, because the number it used
+          // to print (the word cost, struck through) was 13 px of type in the
+          // corner of a cell and nobody read it. It is in the tip.
+          dl->AddRectFilled(a, b, Fade(ColInk(), 0.45f));
+          SlashOut(dl, a, b, Fade(ColBloodHi(), 0.9f));
         }
         ImGui::SetCursorScreenPos(a);
         ImGui::InvisibleButton("##cell", ImVec2(std::max(8.0f, cw),
                                                 std::max(8.0f, b.y - a.y)));
         const bool hov = ImGui::IsItemHovered();
+        // THE NAME IS THE HOVER. A cell carries no caption, so the ring under
+        // the cursor has to be unmistakable: a full glow, not a rim tint.
+        if (hov) Glow(dl, a, b, ColGoldHi(), 8.0f, 0.6f);
         if (hov && !live) {
           if (gu) GlyphInfoBox(*gu, SortLabel(n.sort));
           else Tip("a word that no longer exists");
@@ -818,11 +921,11 @@ GraphCanvasResult SpellGraphCanvas(UIState& s, ImVec2 at, ImVec2 size, bool read
             } else {
               dl->AddRectFilled(pa, pb, Fade(ColInk(), 0.85f));
               dl->AddRect(pa, pb, Fade(ColGoldHi(), 0.95f), 0.0f, 0, 2.0f);
-              const ImVec2 ts = ImGui::CalcTextSize("_");
-              dl->AddText(FontSmall(), 13.0f,
-                          ImVec2(std::floor((pa.x + pb.x - ts.x) * 0.5f),
-                                 std::floor(pa.y + ph * 0.5f - 9)),
-                          ColGoldHi(), "_");
+              // The empty slot's mark: a gold underscore drawn as a RECT, not
+              // as the character "_" — a 13 px glyph in a pip that is 10 px
+              // across at half scale is a smudge.
+              dl->AddRectFilled(ImVec2(pa.x + 4, pb.y - 7), ImVec2(pb.x - 4, pb.y - 5),
+                                ColGoldHi());
               ImGui::PushID(side);
               ImGui::SetCursorScreenPos(pa);
               ImGui::InvisibleButton("##pip", ImVec2(ph, ph));

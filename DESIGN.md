@@ -6408,8 +6408,10 @@ in the HUD** rather than dropped silently.
 words, one hand, no menu. Sprint is on Shift outside magic mode and magic mode
 captures the number row, so nothing collides. A slot holds a glyph OR a
 grimoire page (`SlotKind`), both by NAME; the HUD strip draws two rows and
-lights the bank Shift is holding. The character screen's ARSENAL is a full
-column of its own (`ui/inventory_ui.cpp`): the twenty bound keys on top, then
+lights the bank Shift is holding. The character screen's ARSENAL is the lower
+half of the SPELLBOOK panel (`ui/inventory_ui.cpp`; since 2026-09-21 the
+grimoire and the arsenal are ONE window — see below): the twenty bound keys on
+the left, and beside them
 EVERY WORD as a table with one band of rows per sort — matter, effect,
 operator, delivery, mod — the sort's name in a gutter on the left, each glyph
 with its sort's colour and its valence mark (`<` takes the word before it,
@@ -6437,10 +6439,16 @@ the reason shown (`GrimoireWouldCycle`), and an expansion is capped by the
 unbounded expansion, ever). A word that no longer resolves drops with a log
 line and shows as `?`; the page is kept (the DESIGN §8b contract). Two ways to
 make one: `=` in magic mode CAPTURES the stack to a page auto-named from its
-readout (`fire2-trail-projectile`), and the character screen's GRIMOIRE panel
-COMPOSES — its own panel above the pack, in a third column beside the arsenal
-(when the window is too narrow for three columns it falls back to a toggle on
-the arsenal, over the pack). A page list on the left (the authored starters
+readout (`fire2-trail-projectile`), and the character screen's SPELLBOOK panel
+COMPOSES — the upper half of one window that the arsenal shares, as wide as the
+two columns those used to be (2026-09-21). There is no narrow/wide fork and no
+arsenal/grimoire toggle any more: the toggle existed because the two were
+separate panels and a short window could not hold both, which is exactly the
+problem merging them solves. The book's height is split by serving the PAGE
+first — the words get `min(what the table wants, 45% of the body, whatever the
+page does not need)`, quantised to whole rows of cells so a band is never
+sliced through the middle, and the header's `words` button folds the table away
+entirely and leaves the bindings. A page list on the left (the authored starters
 from `glyphs.json`'s `conjoined` block appear read-only; `heal` = `blood
 mend`, `firebolt` = `fire trail projectile`, `ward` = `transmute null aura
 self`), and for the selected page a name, a word row you drag glyphs and pages
@@ -6570,20 +6578,39 @@ authoring happens on the page, which is a surface with room for it.
 copy of the `duststorm` starter with `shotgun` on it and a lane holding `fire`
 added through the intent path.
 
-**The screen makes room for it.** The PACK is now as tall as what is in it —
-the row holding the last filled slot plus one empty row to drop into, keyed on
-the highest filled INDEX rather than on a count (nothing compacts the bag, so a
-boot at slot 30 would otherwise vanish), and nothing in it at all is the in-hand
-strip alone. Everything that frees goes to the grimoire above it, down to a
-floor below which the page stops being an interface and the pack gives way
-entirely. The composer's own band went the same way: the word row is a compact
-strip sized to the sentence rather than a grid of all 32 cells, and the READOUT
-moved out of the composer to span the whole body under both columns — at the
-composer's width `DescribeSpell`'s verdict wrapped to six lines and ate the
-canvas, at the body's width it is three. It wraps and is never clipped; the
-price and the word count take its last line at the right. Every word cell on
-the canvas carries its NAME under it in the 13 px font at both scales, because
-an engraving and a sort colour say which SORT a node is and not which word.
+**The screen makes room for it.** The PACK is as tall as what is in it — the
+row holding the last filled slot plus one empty row to drop into, keyed on the
+highest filled INDEX rather than on a count (nothing compacts the bag, so a boot
+at slot 30 would otherwise vanish), and nothing in it at all is the in-hand
+strip alone — and its grid and that strip stand SIDE BY SIDE under the book,
+which is 86 px the composer wants far more than the pack does. Everything that
+frees goes to the page. The composer's own band went the same way: save / copy /
+delete moved up beside the NAME (they are pressed once, at the end, and they had
+a row of their own as far from the name they act on as the panel allows); the
+word row is a compact strip sized to the sentence rather than a grid of all 32
+cells, with the PRICE laid out from the composer's right edge on the same band;
+and the READOUT is prose alone, spanning the whole body under both columns — at
+the composer's width `DescribeSpell`'s verdict wrapped to six lines and ate the
+canvas, at the body's width it is one or two. It wraps and is never clipped.
+
+**THE CANVAS CARRIES NO WORDS** (2026-09-21). A node is the sort's engraving
+over the glyph's own colour and nothing else: one silhouette per sort (droplet /
+spark / arrow / bracketed bar / spiral, and a ring for the hand), the
+multiplicity as PIPS over the node rather than an "x3" badge, an incomplete
+operator dimmed and SLASHED rather than captioned with a struck-through number,
+and a wasted mod slashed the same way. The name, the price at that level, the
+instance and lane counts and a cut fan are all in the hover box that already
+existed. It used to spell every leaf under its cell, write the delivery's noun
+in tracked caps across every bar and hang `tariff 441 + carry 882 x3 = 1323`
+under it — three kinds of type at three sizes inside a band 300 px wide, all of
+which collided, clipped, and crossed the strokes. The drawing is the SHAPE of
+the spell; the numbers are on the price band under it where nothing can clip
+them, and the names belong to whatever is under the cursor. The drawing is also
+CENTRED in its band and pinned there whenever it fits, and each LAYER is as tall
+as the tallest node in it rather than a uniform pitch — a bus is 16 px and a
+uniform grid spent a 64 px band on it twice in every spell that shares anything
+(`duststorm-mine`: six layers, 252 px uniform and clipped, 198 px per-layer and
+whole).
 
 Selftest gates `spells` (the trail's voxel budget respected exactly and the
 projectile dead with it; an overcast resolving Fatal, emitting its own payload
@@ -12935,8 +12962,9 @@ within reach of the head. It is the one ray that reads the camera: a UI query
 against Jolt bodies, not a sim input, so the "picking rays use `player.EyePos`
 so the camera cannot change what the sim sees" contract does not apply to it.
 E over a corpse opens the
-character screen with a LOOT panel where the grimoire sits (wide) or the
-arsenal (narrow), one `KitSlotUI` per piece through the same mirror, and
+character screen with a LOOT panel in the SPELLBOOK's place (looting is a
+moment; the words are not going anywhere, and a fourth column would not fit on
+most screens), one `KitSlotUI` per piece through the same mirror, and
 `KitSpace::Loot` is one more address the same drag can name. `TakeCorpseLoot`
 executes it beside `PlayerKit::Move` rather than inside it — a corpse is not
 one of the player's containers and has no `ItemStack` to swap — with Move's

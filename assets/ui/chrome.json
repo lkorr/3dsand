@@ -1,6 +1,12 @@
 {
  "height": 128,
  "sprites": {
+  "glyph_bond": {
+   "h": 16,
+   "w": 16,
+   "x": 18,
+   "y": 66
+  },
   "glyph_element": {
    "h": 16,
    "w": 16,
@@ -19,22 +25,34 @@
    "x": 103,
    "y": 49
   },
-  "icon_bag": {
+  "glyph_ring": {
    "h": 16,
    "w": 16,
    "x": 35,
    "y": 66
   },
-  "item_melee": {
+  "glyph_spark": {
    "h": 16,
    "w": 16,
    "x": 1,
    "y": 66
   },
+  "icon_bag": {
+   "h": 16,
+   "w": 16,
+   "x": 86,
+   "y": 66
+  },
+  "item_melee": {
+   "h": 16,
+   "w": 16,
+   "x": 52,
+   "y": 66
+  },
   "item_unknown": {
    "h": 16,
    "w": 16,
-   "x": 18,
+   "x": 69,
    "y": 66
   },
   "panel": {

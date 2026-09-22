@@ -851,7 +851,12 @@ struct UIState {
   // The page being composed: UI-owned until Save. main.cpp fills the readout
   // and price for the row every frame through the same DescribeSpell the live
   // sentence uses, so the panel can never disagree with the game.
-  bool grimoireMode = false;                // the arsenal panel: glyphs vs grimoire
+  bool grimoireMode = false;                // vestigial: the old arsenal/grimoire toggle
+  // THE SPELLBOOK'S LOWER HALF. The grimoire and the arsenal are one panel
+  // (2026-09-21); this folds the EVERY WORD table away and leaves the bound
+  // keys, which is the trade a short screen wants — the table is a reference
+  // surface, the tree above it is the thing being built. Open by default.
+  bool spellWordsOpen = true;
   std::string grimoireSelected;             // page name, "" = none
   std::string grimoireEditName;
   std::vector<std::string> grimoireEditWords;

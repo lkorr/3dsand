@@ -57,9 +57,6 @@ const char* SortLabel(int sort);
 // and the canvas all open the same one.
 void GlyphInfoBox(const UIState::GlyphUI& g, const char* sortName);
 
-// The canvas band's height in the composer.
-constexpr float kSpellCanvasH = 236.0f;
-
 // What the canvas wants said on the composer's status line this frame, and
 // whether it is a refusal (drawn in blood rather than gold). `note` points into
 // static storage or into `s`; it is read and dropped in the same frame.
