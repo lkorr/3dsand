@@ -195,9 +195,14 @@ GraphCanvasResult SpellGraphCanvas(UIState& s, ImVec2 at, ImVec2 size, bool read
   }
 
   if (g.nodes.empty()) {
+    // Wrapped to the recess and clipped to it: the panel can be narrower than
+    // one line of this, and text running off the edge reads as a bug.
+    dl->PushClipRect(viewMin, viewMax, true);
     dl->AddText(FontSmall(), 13.0f, ImVec2(viewMin.x + 12, viewMin.y + 12),
                 Fade(ColParchDim(), 0.8f),
-                "an empty page - drag a word onto the hand bar below");
+                "an empty page: drag a word from the arsenal here",
+                nullptr, std::max(40.0f, size.x - 24.0f));
+    dl->PopClipRect();
     ImGui::EndChild();
     return res;
   }

@@ -11854,9 +11854,13 @@ int main(int argc, char** argv) {
         // the readout above is produced from, so the drawing and the sentence
         // under it can never be of two different spells.
         //
-        // Only while the page is actually open: it is a parse and a lowering
-        // per frame, and nothing looks at it otherwise.
-        if (ui.inventoryOpen && ui.grimoireMode) {
+        // Only while the character screen is open: it is a parse and a
+        // lowering per frame, and nothing looks at it otherwise. NOT gated on
+        // `grimoireMode` — that flag is the NARROW layout's arsenal/grimoire
+        // toggle; the wide three-column layout draws the grimoire always with
+        // the flag false, and gating on it left the canvas empty in the game
+        // while `--shot-inventory` (which sets the flag by hand) showed a tree.
+        if (ui.inventoryOpen) {
           ui.spellGraph = UIState::SpellGraphUI{};
           const GrimoireExpansion ex =
               ExpandWords(glyphs, caster.grimoire, ui.grimoireEditWords, kSpellStackMax);
