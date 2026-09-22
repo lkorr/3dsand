@@ -3028,14 +3028,10 @@ int RunMobShot(GpuContext& ctx, World& world, Simulation& sim, Physics& phys,
       // this harness exists to answer without a live session.
       uint32_t wearDye = 0;
       if (size_t hash = itemName.find('#'); hash != std::string::npos) {
-        const unsigned long v =
-            std::strtoul(itemName.c_str() + hash + 1, nullptr, 16);
         // Authored the way a human writes a colour (#RRGGBB) and packed the
-        // way the GPU reads one (r in the low byte) — the swap is here rather
-        // than in dye.h because this is the only place a dye is ever typed.
-        wearDye = DyePack((float)((v >> 16) & 0xFFu) / 255.0f,
-                          (float)((v >> 8) & 0xFFu) / 255.0f,
-                          (float)(v & 0xFFu) / 255.0f);
+        // way the GPU reads one (r in the low byte). The swap lives in
+        // dye.h (DyeParseHex) now that a mob's loot table types colours too.
+        wearDye = DyeParseHex(itemName.substr(hash));
         itemName = itemName.substr(0, hash);
       }
       const int ii = items.Find(itemName);
@@ -6330,6 +6326,53 @@ int main(int argc, char** argv) {
   // the hotbar is WHAT IS IN YOUR HAND and predates all of this; the melee
   // path reads Inventory::Selected() and must keep doing exactly that.
   PlayerKit& kit = session.kit;
+  // ---- WHAT THE PLAYER IS CARRYING WHEN THEY DIE INFECTED -----------------
+  //
+  // The avatar is not excluded from turning (Mob::Die's rising test reads the
+  // def's `turn` block, and every character inherits one from human.json), so
+  // a player who dies with the rot in them stands up six seconds later as a
+  // zombie of themselves. It rises in the gear it fell in because `worn_` is
+  // on the body — but the BAG AND HOTBAR ARE NOT ON THE BODY, they are here,
+  // and MobSystem cannot see a session (game/session.h). This is the seam.
+  //
+  // COPY OR MOVE, and that is the whole of `avatar.keepKitOnTurn`:
+  //
+  //   true  (default) — the zombie rises with a COPY and you respawn with
+  //                     everything. Two swords exist where one did. That is a
+  //                     duplication machine and it is deliberately the default
+  //                     while the feature is being played with, because losing
+  //                     your kit to a test bite is worse than duplicating it.
+  //   false           — bag, hotbar and equipment are EMPTIED on the way out.
+  //                     Your kit walks away wearing your face; go and take it
+  //                     back off the thing. No duplication, and the death
+  //                     penalty this was always going to become.
+  //
+  // Equipment is cleared but NOT copied: the worn pieces are already on the
+  // rig and Die() captured them through the ordinary `worn_` walk, so copying
+  // them here would hand the zombie a second breastplate. Clearing it is what
+  // stops the wear loop re-dressing the respawned body from the slot.
+  mobs.SetAvatarKitFn([&kit, &hotbar, &items](std::vector<CarriedItem>& out) {
+    const bool keep = CurrentTuning().avatar.keepKitOnTurn;
+    auto take = [&](ItemStack& s) {
+      if (s.Empty()) return;
+      // BY NAME on the way out (item.h's index hazard): what this hands back
+      // travels through a rising, a save record and a handoff packet, and a
+      // library index survives none of those.
+      const ItemDef* d = items.At(s.def);
+      out.push_back(CarriedItem{d ? d->name : std::string(), s.count, s.dye});
+      if (!keep) s = ItemStack{};
+    };
+    for (ItemStack& s : kit.bag.slots) take(s);
+    for (ItemStack& s : hotbar.slots) take(s);
+    if (!keep)
+      for (int e = 0; e < kEquipSlotCount; e++) kit.equip.slots[e] = ItemStack{};
+    // A name the library no longer knows resolves to "" and would be dropped
+    // silently by the far side; drop it here instead, where the slot it came
+    // from can still be reported if that ever needs saying.
+    out.erase(std::remove_if(out.begin(), out.end(),
+                             [](const CarriedItem& c) { return c.item.empty(); }),
+              out.end());
+  });
   // What we last ASKED the body to wear, per equip slot. Not a second copy of
   // the equipment — it is the record that keeps a REFUSED piece (a helm on a
   // creature with no head) from being retried thirty times a second. Cleared
@@ -11506,9 +11549,36 @@ int main(int argc, char** argv) {
           // stays on the floor as a thing you can pick up (ShedCorpseLoot).
           CorpseReport* c = ui.lootOpen ? corpses.Find(lootCorpse) : nullptr;
           std::string name;
-          if (c && ShedCorpseLoot(*c, ui.dropItem.from.index, debris, ground,
-                                  &name))
+          const int gi = ui.dropItem.from.index;
+          const bool carried =
+              c && gi >= 0 && gi < (int)c->gear.size() && c->gear[gi].body == 0;
+          if (carried) {
+            // A CARRIED STACK HAS NO BODY TO SHED, so this one is a DROP, not
+            // a hand-over: ShedCorpseLoot registers a body that is already
+            // lying in the heap, and a pack item never was one. Same spawn the
+            // bag's own drop uses, from the corpse rather than from the eye —
+            // it should land on the body it came off, not in front of you.
+            CorpseReport::Piece& pc = c->gear[gi];
+            const ItemDef* idef = items.At(items.Find(pc.item));
+            Vec3 at = player.EyePos() + cam.Forward() * 2.0f;
+            if (!c->bodies.empty()) {
+              Vec3 com{};
+              if (phys.BodyCenterOfMass(c->bodies[0], com)) at = com + Vec3{0, 2, 0};
+            }
+            if (idef && DropItemToWorld(*idef, at, Vec3{}, phys, debris, &mbSet,
+                                        ground, nullptr, pc.dye)) {
+              name = pc.item;
+              // ONE of the stack, the rule the bag's drop states one block
+              // down: dropping a count you did not mean to is the mis-click
+              // swap-never-overwrite exists to prevent.
+              if (--pc.count <= 0) c->gear.erase(c->gear.begin() + gi);
+              say("left the " + name + " on the ground");
+            } else {
+              say("there is nowhere to put that");
+            }
+          } else if (c && ShedCorpseLoot(*c, gi, debris, ground, &name)) {
             say("left the " + name + " on the ground");
+          }
         }
       }
       if (ui.moveItem.pending) {
@@ -11916,8 +11986,13 @@ int main(int argc, char** argv) {
             ui.lootTitle = c->def;
             for (const CorpseReport::Piece& pc : c->gear) {
               const int di = items.Find(pc.item);
-              UIState::KitSlotUI u =
-                  mirror(ItemStack{di, di >= 0 ? 1 : 0, pc.dye});
+              // The COUNT comes off the piece now that a corpse can hold a
+              // carried stack as well as a worn garment (CorpseReport::Piece).
+              // Worn and held pieces are always 1 — a rig slot is one garment —
+              // so this reads exactly as the hard-coded 1 did for them, and a
+              // pack item gets its badge (ui::CountBadge, inventory_ui.cpp).
+              const int cnt = di >= 0 ? (pc.count > 0 ? pc.count : 1) : 0;
+              UIState::KitSlotUI u = mirror(ItemStack{di, cnt, pc.dye});
               if (u.name.empty()) u.name = pc.item;   // gone from the library
               if (u.wearable) {
                 u.condition = pc.damage.Condition();

@@ -125,7 +125,8 @@
     "firstPersonForward": 0.255,
     "footTrim": 0,
     "severImpulse": 6,
-    "respawnDelay": 3
+    "respawnDelay": 3,
+    "keepKitOnTurn": true
   },
   "audio": {
     "enabled": true,

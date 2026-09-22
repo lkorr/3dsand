@@ -14,6 +14,7 @@
 
 #include "game/item.h"
 #include "game/anatomy_resolve.h"
+#include "game/dye.h"
 #include "game/rigrender.h"
 #include "game/sidecar.h"
 #include "phys/bodystain.h"
@@ -722,6 +723,68 @@ bool BuildMobDef(const MobDefFactory& fac, const MobSource& src, const json& j,
       def.turn.into = t.value("into", std::string());
       def.turn.afterSec = std::max(0.0f, t.value("afterSec", 0.0f));
       def.turn.infectedLimbs = std::max(1, t.value("infectedLimbs", 1));
+    }
+  }
+  // ---- WHAT IT CARRIES (MobDef::LootEntry) --------------------------------
+  //
+  // Content, validated here and never again: Spawn rolls this table thousands
+  // of times and a malformed row should cost one line in the load log, not one
+  // line per villager. A row that survives this loop is a row Spawn can use
+  // without a single check.
+  //
+  // `item` is NOT resolved against the ItemLibrary here — mob defs and items
+  // load independently and items hot-reload on R, so a name is checked at the
+  // moment it is wanted (Mob::RollLoot logs an unknown item once per spawn,
+  // which is the only place that can tell the difference between "typo" and
+  // "the item table has not been read yet").
+  if (j.contains("loot")) {
+    const json& lt = j["loot"];
+    if (!lt.is_array()) {
+      log += jp + ": `loot` is not an array — ignored\n";
+    } else {
+      for (const json& e : lt) {
+        if (!e.is_object() || !e.contains("item") || !e["item"].is_string()) {
+          log += jp + ": loot: every entry needs a string `item` — row skipped\n";
+          continue;
+        }
+        MobDef::LootEntry le;
+        le.item = e["item"].get<std::string>();
+        // A number means "exactly this many"; a [min, max] pair means a draw.
+        // The same shape `rot.bites` uses, for the same reason: a row that
+        // wants a fixed count should not have to write it twice.
+        if (e.contains("count")) {
+          const json& c = e["count"];
+          if (c.is_number_integer()) {
+            le.countMin = le.countMax = c.get<int>();
+          } else if (c.is_array() && c.size() == 2 && c[0].is_number() &&
+                     c[1].is_number()) {
+            le.countMin = c[0].get<int>();
+            le.countMax = c[1].get<int>();
+          } else {
+            log += jp + ": loot[" + le.item +
+                   "].count: expected an integer or [min, max]\n";
+          }
+        }
+        le.countMin = std::max(0, le.countMin);
+        le.countMax = std::max(le.countMin, le.countMax);
+        le.chance = std::clamp(e.value("chance", 1.0f), 0.0f, 1.0f);
+        // Authored the way every other dyed thing in the data is (game/dye.h),
+        // so a villager's tunic can be a colour rather than the art's own.
+        if (e.contains("dye")) {
+          if (e["dye"].is_string())
+            le.dye = DyeParseHex(e["dye"].get<std::string>());
+          else if (e["dye"].is_number_unsigned())
+            le.dye = e["dye"].get<uint32_t>();
+          else
+            log += jp + ": loot[" + le.item + "].dye: expected \"#rgb\"\n";
+        }
+        // A row that can never produce anything is a row somebody meant to
+        // write differently. Said once, at load, with the name in it.
+        if (le.countMax == 0 || le.chance == 0.0f)
+          log += jp + ": loot[" + le.item + "] can never drop (count 0 or "
+                 "chance 0)\n";
+        def.loot.push_back(std::move(le));
+      }
     }
   }
   // ---- BORN BITTEN (MobRotDef) -------------------------------------------
@@ -2382,6 +2445,15 @@ void MobSystem::ServiceRisings(uint32_t tick) {
                                     g.dye);
           if (ok) dressed++;
         }
+        // ---- AND WITH THE PACK IT FELL WITH --------------------------------
+        //
+        // Through AddCarried rather than a straight assignment, so the merge
+        // and the cap are the ones every other pack obeys: a player who died
+        // holding three part-stacks of the same arrow rises with one, and a
+        // rising can never be the thing that puts a body over kMaxCarried.
+        size_t packed = 0;
+        for (const CarriedItem& c : r.carried)
+          if (now.AddCarried(c.item, c.count, c.dye)) packed++;
         // ---- IT RISES FROM WHERE IT FELL, NOT FROM STANDING ----------------
         //
         // Teleport each of the zombie's limbs to the debris body's last
@@ -2407,9 +2479,11 @@ void MobSystem::ServiceRisings(uint32_t tick) {
           now.BeginGetUp(*world_);
         }
         std::printf("mob: '%s' got up as '%s' (%zu/%zu limbs as they were over "
-                    "%zu repainted art slots, %zu/%zu pieces of kit)\n",
+                    "%zu repainted art slots, %zu/%zu pieces of kit, "
+                    "%zu/%zu stacks in the pack)\n",
                     r.def.c_str(), defs_[at].name.c_str(), restored,
-                    r.limbs.size(), repainted, dressed, r.gear.size());
+                    r.limbs.size(), repainted, dressed, r.gear.size(), packed,
+                    r.carried.size());
       }
     }
     rises_[i] = std::move(rises_.back());
@@ -2630,6 +2704,80 @@ void Mob::MarkInstancesDirty() {
 // voxels) but deliberately NOT into speeds, cones or lifetimes: "this one is a
 // gusher" should mean more blood, not blood that also flies faster and lives
 // longer, which reads as a different material rather than a worse wound.
+// ---- THE PACK ---------------------------------------------------------------
+//
+// Three list operations and a roll. Nothing here touches the rig, physics or
+// the grid — a carried stack is a line of text on a creature, which is exactly
+// why a loot table can be pure data while a suit of armour cannot (MobDef::
+// LootEntry, and the note on Mob::Carried()).
+
+bool Mob::AddCarried(const std::string& item, int count, uint32_t dye) {
+  if (item.empty() || count <= 0) return false;
+  // Merge by item AND DYE, the rule the bag and the hotbar already follow
+  // (item.h ItemStack::dye): a stack is one colour, so a red tunic must not
+  // fold into a stack of blue ones and quietly repaint them.
+  for (CarriedItem& c : carried_)
+    if (c.item == item && c.dye == dye) {
+      c.count += count;
+      return true;
+    }
+  if (carried_.size() >= kMaxCarried) return false;
+  carried_.push_back(CarriedItem{item, count, dye});
+  return true;
+}
+
+int Mob::TakeCarried(int index, int count) {
+  if (index < 0 || index >= (int)carried_.size()) return 0;
+  CarriedItem& c = carried_[(size_t)index];
+  const int take = count < 0 ? c.count : std::min(count, c.count);
+  if (take <= 0) return 0;
+  c.count -= take;
+  if (c.count <= 0) carried_.erase(carried_.begin() + index);
+  return take;
+}
+
+// ONE CREATURE'S PURSE, DRAWN FROM ITS IDENTITY.
+//
+// Keyed on the mob id and the row index alone — no tick, no counter, no
+// ordering. That is what makes it a pure function of WHICH creature this is:
+// the same villager rolls the same pack on a replay, on the other machine, and
+// after a save that predates the loot table being authored at all. (CLAUDE.md
+// rule 1's discipline applied off the CA: this never reaches the grid, so it
+// is not hashed, but a purse that depended on spawn ORDER would still be a
+// desync between two players looking at the same corpse.)
+//
+// Two draws per row, on separate indices, so that the roll for "does it have
+// one" and the roll for "how many" do not move together — a table where every
+// lucky drop is also a big drop reads as a design rather than as luck.
+void Mob::RollLoot() {
+  if (def_ == nullptr || def_->loot.empty()) return;
+  const uint32_t seed = (uint32_t)(id_ ^ (id_ >> 32));
+  for (size_t i = 0; i < def_->loot.size(); i++) {
+    const MobDef::LootEntry& e = def_->loot[i];
+    if (e.chance < 1.0f &&
+        rng::Unit01(rng::Hash3(seed ^ 0x100Eu, 0u, (uint32_t)i)) >= e.chance)
+      continue;
+    int n = e.countMin;
+    if (e.countMax > e.countMin) {
+      const uint32_t span = (uint32_t)(e.countMax - e.countMin + 1);
+      n += (int)(rng::Hash3(seed ^ 0x200Eu, 1u, (uint32_t)i) % span);
+    }
+    if (n <= 0) continue;
+    // THE ITEM IS RESOLVED HERE AND NOWHERE ELSE AT SPAWN. A name the library
+    // does not know is content that was renamed or deleted, and the creature
+    // gets up without it rather than carrying a stack nothing can draw, name
+    // or loot. Said once per spawn because that is the only moment anything
+    // knows both the table row and the live library.
+    const ItemLibrary* lib = sys_ != nullptr ? sys_->Items() : nullptr;
+    if (lib != nullptr && lib->Find(e.item) < 0) {
+      std::printf("mob: '%s' loot names unknown item '%s' — skipped\n",
+                  def_->name.c_str(), e.item.c_str());
+      continue;
+    }
+    AddCarried(e.item, n, e.dye);
+  }
+}
+
 GoreProfile Mob::MakeGoreProfile(uint64_t mobId) {
   const auto& g = CurrentTuning().gore;
   const uint32_t seed = (uint32_t)(mobId ^ (mobId >> 32));
@@ -2797,6 +2945,10 @@ uint64_t MobSystem::Spawn(int defIndex, IVec3 atVoxel) {
   // one case it could not is a rot bite severing a limb before the overlay
   // runs, reshaping the list the overlay is about to index.
   if (world_ != nullptr && !loading_) mobs_.back().RotAtSpawn(*world_);
+  // ...and its pack, on the same terms and for the same reason (Mob::RollLoot).
+  // A load carries the purse the player already saw in the record; rolling a
+  // fresh one here would be a way to refill a corpse by saving next to it.
+  if (!loading_) mobs_.back().RollLoot();
   instancesDirty_ = true;
   return mobs_.back().id_;
 }
@@ -15774,6 +15926,20 @@ void Mob::Die() {
       piece.body = limbs_[heldSlot_].body;
       corpse.gear.push_back(std::move(piece));
     }
+    // ---- AND WHAT WAS IN ITS PACK (Mob::carried_) --------------------------
+    //
+    // Onto the same list, with no body (CorpseReport::Piece::body: 0 means it
+    // was carried, not worn). Last, so the worn and held entries keep the slot
+    // indices the loot panel has always given them and a pack item is simply
+    // further down the grid — the order somebody looting a body expects, and
+    // the order "take all" empties in.
+    for (const CarriedItem& c : carried_) {
+      CorpseReport::Piece piece;
+      piece.item = c.item;
+      piece.count = c.count;
+      piece.dye = c.dye;
+      corpse.gear.push_back(std::move(piece));
+    }
   }
   // ---- A GARMENT IS A FOLLOWER ON A CORPSE TOO ------------------------------
   //
@@ -15905,6 +16071,31 @@ void Mob::Die() {
       g.item = heldItem_;
       g.held = true;
       rise.gear.push_back(std::move(g));
+    }
+    // ---- AND ITS PACK ------------------------------------------------------
+    //
+    // Same argument as the kit one block up, one step simpler: no body, no
+    // damage, no dye read off a shell — the stacks travel as they are. Without
+    // this, turning would be a way to delete a purse, since the remains the
+    // pack would otherwise be looted off are destroyed by the rising.
+    rise.carried = carried_;
+    // ---- ...AND, FOR THE AVATAR, THE PLAYER'S OWN KIT ---------------------
+    //
+    // The player's bag and hotbar are not on the player's body — they are in
+    // PlayerKit on the session, which this class cannot reach and must not
+    // (game/session.h: per-player state is not a process global, and there may
+    // be two sessions). So the owner of the kit answers the question, at the
+    // one moment the answer is wanted.
+    //
+    // The callback also decides whether the player KEEPS what it hands back:
+    // `player.keepKitOnTurn` copies (your gear and a zombie wearing a second
+    // copy of it, which is the dev-mode reading) or MOVES (your gear walks
+    // away on your own corpse). See MobSystem::SetAvatarKitFn.
+    if (sys_ != nullptr && sys_->IsAvatar(this) && sys_->avatarKitFn_) {
+      std::vector<CarriedItem> kit;
+      sys_->avatarKitFn_(kit);
+      for (CarriedItem& c : kit)
+        if (!c.item.empty() && c.count > 0) rise.carried.push_back(std::move(c));
     }
   }
   // whole-body ragdoll: every limb goes dynamic and becomes debris; joints
@@ -16815,6 +17006,23 @@ void Mob::SaveOne(ByteWriter& w) const {
     w.PodVec(L.voxels);
     w.PodVec(L.skinVoxels);
   }
+  // ---- AND THE PACK (kSaveVersion 3) ---------------------------------------
+  //
+  // The first gear this format has ever carried. Worn and held pieces still
+  // are NOT saved here — they are rig slots, and a rig slot is rebuilt by
+  // whoever re-dresses the body — but a carried stack has no rig slot to
+  // rebuild from and nobody outside to re-issue it, so losing it on a save
+  // would make sleeping a way to empty every villager's purse.
+  //
+  // By NAME, not by library index (item.h's index hazard): the item table is
+  // file order and an R reload reorders it, so an index written today means a
+  // different item tomorrow.
+  w.U32((uint32_t)carried_.size());
+  for (const CarriedItem& c : carried_) {
+    w.Str(c.item);
+    w.U32((uint32_t)std::max(0, c.count));
+    w.U32(c.dye);
+  }
 }
 
 void MobSystem::SaveState(std::vector<uint8_t>& out) const {
@@ -16876,6 +17084,7 @@ struct MobSystem::MobRecord {
     std::vector<PrefabVoxel> skinVoxels;
   };
   std::vector<LimbState> limbs;
+  std::vector<CarriedItem> carried;
 };
 
 bool MobSystem::ReadMobRecord(ByteReader& r, MobRecord& out) {
@@ -16900,6 +17109,27 @@ bool MobSystem::ReadMobRecord(ByteReader& r, MobRecord& out) {
     r.PodVec(s.voxels);
     r.PodVec(s.skinVoxels);
   }
+  // The pack, mirroring SaveOne's tail.
+  //
+  // EVERY ENTRY IS READ, and only the first kMaxCarried are KEPT. Stopping at
+  // the cap would leave the rest of this mob's bytes in the stream and every
+  // record after it would parse garbage — a truncation is a bound on what the
+  // creature gets, never a bound on how far the cursor moves. (The reader is
+  // bounds-checked and sticky, so a count that lies about the length still
+  // ends as `ok == false` rather than as a read off the end.)
+  uint32_t nCarried = 0;
+  r.U32(nCarried);
+  out.carried.clear();
+  for (uint32_t i = 0; i < nCarried && r.ok; i++) {
+    CarriedItem c;
+    uint32_t count = 0;
+    r.Str(c.item);
+    r.U32(count);
+    r.U32(c.dye);
+    c.count = (int)count;
+    if (out.carried.size() < Mob::kMaxCarried && !c.item.empty() && c.count > 0)
+      out.carried.push_back(std::move(c));
+  }
   return r.ok;
 }
 
@@ -16909,6 +17139,12 @@ void MobSystem::OverlayMobRecord(Mob& m, MobRecord& rec, bool placeLimbs) {
   m.heading_ = m.desiredHeading_ = rec.heading;
   m.bodyY_ = rec.bodyY;
   m.anim_.lastPos = rec.origin;
+  // THE PACK REPLACES, it does not merge. `rec` is the whole truth about this
+  // creature's carried stacks: on a load `loading_` already kept Spawn from
+  // rolling a fresh table over it (the saved purse is the one the player
+  // spent an hour not looting), and on a handoff the owner's list is
+  // authoritative over whatever the ghost happened to be holding.
+  m.carried_ = std::move(rec.carried);
   const uint32_t nApply =
       std::min<uint32_t>((uint32_t)rec.limbs.size(), (uint32_t)m.limbs_.size());
 

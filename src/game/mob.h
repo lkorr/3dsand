@@ -466,6 +466,35 @@ struct MobDef {
     float afterSec = 0.0f;    // how long the corpse lies there first
     int infectedLimbs = 1;    // how much of it has to be rotten to count
   } turn;
+  // ---- WHAT IT IS CARRYING (sidecar `loot`) --------------------------------
+  //
+  // A creature's PACK, as opposed to what it is wearing and what is in its
+  // fist. Worn and held gear is applied imperatively from outside (WearItem /
+  // EquipItem, because a piece of worn kit is a rig slot and a rig slot is not
+  // something a JSON file can append). This is the other half: things the body
+  // has on it that are not on its body, rolled once at Spawn and lootable off
+  // the corpse.
+  //
+  // ROLLED, not fixed, and rolled from the MOB ID (Mob::RollLoot) so that two
+  // runs of the same seed produce the same villager with the same purse. A
+  // load does NOT re-roll — the saved list is the truth, the same rule
+  // `loading_` already enforces for spawn-time rot.
+  //
+  // `count` is a number or a [min, max] pair; `chance` is 0..1 and defaults to
+  // certain. ITEMS BY NAME (item.h's index hazard). An entry naming an item
+  // the library does not have is dropped loudly at load, not at spawn: a
+  // content typo should be one line in the log, not one line per villager.
+  //
+  // An array REPLACES down an `extends` chain and `"loot": null` clears it
+  // (RFC 7396, game/sidecar.cpp MergePatch), so a character inherits the
+  // human's pack unless it says otherwise and an effect can empty it.
+  struct LootEntry {
+    std::string item;
+    int countMin = 1, countMax = 1;
+    float chance = 1.0f;
+    uint32_t dye = 0;         // game/dye.h packed colour, 0 = as authored
+  };
+  std::vector<LootEntry> loot;
   // ---- WHAT THIS CREATURE IS A COMPOSITION OF ------------------------------
   //
   // The two keys a def keeps from its own sidecar after the resolver has
@@ -1462,6 +1491,22 @@ struct ItemCover;
 // through the BrushOp/CellOp/ParticleSpawn streams like every other mutation,
 // and every RNG draw that reaches those streams is counter-based (id, tick,
 // index), never keyed on a Jolt float.
+// ---- ONE STACK IN A CREATURE'S PACK -----------------------------------------
+//
+// Deliberately NOT an ItemStack (game/item.h). An ItemStack holds a LIBRARY
+// INDEX, which is file order and dies on an R reload — fine for the player's
+// kit, which main.cpp re-validates on every reload, and wrong for something
+// that travels through a corpse report, a save file and a network packet. A
+// name resolves late, once, at the moment somebody actually wants the item.
+//
+// The same three fields the hotbar and the bag merge on, for the same reason:
+// a stack is one item in one colour (game/dye.h).
+struct CarriedItem {
+  std::string item;
+  int count = 1;
+  uint32_t dye = 0;
+};
+
 // ---- WHAT A CORPSE STILL HAS ON IT --------------------------------------------
 //
 // Die() hands every limb to DebrisSystem and the husk is swept out of mobs_ on
@@ -1492,10 +1537,26 @@ struct CorpseReport {
     std::string item;               // by NAME (item.h's index hazard)
     int equipSlot = -1;             // -1 for the held item
     bool held = false;
-    uint64_t body = 0;              // the body that IS the piece
+    // THE BODY THAT IS THE PIECE — or 0, WHICH MEANS IT WAS IN THE PACK.
+    //
+    // A worn or held piece is a real object lying in the heap: you loot it by
+    // taking its body OUT of the world. A carried stack (MobDef::loot) never
+    // had a body — it was a line in the creature's pack — so it is looted by
+    // deleting the entry and nothing else.
+    //
+    // One list rather than two because the LOOT PANEL ADDRESSES ENTRIES BY
+    // INDEX (KitRef{KitSpace::Loot, i}, ui/inventory_ui.cpp): a second vector
+    // would mean every consumer — the mirror, the take, the take-all loop, the
+    // drag-out — splitting one index space across two containers, which is
+    // four places to get an off-by-one wrong for no gain. The branch is
+    // `if (piece.body)`, and it appears exactly where a body is touched.
+    uint64_t body = 0;
     int identityCover = -1;         // that body's ItemCover index (worn only)
     std::vector<uint64_t> rags;     // the piece's other shells
     WornDamage damage;              // as it was at death
+    // How many. Always 1 for worn and held gear — a rig slot is one garment —
+    // and the rolled count for a carried stack.
+    int count = 1;
     // The COLOUR it was (game/dye.h), read off the identity shell. Travels for
     // the same reason `damage` does: what you loot off a body has to be the
     // thing that was on it. Without this a red tunic on a corpse loots into
@@ -1864,6 +1925,35 @@ class Mob {
   bool EquipItem(const ItemDef* item, const char* context = "held_right");
   const std::string& HeldItem() const { return heldItem_; }
   int HeldSlot() const { return heldSlot_; }
+
+  // ---- WHAT IT IS CARRYING (MobDef::loot) ---------------------------------
+  //
+  // The pack: stacks that are on the creature without being on its body. No
+  // rig slot, no shell, no brick, no physics — which is the whole difference
+  // between this and `worn_`, and the reason a loot table can be pure data
+  // while a suit of armour cannot (MobDef::LootEntry).
+  //
+  // Everything a body does with these is a list operation: Die() copies them
+  // into the corpse report, a rising carries them to the creature that gets
+  // up, and the save writes them. Nothing here is drawn or simulated.
+  const std::vector<CarriedItem>& Carried() const { return carried_; }
+  // Merges into an existing stack of the same item AND DYE, exactly as the
+  // bag and the hotbar do (item.h ItemStack::dye: a stack is one colour).
+  // Refused past kMaxCarried, like every other bounded per-mob list here.
+  bool AddCarried(const std::string& item, int count = 1, uint32_t dye = 0);
+  // Takes `count` off entry `index` (all of it by default), erasing the entry
+  // when it empties. Returns what actually came off — 0 for a bad index, so a
+  // stale mirror is reported rather than clamped (the rule corpses.h's
+  // LootResult::NoSuchPiece states).
+  int TakeCarried(int index, int count = -1);
+  void ClearCarried() { carried_.clear(); }
+  void SetCarried(std::vector<CarriedItem> v) { carried_ = std::move(v); }
+  // Roll this creature's def-authored loot table into `carried_`. Called once
+  // by MobSystem::Spawn and keyed on the mob id alone, so it is a pure
+  // function of identity: a replay, a reload-from-seed and the other machine
+  // all produce the same purse. NOT called on a load — the saved list is the
+  // truth there, the same rule `loading_` already enforces for spawn rot.
+  void RollLoot();
 
   // ---- WEARING an item (the same borrowed slot, N times) ------------------
   // A worn piece appends one rig slot per ItemCover entry — a SHELL: parented
@@ -3506,6 +3596,12 @@ class Mob {
   std::vector<WornPiece> worn_;
   std::vector<LostGear> lostGear_;
   static constexpr size_t kMaxLostGear = 16;
+  // The pack (MobDef::loot). Bounded like every other per-mob list: a loot
+  // table is content and content can be edited wrong, and a creature carrying
+  // ten thousand stacks would be ten thousand strings in every save record and
+  // every handoff packet.
+  std::vector<CarriedItem> carried_;
+  static constexpr size_t kMaxCarried = 32;
   // The gear half of DetachLimb: the held item or a worn piece's identity
   // shell leaving as debris. Runs BEFORE the lattice is handed over, because
   // CaptureWorn reads the shells, and returns the item name to register the
@@ -4054,6 +4150,30 @@ class MobSystem {
   void SetOnCorpse(std::function<void(const CorpseReport&)> cb) {
     onCorpse_ = std::move(cb);
   }
+  // ---- WHAT THE PLAYER IS CARRYING, ASKED AT THE MOMENT THEY DIE ----------
+  //
+  // The avatar's pack is not on the avatar. Bag, hotbar and equipment live in
+  // PlayerKit on PlayerSession (game/session.h's rule: per-player state is not
+  // a process global), and MobSystem cannot reach a session — deliberately,
+  // since there may be two of them. So the seam is the same shape as
+  // SetOnCorpse, pointing the other way: Die() ASKS, the session ANSWERS.
+  //
+  // Called only when the avatar's corpse is actually going to get up, and only
+  // on the machine that owns it. `out` receives the stacks to hand the risen
+  // body.
+  //
+  // THE CALLBACK DECIDES WHETHER THE PLAYER KEEPS THEM. With
+  // `avatar.keepKitOnTurn` (the default, and the dev-mode reading) it copies
+  // and the kit is untouched; with it off it MOVES — bag, hotbar and equipment
+  // are emptied on the way out, so what gets up is wearing your armour and you
+  // respawn with nothing. That flag is the whole of the difference between
+  // "your death spawns a second copy of your gear" and "your gear walks away",
+  // and it is a flag rather than a decision because the first one is what you
+  // want while testing and the second is what you want in a game.
+  void SetAvatarKitFn(std::function<void(std::vector<CarriedItem>&)> cb) {
+    avatarKitFn_ = std::move(cb);
+  }
+  bool HasAvatarKitFn() const { return (bool)avatarKitFn_; }
 
   // ---- the attack seam (Phase C consumes this) ----------------------------
   // Requests issued this tick. The AI decides WHEN and WHERE; it never swings,
@@ -4192,7 +4312,16 @@ class MobSystem {
   // went from a byte holding a palette slot to 16 bits holding a MATERIAL, and
   // both lattices are written as PODs — the stride moved, so a version-1
   // section cannot be read and is refused as it already is.
-  static constexpr uint32_t kSaveVersion = 2;
+  //
+  // 3 (2026-09-22): the pack. Every record gained a count-prefixed list of
+  // carried stacks (Mob::carried_, MobDef::loot) after its limbs, so this is
+  // the first inventory the mob format has ever held — until now a creature's
+  // gear was not saved at all and a reloaded villager was re-dressed from
+  // outside. Appended at the end of the record, but a version-2 reader cannot
+  // skip what it does not know is there, so the bump is real and the refusal
+  // stays a refusal. THE HANDOFF PACKET MOVES WITH IT (see below): both sides
+  // of a session must be the same build, which they already had to be.
+  static constexpr uint32_t kSaveVersion = 3;
   void SaveState(std::vector<uint8_t>& out) const;
   // Contract (worldio LoadEntities): Reset() has already run.
   bool LoadState(const uint8_t* data, size_t len, uint32_t version);
@@ -5175,6 +5304,19 @@ class MobSystem {
       WornDamage damage;
     };
     std::vector<RiseGear> gear;
+    // ---- AND WHAT IT HAD IN ITS PACK --------------------------------------
+    //
+    // The same argument as `gear`, one step simpler because there is no body
+    // and no damage to capture: the remains are destroyed by the rising, so a
+    // rising that dropped the pack would be a way to delete a purse by letting
+    // its owner turn. Straight onto the creature that gets up, which is then
+    // lootable for it in the ordinary way — a zombie carrying your dagger is a
+    // zombie you can take your dagger back off.
+    //
+    // FOR THE AVATAR this is where the player's bag and hotbar arrive
+    // (MobSystem::SetAvatarKitFn): Mob cannot reach PlayerSession, and the
+    // kit's owner answers the question at the moment of death.
+    std::vector<CarriedItem> carried;
   };
   // Bounded like every other emergent queue here (CLAUDE.md rule 2): a crowd
   // dying at once books a crowd of risings, and the cost of one is a spawn.
@@ -5215,6 +5357,7 @@ class MobSystem {
   const ItemLibrary* items_ = nullptr;
   std::function<void(uint64_t, const std::string&, uint32_t)> onItemShed_;
   std::function<void(const CorpseReport&)> onCorpse_;
+  std::function<void(std::vector<CarriedItem>&)> avatarKitFn_;
   std::vector<BlockEvent> blocks_;
   // The players' bodies, registered by the frame layer so the handle-keyed
   // lookups can find them. NOT owned and NOT in `mobs_` — see SetAvatars.

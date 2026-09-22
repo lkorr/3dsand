@@ -415,6 +415,13 @@ const char* const kOrder[] = {
     // creature at the end. Nothing before it moves (the append is an append),
     // which is the property that makes this safe to run in-suite at all.
     "zombify",
+    // The pack. Beside `zombify` because half its claim IS a rising, and on
+    // the same terms: it regenerates worldgen on the way in and resets mobs
+    // and debris on every exit. It EDITS `human`'s loot table and restores the
+    // pristine def list before it returns — the rule `crowd` states, and it
+    // matters more here because a def left carrying a fixture table would put
+    // two daggers on every villager every other NPC gate spawns.
+    "mob-loot",
     // Mob-vs-mob spacing. Next to `undead` and for the same reasons: it
     // regenerates worldgen on the way in, ticks no fire and pours no acid,
     // and resets mobs and debris on every exit. It also RESTORES the mob defs
