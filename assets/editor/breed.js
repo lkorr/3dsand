@@ -213,6 +213,13 @@ export function drawBody(canvas, b, opts = {}) {
     face[1][slot - 127] = sh(0.84);
     face[2][slot - 127] = sh(0.66);
   }
+  // Shade/light slots carry their base's colour for rendering — the face-based
+  // brightness (1.0 / 0.84 / 0.66) is the only depth cue the preview needs.
+  for (const [base, deps] of Object.entries(mg.COLOR_FAMILIES))
+    for (const d of deps) {
+      const si = mg.COLOR_SLOTS[d] - 127, bi = mg.COLOR_SLOTS[base] - 127;
+      for (let i = 0; i < 3; i++) face[i][si] = face[i][bi];
+    }
 
   // BACK TO FRONT, and the loop order IS the painter's order: high y is behind
   // (the face is at low y) and within a depth row a lower cell is behind a
