@@ -1087,9 +1087,30 @@ float BoundKeys(UIState& s, ImDrawList* dl, ImVec2 at, float width) {
 // have set "S10" in 27 px cells of 26 px type, and was the panel's worst
 // clipped text.
 void GrimoireBody(UIState& s, ImVec2 at, ImVec2 size) {
+  // ---- what the page MEANS, measured first and drawn last ----
+  //
+  // The readout box spans the WHOLE body, under both columns, because it is
+  // the one thing here that must never be clipped and it is prose: at the
+  // composer's width the bracket string plus DescribeSpell's verdict wrapped
+  // to six lines and ate the canvas above it, and at the body's width the same
+  // text is three. Measured here so both columns can be shortened by exactly
+  // what it will take.
+  const char* roText = s.grimoireEditWords.empty()
+                           ? "an empty page - drop words onto the tree above"
+                           : s.grimoireEditReadout.empty()
+                                 ? "(says nothing)"
+                                 : s.grimoireEditReadout.c_str();
+  const float roWrapW = size.x - 20;
+  ImGui::PushFont(ui::FontSmall());
+  const float roH =
+      std::max(13.0f, ImGui::CalcTextSize(roText, nullptr, false, roWrapW).y) +
+      13.0f + 12;
+  ImGui::PopFont();
+  const float bodyH = std::max(120.0f, size.y - roH - 6);
+
   // ---- the page list ----
   ImGui::SetCursorScreenPos(at);
-  ImGui::BeginChild("##pages", ImVec2(kListW, size.y), ImGuiChildFlags_None,
+  ImGui::BeginChild("##pages", ImVec2(kListW, bodyH), ImGuiChildFlags_None,
                     ImGuiWindowFlags_NoBackground);
   {
     ImDrawList* cd = ImGui::GetWindowDrawList();
@@ -1188,7 +1209,7 @@ void GrimoireBody(UIState& s, ImVec2 at, ImVec2 size) {
   const float compX = at.x + kListW + 12;
   const float compW = size.x - kListW - 12;
   ImGui::SetCursorScreenPos(ImVec2(compX, at.y));
-  ImGui::BeginChild("##compose", ImVec2(compW, size.y), ImGuiChildFlags_None,
+  ImGui::BeginChild("##compose", ImVec2(compW, bodyH), ImGuiChildFlags_None,
                     ImGuiWindowFlags_NoBackground);
   {
     ImDrawList* cd = ImGui::GetWindowDrawList();
@@ -1268,11 +1289,13 @@ void GrimoireBody(UIState& s, ImVec2 at, ImVec2 size) {
                                std::max(nWords + 2, std::min(perRow, 8)));
     const int rowLines = (cells + perRow - 1) / perRow;
     const float footerH = rowLines * kWCell + 6 +                   // the row
-                          3 * 13.0f + 12 + 6 +                      // the readout box
-                          ImGui::GetTextLineHeight() + 14 +         // buttons + status
-                          6;
+                          ImGui::GetTextLineHeight() + 14 +         // the buttons
+                          20;                                       // the status line
+    // THE CANVAS TAKES EVERYTHING ELSE. The readout came out of this budget
+    // when it moved to the body's full width below both columns; what is left
+    // is the tree's, which is the point of the page.
     const float canvasH =
-        std::max(160.0f, std::floor(size.y - (cy - base.y) - footerH));
+        std::max(160.0f, std::floor(bodyH - (cy - base.y) - footerH));
     const ui::GraphCanvasResult canvas =
         ui::SpellGraphCanvas(s, ImVec2(base.x, cy), ImVec2(innerW, canvasH), readOnly);
     cy += canvasH + 6;
@@ -1505,40 +1528,6 @@ void GrimoireBody(UIState& s, ImVec2 at, ImVec2 size) {
     }
     cy += rowLines * kWCell + 6;
 
-    // The readout and the price, in small type on a dark page: this is what
-    // the row MEANS, from main.cpp's DescribeSpell of it.
-    {
-      ImGui::PushFont(ui::FontSmall());
-      const char* ro = nWords == 0 ? "an empty page - drop words into the row above"
-                                   : s.grimoireEditReadout.empty() ? "(says nothing)"
-                                                                   : s.grimoireEditReadout.c_str();
-      const float wrapW = innerW - 20;
-      const ImVec2 ts = ImGui::CalcTextSize(ro, nullptr, false, wrapW);
-      // THE PRICE RIDES IN THE BOX, on its last line at the right end. It used
-      // to have a line of its own under it; the tree above wants that line more
-      // than the price does, and the price belongs to the sentence anyway.
-      char price[96];
-      std::snprintf(price, sizeof price, "price %d%s   %d / %d words", s.grimoireEditPrice,
-                    s.grimoireEditPriceUnknown ? " + ?" : "", nWords, s.grimoireMaxWords);
-      const ImVec2 ps = ImGui::CalcTextSize(price);
-      const float boxH = std::max(2 * 13.0f, ts.y) + 12;
-      const ImVec2 a(base.x, cy), b(base.x + innerW, cy + boxH);
-      cd->AddRectFilled(a, b, Fade(ui::ColInk(), 0.42f));
-      cd->AddRectFilled(a, ImVec2(a.x + 2, b.y), Fade(ui::ColGoldDim(), 0.7f));
-      cd->PushClipRect(a, ImVec2(b.x - ps.x - 12, b.y), true);
-      cd->AddText(ui::FontSmall(), 13.0f, ImVec2(a.x + 10, a.y + 6),
-                  nWords == 0 ? Fade(ui::ColParchDim(), 0.8f) : ui::ColParch(), ro, nullptr,
-                  wrapW);
-      cd->PopClipRect();
-      cd->AddText(ui::FontSmall(), 13.0f, ImVec2(b.x - ps.x - 6, b.y - 13 - 5),
-                  Fade(ui::ColParchDim(), 0.95f), price);
-      cy += boxH + 6;
-      // The row's gestures used to be spelled out here in two lines of small
-      // type. The canvas above is the authoring surface now and it needs that
-      // band more than the row does; the gestures live in each cell's tooltip,
-      // which is where you are when you want them.
-      ImGui::PopFont();
-    }
 
     // Save / Duplicate / Delete, in the screen's own button. A disabled one is
     // drawn and then dimmed: the row keeps its shape whichever page is open.
@@ -1579,12 +1568,14 @@ void GrimoireBody(UIState& s, ImVec2 at, ImVec2 size) {
       }
       if (ImGui::IsItemHovered())
         Tip("Tear the page out. Keys bound to it keep its name and speak nothing.");
-      // The status line shares the buttons' line, to the RIGHT of them: it is
-      // one short sentence and the band it used to own is the tree's now.
-      statusX = bx + 6;
-      statusW = std::max(80.0f, base.x + innerW - statusX);
-      statusY = cy + std::floor((ImGui::GetItemRectMax().y - ImGui::GetItemRectMin().y - 13.0f) * 0.5f);
+      // The status line gets its OWN line under the buttons. It shared theirs
+      // for one iteration and lost 40 px of every sentence off the right edge:
+      // three 80 px buttons leave a quarter of the composer's width, and
+      // "an authored page cannot be changed - copy it..." does not fit in it.
       cy += ImGui::GetTextLineHeight() + 8 + 6;
+      statusX = base.x + 2;
+      statusY = cy;
+      statusW = innerW - 4;
     }
 
     // The status line: what just happened, else what to do next.
@@ -1632,6 +1623,34 @@ void GrimoireBody(UIState& s, ImVec2 at, ImVec2 size) {
     ImGui::Dummy(ImVec2(innerW, cy - base.y));
   }
   ImGui::EndChild();
+
+  // ---- WHAT THE PAGE MEANS, across the foot of the panel ----
+  //
+  // The bracket string the parser built, then DescribeSpell's verdict on its
+  // own line — the sentence that says what the spell DOES, which the brackets
+  // deliberately do not. Wrapped, never clipped; the price and the word count
+  // get the box's last line to themselves at the right, so prose and numbers
+  // never compete for the same pixels. Drawn on the PANEL's list rather than a
+  // child's, because it is the width of both columns.
+  {
+    ImDrawList* dl = ImGui::GetWindowDrawList();
+    ImGui::PushFont(ui::FontSmall());
+    char price[96];
+    std::snprintf(price, sizeof price, "price %d%s   %d / %d words",
+                  s.grimoireEditPrice, s.grimoireEditPriceUnknown ? " + ?" : "",
+                  (int)s.grimoireEditWords.size(), s.grimoireMaxWords);
+    const ImVec2 ps = ImGui::CalcTextSize(price);
+    const ImVec2 a(at.x, at.y + bodyH + 6), b(at.x + size.x, a.y + roH);
+    dl->AddRectFilled(a, b, Fade(ui::ColInk(), 0.42f));
+    dl->AddRectFilled(a, ImVec2(a.x + 2, b.y), Fade(ui::ColGoldDim(), 0.7f));
+    dl->AddText(ui::FontSmall(), 13.0f, ImVec2(a.x + 10, a.y + 6),
+                s.grimoireEditWords.empty() ? Fade(ui::ColParchDim(), 0.8f)
+                                            : ui::ColParch(),
+                roText, nullptr, roWrapW);
+    dl->AddText(ui::FontSmall(), 13.0f, ImVec2(b.x - ps.x - 8, b.y - 13 - 5),
+                Fade(ui::ColParchDim(), 0.95f), price);
+    ImGui::PopFont();
+  }
 }
 
 // ---- THE LOOT PANEL (game/corpses.h) ----------------------------------------
@@ -2470,8 +2489,35 @@ void DrawInventoryScreen(UIState& s) {
   // The pack is exactly as tall as its grid and its hotbar; whatever column
   // it shares gives it that and keeps the rest.
   const float lineH = ImGui::GetTextLineHeight();
-  const float packH = kFrame + ui::kHeaderH + 14 + s.bagRows * (kSlot + kSlotGap) + 10 +
-                      (lineH + 6) + 2 + kSlot + 12 + kFrame;
+  // THE PACK IS AS TALL AS WHAT IS IN IT, and no taller. It used to claim all
+  // `bagRows` whether or not anything was in them, which on a 900 px screen
+  // spent half the middle column on three rows of empty slots — and the column
+  // above it is the GRIMOIRE, which since the spell page landed is the screen's
+  // authoring surface and wants every pixel it can get (PLAN_spell_graph §0b:
+  // the page is THE interface).
+  //
+  // Rows shown = the row holding the LAST filled slot, plus one empty row to
+  // drop into. Keyed on the highest filled INDEX rather than on a count,
+  // because nothing compacts the bag: one boot at slot 30 would otherwise
+  // vanish. Nothing in the bag at all = no grid, just the in-hand strip.
+  int packRows = 0;
+  for (int i = (int)s.bagSlots.size() - 1; i >= 0; i--)
+    if (!s.bagSlots[i].name.empty()) {
+      packRows = std::min(s.bagRows, i / std::max(1, s.bagCols) + 2);
+      break;
+    }
+  auto packHeightFor = [&](int rows) {
+    return kFrame + ui::kHeaderH + 14 + rows * (kSlot + kSlotGap) +
+           (rows > 0 ? 10.0f : 0.0f) + (lineH + 6) + 2 + kSlot + 12 + kFrame;
+  };
+  // The composer needs a name field, a canvas worth looking at, the row and the
+  // footer. Below this the page stops being an interface, so the PACK gives way
+  // — down to the in-hand strip alone if the window is genuinely short.
+  constexpr float kGrimMin = 520.0f;
+  while (packRows > 0 &&
+         (bottom - top) - packHeightFor(packRows) - kColGap < kGrimMin)
+    packRows--;
+  const float packH = packHeightFor(packRows);
   // COLUMN ORDER, left to right: character | grimoire over pack | arsenal.
   //
   // The PACK is next to the body that wears what is in it, which is the drag
@@ -2843,7 +2889,11 @@ void DrawInventoryScreen(UIState& s) {
     // hugging the left edge of a ten-cell panel read as a mistake.
     const float bagInner = s.bagCols * kSlot + (s.bagCols - 1) * kSlotGap;
     const float ox = std::max(0.0f, std::floor((ws.x - kPad * 2 - bagInner) * 0.25f) * 2.0f);
-    for (int r = 0; r < s.bagRows; r++)
+    // Only the rows the geometry above decided on (filled + one to drop into).
+    // A row that is not drawn is not a lost slot: it appears the moment the one
+    // before it takes something, and the bag can only be filled through the
+    // spare row.
+    for (int r = 0; r < packRows; r++)
       for (int c = 0; c < s.bagCols; c++) {
         const int idx = r * s.bagCols + c;
         const float gx = wp.x + kPad + ox + c * (kSlot + kSlotGap);
@@ -2854,7 +2904,7 @@ void DrawInventoryScreen(UIState& s) {
         ItemSlot(s, id, ImVec2(gx, gy), SlotOr(s.bagSlots, idx),
                  KitRef{KitSpace::Bag, idx}, nullptr, true, nullptr, false);
       }
-    y += s.bagRows * (kSlot + kSlotGap) + 10;
+    if (packRows > 0) y += packRows * (kSlot + kSlotGap) + 10;
 
     y = ui::Subheading(dl, ImVec2(wp.x + kPad, y), ws.x - kPad * 2,
                        "IN HAND  1-0");

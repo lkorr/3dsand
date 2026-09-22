@@ -44,6 +44,11 @@ const char* kSortLabels[6] = {"matter", "effect",   "delivery",
 // `kGraphCell` / `kGraphPitch` ever move, these move with them.
 constexpr int kCellPx = 64;
 constexpr int kPitchPx = 96;
+// The 13 px small font's line, which every band reserves under a cell for the
+// word's NAME. At 0.5x a cell is 32 px of engraving and the colour of a sort;
+// which sort is not which WORD, and the name is the difference between reading
+// the tree and guessing at it.
+constexpr float kLabelH = 13.0f;
 
 const char* GlyphIcon(int type) {
   switch (type) {
@@ -174,7 +179,8 @@ GraphCanvasResult SpellGraphCanvas(UIState& s, ImVec2 at, ImVec2 size, bool read
   ImGui::SetCursorScreenPos(at);
   ImGui::BeginChild("##spellcanvas", size, ImGuiChildFlags_None,
                     ImGuiWindowFlags_NoBackground |
-                        ImGuiWindowFlags_HorizontalScrollbar);
+                        ImGuiWindowFlags_HorizontalScrollbar |
+                        ImGuiWindowFlags_AlwaysVerticalScrollbar);
   ImDrawList* dl = ImGui::GetWindowDrawList();
   const ImVec2 viewMin = ImGui::GetWindowPos();
   const ImVec2 viewMax(viewMin.x + size.x, viewMin.y + size.y);
@@ -207,17 +213,25 @@ GraphCanvasResult SpellGraphCanvas(UIState& s, ImVec2 at, ImVec2 size, bool read
   // bus, sockets, bar — stand in a composer band instead of scrolling. It is a
   // spacing decision, not a rounding one: every pitch below is a whole even
   // number of screen pixels, and no node's SIZE is touched.
-  const float avail = size.x - 24.0f, availY = size.y - 14.0f;
+  // A band holds a 64 px cell plus a 13 px NAME under it, or a join's bar plus
+  // its 13 px price line. Even pixels only.
   auto pitchFor = [](float sc) {
-    // The tallest thing in a band is a 64 px cell; a join's bar is shorter but
-    // hangs a 13 px price line under itself, which lands in the 8 px of slack
-    // plus the thin bus band below. Even pixels only.
-    const float snug = std::floor(((float)kCellPx * sc + 8.0f) * 0.5f) * 2.0f;
+    const float snug =
+        std::floor(((float)kCellPx * sc + kLabelH + 8.0f) * 0.5f) * 2.0f;
     const float loose = std::floor((float)kPitchPx * sc * 0.42f) * 2.0f;
     return std::max(snug, loose);
   };
+  // FIT FIRST, THEN SCROLL. 1x if the whole drawing stands in the band, else
+  // 0.5x, else 0.5x with the scrollbars the child already has. Never anything
+  // between: a fractional scale puts a 2x sprite on half pixels, which is the
+  // one thing the pixel-art rule forbids. The margins subtracted here are the
+  // drawing's own padding plus a scrollbar's width, so "it fits" means it fits
+  // with nothing clipped rather than fits-until-a-bar-appears.
+  const float sbar = ImGui::GetStyle().ScrollbarSize;
+  const float avail = size.x - 16.0f - sbar, availY = size.y - 8.0f - sbar;
   float scale = 1.0f;
-  if ((float)g.width > avail || (float)g.layers * pitchFor(1.0f) > availY) scale = 0.5f;
+  if ((float)g.width * 1.0f > avail || (float)g.layers * pitchFor(1.0f) > availY)
+    scale = 0.5f;
   const float pitch = pitchFor(scale);
   const float gw = std::floor((float)g.width * scale);
   const float gh = (float)g.layers * pitch;
@@ -734,6 +748,23 @@ GraphCanvasResult SpellGraphCanvas(UIState& s, ImVec2 at, ImVec2 size, bool read
           char c[16];
           std::snprintf(c, sizeof c, "%d", n.wordCostOf);
           StruckText(dl, ImVec2(a.x + 3, a.y + 2), ColBloodHi(), c);
+        }
+        // THE WORD'S NAME, under the cell, in the 13 px small font at every
+        // scale — the band reserves a line for it (`kLabelH`). A cell is an
+        // engraving and a sort colour, and neither of those is which WORD; at
+        // 0.5x the engraving is 32 px and the tree read as a row of diamonds.
+        // `label` already carries the multiplicity, so it says `gustx2`.
+        if (!n.label.empty()) {
+          const ImVec2 ls = ImGui::CalcTextSize(n.label.c_str());
+          const float lx = std::floor((a.x + b.x - ls.x) * 0.5f);
+          dl->PushClipRect(ImVec2(a.x - 10, b.y), ImVec2(b.x + 10, b.y + kLabelH + 2),
+                           true);
+          dl->AddText(FontSmall(), 13.0f, ImVec2(lx + 1, b.y + 2),
+                      Fade(ColInk(), 0.8f), n.label.c_str());
+          dl->AddText(FontSmall(), 13.0f, ImVec2(lx, b.y + 1),
+                      dimNode ? Fade(ColParchDim(), 0.6f) : ColParch(),
+                      n.label.c_str());
+          dl->PopClipRect();
         }
         ImGui::SetCursorScreenPos(a);
         ImGui::InvisibleButton("##cell", ImVec2(std::max(8.0f, cw),

@@ -6570,6 +6570,21 @@ authoring happens on the page, which is a surface with room for it.
 copy of the `duststorm` starter with `shotgun` on it and a lane holding `fire`
 added through the intent path.
 
+**The screen makes room for it.** The PACK is now as tall as what is in it —
+the row holding the last filled slot plus one empty row to drop into, keyed on
+the highest filled INDEX rather than on a count (nothing compacts the bag, so a
+boot at slot 30 would otherwise vanish), and nothing in it at all is the in-hand
+strip alone. Everything that frees goes to the grimoire above it, down to a
+floor below which the page stops being an interface and the pack gives way
+entirely. The composer's own band went the same way: the word row is a compact
+strip sized to the sentence rather than a grid of all 32 cells, and the READOUT
+moved out of the composer to span the whole body under both columns — at the
+composer's width `DescribeSpell`'s verdict wrapped to six lines and ate the
+canvas, at the body's width it is three. It wraps and is never clipped; the
+price and the word count take its last line at the right. Every word cell on
+the canvas carries its NAME under it in the 13 px font at both scales, because
+an engraving and a sort colour say which SORT a node is and not which word.
+
 Selftest gates `spells` (the trail's voxel budget respected exactly and the
 projectile dead with it; an overcast resolving Fatal, emitting its own payload
 and asking for the caster to be carved; `fire`×N throwing exactly N times the

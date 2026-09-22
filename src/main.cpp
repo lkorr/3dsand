@@ -11812,7 +11812,13 @@ int main(int argc, char** argv) {
           SpellStack st;
           st.spoken = ex.spoken;
           const CastList l = CompileSpell(glyphs, st);
-          readout = DescribeSpell(glyphs, l).text;
+          const SpellReadout r = DescribeSpell(glyphs, l);
+          readout = r.text;
+          // THE VERDICT ON ITS OWN LINE. It is the sentence that says what the
+          // page DOES ("a bolt that sprays sand and fire, three of them"),
+          // which the bracket string above deliberately does not; the composer
+          // wraps both rather than clipping either.
+          if (!r.verdict.empty()) readout += "\n" + r.verdict;
           if (ex.dropped > 0) readout += "   (? = a word that no longer exists)";
           if (ex.truncated) readout += "   (cut at the stack bound)";
           price = l.manaCost;
