@@ -7722,6 +7722,25 @@ that is what makes a telegraph mean something. The windup's own target is
 the beginning; a stroke aimed at its own start point cuts the air behind the
 target every time.
 
+**A cut is a PATH, not only a chord** (2026-09-21; `cut-path` gate). One
+segment can express only a straight line through the target, so a hook that
+comes round a guard, a chop that drops and then drags, and a feint that checks
+and re-commits had no authoring surface at all — and adding another *style*
+cannot make one, because the thing missing is inside one stroke. So `cut` may
+be a **list of legs** (`kMaxCutLegs` = 6) run back to back inside the one Cut
+phase: each leg is an ordinary segment meaning what the single cut meant, a
+travel from wherever the previous leg ended, its deltas divided by its own
+ticks — so a short leg is a fast one and a leg that travels nowhere is a legal
+**hitch**. The phase does not split: `cutTicks` is the total, `phaseTick`
+counts across it, and everything outside `strokes.cpp` that asks "is this
+cutting" or "how many cut ticks are left" — the damage sweep, the bite holdout,
+every gate — needs to know nothing about legs. With a path, "half a cut"
+becomes **which leg meets them**, authored as `"aim": true` on that leg and
+defaulting to the midpoint of the whole travel (which for one leg is `cut/2`
+exactly, so every style written before this is unchanged — the determinism hash
+did not move). The tuner's Attacks lane adds and removes legs; the *shipped*
+library is still all single-leg.
+
 **Variation is deterministic.** Style pick, start bow and tempo are all
 `rng::Hash3(mobId ^ salt, tick, index)`, so ten swings differ and the fight
 replays.

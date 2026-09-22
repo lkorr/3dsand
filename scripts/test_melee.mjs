@@ -257,7 +257,11 @@ function freshDriver() {
 function runStyle(name, aimAz = 0, aimEl = 0, seed = 1) {
   const si = lib.styles.findIndex(s => s.name === name);
   if (si < 0) return null;
-  const sty = lib.styles[si];
+  return runParsed(lib.styles[si], si, aimAz, aimEl, seed);
+}
+
+/** ...and the same for a style that is not in the shipped library. */
+function runParsed(sty, si = 0, aimAz = 0, aimEl = 0, seed = 1) {
   const m = freshDriver();
   const cur = MELEE.newStrokeCursor();
   MELEE.beginStrokeProgram(cur, sty, si, seed);
@@ -295,12 +299,121 @@ for (const nm of ['horizontal_r', 'horizontal_l', 'diagonal', 'overhead']) {
   const spans = (v, arr) => Math.min(...arr) <= v && v <= Math.max(...arr);
   // The dominant axis of the style is where the crossing has to happen; an
   // overhead is an ELEVATION cut and barely moves in azimuth.
-  const dom = Math.abs(r.sty.cut.az) >= Math.abs(r.sty.cut.el) ? 'az' : 'el';
+  // Over the WHOLE path (strokes.h "A CUT IS A PATH"): the dominant channel
+  // is a fact about the total travel, not about the opening leg.
+  const tot = MELEE.cutTravel(r.sty);
+  const dom = Math.abs(tot.az) >= Math.abs(tot.el) ? 'az' : 'el';
   const arr = dom === 'az' ? azs : cutTicks.map(t => t.el);
   const aimV = dom === 'az' ? 0.25 : 0.10;
   check(spans(aimV, arr),
     `${nm}: the cut's ${dom} sweeps THROUGH the aim (${aimV})`,
     `range [${Math.min(...arr).toFixed(2)}, ${Math.max(...arr).toFixed(2)}]`);
+}
+
+/* --------------------------------------------------------------------------
+   A CUT IS A PATH (strokes.h; 2026-09-21)
+
+   `cut` may be a LIST OF LEGS run back to back inside the one Cut phase. The
+   three things worth stating without the engine are the three that would fail
+   silently: that the old spelling still produces the OLD program, that a path
+   really does bend (and not merely arrive), and that the aim marker moves
+   where the target sits along it. All of them are arithmetic on the trace.
+   ------------------------------------------------------------------------ */
+section('the cut path (strokes.h "A CUT IS A PATH")');
+{
+  const AIM_AZ = 0.25;
+  const probe = (cut) => {
+    const l = MELEE.parseStyleLibrary({ styles: [{
+      name: 'probe', windup: { ticks: 6, az: 0.2, el: 0.1, reach: -0.05 },
+      cut, recover: { ticks: 4 }, jitter: { az: 0, el: 0, tempo: 0 },
+    }] });
+    return { sty: l.styles[0], log: l.log };
+  };
+  const cutOf = r => r.trace.filter(t => t.phase === MELEE.STROKE_PHASE.Cut);
+  const ONE = { ticks: 8, az: -2.0, el: 0.0, reach: 0.1 };
+
+  // 1. THE OLD SPELLING IS THE OLD PROGRAM. A bare object and a one-element
+  //    list have to be the same stroke, tick for tick — that is the whole
+  //    compatibility story, and it is the claim that lets the shipped library
+  //    stay unedited.
+  const obj = probe(ONE), lst = probe([{ ...ONE }]);
+  const ra = runParsed(obj.sty, 0, AIM_AZ, 0), rb = runParsed(lst.sty, 0, AIM_AZ, 0);
+  check(obj.sty.cut.length === 1 && lst.sty.cut.length === 1,
+    'both spellings parse to exactly one leg');
+  check(ra.trace.length === rb.trace.length &&
+        ra.trace.every((t, i) => near(t.az, rb.trace[i].az, 1e-9) &&
+                                 near(t.el, rb.trace[i].el, 1e-9) &&
+                                 near(t.radius, rb.trace[i].radius, 1e-9)),
+    'a one-leg LIST and a bare cut OBJECT are the same stroke, tick for tick');
+
+  // 2. A PATH BENDS. Two legs whose az sums to the single cut's, but which
+  //    dive and then climb in elevation, must END where the straight cut ends
+  //    and pass somewhere ELSE on the way. Arriving in the right place is not
+  //    the claim — a straight line does that — so the assertion is on the
+  //    elevation at the corner.
+  const dog = probe([
+    { ticks: 4, az: -1.0, el: -0.40, reach: 0.05 },
+    { ticks: 4, az: -1.0, el: 0.40, reach: 0.05 },
+  ]);
+  const rd = runParsed(dog.sty, 0, AIM_AZ, 0);
+  check(rd.cur.cutLegs === 2 && rd.cur.legTicks.join(',') === '4,4' &&
+        rd.cur.cutTicks === 8,
+    'the path resolves to two legs of four ticks inside one 8-tick Cut phase',
+    `legs ${rd.cur.cutLegs}, ticks [${rd.cur.legTicks}], total ${rd.cur.cutTicks}`);
+  check(cutOf(rd).length === cutOf(ra).length,
+    'a two-leg path spends the same ticks cutting as the straight cut it sums to');
+  const endStraight = cutOf(ra)[cutOf(ra).length - 1];
+  const endDog = cutOf(rd)[cutOf(rd).length - 1];
+  check(near(endDog.az, endStraight.az, 0.06),
+    'the path ENDS where the straight cut of the same total travel ends',
+    `${endDog.az.toFixed(3)} vs ${endStraight.az.toFixed(3)}`);
+  const dipDog = Math.min(...cutOf(rd).map(t => t.el));
+  const dipStraight = Math.min(...cutOf(ra).map(t => t.el));
+  check(dipDog < dipStraight - 0.15,
+    'and it goes somewhere else on the way — the corner is really driven',
+    `dipped to ${dipDog.toFixed(3)} vs the straight cut's ${dipStraight.toFixed(3)}`);
+  // A leg is its own clock: the elevation floor has to happen at the CORNER,
+  // not at the end, or what was measured is a slow arc rather than a dogleg.
+  const dipAt = cutOf(rd).findIndex(t => near(t.el, dipDog, 1e-9));
+  check(dipAt >= 2 && dipAt <= 5,
+    'the corner lands at the leg boundary, not at either end of the cut',
+    `tick ${dipAt} of ${cutOf(rd).length}`);
+
+  // 3. THE AIM MARKER MOVES THE TARGET ALONG THE PATH. Unmarked, the aim sits
+  //    at the midpoint of the whole travel; marking leg 2 puts it in the
+  //    middle of leg 2, which means the stroke STARTS further back and crosses
+  //    the aim later. A marker that parsed but did nothing would look exactly
+  //    like one that worked, from anywhere but here.
+  const marked = probe([
+    { ticks: 4, az: -1.0, el: -0.40, reach: 0.05 },
+    { ticks: 4, az: -1.0, el: 0.40, reach: 0.05, aim: true },
+  ]);
+  check(marked.sty.aimLeg === 1, 'the "aim" flag names leg 2');
+  check(dog.sty.aimLeg === -1, 'and an unmarked path reports no aiming leg');
+  const rm = runParsed(marked.sty, 0, AIM_AZ, 0);
+  const crossAt = (r) => cutOf(r).findIndex(t => t.az <= AIM_AZ);
+  check(crossAt(rd) >= 0 && crossAt(rm) > crossAt(rd),
+    'marking the second leg makes the cut meet the target LATER in the path',
+    `unmarked at tick ${crossAt(rd)}, marked at ${crossAt(rm)}`);
+  check(cutOf(rm).some(t => t.az <= AIM_AZ) && cutOf(rm)[0].az > AIM_AZ,
+    'and it still crosses the aim rather than starting past it');
+
+  // 4. The loader's own refusals, which are the ones an author meets.
+  const many = probe(Array.from({ length: MELEE.MAX_CUT_LEGS + 2 },
+                                () => ({ ticks: 2, az: -0.2 })));
+  check(many.sty.cut.length === MELEE.MAX_CUT_LEGS &&
+        many.log.some(l => l.includes('more than')),
+    `more than ${MELEE.MAX_CUT_LEGS} legs is dropped LOUDLY`);
+  const empty = probe([]);
+  check(empty.sty.cut.length === 1 && empty.log.some(l => l.includes('empty')),
+    'an empty cut list falls back to one default leg, loudly');
+  const tot2 = MELEE.cutTravel(dog.sty);
+  check(near(tot2.az, -2.0, 1e-6) && near(tot2.el, 0, 1e-6) &&
+        near(tot2.reach, 0.1, 1e-6) && tot2.ticks === 8,
+    'cutTravel sums the legs');
+  const thr = MELEE.cutThrough(dog.sty, 0);
+  check(near(thr.az, -1.0, 1e-6) && near(thr.el, -0.40, 1e-6),
+    'cutThrough(0) is where the point stands when the first leg ends');
 }
 
 // ---- the phases run in order and for the authored number of ticks -------

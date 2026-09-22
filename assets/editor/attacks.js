@@ -107,6 +107,23 @@ const clamp = (v, lo, hi) => Math.max(lo, Math.min(hi, v));
 const DEG = 180 / Math.PI;
 const TICK_MS = 1000 / 30;   // the sim's own rate; `ticks` in the JSON are these
 const fmt = (v, n = 2) => (Number.isFinite(v) ? v.toFixed(n) : '—');
+// THE RAW CUT, ALWAYS AS A LIST (strokes.h "A CUT IS A PATH"). The file keeps
+// both spellings — one leg is the bare object every shipped style is written
+// as, several are a list — and every reader here wants the list. The objects
+// are the RAW ones, so editing a field of one edits the document in place,
+// which is what the whole panel relies on.
+const cutLegs = (r) => {
+  if (Array.isArray(r.cut)) {
+    const legs = r.cut.filter(l => l && typeof l === 'object');
+    if (legs.length) return legs;
+  } else if (r.cut && typeof r.cut === 'object') {
+    return [r.cut];
+  }
+  r.cut = { ticks: 8, az: 0, el: 0, reach: 0 };
+  return [r.cut];
+};
+// Which leg carries the target, or -1 for "the midpoint of the whole travel".
+const aimLegOf = (r) => cutLegs(r).findIndex(l => l.aim === true);
 
 /* ==========================================================================
    the seam rig.js binds
@@ -368,20 +385,12 @@ export function render(container) {
 
 function renderStyleBar() {
   const bar = el('div', { class: 'tagbar' });
-  const groups = [
-    ['player', lib.styles.map((s, i) => [s, i]).filter(([s]) => s.name.startsWith('player_'))],
-    ['npc', lib.styles.map((s, i) => [s, i]).filter(([s]) => !s.name.startsWith('player_'))],
-  ];
-  for (const [label, list] of groups) {
-    if (!list.length) continue;
-    bar.append(el('span', { class: 'hint', title: label === 'player'
-      ? 'the player\'s discrete strikes (melee.controlMode 0), picked by the flick at the press'
-      : 'replayed by NPCs; a behaviour profile lists opaque ids and draws one per attack' },
-      label));
-    for (const [s, i] of list)
-      bar.append(chip(s.name.replace(/^player_/, ''), i === selected,
-        () => selectStyle(i), s.label));
-  }
+  // Hide derived `:player` entries — they are auto-generated from the base
+  // style's `player` override block; the author edits the base.
+  const authored = lib.styles.map((s, i) => [s, i]).filter(([s]) => !s.derived);
+  for (const [s, i] of authored)
+    bar.append(chip(s.name, i === selected,
+      () => selectStyle(i), s.label));
 
   bar.append(el('span', { class: 'spacer' }));
   bar.append(
@@ -506,21 +515,9 @@ function programCard(sty) {
     el('div', { class: 'hdr', title: 'elevation: 0 level' }, 'el°'),
     el('div', { class: 'hdr', title: 'a POSITION in this arm\'s reach band, not voxels' }, 'reach'));
 
-  for (const [key, name, tip] of [
-    ['windup', 'windup',
-     'A POSE, relative to the aim, driven closed-loop and deliberately SLOWLY ' +
-     '(under melee.commitSpeed, so the driver stays in Guard and no cut fires). ' +
-     'Its length IS the whole telegraph — there is no UI indicator by design.'],
-    ['cut', 'cut',
-     'A TRAVEL, not a pose: how far the point goes and how fast. The deltas are ' +
-     'divided by the tick count and delivered per tick, which is what commits ' +
-     'the driver\'s own Slash and gives the sweep the tip speed that scales the ' +
-     'damage — SPEED IS THE DAMAGE.'],
-  ]) {
-    if (!r[key] || typeof r[key] !== 'object')
-      r[key] = { ticks: 8, az: 0, el: 0, reach: 0 };
-    const s = r[key];
-    seg.append(el('div', { class: 'lbl', title: tip }, name));
+  // The four value cells of one segment row; the LABEL cell is the caller's,
+  // because a cut leg's label carries its own controls and a windup's does not.
+  const segFields = (s, name, tip) => {
     seg.append(numCell({
       int: true, step: 1, min: 1, max: 120, dflt: 8, title: tip,
       get: () => Math.max(1, Math.round(num(s.ticks, 8))),
@@ -540,7 +537,117 @@ function programCard(sty) {
       subTitle: 'where that lands on the arm currently previewing',
       set: v => editStyles(`${name} reach`, () => { s.reach = v; }),
     }));
-  }
+  };
+
+  const windupTip =
+    'A POSE, relative to the aim, driven closed-loop and deliberately SLOWLY ' +
+    '(under melee.commitSpeed, so the driver stays in Guard and no cut fires). ' +
+    'Its length IS the whole telegraph — there is no UI indicator by design.';
+  if (!r.windup || typeof r.windup !== 'object')
+    r.windup = { ticks: 8, az: 0, el: 0, reach: 0 };
+  seg.append(el('div', { class: 'lbl', title: windupTip }, 'windup'));
+  segFields(r.windup, 'windup', windupTip);
+
+  // ---- THE CUT, WHICH IS A PATH (strokes.h "A CUT IS A PATH") -----------
+  //
+  // One row per LEG, run back to back inside the one Cut phase. Each leg is a
+  // TRAVEL from where the last one ended, so leg 2's az is measured from the
+  // end of leg 1 — which is what lets an author lengthen the opening without
+  // re-typing everything after it.
+  //
+  // THE FILE KEEPS BOTH SPELLINGS and so does this panel: one leg stays the
+  // bare `"cut": { … }` object every style in the library is written as, and
+  // "+ leg" is what turns it into a list. Both loaders read them identically,
+  // so an author who never adds a leg never sees a diff they did not make.
+  cutLegs(r).forEach((leg, k, all) => {
+    const many = all.length > 1;
+    const name = many ? `cut ${k + 1}` : 'cut';
+    const isAim = many && aimLegOf(r) === k;
+    const tip = 'A TRAVEL, not a pose: how far the point goes and how fast. ' +
+      'The deltas are divided by this leg\'s OWN tick count and delivered per ' +
+      'tick, so a short leg is a fast one — which is what commits the ' +
+      'driver\'s Slash and gives the sweep the tip speed that scales the ' +
+      'damage: SPEED IS THE DAMAGE.' + (many
+        ? ` Leg ${k + 1} of ${all.length}, measured from where leg ${k} ended.`
+        : '');
+    const lbl = el('div', { class: 'lbl', title: tip,
+      style: 'display:flex;align-items:center;justify-content:flex-end;gap:3px' });
+    if (many) {
+      // THE AIM MARKER, and it is a marker rather than a number because the
+      // thing being said is "the target is in the middle of THIS leg". Unset
+      // on every leg = the midpoint of the whole travel, which is what a
+      // one-leg cut has always done.
+      lbl.append(el('button', {
+        class: 'small' + (isAim ? ' primary' : ''),
+        style: 'padding:0 4px;font-size:9px;line-height:14px',
+        title: isAim
+          ? 'the TARGET sits in the middle of this leg — click to clear it and ' +
+            'go back to the midpoint of the whole travel'
+          : 'put the TARGET in the middle of this leg. Unset, the aim sits at ' +
+            'the midpoint of the whole path — which on a dogleg is usually the ' +
+            'CORNER, the one point where the blade is slowest and turning.',
+        onclick: () => {
+          editStyles(isAim ? 'clear aim leg' : `aim in cut ${k + 1}`, () => {
+            const legs = cutLegs(r);
+            for (const l of legs) delete l.aim;
+            if (!isAim) legs[k].aim = true;
+          });
+          render();
+        },
+      }, '◎'));
+    }
+    lbl.append(el('span', {}, name));
+    if (many) {
+      lbl.append(el('button', {
+        class: 'small danger', style: 'padding:0 4px;font-size:9px;line-height:14px',
+        title: 'drop this leg. The legs after it keep their own numbers, which ' +
+          'are RELATIVE — so the path after this corner shifts by whatever ' +
+          'this leg travelled.',
+        onclick: () => {
+          editStyles(`drop cut ${k + 1}`, () => {
+            const legs = cutLegs(r);
+            legs.splice(k, 1);
+            r.cut = legs.length > 1 ? legs : legs[0];
+          });
+          render();
+        },
+      }, '✕'));
+    }
+    seg.append(lbl);
+    segFields(leg, name, tip);
+  });
+  seg.append(el('div', {}));
+  seg.append(el('div', { style: 'grid-column:span 4' },
+    chip('+ leg', false, () => {
+      editStyles('add a cut leg', () => {
+        const legs = cutLegs(r);
+        // SEEDED AS A SHORT CONTINUATION of the leg before it, not as zeros
+        // and not as a copy: a new leg that travelled nowhere reads as a
+        // stall, and one that repeated the last would double the stroke. Half
+        // the previous travel, bent the other way in elevation, is a dogleg —
+        // the shape the author came here for — and every number is theirs to
+        // change.
+        const prev = legs[legs.length - 1] || {};
+        legs.push({
+          ticks: Math.max(2, Math.round(num(prev.ticks, 7) * 0.6)),
+          az: num(prev.az, 0) * 0.4,
+          el: -num(prev.el, 0) * 0.5 - 0.15,
+          reach: -num(prev.reach, 0) * 0.5,
+        });
+        r.cut = legs;
+      });
+      render();
+    }, 'add a corner to the cut: the point travels this path in ONE phase, ' +
+       'with no hand-back between the legs — a hook that comes round a guard, ' +
+       'a chop that drops and then drags, a feint that checks and re-commits'),
+    cutLegs(r).length > 1
+      ? el('span', { class: 'hint', style: 'margin-left:6px' },
+          `${cutLegs(r).length} legs · ` +
+          (aimLegOf(r) >= 0
+            ? `target in cut ${aimLegOf(r) + 1}`
+            : 'target at the midpoint of the whole travel'))
+      : el('span', { class: 'hint', style: 'margin-left:6px' },
+          'one straight travel through the target')));
 
   // ---- THE RECOVER, WHICH IS NOW A SEGMENT LIKE THE OTHER TWO -----------
   //
@@ -959,9 +1066,12 @@ function reachSub(offset) {
  * cut travel far enough fast enough.
  */
 function derivedLine(sty) {
-  const w = sty.windup.ticks, c = sty.cut.ticks, rc = sty.recover.ticks;
+  // THE WHOLE PATH: `cut` is a list of legs and the phase is one phase, so
+  // every number here is summed over it (strokes.h "A CUT IS A PATH").
+  const cutAll = MELEE.cutTravel(sty);
+  const w = sty.windup.ticks, c = cutAll.ticks, rc = sty.recover.ticks;
   const total = w + c + rc;
-  const cutDeg = Math.round(Math.hypot(sty.cut.az, sty.cut.el) * DEG);
+  const cutDeg = Math.round(Math.hypot(cutAll.az, cutAll.el) * DEG);
   const cutS = c * TICK_MS / 1000;
   const d = el('div', { class: 'atkderived' });
   d.append(el('span', {},
@@ -969,6 +1079,15 @@ function derivedLine(sty) {
     ' s  ·  telegraph ', el('b', {}, fmt(w * TICK_MS / 1000)),
     ' s  ·  cut sweeps ', el('b', {}, cutDeg + '°'), ' in ', el('b', {}, fmt(cutS)),
     ' s (', el('b', {}, String(Math.round(cutDeg / Math.max(cutS, 1e-3)))), '°/s)'));
+  // WHERE THE TARGET SITS ALONG THE PATH, which is the one thing about a
+  // multi-leg cut an author cannot read off the rows: a dogleg's midpoint is
+  // usually its corner, and a hook whose aim lands there meets the target with
+  // its hesitation instead of its edge.
+  if (sty.cut.length > 1) {
+    const k = Number.isInteger(sty.aimLeg) && sty.aimLeg >= 0 ? sty.aimLeg : -1;
+    d.append(el('span', {}, ` · ${sty.cut.length} legs, target in ` +
+      (k >= 0 ? `cut ${k + 1}` : 'the middle of the whole travel')));
+  }
   if (sty.jitter.tempo > 0) {
     const lo = Math.max(2, Math.round(w * (1 - sty.jitter.tempo)));
     const hi = Math.max(2, Math.round(w * (1 + sty.jitter.tempo)));
@@ -1182,7 +1301,8 @@ function aimSlider(key) {
 /** windup | cut | recover as one proportional bar, with the live phase cursor. */
 function strokeBar(sty) {
   const st = host?.state?.() || {};
-  const w = sty.windup.ticks, c = sty.cut.ticks, rc = sty.recover.ticks;
+  const w = sty.windup.ticks, c = MELEE.cutTravel(sty).ticks,
+        rc = sty.recover.ticks;
   const total = Math.max(1, w + c + rc);
   const bar = el('div', {
     class: 'cliplane', id: 'atkStrokeBar',
@@ -1198,8 +1318,24 @@ function strokeBar(sty) {
     title: tip,
   }, n);
   bar.append(
-    s(`windup ${w}`, w, '#6aa9ff', 'the telegraph: driven under commitSpeed, no cut fires'),
-    s(`cut ${c}`, c, '#ffd08a', 'the travel: this is the part that damages'),
+    s(`windup ${w}`, w, '#6aa9ff', 'the telegraph: driven under commitSpeed, no cut fires'));
+  // ONE BAND PER LEG, alternating shade. The cut is still ONE phase — there is
+  // no hand-back between legs and `phaseTick` runs across all of them — so the
+  // boundaries are drawn as a change of shade rather than as a gap: what an
+  // author is reading here is where the point changes direction, and a gap
+  // would say "and here it stops", which is exactly what it does not do.
+  const aimK = Number.isInteger(sty.aimLeg) && sty.aimLeg >= 0
+    ? sty.aimLeg : -1;
+  sty.cut.forEach((leg, k) => {
+    const isAim = aimK >= 0 ? k === aimK : false;
+    bar.append(s(
+      sty.cut.length > 1 ? `cut ${k + 1} · ${leg.ticks}` : `cut ${leg.ticks}`,
+      leg.ticks, k % 2 ? '#e8b464' : '#ffd08a',
+      `the travel, leg ${k + 1} of ${sty.cut.length}: ` +
+      `${Math.round(Math.hypot(leg.az, leg.el) * DEG)}° in ${leg.ticks} ticks` +
+      (isAim ? ' — the TARGET is in the middle of this leg' : '')));
+  });
+  bar.append(
     s(`recover ${rc}`, rc, '#3d4756', 'hand-back: PoseWeight ramps down'));
   if (st.live) {
     const done = st.phase === 'windup' ? st.phaseTick

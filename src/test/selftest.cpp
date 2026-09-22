@@ -137,6 +137,12 @@ const char* const kOrder[] = {
     // in one tick. Same cost, same independence: it reads
     // attack_styles.json and builds its own MeleeState, and touches no world.
     "swing-smooth",
+    // ...and with them `cut-path`: a cut may be a LIST OF LEGS run inside the
+    // one Cut phase (strokes.h "A CUT IS A PATH"), and nothing in the shipped
+    // library uses one yet, so this is the only gate that would notice a path
+    // that parsed and then ran as a straight line. Its styles are built in
+    // memory and its loader probe is a temp file — milliseconds, no world.
+    "cut-path",
     // AND WITH THEM: `tick-input` is Player alone over a synthetic ground
     // lambda — no world, no GPU, no assets — and it asserts that the
     // controller's trajectory is a function of the COMMAND STREAM and not of

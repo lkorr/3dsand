@@ -5966,7 +5966,9 @@ function installTestSeam() {
     },
     styleTicks: name => {
       const s = ATK.library()?.styles.find(x => x.name === name);
-      return s ? { windup: s.windup.ticks, cut: s.cut.ticks,
+      // `cut` is the WHOLE path's ticks, every leg (strokes.h "A CUT IS A
+      // PATH") — the phase is one phase however many corners it has.
+      return s ? { windup: s.windup.ticks, cut: MELEE.cutTravel(s).ticks,
                    recover: s.recover.ticks } : null;
     },
     // Drives the box the AUTHOR drives, so the undo entry the panel pushes is

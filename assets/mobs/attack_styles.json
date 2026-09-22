@@ -1,85 +1,46 @@
 {
-  "comment": "ATTACK STYLES. A style is a named STROKE PROGRAM: a windup that raises the blade into a stance, then a cut that drives it through the target line. It is fed to the SAME driver the player's mouse feeds (game/melee.h MeleeState, via StrokeSample), so an NPC swing is a motion a person could make and a fix to the feel is a fix to both. The player_* entries are the PLAYER'S discrete strikes (melee.controlMode 0), replayed through the same runner with the camera as the basis -- shorter windups because a click must feel owned, jitter 0 because a strike must go exactly where it was flicked. Hot-reloads on R alongside materials, behaviours, glyphs and items. The full schema, and the reasoning behind every field, is at the top of src/game/strokes.h.",
+  "comment": "ATTACK STYLES. A style is a named STROKE PROGRAM: a windup that raises the blade into a stance, then a cut that drives it through the target line. It is fed to the SAME driver the player's mouse feeds (game/melee.h MeleeState, via StrokeSample), so an NPC swing is a motion a person could make and a fix to the feel is a fix to both. Hot-reloads on R alongside materials, behaviours, glyphs and items. The full schema, and the reasoning behind every field, is at the top of src/game/strokes.h.",
+
+  "player_notes": "PLAYER OVERRIDES. Each style's optional `player` block states only the fields that differ from the base when the player swings it: shorter windups (a click must feel owned), zero jitter (a strike must go exactly where it was flicked), and sometimes different recover timing. The player compass references the BASE style by name; the loader creates a derived copy with overrides merged. Fields not mentioned in the override are inherited from the base. For `recover`, if the override is present but states no az/el/reach, the result has no posed return even if the base did (a player jab that hands back instantly does not need to be driven home). For `windup`, `cut`, and `jitter`, merge is per-field: stated fields override, unstated fields inherit.",
 
   "recover_notes": "THE RECOVER IS A RETURN, AND IT IS DRIVEN (2026-09-21). Until now it was four lines in the runner and none of them was a motion: the program set held=false, the STORED stroke froze wherever the cut ended, and PoseWeight ramped 1 -> 0 over the ONE global `melee.recoverTime` shared by every attack in the game -- a number Mob::ApplyWeaponArm hands to AnimSolveTwoBone as a BLEND WEIGHT. So the path home from a cut was a rotation-space crossfade with nothing in it that knows about anatomy, and a stroke that ends with the blade across the body (horizontal_r finishes at az -2.00) blended THROUGH the torso to get back. That is the 'limbs move in impossible ways' report, and nothing in the windup or the cut could reach it because the recover was not being authored at all. Now: `az`/`el`/`reach` are a RETURN STANCE, `settle` is how many of the `ticks` are spent being STEERED to it with the claim still at full weight, and `fade` is the hand-back, overriding melee.recoverTime for this style alone. THE POSE IS ABSOLUTE, in the mob's own facing basis -- NOT relative to the aim like the windup. A recover is a return to stance, not a second aim: an arm that recovered relative to the target would finish every swing pointed back at whatever it just hit, which reads as re-chambering rather than as finishing. Stating no az/el/reach gets the old behaviour back exactly, which is what a style written before this loads as.",
 
-  "recover_ticks_notes": "AND EVERY `ticks` BELOW IS UNCHANGED FROM BEFORE THE SPLIT, deliberately. The player's next strike waits for the whole program to Finish (session.cpp's strike tick) and an NPC's attack cadence is budgeted against the total, so lengthening a recover would be a balance change wearing an animation fix's clothes -- `player_punch_r` was cut to 5 recover ticks on purpose in 2026-09-16 so two jabs read as a combination. Each style's existing budget is SPLIT instead. That also removes a snap nobody had named: at 5 ticks (0.167 s) the program used to END while the global 0.22 s fade still had a third of the weight left, so the claim was dropped from ~0.25 to 0 in one tick on every player punch. An authored `fade` that fits inside `ticks` cannot do that, and the loader extends the segment rather than allow it.",
-
   "notes": "ANGLES ARE RADIANS in the mob's own facing basis: azimuth 0 is straight ahead and positive is the mob's right; elevation 0 is level. REACH is a fraction of the arm's own reach band, so a thrust is the same lunge on a long arm and a short one. TICKS are 30 Hz sim ticks -- a windup of 12 is 0.40 s of visible blade raise, which IS the telegraph (there is no UI indicator). The cut is CENTRED on the aim point: the windup lands at aim minus half the cut's own travel, so the blade passes through where it was aimed rather than starting there.",
-
-  "player_notes": "The `player` block maps the FLICK at the attack press to a style: `dir` is a unit-ish direction in SCREEN space (+x right, +y DOWN, raw mouse), quantized by max dot product, so adding a sector is adding a line here. Mount & Blade's compass: right flick = cut from the right, up = overhead, down = thrust, up-right = the descending diagonal (it chambers at the right shoulder). A click with no flick (below melee.pickMinSpeed) alternates the two `neutralAlternate` entries.",
 
   "player": {
     "sectors": [
-      { "dir": [1.0, 0.0], "style": "player_horizontal_r" },
-      { "dir": [-1.0, 0.0], "style": "player_horizontal_l" },
-      { "dir": [0.0, -1.0], "style": "player_overhead" },
-      { "dir": [0.0, 1.0], "style": "player_thrust" },
-      { "dir": [0.7, -0.7], "style": "player_diagonal" }
+      { "dir": [1.0, 0.0], "style": "horizontal_r" },
+      { "dir": [-1.0, 0.0], "style": "horizontal_l" },
+      { "dir": [0.0, -1.0], "style": "overhead" },
+      { "dir": [0.0, 1.0], "style": "thrust" },
+      { "dir": [0.7, -0.7], "style": "diagonal" }
     ],
-    "neutralAlternate": ["player_horizontal_r", "player_horizontal_l"]
+    "neutralAlternate": ["horizontal_r", "horizontal_l"]
   },
-
-  "playerUnarmed_notes": "THE SAME COMPASS WITH NOTHING IN YOUR FIST (docs/PLAN_impact_unarmed.md §6). A SECOND map rather than a filter over the first, because the two are different SHAPES: a sword's compass has an overhead and a thrust where a fist's has a jab, a cross and a straight -- asking one set of sectors to mean both would make every punch a re-labelled sword cut. main.cpp picks between them on `meleeArmed`, and which FIST swings comes from the style's own `weapon` (fist.R / fist.L), through the same Mob::ArmForStyle an NPC uses.",
 
   "playerUnarmed": {
     "sectors": [
-      { "dir": [1.0, 0.0], "style": "player_punch_r" },
-      { "dir": [-1.0, 0.0], "style": "player_punch_l" },
-      { "dir": [0.0, 1.0], "style": "player_punch_thrust" },
-      { "dir": [0.0, -1.0], "style": "player_punch_r" }
+      { "dir": [1.0, 0.0], "style": "punch_r" },
+      { "dir": [-1.0, 0.0], "style": "punch_l" },
+      { "dir": [0.0, 1.0], "style": "punch_thrust" },
+      { "dir": [0.0, -1.0], "style": "punch_r" }
     ],
-    "neutralAlternate": ["player_punch_r", "player_punch_l"]
+    "neutralAlternate": ["punch_r", "punch_l"]
   },
 
   "styles": [
-    {
-      "name": "player_horizontal_r",
-      "label": "Horizontal cut from the right",
-      "windup": { "ticks": 8, "az": 0.30, "el": 0.05, "reach": -0.05 },
-      "cut": { "ticks": 7, "az": -2.30, "el": 0.00, "reach": 0.10 },
-      "recover": { "ticks": 8, "az": 0.30, "el": 0.10, "reach": -0.10, "settle": 2, "fade": 6 },
-      "jitter": { "az": 0.0, "el": 0.0, "tempo": 0.0 }
-    },
-    {
-      "name": "player_horizontal_l",
-      "label": "Backhand cut from the left",
-      "windup": { "ticks": 8, "az": -0.25, "el": 0.04, "reach": -0.05 },
-      "cut": { "ticks": 7, "az": 2.10, "el": 0.00, "reach": 0.10 },
-      "recover": { "ticks": 8, "az": 0.30, "el": 0.10, "reach": -0.10, "settle": 2, "fade": 6 },
-      "jitter": { "az": 0.0, "el": 0.0, "tempo": 0.0 }
-    },
-    {
-      "name": "player_overhead",
-      "label": "Overhead chop",
-      "windup": { "ticks": 11, "az": 0.06, "el": 0.55, "reach": -0.10 },
-      "cut": { "ticks": 6, "az": -0.15, "el": -1.90, "reach": 0.14 },
-      "recover": { "ticks": 9, "az": 0.25, "el": 0.15, "reach": -0.10, "settle": 3, "fade": 6 },
-      "jitter": { "az": 0.0, "el": 0.0, "tempo": 0.0 }
-    },
-    {
-      "name": "player_diagonal",
-      "label": "Descending diagonal, shoulder to hip",
-      "windup": { "ticks": 7, "az": 0.35, "el": 0.45, "reach": -0.08 },
-      "cut": { "ticks": 7, "az": -1.60, "el": -1.40, "reach": 0.12 },
-      "recover": { "ticks": 8, "az": 0.30, "el": 0.12, "reach": -0.10, "settle": 2, "fade": 6 },
-      "jitter": { "az": 0.0, "el": 0.0, "tempo": 0.0 }
-    },
-    {
-      "name": "player_thrust",
-      "label": "Chamber and thrust",
-      "windup": { "ticks": 6, "az": 0.28, "el": 0.05, "reach": -0.45 },
-      "cut": { "ticks": 5, "az": -0.20, "el": 0.00, "reach": 0.85 },
-      "recover": { "ticks": 9, "az": 0.28, "el": 0.08, "reach": -0.20, "settle": 3, "fade": 6 },
-      "jitter": { "az": 0.0, "el": 0.0, "tempo": 0.0 }
-    },
     {
       "name": "horizontal_r",
       "label": "Horizontal cut, weapon side across",
       "windup": { "ticks": 12, "az": 0.30, "el": 0.05, "reach": -0.05 },
       "cut": { "ticks": 7, "az": -2.30, "el": 0.00, "reach": 0.10 },
       "recover": { "ticks": 10, "az": 0.30, "el": 0.10, "reach": -0.10, "settle": 4, "fade": 6 },
-      "jitter": { "az": 0.10, "el": 0.04, "tempo": 0.25 }
+      "jitter": { "az": 0.10, "el": 0.04, "tempo": 0.25 },
+      "player": {
+        "windup": { "ticks": 8 },
+        "recover": { "ticks": 8, "settle": 2 },
+        "jitter": { "az": 0, "el": 0, "tempo": 0 }
+      }
     },
     {
       "name": "horizontal_l",
@@ -87,7 +48,12 @@
       "windup": { "ticks": 13, "az": -0.25, "el": 0.04, "reach": -0.05 },
       "cut": { "ticks": 7, "az": 2.10, "el": 0.00, "reach": 0.10 },
       "recover": { "ticks": 11, "az": 0.30, "el": 0.10, "reach": -0.10, "settle": 5, "fade": 6 },
-      "jitter": { "az": 0.10, "el": 0.04, "tempo": 0.25 }
+      "jitter": { "az": 0.10, "el": 0.04, "tempo": 0.25 },
+      "player": {
+        "windup": { "ticks": 8 },
+        "recover": { "ticks": 8, "settle": 2 },
+        "jitter": { "az": 0, "el": 0, "tempo": 0 }
+      }
     },
     {
       "name": "overhead",
@@ -95,7 +61,12 @@
       "windup": { "ticks": 14, "az": 0.06, "el": 0.55, "reach": -0.10 },
       "cut": { "ticks": 6, "az": -0.15, "el": -1.90, "reach": 0.14 },
       "recover": { "ticks": 12, "az": 0.25, "el": 0.15, "reach": -0.10, "settle": 6, "fade": 6 },
-      "jitter": { "az": 0.08, "el": 0.06, "tempo": 0.22 }
+      "jitter": { "az": 0.08, "el": 0.06, "tempo": 0.22 },
+      "player": {
+        "windup": { "ticks": 11 },
+        "recover": { "ticks": 9, "settle": 3 },
+        "jitter": { "az": 0, "el": 0, "tempo": 0 }
+      }
     },
     {
       "name": "diagonal",
@@ -103,7 +74,12 @@
       "windup": { "ticks": 12, "az": 0.35, "el": 0.45, "reach": -0.08 },
       "cut": { "ticks": 7, "az": -1.60, "el": -1.40, "reach": 0.12 },
       "recover": { "ticks": 10, "az": 0.30, "el": 0.12, "reach": -0.10, "settle": 4, "fade": 6 },
-      "jitter": { "az": 0.12, "el": 0.06, "tempo": 0.25 }
+      "jitter": { "az": 0.12, "el": 0.06, "tempo": 0.25 },
+      "player": {
+        "windup": { "ticks": 7 },
+        "recover": { "ticks": 8, "settle": 2 },
+        "jitter": { "az": 0, "el": 0, "tempo": 0 }
+      }
     },
     {
       "name": "thrust",
@@ -111,7 +87,12 @@
       "windup": { "ticks": 11, "az": 0.28, "el": 0.05, "reach": -0.45 },
       "cut": { "ticks": 5, "az": -0.20, "el": 0.00, "reach": 0.85 },
       "recover": { "ticks": 12, "az": 0.28, "el": 0.08, "reach": -0.20, "settle": 6, "fade": 6 },
-      "jitter": { "az": 0.08, "el": 0.04, "tempo": 0.28 }
+      "jitter": { "az": 0.08, "el": 0.04, "tempo": 0.28 },
+      "player": {
+        "windup": { "ticks": 6 },
+        "recover": { "ticks": 9, "settle": 3 },
+        "jitter": { "az": 0, "el": 0, "tempo": 0 }
+      }
     },
 
     {
@@ -122,13 +103,17 @@
       "weapon": "fist.R",
       "fallback": true,
       "reach": 0,
-      "//reach": "ZERO MEANS ASK THE BODY (MobSystem::StyleReachOn). Every natural style shipped a hand-guessed number and every one of them was a lie the rig could not keep: punch_r claimed 9 on an arm that reaches 5, so the AI committed from nine voxels out and --shot-strike measured the fist stopping 6.7 voxels short of the victim and reporting ZERO bodies hit. The derived number is the effector's own reach (the LIVE arm plus its edge, or the jaws' span) plus whatever the lunge closes plus a body's half-depth -- all of it read off the rig and the style, so re-proportioning the art re-derives it and nothing rots. An author who wants to override still can, by putting a number back.",
-      "//shape": "A THRUST, NOT A SWING: a fist has no edge to sweep and no length past the wrist, so the damage has to come from the point going OUT. The reach pair is the thrust's own (-0.40 chamber, +0.80 drive) shortened a little, because an arm ending at a fist reaches less far than one ending at a sword and the band is resolved against the LIVE arm either way (StrokeReachIn). The windup is short -- 8 ticks, 0.27 s -- because a punch that telegraphs like an overhead chop is not a punch.",
       "windup": { "ticks": 8, "az": 0.22, "el": 0.06, "reach": -0.40 },
       "cut": { "ticks": 4, "az": -0.26, "el": -0.02, "reach": 0.80 },
       "recover": { "ticks": 9, "az": 0.20, "el": 0.08, "reach": -0.35, "settle": 3, "fade": 6 },
       "jitter": { "az": 0.08, "el": 0.05, "tempo": 0.25 },
-      "clip": "punch_r"
+      "clip": "punch_r",
+      "player": {
+        "windup": { "ticks": 6, "az": 0.06, "reach": -0.45 },
+        "cut": { "az": -0.07, "reach": 0.90 },
+        "recover": { "ticks": 5, "fade": 5 },
+        "jitter": { "az": 0, "el": 0, "tempo": 0 }
+      }
     },
     {
       "name": "punch_l",
@@ -136,12 +121,17 @@
       "weapon": "fist.L",
       "fallback": true,
       "reach": 0,
-      "//": "The mirror, and the azimuth signs flip with it: azimuth is positive to the mob's RIGHT, so the off hand chambers left and crosses right.",
       "windup": { "ticks": 9, "az": -0.22, "el": 0.06, "reach": -0.40 },
       "cut": { "ticks": 4, "az": 0.26, "el": -0.02, "reach": 0.80 },
       "recover": { "ticks": 10, "az": -0.20, "el": 0.08, "reach": -0.35, "settle": 4, "fade": 6 },
       "jitter": { "az": 0.08, "el": 0.05, "tempo": 0.25 },
-      "clip": "punch_l"
+      "clip": "punch_l",
+      "player": {
+        "windup": { "ticks": 6, "az": -0.06, "reach": -0.45 },
+        "cut": { "az": 0.07, "reach": 0.90 },
+        "recover": { "ticks": 5, "fade": 5 },
+        "jitter": { "az": 0, "el": 0, "tempo": 0 }
+      }
     },
     {
       "name": "hook_r",
@@ -149,7 +139,6 @@
       "weapon": "fist.R",
       "fallback": true,
       "reach": 0,
-      "//shape": "THE ONE PUNCH THAT IS A SWING. Azimuth-dominant and short-radius -- the fist travels around rather than out, which is why `reach` barely moves and the cut's azimuth is 1.1 rad. It reaches a voxel less far than the straights for the same reason a real hook does: the arm is bent through the whole of it.",
       "windup": { "ticks": 10, "az": 0.75, "el": 0.10, "reach": -0.20 },
       "cut": { "ticks": 5, "az": -1.10, "el": -0.08, "reach": 0.20 },
       "recover": { "ticks": 11, "az": 0.45, "el": 0.10, "reach": -0.25, "settle": 5, "fade": 6 },
@@ -161,16 +150,11 @@
       "label": "Bite",
       "weapon": "jaws",
       "reach": 0,
-      "//shape": "THE JAWS ARE AN AIM EFFECTOR, not a chain: no rig puts the head in an IK chain, so the stroke ROTATES the head (and a share of the spine) until its forward lies along the bearing the driver commands -- Mob::ApplyStrikeAim lays StrokeAz/StrokeEl straight onto it. THE MOTION IS THEREFORE ALL IN THE ANGULAR CHANNELS. A first draft put it in `reach` (windup -0.35, cut +0.85) on the theory that a bite is a head thrusting forward, and that is what a head DOES -- but a part that can only point cannot translate, and the radial channel moved nothing at all. What carries the jaws to the throat is the BODY: `bite_lunge` leaps, and a standing bite is authored for a target already inside reach 7. So: rear back half a radian, then snap down and through by nearly one. The small `reach` pair is a token so the driver still has a radius to hold.",
-      "//thrash": "AND IT WORRIES THE BITE ACROSS, not only down (2026-09-19). The azimuth pair was 0.05 -> -0.08, i.e. dead ahead for the whole stroke: the jaws traced a single vertical line and either the target was on it or the bite was air. Cocking the head 0.32 rad to one side and snapping 0.62 back through the aim sweeps nearly a radian of lateral travel THROUGH the target line, so the mouth crosses everything between the two ends rather than arriving at one point -- which is what a dog does to something it is trying to get hold of, and which is the difference between a bite that grazes and a bite that catches. It costs nothing in commit distance (the reach channel is untouched) and the sweep is continuous between ticks, so nothing is skipped over.",
       "windup": { "ticks": 10, "az": 0.32, "el": 0.50, "reach": -0.10 },
       "cut": { "ticks": 4, "az": -0.62, "el": -0.95, "reach": 0.20 },
       "recover": { "ticks": 12, "az": 0.00, "el": 0.10, "reach": 0.00, "settle": 6, "fade": 6 },
-      "//jitter": "az 0.12 -> 0.24: the bow is what decides which side the head cocks to and by how much, so at 0.12 against a 0.32 windup every bite came in off the same shoulder. At 0.24 the line varies from nearly straight-on to well past the shoulder and two bites in a row are two different attempts.",
       "jitter": { "az": 0.24, "el": 0.10, "tempo": 0.22 },
-      "//target": "THE SAME WEIGHTS THE LUNGING BITE USES, and it needs them for the commoner case rather than the rarer one: a zombie already in reach -- crawling, cornered, or with its victim on the ground -- bites with THIS style, and without a table every one of those blows went to the chest (MobSystem::PickTargetLimb reads an absent table as `-1`, which BeginStroke turns into today's chest aim). The owner asked for bites that go for arms and torso too; that has to be true of the bite you actually meet. LIMBS FIRST, AND THE HEAD AND CHEST ARE THE RARE BLOWS (2026-09-19, owner report: 19 bites in 20 ended up on the head or the chest and that is backwards). The weights below are the same ones `bite` above carries; the reasoning for them is stated there once.",
       "target": { "arm": 0.46, "leg": 0.24, "hand": 0.16, "head": 0.07, "spine": 0.07 },
-      "//targetProne": "WHAT A CRAWLER CAN REACH. Drawn from INSTEAD of `target` whenever the BITER is prone -- its active dismemberment loco state is one that lays the body on the ground (crawl, squirm; anim.h AnimStateRule::groundAlign above 0, read through Mob::LocoGroundAlign). A zombie whose legs are gone is at ankle height, and against a standing victim the head and the chest are simply not in front of it: before this it went on drawing the upright weights and aimed four blows in five at a part of you it could not get near. The legs take nearly all of it; the remainder is what a hand hanging at the side or an arm dropped to fend it off puts in range. A SECOND AUTHORED TABLE rather than a rule in the draw, because which limbs a prone body can reach is a fact about that creature's shape -- a rig whose prone form rears up would want the opposite. Absent = no change, whatever posture the attacker is in.",
       "targetProne": { "leg": 0.90, "hand": 0.06, "arm": 0.04 },
       "clip": "bite"
     },
@@ -179,15 +163,9 @@
       "label": "Lunge and bite",
       "weapon": "jaws",
       "reach": 0,
-      "//reach": "FAR OUTSIDE THE ZOMBIE'S PROFILE REACH (9), which is the whole point: MobSystem::AttackReachOf hands the LONGEST usable style's reach to the AI, so the creature commits from three body-lengths out and the leap closes the rest. BeginStroke then refuses the punches at that distance, so the draw at 20 voxels can only come out as this.",
-      "//lunge": "FIRED AT THE START OF THE WINDUP, so the flight IS the telegraph -- there is no UI indicator and a zombie leaving the ground is the most readable warning in the game. `speed` is a CEILING in m/s, not a command: the magnitude is min(speed, (distance - the EFFECTOR's reach)/airTime), so the body arrives at biting distance instead of through the victim, and the same style is a long leap from far out and a hop from close in. `ticks` is what the AUTHOR is aiming the cut at (10 windup ticks, so the feet land about as the cut starts) and `rise` is what actually buys the time: a ballistic hop is airborne for 2*rise/gravity, so 1.5 m/s against 9.8 m/s^2 is 0.31 s = 9 ticks, which is where this number comes from. It must be non-zero or the launch lands on the tick after it left (mob.cpp UpdateFall's launch latch buys exactly one tick); measured at 1.1 the flight was 6 ticks and the leap fell 3 voxels short of the authored one.",
-      "//speed": "2.4 m/s WAS A BRISK WALK, and a pounce is not a brisk walk. The launch law caps the horizontal at exactly the gap it has to close, so `speed` is a CEILING -- and at 2.4 the ceiling bound every leap: --shot-strike measured 6.40 voxels of travel on a lunge that had to cross three body-lengths, and the zombie landed short of its own commit distance every time. 10 m/s is 100 vox/s, and over the ~0.31 s the rise really keeps it airborne that is ~30 voxels available -- comfortably more than the gap, so the CLOSING term wins and the creature arrives at biting distance instead of at the end of its speed budget. That is a ceiling doing what a ceiling is for.",
       "lunge": { "ticks": 10, "speed": 10.0, "rise": 1.5, "at": "windup" },
-      "//target": "WEIGHTS OVER LIMB TAGS, not names, so any rig that tags its parts answers it. Bites go for arms and torso too, not only the head -- the owner asked for that by name. Hands are in at 0.08 because a bitten-off hand is a thing that should happen occasionally and never look aimed at. LIMBS FIRST, HEAD AND CHEST RARE (2026-09-19). Owner report: 19 in 20 zombie bites ended up on the head or the chest and the owner asked for that to be comparatively rare -- bites belong on the arms, the hands and the legs, which is where a thing mauling you gets hold of you and which is what you put between yourself and it. AND THE PER-TAG WEIGHT IS NOT A PER-LIMB CHANCE, which is how the old table read worse than it looked: MobSystem::PickTargetLimb splits a tag's weight across the LIVE LIMBS WEARING IT, and this rig tags four limbs `arm` (two uppers, two lowers) and two `spine` against ONE `head`. So the previous arm 0.40 was 0.10 per arm segment while head 0.20 went to a single part -- the head was the likeliest limb in the game to be bitten, at twice any one arm. The note that used to sit here claimed 0.40 over two arms is 0.20 each, and was simply wrong about the rig. Now: arm 0.46 (0.115 a segment), leg 0.24 (0.06 a segment), hand 0.16 (0.08 a hand), and head and spine 0.07 each -- 14% of bites at the two places a garment always covers and a hit most often kills, 86% at the limbs. `foot` is deliberately still ABSENT, and that is a finding rather than an oversight: the `bite-limbs` gate measured a foot coming clean OFF to a single 4 hp bite, at the surface and at the core alike, which predates all of this. Adding the tag before that is understood would ship a zombie that occasionally removes your foot in one snap.",
       "target": { "arm": 0.46, "leg": 0.24, "hand": 0.16, "head": 0.07, "spine": 0.07 },
-      "//targetProne": "WHAT A CRAWLER CAN REACH. Drawn from INSTEAD of `target` whenever the BITER is prone -- its active dismemberment loco state is one that lays the body on the ground (crawl, squirm; anim.h AnimStateRule::groundAlign above 0, read through Mob::LocoGroundAlign). A zombie whose legs are gone is at ankle height, and against a standing victim the head and the chest are simply not in front of it: before this it went on drawing the upright weights and aimed four blows in five at a part of you it could not get near. The legs take nearly all of it; the remainder is what a hand hanging at the side or an arm dropped to fend it off puts in range. A SECOND AUTHORED TABLE rather than a rule in the draw, because which limbs a prone body can reach is a fact about that creature's shape -- a rig whose prone form rears up would want the opposite. Absent = no change, whatever posture the attacker is in.",
       "targetProne": { "leg": 0.90, "hand": 0.06, "arm": 0.04 },
-      "//shape": "Elevation-dominant like the standing bite above, and for the reason spelled out there: an aim effector POINTS, it does not translate, so a bite's motion has to live in the angular channels. A touch more of it than the standing one -- the body is arriving at speed and the head snaps through further. It carries the standing bite's lateral WORRY too (see the `//thrash` note there): a pounce that arrives a hand's width off line should still catch something.",
       "windup": { "ticks": 10, "az": 0.30, "el": 0.55, "reach": -0.10 },
       "cut": { "ticks": 4, "az": -0.58, "el": -1.05, "reach": 0.20 },
       "recover": { "ticks": 14, "az": 0.00, "el": 0.10, "reach": 0.00, "settle": 8, "fade": 6 },
@@ -196,37 +174,11 @@
     },
 
     {
-      "//": "THE PLAYER'S UNARMED STRIKES. Shorter windups than the NPC punches for the same reason the player's sword styles are shorter than an NPC's: a click must feel owned. Jitter 0, so a strike goes exactly where it was flicked.",
-
-      "name": "player_punch_r",
-      "label": "Straight right",
-      "weapon": "fist.R",
-      "reach": 0,
-      "//reach": "A DEEPER CHAMBER AND A TICK MORE CUT THAN THE FIRST DRAFT. The driver moves a thrust by leaning the blade off a hand held at a fixed extension (melee.cpp's law of cosines), and a fist's whole blade is one voxel of knuckle -- so the radial channel has far less to work with than a sword's and a three-tick cut did not finish converging on it. Measured by npc-styles: commanded dr 0.92 voxels against its 1.0 floor, where the NPC punches (one more windup tick, one more cut tick) made 1.14.",
-      "//jab": "JABBIER (2026-09-16), and the two halves of that are different things. TEMPO: a tick off the windup and two off the recover -- 0.20 s of chamber and 0.17 s of return against 0.23 s of each -- so the fist is out sooner and back sooner and two punches read as a combination rather than as two events. The CUT keeps its four ticks: three did not finish converging the radial channel (see above), and a jab that does not arrive is not a fast jab. LINE: the azimuth pair is tightened toward zero, so the knuckles travel nearly straight out from the chamber to the aim instead of hooking across it -- which is what makes a punch land on the thing the crosshair is on rather than a hand's width inboard of it. The aim itself is fixed in code, not here (main.cpp's strike tick, strokes.h StrokeAimAt).",
-      "windup": { "ticks": 6, "az": 0.06, "el": 0.05, "reach": -0.45 },
-      "cut": { "ticks": 4, "az": -0.07, "el": -0.02, "reach": 0.90 },
-      "recover": { "ticks": 5, "fade": 5 },
-      "jitter": { "az": 0.0, "el": 0.0, "tempo": 0.0 },
-      "clip": "punch_r"
-    },
-    {
-      "name": "player_punch_l",
-      "label": "Straight left",
-      "weapon": "fist.L",
-      "reach": 0,
-      "windup": { "ticks": 6, "az": -0.06, "el": 0.05, "reach": -0.45 },
-      "cut": { "ticks": 4, "az": 0.07, "el": -0.02, "reach": 0.90 },
-      "recover": { "ticks": 5, "fade": 5 },
-      "jitter": { "az": 0.0, "el": 0.0, "tempo": 0.0 },
-      "clip": "punch_l"
-    },
-    {
-      "name": "player_punch_thrust",
+      "name": "punch_thrust",
       "label": "Two-handed drive",
       "weapon": "fist.R",
       "reach": 0,
-      "//": "The deepest chamber and the longest drive in the block, and almost no azimuth -- it is the punch you throw with your weight behind it. Down on the compass, where the sword's thrust lives, because it is the same gesture.",
+      "//": "Player-only unarmed thrust (down flick). The deepest chamber and the longest drive in the block, and almost no azimuth — it is the punch you throw with your weight behind it.",
       "windup": { "ticks": 6, "az": 0.08, "el": 0.02, "reach": -0.50 },
       "cut": { "ticks": 4, "az": -0.08, "el": 0.00, "reach": 0.95 },
       "recover": { "ticks": 7, "az": 0.08, "el": 0.04, "reach": -0.45, "settle": 1, "fade": 6 },

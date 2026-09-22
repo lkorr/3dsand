@@ -946,10 +946,52 @@ export function newStrokeCursor() {
     style: -1,
     phaseTick: 0,
     windupTicks: 0, cutTicks: 0, recoverTicks: 0, settleTicks: 0,
+    // The cut path's resolved tick table (strokes.h StrokeCursor::legTicks):
+    // the tempo jitter applied PER LEG, once, so a corner cannot drift under
+    // the drive. `cutTicks` is their sum, which is why nothing outside the
+    // runner has to know legs exist.
+    cutLegs: 1, legTicks: [], cutLeg: 0,
     seed: 0,
     aimAz: 0, aimEl: 0, aimed: false,
     wantAz: 0, wantEl: 0, wantReach: 0,
   };
+}
+
+// strokes.h kMaxCutLegs.
+export const MAX_CUT_LEGS = 6;
+
+/**
+ * strokes.h AttackStyle::CutTravel / CutThrough / CutAimOffset — the three
+ * ways the path is read, ported so the preview, the panel's derived line and
+ * the engine agree on what a style ASKS for.
+ *
+ * `cutThrough(sty, k)` is cumulative THROUGH leg k inclusive (k < 0 = the
+ * start of the path); `cutTravel` is the whole of it.
+ */
+export function cutThrough(sty, k) {
+  const out = { ticks: 0, az: 0, el: 0, reach: 0 };
+  const legs = sty.cut || [];
+  for (let i = 0; i <= k && i < legs.length; i++) {
+    out.ticks += legs[i].ticks;
+    out.az += legs[i].az;
+    out.el += legs[i].el;
+    out.reach += legs[i].reach;
+  }
+  return out;
+}
+export const cutTravel = (sty) => cutThrough(sty, (sty.cut || []).length - 1);
+// WHERE THE TARGET SITS ALONG THE PATH, from the cut's start: the middle of
+// the leg that claims the aim, or the midpoint of the whole travel (which for
+// one leg is the historical cut/2).
+export function cutAimOffset(sty) {
+  const legs = sty.cut || [];
+  const k = sty.aimLeg;
+  if (Number.isInteger(k) && k >= 0 && k < legs.length) {
+    const before = cutThrough(sty, k - 1);
+    return { az: before.az + 0.5 * legs[k].az, el: before.el + 0.5 * legs[k].el };
+  }
+  const all = cutTravel(sty);
+  return { az: 0.5 * all.az, el: 0.5 * all.el };
 }
 
 /**
@@ -961,7 +1003,21 @@ export function beginStrokeProgram(cur, sty, styleIndex, seed) {
   cur.seed = seed >>> 0;
   const tempo = 1.0 + sty.jitter.tempo * signedUnit(hash3(cur.seed, 1, 0));
   cur.windupTicks = Math.max(2, Math.round(sty.windup.ticks * tempo));
-  cur.cutTicks = Math.max(2, Math.round(sty.cut.ticks * tempo));
+  // THE PATH'S TICK TABLE, per leg and rounded ONCE (strokes.cpp says why): a
+  // leg floors at one tick so the jitter cannot round a corner out of the
+  // path, and the WHOLE cut still floors at two, which for a one-leg cut is
+  // the line this replaced.
+  cur.cutLegs = Math.max(1, Math.min(sty.cut.length, MAX_CUT_LEGS));
+  cur.legTicks = [];
+  let total = 0;
+  for (let k = 0; k < cur.cutLegs; k++) {
+    const n = Math.max(1, Math.round(sty.cut[k].ticks * tempo));
+    cur.legTicks.push(n);
+    total += n;
+  }
+  if (total < 2) { cur.legTicks[cur.cutLegs - 1] += 2 - total; total = 2; }
+  cur.cutTicks = total;
+  cur.cutLeg = 0;
   // THE RECOVER IS NOT TEMPO-JITTERED (strokes.cpp says why): tempo exists so
   // two duelists do not beat time together, and what carries that is the
   // telegraph and the travel — the two segments an opponent reads.
@@ -1017,9 +1073,12 @@ export function stepStrokeProgram(cur, sty, m, liveAz, liveEl, dt, right, up, fw
     }
     case STROKE_PHASE.Windup: {
       if (!sty) break;
-      // THE CUT IS CENTRED ON THE AIM, so the windup lands HALF A CUT SHORT.
-      cur.wantAz = liveAz - 0.5 * sty.cut.az + sty.windup.az + bowAz;
-      cur.wantEl = liveEl - 0.5 * sty.cut.el + sty.windup.el + bowEl;
+      // THE CUT IS CENTRED ON THE AIM, so the windup lands as far SHORT of it
+      // as the target sits ALONG THE PATH — cut/2 for one leg, the middle of
+      // the aiming leg for a path (strokes.h "A CUT IS A PATH").
+      const aimOff = cutAimOffset(sty);
+      cur.wantAz = liveAz - aimOff.az + sty.windup.az + bowAz;
+      cur.wantEl = liveEl - aimOff.el + sty.windup.el + bowEl;
       // AGAINST A NEUTRAL EXTENSION, not against the live radius: computing
       // it as StrokeRadius() + offset every tick is a RUNAWAY.
       cur.wantReach = strokeReachIn(m, sty.windup.reach);
@@ -1036,13 +1095,28 @@ export function stepStrokeProgram(cur, sty, m, liveAz, liveEl, dt, right, up, fw
     }
     case STROKE_PHASE.Cut: {
       if (!sty) break;
-      // FROM WHERE THE BLADE ACTUALLY IS, THROUGH THE AIM, TO HALF A CUT PAST
-      // IT — derived per tick, so a windup that could not quite reach its pose
-      // still produces a cut through the target.
-      const toAz = cur.aimAz + 0.5 * sty.cut.az;
-      const toEl = cur.aimEl + 0.5 * sty.cut.el;
-      const toR = strokeReachIn(m, sty.windup.reach + sty.cut.reach);
-      const left = Math.max(1, cur.cutTicks - cur.phaseTick);
+      // WHICH LEG OF THE PATH: phaseTick counts the WHOLE cut, so the leg is
+      // found by walking the resolved tick table (strokes.cpp says why it is
+      // derived rather than latched).
+      let leg = 0, legEnd = cur.legTicks[0] || cur.cutTicks;
+      while (leg + 1 < cur.cutLegs && cur.phaseTick >= legEnd) {
+        leg++;
+        legEnd += cur.legTicks[leg];
+      }
+      cur.cutLeg = leg;
+      // FROM WHERE THE BLADE ACTUALLY IS, THROUGH THE AIM, TO THE END OF THIS
+      // LEG — derived per tick, so a windup that could not quite reach its
+      // pose still produces a cut through the target, and a leg that fell
+      // short does not displace the legs after it (each target is an ABSOLUTE
+      // point on the path).
+      const aimOff = cutAimOffset(sty);
+      const through = cutThrough(sty, leg);
+      const toAz = cur.aimAz - aimOff.az + through.az;
+      const toEl = cur.aimEl - aimOff.el + through.el;
+      const toR = strokeReachIn(m, sty.windup.reach + through.reach);
+      // THE TICKS LEFT IN THIS LEG, not in the cut: this is what sets the
+      // leg's speed, and a short leg is a fast one.
+      const left = Math.max(1, legEnd - cur.phaseTick);
       const t = m.tuning;
       smp.dx = ((toAz - m.strokeAz()) / left) / t.aimGainX;
       smp.dy = -((toEl - m.strokeEl()) / left) / t.aimGainY;
@@ -1100,6 +1174,49 @@ function readSegment(j, dflt) {
     el: n('el', dflt.el),
     reach: n('reach', dflt.reach),
   };
+}
+
+/**
+ * strokes.cpp ReadCutPath — `cut` is EITHER one segment or a list of legs,
+ * read by the one function so the single-segment form cannot drift into a
+ * special case. Returns { legs, aimLeg }; `legs` is never empty.
+ *
+ * A leg of the list defaults to a SHORT, STATIONARY segment rather than to the
+ * single cut's whole horizontal slash: "{ az: -0.4 }" as a third leg means
+ * "and then a little further", not "and then a second swing".
+ */
+function readCutPath(cutJ, styleName, log) {
+  const legs = [];
+  let aimLeg = -1;
+  if (Array.isArray(cutJ)) {
+    for (const leg of cutJ) {
+      if (!leg || typeof leg !== 'object') {
+        log.push(`style "${styleName}" has a cut leg that is not an object `
+                 + '- skipped');
+        continue;
+      }
+      if (legs.length >= MAX_CUT_LEGS) {
+        log.push(`style "${styleName}" has more than ${MAX_CUT_LEGS} cut legs `
+                 + '- the rest are dropped (a path with that many corners is a '
+                 + 'body clip, not a stroke)');
+        break;
+      }
+      if (leg.aim === true) {
+        if (aimLeg >= 0)
+          log.push(`style "${styleName}" marks leg ${legs.length + 1} with `
+                   + '"aim" as well - the first marked leg keeps it');
+        else aimLeg = legs.length;
+      }
+      legs.push(readSegment(leg, { ticks: 4, az: 0, el: 0, reach: 0 }));
+    }
+    if (!legs.length)
+      log.push(`style "${styleName}" has an empty cut list - falling back to `
+               + 'one default cut');
+  }
+  if (!legs.length)
+    legs.push(readSegment(cutJ && typeof cutJ === 'object' && !Array.isArray(cutJ)
+      ? cutJ : {}, { ticks: 7, az: 0, el: 0, reach: 0 }));
+  return { legs, aimLeg };
 }
 
 /**
@@ -1186,11 +1303,15 @@ export function parseStyleLibrary(json) {
       continue;
     }
     const jt = s.jitter || {};
+    const cutPath = readCutPath(s.cut, name, log);
     styles.push({
       name,
       label: typeof s.label === 'string' ? s.label : name,
       windup: readSegment(s.windup, { ticks: 12, az: 0, el: 0, reach: 0 }),
-      cut: readSegment(s.cut, { ticks: 7, az: 0, el: 0, reach: 0 }),
+      // THE CUT PATH: always a LIST, one leg or several (strokes.h "A CUT IS
+      // A PATH"). Readers that want the old single segment want cutTravel().
+      cut: cutPath.legs,
+      aimLeg: cutPath.aimLeg,
       recover: readRecover(s.recover, name, log),
       jitter: {
         az: Number.isFinite(+jt.az) ? +jt.az : 0,
@@ -1223,13 +1344,87 @@ export function parseStyleLibrary(json) {
       raw: s,                      // the object the editor mutates in place
     });
   }
+  // ---- PLAYER OVERRIDES: create derived copies for styles with a `player`
+  // block. The derived entry carries the merged numbers and is what the player
+  // compass points at; the base entry is what NPCs use. Merge rule: per-field
+  // within windup/cut/jitter (unstated fields inherit from base). For recover:
+  // if the override is present but states no az/el/reach, the result has no
+  // posed return even if the base did.
+  const playerDerived = new Map();
+  const baseCount = styles.length;
+  const n = (v, d) => (Number.isFinite(+v) ? +v : d);
+  for (let bi = 0; bi < baseCount; bi++) {
+    const s = styles[bi].raw;
+    if (!s.player || typeof s.player !== 'object') continue;
+    const p = s.player;
+    const base = styles[bi];
+    const mergeSeg = (baseSeg, over) => {
+      if (!over || typeof over !== 'object') return { ...baseSeg };
+      return {
+        ticks: Math.max(1, n(over.ticks, baseSeg.ticks)),
+        az: n(over.az, baseSeg.az),
+        el: n(over.el, baseSeg.el),
+        reach: n(over.reach, baseSeg.reach),
+      };
+    };
+    const mergeJitter = (baseJ, over) => {
+      if (!over || typeof over !== 'object') return { ...baseJ };
+      return {
+        az: n(over.az, baseJ.az),
+        el: n(over.el, baseJ.el),
+        tempo: n(over.tempo, baseJ.tempo),
+      };
+    };
+    const mergeRecover = (baseR, over) => {
+      if (!over || typeof over !== 'object') return { ...baseR };
+      const posed = over.az !== undefined || over.el !== undefined ||
+                    over.reach !== undefined;
+      return {
+        ticks: Math.max(1, n(over.ticks, baseR.ticks)),
+        posed,
+        az: posed ? n(over.az, 0) : 0,
+        el: posed ? n(over.el, 0) : 0,
+        reach: posed ? n(over.reach, 0) : 0,
+        settle: posed ? Math.max(0, n(over.settle, baseR.settle)) : 0,
+        fade: Math.max(0, n(over.fade, baseR.fade)),
+      };
+    };
+    // A LIST REPLACES, AN OBJECT MERGES INTO THE FIRST LEG (strokes.cpp says
+    // why: merging list into list per index would reinterpret leg 2 of one
+    // path as leg 2 of a differently-shaped one).
+    let cut = base.cut.map(l => ({ ...l }));
+    let aimLeg = base.aimLeg;
+    if (Array.isArray(p.cut)) {
+      const pp = readCutPath(p.cut, base.name + ':player', log);
+      cut = pp.legs;
+      aimLeg = pp.aimLeg;
+    } else if (p.cut && typeof p.cut === 'object') {
+      cut[0] = mergeSeg(cut[0], p.cut);
+    }
+    const derived = {
+      ...base,
+      name: base.name + ':player',
+      windup: mergeSeg(base.windup, p.windup),
+      cut,
+      aimLeg,
+      recover: mergeRecover(base.recover, p.recover),
+      jitter: mergeJitter(base.jitter, p.jitter),
+      derived: true,
+      baseName: base.name,
+      baseIndex: bi,
+      raw: s,
+    };
+    playerDerived.set(base.name, styles.length);
+    styles.push(derived);
+  }
+
   // strokes.h:111 PlayerStrikeMap — INDICES, not names, resolved against the
   // library at load time; a sector naming an unknown style is skipped LOUDLY.
   const find = n => styles.findIndex(s => s.name === n);
-  // TWO BLOCKS THROUGH ONE READER, exactly as strokes.cpp's `readMap` does:
-  // `player` (a weapon in the fist) and `playerUnarmed` (fists). A second copy
-  // of "resolve a sector and skip it loudly" is a second place for the skip to
-  // stop being loud.
+  const findPlayer = n => {
+    const di = playerDerived.get(n);
+    return di !== undefined ? di : find(n);
+  };
   const readMap = (key) => {
     const map = { sectors: [], neutral: [-1, -1] };
     const pj = json && json[key];
@@ -1239,7 +1434,7 @@ export function parseStyleLibrary(json) {
         log.push(`${key}.sectors: an entry with no 2-element "dir" — skipped`);
         continue;
       }
-      const i = find(sec.style);
+      const i = findPlayer(sec.style);
       if (i < 0) {
         log.push(`${key}.sectors: unknown style "${sec.style}" — skipped`);
         continue;
@@ -1249,7 +1444,7 @@ export function parseStyleLibrary(json) {
     const na = Array.isArray(pj.neutralAlternate) ? pj.neutralAlternate : [];
     for (let k = 0; k < 2; k++) {
       if (na[k] === undefined) continue;
-      const i = find(na[k]);
+      const i = findPlayer(na[k]);
       if (i < 0) log.push(`${key}.neutralAlternate: unknown style "${na[k]}"`);
       else map.neutral[k] = i;
     }

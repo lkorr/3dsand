@@ -1615,9 +1615,14 @@ Status GateNpcStyles(Ctx& c, std::string& detail) {
     // ITS OWN CLAIM, FROM ITS OWN AUTHORED NUMBERS. Nothing here names a style,
     // so the check is inherited by every style added later: whichever channel
     // the author asked to travel in must be the one the WEAPON travelled in.
-    const float wantAz = std::fabs(sty.cut.az);
-    const float wantEl = std::fabs(sty.cut.el);
-    const float wantR = std::fabs(sty.cut.reach);
+    //
+    // OVER THE WHOLE PATH, because a cut may be several legs (strokes.h "A CUT
+    // IS A PATH") and the channel a stroke travels in is a fact about its
+    // total displacement, not about whichever leg happens to be first.
+    const StrokeSegment cutAll = sty.CutTravel();
+    const float wantAz = std::fabs(cutAll.az);
+    const float wantEl = std::fabs(cutAll.el);
+    const float wantR = std::fabs(cutAll.reach);
     const std::string n = "\"" + sty.name + "\"";
     const bool natural = !(sty.weapon.empty() || sty.weapon == "held");
     // AN AIM EFFECTOR IS ONE THE RIG CANNOT SERVE WITH A CHAIN, and the rig is
@@ -1758,14 +1763,16 @@ Status GateNpcStyles(Ctx& c, std::string& detail) {
             "style " + n + " (diagonal) is genuinely diagonal");
     }
     std::printf(
-        "npc-styles %-14s [%-7s] authored (az %.2f el %.2f reach %.2f) -> "
+        "npc-styles %-14s [%-7s] authored (az %.2f el %.2f reach %.2f, %d "
+        "legs) -> "
         "swept commanded arc az %.2f el %.2f; posed arc az %.2f el %.2f "
         "(spans %.2f / %.2f) dr %.2f vox (commanded dr %.2f, r %.2f..%.2f) "
         "over %d cut ticks; effector knuckle path %.2f vox, forward turn "
         "%.2f rad, commanded az %.2f..%.2f, blade %.2f, head pitch commanded %.2f -> "
         "posed %.2f\n",
-        sty.name.c_str(), sty.weapon.c_str(), sty.cut.az, sty.cut.el,
-        sty.cut.reach, az, el, posedAz, posedEl, azSpan, elSpan, dr, cmdDr,
+        sty.name.c_str(), sty.weapon.c_str(), cutAll.az, cutAll.el,
+        cutAll.reach, (int)sty.cut.size(),
+        az, el, posedAz, posedEl, azSpan, elSpan, dr, cmdDr,
         cmdRMin, cmdRMax, cutTicks, edgePath, fwdTurn,
         cmdAzLo, cmdAzHi, blade,
         aimCmdPitchHi > aimCmdPitchLo ? aimCmdPitchHi - aimCmdPitchLo : 0.0f,

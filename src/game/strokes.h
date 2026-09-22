@@ -34,6 +34,17 @@
 //     "jitter":  { "az": 0.20, "el": 0.08, "tempo": 0.25 }
 //   }
 //
+// ...and `cut` MAY BE A LIST OF LEGS instead of one segment, which is the only
+// way to author a stroke that is not a straight line (2026-09-21):
+//
+//     "cut": [
+//       { "ticks": 4, "az": -1.10, "el": -0.35, "reach":  0.20 },
+//       { "ticks": 5, "az": -1.20, "el":  0.35, "reach": -0.10, "aim": true }
+//     ]
+//
+// See "A CUT IS A PATH" below for what the legs mean and which one meets the
+// target. One segment and a one-leg list are the same program.
+//
 // WINDUP is a POSE, in the mob's own facing basis, expressed RELATIVE TO THE
 // AIM (see below): azimuth 0 straight ahead and positive to the mob's right,
 // elevation 0 level, `reach` a fraction of the arm's own reach band so a lunge
@@ -56,6 +67,34 @@
 // enough.
 //
 // ---------------------------------------------------------------------------
+// A CUT IS A PATH (2026-09-21)
+//
+// One segment can only express a straight line through the target: the deltas
+// are divided by the ticks and delivered at a constant rate, so every cut in
+// the library was a chord. A hook that comes round the guard, a chop that
+// drops and then drags, a feint that checks and re-commits — none of them had
+// an authoring surface, and "add another style" cannot make one, because the
+// thing missing is INSIDE one stroke.
+//
+// So `cut` is a LIST OF LEGS, run back to back inside the one Cut phase. Each
+// leg is an ordinary `StrokeSegment` and means exactly what the single cut
+// meant: a TRAVEL from wherever the previous leg ended, its deltas divided by
+// its own `ticks`. The path is therefore CUMULATIVE — leg 2's `az` is measured
+// from the end of leg 1, not from the start of the cut — because that is what
+// makes an author able to lengthen leg 1 without re-typing everything after it.
+//
+// THE PHASE DOES NOT SPLIT. `Phase::Cut` covers the whole path, `cutTicks` is
+// its total and `phaseTick` counts across it, so everything outside this file
+// that asks "is this stroke cutting" or "how many cut ticks are left" — the
+// damage sweep, the bite holdout, the dev readout, every gate — is unchanged
+// and needs to know nothing about legs. A leg boundary is a change of velocity,
+// not a change of state; there is no frame of hand-back between them.
+//
+// A leg that travels nowhere is a HITCH, and is legal: it holds the point where
+// it is for its ticks, which is the hesitation in a feint. What is refused is a
+// whole path that travels nowhere — see the loader.
+//
+// ---------------------------------------------------------------------------
 // THE CUT IS CENTRED ON THE AIM, AND THE AIM IS TAKEN ONCE
 //
 // A committed cut does not home. The aim — the target's bearing and elevation
@@ -66,6 +105,15 @@
 // the aim so that the MIDDLE of the travel passes through it, rather than the
 // beginning. A stroke aimed at its own start point cuts the air behind the
 // target every time.
+//
+// WITH A PATH, "half a cut" BECOMES "WHICH LEG MEETS THEM", and it is authored
+// rather than assumed: a leg may say `"aim": true`, and the target then sits at
+// the middle of THAT leg (`AttackStyle::CutAimOffset`). Unstated, the aim sits
+// at the midpoint of the whole travel, which for a one-leg cut is the old
+// `cut/2` exactly. It matters because the midpoint of a dogleg is often the
+// corner — the one point on the path where the blade is slowest and turning —
+// and a hook whose target sits there lands its hesitation on them instead of
+// its edge.
 //
 // ---------------------------------------------------------------------------
 // VARIATION IS DETERMINISTIC (CLAUDE.md rule 1)
@@ -92,6 +140,14 @@ struct StrokeSegment {
   float el = 0;
   float reach = 0;
 };
+
+// HOW MANY LEGS ONE CUT MAY HAVE. A ceiling because the live cursor carries
+// the jittered tick count of each leg in a fixed array (a stroke program is
+// per-creature presentation state stepped every tick; it does not allocate),
+// and because a path with more corners than this is a clip rather than a
+// stroke — the body animation lane is where that belongs. The loader drops the
+// extras LOUDLY rather than silently truncating the motion.
+constexpr int kMaxCutLegs = 6;
 
 struct StrokeJitter {
   float az = 0;      // radians of start-azimuth bow, +-
@@ -204,9 +260,63 @@ struct AttackStyle {
   std::string name;    // the id a behaviour profile refers to
   std::string label;   // human text for the dev readout
   StrokeSegment windup;
-  StrokeSegment cut;
+  // THE CUT PATH, one leg or several ("A CUT IS A PATH" above). NEVER EMPTY
+  // after `LoadAttackStyles` — a style whose whole path travels nowhere is
+  // refused rather than loaded as a cut with no legs, so every reader may say
+  // `cut[0]` and every writer that builds a style by hand owes it one leg.
+  std::vector<StrokeSegment> cut{StrokeSegment{7, -2.0f, 0.0f, 0.10f}};
+  // WHICH LEG THE TARGET IS IN THE MIDDLE OF (`"aim": true` on that leg);
+  // -1 = the midpoint of the whole travel, which is what a one-leg cut has
+  // always done.
+  int aimLeg = -1;
   StrokeRecover recover;
   StrokeJitter jitter;
+
+  // ---- THE PATH, READ THREE WAYS ------------------------------------------
+  // Here rather than at the call sites because a gate, the dev readout and the
+  // runner all need the same arithmetic, and three copies of "sum the legs" is
+  // three chances for one of them to still think a cut is a chord.
+
+  // The whole travel, summed: what a single segment with these numbers would
+  // have been, `ticks` included. This is the displacement a style ASKS for and
+  // what "is this style azimuth-dominant" is a question about.
+  StrokeSegment CutTravel() const {
+    StrokeSegment t{0, 0, 0, 0};
+    for (const StrokeSegment& s : cut) {
+      t.ticks += s.ticks;
+      t.az += s.az;
+      t.el += s.el;
+      t.reach += s.reach;
+    }
+    return t;
+  }
+  // Cumulative travel from the start of the cut through leg `k` INCLUSIVE, so
+  // `CutThrough(k)` is where the point stands when leg k ends. `k < 0` is the
+  // start of the path, which is what makes the aim arithmetic below one line.
+  StrokeSegment CutThrough(int k) const {
+    StrokeSegment t{0, 0, 0, 0};
+    for (int i = 0; i <= k && i < (int)cut.size(); i++) {
+      t.ticks += cut[i].ticks;
+      t.az += cut[i].az;
+      t.el += cut[i].el;
+      t.reach += cut[i].reach;
+    }
+    return t;
+  }
+  // WHERE THE TARGET SITS ALONG THE PATH, measured from the cut's start. The
+  // windup lands at `aim - this`, and leg k therefore ends at
+  // `aim - this + CutThrough(k)`.
+  void CutAimOffset(float& az, float& el) const {
+    if (aimLeg >= 0 && aimLeg < (int)cut.size()) {
+      const StrokeSegment before = CutThrough(aimLeg - 1);
+      az = before.az + 0.5f * cut[aimLeg].az;
+      el = before.el + 0.5f * cut[aimLeg].el;
+      return;
+    }
+    const StrokeSegment all = CutTravel();
+    az = 0.5f * all.az;
+    el = 0.5f * all.el;
+  }
   // ---- WHAT SWINGS IT (plan §4/§5) ---------------------------------------
   // "held" (the default, and every style authored before this existed) or the
   // NAME of a natural weapon on the creature's own rig (mob.h
@@ -334,8 +444,20 @@ struct StrokeCursor {
   int style = -1;
   int phaseTick = 0;         // ticks spent in the current phase
   int windupTicks = 0;       // after tempo jitter
-  int cutTicks = 0;
+  int cutTicks = 0;          // the WHOLE path, every leg (see "A CUT IS A PATH")
   int recoverTicks = 0;
+  // ---- THE PATH, AS THIS SWING WILL ACTUALLY RUN IT -----------------------
+  // The tempo jitter is applied PER LEG and resolved once at BeginStrokeProgram
+  // rather than re-derived per tick: rounding each leg independently every tick
+  // would let a boundary move under the drive, and a leg whose remaining ticks
+  // changed mid-leg is a velocity step — the exact discontinuity `swing-smooth`
+  // exists to catch. `cutTicks` is the sum of these, which is why nothing
+  // outside this file has to know they exist.
+  int cutLegs = 1;
+  int legTicks[kMaxCutLegs] = {0, 0, 0, 0, 0, 0};
+  // Which leg the cut is in right now, recorded for the dev readout and the
+  // gates. Derived from `phaseTick` by the runner; never an input.
+  int cutLeg = 0;
   // How many of `recoverTicks` are DRIVEN to the style's return pose before
   // the button is released (StrokeRecover::settle, resolved and clamped at
   // BeginStrokeProgram). 0 = release immediately, the historical recover.
