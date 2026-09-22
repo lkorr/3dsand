@@ -43,6 +43,13 @@
 //                  that disagree on the seed regenerate different terrain for
 //                  every chunk the store does NOT hold, which is most of
 //                  them, and today nothing in the file would catch it.
+//
+//                  'SVM6' (PLAN_save_system.md S1) appends the WORLDGEN
+//                  FINGERPRINT after the pair: u64 value, u32 part count,
+//                  then that many u32 per-input hashes (see
+//                  WorldgenFingerprint below). SVM5 and SVM4 still load, with
+//                  the fingerprint UNKNOWN -- the same append-only argument
+//                  SVM5 made for the tick and seed.
 //   r_x_y_z.svr    the chunk store's voxel region files (chunkstore.cpp).
 //   entities.sve   OPTIONAL entity state — everything that lives OUTSIDE the
 //                  voxel grid (rigidbodies, mobs, the avatar). See below.
@@ -53,6 +60,72 @@
 // reads meta, points the store at the directory (regions lazy-load from
 // disk), re-fills the window from it (procgen for misses), wakes the world,
 // and applies the entity sections.
+//
+// ---- THE SAVE IS A DELTA FROM THE SEED (PLAN_save_system.md S1) ------------
+//
+// A saved world is `genChunk(seed, generator)` PLUS the store. The resident
+// flush puts in only the chunks something wrote since they entered the window
+// (Stream::FlushResident says how that is proven, and when it falls back to
+// the old write-everything flush); a pristine chunk costs zero bytes and is
+// regenerated on load. That is only sound while the GENERATOR is the same one
+// that made the pristine chunks the save leans on -- hence the fingerprint.
+//
+// NO PRUNE of pristine chunks that an OLDER save (or a full-flush fallback)
+// already wrote. Proving a stored chunk equals what genChunk would make needs
+// the chunk generated and compared, which is a GPU dispatch per chunk the CPU
+// cannot shortcut (there is no CPU genChunk). What is provable without that:
+// a chunk that entered the window FROM the store and left unmodified is still
+// in the store and is simply not re-written -- it may hold a real edit, so it
+// stays. Old full saves therefore keep their dead weight until a regen.
+//
+// ---- THE WORLDGEN FINGERPRINT (SVM6) ---------------------------------------
+//
+// WHAT IT HASHES: the generator's INPUTS, not its output. Chosen over probing
+// genChunk for a handful of chunks because a probe needs scratch slots in a
+// live window (every slot is owned by the residency map; the only gen path is
+// FillSlots' list dispatch into real slots) and a GPU round trip at every save
+// and load, while the inputs are all CPU-readable files. The cost is the file
+// reads, dominated by the tree atlases (~8.6 MB); SaveReport::fingerprint.ms
+// and the save/load log lines report it. The parts, each FNV-1a 32:
+//   [0] worldgen.wgsl AS LoadShader ASSEMBLES IT (world-constant prelude, the
+//       tuning constants worldgen references -- TUNE_VEGETATION and
+//       TUNE_GROUND_COVER today -- common.wgsl, the body), with every comment
+//       stripped and whitespace runs collapsed, so a comment edit does not
+//       move it and a code edit does;
+//   [1] the world map dir (biomes::EnvironmentStamp::map);
+//   [2] biomes + water presets (EnvironmentStamp::biomes);
+//   [3] tree species + baked atlases (EnvironmentStamp::trees);
+//   [4] the authored edit layer, if tuning names one (it re-applies to every
+//       chunk genChunk makes, so it is part of the generator in effect);
+//   [5] the material NAME table (worldgen writes ids; meta already refuses a
+//       reordered table, this is belt and braces for the value).
+// The u64 is FNV-1a 64 over a recipe version and the parts.
+//
+// BLIND SPOTS, stated: C++ that packs the environment tables (PackWorldMap,
+// the tree atlas remap) can change generation without any input file moving;
+// and the fingerprint describes the files ON DISK when it is computed, not
+// what was uploaded -- a session that edited a biome and never applied it
+// fingerprints the edit. A probe hash would close both; it is the upgrade if
+// either bites.
+//
+// POLICY ON MISMATCH AT LOAD: LOAD, LOUDLY. The file's parts are compared
+// with this build's and the differing ones are named; `WorldStamp::
+// worldgenMismatch` is set for the caller and the save-load gate reports it
+// into build/last_run.json. NOT a refusal: dev iteration changes worldgen
+// daily and refusing would kill every dev save. The consequence is visible,
+// not silent: pristine chunks regenerate from the CURRENT generator and can
+// seam against stored ones.
+//
+// OPEN QUESTION (deferred, must be decided before a shipped save format): what
+// a SHIPPED game does when a patch changes the generator under an existing
+// save. Options on the table: (a) freeze generator versions -- every save names
+// its generator and the build keeps each old one it ever shipped; (b) new
+// generation only in never-visited chunks -- requires recording which chunks a
+// save has ever generated (a visited set per region), so a changed generator
+// can be applied only beyond it; (c) bake-on-upgrade -- regenerate the visited
+// set with the OLD generator once and store it, turning the implicit delta
+// into an explicit one. None is implemented; today's answer is the dev policy
+// above.
 //
 // Because the bound store also LRU-spills to the same directory while
 // streaming, the directory is a live world store; a store already bound to a
@@ -120,6 +193,39 @@ struct WorldStamp {
   uint32_t tick = 0;
   uint32_t seed = 0;
   bool known = false;
+  // ---- SVM6 (PLAN_save_system.md S1) ----
+  // LOAD: what the file carried, and whether it disagreed with this build.
+  // SAVE: ignored on input -- SaveWorld computes the fingerprint itself, with
+  // the same function LoadWorld compares against, so the two cannot drift.
+  uint64_t worldgenFingerprint = 0;
+  bool fingerprintKnown = false;   // false for an SVM5/SVM4 file
+  bool worldgenMismatch = false;   // known AND different from this build's
+};
+
+// The generator's identity (see the header comment). `parts` exists so a
+// mismatch names WHICH input moved instead of printing one opaque number.
+struct WorldgenFingerprint {
+  static constexpr uint32_t kParts = 6;
+  static constexpr uint32_t kRecipe = 1;  // bump if the recipe itself changes
+  uint64_t value = 0;
+  uint32_t parts[kParts] = {};
+  double ms = 0;  // what computing it cost
+};
+WorldgenFingerprint ComputeWorldgenFingerprint(const std::string& assetDir,
+                                               const std::vector<MaterialDef>& mats);
+// Short name of part i ("wgsl", "map", "biomes", "trees", "editLayer",
+// "materials"), for log lines.
+const char* WorldgenFingerprintPartName(uint32_t i);
+
+// Optional in/out record of one SaveWorld. `forceFullFlush` is the only input
+// (the pre-S1 write-every-resident-chunk behaviour, kept for measurement);
+// everything else is filled in.
+struct SaveReport {
+  bool forceFullFlush = false;
+  Stream::FlushReport flush;
+  size_t regions = 0;
+  uint64_t bytes = 0;  // ChunkStore::Flush's bytesOut: region files written
+  WorldgenFingerprint fingerprint;
 };
 
 // `stamp` is what to WRITE (pass {} and the file records tick 0 / seed 0 with
@@ -128,7 +234,8 @@ struct WorldStamp {
 // apart from the two appended words.
 bool SaveWorld(GpuContext& ctx, World& world, Stream& stream,
                const std::string& path, const std::vector<MaterialDef>& mats,
-               const EntityIO* entities = nullptr, WorldStamp stamp = {});
+               const EntityIO* entities = nullptr, WorldStamp stamp = {},
+               SaveReport* report = nullptr);
 // `stampOut`, when non-null, receives what the file carried. `known` is false
 // for an SVM4 file; the two numbers are then 0 and MUST NOT be used to set a
 // clock (see the SVM4 paragraph at the top).

@@ -33,41 +33,180 @@ namespace selftest {
 namespace {
 
 // ---- save-load ---------------------------------------------------------
+//
+// THREE CLAIMS, one gate (PLAN_save_system.md S1):
+//
+//  A. ROUND TRIP THROUGH THE DELTA. Snapshot at tick 100, diverge 50 ticks,
+//     load -- the world hash must return exactly to the snapshot value. The
+//     save now stores ONLY modified chunks, so this is also the proof that
+//     every pristine chunk regenerates identically from (seed, generator) and
+//     that the unpublished snapshot tail was folded (the last SelftestOps land
+//     inside it). The gate FAILS if the delta path was not taken -- a silent
+//     fallback to the full flush would pass the hash and prove nothing.
+//  B. AN UNTOUCHED WORLD COSTS ALMOST NOTHING. Fresh worldgen + 30 idle ticks
+//     (so gen-settle activity is included -- PLAN S2 attributes that), saved:
+//     the bytes must stay under tests/baseline.json saveUntouchedMaxBytes, and
+//     the reload must hash identically. SANDVOX_SAVE_MEASURE_FULL=1 also saves
+//     the same world through the pre-S1 full flush and prints both numbers.
+//  C. THE WORLDGEN FINGERPRINT (SVM6). The unperturbed reload reports it
+//     known and matching; a meta.svm whose stored fingerprint was faked loads
+//     ANYWAY with worldgenMismatch set; an SVM5-shaped meta loads with the
+//     fingerprint unknown and no mismatch.
+//
+// The harness drives SubmitTick without Stream::Update, so it calls
+// FoldSnapshot after every tick -- exactly the one duty the game's Update
+// performs for the save path (stream.h, FlushResident).
 Status GateSaveLoad(Ctx& c, std::string& detail) {
   GpuContext& ctx = c.ctx;
   World& world = c.world;
   Simulation& sim = c.sim;
   Stream& stream = c.stream;
-// M2 save/load: snapshot at tick 100, diverge 50 ticks, load — the world
-// hash must return exactly to the snapshot value (stamp bytes excluded).
-bool saveOk = false;
-{
   const char* kPath = "selftest_world.svd";
+  const char* kPathU = "selftest_world_untouched.svd";
+  const char* kPathF = "selftest_world_full.svd";
+  std::filesystem::remove_all(kPath);
+  std::filesystem::remove_all(kPathU);
+  std::filesystem::remove_all(kPathF);
+  // Detach from any directory an earlier gate left bound, and tell the stream
+  // the window is about to be regenerated from nothing -- what the game's
+  // regen does (main.cpp: OnRegen, then SubmitWorldgen).
+  stream.Store().Unbind();
+
+  // ---- A: round trip through the delta ----
+  stream.OnRegen();
   SubmitWorldgen(ctx, world, sim, kDefaultSeed);
   ctx.WaitIdle();
   uint32_t t = 3000;
-  for (int i = 0; i < 100; i++)
+  for (int i = 0; i < 100; i++) {
     SubmitTick(ctx, world, sim, ++t, kDefaultSeed, SelftestOps(i, kDefaultSeed), {}, {}, false,
                {8, 3, 8}, false, false);
+    stream.FoldSnapshot();
+  }
   ctx.WaitIdle();
-  uint32_t h1 = HashWorldNow(ctx, world, sim, kDefaultSeed);
-  bool saved = SaveWorld(ctx, world, stream, kPath, c.mats);
+  const uint32_t h1 = HashWorldNow(ctx, world, sim, kDefaultSeed);
+  SaveReport repA;
+  const bool saved = SaveWorld(ctx, world, stream, kPath, c.mats, nullptr, {}, &repA);
   for (int i = 100; i < 150; i++)
     SubmitTick(ctx, world, sim, ++t, kDefaultSeed, SelftestOps(i, kDefaultSeed), {}, {}, false,
                {8, 3, 8}, false, false);
   ctx.WaitIdle();
-  uint32_t hDiverged = HashWorldNow(ctx, world, sim, kDefaultSeed);
-  bool loaded = LoadWorld(ctx, world, sim, stream, kPath, c.mats);
-  uint32_t h2 = HashWorldNow(ctx, world, sim, kDefaultSeed);
-  saveOk = saved && loaded && h1 == h2 && h1 != hDiverged;
-  std::printf("save/load: %s (hash %08x -> diverged %08x -> restored %08x)\n",
-              saveOk ? "PASS" : "FAIL", h1, hDiverged, h2);
-  stream.Store().Unbind();  // detach before deleting the directory
+  const uint32_t hDiverged = HashWorldNow(ctx, world, sim, kDefaultSeed);
+  WorldStamp lsA;
+  const bool loaded = LoadWorld(ctx, world, sim, stream, kPath, c.mats, nullptr, &lsA);
+  const uint32_t h2 = HashWorldNow(ctx, world, sim, kDefaultSeed);
+  const bool okA = saved && loaded && h1 == h2 && h1 != hDiverged && repA.flush.delta;
+  std::printf("save/load: %s (hash %08x -> diverged %08x -> restored %08x; %s, %u of "
+              "%u chunks stored, %u via the %u-tick tail, %.2f MB)\n",
+              okA ? "PASS" : "FAIL", h1, hDiverged, h2,
+              repA.flush.delta ? "DELTA" : repA.flush.why.c_str(), repA.flush.stored,
+              kNumChunks, repA.flush.tailOnly, repA.flush.tailTicks, repA.bytes / 1e6);
+  stream.Store().Unbind();
   std::filesystem::remove_all(kPath);
-}
 
-  // Verdict: the flag the moved body already computed.
-  return saveOk ? Status::Pass : Status::Fail;
+  // ---- B: an untouched world ----
+  stream.OnRegen();
+  SubmitWorldgen(ctx, world, sim, kDefaultSeed);
+  ctx.WaitIdle();
+  t = 5000;
+  for (int i = 0; i < 30; i++) {
+    SubmitTick(ctx, world, sim, ++t, kDefaultSeed, {}, {}, {}, false, {8, 3, 8}, false, false);
+    stream.FoldSnapshot();
+  }
+  ctx.WaitIdle();
+  const uint32_t hU = HashWorldNow(ctx, world, sim, kDefaultSeed);
+  SaveReport repU;
+  const bool savedU = SaveWorld(ctx, world, stream, kPathU, c.mats, nullptr, {}, &repU);
+  const double maxBytes = BaselineNumber("saveUntouchedMaxBytes", -1.0);
+  RecordObserved("saveUntouchedBytes", (double)repU.bytes);
+  RecordObserved("saveUntouchedChunks", (double)repU.flush.stored);
+  const bool sizeOk = repU.flush.delta && (maxBytes < 0.0 || (double)repU.bytes <= maxBytes);
+
+  // ---- C: the worldgen fingerprint, on the untouched save (small, fast) ----
+  WorldStamp lsU;
+  const bool loadedU = LoadWorld(ctx, world, sim, stream, kPathU, c.mats, nullptr, &lsU);
+  const uint32_t hU2 = HashWorldNow(ctx, world, sim, kDefaultSeed);
+  const bool roundU = savedU && loadedU && hU == hU2;
+  const bool fpClear = lsU.fingerprintKnown && !lsU.worldgenMismatch &&
+                       lsU.worldgenFingerprint == repU.fingerprint.value;
+
+  const std::string metaPath = std::string(kPathU) + "/meta.svm";
+  std::vector<uint8_t> meta;
+  {
+    FILE* fp = std::fopen(metaPath.c_str(), "rb");
+    if (fp) {
+      std::fseek(fp, 0, SEEK_END);
+      meta.resize((size_t)std::ftell(fp));
+      std::fseek(fp, 0, SEEK_SET);
+      if (std::fread(meta.data(), 1, meta.size(), fp) != meta.size()) meta.clear();
+      std::fclose(fp);
+    }
+  }
+  auto writeMeta = [&](const std::vector<uint8_t>& bytes) {
+    FILE* fp = std::fopen(metaPath.c_str(), "wb");
+    if (!fp) return false;
+    const bool ok = std::fwrite(bytes.data(), 1, bytes.size(), fp) == bytes.size();
+    std::fclose(fp);
+    return ok;
+  };
+  // SVM6 tail (worldio.cpp): ... tick seed | fpLo fpHi | nParts | parts[nParts]
+  const size_t kFpTail = 4 * (2 + 1 + WorldgenFingerprint::kParts);
+  bool fpFlagged = false, fpLoadedAnyway = false, svm5Ok = false;
+  if (meta.size() > kFpTail + 8) {
+    // FAKE THE STORED VALUE: the generator that "wrote" this save differs from
+    // this build's in its code (part 0). The load must succeed and say so.
+    std::vector<uint8_t> faked = meta;
+    faked[meta.size() - kFpTail] ^= 0x5A;                  // fingerprint low byte
+    faked[meta.size() - 4 * WorldgenFingerprint::kParts] ^= 0x5A;  // parts[0]
+    WorldStamp lsF;
+    if (writeMeta(faked)) {
+      fpLoadedAnyway = LoadWorld(ctx, world, sim, stream, kPathU, c.mats, nullptr, &lsF);
+      fpFlagged = lsF.fingerprintKnown && lsF.worldgenMismatch;
+    }
+    // AN SVM5 FILE: the same record, cut before the fingerprint, old magic.
+    std::vector<uint8_t> v5(meta.begin(), meta.end() - kFpTail);
+    v5[3] = '5';
+    WorldStamp ls5;
+    if (writeMeta(v5)) {
+      const bool l5 = LoadWorld(ctx, world, sim, stream, kPathU, c.mats, nullptr, &ls5);
+      svm5Ok = l5 && ls5.known && !ls5.fingerprintKnown && !ls5.worldgenMismatch;
+    }
+    writeMeta(meta);
+  }
+
+  // ---- the "before" number, on demand: the pre-S1 full flush ----
+  uint64_t fullBytes = 0;
+  if (const char* e = std::getenv("SANDVOX_SAVE_MEASURE_FULL"); e && e[0] == '1') {
+    stream.Store().Unbind();
+    SaveReport repF;
+    repF.forceFullFlush = true;
+    if (SaveWorld(ctx, world, stream, kPathF, c.mats, nullptr, {}, &repF)) {
+      fullBytes = repF.bytes;
+      std::printf("save-load: untouched world, FULL flush (pre-S1): %.2f MB in %zu "
+                  "regions vs DELTA %.2f MB in %zu regions\n",
+                  repF.bytes / 1e6, repF.regions, repU.bytes / 1e6, repU.regions);
+    }
+    stream.Store().Unbind();
+    std::filesystem::remove_all(kPathF);
+  }
+  stream.Store().Unbind();
+  std::filesystem::remove_all(kPathU);
+
+  const bool okB = sizeOk && roundU;
+  const bool okC = fpClear && fpFlagged && fpLoadedAnyway && svm5Ok &&
+                   lsA.fingerprintKnown && !lsA.worldgenMismatch;
+  detail = Format(
+      "A: delta=%d stored=%u/%u tailOnly=%u tailTicks=%u restored=%d | B: untouched "
+      "bytes=%llu (max %.0f) stored=%u roundtrip=%d%s | C: fp=%016llx (%.1f ms) "
+      "clear=%d worldgenMismatch=%d loadedAnyway=%d svm5=%d",
+      repA.flush.delta ? 1 : 0, repA.flush.stored, kNumChunks, repA.flush.tailOnly,
+      repA.flush.tailTicks, okA ? 1 : 0, (unsigned long long)repU.bytes, maxBytes,
+      repU.flush.stored, roundU ? 1 : 0,
+      fullBytes ? Format(" fullFlushBytes=%llu", (unsigned long long)fullBytes).c_str() : "",
+      (unsigned long long)repU.fingerprint.value, repU.fingerprint.ms, fpClear ? 1 : 0,
+      fpFlagged ? 1 : 0, fpLoadedAnyway ? 1 : 0, svm5Ok ? 1 : 0);
+  const bool ok = okA && okB && okC;
+  std::printf("save-load: %s (%s)\n", ok ? "PASS" : "FAIL", detail.c_str());
+  return ok ? Status::Pass : Status::Fail;
 }
 
 // ---- save-entities -----------------------------------------------------

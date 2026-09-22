@@ -514,16 +514,16 @@ std::string ReferencedTuningBlock(const std::string& block, const std::string& t
   return out;
 }
 
-rhi::ShaderModule LoadShader(const rhi::Device& device, const std::string& shaderDir,
-                             const std::string& name) {
+bool AssembleShaderSource(const std::string& shaderDir, const std::string& name,
+                          std::string& out) {
   std::string common, body;
   if (!ReadFileText(shaderDir + "/common.wgsl", common)) {
     std::fprintf(stderr, "cannot read %s/common.wgsl\n", shaderDir.c_str());
-    return {};
+    return false;
   }
   if (!ReadFileText(shaderDir + "/" + name, body)) {
     std::fprintf(stderr, "cannot read %s/%s\n", shaderDir.c_str(), name.c_str());
-    return {};
+    return false;
   }
   // The seed accessor the page block's JITTER synthesis calls. Empty unless
   // this shader addresses voxels, which is exactly when the block survives.
@@ -546,7 +546,7 @@ rhi::ShaderModule LoadShader(const rhi::Device& device, const std::string& shade
                    "world seed for JITTER synthesis. Add one, or the sentinel "
                    "reads would differ from the page they synthesize.\n",
                    name.c_str());
-      return {};
+      return false;
     }
   }
   // Tuning constants sit between the world prelude and common.wgsl: they may
@@ -560,9 +560,15 @@ rhi::ShaderModule LoadShader(const rhi::Device& device, const std::string& shade
   // the rest would only make the cache key move when they do.
   const std::string tuningBlock =
       ReferencedTuningBlock(TuningWgslBlock(CurrentTuning()), ptSeed + common + body);
-  std::string src = ShaderConstantPrelude() + "\n" + tuningBlock + "\n" + ptSeed +
-                    common + "\n" + body;
+  out = ShaderConstantPrelude() + "\n" + tuningBlock + "\n" + ptSeed + common +
+        "\n" + body;
+  return true;
+}
 
+rhi::ShaderModule LoadShader(const rhi::Device& device, const std::string& shaderDir,
+                             const std::string& name) {
+  std::string src;
+  if (!AssembleShaderSource(shaderDir, name, src)) return {};
   return device.CreateShaderModule(src, name.c_str());
 }
 

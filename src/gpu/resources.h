@@ -68,6 +68,13 @@ bool RenderStatsEnabled();
 // an invalid module on read failure.
 rhi::ShaderModule LoadShader(const rhi::Device& device, const std::string& shaderDir,
                              const std::string& name);
+// The exact WGSL text LoadShader would compile, without compiling it. False
+// (with a message) on read failure. The save format's worldgen fingerprint
+// (sim/worldio.h) hashes worldgen.wgsl through this so it sees the same
+// preludes, the same stripped common.wgsl blocks and the same referenced
+// tuning constants the GPU does — one assembly, two consumers.
+bool AssembleShaderSource(const std::string& shaderDir, const std::string& name,
+                          std::string& out);
 
 rhi::ComputePipeline MakeComputePipeline(const rhi::Device& device,
                                          const rhi::PipelineLayout& layout,

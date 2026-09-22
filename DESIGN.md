@@ -23,7 +23,7 @@ procedurally generated world, alchemy, spells, and online multiplayer.
 | Simulation location | **GPU compute shaders** (CA, particles, worldgen) | Proven viable at 100M+ voxel scale; CPU cannot touch this throughput |
 | What stays on CPU | Rigidbodies, gameplay, projectiles, networking, streaming | Needs branching logic, engine APIs, and authoritative game state |
 | Voxel format | **16 bits: 12-bit material ID + 4-bit state** | 4,096 materials; ~200 MB for a 512³-scale resident region |
-| Chunk size | **16³ voxels (4,096 voxels, 8 KB)** | Fine-grained dirty/sleep granularity; cheap streaming unit |
+| Chunk size | **16³ voxels (4,096 voxels, 16 KiB of 32-bit words)** | Fine-grained dirty/sleep granularity; cheap streaming unit |
 | Sim tick rate | **Fixed 30 Hz**, decoupled from render | Determinism of *timing*, halves sim cost vs 60, imperceptible for sand |
 | Race handling in CA | **3×3×3 cell-coloring — 27 passes/tick** (deterministic by construction); atomics-CAS as an opt-in optimization | Same-color cells are ≥3 apart on every axis while movement reach is ≤1, so destination writes are provably disjoint: race-free AND bit-deterministic across GPUs — keeps lockstep networking and replay debugging viable (see §4 for why chunk-level checkerboarding alone is insufficient) |
 | Materials | **Data-driven JSON → compiled to GPU lookup tables**, hot-reloadable | Moddability requirement; iteration speed |
@@ -255,7 +255,7 @@ one opaque colour. And **the palette is per-document, merged at load**: colours
 are deduplicated across mob defs, so 128 slots cover a whole cast.
 
 ### Chunks
-- **16³ voxels = 8 KB per chunk.**
+- **16³ voxels = 16 KiB per chunk** (4,096 32-bit words since the stain layer widened the word).
 - Resident region: a rolling N³-chunk cube centered on the player (initial target
   N = 32 → 512³ voxels ≈ 134M voxels ≈ 268 MB device memory; tune to hardware).
 - **Toroidal addressing**: the resident array never shifts in memory. Moving the
@@ -325,6 +325,47 @@ are deduplicated across mob defs, so 128 slots cover a whole cast.
   invariant holds from tick one); anything saved mid-flight lands where it
   was, accepted. Entity state is CPU-float gameplay state outside the hashed
   domain (§7), so the grid hash round-trip is unchanged.
+- **The save stores the delta, and meta names its generator (2026-09-22,
+  `docs/PLAN_save_system.md` S1).** A saved world is `genChunk(seed,
+  generator)` plus the store. `Stream::FlushResident` used to write all 32,768
+  resident slots, pristine ones included (JITTER and mixed surface chunks
+  RLE-expand to 22–32 KiB each); it now stores only the slots something wrote
+  since they entered the window — the rule eviction already used — and a
+  pristine chunk costs zero bytes and regenerates on load. **Measured, fresh
+  worldgen + 30 idle ticks: 279.06 MB (all 32,768 chunks) → 18.09 MB (1,485
+  chunks, every one of them gen-settle activity that S2 attributes).** Two
+  things make that exact rather than "exact except the last few ticks": the
+  save drains the in-flight snapshot readbacks and ORs the K=4
+  delivered-but-unpublished snapshots' dirty flags into a LOCAL mask (the
+  save-load gate's round trip needs it: 9 of its 1,688 stored chunks are
+  reachable only through that tail), and the delta is taken only when it is
+  PROVABLE — every tick encoded since the last wholesale refill has a snapshot
+  whose flags reached the mask (`WorldSnapshot::submitSeq`, one per tick,
+  gap-free, counted before the ring can decline) and the snapshot epoch did not
+  move behind the stream. Otherwise it is the old full flush with the reason
+  printed. The game satisfies this by construction (`Update` folds every
+  tick); a harness that ticks without `Update` calls `Stream::FoldSnapshot()`
+  per tick or gets the full flush (`save-entities` does, on purpose, and keeps
+  exercising that path). **No prune:** a stored chunk cannot be proven pristine
+  without generating it on the GPU and comparing, so chunks an older (full)
+  save wrote stay until a regen; a chunk that entered FROM the store and left
+  unmodified is simply not rewritten. `meta.svm` is **`SVM6`**: after SVM5's
+  tick/seed it appends a u64 **worldgen fingerprint** plus six per-input u32
+  parts — `worldgen.wgsl` exactly as `LoadShader` assembles it (preludes, the
+  tuning constants it references, `common.wgsl`) with comments stripped and
+  whitespace collapsed, the map dir, biomes+water, trees, the edit layer, the
+  material names. INPUTS, not a genChunk probe: a probe needs scratch slots in
+  a live window and a GPU round trip at every save and load; the input hash is
+  CPU file reads, 65–130 ms per save/load measured (the 8.6 MB of tree atlases
+  dominate). Blind spots: C++ table packing, and on-disk-but-unapplied edits.
+  SVM5/SVM4 still load with the fingerprint UNKNOWN. **On mismatch the load
+  proceeds, loudly**, naming the parts that differ, and sets
+  `WorldStamp::worldgenMismatch` (the `save-load` gate reports it into
+  `build/last_run.json`): dev iteration changes worldgen daily. **Open
+  question, deferred:** the SHIPPED policy when a patch changes the generator
+  under a save — frozen generator versions, new generation only in
+  never-visited chunks (needs a visited set), or bake-on-upgrade; spelled out
+  in `worldio.h`.
 - **Deferred shift wake (2026-09-03, R1 of `docs/RESEARCH_streaming_hitch.md`):**
   a window shift no longer FENCES. Until this landed, `Stream::FillSlots`
   submitted the plane's `worldgenList` and then blocked on a readback of
@@ -13847,7 +13888,8 @@ tag, the manifest crosses on join in slices before the first batch, and
 either side answers a `ChunkGet` from its own store (with two peers "the
 machine that has it resident" is always the requester's peer, so symmetry
 replaces a relay; a third player is a second link and a relay table).
-`meta.svm` is `SVM5` with tick and seed; `SVM4` still loads. Two defects
+`meta.svm` is `SVM5` with tick and seed (`SVM6` since 2026-09-22 appends the
+worldgen fingerprint, §3); `SVM4` still loads. Two defects
 this package found on the way in: M9.3-C's five sync messages had fallen
 through into M9.4-D's `EntityBatch` case, so the convergence protocol was
 dead on the wire (`hashBlocks recv = 0`, `late = 38`) — the only symptom of

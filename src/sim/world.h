@@ -3369,6 +3369,11 @@ struct WorldSnapshot {
   uint32_t gasDied = 0;          // decay / outer box / ceiling
   uint32_t gasAboveWindow = 0;   // live parcels above the window's top face
   uint32_t tick = 0;                  // sim tick this snapshot was captured at
+  // World::TicksEncoded() as of the tick that encoded this copy: one per tick,
+  // gap-free, and immune to the harness restarting its tick numbers. The save
+  // path proves "every tick since the window was filled had its dirty flags
+  // folded" by walking these (Stream::FoldSnapshot, PLAN_save_system.md S1).
+  uint32_t submitSeq = 0;
   std::vector<uint8_t> dirtyFlags;    // per-chunk next-tick dirty (kNumChunks)
   // Per-chunk support-loss flags (kNumChunks): the sim saw a supporting voxel
   // (solid/powder) vacate next to a solid there since the last readback.
@@ -3828,6 +3833,22 @@ class World {
   const WorldSnapshot& LatestDelivered() const {
     return ready_.empty() ? snap_ : ready_.back();
   }
+
+  // ---- THE SAVE PATH'S VIEW OF THE PIPELINE (PLAN_save_system.md S1) ------
+  //
+  // A save stores only the chunks that differ from what genChunk would make,
+  // and "differs" is the union of every tick's dirty flags since the window
+  // was filled. Snap() is K ticks behind, so the save also needs the K
+  // snapshots that are delivered but not yet published, and a way to prove
+  // none is missing. Read-only, derived consumers only — the same rule as
+  // LatestDelivered: NOTHING THAT FEEDS THE SIM MAY READ THESE.
+  //
+  // TicksEncoded: one per EncodeReadbacks call, i.e. one per sim tick
+  // (the readback is unconditional since N1), counted BEFORE the ring can
+  // decline — so a tick with no snapshot is a visible hole in submitSeq.
+  uint32_t TicksEncoded() const { return ticksEncoded_; }
+  uint32_t SnapshotEpoch() const { return snapEpoch_; }
+  const std::deque<WorldSnapshot>& DeliveredUnpublished() const { return ready_; }
   const SnapshotPipeStats& SnapshotPipe() const { return snapPipe_; }
   SnapshotPipeStats TakeSnapshotPipe() {
     const SnapshotPipeStats s = snapPipe_;
@@ -4377,6 +4398,7 @@ class World {
     uint32_t particleLivePage = 0;
     uint32_t tick = 0;
     uint32_t epoch = 0;  // pipeline epoch at encode time (see snapEpoch_)
+    uint32_t seq = 0;    // ticksEncoded_ at encode time (WorldSnapshot::submitSeq)
     std::vector<IVec3> fetchIds;  // world chunks riding this slot
     // Sentinel slots are not copied at all (§2.1a); their table entry is
     // recorded here at encode time and their 4,096 words are synthesized on
@@ -4406,6 +4428,7 @@ class World {
   // which unsigned arithmetic would otherwise read as "four billion ticks in
   // the future".
   uint32_t snapEpoch_ = 0;
+  uint32_t ticksEncoded_ = 0;  // see TicksEncoded(); monotonic, never reset
   uint32_t lastEncodeTick_ = 0;
   bool haveEncodeTick_ = false;
   SnapshotPipeStats snapPipe_;

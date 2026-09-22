@@ -495,6 +495,10 @@ bool World::EncodeReadbacks(const rhi::Device&, const rhi::CommandEncoder& enc,
   if (haveEncodeTick_ && tick < lastEncodeTick_) InvalidateSnapshot();
   lastEncodeTick_ = tick;
   haveEncodeTick_ = true;
+  // Counted BEFORE the decline below (see TicksEncoded): a tick that gets no
+  // copy must leave a hole in submitSeq, or the save path could not tell it
+  // happened.
+  const uint32_t seq = ++ticksEncoded_;
   int slot = -1;
   const int active = ActiveReadbackSlots();
   for (int i = 0; i < active; i++) {
@@ -513,6 +517,7 @@ bool World::EncodeReadbacks(const rhi::Device&, const rhi::CommandEncoder& enc,
   Slot& s = slots_[slot];
   s.particleLivePage = particleLivePage;
   s.tick = tick;
+  s.seq = seq;
   s.origin = origin_;
 
   // drain queued chunk fetches into this slot (bounded per tick); anything
@@ -689,6 +694,7 @@ void World::KickReadback() {
         // Set before the parse: the SANDVOX_DIRTY_REASONS diagnostic below
         // stamps its line with it.
         out.tick = sl.tick;
+        out.submitSeq = sl.seq;
         std::memcpy(out.mirror.data(), p, kMirrorBytes);
         // Sentinel chunks were never copied (§2.1a); synthesize their words
         // now, through the SAME rule the shader uses. SynthWord (world.h)
