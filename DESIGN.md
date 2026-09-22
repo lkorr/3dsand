@@ -6548,7 +6548,17 @@ shared items feeding a BUS below it, each branch's subtree standing over its
 own socket, a copy of the delivery cell capping EVERY branch (one word, one
 record, one primary cell that owns it; the rest carry `primary`), the pending
 Mods as beads on the trunk with their composed edit and the wasted ones
-marked, and `CastList::boxPrice` copied onto every bar so
+marked — EXCEPT the one that opened the fan: **a record-wide `count` mod IS the
+junction** and the `Split` node wears its tree node, glyph, edit and span at
+CELL size (2026-09-22), because "one of it becomes several here" and "the word
+that says so" are the same place and drawing them as a 32 px bead a band under
+a 16 px blot made the branch point of the spell the least legible mark on the
+page. A fan opened by LANES alone has no word to wear and stays the blot; a
+count spoken inside a lane splits that branch and stays a bead over its socket;
+a LOSING count word stays a slashed bead. Fusing rather than growing the bead
+is also what keeps "a junction is on the box's axis" true for free — a junction
+is placed there by construction, a bead row of two is not. And
+`CastList::boxPrice` is copied onto every bar so
 the multiplicative price is legible at every level. Instance 0 takes the CENTRE
 slot of the socket row, because rule 4 promises the first lane you open is the
 middle bolt. `Linearize(lib, tree)` says a tree back as words, post-order, with

@@ -868,6 +868,41 @@ int Builder::Place(int node, int32_t lane, int layer, int x, int& outIdx,
     else shared.push_back(ii);
   }
 
+  // THE SPLIT WORD *IS* THE JUNCTION (2026-09-22, from the owner's report).
+  // `shotgun` was a 96x32 bead sitting on the trunk with a 32x16 blot one band
+  // above it, and the picture the owner wanted to see - "sand and gust funnel
+  // into ONE shotgun, and the shotgun funnels into three" - was the picture
+  // being drawn, at a size nobody could read it at: at the fit rung the bead
+  // is 14 px tall and the junction is 4, so the whole branch point of the
+  // spell was two smudges on a line between two full cells.
+  //
+  // They are ONE NODE now. A record-wide count mod is not a thing that edits
+  // the junction, it is the junction - "one of it becomes several HERE" and
+  // "the word that says so" are the same place - so the Split node carries the
+  // mod's tree node, its glyph and its span, and it is a 64 px cell like every
+  // other word on the page. Fusing rather than growing the bead is what keeps
+  // the axis law true for free: a junction is placed on the box's axis by
+  // construction, and a bead row of two is not.
+  //
+  // ONLY the record-wide winner fuses. A count spoken inside a LANE splits that
+  // branch and stays a bead over the socket it splits (there is no per-branch
+  // junction to fuse with until the sub-fan is drawn), and a LOSING count word
+  // - `twin` beside a `shotgun` - is a charged no-op and stays a slashed bead,
+  // which is the whole point of drawing it.
+  int splitWord = -1;
+  if (instances > 1) {
+    for (size_t i = 0; i < mods.size(); i++) {
+      const int mi = mods[i];
+      if (t.nodes[(size_t)mi].group) continue;
+      const GlyphDef* gd = lib.At(t.nodes[(size_t)mi].glyph);
+      if (!gd || gd->field != ModField::Count) continue;
+      if (IsWasted(t.nodes[(size_t)mi].glyph) || IsWastedNode(mi)) continue;
+      splitWord = mi;
+      mods.erase(mods.begin() + (long)i);
+      break;
+    }
+  }
+
   // A MOD IS A BEAD ON A STROKE, NOT A LABEL BESIDE IT (2026-09-21). The tags
   // used to hang off the bar's LEFT end on the bar's own layer, which put
   // `shotgun` out in the margin with a stroke running sideways-and-backwards
@@ -1211,9 +1246,26 @@ int Builder::Place(int node, int32_t lane, int layer, int x, int& outIdx,
     sp.kind = GraphKind::Split;
     sp.treeNode = -1;
     sp.instances = instances;
-    sp.x = x + (boxW - kGraphSplitW) / 2;   // ON THE BOX AXIS, always
     sp.w = kGraphSplitW;
     sp.h = kGraphSplitH;
+    // ...AND IT WEARS THE WORD THAT OPENED IT, when a word did. See the note
+    // over `splitWord`: a record-wide count mod is the junction, drawn at cell
+    // size, and the bead it used to be is gone from the trunk. A fan opened by
+    // LANES alone has no word to wear and stays the blot.
+    if (splitWord >= 0) {
+      const SpellNode& mn = t.nodes[(size_t)splitWord];
+      const GlyphDef* gd = lib.At(mn.glyph);
+      sp.treeNode = splitWord;
+      sp.glyph = mn.glyph;
+      sp.n = mn.n;
+      sp.sort = GlyphSort::Mod;
+      sp.lane = mn.lane;
+      sp.label = gd ? gd->id : "?";
+      sp.edit = (gd && gd->field != ModField::None) ? ModEdit(*gd, mn.n) : std::string();
+      sp.w = kGraphCell;
+      sp.h = kGraphCell;
+    }
+    sp.x = x + (boxW - sp.w) / 2;   // ON THE BOX AXIS, always
     sp.layer = cur;
     sp.baseLayer = cur;
     // The junction SPANS THE WHOLE BOX, so every socket AND every record-wide
@@ -1222,8 +1274,11 @@ int Builder::Place(int node, int32_t lane, int layer, int x, int& outIdx,
     // the header note): the drawn mark is 32 px on the axis.
     sp.subX = x;
     sp.subW = boxW;
-    sp.spanFirst = n.first;
-    sp.spanLast = n.last;
+    // THE SPAN IS THE WORD, when it wears one: hovering the junction lights up
+    // `shotgun` in the sentence, not the whole box, because the junction IS the
+    // shotgun. A bare blot still names its box.
+    sp.spanFirst = splitWord >= 0 ? t.nodes[(size_t)splitWord].first : n.first;
+    sp.spanLast = splitWord >= 0 ? t.nodes[(size_t)splitWord].last : n.last;
     splitIdx = Add(sp);
     cur++;
   };

@@ -625,8 +625,14 @@ GraphCanvasResult SpellGraphCanvas(UIState& s, ImVec2 at, ImVec2 size, bool read
   // a layer is as tall as the heaviest thing standing in it.
   enum Band { kBRule = 0, kBSplit, kBSocket, kBBead, kBCell };
   std::vector<int> layerB((size_t)std::max(1, g.layers), kBRule);
+  // WHICH LAYERS HOLD A JUNCTION, which is no longer answerable from the band:
+  // a junction that wears its split word is a 64 px CELL and lands in kBCell
+  // with every other cell on the page (2026-09-22). The fan's gap rule below
+  // is about the junction, not about its height.
+  std::vector<char> layerSplit((size_t)std::max(1, g.layers), 0);
   for (const UIState::SpellGraphUI::Node& n : g.nodes) {
     if (n.layer < 0 || n.layer >= g.layers) continue;
+    if (n.kind == kSplit) layerSplit[(size_t)n.layer] = 1;
     layerH[(size_t)n.layer] = std::max(layerH[(size_t)n.layer], (float)n.h);
     const int band = n.h >= 64.0f      ? kBCell
                      : n.kind == kModTag ? kBBead
@@ -676,8 +682,9 @@ GraphCanvasResult SpellGraphCanvas(UIState& s, ImVec2 at, ImVec2 size, bool read
     // It gets exactly the gap two CELLS get - no more: measured on this scene,
     // a gap of 42 at 1x put `sand gust shotgun projectile` five pixels over the
     // band and dropped the whole page to the overview rung to buy a steeper V.
-    if ((ba == kBSocket && bb == kBSplit) || (ba == kBSplit && bb == kBSocket))
-      return gFull;
+    const bool sa = layerSplit[(size_t)upper] != 0,
+               sb = layerSplit[(size_t)(upper - 1)] != 0;
+    if ((ba == kBSocket && sb) || (sa && bb == kBSocket)) return gFull;
     // ...and a bead may not land on a pip, which after the reorder is the layer
     // next to it in both orders.
     if ((ba == kBSocket && bb == kBBead) || (ba == kBBead && bb == kBSocket))
@@ -919,7 +926,7 @@ GraphCanvasResult SpellGraphCanvas(UIState& s, ImVec2 at, ImVec2 size, bool read
   // marker layer, and only latches the intent on the actual release. The UI
   // never applies an op — main.cpp does, from game/spellgraph.h, and answers a
   // refusal on the status line.
-  enum class Tgt { Bar, Bus, Socket, Split, Body, PipL, PipR, Cell };
+  enum class Tgt { Bar, Bus, Socket, Split, Body, PipL, PipR, Cell, Ahead };
   auto offer = [&](Tgt tgt, int nodeIdx, ImVec2 a, ImVec2 b) {
     if (!ImGui::BeginDragDropTarget()) return;
     const ImGuiPayload* p = ImGui::AcceptDragDropPayload(kPayloadGraphNode, kPeekFlags);
@@ -1011,6 +1018,21 @@ GraphCanvasResult SpellGraphCanvas(UIState& s, ImVec2 at, ImVec2 size, bool read
         e.glyphId = name;
         say = tgt == Tgt::PipL ? "fill this operator's left slot"
                                : "fill this operator's right slot";
+        break;
+      }
+      case Tgt::Ahead: {
+        // The empty slot off the top of the page: the whole sentence goes in
+        // this delivery. `nodeIdx` is the HAND, and `WrapInBox` on a box with
+        // no parent is exactly "a delivery word at the end of a sentence".
+        if (fromGraph || sort != kDelivery) {
+          refuse("only a delivery goes here - it boxes the whole spell");
+          ImGui::EndDragDropTarget();
+          return;
+        }
+        e.op = UIState::GraphEditIntent::Wrap;
+        e.treeNode = n.treeNode;
+        e.glyphId = name;
+        say = "box the WHOLE spell in this delivery";
         break;
       }
       case Tgt::Body: {
@@ -1214,8 +1236,64 @@ GraphCanvasResult SpellGraphCanvas(UIState& s, ImVec2 at, ImVec2 size, bool read
         // happens - the fan used to leave the delivery cell, which said the
         // delivery did it, and it does not: the mod bead sitting on this blot
         // does.
+        //
+        // ...AND WHEN A WORD OPENED IT, THE JUNCTION IS THAT WORD (2026-09-22).
+        // `shotgun` used to be a bead one band below this blot: 14 screen px of
+        // lozenge and 4 of junction, between two full cells, for the single
+        // most important point in the whole drawing. They are one node now and
+        // it is a CELL - the spell reads "sand and gust funnel into ONE
+        // shotgun, and the shotgun funnels into three", which is what the
+        // sentence says and was never what the page showed.
         const ImVec2 c(std::floor((a.x + b.x) * 0.5f),
                        std::floor((a.y + b.y) * 0.5f));
+        if (n.treeNode >= 0) {
+          const ImU32 col = ColOrpiment();
+          const float lr = std::floor(std::min(b.x - a.x, b.y - a.y) * 0.5f);
+          if (scale < 0.5f) {
+            PixelLozenge(dl, c, lr, Fade(col, 0.95f), true, 2.0f);
+          } else {
+            PixelLozenge(dl, c, lr, Fade(ColVellumHi(), 0.85f), true, 2.0f);
+            PixelLozenge(dl, c, lr, Fade(col, 0.95f), false, 2.0f);
+            PixelLozenge(dl, c, lr - 4.0f, Fade(ColIronGall(), 0.35f), false, 2.0f);
+            DrawSpriteCenteredAt(dl, GlyphIcon(kMod), ImVec2(c.x + 1, c.y + 1),
+                                 scale * 0.5f, Fade(ColVellumHi(), 0.7f));
+            DrawSpriteCenteredAt(dl, GlyphIcon(kMod), c, scale * 0.5f, ColIronGall());
+          }
+          // NO TALLY HERE. A cell wears one to say what its picture cannot -
+          // a collapsed sub-fan, a word said twice - and this junction's
+          // picture says it outright: the strokes leaving its point ARE the
+          // count. Drawn, the ticks land in the fan's own convergence and read
+          // as a fourth and fifth stroke.
+          ImGui::SetCursorScreenPos(a);
+          ImGui::InvisibleButton("##splitword",
+                                 ImVec2(std::max(8.0f, b.x - a.x),
+                                        std::max(8.0f, b.y - a.y)));
+          const bool hov = ImGui::IsItemHovered();
+          if (hov) LeafHover(dl, a, b);
+          if (hov && !live) {
+            BeginTip();
+            ImGui::PushStyleColor(ImGuiCol_Text,
+                                  ImGui::ColorConvertU32ToFloat4(ColGoldHi()));
+            ImGui::TextUnformatted(n.label.c_str());
+            ImGui::PopStyleColor();
+            if (!n.edit.empty()) ImGui::TextDisabled("%s", n.edit.c_str());
+            ImGui::TextDisabled("THE SPLIT: one of it becomes %d here.",
+                                n.instances);
+            ImGui::TextDisabled("Drop a word on it and every branch gets it.");
+            ImGui::TextDisabled("right-click to take it off");
+            EndTip();
+          }
+          if (!readOnly && hov && !live &&
+              ImGui::IsMouseClicked(ImGuiMouseButton_Right)) {
+            PushGrimoireUndo(s);
+            s.graphEdit = {};
+            s.graphEdit.pending = true;
+            s.graphEdit.op = UIState::GraphEditIntent::Remove;
+            s.graphEdit.treeNode = n.treeNode;
+          }
+          offer(Tgt::Split, (int)i, a, b);
+          break;
+        }
         const float r = scale < 1.0f ? 4.0f : 6.0f;
         PixelDisc(dl, c, r, ColIronGall());
         PixelRing(dl, c, r + 2.0f, Fade(ColIronSoft(), 0.5f), 2.0f);
@@ -1714,6 +1792,59 @@ GraphCanvasResult SpellGraphCanvas(UIState& s, ImVec2 at, ImVec2 size, bool read
       }
     }
     ImGui::PopID();
+  }
+
+  // ---- AHEAD OF THE SPELL: the empty slot a new delivery goes in -------------
+  //
+  // From the owner's report: "to add a projectile I have to drag it into an
+  // empty slot that occurs BEHIND it". True, and it was the only way. The
+  // drawing grows UPWARD - the hand is the pedestal and the last word spoken is
+  // the top cell - so the place a new outer delivery belongs is off the top of
+  // the page, and the only target that did it was the hand's own bar at the
+  // FOOT of the drawing, which is the opposite end from where the word lands.
+  // (Dropping on the top cell works too, and means the same thing, but it reads
+  // as "into that word" rather than "after it".)
+  //
+  // So: while a DELIVERY is in flight, one empty slot is drawn one band above
+  // the top of the spell, on the box axis, and a drop in it boxes the whole
+  // sentence. It exists only during that drag - an always-drawn empty socket
+  // over every spell is a node the page does not have - and it is UI-only: no
+  // graph node, no layout law, nothing for the gate to hold.
+  if (!readOnly && live && live->IsDataType(kPayloadGlyph) &&
+      PayloadSort(s, false, (const char*)live->Data) == kDelivery) {
+    int rootIdx = -1, topIdx = -1;
+    for (size_t i = 0; i < g.nodes.size(); i++) {
+      const UIState::SpellGraphUI::Node& n = g.nodes[i];
+      if (n.kind == kRoot) rootIdx = (int)i;
+      if (n.h >= 64 && (topIdx < 0 || n.layer > g.nodes[(size_t)topIdx].layer))
+        topIdx = (int)i;
+    }
+    if (rootIdx >= 0) {
+      const UIState::SpellGraphUI::Node& rn = g.nodes[(size_t)rootIdx];
+      // The axis is the hand's, because that is the axis the whole sentence
+      // stands on; the band is one cell above whatever is highest.
+      const float cx = X(rn.x + rn.w / 2);
+      const float half = std::floor(32.0f * scale);
+      const float h = half * 2.0f;
+      const size_t topL = (size_t)std::clamp(
+          topIdx >= 0 ? g.nodes[(size_t)topIdx].layer : 0, 0, g.layers - 1);
+      const float top = org.y + layerTop[topL] - gapFor(scale) - h;
+      const ImVec2 a(cx - half, top), b(cx + half, top + h);
+      // An EMPTY socket in the page's own hand: a pricked ring with nothing in
+      // it, and a short stroke down to the spell it would box.
+      InkStroke(dl, ImVec2(cx, b.y), ImVec2(cx, b.y + gapFor(scale)),
+                Fade(ColIronSoft(), 0.55f), scale < 1.0f ? 2.0f : 3.0f);
+      PixelRing(dl, ImVec2(cx, std::floor((a.y + b.y) * 0.5f)), half - 2.0f,
+                Fade(ColRubric(), 0.75f), 2.0f);
+      DrawSpriteCenteredAt(dl, GlyphIcon(kDelivery),
+                           ImVec2(cx, std::floor((a.y + b.y) * 0.5f)),
+                           scale * 0.5f, Fade(ColIronSoft(), 0.45f));
+      ImGui::SetCursorScreenPos(a);
+      ImGui::PushID(8999);
+      ImGui::InvisibleButton("##ahead", ImVec2(h, h));
+      offer(Tgt::Ahead, rootIdx, a, b);
+      ImGui::PopID();
+    }
   }
 
   // ---- the marker layer, over everything -------------------------------------

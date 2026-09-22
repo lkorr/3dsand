@@ -38,6 +38,19 @@
 //      construct, two pictures, and the second one said the projectile split.
 //      It did not: the shotgun did, and now the drawing says so.
 //
+//      ...AND THE SHOTGUN *IS* THE JUNCTION (2026-09-22, second pass). The
+//      word that opens the fan was a 96x32 bead one band below a 32x16 blot -
+//      14 screen px and 4 at the fit rung, between two full 64 px cells - so
+//      the branch point of the spell was the least legible mark on the page.
+//      A record-wide `count` mod is not a thing that EDITS the junction, it is
+//      the junction, so the Split node carries that mod's tree node, glyph,
+//      edit and span and is drawn at CELL size. Fusing rather than growing the
+//      bead is what keeps law (2) - a junction stands on the box's axis - true
+//      for free: a junction is placed there by construction and a bead row of
+//      two is not. Only the record-wide WINNER fuses; a fan opened by lanes
+//      alone stays the blot, a count inside a lane stays a bead over the
+//      socket it splits, and a losing count word stays a slashed bead.
+//
 //      ...AND A SPOKEN DELIVERY IS DRAWN ONCE PER BRANCH. Everything above the
 //      socket row belongs to one branch each, so each branch rises through its
 //      own payload to its own copy of the delivery cell. They are one word and
