@@ -348,6 +348,36 @@ are deduplicated across mob defs, so 128 slots cover a whole cast.
   invariant holds from tick one); anything saved mid-flight lands where it
   was, accepted. Entity state is CPU-float gameplay state outside the hashed
   domain (§7), so the grid hash round-trip is unchanged.
+- **Entity state is split by owner (2026-09-23, `docs/PLAN_save_system.md`
+  S4; supersedes the single `entities.sve` above).** Three files instead of
+  one: **`r_x_y_z.sve`** beside each region's `.svr` holds the world-anchored
+  entities that bucket one by one (`MOBS` one `Mob::SaveOne` per creature,
+  `ITMS` one entry per ground item), each in the region containing its
+  position at save time, as framed records (`'SVX1'`: section FourCC, section
+  version, position, bytes) so one record can be appended or taken without
+  reading any other; **`world.sve`** (the old SVE1 TLV container) holds the
+  world's non-local state — `DBRS` debris, `WTRB` discovered water bodies,
+  `MOBG` the mob id counter (restored as a max, so a loaded world never
+  re-issues an id), `TIME` the celestial clock — and is the home for quests,
+  flags and factions; **`players/<id>.svp`** holds `AVTR` + `PLYR` (single
+  player is `local`; a multiplayer peer saves its own via `SavePlayerFile`,
+  the host saves the world). The chunk store owns the buckets as OPAQUE
+  records (`ChunkStore::DormantEntities` / `WriteEntityRegion`): in RAM it
+  keeps only DORMANT records (read but not yet made live); a save writes each
+  bucket as dormant + live, skips a bucket whose bytes did not change, and
+  never opens a region that is neither known nor live — so a region's parked
+  records (S5b's dormant NPCs) survive every save that does not concern them.
+  A load resets every system, applies `world.sve`, the player file, then
+  every record the window's regions hold whose POSITION is inside the window
+  (`ApplyRegionEntities`, also the entry point for later touches). Cross-
+  bucket references: `MOBS` and `ITMS` records name nothing outside
+  themselves; `DBRS` names strap hosts by index into its own list and has no
+  per-body entry point, so it stays one group in `world.sve`. Time of day is
+  the celestial clock plus meta's sim tick; weather is a pure function of
+  (tuning, seed, sim tick) with no state of its own. The pre-S4
+  `entities.sve` still loads (whole, every section through its whole-payload
+  loader) and the next save distributes it and deletes it. Gate:
+  `save-split`; `save-entities` asserts its old claims on the new layout.
 - **The save stores the delta, and meta names its generator (2026-09-22,
   `docs/PLAN_save_system.md` S1).** A saved world is `genChunk(seed,
   generator)` plus the store. `Stream::FlushResident` used to write all 32,768

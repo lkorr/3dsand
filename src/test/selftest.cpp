@@ -386,6 +386,11 @@ const char* const kOrder[] = {
     // SVR3 codec (PLAN_save_system.md S3). Runs its own worldgen + 150 ticks
     // and leaves that world behind; chunk-exchange next regenerates on entry.
     "region-codec",
+    // S4 entity split (PLAN_save_system.md). Regenerates on the way in,
+    // spawns and drops its own fixtures, and puts back the two process
+    // globals it touches (the mob id counter and the celestial clock) on the
+    // way out; the world it leaves behind is one chunk-exchange regenerates.
+    "save-split",
     // BETWEEN region-store and streaming, and the slot is chosen rather than
     // convenient. It regenerates the world several times (four arms, each
     // with its own worldgen and its own ReloadWindow) and it SHIFTS the

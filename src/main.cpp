@@ -10240,7 +10240,8 @@ int main(int argc, char** argv) {
       ui.saveWorld = false;
       ctx.WaitIdle();
       // Grid + entities: everything outside the voxel grid rides the
-      // entities.sve sections registered in game/persist.cpp.
+      // sections registered in game/persist.cpp -- world.sve, this player's
+      // players/local.svp, and per-region r_*.sve buckets (S4).
       const PlayerKitRefs kitRefs = PlayerKitOf(session, glyphs, items);
       WorldItemRefs groundRefs{&ground, &phys, &debris, &mbSet, &items};
       EntityIO eio = MakeEntityIO(debris, mobs, &avatar, &kitRefs, &groundRefs);
@@ -10282,6 +10283,12 @@ int main(int argc, char** argv) {
                       loaded.tick, tick);
           tick = loaded.tick;
         }
+        // ...and the SKY follows the save even when the sim clock could not
+        // (an older save reloaded mid-session): game/persist.h ResumeWorldClock.
+        if (loaded.known && ResumeWorldClock(loaded.tick, tick))
+          std::printf("load: sky clock engaged at the save's tick %u (sim tick "
+                      "stays %u)\n",
+                      loaded.tick, tick);
         // Debris/mobs were reset and reloaded by their sections; the avatar
         // was despawned by its reset and respawns on the next tick, applying
         // the saved damage state (avatar.h persistence note). Only main's own

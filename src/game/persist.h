@@ -132,7 +132,34 @@ constexpr uint32_t kWorldItemSaveVersion = 3;
 void SavePlayerKit(const PlayerKitRefs& r, std::vector<uint8_t>& out,
                    uint32_t version = kPlayerKitSaveVersion);
 
+// 'MOBG' v1: the mob id counter (u64 as two u32), world.sve. 'TIME' v1: the
+// celestial clock (u32 engaged, i64 scaleNum, scaleDen, ticks, rem,
+// prevTicks), world.sve. Both S4 (PLAN_save_system.md); persist.cpp says why.
+constexpr uint32_t kMobGlobalSaveVersion = 1;
+constexpr uint32_t kWorldTimeSaveVersion = 1;
+
+// WHICH FILE EACH SECTION LIVES IN (S4, sim/worldio.h layout):
+//   world.sve          DBRS, MOBG, TIME, WTRB
+//   players/<id>.svp   AVTR, PLYR
+//   r_x_y_z.sve        MOBS, ITMS -- one record per creature / item
+// Every section keeps its whole-payload save/load, so a pre-S4 entities.sve
+// (all of them in one file) still loads, and so do the gates that round-trip
+// one section's bytes.
 EntityIO MakeEntityIO(DebrisSystem& debris, MobSystem& mobs,
                       PlayerAvatar* avatar,
                       const PlayerKitRefs* player = nullptr,
                       const WorldItemRefs* ground = nullptr);
+
+// THE SKY AFTER A LOAD, when the sim clock could not follow the save.
+//
+// main.cpp resumes its sim tick at the saved one only when that moves it
+// FORWARD (the stamp-nibble and tick-tag arguments there). An in-session
+// reload of an older save therefore keeps the later tick, and with the
+// celestial clock disengaged the sky IS the sim tick -- the sun would stay
+// where this session had it, not where the save had it. Call this after the
+// resume with the save's tick (WorldStamp::tick, only when `known`): if the
+// clock is disengaged and the two ticks differ, it engages the clock at 1x at
+// the saved position, so time of day round-trips whatever the sim tick did.
+// A clock the 'TIME' section restored as engaged already holds the saved
+// position and is left alone. Returns whether it engaged.
+bool ResumeWorldClock(uint32_t savedSimTick, uint32_t simTickNow);

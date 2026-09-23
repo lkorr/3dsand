@@ -1,5 +1,6 @@
 #include "sim/chunkstore.h"
 
+#include <cmath>
 #include <cstdio>
 #include <cstring>
 #include <filesystem>
@@ -57,8 +58,28 @@ bool IsOurFile(const fs::path& p) {
   // BindSave means "this RAM store is the whole world", and a tick manifest
   // left behind by an earlier session would claim freshness for chunks that
   // are no longer there (M9.5-A).
-  return (name.rfind("r_", 0) == 0 && p.extension() == ".svr") ||
-         name == "meta.svm" || name == "manifest.svt";
+  //
+  // The S4 entity files join it for the same reason (PLAN_save_system.md):
+  // r_*.sve buckets, world.sve and the pre-S4 entities.sve are this world's
+  // entities, and a BindSave of a new world under an old name must not
+  // inherit a previous session's creatures beside its terrain. (players/ is
+  // wiped separately in BindSave: it is a directory.)
+  return (name.rfind("r_", 0) == 0 &&
+          (p.extension() == ".svr" || p.extension() == ".sve")) ||
+         name == "meta.svm" || name == "manifest.svt" || name == "world.sve" ||
+         name == "entities.sve";
+}
+
+// 'SVX1': one region's entity bucket (chunkstore.h EntityRecord).
+constexpr uint32_t kEntityRegionMagic = 0x31585653;  // 'SVX1'
+
+uint64_t Fnv64(const uint8_t* p, size_t n) {
+  uint64_t h = 1469598103934665603ull;
+  for (size_t i = 0; i < n; i++) {
+    h ^= p[i];
+    h *= 1099511628211ull;
+  }
+  return h ? h : 1;  // 0 is reserved for "no file"
 }
 }  // namespace
 
@@ -466,12 +487,186 @@ bool ChunkStore::BindSave(const std::string& dir) {
   // world — this RAM store is the complete current world, so wipe them
   for (const auto& de : fs::directory_iterator(dir, ec))
     if (IsOurFile(de.path())) fs::remove(de.path(), ec);
+  // ...and the player files (S4): a new world's save must not hand a later
+  // load somebody else's pack. Only *.svp, only in players/.
+  for (const auto& de : fs::directory_iterator(dir + "/players", ec))
+    if (de.path().extension() == ".svp") fs::remove(de.path(), ec);
   dir_ = dir;
   for (auto& [key, r] : regions_) {
     r.dirty = true;
     r.loaded = true;  // nothing on disk to merge anymore
   }
+  // Entity buckets held unbound (S5b's parked NPCs in a never-saved world)
+  // have no file now; the next WriteEntityRegion writes them.
+  for (auto& [key, e] : entityRegions_) {
+    e.diskHash = 0;
+    e.loaded = true;
+  }
   return true;
+}
+
+// ---- region entity buckets (chunkstore.h, PLAN_save_system.md S4) ---------
+
+IVec3 ChunkStore::RegionOfVoxel(Vec3 p) {
+  auto chunkOf = [](float v) {
+    return (int)std::floor((double)v / (double)kChunk);
+  };
+  return RegionOf({chunkOf(p.x), chunkOf(p.y), chunkOf(p.z)});
+}
+
+std::string ChunkStore::EntityRegionPath(IVec3 rc) const {
+  return dir_ + "/r_" + std::to_string(rc.x) + "_" + std::to_string(rc.y) +
+         "_" + std::to_string(rc.z) + ".sve";
+}
+
+ChunkStore::EntityRegion& ChunkStore::TouchEntityRegion(IVec3 rc) {
+  EntityRegion& e = entityRegions_[World::PackChunkKey(rc)];
+  e.rc = rc;
+  return e;
+}
+
+std::vector<ChunkStore::EntityRecord>& ChunkStore::DormantEntities(IVec3 rc) {
+  EntityRegion& e = TouchEntityRegion(rc);
+  if (e.loaded) return e.dormant;
+  e.loaded = true;
+  if (dir_.empty()) return e.dormant;
+  FILE* fp = std::fopen(EntityRegionPath(rc).c_str(), "rb");
+  if (!fp) return e.dormant;  // no file: nothing parked here
+  std::vector<uint8_t> buf;
+  std::fseek(fp, 0, SEEK_END);
+  const long len = std::ftell(fp);
+  std::fseek(fp, 0, SEEK_SET);
+  buf.resize(len > 0 ? (size_t)len : 0);
+  const bool readOk =
+      buf.empty() || std::fread(buf.data(), 1, buf.size(), fp) == buf.size();
+  std::fclose(fp);
+  // The hash is of what is ON DISK even when the parse below refuses it, so a
+  // save with nothing to add leaves a file it could not read exactly as it
+  // was -- a refused file is kept for a better build, never replaced by an
+  // empty bucket.
+  e.diskHash = Fnv64(buf.data(), buf.size());
+  std::vector<EntityRecord> recs;
+  bool ok = readOk && buf.size() >= 8;
+  size_t off = 8;
+  uint32_t magic = 0, count = 0;
+  if (ok) {
+    std::memcpy(&magic, buf.data(), 4);
+    std::memcpy(&count, buf.data() + 4, 4);
+    ok = magic == kEntityRegionMagic;
+  }
+  for (uint32_t i = 0; ok && i < count; i++) {
+    if (off + 24 > buf.size()) {
+      ok = false;
+      break;
+    }
+    EntityRecord r;
+    uint32_t n = 0;
+    std::memcpy(&r.section, buf.data() + off, 4);
+    std::memcpy(&r.version, buf.data() + off + 4, 4);
+    std::memcpy(&r.pos.x, buf.data() + off + 8, 4);
+    std::memcpy(&r.pos.y, buf.data() + off + 12, 4);
+    std::memcpy(&r.pos.z, buf.data() + off + 16, 4);
+    std::memcpy(&n, buf.data() + off + 20, 4);
+    off += 24;
+    if (n > buf.size() - off) {
+      ok = false;
+      break;
+    }
+    r.bytes.assign(buf.begin() + (ptrdiff_t)off,
+                   buf.begin() + (ptrdiff_t)(off + n));
+    off += n;
+    recs.push_back(std::move(r));
+  }
+  if (!ok) {
+    // ALL OR NOTHING: a half-read bucket would apply some of a region's
+    // creatures and then, at the next save, write the survivors back as if
+    // they were the whole bucket.
+    std::fprintf(stderr,
+                 "chunkstore: %s is not a readable entity bucket (magic %08x); "
+                 "its records are ignored and the file is left alone unless "
+                 "something live lands in that region\n",
+                 EntityRegionPath(rc).c_str(), magic);
+    return e.dormant;
+  }
+  e.dormant = std::move(recs);
+  return e.dormant;
+}
+
+void ChunkStore::EntityRegionsKnown(std::vector<IVec3>& out) const {
+  for (const auto& [key, e] : entityRegions_) out.push_back(e.rc);
+}
+
+bool ChunkStore::WriteEntityRegion(IVec3 rc,
+                                   const std::vector<const EntityRecord*>& live,
+                                   bool* wrote, uint64_t* bytesOut) {
+  if (wrote) *wrote = false;
+  if (dir_.empty()) return false;
+  // Merge the file first: a region that was never read may hold dormant
+  // records, and writing it from `live` alone would delete them.
+  std::vector<EntityRecord>& dormant = DormantEntities(rc);
+  EntityRegion& e = TouchEntityRegion(rc);
+  std::vector<const EntityRecord*> all;
+  all.reserve(dormant.size() + live.size());
+  for (const EntityRecord& r : dormant) all.push_back(&r);
+  all.insert(all.end(), live.begin(), live.end());
+
+  const std::string path = EntityRegionPath(rc);
+  std::error_code ec;
+  if (all.empty()) {
+    if (e.diskHash != 0) {
+      fs::remove(path, ec);
+      e.diskHash = 0;
+      if (wrote) *wrote = true;
+    }
+    return true;
+  }
+  std::vector<uint8_t> buf;
+  auto put = [&buf](const void* p, size_t n) {
+    buf.insert(buf.end(), (const uint8_t*)p, (const uint8_t*)p + n);
+  };
+  const uint32_t hdr[2] = {kEntityRegionMagic, (uint32_t)all.size()};
+  put(hdr, 8);
+  for (const EntityRecord* r : all) {
+    const uint32_t n = (uint32_t)r->bytes.size();
+    put(&r->section, 4);
+    put(&r->version, 4);
+    put(&r->pos.x, 4);
+    put(&r->pos.y, 4);
+    put(&r->pos.z, 4);
+    put(&n, 4);
+    if (n) put(r->bytes.data(), n);
+  }
+  const uint64_t h = Fnv64(buf.data(), buf.size());
+  if (h == e.diskHash) return true;  // the bucket did not change
+  const std::string tmp = path + ".tmp";
+  FILE* fp = std::fopen(tmp.c_str(), "wb");
+  bool ok = fp && std::fwrite(buf.data(), 1, buf.size(), fp) == buf.size();
+  if (fp) std::fclose(fp);
+  if (ok) {
+    fs::remove(path, ec);
+    fs::rename(tmp, path, ec);
+    ok = !ec;
+  }
+  if (!ok) {
+    std::fprintf(stderr, "chunkstore: failed writing %s\n", path.c_str());
+    fs::remove(tmp, ec);
+    return false;
+  }
+  e.diskHash = h;
+  if (wrote) *wrote = true;
+  if (bytesOut) *bytesOut += buf.size();
+  return true;
+}
+
+void ChunkStore::RemoveAllEntityFiles() {
+  entityRegions_.clear();
+  if (dir_.empty()) return;
+  std::error_code ec;
+  for (const auto& de : fs::directory_iterator(dir_, ec)) {
+    const std::string name = de.path().filename().string();
+    if (name.rfind("r_", 0) == 0 && de.path().extension() == ".sve")
+      fs::remove(de.path(), ec);
+  }
 }
 
 bool ChunkStore::BindLoad(const std::string& dir) {
@@ -479,6 +674,7 @@ bool ChunkStore::BindLoad(const std::string& dir) {
   std::error_code ec;
   if (!fs::is_directory(dir, ec)) return false;
   regions_.clear();  // the disk's copy wins wholesale
+  entityRegions_.clear();
   chunkCount_ = 0;
   dir_ = dir;
   LoadManifest();  // ...and so does its manifest; absent file = all tags 0
