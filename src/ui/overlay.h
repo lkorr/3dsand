@@ -179,6 +179,14 @@ struct UIState {
     kToolCount
   };
   int tool = kToolBrush;
+  // PLAY or DEV (F2, and the dev panel's checkbox). Off = the game as a
+  // player meets it: the hands are the only tool (kToolMelee -- fists, a
+  // drawn weapon, a flask), the number row and wheel pick the hotbar, and
+  // every build/debug binding (Tab tools, brush keys, M/B/K/U/L/H/T/O, fly,
+  // single-step, grenades) is inert. On = everything as it always was. The
+  // F-keys, pause, save/load and the menus work in both. main.cpp enforces
+  // it every frame and applies the transition (fly off, hands up) on a change.
+  bool devControls = true;
 
   // MLS-MPM fluid prototype (docs/PLAN_mpm_fluids.md): the experimental
   // particle liquid, placeable side by side with CA water for comparison.

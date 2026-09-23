@@ -1033,6 +1033,10 @@ void Overlay::Draw(UIState& s) {
   }
 
   ImGui::Separator();
+  ImGui::Checkbox("dev controls (F2)", &s.devControls);
+  if (ImGui::IsItemHovered())
+    ImGui::SetTooltip("off = play mode: hands only, number row picks the hotbar,\n"
+                      "no brush / spawn / fly / tool keys");
   ImGui::Text("tool (Tab):");
   ImGui::SameLine();
   ImGui::RadioButton("brush", &s.tool, UIState::kToolBrush);
