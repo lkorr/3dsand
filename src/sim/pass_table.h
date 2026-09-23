@@ -96,6 +96,7 @@ enum class Buf : uint8_t {
   FarList,
   FarUBO,
   FarPatch,   // cascade edit patches, read by farFill (world.h kFarPatch*)
+  FarSig,     // per-slot far-matter signature, fardown's skip (world.h farSig)
   // ---- the software page table (docs/PLAN_page_table.md §5.1) ----
   // PageTable is READ by every row whose entry point touches a voxel and
   // written by nothing on the tick path — it is dispatch-invariant

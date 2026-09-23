@@ -163,7 +163,7 @@ class DebrisSystem {
                  uint32_t physScale = 0,
                  std::vector<PrefabVoxel> skinVoxels = {},
                  uint32_t bleedMat = 0, BodyWound wound = {},
-                 bool dead = false, int defIndex = -1);
+                 bool dead = false, int defIndex = -1, uint64_t creature = 0);
 
   // ---- WHAT A CORPSE SAYS WHEN YOU CUT IT (2026-09-20) --------------------
   //
@@ -213,6 +213,87 @@ class DebrisSystem {
       if (b.handle == handle) return b.dead && b.bleedMat != 0;
     return false;
   }
+  // Rewrite up to `maxCount` voxels of `fromMat` on one body to `toMat`, on
+  // its authoritative lattice, poking the brick and recounting what the burn
+  // pass keys on. A fixture's way of setting a corpse piece alight (gate
+  // corpse-crossheat) without a world fire that would light everything else
+  // too. Returns how many changed; 0 for an unknown handle.
+  uint32_t RewriteBodyMaterial(uint64_t handle, uint32_t fromMat, uint32_t toMat,
+                               uint32_t maxCount);
+
+  // ---- DEAD FLESH IS THE LIVING'S BUSINESS (2026-09-22) ---------------------
+  //
+  // A corpse's pieces are these bodies, and everything that happens TO flesh
+  // -- the coat it wears (blood, water), the splatter that lands on it, and
+  // the fire and acid that eat it -- runs through MobSystem's passes, the same
+  // BurnOneLimb / StainOneLimb / SplatterView a living limb goes through, not
+  // through a debris twin of them. The twin is how corpses lost cross-joint
+  // heat and armour in the first place: BurnBodies was forked from the living
+  // pass, and every improvement since had to be ported by hand, or was not.
+  //
+  // What stays HERE is what only a body has: compaction, shatter, the
+  // below-body-worthiness particle handoff and the batched collider rebuild
+  // (BurnTail, shared with BurnBodies so there is one of those too).
+  //
+  // FleshLattice is one such body described in the terms MobSystem's view
+  // needs; `creature` groups a corpse's pieces (Mob::Die stamps the mob id on
+  // each, fragments inherit it) the way a creature's limbs are grouped, and
+  // `shells` are the bodies strapped to it (Mob::Die -> StrapBody): its armour.
+  struct FleshShell {
+    uint64_t id = 0;  // global id, the key a march index is cached under
+    const std::vector<PrefabVoxel>* skin = nullptr;
+    const std::vector<DebrisVoxel>* coll = nullptr;
+    const BodyTransform* xf = nullptr;
+    uint32_t scale = 1;
+  };
+  struct FleshLattice {
+    uint64_t id = 0;         // global id: survives a collider rebuild's new handle
+    uint64_t creature = 0;   // the mob it came off; 0 = its own group
+    std::vector<PrefabVoxel>* skin = nullptr;  // authoritative when non-null
+    std::vector<DebrisVoxel>* coll = nullptr;  // ...else this
+    uint32_t scale = 1;      // units of the authoritative lattice / world voxel
+    uint32_t physScale = 1;  // units of the collider lattice
+    const BodyTransform* xf = nullptr;
+    IVec3 lo{}, hi{};        // collider box, physScale units, hi exclusive
+    uint32_t* microModel = nullptr;
+    // Something on it has an ungated self rule (Body::activeCount): the
+    // criterion BuildBurnIndex's sweep uses for "alight". Seeds the view's
+    // burn state the first time MobSystem meets the body, so a corpse whose
+    // only fire is its own embers is not turned away by the cheap gate.
+    bool selfActive = false;
+    std::vector<FleshShell> shells;  // filled by BurnFleshBodies only
+  };
+  // A corpse piece MobSystem burns, rather than BurnBodies. Followers are not:
+  // a strapped garment is not flesh, it burns here, and the flesh under it
+  // reads it through the occlusion probe exactly as a living limb reads its
+  // worn shell.
+  // (A template only because Body is declared further down this class.)
+  template <class B>
+  static bool IsFlesh(const B& b) {
+    return b.dead && b.bleedMat != 0 && !b.Follower();
+  }
+  template <class Fn>
+  void ForEachDeadFlesh(Fn&& fn) {
+    for (Body& b : bodies_) {
+      if (!IsFlesh(b) || !OwnedLocally(b) || b.voxels.empty()) continue;
+      FleshLattice f = FleshOf(b);
+      fn(f);
+    }
+  }
+  // One burn tick over every dead-flesh body. `burn` gets them all at once
+  // (so it can build a per-creature heat snapshot before any of them burns)
+  // and fills one FleshBurn per lattice: how many voxels it tombstoned
+  // (material 0, compacted here) and whether anything changed. The tail then
+  // runs per body, and bodies that burned away / fragments that split off are
+  // settled after the whole list, the way BurnBodies settles them.
+  struct FleshBurn {
+    uint32_t removed = 0;
+    bool changed = false;
+  };
+  void BurnFleshBodies(
+      const std::function<void(std::vector<FleshLattice>&,
+                               std::vector<FleshBurn>&)>& burn,
+      World& world, std::vector<ParticleSpawn>& spawns);
   // Open a wound on an adopted body at its voxel nearest `woundW` (world),
   // owing `budget` blood voxels, with `gushTicks` of dismemberment gout.
   // False when no such body, or it has no blood.
@@ -1379,6 +1460,10 @@ class DebrisSystem {
     // flesh as FLESH rather than as a chip, and `GoreEvent` gives a corpse its
     // own species' wet noises.
     bool dead = false;
+    // The mob this was part of (its id), stamped by Mob::Die and inherited by
+    // fragments like `dead`. Groups a corpse's pieces for the heat that
+    // crosses its joints (MobSystem::BurnCorpses). 0 = no creature.
+    uint64_t creature = 0;
     // ---- WHAT WAS HOLDING EACH JOINT WHEN THE BLOWS STARTED ---------------
     // One entry per joint on this body (joint handle -> flesh count within
     // gore.corpseJointHold of its anchor), captured the first time a carve
@@ -1481,6 +1566,15 @@ class DebrisSystem {
   void BurnBodies(uint32_t tick, World& world, std::vector<CellOp>& cellOps,
                   std::vector<ParticleSpawn>& spawns);
   void RecountBurn(Body& b) const;
+  FleshLattice FleshOf(Body& b);
+  // Everything a burn pass leaves for a BODY to do once it has tombstoned
+  // `removed` voxels: compact, shatter, hand a sub-body remnant to particles,
+  // rebuild the collider on the batched cadence. Shared by BurnBodies and
+  // BurnFleshBodies. True = the body burned below body-worthiness and has been
+  // released; the caller erases it.
+  bool BurnTail(Body& b, uint32_t removed, bool changed, World& world,
+                std::vector<Body>& fragments, std::vector<ParticleSpawn>& spawns,
+                uint32_t& newBodyBudget, bool& rebuiltOne);
   // Corpse bleeding: every body with an open wound drips and gouts from it,
   // on the live wound's own tuning (gore.sever* for the gout, gore.bleed* for
   // the drip). Idle bodies cost two field reads.

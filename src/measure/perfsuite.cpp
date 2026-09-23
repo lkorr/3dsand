@@ -30,6 +30,7 @@
 #include "sim/stream.h"
 #include "sim/tuning.h"
 #include "sim/world.h"
+#include "sim/worldmap.h"
 #include "test/support.h"
 
 namespace sandvox {
@@ -225,6 +226,11 @@ struct Scene {
   // still spends its first recorded frames measuring the transient of setting
   // off, which is not the thing under test.
   uint32_t flightTick = 0;
+
+  // forestfire: ticks driven so far, warm-up included. Record() hands a
+  // warming driver localTick 0 on EVERY warm tick, so a scenario that must
+  // act once (ignite) and then time things (the camera turn) counts itself.
+  uint32_t fireTick = 0;
 
   // Notes the setup wants on the page ("great oak, 187 voxels of trunk").
   std::string note;
@@ -732,6 +738,77 @@ void DriveTreeburn(Scene& s, uint32_t lt, TickOps& out) {
 }
 
 // ---------------------------------------------------------------------------
+// SCENARIO: forestfire -- the frame-rate complaint of 2026-09-22.
+//
+// "20 seconds after a forest has been set on fire all around you": fire is
+// seeded IfAir in a disc of columns out to 100 voxels round a viewer standing
+// in the canopy found by treeburn's search, at ground level and up through
+// the crown band, then 600 warm ticks let it take hold before 300 frames are
+// recorded with the camera turning one full circle. By then the burn is ~5,000
+// awake chunks, most of them SMOKE, which is what makes this the scenario for
+// every per-dirty-chunk pass (fardown, reposeSnap, openness, glow).
+//
+// This is the DETERMINISTIC twin of main.cpp's `--frames N --forest-fire`:
+// one tick per frame and no debris system, so two builds' GPU rows compare
+// directly. The windowed harness is the end-to-end number (debris, Jolt, the
+// real frame pacing) and moves +-15% run to run with the fire's evolution.
+// ---------------------------------------------------------------------------
+bool SetupForestfire(Scene& s, std::string&) {
+  // AT THE MAP'S SPAWN SITE, which is where the report came from: the game
+  // starts the player there, inside a forest. The window this suite settles
+  // at (origin0_) is a meadow, so the window is moved and the world regenerated
+  // and re-settled around the spawn -- the game's own boot order (main.cpp
+  // SpawnWindowOrigin). Record() puts the window back for the next scenario.
+  const worldmap::WorldMapData& m = worldmap::CurrentWorldMap();
+  const int half = (int)kNChunk / 2;
+  s.stream.OnRegen();
+  s.world.SetWindowOrigin({(m.spawnX >> 4) - half, 0, (m.spawnZ >> 4) - half});
+  SubmitWorldgen(s.ctx, s.world, s.sim, kDefaultSeed);
+  s.ctx.WaitIdle();
+  for (uint32_t t = 1; t <= 300; t++)
+    SubmitTick(s.ctx, s.world, s.sim, t, kDefaultSeed, {}, {}, {}, t % 15 == 0,
+               {half, 3, half}, false, false);
+  s.ctx.WaitIdle();
+  const int g = World::TerrainHeight(m.spawnX, m.spawnZ, kDefaultSeed);
+  s.eye = {(float)m.spawnX, (float)(g + 15), (float)m.spawnZ};
+  s.cam.pitch = 0.08f;
+  char note[160];
+  std::snprintf(note, sizeof note,
+                "map spawn (%d,%d); 100-voxel disc of fire seeds round it",
+                m.spawnX, m.spawnZ);
+  s.note = note;
+  return true;
+}
+// The seed disc, shared by the --perf scenario and the --render-budget camera:
+// fire IfAir in jittered columns 12..100 voxels round the eye, at the ground
+// and up through the crown band. The jitter is a fixed hash of the column.
+void ForestfireSeeds(const Scene& s, std::vector<CellOp>& cells) {
+  const uint32_t fire = MatId(s.mats, "fire");
+  const int px = (int)s.eye.x, pz = (int)s.eye.z;
+  for (int gz = -100; gz <= 100; gz += 9)
+    for (int gx = -100; gx <= 100; gx += 9) {
+      const uint32_t h = (uint32_t)(gx * 73856093) ^ (uint32_t)(gz * 19349663);
+      const int x = px + gx + (int)(h % 5u) - 2;
+      const int z = pz + gz + (int)((h >> 8) % 5u) - 2;
+      const int d2 = (x - px) * (x - px) + (z - pz) * (z - pz);
+      if (d2 < 12 * 12 || d2 > 100 * 100) continue;
+      const int g = World::TerrainHeight(x, z, kDefaultSeed);
+      for (int y : {g + 1, g + 2, g + 10, g + 18, g + 26, g + 34, g + 42}) {
+        const IVec3 c{x, y, z};
+        if (!s.world.CellInWindow(c)) continue;
+        cells.push_back({World::SlotCellIndex(c), fire | kCellOpIfAir});
+      }
+    }
+}
+void DriveForestfire(Scene& s, uint32_t lt, TickOps& out) {
+  const uint32_t ft = s.fireTick++;
+  if (ft == 0) ForestfireSeeds(s, out.cells);
+  // One full turn over the recorded frames (lt counts them; 0 while warming).
+  s.cam.yaw = 6.2831853f * (float)(lt % 300u) / 300.0f;
+  out.particlesActive = true;
+}
+
+// ---------------------------------------------------------------------------
 // SCENARIO: flythrough
 //
 // A diagonal descent across the world, the traversal --autofly-hard uses for
@@ -1051,6 +1128,14 @@ const Scenario kScenarios[] = {
      "empty region, with fire and smoke keeping chunks awake for the whole run.",
      "caLoop;particleSys;compact;occupancy;renderPass", 60, 900, SetupTreeburn,
      DriveTreeburn, VerifyTreeburn},
+
+    {"forestfire", "Forest fire (20 s in)",
+     "A disc of fire seeds 100 voxels round a viewer standing in a forest, "
+     "600 ticks to take hold, then 300 frames turning one full circle. "
+     "~5,000 awake chunks, most of them smoke: every per-dirty-chunk pass at "
+     "its worst. Deterministic twin of --frames N --forest-fire (no debris).",
+     "caLoop;particleSys;compact;occupancy;farField;openness;glow;renderPass",
+     600, 300, SetupForestfire, DriveForestfire},
 
     {"flythrough", "Flythrough (streaming)",
      "A diagonal descent across the world at a fixed 1.5 voxels/tick. Lights "
@@ -2536,6 +2621,32 @@ const char* const kArmsSubmerged[] = {
     "baseline", "noshadow", "nofar",       "noreflect",
     "halfres",  "nogodray", "godshadow0",  nullptr};
 
+// THE FOREST FIRE, 20 s in: --perf forestfire's world, frozen, so the arms can
+// price what a burning forest costs INSIDE the raymarch -- the smoke column's
+// media march, the fire's glow, shadows through a plume. Standing in it at eye
+// height and looking level, which is where the player was when it was slow.
+bool CamFire(Scene& s, uint32_t& tick, std::string& why) {
+  if (!SetupForestfire(s, why)) return false;
+  std::vector<CellOp> seeds;
+  ForestfireSeeds(s, seeds);
+  const IVec3 pc{(int)s.eye.x >> 4, (int)s.eye.y >> 4, (int)s.eye.z >> 4};
+  for (uint32_t t = 400; t < 1000; t++) {
+    SubmitTick(s.ctx, s.world, s.sim, t, kDefaultSeed, {}, {},
+               t == 400 ? seeds : std::vector<CellOp>{}, t % 15 == 0, pc,
+               false, true);
+    if ((t & 31u) == 0u) s.ctx.WaitIdle();   // keep the queue shallow
+  }
+  s.ctx.WaitIdle();
+  s.cam.yaw = 0.785f;
+  s.cam.pitch = 0.08f;
+  s.note += "; burned 600 ticks, frame frozen";
+  tick = FindNoonTick(CurrentTuning());
+  return true;
+}
+const char* const kArmsFire[] = {
+    "baseline", "noshadow", "nocache", "nogi",      "noglow", "noopenness",
+    "nofar",    "halfres",  "primary256", "lod8",   "nospec", nullptr};
+
 const BudgetCam kBudgetCams[] = {
     {"noon",
      "the overlook at the sun's highest — the easy case, and the only one with "
@@ -2554,6 +2665,8 @@ const BudgetCam kBudgetCams[] = {
      CamMeadow, kArmsFoliage},
     {"canopy", "under the largest crown, looking up through the leaves",
      CamCanopy, kArmsFoliage},
+    {"fire", "inside a burning forest 20 s after ignition, looking level",
+     CamFire, kArmsFire},
 };
 constexpr int kBudgetCamCount =
     (int)(sizeof(kBudgetCams) / sizeof(kBudgetCams[0]));

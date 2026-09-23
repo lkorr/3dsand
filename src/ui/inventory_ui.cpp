@@ -88,6 +88,7 @@ const char* ItemIcon(const std::string& kind) {
   if (kind == "armor_hands") return "slot_hands";
   if (kind == "armor_belt") return "slot_belt";
   if (kind == "trinket") return "slot_trinket";
+  if (kind == "container") return "item_container";
   return "item_unknown";
 }
 
@@ -667,6 +668,44 @@ void InspectCastPicks(UIState& s, ImVec2 at, ImVec2 size) {
     if (ImGui::IsItemClicked(ImGuiMouseButton_Left)) {
       s.castAtPart.pending = true;
       s.castAtPart.slot = i;
+    }
+    ImGui::PopID();
+  }
+}
+
+// POUR ON A PART. The vessel twin of InspectCastPicks: with a filled flask
+// selected in the hotbar (and no sentence spoken, which keeps the click
+// unambiguous), every present limb is a target and a click latches the slot.
+// main.cpp hands it to the tick, which spends the flask and runs
+// MobSystem::DouseLimb (game/container.h).
+void InspectApplyPicks(UIState& s, ImVec2 at, ImVec2 size) {
+  if (!s.bodyValid || s.applyText.empty() || !s.spellText.empty()) return;
+  ImDrawList* dl = ImGui::GetWindowDrawList();
+  const float flash = 0.5f + 0.5f * (float)std::sin(ImGui::GetTime() * 3.0);
+  const ImU32 base = s.applyColor ? s.applyColor : IM_COL32(150, 200, 255, 255);
+  for (int i = 0; i < UIState::kSlotCount; i++) {
+    const UIState::BodyPartUI& b = s.body[i];
+    if (!b.present || b.severed || !b.projValid) continue;
+    ImVec2 p0(at.x + b.projMin[0] * size.x, at.y + b.projMin[1] * size.y);
+    ImVec2 p1(at.x + b.projMax[0] * size.x, at.y + b.projMax[1] * size.y);
+    if (!ClipToPortrait(at, size, p0, p1)) continue;
+    if (p1.x - p0.x < 2.0f || p1.y - p0.y < 2.0f) continue;
+    ImGui::SetCursorScreenPos(p0);
+    ImGui::PushID(2000 + i);
+    ImGui::InvisibleButton("##applypart", ImVec2(p1.x - p0.x, p1.y - p0.y));
+    if (ImGui::IsItemHovered()) {
+      const ImU32 col = Fade(base, 0.5f + 0.5f * flash);
+      dl->AddRectFilled(ImVec2(p0.x, p0.y), ImVec2(p1.x, p0.y + 2), col);
+      dl->AddRectFilled(ImVec2(p0.x, p1.y - 2), ImVec2(p1.x, p1.y), col);
+      dl->AddRectFilled(ImVec2(p0.x, p0.y), ImVec2(p0.x + 2, p1.y), col);
+      dl->AddRectFilled(ImVec2(p1.x - 2, p0.y), ImVec2(p1.x, p1.y), col);
+      BeginTip();
+      ImGui::Text("pour %s here", s.applyText.c_str());
+      EndTip();
+    }
+    if (ImGui::IsItemClicked(ImGuiMouseButton_Left)) {
+      s.applyAtPart.pending = true;
+      s.applyAtPart.slot = i;
     }
     ImGui::PopID();
   }
@@ -2872,6 +2911,7 @@ void DrawInventoryScreen(UIState& s) {
     if (s.inspectMode) {
       InspectOverlay(s, ImVec2(portX, portY), ImVec2(kPortraitW, kPortraitH));
       InspectCastPicks(s, ImVec2(portX, portY), ImVec2(kPortraitW, kPortraitH));
+      InspectApplyPicks(s, ImVec2(portX, portY), ImVec2(kPortraitW, kPortraitH));
     }
     // A hovered armour slot shades the limbs it is standing in front of. This
     // is the other half of the COVER section in the health column and the same

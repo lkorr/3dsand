@@ -1,6 +1,6 @@
 {
   "comment": "Items are CONTENT, like materials.json and glyphs.json \u00e2\u20ac\u201d not look-and-feel knobs like tuning.json. This file holds an item's BEHAVIOUR: its id, the kind the engine switches on, and its damage numbers. THE ART IS NOT HERE, and it is not part of any creature either: each item owns <id>.vox plus an <id>.json sidecar carrying its grip and its cutting edge. A held item BORROWS a rig slot, so while worn it is a real rig part \u00e2\u20ac\u201d severable with the arm, droppable as debris, carvable per voxel \u00e2\u20ac\u201d but its geometry has its own origin, so a weapon can never inflate the box of the body holding it. That was a real bug: as a rig prop the sword reached 30 micro outside mina's prefab box and drew her body offset from her own arm. Hot-reloads on R alongside materials and glyphs.",
-  "kinds": "melee = swung, and cuts along the `edge` segment its own sidecar declares (see scripts/gen_sword_item.py). The blade geometry is what decides the wound; `carveBonus` only widens it. A HIT IS THREE PARTS (src/game/impact.h): `damage` is the CUT part (the key is not renamed -- it is still the honest name for the half of a blow that opens a wound), `blunt` is trauma that charges hp and bruises without ever dismembering, and `bite` is a tear (authored on creatures, not on items). `bluntCarve` and `armorBreak` are 0..1 fractions of a tuning radius -- how much of gore.bluntCarveRadius a blow dents out of flesh, and how much of gear.bluntDentRadius it breaks out of a worn shell. That is why a mace beats plate and a sword does not.",
+  "kinds": "melee = swung, and cuts along the `edge` segment its own sidecar declares (see scripts/gen_sword_item.py). The blade geometry is what decides the wound; `carveBonus` only widens it. A HIT IS THREE PARTS (src/game/impact.h): `damage` is the CUT part (the key is not renamed -- it is still the honest name for the half of a blow that opens a wound), `blunt` is trauma that charges hp and bruises without ever dismembering, and `bite` is a tear (authored on creatures, not on items). `bluntCarve` and `armorBreak` are 0..1 fractions of a tuning radius -- how much of gore.bluntCarveRadius a blow dents out of flesh, and how much of gear.bluntDentRadius it breaks out of a worn shell. That is why a mace beats plate and a sword does not. container = a vessel (src/game/container.h): `container.holds` names the material CLASSES it takes up (liquid, powder), `capacity` is in cells, the rates are cells per tick, and `applyCells` is what one click on a limb in the health panel spends. The flask and the pouch are the same kind; what differs is data.",
   "items": [
     {
       "id": "sword",
@@ -146,6 +146,34 @@
       "id": "footwraps",
       "kind": "armor_boots",
       "desc": "Strips of linen wound round the foot and crossed at the ankle. The cheapest thing that is not going barefoot, and the first thing to catch."
+    },
+    {
+      "id": "flask",
+      "kind": "container",
+      "container": {
+        "holds": ["liquid"],
+        "capacity": 128,
+        "scoopPerTick": 4,
+        "pourPerTick": 2,
+        "pourRangeM": 4.0,
+        "pourSpeedMps": 3.0,
+        "applyCells": 4
+      },
+      "desc": "A stoppered glass flask. Hold the right button over any liquid to fill it, the left to pour it where you are looking. With the health panel open, a click on a limb pours it there -- over a wound, or a burn, or yourself."
+    },
+    {
+      "id": "pouch",
+      "kind": "container",
+      "container": {
+        "holds": ["powder"],
+        "capacity": 128,
+        "scoopPerTick": 4,
+        "pourPerTick": 2,
+        "pourRangeM": 3.0,
+        "pourSpeedMps": 2.5,
+        "applyCells": 4
+      },
+      "desc": "A drawstring leather pouch for anything that pours but is not wet: sand, ash, dust, seed. Right button to scoop, left to scatter it where you look."
     }
   ]
 }

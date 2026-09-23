@@ -89,7 +89,9 @@ struct PlayerKitRefs {
 // v2, the grimoire in v4) is that an older payload keeps loading and simply
 // stops early. A v4 kit loads with every garment undyed, which is exactly what
 // it was.
-constexpr uint32_t kPlayerKitSaveVersion = 5;
+// Version 6 appends VESSEL CONTENTS (game/container.h): one packed word per
+// slot, the dyes' shape again. A v5 kit loads with every flask empty.
+constexpr uint32_t kPlayerKitSaveVersion = 6;
 constexpr uint32_t kPlayerKitOldestLoadable = 3;
 
 // ITEMS ON THE GROUND ('ITMS'): what is lying around, by name and pose.
@@ -120,7 +122,9 @@ struct WorldItemRefs {
 // and a dropped blue one share a name and a lattice, so the colour is the only
 // thing telling them apart and nothing else in the record implies it. v1 still
 // loads — its items come back undyed, which is what they were.
-constexpr uint32_t kWorldItemSaveVersion = 2;
+// v3 inserts the vessel FILL word after the dye (WorldItem::fill); a v2
+// ground flask loads empty.
+constexpr uint32_t kWorldItemSaveVersion = 3;
 
 // The 'PLYR' serializer, exposed so the grimoire gate can write an OLDER
 // version's payload (everything up to that version's last block) and prove

@@ -17,6 +17,7 @@
 
 #include "game/avatar.h"
 #include "game/bodyreg.h"
+#include "game/corpses.h"
 #include "game/equipment.h"
 #include "game/item.h"
 #include "game/thirdperson.h"
@@ -5766,6 +5767,431 @@ Status GateZombify(Ctx& c, std::string& detail) {
   return ok ? Status::Pass : Status::Fail;
 }
 
+// ---- mob-loot --------------------------------------------------------------
+//
+// THE PACK: what a creature is carrying that is not on its body (MobDef::loot,
+// Mob::carried_). Six claims, in the order the thing actually happens —
+// authored, rolled, dropped, looted, carried through a turning, saved.
+//
+// IT AUTHORS ITS OWN TABLE rather than reading human.json's. A gate that
+// asserted on the shipped loot table would be a gate that fails whenever
+// somebody changes the content, which is the opposite of what it is for: the
+// claim here is that the MECHANISM works, and the content is somebody else's
+// to tune. Same technique the `crowd` gate uses for spacing — SetDefs a copy,
+// restore the pristine list on the way out, because every gate after this one
+// shares the same MobSystem.
+//
+// The fixture is two rows with different shapes: one CERTAIN and stacked (so
+// "it rolled" is not the same statement as "it rolled once"), one COIN-FLIP
+// and dyed (so the chance gate and the dye both have to travel). No render, no
+// worldgen beyond the flat spot, no ticks that are not the rising's clock.
+Status GateMobLoot(Ctx& c, std::string& detail) {
+  c.debris.Reset();
+  c.mobs.Reset();
+  c.mobs.ClearRisings();
+  SubmitWorldgen(c.ctx, c.world, c.sim, kDefaultSeed);
+  c.ctx.WaitIdle();
+
+  const int hi0 = c.mobs.FindDef("human"), zi = c.mobs.FindDef("zombie");
+  if (hi0 < 0 || zi < 0) {
+    detail = "need the human and zombie defs";
+    return Status::Fail;
+  }
+  // The two items the fixture rolls. By NAME against the real library, because
+  // the whole point of a name is that it resolves late: a row naming an item
+  // nobody ships is skipped at spawn, and a gate that hard-coded an index
+  // would be asserting on file order.
+  const char* kSure = "dagger";     // always, two of them
+  const char* kFlip = "hood";       // half the time, dyed
+  const uint32_t kFlipDye = 0x0100Bu | (1u << 24);
+  if (c.items.Find(kSure) < 0 || c.items.Find(kFlip) < 0) {
+    detail = Format("the item library has no '%s'/'%s' to roll", kSure, kFlip);
+    return Status::Fail;
+  }
+  c.mobs.SetItems(&c.items);
+
+  // ---- the fixture table, and the pristine list to put back ----------------
+  const std::vector<MobDef> pristine = c.mobs.Defs();
+  {
+    std::vector<MobDef> edited = pristine;
+    MobDef::LootEntry sure;
+    sure.item = kSure;
+    sure.countMin = sure.countMax = 2;
+    MobDef::LootEntry flip;
+    flip.item = kFlip;
+    flip.chance = 0.5f;
+    flip.dye = kFlipDye;
+    edited[(size_t)hi0].loot = {sure, flip};
+    c.mobs.SetDefs(std::move(edited));
+  }
+  // Every index is re-taken after SetDefs: it MOVES the def vector, so an
+  // index read before it is an index into a dead allocation.
+  const int hi = c.mobs.FindDef("human");
+  const int zid = c.mobs.FindDef("zombie");
+
+  int relief = 0;
+  const IVec3 anchor = AiFixtureCentre(c.world);
+  const IVec3 spot = AiFlatSpot(anchor.x, anchor.z, 96, 16, kDefaultSeed, relief);
+  const int step = 12;
+
+  auto countOf = [](const Mob* m, const char* item) {
+    int n = 0;
+    if (m != nullptr)
+      for (const CarriedItem& ci : m->Carried())
+        if (ci.item == item) n += ci.count;
+    return n;
+  };
+
+  // ---- A: IT ROLLS, AND THE ROLL IS A FUNCTION OF THE CREATURE ------------
+  //
+  // Not "the numbers look plausible" — the same body rolled twice produces the
+  // same pack, byte for byte. That is the property every other consumer leans
+  // on: a replay, the other machine and a reload-from-seed all have to agree
+  // about what is in a villager's pockets, and none of them can ask this one.
+  //
+  // Done by CLEARING and RE-ROLLING the same mob rather than by spawning two,
+  // because two mobs are two ids and two ids are supposed to differ.
+  bool rolled = false;
+  std::string rollWhy = "no spawn";
+  int sureN = 0;
+  {
+    const uint64_t id = c.mobs.Spawn(hi, {spot.x, spot.y + 1, spot.z});
+    Mob* m = c.mobs.FindMobById(id);
+    if (m != nullptr) {
+      const std::vector<CarriedItem> first = m->Carried();
+      m->ClearCarried();
+      m->RollLoot();
+      const std::vector<CarriedItem>& again = m->Carried();
+      bool same = first.size() == again.size();
+      for (size_t i = 0; same && i < first.size(); i++)
+        same = first[i].item == again[i].item &&
+               first[i].count == again[i].count && first[i].dye == again[i].dye;
+      sureN = countOf(m, kSure);
+      // The certain row is certain, and it is a STACK: a roll that produced
+      // one of everything would pass a weaker version of this arm.
+      rolled = same && sureN == 2;
+      if (!rolled)
+        rollWhy = Format("stable=%d sure=%d stacks=%zu/%zu", same ? 1 : 0,
+                         sureN, first.size(), again.size());
+    }
+  }
+
+  // ---- B: THE CHANCE IS A CHANCE ------------------------------------------
+  //
+  // A coin-flip row has to come up both ways across a crowd. Without this arm
+  // a `chance` that was read as "always" (or dropped on the floor) passes
+  // every other claim here — the pack would still travel, still save, still
+  // rise; it would simply be the wrong pack, on everybody.
+  //
+  // Deterministic despite being a distribution: the ids are consecutive from a
+  // Reset, so this is a fixed set of draws and not a sample.
+  bool varied = false;
+  std::string varyWhy;
+  int withFlip = 0, withoutFlip = 0;
+  uint32_t dyeSeen = 0;
+  {
+    for (int k = 0; k < 24; k++) {
+      const uint64_t id =
+          c.mobs.Spawn(hi, {spot.x + step + k, spot.y + 1, spot.z + step});
+      const Mob* m = c.mobs.FindMobById(id);
+      if (m == nullptr) continue;
+      bool has = false;
+      for (const CarriedItem& ci : m->Carried())
+        if (ci.item == kFlip) { has = true; dyeSeen = ci.dye; }
+      if (has) withFlip++; else withoutFlip++;
+    }
+    // ...and the DYE travelled with it. A colour authored in the table and
+    // dropped on the way to the pack is the defect that only shows up as a
+    // looted garment being the wrong colour, which nothing else here would
+    // catch (game/dye.h).
+    varied = withFlip > 0 && withoutFlip > 0 && dyeSeen == kFlipDye;
+    if (!varied)
+      varyWhy = Format("with=%d without=%d dye=%08x/%08x", withFlip,
+                       withoutFlip, dyeSeen, kFlipDye);
+  }
+
+  // ---- C+D: IT FALLS WITH IT, AND YOU CAN TAKE IT --------------------------
+  //
+  // The corpse report is the only way a pack ever reaches a player, and a pack
+  // entry rides the SAME list as the worn gear with no body on it
+  // (CorpseReport::Piece::body == 0). So the two halves are one arm: the entry
+  // has to arrive, and TakeCorpseLoot has to move the WHOLE stack into the bag
+  // without destroying a body it does not have.
+  bool looted = false;
+  std::string lootWhy = "no spawn";
+  int gotN = 0, entriesBefore = 0, bodiesAfter = 0;
+  {
+    c.debris.Reset();
+    c.mobs.Reset();
+    Corpses reg;
+    c.mobs.SetOnCorpse([&reg](const CorpseReport& r) { reg.Add(r); });
+    const uint64_t id =
+        c.mobs.Spawn(hi, {spot.x + 2 * step, spot.y + 1, spot.z});
+    Mob* m = c.mobs.FindMobById(id);
+    const int want = countOf(m, kSure);
+    if (m != nullptr && want > 0) {
+      m->Die();
+      CorpseReport* cr = reg.Find(id);
+      if (cr != nullptr) {
+        entriesBefore = (int)cr->gear.size();
+        // The pack entry, found the way anything finds one: by what it is.
+        int at = -1;
+        for (size_t i = 0; i < cr->gear.size(); i++)
+          if (cr->gear[i].body == 0 && cr->gear[i].item == kSure) at = (int)i;
+        PlayerKit kit;
+        Inventory hotbar;
+        std::string took;
+        const LootResult lr =
+            at >= 0 ? TakeCorpseLoot(*cr, at, KitRef{}, kit, hotbar, c.items,
+                                     c.debris, &took)
+                    : LootResult::NoSuchPiece;
+        for (const ItemStack& s : kit.bag.slots)
+          if (!s.Empty() && s.def == c.items.Find(kSure)) gotN += s.count;
+        for (const ItemStack& s : hotbar.slots)
+          if (!s.Empty() && s.def == c.items.Find(kSure)) gotN += s.count;
+        // THE CORPSE IS STILL THERE. A pack item has no body, so taking it
+        // must not have taken a limb out of the world with it — the failure
+        // this pins is `DestroyBody(0)` reaching the physics layer and eating
+        // whatever handle 0 happens to mean.
+        const CorpseReport* after = reg.Find(id);
+        bodiesAfter = after != nullptr ? (int)after->bodies.size() : 0;
+        looted = at >= 0 && lr == LootResult::Ok && took == kSure &&
+                 gotN == want && bodiesAfter > 0 && after != nullptr &&
+                 (int)after->gear.size() == entriesBefore - 1;
+        if (!looted)
+          lootWhy = Format("at=%d res=%d took=%s got=%d/%d entries=%d->%d "
+                           "bodies=%d",
+                           at, (int)lr, took.c_str(), gotN, want, entriesBefore,
+                           after != nullptr ? (int)after->gear.size() : -1,
+                           bodiesAfter);
+      } else {
+        lootWhy = "no corpse report";
+      }
+    }
+    c.mobs.SetOnCorpse(nullptr);
+  }
+
+  // ---- E: AND IT CARRIES THE PACK BACK UP ---------------------------------
+  //
+  // The remains a pack would be looted off are DESTROYED by a rising, so
+  // without this, turning is a way to delete a purse. Same skipped clock as
+  // the `zombify` gate: PreTick with a later tick, not 180 real ones.
+  bool carried = false;
+  std::string carryWhy = "no spawn";
+  int roseN = 0;
+  {
+    c.debris.Reset();
+    c.mobs.Reset();
+    c.mobs.ClearRisings();
+    const uint64_t id =
+        c.mobs.Spawn(hi, {spot.x + 3 * step, spot.y + 1, spot.z});
+    Mob* m = c.mobs.FindMobById(id);
+    const uint16_t rotMat =
+        zid >= 0 ? c.mobs.Defs()[zid].bite.infectMat : (uint16_t)0;
+    const int want = m != nullptr ? countOf(m, kSure) : 0;
+    if (m != nullptr && rotMat != 0 && want > 0) {
+      std::vector<BrushOp> ops;
+      std::vector<CellOp> cellOps;
+      std::vector<ParticleSpawn> spawns;
+      const uint32_t tick0 = 15000;
+      c.mobs.PreTick(tick0, c.world, ops, cellOps, spawns);
+      int limb = c.mobs.Defs()[hi].rootLimb;
+      for (size_t i = 0; i < c.mobs.Defs()[hi].limbs.size(); i++)
+        if (c.mobs.Defs()[hi].limbs[i].name.rfind("armR", 0) == 0) limb = (int)i;
+      ::BiteHit bt;
+      bt.at = c.mobs.LimbVoxelPos(id, limb, 2251u);
+      bt.hp = 3.0f;
+      bt.power = 0.8f;
+      bt.infectMat = rotMat;
+      bt.infectStain = c.mobs.Defs()[zid].bite.infectStain;
+      bt.seed = 0x10071u;
+      if (const uint64_t lb = c.mobs.LimbBody(id, limb))
+        c.mobs.BiteHit(lb, bt, c.world, spawns);
+      if (Mob* d = c.mobs.FindMobById(id)) d->Die();
+      c.mobs.PreTick(tick0 + 400, c.world, ops, cellOps, spawns);
+      uint64_t risen = 0;
+      for (uint32_t i = 0; i < c.mobs.MobCount(); i++) {
+        const uint64_t oid = c.mobs.MobIdAt(i);
+        const Mob* om = c.mobs.FindMobById(oid);
+        if (om != nullptr && om->Def() != nullptr && om->Def()->undead)
+          risen = oid;
+      }
+      roseN = countOf(c.mobs.FindMobById(risen), kSure);
+      // THE CONTROL, and the reason this cannot pass by accident: the zombie
+      // def has NO loot table of its own, so a body that got up carrying two
+      // daggers got them from the corpse and from nowhere else. If the rising
+      // dropped the pack and the zombie simply rolled its own, this is 0.
+      const uint64_t ctl =
+          c.mobs.Spawn(zid, {spot.x + 4 * step, spot.y + 1, spot.z});
+      const int ctlN = countOf(c.mobs.FindMobById(ctl), kSure);
+      carried = risen != 0 && roseN == want && ctlN == 0;
+      if (!carried)
+        carryWhy = Format("risen=%llu carried=%d/%d control=%d",
+                          (unsigned long long)risen, roseN, want, ctlN);
+    } else {
+      carryWhy = m == nullptr ? "could not spawn a human"
+                              : (rotMat == 0 ? "no bite.infectMat"
+                                             : "the fixture rolled nothing");
+    }
+  }
+
+  // ---- F: AND IT SURVIVES A SAVE ------------------------------------------
+  //
+  // kSaveVersion 3 is this list. A record that wrote it and a reader that did
+  // not would not merely lose the pack — it would desynchronise the stream and
+  // every creature after this one would load as garbage, which is why the
+  // round-trip is asserted over TWO mobs and not one.
+  bool saved = false;
+  std::string saveWhy = "no spawn";
+  int backN = 0, backN2 = 0;
+  {
+    c.debris.Reset();
+    c.mobs.Reset();
+    const uint64_t a =
+        c.mobs.Spawn(hi, {spot.x + 5 * step, spot.y + 1, spot.z});
+    const uint64_t b =
+        c.mobs.Spawn(hi, {spot.x + 6 * step, spot.y + 1, spot.z});
+    const int wantA = countOf(c.mobs.FindMobById(a), kSure);
+    const int wantB = countOf(c.mobs.FindMobById(b), kSure);
+    if (a != 0 && b != 0) {
+      std::vector<uint8_t> blob;
+      c.mobs.SaveState(blob);
+      c.mobs.Reset();
+      const bool read =
+          c.mobs.LoadState(blob.data(), blob.size(), MobSystem::kSaveVersion);
+      std::vector<uint64_t> back;
+      for (uint32_t i = 0; i < c.mobs.MobCount(); i++)
+        back.push_back(c.mobs.MobIdAt(i));
+      if (back.size() == 2) {
+        backN = countOf(c.mobs.FindMobById(back[0]), kSure);
+        backN2 = countOf(c.mobs.FindMobById(back[1]), kSure);
+      }
+      saved = read && back.size() == 2 && backN == wantA && backN2 == wantB &&
+              wantA > 0;
+      if (!saved)
+        saveWhy = Format("read=%d mobs=%zu packs=%d/%d vs %d/%d", read ? 1 : 0,
+                         back.size(), backN, backN2, wantA, wantB);
+    }
+  }
+
+  // ---- G: THE PLAYER'S OWN KIT RIDES THEIR OWN CORPSE ---------------------
+  //
+  // The avatar turns like anybody else, and its pack is the one thing Die()
+  // cannot read: bag, hotbar and equipment live in PlayerKit on a session this
+  // system deliberately cannot see. So there is a callback, and THIS IS THE
+  // ONLY PLACE THE CALLBACK IS EXERCISED — main.cpp binds it to the real kit,
+  // which no gate has.
+  //
+  // Two arms, because "the zombie carried three daggers" means nothing without
+  // the control: with the callback UNSET the same death must produce a zombie
+  // carrying NOTHING. Otherwise a rising that had quietly learned to roll the
+  // human's table for itself would pass the first half.
+  //
+  // The avatar's own `carried_` stays empty throughout (PlayerAvatar::Spawn
+  // builds its rig without going through MobSystem::Spawn, so it never rolls a
+  // table), which is what makes the count attributable to the hook alone.
+  bool kitRode = false;
+  std::string kitWhy = "no avatar";
+  int kitN = 0, kitCtl = -1;
+  {
+    const std::string avName = kAvatarDefName;
+    const int avDef = c.mobs.FindDef(avName);
+    const uint16_t rotMat =
+        zid >= 0 ? c.mobs.Defs()[zid].bite.infectMat : (uint16_t)0;
+    if (avDef >= 0 && rotMat != 0) {
+      // `armed` false is the control pass; true binds the hook. One lambda so
+      // the two passes cannot drift into two different deaths.
+      auto runOne = [&](bool armed) -> int {
+        c.debris.Reset();
+        c.mobs.Reset();
+        c.mobs.ClearRisings();
+        PlayerAvatar avatar;
+        avatar.Init(&c.phys, &c.world, &c.debris, c.mats, &c.mobs);
+        avatar.SetDefs(&c.mobs.Defs(), avName);
+        c.mobs.SetAvatar(&avatar);
+        c.mobs.SetAvatarKitFn(
+            armed ? std::function<void(std::vector<CarriedItem>&)>(
+                        [&](std::vector<CarriedItem>& out) {
+                          out.push_back(CarriedItem{kSure, 3, 0});
+                        })
+                  : nullptr);
+        Player pl;
+        pl.fly = false;
+        pl.grounded = true;
+        const int gy = World::TerrainHeight(spot.x + 7 * step, spot.z,
+                                            kDefaultSeed);
+        pl.pos = Vec3{(float)(spot.x + 7 * step) + 0.5f,
+                      (float)(gy + 2) + Player::kHalfY, (float)spot.z + 0.5f};
+        int got = -1;
+        if (avatar.Spawn(pl, 0.0f)) {
+          std::vector<BrushOp> ops;
+          std::vector<CellOp> cellOps;
+          std::vector<ParticleSpawn> spawns;
+          const uint32_t tick0 = 18000;
+          c.mobs.PreTick(tick0, c.world, ops, cellOps, spawns);
+          // The rot, into whichever limb still has a body — what turns you is
+          // having the disease in you when you die, and one limb is the whole
+          // threshold (human.json turn.infectedLimbs).
+          std::vector<uint64_t> bodies;
+          avatar.AppendLiveLimbBodies(bodies);
+          if (!bodies.empty()) {
+            ::BiteHit bt;
+            c.phys.BodyCenterOfMass(bodies[0], bt.at);
+            bt.hp = 3.0f;
+            bt.power = 0.8f;
+            bt.infectMat = rotMat;
+            bt.infectStain = c.mobs.Defs()[zid].bite.infectStain;
+            bt.seed = 0xAF17u;
+            c.mobs.BiteHit(bodies[0], bt, c.world, spawns);
+          }
+          avatar.Die();
+          c.mobs.PreTick(tick0 + 400, c.world, ops, cellOps, spawns);
+          got = 0;
+          for (uint32_t i = 0; i < c.mobs.MobCount(); i++) {
+            const Mob* om = c.mobs.FindMobById(c.mobs.MobIdAt(i));
+            if (om != nullptr && om->Def() != nullptr && om->Def()->undead)
+              got = countOf(om, kSure);
+          }
+        }
+        c.mobs.SetAvatarKitFn(nullptr);
+        c.mobs.SetAvatar(nullptr);
+        return got;
+      };
+      kitN = runOne(true);
+      kitCtl = runOne(false);
+      kitRode = kitN == 3 && kitCtl == 0;
+      if (!kitRode)
+        kitWhy = Format("carried=%d (want 3) control=%d (want 0)", kitN, kitCtl);
+    } else {
+      kitWhy = avDef < 0 ? "no avatar def" : "no bite.infectMat";
+    }
+  }
+
+  // Put the def list back before anything else runs against it (kOrder's rule:
+  // gates share one MobSystem, so a def left edited retunes every NPC gate
+  // after this one), and drop the item library the harness never had.
+  c.debris.Reset();
+  c.mobs.Reset();
+  c.mobs.ClearRisings();
+  c.mobs.SetDefs(std::vector<MobDef>(pristine));
+  c.mobs.SetItems(nullptr);
+
+  const bool ok = rolled && varied && looted && carried && saved && kitRode;
+  detail = Format(
+      "rolled %d%s (%d of '%s'); chance %d%s (%d with / %d without '%s'); "
+      "looted %d%s (%d taken, %d bodies left); rose with %d%s (%d carried); "
+      "saved %d%s (%d/%d back); player kit %d%s (%d vs control %d)",
+      rolled ? 1 : 0, rolled ? "" : (" [" + rollWhy + "]").c_str(), sureN, kSure,
+      varied ? 1 : 0, varied ? "" : (" [" + varyWhy + "]").c_str(), withFlip,
+      withoutFlip, kFlip, looted ? 1 : 0,
+      looted ? "" : (" [" + lootWhy + "]").c_str(), gotN, bodiesAfter,
+      carried ? 1 : 0, carried ? "" : (" [" + carryWhy + "]").c_str(), roseN,
+      saved ? 1 : 0, saved ? "" : (" [" + saveWhy + "]").c_str(), backN, backN2,
+      kitRode ? 1 : 0, kitRode ? "" : (" [" + kitWhy + "]").c_str(), kitN,
+      kitCtl);
+  return ok ? Status::Pass : Status::Fail;
+}
+
 // ---- ai-dummy --------------------------------------------------------------
 Status GateAiDummy(Ctx& c, std::string& detail) {
   c.debris.Reset();
@@ -9819,6 +10245,12 @@ const std::vector<Gate>& MobGates() {
       // in it gets back up. Counts and def reads; the six-second wait is
       // skipped by calling PreTick with a later tick.
       {"zombify", "mob", {}, false, GateZombify, /*needsRender=*/false},
+      // THE PACK: a creature carries things that are not on its body, they
+      // fall with it, you can loot them, and a body that turns takes them with
+      // it. Authors its own two-row loot table over a copy of the def list and
+      // puts the pristine list back, so it asserts the mechanism and never the
+      // shipped content.
+      {"mob-loot", "mob", {}, false, GateMobLoot, /*needsRender=*/false},
       // Creatures give each other room instead of piling into one point.
       // Two arms in one gate, the second with spacing zeroed IN THE DEF, so
       // the fixture has to prove it crowds before "they did not overlap"

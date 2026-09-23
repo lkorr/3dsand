@@ -737,6 +737,18 @@ SSBO lists of chunk indices.
     own chunk is on the dirty list, and every probe target is within that
     chunk's probe ring, which the prepass covers by construction.
 
+    **Each ring slot has exactly ONE filler (2026-09-22).** The prepass used to
+    let every dirty chunk fill its whole ten-chunk ring and skip a member whose
+    stamp was already this tick's. A stamp is only published when a workgroup
+    finishes, so with thousands of workgroups in flight almost none saw one: on
+    a forest fire (~5,000 awake smoke chunks) the prepass was 5.1 ms/tick, each
+    slot filled by up to ten neighbours. Now `reposeRingOwned` picks the owner
+    from this tick's `dirtyIn` flags — slot `s` belongs to the dirty centre
+    `s - offset(j)` with the smallest `j`, and offset 0 is the centre itself —
+    so the row reads `R(DirtyIn)`, the stamp skip is gone, and the fill is
+    staged through workgroup memory so a member's 4,096 words are read
+    coalesced. Same slots filled, same bits (world hash unmoved); 5.1 -> ~1.3 ms.
+
     **The ALLOCATION is dense; only the WRITING is sparse.** One bit per
     cell in the window is 16.125 MiB resident from `World::Init`, roughly +36%
     on the page pool's own resident bytes, and that is a flat cost paid by any
@@ -4043,10 +4055,45 @@ neighbors, so this needs an explicit connectivity pass:
   232 KB — in the same order, so the box set, collider and resting pose are
   unchanged (fuzzed against a port of the old walk, and the debris /
   settle-back / audio-impact / body-fastfall detail lines are byte-identical):
-  **10.4 ms → 0.5 ms** on the birth tick. Still open: the 1,024-box cap covers
-  only 5,474 of the oak's 28,478 voxels (19%) in flood order, so a canopy's
-  collider is whichever fifth the island scan reached first; raising the cap
-  moves resting positions and is its own gate-measured change.
+  **10.4 ms → 0.5 ms** on the birth tick. The 1,024-box cap that covered only
+  a fifth of the oak's voxels is gone (next item).
+- **A felled tree cost 100+ ms a Jolt step (2026-09-22).** Owner report: "cut
+  a tree down, or split a big body into several, and it runs at 3 fps for a
+  few seconds". Reproduced with `--fell-tree` on the BAKED birch
+  (`SANDVOX_FELL_SPECIES=birch SANDVOX_FELL_SPLIT=90`, and
+  `SANDVOX_FRAMES_NO_RELOAD=1` — the harness's mid-run F5 otherwise wipes the
+  bodies seconds after the cut): after two splits ONE `Update` took 100-138 ms
+  over four bodies, i.e. 300-500 ms frames at 4 ticks a frame. The step was
+  never contact-bound — the watchdog line now counts manifolds, and a 100 ms
+  step had 17 of them, 44 points — and turning enhanced internal-edge removal
+  off changed nothing; `SANDVOX_NO_ANTITUNNEL=ccd` took it to 1.6 ms. The
+  LinearCast was paying twice: Jolt casts when a step exceeds 0.75 × the
+  shape's inner radius, which for a compound is its SMALLEST sub-shape's — one
+  loose leaf, so a 7 m tree cast on every step of its fall — and the cast
+  sweeps every sub-shape, 1,024 of them on a crown. Two rules in
+  `CreateDebrisBodyXf` (`physics.cpp`, beside `kDiscreteMinExtentVox`):
+  1. **A body at least 24 voxels thick on every axis steps Discrete.** To cross
+     a terrain sheet in one step it would have to move half that, 12 voxels, in
+     one 30 Hz tick — 36 m/s, over the 32 m/s terminal velocity of a fall the
+     height of the whole window. Everything thinner keeps `LinearCast`
+     (`body-fastfall` is unchanged).
+  2. **A box budget of 256.** Under it the greedy merge is untouched (same
+     boxes, same order, same resting pose). Over it, boxes at least 8 voxels and
+     2 thick on every side are KEPT EXACT (the trunk — what rests on the
+     ground), and every other voxel is re-merged on a doubling lattice (2, 4,
+     8…) where a cell is solid if any voxel in it is, clipped to the body's
+     bounds, until the total fits. The collider now covers EVERY voxel (the
+     birch: 242 boxes, 46 kept, rest on a 4-voxel lattice) where it covered a
+     sixth; the price is a crown that collides as a slightly fuller blob.
+  Same run after: worst `Update` 0.5 ms, frame p99 23 ms. The carve path paid
+  too — eight sword kerfs on that log were 56-119 ms (one of them 27 ms) — so
+  `ShatterBody`'s connectivity flood reads a dense index grid instead of a hash
+  map (same seed order, same component numbering), `SpallGrow` only hashes the
+  cells within reach of the blow instead of the whole lattice every round,
+  `DamageBody` evaluates the carve predicate once per voxel instead of twice,
+  and `DominantMaterial` tallies into a flat array: 3.7 ms for the eight. Gate
+  `big-body-collider` pins the budget, the full coverage, the exact trunk box,
+  and Discrete-for-thick / LinearCast-for-thin, with no timing in it.
 - **The body draw was overdraw × a shadow ray (2026-09-12).** Under
   `--fell-tree`, `BuildInstances` ran twice for the whole fall (0.3 ms), and
   the draw cost 1.14 ms a frame while the oak was a body: every voxel was an
@@ -4138,12 +4185,16 @@ neighbors, so this needs an explicit connectivity pass:
   17.8 voxels of travel in one 30 Hz tick at `player.maxFall`. Debris and limp
   rigs were going through the floor, and the guarantee needs THREE things,
   because each one covers a case the others cannot:
-  1. **Jolt CCD.** Every dynamic world body is created `LinearCast`, not the
-     default `Discrete` (which advances by v·dt and only then asks what it
-     overlaps). Jolt pays for the shape cast only when a step exceeds 0.75 ×
-     the collider's inner radius, so a settled or walking body costs what it
-     always did. `Physics::CreateDebrisBody`'s note has the arithmetic; the
-     `body-fastfall` gate pins it against a real `PolygonizeChunk` patch.
+  1. **Jolt CCD.** Every dynamic world body thinner than 24 voxels on some
+     axis is created `LinearCast`, not the default `Discrete` (which advances
+     by v·dt and only then asks what it overlaps). Jolt pays for the shape cast
+     only when a step exceeds 0.75 × the collider's inner radius, so a settled
+     or walking body costs what it always did. `Physics::CreateDebrisBody`'s
+     note has the arithmetic; the `body-fastfall` gate pins it against a real
+     `PolygonizeChunk` patch. A body thicker than that on every axis is
+     `Discrete`, because it cannot cross a sheet in one step and the cast on a
+     compound fires off its smallest box (2026-09-22, "A felled tree cost 100+
+     ms a Jolt step").
   2. **Patches requested ALONG the velocity.** A cast can only hit a triangle
      that exists, and the anchor box reaches about one chunk past a
      human-sized body while a patch costs a chunk fetch plus a slot in
@@ -4217,9 +4268,10 @@ still technically being attached" describes.
 > is gone.
 
 **Why it costs minutes rather than merely looking silly.** Two multipliers that
-this document already records elsewhere. Every dynamic body is
-`EMotionQuality::LinearCast`, so once the linear velocity is large each step is
-a swept compound-shape cast against marching-cubes terrain, per body, per step.
+this document already records elsewhere. Every dynamic body thinner than 24
+voxels is `EMotionQuality::LinearCast`, so once the linear velocity is large
+each step is a swept compound-shape cast against marching-cubes terrain, per
+body, per step.
 And the contact solve sees `v + ω × r` at every contact point — the same term
 that turned a 5-second gate into an eight-minute hang when 1e30 rad/s was
 injected past the sweep.
@@ -9250,6 +9302,21 @@ where you hear from either (§12b, "The ears are on the character").
   (`atomicAnd`+`atomicOr` per byte, `atomicMax` on the occupancy flag, which
   keeps it conservative: never falsely zero). Atomics are legal here precisely
   because cascades carry no determinism requirement.
+  **A dirty chunk whose far-visible matter did not change is skipped
+  (2026-09-22).** The dirty list says a chunk was WRITTEN, not that anything
+  the cascade holds changed — and gas never reaches the cascade, so a burning
+  forest's ~5,000 smoke-awake chunks were re-downsampled every tick for
+  identical bytes (15.4 ms/frame, the largest GPU row in the fire). `fardown`
+  now opens with one coalesced read of the chunk, sums a per-cell hash of every
+  cell `farCellIsSolid` keeps (position + material), mixes in the world chunk
+  coord and the eight level origins, and compares against `World::farSig[slot]`
+  (one u32 per slot, far group binding 6). Equal = return. `FarField` zeroes
+  `farSig` on every `ResetLevel` / `FullRefill`, because a refill re-derives the
+  level from procgen + patches and the next dirty tick must downsample afresh.
+  A 32-bit collision skips one downsample of render-only data. The per-sample
+  procgen (`genColumn`, the column top) is also hoisted to one call per COLUMN
+  (a thread per column, cells in an inner loop): 8x fewer at level 1.
+  Together: 15.4 -> ~1.8 ms/frame on the fire.
   **Edits SURVIVE a cascade refill (edit persistence, 2026-08-24;
   `src/sim/faredits.h`):** the downsample above is only half the story, because
   the sieve is the other producer of the same cells and it knows nothing but
@@ -10190,6 +10257,32 @@ fixed number of depth steps at any distance: the largest bias is 1.9e-3 of view
 depth, four thousand times the rounding it must beat and under a hundredth of a
 voxel at arm's length.
 
+**A limb's overlap is ONE cell stored twice, and the two copies share its
+state** (2026-09-23, `Mob::SyncJointTwins`). The same overlap exists between a
+creature's own limbs: mobgen's stack overlaps (`ARCHETYPE.stack[].overlap`) put
+the bottom 2-3 cells of the torso inside the hips, the top of each thigh inside
+the hips, and so on, so a bent joint never opens a gap - 1,904 coincident cells
+on `newcomer`, 896 of them hips/torso. Every lattice writer (rot, fire, coats,
+carves) is per-limb, so the two copies used to live separate lives, and
+`BODY_Z_PRIORITY` then made the covering PERMANENT: a torso cell turned green
+by the rot sat under the hip's pristine copy forever (owner report). The fix
+keeps the overlap and links the copies: at the first sync each parent/child
+pair's rest-pose-coincident cells are linked by REST lattice coordinate (a
+compaction or a brick rebase moves indices and local coords, never that), and
+from then on a change to either copy is copied to the other, FIELD-WISE and only
+when it changed - material+art, coat, and removal (tombstoned and flushed
+through the rot's FlushBurn tail). Copying never runs parent-over-child, so the
+authored difference between the copies (the torso's rim is skin where the hip's
+copy of that cell is muscle) survives until something happens there; when both
+copies change the same field in one tick the parent wins. An infectious
+material carries the infection with it; a self-active one marks the receiver
+alight. A sever or respawn rebuilds the links. Rejected: partitioning the
+overlap (reopens the gap it exists to hide), hiding one copy near rest (a guess
+that fails back into this bug), a single skinned lattice (the right end state,
+and a rewrite of every per-limb path). Cost is zero on a creature nothing is
+happening to (`twinDirty_`, set by `MarkInstancesDirty` and every coat writer)
+and one pass over its twin cells otherwise. Gate: `joint-twins`.
+
 **Bounds and cost.** The per-fragment DDA is hard-capped at `3·maxDim + 4` steps
 (worst-case diagonal of the brick) with no data-dependent loop bound anywhere.
 The draw list is CPU-compacted, so the instance count IS the number of micro
@@ -10270,7 +10363,15 @@ geometry. Every dirty walk stamps the 17×17 columns around its chunk
 (`openTouchAround` — column STAMPS, not the chunk WALKS the paragraph above
 refuses), and so does the refresh when it meets a chunk that arrived in a slot
 with a stale stamp (its neighbours' faces were marched against whatever the
-slot held before). A refresh visit whose column was not touched since the
+slot held before).
+**A dirty chunk whose RAY BLOCKERS did not change skips the dirty walk**
+(2026-09-22). A fourth plane, `OPEN_SIG_BASE` (declared in
+`sim_openness.wgsl`, sized by `kOpennessGenWords`), holds each slot's
+blocker signature at its last dirty walk; the walk computes the current one in
+a single coalesced read and returns if it matches and the stamp is current.
+That makes the chunk exactly a chunk that was not dirty: its own faces are
+unchanged, and a blocker that changed elsewhere stamps the touch plane from its
+own walk. Gas is not a blocker, so smoke-awake chunks stop costing a walk. A refresh visit whose column was not touched since the
 slot's last full walk keeps its bytes and does only the irradiance
 maintenance — the coarse sun re-sample for a face that marched, the decay for
 one that could not — because that half must never stop (the
@@ -13407,6 +13508,59 @@ cell of every dyeable piece is a grey against the MERGED palette the renderer
 actually reads, that three patterns exist per slot, that the dye reaches every
 shell's GPU instance and nothing else's, that a stack is one colour, and that
 the word survives `PLYR` v5.
+
+### Vessels: a flask scoops, a pouch scoops, both pour (2026-09-22; `game/container.*`)
+
+ONE ITEM KIND, `container`, and what it takes up is DATA: items.json's
+`container.holds` names material CLASSES (`liquid`, `powder`), so the flask and
+the pouch are two rows and a bucket would be a third. Amounts are EIGHTHS of a
+cell, the grid's own liquid unit, so a half-drained puddle cell is taken for
+exactly what it held. The contents ride the stack (`ItemStack::fillMat/
+fillAmt`), are part of the merge key (a flask of blood must not fold into a
+stack of empties), and persist through `PLYR` v6, `ITMS` v3, a drop and an R
+reload.
+
+**Hands up, a vessel selected in the hotbar, nothing drawn** (`FrameIntent::
+vesselSlot`): RMB scoops, LMB pours, the flask is held in the rig slot a sword
+would borrow, and the unarmed compass is off. Both directions go through the
+MutationQueue:
+
+- **A scoop is a list of CONDITIONAL CLEARS** (`CellOpClearIfMat`: kCellOpIfAir
+  on an AIR word, expected material in bits 12..23 -- a combination that was
+  otherwise a no-op). The snapshot the CPU scoops from is kSnapshotLatency
+  ticks old and liquid moves, so the GPU refuses a clear whose cell no longer
+  holds that material; nothing that was not what you scooped is ever deleted.
+- **The vessel is paid what the GPU TOOK, not what the CPU asked for.** A flask
+  held over a levelling pool was measured credited 125 eighths for 113
+  removed: water ran into the holes during the snapshot's four ticks and every
+  cell was paid at its stale fullness. So `sim_mutate` adds what each applied
+  clear really removed to a monotonic SCOOP LEDGER (page-fault record words
+  36..38, `kPageFaultScoop*`), the snapshot carries it, and a scoop files a
+  CLAIM that `ContainerSettle` pays when that tick's snapshot arrives. Exact,
+  four ticks late. A world-wide ledger: two scoops landing on one tick share it.
+- **A pour is grid particles on a solved arc** -- the kernel's own
+  integration, so the stream's centre lands on the crosshair (or on the first
+  body the look ray meets, since the grid pick cannot see a creature). They
+  reinsert as matter where they land. The one rounding: the kernel reinserts a
+  liquid particle FULL, so the last partial cell of a flask comes out as a
+  whole one (under one cell per emptying). Ambient wind drags the stream like
+  any particle (sim.windMode).
+- **The pour is also a SplatterEvent**, the same record a severed artery's spray
+  leaves, so any body in the stream -- creature, corpse, or your own feet -- is
+  coated where it is hit. That IS "pour blood on somebody and they are stained".
+
+**The health panel's pour** (`InspectApplyPicks`): with a filled vessel selected
+and no spell spoken, each limb of the portrait is a target. A click spends
+`container.applyCells` and runs `MobSystem::DouseLimb`: the limb is coated
+(SoakLimb), then the material's `coat.effects` run ONCE on that limb -- the
+first reader that list has had. Vocabulary: `stanch` (the cauterise rule's
+three fields -- bleedBudget, stumpOpen, gushTicks) and `disinfect` (a bite's
+infectMat/infectStain). No material authors either yet; medicine is content.
+
+Gates: `vessel` (pure: content, what goes in, the claim, the arc, stacks,
+PLYR v6, DouseLimb) and `vessel-grid` (the real grid: scoop exactly paid by
+the ledger, pour conserved counting grid + MPM -- a splash excites landed water
+into MPM particles for a while, which a grid-only count reads as a loss).
 
 ## 9d. Biomes and water-body presets — the Environment tab (added 2026-09-01)
 

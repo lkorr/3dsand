@@ -52,6 +52,7 @@ const std::vector<Gate>& WorldIoGates();
 const std::vector<Gate>& VoxRegionGates();
 const std::vector<Gate>& SpellGates();
 const std::vector<Gate>& PlayerKitGates();
+const std::vector<Gate>& VesselGates();
 const std::vector<Gate>& GrimoireGates();
 // The spell GRAPH (PLAN_spell_graph phase 2): layout, the linearizer, the tree
 // edit ops. CPU-only over glyphs.json and the generated oracle.
@@ -110,6 +111,7 @@ const char* const kOrder[] = {
     // with the other cheap front-loaded checks rather than after them.
     "scale",
     "player-kit",
+    "vessel",
     // With it: `spells-oracle` is pure CPU over glyphs.json and the generated
     // grammar oracle -- no world, no GPU, nothing left behind -- and a parser
     // that disagrees with the reference script should be the first thing a
@@ -366,6 +368,9 @@ const char* const kOrder[] = {
     // and patch they make. Neither reads the shared World, so the slot is free
     // — but it has to be AFTER the gates that assert over BodyCount().
     "body-fastfall",
+    // Same shape as `body-fastfall`: pure Jolt, its own bodies 900 voxels out,
+    // all removed before it returns.
+    "big-body-collider",
     // AFTER the debris gates and BEFORE anything that owns bodies of its own.
     //
     // It installs an ownership function on the SHARED DebrisSystem, which
@@ -424,6 +429,13 @@ const char* const kOrder[] = {
     // creature at the end. Nothing before it moves (the append is an append),
     // which is the property that makes this safe to run in-suite at all.
     "zombify",
+    // The pack. Beside `zombify` because half its claim IS a rising, and on
+    // the same terms: it regenerates worldgen on the way in and resets mobs
+    // and debris on every exit. It EDITS `human`'s loot table and restores the
+    // pristine def list before it returns — the rule `crowd` states, and it
+    // matters more here because a def left carrying a fixture table would put
+    // two daggers on every villager every other NPC gate spawns.
+    "mob-loot",
     // Mob-vs-mob spacing. Next to `undead` and for the same reasons: it
     // regenerates worldgen on the way in, ticks no fire and pours no acid,
     // and resets mobs and debris on every exit. It also RESTORES the mob defs
@@ -612,6 +624,15 @@ const char* const kOrder[] = {
     // on contact and water rinses it (owner report 2026-09-13). Ticks the
     // world for the last two and regenerates it on the way out.
     "body-stain",
+    // ...and the DEAD take the same coat: a corpse in blood is bloodied and in
+    // water is washed, by the living's own contact pass (owner report
+    // 2026-09-22). Ticks the world and regenerates it on the way out.
+    "corpse-wash",
+    // ...and the three things a corpse did not inherit from the creature it
+    // was: heat crossing its joints, its armour shielding it, and a burst of
+    // blood landing on it (owner report 2026-09-22). Each ticks the world and
+    // regenerates it on the way out.
+    "corpse-crossheat", "corpse-worn", "corpse-splatter", "vessel-grid",
     // ...and what landed there is a SUBSTANCE, not a colour: the per-limb coat
     // ledger names the material, it dries at that material's own authored rate
     // (and does not at the default one), and a coat can be tracked back onto
@@ -656,6 +677,14 @@ const char* const kOrder[] = {
     // (owner report 2026-09-02: the corpse pulsed at its death colour for
     // good). Same world fire as burn-cap, regenerated on the way out.
     "corpse-burn",
+    // ...and a laser through a head kills it in place and bores a hole: hp
+    // does not decapitate, and dead flesh takes the flesh bore, not the rock
+    // melt (owner report 2026-09-22). Pristine ground, CPU only.
+    "laser-head",
+    // ...and the overlap where a limb meets its parent is ONE cell of flesh in
+    // two lattices: rot, a coat or a hole in either copy is in both (owner
+    // report 2026-09-23). Pristine ground, CPU only.
+    "joint-twins",
     // ---- NOTHING IS LEFT HANGING (2026-09-03) -----------------------------
     // LAST of everything that touches the shared World except `voxregion`, and
     // that position was EARNED rather than chosen. It first sat at the end of
@@ -734,7 +763,7 @@ const std::vector<Gate>& Registry() {
                           &MobGates(), &BodyGates(), &FloaterGates(),
                           &WorldIoGates(), &AudioGates(),
                           &VoxRegionGates(),
-                          &SpellGates(), &PlayerKitGates(), &GrimoireGates(), &SpellGraphGates(),
+                          &SpellGates(), &PlayerKitGates(), &VesselGates(), &GrimoireGates(), &SpellGraphGates(),
                           &SwingGates(),
                           &EquipmentGates(), &DyeGates(), &WoundGates(), &ImpactGates(),
                           &CombatGates(),

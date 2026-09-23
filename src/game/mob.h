@@ -466,6 +466,35 @@ struct MobDef {
     float afterSec = 0.0f;    // how long the corpse lies there first
     int infectedLimbs = 1;    // how much of it has to be rotten to count
   } turn;
+  // ---- WHAT IT IS CARRYING (sidecar `loot`) --------------------------------
+  //
+  // A creature's PACK, as opposed to what it is wearing and what is in its
+  // fist. Worn and held gear is applied imperatively from outside (WearItem /
+  // EquipItem, because a piece of worn kit is a rig slot and a rig slot is not
+  // something a JSON file can append). This is the other half: things the body
+  // has on it that are not on its body, rolled once at Spawn and lootable off
+  // the corpse.
+  //
+  // ROLLED, not fixed, and rolled from the MOB ID (Mob::RollLoot) so that two
+  // runs of the same seed produce the same villager with the same purse. A
+  // load does NOT re-roll — the saved list is the truth, the same rule
+  // `loading_` already enforces for spawn-time rot.
+  //
+  // `count` is a number or a [min, max] pair; `chance` is 0..1 and defaults to
+  // certain. ITEMS BY NAME (item.h's index hazard). An entry naming an item
+  // the library does not have is dropped loudly at load, not at spawn: a
+  // content typo should be one line in the log, not one line per villager.
+  //
+  // An array REPLACES down an `extends` chain and `"loot": null` clears it
+  // (RFC 7396, game/sidecar.cpp MergePatch), so a character inherits the
+  // human's pack unless it says otherwise and an effect can empty it.
+  struct LootEntry {
+    std::string item;
+    int countMin = 1, countMax = 1;
+    float chance = 1.0f;
+    uint32_t dye = 0;         // game/dye.h packed colour, 0 = as authored
+  };
+  std::vector<LootEntry> loot;
   // ---- WHAT THIS CREATURE IS A COMPOSITION OF ------------------------------
   //
   // The two keys a def keeps from its own sidecar after the resolver has
@@ -773,6 +802,10 @@ struct BurnLimbView {
   uint32_t scale = 1;                        // lattice units per world voxel
   const BodyTransform* xf = nullptr;         // pose as the ANIMATION left it
   IVec3 size{};                              // collider extents, physScale units
+  // The collider box's LOW corner, same units. Zero on a live limb (its
+  // lattice starts at its own corner); a debris body's lattice is centred and
+  // runs negative, so the corpse stain pass sets it (MobSystem::StainCorpses).
+  IVec3 sizeMin{};
   uint32_t physScale = 1;
   int* microModel = nullptr;   // null / -1 = cube path, no brick to poke
   bool* carved = nullptr;      // latched when the brick becomes copy-on-write
@@ -863,6 +896,13 @@ struct BurnLimbView {
   // back the paint it covered, or a bloodied patch of a painted creature
   // clears to flat material colour and the wound is still visible as a smear
   // of the wrong pink.
+  // The whole stored word (material | variant << 12) and the art slot.
+  uint32_t Word(size_t i) const {
+    return skin ? (uint32_t)(*skin)[i].material : (uint32_t)(*coll)[i].payload;
+  }
+  uint32_t Art(size_t i) const {
+    return skin ? (uint32_t)(*skin)[i].color : (uint32_t)(*coll)[i].color;
+  }
   void SetWord(size_t i, uint32_t word, uint32_t color) const {
     if (skin) {
       (*skin)[i].material = (uint16_t)word;
@@ -961,6 +1001,25 @@ struct BurnLimbView {
 // creature and a map per limb is not worth the allocation: a body is realistically
 // bloody, or wet, or bloody and wet. Anything reading a specific substance off
 // this reads it off `top`; anything reading "how coated is this" reads Frac().
+// ---- JOINT TWINS (Mob::SyncJointTwins; the long note is at Mob::twins_) ----
+// One side of a coincident cell, as of the last sync.
+struct JointTwinSide {
+  uint16_t mat = 0;    // full word (material | variant << 12); 0 = gone
+  uint16_t stain = 0;
+  uint8_t art = 0;
+};
+struct JointTwinCell {
+  IVec3 rest{};              // creature rest-lattice coordinate
+  uint32_t hintA = 0, hintB = 0;
+  JointTwinSide a, b;
+};
+struct JointTwinPair {
+  int a = -1, b = -1;        // parent limb, child limb
+  uint32_t scale = 1;        // the lattice both are on
+  IVec3 lo{}, hi{};          // rest-lattice box of `cells`, inclusive
+  std::vector<JointTwinCell> cells;
+};
+
 struct CoatEntry {
   uint32_t mat = 0;      // the substance (a material id, not a palette slot)
   uint32_t sumAmt = 0;   // total amount of it over the limb, 0..15 per voxel
@@ -977,6 +1036,27 @@ struct LimbCoat {
     return voxels ? (float)sumAmt / (float)(kBodyStainAmtMax * voxels) : 0.0f;
   }
 };
+
+// ---- ONE WORN SHELL, MARCHED -----------------------------------------------
+//
+// "Is something worn between this flesh and that fire?" asked of ONE shell: a
+// dense index over its lattice (rebuilt whenever the voxel count moves --
+// carving and burning both compact it), and a straight march from `from`
+// along `dir` in the shell's own frame. Returns the material met, 0 for none.
+//
+// One implementation for both populations. A living creature's shells are rig
+// slots (Mob::WornShellAlong walks them); a corpse's are bodies strapped to
+// the piece they covered (MobSystem::CorpseWornAlong walks those). The
+// question and the march are the same, so the code is.
+struct ShellMarchIndex {
+  IVec3 min{}, dims{};
+  std::vector<uint16_t> mat;     // 0 = no voxel here
+  size_t builtFor = (size_t)-1;  // voxel count the index was built from
+};
+uint32_t MarchShell(ShellMarchIndex& ix, const std::vector<PrefabVoxel>* skin,
+                    const std::vector<DebrisVoxel>* coll,
+                    const BodyTransform& xf, uint32_t scale, const Vec3& from,
+                    const Vec3& dir, float dist, int maxSteps, Vec3* outAt);
 
 // ---- A SPLASH OF BLOOD LOOKING FOR SOMETHING TO LAND ON ---------------------
 //
@@ -1462,6 +1542,22 @@ struct ItemCover;
 // through the BrushOp/CellOp/ParticleSpawn streams like every other mutation,
 // and every RNG draw that reaches those streams is counter-based (id, tick,
 // index), never keyed on a Jolt float.
+// ---- ONE STACK IN A CREATURE'S PACK -----------------------------------------
+//
+// Deliberately NOT an ItemStack (game/item.h). An ItemStack holds a LIBRARY
+// INDEX, which is file order and dies on an R reload — fine for the player's
+// kit, which main.cpp re-validates on every reload, and wrong for something
+// that travels through a corpse report, a save file and a network packet. A
+// name resolves late, once, at the moment somebody actually wants the item.
+//
+// The same three fields the hotbar and the bag merge on, for the same reason:
+// a stack is one item in one colour (game/dye.h).
+struct CarriedItem {
+  std::string item;
+  int count = 1;
+  uint32_t dye = 0;
+};
+
 // ---- WHAT A CORPSE STILL HAS ON IT --------------------------------------------
 //
 // Die() hands every limb to DebrisSystem and the husk is swept out of mobs_ on
@@ -1492,10 +1588,26 @@ struct CorpseReport {
     std::string item;               // by NAME (item.h's index hazard)
     int equipSlot = -1;             // -1 for the held item
     bool held = false;
-    uint64_t body = 0;              // the body that IS the piece
+    // THE BODY THAT IS THE PIECE — or 0, WHICH MEANS IT WAS IN THE PACK.
+    //
+    // A worn or held piece is a real object lying in the heap: you loot it by
+    // taking its body OUT of the world. A carried stack (MobDef::loot) never
+    // had a body — it was a line in the creature's pack — so it is looted by
+    // deleting the entry and nothing else.
+    //
+    // One list rather than two because the LOOT PANEL ADDRESSES ENTRIES BY
+    // INDEX (KitRef{KitSpace::Loot, i}, ui/inventory_ui.cpp): a second vector
+    // would mean every consumer — the mirror, the take, the take-all loop, the
+    // drag-out — splitting one index space across two containers, which is
+    // four places to get an off-by-one wrong for no gain. The branch is
+    // `if (piece.body)`, and it appears exactly where a body is touched.
+    uint64_t body = 0;
     int identityCover = -1;         // that body's ItemCover index (worn only)
     std::vector<uint64_t> rags;     // the piece's other shells
     WornDamage damage;              // as it was at death
+    // How many. Always 1 for worn and held gear — a rig slot is one garment —
+    // and the rolled count for a carried stack.
+    int count = 1;
     // The COLOUR it was (game/dye.h), read off the identity shell. Travels for
     // the same reason `damage` does: what you loot off a body has to be the
     // thing that was on it. Without this a red tunic on a corpse loots into
@@ -1864,6 +1976,35 @@ class Mob {
   bool EquipItem(const ItemDef* item, const char* context = "held_right");
   const std::string& HeldItem() const { return heldItem_; }
   int HeldSlot() const { return heldSlot_; }
+
+  // ---- WHAT IT IS CARRYING (MobDef::loot) ---------------------------------
+  //
+  // The pack: stacks that are on the creature without being on its body. No
+  // rig slot, no shell, no brick, no physics — which is the whole difference
+  // between this and `worn_`, and the reason a loot table can be pure data
+  // while a suit of armour cannot (MobDef::LootEntry).
+  //
+  // Everything a body does with these is a list operation: Die() copies them
+  // into the corpse report, a rising carries them to the creature that gets
+  // up, and the save writes them. Nothing here is drawn or simulated.
+  const std::vector<CarriedItem>& Carried() const { return carried_; }
+  // Merges into an existing stack of the same item AND DYE, exactly as the
+  // bag and the hotbar do (item.h ItemStack::dye: a stack is one colour).
+  // Refused past kMaxCarried, like every other bounded per-mob list here.
+  bool AddCarried(const std::string& item, int count = 1, uint32_t dye = 0);
+  // Takes `count` off entry `index` (all of it by default), erasing the entry
+  // when it empties. Returns what actually came off — 0 for a bad index, so a
+  // stale mirror is reported rather than clamped (the rule corpses.h's
+  // LootResult::NoSuchPiece states).
+  int TakeCarried(int index, int count = -1);
+  void ClearCarried() { carried_.clear(); }
+  void SetCarried(std::vector<CarriedItem> v) { carried_ = std::move(v); }
+  // Roll this creature's def-authored loot table into `carried_`. Called once
+  // by MobSystem::Spawn and keyed on the mob id alone, so it is a pure
+  // function of identity: a replay, a reload-from-seed and the other machine
+  // all produce the same purse. NOT called on a load — the saved list is the
+  // truth there, the same rule `loading_` already enforces for spawn rot.
+  void RollLoot();
 
   // ---- WEARING an item (the same borrowed slot, N times) ------------------
   // A worn piece appends one rig slot per ItemCover entry — a SHELL: parented
@@ -3141,6 +3282,56 @@ class Mob {
   uint32_t InfectAcrossJoint(int fromLimb, uint32_t tick, int toLimb,
                              const std::vector<Vec3>& srcWorld);
 
+  // ---- JOINT TWINS: one cell of flesh, two copies (2026-09-23) -------------
+  //
+  // mobgen overlaps adjacent segments on purpose (`ARCHETYPE.stack[].overlap`:
+  // hips reach 2 cells into the torso, the torso 3 into the hips, ...) so a
+  // bending joint never opens a gap. Each limb is its own lattice, so every
+  // cell in that overlap exists TWICE — once in the parent, once in the child
+  // — at the same point of the rest pose. Nothing tied them together: the rot
+  // turned the torso's copy green and the hip's pristine copy sat on top of it;
+  // a burn charred one and the other covered the char; a rot hole in one was
+  // plugged by the other.
+  //
+  // The fix is to treat a coincident pair as ONE cell stored twice: whatever
+  // happens to either copy happens to both. Found by rest-pose coincidence (a
+  // cell's rest lattice coordinate is its limb coordinate plus the limb's rest
+  // offset, both on the same lattice), only between a limb and its rig parent,
+  // only on base anatomy (no garments, no held items), and only between limbs
+  // on the same lattice scale. Keyed by REST coordinate, not lattice index, so
+  // a compaction or a brick rebase (both move indices and local coords) cannot
+  // break a link; the indices are hints re-resolved when they stop matching.
+  //
+  // Sync is FIELD-WISE and CHANGE-DRIVEN, never "copy the parent over the
+  // child": each side's last-synced state is remembered, and only a field that
+  // CHANGED on one side is copied to the other. That keeps the authored
+  // difference between the copies (the torso's rim is skin where the hip's
+  // copy of the same cell is muscle) until something actually happens there.
+  //   * material + art colour: copied as a unit (a rewrite zeroes the art);
+  //   * body coat (stain word): copied on its own;
+  //   * removal: the other copy is tombstoned and flushed through the same
+  //     FlushBurn tail the rot uses, then the link is dropped;
+  //   * both sides changed the same field in one tick: the PARENT wins.
+  // Copying an infectious material starts the infection on the receiving limb
+  // (as RestoreVoxels does); copying a self-active one (fire) marks it alight.
+  //
+  // COST (rule 2): nothing unless `twinDirty_` — set by MarkInstancesDirty and
+  // by every coat writer — and then one pass over the twin cells (a few hundred
+  // per creature), never over the limbs. Lattice sweeps happen only when a
+  // limb's layout moved (a carve), which already costs a sweep.
+  //
+  // CPU body state, not hashed, like every other gore mechanic here.
+  std::vector<JointTwinPair> twins_;
+  // Which limbs had a body when twins_ was built; any change (a sever, a
+  // detach, a respawn) rebuilds from the lattices as they now stand.
+  std::vector<uint8_t> twinAttached_;
+  bool twinsBuilt_ = false;
+  bool twinDirty_ = false;
+  void BuildJointTwins();
+  // Returns false when a flush severed a limb or killed the creature, with
+  // InfectTick's contract: the caller must touch nothing afterwards.
+  bool SyncJointTwins(World& world, std::vector<ParticleSpawn>& spawns);
+
   // Shared services, borrowed from MobSystem (burn tables, micro pool,
   // material tables, event sinks). Never null on a spawned creature.
   MicroBodySet* MicroSet() const;
@@ -3496,16 +3687,18 @@ class Mob {
     // a hole into it (carve and burn both compact the lattice). Built LAZILY,
     // so a dressed creature standing in a field costs nothing at all — the
     // probe is only ever reached from the burn pass's `scanHot` branch.
-    struct ShellIndex {
-      IVec3 min{}, dims{};
-      std::vector<uint16_t> mat;   // 0 = no voxel here
-      size_t builtFor = (size_t)-1;  // voxel count the index was built from
-    };
+    using ShellIndex = ShellMarchIndex;
     std::vector<ShellIndex> index;
   };
   std::vector<WornPiece> worn_;
   std::vector<LostGear> lostGear_;
   static constexpr size_t kMaxLostGear = 16;
+  // The pack (MobDef::loot). Bounded like every other per-mob list: a loot
+  // table is content and content can be edited wrong, and a creature carrying
+  // ten thousand stacks would be ten thousand strings in every save record and
+  // every handoff packet.
+  std::vector<CarriedItem> carried_;
+  static constexpr size_t kMaxCarried = 32;
   // The gear half of DetachLimb: the held item or a worn piece's identity
   // shell leaving as debris. Runs BEFORE the lattice is handed over, because
   // CaptureWorn reads the shells, and returns the item name to register the
@@ -4054,6 +4247,30 @@ class MobSystem {
   void SetOnCorpse(std::function<void(const CorpseReport&)> cb) {
     onCorpse_ = std::move(cb);
   }
+  // ---- WHAT THE PLAYER IS CARRYING, ASKED AT THE MOMENT THEY DIE ----------
+  //
+  // The avatar's pack is not on the avatar. Bag, hotbar and equipment live in
+  // PlayerKit on PlayerSession (game/session.h's rule: per-player state is not
+  // a process global), and MobSystem cannot reach a session — deliberately,
+  // since there may be two of them. So the seam is the same shape as
+  // SetOnCorpse, pointing the other way: Die() ASKS, the session ANSWERS.
+  //
+  // Called only when the avatar's corpse is actually going to get up, and only
+  // on the machine that owns it. `out` receives the stacks to hand the risen
+  // body.
+  //
+  // THE CALLBACK DECIDES WHETHER THE PLAYER KEEPS THEM. With
+  // `avatar.keepKitOnTurn` (the default, and the dev-mode reading) it copies
+  // and the kit is untouched; with it off it MOVES — bag, hotbar and equipment
+  // are emptied on the way out, so what gets up is wearing your armour and you
+  // respawn with nothing. That flag is the whole of the difference between
+  // "your death spawns a second copy of your gear" and "your gear walks away",
+  // and it is a flag rather than a decision because the first one is what you
+  // want while testing and the second is what you want in a game.
+  void SetAvatarKitFn(std::function<void(std::vector<CarriedItem>&)> cb) {
+    avatarKitFn_ = std::move(cb);
+  }
+  bool HasAvatarKitFn() const { return (bool)avatarKitFn_; }
 
   // ---- the attack seam (Phase C consumes this) ----------------------------
   // Requests issued this tick. The AI decides WHEN and WHERE; it never swings,
@@ -4192,7 +4409,16 @@ class MobSystem {
   // went from a byte holding a palette slot to 16 bits holding a MATERIAL, and
   // both lattices are written as PODs — the stride moved, so a version-1
   // section cannot be read and is refused as it already is.
-  static constexpr uint32_t kSaveVersion = 2;
+  //
+  // 3 (2026-09-22): the pack. Every record gained a count-prefixed list of
+  // carried stacks (Mob::carried_, MobDef::loot) after its limbs, so this is
+  // the first inventory the mob format has ever held — until now a creature's
+  // gear was not saved at all and a reloaded villager was re-dressed from
+  // outside. Appended at the end of the record, but a version-2 reader cannot
+  // skip what it does not know is there, so the bump is real and the refusal
+  // stays a refusal. THE HANDOFF PACKET MOVES WITH IT (see below): both sides
+  // of a session must be the same build, which they already had to be.
+  static constexpr uint32_t kSaveVersion = 3;
   void SaveState(std::vector<uint8_t>& out) const;
   // Contract (worldio LoadEntities): Reset() has already run.
   bool LoadState(const uint8_t* data, size_t len, uint32_t version);
@@ -4695,6 +4921,21 @@ class MobSystem {
   // other way to ask for one. Returns the voxels marked.
   uint32_t SoakLimb(uint64_t mobId, int limb, uint32_t mat, uint32_t amount,
                     uint32_t tick);
+  // SOMETHING POURED ON A LIMB BY HAND (game/container.h: the health panel's
+  // "apply to this part"). SoakLimb's coat, then the material's authored
+  // `coat.effects`, run ONCE, on that limb -- the first reader that list has
+  // had. The vocabulary is what a remedy can do to state a limb already
+  // carries, and nothing else:
+  //   "stanch"    -- the wound stops owing blood (bleedBudget, the open
+  //                  stump, a gout in progress): the cauterise rule's three
+  //                  fields, reached by a salve instead of a burn;
+  //   "disinfect" -- a bite's rot stops spreading (infectMat/infectStain).
+  // An unknown tag does nothing, so content can name remedies ahead of the
+  // code. Returns a bit per effect that CHANGED something (kRemedy*), so the
+  // caller can say "the bleeding stops" only when it did.
+  static constexpr uint32_t kRemedyStanch = 1u, kRemedyDisinfect = 2u;
+  uint32_t DouseLimb(uint64_t mobId, int limb, uint32_t mat, uint32_t amount,
+                     uint32_t tick, uint32_t* marked = nullptr);
   // Force the ledger's cadence (Mob::RecountCoat) for one creature, so a
   // caller that has just changed a coat can read the answer this instant
   // instead of waiting out tune.coat.recountTicks.
@@ -4711,6 +4952,55 @@ class MobSystem {
   void StainLimbs(uint32_t tick, World& world);
   bool StainOneLimb(BurnLimbView& v, uint32_t tick, uint32_t rngKey,
                     World& world, uint32_t& budget);
+  // The drying half of Mob::StainTick over a view: every substance in `led`
+  // with an authored coat.decay loses a level on half its voxels once per
+  // period. Shared by the living and the dead (StainCorpses).
+  bool DryOneLimb(BurnLimbView& v, const LimbCoat& led, uint32_t tick,
+                  uint32_t key, uint32_t& budget);
+  // One lattice's coat ledger (Mob::RecountCoat's per-limb count).
+  static void TallyCoat(const BurnLimbView& v, LimbCoat& out);
+  // ---- THE DEAD TAKE A COAT TOO (2026-09-22) --------------------------------
+  // Contact (blood stains, water rinses) and drying over every dead-flesh
+  // debris body, through StainOneLimb / DryOneLimb — the passes the living
+  // use, so a corpse in a river is washed at the rate a man in it is. Owner
+  // report: "water doesn't clean the stains off corpses". Splatter onto the
+  // dead is NOT here (Mob::ApplySplatter walks limbs, not bodies).
+  void StainCorpses(uint32_t tick, World& world, uint32_t& budget);
+  // One burst replayed against one lattice (Mob::ApplySplatter's per-limb
+  // body): true when a voxel's coat changed. `salt` keys the draws — the limb
+  // index on the living, a hash of the body id on the dead.
+  bool SplatterView(const SplatterEvent& e, BurnLimbView& v, uint32_t salt);
+  // ...and that replay over every dead-flesh body (StainLimbs' splatter loop).
+  void SplatterCorpses(const SplatterEvent& e);
+  // ---- THE DEAD BURN AS THE LIVING DO (2026-09-22) --------------------------
+  // Every dead-flesh debris body through BurnOneLimb, the living limb pass,
+  // with the two things only the living had until now: heat across the
+  // corpse's joints (BuildCrossHeat, grouped by the creature the pieces came
+  // off) and its armour (the occlusion hook, marching the bodies strapped to
+  // each piece). DebrisSystem keeps only the body tail (BurnFleshBodies).
+  void BurnCorpses(uint32_t tick, World& world, std::vector<CellOp>& cellOps,
+                   std::vector<ParticleSpawn>& spawns);
+  // The cross-joint heat snapshot over any set of lattices: `parts[i]` is
+  // part i's view (null = no body), and a cell's limb bit is its index here.
+  // Mob::BuildCrossLimbHeat passes a creature's limbs; BurnCorpses passes one
+  // corpse's pieces.
+  void BuildCrossHeat(const std::vector<BurnLimbView*>& parts, uint32_t tick,
+                      std::vector<CrossHeatCell>& out);
+  // The corpse twin of Mob::WornAlong: the first shell met marching from
+  // `from` along `dir`, over the bodies strapped to one piece.
+  uint32_t CorpseWornAlong(const std::vector<DebrisSystem::FleshShell>& shells,
+                           const Vec3& from, const Vec3& dir, float dist,
+                           uint32_t tick);
+  struct CorpseWornProbe {
+    MobSystem* sys;
+    const std::vector<DebrisSystem::FleshShell>* shells;
+    uint32_t tick;
+    static uint32_t Call(void* ctx, const Vec3& from, const Vec3& dir,
+                         float dist) {
+      CorpseWornProbe* p = static_cast<CorpseWornProbe*>(ctx);
+      return p->sys->CorpseWornAlong(*p->shells, from, dir, dist, p->tick);
+    }
+  };
   // The limb's AUTHORITATIVE lattice (the skin when it is finer, else the
   // collider re-expressed as PrefabVoxels), copied out for a gate that has
   // to ask WHICH voxels changed rather than how many (corpse-bleed asks where
@@ -4873,6 +5163,20 @@ class MobSystem {
   // lattice LimbVoxelsAtSpawn counted. LimbVoxelCount reports the collider,
   // and mixing the two scales every fraction by (skinScale/physScale)^3.
   uint32_t LimbArtVoxelCount(uint64_t mobId, int limbIndex) const;
+  // ---- joint twins (Mob::SyncJointTwins), for the `joint-twins` gate ----
+  // Linked cells on this creature (building the links if they are not yet),
+  // and the `k`th of them as (parent limb, child limb, rest-lattice cell).
+  uint32_t JointTwinCount(uint64_t mobId);
+  bool JointTwinAt(uint64_t mobId, uint32_t k, int& limbA, int& limbB,
+                   IVec3& rest);
+  // One cell of a limb's authoritative lattice, addressed by REST coordinate
+  // (see JointTwinCell). Get: false if the cell is absent or tombstoned.
+  // Set: mat 0 tombstones it, an unchanged mat leaves the material (and its
+  // art slot) alone; marks the creature dirty like any writer.
+  bool LimbCellAt(uint64_t mobId, int limb, IVec3 rest, uint32_t& mat,
+                  uint16_t& stain);
+  bool SetLimbCellAt(uint64_t mobId, int limb, IVec3 rest, uint32_t mat,
+                     uint16_t stain);
 
  private:
   // ---- per-voxel burning / dissolution (docs/PLAN_body_reactivity.md) --------
@@ -5175,6 +5479,19 @@ class MobSystem {
       WornDamage damage;
     };
     std::vector<RiseGear> gear;
+    // ---- AND WHAT IT HAD IN ITS PACK --------------------------------------
+    //
+    // The same argument as `gear`, one step simpler because there is no body
+    // and no damage to capture: the remains are destroyed by the rising, so a
+    // rising that dropped the pack would be a way to delete a purse by letting
+    // its owner turn. Straight onto the creature that gets up, which is then
+    // lootable for it in the ordinary way — a zombie carrying your dagger is a
+    // zombie you can take your dagger back off.
+    //
+    // FOR THE AVATAR this is where the player's bag and hotbar arrive
+    // (MobSystem::SetAvatarKitFn): Mob cannot reach PlayerSession, and the
+    // kit's owner answers the question at the moment of death.
+    std::vector<CarriedItem> carried;
   };
   // Bounded like every other emergent queue here (CLAUDE.md rule 2): a crowd
   // dying at once books a crowd of risings, and the cost of one is a spawn.
@@ -5215,6 +5532,7 @@ class MobSystem {
   const ItemLibrary* items_ = nullptr;
   std::function<void(uint64_t, const std::string&, uint32_t)> onItemShed_;
   std::function<void(const CorpseReport&)> onCorpse_;
+  std::function<void(std::vector<CarriedItem>&)> avatarKitFn_;
   std::vector<BlockEvent> blocks_;
   // The players' bodies, registered by the frame layer so the handle-keyed
   // lookups can find them. NOT owned and NOT in `mobs_` — see SetAvatars.
@@ -5309,6 +5627,29 @@ class MobSystem {
   // pool is swept whole every tick or two.
   static constexpr uint32_t kStainLatticePerLimb = 6144;
   static constexpr uint32_t kStainLatticePerTick = 32768;
+  // Per corpse body: the contact pass's index (derived, rebuilt when the
+  // lattice's voxel count moves — every carve, burn flush and shatter does),
+  // and the coat ledger drying reads, recounted only while something changed.
+  // Keyed on the body's global id; an entry whose body is gone is dropped the
+  // next tick the pass runs. Never saved, never hashed.
+  struct CorpseCoat {
+    BodyBurnState burn;
+    size_t n = 0;
+    LimbCoat led;
+    bool dirty = true;
+    uint32_t seen = 0;
+  };
+  std::map<uint64_t, CorpseCoat> corpseCoat_;
+  // One march index per strapped shell on a corpse, keyed on the shell body's
+  // global id; dropped when unasked-for for two seconds (the body left).
+  struct CorpseShell {
+    ShellMarchIndex ix;
+    uint32_t seen = 0;
+  };
+  std::map<uint64_t, CorpseShell> corpseShellIdx_;
+  BurnLimbView CorpseView(DebrisSystem::FleshLattice& f, CorpseCoat& cc,
+                          int& model);
+  static uint32_t CorpseKey(uint64_t id);
   static constexpr size_t kSplatterMaxEvents = 64;
   // Lattice steps one droplet's arc may take inside a limb's index box, and
   // the widest splat (lattice voxels) one landing may paint.

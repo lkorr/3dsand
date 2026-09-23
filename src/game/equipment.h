@@ -334,15 +334,17 @@ struct Bag {
   }
   // Merges by def AND DYE, for the reason ItemStack::dye states: a stack is one
   // colour, so a red tunic must not fold into a stack of blue ones.
-  int Add(int defIndex, int count = 1, uint32_t dye = 0) {
+  int Add(int defIndex, int count = 1, uint32_t dye = 0, uint16_t fillMat = 0,
+          uint16_t fillAmt = 0) {
     if (defIndex < 0 || count <= 0) return -1;
     for (int i = 0; i < kSlots; i++)
-      if (!slots[i].Empty() && slots[i].def == defIndex && slots[i].dye == dye) {
+      if (!slots[i].Empty() &&
+          slots[i].SameKind(defIndex, dye, fillMat, fillAmt)) {
         slots[i].count += count;
         return i;
       }
     int f = FirstFree();
-    if (f >= 0) slots[f] = {defIndex, count, dye};
+    if (f >= 0) slots[f] = {defIndex, count, dye, fillMat, fillAmt};
     return f;
   }
 };

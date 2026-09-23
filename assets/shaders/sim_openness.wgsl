@@ -499,10 +499,58 @@ fn openChunk(slot : u32, li : u32, origin : vec3<i32>, fullIn : bool) {
 // reach so the refresh re-marches the neighbours the edit could have changed
 // (a roof stamped over a floor darkens that floor on the floor's next visit,
 // instead of never).
+// The fourth plane of opennessGen (world.h kOpennessGenWords): per slot, the
+// signature of the chunk's RAY BLOCKERS at its last dirty walk. Declared here,
+// not in common.wgsl, because only this shader reads it.
+const OPEN_SIG_BASE : u32 = 2u * NUM_SLOTS + NCHUNK * NCHUNK;
+var<workgroup> wgOpenSig : atomic<u32>;
+
 @compute @workgroup_size(OPEN_WORDS_PER_CHUNK)
 fn dirty(@builtin(workgroup_id) wg : vec3<u32>,
          @builtin(local_invocation_index) li : u32) {
   let slot = dirtyList[wg.x];
+
+  // ---- SKIP A CHUNK WHOSE BLOCKERS DID NOT CHANGE --------------------------
+  // Everything a walk computes is a function of ray blockers (this chunk's and
+  // those within reach). If this chunk's are what they were at its last dirty
+  // walk, and the slot still holds the same world chunk, a walk rewrites what
+  // is there; and a blocker that changed ELSEWHERE is that chunk's own dirty
+  // walk's business -- it stamps the touch plane round itself, which is what
+  // brings the refresh back here. So skipping makes this chunk exactly a chunk
+  // that was not dirty. Gas is not a blocker: a smoke-filled sky chunk (a
+  // forest fire's ~5,000 of them) pays one coalesced read and stops.
+  let wc = openWorldChunk(slot, T.origin);
+  let chunkMin = wc * i32(CHUNK);
+  if (li == 0u) { atomicStore(&wgOpenSig, 0u); }
+  workgroupBarrier();
+  // Read the page directly (i is the chunk-linear in-page index); a sentinel
+  // holds one material everywhere. See fardown's twin of this loop.
+  var acc = 0u;
+  let pe = pageTable[slot];
+  if ((pe & PT_SENTINEL_BIT) != 0u) {
+    let m = pe & PT_MAT_MASK;
+    if (m != MAT_AIR && isRayBlocker(materials[m])) {
+      for (var i = li; i < CHUNK_VOL; i += OPEN_WORDS_PER_CHUNK) { acc += pcg((m << 12u) | i); }
+    }
+  } else {
+    let pageBase = pe * CHUNK_VOL;
+    for (var i = li; i < CHUNK_VOL; i += OPEN_WORDS_PER_CHUNK) {
+      let m = voxMat(voxels[pageBase + i]);
+      if (m != MAT_AIR && isRayBlocker(materials[m])) { acc += pcg((m << 12u) | i); }
+    }
+  }
+  atomicAdd(&wgOpenSig, acc);
+  workgroupBarrier();
+  if (li == 0u) {
+    let stamp = opennessStamp(wc);
+    // Order-free sum, then the stamp; 0 stays "never walked" (zeroed buffer).
+    let sig = max(pcg(atomicLoad(&wgOpenSig) ^ stamp), 1u);
+    let same = opennessGen[OPEN_SIG_BASE + slot] == sig && opennessGen[slot] == stamp;
+    opennessGen[OPEN_SIG_BASE + slot] = sig;
+    atomicStore(&wgOpenSig, select(0u, 1u, same));
+  }
+  if (workgroupUniformLoad(&wgOpenSig) != 0u) { return; }
+
   openTouchAround(slot, li);
   openChunk(slot, li, T.origin, true);
 }

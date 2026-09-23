@@ -229,6 +229,7 @@ BUF_TO_WGSL = {
     "FarList": {"farList"},
     "FarUBO": {"F", "farP"},
     "FarPatch": {"farPatch"},
+    "FarSig": {"farSig"},
     "PageTable": {"pageTable"},
     # The openness (sky-visibility) grid, bindings 27/28 of simBGL_
     # (docs/PLAN_gi.md 2). Written only by sim_openness.wgsl; the render
@@ -383,7 +384,7 @@ _SLIM_GROUP0 = {"voxels", "dirtyIn", "dirtyOut", "materials", "T",
                 "worldMap"}
 _PARTICLE_GROUP1 = {"pRead", "pReadBuf", "pWrite", "counts", "claim", "pArgs",
                     "expOps", "expMask", "spawnOps"}
-_FAR_GROUP1 = {"farVox", "farOcc", "farList", "F", "farDirty", "farPatch"}
+_FAR_GROUP1 = {"farVox", "farOcc", "farList", "F", "farDirty", "farPatch", "farSig"}
 # Gas particles (docs/PLAN_gas_particles.md stage 1). farVox + farP are in this
 # group as well as the far one: a parcel outside the residency window asks the
 # cascade what it is drifting into, and that is the whole reason gas has a

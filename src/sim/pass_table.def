@@ -250,10 +250,9 @@ PASS(copy_argsStage_dispatchArgs, nullptr, PT_TICK, PIPE_NONE, K_COPY, 0,0,12, G
 // Each workgroup fills its dirty chunk AND the nine neighbours a probe can
 // reach (reposeRingOffset in the shader owns that table): a resting grain's
 // probes reach 3 cells and cross into a neighbour chunk that may be asleep, and
-// a boundary artifact every 16 cells is not acceptable. Ring members are
-// re-filled by every dirty chunk that touches them; the bits written are a pure
-// function of pre-CA voxel state, so duplicated work is redundant, never
-// divergent.
+// a boundary artifact every 16 cells is not acceptable. Each ring slot is
+// filled by exactly ONE owner, chosen from this tick's dirty flags -- hence
+// R(DirtyIn) (reposeRingOwned in the shader).
 //
 // read-only in practice: `voxels` is read_write for the module because `main`
 // writes it; `reposesnap` only asks what material a cell holds. No A(DirtyOut),
@@ -261,7 +260,7 @@ PASS(copy_argsStage_dispatchArgs, nullptr, PT_TICK, PIPE_NONE, K_COPY, 0,0,12, G
 // this row from adding a WAW edge to the 54 CA iterations behind it.
 PASS(reposeSnap, "reposeSnap", PT_TICK, PIPE_REPOSE_SNAP, K_INDIRECT, IND_DISPATCHARGS,0,0,
      GRP_SIM, DYN_ZERO, C_REPOSE, 1,
-     USES(U(TickUBO) R(Voxels) R(Materials) R(DirtyList) I(DispatchArgs)
+     USES(U(TickUBO) R(Voxels) R(Materials) R(DirtyIn) R(DirtyList) I(DispatchArgs)
           R(PageTable) W(ReposeSnap)))
 
 // ---- phase 3: the CA loop -------------------------------------------------
@@ -646,7 +645,7 @@ PASS(pick_dirty, "occupancyDirty+pick", PT_TICK, PIPE_PICK, K_COMPUTE, 1,1,1, GR
 PASS(farDown, "farDown", PT_TICK, PIPE_FAR_DOWN, K_INDIRECT, IND_DISPATCHARGS,0,0,
      GRP_SLIM_FAR, DYN_NONE, C_DIRTYTICK, 1,
      USES(R(Voxels) R(Materials) U(TickUBO) U(FarUBO) R(DirtyList) I(DispatchArgs)
-          A(FarVox) A(FarOcc) R(PageTable) R(TreeAtlas) R(WorldMap)))
+          A(FarVox) A(FarOcc) R(PageTable) R(TreeAtlas) R(WorldMap) RW(FarSig)))
 
 // ---- phase 5c: the openness (sky-visibility) grid -------------------------
 // docs/PLAN_gi.md §2. RENDER-ONLY DERIVED DATA written on the TICK table, which

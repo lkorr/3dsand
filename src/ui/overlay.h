@@ -1091,6 +1091,13 @@ struct UIState {
     bool pending = false;
     int slot = -1;             // UIState::BodySlot
   } castAtPart;
+  // ...and with a filled VESSEL selected in the hotbar instead (game/
+  // container.h): pour it on that part. `applyText` is what the flask holds
+  // ("water 64/128"), empty when the selected slot is no filled vessel -- and
+  // then the inspector offers no targets.
+  CastAtPartIntent applyAtPart;
+  std::string applyText;
+  uint32_t applyColor = 0;   // the substance's own colour, for the hover frame
 
   // What the last refused action said, and how long ago. Flashed under the
   // panel rather than swallowed: a slot that silently declines is the failure

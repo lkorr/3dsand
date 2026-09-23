@@ -624,6 +624,7 @@ bool LoadTuning(const std::string& path, Tuning& out) {
     ReadF(*g, "footTrim", a.footTrim, out, at);
     ReadF(*g, "severImpulse", a.severImpulse, out, at);
     ReadF(*g, "respawnDelay", a.respawnDelay, out, at);
+    ReadB(*g, "keepKitOnTurn", a.keepKitOnTurn, out, at);
   }
 
   if (const json* g = Find(j, "audio")) {

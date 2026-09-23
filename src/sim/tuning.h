@@ -572,6 +572,24 @@ struct Tuning {
     float severImpulse = 6.0f;   // extra shove given to a part as it comes off
     // How long the corpse's parts stay before the avatar can respawn, seconds.
     float respawnDelay = 3.0f;
+    // ---- WHAT YOUR ZOMBIE TAKES WITH IT -----------------------------------
+    //
+    // The avatar turns like anybody else: die with the rot in you and your own
+    // corpse gets up as a zombie of you (MobDef::Turn, inherited from
+    // human.json by every character). It rises in the gear it fell in — and
+    // the question this answers is whether you STILL HAVE THAT GEAR.
+    //
+    // true  — it rises with a COPY and you respawn with your kit intact. Two
+    //         swords now exist where there was one. The default, because
+    //         losing your kit to a test bite costs more than a duplicate
+    //         does while the mechanic is being played with.
+    // false — the kit MOVES. Bag, hotbar and equipment are emptied at the
+    //         moment of death and everything is on the thing wearing your
+    //         face. No duplication, and the death penalty this becomes.
+    //
+    // CPU-only, read at the one seam (MobSystem::SetAvatarKitFn, bound in
+    // main.cpp). Nothing here reaches a shader or the CA.
+    bool keepKitOnTurn = true;
   } avatar;
 
   // ---- sound ----

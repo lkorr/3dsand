@@ -521,6 +521,7 @@ add_library(sandvox_core OBJECT
   src/game/spellgraph.cpp
   src/game/caster.cpp
   src/game/melee.cpp
+  src/game/container.cpp
   src/game/strokes.cpp
   # Is this pose inside itself? (game/selfclip.h) — voxel-level limb
   # interpenetration, differenced against the bind pose.
@@ -564,6 +565,7 @@ add_library(sandvox_core OBJECT
   src/test/selftest_spell.cpp
   src/test/selftest_spellgraph.cpp
   src/test/selftest_playerkit.cpp
+  src/test/selftest_vessel.cpp
   src/test/selftest_swing.cpp
   src/test/selftest_combat.cpp
   src/test/selftest_equipment.cpp

@@ -65,6 +65,18 @@
     "//infectedLimbs": "How much of the body has to carry the rot. One limb: a single bite that got through is enough, which is the rule the bite already implies (armour that stops the tear stops the infection outright, melee.h).",
     "infectedLimbs": 1
   },
+  "//loot": "WHAT A PERSON HAS ON THEM, as opposed to what they are WEARING. Worn and held gear is a rig slot and has to be applied from outside (WearItem/EquipItem); this is the pack, and it is pure data because a carried stack has no geometry, no physics and nothing to draw. Rolled ONCE at spawn from the mob id alone (Mob::RollLoot), so the same villager has the same purse on a replay, on the other machine, and after a reload -- and a load does not re-roll, because the saved list is the truth and rolling again would make sleeping next to a corpse a way to refill it. Each row is an item id from assets/items/items.json, an optional `count` (a number, or [min,max] for a draw), an optional `chance` 0..1, and an optional `dye` as \"#RRGGBB\". The two draws use separate keys so that lucky rows are not also big rows. INHERITED BY EVERY CHARACTER through `extends` -- an array REPLACES wholesale (RFC 7396) so a character states its own table in full, and `\"loot\": null` empties it. What dies with a pack drops it: Die() puts every stack on the corpse report where the loot panel can see it, and a body that TURNS carries its pack onto the zombie that gets up, because a rising that dropped the purse would be a way to delete one.",
+  "loot": [
+    {
+      "item": "dagger",
+      "chance": 0.18
+    },
+    {
+      "item": "hood",
+      "chance": 0.12,
+      "dye": "#6b5a3e"
+    }
+  ],
   "speed": 31.5,
   "gait": {
     "groups": [

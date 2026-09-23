@@ -284,6 +284,13 @@ def engraving(kind, size=16):
         fill([(4, 5, 10), (5, 4, 11), (6, 4, 11), (7, 4, 11), (8, 4, 11),
               (9, 4, 11), (10, 5, 10)])
         fill([(6, 6, 9), (7, 6, 9), (8, 6, 9)], INK)
+    elif kind == "container":     # a stoppered flask: a VESSEL
+        fill([(2, 7, 8)], GOLD_DIM)                        # stopper
+        fill([(3, 7, 8), (4, 7, 8), (5, 7, 8)])            # neck
+        fill([(6, 5, 10), (7, 4, 11), (8, 3, 12), (9, 3, 12), (10, 3, 12),
+              (11, 3, 12), (12, 4, 11), (13, 5, 10)])      # belly
+        fill([(10, 4, 11), (11, 4, 11), (12, 5, 10)], GOLD_DIM)  # contents
+        stroke(im, [(4, 8), (4, 9), (3, 10), (3, 11)], h)  # glint
     elif kind == "bag":           # the general storage mark
         fill([(4, 6, 9), (5, 4, 11), (6, 3, 12), (7, 3, 12), (8, 3, 12),
               (9, 3, 12), (10, 3, 12), (11, 4, 11)])
@@ -326,6 +333,9 @@ def build():
     for k in ("melee", "unknown"):
         add("item_" + k, engraving(k))
     add("icon_bag", engraving("bag"))
+    # Appended AFTER the bag, not beside its kin: the shelf packer places in
+    # order, and inserting earlier would move every sprite behind it.
+    add("item_container", engraving("container"))
 
     # Pack into a sheet, one row per 24 px band. Simple shelf packing — the
     # sheet is 20-odd small sprites and an optimal packer would be more code

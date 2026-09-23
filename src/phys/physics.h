@@ -553,11 +553,25 @@ class Physics {
     double worstStepMs = 0.0;   // longest single Update, wall clock
   };
   const RunawayProbe& Runaway() const { return runaway_; }
+  // The last Update: its wall clock and what the narrow phase produced.
+  struct StepStats {
+    double ms = 0.0;
+    uint32_t manifoldsDyn = 0, pointsDyn = 0;        // body vs body
+    uint32_t manifoldsStatic = 0, pointsStatic = 0;  // body vs terrain/static
+  };
+  const StepStats& LastStep() const { return lastStep_; }
   void ResetRunawayProbe() { runaway_ = RunawayProbe{}; }
   // The ceilings every dynamic body this class creates is born with, so a test
   // can assert against the engine's number rather than a copy of it.
   static float MaxBodySpeedVox();
   static float MaxBodySpinRad();
+  // ...and the collider rules CreateDebrisBodyXf builds under, for the
+  // `big-body-collider` gate: the most sub-shapes a debris body gets, and the
+  // thinnest extent (world voxels) at which a body steps discretely.
+  static int ColliderBoxBudget();
+  static float DiscreteMinExtentVox();
+  // True when Jolt shape-casts this body's steps (EMotionQuality::LinearCast).
+  bool UsesLinearCast(uint64_t handle) const;
 
  private:
   std::unique_ptr<JPH::TempAllocatorImpl> tempAlloc_;
@@ -610,6 +624,7 @@ class Physics {
   // that are driving them and puts them to sleep. See the note in physics.cpp.
   void SweepRunawayRigs();
   RunawayProbe runaway_{};
+  StepStats lastStep_{};
   // Jolt body INDEX -> consecutive-ish steps spent at the ceiling. Climbs by
   // one per hot step and falls by one per quiet one, so a body that is being
   // DRIVEN escalates while a body that was merely thrown hard decays back to

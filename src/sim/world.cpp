@@ -367,6 +367,8 @@ void World::Init(const rhi::Device& device) {
   // NOT lean on zero-initialized allocation the way farVox does.
   farPatch = CreateBuffer(device, (uint64_t)kFarPatchWords * 4,
                           U::Storage | U::CopyDst, "farPatch");
+  farSig = CreateBuffer(device, (uint64_t)kNumSlots * 4, U::Storage | U::CopyDst,
+                        "farSig");
 
   for (auto& s : slots_) {
     s.buf = CreateBuffer(device, kSlotBytes, U::MapRead | U::CopyDst, "readback");
@@ -838,6 +840,9 @@ void World::KickReadback() {
         std::memcpy(out.chunkHash.data(), p + kChunkHashOff, kChunkHashBytes);
         out.chunkHashTick = out.chunkHash[kChunkHashTickWord];
         std::memcpy(&out.pageFaults, p + kPageFaultOff, 4);
+        std::memcpy(&out.scoopEighths, p + kPageFaultOff + kPageFaultScoopEighths * 4, 4);
+        std::memcpy(&out.scoopApplied, p + kPageFaultOff + kPageFaultScoopApplied * 4, 4);
+        std::memcpy(&out.scoopRefused, p + kPageFaultOff + kPageFaultScoopRefused * 4, 4);
         std::memcpy(out.pick, b + kPickOff, 32);
         uint32_t pcounts[2];
         std::memcpy(pcounts, b + kPCountOff, 8);
