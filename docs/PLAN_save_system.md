@@ -198,7 +198,23 @@ consume it and must not change. Only `WriteRegion` / `EnsureLoaded` /
 
 ---
 
-## Wave 2 (not started until S1–S3 merge AND the board shows `src/game/mob.*` released)
+## Wave 1 result (landed main 44a095c, 2026-09-23)
+
+- S1: untouched-world save 32,768 chunks / 279 MB -> 1,485 chunks; SVM6
+  fingerprint = hash of generator INPUTS (~95 ms, tree atlases dominate).
+- S3: SVR3 zstd planes, 23x on modified chunks. With S1: untouched save
+  **0.45 MB**. `saveUntouchedMaxBytes` can drop from 20 MB to ~1 MB.
+- S2: `gen-settle` gate. 28% of real-page chunks modified after 300 idle
+  ticks, 12.6% per streamed plane. Causes: (1) one loose desert-sand cell
+  left on slopes above repose (worldgen's `looseCoverDepth` uses a smoothed
+  slope); (2) 13% neighbour-wake, words unchanged; (3) pond beds taking
+  stain. Follow-ups are S2b below.
+
+## Wave 2 (entity work; `src/game/mob.*` released 2026-09-22 862e978)
+
+Order: S4 and S5a in parallel; S5b after S4 lands; S2b after that.
+`src/phys/debris.*` is held by the rigid-body perf session — S4 buckets
+DBRS in the persist layer and does not edit debris.cpp internals.
 
 ## S4 — entities split by owner: region, world, player
 
@@ -214,11 +230,56 @@ Split `entities.sve` into:
 Old `entities.sve` still loads (read and distributed into the new layout).
 Persist time of day + weather (new section) since they are absent today.
 
-## S5 — NPCs outlive the window, and a whole body saves as its name
+Details:
+- Bucketing rule: an entity belongs to the region containing its position
+  at save time (mob origin, body centre of mass, item transform). A region
+  entity file is written whenever that region's bucket changed, loaded when
+  the region is first touched, and the file is the place S5b will put
+  dormant NPCs — design the API so S5b can append/remove single records
+  per region without rewriting unrelated regions.
+- Ids that cross buckets (mob `nextId_`, debris ids, joint/strap host
+  indices like DBRS v3's strap host index) must stay valid when the
+  entities they link land in different region files — find every
+  cross-reference in the DBRS/MOBS/ITMS payloads and make it survive
+  (global counter in world.sve; references by stable id, not by payload
+  position). If a link cannot be split, keep the linked group in ONE
+  bucket (the bucket of the group's first member) and say so.
+- Player files: `players/<id>.svp`. Single player uses id `local`. The M9
+  two-player path: each peer's player file is written by the machine that
+  owns that player; check `src/game/session.*` / `src/net/` for where a
+  remote player's kit lives and do not break `save-entities` or any net
+  gate.
+- Files: `src/sim/worldio.{h,cpp}`, `src/game/persist.{h,cpp}`,
+  `src/sim/chunkstore.{h,cpp}` (only for hooking region load/flush events;
+  S3's disk format is frozen), `src/main.cpp` (only the save/load call
+  sites), `src/test/selftest_worldio.cpp`, `tests/baseline.json`,
+  DESIGN.md. Time of day lives in `src/sim/celestial.*` — read-only access
+  via a new section; weather: find its owner.
+- Gate: save a world with entities spread over several regions and the
+  player; assert per-region files exist where entities are, `world.sve`
+  and `players/local.svp` exist, full round-trip (existing `save-entities`
+  assertions hold on the new layout), an old single-file `entities.sve`
+  loads, and time of day round-trips.
+
+## S5a — a whole body saves as its name
 
 - Mob limb delta: a limb that was never carved saves as a flag, not its
   voxel lists; only carved limbs store lattices (bump `MOBS` version, keep
-  the previous version loadable).
+  the previous version loadable). "Never carved" must be PROVEN, not
+  guessed: compare against the def's pristine lattice (or track a per-limb
+  dirty bit set by every carve/burn/rot/stain path — find them all; rot,
+  burning, blood coats and wound carving all edit limb voxels). A limb that
+  differs in any voxel, stain or skin cell stores its lattice. Equipment on
+  the body is out of scope (already rebuilt by name).
+- Gate: save a crowd of N pristine + a few damaged mobs; MOBS payload bytes
+  before/after (threshold in baseline.json); round-trip byte-identical
+  SaveOne->LoadOne->SaveOne for both kinds; an old-version payload loads.
+- Files: `src/game/mob.{h,cpp}` (SaveOne/LoadOne and the dirty tracking),
+  the mob save gate's selftest file, `tests/baseline.json`, DESIGN.md.
+  Does NOT touch persist.cpp/worldio (S4 owns those).
+
+## S5b — NPCs outlive the window
+
 - Dormant records: a mob leaving the window is serialized (`SaveOne`) into
   its region's entity bucket instead of despawned, and re-instantiated
   (`LoadOne`) when its chunk re-enters. Spawn caps count only live mobs.
@@ -226,3 +287,16 @@ Persist time of day + weather (new section) since they are absent today.
 - Design note (not implemented): authored NPCs need stable content ids
   (`npc:<name>`) distinct from runtime `nextId_`, so quest state can name
   them.
+
+## S2b — worldgen leaves terrain at rest
+
+- Fix cause (1) from wave 1: worldgen's loose-sand thinning must see the
+  column's REAL neighbour heights (or shed the surface cell wherever a
+  diagonal below is free), so no generated grain can slide on tick 1.
+  `worldgen.wgsl` change; moves the determinism hash (expected; rebaseline
+  once at the end with `--selftest --gate determinism --rebaseline`).
+- Tighten `genSettle.*` thresholds in baseline.json to the new measurement.
+- Stretch, only if cheap: cause (3), pond-bed resting stain baked at gen.
+- Cause (2) (modified bit from a per-chunk "a cell was written" flag
+  instead of the dirty flag) is a sim/stream change — write it up, do not
+  do it in this package.
