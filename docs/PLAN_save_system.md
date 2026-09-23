@@ -306,3 +306,8 @@ Details:
   streamed plane; untouched save 454,510 -> 94,582 B. Causes (2) and (3)
   written up in DESIGN.md section 3. `terrain` pass C1 needs `"sandstone"`
   added to its hand-written body list (C++; not done in this WGSL package).
+
+## Status (2026-09-23)
+
+ALL PACKAGES LANDED on main: S1+S2+S3 44a095c, S4+S5a 803d8cb, S2b 4c3af28, S5b f773ab6.
+Open follow-ups: neighbour-wake modified bit (cause 2), pond-bed stain at gen (cause 3, design call), DBRS per-body API + ground-item duplication bug (debris owner), parked NPCs do not tick, client-side unpark via host handoff, ground items do not park, stable authored NPC ids (npc:<name>), shipped-game policy for a changed worldgen fingerprint, pruning pristine chunks written by pre-S1 saves.
