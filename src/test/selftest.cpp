@@ -383,6 +383,9 @@ const char* const kOrder[] = {
     // regenerates the world on the way in so it inherits nothing either.
     "debris-ghost",
     "save-load",   "save-entities", "region-store",
+    // SVR3 codec (PLAN_save_system.md S3). Runs its own worldgen + 150 ticks
+    // and leaves that world behind; chunk-exchange next regenerates on entry.
+    "region-codec",
     // BETWEEN region-store and streaming, and the slot is chosen rather than
     // convenient. It regenerates the world several times (four arms, each
     // with its own worldgen and its own ReloadWindow) and it SHIFTS the
@@ -392,6 +395,12 @@ const char* const kOrder[] = {
     // leaves nothing at all. It also regenerates at the origin on the way
     // out, so `streaming` starts where it always did (M9.5-A).
     "chunk-exchange",
+    // `gen-settle` (PLAN_save_system S2): how many chunks come out MODIFIED
+    // with no player input, attributed. It regenerates on the way in (and
+    // three more times inside), shifts the window 48 chunks in +X, and
+    // regenerates at the origin on the way out -- so it inherits nothing and
+    // `streaming`, which regenerates on the way in anyway, is its neighbour.
+    "gen-settle",
     "streaming",     "spells",
     "page-roundtrip", "daylight-boundary",
     // Support-loss flagging from the MUTATION path. Cheap and
@@ -910,8 +919,19 @@ void WriteJson(const std::string& path, const std::vector<Result>& results) {
       << (r.status == Status::Pass ? "pass"
           : r.status == Status::Fail ? "fail" : "skip")
       << "\", \"seconds\": " << (int)(r.seconds * 100) / 100.0
-      << ", \"detail\": \"" << detail << "\"}"
-      << (i + 1 < results.size() ? "," : "") << "\n";
+      << ", \"detail\": \"" << detail << "\"";
+    // What the gate MEASURED (RecordObserved), always -- not only under
+    // --rebaseline, which is the one run that writes them into baseline.json.
+    // A gate that reports numbers (terrain, gen-settle) is otherwise only
+    // readable back out of its prose detail line.
+    if (!r.observed.empty()) {
+      f << ", \"observed\": {";
+      for (size_t k = 0; k < r.observed.size(); k++)
+        f << (k ? ", " : "") << "\"" << r.observed[k].first << "\": \""
+          << r.observed[k].second << "\"";
+      f << "}";
+    }
+    f << "}" << (i + 1 < results.size() ? "," : "") << "\n";
   }
   f << "  },\n";
   // ---- THE OP STREAM'S REFUSALS, ALWAYS (docs/PLAN_multiplayer_now.md N3) --

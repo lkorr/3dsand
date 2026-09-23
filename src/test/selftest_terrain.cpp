@@ -104,7 +104,10 @@
 #include <string>
 #include <vector>
 
+#include "sim/biomes.h"
+#include "sim/stream.h"
 #include "sim/tuning.h"
+#include "sim/worldedit.h"
 #include "sim/worldmap.h"
 #include "test/selftest.h"
 #include "test/support.h"
@@ -762,6 +765,58 @@ PassCOut PassC(GpuContext& ctx, World& world,
   return o;
 }
 
+// ---- WHICH FIELD OF A WORD MOVED -------------------------------------------
+//
+// Pass D's per-word diff, factored so `gen-settle` below attributes its
+// modified chunks with the SAME machinery rather than a second copy of it.
+// A pond soaking into its bed, a grain creeping down a slope and a stamp
+// churning all read as "N words changed"; they are three different bugs, and
+// the fix for one is not the fix for another — so a diff says WHICH FIELD
+// (material / state nibble / stain) and WHICH MATERIAL, not just how many.
+//
+// `mask` is applied to both words first: pass D compares whole words (a stamp
+// churn is still activity), gen-settle compares under kPersistMask (only what
+// a save would store is a reason to store it).
+struct WordDiff {
+  int moved = 0, matChanged = 0, stateChanged = 0, stainChanged = 0;
+  std::map<uint32_t, int> delta;    // material -> net count change
+  std::map<uint32_t, int> touched;  // material of a word that changed in place
+
+  bool Add(uint32_t before, uint32_t after, uint32_t mask = 0xFFFFFFFFu) {
+    before &= mask;
+    after &= mask;
+    if (before == after) return false;
+    const uint32_t a = before & 0xFFFu, b = after & 0xFFFu;
+    moved++;
+    if (a != b) matChanged++;
+    if (((before >> 12) & 0xF) != ((after >> 12) & 0xF)) stateChanged++;
+    if ((before & 0x7F000000u) != (after & 0x7F000000u)) stainChanged++;
+    if (a == b) touched[a]++;
+    delta[a]--;
+    delta[b]++;
+    return true;
+  }
+
+  // " sand~3 water-12 air+12": in-place changes first, then net counts.
+  std::string What(const std::vector<MaterialDef>& mats) const {
+    std::string what;
+    for (auto& kv : touched) {
+      const char* nm = kv.first < mats.size() ? mats[kv.first].name.c_str()
+                                              : "?";
+      what += Format(" %s~%d", nm, kv.second);
+    }
+    for (auto& kv : delta) {
+      if (kv.second == 0) continue;
+      what += Format(" %s%+d",
+                     kv.first == 0 ? "air"
+                     : kv.first < mats.size() ? mats[kv.first].name.c_str()
+                                              : "?",
+                     kv.second);
+    }
+    return what;
+  }
+};
+
 // ---------------------------------------------------------------------------
 Status GateTerrain(Ctx& c, std::string& detail) {
   GpuContext& ctx = c.ctx;
@@ -972,47 +1027,20 @@ Status GateTerrain(Ctx& c, std::string& detail) {
                    t == 141, false);
       ctx.WaitIdle();
       ctx.ProcessEvents();
-      std::map<uint32_t, int> delta;   // material -> |net change| over the set
-      int moved = 0, matChanged = 0, stateChanged = 0, stainChanged = 0;
-      std::map<uint32_t, int> touched;   // material of a word that changed in place
+      WordDiff wd;
       for (auto& kv : before) {
         std::vector<uint32_t> now(kChunkVol, 0);
         ReadVoxelsSync(ctx, world, kv.first, 1, now.data(), "terrainMove1");
-        for (size_t v = 0; v < kChunkVol; v++) {
-          // THE WHOLE WORD, not just the material. A pond soaking into its own
-          // sand bed changes the stain nibble and the liquid's fullness and
-          // nothing else, so a material-only diff reports "nothing changed"
-          // for a chunk that is very much still working — which is exactly the
-          // wrong answer when the question is "why is this awake".
-          if (kv.second[v] == now[v]) continue;
-          const uint32_t a = kv.second[v] & 0xFFFu, b = now[v] & 0xFFFu;
-          moved++;
-          // WHICH FIELD moved, not just how many words did. A pond soaking into
-          // its bed, a grain creeping down a slope and a stamp churning all read
-          // as "N words changed"; they are three different bugs and the fix for
-          // one is not the fix for another.
-          if (a != b) matChanged++;
-          if (((kv.second[v] >> 12) & 0xF) != ((now[v] >> 12) & 0xF)) stateChanged++;
-          if ((kv.second[v] & 0x7F000000u) != (now[v] & 0x7F000000u)) stainChanged++;
-          if (a == b) { delta[a] += 0; touched[a]++; }
-          delta[a]--;
-          delta[b]++;
-        }
+        // THE WHOLE WORD, not just the material. A pond soaking into its own
+        // sand bed changes the stain nibble and the liquid's fullness and
+        // nothing else, so a material-only diff reports "nothing changed" for
+        // a chunk that is very much still working — which is exactly the
+        // wrong answer when the question is "why is this awake".
+        for (size_t v = 0; v < kChunkVol; v++) wd.Add(kv.second[v], now[v]);
       }
-      std::string what;
-      for (auto& kv : touched) {
-        const char* nm = kv.first < c.mats.size() ? c.mats[kv.first].name.c_str()
-                                                  : "?";
-        what += Format(" %s~%d", nm, kv.second);
-      }
-      for (auto& kv : delta) {
-        if (kv.second == 0) continue;
-        what += Format(" %s%+d",
-                       kv.first == 0 ? "air"
-                       : kv.first < c.mats.size() ? c.mats[kv.first].name.c_str()
-                                                  : "?",
-                       kv.second);
-      }
+      const int moved = wd.moved, matChanged = wd.matChanged,
+                stateChanged = wd.stateChanged, stainChanged = wd.stainChanged;
+      const std::string what = wd.What(c.mats);
       // ---- WHERE THE LOST VOXELS GO ----
       // A page fault is a sim kernel writing into a chunk that is still a
       // SENTINEL, and write reach is one cell — so the faulting chunk is always
@@ -1107,11 +1135,538 @@ Status GateTerrain(Ctx& c, std::string& detail) {
   return ok ? Status::Pass : Status::Fail;
 }
 
+// ===========================================================================
+// gen-settle — TERRAIN DOES NOT CHANGE JUST BECAUSE SOMEONE LOOKED AT IT
+// (docs/PLAN_save_system.md S2)
+//
+// The save is a delta from the seed: Stream::EvictSlots skips every chunk
+// whose sticky `modified_` bit is clear, because genChunk reproduces it. So
+// every chunk that comes out modified WITHOUT player input is save bytes that
+// scale with the area EXPLORED rather than with what the player did. The
+// number was an anecdote ("9% of the real pages on a leaving plane under
+// --autofly-surface"); this gate makes it an attributed, gated number.
+//
+// TWO ARMS, both with no brush, spell, explosion or cell op:
+//
+//   SETTLE   fresh worldgen, N ticks standing still, then every slot with
+//            `modified_` set is read back, the window is REGENERATED at the
+//            same origin, and the pristine words are diffed against it.
+//   TRAVEL   fresh worldgen, then the interest point moves +X one chunk every
+//            T ticks for D window shifts. Every leaving plane is recorded
+//            with the modified set EvictSlots is about to use (the sticky
+//            flags OR the snapshot this Update folds), the store is read back
+//            afterwards, and every stored chunk is diffed against a regenerated
+//            window that contains it. Planes whose chunks came from the
+//            initial worldgen and planes whose chunks were STREAMED IN are
+//            reported apart: only the second is the steady state of flight.
+//
+// ATTRIBUTION (CLAUDE.md rule 6 — a count is not a measurement). Every
+// modified chunk gets exactly one verdict:
+//   changed:<cause>   its persisted words (kPersistMask) differ from genChunk's,
+//                     named by the writer class that changed the most cells:
+//                     powder-move, liquid-flow, liquid-level, powder/liquid
+//                     swap, plant, reaction, gas, solid, jitter, stain.
+//   stale-snapshot    no persisted change, and its FIRST modified flag came
+//                     from a snapshot older than the refill that installed the
+//                     chunk — i.e. the dirty flag belonged to the slot's
+//                     PREVIOUS occupant (traversal only).
+//   neighbour-wake    no persisted change, face-adjacent to a changed chunk.
+//   woke-no-change    no persisted change and nothing changed next to it:
+//                     the chunk was scheduled to act and did nothing net.
+// ...plus depth below the mirror's ground and the top material transitions,
+// which name the worldgen rule.
+//
+// Thresholds live in tests/baseline.json (genSettle.*), measured, so the
+// number cannot get WORSE silently.
+namespace gensettle {
+
+enum Cause : int {
+  kPowder, kLiquidFlow, kLiquidLevel, kSwap, kPlant, kReaction, kGas, kSolid,
+  kJitter, kStain, kNumCauses
+};
+const char* const kCauseName[kNumCauses] = {
+    "powder-move", "liquid-flow", "liquid-level", "powder/liquid-swap",
+    "plant",       "reaction",    "gas",          "solid",
+    "jitter",      "stain"};
+
+bool IsPlant(uint32_t m, const std::vector<MaterialDef>& mats) {
+  if (m == 0 || m >= mats.size()) return false;
+  if (mats[m].gpu.flags & kMatFlagMicro) return true;
+  for (const auto& t : mats[m].tags)
+    if (t == "foliage") return true;
+  return false;
+}
+
+// a, b already masked with kPersistMask and a != b.
+int Classify(uint32_t a, uint32_t b, const std::vector<MaterialDef>& mats) {
+  const uint32_t ma = a & 0xFFFu, mb = b & 0xFFFu;
+  auto klass = [&](uint32_t m) {
+    return m < mats.size() ? mats[m].gpu.klass : (uint32_t)CLASS_SOLID;
+  };
+  if (ma != mb) {
+    if (IsPlant(ma, mats) || IsPlant(mb, mats)) return kPlant;
+    if (ma == 0 || mb == 0) {
+      switch (klass(ma ? ma : mb)) {
+        case CLASS_POWDER: return kPowder;
+        case CLASS_LIQUID: return kLiquidFlow;
+        case CLASS_GAS: return kGas;
+        default: return kSolid;
+      }
+    }
+    const uint32_t ka = klass(ma), kb = klass(mb);
+    if ((ka == CLASS_POWDER && kb == CLASS_LIQUID) ||
+        (ka == CLASS_LIQUID && kb == CLASS_POWDER))
+      return kSwap;
+    if (ka == CLASS_POWDER && kb == CLASS_POWDER) return kPowder;
+    if (ka == CLASS_LIQUID && kb == CLASS_LIQUID) return kLiquidFlow;
+    return kReaction;
+  }
+  if (((a >> 12) & 0xFu) != ((b >> 12) & 0xFu))
+    return klass(ma) == CLASS_LIQUID ? kLiquidLevel : kJitter;
+  return kStain;
+}
+
+// One modified chunk, as read: its current and pristine words.
+struct Sample {
+  IVec3 wc;
+  std::vector<uint32_t> now, gen;
+  bool stale = false;  // first modified flag came from the previous occupant
+  bool page = true;    // held a real page (not a sentinel) when read
+};
+
+enum Verdict : int { kChanged, kStale, kNeighbour, kIdle, kNumVerdicts };
+
+// WHERE A DEPARTED GRAIN STOOD. "sand moved" names the material and not the
+// rule; the column it left names the rule. For every powder-move cell that
+// became AIR (a grain that left), record the column's biome, the ground's
+// TRUE local slope there (central difference of World::TerrainHeight, which
+// includes the detail octaves worldgen's analytic `Col.slope` does not see),
+// in the same Q8 units looseCoverDepth tapers on (256 = 1 voxel per column =
+// the CA's angle of repose), and the cell's height against that ground.
+struct GrainProbe {
+  uint32_t seed = 0;
+  int sedSlope = 96;                     // the taper's start (map terrain)
+  std::vector<std::string> biomeName;    // by engine id
+  std::map<uint64_t, int> hCache;
+  int H(int x, int z) {
+    const uint64_t k = ((uint64_t)(uint32_t)x << 32) | (uint32_t)z;
+    auto it = hCache.find(k);
+    if (it != hCache.end()) return it->second;
+    const int h = World::TerrainHeight(x, z, seed);
+    hCache[k] = h;
+    return h;
+  }
+};
+
+struct Tally {
+  int chunks = 0, pages = 0;
+  int verdict[kNumVerdicts] = {};
+  int primary[kNumCauses] = {};   // changed chunks by dominant cause
+  long cells[kNumCauses] = {};    // changed cells by cause
+  int depth[4] = {};              // changed chunks: aloft/surface/-1/buried
+  std::map<std::pair<uint32_t, uint32_t>, long> pairs;  // a->b material
+  WordDiff wd;
+  // Departed grains (GrainProbe): biome, ground slope bucket (< sedSlope,
+  // sedSlope..repose, repose..2x, steeper), height vs ground (below the
+  // surface cell, the surface cell or one above it, higher).
+  std::map<std::string, long> grainBiome;
+  long grainSlope[4] = {}, grainDy[3] = {}, grains = 0;
+
+  void Attribute(std::vector<Sample>& ss, const std::vector<MaterialDef>& mats,
+                 GrainProbe& gp) {
+    const uint32_t seed = gp.seed;
+    std::vector<int> prim(ss.size(), -1);
+    std::map<uint64_t, bool> changedAt;
+    for (size_t i = 0; i < ss.size(); i++) {
+      Sample& s = ss[i];
+      chunks++;
+      pages += s.page ? 1 : 0;
+      int local[kNumCauses] = {};
+      bool any = false;
+      for (size_t v = 0; v < kChunkVol; v++) {
+        const uint32_t a = s.gen[v] & kPersistMask, b = s.now[v] & kPersistMask;
+        if (!wd.Add(a, b)) continue;
+        any = true;
+        const int k = Classify(a, b, mats);
+        local[k]++;
+        cells[k]++;
+        if (k == kPowder && (b & 0xFFFu) == 0) {
+          const int x = s.wc.x * (int)kChunk + (int)(v % kChunk);
+          const int y = s.wc.y * (int)kChunk + (int)((v / kChunk) % kChunk);
+          const int z = s.wc.z * (int)kChunk + (int)(v / (kChunk * kChunk));
+          const int h = gp.H(x, z);
+          const int gx = std::abs(gp.H(x + 1, z) - gp.H(x - 1, z));
+          const int gz = std::abs(gp.H(x, z + 1) - gp.H(x, z - 1));
+          const int q8 = std::max(gx, gz) * 128;  // central diff /2, in Q8
+          grainSlope[q8 < gp.sedSlope ? 0 : q8 < 256 ? 1 : q8 < 512 ? 2 : 3]++;
+          const int dy = y - h;
+          grainDy[dy < -1 ? 0 : dy <= 1 ? 1 : 2]++;
+          const uint32_t bi = World::MapBiomeAt(x, z, seed);
+          grainBiome[bi < gp.biomeName.size() && !gp.biomeName[bi].empty()
+                         ? gp.biomeName[bi]
+                         : Format("biome%u", bi)]++;
+          grains++;
+        }
+        if ((a & 0xFFFu) != (b & 0xFFFu)) pairs[{a & 0xFFFu, b & 0xFFFu}]++;
+      }
+      if (!any) continue;
+      int best = 0;
+      for (int k = 1; k < kNumCauses; k++)
+        if (local[k] > local[best]) best = k;
+      prim[i] = best;
+      changedAt[World::PackChunkKey(s.wc)] = true;
+      primary[best]++;
+      const int gh = World::TerrainHeight(s.wc.x * (int)kChunk + 8,
+                                          s.wc.z * (int)kChunk + 8, seed);
+      const int d = (gh >> 4) - s.wc.y;
+      depth[d < 0 ? 0 : d == 0 ? 1 : d == 1 ? 2 : 3]++;
+    }
+    static const IVec3 dirs[6] = {{1, 0, 0},  {-1, 0, 0}, {0, 1, 0},
+                                  {0, -1, 0}, {0, 0, 1},  {0, 0, -1}};
+    for (size_t i = 0; i < ss.size(); i++) {
+      if (prim[i] >= 0) { verdict[kChanged]++; continue; }
+      if (ss[i].stale) { verdict[kStale]++; continue; }
+      bool nb = false;
+      for (const IVec3& d : dirs) {
+        const IVec3 n{ss[i].wc.x + d.x, ss[i].wc.y + d.y, ss[i].wc.z + d.z};
+        if (changedAt.count(World::PackChunkKey(n))) { nb = true; break; }
+      }
+      verdict[nb ? kNeighbour : kIdle]++;
+    }
+  }
+
+  // Ranked, one line: verdicts, then changed chunks by cause, then cells by
+  // cause, then depth, then the top transitions by material name.
+  std::string Line(const std::vector<MaterialDef>& mats) const {
+    static const char* const vn[kNumVerdicts] = {
+        "changed", "stale-snapshot", "neighbour-wake", "woke-no-change"};
+    std::string o = Format("%d modified (%d real pages):", chunks, pages);
+    std::vector<std::pair<int, int>> r;
+    for (int v = 0; v < kNumVerdicts; v++) r.push_back({verdict[v], v});
+    std::sort(r.rbegin(), r.rend());
+    for (auto& p : r)
+      if (p.first) o += Format(" %s %d", vn[p.second], p.first);
+    std::vector<std::pair<long, int>> pc, cc;
+    for (int k = 0; k < kNumCauses; k++) {
+      if (primary[k]) pc.push_back({primary[k], k});
+      if (cells[k]) cc.push_back({cells[k], k});
+    }
+    std::sort(pc.rbegin(), pc.rend());
+    std::sort(cc.rbegin(), cc.rend());
+    o += " | changed chunks by cause:";
+    if (pc.empty()) o += " none";
+    for (auto& p : pc) o += Format(" %s %ld", kCauseName[p.second], p.first);
+    o += " | cells by cause:";
+    if (cc.empty()) o += " none";
+    for (auto& p : cc) o += Format(" %s %ld", kCauseName[p.second], p.first);
+    o += Format(" | changed depth: %d aloft, %d surface, %d one under, %d "
+                "buried",
+                depth[0], depth[1], depth[2], depth[3]);
+    std::vector<std::pair<long, std::pair<uint32_t, uint32_t>>> tp;
+    for (auto& kv : pairs) tp.push_back({kv.second, kv.first});
+    std::sort(tp.rbegin(), tp.rend());
+    auto nm = [&](uint32_t m) -> std::string {
+      return m == 0 ? "air" : m < mats.size() ? mats[m].name : "?";
+    };
+    o += " | top transitions:";
+    if (tp.empty()) o += " none";
+    for (size_t i = 0; i < tp.size() && i < 6; i++)
+      o += Format(" %s->%s x%ld", nm(tp[i].second.first).c_str(),
+                  nm(tp[i].second.second).c_str(), tp[i].first);
+    if (grains) {
+      std::vector<std::pair<long, std::string>> gb;
+      for (auto& kv : grainBiome) gb.push_back({kv.second, kv.first});
+      std::sort(gb.rbegin(), gb.rend());
+      o += Format(" | %ld departed grains by biome:", grains);
+      for (auto& p : gb) o += Format(" %s %ld", p.second.c_str(), p.first);
+      o += Format(" ; ground slope: flat %ld, taper %ld, 1-2x repose %ld, "
+                  ">2x repose %ld ; vs ground: below %ld, at %ld, above %ld",
+                  grainSlope[0], grainSlope[1], grainSlope[2], grainSlope[3],
+                  grainDy[0], grainDy[1], grainDy[2]);
+    }
+    return o;
+  }
+};
+
+bool IsPage(World& world, uint32_t s) {
+  return world.PageOffsetOfSlot(s) != World::kNoPage;
+}
+
+}  // namespace gensettle
+
+Status GateGenSettle(Ctx& c, std::string& detail) {
+  using namespace gensettle;
+  GpuContext& ctx = c.ctx;
+  World& world = c.world;
+  Simulation& sim = c.sim;
+  Stream& stream = c.stream;
+  const uint32_t seed = kDefaultSeed;
+  const int half = (int)kNChunk / 2;
+  const uint32_t settleTicks =
+      (uint32_t)BaselineNumber("genSettle.settleTicks", 300);
+  const uint32_t travelShifts =
+      (uint32_t)BaselineNumber("genSettle.travelShifts", 48);
+  const uint32_t ticksPerChunk =
+      (uint32_t)BaselineNumber("genSettle.travelTicksPerChunk", 8);
+  GrainProbe gp;
+  gp.seed = seed;
+  gp.sedSlope = worldmap::CurrentWorldMap().terrain.sedSlope;
+  {
+    biomes::BiomeSet set;
+    std::string blog;
+    if (biomes::LoadBiomeSet(AssetDir(), c.mats, set, blog))
+      for (const auto& b : set.biomes)
+        if (b.index >= 0) {
+          if ((size_t)b.index >= gp.biomeName.size())
+            gp.biomeName.resize(b.index + 1);
+          gp.biomeName[b.index] = b.name;
+        }
+  }
+  if (!WorldEditLayer().Empty())
+    std::printf("gen-settle: NOTE the authored edit layer is loaded (%zu "
+                "chunks) — its chunks are modified by design and count here\n",
+                WorldEditLayer().ChunkCount());
+
+  auto regen = [&](IVec3 origin) {
+    stream.OnRegen();
+    world.SetWindowOrigin(origin);
+    SubmitWorldgen(ctx, world, sim, seed);
+    ctx.WaitIdle();
+    ctx.ProcessEvents();
+  };
+  auto readSlot = [&](uint32_t s, std::vector<uint32_t>& out, const char* l) {
+    out.assign(kChunkVol, 0);
+    ReadVoxelsSync(ctx, world, s, 1, out.data(), l);
+  };
+
+  // ---- SETTLE ARM ---------------------------------------------------------
+  regen({0, 0, 0});
+  const IVec3 centre{half, half, half};
+  for (uint32_t t = 1; t <= settleTicks; t++) {
+    stream.Update(centre, t);
+    SubmitTick(ctx, world, sim, t, seed, {}, {}, {}, false, centre, false,
+               false);
+  }
+  ctx.WaitIdle();
+  ctx.ProcessEvents();
+  stream.Update(centre, settleTicks);  // fold the last published snapshot
+  Tally settle;
+  int settlePages = 0;
+  {
+    std::vector<Sample> ss;
+    std::vector<uint32_t> slots;
+    const std::vector<uint8_t>& mod = stream.ModifiedFlags();
+    for (uint32_t s = 0; s < kNumSlots; s++) {
+      if (IsPage(world, s)) settlePages++;
+      if (!mod[s]) continue;
+      slots.push_back(s);
+      Sample x;
+      x.wc = world.SlotToWorldChunk(s);
+      x.page = IsPage(world, s);
+      readSlot(s, x.now, "genSettleNow");
+      ss.push_back(std::move(x));
+    }
+    regen({0, 0, 0});
+    for (size_t i = 0; i < ss.size(); i++)
+      readSlot(slots[i], ss[i].gen, "genSettleGen");
+    settle.Attribute(ss, c.mats, gp);
+  }
+  std::printf("gen-settle: SETTLE %u ticks, no input, %d real pages resident "
+              "| %s\n",
+              settleTicks, settlePages, settle.Line(c.mats).c_str());
+
+  // ---- TRAVEL ARM ---------------------------------------------------------
+  regen({0, 0, 0});
+  struct Plane {
+    bool streamed = false;
+    int pages = 0, modified = 0, modPages = 0;
+  };
+  std::vector<Plane> planes;
+  struct Ev {
+    IVec3 wc;
+    bool page, stale, streamed;
+  };
+  std::vector<Ev> evicted;                          // modified evictions only
+  std::vector<uint32_t> fillTick(kNumSlots, 0);     // 0 = initial worldgen
+  std::vector<uint8_t> stale(kNumSlots, 0);
+  std::vector<uint8_t> streamedSlot(kNumSlots, 0);  // slot holds a streamed chunk
+  std::vector<uint8_t> prevMod(kNumSlots, 0);
+  uint32_t t = 0, staleFlags = 0;
+  IVec3 pc = centre;
+  auto step = [&]() {
+    const IVec3 o0 = world.WindowOrigin();
+    const uint32_t sh0 = stream.ShiftCount();
+    // What EvictSlots will see this Update: the sticky set OR the snapshot
+    // the top of Update folds. A slot newly set by that fold whose snapshot
+    // is not newer than the slot's refill is carrying its PREVIOUS
+    // occupant's dirty flag (the latent-snapshot inheritance).
+    const WorldSnapshot& sn = world.Snap();
+    std::vector<uint8_t> willMod = stream.ModifiedFlags();
+    if (sn.valid)
+      for (uint32_t s = 0; s < kNumSlots; s++) {
+        if (!sn.dirtyFlags[s]) continue;
+        if (!willMod[s] && !prevMod[s] && sn.tick <= fillTick[s] &&
+            fillTick[s] != 0) {
+          stale[s] = 1;
+          staleFlags++;
+        }
+        willMod[s] = 1;
+      }
+    // The plane leaving on a +X shift is x == o0.x; capture its residency now,
+    // before the refill replaces the page table entries.
+    std::vector<uint8_t> planePage(kNChunk * kNChunk, 0);
+    for (int u = 0; u < (int)kNChunk; u++)
+      for (int v = 0; v < (int)kNChunk; v++)
+        planePage[u * kNChunk + v] = IsPage(
+            world, World::SlotChunkIndex({o0.x, o0.y + u, o0.z + v})) ? 1 : 0;
+    stream.Update(pc, t);
+    if (stream.ShiftCount() != sh0) {
+      const IVec3 o1 = world.WindowOrigin();
+      if (o1.x != o0.x + 1 || o1.y != o0.y || o1.z != o0.z)
+        std::printf("gen-settle: WARNING unexpected shift (%d,%d,%d)->(%d,%d,%d)\n",
+                    o0.x, o0.y, o0.z, o1.x, o1.y, o1.z);
+      Plane p;
+      for (int u = 0; u < (int)kNChunk; u++)
+        for (int v = 0; v < (int)kNChunk; v++) {
+          const IVec3 wc{o0.x, o0.y + u, o0.z + v};
+          const uint32_t s = World::SlotChunkIndex(wc);
+          const bool page = planePage[u * kNChunk + v] != 0;
+          p.streamed = streamedSlot[s] != 0;
+          p.pages += page;
+          if (willMod[s]) {
+            p.modified++;
+            p.modPages += page;
+            evicted.push_back({wc, page, stale[s] != 0, streamedSlot[s] != 0});
+          }
+          // The slot now holds the entering chunk (x = o0.x + kNChunk).
+          fillTick[s] = t;
+          stale[s] = 0;
+          streamedSlot[s] = 1;
+        }
+      planes.push_back(p);
+    }
+    prevMod = stream.ModifiedFlags();
+    SubmitTick(ctx, world, sim, ++t, seed, {}, {}, {}, false, pc, false,
+               false);
+  };
+  for (uint32_t i = 0; stream.ShiftCount() < travelShifts &&
+                       i < (travelShifts + 8) * ticksPerChunk;
+       i++) {
+    pc = {centre.x + (int)(i / ticksPerChunk), centre.y, centre.z};
+    step();
+  }
+  // Drain: the real-page evictions are async readbacks harvested by Update.
+  for (int k = 0; k < 32 && stream.PendingEvictions() > 0; k++) {
+    ctx.WaitIdle();
+    ctx.ProcessEvents();
+    step();
+  }
+  ctx.WaitIdle();
+  ctx.ProcessEvents();
+  const size_t pendingLeft = stream.PendingEvictions();
+  std::map<uint64_t, std::vector<uint32_t>> stored;
+  stream.Store().ForEachStored(
+      [&](IVec3 wc, const uint32_t* rle, size_t pairs) {
+        stored[World::PackChunkKey(wc)].assign(rle, rle + pairs * 2);
+      });
+  // THE MODEL CHECK. The attribution is only as good as the claim that the
+  // set recorded above IS the set EvictSlots stored; if they disagree, say so
+  // and fail rather than attribute the wrong chunks.
+  int notStored = 0;
+  for (const Ev& e : evicted)
+    if (!stored.count(World::PackChunkKey(e.wc))) notStored++;
+  const int storeExtra = (int)stored.size() - ((int)evicted.size() - notStored);
+
+  Tally travInit, travStream;
+  {
+    std::vector<Sample> ssI, ssS;
+    std::vector<uint8_t> done(evicted.size(), 0);
+    size_t left = evicted.size();
+    while (left) {
+      int ox = 1 << 30;
+      for (size_t i = 0; i < evicted.size(); i++)
+        if (!done[i]) ox = std::min(ox, evicted[i].wc.x);
+      regen({ox, 0, 0});
+      for (size_t i = 0; i < evicted.size(); i++) {
+        if (done[i] || evicted[i].wc.x >= ox + (int)kNChunk) continue;
+        done[i] = 1;
+        left--;
+        const Ev& e = evicted[i];
+        auto it = stored.find(World::PackChunkKey(e.wc));
+        if (it == stored.end()) continue;
+        Sample x;
+        x.wc = e.wc;
+        x.page = e.page;
+        x.stale = e.stale;
+        x.now.assign(kChunkVol, 0);
+        RleDecodeChunk(it->second.data(), it->second.size() / 2, x.now.data());
+        readSlot(World::SlotChunkIndex(e.wc), x.gen, "genSettleTravelGen");
+        (e.streamed ? ssS : ssI).push_back(std::move(x));
+      }
+    }
+    travInit.Attribute(ssI, c.mats, gp);
+    travStream.Attribute(ssS, c.mats, gp);
+  }
+  int nInit = 0, nStream = 0, pagesStream = 0, pagesInit = 0;
+  for (const Plane& p : planes) {
+    (p.streamed ? nStream : nInit)++;
+    (p.streamed ? pagesStream : pagesInit) += p.pages;
+  }
+  const double perPlane = nStream ? (double)travStream.chunks / nStream : 0.0;
+  const double changedPerPlane =
+      nStream ? (double)travStream.verdict[kChanged] / nStream : 0.0;
+  const double pctOfPages =
+      pagesStream ? 100.0 * travStream.pages / pagesStream : 0.0;
+  std::printf("gen-settle: TRAVEL %zu shifts +X, 1 chunk / %u ticks, %u ticks; "
+              "%u stale-snapshot flags raised; store %zu chunks (%d recorded "
+              "not stored, %d stored not recorded, %zu evictions pending)\n",
+              planes.size(), ticksPerChunk, t, staleFlags, stored.size(),
+              notStored, storeExtra, pendingLeft);
+  std::printf("gen-settle:   initial-worldgen planes %d (%d real pages) | %s\n",
+              nInit, pagesInit, travInit.Line(c.mats).c_str());
+  std::printf("gen-settle:   STREAMED planes %d (%d real pages): %.1f modified "
+              "/ plane = %.1f%% of real pages, %.1f changed / plane | %s\n",
+              nStream, pagesStream, perPlane, pctOfPages, changedPerPlane,
+              travStream.Line(c.mats).c_str());
+
+  // Leave pristine worldgen at the origin, as the gates around this one expect.
+  regen({0, 0, 0});
+
+  const double sModCap = BaselineNumber("genSettle.settleModifiedMax", 1e9);
+  const double sChgCap = BaselineNumber("genSettle.settleChangedMax", 1e9);
+  const double tModCap = BaselineNumber("genSettle.travelModifiedPerPlaneMax", 1e9);
+  const double tChgCap = BaselineNumber("genSettle.travelChangedPerPlaneMax", 1e9);
+  const bool modelOk = notStored == 0 && storeExtra == 0 && pendingLeft == 0;
+  const bool enough = nStream > 0;
+  const bool ok = modelOk && enough && settle.chunks <= sModCap &&
+                  settle.verdict[kChanged] <= sChgCap && perPlane <= tModCap &&
+                  changedPerPlane <= tChgCap;
+  RecordObserved("genSettle.settleModifiedObserved", (double)settle.chunks);
+  RecordObserved("genSettle.settleChangedObserved",
+                 (double)settle.verdict[kChanged]);
+  RecordObserved("genSettle.travelModifiedPerPlaneObserved", perPlane);
+  RecordObserved("genSettle.travelChangedPerPlaneObserved", changedPerPlane);
+  RecordObserved("genSettle.travelPctOfRealPagesObserved", pctOfPages);
+
+  detail = Format(
+      "settle %u ticks: %s || travel streamed planes %d: %.1f modified/plane "
+      "(%.1f%% of real pages, cap %.1f), %.1f changed/plane (cap %.1f): %s || "
+      "initial planes %d: %s || caps settle modified %.0f changed %.0f%s%s",
+      settleTicks, settle.Line(c.mats).c_str(), nStream, perPlane, pctOfPages,
+      tModCap, changedPerPlane, tChgCap, travStream.Line(c.mats).c_str(), nInit,
+      travInit.Line(c.mats).c_str(), sModCap, sChgCap,
+      modelOk ? "" : " | MODEL CHECK FAILED (recorded != stored)",
+      enough ? "" : " | NO STREAMED PLANE WAS EVICTED (travel too short)");
+  std::printf("gen-settle: %s\n", ok ? "PASS" : "FAIL");
+  return ok ? Status::Pass : Status::Fail;
+}
+
 }  // namespace
 
 const std::vector<Gate>& TerrainGates() {
   static const std::vector<Gate> g = {
       {"terrain", "sim", {}, false, GateTerrain},
+      {"gen-settle", "worldio", {}, false, GateGenSettle},
   };
   return g;
 }

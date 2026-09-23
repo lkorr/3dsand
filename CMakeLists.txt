@@ -386,6 +386,38 @@ if(NOT miniaudio_POPULATED)
 endif()
 
 # ---------------------------------------------------------------------------
+# zstd (region-file compression, SVR3 — src/sim/chunkstore.cpp,
+# docs/PLAN_save_system.md S3)
+#
+# Populate-only, like miniaudio: zstd's own build/cmake project declares the
+# programs, tests, a shared lib and install rules, and configuring it costs
+# more than compiling the library. The library is lib/{common,compress,
+# decompress}/*.c and nothing else, so it is built here as one static target.
+# ZSTD_DISABLE_ASM: the x64 Huffman decoder is a GNU-as .S file MSVC cannot
+# assemble; the C fallback is what an MSVC build of upstream uses too.
+# ZSTD_MULTITHREAD is left undefined — one chunk (16 KiB) per call has nothing
+# to parallelise. Pinned to a release tag.
+# ---------------------------------------------------------------------------
+FetchContent_Declare(
+  zstd
+  GIT_REPOSITORY https://github.com/facebook/zstd.git
+  GIT_TAG        v1.5.7
+  GIT_SHALLOW    TRUE
+)
+sv_reuse_shared_source(zstd)
+FetchContent_GetProperties(zstd)
+if(NOT zstd_POPULATED)
+  FetchContent_Populate(zstd)
+endif()
+file(GLOB SV_ZSTD_SOURCES CONFIGURE_DEPENDS
+  ${zstd_SOURCE_DIR}/lib/common/*.c
+  ${zstd_SOURCE_DIR}/lib/compress/*.c
+  ${zstd_SOURCE_DIR}/lib/decompress/*.c)
+add_library(zstd_lib STATIC ${SV_ZSTD_SOURCES})
+target_include_directories(zstd_lib PUBLIC ${zstd_SOURCE_DIR}/lib)
+target_compile_definitions(zstd_lib PRIVATE ZSTD_DISABLE_ASM XXH_NAMESPACE=ZSTD_)
+
+# ---------------------------------------------------------------------------
 # sandvox
 #
 # Two targets, one program. `sandvox_core` is an OBJECT library holding every
@@ -649,6 +681,9 @@ set(SANDVOX_LINK_LIBS
   # include directories (spirv-tools/optimizer.hpp) and pulls in SPIRV-Tools
   # core for the validator that guards the optimizer's output.
   SPIRV-Tools-opt
+  # SVR3 region files (src/sim/chunkstore.cpp). Declared above, next to
+  # miniaudio.
+  zstd_lib
 )
 target_link_libraries(sandvox_core PRIVATE ${SANDVOX_LINK_LIBS})
 # `sandvox_compile` = "compile everything sandvox links, link nothing". An

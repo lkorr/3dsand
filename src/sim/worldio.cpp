@@ -1,7 +1,15 @@
 #include "sim/worldio.h"
 
 #include <algorithm>
+#include <chrono>
 #include <cstdio>
+#include <cstring>
+
+#include "gpu/resources.h"   // AssembleShaderSource: the fingerprint's WGSL
+#include "sim/biomes.h"      // EnvironmentStamp: map / biomes / trees
+#include "sim/tuning.h"      // CurrentTuning().world.editLayer
+#include "sim/tuningstamp.h" // HashOneFile, the same FNV the stamps use
+#include "test/support.h"    // AssetDir(): the one asset-path chokepoint
 
 namespace {
 // 'SVM5': appended the sim TICK and the SEED (M9.5-B; worldio.h says why the
@@ -14,7 +22,11 @@ namespace {
 // at the same offset with the same meaning, and reading one costs nothing but
 // leaving `tick`/`seed` unknown. The loader therefore accepts both magics and
 // records which it saw.
-constexpr uint32_t kMetaMagic = 0x354D5653;    // 'SVM5'
+//
+// 'SVM6' (PLAN_save_system.md S1) appends the worldgen fingerprint after the
+// pair, by the same argument: an SVM5 file is an SVM6 file that stops early.
+constexpr uint32_t kMetaMagic = 0x364D5653;    // 'SVM6'
+constexpr uint32_t kMetaMagicV5 = 0x354D5653;  // 'SVM5' - still loads
 constexpr uint32_t kMetaMagicV4 = 0x344D5653;  // 'SVM4' - still loads
 constexpr uint32_t kEntMagic = 0x31455653;   // 'SVE1'
 
@@ -108,6 +120,53 @@ void LoadEntities(const std::string& dir, const EntityIO& entities) {
 
 // ---- meta.svm ---------------------------------------------------------------
 
+// ---- the worldgen fingerprint (worldio.h) -----------------------------------
+
+// Strip WGSL comments (line, and NESTED block comments -- WGSL allows them)
+// and collapse every whitespace run to one space, so the hash sees code and
+// not prose. String literals do not exist in WGSL, so no quoting to respect.
+std::string NormalizeWgsl(const std::string& src) {
+  std::string out;
+  out.reserve(src.size() / 2);
+  bool pendingSpace = false;
+  const size_t n = src.size();
+  for (size_t i = 0; i < n;) {
+    const char c = src[i];
+    if (c == '/' && i + 1 < n && src[i + 1] == '/') {
+      while (i < n && src[i] != '\n') i++;
+      pendingSpace = true;
+      continue;
+    }
+    if (c == '/' && i + 1 < n && src[i + 1] == '*') {
+      int depth = 1;
+      i += 2;
+      while (i < n && depth > 0) {
+        if (src[i] == '/' && i + 1 < n && src[i + 1] == '*') { depth++; i += 2; }
+        else if (src[i] == '*' && i + 1 < n && src[i + 1] == '/') { depth--; i += 2; }
+        else i++;
+      }
+      pendingSpace = true;
+      continue;
+    }
+    if (c == ' ' || c == '\t' || c == '\n' || c == '\r') {
+      pendingSpace = true;
+      i++;
+      continue;
+    }
+    if (pendingSpace && !out.empty()) out.push_back(' ');
+    pendingSpace = false;
+    out.push_back(c);
+    i++;
+  }
+  return out;
+}
+
+uint32_t Fnv32(const void* p, size_t n, uint32_t h = 2166136261u) {
+  const unsigned char* b = static_cast<const unsigned char*>(p);
+  for (size_t i = 0; i < n; i++) { h ^= b[i]; h *= 16777619u; }
+  return h;
+}
+
 uint32_t VoxelMetersBits() {
   uint32_t bits = 0;
   static_assert(sizeof(bits) == sizeof(kVoxelMeters), "float32 expected");
@@ -117,9 +176,67 @@ uint32_t VoxelMetersBits() {
 
 }  // namespace
 
+const char* WorldgenFingerprintPartName(uint32_t i) {
+  static const char* kNames[WorldgenFingerprint::kParts] = {
+      "wgsl", "map", "biomes", "trees", "editLayer", "materials"};
+  return i < WorldgenFingerprint::kParts ? kNames[i] : "?";
+}
+
+WorldgenFingerprint ComputeWorldgenFingerprint(const std::string& assetDir,
+                                               const std::vector<MaterialDef>& mats) {
+  const auto t0 = std::chrono::steady_clock::now();
+  WorldgenFingerprint fp;
+  // [0] the generator's code, exactly as the GPU would be handed it. A read
+  // failure hashes as 0 rather than failing the save: the fingerprint is a
+  // diagnostic about the generator, and a missing worldgen.wgsl has already
+  // stopped this process from generating anything.
+  std::string wgsl;
+  if (AssembleShaderSource(assetDir + "/shaders", "worldgen.wgsl", wgsl)) {
+    const std::string norm = NormalizeWgsl(wgsl);
+    fp.parts[0] = Fnv32(norm.data(), norm.size());
+  }
+  // [1..3] the authored environment, with the stamp the tuner already mirrors.
+  const std::string mapName = CurrentTuning().world.mapLayer;
+  const biomes::EnvironmentStamp env = biomes::StampEnvironment(assetDir, mapName);
+  fp.parts[1] = env.map;
+  fp.parts[2] = env.biomes;
+  fp.parts[3] = env.trees;
+  // [4] the edit layer genChunk's output is always patched with (worldedit.h).
+  const std::string& edit = CurrentTuning().world.editLayer;
+  if (!edit.empty())
+    fp.parts[4] = sandvox::HashOneFile(assetDir + "/worldedits/" + edit + ".svedit",
+                                       edit + ".svedit");
+  // [5] the material NAME table, in id order, NUL-separated.
+  {
+    uint32_t h = 2166136261u;
+    const unsigned char zero = 0;
+    for (const MaterialDef& m : mats) {
+      h = Fnv32(m.name.data(), m.name.size(), h);
+      h = Fnv32(&zero, 1, h);
+    }
+    fp.parts[5] = h;
+  }
+  // The value: FNV-1a 64 over the recipe version and the parts.
+  uint64_t h = 1469598103934665603ull;
+  auto mix = [&h](uint32_t v) {
+    for (int b = 0; b < 4; b++) {
+      h ^= (v >> (8 * b)) & 0xFFu;
+      h *= 1099511628211ull;
+    }
+  };
+  mix(WorldgenFingerprint::kRecipe);
+  for (uint32_t i = 0; i < WorldgenFingerprint::kParts; i++) mix(fp.parts[i]);
+  fp.value = h;
+  fp.ms = std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - t0)
+              .count();
+  return fp;
+}
+
 bool SaveWorld(GpuContext& ctx, World& world, Stream& stream,
                const std::string& path, const std::vector<MaterialDef>& mats,
-               const EntityIO* entities, WorldStamp stamp) {
+               const EntityIO* entities, WorldStamp stamp, SaveReport* report) {
+  SaveReport localReport;
+  SaveReport& rep = report ? *report : localReport;
   ChunkStore& store = stream.Store();
   if (store.Bound() && store.Dir() != path) {
     std::fprintf(stderr, "save: store is bound to %s (one world dir per session)\n",
@@ -129,7 +246,8 @@ bool SaveWorld(GpuContext& ctx, World& world, Stream& stream,
 
   // ---- KEEP THE TICK TAGS ACROSS THE FLUSH (M9.5-B) ---------------------
   //
-  // `FlushResident` Puts every resident chunk UNTAGGED — it calls
+  // `FlushResident` Puts every chunk it stores UNTAGGED (every modified
+  // resident chunk; all of them on the full-flush fallback) — it calls
   // `ChunkStore::Put(wc, rle)` with no tick, because M9.5-A deliberately left
   // every existing caller's signature alone and `Stream` has no clock to pass
   // — and an untagged Put ERASES an existing tag (chunkstore.h: "unknown" is
@@ -162,9 +280,19 @@ bool SaveWorld(GpuContext& ctx, World& world, Stream& stream,
                                   }),
                    tagsBefore.end());
 
-  // resident window -> store (unfiltered: air chunks too, so a re-fill needs
-  // no snapshot trust; drains in-flight async evictions)
-  stream.FlushResident();
+  // resident window -> store: the DELTA when Stream can prove its modified
+  // set complete, the old everything-flush (with the reason) when it cannot.
+  // Drains in-flight async evictions either way. See Stream::FlushResident.
+  rep.flush = stream.FlushResident(rep.forceFullFlush);
+  if (rep.flush.delta)
+    std::printf("save: delta flush -- %u of %u resident chunks stored (%u of them "
+                "only via the %u-tick unpublished snapshot tail), %u pristine left "
+                "to genChunk/the store\n",
+                rep.flush.stored, kNumChunks, rep.flush.tailOnly, rep.flush.tailTicks,
+                rep.flush.skipped);
+  else
+    std::printf("save: FULL flush of all %u resident chunks -- %s\n", kNumChunks,
+                rep.flush.why.c_str());
 
   size_t retagged = 0;
   for (const auto& [wc, tickTag] : tagsBefore) {
@@ -184,6 +312,9 @@ bool SaveWorld(GpuContext& ctx, World& world, Stream& stream,
   size_t regions = 0;
   uint64_t bytes = 0;
   if (!store.Flush(&regions, &bytes)) return false;
+  rep.regions = regions;
+  rep.bytes = bytes;
+  rep.fingerprint = ComputeWorldgenFingerprint(sandvox::AssetDir(), mats);
 
   // Entities BEFORE meta, for the same reason meta comes last at all: meta's
   // presence marks a completed save, so everything it vouches for must already
@@ -236,6 +367,14 @@ bool SaveWorld(GpuContext& ctx, World& world, Stream& stream,
     // does NOT hold, which on any real world is most of them.
     w.U32(stamp.tick);
     w.U32(stamp.seed);
+    // ---- SVM6's appended fingerprint (PLAN_save_system.md S1) -----------
+    // After the pair for the pair's reason: an SVM5 reader stops before it.
+    // The parts ride along so a mismatch at load names the input that moved.
+    w.U32((uint32_t)(rep.fingerprint.value & 0xFFFFFFFFull));
+    w.U32((uint32_t)(rep.fingerprint.value >> 32));
+    w.U32(WorldgenFingerprint::kParts);
+    for (uint32_t i = 0; i < WorldgenFingerprint::kParts; i++)
+      w.U32(rep.fingerprint.parts[i]);
     bool ok = std::fwrite(meta.data(), 1, meta.size(), fp) == meta.size();
     std::fclose(fp);
     if (!ok) return false;
@@ -254,8 +393,10 @@ bool SaveWorld(GpuContext& ctx, World& world, Stream& stream,
     std::printf("save: store manifest %zu chunks, %zu tick-tagged\n",
                 rows.size(), tagged);
   }
-  std::printf("saved %s (%.2f MB across %zu regions, tick %u seed %u)\n",
-              path.c_str(), bytes / 1e6, regions, stamp.tick, stamp.seed);
+  std::printf("saved %s (%.2f MB across %zu regions, tick %u seed %u, "
+              "worldgen %016llx in %.1f ms)\n",
+              path.c_str(), bytes / 1e6, regions, stamp.tick, stamp.seed,
+              (unsigned long long)rep.fingerprint.value, rep.fingerprint.ms);
   return true;
 }
 
@@ -283,12 +424,14 @@ bool LoadWorld(GpuContext& ctx, World& world, Simulation& sim, Stream& stream,
   // beats guessing at a header we cannot verify (the old format recorded
   // neither voxel size nor materials, exactly the two silent-corruption axes
   // this header exists to close).
-  const bool haveStamp = (magic == kMetaMagic);
-  if (!r.ok || (magic != kMetaMagic && magic != kMetaMagicV4)) {
+  const bool haveStamp = (magic == kMetaMagic || magic == kMetaMagicV5);
+  const bool haveFingerprint = (magic == kMetaMagic);
+  if (!r.ok ||
+      (magic != kMetaMagic && magic != kMetaMagicV5 && magic != kMetaMagicV4)) {
     std::fprintf(stderr,
                  "load: %s is not a compatible world dir (bad or pre-SVM4 "
-                 "meta.svm magic %08x, want %08x or %08x)\n",
-                 path.c_str(), magic, kMetaMagic, kMetaMagicV4);
+                 "meta.svm magic %08x, want %08x, %08x or %08x)\n",
+                 path.c_str(), magic, kMetaMagic, kMetaMagicV5, kMetaMagicV4);
     return false;
   }
   if (worldN != kWorldN || chunk != kChunk) {
@@ -368,6 +511,57 @@ bool LoadWorld(GpuContext& ctx, World& world, Simulation& sim, Stream& stream,
                    "truncated; treating them as unknown\n",
                    path.c_str());
     }
+  }
+
+  // ---- SVM6's worldgen fingerprint (PLAN_save_system.md S1) --------------
+  //
+  // LOAD, LOUDLY, on a mismatch -- never refuse (worldio.h says why). The
+  // mismatch is computed here, before the window refills, because the refill
+  // is exactly where a different generator shows: every chunk the store does
+  // not hold comes from genChunk as it is NOW.
+  if (haveFingerprint) {
+    uint32_t lo = 0, hi = 0, nParts = 0;
+    if (r.U32(lo) && r.U32(hi)) {
+      stamp.worldgenFingerprint = ((uint64_t)hi << 32) | lo;
+      stamp.fingerprintKnown = true;
+      std::vector<uint32_t> fileParts;
+      if (r.U32(nParts) && nParts <= 64) {
+        fileParts.resize(nParts);
+        for (uint32_t i = 0; i < nParts && r.ok; i++) r.U32(fileParts[i]);
+        if (!r.ok) fileParts.clear();
+      }
+      const WorldgenFingerprint now = ComputeWorldgenFingerprint(sandvox::AssetDir(), mats);
+      stamp.worldgenMismatch = now.value != stamp.worldgenFingerprint;
+      if (stamp.worldgenMismatch) {
+        std::string which;
+        for (uint32_t i = 0; i < WorldgenFingerprint::kParts; i++) {
+          if (i < fileParts.size() && fileParts[i] == now.parts[i]) continue;
+          if (!which.empty()) which += ", ";
+          which += WorldgenFingerprintPartName(i);
+          if (i >= fileParts.size()) which += " (not in file)";
+        }
+        std::fprintf(stderr,
+                     "load: *** WORLDGEN MISMATCH *** %s was saved by generator "
+                     "%016llx, this build is %016llx (differs: %s). Loading "
+                     "anyway: every chunk the save does not store regenerates "
+                     "from the CURRENT generator and may seam against stored "
+                     "ones.\n",
+                     path.c_str(), (unsigned long long)stamp.worldgenFingerprint,
+                     (unsigned long long)now.value, which.empty() ? "?" : which.c_str());
+      } else {
+        std::printf("load: worldgen fingerprint %016llx matches (%.1f ms)\n",
+                    (unsigned long long)now.value, now.ms);
+      }
+    } else {
+      std::fprintf(stderr,
+                   "load: %s meta.svm claims SVM6 but its worldgen fingerprint is "
+                   "truncated; treating it as unknown\n",
+                   path.c_str());
+    }
+  } else {
+    std::printf("load: %s predates SVM6 -- worldgen fingerprint UNKNOWN, pristine "
+                "chunks regenerate from this build's generator unchecked\n",
+                path.c_str());
   }
   if (stampOut) *stampOut = stamp;
 

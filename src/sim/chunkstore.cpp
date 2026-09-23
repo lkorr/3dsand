@@ -1,7 +1,12 @@
 #include "sim/chunkstore.h"
 
 #include <cstdio>
+#include <cstring>
 #include <filesystem>
+
+#include <zstd.h>
+
+#include "sim/stream.h"  // kPersistMask, RleEncodeChunk
 
 namespace fs = std::filesystem;
 
@@ -9,8 +14,41 @@ namespace {
 // 'SVR2' — bumped from 'SVR1' when the persisted voxel word widened from
 // 16 to 32 bits to carry the stain layer (see RleEncodeChunk). An old
 // 'SVR1' file is REJECTED rather than misread: its 16-bit payload would
-// decode as garbage runs at the wrong stride.
-constexpr uint32_t kRegionMagic = 0x32525653;  // 'SVR2'
+// decode as garbage runs at the wrong stride. SVR2 is still READ (never
+// written): a pre-S3 save loads unchanged, and each region is rewritten as
+// SVR3 the next time it goes dirty.
+//
+//   SVR2: u32 magic, u32 count; per chunk: i32 wc[3], u32 pairs,
+//         u32 rle[pairs*2]
+constexpr uint32_t kRegionMagicV2 = 0x32525653;  // 'SVR2'
+// 'SVR3' (docs/PLAN_save_system.md S3): per-chunk records, each independently
+// decodable, so a chunk is still one record away.
+//
+//   SVR3: u32 magic, u32 count, u32 seed; per chunk: i32 wc[3],
+//         u32 len | codec << 28, u8 payload[len]
+//
+// `seed` is the one the planes' jitter residue was computed with (see
+// ChunkStore::EncodeRecord). Codec values are ChunkStore::Codec; an unknown
+// one stops the read at that entry — refuse rather than guess.
+constexpr uint32_t kRegionMagicV3 = 0x33525653;  // 'SVR3'
+constexpr uint32_t kRecLenMask = 0x0FFFFFFFu;
+constexpr uint32_t kRecCodecShift = 28;
+constexpr size_t kPlaneBytes = (size_t)kChunkVol * 4;  // four byte planes
+
+// One zstd context pair per thread, reused across chunks: creating a CCtx is
+// a large allocation that would dominate a 16 KiB compress.
+struct ZstdCtx {
+  ZSTD_CCtx* c = ZSTD_createCCtx();
+  ZSTD_DCtx* d = ZSTD_createDCtx();
+  ~ZstdCtx() {
+    ZSTD_freeCCtx(c);
+    ZSTD_freeDCtx(d);
+  }
+};
+ZstdCtx& Zstd() {
+  thread_local ZstdCtx z;
+  return z;
+}
 
 // region files and the save meta are the only files this code ever deletes
 bool IsOurFile(const fs::path& p) {
@@ -36,41 +74,178 @@ ChunkStore::Region& ChunkStore::Touch(IVec3 rc) {
   return r;
 }
 
+// The state-nibble predictor is the palette variant worldgen gives a non-air
+// cell: world.h's JitterStateFor, through its row form JitterRowSeed /
+// JitterStateInRow — the pair RleEncodeSentinelChunk uses and page-roundtrip
+// checks against the definition. Not a copy of the rule. Planes are in the
+// chunk's linear cell order (x fastest, then y, then z), RleEncodeChunk's.
+ChunkStore::Codec ChunkStore::EncodeRecord(const uint32_t* rle, size_t pairs,
+                                           IVec3 wc, uint32_t seed,
+                                           std::vector<uint8_t>& out,
+                                           int level) {
+  const auto raw = [&]() {
+    out.resize(pairs * 8);
+    if (pairs) std::memcpy(out.data(), rle, pairs * 8);
+    return Codec::RawRle;
+  };
+  // A single run is 8 bytes raw; no zstd frame beats that.
+  if (pairs <= 1) return raw();
+  thread_local std::vector<uint32_t> words(kChunkVol);
+  thread_local std::vector<uint8_t> planes(kPlaneBytes);
+  uint32_t i = 0;
+  for (size_t p = 0; p < pairs; p++) {
+    const uint32_t run = rle[p * 2], w = rle[p * 2 + 1];
+    // Anything the planes cannot carry is stored verbatim, never altered:
+    // a malformed run structure, or bits outside kPersistMask.
+    if (run == 0 || run > kChunkVol - i || (w & ~kPersistMask) != 0u)
+      return raw();
+    std::fill_n(words.data() + i, run, w);
+    i += run;
+  }
+  if (i != kChunkVol) return raw();
+
+  uint8_t* matLo = planes.data();
+  uint8_t* matHi = matLo + kChunkVol;
+  uint8_t* state = matHi + kChunkVol;
+  uint8_t* stain = state + kChunkVol;
+  const int bx = wc.x * (int)kChunk, by = wc.y * (int)kChunk,
+            bz = wc.z * (int)kChunk;
+  uint32_t k = 0;
+  for (int lz = 0; lz < (int)kChunk; lz++)
+    for (int ly = 0; ly < (int)kChunk; ly++) {
+      const uint32_t rowSeed = JitterRowSeed(by + ly, bz + lz, seed);
+      for (int lx = 0; lx < (int)kChunk; lx++, k++) {
+        const uint32_t w = words[k];
+        const uint32_t mat = w & 0xFFFu;
+        const uint32_t pred =
+            mat == kMatAir ? 0u : JitterStateInRow(rowSeed, bx + lx, seed);
+        matLo[k] = (uint8_t)(mat & 0xFFu);
+        matHi[k] = (uint8_t)(mat >> 8);
+        state[k] = (uint8_t)(((w >> 12) & 0xFu) ^ pred);
+        stain[k] = (uint8_t)(w >> 24);
+      }
+    }
+  const size_t bound = ZSTD_compressBound(kPlaneBytes);
+  out.resize(bound);
+  const size_t n = ZSTD_compressCCtx(Zstd().c, out.data(), bound,
+                                     planes.data(), kPlaneBytes, level);
+  if (ZSTD_isError(n) || n >= pairs * 8) return raw();
+  out.resize(n);
+  return Codec::ZstdPlanes;
+}
+
+bool ChunkStore::DecodeRecord(Codec codec, const uint8_t* data, size_t len,
+                              IVec3 wc, uint32_t seed,
+                              std::vector<uint32_t>& rle) {
+  if (codec == Codec::RawRle) {
+    // The SVR2 entry rule, unchanged: 1..kChunkVol pairs. The run structure
+    // itself is validated where it is consumed (RleDecodeChunk), as before.
+    if (len == 0 || len % 8 != 0 || len / 8 > kChunkVol) return false;
+    rle.resize(len / 4);
+    std::memcpy(rle.data(), data, len);
+    return true;
+  }
+  if (codec != Codec::ZstdPlanes) return false;
+  thread_local std::vector<uint32_t> words(kChunkVol);
+  thread_local std::vector<uint8_t> planes(kPlaneBytes);
+  const size_t n =
+      ZSTD_decompressDCtx(Zstd().d, planes.data(), kPlaneBytes, data, len);
+  if (ZSTD_isError(n) || n != kPlaneBytes) return false;
+  const uint8_t* matLo = planes.data();
+  const uint8_t* matHi = matLo + kChunkVol;
+  const uint8_t* state = matHi + kChunkVol;
+  const uint8_t* stain = state + kChunkVol;
+  const int bx = wc.x * (int)kChunk, by = wc.y * (int)kChunk,
+            bz = wc.z * (int)kChunk;
+  uint32_t k = 0;
+  for (int lz = 0; lz < (int)kChunk; lz++)
+    for (int ly = 0; ly < (int)kChunk; ly++) {
+      const uint32_t rowSeed = JitterRowSeed(by + ly, bz + lz, seed);
+      for (int lx = 0; lx < (int)kChunk; lx++, k++) {
+        if (matHi[k] > 0xFu || state[k] > 0xFu) return false;
+        const uint32_t mat = (uint32_t)matLo[k] | ((uint32_t)matHi[k] << 8);
+        const uint32_t pred =
+            mat == kMatAir ? 0u : JitterStateInRow(rowSeed, bx + lx, seed);
+        words[k] = mat | (((uint32_t)state[k] ^ pred) << 12) |
+                   ((uint32_t)stain[k] << 24);
+      }
+    }
+  RleEncodeChunk(words.data(), rle);
+  return true;
+}
+
+bool ChunkStore::ReadRegionFile(
+    const std::string& path,
+    const std::function<void(IVec3 wc, std::vector<uint32_t>& rle)>& fn) {
+  FILE* fp = std::fopen(path.c_str(), "rb");
+  if (!fp) return true;  // absent: nothing stored there
+  // Whole file in one read: regions are small once compressed, and parsing a
+  // buffer makes every bounds check an explicit size compare.
+  std::vector<uint8_t> buf;
+  std::fseek(fp, 0, SEEK_END);
+  const long size = std::ftell(fp);
+  std::fseek(fp, 0, SEEK_SET);
+  if (size > 0) {
+    buf.resize((size_t)size);
+    if (std::fread(buf.data(), 1, buf.size(), fp) != buf.size()) buf.clear();
+  }
+  std::fclose(fp);
+  size_t off = 0;
+  const auto u32 = [&](uint32_t& v) {
+    if (buf.size() - off < 4) return false;
+    std::memcpy(&v, buf.data() + off, 4);
+    off += 4;
+    return true;
+  };
+  uint32_t magic = 0, count = 0, seed = 0;
+  if (!u32(magic) || !u32(count) ||
+      (magic != kRegionMagicV2 && magic != kRegionMagicV3) ||
+      (magic == kRegionMagicV3 && !u32(seed)))
+    return false;
+  for (uint32_t c = 0; c < count; c++) {
+    uint32_t w[3] = {}, len = 0;
+    bool ok = u32(w[0]) && u32(w[1]) && u32(w[2]) && u32(len);
+    const IVec3 wc{(int32_t)w[0], (int32_t)w[1], (int32_t)w[2]};
+    std::vector<uint32_t> rle;
+    if (ok && magic == kRegionMagicV2) {
+      // SVR2: `len` is the pair count
+      ok = len != 0 && len <= kChunkVol && buf.size() - off >= (size_t)len * 8;
+      if (ok) {
+        rle.resize((size_t)len * 2);
+        std::memcpy(rle.data(), buf.data() + off, (size_t)len * 8);
+        off += (size_t)len * 8;
+      }
+    } else if (ok) {
+      const uint32_t bytes = len & kRecLenMask;
+      ok = buf.size() - off >= bytes &&
+           DecodeRecord((Codec)(len >> kRecCodecShift), buf.data() + off,
+                        bytes, wc, seed, rle);
+      off += bytes;
+    }
+    if (!ok) {
+      std::fprintf(stderr, "chunkstore: %s truncated or corrupt at entry %u\n",
+                   path.c_str(), c);
+      break;
+    }
+    fn(wc, rle);
+  }
+  return true;
+}
+
 void ChunkStore::EnsureLoaded(IVec3 rc, Region& r) {
   if (r.loaded) return;
   r.loaded = true;  // even on miss/corrupt: don't retry the disk every Get
   if (dir_.empty()) return;
-  FILE* fp = std::fopen(RegionPath(rc).c_str(), "rb");
-  if (!fp) return;
-  uint32_t hdr[2] = {};
-  if (std::fread(hdr, 4, 2, fp) != 2 || hdr[0] != kRegionMagic) {
+  const bool isRegion = ReadRegionFile(
+      RegionPath(rc), [&](IVec3 wc, std::vector<uint32_t>& rle) {
+        const uint64_t key = World::PackChunkKey(wc);
+        if (r.chunks.count(key)) return;  // RAM copy is newer
+        r.chunks[key] = {wc, std::move(rle)};
+        chunkCount_++;
+      });
+  if (!isRegion)
     std::fprintf(stderr, "chunkstore: %s is not a region file\n",
                  RegionPath(rc).c_str());
-    std::fclose(fp);
-    return;
-  }
-  std::vector<uint32_t> rle;
-  for (uint32_t c = 0; c < hdr[1]; c++) {
-    int32_t wc[3];
-    uint32_t pairs = 0;
-    if (std::fread(wc, 4, 3, fp) != 3 || std::fread(&pairs, 4, 1, fp) != 1 ||
-        pairs == 0 || pairs > kChunkVol) {
-      std::fprintf(stderr, "chunkstore: %s truncated at entry %u\n",
-                   RegionPath(rc).c_str(), c);
-      break;
-    }
-    rle.resize((size_t)pairs * 2);
-    if (std::fread(rle.data(), 4, rle.size(), fp) != rle.size()) {
-      std::fprintf(stderr, "chunkstore: %s truncated at entry %u\n",
-                   RegionPath(rc).c_str(), c);
-      break;
-    }
-    uint64_t key = World::PackChunkKey({wc[0], wc[1], wc[2]});
-    if (r.chunks.count(key)) continue;  // RAM copy is newer
-    r.chunks[key] = {{wc[0], wc[1], wc[2]}, rle};
-    chunkCount_++;
-  }
-  std::fclose(fp);
 }
 
 bool ChunkStore::WriteRegion(IVec3 rc, Region& r, uint64_t* bytesOut) {
@@ -89,16 +264,23 @@ bool ChunkStore::WriteRegion(IVec3 rc, Region& r, uint64_t* bytesOut) {
     std::fprintf(stderr, "chunkstore: cannot write %s\n", tmp.c_str());
     return false;
   }
-  uint32_t hdr[2] = {kRegionMagic, (uint32_t)r.chunks.size()};
-  uint64_t bytes = 8;
-  bool ok = std::fwrite(hdr, 4, 2, fp) == 2;
+  // SVR3, always (SVR2 is read-only). The seed in the header is the one the
+  // records are encoded against, so decode never depends on SetSeed.
+  uint32_t hdr[3] = {kRegionMagicV3, (uint32_t)r.chunks.size(), seed_};
+  uint64_t bytes = sizeof(hdr);
+  bool ok = std::fwrite(hdr, 4, 3, fp) == 3;
+  std::vector<uint8_t> rec;
   for (const auto& [key, e] : r.chunks) {
     int32_t wc[3] = {e.wc.x, e.wc.y, e.wc.z};
-    uint32_t pairs = (uint32_t)(e.rle.size() / 2);
+    const Codec codec =
+        EncodeRecord(e.rle.data(), e.rle.size() / 2, e.wc, seed_, rec);
+    const uint32_t lenCodec =
+        (uint32_t)rec.size() | ((uint32_t)codec << kRecCodecShift);
     ok = ok && std::fwrite(wc, 4, 3, fp) == 3 &&
-         std::fwrite(&pairs, 4, 1, fp) == 1 &&
-         std::fwrite(e.rle.data(), 4, e.rle.size(), fp) == e.rle.size();
-    bytes += 16 + e.rle.size() * 4;
+         std::fwrite(&lenCodec, 4, 1, fp) == 1 &&
+         (rec.empty() ||
+          std::fwrite(rec.data(), 1, rec.size(), fp) == rec.size());
+    bytes += 16 + rec.size();
   }
   std::fclose(fp);
   if (ok) {
@@ -259,30 +441,16 @@ void ChunkStore::ForEachStored(const Visitor& fn) {
   if (dir_.empty()) return;
 
   std::error_code ec;
-  std::vector<uint32_t> rle;
   for (const auto& de : fs::directory_iterator(dir_, ec)) {
     if (!IsOurFile(de.path())) continue;
     if (de.path().extension() != ".svr") continue;  // meta.svm is not a region
-    FILE* fp = std::fopen(de.path().string().c_str(), "rb");
-    if (!fp) continue;
-    uint32_t hdr[2] = {};
-    if (std::fread(hdr, 4, 2, fp) != 2 || hdr[0] != kRegionMagic) {
-      std::fclose(fp);
-      continue;
-    }
-    for (uint32_t c = 0; c < hdr[1]; c++) {
-      int32_t wc[3];
-      uint32_t pairs = 0;
-      if (std::fread(wc, 4, 3, fp) != 3 || std::fread(&pairs, 4, 1, fp) != 1 ||
-          pairs == 0 || pairs > kChunkVol)
-        break;
-      rle.resize((size_t)pairs * 2);
-      if (std::fread(rle.data(), 4, rle.size(), fp) != rle.size()) break;
-      const uint64_t key = World::PackChunkKey({wc[0], wc[1], wc[2]});
-      if (seen.count(key)) continue;
-      fn({wc[0], wc[1], wc[2]}, rle.data(), pairs);
-    }
-    std::fclose(fp);
+    // Same reader as EnsureLoaded (SVR2 and SVR3), its own buffer: nothing
+    // here enters regions_.
+    ReadRegionFile(de.path().string(),
+                   [&](IVec3 wc, std::vector<uint32_t>& rle) {
+                     if (seen.count(World::PackChunkKey(wc))) return;
+                     fn(wc, rle.data(), rle.size() / 2);
+                   });
   }
 }
 
