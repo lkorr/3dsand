@@ -10845,6 +10845,18 @@ int main(int argc, char** argv) {
                                 vesselSlot},
                     ti, tick, opBatch);
 
+      // ---- S5b: NPCs OUTLIVE THE WINDOW (game/persist.h MobParking) --------
+      // A creature leaving the window is parked in its region bucket by
+      // mobs.PreTick; here, after the tick, the ones the window has reached
+      // again come back, at most MobParking::kUnparkPerCall per tick and only
+      // onto ground the fetch cache has answered for. Parking is on for single
+      // player and the host (whose store is the world's), off for a client.
+      {
+        static MobParking mobParking;
+        mobParking.Bind(mobs, stream.Store(), netRoleBoot != NetRole::Client);
+        mobParking.Unpark(mobs, stream.Store(), world, tick);
+      }
+
       // ---- M9.3-B: THE SMOKE'S AUTHOR ------------------------------------
       //
       // SANDVOX_NET_SMOKE_PAINT only (see the switch's note). One small brush

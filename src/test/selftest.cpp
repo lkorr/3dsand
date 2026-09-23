@@ -459,6 +459,12 @@ const char* const kOrder[] = {
     // that gate's exit contract: it resets mobs and debris and puts the id
     // counter back. It ticks nothing and needs no terrain.
     "mob-save-delta",
+    // S5b (PLAN_save_system). After `mob-save-delta` for the same exit
+    // contract (mobs and debris reset, id counter restored) plus its own: it
+    // teleports the window (ReloadWindow) away and back, saves and loads a
+    // world dir, and so REGENERATES worldgen at the home window on the way
+    // out, removes its park function and clears the store.
+    "mob-park",
     // Armour reactivity, right after `mob-burn` and for the same reasons: it
     // lights real fires and pours real acid at absolute coordinates, and it
     // regenerates the world on the way out so the gates after it still find

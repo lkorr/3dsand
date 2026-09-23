@@ -1,6 +1,7 @@
 #include "game/persist.h"
 
 #include <algorithm>
+#include <cmath>
 #include <cstdio>
 #include <cstring>
 #include <string>
@@ -773,4 +774,164 @@ bool ResumeWorldClock(uint32_t savedSimTick, uint32_t simTickNow) {
   c.prevTicks = c.ticks;
   c.rem = 0;
   return true;
+}
+
+// ---- MobParking (persist.h, PLAN_save_system.md S5b) -------------------------
+
+void MobParking::Bind(MobSystem& mobs, ChunkStore& store, bool enabled) {
+  if (boundMobs_ == &mobs && boundStore_ == &store && enabled_ == enabled &&
+      mobs.HasParkFn() == enabled)
+    return;
+  boundMobs_ = &mobs;
+  boundStore_ = &store;
+  enabled_ = enabled;
+  if (!enabled) {
+    mobs.SetParkFn(nullptr);
+    return;
+  }
+  ChunkStore* st = &store;
+  Stats* stats = &stats_;
+  mobs.SetParkFn([st, stats](const Mob& m, std::vector<uint8_t>& record) {
+    // THE SAME RECORD A SAVE WRITES: section, version, origin, SaveOne bytes
+    // (persist.cpp's 'MOBS' saveRecords builds exactly this).
+    ChunkStore::EntityRecord r;
+    r.section = FourCC('M', 'O', 'B', 'S');
+    r.version = MobSystem::kSaveVersion;
+    r.pos = m.Origin();
+    r.bytes = std::move(record);
+    st->DormantEntities(ChunkStore::RegionOfVoxel(r.pos)).push_back(std::move(r));
+    stats->parked++;
+    return true;
+  });
+  // Something new may be parked right at a face the window is about to cross.
+  pending_ = true;
+}
+
+void MobParking::ResetWaits() {
+  waits_.clear();
+  haveOrigin_ = false;
+  pending_ = true;
+}
+
+bool MobParking::GroundKnown(World& world, IVec3 wc, uint32_t tick) {
+  const uint64_t key = World::PackChunkKey(wc);
+  auto it = waits_.find(key);
+  if (it == waits_.end()) {
+    // First sight: whatever the cache holds may predate this residency.
+    waits_[key] = Wait{wc, tick};
+    world.RequestChunkFetch(wc, World::FetchSource::Mob);
+    return false;
+  }
+  const CachedChunk* cc = world.Cached(wc);
+  if (cc != nullptr && cc->voxels.size() == kChunkVol && cc->version >= it->second.since)
+    return true;
+  world.RequestChunkFetch(wc, World::FetchSource::Mob);  // coalesced if queued
+  return false;
+}
+
+uint32_t MobParking::Unpark(MobSystem& mobs, ChunkStore& store, World& world,
+                            uint32_t tick, uint32_t budget) {
+  stats_.lastCall = 0;
+  if (!enabled_) return 0;
+  const IVec3 wo = world.WindowOrigin();
+  const bool moved = !haveOrigin_ || wo.x != lastOrigin_.x ||
+                     wo.y != lastOrigin_.y || wo.z != lastOrigin_.z;
+  if (!moved && !pending_) return 0;
+  const int n = (int)(kWorldN / kChunk);
+  if (moved) {
+    // A chunk that left the window forgets its wait: its cached copy is stale
+    // the moment it re-enters, and asking again is what proves freshness.
+    for (auto it = waits_.begin(); it != waits_.end();) {
+      const IVec3& c = it->second.wc;
+      const bool in = c.x >= wo.x && c.x < wo.x + n && c.y >= wo.y &&
+                      c.y < wo.y + n && c.z >= wo.z && c.z < wo.z + n;
+      it = in ? std::next(it) : waits_.erase(it);
+    }
+  }
+  haveOrigin_ = true;
+  lastOrigin_ = wo;
+  pending_ = false;
+
+  const int m = kUnparkMarginChunks;
+  auto chunkOf = [](float v) { return (int)std::floor((double)v / (double)kChunk); };
+  auto inside = [&](const Vec3& p) {
+    const int cx = chunkOf(p.x), cy = chunkOf(p.y), cz = chunkOf(p.z);
+    return cx >= wo.x + m && cx < wo.x + n - m && cy >= wo.y + m &&
+           cy < wo.y + n - m && cz >= wo.z + m && cz < wo.z + n - m;
+  };
+  const uint32_t kMobs = FourCC('M', 'O', 'B', 'S');
+  const IVec3 lo = ChunkStore::RegionOfChunk(wo);
+  const IVec3 hi = ChunkStore::RegionOfChunk({wo.x + n - 1, wo.y + n - 1, wo.z + n - 1});
+  uint32_t made = 0;
+  for (int rz = lo.z; rz <= hi.z; rz++)
+    for (int ry = lo.y; ry <= hi.y; ry++)
+      for (int rx = lo.x; rx <= hi.x; rx++) {
+        std::vector<EntityRecord>& dormant = store.DormantEntities({rx, ry, rz});
+        for (size_t i = 0; i < dormant.size();) {
+          if (dormant[i].section != kMobs || !inside(dormant[i].pos)) {
+            i++;
+            continue;
+          }
+          // Every wait below leaves the record where it is and asks for a
+          // later call; none of them drops it.
+          if (made >= budget) {
+            stats_.budgetWaits++;
+            pending_ = true;
+            i++;
+            continue;
+          }
+          if (!mobs.HasRoomToSpawn()) {
+            stats_.capWaits++;
+            pending_ = true;
+            i++;
+            continue;
+          }
+          // The record's position is the body's MIN CORNER (Mob::Origin), and
+          // the ground the body rests on runs under the whole footprint -- so
+          // the chunks under the corner AND half a chunk on in x and z (the
+          // centre column of anything up to a chunk wide), at the feet and
+          // one below. Every one is asked every time (no short-circuit), so
+          // the fetches go out together rather than one call apart.
+          const Vec3 p = dormant[i].pos;
+          const float half = 0.5f * (float)kChunk;
+          const int xs[2] = {chunkOf(p.x), chunkOf(p.x + half)};
+          const int zs[2] = {chunkOf(p.z), chunkOf(p.z + half)};
+          const int fy = chunkOf(p.y);
+          bool ground = true;
+          for (int a = 0; a < 2; a++)
+            for (int b = 0; b < 2; b++) {
+              if (a == 1 && xs[1] == xs[0]) continue;
+              if (b == 1 && zs[1] == zs[0]) continue;
+              for (int dy = 0; dy >= -1; dy--)
+                ground &= GroundKnown(world, {xs[a], fy + dy, zs[b]}, tick);
+            }
+          if (!ground) {
+            stats_.groundWaits++;
+            pending_ = true;
+            i++;
+            continue;
+          }
+          // Take it OUT of the bucket first, then apply (ApplyRegionEntities'
+          // order): the creature is live now, and the next save writes it back
+          // from MobSystem. A record LoadOne refuses (def retired, short read)
+          // is logged there and dropped -- the load path's rule.
+          EntityRecord r = std::move(dormant[i]);
+          dormant.erase(dormant.begin() + (ptrdiff_t)i);
+          ByteReader rd{r.bytes.data(), r.bytes.size()};
+          // placeLimbs: it comes back in the pose it left in (mob.h LoadOne).
+          if (mobs.LoadOne(rd, r.version, /*placeLimbs=*/true) != nullptr) {
+            made++;
+            stats_.unparked++;
+          } else {
+            stats_.failed++;
+            std::fprintf(stderr,
+                         "unpark: a parked creature record (v%u) in region "
+                         "(%d,%d,%d) failed to apply and is dropped\n",
+                         r.version, rx, ry, rz);
+          }
+        }
+      }
+  stats_.lastCall = made;
+  stats_.maxCall = std::max(stats_.maxCall, made);
+  return made;
 }

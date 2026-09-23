@@ -1673,11 +1673,12 @@ class Mob {
   // loop, lifted out so the handoff and the save file cannot drift apart
   // (`save-entities` gates the format; `mob-handoff` gates the round trip).
   //
-  // What it does NOT carry, on purpose: the id, the brain, the gear. The id
-  // because a save re-spawns into a fresh counter; the other two because a
-  // save has no use for them and widening the format would move the world
-  // hash for a network feature. The handoff carries all three beside the
-  // record (net/mobsync.h).
+  // What it does NOT carry, on purpose: the id and the worn/held gear. The id
+  // because a save re-spawns into a fresh counter; the gear because it is rig
+  // slots somebody re-dresses by name. The handoff carries both beside the
+  // record (net/mobsync.h). Since v5 (save plan S5b) it DOES carry the
+  // brain's memory -- profile by name and the target -- because a creature
+  // parked out of the window must come back still hunting what it hunted.
   //
   // The one-argument form writes the CURRENT format (MobSystem::kSaveVersion);
   // the two-argument form writes any version this build can still READ
@@ -4458,7 +4459,20 @@ class MobSystem {
   // lattice is applied whenever it differs from the rig — the record only
   // stores what differs, so a stain-only coat now survives a load, where the
   // v3 count test dropped it.
-  static constexpr uint32_t kSaveVersion = 4;
+  //
+  // 5 (2026-09-23, save plan S5b): THE BRAIN'S MEMORY TRAVELS. A tail after
+  // the pack: the AI profile BY NAME ("" = none), then the target (id,
+  // has-target, last live position, last-seen position, last-seen tick) --
+  // exactly the five facts the handoff's MobBrainWire has always carried
+  // beside the record, and for the same reason: a creature that walked out of
+  // the window mid-hunt (and is now PARKED in its region bucket rather than
+  // despawned) must come back still hunting. Everything else in ai::Brain is
+  // per-tick scratch the arbiter rebuilds in a few ticks. A target id names a
+  // SESSION identity (mob ids are re-issued on load; player actor ids are
+  // positional), so after a quit it may name nobody -- the brain then drops
+  // the target the way it drops any target it cannot resolve. v4 and v3 still
+  // LOAD (a fresh brain on the def's profile, which is all they ever had).
+  static constexpr uint32_t kSaveVersion = 5;
   static constexpr uint32_t kSaveVersionMin = 3;
   // Record limb kinds (v4).
   static constexpr uint32_t kLimbSevered = 0;
@@ -4489,7 +4503,14 @@ class MobSystem {
   // Public because the handoff reads one record out of a wire packet rather
   // than a count-prefixed section: `SaveState`/`LoadState` are now loops over
   // this pair, and the network path is the same pair called once.
-  Mob* LoadOne(ByteReader& r, uint32_t version);
+  //
+  // `placeLimbs` also puts every attached limb at the record's transform (the
+  // handoff's overlay rule). A save load leaves it false -- the rig stands in
+  // Spawn's rest pose at the floored origin and the first driven tick poses
+  // it, which is what loads have always done. An UNPARK (save plan S5b)
+  // passes true: the creature comes back exactly as it left, so its SaveOne
+  // is the parked record byte for byte.
+  Mob* LoadOne(ByteReader& r, uint32_t version, bool placeLimbs = false);
 
   // ==== OWNERSHIP: who steps which creature (M9.4-B) ========================
   //
@@ -4508,6 +4529,40 @@ class MobSystem {
     ownershipFn_ = std::move(fn);
   }
   bool HasOwnershipFn() const { return (bool)ownershipFn_; }
+
+  // ==== PARKING: A CREATURE THAT LEAVES THE WINDOW IS PUT AWAY (save S5b) ====
+  //
+  // PreTick used to DESPAWN a mob that wandered (or was left) more than a pad
+  // outside the residency window -- it ceased to exist. With a park function
+  // installed, the same branch first writes the creature's `Mob::SaveOne`
+  // record and hands it over, THEN tears the rig down exactly as before. The
+  // function (game/persist.h MobParking) appends it to the region bucket that
+  // contains its origin (ChunkStore::DormantEntities), which is the very
+  // record a save would have written for it -- so a parked creature and a
+  // saved one are indistinguishable, and the next save writes it to disk with
+  // no code of its own.
+  //
+  // WHO MAY PARK: only a creature this machine OWNS (`!IsGhost()`). A ghost
+  // leaving the window is the peer's creature and is dropped as before; the
+  // ownership rule (net::EntityAuthority: a resident peer beats a
+  // non-resident one) has already handed a creature to any peer whose window
+  // still holds it by the time it is a chunk outside ours, so a mob that
+  // reaches this branch still owned is one nobody else can see. Whether this
+  // MACHINE may park at all (a multiplayer client may not: its store is not
+  // the world's) is the installer's decision -- no function, no parking.
+  //
+  // The function returns false to refuse (the creature is then despawned, the
+  // pre-S5b behaviour). `record` may be moved from.
+  using ParkFn = std::function<bool(const Mob& m, std::vector<uint8_t>& record)>;
+  void SetParkFn(ParkFn fn) { parkFn_ = std::move(fn); }
+  bool HasParkFn() const { return (bool)parkFn_; }
+  // Creatures parked over the life of this system (a diagnostic, never saved).
+  uint64_t ParkedTotal() const { return parkedTotal_; }
+  // THE SPAWN CAP COUNTS LIVE CREATURES ONLY. A parked mob is bytes in a
+  // bucket, not a slot in `mobs_`, so it never holds a cap slot -- and an
+  // unpark is a spawn, so it is refused (and the record stays parked) while
+  // the live crowd is full. This is that test, asked from outside.
+  bool HasRoomToSpawn() const { return mobs_.size() < kMaxMobs; }
   uint32_t MobOwner(uint64_t mobId) const;
   // Set one creature's owner directly. The handoff path and the gate use it;
   // the ownership function overrules it on the next PreTick, which is correct
@@ -5621,6 +5676,8 @@ class MobSystem {
 
   uint32_t localPlayerId_ = kLocalOwner;
   std::function<uint32_t(uint64_t, Vec3)> ownershipFn_;
+  ParkFn parkFn_;               // S5b; null = despawn out of window (pre-S5b)
+  uint64_t parkedTotal_ = 0;
   uint64_t aiSteps_ = 0;
   // Evaluated at the top of PreTick, before anything steps: one creature's
   // owner may not change halfway through its own tick.
