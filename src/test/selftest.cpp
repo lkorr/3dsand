@@ -455,6 +455,10 @@ const char* const kOrder[] = {
     // installs an ownership function and clears it again; a gate after it
     // that found one still installed would be measuring ghosts.
     "mob-handoff",
+    // MOBS v4 (PLAN_save_system S5a). Beside `mob-handoff` because it shares
+    // that gate's exit contract: it resets mobs and debris and puts the id
+    // counter back. It ticks nothing and needs no terrain.
+    "mob-save-delta",
     // Armour reactivity, right after `mob-burn` and for the same reasons: it
     // lights real fires and pours real acid at absolute coordinates, and it
     // regenerates the world on the way out so the gates after it still find

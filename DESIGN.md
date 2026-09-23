@@ -378,6 +378,26 @@ are deduplicated across mob defs, so 128 slots cover a whole cast.
   `entities.sve` still loads (whole, every section through its whole-payload
   loader) and the next save distributes it and deletes it. Gate:
   `save-split`; `save-entities` asserts its old claims on the new layout.
+- **A whole body saves as its name (MOBS v4, 2026-09-23,
+  `docs/PLAN_save_system.md` S5a).** The mob record is the terrain delta rule
+  applied to a body: a limb that is field-for-field its def's authored limb
+  (collider + skin lattice, box, rest offset, anchors) writes a KIND word, hp
+  and its transform and nothing else; only a limb that differs stores its
+  lattices; a severed limb stores none (its matter is `DBRS`'s). "Pristine" is
+  PROVEN by content — `Mob::LimbIsPristine` compares against
+  `MobSystem::PristineOf`, which is built by the same `BuildAuthoredLattice`
+  BuildRig uses — never by a dirty bit, because carve, burn, rot/infection,
+  coats, wound soaks, recolours and the rise/limb-swap overlays all edit limb
+  voxels in place and a bit is one forgotten writer from a save that silently
+  heals a wound. A stored lattice of the same SHAPE as the rig is restored by
+  brick pokes (the door the coat and burn took, no rebase), so SaveOne ->
+  LoadOne -> SaveOne is byte-identical and a blood coat now survives a load
+  (v3's count-compare overlay dropped it). Pristine limbs follow the def's
+  CURRENT art on load, which is the point: an untouched body is its name. v3
+  still loads under its own rule; the handoff packet carries the same record.
+  **Measured: an untouched human 345,969 B (v3) -> 577 B; a crowd of 11
+  untouched + 4 damaged 5.17 MB -> 160 KB (32x), the remainder being the four
+  damaged limbs' lattices.** Gate `mob-save-delta`.
 - **The save stores the delta, and meta names its generator (2026-09-22,
   `docs/PLAN_save_system.md` S1).** A saved world is `genChunk(seed,
   generator)` plus the store. `Stream::FlushResident` used to write all 32,768

@@ -9400,6 +9400,310 @@ Status GateRagdollFallDamage(Ctx& c, std::string& detail) {
   return ok ? Status::Pass : Status::Fail;
 }
 
+// ---- ONE MOBS RECORD, FIELD BY FIELD ---------------------------------------
+//
+// WHAT DIFFERS, not just THAT it differs (CLAUDE.md rule 6). "The re-saved
+// record is not byte-identical" is a bare bool with a dozen causes — a limb
+// count, a transform, one carved lattice, the def name — and eliminating them
+// one rebuild at a time is the ladder that rule forbids. This walks the CURRENT
+// format (Mob::SaveOne's v4 writes, in order) on both sides and names the first
+// field that disagrees. Shared by `mob-handoff` (arm B) and `mob-save-delta`.
+std::string MobRecordDiff(const std::vector<uint8_t>& a,
+                          const std::vector<uint8_t>& b) {
+  if (a.size() == b.size() &&
+      (a.empty() || std::memcmp(a.data(), b.data(), a.size()) == 0))
+    return "";
+  ByteReader ra{a.data(), a.size()}, rb{b.data(), b.size()};
+  std::string na, nb;
+  Vec3 oa{}, ob{};
+  float ha = 0, hb = 0, ya = 0, yb = 0;
+  uint32_t la = 0, lb = 0;
+  ra.Str(na); ra.Pod(oa); ra.F32(ha); ra.F32(ya); ra.U32(la);
+  rb.Str(nb); rb.Pod(ob); rb.F32(hb); rb.F32(yb); rb.U32(lb);
+  if (na != nb) return Format("def '%s' vs '%s'", na.c_str(), nb.c_str());
+  if (oa.x != ob.x || oa.y != ob.y || oa.z != ob.z) return "origin";
+  if (ha != hb) return "heading";
+  if (ya != yb) return "bodyY";
+  if (la != lb) return Format("limb count %u vs %u", la, lb);
+  struct Limb {
+    uint32_t kind = 0;
+    float hp = 0;
+    BodyTransform xf{};
+    Vec3 v3[3]{};
+    IVec3 sz{};
+    std::vector<DebrisVoxel> v;
+    std::vector<PrefabVoxel> s;
+  };
+  auto read = [](ByteReader& r, Limb& L) {
+    r.U32(L.kind);
+    r.F32(L.hp);
+    r.Pod(L.xf);
+    if (L.kind != MobSystem::kLimbStored) return;
+    for (int k = 0; k < 3; k++) r.Pod(L.v3[k]);
+    r.Pod(L.sz);
+    r.PodVec(L.v);
+    r.PodVec(L.s);
+  };
+  for (uint32_t i = 0; i < la && ra.ok && rb.ok; i++) {
+    Limb A, B;
+    read(ra, A);
+    read(rb, B);
+    if (A.kind != B.kind)
+      return Format("limb %u kind %u vs %u (0 severed, 1 pristine, 2 stored)",
+                    i, A.kind, B.kind);
+    if (A.hp != B.hp) return Format("limb %u hp %.3f vs %.3f", i, A.hp, B.hp);
+    if (A.xf.pos.x != B.xf.pos.x || A.xf.pos.y != B.xf.pos.y ||
+        A.xf.pos.z != B.xf.pos.z) {
+      const Vec3 d{A.xf.pos.x - B.xf.pos.x, A.xf.pos.y - B.xf.pos.y,
+                   A.xf.pos.z - B.xf.pos.z};
+      return Format("limb %u xf.pos by %.4f", i,
+                    std::sqrt(d.x * d.x + d.y * d.y + d.z * d.z));
+    }
+    for (int k = 0; k < 4; k++)
+      if (A.xf.quat[k] != B.xf.quat[k]) return Format("limb %u xf.quat", i);
+    for (int k = 0; k < 3; k++)
+      if (A.v3[k].x != B.v3[k].x || A.v3[k].y != B.v3[k].y ||
+          A.v3[k].z != B.v3[k].z)
+        return Format("limb %u %s", i,
+                      k == 0 ? "restOffset" : k == 1 ? "anchorRoot" : "anchorLimb");
+    if (A.sz.x != B.sz.x || A.sz.y != B.sz.y || A.sz.z != B.sz.z)
+      return Format("limb %u size", i);
+    if (A.v.size() != B.v.size())
+      return Format("limb %u voxels %zu vs %zu", i, A.v.size(), B.v.size());
+    if (!A.v.empty() &&
+        std::memcmp(A.v.data(), B.v.data(), A.v.size() * sizeof(DebrisVoxel)) != 0)
+      return Format("limb %u voxel contents", i);
+    if (A.s.size() != B.s.size())
+      return Format("limb %u skin %zu vs %zu", i, A.s.size(), B.s.size());
+    if (!A.s.empty() &&
+        std::memcmp(A.s.data(), B.s.data(), A.s.size() * sizeof(PrefabVoxel)) != 0)
+      return Format("limb %u skin contents", i);
+  }
+  return Format("tail (%zu vs %zu bytes)", a.size(), b.size());
+}
+
+// ---- mob-save-delta --------------------------------------------------------
+//
+// A WHOLE BODY SAVES AS ITS NAME (docs/PLAN_save_system.md S5a, MOBS v4).
+//
+// A crowd of untouched humans plus one creature per KIND of damage — carved
+// (the shape changed), soaked in blood (same shape, every coat word changed),
+// set alight (same shape, materials changed in place by the burn front) and
+// one with a limb cut off — and nothing is ticked, so every difference between
+// two records is the save format's and not the simulation's. Five claims:
+//   A. PRISTINE IS DETECTED. Every base limb of every fresh human reads
+//      Mob::LimbIsPristine — which is what proves the reference PristineOf
+//      builds is BuildRig's output byte for byte (a mismatch would flag every
+//      fresh limb "stored" and fail here, not silently cost bytes). Every
+//      damaged limb reads NOT pristine: the in-place writers (coat, burn) do
+//      not move a count, so this is the half a count-based test would miss.
+//   B. IT IS SMALL. v4 bytes per pristine human under
+//      `mobSaveDeltaPristineMaxBytes`, and the crowd at least
+//      `mobSaveDeltaMinRatio` times smaller than the same crowd written as v3.
+//   C. IT ROUND-TRIPS. SaveOne -> LoadState -> SaveOne is byte-identical for
+//      EVERY record, pristine and damaged (MobRecordDiff names the field).
+//   D. v3 STILL LOADS. The same crowd written in the old format loads through
+//      LoadState(v3): every creature comes back, the carve and the sever are
+//      restored, and pristine and carved bodies re-save as the same v4 bytes.
+//      (The soaked body is exempt BY DESIGN: v3's overlay compares counts and
+//      always dropped a coat — the rule this version exists to retire.)
+// LEAVES NOTHING: resets mobs and debris and puts the id counter back.
+Status GateMobSaveDelta(Ctx& c, std::string& detail) {
+  const uint64_t idCounterWas = c.mobs.NextIdCounter();
+  c.debris.Reset();
+  c.mobs.Reset();
+  c.mobs.SetNextIdCounter(1);
+  auto restore = [&]() {
+    c.debris.Reset();
+    c.mobs.Reset();
+    c.mobs.SetNextIdCounter(idCounterWas);
+  };
+  const int hi = c.mobs.FindDef("human");
+  uint32_t mBlood = 0;
+  for (size_t i = 0; i < c.mats.size(); i++)
+    if (c.mats[i].name == "blood") mBlood = (uint32_t)i;
+  if (hi < 0 || mBlood == 0) {
+    detail = hi < 0 ? "no 'human' def" : "no 'blood' material";
+    restore();
+    return Status::Fail;
+  }
+  const MobDef& hd = c.mobs.Defs()[hi];
+  // The limb a sever takes: the last severable, non-vital, non-root one (a
+  // hand or a foot on the human), so the sever takes nothing else with it.
+  int severLimb = -1;
+  for (int i = (int)hd.limbs.size() - 1; i >= 0 && severLimb < 0; i--)
+    if (hd.limbs[i].severable && !hd.limbs[i].vital && i != hd.rootLimb)
+      severLimb = i;
+  // 16 = MobSystem::kMaxMobs (private); a refused spawn fails loudly below.
+  const int nPristine =
+      std::clamp((int)BaselineNumber("mobSaveDeltaCrowd", 11), 1, 16 - 4);
+  const IVec3 o = c.world.WindowOrigin();
+  const IVec3 base{(o.x + (int)kNChunk / 2) * (int)kChunk,
+                   (o.y + (int)kNChunk / 2) * (int)kChunk,
+                   (o.z + (int)kNChunk / 2) * (int)kChunk};
+  std::vector<uint64_t> ids;
+  for (int k = 0; k < nPristine + 4; k++) {
+    const uint64_t id =
+        c.mobs.Spawn(hi, {base.x + (k % 4) * 12, base.y, base.z + (k / 4) * 12});
+    if (id == 0) {
+      detail = Format("spawn %d of %d refused", k, nPristine + 4);
+      restore();
+      return Status::Fail;
+    }
+    ids.push_back(id);
+  }
+  // ---- the damage, one kind per creature ----
+  const uint64_t idCarved = ids[nPristine], idSoaked = ids[nPristine + 1],
+                 idBurnt = ids[nPristine + 2], idSevered = ids[nPristine + 3];
+  const int carveLimb = hd.rootLimb >= 0 ? hd.rootLimb : 0;
+  {
+    std::vector<ParticleSpawn> spawns;
+    const uint32_t full = c.mobs.LimbArtVoxelCount(idCarved, carveLimb);
+    for (int k = 0; k < 3; k++) {
+      const uint64_t lb = c.mobs.LimbBody(idCarved, carveLimb);
+      if (!lb || c.mobs.LimbArtVoxelCount(idCarved, carveLimb) < full * 8 / 10)
+        break;
+      c.mobs.CarveLimbRadial(
+          lb, c.mobs.LimbVoxelPos(idCarved, carveLimb, 977u * (uint32_t)(k + 1)),
+          1.0f, /*ragged=*/true, /*eject=*/false, c.world, spawns);
+    }
+  }
+  const int soakLimb = carveLimb;
+  const uint32_t soaked = c.mobs.SoakLimb(idSoaked, soakLimb, mBlood, 6, 7000);
+  const uint32_t lit = c.mobs.IgniteLimb(idBurnt, carveLimb, 64, 0);
+  if (severLimb >= 0) c.mobs.Sever(idSevered, severLimb);
+
+  // ======== A: pristine is detected, damage is not ========================
+  int freshNotPristine = 0, freshLimbs = 0;
+  std::string freshWhy;
+  for (int k = 0; k < nPristine; k++) {
+    const Mob* m = c.mobs.FindMobById(ids[k]);
+    if (m == nullptr) continue;
+    for (size_t li = 0; li < hd.limbs.size(); li++) {
+      freshLimbs++;
+      if (!m->LimbIsPristine(li)) {
+        if (freshWhy.empty())
+          freshWhy = Format("mob %d limb %zu (%s)", k, li, hd.limbs[li].name.c_str());
+        freshNotPristine++;
+      }
+    }
+  }
+  auto pristineOf = [&](uint64_t id, int li) {
+    const Mob* m = c.mobs.FindMobById(id);
+    return m != nullptr && m->LimbIsPristine((size_t)li);
+  };
+  const Mob* sevM = c.mobs.FindMobById(idSevered);
+  const bool carvedSeen = !pristineOf(idCarved, carveLimb);
+  const bool soakedSeen = soaked > 0 && !pristineOf(idSoaked, soakLimb);
+  const bool burntSeen = lit > 0 && !pristineOf(idBurnt, carveLimb);
+  const bool severSeen = severLimb >= 0 && sevM != nullptr &&
+                         c.mobs.LimbBody(idSevered, severLimb) == 0;
+  // Only the damaged limb is stored: a wound on the torso does not cost the
+  // legs their lattices. (Not asked of the severed body: a sever opens a
+  // stump on the PARENT, which is damage to a second limb by design.)
+  int damagedOthersStored = 0;
+  for (uint64_t id : {idCarved, idSoaked, idBurnt}) {
+    const Mob* m = c.mobs.FindMobById(id);
+    if (m == nullptr) continue;
+    for (size_t li = 0; li < hd.limbs.size(); li++) {
+      if ((int)li == carveLimb) continue;
+      if (!m->LimbIsPristine(li)) damagedOthersStored++;
+    }
+  }
+
+  // ======== B: bytes, v4 against the same crowd written as v3 =============
+  std::vector<std::vector<uint8_t>> rec4(ids.size()), rec3(ids.size());
+  size_t crowd4 = 0, crowd3 = 0;
+  std::vector<uint8_t> blob3;
+  {
+    ByteWriter w3{blob3};
+    w3.U32((uint32_t)ids.size());
+    for (size_t k = 0; k < ids.size(); k++) {
+      const Mob* m = c.mobs.FindMobById(ids[k]);
+      if (m == nullptr) continue;
+      { ByteWriter w{rec4[k]}; m->SaveOne(w); }
+      { ByteWriter w{rec3[k]}; m->SaveOne(w, 3); }
+      m->SaveOne(w3, 3);
+      crowd4 += rec4[k].size();
+      crowd3 += rec3[k].size();
+    }
+  }
+  const size_t pristine4 = rec4[0].size(), pristine3 = rec3[0].size();
+  const double maxPristine = BaselineNumber("mobSaveDeltaPristineMaxBytes", 2048);
+  const double minRatio = BaselineNumber("mobSaveDeltaMinRatio", 4);
+  const double ratio = crowd4 ? (double)crowd3 / (double)crowd4 : 0.0;
+  RecordObserved("mobSaveDeltaPristineBytes", (double)pristine4);
+  RecordObserved("mobSaveDeltaPristineBytesV3", (double)pristine3);
+  RecordObserved("mobSaveDeltaCrowdBytes", (double)crowd4);
+  RecordObserved("mobSaveDeltaCrowdBytesV3", (double)crowd3);
+
+  // ======== C: v4 round trip, every record =================================
+  std::vector<uint8_t> blob4;
+  c.mobs.SaveState(blob4);
+  c.debris.Reset();
+  c.mobs.Reset();
+  const bool read4 = c.mobs.LoadState(blob4.data(), blob4.size(),
+                                      MobSystem::kSaveVersion);
+  int rtSame = 0;
+  std::string rtWhy;
+  const uint32_t back4 = c.mobs.MobCount();
+  for (uint32_t i = 0; i < back4 && i < ids.size(); i++) {
+    const Mob* m = c.mobs.FindMobById(c.mobs.MobIdAt(i));
+    std::vector<uint8_t> again;
+    if (m != nullptr) { ByteWriter w{again}; m->SaveOne(w); }
+    const std::string why = MobRecordDiff(rec4[i], again);
+    if (why.empty()) rtSame++;
+    else if (rtWhy.empty()) rtWhy = Format("record %u: %s", i, why.c_str());
+  }
+
+  // ======== D: the v3 section still loads ==================================
+  c.debris.Reset();
+  c.mobs.Reset();
+  const bool read3 = c.mobs.LoadState(blob3.data(), blob3.size(), 3);
+  const uint32_t back3 = c.mobs.MobCount();
+  int v3Same = 0, v3Want = 0;
+  std::string v3Why;
+  bool v3Sever = false;
+  for (uint32_t i = 0; i < back3 && i < ids.size(); i++) {
+    const uint64_t id = c.mobs.MobIdAt(i);
+    if (ids[i] == idSevered) {
+      v3Sever = severLimb >= 0 && c.mobs.LimbBody(id, severLimb) == 0;
+      continue;
+    }
+    if (ids[i] == idSoaked || ids[i] == idBurnt) continue;   // v3's own rule
+    v3Want++;
+    const Mob* m = c.mobs.FindMobById(id);
+    std::vector<uint8_t> again;
+    if (m != nullptr) { ByteWriter w{again}; m->SaveOne(w); }
+    const std::string why = MobRecordDiff(rec4[i], again);
+    if (why.empty()) v3Same++;
+    else if (v3Why.empty()) v3Why = Format("record %u: %s", i, why.c_str());
+  }
+  restore();
+
+  const bool okA = freshNotPristine == 0 && carvedSeen && soakedSeen &&
+                   burntSeen && severSeen && damagedOthersStored == 0;
+  const bool okB = (double)pristine4 <= maxPristine && ratio >= minRatio;
+  const bool okC = read4 && back4 == ids.size() && rtSame == (int)ids.size();
+  const bool okD = read3 && back3 == ids.size() && v3Sever && v3Same == v3Want;
+  detail = Format(
+      "A %s: fresh %d/%d limbs pristine%s%s, damage seen carve %d soak %d(%u) "
+      "burn %d(%u) sever %d, other limbs stored %d | B %s: pristine human %zu B "
+      "(v3 %zu, max %.0f), crowd of %zu %zu B vs v3 %zu B = %.1fx (min %.1f) | "
+      "C %s: read %d, %u/%zu back, %d/%zu byte-identical%s%s | D %s: read %d, "
+      "%u/%zu back, sever %d, %d/%d re-save identical%s%s",
+      okA ? "ok" : "FAIL", freshLimbs - freshNotPristine, freshLimbs,
+      freshWhy.empty() ? "" : ", first stored: ", freshWhy.c_str(),
+      carvedSeen ? 1 : 0, soakedSeen ? 1 : 0, soaked, burntSeen ? 1 : 0, lit,
+      severSeen ? 1 : 0, damagedOthersStored, okB ? "ok" : "FAIL", pristine4,
+      pristine3, maxPristine, ids.size(), crowd4, crowd3, ratio, minRatio,
+      okC ? "ok" : "FAIL", read4 ? 1 : 0, back4, ids.size(), rtSame, ids.size(),
+      rtWhy.empty() ? "" : ", first: ", rtWhy.c_str(), okD ? "ok" : "FAIL",
+      read3 ? 1 : 0, back3, ids.size(), v3Sever ? 1 : 0, v3Same, v3Want,
+      v3Why.empty() ? "" : ", first: ", v3Why.c_str());
+  return okA && okB && okC && okD ? Status::Pass : Status::Fail;
+}
+
 // ---- mob-handoff -----------------------------------------------------------
 //
 // ONE CREATURE, ONE SIMULATOR (docs/PLAN_multiplayer_m9.md M9.4-B).
@@ -9558,63 +9862,10 @@ Status GateMobHandoff(Ctx& c, std::string& detail) {
   // them one rebuild at a time is the ladder that rule forbids. This walks the
   // format (Mob::SaveOne's writes, in order) on both sides and names the first
   // field that disagrees.
+  // (MobRecordDiff, file scope: `mob-save-delta` walks the same format.)
   auto recordDiff = [](const std::vector<uint8_t>& a,
                        const std::vector<uint8_t>& b) -> std::string {
-    if (a.size() == b.size() && std::memcmp(a.data(), b.data(), a.size()) == 0)
-      return "";
-    ByteReader ra{a.data(), a.size()}, rb{b.data(), b.size()};
-    std::string na, nb;
-    Vec3 oa{}, ob{};
-    float ha = 0, hb = 0, ya = 0, yb = 0;
-    uint32_t la = 0, lb = 0;
-    ra.Str(na); ra.Pod(oa); ra.F32(ha); ra.F32(ya); ra.U32(la);
-    rb.Str(nb); rb.Pod(ob); rb.F32(hb); rb.F32(yb); rb.U32(lb);
-    if (na != nb) return Format("def '%s' vs '%s'", na.c_str(), nb.c_str());
-    if (oa.x != ob.x || oa.y != ob.y || oa.z != ob.z) return "origin";
-    if (ha != hb) return "heading";
-    if (ya != yb) return "bodyY";
-    if (la != lb) return Format("limb count %u vs %u", la, lb);
-    for (uint32_t i = 0; i < la && ra.ok && rb.ok; i++) {
-      uint32_t aliveA = 0, aliveB = 0;
-      float hpA = 0, hpB = 0;
-      Vec3 v3a[3]{}, v3b[3]{};
-      BodyTransform xfA{}, xfB{};
-      IVec3 szA{}, szB{};
-      std::vector<DebrisVoxel> vA, vB;
-      std::vector<PrefabVoxel> sA, sB;
-      ra.U32(aliveA); ra.F32(hpA);
-      for (int k = 0; k < 3; k++) ra.Pod(v3a[k]);
-      ra.Pod(xfA); ra.Pod(szA); ra.PodVec(vA); ra.PodVec(sA);
-      rb.U32(aliveB); rb.F32(hpB);
-      for (int k = 0; k < 3; k++) rb.Pod(v3b[k]);
-      rb.Pod(xfB); rb.Pod(szB); rb.PodVec(vB); rb.PodVec(sB);
-      if (aliveA != aliveB) return Format("limb %u attached %u vs %u", i, aliveA, aliveB);
-      if (hpA != hpB) return Format("limb %u hp %.3f vs %.3f", i, hpA, hpB);
-      for (int k = 0; k < 3; k++)
-        if (v3a[k].x != v3b[k].x || v3a[k].y != v3b[k].y || v3a[k].z != v3b[k].z)
-          return Format("limb %u anchor %d", i, k);
-      if (xfA.pos.x != xfB.pos.x || xfA.pos.y != xfB.pos.y ||
-          xfA.pos.z != xfB.pos.z)
-        return Format("limb %u xf.pos by %.4f", i,
-                      std::sqrt((xfA.pos.x - xfB.pos.x) * (xfA.pos.x - xfB.pos.x) +
-                                (xfA.pos.y - xfB.pos.y) * (xfA.pos.y - xfB.pos.y) +
-                                (xfA.pos.z - xfB.pos.z) * (xfA.pos.z - xfB.pos.z)));
-      for (int k = 0; k < 4; k++)
-        if (xfA.quat[k] != xfB.quat[k]) return Format("limb %u xf.quat", i);
-      if (szA.x != szB.x || szA.y != szB.y || szA.z != szB.z)
-        return Format("limb %u size", i);
-      if (vA.size() != vB.size())
-        return Format("limb %u voxels %zu vs %zu", i, vA.size(), vB.size());
-      if (!vA.empty() &&
-          std::memcmp(vA.data(), vB.data(), vA.size() * sizeof(DebrisVoxel)) != 0)
-        return Format("limb %u voxel contents", i);
-      if (sA.size() != sB.size())
-        return Format("limb %u skin %zu vs %zu", i, sA.size(), sB.size());
-      if (!sA.empty() &&
-          std::memcmp(sA.data(), sB.data(), sA.size() * sizeof(PrefabVoxel)) != 0)
-        return Format("limb %u skin contents", i);
-    }
-    return Format("tail (%zu vs %zu bytes)", a.size(), b.size());
+    return MobRecordDiff(a, b);
   };
 
   const double trackTol = BaselineNumber("mobGhostTrackVox", 0.05);
@@ -10261,6 +10512,12 @@ const std::vector<Gate>& MobGates() {
       // every claim is an op count, an AI-step count, a distance or a byte
       // comparison.
       {"mob-handoff", "mob", {}, false, GateMobHandoff, /*needsRender=*/false},
+      // MOBS v4: an untouched body saves as its def name plus hp and pose;
+      // only a limb that differs from the def's art stores a lattice. Bytes,
+      // byte-identical round trip, and the v3 section still loading. No
+      // ticks, no render.
+      {"mob-save-delta", "mob", {}, false, GateMobSaveDelta,
+       /*needsRender=*/false},
       // NPC AI. No render either: every claim is a distance, an angle or a
       // count, which is what makes them iterable with `--gate` alone.
       {"ai-dummy", "mob", {}, false, GateAiDummy, /*needsRender=*/false},
