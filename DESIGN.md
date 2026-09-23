@@ -10142,6 +10142,32 @@ fixed number of depth steps at any distance: the largest bias is 1.9e-3 of view
 depth, four thousand times the rounding it must beat and under a hundredth of a
 voxel at arm's length.
 
+**A limb's overlap is ONE cell stored twice, and the two copies share its
+state** (2026-09-23, `Mob::SyncJointTwins`). The same overlap exists between a
+creature's own limbs: mobgen's stack overlaps (`ARCHETYPE.stack[].overlap`) put
+the bottom 2-3 cells of the torso inside the hips, the top of each thigh inside
+the hips, and so on, so a bent joint never opens a gap - 1,904 coincident cells
+on `newcomer`, 896 of them hips/torso. Every lattice writer (rot, fire, coats,
+carves) is per-limb, so the two copies used to live separate lives, and
+`BODY_Z_PRIORITY` then made the covering PERMANENT: a torso cell turned green
+by the rot sat under the hip's pristine copy forever (owner report). The fix
+keeps the overlap and links the copies: at the first sync each parent/child
+pair's rest-pose-coincident cells are linked by REST lattice coordinate (a
+compaction or a brick rebase moves indices and local coords, never that), and
+from then on a change to either copy is copied to the other, FIELD-WISE and only
+when it changed - material+art, coat, and removal (tombstoned and flushed
+through the rot's FlushBurn tail). Copying never runs parent-over-child, so the
+authored difference between the copies (the torso's rim is skin where the hip's
+copy of that cell is muscle) survives until something happens there; when both
+copies change the same field in one tick the parent wins. An infectious
+material carries the infection with it; a self-active one marks the receiver
+alight. A sever or respawn rebuilds the links. Rejected: partitioning the
+overlap (reopens the gap it exists to hide), hiding one copy near rest (a guess
+that fails back into this bug), a single skinned lattice (the right end state,
+and a rewrite of every per-limb path). Cost is zero on a creature nothing is
+happening to (`twinDirty_`, set by `MarkInstancesDirty` and every coat writer)
+and one pass over its twin cells otherwise. Gate: `joint-twins`.
+
 **Bounds and cost.** The per-fragment DDA is hard-capped at `3·maxDim + 4` steps
 (worst-case diagonal of the brick) with no data-dependent loop bound anywhere.
 The draw list is CPU-compacted, so the instance count IS the number of micro

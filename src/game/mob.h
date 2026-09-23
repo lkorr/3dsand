@@ -896,6 +896,13 @@ struct BurnLimbView {
   // back the paint it covered, or a bloodied patch of a painted creature
   // clears to flat material colour and the wound is still visible as a smear
   // of the wrong pink.
+  // The whole stored word (material | variant << 12) and the art slot.
+  uint32_t Word(size_t i) const {
+    return skin ? (uint32_t)(*skin)[i].material : (uint32_t)(*coll)[i].payload;
+  }
+  uint32_t Art(size_t i) const {
+    return skin ? (uint32_t)(*skin)[i].color : (uint32_t)(*coll)[i].color;
+  }
   void SetWord(size_t i, uint32_t word, uint32_t color) const {
     if (skin) {
       (*skin)[i].material = (uint16_t)word;
@@ -994,6 +1001,25 @@ struct BurnLimbView {
 // creature and a map per limb is not worth the allocation: a body is realistically
 // bloody, or wet, or bloody and wet. Anything reading a specific substance off
 // this reads it off `top`; anything reading "how coated is this" reads Frac().
+// ---- JOINT TWINS (Mob::SyncJointTwins; the long note is at Mob::twins_) ----
+// One side of a coincident cell, as of the last sync.
+struct JointTwinSide {
+  uint16_t mat = 0;    // full word (material | variant << 12); 0 = gone
+  uint16_t stain = 0;
+  uint8_t art = 0;
+};
+struct JointTwinCell {
+  IVec3 rest{};              // creature rest-lattice coordinate
+  uint32_t hintA = 0, hintB = 0;
+  JointTwinSide a, b;
+};
+struct JointTwinPair {
+  int a = -1, b = -1;        // parent limb, child limb
+  uint32_t scale = 1;        // the lattice both are on
+  IVec3 lo{}, hi{};          // rest-lattice box of `cells`, inclusive
+  std::vector<JointTwinCell> cells;
+};
+
 struct CoatEntry {
   uint32_t mat = 0;      // the substance (a material id, not a palette slot)
   uint32_t sumAmt = 0;   // total amount of it over the limb, 0..15 per voxel
@@ -3256,6 +3282,56 @@ class Mob {
   uint32_t InfectAcrossJoint(int fromLimb, uint32_t tick, int toLimb,
                              const std::vector<Vec3>& srcWorld);
 
+  // ---- JOINT TWINS: one cell of flesh, two copies (2026-09-23) -------------
+  //
+  // mobgen overlaps adjacent segments on purpose (`ARCHETYPE.stack[].overlap`:
+  // hips reach 2 cells into the torso, the torso 3 into the hips, ...) so a
+  // bending joint never opens a gap. Each limb is its own lattice, so every
+  // cell in that overlap exists TWICE — once in the parent, once in the child
+  // — at the same point of the rest pose. Nothing tied them together: the rot
+  // turned the torso's copy green and the hip's pristine copy sat on top of it;
+  // a burn charred one and the other covered the char; a rot hole in one was
+  // plugged by the other.
+  //
+  // The fix is to treat a coincident pair as ONE cell stored twice: whatever
+  // happens to either copy happens to both. Found by rest-pose coincidence (a
+  // cell's rest lattice coordinate is its limb coordinate plus the limb's rest
+  // offset, both on the same lattice), only between a limb and its rig parent,
+  // only on base anatomy (no garments, no held items), and only between limbs
+  // on the same lattice scale. Keyed by REST coordinate, not lattice index, so
+  // a compaction or a brick rebase (both move indices and local coords) cannot
+  // break a link; the indices are hints re-resolved when they stop matching.
+  //
+  // Sync is FIELD-WISE and CHANGE-DRIVEN, never "copy the parent over the
+  // child": each side's last-synced state is remembered, and only a field that
+  // CHANGED on one side is copied to the other. That keeps the authored
+  // difference between the copies (the torso's rim is skin where the hip's
+  // copy of the same cell is muscle) until something actually happens there.
+  //   * material + art colour: copied as a unit (a rewrite zeroes the art);
+  //   * body coat (stain word): copied on its own;
+  //   * removal: the other copy is tombstoned and flushed through the same
+  //     FlushBurn tail the rot uses, then the link is dropped;
+  //   * both sides changed the same field in one tick: the PARENT wins.
+  // Copying an infectious material starts the infection on the receiving limb
+  // (as RestoreVoxels does); copying a self-active one (fire) marks it alight.
+  //
+  // COST (rule 2): nothing unless `twinDirty_` — set by MarkInstancesDirty and
+  // by every coat writer — and then one pass over the twin cells (a few hundred
+  // per creature), never over the limbs. Lattice sweeps happen only when a
+  // limb's layout moved (a carve), which already costs a sweep.
+  //
+  // CPU body state, not hashed, like every other gore mechanic here.
+  std::vector<JointTwinPair> twins_;
+  // Which limbs had a body when twins_ was built; any change (a sever, a
+  // detach, a respawn) rebuilds from the lattices as they now stand.
+  std::vector<uint8_t> twinAttached_;
+  bool twinsBuilt_ = false;
+  bool twinDirty_ = false;
+  void BuildJointTwins();
+  // Returns false when a flush severed a limb or killed the creature, with
+  // InfectTick's contract: the caller must touch nothing afterwards.
+  bool SyncJointTwins(World& world, std::vector<ParticleSpawn>& spawns);
+
   // Shared services, borrowed from MobSystem (burn tables, micro pool,
   // material tables, event sinks). Never null on a spawned creature.
   MicroBodySet* MicroSet() const;
@@ -5072,6 +5148,20 @@ class MobSystem {
   // lattice LimbVoxelsAtSpawn counted. LimbVoxelCount reports the collider,
   // and mixing the two scales every fraction by (skinScale/physScale)^3.
   uint32_t LimbArtVoxelCount(uint64_t mobId, int limbIndex) const;
+  // ---- joint twins (Mob::SyncJointTwins), for the `joint-twins` gate ----
+  // Linked cells on this creature (building the links if they are not yet),
+  // and the `k`th of them as (parent limb, child limb, rest-lattice cell).
+  uint32_t JointTwinCount(uint64_t mobId);
+  bool JointTwinAt(uint64_t mobId, uint32_t k, int& limbA, int& limbB,
+                   IVec3& rest);
+  // One cell of a limb's authoritative lattice, addressed by REST coordinate
+  // (see JointTwinCell). Get: false if the cell is absent or tombstoned.
+  // Set: mat 0 tombstones it, an unchanged mat leaves the material (and its
+  // art slot) alone; marks the creature dirty like any writer.
+  bool LimbCellAt(uint64_t mobId, int limb, IVec3 rest, uint32_t& mat,
+                  uint16_t& stain);
+  bool SetLimbCellAt(uint64_t mobId, int limb, IVec3 rest, uint32_t mat,
+                     uint16_t stain);
 
  private:
   // ---- per-voxel burning / dissolution (docs/PLAN_body_reactivity.md) --------

@@ -670,6 +670,10 @@ const char* const kOrder[] = {
     // does not decapitate, and dead flesh takes the flesh bore, not the rock
     // melt (owner report 2026-09-22). Pristine ground, CPU only.
     "laser-head",
+    // ...and the overlap where a limb meets its parent is ONE cell of flesh in
+    // two lattices: rot, a coat or a hole in either copy is in both (owner
+    // report 2026-09-23). Pristine ground, CPU only.
+    "joint-twins",
     // ---- NOTHING IS LEFT HANGING (2026-09-03) -----------------------------
     // LAST of everything that touches the shared World except `voxregion`, and
     // that position was EARNED rather than chosen. It first sat at the end of
