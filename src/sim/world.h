@@ -889,6 +889,17 @@ constexpr uint32_t kMaxCellOpsPerTick = 65536;
 // stored word are now the stain layer (below) and a CellOp carries real stain
 // bits through to the grid.
 constexpr uint32_t kCellOpIfAir = 0x80000000u;
+// THE CONDITIONAL CLEAR: "empty this cell, but only if it still holds material
+// M". kCellOpIfAir on a word whose material is AIR would be "write air where
+// there is air" -- a no-op nobody needs -- so that combination is reused, with
+// M in bits 12..23 (sim_mutate.wgsl `cells`). It exists for the vessels
+// (game/container.h): a scoop is decided off a snapshot one tick old, and
+// liquid moves, so an unconditional clear would delete whatever flowed into
+// the cell since -- sand, a plant, somebody's foot. Refused ops cost the
+// scooper nothing but accuracy; they never cost the world matter.
+inline uint32_t CellOpClearIfMat(uint32_t mat) {
+  return kCellOpIfAir | ((mat & 0xFFFu) << 12);
+}
 
 // ---- the voxel word ----
 // bits 0..11 material, 12..15 state, 16..18 tick-stamp, 19..23 excite scratch,
@@ -1517,6 +1528,14 @@ constexpr uint32_t kPtNoWord = 0xFFFFFFFFu;
 //   [18]     LAST fault: the page-table entry (racy store)
 //   [19]     reserved
 //   [20..32] per-kernel fault tally, indexed by PT_K_*
+//   [33..35] reserved (tally headroom: PT_K_COUNT may grow)
+//   [36]     THE SCOOP LEDGER (game/container.h): eighths of a cell that
+//            CONDITIONAL CLEARS (CellOpClearIfMat) actually removed, monotonic.
+//            Not a fault; it lives here because sim_mutate already binds this
+//            record atomically and the snapshot already copies it, so the
+//            one number a vessel needs back from the GPU costs no binding.
+//   [37]     conditional clears applied, monotonic
+//   [38]     conditional clears REFUSED (the cell no longer held the material)
 //
 // [16]/[18] are what separate a FREED page (PT_EMPTY) from a DEMOTED one
 // (UNIFORM / JITTER): the first is the hysteresis free path, the second is
@@ -1535,6 +1554,9 @@ constexpr uint32_t kPtNoWord = 0xFFFFFFFFu;
 // complaint. Sized with headroom for the same reason kMaxUses is.
 constexpr uint32_t kPageFaultWords = 40;
 constexpr uint32_t kPageFaultBytes = kPageFaultWords * 4;
+constexpr uint32_t kPageFaultScoopEighths = 36;
+constexpr uint32_t kPageFaultScoopApplied = 37;
+constexpr uint32_t kPageFaultScoopRefused = 38;
 
 // ---- fluidArgsStage: the FA_* word map -------------------------------------
 // The seam's counter block (common.wgsl's FA_* names, plus the two refusal-site
@@ -3405,6 +3427,13 @@ struct WorldSnapshot {
   // which is what turns §2.4's structural claim into a measurement made on
   // every run rather than in a special configuration.
   uint32_t pageFaults = 0;
+  // The scoop ledger (pageFaults record [36..38], see kPageFaultScoop*): what
+  // the vessels' conditional clears really took, monotonic, as of `tick`.
+  // Zeroed with the rest of the record by a page-table reset or a worldgen,
+  // which a reader sees as the total going DOWN.
+  uint32_t scoopEighths = 0;
+  uint32_t scoopApplied = 0;
+  uint32_t scoopRefused = 0;
   // ---- MLS-MPM fluid (seam) ----
   // The GPU-owned live particle count and the fluidArgsStage event counters
   // (the FA_* map in common.wgsl) as of this snapshot's tick. fluidLive is

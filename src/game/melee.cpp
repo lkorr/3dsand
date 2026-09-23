@@ -520,6 +520,33 @@ bool LoadItems(const std::string& dir, size_t materialCount,
     d.reach = it.value("reach", 9.0f) *
               ((float)kVoxelsPerMetre / (float)kLegacyAuthoringVoxelsPerMetre);
     d.weaponClass = it.value("weaponClass", "");
+    // ---- VESSELS (game/container.h) ----------------------------------------
+    // `holds` by CLASS NAME, so what a vessel takes up is authored, not a
+    // material list: a flask holds every liquid there is or will be.
+    if (d.kind == ItemKind::Container) {
+      const json c = it.value("container", json::object());
+      for (const auto& h : c.value("holds", json::array())) {
+        const std::string hn = h.is_string() ? h.get<std::string>() : "";
+        if (hn == "liquid") d.container.holds |= 1u << CLASS_LIQUID;
+        else if (hn == "powder") d.container.holds |= 1u << CLASS_POWDER;
+        else
+          errors += "items: \"" + d.name + "\" container holds unknown class \"" +
+                    hn + "\" (liquid | powder)\n";
+      }
+      // Authored in CELLS, stored in eighths (kContainerUnitsPerCell).
+      d.container.capacity =
+          std::clamp(c.value("capacity", 0), 0, 4096) * kContainerUnitsPerCell;
+      d.container.scoopPerTick = std::clamp(c.value("scoopPerTick", 4), 1, 64);
+      d.container.pourPerTick = std::clamp(c.value("pourPerTick", 2), 1, 64);
+      d.container.applyCells = std::clamp(c.value("applyCells", 4), 1, 128);
+      d.container.pourRange = MetresToCells(c.value("pourRangeM", 4.0f));
+      d.container.pourSpeed = MetresToCells(c.value("pourSpeedMps", 3.0f));
+      if (d.container.holds == 0 || d.container.capacity == 0) {
+        errors += "items: \"" + d.name +
+                  "\" is a container with no `holds` or no `capacity` -- skipped\n";
+        continue;
+      }
+    }
     // A broken item is skipped, never fatal: one bad asset must not cost the
     // player their whole hotbar (DESIGN.md §6, the same rule mob defs follow).
     if (!LoadItemAsset(dir, materialCount, micro, d, errors)) continue;

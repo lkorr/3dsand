@@ -57,15 +57,26 @@ struct WorldItem {
   // and damage, and that is not a coincidence -- those are exactly the three
   // facts that are identity rather than matter.
   uint32_t damage = 0;
+  // WHAT IS IN IT, for a vessel (ItemStack::fillMat/fillAmt, packed by
+  // PackItemFill). Identity for the same reason as the dye: a corked flask of
+  // blood lying in the grass is not recoverable from its glass.
+  uint32_t fill = 0;
 };
+
+// ItemStack's two vessel fields <-> the one word a registry entry carries.
+inline uint32_t PackItemFill(uint16_t mat, uint16_t amt) {
+  return (uint32_t)mat | ((uint32_t)amt << 16);
+}
+inline uint16_t ItemFillMat(uint32_t f) { return (uint16_t)(f & 0xFFFFu); }
+inline uint16_t ItemFillAmt(uint32_t f) { return (uint16_t)(f >> 16); }
 
 class WorldItems {
  public:
   void Add(uint64_t body, std::string name, uint32_t dye = 0,
-            uint32_t damage = 0) {
+            uint32_t damage = 0, uint32_t fill = 0) {
     if (!body || name.empty()) return;
     Remove(body);   // a reused handle must not resolve to the old item
-    items_.push_back(WorldItem{body, std::move(name), {}, dye, damage});
+    items_.push_back(WorldItem{body, std::move(name), {}, dye, damage, fill});
   }
   const WorldItem* Find(uint64_t body) const {
     for (const WorldItem& w : items_)
@@ -159,7 +170,7 @@ inline uint64_t DropItemToWorld(const ItemDef& def, Vec3 at, Vec3 vel,
                                 MicroBodySet* micro, WorldItems& reg,
                                 const std::vector<PrefabVoxel>* lattice =
                                     nullptr,
-                                uint32_t dye = 0) {
+                                uint32_t dye = 0, uint32_t fill = 0) {
   uint32_t scale = 1;
   const std::vector<PrefabVoxel>* authored = ItemGroundVoxels(def, scale);
   const std::vector<PrefabVoxel>* src =
@@ -211,6 +222,6 @@ inline uint64_t DropItemToWorld(const ItemDef& def, Vec3 at, Vec3 vel,
   // ground LOOKS right, and on the registry entry so picking it up gives you
   // back the garment you dropped. Neither is derivable from the other — the
   // body's word is render state a reload re-packs, the registry's is identity.
-  reg.Add(body, def.name, dye);
+  reg.Add(body, def.name, dye, 0, fill);
   return body;
 }

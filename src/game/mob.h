@@ -4845,6 +4845,21 @@ class MobSystem {
   // other way to ask for one. Returns the voxels marked.
   uint32_t SoakLimb(uint64_t mobId, int limb, uint32_t mat, uint32_t amount,
                     uint32_t tick);
+  // SOMETHING POURED ON A LIMB BY HAND (game/container.h: the health panel's
+  // "apply to this part"). SoakLimb's coat, then the material's authored
+  // `coat.effects`, run ONCE, on that limb -- the first reader that list has
+  // had. The vocabulary is what a remedy can do to state a limb already
+  // carries, and nothing else:
+  //   "stanch"    -- the wound stops owing blood (bleedBudget, the open
+  //                  stump, a gout in progress): the cauterise rule's three
+  //                  fields, reached by a salve instead of a burn;
+  //   "disinfect" -- a bite's rot stops spreading (infectMat/infectStain).
+  // An unknown tag does nothing, so content can name remedies ahead of the
+  // code. Returns a bit per effect that CHANGED something (kRemedy*), so the
+  // caller can say "the bleeding stops" only when it did.
+  static constexpr uint32_t kRemedyStanch = 1u, kRemedyDisinfect = 2u;
+  uint32_t DouseLimb(uint64_t mobId, int limb, uint32_t mat, uint32_t amount,
+                     uint32_t tick, uint32_t* marked = nullptr);
   // Force the ledger's cadence (Mob::RecountCoat) for one creature, so a
   // caller that has just changed a coat can read the answer this instant
   // instead of waiting out tune.coat.recountTicks.

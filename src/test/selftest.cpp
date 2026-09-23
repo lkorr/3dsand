@@ -52,6 +52,7 @@ const std::vector<Gate>& WorldIoGates();
 const std::vector<Gate>& VoxRegionGates();
 const std::vector<Gate>& SpellGates();
 const std::vector<Gate>& PlayerKitGates();
+const std::vector<Gate>& VesselGates();
 const std::vector<Gate>& GrimoireGates();
 // The spell GRAPH (PLAN_spell_graph phase 2): layout, the linearizer, the tree
 // edit ops. CPU-only over glyphs.json and the generated oracle.
@@ -110,6 +111,7 @@ const char* const kOrder[] = {
     // with the other cheap front-loaded checks rather than after them.
     "scale",
     "player-kit",
+    "vessel",
     // With it: `spells-oracle` is pure CPU over glyphs.json and the generated
     // grammar oracle -- no world, no GPU, nothing left behind -- and a parser
     // that disagrees with the reference script should be the first thing a
@@ -621,7 +623,7 @@ const char* const kOrder[] = {
     // was: heat crossing its joints, its armour shielding it, and a burst of
     // blood landing on it (owner report 2026-09-22). Each ticks the world and
     // regenerates it on the way out.
-    "corpse-crossheat", "corpse-worn", "corpse-splatter",
+    "corpse-crossheat", "corpse-worn", "corpse-splatter", "vessel-grid",
     // ...and what landed there is a SUBSTANCE, not a colour: the per-limb coat
     // ledger names the material, it dries at that material's own authored rate
     // (and does not at the default one), and a coat can be tracked back onto
@@ -748,7 +750,7 @@ const std::vector<Gate>& Registry() {
                           &MobGates(), &BodyGates(), &FloaterGates(),
                           &WorldIoGates(), &AudioGates(),
                           &VoxRegionGates(),
-                          &SpellGates(), &PlayerKitGates(), &GrimoireGates(), &SpellGraphGates(),
+                          &SpellGates(), &PlayerKitGates(), &VesselGates(), &GrimoireGates(), &SpellGraphGates(),
                           &SwingGates(),
                           &EquipmentGates(), &DyeGates(), &WoundGates(), &ImpactGates(),
                           &CombatGates(),

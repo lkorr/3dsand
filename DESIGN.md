@@ -13368,6 +13368,59 @@ actually reads, that three patterns exist per slot, that the dye reaches every
 shell's GPU instance and nothing else's, that a stack is one colour, and that
 the word survives `PLYR` v5.
 
+### Vessels: a flask scoops, a pouch scoops, both pour (2026-09-22; `game/container.*`)
+
+ONE ITEM KIND, `container`, and what it takes up is DATA: items.json's
+`container.holds` names material CLASSES (`liquid`, `powder`), so the flask and
+the pouch are two rows and a bucket would be a third. Amounts are EIGHTHS of a
+cell, the grid's own liquid unit, so a half-drained puddle cell is taken for
+exactly what it held. The contents ride the stack (`ItemStack::fillMat/
+fillAmt`), are part of the merge key (a flask of blood must not fold into a
+stack of empties), and persist through `PLYR` v6, `ITMS` v3, a drop and an R
+reload.
+
+**Hands up, a vessel selected in the hotbar, nothing drawn** (`FrameIntent::
+vesselSlot`): RMB scoops, LMB pours, the flask is held in the rig slot a sword
+would borrow, and the unarmed compass is off. Both directions go through the
+MutationQueue:
+
+- **A scoop is a list of CONDITIONAL CLEARS** (`CellOpClearIfMat`: kCellOpIfAir
+  on an AIR word, expected material in bits 12..23 -- a combination that was
+  otherwise a no-op). The snapshot the CPU scoops from is kSnapshotLatency
+  ticks old and liquid moves, so the GPU refuses a clear whose cell no longer
+  holds that material; nothing that was not what you scooped is ever deleted.
+- **The vessel is paid what the GPU TOOK, not what the CPU asked for.** A flask
+  held over a levelling pool was measured credited 125 eighths for 113
+  removed: water ran into the holes during the snapshot's four ticks and every
+  cell was paid at its stale fullness. So `sim_mutate` adds what each applied
+  clear really removed to a monotonic SCOOP LEDGER (page-fault record words
+  36..38, `kPageFaultScoop*`), the snapshot carries it, and a scoop files a
+  CLAIM that `ContainerSettle` pays when that tick's snapshot arrives. Exact,
+  four ticks late. A world-wide ledger: two scoops landing on one tick share it.
+- **A pour is grid particles on a solved arc** -- the kernel's own
+  integration, so the stream's centre lands on the crosshair (or on the first
+  body the look ray meets, since the grid pick cannot see a creature). They
+  reinsert as matter where they land. The one rounding: the kernel reinserts a
+  liquid particle FULL, so the last partial cell of a flask comes out as a
+  whole one (under one cell per emptying). Ambient wind drags the stream like
+  any particle (sim.windMode).
+- **The pour is also a SplatterEvent**, the same record a severed artery's spray
+  leaves, so any body in the stream -- creature, corpse, or your own feet -- is
+  coated where it is hit. That IS "pour blood on somebody and they are stained".
+
+**The health panel's pour** (`InspectApplyPicks`): with a filled vessel selected
+and no spell spoken, each limb of the portrait is a target. A click spends
+`container.applyCells` and runs `MobSystem::DouseLimb`: the limb is coated
+(SoakLimb), then the material's `coat.effects` run ONCE on that limb -- the
+first reader that list has had. Vocabulary: `stanch` (the cauterise rule's
+three fields -- bleedBudget, stumpOpen, gushTicks) and `disinfect` (a bite's
+infectMat/infectStain). No material authors either yet; medicine is content.
+
+Gates: `vessel` (pure: content, what goes in, the claim, the arc, stacks,
+PLYR v6, DouseLimb) and `vessel-grid` (the real grid: scoop exactly paid by
+the ledger, pour conserved counting grid + MPM -- a splash excites landed water
+into MPM particles for a while, which a grid-only count reads as a loss).
+
 ## 9d. Biomes and water-body presets — the Environment tab (added 2026-09-01)
 
 > **A biome SELECTS from component libraries and says how often and where.

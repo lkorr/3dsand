@@ -17095,6 +17095,34 @@ uint32_t MobSystem::SoakLimb(uint64_t mobId, int limb, uint32_t mat,
   return marked;
 }
 
+uint32_t MobSystem::DouseLimb(uint64_t mobId, int limb, uint32_t mat,
+                              uint32_t amount, uint32_t tick, uint32_t* marked) {
+  const uint32_t n = SoakLimb(mobId, limb, mat, amount, tick);
+  if (marked) *marked = n;
+  Mob* mob = nullptr;
+  for (Mob& m : mobs_)
+    if (m.id_ == mobId) mob = &m;
+  if (!mob) mob = AvatarById(mobId);
+  if (!mob || limb < 0 || limb >= (int)mob->limbs_.size()) return 0;
+  if (mat >= coatEffects_.size()) return 0;
+  MobLimb& l = mob->limbs_[limb];
+  uint32_t did = 0;
+  for (const std::string& fx : coatEffects_[mat]) {
+    if (fx == "stanch") {
+      if (l.bleedBudget > 0.0f || l.stumpOpen || l.gushTicks > 0)
+        did |= kRemedyStanch;
+      l.bleedBudget = 0.0f;
+      l.stumpOpen = false;
+      l.gushTicks = 0;
+    } else if (fx == "disinfect") {
+      if (l.infectMat != 0 || l.infectStain != 0) did |= kRemedyDisinfect;
+      l.infectMat = 0;
+      l.infectStain = 0;
+    }
+  }
+  return did;
+}
+
 void MobSystem::RecountCoatOn(uint64_t mobId, uint32_t tick) {
   for (Mob& m : mobs_)
     if (m.id_ == mobId) {

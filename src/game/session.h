@@ -73,6 +73,7 @@
 #include "game/brush.h"
 #include "game/camera.h"
 #include "game/caster.h"
+#include "game/container.h"
 #include "game/corpses.h"
 #include "game/equipment.h"
 #include "game/grab.h"
@@ -401,6 +402,11 @@ struct PlayerSession {
   // specific rig part, a UI transaction rather than a player command, and it
   // has no meaning on a remote peer.
   int castAtPartQueued = -1;
+  // ...and the same click with a filled VESSEL in hand instead of a spell
+  // (game/container.h): pour it on that part. Same latch, same reasoning.
+  int applyAtPartQueued = -1;
+  // What this player's scoop has taken that the snapshot cannot see yet.
+  ContainerScoopMemo scoopMemo;
 
   // ---- melee ----
   MeleeState melee;
@@ -488,6 +494,11 @@ struct FrameIntent {
   bool meleeArmed = false;
   bool meleeReady = false;
   const ItemDef* heldItem = nullptr;
+  // THE HANDS HOLD A VESSEL: the melee tool is up, nothing is drawn, and the
+  // selected hotbar slot is an ItemKind::Container. The hotbar slot, or -1.
+  // LMB pours and RMB scoops (game/container.h); the unarmed compass is off,
+  // because a hand round a flask is not a fist.
+  int vesselSlot = -1;
 };
 
 // ---- the world a tick runs in ---------------------------------------------

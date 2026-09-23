@@ -1420,6 +1420,119 @@ static void PhaseG(TickAuthorityCtx& w, WorldScratch& ws,
             }
       }
 
+      // ---- VESSELS (game/container.h): RMB scoops, LMB pours ----------------
+      //
+      // The hands are up with a flask or a pouch in them (FrameIntent::
+      // vesselSlot). Both halves go out through the MutationQueue: a scoop is
+      // conditional clears, a pour is grid particles plus the SplatterEvent
+      // that lets whoever is standing in the stream be wet by it.
+      // PAY WHAT THE GPU TOOK (ContainerSettle): every tick, held or not, so
+      // a scoop in flight when the flask is put away still lands in it. The
+      // claim goes to the held vessel, else the first vessel on the hotbar or
+      // in the pack that holds the same thing or nothing.
+      if (!s.scoopMemo.claims.empty() || s.scoopMemo.haveLedger) {
+        const WorldSnapshot& lsnap = world.Snap();
+        if (lsnap.valid) {
+          ItemStack* dst = nullptr;
+          const ItemDef* ddef = nullptr;
+          const uint16_t want = s.scoopMemo.PendingMat();
+          auto take = [&](ItemStack& cand) {
+            if (dst || cand.Empty()) return;
+            const ItemDef* d = items.At(cand.def);
+            if (d && d->IsContainer() &&
+                (!cand.Filled() || cand.fillMat == want)) {
+              dst = &cand;
+              ddef = d;
+            }
+          };
+          if (st.intent.vesselSlot >= 0 && st.intent.vesselSlot < kItemSlots)
+            take(hotbar.slots[st.intent.vesselSlot]);
+          for (ItemStack& cand : hotbar.slots) take(cand);
+          for (ItemStack& cand : kit.bag.slots) take(cand);
+          ContainerSettle(s.scoopMemo, lsnap.tick, lsnap.scoopEighths, ddef, dst);
+        }
+      }
+      if (st.intent.vesselSlot >= 0 && st.intent.vesselSlot < kItemSlots) {
+        ItemStack& vs = hotbar.slots[st.intent.vesselSlot];
+        const ItemDef* vdef = vs.Empty() ? nullptr : items.At(vs.def);
+        const WorldSnapshot& vsnap = world.Snap();
+        const Vec3 eye = player.EyePos();
+        const Vec3 fwd = cam.Forward();
+        auto say = [&](const char* why) {
+          if (!why || !*why) return;
+          ui.kitMessage = why;
+          ui.kitMessageAge = 0.0f;
+        };
+        if (vdef && vdef->IsContainer() && ti.Held(TB_ALT)) {
+          const char* why = nullptr;
+          if (!vsnap.valid || vsnap.pick[0] == 0) {
+            why = "there is nothing there to scoop";
+          } else {
+            const IVec3 hit{(int)vsnap.pick[2], (int)vsnap.pick[3],
+                            (int)vsnap.pick[4]};
+            const Vec3 hc{hit.x + 0.5f, hit.y + 0.5f, hit.z + 0.5f};
+            // Arm's reach plus the vessel's own pour range: you scoop where
+            // you could pour, and no further.
+            if ((hc - eye).len() > vdef->container.pourRange + MetresToCells(1.0f)) {
+              why = "too far away";
+            } else if (!ContainerIsolateOne(hotbar.slots, kItemSlots,
+                                            st.intent.vesselSlot, kit.bag.slots,
+                                            Bag::kSlots)) {
+              why = "no room to set the others down";
+            } else {
+              ContainerScoop(*vdef, vs, hit,
+                             [&](IVec3 c, uint32_t& wd) {
+                               return ContainerSnapWord(world, c, wd);
+                             },
+                             world, mats, cellOps, &why, &s.scoopMemo,
+                             OpLandingTick(w, tick));
+              if (!ti.Pressed(TB_ALT)) why = nullptr;
+            }
+          }
+          if (ti.Pressed(TB_ALT)) say(why);
+        }
+        if (vdef && vdef->IsContainer() && ti.Held(TB_ATTACK) && !ti.Held(TB_ALT)) {
+          if (!vs.Filled()) {
+            if (ti.Pressed(TB_ATTACK)) say("it is empty");
+          } else {
+            // From just in front of and below the eye: roughly where a hand
+            // holding something out would tip it. Aimed at the empty cell in
+            // front of what the crosshair touches, else straight out to the
+            // vessel's range.
+            const Vec3 mouth = eye + fwd * MetresToCells(0.35f) -
+                               Vec3{0, MetresToCells(0.15f), 0};
+            Vec3 target = eye + fwd * vdef->container.pourRange;
+            if (vsnap.valid && vsnap.pick[0] != 0)
+              target = {vsnap.pick[5] + 0.5f, vsnap.pick[6] + 0.5f,
+                        vsnap.pick[7] + 0.5f};
+            // ...unless a BODY is in front of that: the grid pick cannot see
+            // a creature, and pouring on one is half of what this is for.
+            // Your own limbs (and the flask in your fist) are not a target.
+            {
+              std::vector<uint64_t> own;
+              avatar.AppendLiveLimbBodies(own);
+              float frac = 1.0f;
+              const float range = vdef->container.pourRange;
+              const uint64_t hb = phys.CastRayBody(eye, fwd, range, frac, own);
+              if (hb != 0 && frac * range < (target - eye).len())
+                target = eye + fwd * (frac * range);
+            }
+            if (world.CellInWindow({ifloor(mouth.x), ifloor(mouth.y),
+                                    ifloor(mouth.z)})) {
+              SplatterEvent splat;
+              const int poured = ContainerPour(
+                  *vdef, vs, mouth, target, CurrentTuning().sim.partGravity,
+                  tick, 0x0F1A5Cu ^ (uint32_t)st.intent.vesselSlot, spawns,
+                  &splat);
+              if (poured > 0) {
+                splat.sourceMob = avatar.Spawned() ? avatar.Id() : 0;
+                mobs.QueueSplatter(splat);
+              }
+            }
+          }
+        }
+      }
+
       BrushOp op;
       if (brushActive && ti.Held(TB_ATTACK) &&
           brush.BuildOp(world.Snap(), player.EyePos(), cam.Forward(), false, op))
@@ -1622,7 +1735,14 @@ static void PhaseI(TickAuthorityCtx& w, WorldScratch& ws,
             // BEFORE melee.Update, not after: the arm read below needs the item
             // in the hand to know WHICH arm is the weapon arm, and the tick the
             // player selects the blade and clicks can be the same tick.
-            const ItemDef* want = meleeArmed ? heldItem : nullptr;
+            // A VESSEL in the hands is held the same way, through the same
+            // borrowed rig slot: the flask is a real part of the arm while
+            // you hold it (game/container.h).
+            const ItemDef* vesselDef = nullptr;
+            if (st.intent.vesselSlot >= 0 && st.intent.vesselSlot < kItemSlots &&
+                !hotbar.slots[st.intent.vesselSlot].Empty())
+              vesselDef = items.At(hotbar.slots[st.intent.vesselSlot].def);
+            const ItemDef* want = meleeArmed ? heldItem : vesselDef;
             const std::string wantName = want ? want->name : std::string();
             if (avatar.HeldItem() != wantName) avatar.EquipItem(want);
             // WHERE THE BLADE IS, so taking control of it is not a teleport:
@@ -2235,6 +2355,38 @@ static void PhaseI(TickAuthorityCtx& w, WorldScratch& ws,
                                          &selfAt, &bodyProbe);
             caster.lastOutcome = res.outcome;
             if (res.outcome != CastOutcome::Nothing) caster.Clear(glyphs);
+          }
+        }
+        // THE SAME CLICK WITH A VESSEL (game/container.h): what is in the
+        // selected hotbar flask goes onto that part -- a coat, and whatever
+        // the material's `coat.effects` say a remedy does (MobSystem::
+        // DouseLimb). Consumed like the cast latch: one-shot, cleared even
+        // when it cannot apply.
+        const int applyPart = s.applyAtPartQueued;
+        s.applyAtPartQueued = -1;
+        if (applyPart >= 0 && avatar.Spawned()) {
+          ItemStack& vs = hotbar.slots[hotbar.selected];
+          const ItemDef* vdef = vs.Empty() ? nullptr : items.At(vs.def);
+          int part = -1;
+          if (const MobDef* def = avatar.Def())
+            for (int i = 0; i < (int)def->limbs.size(); i++)
+              if (BodySlotFor(avatar.PartName(i), avatar.PartTag(i)) == applyPart &&
+                  avatar.PartAlive(i))
+                part = i;
+          if (vdef && vdef->IsContainer() && vs.Filled() && part >= 0) {
+            const uint32_t mat = vs.fillMat;
+            const int spent = ContainerSpend(vs, vdef->container.applyCells);
+            // Coat amount from what was spent: the default four cells land
+            // half-soaked (8/15); a dribble still leaves a mark.
+            const uint32_t amt = (uint32_t)std::clamp(spent / 4, 1, 15);
+            const uint32_t did = mobs.DouseLimb(avatar.Id(), part, mat, amt, tick);
+            std::string msg = "you pour " +
+                              (mat < mats.size() ? mats[mat].name : std::string("it")) +
+                              " over your " + avatar.PartName(part);
+            if (did & MobSystem::kRemedyStanch) msg += "; the bleeding stops";
+            if (did & MobSystem::kRemedyDisinfect) msg += "; the rot stops spreading";
+            ui.kitMessage = msg;
+            ui.kitMessageAge = 0.0f;
           }
         }
         if (castNow && !caster.stack.Empty()) {

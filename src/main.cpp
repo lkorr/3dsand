@@ -9527,8 +9527,10 @@ int main(int argc, char** argv) {
         // registry carries the word because the art cannot: a dyed garment is
         // painted in neutral greys, so a pickup that forgot the dye would hand
         // back a grey tunic with nothing anywhere to say it had ever been red.
-        int where = di >= 0 ? kit.bag.Add(di, 1, w->dye) : -1;
-        if (where < 0 && di >= 0) where = hotbar.Add(di, 1, w->dye);
+        // ...holding what it held when it went down (WorldItem::fill).
+        const uint16_t fm = ItemFillMat(w->fill), fa = ItemFillAmt(w->fill);
+        int where = di >= 0 ? kit.bag.Add(di, 1, w->dye, fm, fa) : -1;
+        if (where < 0 && di >= 0) where = hotbar.Add(di, 1, w->dye, fm, fa);
         if (where >= 0) {
           ui.kitMessage = "picked up " + w->item;
           // Order matters: the registry entry is dropped by the release hook
@@ -10050,22 +10052,32 @@ int main(int argc, char** argv) {
           // (game/dye.h): dropping it here would bleach every coloured garment
           // the player owns on every R, which reads as a rendering bug rather
           // than as the data loss it is.
+          // ...and WHAT A VESSEL HOLDS (game/container.h), for the dye's
+          // reason: an R that forgot it would empty every flask you carry.
           struct KitSnap {
             std::string name;
             int count = 0;
             uint32_t dye = 0;
+            uint16_t fillMat = 0, fillAmt = 0;
           };
           auto snapshot = [&](ItemStack* v, int n,
                               std::vector<KitSnap>& out) {
             out.clear();
             for (int i = 0; i < n; i++)
-              out.push_back({KitItemName(v[i], items), v[i].count, v[i].dye});
+              out.push_back({KitItemName(v[i], items), v[i].count, v[i].dye,
+                             v[i].fillMat, v[i].fillAmt});
           };
           auto restore = [&](ItemStack* v, int n,
                              const std::vector<KitSnap>& in) {
             for (int i = 0; i < n && i < (int)in.size(); i++) {
-              const ItemStack s = KitItemFromName(in[i].name, in[i].count,
-                                                  items, in[i].dye);
+              ItemStack s = KitItemFromName(in[i].name, in[i].count,
+                                            items, in[i].dye);
+              if (const ItemDef* d = s.Empty() ? nullptr : items.At(s.def);
+                  d && d->IsContainer() && in[i].fillAmt > 0) {
+                s.fillMat = in[i].fillMat;
+                s.fillAmt = (uint16_t)std::min<int>(in[i].fillAmt,
+                                                    d->container.capacity);
+              }
               if (!in[i].name.empty() && s.Empty())
                 std::fprintf(stderr,
                              "items reload: \"%s\" is gone; slot emptied\n",
@@ -10502,8 +10514,21 @@ int main(int argc, char** argv) {
     // NPC draw asks). Lose both hands and the compass stops resolving on its
     // own; author a creature with claws instead of fists and nothing here
     // changes.
+    // ---- ...OR A VESSEL (game/container.h) ---------------------------------
+    //
+    // The melee tool is the hands. With nothing drawn and a flask or pouch
+    // selected in the hotbar, the hands hold THAT: RMB scoops, LMB pours, and
+    // the unarmed compass below stays off -- a fist round a flask does not
+    // punch.
+    const int vesselSlot = [&] {
+      if (ui.tool != UIState::kToolMelee || ui.magicMode || heldItem) return -1;
+      const ItemStack& hs = hotbar.Selected();
+      const ItemDef* d = hs.Empty() ? nullptr : items.At(hs.def);
+      return d && d->IsContainer() ? hotbar.selected : -1;
+    }();
     const bool meleeUnarmed = [&] {
       if (ui.tool != UIState::kToolMelee || ui.magicMode) return false;
+      if (vesselSlot >= 0) return false;
       if (heldItem != nullptr || !avatar.Spawned()) return false;
       const StyleLibrary& lib = mobs.AttackStyles();
       if (!lib.playerUnarmed.Usable()) return false;
@@ -10771,7 +10796,8 @@ int main(int argc, char** argv) {
       }
 
       TickAuthority(tickCtx, session,
-                    FrameIntent{brushActive, meleeArmed, meleeReady, heldItem},
+                    FrameIntent{brushActive, meleeArmed, meleeReady, heldItem,
+                                vesselSlot},
                     ti, tick, opBatch);
 
       // ---- M9.3-B: THE SMOKE'S AUTHOR ------------------------------------
@@ -11610,9 +11636,29 @@ int main(int argc, char** argv) {
       for (int i = 0; i < kItemSlots; i++) {
         const ItemDef* d = items.At(hotbar.slots[i].Empty() ? -1
                                                             : hotbar.slots[i].def);
-        ui.itemNames.push_back(d ? d->name : "");
+        // A vessel says what is in it, right on the strip: the only way to
+        // know how much is left while pouring.
+        if (d && d->IsContainer())
+          ui.itemNames.push_back(d->name + " (" +
+                                 ContainerFillText(*d, hotbar.slots[i], mats) + ")");
+        else
+          ui.itemNames.push_back(d ? d->name : "");
       }
       ui.itemSelected = hotbar.selected;
+      // The health panel's pour-on-a-part targets (inventory_ui.cpp
+      // InspectApplyPicks): live only while the selected slot is a FILLED
+      // vessel, tinted with the substance's own colour.
+      {
+        const ItemStack& hs = hotbar.Selected();
+        const ItemDef* hd = hs.Empty() ? nullptr : items.At(hs.def);
+        ui.applyText.clear();
+        ui.applyColor = 0;
+        if (hd && hd->IsContainer() && hs.Filled() && hs.fillMat < mats.size()) {
+          ui.applyText = ContainerFillText(*hd, hs, mats);
+          const uint32_t c = mats[hs.fillMat].gpu.color0;
+          ui.applyColor = 0xFF000000u | (c & 0x00FFFFFFu);
+        }
+      }
       switch (melee.Phase()) {
         case SwingPhase::Idle:    ui.swingPhase = meleeReady ? "ready" : ""; break;
         case SwingPhase::Guard:   ui.swingPhase = "guard"; break;
@@ -11979,7 +12025,8 @@ int main(int argc, char** argv) {
           const Vec3 at = player.EyePos() + cam.Forward() * 2.0f;
           const Vec3 vel = cam.Forward() * 4.0f + player.vel;
           if (DropItemToWorld(*def, at, vel, phys, debris, &mbSet, ground,
-                              nullptr, src->dye)) {
+                              nullptr, src->dye,
+                              PackItemFill(src->fillMat, src->fillAmt))) {
             // ONE of the stack. Dropping a count you did not mean to is the
             // mis-click this system's swap-never-overwrite rule exists to
             // prevent, and it applies here too.
@@ -11994,6 +12041,10 @@ int main(int argc, char** argv) {
       if (ui.castAtPart.pending) {
         ui.castAtPart.pending = false;
         castAtPartQueued = ui.castAtPart.slot;
+      }
+      if (ui.applyAtPart.pending) {
+        ui.applyAtPart.pending = false;
+        session.applyAtPartQueued = ui.applyAtPart.slot;
       }
       if (ui.bindGlyph.pending) {
         ui.bindGlyph.pending = false;
@@ -12279,6 +12330,13 @@ int main(int argc, char** argv) {
                           d->strike.cut, d->reach,
                           d->hasEdge ? "\ncuts along its own edge" : "");
             u.tip = tip;
+          } else if (d->IsContainer()) {
+            // What is in it, and the two buttons -- the vessel has no other
+            // stat, and nothing else on screen says how to use one.
+            u.tip = ContainerFillText(*d, st, mats) +
+                    "\nhands up (melee tool), selected in the hotbar:"
+                    "\nRMB scoops, LMB pours where you look"
+                    "\nhealth panel: click a limb to pour it there";
           }
           return u;
         };

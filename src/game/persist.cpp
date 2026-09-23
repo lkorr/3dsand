@@ -1,5 +1,6 @@
 #include "game/persist.h"
 
+#include <algorithm>
 #include <cstdio>
 #include <cstring>
 #include <string>
@@ -184,6 +185,26 @@ void SavePlayerKitBytes(const PlayerKitRefs& r, std::vector<uint8_t>& out, uint3
   putDyes(r.hotbar->slots, kItemSlots);
   putDyes(r.kit->bag.slots, Bag::kSlots);
   putDyes(r.kit->equip.slots, kEquipSlotCount);
+  if (version < 6) return;
+
+  // ---- v6: what the vessels hold (game/container.h) --------------------------
+  //
+  //   u32 hotbarCount  then per slot: u32 fill (PackItemFill: mat | eighths<<16)
+  //   u32 bagCount     then per slot: u32 fill
+  //   u32 equipCount   then per slot: u32 fill
+  //
+  // The dyes' parallel-array shape, for the dyes' reason. The material is an
+  // ID, not a name, because the grid this came out of is saved by id too: a
+  // content change that renumbers materials has already repainted the world,
+  // and a flask that kept its old name would be the one thing that disagreed.
+  auto putFills = [&](const ItemStack* v, int n) {
+    PutU32(out, (uint32_t)n);
+    for (int i = 0; i < n; i++)
+      PutU32(out, v[i].Empty() ? 0u : PackItemFill(v[i].fillMat, v[i].fillAmt));
+  };
+  putFills(r.hotbar->slots, kItemSlots);
+  putFills(r.kit->bag.slots, Bag::kSlots);
+  putFills(r.kit->equip.slots, kEquipSlotCount);
 }
 
 bool LoadPlayerKit(const PlayerKitRefs& r, const uint8_t* data, size_t len,
@@ -330,6 +351,27 @@ bool LoadPlayerKit(const PlayerKitRefs& r, const uint8_t* data, size_t len,
     getDyes(r.kit->bag.slots, Bag::kSlots);
     getDyes(r.kit->equip.slots, kEquipSlotCount);
   }
+  // ---- v6: vessel contents ---------------------------------------------------
+  // Only onto a slot that resolved to a VESSEL: contents on anything else are
+  // matter attached to nothing, and would make that stack refuse to merge.
+  if (version >= 6) {
+    auto getFills = [&](ItemStack* v, int n) {
+      const uint32_t count = rd.U32();
+      for (uint32_t i = 0; i < count && rd.ok; i++) {
+        const uint32_t f = rd.U32();
+        if (!rd.ok || (int)i >= n || v[i].Empty()) continue;
+        const ItemDef* d = r.items->At(v[i].def);
+        if (!d || !d->IsContainer()) continue;
+        v[i].fillMat = ItemFillMat(f);
+        v[i].fillAmt = (uint16_t)std::min<int>(ItemFillAmt(f),
+                                               d->container.capacity);
+        if (v[i].fillAmt == 0) v[i].fillMat = 0;
+      }
+    };
+    getFills(r.hotbar->slots, kItemSlots);
+    getFills(r.kit->bag.slots, Bag::kSlots);
+    getFills(r.kit->equip.slots, kEquipSlotCount);
+  }
   if (dropped > 0)
     std::fprintf(stderr,
                  "PLYR: %d saved entries name content that no longer exists; "
@@ -368,6 +410,8 @@ void SaveWorldItems(const WorldItemRefs& r, std::vector<uint8_t>& out) {
     // a dropped blue one share a name and a lattice, and the word is not
     // recoverable from either.
     PutU32(out, w.dye);
+    // v3: what a dropped vessel holds (WorldItem::fill).
+    PutU32(out, w.fill);
     BodyTransform xf{};
     r.phys->GetTransform(w.body, xf);
     PutF32(out, xf.pos.x);
@@ -413,6 +457,7 @@ bool LoadWorldItems(const WorldItemRefs& r, const uint8_t* data, size_t len,
   for (uint32_t i = 0; i < n && rd.ok; i++) {
     const std::string name = rd.Str();
     const uint32_t dye = version >= 2 ? rd.U32() : 0u;
+    const uint32_t fill = version >= 3 ? rd.U32() : 0u;
     const uint32_t bx = rd.U32(), by = rd.U32(), bz = rd.U32();
     if (!rd.ok) break;
     Vec3 at{};
@@ -446,7 +491,7 @@ bool LoadWorldItems(const WorldItemRefs& r, const uint8_t* data, size_t len,
       continue;
     }
     DropItemToWorld(*d, at, Vec3{}, *r.phys, *r.debris, r.micro, *r.reg,
-                    lat.empty() ? nullptr : &lat, dye);
+                    lat.empty() ? nullptr : &lat, dye, fill);
   }
   if (dropped > 0)
     std::fprintf(stderr,

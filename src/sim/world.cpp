@@ -834,6 +834,9 @@ void World::KickReadback() {
         std::memcpy(out.chunkHash.data(), p + kChunkHashOff, kChunkHashBytes);
         out.chunkHashTick = out.chunkHash[kChunkHashTickWord];
         std::memcpy(&out.pageFaults, p + kPageFaultOff, 4);
+        std::memcpy(&out.scoopEighths, p + kPageFaultOff + kPageFaultScoopEighths * 4, 4);
+        std::memcpy(&out.scoopApplied, p + kPageFaultOff + kPageFaultScoopApplied * 4, 4);
+        std::memcpy(&out.scoopRefused, p + kPageFaultOff + kPageFaultScoopRefused * 4, 4);
         std::memcpy(out.pick, b + kPickOff, 32);
         uint32_t pcounts[2];
         std::memcpy(pcounts, b + kPCountOff, 8);
