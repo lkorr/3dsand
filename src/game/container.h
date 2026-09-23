@@ -129,22 +129,34 @@ int ContainerScoop(const ItemDef& def, ItemStack& st, IVec3 hit,
 int ContainerSettle(ContainerScoopMemo& memo, uint32_t snapTick, uint32_t ledger,
                     const ItemDef* def, ItemStack* st);
 
-// POUR: throw up to `spec.pourPerTick` cells from `mouth` so they come down on
-// `target` (world voxels, a point), charging `st`. Particles are appended to
-// `spawns`; `splat`, when given and anything left the vessel, is filled with
-// the matching SplatterEvent (the caller queues it and sets sourceMob).
-// `partGravity` is sim.partGravity (24.8 fixed voxels/tick^2), the number the
-// kernel integrates with, so the arc solved here is the arc it flies.
-int ContainerPour(const ItemDef& def, ItemStack& st, Vec3 mouth, Vec3 target,
-                  int partGravity, uint32_t tick, uint32_t seed,
-                  std::vector<ParticleSpawn>& spawns, SplatterEvent* splat);
+// POUR: up to `spec.pourPerTick` cells out of `mouth` (the vessel in the hand),
+// charging `st`. Two ways, and the difference is the owner's report that the
+// first version "flies off at a weird angle instead of appearing slightly in
+// front of the character where they're looking":
+//   * AIMED -- `target` given and within `spec.pourRange`: the stream is
+//     solved to come down ON it (a limb, a cup, the ground at your feet).
+//   * TIPPED -- anything else: out along `fwd` at the vessel's gentle
+//     `pourSpeed` and down under gravity, landing a short way in front. It
+//     used to be solved toward a point `pourRange` along the look line, which
+//     looking at the horizon is a point in mid-AIR -- the stream was lobbed
+//     through it and came down far off, long enough in flight for the wind
+//     (sim.windMode drags every particle) to carry it sideways.
+// Particles are appended to `spawns`; `splat`, when given and anything left
+// the vessel, is filled with the matching SplatterEvent (the caller queues it
+// and sets sourceMob). `partGravity` is sim.partGravity (24.8 fixed
+// voxels/tick^2), the number the kernel integrates with, so the arc solved
+// here is the arc it flies.
+int ContainerPour(const ItemDef& def, ItemStack& st, Vec3 mouth, Vec3 fwd,
+                  const Vec3* target, int partGravity, uint32_t tick,
+                  uint32_t seed, std::vector<ParticleSpawn>& spawns,
+                  SplatterEvent* splat);
 
 // Spend up to `cells` whole cells of contents (the triage "apply to this
 // limb"). Returns the eighths actually spent; empties the fill at zero.
 int ContainerSpend(ItemStack& st, int cells);
 
-// Clamp a pour target to the vessel's reach from `mouth`.
-Vec3 ContainerClampTarget(const ItemDef& def, Vec3 mouth, Vec3 target);
+// Is `target` close enough to AIM at, rather than tip toward?
+bool ContainerInReach(const ItemDef& def, Vec3 mouth, Vec3 target);
 
 // Hotbar stacks of vessels: a stack of N empty flasks cannot all hold the one
 // scoop. Before filling, the rest of the stack moves out to a free hotbar slot,

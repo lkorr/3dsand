@@ -2899,6 +2899,10 @@ constexpr uint32_t kMaxParticleSpawnsPerTick = 4096;
 // note in common.wgsl for why both properties are forced rather than optional.
 constexpr uint32_t kPFlagAlive = 1u;
 constexpr uint32_t kPFlagMicro = 4u;
+// POURED, not thrown: the particle kernel skips the wind drag for it and
+// nothing else (sim_particle.wgsl PFLAG_CALM, which must agree -- it is
+// declared in that shader, its only reader). Set by game/container.h.
+constexpr uint32_t kPFlagCalm = 16384u;
 constexpr uint32_t kPMicroScaleShift = 3, kPMicroScaleMask = 3u;
 constexpr uint32_t kPMicroLifeShift = 5, kPMicroLifeMask = 0xFFu;
 

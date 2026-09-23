@@ -155,8 +155,8 @@
         "capacity": 128,
         "scoopPerTick": 4,
         "pourPerTick": 2,
-        "pourRangeM": 4.0,
-        "pourSpeedMps": 3.0,
+        "pourRangeM": 2.0,
+        "pourSpeedMps": 1.5,
         "applyCells": 4
       },
       "desc": "A stoppered glass flask. Hold the right button over any liquid to fill it, the left to pour it where you are looking. With the health panel open, a click on a limb pours it there -- over a wound, or a burn, or yourself."
@@ -169,8 +169,8 @@
         "capacity": 128,
         "scoopPerTick": 4,
         "pourPerTick": 2,
-        "pourRangeM": 3.0,
-        "pourSpeedMps": 2.5,
+        "pourRangeM": 2.0,
+        "pourSpeedMps": 1.5,
         "applyCells": 4
       },
       "desc": "A drawstring leather pouch for anything that pours but is not wet: sand, ash, dust, seed. Right button to scoop, left to scatter it where you look."

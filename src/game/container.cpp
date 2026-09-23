@@ -194,29 +194,38 @@ int ContainerSettle(ContainerScoopMemo& memo, uint32_t snapTick, uint32_t ledger
   return paid;
 }
 
-Vec3 ContainerClampTarget(const ItemDef& def, Vec3 mouth, Vec3 target) {
-  const Vec3 d = target - mouth;
-  const float len = d.len();
-  const float r = std::max(1.0f, def.container.pourRange);
-  return len > r ? mouth + d * (r / len) : target;
+bool ContainerInReach(const ItemDef& def, Vec3 mouth, Vec3 target) {
+  return (target - mouth).len() <= std::max(1.0f, def.container.pourRange);
 }
 
-int ContainerPour(const ItemDef& def, ItemStack& st, Vec3 mouth, Vec3 target,
-                  int partGravity, uint32_t tick, uint32_t seed,
-                  std::vector<ParticleSpawn>& spawns, SplatterEvent* splat) {
+int ContainerPour(const ItemDef& def, ItemStack& st, Vec3 mouth, Vec3 fwd,
+                  const Vec3* target, int partGravity, uint32_t tick,
+                  uint32_t seed, std::vector<ParticleSpawn>& spawns,
+                  SplatterEvent* splat) {
   if (!def.IsContainer() || !st.Filled()) return 0;
-  target = ContainerClampTarget(def, mouth, target);
-  const Vec3 delta = target - mouth;
-  const float dist = delta.len();
-  // FLIGHT TIME from the vessel's launch speed, in whole ticks, because the
-  // kernel moves a particle once per tick and the arc below is solved in its
-  // own units: after n ticks of `v -= g; p += v` a particle has travelled
-  // n*v0 - g*n(n+1)/2, so v0 = delta/n + g(n+1)/2 lands it on the target.
-  const float speed = std::max(1.0f, def.container.pourSpeed);
-  const int n = std::clamp((int)std::lround(dist / speed * 30.0f), 3, 60);
+  const float speed = std::max(1.0f, def.container.pourSpeed);   // vox/s
   const float gTick = (float)std::max(0, partGravity) / 256.0f;
-  Vec3 v0 = delta * (1.0f / (float)n);
-  v0.y += gTick * (float)(n + 1) * 0.5f;
+  Vec3 v0;
+  int n = 0;        // ticks of flight to the target (aimed) or a guess (tipped)
+  float dist = 0.0f;
+  if (target && ContainerInReach(def, mouth, *target)) {
+    // AIMED. Flight time from the launch speed, in whole ticks, because the
+    // kernel moves a particle once per tick and the arc is solved in its own
+    // units: after n ticks of `v -= g; p += v` a particle has travelled
+    // n*v0 - g*n(n+1)/2, so v0 = delta/n + g(n+1)/2 lands it on the target.
+    const Vec3 delta = *target - mouth;
+    dist = delta.len();
+    n = std::clamp((int)std::lround(dist / speed * 30.0f), 3, 30);
+    v0 = delta * (1.0f / (float)n);
+    v0.y += gTick * (float)(n + 1) * 0.5f;
+  } else {
+    // TIPPED: out along the look at the gentle speed; gravity does the rest.
+    const float fl = fwd.len();
+    const Vec3 dir = fl > 1e-4f ? fwd * (1.0f / fl) : Vec3{0, -1, 0};
+    v0 = dir * (speed / 30.0f);
+    dist = def.container.pourRange;
+    n = 30;
+  }
 
   int poured = 0;
   const uint32_t mat = st.fillMat;
@@ -246,7 +255,8 @@ int ContainerPour(const ItemDef& def, ItemStack& st, Vec3 mouth, Vec3 target,
     // flask come out as one whole cell. That is the one rounding in the
     // system and it is at most 7/8 of a cell per emptying.
     s.payload = (mat & 0xFFFu) | (7u << 12);
-    s.flags = kPFlagAlive;
+    // CALM: a stream, not spray -- the wind does not carry it off.
+    s.flags = kPFlagAlive | kPFlagCalm;
     spawns.push_back(s);
     const int spend = std::min<int>(kContainerUnitsPerCell, st.fillAmt);
     st.fillAmt = (uint16_t)(st.fillAmt - spend);
@@ -262,7 +272,7 @@ int ContainerPour(const ItemDef& def, ItemStack& st, Vec3 mouth, Vec3 target,
     e.cone = 0.04f;
     e.speed = v0.len() * 30.0f;
     e.life = std::clamp(n + 4, 1, 255);
-    e.reach = std::min(tune.gore.splatterReach, dist + 4.0f);
+    e.reach = std::min(tune.gore.splatterReach, std::max(dist, 8.0f) + 4.0f);
     e.count = poured;
     e.mat = mat;
     e.amount = (uint32_t)std::max(1, tune.gore.splatterAmount);

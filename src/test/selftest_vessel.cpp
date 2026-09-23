@@ -247,27 +247,30 @@ Status GateVessel(Ctx& c, std::string& detail) {
   // ---- the pour lands where it is aimed ------------------------------------
   {
     ItemStack st{flaskI, 1, 0, (uint16_t)mBlood, 1024};
-    const Vec3 mouth{(float)base.x, (float)base.y + 20.0f, (float)base.z};
-    const Vec3 target{(float)base.x + 30.0f, (float)base.y, (float)base.z + 10.0f};
+    // Within reach (flask pourRangeM), so this is the AIMED path.
+    const Vec3 mouth{(float)base.x, (float)base.y + 12.0f, (float)base.z};
+    const Vec3 target{(float)base.x + 12.0f, (float)base.y, (float)base.z + 4.0f};
+    check(ContainerInReach(*flask, mouth, target), "the aim fixture is within reach");
     const int g = CurrentTuning().sim.partGravity;
     std::vector<ParticleSpawn> spawns;
     SplatterEvent ev;
-    const int n = ContainerPour(*flask, st, mouth, target, g, 500, 0x1234u,
-                                spawns, &ev);
+    const int n = ContainerPour(*flask, st, mouth, Vec3{1, 0, 0}, &target, g, 500,
+                                0x1234u, spawns, &ev);
     check(n == flask->container.pourPerTick && (int)spawns.size() == n,
           "a pour throws pourPerTick particles");
     check(st.fillAmt == 1024 - n * kContainerUnitsPerCell, "and charges a cell each");
     // Ten more ticks of stream, so the landing is a distribution and not two
     // samples of it.
     for (uint32_t t = 501; t < 511; t++)
-      ContainerPour(*flask, st, mouth, target, g, t, 0x1234u, spawns, nullptr);
+      ContainerPour(*flask, st, mouth, Vec3{1, 0, 0}, &target, g, t, 0x1234u,
+                    spawns, nullptr);
     check(ev.mat == mBlood && ev.count == n && ev.reach > 0.0f,
           "the splatter names the substance poured");
     bool payloadOk = true;
     float worst = 0.0f, sumX = 0.0f, sumZ = 0.0f;
     for (const ParticleSpawn& s : spawns) {
       payloadOk = payloadOk && (s.payload & 0xFFFu) == mBlood &&
-                  (s.flags & kPFlagMicro) == 0;
+                  (s.flags & kPFlagMicro) == 0 && (s.flags & kPFlagCalm) != 0;
       // Fly it the kernel's way, in 24.8 fixed, until it drops through the
       // target's height; measure the miss there.
       int64_t px = s.px, py = s.py, pz = s.pz, vx = s.vx, vy = s.vy, vz = s.vz;
@@ -283,7 +286,7 @@ Status GateVessel(Ctx& c, std::string& detail) {
       sumX += ex;
       sumZ += ez;
     }
-    check(payloadOk, "poured particles are grid matter, not spray");
+    check(payloadOk, "poured particles are grid matter, not spray, and calm");
     // TWO claims: the stream is AIMED at the target (its centre lands within
     // half a cell -- the arc solve), and it is a stream rather than a spray
     // (no particle further out than the authored jitter can put it). The
@@ -301,10 +304,36 @@ Status GateVessel(Ctx& c, std::string& detail) {
                   worst, spread);
     check(worst < spread, b);
     RecordObserved("vesselPourCentreMiss", (double)centre);
-    // A target past the vessel's reach is pulled in to it.
-    const Vec3 far = ContainerClampTarget(*flask, mouth, mouth + Vec3{1000, 0, 0});
-    check(std::fabs((far - mouth).len() - flask->container.pourRange) < 0.01f,
-          "a pour target is clamped to the vessel's reach");
+    // OUT OF REACH -> TIPPED, not lobbed: looking at the horizon, the stream
+    // leaves along the look at the gentle speed and lands a short way in
+    // front -- the owner's report was a stream solved toward a point in
+    // mid-air, which came down far off at an angle.
+    {
+      ItemStack tip{flaskI, 1, 0, (uint16_t)mWater, 64};
+      std::vector<ParticleSpawn> ts;
+      const Vec3 far = mouth + Vec3{1000, 0, 0};
+      ContainerPour(*flask, tip, mouth, Vec3{1, 0, 0}, &far, g, 600, 0x99u, ts,
+                    nullptr);
+      float worstLand = 0.0f;
+      bool forward = !ts.empty();
+      for (const ParticleSpawn& sp : ts) {
+        int64_t px = sp.px, py = sp.py, pz = sp.pz, vx = sp.vx, vy = sp.vy, vz = sp.vz;
+        for (int t = 0; t < 400 && py > (int64_t)base.y * 256; t++) {
+          vy -= g;
+          px += vx;
+          py += vy;
+          pz += vz;
+        }
+        const float dx = px / 256.0f - mouth.x;
+        forward = forward && dx > 0.0f;
+        worstLand = std::max(worstLand, dx);
+      }
+      char tb[128];
+      std::snprintf(tb, sizeof tb,
+                    "a pour past reach is tipped: lands %.1f cells ahead from %.0f up "
+                    "(bound %.1f)", worstLand, 12.0f, flask->container.pourRange);
+      check(forward && worstLand < flask->container.pourRange, tb);
+    }
   }
 
   // ---- stacks --------------------------------------------------------------
@@ -443,6 +472,23 @@ Status GateVesselGrid(Ctx& c, std::string& detail) {
     ~Restore() { SetCurrentTuning(t); }
   } restore{savedTuning};
 
+  // A CLEAN WINDOW FIRST. Gates share one World (selftest.cpp kOrder), and
+  // measured in one process after `determinism` this fixture read a starting
+  // pool of 8,142 eighths and 3,200 live particles that were not its own --
+  // the count below is the whole 3x3x3 box plus the WORLD's MPM population.
+  // Standalone it read 144. So: regenerate, then empty both particle
+  // populations the way the dev panel's "clear fluid" does (the MPM live word)
+  // and the harness does at a tick's head (the ballistic count pages).
+  SubmitWorldgen(c.ctx, c.world, c.sim, kDefaultSeed);
+  c.ctx.WaitIdle();
+  {
+    const uint32_t zeros[2] = {0u, 0u};
+    c.ctx.queue.WriteBuffer(c.world.particleCounts, 0, zeros, sizeof zeros);
+    const uint32_t zero = 0u;
+    c.ctx.queue.WriteBuffer(c.world.fluidArgsStage, 7 * 4, &zero, 4);
+    c.ctx.WaitIdle();
+  }
+
   // High in the window: sky, so nothing the terrain does reaches the basin.
   const IVec3 o = c.world.WindowOrigin();
   const IVec3 base{o.x * (int)kChunk + (int)kWorldN / 2 + 8,
@@ -554,8 +600,8 @@ Status GateVesselGrid(Ctx& c, std::string& detail) {
   const Vec3 target{base.x + 0.5f, base.y + 0.5f, base.z + 0.5f};
   for (int i = 0; i < 200 && st.Filled(); i++) {
     std::vector<ParticleSpawn> spawns;
-    ContainerPour(*flask, st, mouth, target, CurrentTuning().sim.partGravity, tick,
-                  0x77u, spawns, nullptr);
+    ContainerPour(*flask, st, mouth, Vec3{0, -1, 0}, &target,
+                  CurrentTuning().sim.partGravity, tick, 0x77u, spawns, nullptr);
     step({}, spawns);
   }
   // The landing, over time: a count that PEAKS and then falls is the liquid

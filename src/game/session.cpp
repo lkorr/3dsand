@@ -1495,16 +1495,27 @@ static void PhaseG(TickAuthorityCtx& w, WorldScratch& ws,
           if (!vs.Filled()) {
             if (ti.Pressed(TB_ATTACK)) say("it is empty");
           } else {
-            // From just in front of and below the eye: roughly where a hand
-            // holding something out would tip it. Aimed at the empty cell in
-            // front of what the crosshair touches, else straight out to the
-            // vessel's range.
-            const Vec3 mouth = eye + fwd * MetresToCells(0.35f) -
-                               Vec3{0, MetresToCells(0.15f), 0};
-            Vec3 target = eye + fwd * vdef->container.pourRange;
-            if (vsnap.valid && vsnap.pick[0] != 0)
+            // OUT OF THE FLASK: the held rig part when there is one, so the
+            // water visibly leaves the thing in your hand; else just in
+            // front of and below the eye (fly mode, no body).
+            Vec3 mouth = eye + fwd * MetresToCells(0.35f) -
+                         Vec3{0, MetresToCells(0.15f), 0};
+            {
+              Vec3 hp;
+              Quat hq;
+              const int hs = avatar.Spawned() ? avatar.HeldSlot() : -1;
+              if (hs >= 0 && avatar.PartWorldTransform(hs, hp, hq))
+                mouth = hp + Vec3{0, MetresToCells(0.08f), 0};
+            }
+            // AIMED if what the crosshair touches is within the vessel's
+            // reach, TIPPED along the look otherwise (ContainerPour).
+            bool aimed = false;
+            Vec3 target{};
+            if (vsnap.valid && vsnap.pick[0] != 0) {
               target = {vsnap.pick[5] + 0.5f, vsnap.pick[6] + 0.5f,
                         vsnap.pick[7] + 0.5f};
+              aimed = true;
+            }
             // ...unless a BODY is in front of that: the grid pick cannot see
             // a creature, and pouring on one is half of what this is for.
             // Your own limbs (and the flask in your fist) are not a target.
@@ -1514,16 +1525,18 @@ static void PhaseG(TickAuthorityCtx& w, WorldScratch& ws,
               float frac = 1.0f;
               const float range = vdef->container.pourRange;
               const uint64_t hb = phys.CastRayBody(eye, fwd, range, frac, own);
-              if (hb != 0 && frac * range < (target - eye).len())
+              if (hb != 0 && (!aimed || frac * range < (target - eye).len())) {
                 target = eye + fwd * (frac * range);
+                aimed = true;
+              }
             }
             if (world.CellInWindow({ifloor(mouth.x), ifloor(mouth.y),
                                     ifloor(mouth.z)})) {
               SplatterEvent splat;
               const int poured = ContainerPour(
-                  *vdef, vs, mouth, target, CurrentTuning().sim.partGravity,
-                  tick, 0x0F1A5Cu ^ (uint32_t)st.intent.vesselSlot, spawns,
-                  &splat);
+                  *vdef, vs, mouth, fwd, aimed ? &target : nullptr,
+                  CurrentTuning().sim.partGravity, tick,
+                  0x0F1A5Cu ^ (uint32_t)st.intent.vesselSlot, spawns, &splat);
               if (poured > 0) {
                 splat.sourceMob = avatar.Spawned() ? avatar.Id() : 0;
                 mobs.QueueSplatter(splat);

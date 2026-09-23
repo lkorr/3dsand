@@ -2076,6 +2076,15 @@ def check_scoop_ledger():
         if a.group(1) != b.group(1):
             problems.append(f"scoop ledger: world.h {cpp} = {a.group(1)} but "
                             f"sim_mutate.wgsl {wgsl} = {b.group(1)}")
+    # ...and the poured-particle bit, same shape: world.h <-> sim_particle.wgsl.
+    sp = read("assets/shaders/sim_particle.wgsl")
+    a = re.search(r"constexpr\s+uint32_t\s+kPFlagCalm\s*=\s*(\d+)u", wh)
+    b = re.search(r"const\s+PFLAG_CALM\s*:\s*u32\s*=\s*(\d+)u", sp or "")
+    if not a or not b:
+        problems.append("calm flag: kPFlagCalm / PFLAG_CALM not found")
+    elif a.group(1) != b.group(1):
+        problems.append(f"calm flag: world.h kPFlagCalm = {a.group(1)} but "
+                        f"sim_particle.wgsl PFLAG_CALM = {b.group(1)}")
     w = re.search(r"constexpr\s+uint32_t\s+kPageFaultWords\s*=\s*(\d+)", wh)
     e = re.search(r"constexpr\s+uint32_t\s+kPageFaultScoopRefused\s*=\s*(\d+)", wh)
     if w and e and int(e.group(1)) >= int(w.group(1)):
@@ -2135,6 +2144,7 @@ RELEVANT = {
     # ONE entry per file: a duplicate key in a dict literal silently replaces
     # the earlier one, and world.h / perfnodes.h each had two until 2026-09-19.
     "assets/shaders/sim_mutate.wgsl": ["scoop"],
+    "assets/shaders/sim_particle.wgsl": ["scoop"],
     "src/sim/world.h": ["scoop", "world", "params", "substeps", "windprim",
                         "curprim", "waterledger", "ringdepth", "matids"],
     "src/test/selftest_water.cpp": ["waterledger"],
