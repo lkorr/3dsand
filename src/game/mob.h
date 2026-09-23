@@ -3,6 +3,7 @@
 #include <cstdint>
 #include <functional>
 #include <map>
+#include <memory>
 #include <span>
 #include <string>
 #include <vector>
@@ -1677,7 +1678,34 @@ class Mob {
   // save has no use for them and widening the format would move the world
   // hash for a network feature. The handoff carries all three beside the
   // record (net/mobsync.h).
+  //
+  // The one-argument form writes the CURRENT format (MobSystem::kSaveVersion);
+  // the two-argument form writes any version this build can still READ
+  // (kSaveVersionMin..kSaveVersion), which is how the `mob-save-delta` gate
+  // manufactures an old-format record to prove it still loads.
   void SaveOne(ByteWriter& w) const;
+  void SaveOne(ByteWriter& w, uint32_t version) const;
+  // ---- IS THIS LIMB EXACTLY WHAT ITS DEF AUTHORED? (MOBS v4) ----------------
+  //
+  // True when body limb `i` is attached and its collider lattice, skin
+  // lattice, collider box, rest offset and both joint anchors all equal the
+  // def's authored limb FIELD FOR FIELD — the reference is built by the same
+  // function BuildRig builds a fresh limb with (MobSystem::PristineOf), so
+  // "pristine" means "a load's Spawn would put back these exact bytes".
+  //
+  // PROVEN BY CONTENT, NOT BY A DIRTY BIT. A limb's lattice is written by
+  // carving (CarveLimb and its spall/split/collider re-derive), burning and
+  // charring, rot and infection, blood coats and wound soaks and their decay,
+  // turn-tint recolouring, and the rise/limb-swap overlays — over a dozen
+  // writers that edit single voxels in place. A bit that every one of them had
+  // to remember to set would be exactly one forgotten writer away from a save
+  // that silently heals a wound; a comparison cannot be forgotten. It costs a
+  // pass over the limb at SAVE time only, and the early outs (count, box,
+  // offsets) reject nearly every damaged limb before the voxel loop.
+  //
+  // False for appended slots (worn shells, a held item): they have no def limb
+  // to be pristine against, and always store their lattice.
+  bool LimbIsPristine(size_t i) const;
 
   // ---- LIVE RAGDOLL: limp, then back on its feet (sim/tuning.h Ragdoll) -----
   //
@@ -4418,7 +4446,38 @@ class MobSystem {
   // skip what it does not know is there, so the bump is real and the refusal
   // stays a refusal. THE HANDOFF PACKET MOVES WITH IT (see below): both sides
   // of a session must be the same build, which they already had to be.
-  static constexpr uint32_t kSaveVersion = 3;
+  //
+  // 4 (2026-09-23, save plan S5a): A WHOLE BODY SAVES AS ITS NAME. Each limb
+  // record now opens with a KIND word — 0 severed, 1 attached and pristine,
+  // 2 attached and stored — then hp and the transform; only kind 2 carries the
+  // rig offsets, box and both lattices. Pristine is Mob::LimbIsPristine (a
+  // field-for-field comparison against the def's authored limb), so an
+  // untouched human costs a few hundred bytes instead of its whole skin, and
+  // a severed limb stores nothing because its matter is DBRS's. Version 3
+  // still LOADS (kSaveVersionMin) under its own overlay rule; a stored v4
+  // lattice is applied whenever it differs from the rig — the record only
+  // stores what differs, so a stain-only coat now survives a load, where the
+  // v3 count test dropped it.
+  static constexpr uint32_t kSaveVersion = 4;
+  static constexpr uint32_t kSaveVersionMin = 3;
+  // Record limb kinds (v4).
+  static constexpr uint32_t kLimbSevered = 0;
+  static constexpr uint32_t kLimbPristine = 1;
+  static constexpr uint32_t kLimbStored = 2;
+  // ---- THE PRISTINE REFERENCE --------------------------------------------
+  // One def limb exactly as BuildRig authors it (BuildAuthoredLattice + the
+  // rig's anchor). Built lazily per def on the first save that asks, cached
+  // for the def's life, dropped by SetDefs (defs are immutable in between:
+  // the only other writer is FindOrComposeDef's reserved append). Derived
+  // data — never saved.
+  struct PristineLimb {
+    std::vector<DebrisVoxel> voxels;
+    std::vector<PrefabVoxel> skinVoxels;
+    IVec3 size{};
+    Vec3 restOffset{}, anchorRoot{}, anchorLimb{};
+  };
+  // Null when `defIndex`/`limb` name no authored limb.
+  const PristineLimb* PristineOf(int defIndex, size_t limb) const;
   void SaveState(std::vector<uint8_t>& out) const;
   // Contract (worldio LoadEntities): Reset() has already run.
   bool LoadState(const uint8_t* data, size_t len, uint32_t version);
@@ -5548,7 +5607,10 @@ class MobSystem {
   // there — rebuilding it would throw away its Jolt bodies and bricks and
   // flicker the body for nothing.
   struct MobRecord;
-  static bool ReadMobRecord(ByteReader& r, MobRecord& out);
+  static bool ReadMobRecord(ByteReader& r, MobRecord& out, uint32_t version);
+  // PristineOf's cache: one entry per def index, built on demand.
+  mutable std::vector<std::shared_ptr<const std::vector<PristineLimb>>>
+      pristine_;
   // `placeLimbs` puts each limb back on the TRANSFORM the record carries
   // (and moves its Jolt body to match). The handoff wants it — a creature
   // that changed hands must not visibly snap to a rest pose for one tick —
