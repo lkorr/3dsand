@@ -20,6 +20,7 @@
 #include "game/corpses.h"
 #include "game/equipment.h"
 #include "game/item.h"
+#include "game/persist.h"
 #include "game/thirdperson.h"
 #include "game/brush.h"
 #include "game/anatomy_resolve.h"
@@ -9704,6 +9705,385 @@ Status GateMobSaveDelta(Ctx& c, std::string& detail) {
   return okA && okB && okC && okD ? Status::Pass : Status::Fail;
 }
 
+// ---- mob-park --------------------------------------------------------------
+//
+// NPCs OUTLIVE THE WINDOW (docs/PLAN_save_system.md S5b, persist.h MobParking).
+//
+// Three humans near the window centre, one of them carved (so MOBS v4/v5
+// stores a lattice for it), settled on real terrain. Then, all asserted in one
+// run:
+//   A. PARK. The window is moved far away (ReloadWindow) and ONE mobs.PreTick
+//      runs: zero live, three parked, and each region bucket holding a
+//      creature's origin has a 'MOBS' record at that origin whose bytes are
+//      EXACTLY the creature's SaveOne from just before -- the record a save
+//      would have written.
+//   B. THE CAP COUNTS ONLY THE LIVE. With three parked, a full crowd
+//      (MobSystem's cap, 16) still spawns.
+//   C. SAVE AND LOAD WHILE PARKED. The save writes an r_*.sve for every
+//      parked creature's region; a load at the far window applies none of
+//      them (zero live) and the buckets read back from disk hold the same
+//      three records, byte for byte.
+//   D. UNPARK, BOUNDED. The window returns home. While the live crowd is
+//      full, a call makes nobody live and the records stay (cap wait). Then,
+//      at a budget of ONE per call, the creatures come back over successive
+//      ticks -- never more than one per call -- each only after the fetch
+//      cache has answered for the ground under it, at its parked origin, with
+//      SaveOne bytes IDENTICAL to the parked record, over solid ground in the
+//      cache.
+//   E. THEY STAND. 40 ticks of the full mob step afterwards: all three alive
+//      and none has dropped more than `mobParkMaxDropVox` below where it
+//      came back.
+// LEAVES NOTHING: resets mobs and debris, removes the park function, puts the
+// id counter back, clears the store, deletes its save dir and regenerates the
+// world at its home window.
+Status GateMobPark(Ctx& c, std::string& detail) {
+  namespace fs = std::filesystem;
+  const char* kPath = "selftest_mobpark.svd";
+  const uint64_t idCounterWas = c.mobs.NextIdCounter();
+  MobParking parking;
+  auto restore = [&]() {
+    c.debris.Reset();
+    c.mobs.Reset();
+    c.mobs.SetParkFn(nullptr);
+    c.mobs.ClearPlayerActors();
+    c.mobs.SetNextIdCounter(idCounterWas);
+    c.stream.Store().Clear();
+    std::error_code ec;
+    fs::remove_all(kPath, ec);
+  };
+  const int hi = c.mobs.FindDef("human");
+  int dummyDef = -1;
+  for (size_t i = 0; i < c.mobs.Defs().size(); i++)
+    if (c.mobs.Defs()[i].name == "dummy") dummyDef = (int)i;
+  if (hi < 0 || dummyDef < 0) {
+    detail = hi < 0 ? "no 'human' def" : "no 'dummy' def";
+    return Status::Fail;
+  }
+  // CLEAR, not Unbind: Unbind keeps the RAM chunks, and after `save-split`'s
+  // full flush those are a whole window of real pages -- every ReloadWindow
+  // below would restore them instead of regenerating sentinels, driving the
+  // page pool to 94% for nothing this gate asserts on.
+  c.stream.Store().Clear();
+  {
+    std::error_code ec;
+    fs::remove_all(kPath, ec);
+  }
+  c.debris.Reset();
+  c.mobs.Reset();
+  c.mobs.SetNextIdCounter(1);
+  SubmitWorldgen(c.ctx, c.world, c.sim, kDefaultSeed);
+  c.ctx.WaitIdle();
+  const IVec3 home = c.world.WindowOrigin();
+  const int n = (int)kNChunk;
+  const IVec3 away{home.x + n + 8, home.y, home.z + n + 8};
+
+  parking.Bind(c.mobs, c.stream.Store(), true);
+  // A TELEPORT, done the way LoadWorld moves the window: the held readback
+  // snapshot describes the old window and must not be consumed afterwards,
+  // and the sim's transient state is reset over the refilled grid.
+  auto teleport = [&](IVec3 origin) {
+    c.world.InvalidateSnapshot();
+    c.stream.ReloadWindow(origin);
+    rhi::CommandEncoder enc = c.ctx.device.CreateCommandEncoder();
+    c.sim.EncodeLoadReset(enc);
+    rhi::CommandBuffer cmd = enc.Finish();
+    c.ctx.queue.Submit(1, &cmd);
+    c.ctx.WaitIdle();
+  };
+  const uint32_t budget = 1;   // the gate's own, so the budget binds on 3
+
+  // ---- the tick: world + readbacks always, the mob step on request ----
+  uint32_t t = 7000;
+  IVec3 pc{home.x + n / 2, home.y + n / 2, home.z + n / 2};
+  auto tick = [&](bool stepMobs) {
+    std::vector<BrushOp> ops;
+    std::vector<CellOp> cellOps;
+    std::vector<ParticleSpawn> spawns;
+    if (stepMobs) {
+      c.mobs.PreTick(t + 1, c.world, ops, cellOps, spawns);
+      c.debris.QueueSupportEvents(c.world.Snap());
+      c.debris.PreTick(t + 1, c.world, cellOps, spawns);
+    }
+    ++t;
+    SubmitTick(c.ctx, c.world, c.sim, t, kDefaultSeed, ops, {}, cellOps, false,
+               pc, true, false, spawns);
+    c.ctx.WaitIdle();
+    c.ctx.ProcessEvents();
+    if (stepMobs) {
+      c.phys.Step(kTickDt);
+      c.debris.PostStep();
+      c.mobs.PostStep();
+    }
+  };
+
+  // ---- the fixture: three humans on the ground, one carved ----
+  const IVec3 base{(home.x + n / 2) * (int)kChunk, 0, (home.z + n / 2) * (int)kChunk};
+  std::vector<uint64_t> ids;
+  for (int k = 0; k < 3; k++) {
+    const int x = base.x + k * 14, z = base.z + (k % 2) * 10;
+    const int h = World::TerrainHeight(x, z, kDefaultSeed);
+    const uint64_t id = c.mobs.Spawn(hi, {x, h + 1, z});
+    if (id == 0) {
+      detail = Format("spawn %d refused", k);
+      restore();
+      return Status::Fail;
+    }
+    ids.push_back(id);
+  }
+  pc = {base.x >> 4, (World::TerrainHeight(base.x, base.z, kDefaultSeed)) >> 4,
+        base.z >> 4};
+  {
+    const MobDef& hd = c.mobs.Defs()[hi];
+    const int carveLimb = hd.rootLimb >= 0 ? hd.rootLimb : 0;
+    std::vector<ParticleSpawn> spawns;
+    const uint64_t lb = c.mobs.LimbBody(ids[2], carveLimb);
+    if (lb)
+      c.mobs.CarveLimbRadial(lb, c.mobs.LimbVoxelPos(ids[2], carveLimb, 977u), 1.0f,
+                             /*ragged=*/true, /*eject=*/false, c.world, spawns);
+  }
+  // A player standing a few metres off, so a creature whose profile hunts has
+  // a TARGET in its brain when it parks -- the v5 tail then carries more than
+  // defaults. (Whether any profile acquires is reported, not asserted: the
+  // byte-identical round trip is the claim, the target makes it non-vacuous.)
+  {
+    const int px = base.x + 30, pz = base.z + 30;
+    const MobSystem::PlayerActorDesc pa{
+        Vec3{(float)px, (float)World::TerrainHeight(px, pz, kDefaultSeed) + 10.0f,
+             (float)pz},
+        4.0f, 18.0f, true};
+    c.mobs.SetPlayerActors(std::span<const MobSystem::PlayerActorDesc>(&pa, 1));
+  }
+  for (int i = 0; i < 30; i++) tick(true);
+  const Mob* carvedM = c.mobs.FindMobById(ids[2]);
+  bool carvedStored = false;
+  if (carvedM != nullptr)
+    for (size_t li = 0; li < c.mobs.Defs()[hi].limbs.size(); li++)
+      carvedStored |= !carvedM->LimbIsPristine(li);
+
+  // ======== A: park ========================================================
+  struct Parked {
+    Vec3 origin{};
+    std::vector<uint8_t> bytes;
+    ai::Brain brain;
+  };
+  std::vector<Parked> parked;
+  for (uint32_t i = 0; i < c.mobs.MobCount(); i++) {
+    const Mob* m = c.mobs.MobAt(i);
+    if (m == nullptr || !m->Alive()) continue;
+    Parked p;
+    p.origin = m->Origin();
+    ByteWriter w{p.bytes};
+    m->SaveOne(w);
+    if (const ai::Brain* b = c.mobs.MobBrain(m->Id())) p.brain = *b;
+    parked.push_back(std::move(p));
+  }
+  int targetsAtPark = 0;
+  for (const Parked& p : parked) targetsAtPark += p.brain.hasTarget ? 1 : 0;
+  teleport(away);
+  pc = {away.x + n / 2, home.y + n / 2, away.z + n / 2};
+  tick(true);
+  const uint32_t liveAfterPark = c.mobs.MobCount();
+  const uint64_t parkedCount = parking.GetStats().parked;
+  const uint32_t kMobs = 'M' | ('O' << 8) | ('B' << 16) | ((uint32_t)'S' << 24);
+  // Every creature's record, found in the bucket of its origin's region.
+  auto bucketsHold = [&](std::string& why) {
+    int found = 0;
+    for (size_t k = 0; k < parked.size(); k++) {
+      const IVec3 rc = ChunkStore::RegionOfVoxel(parked[k].origin);
+      bool hit = false;
+      for (const EntityRecord& r : c.stream.Store().DormantEntities(rc)) {
+        if (r.section != kMobs || r.pos.x != parked[k].origin.x ||
+            r.pos.y != parked[k].origin.y || r.pos.z != parked[k].origin.z)
+          continue;
+        const std::string d = MobRecordDiff(parked[k].bytes, r.bytes);
+        if (d.empty() && r.version == MobSystem::kSaveVersion) hit = true;
+        else if (why.empty()) why = Format("creature %zu: %s", k, d.c_str());
+      }
+      if (hit) found++;
+      else if (why.empty()) why = Format("creature %zu: no record in its bucket", k);
+    }
+    return found;
+  };
+  std::string whyA;
+  const int foundA = bucketsHold(whyA);
+  const bool okA = parked.size() == 3 && liveAfterPark == 0 && parkedCount == 3 &&
+                   foundA == 3 && carvedStored;
+
+  // ======== B: the cap counts only the live ================================
+  int capSpawned = 0;
+  {
+    const int ax = (away.x + n / 2) * (int)kChunk, az = (away.z + n / 2) * (int)kChunk;
+    const int ah = World::TerrainHeight(ax, az, kDefaultSeed);
+    for (int k = 0; k < 16; k++)
+      if (c.mobs.Spawn(dummyDef, {ax + (k % 4) * 8, ah + 1, az + (k / 4) * 8}) != 0)
+        capSpawned++;
+    c.mobs.Reset();
+  }
+  const bool okB = capSpawned == 16;
+
+  // ======== C: save and load while parked ==================================
+  EntityIO eio = MakeEntityIO(c.debris, c.mobs, nullptr);
+  const bool saved = SaveWorld(c.ctx, c.world, c.stream, kPath, c.mats, &eio);
+  int bucketFiles = 0;
+  {
+    std::error_code ec;
+    std::vector<IVec3> want;
+    for (const Parked& p : parked) {
+      const IVec3 rc = ChunkStore::RegionOfVoxel(p.origin);
+      bool dup = false;
+      for (const IVec3& w : want) dup |= w.x == rc.x && w.y == rc.y && w.z == rc.z;
+      if (!dup) want.push_back(rc);
+    }
+    for (const IVec3& rc : want)
+      if (fs::exists(c.stream.Store().EntityRegionPath(rc), ec)) bucketFiles++;
+    bucketFiles = bucketFiles == (int)want.size() ? bucketFiles : -bucketFiles;
+  }
+  c.mobs.Reset();
+  EntityFileReport lr;
+  const bool loaded =
+      LoadWorld(c.ctx, c.world, c.sim, c.stream, kPath, c.mats, &eio, nullptr, &lr);
+  const uint32_t liveAfterLoad = c.mobs.MobCount();
+  std::string whyC;
+  const int foundC = bucketsHold(whyC);
+  const bool okC = saved && bucketFiles > 0 && loaded && liveAfterLoad == 0 &&
+                   foundC == 3 && lr.recordsApplied == 0;
+
+  // ======== D: unpark, bounded, onto known ground ==========================
+  teleport(home);
+  parking.ResetWaits();
+  parking.ResetStats();
+  pc = {base.x >> 4, (World::TerrainHeight(base.x, base.z, kDefaultSeed)) >> 4,
+        base.z >> 4};
+  // The cap wait first: a full live crowd makes nobody live and keeps every
+  // record where it was.
+  uint32_t capMade = 0;
+  uint64_t capWaits = 0;
+  int foundCap = 0;
+  {
+    for (int k = 0; k < 16; k++)
+      c.mobs.Spawn(dummyDef, {base.x - 60 + (k % 4) * 8,
+                              World::TerrainHeight(base.x - 60, base.z - 60, kDefaultSeed) + 1,
+                              base.z - 60 + (k / 4) * 8});
+    capMade = parking.Unpark(c.mobs, c.stream.Store(), c.world, t, budget);
+    capWaits = parking.GetStats().capWaits;
+    std::string ignore;
+    foundCap = bucketsHold(ignore);
+    c.mobs.Reset();
+    parking.ResetStats();
+  }
+  int calls = 0, callsBeforeFirst = -1, same = 0, onGround = 0;
+  std::string whyD;
+  std::vector<uint64_t> seen;
+  std::vector<float> seenY;
+  int brainsBack = 0;
+  for (int i = 0; i < 240 && seen.size() < parked.size(); i++) {
+    tick(false);
+    const uint32_t made = parking.Unpark(c.mobs, c.stream.Store(), c.world, t, budget);
+    calls++;
+    if (made > 0 && callsBeforeFirst < 0) callsBeforeFirst = calls - 1;
+    for (uint32_t mi = 0; mi < c.mobs.MobCount(); mi++) {
+      const Mob* m = c.mobs.MobAt(mi);
+      if (m == nullptr) continue;
+      if (std::find(seen.begin(), seen.end(), m->Id()) != seen.end()) continue;
+      seen.push_back(m->Id());
+      seenY.push_back(m->Origin().y);
+      std::vector<uint8_t> again;
+      {
+        ByteWriter w{again};
+        m->SaveOne(w);
+      }
+      int match = -1;
+      for (size_t k = 0; k < parked.size(); k++) {
+        const Vec3& o = parked[k].origin;
+        if (o.x == m->Origin().x && o.y == m->Origin().y && o.z == m->Origin().z)
+          match = (int)k;
+      }
+      if (match < 0) {
+        if (whyD.empty()) whyD = "an unparked creature at no parked origin";
+        continue;
+      }
+      // The brain's memory rode the record (v5): profile and target facts.
+      if (const ai::Brain* b = c.mobs.MobBrain(m->Id())) {
+        const ai::Brain& pb = parked[match].brain;
+        if (b->profile == pb.profile && b->targetId == pb.targetId &&
+            b->hasTarget == pb.hasTarget && b->lastSeenTick == pb.lastSeenTick)
+          brainsBack++;
+      }
+      const std::string d = MobRecordDiff(parked[match].bytes, again);
+      if (d.empty()) same++;
+      else if (whyD.empty()) whyD = Format("creature %d: %s", match, d.c_str());
+      // Solid within three cells under the feet, in the very cache the
+      // ground wait trusted (the centre column of the body box).
+      const MobDef& md = c.mobs.Defs()[hi];
+      const int cx = ifloor(m->Origin().x + md.worldSize.x * 0.5f);
+      const int cz = ifloor(m->Origin().z + md.worldSize.z * 0.5f);
+      const int fy = ifloor(m->Origin().y);
+      bool solid = false;
+      for (int y = fy + 1; y >= fy - 3 && !solid; y--) {
+        const CachedChunk* cc = c.world.Cached({cx >> 4, y >> 4, cz >> 4});
+        if (cc == nullptr || cc->voxels.size() != kChunkVol) continue;
+        const uint32_t mat =
+            cc->voxels[(((uint32_t)cz & 15u) * kChunk + ((uint32_t)y & 15u)) * kChunk +
+                       ((uint32_t)cx & 15u)] &
+            0xFFFu;
+        solid = mat != 0 && mat < c.mats.size() &&
+                (c.mats[mat].gpu.klass == CLASS_SOLID ||
+                 c.mats[mat].gpu.klass == CLASS_POWDER);
+      }
+      if (solid) onGround++;
+      else if (whyD.empty()) whyD = Format("creature %d: no solid under its feet", match);
+    }
+  }
+  const MobParking::Stats ds = parking.GetStats();
+  const bool okD = capMade == 0 && capWaits > 0 && foundCap == 3 &&
+                   seen.size() == parked.size() && same == 3 && onGround == 3 &&
+                   ds.maxCall <= budget && ds.unparked == 3 && ds.failed == 0 &&
+                   calls >= 3 && callsBeforeFirst >= 1 && brainsBack == 3;
+  // `callsBeforeFirst >= 1`: the first sight of a chunk only ASKS for it, so a
+  // creature can never come back on the call that first saw its ground.
+
+  // ======== E: they stand ==================================================
+  const double maxDrop = BaselineNumber("mobParkMaxDropVox", 10);
+  for (int i = 0; i < 40; i++) tick(true);
+  int standing = 0;
+  float worstDrop = 0.0f;
+  for (size_t k = 0; k < seen.size(); k++) {
+    const Mob* m = c.mobs.FindMobById(seen[k]);
+    if (m == nullptr || !m->Alive()) continue;
+    const float drop = seenY[k] - m->Origin().y;
+    worstDrop = std::max(worstDrop, drop);
+    if (drop <= (float)maxDrop) standing++;
+  }
+  const bool okE = standing == 3;
+  RecordObserved("mobParkWorstDropVox", (double)worstDrop);
+
+  const bool ok = okA && okB && okC && okD && okE;
+  detail = Format(
+      "A %s: %zu captured, live %u after park, parked %llu, %d/3 records in "
+      "their buckets byte-identical, carved stores lattice %d%s%s | B %s: %d/16 "
+      "spawned with 3 parked | C %s: saved %d, bucket files %d, loaded %d, live %u, "
+      "%d/3 records read back, applied %u%s%s | D %s: cap wait made %u waits %llu "
+      "kept %d/3; %zu back over %d calls (first after %d), max %u/call (budget %u), "
+      "ground waits %llu, budget waits %llu, %d/3 byte-identical, %d/3 on solid "
+      "ground%s%s, brains %d/3 (%d held a target at park) | E %s: %d/3 standing "
+      "after 40 ticks, worst drop %.2f (max %.0f)",
+      okA ? "ok" : "FAIL", parked.size(), liveAfterPark,
+      (unsigned long long)parkedCount, foundA, carvedStored ? 1 : 0,
+      whyA.empty() ? "" : ", first: ", whyA.c_str(), okB ? "ok" : "FAIL", capSpawned,
+      okC ? "ok" : "FAIL", saved ? 1 : 0, bucketFiles, loaded ? 1 : 0, liveAfterLoad,
+      foundC, lr.recordsApplied, whyC.empty() ? "" : ", first: ", whyC.c_str(),
+      okD ? "ok" : "FAIL", capMade, (unsigned long long)capWaits, foundCap,
+      seen.size(), calls, callsBeforeFirst, ds.maxCall, budget,
+      (unsigned long long)ds.groundWaits, (unsigned long long)ds.budgetWaits, same,
+      onGround, whyD.empty() ? "" : ", first: ", whyD.c_str(), brainsBack,
+      targetsAtPark, okE ? "ok" : "FAIL", standing, worstDrop, maxDrop);
+
+  restore();
+  SubmitWorldgen(c.ctx, c.world, c.sim, kDefaultSeed);
+  c.ctx.WaitIdle();
+  return ok ? Status::Pass : Status::Fail;
+}
+
 // ---- mob-handoff -----------------------------------------------------------
 //
 // ONE CREATURE, ONE SIMULATOR (docs/PLAN_multiplayer_m9.md M9.4-B).
@@ -10518,6 +10898,10 @@ const std::vector<Gate>& MobGates() {
       // ticks, no render.
       {"mob-save-delta", "mob", {}, false, GateMobSaveDelta,
        /*needsRender=*/false},
+      // S5b: a creature leaving the window is PARKED in its region bucket and
+      // comes back, byte-identical and on known ground, when the window
+      // returns -- bounded per tick, through a save and load. No render.
+      {"mob-park", "mob", {}, false, GateMobPark, /*needsRender=*/false},
       // NPC AI. No render either: every claim is a distance, an angle or a
       // count, which is what makes them iterable with `--gate` alone.
       {"ai-dummy", "mob", {}, false, GateAiDummy, /*needsRender=*/false},

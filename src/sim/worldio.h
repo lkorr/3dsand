@@ -280,10 +280,12 @@ struct EntityFileReport {
 // edge gives up only what is actually in it. Unknown section ids stay parked
 // too (a newer build's entities survive an older build's save).
 //
-// LoadWorld calls it once after the window fill. It is the entry point for
-// the later touches as well -- a frame-loop call whenever the window moves is
-// what S5b's re-instantiation needs; S4 alone has nothing outside the window
-// to bring in, because every system it buckets despawns out of the window.
+// LoadWorld calls it once after the window fill. The LATER touches -- the
+// window moving onto parked NPCs (S5b) -- do not come through here: they are
+// game/persist.h MobParking::Unpark, which reads the same buckets but applies
+// 'MOBS' records a few per tick, only well inside the window and only onto
+// ground the fetch cache has answered for. A load is allowed to apply all at
+// once because nothing is being drawn while it runs.
 void ApplyRegionEntities(ChunkStore& store, IVec3 windowOriginChunks,
                          const EntityIO& io, EntityFileReport* rep = nullptr);
 

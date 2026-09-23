@@ -398,6 +398,41 @@ are deduplicated across mob defs, so 128 slots cover a whole cast.
   **Measured: an untouched human 345,969 B (v3) -> 577 B; a crowd of 11
   untouched + 4 damaged 5.17 MB -> 160 KB (32x), the remainder being the four
   damaged limbs' lattices.** Gate `mob-save-delta`.
+- **NPCs outlive the window (MOBS v5, 2026-09-23, `docs/PLAN_save_system.md`
+  S5b).** `MobSystem::PreTick` no longer destroys a creature that ends up more
+  than 16 voxels outside the window: with a park function installed it first
+  writes the creature's `Mob::SaveOne` record and appends it, as a `MOBS`
+  EntityRecord at its origin, to that region's bucket
+  (`ChunkStore::DormantEntities`) -- the record a save writes, so a parked
+  creature and a saved one are the same bytes and the next save puts it on
+  disk with no code of its own -- and then releases the rig as before. Only a
+  creature this machine OWNS parks (a ghost is the peer's). `game/persist.h
+  MobParking::Unpark`, called once per sim tick after `TickAuthority`, brings
+  back the `MOBS` records of the window's regions whose origin is at least one
+  chunk inside every face (hysteresis against the 16-voxel park pad), through
+  the load path (`MobSystem::LoadOne`), and a record WAITS -- stays parked,
+  never dropped -- on three things: the per-call budget
+  (`MobParking::kUnparkPerCall` = 2, so a shift into a crowd is a trickle of
+  rig builds, not a spike), the live cap (`MobSystem::HasRoomToSpawn`; parked
+  creatures never hold a cap slot), and the ground: the chunks under its
+  footprint, at the feet and one below, must be in the fetch cache
+  (`World::Cached`) at a version no older than the tick the parker first asked
+  for them, because the CPU never holds the window and a copy cached before
+  the chunk last left is stale. It comes back through `LoadOne(...,
+  placeLimbs=true)` -- in the pose it left in, so its `SaveOne` is the parked
+  record byte for byte (a save LOAD still stands the rig in Spawn's rest pose
+  at the floored origin, as it always has).
+  The walk is skipped when the window has not moved and nothing was left
+  waiting. MOBS v5 appends the brain's memory to each record (profile by name,
+  target id / has-target / target and last-seen positions / last-seen tick,
+  the five facts the handoff's `MobBrainWire` carries), so a creature that left
+  mid-hunt comes back hunting; v4 and v3 still load with a fresh brain.
+  **Multiplayer:** main enables parking in single player and on the host; a
+  client keeps the old despawn, because its store is not the one the host
+  saves. Known gap: a host-parked creature returns only when the HOST's window
+  reaches it. **Not done:** parked creatures do not tick (no off-screen
+  travel or schedules); ground items do not park; authored NPCs still have no
+  stable content id (`npc:<name>`) for quests to name. Gate `mob-park`.
 - **The save stores the delta, and meta names its generator (2026-09-22,
   `docs/PLAN_save_system.md` S1).** A saved world is `genChunk(seed,
   generator)` plus the store. `Stream::FlushResident` used to write all 32,768

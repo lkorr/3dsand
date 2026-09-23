@@ -1,5 +1,7 @@
 #pragma once
 
+#include <unordered_map>
+
 #include "game/avatar.h"
 #include "game/caster.h"
 #include "game/equipment.h"
@@ -163,3 +165,111 @@ EntityIO MakeEntityIO(DebrisSystem& debris, MobSystem& mobs,
 // A clock the 'TIME' section restored as engaged already holds the saved
 // position and is left alone. Returns whether it engaged.
 bool ResumeWorldClock(uint32_t savedSimTick, uint32_t simTickNow);
+
+// ---- NPCs OUTLIVE THE WINDOW (docs/PLAN_save_system.md S5b) -----------------
+//
+// PARK: MobSystem's out-of-window branch hands the creature's Mob::SaveOne
+// record to the function Bind installs, which appends it -- as a 'MOBS'
+// EntityRecord at the creature's origin, the exact record a save writes -- to
+// the region bucket holding that origin (ChunkStore::DormantEntities). The
+// rig is then torn down as it always was. Nothing else is needed for a save:
+// SaveWorld already writes every bucket as dormant + live, so a parked
+// creature reaches disk with the next save and a load leaves it parked unless
+// the window holds it.
+//
+// UNPARK: Unpark walks the buckets of the regions the window intersects and
+// makes live (MobSystem::LoadOne, the load path) the 'MOBS' records whose
+// origin is inside the window by at least kUnparkMarginChunks on every face.
+// The margin is the hysteresis against the park pad (16 voxels OUTSIDE the
+// window): a creature must travel two chunks to flip back, so one standing on
+// the window edge cannot park and unpark on alternate ticks.
+//
+// Three things can make a record WAIT (it stays parked, untouched, and is
+// retried on a later call -- never dropped):
+//   * THE BUDGET. At most `budget` creatures per call (kUnparkPerCall by
+//     default; main calls once per tick). A window shift into a crowded town
+//     is a Spawn + BuildRig + Jolt bodies per creature; spread over ticks it
+//     is a trickle rather than a frame spike.
+//   * THE CAP. MobSystem::HasRoomToSpawn is false: the live crowd is full.
+//     Parked creatures never hold a cap slot; they come back when one frees.
+//   * THE GROUND. The chunks under the creature's footprint (its min corner
+//     and half a chunk on in x and z), at the feet and one below, must be in
+//     the ON-DEMAND FETCH CACHE (World::Cached, the store the mob
+//     ground probe reads) at a version no older than the tick this system
+//     first asked for it. The CPU never holds the whole window (CLAUDE.md
+//     "CPU mirror is 3x3x3 chunks"), and a cached copy from before the chunk
+//     last left the window is stale terrain -- so the first sight of a chunk
+//     issues a fetch (FetchSource::Mob, coalesced) and the creature is
+//     placed only once the answer is back. SenseGround already makes gravity
+//     wait on unknown ground; this makes the creature not EXIST until the
+//     ground it stands on is known, so neither the drive nor the static-
+//     collider sweep ever meets a hole.
+//
+// OUT OF SCOPE (follow-ups): parked creatures do not tick -- no off-screen
+// travel, hunger or schedule; they stand frozen where they left the window.
+// Ground items (ITMS) do not park. Multiplayer: see Bind.
+class MobParking {
+ public:
+  // Creatures made live per Unpark call. main.cpp calls once per sim tick, so
+  // this is creatures per tick: a crowd of 16 (MobSystem's cap) is back in
+  // eight ticks, ~0.13 s, and no tick pays for more than two rig builds.
+  static constexpr uint32_t kUnparkPerCall = 2;
+  // Unpark only well inside the window (see the hysteresis note above).
+  static constexpr int kUnparkMarginChunks = 1;
+
+  struct Stats {
+    uint64_t parked = 0;       // records appended by the park function
+    uint64_t unparked = 0;     // records made live
+    uint64_t failed = 0;       // records LoadOne refused (dropped, logged)
+    uint64_t groundWaits = 0;  // a record left parked: its ground not known yet
+    uint64_t capWaits = 0;     // ...the live crowd was full
+    uint64_t budgetWaits = 0;  // ...this call's budget was spent
+    uint32_t lastCall = 0;     // creatures made live by the last call
+    uint32_t maxCall = 0;      // the most any one call made live
+  };
+
+  // Install (enabled) or remove (disabled) the park function on `mobs`,
+  // writing into `store`. Idempotent: a call that changes nothing costs a
+  // compare, so the frame loop may call it every tick.
+  //
+  // MULTIPLAYER (M9): parking is decided by the machine that OWNS the
+  // creature (MobSystem only parks a non-ghost; the ownership rule has
+  // already handed a creature to any peer whose window holds it), and main
+  // enables it only on a machine whose store is the world's -- single player
+  // and the host. A client's store is not what the host saves, so a client
+  // that parked would hide the creature from the world file; a client keeps
+  // the pre-S5b despawn (and its MobGone), which is no worse than before.
+  // KNOWN GAP: a creature the host parked comes back only when the HOST's
+  // window reaches it; a client walking into that region alone does not see
+  // it (that needs the host to unpark on the client's behalf and hand off).
+  void Bind(MobSystem& mobs, ChunkStore& store, bool enabled);
+  // See the class comment. `tick` is the sim tick just run (the fetch-cache
+  // freshness bound is in ticks). Returns creatures made live.
+  uint32_t Unpark(MobSystem& mobs, ChunkStore& store, World& world,
+                  uint32_t tick, uint32_t budget = kUnparkPerCall);
+  // Forget the ground-wait bookkeeping and the "nothing to do" shortcut
+  // (a load, a regen, a teleporting gate). The binding is kept.
+  void ResetWaits();
+  const Stats& GetStats() const { return stats_; }
+  void ResetStats() { stats_ = Stats{}; }
+
+ private:
+  bool enabled_ = false;
+  MobSystem* boundMobs_ = nullptr;
+  ChunkStore* boundStore_ = nullptr;
+  // Skip the region walk when the window has not moved and nothing inside it
+  // was left waiting: the steady state costs one compare per tick.
+  bool haveOrigin_ = false;
+  IVec3 lastOrigin_{};
+  bool pending_ = true;
+  // Per CHUNK: the tick this system first asked for it. A cached copy is
+  // trusted only at or after that tick. Pruned to the window on every shift,
+  // so a chunk that leaves and re-enters asks again.
+  struct Wait {
+    IVec3 wc{};
+    uint32_t since = 0;
+  };
+  std::unordered_map<uint64_t, Wait> waits_;
+  Stats stats_;
+  bool GroundKnown(World& world, IVec3 wc, uint32_t tick);
+};

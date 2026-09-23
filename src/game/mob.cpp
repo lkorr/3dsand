@@ -6693,6 +6693,18 @@ void MobSystem::PreTick(uint32_t tick, World& world, std::vector<BrushOp>& ops,
                mob.origin_.y > wlo.y + (float)kWorldN + kPad ||
                mob.origin_.z > wlo.z + (float)kWorldN + kPad;
     if (out) {
+      // PARKED, NOT FORGOTTEN (save plan S5b; mob.h SetParkFn). The record is
+      // written BEFORE the rig is released -- SaveOne reads the live limbs --
+      // and only for a creature this machine steps: a ghost is the peer's.
+      if (parkFn_ && !mob.IsGhost() && mob.defIndex_ >= 0 &&
+          mob.defIndex_ < (int)defs_.size()) {
+        std::vector<uint8_t> rec;
+        {
+          ByteWriter w{rec};
+          mob.SaveOne(w);
+        }
+        if (parkFn_(mob, rec)) parkedTotal_++;
+      }
       mob.ReleaseRig();
       mobs_[mi] = std::move(mobs_.back());
       mobs_.pop_back();
@@ -17898,6 +17910,19 @@ void Mob::SaveOne(ByteWriter& w, uint32_t version) const {
     w.U32((uint32_t)std::max(0, c.count));
     w.U32(c.dye);
   }
+  if (version < 5) return;
+  // ---- AND THE BRAIN'S MEMORY (kSaveVersion 5, save plan S5b) --------------
+  //
+  // The same five facts TakeHandoff puts in MobBrainWire, in the same order,
+  // the profile BY NAME (ai::Library is file order). mob.h kSaveVersion says
+  // why this much and no more.
+  const ai::Profile* pr = sys_->behaviors_.At(ai_.profile);
+  w.Str(pr != nullptr ? pr->name : std::string());
+  w.Pod(ai_.targetId);
+  w.U32(ai_.hasTarget ? 1u : 0u);
+  w.Pod(ai_.targetPos);
+  w.Pod(ai_.lastSeenPos);
+  w.U32(ai_.lastSeenTick);
 }
 
 void MobSystem::SaveState(std::vector<uint8_t>& out) const {
@@ -17964,6 +17989,13 @@ struct MobSystem::MobRecord {
   };
   std::vector<LimbState> limbs;
   std::vector<CarriedItem> carried;
+  // v5: the brain's memory (Mob::SaveOne's tail). `haveBrain` false for v3/v4.
+  bool haveBrain = false;
+  std::string brainProfile;
+  uint64_t targetId = 0;
+  uint32_t hasTarget = 0;
+  Vec3 targetPos{}, lastSeenPos{};
+  uint32_t lastSeenTick = 0;
 };
 
 bool MobSystem::ReadMobRecord(ByteReader& r, MobRecord& out, uint32_t version) {
@@ -18033,6 +18065,16 @@ bool MobSystem::ReadMobRecord(ByteReader& r, MobRecord& out, uint32_t version) {
     if (out.carried.size() < Mob::kMaxCarried && !c.item.empty() && c.count > 0)
       out.carried.push_back(std::move(c));
   }
+  // v5's brain tail, mirroring SaveOne.
+  out.haveBrain = version >= 5;
+  if (out.haveBrain) {
+    r.Str(out.brainProfile);
+    r.Pod(out.targetId);
+    r.U32(out.hasTarget);
+    r.Pod(out.targetPos);
+    r.Pod(out.lastSeenPos);
+    r.U32(out.lastSeenTick);
+  }
   return r.ok;
 }
 
@@ -18048,6 +18090,21 @@ void MobSystem::OverlayMobRecord(Mob& m, MobRecord& rec, bool placeLimbs) {
   // spent an hour not looting), and on a handoff the owner's list is
   // authoritative over whatever the ghost happened to be holding.
   m.carried_ = std::move(rec.carried);
+  // v5: the brain's memory, onto a FRESH brain on the named profile
+  // (ApplyHandoff's rule: timers and half-walked paths belong to the run that
+  // made them). A name no profile answers to any more is no AI, which is what
+  // the def-less legacy wander always was. A handoff re-applies its wire
+  // brain after this, which carries the same five facts.
+  if (rec.haveBrain) {
+    const int profile =
+        rec.brainProfile.empty() ? -1 : behaviors_.Find(rec.brainProfile);
+    m.ai_ = ai::Brain(profile);
+    m.ai_.targetId = rec.targetId;
+    m.ai_.hasTarget = rec.hasTarget != 0;
+    m.ai_.targetPos = rec.targetPos;
+    m.ai_.lastSeenPos = rec.lastSeenPos;
+    m.ai_.lastSeenTick = rec.lastSeenTick;
+  }
   const uint32_t nApply =
       std::min<uint32_t>((uint32_t)rec.limbs.size(), (uint32_t)m.limbs_.size());
 
@@ -18200,7 +18257,7 @@ void MobSystem::OverlayMobRecord(Mob& m, MobRecord& rec, bool placeLimbs) {
 // saved carve state, then the severs. Null on a def that no longer exists, a
 // refused spawn, or a short read — all three of which it reports exactly as
 // the loop always did.
-Mob* MobSystem::LoadOne(ByteReader& r, uint32_t version) {
+Mob* MobSystem::LoadOne(ByteReader& r, uint32_t version, bool placeLimbs) {
   if (version < kSaveVersionMin || version > kSaveVersion) {
     std::printf("mob: unknown mob record version %u\n", version);
     return nullptr;
@@ -18247,7 +18304,7 @@ Mob* MobSystem::LoadOne(ByteReader& r, uint32_t version) {
                 rec.defName.c_str());
     return nullptr;
   }
-  OverlayMobRecord(mobs_.back(), rec);
+  OverlayMobRecord(mobs_.back(), rec, placeLimbs);
   // BY ID, not by the reference above: the overlay can sever, and a sever is
   // one of the paths that may re-enter this system. The id is the identity
   // (mob.h's note on NextIdCounter).
