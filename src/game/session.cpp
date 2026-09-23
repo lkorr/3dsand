@@ -802,8 +802,19 @@ static void PhaseC(TickAuthorityCtx& w, WorldScratch& ws,
             // fills further down, and the ray must be cast HERE where the
             // camera and physics state for this tick are current. Carrying the
             // hit forward is cheaper than reordering the tick.
-            float br = (float)CurrentTuning().tools.laserMeltRadius;
-            laserCut = {hitBody, hitPos + fwd * (br * 0.5f), br, false};
+            //
+            // A CORPSE IS STILL FLESH. The kill usually lands a few ticks into
+            // a held beam, and the melt radius (2 voxels, sized for rock) then
+            // bored a ball out of the dead head every tick — the clean hole
+            // the live carve had started turned into a crater. Dead flesh
+            // takes the same sub-voxel bore a living limb does.
+            if (debris.BodyIsDeadFlesh(hitBody)) {
+              laserCut = {hitBody, hitPos,
+                          (float)CurrentTuning().tools.laserCarveRadius, false};
+            } else {
+              float br = (float)CurrentTuning().tools.laserMeltRadius;
+              laserCut = {hitBody, hitPos + fwd * (br * 0.5f), br, false};
+            }
           }
         } else if (gridDist < 1e8f) {
           const int r = CurrentTuning().tools.laserMeltRadius;

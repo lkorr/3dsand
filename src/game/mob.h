@@ -802,6 +802,10 @@ struct BurnLimbView {
   uint32_t scale = 1;                        // lattice units per world voxel
   const BodyTransform* xf = nullptr;         // pose as the ANIMATION left it
   IVec3 size{};                              // collider extents, physScale units
+  // The collider box's LOW corner, same units. Zero on a live limb (its
+  // lattice starts at its own corner); a debris body's lattice is centred and
+  // runs negative, so the corpse stain pass sets it (MobSystem::StainCorpses).
+  IVec3 sizeMin{};
   uint32_t physScale = 1;
   int* microModel = nullptr;   // null / -1 = cube path, no brick to poke
   bool* carved = nullptr;      // latched when the brick becomes copy-on-write
@@ -1006,6 +1010,27 @@ struct LimbCoat {
     return voxels ? (float)sumAmt / (float)(kBodyStainAmtMax * voxels) : 0.0f;
   }
 };
+
+// ---- ONE WORN SHELL, MARCHED -----------------------------------------------
+//
+// "Is something worn between this flesh and that fire?" asked of ONE shell: a
+// dense index over its lattice (rebuilt whenever the voxel count moves --
+// carving and burning both compact it), and a straight march from `from`
+// along `dir` in the shell's own frame. Returns the material met, 0 for none.
+//
+// One implementation for both populations. A living creature's shells are rig
+// slots (Mob::WornShellAlong walks them); a corpse's are bodies strapped to
+// the piece they covered (MobSystem::CorpseWornAlong walks those). The
+// question and the march are the same, so the code is.
+struct ShellMarchIndex {
+  IVec3 min{}, dims{};
+  std::vector<uint16_t> mat;     // 0 = no voxel here
+  size_t builtFor = (size_t)-1;  // voxel count the index was built from
+};
+uint32_t MarchShell(ShellMarchIndex& ix, const std::vector<PrefabVoxel>* skin,
+                    const std::vector<DebrisVoxel>* coll,
+                    const BodyTransform& xf, uint32_t scale, const Vec3& from,
+                    const Vec3& dir, float dist, int maxSteps, Vec3* outAt);
 
 // ---- A SPLASH OF BLOOD LOOKING FOR SOMETHING TO LAND ON ---------------------
 //
@@ -3586,11 +3611,7 @@ class Mob {
     // a hole into it (carve and burn both compact the lattice). Built LAZILY,
     // so a dressed creature standing in a field costs nothing at all — the
     // probe is only ever reached from the burn pass's `scanHot` branch.
-    struct ShellIndex {
-      IVec3 min{}, dims{};
-      std::vector<uint16_t> mat;   // 0 = no voxel here
-      size_t builtFor = (size_t)-1;  // voxel count the index was built from
-    };
+    using ShellIndex = ShellMarchIndex;
     std::vector<ShellIndex> index;
   };
   std::vector<WornPiece> worn_;
@@ -4840,6 +4861,55 @@ class MobSystem {
   void StainLimbs(uint32_t tick, World& world);
   bool StainOneLimb(BurnLimbView& v, uint32_t tick, uint32_t rngKey,
                     World& world, uint32_t& budget);
+  // The drying half of Mob::StainTick over a view: every substance in `led`
+  // with an authored coat.decay loses a level on half its voxels once per
+  // period. Shared by the living and the dead (StainCorpses).
+  bool DryOneLimb(BurnLimbView& v, const LimbCoat& led, uint32_t tick,
+                  uint32_t key, uint32_t& budget);
+  // One lattice's coat ledger (Mob::RecountCoat's per-limb count).
+  static void TallyCoat(const BurnLimbView& v, LimbCoat& out);
+  // ---- THE DEAD TAKE A COAT TOO (2026-09-22) --------------------------------
+  // Contact (blood stains, water rinses) and drying over every dead-flesh
+  // debris body, through StainOneLimb / DryOneLimb — the passes the living
+  // use, so a corpse in a river is washed at the rate a man in it is. Owner
+  // report: "water doesn't clean the stains off corpses". Splatter onto the
+  // dead is NOT here (Mob::ApplySplatter walks limbs, not bodies).
+  void StainCorpses(uint32_t tick, World& world, uint32_t& budget);
+  // One burst replayed against one lattice (Mob::ApplySplatter's per-limb
+  // body): true when a voxel's coat changed. `salt` keys the draws — the limb
+  // index on the living, a hash of the body id on the dead.
+  bool SplatterView(const SplatterEvent& e, BurnLimbView& v, uint32_t salt);
+  // ...and that replay over every dead-flesh body (StainLimbs' splatter loop).
+  void SplatterCorpses(const SplatterEvent& e);
+  // ---- THE DEAD BURN AS THE LIVING DO (2026-09-22) --------------------------
+  // Every dead-flesh debris body through BurnOneLimb, the living limb pass,
+  // with the two things only the living had until now: heat across the
+  // corpse's joints (BuildCrossHeat, grouped by the creature the pieces came
+  // off) and its armour (the occlusion hook, marching the bodies strapped to
+  // each piece). DebrisSystem keeps only the body tail (BurnFleshBodies).
+  void BurnCorpses(uint32_t tick, World& world, std::vector<CellOp>& cellOps,
+                   std::vector<ParticleSpawn>& spawns);
+  // The cross-joint heat snapshot over any set of lattices: `parts[i]` is
+  // part i's view (null = no body), and a cell's limb bit is its index here.
+  // Mob::BuildCrossLimbHeat passes a creature's limbs; BurnCorpses passes one
+  // corpse's pieces.
+  void BuildCrossHeat(const std::vector<BurnLimbView*>& parts, uint32_t tick,
+                      std::vector<CrossHeatCell>& out);
+  // The corpse twin of Mob::WornAlong: the first shell met marching from
+  // `from` along `dir`, over the bodies strapped to one piece.
+  uint32_t CorpseWornAlong(const std::vector<DebrisSystem::FleshShell>& shells,
+                           const Vec3& from, const Vec3& dir, float dist,
+                           uint32_t tick);
+  struct CorpseWornProbe {
+    MobSystem* sys;
+    const std::vector<DebrisSystem::FleshShell>* shells;
+    uint32_t tick;
+    static uint32_t Call(void* ctx, const Vec3& from, const Vec3& dir,
+                         float dist) {
+      CorpseWornProbe* p = static_cast<CorpseWornProbe*>(ctx);
+      return p->sys->CorpseWornAlong(*p->shells, from, dir, dist, p->tick);
+    }
+  };
   // The limb's AUTHORITATIVE lattice (the skin when it is finer, else the
   // collider re-expressed as PrefabVoxels), copied out for a gate that has
   // to ask WHICH voxels changed rather than how many (corpse-bleed asks where
@@ -5452,6 +5522,29 @@ class MobSystem {
   // pool is swept whole every tick or two.
   static constexpr uint32_t kStainLatticePerLimb = 6144;
   static constexpr uint32_t kStainLatticePerTick = 32768;
+  // Per corpse body: the contact pass's index (derived, rebuilt when the
+  // lattice's voxel count moves — every carve, burn flush and shatter does),
+  // and the coat ledger drying reads, recounted only while something changed.
+  // Keyed on the body's global id; an entry whose body is gone is dropped the
+  // next tick the pass runs. Never saved, never hashed.
+  struct CorpseCoat {
+    BodyBurnState burn;
+    size_t n = 0;
+    LimbCoat led;
+    bool dirty = true;
+    uint32_t seen = 0;
+  };
+  std::map<uint64_t, CorpseCoat> corpseCoat_;
+  // One march index per strapped shell on a corpse, keyed on the shell body's
+  // global id; dropped when unasked-for for two seconds (the body left).
+  struct CorpseShell {
+    ShellMarchIndex ix;
+    uint32_t seen = 0;
+  };
+  std::map<uint64_t, CorpseShell> corpseShellIdx_;
+  BurnLimbView CorpseView(DebrisSystem::FleshLattice& f, CorpseCoat& cc,
+                          int& model);
+  static uint32_t CorpseKey(uint64_t id);
   static constexpr size_t kSplatterMaxEvents = 64;
   // Lattice steps one droplet's arc may take inside a limb's index box, and
   // the widest splat (lattice voxels) one landing may paint.

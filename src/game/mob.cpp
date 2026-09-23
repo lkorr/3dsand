@@ -2630,6 +2630,10 @@ void MobSystem::Reset(bool rewindIds) {
   attacks_.clear();
   actors_.clear();
   blocks_.clear();
+  // The corpse coat's derived indices: their bodies belong to the world being
+  // torn down (StainCorpses).
+  corpseCoat_.clear();
+  corpseShellIdx_.clear();
   // THE ID COUNTER IS DELIBERATELY NOT REWOUND BY DEFAULT.
   //
   // A mob id is not just a handle: it seeds the entity-scoped gore variance
@@ -6561,6 +6565,8 @@ void MobSystem::PreTick(uint32_t tick, World& world, std::vector<BrushOp>& ops,
   // pass writes fire into the hashed grid, so running it off the render clock
   // would make the world a function of frame rate.
   BurnLimbs(tick, world, cellOps, spawns);
+  // ...and the dead, through the same limb pass (BurnCorpses).
+  BurnCorpses(tick, world, cellOps, spawns);
   // Bursts from before last tick have been seen by everyone who is going to
   // see them (StainLimbs this tick, the avatar's own PreTick whichever side
   // of this it runs on). A harness with no avatar never marks doneAvatar, so
@@ -8571,7 +8577,17 @@ bool Mob::Damage(uint64_t bodyHandle, float amount, Vec3 hitWorldVoxel,
       // tissue falls apart either way, which is the whole visual difference
       // between beating a man and beating a zombie. Sever() on a vital limb
       // detaches it THEN dies; here we skip the detach and die outright.
-      if (inBluntCarve_ && def_ && !def_->undead && ld.vital) {
+      //
+      // ...AND NEITHER DOES A BEAM, OR ANY OTHER DAMAGE (2026-09-22). hp is a
+      // statement about DEATH, so a vital limb run to zero by damage alone
+      // dies in place with its head on. Sever() detaches a severable vital
+      // limb before it calls Die(), which is right for geometry (the neck was
+      // cut through, CarveLimb's collapse/split/neck rules) and wrong here:
+      // the laser plus gore.brainHpPerVoxel took a head to zero in a few ticks
+      // and popped it off, where the owner wants a clean hole you can see
+      // through. Only the impact-speed exception still detaches outright.
+      if (ld.vital && !impactSevers &&
+          (!inBluntCarve_ || !def_ || !def_->undead)) {
         deathCause_ = "vital limb destroyed";
         Die();
       } else {
@@ -9881,34 +9897,52 @@ constexpr uint32_t kCrossHeatFrontPerLimb = 768;
 void Mob::BuildCrossLimbHeat(uint32_t tick) {
   crossHeat_.clear();
   if (!sys_ || limbs_.size() < 2) return;  // one limb has nothing to cross to
-  if (CurrentTuning().combustion.crossLimbPct <= 0) return;
-
-  // Nothing alight anywhere on the creature is the overwhelmingly common case
-  // and must cost one pass over the limb list (rule 2).
+  // Cheap exit before any view is built: nothing alight anywhere (rule 2).
   bool any = false;
   for (const MobLimb& l : limbs_)
     if (l.body && !l.burn.front.empty()) { any = true; break; }
   if (!any) return;
+  // One view per limb, INDEXED BY LIMB (null for a slot with no body), so a
+  // cell's bit is the limb index exactly as before the builder was shared.
+  std::vector<BurnLimbView> views(limbs_.size());
+  std::vector<BurnLimbView*> parts(limbs_.size(), nullptr);
+  for (size_t li = 0; li < limbs_.size(); li++)
+    if (limbs_[li].body) {
+      views[li] = ViewOf(limbs_[li]);
+      parts[li] = &views[li];
+    }
+  sys_->BuildCrossHeat(parts, tick, crossHeat_);
+}
 
-  std::vector<CrossHeatCell>& out = crossHeat_;
-  const size_t nl = limbs_.size();
+void MobSystem::BuildCrossHeat(const std::vector<BurnLimbView*>& parts,
+                               uint32_t tick, std::vector<CrossHeatCell>& out) {
+  out.clear();
+  if (parts.size() < 2) return;  // one part has nothing to cross to
+  if (CurrentTuning().combustion.crossLimbPct <= 0) return;
+
+  // Nothing alight anywhere on the creature is the overwhelmingly common case
+  // and must cost one pass over the part list (rule 2).
+  bool any = false;
+  for (const BurnLimbView* p : parts)
+    if (p && p->burn && !p->burn->front.empty()) { any = true; break; }
+  if (!any) return;
+
+  const size_t nl = parts.size();
   const size_t startLimb = (size_t)(tick % (uint32_t)nl);
   for (size_t k = 0; k < nl && out.size() < kCrossHeatCells; k++) {
     const size_t li = (startLimb + k) % nl;
-    MobLimb& limb = limbs_[li];
-    if (!limb.body) continue;
-    BodyBurnState& st = limb.burn;
+    if (!parts[li] || !parts[li]->burn) continue;
+    BurnLimbView& v = *parts[li];
+    BodyBurnState& st = *v.burn;
     // The FRONT is the alight set, and it is already maintained by the burn
     // pass -- walking the limb's voxels instead would be O(volume) on a
     // 31,456-voxel torso every tick. A limb whose index was dropped by a carve
     // has an empty front for one tick and contributes nothing until the pass
     // rebuilds it, which is self-healing and one tick latent.
     if (st.front.empty() || st.idx.empty() || st.dims.x <= 0) continue;
-    BurnLimbView v = ViewOf(limb);
     const uint64_t bit = 1ull << (li < 63 ? li : 63);
     const IVec3 bd = st.dims, bm = st.min;
-    const Quat q{limb.xf.quat[0], limb.xf.quat[1], limb.xf.quat[2],
-                 limb.xf.quat[3]};
+    const Quat q{v.xf->quat[0], v.xf->quat[1], v.xf->quat[2], v.xf->quat[3]};
     const float inv = 1.0f / (float)std::max(1u, v.scale);
     const size_t nf = st.front.size();
     const size_t startCell = (size_t)(tick % (uint32_t)nf);
@@ -9925,11 +9959,11 @@ void Mob::BuildCrossLimbHeat(uint32_t tick) {
       // tag:hot, not merely "has rules": what is being offered to the other
       // limbs is HEAT, and a material that decays without being hot (smoke on
       // a body, say) is not heat.
-      if (m == 0 || m >= sys_->matHot_.size() || !sys_->matHot_[m]) continue;
+      if (m == 0 || m >= matHot_.size() || !matHot_[m]) continue;
       const IVec3 p{(int)(c % (uint32_t)bd.x) + bm.x,
                     (int)((c / (uint32_t)bd.x) % (uint32_t)bd.y) + bm.y,
                     (int)(c / ((uint32_t)bd.x * (uint32_t)bd.y)) + bm.z};
-      const Vec3 w = limb.xf.pos + Rotate(q, Vec3{((float)p.x + 0.5f) * inv,
+      const Vec3 w = v.xf->pos + Rotate(q, Vec3{((float)p.x + 0.5f) * inv,
                                                   ((float)p.y + 0.5f) * inv,
                                                   ((float)p.z + 0.5f) * inv});
       const IVec3 cell{ifloor(w.x), ifloor(w.y), ifloor(w.z)};
@@ -9972,7 +10006,7 @@ void Mob::BuildCrossLimbHeat(uint32_t tick) {
       out[w++] = out[i];
   }
   out.resize(w);
-  sys_->burnStats_.crossCells += (uint32_t)w;
+  burnStats_.crossCells += (uint32_t)w;
 }
 
 void MobSystem::BuildBurnIndex(BurnLimbView& v) {
@@ -10556,7 +10590,7 @@ void Mob::EmitCarvedFragment(const MobLimb& src, uint32_t physScale,
   // makes that species' wet noises (DebrisSystem::GoreEvent). `dead` because a
   // lump carved out of a living body is no longer part of a living body.
   debris_->AdoptBody(h, std::move(part), xf, micro, 0, {},
-                     def_->bleedMat, {}, /*dead=*/true, defIndex_);
+                     def_->bleedMat, {}, /*dead=*/true, defIndex_, id_);
   // A lump of live flesh oozes from the face it was cut on: the wound sits on
   // the gobbet's voxel nearest the limb it came off, budgeted like a corpse
   // carve of the same volume. No gout; a gobbet is not an amputation.
@@ -10996,9 +11030,16 @@ bool Mob::CarveLimb(int limbIndex, World& world,
     // which is correct for a blade decapitation but wrong for brain damage: the
     // rot ate the inside, not the neck. Die() directly leaves the head attached
     // and the corpse collapses as a whole.
-    if (inBurnFlush_ && !collapsed && limbIndex < (int)limbDefs_.size() &&
+    //
+    // ...AND SO IS ANY OTHER CARVE THAT KILLED BY HP ALONE (2026-09-22). A
+    // laser bore through the brain charges gore.brainHpPerVoxel per cell and
+    // reaches zero long before the neck is touched; detaching the head then
+    // turned a clean hole into a decapitation. Geometry (`collapsed`, and the
+    // split/neck rules below) is still what takes a head off.
+    if (!collapsed && limbIndex < (int)limbDefs_.size() &&
         limbDefs_[limbIndex].vital && limbDefs_[limbIndex].severable) {
-      deathCause_ = "vital limb burnt/dissolved away";
+      deathCause_ = inBurnFlush_ ? "vital limb burnt/dissolved away"
+                                 : "vital limb destroyed";
       Die();
       return false;
     }
@@ -11557,9 +11598,12 @@ bool MobSystem::BurnOneLimb(BurnLimbView& v, uint32_t tick, uint32_t rngKey,
     const float sinv = 1.0f / (float)std::max(1u, v.physScale);
     Vec3 mn{1e30f, 1e30f, 1e30f}, mx{-1e30f, -1e30f, -1e30f};
     for (int k = 0; k < 8; k++) {
-      const Vec3 c{(k & 1) ? (float)v.size.x * sinv : 0.0f,
-                   (k & 2) ? (float)v.size.y * sinv : 0.0f,
-                   (k & 4) ? (float)v.size.z * sinv : 0.0f};
+      // From `sizeMin`, not 0: a corpse piece's lattice is centred and runs
+      // negative (BurnLimbView::sizeMin), and a box from 0 left half of it
+      // unscanned -- no fire seen, no sibling's heat seen, on that half.
+      const Vec3 c{(float)((k & 1) ? v.size.x : v.sizeMin.x) * sinv,
+                   (float)((k & 2) ? v.size.y : v.sizeMin.y) * sinv,
+                   (float)((k & 4) ? v.size.z : v.sizeMin.z) * sinv};
       const Vec3 w = v.xf->pos + Rotate(q, c);
       mn.x = std::min(mn.x, w.x); mn.y = std::min(mn.y, w.y);
       mn.z = std::min(mn.z, w.z);
@@ -13278,13 +13322,16 @@ bool Mob::BluntPulpTick(uint32_t tick, World& world,
 void MobSystem::StainLimbs(uint32_t tick, World& world) {
   if (matGpu_.empty()) return;
   // Contact, under the shared lattice budget, start creature rotated by tick.
+  uint32_t budget = kStainLatticePerTick;
   if (!mobs_.empty()) {
-    uint32_t budget = kStainLatticePerTick;
     const size_t nm = mobs_.size();
     const size_t start = (size_t)(tick % (uint32_t)nm);
     for (size_t k = 0; k < nm && budget; k++)
       mobs_[(start + k) % nm].StainTick(tick, world, budget);
   }
+  // ...and the dead, out of what the living left. After them, so a crowd in a
+  // river is never washed slower for the corpses floating beside it.
+  StainCorpses(tick, world, budget);
   // This tick's bursts, against every creature (the bleeder included: its
   // own gout lands on its own other limbs; only the bleeding limb is skipped).
   for (SplatterEvent& e : splatters_) {
@@ -13294,6 +13341,9 @@ void MobSystem::StainLimbs(uint32_t tick, World& world) {
     // and a ghost's skin is owned elsewhere (see Mob::StainTick).
     for (Mob& mob : mobs_)
       if (!mob.IsGhost()) mob.ApplySplatter(e);
+    // ...and the dead lying in its way (owner report 2026-09-22: a corpse
+    // beside someone bleeding stayed clean). The same replay, per body.
+    SplatterCorpses(e);
   }
 }
 
@@ -13312,6 +13362,185 @@ bool OwnForStain(BurnLimbView& v, MicroBodySet* micro) {
 }
 }  // namespace
 
+BurnLimbView MobSystem::CorpseView(DebrisSystem::FleshLattice& f,
+                                   CorpseCoat& cc, int& model) {
+  BurnLimbView v;
+  v.skin = f.skin;
+  v.coll = f.coll;
+  v.scale = f.scale;
+  v.physScale = f.physScale;
+  v.xf = f.xf;
+  v.sizeMin = f.lo;
+  v.size = f.hi;
+  v.burn = &cc.burn;
+  // The brick, as the int the view pokes through (OwnForStain re-points it on
+  // the first write). The CALLER writes it back to the body afterwards, so the
+  // body sees the owned copy.
+  model = *f.microModel == kMicroBodyNoModel ? -1 : (int)*f.microModel;
+  v.microModel = &model;
+  // A DERIVED INDEX OVER A LATTICE THAT MOVES UNDER IT. The living drop theirs
+  // on every carve (DropBurnIndex); a corpse is carved, burnt and shattered by
+  // DebrisSystem, which knows nothing of this one, so it is keyed on the voxel
+  // count instead. Every edit that moves voxels changes it; one that only
+  // rewrites payloads (burning, a coat) keeps positions, which is all the
+  // index records.
+  const size_t n = v.Size();
+  if (n != cc.n) {
+    // The index, front and surface point INTO a lattice that just changed
+    // shape; `alight` is a fact about the lattice and survives, exactly as a
+    // living limb's does across a carve (Mob::DropBurnIndex).
+    Mob::DropBurnIndex(cc.burn);
+    cc.n = n;
+    cc.dirty = true;
+  }
+  // First meeting, or a lattice rewritten in place (RewriteBodyMaterial): the
+  // body says something on it is self-active, and with no index yet the
+  // cheap gate in BurnOneLimb would otherwise never look.
+  if (f.selfActive && cc.burn.idx.empty()) cc.burn.alight = true;
+  return v;
+}
+
+uint32_t MobSystem::CorpseKey(uint64_t id) {
+  return (uint32_t)(id * 0x9E3779B97F4A7C15ull >> 32) ^ 0xDEADu;
+}
+
+void MobSystem::SplatterCorpses(const SplatterEvent& e) {
+  if (!debris_ || matGpu_.empty()) return;
+  // Same stamp discipline as StainCorpses: an entry made here for a body the
+  // contact pass has not met yet is live until that pass's own sweep.
+  debris_->ForEachDeadFlesh([&](DebrisSystem::FleshLattice& f) {
+    CorpseCoat& cc = corpseCoat_[f.id];
+    int model = -1;
+    BurnLimbView v = CorpseView(f, cc, model);
+    if (SplatterView(e, v, CorpseKey(f.id))) cc.dirty = true;
+    if (model >= 0) *f.microModel = (uint32_t)model;
+  });
+}
+
+uint32_t MobSystem::CorpseWornAlong(
+    const std::vector<DebrisSystem::FleshShell>& shells, const Vec3& from,
+    const Vec3& dir, float dist, uint32_t tick) {
+  for (const DebrisSystem::FleshShell& sh : shells) {
+    if (!sh.xf) continue;
+    CorpseShell& cs = corpseShellIdx_[sh.id];
+    cs.seen = tick;
+    const uint32_t m = MarchShell(cs.ix, sh.skin, sh.coll, *sh.xf, sh.scale,
+                                  from, dir, dist, kWornMarchMax, nullptr);
+    if (m) return m;
+  }
+  return 0u;
+}
+
+void MobSystem::BurnCorpses(uint32_t tick, World& world,
+                            std::vector<CellOp>& cellOps,
+                            std::vector<ParticleSpawn>& spawns) {
+  if (!debris_ || !BurnTablesReady()) return;
+  const uint32_t crossPct =
+      (uint32_t)std::clamp(CurrentTuning().combustion.crossLimbPct, 0, 100);
+  debris_->BurnFleshBodies(
+      [&](std::vector<DebrisSystem::FleshLattice>& lats,
+          std::vector<DebrisSystem::FleshBurn>& out) {
+        const size_t n = lats.size();
+        // THEIR OWN BUDGETS, the living's numbers. A battlefield of corpses
+        // must not starve the creatures still standing in the fire, and the
+        // living must not starve the dead: they are two populations.
+        uint32_t frontBudget = kBurnFrontPerTick;
+        uint32_t opsBudget = kBurnOpsPerTick;
+        std::vector<BurnLimbView> views(n);
+        std::vector<int> models(n, -1);
+        std::unique_ptr<bool[]> carved(new bool[n]());
+        for (size_t k = 0; k < n; k++) {
+          CorpseCoat& cc = corpseCoat_[lats[k].id];
+          views[k] = CorpseView(lats[k], cc, models[k]);
+          views[k].carved = &carved[k];
+        }
+        // ONE SNAPSHOT PER CORPSE, from the fronts at the top of the tick
+        // (Mob::BurnTick's reason: order-independent). A piece's bit is its
+        // position in its creature's group.
+        std::map<uint64_t, std::vector<size_t>> groups;
+        for (size_t k = 0; k < n; k++)
+          groups[lats[k].creature ? lats[k].creature
+                                  : (1ull << 63) | lats[k].id]
+              .push_back(k);
+        std::vector<std::vector<CrossHeatCell>> heat;
+        std::vector<int> groupOf(n, -1), bitOf(n, -1);
+        heat.reserve(groups.size());
+        for (auto& g : groups) {
+          const int gi = (int)heat.size();
+          heat.emplace_back();
+          std::vector<BurnLimbView*> parts;
+          parts.reserve(g.second.size());
+          for (size_t j = 0; j < g.second.size(); j++) {
+            groupOf[g.second[j]] = gi;
+            bitOf[g.second[j]] = (int)j;
+            parts.push_back(&views[g.second[j]]);
+          }
+          BuildCrossHeat(parts, tick, heat.back());
+        }
+        // Start body rotated by tick, the fairness every burn loop here keeps.
+        const size_t start = (size_t)(tick % (uint32_t)n);
+        for (size_t j = 0; j < n && frontBudget; j++) {
+          const size_t k = (start + j) % n;
+          BurnLimbView& v = views[k];
+          const std::vector<CrossHeatCell>& h = heat[(size_t)groupOf[k]];
+          if (!h.empty()) {
+            v.crossHeat = &h;
+            v.selfLimb = bitOf[k];
+            v.crossPct = crossPct;
+          }
+          CorpseWornProbe probe{this, &lats[k].shells, tick};
+          if (!lats[k].shells.empty()) {
+            v.occlude = &CorpseWornProbe::Call;
+            v.occludeCtx = &probe;
+          }
+          const uint32_t key = CorpseKey(lats[k].id) ^ 0xB0D1E5u;
+          CorpseCoat& cc = corpseCoat_[lats[k].id];
+          out[k].changed =
+              BurnOneLimb(v, tick, key, world, cellOps, frontBudget, opsBudget);
+          out[k].removed = cc.burn.removed;
+          cc.burn.removed = 0;
+          if (out[k].changed) cc.dirty = true;  // the coat ledger, too
+        }
+        // The brick each view may have taken ownership of, back on its body.
+        for (size_t k = 0; k < n; k++)
+          if (models[k] >= 0) *lats[k].microModel = (uint32_t)models[k];
+      },
+      world, spawns);
+  for (auto it = corpseShellIdx_.begin(); it != corpseShellIdx_.end();)
+    it = tick - it->second.seen > 60u ? corpseShellIdx_.erase(it) : std::next(it);
+}
+
+void MobSystem::StainCorpses(uint32_t tick, World& world, uint32_t& budget) {
+  if (!debris_ || matGpu_.empty()) return;
+  // The stamp that marks an entry live this tick; 0 is "never", so skip it.
+  const uint32_t stamp = tick + 1u;
+  debris_->ForEachDeadFlesh([&](DebrisSystem::FleshLattice& f) {
+    CorpseCoat& cc = corpseCoat_[f.id];
+    cc.seen = stamp;
+    if (budget == 0) return;
+    int model = -1;
+    BurnLimbView v = CorpseView(f, cc, model);
+    const uint32_t key = CorpseKey(f.id);
+    bool changed = StainOneLimb(v, tick, key, world, budget);
+    // The ledger drying reads, recounted at the living's cadence and only
+    // while something moved — a clean or settled corpse is never walked.
+    const auto& ct = CurrentTuning().coat;
+    if (cc.dirty &&
+        tick % (uint32_t)std::max(1, ct.recountTicks) == 0) {
+      TallyCoat(v, cc.led);
+      cc.dirty = false;
+    }
+    if (budget && DryOneLimb(v, cc.led, tick, key, budget)) changed = true;
+    if (changed) cc.dirty = true;
+    if (model >= 0) *f.microModel = (uint32_t)model;
+  });
+  // Bodies that went away (despawned, settled into the grid, shattered into
+  // new ids) take their entry with them.
+  for (auto it = corpseCoat_.begin(); it != corpseCoat_.end();)
+    it = it->second.seen == stamp ? std::next(it) : corpseCoat_.erase(it);
+}
+
+
 void Mob::StainTick(uint32_t tick, World& world, uint32_t& budget) {
   if (!sys_ || sys_->matGpu_.empty()) return;
   // Same rule as BurnTick, and before the budget for the same reason: the
@@ -13322,7 +13551,6 @@ void Mob::StainTick(uint32_t tick, World& world, uint32_t& budget) {
   // when it was announced. Blood that lands on a ghost locally would be a
   // SECOND opinion about the same skin, which is worse.
   if (IsGhost()) return;
-  const auto& ct = CurrentTuning().coat;
   const uint32_t mobKey = (uint32_t)id_ * 0x9E3779B9u ^ 0x57A1Eu;
   const int nl = (int)limbs_.size();
   const int start = nl > 0 ? (int)(tick % (uint32_t)nl) : 0;
@@ -13346,54 +13574,102 @@ void Mob::StainTick(uint32_t tick, World& world, uint32_t& budget) {
     // takes it off" means. Which materials are on the limb comes off the
     // LEDGER, so a clean limb reads two zeroes and pays nothing.
     if (budget == 0) continue;
-    const LimbCoat& led = limbs_[li].coat;
-    for (const CoatEntry& en : led.top) {
-      if (en.mat == 0 || en.sumAmt == 0) continue;
-      const float secs = en.mat < sys_->coatDecay_.size()
-                             ? sys_->coatDecay_[en.mat] : 0.0f;
-      if (secs <= 0.0f) continue;
-      const uint32_t floor = en.mat < sys_->coatDecayFloor_.size()
-                                 ? sys_->coatDecayFloor_[en.mat] : 0u;
-      const long tk = std::lround((double)secs * 30.0 / (double)ct.decayScale);
-      const uint32_t decayTicks = (uint32_t)std::max<long>(1, tk);
-      if (tick % decayTicks != 0) continue;
-      // One sweep of the lattice per drying material per period, rotated by a
-      // tick-keyed start and charged against the same shared budget the
-      // contact sweep spends — a 25k-voxel torso against kStainLatticePerLimb
-      // is covered over a few ticks rather than all at once.
-      const size_t n = v.Size();
-      if (n == 0) continue;
-      uint32_t limbBudget = std::min(budget, MobSystem::kStainLatticePerLimb);
-      const uint32_t spendable = limbBudget;
-      bool owned = false;
-      const size_t from = (size_t)(Hash3(key, tick, 0xDECA1u) % (uint32_t)n);
-      for (size_t j = 0; j < n && limbBudget; j++) {
-        limbBudget--;
-        const size_t vi = (from + j) % n;
-        const uint16_t cur = v.Stain(vi);
-        const uint32_t amt = BodyStainAmt(cur);
-        if (amt == 0 || amt <= floor || BodyStainMat(cur) != en.mat) continue;
-        // UNEVEN, on purpose: dropping every voxel a level at once makes a
-        // limb fade like a slider. Half of them per period is the same mean
-        // rate and reads as drying.
-        if (Hash3(key ^ (uint32_t)vi, tick, 0xDECA1u) % 1000u >= 500u) continue;
-        const uint16_t next = PackBodyStain(en.mat, amt - 1u);
-        v.SetStain(vi, next);
-        coatDirty_ = true;
-        if (!owned) owned = OwnForStain(v, sys_->microSet_);
-        if (owned) {
-          const IVec3 p = v.At(vi);
-          MicroBodyPokeStain(*sys_->microSet_, (uint32_t)*v.microModel, p.x, p.y,
-                             p.z, next);
-        }
-      }
-      budget -= std::min(budget, spendable - limbBudget);
-      if (budget == 0) break;
-    }
+    if (sys_->DryOneLimb(v, limbs_[li].coat, tick, key, budget))
+      coatDirty_ = true;
   }
   // The ledger, at its own bounded cadence — the same place and the same
   // reason RecountBurn sits at the tail of BurnTick.
   RecountCoat(tick);
+}
+
+bool MobSystem::DryOneLimb(BurnLimbView& v, const LimbCoat& led,
+                           uint32_t tick, uint32_t key, uint32_t& budget) {
+  // The drying half of Mob::StainTick, over a view, so a corpse's pieces dry
+  // by the same clock their limbs did (StainCorpses). `led` names WHICH
+  // substances are on the lattice; a clean ledger costs nothing here.
+  const auto& ct = CurrentTuning().coat;
+  bool changed = false;
+  for (const CoatEntry& en : led.top) {
+    if (en.mat == 0 || en.sumAmt == 0) continue;
+    const float secs = en.mat < coatDecay_.size() ? coatDecay_[en.mat] : 0.0f;
+    if (secs <= 0.0f) continue;
+    const uint32_t floor =
+        en.mat < coatDecayFloor_.size() ? coatDecayFloor_[en.mat] : 0u;
+    const long tk = std::lround((double)secs * 30.0 / (double)ct.decayScale);
+    const uint32_t decayTicks = (uint32_t)std::max<long>(1, tk);
+    if (tick % decayTicks != 0) continue;
+    // One sweep of the lattice per drying material per period, rotated by a
+    // tick-keyed start and charged against the same shared budget the
+    // contact sweep spends — a 25k-voxel torso against kStainLatticePerLimb
+    // is covered over a few ticks rather than all at once.
+    const size_t n = v.Size();
+    if (n == 0) continue;
+    uint32_t limbBudget = std::min(budget, kStainLatticePerLimb);
+    const uint32_t spendable = limbBudget;
+    bool owned = false;
+    const size_t from = (size_t)(Hash3(key, tick, 0xDECA1u) % (uint32_t)n);
+    for (size_t j = 0; j < n && limbBudget; j++) {
+      limbBudget--;
+      const size_t vi = (from + j) % n;
+      const uint16_t cur = v.Stain(vi);
+      const uint32_t amt = BodyStainAmt(cur);
+      if (amt == 0 || amt <= floor || BodyStainMat(cur) != en.mat) continue;
+      // UNEVEN, on purpose: dropping every voxel a level at once makes a
+      // limb fade like a slider. Half of them per period is the same mean
+      // rate and reads as drying.
+      if (Hash3(key ^ (uint32_t)vi, tick, 0xDECA1u) % 1000u >= 500u) continue;
+      const uint16_t next = PackBodyStain(en.mat, amt - 1u);
+      v.SetStain(vi, next);
+      changed = true;
+      if (!owned) owned = OwnForStain(v, microSet_);
+      if (owned) {
+        const IVec3 p = v.At(vi);
+        MicroBodyPokeStain(*microSet_, (uint32_t)*v.microModel, p.x, p.y, p.z,
+                           next);
+      }
+    }
+    budget -= std::min(budget, spendable - limbBudget);
+    if (budget == 0) break;
+  }
+  return changed;
+}
+
+void MobSystem::TallyCoat(const BurnLimbView& v, LimbCoat& out) {
+  // Occupied voxels (tombstones excluded — a carved-away voxel is not clean,
+  // it is absent, and counting it would make a dismembered limb read as
+  // washed), how many carry anything, and the two heaviest substances.
+  out = LimbCoat{};
+  CoatEntry tally[8]{};
+  size_t nt = 0;
+  const size_t n = v.Size();
+  for (size_t i = 0; i < n; i++) {
+    if (v.Mat(i) == 0) continue;  // tombstone
+    out.voxels++;
+    const uint16_t s = v.Stain(i);
+    const uint32_t amt = BodyStainAmt(s);
+    if (amt == 0) continue;
+    out.stained++;
+    out.sumAmt += amt;
+    const uint32_t mat = BodyStainMat(s);
+    size_t at = nt;
+    for (size_t t = 0; t < nt; t++)
+      if (tally[t].mat == mat) { at = t; break; }
+    if (at == nt) {
+      if (nt == 8) continue;  // a ninth substance on one limb: not ranked
+      tally[nt++] = CoatEntry{mat, 0, 0};
+    }
+    tally[at].sumAmt += amt;
+    tally[at].voxels++;
+  }
+  for (size_t t = 0; t < nt; t++) {
+    const CoatEntry& en = tally[t];
+    if (en.sumAmt > out.top[0].sumAmt) {
+      out.top[1] = out.top[0];
+      out.top[0] = en;
+    } else if (en.sumAmt > out.top[1].sumAmt) {
+      out.top[1] = en;
+    }
+  }
 }
 
 void Mob::RecountCoat(uint32_t tick, bool force) {
@@ -13419,41 +13695,13 @@ void Mob::RecountCoat(uint32_t tick, bool force) {
   // is not clean, it is absent, and counting it would make a dismembered limb
   // read as washed), how many carry anything, and the two heaviest substances.
   bodyCoat_ = LimbCoat{};
-  // Accumulator for one limb. A handful of substances at most: a creature is
-  // realistically bloody, or wet, or both, and the ledger keeps two.
-  std::vector<CoatEntry> tally;
   const int nl = (int)limbs_.size();
   for (int li = 0; li < nl; li++) {
     MobLimb& l = limbs_[li];
     LimbCoat out;
     if (l.body) {
-      tally.clear();
       BurnLimbView v = ViewOf(l);
-      const size_t n = v.Size();
-      for (size_t i = 0; i < n; i++) {
-        if (v.Mat(i) == 0) continue;  // tombstone
-        out.voxels++;
-        const uint16_t s = v.Stain(i);
-        const uint32_t amt = BodyStainAmt(s);
-        if (amt == 0) continue;
-        out.stained++;
-        out.sumAmt += amt;
-        const uint32_t mat = BodyStainMat(s);
-        size_t at = tally.size();
-        for (size_t t = 0; t < tally.size(); t++)
-          if (tally[t].mat == mat) { at = t; break; }
-        if (at == tally.size()) tally.push_back(CoatEntry{mat, 0, 0});
-        tally[at].sumAmt += amt;
-        tally[at].voxels++;
-      }
-      for (const CoatEntry& en : tally) {
-        if (en.sumAmt > out.top[0].sumAmt) {
-          out.top[1] = out.top[0];
-          out.top[0] = en;
-        } else if (en.sumAmt > out.top[1].sumAmt) {
-          out.top[1] = en;
-        }
-      }
+      MobSystem::TallyCoat(v, out);
     }
     l.coat = out;
     // THE BODY IS THE BASE RIG. A robe soaked through is not the wearer being
@@ -13752,9 +14000,9 @@ bool MobSystem::StainOneLimb(BurnLimbView& v, uint32_t tick, uint32_t rngKey,
     const float sinv = 1.0f / (float)std::max(1u, v.physScale);
     Vec3 mn{1e30f, 1e30f, 1e30f}, mx{-1e30f, -1e30f, -1e30f};
     for (int k = 0; k < 8; k++) {
-      const Vec3 c{(k & 1) ? (float)v.size.x * sinv : 0.0f,
-                   (k & 2) ? (float)v.size.y * sinv : 0.0f,
-                   (k & 4) ? (float)v.size.z * sinv : 0.0f};
+      const Vec3 c{(float)((k & 1) ? v.size.x : v.sizeMin.x) * sinv,
+                   (float)((k & 2) ? v.size.y : v.sizeMin.y) * sinv,
+                   (float)((k & 4) ? v.size.z : v.sizeMin.z) * sinv};
       const Vec3 w = v.xf->pos + Rotate(q, c);
       mn.x = std::min(mn.x, w.x); mn.y = std::min(mn.y, w.y); mn.z = std::min(mn.z, w.z);
       mx.x = std::max(mx.x, w.x); mx.y = std::max(mx.y, w.y); mx.z = std::max(mx.z, w.z);
@@ -13879,14 +14127,15 @@ bool MobSystem::StainOneLimb(BurnLimbView& v, uint32_t tick, uint32_t rngKey,
   return changed;
 }
 
-void Mob::ApplySplatter(const SplatterEvent& e) {
-  if (!sys_ || e.count <= 0 || e.amount == 0 || e.mat == 0) return;
+bool MobSystem::SplatterView(const SplatterEvent& e, BurnLimbView& v,
+                             uint32_t salt) {
+  if (e.count <= 0 || e.amount == 0 || e.mat == 0) return false;
   const Tuning& tune = CurrentTuning();
   const auto& gt = tune.gore;
   const int trialCap = std::max(0, gt.splatterPerLimb);
-  if (trialCap <= 0 || e.reach <= 0.0f || e.speed <= 0.0f || e.life <= 0) return;
+  if (trialCap <= 0 || e.reach <= 0.0f || e.speed <= 0.0f || e.life <= 0) return false;
   const float axisLen = e.axis.len();
-  if (axisLen < 1e-4f) return;
+  if (axisLen < 1e-4f) return false;
   const Vec3 axisN = e.axis * (1.0f / axisLen);
   const float coneTan = std::max(0.0f, e.cone);
   constexpr float kPi = 3.14159265f;
@@ -13959,19 +14208,27 @@ void Mob::ApplySplatter(const SplatterEvent& e) {
     return true;
   };
 
-  bool owned = false;
-  for (size_t li = 0; li < limbs_.size(); li++) {
-    MobLimb& limb = limbs_[li];
-    if (!limb.body) continue;
-    if (e.sourceMob == id_ && e.sourceLimb == (int)li) continue;
-    BurnLimbView v = ViewOf(limb);
-    if (v.Size() == 0) continue;
-    const Quat q{limb.xf.quat[0], limb.xf.quat[1], limb.xf.quat[2], limb.xf.quat[3]};
+  bool owned = false, changed = false;
+  // ONE VIEW, one pass. A do/while(false) so every "this limb is out of
+  // reach" exit below reads as the `continue` it was when this walked a
+  // creature's limbs itself (Mob::ApplySplatter now does the walking, and
+  // StainLimbs walks the corpses through the same function).
+  const size_t li = salt;
+  if (v.Size() == 0) return false;
+  do {
+    const Quat q{v.xf->quat[0], v.xf->quat[1], v.xf->quat[2], v.xf->quat[3]};
     const float sinv = 1.0f / (float)std::max(1u, v.physScale);
-    const Vec3 half{0.5f * (float)v.size.x * sinv, 0.5f * (float)v.size.y * sinv,
-                    0.5f * (float)v.size.z * sinv};
+    // The collider box's middle and half-diagonal. `sizeMin` is zero on a live
+    // limb (this is then exactly the old centre) and negative on a centred
+    // debris lattice.
+    const Vec3 half{0.5f * (float)(v.size.x - v.sizeMin.x) * sinv,
+                    0.5f * (float)(v.size.y - v.sizeMin.y) * sinv,
+                    0.5f * (float)(v.size.z - v.sizeMin.z) * sinv};
+    const Vec3 mid{0.5f * (float)(v.size.x + v.sizeMin.x) * sinv,
+                   0.5f * (float)(v.size.y + v.sizeMin.y) * sinv,
+                   0.5f * (float)(v.size.z + v.sizeMin.z) * sinv};
     const float limbR = half.len();
-    const Vec3 centre = limb.xf.pos + Rotate(q, half);
+    const Vec3 centre = v.xf->pos + Rotate(q, mid);
     const Vec3 toC = centre - e.origin;
     const float dist = toC.len();
     if (dist - limbR > e.reach) continue;
@@ -14020,8 +14277,8 @@ void Mob::ApplySplatter(const SplatterEvent& e) {
     }
 
     // Something will be thrown at it: the index, then one arc per trial.
-    BodyBurnState& st = limb.burn;
-    if (st.idx.empty()) sys_->BuildBurnIndex(v);
+    BodyBurnState& st = *v.burn;
+    if (st.idx.empty()) BuildBurnIndex(v);
     if (st.idx.empty()) continue;
     st.quiet = 0;
     const IVec3 bd = st.dims, bm = st.min;
@@ -14061,11 +14318,11 @@ void Mob::ApplySplatter(const SplatterEvent& e) {
       const uint16_t next = RaiseBodyStain(cur, e.mat, want);
       if (next == cur) return;
       v.SetStain(vi, next);
-      coatDirty_ = true;
-      if (!owned) owned = OwnForStain(v, sys_->microSet_);
+      changed = true;
+      if (!owned) owned = OwnForStain(v, microSet_);
       if (owned) {
         const IVec3 pp = v.At(vi);
-        MicroBodyPokeStain(*sys_->microSet_, (uint32_t)*v.microModel, pp.x, pp.y,
+        MicroBodyPokeStain(*microSet_, (uint32_t)*v.microModel, pp.x, pp.y,
                            pp.z, next);
       }
     };
@@ -14142,8 +14399,8 @@ void Mob::ApplySplatter(const SplatterEvent& e) {
         // This tick's segment against the index box, in the lattice frame,
         // and a unit-step march through whatever of it is inside. A limb the
         // droplet never enters costs one slab test per tick of flight.
-        const Vec3 a = RotateInv(q, pos - limb.xf.pos) * scale;
-        const Vec3 b = RotateInv(q, nxt - limb.xf.pos) * scale;
+        const Vec3 a = RotateInv(q, pos - v.xf->pos) * scale;
+        const Vec3 b = RotateInv(q, nxt - v.xf->pos) * scale;
         const Vec3 d = b - a;
         float t0 = 0.0f, t1 = 1.0f;
         bool miss = false;
@@ -14181,8 +14438,21 @@ void Mob::ApplySplatter(const SplatterEvent& e) {
         if (vel.y < 0.0f && pos.y < floorY) break;
       }
     }
+  } while (false);
+  return changed;
+}
+
+void Mob::ApplySplatter(const SplatterEvent& e) {
+  if (!sys_) return;
+  for (size_t li = 0; li < limbs_.size(); li++) {
+    MobLimb& limb = limbs_[li];
+    if (!limb.body) continue;
+    if (e.sourceMob == id_ && e.sourceLimb == (int)li) continue;
+    BurnLimbView v = ViewOf(limb);
+    if (sys_->SplatterView(e, v, (uint32_t)li)) coatDirty_ = true;
   }
 }
+
 
 bool MobSystem::CarveLimbRadial(uint64_t bodyHandle, Vec3 centerWorldVoxel,
                                 float radiusVoxels, bool ragged, bool eject,
@@ -15764,7 +16034,7 @@ void Mob::DetachLimb(int limbIndex, bool adopt) {
     debris_->AdoptBody(limb.body, limb.voxels, limb.xf,
                        limb.MicroRef(SkinScaleOf(limb)), PhysScaleOf(limb),
                        std::move(limb.skinVoxels), def.bleedMat, WoundOf(limb),
-                       /*dead=*/true, defIndex_);
+                       /*dead=*/true, defIndex_, id_);
     limb.skinVoxels.clear();
     limb.carved = false;
     // ...AND THE SLOT FORGETS THE INDEX, not just the ownership. `carved =
@@ -16120,7 +16390,7 @@ void Mob::Die() {
     debris_->AdoptBody(limb.body, limb.voxels, limb.xf,
                        limb.MicroRef(SkinScaleOf(limb)), PhysScaleOf(limb),
                        std::move(limb.skinVoxels), def_->bleedMat,
-                       WoundOf(limb), /*dead=*/true, defIndex_);
+                       WoundOf(limb), /*dead=*/true, defIndex_, id_);
     // A CORPSE FALLS WHERE IT STOOD, which for the avatar is entirely inside
     // the player's capsule proxy, and for an NPC killed at sword's reach is
     // often half inside it. Handing those limbs to the plain MOVING layer in
@@ -18711,110 +18981,110 @@ int Mob::WornShellAlong(int bodyLimb, const Vec3& from, const Vec3& dir,
       if (skel_.parts[s].parent != bodyLimb) continue;
       MobLimb& shell = limbs_[s];
       if (!shell.body) continue;          // strap cut: it is not there any more
-      const bool fine = shell.HasFineSkin();
-      const size_t n = fine ? shell.skinVoxels.size() : shell.voxels.size();
-      if (n == 0) continue;
       if (k >= piece.index.size()) continue;
-      WornPiece::ShellIndex& ix = piece.index[k];
-
-      // (Re)build the dense index whenever the lattice changed size. Carving
-      // and burning both COMPACT the lattice, so the count is a sufficient
-      // witness — and it is the same witness the save/restore path uses to
-      // decide a limb was carved.
-      if (ix.builtFor != n) {
-        IVec3 mn{1 << 30, 1 << 30, 1 << 30}, mx{-(1 << 30), -(1 << 30),
-                                                -(1 << 30)};
-        for (size_t i = 0; i < n; i++) {
-          const IVec3 q = fine ? IVec3{shell.skinVoxels[i].x,
-                                       shell.skinVoxels[i].y,
-                                       shell.skinVoxels[i].z}
-                               : IVec3{shell.voxels[i].x, shell.voxels[i].y,
-                                       shell.voxels[i].z};
-          mn.x = std::min(mn.x, q.x); mn.y = std::min(mn.y, q.y);
-          mn.z = std::min(mn.z, q.z);
-          mx.x = std::max(mx.x, q.x); mx.y = std::max(mx.y, q.y);
-          mx.z = std::max(mx.z, q.z);
-        }
-        const IVec3 dims{mx.x - mn.x + 1, mx.y - mn.y + 1, mx.z - mn.z + 1};
-        const uint64_t cells = (uint64_t)dims.x * dims.y * dims.z;
-        // Same refusal BuildBurnIndex makes, and for the same reason: a long
-        // diagonal sliver would allocate a lot to index very little. A refused
-        // shell simply does not occlude, which fails toward "the fire reaches
-        // the skin" — the honest direction to fail in.
-        if (cells > (1u << 20)) {
-          ix.builtFor = n;
-          ix.mat.clear();
-          ix.dims = IVec3{0, 0, 0};
-          continue;
-        }
-        ix.min = mn;
-        ix.dims = dims;
-        ix.mat.assign((size_t)cells, 0);
-        for (size_t i = 0; i < n; i++) {
-          const IVec3 q = fine ? IVec3{shell.skinVoxels[i].x,
-                                       shell.skinVoxels[i].y,
-                                       shell.skinVoxels[i].z}
-                               : IVec3{shell.voxels[i].x, shell.voxels[i].y,
-                                       shell.voxels[i].z};
-          const uint32_t m = fine
-                                 ? (uint32_t)(shell.skinVoxels[i].material &
-                                              0xFFFu)
-                                 : (uint32_t)(shell.voxels[i].payload & 0xFFFu);
-          // A material-0 tombstone is an unflushed burn: the voxel is already
-          // gone and must not go on occluding.
-          if (m == 0) continue;
-          const size_t ci = (size_t)(((q.z - mn.z) * (size_t)dims.y +
-                                      (q.y - mn.y)) *
-                                         (size_t)dims.x +
-                                     (q.x - mn.x));
-          ix.mat[ci] = (uint16_t)m;
-        }
-        ix.builtFor = n;
-      }
-      if (ix.mat.empty()) continue;
-
-      // World -> the shell's own lattice. The pose is read from `shell.xf` as
-      // the animation left it, NEVER re-read from Jolt: a live shell is
-      // kinematic and re-posed every tick, and a mid-pass re-read would test
-      // against a pose the rest of the burn pass was not computed against
-      // (gotcha-live-limb-carve-pose).
-      const Quat q{shell.xf.quat[0], shell.xf.quat[1], shell.xf.quat[2],
-                   shell.xf.quat[3]};
-      const float scale = (float)std::max(1u, SkinScaleOf(shell));
-      Vec3 l = RotateInv(q, from - shell.xf.pos) * scale;
-      // ONE transform for the whole march. A shell rides its limb, so the
-      // rotation does not change along the segment: the lattice-space step is
-      // the rotated direction, and moving 1/scale world voxels is one cell.
-      const float dl = dir.len();
-      const Vec3 stepL =
-          dl > 1e-6f ? RotateInv(q, dir * (1.0f / dl)) : Vec3{0, 0, 0};
-      // Bounded, like every other loop in this system: a caller asking for a
-      // long ray gets a truncated one rather than an unbounded cost.
-      const int steps = std::min(std::max(1, maxSteps),
-                                 std::max(1, (int)(dist * scale) + 1));
-      for (int st = 0; st < steps; st++) {
-        const int lx = ifloor(l.x) - ix.min.x, ly = ifloor(l.y) - ix.min.y,
-                  lz = ifloor(l.z) - ix.min.z;
-        if (lx >= 0 && ly >= 0 && lz >= 0 && lx < ix.dims.x &&
-            ly < ix.dims.y && lz < ix.dims.z) {
-          const uint32_t m =
-              ix.mat[(size_t)(((size_t)lz * ix.dims.y + ly) * ix.dims.x + lx)];
-          if (m) {
-            if (outMat) *outMat = m;
-            // Where along the march the shell was met, back in world voxels:
-            // `st` lattice cells of 1/scale each along the unit direction.
-            if (outAt)
-              *outAt = dl > 1e-6f
-                           ? from + dir * ((float)st / (scale * dl))
-                           : from;
-            return s;
-          }
-        }
-        l += stepL;
+      // The pose is read from `shell.xf` as the animation left it, NEVER
+      // re-read from Jolt: a live shell is kinematic and re-posed every tick,
+      // and a mid-pass re-read would test against a pose the rest of the burn
+      // pass was not computed against (gotcha-live-limb-carve-pose).
+      const bool fine = shell.HasFineSkin();
+      const uint32_t m = MarchShell(
+          piece.index[k], fine ? &shell.skinVoxels : nullptr,
+          fine ? nullptr : &shell.voxels, shell.xf, SkinScaleOf(shell), from,
+          dir, dist, maxSteps, outAt);
+      if (m) {
+        if (outMat) *outMat = m;
+        return s;
       }
     }
   }
   return -1;
+}
+
+uint32_t MarchShell(ShellMarchIndex& ix, const std::vector<PrefabVoxel>* skin,
+                    const std::vector<DebrisVoxel>* coll,
+                    const BodyTransform& xf, uint32_t scaleU, const Vec3& from,
+                    const Vec3& dir, float dist, int maxSteps, Vec3* outAt) {
+  const bool fine = skin != nullptr;
+  const size_t n = fine ? skin->size() : (coll ? coll->size() : 0);
+  if (n == 0) return 0u;
+  auto at = [&](size_t i) {
+    return fine ? IVec3{(*skin)[i].x, (*skin)[i].y, (*skin)[i].z}
+                : IVec3{(*coll)[i].x, (*coll)[i].y, (*coll)[i].z};
+  };
+  // (Re)build the dense index whenever the lattice changed size. Carving and
+  // burning both COMPACT the lattice, so the count is a sufficient witness —
+  // and it is the same witness the save/restore path uses to decide a limb
+  // was carved.
+  if (ix.builtFor != n) {
+    IVec3 mn{1 << 30, 1 << 30, 1 << 30}, mx{-(1 << 30), -(1 << 30), -(1 << 30)};
+    for (size_t i = 0; i < n; i++) {
+      const IVec3 q = at(i);
+      mn.x = std::min(mn.x, q.x); mn.y = std::min(mn.y, q.y);
+      mn.z = std::min(mn.z, q.z);
+      mx.x = std::max(mx.x, q.x); mx.y = std::max(mx.y, q.y);
+      mx.z = std::max(mx.z, q.z);
+    }
+    const IVec3 dims{mx.x - mn.x + 1, mx.y - mn.y + 1, mx.z - mn.z + 1};
+    const uint64_t cells = (uint64_t)dims.x * dims.y * dims.z;
+    ix.builtFor = n;
+    // Same refusal BuildBurnIndex makes, and for the same reason: a long
+    // diagonal sliver would allocate a lot to index very little. A refused
+    // shell simply does not occlude, which fails toward "the fire reaches the
+    // skin" — the honest direction to fail in.
+    if (cells > (1u << 20)) {
+      ix.mat.clear();
+      ix.dims = IVec3{0, 0, 0};
+      return 0u;
+    }
+    ix.min = mn;
+    ix.dims = dims;
+    ix.mat.assign((size_t)cells, 0);
+    for (size_t i = 0; i < n; i++) {
+      const uint32_t m = fine ? (uint32_t)((*skin)[i].material & 0xFFFu)
+                              : (uint32_t)((*coll)[i].payload & 0xFFFu);
+      // A material-0 tombstone is an unflushed burn: the voxel is already gone
+      // and must not go on occluding.
+      if (m == 0) continue;
+      const IVec3 q = at(i);
+      ix.mat[(size_t)(((q.z - mn.z) * (size_t)dims.y + (q.y - mn.y)) *
+                          (size_t)dims.x +
+                      (q.x - mn.x))] = (uint16_t)m;
+    }
+  }
+  if (ix.mat.empty()) return 0u;
+
+  // World -> the shell's own lattice.
+  const Quat q{xf.quat[0], xf.quat[1], xf.quat[2], xf.quat[3]};
+  const float scale = (float)std::max(1u, scaleU);
+  Vec3 l = RotateInv(q, from - xf.pos) * scale;
+  // ONE transform for the whole march. A shell rides its limb, so the rotation
+  // does not change along the segment: the lattice-space step is the rotated
+  // direction, and moving 1/scale world voxels is one cell.
+  const float dl = dir.len();
+  const Vec3 stepL =
+      dl > 1e-6f ? RotateInv(q, dir * (1.0f / dl)) : Vec3{0, 0, 0};
+  // Bounded, like every other loop in this system: a caller asking for a long
+  // ray gets a truncated one rather than an unbounded cost.
+  const int steps = std::min(std::max(1, maxSteps),
+                             std::max(1, (int)(dist * scale) + 1));
+  for (int st = 0; st < steps; st++) {
+    const int lx = ifloor(l.x) - ix.min.x, ly = ifloor(l.y) - ix.min.y,
+              lz = ifloor(l.z) - ix.min.z;
+    if (lx >= 0 && ly >= 0 && lz >= 0 && lx < ix.dims.x && ly < ix.dims.y &&
+        lz < ix.dims.z) {
+      const uint32_t m =
+          ix.mat[(size_t)(((size_t)lz * ix.dims.y + ly) * ix.dims.x + lx)];
+      if (m) {
+        // Where along the march the shell was met, back in world voxels:
+        // `st` lattice cells of 1/scale each along the unit direction.
+        if (outAt)
+          *outAt = dl > 1e-6f ? from + dir * ((float)st / (scale * dl)) : from;
+        return m;
+      }
+    }
+    l += stepL;
+  }
+  return 0u;
 }
 
 // =============================================================================

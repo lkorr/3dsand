@@ -613,6 +613,15 @@ const char* const kOrder[] = {
     // on contact and water rinses it (owner report 2026-09-13). Ticks the
     // world for the last two and regenerates it on the way out.
     "body-stain",
+    // ...and the DEAD take the same coat: a corpse in blood is bloodied and in
+    // water is washed, by the living's own contact pass (owner report
+    // 2026-09-22). Ticks the world and regenerates it on the way out.
+    "corpse-wash",
+    // ...and the three things a corpse did not inherit from the creature it
+    // was: heat crossing its joints, its armour shielding it, and a burst of
+    // blood landing on it (owner report 2026-09-22). Each ticks the world and
+    // regenerates it on the way out.
+    "corpse-crossheat", "corpse-worn", "corpse-splatter",
     // ...and what landed there is a SUBSTANCE, not a colour: the per-limb coat
     // ledger names the material, it dries at that material's own authored rate
     // (and does not at the default one), and a coat can be tracked back onto
@@ -657,6 +666,10 @@ const char* const kOrder[] = {
     // (owner report 2026-09-02: the corpse pulsed at its death colour for
     // good). Same world fire as burn-cap, regenerated on the way out.
     "corpse-burn",
+    // ...and a laser through a head kills it in place and bores a hole: hp
+    // does not decapitate, and dead flesh takes the flesh bore, not the rock
+    // melt (owner report 2026-09-22). Pristine ground, CPU only.
+    "laser-head",
     // ---- NOTHING IS LEFT HANGING (2026-09-03) -----------------------------
     // LAST of everything that touches the shared World except `voxregion`, and
     // that position was EARNED rather than chosen. It first sat at the end of

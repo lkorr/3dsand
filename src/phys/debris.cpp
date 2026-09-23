@@ -2781,6 +2781,125 @@ void DebrisSystem::SettleBodies(uint32_t tick, World& world,
 // Grid writes ride the MutationQueue like settle-back; RNG is counter-based
 // (serial, tick, voxel, rule). Idle cost is zero: bodies with no self-driven
 // voxels skip unless the sim is actually moving in a chunk they overlap.
+DebrisSystem::FleshLattice DebrisSystem::FleshOf(Body& b) {
+  RefreshLocalBounds(b);
+  FleshLattice f;
+  f.id = ((uint64_t)b.ownerAtCreate << 48) | (uint64_t)b.serial;
+  f.creature = b.creature;
+  const bool fine = b.HasFineSkin();
+  if (fine) f.skin = &b.skinVoxels; else f.coll = &b.voxels;
+  f.scale = std::max(1u, fine ? b.micro.skinScale : b.physScale);
+  f.physScale = std::max(1u, b.physScale);
+  f.xf = &b.xf;
+  f.lo = IVec3{b.lmin[0], b.lmin[1], b.lmin[2]};
+  f.hi = IVec3{b.lmax[0] + 1, b.lmax[1] + 1, b.lmax[2] + 1};
+  f.microModel = &b.micro.model;
+  f.selfActive = b.activeCount > 0;
+  return f;
+}
+
+void DebrisSystem::BurnFleshBodies(
+    const std::function<void(std::vector<FleshLattice>&,
+                             std::vector<FleshBurn>&)>& burn,
+    World& world, std::vector<ParticleSpawn>& spawns) {
+  if (!burn || bodies_.empty()) return;
+  // Which bodies, by index. Stable for the whole call: the callback edits
+  // lattices in place (tombstones, material rewrites, coats) and nothing is
+  // appended or erased until the tail below has run for every body.
+  std::vector<size_t> which;
+  for (size_t i = 0; i < bodies_.size(); i++) {
+    const Body& b = bodies_[i];
+    if (IsFlesh(b) && OwnedLocally(b) && !b.voxels.empty()) which.push_back(i);
+  }
+  if (which.empty()) return;
+  std::vector<FleshLattice> lats;
+  lats.reserve(which.size());
+  for (size_t i : which) lats.push_back(FleshOf(bodies_[i]));
+  // Its armour: every follower strapped to it. A handful per corpse at most.
+  for (size_t k = 0; k < which.size(); k++) {
+    const uint64_t host = bodies_[which[k]].handle;
+    for (const Body& sh : bodies_) {
+      if (sh.wornHost != host) continue;
+      const bool fine = sh.HasFineSkin();
+      FleshShell fs;
+      fs.id = ((uint64_t)sh.ownerAtCreate << 48) | (uint64_t)sh.serial;
+      fs.skin = fine ? &sh.skinVoxels : nullptr;
+      fs.coll = fine ? nullptr : &sh.voxels;
+      fs.xf = &sh.xf;
+      fs.scale = std::max(1u, fine ? sh.micro.skinScale : sh.physScale);
+      lats[k].shells.push_back(fs);
+    }
+  }
+  std::vector<FleshBurn> out(lats.size());
+  burn(lats, out);
+
+  std::vector<Body> fragments;
+  std::vector<size_t> dead;
+  uint32_t newBodyBudget = kMaxNewBodiesPerTick;
+  bool rebuiltOne = false;
+  for (size_t k = 0; k < which.size(); k++) {
+    if (!out[k].changed && !out[k].removed) continue;
+    Body& b = bodies_[which[k]];
+    if (BurnTail(b, out[k].removed, out[k].changed, world, fragments, spawns,
+                 newBodyBudget, rebuiltOne))
+      dead.push_back(which[k]);
+  }
+  std::sort(dead.begin(), dead.end());
+  for (size_t i = dead.size(); i-- > 0;) {
+    const size_t bi = dead[i];
+    bodies_[bi] = std::move(bodies_.back());
+    bodies_.pop_back();
+  }
+  for (Body& f : fragments) {
+    bodies_.push_back(std::move(f));
+    instancesDirty_ = true;
+  }
+}
+
+uint32_t DebrisSystem::RewriteBodyMaterial(uint64_t handle, uint32_t fromMat,
+                                          uint32_t toMat, uint32_t maxCount) {
+  for (Body& b : bodies_) {
+    if (b.handle != handle) continue;
+    const bool fine = b.HasFineSkin();
+    const size_t n = fine ? b.skinVoxels.size() : b.voxels.size();
+    uint32_t done = 0;
+    bool owned = false;
+    for (size_t i = 0; i < n && done < maxCount; i++) {
+      IVec3 p;
+      if (fine) {
+        PrefabVoxel& v = b.skinVoxels[i];
+        if ((uint32_t)(v.material & 0xFFFu) != fromMat) continue;
+        v.material = (uint16_t)((v.material & ~0xFFFu) | (toMat & 0xFFFu));
+        v.color = 0;
+        p = {v.x, v.y, v.z};
+      } else {
+        DebrisVoxel& v = b.voxels[i];
+        if ((uint32_t)(v.payload & 0xFFFu) != fromMat) continue;
+        v.payload = (uint16_t)((v.payload & ~0xFFFu) | (toMat & 0xFFFu));
+        v.color = 0;
+        p = {v.x, v.y, v.z};
+      }
+      done++;
+      if (!owned && b.micro.Valid() && microSet_) {
+        const int own = MicroBodyOwn(*microSet_, b.micro.model);
+        if (own >= 0) {
+          b.micro.model = (uint32_t)own;
+          owned = true;
+        }
+      }
+      if (owned)
+        MicroBodyPoke(*microSet_, b.micro.model, p.x, p.y, p.z, (uint8_t)toMat, 0);
+    }
+    if (done) {
+      if (fine) DeriveColliderFromSkin(b);
+      RecountBurn(b);
+      instancesDirty_ = true;
+    }
+    return done;
+  }
+  return 0;
+}
+
 void DebrisSystem::BurnBodies(uint32_t tick, World& world,
                               std::vector<CellOp>& cellOps,
                               std::vector<ParticleSpawn>& spawns) {
@@ -2836,6 +2955,10 @@ void DebrisSystem::BurnBodies(uint32_t tick, World& world,
     // Counting ghosts would quietly starve the owner's own bodies of budget in
     // proportion to how much of the peer's battlefield is in view.
     if (!OwnedLocally(b)) return false;
+    // DEAD FLESH BURNS IN MobSystem::BurnCorpses (see IsFlesh): the living
+    // limb pass, with the creature's cross-joint heat and its armour. Not
+    // counted among the scanners either, so it takes no share of this budget.
+    if (IsFlesh(b)) return false;
     const uint32_t n = (uint32_t)(b.HasFineSkin() ? b.skinVoxels.size()
                                                   : b.voxels.size());
     if (n == 0) return false;
@@ -3330,6 +3453,32 @@ void DebrisSystem::BurnBodies(uint32_t tick, World& world,
     }
     b.burnCursor = n > 0 ? (b.burnCursor + steps) % n : 0;
 
+    if (BurnTail(b, removed, changed, world, fragments, spawns, newBodyBudget,
+                 rebuiltOne)) {
+      dead.push_back(bi);
+      continue;
+    }
+  }
+
+  // Erase the dead, highest index first so each swap-remove moves a body that
+  // is not itself waiting to be erased.
+  std::sort(dead.begin(), dead.end());
+  for (size_t i = dead.size(); i-- > 0;) {
+    const size_t bi = dead[i];
+    bodies_[bi] = std::move(bodies_.back());
+    bodies_.pop_back();
+  }
+  for (Body& f : fragments) {
+    bodies_.push_back(std::move(f));
+    instancesDirty_ = true;
+  }
+}
+
+bool DebrisSystem::BurnTail(Body& b, uint32_t removed, bool changed,
+                            World& world, std::vector<Body>& fragments,
+                            std::vector<ParticleSpawn>& spawns,
+                            uint32_t& newBodyBudget, bool& rebuiltOne) {
+  const bool fine = b.HasFineSkin();
     if (removed) {
       // Compact the AUTHORITATIVE lattice, then re-derive the collider from it.
       // Data flows skin -> collider and never the other way, so a fine-skinned
@@ -3350,7 +3499,8 @@ void DebrisSystem::BurnBodies(uint32_t tick, World& world,
             b.voxels.end());
       }
       b.burnedSinceRebuild += removed;
-      const uint32_t latNow = (uint32_t)lat.Size();
+      const uint32_t latNow =
+          (uint32_t)(fine ? b.skinVoxels.size() : b.voxels.size());
       if (latNow) b.burnCursor %= latNow;
       // removals can disconnect the remainder: split fragments off (bodies /
       // ballistic particles) before recounting. The connectivity flood is O(n)
@@ -3392,9 +3542,8 @@ void DebrisSystem::BurnBodies(uint32_t tick, World& world,
       ReleaseBody(b);
       b.voxels.clear();  // nothing below may burn it again this tick
       b.skinVoxels.clear();
-      dead.push_back(bi);
       instancesDirty_ = true;
-      continue;
+      return true;
     }
 
     // batched collider refresh: the charred shape sheds its burned voxels
@@ -3426,20 +3575,7 @@ void DebrisSystem::BurnBodies(uint32_t tick, World& world,
         rebuiltOne = true;
       }
     }
-  }
-
-  // Erase the dead, highest index first so each swap-remove moves a body that
-  // is not itself waiting to be erased.
-  std::sort(dead.begin(), dead.end());
-  for (size_t i = dead.size(); i-- > 0;) {
-    const size_t bi = dead[i];
-    bodies_[bi] = std::move(bodies_.back());
-    bodies_.pop_back();
-  }
-  for (Body& f : fragments) {
-    bodies_.push_back(std::move(f));
-    instancesDirty_ = true;
-  }
+  return false;
 }
 
 void DebrisSystem::ShatterBody(Body& b, World& world, std::vector<Body>& fragments,
@@ -3693,6 +3829,7 @@ void DebrisSystem::ShatterBody(Body& b, World& world, std::vector<Body>& fragmen
       nb.bleedMat = b.bleedMat;
       nb.dead = b.dead;  // half a corpse is still a corpse
       nb.defIndex = b.defIndex;   // ...and still that creature's flesh
+      nb.creature = b.creature;
       // The fragment's skin rebases by the SAME corner, expressed in skin
       // units. Both lattices must land on one origin or the art slides off the
       // collider — the same agreement ReskinMicro maintains after a carve.
@@ -3928,7 +4065,7 @@ void DebrisSystem::AdoptBody(uint64_t handle, std::vector<DebrisVoxel> voxels,
                              uint32_t physScale,
                              std::vector<PrefabVoxel> skinVoxels,
                              uint32_t bleedMat, BodyWound wound, bool dead,
-                             int defIndex) {
+                             int defIndex, uint64_t creature) {
   if (handle == 0 || voxels.empty()) return;
   Body body;
   body.handle = handle;
@@ -3973,6 +4110,7 @@ void DebrisSystem::AdoptBody(uint64_t handle, std::vector<DebrisVoxel> voxels,
   body.bleedMat = bleedMat;
   body.dead = dead;
   body.defIndex = defIndex;
+  body.creature = creature;
   RecountBurn(body);
   bodies_.push_back(std::move(body));
   instancesDirty_ = true;
@@ -5923,6 +6061,7 @@ bool DebrisSystem::SplitBody(uint64_t handle, Vec3 planePointVoxel,
     newBodies[h].bleedMat = b.bleedMat;
     newBodies[h].dead = b.dead;
     newBodies[h].defIndex = b.defIndex;
+    newBodies[h].creature = b.creature;
     RecountBurn(newBodies[h]);
     phys_->SetBodyVelocities(newBodies[h].handle, lin, ang);
   }
