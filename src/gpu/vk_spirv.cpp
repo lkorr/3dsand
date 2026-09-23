@@ -4,6 +4,7 @@
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
+#include <mutex>
 #include <sstream>
 
 // Tint's headers are noisy under MSVC's default warning level and are not ours
@@ -273,6 +274,22 @@ CompileResult Compile(const std::string& wgsl, const std::string& label,
   // takes a Program, not a cached IR — which is what this line makes visible.
   const auto tTint0 = std::chrono::steady_clock::now();
 
+  // TINT RUNS ONE ENTRY POINT AT A TIME. The pipeline pool compiles on several
+  // threads, and with Tint running concurrently a cold compile produced
+  // errors about options nobody set -- "unsupported SPIR-V version", and
+  // "immediate 'tint_frag_depth_min' exceeds maximum immediate block size" for
+  // a COMPUTE entry (2026-09-22, sim_fluid_seam.wgsl, a different entry point
+  // each run). Those were first read as a torn shader_cache file (see the
+  // write-then-rename in rhi_vulkan.cpp, which is also true) but this one never
+  // touched the cache. spirv-opt below and the driver compile after it stay
+  // parallel, and they are the expensive part (fardown: Tint 165 ms, spirv-opt
+  // 14 s).
+  // Every Tint object lives inside this block, so each is destroyed before
+  // the lock (constructed first) is released.
+  static std::mutex tintMutex;
+  {
+  std::lock_guard<std::mutex> tintLock(tintMutex);
+
   // 1. WGSL -> AST program. Parse errors surface here with source locations.
   tint::Source::File file(label, wgsl);
   tint::Program program = tint::wgsl::reader::Parse(&file);
@@ -320,6 +337,7 @@ CompileResult Compile(const std::string& wgsl, const std::string& label,
   }
 
   r.spirv = std::move(spv.Get().spirv);
+  }  // tintLock
   if (TimingOn()) {
     const double ms = std::chrono::duration<double, std::milli>(
                           std::chrono::steady_clock::now() - tTint0)

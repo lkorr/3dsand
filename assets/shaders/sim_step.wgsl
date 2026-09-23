@@ -625,12 +625,16 @@ fn reposeSnapOpen(c : vec3<i32>) -> bool {
 // and cross into a neighbour chunk that may be asleep, and a boundary artifact
 // every 16 cells is not acceptable.
 //
-// Ring members are re-filled by every dirty chunk that touches them. That is
-// redundant, never divergent -- the bits are a pure function of voxel state
-// that nothing in this pass writes -- and the stamp test below skips most of
-// it. The skip READS state this pass writes, so which workgroup does the work
-// depends on scheduling; WHAT IT WRITES does not, which is the only thing rule
-// 1 is about.
+// EACH RING SLOT HAS EXACTLY ONE OWNER, decided from this tick's dirty flags
+// (reposeRingOwned below). It used to be "every dirty chunk that touches a
+// slot fills it, and a stamp test skips the ones already done" -- but a stamp
+// is only published when a workgroup FINISHES, and with thousands of
+// workgroups in flight at once almost none of them saw one. Measured
+// 2026-09-22 on a forest fire (~5,000 dirty chunks, a solid block of smoke):
+// 5.1 ms/tick, i.e. nearly every slot filled by all of its up-to-ten
+// neighbours. Ownership is a pure function of dirtyIn, so which workgroup
+// does the work is no longer scheduling-dependent either; the bits written
+// were always a pure function of pre-CA voxel state.
 //
 // A SENTINEL CHUNK COSTS 128 STORES AND NO VOXEL READS. Its material is
 // uniform, so its occupancy bit is uniform, so the whole 4096-cell bitfield is
@@ -687,6 +691,29 @@ fn reposeRingSlot(cx : u32, cy : u32, cz : u32, k : u32) -> u32 {
   return (nz * NCHUNK + ny) * NCHUNK + nx;
 }
 
+// Does the dirty chunk at (cx,cy,cz) own ring member k? The member's slot s is
+// in the ring of every dirty centre s - offset(j); the owner is the one with
+// the SMALLEST j. Offset 0 is j = 0, so a dirty chunk always owns itself, and
+// every slot some dirty chunk's ring reaches has exactly one owner.
+fn reposeRingOwned(cx : u32, cy : u32, cz : u32, k : u32) -> bool {
+  let o = reposeRingOffset(k);
+  let sx = i32(cx) + o.x;
+  let sy = i32(cy) + o.y;
+  let sz = i32(cz) + o.z;
+  for (var j = 0u; j < k; j++) {
+    let oj = reposeRingOffset(j);
+    let nx = u32((sx - oj.x + 2 * i32(NCHUNK)) % i32(NCHUNK));
+    let ny = u32((sy - oj.y + 2 * i32(NCHUNK)) % i32(NCHUNK));
+    let nz = u32((sz - oj.z + 2 * i32(NCHUNK)) % i32(NCHUNK));
+    if (dirtyIn[(nz * NCHUNK + ny) * NCHUNK + nx] != 0u) { return false; }
+  }
+  return true;
+}
+
+var<workgroup> wgReposeOwned : array<u32, REPOSE_RING>;
+var<workgroup> wgReposeEntry : u32;
+var<workgroup> wgReposeFlag : array<u32, 4224>;   // CHUNK_VOL + CHUNK_VOL / 32
+
 @compute @workgroup_size(64)
 fn reposesnap(@builtin(workgroup_id) wg : vec3<u32>,
               @builtin(local_invocation_index) li : u32) {
@@ -697,22 +724,26 @@ fn reposesnap(@builtin(workgroup_id) wg : vec3<u32>,
   let cx = centre % NCHUNK;
   let wpc = CHUNK_VOL / 32u;   // 128 bitfield words per chunk
 
-  // PASS 1: the bits. Work items are FLATTENED over (ring member, word) so the
-  // per-item skip below sits in non-uniform control flow with no barrier in it
-  // -- WGSL forbids a workgroupBarrier() under a non-uniform branch, and this
-  // shape sidesteps the question instead of arguing about it.
-  for (var t = li; t < REPOSE_RING * wpc; t += 64u) {
-    let k = t / wpc;
-    let i = t % wpc;
+  // PASS 0: which ring members are OURS (one thread each, then shared).
+  if (li < REPOSE_RING) {
+    wgReposeOwned[li] = select(0u, 1u, reposeRingOwned(cx, cy, cz, li));
+  }
+  workgroupBarrier();
+
+  // PASS 1: the bits, one ring member at a time. The loop is UNIFORM (every
+  // branch that holds a barrier tests a workgroupUniformLoad), so a member is
+  // read COALESCED -- thread v loads voxel v into a padded flag array -- and
+  // then packed thread-per-word out of workgroup memory. The previous shape,
+  // thread-per-word straight from the page, strode 128 B between lanes on
+  // every load; measured on a forest fire it was 2.6 ms/tick of a pass whose
+  // whole input is one read of each chunk.
+  for (var k = 0u; k < REPOSE_RING; k++) {
+    // Another dirty chunk owns this member and fills it (reposeRingOwned).
+    if (workgroupUniformLoad(&wgReposeOwned[k]) == 0u) { continue; }
     let slot = reposeRingSlot(cx, cy, cz, k);
-    // A stamp already at this tick's value means SOME workgroup has already
-    // written every word of this chunk -- see pass 2 for why that is safe to
-    // rely on. Skipping is then free of consequence: the bits are a pure
-    // function of voxel state that nothing in this pass writes, so whoever did
-    // the work wrote exactly what this thread would have.
-    if (reposeSnap[REPOSE_SNAP_TICK_BASE + slot] == stamp) { continue; }
     let wordBase = slot * wpc;
-    let e = pageTable[slot];
+    if (li == 0u) { wgReposeEntry = pageTable[slot]; }
+    let e = workgroupUniformLoad(&wgReposeEntry);
     if ((e & PT_SENTINEL_BIT) != 0u) {
       // Uniform by definition: EMPTY, UNIFORM(mat) and JITTER(mat) all hold ONE
       // material, and JITTER varies only the palette nibble -- which this
@@ -722,34 +753,32 @@ fn reposesnap(@builtin(workgroup_id) wg : vec3<u32>,
       // and a per-cell synth pays two PCG rounds for an answer that cannot vary.
       var bits = 0u;
       if (reposeSnapOpenMat(e & PT_MAT_MASK)) { bits = 0xFFFFFFFFu; }
-      reposeSnap[wordBase + i] = bits;
-    } else {
-      let pageBase = e * CHUNK_VOL;
+      for (var i = li; i < wpc; i += 64u) { reposeSnap[wordBase + i] = bits; }
+      continue;
+    }
+    let pageBase = e * CHUNK_VOL;
+    for (var v = li; v < CHUNK_VOL; v += 64u) {
+      // +1 word of padding per 32 so the packing reads below (lane t at
+      // t*33 + b) fall in 32 different banks.
+      wgReposeFlag[v + (v >> 5u)] = select(0u, 1u, reposeSnapOpenWord(voxels[pageBase + v]));
+    }
+    workgroupBarrier();
+    for (var i = li; i < wpc; i += 64u) {
       var bits = 0u;
-      for (var b = 0u; b < 32u; b++) {
-        if (reposeSnapOpenWord(voxels[pageBase + i * 32u + b])) {
-          bits |= 1u << b;
-        }
-      }
+      for (var b = 0u; b < 32u; b++) { bits |= wgReposeFlag[i * 33u + b] << b; }
       reposeSnap[wordBase + i] = bits;
     }
+    // The next member overwrites the flags this one's packing is reading.
+    workgroupBarrier();
   }
 
-  // ONE BARRIER, at a uniform point, and it is what makes pass 1's skip sound:
-  // a stamp must mean "every word of this chunk is final", so no thread may
-  // publish a stamp while a sibling is still filling the same chunk.
-  //
-  // storageBarrier(), not workgroupBarrier(): the thing being ordered is a
-  // STORAGE write (the bit region) against a storage write another WORKGROUP
-  // may read (the stamp). workgroupBarrier only fences workgroup-address-space
-  // memory, so with it the sentence above would be true of this workgroup's
-  // execution and not of what anyone else can see -- which is exactly the
-  // distinction the skip leans on.
-  storageBarrier();
+  // NO BARRIER before publishing: nothing in this pass reads a stamp any
+  // more (ownership replaced the stamp skip), and the CA that does read them
+  // runs behind the pass-table barrier on W(ReposeSnap).
 
-  // PASS 2: publish. Cheap (10 stores per workgroup), and re-publishing a stamp
-  // another workgroup already set is a write of the same value.
+  // PASS 2: publish the members this workgroup owns and filled.
   for (var k = li; k < REPOSE_RING; k += 64u) {
+    if (wgReposeOwned[k] == 0u) { continue; }
     reposeSnap[REPOSE_SNAP_TICK_BASE + reposeRingSlot(cx, cy, cz, k)] = stamp;
   }
 }

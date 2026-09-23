@@ -8,6 +8,7 @@
 #include <filesystem>
 #include <functional>
 #include <iterator>  // std::make_move_iterator — AbandonCommands re-queue
+#include <thread>    // SPIR-V cache temp name (write-then-rename)
 
 // The pipeline cache's temp-file name carries the PID: SANDVOX_PIPELINE_CACHE
 // lets several processes share one cache file, and two of them renaming the
@@ -1392,7 +1393,9 @@ VkShaderModule Backend::GetShaderModule(const std::string& wgsl, const std::stri
         spirv.resize(fsize / sizeof(uint32_t));
         size_t got = std::fread(spirv.data(), 1, fsize, f);
         std::fclose(f);
-        if (got == fsize)
+        // The magic word too: a blob that does not start with it is not SPIR-V
+        // and is recompiled rather than handed to the driver.
+        if (got == fsize && spirv[0] == 0x07230203u)
           fromDisk = true;
         else
           spirv.clear();
@@ -1405,10 +1408,28 @@ VkShaderModule Backend::GetShaderModule(const std::string& wgsl, const std::stri
     diagnostics = cr.diagnostics;
     if (!cr.ok) return VK_NULL_HANDLE;
     spirv = std::move(cr.spirv);
-    if (FILE* f = std::fopen(cachePath.string().c_str(), "wb")) {
-      std::fwrite(spirv.data(), sizeof(uint32_t), spirv.size(), f);
-      std::fclose(f);
+    // WRITE-THEN-RENAME. The cache is shared across processes (the running
+    // game, a run.sh gate, a worktree via SANDVOX_SHADER_CACHE), and a reader
+    // that opened this path mid-write got a short blob of whole words:
+    // "shader compile failed ... unsupported SPIR-V version", the kernel
+    // absent, and a gate reporting a defect that did not exist (seen 4x on
+    // 2026-09-19 and again 2026-09-22). A rename onto the final name is atomic
+    // on one volume, so a reader sees the old file, no file, or the whole new
+    // one. The temp name is private to this process and thread.
+    char tmpName[96];
+    std::snprintf(tmpName, sizeof(tmpName), "%s.%lu.%zx.tmp", cacheName,
+                  (unsigned long)SANDVOX_GETPID,
+                  std::hash<std::thread::id>{}(std::this_thread::get_id()));
+    const fs::path tmpPath = cacheDir / tmpName;
+    bool wrote = false;
+    if (FILE* f = std::fopen(tmpPath.string().c_str(), "wb")) {
+      wrote = std::fwrite(spirv.data(), sizeof(uint32_t), spirv.size(), f) ==
+              spirv.size();
+      wrote = (std::fclose(f) == 0) && wrote;
     }
+    std::error_code rec;
+    if (wrote) fs::rename(tmpPath, cachePath, rec);
+    if (!wrote || rec) fs::remove(tmpPath, rec);
   }
 
   VkShaderModuleCreateInfo sci{VK_STRUCTURE_TYPE_SHADER_MODULE_CREATE_INFO};

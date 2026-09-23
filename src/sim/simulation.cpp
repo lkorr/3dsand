@@ -607,6 +607,7 @@ bool Simulation::Init(const rhi::Device& device, World& world,
         entry(3, T::Uniform),          // FarParams
         entry(4, T::ReadOnlyStorage),  // dirtyList (phase-2 downsample work set)
         entry(5, T::ReadOnlyStorage),  // farPatch (cascade edit persistence)
+        entry(6, T::Storage),          // farSig (fardown's unchanged-chunk skip)
     };
     farBGL_ = device.CreateBindGroupLayout(entries, std::size(entries));
 
@@ -836,6 +837,7 @@ bool Simulation::Init(const rhi::Device& device, World& world,
         b(3, world_->farUBO),
         b(4, world_->dirtyList),
         b(5, world_->farPatch),
+        b(6, world_->farSig),
     };
     farBG_ = device.CreateBindGroup(farBGL_, entries, std::size(entries), "farBG");
   }
@@ -1933,6 +1935,7 @@ const rhi::Buffer& Simulation::PassBuffer(pass::Buf b) const {
     case B::FarList:        return world_->farList;
     case B::FarUBO:         return world_->farUBO;
     case B::FarPatch:       return world_->farPatch;
+    case B::FarSig:         return world_->farSig;
     case B::PageTable:      return world_->pageTable;
     case B::PageFaults:     return world_->pageFaults;
     case B::FluidParticlesRead:  return world_->fluidParticles[page_];

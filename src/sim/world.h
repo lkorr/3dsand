@@ -1042,7 +1042,13 @@ constexpr uint64_t kOpennessBytes =
 // a walk tick like any other). The third is per window COLUMN and stays
 // kNChunk^2: a ticket has no place in the window's (x, z) column grid, and the
 // refresh cursor that reads it only ever walks window slots.
-constexpr uint32_t kOpennessGenWords = 2 * kNumSlots + kNChunk * kNChunk;
+// A FOURTH plane after the columns, per slot: the ray-blocker signature of the
+// chunk at its last DIRTY walk (sim_openness.wgsl OPEN_SIG_BASE). A dirty chunk
+// whose blockers have not changed is skipped by the dirty pass -- it is then
+// exactly a chunk that was not dirty, which the touch plane already handles.
+// That is a burning forest's smoke: thousands of chunks awake for gas, which
+// is not a blocker (2026-09-22, 2.7 ms/frame of opennessDirty).
+constexpr uint32_t kOpennessGenWords = 3 * kNumSlots + kNChunk * kNChunk;
 constexpr uint64_t kOpennessGenBytes = (uint64_t)kOpennessGenWords * 4;   // 260 KiB
 
 // ---- the IRRADIANCE grid (docs/PLAN_gi.md §3, W3 P1) -----------------------
@@ -4314,6 +4320,15 @@ class World {
   rhi::Buffer farList;  // kFarListCap entries: (level-1)<<kFarSlotShift | slot
   rhi::Buffer farUBO;   // FarParams
   rhi::Buffer farPatch; // per-fill edit patches (kFarPatch* above)
+  // One u32 per slot: a signature of the chunk's far-visible matter (every
+  // cell farCellIsSolid keeps, keyed by position and material, mixed with the
+  // world chunk coord and the level origins) as of its last `fardown`. A dirty
+  // chunk whose signature has not moved is skipped: nothing the cascade can
+  // show has changed. That is most of a burning forest, whose ~5,000 awake
+  // chunks are awake for SMOKE, which the cascade never holds (2026-09-22:
+  // 15.4 ms/frame of fardown). Derived, zero-initialised; FarField zeroes it
+  // on every reset / full refill so a re-filled level is downsampled afresh.
+  rhi::Buffer farSig;
 
   // The CPU's far-field edit index (src/sim/faredits.h), owned by Stream —
   // it is fed by the same eviction path that fills the ChunkStore, and that

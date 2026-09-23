@@ -76,6 +76,7 @@ void FarField::ResetLevel(uint32_t k, IVec3 desired) {
   PruneLevel(k);
   origins_[k] = desired;
   uboDirty_ = true;
+  sigClear_ = true;
   for (uint32_t slot = 0; slot < kFarNumChunks; slot++) Enqueue(k, slot);
   bulkPending_[k] += kFarNumChunks;
   // Every plane record queued for this level is now meaningless — the whole
@@ -89,6 +90,7 @@ void FarField::FullRefill(const InterestSet& interest) {
   if (interest.Empty()) return;
   const IVec3 playerChunk = interest.Primary();
   refills_++;
+  sigClear_ = true;
   queue_.clear();
   recs_.clear();
   for (uint32_t k = 0; k < kFarLevels; k++) {
@@ -273,6 +275,11 @@ uint32_t FarField::PrepareTick(const rhi::Queue& queue, bool drain) {
     }
     queue.WriteBuffer(world_->farUBO, 0, &fp, sizeof(fp));
     uboDirty_ = false;
+  }
+  if (sigClear_) {
+    static const std::vector<uint32_t> zeros(kNumSlots, 0u);
+    queue.WriteBuffer(world_->farSig, 0, zeros.data(), zeros.size() * 4);
+    sigClear_ = false;
   }
   // The UBO above is published either way — a caller that is not draining
   // still has to tell the renderer which levels it may march.

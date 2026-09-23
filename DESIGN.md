@@ -622,6 +622,18 @@ SSBO lists of chunk indices.
     own chunk is on the dirty list, and every probe target is within that
     chunk's probe ring, which the prepass covers by construction.
 
+    **Each ring slot has exactly ONE filler (2026-09-22).** The prepass used to
+    let every dirty chunk fill its whole ten-chunk ring and skip a member whose
+    stamp was already this tick's. A stamp is only published when a workgroup
+    finishes, so with thousands of workgroups in flight almost none saw one: on
+    a forest fire (~5,000 awake smoke chunks) the prepass was 5.1 ms/tick, each
+    slot filled by up to ten neighbours. Now `reposeRingOwned` picks the owner
+    from this tick's `dirtyIn` flags — slot `s` belongs to the dirty centre
+    `s - offset(j)` with the smallest `j`, and offset 0 is the centre itself —
+    so the row reads `R(DirtyIn)`, the stamp skip is gone, and the fill is
+    staged through workgroup memory so a member's 4,096 words are read
+    coalesced. Same slots filled, same bits (world hash unmoved); 5.1 -> ~1.3 ms.
+
     **The ALLOCATION is dense; only the WRITING is sparse.** One bit per
     cell in the window is 16.125 MiB resident from `World::Init`, roughly +36%
     on the page pool's own resident bytes, and that is a flat cost paid by any
@@ -9175,6 +9187,21 @@ where you hear from either (§12b, "The ears are on the character").
   (`atomicAnd`+`atomicOr` per byte, `atomicMax` on the occupancy flag, which
   keeps it conservative: never falsely zero). Atomics are legal here precisely
   because cascades carry no determinism requirement.
+  **A dirty chunk whose far-visible matter did not change is skipped
+  (2026-09-22).** The dirty list says a chunk was WRITTEN, not that anything
+  the cascade holds changed — and gas never reaches the cascade, so a burning
+  forest's ~5,000 smoke-awake chunks were re-downsampled every tick for
+  identical bytes (15.4 ms/frame, the largest GPU row in the fire). `fardown`
+  now opens with one coalesced read of the chunk, sums a per-cell hash of every
+  cell `farCellIsSolid` keeps (position + material), mixes in the world chunk
+  coord and the eight level origins, and compares against `World::farSig[slot]`
+  (one u32 per slot, far group binding 6). Equal = return. `FarField` zeroes
+  `farSig` on every `ResetLevel` / `FullRefill`, because a refill re-derives the
+  level from procgen + patches and the next dirty tick must downsample afresh.
+  A 32-bit collision skips one downsample of render-only data. The per-sample
+  procgen (`genColumn`, the column top) is also hoisted to one call per COLUMN
+  (a thread per column, cells in an inner loop): 8x fewer at level 1.
+  Together: 15.4 -> ~1.8 ms/frame on the fire.
   **Edits SURVIVE a cascade refill (edit persistence, 2026-08-24;
   `src/sim/faredits.h`):** the downsample above is only half the story, because
   the sieve is the other producer of the same cells and it knows nothing but
@@ -10195,7 +10222,15 @@ geometry. Every dirty walk stamps the 17×17 columns around its chunk
 (`openTouchAround` — column STAMPS, not the chunk WALKS the paragraph above
 refuses), and so does the refresh when it meets a chunk that arrived in a slot
 with a stale stamp (its neighbours' faces were marched against whatever the
-slot held before). A refresh visit whose column was not touched since the
+slot held before).
+**A dirty chunk whose RAY BLOCKERS did not change skips the dirty walk**
+(2026-09-22). A fourth plane, `OPEN_SIG_BASE` (declared in
+`sim_openness.wgsl`, sized by `kOpennessGenWords`), holds each slot's
+blocker signature at its last dirty walk; the walk computes the current one in
+a single coalesced read and returns if it matches and the stamp is current.
+That makes the chunk exactly a chunk that was not dirty: its own faces are
+unchanged, and a blocker that changed elsewhere stamps the touch plane from its
+own walk. Gas is not a blocker, so smoke-awake chunks stop costing a walk. A refresh visit whose column was not touched since the
 slot's last full walk keeps its bytes and does only the irradiance
 maintenance — the coarse sun re-sample for a face that marched, the decay for
 one that could not — because that half must never stop (the

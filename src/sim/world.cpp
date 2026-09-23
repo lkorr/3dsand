@@ -367,6 +367,8 @@ void World::Init(const rhi::Device& device) {
   // NOT lean on zero-initialized allocation the way farVox does.
   farPatch = CreateBuffer(device, (uint64_t)kFarPatchWords * 4,
                           U::Storage | U::CopyDst, "farPatch");
+  farSig = CreateBuffer(device, (uint64_t)kNumSlots * 4, U::Storage | U::CopyDst,
+                        "farSig");
 
   for (auto& s : slots_) {
     s.buf = CreateBuffer(device, kSlotBytes, U::MapRead | U::CopyDst, "readback");

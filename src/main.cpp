@@ -625,6 +625,21 @@ int g_fellTreeAt = 240;  // the plant tick; the cut is 120 ticks later
 // cut and wipes the bodies, which read as "the tree vanished".
 bool g_fellSiteSet = false;
 int g_fellSiteX = 0, g_fellSiteZ = 0;
+// --forest-fire [tick]: the "whole forest is burning around me" frame-rate
+// repro, in the live loop so debris, mobs, audio and the render all pay what
+// the game pays (--perf treeburn is ONE tree, headless, with no debris).
+// On `tick` (default 240) fire is seeded, IfAir, in a disc of columns out to
+// 100 voxels round the player at ground level and up through the canopy
+// band; the first 600 ticks after that are the fire taking hold and are NOT
+// measured (every harness series is cleared at ignition+600), the next 600
+// are, with the camera turning one full circle so the number is the fire all
+// round and not whichever side the spawn faced. Then the run ends itself and
+// the normal --frames report is the forest fire's.
+//   SANDVOX_FRAMES_NO_RELOAD is implied.
+//   bash scripts/run.sh ./build/Release/sandvox.exe --frames 100000 --forest-fire
+bool g_forestFire = false;
+int g_forestFireAt = 240;
+bool g_forestFireDone = false;
 // SANDVOX_PARK_AT="x,y,z": park at a NAMED PLACE instead of wherever the
 // procedural surface route happens to stop.
 //
@@ -4483,11 +4498,11 @@ int main(int argc, char** argv) {
           "  --measure             Vulkan sizing harness (occupancy + GPU timings)\n"
           "  --perf                Performance suite -> build/perf.json (tuner Performance tab)\n"
           "  --perf-list           List the --perf scenarios and exit\n"
-          "  --scenario <id>       One --perf scenario (idle|treeburn|flythrough|explosion|water)\n"
+          "  --scenario <id>       One --perf scenario (idle|treeburn|forestfire|flythrough|explosion|water)\n"
           "  --perf-out <path>     Where --perf writes its JSON\n"
           "  --perf-w/--perf-h <n> Offscreen render size for --perf/--render-budget\n"
           "  --render-budget       Where INSIDE the raymarch the GPU frame went\n"
-          "  --budget-cams <list>  --render-budget cameras (noon,dusk,cascade,submerged,meadow,canopy; default all)\n"
+          "  --budget-cams <list>  --render-budget cameras (noon,dusk,cascade,submerged,meadow,canopy,fire; default all)\n"
           "  --shader-stats        Per-shader registers/spills from the driver\n"
           "                        -> build/shader_stats.json (headless)\n\n"
           "Residency:\n"
@@ -4620,6 +4635,10 @@ int main(int argc, char** argv) {
     // stroke can be judged against a body rather than against the sky. Phase B's
     // AI/spawn panel supersedes it; keep the footprint here at one bool.
     else if (a == "--duel-dummy") g_duelDummy = true;
+    else if (a == "--forest-fire") {
+      g_forestFire = true;
+      if (i + 1 < argc && argv[i + 1][0] != '-') g_forestFireAt = std::atoi(argv[++i]);
+    }
     else if (a == "--fell-tree") {
       g_fellTree = true;
       if (i + 1 < argc && argv[i + 1][0] != '-') g_fellTreeAt = std::atoi(argv[++i]);
@@ -7172,6 +7191,99 @@ int main(int argc, char** argv) {
       }
     };
   }
+  if (g_forestFire && !g_fellTree) {
+    // ---- --forest-fire (see g_forestFire). Borrows the fell-tree slot: it is
+    // the frame layer's one cell-op hook, and the two harnesses are exclusive.
+    tickCtx.fellTree = [&world, &mats, &debris, &player, &sim](
+                           uint32_t tick, std::vector<CellOp>& cellOps) {
+      static std::vector<CellOp> seed;
+      static size_t seedAt = 0;
+      static bool built = false;
+      if (g_forestFireDone) return;
+      // NOT BEFORE THE HORIZON EXISTS. The far pipelines compile on background
+      // threads and any worldgen.wgsl edit makes that a minute or more; a
+      // fire measured before `fardown` exists is measured without it (it
+      // happened twice on 2026-09-22 and read as a 15 ms win). Ignition slides
+      // to 60 ticks after they are ready, and every later phase with it.
+      if (!built && (uint32_t)g_forestFireAt <= tick && !sim.FarPipelinesReady()) {
+        g_forestFireAt = (int)tick + 60;
+        return;
+      }
+      const uint32_t t0 = (uint32_t)g_forestFireAt;
+      if (tick < t0) return;
+      if (!built) {
+        built = true;
+        uint32_t fire = 0;
+        for (size_t i = 0; i < mats.size(); i++)
+          if (mats[i].name == "fire") { fire = (uint32_t)i; break; }
+        const int px = ifloor(player.pos.x), pz = ifloor(player.pos.z);
+        // A jittered 9-voxel grid of columns, 12..100 voxels out. Jitter is a
+        // fixed hash of the column so the seed set is the same every run.
+        for (int gz = -100; gz <= 100; gz += 9)
+          for (int gx = -100; gx <= 100; gx += 9) {
+            const uint32_t h = (uint32_t)(gx * 73856093) ^ (uint32_t)(gz * 19349663);
+            const int x = px + gx + (int)(h % 5u) - 2;
+            const int z = pz + gz + (int)((h >> 8) % 5u) - 2;
+            const int d2 = (x - px) * (x - px) + (z - pz) * (z - pz);
+            if (d2 < 12 * 12 || d2 > 100 * 100) continue;
+            const int g = World::TerrainHeight(x, z, kDefaultSeed);
+            for (int y : {g + 1, g + 2, g + 10, g + 18, g + 26, g + 34, g + 42}) {
+              const IVec3 c{x, y, z};
+              if (!world.CellInWindow(c)) continue;
+              seed.push_back({World::SlotCellIndex(c), fire | kCellOpIfAir});
+            }
+          }
+        // SANDVOX_FOREST_FIRE_CONTROL=1: the same run, camera and schedule
+        // with no fire -- the control arm every per-pass number is read against.
+        if (std::getenv("SANDVOX_FOREST_FIRE_CONTROL")) seed.clear();
+        std::printf("--forest-fire: tick %u, %zu fire seeds round (%d,%d)\n",
+                    tick, seed.size(), px, pz);
+        std::fflush(stdout);
+      }
+      while (seedAt < seed.size() && cellOps.size() < kMaxCellOpsPerTick)
+        cellOps.push_back(seed[seedAt++]);
+      if (tick % 60u == 0u) {
+        const WorldSnapshot& sn = world.Snap();
+        std::printf("--forest-fire: tick %u (+%u) active %u particles %u bodies %u\n",
+                    tick, tick - t0, sn.valid ? sn.activeChunks : 0u,
+                    sn.valid ? sn.particleCount : 0u, debris.BodyCount());
+        std::fflush(stdout);
+      }
+      // The fire has had 20 s. Every --frames series starts over here, so the
+      // exit report is the burning forest and nothing before it.
+      if (tick == t0 + 600u) {
+        g_frameMs.clear();
+        g_activeChunks.clear();
+        for (int i = 0; i < sandvox::kPerfScopeCount; i++) {
+          g_frameScopeSum[i] = 0;
+          g_frameScopeMax[i] = 0;
+          g_frameScopeSeries[i].clear();
+        }
+        for (int n = 0; n < sandvox::kPerfNodeCount; n++) g_frameGpuSeries[n].clear();
+        g_frameGpuPassSeries.clear();
+        g_frameGpuFrames = 0;
+        // The debris/terrain phase profile over the same window: the CPU
+        // table's terrainMesh / debris rows are the whole of it, and a row
+        // is a sum -- this says which phase of it.
+        debris.SetProfiling(true);
+        debris.ResetProfile();
+        std::printf("--forest-fire: MEASURING from tick %u\n", tick);
+        std::fflush(stdout);
+      }
+      // SANDVOX_FOREST_FIRE_PROBE=1: WHAT the awake chunks are (depth band and
+      // material mix vs an idle control), via the park probe's sampler. Off by
+      // default: it pulls ~380 chunks through the fetch ring mid-measurement.
+      static const bool probe = std::getenv("SANDVOX_FOREST_FIRE_PROBE") != nullptr;
+      if (probe && tick == t0 + 900u) ParkSampleRequest(world, "fire");
+      if (probe && tick == t0 + 940u) ParkSampleReport(world, mats, "fire");
+      if (tick >= t0 + 1200u) {
+        std::printf("--forest-fire: debris profile over the measured window: %s\n",
+                    debris.ProfileReport().c_str());
+        std::fflush(stdout);
+        g_forestFireDone = true;
+      }
+    };
+  }
   // Respawn out of an open inventory hands the cursor back to the window:
   // `captureBeforeUi`, glfwSetInputMode and the cursor-position reset are all
   // the WINDOW's, and there is no window on the authority side.
@@ -8481,7 +8593,7 @@ int main(int argc, char** argv) {
       // tail of a default `--frames` run is the compiler, not the game.
       // SANDVOX_FRAMES_NO_RELOAD=1 is the measurement arm.
       static const bool noReload =
-          std::getenv("SANDVOX_FRAMES_NO_RELOAD") != nullptr;
+          std::getenv("SANDVOX_FRAMES_NO_RELOAD") != nullptr || g_forestFire;
       if (frameCounter == g_harnessFrames / 2 && !noReload) {
         std::printf("--frames harness: triggering shader reload (F5 path)\n");
         ui.reloadShaders = true;
@@ -8490,7 +8602,7 @@ int main(int argc, char** argv) {
     }
     // The park probe is tick-scheduled, so it decides its own end: --frames
     // only has to be generous enough to reach it.
-    if (g_parkDone) glfwSetWindowShouldClose(window, 1);
+    if (g_parkDone || g_forestFireDone) glfwSetWindowShouldClose(window, 1);
 
     // --shot-jump: decide whether THIS frame is one of the four pictures.
     //
@@ -9610,6 +9722,13 @@ int main(int argc, char** argv) {
       }
       // A fixed tick schedule, like the autofly phases: reproducible run to run.
       cam.yaw = 2.35f + (float)((tick / 240u) % 4u) * 1.5707963f;
+    }
+    // --forest-fire: one full turn over the measured 600 ticks, level-ish, so
+    // the frame is the fire on every side and not the side the spawn faced.
+    if (g_forestFire && tick >= (uint32_t)g_forestFireAt + 600u) {
+      const uint32_t t = tick - ((uint32_t)g_forestFireAt + 600u);
+      cam.yaw = 6.2831853f * (float)(t % 600u) / 600.0f;
+      cam.pitch = 0.08f;
     }
     if (g_autofly) {
       player.fly = true;

@@ -698,16 +698,24 @@ fn exciteDetect(@builtin(workgroup_id) wg : vec3<u32>,
   let ci = dirtyList[wg.x];
   let wc = slotWorldChunk(ci, T.origin);
   let base = wc * i32(CHUNK);
+  // Sentinel chunk: nothing to excite in a chunk with no page -- a uniform
+  // interior has no exposed face by construction. Decided ONCE for the
+  // workgroup (every cell of the chunk shares this entry) instead of by a
+  // page-table lookup per cell.
+  let pe = pageTable[ci];
+  if ((pe & PT_SENTINEL_BIT) != 0u) { return; }
+  let pageBase = pe * CHUNK_VOL;
   for (var s = 0u; s < 16u; s++) {
-    let localIdx = li * 16u + s;
+    // LANE-CONSECUTIVE cells, so a warp's loads coalesce. It was li * 16 + s,
+    // a 64-byte stride between lanes; measured on a forest fire (thousands of
+    // awake smoke chunks, not one liquid cell among them) the pass cost
+    // ~1.1 ms/tick doing nothing but those loads. No iteration reads another's
+    // state, so which thread visits which cell cannot change the outcome.
+    let localIdx = s * 256u + li;
     let lo = vec3<i32>(i32(localIdx & 15u), i32((localIdx >> 4u) & 15u),
                        i32(localIdx >> 8u));
     let c = base + lo;
-    let idx = voxWordIndex(c);
-    if (idx == PT_NO_WORD) { continue; }  // sentinel chunk: nothing to excite
-                                          // in a chunk with no page — a
-                                          // uniform interior has no exposed
-                                          // face by construction
+    let idx = pageBase + localIdx;   // chunk-linear in-page index
     let w = voxels[idx];
     let mat = voxMat(w);
     if (!seamLiquid(mat)) { continue; }
