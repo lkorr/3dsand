@@ -3128,6 +3128,12 @@ struct Col {
   wp          : u32,         // the water preset this column's pond or shore wears; 0 = none (P-F)
   bedSolid    : bool,        // inside a disc: the bowl face here is steeper than a powder bed can hold
   plant       : PlantCol,    // the tile plant whose footprint covers this column
+  // The highest y a LOOSE cover cell may occupy and still be at rest on
+  // tick 1: min over the four axis neighbours' ground + 1 (see
+  // looseRestTop). genColumn sets it to `h` (no restriction); only
+  // genChunk, which owns the pristine words the save compares against,
+  // pays the four neighbour heights to tighten it.
+  looseTop    : i32,
 };
 
 // ---- tile plants: ferns and big toadstools ---------------------------------
@@ -3540,6 +3546,7 @@ fn genColumn(x : i32, z : i32, seed : u32) -> Col {
     lab.plant.mat = MAT_AIR;
     lab.plant.base = 0;
     lab.plant.top = -1;
+    lab.looseTop = LAB_SLAB_Y;
     return lab;
   }
   // THE GROUND, and everything derived from it, in one call. This is the same
@@ -3609,6 +3616,7 @@ fn genColumn(x : i32, z : i32, seed : u32) -> Col {
   col.wp = L.wp;
   col.bedSolid = L.bedSolid;
   col.plant = plantColumnAt(x, z, seed, biome);
+  col.looseTop = h;
   return col;
 }
 
@@ -3679,6 +3687,57 @@ fn looseCoverDepth(col : ptr<function, Col>, depth : i32) -> i32 {
   let flat = wmTerrain(WM_H_TERRAIN_SED_SLOPE);
   let span = max(CAP_REPOSE_Q8 - flat, 1);
   return clamp((depth * (CAP_REPOSE_Q8 - (*col).slope)) / span, 0, depth);
+}
+
+// ---- THE LOCAL STEP TEST: no loose grain above a free down-diagonal ------
+//
+// looseCoverDepth is a GRADIENT test, and on the landform gradient by design
+// (DESIGN.md "A loose cover is born at rest too": gated on the full gradient
+// the taper becomes a cliff). So it cannot see the +-2-voxel steps the detail
+// and grain octaves put on an otherwise gentle dune face, and on every such
+// step one loose voxel survived and slid on tick 1. Measured by gen-settle
+// (docs/PLAN_save_system.md S2): 1,157 of the 1,485 chunks an untouched world
+// saved were exactly that, and a raw-worldgen probe over the same window found
+// 9,351 sand cells with a free cell below or on an axis down-diagonal, all of
+// them desert sand.
+//
+// This is the instrument the note asked for, and it is exact rather than
+// statistical. sim_step moves a powder that authors no `repose` (sand is 1:1)
+// straight down or into one of the FOUR AXIS down-diagonals, nothing else. A
+// loose cell at y therefore rests iff every axis neighbour's cell at y-1 is
+// ground, i.e. iff  y <= min(axis neighbour ground) + 1.  Cells above that
+// line go to the firm cover (sandstone), exactly what the taper already hands
+// its steep ground; the loose depth below the line is untouched. Corners do
+// not matter (the CA never takes a corner diagonal for a powder), and neither
+// does what stands above a lower neighbour's ground (water, a plant, a cactus):
+// the line is drawn at the neighbour's GROUND, so a cell above it is firmed
+// whatever occupies the diagonal -- conservative, and it only ever fires on a
+// real 2+ voxel step.
+//
+// COST, and why it lives in genChunk and not genColumn. Four colHeightAt per
+// column (landColumn: ~25 hashes each), paid only by columns of a biome whose
+// cover is loose-with-a-firm-opt-in, only in the chunk(s) whose 16 cells reach
+// the top four of the column, and only where the taper left any loose depth.
+// genColumn stays as it was because it is also the far cascades' per-cell
+// entry, where sand vs sandstone is one far palette slot (sandstone far-aliases
+// sand) and four more ground evaluations per sample would be pure cost.
+fn looseRestTop(col : ptr<function, Col>, x : i32, z : i32, seed : u32) -> i32 {
+  var m = colHeightAt(x + 1, z, seed);
+  m = min(m, colHeightAt(x - 1, z, seed));
+  m = min(m, colHeightAt(x, z + 1, seed));
+  m = min(m, colHeightAt(x, z - 1, seed));
+  return min((*col).h, m + 1);
+}
+
+// Does this column's cover get the loose/firm split at all? The same two opt-ins
+// genCellIn's cap and skin branches read: the sand cap flag, or a POWDER skin
+// in a biome that authored a firm skin (tundra's snow authored none and keeps
+// its settle transient, as before).
+fn coverSplits(biome : u32) -> bool {
+  if (wmFlag(biome, WM_BF_SAND_CAP)) { return true; }
+  let skin = wmBiome(biome, WM_B_SKIN);
+  return skin != MAT_AIR && materials[skin].klass == CLASS_POWDER &&
+         wmBiome(biome, WM_B_FIRM_COVER) != MAT_AIR;
 }
 
 // The material the ramp above hands the rest of the cap to: the biome's
@@ -3784,8 +3843,11 @@ fn genCellIn(col : ptr<function, Col>,
       // so a cut bank reads as sandstone rock instead of as sand that has not
       // fallen yet. In between the two split at the ramp, which is what a real
       // dune face looks like anyway.
+      // And never above the local step line (looseRestTop): a cell with a
+      // free down-diagonal is firm whatever the gradient said.
       let loose = looseCoverDepth(col, 4);
-      mat = select(coverFirmMat(biome), M_SAND, y > h - loose);
+      mat = select(coverFirmMat(biome), M_SAND,
+                   y > h - loose && y <= (*col).looseTop);
     } else if (shore.onShore && shore.past < wmWaterI(wp, WM_W_MUD_WIDTH) &&
                y > h - 2) {
       // WET MUD, in the inner ring only. This is the transition the whole
@@ -3827,7 +3889,10 @@ fn genCellIn(col : ptr<function, Col>,
       let loose = select(depth, looseCoverDepth(col, depth),
                          skin != MAT_AIR && materials[skin].klass == CLASS_POWDER &&
                          wmBiome(biome, WM_B_FIRM_COVER) != MAT_AIR);
-      mat = select(coverFirmMat(biome), skin, y > h - loose);
+      // looseTop is `h` for every column genChunk did not tighten, which
+      // includes every biome coverSplits() rejects (tundra's snow), so the
+      // step line cannot firm a skin whose author did not opt in.
+      mat = select(coverFirmMat(biome), skin, y > h - loose && y <= (*col).looseTop);
     } else if (y > h - sed) {
       // NOT ON A FIXTURE PAD. The pad keeps its authored loose SAND cap on
       // purpose ("avalanches into repose piles"), but the four voxels under it
@@ -4677,6 +4742,17 @@ fn genChunk(slot : u32, li : u32, actIdx : u32) {
     // of the COLUMN -- the cover stack's own guard with the y test replaced by
     // "does this chunk's 16-cell stack reach the band at all". -1 = not
     // computed; genCellIn scans on demand.
+    // THE LOCAL STEP LINE for a loose cover (looseRestTop, above genCellIn):
+    // only where the cover splits, only where this chunk reaches the loose
+    // band (the cap is 4 deep, a skin its authored skinDepth), and only where
+    // the taper left loose depth to restrict. Every other column keeps
+    // genColumn's `looseTop = h`.
+    let coverDepth = max(4, i32(wmBiome(col.biome, WM_B_SKIN_DEPTH)));
+    if (coverSplits(col.biome) && base.y <= col.h &&
+        base.y + i32(CHUNK) > col.h - coverDepth &&
+        looseCoverDepth(&col, coverDepth) > 0) {
+      col.looseTop = looseRestTop(&col, wx, wz, T.seed);
+    }
     var canopy = -1;
     if (wmFlag(col.biome, WM_BF_CANOPY_ROWS) && !col.inRim && col.pond < 0 &&
         !siteKeepOut(wx, wz) &&

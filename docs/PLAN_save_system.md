@@ -300,3 +300,9 @@ Details:
 - Cause (2) (modified bit from a per-chunk "a cell was written" flag
   instead of the dirty flag) is a sim/stream change — write it up, do not
   do it in this package.
+- **Result (2026-09-23):** cause (1) fixed by `looseRestTop` in worldgen.wgsl
+  (a loose cover cell is never above min(axis-neighbour ground) + 1).
+  gen-settle settle 1,485 -> 160 modified chunks, travel 45.4 -> 0.0 per
+  streamed plane; untouched save 454,510 -> 94,582 B. Causes (2) and (3)
+  written up in DESIGN.md section 3. `terrain` pass C1 needs `"sandstone"`
+  added to its hand-written body list (C++; not done in this WGSL package).

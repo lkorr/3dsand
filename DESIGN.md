@@ -573,19 +573,67 @@ are deduplicated across mob defs, so 128 slots cover a whole cast.
     the refill) raised 0 flags; "woke and changed nothing" with no changed
     neighbour is 0; nothing below one chunk under the surface except 19
     settle chunks.
-  - Not fixed here, because none of it is a data-only change: (1) wants
-    `looseCoverDepth` to gate on the column's REAL neighbour heights (or
-    worldgen to shed the surface cell wherever a down-diagonal is free),
-    which is a worldgen.wgsl change and moves the hash — the data knob
-    (`sedSlope`) trades the dune look for it and also moves the sediment
-    wedge; (2) wants `modified_` fed by a "a cell was WRITTEN" chunk bit
-    rather than the "scheduled to act" dirty flag; (3) wants genChunk to
-    bake the at-rest bed stain. Caps in `tests/baseline.json` (`genSettle.*`,
-    measurement + ~5%) so it cannot get worse silently; lower them when a
-    fix lands. Caveat: the travel strip is one biome (desert). Only biomes
-    that author a POWDER cover (desert and ocean author `sand`) can produce
-    cause 1, so the per-plane number is biome-dependent and unmeasured
-    elsewhere.
+  - **Cause 1 FIXED (2026-09-23, PLAN S2b): the local step line.**
+    `genChunk` computes, for every column whose cover splits (sand cap, or a
+    powder skin with an authored `firmSkin`) in the chunk that holds its loose
+    band, `looseTop = min(h, min(axis-neighbour ground) + 1)` from four
+    `colHeightAt` calls, and `genCellIn` lays a loose cell only at
+    `y <= looseTop`; anything above goes to the firm cover (`sandstone`). This
+    is exact, not statistical: sim_step moves a 1:1 powder only straight down
+    or into the four AXIS down-diagonals, so a cell at or below that line has
+    ground in every cell it could move into. Corners and whatever stands above
+    a lower neighbour's ground are irrelevant by construction. `genColumn`
+    keeps `looseTop = h`, so the far cascades (where sandstone far-aliases
+    sand anyway) pay nothing. Measured over the gate's window on raw worldgen
+    (`--voxserve`, no CA, 512x384x512): sand cells with a legal first move
+    **9,351 -> 0** (22 snow grains remain, treeline snow in the desert, not
+    this rule); sand cells 765,161 -> 755,809 (**-1.2%** of the sand, all of it
+    the top one or two cells of a 2+ voxel step); columns whose surface is sand
+    240,977 -> 231,883 (-3.8%, those 9,094 surface as sandstone). The flat dune
+    field is untouched. gen-settle after:
+    - settle: **1,485 -> 160 modified chunks** (4,706 real pages): 132 changed
+      = 131 pond-bed stain + 1 snow grain; 28 neighbour-wake.
+    - travel: **45.4 -> 0.0 modified chunks per streamed plane** (0 changed).
+    - untouched save (`save-load` B): **454,510 B / 1,485 chunks -> 94,582 B /
+      160 chunks**. Caps: `genSettle.*` 168 / 139 / 0.5 / 0.5,
+      `saveUntouchedMaxBytes` 190,000.
+    - **`terrain` goes red on it, and that is the gate's list, not the
+      world**: pass C1's `BuildBodyMask` (selftest_terrain.cpp) names the
+      ground materials by hand and has no `sandstone`, so the 330 columns of
+      its 97x97 box whose surface is now sandstone read as "hollow". The box
+      had 0 sandstone-topped columns before and exactly 330 after (raw-worldgen
+      probe). Fix is adding `"sandstone"` to `kBody` — a C++ line, left to the
+      next C++ package because this one does not build.
+  - Still open, ranked:
+    2. **Neighbour wake (28 settle chunks, now 18% of what remains).**
+       `modified_` is fed by the CA's NEXT-TICK dirty flag, which means
+       "scheduled to act", not "a word changed": `markDirtyR` wakes all 26
+       neighbours of a mover, and the stream folds the dirty set into
+       `modified_` without asking whether any word in the chunk was written.
+       Fix (sim/stream change, not this package): a per-chunk WRITTEN bit set
+       by `voxStore` on an actual word change (or by the CA's move/stain
+       write sites — `tryMove`, `doStaining`, reactions, `sim_mutate`), carried
+       to the CPU in the same snapshot as the dirty flags, and `modified_` fed
+       from that bit instead of the dirty flag. It must include every writer
+       (mutations, explosions, fluid seam, particle deposit) or edits go
+       unsaved, which is the dangerous direction; the gate's recorded-vs-stored
+       model check is the instrument. Expected: settle 160 -> ~132, the
+       remaining chunks all with changed words.
+    3. **Pond-bed stain (131 settle chunks, 23,805 cells) — not done here,
+       and not cheap.** Baking the at-rest stain in worldgen means: every
+       solid/powder cell face-adjacent to a water cell gets `wet` at
+       `min(amount, max(capacity, 1))` (sand 6, stone 1). Three things make it
+       more than a WGSL line: side faces need the NEIGHBOUR columns' fluid top
+       (four more `genColumn`-grade evaluations near water); worldgen writes
+       no stain today and `occupancy`'s stain bit (`packOcc`, not
+       `packOccStain`) plus the page table's "a generated chunk is demotable
+       on sight" rely on that; and the CA's absorption SPENDS an eighth of
+       water per level soaked into sand, so a baked-wet bed with full water is
+       a different (arguably better — a lake bed is saturated) world than the
+       one the CA reaches, which should be decided rather than slipped in.
+  - Caveat: the travel strip is one biome (desert). The step line covers every
+    biome whose cover splits (desert, ocean); tundra's snow skin opted out of
+    the firm split and keeps its settle transient.
 
 ---
 
@@ -2993,7 +3041,7 @@ powder, and firming a tenth of the tundra broke its own authored claim ("99% of
 columns wear snow at `y == h`", the `env-truth` gate) for a settle transient
 tundra has always accepted.
 
-**Known gap, not fixed here.** This gate reads `Land.slope`, the *landform*
+**Known gap, FIXED 2026-09-23 by the local step line (§3 "Settle-after-generation", `looseRestTop`).** This gate reads `Land.slope`, the *landform*
 gradient, which by design excludes the detail and grain octaves (see the note
 above -- gating on the full gradient turns the wedge into a cliff). So the
 +-2-voxel steps fine noise puts on an otherwise gentle dune face are invisible
