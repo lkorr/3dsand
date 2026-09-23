@@ -2453,9 +2453,10 @@ buffer read. `RenderParams.fluidCount == 0`
 (or `render.fluidSurface = 0`, which restores the old debug cubes via
 `debris.wgsl:vsFluid`) skips every instruction of it. Tuner section "MPM
 Fluid Look": iso, smoothing, IOR, clarity (metres), reflection/specular
-gains, foam amount/speed, shimmer, per-species colours. Depth is written at
-the fluid interface, so raster spray in front composites over it and debris
-behind it is covered.
+gains, foam amount/speed, shimmer, per-species colours. Depth was written at
+the fluid interface, so raster spray in front composited over it and debris
+behind it was covered; since 2026-09-23 the interface writes NO depth and a
+body behind it is shaded through it instead (§9.zz THE WATER VEIL).
 
 THE RENDER SEAM: ONE LAKE, TWO REPRESENTATIONS (2026-08-25). The virtual-mass
 blend above lets the isosurface reach over SETTLED voxel water, which closes the
@@ -10289,8 +10290,9 @@ point where the accumulated GAS crosses half opacity (`MEDIA_HALF_TAU`, ln 2;
 the honest single depth for a volume: a wisp never reaches it and nothing
 changes, geometry beyond it is more hidden than shown, and geometry in FRONT of
 it still wins the reversed-Z test and draws over the flame. Liquids are excluded
-— they have a real interface (`liqT`) and already report it. Ordering geometry
-*inside* a plume still needs order-independent transparency.
+— they have a real interface (`liqT`), and since 2026-09-23 a clear one reports
+the depth BEHIND it and hands raster geometry a per-pixel veil instead (§9.zz).
+Ordering geometry *inside* a plume still needs order-independent transparency.
 
 Gated by `--selftest --gate fire-depth`, which renders a stone block behind a
 fire slab and the same block in front of it and compares both against the flame
@@ -10720,6 +10722,70 @@ casts one ray per FRAGMENT with nowhere to accumulate, so a limb still takes a
 hard edge; the terrain under it does not. Per-fragment cone jitter would dither
 it at the cost of noise on a moving body, which is the artifact this pass exists
 to avoid — the honest fix is a body-side cache, and it is not written.
+
+### 9.zz THE WATER VEIL — raster bodies under a liquid surface (added 2026-09-23)
+
+**The defect.** Bodies, micro bodies (every mob) and particles are rasterized
+after the raymarch and composite by depth, and the raymarch wrote its depth at
+a liquid's SURFACE (it shades the interface, then keeps marching to light the
+bed). Every body fragment below the waterline failed the depth test: a wading
+mob was cut off at the surface as if the lake were concrete (owner report:
+"completely obfuscated").
+
+**Why a depth alone cannot fix it.** Moving the depth behind the water makes
+the body visible but draws it untouched — no absorption, no Fresnel, no foam —
+floating in front of a lake whose bed beside it is tinted cyan. The body needs
+the SAME optics the bed got, evaluated at its own distance, and those depend on
+per-pixel state only the raymarch has (the surface's Fresnel, reflection, foam,
+the column's coefficients).
+
+**The fix: record the equation, not the answer.** Every water shade in
+`raymarch.wgsl` (`shadeWater`, `shadeSubmerged`, `shadeMpmFluid`) has the form
+`final = Arest + K·(lit·caustic·T(d) + scatter·(1 − T(d)))`, with T(d) =
+exp(−absorb·d) over the path d in the liquid. The raymarch solves it for its bed
+and writes the COEFFICIENTS per pixel — K, A = Arest + K·scatter, S =
+K·scatter, absorb, the surface distance, the path cap and the caustic
+curvature: six words, `VEIL_WORDS` (common.wgsl THE WATER VEIL), at render
+binding 24. A body fragment at distance `dist` beyond the surface shades
+`A + T·(K·lit·caustic − S)`; one nearer than the surface takes the ordinary
+air fog. The raymarch then writes the depth BEHIND a clear liquid (viscous
+ones — blood, oil — keep the interface and record no veil). Fog is not
+double-counted: the body shades unfogged (`litColorSNoFog`) and K/A already
+carry the air fog to the surface. Caustics are split into curvature
+(`waterCausticCurv`) and a depth law (`veilCaustic`) so a mob on a lake bed
+wears the bed's web.
+
+**The pass split.** The veil is a fragment-stage STORAGE write read by later
+draws of the same pass, and no barrier is legal inside a rendering scope.
+`Simulation::DrawWorld` ends with `RenderPass::SplitAfterFragmentWrite`, which
+ends the scope, emits the fragment-write → vertex/fragment read+write barrier
+(`vk::Recorder::SplitRenderingAfterFragmentWrite`), and reopens on the same
+attachments with LOAD — in the one function every world pass calls, so none of
+the dozens of DrawWorld-then-DrawBodies call sites changed. A pass with no
+DrawWorld (the character portrait) binds `renderBGNoVeil_` (a one-word buffer
+the bounds test rejects), so it never reads a veil written for other pixels.
+
+**Cost.** One store per pixel (w0 = 0) for a dry pixel; six for a water pixel;
+six loads per body fragment. The buffer is 24 B/px (~50 MB at 1080p), grow-only.
+Without fragment stores (`WATER_VEIL` = `SHADOW_CACHE_AVAILABLE`) the old
+contract holds exactly.
+
+**What it does NOT do: refraction.** Nothing is bent. That matches the terrain —
+the CA water shade lights its bed along the UNBENT primary ray too (only the MPM
+path traces refraction, and fades it out over settled water, §MLS-MPM RENDER
+SEAM) — and it has to: bending the body alone would lift its image off an unbent
+bed, and a mob's feet would float. True refraction needs the primary ray bent at
+the surface in the raymarch (a second trace per water pixel) and the micro-body
+march bent the same way (it can: it already marches a ray inside its OBB); the
+cube-body path, which marches nothing, cannot follow.
+
+**The gate.** `--gate underwater-body`: a sand cube-path pillar standing out of
+six cells of water and one real mob limb micro brick wholly under it, in a
+sealed basin, each rendered dry and wet against an adjacent no-body reference.
+Veil on: cube 0.95–0.99 of its dry pixels visible, blue shift +16; micro 0.99,
++54. Veil forced off (`WATER_VEIL = false`, the old contract): cube 0.59 / −1.0,
+micro 0.00. Thresholds in `tests/baseline.json`. `determinismHash` cannot move —
+render-only data, no sim binding.
 
 ### 9.z Raster body shading parity (added 2026-09-04)
 

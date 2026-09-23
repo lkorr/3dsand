@@ -306,6 +306,10 @@ const char* const kOrder[] = {
     // matters, because neither of those resets the debris system and both
     // assert over BodyCount().
     "body-shade",
+    // Beside it: the other gate that draws a rigidbody, standing in water. It
+    // leaves a filled basin 45 cells from body-shade's site, clear of that
+    // gate's roof; nothing after it reads that region before regenerating.
+    "underwater-body",
     "player-walk", "player-waterjump", "player-ledgegrab", "player-crouch",
     "player-fastfall",
     "player-plants",

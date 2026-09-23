@@ -544,6 +544,14 @@ bool Simulation::Init(const rhi::Device& device, World& world,
         // the pipeline will not build, and that is the one thing a
         // renderer edit cannot add for itself.
         entry(23, T::ReadOnlyStorage, S::Fragment),               // gasFarOuter
+        // THE WATER VEIL (common.wgsl): one VEIL_WORDS record per pixel, how
+        // the liquid a pixel's primary ray crossed transforms the light of a
+        // raster body under it. Written by raymarch.wgsl's fragment stage,
+        // read by debris.wgsl / microbody.wgsl after DrawWorld's
+        // SplitAfterFragmentWrite. Render-private like shadowCache (14):
+        // never hashed, never saved, no sim binding. Storage (not ReadOnly)
+        // because the raymarch writes it; the body shaders declare it `read`.
+        entry(24, T::Storage, S::Fragment),                       // waterVeil
     };
     renderBGL_ = device.CreateBindGroupLayout(entries, std::size(entries));
 
@@ -681,33 +689,14 @@ bool Simulation::Init(const rhi::Device& device, World& world,
                                                  std::size(rpentries), "renderPartBG");
   }
   {
-    rhi::BindGroupEntry entries[] = {
-        b(0, world_->voxels),
-        b(1, world_->occupancy),
-        b(2, materialBuf_),
-        b(3, world_->renderUBO),
-        b(4, world_->farVox),
-        b(5, world_->farOcc),
-        b(6, world_->farUBO),
-        b(7, microTableBuf_),
-        b(8, microPoolBuf_),
-        b(9, world_->pageTable),
-        b(10, world_->fluidBlockMap),
-        b(11, world_->fluidGrid),
-        b(12, world_->dirtyViz),
-        b(13, world_->actVoxViz),
-        b(14, world_->shadowCache),
-        b(15, world_->shadowReq),
-        b(16, world_->renderStats),
-        b(17, world_->openness),
-        b(18, world_->opennessGen),
-        b(19, world_->irradiance),
-        b(20, world_->glow),
-        b(21, world_->gasOuter),
-        b(22, world_->waterFlux),
-        b(23, world_->gasFarOuter),
-    };
-    renderBG_ = device.CreateBindGroup(renderBGL_, entries, std::size(entries), "renderBG");
+    // One record's worth is below VEIL_WORDS, so the shaders' bounds test
+    // reads NO veil from either buffer until EnsureVeil sizes the live one.
+    using U = rhi::BufferUsage;
+    veilBuf_ = CreateBuffer(device, 4, U::Storage, "waterVeil");
+    veilNone_ = CreateBuffer(device, 4, U::Storage, "waterVeilNone");
+    veilPixels_ = 0;
+    BuildRenderBindGroup(renderBG_, veilBuf_);
+    BuildRenderBindGroup(renderBGNoVeil_, veilNone_);
   }
   // ---- the shadow-cache resolve pass (shadow_resolve.wgsl) ----
   // Its OWN layout rather than a reuse of renderBGL_ with widened visibility:
@@ -2661,6 +2650,61 @@ void Simulation::EncodeTick(const rhi::CommandEncoder& enc, uint32_t opsCount,
 }
 
 
+void Simulation::BuildRenderBindGroup(rhi::BindGroup& out,
+                                      const rhi::Buffer& veil) {
+  auto b = [](uint32_t binding, const rhi::Buffer& buf) {
+    rhi::BindGroupEntry e{};
+    e.binding = binding;
+    e.buffer = buf;
+    e.size = 0;  // whole buffer
+    return e;
+  };
+  {
+    rhi::BindGroupEntry entries[] = {
+        b(0, world_->voxels),
+        b(1, world_->occupancy),
+        b(2, materialBuf_),
+        b(3, world_->renderUBO),
+        b(4, world_->farVox),
+        b(5, world_->farOcc),
+        b(6, world_->farUBO),
+        b(7, microTableBuf_),
+        b(8, microPoolBuf_),
+        b(9, world_->pageTable),
+        b(10, world_->fluidBlockMap),
+        b(11, world_->fluidGrid),
+        b(12, world_->dirtyViz),
+        b(13, world_->actVoxViz),
+        b(14, world_->shadowCache),
+        b(15, world_->shadowReq),
+        b(16, world_->renderStats),
+        b(17, world_->openness),
+        b(18, world_->opennessGen),
+        b(19, world_->irradiance),
+        b(20, world_->glow),
+        b(21, world_->gasOuter),
+        b(22, world_->waterFlux),
+        b(23, world_->gasFarOuter),
+        b(24, veil),
+    };
+    out = device_.CreateBindGroup(renderBGL_, entries, std::size(entries),
+                                  "renderBG");
+  }
+}
+
+// The veil is per PIXEL, so it follows the largest target a world pass has
+// drawn into (24 bytes a pixel: ~50 MB at 1080p). Grow-only, like the depth
+// caches are keyed, so alternating a native frame with a smaller --shot or
+// portrait never reallocates; a rebuilt renderBG_ is the only side effect.
+void Simulation::EnsureVeil(uint32_t width, uint32_t height) {
+  const uint64_t px = (uint64_t)width * height;
+  if (px <= veilPixels_) return;
+  veilPixels_ = px;
+  veilBuf_ = CreateBuffer(device_, px * 6 * 4, rhi::BufferUsage::Storage,
+                          "waterVeil");
+  BuildRenderBindGroup(renderBG_, veilBuf_);
+}
+
 void Simulation::EnsureDepth(uint32_t width, uint32_t height) {
   if (depthView_ && depthW_ == width && depthH_ == height) return;
   depthW_ = width;
@@ -3356,6 +3400,8 @@ rhi::RenderPass Simulation::BeginRenderPass(const rhi::CommandEncoder& enc,
                                             uint32_t width, uint32_t height) {
   EnsureRenderPipelines(format);
   EnsureDepth(width, height);
+  EnsureVeil(width, height);
+  veilLive_ = false;  // until this pass's DrawWorld writes it
 
   rhi::RenderPassDesc d{};
   d.label = "world";
@@ -3381,6 +3427,8 @@ rhi::RenderPass Simulation::BeginAuxRenderPass(const rhi::CommandEncoder& enc,
                                                const float clear[4]) {
   EnsureRenderPipelines(format);
   EnsureAuxDepth(width, height);
+  EnsureVeil(width, height);
+  veilLive_ = false;  // until this pass's DrawWorld writes it
 
   rhi::RenderPassDesc d{};
   d.label = "aux";
@@ -3405,6 +3453,7 @@ rhi::RenderPass Simulation::BeginOverlayRenderPass(const rhi::CommandEncoder& en
                                                    uint32_t width, uint32_t height) {
   EnsureRenderPipelines(format);
   EnsureOverlayDepth(width, height);
+  veilLive_ = false;  // until this pass's DrawWorld writes it
 
   rhi::RenderPassDesc d{};
   d.label = "overlay";
@@ -3440,11 +3489,25 @@ void Simulation::DrawWorld(const rhi::RenderPass& pass) {
   pass.SetBindGroup(0, renderBG_);
   pass.SetBindGroup(1, renderPartBG_[page_]);
   pass.Draw(3);
+  // THE WATER VEIL (common.wgsl): the raymarch just wrote each pixel's record
+  // from its fragment stage, and every raster draw after this reads it. No
+  // barrier is legal inside a rendering scope, so the scope is split here —
+  // in the one function every world pass calls — rather than at each of the
+  // dozens of call sites that draw bodies after the world.
+  //
+  // WATER_VEIL (raymarch.wgsl) is SHADOW_CACHE_AVAILABLE: without fragment
+  // stores the raymarch writes no record, so the body passes must not read
+  // one — they keep renderBGNoVeil_, and the raymarch keeps its depth at the
+  // liquid interface, which is the old contract whole.
+  if (veilPixels_ > 0 && FragmentStoresAvailable()) {
+    pass.SplitAfterFragmentWrite(veilBuf_);
+    veilLive_ = true;
+  }
 }
 
 void Simulation::DrawParticles(const rhi::RenderPass& pass) {
   pass.SetPipeline(particleDraw_);
-  pass.SetBindGroup(0, renderBG_);
+  pass.SetBindGroup(0, BodyRenderBG());
   pass.SetBindGroup(1, renderPartBG_[page_]);
   pass.DrawIndirect(world_->drawArgs, 0);
 }
@@ -3452,7 +3515,7 @@ void Simulation::DrawParticles(const rhi::RenderPass& pass) {
 void Simulation::DrawSprites(const rhi::RenderPass& pass, uint32_t count) {
   if (count == 0) return;
   pass.SetPipeline(spriteDraw_);
-  pass.SetBindGroup(0, renderBG_);
+  pass.SetBindGroup(0, BodyRenderBG());
   pass.SetBindGroup(1, renderPartBG_[page_]);
   pass.Draw(36, count);
 }
@@ -3460,7 +3523,7 @@ void Simulation::DrawSprites(const rhi::RenderPass& pass, uint32_t count) {
 void Simulation::DrawFluid(const rhi::RenderPass& pass, uint32_t count) {
   if (count == 0) return;   // no fluid placed: costs nothing
   pass.SetPipeline(fluidDraw_);
-  pass.SetBindGroup(0, renderBG_);
+  pass.SetBindGroup(0, BodyRenderBG());
   pass.SetBindGroup(1, renderPartBG_[page_]);
   pass.Draw(36, count);
 }
@@ -3469,7 +3532,7 @@ void Simulation::DrawDebugBoxes(const rhi::RenderPass& pass,
                                uint32_t count) {
   if (count == 0) return;   // overlay off: costs nothing
   pass.SetPipeline(debugBoxDraw_);
-  pass.SetBindGroup(0, renderBG_);
+  pass.SetBindGroup(0, BodyRenderBG());
   pass.SetBindGroup(1, renderPartBG_[page_]);
   // 12 edges x 6 vertices (two triangles per edge quad).
   pass.Draw(72, count);
@@ -3478,7 +3541,7 @@ void Simulation::DrawDebugBoxes(const rhi::RenderPass& pass,
 void Simulation::DrawWindField(const rhi::RenderPass& pass, uint32_t arrows) {
   if (arrows == 0) return;   // overlay off: costs nothing, not even a bind
   pass.SetPipeline(debugWindDraw_);
-  pass.SetBindGroup(0, renderBG_);
+  pass.SetBindGroup(0, BodyRenderBG());
   pass.SetBindGroup(1, renderPartBG_[page_]);
   // 3 segments (shaft + two head barbs) x 6 vertices (two triangles per
   // segment quad). No vertex or instance buffer: the shader derives its
@@ -3490,14 +3553,14 @@ void Simulation::DrawCurrentField(const rhi::RenderPass& pass,
                                   uint32_t arrows) {
   if (arrows == 0) return;   // overlay off: costs nothing, not even a bind
   pass.SetPipeline(debugCurrentDraw_);
-  pass.SetBindGroup(0, renderBG_);
+  pass.SetBindGroup(0, BodyRenderBG());
   pass.SetBindGroup(1, renderPartBG_[page_]);
   pass.Draw(18, arrows);
 }
 
 void Simulation::DrawBodies(const rhi::RenderPass& pass, uint32_t voxInstances) {
   if (voxInstances == 0) return;
-  pass.SetBindGroup(0, renderBG_);
+  pass.SetBindGroup(0, BodyRenderBG());
   pass.SetBindGroup(1, renderPartBG_[page_]);
   // Depth first, then colour: the second draw's fragments pass GreaterEqual
   // only where they are the nearest body surface, so fsBody's per-fragment
@@ -3523,7 +3586,7 @@ uint32_t Simulation::UploadMicroBodyInsts(const rhi::Queue& queue,
 void Simulation::DrawMicroBodies(const rhi::RenderPass& pass, uint32_t count) {
   if (count == 0) return;  // nothing uploaded this frame: no bind, no draw
   pass.SetPipeline(microBodyDraw_);
-  pass.SetBindGroup(0, renderBG_);
+  pass.SetBindGroup(0, BodyRenderBG());
   pass.SetBindGroup(1, microBodyBG_);
   pass.Draw(36, count);
 }

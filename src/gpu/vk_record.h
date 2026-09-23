@@ -356,6 +356,11 @@ class Recorder {
   // hand-placed image barrier either.
   void BeginRendering(const RenderAttachments& att);
   void EndRendering();
+  // rhi::RenderPass::SplitAfterFragmentWrite: end the open scope, declare
+  // `written` as written by the fragment stage of that scope, emit its
+  // fragment-write -> vertex/fragment read+write barrier, and reopen on the
+  // attachments of the last BeginRendering with LOAD. No-op with no scope open.
+  void SplitRenderingAfterFragmentWrite(Buffer* written);
   // Draws record inside the open rendering scope. No barrier can be (or needs
   // to be) emitted here; routing them through the recorder keeps the "every
   // command is reachable only through the recorder" property plus stats, and
@@ -435,6 +440,7 @@ class Recorder {
   std::vector<std::pair<Image*, BufState>> imgState_;
   std::vector<VkImageMemoryBarrier2> pendingImg_;
   bool renderOpen_ = false;
+  RenderAttachments lastAtt_{};  // for SplitRenderingAfterFragmentWrite
   std::vector<VkBufferMemoryBarrier2> pending_;
   // Host-visible buffers written during this recording, for the Finish()
   // barrier. Kept as a small vector rather than a set: it is never more than a

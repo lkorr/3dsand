@@ -1848,6 +1848,18 @@ fn wrapDiffuse(ndl : f32, wrap : f32) -> f32 {
 fn litColorS(albedo : vec3f, n : vec3f, worldPos : vec3f, emission : f32,
              R : RenderParams, openScale : f32, openRaw : f32,
              sh : f32) -> vec3f {
+  return bodyAirFog(litColorSNoFog(albedo, n, worldPos, emission, R, openScale,
+                                   openRaw, sh), worldPos, R);
+}
+
+// litColorS without the air fog. A body seen THROUGH a water surface takes its
+// fog from the water veil (waterVeilApply), which carries the raymarch's own
+// aerial term for the air between the eye and the surface — fogging the whole
+// eye-to-body distance here as well would count that air twice and fog the
+// water column as if it were air.
+fn litColorSNoFog(albedo : vec3f, n : vec3f, worldPos : vec3f, emission : f32,
+                  R : RenderParams, openScale : f32, openRaw : f32,
+                  sh : f32) -> vec3f {
   // Per-face constant, keyed on the WORLD normal exactly as the terrain keys it
   // (raymarch.wgsl's `face`) — it only breaks the tie between the two
   // horizontal axes so parallel faces don't fuse. A cube lit without it sat a
@@ -1868,6 +1880,11 @@ fn litColorS(albedo : vec3f, n : vec3f, worldPos : vec3f, emission : f32,
           (ambientOpen(ambientAtP(n, R), openScale, openRaw) +
            keyLightColorP(R) * lambert);
   c += albedo * emission * 1.7;
+  return c;
+}
+
+// The raster bodies' air fog, the tail litColorS always had.
+fn bodyAirFog(c : vec3f, worldPos : vec3f, R : RenderParams) -> vec3f {
   let dist = length(worldPos - R.camPos);
   // R.fogDensity, not a hardcoded 0.0128. They agreed at the shipped default
   // and diverged everywhere else — main.cpp passes 0.0 for portrait renders,
@@ -4115,6 +4132,119 @@ fn unpackRgb9e5(w : u32) -> vec3f {
   let scale = exp2(f32(i32(w >> 27u) - 15 - 9));
   return vec3f(f32(w & 511u), f32((w >> 9u) & 511u), f32((w >> 18u) & 511u)) *
          scale;
+}
+
+// ============================================================================
+// THE WATER VEIL — raster bodies seen through a liquid surface
+// ============================================================================
+// Bodies, micro bodies (every mob) and particles are RASTERIZED after the
+// raymarch and composite by depth. Water is not a surface the march stops at —
+// it shades the interface and keeps going to the bed — so when it wrote its
+// depth at the interface, everything under the surface failed the depth test
+// and a wading mob was cut off at the waterline as if the lake were concrete.
+//
+// Now the march writes the depth of what is BEHIND the water, and records for
+// each pixel how the water it crossed transforms whatever light comes up from
+// below. Every water shade in raymarch.wgsl already has the form
+//
+//     final = Arest + K * (lit * caustic * T(d) + scatter * (1 - T(d)))
+//
+// with T(d) = exp(-absorb * d) over the path d the light travels in the liquid,
+// K the part of the surface that transmits ((1 - Fresnel) x (1 - foam) x the
+// air fog to the surface) and Arest everything the surface adds on top
+// (reflection, glint, foam, fog in-scatter). The march solves it for its own
+// bed; a body in front of the bed needs the same equation at ITS distance, so
+// the record holds the equation, not an answer:
+//
+//   w0  tSurf + 1 as f32 bits (0 = no veil on this pixel; tSurf 0 = camera
+//       already submerged), in voxels along the normalized primary ray
+//   w1  K                       rgb9e5
+//   w2  A = Arest + K*scatter   rgb9e5 — the colour of infinitely deep water
+//   w3  S = K*scatter           rgb9e5
+//   w4  absorb, per metre       rgb9e5
+//   w5  pack2x16float(path cap in voxels, caustic curvature)
+//
+// and a body at distance `dist` shades A + T * (K * lit * caustic - S). A
+// body point nearer than the surface is simply not under it and takes the
+// ordinary air fog. The path cap is how far the primary ray actually ran in
+// liquid, so a body seen through a thin sheet (a waterfall curtain) is dimmed
+// by the sheet, not by the air behind it.
+//
+// Render-only derived data, rewritten every frame by the raymarch (one store of
+// w0 for a dry pixel), never hashed, never saved. Bound at renderBGL_ binding
+// 24; the raymarch writes it, the body passes read it after
+// RenderPass::SplitAfterFragmentWrite.
+const VEIL_WORDS : u32 = 6u;
+
+struct WaterVeil {
+  on      : bool,
+  tSurf   : f32,
+  k       : vec3f,
+  a       : vec3f,
+  s       : vec3f,
+  absorb  : vec3f,
+  pathCap : f32,
+  curv    : f32,
+};
+
+// Word offset of this pixel's record, or 0xFFFFFFFF when the pixel is outside
+// the addressed rectangle. Both sides compute the pitch from the SAME uniform,
+// so they agree on the mapping even where it is not the target's exact width.
+fn veilBase(fragXY : vec2f, R : ptr<uniform, RenderParams>) -> u32 {
+  let w = u32(round((*R).viewPx * (*R).aspect));
+  let x = u32(max(fragXY.x, 0.0));
+  let y = u32(max(fragXY.y, 0.0));
+  if (x >= w) { return 0xFFFFFFFFu; }
+  return (y * w + x) * VEIL_WORDS;
+}
+
+fn waterVeilDecode(w0 : u32, w1 : u32, w2 : u32, w3 : u32, w4 : u32,
+                   w5 : u32) -> WaterVeil {
+  var v : WaterVeil;
+  v.on = w0 != 0u;
+  v.tSurf = bitcast<f32>(w0) - 1.0;
+  v.k = unpackRgb9e5(w1);
+  v.a = unpackRgb9e5(w2);
+  v.s = unpackRgb9e5(w3);
+  v.absorb = unpackRgb9e5(w4);
+  let pc = unpack2x16float(w5);
+  v.pathCap = pc.x;
+  v.curv = pc.y;
+  return v;
+}
+
+// The caustic web's brightening at a water depth, from the curvature the march
+// measured on the surface above this pixel. The same law as waterCaustics in
+// raymarch.wgsl — focus grows with the lever arm to the lit point, then
+// saturates — so a mob standing on a lake bed wears the web the bed wears.
+fn veilCaustic(curv : f32, depthM : f32) -> f32 {
+  let focus = clamp(depthM * 1.5, 0.0, 1.4);
+  return 1.0 + min(curv * focus * TUNE_CAUSTIC_GAIN, TUNE_CAUSTIC_CAP);
+}
+
+// `lit` is the body's linear HDR radiance WITHOUT air fog (litColorSNoFog);
+// `dist` its distance from the eye in voxels. Returns linear HDR, pre-tonemap.
+fn waterVeilApply(v : WaterVeil, lit : vec3f, dist : f32) -> vec3f {
+  let d = clamp(dist - v.tSurf, 0.0, v.pathCap) * VOXEL_METERS;
+  let t = exp(-v.absorb * d);
+  return v.a + t * (v.k * lit * veilCaustic(v.curv, d) - v.s);
+}
+
+// The raster side's lookup: the veil over this fragment, with `on` false when
+// the pixel is dry OR the fragment is NEARER than the surface (a body standing
+// on the shore in front of a lake is not under it). `dist` in voxels.
+fn waterVeilAt(veil : ptr<storage, array<u32>, read>, fragXY : vec2f,
+               dist : f32, R : ptr<uniform, RenderParams>) -> WaterVeil {
+  var v : WaterVeil;
+  v.on = false;
+  let b = veilBase(fragXY, R);
+  if (b == 0xFFFFFFFFu || b + VEIL_WORDS > arrayLength(veil)) { return v; }
+  let w0 = (*veil)[b];
+  if (w0 == 0u) { return v; }
+  v = waterVeilDecode(w0, (*veil)[b + 1u], (*veil)[b + 2u], (*veil)[b + 3u],
+                      (*veil)[b + 4u], (*veil)[b + 5u]);
+  v.on = dist > v.tSurf;
+  return v;
 }
 
 // Blend one radiance sample into a block-face word. `stampOk` false means the

@@ -3069,6 +3069,272 @@ Status GateBodyShade(Ctx& c, std::string& detail) {
   return ok ? Status::Pass : Status::Fail;
 }
 
+// underwater-body: A BODY UNDER WATER IS SEEN THROUGH THE WATER.
+//
+// WHAT IS UNDER TEST. Bodies are rasterized after the raymarch and composite by
+// depth. The raymarch used to write its depth AT a liquid's surface, so every
+// body fragment below the waterline failed the depth test: a wading mob was cut
+// off at the surface as if the lake were concrete (owner report 2026-09-23:
+// "completely obfuscated"). Now the raymarch writes the depth BEHIND the water
+// and records a per-pixel water veil (common.wgsl THE WATER VEIL) that
+// debris.wgsl / microbody.wgsl shade the fragment through.
+//
+// THE FIXTURE. A sealed stone basin, a SAND pillar standing on its floor that
+// rises three voxels out of six of water, and a camera above the surface
+// looking down at it. Sand rather than stone so the pillar contrasts with the
+// basin it stands in: the mask below is "pixels that change when the body is
+// drawn", and a stone pillar on a stone floor under the same water changes
+// fewer of them for reasons that have nothing to do with the veil.
+//
+// FOUR ARMS, TWO WORLD STATES. The basin is photographed DRY (with and without
+// the body), then filled and photographed WET (with and without). Each body
+// mask is a same-state differential -- a pixel is body iff drawing the body
+// changed it -- so the two claims compare like with like:
+//   VISIBLE  the wet mask holds most of the dry mask's pixels. With the depth
+//            at the surface only the three dry voxels of the pillar survive.
+//   TINTED   the pillar's pixels shift toward blue when the water arrives:
+//            water absorbs red about nine times faster than blue per metre
+//            (TUNE_WATER_ABSORB), so a body drawn through it untinted -- the
+//            veil not applied -- keeps its dry colour.
+Status GateUnderwaterBody(Ctx& c, std::string& detail) {
+  GpuContext& ctx = c.ctx;
+  World& world = c.world;
+  Simulation& sim = c.sim;
+  const uint32_t W = c.width, H = c.height;
+
+  SubmitWorldgen(ctx, world, sim, kDefaultSeed);
+  ctx.WaitIdle();
+
+  // Beside body-shade's site (inside the window wherever streaming has left
+  // it) but NOT on it: body-shade runs first in kOrder and leaves a 45x45 roof
+  // at (300, ground+21, 300) +-22, which shadowed this basin at suite scope
+  // and nowhere else (0.79 visible vs 0.99 at --gate scope).
+  const int gx = 300, gz = 345;
+  const int ground = World::TerrainHeight(gx, gz, kDefaultSeed);
+  const int kHalf = 10;             // 21x21 basin
+  const int floorY = ground + 8;    // two-thick floor at floorY, floorY + 1
+  const int waterTop = floorY + 7;  // six cells of water: floorY+2..floorY+7
+  const int wallTop = floorY + 9;
+  const IVec3 pchunk{gx / 16, floorY / 16, gz / 16};
+
+  auto put = [&](std::vector<CellOp>& ops, int x, int y, int z, uint32_t word) {
+    const IVec3 cc{x, y, z};
+    if (world.CellInWindow(cc)) ops.push_back({World::SlotCellIndex(cc), word});
+  };
+  std::vector<CellOp> basin, water;
+  // The cleared box is two cells wider than the basin and runs 20 above the
+  // rim, so nothing a previous gate or worldgen left there shades the water.
+  for (int dx = -kHalf - 2; dx <= kHalf + 2; dx++)
+    for (int dz = -kHalf - 2; dz <= kHalf + 2; dz++) {
+      const bool out = dx < -kHalf || dx > kHalf || dz < -kHalf || dz > kHalf;
+      const bool rim = !out && (dx == -kHalf || dx == kHalf || dz == -kHalf ||
+                                dz == kHalf);
+      for (int y = floorY; y <= wallTop + 20; y++) {
+        if (out && y <= floorY + 1) continue;   // keep the ground around it
+        // Air everywhere else in the box: clears whatever worldgen put there.
+        uint32_t w = PackVoxNew(kMatAir, 0u);
+        if (!out && (y <= floorY + 1 || (rim && y <= wallTop)))
+          w = PackVoxNew(kMatStone, 0u);
+        put(basin, gx + dx, y, gz + dz, w);
+        if (!out && !rim && y >= floorY + 2 && y <= waterTop)
+          put(water, gx + dx, y, gz + dz, PackVoxNew(kMatWater, 8u));
+      }
+    }
+  if (basin.empty() || water.empty()) {
+    detail = "fixture site is outside the residency window";
+    return Status::Fail;
+  }
+  uint32_t tick = 91000;
+  auto settle = [&](const std::vector<CellOp>& ops, int n) {
+    SubmitTick(ctx, world, sim, ++tick, kDefaultSeed, {}, {}, ops, false,
+               pchunk, false, false);
+    for (int i = 0; i < n; i++)
+      SubmitTick(ctx, world, sim, ++tick, kDefaultSeed, {}, {}, {}, false,
+                 pchunk, false, false);
+    ctx.WaitIdle();
+  };
+  settle(basin, 6);
+
+  const Tuning base = CurrentTuning();
+  uint32_t noonTick = 0;
+  {
+    float bestUp = -2.0f;
+    for (uint32_t t = 0; t < 200000u; t += 64u) {
+      const float up = ComputeSky(base, (double)t).sunDir[1];
+      if (up > bestUp) { bestUp = up; noonTick = t; }
+    }
+  }
+
+  // ---- the body: a 5 x 9 x 5 sand pillar on the basin floor ----
+  const int kBX = 5, kBY = 9;
+  std::vector<BodyVoxInst> inst;
+  for (int x = 0; x < kBX; x++)
+    for (int y = 0; y < kBY; y++)
+      for (int z = 0; z < kBX; z++)
+        inst.push_back({(float)x, (float)y, (float)z, kMatSand});
+  std::vector<BodyXformGpu> xf;
+  {
+    BodyXformGpu m{};
+    m.pos[0] = (float)gx - (float)kBX * 0.5f;
+    m.pos[1] = (float)(floorY + 2);
+    m.pos[2] = (float)gz - (float)kBX * 0.5f;
+    m.quat[3] = 1.0f;
+    xf.push_back(m);
+  }
+  ctx.queue.WriteBuffer(world.bodyInstances, 0, inst.data(),
+                        inst.size() * sizeof(BodyVoxInst));
+  ctx.queue.WriteBuffer(world.bodyXforms, 0, xf.data(),
+                        xf.size() * sizeof(BodyXformGpu));
+
+  // Above the surface, down at the pillar across the water, so most of what
+  // the frame holds of it is under the surface.
+  const Vec3 eye{(float)gx - 9.0f, (float)(waterTop + 9), (float)gz - 9.0f};
+  const Vec3 at{(float)gx, (float)(floorY + 5), (float)gz};
+  Camera cam;
+  {
+    const float dx = at.x - eye.x, dy = at.y - eye.y, dz = at.z - eye.z;
+    cam.yaw = std::atan2(dz, dx);
+    cam.pitch = std::atan2(dy, std::sqrt(dx * dx + dz * dz));
+  }
+
+  // ---- the MICRO body: one real mob limb brick, the path every mob draws
+  // through (microbody.wgsl), with its own veil wiring. The first limb of the
+  // first def that has one, posed by the pillar's transform (slot 0) so its
+  // brick sits on the basin floor -- and, at a limb's size, entirely under
+  // six cells of water, so the old contract drew none of it.
+  std::vector<MicroBodyInstGpu> micro;
+  for (const MobDef& md : c.mobs.Defs()) {
+    for (const auto& l : md.limbs)
+      if (l.microModel >= 0) {
+        MicroBodyInstGpu mi{};
+        mi.slot = 0;
+        mi.model = (uint32_t)l.microModel;
+        micro.push_back(mi);
+        break;
+      }
+    if (!micro.empty()) break;
+  }
+
+  auto render = [&](uint32_t bodyInstances, bool withMicro,
+                    std::vector<uint8_t>& out) -> bool {
+    rhi::Buffer shot =
+        CreateBuffer(ctx.device, (uint64_t)W * H * 4,
+                     rhi::BufferUsage::MapRead | rhi::BufferUsage::CopyDst,
+                     "underwaterBodyShot");
+    const uint32_t microCount =
+        withMicro ? sim.UploadMicroBodyInsts(ctx.queue, micro) : 0u;
+    // Four frames, grab the last: body-shade's warm-shadow-cache reason.
+    for (uint32_t f = 0; f < 4; f++) {
+      WriteRenderParams(ctx.queue, world, eye, cam, (float)W / H, true, 0.0f,
+                        kFarFogDensity, (float)H, noonTick);
+      rhi::CommandEncoder enc = ctx.device.CreateCommandEncoder();
+      sim.EncodeShadowResolve(enc);
+      rhi::RenderPass rp = sim.BeginRenderPass(
+          enc, c.view, rhi::TextureFormat::RGBA8Unorm, W, H);
+      sim.DrawWorld(rp);
+      sim.DrawBodies(rp, bodyInstances);
+      sim.DrawMicroBodies(rp, microCount);
+      rp.End();
+      if (f == 3) {
+        rhi::TexelCopyTexture srcT{};
+        srcT.texture = c.offscreen;
+        rhi::TexelCopyBuffer dstB{};
+        dstB.buffer = shot;
+        dstB.bytesPerRow = W * 4;
+        dstB.rowsPerImage = H;
+        enc.CopyTextureToBuffer(srcT, dstB, rhi::Extent3D{W, H, 1});
+      }
+      ctx.queue.Submit(enc.Finish());
+    }
+    out.assign((size_t)W * H * 4, 0);
+    return rhi::ReadBufferBlocking(ctx.device, shot, 0, out.data(), out.size());
+  };
+
+  const uint32_t n = (uint32_t)inst.size();
+  const bool haveMicro = !micro.empty();
+  // EVERY MASK GETS A REFERENCE RENDERED IMMEDIATELY BEFORE IT. The shadow
+  // resolve blends irradiance into the GI grid every frame, so terrain keeps
+  // drifting for a few frames after a fixture edit; a reference two arms back
+  // counted that drift as body (a limb measured at 3x its own footprint).
+  std::vector<uint8_t> dryNo, dryBody, dryNoM, dryMicro;
+  std::vector<uint8_t> wetNo, wetBody, wetNoM, wetMicro;
+  if (!render(0, false, dryNo) || !render(0, false, dryNo) ||
+      !render(n, false, dryBody) ||
+      (haveMicro && (!render(0, false, dryNoM) || !render(0, true, dryMicro)))) {
+    detail = "render/readback failed (dry)";
+    return Status::Fail;
+  }
+  settle(water, 20);
+  if (!render(0, false, wetNo) || !render(0, false, wetNo) ||
+      !render(n, false, wetBody) ||
+      (haveMicro && (!render(0, false, wetNoM) || !render(0, true, wetMicro)))) {
+    detail = "render/readback failed (wet)";
+    return Status::Fail;
+  }
+  if (haveMicro) WriteBmpFile("underwater_body_micro.bmp", wetMicro, W, H);
+  WriteBmpFile("underwater_body_dry.bmp", dryBody, W, H);
+  WriteBmpFile("underwater_body_wet.bmp", wetBody, W, H);
+
+  // A pixel is body iff drawing the body moved any channel by more than 10.
+  // Returns the count, and the mean (blue - red) over those pixels.
+  auto mask = [&](const std::vector<uint8_t>& no, const std::vector<uint8_t>& yes,
+                  double& meanBR) {
+    size_t cnt = 0;
+    double br = 0;
+    for (size_t p = 0; p < (size_t)W * H; p++) {
+      const size_t i = p * 4;
+      const int d = std::max({std::abs((int)yes[i] - (int)no[i]),
+                              std::abs((int)yes[i + 1] - (int)no[i + 1]),
+                              std::abs((int)yes[i + 2] - (int)no[i + 2])});
+      if (d <= 10) continue;
+      cnt++;
+      br += (double)yes[i + 2] - (double)yes[i];
+    }
+    meanBR = cnt ? br / (double)cnt : 0.0;
+    return cnt;
+  };
+  double dryBR = 0, wetBR = 0;
+  const size_t nDry = mask(dryNo, dryBody, dryBR);
+  const size_t nWet = mask(wetNo, wetBody, wetBR);
+  if (nDry < 500) {
+    detail = Format("only %zu body px in the DRY frame -- the pillar is not in "
+                    "shot (fixture, not the veil)", nDry);
+    return Status::Fail;
+  }
+  const double visible = (double)nWet / (double)nDry;
+  const double tint = wetBR - dryBR;
+  // Thresholds in baseline.json (CLAUDE.md: no thresholds in source).
+  const double minVisible = BaselineNumber("underwaterBody.minVisible", 0.80);
+  const double minTint = BaselineNumber("underwaterBody.minBlueShift", 6.0);
+  bool ok = visible >= minVisible && tint >= minTint;
+  detail = Format(
+      "CUBE pillar px dry %zu / wet %zu = %.2f visible (must be >= %.2f; depth "
+      "at the surface leaves only the 3 dry voxels); blue-red dry %.1f -> wet "
+      "%.1f, shift %+.1f (must be >= %.1f; an untinted body keeps its dry "
+      "colour). ",
+      nDry, nWet, visible, minVisible, dryBR, wetBR, tint, minTint);
+  // The micro limb is wholly submerged, so the same two claims are sharper:
+  // the old contract drew NONE of it.
+  if (haveMicro) {
+    double dryMBR = 0, wetMBR = 0;
+    const size_t nDryM = mask(dryNoM, dryMicro, dryMBR);
+    const size_t nWetM = mask(wetNoM, wetMicro, wetMBR);
+    const double visM = nDryM ? (double)nWetM / (double)nDryM : 0.0;
+    const bool okM = nDryM >= 100 && visM >= minVisible &&
+                     wetMBR - dryMBR >= minTint;
+    ok = ok && okM;
+    detail += Format("MICRO limb (model %u) px dry %zu / wet %zu = %.2f "
+                     "visible, blue-red shift %+.1f%s. ",
+                     micro[0].model, nDryM, nWetM, visM, wetMBR - dryMBR,
+                     nDryM < 100 ? " -- NOT IN SHOT (fixture)" : "");
+  } else {
+    detail += "MICRO: no def carries a micro limb at this voxel size, "
+              "skipped. ";
+  }
+  detail += "Frames: underwater_body_{dry,wet,micro}.bmp";
+  return ok ? Status::Pass : Status::Fail;
+}
+
 }  // namespace
 
 
@@ -4055,6 +4321,10 @@ const std::vector<Gate>& RenderGates() {
       // The only gate in the suite that DRAWS A RIGIDBODY. Three arms of one
       // fixture frame, and it spawns a body through the real destruction path.
       {"body-shade", "render", {}, false, GateBodyShade, /*needsRender=*/true},
+      // Draws a body standing in water, dry and wet (common.wgsl THE WATER
+      // VEIL). Leaves a filled stone basin at (300, ground+8, 345).
+      {"underwater-body", "render", {}, false, GateUnderwaterBody,
+       /*needsRender=*/true},
       // Draws three frames of a painted stand and reads them back.
       {"plants", "render", {}, false, GatePlants, /*needsRender=*/true},
       // The TAA resolve: draws 4 + 2 + 4 + 16 frames of the same terrain view

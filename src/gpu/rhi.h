@@ -350,6 +350,14 @@ class RenderPass {
   void Draw(uint32_t vertexCount, uint32_t instanceCount = 1,
             uint32_t firstVertex = 0, uint32_t firstInstance = 0) const;
   void DrawIndirect(const Buffer& args, uint64_t offset) const;
+  // A FRAGMENT-STAGE STORAGE WRITE THAT LATER DRAWS OF THIS PASS READ. No
+  // barrier is legal inside a rendering scope, so this ends the scope, orders
+  // the fragment writes to `written` ahead of every later vertex/fragment
+  // access (read or write), and reopens the scope on the SAME attachments with
+  // LOAD, so the colour and depth drawn so far carry on. The bound pipeline
+  // and bind groups are command-buffer state and carry over too.
+  // The water veil (raymarch.wgsl -> debris/microbody.wgsl) is the one user.
+  void SplitAfterFragmentWrite(const Buffer& written) const;
   void End() const;
 
  private:

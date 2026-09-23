@@ -62,6 +62,10 @@
 // ONE buffer load per shaded point, no ray and no voxel read, which is the only
 // shape of emitter light this path can consume.
 @group(0) @binding(20) var<storage, read> glow : array<u32>;
+// The water veil (common.wgsl THE WATER VEIL): how the liquid over each pixel
+// transforms light coming up from below. Written by raymarch.wgsl in the half
+// of the world pass before this one draws.
+@group(0) @binding(24) var<storage, read> waterVeil : array<u32>;
 
 struct BodyXform {
   pos : vec3f, _p : f32,         // world voxels
@@ -631,7 +635,9 @@ fn fs(in : VSOut) -> FSOut {
   // Same ray, same softening law and same lift cap as the terrain beside it
   // (bodySunShadow -> shadowFromOpaqueHit, common.wgsl).
   let sh = bodySunShadow(worldPos, n, R, &occupancy, &materials);
-  var col = litColorS(albedo, n, worldPos, emis, R, open.x, open.y, sh);
+  // Unfogged: the air fog is applied at the end, by the water veil when the
+  // fragment is under a liquid surface and by bodyAirFog when it is not.
+  let lit = litColorSNoFog(albedo, n, worldPos, emis, R, open.x, open.y, sh);
   // Emitter light from the glow field (common.wgsl THE GLOW FIELD). ONE buffer
   // load, no ray: this is the term that lights a mob standing in a lava pit or
   // beside a burning tree, which nothing did before. It cannot come from the
@@ -641,8 +647,8 @@ fn fs(in : VSOut) -> FSOut {
   // `open.x` as the occlusion, not 1.0: unlike a loose particle a limb is a
   // solid body with creases, and this is the same multiplier the ambient took
   // one line up.
-  col += glowLight(albedo, open.x, glowAtPos(worldPos, &glow),
-                   TUNE_GLOW_STRENGTH);
+  var add = glowLight(albedo, open.x, glowAtPos(worldPos, &glow),
+                     TUNE_GLOW_STRENGTH);
 
   // ---- THE HIT FLASH -------------------------------------------------------
   // ADDITIVE, and BEFORE the tonemap, because litColor's output is linear HDR
@@ -660,7 +666,23 @@ fn fs(in : VSOut) -> FSOut {
   // uniform across the instance (the value is flat-interpolated), so it costs
   // nothing on the ones that skip it.
   if (in.flash > 0.0) {
-    col += (vec3f(1.0, 0.86, 0.78) + albedo) * in.flash;
+    add += (vec3f(1.0, 0.86, 0.78) + albedo) * in.flash;
+  }
+
+  // ---- UNDER WATER ---------------------------------------------------------
+  // A limb below a liquid surface is seen through it: dimmed and tinted by the
+  // column between it and the surface, lit by the caustic web, and behind the
+  // surface's own Fresnel reflection and foam — the same equation the lake bed
+  // under it was shaded with (common.wgsl THE WATER VEIL). Above the surface
+  // it takes the ordinary air fog, with glow and flash on top unfogged as
+  // they always were.
+  let dist = length(worldPos - R.camPos);
+  let veil = waterVeilAt(&waterVeil, in.pos.xy, dist, &R);
+  var col : vec3f;
+  if (veil.on) {
+    col = waterVeilApply(veil, lit + add, dist);
+  } else {
+    col = bodyAirFog(lit, worldPos, R) + add;
   }
 
   // ---- reversed-Z depth, EXACTLY raymarch.wgsl's convention ----

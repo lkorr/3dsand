@@ -139,6 +139,35 @@
 // near box does not reach. Same layout, same u16 pair-per-word packing, same
 // render-only standing; eight times the cell and eight times the span.
 @group(0) @binding(23) var<storage, read> gasFarOuter : array<u32>;
+
+// ---- THE WATER VEIL (common.wgsl THE WATER VEIL) ---------------------------
+// One VEIL_WORDS record per pixel: how the liquid this pixel's primary ray
+// crossed transforms the light of whatever raster body sits under it. Written
+// here (w0 = 0 for every dry pixel), read by debris.wgsl / microbody.wgsl after
+// Simulation::DrawWorld splits the pass. The fifth render-private buffer a
+// fragment shader writes, with shadowCache's standing.
+//
+// WATER_VEIL off (no fragment stores on the device) restores the old contract
+// exactly: depth at the liquid interface, and nothing under it drawn.
+@group(0) @binding(24) var<storage, read_write> waterVeil : array<u32>;
+const WATER_VEIL : bool = SHADOW_CACHE_AVAILABLE;
+
+// What the liquid shades (shadeWater / shadeSubmerged / shadeMpmFluid) leave
+// for fs() to write into the veil. Private globals rather than a returned
+// struct for gRsTraceSteps' reason: those functions are inlined into fs() and
+// their signatures are load-bearing for register pressure. Only meaningful
+// once one of them ran on this pixel.
+//   gVK       transmitting fraction of the surface, before the air fog
+//   gVScatter the column's in-scatter colour
+//   gVAbsorb  per-metre extinction
+//   gVDelta   T_bed * (caustic * bed - scatter): the part of the pixel a body
+//             under the surface replaces, before K
+//   gVCurv    caustic curvature (0 = no caustic web)
+var<private> gVK : vec3f;
+var<private> gVScatter : vec3f;
+var<private> gVAbsorb : vec3f;
+var<private> gVDelta : vec3f;
+var<private> gVCurv : f32;
 // Must match kWaterFluxWords / WV_* in src/sim/world.h and
 // assets/shaders/sim_waterbody.wgsl. Declared here rather than in common.wgsl
 // for the GAS_OUTER_N reason above and CLAUDE.md's: a constant two shaders must
@@ -6032,15 +6061,19 @@ fn waterRippleFootprint(hitP : vec3f) -> f32 {
 // across the bed with the sun's angle instead of being pinned under the waves
 // that cast it.
 //
-// Returns a MULTIPLIER for the bed colour, not an addition. Caustics are a
-// redistribution of the sunlight already landing on the bed, so they scale what
-// is there: bright sand goes brighter, dark stone stays dark. Adding a constant
-// instead lights up the water itself, which reads as glowing blobs floating in
-// the volume rather than light playing over a surface.
+// Two halves. This one returns the CURVATURE — how strongly the swell above
+// this pixel focuses (>= 0, a wave crest acting as a converging lens).
+// veilCaustic (common.wgsl) turns it into a MULTIPLIER for the lit colour at a
+// given depth, not an addition: caustics are a redistribution of the sunlight
+// already landing on the bed, so they scale what is there — bright sand goes
+// brighter, dark stone stays dark. Adding a constant instead lights up the
+// water itself, which reads as glowing blobs floating in the volume. The split
+// is what lets the water veil re-apply the web at a raster body's own depth.
 //
 // Shared by shadeWater and the MPM fluid's seam path so a lake whose surface is
 // half CA and half marched isosurface throws ONE caustic web across its bed.
-fn waterCaustics(hitP : vec3f, rd : vec3f, pathVox : f32, depthM : f32) -> f32 {
+fn waterCausticCurv(hitP : vec3f, rd : vec3f, pathVox : f32,
+                    depthM : f32) -> f32 {
   // where on the surface the sunlight entering this bed point came from
   let bedP = hitP + rd * pathVox;
   let kdc = keyLightDir();
@@ -6061,12 +6094,9 @@ fn waterCaustics(hitP : vec3f, rd : vec3f, pathVox : f32, depthM : f32) -> f32 {
   // divergence of the slope field = Laplacian of the height field. Negative
   // curvature (a wave crest acting as a converging lens) is the bright case.
   let curv = ((sx.x - s0.x) + (sz.y - s0.y)) / e;
-  // Focusing strength grows with depth (longer lever arm from surface to bed)
-  // then saturates — deep water's caustics wash out as the light scatters, and
-  // unbounded growth would blow the bed out to white.
-  let focus = clamp(depthM * 1.5, 0.0, 1.4);
-  let caustic = max(-curv, 0.0) * focus;
-  return 1.0 + min(caustic * TUNE_CAUSTIC_GAIN, TUNE_CAUSTIC_CAP);
+  // The focusing strength (growing with depth, then saturating) is
+  // veilCaustic's half.
+  return max(-curv, 0.0);
 }
 
 // ---- W3: the sim's own surface momentum, at this column --------------------
@@ -7025,6 +7055,12 @@ fn shadeSubmerged(ro : vec3f, rd : vec3f, mat : u32, pathVox : f32,
   let extinction = absorbK + vec3f(1.0 / prof.visM);
   let trans = exp(-extinction * distM);
   var color = behind * trans + ambientWater * (vec3f(1.0) - trans);
+  // The water veil (gV* globals): the eye is in the medium, so a raster body
+  // at any distance sits in the same column, under no surface and no caustic.
+  gVScatter = ambientWater;
+  gVAbsorb = extinction;
+  gVDelta = (behind - ambientWater) * trans;
+  gVCurv = 0.0;
 
   // ---- god rays and silt ----
   // BOTH GATED ON CLARITY, and both skipped outright in a dense liquid.
@@ -7089,7 +7125,9 @@ fn shadeSubmerged(ro : vec3f, rd : vec3f, mat : u32, pathVox : f32,
   // with aspect ratio. Stronger in a dense liquid, which is what makes being
   // in oil feel like being in oil.
   let off = 1.0 - clamp(dot(rd, R.camFwd), 0.0, 1.0);
-  color *= 1.0 - clamp(off * prof.vignette * 2.5, 0.0, prof.vignette);
+  let vig = 1.0 - clamp(off * prof.vignette * 2.5, 0.0, prof.vignette);
+  color *= vig;
+  gVK = vec3f(vig);
 
   return color;
 }
@@ -7284,14 +7322,21 @@ fn shadeWater(hitP : vec3f, rd : vec3f, mat : u32, cell : vec3<i32>,
   // shifts across the bed with the sun's angle instead of being pinned under
   // the waves that cast it.
   var lit = sceneBehind;
+  gVCurv = 0.0;
   if (!underwater && depthM > 0.02) {
-    lit *= waterCaustics(hitP, rd, pathVox, depthM);
+    gVCurv = waterCausticCurv(hitP, rd, pathVox, depthM);
+    lit *= veilCaustic(gVCurv, depthM);
   }
 
   // What comes back up: the bed (plus its caustics), filtered by the water
   // column, plus the column's own in-scattered light (which is what keeps
   // deep water blue rather than black).
   var refracted = lit * trans + scatter * (vec3f(1.0) - trans);
+  // The water veil's half of this equation (see the gV* globals): a raster
+  // body under the surface replaces the bed term at its own depth.
+  gVScatter = scatter;
+  gVAbsorb = absorbK;
+  gVDelta = (lit - scatter) * trans;
 
   // ---- reflection ----
   var reflection : vec3f;
@@ -7319,6 +7364,7 @@ fn shadeWater(hitP : vec3f, rd : vec3f, mat : u32, cell : vec3<i32>,
   }
 
   var color = mix(refracted, reflection, fres);
+  gVK = vec3f(1.0 - fres);
 
   // ---- sun glint ----
   // Sharp Blinn-Phong lobe on the RIPPLED normal. This is what turns a
@@ -7388,7 +7434,9 @@ fn shadeWater(hitP : vec3f, rd : vec3f, mat : u32, cell : vec3<i32>,
       // damping it would dissolve the far shore's foam line)
       let s = rippleSlope(pm, R.time, 0.0);
       let mask = smoothstep(0.010, 0.055, length(s));
-      color = mix(color, vec3f(0.92, 0.95, 0.97), amount * mask * TUNE_FOAM_STRENGTH);
+      let foamA = amount * mask * TUNE_FOAM_STRENGTH;
+      color = mix(color, vec3f(0.92, 0.95, 0.97), foamA);
+      gVK *= 1.0 - foamA;
     }
   }
 
@@ -8286,6 +8334,27 @@ struct FSOut {
   @location(0) color : vec4f,
   @builtin(frag_depth) depth : f32,
 };
+
+// Publish this pixel's water veil (common.wgsl THE WATER VEIL) from the gV*
+// globals the liquid shade just left. `colorNow` is the pixel as shaded so far
+// — surface, reflection, foam and the air fog to the surface all included —
+// and `fogF` that air fog's fraction, which scales the transmitting part the
+// same way applyAerial scaled the bed's. The pitch is recomputed from the
+// uniform rather than carried from the top of fs(): a value live across
+// trace() costs registers in the one place this shader has none.
+fn writeWaterVeil(fragXY : vec2f, tSurf : f32, pathCap : f32, colorNow : vec3f,
+                  fogF : f32) {
+  let b = veilBase(fragXY, &R);
+  if (b == 0xFFFFFFFFu || b + VEIL_WORDS > arrayLength(&waterVeil)) { return; }
+  let k = gVK * (1.0 - fogF);
+  waterVeil[b] = bitcast<u32>(max(tSurf, 0.0) + 1.0);
+  waterVeil[b + 1u] = packRgb9e5(k);
+  waterVeil[b + 2u] = packRgb9e5(colorNow - k * gVDelta);
+  waterVeil[b + 3u] = packRgb9e5(k * gVScatter);
+  waterVeil[b + 4u] = packRgb9e5(gVAbsorb);
+  waterVeil[b + 5u] = pack2x16float(vec2f(clamp(pathCap, 0.0, 60000.0),
+                                          clamp(gVCurv, 0.0, 60000.0)));
+}
 
 // ============================================================================
 // MPM FLUID SURFACE — the Splash-style water look for the MLS-MPM liquid
@@ -9469,6 +9538,13 @@ fn shadeMpmFluid(ro : vec3f, rd : vec3f, fh : FluidHit, caMat : u32,
     body = mix(body, caScatter, caFrac);
   }
   let trans = exp(-absorb * thickM);
+  // The water veil (gV* globals): the same two coefficients a raster body in
+  // this column is dimmed by. Delta is refined below once `behind` is known.
+  gVScatter = body;
+  gVAbsorb = absorb;
+  gVK = vec3f(1.0);
+  gVCurv = 0.0;
+  gVDelta = (sceneBehind - body) * trans;
 
   if (fh.inside) {
     // Submerged: volumetric only — no interface, no Fresnel split. The
@@ -9583,9 +9659,12 @@ fn shadeMpmFluid(ro : vec3f, rd : vec3f, fh : FluidHit, caMat : u32,
   // seam as the colour was, and free to fix because both surfaces now agree
   // about the wave field that casts it (waterCaustics / rippleSlope).
   if (caFrac > 0.001 && thickM > 0.02) {
-    behind *= mix(1.0, waterCaustics(hitP, rd, colVox, thickM), caFrac);
+    let cc = waterCausticCurv(hitP, rd, colVox, thickM);
+    behind *= mix(1.0, veilCaustic(cc, thickM), caFrac);
+    gVCurv = cc * caFrac;
   }
   var refracted = behind * trans + body * (1.0 - trans);
+  gVDelta = (behind - body) * trans;
 
   // ---- reflection ----
   var reflection : vec3f;
@@ -9599,6 +9678,7 @@ fn shadeMpmFluid(ro : vec3f, rd : vec3f, fh : FluidHit, caMat : u32,
   reflection *= TUNE_FLUID_REFLECT;
 
   var color = mix(refracted, reflection, clamp(fres, 0.0, 1.0));
+  gVK = vec3f(1.0 - clamp(fres, 0.0, 1.0));
 
   // ---- sun glint ----
   // Tight Blinn-Phong lobe; the wobble normal breaks it into the moving
@@ -9657,12 +9737,19 @@ fn shadeMpmFluid(ro : vec3f, rd : vec3f, fh : FluidHit, caMat : u32,
     let foamCol = vec3f(0.93, 0.96, 0.99) *
                   (ambientAt(n) + keyLightColor() * 0.55);
     color = mix(color, foamCol, clamp(foam, 0.0, 0.90));
+    gVK *= 1.0 - clamp(foam, 0.0, 0.90);
   }
   return color;
 }
 
 @fragment
 fn fs(in : VSOut) -> FSOut {
+  // Every pixel starts dry; a liquid shade below overwrites the record. Done
+  // FIRST so nothing about it is live across trace().
+  if (WATER_VEIL) {
+    let vb = veilBase(in.pos.xy, &R);
+    if (vb != 0xFFFFFFFFu && vb < arrayLength(&waterVeil)) { waterVeil[vb] = 0u; }
+  }
   if (RENDER_STATS) {
     // The 1-in-16 sample: every fourth pixel on both axes. Decided once here;
     // rsAdd() reads the flag on every count.
@@ -9809,14 +9896,28 @@ fn fs(in : VSOut) -> FSOut {
   // Liquid interface: nearest wins. `> 0.0` skips the underwater case (liqT
   // ~0 means the camera is already submerged, so there is no interface in
   // front of anything and depth belongs to whatever the ray actually found).
+  //
+  // UNLESS THE WATER VEIL CARRIES IT. A clear liquid's surface is not what
+  // covers a body under it — the water column is, and it is recorded per pixel
+  // (writeWaterVeil) for the raster passes to shade through. Its depth
+  // therefore stays with what the march found BEHIND it, so a wading mob's
+  // legs pass the depth test and are drawn dimmed and tinted instead of being
+  // cut off at the waterline. Viscous liquids (blood, oil) keep the interface:
+  // they are near-opaque and their shade records no veil.
   if (h.liqT > 0.05 && (tDepth < 0.0 || h.liqT < tDepth)) {
-    tDepth = h.liqT;
+    if (!WATER_VEIL ||
+        isViscousLiquid(materials[voxMat(voxWordAt(h.liqCell))])) {
+      tDepth = h.liqT;
+    }
   }
   // MPM fluid interface: same nearest-wins rule as the CA liquid above, and
   // the same "> 0.05" skip for a submerged camera. Raster geometry (droplet
   // spray, debris) behind the surface is covered by it; spray in front of it
   // draws over it — which is exactly what a splash should do.
-  if (SPEC_FLUID && mf.hit && mf.t > 0.05 && (tDepth < 0.0 || mf.t < tDepth)) {
+  // The MPM shade always records a veil (it only ever holds non-viscous
+  // liquid), so under WATER_VEIL its interface writes no depth either.
+  if (!WATER_VEIL && SPEC_FLUID && mf.hit && mf.t > 0.05 &&
+      (tDepth < 0.0 || mf.t < tDepth)) {
     tDepth = mf.t;
   }
   // Half-opaque gas: same nearest-wins rule as the two interfaces above, and
@@ -10480,12 +10581,16 @@ fn fs(in : VSOut) -> FSOut {
                      && materials[lm].moveEvery <= 1u
                      && (mf.inside || mf.t <= h.liqT + 1.0);
 
+      // The veil's surface distance, set by the two shades that record one
+      // (-1 = none): 0 for a submerged eye, the interface otherwise.
+      var veilT = -1.0;
       if (underwater && !mpmOwned) {
         let sawSky = !h.hit && !h.saturated && !far.hit;
         rsAdd(RS_PX_SUB, 1u);
         color = shadeSubmerged(R.camPos, rd, lm, h.liqPath, color, in.pos.xy,
                                sawSky);
         caShadedLiquid = true;
+        veilT = 0.0;
       } else if (isViscousLiquid(materials[lm])) {
         color = shadeViscous(hitP, rd, lm, h.liqCell, h.liqAxis, h.liqSgn,
                              h.liqPath, max(h.mediaSurf, 0.125), color,
@@ -10499,6 +10604,7 @@ fn fs(in : VSOut) -> FSOut {
                            h.liqT, underwater);
         color = applyAerial(color, rd, h.liqT);
         caShadedLiquid = true;
+        veilT = h.liqT;
       }
       // mpmOwned && !viscous && !underwater: the MPM path below will shade it.
 
@@ -10511,6 +10617,12 @@ fn fs(in : VSOut) -> FSOut {
       // render.mistDensity at 0 so does this one.
       if (!underwater && caShadedLiquid) {
         color = waterfallMist(color, hitP, rd, h.liqT, h.liqCell, lm);
+      }
+      // After the mist, which hangs between the eye and the surface and so
+      // covers a body under it exactly as it covers the bed.
+      if (WATER_VEIL && veilT >= 0.0) {
+        writeWaterVeil(in.pos.xy, veilT, h.liqPath, color,
+                       select(0.0, aerialFrac(veilT), veilT > 0.0));
       }
     }
   }
@@ -10592,6 +10704,11 @@ fn fs(in : VSOut) -> FSOut {
       }
       color = shadeMpmFluid(R.camPos, rd, mf, caMat, caPath, color);
       if (!mf.inside) { color = applyAerial(color, rd, mf.t); }
+      if (WATER_VEIL) {
+        writeWaterVeil(in.pos.xy, select(mf.t, 0.0, mf.inside),
+                       max(mf.thick, caPath), color,
+                       select(aerialFrac(mf.t), 0.0, mf.inside));
+      }
     }
   }
 

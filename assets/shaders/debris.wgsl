@@ -31,6 +31,22 @@
 // ONE buffer load per shaded point, no ray and no voxel read, which is the only
 // shape of emitter light this path can consume.
 @group(0) @binding(20) var<storage, read> glow : array<u32>;
+// The water veil (common.wgsl THE WATER VEIL), written by raymarch.wgsl in the
+// half of the world pass before these draws.
+@group(0) @binding(24) var<storage, read> waterVeil : array<u32>;
+
+// Eye distance of a fragment, in voxels, from its reversed-Z depth — for the
+// per-vertex paths, which carry no world position to the fragment stage.
+// depth = KNEAR / viewZ, and a pixel's ray has |rd| / viewZ = the length of
+// its unnormalized camera-basis direction (camFwd + ndc offsets).
+fn fragEyeDist(fragPos : vec4f) -> f32 {
+  let viewZ = KNEAR / max(fragPos.z, 1e-7);
+  let h = max(R.viewPx, 1.0);
+  let w = max(round(R.viewPx * R.aspect), 1.0);
+  let ndc = vec2f(fragPos.x / w * 2.0 - 1.0, 1.0 - fragPos.y / h * 2.0);
+  let off = ndc * vec2f(R.tanHalfFov * R.aspect, R.tanHalfFov);
+  return viewZ * sqrt(1.0 + dot(off, off));
+}
 
 @group(1) @binding(0) var<storage, read> particles : array<Particle>;
 
@@ -351,8 +367,8 @@ fn fsBody(in : BodyVSOut) -> @location(0) vec4f {
       (!BODY_SUN_SKIP || dot(in.wn, keyLightDirP(R)) > -TUNE_DIFFUSE_WRAP)) {
     sh = bodySunShadow(in.world, in.wn, R, &occupancy, &materials);
   }
-  var col = litColorS(in.albedo, in.wn, in.world, in.misc.x, R,
-                      in.misc.y, in.misc.z, sh);
+  let lit = litColorSNoFog(in.albedo, in.wn, in.world, in.misc.x, R,
+                           in.misc.y, in.misc.z, sh);
   // Emitter light from the glow field (common.wgsl THE GLOW FIELD), and this
   // is the call site the whole feature exists for: THE CROWN THAT FALLS OFF A
   // BURNING TREE COMES THROUGH HERE. A rigid body is not in the voxel grid, so
@@ -364,8 +380,18 @@ fn fsBody(in : BodyVSOut) -> @location(0) vec4f {
   //
   // `in.misc.y` is the ambient openness multiplier the vertex stage measured —
   // the same occlusion the ambient takes, for the same reason.
-  col += glowLight(in.albedo, in.misc.y, glowAtPos(in.world, &glow),
-                   TUNE_GLOW_STRENGTH);
+  let add = glowLight(in.albedo, in.misc.y, glowAtPos(in.world, &glow),
+                      TUNE_GLOW_STRENGTH);
+  // Under a liquid surface the cube is seen through the water column exactly
+  // as a micro body is (microbody.wgsl UNDER WATER); above it, air fog.
+  let dist = length(in.world - R.camPos);
+  let veil = waterVeilAt(&waterVeil, in.pos.xy, dist, &R);
+  var col : vec3f;
+  if (veil.on) {
+    col = waterVeilApply(veil, lit + add, dist);
+  } else {
+    col = bodyAirFog(lit, in.world, R) + add;
+  }
   // Same tonemap as fs() and as the terrain: a cube must match the ground it
   // lands on at any time of day.
   return vec4f(tonemapHdr(col), 1.0);
@@ -444,8 +470,17 @@ fn vsSprite(@builtin(vertex_index) vi : u32,
 
 @fragment
 fn fs(in : VSOut) -> @location(0) vec4f {
+  // A particle under a liquid surface (sand sinking into a pond, a droplet
+  // below the waterline) is seen through the column like a body is. Its colour
+  // was lit and air-fogged per vertex over the whole eye distance, so the fog
+  // to the surface is counted twice here — at particle size, not worth a
+  // second interstage colour to undo.
+  var c = in.color;
+  let dist = fragEyeDist(in.pos);
+  let veil = waterVeilAt(&waterVeil, in.pos.xy, dist, &R);
+  if (veil.on) { c = waterVeilApply(veil, c, dist); }
   // litColor is linear HDR; compress through the terrain's tonemap so a cube
   // matches the ground it lands on at any time of day (bare gamma here made
   // debris glow at night).
-  return vec4f(tonemapHdr(in.color), 1.0);
+  return vec4f(tonemapHdr(c), 1.0);
 }

@@ -79,6 +79,7 @@ struct RenderPassImpl {
   virtual void Draw(uint32_t vertexCount, uint32_t instanceCount, uint32_t firstVertex,
                     uint32_t firstInstance) = 0;
   virtual void DrawIndirect(const Buffer& args, uint64_t offset) = 0;
+  virtual void SplitAfterFragmentWrite(const Buffer& written) = 0;
   virtual void End() = 0;
 };
 

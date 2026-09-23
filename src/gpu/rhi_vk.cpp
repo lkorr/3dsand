@@ -205,6 +205,11 @@ struct VkrRenderPass final : RenderPassImpl {
   void DrawIndirect(const Buffer& args, uint64_t offset) override {
     rec->DrawIndirect(NB(args), offset);
   }
+  void SplitAfterFragmentWrite(const Buffer& written) override {
+    // The bound pipeline and descriptor sets are command-buffer state and
+    // survive the scope boundary, so curLayout stays valid.
+    rec->SplitRenderingAfterFragmentWrite(NB(written));
+  }
   void End() override { rec->EndRendering(); }
 };
 

@@ -597,6 +597,17 @@ class Simulation {
   void EnsureDepth(uint32_t width, uint32_t height);
   void EnsureAuxDepth(uint32_t width, uint32_t height);
   void EnsureOverlayDepth(uint32_t width, uint32_t height);
+  // The water veil (common.wgsl THE WATER VEIL): grow the per-pixel record
+  // buffer to cover a width x height target and rebuild renderBG_ around it.
+  void EnsureVeil(uint32_t width, uint32_t height);
+  void BuildRenderBindGroup(rhi::BindGroup& out, const rhi::Buffer& veil);
+  // The group-0 bind group a raster body draw uses: the live veil once this
+  // pass's DrawWorld has written it, otherwise one bound to a zeroed record so
+  // a body-only pass (the character portrait) never reads a veil some other
+  // pass wrote for other pixels.
+  const rhi::BindGroup& BodyRenderBG() const {
+    return veilLive_ ? renderBG_ : renderBGNoVeil_;
+  }
   void EnsureRenderPipelines(rhi::TextureFormat format);
   // Derive raymarchLeanModule_ from an already-loaded raymarch module by
   // flipping the three `const SPEC_* : bool = true;` lines in the source
@@ -842,6 +853,13 @@ class Simulation {
   // source.
   rhi::BindGroup renderBG_, renderPartBG_[2], farBG_, microBodyBG_, fluidBG_[2],
       fluidSeamBG_[2], shadowBG_;
+  // Water veil: renderBG_ binds veilBuf_ at 24 (grown by EnsureVeil, never
+  // shrunk); renderBGNoVeil_ binds veilNone_, one zeroed record. veilLive_ is
+  // true between a pass's DrawWorld and the next Begin*RenderPass.
+  rhi::Buffer veilBuf_, veilNone_;
+  uint64_t veilPixels_ = 0;
+  rhi::BindGroup renderBGNoVeil_;
+  bool veilLive_ = false;
   int page_ = 0;
 
   // ---- settled-tick skip state (§3.4) -------------------------------------
