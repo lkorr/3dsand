@@ -575,7 +575,7 @@ struct BodyMask {
 
 BodyMask BuildBodyMask(const std::vector<MaterialDef>& mats) {
   static const char* kBody[] = {"stone", "dirt", "sand", "grass",
-                                "snow",  "mud",  "gravel"};
+                                "snow",  "mud",  "gravel", "sandstone"};
   static const char* kBulk[] = {"stone", "dirt", "mud", "gravel"};
   BodyMask m;
   m.body.assign(mats.size(), 0);
