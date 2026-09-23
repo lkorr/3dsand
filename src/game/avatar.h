@@ -468,7 +468,10 @@ class PlayerAvatar : public Mob {
   // death screen; Despawn/Revive tears it down instead of the husk sweep.
   bool DropLimbListOnDeath() const override { return false; }
   // The avatar renders through its own slot range with its own dirty flag.
-  void MarkInstancesDirty() override { instancesDirty_ = true; }
+  void MarkInstancesDirty() override {
+    instancesDirty_ = true;
+    twinDirty_ = true;  // Mob::SyncJointTwins: a lattice may have changed
+  }
 
  private:
   // Damage state read from a save (LoadState), applied at the end of the next

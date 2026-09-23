@@ -4940,6 +4940,183 @@ Status GateLaserHead(Ctx& c, std::string& detail) {
   return ok ? Status::Pass : Status::Fail;
 }
 
+// ---- joint-twins -----------------------------------------------------------
+// ONE CELL OF FLESH, TWO COPIES, ONE STATE (Mob::SyncJointTwins).
+//
+// Owner report 2026-09-23: the hips and the torso overlap, so an infected torso
+// voxel could sit under the hip's pristine copy of the same cell and never be
+// seen. The overlap is authored and stays; what is asserted is that the two
+// copies now share whatever happens to either:
+//
+//   MATERIAL  rot written into the PARENT's copy appears in the child's;
+//   COAT      blood written into the CHILD's copy appears in the parent's;
+//   REMOVAL   a hole in the child's copy is a hole in the parent's;
+//   CONTROL   no OTHER twin cell's material moved (the sync copies changes,
+//             never the parent over the child).
+//
+// The infection's own spread and rot are switched off for the duration, so
+// the only writer is this gate and the sync; one tick of PreTick is what the
+// claim is about ("next tick, both copies agree"). Picks the def with the most
+// twin cells, by shape rather than by name; reports every pair's count.
+Status GateJointTwins(Ctx& c, std::string& detail) {
+  MobSystem& mobs = c.mobs;
+  IdCounterScope idScope(mobs);
+  PrepareWorld(c);
+  const uint32_t rotMat = mobs.MaterialIdNamed("rotflesh");
+  if (!rotMat) {
+    detail = "materials.json has no `rotflesh`";
+    return Status::Skip;
+  }
+  Target t;
+  uint32_t most = 0;
+  for (size_t d = 0; d < mobs.Defs().size(); d++) {
+    const MobDef& def = mobs.Defs()[d];
+    if (def.limbs.empty() || def.bleedMat == 0) continue;
+    mobs.Reset();
+    const uint64_t id = mobs.Spawn((int)d, FixtureSite(c.world, 505));
+    if (!id) continue;
+    const uint32_t n = mobs.JointTwinCount(id);
+    if (n > most) {
+      most = n;
+      t.defIndex = (int)d;
+      t.defName = def.name;
+    }
+  }
+  mobs.Reset();
+  if (t.defIndex < 0) {
+    detail = "no loaded bleeding def has a single twin cell (no limb overlaps "
+             "its parent on the rest pose)";
+    return Status::Fail;
+  }
+  const uint32_t blood = mobs.Defs()[t.defIndex].bleedMat;
+
+  const Tuning saved = CurrentTuning();
+  Tuning tt = saved;
+  tt.gore.infectSpreadRate = 0.0f;
+  tt.gore.infectRotRate = 0.0f;
+  SetCurrentTuning(tt);
+
+  IVec3 chunk{};
+  const uint64_t id = SpawnTarget(c, t, 505, chunk);
+  const uint32_t n = id ? mobs.JointTwinCount(id) : 0;
+  if (n < 3) {
+    SetCurrentTuning(saved);
+    mobs.Reset();
+    detail = t.defName + ": " + std::to_string(n) + " twin cells after spawn";
+    return Status::Fail;
+  }
+  // Per-pair attribution: which joints overlap, and by how much.
+  std::string pairs;
+  {
+    int pa = -2, pb = -2;
+    uint32_t run = 0;
+    auto flush = [&]() {
+      if (pa < 0) return;
+      const auto& L = mobs.Defs()[t.defIndex].limbs;
+      pairs += (pairs.empty() ? "" : ", ") + L[pa].name + "/" + L[pb].name +
+               " " + std::to_string(run);
+    };
+    for (uint32_t k = 0; k < n; k++) {
+      int a = -1, b = -1;
+      IVec3 r{};
+      mobs.JointTwinAt(id, k, a, b, r);
+      if (a != pa || b != pb) {
+        flush();
+        pa = a;
+        pb = b;
+        run = 0;
+      }
+      run++;
+    }
+    flush();
+  }
+
+  struct Probe { int a = -1, b = -1; IVec3 rest{}; };
+  auto probeAt = [&](uint32_t k) {
+    Probe p;
+    mobs.JointTwinAt(id, k, p.a, p.b, p.rest);
+    return p;
+  };
+  const Probe pm = probeAt(0), ps = probeAt(n / 2), pr = probeAt(n - 1);
+
+  // Every twin cell's material on both sides, for the control.
+  auto snapshot = [&]() {
+    std::vector<uint32_t> s;
+    for (uint32_t k = 0; k < n; k++) {
+      const Probe p = probeAt(k);
+      uint32_t ma = 0, mb = 0;
+      uint16_t st = 0;
+      mobs.LimbCellAt(id, p.a, p.rest, ma, st);
+      mobs.LimbCellAt(id, p.b, p.rest, mb, st);
+      s.push_back(ma);
+      s.push_back(mb);
+    }
+    return s;
+  };
+  const std::vector<uint32_t> before = snapshot();
+
+  uint32_t m0 = 0, m1 = 0;
+  uint16_t s0 = 0, s1 = 0;
+  // MATERIAL, parent -> child.
+  mobs.LimbCellAt(id, pm.a, pm.rest, m0, s0);
+  mobs.SetLimbCellAt(id, pm.a, pm.rest, rotMat, s0);
+  // COAT, child -> parent: 9/15 of the creature's own blood.
+  mobs.LimbCellAt(id, ps.b, ps.rest, m1, s1);
+  const uint16_t coat = (uint16_t)((blood & 0xFFFu) | (9u << 12));
+  mobs.SetLimbCellAt(id, ps.b, ps.rest, m1, coat);
+  // REMOVAL, child -> parent.
+  mobs.SetLimbCellAt(id, pr.b, pr.rest, 0, 0);
+
+  {
+    std::vector<BrushOp> ops;
+    std::vector<ParticleSpawn> spawns;
+    std::vector<CellOp> cellOps;
+    mobs.PreTick(2000u, c.world, ops, cellOps, spawns);
+    c.phys.Step(kTickDt);
+    mobs.PostStep();
+  }
+
+  uint32_t mat = 0;
+  uint16_t st = 0;
+  const bool matOk = mobs.LimbCellAt(id, pm.b, pm.rest, mat, st) && mat == rotMat;
+  const uint32_t matSeen = mat;
+  st = 0;
+  const bool coatOk = mobs.LimbCellAt(id, ps.a, ps.rest, mat, st) && st == coat;
+  const uint16_t coatSeen = st;
+  const bool goneOk = !mobs.LimbCellAt(id, pr.a, pr.rest, mat, st);
+
+  // The removed cell was the LAST link, so every surviving link keeps its
+  // index and `after[2k..2k+1]` is the same rest cell as `before[2k..2k+1]`.
+  const std::vector<uint32_t> after = snapshot();
+  uint32_t moved = 0;
+  for (uint32_t k = 1; k + 1 < n; k++) {
+    if (k == n / 2) continue;  // the coat probe (its material is unchanged,
+                               // but it is not a bystander)
+    if (before[2 * k] != after[2 * k] || before[2 * k + 1] != after[2 * k + 1])
+      moved++;
+  }
+  const uint32_t linksAfter = mobs.JointTwinCount(id);
+
+  SetCurrentTuning(saved);
+  mobs.Reset();
+  c.debris.Reset();
+
+  char buf[224];
+  std::snprintf(buf, sizeof buf,
+                "; material %s (child reads %u, want %u), coat %s (parent "
+                "reads 0x%04x, want 0x%04x), removal %s, %u other cells moved, "
+                "%u links left (want %u)",
+                matOk ? "SHARED" : "NOT shared", matSeen, rotMat,
+                coatOk ? "SHARED" : "NOT shared", coatSeen, coat,
+                goneOk ? "SHARED" : "NOT shared", moved, linksAfter, n - 1);
+  detail = t.defName + ": " + std::to_string(n) + " twin cells (" + pairs +
+           ")" + buf;
+  (void)m0;
+  return matOk && coatOk && goneOk && moved == 0 && linksAfter == n - 1
+             ? Status::Pass
+             : Status::Fail;
+}
+
 const std::vector<Gate>& WoundGates() {
   static const std::vector<Gate> g = {
       {"wound-chip", "mob", {}, false, GateWoundChip, /*needsRender=*/false},
@@ -4966,6 +5143,7 @@ const std::vector<Gate>& WoundGates() {
       {"wound-heal", "mob", {}, false, GateWoundHeal, false},
       {"corpse-burn", "mob", {}, false, GateCorpseBurn, false},
       {"laser-head", "mob", {}, false, GateLaserHead, false},
+      {"joint-twins", "mob", {}, false, GateJointTwins, false},
   };
   return g;
 }

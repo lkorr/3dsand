@@ -2698,6 +2698,9 @@ void Mob::MarkInstancesDirty() {
   // NPCs share MobSystem's instance list; the avatar overrides this to mark
   // its own (game/avatar.h).
   if (sys_) sys_->instancesDirty_ = true;
+  // Every lattice writer lands here (or on a coat flag, which sets this too),
+  // so this is what wakes the joint-twin sync (Mob::SyncJointTwins).
+  twinDirty_ = true;
 }
 
 // Draws this mob's own bleed character. Entity-scoped variances resolve here,
@@ -2987,6 +2990,11 @@ bool Mob::BuildRig(const MobDef& def, Vec3 origin) {
   worn_.clear();
   baseLimbs_ = (int)def.limbs.size();
   limbs_.assign(def.limbs.size(), MobLimb{});
+  // The joint-twin links are facts about THESE lattices (Mob::SyncJointTwins).
+  twins_.clear();
+  twinAttached_.clear();
+  twinsBuilt_ = false;
+  twinDirty_ = true;
 
   // SKIN -> WORLD. The .vox model is authored on the skin lattice, so every
   // POSITION derived from it divides by skinScale to reach world voxels.
@@ -9132,7 +9140,7 @@ uint32_t Mob::BruiseLimb(int limbIndex, Vec3 centreLocal, float radiusWorld,
   // the coat DECAY sweep, which walks the ledger's materials and would
   // therefore never dry a bruise off. A stain written behind the ledger's back
   // is a stain that is permanent by accident.
-  if (marked) coatDirty_ = true;
+  if (marked) coatDirty_ = twinDirty_ = true;
   if (report) {
     report->marked = marked;
     report->core = coreCells;
@@ -9437,7 +9445,7 @@ uint32_t Mob::StainWoundAs(int limbIndex, Vec3 centreLocal, float radiusWorld,
     if (fine) L.skin = &limb.skinVoxels; else L.coll = &limb.voxels;
     if (SoakCut(L, c, soak, seed ^ 0x5741Bu, micro, poke ? limb.microModel : -1)) {
       stained++;
-      coatDirty_ = true;  // the ledger owes a recount (see LimbCoat)
+      coatDirty_ = twinDirty_ = true;  // the ledger owes a recount (see LimbCoat)
     }
   }
   if (!stained) return 0;
@@ -12448,6 +12456,7 @@ void Mob::BurnTick(uint32_t tick, World& world, std::vector<CellOp>& cellOps,
   // PULPED TISSUE DISSOLVES (the blunt counterpart of InfectTick). Same
   // position, same FlushBurn tail, same return contract.
   if (!BluntPulpTick(tick, world, spawns)) return;
+  if (!SyncJointTwins(world, spawns)) return;
   // The burn cap (Gore §G). Recounted at a bounded cadence while the lattice
   // is changing and not at all while it is not; may kill the creature, and is
   // last here for the same reason FlushBurn returns above.
@@ -12984,7 +12993,7 @@ bool Mob::InfectStep(int li, uint32_t tick, uint32_t nSpread, uint32_t nRot,
   // THE LEDGER OWES A RECOUNT (mob.h LimbCoat) -- BruiseLimb's note gives the
   // reason at length: a stain written behind the ledger's back is one the coat
   // DECAY sweep never walks, i.e. one that is permanent by accident.
-  if (coated) coatDirty_ = true;
+  if (coated) coatDirty_ = twinDirty_ = true;
 
   if (grown || eaten || coated) {
     MarkInstancesDirty();
@@ -13110,6 +13119,407 @@ uint32_t Mob::InfectAcrossJoint(int fromLimb, uint32_t tick, int toLimb,
   dst.infectStain = limbs_[fromLimb].infectStain;
   MarkInstancesDirty();
   return 1;
+}
+
+// ============================================================================
+// JOINT TWINS — one cell of flesh stored in two limbs (see JointTwinPair, mob.h)
+//
+// Owner report 2026-09-23: "hips and torso overlap on a few spots, so if the
+// torso has an infected voxel it can be covered up by the hip voxel that's
+// aligned." The overlap is authored (mobgen's stack overlaps) and has to stay:
+// it is what keeps a bending joint from opening a gap. What was wrong is that
+// the two copies of one cell had independent lives.
+//
+// THE ALTERNATIVES, and why not them:
+//   * PARTITION the overlap (each cell kept by one limb). Kills the duplicate,
+//     and with it the reason the overlap exists — the first time the hip
+//     swings, the gap the overlap was covering opens.
+//   * HIDE the non-owner copy while the joint is near rest. A render rule that
+//     has to guess when a copy is "coincident", and the covered-infection bug
+//     comes straight back the moment it guesses wrong.
+//   * ONE SKINNED LATTICE with per-cell bone weights. The honest end state for
+//     a deforming body, and a rewrite of the collider, carve, burn, rot and
+//     brick paths — every one of which is per-limb today.
+// So the copies stay and are made to agree. Both then show the same thing
+// whichever of them ends up in front, and a bent joint reveals matching
+// state rather than a pristine patch.
+// ============================================================================
+
+namespace {
+
+// A limb's rest-pose min corner on lattice `scale`, in whole cells. restOffset
+// is authored in 1/skinScale steps and ReskinLimbMicro moves it by whole skin
+// cells, so this is exact; the round only absorbs float noise.
+IVec3 TwinOrigin(const MobLimb& l, uint32_t scale) {
+  const float s = (float)scale;
+  return {(int)std::lround(l.restOffset.x * s),
+          (int)std::lround(l.restOffset.y * s),
+          (int)std::lround(l.restOffset.z * s)};
+}
+
+JointTwinSide TwinSideOf(const BurnLimbView& v, size_t i) {
+  JointTwinSide s;
+  s.mat = (uint16_t)v.Word(i);
+  s.stain = v.Stain(i);
+  s.art = (uint8_t)v.Art(i);
+  return s;
+}
+
+// One side's rest -> lattice-index lookup over a pair's box. Built only when an
+// index hint has gone stale (a compaction or a rebase moved the lattice), so a
+// sync that finds every hint valid never sweeps a limb.
+struct TwinLook {
+  const BurnLimbView* v = nullptr;
+  IVec3 o{};
+  IVec3 lo{}, dims{};
+  std::vector<uint32_t> map;   // index + 1, 0 = absent
+  bool built = false;
+
+  // -1 = no live voxel at `rest`.
+  int Find(IVec3 rest, uint32_t hint) {
+    const IVec3 p{rest.x - o.x, rest.y - o.y, rest.z - o.z};
+    if (hint < v->Size()) {
+      const IVec3 q = v->At(hint);
+      if (q.x == p.x && q.y == p.y && q.z == p.z)
+        return v->Mat(hint) ? (int)hint : -1;
+    }
+    if (!built) {
+      built = true;
+      map.assign((size_t)dims.x * dims.y * dims.z, 0u);
+      for (size_t i = 0; i < v->Size(); i++) {
+        if (v->Mat(i) == 0) continue;
+        const IVec3 q = v->At(i);
+        const int x = q.x + o.x - lo.x, y = q.y + o.y - lo.y, z = q.z + o.z - lo.z;
+        if (x < 0 || y < 0 || z < 0 || x >= dims.x || y >= dims.y || z >= dims.z)
+          continue;
+        map[((size_t)z * dims.y + y) * dims.x + x] = (uint32_t)i + 1u;
+      }
+    }
+    const int x = rest.x - lo.x, y = rest.y - lo.y, z = rest.z - lo.z;
+    if (x < 0 || y < 0 || z < 0 || x >= dims.x || y >= dims.y || z >= dims.z)
+      return -1;
+    return (int)map[((size_t)z * dims.y + y) * dims.x + x] - 1;
+  }
+};
+
+}  // namespace
+
+void Mob::BuildJointTwins() {
+  twins_.clear();
+  twinsBuilt_ = true;
+  twinAttached_.assign(limbs_.size(), 0);
+  for (size_t i = 0; i < limbs_.size(); i++)
+    twinAttached_[i] = limbs_[i].body ? 1 : 0;
+  if (!def_) return;
+  const int nl = std::min((int)limbs_.size(), (int)limbDefs_.size());
+  for (int b = 0; b < nl; b++) {
+    // BASE ANATOMY ONLY: a garment's panels are their own seam problem
+    // (MicroBodyCutFaces), and a sword is not flesh shared with a hand.
+    if (b >= baseLimbs_ || IsWornSlot(b)) continue;
+    const int a = ParentLimbIndex(b);
+    if (a < 0 || a >= baseLimbs_ || IsWornSlot(a)) continue;
+    MobLimb& la = limbs_[a];
+    MobLimb& lb = limbs_[b];
+    if (!la.body || !lb.body) continue;
+    // SAME LATTICE or no pairing: a cell only "coincides" with a cell of the
+    // same size. Every authored rig puts its limbs on one skin scale.
+    if (la.HasFineSkin() != lb.HasFineSkin()) continue;
+    const uint32_t sc = la.HasFineSkin() ? SkinScaleOf(la) : PhysScaleOf(la);
+    if (sc != (lb.HasFineSkin() ? SkinScaleOf(lb) : PhysScaleOf(lb))) continue;
+    BurnLimbView va = ViewOf(la), vb = ViewOf(lb);
+    if (va.Size() == 0 || vb.Size() == 0) continue;
+    const IVec3 oa = TwinOrigin(la, sc), ob = TwinOrigin(lb, sc);
+    auto restBox = [](const BurnLimbView& v, IVec3 o, IVec3& lo, IVec3& hi) {
+      lo = {1 << 30, 1 << 30, 1 << 30};
+      hi = {-(1 << 30), -(1 << 30), -(1 << 30)};
+      for (size_t i = 0; i < v.Size(); i++) {
+        if (v.Mat(i) == 0) continue;
+        const IVec3 p = v.At(i);
+        lo.x = std::min(lo.x, p.x + o.x); hi.x = std::max(hi.x, p.x + o.x);
+        lo.y = std::min(lo.y, p.y + o.y); hi.y = std::max(hi.y, p.y + o.y);
+        lo.z = std::min(lo.z, p.z + o.z); hi.z = std::max(hi.z, p.z + o.z);
+      }
+    };
+    IVec3 aLo, aHi, bLo, bHi;
+    restBox(va, oa, aLo, aHi);
+    restBox(vb, ob, bLo, bHi);
+    const IVec3 lo{std::max(aLo.x, bLo.x), std::max(aLo.y, bLo.y),
+                   std::max(aLo.z, bLo.z)};
+    const IVec3 hi{std::min(aHi.x, bHi.x), std::min(aHi.y, bHi.y),
+                   std::min(aHi.z, bHi.z)};
+    if (lo.x > hi.x || lo.y > hi.y || lo.z > hi.z) continue;  // boxes apart
+    const IVec3 dims{hi.x - lo.x + 1, hi.y - lo.y + 1, hi.z - lo.z + 1};
+    // BuildBurnIndex's ceiling, for its reason: a box absurd next to what it
+    // holds is refused rather than allocated. No authored joint comes near.
+    if ((uint64_t)dims.x * dims.y * dims.z > (1u << 20)) continue;
+    std::vector<uint32_t> idxB((size_t)dims.x * dims.y * dims.z, 0u);
+    for (size_t i = 0; i < vb.Size(); i++) {
+      if (vb.Mat(i) == 0) continue;
+      const IVec3 p = vb.At(i);
+      const int x = p.x + ob.x - lo.x, y = p.y + ob.y - lo.y, z = p.z + ob.z - lo.z;
+      if (x < 0 || y < 0 || z < 0 || x >= dims.x || y >= dims.y || z >= dims.z)
+        continue;
+      idxB[((size_t)z * dims.y + y) * dims.x + x] = (uint32_t)i + 1u;
+    }
+    JointTwinPair tp;
+    tp.a = a;
+    tp.b = b;
+    tp.scale = sc;
+    tp.lo = hi;
+    tp.hi = lo;
+    // In A's lattice order, so the link list (and with it every tie the sync
+    // breaks) is a pure function of the lattices.
+    for (size_t i = 0; i < va.Size(); i++) {
+      if (va.Mat(i) == 0) continue;
+      const IVec3 p = va.At(i);
+      const IVec3 r{p.x + oa.x, p.y + oa.y, p.z + oa.z};
+      const int x = r.x - lo.x, y = r.y - lo.y, z = r.z - lo.z;
+      if (x < 0 || y < 0 || z < 0 || x >= dims.x || y >= dims.y || z >= dims.z)
+        continue;
+      const uint32_t j = idxB[((size_t)z * dims.y + y) * dims.x + x];
+      if (!j) continue;
+      JointTwinCell c;
+      c.rest = r;
+      c.hintA = (uint32_t)i;
+      c.hintB = j - 1u;
+      c.a = TwinSideOf(va, i);
+      c.b = TwinSideOf(vb, j - 1u);
+      tp.cells.push_back(c);
+      tp.lo = {std::min(tp.lo.x, r.x), std::min(tp.lo.y, r.y), std::min(tp.lo.z, r.z)};
+      tp.hi = {std::max(tp.hi.x, r.x), std::max(tp.hi.y, r.y), std::max(tp.hi.z, r.z)};
+    }
+    if (!tp.cells.empty()) twins_.push_back(std::move(tp));
+  }
+}
+
+bool Mob::SyncJointTwins(World& world, std::vector<ParticleSpawn>& spawns) {
+  if (!twinDirty_) return true;
+  twinDirty_ = false;
+  // A SEVER, A DETACH OR A RESPAWN changes which limbs exist, and a twin whose
+  // other half has left the body is no longer a twin: the severed hip keeps
+  // its copy of the torso's rim and the torso keeps its own. Rebuilding
+  // baselines against the lattices as they now stand; it propagates nothing.
+  bool rebuild = !twinsBuilt_ || twinAttached_.size() != limbs_.size();
+  for (size_t i = 0; !rebuild && i < limbs_.size(); i++)
+    rebuild = (limbs_[i].body ? 1 : 0) != twinAttached_[i];
+  if (rebuild) {
+    BuildJointTwins();
+    return true;
+  }
+  if (twins_.empty()) return true;
+
+  MicroBodySet* micro = MicroSet();
+  std::vector<uint8_t> owned(limbs_.size(), 0);   // 1 = brick owned, 2 = refused
+  auto ownBrick = [&](int li) -> bool {
+    MobLimb& l = limbs_[li];
+    if (owned[li]) return owned[li] == 1;
+    owned[li] = 2;
+    if (!micro || l.microModel < 0) return false;
+    const int own = MicroBodyOwn(*micro, (uint32_t)l.microModel);
+    if (own < 0) return false;  // pool full: the lattice agrees, the skin lags
+    l.microModel = own;
+    l.carved = true;
+    l.flipbookModel = -1;
+    owned[li] = 1;
+    return true;
+  };
+  bool matChanged = false, stainChanged = false, removed = false;
+
+  // Copy one side's material + art onto the other copy.
+  auto writeMat = [&](int li, const BurnLimbView& v, size_t i, JointTwinSide src,
+                      int fromLi) {
+    v.SetWord(i, src.mat, src.art);
+    const IVec3 p = v.At(i);
+    if (ownBrick(li))
+      MicroBodyPoke(*micro, (uint32_t)limbs_[li].microModel, p.x, p.y, p.z,
+                    (uint8_t)(src.mat & 0xFFFu), src.art);
+    MobLimb& l = limbs_[li];
+    const uint32_t m = src.mat & 0xFFFu;
+    // THE ROT CAME ACROSS WITH IT. A copied rotflesh cell is the infection now
+    // living in this limb too — RestoreVoxels' rule — or it would sit there
+    // inert while its twin went on spreading.
+    if (l.infectMat == 0 && m < sys_->matInfectious_.size() &&
+        sys_->matInfectious_[m]) {
+      l.infectMat = (uint16_t)m;
+      l.infectStain = limbs_[fromLi].infectStain;
+    }
+    // ...and so did the fire: a burning cell copied without a place on the
+    // front would never roll its decay again (BodyBurnState::alight's note).
+    if (m < sys_->matSelfActive_.size() && sys_->matSelfActive_[m]) {
+      BodyBurnState& st = l.burn;
+      st.alight = true;
+      if (!st.idx.empty()) {
+        const int x = p.x - st.min.x, y = p.y - st.min.y, z = p.z - st.min.z;
+        if (x >= 0 && y >= 0 && z >= 0 && x < st.dims.x && y < st.dims.y &&
+            z < st.dims.z)
+          st.front.push_back(
+              (uint32_t)(((size_t)z * st.dims.y + y) * st.dims.x + x));
+      }
+    }
+    matChanged = true;
+  };
+  auto writeStain = [&](int li, const BurnLimbView& v, size_t i, uint16_t s) {
+    v.SetStain(i, s);
+    const IVec3 p = v.At(i);
+    if (ownBrick(li))
+      MicroBodyPokeStain(*micro, (uint32_t)limbs_[li].microModel, p.x, p.y,
+                         p.z, s);
+    stainChanged = true;
+  };
+  // Tombstone, exactly as the rot's removal does (InfectStep): the index entry
+  // goes NOW so neighbours see through it, and FlushBurn below compacts it.
+  auto remove = [&](int li, const BurnLimbView& v, size_t i) {
+    const IVec3 p = v.At(i);
+    v.Set(i, 0, 0);
+    BodyBurnState& st = limbs_[li].burn;
+    if (!st.idx.empty()) {
+      const int x = p.x - st.min.x, y = p.y - st.min.y, z = p.z - st.min.z;
+      if (x >= 0 && y >= 0 && z >= 0 && x < st.dims.x && y < st.dims.y &&
+          z < st.dims.z)
+        st.idx[((size_t)z * st.dims.y + y) * st.dims.x + x] = 0;
+    }
+    st.removed++;
+    if (ownBrick(li))
+      MicroBodyPoke(*micro, (uint32_t)limbs_[li].microModel, p.x, p.y, p.z, 0, 0);
+    removed = true;
+  };
+
+  for (JointTwinPair& tp : twins_) {
+    if (!limbs_[tp.a].body || !limbs_[tp.b].body) continue;
+    BurnLimbView va = ViewOf(limbs_[tp.a]), vb = ViewOf(limbs_[tp.b]);
+    const IVec3 dims{tp.hi.x - tp.lo.x + 1, tp.hi.y - tp.lo.y + 1,
+                     tp.hi.z - tp.lo.z + 1};
+    TwinLook la{&va, TwinOrigin(limbs_[tp.a], tp.scale), tp.lo, dims};
+    TwinLook lb{&vb, TwinOrigin(limbs_[tp.b], tp.scale), tp.lo, dims};
+    size_t w = 0;
+    for (size_t k = 0; k < tp.cells.size(); k++) {
+      JointTwinCell c = tp.cells[k];
+      const int ia = la.Find(c.rest, c.hintA);
+      const int ib = lb.Find(c.rest, c.hintB);
+      // GONE ON EITHER SIDE IS GONE ON BOTH: a hole the rot (or a blade, or
+      // the fire) made in one copy may not be plugged by the other.
+      if (ia < 0 || ib < 0) {
+        if (ia >= 0) remove(tp.a, va, (size_t)ia);
+        if (ib >= 0) remove(tp.b, vb, (size_t)ib);
+        continue;  // the link dies with the cell
+      }
+      const JointTwinSide ca = TwinSideOf(va, (size_t)ia);
+      const JointTwinSide cb = TwinSideOf(vb, (size_t)ib);
+      const bool aMat = ca.mat != c.a.mat || ca.art != c.a.art;
+      const bool bMat = cb.mat != c.b.mat || cb.art != c.b.art;
+      if ((aMat || bMat) && (ca.mat != cb.mat || ca.art != cb.art)) {
+        // Both moved in one tick: the PARENT's answer stands.
+        if (aMat) writeMat(tp.b, vb, (size_t)ib, ca, tp.a);
+        else writeMat(tp.a, va, (size_t)ia, cb, tp.b);
+      }
+      const bool aSt = ca.stain != c.a.stain;
+      const bool bSt = cb.stain != c.b.stain;
+      if ((aSt || bSt) && ca.stain != cb.stain) {
+        if (aSt) writeStain(tp.b, vb, (size_t)ib, ca.stain);
+        else writeStain(tp.a, va, (size_t)ia, cb.stain);
+      }
+      c.hintA = (uint32_t)ia;
+      c.hintB = (uint32_t)ib;
+      c.a = TwinSideOf(va, (size_t)ia);
+      c.b = TwinSideOf(vb, (size_t)ib);
+      tp.cells[w++] = c;
+    }
+    tp.cells.resize(w);
+  }
+
+  if (matChanged || stainChanged || removed) {
+    MarkInstancesDirty();
+    burnFracDirty_ = true;
+  }
+  if (stainChanged) coatDirty_ = true;
+  // What this pass wrote is already reconciled; only a later writer (or the
+  // flush below, which compacts and so moves every hint) needs another pass.
+  twinDirty_ = false;
+  if (!removed) return true;
+  // LAST, for InfectStep's reason: a flush may sever or kill.
+  for (int li = 0; li < (int)limbs_.size(); li++) {
+    if (!limbs_[li].body || limbs_[li].burn.removed == 0) continue;
+    if (!FlushBurn(li, world, spawns, /*force=*/false)) return false;
+  }
+  return true;
+}
+
+// ---- joint-twin test hooks (the `joint-twins` gate) -------------------------
+
+uint32_t MobSystem::JointTwinCount(uint64_t mobId) {
+  Mob* m = FindMobById(mobId);
+  if (!m) return 0;
+  if (!m->twinsBuilt_) m->BuildJointTwins();
+  uint32_t n = 0;
+  for (const JointTwinPair& tp : m->twins_) n += (uint32_t)tp.cells.size();
+  return n;
+}
+
+bool MobSystem::JointTwinAt(uint64_t mobId, uint32_t k, int& limbA, int& limbB,
+                            IVec3& rest) {
+  Mob* m = FindMobById(mobId);
+  if (!m) return false;
+  if (!m->twinsBuilt_) m->BuildJointTwins();
+  for (const JointTwinPair& tp : m->twins_) {
+    if (k < tp.cells.size()) {
+      limbA = tp.a;
+      limbB = tp.b;
+      rest = tp.cells[k].rest;
+      return true;
+    }
+    k -= (uint32_t)tp.cells.size();
+  }
+  return false;
+}
+
+namespace {
+// The index of the live voxel at REST coordinate `rest` on `limb`, or -1.
+int LimbCellIndex(MobLimb& l, const BurnLimbView& v, uint32_t scale,
+                  IVec3 rest) {
+  const IVec3 o = TwinOrigin(l, scale);
+  const IVec3 p{rest.x - o.x, rest.y - o.y, rest.z - o.z};
+  for (size_t i = 0; i < v.Size(); i++) {
+    const IVec3 q = v.At(i);
+    if (q.x == p.x && q.y == p.y && q.z == p.z) return v.Mat(i) ? (int)i : -1;
+  }
+  return -1;
+}
+}  // namespace
+
+bool MobSystem::LimbCellAt(uint64_t mobId, int limb, IVec3 rest, uint32_t& mat,
+                           uint16_t& stain) {
+  Mob* m = FindMobById(mobId);
+  if (!m || limb < 0 || limb >= (int)m->limbs_.size()) return false;
+  MobLimb& l = m->limbs_[limb];
+  BurnLimbView v = m->ViewOf(l);
+  const int i = LimbCellIndex(l, v, v.scale, rest);
+  if (i < 0) return false;
+  mat = v.Mat((size_t)i);
+  stain = v.Stain((size_t)i);
+  return true;
+}
+
+bool MobSystem::SetLimbCellAt(uint64_t mobId, int limb, IVec3 rest,
+                              uint32_t mat, uint16_t stain) {
+  Mob* m = FindMobById(mobId);
+  if (!m || limb < 0 || limb >= (int)m->limbs_.size()) return false;
+  MobLimb& l = m->limbs_[limb];
+  BurnLimbView v = m->ViewOf(l);
+  const int i = LimbCellIndex(l, v, v.scale, rest);
+  if (i < 0) return false;
+  if (mat == 0) {
+    // A tombstone, the way every removal path leaves one before its flush.
+    v.Set((size_t)i, 0, 0);
+    l.burn.removed++;
+    m->DropBurnIndex(l.burn);
+  } else {
+    // The material only when it CHANGES: Set zeroes the art slot, and a
+    // stain-only edit must not also read as a material edit.
+    if (v.Mat((size_t)i) != (mat & 0xFFFu)) v.Set((size_t)i, mat, 0);
+    v.SetStain((size_t)i, stain);
+  }
+  m->MarkInstancesDirty();
+  return true;
 }
 
 // ============================================================================
@@ -13559,7 +13969,7 @@ void Mob::StainTick(uint32_t tick, World& world, uint32_t& budget) {
     if (!limbs_[li].body) continue;
     BurnLimbView v = ViewOf(limbs_[li]);
     const uint32_t key = mobKey + (uint32_t)li * 2654435761u;
-    if (sys_->StainOneLimb(v, tick, key, world, budget)) coatDirty_ = true;
+    if (sys_->StainOneLimb(v, tick, key, world, budget)) coatDirty_ = twinDirty_ = true;
 
     // ---- AND WHAT IS ALREADY ON IT DRIES ------------------------------------
     // AFTER the contact pass and NOT gated on it: StainOneLimb returns early
@@ -13575,7 +13985,7 @@ void Mob::StainTick(uint32_t tick, World& world, uint32_t& budget) {
     // LEDGER, so a clean limb reads two zeroes and pays nothing.
     if (budget == 0) continue;
     if (sys_->DryOneLimb(v, limbs_[li].coat, tick, key, budget))
-      coatDirty_ = true;
+      coatDirty_ = twinDirty_ = true;
   }
   // The ledger, at its own bounded cadence — the same place and the same
   // reason RecountBurn sits at the tail of BurnTick.
@@ -13904,7 +14314,7 @@ uint32_t Mob::ShedCoat(int footLimb, Vec3 footPosVox, uint32_t tick,
     if ((int)v.At(vi).y > minY + band) continue;
     const uint16_t next = PackBodyStain(mat, amt - 1u);
     v.SetStain(vi, next);
-    coatDirty_ = true;
+    coatDirty_ = twinDirty_ = true;
     want--;
     if (!owned) owned = OwnForStain(v, sys_->microSet_);
     if (owned) {
@@ -14449,7 +14859,7 @@ void Mob::ApplySplatter(const SplatterEvent& e) {
     if (!limb.body) continue;
     if (e.sourceMob == id_ && e.sourceLimb == (int)li) continue;
     BurnLimbView v = ViewOf(limb);
-    if (sys_->SplatterView(e, v, (uint32_t)li)) coatDirty_ = true;
+    if (sys_->SplatterView(e, v, (uint32_t)li)) coatDirty_ = twinDirty_ = true;
   }
 }
 
@@ -17083,7 +17493,7 @@ uint32_t MobSystem::SoakLimb(uint64_t mobId, int limb, uint32_t mat,
     if (next == cur) continue;
     v.SetStain(i, next);
     marked++;
-    mob->coatDirty_ = true;
+    mob->coatDirty_ = mob->twinDirty_ = true;
     if (!owned) owned = OwnForStain(v, microSet_);
     if (owned) {
       const IVec3 p = v.At(i);
