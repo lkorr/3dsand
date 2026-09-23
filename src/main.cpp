@@ -6214,6 +6214,18 @@ int main(int argc, char** argv) {
     player.fly = true;
     ui.fly = true;
   }
+  // PLAY OR DEV at boot (UIState::devControls). A lab scene is a bench,
+  // SANDVOX_DEV=1 asks for one, and every SCRIPTED run (--frames, each --shot,
+  // which all set g_harnessFrames) keeps the dev bindings and fly state it was
+  // measured with. Otherwise the game starts as a game: walking, hands up.
+  // F2 flips it.
+  ui.devControls = labScene >= 0 || g_harnessFrames > 0 ||
+                   std::getenv("SANDVOX_DEV") != nullptr;
+  if (!ui.devControls) {
+    ui.fly = false;
+    player.fly = false;
+    ui.tool = UIState::kToolMelee;
+  }
   // The render camera interpolates prevPos -> pos across a tick (N2), and
   // every placement above is a TELEPORT: without this the first frames would
   // lerp the eye in from the constructor's default position.
@@ -6241,7 +6253,7 @@ int main(int argc, char** argv) {
   // switched (camera.meleeSensHalflife). See the note at the ApplyMouse call.
   float lookSensNow = 1.0f;
 
-  KeyEdge eP, eN, eV, eF1, eF3, eF4, eF5, eF6, eF7, eF9, eF10, eR, eEsc, eLBracket, eRBracket, eJump,
+  KeyEdge eP, eN, eV, eF1, eF2, eF3, eF4, eF5, eF6, eF7, eF9, eF10, eR, eEsc, eLBracket, eRBracket, eJump,
       eG, eX, eB, eT, eO, eM, eK, eTab, eC, eH, eZ, eBack, eDel, eU, eL, eI, eQ;
   // (E has no KeyEdge: it is a hold-aware binding now — see the tap/hold
   // block by `takeE` — and an edge tracker would only be half of it.)
@@ -9256,9 +9268,12 @@ int main(int argc, char** argv) {
     // The DEV tier: still live with the character screen open, dead while an
     // ImGui field has focus.
     if (devKeys && eP.Pressed(key(GLFW_KEY_P))) ui.paused = !ui.paused;
-    if (devKeys && eN.Pressed(key(GLFW_KEY_N))) ui.stepOnce = true;
-    if (devKeys && eV.Pressed(key(GLFW_KEY_V))) ui.fly = !ui.fly;
+    if (devKeys && ui.devControls && eN.Pressed(key(GLFW_KEY_N))) ui.stepOnce = true;
+    if (devKeys && ui.devControls && eV.Pressed(key(GLFW_KEY_V))) ui.fly = !ui.fly;
     if (devKeys && eF1.Pressed(key(GLFW_KEY_F1))) ui.visible = !ui.visible;
+    // F2: PLAY <-> DEV controls (UIState::devControls). The transition itself
+    // is applied below, where the checkbox path lands too.
+    if (devKeys && eF2.Pressed(key(GLFW_KEY_F2))) ui.devControls = !ui.devControls;
     if (devKeys && eF3.Pressed(key(GLFW_KEY_F3)))
       ui.showCollisionBoxes = !ui.showCollisionBoxes;
     // F4 CYCLES the vector-field arrows: off -> wind (RESEARCH_wind.md §4.8)
@@ -9291,9 +9306,9 @@ int main(int argc, char** argv) {
     if (devKeys && eF9.Pressed(key(GLFW_KEY_F9))) ui.saveWorld = true;
     if (devKeys && eF10.Pressed(key(GLFW_KEY_F10))) ui.loadWorld = true;
     if (devKeys && eR.Pressed(key(GLFW_KEY_R))) ui.reloadMaterials = true;
-    if (gameKeys && eLBracket.Pressed(key(GLFW_KEY_LEFT_BRACKET)))
+    if (gameKeys && ui.devControls && eLBracket.Pressed(key(GLFW_KEY_LEFT_BRACKET)))
       ui.brushRadius = std::max(1, ui.brushRadius - 1);
-    if (gameKeys && eRBracket.Pressed(key(GLFW_KEY_RIGHT_BRACKET)))
+    if (gameKeys && ui.devControls && eRBracket.Pressed(key(GLFW_KEY_RIGHT_BRACKET)))
       ui.brushRadius = std::min(7, ui.brushRadius + 1);
     // The number row is SHARED: it picks a brush material normally and SPEAKS
     // glyphs in magic mode (Z). Both wanted 1-8 and the brush binding predates
@@ -9301,7 +9316,8 @@ int main(int argc, char** argv) {
     // than silently stealing its keys.
     if (!ui.magicMode) {
       for (int i = 0; i < 8; i++)
-        if (gameKeys && key(GLFW_KEY_1 + i) && i + 1 < (int)mats.size()) {
+        if (gameKeys && ui.devControls && key(GLFW_KEY_1 + i) &&
+            i + 1 < (int)mats.size()) {
           if (ui.tool == UIState::kToolFluid)
             ui.fluidSpecies = i & 3;
           else
@@ -9337,7 +9353,7 @@ int main(int argc, char** argv) {
     // universal "undo what I just typed" key and the left hand is on WASD.
     if (captured && eBack.Pressed(key(GLFW_KEY_BACKSPACE))) caster.Clear(glyphs);
 
-    if (captured && eG.Pressed(key(GLFW_KEY_G))) {
+    if (captured && ui.devControls && eG.Pressed(key(GLFW_KEY_G))) {
       Grenade g;
       g.pos = player.EyePos() + cam.Forward() * 2.0f;
       g.vel = cam.Forward() * (CurrentTuning().grenade.throwSpeed / kVoxelMeters) +
@@ -9345,7 +9361,8 @@ int main(int argc, char** argv) {
       g.fuse = CurrentTuning().grenade.fuse;
       grenades.push_back(g);
     }
-    if (captured && eX.Pressed(key(GLFW_KEY_X))) ui.pendingDetonate = true;
+    if (captured && ui.devControls && eX.Pressed(key(GLFW_KEY_X)))
+      ui.pendingDetonate = true;
     // DRAW / STOW. Q rather than the X the plan proposed: X already
     // detonates, and a key that does two things is a key that does the wrong
     // one under pressure.
@@ -9588,17 +9605,17 @@ int main(int argc, char** argv) {
       if (!eDown) eHeld = 0.0f;
       ePrevDown = eDown;
     }
-    if (captured && eTab.Pressed(key(GLFW_KEY_TAB))) {
+    if (captured && ui.devControls && eTab.Pressed(key(GLFW_KEY_TAB))) {
       ui.tool = (ui.tool + 1) % UIState::kToolCount;
       if (ui.tool == UIState::kToolFluid && fluidCueMat != 0)
         ui.brushMaterial = (int)fluidCueMat;
     }
-    if (captured && eM.Pressed(key(GLFW_KEY_M))) feeder.Press(TB_SPAWN);
-    if (captured && eB.Pressed(key(GLFW_KEY_B))) feeder.Press(TB_PLACE);
-    if (captured && eK.Pressed(key(GLFW_KEY_K))) ui.spawnSphere = true;
+    if (captured && ui.devControls && eM.Pressed(key(GLFW_KEY_M))) feeder.Press(TB_SPAWN);
+    if (captured && ui.devControls && eB.Pressed(key(GLFW_KEY_B))) feeder.Press(TB_PLACE);
+    if (captured && ui.devControls && eK.Pressed(key(GLFW_KEY_K))) ui.spawnSphere = true;
     // U clears the experimental MLS-MPM fluid (sticky flag, consumed in the
     // tick loop like every other one-shot input — see the cast-key note).
-    if (captured && eU.Pressed(key(GLFW_KEY_U))) ui.clearFluid = true;
+    if (captured && ui.devControls && eU.Pressed(key(GLFW_KEY_U))) ui.clearFluid = true;
     // L (lab only) resets the scene: scene clock to zero + fluid cleared, so
     // the next tick re-submits the build CellOps and the pour replays from
     // its fixed schedule — an identical A/B run without regenerating the
@@ -9618,7 +9635,8 @@ int main(int argc, char** argv) {
     // dismemberment states that does not need a weapon pointed at yourself.
     // The order walks DOWN the state ladder (hand -> arm -> foot -> leg ->
     // head), so repeated presses march through limp, hop, crawl and squirm.
-    if (captured && eH.Pressed(key(GLFW_KEY_H)) && avatar.Spawned()) {
+    if (captured && ui.devControls && eH.Pressed(key(GLFW_KEY_H)) &&
+        avatar.Spawned()) {
       static const char* kSeverOrder[] = {
           "staff",  "hand.R", "hand.L", "armL.R", "armL.L",
           "foot.R", "foot.L", "legL.R", "legL.L", "armU.R",
@@ -9626,10 +9644,10 @@ int main(int argc, char** argv) {
       for (const char* nm : kSeverOrder)
         if (avatar.SeverByName(nm)) break;
     }
-    if (gameKeys && ui.tool == UIState::kToolPrefab &&
+    if (gameKeys && ui.devControls && ui.tool == UIState::kToolPrefab &&
         eT.Pressed(key(GLFW_KEY_T)))
       ui.prefabRot = (ui.prefabRot + 1) & 3;
-    if (gameKeys && ui.tool == UIState::kToolPrefab &&
+    if (gameKeys && ui.devControls && ui.tool == UIState::kToolPrefab &&
         eO.Pressed(key(GLFW_KEY_O)) && !prefabs.empty())
       ui.prefabSelected = (ui.prefabSelected + 1) % (int)prefabs.size();
 
@@ -10456,6 +10474,26 @@ int main(int argc, char** argv) {
       // index sitting in `strikeQueued`, and that one has to be dropped here
       // or it fires the instant the world resumes.
       strikeQueued = -1;
+    }
+    // ---- PLAY / DEV (UIState::devControls) ----------------------------------
+    // Applied here, after every key and the dev panel have had their say and
+    // before anything reads the tool, so the checkbox and F2 are one path.
+    // ON A CHANGE TO PLAY: land (fly off) and put the hands up. EVERY FRAME IN
+    // PLAY: the hands are the only tool -- the dev panel's radio buttons and a
+    // Q that stows back to `toolBefore` cannot leave the brush in them.
+    {
+      static bool devPrev = ui.devControls;
+      if (ui.devControls != devPrev) {
+        devPrev = ui.devControls;
+        if (!ui.devControls) {
+          ui.fly = false;
+          player.fly = false;
+        }
+        ui.kitMessage = ui.devControls ? "dev controls ON (F2)"
+                                       : "dev controls OFF -- play mode (F2)";
+        ui.kitMessageAge = 0.0f;
+      }
+      if (!ui.devControls) ui.tool = UIState::kToolMelee;
     }
     bool brushActive = ui.tool == UIState::kToolBrush && !ui.magicMode;
     // MELEE: hold LMB with the melee tool to arm the weapon, then flick.
