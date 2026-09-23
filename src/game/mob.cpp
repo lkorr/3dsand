@@ -2031,6 +2031,10 @@ void MobSystem::SetDefs(std::vector<MobDef> defs) {
   for (size_t i = 0; i < mobs_.size(); i++)
     if (mobs_[i].def_ != nullptr) was[i] = mobs_[i].def_->name;
   defs_ = std::move(defs);
+  // The pristine references (PristineOf) describe the OLD defs' art. A reload
+  // may have changed any of it, and a stale reference would let a save flag a
+  // limb "pristine" against art the load will not rebuild.
+  pristine_.clear();
   // Room for the compositions, once, so no later append can move a MobDef the
   // avatar or a live limb is pointing at. See kDerivedDefs.
   defs_.reserve(defs_.size() + kDerivedDefs);
@@ -2960,6 +2964,66 @@ uint64_t MobSystem::Spawn(int defIndex, IVec3 atVoxel) {
   return mobs_.back().id_;
 }
 
+// ---- ONE LIMB'S AUTHORED LATTICE ---------------------------------------------
+//
+// Skin lattice, collider lattice, collider box and rest offset of limb `i`,
+// exactly as the art describes them. BuildRig builds every body limb with this
+// and MobSystem::PristineOf builds the save's "never touched" reference with
+// it, so the pristine test (Mob::LimbIsPristine) compares a limb against the
+// very bytes a load's Spawn will put back — not against a re-derivation that
+// could drift from the spawn path.
+static void BuildAuthoredLattice(const MobDef& def, size_t i,
+                                 std::vector<DebrisVoxel>& voxels,
+                                 std::vector<PrefabVoxel>& skinVoxels,
+                                 IVec3& size, Vec3& restOffset, bool log) {
+  const MobLimbDef& ld = def.limbs[i];
+  const int mi = FindModel(def.prefab, ld.name);
+  const PrefabModel& model = def.prefab.models[mi];
+  // SKIN -> WORLD: the .vox model is authored on the skin lattice.
+  const float inv = 1.0f / (float)def.skinScale;
+  const uint32_t ratio =
+      std::max(1u, def.skinScale / std::max(1u, def.physScale));
+  voxels.clear();
+  skinVoxels.clear();
+  restOffset = Vec3{(float)model.offset.x, (float)model.offset.y,
+                    (float)model.offset.z} * inv;
+  if (ratio > 1) {
+    // Fine skin: the authored art IS the skin lattice, and the collider is
+    // DERIVED from it by the same majority-fill the debris path uses. Data
+    // flows skin -> collider and never back (phys/lattice.h), so the two can
+    // never drift; a carve edits the skin and re-derives.
+    skinVoxels.reserve(model.voxels.size());
+    for (const PrefabVoxel& v : model.voxels) {
+      uint32_t variant = ((uint32_t)(v.x * 7 + v.y * 13 + v.z * 29)) % 3u;
+      // `color` rides along untouched: it is ART, independent of the
+      // material, and only the material reaches the collider below.
+      skinVoxels.push_back(
+          {v.x, v.y, v.z, (uint16_t)(v.material | (variant << 12)), v.color});
+    }
+    bool overflow = false;
+    voxels = DownsampleSkin(skinVoxels, ratio, &overflow);
+    if (overflow && log)
+      std::printf(
+          "mob: limb \"%s\" of %s exceeded the collider's +-127 bound; part "
+          "of it was dropped from the collider (physScale too fine)\n",
+          ld.name.c_str(), def.name.c_str());
+    // Collider units, so the body's box matches the lattice it is built on.
+    size = IVec3{(model.size.x + (int)ratio - 1) / (int)ratio,
+                 (model.size.y + (int)ratio - 1) / (int)ratio,
+                 (model.size.z + (int)ratio - 1) / (int)ratio};
+  } else {
+    // The two lattices coincide: `voxels` is the whole story and skinVoxels
+    // stays empty, exactly the pre-split path.
+    size = model.size;
+    voxels.reserve(model.voxels.size());
+    for (const PrefabVoxel& v : model.voxels) {
+      uint32_t variant = ((uint32_t)(v.x * 7 + v.y * 13 + v.z * 29)) % 3u;
+      voxels.push_back({(int8_t)v.x, (int8_t)v.y, (int8_t)v.z, v.color,
+                        (uint16_t)(v.material | (variant << 12))});
+    }
+  }
+}
+
 // Build limbs, bodies, joints and animation state from `def`, prefab min
 // corner at `origin` (world voxels). THE one rig-construction path: NPCs and
 // the player avatar both assemble here, so a change to how a creature is
@@ -2996,61 +3060,24 @@ bool Mob::BuildRig(const MobDef& def, Vec3 origin) {
   twinsBuilt_ = false;
   twinDirty_ = true;
 
-  // SKIN -> WORLD. The .vox model is authored on the skin lattice, so every
-  // POSITION derived from it divides by skinScale to reach world voxels.
-  const float inv = 1.0f / (float)def.skinScale;
   // COLLIDER pitch: limb.voxels live on the physScale lattice, so the Jolt
   // body is built at 1/physScale. These two differ whenever the collider was
   // derived coarser than the art, and using one where the other belongs is the
-  // silent-joint-shift bug the split exists to make impossible.
+  // silent-joint-shift bug the split exists to make impossible. (SKIN -> WORLD
+  // for the rest offset is BuildAuthoredLattice's.)
   const float physInv = 1.0f / (float)std::max(1u, def.physScale);
-  const uint32_t ratio =
-      std::max(1u, def.skinScale / std::max(1u, def.physScale));
 
   for (size_t i = 0; i < def.limbs.size(); i++) {
     const MobLimbDef& ld = def.limbs[i];
-    int mi = FindModel(def.prefab, ld.name);
-    const PrefabModel& model = def.prefab.models[mi];
     MobLimb& limb = limbs_[i];
     limb.hp = ld.hp;
     limb.microModel = ld.microModel;
-    limb.restOffset = Vec3{(float)model.offset.x, (float)model.offset.y,
-                           (float)model.offset.z} * inv;
-    if (ratio > 1) {
-      // Fine skin: the authored art IS the skin lattice, and the collider is
-      // DERIVED from it by the same majority-fill the debris path uses. Data
-      // flows skin -> collider and never back (phys/lattice.h), so the two can
-      // never drift; a carve edits the skin and re-derives.
-      limb.skinVoxels.reserve(model.voxels.size());
-      for (const PrefabVoxel& v : model.voxels) {
-        uint32_t variant = ((uint32_t)(v.x * 7 + v.y * 13 + v.z * 29)) % 3u;
-        // `color` rides along untouched: it is ART, independent of the
-        // material, and only the material reaches the collider below.
-        limb.skinVoxels.push_back(
-            {v.x, v.y, v.z, (uint16_t)(v.material | (variant << 12)), v.color});
-      }
-      bool overflow = false;
-      limb.voxels = DownsampleSkin(limb.skinVoxels, ratio, &overflow);
-      if (overflow)
-        std::printf(
-            "mob: limb \"%s\" of %s exceeded the collider's +-127 bound; part "
-            "of it was dropped from the collider (physScale too fine)\n",
-            ld.name.c_str(), def.name.c_str());
-      // Collider units, so the body's box matches the lattice it is built on.
-      limb.size = IVec3{(model.size.x + (int)ratio - 1) / (int)ratio,
-                        (model.size.y + (int)ratio - 1) / (int)ratio,
-                        (model.size.z + (int)ratio - 1) / (int)ratio};
-    } else {
-      // The two lattices coincide: `voxels` is the whole story and skinVoxels
-      // stays empty, exactly the pre-split path. Every existing def is here.
-      limb.size = model.size;
-      limb.voxels.reserve(model.voxels.size());
-      for (const PrefabVoxel& v : model.voxels) {
-        uint32_t variant = ((uint32_t)(v.x * 7 + v.y * 13 + v.z * 29)) % 3u;
-        limb.voxels.push_back({(int8_t)v.x, (int8_t)v.y, (int8_t)v.z, v.color,
-                               (uint16_t)(v.material | (variant << 12))});
-      }
-    }
+    // The lattice, the collider box and the rest offset, from the art — the
+    // SAME function the save's pristine test builds its reference with
+    // (MobSystem::PristineOf), so "equals the authored limb" is a statement
+    // about this code path and not about a second copy of it.
+    BuildAuthoredLattice(def, i, limb.voxels, limb.skinVoxels, limb.size,
+                         limb.restOffset, /*log=*/true);
     // Authored volume, so carve damage can be expressed as a FRACTION of the
     // limb — the same wound should read the same on a scale-1 and a scale-4 rig.
     // Counted on the lattice a carve actually removes from, so the fraction is
@@ -17692,7 +17719,121 @@ uint32_t Mob::LimbBodyCount() const {
 // the same writes in the same order — the format did NOT move when this was
 // lifted out (M9.4-B), which is what `save-entities` asserts and what lets a
 // handoff packet carry a save record instead of a second serializer.
+// ---- THE PRISTINE REFERENCE (MOBS v4) --------------------------------------
+const MobSystem::PristineLimb* MobSystem::PristineOf(int defIndex,
+                                                     size_t limb) const {
+  if (defIndex < 0 || defIndex >= (int)defs_.size()) return nullptr;
+  const MobDef& def = defs_[defIndex];
+  if (limb >= def.limbs.size() || limb >= def.skel.parts.size()) return nullptr;
+  if (pristine_.size() < defs_.size()) pristine_.resize(defs_.size());
+  if (!pristine_[defIndex]) {
+    auto built = std::make_shared<std::vector<PristineLimb>>(def.limbs.size());
+    for (size_t i = 0; i < def.limbs.size() && i < def.skel.parts.size(); i++) {
+      PristineLimb& p = (*built)[i];
+      BuildAuthoredLattice(def, i, p.voxels, p.skinVoxels, p.size,
+                           p.restOffset, /*log=*/false);
+      // BuildRig's anchor, root and non-root alike: the rig's resolved
+      // anchorLocal, and the same subtraction.
+      p.anchorRoot = def.skel.parts[i].anchorLocal;
+      p.anchorLimb = p.anchorRoot - p.restOffset;
+    }
+    pristine_[defIndex] = std::move(built);
+  }
+  return &(*pristine_[defIndex])[limb];
+}
+
+// Field-wise, never memcmp: PrefabVoxel has a padding byte after `color`, and
+// its value is whatever the allocator left there — two identical skins can
+// differ in it.
+static bool SameSkin(const std::vector<PrefabVoxel>& a,
+                     const std::vector<PrefabVoxel>& b) {
+  if (a.size() != b.size()) return false;
+  for (size_t k = 0; k < a.size(); k++)
+    if (a[k].x != b[k].x || a[k].y != b[k].y || a[k].z != b[k].z ||
+        a[k].material != b[k].material || a[k].color != b[k].color ||
+        a[k].stain != b[k].stain)
+      return false;
+  return true;
+}
+static bool SameCollider(const std::vector<DebrisVoxel>& a,
+                         const std::vector<DebrisVoxel>& b) {
+  if (a.size() != b.size()) return false;
+  for (size_t k = 0; k < a.size(); k++)
+    if (a[k].x != b[k].x || a[k].y != b[k].y || a[k].z != b[k].z ||
+        a[k].color != b[k].color || a[k].payload != b[k].payload ||
+        a[k].stain != b[k].stain)
+      return false;
+  return true;
+}
+static bool SameVec3(Vec3 a, Vec3 b) {
+  return a.x == b.x && a.y == b.y && a.z == b.z;
+}
+// Same cells, in the same order — the voxels' STATE (material, art, coat) may
+// differ. What decides whether a restored lattice can be poked into the brick
+// or has to be re-packed.
+template <class V>
+static bool SameShape(const std::vector<V>& a, const std::vector<V>& b) {
+  if (a.size() != b.size()) return false;
+  for (size_t k = 0; k < a.size(); k++)
+    if (a[k].x != b[k].x || a[k].y != b[k].y || a[k].z != b[k].z) return false;
+  return true;
+}
+// Bring a limb's brick up to its (same-shaped) lattice by POKES: own it copy-
+// on-write, then rewrite every cell's material, art slot and coat — the door
+// SoakLimb and the burn front use, which never rebases the brick. Lattice
+// coordinates are brick-local for a limb (those paths poke v.At(i) directly).
+// A collider-only limb draws unpainted (ReskinLimbMicro's rule for that case).
+static void RepaintLimbMicro(MobLimb& L, MicroBodySet* micro) {
+  if (L.microModel < 0 || micro == nullptr) return;
+  const int own = MicroBodyOwn(*micro, (uint32_t)L.microModel);
+  if (own < 0) return;   // pool full: the skin lags, the lattice is right
+  L.microModel = own;
+  L.carved = true;
+  L.flipbookModel = -1;
+  const uint32_t model = (uint32_t)own;
+  if (L.HasFineSkin()) {
+    for (const PrefabVoxel& v : L.skinVoxels) {
+      MicroBodyPoke(*micro, model, v.x, v.y, v.z,
+                    (uint8_t)(v.material & 0xFFFu), v.color);
+      MicroBodyPokeStain(*micro, model, v.x, v.y, v.z, v.stain);
+    }
+  } else {
+    for (const DebrisVoxel& v : L.voxels) {
+      MicroBodyPoke(*micro, model, v.x, v.y, v.z,
+                    (uint8_t)(v.payload & 0xFFFu), 0);
+      MicroBodyPokeStain(*micro, model, v.x, v.y, v.z, v.stain);
+    }
+  }
+}
+
+bool Mob::LimbIsPristine(size_t i) const {
+  if (sys_ == nullptr || i >= limbs_.size() || (int)i >= baseLimbs_)
+    return false;
+  const MobLimb& L = limbs_[i];
+  if (!L.body || L.ownSkinScale != 0 || L.ownPhysScale != 0) return false;
+  const MobSystem::PristineLimb* p = sys_->PristineOf(defIndex_, i);
+  if (p == nullptr) return false;
+  // Cheap rejections first: a carve changes the count, a re-skin the box and
+  // the offsets. Only a limb that survives all of them pays the voxel pass —
+  // and the voxel pass is what catches a coat, a char, a rot conversion or a
+  // recolour, none of which moves a count.
+  if (L.voxels.size() != p->voxels.size() ||
+      L.skinVoxels.size() != p->skinVoxels.size())
+    return false;
+  if (L.size.x != p->size.x || L.size.y != p->size.y || L.size.z != p->size.z)
+    return false;
+  if (!SameVec3(L.restOffset, p->restOffset) ||
+      !SameVec3(L.anchorRoot, p->anchorRoot) ||
+      !SameVec3(L.anchorLimb, p->anchorLimb))
+    return false;
+  return SameCollider(L.voxels, p->voxels) && SameSkin(L.skinVoxels, p->skinVoxels);
+}
+
 void Mob::SaveOne(ByteWriter& w) const {
+  SaveOne(w, MobSystem::kSaveVersion);
+}
+
+void Mob::SaveOne(ByteWriter& w, uint32_t version) const {
   // The def NAME out of the system's table rather than `def_->name`: the two
   // are the same pointer today, and writing it the way the loop always wrote
   // it is worth more than the indirection saved.
@@ -17701,7 +17842,33 @@ void Mob::SaveOne(ByteWriter& w) const {
   w.F32(heading_);
   w.F32(bodyY_);
   w.U32((uint32_t)limbs_.size());
-  for (const MobLimb& L : limbs_) {
+  for (size_t li = 0; li < limbs_.size(); li++) {
+    const MobLimb& L = limbs_[li];
+    if (version >= 4) {
+      // ---- v4: A LIMB IS ITS NAME UNLESS IT WAS TOUCHED ------------------
+      //
+      // hp and the transform always (a few bytes, and hp moves without the
+      // lattice moving: a blunt blow). The lattice only when it differs from
+      // the def's — see Mob::LimbIsPristine for why that is a comparison and
+      // not a dirty bit. A severed limb stores no lattice at all: its matter
+      // left with it as debris (DBRS), and the overlay has never read a
+      // severed limb's lattice.
+      const uint32_t kind = !L.body              ? MobSystem::kLimbSevered
+                            : LimbIsPristine(li) ? MobSystem::kLimbPristine
+                                                 : MobSystem::kLimbStored;
+      w.U32(kind);
+      w.F32(L.hp);
+      w.Pod(L.xf);
+      if (kind != MobSystem::kLimbStored) continue;
+      w.Pod(L.restOffset);
+      w.Pod(L.anchorRoot);
+      w.Pod(L.anchorLimb);
+      w.Pod(L.size);
+      w.PodVec(L.voxels);
+      w.PodVec(L.skinVoxels);
+      continue;
+    }
+    // ---- v3: every limb, whole ------------------------------------------
     w.U32(L.body ? 1u : 0u);  // 0 = severed (sever state IS this flag)
     w.F32(L.hp);
     // The rig offsets travel because a carve SHIFTS them (ReskinLimbMicro):
@@ -17752,7 +17919,7 @@ void MobSystem::SaveState(std::vector<uint8_t>& out) const {
 }
 
 bool MobSystem::LoadState(const uint8_t* data, size_t len, uint32_t version) {
-  if (version != kSaveVersion) {
+  if (version < kSaveVersionMin || version > kSaveVersion) {
     std::printf("mob: unknown MOBS section version %u\n", version);
     return false;
   }
@@ -17779,11 +17946,15 @@ bool MobSystem::LoadState(const uint8_t* data, size_t len, uint32_t version) {
 // nothing). So the read and the overlay are two functions and `LoadOne` is the
 // pair with a Spawn between them.
 struct MobSystem::MobRecord {
+  uint32_t version = kSaveVersion;
   std::string defName;
   Vec3 origin{};
   float heading = 0, bodyY = 0;
   struct LimbState {
     uint32_t alive = 1;
+    // v4's limb kind; a v3 record reads as kLimbStored (attached) or
+    // kLimbSevered, which is what its bytes are.
+    uint32_t kind = kLimbStored;
     float hp = 0;
     Vec3 restOffset{}, anchorRoot{}, anchorLimb{};
     BodyTransform xf{};
@@ -17795,7 +17966,9 @@ struct MobSystem::MobRecord {
   std::vector<CarriedItem> carried;
 };
 
-bool MobSystem::ReadMobRecord(ByteReader& r, MobRecord& out) {
+bool MobSystem::ReadMobRecord(ByteReader& r, MobRecord& out, uint32_t version) {
+  if (version < kSaveVersionMin || version > kSaveVersion) return false;
+  out.version = version;
   uint32_t nLimbs = 0;
   r.Str(out.defName);
   r.Pod(out.origin);
@@ -17807,7 +17980,29 @@ bool MobSystem::ReadMobRecord(ByteReader& r, MobRecord& out) {
   // default-constructed and `ok` false.
   out.limbs.assign(nLimbs, MobRecord::LimbState{});
   for (MobRecord::LimbState& s : out.limbs) {
+    if (version >= 4) {
+      // Mob::SaveOne's v4 limb: kind, hp, transform, and the lattice block
+      // only for kLimbStored. An unknown kind is a record this build cannot
+      // read correctly — refused, not guessed at.
+      r.U32(s.kind);
+      r.F32(s.hp);
+      r.Pod(s.xf);
+      if (s.kind > kLimbStored) {
+        r.ok = false;
+        break;
+      }
+      s.alive = s.kind != kLimbSevered ? 1u : 0u;
+      if (s.kind != kLimbStored) continue;
+      r.Pod(s.restOffset);
+      r.Pod(s.anchorRoot);
+      r.Pod(s.anchorLimb);
+      r.Pod(s.size);
+      r.PodVec(s.voxels);
+      r.PodVec(s.skinVoxels);
+      continue;
+    }
     r.U32(s.alive);
+    s.kind = s.alive ? kLimbStored : kLimbSevered;
     r.F32(s.hp);
     r.Pod(s.restOffset);
     r.Pod(s.anchorRoot);
@@ -17864,6 +18059,80 @@ void MobSystem::OverlayMobRecord(Mob& m, MobRecord& rec, bool placeLimbs) {
     if (!rec.limbs[i].alive) continue;
     MobLimb& L = m.limbs_[i];
     L.hp = rec.limbs[i].hp;
+    if (rec.version >= 4) {
+      // ---- v4: THE RECORD ONLY STORES WHAT DIFFERS ----------------------
+      //
+      // So a stored lattice is applied whenever the rig's is not already
+      // exactly it (a handoff onto a ghost that already has these bytes is
+      // left alone — no rebuild, no flicker), stain included: the v3 count
+      // test below existed because a v3 record could not say whether a
+      // same-count limb had been touched, and v4's writer already answered
+      // that question field for field.
+      //
+      // A PRISTINE limb is the def's art. A fresh Spawn already built exactly
+      // that (BuildAuthoredLattice), so on a save load this is one comparison
+      // and a `continue`. A ghost that this machine saw marked (a coat applied
+      // from a stale view) is put back to the art, because the owner says it
+      // is clean.
+      MobRecord::LimbState& s = rec.limbs[i];
+      if (s.kind == kLimbPristine) {
+        if (m.LimbIsPristine(i)) continue;
+        const PristineLimb* p = PristineOf(m.defIndex_, i);
+        if (p == nullptr) continue;   // not a body limb: nothing to restore
+        s.voxels = p->voxels;
+        s.skinVoxels = p->skinVoxels;
+        s.size = p->size;
+        s.restOffset = p->restOffset;
+        s.anchorRoot = p->anchorRoot;
+        s.anchorLimb = p->anchorLimb;
+      } else if (SameCollider(s.voxels, L.voxels) &&
+                 SameSkin(s.skinVoxels, L.skinVoxels) &&
+                 s.size.x == L.size.x && s.size.y == L.size.y &&
+                 s.size.z == L.size.z && SameVec3(s.restOffset, L.restOffset) &&
+                 SameVec3(s.anchorRoot, L.anchorRoot) &&
+                 SameVec3(s.anchorLimb, L.anchorLimb)) {
+        // Field-for-field the same, so brick and body stay as they are — but
+        // the RECORD's bytes are taken anyway: PrefabVoxel has a padding byte
+        // whose value is whatever built each copy, and a re-save of this rig
+        // must be the bytes that arrived (`mob-handoff` arm B, measured: the
+        // dressed ghost's worn shell differed from the record in nothing but
+        // that byte).
+        L.voxels = std::move(s.voxels);
+        L.skinVoxels = std::move(s.skinVoxels);
+        continue;
+      }
+      if (s.voxels.empty()) continue;   // v3's guard: no collider, no body
+      // ---- SAME SHAPE, DIFFERENT STATE: repaint, do not re-pack ----------
+      //
+      // A coat, a char or a recolour leaves every voxel where it was, and the
+      // paths that made them never re-packed the brick either — they poked it
+      // (SoakLimb, the burn front). Re-packing here (ReskinLimbMicro ->
+      // MicroBodyEdit) would re-derive the tight box and REBASE the lattice
+      // whenever the authored art does not start at its own min corner,
+      // moving restOffset and every voxel coordinate: a loaded body that
+      // saves as different bytes than the body that was saved. So the same
+      // shape takes the same door the damage took.
+      const bool sameShape = SameShape(s.voxels, L.voxels) &&
+                             SameShape(s.skinVoxels, L.skinVoxels) &&
+                             s.size.x == L.size.x && s.size.y == L.size.y &&
+                             s.size.z == L.size.z &&
+                             SameVec3(s.restOffset, L.restOffset) &&
+                             SameVec3(s.anchorRoot, L.anchorRoot) &&
+                             SameVec3(s.anchorLimb, L.anchorLimb);
+      L.voxels = std::move(s.voxels);
+      L.skinVoxels = std::move(s.skinVoxels);
+      L.size = s.size;
+      L.restOffset = s.restOffset;
+      L.anchorRoot = s.anchorRoot;
+      L.anchorLimb = s.anchorLimb;
+      if (sameShape)
+        RepaintLimbMicro(L, microSet_);
+      else if (L.microModel >= 0)
+        m.ReskinLimbMicro(L, m.SkinScaleOf(L), m.PhysScaleOf(L));
+      m.RebuildLimbBody((int)i);
+      continue;
+    }
+    // ---- v3 (kSaveVersionMin): the overlay rule that format always had ----
     bool differs = rec.limbs[i].voxels.size() != L.voxels.size() ||
                    rec.limbs[i].skinVoxels.size() != L.skinVoxels.size();
     // ---- A HANDOFF COMPARES THE CONTENTS, A SAVE LOAD COMPARES THE COUNT --
@@ -17901,7 +18170,12 @@ void MobSystem::OverlayMobRecord(Mob& m, MobRecord& rec, bool placeLimbs) {
   // adopt=false — the severed piece is not re-created here, it already
   // travels in the 'DBRS' section as the debris it became.
   for (uint32_t i = 0; i < nApply; i++)
-    if (!rec.limbs[i].alive && m.limbs_[i].body) m.DetachLimb((int)i, false);
+    if (!rec.limbs[i].alive && m.limbs_[i].body) {
+      // v4 carries a severed limb's hp too (it writes hp for every kind), and
+      // restoring it is what makes a re-save of a loaded body the same bytes.
+      if (rec.version >= 4) m.limbs_[i].hp = rec.limbs[i].hp;
+      m.DetachLimb((int)i, false);
+    }
 
   // ---- ...and, for a handoff, WHERE EACH LIMB WAS STANDING ----------------
   //
@@ -17927,12 +18201,12 @@ void MobSystem::OverlayMobRecord(Mob& m, MobRecord& rec, bool placeLimbs) {
 // refused spawn, or a short read — all three of which it reports exactly as
 // the loop always did.
 Mob* MobSystem::LoadOne(ByteReader& r, uint32_t version) {
-  if (version != kSaveVersion) {
+  if (version < kSaveVersionMin || version > kSaveVersion) {
     std::printf("mob: unknown mob record version %u\n", version);
     return nullptr;
   }
   MobRecord rec;
-  if (!ReadMobRecord(r, rec)) return nullptr;
+  if (!ReadMobRecord(r, rec, version)) return nullptr;
 
   // Resolve the def BY NAME: index order is whatever the directory listing
   // was the day the save was written. A missing def skips the mob (the save
@@ -18383,7 +18657,7 @@ Mob* MobSystem::ApplyHandoff(const ::net::MobHandoff& h) {
   }
   ByteReader r{h.record.data(), h.record.size()};
   MobRecord rec;
-  if (!ReadMobRecord(r, rec)) {
+  if (!ReadMobRecord(r, rec, h.recordVersion)) {
     std::printf("mob: handoff record for id %llu is short\n",
                 (unsigned long long)h.announce.id);
     return nullptr;

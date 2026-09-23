@@ -386,6 +386,11 @@ const char* const kOrder[] = {
     // SVR3 codec (PLAN_save_system.md S3). Runs its own worldgen + 150 ticks
     // and leaves that world behind; chunk-exchange next regenerates on entry.
     "region-codec",
+    // S4 entity split (PLAN_save_system.md). Regenerates on the way in,
+    // spawns and drops its own fixtures, and puts back the two process
+    // globals it touches (the mob id counter and the celestial clock) on the
+    // way out; the world it leaves behind is one chunk-exchange regenerates.
+    "save-split",
     // BETWEEN region-store and streaming, and the slot is chosen rather than
     // convenient. It regenerates the world several times (four arms, each
     // with its own worldgen and its own ReloadWindow) and it SHIFTS the
@@ -450,6 +455,10 @@ const char* const kOrder[] = {
     // installs an ownership function and clears it again; a gate after it
     // that found one still installed would be measuring ghosts.
     "mob-handoff",
+    // MOBS v4 (PLAN_save_system S5a). Beside `mob-handoff` because it shares
+    // that gate's exit contract: it resets mobs and debris and puts the id
+    // counter back. It ticks nothing and needs no terrain.
+    "mob-save-delta",
     // Armour reactivity, right after `mob-burn` and for the same reasons: it
     // lights real fires and pours real acid at absolute coordinates, and it
     // regenerates the world on the way out so the gates after it still find

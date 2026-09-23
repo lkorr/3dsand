@@ -64,10 +64,16 @@ class ChunkStore {
   void Clear() {
     regions_.clear();
     tickTags_.clear();
+    entityRegions_.clear();
     chunkCount_ = 0;
     dir_.clear();
   }
-  void Unbind() { dir_.clear(); }
+  // The entity buckets go with the binding (a dormant record belongs to the
+  // world dir it was read from); the RAM chunks stay, as they always have.
+  void Unbind() {
+    dir_.clear();
+    entityRegions_.clear();
+  }
   bool Bound() const { return !dir_.empty(); }
   const std::string& Dir() const { return dir_; }
   size_t Count() const { return chunkCount_; }  // chunks resident in RAM
@@ -139,6 +145,61 @@ class ChunkStore {
   static bool DecodeRecord(Codec codec, const uint8_t* data, size_t len,
                            IVec3 wc, uint32_t seed, std::vector<uint32_t>& rle);
 
+  // ---- REGION ENTITY BUCKETS: r_x_y_z.sve (PLAN_save_system.md S4) ---------
+  //
+  // The entity half of a region. World-anchored entities (mobs, ground items)
+  // are saved into the region that contains their position, in a file beside
+  // that region's `.svr`, so they stream with the terrain instead of living in
+  // one monolithic file that is rewritten and loaded whole.
+  //
+  // THE STORE HOLDS OPAQUE RECORDS AND NOTHING ELSE. A record is a section
+  // FourCC, that section's payload version, the position that bucketed it and
+  // the owning system's bytes. Which system a FourCC names, and what its bytes
+  // mean, is sim/worldio.h's and game/persist.cpp's business; this class only
+  // keeps them per region and gets them to and from disk.
+  //
+  // WHAT THE STORE KEEPS IN RAM is each region's DORMANT records: the ones
+  // read from disk that have not been handed to a live system. A record that
+  // IS live (applied at load, or a creature spawned this session) is owned by
+  // its system and is written back from there at save time
+  // (WriteEntityRegion's `live`). A region's file is therefore always
+  // dormant + live, and a region that was never read and holds nothing live
+  // is never opened, rewritten or deleted -- which is what lets S5b park an
+  // NPC in one region without touching any other.
+  //
+  //   r_x_y_z.sve: u32 magic 'SVX1', u32 count; per record:
+  //                u32 section, u32 version, f32 pos[3], u32 len, u8 bytes[len]
+  //
+  // Flat and individually framed so one record can be appended or removed
+  // without understanding any other. Lifecycle follows the chunk half:
+  // BindLoad and Clear/Unbind forget every bucket; BindSave from unbound wipes
+  // the files with the region files (IsOurFile).
+  struct EntityRecord {
+    uint32_t section = 0;  // FourCC of the owning EntitySection
+    uint32_t version = 0;  // the payload version the bytes were written at
+    Vec3 pos{};            // world voxels: decides the bucket
+    std::vector<uint8_t> bytes;
+  };
+  static IVec3 RegionOfChunk(IVec3 wc) { return RegionOf(wc); }
+  static IVec3 RegionOfVoxel(Vec3 p);
+  // The dormant records of region `rc`, read from its file the first time
+  // they are asked for (unbound, or no file: empty). Mutable on purpose --
+  // taking a record out of this vector IS making it live, and appending one
+  // is parking it (S5b); either changes what the next save writes.
+  std::vector<EntityRecord>& DormantEntities(IVec3 rc);
+  // Every region the entity half has opened or written under this binding.
+  void EntityRegionsKnown(std::vector<IVec3>& out) const;
+  // Write region `rc`'s file as its dormant records + `live`. Skipped when the
+  // bytes equal what the file already holds (so an unchanged bucket costs a
+  // hash, not a write); the file is removed when the result is empty.
+  // `wrote` / `bytesOut` (added to) report what happened. Unbound: false.
+  bool WriteEntityRegion(IVec3 rc, const std::vector<const EntityRecord*>& live,
+                         bool* wrote = nullptr, uint64_t* bytesOut = nullptr);
+  // Remove every r_*.sve under the bound dir and forget every bucket: a
+  // grid-only save must not leave a previous save's creatures on disk.
+  void RemoveAllEntityFiles();
+  std::string EntityRegionPath(IVec3 rc) const;
+
  private:
   struct Region {
     IVec3 rc{};                                  // region coord (file name)
@@ -191,6 +252,18 @@ class ChunkStore {
     uint32_t tick = 0;
   };
   std::unordered_map<uint64_t, Tag> tickTags_;  // packed chunk key -> tag
+
+  // One region's entity bucket (see EntityRecord). `diskHash` is FNV-1a 64 of
+  // the file bytes as last read or written, 0 = no file: it is how an
+  // unchanged bucket skips its write.
+  struct EntityRegion {
+    IVec3 rc{};
+    std::vector<EntityRecord> dormant;
+    uint64_t diskHash = 0;
+    bool loaded = false;
+  };
+  EntityRegion& TouchEntityRegion(IVec3 rc);
+  std::unordered_map<uint64_t, EntityRegion> entityRegions_;  // packed region key
   size_t chunkCount_ = 0;
   uint64_t useCounter_ = 0;
 };

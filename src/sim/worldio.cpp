@@ -2,8 +2,11 @@
 
 #include <algorithm>
 #include <chrono>
+#include <cmath>
 #include <cstdio>
 #include <cstring>
+#include <filesystem>
+#include <unordered_map>
 
 #include "gpu/resources.h"   // AssembleShaderSource: the fingerprint's WGSL
 #include "sim/biomes.h"      // EnvironmentStamp: map / biomes / trees
@@ -31,7 +34,26 @@ constexpr uint32_t kMetaMagicV4 = 0x344D5653;  // 'SVM4' - still loads
 constexpr uint32_t kEntMagic = 0x31455653;   // 'SVE1'
 
 std::string MetaPath(const std::string& dir) { return dir + "/meta.svm"; }
+// The pre-S4 monolithic file: read (legacy load), never written, deleted by
+// the first S4 save.
 std::string EntPath(const std::string& dir) { return dir + "/entities.sve"; }
+std::string WorldEntPath(const std::string& dir) { return dir + "/world.sve"; }
+std::string PlayerDirPath(const std::string& dir) { return dir + "/players"; }
+std::string PlayerPath(const std::string& dir, const std::string& id) {
+  return PlayerDirPath(dir) + "/" + id + ".svp";
+}
+
+bool IsRegionSection(const EntitySection& s) {
+  return s.scope == EntityScope::Region && s.saveRecords && s.loadRecord;
+}
+// Which container file a section's whole payload goes to. A Region section
+// without the per-record pair is written whole into world.sve rather than
+// silently dropped.
+EntityScope FileScopeOf(const EntitySection& s) {
+  if (s.scope == EntityScope::Player) return EntityScope::Player;
+  if (IsRegionSection(s)) return EntityScope::Region;
+  return EntityScope::World;
+}
 
 std::string FourCCStr(uint32_t id) {
   char s[5] = {(char)(id & 0xFF), (char)((id >> 8) & 0xFF),
@@ -54,50 +76,74 @@ bool ReadFileBytes(const std::string& path, std::vector<uint8_t>& out) {
   return ok;
 }
 
-// ---- entities.sve -----------------------------------------------------------
+// ---- the SVE1 section containers (world.sve, players/<id>.svp) ------------
 
-bool WriteEntities(const std::string& dir, const EntityIO& entities) {
-  std::vector<uint8_t> buf;
-  ByteWriter w{buf};
-  w.U32(kEntMagic);
-  w.U32((uint32_t)entities.sections.size());
-  std::vector<uint8_t> payload;
-  for (const EntitySection& s : entities.sections) {
-    payload.clear();
-    if (s.save) s.save(payload);
-    w.U32(s.id);
-    w.U32(s.version);
-    w.U32((uint32_t)payload.size());
-    w.Bytes(payload.data(), payload.size());
-  }
-  FILE* fp = std::fopen(EntPath(dir).c_str(), "wb");
+// tmp + rename, the region files' rule: a crash mid-write leaves the previous
+// file, never half of a new one.
+bool WriteFileAtomic(const std::string& path, const std::vector<uint8_t>& buf) {
+  const std::string tmp = path + ".tmp";
+  FILE* fp = std::fopen(tmp.c_str(), "wb");
   if (!fp) return false;
   bool ok = std::fwrite(buf.data(), 1, buf.size(), fp) == buf.size();
   std::fclose(fp);
+  std::error_code ec;
+  if (ok) {
+    std::filesystem::remove(path, ec);
+    std::filesystem::rename(tmp, path, ec);
+    ok = !ec;
+  }
+  if (!ok) std::filesystem::remove(tmp, ec);
   return ok;
 }
 
-void LoadEntities(const std::string& dir, const EntityIO& entities) {
-  // Reset EVERY registered system first, whether or not the file (or its
-  // section) exists: entities from the session being replaced must not stand
-  // in the loaded world, and an older grid-only save must load into an empty
-  // entity state rather than a haunted one.
-  for (const EntitySection& s : entities.sections)
-    if (s.reset) s.reset();
-
+// Every section whose FILE scope is `scope`, as one SVE1 container. False on
+// a write failure. With no such section and `always` false, no file is
+// written (a save with no player writes no player file).
+bool WriteSectionFile(const std::string& path, const EntityIO& io,
+                      EntityScope scope, bool always, uint64_t* bytes) {
+  std::vector<const EntitySection*> picked;
+  for (const EntitySection& s : io.sections)
+    if (FileScopeOf(s) == scope) picked.push_back(&s);
+  if (picked.empty() && !always) return true;
   std::vector<uint8_t> buf;
-  if (!ReadFileBytes(EntPath(dir), buf)) return;  // absent: nothing to apply
+  ByteWriter w{buf};
+  w.U32(kEntMagic);
+  w.U32((uint32_t)picked.size());
+  std::vector<uint8_t> payload;
+  for (const EntitySection* s : picked) {
+    payload.clear();
+    if (s->save) s->save(payload);
+    w.U32(s->id);
+    w.U32(s->version);
+    w.U32((uint32_t)payload.size());
+    w.Bytes(payload.data(), payload.size());
+  }
+  if (!WriteFileAtomic(path, buf)) {
+    std::fprintf(stderr, "save: failed to write %s\n", path.c_str());
+    return false;
+  }
+  if (bytes) *bytes += buf.size();
+  return true;
+}
+
+// Apply every section of one SVE1 container through the sections' WHOLE-
+// payload loaders, whatever scope they are registered at (so the pre-S4
+// entities.sve, which holds MOBS and ITMS whole, loads through this too).
+// False when the file is absent.
+bool ApplySectionFile(const std::string& path, const EntityIO& entities) {
+  std::vector<uint8_t> buf;
+  if (!ReadFileBytes(path, buf)) return false;  // absent: nothing to apply
   ByteReader r{buf.data(), buf.size()};
   uint32_t magic = 0, count = 0;
   if (!r.U32(magic) || magic != kEntMagic || !r.U32(count)) {
-    std::fprintf(stderr, "load: entities.sve is corrupt (bad header)\n");
-    return;
+    std::fprintf(stderr, "load: %s is corrupt (bad header)\n", path.c_str());
+    return true;
   }
   for (uint32_t i = 0; i < count; i++) {
     uint32_t id = 0, version = 0, len = 0;
     if (!r.U32(id) || !r.U32(version) || !r.U32(len) || r.off + len > r.n) {
-      std::fprintf(stderr, "load: entities.sve truncated at section %u\n", i);
-      return;
+      std::fprintf(stderr, "load: %s truncated at section %u\n", path.c_str(), i);
+      return true;
     }
     const uint8_t* payload = r.p + r.off;
     r.off += len;  // the table lets us seek past ANY section, known or not
@@ -115,6 +161,122 @@ void LoadEntities(const std::string& dir, const EntityIO& entities) {
                    "load: entity section '%s' (v%u) failed to apply; that "
                    "system starts empty\n",
                    FourCCStr(id).c_str(), version);
+  }
+  return true;
+}
+
+// ---- the whole entity save / load (worldio.h layout) ----------------------
+
+bool SaveEntities(const std::string& dir, const EntityIO& io, ChunkStore& store,
+                  EntityFileReport& rep) {
+  // world.sve ALWAYS, even with no World-scope section: its presence is what
+  // marks a dir as S4-layout, so a load never falls back to a stale
+  // entities.sve beside it.
+  if (!WriteSectionFile(WorldEntPath(dir), io, EntityScope::World, true, &rep.bytes))
+    return false;
+
+  bool anyPlayer = false;
+  for (const EntitySection& s : io.sections)
+    if (FileScopeOf(s) == EntityScope::Player) anyPlayer = true;
+  if (anyPlayer) {
+    std::error_code ec;
+    std::filesystem::create_directories(PlayerDirPath(dir), ec);
+    if (!WriteSectionFile(PlayerPath(dir, io.playerId), io, EntityScope::Player,
+                          false, &rep.bytes))
+      return false;
+  }
+
+  // ---- the region buckets ----
+  // Every live record, keyed by the region holding its position NOW.
+  struct Bucket {
+    IVec3 rc{};
+    std::vector<EntityRecord> live;
+  };
+  std::unordered_map<uint64_t, Bucket> buckets;
+  std::vector<EntityRecord> recs;
+  for (const EntitySection& s : io.sections) {
+    if (!IsRegionSection(s)) continue;
+    recs.clear();
+    s.saveRecords(recs);
+    for (EntityRecord& r : recs) {
+      r.section = s.id;
+      r.version = s.version;
+      const IVec3 rc = ChunkStore::RegionOfVoxel(r.pos);
+      Bucket& b = buckets[World::PackChunkKey(rc)];
+      b.rc = rc;
+      b.live.push_back(std::move(r));
+      rep.regionRecords++;
+    }
+  }
+  // ...plus every region the store already knows a bucket for: one whose
+  // records were all applied (or all walked away) must be rewritten without
+  // them, or the next load would resurrect them beside their live selves.
+  // A region neither live nor known is NOT visited -- its file, if any, holds
+  // parked records nobody has asked for, and they stay exactly as they are.
+  std::vector<IVec3> known;
+  store.EntityRegionsKnown(known);
+  for (const IVec3& rc : known) {
+    Bucket& b = buckets[World::PackChunkKey(rc)];
+    b.rc = rc;
+  }
+  bool ok = true;
+  std::vector<const EntityRecord*> ptrs;
+  for (auto& [key, b] : buckets) {
+    ptrs.clear();
+    for (const EntityRecord& r : b.live) ptrs.push_back(&r);
+    bool wrote = false;
+    if (!store.WriteEntityRegion(b.rc, ptrs, &wrote, &rep.bytes)) {
+      std::fprintf(stderr, "save: failed to write entity bucket %s\n",
+                   store.EntityRegionPath(b.rc).c_str());
+      ok = false;
+      continue;
+    }
+    if (wrote)
+      rep.regionFilesWritten++;
+    else
+      rep.regionFilesKept++;
+  }
+  if (!ok) return false;
+
+  // The pre-S4 file is now fully superseded: everything it held is live and
+  // has just been written into the three files above.
+  std::error_code ec;
+  if (std::filesystem::exists(EntPath(dir), ec)) {
+    std::filesystem::remove(EntPath(dir), ec);
+    std::printf("save: pre-S4 entities.sve distributed into world.sve / players / "
+                "region buckets and removed\n");
+  }
+  std::printf("save: entities -> world.sve, %s, %u live records in region buckets "
+              "(%u files written, %u unchanged), %.1f KB\n",
+              anyPlayer ? PlayerPath(dir, io.playerId).c_str() : "no player file",
+              rep.regionRecords, rep.regionFilesWritten, rep.regionFilesKept,
+              rep.bytes / 1e3);
+  return true;
+}
+
+void LoadEntities(const std::string& dir, const EntityIO& entities,
+                  ChunkStore& store, IVec3 windowOrigin, EntityFileReport& rep) {
+  // Reset EVERY registered system first, whether or not the file (or its
+  // section) exists: entities from the session being replaced must not stand
+  // in the loaded world, and an older grid-only save must load into an empty
+  // entity state rather than a haunted one.
+  for (const EntitySection& s : entities.sections)
+    if (s.reset) s.reset();
+
+  // S4 layout: world, then the player, then the regions the window touches.
+  // World first because it carries the state the others are applied against
+  // (the mob id counter every loaded creature draws from).
+  if (ApplySectionFile(WorldEntPath(dir), entities)) {
+    ApplySectionFile(PlayerPath(dir, entities.playerId), entities);
+    ApplyRegionEntities(store, windowOrigin, entities, &rep);
+    return;
+  }
+  // Pre-S4: one file, every section whole. Distributed by the next save.
+  if (ApplySectionFile(EntPath(dir), entities)) {
+    rep.legacy = true;
+    std::printf("load: %s holds a pre-S4 entities.sve; loaded whole, the next "
+                "save splits it into world.sve / players / region buckets\n",
+                dir.c_str());
   }
 }
 
@@ -232,6 +394,76 @@ WorldgenFingerprint ComputeWorldgenFingerprint(const std::string& assetDir,
   return fp;
 }
 
+void ApplyRegionEntities(ChunkStore& store, IVec3 wo, const EntityIO& io,
+                         EntityFileReport* rep) {
+  const int n = (int)(kWorldN / kChunk);  // window edge, chunks
+  auto inWindow = [&](const Vec3& p) {
+    const int cx = (int)std::floor((double)p.x / (double)kChunk);
+    const int cy = (int)std::floor((double)p.y / (double)kChunk);
+    const int cz = (int)std::floor((double)p.z / (double)kChunk);
+    return cx >= wo.x && cx < wo.x + n && cy >= wo.y && cy < wo.y + n &&
+           cz >= wo.z && cz < wo.z + n;
+  };
+  const IVec3 lo = ChunkStore::RegionOfChunk(wo);
+  const IVec3 hi = ChunkStore::RegionOfChunk({wo.x + n - 1, wo.y + n - 1, wo.z + n - 1});
+  for (int rz = lo.z; rz <= hi.z; rz++)
+    for (int ry = lo.y; ry <= hi.y; ry++)
+      for (int rx = lo.x; rx <= hi.x; rx++) {
+        std::vector<EntityRecord>& dormant = store.DormantEntities({rx, ry, rz});
+        if (dormant.empty()) continue;
+        // Take what this window can hold OUT of the bucket first, then apply:
+        // a loader that spawned something must never see (or re-enter) a
+        // bucket that still lists the record it is applying.
+        std::vector<EntityRecord> take, keep;
+        for (EntityRecord& r : dormant) {
+          const EntitySection* match = nullptr;
+          for (const EntitySection& s : io.sections)
+            if (s.id == r.section && IsRegionSection(s)) match = &s;
+          if (!match) {
+            // Unknown (or not registered by this caller): stays parked, and so
+            // survives this build's next save untouched.
+            std::printf("load: region (%d,%d,%d) keeps a '%s' record this build "
+                        "does not apply\n",
+                        rx, ry, rz, FourCCStr(r.section).c_str());
+            keep.push_back(std::move(r));
+          } else if (!inWindow(r.pos)) {
+            keep.push_back(std::move(r));
+          } else {
+            take.push_back(std::move(r));
+          }
+        }
+        dormant = std::move(keep);
+        if (rep) rep->recordsDormant += (uint32_t)dormant.size();
+        if (take.empty()) continue;
+        if (rep) rep->regionsApplied++;
+        for (const EntityRecord& r : take) {
+          const EntitySection* match = nullptr;
+          for (const EntitySection& s : io.sections)
+            if (s.id == r.section && IsRegionSection(s)) match = &s;
+          // A record that fails (content gone, truncated) is logged and NOT
+          // re-parked: the same rule the whole-payload loaders follow for a
+          // name that no longer resolves.
+          if (!match->loadRecord(r.bytes.data(), r.bytes.size(), r.version))
+            std::fprintf(stderr,
+                         "load: a '%s' record (v%u) in region (%d,%d,%d) failed "
+                         "to apply and is dropped\n",
+                         FourCCStr(r.section).c_str(), r.version, rx, ry, rz);
+          if (rep) rep->recordsApplied++;
+        }
+      }
+}
+
+bool SavePlayerFile(const std::string& dir, const EntityIO& io) {
+  std::error_code ec;
+  std::filesystem::create_directories(PlayerDirPath(dir), ec);
+  return WriteSectionFile(PlayerPath(dir, io.playerId), io, EntityScope::Player,
+                          false, nullptr);
+}
+
+bool LoadPlayerFile(const std::string& dir, const EntityIO& io) {
+  return ApplySectionFile(PlayerPath(dir, io.playerId), io);
+}
+
 bool SaveWorld(GpuContext& ctx, World& world, Stream& stream,
                const std::string& path, const std::vector<MaterialDef>& mats,
                const EntityIO* entities, WorldStamp stamp, SaveReport* report) {
@@ -318,16 +550,20 @@ bool SaveWorld(GpuContext& ctx, World& world, Stream& stream,
 
   // Entities BEFORE meta, for the same reason meta comes last at all: meta's
   // presence marks a completed save, so everything it vouches for must already
-  // be on disk. A grid-only save removes any stale entities.sve — pairing an
-  // old entity file with a new grid would resurrect bodies over terrain that
-  // no longer matches.
+  // be on disk. A grid-only save removes the WORLD's stale entity files
+  // (entities.sve, world.sve, every r_*.sve) — pairing an old entity file with
+  // a new grid would resurrect bodies over terrain that no longer matches.
+  // Player files are not the world's and are left alone.
   if (entities) {
-    if (!WriteEntities(path, *entities)) {
-      std::fprintf(stderr, "save: failed to write entities.sve\n");
+    rep.entities = EntityFileReport{};
+    if (!SaveEntities(path, *entities, store, rep.entities)) {
+      std::fprintf(stderr, "save: failed to write the entity files\n");
       return false;
     }
   } else {
     std::remove(EntPath(path).c_str());
+    std::remove(WorldEntPath(path).c_str());
+    store.RemoveAllEntityFiles();
   }
 
   // meta last: its presence marks a completed save
@@ -402,7 +638,8 @@ bool SaveWorld(GpuContext& ctx, World& world, Stream& stream,
 
 bool LoadWorld(GpuContext& ctx, World& world, Simulation& sim, Stream& stream,
                const std::string& path, const std::vector<MaterialDef>& mats,
-               const EntityIO* entities, WorldStamp* stampOut) {
+               const EntityIO* entities, WorldStamp* stampOut,
+               EntityFileReport* entReport) {
   std::vector<uint8_t> meta;
   if (!ReadFileBytes(MetaPath(path), meta)) {
     std::fprintf(stderr, "load: %s has no meta.svm\n", path.c_str());
@@ -589,7 +826,20 @@ bool LoadWorld(GpuContext& ctx, World& world, Simulation& sim, Stream& stream,
   // Entities after the grid: their load paths (Jolt bodies, terrain anchors)
   // read the world that is now in place. With no EntityIO the entity file is
   // ignored entirely — grid-only callers keep their exact old behaviour.
-  if (entities) LoadEntities(path, *entities);
+  //
+  // S4: world.sve, then players/<id>.svp, then every region bucket the
+  // window intersects (records inside the window only). The window was just
+  // reloaded at the saved origin, so that is every region a live entity could
+  // have been saved into.
+  if (entities) {
+    EntityFileReport entRep;
+    LoadEntities(path, *entities, store, {origin[0], origin[1], origin[2]}, entRep);
+    if (entReport) *entReport = entRep;
+    if (!entRep.legacy)
+      std::printf("load: entities -> %u records applied from %u region buckets, "
+                  "%u left parked outside the window\n",
+                  entRep.recordsApplied, entRep.regionsApplied, entRep.recordsDormant);
+  }
 
   // ---- far-field EDIT PERSISTENCE across a load (src/sim/faredits.h) -------
   // Everything above restores the SIMULATED world; the cascades are rebuilt

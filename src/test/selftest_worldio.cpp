@@ -354,6 +354,23 @@ Status GateSaveEntities(Ctx& c, std::string& detail) {
   mobs.Reset();
   avatar.Despawn();
 
+  // --- the S4 layout: world, player, and the mob's region bucket ---
+  bool layoutOk = false;
+  {
+    namespace fs = std::filesystem;
+    std::error_code ec;
+    const std::string dir(kPath);
+    size_t buckets = 0;
+    for (const auto& de : fs::directory_iterator(dir, ec))
+      if (de.path().extension() == ".sve" &&
+          de.path().filename().string().rfind("r_", 0) == 0)
+        buckets++;
+    layoutOk = fs::exists(dir + "/world.sve", ec) &&
+               (!haveAvatar || fs::exists(dir + "/players/local.svp", ec)) &&
+               !fs::exists(dir + "/entities.sve", ec) &&
+               (dummyDef < 0 || buckets >= 1);
+  }
+
   bool loaded = LoadWorld(ctx, world, sim, stream, kPath, c.mats, &eio);
 
   // --- everything came back? ---
@@ -383,9 +400,10 @@ Status GateSaveEntities(Ctx& c, std::string& detail) {
   }
 
   // --- forward compat: an UNKNOWN section id must be skipped, not fatal ---
+  // (world.sve since S4: the same SVE1 container entities.sve was.)
   bool unknownOk = false;
   {
-    const std::string ent = std::string(kPath) + "/entities.sve";
+    const std::string ent = std::string(kPath) + "/world.sve";
     FILE* fp = std::fopen(ent.c_str(), "rb");
     std::vector<uint8_t> buf;
     if (fp) {
@@ -471,18 +489,19 @@ Status GateSaveEntities(Ctx& c, std::string& detail) {
   bool sleepOk = reloaded && awakeAfter == 0;
 
   bool ok = saved && loaded && countsOk && asleepOk && poseOk && carveOk &&
-            avatarOk && unknownOk && refuseOk && sleepOk;
+            avatarOk && unknownOk && refuseOk && sleepOk && layoutOk;
   // counts=... was asserted right after the FIRST load; the current BodyCount
   // may legitimately be lower by now (settle-back converts long-asleep loaded
   // bodies to grid during the settle run — which is itself the loaded world
   // behaving normally).
   detail = Format(
       "saved=%d loaded=%d counts=%d(%u bodies, %u limbs) asleep=%d pose=%d "
-      "carve=%d avatar=%d unknown-skip=%d refuse=%d settle=%d(awake %u)",
+      "carve=%d avatar=%d unknown-skip=%d refuse=%d settle=%d(awake %u) "
+      "s4-layout=%d",
       saved ? 1 : 0, loaded ? 1 : 0, countsOk ? 1 : 0, debrisBefore,
       limbBodiesBefore, asleepOk ? 1 : 0, poseOk ? 1 : 0,
       carveOk ? 1 : 0, avatarOk ? 1 : 0, unknownOk ? 1 : 0, refuseOk ? 1 : 0,
-      sleepOk ? 1 : 0, awakeAfter);
+      sleepOk ? 1 : 0, awakeAfter, layoutOk ? 1 : 0);
   std::printf("save-entities: %s (%s)\n", ok ? "PASS" : "FAIL",
               detail.c_str());
 
@@ -1580,12 +1599,306 @@ Status GateRegionCodec(Ctx& c, std::string& detail) {
   return ok ? Status::Pass : Status::Fail;
 }
 
+// ---- save-split --------------------------------------------------------
+//
+// PLAN_save_system.md S4: entity state split by OWNER. One fixture, five
+// claims, all asserted in one run:
+//
+//  A. LAYOUT. Two creatures and two ground items placed ~430 voxels apart
+//     (so in two different 256-voxel regions whatever the window origin),
+//     a player kit and an engaged celestial clock. The save must write
+//     world.sve, players/local.svp, and EXACTLY one r_*.sve per region that
+//     holds a live creature or item -- the set computed from the live
+//     positions, compared to the files on disk -- and no entities.sve.
+//  B. ROUND TRIP. Wreck everything, load: both creatures, both items, the
+//     kit slot and every field of the celestial clock come back.
+//  C. PRE-S4 FILE. The same live state written as ONE entities.sve (every
+//     section's whole payload, the old container) with the S4 files deleted
+//     loads identically, and the next save distributes it: S4 files present,
+//     entities.sve gone, and that save round-trips too.
+//  D. PARKED RECORDS SURVIVE. A creature record appended to a region far
+//     outside the window (the S5b entry point) is written by the save, NOT
+//     applied by the load (it is outside the window), and a second save
+//     leaves its file byte-identical -- unrelated regions are not rewritten.
+//  E. THE SKY FOLLOWS A SAVE the sim clock cannot (ResumeWorldClock).
+//
+// Debris is world.sve's (no per-body entry point yet); its body count is
+// reported, not asserted -- save-entities owns the debris round trip.
+Status GateSaveSplit(Ctx& c, std::string& detail) {
+  namespace fs = std::filesystem;
+  GpuContext& ctx = c.ctx;
+  World& world = c.world;
+  Simulation& sim = c.sim;
+  Stream& stream = c.stream;
+  DebrisSystem& debris = c.debris;
+  MobSystem& mobs = c.mobs;
+  const char* kPath = "selftest_split.svd";
+  const std::string dir(kPath);
+
+  // The two process globals this gate touches, put back on every exit.
+  const uint64_t idCounterWas = mobs.NextIdCounter();
+  const CelestialClock celestialWas = Celestial();
+
+  int dummyDef = -1;
+  for (size_t i = 0; i < mobs.Defs().size(); i++)
+    if (mobs.Defs()[i].name == "dummy") dummyDef = (int)i;
+  int itemIdx = -1;
+  for (size_t i = 0; i < c.items.items.size() && itemIdx < 0; i++) {
+    uint32_t sc = 1;
+    if (ItemGroundVoxels(c.items.items[i], sc)) itemIdx = (int)i;
+  }
+  if (dummyDef < 0 || itemIdx < 0) {
+    detail = "no 'dummy' mob def or no droppable item";
+    return Status::Skip;
+  }
+  const ItemDef& itemDef = c.items.items[itemIdx];
+
+  stream.Store().Unbind();
+  std::filesystem::remove_all(kPath);
+  debris.Reset();
+  mobs.Reset();
+  SubmitWorldgen(ctx, world, sim, kDefaultSeed);
+  ctx.WaitIdle();
+
+  WorldItems ground;
+  debris.SetOnBodyGone([&ground](uint64_t h) { ground.OnBodyGone(h); });
+  PlayerCaster caster;
+  GlyphLibrary glyphs;
+  Inventory hb;
+  PlayerKit kit;
+  PlayerKitRefs kitRefs{&caster, &glyphs, &hb, &kit, &c.items};
+  WorldItemRefs groundRefs{&ground, &c.phys, &debris, nullptr, &c.items};
+  EntityIO eio = MakeEntityIO(debris, mobs, nullptr, &kitRefs, &groundRefs);
+
+  const IVec3 wo = world.WindowOrigin();
+  const int x0 = wo.x * (int)kChunk, z0 = wo.z * (int)kChunk;
+  const int sites[2][2] = {{x0 + 40, z0 + 40}, {x0 + 470, z0 + 470}};
+  for (const auto& s : sites) {
+    const int h = World::TerrainHeight(s[0], s[1], kDefaultSeed);
+    mobs.Spawn(dummyDef, {s[0], h + 1, s[1]});
+    const int hi = World::TerrainHeight(s[0] + 8, s[1] + 8, kDefaultSeed);
+    DropItemToWorld(itemDef, Vec3{(float)s[0] + 8, (float)(hi + 3), (float)s[1] + 8},
+                    Vec3{}, c.phys, debris, nullptr, ground);
+  }
+  hb.slots[2] = ItemStack{itemIdx, 1, 0};
+  // An ENGAGED clock at 3x, advanced off the sim tick, so every field of the
+  // 'TIME' section carries something a default clock would not.
+  Celestial() = CelestialClock{};
+  Celestial().SetScale(3.0f, 777);
+  for (int i = 0; i < 5; i++) Celestial().Advance();
+  const CelestialClock clockSaved = Celestial();
+
+  const uint32_t mobsBefore = mobs.MobCount();
+  const size_t itemsBefore = ground.Count();
+  const uint32_t debrisBefore = debris.BodyCount();
+
+  // The regions that MUST hold a bucket: every live creature's and item's.
+  auto expectedRegions = [&]() {
+    std::map<std::tuple<int, int, int>, int> want;
+    for (uint32_t i = 0; i < mobs.MobCount(); i++)
+      if (const Mob* m = mobs.MobAt(i); m && m->Alive()) {
+        const IVec3 rc = ChunkStore::RegionOfVoxel(m->Origin());
+        want[{rc.x, rc.y, rc.z}]++;
+      }
+    for (const WorldItem& w : ground.All()) {
+      BodyTransform xf{};
+      c.phys.GetTransform(w.body, xf);
+      const IVec3 rc = ChunkStore::RegionOfVoxel(xf.pos);
+      want[{rc.x, rc.y, rc.z}]++;
+    }
+    return want;
+  };
+  auto bucketFiles = [&]() {
+    std::map<std::tuple<int, int, int>, int> have;
+    std::error_code ec;
+    for (const auto& de : fs::directory_iterator(dir, ec)) {
+      const std::string n = de.path().filename().string();
+      int x = 0, y = 0, z = 0;
+      if (de.path().extension() == ".sve" &&
+          std::sscanf(n.c_str(), "r_%d_%d_%d.sve", &x, &y, &z) == 3)
+        have[{x, y, z}] = 1;
+    }
+    return have;
+  };
+  auto sameKeys = [](const std::map<std::tuple<int, int, int>, int>& a,
+                     const std::map<std::tuple<int, int, int>, int>& b) {
+    if (a.size() != b.size()) return false;
+    for (const auto& [k, v] : a)
+      if (!b.count(k)) return false;
+    return true;
+  };
+  auto wreck = [&]() {
+    debris.Reset();  // fires OnBodyGone: the registry empties with it
+    mobs.Reset();
+    ground.Clear();
+    hb.slots[2] = ItemStack{};
+    Celestial() = CelestialClock{};
+  };
+  auto restored = [&]() {
+    const CelestialClock& k = Celestial();
+    return mobs.MobCount() == mobsBefore && ground.Count() == itemsBefore &&
+           !hb.slots[2].Empty() && hb.slots[2].def == itemIdx &&
+           k.engaged == clockSaved.engaged && k.scaleNum == clockSaved.scaleNum &&
+           k.scaleDen == clockSaved.scaleDen && k.ticks == clockSaved.ticks &&
+           k.rem == clockSaved.rem && k.prevTicks == clockSaved.prevTicks;
+  };
+  std::error_code ec;
+
+  // ---- A: layout ----
+  const auto want = expectedRegions();
+  SaveReport rep1;
+  const bool saved1 = SaveWorld(ctx, world, stream, kPath, c.mats, &eio, {}, &rep1);
+  const auto have1 = bucketFiles();
+  const bool okA = saved1 && want.size() >= 2 && sameKeys(want, have1) &&
+                   fs::exists(dir + "/world.sve", ec) &&
+                   fs::exists(dir + "/players/local.svp", ec) &&
+                   !fs::exists(dir + "/entities.sve", ec);
+
+  // ---- B: round trip ----
+  wreck();
+  EntityFileReport lr1;
+  const bool loaded1 =
+      LoadWorld(ctx, world, sim, stream, kPath, c.mats, &eio, nullptr, &lr1);
+  const uint32_t debrisAfter = debris.BodyCount();
+  const bool okB = loaded1 && restored() && !lr1.legacy &&
+                   lr1.recordsApplied == (uint32_t)(mobsBefore + itemsBefore);
+
+  // ---- C: a pre-S4 entities.sve ----
+  bool okC = false;
+  EntityFileReport lr2;
+  {
+    // The old container, byte for byte: SVE1, then every section's WHOLE
+    // payload -- exactly what the pre-S4 WriteEntities produced.
+    std::vector<uint8_t> buf;
+    ByteWriter w{buf};
+    w.U32(0x31455653u);  // 'SVE1'
+    w.U32((uint32_t)eio.sections.size());
+    std::vector<uint8_t> payload;
+    for (const EntitySection& s : eio.sections) {
+      payload.clear();
+      s.save(payload);
+      w.U32(s.id);
+      w.U32(s.version);
+      w.U32((uint32_t)payload.size());
+      w.Bytes(payload.data(), payload.size());
+    }
+    for (const auto& de : fs::directory_iterator(dir, ec))
+      if (de.path().extension() == ".sve") fs::remove(de.path(), ec);
+    fs::remove_all(dir + "/players", ec);
+    if (FILE* fp = std::fopen((dir + "/entities.sve").c_str(), "wb")) {
+      std::fwrite(buf.data(), 1, buf.size(), fp);
+      std::fclose(fp);
+    }
+    wreck();
+    const bool loaded2 =
+        LoadWorld(ctx, world, sim, stream, kPath, c.mats, &eio, nullptr, &lr2);
+    const bool legacyOk = loaded2 && lr2.legacy && restored();
+    // The next save distributes it...
+    const auto want2 = expectedRegions();
+    const bool saved2 = SaveWorld(ctx, world, stream, kPath, c.mats, &eio);
+    const bool split2 = saved2 && sameKeys(want2, bucketFiles()) &&
+                        fs::exists(dir + "/world.sve", ec) &&
+                        fs::exists(dir + "/players/local.svp", ec) &&
+                        !fs::exists(dir + "/entities.sve", ec);
+    // ...and what it distributed loads back.
+    wreck();
+    const bool loaded3 = LoadWorld(ctx, world, sim, stream, kPath, c.mats, &eio);
+    okC = legacyOk && split2 && loaded3 && restored();
+  }
+
+  // ---- D: a parked record far outside the window ----
+  bool okD = false;
+  uint32_t parkedLeft = 0;
+  {
+    const Vec3 far{(float)(x0 - 2000), (float)(wo.y * (int)kChunk + 100),
+                   (float)(z0 - 2000)};
+    const IVec3 frc = ChunkStore::RegionOfVoxel(far);
+    ChunkStore::EntityRecord rec;
+    rec.section = eio.sections[0].id;
+    for (const EntitySection& s : eio.sections)
+      if (s.scope == EntityScope::Region && s.saveRecords) {
+        std::vector<EntityRecord> recs;
+        s.saveRecords(recs);
+        if (!recs.empty() && recs[0].bytes.size() > 0 &&
+            s.id == (uint32_t)('M' | ('O' << 8) | ('B' << 16) | ((uint32_t)'S' << 24))) {
+          rec = recs[0];
+          rec.section = s.id;
+          rec.version = s.version;
+        }
+      }
+    rec.pos = far;
+    stream.Store().DormantEntities(frc).push_back(rec);
+    const bool saved3 = SaveWorld(ctx, world, stream, kPath, c.mats, &eio);
+    const std::string farPath = stream.Store().EntityRegionPath(frc);
+    std::vector<uint8_t> farBytes;
+    auto readFar = [&](std::vector<uint8_t>& out) {
+      out.clear();
+      FILE* fp = std::fopen(farPath.c_str(), "rb");
+      if (!fp) return false;
+      std::fseek(fp, 0, SEEK_END);
+      out.resize((size_t)std::ftell(fp));
+      std::fseek(fp, 0, SEEK_SET);
+      const bool ok = std::fread(out.data(), 1, out.size(), fp) == out.size();
+      std::fclose(fp);
+      return ok;
+    };
+    const bool farWritten = saved3 && readFar(farBytes) && !farBytes.empty();
+    wreck();
+    EntityFileReport lr4;
+    const bool loaded4 =
+        LoadWorld(ctx, world, sim, stream, kPath, c.mats, &eio, nullptr, &lr4);
+    parkedLeft = lr4.recordsDormant;
+    // Not applied (the window does not reach it)...
+    const bool notApplied = loaded4 && mobs.MobCount() == mobsBefore;
+    // ...and a save that did not touch that region leaves its file alone.
+    SaveReport rep5;
+    const bool saved5 = SaveWorld(ctx, world, stream, kPath, c.mats, &eio, {}, &rep5);
+    std::vector<uint8_t> farAfter;
+    const bool farKept = saved5 && readFar(farAfter) && farAfter == farBytes;
+    okD = farWritten && notApplied && farKept;
+  }
+
+  // ---- E: the sky after a reload the sim clock could not follow ----
+  bool okE = false;
+  {
+    Celestial() = CelestialClock{};
+    const bool engaged = ResumeWorldClock(1000, 5000);
+    const bool atSave = Celestial().SimTick(5000) == 1000;
+    Celestial() = CelestialClock{};
+    const bool noop = !ResumeWorldClock(5000, 5000) && !Celestial().engaged;
+    okE = engaged && atSave && noop;
+  }
+
+  const bool ok = okA && okB && okC && okD && okE;
+  detail = Format(
+      "A layout=%d (%zu regions expected, %zu bucket files, %u records, %.1f KB) | "
+      "B roundtrip=%d (applied %u, mobs %u, items %zu, debris %u->%u) | "
+      "C preS4=%d | D parked=%d (dormant %u) | E skyResume=%d",
+      okA ? 1 : 0, want.size(), have1.size(), rep1.entities.regionRecords,
+      rep1.entities.bytes / 1e3, okB ? 1 : 0, lr1.recordsApplied, mobs.MobCount(),
+      ground.Count(), debrisBefore, debrisAfter, okC ? 1 : 0, okD ? 1 : 0, parkedLeft,
+      okE ? 1 : 0);
+  std::printf("save-split: %s (%s)\n", ok ? "PASS" : "FAIL", detail.c_str());
+
+  // teardown: nothing of this gate survives into the next one
+  debris.Reset();
+  mobs.Reset();
+  ground.Clear();
+  debris.SetOnBodyGone(nullptr);
+  mobs.SetNextIdCounter(idCounterWas);
+  Celestial() = celestialWas;
+  stream.Store().Unbind();
+  std::filesystem::remove_all(kPath);
+  return ok ? Status::Pass : Status::Fail;
+}
+
 }  // namespace
 
 const std::vector<Gate>& WorldIoGates() {
   static const std::vector<Gate> g = {
       {"save-load", "worldio", {}, false, GateSaveLoad},
       {"save-entities", "worldio", {}, false, GateSaveEntities},
+      {"save-split", "worldio", {}, false, GateSaveSplit},
       {"region-store", "worldio", {}, false, GateRegionStore},
       {"region-codec", "worldio", {}, false, GateRegionCodec},
       {"streaming", "worldio", {}, false, GateStreaming},
