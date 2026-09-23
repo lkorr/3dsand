@@ -13423,10 +13423,16 @@ MutationQueue:
   36..38, `kPageFaultScoop*`), the snapshot carries it, and a scoop files a
   CLAIM that `ContainerSettle` pays when that tick's snapshot arrives. Exact,
   four ticks late. A world-wide ledger: two scoops landing on one tick share it.
-- **A pour is grid particles on a solved arc** -- the kernel's own
-  integration, so the stream's centre lands on the crosshair (or on the first
-  body the look ray meets, since the grid pick cannot see a creature). They
-  reinsert as matter where they land. The one rounding: the kernel reinserts a
+- **A pour leaves the flask in your hand as grid particles**, two ways. AIMED
+  when what the crosshair touches (the grid pick, or the first body the look
+  ray meets -- the pick cannot see a creature) is within `pourRangeM` (2 m):
+  the arc is solved in the kernel's own integration and lands on it. TIPPED
+  otherwise: out along the look at the gentle `pourSpeedMps` and down, a short
+  way in front. The first version solved every pour toward a point
+  `pourRange` along the look line -- in mid-air when you look at the horizon
+  -- and the owner saw it "fly off at a weird angle": a long lob, and long
+  enough in flight for the wind to carry it. They reinsert as matter where
+  they land. The one rounding: the kernel reinserts a
   liquid particle FULL, so the last partial cell of a flask comes out as a
   whole one (under one cell per emptying). Ambient wind drags the stream like
   any particle (sim.windMode).

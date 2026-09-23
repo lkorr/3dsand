@@ -465,8 +465,8 @@ struct ItemDef {
     int capacity = 0;      // eighths; 128 cells authored = 1024
     int scoopPerTick = 4;  // cells lifted per tick while the button is held
     int pourPerTick = 2;   // cells thrown per tick while the button is held
-    float pourRange = MetresToCells(4.0f);  // farthest target, world voxels
-    float pourSpeed = MetresToCells(3.0f);  // launch speed, world voxels/s
+    float pourRange = MetresToCells(2.0f);  // farthest AIMED target, voxels
+    float pourSpeed = MetresToCells(1.5f);  // launch speed, world voxels/s
     int applyCells = 4;    // cells spent per click on a limb (triage)
   } container;
   bool IsContainer() const {
