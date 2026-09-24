@@ -10171,7 +10171,7 @@ Status GateMobPark(Ctx& c, std::string& detail) {
       std::ifstream f(path, std::ios::binary);
       f.read((char*)&magic, 4);
     }
-    okF4 = unread && wroteOk && wrote && kept == junk && magic == 0x31585653u;
+    okF4 = unread && wroteOk && wrote && kept == junk && magic == 0x32585653u /* SVX2 */;
     if (!okF4)
       whyF4 = Format(" (unread %d wrote %d/%d corrupt '%s' magic %08x)", unread ? 1 : 0,
                      wroteOk ? 1 : 0, wrote ? 1 : 0, kept.c_str(), magic);

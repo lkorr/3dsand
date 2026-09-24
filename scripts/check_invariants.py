@@ -2033,8 +2033,20 @@ def check_material_ids():
         return
     ids = {m["id"]: i + 1 for i, m in enumerate(mats) if isinstance(m, dict)}
     checked.append("material ids")
+    # The RUNTIME half (rule-unification W1-D): materials.cpp
+    # CheckPinnedMaterialIds refuses a materials.json that moved a constant, by
+    # a {kMatX, "x"} table. Every world.h constant must have its row there, with
+    # the same snake name this check derives -- or the runtime would not refuse.
+    mcpp = read("src/sim/materials.cpp") or ""
+    pins = dict(re.findall(r"\{(kMat[A-Z][A-Za-z0-9]*),\s*\"([a-z0-9_]+)\"\}", mcpp))
     for name, val in re.findall(r"\b(kMat[A-Z][A-Za-z0-9]*)\s*=\s*(\d+)", world):
         snake = re.sub(r"(?<!^)(?=[A-Z])", "_", name[4:]).lower()
+        if mcpp and pins.get(name) != snake:
+            problems.append(
+                f"world.h {name}: materials.cpp CheckPinnedMaterialIds has "
+                f"{'no row' if name not in pins else repr(pins[name])} for it "
+                f"(want {{{name}, \"{snake}\"}}) -- the runtime would not "
+                f"refuse a materials.json that moved it")
         if snake == "air":
             continue
         if snake not in ids:

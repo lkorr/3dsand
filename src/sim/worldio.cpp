@@ -31,7 +31,11 @@ namespace {
 constexpr uint32_t kMetaMagic = 0x364D5653;    // 'SVM6'
 constexpr uint32_t kMetaMagicV5 = 0x354D5653;  // 'SVM5' - still loads
 constexpr uint32_t kMetaMagicV4 = 0x344D5653;  // 'SVM4' - still loads
-constexpr uint32_t kEntMagic = 0x31455653;   // 'SVE1'
+constexpr uint32_t kEntMagicV1 = 0x31455653;  // 'SVE1' - still loads (untagged)
+// 'SVE2' (rule-unification W1-D): SVE1 plus, after the count, the hash of the
+// material name table every section in the file was written under
+// (sim/mattable.h). The sections' own bytes are unchanged.
+constexpr uint32_t kEntMagic = 0x32455653;    // 'SVE2'
 
 std::string MetaPath(const std::string& dir) { return dir + "/meta.svm"; }
 // The pre-S4 monolithic file: read (legacy load), never written, deleted by
@@ -96,15 +100,19 @@ bool WriteFileAtomic(const std::string& path, const std::vector<uint8_t>& buf) {
 // a write failure. With no such section and `always` false, no file is
 // written (a save with no player writes no player file).
 bool WriteSectionFile(const std::string& path, const EntityIO& io,
-                      EntityScope scope, bool always, uint64_t* bytes) {
+                      EntityScope scope, bool always, uint64_t* bytes,
+                      MatTableSet& tables) {
   std::vector<const EntitySection*> picked;
   for (const EntitySection& s : io.sections)
     if (FileScopeOf(s) == scope) picked.push_back(&s);
   if (picked.empty() && !always) return true;
+  // The table file before the container that names it (the region rule).
+  if (!tables.EnsureRunningWritten(bytes)) return false;
   std::vector<uint8_t> buf;
   ByteWriter w{buf};
   w.U32(kEntMagic);
   w.U32((uint32_t)picked.size());
+  w.U32(tables.RunningHash());
   std::vector<uint8_t> payload;
   for (const EntitySection* s : picked) {
     payload.clear();
@@ -126,15 +134,19 @@ bool WriteSectionFile(const std::string& path, const EntityIO& io,
 // payload loaders, whatever scope they are registered at (so the pre-S4
 // entities.sve, which holds MOBS and ITMS whole, loads through this too).
 // False when the file is absent.
-bool ApplySectionFile(const std::string& path, const EntityIO& entities) {
+bool ApplySectionFile(const std::string& path, const EntityIO& entities,
+                      MatTableSet& tables) {
   std::vector<uint8_t> buf;
   if (!ReadFileBytes(path, buf)) return false;  // absent: nothing to apply
   ByteReader r{buf.data(), buf.size()};
-  uint32_t magic = 0, count = 0;
-  if (!r.U32(magic) || magic != kEntMagic || !r.U32(count)) {
+  uint32_t magic = 0, count = 0, table = MatTableSet::kUntagged;
+  if (!r.U32(magic) || (magic != kEntMagic && magic != kEntMagicV1) ||
+      !r.U32(count) || (magic == kEntMagic && !r.U32(table))) {
     std::fprintf(stderr, "load: %s is corrupt (bad header)\n", path.c_str());
     return true;
   }
+  // Every section's lattices read under the file's table (mattable.h).
+  const ScopedLoadRemap remapScope(tables.RemapFor(MatTableSet::FromDisk(table)));
   for (uint32_t i = 0; i < count; i++) {
     uint32_t id = 0, version = 0, len = 0;
     if (!r.U32(id) || !r.U32(version) || !r.U32(len) || r.off + len > r.n) {
@@ -168,7 +180,8 @@ bool SaveEntities(const std::string& dir, const EntityIO& io, ChunkStore& store,
   // world.sve ALWAYS, even with no World-scope section: its presence is what
   // marks a dir as S4-layout, so a load never falls back to a stale
   // entities.sve beside it.
-  if (!WriteSectionFile(WorldEntPath(dir), io, EntityScope::World, true, &rep.bytes))
+  if (!WriteSectionFile(WorldEntPath(dir), io, EntityScope::World, true, &rep.bytes,
+                        store.Tables()))
     return false;
 
   bool anyPlayer = false;
@@ -178,7 +191,7 @@ bool SaveEntities(const std::string& dir, const EntityIO& io, ChunkStore& store,
     std::error_code ec;
     std::filesystem::create_directories(PlayerDirPath(dir), ec);
     if (!WriteSectionFile(PlayerPath(dir, io.playerId), io, EntityScope::Player,
-                          false, &rep.bytes))
+                          false, &rep.bytes, store.Tables()))
       return false;
   }
 
@@ -262,13 +275,13 @@ void LoadEntities(const std::string& dir, const EntityIO& entities,
   // S4 layout: world, then the player, then the regions the window touches.
   // World first because it carries the state the others are applied against
   // (the mob id counter every loaded creature draws from).
-  if (ApplySectionFile(WorldEntPath(dir), entities)) {
-    ApplySectionFile(PlayerPath(dir, entities.playerId), entities);
+  if (ApplySectionFile(WorldEntPath(dir), entities, store.Tables())) {
+    ApplySectionFile(PlayerPath(dir, entities.playerId), entities, store.Tables());
     ApplyRegionEntities(store, windowOrigin, entities, &rep);
     return;
   }
   // Pre-S4: one file, every section whole. Distributed by the next save.
-  if (ApplySectionFile(EntPath(dir), entities)) {
+  if (ApplySectionFile(EntPath(dir), entities, store.Tables())) {
     rep.legacy = true;
     std::printf("load: %s holds a pre-S4 entities.sve; loaded whole, the next "
                 "save splits it into world.sve / players / region buckets\n",
@@ -447,6 +460,9 @@ void ApplyRegionEntities(ChunkStore& store, IVec3 wo, const EntityIO& io,
           const EntitySection* match = nullptr;
           for (const EntitySection& s : io.sections)
             if (s.id == r.section && IsRegionSection(s)) match = &s;
+          // The record's ids are in the table IT was written under, which
+          // in one bucket can differ record to record (chunkstore.h).
+          const ScopedLoadRemap remapScope(store.Tables().RemapFor(r.matTable));
           const RecordLoad got =
               match->loadRecord(r.bytes.data(), r.bytes.size(), r.version);
           if (got == RecordLoad::Applied) {
@@ -470,15 +486,15 @@ void ApplyRegionEntities(ChunkStore& store, IVec3 wo, const EntityIO& io,
       }
 }
 
-bool SavePlayerFile(const std::string& dir, const EntityIO& io) {
+bool SavePlayerFile(const std::string& dir, const EntityIO& io, ChunkStore& store) {
   std::error_code ec;
   std::filesystem::create_directories(PlayerDirPath(dir), ec);
   return WriteSectionFile(PlayerPath(dir, io.playerId), io, EntityScope::Player,
-                          false, nullptr);
+                          false, nullptr, store.Tables());
 }
 
-bool LoadPlayerFile(const std::string& dir, const EntityIO& io) {
-  return ApplySectionFile(PlayerPath(dir, io.playerId), io);
+bool LoadPlayerFile(const std::string& dir, const EntityIO& io, ChunkStore& store) {
+  return ApplySectionFile(PlayerPath(dir, io.playerId), io, store.Tables());
 }
 
 bool SaveWorld(GpuContext& ctx, World& world, Stream& stream,
@@ -487,6 +503,9 @@ bool SaveWorld(GpuContext& ctx, World& world, Stream& stream,
   SaveReport localReport;
   SaveReport& rep = report ? *report : localReport;
   ChunkStore& store = stream.Store();
+  // Before ANY write: the resident flush below can LRU-spill a region, and
+  // every region written is tagged with this table (mattable.h).
+  store.Tables().SetRunning(MaterialNameTableOf(mats));
   if (store.Bound() && store.Dir() != path) {
     std::fprintf(stderr, "save: store is bound to %s (one world dir per session)\n",
                  store.Dir().c_str());
@@ -708,41 +727,46 @@ bool LoadWorld(GpuContext& ctx, World& world, Simulation& sim, Stream& stream,
                  path.c_str(), savedVm, vmBits, kVoxelMeters, VoxelMetersBits());
     return false;
   }
+  // ---- the material NAME table (rule-unification W1-D, sim/mattable.h) ---
+  //
+  // This used to REFUSE any change but an append: saved chunks reference
+  // materials by id, so a reorder would have loaded stone as blood. Now every
+  // blob in the dir names the table it was written under and is remapped BY
+  // NAME as it is read, so a reordered or grown materials.json loads the same
+  // substances. What this table still decides is the files that name NO table
+  // -- everything written before W1-D -- which read under it (or under the
+  // mat_legacy.svmt a previous W1-D load pinned). The mismatch is logged, not
+  // refused; an unknown name loads as air and is named in the log.
+  MaterialNameTable metaTable;
   {
     uint32_t savedCount = 0;
     r.U32(savedCount);
-    std::vector<std::string> names(savedCount);
-    for (uint32_t i = 0; i < savedCount && r.ok; i++) r.Str(names[i]);
+    // A count the file cannot hold is a corrupt header, not a big table.
+    if (!r.ok || (size_t)savedCount > (r.n - r.off) / 4) {
+      std::fprintf(stderr, "load: %s meta.svm material table is truncated\n",
+                   path.c_str());
+      return false;
+    }
+    metaTable.mats.resize(savedCount);
+    for (uint32_t i = 0; i < savedCount && r.ok; i++) r.Str(metaTable.mats[i]);
     if (!r.ok) {
       std::fprintf(stderr, "load: %s meta.svm material table is truncated\n",
                    path.c_str());
       return false;
     }
-    // Saved chunks reference materials BY ID; anything but an append means an
-    // old id now names a different substance (stone chunks turning to blood
-    // with a green build is the failure this refuses).
-    const uint32_t common = std::min<uint32_t>(savedCount, (uint32_t)mats.size());
-    for (uint32_t i = 0; i < common; i++) {
-      if (names[i] != mats[i].name) {
-        std::fprintf(stderr,
-                     "load: %s material table mismatch at id %u: saved "
-                     "'%s', this build has '%s' (materials.json was reordered "
-                     "or renamed — saved chunks would decode as the wrong "
-                     "materials)\n",
-                     path.c_str(), i, names[i].c_str(), mats[i].name.c_str());
-        return false;
-      }
+    const MaterialNameTable running = MaterialNameTableOf(mats);
+    if (metaTable.mats != running.mats) {
+      // Stain names are not in meta.svm, so this compares materials only.
+      MaterialNameTable runMatsOnly;
+      runMatsOnly.mats = running.mats;
+      const MatRemap m = BuildMatRemap(metaTable, runMatsOnly);
+      std::printf("load: %s was last saved under a different materials.json "
+                  "(%u names, this build %zu): %s -- loading BY NAME, not "
+                  "refusing\n",
+                  path.c_str(), savedCount, mats.size(),
+                  m.identity ? "an append only, every id keeps its meaning"
+                             : m.Describe().c_str());
     }
-    if (savedCount > (uint32_t)mats.size()) {
-      std::fprintf(stderr,
-                   "load: %s uses %u materials but this build has only %zu "
-                   "(first missing: '%s')\n",
-                   path.c_str(), savedCount, mats.size(),
-                   names[mats.size()].c_str());
-      return false;
-    }
-    // savedCount < mats.size() is fine: appending materials is the sanctioned
-    // way to grow the table, and old saves simply never reference the new ids.
   }
 
   // ---- SVM5's appended pair, read AFTER the material table (M9.5-B) ------
@@ -821,11 +845,15 @@ bool LoadWorld(GpuContext& ctx, World& world, Simulation& sim, Stream& stream,
   if (stampOut) *stampOut = stamp;
 
   ChunkStore& store = stream.Store();
+  store.Tables().SetRunning(MaterialNameTableOf(mats));
   if (!store.BindLoad(path)) {
     std::fprintf(stderr, "load: store is bound to %s (one world dir per session)\n",
                  store.Bound() ? store.Dir().c_str() : "?");
     return false;
   }
+  // Before the window refill reads a single region: the table untagged files
+  // decode under (see the material-table block above).
+  store.Tables().AdoptLegacy(metaTable);
 
   {
     // Snapshot restore (worldgen-equivalent), not a live mutation: the direct

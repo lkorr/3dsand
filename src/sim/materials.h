@@ -830,6 +830,14 @@ bool LoadAssets(const std::string& materialsPath, const std::string& reactionsPa
                 std::vector<MaterialDef>& mats, std::vector<ReactionGpu>& reactions,
                 std::string& errors);
 
+// Every world.h kMat* literal must name the material its NAME says (the
+// constant stays a compile-time literal -- it feeds the WGSL prelude -- but a
+// materials.json edit that moved one is refused at load rather than run).
+// Appends one line per mismatch to `errors`; LoadAssets calls it, so a
+// failing table never replaces the running one.
+void CheckPinnedMaterialIds(const std::vector<MaterialDef>& mats,
+                            const std::string& path, std::string& errors);
+
 // Builds the material-id -> COLLISION class table that World::KindAt reads.
 //
 // This is not just `m.gpu.klass` per material, and the difference is the whole

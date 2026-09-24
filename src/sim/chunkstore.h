@@ -8,6 +8,7 @@
 #include <vector>
 
 #include "math3d.h"
+#include "sim/mattable.h"
 #include "sim/world.h"
 
 // Move `from` over `to` in ONE step: `to` names the old file or the new one at
@@ -77,6 +78,7 @@ class ChunkStore {
     absentRegions_.clear();
     chunkCount_ = 0;
     dir_.clear();
+    tables_.Bind(std::string());
   }
   // The entity buckets go with the binding (a dormant record belongs to the
   // world dir it was read from); the RAM chunks stay, as they always have.
@@ -84,6 +86,7 @@ class ChunkStore {
     dir_.clear();
     entityRegions_.clear();
     absentRegions_.clear();
+    tables_.Bind(std::string());
   }
   bool Bound() const { return !dir_.empty(); }
   const std::string& Dir() const { return dir_; }
@@ -178,8 +181,10 @@ class ChunkStore {
   // is never opened, rewritten or deleted -- which is what lets S5b park an
   // NPC in one region without touching any other.
   //
-  //   r_x_y_z.sve: u32 magic 'SVX1', u32 count; per record:
-  //                u32 section, u32 version, f32 pos[3], u32 len, u8 bytes[len]
+  //   r_x_y_z.sve: u32 magic 'SVX2', u32 count; per record:
+  //                u32 section, u32 version, u32 matTable, f32 pos[3],
+  //                u32 len, u8 bytes[len]
+  //   ('SVX1', still read: the same without matTable -> untagged.)
   //
   // Flat and individually framed so one record can be appended or removed
   // without understanding any other. Lifecycle follows the chunk half:
@@ -188,6 +193,12 @@ class ChunkStore {
   struct EntityRecord {
     uint32_t section = 0;  // FourCC of the owning EntitySection
     uint32_t version = 0;  // the payload version the bytes were written at
+    // The material name table the bytes' ids were written under, in the RAM
+    // spelling (mattable.h MatTableSet): 0 = this process's running table --
+    // what every record built from live state is, so nobody has to set it --
+    // kLegacy for one read untagged (SVX1), else the hash its file named. The
+    // loader wraps the apply in ScopedLoadRemap(Tables().RemapFor(matTable)).
+    uint32_t matTable = 0;
     Vec3 pos{};            // world voxels: decides the bucket
     std::vector<uint8_t> bytes;
   };
@@ -210,6 +221,17 @@ class ChunkStore {
   // grid-only save must not leave a previous save's creatures on disk.
   void RemoveAllEntityFiles();
   std::string EntityRegionPath(IVec3 rc) const;
+
+  // ---- MATERIAL NAME TABLES (sim/mattable.h, rule-unification W1-D) --------
+  //
+  // Every region file and every bucket record this store writes is tagged with
+  // Tables().RunningHash() and the table itself lands beside them as
+  // mat_<hash>.svmt first; every one it reads is remapped by name to the
+  // running table before RAM sees it. So Get / ForEachStored / DormantEntities'
+  // callers (after ScopedLoadRemap for the opaque entity bytes) only ever see
+  // running ids. The running table is set by SaveWorld/LoadWorld; a bare store
+  // (a gate's) has none and reads and writes ids as they are.
+  MatTableSet& Tables() { return tables_; }
 
  private:
   struct Region {
@@ -242,16 +264,19 @@ class ChunkStore {
   void LoadManifest();
   bool WriteManifest();
 
-  // Reads one region file (SVR2 or SVR3) and hands every chunk to `fn`.
-  // The single reader both EnsureLoaded and ForEachStored use, so the two
-  // cannot disagree about the format. Returns false if the file is not a
-  // region file; a bad entry stops the walk (the entries before it stand).
-  static bool ReadRegionFile(
+  // Reads one region file (SVR2, SVR3 or SVR4) and hands every chunk to `fn`,
+  // its material ids already remapped to the running table (SVR4 names its
+  // table; SVR2/SVR3 read as untagged). The single reader both EnsureLoaded
+  // and ForEachStored use, so the two cannot disagree about the format.
+  // Returns false if the file is not a region file; a bad entry stops the
+  // walk (the entries before it stand).
+  bool ReadRegionFile(
       const std::string& path,
       const std::function<void(IVec3 wc, std::vector<uint32_t>& rle)>& fn);
 
   std::string dir_;
   uint32_t seed_ = 0;
+  MatTableSet tables_;
   std::unordered_map<uint64_t, Region> regions_;  // packed region key
   // Regions a Get found neither in RAM nor on disk, under the current
   // binding. A MISS USED TO CREATE AN EMPTY RAM REGION (Touch) so that the
