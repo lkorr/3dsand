@@ -2,6 +2,28 @@
 
 Branch `corpse-is-a-mob`, from main 8360a8c (2026-09-24).
 
+**STATUS: LANDED (P1, P2a-d, P3; 2026-09-24).** DESIGN.md "Corpses are Mobs"
+is the architecture record now; this file is the plan and its per-package
+notes. P3 closed the cross-package seams (a player corpse saves -- MOBS v6
+flags bit 1 -- and loads back into its own id band; dead Mobs hand off, with
+the rising moving in the record; `BuildAnnounce` is `Mob::CaptureGear`; the net
+report prints `asleep`/`states`), renamed the severed-part passes
+(`BurnDeadFlesh`, `StainDeadFlesh`, `SplatterDeadFlesh`, `FleshView`,
+`fleshCoat_`, `fleshShellIdx_`) and deleted the old corpse-gate probes.
+
+Follow-ups, not done:
+- A REMOTE player's death: `AdoptDeadAvatar` skips ghost avatars, so the
+  owner's corpse arrives as an announced dead Mob while this machine's ghost
+  avatar still holds a dead rig for the same body -- unverified; needs a
+  two-machine death in the `net-corpse` style.
+- `net-corpse` arm H hands the corpse over by direct `TakeHandoff`/
+  `ApplyHandoff`; the `EntitySync::ScanHandoffs` authority flip for a dead
+  Mob is not exercised by a gate.
+- `kGoneDeath` stays in the wire enum as a retired value (decodes to a name).
+- `ServiceRising`'s `RiseLimb`/`RiseGear` are local structs over the moved
+  rig; they could read straight off the dead Mob via `TurnMob`.
+- Corpses do not tick while parked (same as the living).
+
 ## Why
 
 `Mob::Die()` hands every limb body to `DebrisSystem::AdoptBody(dead=true)`. On the
@@ -172,7 +194,7 @@ goes away, and severed-part ghost-debris stays.
 | **P2a save** | MOBS v6, dead records, parking/unpark cap | P1 |
 | **P2b avatar** | dead avatar rig moved into `mobs_` at `Revive` | P1 |
 | **P2c net** | pose streaming of the dead, ghost dead state, no death `MobGone` | P1 |
-| **P3 finish** | rename the dead-flesh passes; delete what is now unreferenced; DESIGN.md, `tuner.html` ARCH_NODES; one `--suite acceptance`; `--rebaseline` | P2* |
+| **P3 finish** (LANDED) | seams between P2a-d; rename the dead-flesh passes; delete what is now unreferenced; DESIGN.md, `tuner.html` ARCH_NODES; one full `--selftest`; `--rebaseline` | P2* |
 
 ## Gates
 

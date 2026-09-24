@@ -459,6 +459,11 @@ are deduplicated across mob defs, so 128 slots cover a whole cast.
   target id / has-target / target and last-seen positions / last-seen tick,
   the five facts the handoff's `MobBrainWire` carries), so a creature that left
   mid-hunt comes back hunting; v4 and v3 still load with a fresh brain.
+  **MOBS v6 (2026-09-24)** adds the dead and the gear: a flags word (dead,
+  player corpse), the appended slots' names, the worn + held gear list for
+  every record (`Mob::CaptureGear`; v5 and earlier loaded undressed), and for a
+  corpse its cause, death order and pending rising; the dead park and unpark
+  like the living ("Corpses are Mobs").
   **Multiplayer:** main enables parking in single player and on the host; a
   client keeps the old despawn, because its store is not the one the host
   saves. Known gap: a host-parked creature returns only when the HOST's window
@@ -7969,9 +7974,11 @@ handmade art becomes matter the existing destruction pipeline already breaks.
   CPU-float gameplay state outside the hashed grid domain; blood, severed
   limbs and corpses reach the grid exclusively through the op stream, so
   determinism rule #1 is untouched. Alive = kinematic keyframe walk (ground
-  sampled from the chunk cache); death = flip dynamic and hand every limb to
-  `DebrisSystem::AdoptBody`, where culling, terrain upkeep and settle-back
-  apply with zero mob-specific code. Intra-mob collisions are disabled via a
+  sampled from the chunk cache); death = flip dynamic and KEEP the rig: the
+  dead creature stays a Mob, a permanent limp ragdoll (next section but one,
+  "Corpses are Mobs"). Severed limbs, carved gobbets and a corpse the dead cap
+  decays go to `DebrisSystem::AdoptBody`, where culling, terrain upkeep and
+  settle-back apply with zero mob-specific code. Intra-mob collisions are disabled via a
   Jolt `GroupFilterTable` — adjacent limb boxes otherwise fight their joints
   and the ragdoll never sleeps. Mob limbs render as extra body slots appended
   after the debris bodies (shared 12-bit slot space, `kMaxBodySlots`).
@@ -7982,14 +7989,14 @@ handmade art becomes matter the existing destruction pipeline already breaks.
   list — and an instance is `(slot, model)` drawn at `bodyXforms[slot]`, so a
   base that is one too high does not lose a body, it SWAPS two. The mob base
   used to be `DebrisSystem::BodyCount()` while all three debris walks stop at
-  `kMaxBodies`, and `AdoptBody` takes no cap — a corpse hands over fifteen
-  limbs at once and `bodies_` sits past the ceiling until the next `PostStep`
+  `kMaxBodies`, and `AdoptBody` takes no cap — a decayed corpse hands over
+  fifteen limbs at once and `bodies_` sits past the ceiling until the next `PostStep`
   cull. `DebrisSystem::SlotCount()` is the emitted count and is the only legal
   base; the mob walks return their next free slot for the same reason.
 
   **A BRICK RECORD HAS EXACTLY ONE HOLDER**, and handing a limb to
   `AdoptBody` means the slot forgets the index, not merely the ownership flag.
-  `Mob::DetachLimb` and `Mob::Die` clear `carved` AND `microModel`: the slot
+  `Mob::DetachLimb` and `Mob::ReleaseRigToDebris` clear `carved` AND `microModel`: the slot
   outlives the hand-off (it holds the kinematic piece for the sever beat, and
   the avatar keeps its whole limb list past death), so a slot that kept the
   index is a second holder of a record `DebrisSystem` now owns — and
@@ -7998,6 +8005,80 @@ handmade art becomes matter the existing destruction pipeline already breaks.
   tick by `BodyRegistry::AuditMicroModels` + `BuildMicroInsts`, which name the
   two entities rather than counting; the `limb-alias` gate is the fixture that
   makes them fire (three duels, audited per tick, faults 15 -> 0).
+### Corpses are Mobs (2026-09-24; `docs/PLAN_corpse_is_a_mob.md`, `game/mob.*`)
+
+**Death is a state of the Mob, not a change of owner.** `Mob::Die` sets
+`alive_ = false`, books a rising if the rot is in the flesh, and flips the rig
+limp (`EnterDeadRagdoll`); every body, joint, worn shell, twin table, burn
+index, coat ledger, wound, `worn_`, `heldItem_` and `carried_` stays where it
+was, in `MobSystem::mobs_`. Until this, `Die` handed every limb to
+`DebrisSystem::AdoptBody(dead=true)` and the Mob was swept a tick later, and a
+parallel system rebuilt what the rig had known (`CorpseReport`/`Corpses` for
+loot, `DyingStrap`/`StrapBody` for armour, `CorpseView`/`corpseCoat_` for burn
+and coat, lattice copies under a 256k budget for rising, `MobGone` plus ghost
+debris for the network). All of that is gone.
+
+- **What runs on the dead:** burn, char, joint twins, cross-limb heat; stain,
+  rain, dry, wet, splatter; infection/rot, blunt pulp; carve, cut, blunt,
+  bite, blast (one capped rig launch, `BlastMobsRadial`; the per-body impulse
+  skips a dead rig), sever as flesh; bleed (wounds pay out and close, no pump
+  refill); `DriveWornShells`, `UntunnelRig`, read-back. **What never runs:**
+  AI, steering, gait, animation, `SubmitPose`, get-up, fall damage, hit react,
+  voices after the death cry, hp/blood death transitions, crowd spacing,
+  targeting, attacks. `FindMobById` returns the dead; "gone" means released.
+- **Bounds (rule 2).** `kMaxMobs` counts the living only (`LiveMobCount`,
+  `HasRoomToSpawn`). The dead have their own caps, `kMaxDeadMobs = 12` and
+  `kMaxDeadBodies = 240`; past either, `EvictDead` decays the OLDEST corpse
+  (by `deathSeq_`, a corpse with a pending rising skipped) through
+  `Mob::ReleaseRigToDebris` -- the old handover, extracted -- and debris's own
+  FIFO cull and settle-back finish it. So the old corpse lifetime is the tail
+  of the new one. Dead Mobs have their own burn and stain budget pots so a
+  battlefield cannot starve the living. Gate `corpse-cap`.
+- **Sleep.** A dead Mob sleeps after `kDeadSleepTicks` of: every limb inactive
+  in Jolt, no burn front or `alight`, no active coat (washer, corrosive, hot)
+  and nothing dirty, no bleed budget or gush, twins clean. Asleep it skips
+  `PostStep`, the burn/stain scans and all but a strided terrain anchor; it
+  wakes on Jolt activity, any damage entry point or a change in the chunk
+  versions around it (`DeadWakeKey`). A PASSIVE coat (one that only dries --
+  blood, ichor, oil: `MobSystem::CoatDriesAsleep`) does not hold it awake: it
+  gets one visit per tick its next drying level is due (`Mob::NextDryTick`,
+  `DeadDryVisit` = the awake `StainTick` of that tick), so the coat ends
+  voxel-for-voxel as an awake corpse's would. `DeadAwakeReason` names why one
+  is awake. Gate `corpse-sleep` (with a shadow awake arm).
+- **Loot** reads the dead Mob live (`Mob::Lootable`/`LootPieces`: worn, held,
+  pack), and taking is an operation on it (`TakeLootPiece`, `game/corpses.h`).
+- **Rising** reads the dead rig (lattices moved, not copied; pose, gear, pack
+  by name) and releases it; a `PendingRise` is only who/what/when/whose.
+- **The player's corpse** (`MobSystem::AdoptDeadAvatar`): at the top of the
+  PreTick after the death the dead avatar's rig is slice-moved into `mobs_`
+  under an id from its own band (bit 61 | player << 40 | seq, so `nextId_` is
+  untouched), `PlayerCorpse()`, never lootable (the kit lives on the session);
+  the avatar keeps a bodiless husk until `Revive`. Gate `player-corpse`.
+- **Save (MOBS v6).** A record carries a flags word (bit 0 dead, bit 1 player
+  corpse), the appended slots' names (loaded records are aligned onto the
+  re-dressed rig BY NAME, `AlignRecordToRig`), the gear list for the living and
+  the dead (`Mob::CaptureGear`, rig-slot order: v5 and earlier re-dressed
+  nobody), and for a corpse its cause, death order and pending rising (ticks
+  left). A dead record loads on its lying pose straight into the dead state
+  (`EnterLoadedDead`: no death cry, no fresh rising), past the living cap and
+  under the dead cap; a player corpse comes back in its band without spending
+  an NPC id. Corpses park and unpark like the living. Gates `corpse-save`,
+  `player-corpse` (F).
+- **Network.** A dead Mob keeps its announce; `MobPose.alive = 0` enters the
+  ghost dead state (`EnterGhostDeath`: rig kept, still posed from the stream);
+  a shape change sends a `MobState` (gear + record); an asleep corpse is posed
+  on a 30-tick keyframe. A death sends no `MobGone` (`kGoneDeath` is retired);
+  a corpse decayed by the cap sends `kGoneEvicted` and its limbs arrive as
+  ghost debris. Corpses hand off like the living: the record says dead, and
+  `ApplyHandoff` enters `EnterLoadedDead`; the sender withdraws its rising
+  booking (the record carries it) and makes the limbs kinematic for the
+  ghost. Gate `net-corpse` (arm H is the handoff).
+- **What stays in DebrisSystem:** severed limbs and carved gobbets of living
+  and dead creatures -- a part that has left the rig has no rig to belong to.
+  Their passes are MobSystem's `BurnDeadFlesh` / `StainDeadFlesh` /
+  `SplatterDeadFlesh` over `ForEachDeadFlesh`, the living limb passes through
+  `FleshView`.
+
 ### A creature knocked down gets back up: the live ragdoll (2026-09-09; `Mob::StartRagdoll`, `sim/tuning.h` Ragdoll)
 
 Until now the only ragdoll was death. `Mob::Die` flips every limb dynamic and
@@ -8949,9 +9030,10 @@ sample point plus the blade's own half-thickness.
 sweep melted the player's limbs as debris instead of wounding them.
 `MobSystem::SetAvatar` registers it, and `FindLimb`/`FindOwner`/`Damage`/
 `CutLimb`/`CarveLimbRadial` consult it **after** the mob list — every existing
-caller that already checked the avatar first is bit-identical. Death is what it
-already was: the parts are handed to `DebrisSystem` and the corpse settles like
-any other debris.
+caller that already checked the avatar first is bit-identical. Death was then
+what it already was: the parts were handed to `DebrisSystem` and the corpse
+settled like any other debris. (Since 2026-09-24 the player's corpse is a dead
+Mob, `MobSystem::AdoptDeadAvatar` -- "Corpses are Mobs".)
 
 **Death holds, and is read before it is undone.** Nothing rebuilds the player
 on a timer. `Mob::Die()` calls a new virtual `OnDying()` after recording the
@@ -14231,6 +14313,11 @@ index and the ground registry carries only a name and a lattice.
 
 ### Corpses keep what they fell with, and E says what it will do (2026-09-12)
 
+> **Superseded 2026-09-24 ("Corpses are Mobs"):** the corpse is the dead Mob
+> itself, so `CorpseReport`, `SetOnCorpse` and the `Corpses` registry are gone
+> and the loot panel reads `Mob::LootPieces` live; corpses now save (MOBS v6).
+> The reach-ray and prompt half of this section still stands.
+
 `Mob::Die` hands every limb to `DebrisSystem` and the husk is swept on the next
 tick, so a tick after a creature falls there was no Mob left to ask "what was it
 wearing" — the robe was still THERE, a debris body jointed to the torso it fell
@@ -15100,7 +15187,9 @@ machine does not own. Entities are announced on first entering the peer's
 window plus a chunk, posed every tick while inside, handed off when the
 authority flips (`MobHandoff` = the per-mob save record + brain + gear by
 name, promoted in place; `BodyHandoff` re-creates the body dynamic with its
-velocity), and `Gone` on death or release; a ghost whose owner stops posing
+velocity), and `Gone` on release (since 2026-09-24 a death is a pose state,
+`MobPose.alive = 0`, and a corpse decayed by the dead cap is `kGoneEvicted`:
+"Corpses are Mobs"); a ghost whose owner stops posing
 for 3 s is dropped, and on disconnect every ghost is promoted to local at its
 last pose so nothing freezes. Explosion craters are scanned by the CHUNK
 authority from the merged batch, so a peer's blast in my chunk becomes my
