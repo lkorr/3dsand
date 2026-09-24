@@ -370,6 +370,7 @@ class Stream {
     std::vector<uint64_t> keys;    // PackChunkKey(world chunk) at copy time
     std::vector<uint8_t> copied;   // a real copy landed for this index
     uint32_t copyTick = 0;         // sim tick the copy was issued on
+    uint32_t generation = 0;       // re-copies so far (HarvestDemotes' cap)
   };
 
   void ShiftAxis(int axis, int dir);
@@ -477,10 +478,13 @@ class Stream {
 
   // ---- deferred shift-demote pipeline ----
   // Issue copies for demote candidates (batched, deferred maps, no wait).
+  // `generation` is how many times these slots have already been re-copied.
   void IssueDemoteCopies(const std::vector<uint32_t>& slots,
-                         const std::vector<uint64_t>& keys, uint32_t tick);
-  // Classify+demote every COMPLETED batch; never blocks. Stale batches are
-  // re-copied rather than trusted (see the staleness note at the definition).
+                         const std::vector<uint64_t>& keys, uint32_t tick,
+                         uint32_t generation = 0);
+  // Classify+demote every COMPLETED batch; never blocks. A slot that may have
+  // been written since its copy is re-copied rather than trusted, a bounded
+  // number of times (see the staleness note at the definition).
   void HarvestDemotes(uint32_t tick);
   // Throw away every queued demote batch, bytes and all. MANDATORY on regen /
   // LoadWorld: the bytes belong to the REPLACED world, and while the identity
@@ -574,12 +578,17 @@ class Stream {
   // The CPU half of a streamed-in plane's verdict, shared by both callers:
   // the SYNCHRONOUS fill (ReloadWindow, which reads occupancy right there) and
   // the DEFERRED one (a shift, K ticks later). `act` is genChunk's per-genList
-  // act verdict and is empty for the synchronous path, where the kernel woke
-  // the slots itself; a non-empty `act` means this call owes the dirty writes.
+  // verdict word (world.h kGenVerdict*: the act bit plus the page-table class)
+  // and is empty for the synchronous path, where the kernel woke the slots
+  // itself; a non-empty `act` means this call owes the dirty writes, and lets
+  // a FULL chunk demote on the kernel's class instead of a word copy.
+  // `genTick` is the tick the plane was generated on — the write-reach
+  // clock's reference for "written since generation".
   void ApplyGenVerdict(const std::vector<uint32_t>& genSlots,
                        const std::vector<uint8_t>& stale,
                        const std::vector<uint32_t>& occ, bool occValid,
-                       const std::vector<uint32_t>& act, uint32_t tick);
+                       const std::vector<uint32_t>& act, uint32_t genTick,
+                       uint32_t tick);
   std::deque<PendingShift> pendingShifts_;
   // Staging for the deferred readbacks: occupancy (kNumChunks u32) followed by
   // one genAct u32 per generated slot, in ONE buffer so a shift costs one

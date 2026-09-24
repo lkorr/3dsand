@@ -2632,6 +2632,7 @@ void Simulation::EncodeTick(const rhi::CommandEncoder& enc, uint32_t opsCount,
   const bool exciteOn = CurrentTuning().sim.fluidExciteMode != 0;
   const bool seamActive =
       fluidCount > 0 || fluidSpawnCount > 0 || (exciteOn && cx.caActive);
+  fluidSeamRecorded_ = seamActive;
   if (seamActive) {
     RecordTable(enc, pass::Table::FluidSeam, &cx);
     // The chunk->block map is built ONCE here, not once per substep: max

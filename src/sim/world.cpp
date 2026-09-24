@@ -82,7 +82,8 @@ static void SizeSnapshot(WorldSnapshot& s) {
   s.supportFlags.assign(kNumSlots, 0);
   s.occupancy.assign(kNumSlots, 0);
   s.occStain.assign(kNumSlots, 0);
-  s.chunkHash.assign(kChunkHashWords, 0);
+  // chunkHash is NOT sized here: it is a shared, immutable table the parse
+  // either copies fresh (hash ticks) or inherits from the previous snapshot.
   s.fluidBlocks.assign(kFluidBlocks, 0);
   s.fluidMirror.assign(27ull * kChunkVol, 0);
 }
@@ -337,10 +338,12 @@ void World::Init(const rhi::Device& device) {
   bodyXforms = CreateBuffer(device, (uint64_t)kMaxBodySlots * 32,
                             U::Storage | U::CopyDst, "bodyXforms");
   genList = CreateBuffer(device, kNumSlots * 4, U::Storage | U::CopyDst, "genList");
-  // The deferred-wake act verdict (world.h's genAct note). CopySrc because
-  // Stream reads it back — one small copy per window shift, never mapped in
-  // the frame path.
-  genAct = CreateBuffer(device, (uint64_t)kNChunk * kNChunk * 4,
+  // The generation verdict (world.h kGenVerdict*: the deferred wake's act bit
+  // plus the chunk's page-table class). CopySrc because Stream reads it back —
+  // one small copy per window shift, never mapped in the frame path — and so
+  // does the batched worldgen, 8 KiB per batch instead of 32 MiB of words.
+  // kGenActEntries covers a shift plane and a worldgen batch.
+  genAct = CreateBuffer(device, (uint64_t)kGenActEntries * 4,
                         U::Storage | U::CopyDst | U::CopySrc, "genAct");
   // JITTER page materialization gets its OWN list, deliberately NOT genList.
   // Two u32 per entry (slot, sentinel entry) against genList's one, and — the
@@ -484,7 +487,7 @@ static int ActiveReadbackSlots() {
 
 bool World::EncodeReadbacks(const rhi::Device&, const rhi::CommandEncoder& enc,
                             IVec3 playerChunkBase, uint32_t particleLivePage,
-                            uint32_t tick) {
+                            uint32_t tick, bool hashTick, bool fluidRecorded) {
   // A TICK REWIND FLUSHES THE PIPELINE. The harness runs many scenes through
   // one World and each restarts its own tick base (kOrder, test/selftest.cpp),
   // so `tick` is monotonic WITHIN a scene and not across them. Unsigned
@@ -595,13 +598,23 @@ bool World::EncodeReadbacks(const rhi::Device&, const rhi::CommandEncoder& enc,
   // buffer reference at encode time via these explicit copies instead.
   enc.CopyTracked(pass::Buf::Occupancy, occupancy, 0, s.buf, kOccOff, kOccBytes);
   enc.CopyTracked(pass::Buf::Hash, hash, 0, s.buf, kHashOff, 16);
-  // The per-chunk digest table. Copied EVERY tick even though only the full
-  // occupancy pass writes it: the copy is 128 KiB of DMA out of a buffer the
-  // GPU is not touching on a dirty tick, and the trailing tick word tells the
-  // reader which pass it is looking at — which is cheaper and less fragile
-  // than teaching the ring which ticks were hash ticks.
-  enc.CopyTracked(pass::Buf::ChunkHash, chunkHash, 0, s.buf, kChunkHashOff,
-                  kChunkHashBytes);
+  // The per-chunk digest table: 128 KiB, copied ONLY when this tick can have
+  // rewritten it. It used to ride every snapshot on the argument that the
+  // trailing tick word tells the reader which pass it is looking at — true,
+  // and it cost 128 KiB of DMA plus a 128 KiB memcpy per tick to re-deliver a
+  // table that changes on one tick in fifteen (the game's hash cadence). The
+  // in-tick writer is the full occupancy pass (C_HASH, i.e. `hashTick`); the
+  // out-of-tick writers — worldgen's fill and the load reset, both behind
+  // InvalidateSnapshot, and the hash-only pass behind NoteChunkHashWritten —
+  // raise chunkHashForce_. A slot that skips the copy inherits the previous
+  // snapshot's table at parse time, which is byte-for-byte what the buffer
+  // still holds, so ChunkHashOfSlot/ChunkHashTick read exactly what they did.
+  s.hashCopied = hashTick || chunkHashForce_;
+  if (s.hashCopied) {
+    enc.CopyTracked(pass::Buf::ChunkHash, chunkHash, 0, s.buf, kChunkHashOff,
+                    kChunkHashBytes);
+    chunkHashForce_ = false;
+  }
   enc.CopyTracked(pass::Buf::Pick, pick, 0, s.buf, kPickOff, 32);
   enc.CopyTracked(pass::Buf::ParticleCounts, particleCounts, 0, s.buf, kPCountOff, 16);
   // Gas: the live per-page counts and the 8-word counter header. Async and one
@@ -630,8 +643,16 @@ bool World::EncodeReadbacks(const rhi::Device&, const rhi::CommandEncoder& enc,
                   kFluidArgsOff, kFluidArgsBytes);
   enc.CopyTracked(pass::Buf::FluidBlockList, fluidBlockList, 0, s.buf,
                   kFluidBlocksOff, kFluidBlocksBytes);
-  enc.CopyTracked(pass::Buf::FluidMirror, fluidMirror, 0, s.buf,
-                  kFluidMirrorOff, kFluidMirrorBytes);
+  // The swimming fold (108 KiB) only when the seam was RECORDED this tick —
+  // the fold pass is its last row, so a tick without the seam leaves the
+  // buffer as it was and there is no live fluid for it to describe (the
+  // seam's recording predicate covers every live particle; see
+  // Simulation::EncodeTick). The parse treats a skipped copy as "no water",
+  // the zero-fill it already applied whenever fluidLive read 0.
+  s.fluidCopied = fluidRecorded;
+  if (fluidRecorded)
+    enc.CopyTracked(pass::Buf::FluidMirror, fluidMirror, 0, s.buf,
+                    kFluidMirrorOff, kFluidMirrorBytes);
   lastSlot_ = slot;
   return true;
 }
@@ -705,42 +726,14 @@ void World::KickReadback() {
         for (size_t m = 0; m < sl.mirrorSentinel.size(); m++) {
           const uint32_t e = sl.mirrorSentinel[m];
           if (e == 0u) continue;  // a real copy landed for this cell
-          uint32_t* dst = out.mirror.data() + m * kChunkVol;
           const int mx = (int)(m % 3), my = (int)((m / 3) % 3),
                     mz = (int)(m / 9);
           const IVec3 wc{sl.base.x + mx, sl.base.y + my, sl.base.z + mz};
-          // SynthWordAt returns 0 for air whatever the JITTER bit says
-          // (world.h), so an air-tagged JITTER sentinel must NOT take the
-          // row branch below — it would produce 0 | (state << 12). Classify
-          // refuses to mint JITTER(air), so this cannot arise today; the
-          // branch makes the equivalence unconditional instead of argued.
-          if ((e & kPtMatMask) == kMatAir) {
-            std::fill_n(dst, kChunkVol, 0u);
-          } else if ((e & kPtJitterBit) == 0u) {
-            std::fill_n(dst, kChunkVol, SynthWord(e));
-          } else {
-            // ROW ORDER, as pagetable.cpp's JITTER verify and
-            // RleEncodeSentinelChunk already do it: Pcg(y) and the z term
-            // are loop-invariant across a row, so JitterRowSeed removes
-            // one of three PCG rounds per cell. Strictly derived from
-            // SynthWordAt (world.h says so, and page-roundtrip compares
-            // them) — this is a strength reduction, not a second rule.
-            const int bx = wc.x * (int)kChunk, by = wc.y * (int)kChunk,
-                      bz = wc.z * (int)kChunk;
-            const uint32_t mat = e & kPtMatMask;
-            const uint32_t stampBits = kStampNever << kStampShift;
-            uint32_t i = 0;
-            for (int lz = 0; lz < (int)kChunk; lz++)
-              for (int ly = 0; ly < (int)kChunk; ly++) {
-                const uint32_t rowSeed =
-                    JitterRowSeed(by + ly, bz + lz, mirrorSeed_);
-                for (int lx = 0; lx < (int)kChunk; lx++, i++)
-                  dst[i] = mat |
-                           (JitterStateInRow(rowSeed, bx + lx, mirrorSeed_)
-                            << 12) |
-                           stampBits;
-              }
-          }
+          // Air (whatever the JITTER bit says) / UNIFORM / JITTER in row
+          // order: world.h SynthChunkWords, the one whole-chunk form of
+          // SynthWordAt, shared with the fetch cache below.
+          SynthChunkWords(e, wc, mirrorSeed_,
+                          out.mirror.data() + m * kChunkVol);
         }
         out.mirrorBase = sl.base;
         out.windowOrigin = sl.origin;
@@ -825,12 +818,22 @@ void World::KickReadback() {
         }
         std::memcpy(&out.worldHash, b + kHashOff, 4);
         // The digest table rides the tail of the slot, outside the bounce
-        // above, so it is read from the mapped pointer directly. The trailing
+        // above, so it is read from the mapped pointer directly — but only
+        // when this slot carried it (EncodeReadbacks' hashTick). Otherwise
+        // the snapshot SHARES the previous one's table: the GPU buffer was
+        // not rewritten in between, so it is the same bytes, and sharing
+        // costs a reference count instead of a 128 KiB memcpy. The trailing
         // word is the tick the FULL occupancy pass stamped it with; on a
         // dirty tick that is an earlier tick, and saying so is the whole
         // point of carrying it.
-        std::memcpy(out.chunkHash.data(), p + kChunkHashOff, kChunkHashBytes);
-        out.chunkHashTick = out.chunkHash[kChunkHashTickWord];
+        if (sl.hashCopied || !lastChunkHash_) {
+          auto t = std::make_shared<std::vector<uint32_t>>(kChunkHashWords, 0u);
+          if (sl.hashCopied)
+            std::memcpy(t->data(), p + kChunkHashOff, kChunkHashBytes);
+          lastChunkHash_ = std::move(t);
+        }
+        out.chunkHash = lastChunkHash_;
+        out.chunkHashTick = (*out.chunkHash)[kChunkHashTickWord];
         std::memcpy(&out.pageFaults, p + kPageFaultOff, 4);
         std::memcpy(out.pick, b + kPickOff, 32);
         uint32_t pcounts[2];
@@ -871,7 +874,7 @@ void World::KickReadback() {
           // The occupancy fold is only meaningful while fluid is live —
           // the seam stops recording (and refreshing the buffer) at
           // zero, so a stale fold must read as no water.
-          if (out.fluidLive > 0) {
+          if (out.fluidLive > 0 && sl.fluidCopied) {
             std::memcpy(out.fluidMirror.data(), p + kFluidMirrorOff,
                         kFluidMirrorBytes);
           } else {
@@ -908,35 +911,9 @@ void World::KickReadback() {
               // words, so assign's zero-fill was 16 KiB of memset thrown
               // away immediately. (§2.1a)
               cc.voxels.resize(kChunkVol);
-              uint32_t* dst = cc.voxels.data();
-              const IVec3 wc = sl.fetchIds[i];
-              // Same three cases, and for the same reasons, as the mirror
-              // synthesis above: air is one word whatever the JITTER bit
-              // says, non-JITTER is one word by definition, and JITTER
-              // walks rows so JitterRowSeed can hoist the y/z half of the
-              // hash out of the inner loop.
-              if ((e & kPtMatMask) == kMatAir) {
-                std::fill_n(dst, kChunkVol, 0u);
-              } else if ((e & kPtJitterBit) == 0u) {
-                std::fill_n(dst, kChunkVol, SynthWord(e));
-              } else {
-                const int bx = wc.x * (int)kChunk, by = wc.y * (int)kChunk,
-                          bz = wc.z * (int)kChunk;
-                const uint32_t mat = e & kPtMatMask;
-                const uint32_t stampBits = kStampNever << kStampShift;
-                uint32_t k = 0;
-                for (int lz = 0; lz < (int)kChunk; lz++)
-                  for (int ly = 0; ly < (int)kChunk; ly++) {
-                    const uint32_t rowSeed =
-                        JitterRowSeed(by + ly, bz + lz, mirrorSeed_);
-                    for (int lx = 0; lx < (int)kChunk; lx++, k++)
-                      dst[k] = mat |
-                               (JitterStateInRow(rowSeed, bx + lx,
-                                                 mirrorSeed_)
-                                << 12) |
-                               stampBits;
-                  }
-              }
+              // The mirror's synthesis, from the same helper (world.h).
+              SynthChunkWords(e, sl.fetchIds[i], mirrorSeed_,
+                              cc.voxels.data());
             } else {
               cc.voxels.assign(
                   (const uint32_t*)(p + kFetchOff + i * kChunkBytes),
@@ -958,6 +935,11 @@ void World::KickReadback() {
 
 void World::InvalidateSnapshot() {
   snap_.valid = false;
+  // The digest table the next snapshot would inherit describes the dead
+  // world, and the resets that land here (worldgen's fill, the load reset)
+  // rewrite the GPU table: the next readback must COPY it, not share.
+  lastChunkHash_.reset();
+  chunkHashForce_ = true;
   // The quiet streaks described the DEAD world's chunks (M9.3-A). A fresh
   // worldgen makes every slot's history meaningless, and a stale streak here
   // would read as "settled, safe to compare" for a chunk that has not been

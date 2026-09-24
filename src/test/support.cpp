@@ -799,9 +799,10 @@ void SubmitTick(GpuContext& ctx, World& world, Simulation& sim, uint32_t tick,
   // through the back door. Quiescence and adoption are GPU-side now
   // (sim_waterbody.wgsl); what rides this stream cannot see a fence.
   //
-  // `sim.waterBodyMode` is 0 by default and mode 0 is an immediate early-out
-  // that leaves both counts at zero, so every pass row's condition is false,
-  // nothing is recorded, and the pinned world hash cannot see any of it.
+  // `sim.waterBodyMode` 0 is an immediate early-out that leaves both counts
+  // at zero, so every pass row's condition is false and nothing is recorded.
+  // The SHIPPED tuning.json sets mode 1 (label lakes, write nothing — see the
+  // settled-tick note further down), so this is not a default-off system.
   const WaterBodyGpu* waterGpu = nullptr;
   uint32_t drainBodies = 0;
   {
@@ -1439,7 +1440,8 @@ void SubmitTick(GpuContext& ctx, World& world, Simulation& sim, uint32_t tick,
   // reading is how a chunk that just gained matter gets demoted under it.
   if (world.LatestDelivered().valid)
     pt.ConsumeOccupancy(world.LatestDelivered().occupancy,
-                        world.LatestDelivered().occStain, tick);
+                        world.LatestDelivered().occStain,
+                        world.LatestDelivered().tick, tick);
   pt.RetirePages(tick);
 
   // ---- the §3.4 settled-skip latch ----------------------------------------
@@ -1569,13 +1571,19 @@ void SubmitTick(GpuContext& ctx, World& world, Simulation& sim, uint32_t tick,
   }
   bool doCopy = false;
   {
-    // TIMED (P3-F): ~1.9 MiB of copies out per tick, recorded as raw
+    // TIMED (P3-F): up to ~2 MiB of copies out per tick (~0.8 MiB at rest,
+    // more with chunk fetches in flight), recorded as raw
     // CopyBufferToBuffer rather than as pass rows. `readback` was a CPU-only
     // row on the Performance page; this is the GPU side of the same system.
     TickGpuSpan spanRb(enc, "readbackCopy");
+    // The digest table rides hash ticks only and the swimming fold only
+    // ticks that recorded the seam — the only ticks either GPU table can
+    // have changed on (World::EncodeReadbacks). 236 KiB of the ~1 MiB a
+    // resting tick used to copy out.
     doCopy = world.EncodeReadbacks(ctx.device, enc,
                                    {playerChunk.x - 1, playerChunk.y - 1, playerChunk.z - 1},
-                                   1 - sim.Page(), tick);
+                                   1 - sim.Page(), tick, hashEnable,
+                                   sim.FluidSeamRecorded());
     if (doCopy) {
       world.EncodeDirtyCopy(enc, sim.DirtyNext());
     } else {
@@ -1819,7 +1827,18 @@ void SubmitWorldgen(GpuContext& ctx, World& world, Simulation& sim, uint32_t see
   // generalizes to a grown window, where a dense transient would be 4 GiB and
   // simply impossible.
   {
-    const uint32_t kGenBatch = 2048;
+    const uint32_t kGenBatch = kWorldgenBatch;   // world.h: genAct covers it
+    // SANDVOX_GEN_VERDICT_CHECK=1: classify every batch BOTH ways — the GPU
+    // verdict and PageTable::Classify over the read-back words — install the
+    // words' answer, and count every disagreement. The verdict path's claim is
+    // "identical to Classify", and this is the switch that measures it rather
+    // than argues it (one --verify boot with it set covers every worldgen the
+    // gates run).
+    static const bool kVerdictCheck = [] {
+      const char* e = std::getenv("SANDVOX_GEN_VERDICT_CHECK");
+      return e && e[0] == '1';
+    }();
+    uint64_t verdictMismatch = 0, verdictChecked = 0;
     // The first submit still has to clear the transient buffers (hash,
     // support, particle counts, both dirty pages) exactly as EncodeWorldgen
     // does, so run it over an EMPTY slot list: the fills land, the dispatch
@@ -1831,7 +1850,8 @@ void SubmitWorldgen(GpuContext& ctx, World& world, Simulation& sim, uint32_t see
       ctx.queue.Submit(enc.Finish());
     }
     std::vector<uint32_t> batch;
-    std::vector<uint32_t> vox((size_t)kGenBatch * kChunkVol);
+    std::vector<uint32_t> verdict(kGenBatch, 0u);
+    std::vector<uint32_t> vox;   // words: only for the check / a fallback
     batch.reserve(kGenBatch);
     for (uint32_t base = 0; base < kNumSlots; base += kGenBatch) {
       const uint32_t n = std::min(kGenBatch, kNumSlots - base);
@@ -1854,10 +1874,39 @@ void SubmitWorldgen(GpuContext& ctx, World& world, Simulation& sim, uint32_t see
       // Classify and demote, which returns the all-air pages to the free list
       // for the next batch. This is the compaction §3.5c calls for, run
       // eagerly once per batch rather than on the hysteresis cadence.
-      ReadVoxelsSync(ctx, world, base, n, vox.data(), "wgClassify");
+      //
+      // ON THE GPU'S VERDICT, NOT THE WORDS. genChunk's `list` entry reduces
+      // PageTable::Classify's three tests over the words it wrote and
+      // publishes the class into genAct (world.h kGenVerdict*), so a batch
+      // costs an 8 KiB readback instead of ReadVoxelsSync's 32 MiB — 512 MiB
+      // per paged worldgen, which startup, every menu regen, vk_smoke and
+      // ~220 selftest regens used to pay, plus a CPU Classify of 32,768
+      // chunks. The words are read only to CHECK the verdict
+      // (SANDVOX_GEN_VERDICT_CHECK=1) or when a verdict was not published.
+      rhi::ReadbackBlocking(ctx.device, ctx.queue, world.genAct, 0,
+                            verdict.data(), (size_t)n * 4, "wgVerdict");
+      bool needWords = kVerdictCheck;
+      for (uint32_t k = 0; k < n && !needWords; k++)
+        if ((verdict[k] & kGenVerdictValid) == 0u) needWords = true;
+      if (needWords) {
+        if (vox.size() < (size_t)kGenBatch * kChunkVol)
+          vox.resize((size_t)kGenBatch * kChunkVol);
+        ReadVoxelsSync(ctx, world, base, n, vox.data(), "wgClassify");
+      }
       for (uint32_t k = 0; k < n; k++) {
-        const uint32_t e =
-            world.pages->Classify(base + k, vox.data() + (size_t)k * kChunkVol);
+        uint32_t e = world.pages->ClassifyGenVerdict(verdict[k], seed);
+        if (needWords) {
+          const uint32_t ew = world.pages->Classify(
+              base + k, vox.data() + (size_t)k * kChunkVol);
+          if (kVerdictCheck && (verdict[k] & kGenVerdictValid) != 0u) {
+            verdictChecked++;
+            if (ew != e && verdictMismatch++ < 8)
+              std::printf("[genverdict] MISMATCH slot %u: verdict 0x%08x -> "
+                          "0x%08x, Classify(words) 0x%08x\n",
+                          base + k, verdict[k], e, ew);
+          }
+          e = ew;
+        }
         if (e != PageTable::kNeedsPage) world.pages->SetSentinel(base + k, e);
       }
       world.pages->FlushTableWrites(ctx.queue);
@@ -1893,8 +1942,8 @@ void SubmitWorldgen(GpuContext& ctx, World& world, Simulation& sim, uint32_t see
     // GPU's dirty buffer IS the wake, so a mirror taken from it cannot
     // disagree with it; a second implementation of the act predicate is the
     // divergence rule 3 of the design guidelines forbids. 128 KiB once per
-    // worldgen, beside the 16 synchronous 32 MiB voxel reads the loop above
-    // already pays.
+    // worldgen, beside the sixteen 8 KiB verdict reads the loop above pays
+    // (it was sixteen 32 MiB voxel reads before the GPU verdict).
     //
     // RefilledSlot, NOT WakeAll, and the difference is CLAUDE.md rule 2.
     // Contributor (d) is defined for precisely this case ("a slot the CPU
@@ -1920,21 +1969,19 @@ void SubmitWorldgen(GpuContext& ctx, World& world, Simulation& sim, uint32_t see
       }
     }
 
-    // ZERO THE FAULT COUNTER AFTER WORLDGEN, and only here.
+    // ZERO THE FAULT COUNTER AFTER WORLDGEN.
     //
-    // Worldgen is the one writer that legitimately stores through sentinels:
-    // genChunk writes all 4,096 cells of every slot in its batch, and the
-    // batches it does NOT currently hold are PT_EMPTY by construction (that is
-    // what makes a 8,192-page pool able to generate 32,768 slots at all). Those
-    // stores no-op and count, so the counter reaches exactly
-    // kNumChunks * kChunkVol = 134,217,728 before tick 1 — in a run that is
-    // otherwise perfectly correct. Measured identically on quiet-paged, which
-    // is 5/5 MATCH, so it is a startup artifact and not a lost voxel.
-    //
-    // The invariant the gates actually assert is about the TICK LOOP: no sim
-    // kernel may write through a sentinel. Zeroing here is what makes the
-    // counter mean that, and it is why the dense run (identity map, nothing to
-    // fault on) reads 0 both before and after this line.
+    // HISTORY, not the current mechanism: the whole-window `main` dispatch
+    // this path replaced stored through every slot a 8,192-page pool did not
+    // hold, and those no-op stores counted — exactly kNumChunks * kChunkVol =
+    // 134,217,728 before tick 1 in an otherwise correct run. The BATCHED
+    // path above never does that: `list` writes only genList's slots, and
+    // every one of them was given a page (EnsurePageForOverwrite) before its
+    // dispatch, so a correct worldgen adds nothing to the counter and
+    // ResetAllEmpty already zeroed it at the top. This write is kept as the
+    // statement of what the gates assert — the TICK LOOP never writes through
+    // a sentinel — and so that a counter left over from a pre-reset world
+    // cannot leak into the first tick's reading.
     const uint32_t faultZero[kPageFaultWords] = {};
     ctx.queue.WriteBuffer(world.pageFaults, 0, faultZero, sizeof(faultZero));
     std::printf("worldgen (paged, %u-slot batches): %u pages in use "
@@ -1943,6 +1990,12 @@ void SubmitWorldgen(GpuContext& ctx, World& world, Simulation& sim, uint32_t see
                 (double)world.pages->PagesInUse() * kChunkVol * 4.0 / 1048576.0,
                 (double)world.pages->PoolPages() * kChunkVol * 4.0 / 1048576.0,
                 world.pages->PagesHighWater(), woken);
+    if (kVerdictCheck)
+      std::printf("[genverdict] worldgen check: %llu verdicts vs "
+                  "Classify(words), %llu mismatch%s\n",
+                  (unsigned long long)verdictChecked,
+                  (unsigned long long)verdictMismatch,
+                  verdictMismatch == 1 ? "" : "es");
     return;
   }
 }
@@ -2024,6 +2077,9 @@ uint32_t HashWorldNow(GpuContext& ctx, World& world, Simulation& sim, uint32_t s
   rhi::CommandEncoder enc = ctx.device.CreateCommandEncoder();
   sim.EncodeHashOnly(enc);
   ctx.queue.Submit(enc.Finish());
+  // ho_occupancyFull rewrote the per-chunk digest table outside a hash tick,
+  // so the next snapshot must copy it rather than inherit the previous one.
+  world.NoteChunkHashWritten();
   return ReadHashSync(ctx, world);
 }
 
@@ -2304,21 +2360,13 @@ void ReadVoxelsSync(GpuContext& ctx, World& world, uint32_t firstSlot,
     const uint64_t off = world.PageOffsetOfSlot(firstSlot + i);
     if (off == World::kNoPage) {
       // Sentinel: synthesize, through the same rule the shader uses.
-      // POSITIONAL: SynthWordAt collapses to SynthWord for EMPTY/UNIFORM, so
-      // one loop serves every sentinel form. A JITTER chunk read back through
-      // here (the worldgen compaction classifier does exactly that) must see
-      // the same words the GPU would, or classification would refuse chunks it
-      // had itself just promoted.
-      const uint32_t e = world.PageEntryOfSlot(firstSlot + i);
-      const IVec3 wc = world.SlotToWorldChunk(firstSlot + i);
-      const int bx = wc.x * (int)kChunk, by = wc.y * (int)kChunk,
-                bz = wc.z * (int)kChunk;
-      uint32_t* dst = out + (size_t)i * kChunkVol;
-      for (uint32_t k = 0; k < kChunkVol; k++)
-        dst[k] = SynthWordAt(e, bx + (int)(k % kChunk),
-                             by + (int)((k / kChunk) % kChunk),
-                             bz + (int)(k / (kChunk * kChunk)),
-                             world.pages->WorldSeed());
+      // POSITIONAL (JITTER), so the world chunk travels. A JITTER chunk read
+      // back through here must see the same words the GPU would, or a
+      // classifier would refuse chunks it had itself just promoted. world.h
+      // SynthChunkWords is the one whole-chunk form of SynthWordAt.
+      SynthChunkWords(world.PageEntryOfSlot(firstSlot + i),
+                      world.SlotToWorldChunk(firstSlot + i),
+                      world.pages->WorldSeed(), out + (size_t)i * kChunkVol);
       i++;
       continue;
     }

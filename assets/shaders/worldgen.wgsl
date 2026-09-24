@@ -40,14 +40,32 @@
 // drains at the head of the next command buffer, and the deferred writes
 // interleave (see world.cpp).
 @group(0) @binding(19) var<storage, read> pageFillList : array<u32>;
-// THE DEFERRED-WAKE SIDE CHANNEL (docs/RESEARCH_streaming_hitch.md R1).
-// One u32 per genList POSITION: 1 if this entry's chunk holds a cell that can
-// act, 0 otherwise. Written only when T.genDeferWake is set (a window shift);
-// the CPU reads it back asynchronously and puts the act set into dirtyIn
-// kWakeLatency ticks later, which is what lets the shift stop fencing.
+// THE GENERATION VERDICT (docs/RESEARCH_streaming_hitch.md R1; world.h's
+// kGenVerdict* block is the CPU half of this layout).
+// One u32 per genList POSITION, written by the `list` entry point for every
+// position below arrayLength(genAct):
+//   bit 0      the chunk holds a cell that can act — the deferred wake's act
+//              set (the whole word was this bit before the classification
+//              joined it). The CPU reads it back asynchronously when
+//              T.genDeferWake is set and puts the act set into dirtyIn
+//              kWakeLatency ticks later, which is what lets the shift stop
+//              fencing.
+//   bit 1      GEN_V_VALID: the class below was published
+//   bits 2..3  the chunk's page-table class, PageTable::Classify's answer to
+//              the words just written: 0 needs a page, 1 EMPTY, 2 UNIFORM,
+//              3 JITTER — so neither the batched worldgen nor a shift's full
+//              chunks have to read 16 KiB of words back to demote
+//   bits 4..15 the material, for UNIFORM / JITTER
 // Binding 30 exists ONLY in simBGL_ — `far`/`fardown` run on the slim group
 // and never reach genChunk, exactly like pageFillList at 19.
 @group(0) @binding(30) var<storage, read_write> genAct : array<u32>;
+const GEN_V_ACT : u32 = 1u;
+const GEN_V_VALID : u32 = 2u;
+const GEN_V_CLASS_SHIFT : u32 = 2u;
+const GEN_V_EMPTY : u32 = 1u;
+const GEN_V_UNIFORM : u32 = 2u;
+const GEN_V_JITTER : u32 = 3u;
+const GEN_V_MAT_SHIFT : u32 = 4u;
 // The BAKED TREE ATLAS (src/sim/treeatlas.h). Read-only asset data uploaded
 // once at load, like `materials` — see the tree section below for the layout
 // and for why worldgen samples a baked grid instead of evaluating tree shapes.
@@ -4510,6 +4528,13 @@ var<workgroup> wgAct : atomic<u32>;
 // sim_occupancy's dirty pass. Streamed-in terrain would keep its pessimistic
 // mask for as long as the player stayed near it.
 var<workgroup> wgSub : array<atomic<u32>, 4>;
+// The verdict's second sweep (see the tail of genChunk): whether the chunk is
+// FULL (read through workgroupUniformLoad, so the sweep's barriers sit in
+// uniform control flow), and whether any cell differs from cell 0's word /
+// from the JITTER synthesis at its position.
+var<workgroup> wgGenFull : u32;
+var<workgroup> wgNotEq : atomic<u32>;
+var<workgroup> wgNotJit : atomic<u32>;
 
 fn storeSubOcc(slot : u32, t0 : u32, t1 : u32, b0 : u32, b1 : u32) {
   occupancy[subOccIndex(slot, 0u, 0u)] = t0;
@@ -4519,14 +4544,17 @@ fn storeSubOcc(slot : u32, t0 : u32, t1 : u32, b0 : u32, b1 : u32) {
 }
 
 // `actIdx` is the caller's position in genList — the index genAct is keyed on.
-// It is only read when T.genDeferWake is set, which only the streaming `list`
-// entry point ever sees; the dense `main` path passes its own workgroup id and
-// never defers.
-fn genChunk(slot : u32, li : u32, actIdx : u32) {
+// `publish` is true for the streaming `list` entry point, which writes the
+// verdict word (act bit + page-table class) for every position genAct holds;
+// the dense `main` path passes false and its own workgroup id, publishes
+// nothing and never defers.
+fn genChunk(slot : u32, li : u32, actIdx : u32, publish : bool) {
   if (li == 0u) {
     atomicStore(&wgCount, 0u);
     atomicStore(&wgBlock, 0u);
     atomicStore(&wgAct, 0u);
+    atomicStore(&wgNotEq, 0u);
+    atomicStore(&wgNotJit, 0u);
     atomicStore(&wgSub[0], 0u);
     atomicStore(&wgSub[1], 0u);
     atomicStore(&wgSub[2], 0u);
@@ -4768,8 +4796,10 @@ fn genChunk(slot : u32, li : u32, actIdx : u32) {
     // optional in that mode — the slot may carry the previous occupant's
     // dirty flag, and leaving it set would dispatch the CA over a plane whose
     // neighbourhood the mirror has not materialized yet.
+    //
+    // The genAct word itself is written at the very end, once the verdict's
+    // second sweep below has run: it carries this act bit AND the class.
     if (T.genDeferWake != 0u) {
-      genAct[actIdx] = select(0u, 1u, canAct);
       atomicStore(&dirtyIn[slot], 0u);
       atomicStore(&dirtyOut[slot], 0u);
     } else if (canAct) {
@@ -4779,14 +4809,91 @@ fn genChunk(slot : u32, li : u32, actIdx : u32) {
       atomicStore(&dirtyIn[slot], 0u);
       atomicStore(&dirtyOut[slot], 0u);
     }
+    wgGenFull = select(0u, 1u, n == CHUNK_VOL);
+  }
+
+  // ---- THE GENERATION VERDICT (world.h kGenVerdict*) -------------------
+  //
+  // PageTable::Classify's answer for the words this workgroup just wrote,
+  // reduced here instead of on the CPU — which used to read every generated
+  // chunk back (16 x 32 MiB synchronous per worldgen) or, on a shift, every
+  // FULL one (16 KiB each, harvested frames later). Same tests, same order:
+  //
+  //   EMPTY    count == 0. Exact, not a hint: genCellIn returns 0u for air
+  //            and worldgen writes no stain and no bit 31, so every word is
+  //            0 and Classify's stainless-air mask holds in all 4,096 cells
+  //            (the argument ApplyGenVerdict's sky demote already makes).
+  //   mixed    0 < count < 4,096: some cell is air and some is not, so the
+  //            words are not all equal and not all one material — no
+  //            sentinel form, class 0.
+  //   FULL     count == 4,096: the only case that needs the words. One more
+  //            sweep reads them back (storageBarrier: they were written by
+  //            other threads of this workgroup) and asks the two remaining
+  //            questions: all equal to cell 0's word (UNIFORM, if that word
+  //            is exactly synthWord's), else every cell exactly the JITTER
+  //            synthesis for cell 0's material at its world position,
+  //            stamp included. Buried bulk only; sky and surface never pay.
+  //
+  // The CPU applies Classify's two refusals the kernel cannot see (JITTER
+  // disabled, a mismatched seed) in PageTable::ClassifyGenVerdict.
+  if (!publish) { return; }
+  let full = workgroupUniformLoad(&wgGenFull);
+  var w0 = 0u;
+  if (full != 0u) {
+    storageBarrier();
+    let e = pageTable[slot];
+    if ((e & PT_SENTINEL_BIT) == 0u) {
+      let pageBase = e * CHUNK_VOL;
+      w0 = voxels[pageBase];
+      let jEntry = PT_SENTINEL_BIT | PT_JITTER_BIT | (w0 & PT_MAT_MASK);
+      var ne = 0u;
+      var nj = 0u;
+      for (var ci = li; ci < CHUNK_VOL; ci += 64u) {
+        let w = voxels[pageBase + ci];
+        ne |= w ^ w0;
+        if (nj == 0u) {
+          let lc = vec3<i32>(i32(ci % CHUNK), i32((ci / CHUNK) % CHUNK),
+                             i32(ci / (CHUNK * CHUNK)));
+          nj |= w ^ synthWordAt(jEntry, base + lc, T.seed);
+        }
+      }
+      if (ne != 0u) { atomicOr(&wgNotEq, 1u); }
+      if (nj != 0u) { atomicOr(&wgNotJit, 1u); }
+    } else {
+      // No page to read (cannot happen: every genList slot is materialized
+      // before the dispatch) — publish no sentinel claim.
+      if (li == 0u) {
+        atomicOr(&wgNotEq, 1u);
+        atomicOr(&wgNotJit, 1u);
+      }
+    }
+    workgroupBarrier();
+  }
+  if (li == 0u && actIdx < arrayLength(&genAct)) {
+    let n = atomicLoad(&wgCount);
+    let mat = w0 & PT_MAT_MASK;
+    var cls = 0u;
+    if (n == 0u) {
+      cls = GEN_V_EMPTY;
+    } else if (full != 0u) {
+      if (atomicLoad(&wgNotEq) == 0u) {
+        if (synthWord(PT_SENTINEL_BIT | mat) == w0) { cls = GEN_V_UNIFORM; }
+      } else if (atomicLoad(&wgNotJit) == 0u) {
+        cls = GEN_V_JITTER;
+      }
+    }
+    genAct[actIdx] = select(0u, GEN_V_ACT, atomicLoad(&wgAct) > 0u) |
+                     GEN_V_VALID | (cls << GEN_V_CLASS_SHIFT) |
+                     (mat << GEN_V_MAT_SHIFT);
   }
 }
 
-// The whole slot space: NUM_SLOTS workgroups.
+// The whole slot space: NUM_SLOTS workgroups. Publishes no verdict (genAct is
+// sized for a list, and nothing classifies a dense whole-world dispatch).
 @compute @workgroup_size(64)
 fn main(@builtin(workgroup_id) wg : vec3<u32>,
         @builtin(local_invocation_index) li : u32) {
-  genChunk(wg.x, li, wg.x);
+  genChunk(wg.x, li, wg.x, false);
 }
 
 // Streamed-in chunks: T.genCount slot indices from genList.
@@ -4798,7 +4905,7 @@ fn list(@builtin(workgroup_id) wg : vec3<u32>,
   // SubmitTick's batched worldgen), and the fault record has to say which.
   gPtKernel = PT_K_GENLIST;
   if (wg.x >= T.genCount) { return; }
-  genChunk(genList[wg.x], li, wg.x);
+  genChunk(genList[wg.x], li, wg.x, true);
 }
 
 // ---- JITTER page materialization (world.h's JITTER block) ----------------

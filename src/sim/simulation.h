@@ -246,6 +246,10 @@ class Simulation {
   // Whether the CA rows would be recorded for the NEXT tick. Measurement and
   // gates only — nothing in the sim may branch on this.
   bool CaSkipped() const { return caSkipped_; }
+  // Whether the last EncodeTick recorded the MPM seam (and so its last row,
+  // the swimming fold). The snapshot readback copies the fold only then.
+  // Readback plumbing only — nothing in the sim may branch on this either.
+  bool FluidSeamRecorded() const { return fluidSeamRecorded_; }
   uint64_t CaSkipCount() const { return caSkipCount_; }
   // MEASUREMENT / TEST ONLY: force the CA rows to be recorded every tick, i.e.
   // defeat the §3.4 skip. Two uses, both of which need it to be a switch rather
@@ -858,6 +862,7 @@ class Simulation {
   uint32_t curTick_ = 0;        // tick being encoded (NoteTickInputs)
   bool settledProven_ = false;  // a fresh snapshot showed 0 active chunks
   bool caSkipped_ = false;      // last EncodeTick omitted the CA rows
+  bool fluidSeamRecorded_ = false;  // last EncodeTick recorded the MPM seam
   uint64_t caSkipCount_ = 0;    // how many ticks skipped (measurement only)
   bool caForced_ = false;       // SetCaForced / SANDVOX_CA_FORCE (test only)
 };

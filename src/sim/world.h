@@ -4,6 +4,7 @@
 #include <cstdint>
 #include <deque>
 #include <functional>
+#include <memory>
 #include <string>
 #include <unordered_map>
 #include <vector>
@@ -796,7 +797,8 @@ inline GasSpawnOp MakeGasSpawn(int32_t cx, int32_t cy, int32_t cz,
 constexpr uint32_t kFluidCap = 262144;            // hard particle budget (rule 2)
 constexpr uint32_t kMaxFluidSpawnsPerTick = 4096; // spawn-op stream cap
 // Sparse scratch-grid blocks: one 16^3 node block per ACTIVE chunk slot,
-// allocated per substep by a deterministic scan. 256 blocks * 4096 nodes *
+// allocated once per TICK by a deterministic scan (the FluidMap table is
+// recorded once, not per substep — see simulation.cpp's seam recording). 256 blocks * 4096 nodes *
 // 32 B = 32 MiB, and bounds simultaneously-active fluid to 256 chunks.
 constexpr uint32_t kFluidBlocks = 256;
 // MPM substeps per 30 Hz tick — the FALLBACK DEFAULT only. Since WP3 this is
@@ -1798,6 +1800,44 @@ inline uint32_t JitterRowSeed(int y, int z, uint32_t seed) {
 inline uint32_t JitterStateInRow(uint32_t rowSeed, int x, uint32_t seed) {
   // rowSeed = Pcg(y) ^ (z << 12); b ^ Pcg(c) = (x ^ (z<<12)) ^ Pcg(y) = x ^ rowSeed
   return (rng::Pcg((seed ^ 0xC0FFEEu) ^ rng::Pcg((uint32_t)x ^ rowSeed))) % 3u;
+}
+
+// The 4,096 words a SENTINEL chunk reads as, written chunk-linear into `dst`
+// (index = (lz * 16 + ly) * 16 + lx, the voxel buffer's own order). `wc` is
+// the WORLD chunk, because JITTER is positional. ONE copy of the three cases
+// every whole-chunk synthesis site used to spell out for itself (the snapshot
+// mirror, the fetch cache, ReadVoxelsSync's slow form):
+//   - air, whatever the JITTER bit says: all zeros (SynthWordAt returns 0 for
+//     air, so the row branch below would produce 0 | state << 12 instead);
+//   - non-JITTER: one word, SynthWord(entry);
+//   - JITTER: row order, JitterRowSeed hoisting Pcg(y) and the z term.
+// Strictly derived from SynthWordAt, like the row helpers above — the
+// page-roundtrip gate compares the two. RleEncodeSentinelChunk (stream.cpp)
+// fuses this with its run scan and Classify VERIFIES rather than writes, so
+// neither calls it.
+inline void SynthChunkWords(uint32_t entry, IVec3 wc, uint32_t seed,
+                            uint32_t* dst) {
+  const uint32_t mat = entry & kPtMatMask;
+  if (mat == kMatAir) {
+    for (uint32_t i = 0; i < kChunkVol; i++) dst[i] = 0u;
+    return;
+  }
+  if ((entry & kPtJitterBit) == 0u) {
+    const uint32_t w = SynthWord(entry);
+    for (uint32_t i = 0; i < kChunkVol; i++) dst[i] = w;
+    return;
+  }
+  const int bx = wc.x * (int)kChunk, by = wc.y * (int)kChunk,
+            bz = wc.z * (int)kChunk;
+  const uint32_t stampBits = kStampNever << kStampShift;
+  uint32_t i = 0;
+  for (int lz = 0; lz < (int)kChunk; lz++)
+    for (int ly = 0; ly < (int)kChunk; ly++) {
+      const uint32_t rowSeed = JitterRowSeed(by + ly, bz + lz, seed);
+      for (int lx = 0; lx < (int)kChunk; lx++, i++)
+        dst[i] = mat | (JitterStateInRow(rowSeed, bx + lx, seed) << 12) |
+                 stampBits;
+    }
 }
 
 // ---- the stain layer (DESIGN.md §3) ----
@@ -3138,7 +3178,7 @@ constexpr int kFluidRenderPadVox = 2 * (int)kChunk;
 
 // ---- far-field cascades (render-only LOD — DESIGN.md §9,
 // docs/PLAN_far_field_cascades.md) ----
-// kFarLevels nested toroidal 256^3 volumes around the residency window; level
+// kFarLevels nested toroidal kFarN^3 (512^3) volumes around the residency window; level
 // k (1-based) cells are 2^k fine voxels, so each level doubles view distance
 // at constant memory. Derived data: filled from worldgen on the GPU, never
 // read by the sim, excluded from the world hash — determinism rule #1 is
@@ -3390,8 +3430,11 @@ struct WorldSnapshot {
   // `chunkHashTick` — a table from tick 30 is a perfectly good description of
   // tick 30 and says nothing about tick 34.
   //
-  // Empty until the first full pass has been read back.
-  std::vector<uint32_t> chunkHash;
+  // Null/empty until the first full pass has been read back. SHARED between
+  // consecutive snapshots: the readback copies the 128 KiB table only on ticks
+  // that can have rewritten it (World::EncodeReadbacks' hashTick), and every
+  // other snapshot points at the table it inherited — immutable once parsed.
+  std::shared_ptr<const std::vector<uint32_t>> chunkHash;
   uint32_t chunkHashTick = 0;
   // Page faults since process start — voxStore()'s sentinel no-op path
   // (PLAN_page_table.md §2.4). MONOTONIC and never cleared: a non-zero value is
@@ -3440,6 +3483,41 @@ struct CachedChunk {
   std::vector<uint32_t> voxels;       // kChunkVol words
 };
 
+// ---- THE GENERATION VERDICT (genAct's word) ------------------------------
+//
+// genChunk's `list` entry point publishes one u32 per genList position into
+// `genAct`: the deferred wake's act bit (bit 0, the only thing the word held
+// before) plus the chunk's PAGE-TABLE CLASSIFICATION, reduced on the GPU over
+// the words it just wrote. That second half is what lets the batched worldgen
+// (test/support.cpp SubmitWorldgen) and a window shift's FULL chunks
+// (Stream::ApplyGenVerdict) demote without reading 16 KiB of words per chunk
+// back to the CPU — the worldgen read was 16 x 32 MiB synchronous, 512 MiB per
+// regen. The class is PageTable::Classify's answer to the same words, in the
+// same order (EMPTY, then whole-word UNIFORM, then JITTER) — see
+// PageTable::ClassifyGenVerdict for the one CPU decoder and
+// SANDVOX_GEN_VERDICT_CHECK=1 for the cross-check against Classify.
+//
+// EXACT MIRROR of the GEN_V_* consts in worldgen.wgsl (its only writer).
+constexpr uint32_t kGenVerdictAct = 1u << 0;     // a cell can act (deferred wake)
+constexpr uint32_t kGenVerdictValid = 1u << 1;   // the class below was published
+constexpr uint32_t kGenVerdictClassShift = 2;    // 2 bits:
+constexpr uint32_t kGenVerdictClassMask = 0x3u;
+constexpr uint32_t kGenVerdictNeedsPage = 0;     //   mixed: no sentinel form
+constexpr uint32_t kGenVerdictEmpty = 1;         //   PT_EMPTY
+constexpr uint32_t kGenVerdictUniform = 2;       //   UNIFORM(mat)
+constexpr uint32_t kGenVerdictJitter = 3;        //   JITTER(mat)
+constexpr uint32_t kGenVerdictMatShift = 4;      // 12 bits of material
+// Slots per batched-worldgen dispatch (SubmitWorldgen): the transient page
+// demand of one batch, and so the pool headroom a regen needs. It is NOT a
+// readback-ring quantity — nothing about it follows from kReadbackSlots.
+constexpr uint32_t kWorldgenBatch = 2048;
+// genAct holds one verdict per genList position, so it must cover the widest
+// list that asks for one: a shift plane (kNChunk^2, the deferred wake) or a
+// worldgen batch. A longer list (ReloadWindow's whole window) is bounds-checked
+// in the kernel and simply publishes nothing past this.
+constexpr uint32_t kGenActEntries =
+    kWorldgenBatch > kNChunk * kNChunk ? kWorldgenBatch : kNChunk * kNChunk;
+
 // Owns every GPU buffer of the simulation plus the async readback ring.
 class World {
  public:
@@ -3449,9 +3527,29 @@ class World {
   // passes. Returns false if all ring slots are still in flight (skip copies).
   // particleLivePage: which particleCounts index holds the post-tick count.
   // tick: the sim tick being encoded (stamps the snapshot + fetched chunks).
+  //
+  // The two 100+ KiB tables that are usually unchanged are copied only when
+  // they can have changed (the rest of the slot is ~0.8 MiB at rest):
+  //   hashTick      — the tick recorded the FULL occupancy pass, the only
+  //                   in-tick writer of the per-chunk digest table. A slot
+  //                   without the copy SHARES the previous snapshot's table
+  //                   (WorldSnapshot::chunkHash is a shared pointer), which is
+  //                   what the GPU buffer still holds. Every out-of-tick
+  //                   writer forces the next copy: InvalidateSnapshot
+  //                   (worldgen, load reset, tick rewind) and
+  //                   NoteChunkHashWritten (the hash-only pass).
+  //   fluidRecorded — the MPM seam was recorded this tick, the only writer of
+  //                   the swimming fold. With no seam there is no live fluid
+  //                   (the seam's recording predicate covers every particle,
+  //                   Simulation::EncodeTick), and the parse zero-fills.
+  // Both default to true, which is the old copy-everything behaviour.
   bool EncodeReadbacks(const rhi::Device& device, const rhi::CommandEncoder& enc,
                        IVec3 playerChunkBase, uint32_t particleLivePage,
-                       uint32_t tick);
+                       uint32_t tick, bool hashTick = true,
+                       bool fluidRecorded = true);
+  // Something outside a hash tick rewrote the digest table (the standalone
+  // hash-only pass): make the next readback copy it rather than share.
+  void NoteChunkHashWritten() { chunkHashForce_ = true; }
 
   // Excited-fluid eighths (0..8) at a world cell, from the snapshot's fluid
   // mirror fold. 0 outside the 3x3x3 mirror, when no snapshot exists, or
@@ -3730,7 +3828,9 @@ class World {
   // any window origin, and whether the chunk is a real page or a sentinel.
   uint32_t ChunkHashOfSlot(uint32_t slot) const {
     const WorldSnapshot& s = snap_;
-    return (s.valid && slot < s.chunkHash.size()) ? s.chunkHash[slot] : 0u;
+    return (s.valid && s.chunkHash && slot < s.chunkHash->size())
+               ? (*s.chunkHash)[slot]
+               : 0u;
   }
   // The tick the digest table above describes. Zero means "no full pass has
   // been read back yet". Always <= Snap().tick.
@@ -4307,7 +4407,7 @@ class World {
   rhi::Buffer pageFillList;    // JITTER materialization: (slot, entry) pairs
 
   // ---- far-field cascades (render-only; never bound in any sim pipeline) ----
-  rhi::Buffer farVox;   // kFarLevels x 256^3 material bytes, packed 4/u32
+  rhi::Buffer farVox;   // kFarLevels x kFarN^3 material bytes, packed 4/u32
                          // (atomic in the fill/downsample kernels: partial-word
                          // byte updates from neighboring dirty chunks race)
   rhi::Buffer farOcc;   // kFarLevels x kNumChunks u32 non-air counts
@@ -4348,9 +4448,12 @@ class World {
   //
   // COST: one slot is a mapped host-visible staging buffer of
   //   27 x 16 KiB mirror + 128 KiB dirty + 128 KiB occupancy + 128 KiB support
-  //   + 108 KiB fluid mirror + ~2 KiB of small tables
+  //   + 108 KiB fluid mirror + 128 KiB per-chunk digest + ~2 KiB small tables
   //   + kFetchPerTick x 16 KiB chunk fetches (1 MiB, the biggest single term)
-  // = 1,997,056 B = 1.904 MiB. 16 slots is 30.5 MiB, up from 5.7 MiB at three.
+  // ~= 2.03 MiB. 16 slots is ~32.5 MiB, up from 5.7 MiB at three. The slot is
+  // SIZED for all of it; what is COPIED per tick is less — sentinel mirror
+  // chunks and fetches are skipped, the digest rides hash ticks only and the
+  // fluid fold only ticks that recorded the seam (EncodeReadbacks).
   // That is against a 360 MiB page pool and a 512 MiB voxel binding, and it is
   // the price of never refusing a snapshot the mirror's freshness depends on.
   //
@@ -4383,6 +4486,11 @@ class World {
     // consumption. 0 means "a real copy was issued for this index".
     std::vector<uint32_t> fetchSentinel;
     std::array<uint32_t, 27> mirrorSentinel{};
+    // Which of the two conditional tables this slot's copy carries (see
+    // EncodeReadbacks). A slot without the digest shares the previous
+    // snapshot's; a slot without the fold parses as no water.
+    bool hashCopied = true;
+    bool fluidCopied = true;
   };
   static constexpr int kSlots = kReadbackSlots;
   Slot slots_[kSlots];
@@ -4457,4 +4565,11 @@ class World {
   // N?", so the cap costs nothing and the array costs 64 KiB instead of 128.
   std::vector<uint16_t> quietTicks_;
   std::vector<uint8_t> snapBounce_;
+  // The digest table of the most recently PARSED snapshot, which a slot that
+  // skipped the copy inherits. Callbacks parse in submission order, so this is
+  // always the table of the newest earlier tick. Dropped on a reset.
+  std::shared_ptr<const std::vector<uint32_t>> lastChunkHash_;
+  // The next readback must copy the digest table even on a non-hash tick:
+  // something outside the tick recurrence rewrote it (see EncodeReadbacks).
+  bool chunkHashForce_ = true;
 };
