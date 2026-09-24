@@ -202,6 +202,10 @@ struct Buffer {
   uint64_t flushTouch = 0;
   bool zeroFillSuperseded = false;
   std::string label;
+  // The Vulkan usage flags it was created with; read by the recorder to name
+  // a copy source that lacks TRANSFER_SRC (the validation message only
+  // gives a handle).
+  VkBufferUsageFlags usage = 0;
 };
 
 // --------------------------------------------------------------- image ----

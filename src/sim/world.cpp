@@ -145,7 +145,7 @@ void World::Init(const rhi::Device& device) {
   // Shadow cache (world.h kShadowCacheBuckets). CopyDst so a zero-fill can
   // reset it; never CopySrc — nothing reads it back, and a readback here would
   // put a fence in the frame path.
-  shadowCache = CreateBuffer(device, kShadowCacheBytes, U::Storage | U::CopyDst,
+  shadowCache = CreateBuffer(device, kShadowCacheBytes, U::Storage | U::CopySrc | U::CopyDst,
                              "shadowCache");
   // CopySrc for the stats words only: --render-budget reads back the request
   // count and the overflow after a frame. Diagnostics, never the frame path.

@@ -789,6 +789,7 @@ Buffer* Backend::CreateBuffer(uint64_t size, rhi::BufferUsage usage, const char*
   // POLICY, and paying it everywhere is what makes the policy a mechanism
   // rather than a list somebody has to maintain correctly (barrier_graph §4.8).
   bci.usage = ToVkUsage(usage) | VK_BUFFER_USAGE_TRANSFER_DST_BIT;
+  b->usage = bci.usage;
   bci.sharingMode = VK_SHARING_MODE_EXCLUSIVE;
 
   VmaAllocationCreateInfo aci{};

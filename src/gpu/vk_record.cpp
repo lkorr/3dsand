@@ -13,6 +13,19 @@
 
 #include "sim/world.h"  // kExplosionWg, kNumChunks (pass::kPassStride is in pass_table.h)
 
+// A copy whose source lacks TRANSFER_SRC is a validation error that names
+// only a handle. Name the buffer (once per buffer) so the culprit is one
+// line of output, not an elimination hunt (CLAUDE.md rule 6).
+static void WarnCopySrc(const vk::Buffer* src) {
+  if (!src || (src->usage & VK_BUFFER_USAGE_TRANSFER_SRC_BIT)) return;
+  static std::vector<const vk::Buffer*> seen;
+  for (const vk::Buffer* b : seen) if (b == src) return;
+  seen.push_back(src);
+  std::fprintf(stderr, "[copy-src] buffer '%s' is a copy source but was created without CopySrc\n",
+               src->label.c_str());
+  std::fflush(stderr);
+}
+
 namespace vk {
 
 // A SILENT OVERFLOW MADE LOUD. Both pipeline tables -- `Bindings::pipelines` in
@@ -517,6 +530,7 @@ void Recorder::RecordTable(pass::Table which, const RecordCtx& cx) {
         region.srcOffset = r.x;
         region.dstOffset = r.y;
         region.size = r.z;
+        WarnCopySrc(src);
         f.CmdCopyBuffer(cmd_, src->buf, dst->buf, 1, &region);
         if (dst->mapped) hostWritten_.push_back(dst);
       }
@@ -730,6 +744,7 @@ void Recorder::CopyToHost(Buffer* src, uint64_t srcOffset, Buffer* dst,
   region.srcOffset = srcOffset;
   region.dstOffset = dstOffset;
   region.size = size;
+  WarnCopySrc(src);
   be_.Fns().CmdCopyBuffer(cmd_, src->buf, dst->buf, 1, &region);
   stats_.copies++;
   if (dst->mapped) hostWritten_.push_back(dst);
@@ -795,6 +810,7 @@ void Recorder::CopyTracked(pass::Buf srcId, Buffer* src, uint64_t srcOffset, Buf
   region.srcOffset = srcOffset;
   region.dstOffset = dstOffset;
   region.size = size;
+  WarnCopySrc(s);
   be_.Fns().CmdCopyBuffer(cmd_, s->buf, dst->buf, 1, &region);
   stats_.copies++;
   if (dst->mapped) hostWritten_.push_back(dst);
@@ -828,6 +844,7 @@ void Recorder::CopyTrackedRegions(pass::Buf srcId, Buffer* src, Buffer* dst,
     out[i].dstOffset = regions[i].dstOffset;
     out[i].size = regions[i].size;
   }
+  WarnCopySrc(s);
   be_.Fns().CmdCopyBuffer(cmd_, s->buf, dst->buf, (uint32_t)count, out);
   stats_.copies++;
   if (dst->mapped) hostWritten_.push_back(dst);
@@ -866,6 +883,7 @@ void Recorder::CopyRenderWritten(Buffer* src, uint64_t srcOffset, Buffer* dst,
   region.srcOffset = srcOffset;
   region.dstOffset = dstOffset;
   region.size = size;
+  WarnCopySrc(src);
   be_.Fns().CmdCopyBuffer(cmd_, src->buf, dst->buf, 1, &region);
   stats_.copies++;
   if (dst->mapped) hostWritten_.push_back(dst);
