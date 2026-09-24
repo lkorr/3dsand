@@ -24,45 +24,99 @@ IVec3 DesiredOrigin(IVec3 fineChunk, uint32_t k) {
 }  // namespace
 
 void FarField::Enqueue(uint32_t k, uint32_t slot) {
-  queue_.push_back((k << kFarSlotShift) | slot);
+  queue_[k].push_back(slot);
   pending_[k]++;
 }
 
-void FarField::EnqueuePlane(uint32_t k, int axis, int wcoord) {
+bool FarField::LevelChunkHitsWindow(uint32_t k, IVec3 lc) const {
+  if (!world_) return false;
+  // A level-k chunk (0-based k) spans 2^(k + 1 + kFarShiftBase) fine chunks
+  // per axis, aligned (FarEdits::LevelChunkOf is the same relation).
+  const int s = (int)(k + 1 + kFarShiftBase);
+  const IVec3 o = world_->WindowOrigin();
+  const int n = (int)kNChunk;
+  auto hit = [s, n](int l, int w) {
+    const int lo = l * (1 << s), hi = lo + (1 << s);
+    return lo < w + n && hi > w;
+  };
+  return hit(lc.x, o.x) && hit(lc.y, o.y) && hit(lc.z, o.z);
+}
+
+void FarField::DropPendingPlane(uint32_t k, int axis, int sa) {
+  // Newest first: a reversal undoes the MOST RECENT step on this axis. Every
+  // record before `r` owns a contiguous run of queue_[k] in record order (the
+  // front one partially popped, its `remaining` already net of that), so the
+  // dropped run starts at the sum of their remainders.
+  std::deque<PlaneRec>& recs = recs_[k];
+  for (size_t ri = recs.size(); ri-- > 0;) {
+    const PlaneRec& r = recs[ri];
+    if (r.axis != axis || r.sa != sa) continue;
+    size_t off = 0;
+    for (size_t j = 0; j < ri; j++) off += recs[j].remaining;
+    queue_[k].erase(queue_[k].begin() + (ptrdiff_t)off,
+                    queue_[k].begin() + (ptrdiff_t)(off + r.remaining));
+    pending_[k] -= r.remaining;
+    reversalDrops_ += r.remaining;
+    // Released exactly as PrepareTick releases a plane whose last entry
+    // popped: the slab it excluded is the layer the box just stepped back
+    // off, and the plane replacing it owns the layer that is stale now.
+    if (r.epoch == epoch_[k] && faces_[k][r.axis][r.side] > 0) {
+      faces_[k][r.axis][r.side]--;
+      uboDirty_ = true;
+    }
+    recs.erase(recs.begin() + (ptrdiff_t)ri);
+    return;
+  }
+}
+
+void FarField::EnqueuePlane(uint32_t k, int axis, int wcoord,
+                            const int skipSa[3]) {
   int m = (int)kFarNChunk - 1;
   int sa = wcoord & m;
+  // ---- A REVERSAL REFILLS THE SAME SLOTS -----------------------------------
+  // The box stepped one level chunk toward -axis after stepping toward +axis
+  // (or the reverse) before that step's plane had drained. The torus puts the
+  // new incoming layer in the SAME slot layer as the one the undone step
+  // queued — (o + N) & m == o & m — and a fill entry fills its slot under the
+  // origins current when it is DISPATCHED, so the pending plane would only
+  // write bytes this one is about to overwrite. Dropping it halves the work
+  // of a player pacing across a chunk boundary.
+  DropPendingPlane(k, axis, sa);
   // The incoming plane is the box's high face when the origin stepped toward
   // +axis (wcoord = o + N - 1) and its low face otherwise (wcoord = o).
   const int oa = axis == 0 ? origins_[k].x : axis == 1 ? origins_[k].y
                                                      : origins_[k].z;
   const int side = wcoord == oa + (int)kFarNChunk - 1 ? 1 : 0;
   planes_++;
-  recs_.push_back({k, axis, side, kFarNChunk * kFarNChunk, epoch_[k]});
-  faces_[k][axis][side]++;
-  uboDirty_ = true;
+  uint32_t n = 0;
   for (int b = 0; b < (int)kFarNChunk; b++) {
     for (int a = 0; a < (int)kFarNChunk; a++) {
       int s[3];
       s[axis] = sa;
       s[(axis + 1) % 3] = a;
       s[(axis + 2) % 3] = b;
+      // ---- A DIAGONAL STEP QUEUES THE CROSSING LINE ONCE -----------------
+      // Two planes of one Update cross in a line of kFarNChunk slots. The
+      // earlier plane already holds it, earlier in this level's FIFO, so its
+      // fill lands before this plane's last entry releases this face.
+      bool dup = false;
+      for (int e = 0; e < 3; e++)
+        if (e != axis && skipSa[e] >= 0 && s[e] == skipSa[e]) dup = true;
+      if (dup) { edgeDedupes_++; continue; }
       uint32_t slot = ((uint32_t)s[2] * kFarNChunk + (uint32_t)s[1]) * kFarNChunk +
                       (uint32_t)s[0];
       Enqueue(k, slot);
+      n++;
     }
   }
+  recs_[k].push_back({k, axis, side, sa, n, epoch_[k]});
+  faces_[k][axis][side]++;
+  uboDirty_ = true;
 }
 
 void FarField::PruneLevel(uint32_t k) {
-  if (pending_[k] == 0) return;
-  queue_.erase(std::remove_if(queue_.begin(), queue_.end(),
-                              [k](uint32_t e) {
-                                return (e >> kFarSlotShift) == k;
-                              }),
-               queue_.end());
-  recs_.erase(std::remove_if(recs_.begin(), recs_.end(),
-                             [k](const PlaneRec& r) { return r.level == k; }),
-              recs_.end());
+  queue_[k].clear();
+  recs_[k].clear();
   pending_[k] = 0;
   bulkPending_[k] = 0;
 }
@@ -76,24 +130,25 @@ void FarField::ResetLevel(uint32_t k, IVec3 desired) {
   PruneLevel(k);
   origins_[k] = desired;
   uboDirty_ = true;
-  sigClear_ = true;
+  // No farSig clear HERE: the entries that overlap the window raise it as
+  // they are dispatched (sigClear_), which is the only moment it is not racing
+  // the refill.
   for (uint32_t slot = 0; slot < kFarNumChunks; slot++) Enqueue(k, slot);
   bulkPending_[k] += kFarNumChunks;
   // Every plane record queued for this level is now meaningless — the whole
   // level is invalid until the reset lands — so it stops owning a face.
   epoch_[k]++;
   for (int a = 0; a < 3; a++) faces_[k][a][0] = faces_[k][a][1] = 0;
-  recs_.push_back({k, -1, 0, kFarNumChunks, epoch_[k]});
+  recs_[k].push_back({k, -1, 0, -1, kFarNumChunks, epoch_[k]});
 }
 
 void FarField::FullRefill(const InterestSet& interest) {
   if (interest.Empty()) return;
   const IVec3 playerChunk = interest.Primary();
   refills_++;
-  sigClear_ = true;
-  queue_.clear();
-  recs_.clear();
   for (uint32_t k = 0; k < kFarLevels; k++) {
+    queue_[k].clear();
+    recs_[k].clear();
     pending_[k] = 0;
     bulkPending_[k] = 0;
     for (int a = 0; a < 3; a++) faces_[k][a][0] = faces_[k][a][1] = 0;
@@ -102,7 +157,7 @@ void FarField::FullRefill(const InterestSet& interest) {
   // This ran COARSEST first, on the argument that "a horizon band appears
   // before the near bands refine". The valid box makes that argument true
   // and undesirable at the same time: a level whose reset is in flight
-  // publishes bit 24, raymarch.wgsl's farBox collapses its box to empty, and
+  // publishes bit 30, raymarch.wgsl's farBox collapses its box to empty, and
   // the ray falls straight through to the next level that HAS data. So with
   // only the coarsest level filled a ray leaving the residency window at
   // 25.6 m immediately marches level-8 cells — 25.6 m across, one cell per
@@ -216,6 +271,9 @@ void FarField::Update(const InterestSet& interest) {
       continue;
     }
     bool stepped = false;
+    // The slot layer each axis's plane took THIS Update, so a later axis's
+    // plane can leave out the line the two share (EnqueuePlane).
+    int stepSa[3] = {-1, -1, -1};
     for (int axis = 0; axis < 3; axis++) {
       if (std::abs(d[axis]) < kHyst) continue;
       stepped = true;
@@ -226,7 +284,8 @@ void FarField::Update(const InterestSet& interest) {
       uboDirty_ = true;
       // incoming plane: the window's leading face after the shift
       int wcoord = dir > 0 ? *o + (int)kFarNChunk - 1 : *o;
-      EnqueuePlane(k, axis, wcoord);
+      EnqueuePlane(k, axis, wcoord, stepSa);
+      stepSa[axis] = wcoord & ((int)kFarNChunk - 1);
     }
 
     // ---- COALESCE A FACE THAT HAS FALLEN A WHOLE BOX BEHIND (2026-09-12) ---
@@ -283,7 +342,7 @@ uint32_t FarField::PrepareTick(const rhi::Queue& queue, bool drain) {
   }
   // The UBO above is published either way — a caller that is not draining
   // still has to tell the renderer which levels it may march.
-  if (!drain || queue_.empty()) return 0;
+  if (!drain || PendingFills() == 0) return 0;
   // A reset (teleport, load, the startup horizon) drains at the bulk cap; in
   // play, incoming planes drain at kPlayFillCap (see farfield.h).
   bool bulk = false;
@@ -297,69 +356,76 @@ uint32_t FarField::PrepareTick(const rhi::Queue& queue, bool drain) {
     else bulkThisFrame_ = true;
   }
   const uint32_t cap = (uint32_t)std::min(
-      queue_.size(), (size_t)(bulk ? bulkCap_ : planeCap_));
-  std::vector<uint32_t> list;
-  list.reserve(cap);
+      PendingFills(), (size_t)(bulk ? bulkCap_ : planeCap_));
+  list_.clear();
+  list_.reserve(cap);
   patchHeader_.clear();
   patchPayload_.clear();
 
   FarEdits* edits = world_->farEdits;
-  for (uint32_t i = 0; i < cap; i++) {
-    const uint32_t packed = queue_.front();
-    const uint32_t k = packed >> kFarSlotShift;        // 0-based level index
-    const uint32_t slot = packed & kFarSlotMask;
+  const int m = (int)kFarNChunk - 1;
+  bool budgetHit = false;
+  // FINEST LEVEL FIRST (see queue_): level 1's pending planes are the ones in
+  // view at the shortest range, so they go before any coarser level's.
+  for (uint32_t k = 0; k < kFarLevels && !budgetHit; k++) {
+    std::deque<uint32_t>& q = queue_[k];
+    while (!q.empty() && list_.size() < cap) {
+      const uint32_t slot = q.front();
 
-    // ---- this entry's edit patches (far-field edit persistence) ----------
-    // The queue names SLOTS, so the world level chunk resident in that slot is
-    // resolved here under the SAME origins the kernel will read this tick —
-    // the mirror of common.wgsl's farSlotToChunk. Resolving it any earlier
-    // (at enqueue time) would name the chunk that used to live there.
-    const std::vector<uint32_t>* patch = nullptr;
-    if (edits && !edits->Empty()) {
-      const int m = (int)kFarNChunk - 1;
+      // The queue names SLOTS, so the world level chunk resident in that slot
+      // is resolved here under the SAME origins the kernel will read this
+      // tick — the mirror of common.wgsl's farSlotToChunk. Resolving it any
+      // earlier (at enqueue time) would name the chunk that used to live
+      // there.
       const IVec3 sc{(int)(slot % kFarNChunk),
                      (int)((slot / kFarNChunk) % kFarNChunk),
                      (int)(slot / (kFarNChunk * kFarNChunk))};
       const IVec3 o = origins_[k];
       const IVec3 lc{o.x + ((sc.x - o.x) & m), o.y + ((sc.y - o.y) & m),
                      o.z + ((sc.z - o.z) & m)};
-      patch = edits->Lookup(k + 1, lc);
-    }
-    const uint32_t n = patch ? (uint32_t)patch->size() : 0u;
-    // BUDGET BEFORE EMISSION (CLAUDE.md's rule for every other queue here): an
-    // entry that will not fit stays queued rather than being filled with a
-    // truncated patch, which would leave the horizon showing half an edit and
-    // no record that it did. One entry can hold at most kChunkVol = 4096
-    // words, far under the cap, so this can never deadlock.
-    if (patchPayload_.size() + n > kFarPatchCap) break;
 
-    patchHeader_.push_back((uint32_t)patchPayload_.size());
-    patchHeader_.push_back(n);
-    if (n) patchPayload_.insert(patchPayload_.end(), patch->begin(), patch->end());
+      // ---- this entry's edit patches (far-field edit persistence) --------
+      const std::vector<uint32_t>* patch = nullptr;
+      if (edits && !edits->Empty()) patch = edits->Lookup(k + 1, lc);
+      const uint32_t n = patch ? (uint32_t)patch->size() : 0u;
+      // BUDGET BEFORE EMISSION (CLAUDE.md's rule for every other queue here):
+      // an entry that will not fit stays queued rather than being filled with
+      // a truncated patch, which would leave the horizon showing half an edit
+      // and no record that it did. One entry can hold at most kChunkVol = 4096
+      // words, far under the cap, so this can never deadlock.
+      if (patchPayload_.size() + n > kFarPatchCap) { budgetHit = true; break; }
 
-    list.push_back(packed);
-    queue_.pop_front();
-    // The dispatch is encoded in THIS tick's submit, so the entry counts as
-    // filled from here on — SafeRadiusMeters is read on the render path of the
-    // same frame, one submit behind at worst.
-    pending_[k]--;
-    if (bulkPending_[k] > 0) bulkPending_[k]--;  // FIFO: resets pop first
-    // The plane this entry belongs to is the front record (same FIFO). Its
-    // face is released when its last entry is dispatched — published next
-    // tick, after this tick's sieve is in the queue.
-    PlaneRec& r = recs_.front();
-    if (--r.remaining == 0) {
-      if (r.axis >= 0 && r.epoch == epoch_[r.level] &&
-          faces_[r.level][r.axis][r.side] > 0) {
-        faces_[r.level][r.axis][r.side]--;
-        uboDirty_ = true;
+      patchHeader_.push_back((uint32_t)patchPayload_.size());
+      patchHeader_.push_back(n);
+      if (n) patchPayload_.insert(patchPayload_.end(), patch->begin(), patch->end());
+
+      list_.push_back((k << kFarSlotShift) | slot);
+      q.pop_front();
+      // A refill of cells a resident chunk owns undoes that chunk's last
+      // downsample: clear the signatures on the NEXT PrepareTick (sigClear_).
+      if (!sigClear_ && LevelChunkHitsWindow(k, lc)) sigClear_ = true;
+      // The dispatch is encoded in THIS tick's submit, so the entry counts as
+      // filled from here on — SafeRadiusMeters is read on the render path of
+      // the same frame, one submit behind at worst.
+      pending_[k]--;
+      if (bulkPending_[k] > 0) bulkPending_[k]--;  // resets pop first in a level
+      // The plane this entry belongs to is the level's front record (same
+      // FIFO). Its face is released when its last entry is dispatched —
+      // published next tick, after this tick's sieve is in the queue.
+      PlaneRec& r = recs_[k].front();
+      if (--r.remaining == 0) {
+        if (r.axis >= 0 && r.epoch == epoch_[r.level] &&
+            faces_[r.level][r.axis][r.side] > 0) {
+          faces_[r.level][r.axis][r.side]--;
+          uboDirty_ = true;
+        }
+        recs_[k].pop_front();
       }
-      recs_.pop_front();
     }
   }
-  const uint32_t count = (uint32_t)list.size();
+  const uint32_t count = (uint32_t)list_.size();
   if (count == 0) return 0;   // first entry alone blew the budget: cannot happen
-  queue.WriteBuffer(world_->farList, 0, list.data(), count * 4);
+  queue.WriteBuffer(world_->farList, 0, list_.data(), count * 4);
   // The header is written for EVERY dispatched entry, always — the kernel
   // indexes it by dispatch index and a stale pair points the patch loop at
   // another entry's payload. 8 bytes per entry, so <= 32 KiB in the fullest

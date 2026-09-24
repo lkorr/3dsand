@@ -8,11 +8,13 @@
 #include "sim/world.h"
 
 // Far-field cascade manager (render-only LOD — DESIGN.md §9,
-// docs/PLAN_far_field_cascades.md). Keeps kFarLevels nested toroidal 256^3
+// docs/PLAN_far_field_cascades.md). Keeps kFarLevels nested toroidal kFarN^3
 // volumes centered on the player: recenters each level toward the player at
 // most one level-chunk per axis per tick (2-chunk hysteresis, mirroring
-// Stream), enqueues incoming planes for GPU fill, and drains the queue at
-// kFarListCap level-chunks per tick through worldgen.wgsl `far`.
+// Stream), enqueues incoming planes for GPU fill, and drains the per-level
+// queues FINEST LEVEL FIRST — at the bulk cap while a reset is in flight, at
+// the plane cap otherwise (see bulkCap_ / planeCap_) — through worldgen.wgsl
+// `far` + `farpatch`.
 //
 // Derived data only: no readbacks, no sim interaction, not hashed. Fill
 // entries name SLOTS; the kernel maps slot -> world level-chunk under the
@@ -106,7 +108,16 @@ class FarField {
   // farfield.cpp. An empty set is a no-op for the same reason Update's is.
   void FullRefill(const InterestSet& interest);
 
-  size_t PendingFills() const { return queue_.size(); }
+  size_t PendingFills() const {
+    size_t n = 0;
+    for (uint32_t k = 0; k < kFarLevels; k++) n += queue_[k].size();
+    return n;
+  }
+  // Pending plane entries a direction REVERSAL dropped instead of filling
+  // twice (EnqueuePlane), and diagonal-step edge entries not queued twice.
+  // Diagnostics.
+  uint64_t ReversalDrops() const { return reversalDrops_; }
+  uint64_t EdgeDedupes() const { return edgeDedupes_; }
 
   // ---- WHERE THE QUEUE CAME FROM (2026-09-12) ----------------------------
   // PendingFills alone is a bare count, and a bare count sends you A/B-ing
@@ -135,14 +146,11 @@ class FarField {
   // straight through it and hit sky. Rather than let that read as holes in the
   // horizon, the renderer fogs everything past the last KNOWN-GOOD band out.
   //
-  // The bound is the INNERMOST incomplete level: cascade boxes are nested, so
-  // if level k has pending work, level k's half-extent and everything past it
-  // is suspect, but levels 1..k-1 are complete and cover out to level k-1's
-  // half-extent. (Levels coarser than k may also be complete — FullRefill
-  // fills coarsest-first exactly so the horizon exists early — but their data
-  // is only reachable through the gap at level k, so it cannot be trusted to
-  // be visible.) With no pending work anywhere this is the full outermost
-  // half-extent, which is what kFarFogDensity was pinned to.
+  // The bound is the FARTHEST COMPLETE level (a plane-incomplete level counts
+  // out to its edge less its queued faces); the note on the definition in
+  // farfield.cpp says why it is no longer the innermost incomplete one. With
+  // no pending work anywhere this is the full outermost half-extent, which is
+  // what kFarFogDensity was pinned to.
   float SafeRadiusMeters() const;
 
   // ---- THE VALID BOX (2026-09-10): what the RENDERER may march ------------
@@ -150,7 +158,8 @@ class FarField {
   // player, the incoming face's SLOTS are the outgoing face's, and they keep
   // the outgoing face's bytes until the sieve refills them. That was invisible
   // while a plane landed in the tick it was queued; under kPlayFillCap a
-  // plane takes ~16 ticks and sprint flight backlogs planes deep, so the
+  // plane takes several ticks (1,024 entries at 64 per tick when this was
+  // written, 256 per tick now) and sprint flight backlogs planes deep, so the
   // renderer, which marched the full box from `origins` the tick they moved,
   // drew the hillside BEHIND the player ahead of them and the underground of
   // the bottom face in the sky when the box stepped up.
@@ -159,7 +168,8 @@ class FarField {
   // planes still queued (and empty while a reset is in flight), published in
   // FarParams.origins[k].w — the word every other reader ignores — as six
   // 5-bit counts, one per face (-x,+x,-y,+y,-z,+z, low field first), plus
-  // bit 30 = whole level pending. raymarch.wgsl `farBox` unpacks it; a ray in
+  // bit 30 (kFarFaceAllPending) = whole level pending. raymarch.wgsl `farBox`
+  // unpacks it; a ray in
   // an excluded slab leaves the level at the shrunken face and the next
   // coarser level, which is filled, picks up at the same t (the seam contract
   // traceFar already keeps for TUNE_FAR_STEPS).
@@ -179,14 +189,15 @@ class FarField {
   // which costs a fall-through to the next level and never draws a wrong one.
   //
   // Counted per PLANE, not per entry: each EnqueuePlane / ResetLevel pushes a
-  // record onto recs_ (FIFO, parallel to queue_) with its entry count, and a
-  // face count drops only when that plane's LAST entry is popped — the queue
-  // is FIFO so a plane's entries are contiguous and drain in order. A reset
-  // bumps the level's epoch and zeroes its faces: plane records queued before
-  // it still pop (the queue is not reordered) but no longer own a face.
-  // Always conservative — a face that reversed direction is excluded on both
-  // sides until both records drain, and a landed face is published one tick
-  // late (the UBO is written at the top of the NEXT PrepareTick), never early.
+  // record onto its level's recs_ (FIFO, parallel to that level's queue_) with
+  // its entry count, and a face count drops only when that plane's LAST entry
+  // is popped — each level's queue is FIFO, so a plane's entries are
+  // contiguous and drain in order. A reset bumps the level's epoch, zeroes its
+  // faces and prunes the level's queue, so no older plane record survives it.
+  // A face that REVERSED direction drops the still-pending plane it undoes
+  // (same axis, same slot layer — the new plane refills exactly those slots)
+  // and releases that plane's face. A landed face is published one tick late
+  // (the UBO is written at the top of the NEXT PrepareTick), never early.
   uint32_t FaceWord(uint32_t k) const;   // the packed w (the selftest reads it)
 
  private:
@@ -199,33 +210,48 @@ class FarField {
   // contiguous run of its own level's entries and both sides lose level k
   // entirely (see PrepareTick's front-record bookkeeping).
   void PruneLevel(uint32_t k);
-  void EnqueuePlane(uint32_t k, int axis, int wcoord);  // one incoming plane
+  // One incoming plane. `skipSa[a]` >= 0 names the slot layer an EARLIER
+  // plane of the same Update already queued on axis a (a diagonal step): the
+  // line where the two planes cross is queued once, by the earlier plane.
+  void EnqueuePlane(uint32_t k, int axis, int wcoord, const int skipSa[3]);
   void Enqueue(uint32_t k, uint32_t slot);           // queue + per-level counter
+  // A direction reversal on `axis` makes the newest pending plane with slot
+  // layer `sa` redundant: drop its remaining entries and release its face.
+  void DropPendingPlane(uint32_t k, int axis, int sa);
+  // Does level k's level chunk `lc` (level-chunk units) overlap the residency
+  // window? The farSig clear's trigger (sigClear_).
+  bool LevelChunkHitsWindow(uint32_t k, IVec3 lc) const;
 
   World* world_ = nullptr;
   IVec3 origins_[kFarLevels] = {};  // per level, level-chunk units
-  std::deque<uint32_t> queue_;  // packed (level-1) << kFarSlotShift | slot
-  // One record per EnqueuePlane / ResetLevel, in queue order (see FaceWord).
-  // axis < 0 is a reset: it drains like any other record but owns no face.
+  // PER-LEVEL queues of SLOTS (the level is the index), drained finest level
+  // first. One FIFO for all eight levels drained them in arrival order, so a
+  // coarse level's plane queued a tick earlier held up the level-1 plane on
+  // the face the player is walking into — the one whose absence shows at the
+  // shortest range.
+  std::deque<uint32_t> queue_[kFarLevels];
+  // One record per EnqueuePlane / ResetLevel, in its level's queue order (see
+  // FaceWord). axis < 0 is a reset: it drains like any other record but owns
+  // no face.
   struct PlaneRec {
     uint32_t level;      // 0-based
     int axis;            // 0..2, or -1 for a reset
     int side;            // 0 = low face (-), 1 = high face (+)
-    uint32_t remaining;  // entries of this plane still in queue_
+    int sa;              // slot layer on `axis`; -1 for a reset
+    uint32_t remaining;  // entries of this plane still in queue_[level]
     uint32_t epoch;      // epoch_[level] when queued; stale after a reset
   };
-  std::deque<PlaneRec> recs_;
+  std::deque<PlaneRec> recs_[kFarLevels];
   uint32_t faces_[kFarLevels][3][2] = {};  // planes queued per level face
   uint32_t epoch_[kFarLevels] = {};
-  // Outstanding entries per level, mirroring queue_ (the queue is FIFO across
-  // levels, so scanning it per frame would be O(24576); these counters make
-  // SafeRadiusMeters O(kFarLevels)). Incremented on every enqueue, decremented
-  // as PrepareTick pops.
+  // Outstanding entries per level, mirroring queue_[k].size() (a counter
+  // beside the deque so SafeRadiusMeters and FaceWord read one word a level).
+  // Incremented on every enqueue, decremented as PrepareTick pops.
   uint32_t pending_[kFarLevels] = {};
   // Of those, how many came from a RESET (ResetLevel / FullRefill: a whole
-  // level, 32,768 entries) rather than from an incoming plane. Popped first,
-  // because the queue is FIFO and a reset's entries precede any plane queued
-  // after it. Two consumers: PrepareTick's cap (a reset takes kFarListCap per
+  // level, 32,768 entries) rather than from an incoming plane. Popped first
+  // within its level: a reset prunes the level's queue, so every plane queued
+  // afterwards lands behind it. Two consumers: PrepareTick's cap (a reset takes kFarListCap per
   // tick — the horizon has to exist — while planes take kPlayFillCap), and
   // SafeRadiusMeters (a plane-incomplete level is trusted out to its edge
   // minus the plane; a reset-incomplete one only to the level inside it).
@@ -294,17 +320,34 @@ class FarField {
   uint32_t bulkCap_ = kFarListCap;
   uint64_t resets_ = 0, gapResets_ = 0, planes_ = 0, refills_ = 0;
   uint64_t coalesced_ = 0;
+  uint64_t reversalDrops_ = 0, edgeDedupes_ = 0;
   uint32_t worstGap_ = 0, worstGapLevel_ = 0;
   uint32_t planeCap_ = kPlayFillCap;
   bool frameGated_ = false;   // BeginFrame has been called at least once
   bool bulkThisFrame_ = false;
   bool uboDirty_ = true;
-  // A reset / full refill re-fills a level from procgen (+ FarEdits patches),
-  // so every slot's fardown signature (world.h farSig) is stale: zero them all
-  // on the next PrepareTick and every dirty chunk downsamples afresh.
+  // THE farSig CLEAR (world.h farSig; worldgen.wgsl `fardown`'s skip). A sieve
+  // fill rewrites its level chunk from procgen (+ FarEdits patches), which for
+  // any RESIDENT fine chunk inside it undoes what `fardown` last wrote — and
+  // fardown's signature would then call that chunk unchanged and skip it. So
+  // a DISPATCHED fill entry whose level chunk overlaps the residency window
+  // raises this, and the NEXT PrepareTick zeroes every signature: the next,
+  // not this one, because the fill is recorded AFTER the tick's `farDown` row
+  // in the same command buffer (SubmitTick: EncodeTick, then EncodeFarFill),
+  // so a clear written before this tick's submit would be spent by a
+  // downsample the fill then overwrites. (It used to be raised when a reset
+  // was QUEUED, which had exactly that race for every entry of the refill.)
+  //
+  // Only an overlapping entry raises it. In steady state none does — level
+  // 1's box is twice the window and its incoming face half a box away — so
+  // walking no longer re-downsamples every dirty chunk per origin step, which
+  // is why fardown's signature stopped hashing the level origins. Resets,
+  // teleports and a level still catching up with a jump do overlap, and pay.
   bool sigClear_ = true;
-  // Reused across ticks so a fill-heavy frame does not reallocate: the header
-  // is 2 u32 per dispatched entry, the payload is the concatenated patch runs.
+  // Reused across ticks so a fill-heavy frame does not reallocate: the list,
+  // the patch header (2 u32 per dispatched entry) and the concatenated patch
+  // runs.
+  std::vector<uint32_t> list_;
   std::vector<uint32_t> patchHeader_;
   std::vector<uint32_t> patchPayload_;
   uint32_t lastPatchWords_ = 0;

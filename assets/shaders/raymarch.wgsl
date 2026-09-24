@@ -4142,7 +4142,7 @@ fn gasOuterFill(ro : vec3f, rdIn : vec3f, tEnd : f32, px : vec2f) -> f32 {
 // ---- THE VALID BOX (2026-09-10): the box a far reader may march ------------
 // A level's box is toroidal: when its origin steps one level chunk toward the
 // player, the incoming face's SLOTS are the outgoing face's, and they keep the
-// outgoing face's bytes until the sieve refills them — ~16 ticks per plane
+// outgoing face's bytes until the sieve refills them — a few ticks per plane
 // under the play fill cap (farfield.h kPlayFillCap), and sprint flight backlogs
 // planes deep. Marched as terrain from the full [origin, origin + FAR_N) box,
 // those bytes were the hillside BEHIND the player drawn ahead of them, and the

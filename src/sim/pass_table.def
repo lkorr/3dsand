@@ -610,6 +610,33 @@ PASS(occupancyFull, "occupancyFull+pick(hashTick)", PT_TICK, PIPE_OCCUPANCY, K_C
           R(PageTable)))
 PASS(pick_hash, "occupancyFull+pick(hashTick)", PT_TICK, PIPE_PICK,      K_COMPUTE, 1,1,1,       GRP_SIM, DYN_ZERO, C_HASH, 1,
      USES(R(Voxels) R(Materials) U(RenderUBO) W(Pick) R(PageTable)))
+// ---- THE HASH-TICK farDown BACKSTOP (2026-09-24) --------------------------
+// `farDown` below rides compactNext's dirtyOut list, and a hash tick compacts
+// none — so a chunk whose LAST write landed on a hash tick was never
+// downsampled: the next tick's dirtyOut holds only that tick's writes, and a
+// chunk that went quiet after the hash tick is not in it. openness and glow
+// have a rolling refresh that eventually repairs such a miss; the cascades do
+// not, so the edit simply never reached the horizon.
+//
+// The same pipeline over the list that IS in DirtyList/DispatchArgs on a hash
+// tick: `compact`'s dirtyIn list (the chunks the CA ran this tick), which
+// contains every chunk written this tick by the CA from inside itself and by
+// the mutation/explosion rows (they flag dirtyIn before `compact`). It does
+// NOT cover a chunk first written this tick from OUTSIDE the active set — a
+// grain crossing into a sleeping neighbour, a particle or gas parcel landing,
+// an MPM deposit — that then stays quiet on the next tick. Closing that needs
+// a dirtyOut compaction on hash ticks, and that is not free to add: this
+// tick's DirtyList is also what the PT_FLUIDSEAM excite rows read after
+// PT_TICK, and they WRITE VOXELS, so changing which list a hash tick leaves
+// behind would move the world. Render-only; when the CA is skipped the args
+// still hold the previous tick's list, and fardown's signature makes that a
+// read of unchanged chunks.
+// read-only in practice: `voxels` is read_write for the module because
+// `genChunk` (main/list) writes it; `fardown` only samples the live grid.
+PASS(farDownHash, "farDown", PT_TICK, PIPE_FAR_DOWN, K_INDIRECT, IND_DISPATCHARGS,0,0,
+     GRP_SLIM_FAR, DYN_NONE, C_HASH, 1,
+     USES(R(Voxels) R(Materials) U(TickUBO) U(FarUBO) R(DirtyList) I(DispatchArgs)
+          A(FarVox) A(FarOcc) R(PageTable) R(TreeAtlas) R(WorldMap) RW(FarSig)))
 
 // ---- phase 5b: dirty tick -------------------------------------------------
 // Occupancy update over only the chunks written this tick: compact the dirtyOut
@@ -636,8 +663,10 @@ PASS(pick_dirty, "occupancyDirty+pick", PT_TICK, PIPE_PICK, K_COMPUTE, 1,1,1, GR
 // update, so a settled world dispatches nothing. Separate pass: it uses farPL_
 // (slim group 0 + far group 1), not simPL_.
 // NOTE: hash ticks skip this — they take the whole-world occupancy branch and
-// never compact dirtyOut, so there is no work list. A chunk edited on a hash
-// tick is still dirty the next tick and downsamples then.
+// never compact dirtyOut, so there is no work list. The old claim here, "a
+// chunk edited on a hash tick is still dirty the next tick and downsamples
+// then", was wrong: next tick's dirtyOut holds only next tick's writes. The
+// `farDownHash` row above is the backstop, and its note says what it covers.
 // read-only in practice: `voxels` is read_write for the module because
 // `genChunk` (main/list) writes it. `fardown` only samples the live grid to
 // downsample into the cascades — far-field is derived, render-only data and

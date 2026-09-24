@@ -225,6 +225,38 @@ bool fogOk = false;
     prevR = r;
   }
   ctx.WaitIdle();
+  // SANDVOX_FAR_DIGEST=1: a byte digest of every cascade level (farVox)
+  // right after the full refill — the pure sieve + patch output, so
+  // a rewrite of the `far` kernel can be shown byte-identical by running this
+  // gate against two asset trees with ONE exe. Off by default: it reads back
+  // the whole 1 GiB cascade.
+  if (std::getenv("SANDVOX_FAR_DIGEST")) {
+    auto digest = [&](const rhi::Buffer& src, uint64_t total) {
+      const uint64_t step = 64ull << 20;
+      rhi::Buffer st = CreateBuffer(
+          ctx.device, std::min(step, total),
+          rhi::BufferUsage::MapRead | rhi::BufferUsage::CopyDst, "farDigest");
+      std::vector<uint8_t> buf((size_t)std::min(step, total));
+      uint64_t h = 1469598103934665603ull;
+      for (uint64_t off = 0; off < total; off += step) {
+        const uint64_t n = std::min(step, total - off);
+        rhi::CommandEncoder enc = ctx.device.CreateCommandEncoder();
+        enc.CopyBufferToBuffer(src, off, st, 0, n);
+        ctx.queue.Submit(enc.Finish());
+        rhi::ReadBufferBlocking(ctx.device, st, 0, buf.data(), n);
+        for (uint64_t i = 0; i + 8 <= n; i += 8) {
+          uint64_t w;
+          std::memcpy(&w, buf.data() + i, 8);
+          h = (h ^ w) * 1099511628211ull;
+        }
+      }
+      return h;
+    };
+    // farVox only: farOcc is not created CopySrc (world.cpp).
+    std::printf("far digest: farVox %016llx\n",
+                (unsigned long long)digest(world.farVox,
+                                           (uint64_t)kFarLevels * kFarVox));
+  }
   // cold start: level 1 still pending -> only the residency window is trusted.
   // Both bounds come from world.h's cascade helpers rather than restating the
   // box-size relation: this gate previously hardcoded "half-extent = 2^k

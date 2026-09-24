@@ -43,12 +43,12 @@ void FarEdits::Sweep(IVec3 wc,
     if (n[0] == 0 || n[1] == 0 || n[2] == 0) continue;
 
     scratch_.clear();
-    // iz/iy/ix ascending == cell index ascending (chunk-linear is x-fastest),
-    // so one fine chunk's run arrives already sorted and a level chunk fed by
-    // exactly one chunk needs no compaction at all.
+    // iz/ix/iy ascending == ColumnKey ascending (z, then x, then y), so one
+    // fine chunk's run arrives already in Lookup's order and a level chunk
+    // fed by exactly one chunk needs no compaction at all.
     for (int iz = 0; iz < n[2]; iz++)
-      for (int iy = 0; iy < n[1]; iy++)
-        for (int ix = 0; ix < n[0]; ix++) {
+      for (int ix = 0; ix < n[0]; ix++)
+        for (int iy = 0; iy < n[1]; iy++) {
           const int fine[3] = {first[0] + ix * step, first[1] + iy * step,
                                first[2] + iz * step};
           const uint32_t mat =
@@ -79,15 +79,50 @@ void FarEdits::NoteUniformChunk(IVec3 wc, uint32_t mat) {
 
 void FarEdits::Append(const LKey& key, const std::vector<uint32_t>& add) {
   if (add.empty()) return;
-  Chunk& c = byChunk_[key];
-  if (c.words.empty()) {
-    c.words = add;          // already sorted, one word per cell
+  auto it = byChunk_.find(key);
+  if (it == byChunk_.end()) {
+    // The cap refuses only NEW level chunks (see kMaxCells): one already
+    // indexed is bounded by the compaction below, and refusing its update
+    // would leave a stale edit on the horizon rather than a missing one.
+    if (cells_ + add.size() > kMaxCells) { refused_++; return; }
+    Chunk& c = byChunk_[key];
+    c.words = add;          // already in ColumnKey order, one word per cell
     c.sorted = true;
-  } else {
-    c.words.insert(c.words.end(), add.begin(), add.end());
-    c.sorted = false;
+    cells_ += add.size();
+    return;
   }
+  Chunk& c = it->second;
+  c.words.insert(c.words.end(), add.begin(), add.end());
+  c.sorted = false;
   cells_ += add.size();
+  // THE BOUND ON A RE-NOTED CHUNK. Appending and compacting on first read is
+  // what keeps a bulk build O(n log n) (see Lookup), but a level chunk that is
+  // re-noted over and over — the same edited fine chunks evicted and
+  // re-entered every time the player paces past a window face — and never
+  // read grew without limit. A level chunk has at most kChunkVol distinct
+  // cells, so past twice that the list is mostly superseded words: compact.
+  if (c.words.size() > 2 * (size_t)kChunkVol) Compact(c);
+}
+
+void FarEdits::Compact(Chunk& c) {
+  // STABLE, so equal cells keep append order and the LAST of a run is the
+  // newest read. The dedupe below therefore keeps the last of each run (it
+  // skips an entry whose successor is the same cell) rather than the first,
+  // which std::unique would have kept.
+  std::stable_sort(c.words.begin(), c.words.end(), [](uint32_t a, uint32_t b) {
+    return ColumnKey(a) < ColumnKey(b);
+  });
+  size_t w = 0;
+  for (size_t r = 0; r < c.words.size(); r++) {
+    // last of each run of equal cell indices
+    if (r + 1 < c.words.size() &&
+        (c.words[r] & kCellMask) == (c.words[r + 1] & kCellMask))
+      continue;
+    c.words[w++] = c.words[r];
+  }
+  cells_ -= c.words.size() - w;
+  c.words.resize(w);
+  c.sorted = true;
 }
 
 const std::vector<uint32_t>* FarEdits::Lookup(uint32_t level,
@@ -95,27 +130,7 @@ const std::vector<uint32_t>* FarEdits::Lookup(uint32_t level,
   auto it = byChunk_.find({levelChunk.x, levelChunk.y, levelChunk.z, level});
   if (it == byChunk_.end()) return nullptr;
   Chunk& c = it->second;
-  if (!c.sorted) {
-    // STABLE, so equal cell indices keep append order and the LAST of a run is
-    // the newest read. The dedupe below therefore keeps the last of each run
-    // (it skips an entry whose successor shares its cell index) rather than
-    // the first, which std::unique would have kept.
-    std::stable_sort(c.words.begin(), c.words.end(),
-                     [](uint32_t a, uint32_t b) {
-                       return (a & kCellMask) < (b & kCellMask);
-                     });
-    size_t w = 0;
-    for (size_t r = 0; r < c.words.size(); r++) {
-      // last of each run of equal cell indices
-      if (r + 1 < c.words.size() &&
-          (c.words[r] & kCellMask) == (c.words[r + 1] & kCellMask))
-        continue;
-      c.words[w++] = c.words[r];
-    }
-    cells_ -= c.words.size() - w;
-    c.words.resize(w);
-    c.sorted = true;
-  }
+  if (!c.sorted) Compact(c);
   return &c.words;
 }
 
