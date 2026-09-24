@@ -5502,6 +5502,10 @@ int main(int argc, char** argv) {
   });
   MobSystem mobs;
   mobs.Init(&phys, &world, &debris, mats, reactions);
+  // S5b parking (game/persist.h). Lives beside `mobs` rather than in the
+  // tick block so a load can ResetWaits(): records LoadWorld had to keep
+  // (cap full, pool refused) are retried at once, not on the next window move.
+  MobParking mobParking;
   // Micro-body bricks (PLAN §C) are packed at mob-def load and uploaded
   // straight after: they are per-DEF art, shared by every instance. The set
   // persists past load because the sphere spawner packs 2x-detail ball models
@@ -10354,6 +10358,7 @@ int main(int argc, char** argv) {
       EntityIO eio = MakeEntityIO(debris, mobs, &avatar, &kitRefs, &groundRefs);
       WorldStamp loaded{};
       if (LoadWorld(ctx, world, sim, stream, worldDir, mats, &eio, &loaded)) {
+        mobParking.ResetWaits();
         // ---- RESUME THE CLOCK ABOVE THE SAVE (M9.5-B) -----------------
         //
         // The per-chunk tick tags in `manifest.svt` were written against the
@@ -11023,7 +11028,6 @@ int main(int argc, char** argv) {
       // onto ground the fetch cache has answered for. Parking is on for single
       // player and the host (whose store is the world's), off for a client.
       {
-        static MobParking mobParking;
         mobParking.Bind(mobs, stream.Store(), netRoleBoot != NetRole::Client);
         mobParking.Unpark(mobs, stream.Store(), world, tick);
       }
