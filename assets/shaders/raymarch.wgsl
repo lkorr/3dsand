@@ -85,13 +85,7 @@
 // is blended into its block-face at TUNE_GI_FEEDBACK so bounces compound. The
 // third buffer a fragment shader writes, with shadowCache's argument: render-
 // private derived data the renderer itself produced.
-//
-// ATOMIC HERE ONLY (the other shaders bind the same buffer as plain u32): the
-// gather cache's refresh is ELECTED with one compare-exchange per block-face
-// (giBounceAt), so a face that is due re-gathers once per frame instead of
-// once per pixel that lands on it. Every other access is a plain
-// atomicLoad/atomicStore with the same racy-by-design semantics as before.
-@group(0) @binding(19) var<storage, read_write> irradiance : array<atomic<u32>>;
+@group(0) @binding(19) var<storage, read_write> irradiance : array<u32>;
 // The glow field (src/sim/world.h kGlowBytes, common.wgsl THE GLOW FIELD).
 // Declared here so the terrain path CAN sample it under render.glowTerrain, and
 // because renderBGL_ is one layout shared with debris.wgsl and microbody.wgsl,
@@ -5234,9 +5228,9 @@ fn giGatherRays(ro : vec3f, n : vec3f, face : u32) -> vec3f {
     let ay = abs(d.y);
     let az = abs(d.z);
     var e = vec3f(0.0);
-    if (ax > 0.1) { e += unpackRgb9e5(atomicLoad(&irradiance[base + 0u + select(0u, 1u, d.x < 0.0)])) * ax; }
-    if (ay > 0.1) { e += unpackRgb9e5(atomicLoad(&irradiance[base + 2u + select(0u, 1u, d.y < 0.0)])) * ay; }
-    if (az > 0.1) { e += unpackRgb9e5(atomicLoad(&irradiance[base + 4u + select(0u, 1u, d.z < 0.0)])) * az; }
+    if (ax > 0.1) { e += unpackRgb9e5(irradiance[base + 0u + select(0u, 1u, d.x < 0.0)]) * ax; }
+    if (ay > 0.1) { e += unpackRgb9e5(irradiance[base + 2u + select(0u, 1u, d.y < 0.0)]) * ay; }
+    if (az > 0.1) { e += unpackRgb9e5(irradiance[base + 4u + select(0u, 1u, d.z < 0.0)]) * az; }
     acc += e * (w / (ax + ay + az));
   }
   return acc;
@@ -5293,7 +5287,7 @@ fn giGather(p : vec3f, n : vec3f, cell : vec3<i32>) -> vec3f {
 fn giCacheWordAt(c : vec3<i32>, face : u32) -> u32 {
   let slot = chunkIndexW(c);
   if (opennessGen[slot] != opennessStamp(worldChunkOf(c))) { return 0u; }
-  return atomicLoad(&irradiance[GI_CACHE_BASE + irrIndexOfCell(c, face)]);
+  return irradiance[GI_CACHE_BASE + irrIndexOfCell(c, face)];
 }
 fn giBounceAt(p : vec3f, n : vec3f, cell : vec3<i32>) -> vec3f {
   if (TUNE_GI_CACHE_PERIOD <= 0) { return giGather(p, n, cell); }
@@ -5304,58 +5298,21 @@ fn giBounceAt(p : vec3f, n : vec3f, cell : vec3<i32>) -> vec3f {
   let face = openFaceOfNormal(n);
   let lo = vec3<u32>(cell & vec3<i32>(i32(CHUNK) - 1));
   let idx = GI_CACHE_BASE + irrIndex(slot, subOccBitLocal(lo), face);
-  var own = atomicLoad(&irradiance[idx]);
+  var own = irradiance[idx];
   // max(.., 1): the early return above folds the period-0 arm away, but the
   // modulo below is still compiled, and a const-evaluated `% 0u` is a Tint
   // error that refuses the whole shader (the first `nogicache` measurement
   // silently measured nothing for exactly that reason).
-  let period = max(u32(TUNE_GI_CACHE_PERIOD), 1u);
-  let clock = R.frameIdx + ((slot * 2654435761u) >> 24u);
-  let phase = clock % period;
-  // ---- ONE GATHERER PER FACE PER REFRESH (the election) ----
-  // The gather runs from the FACE CENTRE, so every pixel on a due face used to
-  // compute the identical nine rays and race to store the identical word -- a
-  // near wall of 20k pixels paid 20k gathers for one number. Bit 1 of the
-  // word now carries the parity of the refresh EPOCH (clock / period) the
-  // word was gathered in; on a due frame the first pixel to flip it with a
-  // compare-exchange gathers and stores, and every other pixel sees the
-  // flipped bit (or loses the exchange) and reads the word as it stands. The
-  // claim KEEPS THE OLD COLOUR, so a neighbour's bilinear tap never reads a
-  // placeholder -- it reads the last gather until the new one lands.
-  //
-  // Two consequences, both small. Bits 0 and 1 are the red mantissa's lowest
-  // two (bit 0 was already forced on as "gathered"): <= 3/512 of the red
-  // channel. And a face that was OFF SCREEN across an even number of its
-  // refreshes comes back with a parity that already matches, so it re-gathers
-  // one period later than before (at most 2 x giCachePeriod frames, ~0.5 s
-  // at 16) -- the cache's latency, not its value, which is what the bounce
-  // already trails the sun by.
-  //
-  // A face never gathered (word 0) is NOT elected: every pixel on it gathers
-  // live that one frame, as before, and stores the same word. Electing it
-  // would leave the losers a word with no colour in it for a frame, and the
-  // first sight of a chunk is exactly when that would show.
-  let epochBit = ((clock / period) & 1u) << 1u;
-  if (own == 0u) {
+  let phase = (R.frameIdx + ((slot * 2654435761u) >> 24u)) %
+              max(u32(TUNE_GI_CACHE_PERIOD), 1u);
+  if (own == 0u || phase == 0u) {
     let half = f32(SUBOCC_BLOCK) * 0.5;
     let blockMin = cell - vec3<i32>(lo & vec3<u32>(SUBOCC_BLOCK - 1u));
     let ro = vec3f(blockMin) + vec3f(half) + n * (half + 0.5);
     // The low bit forced on: 0 must mean "never", and a face in the dark
     // gathers a true zero.
-    own = (packRgb9e5(giGatherRays(ro, n, face)) & 0xFFFFFFFDu) | 1u | epochBit;
-    atomicStore(&irradiance[idx], own);
-  } else if (phase == 0u && (own & 2u) != epochBit) {
-    let claim = atomicCompareExchangeWeak(&irradiance[idx], own,
-                                          (own & 0xFFFFFFFDu) | epochBit);
-    if (claim.exchanged) {
-      let half = f32(SUBOCC_BLOCK) * 0.5;
-      let blockMin = cell - vec3<i32>(lo & vec3<u32>(SUBOCC_BLOCK - 1u));
-      let ro = vec3f(blockMin) + vec3f(half) + n * (half + 0.5);
-      own = (packRgb9e5(giGatherRays(ro, n, face)) & 0xFFFFFFFDu) | 1u | epochBit;
-      atomicStore(&irradiance[idx], own);
-    } else {
-      own = claim.old_value;
-    }
+    own = packRgb9e5(giGatherRays(ro, n, face)) | 1u;
+    irradiance[idx] = own;
   }
   if (TUNE_OPENNESS_BILINEAR == 0) { return unpackRgb9e5(own); }
   // The four taps, as opennessAt places them: block centres in the face
@@ -10563,9 +10520,8 @@ fn fs(in : VSOut) -> FSOut {
           opennessGen[chunkIndexW(h.cell)] == opennessStamp(worldChunkOf(h.cell))) {
         let wi = irrIndexOfCell(h.cell, openFaceOfNormal(n));
         let outgoing = albedo * sun + bounce;
-        atomicStore(&irradiance[wi],
-            packRgb9e5(mix(unpackRgb9e5(atomicLoad(&irradiance[wi])), outgoing,
-                           TUNE_GI_FEEDBACK)));
+        irradiance[wi] =
+            packRgb9e5(mix(unpackRgb9e5(irradiance[wi]), outgoing, TUNE_GI_FEEDBACK));
       }
     }
 
