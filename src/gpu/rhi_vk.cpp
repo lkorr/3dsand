@@ -30,6 +30,7 @@
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
+#include <mutex>
 #include <vector>
 
 #include "gpu/passtimer.h"
@@ -41,16 +42,6 @@
 namespace rhi {
 namespace vkr {
 namespace {
-
-[[noreturn]] void NotReachable(const char* what) {
-  std::fprintf(stderr,
-               "FATAL: %s has no Vulkan implementation because no code path "
-               "should reach it (sim recording goes through the RecordTable "
-               "bridge). A caller reaching this is bypassing the pass table — "
-               "wire it through the table/recorder, do not soften this abort.\n",
-               what);
-  std::abort();
-}
 
 struct VkrState {
   std::shared_ptr<vk::Backend> be;
@@ -68,6 +59,11 @@ struct VkrState {
   };
   std::vector<PendingMap> maps;
   vk::RecordStats lastStats{};
+  // Recorders handed back by dead encoders, reused by the next one. A Recorder
+  // owns half a dozen vectors (barrier batches, image state, the extras
+  // table) whose capacity survives Begin(), so a reused one records a tick
+  // without allocating; a fresh one per encoder paid all of them every time.
+  std::vector<std::unique_ptr<vk::Recorder>> freeRecorders;
 };
 
 // ------------------------------------------------------------- resources ----
@@ -124,13 +120,40 @@ vk::Image* NI(const TextureView& v) {
   return v ? static_cast<VkrTextureView*>(v.Get())->img : nullptr;
 }
 
+// ---- pipeline-side objects RELEASE THEMSELVES (F5 used to leak them all) ----
+//
+// Until 2026-09-24 none of these wrappers had a destructor: the Vulkan objects
+// lived in the backend's registries until Shutdown, so every F5 reload (which
+// re-keys every shader through the re-baked tuning prelude and rebuilds every
+// pipeline) added a full set of modules and pipelines that nothing would ever
+// use again. Each wrapper now hands its object back when the last seam handle
+// drops — pipelines and layouts DEFERRED behind the submit-serial graveyard
+// (an in-flight command buffer may still bind them), shader modules by
+// refcount (a module is dead weight once its pipelines exist). A wrapper that
+// depends on another's object holds that wrapper alive (`keep*` below), so the
+// release order cannot invert.
+
 struct VkrShaderModule final : ShaderModuleImpl {
   // Compilation is DEFERRED to pipeline creation: Tint emits single-entry-point
   // SPIR-V, and the entry point arrives with CreateComputePipeline. The
   // backend's module cache (label + entry + source hash) keeps each combination
-  // compiled once.
+  // compiled once while anyone holds it.
   std::string source;
   std::string label;
+  std::shared_ptr<VkrState> st;
+  // One backend cache reference per GetShaderModule this module made; released
+  // together when the handle dies. Locked because the build pool creates
+  // several pipelines from one module on different threads.
+  std::mutex keysMutex;
+  std::vector<std::string> keys;
+  void Hold(std::string key) {
+    std::lock_guard<std::mutex> lock(keysMutex);
+    keys.push_back(std::move(key));
+  }
+  ~VkrShaderModule() override {
+    if (!st || !st->be) return;
+    for (const std::string& k : keys) st->be->ReleaseShaderModule(k);
+  }
 };
 
 struct VkrBindGroupLayout final : BindGroupLayoutImpl {
@@ -138,15 +161,45 @@ struct VkrBindGroupLayout final : BindGroupLayoutImpl {
   // Kept because descriptor WRITES need the layout entry types matched by
   // binding number (Backend::CreateDescriptorSet's hard-won rule).
   std::vector<BindGroupLayoutEntry> entries;
+  std::shared_ptr<VkrState> st;
+  ~VkrBindGroupLayout() override {
+    if (st && st->be) st->be->DestroySetLayoutDeferred(l);
+  }
 };
-struct VkrBindGroup final : BindGroupImpl { VkDescriptorSet set = VK_NULL_HANDLE; };
-struct VkrPipelineLayout final : PipelineLayoutImpl { VkPipelineLayout l = VK_NULL_HANDLE; };
-struct VkrComputePipeline final : ComputePipelineImpl { VkPipeline p = VK_NULL_HANDLE; };
+// Descriptor SETS are not released: the pool has no FREE bit and is a fixed
+// budget by design (rhi_vulkan.cpp's pool comment). The set's layout is held
+// so it outlives every set allocated against it.
+struct VkrBindGroup final : BindGroupImpl {
+  VkDescriptorSet set = VK_NULL_HANDLE;
+  std::shared_ptr<BindGroupLayoutImpl> keepLayout;
+};
+struct VkrPipelineLayout final : PipelineLayoutImpl {
+  VkPipelineLayout l = VK_NULL_HANDLE;
+  std::vector<std::shared_ptr<BindGroupLayoutImpl>> keepSets;
+  std::shared_ptr<VkrState> st;
+  ~VkrPipelineLayout() override {
+    if (st && st->be) st->be->DestroyPipelineLayoutDeferred(l);
+  }
+};
+struct VkrComputePipeline final : ComputePipelineImpl {
+  VkPipeline p = VK_NULL_HANDLE;
+  std::shared_ptr<PipelineLayoutImpl> keepLayout;
+  std::shared_ptr<VkrState> st;
+  ~VkrComputePipeline() override {
+    if (st && st->be) st->be->DestroyPipelineDeferred(p);
+  }
+};
 // The pipeline layout rides along because vkCmdBindDescriptorSets needs it at
 // SetBindGroup time — wgpu infers it from the bound pipeline, Vulkan does not.
+// Holding its wrapper (keepLayout) is what keeps that raw handle alive.
 struct VkrRenderPipeline final : RenderPipelineImpl {
   VkPipeline p = VK_NULL_HANDLE;
   VkPipelineLayout layout = VK_NULL_HANDLE;
+  std::shared_ptr<PipelineLayoutImpl> keepLayout;
+  std::shared_ptr<VkrState> st;
+  ~VkrRenderPipeline() override {
+    if (st && st->be) st->be->DestroyPipelineDeferred(p);
+  }
 };
 struct VkrCommandBuffer final : CommandBufferImpl {
   VkCommandBuffer cmd = VK_NULL_HANDLE;
@@ -162,7 +215,9 @@ struct VkrCommandBuffer final : CommandBufferImpl {
   bool submitted = false;
   std::shared_ptr<VkrState> st;
   ~VkrCommandBuffer() override {
-    if (!submitted && st && cmd != VK_NULL_HANDLE) st->be->AbandonCommands(cmd);
+    // Finish() already ended it, so the backend must not end it again.
+    if (!submitted && st && cmd != VK_NULL_HANDLE)
+      st->be->AbandonCommands(cmd, /*ended=*/true);
   }
 };
 struct VkrQuerySet final : QuerySetImpl {
@@ -216,8 +271,7 @@ struct VkrRenderPass final : RenderPassImpl {
 struct VkrEncoder final : CommandEncoderImpl {
   std::shared_ptr<VkrState> st;
   VkCommandBuffer cmd = VK_NULL_HANDLE;
-  std::unique_ptr<vk::Recorder> rec;
-  vk::Bindings bindings{};  // set by the bridge at the first RecordTable call
+  std::unique_ptr<vk::Recorder> rec;  // from VkrState::freeRecorders when one is free
 
   // Set by Finish(): from then on the CommandBuffer handle owns the upload
   // debt and this destructor must not settle it a second time.
@@ -229,6 +283,8 @@ struct VkrEncoder final : CommandEncoderImpl {
     // test at the next BeginCommands cannot tell a dead encoder from a live
     // second one, and guessing wrong there double-writes the staging ring.
     if (!handedOff && cmd != VK_NULL_HANDLE) st->be->AbandonCommands(cmd);
+    // The recorder goes back for the next encoder (VkrState::freeRecorders).
+    if (rec) st->freeRecorders.push_back(std::move(rec));
   }
 
   VkrEncoder(std::shared_ptr<VkrState> s, const char* label) : st(std::move(s)) {
@@ -238,12 +294,16 @@ struct VkrEncoder final : CommandEncoderImpl {
     // recorded after it. Same order as phase 3c's RunTable — load-bearing.
     cmd = st->be->BeginCommands(label ? label : "enc");
     if (cmd == VK_NULL_HANDLE) return;
-    rec = std::make_unique<vk::Recorder>(*st->be, bindings, st->mode);
+    if (!st->freeRecorders.empty()) {
+      rec = std::move(st->freeRecorders.back());
+      st->freeRecorders.pop_back();
+    } else {
+      rec = std::make_unique<vk::Recorder>(*st->be, st->mode);
+    }
+    // Begin() resets EVERYTHING per-recording — tracker, bindings, stats and
+    // the --measure timer a previous encoder attached — so a reused recorder
+    // records exactly what a fresh one would.
     rec->Begin(cmd);
-  }
-
-  void ClearBuffer(const Buffer& b, uint64_t offset, uint64_t size) override {
-    rec->FillUntracked(NB(b), offset, size == kWholeSize ? UINT64_MAX : size);
   }
   void CopyBufferToBuffer(const Buffer& src, uint64_t srcOffset, const Buffer& dst,
                           uint64_t dstOffset, uint64_t size) override {
@@ -252,6 +312,10 @@ struct VkrEncoder final : CommandEncoderImpl {
   void CopyTracked(pass::Buf srcId, const Buffer& src, uint64_t srcOffset,
                    const Buffer& dst, uint64_t dstOffset, uint64_t size) override {
     rec->CopyTracked(srcId, NB(src), srcOffset, NB(dst), dstOffset, size);
+  }
+  void CopyTrackedRegions(pass::Buf srcId, const Buffer& src, const Buffer& dst,
+                          const CopyRegion* regions, size_t count) override {
+    rec->CopyTrackedRegions(srcId, NB(src), NB(dst), regions, count);
   }
   void CopyRenderWritten(const Buffer& src, uint64_t srcOffset, const Buffer& dst,
                          uint64_t dstOffset, uint64_t size) override {
@@ -284,12 +348,6 @@ struct VkrEncoder final : CommandEncoderImpl {
   void ResolveQuerySet(const QuerySet& qs, uint32_t firstQuery, uint32_t queryCount,
                        const Buffer& dst, uint64_t dstOffset) override;
   void WriteTimestamp(const QuerySet& qs, uint32_t index, bool bottom) override;
-  ComputePass BeginComputePass(const char*, const PassTimestampWrites*) override {
-    // Nothing reaches this on Vulkan: sim recording goes through the
-    // RecordTableVulkan bridge (the recorder walks the rows itself), and the
-    // measure timer hangs its timestamps off the recorder's group transitions.
-    NotReachable("BeginComputePass (generic compute-pass encoding)");
-  }
   bool presenting = false;  // set when a pass targets a swapchain image
 
   RenderPass BeginRenderPass(const RenderPassDesc& d) override {
@@ -434,6 +492,7 @@ struct VkrDevice final : DeviceImpl {
     auto impl = std::make_shared<VkrBindGroupLayout>();
     impl->l = st->be->CreateSetLayout(entries, count);
     if (impl->l == VK_NULL_HANDLE) return {};
+    impl->st = st;
     impl->entries.assign(entries, entries + count);
     return BindGroupLayout(std::move(impl));
   }
@@ -446,6 +505,8 @@ struct VkrDevice final : DeviceImpl {
     auto impl = std::make_shared<VkrPipelineLayout>();
     impl->l = st->be->CreatePipelineLayout(sets.data(), count);
     if (impl->l == VK_NULL_HANDLE) return {};
+    impl->st = st;
+    for (size_t i = 0; i < count; i++) impl->keepSets.push_back(groups[i].Ref());
     return PipelineLayout(std::move(impl));
   }
 
@@ -458,6 +519,7 @@ struct VkrDevice final : DeviceImpl {
     impl->set = st->be->CreateDescriptorSet(bgl->l, bgl->entries.data(), entries, count,
                                             bufs);
     if (impl->set == VK_NULL_HANDLE) return {};
+    impl->keepLayout = layout.Ref();
     return BindGroup(std::move(impl));
   }
 
@@ -470,6 +532,7 @@ struct VkrDevice final : DeviceImpl {
     auto impl = std::make_shared<VkrShaderModule>();
     impl->source = wgsl;
     impl->label = label ? label : "shader";
+    impl->st = st;
     return ShaderModule(std::move(impl));
   }
 
@@ -478,9 +541,10 @@ struct VkrDevice final : DeviceImpl {
                                         const char* label) override {
     auto* m = static_cast<VkrShaderModule*>(module.Get());
     auto* pl = static_cast<VkrPipelineLayout*>(layout.Get());
-    std::string diag;
+    std::string diag, key;
     VkShaderModule sm = st->be->GetShaderModule(m->source, m->label, entry,
-                                                /*bodyLineOffset=*/0, diag);
+                                                /*bodyLineOffset=*/0, diag, &key);
+    if (sm != VK_NULL_HANDLE) m->Hold(std::move(key));
     if (sm == VK_NULL_HANDLE) {
       std::fprintf(stderr, "shader compile failed for %s::%s\n%s\n", m->label.c_str(),
                    entry, diag.c_str());
@@ -494,6 +558,8 @@ struct VkrDevice final : DeviceImpl {
     }
     auto impl = std::make_shared<VkrComputePipeline>();
     impl->p = p;
+    impl->st = st;
+    impl->keepLayout = layout.Ref();
     return ComputePipeline(std::move(impl));
   }
 
@@ -503,16 +569,18 @@ struct VkrDevice final : DeviceImpl {
     auto* pl = static_cast<VkrPipelineLayout*>(d.layout.Get());
     if (!vm || !fm || !pl) return {};
     const char* label = d.label ? d.label : "renderPipeline";
-    std::string diag;
+    std::string diag, key;
     VkShaderModule vs =
-        st->be->GetShaderModule(vm->source, vm->label, d.vertexEntry, 0, diag);
+        st->be->GetShaderModule(vm->source, vm->label, d.vertexEntry, 0, diag, &key);
+    if (vs != VK_NULL_HANDLE) vm->Hold(std::move(key));
     if (vs == VK_NULL_HANDLE) {
       std::fprintf(stderr, "shader compile failed for %s::%s\n%s\n", vm->label.c_str(),
                    d.vertexEntry, diag.c_str());
       return {};
     }
     VkShaderModule fs =
-        st->be->GetShaderModule(fm->source, fm->label, d.fragmentEntry, 0, diag);
+        st->be->GetShaderModule(fm->source, fm->label, d.fragmentEntry, 0, diag, &key);
+    if (fs != VK_NULL_HANDLE) fm->Hold(std::move(key));
     if (fs == VK_NULL_HANDLE) {
       std::fprintf(stderr, "shader compile failed for %s::%s\n%s\n", fm->label.c_str(),
                    d.fragmentEntry, diag.c_str());
@@ -528,6 +596,8 @@ struct VkrDevice final : DeviceImpl {
     auto impl = std::make_shared<VkrRenderPipeline>();
     impl->p = p;
     impl->layout = pl->l;
+    impl->keepLayout = d.layout.Ref();
+    impl->st = st;
     return RenderPipeline(std::move(impl));
   }
 
@@ -683,7 +753,7 @@ void VkrEncoder::ResolveQuerySet(const QuerySet& qs, uint32_t firstQuery,
   // ordinary way instead of needing a hand-placed one.
   rec->DeclareUse(d, pass::Acc::TransferWrite);
   st->be->Fns().CmdCopyQueryPoolResults(cmd, q->pool, firstQuery, queryCount, d->buf,
-                                        dstOffset, 8,
+                                        dstOffset, kTimestampBytes,
                                         VK_QUERY_RESULT_64_BIT | VK_QUERY_RESULT_WAIT_BIT);
   // Reset the consumed range so the next command buffer can reuse it. Legal
   // outside a render pass; ordering against the copy above is by submission
@@ -775,24 +845,32 @@ VkImageView NativeImageView(const TextureView& v) {
 }  // namespace vkr
 
 // RecordTableVulkan lives in namespace rhi (declared in rhi_record.h).
-void RecordTableVulkan(const CommandEncoder& enc, pass::Table which, const TableCtx& cx,
-                       const TableBindings& tb, PassTimer* timer) {
+//
+// Two things cross here and neither is copied field by field any more: the
+// record context is the recorder's own type (pass::RecordCtx) passed by
+// reference, and the bindings arrive as raw seam pointers that are downcast
+// once each. What remains is the one translation the seam exists for — seam
+// object to live Vulkan handle.
+void RecordTableVulkan(const CommandEncoder& enc, pass::Table which,
+                       const pass::RecordCtx& cx, const TableBindings& tb,
+                       PassTimer* timer) {
   using namespace vkr;
   auto* e = static_cast<VkrEncoder*>(enc.Get());
   if (!e || !e->rec) return;
 
   vk::Bindings bd{};
-  for (int i = 0; i < (int)pass::Buf::kCount; i++) bd.buffers[i] = NB(tb.buffers[i]);
+  for (int i = 0; i < (int)pass::Buf::kCount; i++)
+    bd.buffers[i] = tb.buffers[i] ? static_cast<VkrBuffer*>(tb.buffers[i])->b : nullptr;
   for (int i = 0; i < (int)pass::Pipe::kPipeCount; i++) {
-    bd.pipelines[i] =
-        tb.pipelines[i] ? static_cast<VkrComputePipeline*>(tb.pipelines[i].Get())->p
-                        : VK_NULL_HANDLE;
+    bd.pipelines[i] = tb.pipelines[i]
+                          ? static_cast<VkrComputePipeline*>(tb.pipelines[i])->p
+                          : VK_NULL_HANDLE;
   }
-  auto layout = [](const PipelineLayout& l) {
-    return l ? static_cast<VkrPipelineLayout*>(l.Get())->l : VK_NULL_HANDLE;
+  auto layout = [](PipelineLayoutImpl* l) {
+    return l ? static_cast<VkrPipelineLayout*>(l)->l : VK_NULL_HANDLE;
   };
-  auto set = [](const BindGroup& g) {
-    return g ? static_cast<VkrBindGroup*>(g.Get())->set : VK_NULL_HANDLE;
+  auto set = [](BindGroupImpl* g) {
+    return g ? static_cast<VkrBindGroup*>(g)->set : VK_NULL_HANDLE;
   };
   bd.simLayout = layout(tb.simLayout);
   bd.slimPartLayout = layout(tb.slimPartLayout);
@@ -824,50 +902,7 @@ void RecordTableVulkan(const CommandEncoder& enc, pass::Table which, const Table
     }
   }
 
-  vk::RecordCtx cxv{};
-  cxv.opsCount = cx.opsCount;
-  cxv.cellCount = cx.cellCount;
-  cxv.expCount = cx.expCount;
-  cxv.spawnCount = cx.spawnCount;
-  cxv.genCount = cx.genCount;
-  cxv.farCount = cx.farCount;
-  cxv.fluidCount = cx.fluidCount;
-  cxv.fluidSpawnCount = cx.fluidSpawnCount;
-  cxv.windWakeCount = cx.windWakeCount;
-  cxv.waterChunkCount = cx.waterChunkCount;
-  cxv.waterDrainBodies = cx.waterDrainBodies;
-  cxv.waterSweepSlot = cx.waterSweepSlot;
-  cxv.waveMode = cx.waveMode;
-  cxv.opennessChunks = cx.opennessChunks;
-  cxv.gasActive = cx.gasActive;
-  cxv.gasFarEmitCount = cx.gasFarEmitCount;
-  cxv.gasFarWideCount = cx.gasFarWideCount;
-  cxv.reposeActive = cx.reposeActive;
-  cxv.glowChunks = cx.glowChunks;
-  cxv.hashEnable = cx.hashEnable;
-  cxv.particlesActive = cx.particlesActive;
-  // Both of these were missing from this copy until ROADMAP §3.4 added
-  // caActive next to denseWorldgen and the omission became load-bearing.
-  // denseWorldgen defaulting to true meant --residency paged still recorded
-  // the whole-world worldgen dispatch it is supposed to suppress; it was
-  // invisible because the paged path ALSO runs the batched genList and the
-  // extra dispatch is idempotent over the same slots. Fixed here rather than
-  // left, because a field that silently does not cross the seam is exactly
-  // the "two structs that must agree" failure this bridge exists to avoid.
-  cxv.denseWorldgen = cx.denseWorldgen;
-  cxv.caActive = cx.caActive;
-  // ...and vizActive was the next one to go missing, the same way, one commit
-  // later: the Cond::VizActive case was added to the recorder without the
-  // field, so the tree did not compile — and adding only the field would have
-  // left the overlay permanently off with nothing to see. Three structs, one
-  // value; all three or none.
-  cxv.vizActive = cx.vizActive;
-  // The clouds' three switches and their dispatch extent. Same rule as the
-  // note above: three structs, one value; all three or none.
-  cxv.cloudFlags = cx.cloudFlags;
-  cxv.cloudGx = cx.cloudGx;
-  cxv.cloudGy = cx.cloudGy;
-  e->rec->RecordTable(which, cxv);
+  e->rec->RecordTable(which, cx);
 }
 
 }  // namespace rhi

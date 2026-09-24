@@ -5,7 +5,9 @@
 #include <chrono>
 #include <cstdio>
 #include <cstdlib>
+#include <filesystem>
 #include <fstream>
+#include <memory>
 #include <mutex>
 #include <sstream>
 #include <string_view>
@@ -26,27 +28,64 @@
 // re-deriving constants on paper, which is how ROADMAP_scale.md ended up with a
 // memory anchor that has never been checked against an allocation.
 // Diagnostics only: nothing reads the tally, and it is not in any hash.
-static std::vector<GpuBufferRecord>& BufferLog() {
-  static std::vector<GpuBufferRecord> log;
+//
+// LIVE buffers, not every buffer ever made: each record holds a weak reference
+// to the seam object, and a record whose buffer has been released is dropped
+// at the next read. The tally used to be append-only, so every gate's staging
+// read and every F5-rebuilt buffer stayed in the "budget" forever and the total
+// only grew. Locked because buffers are created from build-pool threads.
+namespace {
+struct BufferLogEntry {
+  GpuBufferRecord rec;
+  std::weak_ptr<rhi::BufferImpl> live;
+};
+std::mutex& BufferLogMutex() {
+  static std::mutex m;
+  return m;
+}
+std::vector<BufferLogEntry>& BufferLog() {
+  static std::vector<BufferLogEntry> log;
   return log;
 }
+// Caller holds BufferLogMutex.
+void PruneBufferLog() {
+  auto& log = BufferLog();
+  log.erase(std::remove_if(log.begin(), log.end(),
+                           [](const BufferLogEntry& e) { return e.live.expired(); }),
+            log.end());
+}
+}  // namespace
 
 rhi::Buffer CreateBuffer(const rhi::Device& device, uint64_t size,
                          rhi::BufferUsage usage, const char* label) {
-  BufferLog().push_back({label ? label : "<unlabelled>", size});
-  return device.CreateBuffer(size, usage, label);
+  rhi::Buffer b = device.CreateBuffer(size, usage, label);
+  if (b) {
+    std::lock_guard<std::mutex> lock(BufferLogMutex());
+    PruneBufferLog();  // keeps the log bounded by the live set
+    BufferLog().push_back({{label ? label : "<unlabelled>", size}, b.Ref()});
+  }
+  return b;
 }
 
 uint64_t GpuBufferBytesTotal() {
+  std::lock_guard<std::mutex> lock(BufferLogMutex());
+  PruneBufferLog();
   uint64_t t = 0;
-  for (const auto& r : BufferLog()) t += r.bytes;
+  for (const auto& e : BufferLog()) t += e.rec.bytes;
   return t;
 }
 
-const std::vector<GpuBufferRecord>& GpuBufferRecords() { return BufferLog(); }
+std::vector<GpuBufferRecord> GpuBufferRecords() {
+  std::lock_guard<std::mutex> lock(BufferLogMutex());
+  PruneBufferLog();
+  std::vector<GpuBufferRecord> out;
+  out.reserve(BufferLog().size());
+  for (const auto& e : BufferLog()) out.push_back(e.rec);
+  return out;
+}
 
 void DumpGpuBufferBudget(const char* whenLabel) {
-  auto sorted = BufferLog();
+  auto sorted = GpuBufferRecords();
   std::stable_sort(sorted.begin(), sorted.end(),
                    [](const GpuBufferRecord& a, const GpuBufferRecord& b) {
                      return a.bytes > b.bytes;
@@ -82,6 +121,40 @@ static bool ReadFileText(const std::string& path, std::string& out) {
   return true;
 }
 
+// common.wgsl is prepended to EVERY shader, so a BuildPipelines used to read
+// it from disk once per shader file (23 times) and a --sweep / F5 loop paid
+// that again per rebuild. Cached by (path, mtime, size): one stat per shader
+// instead of one read, and an edit still takes effect on the next load — the
+// F5 contract — because the edit moves the mtime. Thread-safe: LoadShader runs
+// on the build pool.
+static bool ReadCommonCached(const std::string& path, std::string& out) {
+  namespace fs = std::filesystem;
+  std::error_code ec;
+  const auto mtime = fs::last_write_time(path, ec);
+  const auto size = ec ? 0 : fs::file_size(path, ec);
+  if (ec) return ReadFileText(path, out);  // let the plain read report it
+  static std::mutex m;
+  static std::string cPath, cText;
+  static fs::file_time_type cTime{};
+  static uintmax_t cSize = 0;
+  static bool cValid = false;
+  {
+    std::lock_guard<std::mutex> lock(m);
+    if (cValid && cPath == path && cTime == mtime && cSize == size) {
+      out = cText;
+      return true;
+    }
+  }
+  if (!ReadFileText(path, out)) return false;
+  std::lock_guard<std::mutex> lock(m);
+  cPath = path;
+  cText = out;
+  cTime = mtime;
+  cSize = size;
+  cValid = true;
+  return true;
+}
+
 // World constants, emitted as WGSL from the C++ definitions in world.h so the
 // two can never disagree. Previously common.wgsl redeclared these by hand and a
 // mismatch was silent: kVoxelMeters drifting from VOXEL_METERS just meant the
@@ -90,8 +163,9 @@ static bool ReadFileText(const std::string& path, std::string& out) {
 
 // The one exception, and it is flagged rather than hidden: a DEVICE CAPABILITY,
 // not a world constant — see resources.h. Defaults true so every prelude
-// consumer that has no device (--vk-info, check_shaders.sh) assembles the
-// shipping variant of raymarch.wgsl rather than a fallback one nobody runs.
+// consumer that has no device (check_shaders.sh, the save fingerprint)
+// assembles the shipping variant of raymarch.wgsl rather than a fallback one
+// nobody runs.
 static bool g_fragmentStoresAvailable = true;
 void SetFragmentStoresAvailable(bool available) {
   g_fragmentStoresAvailable = available;
@@ -102,7 +176,36 @@ static bool g_renderStatsEnabled = false;
 void SetRenderStatsEnabled(bool on) { g_renderStatsEnabled = on; }
 bool RenderStatsEnabled() { return g_renderStatsEnabled; }
 
+// The generated text depends on compile-time world.h constants plus exactly
+// these load-time inputs; ShaderConstantPrelude memoizes on them so the build
+// pool's 23 LoadShader calls format it once instead of 23 times. ADD AN INPUT
+// HERE when the prelude grows a non-constant line, or a reload that moves it
+// will keep serving the old text.
+static std::string PreludeInputsKey() {
+  const treeatlas::TreeLattice& l = treeatlas::CurrentTreeLattice();
+  return std::to_string((int)g_fragmentStoresAvailable) + "," +
+         std::to_string((int)g_renderStatsEnabled) + "," + std::to_string(l.tile) +
+         "," + std::to_string(l.scan) + "," + std::to_string(l.candMax) + "," +
+         std::to_string(worldmap::CurrentWorldMap().pondTile) + "," +
+         std::to_string(worldmap::CurrentTerrain().refVoxelsPerMetre);
+}
+static std::string BuildShaderConstantPrelude();
 std::string ShaderConstantPrelude() {
+  static std::mutex m;
+  static std::string key, text;
+  const std::string k = PreludeInputsKey();
+  {
+    std::lock_guard<std::mutex> lock(m);
+    if (!text.empty() && key == k) return text;
+  }
+  std::string t = BuildShaderConstantPrelude();
+  std::lock_guard<std::mutex> lock(m);
+  key = k;
+  text = t;
+  return t;
+}
+
+static std::string BuildShaderConstantPrelude() {
   std::ostringstream o;
   o << "// GENERATED from src/sim/world.h by ShaderConstantPrelude() — do not\n"
        "// edit, and do not redeclare these in common.wgsl.\n";
@@ -517,7 +620,7 @@ std::string ReferencedTuningBlock(const std::string& block, const std::string& t
 bool AssembleShaderSource(const std::string& shaderDir, const std::string& name,
                           std::string& out) {
   std::string common, body;
-  if (!ReadFileText(shaderDir + "/common.wgsl", common)) {
+  if (!ReadCommonCached(shaderDir + "/common.wgsl", common)) {
     std::fprintf(stderr, "cannot read %s/common.wgsl\n", shaderDir.c_str());
     return false;
   }

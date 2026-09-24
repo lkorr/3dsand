@@ -11,33 +11,25 @@
 // why the declarations come from `src/sim/pass_table.def` rather than from
 // anything typed next to a dispatch.
 //
-// HOW THE PASS TABLE REACHES THE TRACKER (the seam phase 3b adds)
-// ---------------------------------------------------------------
-// Under Dawn, `Simulation::RecordTable` walks the table and calls
-// `enc.ClearBuffer` / `enc.CopyBufferToBuffer` / `pass.Dispatch*`. Dawn derives
-// its barriers from bind-group usage, so the row's `uses` array is inert there
-// — it exists only for the checker.
+// HOW THE PASS TABLE REACHES THE TRACKER
+// --------------------------------------
+// The `uses` array is the whole point, so the recording call must carry it.
+// Rather than widen the wgpu-shaped `rhi::` encoder surface with a
+// `DeclareUses()` — an API where forgetting the call silently removes
+// barriers — the recorder walks `pass::kRows` itself, through `RecordTable()`
+// below. The row is therefore not a parameter that can be omitted: it is the
+// loop variable. Every command the recorder can issue is reachable only from a
+// row, and each takes a `Uses` span that the row supplies. Simulation hands
+// across only the RESOLUTION (page-symbolic ids -> live objects) through the
+// rhi_record.h bridge.
 //
-// Under Vulkan the `uses` array is the whole point, so the recording call must
-// carry it. Rather than widen the wgpu-shaped `rhi::` encoder surface with a
-// `DeclareUses()` that only one backend can honour — an API where forgetting
-// the call silently removes barriers — this backend walks the SAME
-// `pass::kRows` array itself, through `RecordTable()` below. The row is
-// therefore not a parameter that can be omitted: it is the loop variable. Every
-// command the recorder can issue is reachable only from a row, and each takes a
-// `Uses` span that the row supplies.
+// (Until the Dawn removal on 2026-08-22 there were two walkers of the one
+// table, Dawn's deriving its own barriers from bind-group usage; this is the
+// one that survived.)
 //
-// The two walkers (Dawn's in simulation.cpp, Vulkan's in vk_record.cpp) read
-// one table and must agree about WHAT is recorded; the checker plus
-// cross-backend hash equality is what proves they do. That duplication is
-// deliberate and bounded: the alternative was making `rhi::` handles virtual,
-// which would have restructured the Dawn backend that is currently the port's
-// only hash oracle.
-//
-// WHAT IS NOT HERE
-// ----------------
-// Render passes (phase 4), the readback ring and streaming (phase 3c). This
-// file records compute, copies and fills, and nothing else.
+// Off-table work goes through the same tracker: the readback/eviction copies
+// (CopyTracked*), the render domain (BeginRendering and friends, phase 4b),
+// and the ad-hoc copies of the seam's generic encoder calls (CopyToHost).
 
 #pragma once
 
@@ -64,88 +56,10 @@ enum class BarrierMode {
   Sledgehammer, // a full ALL_COMMANDS/MEMORY_READ|WRITE barrier before EVERY command
 };
 
-// Everything the recorder needs to resolve a row's selectors. Mirrors the
-// anonymous RecordCtx in simulation.cpp — same fields, same meanings, because
-// the conditions and dispatch extents are properties of the TABLE, not of a
-// backend.
-struct RecordCtx {
-  uint32_t opsCount = 0;
-  uint32_t cellCount = 0;
-  uint32_t expCount = 0;
-  uint32_t spawnCount = 0;
-  uint32_t genCount = 0;
-  uint32_t farCount = 0;
-  uint32_t fluidCount = 0;       // MLS-MPM particles alive AFTER this tick's spawns
-  uint32_t fluidSpawnCount = 0;  // MLS-MPM spawn ops this tick
-  uint32_t windWakeCount = 0;    // wind primitive footprint chunks this tick
-  // Water-body chunk-list entries this tick (docs/PLAN_water_master.md M2).
-  // Zero whenever sim.waterBodyMode is 0, which is what makes the off switch an
-  // exact identity: no row is recorded at all.
-  uint32_t waterChunkCount = 0;
-  // Reserved drain spawn-op BLOCKS this tick (M3, component 6). Zero at
-  // sim.waterBodyMode 0 and whenever no body is proposed, so the discharge
-  // row is not recorded and the shipped world cannot see it.
-  uint32_t waterDrainBodies = 0;
-  // M5: which body's container curve re-derives this tick, or
-  // kWaterBodyCap for "none". A pure function of the tick (plan
-  // section 3.4) and the whole condition on both sweep rows.
-  uint32_t waterSweepSlot = 0xFFFFFFFFu;
-  // W2: sim.waveMode ANDed with "a body is listed this tick"
-  // (docs/PLAN_water_relevel.md §4.2). 0 leaves the surface-momentum row
-  // unrecorded, which is the exact-identity arm.
-  uint32_t waveMode = 0;
-  // Chunks the openness refresh walks this tick (render.opennessChunksPerFrame,
-  // clamped). Zero suppresses the row entirely, which is what makes
-  // `opennessChunksPerFrame = 0` an exact "off" rather than a cheap path.
-  uint32_t opennessChunks = 0;
-  // Chunks the glow refresh walks this tick (render.glowChunksPerFrame,
-  // clamped, and zeroed when render.glowStrength is 0). Suppresses all three
-  // glow rows, which is what makes the off switch exact.
-  uint32_t glowChunks = 0;
-  bool hashEnable = false;
-  bool particlesActive = false;
-  // False under --residency paged: worldgen's whole-world dispatch is
-  // replaced by batched worldgenList submits (PLAN_page_table.md §3.5c).
-  bool denseWorldgen = true;
-  // False ONLY when the CPU can prove the dirty set is empty (ROADMAP_scale.md
-  // §3.4). Drops compact + the args staging copy + all 54 CA iterations, which
-  // is the whole of a settled tick's CA cost. Defaults TRUE so a caller that
-  // never sets it records the CA exactly as before — the safe direction.
-  bool caActive = true;
-  // True only while the per-voxel activity overlay is on. Gates the ActVoxViz
-  // write so the debug buffer costs nothing when the dev toggle is off.
-  bool vizActive = false;
-  // Gas particles (docs/PLAN_gas_particles.md). True when parcels are already
-  // in flight OR the CA has work this tick — a voxel can only reach the window
-  // edge from a chunk the CA is running, and a parcel already out there has to
-  // be stepped whether or not any chunk is awake. False on every tick of a
-  // settled world with no plume, and then no gas row is recorded at all.
-  bool gasActive = false;
-  // Far fire-plume emitters the CPU handed the GPU this tick (world.h
-  // kGasFarEmitMax). 0 = no frozen fire is in range, and then the splat row is
-  // not recorded at all; it also decides, together with gasActive, whether the
-  // density box is cleared (C_GASOUT).
-  uint32_t gasFarEmitCount = 0;
-  // ...and the LONG-RANGE emitters (world.h kGasFarOuterN). 0 = no fire is in
-  // the 51.2 m..409.6 m band, and then neither the wide splat nor the wide
-  // box's clear is recorded.
-  uint32_t gasFarWideCount = 0;
-  // Any loaded material authors a `repose` AND the CA has work this tick
-  // (world.h kReposeSnap*). False for a materials.json with no repose line,
-  // and then the snapshot prepass is not recorded at all.
-  bool reposeActive = false;
-  // ---- the clouds (cloud.wgsl, DESIGN.md 9.w) — per-FRAME, ShadowCache table
-  // bit 0 kCloudRecOn: the weather has something in the sky and weather.clouds
-  //   is on, so the weather/shadow/env/march/resolve rows record.
-  // bit 1 kCloudRecBake: the noise volume has not been baked since the last
-  //   pipeline build; the bake row records once.
-  // bit 2 kCloudRecShadowCache: the voxel shadow cache is on (its three rows
-  //   used to be C_ALWAYS inside EncodeShadowResolve's early-out; they now
-  //   share the table with the clouds, which run without it).
-  uint32_t cloudFlags = 0;
-  // Workgroups (8x8) over the low-res cloud target, from the frame's size.
-  uint32_t cloudGx = 0, cloudGy = 0;
-};
+// Everything the recorder needs to resolve a row's selectors: the ONE struct
+// Simulation fills and passes through the bridge by reference
+// (sim/pass_table.h says why there is only one now).
+using RecordCtx = pass::RecordCtx;
 
 // The live GPU objects a table row resolves against. The recorder is handed one
 // of these per recording; it never looks anything up globally.
@@ -223,8 +137,7 @@ struct RenderAttachments {
 // command buffers — that is what the head barrier makes sound.
 class Recorder {
  public:
-  Recorder(Backend& be, const Bindings& bind, BarrierMode mode)
-      : be_(be), bind_(bind), mode_(mode) {}
+  Recorder(Backend& be, BarrierMode mode) : be_(be), mode_(mode) {}
 
   // Replace the bindings mid-recording. Exists for the seam encoder (rhi_vk.cpp),
   // which is constructed before Simulation resolves the page-symbolic ids and
@@ -237,6 +150,12 @@ class Recorder {
   // barrier that makes "the tracker resets per command buffer" sound
   // (barrier_graph §3.4): submission order gives execution ordering between
   // submits, never memory visibility.
+  //
+  // RESETS EVERY PER-RECORDING FIELD — tracker state, bindings (to none),
+  // stats, the --measure timer, the compute bind cache — because the seam
+  // REUSES recorders across encoders (rhi_vk.cpp VkrState::freeRecorders). A
+  // field left out here is state leaking from one command buffer into the
+  // next.
   void Begin(VkCommandBuffer cmd);
 
   // Walk one table's rows in record order, recording each and emitting the
@@ -260,10 +179,6 @@ class Recorder {
   // The destination is registered for the Finish() host barrier when mapped.
   void CopyToHost(Buffer* src, uint64_t srcOffset, Buffer* dst, uint64_t dstOffset,
                   uint64_t size);
-  // vkCmdFillBuffer with no pass::Buf id — the seam's generic ClearBuffer.
-  // Same pointer-derived tracking as CopyToHost.
-  void FillUntracked(Buffer* dst, uint64_t offset, uint64_t size);
-
   // Declare an access performed by a command the recorder does not itself
   // issue (vkCmdCopyQueryPoolResults writing the timer resolve buffer). The
   // hazard against/for it is still DERIVED by the tracker; call BEFORE
@@ -320,6 +235,15 @@ class Recorder {
   // whose bindings were never set — the eviction command buffer).
   void CopyTracked(pass::Buf srcId, Buffer* src, uint64_t srcOffset, Buffer* dst,
                    uint64_t dstOffset, uint64_t size);
+  // The batched form: `count` regions from one tracked source into one
+  // destination, as ONE tracker touch and ONE vkCmdCopyBuffer. A loop of
+  // CopyTracked calls over the same pair (a readback's chunk fetches, an
+  // eviction batch) derives the identical barrier on its first call and none
+  // after, so this records the same dependencies with one command instead of
+  // `count`. Same destination rules as CopyTracked (disjoint regions,
+  // host-read only).
+  void CopyTrackedRegions(pass::Buf srcId, Buffer* src, Buffer* dst,
+                          const rhi::CopyRegion* regions, size_t count);
 
   // rhi::CommandEncoder::CopyRenderWritten — see the contract there. `src` is
   // an EXTRAS buffer (never a table slot): its state is set to "last written
@@ -424,8 +348,24 @@ class Recorder {
   void TimerOpen(const char* group);
   void TimerClose();
 
+  // The compute bind point's last vkCmdBindDescriptorSets, so a row whose
+  // (layout, sets, dynamic offset) is identical to what is already bound skips
+  // the call. Bound sets survive vkCmdBindPipeline between pipelines of one
+  // layout, and nothing else in this engine binds on the COMPUTE point of a
+  // recorder's command buffer, so equality here is exactly "already bound".
+  // Reset by Begin(). The CA loop never hits it (each iteration's dynamic
+  // offset differs); consecutive rows on one layout do.
+  struct ComputeBind {
+    VkPipelineLayout layout = VK_NULL_HANDLE;
+    VkDescriptorSet sets[2] = {VK_NULL_HANDLE, VK_NULL_HANDLE};
+    uint32_t setCount = 0;
+    uint32_t dynCount = 0;
+    uint32_t dynOff = 0;
+  };
+  ComputeBind lastBind_{};
+
   Backend& be_;
-  Bindings bind_;
+  Bindings bind_{};
   BarrierMode mode_ = BarrierMode::Precise;
   VkCommandBuffer cmd_ = VK_NULL_HANDLE;
 

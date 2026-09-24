@@ -252,8 +252,18 @@ fn sampleDetail(uvw : vec3f) -> vec4f {
 }
 
 // ============================================================================
-// THE WEATHER MAP — entry `weather`, every frame
+// THE WEATHER MAP — entry `weather`, when the uniform asks (CLF_WEATHER)
 // ============================================================================
+// REBUILT ONLY WHEN IT CHANGES (WriteCloudParams, support.cpp). The row is
+// recorded every frame, but a frame without CLF_WEATHER returns at the first
+// line: the map from the last rebuild is REUSED, because nothing in it moves
+// at frame rate. The drift and the camera re-centring are translations of the
+// noise domain, which weatherAt applies at lookup (C.spare.yz, metres the
+// drift has moved since the rebuild; C.weatherOrigin stays the map's own), so
+// reuse costs no accuracy at all; the slow shape terms (weatherEvolve and the
+// preset's coverage / type / precip) rebuild it when they have moved by a
+// step too small to see. It had been 512^2 texels x six 5-octave fBms every
+// frame — ~31M hashes and ~16M sincos for a picture that changes over minutes.
 // Four channels per 125 m texel around the camera:
 //   R  local coverage (the density threshold the march remaps against)
 //   G  cloud type (0 stratus .. 1 cumulonimbus)
@@ -295,8 +305,13 @@ fn fbm2(pIn : vec2f, salt : u32) -> f32 {
   return clamp(s * 1.35 + 0.5, 0.0, 1.0);
 }
 
+// CloudParams.flags bit (world.h kClfWeather): rebuild the weather map this
+// frame. Declared here, its only reader.
+const CLF_WEATHER : u32 = 8u;
+
 @compute @workgroup_size(8, 8)
 fn weather(@builtin(global_invocation_id) gid : vec3<u32>) {
+  if ((C.flags & CLF_WEATHER) == 0u) { return; }
   if (gid.x >= CLOUD_WEATHER_N || gid.y >= CLOUD_WEATHER_N) { return; }
   let pM = C.weatherOrigin + (vec2f(gid.xy) + 0.5) * C.weatherTexelM;
   let s = pM / TUNE_CLOUD_WEATHER_SCALE_M + C.weatherOff;
@@ -344,10 +359,11 @@ fn weather(@builtin(global_invocation_id) gid : vec3<u32>) {
 
 // Bilinear weather at absolute metres (x, z). Off the map: the preset's
 // global coverage with no rain, so the deck thins into the average rather
-// than ending.
+// than ending. `C.spare.yz` is the drift since the map was built (zero on a
+// rebuild frame): the field at xz now is the built field at xz + that.
 fn weatherAt(xz : vec2f) -> vec4f {
   let n = f32(CLOUD_WEATHER_N);
-  let f = (xz - C.weatherOrigin) / C.weatherTexelM - 0.5;
+  let f = (xz + C.spare.yz - C.weatherOrigin) / C.weatherTexelM - 0.5;
   if (f.x < 0.0 || f.y < 0.0 || f.x >= n - 1.0 || f.y >= n - 1.0) {
     return vec4f(C.coverage * 0.8, C.cloudType, 0.0, 0.5);
   }

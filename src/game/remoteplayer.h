@@ -70,7 +70,7 @@ struct PlayerSession;  // session.h includes THIS file; MakePlayerState is in .c
 // reinterpreted. The handshake compares it and refuses a mismatch rather than
 // reading a peer's struct with our layout — the failure mode of getting that
 // wrong is a player standing in the wrong place with no error anywhere.
-constexpr uint32_t kPlayerStateVersion = 1;
+constexpr uint32_t kPlayerStateVersion = 2;  // 2: kThrowDraw/kThrowSwing
 
 // ONE TICK OF SOMEBODY ELSE'S CONTROLLER, AS A RESULT. POD, fixed layout, no
 // pointers and no std:: anything: this struct is memcpy'd into a frame by
@@ -136,6 +136,13 @@ struct PlayerState {
     kHanging = 1u << 6,
     kAlive = 1u << 7,
     kBlindFall = 1u << 8,
+    // THE THROW, as LEVELS rather than edges: drawing (Q held, the wind-up
+    // hold) and swinging (released, the arm coming through until the vessel
+    // leaves the hand -- PlayerSession::throwLaunchIn, 3 ticks). A level
+    // survives a dropped state where a one-tick edge would not; the ghost
+    // plays the clips on the transitions it sees (RemotePlayersPreTick).
+    kThrowDraw = 1u << 9,
+    kThrowSwing = 1u << 10,
   };
   bool Has(Flag f) const { return (flags & (uint32_t)f) != 0; }
   void Set(Flag f, bool on) {
@@ -195,6 +202,10 @@ struct RemotePlayer {
   // The kinematic Jolt capsule, so a local player cannot walk through a ghost.
   uint64_t proxyBody = 0;
   bool spawned = false;  // our own record, so Despawn/Revive stay symmetric
+  // The throw levels as last played on the rig, so a clip starts on the
+  // transition and not every tick. Cleared while the avatar is despawned (a
+  // respawned rig has no clips running).
+  bool throwDraw = false, throwSwing = false;
 
   // Fill `ghost` + `heading` from a freshly arrived state. The ONE-TICK EDGES
   // (`jumped`, `impactDeltaV`) are set from the state here and drained after

@@ -208,7 +208,139 @@ uint32_t gRainLatchWord = 0;
 State gLast;
 Preset gEased;
 bool gEasedValid = false;
-std::string gEasedTarget;
+
+// ============================================================================
+// THE SIM'S HALF, IN INTEGERS (SimRainWord; weather.h says why)
+// ============================================================================
+//
+// Q16 fixed point throughout: 65536 = 1.0. Every float that enters is turned
+// into an integer by ONE exact step — float -> double is exact, a multiply by
+// 65536 (or by a whole tick count that fits the mantissa) is exact, and
+// llround's half-away-from-zero is specified — so the quantised inputs are a
+// pure function of the authored bits. Everything after that is int64 add,
+// multiply, arithmetic shift and division, which no two machines disagree on.
+// The structure mirrors the float path above step for step (MoistureAt,
+// Ladder, Scheduled, GroundPrecip, WetnessAt), so the renderer's sky and the
+// sim's rain are the same weather to within fixed-point rounding.
+
+constexpr int64_t kQ = 65536;
+// Ticks per second, from the one tick constant rather than a literal 30.
+constexpr int64_t kTickHz = (int64_t)(1.0f / sandvox::kTickDt + 0.5f);
+static_assert(kTickHz == 30, "weather's tick clock assumes the 30 Hz tick");
+
+int64_t Q16(float v) { return (int64_t)std::llround((double)v * 65536.0); }
+int64_t ClampQ(int64_t v) { return std::clamp<int64_t>(v, 0, kQ); }
+// Floor division for a possibly negative numerator, positive denominator: the
+// float path's std::floor, which C++'s truncating `/` is not below zero.
+int64_t FloorDiv(int64_t a, int64_t b) {
+  const int64_t q = a / b;
+  return (a % b != 0 && a < 0) ? q - 1 : q;
+}
+// smoothstep's x*x*(3-2x) on a Q16 x in [0, 1].
+int64_t SmoothQ(int64_t x) { return (x * x * (3 * kQ - 2 * x)) >> 32; }
+// Unit() as Q16: the same 24 hashed bits, truncated to 16.
+int64_t UnitQ(uint32_t seed, uint32_t a, uint32_t b) {
+  return (int64_t)((rng::Hash3(seed, a, b) & 0x00FFFFFFu) >> 8);
+}
+int64_t LerpQ(int64_t a, int64_t b, int64_t t) { return a + (((b - a) * t) >> 16); }
+
+// exp(-k/4) for k = 1..8, the wetness decay weights, as Q16 literals —
+// round(exp(-k/4) * 65536). A table rather than std::exp: the one
+// transcendental in the old path, and the reason this block exists.
+constexpr int64_t kWetDecayQ[8] = {51039, 39750, 30957, 24109,
+                                   18776, 14623, 11388, 8869};
+
+// The weather.* tuning the sim word reads, quantised once per call.
+struct SimTuneQ {
+  bool autoCycle = false;
+  int64_t epochTicks = 1;  // one weather epoch, in ticks (>= 15 s)
+  int64_t speedQ = 0;      // cycleSpeed, Q16
+  uint32_t seedOffset = 0;
+  int64_t dryTicks = 1;    // drySeconds, in ticks (>= 5 s)
+  int64_t precipScaleQ = 0;
+  int64_t igniteDampQ = 0;
+};
+
+SimTuneQ QuantiseTuning(const Tuning& tn) {
+  const Tuning::Weather& w = tn.weather;
+  SimTuneQ q;
+  q.autoCycle = w.autoCycle;
+  q.epochTicks = std::max<int64_t>(
+      1, std::llround((double)std::max(0.5f, w.epochMinutes) * 60.0 * (double)kTickHz));
+  q.speedQ = Q16(std::max(0.0f, w.cycleSpeed));
+  q.seedOffset = (uint32_t)w.seedOffset;
+  q.dryTicks = std::max<int64_t>(
+      1, std::llround((double)std::max(5.0f, w.drySeconds) * (double)kTickHz));
+  q.precipScaleQ = Q16(w.precipScale);
+  q.igniteDampQ = ClampQ(Q16(w.rainIgniteDamp));
+  return q;
+}
+
+// MoistureAt, Q16 in and out. `eQ` is the epoch position in Q16 epochs.
+int64_t MoistureQ(uint32_t seed, int64_t eQ) {
+  auto oct = [&](int64_t xQ, uint32_t comp) {
+    const int64_t i = xQ >> 16;  // floor: arithmetic shift of a signed value
+    const int64_t f = SmoothQ(xQ - (i << 16));
+    const int64_t a = UnitQ(seed ^ kCycleSalt, (uint32_t)i, comp);
+    const int64_t b = UnitQ(seed ^ kCycleSalt, (uint32_t)(i + 1), comp);
+    return LerpQ(a, b, f);
+  };
+  // 0.65 / 0.35 and the 1.45 contrast stretch, as Q16 (42598 + 22938 = 1.0).
+  const int64_t v = (oct(FloorDiv(eQ, 3), 1u) * 42598 + oct(eQ, 2u) * 22938) >> 16;
+  return ClampQ((((v - kQ / 2) * 95027) >> 16) + kQ / 2);
+}
+
+// Ladder, Q16: the preset pair bracketing moisture `m` and the blend.
+void LadderQ(const std::vector<PresetQ>& ps, int64_t m, int& a, int& b, int64_t& t) {
+  int64_t total = 0;
+  for (const PresetQ& p : ps) total += p.weight;
+  a = b = 0;
+  t = 0;
+  if (total <= 0 || ps.empty()) return;
+  int64_t acc = 0;
+  const int64_t x = (m * total) >> 16;
+  int last = -1;
+  for (int i = 0; i < (int)ps.size(); i++) {
+    if (ps[i].weight <= 0) continue;
+    const int64_t lo = acc, hi = acc + ps[i].weight;
+    last = i;
+    if (x <= hi) {
+      int nx = -1;
+      for (int k = i + 1; k < (int)ps.size(); k++)
+        if (ps[k].weight > 0) { nx = k; break; }
+      const int64_t u = ((x - lo) << 16) / std::max<int64_t>(hi - lo, 1);
+      a = i;
+      b = nx < 0 ? i : nx;
+      // edge = 0.5: (u - (1 - edge)) / edge = (u - 0.5) * 2
+      t = nx < 0 ? 0 : SmoothQ(ClampQ((u - kQ / 2) * 2));
+      return;
+    }
+    acc = hi;
+  }
+  a = b = std::max(last, 0);
+}
+
+// Scheduled, Q16, at `tick` (signed: the wetness history reaches before 0).
+// `pinned` is the tuning's fixed preset index when the cycle is off.
+PresetQ ScheduledQ(const SimTuneQ& q, const std::vector<PresetQ>& ps, int pinned,
+                   uint32_t seed, int64_t tick) {
+  if (!q.autoCycle || ps.size() < 2) return ps[pinned];
+  const int64_t eQ = FloorDiv(tick * q.speedQ, q.epochTicks);
+  const int64_t m = MoistureQ(seed + q.seedOffset, eQ);
+  int a, b;
+  int64_t t;
+  LadderQ(ps, m, a, b, t);
+  PresetQ o;
+  o.weight = LerpQ(ps[a].weight, ps[b].weight, t);
+  o.coverage = LerpQ(ps[a].coverage, ps[b].coverage, t);
+  o.precip = LerpQ(ps[a].precip, ps[b].precip, t);
+  o.precipType = LerpQ(ps[a].precipType, ps[b].precipType, t);
+  return o;
+}
+
+int64_t GroundPrecipQ(const PresetQ& p) {
+  return ClampQ((p.precip * SmoothQ(ClampQ((p.coverage - kQ / 4) * 2))) >> 16);
+}
 
 }  // namespace
 
@@ -281,11 +413,20 @@ void Library::EnsureLoaded() {
     return a.name < b.name;
   });
   for (const std::string& w : warnings_) std::fprintf(stderr, "weather: %s\n", w.c_str());
+  // The sim's quantised copy, parallel and in the same (sorted) order.
+  presetsQ_.clear();
+  for (const Preset& p : presets_)
+    presetsQ_.push_back({Q16(p.weight), Q16(p.coverage), Q16(p.precip), Q16(p.precipType)});
 }
 
 const std::vector<Preset>& Library::Presets() {
   EnsureLoaded();
   return presets_;
+}
+
+const std::vector<PresetQ>& Library::PresetsQ() {
+  EnsureLoaded();
+  return presetsQ_;
 }
 
 const Preset* Library::Find(const std::string& name) {
@@ -315,10 +456,7 @@ const std::string& Override() {
   return gOverride;
 }
 
-State Resolve(const Tuning& tn, uint32_t seed, double ts, float dt, float camXM,
-              float camZM, bool commit) {
-  (void)camXM;
-  (void)camZM;
+State Resolve(const Tuning& tn, uint32_t seed, double ts, float dt, bool commit) {
   EnsureEnvPin();
   State s;
   s.enabled = tn.weather.clouds;
@@ -326,15 +464,12 @@ State Resolve(const Tuning& tn, uint32_t seed, double ts, float dt, float camXM,
 
   // ---- the target: the override if one is pinned, else the schedule ----
   Preset target;
-  std::string targetKey;
   const Preset* ov = gOverride.empty() ? nullptr : Presets().Find(gOverride);
   if (ov) {
     target = *ov;
     s.fromName = s.toName = ov->name;
-    targetKey = "ov:" + ov->name;
   } else {
     target = Scheduled(tn, ps, seed, ts, &s.fromName, &s.toName, &s.blend);
-    targetKey = "sched";
   }
 
   // ---- the manual ease ------------------------------------------------------
@@ -355,7 +490,6 @@ State Resolve(const Tuning& tn, uint32_t seed, double ts, float dt, float camXM,
     gEased.name = target.name;
     gEased.label = target.label;
   }
-  (void)targetKey;
   if (commit) s.mix = gEased;
 
   // Global knobs on top of whatever the sky is doing.
@@ -428,23 +562,43 @@ const State& Last() { return gLast; }
 uint32_t SimRainWord(const Tuning& tn, uint32_t seed, uint32_t tick) {
   EnsureEnvPin();
   if (!tn.weather.clouds || !tn.weather.rainTouchesWorld) return 0u;
+  // Integers only from here (the block above the anonymous namespace's end
+  // says how the floats got in). The same steps as the renderer's
+  // Scheduled / GroundPrecip / WetnessAt, on PresetQ.
   const std::vector<Preset>& ps = Presets().Presets();
-  const double ts = (double)tick / 30.0;
+  const std::vector<PresetQ>& pq = Presets().PresetsQ();
+  const SimTuneQ q = QuantiseTuning(tn);
+  // The tuning's fixed preset when the cycle is off: the LAST name match, as
+  // Scheduled picks it, else the first preset.
+  int pinned = 0;
+  for (int i = 0; i < (int)ps.size(); i++)
+    if (ps[i].name == tn.weather.preset) pinned = i;
   // The TARGET, never the frame-time ease: the ease is wall-clock and would
   // make the world hash depend on frame pacing. So a dev-panel pin rains on
   // the world at once while the sky takes transitionSeconds to catch up.
   const Preset* ov = gOverride.empty() ? nullptr : Presets().Find(gOverride);
-  Preset now = ov ? *ov : Scheduled(tn, ps, seed, ts, nullptr, nullptr, nullptr);
-  now.precip = std::clamp(now.precip * tn.weather.precipScale, 0.0f, 1.0f);
+  const PresetQ* ovq = ov ? &pq[(size_t)(ov - ps.data())] : nullptr;
+  const int64_t t0 = (int64_t)tick;
+  PresetQ now = ovq ? *ovq : ScheduledQ(q, pq, pinned, seed, t0);
+  now.precip = ClampQ((now.precip * q.precipScaleQ) >> 16);
   // Rain only: snow neither douses nor soaks (it is a later package, as the
   // composite's whitening is).
-  const float rain = GroundPrecip(now) * (1.0f - now.precipType);
-  const float wet = WetnessAt(tn, ps, seed, ts, ov, now);
-  auto q8 = [](float v) {
-    return (uint32_t)std::lround(std::clamp(v, 0.0f, 1.0f) * 255.0f);
-  };
-  gLastSimWord = (q8(rain) & 0xFFu) | (q8(tn.weather.rainIgniteDamp) << 8) |
-                 (q8(wet) << 16);
+  const int64_t gpNow = GroundPrecipQ(now);
+  const int64_t rain = (gpNow * (kQ - now.precipType)) >> 16;
+  // Wetness: WetnessAt's eight exp-weighted samples of the schedule, reaching
+  // back k * drySeconds / 4 (the pin itself when one is set), plus `now` at
+  // weight 1. The weighted mean is Q16; the x1.6 is 104858 / 65536.
+  int64_t acc = gpNow * kQ, wsum = kQ;
+  for (int k = 1; k <= 8; k++) {
+    const int64_t back = ((int64_t)k * q.dryTicks) / 4;
+    const PresetQ p = ovq ? *ovq : ScheduledQ(q, pq, pinned, seed, t0 - back);
+    acc += GroundPrecipQ(p) * kWetDecayQ[k - 1];
+    wsum += kWetDecayQ[k - 1];
+  }
+  const int64_t wet =
+      (ClampQ(((acc / wsum) * 104858) >> 16) * (kQ - now.precipType)) >> 16;
+  auto q8 = [](int64_t v) { return (uint32_t)((ClampQ(v) * 255 + kQ / 2) >> 16); };
+  gLastSimWord = (q8(rain) & 0xFFu) | (q8(q.igniteDampQ) << 8) | (q8(wet) << 16);
   return gLastSimWord;
 }
 

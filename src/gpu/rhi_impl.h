@@ -26,8 +26,9 @@
 // Vulkan encoder does not derive barriers from these wgpu-shaped calls — sim
 // recording routes through vk::Recorder walking pass::kRows (see the bridge in
 // rhi_record.h), exactly the phase-3b shape. The encoder virtuals below exist
-// for the off-table paths (readback copies, staging reads, fills), every one of
-// which still expresses its hazard through the same tracker.
+// for the off-table paths (readback copies, staging reads, fills, the render
+// pass), every one of which still expresses its hazard through the same
+// tracker. There is deliberately no generic compute-pass virtual.
 
 #pragma once
 
@@ -62,16 +63,6 @@ struct RenderPipelineImpl { virtual ~RenderPipelineImpl() = default; };
 struct CommandBufferImpl { virtual ~CommandBufferImpl() = default; };
 struct QuerySetImpl { virtual ~QuerySetImpl() = default; };
 
-struct ComputePassImpl {
-  virtual ~ComputePassImpl() = default;
-  virtual void SetPipeline(const ComputePipeline& p) = 0;
-  virtual void SetBindGroup(uint32_t index, const BindGroup& bg, uint32_t dynCount,
-                            const uint32_t* dynOffsets) = 0;
-  virtual void Dispatch(uint32_t x, uint32_t y, uint32_t z) = 0;
-  virtual void DispatchIndirect(const Buffer& args, uint64_t offset) = 0;
-  virtual void End() = 0;
-};
-
 struct RenderPassImpl {
   virtual ~RenderPassImpl() = default;
   virtual void SetPipeline(const RenderPipeline& p) = 0;
@@ -85,11 +76,12 @@ struct RenderPassImpl {
 
 struct CommandEncoderImpl {
   virtual ~CommandEncoderImpl() = default;
-  virtual void ClearBuffer(const Buffer& b, uint64_t offset, uint64_t size) = 0;
   virtual void CopyBufferToBuffer(const Buffer& src, uint64_t srcOffset, const Buffer& dst,
                                   uint64_t dstOffset, uint64_t size) = 0;
   virtual void CopyTracked(pass::Buf srcId, const Buffer& src, uint64_t srcOffset,
                            const Buffer& dst, uint64_t dstOffset, uint64_t size) = 0;
+  virtual void CopyTrackedRegions(pass::Buf srcId, const Buffer& src, const Buffer& dst,
+                                  const CopyRegion* regions, size_t count) = 0;
   virtual void CopyRenderWritten(const Buffer& src, uint64_t srcOffset,
                                  const Buffer& dst, uint64_t dstOffset,
                                  uint64_t size) = 0;
@@ -103,9 +95,6 @@ struct CommandEncoderImpl {
   virtual void ResolveQuerySet(const QuerySet& qs, uint32_t firstQuery, uint32_t queryCount,
                                const Buffer& dst, uint64_t dstOffset) = 0;
   virtual void WriteTimestamp(const QuerySet& qs, uint32_t index, bool bottom) = 0;
-  // ts == nullptr means an untimed pass; the public API's two overloads
-  // collapse here so a backend implements exactly one entry point.
-  virtual ComputePass BeginComputePass(const char* label, const PassTimestampWrites* ts) = 0;
   virtual RenderPass BeginRenderPass(const RenderPassDesc& d) = 0;
   virtual CommandBuffer Finish() = 0;
 };

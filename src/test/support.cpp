@@ -384,6 +384,35 @@ CloudPrev gCloudPrev;
 CloudPrev gCloudPrevAux;
 unsigned gVeilPitch = 0;
 
+// ---- WEATHER-MAP REUSE (cloud.wgsl `weather`) -----------------------------
+// The weather map is 512^2 texels of six 5-octave gradient-noise fBms — about
+// 31M hashes and 16M sincos — and it used to be rebuilt in full every frame
+// although nothing in it moves at frame rate. Everything it depends on is one
+// of three kinds:
+//   * TRANSLATIONS of the noise domain: the drift (weatherOff) and the camera
+//     re-centring (weatherOrigin). A translated field is the same field read
+//     at a shifted position, so the map is REUSED and the lookup (weatherAt)
+//     adds the metres the drift has moved since it was built (spare.yz). No
+//     approximation at all while the reused map still covers the view.
+//   * SLOW CHANGES of shape: weatherEvolve (1 unit per 25 min, on a lattice
+//     of cloudWeatherScaleM / 0.7 ~ 17 km) and the preset's coverage / type /
+//     precip (weather transitions over minutes). Rebuilt when they move past
+//     a step small enough that the step is below what the eye can see — the
+//     evolve step is ~7 m of front movement, under a 125 m texel.
+//   * a changed map scale or a first frame: rebuilt outright.
+// The camera probe (cloudMaps CLOUD_PROBE_BASE) is written by the regen, so
+// between regens it is the column the camera was over at the last one — at
+// most a few hundred metres off, for a rain-here flag.
+struct WeatherGen {
+  bool valid = false;
+  float off[2] = {0, 0};
+  float origin[2] = {0, 0};
+  float evolve = 0, coverage = 0, precip = 0, cloudType = 0, scaleM = 0;
+};
+WeatherGen gWeatherGen;      // the map on the GPU (committed by the recorder)
+WeatherGen gWeatherPending;  // what this frame's uniform asked to build
+bool gWeatherRegenAsked = false;
+
 }  // namespace
 
 const CloudFrame& LastCloudFrame() { return gCloudFrame; }
@@ -395,6 +424,11 @@ CloudHistoryProbe MainCloudHistory() {
   p.lowW = gCloudPrev.lowW;
   p.lowH = gCloudPrev.lowH;
   return p;
+}
+void CommitCloudWeather() {
+  if (!gWeatherRegenAsked) return;
+  gWeatherGen = gWeatherPending;
+  gWeatherRegenAsked = false;
 }
 
 // Fills the weather fields of `rp` and uploads CloudParams. Called from
@@ -421,7 +455,7 @@ static void WriteCloudParams(const rhi::Queue& queue, const World& world,
   // An aux view PEEKS at the weather (commit = false): the main view's eased
   // sky, with neither the ease nor Last() touched.
   const weather::State st =
-      weather::Resolve(tun, rp.seed, tSec, dt, camXM, camZM, !auxView);
+      weather::Resolve(tun, rp.seed, tSec, dt, !auxView);
   const weather::Preset& w = st.mix;
   const bool on = st.enabled &&
                   (w.coverage > 0.001f || w.cirrus > 0.001f || w.precip > 0.001f);
@@ -549,6 +583,56 @@ static void WriteCloudParams(const rhi::Queue& queue, const World& world,
     cp.weatherOrigin[0] = (float)(std::floor(((double)camXM - h) / t) * t);
     cp.weatherOrigin[1] = (float)(std::floor(((double)camZM - h) / t) * t);
   }
+  // ---- reuse the weather map, or rebuild it (WeatherGen above) ----
+  {
+    const WeatherGen& g = gWeatherGen;
+    const float S = (float)weatherS;
+    const float shiftX = (cp.weatherOff[0] - g.off[0]) * S;
+    const float shiftZ = (cp.weatherOff[1] - g.off[1]) * S;
+    // Slack: 16 texels (2 km) of combined drift + camera travel from the
+    // centre the map was built round. The map reaches 256 texels (32 km) each
+    // way, so the view keeps >= 30 km of it in every direction.
+    const float slackM = 16.0f * cp.weatherTexelM;
+    const float lagX = std::fabs(cp.weatherOrigin[0] - g.origin[0]);
+    const float lagZ = std::fabs(cp.weatherOrigin[1] - g.origin[1]);
+    const bool regen =
+        !g.valid || g.scaleM != S ||
+        std::fabs(shiftX) + lagX > slackM || std::fabs(shiftZ) + lagZ > slackM ||
+        std::fabs(cp.weatherEvolve - g.evolve) > 4e-4f ||
+        std::fabs(cp.coverage - g.coverage) > 2e-3f ||
+        std::fabs(cp.precip - g.precip) > 2e-3f ||
+        std::fabs(cp.cloudType - g.cloudType) > 2e-3f;
+    // An aux view records no cloud passes, so it must not ask for (or stage)
+    // a regen the main view's recorder would then commit as its own.
+    if (!auxView) gWeatherRegenAsked = on && regen;
+    if (regen) {
+      static WeatherGen auxScratch;
+      WeatherGen& p = auxView ? auxScratch : gWeatherPending;
+      p.valid = true;
+      p.off[0] = cp.weatherOff[0];
+      p.off[1] = cp.weatherOff[1];
+      p.origin[0] = cp.weatherOrigin[0];
+      p.origin[1] = cp.weatherOrigin[1];
+      p.evolve = cp.weatherEvolve;
+      p.coverage = cp.coverage;
+      p.precip = cp.precip;
+      p.cloudType = cp.cloudType;
+      p.scaleM = S;
+      cp.flags |= kClfWeather;
+      cp.spare[1] = 0.0f;
+      cp.spare[2] = 0.0f;
+    } else {
+      // The map on the GPU was built at g.origin with g.off: read it there,
+      // shifted by the drift since. The regen-only fields (off, origin) are
+      // left as the map's own so nothing can read a mixed pair.
+      cp.weatherOrigin[0] = g.origin[0];
+      cp.weatherOrigin[1] = g.origin[1];
+      cp.weatherOff[0] = g.off[0];
+      cp.weatherOff[1] = g.off[1];
+      cp.spare[1] = shiftX;
+      cp.spare[2] = shiftZ;
+    }
+  }
   cp.shadowTexelM = 40.0f;
   // Just under the lowest local base: the jitter cap mirrors common.wgsl's
   // cloudBaseJitterM (10% of thickness, at most CLOUD_BASE_JITTER_MAX_M
@@ -600,6 +684,73 @@ static void WriteCloudParams(const rhi::Queue& queue, const World& world,
     gCloudFrame.lowW = lowW;
     gCloudFrame.lowH = lowH;
   }
+}
+
+// ---- THE FRAME'S LIGHT: one author for the key light and the ambient ------
+// Fills RenderParams' dayWeight / moonLit / keyDir / keyCol / ambGround /
+// ambSky / ambOvercast from the sky state already in `rp` and the TUNE_*
+// values, exactly as the per-pixel WGSL did (common.wgsl keyLightColorP,
+// keyLightDirP, ambientAtP, moonContribP, sunTransmittance, airMass — the
+// shader now reads the results instead of re-deriving them). Everything here
+// is frame-constant, so it was 21 + 18 call sites of per-pixel smoothsteps,
+// pows and an acos computing the same numbers, in two copies that had
+// drifted apart (the terrain's missed the overcast and lightning).
+//
+// Render-only float math: nothing here reaches the sim or the world hash.
+// Called after WriteCloudParams, which is what writes overcast / lightning.
+static void ResolveFrameLight(RenderParams& rp, const Tuning::Render& r) {
+  auto clampf = [](float x, float lo, float hi) { return std::min(std::max(x, lo), hi); };
+  auto smooth = [&](float e0, float e1, float x) {
+    const float t = clampf((x - e0) / (e1 - e0), 0.0f, 1.0f);
+    return t * t * (3.0f - 2.0f * t);
+  };
+  // moonContribP: up-ness x intensity x (illuminated fraction)^2 shaping.
+  auto moonContrib = [&](const float* dir, float phase, float intensity) {
+    return smooth(-0.10f, 0.18f, dir[1]) * intensity *
+           (0.15f + 1.70f * phase * phase);
+  };
+  // airMass (Kasten-Young) and sunTransmittance, common.wgsl.
+  const float c = clampf(rp.sunDir[1], -0.02f, 1.0f);
+  const float zdeg = std::acos(clampf(c, -1.0f, 1.0f)) * (180.0f / 3.14159265358979f);
+  const float mass = 1.0f / (c + 0.50572f * std::pow(std::max(96.07995f - zdeg, 1e-3f), -1.6364f));
+  static const float kRayleigh[3] = {0.1440f, 0.3125f, 0.7940f};
+  const float kSunTransmitK = 0.09f;
+
+  const float a = moonContrib(rp.moonDir, rp.moonPhase, r.moonLightIntensity);
+  const float b = moonContrib(rp.moon2Dir, rp.moon2Phase, r.moon2LightIntensity);
+  const float f = clampf(rp.solarEclipse, 0.0f, 1.0f);
+  const float dayW = rp.sunUp * (1.0f - std::pow(f, r.eclipseCurve) * r.eclipseDarkness);
+  const float inv = 1.0f / std::max(r.moonLightIntensity, 1e-4f);
+  const float moonLit = (a + b) * inv;
+  rp.dayWeight = dayW;
+  rp.moonLit = moonLit;
+
+  // Key colour: the brighter moon by night, the reddened sun by day.
+  for (int k = 0; k < 3; k++) {
+    const float sunCol = std::exp(-kRayleigh[k] * mass * kSunTransmitK * r.sunReddening) *
+                         r.sunColor[k] * r.sunIntensity;
+    const float keyMoon = a >= b ? r.moonLightColor[k] * a : r.moon2LightColor[k] * b;
+    rp.keyCol[k] = keyMoon + (sunCol - keyMoon) * dayW;
+  }
+  // Key direction: a hard switch at RAW sunUp = 0.5 (keyLightDirP's argument
+  // for not blending, and for not using the eclipse-dimmed weight).
+  {
+    const float* d = rp.sunUp >= 0.5f ? rp.sunDir : (a >= b ? rp.moonDir : rp.moon2Dir);
+    const float len = std::sqrt(d[0] * d[0] + d[1] * d[1] + d[2] * d[2]);
+    const float il = len > 0.0f ? 1.0f / len : 0.0f;
+    for (int k = 0; k < 3; k++) rp.keyDir[k] = d[k] * il;
+    if (len <= 0.0f) rp.keyDir[1] = 1.0f;
+  }
+  // Hemisphere ambient at its two ends. Linear in n.y, so the shader's
+  // mix(ambGround, ambSky, n.y * 0.5 + 0.5) is the old expression exactly.
+  const float moonAmt = 0.30f * (moonLit >= 0.001f ? 1.0f : 0.0f) + 1.40f * moonLit * 0.5f;
+  for (int k = 0; k < 3; k++) {
+    const float nightG = r.nightAmbGround[k] * (0.45f + moonAmt);
+    const float nightS = r.nightAmbSky[k] * (0.45f + moonAmt);
+    rp.ambGround[k] = nightG + (r.ambGround[k] - nightG) * dayW;
+    rp.ambSky[k] = nightS + (r.ambSky[k] - nightS) * dayW;
+  }
+  rp.ambOvercast = clampf(rp.overcast, 0.0f, 1.0f) * 0.8f;
 }
 
 void WriteRenderParams(const rhi::Queue& queue, const World& world,
@@ -804,6 +955,8 @@ void WriteRenderParams(const rhi::Queue& queue, const World& world,
   // veilBase's pitch, computed the way the shader computes it (f32 product,
   // rounded); EnsureVeil adds a column of slack for the rounding-mode tie.
   gVeilPitch = (unsigned)std::max(1.0f, std::round(rp.viewPx * rp.aspect));
+  // After the clouds: the ambient's overcast and lightning come from there.
+  ResolveFrameLight(rp, tun.render);
   queue.WriteBuffer(world.renderUBO, 0, &rp, sizeof(rp));
 }
 
@@ -1142,9 +1295,10 @@ void SubmitTick(GpuContext& ctx, World& world, Simulation& sim, uint32_t tick,
   // through the back door. Quiescence and adoption are GPU-side now
   // (sim_waterbody.wgsl); what rides this stream cannot see a fence.
   //
-  // `sim.waterBodyMode` is 0 by default and mode 0 is an immediate early-out
-  // that leaves both counts at zero, so every pass row's condition is false,
-  // nothing is recorded, and the pinned world hash cannot see any of it.
+  // `sim.waterBodyMode` 0 is an immediate early-out that leaves both counts
+  // at zero, so every pass row's condition is false and nothing is recorded.
+  // The SHIPPED tuning.json sets mode 1 (label lakes, write nothing — see the
+  // settled-tick note further down), so this is not a default-off system.
   const WaterBodyGpu* waterGpu = nullptr;
   uint32_t drainBodies = 0;
   {
@@ -1466,9 +1620,12 @@ void SubmitTick(GpuContext& ctx, World& world, Simulation& sim, uint32_t tick,
   // opposite reason. A spawn op is consumed on the tick it arrives, so its
   // buffer must be rewritten every tick or the previous tick's ops respawn.
   // The emitter list is a STANDING description of where the frozen fires are:
-  // it changes only when a chunk is evicted, re-loaded or the window moves, so
-  // it is uploaded only when Build() says it changed — which is no ticks at all
-  // in a world nobody has set alight, and one tick per window shift otherwise.
+  // its membership changes only when a chunk is evicted, re-loaded or the
+  // window moves, and its crossfade weights when the eye has moved
+  // kGasFarEyeStepVox (FarPlumes::SetEye; the eye-only rebuild reuses the
+  // cached membership). It is uploaded only when Build() produced a different
+  // image — no ticks at all in a world nobody has set alight, and otherwise a
+  // window shift or a weight byte that actually moved.
   //
   // Simulation is told the count BEFORE EncodeTick for NoteGasSpawns' reason:
   // the count is the splat row's dispatch extent AND half the condition on the
@@ -1782,7 +1939,8 @@ void SubmitTick(GpuContext& ctx, World& world, Simulation& sim, uint32_t tick,
   // reading is how a chunk that just gained matter gets demoted under it.
   if (world.LatestDelivered().valid)
     pt.ConsumeOccupancy(world.LatestDelivered().occupancy,
-                        world.LatestDelivered().occStain, tick);
+                        world.LatestDelivered().occStain,
+                        world.LatestDelivered().tick, tick);
   pt.RetirePages(tick);
 
   // ---- the §3.4 settled-skip latch ----------------------------------------
@@ -1912,13 +2070,19 @@ void SubmitTick(GpuContext& ctx, World& world, Simulation& sim, uint32_t tick,
   }
   bool doCopy = false;
   {
-    // TIMED (P3-F): ~1.9 MiB of copies out per tick, recorded as raw
+    // TIMED (P3-F): up to ~2 MiB of copies out per tick (~0.8 MiB at rest,
+    // more with chunk fetches in flight), recorded as raw
     // CopyBufferToBuffer rather than as pass rows. `readback` was a CPU-only
     // row on the Performance page; this is the GPU side of the same system.
     TickGpuSpan spanRb(enc, "readbackCopy");
+    // The digest table rides hash ticks only and the swimming fold only
+    // ticks that recorded the seam — the only ticks either GPU table can
+    // have changed on (World::EncodeReadbacks). 236 KiB of the ~1 MiB a
+    // resting tick used to copy out.
     doCopy = world.EncodeReadbacks(ctx.device, enc,
                                    {playerChunk.x - 1, playerChunk.y - 1, playerChunk.z - 1},
-                                   1 - sim.Page(), tick);
+                                   1 - sim.Page(), tick, hashEnable,
+                                   sim.FluidSeamRecorded());
     if (doCopy) {
       world.EncodeDirtyCopy(enc, sim.DirtyNext());
     } else {
@@ -1998,6 +2162,11 @@ void SubmitTick(GpuContext& ctx, World& world, Simulation& sim, uint32_t tick,
   // candidate instead of one rebuild per candidate.
   static const uint32_t kPagedSnapshotMaxGap = [] {
     constexpr uint32_t kDefault = 4;
+    // World::kSnapshotLatency's ceiling, checked where it is declared rather
+    // than in two comments: the published snapshot is K ticks old, and the
+    // page table's drain may not accept a delivered one older than that.
+    static_assert(World::kSnapshotLatency <= kDefault,
+                  "kSnapshotLatency must stay <= kPagedSnapshotMaxGap");
     if (const char* e = std::getenv("SANDVOX_SNAP_MAXGAP")) {
       const long n = std::strtol(e, nullptr, 10);
       if (n >= 1 && n <= 13) {
@@ -2162,7 +2331,18 @@ void SubmitWorldgen(GpuContext& ctx, World& world, Simulation& sim, uint32_t see
   // generalizes to a grown window, where a dense transient would be 4 GiB and
   // simply impossible.
   {
-    const uint32_t kGenBatch = 2048;
+    const uint32_t kGenBatch = kWorldgenBatch;   // world.h: genAct covers it
+    // SANDVOX_GEN_VERDICT_CHECK=1: classify every batch BOTH ways — the GPU
+    // verdict and PageTable::Classify over the read-back words — install the
+    // words' answer, and count every disagreement. The verdict path's claim is
+    // "identical to Classify", and this is the switch that measures it rather
+    // than argues it (one --verify boot with it set covers every worldgen the
+    // gates run).
+    static const bool kVerdictCheck = [] {
+      const char* e = std::getenv("SANDVOX_GEN_VERDICT_CHECK");
+      return e && e[0] == '1';
+    }();
+    uint64_t verdictMismatch = 0, verdictChecked = 0;
     // The first submit still has to clear the transient buffers (hash,
     // support, particle counts, both dirty pages) exactly as EncodeWorldgen
     // does, so run it over an EMPTY slot list: the fills land, the dispatch
@@ -2174,7 +2354,8 @@ void SubmitWorldgen(GpuContext& ctx, World& world, Simulation& sim, uint32_t see
       ctx.queue.Submit(enc.Finish());
     }
     std::vector<uint32_t> batch;
-    std::vector<uint32_t> vox((size_t)kGenBatch * kChunkVol);
+    std::vector<uint32_t> verdict(kGenBatch, 0u);
+    std::vector<uint32_t> vox;   // words: only for the check / a fallback
     batch.reserve(kGenBatch);
     for (uint32_t base = 0; base < kNumSlots; base += kGenBatch) {
       const uint32_t n = std::min(kGenBatch, kNumSlots - base);
@@ -2197,10 +2378,39 @@ void SubmitWorldgen(GpuContext& ctx, World& world, Simulation& sim, uint32_t see
       // Classify and demote, which returns the all-air pages to the free list
       // for the next batch. This is the compaction §3.5c calls for, run
       // eagerly once per batch rather than on the hysteresis cadence.
-      ReadVoxelsSync(ctx, world, base, n, vox.data(), "wgClassify");
+      //
+      // ON THE GPU'S VERDICT, NOT THE WORDS. genChunk's `list` entry reduces
+      // PageTable::Classify's three tests over the words it wrote and
+      // publishes the class into genAct (world.h kGenVerdict*), so a batch
+      // costs an 8 KiB readback instead of ReadVoxelsSync's 32 MiB — 512 MiB
+      // per paged worldgen, which startup, every menu regen, vk_smoke and
+      // ~220 selftest regens used to pay, plus a CPU Classify of 32,768
+      // chunks. The words are read only to CHECK the verdict
+      // (SANDVOX_GEN_VERDICT_CHECK=1) or when a verdict was not published.
+      rhi::ReadbackBlocking(ctx.device, ctx.queue, world.genAct, 0,
+                            verdict.data(), (size_t)n * 4, "wgVerdict");
+      bool needWords = kVerdictCheck;
+      for (uint32_t k = 0; k < n && !needWords; k++)
+        if ((verdict[k] & kGenVerdictValid) == 0u) needWords = true;
+      if (needWords) {
+        if (vox.size() < (size_t)kGenBatch * kChunkVol)
+          vox.resize((size_t)kGenBatch * kChunkVol);
+        ReadVoxelsSync(ctx, world, base, n, vox.data(), "wgClassify");
+      }
       for (uint32_t k = 0; k < n; k++) {
-        const uint32_t e =
-            world.pages->Classify(base + k, vox.data() + (size_t)k * kChunkVol);
+        uint32_t e = world.pages->ClassifyGenVerdict(verdict[k], seed);
+        if (needWords) {
+          const uint32_t ew = world.pages->Classify(
+              base + k, vox.data() + (size_t)k * kChunkVol);
+          if (kVerdictCheck && (verdict[k] & kGenVerdictValid) != 0u) {
+            verdictChecked++;
+            if (ew != e && verdictMismatch++ < 8)
+              std::printf("[genverdict] MISMATCH slot %u: verdict 0x%08x -> "
+                          "0x%08x, Classify(words) 0x%08x\n",
+                          base + k, verdict[k], e, ew);
+          }
+          e = ew;
+        }
         if (e != PageTable::kNeedsPage) world.pages->SetSentinel(base + k, e);
       }
       world.pages->FlushTableWrites(ctx.queue);
@@ -2236,8 +2446,8 @@ void SubmitWorldgen(GpuContext& ctx, World& world, Simulation& sim, uint32_t see
     // GPU's dirty buffer IS the wake, so a mirror taken from it cannot
     // disagree with it; a second implementation of the act predicate is the
     // divergence rule 3 of the design guidelines forbids. 128 KiB once per
-    // worldgen, beside the 16 synchronous 32 MiB voxel reads the loop above
-    // already pays.
+    // worldgen, beside the sixteen 8 KiB verdict reads the loop above pays
+    // (it was sixteen 32 MiB voxel reads before the GPU verdict).
     //
     // RefilledSlot, NOT WakeAll, and the difference is CLAUDE.md rule 2.
     // Contributor (d) is defined for precisely this case ("a slot the CPU
@@ -2263,21 +2473,19 @@ void SubmitWorldgen(GpuContext& ctx, World& world, Simulation& sim, uint32_t see
       }
     }
 
-    // ZERO THE FAULT COUNTER AFTER WORLDGEN, and only here.
+    // ZERO THE FAULT COUNTER AFTER WORLDGEN.
     //
-    // Worldgen is the one writer that legitimately stores through sentinels:
-    // genChunk writes all 4,096 cells of every slot in its batch, and the
-    // batches it does NOT currently hold are PT_EMPTY by construction (that is
-    // what makes a 8,192-page pool able to generate 32,768 slots at all). Those
-    // stores no-op and count, so the counter reaches exactly
-    // kNumChunks * kChunkVol = 134,217,728 before tick 1 — in a run that is
-    // otherwise perfectly correct. Measured identically on quiet-paged, which
-    // is 5/5 MATCH, so it is a startup artifact and not a lost voxel.
-    //
-    // The invariant the gates actually assert is about the TICK LOOP: no sim
-    // kernel may write through a sentinel. Zeroing here is what makes the
-    // counter mean that, and it is why the dense run (identity map, nothing to
-    // fault on) reads 0 both before and after this line.
+    // HISTORY, not the current mechanism: the whole-window `main` dispatch
+    // this path replaced stored through every slot a 8,192-page pool did not
+    // hold, and those no-op stores counted — exactly kNumChunks * kChunkVol =
+    // 134,217,728 before tick 1 in an otherwise correct run. The BATCHED
+    // path above never does that: `list` writes only genList's slots, and
+    // every one of them was given a page (EnsurePageForOverwrite) before its
+    // dispatch, so a correct worldgen adds nothing to the counter and
+    // ResetAllEmpty already zeroed it at the top. This write is kept as the
+    // statement of what the gates assert — the TICK LOOP never writes through
+    // a sentinel — and so that a counter left over from a pre-reset world
+    // cannot leak into the first tick's reading.
     const uint32_t faultZero[kPageFaultWords] = {};
     ctx.queue.WriteBuffer(world.pageFaults, 0, faultZero, sizeof(faultZero));
     std::printf("worldgen (paged, %u-slot batches): %u pages in use "
@@ -2286,6 +2494,12 @@ void SubmitWorldgen(GpuContext& ctx, World& world, Simulation& sim, uint32_t see
                 (double)world.pages->PagesInUse() * kChunkVol * 4.0 / 1048576.0,
                 (double)world.pages->PoolPages() * kChunkVol * 4.0 / 1048576.0,
                 world.pages->PagesHighWater(), woken);
+    if (kVerdictCheck)
+      std::printf("[genverdict] worldgen check: %llu verdicts vs "
+                  "Classify(words), %llu mismatch%s\n",
+                  (unsigned long long)verdictChecked,
+                  (unsigned long long)verdictMismatch,
+                  verdictMismatch == 1 ? "" : "es");
     return;
   }
 }
@@ -2367,6 +2581,9 @@ uint32_t HashWorldNow(GpuContext& ctx, World& world, Simulation& sim, uint32_t s
   rhi::CommandEncoder enc = ctx.device.CreateCommandEncoder();
   sim.EncodeHashOnly(enc);
   ctx.queue.Submit(enc.Finish());
+  // ho_occupancyFull rewrote the per-chunk digest table outside a hash tick,
+  // so the next snapshot must copy it rather than inherit the previous one.
+  world.NoteChunkHashWritten();
   return ReadHashSync(ctx, world);
 }
 
@@ -2647,21 +2864,13 @@ void ReadVoxelsSync(GpuContext& ctx, World& world, uint32_t firstSlot,
     const uint64_t off = world.PageOffsetOfSlot(firstSlot + i);
     if (off == World::kNoPage) {
       // Sentinel: synthesize, through the same rule the shader uses.
-      // POSITIONAL: SynthWordAt collapses to SynthWord for EMPTY/UNIFORM, so
-      // one loop serves every sentinel form. A JITTER chunk read back through
-      // here (the worldgen compaction classifier does exactly that) must see
-      // the same words the GPU would, or classification would refuse chunks it
-      // had itself just promoted.
-      const uint32_t e = world.PageEntryOfSlot(firstSlot + i);
-      const IVec3 wc = world.SlotToWorldChunk(firstSlot + i);
-      const int bx = wc.x * (int)kChunk, by = wc.y * (int)kChunk,
-                bz = wc.z * (int)kChunk;
-      uint32_t* dst = out + (size_t)i * kChunkVol;
-      for (uint32_t k = 0; k < kChunkVol; k++)
-        dst[k] = SynthWordAt(e, bx + (int)(k % kChunk),
-                             by + (int)((k / kChunk) % kChunk),
-                             bz + (int)(k / (kChunk * kChunk)),
-                             world.pages->WorldSeed());
+      // POSITIONAL (JITTER), so the world chunk travels. A JITTER chunk read
+      // back through here must see the same words the GPU would, or a
+      // classifier would refuse chunks it had itself just promoted. world.h
+      // SynthChunkWords is the one whole-chunk form of SynthWordAt.
+      SynthChunkWords(world.PageEntryOfSlot(firstSlot + i),
+                      world.SlotToWorldChunk(firstSlot + i),
+                      world.pages->WorldSeed(), out + (size_t)i * kChunkVol);
       i++;
       continue;
     }

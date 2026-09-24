@@ -3,6 +3,7 @@
 // JSON materials, deterministic kernels with per-tick world hash.
 
 #include <algorithm>
+#include <array>
 #include <chrono>
 #include <cmath>
 #include <thread>
@@ -51,7 +52,6 @@
 #include "gpu/context.h"
 #include "gpu/resources.h"
 #include "gpu/rhi_vk.h"  // rhi::vkr::SetCaptureStats (--shader-stats)
-#include "gpu/vk_info.h"
 #include "gpu/vk_shader_stats.h"
 #include "gpu/vk_smoke.h"
 #include "lab/lab.h"
@@ -1136,6 +1136,25 @@ void FillBodyUI(const PlayerAvatar& avatar, const BurnMats& burnMats,
   if (!def) return;
   const uint64_t mobId = avatar.Id();
   SlotCoat slotCoat[UIState::kSlotCount];
+  // ONE WALK PER LIMB. Every material this readout counts gets a bit in a
+  // 4096-entry mask table, and PartMaterialTally bins the limb's voxels in a
+  // single pass. It was one full walk of the skin PER MATERIAL — two burn
+  // lists, five tissues and the rot list, ten-plus walks of every limb every
+  // frame. A MASK, not a bin index, so a material in two lists (a cooked id
+  // that is also a named tissue) still counts into both, exactly as the
+  // separate PartMaterialCount calls did.
+  enum : int { kBinCooked, kBinCharred, kBinSkin, kBinFlesh, kBinMuscle,
+               kBinBone, kBinBrain, kBinRot, kBinCount };
+  std::array<uint16_t, 4096> binMask{};
+  auto mark = [&](uint32_t m, int bin) { binMask[m & 0xFFFu] |= (uint16_t)(1u << bin); };
+  for (uint32_t m : burnMats.cooked) mark(m, kBinCooked);
+  for (uint32_t m : burnMats.charred) mark(m, kBinCharred);
+  if (tissueMats.skin)   mark(tissueMats.skin, kBinSkin);
+  if (tissueMats.flesh)  mark(tissueMats.flesh, kBinFlesh);
+  if (tissueMats.muscle) mark(tissueMats.muscle, kBinMuscle);
+  if (tissueMats.bone)   mark(tissueMats.bone, kBinBone);
+  if (tissueMats.brain)  mark(tissueMats.brain, kBinBrain);
+  for (uint32_t m : tissueMats.rot) mark(m, kBinRot);
   // Walk the DEF's limbs, not PartCount() — the latter includes the borrowed
   // held-item slot, which is not part of the body.
   const int limbCount = (int)def->limbs.size();
@@ -1165,11 +1184,10 @@ void FillBodyUI(const PlayerAvatar& avatar, const BurnMats& burnMats,
     const uint32_t now = avatar.PartVoxelCount(i);
     b.voxelFrac = spawn > 0 ? std::clamp((float)now / (float)spawn, 0.0f, 1.0f)
                             : 1.0f;
+    uint32_t bins[kBinCount] = {};
+    if (now > 0) avatar.PartMaterialTally(i, binMask.data(), bins);
     if (now > 0) {
-      uint32_t cooked = 0, charred = 0;
-      for (uint32_t m : burnMats.cooked) cooked += avatar.PartMaterialCount(i, m);
-      for (uint32_t m : burnMats.charred)
-        charred += avatar.PartMaterialCount(i, m);
+      const uint32_t cooked = bins[kBinCooked], charred = bins[kBinCharred];
       // Charred counts double against "intact-looking": cooked flesh is still
       // flesh, charred flesh is structurally gone. Reported as one fraction
       // because the player's question is "how much of this limb is ruined",
@@ -1180,18 +1198,18 @@ void FillBodyUI(const PlayerAvatar& avatar, const BurnMats& burnMats,
     }
 
     b.voxelTotal = now;
-    if (tissueMats.skin)   b.voxelSkin   = avatar.PartMaterialCount(i, tissueMats.skin);
-    if (tissueMats.flesh)  b.voxelFlesh  = avatar.PartMaterialCount(i, tissueMats.flesh);
-    if (tissueMats.muscle) b.voxelMuscle = avatar.PartMaterialCount(i, tissueMats.muscle);
-    if (tissueMats.bone)   b.voxelBone   = avatar.PartMaterialCount(i, tissueMats.bone);
-    if (tissueMats.brain)  b.voxelBrain  = avatar.PartMaterialCount(i, tissueMats.brain);
+    // (A limb with no voxels tallied nothing, which is the 0 every one of
+    // these per-material counts returned for it.)
+    if (tissueMats.skin)   b.voxelSkin   = bins[kBinSkin];
+    if (tissueMats.flesh)  b.voxelFlesh  = bins[kBinFlesh];
+    if (tissueMats.muscle) b.voxelMuscle = bins[kBinMuscle];
+    if (tissueMats.bone)   b.voxelBone   = bins[kBinBone];
+    if (tissueMats.brain)  b.voxelBrain  = bins[kBinBrain];
     // Rot is tissue the limb is made of NOW, exactly like the four above — a
     // bitten arm's flesh bar shrinking with nothing taking its place was the
     // whole defect: the voxels are still in voxelTotal, they had just stopped
     // being anything the panel had a name for.
-    uint32_t rotted = 0;
-    for (uint32_t m : tissueMats.rot) rotted += avatar.PartMaterialCount(i, m);
-    b.voxelRot = rotted;
+    b.voxelRot = bins[kBinRot];
     b.voxelBrainMax = avatar.PartBrainAtSpawn(i);
 
     // What is ON the limb. The ledger is recounted by the creature itself at
@@ -4368,7 +4386,6 @@ int main(int argc, char** argv) {
   // --present fifo|mailbox|immediate pins the swapchain present mode for the
   // run; -1 = follow render.presentMode in tuning.json (F5-live).
   int presentOverride = -1;
-  bool vkInfo = false;   // --vk-info: Vulkan backend smoke test (headless)
   bool vkSmoke = false;  // --vk-smoke: cross-backend world-hash comparison (headless)
   // --vk-smoke-loud: phase 3c's determinism acceptance evidence — the same
   // comparison over an ACTIVE world (ops, explosions, particles, readback ring,
@@ -4557,7 +4574,6 @@ int main(int argc, char** argv) {
           "  --residency paged|dense  Voxel buffer residency mode (default: paged)\n\n"
           "Vulkan / debug:\n"
           "  --backend vulkan      Explicitly name the Vulkan backend\n"
-          "  --vk-info             Vulkan device + shader compile check (headless)\n"
           "  --vk-smoke            Quiet 50-tick pinned hash comparison\n"
           "  --vk-smoke-loud       Active 120-tick hash comparison (19 probes)\n"
           "  --vk-validation       Enable VK_LAYER_KHRONOS_validation + sync\n"
@@ -4836,12 +4852,6 @@ int main(int argc, char** argv) {
       if (i + 1 >= argc) { std::fprintf(stderr, "--adapter requires a value\n"); return 1; }
       lowPowerAdapter = std::string(argv[++i]) == "low";
     }
-    // `--vk-info` is the Vulkan port's phase-3a exit proof (src/gpu/vk_info.cpp):
-    // create a VkDevice, print the capability record phase 7 needs, compile
-    // every WGSL shader to SPIR-V through Tint, build every compute pipeline,
-    // zero-init and submit one fenced command buffer. Headless, and it runs no
-    // sim work — the only commands submitted are the zero-init fills.
-    else if (a == "--vk-info") vkInfo = true;
     // `--vk-smoke` runs a quiet 50-tick world and compares its hashes against
     // the PINNED sequence (src/gpu/vk_smoke.cpp). It used to compare Dawn
     // against Vulkan; with Dawn gone the pinned values ARE the reference, so
@@ -5049,11 +5059,6 @@ int main(int argc, char** argv) {
     return WriteHeightmap(heightmapArgs, heightmapOut);
   }
 
-  // --vk-info answers before any GpuContext exists: it builds its own device
-  // to print the capability record, so it must not race the engine's for the
-  // adapter.
-  if (vkInfo) return sandvox::RunVkInfo(lowPowerAdapter);
-
   // --suite acceptance: one process, all measurements. The expensive part of a
   // run is Vulkan device creation + SPIR-V compilation + worldgen. This
   // amortizes that cost across selftest + both smokes in one invocation.
@@ -5237,6 +5242,29 @@ int main(int argc, char** argv) {
     std::printf("loaded %zu glyphs (%zu conjoined)\n", glyphs.glyphs.size(),
                 glyphs.conjoined.size());
   }
+  // Bumped whenever `glyphs` or `mats` is replaced (the R reload). The
+  // character screen's glyph and spell-readout mirrors are cached against it
+  // rather than rebuilt every frame — see "the mirrors" in the frame loop.
+  uint32_t glyphEpoch = 1;
+  uint32_t glyphsOwnedEpoch = 0;  // the epoch ui.glyphsOwned was built at
+  // What a word list SAYS and COSTS (ExpandWords -> CompileSpell ->
+  // DescribeSpell), keyed on the words. A pure function of (glyph library,
+  // grimoire, words), so the cache is dropped whenever `glyphEpoch` moves or
+  // the grimoire's content differs from the one it was filled against. It
+  // was recomputed for every page, every bound hotbar page and the composer,
+  // every frame, whether or not the character screen was even open.
+  struct SpellDescCache {
+    struct Entry {
+      std::string text;     // DescribeSpell's bracket string alone
+      std::string readout;  // + verdict + the dropped / truncated notes
+      int32_t price = 0;
+      bool unknown = false;
+      int dropped = 0;
+    };
+    uint32_t epoch = 0;
+    std::string grimoireKey;
+    std::unordered_map<std::string, Entry> byWords;
+  } spellDesc;
 
   // items (assets/items/items.json — game/item.h). Content, same as glyphs,
   // same hot-reload key. Not fatal if it fails: an item file that will not
@@ -10101,6 +10129,9 @@ int main(int argc, char** argv) {
           } else {
             std::fprintf(stderr, "glyph reload failed:\n%s", gerr.c_str());
           }
+          // Either way: the materials changed under the glyph mirrors (their
+          // swatches are material colours) even when the glyphs did not.
+          glyphEpoch++;
         }
         // prefabs hot-reload with materials: palette indices may map now
         std::string plog;
@@ -11667,9 +11698,15 @@ int main(int argc, char** argv) {
       // DECIDED this tick and how far its target is. That last pair is the
       // whole debugging surface — "it walked at me" and "it scored Approach
       // 1.15 against HoldRange 0.6" are very different amounts of information.
+      //
+      // ONLY WHILE THE WINDOW IS OPEN: an snprintf and a std::string per
+      // creature per frame for a list nothing draws otherwise. The one other
+      // reader, the tick's "apply behaviour" latch (session.cpp), is set by a
+      // button in this same window, so it is only ever raised against a list
+      // built while the window was up.
       ui.aiMobIds.clear();
       ui.aiMobLabels.clear();
-      for (uint32_t i = 0; i < mobs.MobCount(); i++) {
+      for (uint32_t i = 0; ui.aiWindowOpen && i < mobs.MobCount(); i++) {
         const uint64_t mid = mobs.MobIdAt(i);
         if (mid == 0) continue;
         const ai::Brain* br = mobs.MobBrain(mid);
@@ -11795,19 +11832,18 @@ int main(int argc, char** argv) {
       ui.manaReserved = caster.mana.reserved;
       ui.spellStatuses.clear();
       for (const SpellStatus& st : spells.Statuses()) {
-        if (st.casterId != 0x9134A5EEu) continue;
-        std::string line = DescribeCast(glyphs, SpellCast{});
-        line.clear();
+        if (st.casterId != kPlayerCasterId) continue;
         const GlyphDef* ig = glyphs.At(st.effect.inner.empty() ? -1 : st.effect.inner[0].glyph);
         const GlyphDef* ag = glyphs.At(st.effect.glyph);
-        line = std::string(ig ? ig->id : "mod") + " " + (ag ? ag->id : "aura") +
-               (st.target == 0x9134A5EEu ? " on you" : (st.target ? " on them" : " on the place")) +
+        std::string line =
+            std::string(ig ? ig->id : "mod") + " " + (ag ? ag->id : "aura") +
+               (st.target == kPlayerCasterId ? " on you" : (st.target ? " on them" : " on the place")) +
                "  " + std::to_string(st.perTick) + "/tick, " +
                std::to_string(st.ticksLeft / 30) + " s";
         ui.spellStatuses.push_back(line);
       }
       for (const SpellBeam& bm : spells.Beams())
-        if (bm.casterId == 0x9134A5EEu)
+        if (bm.casterId == kPlayerCasterId)
           ui.spellStatuses.push_back("beam  " + std::to_string(bm.perTick) + "/tick");
       // FROZEN ONCE DEAD. The dying observer above took this same mirror at
       // the instant of death; from here on the rig is a pile of debris
@@ -11840,6 +11876,60 @@ int main(int argc, char** argv) {
       // those primitives are holding awake so they can move settled matter.
       ui.windPrims = (int)WindPrims().Count();
       ui.windWakeChunks = (int)WindPrims().LastWakeCount();
+      // The spell readout cache (SpellDescCache, declared with glyphEpoch):
+      // validate against the grimoire as it stands, then look words up. Called
+      // again before the character-screen mirrors below, because the panel's
+      // intents in between may have edited the grimoire.
+      auto spellDescValidate = [&]() {
+        std::string key;
+        for (const GrimoirePage& pg : caster.grimoire.pages) {
+          key += pg.name;
+          key += pg.readOnly ? "\x1e" "1" : "\x1e" "0";
+          for (const std::string& w : pg.words) {
+            key += '\x1f';
+            key += w;
+          }
+          key += '\x1d';
+        }
+        if (spellDesc.epoch != glyphEpoch || key != spellDesc.grimoireKey) {
+          spellDesc.byWords.clear();
+          spellDesc.epoch = glyphEpoch;
+          spellDesc.grimoireKey = std::move(key);
+        }
+      };
+      auto spellDescFor = [&](const std::vector<std::string>& words)
+          -> const SpellDescCache::Entry& {
+        std::string key;
+        for (const std::string& w : words) {
+          key += w;
+          key += '\x1f';
+        }
+        auto it = spellDesc.byWords.find(key);
+        if (it != spellDesc.byWords.end()) return it->second;
+        // Bounded: every intermediate composer edit is a new key.
+        if (spellDesc.byWords.size() >= 512) spellDesc.byWords.clear();
+        SpellDescCache::Entry e;
+        const GrimoireExpansion ex = ExpandWords(glyphs, caster.grimoire, words, kSpellStackMax);
+        SpellStack st = StackOf(ex);
+        const CastList l = CompileSpell(glyphs, st);
+        const SpellReadout r = DescribeSpell(glyphs, l);
+        e.text = r.text;
+        e.readout = r.text;
+        // THE VERDICT ON ITS OWN LINE. It is the sentence that says what the
+        // page DOES ("a bolt that sprays sand and fire, three of them"),
+        // which the bracket string above deliberately does not; the composer
+        // wraps both rather than clipping either.
+        if (!r.verdict.empty()) e.readout += "\n" + r.verdict;
+        if (ex.dropped > 0) e.readout += "   (? = a word that no longer exists)";
+        if (ex.truncated) e.readout += "   (cut at the stack bound)";
+        e.price = l.manaCost;
+        e.unknown = l.priceUnknown;
+        e.dropped = ex.dropped;
+        return spellDesc.byWords.emplace(std::move(key), std::move(e)).first->second;
+      };
+      // The readouts are read only by the character screen (inventory_ui.cpp);
+      // the HUD's glyph bar draws the names and kinds, which stay per frame.
+      if (ui.inventoryOpen) spellDescValidate();
       ui.glyphSlots.clear();
       ui.glyphSlotKinds.clear();
       ui.glyphSlotReadouts.clear();
@@ -11849,9 +11939,8 @@ int main(int argc, char** argv) {
         if (k == SlotKind::Page) {
           const std::string& name = caster.inventory.PageAt(i);
           ui.glyphSlots.push_back(name);
-          const GrimoireExpansion ex = ExpandWords(glyphs, caster.grimoire, {name}, kSpellStackMax);
-          SpellStack st = StackOf(ex);
-          ui.glyphSlotReadouts.push_back(DescribeSpell(glyphs, CompileSpell(glyphs, st)).text);
+          ui.glyphSlotReadouts.push_back(
+              ui.inventoryOpen ? spellDescFor({name}).text : std::string());
           continue;
         }
         int gi = caster.inventory.At(i);
@@ -12574,9 +12663,11 @@ int main(int argc, char** argv) {
       ui.kitMessageAge += dt;
 
       // ---- the mirrors -------------------------------------------------------
-      // Rebuilt every frame from the real containers. Cheap (a few dozen
-      // string copies) and it is the reason the panel can never show something
-      // the game does not have.
+      // Rebuilt from the real containers every frame the character screen is
+      // OPEN (the hotbar strip every frame, the HUD draws it) — that is the
+      // reason the panel can never show something the game does not have.
+      // Shut, nothing reads them, and the spell readouts and glyph catalogue
+      // they carry were most of a frame's string work (P6.2).
       {
         // CONDITION COMES FROM WHEREVER THE PIECE ACTUALLY IS. On the body the
         // shells are the truth and the blob in `kit.wornDamage` is stale (it is
@@ -12644,9 +12735,16 @@ int main(int argc, char** argv) {
           }
           return u;
         };
+        // The HUD's hotbar strip (DrawHudHotbar) reads this one, so it is the
+        // one mirror built with the screen shut.
         ui.hotbarSlots.clear();
         for (int i = 0; i < kItemSlots; i++)
           ui.hotbarSlots.push_back(mirror(hotbar.slots[i]));
+        // EVERYTHING BELOW IS THE CHARACTER SCREEN'S, and only it reads these
+        // (inventory_ui.cpp, spellgraph_ui.cpp). Shut, they are left as they
+        // were and rebuilt on the first frame it is open again — the open key
+        // is handled above this block, so that frame is never stale.
+        if (ui.inventoryOpen) {
         ui.bagSlots.clear();
         for (int i = 0; i < Bag::kSlots; i++)
           ui.bagSlots.push_back(mirror(kit.bag.slots[i]));
@@ -12680,6 +12778,13 @@ int main(int argc, char** argv) {
           }
         }
 
+        // The glyph catalogue is a function of the library and the materials
+        // alone — valence strings, tariffs, the O(glyphs^2) "delivers" list —
+        // so it is REBUILT ONLY WHEN glyphEpoch MOVES. The one per-player
+        // field, `owned`, is refreshed every frame the screen is open.
+        if (glyphsOwnedEpoch != glyphEpoch ||
+            ui.glyphsOwned.size() != glyphs.glyphs.size()) {
+        glyphsOwnedEpoch = glyphEpoch;
         ui.glyphsOwned.clear();
         for (int gi = 0; gi < (int)glyphs.glyphs.size(); gi++) {
           const GlyphDef& g = glyphs.glyphs[gi];
@@ -12758,30 +12863,26 @@ int main(int argc, char** argv) {
             u.color = mats[g.material].gpu.color0;
           ui.glyphsOwned.push_back(std::move(u));
         }
+        }  // glyphsOwnedEpoch
+        for (int gi = 0; gi < (int)ui.glyphsOwned.size(); gi++)
+          ui.glyphsOwned[gi].owned = caster.inventory.Owns(gi);
 
         // The grimoire: the authored starters (read-only) and the player's
         // pages, each with the readout and price of its expansion, through
-        // the same DescribeSpell the live sentence uses.
+        // the same DescribeSpell the live sentence uses — via the readout
+        // cache (spellDescFor, above), re-validated here because the panel's
+        // intents earlier this frame may have edited the grimoire.
+        spellDescValidate();
         ui.grimoirePages.clear();
         ui.grimoireMaxPages = glyphs.budgets.maxGrimoirePages;
         ui.grimoireMaxWords = glyphs.budgets.maxMacroWords;
         auto describeWords = [&](const std::vector<std::string>& words, std::string& readout,
                                  int32_t& price, bool& unknown, int& dropped) {
-          const GrimoireExpansion ex = ExpandWords(glyphs, caster.grimoire, words, kSpellStackMax);
-          SpellStack st = StackOf(ex);
-          const CastList l = CompileSpell(glyphs, st);
-          const SpellReadout r = DescribeSpell(glyphs, l);
-          readout = r.text;
-          // THE VERDICT ON ITS OWN LINE. It is the sentence that says what the
-          // page DOES ("a bolt that sprays sand and fire, three of them"),
-          // which the bracket string above deliberately does not; the composer
-          // wraps both rather than clipping either.
-          if (!r.verdict.empty()) readout += "\n" + r.verdict;
-          if (ex.dropped > 0) readout += "   (? = a word that no longer exists)";
-          if (ex.truncated) readout += "   (cut at the stack bound)";
-          price = l.manaCost;
-          unknown = l.priceUnknown;
-          dropped = ex.dropped;
+          const SpellDescCache::Entry& e = spellDescFor(words);
+          readout = e.readout;
+          price = e.price;
+          unknown = e.unknown;
+          dropped = e.dropped;
         };
         for (const ConjoinedGlyph& cg : glyphs.conjoined) {
           UIState::GrimoirePageUI p;
@@ -12804,6 +12905,7 @@ int main(int argc, char** argv) {
           describeWords(ui.grimoireEditWords, ui.grimoireEditReadout, ui.grimoireEditPrice,
                         ui.grimoireEditPriceUnknown, dropped);
         }
+        }  // if (ui.inventoryOpen): the character screen's mirrors
 
         // ---- THE SPELL GRAPH MIRROR (docs/PLAN_spell_graph.md §4) ----------
         //

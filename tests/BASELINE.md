@@ -690,3 +690,25 @@ refusal is correct and is not about this work: a clean detached control at
 packages introduce none of them — the failing set on `mp-land` is a strict
 SUBSET of the control's, measured at the same full-suite scope. Same precedent
 and same reasoning as 4097d71.
+
+## 2026-09-24 — `75d184ca` → `709ec4b7` (perf/tech-debt audit, docs/PLAN_perf_audit_2026-09-23.md)
+
+Moved by P1's CA rule changes only: stains settle in a strict order (a
+non-washer stains only clean or same-type cells, water steps foreign stains
+down), a PAIR rule that would rewrite a neighbour into itself is skipped (grass
+over grass), fungus decays to dirt, vine flowers are daylight-gated, non-write
+keep-awake marks reach only the own chunk, and blast-rim marks fan out. Every
+other package (fluids, worldgen/far, paging, render, CPU frame, Vulkan) proved
+`75d184ca` unchanged base-vs-after in its own worktree. The twice-run
+comparison passed on the integration tree. Pinned with
+`--selftest --gate determinism --rebaseline`.
+
+Smoke probe tables (`--vk-smoke*`) were NOT re-pinned (owner directive: no
+smoke runs for this). Expect them to report moved probes until someone runs
+`--vk-smoke-loud --rebaseline`.
+
+Inherited, not from this work (fail identically on main 3d9be4b, recorded
+`pass` here): `tree-fell` (`tree-actually-burned`; on the integration tree the
+changed burn trajectory also leaves one floating pine-needle single, and it
+persists with main's reactions.json and main's sim_step.wgsl swapped in), and
+`waterbody` (pass H1 conservation +718 eighths).

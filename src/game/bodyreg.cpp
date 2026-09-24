@@ -133,13 +133,14 @@ uint32_t BodyRegistry::AuditMicroModels() const {
   };
   for (uint32_t i = 0; i < debris_.BodyCount(); i++)
     note(debris_.BodyMicroModel(i));
-  holders_.clear();
   if (!suspect) {
-    // Mob/avatar holders have no cheap index accessor, so phase 1 takes their
-    // descriptions too; the debris side is the big population and is free.
-    mobs_.AppendMicroHolders(holders_);
-    if (avatar_) avatar_->AppendMicroHolders(holders_);
-    for (const MicroHolder& h : holders_) note(h.model);
+    // Mob/avatar holders as bare indices (Mob::AppendMicroModelIds): phase 1
+    // used to take their full descriptions — an snprintf and a std::string
+    // per limb per frame — only to read the model index back out of them.
+    ids_.clear();
+    mobs_.AppendMicroModelIds(ids_);
+    if (avatar_) avatar_->AppendMicroModelIds(ids_);
+    for (uint32_t m : ids_) note(m);
   }
   if (!suspect) {
     std::sort(scratch_.begin(), scratch_.end());

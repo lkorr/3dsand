@@ -553,7 +553,7 @@ TP_F(render, farPlumeHeight, TUNE_FAR_PLUME_HEIGHT, 28.0f)
 TP_F(render, farPlumeRange, TUNE_FAR_PLUME_RANGE, 3276.8f)
 
 // ---- in-window LOD handoff (PLAN_surface_flight_perf.md A1) ----
-TP_F(render, lodHandoffDist, TUNE_LOD_HANDOFF_DIST, 24.0f)
+TP_F(render, lodHandoffDist, TUNE_LOD_HANDOFF_DIST, 26.0f)
 TP_F(render, shadowMaxDist, TUNE_SHADOW_MAX_DIST, 999.0f)
 
 // ---- SHORT-RANGE MODE (dev panel checkbox, RenderParams flag bit 2) ----

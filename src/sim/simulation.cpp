@@ -91,6 +91,7 @@ bool Simulation::Init(const rhi::Device& device, World& world,
   materialBuf_ = CreateBuffer(device, sizeof(MaterialGpu) * 4096,
                               rhi::BufferUsage::Storage | rhi::BufferUsage::CopyDst,
                               "materials");
+  artPaletteLive_ = false;  // a new buffer holds no palette write
   reactionBuf_ = CreateBuffer(device, sizeof(ReactionGpu) * kMaxReactions,
                               rhi::BufferUsage::Storage | rhi::BufferUsage::CopyDst,
                               "reactions");
@@ -113,6 +114,7 @@ bool Simulation::Init(const rhi::Device& device, World& world,
   mbModelBuf_ = CreateBuffer(device, sizeof(MicroBodyModelGpu) * kMaxMicroBodyModels,
                              rhi::BufferUsage::Storage | rhi::BufferUsage::CopyDst,
                              "microBodyModels");
+  mbModelLive_ = false;  // a new buffer holds no table write
   mbPoolBuf_ = CreateBuffer(device, (uint64_t)kMicroBodyPoolWordsWorld * 4,
                             rhi::BufferUsage::Storage | rhi::BufferUsage::CopyDst,
                             "microBodyPool");
@@ -931,17 +933,22 @@ void Simulation::ApplyArtPalette(std::vector<MaterialGpu>& table) const {
 
 void Simulation::SetArtPalette(const rhi::Queue& queue,
                                const std::vector<uint32_t>& rgb) {
-  artPalette_ = rgb;
-  if (artPalette_.size() > kArtPaletteSlotsGpu)
-    artPalette_.resize(kArtPaletteSlotsGpu);
+  // UNCHANGED AND ALREADY ON THE GPU: nothing to send. This is called on every
+  // dirty micro-body frame, and the palette changes only when prefabs load.
+  const size_t n = std::min<size_t>(rgb.size(), kArtPaletteSlotsGpu);
+  if (artPaletteLive_ && n == artPalette_.size() &&
+      std::equal(artPalette_.begin(), artPalette_.end(), rgb.begin()))
+    return;
+  artPalette_.assign(rgb.begin(), rgb.begin() + n);
   if (artPalette_.empty()) return;
   // Patch just the reserved run rather than re-uploading all 4096 entries: the
   // rest of the table is unchanged and may be mid-frame on the GPU.
-  std::vector<MaterialGpu> run(kArtPaletteSlotsGpu, MaterialGpu{});
+  artRunScratch_.assign(kArtPaletteSlotsGpu, MaterialGpu{});
   for (size_t i = 0; i < artPalette_.size(); i++)
-    run[i].color0 = ArtRgbToGpu(artPalette_[i]);
+    artRunScratch_[i].color0 = ArtRgbToGpu(artPalette_[i]);
   queue.WriteBuffer(materialBuf_, (uint64_t)kArtPaletteBaseGpu * sizeof(MaterialGpu),
-                    run.data(), run.size() * sizeof(MaterialGpu));
+                    artRunScratch_.data(), artRunScratch_.size() * sizeof(MaterialGpu));
+  artPaletteLive_ = true;
 }
 
 void Simulation::BuildSimBindGroups(const rhi::Device& device) {
@@ -1162,6 +1169,9 @@ void Simulation::UploadTables(const rhi::Queue& queue,
   ApplyArtPalette(table);
 
   queue.WriteBuffer(materialBuf_, 0, table.data(), table.size() * sizeof(MaterialGpu));
+  // The run now holds THIS table's entries, not SetArtPalette's last write,
+  // so the next SetArtPalette must send even an unchanged palette.
+  artPaletteLive_ = false;
 
   std::vector<ReactionGpu> rtable(kMaxReactions, ReactionGpu{});
   for (size_t i = 0; i < reactions.size() && i < kMaxReactions; i++)
@@ -1188,12 +1198,23 @@ void Simulation::UploadMicroBodies(const rhi::Queue& queue, MicroBodySet& set) {
   // Fixed-size GPU buffers: pad the table so a shrinking reload cannot leave a
   // stale model behind a still-live index, and never write past the ceiling.
   // The whole table is 16 bytes x kMaxMicroBodyModels — small enough that
-  // tracking which records moved would cost more than the write.
-  std::vector<MicroBodyModelGpu> table = set.models;
-  if (table.size() > kMaxMicroBodyModels) table.resize(kMaxMicroBodyModels);
+  // tracking which records moved would cost more than the write. But a dirty
+  // frame is usually a POOL change (a burning limb's pokes), not a table one,
+  // so the padded table is built in member scratch and compared with the last
+  // one sent: an unchanged table is not written again.
+  std::vector<MicroBodyModelGpu>& table = mbModelScratch_;
+  table.assign(set.models.begin(),
+               set.models.begin() + std::min<size_t>(set.models.size(),
+                                                     kMaxMicroBodyModels));
   table.resize(kMaxMicroBodyModels, MicroBodyModelGpu{kMicroBodyNoModel, 0, 1, 0});
-  queue.WriteBuffer(mbModelBuf_, 0, table.data(),
-                    table.size() * sizeof(MicroBodyModelGpu));
+  if (!mbModelLive_ || mbModelLast_.size() != table.size() ||
+      std::memcmp(mbModelLast_.data(), table.data(),
+                  table.size() * sizeof(MicroBodyModelGpu)) != 0) {
+    queue.WriteBuffer(mbModelBuf_, 0, table.data(),
+                      table.size() * sizeof(MicroBodyModelGpu));
+    mbModelLast_ = table;
+    mbModelLive_ = true;
+  }
 
   // The POOL is 4 MiB and is sent by RANGE (MicroBodySet::MarkPool). Writing
   // all of it on any dirty was correct and free while only a carve dirtied it;
@@ -1220,7 +1241,8 @@ void Simulation::UploadMicroBodies(const rhi::Queue& queue, MicroBodySet& set) {
 
   // The skin's art colours ride the same upload the bricks do: they are
   // published together or a painted brick indexes colours that are not there
-  // yet. Cheap and idempotent when nothing painted (SetArtPalette early-outs).
+  // yet. Free when the palette has not changed since it was last sent
+  // (SetArtPalette compares before it writes).
   SetArtPalette(queue, set.artColors);
 }
 
@@ -1874,62 +1896,12 @@ namespace {
 // Everything the recorder needs to resolve a row's selectors, gathered once per
 // Encode* call. Conditions are all known on the CPU before recording begins
 // (barrier_graph §2.3), which is what makes a skipped row a non-event.
-struct RecordCtx {
-  uint32_t opsCount = 0;
-  uint32_t cellCount = 0;
-  uint32_t expCount = 0;
-  uint32_t spawnCount = 0;
-  uint32_t genCount = 0;
-  uint32_t farCount = 0;
-  uint32_t fluidCount = 0;       // MLS-MPM particles alive AFTER this tick's spawns
-  uint32_t fluidSpawnCount = 0;  // MLS-MPM spawn ops this tick
-  uint32_t windWakeCount = 0;    // wind primitive footprint chunks this tick
-  // Water-body chunk-list entries this tick (docs/PLAN_water_master.md M2).
-  // Mirrors rhi::TableCtx / vk_record.h, like every field here. Zero at
-  // sim.waterBodyMode 0, which is what makes C_WATERBODY false and leaves the
-  // whole subsystem unrecorded.
-  uint32_t waterChunkCount = 0;
-  uint32_t waterDrainBodies = 0;   // reserved drain op blocks (M3)
-  // M5: which body's container curve re-derives this tick, or kWaterBodyCap
-  // for "none" — which is every tick of a basin nobody has dug into, and is
-  // what leaves both sweep rows unrecorded (C_WATERSWEEP).
-  uint32_t waterSweepSlot = kWaterBodyCap;
-  // W2: sim.waveMode ANDed with "a body is listed this tick"
-  // (docs/PLAN_water_relevel.md §4.2). Zero leaves the surface-momentum row
-  // unrecorded (C_WATERWAVE), which is the exact-identity arm.
-  uint32_t waveMode = 0;
-  // Chunks the openness refresh walks this tick (docs/PLAN_gi.md §2). Derived
-  // from render.opennessChunksPerFrame and gated on render.opennessStrength, so
-  // a zero here is C_OPENNESS false and NOTHING recorded -- which is what makes
-  // the `noopenness` --render-budget arm measure the pass as well as the reads.
-  uint32_t opennessChunks = 0;
-  // Chunks the glow refresh walks this tick (src/sim/world.h kGlowBytes).
-  // Derived from render.glowChunksPerFrame and gated on render.glowStrength, so
-  // a zero here is C_GLOW false and NOTHING recorded.
-  uint32_t glowChunks = 0;
-  bool hashEnable = false;
-  bool particlesActive = false;
-  // False under --residency paged: worldgen's whole-world dispatch is replaced
-  // by batched worldgenList submits (PLAN_page_table.md §3.5c).
-  bool denseWorldgen = true;
-  // False ONLY when the CPU can prove the dirty set is empty (§3.4). Mirrors
-  // vk_record.h's field; defaults TRUE so the CA records unless proven idle.
-  bool caActive = true;
-  bool vizActive = false;
-  // Gas particles (docs/PLAN_gas_particles.md). See the latch in EncodeTick.
-  bool gasActive = false;
-  // Far fire-plume emitters this tick (world.h kGasFarEmitMax). Mirrors
-  // rhi::TableCtx. Zero on every tick of a world with no evicted fire in
-  // range, and then the splat row records NOTHING -- and the density box's
-  // clear falls back to the parcel latch alone, exactly as before.
-  uint32_t gasFarEmitCount = 0;
-  uint32_t gasFarWideCount = 0;
-  // Angle of repose (world.h kReposeSnap*). See the latch in EncodeTick.
-  bool reposeActive = false;
-  // The per-frame table's switches (rhi_record.h TableCtx::cloudFlags).
-  uint32_t cloudFlags = 0;
-  uint32_t cloudGx = 0, cloudGy = 0;
-};
+//
+// THE recorder's own type (sim/pass_table.h pass::RecordCtx), not a mirror of
+// it: RecordTable passes it through the bridge by reference. It used to be one
+// of three hand-copied structs, and three fields went missing across the
+// copies before this was one.
+using RecordCtx = pass::RecordCtx;
 
 // NOTE: the condition and dispatch-extent resolvers that used to live here
 // were the DAWN walk's copies. The Vulkan recorder has always carried its own
@@ -2147,60 +2119,34 @@ void Simulation::RecordTable(const rhi::CommandEncoder& enc, pass::Table which,
                              const void* ctxOpaque) {
   const RecordCtx& cx = *(const RecordCtx*)ctxOpaque;
 
-  rhi::TableCtx tc{};
-  tc.opsCount = cx.opsCount;
-  tc.cellCount = cx.cellCount;
-  tc.expCount = cx.expCount;
-  tc.spawnCount = cx.spawnCount;
-  tc.genCount = cx.genCount;
-  tc.farCount = cx.farCount;
-  tc.fluidCount = cx.fluidCount;
-  tc.fluidSpawnCount = cx.fluidSpawnCount;
-  tc.windWakeCount = cx.windWakeCount;
-  tc.waterChunkCount = cx.waterChunkCount;
-  tc.waterDrainBodies = cx.waterDrainBodies;
-  tc.waterSweepSlot = cx.waterSweepSlot;
-  tc.waveMode = cx.waveMode;
-  tc.opennessChunks = cx.opennessChunks;
-  tc.glowChunks = cx.glowChunks;
-  tc.hashEnable = cx.hashEnable;
-  tc.particlesActive = cx.particlesActive;
-  tc.denseWorldgen = cx.denseWorldgen;
-  tc.caActive = cx.caActive;
-  tc.vizActive = cx.vizActive;
-  tc.gasActive = cx.gasActive;
-  tc.gasFarEmitCount = cx.gasFarEmitCount;
-  tc.gasFarWideCount = cx.gasFarWideCount;
-  tc.reposeActive = cx.reposeActive;
-  tc.cloudFlags = cx.cloudFlags;
-  tc.cloudGx = cx.cloudGx;
-  tc.cloudGy = cx.cloudGy;
-
+  // Resolved as RAW seam pointers (rhi_record.h says why): this runs up to
+  // fluidSubsteps + 4 times a tick, and as refcounted handles every call cost
+  // ~180 atomic increments and as many decrements for data only read below.
   rhi::TableBindings tb{};
   for (int i = 0; i < (int)pass::Buf::kCount; i++)
-    tb.buffers[i] = PassBuffer((pass::Buf)i);
+    tb.buffers[i] = PassBuffer((pass::Buf)i).Get();
   // Bound by the LAST enumerator, which is what the note in pass_table.h's
   // Pipe block is about: a pipeline added past this bound is silently never
   // handed to the recorder, which reads as a skipped row rather than a crash.
   for (int i = 1; i < (int)pass::Pipe::ShadowResolve + 1; i++)
-    tb.pipelines[i] = PassPipeline((pass::Pipe)i);
-  tb.simLayout = simPL_;
-  tb.slimPartLayout = simPL2_;
-  tb.slimFarLayout = farPL_;
-  tb.slimFluidLayout = fluidPL_;
-  tb.slimFluidSeamLayout = fluidSeamPL_;
-  tb.slimGasLayout = gasPL_;
-  tb.shadowLayout = shadowPL_;
-  tb.simSet = simBG_[page_];
-  tb.slimSet = simSlimBG_[page_];
-  tb.particleSet = particleBG_[page_];
-  tb.farSet = farBG_;
-  tb.fluidSet = fluidBG_[page_];
-  tb.fluidSeamSet = fluidSeamBG_[page_];
-  tb.gasSet = gasBG_[page_];
-  tb.shadowSet = shadowBG_;
+    tb.pipelines[i] = PassPipeline((pass::Pipe)i).Get();
+  tb.simLayout = simPL_.Get();
+  tb.slimPartLayout = simPL2_.Get();
+  tb.slimFarLayout = farPL_.Get();
+  tb.slimFluidLayout = fluidPL_.Get();
+  tb.slimFluidSeamLayout = fluidSeamPL_.Get();
+  tb.slimGasLayout = gasPL_.Get();
+  tb.shadowLayout = shadowPL_.Get();
+  tb.simSet = simBG_[page_].Get();
+  tb.slimSet = simSlimBG_[page_].Get();
+  tb.particleSet = particleBG_[page_].Get();
+  tb.farSet = farBG_.Get();
+  tb.fluidSet = fluidBG_[page_].Get();
+  tb.fluidSeamSet = fluidSeamBG_[page_].Get();
+  tb.gasSet = gasBG_[page_].Get();
+  tb.shadowSet = shadowBG_.Get();
 
-  rhi::RecordTableVulkan(enc, which, tc, tb,
+  rhi::RecordTableVulkan(enc, which, cx, tb,
                          passTimer_ && passTimer_->Valid() ? passTimer_ : nullptr);
 }
 
@@ -2271,6 +2217,9 @@ void Simulation::EncodeShadowResolve(const rhi::CommandEncoder& enc) {
     cx.cloudGy = (cf.lowH + 7) / 8;
   }
   RecordTable(enc, pass::Table::ShadowCache, &cx);
+  // The weather row just recorded: if the uniform asked it to rebuild the map
+  // (kClfWeather), that map is now the one later frames reuse.
+  if (clouds) sandvox::CommitCloudWeather();
 }
 
 // Materialize `count` JITTER pages from the (slot, entry) pairs the caller has
@@ -2638,6 +2587,11 @@ void Simulation::EncodeTick(const rhi::CommandEncoder& enc, uint32_t opsCount,
   cx.gasActive = gasOn && (cx.caActive || gasSpawnsThisTick_ > 0 ||
                            gasLive_ > 0 || gasIdleTicks_ < kGasIdleTicks);
   gasSpawnsThisTick_ = 0;
+  // pass_table.def's fill_gasSpawn clears the HEADER only, by a literal byte
+  // count (pass_table.cpp does not see world.h). Keep the two in step.
+  static_assert(kGasSpHdrBytes == 64,
+                "fill_gasSpawn's size (pass_table.def, 0,64,0) is the gasSpawn "
+                "header: update the row with the header");
 
   // ---- C_GASFAR: the frozen fires, which are NOT a parcel population -------
   //
@@ -2714,9 +2668,22 @@ void Simulation::EncodeTick(const rhi::CommandEncoder& enc, uint32_t opsCount,
   // does, the emitted dirt keeps caActive true until the readback catches
   // up, so this predicate can never strand live particles unsimulated).
   // Every input here is tick-deterministic — never frame timing (rule 1).
+  //
+  // THE NO-WATER TICK. Because excite can create particles the CPU cannot see
+  // yet, the tables are recorded on every CA-awake tick whether or not any
+  // water exists, so what they cost with FA_LIVE == 0 is a standing cost of
+  // the CA itself. It is kept near the dispatch floor on the GPU side: no
+  // scratch or map Fills (each region is cleared by its last reader), every
+  // per-particle / per-block row dispatches off a GPU-written count that is
+  // zero, and the fixed-shape rows (alloc, exciteScan, settleJudge,
+  // settleScan, mirrorFold) skip their slot walks when nothing is or was live.
+  // What remains is exciteDetect over this tick's dirty chunks (real work:
+  // it is the excite trigger) plus ~55 dispatches — 36 of them the substep
+  // table's four rows x 9 — that are empty, one workgroup, or an early-out.
   const bool exciteOn = CurrentTuning().sim.fluidExciteMode != 0;
   const bool seamActive =
       fluidCount > 0 || fluidSpawnCount > 0 || (exciteOn && cx.caActive);
+  fluidSeamRecorded_ = seamActive;
   if (seamActive) {
     RecordTable(enc, pass::Table::FluidSeam, &cx);
     // The chunk->block map is built ONCE here, not once per substep: max
@@ -2789,7 +2756,7 @@ void Simulation::BuildRenderBindGroup(rhi::BindGroup& out,
 }
 
 // The veil is per PIXEL, so it follows the largest target a world pass has
-// drawn into (24 bytes a pixel: ~50 MB at 1080p). Grow-only, like the depth
+// drawn into (kVeilWords x 4 = 28 bytes a pixel: ~58 MB at 1080p). Grow-only, like the depth
 // caches are keyed, so alternating a native frame with a smaller --shot or
 // portrait never reallocates; a rebuilt renderBG_ is the only side effect.
 void Simulation::EnsureVeil(uint32_t width, uint32_t height) {
@@ -2801,7 +2768,10 @@ void Simulation::EnsureVeil(uint32_t width, uint32_t height) {
   const uint64_t px = pitch * height;
   if (px <= veilPixels_) return;
   veilPixels_ = px;
-  veilBuf_ = CreateBuffer(device_, px * 6 * 4, rhi::BufferUsage::Storage,
+  // Must match VEIL_WORDS in common.wgsl: six words of record + the frame
+  // stamp that marks it live (w6, which replaced the per-pixel dry clear).
+  constexpr uint64_t kVeilWords = 7;
+  veilBuf_ = CreateBuffer(device_, px * kVeilWords * 4, rhi::BufferUsage::Storage,
                           "waterVeil");
   BuildRenderBindGroup(renderBG_, veilBuf_);
 }
@@ -3574,6 +3544,7 @@ rhi::RenderPass Simulation::BeginRenderPass(const rhi::CommandEncoder& enc,
   EnsureDepth(width, height);
   EnsureVeil(width, height);
   veilLive_ = false;  // until this pass's DrawWorld writes it
+  veilSplitPending_ = false;
 
   rhi::RenderPassDesc d{};
   d.label = "world";
@@ -3601,6 +3572,7 @@ rhi::RenderPass Simulation::BeginAuxRenderPass(const rhi::CommandEncoder& enc,
   EnsureAuxDepth(width, height);
   EnsureVeil(width, height);
   veilLive_ = false;  // until this pass's DrawWorld writes it
+  veilSplitPending_ = false;
 
   rhi::RenderPassDesc d{};
   d.label = "aux";
@@ -3626,6 +3598,7 @@ rhi::RenderPass Simulation::BeginOverlayRenderPass(const rhi::CommandEncoder& en
   EnsureRenderPipelines(format);
   EnsureOverlayDepth(width, height);
   veilLive_ = false;  // until this pass's DrawWorld writes it
+  veilSplitPending_ = false;
 
   rhi::RenderPassDesc d{};
   d.label = "overlay";
@@ -3671,15 +3644,24 @@ void Simulation::DrawWorld(const rhi::RenderPass& pass) {
   // stores the raymarch writes no record, so the body passes must not read
   // one — they keep renderBGNoVeil_, and the raymarch keeps its depth at the
   // liquid interface, which is the old contract whole.
-  if (veilPixels_ > 0 && FragmentStoresAvailable()) {
+  //
+  // The split itself is LAZY (VeilReaderBG): only the first draw that reads
+  // the veil takes it, so a pass that draws nothing after the world pays none.
+  if (veilPixels_ > 0 && FragmentStoresAvailable()) veilSplitPending_ = true;
+}
+
+const rhi::BindGroup& Simulation::VeilReaderBG(const rhi::RenderPass& pass) {
+  if (veilSplitPending_) {
     pass.SplitAfterFragmentWrite(veilBuf_);
     veilLive_ = true;
+    veilSplitPending_ = false;
   }
+  return BodyRenderBG();
 }
 
 void Simulation::DrawParticles(const rhi::RenderPass& pass) {
   pass.SetPipeline(particleDraw_);
-  pass.SetBindGroup(0, BodyRenderBG());
+  pass.SetBindGroup(0, VeilReaderBG(pass));
   pass.SetBindGroup(1, renderPartBG_[page_]);
   pass.DrawIndirect(world_->drawArgs, 0);
 }
@@ -3687,7 +3669,7 @@ void Simulation::DrawParticles(const rhi::RenderPass& pass) {
 void Simulation::DrawSprites(const rhi::RenderPass& pass, uint32_t count) {
   if (count == 0) return;
   pass.SetPipeline(spriteDraw_);
-  pass.SetBindGroup(0, BodyRenderBG());
+  pass.SetBindGroup(0, VeilReaderBG(pass));
   pass.SetBindGroup(1, renderPartBG_[page_]);
   pass.Draw(36, count);
 }
@@ -3695,7 +3677,7 @@ void Simulation::DrawSprites(const rhi::RenderPass& pass, uint32_t count) {
 void Simulation::DrawFluid(const rhi::RenderPass& pass, uint32_t count) {
   if (count == 0) return;   // no fluid placed: costs nothing
   pass.SetPipeline(fluidDraw_);
-  pass.SetBindGroup(0, BodyRenderBG());
+  pass.SetBindGroup(0, VeilReaderBG(pass));
   pass.SetBindGroup(1, renderPartBG_[page_]);
   pass.Draw(36, count);
 }
@@ -3741,7 +3723,7 @@ void Simulation::DrawCurrentField(const rhi::RenderPass& pass,
 
 void Simulation::DrawBodies(const rhi::RenderPass& pass, uint32_t voxInstances) {
   if (voxInstances == 0) return;
-  pass.SetBindGroup(0, BodyRenderBG());
+  pass.SetBindGroup(0, VeilReaderBG(pass));
   pass.SetBindGroup(1, renderPartBG_[page_]);
   // Depth first, then colour: the second draw's fragments pass GreaterEqual
   // only where they are the nearest body surface, so fsBody's per-fragment
@@ -3767,7 +3749,7 @@ uint32_t Simulation::UploadMicroBodyInsts(const rhi::Queue& queue,
 void Simulation::DrawMicroBodies(const rhi::RenderPass& pass, uint32_t count) {
   if (count == 0) return;  // nothing uploaded this frame: no bind, no draw
   pass.SetPipeline(microBodyDraw_);
-  pass.SetBindGroup(0, BodyRenderBG());
+  pass.SetBindGroup(0, VeilReaderBG(pass));
   pass.SetBindGroup(1, microBodyBG_);
   pass.Draw(36, count);
 }

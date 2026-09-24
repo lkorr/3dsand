@@ -121,8 +121,13 @@ PASS(fill_actVoxViz, nullptr, PT_TICK, PIPE_NONE, K_FILL, 0,0,0, GRP_NONE, DYN_N
 // records none of them.
 //
 // gasSpawn is cleared HERE, before the CA, because the CA is what fills it —
-// and because its 8-word header is this tick's gas counter block, which has to
-// start at zero for "this tick" to mean anything. gasOuter is cleared every
+// and because its header is this tick's gas counter block, which has to start
+// at zero for "this tick" to mean anything. ONLY THE HEADER (64 bytes =
+// kGasSpHdrBytes, static_assert-ed in simulation.cpp; x/y = offset/size):
+// the records behind it were a 2 MiB clear every CA tick for nothing —
+// gasLeave writes all eight words of every record it appends, and
+// gasSpawnStep reads records only below min(count, cap), so no reader ever
+// sees a record this tick did not write. gasOuter is cleared every
 // tick because it is a per-tick SPLAT, not an accumulator: a stale byte is a
 // plume that stopped existing several seconds ago still hanging in the sky.
 // gasClaim mirrors fill_claim exactly.
@@ -133,7 +138,7 @@ PASS(fill_actVoxViz, nullptr, PT_TICK, PIPE_NONE, K_FILL, 0,0,0, GRP_NONE, DYN_N
 // world with no parcels and a settled CA. C_GASOUT is exactly that union. The
 // other two fills stay on C_GAS because they belong to the parcel pipeline,
 // which a frozen fire deliberately does not arm.
-PASS(fill_gasSpawn, nullptr, PT_TICK, PIPE_NONE, K_FILL, 0,0,0, GRP_NONE, DYN_NONE, C_GAS, 1,
+PASS(fill_gasSpawn, nullptr, PT_TICK, PIPE_NONE, K_FILL, 0,64,0, GRP_NONE, DYN_NONE, C_GAS, 1,
      USES(TW(GasSpawn)))
 PASS(fill_gasClaim, nullptr, PT_TICK, PIPE_NONE, K_FILL, 0,0,0, GRP_NONE, DYN_NONE, C_GAS, 1,
      USES(TW(GasClaim)))
@@ -610,6 +615,33 @@ PASS(occupancyFull, "occupancyFull+pick(hashTick)", PT_TICK, PIPE_OCCUPANCY, K_C
           R(PageTable)))
 PASS(pick_hash, "occupancyFull+pick(hashTick)", PT_TICK, PIPE_PICK,      K_COMPUTE, 1,1,1,       GRP_SIM, DYN_ZERO, C_HASH, 1,
      USES(R(Voxels) R(Materials) U(RenderUBO) W(Pick) R(PageTable)))
+// ---- THE HASH-TICK farDown BACKSTOP (2026-09-24) --------------------------
+// `farDown` below rides compactNext's dirtyOut list, and a hash tick compacts
+// none — so a chunk whose LAST write landed on a hash tick was never
+// downsampled: the next tick's dirtyOut holds only that tick's writes, and a
+// chunk that went quiet after the hash tick is not in it. openness and glow
+// have a rolling refresh that eventually repairs such a miss; the cascades do
+// not, so the edit simply never reached the horizon.
+//
+// The same pipeline over the list that IS in DirtyList/DispatchArgs on a hash
+// tick: `compact`'s dirtyIn list (the chunks the CA ran this tick), which
+// contains every chunk written this tick by the CA from inside itself and by
+// the mutation/explosion rows (they flag dirtyIn before `compact`). It does
+// NOT cover a chunk first written this tick from OUTSIDE the active set — a
+// grain crossing into a sleeping neighbour, a particle or gas parcel landing,
+// an MPM deposit — that then stays quiet on the next tick. Closing that needs
+// a dirtyOut compaction on hash ticks, and that is not free to add: this
+// tick's DirtyList is also what the PT_FLUIDSEAM excite rows read after
+// PT_TICK, and they WRITE VOXELS, so changing which list a hash tick leaves
+// behind would move the world. Render-only; when the CA is skipped the args
+// still hold the previous tick's list, and fardown's signature makes that a
+// read of unchanged chunks.
+// read-only in practice: `voxels` is read_write for the module because
+// `genChunk` (main/list) writes it; `fardown` only samples the live grid.
+PASS(farDownHash, "farDown", PT_TICK, PIPE_FAR_DOWN, K_INDIRECT, IND_DISPATCHARGS,0,0,
+     GRP_SLIM_FAR, DYN_NONE, C_HASH, 1,
+     USES(R(Voxels) R(Materials) U(TickUBO) U(FarUBO) R(DirtyList) I(DispatchArgs)
+          A(FarVox) A(FarOcc) R(PageTable) R(TreeAtlas) R(WorldMap) RW(FarSig)))
 
 // ---- phase 5b: dirty tick -------------------------------------------------
 // Occupancy update over only the chunks written this tick: compact the dirtyOut
@@ -636,8 +668,10 @@ PASS(pick_dirty, "occupancyDirty+pick", PT_TICK, PIPE_PICK, K_COMPUTE, 1,1,1, GR
 // update, so a settled world dispatches nothing. Separate pass: it uses farPL_
 // (slim group 0 + far group 1), not simPL_.
 // NOTE: hash ticks skip this — they take the whole-world occupancy branch and
-// never compact dirtyOut, so there is no work list. A chunk edited on a hash
-// tick is still dirty the next tick and downsamples then.
+// never compact dirtyOut, so there is no work list. The old claim here, "a
+// chunk edited on a hash tick is still dirty the next tick and downsamples
+// then", was wrong: next tick's dirtyOut holds only next tick's writes. The
+// `farDownHash` row above is the backstop, and its note says what it covers.
 // read-only in practice: `voxels` is read_write for the module because
 // `genChunk` (main/list) writes it. `fardown` only samples the live grid to
 // downsample into the cascades — far-field is derived, render-only data and
@@ -1052,19 +1086,26 @@ PASS(cloud_resolve, "cloudResolve", PT_SHADOWCACHE, PIPE_CLOUD_RESOLVE, K_COMPUT
 // The recorder's last-access tracker persists across RecordTable calls within
 // one command buffer, so repeating this table generates the inter-substep
 // barriers (grid WAW into the next clear, particle RAW into the next mark)
-// exactly like intra-table ones. Determinism does not ride on any of these
-// conditions: every row is C_ALWAYS within the table, and whether the table
-// is recorded at all is a pure function of the CPU-owned particle count.
+// exactly like intra-table ones. Every row is C_ALWAYS within the table, and
+// each kernel bounds itself on the GPU-owned live count (fluidArgs[FA_LIVE]).
+// Whether the table is recorded is EncodeTick's seamActive: the CPU's
+// particle estimate (session.cpp: the snapshot's latent FA_LIVE plus spawns
+// queued since), this tick's spawns, or disturbance-excite with an active CA.
 //
 // The node ACCUMULATORS are rebuilt every substep (fluidClear below). The
 // chunk->block MAP is not: it is built ONCE per tick, by PT_FLUIDMAP.
 //
 // ===================================================== PT_FLUIDMAP ========
 // The chunk -> node-block map, built ONCE PER TICK between the seam's front
-// half and the first substep (plan §7 item 4). fill zeroes the map, mark flags
-// chunks under particle support (atomicOr — the final map state is
-// order-independent), alloc assigns block indices by a single-workgroup scan in
-// slot order (deterministic) and emits the node-pass dispatch args.
+// half and the first substep (plan §7 item 4). mark flags chunks under
+// particle support (atomicOr of a mark bit — the final map state is
+// order-independent), alloc first retires LAST tick's entries (by walking last
+// tick's block list — see alloc in sim_fluid.wgsl) and then assigns block
+// indices by a single-workgroup scan in slot order (deterministic) and emits
+// the node-pass dispatch args. There is no whole-map Fill: it was 256 KiB on
+// every seam tick, water or no water, and the list-driven retire produces the
+// identical map. worldgen/reset still Fill the map and fluidArgs TOGETHER,
+// which is what keeps "non-zero map words belong to listed slots" true.
 //
 // WHY ONCE IS ENOUGH, and what pays for it: a particle's velocity is CFL-capped
 // at 0.45 cell/substep, so it travels at most 0.45*sim.fluidSubsteps cells in a
@@ -1083,8 +1124,6 @@ PASS(cloud_resolve, "cloudResolve", PT_SHADOWCACHE, PIPE_CLOUD_RESOLVE, K_COMPUT
 // LAST tick (consumeApply addresses the CA's flags exactly as the CA wrote
 // them), which is why this is a table of its own rather than rows appended to
 // the seam.
-PASS(fluid_fill_blockMap, nullptr, PT_FLUIDMAP, PIPE_NONE, K_FILL, 0,0,0, GRP_NONE, DYN_NONE, C_ALWAYS, 1,
-     USES(TW(FluidBlockMap)))
 // read-only in practice: `fluidParticles` is read_write for the module because
 // g2p writes it. mark only reads positions to flag chunks. The per-particle
 // extent is GPU-owned now (fluidArgs[FA_LIVE], the seam's count), so mark and
@@ -1092,8 +1131,10 @@ PASS(fluid_fill_blockMap, nullptr, PT_FLUIDMAP, PIPE_NONE, K_FILL, 0,0,0, GRP_NO
 // and each kernel re-bounds itself on the live count it reads from fluidArgs.
 PASS(fluidMark, "fluid(substep)", PT_FLUIDMAP, PIPE_FLUID_MARK, K_INDIRECT, IND_FLUIDPARGS,0,0, GRP_SLIM_FLUID, DYN_NONE, C_ALWAYS, 1,
      USES(U(TickUBO) R(FluidParticlesWrite) A(FluidBlockMap) R(FluidArgsStage) I(FluidPDispatchArgs)))
+// RW(FluidBlockList) / A(FluidArgsStage): the retire phase READS last tick's
+// list and its length (fluidArgs[3]) before the scan overwrites both.
 PASS(fluidAlloc, "fluid(substep)", PT_FLUIDMAP, PIPE_FLUID_ALLOC, K_COMPUTE, 1,1,1, GRP_SLIM_FLUID, DYN_NONE, C_ALWAYS, 1,
-     USES(RW(FluidBlockMap) W(FluidBlockList) W(FluidArgsStage)))
+     USES(RW(FluidBlockMap) RW(FluidBlockList) A(FluidArgsStage)))
 // Same staging-copy shape as argsStage -> dispatchArgs: the indirect-only
 // buffer is never bound in any bind group.
 PASS(copy_fluidArgs, nullptr, PT_FLUIDMAP, PIPE_NONE, K_COPY, 0,0,12, GRP_NONE, DYN_NONE, C_ALWAYS, 1,
@@ -1211,10 +1252,15 @@ PASS(fluidG2p, "fluid(substep)", PT_FLUID, PIPE_FLUID_G2P, K_INDIRECT, IND_FLUID
 // first fluid code inside the hashed world domain. Every voxel it can touch
 // is in this tick's dirty list (I(DispatchArgs) domain), which §3 of the
 // page-table plan guarantees is materialized.
-PASS(seam_fill_excite, nullptr, PT_FLUIDSEAM, PIPE_NONE, K_FILL, 0,0,0, GRP_NONE, DYN_NONE, C_ALWAYS, 1,
-     USES(TW(FluidExciteScratch)))
-PASS(seam_fill_settle, nullptr, PT_FLUIDSEAM, PIPE_NONE, K_FILL, 0,0,0, GRP_NONE, DYN_NONE, C_ALWAYS, 1,
-     USES(TW(FluidSettleScratch)))
+//
+// NO SCRATCH FILLS. seam_fill_excite (393 KB) and seam_fill_settle (787 KB)
+// used to open this table, which is recorded on every CA-awake tick while
+// disturbance-excite is on — i.e. ~1.2 MB of clears per tick in a world with
+// no water in it. Each region is now zeroed by its LAST reader instead
+// (exciteScan: the per-slot counts; settleJudge: the speed maxima; settleScan:
+// last tick's marks; settleCommit: the bins), so both buffers are all-zero
+// outside their producer -> consumer windows — the state the Fill produced —
+// and a buffer is zero-initialised at creation (rhi_vulkan.cpp's zeroFill).
 // COMPACTION SIZING (plan §7 item 1). These two rows dispatched 1,024 fixed
 // workgroups — one thread per pool SLOT, all 262,144 of them — whether 100
 // particles existed or 40,000, which measured as a count-INDEPENDENT ~0.35 ms
@@ -1335,10 +1381,22 @@ PASS(seam_stain_apply, "fluidSettle", PT_FLUIDSETTLE, PIPE_FLUID_STAIN_APPLY, K_
      USES(RW(Voxels) R(Materials) U(TickUBO) R(PageTable) A(DirtyOut)
           R(FluidBlockList) A(FluidCellScratch) A(FluidArgsStage)
           A(FluidBlockMap) I(FluidDispatchArgs)))
+// A(FluidArgsStage): judge sleeps on FA_LIVE + settleScan's SP_LIVEFLAG.
 PASS(seam_settle_judge, "fluidSettle", PT_FLUIDSETTLE, PIPE_FLUID_SETTLE_JUDGE, K_COMPUTE, 128,1,1, GRP_SLIM_FLUIDSEAM, DYN_NONE, C_ALWAYS, 1,
-     USES(A(FluidSettleScratch) A(FluidCalm)))
+     USES(A(FluidSettleScratch) A(FluidCalm) A(FluidArgsStage)))
+// A(FluidExciteScratch): the scan writes settleBin/settleKill's dispatch args
+// into that buffer's spare header triple (EX_SETTLE_ARGS), staged just below.
 PASS(seam_settle_scan, "fluidSettle", PT_FLUIDSETTLE, PIPE_FLUID_SETTLE_SCAN, K_COMPUTE, 1,1,1, GRP_SLIM_FLUIDSEAM, DYN_NONE, C_ALWAYS, 1,
-     USES(A(FluidCalm) A(FluidSettleScratch) A(FluidArgsStage)))
+     USES(A(FluidCalm) A(FluidSettleScratch) A(FluidArgsStage)
+          A(FluidExciteScratch)))
+// settleBin and settleKill do nothing to a particle outside a PICKED block, so
+// on the (common) tick nothing was picked they were two full passes over the
+// pool for nothing. settleScan writes {groups, 1, 1} — the per-particle count
+// when it picked anything, zero when it did not — at exciteScratch word
+// EX_SETTLE_ARGS (8, byte 32), and this stages it for both rows. The WAR
+// against particleTick's fetch of the old args is the recorder's to derive.
+PASS(copy_settleArgs, nullptr, PT_FLUIDSETTLE, PIPE_NONE, K_COPY, 32,0,12, GRP_NONE, DYN_NONE, C_ALWAYS, 1,
+     USES(TR(FluidExciteScratch) TW(FluidPDispatchArgs)))
 // read-only in practice: `fluidParticles` is read_write for the module;
 // settleBin only reads position + attr to bin eighths and stains.
 PASS(seam_settle_bin, "fluidSettle", PT_FLUIDSETTLE, PIPE_FLUID_SETTLE_BIN, K_INDIRECT, IND_FLUIDPARGS,0,0, GRP_SLIM_FLUIDSEAM, DYN_NONE, C_ALWAYS, 1,
@@ -1371,7 +1429,10 @@ PASS(seam_settle_kill, "fluidSettle", PT_FLUIDSETTLE, PIPE_FLUID_SETTLE_KILL, K_
 // The swimming fold: excited-fluid eighths for the 27 CPU-mirror chunks,
 // packed for the snapshot readback (plan §6.5). Last so it reads the tick's
 // final node mass.
+// A(FluidArgsStage) A(FluidSettleScratch): the fold sleeps on FA_LIVE and
+// SP_LIVEPREV (it would only rewrite zeros over zeros).
 PASS(seam_mirror_fold, "fluidSettle", PT_FLUIDSETTLE, PIPE_FLUID_MIRROR_FOLD, K_COMPUTE, 27,1,1, GRP_SLIM_FLUIDSEAM, DYN_NONE, C_ALWAYS, 1,
-     USES(U(TickUBO) R(FluidBlockMap) R(FluidGrid) W(FluidMirror)))
+     USES(U(TickUBO) R(FluidBlockMap) R(FluidGrid) W(FluidMirror)
+          A(FluidArgsStage) A(FluidSettleScratch)))
 
 // clang-format on

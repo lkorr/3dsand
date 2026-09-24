@@ -9,8 +9,22 @@
 
 #include <cstdio>
 #include <cstdlib>  // std::abort -- the null-handle guard in RecordTable
+#include <iterator>  // std::size
 
 #include "sim/world.h"  // kExplosionWg, kNumChunks (pass::kPassStride is in pass_table.h)
+
+// A copy whose source lacks TRANSFER_SRC is a validation error that names
+// only a handle. Name the buffer (once per buffer) so the culprit is one
+// line of output, not an elimination hunt (CLAUDE.md rule 6).
+static void WarnCopySrc(const vk::Buffer* src) {
+  if (!src || (src->usage & VK_BUFFER_USAGE_TRANSFER_SRC_BIT)) return;
+  static std::vector<const vk::Buffer*> seen;
+  for (const vk::Buffer* b : seen) if (b == src) return;
+  seen.push_back(src);
+  std::fprintf(stderr, "[copy-src] buffer '%s' is a copy source but was created without CopySrc\n",
+               src->label.c_str());
+  std::fflush(stderr);
+}
 
 namespace vk {
 
@@ -37,6 +51,19 @@ static_assert((int)pass::Pipe::ShadowResolve + 1 == (int)pass::Pipe::kPipeCount,
               "(a skipped row, not a crash)");
 
 namespace {
+
+// Bytes per texel of the formats CreateImage can produce (ToVkFormat in
+// rhi_vulkan.cpp). 0 = not a format this recorder copies.
+uint32_t TexelBytes(VkFormat f) {
+  switch (f) {
+    case VK_FORMAT_R8G8B8A8_UNORM:
+    case VK_FORMAT_B8G8R8A8_UNORM:
+    case VK_FORMAT_D32_SFLOAT:
+      return 4;
+    default:
+      return 0;
+  }
+}
 
 // ---- barrier_graph §3.2: Acc -> (stage, access) ---------------------------
 //
@@ -201,6 +228,17 @@ void Recorder::Begin(VkCommandBuffer cmd) {
   imgState_.clear();
   pendingImg_.clear();
   renderOpen_ = false;
+  // The fields a FRESH recorder got from its constructor, reset because the
+  // seam reuses recorders (see the header note on Begin).
+  bind_ = Bindings{};
+  stats_ = RecordStats{};
+  lastBind_ = ComputeBind{};
+  lastAtt_ = RenderAttachments{};
+  timerPool_ = VK_NULL_HANDLE;
+  timerAlloc_ = nullptr;
+  timerGroup_ = nullptr;
+  timerEndIdx_ = UINT32_MAX;
+  timerPerRow_ = false;
 
   VkMemoryBarrier2 mb{VK_STRUCTURE_TYPE_MEMORY_BARRIER_2};
   mb.srcStageMask = VK_PIPELINE_STAGE_2_ALL_COMMANDS_BIT;
@@ -432,14 +470,14 @@ void Recorder::SetTimer(VkQueryPool pool,
 }
 
 // --measure only. Begin latches at TOP_OF_PIPE (waits for nothing), end at
-// ALL_COMMANDS (all previous work complete) — the same span Dawn's
-// beginning/end-of-pass timestamp writes cover. The sim's recording is
-// serialized by the generated barriers anyway, so per-group spans do not
-// overlap and the numbers compare directly against the Dawn baseline.
+// ALL_COMMANDS (all previous work complete) — the span a compute pass's
+// beginning/end timestamp writes covered in the phase-0 baseline. The sim's
+// recording is serialized by the generated barriers anyway, so per-group spans
+// do not overlap and the numbers compare directly against that baseline.
 void Recorder::TimerOpen(const char* group) {
   if (timerPool_ == VK_NULL_HANDLE || !timerAlloc_ || !group) return;
   uint32_t b = 0, e = 0;
-  if (!timerAlloc_(group, b, e)) return;  // pool full: untimed, like BeginPass
+  if (!timerAlloc_(group, b, e)) return;  // pool full: this group goes untimed
   be_.Fns().CmdWriteTimestamp2(cmd_, VK_PIPELINE_STAGE_2_TOP_OF_PIPE_BIT, timerPool_, b);
   timerGroup_ = group;
   timerEndIdx_ = e;
@@ -470,10 +508,12 @@ void Recorder::RecordTable(pass::Table which, const RecordCtx& cx) {
     stats_.rows++;
 
     if (r.kind == pass::Kind::Fill) {
-      TimerClose();  // a Fill/Copy row ends the open Dawn pass; mirror it
+      TimerClose();  // a Fill/Copy row ends the group's timestamp span
       ApplyUses(r.uses, r.useCount, /*global=*/false);
       Buffer* b = bind_.buffers[(int)r.uses[0].buf];
-      if (b && b->buf) f.CmdFillBuffer(cmd_, b->buf, 0, VK_WHOLE_SIZE, 0);
+      // x = offset, y = size (0 = to the end): pass_table.h's Row.
+      if (b && b->buf)
+        f.CmdFillBuffer(cmd_, b->buf, r.x, r.y ? (VkDeviceSize)r.y : VK_WHOLE_SIZE, 0);
       stats_.fills++;
       continue;
     }
@@ -490,6 +530,7 @@ void Recorder::RecordTable(pass::Table which, const RecordCtx& cx) {
         region.srcOffset = r.x;
         region.dstOffset = r.y;
         region.size = r.z;
+        WarnCopySrc(src);
         f.CmdCopyBuffer(cmd_, src->buf, dst->buf, 1, &region);
         if (dst->mapped) hostWritten_.push_back(dst);
       }
@@ -500,13 +541,13 @@ void Recorder::RecordTable(pass::Table which, const RecordCtx& cx) {
     // ---- compute / computeIndirect ----
     //
     // There is no "compute pass" in Vulkan (barrier_graph §1.2), so the row's
-    // `group` label — which under Dawn decides ComputePassEncoder boundaries —
-    // is purely a name here. Phase 4's PassTimer will hang timestamps off it.
+    // `group` label — which decided ComputePassEncoder boundaries in the Dawn
+    // era — is purely a name here: the --measure timer's span key.
     VkPipeline pipe = bind_.pipelines[(int)r.pipe];
     if (pipe == VK_NULL_HANDLE) continue;
 
-    // --measure: the row's `group` label is exactly where Dawn opens/closes a
-    // ComputePassEncoder, so the timestamp pair spans the same rows.
+    // --measure: the timestamp pair spans each run of rows sharing a `group`
+    // label, the granularity the phase-0 baseline was measured at.
     // --perf (timerPerRow_): key on the row instead, so a group covering
     // several architecture components reports one number each.
     const char* timerKey = timerPerRow_ ? r.name : r.group;
@@ -615,8 +656,18 @@ void Recorder::RecordTable(pass::Table which, const RecordCtx& cx) {
         dynCount = 1;
         dynOff = (r.dyn == pass::Dyn::Ca) ? k * pass::kPassStride : 0;
       }
-      f.CmdBindDescriptorSets(cmd_, VK_PIPELINE_BIND_POINT_COMPUTE, layout, 0, setCount,
-                              sets, dynCount, dynCount ? &dynOff : nullptr);
+      // Skip a bind identical to the one already on the compute bind point
+      // (ComputeBind, vk_record.h). Pure command-count saving: what is bound
+      // when the dispatch runs is the same either way.
+      const bool sameBind =
+          lastBind_.layout == layout && lastBind_.setCount == setCount &&
+          lastBind_.sets[0] == sets[0] && lastBind_.sets[1] == sets[1] &&
+          lastBind_.dynCount == dynCount && lastBind_.dynOff == dynOff;
+      if (!sameBind) {
+        f.CmdBindDescriptorSets(cmd_, VK_PIPELINE_BIND_POINT_COMPUTE, layout, 0,
+                                setCount, sets, dynCount, dynCount ? &dynOff : nullptr);
+        lastBind_ = ComputeBind{layout, {sets[0], sets[1]}, setCount, dynCount, dynOff};
+      }
 
       if (r.kind == pass::Kind::ComputeIndirect) {
         Buffer* args;
@@ -693,6 +744,7 @@ void Recorder::CopyToHost(Buffer* src, uint64_t srcOffset, Buffer* dst,
   region.srcOffset = srcOffset;
   region.dstOffset = dstOffset;
   region.size = size;
+  WarnCopySrc(src);
   be_.Fns().CmdCopyBuffer(cmd_, src->buf, dst->buf, 1, &region);
   stats_.copies++;
   if (dst->mapped) hostWritten_.push_back(dst);
@@ -722,28 +774,6 @@ void Recorder::BlitImage(Image* src, Image* dst, bool linear) {
                          dst->img, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, 1, &region,
                          linear ? VK_FILTER_LINEAR : VK_FILTER_NEAREST);
   stats_.copies++;
-}
-
-void Recorder::FillUntracked(Buffer* dst, uint64_t offset, uint64_t size) {
-  if (!dst || !dst->buf) return;
-  bool dstTable = false;
-  for (int i = 0; i < (int)pass::Buf::kCount; i++) {
-    if (bind_.buffers[i] == dst) {
-      TouchBuffer((pass::Buf)i, pass::Acc::TransferWrite);
-      dstTable = true;
-    }
-  }
-  if (!dstTable) TouchExtra(dst, pass::Acc::TransferWrite);
-  if (mode_ == BarrierMode::Sledgehammer) {
-    pending_.clear();
-    Sledgehammer();
-  } else {
-    FlushPending(/*global=*/false);
-  }
-  be_.Fns().CmdFillBuffer(cmd_, dst->buf, offset,
-                          size == UINT64_MAX ? VK_WHOLE_SIZE : size, 0);
-  stats_.fills++;
-  if (dst->mapped) hostWritten_.push_back(dst);
 }
 
 // ---------------------------------------------------------------------------
@@ -780,7 +810,42 @@ void Recorder::CopyTracked(pass::Buf srcId, Buffer* src, uint64_t srcOffset, Buf
   region.srcOffset = srcOffset;
   region.dstOffset = dstOffset;
   region.size = size;
+  WarnCopySrc(s);
   be_.Fns().CmdCopyBuffer(cmd_, s->buf, dst->buf, 1, &region);
+  stats_.copies++;
+  if (dst->mapped) hostWritten_.push_back(dst);
+}
+
+void Recorder::CopyTrackedRegions(pass::Buf srcId, Buffer* src, Buffer* dst,
+                                  const rhi::CopyRegion* regions, size_t count) {
+  Buffer* s = src ? src : bind_.buffers[(int)srcId];
+  if (!s || !s->buf || !dst || !dst->buf || !regions || count == 0) return;
+  // ONE touch for the whole batch: every region reads the same source in the
+  // same stage, so the first CopyTracked of a loop derived this barrier and
+  // the rest derived nothing (read-after-read). Destination untracked for
+  // CopyTracked's reason.
+  TouchBuffer(srcId, pass::Acc::TransferRead, s);
+  if (mode_ == BarrierMode::Sledgehammer) {
+    pending_.clear();
+    Sledgehammer();
+  } else {
+    FlushPending(/*global=*/false);
+  }
+  // Small batches (the common case) stay on the stack.
+  VkBufferCopy local[64];
+  std::vector<VkBufferCopy> heap;
+  VkBufferCopy* out = local;
+  if (count > std::size(local)) {
+    heap.resize(count);
+    out = heap.data();
+  }
+  for (size_t i = 0; i < count; i++) {
+    out[i].srcOffset = regions[i].srcOffset;
+    out[i].dstOffset = regions[i].dstOffset;
+    out[i].size = regions[i].size;
+  }
+  WarnCopySrc(s);
+  be_.Fns().CmdCopyBuffer(cmd_, s->buf, dst->buf, (uint32_t)count, out);
   stats_.copies++;
   if (dst->mapped) hostWritten_.push_back(dst);
 }
@@ -818,6 +883,7 @@ void Recorder::CopyRenderWritten(Buffer* src, uint64_t srcOffset, Buffer* dst,
   region.srcOffset = srcOffset;
   region.dstOffset = dstOffset;
   region.size = size;
+  WarnCopySrc(src);
   be_.Fns().CmdCopyBuffer(cmd_, src->buf, dst->buf, 1, &region);
   stats_.copies++;
   if (dst->mapped) hostWritten_.push_back(dst);
@@ -935,11 +1001,21 @@ void Recorder::TransitionImage(Image* im, VkImageLayout newLayout,
     return;
   }
   VkImageMemoryBarrier2 b{VK_STRUCTURE_TYPE_IMAGE_MEMORY_BARRIER_2};
-  // First touch this recording: src NONE/0 is correct — availability of prior
-  // submits' writes came from the head barrier; this transition only needs the
-  // layout change itself ordered before dst.
+  // First touch this recording: src NONE/0 is correct for an image only this
+  // queue writes — availability of prior submits' writes came from the head
+  // barrier; this transition only needs the layout change itself ordered
+  // before dst.
   b.srcStageMask = s->lastWriteStage | s->readStagesSince;
   b.srcAccessMask = s->lastWriteAccess | s->readAccessSince;
+  // ...but NOT for a swapchain image. Its previous user is the PRESENTATION
+  // ENGINE, and the only thing ordering this transition after it is the
+  // acquire semaphore, whose wait covers kSwapchainAcquireStages2. A barrier
+  // whose source scope is empty is not in that dependency chain, so its layout
+  // transition could run while the image is still being scanned out. Naming
+  // the wait stages as the source is what chains it (the standard acquire
+  // pattern; srcAccess stays 0 — a semaphore wait makes memory available
+  // itself).
+  if (im->presentable && b.srcStageMask == 0) b.srcStageMask = kSwapchainAcquireStages2;
   b.dstStageMask = dstStage;
   b.dstAccessMask = dstAccess;
   b.oldLayout = im->layout;
@@ -1156,8 +1232,12 @@ void Recorder::CopyImageToBuffer(Image* src, Buffer* dst, uint64_t dstOffset,
   FlushPendingImages();
 
   // bufferRowLength is in TEXELS, not bytes — the one WebGPU/Vulkan unit
-  // mismatch in this call. Only 4-byte color formats reach this path.
-  const uint32_t texelBytes = 4;
+  // mismatch in this call. Derived from the image's format (every format
+  // rhi::TextureFormat can name is 4 bytes a texel today, which is why this
+  // used to be a bare 4); a format it cannot size is refused rather than
+  // copied with a wrong row pitch.
+  const uint32_t texelBytes = TexelBytes(src->format);
+  if (texelBytes == 0) return;
   VkBufferImageCopy region{};
   region.bufferOffset = dstOffset;
   region.bufferRowLength = bytesPerRow / texelBytes;

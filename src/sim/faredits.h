@@ -67,16 +67,31 @@ class FarEdits {
     byChunk_.clear();
     cells_ = 0;
   }
+  // ---- THE INDEX IS CAPPED (2026-09-24) ------------------------------------
+  // It was an unbounded unordered_map, and what feeds it is every chunk the
+  // stream's sticky `modified_` calls written — which includes a chunk that
+  // was only ever dirty for SMOKE drifting through or water settling, so a
+  // session that burned a forest grew ~585 patch words per touched chunk,
+  // forever. Past this many recorded words a NEW level chunk is refused and
+  // counted (RefusedChunks); level chunks already in the index keep updating,
+  // so a re-noted edit is never lost to the cap. 2^24 words is 64 MiB — about
+  // 28,000 edited fine chunks' worth at 585 words each.
+  static constexpr size_t kMaxCells = size_t(1) << 24;
+  uint64_t RefusedChunks() const { return refused_; }
   bool Empty() const { return byChunk_.empty(); }
   size_t LevelChunks() const { return byChunk_.size(); }
   // Samples recorded (before compaction — a cell re-noted by a second
-  // eviction of the same chunk counts twice until its level chunk is read).
-  // Diagnostics only.
+  // eviction of the same chunk counts twice until its level chunk is
+  // compacted). Diagnostics, and the cap's measure.
   size_t Cells() const { return cells_; }
 
   // Record one fine chunk's contribution to every cascade level. `words` is
   // kChunkVol voxel words in chunk-linear order (the same layout genChunk and
-  // RleDecodeChunk use). Re-noting a chunk REPLACES its previous entries.
+  // RleDecodeChunk use). Re-noting a chunk REPLACES its previous entries in
+  // effect: a fine chunk always contributes the SAME cells, the newer word for
+  // a cell wins at compaction, and a level chunk whose appended runs outgrow
+  // twice its cell count is compacted on the spot (Append), so storage stays
+  // bounded however often a chunk is re-noted.
   void NoteChunk(IVec3 wc, const uint32_t* words);
   // Same, for a page-table sentinel slot whose whole content is one material
   // (EMPTY / UNIFORM / JITTER — JITTER varies only the palette nibble, which
@@ -84,8 +99,11 @@ class FarEdits {
   void NoteUniformChunk(IVec3 wc, uint32_t mat);
 
   // Patch words for one level chunk (1-based level, coord in level-CHUNK
-  // units), or nullptr when that chunk holds no edits. Sorted by cell index,
-  // one word per cell.
+  // units), or nullptr when that chunk holds no edits. One word per cell,
+  // sorted COLUMN-MAJOR — by (z, x, y) of the cell, see ColumnKey — so the
+  // `farpatch` kernel, which gives each thread a contiguous run, finds the
+  // cells of one (x, z) column adjacent and builds that column's genColumn
+  // once instead of once per cell.
   //
   // NOT const, because this is where a level chunk's appended runs are
   // COMPACTED. Merging on every NoteChunk would be quadratic on a bulk build:
@@ -137,6 +155,16 @@ class FarEdits {
     std::vector<uint32_t> words;
     bool sorted = true;
   };
+  // The cell index is x-fastest (x + y*16 + z*256); this reorders it to
+  // (z, x, y) so the cells of one column are adjacent. A bijection of the cell
+  // index, so "equal key" is still "same cell" for the dedupe.
+  static uint32_t ColumnKey(uint32_t w) {
+    const uint32_t ci = w & kCellMask;
+    return (ci & ~0xFFu) | ((ci & 15u) << 4) | ((ci >> 4) & 15u);
+  }
+  // Sort by ColumnKey (stable: the newest of equal cells is the last) and keep
+  // the last word of each cell. Lookup's lazy compaction and Append's bound.
+  void Compact(Chunk& c);
   // Append `add` (itself sorted, one word per cell) to the level chunk's list.
   // Later appends win on a repeated cell — re-noting the same fine chunk must
   // not grow the compacted list, and the newer read is the truth.
@@ -149,5 +177,6 @@ class FarEdits {
 
   std::unordered_map<LKey, Chunk, LKeyHash> byChunk_;
   size_t cells_ = 0;                // appended samples, before compaction
+  uint64_t refused_ = 0;            // new level chunks refused at kMaxCells
   std::vector<uint32_t> scratch_;   // per-level `add` list
 };

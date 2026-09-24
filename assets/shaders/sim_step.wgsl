@@ -141,25 +141,31 @@ fn inBounds(c : vec3<i32>) -> bool { return cellResident(c, T.origin); }
 // the block there: the plain markDirty() below keeps the old call shape for
 // the write paths, which are the overwhelming majority of the call sites and
 // the only ones that also markVoxActive.
+//
+// NON-WRITE REASONS MARK ONLY THE OWN CHUNK (2026-09-23). REACT (matched, did
+// not fire), STAIN (unsaturated surface in reach), VISCOUS (off-tick with
+// somewhere to go) and the retired FLOW say "THIS cell still has work", and
+// that work is done by this cell, in this chunk. Nothing was written, so no
+// neighbour's view changed and there is nothing for it to re-evaluate; a
+// neighbour chunk that has work of its own marks itself, and the moment this
+// cell's work IS a write, that write fans out as before. Fanning these out
+// used to hold up to 7 innocent chunks awake beside every idle reactor. None
+// of the four is in FILM_LICENCE, and the repose snapshot is keyed on the
+// dispatch list rather than on who marked it, so neither depends on the fan.
+const DIRTY_OWN_CHUNK_ONLY : u32 =
+    DIRTY_R_REACT | DIRTY_R_STAIN | DIRTY_R_FLOW | DIRTY_R_VISCOUS;
+
 fn markDirtyR(c : vec3<i32>, reason : u32) {
-  let lo = c & vec3<i32>(CHUNK_MASK);
-  let ch = worldChunkOf(c);
-  var xs = array<i32, 2>(0, 0);
-  var ys = array<i32, 2>(0, 0);
-  var zs = array<i32, 2>(0, 0);
-  if (lo.x == 0) { xs[1] = -1; } else if (lo.x == CHUNK_MASK) { xs[1] = 1; }
-  if (lo.y == 0) { ys[1] = -1; } else if (lo.y == CHUNK_MASK) { ys[1] = 1; }
-  if (lo.z == 0) { zs[1] = -1; } else if (lo.z == CHUNK_MASK) { zs[1] = 1; }
-  for (var i = 0; i < 2; i++) {
-    for (var j = 0; j < 2; j++) {
-      for (var k = 0; k < 2; k++) {
-        let n = ch + vec3<i32>(xs[i], ys[j], zs[k]);
-        let ns = chunkSlotOf(n, T.origin);
-        if (ns != SLOT_NONE) {
-          atomicOr(&dirtyOut[ns], reason);
-        }
-      }
-    }
+  if ((reason & ~DIRTY_OWN_CHUNK_ONLY) == 0u) {
+    let own = dirtyFanSlot(c, T.origin, 0u);  // k = 0: c's own chunk
+    if (own != SLOT_NONE) { atomicOr(&dirtyOut[own], reason); }
+    return;
+  }
+  // The fan-out rule is common.wgsl's dirtyFanSlot: only the distinct chunks
+  // c borders, so an interior cell pays one atomic instead of eight.
+  for (var k = 0u; k < 8u; k++) {
+    let ns = dirtyFanSlot(c, T.origin, k);
+    if (ns != SLOT_NONE) { atomicOr(&dirtyOut[ns], reason); }
   }
 }
 
@@ -378,6 +384,12 @@ const FILM_LICENCE : u32 =
 // sleeps with work left.
 var<private> gFilmLicence : bool = false;
 
+// The acting cell and its physical word index, set once at the top of main.
+// tryMove's source is always this cell, and re-resolving it through the page
+// table on every move was a second lookup of an answer main already had.
+var<private> gSelfCell : vec3<i32> = vec3<i32>(0);
+var<private> gSelfIdx : u32 = PT_NO_WORD;
+
 // Is there more of this same liquid directly ABOVE c? Out of window reads as
 // "no": the residency edge is solid and inert, so a cell at the top of the
 // window counts as a free surface, which is the conservative direction — it may
@@ -439,8 +451,10 @@ fn canDisplace(myDensity : i32, rising : bool, tw : u32) -> bool {
 
 fn tryMove(src : vec3<i32>, dst : vec3<i32>, myWord : u32, myDensity : i32, rising : bool) -> bool {
   if (!inBounds(dst)) { return false; }
-  let di = voxWordIndex((dst));
-  let tw = voxWordAt((dst));
+  // One table resolution for the target's index AND word.
+  let dt = voxIndexAndWord(dst);
+  let di = dt.x;
+  let tw = dt.y;
   if (!canDisplace(myDensity, rising, tw)) { return false; }
   let stamp = stampFor(T.tick, P.substep);
   // Stain travels WITH the voxel, not with the cell: a stained pebble that
@@ -449,8 +463,11 @@ fn tryMove(src : vec3<i32>, dst : vec3<i32>, myWord : u32, myDensity : i32, risi
   voxStore(di, packVoxKeepStain(voxMat(myWord), voxState(myWord), stamp, myWord));
   markVoxActive(di);
   // displaced fluid (or air) swaps into the source cell, stamped so it does
-  // not act again this tick
-  let si = voxWordIndex((src));
+  // not act again this tick. Every caller's `src` is the acting cell, whose
+  // index main already resolved (gSelf*); anything else resolves here. So
+  // does a sentinel source, so a fault record names the right chunk.
+  var si = gSelfIdx;
+  if (any(src != gSelfCell) || si == PT_NO_WORD) { si = voxWordIndex(src); }
   voxStore(si, packVoxKeepStain(voxMat(tw), voxState(tw), stamp, tw));
   markVoxActive(si);
   markDirtyR(src, DIRTY_R_MOVE);
@@ -833,8 +850,11 @@ fn reposeDiagAllowed(c : vec3<i32>, d : vec2<i32>, code : u32) -> bool {
 fn transferLiquid(src : vec3<i32>, dst : vec3<i32>, mat : u32,
                   sf : u32, df : u32, t : u32) {
   let stamp = stampFor(T.tick, P.substep);
-  let si = voxWordIndex((src));
-  let di = voxWordIndex((dst));
+  // One table resolution per cell for index AND word (they used to be four).
+  let sv = voxIndexAndWord(src);
+  let dv = voxIndexAndWord(dst);
+  let si = sv.x;
+  let di = dv.x;
   // Stain and flowing liquid: the DESTINATION keeps its own stain, and the
   // source keeps its own. A liquid moving through a cell does not pick the
   // cell's stain up and carry it downstream — stain marks the SURFACE that was
@@ -845,8 +865,8 @@ fn transferLiquid(src : vec3<i32>, dst : vec3<i32>, mat : u32,
   // A source cell that empties completely goes to 0 — full air, no stain. That
   // is deliberate: the stain belonged to the liquid that just left, and an
   // empty cell of air has no surface to hold it.
-  let sw = voxWordAt((src));
-  let dw = voxWordAt((dst));
+  let sw = sv.y;
+  let dw = dv.y;
   if (t >= sf) { voxStore(si, 0u); }
   else { voxStore(si, packVoxKeepStain(mat, sf - t - 1u, stamp, sw)); }
   markVoxActive(si);
@@ -1109,14 +1129,17 @@ fn doReactions(c : vec3<i32>, idx : u32, slotIdx : u32, w : u32, mat : u32,
     let rule = reactions[m.reactOffset + ri];
     let kind = rule.packed & 3u;
     let dmask = (rule.packed >> 2u) & 7u;
-    let rr = hash3(rnd, ri, slotIdx);  // SLOT index: never the page index
-    let rot = rr >> 12u;
 
     // Light/phase gate. A rule whose condition is not met is skipped WITHOUT
     // setting keepAwake — that is what lets a lit pond go back to sleep at
     // night instead of spinning on a rule that cannot fire (rule 2). The
     // chunk is re-woken when the phase crosses back, see wakeOnPhaseChange.
     if (!lightMatches(rule, c)) { continue; }
+
+    // Drawn AFTER the gate: hash3 is stateless and keyed on (rnd, ri, slot),
+    // so a skipped rule consumes nothing and every later draw is unchanged.
+    let rr = hash3(rnd, ri, slotIdx);  // SLOT index: never the page index
+    let rot = rr >> 12u;
 
     // A light-gated rule does not hold its chunk awake even when it MATCHES.
     //
@@ -1162,10 +1185,10 @@ fn doReactions(c : vec3<i32>, idx : u32, slotIdx : u32, w : u32, mat : u32,
         if ((faceDirBit(di) & dmask) == 0u) { continue; }
         let n = c + faceDir(di);
         if (!inBounds(n)) { continue; }
-        let ni = voxWordIndex((n));
-        if (voxMat(voxWordAt((n))) != MAT_AIR) { continue; }
+        if (voxMat(voxWordAt(n)) != MAT_AIR) { continue; }
         keepAwake = keepAwake || !lightGated;
         if ((rr % REACT_CHANCE_DEN) < rainChance(rule, c, rule.chance)) {
+          let ni = voxWordIndex(n);  // resolved only for the cell that is written
           voxStore(ni, packVox(rule.prodNbr, productState(rule.prodNbr, rr >> 4u), stamp));
           markVoxActive(ni);
           markDirtyR(n, DIRTY_R_REACTW);
@@ -1187,9 +1210,9 @@ fn doReactions(c : vec3<i32>, idx : u32, slotIdx : u32, w : u32, mat : u32,
         if ((faceDirBit(di) & dmask) == 0u) { continue; }
         let n = c + faceDir(di);
         if (!inBounds(n)) { continue; }
-        let ni = voxWordIndex((n));
-        let nw = voxWordAt((n));
-        var nmat = voxMat(nw);
+        let niw = voxIndexAndWord(n);  // one table resolution for index + word
+        let ni = niw.x;
+        var nmat = voxMat(niw.y);
         // Excited-fluid synthesis: an air cell holding MPM particles reads
         // as a liquid neighbour of the particles' material, so every
         // authored PAIR rule works against excited water exactly as against
@@ -1202,6 +1225,19 @@ fn doReactions(c : vec3<i32>, idx : u32, slotIdx : u32, w : u32, mat : u32,
           synthFluid = true;
         }
         if (!nbrMatches(rule, nmat, materials[nmat])) { continue; }
+        // A PAIR that would turn this neighbour into WHAT IT ALREADY IS, and
+        // leave self alone, is a no-op, and it is not a match. The case that
+        // found it: grass spreads onto `tag:soil`, and grass carries `soil`, so
+        // every grass cell matched its grass neighbours and rewrote grass over
+        // grass at 3 per mille. Each such write marked REACTW, which is in
+        // FILM_LICENCE and re-dirties the chunk, so a lawn in daylight never
+        // slept. Skipped here, before keepAwake and before the roll, so the
+        // scan goes on to a neighbour the rule can actually change (dirt,
+        // sand). A synthesized fluid neighbour is never a no-op — its product
+        // is written into the AIR cell — so it is excluded.
+        if (!synthFluid && rule.prodSelf == PROD_KEEP && rule.prodNbr == nmat) {
+          continue;
+        }
         keepAwake = keepAwake || !lightGated;
         // Weather scale here, after the neighbour matched, so a dry-sky tick
         // and a wood cell with nothing hot beside it never pay the probe.
@@ -1252,8 +1288,10 @@ fn doReactions(c : vec3<i32>, idx : u32, slotIdx : u32, w : u32, mat : u32,
 //   * A staining liquid rolls once per tick against `chance` (per-mille).
 //   * On success it stains ONE face neighbour — chosen by an RNG rotation, so
 //     which one is deterministic but not biased toward an axis.
-//   * The stain ADDS to whatever the neighbour already carries, saturating at
-//     STAIN_AMT_MAX. Repeated contact deepens a stain rather than resetting it.
+//   * The stain ADDS to what the neighbour already carries OF ITS OWN TYPE,
+//     saturating at the ceiling. Repeated contact deepens a stain rather than
+//     resetting it. A FOREIGN stain is never painted over (only a washer may
+//     touch it, and only downward) — see `canStain` below.
 //   * Having stained, it may CONSUME the voxel (per-mille `consume`), which
 //     deletes it to air and lets the liquid flow into the hole.
 //
@@ -1315,7 +1353,8 @@ fn doReactions(c : vec3<i32>, idx : u32, slotIdx : u32, w : u32, mat : u32,
 // the trap in the drying variant, and why saturation here is terminal.
 //
 // Returns whether the caller should keep the cell awake.
-fn doStaining(c : vec3<i32>, idx : u32, m : Material, rnd : u32) -> bool {
+fn doStaining(c : vec3<i32>, idx : u32, selfWord : u32, m : Material,
+               rnd : u32) -> bool {
   let stainType = matStainType(m);
   let addAmt = matStainAmount(m);
   let washes = matWashes(m);
@@ -1326,9 +1365,9 @@ fn doStaining(c : vec3<i32>, idx : u32, m : Material, rnd : u32) -> bool {
   let rot = rnd >> 7u;
   let fires = (rnd % 1000u) < matStainChance(m);
 
-  // This cell's own fullness, for the absorption debit below. Re-read rather
-  // than passed in: a reaction earlier this tick may have rewritten it.
-  let selfWord = voxWordAt(c);
+  // This cell's own word, for the absorption debit below. Passed in from main
+  // rather than re-read: doReactions returns true (and main returns) whenever
+  // it rewrites SELF, so reaching here means the word main loaded is current.
   let selfMat = voxMat(selfWord);
   let selfIsLiquid = materials[selfMat].klass == CLASS_LIQUID;
 
@@ -1346,8 +1385,9 @@ fn doStaining(c : vec3<i32>, idx : u32, m : Material, rnd : u32) -> bool {
     // stream depend on allocation history — the world would still be
     // self-consistent and would still diverge from a dense run.
     let niSlot = cellIndexW(n);
-    let ni = voxWordIndex(n);
-    let nw = voxWordAt(n);
+    let niw = voxIndexAndWord(n);  // one table resolution for index + word
+    let ni = niw.x;
+    let nw = niw.y;
     let nmat = voxMat(nw);
     if (nmat == MAT_AIR) { continue; }
     // Don't stain other liquids or gases: a stain is something that soaks into
@@ -1362,16 +1402,33 @@ fn doStaining(c : vec3<i32>, idx : u32, m : Material, rnd : u32) -> bool {
     // amount is still the ceiling, so `absorb` can only ever hold LESS than the
     // liquid would otherwise apply — a material opts into being soakable, it
     // cannot opt into being stained harder than the liquid stains.
+    //
+    // NON-ABSORBENT ground (capacity 0: all stone) takes a SURFACE MARK of
+    // exactly 1, not the liquid's full amount: `max(capacity, 1u)` is what
+    // keeps it from being 0 (unstainable). This has been the running behaviour
+    // since absorption landed (0787d38), and sim_fluid_seam's stainApply uses
+    // the same ceiling, so the two stainers agree; a comment below used to
+    // claim stone got the full amount, which the code never did.
     let capacity = matAbsorbCapacity(materials[nmat]);
     let ceiling = min(addAmt, max(capacity, 1u));
 
-    // Is there work left on this neighbour? A foreign stain is work for a
-    // washer (rinse it out) and for a non-washer alike (overwrite it, the
-    // pre-existing behaviour). Our own stain is work only while it sits under
-    // the ceiling this ground allows.
+    // Is there work left on this neighbour? A STRICT ORDER, and it is the
+    // termination argument (2026-09-23): a foreign stain is work ONLY for a
+    // washer, which steps it down; a non-washer stains only CLEAN ground or
+    // its OWN type below the ceiling, and never paints over somebody else's.
+    //
+    // It used to overwrite, and that was two stains on one cell that never
+    // settled: blood painted over wet ground, water rinsed the blood one level
+    // and re-wet it, blood painted it again — and blood vs ichor simply
+    // repainted each other forever. Every one of those events also rolled
+    // `consume`, so the surface eroded and the chunk never slept. Now every
+    // step is monotone: a washer only lowers a foreign amount, a stainer only
+    // raises its own, and nobody raises a foreign one, so each cell reaches a
+    // fixed point. The price is accepted: blood no longer recolours ground
+    // that is already wet (or rotted, or bloodied by ichor's opposite).
     let foreign = cur != 0u && curType != stainType;
     let canWash = washes && foreign;
-    let canStain = foreign || cur < ceiling;
+    let canStain = !foreign && cur < ceiling;
     if (!canWash && !canStain) { continue; }
     progress = true;
     if (!fires) { break; }  // work remains, but not this tick
@@ -1407,13 +1464,14 @@ fn doStaining(c : vec3<i32>, idx : u32, m : Material, rnd : u32) -> bool {
     // which is both free mass and an instant, un-watchable transition.
     //
     // On NON-absorbent ground (capacity 0, all stone) nothing is spent, so
-    // there is no rate to keep in step with and the original behaviour stands:
-    // the stainer applies its full amount at once. That is what keeps blood on
-    // stone looking exactly as it did before this feature.
+    // there is no rate to keep in step with: the stainer applies the whole
+    // ceiling at once — which on stone is the 1-level surface mark above.
     var amt = ceiling;
     if (capacity > 0u) {
       amt = min(cur + 1u, ceiling);
-      if (curType != stainType) { amt = 1u; }  // foreign stain: start over at 1
+      // Only a stale type at amount 0 reaches here now (foreign stains are
+      // refused above): start clean at 1.
+      if (curType != stainType) { amt = 1u; }
     } else if (curType == stainType) {
       amt = min(cur + addAmt, ceiling);
     }
@@ -1833,10 +1891,10 @@ fn bridgeLevel(c : vec3<i32>, mat : u32, apply : bool) -> bool {
 // it stays inside the colour lattice's guarantee exactly like the reaction
 // neighbour scans do.
 //
-// Exists for two callers now: a viscous liquid on an off-tick deciding whether
-// it is worth staying awake for (the moveEvery gate in main), and the SETTLED
-// path of stepLiquid — PLAN §1.1 defect 4, "a cell that found no move sleeps
-// and never retries". The conditions below MIRROR stepLiquid's stages one for
+// One caller: a viscous liquid on an off-tick deciding whether it is worth
+// staying awake for (the moveEvery gate in main). It used to be asked after a
+// failed stepLiquid too, where it was provably false — see the liquid branch
+// of main. The conditions below MIRROR stepLiquid's stages one for
 // one; drift in the loose direction pins chunks awake forever (rule 2), drift
 // in the tight direction lets a cell sleep with work left, so keep them in
 // step. Same shape as the powder path's "nothing to do: cell settles".
@@ -2386,6 +2444,29 @@ fn main(@builtin(workgroup_id) wg : vec3<u32>,
   // one workgroup per compacted dirty chunk (indirect dispatch). The list
   // holds SLOT indices; reconstruct the world chunk from the window origin.
   let ci = dirtyList[wg.x];
+
+  // ---- A SENTINEL CHUNK WHOSE MATERIAL CANNOT ACT IS A WHOLE-CHUNK NO-OP ----
+  // Workgroup-uniform (one table load per workgroup), so the early return is
+  // uniform too. Two cases, and ONLY these two, are provably inert:
+  //   * PT_EMPTY: every cell is air, and main returns on air.
+  //   * UNIFORM / JITTER of a material with !matCanAct (a plain solid: no
+  //     reaction bucket, no stain, CLASS_SOLID). Every cell is that solid for
+  //     the whole dispatch — the table is read-only during it, and a store into
+  //     a sentinel is a dropped fault, never a write — so every cell has an
+  //     in-chunk face neighbour of the same solid, soloSolid() is false, and
+  //     main's `!matCanAct` return is the next thing it does. Nothing is written
+  //     and nothing is marked.
+  // What this does NOT skip, deliberately: a sentinel of any material that CAN
+  // act (sand, water, grass, anything with a rule or a stain). Rules that a
+  // NEIGHBOUR chunk's content triggers across the face (a PAIR, a stain, a
+  // flow into this chunk) are run by the neighbour's cells, which are in the
+  // neighbour's workgroup and untouched by this return.
+  let pe = pageEntryOf(ci);
+  if ((pe & PT_SENTINEL_BIT) != 0u) {
+    let smat = pe & PT_MAT_MASK;
+    if (smat == MAT_AIR || !matCanAct(materials[smat])) { return; }
+  }
+
   // Workgroup-uniform, one scalar load, read only by the riser film step: did
   // anything that is not itself a film step happen in this chunk last tick?
   // FILM_LICENCE block — this is what stops a neutral rule from keeping a
@@ -2411,10 +2492,13 @@ fn main(@builtin(workgroup_id) wg : vec3<u32>,
   // history, and a paged run would diverge from a dense one with no other
   // symptom.
   let slotIdx = cellIndexW(c);
-  let idx = voxWordIndex(c);
-  let w = voxWordAt(c);
+  let here = voxIndexAndWord(c);  // one table resolution for index + word
+  let idx = here.x;
+  let w = here.y;
   let mat = voxMat(w);
   if (mat == MAT_AIR) { return; }
+  gSelfCell = c;
+  gSelfIdx = idx;
   if (voxStamp(w) == stampFor(T.tick, P.substep)) { return; }  // already acted this substep
 
   let m = materials[mat];
@@ -2483,7 +2567,7 @@ fn main(@builtin(workgroup_id) wg : vec3<u32>,
   // Keeps the chunk awake only while unstained surface remains in reach — see
   // the sleep note on doStaining.
   if (P.substep == 0u && matStains(m)) {
-    if (doStaining(c, idx, m, rnd)) { markDirtyR(c, DIRTY_R_STAIN); }
+    if (doStaining(c, idx, w, m, rnd)) { markDirtyR(c, DIRTY_R_STAIN); }
     // Absorption can have emptied this cell (the liquid soaked away) or docked
     // its fullness and stamped it. Re-read before the movement code below acts
     // on a stale word: moving an already-spent eighth would create mass.
@@ -2517,20 +2601,19 @@ fn main(@builtin(workgroup_id) wg : vec3<u32>,
   }
 
   if (m.klass == CLASS_LIQUID) {
-    // re-read: a reaction may have rewritten this cell's fullness
-    let lw = voxWordAt(c);
-    if (!stepLiquid(c, idx, lw, mat, m, rnd)) {
-      // PLAN §1.1 defect 4. A cell that moved nothing this substep used to fall
-      // straight out with no markDirty, on the assumption that "found no move"
-      // means "settled". It does not always: the RNG-ordered scans return on
-      // the FIRST success, a neighbour may have taken the only exit earlier in
-      // the tick, and every stage can be refused for a reason that is gone next
-      // tick. So ask the mirror predicate, exactly as the viscous off-tick
-      // branch above does, and stay awake only while genuinely flow-unstable.
-      // A flat pool answers false and the chunk sleeps, which is the guarantee
-      // this line must not break (rule 2) — the `sleep` gate is its test.
-      if (canFlowAnywhere(c, lw, mat, m)) { markDirtyR(c, DIRTY_R_FLOW); }
-    }
+    // `w` is still this cell's word here: doReactions returns true whenever it
+    // writes SELF (every other write it makes is a face neighbour), and the
+    // staining block above returns if absorption wrote self (it stamps it).
+    //
+    // NO canFlowAnywhere AFTER A FAILED stepLiquid (DIRTY_R_FLOW, retired
+    // 2026-09-23). It used to be asked here as PLAN §1.1 defect 4's "settled
+    // but not stable" mark, and it could never answer true: stepLiquid writes
+    // nothing on any path that returns false, every read both functions make
+    // is at reach 1 (which no other thread writes this pass), and the mirror
+    // tests the same stages against the same word, licence and submerged
+    // flag. Measured-by-proof dead, so deleted. A cell whose exit a neighbour
+    // took this tick is woken by that neighbour's write, which fans out.
+    stepLiquid(c, idx, w, mat, m, rnd);
     return;
   }
 

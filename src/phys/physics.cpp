@@ -88,7 +88,17 @@ constexpr JPH::ObjectLayer AVATAR = 3;
 // applies no impulses at all. All three keep working here, because a query
 // filter is what they go through and this layer is in DynamicLayerFilter.
 constexpr JPH::ObjectLayer PROP = 4;
-constexpr JPH::ObjectLayer NUM = 5;
+// A THROWN BODY STILL LEAVING THE THROWER. AVATAR is not enough for this: it
+// keeps a released piece off the player PROXY, but AVATAR collides with AVATAR,
+// so a flask launched from the hand slammed into the thrower's own head and arm
+// on its first step — a velocity jump the vessel break pass reads as a blow,
+// and the flask burst in your face. This layer touches only terrain and
+// ordinary bodies (STATIC, MOVING); TickPendingReleases moves it to MOVING the
+// moment it is clear of every player, after which it hits anyone, the thrower
+// included. Reported by the contact listener like MOVING — it is a real
+// projectile, and its impacts are what break it.
+constexpr JPH::ObjectLayer THROWN = 5;
+constexpr JPH::ObjectLayer NUM = 6;
 }  // namespace Layers
 
 namespace BP {
@@ -133,6 +143,11 @@ class ObjPairFilter final : public JPH::ObjectLayerPairFilter {
     // MobSystem::FindParry, and letting the solver see them as well would put
     // a second, disagreeing answer underneath the one combat actually reads.
     if (a == Layers::PROP || b == Layers::PROP) return false;
+    // A body on its way out of a thrower meets only the world (see THROWN).
+    if (a == Layers::THROWN || b == Layers::THROWN) {
+      const JPH::ObjectLayer o = a == Layers::THROWN ? b : a;
+      return o == Layers::STATIC || o == Layers::MOVING;
+    }
     // The avatar's own limbs never touch the player proxy they live inside.
     if ((a == Layers::PLAYER && b == Layers::AVATAR) ||
         (a == Layers::AVATAR && b == Layers::PLAYER))
@@ -154,7 +169,7 @@ class DynamicLayerFilter final : public JPH::ObjectLayerFilter {
  public:
   bool ShouldCollide(JPH::ObjectLayer layer) const override {
     return layer == Layers::MOVING || layer == Layers::AVATAR ||
-           layer == Layers::PROP;
+           layer == Layers::PROP || layer == Layers::THROWN;
   }
 };
 
@@ -2174,7 +2189,7 @@ bool Physics::WorldBounds(uint64_t handle, float outMin[3],
   return true;
 }
 
-void Physics::ReleaseToWorldWhenClear(uint64_t handle) {
+void Physics::ReleaseToWorldWhenClear(uint64_t handle, bool thrown) {
   if (!system_ || handle == 0) return;
   JPH::BodyInterface& bi = system_->GetBodyInterface();
   const JPH::BodyID id = ToBodyID(handle);
@@ -2189,7 +2204,7 @@ void Physics::ReleaseToWorldWhenClear(uint64_t handle) {
     bi.SetObjectLayer(id, Layers::MOVING);
     return;
   }
-  bi.SetObjectLayer(id, Layers::AVATAR);
+  bi.SetObjectLayer(id, thrown ? Layers::THROWN : Layers::AVATAR);
   for (uint64_t h : pendingRelease_)
     if (h == handle) return;
   if (pendingRelease_.size() >= kMaxPendingRelease) {

@@ -4,6 +4,7 @@
 #include <functional>
 #include <string>
 #include <unordered_map>
+#include <unordered_set>
 #include <vector>
 
 #include "math3d.h"
@@ -73,6 +74,7 @@ class ChunkStore {
     regions_.clear();
     tickTags_.clear();
     entityRegions_.clear();
+    absentRegions_.clear();
     chunkCount_ = 0;
     dir_.clear();
   }
@@ -81,6 +83,7 @@ class ChunkStore {
   void Unbind() {
     dir_.clear();
     entityRegions_.clear();
+    absentRegions_.clear();
   }
   bool Bound() const { return !dir_.empty(); }
   const std::string& Dir() const { return dir_; }
@@ -250,6 +253,14 @@ class ChunkStore {
   std::string dir_;
   uint32_t seed_ = 0;
   std::unordered_map<uint64_t, Region> regions_;  // packed region key
+  // Regions a Get found neither in RAM nor on disk, under the current
+  // binding. A MISS USED TO CREATE AN EMPTY RAM REGION (Touch) so that the
+  // `loaded` flag would stop the next Get re-opening the file — which grew
+  // regions_ by one per unexplored region, never spilled it (Get does not
+  // spill), and pushed real regions out of the LRU on the next Put. This set
+  // is the same "don't ask the disk twice" memory without the region. Any
+  // Put into the region (Touch) or any rebinding forgets the entry.
+  std::unordered_set<uint64_t> absentRegions_;
   // Value carries the COORDINATE as well as the tick, because the manifest
   // writer has to emit (wc, tick) and World::PackChunkKey has no inverse —
   // writing one here would be a second copy of that packing to keep in step

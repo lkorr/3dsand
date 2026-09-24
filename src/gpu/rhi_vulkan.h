@@ -1,28 +1,15 @@
-// rhi_vulkan.h — the Vulkan backend's foundations (port phase 3a).
+// rhi_vulkan.h — the Vulkan backend: device, memory, uploads, readbacks,
+// shaders, pipelines, swapchain.
 //
-// SCOPE, AND WHAT IS DELIBERATELY MISSING
-// ---------------------------------------
-// Phase 3a builds the things a Vulkan backend needs before it can record
-// anything: a device, memory, an upload path, a readback path, shader
-// compilation, and pipelines. It executes NO sim work. The only commands this
-// file ever submits are the zero-init fills and (from --vk-info) an empty
-// command buffer, because the value of foundations is only provable by running
-// them once.
-//
-// Phase 3b adds command recording and the barriers generated from
-// src/sim/pass_table.def. Phase 3c wires the whole tick chain and the
-// `--backend vulkan` flag. Until then Dawn is the only live backend and this
-// type is reachable only from `--vk-info`.
-//
-// WHY THIS IS NOT YET AN rhi::Device IMPLEMENTATION
-// -------------------------------------------------
-// src/gpu/rhi.h is a seam with ONE backend behind it today (rhi_dawn.cpp). A
-// second implementation of the same handle types cannot coexist in one binary
-// without either a virtual dispatch layer or a compile-time switch, and phase 2a
-// deliberately chose neither while Dawn is the hash oracle. So phase 3a exposes
-// its own concrete `vk::Backend` type and phase 3b decides how it plugs in, with
-// the pass table (which is backend-neutral) as the join. Naming the classes here
-// after the seam's concepts keeps that a mechanical step.
+// WHERE THIS SITS
+// ---------------
+// `vk::Backend` is the concrete device object. The engine never sees it: the
+// rhi.h seam's one implementation (rhi_vk.cpp, the Vkr* impl subclasses) wraps
+// it, command recording with generated barriers lives in vk_record.{h,cpp}, and
+// the only direct users outside src/gpu are the sanctioned escape hatches in
+// rhi_vk.h (the overlay's ImGui backend, --shader-stats). Dawn, which this file
+// was written alongside during the port, was removed 2026-08-22; the port's
+// history is docs/PLAN_vulkan_port.md.
 //
 // FIVE SEMANTICS THE SEAM PROMISES, AND WHERE EACH IS HONORED HERE
 // (phase 2a recorded them; they are the reason this file is shaped as it is)
@@ -45,6 +32,7 @@
 
 #pragma once
 
+#include <atomic>
 #include <condition_variable>
 #include <cstdint>
 #include <memory>
@@ -69,8 +57,9 @@ namespace vk {
 // The capability record. This is not diagnostics: phase 7's sparse-residency
 // payoff (a 4 GiB virtual voxels buffer backed only where non-air lives, ~83%
 // of the 512 MiB dense allocation saved) is GATED on two of these bits, and the
-// window-size question is gated on maxStorageBufferRange. --vk-info prints the
-// whole struct so the decision rests on measurements from the actual device.
+// window-size question is gated on maxStorageBufferRange. (The `--vk-info`
+// mode that printed this struct was retired 2026-09-24 with nothing reading
+// it; the fields are still queried from the live device at Init.)
 struct Caps {
   std::string deviceName;
   uint32_t apiVersion = 0;
@@ -204,7 +193,19 @@ struct Buffer {
   // but "prefer cached" is a PREFERENCE — a device that only has an uncoherent
   // cached type would silently read stale bytes without this.
   bool needsInvalidate = false;
+  // Upload-queue bookkeeping, both private to Backend::QueueWrite/FlushUploads.
+  // `flushTouch` is the flush epoch that last recorded a write to this buffer
+  // (FlushUploads' intra-flush WAW test, O(1) instead of a scan of every
+  // destination seen so far). `zeroFillSuperseded` is set when a queued write
+  // covers the WHOLE buffer after CreateBuffer queued its zero fill, which then
+  // has nothing left to zero and is skipped.
+  uint64_t flushTouch = 0;
+  bool zeroFillSuperseded = false;
   std::string label;
+  // The Vulkan usage flags it was created with; read by the recorder to name
+  // a copy source that lacks TRANSFER_SRC (the validation message only
+  // gives a handle).
+  VkBufferUsageFlags usage = 0;
 };
 
 // --------------------------------------------------------------- image ----
@@ -265,8 +266,14 @@ class Backend {
             bool wantSwapchain = false);
   void Shutdown();
   // Persist the driver pipeline cache to disk now (see the definition for why
-  // Shutdown is the wrong only-place). Safe to call any time after Init.
+  // Shutdown is the wrong only-place). Safe to call any time after Init, and
+  // cheap to call when nothing changed: it writes ONLY if some pipeline create
+  // since the last save missed the cache (VkPipelineCreationFeedback), so a
+  // warm launch never rewrites the file.
   void SavePipelineCache();
+  // True when a pipeline create since the last successful save missed the
+  // application cache, i.e. the next SavePipelineCache will write.
+  bool PipelineCacheDirty() const { return pipelineCacheDirty_.load(); }
 
   const Caps& GetCaps() const { return caps_; }
 
@@ -322,25 +329,25 @@ class Backend {
   rhi::TextureFormat SwapchainFormat() const;
   uint32_t SwapchainImageCount() const { return (uint32_t)swapImages_.size(); }
   // SubmitEnded, plus the swapchain semaphores: waits the pending acquire
-  // semaphore at COLOR_ATTACHMENT_OUTPUT and signals the acquired image's
-  // render-done semaphore (which PresentAcquired waits on). Used by the seam
-  // for any command buffer whose render pass targeted a swapchain image.
+  // semaphore at kSwapchainAcquireWaitStages (colour-attachment output AND
+  // transfer — the render-scale path reaches the image by a blit) and signals
+  // the acquired image's render-done semaphore (which PresentAcquired waits
+  // on). Used by the seam for any command buffer whose render pass or blit
+  // targeted a swapchain image.
   VkFence SubmitEndedPresenting(VkCommandBuffer cmd, std::string& err);
 
   // ---- buffers (barrier_graph §4.8) ----
   //
-  // THE ONLY buffer constructor. It unconditionally adds TRANSFER_DST and
-  // registers the buffer for ZeroInitAll(). WebGPU guarantees zero-initialized
-  // buffers and Vulkan guarantees nothing, so this is a mechanism rather than a
-  // list — the barrier doc's own draft tried to enumerate "buffers that need
-  // zeroing", missed two of them including the worst case, and that is exactly
-  // the shape this replaces. Do not add a "skip zero-init" parameter.
+  // THE ONLY buffer constructor. It unconditionally adds TRANSFER_DST, registers
+  // the buffer, and QUEUES a whole-buffer zero fill (§4.8). WebGPU guarantees
+  // zero-initialized buffers and Vulkan guarantees nothing, so this is a
+  // mechanism rather than a list — the barrier doc's own draft tried to
+  // enumerate "buffers that need zeroing", missed two of them including the
+  // worst case, and that is exactly the shape this replaces. Do not add a
+  // "skip zero-init" parameter. (The fill is skipped automatically when a
+  // queued write covers the whole buffer before it drains — see QueueWrite —
+  // which is an optimisation of the same guarantee, not an opt-out.)
   Buffer* CreateBuffer(uint64_t size, rhi::BufferUsage usage, const char* label);
-
-  // vkCmdFillBuffer(0) over every registered buffer, in one command buffer,
-  // submitted and waited. Called once after all buffers exist (--vk-info's
-  // explicit path; the seam relies on the queued per-buffer fill below).
-  bool ZeroInitAll(std::string& err);
 
   // Free a buffer created by CreateBuffer, DEFERRED until every submit that was
   // in flight at the call has retired (phase 4a). The seam's rhi::Buffer
@@ -389,7 +396,10 @@ class Backend {
   // than heuristic — the destructor knows the buffer is dead, where a "was the
   // previous one submitted yet?" test at the next BeginCommands could not tell
   // a dead encoder from a live second one.
-  void AbandonCommands(VkCommandBuffer cmd);
+  // `ended`: the caller already vkEndCommandBuffer'd it (a Finish()ed seam
+  // CommandBuffer that was never submitted), so it must not be ended again.
+  // The buffer goes back to the reuse list either way.
+  void AbandonCommands(VkCommandBuffer cmd, bool ended = false);
   uint64_t FlushesRecovered() const { return flushesRecovered_; }
 
   // ---- submit (barrier_graph §4.2) ----
@@ -481,23 +491,45 @@ class Backend {
 
   // ---- shaders ----
   //
-  // Compiles WGSL to SPIR-V through Tint and creates a VkShaderModule. Cached
-  // by (label, source hash) so the 12 shader files that produce 20+ pipelines
-  // compile once each rather than once per entry point.
+  // Compiles WGSL to SPIR-V through Tint (and the optional SPIRV-Tools pass,
+  // vk_spirv.h) and creates a VkShaderModule. Tint emits one entry point per
+  // module, so the cache key is (label, entry point, source hash); the on-disk
+  // shader_cache/ is keyed the same way and skips Tint on a later launch.
   //
   // THREAD-SAFE AND CONCURRENT (Simulation::BuildPipelines fans the creates
   // out over a pool). `shaderMutex_` covers the cache lookup and the publish,
-  // NOT the compile: Tint and — once package B lands — the SPIR-V optimizer
-  // run outside it, which is where the parallel win is. Two threads asking for
-  // the same key compile it once; the second waits on `shaderCv_`.
+  // NOT the compile: Tint and the SPIR-V optimizer run outside it, which is
+  // where the parallel win is. Two threads asking for the same key compile it
+  // once; the second waits on `shaderCv_`.
+  //
+  // REFCOUNTED. Every successful call takes one reference on the cached module
+  // and reports its cache key through `cacheKey`; the caller hands the key back
+  // to ReleaseShaderModule exactly once when it no longer needs the module
+  // (the seam's VkrShaderModule does it from its destructor). The last release
+  // destroys the VkShaderModule immediately — legal even while pipelines built
+  // from it are in flight (a module is only read during pipeline creation), and
+  // what stops an F5 reload, whose re-baked tuning prelude re-keys every
+  // shader, from leaking every module it ever compiled.
   VkShaderModule GetShaderModule(const std::string& wgsl, const std::string& label,
                                  const std::string& entryPoint, uint32_t bodyLineOffset,
-                                 std::string& diagnostics);
+                                 std::string& diagnostics, std::string* cacheKey);
+  void ReleaseShaderModule(const std::string& cacheKey);
 
   // ---- descriptors and pipelines ----
   VkDescriptorSetLayout CreateSetLayout(const rhi::BindGroupLayoutEntry* entries,
                                         size_t count);
   VkPipelineLayout CreatePipelineLayout(const VkDescriptorSetLayout* sets, size_t count);
+  // Release a pipeline / pipeline layout / set layout created above, DEFERRED
+  // behind the same submit-serial graveyard buffers use: the handle is
+  // destroyed once every submit that was in flight at the call has retired.
+  // Called by the seam's handle destructors (rhi_vk.cpp), which is what makes an
+  // F5 reload release the set it replaced instead of accumulating them until
+  // Shutdown. THREAD-SAFE: a build-pool job that assigns over a member handle
+  // runs the old handle's destructor on the pool thread. A handle this backend
+  // does not own (already released, or released after Shutdown) is ignored.
+  void DestroyPipelineDeferred(VkPipeline p);
+  void DestroyPipelineLayoutDeferred(VkPipelineLayout l);
+  void DestroySetLayoutDeferred(VkDescriptorSetLayout l);
   // THREAD-SAFE. vkCreateComputePipelines is internally synchronized with
   // respect to the VkPipelineCache handed to it (Vulkan 1.3 §10.6: pipeline
   // cache objects are the one exception to the "externally synchronized"
@@ -535,9 +567,12 @@ class Backend {
     Buffer* dst = nullptr;
     uint64_t dstOffset = 0;
     uint64_t size = 0;
-    // Class A: the payload, captured now and copied into the command buffer at
-    // record time by vkCmdUpdateBuffer.
-    std::vector<uint8_t> inlineData;
+    // Class A: the payload, captured now into the upload ARENA (inlineArena_,
+    // or heldArena_ once flushed) at this byte offset, and copied into the
+    // command buffer at record time by vkCmdUpdateBuffer. An offset rather than
+    // a per-write std::vector: a tick queues dozens of these, each of which was
+    // a heap allocation, and the arena is a bump pointer reset per flush.
+    uint64_t inlineOffset = 0;
     // Class B: offset into the staging ring.
     uint64_t stagingOffset = 0;
     bool classA = true;
@@ -580,6 +615,18 @@ class Backend {
     VkImageView view = VK_NULL_HANDLE;
     uint64_t serial = 0;
   };
+  // ...and for the pipeline-side objects the seam's handle destructors release
+  // (DestroyPipelineDeferred and friends). One struct, three kinds, because
+  // they share the discipline and differ only in the vkDestroy* call.
+  struct DoomedHandle {
+    enum Kind : uint8_t { Pipeline, PipelineLayout, SetLayout } kind = Pipeline;
+    uint64_t handle = 0;  // the VkPipeline / VkPipelineLayout / VkDescriptorSetLayout
+    uint64_t serial = 0;
+  };
+  void DestroyDoomedHandle(const DoomedHandle& d);
+  // Pipeline-cache bookkeeping shared by both create paths: marks the cache
+  // dirty when the driver says the create MISSED it (or could not say).
+  void NoteCreationFeedback(const VkPipelineCreationFeedback& fb);
 
   bool PickPhysicalDevice(bool lowPower, std::string& err);
   void QueryCaps();
@@ -654,6 +701,17 @@ class Backend {
 
   // Pending uploads, in ISSUE ORDER. Never sorted, never coalesced.
   std::vector<Pending> pending_;
+  // Class A payload arenas (Pending::inlineOffset). `inlineArena_` backs
+  // pending_; FlushUploads hands it to `heldArena_` together with the pending
+  // list (heldFlush_), because an abandoned command buffer re-queues those
+  // writes and their bytes must still exist. Swapped rather than reallocated,
+  // so steady state allocates nothing.
+  std::vector<uint8_t> inlineArena_;
+  std::vector<uint8_t> heldArena_;
+  // FlushUploads' intra-flush WAW epoch (Buffer::flushTouch). Bumped every
+  // time the flush emits its WAW barrier or starts, so "touched in this
+  // barrier span" is one compare.
+  uint64_t flushEpoch_ = 0;
   Buffer* stagingRing_ = nullptr;
   // ABSOLUTE byte counters into a conceptually infinite ring; the physical
   // offset is `% stagingRing_->size`. Absolute rather than wrapped because
@@ -683,8 +741,18 @@ class Backend {
   uint64_t stagingFallbacks_ = 0;
 
   std::vector<InFlight> inFlight_;
-  uint64_t submitSerial_ = 0;
+  // Atomic because DestroyPipelineDeferred reads it from build-pool threads
+  // (see there); every WRITE is still on the submitting thread.
+  std::atomic<uint64_t> submitSerial_{0};
   std::vector<Doomed> graveyard_;
+  // Pipeline-side graveyard, under its own lock for the threading reason
+  // above. Drained by PollFences, remnants destroyed by Shutdown.
+  std::vector<DoomedHandle> handleGraveyard_;
+  std::mutex handleGraveMutex_;
+  // Retired command buffers, reset and reused by BeginCommands instead of a
+  // vkFreeCommandBuffers + vkAllocateCommandBuffers pair per submit (the pool
+  // has RESET_COMMAND_BUFFER, so vkBeginCommandBuffer resets implicitly).
+  std::vector<VkCommandBuffer> freeCmds_;
   std::vector<VkFence> freeFences_;
   // Borrow counts for fences pinned by RetainFence. A fence with a non-zero
   // count is never returned to freeFences_, so a borrower's handle stays valid
@@ -695,7 +763,13 @@ class Backend {
   // waiting for the last ReleaseFence to hand them back to the pool.
   std::vector<VkFence> retiredRetained_;
 
-  std::unordered_map<std::string, VkShaderModule> moduleCache_;
+  // A compiled module and the number of seam handles holding it (see
+  // GetShaderModule / ReleaseShaderModule).
+  struct CachedModule {
+    VkShaderModule module = VK_NULL_HANDLE;
+    uint32_t refs = 0;
+  };
+  std::unordered_map<std::string, CachedModule> moduleCache_;
   // Keys some thread is compiling RIGHT NOW. A second asker for the same key
   // waits on shaderCv_ instead of compiling it a second time; see
   // GetShaderModule for why the compile itself is NOT under the lock.
@@ -704,6 +778,10 @@ class Backend {
   std::condition_variable shaderCv_;     // a key left moduleInFlight_
   VkPipelineCache pipelineCache_ = VK_NULL_HANDLE;
   std::string pipelineCachePath_;
+  // Set by a create that missed the application pipeline cache; cleared by a
+  // successful SavePipelineCache. The whole of "don't rewrite a 400 MB file on
+  // every launch": a warm launch never sets it.
+  std::atomic<bool> pipelineCacheDirty_{false};
   std::vector<VkDescriptorSetLayout> setLayouts_;
   std::vector<VkPipelineLayout> pipeLayouts_;
   // Pipelines keep their ENGINE LABEL. They used to be bare handles — both
@@ -767,5 +845,47 @@ inline constexpr uint64_t kClassAMaxBytes = 4096;
 static_assert(kClassAMaxBytes <= kVkUpdateBufferLimit,
               "the Class A policy threshold cannot exceed vkCmdUpdateBuffer's "
               "own limit");
+
+// THE SWAPCHAIN ACQUIRE DEPENDENCY, in both flag vocabularies, defined once so
+// the two halves cannot drift.
+//
+// A swapchain image reaches this engine's command buffers two ways: as a
+// colour attachment (the frame's render pass, the overlay) and as a BLIT
+// destination (the render.renderScale upscale). The acquire semaphore's wait
+// must cover the stage of whichever comes first, and the image's first layout
+// transition in the recording must name the same stages as its SOURCE scope,
+// or the transition is not chained to the semaphore at all and may run while
+// the presentation engine still reads the image. Until 2026-09-24 the wait was
+// COLOR_ATTACHMENT_OUTPUT only and the transition's source was NONE — correct
+// for neither path.
+//
+// Not ALL_COMMANDS: the presenting submit also carries the tick's compute
+// work, and a wider wait would hold that behind the vsync-paced acquire.
+inline constexpr VkPipelineStageFlags kSwapchainAcquireWaitStages =
+    VK_PIPELINE_STAGE_COLOR_ATTACHMENT_OUTPUT_BIT | VK_PIPELINE_STAGE_TRANSFER_BIT;
+inline constexpr VkPipelineStageFlags2 kSwapchainAcquireStages2 =
+    VK_PIPELINE_STAGE_2_COLOR_ATTACHMENT_OUTPUT_BIT | VK_PIPELINE_STAGE_2_ALL_TRANSFER_BIT;
+
+// The on-disk pipeline cache's size cap. The NVIDIA blob only ever grows (every
+// shader edit adds entries, nothing evicts), and it was measured at 394 MB,
+// rewritten in full three to five times per launch. Past this size the load
+// DISCARDS the file and starts fresh: the next launch pays one cold compile of
+// whatever it actually uses, and the file shrinks back to the live set.
+inline constexpr uint64_t kPipelineCacheMaxBytes = 512ull << 20;
+
+// shader_cache/ (the SPIR-V disk cache) is content-keyed, so every shader edit
+// leaves the previous entry behind forever — measured 2.5 GB / 35,405 files.
+// Each hit touches its file's mtime; a background sweep at the first shader
+// load deletes entries untouched for this long.
+inline constexpr int kShaderCacheMaxAgeDays = 14;
+
+// The descriptor pool's budget (see its creation in rhi_vulkan.cpp for why it
+// is a budget and aborts rather than failing soft). Named so a resize is one
+// edit with the reasoning next to it.
+inline constexpr uint32_t kDescPoolStorageBuffers = 4096;
+inline constexpr uint32_t kDescPoolUniformBuffers = 512;
+inline constexpr uint32_t kDescPoolUniformDynamic = 256;
+inline constexpr uint32_t kDescPoolStorageDynamic = 256;
+inline constexpr uint32_t kDescPoolMaxSets = 512;
 
 }  // namespace vk

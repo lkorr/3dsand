@@ -1144,9 +1144,12 @@ void Stream::FillSlots(const std::vector<uint32_t>& slots, bool deferWake) {
       pendingShifts_.push_back(std::move(ps));
       // BACKSTOP, not a throughput knob (IssueDemoteCopies' shape). Entries
       // retire on a TICK deadline, so a caller that drives Update without
-      // advancing `tick` would queue them forever. Three is the steady-state
-      // ceiling (one per tick, retired at T+kWakeLatency); eight is slack.
-      while (pendingShifts_.size() > 8) {
+      // advancing `tick` would queue them forever. The steady state is at
+      // most one entry per tick for the kWakeLatency ticks each one lives;
+      // twice that is slack. It is a kWakeLatency quantity, not a readback-
+      // ring one: entries retire on the WAKE deadline, not on a fence.
+      constexpr size_t kMaxPendingShifts = 2 * (size_t)kWakeLatency;
+      while (pendingShifts_.size() > kMaxPendingShifts) {
         PendingShift& front = pendingShifts_.front();
         front.map.Wait();
         CompleteShift(front, lastTick_);
@@ -1182,7 +1185,7 @@ void Stream::FillSlots(const std::vector<uint32_t>& slots, bool deferWake) {
           std::fill(occ.begin(), occ.end(), 0u);  // failed: fall back to all
         omap.Unmap();
         // No `act`: the kernel already wrote dirtyIn/dirtyOut itself.
-        ApplyGenVerdict(genSlots, {}, occ, occValid, {}, lastTick_);
+        ApplyGenVerdict(genSlots, {}, occ, occValid, {}, lastTick_, lastTick_);
       }
       timing_.demoteMs += PtNowMs() - dT0;
     }
@@ -1271,7 +1274,7 @@ void Stream::CompleteShift(PendingShift& ps, uint32_t tick) {
     std::fill(act.begin(), act.end(), 1u);
   }
   ps.map.Unmap();
-  ApplyGenVerdict(ps.genSlots, ps.stale, occ, occValid, act, tick);
+  ApplyGenVerdict(ps.genSlots, ps.stale, occ, occValid, act, ps.tick, tick);
   timing_.demoteMs += PtNowMs() - dT0;
   if (PtDbg())
     std::printf("[pt-time] shift wake T+%u: gen=%zu %.2f ms\n",
@@ -1281,7 +1284,8 @@ void Stream::CompleteShift(PendingShift& ps, uint32_t tick) {
 void Stream::ApplyGenVerdict(const std::vector<uint32_t>& genSlots,
                              const std::vector<uint8_t>& stale,
                              const std::vector<uint32_t>& occ, bool occValid,
-                             const std::vector<uint32_t>& act, uint32_t tick) {
+                             const std::vector<uint32_t>& act,
+                             uint32_t genTick, uint32_t tick) {
   const bool paged = world_->residency == World::Residency::Paged;
   const bool enactWake = !act.empty();
   const WorldSnapshot& snap = world_->Snap();
@@ -1323,7 +1327,10 @@ void Stream::ApplyGenVerdict(const std::vector<uint32_t>& genSlots,
   for (size_t i = 0; i < genSlots.size(); i++) {
     if (isStale(i)) continue;
     const uint32_t gs = genSlots[i];
-    const bool canAct = enactWake && act[i] != 0u;
+    // Bit 0 of the verdict word; the rest is the page-table class, used by
+    // the demote pass below. A failed map fills the words with 1 (act, no
+    // published class), which is "wake everything, demote nothing new".
+    const bool canAct = enactWake && (act[i] & kGenVerdictAct) != 0u;
     if (canAct) wake.push_back(gs);
     if (!paged) continue;
     bool w = true;
@@ -1367,7 +1374,7 @@ void Stream::ApplyGenVerdict(const std::vector<uint32_t>& genSlots,
     // content.
     std::vector<uint32_t> cands;
     cands.reserve(genSlots.size());
-    uint32_t skyDemoted = 0, skyHeld = 0;
+    uint32_t skyDemoted = 0, skyHeld = 0, fullDemoted = 0;
     for (size_t i = 0; i < genSlots.size(); i++) {
       if (isStale(i)) continue;
       const uint32_t gs = genSlots[i];
@@ -1399,13 +1406,38 @@ void Stream::ApplyGenVerdict(const std::vector<uint32_t>& genSlots,
         continue;
       }
       // A partially-full chunk cannot demote: no sentinel form describes a mix
-      // of air and matter. The FULL case still needs the words — a sentinel
-      // must reproduce the resident content bit-exactly, which is Classify's
-      // exact-word rule and not something a count can decide.
+      // of air and matter. The FULL case needs Classify's exact-word rule —
+      // a sentinel must reproduce the resident content bit-exactly, which a
+      // count cannot decide — and gets it from the kernel's verdict below
+      // when the chunk is provably untouched, or from a word copy otherwise.
       if (nonAir != 0u && nonAir != kChunkVol) continue;
+      // ---- THE KERNEL'S VERDICT FOR A FULL CHUNK -----------------------
+      //
+      // genChunk already ran Classify's three tests over the words it wrote
+      // (worldgen.wgsl, world.h kGenVerdict*), so a FULL chunk nothing has
+      // touched since generation needs no word copy: its words now ARE the
+      // words the verdict describes. "Nothing has touched it" is the sky
+      // share's guard above, plus the write-reach clock — every writer marks
+      // reachTick_ (Materialize for the CA and op rings,
+      // EnsurePageForOverwrite for the CPU seam), so ReachTick < genTick
+      // proves no write since the plane was generated. A chunk that fails
+      // any of them takes the word copy exactly as before; so does one whose
+      // verdict was not published (a failed map fills act with 1s).
+      const uint32_t v = i < act.size() ? act[i] : 0u;
+      if ((v & kGenVerdictValid) != 0u &&
+          !world_->pages->CpuDirty().Has(gs) &&
+          !(snap.valid && snap.dirtyFlags[gs]) &&
+          world_->pages->ReachTick(gs) < genTick) {
+        const uint32_t e = world_->pages->ClassifyGenVerdict(v, seed_);
+        if (e != PageTable::kNeedsPage) {
+          world_->pages->SetSentinel(gs, e);
+          fullDemoted++;
+        }
+        continue;
+      }
       cands.push_back(gs);
     }
-    if (skyDemoted) world_->pages->FlushTableWrites(ctx_->queue);
+    if (skyDemoted || fullDemoted) world_->pages->FlushTableWrites(ctx_->queue);
 
     // ISSUE the copies now, CLASSIFY on a later frame's harvest. Under R1
     // these are encoded kWakeLatency ticks AFTER genChunk rather than
@@ -1418,8 +1450,10 @@ void Stream::ApplyGenVerdict(const std::vector<uint32_t>& genSlots,
       keys.push_back(World::PackChunkKey(world_->SlotToWorldChunk(gs)));
     IssueDemoteCopies(cands, keys, tick);
     if (PtDbg())
-      std::printf("[pt-time] shift demote: gen=%zu cands=%zu sky=%u held=%u\n",
-                  genSlots.size(), cands.size(), skyDemoted, skyHeld);
+      std::printf("[pt-time] shift demote: gen=%zu cands=%zu sky=%u held=%u "
+                  "full-by-verdict=%u\n",
+                  genSlots.size(), cands.size(), skyDemoted, skyHeld,
+                  fullDemoted);
   }
 
   // ---- and only now, THE WAKE ------------------------------------------
@@ -1470,13 +1504,16 @@ void Stream::DiscardDemotes() {
 
 void Stream::IssueDemoteCopies(const std::vector<uint32_t>& slots,
                                const std::vector<uint64_t>& keys,
-                               uint32_t tick) {
+                               uint32_t tick, uint32_t generation) {
   // Backstop, not a throughput knob: 32 in-flight batches is 128 MiB of
   // staging and far beyond the ~4-8 a saturated flight keeps queued. Hitting
   // it means the GPU is pathologically behind; forcing the oldest batch
   // through (Wait + harvest) is the bounded-memory answer, and the harvest's
-  // own retry logic keeps correctness.
-  constexpr size_t kMaxPendingDemotes = 32;
+  // own retry logic keeps correctness. TWICE the readback ring's depth: a
+  // batch is outstanding for as long as the ticks in flight ahead of it
+  // (World::kReadbackSlots is exactly that count), so a backlog past two
+  // ring-depths is the GPU being behind, not the pipeline being deep.
+  constexpr size_t kMaxPendingDemotes = 2 * (size_t)World::kReadbackSlots;
   while (demotes_.size() >= kMaxPendingDemotes) {
     demotes_.front().map.Wait();
     HarvestDemotes(tick);
@@ -1486,6 +1523,7 @@ void Stream::IssueDemoteCopies(const std::vector<uint32_t>& slots,
     PendingDemote d;
     d.staging = AcquireStaging();
     d.copyTick = tick;
+    d.generation = generation;
     d.slots.reserve(n);
     d.keys.reserve(n);
     d.copied.reserve(n);
@@ -1532,9 +1570,34 @@ void Stream::HarvestDemotes(uint32_t tick) {
   // more 4 MiB GPU copy and converges as soon as the GPU keeps up. Dropping
   // them instead would leak resident pages until the slot scrolls out, which
   // is bounded but is also how the pre-JITTER pool exhausted.
+  //
+  // ---- AND WHY AGE ALONE RETRIED FOREVER --------------------------------
+  //
+  // A batch is only harvested once its map is Ready, i.e. once the GPU has
+  // executed it, and the pipeline lets the GPU run up to kSnapshotLatency /
+  // kPagedSnapshotMaxGap ticks behind the CPU. A copy issued at Update(T) is
+  // therefore only GUARANTEED ready around T + 5 — past the 3-tick bound. On a
+  // GPU-bound stretch (several ticks per frame, the GPU at the lag ceiling)
+  // every batch came back "stale", was re-copied at the current tick, came
+  // back stale again, and nothing ever classified: 4 MiB of copies per batch
+  // per tick, no demotions.
+  //
+  // So age is no longer the only way in. THE WRITE-REACH CLOCK
+  // (PageTable::ReachTick) answers the question the age bound approximates:
+  // every writer that could reach a slot stamps it — Materialize for the CA,
+  // op, particle and fluid rings, EnsurePageForOverwrite for the CPU seam —
+  // so `ReachTick(s) < copyTick` PROVES nothing has written the slot since
+  // the copy was issued (the copy is submitted before tick copyTick's work,
+  // and a write at copyTick stamps copyTick itself). Such a slot's bytes are
+  // current however late they are harvested. The age bound stays as the
+  // other door, and a slot that passes neither is re-copied at most
+  // kDemoteMaxRetries times — after that it keeps its page (bounded: the
+  // slot scrolls out eventually, and an all-air one is freed by the
+  // hysteresis in ConsumeOccupancy) rather than paying a copy per tick.
   constexpr uint32_t kDemoteFreshTicks = 3;
+  constexpr uint32_t kDemoteMaxRetries = 4;
   const bool dbg = PtDbg();
-  uint32_t demoted = 0, retried = 0, harvested = 0;
+  uint32_t demoted = 0, retried = 0, harvested = 0, dropped = 0;
   double cpyMs = 0.0, clsMs = 0.0;
   while (!demotes_.empty() && demotes_.front().map.Ready()) {
     PendingDemote d = std::move(demotes_.front());
@@ -1565,9 +1628,14 @@ void Stream::HarvestDemotes(uint32_t tick) {
         if (World::PackChunkKey(world_->SlotToWorldChunk(s)) != d.keys[i])
           continue;
         if (world_->PageOffsetOfSlot(s) == World::kNoPage) continue;  // demoted already
-        if (!fresh) {
-          retry.push_back(s);
-          retryKeys.push_back(d.keys[i]);
+        const bool untouched = world_->pages->ReachTick(s) < d.copyTick;
+        if (!fresh && !untouched) {
+          if (d.generation < kDemoteMaxRetries) {
+            retry.push_back(s);
+            retryKeys.push_back(d.keys[i]);
+          } else {
+            dropped++;
+          }
           continue;
         }
         if (world_->pages->CpuDirty().Has(s)) continue;  // written since the copy
@@ -1581,7 +1649,7 @@ void Stream::HarvestDemotes(uint32_t tick) {
       }
       if (!retry.empty()) {
         retried += (uint32_t)retry.size();
-        IssueDemoteCopies(retry, retryKeys, tick);
+        IssueDemoteCopies(retry, retryKeys, tick, d.generation + 1);
       }
     } else {
       d.map.Unmap();
@@ -1589,10 +1657,11 @@ void Stream::HarvestDemotes(uint32_t tick) {
     stagingPool_.push_back(d.staging);
   }
   if (demoted) world_->pages->FlushTableWrites(ctx_->queue);
-  if (dbg && (harvested || retried))
+  if (dbg && (harvested || retried || dropped))
     std::printf("[pt-time] demote harvest: batches=%u demoted=%u retried=%u "
-                "queued=%zu (memcpy %.2f ms, classify %.2f ms)\n",
-                harvested, demoted, retried, demotes_.size(), cpyMs, clsMs);
+                "dropped=%u queued=%zu (memcpy %.2f ms, classify %.2f ms)\n",
+                harvested, demoted, retried, dropped, demotes_.size(), cpyMs,
+                clsMs);
 }
 
 void Stream::FoldSnapshot() {

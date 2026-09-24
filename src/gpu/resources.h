@@ -12,7 +12,8 @@ rhi::Buffer CreateBuffer(const rhi::Device& device, uint64_t size,
 
 // ---- GPU buffer budget (diagnostics) ---------------------------------------
 // CreateBuffer above is the single choke point for every buffer the engine
-// owns, so it records one of these per allocation. This exists so that a
+// owns, so it records one of these per allocation — and the record lives only
+// as long as the buffer does (the tally is of LIVE buffers). This exists so that a
 // question like "what does kFarN=512 or a 1024^3 window actually cost?" is
 // answered by an allocation record instead of by re-deriving constants on
 // paper. Never read by the sim, never hashed.
@@ -21,7 +22,7 @@ struct GpuBufferRecord {
   uint64_t bytes;
 };
 uint64_t GpuBufferBytesTotal();
-const std::vector<GpuBufferRecord>& GpuBufferRecords();
+std::vector<GpuBufferRecord> GpuBufferRecords();
 // Prints every buffer >= 1 MiB largest-first, plus a rolled-up tail and total.
 void DumpGpuBufferBudget(const char* whenLabel);
 
@@ -29,13 +30,13 @@ void DumpGpuBufferBudget(const char* whenLabel);
 // C++ definitions in sim/world.h, so the two can never disagree. Prepended
 // ahead of common.wgsl by LoadShader below.
 //
-// Declared here (it used to be a bare definition in resources.cpp) because the
-// Vulkan backend's `--vk-info` compiles the same shaders through Tint and has
-// to assemble byte-for-byte the same source string. A compiler that succeeds on
-// a source the engine never feeds it has proven nothing — so the concatenation
-// has to be shared, not re-derived. NOTE that scripts/check_shaders.sh is a
-// THIRD reproduction of this same prelude, scraped from world.h in bash; adding
-// a constant means adding it there too.
+// Declared here (it used to be a bare definition in resources.cpp) so every
+// consumer assembles byte-for-byte the same source string the engine compiles
+// — a check that passes on a source the engine never feeds the compiler has
+// proven nothing. NOTE that scripts/check_shaders.sh is a SECOND reproduction
+// of this same prelude, scraped from world.h in bash; adding a constant means
+// adding it there too. Memoized on its load-time inputs (resources.cpp
+// PreludeInputsKey), so it is cheap to call per shader.
 std::string ShaderConstantPrelude();
 
 // Whether this device enabled fragmentStoresAndAtomics, which the shadow cache
@@ -46,9 +47,9 @@ std::string ShaderConstantPrelude();
 // A CAPABILITY, NOT A PREFERENCE, and the two are deliberately separate
 // constants: this one says the hardware can, `TUNE_SHADOW_CACHE` says we want
 // to. raymarch.wgsl ANDs them, so either can turn the cache off and only the
-// tuning one is hot-reloadable. Defaults true so --vk-info, check_shaders.sh
-// and any other consumer that assembles the prelude without a device still
-// compiles the shipping variant of the shader.
+// tuning one is hot-reloadable. Defaults true so check_shaders.sh and any
+// other consumer that assembles the prelude without a device still compiles
+// the shipping variant of the shader.
 void SetFragmentStoresAvailable(bool available);
 bool FragmentStoresAvailable();
 

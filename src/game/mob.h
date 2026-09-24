@@ -2066,6 +2066,11 @@ class Mob {
   void RegisterTerrainAnchor();
   void PlayClip(const std::string& name);
   void PlayClipIndex(int ci);
+  // Blend out every running instance of `name` (a looping hold, e.g. the
+  // throw wind-up, that only its owner knows when to end). No-op if absent.
+  void StopClip(const std::string& name);
+  // Summed weight x fade of the running instances of `name`; 0 when none.
+  float ClipWeight(const std::string& name) const;
 
   // ---- holding an item (THE ENTITY<->SLOT SYNC SEAM; see game/avatar.h) ----
   // Equipping BORROWS A RIG SLOT: the item's geometry fills a real MobLimb
@@ -2687,6 +2692,8 @@ class Mob {
   // DebrisSystem and after Die() does, so the slots that no longer draw are
   // precisely the stale holders worth naming. Audit path only.
   void AppendMicroHolders(std::vector<MicroHolder>& out) const;
+  // The same holders as bare model indices, for the audit's per-frame phase.
+  void AppendMicroModelIds(std::vector<uint32_t>& out) const;
   void AppendDebugBoxes(std::vector<DebugBox>& out, size_t limit,
                         uint32_t color) const;
   uint32_t LimbBodyCount() const;
@@ -2872,6 +2879,7 @@ class Mob {
   // engine. A cell the CPU mirror cannot answer for is NOT solid — unknown is
   // open, everywhere, always (ai_nav.h rule 1).
   bool CellSupportsWeight(World& world, IVec3 cell) const;
+  bool CellSupportsWeightIn(const CachedChunk* cc, IVec3 cell) const;
 
   // ---- footfall events (presentation only) --------------------------------
   // A foot touching down, produced by the gait's own plant moment rather than
@@ -4898,6 +4906,7 @@ class MobSystem {
                             uint32_t slotBase) const;
   // Every brick record every creature in this system holds, drawn or not.
   void AppendMicroHolders(std::vector<MicroHolder>& out) const;
+  void AppendMicroModelIds(std::vector<uint32_t>& out) const;
   // Collision-box debug overlay (world.h DebugBox, the dev panel's "collision
   // boxes" toggle). One oriented wireframe per LIVE limb body, read from the
   // body's actual Jolt collider via Physics::GetLocalBounds — not from the

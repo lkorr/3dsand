@@ -76,9 +76,10 @@ class SlotSet {
   size_t Size() const { return members_.size(); }
   bool Empty() const { return members_.empty(); }
 
-  // this <- this INTERSECT other. The only way an estimate is ever narrowed
-  // (§3.2 step 2) — never an assignment, because both operands are supersets
-  // of the true dirty set and only their intersection is guaranteed to be one.
+  // this <- this INTERSECT other. §3.2 step 2's narrowing: both operands are
+  // supersets of the true dirty set, so their intersection is one too. (The
+  // tightening itself now ASSIGNS the rolled-forward snapshot set, because it
+  // unions that set straight back in — see TightenFromSnapshot.)
   void IntersectWith(const SlotSet& other);
   void UnionWith(const SlotSet& other);
 
@@ -400,6 +401,19 @@ class PageTable {
   // toroidal window origin. `slot` must be the slot these words came from.
   static constexpr uint32_t kNeedsPage = 0u;  // never a valid sentinel
   uint32_t Classify(uint32_t slot, const uint32_t* words) const;
+  // Classify's answer for a freshly GENERATED chunk, decoded from the verdict
+  // word genChunk published into genAct (world.h kGenVerdict*) instead of
+  // from its 16 KiB of words. Identical to Classify on the words the kernel
+  // wrote — the kernel reduces the same three tests in the same order, and
+  // this applies Classify's two CPU-side refusals (JITTER disabled, a
+  // generating seed that is not seed_). `genSeed` is TickParams.seed of the
+  // generating dispatch. An unpublished verdict is kNeedsPage.
+  uint32_t ClassifyGenVerdict(uint32_t verdict, uint32_t genSeed) const;
+  // The write-reach clock for one slot: the last tick anything could have
+  // written it (see reachTick_). `ReachTick(s) < t` proves no write since t.
+  uint32_t ReachTick(uint32_t slot) const {
+    return slot < reachTick_.size() ? reachTick_[slot] : 0u;
+  }
 
   // Install a sentinel for a slot, freeing any page it held. Used by
   // worldgen's post-pass compaction and by streaming/LoadWorld classification.
@@ -451,8 +465,11 @@ class PageTable {
   // it, a demotion is decided entirely from data the CPU already holds. Pass an
   // empty vector to fall back to the blocking word probe — same decision, same
   // result, just capped and slow. Correctness does not depend on it; rate does.
+  // `occTick` is the tick the occupancy was captured at: a call that hands
+  // over the same snapshot again skips the streak walk (see the .cpp).
   void ConsumeOccupancy(const std::vector<uint32_t>& occupancy,
-                        const std::vector<uint8_t>& occStain, uint32_t tick);
+                        const std::vector<uint8_t>& occStain, uint32_t occTick,
+                        uint32_t tick);
 
   // How ConsumeOccupancy CONFIRMS a candidate is really empty before freeing
   // its page. `occTotal == 0` is not sufficient: occupancy counts NON-AIR
@@ -532,7 +549,9 @@ class PageTable {
   uint32_t allocsMat_ = 0, allocsOvr_ = 0, refills_ = 0;
   uint32_t PagesHighWater() const { return pagesHighWater_; }
   // ---- residency attribution (see PageCensus above) ------------------------
-  // `Census()` is the most recent tick's, recomputed inside ConsumeOccupancy's
+  // `Census()` is the most recent CENSUS tick's (every kCensusEveryTicks, every
+  // tick under SANDVOX_PT_DEBUG, and every new high water), recomputed at the
+  // end of ConsumeOccupancy, beside its
   // existing kNumSlots walk. `CensusAtHighWater()` is a copy latched on the
   // tick pagesInUse_ last set a new maximum — which is the tick a --frames run
   // actually wants to explain, and which is gone by the time it exits.
@@ -555,6 +574,15 @@ class PageTable {
   void ResetAllEmpty(const rhi::Queue& queue);
 
  private:
+  // The half of ResetAllEmpty / ResetIdentity they share: fault counter,
+  // pending uploads and fills, every mirror contributor, the retire queue, the
+  // streaks and the write-reach clock.
+  void ClearTransientState(const rhi::Queue& queue);
+  // TightenFromSnapshot's scratch, hoisted out of a per-tick allocation.
+  SlotSet tightenSnap_, tightenRolled_;
+  // The snapshot tick ConsumeOccupancy last walked (see its L2 note).
+  uint32_t consumedOccTick_ = 0;
+  bool consumedOccValid_ = false;
   uint32_t Alloc();                       // pops the LIFO free list; may abort
   void Free(uint32_t slot);
   void MarkTableDirty(uint32_t slot);

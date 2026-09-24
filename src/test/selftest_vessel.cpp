@@ -35,6 +35,7 @@
 #include "game/container.h"
 #include "game/equipment.h"
 #include "game/mob.h"
+#include "game/player.h"
 #include "game/persist.h"
 #include "game/worlditems.h"
 #include "game/spell.h"
@@ -1137,6 +1138,68 @@ Status GateVesselBreak(Ctx& c, std::string& detail) {
     else if (brokeC < 0) fail("C: a flask struck by a flying stone did not break");
   }
 
+  // ---- D: thrown out of a body ---------------------------------------------
+  // The player's throw (session.cpp): launched from the hand, i.e. inside the
+  // capsule proxy AND inside the thrower's own limbs, which are kinematic
+  // bodies on Layers::AVATAR. Released `thrown`, it must fly clear of both
+  // unbroken. The CONTROL arm is the old release (plain AVATAR layer, which
+  // collides with AVATAR): reported, not asserted -- it is the bug, and what
+  // it does is the diagnosis, not a contract.
+  int brokeD = -1, brokeCtl = -1;
+  float flewD = 0.0f;
+  {
+    const Vec3 pc{(float)px - 5, top + 12.0f, (float)pz - 4};
+    const uint64_t proxy = phys.CreatePlayerBody(Player::kHalfXZ, Player::kHalfY);
+    std::vector<DebrisVoxel> arm;
+    for (int8_t z = 0; z < 3; z++)
+      for (int8_t y = 0; y < 3; y++)
+        for (int8_t x = 0; x < 3; x++)
+          arm.push_back(DebrisVoxel{x, y, z, 0, (uint16_t)kMatStone});
+    auto throwArm = [&](bool thrown, float* flew) {
+      BodyTransform ax{};
+      ax.pos = pc + Vec3{-1.5f, 0.0f, -1.5f};
+      ax.quat[3] = 1;
+      const uint64_t limb =
+          phys.CreateDebrisBodyXf(arm, ax, debris.DensityOf(), true);
+      if (!limb) return -2;
+      phys.SetBodyKinematic(limb, true);
+      phys.SetBodyAvatarLayer(limb, true);
+      const Vec3 vel{0, full * 0.25f, -full};
+      const uint64_t f = drop(pc - Vec3{0.5f, 0.5f, 0.5f}, vel);
+      if (!f) {
+        phys.RemoveBody(limb);
+        return -2;
+      }
+      phys.ReleaseToWorldWhenClear(f, thrown);
+      BodyTransform f0{};
+      phys.GetTransform(f, f0);
+      int broke = -1;
+      for (int i = 0; i < 5 && broke < 0; i++) {
+        if (proxy) phys.MovePlayerBody(proxy, pc, kTickDt);
+        phys.MoveKinematicBody(limb, ax.pos, ax.quat, kTickDt);
+        if (tick({}) > 0 && !ground.Find(f)) broke = i;
+      }
+      BodyTransform f1{};
+      if (flew && broke < 0 && phys.GetTransform(f, f1))
+        *flew = (f1.pos - f0.pos).len();
+      phys.RemoveBody(limb);
+      if (ground.Find(f)) debris.DestroyBody(f);
+      return broke;
+    };
+    brokeCtl = throwArm(false, nullptr);
+    brokeD = throwArm(true, &flewD);
+    if (proxy) phys.RemoveBody(proxy);
+    // Five ticks at full draw is ~2 m; a flask that flew a third of that
+    // left the hand at speed rather than being caught in it.
+    if (brokeD == -2) fail("D: Jolt refused the arm or the flask");
+    else if (brokeD >= 0)
+      fail(Format("D: a flask thrown out of the thrower's own arm broke at +%d",
+                  brokeD));
+    else if (flewD < full * kTickDt * 5.0f / 3.0f)
+      fail(Format("D: the thrown flask was held back (flew %.1f vox in 5 ticks)",
+                  flewD));
+  }
+
   // A must survive the WHOLE fixture, not only its own settle: B landing and
   // C being struck nearby must not take it with them.
   if (aGone >= 0)
@@ -1144,8 +1207,12 @@ Status GateVesselBreak(Ctx& c, std::string& detail) {
                 "at %.1f,%.1f,%.1f)", aGone - aT0, aHow, aWhere.x, aWhere.y,
                 aWhere.z));
   detail = Format("A intact throughout: %s; B broke at +%d (spill %d/1024); "
-                  "C struck, broke at +%d",
-                  aGone < 0 ? "yes" : "no", brokeB, spilledB, brokeC);
+                  "C struck, broke at +%d; D thrown from an arm: %s (flew "
+                  "%.1f vox), old AVATAR release %s",
+                  aGone < 0 ? "yes" : "no", brokeB, spilledB, brokeC,
+                  brokeD == -1 ? "intact" : "BROKE", flewD,
+                  brokeCtl >= 0 ? Format("broke at +%d", brokeCtl).c_str()
+                                : "intact");
   if (!ok) detail = why + " -- " + detail;
   std::printf("vessel-break: %s\n", detail.c_str());
   // Leave nothing behind but a regenerated world: the bodies and the slab.

@@ -246,6 +246,10 @@ class Simulation {
   // Whether the CA rows would be recorded for the NEXT tick. Measurement and
   // gates only — nothing in the sim may branch on this.
   bool CaSkipped() const { return caSkipped_; }
+  // Whether the last EncodeTick recorded the MPM seam (and so its last row,
+  // the swimming fold). The snapshot readback copies the fold only then.
+  // Readback plumbing only — nothing in the sim may branch on this either.
+  bool FluidSeamRecorded() const { return fluidSeamRecorded_; }
   uint64_t CaSkipCount() const { return caSkipCount_; }
   // MEASUREMENT / TEST ONLY: force the CA rows to be recorded every tick, i.e.
   // defeat the §3.4 skip. Two uses, both of which need it to be a switch rather
@@ -621,6 +625,12 @@ class Simulation {
   const rhi::BindGroup& BodyRenderBG() const {
     return veilLive_ ? renderBG_ : renderBGNoVeil_;
   }
+  // BodyRenderBG for a draw whose fragment stage READS the veil. The scope
+  // split that makes the raymarch's veil writes visible is taken here, by the
+  // first such draw after DrawWorld, instead of unconditionally in DrawWorld:
+  // a pass that draws no veil reader after the world (--shot, a sky-only
+  // frame) pays no split at all.
+  const rhi::BindGroup& VeilReaderBG(const rhi::RenderPass& pass);
   void EnsureRenderPipelines(rhi::TextureFormat format);
   // Derive raymarchLeanModule_ from an already-loaded raymarch module by
   // flipping the three `const SPEC_* : bool = true;` lines in the source
@@ -676,6 +686,16 @@ class Simulation {
   // Art palette RGB (0x00RRGGBB), indexed from kArtPaletteBaseGpu. Cached so a
   // materials hot-reload can restore it — see SetArtPalette.
   std::vector<uint32_t> artPalette_;
+  // UploadMicroBodies runs on every dirty frame (a burning limb is every
+  // frame), and it re-sent the model table and the art run each time whether
+  // or not either had changed. These remember what the GPU copy holds so an
+  // unchanged table / palette is not written again. `*Live_` = "the buffer
+  // holds exactly the last write recorded here"; anything else that writes the
+  // same range (the whole material table, a buffer re-create) clears it.
+  std::vector<MaterialGpu> artRunScratch_;
+  bool artPaletteLive_ = false;
+  std::vector<MicroBodyModelGpu> mbModelScratch_, mbModelLast_;
+  bool mbModelLive_ = false;
   // Static micro-detail (render-only). Deliberately NOT in any sim bind group.
   rhi::Buffer microTableBuf_, microPoolBuf_;
   // Dynamic micro BODIES (render-only, same doctrine): per-def limb models, the
@@ -883,6 +903,8 @@ class Simulation {
   uint64_t veilPixels_ = 0;
   rhi::BindGroup renderBGNoVeil_;
   bool veilLive_ = false;
+  // DrawWorld wrote the veil and no split has been taken yet (VeilReaderBG).
+  bool veilSplitPending_ = false;
   int page_ = 0;
 
   // ---- settled-tick skip state (§3.4) -------------------------------------
@@ -899,6 +921,7 @@ class Simulation {
   uint32_t curTick_ = 0;        // tick being encoded (NoteTickInputs)
   bool settledProven_ = false;  // a fresh snapshot showed 0 active chunks
   bool caSkipped_ = false;      // last EncodeTick omitted the CA rows
+  bool fluidSeamRecorded_ = false;  // last EncodeTick recorded the MPM seam
   uint64_t caSkipCount_ = 0;    // how many ticks skipped (measurement only)
   bool caForced_ = false;       // SetCaForced / SANDVOX_CA_FORCE (test only)
 };

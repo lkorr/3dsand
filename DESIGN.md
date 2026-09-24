@@ -495,8 +495,22 @@ are deduplicated across mob defs, so 128 slots cover a whole cast.
   occupancy + `genAct` readback is queued with **no `Wait()`** and a
   `PendingShift` records what is owed. At tick T+K `Stream::Update` polls the
   ticket, runs the same CPU logic as before (act set → `RefilledSlot`, pure sky
-  → `PT_EMPTY`, full → demote copies) and only then writes the act set into
-  both dirty pages. Between T and T+K the plane is resident and drawn but
+  → `PT_EMPTY`, full → the kernel's page-table class, or demote copies when the
+  chunk may have been written since generation) and only then writes the act
+  set into both dirty pages.
+
+  **The `genAct` word is a verdict, not a bit (P4, 2026-09-24).** Bit 0 is
+  still the act set; bits 1..15 are `PageTable::Classify`'s answer for the
+  words `genChunk` just wrote (valid, class EMPTY/UNIFORM/JITTER/needs-page,
+  material — `world.h` `kGenVerdict*`), reduced in-kernel with a second sweep
+  over FULL chunks only. The batched whole-window worldgen (`SubmitWorldgen`)
+  classifies from it too: an 8 KiB readback per 2,048-slot batch instead of a
+  32 MiB `ReadVoxelsSync` (512 MiB per paged regen). A shift's FULL chunk
+  demotes on the verdict when `cpuDirty`, the snapshot dirty flags and the
+  write-reach clock (`ReachTick < genTick`) all prove nothing wrote it since
+  generation; otherwise it takes the word copy as before.
+  `SANDVOX_GEN_VERDICT_CHECK=1` classifies every worldgen batch both ways and
+  counts disagreements. Between T and T+K the plane is resident and drawn but
   nothing dispatches it; a neighbour that writes into it lands on a real page
   (every gen slot has one) and marks it dirty through the ordinary path.
 
@@ -2895,7 +2909,10 @@ Author in JSON, hot-reload at runtime, compile at load into flat GPU tables.
     quickly but shallowly, into loam slowly but deeply — and the effective depth
     is `min(amount, capacity)`. Authoring the ceiling per material PAIR would be
     exactly the N×M explosion tags exist to avoid. Capacity 0 (every material
-    predating this, all stone) means the liquid never soaks in and pools at once.
+    predating this, all stone) means the liquid never soaks in and pools at once;
+    such ground still takes a 1-level surface mark (the ceiling is
+    `min(amount, max(capacity, 1))`, in both `doStaining` and the MPM seam's
+    `stainApply`).
   - **Absorbing SPENDS the liquid**: one eighth of the source cell's fullness
     per successful contact, in the same units `stepLiquid` speaks, and the cell
     dies when it gives its last. Without that debit the puddle would stain the
@@ -2906,6 +2923,13 @@ Author in JSON, hot-reload at runtime, compile at load into flat GPU tables.
     0) instead of overwriting it. Water over blood-soaked ground would otherwise
     relabel the blood as "wet" at full strength: the colour would change but the
     mess would never come out.
+  - **A non-washer never paints over a foreign stain (2026-09-23).** It stains
+    only clean ground or its own type. Overwriting made two stains on one cell
+    a cycle that never settled (blood re-painting wet ground that water then
+    rinsed; blood and ichor repainting each other), each step rolling `consume`
+    so the surface eroded and the chunk never slept. With the strict order a
+    washer only lowers a foreign amount and a stainer only raises its own, so
+    every cell reaches a fixed point. Blood no longer recolours wet ground.
   - Both fit in `stainPack`'s spare bits (27..30 capacity, 31 washes), so the
     64-byte `Material` still did not grow.
   - **Sleep discipline (rule 2)** survives because every step is monotone toward
@@ -9662,11 +9686,11 @@ where you hear from either (§12b, "The ears are on the character").
   a VALID box, not the level box (2026-09-10).** A level is toroidal, so when
   its origin steps one level chunk the incoming face's SLOTS are the outgoing
   face's and hold the outgoing face's bytes until the sieve refills them —
-  ~16 ticks per plane under the play cap, deeper under sprint flight. Marched
+  a few ticks per plane under the play cap, deeper under sprint flight. Marched
   from the full box the tick the origin moved, those bytes were the hillside
   BEHIND the player drawn ahead of them, and the underground of the bottom
   face drawn in the sky when the box stepped up. `FarField` now keeps one
-  record per queued plane (FIFO beside the entry queue) and a count of planes
+  record per queued plane (FIFO beside its level's entry queue) and a count of planes
   outstanding on each of a level's six faces, released when a plane's LAST
   entry is dispatched; `FarField::FaceWord` packs the six counts (5 bits each)
   plus a whole-level-pending bit (30) into `FarParams.origins[k].w`, the word
@@ -9684,8 +9708,12 @@ where you hear from either (§12b, "The ears are on the character").
   shrunken face and the next coarser level, which is filled, picks it up at
   the same t by the seam contract `traceFar` already keeps for a ray out of
   `farSteps`. Always conservative: a landed face is published a tick late, a
-  reversed face is excluded on both sides until both records drain, and a
-  reset voids the level's older records via an epoch. `SafeRadiusMeters`
+  reversal drops the still-pending plane it undoes (same axis and slot layer,
+  so the new plane refills exactly those slots) and releases its face, and a
+  reset voids the level's older records via an epoch. **The queue is per level
+  and drains finest first (2026-09-24)**, so a coarse level's backlog never
+  holds up the level-1 plane in front of the player, and a diagonal step
+  queues the line where its two planes cross once. `SafeRadiusMeters`
   subtracts one level chunk PER QUEUED PLANE, not one: the excluded slab is
   that deep, and subtracting one fogged open over exactly the band the
   renderer was refusing to march. The `far-fog` gate steps the player one
@@ -9712,11 +9740,23 @@ where you hear from either (§12b, "The ears are on the character").
   identical bytes (15.4 ms/frame, the largest GPU row in the fire). `fardown`
   now opens with one coalesced read of the chunk, sums a per-cell hash of every
   cell `farCellIsSolid` keeps (position + material), mixes in the world chunk
-  coord and the eight level origins, and compares against `World::farSig[slot]`
-  (one u32 per slot, far group binding 6). Equal = return. `FarField` zeroes
-  `farSig` on every `ResetLevel` / `FullRefill`, because a refill re-derives the
-  level from procgen + patches and the next dirty tick must downsample afresh.
-  A 32-bit collision skips one downsample of render-only data. The per-sample
+  coord, and compares against `World::farSig[slot]` (one u32 per slot, far
+  group binding 6). Equal = return. A sentinel slot's signature is one
+  closed-form term of its material instead of a 4,096-cell sum. The level
+  ORIGINS are not in it any more (2026-09-24): hashing them re-downsampled
+  every dirty chunk into all eight levels on every level-1 step (one per 32
+  voxels walked), while all an origin step can do to a resident chunk's cells
+  is have a sieve refill overwrite them. So `FarField` zeroes `farSig` on the
+  tick AFTER it dispatches a fill entry whose level chunk overlaps the
+  residency window — resets, teleports, a level catching up with a jump; never
+  a steady-state plane, whose incoming face is half a level-1 box from the
+  player — and that is also the first moment the clear does not race the
+  refill (the fill is recorded after `farDown` in the tick's command buffer).
+  Hash ticks compact no dirty list, so `farDownHash` runs the same kernel over
+  the CA's active list there; a chunk first written on a hash tick from OUTSIDE
+  the active set that is quiet the tick after is still missed (pass_table.def
+  says why the fix is not a dirtyOut compaction). A 32-bit collision skips one
+  downsample of render-only data. The per-sample
   procgen (`genColumn`, the column top) is also hoisted to one call per COLUMN
   (a thread per column, cells in an inner loop): 8x fewer at level 1.
   Together: 15.4 -> ~1.8 ms/frame on the fire.
@@ -10717,7 +10757,10 @@ the binding summary.
 
 **The problem.** `ambientAt(n)` (raymarch.wgsl) and its raster twin
 `ambientAtP` (common.wgsl) are a hemisphere lerp on `n.y` between
-`TUNE_AMB_GROUND` and `TUNE_AMB_SKY`. Pure functions of the NORMAL: no term in
+`TUNE_AMB_GROUND` and `TUNE_AMB_SKY`. (Since 2026-09-24 both read ONE
+definition, `ambientHemi`, on ends resolved once per frame on the CPU —
+`ResolveFrameLight`, support.cpp, which also owns the key light's colour and
+direction; the hand-inlined terrain copy had missed the overcast and lightning.) Pure functions of the NORMAL: no term in
 either knows where the receiver is. So a cave floor was lit exactly as brightly
 as a meadow, a room exactly as brightly as the field outside its door, and
 `voxelAO`'s three in-plane taps cannot see a ceiling 3 m up. It was also the
@@ -11028,8 +11071,10 @@ the column's coefficients).
 exp(−absorb·d) over the path d in the liquid. The raymarch solves it for its bed
 and writes the COEFFICIENTS per pixel — K, A = Arest + K·scatter, S =
 K·scatter, absorb, the surface distance, the path cap and the caustic
-curvature: six words, `VEIL_WORDS` (common.wgsl THE WATER VEIL), at render
-binding 24. A body fragment at distance `dist` beyond the surface shades
+curvature: six words plus a frame stamp, `VEIL_WORDS` = 7 (common.wgsl THE
+WATER VEIL), at render binding 24. The stamp (w6 = `RenderParams.frameIdx`)
+is what makes a record live: a reader whose frame differs sees a dry pixel,
+so the raymarch no longer clears every pixel's record at the top of fs. A body fragment at distance `dist` beyond the surface shades
 `A + T·(K·lit·caustic − S)`; one nearer than the surface takes the ordinary
 air fog. The raymarch then writes the depth BEHIND a clear liquid (viscous
 ones — blood, oil — keep the interface and record no veil). Fog is not
@@ -11040,16 +11085,20 @@ wears the bed's web.
 
 **The pass split.** The veil is a fragment-stage STORAGE write read by later
 draws of the same pass, and no barrier is legal inside a rendering scope.
-`Simulation::DrawWorld` ends with `RenderPass::SplitAfterFragmentWrite`, which
-ends the scope, emits the fragment-write → vertex/fragment read+write barrier
+`RenderPass::SplitAfterFragmentWrite` ends the scope, emits the fragment-write
+→ vertex/fragment read+write barrier
 (`vk::Recorder::SplitRenderingAfterFragmentWrite`), and reopens on the same
-attachments with LOAD — in the one function every world pass calls, so none of
-the dozens of DrawWorld-then-DrawBodies call sites changed. A pass with no
+attachments with LOAD. `Simulation::DrawWorld` only ARMS it; the first draw
+whose fragment stage reads the veil (particles, sprites, fluid cubes, bodies,
+micro bodies — all through `Simulation::VeilReaderBG`) takes it, so a pass
+that draws nothing after the world pays no split, and none of the
+DrawWorld-then-DrawBodies call sites changed. A pass with no
 DrawWorld (the character portrait) binds `renderBGNoVeil_` (a one-word buffer
 the bounds test rejects), so it never reads a veil written for other pixels.
 
-**Cost.** One store per pixel (w0 = 0) for a dry pixel; six for a water pixel;
-six loads per body fragment. The buffer is 24 B/px (~50 MB at 1080p), grow-only.
+**Cost.** Nothing for a dry pixel; seven stores for a water pixel; one load
+(the stamp) per body fragment on a dry pixel, seven on a wet one. The buffer is
+28 B/px (~58 MB at 1080p), grow-only.
 Without fragment stores (`WATER_VEIL` = `SHADOW_CACHE_AVAILABLE`) the old
 contract holds exactly.
 
@@ -11643,7 +11692,13 @@ hash.** What does is ONE word, `weather::SimRainWord` → `TickParams.weatherRai
 (the old `padWp1`): rain reaching the ground (bits 0..7), `weather.rainIgniteDamp`
 (8..15) and ground wetness (16..23), quantised once per tick from the pinned or
 scheduled preset — the un-eased TARGET, never the frame-time ease, so frame
-pacing cannot reach the hash. Two reaction flags read it (`materials.h`
+pacing cannot reach the hash. **The word is computed in integers** (2026-09-24):
+the presets' four sim-relevant fields and the `weather.*` tuning are quantised to
+Q16 by one exact conversion each, and the schedule, ladder, blend and wetness sum
+run on int64 with a Q16 table for the `exp(-k/4)` decay — no libm on the path to
+TickParams, so two machines cannot round a word differently. The renderer's
+`Resolve` keeps its float path; the two agree up to fixed-point rounding. Two
+reaction flags read it (`materials.h`
 `kCondRain` / `kCondRainDamp`, `RCOND_RAIN` / `RCOND_RAINDAMP`):
 
 - `"rain": true` — a douse. Fires only on a RAIN-EXPOSED cell while it rains, at
@@ -11739,7 +11794,7 @@ in the memories index), so the march lives in `cloud.wgsl` on the per-frame
 | row | what | size |
 |---|---|---|
 | `cloud_noise` | tileable Perlin-Worley SHAPE (R) + Worley fBm (GBA), 128³; Worley DETAIL, 32³. Once per pipeline build (`Cond::CloudBake`) | 8.1 MiB |
-| `cloud_weather` | per-frame 512² WEATHER MAP around the camera at 125 m: local coverage, type, rain, base jitter — plus the camera probe (8 words; 4..6 = the 20 m averaged wind, written by `cloud_env`) | 1 MiB |
+| `cloud_weather` | 512² WEATHER MAP around the camera at 125 m: local coverage, type, rain, base jitter — plus the camera probe (8 words; 4..6 = the 20 m averaged wind, written by `cloud_env`). Recorded every frame but REBUILT only on frames with `kClfWeather` (below) | 1 MiB |
 | `cloud_shadow` | per-frame 256² CLOUD SHADOW map at 40 m, indexed at the deck-base plane along the key light | 256 KiB |
 | `cloud_env` | per-frame 64² octahedral ENV map: (in-scatter, T) per direction | 32 KiB |
 | `cloud_march` | the deck, cirrus and rain curtains, one ray per LOW-RES pixel (target ÷ `render.cloudResDiv`) | 4 words/px |
@@ -11748,6 +11803,20 @@ in the memories index), so the march lives in `cloud.wgsl` on the per-frame
 All six are gated by `Cond::Clouds`: `weather.clouds` off, or a sky with no
 cloud, cirrus or rain, records no row, and `RenderParams.weatherFlags`'
 `RWF_CLOUDS` (set from the same `CloudFrame`) tells every reader not to look.
+
+**The weather map is reused, not rebuilt, between changes** (2026-09-24). Its
+inputs are translations of the noise domain (the drift `weatherOff`, the camera
+re-centring `weatherOrigin`) and slow shape terms (`weatherEvolve`, the
+preset's coverage / type / precip). A translated field is the same field read
+elsewhere, so `WriteCloudParams` keeps the map it last built and hands
+`weatherAt` the metres the drift has moved since (`CloudParams.spare.yz`) —
+exact while the map still covers 30 km each way (a 16-texel slack) — and asks
+for a rebuild (`kClfWeather`) only when a shape term moves by a step below
+visibility (evolve 4e-4 ≈ 7 m of front, preset terms 0.002) or the slack runs
+out. The rebuild is COMMITTED by the recorder (`CommitCloudWeather`, called by
+`EncodeShadowResolve` once the rows are recorded), so a caller that writes
+params and records no sky cannot leave the offset describing a map that was
+never built. It was ~31M hashes and ~16M sincos every frame.
 
 **The look is the Nubis recipe, bent to this engine.** Coverage LOWERS THE
 DENSITY THRESHOLD (the corpus's three-field model: `remap(shape, 1−cov, 1)·cov`),
