@@ -6515,6 +6515,10 @@ int main(int argc, char** argv) {
   // is settled before this frame's eye exists.
   Vec3 pourFrom{};
   bool pourFromValid = false;
+  // The hotbar slot `heldItem` was read from on the last frame that had one
+  // (-1 = nothing drawn). The knocked-from-hand handler clears THIS slot,
+  // not whatever is selected by the time it runs.
+  int heldItemSlot = -1;
   // ---- THE HOTBAR IS THE HAND ---------------------------------------------
   //
   // A weapon is drawn the way a flask is: put it in a hotbar slot and select
@@ -10389,6 +10393,28 @@ int main(int argc, char** argv) {
                                      // GPU count + calm state)
         player.SnapRender();  // the load moved the body: do not lerp into it
         tpRig.Snap();
+        // ---- A BLADE SAVED IN THE SHEATH COMES BACK TO THE HOTBAR -------
+        //
+        // Before 2026-09-23 the draw key pulled from the Sheath slot; now
+        // the hand reads ONLY the hotbar ("THE HOTBAR IS THE HAND"), so a
+        // save made under the old rule would leave its sword where no key
+        // reaches it. Moved here, at the one game-side load, rather than in
+        // LoadPlayerKit: the format round-trip stays exact (the playerkit
+        // gate asserts the sheath comes back) and only the GAME re-homes it.
+        // No free hotbar slot = it stays sheathed; the pack UI can still
+        // drag it out.
+        for (int e = 0; e < kEquipSlotCount; e++) {
+          if (EquipSlotAt(e).id != EquipSlotId::Sheath) continue;
+          ItemStack& sh = kit.equip.slots[e];
+          if (sh.Empty()) continue;
+          for (ItemStack& hs : hotbar.slots) {
+            if (!hs.Empty()) continue;
+            hs = sh;
+            sh = ItemStack{};
+            wearTried[e].clear();
+            break;
+          }
+        }
       }
     }
 
@@ -10534,19 +10560,33 @@ int main(int argc, char** argv) {
     // already on the mouse for aiming. A spell is AIMED, so the cast belongs
     // on the aiming hand; magic mode is what keeps this from stealing
     // brush-erase.
-    if (mouseLClick && ui.tool == UIState::kToolPrefab) feeder.Press(TB_PLACE);
-    if (mouseLClick && ui.tool == UIState::kToolMob) feeder.Press(TB_SPAWN);
+    // PLAY (UIState::devControls off) has no prefab or mob tool: the panel's
+    // radio buttons can still set one for the frame before the PLAY block
+    // below forces the hands back, so the click is gated here too.
+    if (ui.devControls && mouseLClick && ui.tool == UIState::kToolPrefab)
+      feeder.Press(TB_PLACE);
+    if (ui.devControls && mouseLClick && ui.tool == UIState::kToolMob)
+      feeder.Press(TB_SPAWN);
     if (mouseLClick) feeder.Press(TB_ATTACK);
     if (captured && ui.magicMode && mouseRClick) feeder.Press(TB_CAST);
     if (captured && ui.magicMode && eDel.Pressed(key(GLFW_KEY_DELETE)))
       feeder.Press(TB_DROP);
     // The DEV PANEL asks for the same two things through UIState, so its
     // buttons funnel into the same edges rather than through a second door.
-    // The flag is cleared as it is converted: it is a request, not state.
-    if (ui.placePrefab) { ui.placePrefab = false; feeder.Press(TB_PLACE); }
-    if (ui.spawnMob) { ui.spawnMob = false; feeder.Press(TB_SPAWN); }
+    // The flag is cleared as it is converted: it is a request, not state --
+    // and in PLAY it is cleared WITHOUT converting, so a panel button pressed
+    // in play mode neither fires now nor waits to fire on the switch to DEV.
+    if (ui.placePrefab) {
+      ui.placePrefab = false;
+      if (ui.devControls) feeder.Press(TB_PLACE);
+    }
+    if (ui.spawnMob) {
+      ui.spawnMob = false;
+      if (ui.devControls) feeder.Press(TB_SPAWN);
+    }
     // The held mouse bits, and the laser's OR of F-from-any-tool with
-    // LMB-with-the-laser-tool. Re-sampled every frame, so a button released
+    // LMB-with-the-laser-tool. The laser is a DEV tool: in PLAY neither door
+    // opens (the tool is forced to the hands below, and F is gated here). Re-sampled every frame, so a button released
     // between two ticks reads as released on the second one.
     feeder.Hold(TB_ATTACK, mouseL);
     feeder.Hold(TB_ALT, mouseR);
@@ -10555,8 +10595,9 @@ int main(int argc, char** argv) {
     feeder.Hold(TB_THROW, captured && gameKeys &&
                               glfwGetKey(window, GLFW_KEY_Q) == GLFW_PRESS);
     feeder.Hold(TB_LASER,
-                captured && (glfwGetKey(window, GLFW_KEY_F) == GLFW_PRESS ||
-                             (ui.tool == UIState::kToolLaser && mouseL)));
+                captured && ui.devControls &&
+                    (glfwGetKey(window, GLFW_KEY_F) == GLFW_PRESS ||
+                     (ui.tool == UIState::kToolLaser && mouseL)));
     // The RENDER layer draws the beam sprites and has no TickInput (it runs on
     // frames the tick loop did not). It reads the same bit off the pending
     // command rather than re-deriving the expression, so what is DRAWN and
@@ -10593,7 +10634,15 @@ int main(int argc, char** argv) {
                                        : "dev controls OFF -- play mode (F2)";
         ui.kitMessageAge = 0.0f;
       }
-      if (!ui.devControls) ui.tool = UIState::kToolMelee;
+      // ...and EVERY FRAME, not only on the change: the panel's fly checkbox
+      // is still a live widget in PLAY. `player.fly = ui.fly` ran above this
+      // frame, but the ticks run below, so clearing both here means no tick
+      // ever flies in PLAY.
+      if (!ui.devControls) {
+        ui.tool = UIState::kToolMelee;
+        ui.fly = false;
+        player.fly = false;
+      }
     }
     bool brushActive = ui.tool == UIState::kToolBrush && !ui.magicMode;
     // MELEE: hold LMB with the melee tool to arm the weapon, then flick.
@@ -10615,7 +10664,14 @@ int main(int argc, char** argv) {
     // piece dragged into the pack takes.
     for (const Mob::LostGear& lg : avatar.LostGearEvents()) {
       if (lg.held) {
-        ItemStack& sh = hotbar.slots[std::clamp(hotbar.selected, 0, kItemSlots - 1)];
+        // The slot the hand was FILLED FROM when the ticks ran, not the one
+        // selected now: the number row below changes `hotbar.selected` after
+        // `heldItem` is read, so by the frame this event is seen the
+        // selection may already point at another slot -- and clearing THAT
+        // one (or nothing, on a name mismatch) left the knocked weapon both
+        // on the ground and still in its slot.
+        const int from = heldItemSlot >= 0 ? heldItemSlot : hotbar.selected;
+        ItemStack& sh = hotbar.slots[std::clamp(from, 0, kItemSlots - 1)];
         if (KitItemName(sh, items) == lg.item) sh = ItemStack{};
         ui.kitMessage = "your " + lg.item + " was knocked from your hand";
       } else {
@@ -10637,6 +10693,7 @@ int main(int argc, char** argv) {
       const ItemDef* d = items.At(hs.Empty() ? -1 : hs.def);
       return d && d->kind == ItemKind::Melee ? d : nullptr;
     }();
+    heldItemSlot = heldItem ? hotbar.selected : -1;
     const bool meleeArmed = ui.tool == UIState::kToolMelee && !ui.magicMode &&
                             heldItem && heldItem->kind == ItemKind::Melee;
     // ---- ...AND WITH NOTHING IN YOUR HANDS (plan §6) -----------------------
