@@ -9685,11 +9685,11 @@ where you hear from either (§12b, "The ears are on the character").
   a VALID box, not the level box (2026-09-10).** A level is toroidal, so when
   its origin steps one level chunk the incoming face's SLOTS are the outgoing
   face's and hold the outgoing face's bytes until the sieve refills them —
-  ~16 ticks per plane under the play cap, deeper under sprint flight. Marched
+  a few ticks per plane under the play cap, deeper under sprint flight. Marched
   from the full box the tick the origin moved, those bytes were the hillside
   BEHIND the player drawn ahead of them, and the underground of the bottom
   face drawn in the sky when the box stepped up. `FarField` now keeps one
-  record per queued plane (FIFO beside the entry queue) and a count of planes
+  record per queued plane (FIFO beside its level's entry queue) and a count of planes
   outstanding on each of a level's six faces, released when a plane's LAST
   entry is dispatched; `FarField::FaceWord` packs the six counts (5 bits each)
   plus a whole-level-pending bit (30) into `FarParams.origins[k].w`, the word
@@ -9707,8 +9707,12 @@ where you hear from either (§12b, "The ears are on the character").
   shrunken face and the next coarser level, which is filled, picks it up at
   the same t by the seam contract `traceFar` already keeps for a ray out of
   `farSteps`. Always conservative: a landed face is published a tick late, a
-  reversed face is excluded on both sides until both records drain, and a
-  reset voids the level's older records via an epoch. `SafeRadiusMeters`
+  reversal drops the still-pending plane it undoes (same axis and slot layer,
+  so the new plane refills exactly those slots) and releases its face, and a
+  reset voids the level's older records via an epoch. **The queue is per level
+  and drains finest first (2026-09-24)**, so a coarse level's backlog never
+  holds up the level-1 plane in front of the player, and a diagonal step
+  queues the line where its two planes cross once. `SafeRadiusMeters`
   subtracts one level chunk PER QUEUED PLANE, not one: the excluded slab is
   that deep, and subtracting one fogged open over exactly the band the
   renderer was refusing to march. The `far-fog` gate steps the player one
@@ -9735,11 +9739,23 @@ where you hear from either (§12b, "The ears are on the character").
   identical bytes (15.4 ms/frame, the largest GPU row in the fire). `fardown`
   now opens with one coalesced read of the chunk, sums a per-cell hash of every
   cell `farCellIsSolid` keeps (position + material), mixes in the world chunk
-  coord and the eight level origins, and compares against `World::farSig[slot]`
-  (one u32 per slot, far group binding 6). Equal = return. `FarField` zeroes
-  `farSig` on every `ResetLevel` / `FullRefill`, because a refill re-derives the
-  level from procgen + patches and the next dirty tick must downsample afresh.
-  A 32-bit collision skips one downsample of render-only data. The per-sample
+  coord, and compares against `World::farSig[slot]` (one u32 per slot, far
+  group binding 6). Equal = return. A sentinel slot's signature is one
+  closed-form term of its material instead of a 4,096-cell sum. The level
+  ORIGINS are not in it any more (2026-09-24): hashing them re-downsampled
+  every dirty chunk into all eight levels on every level-1 step (one per 32
+  voxels walked), while all an origin step can do to a resident chunk's cells
+  is have a sieve refill overwrite them. So `FarField` zeroes `farSig` on the
+  tick AFTER it dispatches a fill entry whose level chunk overlaps the
+  residency window — resets, teleports, a level catching up with a jump; never
+  a steady-state plane, whose incoming face is half a level-1 box from the
+  player — and that is also the first moment the clear does not race the
+  refill (the fill is recorded after `farDown` in the tick's command buffer).
+  Hash ticks compact no dirty list, so `farDownHash` runs the same kernel over
+  the CA's active list there; a chunk first written on a hash tick from OUTSIDE
+  the active set that is quiet the tick after is still missed (pass_table.def
+  says why the fix is not a dirtyOut compaction). A 32-bit collision skips one
+  downsample of render-only data. The per-sample
   procgen (`genColumn`, the column top) is also hoisted to one call per COLUMN
   (a thread per column, cells in an inner loop): 8x fewer at level 1.
   Together: 15.4 -> ~1.8 ms/frame on the fire.

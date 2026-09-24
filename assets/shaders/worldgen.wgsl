@@ -4656,10 +4656,6 @@ fn genChunk(slot : u32, li : u32, actIdx : u32, publish : bool) {
     let wx = base.x + i32(lx);
     let wz = base.z + i32(lz);
     var col = genColumn(wx, wz, T.seed);
-    // The column's pond candidates, ONCE, by pointer into the scans (like
-    // `trees`): the tree/cactus scans and the near-water conditions read it
-    // per candidate as arithmetic, never as table reads.
-    var ponds = pondScan(wx, wz, T.seed);
     // ---- THE COLUMN PROLOGUE (the other 15/16ths of the saving) ----------
     //
     // Cave bands: only worth having where a cell of THIS chunk can be stone
@@ -4671,6 +4667,31 @@ fn genChunk(slot : u32, li : u32, actIdx : u32, publish : bool) {
     // cost on every air column of every cascade fill.
     let caveValid = base.y <= col.h && !col.inRim;
     if (caveValid) { cave = caveBands(wx, wz, col.h, col.biome, T.seed); }
+    // ---- THE EARLY SKY TEST: before the pond scan (2026-09-24) -------------
+    // The sky early-out below needs `trees.top`, and the tree scan needs the
+    // pond candidates — but ABOVE treeMaxTop() the tree set is empty by the
+    // exact argument the tree block makes, so there the ceiling is known
+    // without either scan, and a sky column was paying a pondScan (a pond tile
+    // plus its neighbour scan) only to throw it away. Same ceiling, same
+    // test, same sixteen zeros; the full test below still catches the band
+    // between the ground and the treeline, where the candidates are needed.
+    // See the SKY EARLY-OUT block for what the ceiling enumerates and why.
+    let skyMargin = max(FLOWER_MAX_H, i32(wmBiome(col.biome, WM_B_MAX_COVER_H)));
+    var colTop = col.h + skyMargin;
+    colTop = max(colTop, col.fluidTop);
+    colTop = max(colTop, col.pond + 1);
+    colTop = max(colTop, wmSiteTopAt(wx, wz, T.seed));
+    let skySkippable = !wmFlag(col.biome, WM_BF_CACTI);
+    if (skySkippable && base.y > treeMaxTop() && base.y > colTop) {
+      for (var ly = unrollFenceU(); ly < CHUNK; ly += 1u) {
+        voxStore(voxWordInChunk(slot, lx + ly * CHUNK + lz * CHUNK * CHUNK), 0u);
+      }
+      continue;
+    }
+    // The column's pond candidates, ONCE, by pointer into the scans (like
+    // `trees`): the tree/cactus scans and the near-water conditions read it
+    // per candidate as arithmetic, never as table reads.
+    var ponds = pondScan(wx, wz, T.seed);
     // Tree candidates: because the answer is what makes the vertical reject a
     // LOCAL ceiling (`trees.top`) instead of a world-wide constant.
     //
@@ -4751,13 +4772,10 @@ fn genChunk(slot : u32, li : u32, actIdx : u32, publish : bool) {
     // map's P1 the cover rows are DATA and can be taller than the fixed term
     // here (a 2 m cattail is 23 voxels with its jitter); a margin that ignored
     // them would skip a chunk whose plants it never wrote.
-    let skyMargin = max(FLOWER_MAX_H, i32(wmBiome(col.biome, WM_B_MAX_COVER_H)));
-    var colTop = col.h + skyMargin;
-    colTop = max(colTop, col.fluidTop);
-    colTop = max(colTop, col.pond + 1);
+    // (skyMargin and every term but the trees' were taken above, for the
+    // early test.)
     colTop = max(colTop, trees.top);
-    colTop = max(colTop, wmSiteTopAt(wx, wz, T.seed));
-    if (!wmFlag(col.biome, WM_BF_CACTI) && base.y > colTop) {
+    if (skySkippable && base.y > colTop) {
       for (var ly = unrollFenceU(); ly < CHUNK; ly += 1u) {
         voxStore(voxWordInChunk(slot, lx + ly * CHUNK + lz * CHUNK * CHUNK), 0u);
       }
@@ -4769,7 +4787,12 @@ fn genChunk(slot : u32, li : u32, actIdx : u32, publish : bool) {
     // canopyMin / canopyMax conditions. Every term of the guard is a property
     // of the COLUMN -- the cover stack's own guard with the y test replaced by
     // "does this chunk's 16-cell stack reach the band at all". -1 = not
-    // computed; genCellIn scans on demand.
+    // computed, and it is handed on as max(canopy, 0): genCellIn only ever
+    // reads it as max(canopy, 0), and where this guard declines the scan no
+    // cell of the chunk can reach a cover row that reads it (no cell above the
+    // ground, or every cell above the biome's tallest row, where each row
+    // breaks to air on `up > hgt`). A non-negative memo is what stops
+    // genCellIn's per-cell on-demand scan, and lets the compiler drop it.
     // THE LOCAL STEP LINE for a loose cover (looseRestTop, above genCellIn):
     // only where the cover splits, only where this chunk reaches the loose
     // band (the cap is 4 deep, a skin its authored skinDepth), and only where
@@ -4789,7 +4812,7 @@ fn genChunk(slot : u32, li : u32, actIdx : u32, publish : bool) {
     }
     for (var ly = unrollFenceU(); ly < CHUNK; ly += 1u) {
       let i = lx + ly * CHUNK + lz * CHUNK * CHUNK;
-      let w = genCellIn(&col, &cave, caveValid, &trees, true, &ponds, canopy,
+      let w = genCellIn(&col, &cave, caveValid, &trees, true, &ponds, max(canopy, 0),
                         wx, base.y + i32(ly), wz, T.seed);
       // Chunk-linear: the slot's page resolved once, per §2.1's second entry
       // point. genChunk overwrites the WHOLE chunk, so the CPU materializes
@@ -5133,130 +5156,185 @@ fn far(@builtin(workgroup_id) wg : vec3<u32>,
   var count = 0u;
   let zi = li / 4u;              // this thread's z within the level chunk
   let x0 = (li % 4u) * 4u;       // and the first of its four x
-  var cols : array<Col, 4>;
-  // Column tops for the blocker bit, hoisted out of the y loop for the same
-  // reason the columns themselves are: they depend on (x, z) alone.
-  var tops : array<i32, 4>;
-  // Corner-max tops for the ONE surface-band cell of each column — the middle
-  // band of farBlockerBitAt — hoisted out of the y loop like `tops`, but for
-  // COMPILE cost, not run cost. farBlockerBitAt's middle band inlines FOUR
-  // farColTop, each a full landColumn, and calling it from the 16x4 cell loop
-  // put those four copies inside the loop body the driver unrolls; after P-F
-  // grew landColumnBare with the pond-table machinery (pondScan + two
-  // pondGates) the driver's compile of this entry point went from part of a
-  // slow minute to tens of minutes at ~10 GB, which read as "the game never
-  // loads". For a fixed topC exactly one multiple of `step` lies inside
-  // (topC, topC + step), so the middle band fires for at most one cc.y per
-  // column: compute that row's corner max here, once per column, and the cell
-  // loop below is pure arithmetic — same values, same laziness.
-  var btops : array<i32, 4>;
   let step = 1 << shift;
+  let half = 1 << (shift - 1u);
+  // The row samples of this level chunk, lowest and highest (fine voxels).
+  // Column-invariant: every column of the chunk samples the same sixteen y.
+  let yLo = (base.y << shift) + half;
+  let yHi = ((base.y + i32(CHUNK) - 1) << shift) + half;
+  // ---- COLUMN-OUTER, ROW-INNER (2026-09-24) ---------------------------------
+  //
+  // The four columns this thread owns are walked ONE AT A TIME, each with its
+  // sixteen rows inside, and the sixteen output words are assembled in `words`
+  // byte by byte. The previous form walked rows outside and columns inside,
+  // which kept all four Cols live across the whole sweep — and so could not
+  // afford to give them anything more: every cell went through genCellCol,
+  // i.e. genCellIn with NOTHING hoisted. Per cell that was a fresh pondScan,
+  // `caveBands` for every stone cell, a 25-tile `treeAt` for every air cell
+  // below the treeline, and a 25-tile `undergrowthSite` for every air cell of
+  // a canopy-row biome — column-invariant work, paid up to sixteen times.
+  //
+  // With one column live at a time the thread can hold genChunk's whole
+  // COLUMN PROLOGUE for it (pond candidates, cave bands, tree candidates, the
+  // canopy memo) and call genCellIn with the valid flags set, exactly as
+  // genChunk does. The flags pick the other spelling of the SAME function —
+  // caveAt is caveBands+caveIn, treeAt is treeCandsInto+treeFromCands (the
+  // world hash proves that composition in genChunk every tick) — so the bytes
+  // are the ones the old sweep wrote. Same 64 cells per thread, same whole-word
+  // stores, same count and top row.
+  var words : array<u32, CHUNK>;   // one output word per row; zero-initialised
+  var top = 0u;   // one plus the highest row with a non-empty cell, this thread
   for (var b = unrollFenceU(); b < 4u; b++) {
-    let cc = base + vec3<i32>(i32(x0 + b), 0, i32(zi));
-    let fine = (cc << vec3<u32>(shift)) + vec3<i32>(1 << (shift - 1u));
-    cols[b] = genColumn(fine.x, fine.z, T.seed);
-    tops[b] = farColTopFrom(cols[b].h, cols[b].fluidTop, fine.x, fine.z, T.seed);
-    btops[b] = tops[b];
-    // The only cell row whose span can straddle the top: y0 = bcy * step is
-    // the one multiple of step in (topC, topC + step]. Strictly inside means
-    // the middle band exists; the range test means it is one of OUR rows.
-    let bcy = fdiv(tops[b], step) + 1;
-    if (bcy * step - tops[b] < step &&
+    let cc0 = base + vec3<i32>(i32(x0 + b), 0, i32(zi));
+    // the sieve's sample column: the fine-voxel centre of the cell footprint
+    let fx = (cc0.x << shift) + half;
+    let fz = (cc0.z << shift) + half;
+    var col = genColumn(fx, fz, T.seed);
+    // The column top for the blocker bit (farBlockerBitAt's centre sample).
+    let topC = farColTopFrom(col.h, col.fluidTop, fx, fz, T.seed);
+    // Corner-max top for the ONE surface-band cell of this column — the middle
+    // band of farBlockerBitAt — hoisted out of the row loop for COMPILE cost,
+    // not run cost. farBlockerBitAt's middle band inlines FOUR farColTop, each
+    // a full landColumn, and calling it from the cell loop put those copies
+    // inside the loop body the driver unrolls; after P-F grew landColumnBare
+    // the driver's compile of this entry went from part of a slow minute to
+    // tens of minutes at ~10 GB. For a fixed topC exactly one multiple of
+    // `step` lies inside (topC, topC + step), so the middle band fires for at
+    // most one cc.y per column: compute that row's corner max here, once —
+    // same values, same laziness.
+    var btop = topC;
+    let bcy = fdiv(topC, step) + 1;
+    if (bcy * step - topC < step &&
         bcy >= base.y && bcy < base.y + i32(CHUNK)) {
-      let cx0 = cc.x << shift; let cx1 = cx0 + step - 1;
-      let cz0 = cc.z << shift; let cz1 = cz0 + step - 1;
-      var t = tops[b];
+      let cx0 = cc0.x << shift; let cx1 = cx0 + step - 1;
+      let cz0 = cc0.z << shift; let cz1 = cz0 + step - 1;
       for (var ci = unrollFenceU(); ci < 4u; ci++) {
         let cx = select(cx0, cx1, (ci & 1u) != 0u);
         let cz = select(cz0, cz1, (ci & 2u) != 0u);
-        t = max(t, farColTop(cx, cz, T.seed));
+        btop = max(btop, farColTop(cx, cz, T.seed));
       }
-      btops[b] = t;
     }
-  }
-  // ---- THE SKY CEILING: the row above which this thread has nothing to do ----
-  //
-  // genChunk has had a sky-skip since it existed (the `trees.top` block below
-  // it); the sieve never did, so a level-8 chunk 3 km above the ground still
-  // ran 64 full genCellCol evaluations per thread to conclude "air". A level
-  // box is FAR_N cells tall — 13 km at level 8 — and the terrain occupies a few
-  // hundred metres of it, so MOST of a coarse level's fill was generating sky.
-  // That per-entry cost is what forces farfield.h's kPlayFillCap down, and the
-  // cap is what makes the horizon lag a moving player.
-  //
-  // THE BOUND, and why each term is needed. A row is skippable when its floor
-  // y0 is above everything a cell in it could report:
-  //   tops[b] + step   the column's own conservative top (ground, standing
-  //                    fluid, the cover stack, an authored stamp) plus one
-  //                    cell, because farBlockerBitAt's MIDDLE band fires for
-  //                    y0 in (tops, tops + step) and must not be skipped.
-  //   btops[b]         that band's corner max, which can exceed tops[b].
-  //   treeMaxTop()     trees are NOT in farColTopFrom (see its note) and a tree
-  //                    rooted on a neighbouring, higher column can lean over
-  //                    this one — so the tree term has to be the GLOBAL
-  //                    ceiling, which is exactly what treeAt's own first line
-  //                    tests. A trunk only stands below the treeline.
-  // Everything else genCellIn can put above ground is a gas, and
-  // farCellIsSolid drops those already.
-  //
-  // Conservative on the only axis that matters: it can only skip rows whose
-  // cells were all going to be zero, so the bytes, the count, the top row and
-  // farOcc are bit-identical to the full sweep. `fardown` and `farpatch` keep
-  // the full form — they visit single scattered cells with no row to amortize
-  // over — and still agree byte for byte (the `far-downsample` gate).
-  var skyCeil = treeMaxTop();
-  for (var b = unrollFenceU(); b < 4u; b++) {
-    skyCeil = max(skyCeil, max(tops[b] + step, btops[b]));
+
+    // ---- THE COLUMN PROLOGUE, genChunk's, with the sample rows as the stack
+    //
+    // Pond candidates: once, by pointer into every scan below (they were a
+    // pondScan per CELL through genCellCol).
+    var ponds = pondScan(fx, fz, T.seed);
+    // Cave bands: only where one of this column's samples can be stone under
+    // the surface. genCellIn reads them only for `y <= h && !inRim`, and every
+    // y it is asked about here is a row sample (>= yLo) or the surface skin
+    // (y == h, looked up only for a cell whose sample is <= h) — so when this
+    // guard is false nothing reads them, and caveValid can be the constant
+    // `true`, which drops genCellIn's fallback caveBands from this entry.
+    var cave : CaveBands;
+    if (!col.inRim && yLo <= col.h) {
+      cave = caveBands(fx, fz, col.h, col.biome, T.seed);
+    }
+    // Tree candidates, with genChunk's EXACT skip above the tallest possible
+    // tree (see its note): every sample above treeMaxTop() would be rejected by
+    // treeFromCands' own `y > top` test against any set treeCandsInto builds.
+    var trees : TreeCands;
+    if (yLo <= treeMaxTop()) {
+      treeCandsInto(&trees, fx, fz, T.seed, &ponds);
+    } else {
+      trees.n = 0;
+      trees.top = -1048576;   // the same "far below any y" treeCandsInto uses
+    }
+    // The canopy memo for the cover rows' canopyMin / canopyMax, under
+    // genChunk's guard with the chunk's cell range replaced by the sample
+    // range. Passed as max(canopy, 0), which is exact both ways: genCellIn
+    // only ever reads it as max(canopy, 0), and where the guard declines the
+    // scan no cell can reach a cover row that reads it — either no sample is
+    // above ground, or every sample is above the biome's tallest cover row
+    // (skyMargin), where each row breaks to air on `up > hgt` whatever the
+    // canopy said. Non-negative is what keeps genCellIn's per-cell on-demand
+    // scan from running here (and lets the compiler drop it).
+    let skyMargin = max(FLOWER_MAX_H, i32(wmBiome(col.biome, WM_B_MAX_COVER_H)));
+    var canopy = -1;
+    if (wmFlag(col.biome, WM_BF_CANOPY_ROWS) && !col.inRim && col.pond < 0 &&
+        !siteKeepOut(fx, fz) && yHi > col.h && yLo <= col.h + skyMargin) {
+      canopy = undergrowthSite(fx, fz, T.seed, &ponds).cover;
+    }
+    let canopyArg = max(canopy, 0);
+
+    // ---- THE SKY CEILING: the row above which this column has nothing ----
+    //
+    // A level box is FAR_N cells tall — 13 km at level 8 — and the terrain
+    // occupies a few hundred metres of it, so most of a coarse level's fill is
+    // sky. A row is skippable when its floor is above everything a cell in it
+    // could report:
+    //   topC + step   the column's conservative top (ground, standing fluid,
+    //                 the cover stack, an authored stamp) plus one cell,
+    //                 because farBlockerBitAt's MIDDLE band fires for a floor
+    //                 in (topC, topC + step) and must not be skipped.
+    //   btop          that band's corner max, which can exceed topC.
+    //   trees.top     trees are NOT in farColTopFrom (see its note), and a
+    //                 tree rooted on a neighbouring, higher column can lean
+    //                 over this one. The candidate set IS that neighbourhood,
+    //                 so its `top` is the exact per-column bound genChunk's own
+    //                 sky skip uses; it replaced the global treeMaxTop() here,
+    //                 which is a ceiling for the whole world.
+    //   the rest of genChunk's own column ceiling, which the global term used
+    //                 to cover by being taller than anything: the h-relative
+    //                 plant reach (skyMargin), the pond life (pond + 1) and the
+    //                 tile plant standing on this column (cells end at
+    //                 plant.top). CACTI have no column-local bound (genChunk
+    //                 never sky-skips a cactus column for that reason), so a
+    //                 cactus-biome column keeps the old global term.
+    // Everything else genCellIn can put above ground is a gas, and
+    // farCellIsSolid drops those already. Rows ascend, so the first row past
+    // the ceiling ends the column: its bytes and every later row's stay 0.
+    // `fardown` and `farpatch` keep the one-shot form — they visit single
+    // scattered cells with no column to amortize over — and still agree byte
+    // for byte (the `far-downsample` gate).
+    var skyCeil = max(max(topC + step, btop), trees.top);
+    skyCeil = max(skyCeil, max(col.h + skyMargin, max(col.pond + 1, col.plant.top)));
+    if (wmFlag(col.biome, WM_BF_CACTI)) { skyCeil = max(skyCeil, treeMaxTop()); }
+    for (var yi = unrollFenceU(); yi < CHUNK; yi++) {
+      // The row's floor.
+      let yRow = (base.y + i32(yi)) << shift;
+      if (yRow > skyCeil) { break; }
+      let fine = vec3<i32>(fx, yRow + half, fz);
+      let mat = genCellIn(&col, &cave, true, &trees, true, &ponds, canopyArg,
+                          fine.x, fine.y, fine.z, T.seed) & 0xFFFu;
+      // The conservative flag first: it is what a cell keeps when the centre
+      // sample found nothing (common.wgsl FAR_BLOCKER_BIT). This is
+      // farBlockerBitAt flattened onto the hoisted topC/btop — the three bands
+      // are byte-identical.
+      var byteV = 0u;
+      if (yRow <= topC) {
+        byteV = FAR_BLOCKER_BIT;
+      } else if (yRow - topC < step) {
+        byteV = select(0u, FAR_BLOCKER_BIT, yRow <= btop);
+      }
+      if (farCellIsSolid(mat)) {
+        // shape from the center sample, color from the surface skin (phase 4).
+        // What lands in the byte is the skin material's FAR PALETTE SLOT, not
+        // its id (common.wgsl FAR_PAL_MASK); slots are identity while the id
+        // fits in seven bits, so an unaliased material table writes exactly
+        // the byte this line wrote before the palette existed.
+        byteV |= matFarPal(&materials, farSurfaceMat(&col, mat, fine, shift, T.seed));
+      }
+      // farOcc counts NON-EMPTY cells, which now includes blocker-only ones —
+      // it gates empty-space skipping for every far reader, and a reader that
+      // hits on the flag must not have its chunk skipped out from under it.
+      if (byteV != 0u) { count += 1u; top = max(top, yi + 1u); }
+      words[yi] |= byteV << (b * 8u);
+    }
   }
   let planeBase = ((level - 1u) * FAR_VOX + slot * CHUNK_VOL) / 4u;
-  var top = 0u;   // one plus the highest row with a non-empty cell, this thread
-  for (var yi = unrollFenceU(); yi < CHUNK; yi++) {
-    // The row's floor, shared by all four of its cells (cc.y is the same).
-    let yRow = (base.y + i32(yi)) << shift;
-    var word = 0u;
-    // The store below stays UNCONDITIONAL: this slot may hold the bytes of the
-    // level chunk that used to live in it, and a skipped row still has to be
-    // cleared to the air it now is.
-    if (yRow <= skyCeil) {
-      for (var b = unrollFenceU(); b < 4u; b++) {
-        let cc = base + vec3<i32>(i32(x0 + b), i32(yi), i32(zi));
-        // the sieve: fine-voxel center of the 2^shift-wide region this cell covers
-        let fine = (cc << vec3<u32>(shift)) + vec3<i32>(1 << (shift - 1u));
-        var col = cols[b];
-        let mat = genCellCol(&col, fine, T.seed) & 0xFFFu;
-        // The conservative flag first: it is what a cell keeps when the centre
-        // sample found nothing (common.wgsl FAR_BLOCKER_BIT). This is
-        // farBlockerBitAt flattened onto the hoisted `tops`/`btops` — see the
-        // comment above the b loop; the three bands are byte-identical.
-        var byteV = 0u;
-        if (yRow <= tops[b]) {
-          byteV = FAR_BLOCKER_BIT;
-        } else if (yRow - tops[b] < step) {
-          byteV = select(0u, FAR_BLOCKER_BIT, yRow <= btops[b]);
-        }
-        if (farCellIsSolid(mat)) {
-          // shape from the center sample, color from the surface skin (phase 4).
-          // What lands in the byte is the skin material's FAR PALETTE SLOT, not
-          // its id (common.wgsl FAR_PAL_MASK); slots are identity while the id
-          // fits in seven bits, so an unaliased material table writes exactly
-          // the byte this line wrote before the palette existed.
-          byteV |= matFarPal(&materials, farSurfaceMat(&col, mat, fine, shift, T.seed));
-        }
-        // farOcc counts NON-EMPTY cells, which now includes blocker-only ones —
-        // it gates empty-space skipping for every far reader, and a reader that
-        // hits on the flag must not have its chunk skipped out from under it.
-        if (byteV != 0u) { count += 1u; top = yi + 1u; }
-        word |= byteV << (b * 8u);
-      }
-    }
-    // The cell index in this level chunk is x + y*CHUNK + z*CHUNK*CHUNK (see the
-    // `farpatch` entry's unpack), so in words of four x-consecutive cells that
-    // is x/4 + y*(CHUNK/4) + z*(CHUNK*CHUNK/4). x0 is a multiple of 4, so byte
-    // `b` of the word is cell x0+b and the packing above is the same one the
-    // flat form used.
+  // The cell index in this level chunk is x + y*CHUNK + z*CHUNK*CHUNK (see the
+  // `farpatch` entry's unpack), so in words of four x-consecutive cells that is
+  // x/4 + y*(CHUNK/4) + z*(CHUNK*CHUNK/4). x0 is a multiple of 4, so byte `b`
+  // of the word is cell x0+b and the packing above is the same one the flat
+  // form used.
+  // Every row is stored UNCONDITIONALLY: this slot may hold the bytes of the
+  // level chunk that used to live in it, and a row above the sky ceiling still
+  // has to be cleared to the air it now is.
+  for (var yi = 0u; yi < CHUNK; yi++) {
     atomicStore(&farVox[planeBase + zi * (CHUNK * CHUNK / 4u) +
                         yi * (CHUNK / 4u) + li % 4u],
-                word);
+                words[yi]);
   }
   atomicAdd(&wgFarCount, count);
   atomicMax(&wgFarTop, top);
@@ -5336,7 +5414,24 @@ fn farpatch(@builtin(workgroup_id) wg : vec3<u32>,
   let pOff = farPatch[wg.x * 2u];
   let pCnt = farPatch[wg.x * 2u + 1u];
   var pnz = 0u;
-  for (var pi = li; pi < pCnt; pi += 64u) {
+  // ---- A CONTIGUOUS RUN PER THREAD, ONE COLUMN AT A TIME (2026-09-24) ------
+  // FarEdits::Lookup hands the payload over sorted COLUMN-MAJOR — (z, x, y) of
+  // the cell — so the cells of one (x, z) column are adjacent, and a thread
+  // that owns a contiguous run [p0, p1) walks them column by column. The
+  // column half (genColumn + the column top) is rebuilt only when the column
+  // changes: an edited level chunk is typically whole columns of patched
+  // cells, which used to cost one genColumn EACH (a strided pi += 64 loop
+  // never sees two cells of one column). The per-cell blocker flag stays
+  // per cell; its corner scan fires in at most one row per column.
+  let per = (pCnt + 63u) / 64u;
+  let p0 = min(li * per, pCnt);
+  let p1 = min(p0 + per, pCnt);
+  var pcol : Col;
+  var pTop = 0;
+  var haveCol = false;
+  var lastX = 0;
+  var lastZ = 0;
+  for (var pi = p0; pi < p1; pi++) {
     let e = farPatch[FAR_PATCH_BASE + pOff + pi];
     let ci = e & 0xFFFu;                       // cell index in this level chunk
     let pmat = (e >> 12u) & 0xFFFu;            // raw material at the sample voxel
@@ -5345,15 +5440,17 @@ fn farpatch(@builtin(workgroup_id) wg : vec3<u32>,
     let pcc = base + pl;
     let pfine = (pcc << vec3<u32>(shift)) + vec3<i32>(1 << (shift - 1u));
     // Its own genColumn: a patch cell is an arbitrary cell of this level
-    // chunk, so it shares no column with the sweep's four. Patches are rare
-    // (only cells the player edited), so this is the one place in the kernel
-    // that still pays a column per cell — and it pays it unconditionally,
-    // because the blocker flag is a property of the TERRAIN under the patch
-    // and has to survive a patch that clears the cell's material.
-    var pcol = genColumn(pfine.x, pfine.z, T.seed);
-    var byteV = farBlockerBitAt(
-        farColTopFrom(pcol.h, pcol.fluidTop, pfine.x, pfine.z, T.seed),
-        pcc, shift, T.seed);
+    // chunk, so it shares no column with the sweep's. It is paid even for a
+    // patch that clears the cell, because the blocker flag is a property of
+    // the TERRAIN under the patch and has to survive that.
+    if (!haveCol || pfine.x != lastX || pfine.z != lastZ) {
+      pcol = genColumn(pfine.x, pfine.z, T.seed);
+      pTop = farColTopFrom(pcol.h, pcol.fluidTop, pfine.x, pfine.z, T.seed);
+      lastX = pfine.x;
+      lastZ = pfine.z;
+      haveCol = true;
+    }
+    var byteV = farBlockerBitAt(pTop, pcc, shift, T.seed);
     if (farCellIsSolid(pmat)) {
       byteV |= matFarPal(&materials, farSurfaceMat(&pcol, pmat, pfine, shift, T.seed));
     }
@@ -5431,8 +5528,20 @@ fn fardown(@builtin(workgroup_id) wg : vec3<u32>,
   // ---- SKIP A CHUNK WHOSE FAR-VISIBLE MATTER HAS NOT CHANGED ----------------
   // Everything below writes a pure function of (the cells farCellIsSolid
   // keeps, procgen, the level origins). Procgen is fixed per coord, so if the
-  // kept cells and the origins match what this slot held at its last
-  // downsample, every byte would be rewritten with the value it already has.
+  // kept cells match what this slot held at its last downsample, every byte
+  // would be rewritten with the value it already has.
+  //
+  // THE ORIGINS ARE NOT IN THE SIGNATURE (2026-09-24). They used to be — all
+  // eight hashed in — so every level-1 origin step (one per 32 voxels walked)
+  // re-downsampled every dirty chunk into all eight levels. What an origin
+  // step can actually change for a RESIDENT chunk is narrower: its cells are
+  // inside every level's box in steady state (level 1's box is twice the
+  // window), so farInBox does not flip for them, and their bytes are only
+  // ever overwritten by a sieve refill of a plane or level that covers the
+  // window. FarField raises the farSig clear for exactly those — a reset, and
+  // a plane whose slab intersects the residency window — when that refill has
+  // been DISPATCHED, which is also the moment the clear stops racing it
+  // (farfield.cpp PrepareTick).
   // The dirty list cannot say that on its own: a chunk awake only for SMOKE
   // (a burning forest's ~5,000 of them, 2026-09-22) changes nothing here,
   // because gas never reaches the cascade.
@@ -5449,10 +5558,15 @@ fn fardown(@builtin(workgroup_id) wg : vec3<u32>,
   var acc = 0u;
   let pe = pageTable[slot];
   if ((pe & PT_SENTINEL_BIT) != 0u) {
+    // A sentinel is ONE material everywhere, so its signature is a function of
+    // that material alone and needs no 4,096-cell sum: one closed-form term,
+    // added once. It is deliberately NOT the sum a materialized page of the
+    // same content would give — that sum has no closed form — so a sentinel
+    // that materializes costs one redundant downsample, the direction this
+    // skip is allowed to err in. EMPTY (and any non-far-visible material)
+    // still contributes 0, exactly like an all-air page.
     let m = pe & PT_MAT_MASK;
-    if (farCellIsSolid(m)) {
-      for (var i = li; i < CHUNK_VOL; i += 64u) { acc += pcg((m << 12u) | i); }
-    }
+    if (li == 0u && farCellIsSolid(m)) { acc = pcg(m ^ 0x5E17A1u); }
   } else {
     let pageBase = pe * CHUNK_VOL;
     for (var i = li; i < CHUNK_VOL; i += 64u) {
@@ -5463,11 +5577,10 @@ fn fardown(@builtin(workgroup_id) wg : vec3<u32>,
   atomicAdd(&wgFarCount, acc);
   workgroupBarrier();
   if (li == 0u) {
-    var sig = hash3(u32(wc.x), u32(wc.y), u32(wc.z)) ^ atomicLoad(&wgFarCount);
-    for (var k = 0u; k < FAR_LEVELS; k++) {
-      let o = F.origins[k].xyz;
-      sig = pcg(sig ^ hash3(u32(o.x), u32(o.y), u32(o.z)));
-    }
+    // The world chunk coord stays in: a slot is REUSED by another chunk after a
+    // window shift, and the same content in a different place writes
+    // different cells.
+    var sig = pcg(hash3(u32(wc.x), u32(wc.y), u32(wc.z)) ^ atomicLoad(&wgFarCount));
     sig = max(sig, 1u);   // 0 is "never downsampled" (zeroed buffer)
     let same = farSig[slot] == sig;
     farSig[slot] = sig;

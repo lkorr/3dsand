@@ -193,14 +193,9 @@ void FarPlumes::NoteUniformChunk(IVec3 wc, uint32_t mat) {
 }
 
 namespace {
-// One candidate emitter with its rank. Distance is squared euclidean from the
-// window centre; the BAND it falls in is decided by the max norm, which is a
-// different metric on purpose (see the header).
-struct Ranked {
-  int64_t d2;
-  FarPlumes::Emitter e;
-  uint32_t w8;   // crossfade weight 0..255 (world.h kGasFarBlendVox)
-};
+// One candidate emitter with its rank (FarPlumes::Ranked, in the header only
+// because Build keeps its scratch vectors as members).
+using Ranked = FarPlumes::Ranked;
 // A smoothstep in the 0..255 the record's top byte carries. Used for BOTH
 // crossfade shells, because a linear weight leaves a slope discontinuity at
 // each end of a shell and a slope discontinuity in a plume's brightness is
@@ -253,11 +248,21 @@ void FarPlumes::Build(IVec3 windowOriginChunks, int32_t rangeVox) {
       hasEye_ && (std::abs(eye_.x - builtEye_.x) >= kGasFarEyeStepVox ||
                   std::abs(eye_.y - builtEye_.y) >= kGasFarEyeStepVox ||
                   std::abs(eye_.z - builtEye_.z) >= kGasFarEyeStepVox);
-  if (!dirty_ && !(eyeMoved && !byChunk_.empty()) &&
-      windowOriginChunks.x == builtOrigin_.x &&
-      windowOriginChunks.y == builtOrigin_.y &&
-      windowOriginChunks.z == builtOrigin_.z && rangeVox == builtRange_)
-    return;
+  // ---- WHAT AN EYE-ONLY MOVE MAY SKIP (2026-09-24) -------------------------
+  // Everything but the crossfade WEIGHTS is a function of (index, window
+  // origin, range): which chunks are resident, each emitter's distance from
+  // the window centre and which box it is inside. The eye moves every tick a
+  // player walks and earned a rebuild every kGasFarEyeStepVox, which re-walked
+  // the whole hash map and redid all of that for weights alone. `geo_` caches
+  // it; only a changed index, origin or range rebuilds it. Its order is the
+  // map's iteration order at build time, and the map is unchanged until
+  // dirty_ is raised, so the candidates arrive in exactly the order the
+  // full walk produced them — the output image is byte-identical.
+  const bool geoStale = dirty_ || windowOriginChunks.x != builtOrigin_.x ||
+                        windowOriginChunks.y != builtOrigin_.y ||
+                        windowOriginChunks.z != builtOrigin_.z ||
+                        rangeVox != builtRange_;
+  if (!geoStale && !(eyeMoved && !byChunk_.empty())) return;
   dirty_ = false;
   builtOrigin_ = windowOriginChunks;
   builtRange_ = rangeVox;
@@ -308,6 +313,39 @@ void FarPlumes::Build(IVec3 windowOriginChunks, int32_t rangeVox) {
   const int wideFadeEnd = wideEnd - slack;
   const int wideFadeStart = wideFadeEnd - kGasFarRangeFadeVox;
 
+  // ---- THE GEOMETRY: rebuilt only when the index, origin or range moved ---
+  if (geoStale) {
+    geo_.clear();
+    geo_.reserve(byChunk_.size() * 2);
+    resident_.clear();
+    for (const auto& kv : byChunk_) {
+      const IVec3 wc{kv.first.x, kv.first.y, kv.first.z};
+      // RESIDENT CHUNKS ARE DROPPED. A fire inside the window is a running
+      // fire: the CA makes real smoke voxels for it, sim_step splats those
+      // into the fine box, and an emitter on top would draw the plume twice.
+      // This is also what retires an emitter when the player walks back to a
+      // fire -- no event is needed, the test simply stops passing.
+      if (ChunkInWindow(wc, windowOriginChunks)) {
+        if (PlumeDebug()) resident_.push_back(kv.first);
+        continue;
+      }
+      for (const Emitter& e : kv.second) {
+        const int dx = e.x - cx, dy = e.y - cy, dz = e.z - cz;
+        const int mx =
+            std::max(std::abs(dx), std::max(std::abs(dy), std::abs(dz)));
+        Geo g;
+        g.e = e;
+        g.key = kv.first;
+        g.d2 = (int64_t)dx * dx + (int64_t)dy * dy + (int64_t)dz * dz;
+        g.nearFine = mx < fineHalf;
+        g.inFine = g.nearFine && InBox({e.x, e.y, e.z}, ov);
+        g.inWide = rangeVox > 0 && mx <= rangeVox && InWideBox({e.x, e.y, e.z}, wov);
+        g.outOfRange = rangeVox <= 0 || mx > rangeVox;
+        geo_.push_back(g);
+      }
+    }
+  }
+
   // ---- PASS 1: one candidate per emitter, no caps applied yet -------------
   // The caps used to be applied AFTER the wide aggregation had already run
   // inline in this loop, which made the fine cap a silent DELETE: the 257th
@@ -315,67 +353,55 @@ void FarPlumes::Build(IVec3 windowOriginChunks, int32_t rangeVox) {
   // so three or four trees exhausted the fine list and every other fire in the
   // world went out. Deciding membership first and aggregating second is what
   // lets an overflowing fine list fall back to the WIDE one instead.
-  struct Cand {
-    Emitter e;
-    int64_t d2;
-    uint32_t wFine;   // 0 = cannot be in the fine section at all
-    uint32_t outer;   // 0..255 wide-list outer fade; 0 = not wide-eligible
-  };
-  std::vector<Cand> cand;
-  cand.reserve(byChunk_.size() * 2);
-
-  for (const auto& kv : byChunk_) {
-    const IVec3 wc{kv.first.x, kv.first.y, kv.first.z};
-    // RESIDENT CHUNKS ARE DROPPED. A fire inside the window is a running fire:
-    // the CA makes real smoke voxels for it, sim_step splats those into the
-    // fine box, and an emitter on top would draw the plume twice. This is also
-    // what retires an emitter when the player walks back to a fire -- no event
-    // is needed, the test simply stops passing.
-    uint8_t band = 0;
-    if (ChunkInWindow(wc, windowOriginChunks)) band = 1;
-    for (const Emitter& e : kv.second) {
-      if (band == 1) break;
-      const int dx = e.x - cx, dy = e.y - cy, dz = e.z - cz;
-      const int mx = std::max(std::abs(dx), std::max(std::abs(dy), std::abs(dz)));
-      const int64_t d2 = (int64_t)dx * dx + (int64_t)dy * dy + (int64_t)dz * dz;
-      // The WEIGHT's distance, from the eye. `mx` decides membership; `dv`
-      // decides how much. They are the same number when no eye is set.
-      const int dv = std::max(std::abs(e.x - ex),
-                              std::max(std::abs(e.y - ey), std::abs(e.z - ez)));
-      // THE CROSSFADE SHELL (world.h kGasFarBlendVox): inside the fine box's
-      // face by less than the shell, an emitter is in BOTH lists with weights
-      // that sum to one. Past the face it is wide only; deeper in, fine only.
-      uint32_t wFine = 0;
-      if (mx < fineHalf && InBox({e.x, e.y, e.z}, ov)) {
-        wFine = dv > fineFadeIn
-                    ? 255u - Smooth255(dv - fineFadeIn, fineFadeOut - fineFadeIn)
-                    : 255u;
-        if (wFine != 0) band = 2;
-      } else if (mx < fineHalf) {
-        band = 5;
-      }
-      // ...and the WIDE side of the same emitter, which is the complement of
-      // that times its own outer fade. `outer` is kept SEPARATE from the
-      // complement because the promotion below raises the complement to 255
-      // and must not lose the fade along with it.
-      uint32_t outer = 0;
-      if (rangeVox > 0 && mx <= rangeVox && InWideBox({e.x, e.y, e.z}, wov)) {
-        // THE OUTER SHELL (world.h kGasFarRangeFadeVox): the wide list's own
-        // far edge, faded to nothing instead of clipped. Applied BEFORE the
-        // aggregation so a coarse cell straddling the edge fades by how much
-        // of its fire is past it, which is the same rule the inner shell's
-        // strength-weighted mean follows.
-        outer = dv > wideFadeStart
-                    ? 255u - Smooth255(dv - wideFadeStart, kGasFarRangeFadeVox)
-                    : 255u;
-        if (outer != 0 && wFine != 255) band = band == 2 ? 6 : 3;
-      } else if (band != 2) {
-        band = (rangeVox <= 0 || mx > rangeVox) ? 4 : 5;
-      }
-      if (wFine == 0 && outer == 0) continue;
-      cand.push_back({e, d2, wFine, outer});
+  std::vector<Cand>& cand = cand_;
+  cand.clear();
+  if (PlumeDebug())
+    for (const Key& k : resident_) dbgBand_[k] = 1;
+  uint8_t band = 0;
+  for (size_t gi = 0; gi < geo_.size(); gi++) {
+    const Geo& g = geo_[gi];
+    const Emitter& e = g.e;
+    // The debug band is per CHUNK, and a chunk's emitters are contiguous in
+    // geo_ (the map is walked chunk by chunk): start each chunk at 0.
+    if (gi == 0 || !(geo_[gi - 1].key == g.key)) band = 0;
+    // The WEIGHT's distance, from the eye. Membership was decided from the
+    // window centre (geo_); `dv` decides how much. They are the same number
+    // when no eye is set.
+    const int dv = std::max(std::abs(e.x - ex),
+                            std::max(std::abs(e.y - ey), std::abs(e.z - ez)));
+    // THE CROSSFADE SHELL (world.h kGasFarBlendVox): inside the fine box's
+    // face by less than the shell, an emitter is in BOTH lists with weights
+    // that sum to one. Past the face it is wide only; deeper in, fine only.
+    uint32_t wFine = 0;
+    if (g.inFine) {
+      wFine = dv > fineFadeIn
+                  ? 255u - Smooth255(dv - fineFadeIn, fineFadeOut - fineFadeIn)
+                  : 255u;
+      if (wFine != 0) band = 2;
+    } else if (g.nearFine) {
+      band = 5;
     }
-    if (PlumeDebug()) dbgBand_[kv.first] = band;
+    // ...and the WIDE side of the same emitter, which is the complement of
+    // that times its own outer fade. `outer` is kept SEPARATE from the
+    // complement because the promotion below raises the complement to 255
+    // and must not lose the fade along with it.
+    uint32_t outer = 0;
+    if (g.inWide) {
+      // THE OUTER SHELL (world.h kGasFarRangeFadeVox): the wide list's own
+      // far edge, faded to nothing instead of clipped. Applied BEFORE the
+      // aggregation so a coarse cell straddling the edge fades by how much
+      // of its fire is past it, which is the same rule the inner shell's
+      // strength-weighted mean follows.
+      outer = dv > wideFadeStart
+                  ? 255u - Smooth255(dv - wideFadeStart, kGasFarRangeFadeVox)
+                  : 255u;
+      if (outer != 0 && wFine != 255) band = band == 2 ? 6 : 3;
+    } else if (band != 2) {
+      band = g.outOfRange ? 4 : 5;
+    }
+    if (PlumeDebug()) dbgBand_[g.key] = band;
+    if (wFine == 0 && outer == 0) continue;
+    cand.push_back({e, g.d2, wFine, outer});
   }
 
   if (PlumeDebug()) {
@@ -405,7 +431,8 @@ void FarPlumes::Build(IVec3 windowOriginChunks, int32_t rangeVox) {
   // 0.8 m column still gets a 6.4 m one -- where before it was silence, and it
   // is why "a big fire deletes every other fire's smoke" is no longer
   // reachable through this cap.
-  std::vector<Ranked> fine;
+  std::vector<Ranked>& fine = fine_;
+  fine.clear();
   fine.reserve(cand.size());
   for (size_t i = 0; i < cand.size(); i++)
     if (cand[i].wFine != 0) fine.push_back({cand[i].d2, cand[i].e, (uint32_t)i});
@@ -440,11 +467,14 @@ void FarPlumes::Build(IVec3 windowOriginChunks, int32_t rangeVox) {
   // clamped to CHORD^2) are what keep a huge aggregate from drawing a huge
   // plume -- it draws ONE fat column instead of many, which is the LOD answer
   // to "more fires than the list can name".
-  struct WideAgg { Emitter e; uint64_t sw; };
-  std::vector<Ranked> wideRanked;
+  std::vector<Ranked>& wideRanked = wideRanked_;
   uint32_t extraShift = 0;
   for (;; extraShift++) {
-    std::unordered_map<Key, WideAgg, KeyHash> wide;
+    // Reused, not rebuilt: clear() keeps the bucket array, so a steady fire
+    // field costs no allocation per build. The output is sorted by a total
+    // order (RankLess) below, so the map's iteration order never reaches it.
+    std::unordered_map<Key, WideAgg, KeyHash>& wide = wide_;
+    wide.clear();
     for (const Cand& c : cand) {
       const uint32_t w = (255u - c.wFine) * c.outer / 255u;
       if (w == 0) continue;
