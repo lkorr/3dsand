@@ -3973,6 +3973,15 @@ void Mob::StopClip(const std::string& name) {
     if (inst.clip == ci) inst.stopping = true;
 }
 
+float Mob::ClipWeight(const std::string& name) const {
+  const int ci = skel_.FindClip(name);
+  float w = 0.0f;
+  if (ci < 0) return w;
+  for (const ClipInstance& inst : anim_.clips)
+    if (inst.clip == ci) w += inst.weight * inst.fade;
+  return w;
+}
+
 void Mob::PlayClipIndex(int ci) {
   if (ci < 0 || ci >= (int)skel_.clips.size()) return;
   for (ClipInstance& inst : anim_.clips)

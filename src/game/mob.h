@@ -2034,6 +2034,8 @@ class Mob {
   // Blend out every running instance of `name` (a looping hold, e.g. the
   // throw wind-up, that only its owner knows when to end). No-op if absent.
   void StopClip(const std::string& name);
+  // Summed weight x fade of the running instances of `name`; 0 when none.
+  float ClipWeight(const std::string& name) const;
 
   // ---- holding an item (THE ENTITY<->SLOT SYNC SEAM; see game/avatar.h) ----
   // Equipping BORROWS A RIG SLOT: the item's geometry fills a real MobLimb

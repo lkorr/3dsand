@@ -1815,6 +1815,14 @@ constexpr int kGhostReviveTick = 240;  // ...alive again from here
 // not a target and the creature correctly drops it, so sampling at tick 300
 // would be asserting the re-acquisition timer rather than the band.
 constexpr int kGhostTargetProbeTick = 190;
+// ONE THROW, as the owner's session reports it: drawing, then the release's
+// swing (3 ticks, PlayerSession::throwLaunchIn). Probed a few ticks into each
+// level, past the clip's blend-in start.
+constexpr int kGhostThrowDrawFrom = 20;
+constexpr int kGhostThrowSwingFrom = 32;
+constexpr int kGhostThrowSwingTo = 35;
+constexpr int kGhostThrowDrawProbe = 28;
+constexpr int kGhostThrowSwingProbe = 33;
 
 // What one arm measured.
 struct GhostArm {
@@ -1835,6 +1843,8 @@ struct GhostArm {
   bool mobBrain = false;
   bool combatantOk = false;
   float mobToGhost = 0, mobToLocal = 0;
+  float windupW = 0, throwW = 0;        // the ghost's clip weights at the probes
+  float windupAfterRelease = -1;        // wind-up weight at the swing probe
   std::vector<uint32_t> hashes;
   std::string why;
 };
@@ -1870,6 +1880,10 @@ PlayerState GhostScript(int tick, const IVec3& site, uint32_t seed) {
          tick >= kGhostCrouchFrom && tick < kGhostCrouchTo);
   // The other one-tick edge, same rule: one tick only.
   if (tick == kGhostLandTick) st.impactDeltaV = Vec3{0, -kGhostLandDeltaV, 0};
+  st.Set(PlayerState::kThrowDraw,
+         tick >= kGhostThrowDrawFrom && tick < kGhostThrowSwingFrom);
+  st.Set(PlayerState::kThrowSwing,
+         tick >= kGhostThrowSwingFrom && tick < kGhostThrowSwingTo);
   st.health = 100;
   return st;
 }
@@ -2058,6 +2072,13 @@ void RunGhostArm(Ctx& c, GhostArm& a) {
         }
       }
     }
+    if (i == kGhostThrowDrawProbe)
+      a.windupW = ghost.avatar.ClipWeight("throw_windup");
+    if (i == kGhostThrowSwingProbe) {
+      a.throwW = ghost.avatar.ClipWeight("throw");
+      // Stopping, not gone: a released wind-up blends out over the swing.
+      a.windupAfterRelease = ghost.avatar.ClipWeight("throw_windup");
+    }
     if (i == kGhostTargetProbeTick) {
       const ai::Brain* br = c.mobs.MobBrain(a.mobId);
       a.mobBrain = br != nullptr;
@@ -2143,16 +2164,21 @@ Status GateRemoteGhost(Ctx& c, std::string& detail) {
   RecordObserved("remoteGhost.firstDiscardTick", (double)a.firstDiscardTick);
   RecordObserved("remoteGhost.leakedOps", (double)a.leaked);
 
-  const bool ok =
-      spawnOk && posOk && lifeOk && targetOk && triedOk && noLeakOk && detOk;
-  char buf[760];
+  // (7) THE OTHER PLAYER SEES YOU THROW: the wire's throw levels drive the
+  // same clips on the ghost's rig that session.cpp plays on the owner's.
+  const bool throwOk = a.windupW > 0.0f && a.throwW > 0.0f;
+
+  const bool ok = spawnOk && posOk && lifeOk && targetOk && triedOk &&
+                  noLeakOk && detOk && throwOk;
+  char buf[900];
   std::snprintf(
       buf, sizeof buf,
       "%d ticks x2: spawned tick %d (want <= 2) | worst root-vs-state %.4f vox "
       "at tick %d over %d samples (tol %.2f) | dead %d..%d held %d, revived %d "
       "| authored %llu ops, ALL discarded (first at tick %d), leaked %llu | "
       "mob %llu targets %llx (want %llx) at tick %d, d(ghost)=%.1f "
-      "d(local)=%.1f, band resolves %d | hashes %zu %s",
+      "d(local)=%.1f, band resolves %d | throw clips on the ghost: wind-up "
+      "%.2f, throw %.2f (wind-up %.2f after release) | hashes %zu %s",
       kGhostTicks, a.spawnTick, a.worstPosErr, a.worstPosErrTick, a.posSamples,
       posTol,
       kGhostDieTick, kGhostReviveTick, a.deadWhileDead ? 1 : 0,
@@ -2160,7 +2186,8 @@ Status GateRemoteGhost(Ctx& c, std::string& detail) {
       a.firstDiscardTick, (unsigned long long)a.leaked,
       (unsigned long long)a.mobId, (unsigned long long)a.mobTarget,
       (unsigned long long)(ai::kPlayerActorBase + 1), kGhostTargetProbeTick,
-      a.mobToGhost, a.mobToLocal, a.combatantOk ? 1 : 0, a.hashes.size(),
+      a.mobToGhost, a.mobToLocal, a.combatantOk ? 1 : 0, a.windupW, a.throwW,
+      a.windupAfterRelease, a.hashes.size(),
       detOk ? "reproduced" : "DIVERGED between the two runs");
   detail = buf;
   std::printf("remote ghost: %s (%s)\n", ok ? "PASS" : "FAIL", buf);
