@@ -1763,10 +1763,16 @@ static void PhaseH(TickAuthorityCtx& w, WorldScratch& ws,
       // sim/reactcpu.h for why the CPU has to agree with the GPU here.
       mobs.SetDayPhase(DayPhaseNow(tick));
       debris.SetDayPhase(DayPhaseNow(tick));
-      // ...and the weather, from the one function that also puts it on
-      // TickParams (weather::SimRainWord), for the same reason.
-      mobs.SetWeatherRain(weather::SimRainWord(CurrentTuning(), kDefaultSeed, tick));
-      debris.SetWeatherRain(weather::SimRainWord(CurrentTuning(), kDefaultSeed, tick));
+      // ...and the weather: the tick's rain word, LATCHED here once and taken
+      // by SubmitTick for TickParams (weather::TakeTickRain), so the body
+      // reactions and the GPU kernels read one value even if the weather pin
+      // moves between here and the submit.
+      {
+        const uint32_t rainWord =
+            weather::LatchTickRain(CurrentTuning(), kDefaultSeed, tick);
+        mobs.SetWeatherRain(rainWord);
+        debris.SetWeatherRain(rainWord);
+      }
 
       // ---- BROKEN VESSELS (game/container.h ContainerShouldBreak) -----------
       //

@@ -11546,12 +11546,13 @@ int main(int argc, char** argv) {
           (taaOn && CurrentTuning().render.taaSharpLod != 0) ? (float)ctx.height
                                                              : (float)renderH;
       auto writeMainRenderParams = [&] {
+        // renderW x renderH is the target, whatever viewPx says for LOD.
         WriteRenderParams(ctx.queue, world, eye, jcam,
                           (float)ctx.width / (float)ctx.height, ui.shadows,
                           (float)now, fogSmooth, viewPxThisFrame, tick,
                           fluidCount,
                           (float)(accumulator / kTickDt),
-                          ui.showDirtyVoxels ? 2u : 0u);
+                          ui.showDirtyVoxels ? 2u : 0u, renderW, renderH);
       };
       writeMainRenderParams();
       // actVoxViz is filled GPU-side by sim_step.wgsl when vizActive is set;
@@ -13600,10 +13601,15 @@ int main(int argc, char** argv) {
         bodyReg.BuildMicroInsts(microInsts);
         const uint32_t pMicro = sim.UploadMicroBodyInsts(ctx.queue, microInsts);
 
+        // auxView: the portrait is drawn INSIDE the main view's frame, so it
+        // must not touch the main view's cloud history or weather ease (see
+        // WriteRenderParams in test/support.h).
         WriteRenderParams(ctx.queue, world, portraitCam.eye, portraitCam.cam,
                           portraitCam.aspect, /*shadows=*/true, (float)now,
                           /*fogDensity=*/0.0f, (float)kPortraitH,
-                          kPortraitLightTick);
+                          kPortraitLightTick, /*fluidCount=*/0,
+                          /*frameFrac=*/0.0f, /*extraFlags=*/0u, kPortraitW,
+                          kPortraitH, /*auxView=*/true);
         rhi::CommandEncoder pEnc = ctx.device.CreateCommandEncoder();
         // Near-black indigo, the panel's own deepest tone, so the portrait
         // reads as an inset rather than as a hole punched in the sheet.

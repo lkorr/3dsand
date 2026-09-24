@@ -540,6 +540,16 @@ fn hazeGrey() -> vec3f {
           Lt.col * TUNE_CLOUD_SUN_GAIN * 0.13) * (1.0 - C.darkness * 0.5);
 }
 
+// Three Gaussian bands at once: exp(-((x - c) / w)^2) per channel. Squared by
+// multiplication, NOT pow(v, 2.0): pow is undefined for a negative base in
+// WGSL/SPIR-V (GLSL.std.450 Pow), and x - c is negative on one side of every
+// band — a driver that returns NaN there puts NaN into the cloud history,
+// which the temporal resolve then keeps.
+fn gaussBands(x : f32, c : vec3f, w : vec3f) -> vec3f {
+  let g = (vec3f(x) - c) / w;
+  return exp(-(g * g));
+}
+
 // The cirrus veil: one analytic sample on the high shell, no march. Thin,
 // streaked along the wind, lit mostly by forward scattering — and the 22°
 // HALO when the sun shines through it (plan §3, a ring and three smoothsteps).
@@ -569,9 +579,8 @@ fn cirrusLayer(rd : vec3f, Lt : CloudLight, mu : f32) -> March {
   // ~22°, and dispersion puts red on the inside edge. Three rings a hair apart
   // are that spectrum.
   let ang = acos(clamp(mu, -1.0, 1.0));
-  let ring = vec3f(exp(-pow((ang - 0.3815) / 0.010, 2.0)),
-                   exp(-pow((ang - 0.3850) / 0.011, 2.0)),
-                   exp(-pow((ang - 0.3890) / 0.013, 2.0)));
+  let ring = gaussBands(ang, vec3f(0.3815, 0.3850, 0.3890),
+                        vec3f(0.010, 0.011, 0.013));
   col += Lt.col * ring * 0.9;
   o.c = col * alpha;
   o.t = 1.0 - alpha;
@@ -597,12 +606,10 @@ fn rainLayer(rd : vec3f, Lt : CloudLight, mu : f32, tMax : f32, jit : f32) -> Ma
   // Rainbow: primary bow at 42° (138° from the sun), secondary at 51° with
   // the colours reversed and a dark Alexander band between. Needs the sun up.
   let ang = acos(clamp(-mu, -1.0, 1.0));
-  let bowP = vec3f(exp(-pow((ang - 0.7400) / 0.012, 2.0)),
-                   exp(-pow((ang - 0.7260) / 0.012, 2.0)),
-                   exp(-pow((ang - 0.7090) / 0.013, 2.0)));
-  let bowS = vec3f(exp(-pow((ang - 0.8900) / 0.016, 2.0)),
-                   exp(-pow((ang - 0.9080) / 0.016, 2.0)),
-                   exp(-pow((ang - 0.9290) / 0.017, 2.0))) * 0.35;
+  let bowP = gaussBands(ang, vec3f(0.7400, 0.7260, 0.7090),
+                        vec3f(0.012, 0.012, 0.013));
+  let bowS = gaussBands(ang, vec3f(0.8900, 0.9080, 0.9290),
+                        vec3f(0.016, 0.016, 0.017)) * 0.35;
   // A real bow is faint against the curtain it stands in: ~a third of the
   // curtain's own brightness at its peak, less toward the sides.
   let bow = (bowP + bowS) * 0.15 * TUNE_CLOUD_RAINBOW * smoothstep(0.0, 0.06, R.sunDir.y) *

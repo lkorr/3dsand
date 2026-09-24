@@ -2793,7 +2793,12 @@ void Simulation::BuildRenderBindGroup(rhi::BindGroup& out,
 // caches are keyed, so alternating a native frame with a smaller --shot or
 // portrait never reallocates; a rebuilt renderBG_ is the only side effect.
 void Simulation::EnsureVeil(uint32_t width, uint32_t height) {
-  const uint64_t px = (uint64_t)width * height;
+  // Row pitch is veilBase's, not the target's (renderspec.h LastVeilPitch):
+  // they differ under TAA + taaSharpLod, and a buffer of width x height then
+  // dropped every row past height * width / pitch.
+  const uint64_t pitch =
+      std::max<uint64_t>(width, (uint64_t)sandvox::LastVeilPitch() + 1u);
+  const uint64_t px = pitch * height;
   if (px <= veilPixels_) return;
   veilPixels_ = px;
   veilBuf_ = CreateBuffer(device_, px * 6 * 4, rhi::BufferUsage::Storage,

@@ -480,6 +480,16 @@ void ReplaceGasIfReplaying(uint32_t tick, std::vector<GasSpawnOp>& gas) {
   gas.clear();
 }
 
+bool RecordedWeatherRain(uint32_t tick, uint32_t& word) {
+  if (!g_replay) return false;
+  for (const Frame& f : g_replay->frames) {
+    if (f.in.tick != tick) continue;
+    word = f.tp.weatherRain;
+    return true;
+  }
+  return false;
+}
+
 bool Log::Load(const std::string& path, const std::vector<MaterialDef>& mats,
                std::string& err) {
   frames.clear();

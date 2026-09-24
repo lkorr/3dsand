@@ -78,7 +78,6 @@ bool ReadPreset(const std::string& path, Preset& p, std::string& err) {
   num("precipType", p.precipType, 0.0f, 1.0f);
   num("mist", p.mist, 0.0f, 20.0f);
   num("lightning", p.lightning, 0.0f, 60.0f);
-  num("windShear", p.windShear, 0.0f, 10.0f);
   if (p.label.empty()) p.label = p.name;
   return true;
 }
@@ -181,10 +180,16 @@ float GroundPrecip(const Preset& p) {
 float WetnessAt(const Tuning& tn, const std::vector<Preset>& ps, uint32_t seed,
                 double ts, const Preset* ov, const Preset& now) {
   const float dry = std::max(5.0f, tn.weather.drySeconds);
+  // exp(-k/4), k = 1..8, as LITERALS: this sum feeds SimRainWord's wetness
+  // byte, which is hashed sim input, and a CRT exp() is not guaranteed to
+  // round the same on every CPU / runtime. Basic IEEE arithmetic is.
+  static constexpr float kDecay[8] = {
+      0.77880078f, 0.60653066f, 0.47236655f, 0.36787944f,
+      0.28650480f, 0.22313016f, 0.17377394f, 0.13533528f};
   float acc = GroundPrecip(now), wsum = 1.0f;
   for (int k = 1; k <= 8; k++) {
     const double back = (double)k * dry / 4.0;
-    const float wk = std::exp(-(float)k / 4.0f);
+    const float wk = kDecay[k - 1];
     Preset p = ov ? *ov : Scheduled(tn, ps, seed, ts - back, nullptr, nullptr, nullptr);
     acc += GroundPrecip(p) * wk;
     wsum += wk;
@@ -195,7 +200,11 @@ float WetnessAt(const Tuning& tn, const std::vector<Preset>& ps, uint32_t seed,
 }
 
 std::string gOverride;
+bool gEnvPinRead = false;
 uint32_t gLastSimWord = 0;
+bool gRainLatched = false;
+uint32_t gRainLatchTick = 0;
+uint32_t gRainLatchWord = 0;
 State gLast;
 Preset gEased;
 bool gEasedValid = false;
@@ -221,13 +230,27 @@ Preset Lerp(const Preset& a, const Preset& b, float tIn) {
   o.precipType = L(a.precipType, b.precipType);
   o.mist = L(a.mist, b.mist);
   o.lightning = L(a.lightning, b.lightning);
-  o.windShear = L(a.windShear, b.windShear);
   return o;
+}
+
+// SANDVOX_WEATHER=<preset> pins the sky for a whole run -- the headless handle
+// for --shot / --verify look iteration, the same shape SANDVOX_SHORT_RANGE is.
+// Read ONCE, as the initial override, so the dev panel can still change it;
+// and EAGERLY -- at preset load or the first override access, whichever comes
+// first -- so the tick stream sees the pin from tick 0, not from the first
+// frame that happened to resolve the sky.
+static void EnsureEnvPin() {
+  if (gEnvPinRead) return;
+  gEnvPinRead = true;
+  if (const char* e = std::getenv("SANDVOX_WEATHER")) {
+    if (e[0]) gOverride = e;
+  }
 }
 
 void Library::EnsureLoaded() {
   if (loaded_) return;
   loaded_ = true;
+  EnsureEnvPin();
   presets_.clear();
   warnings_.clear();
   namespace fs = std::filesystem;
@@ -283,27 +306,20 @@ Library& Presets() {
   return lib;
 }
 
-void SetOverride(const std::string& name) { gOverride = name; }
-const std::string& Override() { return gOverride; }
-
-// SANDVOX_WEATHER=<preset> pins the sky for a whole run — the headless handle
-// for --shot / --verify look iteration, the same shape SANDVOX_SHORT_RANGE is.
-// Read once, as the initial override, so the dev panel can still change it.
-namespace {
-struct EnvPin {
-  EnvPin() {
-    if (const char* e = std::getenv("SANDVOX_WEATHER")) {
-      if (e[0]) gOverride = e;
-    }
-  }
-};
-}  // namespace
+void SetOverride(const std::string& name) {
+  EnsureEnvPin();  // an explicit pin set first must not be clobbered later
+  gOverride = name;
+}
+const std::string& Override() {
+  EnsureEnvPin();
+  return gOverride;
+}
 
 State Resolve(const Tuning& tn, uint32_t seed, double ts, float dt, float camXM,
-              float camZM) {
+              float camZM, bool commit) {
   (void)camXM;
   (void)camZM;
-  static EnvPin pin;
+  EnsureEnvPin();
   State s;
   s.enabled = tn.weather.clouds;
   const std::vector<Preset>& ps = Presets().Presets();
@@ -326,7 +342,10 @@ State Resolve(const Tuning& tn, uint32_t seed, double ts, float dt, float camXM,
   // is a CUT — the dev panel pinning a preset, or handing the sky back. That is
   // eased in FRAME time over transitionSeconds. A headless path passes dt = 0
   // and snaps, which is what makes --shot of a pinned preset show the preset.
-  if (!gEasedValid || dt <= 0.0f) {
+  if (!commit) {
+    // A peek: the main view's sky as it stands, nothing written.
+    s.mix = gEasedValid ? gEased : target;
+  } else if (!gEasedValid || dt <= 0.0f) {
     gEased = target;
     gEasedValid = true;
   } else {
@@ -337,7 +356,7 @@ State Resolve(const Tuning& tn, uint32_t seed, double ts, float dt, float camXM,
     gEased.label = target.label;
   }
   (void)targetKey;
-  s.mix = gEased;
+  if (commit) s.mix = gEased;
 
   // Global knobs on top of whatever the sky is doing.
   s.mix.coverage = std::clamp(s.mix.coverage + tn.weather.coverageBias, 0.0f, 1.0f);
@@ -400,13 +419,14 @@ State Resolve(const Tuning& tn, uint32_t seed, double ts, float dt, float camXM,
     s.wetness = 0.0f;
     s.flash = 0.0f;
   }
-  gLast = s;
+  if (commit) gLast = s;
   return s;
 }
 
 const State& Last() { return gLast; }
 
 uint32_t SimRainWord(const Tuning& tn, uint32_t seed, uint32_t tick) {
+  EnsureEnvPin();
   if (!tn.weather.clouds || !tn.weather.rainTouchesWorld) return 0u;
   const std::vector<Preset>& ps = Presets().Presets();
   const double ts = (double)tick / 30.0;
@@ -429,6 +449,23 @@ uint32_t SimRainWord(const Tuning& tn, uint32_t seed, uint32_t tick) {
 }
 
 uint32_t LastSimRainWord() { return gLastSimWord; }
+
+uint32_t LatchTickRain(const Tuning& tn, uint32_t seed, uint32_t tick) {
+  gRainLatchWord = SimRainWord(tn, seed, tick);
+  gRainLatchTick = tick;
+  gRainLatched = true;
+  return gRainLatchWord;
+}
+
+uint32_t TakeTickRain(const Tuning& tn, uint32_t seed, uint32_t tick) {
+  if (gRainLatched && gRainLatchTick == tick) {
+    gRainLatched = false;
+    gLastSimWord = gRainLatchWord;
+    return gRainLatchWord;
+  }
+  gRainLatched = false;  // a stale latch (a tick that never submitted) dies here
+  return SimRainWord(tn, seed, tick);
+}
 
 void Snap() { gEasedValid = false; }
 

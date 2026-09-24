@@ -3987,7 +3987,9 @@ Status GateTaa(Ctx& c, std::string& detail) {
       // the point of this gate is to MEASURE both arms in one run, so the knob
       // it is deciding must not also be the knob it obeys.
       WriteRenderParams(ctx.queue, world, eye, jcam, aspect, true, 0.0f,
-                        kFarFogDensity, sharpLod ? (float)H : (float)h);
+                        kFarFogDensity, sharpLod ? (float)H : (float)h,
+                        /*tick=*/0, /*fluidCount=*/0, /*frameFrac=*/0.0f,
+                        /*extraFlags=*/0, /*targetW=*/w, /*targetH=*/h);
       sim.WriteTaaParams(ctx.queue, taaCam, CurrentTuning().render.taaMaxHist,
                          CurrentTuning().render.taaClamp, /*reset=*/f == 0,
                          /*bgraSource=*/false);
@@ -4537,6 +4539,49 @@ Status GateClouds(Ctx& c, std::string& detail) {
     armTick = tick;
   }
 
+  // ---- C. A SECOND VIEW DOES NOT DISTURB THE FIRST -------------------------
+  // The inventory portrait writes its render params between two game frames,
+  // at another size and another (fixed) light tick. It must leave the main
+  // view's cloud history valid and still accumulating, and must not move the
+  // main view's weather. CPU state only: no frame has to be drawn to ask.
+  bool auxIsolated = false;
+  unsigned auxAgeBefore = 0, auxAgeAfter = 0;
+  {
+    Tuning t = base;
+    t.weather.clouds = true;
+    t.weather.autoCycle = false;
+    SetCurrentTuning(t);
+    weather::SetOverride("overcast");
+    weather::Snap();
+    Camera cam;
+    cam.yaw = 0.785f;
+    cam.pitch = skyPitch;
+    for (int f = 0; f < 3; f++)
+      WriteRenderParams(ctx.queue, world, skyEye, cam, aspect, true, 0.0f,
+                        kFarFogDensity, (float)H, tick);
+    const CloudHistoryProbe h0 = MainCloudHistory();
+    const float cov0 = weather::Last().mix.coverage;
+    // The portrait's shape: its own size, fog off, a different tick, and a
+    // pin change the main view has not eased toward yet.
+    weather::SetOverride("clear");
+    Camera pc;
+    pc.yaw = 2.0f;
+    WriteRenderParams(ctx.queue, world, skyEye, pc, 320.0f / 448.0f, true, 0.0f,
+                      0.0f, 448.0f, tick + 5000, 0, 0.0f, 0u, 320, 448,
+                      /*auxView=*/true);
+    const CloudHistoryProbe h1 = MainCloudHistory();
+    const float cov1 = weather::Last().mix.coverage;
+    weather::SetOverride("overcast");
+    WriteRenderParams(ctx.queue, world, skyEye, cam, aspect, true, 0.0f,
+                      kFarFogDensity, (float)H, tick);
+    const CloudHistoryProbe h2 = MainCloudHistory();
+    auxAgeBefore = h0.age;
+    auxAgeAfter = h2.age;
+    auxIsolated = h0.valid && h1.valid && h1.lowW == h0.lowW &&
+                  h1.lowH == h0.lowH && h1.age == h0.age && cov1 == cov0 &&
+                  h2.valid && h2.age == h0.age + 1;
+  }
+
   const Stat sc = stat(imClear, dClear, true), so = stat(imOver, dOver, true),
              sf = stat(imOff, dOff, true);
   const Stat gc = stat(imGClear, dGClear, false), go = stat(imGOver, dGOver, false);
@@ -4548,18 +4593,21 @@ Status GateClouds(Ctx& c, std::string& detail) {
   const bool greyed = so.n > 1000 && so.sat < sc.sat * 0.6;
   const bool offRestores = sf.n > 1000 && sf.sat > so.sat * 1.4;
   const bool shaded = gc.n > 1000 && go.lum < gc.lum * 0.9;
-  char b[640];
+  char b[768];
   std::snprintf(b, sizeof(b),
                 "sky sat clear %.3f / overcast %.3f / overcast+off %.3f (%zu px) | "
                 "ground lum clear %.1f / overcast %.1f | auto cycle: %zu presets "
-                "visited in 2 h, max 1 s step cov %.4f rain %.4f | ms/frame "
-                "clear %.2f overcast %.2f off %.2f (advisory)%s%s%s",
+                "visited in 2 h, max 1 s step cov %.4f rain %.4f | aux view: main "
+                "history age %u -> %u | ms/frame "
+                "clear %.2f overcast %.2f off %.2f (advisory)%s%s%s%s",
                 sc.sat, so.sat, sf.sat, so.n, gc.lum, go.lum, distinct, maxCov, maxRain,
+                auxAgeBefore, auxAgeAfter,
                 msClear, msOver, msOff, greyed ? "" : " | OVERCAST SKY NOT GREY",
                 offRestores ? "" : " | clouds=false DID NOT RESTORE THE SKY",
-                shaded ? "" : " | OVERCAST DID NOT SHADE THE GROUND");
+                shaded ? "" : " | OVERCAST DID NOT SHADE THE GROUND",
+                auxIsolated ? "" : " | AUX VIEW DISTURBED THE MAIN CLOUD HISTORY/WEATHER");
   detail = b;
-  return (greyed && offRestores && shaded) ? Status::Pass : Status::Fail;
+  return (greyed && offRestores && shaded && auxIsolated) ? Status::Pass : Status::Fail;
 }
 
 const std::vector<Gate>& RenderGates() {

@@ -70,7 +70,6 @@ struct Preset {
   // ---- the world under it ----
   float mist = 0.0f;        // extra ground fog, x the base fog density (+1)
   float lightning = 0.0f;   // mean flashes per minute (0 = never)
-  float windShear = 1.0f;   // how fast the deck drifts vs the wind (x)
 };
 
 // The weather for one frame, resolved and blended. What WriteRenderParams and
@@ -119,6 +118,12 @@ Library& Presets();
 // ease: SimRainWord reads the pin directly, because a wall-clock ease on the
 // tick stream would make the world hash depend on frame pacing. The pin is an
 // input, recorded on the tick stream like any other.
+//
+// SANDVOX_WEATHER=<preset> is the initial value. It is read the first time the
+// presets load or the override is touched, whichever comes first, so the very
+// first SimRainWord of a run already sees it (it used to be read only by
+// Resolve, i.e. by the first WriteRenderParams, and ticks before that rained
+// on the unpinned schedule).
 void SetOverride(const std::string& name);
 const std::string& Override();
 
@@ -126,8 +131,15 @@ const std::string& Override();
 // (tick / 30 + frameFrac / 30) — NOT wall time, so replays and --shot agree.
 // `frameDtSeconds` only drives the manual-override ease and the lightning
 // envelope; pass 0 on a headless path and both snap.
+//
+// `commit = false` is a PEEK, for a second view drawn inside the main view's
+// frame (the inventory portrait): it reads the main view's eased preset as it
+// stands and writes nothing -- not the ease, not Last(). Without it a portrait
+// resolved at its own fixed light tick dragged the game's sky toward the
+// portrait's weather every frame the inventory was open.
 State Resolve(const Tuning& t, uint32_t seed, double timeSeconds,
-              float frameDtSeconds, float camXM, float camZM);
+              float frameDtSeconds, float camXM, float camZM,
+              bool commit = true);
 
 // THE SIM'S VIEW OF THE WEATHER: TickParams::weatherRain for `tick`, the one
 // integer by which the sky touches the world (reaction flags "rain" and
@@ -141,6 +153,18 @@ State Resolve(const Tuning& t, uint32_t seed, double timeSeconds,
 // input stream, which is what replays and the determinism gates capture.
 // 0 when weather.clouds or weather.rainTouchesWorld is off.
 uint32_t SimRainWord(const Tuning& t, uint32_t seed, uint32_t tick);
+
+// THE TICK'S RAIN WORD, decided ONCE. The authority (session.cpp) calls
+// LatchTickRain at the head of the tick and hands the result to the CPU rain
+// readers (mob and debris body reactions); SubmitTick calls TakeTickRain to
+// fill TickParams::weatherRain. Take returns the latched word when the latch
+// is for `tick` (and clears it), else computes SimRainWord afresh -- every
+// headless path, which never latches. So the CPU reactions and the GPU
+// kernels read ONE value per tick even if the dev-panel pin changes between
+// the two calls: the pin is sampled once, and what TickParams records (and
+// ops-replay feeds back, opstream::RecordedWeatherRain) is that sample.
+uint32_t LatchTickRain(const Tuning& t, uint32_t seed, uint32_t tick);
+uint32_t TakeTickRain(const Tuning& t, uint32_t seed, uint32_t tick);
 // The word the last SimRainWord call returned — a readout for the dev panel,
 // never an input to anything.
 uint32_t LastSimRainWord();

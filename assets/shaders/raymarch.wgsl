@@ -10975,8 +10975,27 @@ fn fs(in : VSOut) -> FSOut {
   // the rain stops at a roof and keeps falling two metres away outside, which
   // is the per-sample gate the corpus says a player-centred cull gets wrong.
   // Only when the camera probe says it is raining HERE.
+  //
+  // NOT against tDepth alone: under WATER_VEIL a clear liquid's interface
+  // writes no depth (tDepth is whatever the march found BEHIND the water), so
+  // the streaks would draw under the surface of a pond. Rain stops at the
+  // nearest water surface this ray crossed — the CA liquid, or the MPM surface
+  // when it shaded the pixel — and not at all for an eye that is under water.
   if ((R.weatherFlags & (RWF_RAIN | RWF_CLOUDS)) == (RWF_RAIN | RWF_CLOUDS)) {
-    color = rainOverlay(color, rd, tDepth);
+    var rainT = tDepth;
+    var eyeWet = false;
+    if (h.liqT > 0.0) {
+      if (h.liqT < 0.05) { eyeWet = true; }
+      else if (rainT < 0.0 || h.liqT < rainT) { rainT = h.liqT; }
+    }
+    // !caShadedLiquid: the pane guard's case, where the fluid march's
+    // "interface" (and its `inside`) is a chunk face inside settled water, not
+    // a surface — the CA liquid above already clipped that ray.
+    if (SPEC_FLUID && mf.hit && !caShadedLiquid) {
+      if (mf.inside) { eyeWet = true; }
+      else if (mf.t > 0.05 && (rainT < 0.0 || mf.t < rainT)) { rainT = mf.t; }
+    }
+    if (!eyeWet) { color = rainOverlay(color, rd, rainT); }
   }
 
   // fire glow: additive, from the flicker-weighted emissive path. Intensity
