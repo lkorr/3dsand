@@ -2634,7 +2634,10 @@ Author in JSON, hot-reload at runtime, compile at load into flat GPU tables.
     quickly but shallowly, into loam slowly but deeply — and the effective depth
     is `min(amount, capacity)`. Authoring the ceiling per material PAIR would be
     exactly the N×M explosion tags exist to avoid. Capacity 0 (every material
-    predating this, all stone) means the liquid never soaks in and pools at once.
+    predating this, all stone) means the liquid never soaks in and pools at once;
+    such ground still takes a 1-level surface mark (the ceiling is
+    `min(amount, max(capacity, 1))`, in both `doStaining` and the MPM seam's
+    `stainApply`).
   - **Absorbing SPENDS the liquid**: one eighth of the source cell's fullness
     per successful contact, in the same units `stepLiquid` speaks, and the cell
     dies when it gives its last. Without that debit the puddle would stain the
@@ -2645,6 +2648,13 @@ Author in JSON, hot-reload at runtime, compile at load into flat GPU tables.
     0) instead of overwriting it. Water over blood-soaked ground would otherwise
     relabel the blood as "wet" at full strength: the colour would change but the
     mess would never come out.
+  - **A non-washer never paints over a foreign stain (2026-09-23).** It stains
+    only clean ground or its own type. Overwriting made two stains on one cell
+    a cycle that never settled (blood re-painting wet ground that water then
+    rinsed; blood and ichor repainting each other), each step rolling `consume`
+    so the surface eroded and the chunk never slept. With the strict order a
+    washer only lowers a foreign amount and a stainer only raises its own, so
+    every cell reaches a fixed point. Blood no longer recolours wet ground.
   - Both fit in `stainPack`'s spare bits (27..30 capacity, 31 washes), so the
     64-byte `Material` still did not grow.
   - **Sleep discipline (rule 2)** survives because every step is monotone toward

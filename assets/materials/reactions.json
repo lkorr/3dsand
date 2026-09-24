@@ -620,9 +620,11 @@
       "chance": 250
     },
     {
+      "note": "BOUNDED BY DAYLIGHT (2026-09-23). Ungated, this rule held its chunk awake whenever any side of any vine was air (an EMIT that finds its cell sets keepAwake), i.e. forever for a hanging vine, and made flowers from nothing at 2 per mille per vine the whole time. `when: day` makes it light-gated, and a light-gated rule never sets keepAwake (sim_step doReactions), so a vine no longer holds a chunk awake by itself; it flowers only on daylight ticks its chunk is awake for another reason. Total output stays bounded at one flower per open side (4 per vine voxel) because a flower fills the cell it is emitted into. `vine emit vine down` is unchanged: its keep-awake ends when the tip reaches something.",
       "self": "vine",
       "emit": "flower",
       "dir": "side",
+      "when": "day",
       "chance": 2
     },
     {
@@ -849,6 +851,13 @@
       "when": "night",
       "chance": 9,
       "neighborBecomes": "fungus"
+    },
+    {
+      "note": "FUNGUS ROTS AWAY (2026-09-23, CLAUDE.md rule 2: bound every emergent process). Without this a fungus voxel was permanent and converted every organic neighbour, grass included, so a patch crept over a whole meadow or forest. The bound is a decay to dirt, tried AFTER both spread rules so it only rolls on ticks the cell did not spread. Expected neighbours converted over one fungus voxel's life = p / ((1 - p) q) with q = 0.020: at night p = 1 - (1 - 0.007)(1 - 0.009) = 0.0159, giving 0.81; by day p = 0.007, giving 0.35. Both < 1, so a fungus front is subcritical and dies out, leaving dirt (soil, which grass can re-cover by day). Mean life 1/q = 50 ticks, during which the unconditional decay keeps the chunk awake; that ends when the cell rots.",
+      "self": "fungus",
+      "decay": true,
+      "chance": 20,
+      "becomes": "dirt"
     },
     {
       "note": "-------- sunlight through glass ignites tinder --------\nThe magnifying-glass trick. Requires the dry foliage to be under open sky AND\ntouching glass AND near peak sun, so it is rare enough to be a discovery\nrather than a hazard that burns the world down every noon. Fire is already\nbounded (it decays in ~6 ticks and leaves nothing that regrows)."

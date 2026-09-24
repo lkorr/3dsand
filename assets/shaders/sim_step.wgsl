@@ -141,7 +141,26 @@ fn inBounds(c : vec3<i32>) -> bool { return cellResident(c, T.origin); }
 // the block there: the plain markDirty() below keeps the old call shape for
 // the write paths, which are the overwhelming majority of the call sites and
 // the only ones that also markVoxActive.
+//
+// NON-WRITE REASONS MARK ONLY THE OWN CHUNK (2026-09-23). REACT (matched, did
+// not fire), STAIN (unsaturated surface in reach), VISCOUS (off-tick with
+// somewhere to go) and the retired FLOW say "THIS cell still has work", and
+// that work is done by this cell, in this chunk. Nothing was written, so no
+// neighbour's view changed and there is nothing for it to re-evaluate; a
+// neighbour chunk that has work of its own marks itself, and the moment this
+// cell's work IS a write, that write fans out as before. Fanning these out
+// used to hold up to 7 innocent chunks awake beside every idle reactor. None
+// of the four is in FILM_LICENCE, and the repose snapshot is keyed on the
+// dispatch list rather than on who marked it, so neither depends on the fan.
+const DIRTY_OWN_CHUNK_ONLY : u32 =
+    DIRTY_R_REACT | DIRTY_R_STAIN | DIRTY_R_FLOW | DIRTY_R_VISCOUS;
+
 fn markDirtyR(c : vec3<i32>, reason : u32) {
+  if ((reason & ~DIRTY_OWN_CHUNK_ONLY) == 0u) {
+    let own = dirtyFanSlot(c, T.origin, 0u);  // k = 0: c's own chunk
+    if (own != SLOT_NONE) { atomicOr(&dirtyOut[own], reason); }
+    return;
+  }
   // The fan-out rule is common.wgsl's dirtyFanSlot: only the distinct chunks
   // c borders, so an interior cell pays one atomic instead of eight.
   for (var k = 0u; k < 8u; k++) {
@@ -1128,6 +1147,19 @@ fn doReactions(c : vec3<i32>, idx : u32, slotIdx : u32, w : u32, mat : u32,
           synthFluid = true;
         }
         if (!nbrMatches(rule, nmat, materials[nmat])) { continue; }
+        // A PAIR that would turn this neighbour into WHAT IT ALREADY IS, and
+        // leave self alone, is a no-op, and it is not a match. The case that
+        // found it: grass spreads onto `tag:soil`, and grass carries `soil`, so
+        // every grass cell matched its grass neighbours and rewrote grass over
+        // grass at 3 per mille. Each such write marked REACTW, which is in
+        // FILM_LICENCE and re-dirties the chunk, so a lawn in daylight never
+        // slept. Skipped here, before keepAwake and before the roll, so the
+        // scan goes on to a neighbour the rule can actually change (dirt,
+        // sand). A synthesized fluid neighbour is never a no-op — its product
+        // is written into the AIR cell — so it is excluded.
+        if (!synthFluid && rule.prodSelf == PROD_KEEP && rule.prodNbr == nmat) {
+          continue;
+        }
         keepAwake = keepAwake || !lightGated;
         if ((rr % REACT_CHANCE_DEN) < rule.chance) {
           if (rule.prodNbr != PROD_KEEP) {
@@ -1176,8 +1208,10 @@ fn doReactions(c : vec3<i32>, idx : u32, slotIdx : u32, w : u32, mat : u32,
 //   * A staining liquid rolls once per tick against `chance` (per-mille).
 //   * On success it stains ONE face neighbour — chosen by an RNG rotation, so
 //     which one is deterministic but not biased toward an axis.
-//   * The stain ADDS to whatever the neighbour already carries, saturating at
-//     STAIN_AMT_MAX. Repeated contact deepens a stain rather than resetting it.
+//   * The stain ADDS to what the neighbour already carries OF ITS OWN TYPE,
+//     saturating at the ceiling. Repeated contact deepens a stain rather than
+//     resetting it. A FOREIGN stain is never painted over (only a washer may
+//     touch it, and only downward) — see `canStain` below.
 //   * Having stained, it may CONSUME the voxel (per-mille `consume`), which
 //     deletes it to air and lets the liquid flow into the hole.
 //
@@ -1288,16 +1322,33 @@ fn doStaining(c : vec3<i32>, idx : u32, selfWord : u32, m : Material,
     // amount is still the ceiling, so `absorb` can only ever hold LESS than the
     // liquid would otherwise apply — a material opts into being soakable, it
     // cannot opt into being stained harder than the liquid stains.
+    //
+    // NON-ABSORBENT ground (capacity 0: all stone) takes a SURFACE MARK of
+    // exactly 1, not the liquid's full amount: `max(capacity, 1u)` is what
+    // keeps it from being 0 (unstainable). This has been the running behaviour
+    // since absorption landed (0787d38), and sim_fluid_seam's stainApply uses
+    // the same ceiling, so the two stainers agree; a comment below used to
+    // claim stone got the full amount, which the code never did.
     let capacity = matAbsorbCapacity(materials[nmat]);
     let ceiling = min(addAmt, max(capacity, 1u));
 
-    // Is there work left on this neighbour? A foreign stain is work for a
-    // washer (rinse it out) and for a non-washer alike (overwrite it, the
-    // pre-existing behaviour). Our own stain is work only while it sits under
-    // the ceiling this ground allows.
+    // Is there work left on this neighbour? A STRICT ORDER, and it is the
+    // termination argument (2026-09-23): a foreign stain is work ONLY for a
+    // washer, which steps it down; a non-washer stains only CLEAN ground or
+    // its OWN type below the ceiling, and never paints over somebody else's.
+    //
+    // It used to overwrite, and that was two stains on one cell that never
+    // settled: blood painted over wet ground, water rinsed the blood one level
+    // and re-wet it, blood painted it again — and blood vs ichor simply
+    // repainted each other forever. Every one of those events also rolled
+    // `consume`, so the surface eroded and the chunk never slept. Now every
+    // step is monotone: a washer only lowers a foreign amount, a stainer only
+    // raises its own, and nobody raises a foreign one, so each cell reaches a
+    // fixed point. The price is accepted: blood no longer recolours ground
+    // that is already wet (or rotted, or bloodied by ichor's opposite).
     let foreign = cur != 0u && curType != stainType;
     let canWash = washes && foreign;
-    let canStain = foreign || cur < ceiling;
+    let canStain = !foreign && cur < ceiling;
     if (!canWash && !canStain) { continue; }
     progress = true;
     if (!fires) { break; }  // work remains, but not this tick
@@ -1333,13 +1384,14 @@ fn doStaining(c : vec3<i32>, idx : u32, selfWord : u32, m : Material,
     // which is both free mass and an instant, un-watchable transition.
     //
     // On NON-absorbent ground (capacity 0, all stone) nothing is spent, so
-    // there is no rate to keep in step with and the original behaviour stands:
-    // the stainer applies its full amount at once. That is what keeps blood on
-    // stone looking exactly as it did before this feature.
+    // there is no rate to keep in step with: the stainer applies the whole
+    // ceiling at once — which on stone is the 1-level surface mark above.
     var amt = ceiling;
     if (capacity > 0u) {
       amt = min(cur + 1u, ceiling);
-      if (curType != stainType) { amt = 1u; }  // foreign stain: start over at 1
+      // Only a stale type at amount 0 reaches here now (foreign stains are
+      // refused above): start clean at 1.
+      if (curType != stainType) { amt = 1u; }
     } else if (curType == stainType) {
       amt = min(cur + addAmt, ceiling);
     }
