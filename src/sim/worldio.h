@@ -216,6 +216,14 @@ enum class EntityScope : uint8_t { World, Player, Region };
 // One positioned record of a Region-scope section (chunkstore.h).
 using EntityRecord = ChunkStore::EntityRecord;
 
+// What a Region-scope `loadRecord` did with ONE record. `Retry` is the
+// difference between "this record is bad" and "not now": a record that could
+// not be made live for a reason that can clear (the live-creature cap, a
+// physics or micro-brick pool momentarily full) stays PARKED in its bucket --
+// MobParking::Unpark's rule -- where the next save writes it back and a later
+// unpark tries again. Only `Dropped` (content retired, corrupt bytes) loses it.
+enum class RecordLoad : uint8_t { Applied, Dropped, Retry };
+
 // One persistable entity system: a section in world.sve, a player file, or
 // (per entity) the region buckets.
 struct EntitySection {
@@ -246,7 +254,7 @@ struct EntitySection {
   // system pair: the pre-S4 entities.sve loads through them, and the gates
   // that round-trip one section's bytes use them.
   std::function<void(std::vector<EntityRecord>& out)> saveRecords;
-  std::function<bool(const uint8_t* data, size_t len, uint32_t fileVersion)>
+  std::function<RecordLoad(const uint8_t* data, size_t len, uint32_t fileVersion)>
       loadRecord;
 };
 
@@ -269,7 +277,11 @@ struct EntityFileReport {
   uint32_t regionRecords = 0;       // SAVE: live records bucketed
   uint32_t regionsApplied = 0;      // LOAD: buckets applied
   uint32_t recordsApplied = 0;      // LOAD: records made live
-  uint32_t recordsDormant = 0;      // LOAD: records left parked (outside window)
+  uint32_t recordsDormant = 0;      // LOAD: records left parked (outside window,
+                                    //       or inside it and `Retry`)
+  uint32_t recordsRetried = 0;      // LOAD: in-window records that could not be
+                                    //       made live yet and stayed parked
+  uint32_t recordsDropped = 0;      // LOAD: records refused for good (logged)
   uint64_t bytes = 0;               // SAVE: world + player + region bytes written
 };
 
