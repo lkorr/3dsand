@@ -487,7 +487,9 @@ struct MicroBodyModel {
   base  : u32,
   dims  : u32,  // bits 0..9 x, 10..19 y, 20..29 z (micro voxels)
   scale : u32,  // micro voxels per world voxel: 2 or 4
-  _pad  : u32,  // padding to 16 bytes; no flag bits are defined
+  // Boundary planes of the brick that are JOINTS (another limb pressed
+  // against them): six bits, axis * 2 + positive. microbody.h `cutFaces`.
+  cutFaces : u32,
 };
 
 fn microBodyDims(m : MicroBodyModel) -> vec3<i32> {
@@ -1478,8 +1480,20 @@ struct RenderParams {
   // its low 4 bits are ever used.
   frameIdx : u32,
   shadowSubdiv : u32,   // voxel-face subdivision per axis, <= SHADOW_SUBDIV_MAX
-  _psc0 : u32,
-  _psc1 : u32,
+  // ---- the frame's light (must match RenderParams in world.h) ----
+  // Resolved ONCE per frame on the CPU (ResolveFrameLight, support.cpp) and
+  // read through keyLightDirP / keyLightColorP / ambientAtP below, so the
+  // terrain and every raster body cannot disagree about the light.
+  dayWeight : f32,      // sunUp after the eclipse
+  moonLit   : f32,      // (moon A + moon B contribution) / moon A intensity
+  keyDir    : vec3f,    // unit, sun by day / brighter moon by night
+  ambOvercast : f32,    // clamp(overcast) * 0.8, the ambient's grey blend
+  keyCol    : vec3f,    // key-light colour x intensity
+  _pkl0 : f32,
+  ambGround : vec3f,    // hemisphere ambient at n.y = -1, before overcast
+  _pkl1 : f32,
+  ambSky    : vec3f,    // ...and at n.y = +1
+  _pkl2 : f32,
 };
 
 // ---- THE CLOUDS: the shared half (cloud.wgsl, src/sim/weather.h) ----------
@@ -1762,96 +1776,70 @@ fn sunTransmittance(mass : f32) -> vec3f {
   return exp(-RAYLEIGH_RGB * mass * SUN_TRANSMIT_K * TUNE_SUN_REDDENING);
 }
 
-// ---- how much light each body is actually giving ----------------------------
-// One place computes "how much moonlight is this body contributing", so the
-// key light, the ambient and the fog tint cannot disagree about which moon is
-// up. Falls to zero below the horizon and scales with the illuminated
-// fraction squared — a crescent gives far less than half a full moon's light,
-// which is why moonlit nights vary so much.
-fn moonContribP(mDir : vec3f, mPhase : f32, intensity : f32) -> f32 {
-  let up = smoothstep(-0.10, 0.18, mDir.y);
-  return up * intensity * (0.15 + 1.70 * mPhase * mPhase);
-}
-
-// Daylight weight AFTER an eclipse. R.solarEclipse is the fraction of the
-// sun's area a moon covers; TUNE_ECLIPSE_CURVE is the perceptual curve (a
-// half-eclipsed sun is barely dimmer to the eye — the collapse is in the last
-// few percent). Mirrors dayWeight()/eclipseDim() in raymarch.wgsl; the two
-// MUST agree, including the exponent, or the world lights at a different
-// brightness than the sky it stands under.
-fn eclipseDayWeightP(R : RenderParams) -> f32 {
-  let f = clamp(R.solarEclipse, 0.0, 1.0);
-  return R.sunUp * (1.0 - pow(f, TUNE_ECLIPSE_CURVE) * TUNE_ECLIPSE_DARKNESS);
-}
-
-// Direct light: sun by day, the brighter moon by night. Returns colour x
-// intensity; callers multiply by their own N.L / shadow terms.
-fn keyLightColorP(R : RenderParams) -> vec3f {
-  let sunCol = sunTransmittance(airMass(R.sunDir.y)) * TUNE_SUN_COLOR *
-               TUNE_SUN_INTENSITY;
-  // Two moons now. The BRIGHTER one is the key light (its direction is what
-  // casts the shadows, below); the other is folded into ambient rather than
-  // given a second shadowed lambert term, because two sets of soft shadows at
-  // moonlight levels costs a whole extra shadow march for something the eye
-  // cannot separate at these intensities.
-  let a = moonContribP(R.moonDir, R.moonPhase, TUNE_MOON_LIGHT_INTENSITY);
-  let b = moonContribP(R.moon2Dir, R.moon2Phase, TUNE_MOON2_LIGHT_INTENSITY);
-  let keyMoon = select(TUNE_MOON2_LIGHT_COLOR * b, TUNE_MOON_LIGHT_COLOR * a,
-                       a >= b);
-  return mix(keyMoon, sunCol, eclipseDayWeightP(R));
-}
-
-// Direction of the key light. A hard switch at sunUp = 0.5 rather than a
-// blend: a lerp between two directions would swing shadows wildly through
-// twilight, and at the crossover both lights are dim enough to hide the swap.
+// ---- the frame's light: ONE author, read here ------------------------------
+// The key light, the eclipse-dimmed day weight, the moons' fill and the
+// hemisphere ambient's two ends are frame constants. They are resolved once
+// per frame on the CPU (ResolveFrameLight, src/test/support.cpp — the port of
+// what moonContribP / eclipseDayWeightP / keyLightColorP / keyLightDirP /
+// ambientAtP used to compute here per pixel) and uploaded in RenderParams.
+// These accessors keep the old names and signatures, so every raster path is
+// unchanged at its call site; raymarch.wgsl reads the same fields through
+// ambientHemi and R directly. There is no second copy left to drift: the
+// terrain's own ambientAt() had missed the overcast and the lightning that
+// 8124088 taught this one, and a storm greyed the bodies but not the ground.
 //
-// The same argument picks BETWEEN the two moons — whichever is contributing
-// more light owns the shadows, and the swap happens where they are equal and
-// therefore each half as bright as the pair, which is the least visible moment
-// available. Note this uses the RAW sunUp, not the eclipse-dimmed weight: a
-// total eclipse must not swing every shadow in the world round to a moon
-// direction (they would be the same direction anyway, and the swing would be
-// the most visible thing on screen).
-fn keyLightDirP(R : RenderParams) -> vec3f {
-  let a = moonContribP(R.moonDir, R.moonPhase, TUNE_MOON_LIGHT_INTENSITY);
-  let b = moonContribP(R.moon2Dir, R.moon2Phase, TUNE_MOON2_LIGHT_INTENSITY);
-  let moonDir = select(R.moon2Dir, R.moonDir, a >= b);
-  return normalize(mix(moonDir, R.sunDir, step(0.5, R.sunUp)));
+// Moon B contributes to the ambient and the fog tint through R.moonLit (the
+// pair's summed contribution over moon A's intensity), and the brighter moon
+// owns the key light — both decided on the CPU with the same rules.
+
+// Daylight weight AFTER an eclipse: sunUp x (1 - curve(covered area)).
+fn eclipseDayWeightP(R : RenderParams) -> f32 {
+  return R.dayWeight;
 }
 
-// Two-tone hemisphere ambient (cool sky above, warm bounce below), scaled to
-// a dim blue moon/starlight version at night. Both moons contribute here —
-// the secondary one adds real fill on a night when they are both up, which is
-// the payoff for having two of them.
-fn ambientAtP(n : vec3f, R : RenderParams) -> vec3f {
-  let base = mix(TUNE_AMB_GROUND, TUNE_AMB_SKY, n.y * 0.5 + 0.5);
-  let nightAmb = mix(TUNE_NIGHT_AMB_GROUND, TUNE_NIGHT_AMB_SKY, n.y * 0.5 + 0.5);
-  // Normalised against moon A's own intensity so the existing 0.30/1.40 ramp
-  // (tuned when there was one moon) still means the same thing when only A is
-  // up, and B can only ever ADD to it.
-  let inv = 1.0 / max(TUNE_MOON_LIGHT_INTENSITY, 1e-4);
-  let a = moonContribP(R.moonDir, R.moonPhase, TUNE_MOON_LIGHT_INTENSITY) * inv;
-  let b = moonContribP(R.moon2Dir, R.moon2Phase, TUNE_MOON2_LIGHT_INTENSITY) * inv;
-  let moonAmt = 0.30 * step(0.001, a + b) + 1.40 * (a + b) * 0.5;
-  var amb = mix(nightAmb * (0.45 + moonAmt), base, eclipseDayWeightP(R));
-  // THE OVERCAST (src/sim/weather.h). Under a closed deck the sky stops being
-  // a blue dome over a sunlit ground and becomes one grey diffuser: the
-  // blue-above / warm-below split collapses toward the dome's luminance, and
-  // the warm half loses the sunlit ground that was bouncing into it. Shared
-  // here so the terrain, the far field and every raster body grey together.
-  // The DIRECT light is not touched — the cloud shadow map dims it per
-  // position, which is what lets a single cloud's shadow cross a field.
-  if (R.overcast > 0.0) {
+// Direct light colour x intensity: the reddened sun by day, the brighter moon
+// by night. Callers multiply by their own N.L / shadow terms.
+fn keyLightColorP(R : RenderParams) -> vec3f {
+  return R.keyCol;
+}
+
+// Unit direction of the key light (hard switch at RAW sunUp = 0.5; see
+// ResolveFrameLight for why it is not blended and not eclipse-weighted).
+fn keyLightDirP(R : RenderParams) -> vec3f {
+  return R.keyDir;
+}
+
+// Two-tone hemisphere ambient (cool sky above, warm bounce below; the dim
+// moonlit version at night), plus the weather. `ground`/`sky` are the ambient
+// at n.y = -1 / +1 — the whole day/night/moon blend is linear in n.y, so the
+// CPU hands over its two ends — and `overcast` the grey blend (0 = clear).
+//
+// THE OVERCAST (src/sim/weather.h). Under a closed deck the sky stops being a
+// blue dome over a sunlit ground and becomes one grey diffuser: the
+// blue-above / warm-below split collapses toward the dome's luminance, and the
+// warm half loses the sunlit ground that was bouncing into it. The DIRECT
+// light is not touched — the cloud shadow map dims it per position, which is
+// what lets a single cloud's shadow cross a field.
+//
+// Lightning: a cold white flash from the sky side, weighted by how much the
+// face looks up so a flash lights a field and not the underside of a ledge.
+fn ambientHemi(n : vec3f, ground : vec3f, sky : vec3f, overcast : f32,
+               lightning : f32) -> vec3f {
+  let up = n.y * 0.5 + 0.5;
+  var amb = mix(ground, sky, up);
+  if (overcast > 0.0) {
     let lum = dot(amb, vec3f(0.2126, 0.7152, 0.0722));
     let grey = vec3f(lum) * vec3f(0.96, 0.99, 1.04) *
                mix(1.0, 0.72, clamp(-n.y, 0.0, 1.0));
-    amb = mix(amb, grey, clamp(R.overcast, 0.0, 1.0) * 0.8);
+    amb = mix(amb, grey, overcast);
   }
-  // Lightning: a cold white flash from the sky side, weighted by how much the
-  // face looks up so a flash lights a field and not the underside of a ledge.
-  amb += vec3f(0.78, 0.84, 1.0) * R.lightning *
-         (0.35 + 0.65 * clamp(n.y * 0.5 + 0.5, 0.0, 1.0));
+  amb += vec3f(0.78, 0.84, 1.0) * lightning * (0.35 + 0.65 * clamp(up, 0.0, 1.0));
   return amb;
+}
+
+// The shared hemisphere ambient for a path that holds RenderParams by value.
+fn ambientAtP(n : vec3f, R : RenderParams) -> vec3f {
+  return ambientHemi(n, R.ambGround, R.ambSky, R.ambOvercast, R.lightning);
 }
 
 // Reinhard-with-white-point applied to LUMINANCE then reapplied to the colour
@@ -2082,12 +2070,8 @@ fn bodyAirFog(c : vec3f, worldPos : vec3f, R : RenderParams) -> vec3f {
   // cheap sky tint for fog, dimmed through the night like the real sky (a
   // fixed day-blue tint here was a second source of midnight glow). Both moons
   // count, and an eclipse dims it with everything else.
-  let inv = 1.0 / max(TUNE_MOON_LIGHT_INTENSITY, 1e-4);
-  let moonLit =
-      (moonContribP(R.moonDir, R.moonPhase, TUNE_MOON_LIGHT_INTENSITY) +
-       moonContribP(R.moon2Dir, R.moon2Phase, TUNE_MOON2_LIGHT_INTENSITY)) * inv;
   let fogTint = vec3f(0.55, 0.65, 0.85) *
-                mix(0.015 + 0.05 * moonLit, 1.0, eclipseDayWeightP(R));
+                mix(0.015 + 0.05 * R.moonLit, 1.0, R.dayWeight);
   return mix(c, fogTint, fog);
 }
 
@@ -4357,13 +4341,20 @@ fn unpackRgb9e5(w : u32) -> vec3f {
 // bed; a body in front of the bed needs the same equation at ITS distance, so
 // the record holds the equation, not an answer:
 //
-//   w0  tSurf + 1 as f32 bits (0 = no veil on this pixel; tSurf 0 = camera
-//       already submerged), in voxels along the normalized primary ray
+//   w0  tSurf + 1 as f32 bits (tSurf 0 = camera already submerged), in
+//       voxels along the normalized primary ray
 //   w1  K                       rgb9e5
 //   w2  A = Arest + K*scatter   rgb9e5 — the colour of infinitely deep water
 //   w3  S = K*scatter           rgb9e5
 //   w4  absorb, per metre       rgb9e5
 //   w5  pack2x16float(path cap in voxels, caustic curvature)
+//   w6  the RenderParams.frameIdx the record was written in. A record is live
+//       only when this equals the reader's frameIdx; anything else is a dry
+//       pixel. This is what replaced clearing w0 on EVERY pixel at the top of
+//       the raymarch's fs — one scattered store per pixel per frame (~2M at
+//       1080p, each its own cache line) to say "dry" about pixels that mostly
+//       never held water. frameIdx is 32-bit and advances once per
+//       WriteRenderParams, so a stale record cannot alias a live one.
 //
 // and a body at distance `dist` shades A + T * (K * lit * caustic - S). A
 // body point nearer than the surface is simply not under it and takes the
@@ -4371,11 +4362,11 @@ fn unpackRgb9e5(w : u32) -> vec3f {
 // liquid, so a body seen through a thin sheet (a waterfall curtain) is dimmed
 // by the sheet, not by the air behind it.
 //
-// Render-only derived data, rewritten every frame by the raymarch (one store of
-// w0 for a dry pixel), never hashed, never saved. Bound at renderBGL_ binding
+// Render-only derived data, written by the raymarch for liquid pixels only
+// (stamped w6), never hashed, never saved. Bound at renderBGL_ binding
 // 24; the raymarch writes it, the body passes read it after
 // RenderPass::SplitAfterFragmentWrite.
-const VEIL_WORDS : u32 = 6u;
+const VEIL_WORDS : u32 = 7u;   // Simulation::EnsureVeil sizes by this
 
 struct WaterVeil {
   on      : bool,
@@ -4440,6 +4431,7 @@ fn waterVeilAt(veil : ptr<storage, array<u32>, read>, fragXY : vec2f,
   v.on = false;
   let b = veilBase(fragXY, R);
   if (b == 0xFFFFFFFFu || b + VEIL_WORDS > arrayLength(veil)) { return v; }
+  if ((*veil)[b + 6u] != (*R).frameIdx) { return v; }
   let w0 = (*veil)[b];
   if (w0 == 0u) { return v; }
   v = waterVeilDecode(w0, (*veil)[b + 1u], (*veil)[b + 2u], (*veil)[b + 3u],
@@ -4849,6 +4841,36 @@ fn pcg(v : u32) -> u32 {
   let s = v * 747796405u + 2891336453u;
   let w = ((s >> ((s >> 28u) + 4u)) ^ s) * 277803737u;
   return (w >> 22u) ^ w;
+}
+
+// ---- smooth value noise (render only) --------------------------------------
+// Trilinear value noise over a lattice of `scale` voxels, smoothstep-faded so
+// the lattice leaves no creases. The ground's grain and stain mottle
+// (raymarch.wgsl surfaceGrain / applyStain) and the micro bodies' stain
+// mottle (microbody.wgsl bodyStainTint) read this ONE definition, which is
+// what keeps blood that ran off an arm the same pattern as the pool it made.
+fn vnHash(c : vec3<i32>) -> f32 {
+  return f32(pcg(u32(c.x * 374761393 + c.y * 668265263 + c.z * 1274126177)) &
+             0xFFFFu) * (1.0 / 65535.0);
+}
+fn valueNoise(p : vec3f, scale : f32) -> f32 {
+  let q = p / scale;
+  let i = vec3<i32>(floor(q));
+  var f = fract(q);
+  f = f * f * (3.0 - 2.0 * f);   // smoothstep fade — no lattice creases
+  let c000 = vnHash(i + vec3<i32>(0,0,0));
+  let c100 = vnHash(i + vec3<i32>(1,0,0));
+  let c010 = vnHash(i + vec3<i32>(0,1,0));
+  let c110 = vnHash(i + vec3<i32>(1,1,0));
+  let c001 = vnHash(i + vec3<i32>(0,0,1));
+  let c101 = vnHash(i + vec3<i32>(1,0,1));
+  let c011 = vnHash(i + vec3<i32>(0,1,1));
+  let c111 = vnHash(i + vec3<i32>(1,1,1));
+  let x00 = mix(c000, c100, f.x);
+  let x10 = mix(c010, c110, f.x);
+  let x01 = mix(c001, c101, f.x);
+  let x11 = mix(c011, c111, f.x);
+  return mix(mix(x00, x10, f.y), mix(x01, x11, f.y), f.z);
 }
 fn hash3(a : u32, b : u32, c : u32) -> u32 {
   return pcg(a ^ pcg(b ^ pcg(c)));

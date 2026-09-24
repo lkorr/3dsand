@@ -85,7 +85,13 @@
 // is blended into its block-face at TUNE_GI_FEEDBACK so bounces compound. The
 // third buffer a fragment shader writes, with shadowCache's argument: render-
 // private derived data the renderer itself produced.
-@group(0) @binding(19) var<storage, read_write> irradiance : array<u32>;
+//
+// ATOMIC HERE ONLY (the other shaders bind the same buffer as plain u32): the
+// gather cache's refresh is ELECTED with one compare-exchange per block-face
+// (giBounceAt), so a face that is due re-gathers once per frame instead of
+// once per pixel that lands on it. Every other access is a plain
+// atomicLoad/atomicStore with the same racy-by-design semantics as before.
+@group(0) @binding(19) var<storage, read_write> irradiance : array<atomic<u32>>;
 // The glow field (src/sim/world.h kGlowBytes, common.wgsl THE GLOW FIELD).
 // Declared here so the terrain path CAN sample it under render.glowTerrain, and
 // because renderBGL_ is one layout shared with debris.wgsl and microbody.wgsl,
@@ -518,6 +524,18 @@ fn shortRangeCeilM() -> f32 {
 
 fn isVoxActive(idx : u32) -> bool {
   return (actVoxViz[idx >> 5u] & (1u << (idx & 31u))) != 0u;
+}
+// The debug bit for a WORLD cell, addressed like every other voxel access:
+// the slot through voxSlotOfCell (so a ticket slot outside the window is
+// honoured too), the page through the table, and a sentinel chunk — which
+// has no page, so no memory for the bit to live in — is never active. The
+// two debug views used to spell this out by hand, each its own copy of the
+// page arithmetic CLAUDE.md says to keep behind the accessors.
+fn voxActiveAtCell(c : vec3<i32>) -> bool {
+  let e = pageTable[voxSlotOfCell(c)];
+  if ((e & PT_SENTINEL_BIT) != 0u) { return false; }
+  let lo = vec3<u32>(c & vec3<i32>(CHUNK_MASK));
+  return isVoxActive(e * CHUNK_VOL + (lo.z * CHUNK + lo.y) * CHUNK + lo.x);
 }
 
 struct VSOut {
@@ -1121,29 +1139,16 @@ fn sunDisc(rd : vec3f) -> vec3f {
 // adding them. Stars take every veil and produce none: nothing this renderer
 // draws is behind them.
 // ---- eclipse weight -------------------------------------------------------
-// How much daylight an eclipse has taken away, 0..1. The sky is lit by the
-// sun's whole disc, so it dims by the covered AREA — but not linearly: a 50%
-// eclipse is barely noticeable to the eye in reality, and the last few percent
-// of coverage is where the light collapses. The cubic is that curve, and it is
-// the reason a partial eclipse reads as "slightly odd light" rather than as
-// someone turning the exposure down.
-fn eclipseDim() -> f32 {
-  let f = clamp(R.solarEclipse, 0.0, 1.0);
-  // The exponent is the PERCEPTUAL curve, not the physics: covered area falls
-  // linearly, but the eye's adaptation means half a sun still reads as broad
-  // daylight. A high power keeps the world bright until the last sliver goes,
-  // which is what real partial eclipses feel like; 1.0 makes the dimming track
-  // the covered area directly and reads as someone pulling the exposure down.
-  return pow(f, TUNE_ECLIPSE_CURVE) * TUNE_ECLIPSE_DARKNESS;
-}
-
-// The effective daylight weight during an eclipse. Everything that keyed off
-// R.sunUp — sky brightness, star fade, the moons' visibility — goes through
-// this instead, so totality brings the stars out and lifts the moons into a
-// daytime sky the same way real totality does. Without routing the STAR fade
-// through it too, a total eclipse would darken the dome and leave it blank.
+// The effective daylight weight during an eclipse: R.sunUp dimmed by the
+// perceptual curve of the covered AREA (a 50% eclipse is barely noticeable;
+// the last few percent is where the light collapses). Everything that keyed
+// off R.sunUp — sky brightness, star fade, the moons' visibility — goes
+// through this, so totality brings the stars out and lifts the moons into a
+// daytime sky the same way real totality does. A frame constant, resolved on
+// the CPU (RenderParams.dayWeight, ResolveFrameLight in support.cpp) — the
+// same number eclipseDayWeightP gives the raster paths.
 fn dayWeight() -> f32 {
-  return R.sunUp * (1.0 - eclipseDim());
+  return R.dayWeight;
 }
 
 // ---- the tiers, split so the chain does its shared work ONCE ---------------
@@ -1251,51 +1256,25 @@ fn skyColor(rdIn : vec3f) -> vec3f {
 }
 
 // ---- direct light: sun by day, moon by night --------------------------------
-// One function so every shading path (near field, far field, reflections,
-// water) agrees on what "the key light" is at this moment. Returns the light
-// colour x intensity; callers multiply by their own N.L / shadow terms.
-// Declared here, immediately after the sky, because everything below shades
-// against it — WGSL requires definition before use.
-fn keyLightColor() -> vec3f {
-  // Sunlight reddens as it sets because its own path through the atmosphere
-  // grows — the same sunTransmittance() the disc and the sky use, so a red sun
-  // always lights the world red. Moonlight is sunlight bounced off a dark grey
-  // rock: same spectrum, ~400k times dimmer, read as blue because of the
-  // Purkinje shift at scotopic levels — the tint is a perceptual choice and
-  // lives in TUNE_MOON_LIGHT_COLOR. MUST MATCH keyLightColorP (common.wgsl),
-  // which the raster body paths use: inlined here rather than calling it
-  // because this sits in per-hit shading loops and passing RenderParams by
-  // value per call is a real cost at this call frequency.
-  let sunCol = sunTransmittance(airMass(R.sunDir.y)) * TUNE_SUN_COLOR *
-               TUNE_SUN_INTENSITY;
-  // TWO moons. The brighter contributor owns the key light; the other adds
-  // only ambient (see ambientAt). moonContribP/eclipseDayWeightP are the
-  // SHARED helpers from common.wgsl — they take scalars rather than the
-  // RenderParams struct, so the "inline it, don't pass R by value" argument
-  // above does not apply to them and the two copies cannot drift on the part
-  // that actually got complicated.
-  let a = moonContribP(R.moonDir, R.moonPhase, TUNE_MOON_LIGHT_INTENSITY);
-  let b = moonContribP(R.moon2Dir, R.moon2Phase, TUNE_MOON2_LIGHT_INTENSITY);
-  let moonCol = select(TUNE_MOON2_LIGHT_COLOR * b, TUNE_MOON_LIGHT_COLOR * a,
-                       a >= b);
-  // An eclipse takes the sun's light out of the world, not just off the sky.
-  return mix(moonCol, sunCol, eclipseDayWeightP(R));
-}
-
-// Direction of the key light — the sun by day, the brighter moon by night.
-// Shadows are cast from whichever is dominant, so moonlit shadows point the
-// right way. MUST MATCH keyLightDirP (common.wgsl); inlined for the same
-// reason as above.
+// One answer for every shading path (near field, far field, reflections,
+// water) about what "the key light" is at this moment: RenderParams.keyCol /
+// keyDir, resolved ONCE per frame on the CPU (ResolveFrameLight, support.cpp)
+// and read by the raster bodies through keyLightColorP / keyLightDirP. This
+// file used to carry its own inlined copy of that math "because passing
+// RenderParams by value per call is a real cost" — reading two uniform fields
+// costs nothing at all, and there is no second copy left to drift.
 //
-// Deliberately the RAW sunUp, not the eclipse-dimmed weight: a total eclipse
-// must not swing every shadow in the world round to a lunar direction. Both
-// bodies are in nearly the same place at totality anyway, so the swing would
-// buy nothing and would be the single most visible artefact on screen.
+// The colour: sunlight reddened by its own path through the atmosphere (the
+// same sunTransmittance() the disc and the sky use, so a red sun always lights
+// the world red), or the brighter of the two moons' light at night, blended by
+// the eclipse-dimmed day weight. The direction: the sun by day, the brighter
+// moon by night, a hard switch at RAW sunUp = 0.5 — a total eclipse must not
+// swing every shadow in the world round to a lunar direction.
+fn keyLightColor() -> vec3f {
+  return R.keyCol;
+}
 fn keyLightDir() -> vec3f {
-  let a = moonContribP(R.moonDir, R.moonPhase, TUNE_MOON_LIGHT_INTENSITY);
-  let b = moonContribP(R.moon2Dir, R.moon2Phase, TUNE_MOON2_LIGHT_INTENSITY);
-  let moonDir = select(R.moon2Dir, R.moonDir, a >= b);
-  return normalize(mix(moonDir, R.sunDir, step(0.5, R.sunUp)));
+  return R.keyDir;
 }
 
 // Per-meter absorption scale applied to material opacity — trace() (media
@@ -2241,7 +2220,11 @@ fn tracePlant(b : MicroBrick, d : PlantDef, mat : u32, cell : vec3<i32>,
       // Widest a blade ever is in XZ: half width along wdir, thickness along
       // ndir, so this bounds both axes whatever the yaw.
       let bladeR = halfW + thick;
-      for (var s = 0u; s < d.count; s++) {
+      // min(.., 16u): a HARD cap like the sibling loops' (leaves 3, heads 8/12,
+      // fern fronds 12). `count` is an 8-bit data field, so an authoring slip
+      // could ask for 255 blades per column per ray; the shipped grasses author
+      // 6-8. Rule 2: bound every loop by a constant, not by data.
+      for (var s = 0u; s < min(d.count, 16u); s++) {
         rsAdd(RS_MICRO, 1u);
         let hs = hash3(colH, s, 0x57A4Du);
         let hs2 = hash3(colH, s, 0xB1ADEu);
@@ -2840,8 +2823,8 @@ fn trace(ro : vec3f, rdIn : vec3f, maxSteps : i32, wantMedia : bool) -> Hit {
   // ---- SHORT-RANGE MODE (RenderParams flag bit 2, arm in bit 4) ----
   // The same shortening, against the mode's ray ceiling. At either default
   // (100 m far arm, 50 m near) this is inert — the window is only 25.6 m
-  // half-extent and the LOD handoff above already ended the fine march at
-  // 24 m — and it is here so that "no ray goes past the ceiling" stays true if
+  // half-extent, so the fine march already ends at the window face (the LOD
+  // handoff above ships OFF, at 26 m) — and it is here so that "no ray goes past the ceiling" stays true if
   // the ceiling is pulled BELOW the window, rather than being a claim about
   // the current value of a different knob. Same min()-only shape, same
   // wantMedia gate (shadow/reflection rays are budget-capped elsewhere and
@@ -3156,17 +3139,9 @@ fn trace(ro : vec3f, rdIn : vec3f, maxSteps : i32, wantMedia : bool) -> Hit {
           cellOp = f32(materials[mat].opacity) / 255.0;
           cellTint = (unpackColor(materials[mat].color0) +
                       unpackColor(materials[mat].color1)) * 0.5;
-          if (SPEC_DEBUG_VIZ && (R.flags & 2u) != 0u) {
-            let gs = vec3<u32>(cell & vec3<i32>(WORLD_MASK));
-            let ge = pageTable[chunkIndexOf(gs)];
-            if ((ge & PT_SENTINEL_BIT) == 0u) {
-              let glo = gs % CHUNK;
-              let gi = ge * CHUNK_VOL + (glo.z * CHUNK + glo.y) * CHUNK + glo.x;
-              if (isVoxActive(gi)) {
-                cellTint = vec3f(1.0, 0.05, 0.05);
-                cellOp = 1.0;
-              }
-            }
+          if (SPEC_DEBUG_VIZ && (R.flags & 2u) != 0u && voxActiveAtCell(cell)) {
+            cellTint = vec3f(1.0, 0.05, 0.05);
+            cellOp = 1.0;
           }
           if (out.mediaMat == 0u) {
             out.mediaMat = mat;
@@ -3419,7 +3394,7 @@ fn trace(ro : vec3f, rdIn : vec3f, maxSteps : i32, wantMedia : bool) -> Hit {
       var fade = 1.0;
       if ((R.flags & RFLAG_GAS) != 0u && cellLiq == 0.0) {
         let bw = gasBlendW(ro + rd * tCur);
-        if (bw > 0.0 && gasOuterCountAt(ro + rd * tCur) > 0.0) {
+        if (bw > 0.0 && gasOuterAnyAt(ro + rd * tCur)) {
           fade = 1.0 - bw;
         }
       }
@@ -3784,6 +3759,31 @@ fn gasOuterCountAt(p : vec3f) -> f32 {
   let x11 = mix(gasOuterCell16(d + vec3<i32>(0, 1, 1)),
                 gasOuterCell16(d + vec3<i32>(1, 1, 1)), u.x);
   return mix(mix(x00, x10, u.y), mix(x01, x11, u.y), u.z);
+}
+
+// `gasOuterCountAt(p) > 0.0` without the filter: trace()'s innermost loop
+// asks only whether the coarse box holds ANYTHING under this point, and a
+// trilinear blend of non-negative counts is > 0 exactly when some corner with
+// a non-zero weight is. The smoothstep weight of the +1 corner on an axis is
+// zero only where the fraction is exactly 0, so that corner is skipped there
+// and the answer is the filtered test's, bit for bit — a straight-line sum of
+// the eight counts (the loads stay independent, so they overlap) instead of
+// the smoothstep and the seven mixes. Where a fraction is exactly 0 the +1
+// offset on that axis is 0 and the corner is re-read, which adds nothing.
+fn gasOuterAnyAt(p : vec3f) -> bool {
+  let g = (p - vec3f(gasOuterOriginVox())) *
+          (1.0 / f32(1u << GAS_OUTER_SHIFT)) - vec3f(0.5);
+  let b = floor(g);
+  let f = g - b;
+  let d = vec3<i32>(b);
+  let x = vec3<i32>(select(0, 1, f.x > 0.0), 0, 0);
+  let y = vec3<i32>(0, select(0, 1, f.y > 0.0), 0);
+  let z = vec3<i32>(0, 0, select(0, 1, f.z > 0.0));
+  let sum = gasOuterCell16(d) + gasOuterCell16(d + x) +
+            gasOuterCell16(d + y) + gasOuterCell16(d + x + y) +
+            gasOuterCell16(d + z) + gasOuterCell16(d + x + z) +
+            gasOuterCell16(d + y + z) + gasOuterCell16(d + x + y + z);
+  return sum > 0.0;
 }
 
 // The same two functions for the LONG-RANGE box. IDENTICAL EXPRESSIONS to
@@ -5085,24 +5085,13 @@ fn farEmberPlasma(p : vec3f, amp : f32) -> f32 {
 // shaded this way gets its form back for free — north faces go blue-shifted,
 // undersides go earth-toned, and the eye reads that split as shape.
 fn ambientAt(n : vec3f) -> vec3f {
-  // n.y = -1 -> full bounce, n.y = +1 -> full sky. Day/night: at night the
-  // sky term is replaced by a much dimmer, bluer moon/starlight ambient, and
-  // the warm ground bounce nearly vanishes (there is no sun to bounce).
-  // Scaling the SAME split rather than adding a separate night ambient keeps
-  // the shape cues the sky/ground split buys. MUST MATCH ambientAtP
-  // (common.wgsl), which the raster body paths use; inlined here because this
-  // sits in per-hit shading loops (see keyLightColor).
-  let base = mix(TUNE_AMB_GROUND, TUNE_AMB_SKY, n.y * 0.5 + 0.5);
-  let nightAmb = mix(TUNE_NIGHT_AMB_GROUND, TUNE_NIGHT_AMB_SKY, n.y * 0.5 + 0.5);
-  // Both moons fill here — the secondary one is real ambient on a night when
-  // they are both up, which is the payoff for having two. Normalised against
-  // moon A's own intensity so the 0.30/1.40 ramp (tuned when there was one
-  // moon) still means the same thing when only A is up.
-  let inv = 1.0 / max(TUNE_MOON_LIGHT_INTENSITY, 1e-4);
-  let a = moonContribP(R.moonDir, R.moonPhase, TUNE_MOON_LIGHT_INTENSITY) * inv;
-  let b = moonContribP(R.moon2Dir, R.moon2Phase, TUNE_MOON2_LIGHT_INTENSITY) * inv;
-  let moonAmt = 0.30 * step(0.001, a + b) + 1.40 * (a + b) * 0.5;
-  return mix(nightAmb * (0.45 + moonAmt), base, eclipseDayWeightP(R));
+  // n.y = -1 -> full bounce, n.y = +1 -> full sky; the dimmer, bluer moonlit
+  // version at night, greyed under an overcast and flashed by lightning. THE
+  // SAME FUNCTION the raster bodies use (common.wgsl ambientHemi via
+  // ambientAtP) on the same CPU-resolved ends — this copy used to be
+  // hand-inlined and never learned about the overcast or the lightning, so a
+  // storm greyed every body while the ground stayed in blue daylight.
+  return ambientHemi(n, R.ambGround, R.ambSky, R.ambOvercast, R.lightning);
 }
 
 // ---- one-bounce gather over the irradiance grid (docs/PLAN_gi.md §3) -------
@@ -5151,10 +5140,11 @@ fn ambientAt(n : vec3f) -> vec3f {
 // reached 1.2 m — light could not cross a room, so the gather delivered
 // essentially nothing to a wall ten metres from a doorway (measured: 0.00136
 // with it on, 0.00133 with it off), and `render.opennessFloor` was standing in
-// for the missing transport by leaking 30% of DAYLIGHT into sealed rock. At 24
-// it crosses ~12 m of open interior, which is what let that floor go to zero.
-// The extra steps are paid only on a re-gather frame (giCachePeriod), and a
-// distant hit reads a coarser level of the pyramid rather than a point sample.
+// for the missing transport by leaking 30% of DAYLIGHT into sealed rock. It was
+// raised to 24 for that measurement and SHIPS AT 12 (tuning_params.def), which
+// still crosses a room and is what let that floor go to zero. The extra steps
+// are paid only on a re-gather frame (giCachePeriod, doubled to 16 to pay for
+// them). There is no pyramid (see below): a distant hit is a point sample.
 //
 // REGISTERS. This sits in fs, which is at the 128-register cap and spills; the
 // loop state is kept to the accumulator, the direction and two block coords,
@@ -5244,9 +5234,9 @@ fn giGatherRays(ro : vec3f, n : vec3f, face : u32) -> vec3f {
     let ay = abs(d.y);
     let az = abs(d.z);
     var e = vec3f(0.0);
-    if (ax > 0.1) { e += unpackRgb9e5(irradiance[base + 0u + select(0u, 1u, d.x < 0.0)]) * ax; }
-    if (ay > 0.1) { e += unpackRgb9e5(irradiance[base + 2u + select(0u, 1u, d.y < 0.0)]) * ay; }
-    if (az > 0.1) { e += unpackRgb9e5(irradiance[base + 4u + select(0u, 1u, d.z < 0.0)]) * az; }
+    if (ax > 0.1) { e += unpackRgb9e5(atomicLoad(&irradiance[base + 0u + select(0u, 1u, d.x < 0.0)])) * ax; }
+    if (ay > 0.1) { e += unpackRgb9e5(atomicLoad(&irradiance[base + 2u + select(0u, 1u, d.y < 0.0)])) * ay; }
+    if (az > 0.1) { e += unpackRgb9e5(atomicLoad(&irradiance[base + 4u + select(0u, 1u, d.z < 0.0)])) * az; }
     acc += e * (w / (ax + ay + az));
   }
   return acc;
@@ -5303,7 +5293,7 @@ fn giGather(p : vec3f, n : vec3f, cell : vec3<i32>) -> vec3f {
 fn giCacheWordAt(c : vec3<i32>, face : u32) -> u32 {
   let slot = chunkIndexW(c);
   if (opennessGen[slot] != opennessStamp(worldChunkOf(c))) { return 0u; }
-  return irradiance[GI_CACHE_BASE + irrIndexOfCell(c, face)];
+  return atomicLoad(&irradiance[GI_CACHE_BASE + irrIndexOfCell(c, face)]);
 }
 fn giBounceAt(p : vec3f, n : vec3f, cell : vec3<i32>) -> vec3f {
   if (TUNE_GI_CACHE_PERIOD <= 0) { return giGather(p, n, cell); }
@@ -5314,21 +5304,58 @@ fn giBounceAt(p : vec3f, n : vec3f, cell : vec3<i32>) -> vec3f {
   let face = openFaceOfNormal(n);
   let lo = vec3<u32>(cell & vec3<i32>(i32(CHUNK) - 1));
   let idx = GI_CACHE_BASE + irrIndex(slot, subOccBitLocal(lo), face);
-  var own = irradiance[idx];
+  var own = atomicLoad(&irradiance[idx]);
   // max(.., 1): the early return above folds the period-0 arm away, but the
   // modulo below is still compiled, and a const-evaluated `% 0u` is a Tint
   // error that refuses the whole shader (the first `nogicache` measurement
   // silently measured nothing for exactly that reason).
-  let phase = (R.frameIdx + ((slot * 2654435761u) >> 24u)) %
-              max(u32(TUNE_GI_CACHE_PERIOD), 1u);
-  if (own == 0u || phase == 0u) {
+  let period = max(u32(TUNE_GI_CACHE_PERIOD), 1u);
+  let clock = R.frameIdx + ((slot * 2654435761u) >> 24u);
+  let phase = clock % period;
+  // ---- ONE GATHERER PER FACE PER REFRESH (the election) ----
+  // The gather runs from the FACE CENTRE, so every pixel on a due face used to
+  // compute the identical nine rays and race to store the identical word -- a
+  // near wall of 20k pixels paid 20k gathers for one number. Bit 1 of the
+  // word now carries the parity of the refresh EPOCH (clock / period) the
+  // word was gathered in; on a due frame the first pixel to flip it with a
+  // compare-exchange gathers and stores, and every other pixel sees the
+  // flipped bit (or loses the exchange) and reads the word as it stands. The
+  // claim KEEPS THE OLD COLOUR, so a neighbour's bilinear tap never reads a
+  // placeholder -- it reads the last gather until the new one lands.
+  //
+  // Two consequences, both small. Bits 0 and 1 are the red mantissa's lowest
+  // two (bit 0 was already forced on as "gathered"): <= 3/512 of the red
+  // channel. And a face that was OFF SCREEN across an even number of its
+  // refreshes comes back with a parity that already matches, so it re-gathers
+  // one period later than before (at most 2 x giCachePeriod frames, ~0.5 s
+  // at 16) -- the cache's latency, not its value, which is what the bounce
+  // already trails the sun by.
+  //
+  // A face never gathered (word 0) is NOT elected: every pixel on it gathers
+  // live that one frame, as before, and stores the same word. Electing it
+  // would leave the losers a word with no colour in it for a frame, and the
+  // first sight of a chunk is exactly when that would show.
+  let epochBit = ((clock / period) & 1u) << 1u;
+  if (own == 0u) {
     let half = f32(SUBOCC_BLOCK) * 0.5;
     let blockMin = cell - vec3<i32>(lo & vec3<u32>(SUBOCC_BLOCK - 1u));
     let ro = vec3f(blockMin) + vec3f(half) + n * (half + 0.5);
     // The low bit forced on: 0 must mean "never", and a face in the dark
     // gathers a true zero.
-    own = packRgb9e5(giGatherRays(ro, n, face)) | 1u;
-    irradiance[idx] = own;
+    own = (packRgb9e5(giGatherRays(ro, n, face)) & 0xFFFFFFFDu) | 1u | epochBit;
+    atomicStore(&irradiance[idx], own);
+  } else if (phase == 0u && (own & 2u) != epochBit) {
+    let claim = atomicCompareExchangeWeak(&irradiance[idx], own,
+                                          (own & 0xFFFFFFFDu) | epochBit);
+    if (claim.exchanged) {
+      let half = f32(SUBOCC_BLOCK) * 0.5;
+      let blockMin = cell - vec3<i32>(lo & vec3<u32>(SUBOCC_BLOCK - 1u));
+      let ro = vec3f(blockMin) + vec3f(half) + n * (half + 0.5);
+      own = (packRgb9e5(giGatherRays(ro, n, face)) & 0xFFFFFFFDu) | 1u | epochBit;
+      atomicStore(&irradiance[idx], own);
+    } else {
+      own = claim.old_value;
+    }
   }
   if (TUNE_OPENNESS_BILINEAR == 0) { return unpackRgb9e5(own); }
   // The four taps, as opennessAt places them: block centres in the face
@@ -5388,30 +5415,8 @@ fn giBounceAt(p : vec3f, n : vec3f, cell : vec3<i32>) -> vec3f {
 // per-voxel static into patches that read as material variation. Two octaves at
 // different world scales: a broad one for large-scale mottling, a fine one that
 // still varies per voxel but at a fraction of the amplitude.
-fn vnHash(c : vec3<i32>) -> f32 {
-  return f32(pcg(u32(c.x * 374761393 + c.y * 668265263 + c.z * 1274126177)) &
-             0xFFFFu) * (1.0 / 65535.0);
-}
-// Trilinear value noise over a lattice of `scale` voxels.
-fn valueNoise(p : vec3f, scale : f32) -> f32 {
-  let q = p / scale;
-  let i = vec3<i32>(floor(q));
-  var f = fract(q);
-  f = f * f * (3.0 - 2.0 * f);   // smoothstep fade — no lattice creases
-  let c000 = vnHash(i + vec3<i32>(0,0,0));
-  let c100 = vnHash(i + vec3<i32>(1,0,0));
-  let c010 = vnHash(i + vec3<i32>(0,1,0));
-  let c110 = vnHash(i + vec3<i32>(1,1,0));
-  let c001 = vnHash(i + vec3<i32>(0,0,1));
-  let c101 = vnHash(i + vec3<i32>(1,0,1));
-  let c011 = vnHash(i + vec3<i32>(0,1,1));
-  let c111 = vnHash(i + vec3<i32>(1,1,1));
-  let x00 = mix(c000, c100, f.x);
-  let x10 = mix(c010, c110, f.x);
-  let x01 = mix(c001, c101, f.x);
-  let x11 = mix(c011, c111, f.x);
-  return mix(mix(x00, x10, f.y), mix(x01, x11, f.y), f.z);
-}
+// vnHash / valueNoise live in common.wgsl: the micro-body stain mottle
+// (microbody.wgsl) samples the same field, and used to carry a private copy.
 
 // Multiplicative brightness grain in roughly [1-amp, 1+amp].
 fn surfaceGrain(cell : vec3<i32>, amp : f32) -> f32 {
@@ -5596,15 +5601,24 @@ fn voxelAO(cell : vec3<i32>, n : vec3<i32>, a1 : i32, a2 : i32, uv : vec2f) -> f
 // The code below is correct and hot-reloadable; set shadowMaxDist to a real
 // distance to re-run the experiment. It is not on any frame's critical path
 // while the default stands.
+// The cascade half of sunShadowAt, for a receiver past TUNE_SHADOW_MAX_DIST.
+// Split out so the SHADOW_CACHE caller in fs() can reach it WITHOUT compiling
+// the near traceOpaque arm in behind it: with the cache on, that arm is
+// unreachable from there (the cache serves every receiver inside the distance)
+// but the compiler cannot prove it through sunShadowAt's own re-test.
+fn sunShadowFar(hp : vec3f, n : vec3f, camDistFine : f32) -> f32 {
+  // Lift the start point off the face by half a CASCADE cell, not half a
+  // voxel: at this level the receiver's own cell is what the ray would
+  // otherwise immediately hit, exactly as the far-field call site does.
+  let lvl = farLevelForDist(camDistFine);
+  let off = n * (0.55 * f32(1u << farCellShift(lvl)));
+  if (farShadowed(lvl, hp + off)) { return TUNE_SHADOW_FAR_LIFT; }
+  return 1.0;
+}
+
 fn sunShadowAt(hp : vec3f, n : vec3f, px : vec2f, camDistFine : f32) -> f32 {
   if (camDistFine * VOXEL_METERS > TUNE_SHADOW_MAX_DIST) {
-    // Lift the start point off the face by half a CASCADE cell, not half a
-    // voxel: at this level the receiver's own cell is what the ray would
-    // otherwise immediately hit, exactly as the far-field call site does.
-    let lvl = farLevelForDist(camDistFine);
-    let off = n * (0.55 * f32(1u << farCellShift(lvl)));
-    if (farShadowed(lvl, hp + off)) { return TUNE_SHADOW_FAR_LIFT; }
-    return 1.0;
+    return sunShadowFar(hp, n, camDistFine);
   }
   // traceOpaque, not trace(): identical answer for a media-blind ray (the
   // shadow-cache gate asserts it against the compute-stage cast) and none of
@@ -8552,6 +8566,7 @@ fn writeWaterVeil(fragXY : vec2f, tSurf : f32, pathCap : f32, colorNow : vec3f,
   waterVeil[b + 4u] = packRgb9e5(gVAbsorb);
   waterVeil[b + 5u] = pack2x16float(vec2f(clamp(pathCap, 0.0, 60000.0),
                                           clamp(gVCurv, 0.0, 60000.0)));
+  waterVeil[b + 6u] = R.frameIdx;   // the stamp that makes the record live
 }
 
 // ============================================================================
@@ -9942,12 +9957,8 @@ fn shadeMpmFluid(ro : vec3f, rd : vec3f, fh : FluidHit, caMat : u32,
 
 @fragment
 fn fs(in : VSOut) -> FSOut {
-  // Every pixel starts dry; a liquid shade below overwrites the record. Done
-  // FIRST so nothing about it is live across trace().
-  if (WATER_VEIL) {
-    let vb = veilBase(in.pos.xy, &R);
-    if (vb != 0xFFFFFFFFu && vb < arrayLength(&waterVeil)) { waterVeil[vb] = 0u; }
-  }
+  // No per-pixel "dry" clear: a veil record is live only when its w6 names
+  // this frame (common.wgsl THE WATER VEIL), and only liquid pixels write one.
   if (RENDER_STATS) {
     // The 1-in-16 sample: every fourth pixel on both axes. Decided once here;
     // rsAdd() reads the flag on every count.
@@ -10421,8 +10432,14 @@ fn fs(in : VSOut) -> FSOut {
       // is farShadowed's own cascade march, not trace() — a much smaller
       // register footprint, and it was already here.
       var sh = 1.0;
-      if (SHADOW_CACHE && h.t * VOXEL_METERS <= TUNE_SHADOW_MAX_DIST) {
-        sh = shadowCached(hitP, h.cell, h.axis, h.sgn, h.t);
+      if (SHADOW_CACHE) {
+        // The cache or the cascade: the per-voxel traceOpaque fallback cannot
+        // run from here, so it is not compiled in (sunShadowFar).
+        if (h.t * VOXEL_METERS <= TUNE_SHADOW_MAX_DIST) {
+          sh = shadowCached(hitP, h.cell, h.axis, h.sgn, h.t);
+        } else {
+          sh = sunShadowFar(hitP, n, h.t);
+        }
       } else {
         sh = sunShadowAt(hitP, n, in.pos.xy, h.t);
       }
@@ -10499,7 +10516,7 @@ fn fs(in : VSOut) -> FSOut {
     // lava, embers and burning foliage deposit their emission into the
     // irradiance grid through `irrSample`, and `giGather` below picks it up. So
     // adding a glow sample here DOUBLE-COUNTS every emitter inside the gather's
-    // TUNE_GI_GATHER_BLOCKS reach (1.2 m at the shipped 3).
+    // TUNE_GI_GATHER_BLOCKS reach (a room's width at the shipped 12 steps).
     //
     // What it buys when it IS on is the range past that: the glow field reaches
     // render.glowReach (2.4 m) and needs no ray, so a lava pool lights rock the
@@ -10546,8 +10563,9 @@ fn fs(in : VSOut) -> FSOut {
           opennessGen[chunkIndexW(h.cell)] == opennessStamp(worldChunkOf(h.cell))) {
         let wi = irrIndexOfCell(h.cell, openFaceOfNormal(n));
         let outgoing = albedo * sun + bounce;
-        irradiance[wi] =
-            packRgb9e5(mix(unpackRgb9e5(irradiance[wi]), outgoing, TUNE_GI_FEEDBACK));
+        atomicStore(&irradiance[wi],
+            packRgb9e5(mix(unpackRgb9e5(atomicLoad(&irradiance[wi])), outgoing,
+                           TUNE_GI_FEEDBACK)));
       }
     }
 
@@ -10678,19 +10696,11 @@ fn fs(in : VSOut) -> FSOut {
     if (h.liqT <= 0.0) { color = applyAerial(color, rd, h.t); }
 
     // ---- active-voxel debug highlight (dev panel toggle) ----
-    if (SPEC_DEBUG_VIZ && (R.flags & 2u) != 0u) {
-      let avs = vec3<u32>(h.cell & vec3<i32>(WORLD_MASK));
-      let ave = pageTable[chunkIndexOf(avs)];
-      if ((ave & PT_SENTINEL_BIT) == 0u) {
-        let avlo = avs % CHUNK;
-        let avi = ave * CHUNK_VOL + (avlo.z * CHUNK + avlo.y) * CHUNK + avlo.x;
-        if (isVoxActive(avi)) {
-          let ed = min(uv, 1.0 - uv);
-          let me = min(ed.x, ed.y);
-          if (me < 0.08) {
-            color = vec3f(1.0, 0.05, 0.05);
-          }
-        }
+    if (SPEC_DEBUG_VIZ && (R.flags & 2u) != 0u && voxActiveAtCell(h.cell)) {
+      let ed = min(uv, 1.0 - uv);
+      let me = min(ed.x, ed.y);
+      if (me < 0.08) {
+        color = vec3f(1.0, 0.05, 0.05);
       }
     }
   }
@@ -10919,8 +10929,9 @@ fn fs(in : VSOut) -> FSOut {
   //     it got there, which is precisely what caShadedLiquid records.
   if (SPEC_FLUID && mf.hit && !caShadedLiquid) {
     let caMatRaw = select(MAT_AIR, voxMat(voxWordAt(h.liqCell)), h.liqT > 0.0);
+    // caMatRaw IS the liquid cell's material whenever liqT > 0.05 > 0.
     let viscousNearer = h.liqT > 0.05 && h.liqT < mf.t
-                        && isViscousLiquid(materials[voxMat(voxWordAt(h.liqCell))]);
+                        && isViscousLiquid(materials[caMatRaw]);
     if (!viscousNearer) {
       // The SETTLED water this surface is standing on (see the SEAM SHADING
       // block above shadeMpmFluid). Only a non-viscous CA liquid the primary

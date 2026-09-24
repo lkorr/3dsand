@@ -340,7 +340,7 @@ SPEC = [
     ("render", "farPlumeRange", "TUNE_FAR_PLUME_RANGE", "f", 3276.8),
 
     # in-window LOD handoff (PLAN_surface_flight_perf.md A1)
-    ("render", "lodHandoffDist", "TUNE_LOD_HANDOFF_DIST", "f", 24.0),
+    ("render", "lodHandoffDist", "TUNE_LOD_HANDOFF_DIST", "f", 26.0),
     ("render", "shadowMaxDist", "TUNE_SHADOW_MAX_DIST", "f", 999.0),
 
     # SHORT-RANGE MODE (dev panel checkbox, RenderParams flag bit 2)

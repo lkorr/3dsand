@@ -2271,6 +2271,9 @@ void Simulation::EncodeShadowResolve(const rhi::CommandEncoder& enc) {
     cx.cloudGy = (cf.lowH + 7) / 8;
   }
   RecordTable(enc, pass::Table::ShadowCache, &cx);
+  // The weather row just recorded: if the uniform asked it to rebuild the map
+  // (kClfWeather), that map is now the one later frames reuse.
+  if (clouds) sandvox::CommitCloudWeather();
 }
 
 // Materialize `count` JITTER pages from the (slot, entry) pairs the caller has
@@ -2789,14 +2792,17 @@ void Simulation::BuildRenderBindGroup(rhi::BindGroup& out,
 }
 
 // The veil is per PIXEL, so it follows the largest target a world pass has
-// drawn into (24 bytes a pixel: ~50 MB at 1080p). Grow-only, like the depth
+// drawn into (kVeilWords x 4 = 28 bytes a pixel: ~58 MB at 1080p). Grow-only, like the depth
 // caches are keyed, so alternating a native frame with a smaller --shot or
 // portrait never reallocates; a rebuilt renderBG_ is the only side effect.
 void Simulation::EnsureVeil(uint32_t width, uint32_t height) {
   const uint64_t px = (uint64_t)width * height;
   if (px <= veilPixels_) return;
   veilPixels_ = px;
-  veilBuf_ = CreateBuffer(device_, px * 6 * 4, rhi::BufferUsage::Storage,
+  // Must match VEIL_WORDS in common.wgsl: six words of record + the frame
+  // stamp that marks it live (w6, which replaced the per-pixel dry clear).
+  constexpr uint64_t kVeilWords = 7;
+  veilBuf_ = CreateBuffer(device_, px * kVeilWords * 4, rhi::BufferUsage::Storage,
                           "waterVeil");
   BuildRenderBindGroup(renderBG_, veilBuf_);
 }
@@ -3569,6 +3575,7 @@ rhi::RenderPass Simulation::BeginRenderPass(const rhi::CommandEncoder& enc,
   EnsureDepth(width, height);
   EnsureVeil(width, height);
   veilLive_ = false;  // until this pass's DrawWorld writes it
+  veilSplitPending_ = false;
 
   rhi::RenderPassDesc d{};
   d.label = "world";
@@ -3596,6 +3603,7 @@ rhi::RenderPass Simulation::BeginAuxRenderPass(const rhi::CommandEncoder& enc,
   EnsureAuxDepth(width, height);
   EnsureVeil(width, height);
   veilLive_ = false;  // until this pass's DrawWorld writes it
+  veilSplitPending_ = false;
 
   rhi::RenderPassDesc d{};
   d.label = "aux";
@@ -3621,6 +3629,7 @@ rhi::RenderPass Simulation::BeginOverlayRenderPass(const rhi::CommandEncoder& en
   EnsureRenderPipelines(format);
   EnsureOverlayDepth(width, height);
   veilLive_ = false;  // until this pass's DrawWorld writes it
+  veilSplitPending_ = false;
 
   rhi::RenderPassDesc d{};
   d.label = "overlay";
@@ -3666,15 +3675,24 @@ void Simulation::DrawWorld(const rhi::RenderPass& pass) {
   // stores the raymarch writes no record, so the body passes must not read
   // one — they keep renderBGNoVeil_, and the raymarch keeps its depth at the
   // liquid interface, which is the old contract whole.
-  if (veilPixels_ > 0 && FragmentStoresAvailable()) {
+  //
+  // The split itself is LAZY (VeilReaderBG): only the first draw that reads
+  // the veil takes it, so a pass that draws nothing after the world pays none.
+  if (veilPixels_ > 0 && FragmentStoresAvailable()) veilSplitPending_ = true;
+}
+
+const rhi::BindGroup& Simulation::VeilReaderBG(const rhi::RenderPass& pass) {
+  if (veilSplitPending_) {
     pass.SplitAfterFragmentWrite(veilBuf_);
     veilLive_ = true;
+    veilSplitPending_ = false;
   }
+  return BodyRenderBG();
 }
 
 void Simulation::DrawParticles(const rhi::RenderPass& pass) {
   pass.SetPipeline(particleDraw_);
-  pass.SetBindGroup(0, BodyRenderBG());
+  pass.SetBindGroup(0, VeilReaderBG(pass));
   pass.SetBindGroup(1, renderPartBG_[page_]);
   pass.DrawIndirect(world_->drawArgs, 0);
 }
@@ -3682,7 +3700,7 @@ void Simulation::DrawParticles(const rhi::RenderPass& pass) {
 void Simulation::DrawSprites(const rhi::RenderPass& pass, uint32_t count) {
   if (count == 0) return;
   pass.SetPipeline(spriteDraw_);
-  pass.SetBindGroup(0, BodyRenderBG());
+  pass.SetBindGroup(0, VeilReaderBG(pass));
   pass.SetBindGroup(1, renderPartBG_[page_]);
   pass.Draw(36, count);
 }
@@ -3690,7 +3708,7 @@ void Simulation::DrawSprites(const rhi::RenderPass& pass, uint32_t count) {
 void Simulation::DrawFluid(const rhi::RenderPass& pass, uint32_t count) {
   if (count == 0) return;   // no fluid placed: costs nothing
   pass.SetPipeline(fluidDraw_);
-  pass.SetBindGroup(0, BodyRenderBG());
+  pass.SetBindGroup(0, VeilReaderBG(pass));
   pass.SetBindGroup(1, renderPartBG_[page_]);
   pass.Draw(36, count);
 }
@@ -3736,7 +3754,7 @@ void Simulation::DrawCurrentField(const rhi::RenderPass& pass,
 
 void Simulation::DrawBodies(const rhi::RenderPass& pass, uint32_t voxInstances) {
   if (voxInstances == 0) return;
-  pass.SetBindGroup(0, BodyRenderBG());
+  pass.SetBindGroup(0, VeilReaderBG(pass));
   pass.SetBindGroup(1, renderPartBG_[page_]);
   // Depth first, then colour: the second draw's fragments pass GreaterEqual
   // only where they are the nearest body surface, so fsBody's per-fragment
@@ -3762,7 +3780,7 @@ uint32_t Simulation::UploadMicroBodyInsts(const rhi::Queue& queue,
 void Simulation::DrawMicroBodies(const rhi::RenderPass& pass, uint32_t count) {
   if (count == 0) return;  // nothing uploaded this frame: no bind, no draw
   pass.SetPipeline(microBodyDraw_);
-  pass.SetBindGroup(0, BodyRenderBG());
+  pass.SetBindGroup(0, VeilReaderBG(pass));
   pass.SetBindGroup(1, microBodyBG_);
   pass.Draw(36, count);
 }

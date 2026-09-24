@@ -4084,7 +4084,7 @@ struct Tuning {
     float cloudCirrusScaleM = 7000.0f;
     // How much the clouds in a direction colour the distance fog and reflections in it (the env map).
     float cloudFogMix = 1.0f;
-    float lodHandoffDist = 24.0f;
+    float lodHandoffDist = 26.0f;  // shipped: 26 = past the 25.6 m window face, i.e. OFF (tuning.json)
     // ---- frame pacing and internal resolution (CPU-only: no .def row, no
     // TUNE_* constant — nothing here reaches a shader) ----------------------
     //
