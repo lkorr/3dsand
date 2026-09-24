@@ -544,36 +544,20 @@ fn gasKey(c : vec3<i32>, payload : u32) -> u32 {
 //     has no neighbours to count, and scaledChance's answer would be a
 //     fabrication. Skipping is the conservative direction: the rule simply
 //     does not apply to gas that has left.
-//   * nothing else. RCOND_SKY is SATISFIED by construction — a parcel above
-//     the window has nothing over it — and the day/night gates read T.dayPhase
-//     exactly as the CA does.
+//   * nothing else. The condition gate is common.wgsl's reactGate, the one
+//     the CA and (by mirror) the body burners use; what is this caller's own
+//     is only the two exposure answers, and both are TRUE by construction: a
+//     parcel above the window has nothing over it (RCOND_SKY), and it is
+//     under open sky, so rain reaches it (a douse applies whenever it rains,
+//     an ignition is damped whenever anything is wet).
 fn gasDecayProduct(m : Material, key : u32) -> u32 {
   let day = daylightStrength(T.dayPhase);
   for (var ri = 0u; ri < m.reactCount; ri++) {
     let rule = reactions[m.reactOffset + ri];
     if ((rule.packed & 3u) != RK_DECAY) { continue; }
     if ((rule.cond & RSCALE_ON) != 0u) { continue; }
-    let cond = rule.cond & 0xFFu;
-    // Weather (sim_step rainChance): a parcel above the window is under open
-    // sky by construction, so it is rain-exposed and a douse applies whenever
-    // it rains. Same integer arithmetic as the CA and RainScaledChance.
-    var chance = rule.chance;
-    let rain = T.weatherRain & 0xFFu;
-    if ((cond & RCOND_RAIN) != 0u) {
-      if (rain == 0u) { continue; }
-      chance = (chance * rain / 255u) * rain / 255u;
-    } else if ((cond & RCOND_RAINDAMP) != 0u) {
-      let wet = max(rain, (T.weatherRain >> 16u) & 0xFFu);
-      if (wet != 0u) {
-        let damp = (T.weatherRain >> 8u) & 0xFFu;
-        chance = chance * (255u - (wet * damp + 127u) / 255u) / 255u;
-      }
-    }
-    if (cond != 0u) {
-      if ((cond & RCOND_DAY) != 0u && day == 0u) { continue; }
-      if ((cond & RCOND_NIGHT) != 0u && day != 0u) { continue; }
-      if (day < ((rule.cond >> 8u) & 0xFFu)) { continue; }
-    }
+    let chance = reactGate(rule.cond, rule.chance, day, T.weatherRain, true, true);
+    if (chance == 0u) { continue; }
     let rr = hash3(key, ri, GAS_DECAY_SALT);
     if ((rr % REACT_CHANCE_DEN) < chance) { return rule.prodSelf; }
   }

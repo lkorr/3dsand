@@ -66,18 +66,16 @@ inline bool ReactNbrMatches(const ReactionGpu& r, uint32_t nmat,
 // reason it is treated as seeing the sky. Callers then roll against
 // RainScaledChance(r.cond, chance, rainWord, true) — the gate and the scale are
 // both needed, exactly as lightMatches + rainChance are in the shader.
+// The tick-only half is reactPhaseOpen (materials.h), the mirror of the one
+// WGSL definition in common.wgsl; the exposure half is `seesSky`, which a body
+// answers for both the sky and the rain.
 inline bool ReactLightMatches(const ReactionGpu& r, uint32_t dayPhase,
                               bool seesSky, uint32_t rainWord) {
   const uint32_t cond = r.cond & 0xFFu;
   if (cond == 0) return true;  // unconditional: the common case, free
-  if ((cond & kCondRain) != 0 &&
-      ((rainWord & kRainAmountMask) == 0 || !seesSky))
+  if (!reactPhaseOpen(r.cond, DaylightStrengthCpu(dayPhase), rainWord))
     return false;
-  const uint32_t day = DaylightStrengthCpu(dayPhase);
-  if ((cond & kCondDay) != 0 && day == 0) return false;
-  if ((cond & kCondNight) != 0 && day != 0) return false;
-  const uint32_t minLight = (r.cond >> 8) & 0xFFu;
-  if (day < minLight) return false;
+  if ((cond & kCondRain) != 0 && !seesSky) return false;
   if ((cond & kCondSky) != 0 && !seesSky) return false;
   return true;
 }

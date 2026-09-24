@@ -26,6 +26,36 @@ std::string FormatMille(double mille) {
   return s;
 }
 
+std::vector<uint8_t> SmokeSourceTable(const std::vector<MaterialDef>& mats,
+                                      const std::vector<ReactionGpu>& reactions) {
+  std::vector<uint8_t> out(mats.size(), 0u);
+  // The two products that ARE smoke in the sky, resolved by name like every
+  // other authored reference (an absent one simply never matches).
+  uint32_t fireId = 0, smokeId = 0;
+  for (size_t i = 1; i < mats.size(); i++) {
+    if (mats[i].name == "fire") fireId = (uint32_t)i;
+    if (mats[i].name == "smoke") smokeId = (uint32_t)i;
+  }
+  auto smoky = [&](uint32_t p) {
+    return p != 0 && p != kProdKeep && (p == fireId || p == smokeId);
+  };
+  for (size_t i = 1; i < mats.size(); i++) {   // 0 is air
+    const MaterialGpu& g = mats[i].gpu;
+    for (uint32_t k = 0; k < g.reactCount; k++) {
+      const size_t ri = (size_t)g.reactOffset + k;
+      if (ri >= reactions.size()) break;
+      const ReactionGpu& r = reactions[ri];
+      const uint32_t kind = r.packed & 3u;
+      if ((kind == kReactDecay && smoky(r.prodSelf)) ||
+          (kind == kReactEmit && smoky(r.prodNbr))) {
+        out[i] = 1u;
+        break;
+      }
+    }
+  }
+  return out;
+}
+
 static bool ParseColor(const std::string& hex, uint32_t& out) {
   if (hex.size() != 7 || hex[0] != '#') return false;
   uint32_t v = 0;

@@ -49,6 +49,15 @@
 @group(0) @binding(2) var<storage, read_write> dirtyOut : array<atomic<u32>>;
 @group(0) @binding(3) var<storage, read> materials : array<Material>;
 @group(0) @binding(4) var<uniform> T : TickParams;
+// The compiled reaction table (slim group, same number as sim_step's).
+// particleTick walks a particle's bucket to decide whether it has a reaction
+// partner beside it — the wake that lets excited fluid run its own rules
+// (sim_step's excitedReact) in a chunk the CA had let sleep.
+@group(0) @binding(11) var<storage, read> reactions : array<Reaction>;
+// Support-loss flags (slim group, same number as sim_step's): stainApply's
+// stain CONSUMPTION removes a solid, and whatever it held up must be scanned,
+// exactly as when the CA's doStaining eats one (common.wgsl flagSupportLoss).
+@group(0) @binding(15) var<storage, read_write> supportOut : array<atomic<u32>>;
 @group(0) @binding(17) var<storage, read> pageTable : array<u32>;
 @group(0) @binding(18) var<storage, read_write> pageFaults : array<atomic<u32>>;
 // This module's page-fault identity (common.wgsl's PT_K_* block). Every
@@ -1486,20 +1495,45 @@ fn particleTick(@builtin(global_invocation_id) gid : vec3<u32>) {
     let ci = (bm - 1u) * CHUNK_VOL + (lo.z * CHUNK + lo.y) * CHUNK + lo.x;
     atomicMax(&fluidCellScratch[ci * 2u], intent);
   }
+  // The particle's OWN rules run in the CA next tick (sim_step excitedReact),
+  // over the occupancy intent just written -- but only in a chunk the CA is
+  // processing. This is what puts it there.
+  seamReactWake(cell, slot, m);
   if (sType == 0u) { return; }
 
-  // Solid/powder face neighbours: stain intents (applied by stainApply).
-  for (var f = 0u; f < 6u; f++) {
-    var d = vec3<i32>(0, 0, 0);
-    if (f == 0u) { d.x = 1; } else if (f == 1u) { d.x = -1; }
-    else if (f == 2u) { d.y = 1; } else if (f == 3u) { d.y = -1; }
-    else if (f == 4u) { d.z = 1; } else { d.z = -1; }
-    let n = cell + d;
+  // Solid/powder face neighbours: stain intents (applied by stainApply), and
+  // this particle's DONOR BID on one of them.
+  //
+  // THE DONOR is how excited fluid pays for wetting absorbent ground, in the
+  // same currency the CA pays (doStaining's absorption: one eighth per level
+  // of stain on ground that declared `absorb`). stainApply decides the stain
+  // one SOLID cell per thread, and the mass it must charge lives in particles
+  // in the cells around it; the bid names exactly one particle to charge.
+  //   * Each particle bids on at most ONE neighbour: the first, in a rotation
+  //     keyed on its CELL, that common.wgsl's stainStep says a contact would
+  //     deepen AND charge (STAIN_SPEND). Keying on the cell makes every
+  //     particle of one cell pick the same face -- one liquid cell, one soaked
+  //     neighbour per tick, which is the CA's own rate.
+  //   * The bid is (index + 1) << 1, atomicMax into the neighbour's FLAGS
+  //     word: the highest-index bidder wins, a pure function of the particle
+  //     order compaction produced (slot order, rule 1), never of scheduling.
+  //     Shifted clear of bit0, the CA's consume flag. That word is zero here
+  //     (cellClear ran at the head of this phase) and stainApply clears it
+  //     after reading, so the CA never sees a bid.
+  //   * Because each particle bids once, the thread that wins a cell is the
+  //     only writer of that particle's attr: stainApply can charge it with a
+  //     plain store (no race, no CAS).
+  let rot = hash3(T.seed ^ 0xD0A0u, T.tick, cellIndexW(cell)) % 6u;
+  let washes = matWashes(m);
+  var bid = false;
+  for (var k = 0u; k < 6u; k++) {
+    let n = cell + faceDir((k + rot) % 6u);
     if (!cellResident(n, T.origin)) { continue; }
-    let nmat = voxMat(voxWordAt(n));
+    let nw = voxWordAt(n);
+    let nmat = voxMat(nw);
     if (nmat == MAT_AIR) { continue; }
-    let nk = materials[nmat].klass;
-    if (nk != CLASS_SOLID && nk != CLASS_POWDER) { continue; }
+    let nm = materials[nmat];
+    if (nm.klass != CLASS_SOLID && nm.klass != CLASS_POWDER) { continue; }
     let nwc = worldChunkOf(n);
     let nsl2 = chunkSlotOf(nwc, T.origin);
     if (nsl2 == SLOT_NONE) { continue; }
@@ -1509,18 +1543,78 @@ fn particleTick(@builtin(global_invocation_id) gid : vec3<u32>) {
     let nlo = vec3<u32>(n & vec3<i32>(CHUNK_MASK));
     let nci = (nbm - 1u) * CHUNK_VOL + (nlo.z * CHUNK + nlo.y) * CHUNK + nlo.x;
     atomicMax(&fluidCellScratch[nci * 2u], intent);
+    if (!bid && (stainStep(sType, sAmt, washes, nw, nm).y & STAIN_SPEND) != 0u) {
+      atomicMax(&fluidCellScratch[nci * 2u + 1u], (gid.x + 1u) << 1u);
+      bid = true;
+    }
+  }
+}
+
+// The wake for excited fluid's own rules. Marks the particle's OWN chunk
+// DIRTY_R_REACT (next tick's business, like every seam mark) when running this
+// material's bucket here could do something -- the same condition doReactions
+// uses to hold a chunk awake (`keepAwake`), evaluated from the particle side:
+//   * a light/weather-GATED rule never wakes (doReactions' lightGated note: a
+//     condition that holds for half a day must not pin chunks awake -- it
+//     still runs whenever the chunk is awake for another reason);
+//   * an ungated DECAY or EMIT can fire anywhere, so it wakes;
+//   * an ungated PAIR wakes only if a face neighbour VOXEL matches it in its
+//     authored direction and the rule would change something (the no-op
+//     rewrite exclusion doReactions makes). Excited neighbours are not
+//     probed: a fluid-fluid pair is rare and is caught whenever either side's
+//     chunk is awake.
+// So a splash over plain rock wakes nothing (water's only ungated rule wants
+// tag:hot), acid on stone wakes its chunk, water on lava wakes its chunk.
+// Bounded (rule 2): a mark per chunk per tick, only while particles with a
+// live partner exist; the partner is finite and the particles settle.
+// Deterministic: an OR of one bit, guarded by a load that only ever skips a
+// redundant OR.
+fn seamReactWake(cell : vec3<i32>, slot : u32, m : Material) {
+  if (m.reactCount == 0u) { return; }
+  if ((atomicLoad(&dirtyOut[slot]) & DIRTY_R_REACT) != 0u) { return; }
+  var anyPair = false;
+  for (var ri = 0u; ri < m.reactCount; ri++) {
+    let rule = reactions[m.reactOffset + ri];
+    if ((rule.cond & RCOND_GATES) != 0u) { continue; }
+    if ((rule.packed & 3u) != RK_PAIR) {
+      atomicOr(&dirtyOut[slot], DIRTY_R_REACT);
+      return;
+    }
+    anyPair = true;
+  }
+  if (!anyPair) { return; }
+  for (var f = 0u; f < 6u; f++) {
+    let n = cell + faceDir(f);
+    if (!cellResident(n, T.origin)) { continue; }
+    let nmat = voxMat(voxWordAt(n));
+    if (nmat == MAT_AIR) { continue; }
+    let nm = materials[nmat];
+    for (var ri = 0u; ri < m.reactCount; ri++) {
+      let rule = reactions[m.reactOffset + ri];
+      if ((rule.cond & RCOND_GATES) != 0u || (rule.packed & 3u) != RK_PAIR) {
+        continue;
+      }
+      if ((faceDirBit(f) & ((rule.packed >> 2u) & 7u)) == 0u) { continue; }
+      if (!nbrMatches(rule, nmat, nm)) { continue; }
+      if (rule.prodSelf == PROD_KEEP && rule.prodNbr == nmat) { continue; }
+      atomicOr(&dirtyOut[slot], DIRTY_R_REACT);
+      return;
+    }
   }
 }
 
 // stainApply: one thread per active-block cell (the node-pass indirect args
-// from the last substep). A SOLID cell with a stain intent rolls the seam's
-// stain chance and takes the stain, following the CA's stain order: same
-// type climbs toward the substrate's ceiling, a foreign stain is only ever
-// washed DOWN (by a washing liquid), never painted over.
-// One thread owns one cell — no write races, and the roll keys on
+// from the last substep). A SOLID cell with a stain intent takes it by
+// common.wgsl's stainStep -- the SAME decision the CA's doStaining makes, so
+// the two stainers cannot drift again (rule-unification W1-B1). What is this
+// kernel's own is only the currency: the roll is the stainer material's
+// authored per-mille chance (it was the global sim.fluidStainRate, which is
+// now unread -- its .def row stays for W1-A to retire), consumption rolls the
+// stainer's `consume`, and wetting absorbent ground is paid by the DONOR
+// particle particleTick named (one eighth per level, as the CA pays in
+// fullness).
+// One thread owns one cell -- no write races, and the rolls key on
 // hash3(seed, tick, cellSlot): state, never scheduling (rule 1).
-const SEAM_STAIN_CHANCE : u32 =
-    u32(round(clamp(TUNE_FLUID_STAIN_RATE, 0.0, 30.0) * 65536.0 / 30.0));
 
 // A workgroup is one z-slice of ONE block, so all 256 threads share the
 // block's Y-mask word — the per-cell atomicOr (every liquid cell of a pool)
@@ -1556,7 +1650,13 @@ fn stainApply(@builtin(workgroup_id) wg : vec3<u32>,
 fn stainApplyCell(wgx : u32, li : u32) -> vec2<u32> {
   let block = wgx >> 4u;
   let localIdx = (wgx & 15u) * 256u + li;
-  let intent = atomicLoad(&fluidCellScratch[(block * CHUNK_VOL + localIdx) * 2u]);
+  let sci = block * CHUNK_VOL + localIdx;
+  let intent = atomicLoad(&fluidCellScratch[sci * 2u]);
+  // The donor bid (particleTick), read and CLEARED by the one thread that owns
+  // this cell, before any early return -- so the flags word is back to the
+  // CA's consume bits only, whatever this cell decides.
+  let bid = atomicLoad(&fluidCellScratch[sci * 2u + 1u]);
+  if (bid != 0u) { atomicStore(&fluidCellScratch[sci * 2u + 1u], 0u); }
   let sType = intent & 0x7u;
   let sAmt = (intent >> 3u) & 0xFu;
   let slot = fluidBlockList[block];
@@ -1583,40 +1683,47 @@ fn stainApplyCell(wgx : u32, li : u32) -> vec2<u32> {
   if (nmat == MAT_AIR) { return vec2<u32>(ybits, 0u); }
   let nk = materials[nmat].klass;
   if (nk != CLASS_SOLID && nk != CLASS_POWDER) { return vec2<u32>(ybits, 0u); }
+  // The STAINER is the intent's material (the dominant particle touching
+  // this cell); the stain is what that intent carries.
+  let sm = materials[intent >> 16u];
   let h = hash3(T.seed ^ 0x5741u, T.tick, cellIndexW(c));
-  if ((h & 0xFFFFu) >= SEAM_STAIN_CHANCE) { return vec2<u32>(ybits, 0u); }
-  // THE CA's STAIN ORDER (sim_step.wgsl doStaining), which this path used to
-  // break by painting over whatever was there:
-  //   * a FOREIGN stain (non-zero amount, another type) is never overwritten.
-  //     A washer (`stain: {washes: true}` on the particle's material — water)
-  //     steps it DOWN one level per contact, clearing the type with the last
-  //     level; a non-washer (blood, oil, ichor) leaves it alone.
-  //   * a clean cell, or one already carrying THIS stain type, takes the
-  //     stain: the substrate's absorb capacity caps how deep; the same type
-  //     climbs one level per contact and a clean cell starts at the ceiling.
-  // Every branch is a monotone step toward a fixed point (amount up to the
-  // ceiling, a foreign amount down to 0), so a wall under a standing flow
-  // still goes quiet (rule 2).
-  let cur = voxStainAmt(w);
-  let curType = voxStainType(w);
-  if (cur != 0u && curType != sType) {
-    if (!matWashes(materials[intent >> 16u])) {   // not ours to touch
-      return vec2<u32>(ybits, 0u);
+  if (!stainFires(sm, h)) { return vec2<u32>(ybits, 0u); }
+  let d = stainStep(sType, sAmt, matWashes(sm), w, materials[nmat]);
+  // No work: saturated, or a foreign stain a non-washer may not touch.
+  // Monotone either way, so a wall under a standing flow goes quiet (rule 2).
+  if ((d.y & STAIN_WORK) == 0u) { return vec2<u32>(ybits, 0u); }
+  if ((d.y & STAIN_SPEND) != 0u) {
+    // Absorbent ground drinks one eighth, and a contact with nobody to pay
+    // for it does not happen -- exactly as a CA liquid with no fullness left
+    // could not have soaked in. The donor is the one particle whose bid won
+    // this cell; each particle bids on one cell only, so this thread is its
+    // only writer this pass. Counted into FA_CONSUMED (the pool's "left for
+    // the world" column -- the mass audits read it) and, on its last eighth,
+    // FA_DEAD like any other kill.
+    if (bid == 0u) { return vec2<u32>(ybits, 0u); }
+    let di = (bid >> 1u) - 1u;
+    let a = fluidParticles[di].attr;
+    let f = fpFullness(a);
+    if (!fpAlive(a) || fpGhost(a)) { return vec2<u32>(ybits, 0u); }
+    if (f <= 1u) {
+      fluidParticles[di].attr = 0u;
+      atomicAdd(&fluidArgs[FA_DEAD], 1u);
+    } else {
+      fluidParticles[di].attr = (a & ~(0x7u << 12u)) | ((f - 1u) << 12u);
     }
-    let washed = cur - 1u;
-    voxels[idx] = (w & ~STAIN_BITS) |
-                  packStain(select(curType, 0u, washed == 0u), washed);
-    markDirtyNext(c);
-    return vec2<u32>(ybits, 1u);   // FA_STAINED, folded by the entry point
+    atomicAdd(&fluidArgs[FA_CONSUMED], 1u);
   }
-  let ceiling = min(sAmt, max(matAbsorbCapacity(materials[nmat]), 1u));
-  var amt = ceiling;
-  if (curType == sType && cur >= ceiling) {   // saturated: sleep
-    return vec2<u32>(ybits, 0u);
-  }
-  if (curType == sType) { amt = min(cur + 1u, ceiling); }
-  voxels[idx] = (w & ~STAIN_BITS) | packStain(sType, amt);
+  voxels[idx] = d.x;
   markDirtyNext(c);
+  // Consumption: the stain eats the voxel it just marked (the stainer's
+  // authored `consume`, a separate hash slice from the stain roll). A rinse
+  // eats nothing -- same as the CA.
+  if ((d.y & STAIN_WASH) == 0u &&
+      stainConsumes(sm, hash3(h, 0x51A17u, cellIndexW(c)))) {
+    voxels[idx] = 0u;
+    // The voxel that vanished may have been holding a solid up.
+    flagSupportLoss(c, materials[nmat].klass, MAT_AIR);
+  }
   return vec2<u32>(ybits, 1u);   // FA_STAINED, folded by the entry point
 }
 

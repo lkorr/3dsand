@@ -506,6 +506,22 @@ constexpr double kReactChanceMinMille = 1.0 / (double)kReactChanceScale;
 // (0.0005 rather than 0.000500).
 std::string FormatMille(double mille);
 
+struct MaterialDef;
+struct ReactionGpu;
+// WHICH MATERIALS MAKE SMOKE, read off the compiled reaction table
+// (rule-unification W1-B1). A voxel of material m is a smoke source iff m's
+// own bucket has a DECAY rule whose product is `fire` or `smoke`, or an EMIT
+// rule that emits one of them — i.e. exactly the materials that put smoke into
+// the sky in the near field, through the CA. `fire` qualifies by its own
+// decay-to-smoke rule; embers and every *_burning material by their emits;
+// lava and molten glass (tag:hot, emissive, but with no such rule) do not.
+// The far fire-plume index (FarPlumes::SetMaterials) asks this so that what
+// plumes at distance is what smokes up close — it used to ask "tagged hot,
+// emissive, not a gas", which made lava lakes plume at distance and nowhere
+// else. Returns one byte per material id (1 = source), sized mats.size().
+std::vector<uint8_t> SmokeSourceTable(const std::vector<MaterialDef>& mats,
+                                      const std::vector<ReactionGpu>& reactions);
+
 // Reaction kinds / direction bits — must match common.wgsl.
 constexpr uint32_t kReactPair = 0, kReactDecay = 1, kReactEmit = 2;
 constexpr uint32_t kDirDown = 1, kDirUp = 2, kDirSide = 4, kDirAny = 7;
@@ -535,23 +551,60 @@ constexpr uint32_t kRainAmountMask = 0xFFu;   // bits 0..7: rain reaching the gr
 constexpr uint32_t kRainDampShift = 8;        // bits 8..15: ignition damp strength at 255
 constexpr uint32_t kRainWetShift = 16;        // bits 16..23: ground wetness (lingers)
 
-// A reaction chance under this tick's weather. `exposed` is the caller's
-// answer to "does rain reach this cell" (the grid asks rainExposed(); a body
-// answers true, the seesSky precedent in reactcpu.h). Integer, divide-last,
-// and bit-identical to rainChance() in sim_step.wgsl. A kCondRain rule is
-// assumed to have passed its gate already (rain > 0 and exposed).
-inline uint32_t RainScaledChance(uint32_t cond, uint32_t chance,
-                                 uint32_t rainWord, bool exposed) {
+// ---- THE REACTION-CONDITION GATE, CPU mirror (rule-unification W1-B1) ----
+// Token for token the MIRROR block of the same tag in common.wgsl, which is
+// the one WGSL definition the CA (sim_step lightMatches / rainChance) and the
+// gas parcels (sim_gas gasDecayProduct) both call. scripts/check_invariants.py
+// `reactgate` compares the two token streams and the constants they read, so
+// an edit to either side that the other does not get fails the check rather
+// than making a body burn differently from the voxel beside it. Written in the
+// shader's spelling (lower-camel names, braces on every if) BECAUSE it is
+// compared as text; the engine-style names below are thin wrappers.
+//   reactPhaseOpen     — what the tick alone decides: a douse needs rain
+//                        falling; day / night / minLight. Exposure (sky, rain
+//                        reaching the cell) is the caller's to answer.
+//   reactWeatherChance — the rain rescale: a douse at (rain/255)^2, an
+//                        ignition cut by max(rain, wet) x damp where exposed.
+// Integer and divide-last: chance <= kReactChanceDen (2e6), so chance * 255
+// fits a u32.
+// MIRROR-BEGIN reactgate
+inline bool reactPhaseOpen(uint32_t cond, uint32_t day, uint32_t rainWord) {
+  const uint32_t c = cond & 0xFFu;
+  if (c == 0u) { return true; }
+  if ((c & kCondRain) != 0u && (rainWord & kRainAmountMask) == 0u) { return false; }
+  if ((c & kCondDay) != 0u && day == 0u) { return false; }
+  if ((c & kCondNight) != 0u && day != 0u) { return false; }
+  if (day < ((cond >> 8u) & 0xFFu)) { return false; }
+  return true;
+}
+inline uint32_t reactWeatherChance(uint32_t cond, uint32_t chance, uint32_t rainWord, bool exposed) {
   const uint32_t rain = rainWord & kRainAmountMask;
-  if ((cond & kCondRain) != 0) return (chance * rain / 255u) * rain / 255u;
-  if ((cond & kCondRainDamp) != 0 && exposed) {
+  if ((cond & kCondRain) != 0u) { return (chance * rain / 255u) * rain / 255u; }
+  if ((cond & kCondRainDamp) != 0u && exposed) {
     const uint32_t wet = std::max(rain, (rainWord >> kRainWetShift) & 0xFFu);
-    if (wet == 0) return chance;
+    if (wet == 0u) { return chance; }
     const uint32_t damp = (rainWord >> kRainDampShift) & 0xFFu;
     const uint32_t keep = 255u - (wet * damp + 127u) / 255u;
     return chance * keep / 255u;
   }
   return chance;
+}
+inline uint32_t reactGate(uint32_t cond, uint32_t chance, uint32_t day, uint32_t rainWord, bool sky,
+             bool exposed) {
+  if (!reactPhaseOpen(cond, day, rainWord)) { return 0u; }
+  if ((cond & kCondSky) != 0u && !sky) { return 0u; }
+  if ((cond & kCondRain) != 0u && !exposed) { return 0u; }
+  return reactWeatherChance(cond, chance, rainWord, exposed);
+}
+// MIRROR-END reactgate
+
+// A reaction chance under this tick's weather. `exposed` is the caller's
+// answer to "does rain reach this cell" (the grid asks rainExposed(); a body
+// answers true, the seesSky precedent in reactcpu.h). A kCondRain rule is
+// assumed to have passed its gate already (rain > 0 and exposed).
+inline uint32_t RainScaledChance(uint32_t cond, uint32_t chance,
+                                 uint32_t rainWord, bool exposed) {
+  return reactWeatherChance(cond, chance, rainWord, exposed);
 }
 
 // Neighbour-count scaling (ReactionGpu.cond bits 16..31) — see the RSCALE_*

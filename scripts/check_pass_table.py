@@ -384,6 +384,11 @@ _SLIM_GROUP0 = {"voxels", "dirtyIn", "dirtyOut", "materials", "T",
                 # name the same buffer here that it does in simBGL_. Same
                 # argument as waterBodyState and treeAtlas.
                 "supportOut",
+                # reactions is in the SLIM group as of rule-unification W1-B1:
+                # the seam's particleTick walks a particle's own bucket to wake
+                # its chunk (sim_step excitedReact runs the rules), and binding
+                # 11 has to name the same buffer here that it does in simBGL_.
+                "reactions",
                 # treeAtlas is in the SLIM group as well as the full one: `far`
                 # and `fardown` build on farPL_ and both reach the tree sampler
                 # (genCell -> treeAt, farSurfaceMat -> treeCanopyAt), so binding
