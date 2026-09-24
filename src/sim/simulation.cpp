@@ -1874,62 +1874,12 @@ namespace {
 // Everything the recorder needs to resolve a row's selectors, gathered once per
 // Encode* call. Conditions are all known on the CPU before recording begins
 // (barrier_graph §2.3), which is what makes a skipped row a non-event.
-struct RecordCtx {
-  uint32_t opsCount = 0;
-  uint32_t cellCount = 0;
-  uint32_t expCount = 0;
-  uint32_t spawnCount = 0;
-  uint32_t genCount = 0;
-  uint32_t farCount = 0;
-  uint32_t fluidCount = 0;       // MLS-MPM particles alive AFTER this tick's spawns
-  uint32_t fluidSpawnCount = 0;  // MLS-MPM spawn ops this tick
-  uint32_t windWakeCount = 0;    // wind primitive footprint chunks this tick
-  // Water-body chunk-list entries this tick (docs/PLAN_water_master.md M2).
-  // Mirrors rhi::TableCtx / vk_record.h, like every field here. Zero at
-  // sim.waterBodyMode 0, which is what makes C_WATERBODY false and leaves the
-  // whole subsystem unrecorded.
-  uint32_t waterChunkCount = 0;
-  uint32_t waterDrainBodies = 0;   // reserved drain op blocks (M3)
-  // M5: which body's container curve re-derives this tick, or kWaterBodyCap
-  // for "none" — which is every tick of a basin nobody has dug into, and is
-  // what leaves both sweep rows unrecorded (C_WATERSWEEP).
-  uint32_t waterSweepSlot = kWaterBodyCap;
-  // W2: sim.waveMode ANDed with "a body is listed this tick"
-  // (docs/PLAN_water_relevel.md §4.2). Zero leaves the surface-momentum row
-  // unrecorded (C_WATERWAVE), which is the exact-identity arm.
-  uint32_t waveMode = 0;
-  // Chunks the openness refresh walks this tick (docs/PLAN_gi.md §2). Derived
-  // from render.opennessChunksPerFrame and gated on render.opennessStrength, so
-  // a zero here is C_OPENNESS false and NOTHING recorded -- which is what makes
-  // the `noopenness` --render-budget arm measure the pass as well as the reads.
-  uint32_t opennessChunks = 0;
-  // Chunks the glow refresh walks this tick (src/sim/world.h kGlowBytes).
-  // Derived from render.glowChunksPerFrame and gated on render.glowStrength, so
-  // a zero here is C_GLOW false and NOTHING recorded.
-  uint32_t glowChunks = 0;
-  bool hashEnable = false;
-  bool particlesActive = false;
-  // False under --residency paged: worldgen's whole-world dispatch is replaced
-  // by batched worldgenList submits (PLAN_page_table.md §3.5c).
-  bool denseWorldgen = true;
-  // False ONLY when the CPU can prove the dirty set is empty (§3.4). Mirrors
-  // vk_record.h's field; defaults TRUE so the CA records unless proven idle.
-  bool caActive = true;
-  bool vizActive = false;
-  // Gas particles (docs/PLAN_gas_particles.md). See the latch in EncodeTick.
-  bool gasActive = false;
-  // Far fire-plume emitters this tick (world.h kGasFarEmitMax). Mirrors
-  // rhi::TableCtx. Zero on every tick of a world with no evicted fire in
-  // range, and then the splat row records NOTHING -- and the density box's
-  // clear falls back to the parcel latch alone, exactly as before.
-  uint32_t gasFarEmitCount = 0;
-  uint32_t gasFarWideCount = 0;
-  // Angle of repose (world.h kReposeSnap*). See the latch in EncodeTick.
-  bool reposeActive = false;
-  // The per-frame table's switches (rhi_record.h TableCtx::cloudFlags).
-  uint32_t cloudFlags = 0;
-  uint32_t cloudGx = 0, cloudGy = 0;
-};
+//
+// THE recorder's own type (sim/pass_table.h pass::RecordCtx), not a mirror of
+// it: RecordTable passes it through the bridge by reference. It used to be one
+// of three hand-copied structs, and three fields went missing across the
+// copies before this was one.
+using RecordCtx = pass::RecordCtx;
 
 // NOTE: the condition and dispatch-extent resolvers that used to live here
 // were the DAWN walk's copies. The Vulkan recorder has always carried its own
@@ -2147,60 +2097,34 @@ void Simulation::RecordTable(const rhi::CommandEncoder& enc, pass::Table which,
                              const void* ctxOpaque) {
   const RecordCtx& cx = *(const RecordCtx*)ctxOpaque;
 
-  rhi::TableCtx tc{};
-  tc.opsCount = cx.opsCount;
-  tc.cellCount = cx.cellCount;
-  tc.expCount = cx.expCount;
-  tc.spawnCount = cx.spawnCount;
-  tc.genCount = cx.genCount;
-  tc.farCount = cx.farCount;
-  tc.fluidCount = cx.fluidCount;
-  tc.fluidSpawnCount = cx.fluidSpawnCount;
-  tc.windWakeCount = cx.windWakeCount;
-  tc.waterChunkCount = cx.waterChunkCount;
-  tc.waterDrainBodies = cx.waterDrainBodies;
-  tc.waterSweepSlot = cx.waterSweepSlot;
-  tc.waveMode = cx.waveMode;
-  tc.opennessChunks = cx.opennessChunks;
-  tc.glowChunks = cx.glowChunks;
-  tc.hashEnable = cx.hashEnable;
-  tc.particlesActive = cx.particlesActive;
-  tc.denseWorldgen = cx.denseWorldgen;
-  tc.caActive = cx.caActive;
-  tc.vizActive = cx.vizActive;
-  tc.gasActive = cx.gasActive;
-  tc.gasFarEmitCount = cx.gasFarEmitCount;
-  tc.gasFarWideCount = cx.gasFarWideCount;
-  tc.reposeActive = cx.reposeActive;
-  tc.cloudFlags = cx.cloudFlags;
-  tc.cloudGx = cx.cloudGx;
-  tc.cloudGy = cx.cloudGy;
-
+  // Resolved as RAW seam pointers (rhi_record.h says why): this runs up to
+  // fluidSubsteps + 4 times a tick, and as refcounted handles every call cost
+  // ~180 atomic increments and as many decrements for data only read below.
   rhi::TableBindings tb{};
   for (int i = 0; i < (int)pass::Buf::kCount; i++)
-    tb.buffers[i] = PassBuffer((pass::Buf)i);
+    tb.buffers[i] = PassBuffer((pass::Buf)i).Get();
   // Bound by the LAST enumerator, which is what the note in pass_table.h's
   // Pipe block is about: a pipeline added past this bound is silently never
   // handed to the recorder, which reads as a skipped row rather than a crash.
   for (int i = 1; i < (int)pass::Pipe::ShadowResolve + 1; i++)
-    tb.pipelines[i] = PassPipeline((pass::Pipe)i);
-  tb.simLayout = simPL_;
-  tb.slimPartLayout = simPL2_;
-  tb.slimFarLayout = farPL_;
-  tb.slimFluidLayout = fluidPL_;
-  tb.slimFluidSeamLayout = fluidSeamPL_;
-  tb.slimGasLayout = gasPL_;
-  tb.shadowLayout = shadowPL_;
-  tb.simSet = simBG_[page_];
-  tb.slimSet = simSlimBG_[page_];
-  tb.particleSet = particleBG_[page_];
-  tb.farSet = farBG_;
-  tb.fluidSet = fluidBG_[page_];
-  tb.fluidSeamSet = fluidSeamBG_[page_];
-  tb.gasSet = gasBG_[page_];
-  tb.shadowSet = shadowBG_;
+    tb.pipelines[i] = PassPipeline((pass::Pipe)i).Get();
+  tb.simLayout = simPL_.Get();
+  tb.slimPartLayout = simPL2_.Get();
+  tb.slimFarLayout = farPL_.Get();
+  tb.slimFluidLayout = fluidPL_.Get();
+  tb.slimFluidSeamLayout = fluidSeamPL_.Get();
+  tb.slimGasLayout = gasPL_.Get();
+  tb.shadowLayout = shadowPL_.Get();
+  tb.simSet = simBG_[page_].Get();
+  tb.slimSet = simSlimBG_[page_].Get();
+  tb.particleSet = particleBG_[page_].Get();
+  tb.farSet = farBG_.Get();
+  tb.fluidSet = fluidBG_[page_].Get();
+  tb.fluidSeamSet = fluidSeamBG_[page_].Get();
+  tb.gasSet = gasBG_[page_].Get();
+  tb.shadowSet = shadowBG_.Get();
 
-  rhi::RecordTableVulkan(enc, which, tc, tb,
+  rhi::RecordTableVulkan(enc, which, cx, tb,
                          passTimer_ && passTimer_->Valid() ? passTimer_ : nullptr);
 }
 

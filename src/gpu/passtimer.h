@@ -1,4 +1,4 @@
-// passtimer.h — per-ComputePass GPU timestamps, for the measurement harnesses
+// passtimer.h — per-pass GPU timestamps, for the measurement harnesses
 // (`--measure`, `--perf`) and the live telemetry stream.
 //
 // MEASUREMENT-ONLY TOOLING. Nothing in the DEFAULT frame path constructs one of
@@ -59,9 +59,10 @@ struct PassSample {
   uint64_t ns = 0;
 };
 
-// One timed compute pass. Begin() returns a pass encoder that already carries
-// ComputePassTimestampWrites for `name`; End() closes it. Call sites that have
-// no timer attached call enc.BeginComputePass() directly.
+// The query pool and its bookkeeping. The recorder (vk_record.cpp) writes the
+// timestamp pairs itself at its group/row transitions, taking each pair's
+// indices from AllocPassPair; this class owns the pool, the resolve, and the
+// readback.
 class PassTimer {
  public:
   // capacity = max timed passes per submitted command buffer. Each pass burns
@@ -69,16 +70,10 @@ class PassTimer {
   bool Init(GpuContext& ctx, uint32_t capacity);
   bool Valid() const { return (bool)querySet_; }
 
-  // Begin a compute pass with timestamps attached. Falls back to an untimed
-  // pass if the query set is full or unavailable, so encoding never fails.
-  // DAWN PATH ONLY — the Vulkan recorder has no compute-pass concept and takes
-  // its (begin, end) indices through AllocPassPair below instead.
-  rhi::ComputePass BeginPass(const rhi::CommandEncoder& enc, const char* name);
-
-  // Vulkan path (--measure --backend vulkan): hand out a (begin, end) query
-  // index pair for a named pass — the bookkeeping of BeginPass without the
-  // encoder. Returns false when the set is full or absent (pass goes untimed).
-  // The vk recorder writes the timestamps itself at its group transitions.
+  // Hand out a (begin, end) query index pair for a named pass. Returns false
+  // when the set is full or absent, and the pass then goes untimed (encoding
+  // never fails). The vk recorder writes the timestamps itself at its group
+  // transitions.
   bool AllocPassPair(const char* name, uint32_t& beginIdx, uint32_t& endIdx);
   // The query set handle, for the recorder's timestamp writes.
   const rhi::QuerySet& NativeQuerySet() const { return querySet_; }
