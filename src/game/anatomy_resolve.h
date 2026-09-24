@@ -79,6 +79,9 @@ Report Resolve(Prefab& prefab, const nlohmann::json& recipe,
 // kDepthEmpty for an empty cell, else the 6-connected step count in from the
 // nearest exposed face (0 = a face).
 constexpr uint8_t kDepthEmpty = 255;
-std::vector<uint8_t> UnionDepth(const Prefab& prefab);
+// `include[i]` false leaves model i out of the union (and out of the own-face
+// override): Resolve passes it for keep-only limbs such as hair. Null = all.
+std::vector<uint8_t> UnionDepth(const Prefab& prefab,
+                                const std::vector<bool>* include = nullptr);
 
 }  // namespace anatomy

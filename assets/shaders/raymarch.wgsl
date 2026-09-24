@@ -27,7 +27,7 @@
 @group(0) @binding(9) var<storage, read> pageTable : array<u32>;
 // MPM fluid surface (see the MPM FLUID SURFACE block below). The renderer
 // samples the solver's LAST substep's node grid directly — mass for the
-// isosurface, velocity for foam, species masses for colour. Both are the sim's
+// isosurface, velocity for foam, composition (material ids) for colour. Both are the sim's
 // own device-local buffers, read here exactly like `voxels`: zero upload, and
 // the arrow still only points sim -> render. Declared plain (non-atomic) over
 // the same memory sim_fluid.wgsl accumulates atomically — the tick's writes
@@ -7054,23 +7054,49 @@ fn waterfallMist(base : vec3f, hitP : vec3f, rd : vec3f, tHit : f32,
 // you see across a pond), acid 170, blood 200, oil 235 (nearly opaque, arm's
 // length). Everything below is a function of it, so a new liquid's look
 // follows from one number the author was going to write anyway.
-struct SubProfile {
+//
+// ONE LIQUID OPTICS MODEL (W1-B2, 2026-09-24). This used to be the submerged
+// path's private profile, while the CA surface (shadeWater) and the MPM surface
+// (shadeMpmFluid) each kept the old `isWater = tagMask != 0 && opacity < 0.45`
+// test and their own derivation (absorb gain 9, scatter 0.22 — a third copy of
+// the same idea with different numbers). Now all three read liquidOptics():
+// ONE derivation from palette + opacity, ONE clear-liquid weight (`clear`),
+// ONE interface-reflectance scale (`fresnel`). What legitimately differs per
+// path is only the CLEAR-WATER coefficients each blends toward by `clear` —
+// the surface's TUNE_WATER_ABSORB/SCATTER, the submerged view's
+// TUNE_SUB_ABSORB/SCATTER/VISIBILITY, the MPM body's depth-ramped albedo —
+// because each of those was tuned by eye for what that path draws
+// (liquidClearBlend below). No path names a material or a tag.
+struct LiquidOptics {
   absorbK   : vec3f,  // per-channel extinction per metre
   scatter   : vec3f,  // colour the volume tends toward
   visM      : f32,    // metres to full fade — the "how murky" distance
   clarity   : f32,    // 0 = opaque sludge, 1 = clear water. Gates the extras.
   vignette  : f32,    // screen-edge darkening
   snellGain : f32,    // brightness of the window looking up
+  // How far this liquid takes the per-path CLEAR-WATER coefficients instead
+  // of the derived ones (0..1): smoothstep of clarity over subClearLow/High.
+  // The one classifier that replaced `isWater`.
+  clear     : f32,
+  // Interface reflectance scale: a clear dielectric reflects fully, a murky
+  // absorbing one (oil, acid, blood) at 0.55 — shadeWater's old non-water
+  // multiplier, now continuous in `clear` instead of a cliff.
+  fresnel   : f32,
 };
 
-fn submergedProfile(m : Material) -> SubProfile {
-  var p : SubProfile;
+// The liquid's own colour is common.wgsl's liquidAlbedo (shared with
+// debris.wgsl's MPM particle cubes).
+
+fn liquidOptics(m : Material) -> LiquidOptics {
+  var p : LiquidOptics;
   // Authored palette average — the liquid's own colour is what the volume
   // tends toward with distance, for every liquid including water.
-  let base = (unpackColor(m.color0) + unpackColor(m.color1)) * 0.5;
+  let base = liquidAlbedo(m);
   // 0 for a perfectly clear liquid, 1 for a fully blocking one. Water sits at
-  // 0.35, oil at 0.92.
-  let op = clamp(f32(m.opacity) / 255.0, 0.0, 1.0);
+  // 0.35, oil at 0.92. An OPAQUE liquid (lava: authored `opaque`, no opacity)
+  // blocks fully — without this its absent opacity reads as crystal clear.
+  var op = clamp(f32(m.opacity) / 255.0, 0.0, 1.0);
+  if ((m.flags & MATF_OPAQUE) != 0u) { op = 1.0; }
 
   // CLARITY drives everything that only makes sense in a medium you can see
   // through. It is deliberately non-linear: opacity 90 (water) has to land
@@ -7110,23 +7136,41 @@ fn submergedProfile(m : Material) -> SubProfile {
   // Snell's window needs a medium you can see the sky through at all.
   p.snellGain = TUNE_SUB_SNELL_GAIN * p.clarity;
 
-  // ---- WATER'S REFINEMENT ----
-  // Water is the one liquid whose submerged look has been tuned by eye rather
-  // than derived, and those hand-set coefficients are better than the generic
-  // curve can be — the per-channel red kill that makes water read as water is
-  // not recoverable from a palette average. So the derivation above is the
-  // DEFAULT and this is an override on top of it, not the other way round.
+  // ---- THE CLEAR-LIQUID WEIGHT ----
+  // Water is the one liquid whose look has been tuned by eye rather than
+  // derived, and those hand-set coefficients are better than the generic curve
+  // can be — the per-channel red kill that makes water read as water is not
+  // recoverable from a palette average. So the derivation above is the DEFAULT
+  // and each path's clear-water coefficients are an override on top of it
+  // (liquidClearBlend), not the other way round.
   //
   // Keyed on clarity rather than on a tag or an id: any liquid authored as
   // clear as water gets water's treatment, which is the correct generalisation
   // ("clear liquids behave like this") rather than a special case for one
   // material. The blend means there is no cliff — a liquid authored slightly
-  // murkier than water slides smoothly off the refined values onto the
-  // derived ones.
-  let refined = smoothstep(TUNE_SUB_CLEAR_LOW, TUNE_SUB_CLEAR_HIGH, p.clarity);
-  p.absorbK = mix(p.absorbK, TUNE_SUB_ABSORB, refined);
-  p.scatter = mix(p.scatter, TUNE_SUB_SCATTER, refined);
-  p.visM = mix(p.visM, TUNE_SUB_VISIBILITY, refined);
+  // murkier than water slides smoothly off the clear values onto the derived
+  // ones. subClearHigh sits at water's clarity (0.787) or below, so water
+  // itself takes the clear coefficients in full on every path.
+  p.clear = smoothstep(TUNE_SUB_CLEAR_LOW, TUNE_SUB_CLEAR_HIGH, p.clarity);
+  p.fresnel = mix(0.55, 1.0, p.clear);
+  return p;
+}
+
+// Blend a liquid's derived body coefficients toward ONE path's clear-water
+// pair by its clear weight. The only per-path part of the model.
+fn liquidClearBlend(o : LiquidOptics, clearAbsorb : vec3f,
+                    clearScatter : vec3f) -> LiquidOptics {
+  var p = o;
+  p.absorbK = mix(o.absorbK, clearAbsorb, o.clear);
+  p.scatter = mix(o.scatter, clearScatter, o.clear);
+  return p;
+}
+
+// The submerged view's model: the clear end is TUNE_SUB_ABSORB/SCATTER, plus the
+// authored visibility distance.
+fn submergedProfile(m : Material) -> LiquidOptics {
+  var p = liquidClearBlend(liquidOptics(m), TUNE_SUB_ABSORB, TUNE_SUB_SCATTER);
+  p.visM = mix(p.visM, TUNE_SUB_VISIBILITY, p.clear);
   return p;
 }
 
@@ -7442,11 +7486,12 @@ fn shadeWater(hitP : vec3f, rd : vec3f, mat : u32, cell : vec3<i32>,
   // is what makes water look wet: you see THROUGH it at your feet and see the
   // SKY in it at the far shore, across one continuous surface.
   var fres = WATER_F0 + (1.0 - WATER_F0) * pow(1.0 - cosI, TUNE_WATER_FRESNEL_POWER);
-  // Non-water liquids (oil, acid, blood) are dielectrics too but far more
+  // Murky liquids (oil, acid, blood) are dielectrics too but far more
   // absorbing; they get the same interface with a muted reflection so they
-  // read as their own substance rather than all becoming "water".
-  let isWater = (m.tagMask != 0u) && (f32(m.opacity) / 255.0 < 0.45);
-  if (!isWater) { fres *= 0.55; }
+  // read as their own substance rather than all becoming "water". The one
+  // liquid optics model decides how much (liquidOptics: fresnel, clear).
+  let optics = liquidClearBlend(liquidOptics(m), WATER_ABSORB, WATER_SCATTER);
+  fres *= optics.fresnel;
   // A partially-filled surface cell is a thin film / spray, not a mirror:
   // fade the specular interface out with fullness so a 1/8 puddle skin doesn't
   // reflect the sky as hard as a lake does.
@@ -7460,19 +7505,11 @@ fn shadeWater(hitP : vec3f, rd : vec3f, mat : u32, cell : vec3<i32>,
   // back trip only when we can see a bed; for an unbounded view the march
   // already accumulated the true path.
   let depthM = max(pathVox, 0.0) * VOXEL_METERS;
-  var absorbK = WATER_ABSORB;
-  var scatter = WATER_SCATTER;
-  if (!isWater) {
-    // Other liquids: derive the absorption from their authored opacity and
-    // palette so oil stays black-brown and acid stays acid-green, without
-    // hardcoding material IDs (CLAUDE.md conventions).
-    let base = (unpackColor(m.color0) + unpackColor(m.color1)) * 0.5;
-    let k = (f32(m.opacity) / 255.0) * 9.0;
-    // absorb the COMPLEMENT of the material color: a green liquid must absorb
-    // red and blue, which is what leaves it looking green at depth
-    absorbK = (vec3f(1.0) - base) * k + vec3f(0.05);
-    scatter = base * 0.22;
-  }
+  // Clear water takes the surface's hand-tuned TUNE_WATER_ABSORB/SCATTER; murkier
+  // liquids their palette+opacity derivation, so oil stays black-brown and
+  // acid stays acid-green without a material id anywhere (liquidOptics).
+  let absorbK = optics.absorbK;
+  let scatter = optics.scatter;
   let trans = exp(-absorbK * depthM);
 
   // ---- caustics ----
@@ -8556,7 +8593,7 @@ fn writeWaterVeil(fragXY : vec2f, tSurf : f32, pathCap : f32, colorNow : vec3f,
 //     fluid, with the same step budget as water reflections.
 //
 // The grid holds the LAST substep's state: mass (Q10) at word 0, post-BC node
-// velocity (Q16.16 cells/tick) at words 1..3, species masses at 4..6. The
+// velocity (Q16.16 cells/tick) at words 1..3, composition at 4..6. The
 // block map is valid until the next tick rebuilds it. A chunk past the
 // kFluidBlocks budget has no block, so its fluid is invisible for that tick —
 // the same bounded degradation the solver itself accepts (particles there are
@@ -8838,8 +8875,16 @@ fn fluidNormalAt(p : vec3f) -> vec3f {
 }
 
 // Mass-weighted velocity (voxels/SECOND — human units for the foam knobs),
-// species-blended albedo and the advected FOAM FIELD at a point, in one gather
+// material-blended albedo and the advected FOAM FIELD at a point, in one gather
 // so the shade pays the eight node lookups once.
+//
+// COLOUR IS THE MATERIAL'S (W1-B2). Grid words 4..6 are the node's composition
+// (sim_fluid.wgsl GRID LAYOUT): highest and lowest material id and the
+// volume-weighted id sum, which pin down a two-material split exactly. The
+// albedo is liquidAlbedo() of those materials, blended by that split — so
+// excited acid is acid-green, a pour into an oil pond goes oil-brown, and
+// there is no colour table: the tuned species colours are gone with the
+// species.
 //
 // The foam field is grid word 7, written by sim_fluid.wgsl's g2p from the
 // Ihmsen trapped-air / wave-crest / kinetic-energy potentials. It is a real
@@ -8849,6 +8894,10 @@ fn fluidNormalAt(p : vec3f) -> vec3f {
 struct FluidSample {
   vel  : vec3f,
   col  : vec3f,
+  // The material holding the most of the sampled volume (particles or the
+  // settled liquid behind them): whose liquidOptics the shade uses. MAT_AIR
+  // only when nothing was sampled.
+  mat  : u32,
   foam : f32,
   // Share of the sampled density that is SETTLED voxel water rather than live
   // MPM particles: 0 = all particles, 1 = the march is drawing a surface over
@@ -8867,7 +8916,10 @@ fn fluidSampleAt(p : vec3f) -> FluidSample {
   var mass = 0.0;      // live MPM particle mass
   var vmass = 0.0;     // virtual mass contributed by settled voxel water
   var vel = vec3f(0.0);
-  var sp = vec4f(0.0);
+  var colAcc = vec3f(0.0);   // sum of albedo * weighted volume
+  var colW = 0.0;
+  var domMat = MAT_AIR;
+  var domW = 0.0;
   var foam = 0.0;
   for (var i = 0; i < 8; i++) {
     let o = vec3<i32>(i & 1, (i >> 1) & 1, (i >> 2) & 1);
@@ -8891,23 +8943,43 @@ fn fluidSampleAt(p : vec3f) -> FluidSample {
       vel += vec3f(f32(fluidGridR[u32(nb) + 1u]),
                    f32(fluidGridR[u32(nb) + 2u]),
                    f32(fluidGridR[u32(nb) + 3u])) * (w * m * (1.0 / 65536.0));
-      let m1 = max(f32(fluidGridR[u32(nb) + 4u]) * (1.0 / 1024.0), 0.0);
-      let m2 = max(f32(fluidGridR[u32(nb) + 5u]) * (1.0 / 1024.0), 0.0);
-      let m3 = max(f32(fluidGridR[u32(nb) + 6u]) * (1.0 / 1024.0), 0.0);
-      sp += vec4f(max(m - m1 - m2 - m3, 0.0), m1, m2, m3) * w;
+      // Composition -> albedo. A pure node (hi == lo) costs one material
+      // read; a mixed one solves the split from the wrapping i32 id sum
+      // exactly as sim_fluid.wgsl's nodeHiVol does (integer, so the wrap is
+      // harmless), then blends the two albedos. hi == 0: only dead slots.
+      let hiW = fluidGridR[u32(nb) + 4u];
+      if (hiW > 0) {
+        let hi = u32(hiW);
+        let loW = fluidGridR[u32(nb) + 5u];
+        let lo = select(hi, 4096u - u32(loW), loW > 0);
+        var fh = 1.0;
+        var a = liquidAlbedo(materials[hi]);
+        if (lo != hi) {
+          let mi = fluidGridR[u32(nb)];
+          let sh = fluidGridR[u32(nb) + 6u] - i32(lo) * mi;
+          fh = clamp(f32(sh) / (f32(i32(hi) - i32(lo)) * max(f32(mi), 1.0)),
+                     0.0, 1.0);
+          a = mix(liquidAlbedo(materials[lo]), a, fh);
+          if (w * m * (1.0 - fh) > domW) { domW = w * m * (1.0 - fh); domMat = lo; }
+        }
+        if (w * m * fh > domW) { domW = w * m * fh; domMat = hi; }
+        colAcc += a * (w * m);
+        colW += w * m;
+      }
     }
     // THE SEAM'S OTHER HALF. fluidCellAt already lets settled liquid voxels
     // contribute virtual mass to the FIELD, so the isosurface reaches over
     // them and the two surfaces meet instead of leaving a gap — but nothing
     // used to give that mass a COLOUR. A node with virtual mass and no
     // particles fell through the `continue` above, left `sp` at zero, and the
-    // species blend divided by its 1e-4 floor: the shade came back BLACK.
+    // colour blend divided by its 1e-4 floor: the shade came back BLACK.
     // That is the dark rim around every marched region that touches a pond.
     //
-    // Settled water is species 0 — it is the same substance TUNE_FLUID_COLOR
-    // names — so it accumulates into sp.x. max(), not +, exactly as
-    // fluidCellAt: a cell mid-conversion briefly holds both representations of
-    // the SAME water and adding them would double its density.
+    // Settled liquid is drawn in its OWN material's albedo — the same one its
+    // particles would have — so a pond of oil under an oil pour is one colour.
+    // max(), not +, exactly as fluidCellAt: a cell mid-conversion briefly
+    // holds both representations of the SAME water and adding them would
+    // double its density.
     let vw = voxWordAt(c);
     let vmat = voxMat(vw);
     if (vmat != MAT_AIR && materials[vmat].klass == CLASS_LIQUID) {
@@ -8915,7 +8987,9 @@ fn fluidSampleAt(p : vec3f) -> FluidSample {
                  max(TUNE_FLUID_REST_DENSITY, 1.0);
       let extra = max(full - m, 0.0);
       vmass += w * extra;
-      sp.x += w * extra;
+      colAcc += liquidAlbedo(materials[vmat]) * (w * extra);
+      colW += w * extra;
+      if (w * extra > domW) { domW = w * extra; domMat = vmat; }
     }
   }
   var out : FluidSample;
@@ -8924,16 +8998,15 @@ fn fluidSampleAt(p : vec3f) -> FluidSample {
   // it gets no churn foam and no wobble, which is what it should look like.
   out.vel = vec3f(0.0);
   if (mass > 1e-4) { out.vel = vel * (30.0 / mass); }   // cells/tick -> vox/s
-  let tot = max(sp.x + sp.y + sp.z + sp.w, 1e-4);
-  out.col = (TUNE_FLUID_COLOR * sp.x + TUNE_FLUID_COLOR1 * sp.y +
-             TUNE_FLUID_COLOR2 * sp.z + TUNE_FLUID_COLOR3 * sp.w) / tot;
+  out.col = colAcc / max(colW, 1e-4);
+  out.mat = domMat;
   out.foam = clamp(foam, 0.0, 1.0);
   out.settled = vmass / max(mass + vmass, 1e-4);
   return out;
 }
 
 // ---- DEPTH GRADIENT --------------------------------------------------------
-// The species albedo says WHAT the liquid is; this says how its colour changes
+// The material albedo says WHAT the liquid is; this says how its colour changes
 // with how much of it you are looking through. Real water is not one colour
 // attenuated — the shallow edge of a pool and its deep middle differ in HUE,
 // because absorption is strongly wavelength-dependent (red goes first) and the
@@ -8942,7 +9015,7 @@ fn fluidSampleAt(p : vec3f) -> FluidSample {
 // Rather than fake that with a tint, the ramped colour is fed BACK into the
 // Beer-Lambert coefficients, so shallow water genuinely absorbs like the
 // shallow tint and deep water like the deep one. Setting fluidGradient to 0
-// collapses this to the flat species albedo (the pre-gradient look).
+// collapses this to the flat material albedo (the pre-gradient look).
 //
 // The ramp is exponential, not linear: it matches the shape of the absorption
 // it is driving, so the hue shift tracks the brightness falloff instead of
@@ -8953,10 +9026,10 @@ fn fluidGradientColor(base : vec3f, thickM : f32) -> vec3f {
   if (g <= 0.001) { return base; }
   let d = max(TUNE_FLUID_DEPTH, 0.05);
   let t = 1.0 - exp(-thickM / d);
-  // The species albedo modulates the ramp rather than being replaced by it:
-  // pouring the green species still reads green, but it now has a shallow
-  // edge and a deep body. Species 1 (the water default) sits at ~(0.2,0.42,
-  // 0.85), so this preserves the authored identity while adding the depth cue.
+  // The material albedo modulates the ramp rather than being replaced by it:
+  // poured acid still reads green, but it now has a shallow edge and a deep
+  // body. Water's palette average sits at ~(0.22,0.46,0.89), so this preserves
+  // the authored identity while adding the depth cue.
   let ramp = mix(TUNE_FLUID_SHALLOW, TUNE_FLUID_DEEP, t);
   return mix(base, base * ramp * 2.0, g);
 }
@@ -9617,7 +9690,7 @@ fn traceRefraction(p : vec3f, rdr : vec3f, waterVox : f32,
 //
 //     CA water  : absorb = TUNE_WATER_ABSORB  (1.85, 0.42, 0.20) per metre
 //                 in-scatter = TUNE_WATER_SCATTER (0.045, 0.16, 0.20), flat
-//     MPM fluid : absorb = (1.06 - depth-ramped species albedo) / clarity
+//     MPM fluid : absorb = (1.06 - depth-ramped material albedo) / clarity
 //                 in-scatter = that albedo, squared and lit
 //
 // At 2.6 m of pond those two disagree by roughly (60,120,130) against
@@ -9642,9 +9715,13 @@ fn traceRefraction(p : vec3f, rdr : vec3f, waterVox : f32,
 // mid-air, or a sheet on dry rock) every term collapses to the authored MPM
 // look, unchanged — which is what keeps --shot-fluid the picture it was.
 //
-// `caMat` is MAT_AIR when the ray crossed no CA liquid, and non-water liquids
-// derive their coefficients here the same way shadeWater derives them, so an
-// MPM pour into an oil pond blends toward OIL rather than toward water.
+// `caMat` is MAT_AIR when the ray crossed no CA liquid, and every liquid takes
+// its coefficients from the same liquidOptics() shadeWater uses, so an MPM
+// pour into an oil pond blends toward OIL rather than toward water. The
+// particles' OWN material goes through the same model (s.mat): the MPM
+// body's authored look is the CLEAR-liquid end of it, and excited acid, oil
+// or blood shade with their derived coefficients exactly as a pool of them
+// would.
 fn shadeMpmFluid(ro : vec3f, rd : vec3f, fh : FluidHit, caMat : u32,
                  caPath : f32, sceneBehind : vec3f) -> vec3f {
   let hitP = ro + rd * fh.t;
@@ -9673,14 +9750,14 @@ fn shadeMpmFluid(ro : vec3f, rd : vec3f, fh : FluidHit, caMat : u32,
   let caFrac = smoothstep(0.05, 0.55, caLen / max(colVox, 0.5));
 
   // ---- absorption + body (shared by the submerged and surface paths) ----
-  // Beer-Lambert per channel, coefficients derived from the species albedo:
+  // Beer-Lambert per channel, coefficients derived from the material albedo:
   // what the fluid does NOT reflect it absorbs, at a rate set by the clarity
   // knob (metres to roughly 1/e). The body term is the light the water itself
   // scatters back — it replaces the absorbed fraction so deep water goes to
   // the fluid's colour, never to black.
   let thickM = colVox * VOXEL_METERS;
   let clar = max(TUNE_FLUID_CLARITY, 0.05);
-  // The depth-ramped colour, not the raw species albedo, is what drives the
+  // The depth-ramped colour, not the raw material albedo, is what drives the
   // absorption — see the DEPTH GRADIENT block. This is the whole gradient:
   // a thin film absorbs like the shallow tint, a deep body like the deep one.
   let gcol = fluidGradientColor(s.col, thickM);
@@ -9690,22 +9767,20 @@ fn shadeMpmFluid(ro : vec3f, rd : vec3f, fh : FluidHit, caMat : u32,
   // own (near-white) colour, and the pool read as grey milk.
   var body = gcol * mix(gcol, vec3f(1.0), 0.25) *
              (ambientAt(vec3f(0.0, 1.0, 0.0)) * 0.85 + keyLightColor() * 0.35);
+  // The particles' own liquid through the one optics model: the authored MPM
+  // look above is its clear-water end, so water is untouched and a murky
+  // liquid shades with the same derived coefficients its pool would have.
+  let po = liquidClearBlend(liquidOptics(materials[s.mat]), absorb, body);
+  absorb = po.absorbK;
+  body = po.scatter;
   if (caFrac > 0.001) {
-    // The CA water's own coefficients, derived exactly as shadeWater derives
-    // them — including its non-water branch, so an oil or acid pool keeps its
-    // substance instead of being repainted as water by whatever fell in it.
-    let cm = materials[caMat];
-    let isWater = (cm.tagMask != 0u) && (f32(cm.opacity) / 255.0 < 0.45);
-    var caAbsorb = WATER_ABSORB;
-    var caScatter = WATER_SCATTER;
-    if (!isWater) {
-      let base = (unpackColor(cm.color0) + unpackColor(cm.color1)) * 0.5;
-      let k = (f32(cm.opacity) / 255.0) * 9.0;
-      caAbsorb = (vec3f(1.0) - base) * k + vec3f(0.05);
-      caScatter = base * 0.22;
-    }
-    absorb = mix(absorb, caAbsorb, caFrac);
-    body = mix(body, caScatter, caFrac);
+    // The CA liquid's own coefficients — exactly shadeWater's, through the
+    // same liquidOptics — so an oil or acid pool keeps its substance instead
+    // of being repainted as water by whatever fell in it.
+    let co = liquidClearBlend(liquidOptics(materials[caMat]),
+                              WATER_ABSORB, WATER_SCATTER);
+    absorb = mix(absorb, co.absorbK, caFrac);
+    body = mix(body, co.scatter, caFrac);
   }
   let trans = exp(-absorb * thickM);
   // The water veil (gV* globals): the same two coefficients a raster body in
@@ -9798,6 +9873,8 @@ fn shadeMpmFluid(ro : vec3f, rd : vec3f, fh : FluidHit, caMat : u32,
   // the COLUMN, not on the march's own thickness: a one-cell excited film on a
   // deep lake is the surface of that lake and reflects like one.
   fres *= clamp(colVox * 0.65, 0.3, 1.0);
+  // Murky liquids reflect less, by the same scale shadeWater applies.
+  fres *= po.fresnel;
 
   // ---- refraction ----
   // Faded out over a settled column, and this is a CORRECTNESS fix, not a

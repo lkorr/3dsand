@@ -463,7 +463,6 @@ int ContainerPourFluid(const ItemDef& def, ItemStack& st, Vec3 mouth, Vec3 fwd,
   }
 
   const uint32_t mat = st.fillMat;
-  const uint32_t species = (mat - 1u) & 3u;   // exciteEmit's rule
   const int want = std::min<int>(
       {def.container.pourPerTick * kContainerUnitsPerCell, (int)st.fillAmt,
        (int)std::min<uint32_t>(room, (uint32_t)kMaxFluidSpawnsPerTick)});
@@ -487,7 +486,6 @@ int ContainerPourFluid(const ItemDef& def, ItemStack& st, Vec3 mouth, Vec3 fwd,
     FluidSpawnOp op{};
     op.px = Q16(p.x); op.py = Q16(p.y); op.pz = Q16(p.z);
     op.vx = Q16(v.x); op.vy = Q16(v.y); op.vz = Q16(v.z);
-    op.species = species;
     op.mat = mat;
     out.push_back(op);
     poured++;
@@ -517,8 +515,7 @@ uint32_t ContainerScoopStream(IVec3 cell, uint32_t mat, Vec3 mouth, int life,
                               uint32_t seed, uint32_t tick, uint32_t room,
                               std::vector<FluidSpawnOp>& out) {
   life = std::clamp(life, 2, 255);
-  const uint32_t species = ((mat - 1u) & 3u) | kFluidOpGhost |
-                           ((uint32_t)life << kFluidOpLifeShift);
+  const uint32_t flags = kFluidOpGhost | ((uint32_t)life << kFluidOpLifeShift);
   uint32_t n = 0;
   for (int s = 0; s < 8 && n < room; s++) {
     const uint32_t h =
@@ -537,7 +534,7 @@ uint32_t ContainerScoopStream(IVec3 cell, uint32_t mat, Vec3 mouth, int life,
     FluidSpawnOp op{};
     op.px = Q16(p.x); op.py = Q16(p.y); op.pz = Q16(p.z);
     op.vx = Q16(v.x); op.vy = Q16(v.y); op.vz = Q16(v.z);
-    op.species = species;
+    op.flags = flags;
     op.mat = mat;
     out.push_back(op);
     n++;
@@ -618,7 +615,6 @@ int ContainerSpillStep(ContainerSpill& sp, const std::vector<MaterialDef>& mats,
 
   int emitted = 0;
   if (asFluid) {
-    const uint32_t species = (sp.mat - 1u) & 3u;
     const int n = (int)std::min<uint32_t>((uint32_t)sp.units, fluidRoom);
     for (int k = 0; k < n; k++) {
       Vec3 p, v;
@@ -629,7 +625,6 @@ int ContainerSpillStep(ContainerSpill& sp, const std::vector<MaterialDef>& mats,
       FluidSpawnOp op{};
       op.px = Q16(p.x); op.py = Q16(p.y); op.pz = Q16(p.z);
       op.vx = Q16(v.x); op.vy = Q16(v.y); op.vz = Q16(v.z);
-      op.species = species;
       op.mat = sp.mat;
       fluid.push_back(op);
       emitted++;

@@ -1160,9 +1160,10 @@ PASS(fluidClear, "fluid(substep)", PT_FLUID, PIPE_FLUID_CLEAR, K_INDIRECT, IND_F
 // read-only in practice: `fluidParticles` is read_write for the module (spawn
 // and g2p write it); p2g1 only reads particle state to scatter it. Likewise
 // `fluidBlockMap` is written by mark/alloc; p2g only atomicLoads the mapping.
+// R(Materials): a particle's mass is materials[mat].density (W1-B2).
 PASS(fluidP2g1, "fluid(substep)", PT_FLUID, PIPE_FLUID_P2G, K_INDIRECT, IND_FLUIDPARGS,0,0, GRP_SLIM_FLUID, DYN_NONE, C_ALWAYS, 1,
-     USES(U(TickUBO) R(FluidParticlesWrite) R(FluidBlockMap) A(FluidGrid)
-          R(FluidArgsStage) I(FluidPDispatchArgs)))
+     USES(U(TickUBO) R(Materials) R(FluidParticlesWrite) R(FluidBlockMap)
+          A(FluidGrid) R(FluidArgsStage) I(FluidPDispatchArgs)))
 // p2g2 is the density-EOS half of the grantkot two-pass P2G: it needs p2g1's
 // COMPLETE mass field (the A->A WAW barrier between these rows orders it),
 // gathers density per particle, and scatters stress as momentum. Within the
@@ -1364,10 +1365,16 @@ PASS(seam_cell_clear, "fluidSettle", PT_FLUIDSETTLE, PIPE_FLUID_CELL_CLEAR, K_IN
 // (compaction/spawn/emit/kill write it); particleTick only reads state to
 // fold each particle's speed into its slot's maximum and scatter its
 // occupancy + contact-stain intents.
+// R(Reactions) A(DirtyOut): the W1-B1 wake -- a particle walks its own
+// reaction bucket and marks its chunk DIRTY_R_REACT when an ungated rule has a
+// partner beside it, so the CA runs the particle's OWN rules next tick
+// (sim_step excitedReact). A(FluidCellScratch) now also carries the absorb
+// DONOR BID into a solid neighbour's flags word, which stainApply consumes.
 PASS(seam_particle_tick, "fluidSettle", PT_FLUIDSETTLE, PIPE_FLUID_PTICK, K_INDIRECT, IND_FLUIDPARGS,0,0, GRP_SLIM_FLUIDSEAM, DYN_NONE, C_ALWAYS, 1,
      USES(U(TickUBO) R(FluidParticlesWrite) A(FluidSettleScratch)
-          A(FluidArgsStage) R(Voxels) R(Materials) R(PageTable)
-          R(FluidBlockMap) A(FluidCellScratch) I(FluidPDispatchArgs)))
+          A(FluidArgsStage) R(Voxels) R(Materials) R(Reactions) R(PageTable)
+          R(FluidBlockMap) A(FluidCellScratch) A(DirtyOut)
+          I(FluidPDispatchArgs)))
 // Contact staining: one thread per active-block cell (the node-pass args of
 // the LAST substep), applying the intents particleTick just scattered —
 // solid surfaces touched by excited fluid take its stain, the CA's
@@ -1377,10 +1384,15 @@ PASS(seam_particle_tick, "fluidSettle", PT_FLUIDSETTLE, PIPE_FLUID_PTICK, K_INDI
 // in hand, and settled liquid contributes virtual mass to the isosurface, so
 // without it the march would skip the y levels a half-converted pool holds as
 // voxels.
+// RW(FluidParticlesWrite): the absorb DONOR -- wetting absorbent ground
+// charges one eighth off the one particle whose bid won the cell (W1-B1; the
+// CA's doStaining pays the same eighth in fullness). A(Support): a stain that
+// CONSUMES its voxel removes a solid, and flagSupportLoss reports it.
 PASS(seam_stain_apply, "fluidSettle", PT_FLUIDSETTLE, PIPE_FLUID_STAIN_APPLY, K_INDIRECT, IND_FLUIDARGS,0,0, GRP_SLIM_FLUIDSEAM, DYN_NONE, C_ALWAYS, 1,
      USES(RW(Voxels) R(Materials) U(TickUBO) R(PageTable) A(DirtyOut)
           R(FluidBlockList) A(FluidCellScratch) A(FluidArgsStage)
-          A(FluidBlockMap) I(FluidDispatchArgs)))
+          A(FluidBlockMap) RW(FluidParticlesWrite) A(Support)
+          I(FluidDispatchArgs)))
 // A(FluidArgsStage): judge sleeps on FA_LIVE + settleScan's SP_LIVEFLAG.
 PASS(seam_settle_judge, "fluidSettle", PT_FLUIDSETTLE, PIPE_FLUID_SETTLE_JUDGE, K_COMPUTE, 128,1,1, GRP_SLIM_FLUIDSEAM, DYN_NONE, C_ALWAYS, 1,
      USES(A(FluidSettleScratch) A(FluidCalm) A(FluidArgsStage)))

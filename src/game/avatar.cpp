@@ -2430,11 +2430,20 @@ bool PlayerAvatar::RagdollFollow(Vec3& outPlayerPos) const {
 // dismemberment system already maintains, so the mana bar's overdraw and the
 // visible damage state cannot drift apart.
 
+// HAIR IS NOT HEALTH. A `bloodless` base limb (a generated character's
+// `hair`/`mane`) is left out of all three of TotalHealth, HealthMax and
+// SpendHealth -- the same set Mob::TotalHp/DrainBlood leave out -- so a
+// haircut neither empties the bar nor makes the bar longer. Asked of the DEF
+// field and not of Mob::IsBloodless, which also folds in worn slots: whether
+// a garment's hp belongs in the player's bar is a separate question these
+// three have always answered "yes" to, and this change does not reopen it.
 int32_t PlayerAvatar::TotalHealth() const {
   if (!spawned_ || !alive_) return 0;
   float sum = 0;
   for (size_t i = 0; i < limbs_.size(); i++)
-    if (PartAlive((int)i) && limbs_[i].hp > 0) sum += limbs_[i].hp;
+    if (PartAlive((int)i) && limbs_[i].hp > 0 &&
+        !(i < limbDefs_.size() && limbDefs_[i].bloodless))
+      sum += limbs_[i].hp;
   return sum <= 0 ? 0 : (int32_t)sum;
 }
 
@@ -2447,7 +2456,7 @@ int32_t PlayerAvatar::HealthMax() const {
   if (!def_) return 0;
   float sum = 0;
   for (const MobLimbDef& ld : limbDefs_)
-    if (ld.hp > 0) sum += ld.hp;
+    if (ld.hp > 0 && !ld.bloodless) sum += ld.hp;
   return sum <= 0 ? 0 : (int32_t)sum;
 }
 
@@ -2477,7 +2486,9 @@ void PlayerAvatar::SpendHealth(int32_t amount) {
   // what keeps this from walking a list that reshapes underneath it.
   std::vector<int> severed;
   for (size_t i = 0; i < limbs_.size(); i++) {
-    if (!PartAlive((int)i) || limbs_[i].hp <= 0) continue;
+    if (!PartAlive((int)i) || limbs_[i].hp <= 0 ||
+        (i < limbDefs_.size() && limbDefs_[i].bloodless))
+      continue;
     limbs_[i].hp -= limbs_[i].hp * frac;
     // Bleeding from the strain of the overcast, through the ordinary budget.
     if (def_)

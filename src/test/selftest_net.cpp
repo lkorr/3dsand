@@ -36,12 +36,16 @@
 // testing a second implementation and would keep passing while the shipped one
 // was broken — the "fixture that measures itself" failure.
 
+#include <algorithm>
 #include <cstdio>
 #include <cstring>
 #include <filesystem>
+#include <span>
 #include <string>
 #include <vector>
 
+#include "game/avatar.h"
+#include "game/session.h"
 #include "net/authority.h"
 #include "net/link.h"
 #include "net/opsync.h"
@@ -1323,7 +1327,6 @@ Status GateOpsExchange(Ctx& c, std::string& detail) {
                     f.in.playerChunk[2]},
                    f.in.wantReadback != 0, f.in.particlesActive != 0, f.spawns,
                    f.in.farCount, f.fluid, f.in.fluidLive,
-                   f.in.hasSplashMat ? f.in.fluidSplashMat : nullptr,
                    f.in.vizActive != 0);
         if (f.in.tick % kProbeEvery == 0 || f.in.tick == (uint32_t)kTicks)
           replay.push_back(ReadHashSync(c.ctx, c.world));
@@ -1773,6 +1776,261 @@ Status GateStoreSync(Ctx& c, std::string& detail) {
   return pinOk ? Status::Pass : Status::Fail;
 }
 
+// ---- blast-players ----------------------------------------------------------
+//
+// ONE PLAYER'S GRENADE HITS THE OTHER PLAYER (W1-F, 2026-09-24; the owner's
+// half at wave-1 integration).
+//
+// Phase K used to carve and launch THE SESSION'S OWN avatar beside the NPC
+// calls, so with two players the thrower's blast reached the thrower and
+// nobody else: B could stand on A's grenade untouched. The body pass is now
+// `ExplosionHitsBodies` (session.h) and every player is reached through
+// MobSystem's registered avatars. Over the wire the author's machine can only
+// carve B's GHOST; B's machine applies A's blast to B's real body in phase N
+// (`RemoteExplosionsHitOwnAvatars`), from the explosion indices
+// `OpDelayQueue::Merge` reports as remote. The gate calls those functions --
+// the code phases K and N run -- rather than restating them. CPU + Jolt only:
+// no tick, no worldgen, nothing pinned.
+//
+//   (a) TWO LOCAL PLAYERS. A's blast at B's chest: B loses voxels AND goes
+//       limp; A, 80 voxels off, loses nothing and stays up (the reach is the
+//       blast's, not "every avatar"). B's limbs are in the impulse skip list.
+//   (b) B IS A PEER'S GHOST (`SetAvatars(.., localCount = 1)`), A's machine,
+//       phase K: the same blast carves it (the melee rule: presentation), does
+//       NOT launch it -- a ghost's position is the wire's -- and emits NO gore
+//       (the owner authors that; emitting it here too doubles it). "Not
+//       launched" is only a claim about a LIVE body (a dead one is never
+//       launched either), so the ghost must survive the blast, and the launch
+//       is measured where it would show: the root limb's velocity straight
+//       after the blast and the root's travel over one physics step. Arm (a)
+//       is the witness that the same numbers DO move for a launched body and
+//       that this blast is not lethal.
+//   (c) B'S MACHINE, phase N. A's blast arrives as a REMOTE batch; the merge
+//       names it remote; B's own avatar is carved AND launched (its gore, if
+//       the carve ejects any, lands in the carry vector: reported, not
+//       required -- a shallow carve of a fine-skinned limb can take no
+//       collider voxel and so eject nothing, as arm (a) shows). A's ghost,
+//       standing in the same blast on the far side, is untouched: A's machine
+//       already hit A in phase K.
+//   (d) A'S MACHINE, phase N. The same blast is A's LOCAL op in A's merge, so
+//       phase N applies nothing -- A and B's ghost, both in reach, are
+//       untouched. Together with (b) that is "never applied twice".
+namespace blastp {
+
+enum class Arm { Local, Ghost, OwnerSide, AuthorSide };
+
+struct BlastArm {
+  uint32_t lostA = 0, lostB = 0;
+  bool limpA = false, limpB = false;
+  bool aliveB = false;
+  float bSpeed = 0.0f;    // |root limb velocity| after the blast, vox/s
+  float bSpeed0 = 0.0f;   // ...and before it
+  float bRootMove = 0.0f; // root travel over one physics step, vox
+  bool bSkipped = false;  // B's limb bodies were in AppendLiveLimbBodies
+  size_t spawns = 0;      // gore into the batch (or phase N's carry vector)
+  size_t remoteExps = 0;  // (c)/(d): what the merge reported as remote
+  uint32_t applied = 0;   // (c)/(d): RemoteExplosionsHitOwnAvatars' count
+  std::string why;
+};
+
+uint32_t AvatarVoxels(const PlayerAvatar& av) {
+  uint32_t n = 0;
+  for (int i = 0; i < av.PartCount(); i++) n += av.PartVoxelCount(i);
+  return n;
+}
+
+// One blast through phase N's two calls, on the machine whose local id is
+// `localId`. `authorId` authored the blast; the other id sends an empty batch.
+uint32_t PhaseNOnce(Ctx& c, uint32_t localId, uint32_t authorId,
+                    const ExplosionOp& e, BlastArm& r,
+                    std::vector<ParticleSpawn>& gore) {
+  net::OpDelayQueue q;
+  q.SetLocalId(localId);
+  const uint32_t t = 1, label = t + q.D();
+  const IVec3 origin = c.world.WindowOrigin();
+  OpBatch withBlast, empty;
+  withBlast.exps.push_back(e);
+  const uint32_t peerId = localId == 0 ? 1u : 0u;
+  q.PushLocal(t, localId == authorId ? withBlast : empty, origin);
+  q.NoteRemote(label, peerId, origin, peerId == authorId ? withBlast : empty);
+  net::MergeStats ms;
+  std::vector<uint32_t> remoteBrush, remoteExp;
+  const OpBatch merged = q.Merge(label, c.world, ms, &remoteBrush, &remoteExp);
+  r.remoteExps = remoteExp.size();
+  // Merge noted author ranges for the merged vector; this gate submits
+  // nothing, so drop them rather than hand them to the next gate's tick.
+  sandvox::opstream::ClearAuthorRanges();
+  return RemoteExplosionsHitOwnAvatars(merged.exps, remoteExp, c.world, c.phys,
+                                       c.debris, c.mobs, gore);
+}
+
+void RunBlastArm(Ctx& c, Arm arm, BlastArm& r) {
+  c.debris.Reset();
+  c.mobs.Reset(true);
+  const IVec3 wo = c.world.WindowOrigin();
+  const int cx = (wo.x + (int)kNChunk / 2) * (int)kChunk;
+  const int cz = (wo.z + (int)kNChunk / 2) * (int)kChunk;
+  const int gy = World::TerrainHeight(cx, cz, c.world.WorldSeed());
+  // Well above the ground: nothing but the blast may touch either body.
+  const float y = (float)(gy + 40) + Player::kHalfY;
+  // 12 voxels to B's side at chest height: close enough that the crater
+  // bites B's near flank, far enough that it does not kill (a grenade AT the
+  // chest takes the whole body, and a dead body is not launched), and well
+  // inside the launch reach (radius x ragdoll.blastRadiusScale).
+  const int off = 12;
+  // (a)/(b): A 80 voxels off, out of reach. (c)/(d): A on the FAR side of the
+  // blast, as close to it as B, so "A untouched" is a claim about who the
+  // pass applies to and not about distance.
+  const bool aInReach = arm == Arm::OwnerSide || arm == Arm::AuthorSide;
+  Player pa, pb;
+  pa.fly = pb.fly = true;
+  pb.pos = Vec3{(float)cx + 0.5f, y, (float)cz + 0.5f};
+  pa.pos = aInReach ? Vec3{(float)(cx - 2 * off) + 0.5f, y, (float)cz + 0.5f}
+                    : Vec3{(float)cx + 80.5f, y, (float)cz + 0.5f};
+  pa.SnapRender();
+  pb.SnapRender();
+  PlayerAvatar a(0x5A11EDU), b(0x5A11EDU + 1);
+  a.Init(&c.phys, &c.world, &c.debris, c.mats, &c.mobs);
+  b.Init(&c.phys, &c.world, &c.debris, c.mats, &c.mobs);
+  a.SetDefs(&c.mobs.Defs(), kAvatarDefName);
+  b.SetDefs(&c.mobs.Defs(), kAvatarDefName);
+  if (!a.HasDef() || !a.Spawn(pa, 0.0f) || !b.Spawn(pb, 0.0f)) {
+    r.why = std::string("could not spawn two \"") + kAvatarDefName + "\" avatars";
+    a.Despawn();
+    b.Despawn();
+    return;
+  }
+  // The avatar list as the machine in question holds it: its own sessions
+  // first, then the peer's ghost (RemotePlayersSyncAvatars' order).
+  if (arm == Arm::OwnerSide) {
+    Mob* avs[2] = {&b, &a};  // B's machine: B is mine, A a ghost
+    c.mobs.SetAvatars(std::span<Mob* const>(avs, 2), 1);
+  } else {
+    Mob* avs[2] = {&a, &b};  // A's machine (or both local in (a))
+    c.mobs.SetAvatars(std::span<Mob* const>(avs, 2), arm == Arm::Local ? 2 : 1);
+  }
+
+  std::vector<uint64_t> skip;
+  c.mobs.AppendLiveLimbBodies(skip);
+  const uint64_t bBody = b.PartBody(0);
+  r.bSkipped = bBody != 0 &&
+               std::find(skip.begin(), skip.end(), bBody) != skip.end();
+
+  const uint32_t a0 = AvatarVoxels(a), b0 = AvatarVoxels(b);
+  auto rootSpeed = [&](const PlayerAvatar& av) {
+    Vec3 lin{}, ang{};
+    const uint64_t h = av.PartBody(0);
+    return h != 0 && c.phys.GetBodyVelocities(h, lin, ang) ? lin.len() : 0.0f;
+  };
+  r.bSpeed0 = rootSpeed(b);
+  const auto& g = CurrentTuning().grenade;
+  const ExplosionOp e{ifloor(pb.pos.x) - off, ifloor(pb.pos.y),
+                      ifloor(pb.pos.z), g.blastRadius, g.blastPower, 0, 0, 0};
+  std::vector<ParticleSpawn> spawns;
+  if (arm == Arm::OwnerSide)
+    r.applied = PhaseNOnce(c, 1, 0, e, r, spawns);
+  else if (arm == Arm::AuthorSide)
+    r.applied = PhaseNOnce(c, 0, 0, e, r, spawns);
+  else
+    ExplosionHitsBodies(e, c.world, c.phys, c.debris, c.mobs, spawns);
+  const uint32_t a1 = AvatarVoxels(a), b1 = AvatarVoxels(b);
+  r.lostA = a0 > a1 ? a0 - a1 : 0;
+  r.lostB = b0 > b1 ? b0 - b1 : 0;
+  r.limpA = a.Ragdoll() == Mob::RagdollPhase::Limp;
+  r.limpB = b.Ragdoll() == Mob::RagdollPhase::Limp;
+  r.spawns = spawns.size();
+  r.aliveB = b.IsAlive();
+  r.bSpeed = rootSpeed(b);
+  // One physics step: a launched root flies, a kinematic ghost stays where
+  // its last pose put it. Read from Jolt, not Mob::RootWorldPos, which is
+  // the pose cached at the mob's own PostStep and does not move here.
+  auto rootAt = [&](Vec3& at) {
+    BodyTransform xf{};
+    const uint64_t h = b.PartBody(0);
+    if (h == 0 || !c.phys.GetTransform(h, xf)) return false;
+    at = xf.pos;
+    return true;
+  };
+  Vec3 root0{}, root1{};
+  const bool haveRoot0 = rootAt(root0);
+  c.phys.Step(kTickDt);
+  const bool haveRoot1 = rootAt(root1);
+  r.bRootMove = haveRoot0 && haveRoot1 ? (root1 - root0).len() : 1e9f;
+
+  // Leave nothing behind: limb bodies, severed limbs adopted by debris, and
+  // the avatar list are all shared with the next gate.
+  c.mobs.SetAvatars({});
+  a.Despawn();
+  b.Despawn();
+  c.debris.Reset();
+  c.mobs.Reset(true);
+}
+
+}  // namespace blastp
+
+Status GateBlastPlayers(Ctx& c, std::string& detail) {
+  using blastp::Arm;
+  blastp::BlastArm local, ghost, owner, author;
+  blastp::RunBlastArm(c, Arm::Local, local);
+  if (local.why.empty()) blastp::RunBlastArm(c, Arm::Ghost, ghost);
+  if (ghost.why.empty()) blastp::RunBlastArm(c, Arm::OwnerSide, owner);
+  if (owner.why.empty()) blastp::RunBlastArm(c, Arm::AuthorSide, author);
+  const std::string why = !local.why.empty()   ? local.why
+                          : !ghost.why.empty() ? ghost.why
+                          : !owner.why.empty() ? owner.why
+                                               : author.why;
+  if (!why.empty()) {
+    detail = why;
+    std::printf("blast-players: FAIL (%s)\n", why.c_str());
+    return Status::Fail;
+  }
+  // A launch is metres per second; 0.5 vox/s and 0.05 vox per step are far
+  // below any launch (ragdoll.blastMinSpeed is 1.5 m/s = 15 vox/s) and far
+  // above float noise on a body nothing touched.
+  const bool localOk = local.lostB > 0 && local.limpB && local.lostA == 0 &&
+                       !local.limpA && local.bSkipped && local.aliveB &&
+                       local.bSpeed > 0.5f && local.bRootMove > 0.05f;
+  const bool ghostOk = ghost.lostB > 0 && !ghost.limpB && ghost.bSkipped &&
+                       ghost.spawns == 0 && ghost.aliveB &&
+                       ghost.bSpeed == ghost.bSpeed0 &&
+                       ghost.bRootMove < 0.05f;
+  const bool ownerOk = owner.remoteExps == 1 && owner.applied == 1 &&
+                       owner.lostB > 0 && owner.limpB &&
+                       owner.lostA == 0 && !owner.limpA;
+  const bool authorOk = author.remoteExps == 0 && author.applied == 0 &&
+                        author.lostA == 0 && !author.limpA &&
+                        author.lostB == 0 && !author.limpB &&
+                        author.spawns == 0;
+  char buf[900];
+  std::snprintf(buf, sizeof buf,
+                "(a) local B: -%u vox, %s, %s, root %.1f vox/s, moved %.2f, gore "
+                "%zu, in skip list %d | A (80 vox off): -%u vox, %s | (b) ghost B: -%u "
+                "vox, %s, %s, root %.2f -> %.2f vox/s, moved %.3f, gore %zu "
+                "(want alive, carved, NOT launched, 0 gore) | (c) B's machine: "
+                "remote %zu, applied %u, B -%u vox %s gore %zu, ghost A -%u vox "
+                "%s (want 1/1, carved+launched, ghost untouched) | (d) A's "
+                "machine: remote %zu, applied %u, A -%u %s, ghost B -%u %s "
+                "(want 0, untouched)",
+                local.lostB, local.aliveB ? "alive" : "DEAD",
+                local.limpB ? "launched" : "NOT LAUNCHED", local.bSpeed,
+                local.bRootMove, local.spawns, local.bSkipped ? 1 : 0,
+                local.lostA,
+                local.limpA ? "LAUNCHED" : "standing", ghost.lostB,
+                ghost.aliveB ? "alive" : "DEAD",
+                ghost.limpB ? "LAUNCHED" : "not launched", ghost.bSpeed0,
+                ghost.bSpeed, ghost.bRootMove, ghost.spawns,
+                owner.remoteExps, owner.applied, owner.lostB,
+                owner.limpB ? "launched" : "NOT LAUNCHED", owner.spawns,
+                owner.lostA, owner.limpA ? "LAUNCHED" : "standing",
+                author.remoteExps, author.applied, author.lostA,
+                author.limpA ? "LAUNCHED" : "standing", author.lostB,
+                author.limpB ? "LAUNCHED" : "standing");
+  detail = buf;
+  const bool ok = localOk && ghostOk && ownerOk && authorOk;
+  std::printf("blast-players: %s (%s)\n", ok ? "PASS" : "FAIL", buf);
+  return ok ? Status::Pass : Status::Fail;
+}
+
 }  // namespace
 
 const std::vector<Gate>& NetGates() {
@@ -1791,6 +2049,11 @@ const std::vector<Gate>& NetGates() {
       // It regenerates at the origin on the way out, so the gate after it
       // starts where it always did.
       {"store-sync", "net", {}, false, GateStoreSync},
+      // W1-F + integration. CPU + Jolt only: two avatars, ExplosionHitsBodies
+      // (phase K) and one OpDelayQueue merge into RemoteExplosionsHitOwnAvatars
+      // (phase N) per side.
+      // Resets debris and mobs on the way in and out.
+      {"blast-players", "net", {}, false, GateBlastPlayers},
   };
   return g;
 }

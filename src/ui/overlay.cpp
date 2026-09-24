@@ -1282,7 +1282,7 @@ void Overlay::Draw(UIState& s) {
     ImGui::TextDisabled("hold LMB to guard, then FLICK the mouse to cut");
   }
   if (s.tool == UIState::kToolFluid) {
-    ImGui::TextDisabled("hold LMB: pour  1-4 species  U clear");
+    ImGui::TextDisabled("hold LMB: pour  1-4 water/oil/acid/blood  U clear");
     ImGui::Text("mpm particles: %u / 262144", s.fluidCount);
     ImGui::SameLine();
     if (ImGui::Button("clear (U)")) s.clearFluid = true;
@@ -1446,7 +1446,6 @@ void Overlay::Draw(UIState& s) {
             fslider("settle below",     &s.fSettleEps,   0.05f, 20.0f);
             fslider("wake above",       &s.fWakeSpeed,   0.1f, 50.0f);
             islider("settle ticks",     &s.fSettleTicks, 8, 600);
-            fslider("stain rate",       &s.fStainRate,   0.0f, 30.0f);
           }
           ImGui::EndTabItem();
         }
@@ -1477,11 +1476,6 @@ void Overlay::Draw(UIState& s) {
             fslider("shimmer##l",         &s.fWobble,   0.0f, 2.0f);
           }
           if (ImGui::CollapsingHeader("Colour")) {
-            fcolor("species 1##l", s.fColor);
-            fcolor("species 2##l", s.fColor1);
-            fcolor("species 3##l", s.fColor2);
-            fcolor("species 4##l", s.fColor3);
-            ImGui::Separator();
             fcolor("shallow tint##l", s.fShallow);
             fcolor("deep tint##l",    s.fDeep);
             fslider("gradient depth##l",   &s.fDepth,       0.05f, 20.0f);
@@ -2922,8 +2916,8 @@ void Overlay::Draw(UIState& s) {
               ImGui::SetTooltip(
                   "Radius in metres within which combat sounds are\n"
                   "audible. Same unit as audio cue groups.");
-            ImGui::TextDisabled("assets are PLACEHOLDERS —");
-            ImGui::TextDisabled("scripts/gen_combat_sounds.py");
+            ImGui::TextDisabled("add takes through");
+            ImGui::TextDisabled("scripts/import_sounds.py");
           }
           ImGui::EndChild();
           ImGui::EndTabItem();

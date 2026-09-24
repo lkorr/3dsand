@@ -1046,14 +1046,12 @@ TissueMats ResolveTissueMats(const MobSystem& mobs,
 
 BurnMats ResolveBurnMats(const std::vector<MaterialDef>& mats) {
   BurnMats bm;
-  // Named, never hardcoded by id (CLAUDE.md conventions), and the NAME LIST
-  // lives in one place: Mob::BurnStageOfMaterialName is what the burn cap
-  // (sim/tuning.h Gore §G) counts with, so the HUD's per-limb readout and the
-  // creature's own health cap cannot disagree about what "burnt" is. A name
-  // not in this content simply contributes nothing — the readout degrades to
-  // "not charred" rather than reporting a wrong material's count.
+  // Never hardcoded by id (CLAUDE.md conventions): the stage is AUTHORED on
+  // the material (materials.json "burnStage"), and it is the same field the
+  // burn cap (sim/tuning.h Gore §G) counts with, so the HUD's per-limb readout
+  // and the creature's own health cap cannot disagree about what "burnt" is.
   for (size_t i = 0; i < mats.size(); i++) {
-    const uint8_t stage = Mob::BurnStageOfMaterialName(mats[i].name);
+    const uint8_t stage = mats[i].burnStage;
     if (stage == 1) bm.cooked.push_back((uint32_t)i);
     if (stage == 2) bm.charred.push_back((uint32_t)i);
   }
@@ -2867,12 +2865,24 @@ int RunFluidShot(GpuContext& ctx, World& world, Simulation& sim,
   SubmitWorldgen(ctx, world, sim, kDefaultSeed);
   ctx.WaitIdle();
 
-  // Splash droplets carry the water material, resolved BY NAME at load like
-  // all content (CLAUDE.md conventions). Missing name = no droplets, not a
-  // crash — the surface still renders.
-  uint32_t splashMats[4] = {0, 0, 0, 0};
-  for (size_t i = 0; i < mats.size(); i++)
-    if (mats[i].name == "water") { splashMats[0] = (uint32_t)i; break; }
+  // The poured liquid, resolved BY NAME at load like all content (CLAUDE.md
+  // conventions): water, or SANDVOX_SHOT_FLUID_MAT=<name> (e.g. acid) for the
+  // same scene in another liquid. The particle's material is its whole
+  // identity — colour, splash droplets, density — so this one id is all the
+  // scene needs. Missing name = water; missing water = nothing poured.
+  uint32_t pourMat = 0;
+  {
+    const char* want = std::getenv("SANDVOX_SHOT_FLUID_MAT");
+    const std::string name = (want && *want) ? want : "water";
+    for (size_t i = 0; i < mats.size(); i++)
+      if (mats[i].name == name) { pourMat = (uint32_t)i; break; }
+    if (pourMat == 0)
+      for (size_t i = 0; i < mats.size(); i++)
+        if (mats[i].name == "water") { pourMat = (uint32_t)i; break; }
+    std::printf("--shot-fluid: pouring '%s' (id %u)\n",
+                pourMat < mats.size() ? mats[pourMat].name.c_str() : "?",
+                pourMat);
+  }
 
   // Pour target. On dry terrain that is the ground under the pour; over the
   // pond it is the RIM height, because TerrainHeight in the middle of a bowl
@@ -2904,8 +2914,7 @@ int RunFluidShot(GpuContext& ctx, World& world, Simulation& sim,
             op.pz = ((at.z + z) << 16) + ((s & 4) ? 49152 : 16384) +
                     (int32_t)((hh >> 19) % 8192u) - 4096;
             op.vx = 0; op.vy = -19661; op.vz = 0;
-            op.species = 0;
-            op.mat = splashMats[0];  // water: the particle's settled identity
+            op.mat = pourMat;  // the particle's one identity
             out.push_back(op);
           }
         }
@@ -2919,8 +2928,7 @@ int RunFluidShot(GpuContext& ctx, World& world, Simulation& sim,
       if (pourR > 0) pour(tick, {cx, h + pourHeight, cz}, pourR, spawns);
       SubmitTick(ctx, world, sim, tick, kDefaultSeed, {}, {}, {}, false,
                  {cx / (int)kChunk, h / (int)kChunk, cz / (int)kChunk}, false,
-                 /*particlesActive=*/true, {}, 0, spawns, fluidCount,
-                 splashMats);
+                 /*particlesActive=*/true, {}, 0, spawns, fluidCount);
       fluidCount = std::min(fluidCount + (uint32_t)spawns.size(), kFluidCap);
     }
   };
@@ -5738,7 +5746,6 @@ int main(int argc, char** argv) {
                  {f.in.playerChunk[0], f.in.playerChunk[1], f.in.playerChunk[2]},
                  f.in.wantReadback != 0, f.in.particlesActive != 0, f.spawns,
                  f.in.farCount, f.fluid, f.in.fluidLive,
-                 f.in.hasSplashMat ? f.in.fluidSplashMat : nullptr,
                  f.in.vizActive != 0);
       played++;
       if (f.in.tick % kProbeEvery == 0 || played == log.frames.size()) {
@@ -5947,13 +5954,8 @@ int main(int argc, char** argv) {
     ui.fSettleEps        = fs.fluidSettleEps;
     ui.fWakeSpeed        = fs.fluidWakeSpeed;
     ui.fSettleTicks      = fs.fluidSettleTicks;
-    ui.fStainRate        = fs.fluidStainRate;
     const auto& fr = CurrentTuning().render;
     ui.fSurface      = fr.fluidSurface;
-    std::memcpy(ui.fColor,  fr.fluidColor,  sizeof(ui.fColor));
-    std::memcpy(ui.fColor1, fr.fluidColor1, sizeof(ui.fColor1));
-    std::memcpy(ui.fColor2, fr.fluidColor2, sizeof(ui.fColor2));
-    std::memcpy(ui.fColor3, fr.fluidColor3, sizeof(ui.fColor3));
     ui.fIso          = fr.fluidIso;
     ui.fSmooth       = fr.fluidSmooth;
     ui.fIor          = fr.fluidIor;
@@ -6715,10 +6717,7 @@ int main(int argc, char** argv) {
   // excitement, voiced through water's Impact slot (the Break precedent —
   // audio is presentation-only and reads the same readback).
   uint32_t lastFluidCueTick = 0;
-  // fluidCueMat / fluidSpeciesMat moved into TickAuthorityCtx (N5).
-  // Material id each MPM species splashes micro droplets as, recorded from the
-  // pour's brush material (TickParams.fluidSplashMat). Species 0 defaults to
-  // water so the fluid tool pours water without an explicit key press.
+  // fluidCueMat / fluidPourMat moved into TickAuthorityCtx (N5).
   // Last tick the MPM fluid was live: keeps the particle passes awake for the
   // splash droplets (see particlesActive below).
   // lastFluidTick moved into TickAuthorityCtx (N5, section D).
@@ -6930,7 +6929,19 @@ int main(int argc, char** argv) {
   // fluid tool pours water without an explicit key press.
   for (size_t i = 0; i < mats.size(); i++)
     if (mats[i].name == "water") { fluidCueMat = (uint32_t)i; break; }
-  tickCtx.fluidSpeciesMat[0] = fluidCueMat;
+  // The mpm tool's keys 1-4 pour these liquids, resolved BY NAME (a missing
+  // one falls back to water in the pour). The particle's material is its whole
+  // identity -- colour, splash, density -- so this table is all "which liquid"
+  // means; there is no species.
+  {
+    static const char* kPourNames[4] = {"water", "oil", "acid", "blood"};
+    for (int k = 0; k < 4; k++)
+      for (size_t i = 0; i < mats.size(); i++)
+        if (mats[i].name == kPourNames[k]) {
+          tickCtx.fluidPourMat[k] = (uint32_t)i;
+          break;
+        }
+  }
   tickCtx.duelDummy = g_duelDummy;
 
   // HOW THIS SESSION READS THE WORLD, bound ONCE rather than rebuilt as a
@@ -9451,7 +9462,7 @@ int main(int argc, char** argv) {
         if (gameKeys && ui.devControls && key(GLFW_KEY_1 + i) &&
             i + 1 < (int)mats.size()) {
           if (ui.tool == UIState::kToolFluid)
-            ui.fluidSpecies = i & 3;
+            ui.fluidPour = i & 3;   // which liquid (TickAuthorityCtx::fluidPourMat)
           else
             ui.brushMaterial = i + 1;
         }
@@ -10003,13 +10014,8 @@ int main(int argc, char** argv) {
           ui.fSettleEps        = fs.fluidSettleEps;
           ui.fWakeSpeed        = fs.fluidWakeSpeed;
           ui.fSettleTicks      = fs.fluidSettleTicks;
-          ui.fStainRate        = fs.fluidStainRate;
           const auto& fr = tune.render;
           ui.fSurface      = fr.fluidSurface;
-          std::memcpy(ui.fColor,  fr.fluidColor,  sizeof(ui.fColor));
-          std::memcpy(ui.fColor1, fr.fluidColor1, sizeof(ui.fColor1));
-          std::memcpy(ui.fColor2, fr.fluidColor2, sizeof(ui.fColor2));
-          std::memcpy(ui.fColor3, fr.fluidColor3, sizeof(ui.fColor3));
           ui.fIso          = fr.fluidIso;
           ui.fSmooth       = fr.fluidSmooth;
           ui.fIor          = fr.fluidIor;
@@ -11238,9 +11244,15 @@ int main(int argc, char** argv) {
           const int heldPart = avatar.HeldSlot();
           if (camMode == CameraMode::First) {
             // Show the whole body except the head (its inside would fill the
-            // view). Worn shells over the head are hidden too.
+            // view). Worn shells over the head are hidden too -- and so is
+            // anything else hung off it, which since long hair became a BASE
+            // limb (a generated character's `hair`, parent "head") includes
+            // base slots: starting the sweep at AppendedBase() drew the hair
+            // across the camera. Parents precede children in both ranges
+            // (the base rig is ParentsFirst, an appended slot's host is an
+            // earlier slot), so one forward pass reaches every descendant.
             if (p.head >= 0 && p.head < (int)hide.size()) hide[p.head] = 1;
-            for (int i = avatar.AppendedBase(); i < (int)hide.size(); i++) {
+            for (int i = 0; i < (int)hide.size(); i++) {
               const int par = avatar.PartParent(i);
               if (par >= 0 && par < (int)hide.size() && hide[par] == 1)
                 hide[i] = 1;
@@ -13224,11 +13236,6 @@ int main(int argc, char** argv) {
         t.sim.fluidSettleEps        = ui.fSettleEps;
         t.sim.fluidWakeSpeed        = ui.fWakeSpeed;
         t.sim.fluidSettleTicks      = ui.fSettleTicks;
-        t.sim.fluidStainRate        = ui.fStainRate;
-        std::memcpy(t.render.fluidColor,  ui.fColor,  sizeof(ui.fColor));
-        std::memcpy(t.render.fluidColor1, ui.fColor1, sizeof(ui.fColor1));
-        std::memcpy(t.render.fluidColor2, ui.fColor2, sizeof(ui.fColor2));
-        std::memcpy(t.render.fluidColor3, ui.fColor3, sizeof(ui.fColor3));
         t.render.fluidSurface      = ui.fSurface;
         t.render.fluidIso          = ui.fIso;
         t.render.fluidSmooth       = ui.fSmooth;

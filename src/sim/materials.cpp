@@ -26,6 +26,36 @@ std::string FormatMille(double mille) {
   return s;
 }
 
+std::vector<uint8_t> SmokeSourceTable(const std::vector<MaterialDef>& mats,
+                                      const std::vector<ReactionGpu>& reactions) {
+  std::vector<uint8_t> out(mats.size(), 0u);
+  // The two products that ARE smoke in the sky, resolved by name like every
+  // other authored reference (an absent one simply never matches).
+  uint32_t fireId = 0, smokeId = 0;
+  for (size_t i = 1; i < mats.size(); i++) {
+    if (mats[i].name == "fire") fireId = (uint32_t)i;
+    if (mats[i].name == "smoke") smokeId = (uint32_t)i;
+  }
+  auto smoky = [&](uint32_t p) {
+    return p != 0 && p != kProdKeep && (p == fireId || p == smokeId);
+  };
+  for (size_t i = 1; i < mats.size(); i++) {   // 0 is air
+    const MaterialGpu& g = mats[i].gpu;
+    for (uint32_t k = 0; k < g.reactCount; k++) {
+      const size_t ri = (size_t)g.reactOffset + k;
+      if (ri >= reactions.size()) break;
+      const ReactionGpu& r = reactions[ri];
+      const uint32_t kind = r.packed & 3u;
+      if ((kind == kReactDecay && smoky(r.prodSelf)) ||
+          (kind == kReactEmit && smoky(r.prodNbr))) {
+        out[i] = 1u;
+        break;
+      }
+    }
+  }
+  return out;
+}
+
 static bool ParseColor(const std::string& hex, uint32_t& out) {
   if (hex.size() != 7 || hex[0] != '#') return false;
   uint32_t v = 0;
@@ -620,6 +650,9 @@ static bool LoadMaterialsJson(const std::string& path, std::vector<MaterialDef>&
     if (d.rotRate > 1.0f) d.rotRate = 1.0f;
     d.bareBlood = std::clamp(m.value("bareBlood", 0.0f), 0.0f, 1.0f);
     if (!(d.bareBlood == d.bareBlood)) d.bareBlood = 0.0f;   // NaN
+    // 0 intact / 1 half / 2 whole (materials.h burnStage). Clamped, like the
+    // weights above: a silly number should misbehave visibly, not refuse.
+    d.burnStage = (uint8_t)std::clamp(m.value("burnStage", 0), 0, 2);
     // The tariff base. Derived from density when not authored: a voxel of
     // something heavy is worth more to conjure than a voxel of smoke, which is
     // the right default for the long tail and wrong for exactly the materials
@@ -1418,10 +1451,73 @@ bool LoadAssets(const std::string& materialsPath, const std::string& reactionsPa
         d.gpu.molten = (uint32_t)id;
     }
   }
+  CheckPinnedMaterialIds(m, materialsPath, errors);
   if (!errors.empty()) return false;
   mats = std::move(m);
   reactions = std::move(r);
   return true;
+}
+
+// ---- the kMat* literals, resolved by NAME (rule-unification W1-D) ------------
+//
+// world.h's kMat* constants are compile-time ids because they feed the WGSL
+// prelude and a hundred switch statements; they stay literals. What was
+// missing is the RUNTIME half of the promise they make: that the material at
+// that position in materials.json is the one the name says. check_invariants.py
+// (check_material_ids) pins it statically; this makes the running build refuse
+// too, so an edited materials.json cannot load stone where the code means
+// water (kMatMushroomLarge drifted one slot exactly that way on 2026-09-17).
+//
+// The name of each constant is spelled out rather than derived from the C++
+// identifier: `check_invariants.py pinnedids` holds this table and world.h to
+// the same list, so a new kMat* without a row here fails the static check.
+void CheckPinnedMaterialIds(const std::vector<MaterialDef>& mats,
+                            const std::string& path, std::string& errors) {
+  struct Pin {
+    uint32_t id;
+    const char* name;
+  };
+  static const Pin kPins[] = {
+      {kMatAir, "air"}, {kMatStone, "stone"}, {kMatWood, "wood"},
+      {kMatSand, "sand"}, {kMatGravel, "gravel"}, {kMatWater, "water"},
+      {kMatOil, "oil"}, {kMatSmoke, "smoke"}, {kMatSteam, "steam"},
+      {kMatFire, "fire"}, {kMatEmber, "ember"}, {kMatAsh, "ash"},
+      {kMatLava, "lava"}, {kMatAcid, "acid"}, {kMatIce, "ice"},
+      {kMatSnow, "snow"}, {kMatDirt, "dirt"}, {kMatPlant, "plant"},
+      {kMatSeed, "seed"}, {kMatSprout, "sprout"}, {kMatStem, "stem"},
+      {kMatFlower, "flower"}, {kMatVine, "vine"}, {kMatFungus, "fungus"},
+      {kMatDust, "dust"}, {kMatMoltenGlass, "molten_glass"},
+      {kMatGlass, "glass"}, {kMatSourceWater, "source_water"},
+      {kMatSourceSand, "source_sand"}, {kMatSourceLava, "source_lava"},
+      {kMatVoid, "void"}, {kMatMite, "mite"}, {kMatBlood, "blood"},
+      {kMatGrass, "grass"}, {kMatLeaves, "leaves"},
+      {kMatPineNeedles, "pine_needles"}, {kMatAutumnLeaves, "autumn_leaves"},
+      {kMatBirchWood, "birch_wood"}, {kMatPetal, "petal"},
+      {kMatGrassTuft, "grass_tuft"}, {kMatFoliageBush, "foliage_bush"},
+      {kMatFlowerPoppy, "flower_poppy"}, {kMatFlowerDaisy, "flower_daisy"},
+      {kMatPetalRed, "petal_red"}, {kMatPetalWhite, "petal_white"},
+      {kMatPetalYellow, "petal_yellow"}, {kMatLeafGreen, "leaf_green"},
+      {kMatStemGreen, "stem_green"}, {kMatFlowerBluebell, "flower_bluebell"},
+      {kMatFlowerFoxglove, "flower_foxglove"},
+      {kMatFlowerButtercup, "flower_buttercup"}, {kMatFern, "fern"},
+      {kMatMushroomCluster, "mushroom_cluster"},
+      {kMatToadstoolPale, "toadstool_pale"}, {kMatTallGrass, "tall_grass"},
+      {kMatTallGrassHead, "tall_grass_head"},
+      {kMatMushroomLarge, "mushroom_large"},
+  };
+  for (const Pin& p : kPins) {
+    if (p.id < mats.size() && mats[p.id].name == p.name) continue;
+    const int at = FindMaterial(mats, p.name);
+    errors += path + ": world.h pins material id " + std::to_string(p.id) +
+              " to \"" + p.name + "\" but " +
+              (p.id < mats.size() ? "that position holds \"" + mats[p.id].name + "\""
+                                  : std::string("the table ends before it")) +
+              (at >= 0 ? " (\"" + std::string(p.name) + "\" is at " +
+                             std::to_string(at) + ")"
+                       : std::string(" (no material by that name)")) +
+              " -- a material was inserted, removed or renamed above it; the "
+              "compiled-in id would name the wrong substance\n";
+  }
 }
 
 std::vector<uint32_t> BuildCollisionClasses(const std::vector<MaterialDef>& mats) {

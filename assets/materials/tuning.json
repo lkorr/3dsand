@@ -524,7 +524,6 @@
     "fluidStuckTicks": 96,
     "fluidForceBlocks": 4,
     "fluidForceReach": 64,
-    "fluidStainRate": 8,
     "waterBodyMode": 1,
     "waterBodyMinVolume": 65536,
     "waterBodyExitVolume": 32768,
@@ -584,26 +583,6 @@
       0.25,
       0.47,
       0.85
-    ],
-    "fluidColor": [
-      0.2,
-      0.42,
-      0.85
-    ],
-    "fluidColor1": [
-      0.92,
-      0.34,
-      0.1
-    ],
-    "fluidColor2": [
-      0.22,
-      0.78,
-      0.28
-    ],
-    "fluidColor3": [
-      0.88,
-      0.72,
-      0.25
     ],
     "fluidParticleSize": 0.58,
     "fluidStretch": 0.4,
@@ -846,7 +825,7 @@
     "subScatterDense": 0.42,
     "subScatterClear": 0.16,
     "subClearLow": 0.62,
-    "subClearHigh": 0.82,
+    "subClearHigh": 0.78,
     "lavaCrackFreq": 2.4,
     "lavaCrackKneeLow": 0.5,
     "lavaCrackKneeHigh": 0.9,
@@ -854,7 +833,6 @@
     "lavaEmissionGain": 1.9,
     "lavaPulseAmp": 0.06,
     "lavaPulseRate": 0.9,
-    "heatSpillStrength": 0.16,
     "emberBrightness": 2.2,
     "emberRise": 26,
     "emberRate": 3.4,

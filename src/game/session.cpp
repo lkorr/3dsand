@@ -289,7 +289,7 @@ struct TickScratch {
   auto& fluidPendingSpawns = w.fluidPendingSpawns;         \
   uint32_t& fluidCueMat = w.fluidCueMat;                   \
   uint32_t& lastFluidTick = w.lastFluidTick;               \
-  uint32_t* fluidSpeciesMat = w.fluidSpeciesMat;           \
+  uint32_t* fluidPourMat = w.fluidPourMat;                 \
   uint32_t& labTick = w.labTick;                           \
   bool& duelDummySpawned = w.duelDummySpawned;             \
   const double now = w.frameTime;                          \
@@ -1474,8 +1474,8 @@ static void PhaseG(TickAuthorityCtx& w, WorldScratch& ws,
           at = {ifloor(p.x), ifloor(p.y), ifloor(p.z)};
         }
         const int rr = std::min(std::max(ui.brushRadius / 2, 1), 3);
-        const uint32_t fluidSpecies = (uint32_t)ui.fluidSpecies & 3u;
-        fluidSpeciesMat[fluidSpecies] = fluidCueMat;
+        uint32_t pourMat = fluidPourMat[(uint32_t)ui.fluidPour & 3u];
+        if (pourMat == 0) pourMat = fluidCueMat;
         for (int z = -rr; z <= rr && fluidSpawns.size() < kMaxFluidSpawnsPerTick; z++)
           for (int y = -rr; y <= rr; y++)
             for (int x = -rr; x <= rr; x++) {
@@ -1498,8 +1498,7 @@ static void PhaseG(TickAuthorityCtx& w, WorldScratch& ws,
                 op.pz = ((at.z + z) << 16) + ((s & 4) ? 49152 : 16384) +
                         (int32_t)((h >> 19) % 8192u) - 4096;
                 op.vx = 0; op.vy = -19661; op.vz = 0;  // gentle -0.3 cells/tick
-                op.species = fluidSpecies;
-                op.mat = fluidCueMat;
+                op.mat = pourMat;
                 fluidSpawns.push_back(op);
               }
             }
@@ -3383,52 +3382,93 @@ static void PhaseK(TickAuthorityCtx& w, WorldScratch& ws,
           // IS this vector, `OpLandingTick` is `tick`, phase N is after phase
           // J (the only other producer of destruction events in a tick), so
           // the same boxes are queued at the same tick in the same order.
-          // Blow voxels OFF the bodies in range before shoving what survives:
-          // an explosion next to a rigidbody now craters it, and splits it into
-          // separate bodies when the crater severs it. Runs first so the
-          // impulse below acts on the post-damage bodies (including the new
-          // fragments, which is what makes a blown-apart object scatter).
-          const Vec3 ec{(float)e.x + 0.5f, (float)e.y + 0.5f, (float)e.z + 0.5f};
-          const float edr =
-              (float)e.radius * CurrentTuning().physics.explosionBodyDamageScale;
-          debris.DamageBodiesRadial(ec, edr, world, spawns);
-          // Living flesh craters too: a blast next to a mob tears voxels off
-          // its limbs, and takes a limb clean off when it removes enough of it.
-          // Same call shape as the debris line above — that parallel is the
-          // point (game/mob.h).
-          mobs.CarveMobsRadial(ec, edr, world, spawns);
-          avatar.CarveRadial(ec, edr, world, spawns);
-          // The per-body impulse is for DEBRIS. A living creature's limbs are
-          // skipped whether kinematic (standing) or dynamic (already limp
-          // from an earlier blast): impulse / limb mass on a 0.3 kg hand is
-          // 170 m/s and the joints drag the rest of the rig after it —
-          // "bodies zoom across the map". The rig takes ONE launch below.
-          std::vector<uint64_t> rigBodies;
-          mobs.AppendLiveLimbBodies(rigBodies);
-          if (avatar.Spawned()) avatar.AppendLiveLimbBodies(rigBodies);
-          std::sort(rigBodies.begin(), rigBodies.end());
-          phys.ApplyRadialImpulse(
-              Vec3{(float)e.x, (float)e.y, (float)e.z},
-              (float)e.radius * CurrentTuning().physics.explosionImpulseRadiusScale,
-              (float)e.power * CurrentTuning().physics.explosionImpulseScale,
-              &rigBodies);
-          // ...and the LIVING are knocked flying. A standing creature's limbs
-          // are kinematic, so the impulse above never touched them; this is
-          // the blast's other half (Mob::BlastRadial): go limp, take a launch
-          // velocity of impulse / body mass toward away-from-the-blast,
-          // capped at ragdoll.maxLaunchSpeed, and get back up once landed.
-          {
-            const auto& rg = CurrentTuning().ragdoll;
-            const float reach = (float)e.radius * rg.blastRadiusScale;
-            const float impulse = (float)e.power * rg.blastImpulseScale;
-            mobs.BlastMobsRadial(ec, reach, impulse);
-            if (avatar.Spawned()) avatar.BlastRadial(ec, reach, impulse);
-          }
+          //
+          // ---- THE BODIES STAY HERE, ON THE AUTHOR'S MACHINE (W1-F) -------
+          // Every body this process holds: NPCs, every local player, and a
+          // peer's ghost (carved as presentation, never launched) — the same
+          // rule a melee hit on a ghost follows. The peer's REAL body is hit
+          // on the peer's machine, by the peer, at the landing tick: phase N's
+          // RemoteExplosionsHitOwnAvatars applies every REMOTE blast in the
+          // merged batch to that machine's own avatars (DESIGN.md §10). The
+          // ghost's gore is discarded here (MobSystem::CarveMobsRadial) and
+          // authored there, so it enters the shared batch once.
+          ExplosionHitsBodies(e, world, phys, debris, mobs, spawns);
           stream.MarkModifiedBox({e.x - e.radius, e.y - e.radius, e.z - e.radius},
                                  {e.x + e.radius, e.y + e.radius, e.z + e.radius});
         }
       }
   }
+}
+
+// ---- ONE EXPLOSION AGAINST EVERY BODY (session.h) -------------------------
+void ExplosionHitsBodies(const ExplosionOp& e, World& world, Physics& phys,
+                         DebrisSystem& debris, MobSystem& mobs,
+                         std::vector<ParticleSpawn>& spawns, BlastBodies who) {
+  const Vec3 ec{(float)e.x + 0.5f, (float)e.y + 0.5f, (float)e.z + 0.5f};
+  const float edr =
+      (float)e.radius * CurrentTuning().physics.explosionBodyDamageScale;
+  const auto& rg = CurrentTuning().ragdoll;
+  const float reach = (float)e.radius * rg.blastRadiusScale;
+  const float impulse = (float)e.power * rg.blastImpulseScale;
+  if (who == BlastBodies::OwnAvatars) {
+    // A PEER's blast on this machine: the same carve and the same launch as
+    // below, on this process's own avatars only. The debris, the NPCs and the
+    // impulse are left alone -- this is the owner-side half of a player hit,
+    // not a second application of the whole blast.
+    mobs.CarveLocalAvatarsRadial(ec, edr, world, spawns);
+    mobs.BlastLocalAvatarsRadial(ec, reach, impulse);
+    return;
+  }
+  // Blow voxels OFF the bodies in range before shoving what survives:
+  // an explosion next to a rigidbody now craters it, and splits it into
+  // separate bodies when the crater severs it. Runs first so the
+  // impulse below acts on the post-damage bodies (including the new
+  // fragments, which is what makes a blown-apart object scatter).
+  debris.DamageBodiesRadial(ec, edr, world, spawns);
+  // Living flesh craters too: a blast next to a mob tears voxels off
+  // its limbs, and takes a limb clean off when it removes enough of it.
+  // Same call shape as the debris line above — that parallel is the
+  // point (game/mob.h). EVERY PLAYER is in it (W1-F): MobSystem walks
+  // its registered avatars after the NPCs, so another player standing
+  // in this session's blast is carved. It used to be this session's
+  // own `avatar.CarveRadial` beside it, which reached nobody else.
+  mobs.CarveMobsRadial(ec, edr, world, spawns);
+  // The per-body impulse is for DEBRIS. A living creature's limbs are
+  // skipped whether kinematic (standing) or dynamic (already limp
+  // from an earlier blast): impulse / limb mass on a 0.3 kg hand is
+  // 170 m/s and the joints drag the rest of the rig after it —
+  // "bodies zoom across the map". The rig takes ONE launch below.
+  std::vector<uint64_t> rigBodies;
+  mobs.AppendLiveLimbBodies(rigBodies);  // NPCs + every avatar
+  std::sort(rigBodies.begin(), rigBodies.end());
+  phys.ApplyRadialImpulse(
+      Vec3{(float)e.x, (float)e.y, (float)e.z},
+      (float)e.radius * CurrentTuning().physics.explosionImpulseRadiusScale,
+      (float)e.power * CurrentTuning().physics.explosionImpulseScale,
+      &rigBodies);
+  // ...and the LIVING are knocked flying. A standing creature's limbs
+  // are kinematic, so the impulse above never touched them; this is
+  // the blast's other half (Mob::BlastRadial): go limp, take a launch
+  // velocity of impulse / body mass toward away-from-the-blast,
+  // capped at ragdoll.maxLaunchSpeed, and get back up once landed.
+  // NPCs + every LOCAL avatar; a peer's ghost is carved above but
+  // never launched — its position is the wire's (game/mob.h).
+  mobs.BlastMobsRadial(ec, reach, impulse);
+}
+
+uint32_t RemoteExplosionsHitOwnAvatars(std::span<const ExplosionOp> exps,
+                                       std::span<const uint32_t> remoteIdx,
+                                       World& world, Physics& phys,
+                                       DebrisSystem& debris, MobSystem& mobs,
+                                       std::vector<ParticleSpawn>& gore) {
+  uint32_t n = 0;
+  for (uint32_t i : remoteIdx) {
+    if (i >= exps.size()) continue;
+    ExplosionHitsBodies(exps[i], world, phys, debris, mobs, gore,
+                        BlastBodies::OwnAvatars);
+    n++;
+  }
+  return n;
 }
 
 // ---- PHASE L (WORLD) - dirty marks, the celestial clock and the edit layer
@@ -3457,6 +3497,14 @@ static void PhaseL(TickAuthorityCtx& w, WorldScratch& ws,
       for (const BrushOp& b : ops)
         stream.MarkModifiedBox({b.x - b.radius, b.y - b.radius, b.z - b.radius},
                                {b.x + b.radius, b.y + b.radius, b.z + b.radius});
+      // A peer's blast carved my avatar last tick (phase N); its gore joins
+      // THIS tick's local batch so it reaches both machines (session.h).
+      // Empty unless a peer is connected.
+      if (!w.remoteBlastGore.empty()) {
+        spawns.insert(spawns.end(), w.remoteBlastGore.begin(),
+                      w.remoteBlastGore.end());
+        w.remoteBlastGore.clear();
+      }
       // body-shatter spawns keep the particle passes alive exactly like
       // explosions do (a fragment must fly and land on later ticks too)
       if (!spawns.empty()) {
@@ -3635,8 +3683,8 @@ static void PhaseN(TickAuthorityCtx& w, WorldScratch& ws,
         opstream::ClearAuthorRanges();
 
         net::MergeStats ms;
-        std::vector<uint32_t> remoteBrush;
-        OpBatch merged = q.Merge(tick, world, ms, &remoteBrush);
+        std::vector<uint32_t> remoteBrush, remoteExp;
+        OpBatch merged = q.Merge(tick, world, ms, &remoteBrush, &remoteExp);
         // The local ops were marked modified at their own tick (phase L, by
         // the machine that authored them); a REMOTE brush op touches chunks
         // this machine never marked, and an unmarked chunk can be evicted
@@ -3649,11 +3697,29 @@ static void PhaseN(TickAuthorityCtx& w, WorldScratch& ws,
               {b.x - b.radius, b.y - b.radius, b.z - b.radius},
               {b.x + b.radius, b.y + b.radius, b.z + b.radius});
         }
+        // A peer's crater is an edit to chunks this machine never marked,
+        // for the same reason (phase K marks only this machine's blasts).
+        for (uint32_t i : remoteExp) {
+          const ExplosionOp& e = merged.exps[i];
+          stream.MarkModifiedBox(
+              {e.x - e.radius, e.y - e.radius, e.z - e.radius},
+              {e.x + e.radius, e.y + e.radius, e.z + e.radius});
+        }
         // `ops`, `exps`, `cellOps`, `spawns` and `fluidSpawns` are references
         // to out's members (SV_OPS_REFS), so assigning `out` re-points every
         // one of them at the merged vectors and the submit below needs no
         // change at all.
         out = std::move(merged);
+        // ---- A PEER'S GRENADE HITS MY BODY, ON MY MACHINE ---------------
+        // The owner-side half W1-F left open (DESIGN.md s10): at the landing
+        // tick, the tick its crater reaches this GPU, each REMOTE explosion
+        // carves and launches this machine's own avatars. The author's
+        // machine carved my ghost as presentation and could not launch it;
+        // this is the real body. My own blasts are LOCAL in the merge and
+        // were applied in phase K when I authored them, so nothing is applied
+        // twice. The gore goes to the next local batch (session.h).
+        RemoteExplosionsHitOwnAvatars(exps, remoteExp, world, phys, debris,
+                                      mobs, w.remoteBlastGore);
       }
       // ---- M9.3-C: THE SMOKE'S DELIBERATE DIVERGENCE --------------------
       //
@@ -3697,7 +3763,7 @@ static void PhaseN(TickAuthorityCtx& w, WorldScratch& ws,
       tSubmit0 = NowSeconds();
       SubmitTick(ctx, world, sim, tick, kDefaultSeed, ops, exps, cellOps,
                  tick % 15 == 0 /*hash occasionally*/, pc, true, particlesActive,
-                 spawns, farCount, fluidSpawns, fluidCount, fluidSpeciesMat,
+                 spawns, farCount, fluidSpawns, fluidCount,
                  ui.showDirtyVoxels);
       // Conservative estimate refresh: the newest snapshot's GPU-owned count
       // plus every spawn batch it has not seen yet. Settles decay it (the

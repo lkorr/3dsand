@@ -15,13 +15,14 @@
  * is the arrangement treegen.js / biomegen.js / watergen.js already use and
  * the reason the Trees page shows the engine's actual tree.
  *
- * THE PORT IS PINNED. `generateMob(defaultGenome())` reproduces
- * gen_human.py's output cell for cell — same limb boxes, same voxels, same
- * art slots, same placements, same sidecar fields. `scripts/test_mobgen.mjs`
- * asserts it against a digest of a live gen_human.py run. That is the one
- * test that makes a 1,588-line translation safe, and it is why every
- * default below is the exact literal the Python carries rather than a tidier
- * number nearby.
+ * THE STANDARD IS assets/mobs/human.json. The port was pinned cell for cell
+ * against gen_human.py's own output until 2026-09-24, which is why every
+ * default below is the exact literal the Python carried rather than a tidier
+ * number nearby. That pin and the Python are DELETED (rule-unification W1-E):
+ * the Python had stopped reproducing the shipped human, so the pin held this
+ * file to a stale rig. `scripts/test_mobgen.mjs` §L now holds the default
+ * genome's rig contract to human.json and §M every bred character to its
+ * genome; `scripts/generator_parity.mjs` runs it after every edit here.
  *
  * NOTE: it does NOT reproduce assets/mobs/human.vox, and neither does
  * gen_human.py any more. The shipped human has been hand-extended past its
@@ -249,7 +250,49 @@ export const ART = {
   CLOTH: 249,
   CLOTH_SHADE: 248,
   NAIL: 247,         // reserved (nails are below this resolution)
+  // THE WISPS: the hair colour at three coverages, for the thinning ends of
+  // hanging hair. Not genome colours -- they are DERIVED from `hair` at
+  // palette-write time (wispColors) and carry an ALPHA, which microbody.wgsl
+  // draws as screen-door coverage. Heaviest first.
+  HAIR_WISP1: 246,
+  HAIR_WISP2: 245,
+  HAIR_WISP3: 244,
 };
+
+/** Coverage of each wisp tier, 0..255. The steps are even in how THIN they
+ *  read rather than in the number: the eye barely separates 200 from 255, so
+ *  the first tier already drops a quarter. */
+export const WISP_ALPHA = { [ART.HAIR_WISP1]: 190, [ART.HAIR_WISP2]: 120,
+                            [ART.HAIR_WISP3]: 60 };
+
+/** Wisp slot -> `#rrggbbaa` (vox.js hexAlpha). The tips of a strand are the
+ *  hair colour a touch toward the light -- sun through thin hair -- at their
+ *  tier's coverage. */
+export function wispColors(colors) {
+  const n = parseInt(String(colors.hair || '#4a3728').slice(1, 7), 16);
+  const rgb = [(n >> 16) & 255, (n >> 8) & 255, n & 255]
+    .map(v => Math.min(255, Math.round(v * 1.08 + 6)));
+  const hex = v => v.toString(16).padStart(2, '0');
+  const out = {};
+  for (const [slot, a] of Object.entries(WISP_ALPHA))
+    out[slot] = '#' + rgb.map(hex).join('') + hex(a);
+  return out;
+}
+
+/** What hair is made of once it leaves the scalp. The painted cap on the
+ *  skull stays FLESH -- it is the scalp. The MASS (volume, crests, buns,
+ *  anything that hangs) is `hair_white`, which catches fast, burns out to ash
+ *  and does not bleed. Its own white is never seen while the art layer holds:
+ *  the name is the material's, not the character's. By NAME, for FLESH_ID's
+ *  reason. */
+export const HAIR_MAT_ID = 'hair_white';
+
+/** The parts hairMass may add, and what each rides. `hair` turns with the
+ *  head; `mane` is everything below the neck and rides the TORSO, because a
+ *  head that turns sixty degrees to look would otherwise swing a curtain of
+ *  hair through the shoulders. Neither exists on a body whose style has no
+ *  mass, so every pre-existing character builds exactly as it did. */
+export const HAIR_PARTS = { hair: 'head', mane: 'torso' };
 
 /** genome.colors key -> art slot. The genome names a colour by what it IS,
  *  the slot is where it lands; the UI pickers walk this map. */
@@ -444,6 +487,22 @@ export function defaultGenome() {
       front: 10.0,
       length: 0,        // micro of mane below the skull, down the nape
       knot: false,      // a topknot nub above the crown
+      // ---- the hair MASS (hairMass): real voxels off the scalp, built on the
+      // shipped lattice into their own `hair` / `mane` parts. Every default is
+      // "none", so a genome written before these genes existed builds the
+      // same body it always did.
+      side: 0,          // parting: -1..1 tilts the fringe line to one side
+      band: 1,          // fraction of the skull's width that grows hair
+      volume: 0,        // shipped voxels of hair standing off the scalp
+      crest: 0,         // mohawk fin height, shipped voxels
+      spikes: 0,        // spike length, shipped voxels
+      buns: false,      // two buns on the crown
+      drop: 0,          // loose hanging length: 0 none .. 1 to the waist
+      tail: 0,          // ponytail length, on the same scale as drop
+      braid: false,     // the tail is plaited
+      twin: false,      // two tails behind the ears instead of one
+      wisp: 0.35,       // share of a hanging strand that thins to nothing
+      ragged: 0.3,      // how uneven the ends are
     },
 
     colors: {
@@ -460,22 +519,52 @@ export function defaultGenome() {
   };
 }
 
-/** Hairstyles, as the two numbers plus the two flags they set. A style is a
- *  PRESET of the hair genes, never a separate code path, so a hand-dragged
- *  slider and a picked style are the same thing to the generator and mutation
- *  does not have to know which one produced the body. Numbers are authored
- *  micro at the default 16-micro head and scale with it. */
+/** Hairstyles, as PRESETS of the hair genes. A style is never a separate
+ *  code path, so a hand-dragged slider and a picked style are the same thing
+ *  to the generator and mutation does not have to know which one produced the
+ *  body. Cap numbers (`back`/`front`/`length`) are authored micro at the
+ *  default 16-micro head and scale with it; the mass numbers are shipped
+ *  voxels and fractions (see the genome).
+ *
+ *  EVERY STYLE STATES EVERY GENE, through HAIR_NONE. applyHairStyle is an
+ *  Object.assign, so a style that left `tail` out would keep the ponytail of
+ *  whatever was picked before it. */
+const HAIR_NONE = { back: 99, front: 99, length: 0, knot: false, side: 0,
+                    band: 1, volume: 0, crest: 0, spikes: 0, buns: false,
+                    drop: 0, tail: 0, braid: false, twin: false, wisp: 0.35,
+                    ragged: 0.3 };
+const hs = o => ({ ...HAIR_NONE, ...o });
 export const HAIR_STYLES = {
-  bald:    { back: 99, front: 99, length: 0, knot: false },
-  cropped: { back: 8.5, front: 8.5, length: 0, knot: false },
-  swept:   { back: 5.5, front: 10.0, length: 0, knot: false },
-  fringe:  { back: 9.5, front: 5.0, length: 0, knot: false },
-  long:    { back: 4.5, front: 9.5, length: 6, knot: false },
-  mane:    { back: 3.5, front: 8.5, length: 10, knot: false },
-  topknot: { back: 10.5, front: 11.5, length: 0, knot: true },
+  // ---- short: paint on the skull, and at most a little mass
+  bald:     hs({}),
+  cropped:  hs({ back: 8.5, front: 8.5 }),
+  swept:    hs({ back: 5.5, front: 10.0 }),
+  fringe:   hs({ back: 9.5, front: 5.0 }),
+  sidepart: hs({ back: 5.5, front: 8.0, side: 0.8, volume: 1 }),
+  crew:     hs({ back: 7.0, front: 9.5, volume: 1 }),
+  bowl:     hs({ back: 6.0, front: 6.0, volume: 2, ragged: 0 }),
+  undercut: hs({ back: 9.5, front: 9.0, band: 0.55, volume: 2, side: 0.5 }),
+  mohawk:   hs({ back: 5.0, front: 9.0, band: 0.22, crest: 5, ragged: 0.2 }),
+  spiky:    hs({ back: 6.5, front: 9.0, volume: 1, spikes: 5 }),
+  afro:     hs({ back: 5.0, front: 9.5, volume: 4, wisp: 0 }),
+  topknot:  hs({ back: 10.5, front: 11.5, knot: true }),
+  buns:     hs({ back: 5.5, front: 9.5, buns: true }),
+  // ---- hanging: a `mane` part below the neck, thinning to wisps
+  bob:      hs({ back: 4.5, front: 7.0, volume: 1, drop: 0.12, wisp: 0.25,
+                 ragged: 0.1 }),
+  long:     hs({ back: 4.5, front: 9.5, length: 6, drop: 0.6 }),
+  mane:     hs({ back: 3.5, front: 8.5, length: 10, volume: 2, drop: 0.75,
+                 ragged: 0.6 }),
+  flowing:  hs({ back: 4.0, front: 8.0, side: -0.6, volume: 1, drop: 1.0,
+                 wisp: 0.45, ragged: 0.45 }),
+  ponytail: hs({ back: 5.0, front: 10.0, tail: 0.7 }),
+  braid:    hs({ back: 5.0, front: 10.0, tail: 0.95, braid: true,
+                 wisp: 0.15 }),
+  pigtails: hs({ back: 5.0, front: 7.0, tail: 0.5, twin: true }),
+  wild:     hs({ back: 3.5, front: 6.0, volume: 3, spikes: 3, drop: 0.45,
+                 ragged: 0.9, wisp: 0.5 }),
 };
-export const HAIR_STYLE_ORDER =
-  ['bald', 'cropped', 'swept', 'fringe', 'long', 'mane', 'topknot'];
+export const HAIR_STYLE_ORDER = Object.keys(HAIR_STYLES);
 
 /**
  * THE GENE GROUPS, in the order the Characters page stacks them. `note` is the
@@ -498,9 +587,10 @@ export const GENE_GROUPS = [
     note: 'A face here is about twenty voxels across, so small moves read ' +
           'large. The side view is where the skull shape shows.' },
   { key: 'hair', title: 'hair',
-    note: 'Hair is two heights on the skull, not a texture: how far down the ' +
-          'back, and how far down the forehead. Which one is lower is the ' +
-          'difference between swept-back hair and a fringe.' },
+    note: 'Two layers. The CAP is paint on the skull: how far down the back ' +
+          'and the forehead it reaches. The MASS is real hair off the scalp ' +
+          '-- volume, crests, buns, and anything that hangs, which thins to ' +
+          'see-through wisps at the ends.' },
   { key: 'colour', title: 'colours',
     note: 'Nine art slots. Each surface picks base, shadow or highlight by ' +
           'which way it faces, so the three skin tones want to be the same ' +
@@ -680,7 +770,7 @@ export const GENE_SPECS = [
     sigma: 0.25 },
 
   { path: 'hair.style', label: 'style', group: 'hair',
-    hint: 'A preset of the four settings below. Picking one overwrites them; ' +
+    hint: 'A preset of every setting below. Picking one overwrites them; ' +
           'drag them afterwards and you are off the preset, which is fine.',
     kind: 'enum', choices: HAIR_STYLE_ORDER, sigma: 0.35 },
   { path: 'hair.back', label: 'nape line', group: 'hair',
@@ -701,6 +791,48 @@ export const GENE_SPECS = [
   { path: 'hair.knot', label: 'topknot', group: 'hair', kind: 'bool',
     hint: 'A nub of hair above the crown.',
     sigma: 0.15 },
+  { path: 'hair.side', label: 'parting', group: 'hair',
+    hint: 'Tilts the fringe so it sweeps down over one eye and lifts off ' +
+          'the other. 0 is a centre part.',
+    min: -1, max: 1, step: 0.1, sigma: 0.3 },
+  { path: 'hair.band', label: 'width on top', group: 'hair',
+    hint: 'How much of the skull, side to side, grows it. Narrow is an ' +
+          'undercut; narrower still is a mohawk strip.',
+    min: 0.15, max: 1, step: 0.05, sigma: 0.15 },
+  { path: 'hair.volume', label: 'volume', group: 'hair',
+    hint: 'How far it stands off the scalp. Four is an afro.',
+    min: 0, max: 4, step: 1, int: true, sigma: 0.8 },
+  { path: 'hair.crest', label: 'crest', group: 'hair',
+    hint: 'A fin standing up along the middle of the head, as tall as ' +
+          'this many voxels.',
+    min: 0, max: 8, step: 1, int: true, sigma: 1.2 },
+  { path: 'hair.spikes', label: 'spikes', group: 'hair',
+    hint: 'Stiff points radiating off the crown, this long.',
+    min: 0, max: 8, step: 1, int: true, sigma: 1.2 },
+  { path: 'hair.buns', label: 'buns', group: 'hair', kind: 'bool',
+    hint: 'Two round knots on top, either side of the crown.',
+    sigma: 0.15 },
+  { path: 'hair.drop', label: 'hangs to', group: 'hair',
+    hint: 'Loose hair falling from the nape: 0.25 reaches the shoulders, ' +
+          '0.6 the middle of the back, 1 the waist. It lies on the back.',
+    min: 0, max: 1, step: 0.05, sigma: 0.15 },
+  { path: 'hair.tail', label: 'ponytail', group: 'hair',
+    hint: 'Gathered and tied at the back of the head, hanging this far on ' +
+          'the same scale as the loose length.',
+    min: 0, max: 1, step: 0.05, sigma: 0.15 },
+  { path: 'hair.braid', label: 'braided', group: 'hair', kind: 'bool',
+    hint: 'Plaits the tail into crossing strands.',
+    sigma: 0.2 },
+  { path: 'hair.twin', label: 'twin tails', group: 'hair', kind: 'bool',
+    hint: 'Two tails tied behind the ears instead of one at the back.',
+    sigma: 0.2 },
+  { path: 'hair.wisp', label: 'thinning ends', group: 'hair',
+    hint: 'What share of each hanging strand fades toward see-through at ' +
+          'its tip. 0 cuts off blunt.',
+    min: 0, max: 0.8, step: 0.05, sigma: 0.1 },
+  { path: 'hair.ragged', label: 'ragged ends', group: 'hair',
+    hint: 'How uneven the strands are where they end. 0 is a clean cut.',
+    min: 0, max: 1, step: 0.05, sigma: 0.15 },
 
   // BASE FIRST, THEN ITS TONES. COLOR_SLOTS is keyed for the palette writer
   // and puts `nail` last; on screen it belongs under the skin it follows, or
@@ -1430,9 +1562,24 @@ function headVox(g, size, ctx) {
   // so a small skull is not bald by arithmetic.
   const hz = sz / DEF.head.size[2], hy = sy / DEF.head.size[1];
   const hBack = g.hair.back * hz, hFront = g.hair.front * hz;
-  const hairLine = y => {
-    const t = clamp((y + 0.5 - (hcy - 4.0 * hy)) / (8.0 * hy), 0.0, 1.0);
-    return hBack + (hFront - hBack) * t;
+  const hairT = y => clamp((y + 0.5 - (hcy - 4.0 * hy)) / (8.0 * hy), 0.0, 1.0);
+  const hairLine = y => hBack + (hFront - hBack) * hairT(y);
+  // THE PARTING tilts the line side to side, weighted toward the FRONT (a
+  // part is a fringe that falls one way; the nape does not care). THE BAND is
+  // how wide a strip across the skull grows hair at all -- measured against
+  // the skull's WIDEST radius, not the row's own, so a mohawk strip is the
+  // same width at the brow as at the crown instead of pinching to one cell on
+  // top. At side 0 / band 1 both are exact no-ops, which is what keeps every
+  // existing character's head bit-identical.
+  const bandHalf = g.hair.band * Math.max(...prx.map(k => k[1]));
+  const isHair = (x, y, z) => {
+    if (z < skullLo) return false;
+    const dx = x + 0.5 - cx;
+    if (Math.abs(dx) > bandHalf) return false;
+    let line = hairLine(y);
+    if (g.hair.side)
+      line += g.hair.side * (dx / Math.max(bandHalf, 1)) * 3.0 * hz * hairT(y);
+    return z >= line;
   };
 
   const out = [];
@@ -1448,7 +1595,7 @@ function headVox(g, size, ctx) {
         if (!ellipseMask(x, y, cx, hcy, rx, ry)) continue;
         const back = y + 0.5 < hcy - 1.5;
         let col;
-        if (z >= skullLo && z >= hairLine(y))
+        if (isHair(x, y, z))
           col = back ? ART.HAIR_SHADE : ART.HAIR;
         else col = back ? ART.SKIN_SHADE : ART.SKIN_BASE;
         out.push([x, y, z, col]);
@@ -1637,6 +1784,492 @@ function footVox(g, size) {
         out.push([x, y, z, z === 0 ? ART.SKIN_SHADE : ART.SKIN_BASE]);
       }
   return flipY(size, out);
+}
+
+// =============================================================================
+// THE HAIR MASS
+//
+// Everything hair does that is not paint on the skull: volume standing off the
+// scalp, a mohawk crest, spikes, buns, a ponytail or two, and loose hair that
+// hangs and drapes over the back. It cannot live in the head brick. The head's
+// box is the skull's box, and every worn helm and hood is FIT by resampling to
+// that box (mob.cpp cover.fitBox), so growing it to hold an afro would stretch
+// every hat in the game. So the mass gets its own parts:
+//
+//   `hair` rides the HEAD (joint fixed) -- everything at or above the neck;
+//   `mane` rides the TORSO (joint ball + spring) -- everything below it.
+//
+// The split is at the head's own joint. A curtain hung off the head would turn
+// with it, and the head turns up to sixty degrees to follow the camera: hair
+// down the back would swing through the shoulders. Below the neck, real hair
+// lies on the back and stays there.
+//
+// BUILT ON THE SHIPPED LATTICE, after the upscale, because hair is the one
+// thing on the figure that wants to be fine: a strand is one shipped voxel.
+// The body's own cells are the obstacle field, so hair is never placed inside
+// flesh, and it DRAPES: a strand that meets the back slides outward over it
+// rather than stopping or passing through.
+//
+// ALWAYS AT LEAST ONE CELL OF SHELL when there is any mass at all. It is what
+// makes everything rooted on the scalp (a bun, a spike, a tail's knot) one
+// connected piece -- the engine splits a disconnected limb into fragments on
+// its first carve -- and a real head of hair has thickness anyway.
+//
+// THE ENDS THIN. The last `wisp` share of a hanging strand steps down through
+// three see-through art slots (ART.HAIR_WISP1..3), so long hair ends in wisps
+// instead of a sawn-off plank. microbody.wgsl draws them as screen-door
+// coverage; the collider does not care.
+//
+// Returns [{name, parent, cells:[[X,Y,Z,slot]] in SCENE shipped coords}] --
+// one entry per connected piece, named hair, hair.2, mane, mane.2 ... in
+// order of size, so twin tails are two limbs rather than one limb in two
+// pieces. Empty when the style has no mass, which is every character that
+// existed before this.
+// =============================================================================
+
+/** Longest a hair part may be, shipped cells. The collider resolution is
+ *  picked off the LARGEST model (mob.cpp), 120 collider units at 1:1; a mane
+ *  that outgrew the torso past that would coarsen the whole body's collider. */
+const HAIR_MAX_EXTENT = 110;
+
+export function hairWants(h) {
+  return h.volume > 0 || h.crest > 0 || h.spikes > 0 || !!h.buns ||
+         h.drop > 0 || h.tail > 0;
+}
+
+function hairMass(g, parts) {
+  const h = g.hair;
+  if (!hairWants(h)) return [];
+  const U = SKIN_UPSCALE;
+  const K = (x, y, z) => ((z + 512) * 2048 + (y + 1024)) * 2048 + (x + 1024);
+  const P = {};
+  for (const p of parts) P[p.name] = p;
+  const head = P.head;
+  const body = new Set();
+  for (const p of parts)
+    for (const [x, y, z] of p.cells) body.add(K(p.mn[0] + x, p.mn[1] + y, p.mn[2] + z));
+
+  // The skull: its hair cells (the scalp the mass roots on), its skin cells
+  // (which hair must never touch but at the hairline), and a centre taken
+  // over the skull rather than the neck stub.
+  const hz0 = head.mn[2], hz1 = head.mn[2] + head.size[2];
+  const scalp = [], skin = new Set();
+  let c0 = [1e9, 1e9, 1e9], c1 = [-1e9, -1e9, -1e9];
+  for (const [x, y, z, c] of head.cells) {
+    const X = head.mn[0] + x, Y = head.mn[1] + y, Z = head.mn[2] + z;
+    if (Z >= hz0 + (hz1 - hz0) * 0.25) {
+      c0 = [Math.min(c0[0], X), Math.min(c0[1], Y), Math.min(c0[2], Z)];
+      c1 = [Math.max(c1[0], X), Math.max(c1[1], Y), Math.max(c1[2], Z)];
+    }
+    if (c === ART.HAIR || c === ART.HAIR_SHADE) scalp.push([X, Y, Z]);
+    else skin.add(K(X, Y, Z));
+  }
+  if (!scalp.length) return [];                 // bald: nothing to root on
+  const C = [(c0[0] + c1[0] + 1) / 2, (c0[1] + c1[1] + 1) / 2,
+             (c0[2] + c1[2] + 1) / 2];
+  const halfW = (c1[0] - c0[0] + 1) / 2, halfD = (c1[1] - c0[1] + 1) / 2;
+  const skullH = c1[2] - c0[2] + 1;
+  const rnd = (...v) => hashN(...v) / 4294967296;
+  const top = p => p.mn[2] + p.size[2];
+  const hipsTop = top(P.hips);
+  const splitZ = top(P.torso) - U;              // the head's joint (buildSidecar)
+  const shadeOf = Y => (Y > C[1] + 1 ? ART.HAIR_SHADE : ART.HAIR);
+
+  // THE BACK, per (column x, row z): the largest y the trunk and head reach
+  // there. Arms are left out -- they swing, so they are something to avoid,
+  // never something to lie on.
+  const backMap = new Map();
+  for (const nm of ['hips', 'torso', 'head']) {
+    const p = P[nm];
+    for (const [x, y, z] of p.cells) {
+      const k = (p.mn[0] + x) * 4096 + (p.mn[2] + z), Y = p.mn[1] + y;
+      if (!backMap.has(k) || Y > backMap.get(k)) backMap.set(k, Y);
+    }
+  }
+  const backOf = (X, Z) => backMap.has(X * 4096 + Z) ? backMap.get(X * 4096 + Z)
+                                                       : null;
+  const tailCells = new Set();                  // keys: always ride the head
+
+  const mass = new Map();                       // key -> [X, Y, Z, slot]
+  const add = (X, Y, Z, slot) => {
+    const k = K(X, Y, Z);
+    if (body.has(k) || mass.has(k)) return false;
+    mass.set(k, [X, Y, Z, slot]);
+    return true;
+  };
+  const free = (X, Y, Z) => !body.has(K(X, Y, Z));
+  const touchesSkin = (X, Y, Z) =>
+    skin.has(K(X + 1, Y, Z)) || skin.has(K(X - 1, Y, Z)) ||
+    skin.has(K(X, Y + 1, Z)) || skin.has(K(X, Y - 1, Z)) ||
+    skin.has(K(X, Y, Z + 1)) || skin.has(K(X, Y, Z - 1));
+
+  // ---- the shell: volume off the scalp ------------------------------------
+  // A BFS that carries each cell's SEED (the scalp cell it grew from), so the
+  // distance test is to the scalp, not along the path -- a cheap Euclidean
+  // distance transform. Growth must point AWAY from the skull centre, never
+  // touches skin (the face and ears stay clear) and never drops below a FRONT
+  // seed, or the fringe grows a visor over the eyes.
+  const V = Math.max(1, h.volume * U);
+  const shell = [];
+  {
+    const seen = new Set(scalp.map(([X, Y, Z]) => K(X, Y, Z)));
+    const q = scalp.map(([X, Y, Z]) => [X, Y, Z, X, Y, Z]);
+    for (let qi = 0; qi < q.length; qi++) {
+      const [X, Y, Z, sx, sy, sz] = q[qi];
+      const ox = sx - C[0], oy = sy - C[1], oz = sz - C[2];
+      const front = sy < C[1] - halfD * 0.3;
+      for (let dz = -1; dz <= 1; dz++)
+        for (let dy = -1; dy <= 1; dy++)
+          for (let dx = -1; dx <= 1; dx++) {
+            const x = X + dx, y = Y + dy, z = Z + dz;
+            const k = K(x, y, z);
+            if (seen.has(k) || body.has(k)) continue;
+            const ex = x - sx, ey = y - sy, ez = z - sz;
+            const d2 = ex * ex + ey * ey + ez * ez;
+            if (d2 > (V + 0.45) * (V + 0.45)) continue;
+            if (ex * ox + ey * oy + ez * oz <= 0) continue;
+            if (front && z < sz) continue;
+            if (touchesSkin(x, y, z)) continue;
+            seen.add(k);
+            const d = Math.sqrt(d2);
+            // The outermost layer of a big volume is FLUFF: a broken edge of
+            // the lightest wisp rather than a hard shell.
+            const fluff = h.volume >= 3 && h.wisp > 0 && d > V - 1.2 &&
+                          rnd(x, y, z, 11) < 0.55;
+            add(x, y, z, fluff ? ART.HAIR_WISP1 : shadeOf(y));
+            shell.push([x, y, z]);
+            q.push([x, y, z, sx, sy, sz]);
+          }
+    }
+  }
+  const outer = scalp.concat(shell);
+
+  // ---- a crest: the mohawk fin ---------------------------------------------
+  // Rays out of the skull centre through every hair cell in a strip along the
+  // midline, upper half only. Many seeds per ray line make the fin solid; the
+  // `ragged` gene knocks a little off each ray so the top edge is not a ruler.
+  if (h.crest > 0) {
+    const H = h.crest * U;
+    for (const [X, Y, Z] of outer) {
+      // Upper skull only, and the ray LEANS UP: a crest seeded down at the
+      // brow and fired radially fanned forward over the face.
+      if (Math.abs(X + 0.5 - C[0]) > 1.6 || Z < C[2] + skullH * 0.12) continue;
+      const r0 = [X + 0.5 - C[0], Y + 0.5 - C[1], Z + 0.5 - C[2]];
+      const rn = Math.hypot(...r0) || 1;
+      const d = [r0[0] / rn, r0[1] / rn * 0.6, r0[2] / rn + 0.8];
+      const n = Math.hypot(...d);
+      const len = Math.round(H * (1 - h.ragged * 0.35 * rnd(X, Y, Z, 23)));
+      for (let t = 1; t <= len; t++) {
+        const x = Math.floor(X + 0.5 + d[0] / n * t);
+        const y = Math.floor(Y + 0.5 + d[1] / n * t);
+        const z = Math.floor(Z + 0.5 + d[2] / n * t);
+        add(x, y, z, t >= len - 1 && h.wisp > 0 ? ART.HAIR_WISP1 : shadeOf(y));
+      }
+    }
+  }
+
+  // ---- spikes ----------------------------------------------------------------
+  // Points picked off the outer hair surface by hash, kept apart so they read
+  // as separate spikes, each a cone that leans UP from its radial direction.
+  if (h.spikes > 0) {
+    const L = h.spikes * U;
+    const cand = outer
+      .filter(([X, Y, Z]) => Z >= C[2] + skullH * 0.08 &&
+                             Y > C[1] - halfD * 0.75)
+      .map(c => [rnd(c[0], c[1], c[2], 37), c]).sort((a, b) => a[0] - b[0]);
+    const picked = [];
+    const sep2 = Math.max(16, (L * 0.6) ** 2);
+    for (const [, c] of cand) {
+      if (picked.length >= 22) break;
+      if (picked.some(p => (p[0] - c[0]) ** 2 + (p[1] - c[1]) ** 2 +
+                           (p[2] - c[2]) ** 2 < sep2)) continue;
+      picked.push(c);
+    }
+    for (const [X, Y, Z] of picked) {
+      const r = [X + 0.5 - C[0], Y + 0.5 - C[1], Z + 0.5 - C[2]];
+      const rn = Math.hypot(...r) || 1;
+      const d = [r[0] / rn, r[1] / rn, r[2] / rn + 0.9];
+      const dn = Math.hypot(...d);
+      const len = L * (1 - h.ragged * 0.4 * rnd(X, Y, Z, 41));
+      for (let t = 0; t <= len; t += 0.5) {
+        const rad = 1.25 * (1 - t / len);
+        const px = X + 0.5 + d[0] / dn * t, py = Y + 0.5 + d[1] / dn * t,
+              pz = Z + 0.5 + d[2] / dn * t;
+        const tip = t > len - 1.5;
+        for (let oz = -1; oz <= 1; oz++)
+          for (let oy = -1; oy <= 1; oy++)
+            for (let ox = -1; ox <= 1; ox++) {
+              if (ox * ox + oy * oy + oz * oz > rad * rad + 0.3) continue;
+              const x = Math.floor(px) + ox, y = Math.floor(py) + oy,
+                    z = Math.floor(pz) + oz;
+              add(x, y, z, tip && h.wisp > 0 ? ART.HAIR_WISP1 : shadeOf(y));
+            }
+      }
+    }
+  }
+
+  // Where a ray from the skull centre leaves the head and its hair: the root
+  // of a bun or a tail. Marches until two consecutive free, hairless cells.
+  const surfaceAlong = dir => {
+    const n = Math.hypot(...dir);
+    const u = dir.map(v => v / n);
+    let last = null;
+    for (let t = 0; t < 80; t += 0.5) {
+      const X = Math.floor(C[0] + u[0] * t), Y = Math.floor(C[1] + u[1] * t),
+            Z = Math.floor(C[2] + u[2] * t);
+      const k = K(X, Y, Z);
+      if (body.has(k) || mass.has(k)) last = [X, Y, Z];
+      else if (last && t > 2) return { at: last, u };
+    }
+    return { at: last || C.map(Math.floor), u };
+  };
+
+  // ---- buns ------------------------------------------------------------------
+  if (h.buns) {
+    const R = Math.max(2.5, halfW * 0.42);
+    for (const sgn of [-1, 1]) {
+      const { at, u } = surfaceAlong([sgn * 0.55, 0.2, 0.85]);
+      const c = [at[0] + 0.5 + u[0] * (R - 1), at[1] + 0.5 + u[1] * (R - 1),
+                 at[2] + 0.5 + u[2] * (R - 1)];
+      const r = Math.ceil(R);
+      for (let dz = -r; dz <= r; dz++)
+        for (let dy = -r; dy <= r; dy++)
+          for (let dx = -r; dx <= r; dx++) {
+            const x = Math.floor(c[0]) + dx, y = Math.floor(c[1]) + dy,
+                  z = Math.floor(c[2]) + dz;
+            const e = [x + 0.5 - c[0], y + 0.5 - c[1], z + 0.5 - c[2]];
+            if (e[0] * e[0] + e[1] * e[1] + e[2] * e[2] > R * R) continue;
+            // A wound knot, not a ball: a spiral band of shade round it.
+            const band = ((Math.atan2(e[1], e[0]) / (2 * Math.PI) + 1) * 3 +
+                          e[2] * 0.35) % 1 < 0.33;
+            add(x, y, z, band ? ART.HAIR_SHADE : ART.HAIR);
+          }
+    }
+  }
+
+  // The back of the body at height Z around column X (the largest Y any
+  // body cell reaches there), for draping a tail over it.
+  const backAt = (X, Z, r) => {
+    let b = -1e9;
+    for (let x = Math.floor(X - r); x <= Math.ceil(X + r); x++) {
+      const y = backOf(x, Z);
+      if (y !== null && y > b) b = y;
+    }
+    return b;
+  };
+  // How far a hanging thing reaches, from a start height, on the one scale
+  // `drop` and `tail` share: 0 nothing, 1 the waist. Clamped so no part can
+  // outgrow HAIR_MAX_EXTENT.
+  const reach = (z0, frac) => {
+    const want = Math.round(z0 - frac * (z0 - hipsTop));
+    return Math.max(want, z0 - HAIR_MAX_EXTENT + 8);
+  };
+  // Tier of a hanging cell by its distance from its strand's end.
+  const tierOf = (fromEnd, len) => {
+    const wl = Math.round(h.wisp * len);
+    if (wl < 1 || fromEnd >= wl) return 0;
+    const f = fromEnd / wl;
+    return f < 1 / 3 ? 3 : f < 2 / 3 ? 2 : 1;
+  };
+  const WISP = [0, ART.HAIR_WISP1, ART.HAIR_WISP2, ART.HAIR_WISP3];
+
+  // ---- tails: gathered, tied, hanging ---------------------------------------
+  if (h.tail > 0) {
+    const roots = h.twin
+      ? [[-1, 0.55, -0.15], [1, 0.55, -0.15]]
+      : [[0, 1, 0.25]];
+    for (const dir of roots) {
+      const { at, u } = surfaceAlong(dir);
+      const cx = at[0] + 0.5 + u[0] * 1.5;
+      let cy = at[1] + 0.5 + u[1] * 1.5;
+      const z0 = at[2];
+      const zEnd = reach(z0, h.tail);
+      const len = z0 - zEnd;
+      if (len < 2) continue;
+      const r0 = 1.4, r1 = h.braid ? 2.0 : 2.6;
+      for (let z = z0; z >= zEnd; z--) {
+        const t = (z0 - z) / len;
+        let r = t < 0.06 ? r0 : t < 0.25
+          ? r0 + (r1 - r0) * (t - 0.06) / 0.19
+          : r1 - (r1 - 1.0) * (t - 0.25) / 0.75;
+        const phase = z0 - z;
+        if (h.braid) r *= 1 + 0.18 * Math.cos(phase * 2 * Math.PI / 4);
+        // DRAPE. Below the skull a tail falls in toward the back a cell every
+        // other row until it lies on it, and never passes into it. Hanging
+        // straight down from the back of the skull left it floating a hand's
+        // breadth behind the shoulder blades on every rig, because the
+        // skull sits behind the torso's back plane.
+        const b = backAt(cx, z, r);
+        if (b > -1e9) {
+          const rest = b + 0.5 + r;
+          if (cy < rest) cy = rest;
+          else if (z < c0[2] && (z0 - z) % 2 === 0) cy = Math.max(rest, cy - 1);
+        }
+        const tier = tierOf(z - zEnd, len);
+        const rr = Math.ceil(r);
+        for (let dy = -rr; dy <= rr; dy++)
+          for (let dx = -rr; dx <= rr; dx++) {
+            const x = Math.floor(cx) + dx, y = Math.floor(cy) + dy;
+            const ex = x + 0.5 - cx, ey = y + 0.5 - cy;
+            if (ex * ex + ey * ey > r * r + 0.25) continue;
+            let slot;
+            if (tier) slot = WISP[tier];
+            else if (phase < 2) slot = ART.CLOTH_SHADE;         // the tie
+            else if (h.braid) {
+              // Three strands crossing: which one is on top turns with the
+              // angle and advances a third of a turn every plait.
+              const a = (Math.atan2(ey, ex) / (2 * Math.PI) + 1) * 3;
+              slot = Math.floor(a + phase / 1.34) % 3 === 0
+                ? ART.HAIR_SHADE : ART.HAIR;
+            } else slot = rnd(x, y, 53) < 0.22 ? ART.HAIR_SHADE : ART.HAIR;
+            if (add(x, y, z, slot)) tailCells.add(K(x, y, z));
+          }
+      }
+    }
+  }
+
+  // ---- loose hair: the curtain ----------------------------------------------
+  // Falls from the underside of the outer hair (scalp + shell) at the back and
+  // the sides. A column only falls if nothing of the head is under its root --
+  // that is what keeps it off the face and out of the skull. It then drops
+  // straight; where it meets the body a BACK strand slides outward over it
+  // (hair lying on the back and shoulders) and a SIDE strand stops (hair
+  // resting on the shoulder, the way it frames a face).
+  if (h.drop > 0) {
+    const headLow = new Map();                  // column -> lowest head cell
+    for (const [x, y, z] of head.cells) {
+      const k = (head.mn[0] + x) * 4096 + (head.mn[1] + y);
+      const Z = head.mn[2] + z;
+      if (!headLow.has(k) || Z < headLow.get(k)) headLow.set(k, Z);
+    }
+    const root = new Map();                     // column -> [X, Y, lowest Z]
+    for (const [X, Y, Z] of outer) {
+      if (Y < C[1] - halfD * 0.3) continue;     // in front of the ears
+      const k = X * 4096 + Y;
+      if (!root.has(k) || Z < root.get(k)[2]) root.set(k, [X, Y, Z]);
+    }
+    let zNape = 1e9;
+    for (const [, Y, Z] of scalp) if (Y > C[1] && Z < zNape) zNape = Z;
+    if (zNape === 1e9) zNape = Math.round(C[2]);
+    const zBase = reach(zNape, h.drop);
+    const len0 = zNape - zBase;
+    for (const [k, [X, Y, z0]] of root) {
+      if (headLow.has(k) && headLow.get(k) < z0) continue;   // skull below
+      // A soft U: the edges a little shorter than the middle, and `ragged`
+      // lifting each strand's end by its own amount.
+      const edge = Math.min(1, Math.abs(X + 0.5 - C[0]) / Math.max(halfW, 1));
+      const zEnd = Math.round(zBase + edge * edge * 0.18 * len0 +
+                              rnd(X, Y, 61) * h.ragged * 0.3 * len0);
+      if (zEnd >= z0) continue;
+      const len = z0 - zEnd;
+      const back = Y >= C[1] - 1;
+      const streak = rnd(X, Y, 67) < 0.18;
+      let y = Y;
+      for (let z = z0 - 1; z >= zEnd; z--) {
+        // DRAPE: once below the skull, a back strand closes on the back by a
+        // cell a row until it lies on it (see the tail's note for why).
+        if (back && z < c0[2]) {
+          const b = backOf(X, z);
+          if (b !== null && y > b + 1 && free(X, y - 1, z)) y--;
+        }
+        if (!free(X, y, z)) {
+          if (!back) break;
+          let j = 0;
+          while (j < 16 && !free(X, y + j, z)) j++;
+          if (j >= 16) break;
+          // Lay the strand over the top of what it met, so the column stays
+          // one piece instead of jumping a gap.
+          for (let i = 1; i <= j; i++) add(X, y + i, z + 1, streak ? ART.HAIR_SHADE : ART.HAIR);
+          y += j;
+        }
+        const tier = tierOf(z - zEnd, len);
+        add(X, y, z, tier ? WISP[tier] : streak ? ART.HAIR_SHADE : ART.HAIR);
+      }
+    }
+    // Depth: a hanging cell with more hair behind it is in the shade of it.
+    for (const v of mass.values())
+      if (v[3] === ART.HAIR && v[2] < C[2] && mass.has(K(v[0], v[1] + 1, v[2])))
+        v[3] = ART.HAIR_SHADE;
+  }
+
+  // ---- split by what it rides, then into connected pieces -------------------
+  const groups = { hair: [], mane: [] };
+  // A TAIL RIDES THE HEAD all the way down: it is tied to the head, and a
+  // ponytail swinging when the head turns is what one does.
+  for (const [k, v] of mass)
+    groups[v[2] >= splitZ || tailCells.has(k) ? 'hair' : 'mane'].push(v);
+  const out = [];
+  // FACE-CONNECTED, because that is what the engine means by one piece: a
+  // carve splits a limb into fragments by 6-connectivity, and the anatomy
+  // peel and test_mobgen's "one connected piece" check do the same. The
+  // generators above step diagonally all the time (a ray, a strand closing
+  // on the back a cell a row), so pieces that only touch along an EDGE or a
+  // CORNER are WELDED: the free cells between them, walked one axis at a
+  // time, are filled with hair. Then whatever is still apart is its own limb.
+  const pieces6 = cells => {
+    const idx = new Map(cells.map((c, i) => [K(c[0], c[1], c[2]), i]));
+    const comp = new Int32Array(cells.length).fill(-1);
+    const pieces = [];
+    for (let i = 0; i < cells.length; i++) {
+      if (comp[i] >= 0) continue;
+      const piece = [i];
+      comp[i] = pieces.length;
+      for (let qi = 0; qi < piece.length; qi++) {
+        const [X, Y, Z] = cells[piece[qi]];
+        for (const [dx, dy, dz] of [[1, 0, 0], [-1, 0, 0], [0, 1, 0], [0, -1, 0],
+                                    [0, 0, 1], [0, 0, -1]]) {
+          const j = idx.get(K(X + dx, Y + dy, Z + dz));
+          if (j === undefined || comp[j] >= 0) continue;
+          comp[j] = pieces.length;
+          piece.push(j);
+        }
+      }
+      pieces.push(piece);
+    }
+    return { pieces, comp, idx };
+  };
+  for (const [base, list] of Object.entries(groups)) {
+    let cells = list;
+    for (let pass = 0; pass < 4; pass++) {
+      const { pieces, comp, idx } = pieces6(cells);
+      if (pieces.length < 2) break;
+      const added = [];
+      const have = new Set(cells.map(c => K(c[0], c[1], c[2])));
+      for (let i = 0; i < cells.length; i++) {
+        const [X, Y, Z, slot] = cells[i];
+        for (let dz = -1; dz <= 1; dz++)
+          for (let dy = -1; dy <= 1; dy++)
+            for (let dx = -1; dx <= 1; dx++) {
+              if (Math.abs(dx) + Math.abs(dy) + Math.abs(dz) < 2) continue;
+              const j = idx.get(K(X + dx, Y + dy, Z + dz));
+              if (j === undefined || comp[j] === comp[i]) continue;
+              // x first, then y: the first free step joins them.
+              for (const [sx, sy, sz] of [[dx, 0, 0], [0, dy, 0], [0, 0, dz],
+                                          [dx, dy, 0], [dx, 0, dz], [0, dy, dz]]) {
+                if (!sx && !sy && !sz) continue;
+                const x = X + sx, y = Y + sy, z = Z + sz, k = K(x, y, z);
+                if (body.has(k)) continue;
+                if (!have.has(k)) { have.add(k); added.push([x, y, z, slot]); }
+                break;
+              }
+            }
+      }
+      if (!added.length) break;
+      cells = cells.concat(added);
+    }
+    const { pieces } = pieces6(cells);
+    const total = cells.length;
+    // Specks too small to be a limb (a crest ray that clipped a corner) are
+    // dropped; everything else is a limb.
+    pieces.filter(p => p.length >= Math.max(32, total * 0.02))
+      .sort((a, b) => b.length - a.length)
+      .forEach((p, n) => out.push({
+        name: n === 0 ? base : `${base}.${n + 1}`,
+        parent: HAIR_PARTS[base],
+        cells: p.map(i => cells[i]),
+      }));
+  }
+  return out;
 }
 
 /** name -> builder. The one place the name vocabulary meets the geometry. */
@@ -2148,9 +2781,9 @@ export function generateMob(genome, seed = 0, opts = {}) {
     cells = upscaleCells(cells, SKIN_UPSCALE);
     // THE SHOULDER ROUND, after the upscale because that is the only lattice
     // fine enough to round on (see roundShoulders). `roundShoulders: false`
-    // gives gen_human.py's geometry exactly, which is what the port pin in
-    // scripts/test_mobgen.mjs builds with — the pin proves the TRANSLATION, and
-    // this is a deliberate improvement on top of it rather than part of it.
+    // gives the retired gen_human.py's geometry exactly, which is what
+    // scripts/test_mobgen.mjs §K measures the round against — a deliberate
+    // improvement on top of the translation rather than part of it.
     if (opts.roundShoulders !== false) {
       const before = cells.length;
       if (ARCHETYPE.shoulders.fin.includes(nm))
@@ -2179,6 +2812,33 @@ export function generateMob(genome, seed = 0, opts = {}) {
     parts.push({ name: nm, size, mn, cells: uniq });
   }
 
+  // ---- the hair mass, as its own parts (see hairMass) ----------------------
+  // Scene cells -> a tight box each. Appended AFTER the body, so every body
+  // limb keeps its index and the figure's own asserts never see them.
+  const hairId = opts.materials
+    ? opts.materials.findIndex(m => m.id === HAIR_MAT_ID) + 1
+    : 52;
+  if (opts.materials && hairId <= 0)
+    throw new Error(`materials.json has no "${HAIR_MAT_ID}" material`);
+  if (hairId > 127)
+    throw new Error(`"${HAIR_MAT_ID}" is material ${hairId}; mob voxel ` +
+                    `material ids must stay <= 127`);
+  const hairParts = [];
+  for (const hp of hairMass(g, parts)) {
+    const mn = [0, 1, 2].map(i => Math.min(...hp.cells.map(c => c[i])));
+    const mx = [0, 1, 2].map(i => Math.max(...hp.cells.map(c => c[i])));
+    const size = [0, 1, 2].map(i => mx[i] - mn[i] + 1);
+    if (Math.max(...size) > 120)
+      throw new Error(`${hp.name} is ${Math.max(...size)} cells long; it would ` +
+                      `coarsen the whole body's collider (HAIR_MAX_EXTENT)`);
+    const cells = hp.cells.map(([x, y, z, c]) => [x - mn[0], y - mn[1], z - mn[2], c]);
+    painted += cells.length;
+    const part = { name: hp.name, size, mn, cells, parent: hp.parent,
+                   hair: true, mat: hairId };
+    parts.push(part);
+    hairParts.push(part);
+  }
+
   // ---- .vox ---------------------------------------------------------------
   let vox = null;
   if (opts.materials) {
@@ -2189,19 +2849,21 @@ export function generateMob(genome, seed = 0, opts = {}) {
       // layout); pivot is the integer half-size, exactly as MagicaVoxel writes.
       const t = { x: p.mn[0] + (p.size[0] >> 1), y: p.mn[1] + (p.size[1] >> 1),
                   z: p.mn[2] + (p.size[2] >> 1) };
+      const mat = p.mat || fleshId;
       models.push({ name: p.name, size, t,
-                    voxels: p.cells.map(([x, y, z]) => ({ x, y, z, c: fleshId })) });
+                    voxels: p.cells.map(([x, y, z]) => ({ x, y, z, c: mat })) });
       models.push({ name: p.name + '.col', size, t,
                     voxels: p.cells.map(([x, y, z, c]) => ({ x, y, z, c })) });
     }
     vox = writeVox(models, paletteBytes(opts.materials, g.colors), { scene: true });
   }
 
-  const sidecar = buildSidecar(g, table, opts, name);
+  const sidecar = buildSidecar(g, table, opts, name, hairParts);
   return {
     name, genome: g, table, parts, vox, sidecar,
     stats: { painted, rounded, worldH: table.worldH, microH: table.microH,
-             eyeZ: table.eyeZ, parts: parts.length },
+             eyeZ: table.eyeZ, parts: parts.length,
+             hair: hairParts.reduce((n, p) => n + p.cells.length, 0) },
   };
 }
 
@@ -2237,9 +2899,9 @@ export function generateMob(genome, seed = 0, opts = {}) {
  * out of one implementation. `scripts/anatomize_mob.mjs` stays as the way to
  * (re-)bake a mob that is ALREADY on disk, including hand-authored ones.
  *
- * SEPARATE FROM generateMob ON PURPOSE. The port pin (`test_mobgen.mjs`) is
- * against `gen_human.py`, which has no anatomy pass, so the generator's own
- * output has to stay the un-baked figure. Baking is a second, named step.
+ * SEPARATE FROM generateMob ON PURPOSE. The generator's own output is the
+ * un-baked figure (the retired gen_human.py it was ported from had no anatomy
+ * pass). Baking is a second, named step.
  *
  * @param built  the object generateMob returned; `vox` is REPLACED in place
  * @param materials the engine material list in ID order
@@ -2286,10 +2948,13 @@ export function bakeAnatomy(built, materials) {
 export function paletteBytes(materials, colors) {
   const pal = new Uint8Array(1024);
   const put = (idx, hex) => {
-    const n = parseInt(String(hex).replace('#', ''), 16);
+    const h = String(hex).replace('#', '');
+    const n = parseInt(h.slice(0, 6), 16);
     const o = (idx - 1) * 4;
     pal[o] = (n >> 16) & 255; pal[o + 1] = (n >> 8) & 255;
-    pal[o + 2] = n & 255; pal[o + 3] = 255;
+    pal[o + 2] = n & 255;
+    // `#rrggbbaa` carries a coverage (the wisps); voxload.cpp reads it.
+    pal[o + 3] = h.length === 8 ? parseInt(h.slice(6, 8), 16) & 255 : 255;
   };
   (materials || []).forEach((m, i) => {
     const hex = m && (m.colors ? m.colors[0] : m.color0);
@@ -2297,10 +2962,12 @@ export function paletteBytes(materials, colors) {
   });
   for (const [k, slot] of Object.entries(COLOR_SLOTS))
     if (colors[k]) put(slot, colors[k]);
+  for (const [slot, hex] of Object.entries(wispColors(colors)))
+    put(Number(slot), hex);
   return pal;
 }
 
-function buildSidecar(g, table, opts, name) {
+function buildSidecar(g, table, opts, name, hairParts = []) {
   const L = table.limbs;
   const U = SKIN_UPSCALE;
   // SHIPPED (upscaled) boxes. Anchors, sockets and natural-weapon edges are
@@ -2549,6 +3216,55 @@ function buildSidecar(g, table, opts, name) {
                   // elbows point BACK, so the pole is behind the figure
                   pole: [0, 0, -1], solver: 'twobone' });
 
+  // ---- THE HAIR LIMBS (hairMass) --------------------------------------------
+  // BLOODLESS and SEVERABLE, and both are load-bearing. A limb that is not
+  // severable is one whose loss is a DEATH (mob.cpp HpZeroSevers), so hair
+  // burnt off would kill the character; severable, losing it is a haircut.
+  // `bloodless` keeps it out of the bleed, wound, burn and hp bookkeeping.
+  // `hair` rides the head rigidly; `mane` hangs off the torso on a stiff ball
+  // joint with a slow spring, so it lags a step when the body moves -- the
+  // one bit of motion rigid hair can have. Tag `hair`: never a gait, IK or AI
+  // target, and measured out of the creature's size like a held prop.
+  //
+  // THE ANCHOR is the piece's cell nearest its parent's joint side: the top of
+  // a mane, the scalp contact of a crest. The "hanging by a thread" check
+  // (mob.cpp) measures the parent's voxels round it, so it must be on the
+  // parent, not out at a tip.
+  const hairLimbs = [], hairAnatomy = {};
+  for (const p of hairParts) {
+    let best = null, bestD = Infinity;
+    for (const [x, y, z] of p.cells) {
+      const X = (p.mn[0] + x) / U, Y = (p.mn[1] + y) / U, Z = (p.mn[2] + z) / U;
+      const par = L[p.parent];
+      const px = par.mn[0] + par.size[0] / 2, py = par.mn[1] + par.size[1] / 2;
+      const pz = p.parent === 'head' ? par.mn[2] + par.size[2] * 0.5
+                                     : par.mn[2] + par.size[2];
+      const d = (X - px) ** 2 + (Y - py) ** 2 + (Z - pz) ** 2;
+      if (d < bestD) { bestD = d; best = [p.mn[0] + x, p.mn[1] + y, p.mn[2] + z]; }
+    }
+    const hp = Math.max(4, Math.min(40, Math.round(p.cells.length / 60)));
+    const limb = {
+      name: p.name, parent: p.parent, joint: p.parent === 'head' ? 'fixed' : 'ball',
+      hp, severable: true, vital: false, bloodless: true, tag: 'hair',
+      anchor: anchor([best[0] + 0.5, best[1] + 0.5, best[2] + 1]),
+    };
+    if (p.parent !== 'head') {
+      Object.assign(limb, { cone: 0.3, coneSide: 0.2, twist: 0.15,
+                            spring: { halflife: 0.3, gain: 0.3, maxAngle: 0.25 } });
+    }
+    hairLimbs.push(limb);
+    // Keep every voxel exactly as generated: hair has no inside.
+    hairAnatomy[p.name] = { layers: [{ material: HAIR_MAT_ID, keep: true }] };
+  }
+  limbs.push(...hairLimbs);
+  const anatomy = anatomyRecipe();
+  if (hairLimbs.length) {
+    anatomy['//hair'] = 'Hair has no inside: every voxel of a hair piece is ' +
+                        'kept as generated, and keep-only pieces are left out ' +
+                        'of the depth union so they do not bury the scalp.';
+    Object.assign(anatomy.limbs, hairAnatomy);
+  }
+
   const gait = gaitNumbers(table, opts);
   const clips = scaleClipPositions(buildClips(gait), SKIN_UPSCALE);
 
@@ -2565,7 +3281,7 @@ function buildSidecar(g, table, opts, name) {
     // failure mob.cpp's legacy path warns about.
     sidecarVoxelsPerMetre: SIDECAR_VOXELS_PER_METRE,
     bleed: { material: 'blood', perDamage: 2.5 },
-    anatomy: anatomyRecipe(),
+    anatomy,
     speed: pyRound(gait.refSpeed, 4),
     gait: {
       // Biped: two SINGLETON groups, so only one foot may swing at a time.
@@ -2754,8 +3470,11 @@ export function validateMob(built) {
   const { table, sidecar, parts } = built;
   const S = {};
   for (const p of parts) S[p.name] = p;
-  const minX = Math.min(...parts.map(p => p.mn[0]));
-  const maxY = Math.max(...parts.map(p => p.mn[1] + p.size[1]));
+  // The BODY's corner is the prefab origin (mob.cpp rebases to it, measuring
+  // hair out exactly as it measures a held prop out); hair may lie past it.
+  const bodyParts = parts.filter(p => !p.hair);
+  const minX = Math.min(...bodyParts.map(p => p.mn[0]));
+  const maxY = Math.max(...bodyParts.map(p => p.mn[1] + p.size[1]));
   for (const lm of sidecar.limbs) {
     if (!lm.anchor) continue;
     const p = S[lm.name];

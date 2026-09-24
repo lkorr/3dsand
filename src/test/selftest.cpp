@@ -32,6 +32,9 @@ const std::vector<Gate>& TerrainGates();
 const std::vector<Gate>& TreeGates();
 const std::vector<Gate>& BiomeGates();
 const std::vector<Gate>& EnvTruthGates();
+// The Node generator data gates (test_mobgen / test_anatomy / test_environment.mjs),
+// shelled out to through scripts/generator_parity.mjs. No World, no GPU.
+const std::vector<Gate>& GeneratorGates();
 const std::vector<Gate>& ScaleGates();
 const std::vector<Gate>& SimGates();
 const std::vector<Gate>& CaGates();
@@ -185,6 +188,10 @@ const char* const kOrder[] = {
     // later melee gate measure the wrong numbers silently, and it is better
     // reported in the first second than in the fiftieth.
     "combat-tuning", "combat-cues",
+    // Same shape (pure CPU, one temp file removed before it returns), for
+    // every tuning_params.def row: a dead slider is reported in the first
+    // second rather than never.
+    "tuning-reach",
     // SECOND, and for the same reason: `tree-atlas` reads assets/trees/*.svtree
     // off disk and asserts on the bytes. No world, no GPU, no state left
     // behind -- and when the atlas is wrong every gate after it is measuring a
@@ -195,6 +202,12 @@ const char* const kOrder[] = {
     // asserts they agree with each other and with the atlas that was just
     // checked. No world, no GPU, nothing left behind.
     "biomes",
+    // With them: `generator-parity` runs the Node generator data gates
+    // (scripts/generator_parity.mjs). A child process over files on disk -- no
+    // World, no GPU, nothing left behind -- and cached on its inputs, so it
+    // costs one node start unless a generator or its data changed. SKIPS
+    // without node on PATH.
+    "generator-parity",
     "terrain",
     // Right after terrain, on the same pristine world: the painted map's
     // biome reaches the kernel (CPU twin at cell centres, GPU skin in-window).
@@ -285,8 +298,8 @@ const char* const kOrder[] = {
     // disturbs a neighbour.
     "pond-shore",
     "evaporation", "wind",      "wind-gas",   "wind-prim",
-    "blood-stain", "flung-liquid", "fluid-det",     "fluid-settle",
-    "fluid-excite", "fluid-onwater", "debris-float", "fluid-stain", "fluid-react", "far-fog",  "far-downsample",
+    "blood-stain", "flung-liquid", "fluid-det",     "fluid-identity", "fluid-settle",
+    "fluid-excite", "fluid-onwater", "debris-float", "fluid-stain", "fluid-react", "fluid-self-react", "far-fog",  "far-downsample",
     "far-persist",
     // `shadow-cache` recompiles raymarch.wgsl three times (its three arms are
     // const-folded, so they do not exist without a reload) and restores the
@@ -342,6 +355,10 @@ const char* const kOrder[] = {
     // debris and mobs into every arm and regenerates pristine worldgen at
     // kDefaultSeed on the way out.
     "remote-ghost",
+    // W1-F: one player's grenade carves and launches the other (and carves,
+    // but never launches, a peer's ghost). CPU + Jolt, resets debris and mobs
+    // on both sides; beside the other two-body gates.
+    "blast-players",
     "debris",
     // `audio-spatial` touches no World at all (it is the mixer and a Camera),
     // so its slot is free; it sits with the other audio gates.
@@ -401,6 +418,11 @@ const char* const kOrder[] = {
     // globals it touches (the mob id counter and the celestial clock) on the
     // way out; the world it leaves behind is one chunk-exchange regenerates.
     "save-split",
+    // W1-D material names in saves (sim/mattable.h). Regenerates on the way
+    // in, saves and loads its own dir under a permuted material table, and
+    // resets mobs + debris and regenerates at the origin on the way out --
+    // so chunk-exchange, which regenerates on entry anyway, inherits nothing.
+    "save-material-remap",
     // BETWEEN region-store and streaming, and the slot is chosen rather than
     // convenient. It regenerates the world several times (four arms, each
     // with its own worldgen and its own ReloadWindow) and it SHIFTS the
@@ -822,7 +844,7 @@ const char* const kOrder[] = {
 const std::vector<Gate>& Registry() {
   static std::vector<Gate> all = [] {
     std::vector<Gate> pool;
-    for (const auto* g : {&TerrainGates(), &TreeGates(), &BiomeGates(), &EnvTruthGates(), &ScaleGates(),
+    for (const auto* g : {&TerrainGates(), &TreeGates(), &BiomeGates(), &EnvTruthGates(), &GeneratorGates(), &ScaleGates(),
                           &SimGates(), &CaGates(), &GasGates(), &WindGates(), &WaterGates(),
                           &RenderGates(),
                           &PlayerGates(),

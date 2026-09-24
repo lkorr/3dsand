@@ -14,6 +14,7 @@
 #include "phys/lattice.h"
 #include "phys/marching_cubes.h"
 #include "measure/perfscope.h"
+#include "sim/mattable.h"
 #include "sim/bytestream.h"
 #include "sim/reactcpu.h"
 #include "sim/rng.h"
@@ -7350,6 +7351,13 @@ bool DebrisSystem::LoadState(const uint8_t* data, size_t len, uint32_t version) 
     r.PodVec(voxels);
     r.PodVec(skinVoxels);
     if (!r.ok || voxels.empty()) continue;
+    // MATERIAL NAMES (sim/mattable.h, W1-D): ids in the table this payload's
+    // file named, remapped by name before anything is built from them.
+    if (const MatRemap* mr = ActiveLoadRemap()) {
+      RemapDebrisVoxels(voxels, *mr);
+      RemapPrefabVoxels(skinVoxels, *mr);
+      bleedMat = mr->Mat(bleedMat);
+    }
     if (bodies_.size() >= kMaxBodies) break;  // same ceiling spawning obeys
 
     physScale = std::max(1u, physScale);

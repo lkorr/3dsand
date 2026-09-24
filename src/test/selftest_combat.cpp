@@ -63,6 +63,7 @@
 #include <cstdlib>
 #include <fstream>
 #include <map>
+#include <memory>
 #include <set>
 #include <string>
 #include <vector>
@@ -639,8 +640,7 @@ Status GateCombatCues(Ctx& c, std::string& detail) {
       ok = false;
       std::printf(
           "combat-cues: FAILED '%s' resolves to nothing. The set is a FOLDER "
-          "under assets/sounds — run `python scripts/gen_combat_sounds.py` for "
-          "the placeholders, or add real takes through scripts/import_sounds.py\n",
+          "under assets/sounds — add takes through scripts/import_sounds.py\n",
           s.name);
     } else {
       resolved++;
@@ -676,6 +676,114 @@ Status GateCombatCues(Ctx& c, std::string& detail) {
   std::printf("combat-cues: %s (%d checks, %d/6 sets resolved)\n",
               ok ? "PASS" : "FAIL", checks, resolved);
   return ok ? Status::Pass : Status::Fail;
+}
+
+// ---------------------------------------------------------------------------
+// tuning-reach
+// ---------------------------------------------------------------------------
+// combat-tuning's one-key differential, applied to EVERY shader-facing row in
+// sim/tuning_params.def by expanding the table itself, so a new row is covered
+// the moment it exists. For each row: write a tuning file holding only that
+// key at a value off its compiled default, LoadTuning it, and require the
+// struct field to have moved. A row whose field does not move has no Read* in
+// LoadTuning, and its tuner slider is dead -- nine render.wave* rows were, from
+// 9a79eba to 2026-09-24. scripts/check_invariants.py (`tuning reach`) states
+// the same property statically; this is the proof that the read it greps for
+// actually lands in the right field.
+//
+// Two candidates per row (above and below the default) because LoadTuning
+// clamps: a default sitting on a clamp bound pulls one candidate straight back,
+// never both. "Moved" is judged against a default-constructed Tuning, which is
+// what LoadTuning starts from.
+Status GateTuningReach(Ctx& c, std::string& detail) {
+  (void)c;
+  const std::string probePath =
+      sandvox::AssetDir() + "/materials/tuning.reachprobe.json";
+  // Heap, not stack: Tuning is large, and a local per expanded row (MSVC
+  // gives each block scope its own slot) overflowed the stack at ~1.8 MB.
+  const auto baseOwn = std::make_unique<Tuning>();
+  const auto probe = std::make_unique<Tuning>();
+  const Tuning& base = *baseOwn;
+  Tuning& t = *probe;
+  int rows = 0, wired = 0;
+  std::string dead;
+
+  auto loadOne = [&](const char* group, const char* key,
+                     const std::string& value, Tuning& got) {
+    {
+      std::ofstream f(probePath);
+      f << "{\n  \"" << group << "\": { \"" << key << "\": " << value
+        << " }\n}\n";
+    }
+    return LoadTuning(probePath, got);
+  };
+  auto num = [](double v) {
+    char b[64];
+    std::snprintf(b, sizeof b, "%.9g", v);
+    return std::string(b);
+  };
+  auto report = [&](const char* group, const char* key, bool moved) {
+    rows++;
+    if (moved) {
+      wired++;
+      return;
+    }
+    std::printf("tuning-reach: FAILED %s.%s did not reach its field -- no "
+                "Read* for it in LoadTuning's \"%s\" group?\n",
+                group, key, group);
+    if (dead.size() < 200) dead += std::string(dead.empty() ? "" : ", ") +
+                                   group + "." + key;
+  };
+
+#define TP_F(g, m, n, d)                                                  \
+  {                                                                       \
+    const double v0 = base.g.m, s = 0.25 * (std::fabs(v0) + 1.0);        \
+    bool moved = false;                                                   \
+    for (double cand : {v0 + s, v0 - s}) {                                \
+      t = base;                                                           \
+      if (loadOne(#g, #m, num(cand), t) && t.g.m != base.g.m) moved = true; \
+    }                                                                     \
+    report(#g, #m, moved);                                                \
+  }
+#define TP_I(g, m, n, d)                                                  \
+  {                                                                       \
+    const long long v0 = base.g.m;                                        \
+    bool moved = false;                                                   \
+    for (long long cand : {v0 + 1, v0 - 1}) {                             \
+      t = base;                                                           \
+      if (loadOne(#g, #m, std::to_string(cand), t) && t.g.m != base.g.m)  \
+        moved = true;                                                     \
+    }                                                                     \
+    report(#g, #m, moved);                                                \
+  }
+#define TP_U(g, m, n, d) TP_I(g, m, n, d)
+#define TP_V3(g, m, n, ...)                                               \
+  {                                                                       \
+    const double v0 = base.g.m[0], s = 0.25 * (std::fabs(v0) + 1.0);      \
+    bool moved = false;                                                   \
+    for (double cand : {v0 + s, v0 - s}) {                                \
+      t = base;                                                           \
+      const std::string arr = "[" + num(cand) + ", " +                    \
+                              num(base.g.m[1]) + ", " +                   \
+                              num(base.g.m[2]) + "]";                     \
+      if (loadOne(#g, #m, arr, t) && t.g.m[0] != base.g.m[0]) moved = true; \
+    }                                                                     \
+    report(#g, #m, moved);                                                \
+  }
+#include "sim/tuning_params.def"
+#undef TP_V3
+#undef TP_U
+#undef TP_I
+#undef TP_F
+
+  std::remove(probePath.c_str());
+  std::printf("tuning-reach: %s (%d/%d tuning_params.def rows reach their "
+              "field)\n", wired == rows ? "PASS" : "FAIL", wired, rows);
+  if (wired != rows) {
+    detail = std::to_string(rows - wired) + " dead row(s): " + dead;
+    return Status::Fail;
+  }
+  return Status::Pass;
 }
 
 
@@ -4073,6 +4181,9 @@ const std::vector<Gate>& CombatGates() {
       // leaves anything behind, so they can be run alone and in any order.
       {"combat-tuning", "player", {}, false, GateCombatTuning},
       {"combat-cues", "player", {}, false, GateCombatCues},
+      // Pure CPU over tuning.json like combat-tuning, but for every
+      // tuning_params.def row rather than the combat groups.
+      {"tuning-reach", "player", {}, false, GateTuningReach},
       // These four DO touch the world and spawn creatures, so kOrder puts them
       // at the END of the mob group. Same list, opposite end of the run.
       {"npc-strike", "mob", {}, false, GateNpcStrike},

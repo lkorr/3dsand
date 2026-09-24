@@ -2286,7 +2286,7 @@ fn wbDrain(@builtin(global_invocation_id) gid : vec3<u32>) {
   var op : FluidSpawnOp;
   op.px = 0; op.py = 0; op.pz = 0;
   op.vx = 0; op.vy = 0; op.vz = 0;
-  op.species = 0u;
+  op.flags = 0u;
   op.mat = 0u;                       // DEAD: spawnAppend writes a dead particle
 
   if (b < T.waterBodyCount && b < WATERBODY_CAP) {
@@ -2326,7 +2326,6 @@ fn wbDrain(@builtin(global_invocation_id) gid : vec3<u32>) {
       // the momentum granted is the momentum the head paid for.
       op.vy = -wbGet(b, WBS_JETV);
       op.mat = u32(g.w);
-      op.species = (u32(g.w) - 1u) & 3u;   // the exciteEmit convention
     }
   }
   waterSpawnOps[slot] = op;

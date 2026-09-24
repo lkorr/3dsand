@@ -190,6 +190,10 @@ Target ChooseTarget(MobSystem& mobs, IVec3 at) {
     for (size_t li = 0; li < def.limbs.size(); li++) {
       if ((int)li == def.rootLimb) continue;
       if (!def.limbs[li].severable || def.limbs[li].vital) continue;
+      // Not hair: a `bloodless` limb (Mob::IsBloodless) is severable,
+      // non-vital and can be big, and it never bleeds -- a fixture that
+      // expects blood must not land on a long-haired character's mane.
+      if (def.limbs[li].bloodless) continue;
       if (!mobs.LimbBody(id, (int)li)) continue;
       const uint32_t n = mobs.LimbVoxelsAtSpawn(id, (int)li);
       if (n <= best.atSpawn) continue;
@@ -5555,6 +5559,13 @@ Status GateJointTwins(Ctx& c, std::string& detail) {
   for (size_t d = 0; d < mobs.Defs().size(); d++) {
     const MobDef& def = mobs.Defs()[d];
     if (def.limbs.empty() || def.bleedMat == 0) continue;
+    // Not a long-haired character: its `hair` limb overlaps the head and so
+    // brings twin cells of its own, which would win this by hair alone and
+    // put the probe on a pair where one side is not tissue (IsBloodless
+    // refuses the infection this gate paints with). No existing def has one.
+    bool hair = false;
+    for (const MobLimbDef& ld : def.limbs) hair |= ld.bloodless;
+    if (hair) continue;
     mobs.Reset();
     const uint64_t id = mobs.Spawn((int)d, FixtureSite(c.world, 505));
     if (!id) continue;
@@ -5707,6 +5718,9 @@ Status GateJointTwins(Ctx& c, std::string& detail) {
     for (int li = (int)def.limbs.size() - 1; li >= 0 && p4.a >= 0; li--) {
       if (li == p4.a || li == p4.b || li == def.rootLimb) continue;
       if (!def.limbs[li].severable || def.limbs[li].vital) continue;
+      // Hair is appended last and so would be the first leaf met here; it is
+      // not anatomy, so it is not the leaf this probe means (IsBloodless).
+      if (def.limbs[li].bloodless) continue;
       bool parent = false;
       for (const auto& o : def.limbs) parent |= o.parent == def.limbs[li].name;
       if (parent) continue;

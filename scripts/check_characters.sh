@@ -2,8 +2,8 @@
 # check_characters.sh — end-to-end check of the tuner's Characters tab.
 #
 # WHAT THIS COVERS THAT `node scripts/test_mobgen.mjs` DOES NOT. The Node gate
-# asserts the DATA: that the generator reproduces scripts/gen_human.py cell for
-# cell, that every rolled genome is structurally sound, that mutate and cross
+# asserts the DATA: that the default genome IS assets/mobs/human.json's rig,
+# field for field, that every rolled genome is structurally sound, that mutate and cross
 # are reproducible and stay between their parents. None of that says whether the
 # TAB boots inside the tuner, whether the bridge hands it the palette, whether
 # the software voxel painter puts a single pixel on a canvas, whether a slider

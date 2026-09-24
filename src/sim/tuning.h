@@ -2234,11 +2234,13 @@ struct Tuning {
     float fluidSprayDensity = 0.42f;  // below this x rest -> spray
     int fluidFoamScaleIdx = 3;        // foam particle size (0=1/2 .. 3=1/6 vox)
     // ---- MLS-MPM settle / excite seam: the CA <-> particle handover ----
-    int fluidExciteMode = 0;      // 0 = disturbance-excite off: the CA owns
-                                  // disturbed settled liquid (Phase-2 default,
-                                  // keeps the pinned world hash); 1 = settled
+    int fluidExciteMode = 1;      // 0 = disturbance-excite off: the CA owns
+                                  // disturbed settled liquid; 1 = settled
                                   // liquid with air below converts to MPM
-                                  // particles
+                                  // particles. 1 is what tuning.json ships and
+                                  // what the .def row says; this initializer
+                                  // said 0 until 2026-09-24
+                                  // (check_invariants.py pins them together)
     // ---- THE BURST BOUND (WP5) ----
     // Excite is a per-cell trigger with no notion of "only wake what the
     // disturbance can reach", and it emits one particle per eighth of
@@ -2457,9 +2459,6 @@ struct Tuning {
                                   // page-materialization readback latency, so
                                   // the settle converter never writes voxels
                                   // into a chunk the mirror has not seen
-    float fluidStainRate = 8.0f;  // chances/s that an excited-fluid contact
-                                  // stains an adjacent solid cell — the MPM
-                                  // counterpart of CA liquid staining
     int fluidStuckTicks = 96;     // ticks a chunk slot may hold particles
                                   // before its blocks are force-settled
                                   // regardless of calm. 0 disables the
@@ -3282,12 +3281,8 @@ struct Tuning {
     // ---- night sky ----
     float nightZenith[3] = {0.006f, 0.010f, 0.028f};
     float nightHorizon[3] = {0.030f, 0.036f, 0.062f};
-    // MLS-MPM fluid prototype (debris.wgsl vsFluid). fluidColor is species 0
-    // (water); 1..3 are the other pourable species (keys 1-4 in the mpm tool).
-    float fluidColor[3] = {0.20f, 0.42f, 0.85f};
-    float fluidColor1[3] = {0.92f, 0.34f, 0.10f};
-    float fluidColor2[3] = {0.22f, 0.78f, 0.28f};
-    float fluidColor3[3] = {0.88f, 0.72f, 0.25f};
+    // MLS-MPM fluid prototype (debris.wgsl vsFluid). There is no fluid
+    // colour knob: a particle is drawn in its MATERIAL's colour (W1-B2).
     // Cube half-extent per particle, in cells. 0.5 tiles the rest lattice
     // exactly; slightly over closes the gaps so a pool reads as a surface.
     float fluidParticleSize = 0.58f;
@@ -3334,7 +3329,8 @@ struct Tuning {
     float fluidFoamSpeed = 22.0f; // surface speed (vox/s) for full churn foam
     float fluidWobble = 0.5f;    // sub-voxel normal shimmer on moving fluid
     // Speed-driven whitening: fast, loose particles read as spray/foam.
-    float fluidFoam = 0.35f;
+    // 0.55 = tuning.json and the .def row (this said 0.35 until 2026-09-24).
+    float fluidFoam = 0.55f;
     // ---- depth colour gradient (raymarch.wgsl DEPTH GRADIENT) ----
     // A thin film reads as `fluidShallow`, the deep body tends toward
     // `fluidDeep`, ramped over `fluidDepth` metres of in-fluid path. The ramped
@@ -3715,7 +3711,7 @@ struct Tuning {
     // Clarity band over which a liquid crosses from the derived profile onto
     // water's hand-tuned coefficients. Water sits at clarity ~0.79, oil ~0.25;
     // widening this band makes more liquids inherit water's look.
-    float subClearLow = 0.62f, subClearHigh = 0.82f;
+    float subClearLow = 0.62f, subClearHigh = 0.78f;
 
     // Faint directional glow toward the surface when submerged in a medium
     // too dense to see through. A near-opaque liquid gates off Snell's window,
@@ -4342,15 +4338,6 @@ std::string TuningWgslBlock(const Tuning& t);
 const Tuning& CurrentTuning();
 void SetCurrentTuning(const Tuning& t);
 
-// Set a sim.* field by name (e.g. "windDragRef"). Returns false if the name
-// is unknown. For --sweep: lets you test parameter reachability without editing
-// tuning.json. Handles both int and float sim fields.
-// SUPERSEDED by SetTuningField below, and kept only because deleting a
-// 60-row hand-kept table out of tuning.cpp is a merge conflict against
-// every concurrent session for no behavioural gain. It has no callers.
-// Do not add rows to it -- add them to tuning_params.def, which is where
-// SetTuningField reads from and where the WGSL constants come from too.
-bool SetSimField(Tuning& t, const std::string& name, float value);
 // Any group, by the tuning_params.def name. This is what --sweep uses, so a new
 // row is sweepable the moment it exists. Returns false for an unknown group or
 // member, and for TP_V3 rows (a vec3 has no single float to sweep).

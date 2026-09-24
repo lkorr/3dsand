@@ -173,6 +173,84 @@ fn matWashes(m : Material) -> bool { return (m.stainPack & 0x80000000u) != 0u; }
 // can reject the overwhelmingly common "no" before doing any other work.
 fn matStains(m : Material) -> bool { return (m.stainPack & 0x7u) != 0u; }
 
+// ---- ONE STAIN DECISION, two stainers (rule-unification W1-B1, 2026-09-24) --
+// A staining liquid touching a surface has exactly one set of rules, and they
+// used to be written twice: sim_step's doStaining (the CA's liquid voxels) and
+// sim_fluid_seam's stainApply (MPM particles). The two copies drifted twice
+// (13b2c51 -> 1dfe699) and still disagreed on four points when this replaced
+// them: the chance (the stainer's authored per-mille vs one global knob),
+// consumption (CA only), absorption spending the liquid (CA only), and how deep
+// a clean absorbent cell starts (1 vs the ceiling). The DECISION now lives
+// here, with the CA's semantics as the truth; both kernels only roll, perform
+// the write, and pay the spend in their own currency (a voxel's fullness
+// eighth, or a donor particle's eighth).
+//
+//   sAmt/sType : the stain being applied — the stainer material's authored
+//                one, or (seam only) the stain a particle CARRIES out of a
+//                stained voxel, which wins so blood-water marks walls with
+//                blood.
+//   washes     : the stainer material rinses foreign stains (water).
+//   nw, nm     : the neighbour's word and its Material entry (materials[] is a
+//                per-shader binding, so it is passed in rather than read here).
+//
+// Returns (new neighbour word, STAIN_* flags). No flag set = no work for this
+// stainer on this neighbour; the word comes back unchanged.
+//
+// THE ORDER, and it is the termination argument (rule 2; see doStaining's
+// sleep notes): a FOREIGN stain (non-zero amount, other type) is work only for
+// a washer, which steps it DOWN one level, clearing the type with the last; a
+// clean cell or one carrying this stain climbs toward
+// ceiling = min(sAmt, max(capacity, 1)). On ABSORBENT ground (capacity > 0)
+// the climb is one level per contact and every level is paid for (STAIN_SPEND);
+// on non-absorbent ground (capacity 0: stone) it jumps to the ceiling, which is
+// a 1-level surface mark, and costs nothing. Every branch is monotone toward a
+// fixed point, so a pool on saturated ground goes quiet.
+const STAIN_WORK  : u32 = 1u;  // the neighbour takes this write (it has work left)
+const STAIN_WASH  : u32 = 2u;  // ...and it is a rinse: no spend, no consume roll
+const STAIN_SPEND : u32 = 4u;  // ...and it deepened absorbent ground: pay one eighth
+fn stainStep(sType : u32, sAmt : u32, washes : bool, nw : u32,
+             nm : Material) -> vec2<u32> {
+  if (sType == 0u || sAmt == 0u || voxMat(nw) == MAT_AIR) {
+    return vec2<u32>(nw, 0u);
+  }
+  // A stain soaks into a SURFACE: never into another liquid or a gas.
+  if (nm.klass != CLASS_SOLID && nm.klass != CLASS_POWDER) {
+    return vec2<u32>(nw, 0u);
+  }
+  let cur = voxStainAmt(nw);
+  let curType = voxStainType(nw);
+  if (cur != 0u && curType != sType) {
+    if (!washes) { return vec2<u32>(nw, 0u); }   // not ours to touch
+    let washed = cur - 1u;
+    return vec2<u32>((nw & ~STAIN_BITS) |
+                         packStain(select(curType, 0u, washed == 0u), washed),
+                     STAIN_WORK | STAIN_WASH);
+  }
+  let capacity = matAbsorbCapacity(nm);
+  let ceiling = min(sAmt, max(capacity, 1u));
+  // `cur < ceiling` for our own type; a stale type at amount 0 is clean.
+  if (curType == sType && cur >= ceiling) { return vec2<u32>(nw, 0u); }
+  var amt = ceiling;
+  if (capacity > 0u) {
+    amt = select(1u, min(cur + 1u, ceiling), curType == sType);
+  } else if (curType == sType) {
+    amt = min(cur + sAmt, ceiling);
+  }
+  var f = STAIN_WORK;
+  // `amt > cur` charges only a contact that actually deepened the stain —
+  // the guard against a puddle draining into ground it is no longer wetting.
+  if (capacity > 0u && amt > cur) { f |= STAIN_SPEND; }
+  return vec2<u32>((nw & ~STAIN_BITS) | packStain(sType, amt), f);
+}
+// The stainer's two rolls, from ITS authored numbers (per-mille), for both
+// kernels. `roll` is any 32-bit hash slice the caller owns.
+fn stainFires(sm : Material, roll : u32) -> bool {
+  return (roll % 1000u) < matStainChance(sm);
+}
+fn stainConsumes(sm : Material, roll : u32) -> bool {
+  return (roll % 1000u) < matStainConsume(sm);
+}
+
 // fluidPack accessors — must match kFluidPack* in src/sim/materials.h.
 // LIFT first and on its own line because it is the early-out: a material that
 // does not interact with liquids costs one comparison and nothing else, exactly
@@ -270,6 +348,8 @@ fn matCanAct(m : Material) -> bool {
 // wants the old boolean gets it from `!= 0` exactly as before.
 const DIRTY_R_WRITE    : u32 = 1u;    // sim_step wrote a voxel (move/react/stain)
 const DIRTY_R_REACT    : u32 = 2u;    // doReactions: rule MATCHED, did not fire
+                                      // (also sim_fluid_seam particleTick: an
+                                      // excited particle has a rule partner here)
 const DIRTY_R_STAIN    : u32 = 4u;    // doStaining: unsaturated surface in reach
 const DIRTY_R_FLOW     : u32 = 8u;    // RETIRED: never set (see above)
 const DIRTY_R_VISCOUS  : u32 = 16u;   // viscous off-tick with somewhere to go
@@ -544,6 +624,68 @@ const RCOND_NIGHT : u32 = 4u;  // only while the sun is down
 const RCOND_RAIN     : u32 = 8u;
 const RCOND_RAINDAMP : u32 = 16u;
 const RCOND_GATES    : u32 = 15u;  // SKY | DAY | NIGHT | RAIN
+// T.weatherRain word layout — must match kRain* in src/sim/materials.h.
+const RAIN_AMOUNT_MASK : u32 = 0xFFu;  // bits 0..7: rain reaching the ground now
+const RAIN_DAMP_SHIFT  : u32 = 8u;     // bits 8..15: ignition damp strength at 255
+const RAIN_WET_SHIFT   : u32 = 16u;    // bits 16..23: ground wetness (lingers)
+
+// ---- ONE REACTION-CONDITION GATE (rule-unification W1-B1, 2026-09-24) ------
+// A rule's light / day-phase / weather condition was evaluated in three places
+// that each retyped the arithmetic: sim_step's lightMatches + rainChance, the
+// gas parcels' gasDecayProduct (sim_gas.wgsl), and the CPU's ReactLightMatches
+// + RainScaledChance (reactcpu.h / materials.h, which roll the same table over
+// bodies). The arithmetic is here now, once; what stays with each caller is
+// only the EXPOSURE answers, because where they come from genuinely differs —
+// the grid probes the cell (seesSky / rainExposed), a parcel above the window
+// is under open sky by construction, and a body is treated as outdoors.
+//
+// Split in two so the grid can keep its probes lazy: reactPhaseOpen is what
+// the tick alone decides (a douse needs rain falling; day / night / minLight),
+// and the caller asks for SKY / rain exposure only once it has passed.
+// reactWeatherChance is the rain rescale. reactGate composes the two for a
+// caller that has its exposure answers in hand.
+//
+// MIRRORED TOKEN FOR TOKEN in src/sim/materials.h (the MIRROR block of the
+// same tag); scripts/check_invariants.py `reactgate` compares the two streams
+// and the constants they read. Integer and divide-last: chance <=
+// REACT_CHANCE_DEN (2e6), so chance * 255 fits a u32.
+// MIRROR-BEGIN reactgate
+fn reactPhaseOpen(cond : u32, day : u32, rainWord : u32) -> bool {
+  let c = cond & 0xFFu;
+  if (c == 0u) { return true; }
+  if ((c & RCOND_RAIN) != 0u && (rainWord & RAIN_AMOUNT_MASK) == 0u) { return false; }
+  if ((c & RCOND_DAY) != 0u && day == 0u) { return false; }
+  if ((c & RCOND_NIGHT) != 0u && day != 0u) { return false; }
+  if (day < ((cond >> 8u) & 0xFFu)) { return false; }
+  return true;
+}
+fn reactWeatherChance(cond : u32, chance : u32, rainWord : u32, exposed : bool) -> u32 {
+  let rain = rainWord & RAIN_AMOUNT_MASK;
+  if ((cond & RCOND_RAIN) != 0u) { return (chance * rain / 255u) * rain / 255u; }
+  if ((cond & RCOND_RAINDAMP) != 0u && exposed) {
+    let wet = max(rain, (rainWord >> RAIN_WET_SHIFT) & 0xFFu);
+    if (wet == 0u) { return chance; }
+    let damp = (rainWord >> RAIN_DAMP_SHIFT) & 0xFFu;
+    let keep = 255u - (wet * damp + 127u) / 255u;
+    return chance * keep / 255u;
+  }
+  return chance;
+}
+fn reactGate(cond : u32, chance : u32, day : u32, rainWord : u32, sky : bool,
+             exposed : bool) -> u32 {
+  if (!reactPhaseOpen(cond, day, rainWord)) { return 0u; }
+  if ((cond & RCOND_SKY) != 0u && !sky) { return 0u; }
+  if ((cond & RCOND_RAIN) != 0u && !exposed) { return 0u; }
+  return reactWeatherChance(cond, chance, rainWord, exposed);
+}
+// MIRROR-END reactgate
+// Does reactWeatherChance consult `exposed` for this rule under this weather?
+// Only a RAINDAMP rule while anything is wet — the grid's cue to pay its
+// rain-exposure probe, and to skip it on a dry tick.
+fn reactWantsExposure(cond : u32, rainWord : u32) -> bool {
+  if ((cond & (RCOND_RAIN | RCOND_RAINDAMP)) != RCOND_RAINDAMP) { return false; }
+  return max(rainWord & RAIN_AMOUNT_MASK, (rainWord >> RAIN_WET_SHIFT) & 0xFFu) != 0u;
+}
 
 // Neighbour-count scaling — must match kScale* in src/sim/materials.h.
 // Chance scales with how many of the 6 face neighbours match the rule's
@@ -593,12 +735,10 @@ struct TickParams {
   // old CPU append base is gone with it.
   fluidExciteEnable : u32,
   fluidSpawnCount   : u32,
-  // Material id each MPM species splashes micro droplets as (0 = species was
-  // never poured, so it emits none). CPU-owned, recorded from the pour's brush
-  // material — blood MPM sprays blood droplets that stain, water sprays water.
-  // Part of the tick input stream like every field above, so replays and the
-  // determinism gates capture it for free.
-  fluidSplashMat  : vec4<u32>,
+  // PADDING (was the per-species splash material table, retired by W1-B2: a
+  // particle splashes as its own material). Kept so mirrorBase stays at the
+  // same offset; world.h TickParams::_padSplash is its twin. Nothing reads it.
+  _padSplash      : vec4<u32>,
   // WORLD chunk coord of the 3x3x3 CPU-mirror corner (the same clamp the
   // readback uses). The seam's mirrorFold packs excited-fluid occupancy for
   // these 27 chunks — the swimming query's view of the particles.
@@ -1685,6 +1825,14 @@ fn axisUnit(a : u32) -> vec3f {
 
 fn unpackColor(c : u32) -> vec3f {
   return vec3f(f32(c & 0xFFu), f32((c >> 8u) & 0xFFu), f32((c >> 16u) & 0xFFu)) / 255.0;
+}
+
+// A liquid's own colour: its authored palette average. What a liquid volume
+// tends toward with depth (raymarch.wgsl liquidOptics), the albedo the MPM
+// surface blends per node composition, and the colour an MPM particle cube is
+// drawn in (debris.wgsl vsFluid). The ONE definition; render-only.
+fn liquidAlbedo(m : Material) -> vec3f {
+  return (unpackColor(m.color0) + unpackColor(m.color1)) * 0.5;
 }
 
 // The COSMETIC 3-variant decode, keyed on an arbitrary number rather than on a
@@ -3369,9 +3517,11 @@ const FLUID_VMAX      : i32 = i32(round(0.45 * f32(FLUID_SUBSTEPS) * 65536.0));
 const FLUID_MARK_PAD  : i32 = min(i32(ceil(0.45 * f32(FLUID_SUBSTEPS))), 7);
 const FLUID_ONE       : i32 = 65536;    // 1.0 in Q16.16
 // Words per fluid grid node: [0] mass Q10, [1..3] momentum->velocity Q16.16,
-// [4..6] species 1..3 mass Q10, [7] foam field (persistent). Shared by the
-// solver (sim_fluid.wgsl) and the surface renderer (raymarch.wgsl reads mass,
-// velocity and species words of the LAST substep's grid); world.cpp sizes
+// [4..6] material composition (hi id, 4096 - lo id, volume-weighted id sum;
+// sim_fluid.wgsl's GRID LAYOUT block owns the encoding), [7] foam field
+// (persistent). Shared by the solver (sim_fluid.wgsl) and the surface renderer
+// (raymarch.wgsl reads mass, velocity and composition words of the LAST
+// substep's grid); world.cpp sizes
 // fluidGrid by this.
 const FLUID_GW        : u32 = 8u;
 
@@ -3420,9 +3570,9 @@ struct FluidParticle {
                                   // excite converter seeds it from hydrostatic
                                   // depth so a reawakened column starts
                                   // pre-compressed instead of jello-popping.
-  species : u32,                  // 0..3, grid species-mass slot (render color
-                                  // + attraction). Derived from attr's mat at
-                                  // excite time; the pour picks it directly.
+  _padSpecies : u32,              // PADDING (was `species`, retired by
+                                  // W1-B2: a particle's one identity is its
+                                  // material in `attr`). Nothing reads it.
   density : i32,                  // Q16.16 masses/cell sampled by p2g2 last
                                   // substep (render shading + attraction)
   // ---- seam identity (word 18): what this particle IS in voxel terms ------
@@ -3473,7 +3623,7 @@ const FP_EXCITED : u32 = 1u << 22u;
 fn fpExcited(attr : u32) -> bool { return (attr & FP_EXCITED) != 0u; }
 // GHOST (bit 23): a picture of water, not water -- the flask's scoop stream
 // (ContainerScoopStream, 2026-09-23). spawnAppend sets it from the op's
-// species bit 8, with the homing target in _r0.._r2 and the death tick in _r3.
+// flags bit 8, with the homing target in _r0.._r2 and the death tick in _r3.
 // It is splatted into the grid like any particle, so the fluid surface draws
 // it, and g2p steers it onto its target. It is NEVER matter: spawnAppend does
 // not book it, particleTick gives the CA no occupancy or stain intent for it
@@ -3509,7 +3659,10 @@ fn fpGhost(attr : u32) -> bool { return (attr & FP_GHOST) != 0u; }
 // [13]    settling block count this tick
 // [14]    last excite chunk slot (sound cue positioning, coarse)
 // [15]    eighths binned by settle this tick (mass audits)
-// [16]    eighths consumed by CA reactions this tick (mass audits)
+// [16]    eighths consumed this tick (mass audits): by CA reactions (a whole
+//         cell bin, consumeApply) AND by absorbent ground drinking a
+//         particle's eighth (stainApply's donor spend) -- both leave the pool
+//         for the same reason a CA liquid voxel's eighth does.
 // [17]    contact stains applied this tick (parity gates, telemetry)
 // [18]    node-substeps the FLUID_VMAX clamp truncated this tick (gridUpdate;
 //         the CFL-honesty probe — plan §5 item 1). ~0 in steady flow, or the
@@ -3588,11 +3741,12 @@ const FA_ARGS_COMPACT : u32 = 19u;
 const FA_ARGS_CONSUME : u32 = 22u;
 
 // Must match FluidSpawnOp in world.h (32 bytes). mat carries the pour's brush
-// material into the particle's attr word (stainless, fullness 1).
+// material into the particle's attr word (stainless, fullness 1). flags: bit 8
+// GHOST (kFluidOpGhost), bits 16..23 ghost life in ticks; bits 0..7 unused.
 struct FluidSpawnOp {
   px : i32, py : i32, pz : i32,   // Q16.16 world cells
   vx : i32, vy : i32, vz : i32,   // Q16.16 cells/tick
-  species : u32, mat : u32,
+  flags : u32, mat : u32,
 };
 
 // ---- excite scratch bits (voxel word bits 19..23, per the allocation table
@@ -5986,6 +6140,28 @@ fn faceDir(i : u32) -> vec3<i32> {
     case 4u: { return vec3<i32>(0, 0,  1); }
     default: { return vec3<i32>(0, 0, -1); }
   }
+}
+// The RDIR_* bit of face i, the direction mask a reaction rule authors
+// (`dir: up|down|side`). Promoted from sim_step.wgsl with nbrMatches (W1-B1):
+// the MPM seam walks a particle's bucket with the same mask doReactions does.
+fn faceDirBit(i : u32) -> u32 {
+  switch (i % 6u) {
+    case 0u: { return RDIR_DOWN; }
+    case 1u: { return RDIR_UP; }
+    default: { return RDIR_SIDE; }
+  }
+}
+// Does neighbour material `nmat` (Material entry `nm`) satisfy a rule's
+// neighbour predicate? The ONE definition — sim_step's doReactions /
+// scaledChance and the seam's particleTick wake all ask it; reactcpu.h's
+// ReactNbrMatches is its CPU mirror. `nm` is passed in because `materials` is
+// a per-shader binding. MAT_AIR has no Material entry worth matching on
+// tags/class, so callers test air themselves.
+fn nbrMatches(rule : Reaction, nmat : u32, nm : Material) -> bool {
+  if (rule.nbrClass != 0u && ((1u << nm.klass) & rule.nbrClass) == 0u) { return false; }
+  if (rule.nbrMat != NBR_ANY) { return nmat == rule.nbrMat; }
+  if (rule.nbrTags != 0u) { return (nm.tagMask & rule.nbrTags) != 0u; }
+  return true;  // wildcard "any"
 }
 
 // >>>SUPPORT_LOSS_BEGIN<<<

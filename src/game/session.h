@@ -128,6 +128,39 @@ struct Grenade {
 // Integrate one 30 Hz tick against the voxel mirror. Returns true on detonate.
 bool UpdateGrenade(Grenade& g, float dt, const Player::KindFn& kindAt);
 
+// ONE EXPLOSION AGAINST EVERY BODY: rigidbodies crater, creatures AND players
+// are carved, debris takes the impulse, the living are launched. Phase K's
+// per-explosion body block, lifted out so the `blast-players` gate runs the
+// code the game runs. Every player is reached through MobSystem's registered
+// avatars (W1-F): a grenade carves and launches the OTHER player too, and a
+// peer's ghost is carved but never launched (game/mob.h).
+//
+// `who` narrows the pass. Everyone (phase K, the AUTHOR's machine): debris,
+// NPCs, every avatar, the impulse. OwnAvatars (phase N, a PEER's blast on the
+// OWNER's machine): only this process's own avatars, carved and launched --
+// the body the author's machine could only carve as a ghost.
+enum class BlastBodies : uint8_t { Everyone, OwnAvatars };
+void ExplosionHitsBodies(const ExplosionOp& e, World& world, Physics& phys,
+                         DebrisSystem& debris, MobSystem& mobs,
+                         std::vector<ParticleSpawn>& spawns,
+                         BlastBodies who = BlastBodies::Everyone);
+
+// THE OWNER-SIDE HALF OF A PEER'S GRENADE. `remoteIdx` are the merged indices
+// of the peer's explosions (OpDelayQueue::Merge's remoteExpIdx); each is
+// applied to this machine's own avatars with BlastBodies::OwnAvatars at the
+// landing tick. Nothing is applied twice: the author's machine sees its own
+// blast as LOCAL in the merge (so this skips it; phase K hit its bodies when
+// it was authored), and here the author is a ghost, which OwnAvatars never
+// touches. `gore` receives the carve's particle spawns; phase N runs AFTER the
+// outgoing batch was stored, so the caller carries them into its NEXT local
+// batch (TickAuthorityCtx::remoteBlastGore) rather than into the merged one,
+// which would reach only this machine's GPU. Returns the number applied.
+uint32_t RemoteExplosionsHitOwnAvatars(std::span<const ExplosionOp> exps,
+                                       std::span<const uint32_t> remoteIdx,
+                                       World& world, Physics& phys,
+                                       DebrisSystem& debris, MobSystem& mobs,
+                                       std::vector<ParticleSpawn>& gore);
+
 // Where a spell resolved, for the renderer: a short-lived burst of sprites
 // (SpellEmission::impacts). Render-only, counted down per TICK so the flash
 // lasts the same world-time at any frame rate.
@@ -619,11 +652,16 @@ struct TickAuthorityCtx {
   // The CONSERVATIVE MLS-MPM live estimate the CPU owns (world.h fluid block).
   uint32_t fluidCount = 0;
   std::vector<std::pair<uint32_t, uint32_t>> fluidPendingSpawns;
+  // Gore from a PEER's blast on this machine's own avatars (phase N,
+  // RemoteExplosionsHitOwnAvatars), drained into the next tick's local
+  // spawns in phase L so it travels to the peer like any gore authored here.
+  // Always empty without a connected peer.
+  std::vector<ParticleSpawn> remoteBlastGore;
   uint32_t fluidCueMat = 0;
   uint32_t lastFluidTick = 0;
-  // Material id each MPM species splashes micro droplets as
-  // (TickParams.fluidSplashMat).
-  uint32_t fluidSpeciesMat[4] = {0, 0, 0, 0};
+  // The liquid the mpm tool's keys 1-4 pour (UIState::fluidPour indexes it;
+  // 0 = fall back to fluidCueMat, water). Resolved by name at startup.
+  uint32_t fluidPourMat[4] = {0, 0, 0, 0};
   // BROKEN VESSELS (game/container.h ContainerSpill): what is still coming
   // out of a flask that shattered, drained under the spawn budgets. Nearly
   // always empty; one entry for a tick when a flask breaks.

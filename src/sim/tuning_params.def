@@ -57,10 +57,6 @@ TP_F(render, sunReddening, TUNE_SUN_REDDENING, 1.0f)
 // ---- night sky ----
 TP_V3(render, nightZenith, TUNE_NIGHT_ZENITH, 0.006f, 0.01f, 0.028f)
 TP_V3(render, nightHorizon, TUNE_NIGHT_HORIZON, 0.03f, 0.036f, 0.062f)
-TP_V3(render, fluidColor, TUNE_FLUID_COLOR, 0.20f, 0.42f, 0.85f)
-TP_V3(render, fluidColor1, TUNE_FLUID_COLOR1, 0.92f, 0.34f, 0.10f)
-TP_V3(render, fluidColor2, TUNE_FLUID_COLOR2, 0.22f, 0.78f, 0.28f)
-TP_V3(render, fluidColor3, TUNE_FLUID_COLOR3, 0.88f, 0.72f, 0.25f)
 TP_F(render, fluidParticleSize, TUNE_FLUID_PARTICLE_SIZE, 0.58f)
 TP_F(render, fluidStretch, TUNE_FLUID_STRETCH, 0.4f)
 TP_F(render, fluidDensityShade, TUNE_FLUID_DENSITY_SHADE, 0.45f)
@@ -473,7 +469,7 @@ TP_F(render, subScatterClear, TUNE_SUB_SCATTER_CLEAR, 0.16f)
 // water's hand-tuned coefficients. Water sits at clarity ~0.79, oil ~0.16.
 // Widening this band makes more liquids inherit water's look.
 TP_F(render, subClearLow, TUNE_SUB_CLEAR_LOW, 0.62f)
-TP_F(render, subClearHigh, TUNE_SUB_CLEAR_HIGH, 0.82f)
+TP_F(render, subClearHigh, TUNE_SUB_CLEAR_HIGH, 0.78f)
 
 // ---- blood / viscous liquids ----
 TP_F(render, bloodF0, TUNE_BLOOD_F0, 0.03f)
@@ -695,7 +691,6 @@ TP_I(sim, fluidSubmergedSolid, TUNE_FLUID_SUBMERGED_SOLID, 1)
 TP_F(sim, fluidSettleEps, TUNE_FLUID_SETTLE_EPS, 6.0f)
 TP_F(sim, fluidWakeSpeed, TUNE_FLUID_WAKE_SPEED, 24.0f)
 TP_I(sim, fluidSettleTicks, TUNE_FLUID_SETTLE_TICKS, 24)
-TP_F(sim, fluidStainRate, TUNE_FLUID_STAIN_RATE, 8.0f)
 
 // ---- THE FORCE-SETTLE BACKSTOP (rule 2's termination guarantee) ------------
 // settleColumn walks its own 16 cells plus SETTLE_SPILL more, so a SUBMERGED

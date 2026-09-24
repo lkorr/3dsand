@@ -8,8 +8,9 @@
 
 namespace {
 
-// Which material ids are frozen fire, by id. Rebuilt whole by SetMaterials, so
-// there is no stale half-state after a reload that renamed or removed one.
+// Which material ids make smoke, by id (materials.h SmokeSourceTable). Rebuilt
+// whole by SetMaterials, so there is no stale half-state after a reload that
+// renamed or removed one.
 std::vector<uint8_t> g_hot;
 
 // SANDVOX_PLUME_DEBUG=1: one stderr line per change to what the index holds
@@ -83,23 +84,24 @@ inline bool InWideBox(IVec3 v, IVec3 originVox) {
 
 }  // namespace
 
-void FarPlumes::SetMaterials(const std::vector<MaterialDef>& mats) {
-  g_hot.assign(mats.size(), 0u);
-  for (size_t i = 1; i < mats.size(); i++) {   // 0 is air
-    const MaterialDef& m = mats[i];
-    // A GAS is excluded and the exclusion is load-bearing rather than tidy:
-    // `fire` is CLASS_GAS, and farCellIsSolid (worldgen.wgsl) never writes a
-    // gas into the cascade — so a frozen fire's actual flames are not out
-    // there to see. What IS out there is the ember/lava/charred foliage under
-    // them, which is exactly this set.
-    if (m.gpu.klass == CLASS_GAS) continue;
-    if (m.gpu.emission == 0) continue;
-    for (const std::string& t : m.tags)
-      if (t == "hot") { g_hot[i] = 1; break; }
-  }
+void FarPlumes::SetMaterials(const std::vector<MaterialDef>& mats,
+                             const std::vector<ReactionGpu>& reactions) {
+  // NEAR AND FAR AGREE (rule-unification W1-B1). "On fire" at distance is
+  // exactly "puts smoke into the sky up close": the material's own compiled
+  // bucket decays to or emits fire/smoke (materials.h SmokeSourceTable). The
+  // old rule — tagged `hot`, emissive, not a gas — was a second definition of
+  // the same fact and disagreed with the first: lava and molten glass are hot
+  // and glow but have no smoke rule, so a lava lake plumed at distance and
+  // never up close.
+  //
+  // `fire` itself is IN now (its own decay-to-smoke rule puts it there). It
+  // used to be excluded because the far cascade never draws a gas; but this
+  // index is harvested from the fine chunk's WORDS at eviction, not from the
+  // cascade, and a chunk evicted mid-blaze does hold flames that are smoking.
+  g_hot = SmokeSourceTable(mats, reactions);
 }
 
-bool FarPlumes::HotEmissive(uint32_t mat) {
+bool FarPlumes::SmokeSource(uint32_t mat) {
   return mat < g_hot.size() && g_hot[mat] != 0;
 }
 
@@ -150,7 +152,7 @@ void FarPlumes::NoteChunk(IVec3 wc, const uint32_t* words) {
     for (uint32_t y = 0; y < kChunk; y++)
       for (uint32_t x = 0; x < kChunk; x++) {
         const uint32_t mat = words[(z * kChunk + y) * kChunk + x] & 0xFFFu;
-        if (!HotEmissive(mat)) continue;
+        if (!SmokeSource(mat)) continue;
         const uint32_t s = (z / kCell) * kSub + (x / kCell);
         count[s]++;
         topY[s] = (int)y;   // ascending y, so the last write is the topmost
@@ -172,7 +174,7 @@ void FarPlumes::NoteChunk(IVec3 wc, const uint32_t* words) {
 }
 
 void FarPlumes::NoteUniformChunk(IVec3 wc, uint32_t mat) {
-  if (!HotEmissive(mat & 0xFFFu)) { Replace(wc, nullptr, 0); return; }
+  if (!SmokeSource(mat & 0xFFFu)) { Replace(wc, nullptr, 0); return; }
   // A whole chunk of ember: every column is saturated and the top hot voxel is
   // the chunk's top. Rare (a sentinel chunk of burning matter takes a
   // deliberate fill) but it is the other door into the index and leaving it

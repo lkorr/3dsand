@@ -732,6 +732,18 @@ const rgbToHex = (r, g, b) =>
   '#' + [r, g, b].map(v => Math.max(0, Math.min(255, v | 0))
                             .toString(16).padStart(2, '0')).join('');
 
+/** An art colour's ALPHA: `#rrggbbaa` carries one, `#rrggbb` is opaque. Only
+ *  see-through art (long hair's wisps, mobgen.js ART.HAIR_WISP*) spells the
+ *  long form, so every other colour string is exactly what it always was.
+ *  voxload.cpp reads the RGBA chunk's alpha byte, microbody.wgsl draws it. */
+export const hexAlpha = h => {
+  const s = String(h || '').replace('#', '');
+  return s.length === 8 ? parseInt(s.slice(6, 8), 16) & 255 : 255;
+};
+const rgbaToHex = (r, g, b, a) =>
+  rgbToHex(r, g, b) + (a > 0 && a < 255
+    ? (a | 0).toString(16).padStart(2, '0') : '');
+
 /**
  * The art colours a document uses, allocated from the top of the .vox palette
  * downward (see ART_BASE). Indices are stable for the lifetime of a document
@@ -771,7 +783,7 @@ export class ArtPalette {
     this.colors.forEach((hex, i) => {
       const [r, g, b] = hexToRgb(hex);
       const o = (ART_TOP - i - 1) * 4;              // entry j holds index j+1
-      rgba[o] = r; rgba[o + 1] = g; rgba[o + 2] = b; rgba[o + 3] = 255;
+      rgba[o] = r; rgba[o + 1] = g; rgba[o + 2] = b; rgba[o + 3] = hexAlpha(hex);
     });
     return rgba;
   }
@@ -786,7 +798,7 @@ export class ArtPalette {
       // placeholder rather than shifting colours onto the wrong voxels.
       while (p.colors.length < ART_TOP - idx) p.colors.push('#000000');
       const o = (idx - 1) * 4;
-      p.colors.push(rgbToHex(rgba[o], rgba[o + 1], rgba[o + 2]));
+      p.colors.push(rgbaToHex(rgba[o], rgba[o + 1], rgba[o + 2], rgba[o + 3]));
     }
     return p;
   }
@@ -1013,7 +1025,8 @@ export function roundTripTest(models, palette, opts = {}) {
     }
 
     // Palette: entry i of the RGBA array is index i+1. Compare RGB only —
-    // alpha is written as 255 and carries no engine meaning.
+    // alpha means something only in the art range (see hexAlpha), and a
+    // reader that zero-fills it is not a round-trip failure.
     if (palette) {
       for (let i = 0; i < 256; i++) {
         for (let c = 0; c < 3; c++) {

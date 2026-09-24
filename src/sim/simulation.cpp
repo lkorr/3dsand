@@ -313,6 +313,12 @@ bool Simulation::Init(const rhi::Device& device, World& world,
         entry(2, T::Storage),          // dirtyOut
         entry(3, T::ReadOnlyStorage),  // materials
         entry(4, T::Uniform),          // TickParams
+        // The compiled reaction table, SAME binding number as in simBGL_ (the
+        // one-identifier-one-binding rule above). The excite/settle seam's
+        // particleTick reads it (rule-unification W1-B1): an excited particle
+        // wakes its chunk only when one of its own UNGATED rules has a
+        // partner beside it, which it cannot know without the bucket.
+        entry(11, T::ReadOnlyStorage), // reactions
         // Support-loss flags, SAME binding number as in simBGL_ for the reason
         // the page-table note above gives: one WGSL identifier cannot carry two
         // binding numbers across modules that share common.wgsl, and the
@@ -919,9 +925,13 @@ namespace {
 // from bits 0..7 (RGBA8 little-endian), so the byte order flips on the way in.
 // Getting this wrong swaps red and blue, which reads as an art mistake rather
 // than a packing one — hence one definition, used by both writers below.
+//
+// The top byte is TRANSPARENCY on the CPU side (voxload.cpp: 0 = opaque, so
+// every colour that predates it is unchanged) and ALPHA on the GPU side, where
+// microbody.wgsl reads color0 >> 24 as a voxel's screen-door coverage.
 inline uint32_t ArtRgbToGpu(uint32_t rgb) {
   return ((rgb & 0xFFu) << 16) | (rgb & 0xFF00u) | ((rgb >> 16) & 0xFFu) |
-         0xFF000000u;
+         ((255u - (rgb >> 24)) << 24);
 }
 }  // namespace
 
@@ -1008,6 +1018,7 @@ void Simulation::BuildSimBindGroups(const rhi::Device& device) {
         b(2, world_->dirty[1 - page]),
         b(3, materialBuf_),
         b(4, world_->tickUBO),
+        b(11, reactionBuf_),
         b(15, world_->support),
         b(17, world_->pageTable),
         b(18, world_->pageFaults),
@@ -1107,7 +1118,7 @@ void Simulation::UploadTables(const rhi::Queue& queue,
   // on a materials reload, and a reload comes back through this function. The
   // far fire-plume index (src/sim/farplumes.h) asks this per evicted voxel and
   // must not be scanning tag STRINGS to do it.
-  FarPlumes::SetMaterials(mats);
+  FarPlumes::SetMaterials(mats, reactions);
 
   // Mirror the stain palette into the reserved top entries (kStainPaletteBase,
   // materials.h): the renderer maps a voxel's 3-bit stain TYPE to a colour by

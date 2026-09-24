@@ -48,6 +48,12 @@ struct MobLimbDef {
   float hp = 20;
   bool severable = true;
   bool vital = false;          // severing/destroying this kills the mob
+  // Not flesh: hair, and anything else with no blood in it. Carving, burning
+  // or severing it draws no blood, charges no health, rots/pulps/infects
+  // nothing, and it is left out of every "how much body is left" total. Read
+  // through Mob::IsBloodless, which folds worn slots in (a garment is
+  // bloodless too, by tag rather than by field).
+  bool bloodless = false;
   Vec3 axis{1, 0, 0};          // hinge axis
   float minAngle = -1.2f, maxAngle = 1.2f;
   // ---- ball-joint (swing-twist) limits; see Physics::JointDesc ------------
@@ -1906,11 +1912,9 @@ class Mob {
   // fixture and the HUD can draw it: piecewise-linear through (0, 1),
   // (burnCapMidFraction, burnCapMidHealth), (burnDeathFraction, 0).
   static float BurnHealthCapFor(float burntFraction);
-  // How burnt a MATERIAL reads, by name: 0 = intact, 1 = half (cooked /
-  // alight), 2 = whole (charred / ash / cinder). The one list every consumer
-  // of "is this voxel burnt" reads — MobSystem's per-id table, and the HUD's
-  // limb readout in main.cpp — so the two cannot disagree about ash.
-  static uint8_t BurnStageOfMaterialName(const std::string& name);
+  // How burnt a MATERIAL reads is authored data now: MaterialDef::burnStage
+  // (materials.json "burnStage"), read by MobSystem's per-id table and the
+  // HUD's limb readout alike, so the two cannot disagree about ash.
 
   // ---- damage / dismemberment (shared; see MobSystem for the id-keyed API) --
   // Damage a limb by physics body handle. Returns true if the handle belonged
@@ -3416,8 +3420,11 @@ class Mob {
   bool HpZeroSevers(int limbIndex) const;
   // The debris handle of the fragment, or 0 when it went to particles instead
   // (no brick, Jolt refused). CarveLimb joints a child limb to it when the
-  // child's socket left with the fragment.
-  uint64_t EmitCarvedFragment(const MobLimb& src, uint32_t physScale,
+  // child's socket left with the fragment. `srcLimb` is `src`'s slot, asked
+  // only whether it has blood in it (IsBloodless): a lock of hair cut off is
+  // not a gobbet and does not ooze.
+  uint64_t EmitCarvedFragment(const MobLimb& src, int srcLimb,
+                              uint32_t physScale,
                               std::vector<DebrisVoxel> part, World& world,
                               std::vector<ParticleSpawn>& spawns);
   void LimbVoxelsToParticles(const MobLimb& limb, uint32_t physScale,
@@ -4124,6 +4131,21 @@ class Mob {
            limbDefs_[limbIndex].tag == "worn";
   }
 
+  // ---- DOES THIS RIG SLOT HAVE BLOOD IN IT? ---------------------------------
+  //
+  // IsWornSlot's wider sibling. Long hair is a BASE limb (a generated
+  // character's `hair`/`mane`, appended after the human's 15 by the sidecar
+  // merge) -- it animates, burns and severs like a limb, but it is not
+  // anatomy: cutting it off must not spurt, cost health or kill anybody.
+  // Every blood/health site asks this instead of IsWornSlot; the ones that
+  // are about WARDROBE specifically (Sever's `adopt`, the HUD's garment
+  // rows) keep asking IsWornSlot.
+  bool IsBloodless(int limbIndex) const {
+    return IsWornSlot(limbIndex) ||
+           (limbIndex >= 0 && limbIndex < (int)limbDefs_.size() &&
+            limbDefs_[limbIndex].bloodless);
+  }
+
   // how long a severed piece holds its last animated pose before ragdolling
   static constexpr float kSeverHoldSeconds = 0.25f;
   // A carved chunk needs this many voxels to become its own rigidbody.
@@ -4324,21 +4346,29 @@ class MobSystem {
   // that already checked the avatar first is bit-identical, and the one caller
   // that could not check it now works.
   //
-  // Deliberately NOT extended to CarveMobsRadial: that one is position-keyed
-  // (the explosion path) and the avatar already has its own CarveRadial call
-  // beside it. Routing it here as well would carve the player twice.
+  // The position-keyed explosion entry points (CarveMobsRadial,
+  // BlastMobsRadial, AppendLiveLimbBodies) walk this list too since W1-F
+  // (2026-09-24); the per-session avatar calls beside them in session.cpp
+  // were deleted in the same change, so nothing is carved twice.
   //
   // A LIST, NOT A SLOT (N5), for the same reason the actor list is: every one
   // of the five lookups below already walks `mobs_` and then falls through, so
   // "and then every registered avatar" is the same loop with a different
   // container. With one entry it is bit-identical to the single pointer it
   // replaces. The avatars are NOT owned: each is a member of a PlayerSession.
-  void SetAvatars(std::span<Mob* const> avatars) {
+  //
+  // `localCount`: how many leading entries are THIS process's sessions; the
+  // rest are peers' ghosts (RemotePlayersSyncAvatars appends them after the
+  // sessions). Default: all local. Read only by BlastMobsRadial.
+  void SetAvatars(std::span<Mob* const> avatars,
+                  size_t localCount = (size_t)-1) {
     avatars_.assign(avatars.begin(), avatars.end());
+    localAvatars_ = localCount < avatars_.size() ? localCount : avatars_.size();
   }
   void SetAvatar(Mob* avatar) {
     avatars_.clear();
     if (avatar) avatars_.push_back(avatar);
+    localAvatars_ = avatars_.size();
   }
   // The LOCAL player's avatar, or null. Still singular on purpose: the render
   // path and the character screen draw one body, and that body is this one.
@@ -4694,15 +4724,37 @@ class MobSystem {
   bool CutLimb(uint64_t bodyHandle, const BladeCut& cut, World& world,
                std::vector<ParticleSpawn>& spawns);
   // Every live limb of every mob within the blast — the explosion entry point.
+  // THE PLAYERS TOO (W1-F, 2026-09-24): every registered avatar is carved
+  // after the NPCs, so a second player standing in the first player's blast is
+  // hit. It used to be `mobs_` only plus a per-session `avatar.CarveRadial`,
+  // which meant a session's grenade reached ITS OWN avatar and nobody else's.
+  // A peer's ghost avatar is carved too — the melee rule (remoteplayer.cpp:
+  // local damage to a ghost carves its rig as presentation; the owner decides
+  // its life). A GHOST'S GORE IS THROWN AWAY (ghostSpawns_, cleared per call),
+  // like every other op a ghost authors: the owner applies the same blast to
+  // its real body at the landing tick (RemoteExplosionsHitOwnAvatars) and its
+  // gore reaches both worlds from there. Emitting it here too would put the
+  // blood in the shared batch twice.
   void CarveMobsRadial(Vec3 centerWorldVoxel, float radiusVoxels, World& world,
                        std::vector<ParticleSpawn>& spawns);
+  // Only THIS process's avatars (the leading `localCount` of SetAvatars): the
+  // owner-side half of a PEER's blast. No NPC, no ghost.
+  void CarveLocalAvatarsRadial(Vec3 centerWorldVoxel, float radiusVoxels,
+                               World& world,
+                               std::vector<ParticleSpawn>& spawns);
+  int BlastLocalAvatarsRadial(Vec3 centerWorldVoxel, float radiusVoxels,
+                              float impulseKgMs);
   // The blast's OTHER half: knock every creature in reach off its feet
   // (Mob::BlastRadial). Runs after the carve, on what survived it. Returns
-  // how many were knocked down.
+  // how many were knocked down. Covers the LOCAL avatars as well, never a
+  // ghost's: a ghost's position is the wire's (RemotePlayersPostStep), and a
+  // limp ghost would be this machine disagreeing with its owner.
   int BlastMobsRadial(Vec3 centerWorldVoxel, float radiusVoxels,
                       float impulseKgMs);
-  // Mob::AppendLiveLimbBodies over every live NPC, plus every limb of an
-  // unreleased corpse (a dead rig is still a rig: see the definition).
+  // Mob::AppendLiveLimbBodies over every live NPC, every limb of an
+  // unreleased corpse (a dead rig is still a rig: see the definition), and
+  // every spawned avatar (ghosts included: the impulse must not shove any
+  // creature's limbs).
   void AppendLiveLimbBodies(std::vector<uint64_t>& out) const;
   // Dev panel / tests: put one creature (or every live one) on the floor.
   bool RagdollMob(uint64_t mobId, float minSeconds);
@@ -5354,6 +5406,18 @@ class MobSystem {
   // literally "this is 0 and stays 0", and "a lone hot voxel gutters out" is
   // "this went to 0 without the limb losing matter".
   uint32_t LimbBurningCount(uint64_t mobId, int limbIndex) const;
+  // The burn pass's own bookkeeping for one limb (BodyBurnState), for the
+  // mob-burn gate's "a charred limb sleeps" claim (W1-F): front size, the
+  // `alight` latch, and whether the idle walk is asleep (sleepKey != 0).
+  struct LimbBurnProbe {
+    uint32_t front = 0;
+    bool alight = false, asleep = false;
+    uint32_t frontMat = 0, frontMatCount = 0;  // the commonest front material
+    uint32_t frontBurnt = 0;  // front voxels of a burnStage material (char)
+    bool indexed = false;     // the burn index is held
+    uint32_t quiet = 0;       // consecutive idle ticks with the index held
+  };
+  LimbBurnProbe LimbBurnStateOf(uint64_t mobId, int limbIndex) const;
   // How many of this limb's voxels are of material `mat`. The differential the
   // burn gate is built on — flesh charring is a MATERIAL transition, so
   // "cooked, then burnt" is visible as counts moving between slots rather than
@@ -5676,7 +5740,7 @@ class MobSystem {
   float BurnFraction(uint64_t mobId) const;
   float BurnHealthCap(uint64_t mobId) const;
   // How burnt a material reads (0 intact / 1 half / 2 whole), by id, from the
-  // table OnMaterialsReloaded builds off Mob::BurnStageOfMaterialName.
+  // table OnMaterialsReloaded builds off MaterialDef::burnStage.
   uint8_t BurnStageOf(uint32_t mat) const {
     return mat < burnStage_.size() ? burnStage_[mat] : 0u;
   }
@@ -6016,7 +6080,7 @@ class MobSystem {
   std::vector<uint8_t> burnStage_;
   std::vector<uint8_t> burnable_;
   std::vector<ReactionGpu> reactions_;
-  std::vector<uint8_t> matSelfActive_;  // has decay/emit rules — i.e. is ALIGHT
+  std::vector<uint8_t> matSelfActive_;  // has UNGATED decay/emit rules — ALIGHT
   std::vector<uint8_t> matHasPair_;     // has pair rules — i.e. is ignitable
   WornStats wornStats_{};
   BurnStats burnStats_{};
@@ -6187,6 +6251,8 @@ class MobSystem {
   // The players' bodies, registered by the frame layer so the handle-keyed
   // lookups can find them. NOT owned and NOT in `mobs_` — see SetAvatars.
   std::vector<Mob*> avatars_;
+  size_t localAvatars_ = 0;  // leading entries of avatars_ that are not ghosts
+  std::vector<ParticleSpawn> ghostSpawns_;  // CarveMobsRadial's discard
   uint64_t nextId_ = 1;
   // ---- ownership state (M9.4-B) -------------------------------------------
   // All three are PROCESS state, not world state: none is hashed, none is

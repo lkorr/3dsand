@@ -19,11 +19,13 @@
 //                  bit pattern of kVoxelMeters), the window origin, the full
 //                  material NAME table, and (SVM5) the SIM TICK and the SEED
 //                  the world was saved at. Written LAST: its presence marks
-//                  a completed save. A load refuses any mismatch and says
-//                  exactly which field disagreed — material IDs are baked into
-//                  every chunk (world.h "never reorder"), and a world saved at
-//                  one voxel size loaded into a build with another would
-//                  silently change physical scale.
+//                  a completed save. A load refuses a mismatch of the world
+//                  constants or the voxel size and says exactly which field
+//                  disagreed — a world saved at one voxel size loaded into a
+//                  build with another would silently change physical scale.
+//                  The MATERIAL table no longer refuses (W1-D, below): it is
+//                  logged, and it is the table the dir's UNTAGGED files read
+//                  under.
 //
 //                  'SVM4' STILL LOADS, and reports tick/seed as UNKNOWN (0).
 //                  That is not politeness to old files: the two fields are
@@ -52,6 +54,16 @@
 //                  the fingerprint UNKNOWN -- the same append-only argument
 //                  SVM5 made for the tick and seed.
 //   r_x_y_z.svr    the chunk store's voxel region files (chunkstore.cpp).
+//   mat_<hash>.svmt  MATERIAL NAME TABLES (rule-unification W1-D,
+//                  sim/mattable.h). Every region file (SVR4), every bucket
+//                  record (SVX2) and every section container (SVE2) carries the
+//                  hash of the name table its ids were written under; the table
+//                  is written here, content-addressed, before the first blob
+//                  that names it. Reads remap ids BY NAME to the running
+//                  materials.json, so reordering or inserting materials no
+//                  longer repaints (or refuses) a save. Pre-W1-D files carry no
+//                  hash and read under `mat_legacy.svmt` -- meta.svm's table,
+//                  pinned by the first W1-D load that saw it differ.
 //
 //   ENTITY STATE (everything OUTSIDE the voxel grid), split BY OWNER since
 //   PLAN_save_system.md S4. Every file is the same TLV-or-record container
@@ -162,12 +174,15 @@
 //
 // A flat TLV container (the pre-S4 entities.sve used the same one):
 //
-//   u32 magic 'SVE1', u32 sectionCount, then per section:
+//   u32 magic 'SVE2', u32 sectionCount, u32 matTable, then per section:
 //   u32 id (FourCC), u32 version, u32 byteLen, payload[byteLen]
 //
+// ('SVE1', still read, is the same without matTable: its sections' material
+// ids read under the dir's legacy table -- sim/mattable.h.)
+//
 // r_x_y_z.sve is a RECORD list instead (chunkstore.h EntityRecord): one
-// framed record per entity -- section FourCC, section version, position,
-// bytes -- so one record can be appended or taken without reading any other
+// framed record per entity -- section FourCC, section version, material
+// table, position, bytes -- so one record can be appended or taken without reading any other
 // (PLAN S5b parks dormant NPCs this way). A region section's record bytes are
 // exactly ONE ENTRY of that section's whole payload, and a whole payload is
 // `u32 count` + entries, so the two forms stay one format: a record is loaded
@@ -304,8 +319,10 @@ void ApplyRegionEntities(ChunkStore& store, IVec3 windowOriginChunks,
 // The per-player file on its own, for a multiplayer peer that saves its own
 // player into its own copy of the dir (the host writes the world). Only the
 // Player-scope sections of `io` are touched; neither function resets.
-bool SavePlayerFile(const std::string& dir, const EntityIO& io);
-bool LoadPlayerFile(const std::string& dir, const EntityIO& io);
+// `store` supplies the material tables (its running one tags the write; the
+// file's own is resolved against it on the read) -- sim/mattable.h.
+bool SavePlayerFile(const std::string& dir, const EntityIO& io, ChunkStore& store);
+bool LoadPlayerFile(const std::string& dir, const EntityIO& io, ChunkStore& store);
 
 // The two facts meta.svm gained in SVM5 (M9.5-B). A VALUE TYPE with a
 // `known` flag rather than a pair of magic zeros, because tick 0 and seed 0

@@ -194,7 +194,7 @@ struct UIState {
   // clearFluid is a one-shot request consumed inside the tick loop.
   uint32_t fluidCount = 0;
   bool clearFluid = false;
-  int fluidSpecies = 0;
+  int fluidPour = 0;   // mpm tool keys 1-4: water / oil / acid / blood
   // Live tuning copies — main.cpp seeds these from CurrentTuning() on
   // startup.  The overlay draws sliders; main.cpp detects changes (via
   // fluidTuningDirty) and writes them back + reloads shaders.
@@ -233,13 +233,8 @@ struct UIState {
   float fSettleEps = 0.9f;
   float fWakeSpeed = 3.6f;
   int   fSettleTicks = 45;
-  float fStainRate = 8.0f;
   // ---- look tab (render) ----
   float fSurface = 1.0f;
-  float fColor[3] = {0.20f, 0.42f, 0.85f};
-  float fColor1[3] = {0.92f, 0.34f, 0.10f};
-  float fColor2[3] = {0.22f, 0.78f, 0.28f};
-  float fColor3[3] = {0.88f, 0.72f, 0.25f};
   float fIso = 0.30f;
   float fSmooth = 1.3f;
   float fIor = 1.33f;

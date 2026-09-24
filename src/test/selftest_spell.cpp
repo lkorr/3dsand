@@ -1474,9 +1474,9 @@ Status GateSpells(Ctx& c, std::string& detail) {
         }
         if (parent >= 0) {
           for (size_t m = 0; m < mats.size(); m++)
-            if (Mob::BurnStageOfMaterialName(mats[m].name) == 2)
+            if (mats[m].burnStage == 2)
               charredAtEnd += (int)mobs.LimbMaterialCount(id, parent, (uint32_t)m);
-            else if (Mob::BurnStageOfMaterialName(mats[m].name) == 1)
+            else if (mats[m].burnStage == 1)
               cookedAtEnd += (int)mobs.LimbMaterialCount(id, parent, (uint32_t)m);
           burningAtEnd = (int)mobs.LimbBurningCount(id, parent);
           parentVox = (int)mobs.LimbVoxelCount(id, parent);

@@ -169,7 +169,11 @@ uint32_t CellHash(int x, int y, int z, int salt) {
 // voxels tall would come out skin / flesh / muscle / flesh / skin with no bone
 // in it. Overriding only the face keeps the union's depth underneath, so the
 // core runs continuously through the joint.
-std::vector<uint8_t> UnionDepth(const Prefab& prefab) {
+std::vector<uint8_t> UnionDepth(const Prefab& prefab,
+                                const std::vector<bool>* include) {
+  const auto counts = [&](size_t mi) {
+    return !include || mi >= include->size() || (*include)[mi];
+  };
   const IVec3 dim = prefab.size;
   const size_t n = (size_t)std::max(dim.x, 0) * (size_t)std::max(dim.y, 0) *
                    (size_t)std::max(dim.z, 0);
@@ -181,12 +185,15 @@ std::vector<uint8_t> UnionDepth(const Prefab& prefab) {
   const auto inBox = [&](int x, int y, int z) {
     return x >= 0 && y >= 0 && z >= 0 && x < dim.x && y < dim.y && z < dim.z;
   };
-  for (const PrefabModel& m : prefab.models)
+  for (size_t mi = 0; mi < prefab.models.size(); mi++) {
+    if (!counts(mi)) continue;
+    const PrefabModel& m = prefab.models[mi];
     for (const PrefabVoxel& v : m.voxels) {
       const int px = v.x + m.offset.x, py = v.y + m.offset.y,
                 pz = v.z + m.offset.z;
       if (inBox(px, py, pz)) solid[px + py * sy + pz * sz] = 1;
     }
+  }
 
   std::vector<int32_t> queue;
   queue.reserve(n / 4 + 1);
@@ -228,7 +235,9 @@ std::vector<uint8_t> UnionDepth(const Prefab& prefab) {
 
   // A LIMB'S OWN FACES ARE SURFACE.
   std::vector<uint8_t> own;
-  for (const PrefabModel& m : prefab.models) {
+  for (size_t mi = 0; mi < prefab.models.size(); mi++) {
+    if (!counts(mi)) continue;
+    const PrefabModel& m = prefab.models[mi];
     const size_t mn = (size_t)std::max(m.size.x, 0) *
                       (size_t)std::max(m.size.y, 0) *
                       (size_t)std::max(m.size.z, 0);
@@ -283,7 +292,15 @@ Report Resolve(Prefab& prefab, const nlohmann::json& recipe,
                    (size_t)std::max(dim.z, 0);
   if (!n) return rep;
   const size_t sy = (size_t)dim.x, sz = (size_t)dim.x * dim.y;
-  const std::vector<uint8_t> depth = UnionDepth(prefab);
+  // A KEEP-ONLY LIMB IS NOT BODY (anatomy.js planAnatomy says why): hair
+  // lying on the scalp would otherwise bury it and push the skull inward.
+  std::vector<bool> include(prefab.models.size(), true);
+  for (size_t mi = 0; mi < prefab.models.size(); mi++) {
+    const std::vector<Layer> ls = LayersFor(recipe, prefab.models[mi].name);
+    include[mi] = ls.empty() || !std::all_of(ls.begin(), ls.end(),
+                                             [](const Layer& l) { return l.keep; });
+  }
+  const std::vector<uint8_t> depth = UnionDepth(prefab, &include);
 
   // GARMENTS: surface voxels that are CLOTHING, not body. The voxel directly
   // under one takes the FIRST layer's material — skin under the shorts, not

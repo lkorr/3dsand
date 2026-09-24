@@ -789,27 +789,36 @@ Status GateGasFarPlume(Ctx& c, std::string& detail) {
   FarPlumes& plumes = *world.farPlumes;
 
   // WHAT COUNTS AS FROZEN FIRE IS DATA, and the fixture proves it rather than
-  // assuming it: the material is the first in the loaded table that satisfies
-  // the rule FarPlumes::SetMaterials applies (tagged `hot`, emits light, not a
-  // gas). Naming `ember` here would have made the gate pass over a hardcoded id
-  // and say nothing about the rule (memory: gotcha-gate-hardcodes-asset-cast).
+  // assuming it: the material is the first NON-GAS one the compiled reaction
+  // table says makes smoke (materials.h SmokeSourceTable: its own rules decay
+  // to or emit fire/smoke -- the near-field fact, rule-unification W1-B1).
+  // Non-gas because the fixture paints a whole chunk of it and a gas would
+  // drift off before the harvest. Naming `ember` here would have made the gate
+  // pass over a hardcoded id and say nothing about the rule (memory:
+  // gotcha-gate-hardcodes-asset-cast).
+  //
+  // NEAR AND FAR AGREE: the index must hold exactly that table for every id.
+  // The old rule (tagged hot + emissive) put lava in it, so a lava lake
+  // plumed at distance and never up close; that is the disagreement this
+  // loop now refuses.
+  const std::vector<uint8_t> smoky = SmokeSourceTable(c.mats, c.reactions);
   uint32_t hotId = 0;
   for (uint32_t i = 1; i < (uint32_t)c.mats.size(); i++) {
-    const MaterialDef& m = c.mats[i];
-    if (m.gpu.klass == CLASS_GAS || m.gpu.emission == 0) continue;
-    bool hot = false;
-    for (const std::string& t : m.tags) if (t == "hot") { hot = true; break; }
-    if (hot) { hotId = i; break; }
+    if (FarPlumes::SmokeSource(i) != (smoky[i] != 0)) {
+      detail = Format("material %s: the far plume index says %s but its own "
+                      "reaction rules say %s - near and far disagree about "
+                      "whether it is on fire (Simulation::UploadTables did not "
+                      "latch the table, or FarPlumes grew a second rule)",
+                      c.mats[i].name.c_str(),
+                      FarPlumes::SmokeSource(i) ? "smoke" : "no smoke",
+                      smoky[i] ? "smoke" : "no smoke");
+      return Status::Fail;
+    }
+    if (!hotId && smoky[i] && c.mats[i].gpu.klass != CLASS_GAS) hotId = i;
   }
   if (!hotId) {
-    detail = "no material is tagged `hot`, emissive and non-gas - nothing in "
-             "this table could ever freeze as a distant fire";
-    return Status::Fail;
-  }
-  if (!FarPlumes::HotEmissive(hotId)) {
-    detail = Format("material %s satisfies the rule but FarPlumes does not "
-                    "agree - Simulation::UploadTables never latched the table",
-                    c.mats[hotId].name.c_str());
+    detail = "no non-gas material has a rule that decays to or emits fire or "
+             "smoke - nothing in this table could ever freeze as a distant fire";
     return Status::Fail;
   }
 
@@ -1235,16 +1244,15 @@ Status GateGasFarPlume2(Ctx& c, std::string& detail) {
   }
   FarPlumes& plumes = *world.farPlumes;
 
+  // The same fixture material gas-farplume derives: the first non-gas smoke
+  // source in the compiled reaction table (materials.h SmokeSourceTable).
+  const std::vector<uint8_t> smoky = SmokeSourceTable(c.mats, c.reactions);
   uint32_t hotId = 0;
-  for (uint32_t i = 1; i < (uint32_t)c.mats.size(); i++) {
-    const MaterialDef& m = c.mats[i];
-    if (m.gpu.klass == CLASS_GAS || m.gpu.emission == 0) continue;
-    for (const std::string& t : m.tags)
-      if (t == "hot") { hotId = i; break; }
-    if (hotId) break;
-  }
+  for (uint32_t i = 1; i < (uint32_t)c.mats.size() && !hotId; i++)
+    if (smoky[i] && c.mats[i].gpu.klass != CLASS_GAS) hotId = i;
   if (!hotId) {
-    detail = "no material is tagged `hot`, emissive and non-gas";
+    detail = "no non-gas material has a rule that decays to or emits fire or "
+             "smoke";
     return Status::Fail;
   }
 

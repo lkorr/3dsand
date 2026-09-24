@@ -233,7 +233,7 @@ Status GateAudioMobVoice(Ctx& c, std::string& detail) {
   MobSystem& mobs = c.mobs;
 
   if (mobs.Defs().empty()) {
-    detail = "no mob defs — run scripts/gen_test_mob.py";
+    detail = "no mob defs — assets/mobs/ has no loadable sidecar";
     std::printf("audio mob voice: FAIL (%s)\n", detail.c_str());
     return Status::Fail;
   }

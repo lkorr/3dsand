@@ -2,58 +2,37 @@
 /* test_mobgen.mjs — the data gate for assets/editor/mobgen.js.
  *
  *   node scripts/test_mobgen.mjs               run the gate
- *   node scripts/test_mobgen.mjs --rebaseline  re-pin the reference from
- *                                              scripts/gen_human.py (needs python)
  *
- * Costs nothing, takes no lock, needs no C++ build and no GPU. That is the
- * point: mobgen.js is a 1,588-line translation of a Python generator, and the
- * difference between finding a translation bug in five seconds and finding it
- * after forty characters have been bred on top of it is this file.
+ * Costs nothing, takes no lock, needs no C++ build and no GPU. Run by
+ * scripts/post_edit_check.sh on an edit to assets/editor/, assets/mobs/,
+ * assets/biomes/ or assets/trees/, and by the `generator-parity` selftest gate.
  *
- * WHAT IS PINNED, AND WHY IT IS NOT assets/mobs/human.vox
- * ------------------------------------------------------
- * The reference is `scripts/gen_human.py`'s OWN OUTPUT, captured in
- * tests/mobgen_human_ref.json, because the shipped human is no longer what its
- * generator produces. Measured, not assumed:
+ * WHAT IS PINNED: assets/mobs/human.json, THE STANDARD (sections L and M).
+ * ------------------------------------------------------------------------
+ * mobgen.js began as a port of `scripts/gen_human.py`, and until 2026-09-24 a
+ * section A here pinned `generateMob(defaultGenome())` cell for cell against a
+ * digest of that Python's own output (tests/mobgen_human_ref.json). That pin
+ * was DELETED with the Python (rule-unification W1-E): a generator is a
+ * snapshot of the rig on the day it was written, and the Python had stopped
+ * reproducing assets/mobs/human.{vox,json} — so the port test agreed perfectly
+ * with a rig four commits stale and every bred character inherited it. What
+ * the Python still knew that is still true (the limb art table the wardrobe is
+ * measured off) lives on in scripts/human_art.py as a library.
  *
- *   GEOMETRY. Thirteen of the fifteen limbs are identical to the cell. The
- *   torso and the two upper arms differ by 130 cells in total, every one of them
- *   a REMOVAL, all in the shoulder — the shipped human has had its shoulders
- *   rounded by hand in the model editor. That sculpting is the whole geometric
- *   divergence, and section K reproduces it as a rule so generated characters
- *   get it too.
- *
- *   EVERYTHING ELSE. The interior has been rewritten by the anatomy pass, the
- *   art palette carries clothing dye in slots gen_human.py never knew about,
- *   and seven sidecar blocks have been hand-extended since (limbs, natural,
- *   clips, states, anatomy, and skinScale superseded by artVoxelsPerMetre).
- *
- * So pinning against the shipped asset would pin against a body the generator
- * cannot make, and the only honest reference is the generator. What the pin
- * buys is exactly what §4 of the handoff wanted: `generateMob(defaultGenome())`
- * with the shoulder round off is the Python's figure, cell for cell, slot for
- * slot, anchor for anchor.
- *
- * The comparison is on the PARSED prefab (per-limb name, placement, dimensions,
- * material layer, colour layer) and on the sidecar FIELDS, not on the file
- * bytes. Two container details differ by design and neither reaches the engine:
- * vox.js writes a PACK chunk for a multi-model file and an empty root frame
- * dict, gen_human.py writes neither. Comparing bytes would fail on those two
- * and tell you nothing about the geometry, which is the thing that can actually
- * be wrong.
+ * The standard is the shipped human now: section L holds the default genome's
+ * rig contract to human.json exactly, section M every generated character on
+ * disk to what its genome generates today, and section K the shoulder round
+ * against the shipped human.vox.
  */
 
 import fs from 'fs';
 import path from 'path';
-import crypto from 'crypto';
-import { spawnSync } from 'child_process';
 import { fileURLToPath } from 'url';
 import { readVox } from '../assets/editor/vox.js';
 import * as mg from '../assets/editor/mobgen.js';
 import * as sc from '../assets/editor/sidecar.js';
 
 const ROOT = path.resolve(path.dirname(fileURLToPath(import.meta.url)), '..');
-const REF_PATH = path.join(ROOT, 'tests', 'mobgen_human_ref.json');
 
 let fails = 0, checks = 0;
 const ok = (cond, what, detail) => {
@@ -69,7 +48,6 @@ const readJson = p => JSON.parse(fs.readFileSync(p, 'utf8'));
 const materials = readJson(path.join(ROOT, 'assets/materials/materials.json'))
   .materials;
 const tuning = readJson(path.join(ROOT, 'assets/materials/tuning.json'));
-const sha = u8 => crypto.createHash('sha256').update(u8).digest('hex').slice(0, 16);
 
 /** The four gait constants avatar.cpp owns, read out of it rather than copied —
  *  mobgen.js carries fallbacks so the browser can run without the C++ in hand,
@@ -96,8 +74,8 @@ function avatarConstants() {
  * address it) and `sidecarVoxelsPerMetre` (the world-length stamp its position
  * keys are written at, the same one a sidecar carries). Strip those two and
  * what is left is EXACTLY what used to sit inline in every generated sidecar,
- * which is what lets section A keep comparing the whole clip set against the
- * Python reference after the move.
+ * which is what lets a clip-reachability check see a sidecar and the library
+ * together.
  *
  * Only clips written at the generator's own scale are usable that way, so a
  * library file stamped at some other voxel size is skipped rather than
@@ -116,24 +94,6 @@ function clipLibrary() {
     out[name] = vpm === mg.SIDECAR_VOXELS_PER_METRE ? c : null;
   }
   return out;
-}
-
-/** A parsed .vox reduced to what MUST match: one entry per model, in order. */
-function digestPrefab(buf) {
-  const { prefab, warnings } = readVox(buf);
-  if (!prefab) throw new Error('no prefab in .vox');
-  return {
-    warnings,
-    size: prefab.size,
-    models: prefab.models.map(m => ({
-      name: m.name,
-      offset: m.offset,
-      dim: m.dim,
-      cells: m.grid.data.reduce((s, v) => s + (v ? 1 : 0), 0),
-      data: sha(m.grid.data),
-      color: m.grid.color ? sha(m.grid.color) : null,
-    })),
-  };
 }
 
 /** Deep structural equality, reporting the FIRST differing path rather than a
@@ -172,41 +132,6 @@ function diff(a, b, at = '') {
   return null;
 }
 
-// =============================================================================
-// rebaseline: run gen_human.py into a scratch dir and capture its output
-// =============================================================================
-
-function rebaseline() {
-  const tmp = fs.mkdtempSync(path.join(ROOT, 'build', 'mobgen_ref_'));
-  let py = null;
-  for (const cand of ['python', 'python3', 'py']) {
-    const r = spawnSync(cand, [path.join(ROOT, 'scripts/gen_human.py'),
-                               '--out', tmp], { encoding: 'utf8' });
-    if (r.status === 0) { py = cand; console.log(r.stdout.trim()); break; }
-  }
-  if (!py) {
-    console.log('could not run scripts/gen_human.py with python/python3/py');
-    process.exit(2);
-  }
-  const ref = {
-    '//': 'Reference output of scripts/gen_human.py, which assets/editor/' +
-          'mobgen.js is a port of. Regenerate with `node scripts/' +
-          'test_mobgen.mjs --rebaseline`. NOT a digest of assets/mobs/' +
-          'human.vox — see the banner in test_mobgen.mjs for why the shipped ' +
-          'asset cannot be the reference.',
-    generator: 'scripts/gen_human.py',
-    prefab: digestPrefab(fs.readFileSync(path.join(tmp, 'human.vox'))),
-    sidecar: readJson(path.join(tmp, 'human.json')),
-  };
-  delete ref.prefab.warnings;
-  fs.writeFileSync(REF_PATH, JSON.stringify(ref, null, 2) + '\n');
-  fs.rmSync(tmp, { recursive: true, force: true });
-  console.log(`re-pinned ${path.relative(ROOT, REF_PATH)} ` +
-              `(${ref.prefab.models.length} models)`);
-}
-
-if (process.argv.includes('--rebaseline')) { rebaseline(); process.exit(0); }
-
 /** `//`-prefixed keys are authoring notes for a human reader (human.json
  *  carries several), never read by the loader, and not something a generator
  *  should be asked to reproduce word for word. */
@@ -230,83 +155,6 @@ const fillState = s => ({
   bodyYOffset: 0, groundAlign: 0, disableGait: false, speedScale: 1,
   missing: [], missingAny: [], minChainsLost: 0, ...noNotes(s),
 });
-
-// =============================================================================
-// 1. the port is faithful
-// =============================================================================
-
-const ref = readJson(REF_PATH);
-// `roundShoulders: false` is what makes this a PORT test rather than a
-// regression test. The shoulder round (section K) is a deliberate improvement
-// ON TOP of the translation -- it reproduces a hand edit the shipped human
-// carries and gen_human.py does not -- so the pin has to be able to ask for the
-// Python's geometry exactly. Turning it off is that ask.
-const built = mg.generateMob(mg.defaultGenome(), 0, {
-  materials,
-  player: tuning.player,
-  avatar: avatarConstants(),
-  name: 'human',
-  roundShoulders: false,
-});
-
-section('A. the default genome reproduces scripts/gen_human.py (round off)');
-{
-  const got = digestPrefab(built.vox);
-  ok(got.warnings.length === 0, 'the written .vox reads back without warnings',
-     got.warnings.join('; '));
-  delete got.warnings;
-  const d = diff(got, ref.prefab, 'prefab');
-  ok(!d, 'geometry, placement and paint match the reference cell for cell', d);
-
-  // The two intentional sidecar differences, stated rather than tolerated:
-  // `skinScale` was replaced by the modern `artVoxelsPerMetre` (mob.cpp reads
-  // the legacy key as scale * 10 vox/m, so 8 and 80 are the same fact), and a
-  // generated body needs the anatomy recipe and an explicit
-  // sidecarVoxelsPerMetre.
-  const mine = JSON.parse(JSON.stringify(built.sidecar));
-  // THE CLIPS THE GENERATOR NO LONGER EMITS ARE STILL COMPARED, out of the
-  // shared library they moved to. The Python reference carries all fifteen
-  // inline; the generator now derives only `walk` and `run` (their period is a
-  // function of THIS figure's leg) and inherits the rest from assets/anims/,
-  // which is what the loader does at runtime. Re-assembling the two here keeps
-  // this a port test of the whole clip set rather than of the leftovers — and
-  // it is what asserts the moved files are byte-for-byte what they replaced.
-  //
-  // `attack` was a second NAME for `cast` and is not in the library: nothing
-  // selects it (attack_styles.json names none of these), MobSystem stopped
-  // playing it at 96c86d5, and critter.json authors its own. Dropped from both
-  // sides rather than aliased back in, so the reference stops claiming a clip
-  // the engine does not have.
-  const lib = clipLibrary();
-  const theirClips = { ...ref.sidecar.clips };
-  delete theirClips.attack;
-  for (const k of Object.keys(theirClips))
-    ok(lib[k] !== undefined || mine.clips[k] !== undefined,
-       `clip "${k}" is still reachable — in the sidecar or in assets/anims/`);
-  mine.clips = { ...lib, ...mine.clips };
-  for (const k of Object.keys(mine.clips))
-    if (mine.clips[k] === null) delete mine.clips[k];   // a foreign voxel scale
-  const mineClipsOnly = Object.fromEntries(
-    Object.keys(theirClips).filter(k => k in mine.clips).map(k => [k, mine.clips[k]]));
-  const dc = diff(mineClipsOnly, theirClips, 'clips');
-  ok(!dc, 'every clip matches the reference, sidecar and library together', dc);
-  const theirs = JSON.parse(JSON.stringify(ref.sidecar));
-  ok(mine.artVoxelsPerMetre === theirs.skinScale * 10,
-     'artVoxelsPerMetre says what the legacy skinScale said',
-     `${mine.artVoxelsPerMetre} vs ${theirs.skinScale} * 10`);
-  ok(mine.sidecarVoxelsPerMetre === 10,
-     'sidecarVoxelsPerMetre is stated, and is the value the loader defaults to');
-  ok(!!mine.anatomy && mine.anatomy.layers.length === 4 &&
-     !!mine.anatomy.limbs.head,
-     'the anatomy recipe is present, with the head override');
-  for (const k of ['artVoxelsPerMetre', 'sidecarVoxelsPerMetre', 'anatomy',
-                   'genome', 'clips'])
-    delete mine[k];
-  delete theirs.skinScale;
-  delete theirs.clips;   // compared above, against the library as well
-  const ds = diff(mine, theirs, 'sidecar');
-  ok(!ds, 'every other sidecar field matches the reference exactly', ds);
-}
 
 section('B. the constants this file derives FROM have not drifted');
 {
@@ -363,7 +211,7 @@ section('D. genome normalisation');
      `got ${round.body.shoulderWidth}`);
   const wild = mg.normalizeGenome({
     body: { heightM: 99, limbWidth: -5, footDepth: 'x' },
-    hair: { style: 'mohawk' }, colors: { skin: 'not a colour' },
+    hair: { style: 'mullet' }, colors: { skin: 'not a colour' },
     face: { eyeCols: 12 },
   });
   ok(wild.body.heightM === mg.HEIGHT_BAND[1],
@@ -660,14 +508,21 @@ section('F. every rolled body is STRUCTURALLY SOUND');
     // art slot. Checked on the written file, not on the builders' return, so a
     // palette bug in the write path cannot pass.
     const { prefab } = readVox(b.vox);
-    const mats = new Set(), cols = new Set();
+    // The hair mass (mobgen.js hairMass) is the one exception, and it is
+    // ONE material of its own: hair_white, never flesh.
+    const mats = new Set(), hairMats = new Set(), cols = new Set();
+    const isHair = n => /^(hair|mane)(\.\d+)?$/.test(n);
     for (const m of prefab.models) {
-      for (const v of m.grid.data) if (v) mats.add(v);
+      for (const v of m.grid.data) if (v) (isHair(m.name) ? hairMats : mats).add(v);
       if (m.grid.color) for (const v of m.grid.color) if (v) cols.add(v);
     }
     ok(mats.size === 1 && [...mats][0] <= 127,
        `${label} is one material, id <= 127`,
        `materials ${[...mats].join(',')}`);
+    const hairId = materials.findIndex(m => m.id === mg.HAIR_MAT_ID) + 1;
+    ok(hairMats.size === 0 || (hairMats.size === 1 && hairMats.has(hairId)),
+       `${label}'s hair is all ${mg.HAIR_MAT_ID}`,
+       `materials ${[...hairMats].join(',')}`);
     ok([...cols].every(c => c >= 128 && c <= 255),
        `${label} paints only art slots`,
        `colours ${[...cols].filter(c => c < 128).join(',')}`);
@@ -760,11 +615,15 @@ section('H. visual distinctness is actually reachable');
   // check is that the LEVERS MOVE VOXELS — a hairstyle that renders identically
   // is a slider that lies.
   const opts = { materials, player: tuning.player, avatar: avatarConstants() };
+  // The head AND the hair mass (hairMass): a style may differ only in hair
+  // that stands off the scalp, which the head brick never sees.
   const headOf = g => {
     const b = mg.generateMob(g, 0, opts);
-    const p = b.parts.find(x => x.name === 'head');
-    return { shape: p.cells.map(([x, y, z]) => `${x},${y},${z}`).sort().join(';'),
-             paint: p.cells.map(c => c.join(',')).sort().join(';') };
+    const ps = b.parts.filter(x => x.name === 'head' || x.hair);
+    const cells = ps.flatMap(p => p.cells.map(([x, y, z, c]) =>
+      [p.mn[0] + x, p.mn[1] + y, p.mn[2] + z, c]));
+    return { shape: cells.map(([x, y, z]) => `${x},${y},${z}`).sort().join(';'),
+             paint: cells.map(c => c.join(',')).sort().join(';') };
   };
   const base = headOf(mg.defaultGenome());
   const seenShapes = new Set();
@@ -1128,9 +987,9 @@ section('K. the shoulder round, which the shipped human has and the Python does 
 
 section('L. the rig contract matches assets/mobs/human.json, the standard');
 {
-  // WHY THIS IS A SEPARATE CLAIM FROM SECTION A. Section A pins the port
-  // against `gen_human.py`, which proves the translation is faithful and
-  // proves nothing about whether the thing being translated is current. It was
+  // WHY THIS IS THE PIN. A section A used to pin the port against
+  // `gen_human.py` (both deleted 2026-09-24), which proved the translation
+  // faithful and nothing about whether the thing translated was current. It was
   // not: the Python was the rig as of the day it was written, and the SHIPPED
   // human has been the standard ever since, edited in place by the commits
   // that changed how bodies fight and fall apart. Four of those edits never
@@ -1148,7 +1007,7 @@ section('L. the rig contract matches assets/mobs/human.json, the standard');
   //   9190307  the jaws' halfWidth is the width of a skull, not of a needle.
   //
   // None of those is a thing a generator can be expected to guess, and none of
-  // them is caught by section A, because gen_human.py was equally stale and
+  // them was caught by that port pin, because gen_human.py was equally stale and
   // the two agreed perfectly on the wrong answer. So this section asks the
   // question the port test cannot: AT THE DEFAULT GENOME — which is the human
   // — is the sidecar the shipped human's sidecar?
@@ -1201,7 +1060,7 @@ section('L. the rig contract matches assets/mobs/human.json, the standard');
          `state "${s.name}" does not claim the ONE-foot case from the ` +
          'derived stump drag');
 
-  // The anatomy recipe is not in the Python at all (section A deletes it), so
+  // The anatomy recipe was never in the Python at all, so
   // this is the only place it is checked against the standard. The head
   // override is the one that matters: it is what a `brain` is.
   const da = diff(noNotes(mine.anatomy), noNotes(shipped.anatomy), 'anatomy');
@@ -1445,10 +1304,12 @@ section('N. the sidecar resolver, and both languages running it the same way');
 
 // =============================================================================
 
-console.log(`\n${fails ? 'FAIL' : 'PASS'}  ${checks - fails}/${checks} checks`);
 if (fails) {
-  console.log('\nIf the reference is what moved (you changed gen_human.py, or a ' +
-              'material\nid, or tuning.json player speed), re-pin it:\n' +
-              '  node scripts/test_mobgen.mjs --rebaseline');
+  console.log('\nThe standard is assets/mobs/human.json. If it moved on purpose, ' +
+              'mobgen.js follows it;\na stale character on disk is re-baked with ' +
+              '`node scripts/gen_mobs.mjs <name> --rebake`.');
 }
+// The verdict is the LAST line: scripts/generator_parity.mjs reads it as this
+// test's summary.
+console.log(`\n${fails ? 'FAIL' : 'PASS'}  ${checks - fails}/${checks} checks`);
 process.exit(fails ? 1 : 0);

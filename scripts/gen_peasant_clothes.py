@@ -55,7 +55,7 @@ import sys
 
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 
-import gen_human as H
+import human_art as H
 # The shape builders, the .vox writer and the two measured numbers. IMPORTED,
 # never restated — see the note above.
 import gen_stock_armor as A

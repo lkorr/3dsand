@@ -331,10 +331,10 @@ are deduplicated across mob defs, so 128 slots cover a whole cast.
 - **Save-format hardening + entity persistence (2026-08-22, worldio.h):**
   `meta.svm` is `'SVM4'` and now records the exact BIT PATTERN of
   `kVoxelMeters` and the full material NAME table alongside `kWorldN`/`kChunk`;
-  a load refuses any mismatch and names the exact field (down to "material id
-  12 was 'lava', build has 'acid'") — material ids are baked into every saved
-  chunk, and a silent voxel-size or table change is world corruption with a
-  green build. The directory also gains an optional `entities.sve`: a TLV
+  a load refuses any mismatch and names the exact field — a silent voxel-size
+  change is world corruption with a green build. (The material table was
+  refused the same way until 2026-09-24; it is now REMAPPED BY NAME, next
+  bullet.) The directory also gains an optional `entities.sve`: a TLV
   container of independently VERSIONED sections (`DBRS` debris bodies, `MOBS`
   mob instances incl. sever/carve state, `AVTR` the player avatar), written
   before `meta.svm` so meta's completed-save guarantee covers it. Unknown
@@ -348,6 +348,38 @@ are deduplicated across mob defs, so 128 slots cover a whole cast.
   invariant holds from tick one); anything saved mid-flight lands where it
   was, accepted. Entity state is CPU-float gameplay state outside the hashed
   domain (§7), so the grid hash round-trip is unchanged.
+- **Material names in saves (2026-09-24, rule-unification W1-D,
+  `sim/mattable.h`).** A material id is its position in `materials.json`, and
+  every save file stores ids — voxel words, and the lattices and fields inside
+  entity payloads (DBRS debris, MOBS stored limbs incl. body coats, ITMS
+  lattice + vessel fill, PLYR worn damage + fills, WTRB body material). Every
+  blob now carries the HASH of the name table (material names in id order +
+  stain-slot names; stain types are palette slots assigned in file order, so
+  they move too) it was written under: `SVR4` region headers, `SVX2` bucket
+  RECORDS (per record — one bucket mixes dormant records from older sessions
+  with ones parked this session), `SVE2` section containers. The tables are
+  written beside the save as content-addressed `mat_<hash>.svmt`, before the
+  first blob that names them (so an LRU spill after a crash is never
+  orphaned). Reads remap to the running table BY NAME on the way in
+  (`ChunkStore::ReadRegionFile` for chunks; for the opaque entity bytes the
+  loader wraps each apply in `ScopedLoadRemap` and the lattice readers call
+  `ActiveLoadRemap()`), so RAM, the GPU and every live system only ever hold
+  running ids and a reordered or grown `materials.json` loads the same world.
+  A name the running table lacks loads as clean air (a stain with no slot as
+  clean) and is named in the log; nothing is refused. Pre-W1-D (untagged)
+  files read under `meta.svm`'s inline table, which the first W1-D load that
+  sees it differ pins to `mat_legacy.svmt` before a save can rewrite meta; a
+  blob whose table cannot be found loads as stored and says so. The other half:
+  `world.h`'s `kMat*` literals stay compile-time (they feed the WGSL prelude),
+  but `LoadAssets` now resolves each against its NAME and refuses a
+  `materials.json` that moved one (`CheckPinnedMaterialIds`; its pin table is
+  held to `world.h` by `check_invariants.py matids`). Not covered: authored
+  `.svedit` edit layers (assets, not saves) still carry raw ids. Gate:
+  `save-material-remap` (CPU store vs a table with an inserted + swapped
+  material and swapped stain slots, the untagged/legacy and missing-table
+  paths; then SaveWorld under a permuted copy of the real materials and
+  LoadWorld under the real one — stored chunks' region hash matches BY NAME,
+  a debris lattice and a creature's coat follow the names).
 - **Entity state is split by owner (2026-09-23, `docs/PLAN_save_system.md`
   S4; supersedes the single `entities.sve` above).** Three files instead of
   one: **`r_x_y_z.sve`** beside each region's `.svr` holds the world-anchored
@@ -1601,7 +1633,7 @@ through it, or a broken fixture passes too.
 
 ### Far fire plumes: the smoke of fires the window has left behind (2026-09-15; `sim_gas.wgsl` `gasFarPlume`, `src/sim/farplumes.h`)
 
-**The gap.** A chunk evicted mid-burn is FROZEN. Its `ember` / `lava` /
+**The gap.** A chunk evicted mid-burn is FROZEN. Its `ember` /
 burning-foliage voxels were downsampled into the far cascade by the last
 `fardown`, so the fire stays visibly orange at cascade distance for the rest of
 the session — that is the cascade working. Its SMOKE is not, and that is the
@@ -1620,11 +1652,18 @@ synthesizes their plumes. Both halves are deliberately small:
   FOOTPRINT: a cell is 8 voxels and a chunk is 16, so a burning chunk
   contributes at most FOUR emitters however much of it is alight, each carrying
   the column's hot-voxel count and its topmost hot voxel. What counts as fire is
-  data (`hot` tag + emission > 0 + not a gas), latched from the material table
-  by `Simulation::UploadTables`; no material id appears anywhere in the feature.
-  `fire` itself is CLASS_GAS and `farCellIsSolid` never writes a gas into the
-  cascade, so what is actually visible out there is the ember under the flame,
-  which is exactly the set the rule selects.
+  READ OFF THE REACTION TABLE (`SmokeSourceTable`, `materials.h`; since
+  rule-unification W1-B1, 2026-09-24): a material whose own bucket DECAYS to
+  or EMITS `fire` or `smoke` — exactly the materials that put smoke into the
+  sky in the near field, through the CA. Near and far therefore agree by
+  construction. It was `hot` tag + emission > 0 + not a gas until then, a
+  second definition of the same fact that disagreed with the first: lava and
+  molten glass are hot and glow but have no smoke rule, so a lava lake plumed
+  at distance and never up close. Latched from the compiled table by
+  `Simulation::UploadTables`; no material id appears anywhere in the feature.
+  `fire` itself is now in the set (its own decay-to-smoke rule): the index is
+  harvested from the evicted chunk's WORDS, not from the cascade, and a chunk
+  evicted mid-blaze does hold smoking flames.
 * `Build()` drops every emitter that is back INSIDE the residency window and
   every one outside the density box, then keeps the 256 nearest the window
   centre. The in-window drop is what stops a plume being drawn twice: a resident
@@ -1674,8 +1713,9 @@ race is `FAR_PLUME_CEIL + (kGasFarEmitMax * PUFFS - 1) * ADD_MAX`, and a
 **Knobs:** `render.farPlumeStrength` (0 = exact off: no emitters, no row, no
 write) and `render.farPlumeHeight` (metres, clamped to the box).
 
-**Gate:** `gas-farplume`. One chunk of the first hot+emissive+non-gas material in
-the table, harvested off the GPU and handed to the index at a coordinate half a
+**Gate:** `gas-farplume`. It first asserts the index agrees with the reaction
+table for EVERY material id (near and far agree), then paints one chunk of the
+first non-gas smoke source in the table, harvested off the GPU and handed to the index at a coordinate half a
 window away — the same words eviction would have handed it, without forcing a
 window shift that would move the origin out from under every gate after it
 (`far-persist` feeds `FarEdits` the same way and for the same reason). Four
@@ -2320,9 +2360,19 @@ RTX 3060 Ti; cross-vendor remains open exactly as it does for the CA itself.
 Particles carry their IDENTITY in a packed attr word (32-word / 128 B struct,
 power-of-two stride): material id (settle writes it back; splash droplets and
 staining key on it), fullness eighths, and stain type/amount excited out of
-the voxel's stain bits. The species id (0..3) survives as the grid's
-mass-channel / render-colour grouping, derived from the material at excite
-time.
+the voxel's stain bits. **The material is the particle's ONLY identity**
+(W1-B2, 2026-09-24). There used to be a second one, `species = (mat-1)&3`,
+picking the render colour (`render.fluidColor0..3`), the attraction slot and
+— via `TickParams.fluidSplashMat` — a fallback splash material; acid and water
+were both species 0, so splashed acid drew water-blue and the solver treated
+the two as one liquid. Now colour is `materials[mat]`'s palette average,
+"same liquid" is "same material id", and weight is `materials[mat].density`
+(see the grid composition words below; the colour is `common.wgsl`'s
+`liquidAlbedo`, shared by the raymarched surface and `debris.wgsl`'s particle
+cubes). The old `FluidParticle.species` and `TickParams.fluidSplashMat` words
+are named padding (`_padSpecies`, `_padSplash`, twin in `world.h`), so every
+offset is unchanged; `FluidSpawnOp`'s same word is `flags` on both sides
+(bit 8 ghost, bits 16..23 ghost life).
 
 ENVIRONMENT PARITY (Phase 2's §6 slice) runs through ONE per-cell bridge
 buffer, `fluidCellScratch` (intent word from the seam, flags from the CA):
@@ -2337,11 +2387,42 @@ buffer, `fluidCellScratch` (intent word from the seam, flags from the CA):
   standing + live + consumed == placed). Transitions that PRODUCE matter
   write ordinary voxels into the (air) cell; every phase change crosses the
   seam through the voxel form (plan §6.6).
+- EXCITED FLUID RUNS ITS OWN RULES (rule-unification W1-B1, 2026-09-24).
+  The same synthesis makes an excited cell a SELF: an air cell whose intent
+  names a fluid material runs that material's bucket through the unchanged
+  `doReactions` (`sim_step` `excitedReact`, substep 0, gated on the chunk's
+  block-map word so a fluid-free chunk pays one broadcast load). A self
+  product is written into the air cell and the cell's bin is flagged for
+  `consumeApply` (`reactWriteSelf`) — the neighbour side's contract, from
+  the other side. So splashing acid corrodes stone and eats organics, and
+  excited water beside `tag:hot` becomes steam. Chosen over per-particle
+  evaluation (two particles beside one stone would race on its voxel — the
+  mark/apply problem the colour lattice already solves) and over a separate
+  mark/apply pass (a second rule walk is the drift this program removes).
+  The WAKE is `particleTick`'s `seamReactWake`: a particle marks its chunk
+  `DIRTY_R_REACT` only when one of its UNGATED rules has a partner beside
+  it (an ungated decay/emit, or a PAIR whose predicate a face-neighbour
+  voxel meets in its authored direction) — the doReactions keepAwake
+  condition from the particle side, so a splash over plain rock wakes
+  nothing. Frontier neighbour-count scaling (`scaledChance`) now counts an
+  excited neighbour as its fluid, not as air, on both sides. Gate:
+  `fluid-self-react`.
 - CONTACT STAINING: `particleTick` scatters each particle's stain (carried
   attr stain beats the material's authored one) onto solid/powder face
-  neighbours as intents; `stainApply` rolls `sim.fluidStainRate` per cell
-  and merges with the CA's rules. Settled water then WASHES foreign stains
-  exactly as CA water does — the fluid-stain gate observes both halves.
+  neighbours as intents; `stainApply` applies them through
+  `common.wgsl`'s `stainStep`, the ONE stain decision `doStaining` also
+  calls (W1-B1: the two copies had drifted twice and disagreed on the
+  chance, consumption, absorption and a clean absorbent cell's first
+  level). The roll is the stainer material's authored per-mille chance
+  (the old global `sim.fluidStainRate` knob is deleted), `consume` applies, and wetting
+  ABSORBENT ground is paid for: each particle bids (`(index+1) << 1`,
+  atomicMax into the ground cell's flags word — highest index wins, a pure
+  function of compaction order) on the one neighbour a contact would
+  deepen and charge, and `stainApply` takes one eighth off the winning
+  donor per level — the CA's fullness spend, in particle currency, counted
+  into FA_CONSUMED. No donor, no soak. Settled water then WASHES foreign
+  stains exactly as CA water does — the fluid-stain gate observes both
+  halves.
 - SWIMMING: `mirrorFold` packs excited-fluid eighths for the 27 CPU-mirror
   chunks (one byte per cell, `TickParams.mirrorBase` = the readback's own
   clamp) into the snapshot; `World::FluidEighthsAt` folds it into the
@@ -2361,7 +2442,8 @@ buffer, `fluidCellScratch` (intent word from the seam, flags from the CA):
 KNOWN LIMITS (Phase 2): excite converts non-viscous liquids only
 (moveEvery <= 1 — lava/blood stay CA until per-material fluid dynamics,
 plan Phase 7); splash droplets from STAINED water carry the material, not
-the carried stain; frontier neighbour-count scaling sees excited fluid as
+the carried stain; (fixed by W1-B1, 2026-09-24:) frontier neighbour-count
+scaling saw excited fluid as
 air; a sealed, undamped pool at stock stiffness can churn indefinitely
 (sim.fluidDamping defaults to 0 — the settle gates document the tuning that
 calms adversarial geometry, and Phase 7 owns the defaults).
@@ -2394,10 +2476,26 @@ P2G is split into a mass/momentum scatter (`p2g1`) and a stress scatter
 from a per-particle volume ratio J (which saturated at its clamp and let a
 small cavity swallow unbounded particles; the density EOS makes over-packing
 eject instead). p2g2 also applies dynamic viscosity through the APIC C matrix
-and the species terms: particles carry a species id (0..3), the grid carries
-per-species mass channels, and `attractSame`/`attractDiff` add signed pulling
-pressure per species — cohesion within a liquid, repulsion (layering) or
-mixing between different liquids. Every solver constant is a `sim.fluid*`
+and the attraction terms: `attractSame`/`attractDiff` add signed pulling
+pressure toward the same / other MATERIALS — cohesion within a liquid,
+repulsion or mixing between different liquids (both 0 by default, which
+compiles the gather out). Grid words 4..6 are the node's COMPOSITION: highest
+material id (`atomicMax`), 4096 minus the lowest (`atomicMax`), and the
+volume-weighted id sum (wrapping i32). A pure node is exact; a two-material
+node is exact too, because `sum - lo*vol` is `sum(vol_i*(mat_i - lo))` in
+wrapping arithmetic whenever that true value fits, and it is at most
+`vol*(hi-lo)`; three or more at one node is approximated as a mix of the
+extremes. DENSITY WEIGHTS MASS, NOT VOLUME: every particle is an eighth of a
+voxel, so word 0 stays a VOLUME (the EOS, the isosurface and every threshold
+read it and a lava pool is not over-packed), while `p2g1` scales the momentum
+by `materials[mat].density / 1000` and `gridUpdate` divides by the node's
+MASS (volume x composition density). A light liquid is then pushed up through
+a heavy one by the hydrostatic gradient the heavy one builds — buoyancy with
+no buoyancy term, at grid resolution (one velocity per node, so a lone
+particle mixed into another liquid feels it diluted; a blob separates). Water
+is exactly 1.0 and every scaling is skipped at 1.0, so water is bit-identical
+to the pre-density solver. Gate `fluid-identity`: acid poured onto water ends
+below it, the same pour of water does not. Every solver constant is a `sim.fluid*`
 tuning row (tuner section "MPM Fluid") in HUMAN units — gravity in voxels/s²,
 stiffness/cohesion/attract in (vox/s)², viscosity in vox²/s, damping per
 second — converted to Q16.16-per-tick integers at SHADER COMPILE TIME by the
@@ -2455,7 +2553,8 @@ from `fluidGrid`/`fluidBlockMap` — zero upload) as a trilinear isosurface.
 Gradient normals, Schlick Fresnel, TRACED reflections and TRACED refraction
 (the bent ray re-marches the world through `shadeSecondaryHit`, so the shore
 genuinely bends at the surface), per-channel Beer-Lambert absorption derived
-from the species colour, mass-weighted grid velocity driving churn foam and
+from the material colour (the composition words, blended by the node's split),
+mass-weighted grid velocity driving churn foam and
 sub-voxel shimmer, and a camera-submerged volumetric path. Cost is bounded in
 three nested steps: `RenderParams.fluidLo/fluidHi` is the world AABB of live
 fluid, so a ray that misses it pays one slab test and a ray that hits it marches
@@ -2467,16 +2566,34 @@ buffer read. `RenderParams.fluidCount == 0`
 (or `render.fluidSurface = 0`, which restores the old debug cubes via
 `debris.wgsl:vsFluid`) skips every instruction of it. Tuner section "MPM
 Fluid Look": iso, smoothing, IOR, clarity (metres), reflection/specular
-gains, foam amount/speed, shimmer, per-species colours. Depth was written at
+gains, foam amount/speed, shimmer (there is no colour knob: the liquid's
+material is its colour). Depth was written at
 the fluid interface, so raster spray in front composited over it and debris
 behind it was covered; since 2026-09-23 the interface writes NO depth and a
 body behind it is shaded through it instead (§9.zz THE WATER VEIL).
+
+ONE LIQUID OPTICS MODEL (W1-B2, 2026-09-24). The CA surface (`shadeWater`), the
+MPM surface (`shadeMpmFluid`) and the submerged view (`shadeSubmerged`) all
+read `liquidOptics(material)` in `raymarch.wgsl`: one derivation from the
+palette average and the authored opacity (an `opaque` liquid counts as fully
+opaque), one clear-liquid weight `clear = smoothstep(subClearLow,
+subClearHigh, clarity)` and one interface-reflectance scale `fresnel =
+mix(0.55, 1, clear)`. It replaced `isWater = tagMask != 0 && opacity < 0.45`,
+which two of the three paths still used (a tagless clear liquid was "not
+water", acid only failed it by accident) with their own derivation (absorb
+gain 9, scatter 0.22). The only per-path part is the CLEAR-WATER pair each
+blends toward by `clear` (`liquidClearBlend`): the surface's
+`waterAbsorb/waterScatter`, the submerged view's `subAbsorb/subScatter/
+subVisibility`, the MPM body's depth-ramped albedo — each tuned by eye for what
+that path draws. `subClearHigh` moved 0.82 -> 0.78 so that water (clarity
+0.787) is fully clear on every path; at 0.82 it was 93% clear, which the
+submerged comment had always claimed was 100%.
 
 THE RENDER SEAM: ONE LAKE, TWO REPRESENTATIONS (2026-08-25). The virtual-mass
 blend above lets the isosurface reach over SETTLED voxel water, which closes the
 geometric gap — and hands this shade a body of water the CA owns, described by
 completely unrelated coefficients (`waterAbsorb`/`waterScatter`, flat, versus
-`(1.06 - depth-ramped species albedo)/clarity` with a lit squared-albedo
+`(1.06 - depth-ramped material albedo)/clarity` with a lit squared-albedo
 in-scatter). Measured over 2.5 m of pond that is (60,120,130) against
 (142,159,177). So exciting one chunk of a lake used to REPAINT it: a
 chunk-aligned rectangle of flat pale blue with a black rim, flickering as blocks
@@ -2533,8 +2650,8 @@ enforces it. It replaced two independent tests that had to agree and did not:
   already records.
 
 Two smaller repairs in the same pass: `fluidSampleAt` gained the virtual-mass
-term (settled water accumulates into species 0), without which a node carrying
-only settled mass divided by the species floor and shaded BLACK — the dark rim
+term (settled liquid accumulates in its own material's colour), without which
+a node carrying only settled mass divided by the colour floor and shaded BLACK — the dark rim
 around every marched region that touched a pond; and the thickness walk is now
 bounded by the SCENE, not by `fluidLo/fluidHi`, because the settled water in the
 field extends arbitrarily far past the live particle blocks and clipping there
@@ -2610,8 +2727,8 @@ SPLASH COUPLING — fast fluid particles at low density (spray, breaking
 crests) shed `PFLAG_MICRO` droplets into the ballistic particle system from
 `g2p` (bindings 6/7 of the fluid group are the particle write page + counts;
 the appends land after `particleResolve`, so droplets fly next tick). Each
-droplet carries the particle's OWN material (the attr word; the poured-species
-table is the fallback) — so MPM blood spatters real stains through the
+droplet carries the particle's OWN material (the attr word; there is no
+fallback table any more) — so MPM blood spatters real stains through the
 existing claim-hash stain path and MPM water is pure sparkle. Emission is
 hash-keyed on particle state + tick (the fluid slot index is a stable
 identity — assigned by the seam's deterministic slot-order compaction),
@@ -2620,10 +2737,12 @@ lifetime, and `PARTICLE_CAP`. Live fluid holds `particlesActive` on (plus a
 droplet-lifetime tail) so the spray integrates without an explosion ever
 having happened.
 
-Usage: the `mpm` tool (Tab; hold LMB to pour, keys 1-4 pick the species, U
-clears — which now zeroes the GPU-owned count directly). `--shot-fluid` is
-the look-iteration harness: worldgen, pour a pool + a falling stream with the
-tool's own spawn shape, write `screenshot_fluid{,_top,_splash,_low}.bmp`. The
+Usage: the `mpm` tool (Tab; hold LMB to pour, keys 1-4 pour water / oil /
+acid / blood, U clears — which now zeroes the GPU-owned count directly).
+`--shot-fluid` is the look-iteration harness: worldgen, pour a pool + a
+falling stream with the tool's own spawn shape, write
+`screenshot_fluid{,_top,_splash,_low}.bmp`; `SANDVOX_SHOT_FLUID_MAT=<name>`
+pours another liquid (e.g. `acid`) in the same scene. The
 CPU keeps only a CONSERVATIVE live estimate (snapshot readback + spawns since
 — drives record/skip, the draw count and the HUD; every kernel re-bounds
 itself on the GPU count, and `vsFluid` collapses dead/stale slots). Hard
@@ -2911,8 +3030,10 @@ Author in JSON, hot-reload at runtime, compile at load into flat GPU tables.
     exactly the N×M explosion tags exist to avoid. Capacity 0 (every material
     predating this, all stone) means the liquid never soaks in and pools at once;
     such ground still takes a 1-level surface mark (the ceiling is
-    `min(amount, max(capacity, 1))`, in both `doStaining` and the MPM seam's
-    `stainApply`).
+    `min(amount, max(capacity, 1))`). Every rule in this bullet list is ONE
+    function, `common.wgsl`'s `stainStep`, which both `doStaining` and the MPM
+    seam's `stainApply` call (rule-unification W1-B1); the kernels keep only
+    the roll, the write and the spend in their own currency.
   - **Absorbing SPENDS the liquid**: one eighth of the source cell's fullness
     per successful contact, in the same units `stepLiquid` speaks, and the cell
     dies when it gives its last. Without that debit the puddle would stain the
@@ -3502,6 +3623,15 @@ to `check_shaders.sh`, and is **generated** from `src/sim/tuning_params.def` —
 the one table the emitter itself expands — so the offline validator and the
 engine cannot disagree about a name, a type, or a default. They used to be two
 hand-maintained lists, and only the *names* were ever compared.
+
+The table does NOT generate the `tuning.h` initializer or the `LoadTuning`
+read, and both drifted: nine `render.wave*` rows had no read from 9a79eba until
+2026-09-24 (every slider dead, the shader always on the C++ default), and
+`render.fluidFoam` / `sim.fluidExciteMode` carried different defaults in the
+`.def` and in `tuning.h`. `check_invariants.py`'s `tuning reach` check now
+refuses a `.def` row whose key `LoadTuning` never reads in its group, a `.def`
+default that differs from the `tuning.h` initializer, and a `tuning.json` key
+no reader consumes.
 
 #### Per-instance variance (2026-08-20)
 A tuned constant makes every instance identical: every NPC bleeds exactly the
@@ -5020,9 +5150,24 @@ reads as a permanently short bar rather than one that quietly rescaled. The
 recount is dirtied by the burn pass and by every carve and taken at most every
 `kBurnRecountTicks` (8) — a creature that is not changing costs nothing, one
 that is burning pays one pass over its body per cadence, never one per burn
-step (rule 2). The material list is `Mob::BurnStageOfMaterialName`, and
-main.cpp's per-limb HUD readout resolves through it, so the two cannot disagree
-about ash. Derived, not saved: a loaded avatar keeps its low hp but starts at
+step (rule 2). How burnt a material reads is AUTHORED: `"burnStage"` in
+materials.json (0 intact / 1 half / 2 whole), compiled into
+`MaterialDef::burnStage` (W1-F, 2026-09-24; it replaced a twelve-name list,
+`Mob::BurnStageOfMaterialName`). The burn cap, `burntAway`, the wet guard,
+`burnable` and main.cpp's per-limb HUD readout all read that one field, so they
+cannot disagree about ash, and a new burn stage is a JSON key.
+
+A charred LIVE limb sleeps (W1-F). The burn front holds only materials with an
+UNGATED decay/emit rule; charred and cooked flesh own only rules behind a
+neighbour-count ramp, which the front's neighbour queue and the world/sibling
+face seeding already reach whenever there is heat to satisfy them. Counting
+them as self-active kept every charred limb `alight` and off the burn
+`sleepKey` forever — the split debris had already made (`matSelfScaled_`).
+That split exposed the second half: `alight` is cleared only by the index
+SWEEP, and the sweep ran only on an index rebuild, so a fire that went out
+without a further carve latched the limb awake with an empty front. An empty
+front under a set latch now drops the index, and the next tick's sweep decides.
+Gate `mob-burn`, line "charred limbs sleep". Derived, not saved: a loaded avatar keeps its low hp but starts at
 cap 1 until it burns again.
 
 **Heat crosses a joint, and until it did a burning torso never lit the legs.**
@@ -5998,8 +6143,8 @@ running over the baked model.
 
 ### Characters are generated and bred (2026-09-19, thinned to a diff 2026-09-20; `assets/editor/mobgen.js`, `assets/editor/sidecar.js`, `assets/editor/breed.js`, `scripts/gen_mobs.mjs`, gate `node scripts/test_mobgen.mjs`)
 
-A character used to be a Python script. `scripts/gen_human.py` is 1,588 lines
-that run by hand and write one file, and a second character meant a second copy
+A character used to be a Python script. `scripts/gen_human.py` was 1,588 lines
+(deleted 2026-09-24, see below) that ran by hand and wrote one file, and a second character meant a second copy
 of the whole thing — there were three (`gen_mina`, `gen_wizard`, `gen_asha`),
 all subtly diverged, all since deleted. Nothing else could call any of them: the
 tuner could not preview a body it was about to make, and the only way to see a
@@ -6037,20 +6182,24 @@ segment weights are normalised against `MICRO_H` plus the archetype's joint
 overlaps and the residual is handed out one micro at a time, so "longer legs"
 can never also mean "taller".
 
-**The port is pinned to its SOURCE, not to the shipped human.**
-`generateMob(defaultGenome())` with the shoulder round off reproduces
-`gen_human.py`'s output cell for cell, slot for slot and anchor for anchor,
-against a digest in `tests/mobgen_human_ref.json`. It does *not* reproduce
-`assets/mobs/human.vox` — and neither does `gen_human.py`, any more. Measured:
-thirteen of the fifteen limbs are identical to the cell, and the torso and the
-two upper arms differ by 130 cells, every one of them a REMOVAL, all in the
-shoulder, because **the shipped human's shoulders were rounded by hand in the
-model editor**. That sculpting is the entire geometric divergence and is now a
-generator rule (see below). Beyond geometry the shipped human also has an
-anatomized interior, clothing dye in art slots the script never knew about, and
-seven hand-extended sidecar blocks. Pinning to it would pin to a body the
-generator cannot make, so the reference is the generator, and regenerating the
-human is explicitly not part of this (it would move the world hash for nothing). Keeping
+**The port is pinned to the shipped human, not to its source** (since 2026-09-24,
+rule-unification W1-E). It used to be the other way round: `generateMob(defaultGenome())`
+with the shoulder round off reproduced `gen_human.py`'s output cell for cell
+against a digest in `tests/mobgen_human_ref.json`, on the argument that the
+shipped human (anatomized interior, clothing dye, hand-rounded shoulders, seven
+hand-extended sidecar blocks) was a body the generator could not make. That pin
+proved the TRANSLATION and nothing about whether what was translated was
+current, and it was not: the Python was the rig of the day it was written, four
+`human.json` commits never reached it, and every bred character inherited the
+stale side of all four while the pin stayed green (the two agreed on the wrong
+answer). The Python, its reference digest and `test_mobgen.mjs` §A are deleted;
+§L holds the default genome's rig contract to `assets/mobs/human.json`, §M every
+bred character on disk to what its genome generates today, and §K the shoulder
+round to the shipped `human.vox`. What the Python knew that is still true — the
+limb art table and shape builders the stock wardrobe's `fitBox`es are measured
+off — lives on as a library, `scripts/human_art.py`, that writes nothing.
+Regenerating the human is still not a thing: `human.json`/`human.vox` are
+authored truth. When the pin existed, keeping
 the equality exact needed two things worth writing down: `pyRound` reproduces
 Python's half-to-even rounding of the exact binary value (`Math.round` is
 half-up, and the difference shows up in the ear row and in an arm cycle that
@@ -6189,8 +6338,22 @@ expressed against the art's own boxes and a bake that moved a voxel would drift
 the whole rig with nothing to say so. `scripts/anatomize_mob.mjs` remains the way
 to re-bake a mob already on disk, including hand-authored ones.
 
-**Verified** by `node scripts/test_mobgen.mjs` (the cell-for-cell pin, genome
-normalisation, mutate/cross reproducibility and bounds, and ~100 rolled bodies
+**The generator gates run themselves** (2026-09-24). `test_mobgen.mjs`,
+`test_anatomy.mjs` and `test_environment.mjs` were run by nothing automatic, so
+each was green on the day it was written and silent afterwards.
+`scripts/generator_parity.mjs` is now the one place that knows which test reads
+what (a test's import closure, parsed from the sources, plus the data
+directories it opens) and has two callers: `scripts/post_edit_check.sh` runs
+the affected tests after every Edit/Write of an `assets/editor/*.js`,
+`assets/mobs/`, `assets/biomes/` or `assets/trees/` file, and the
+`generator-parity` selftest gate runs all three through an input-hash cache
+(`build/generator_parity.json`: one node start in the steady state, ~20 s after
+an edit). The gate SKIPS without `node` on PATH; tests known red at baseline
+are listed by name in `tests/baseline.json`'s `generatorParityKnownRed`, so one
+red test does not disarm the gate for the others.
+
+**Verified** by `node scripts/test_mobgen.mjs` (the rig contract against
+`human.json`, genome normalisation, mutate/cross reproducibility and bounds, and ~100 rolled bodies
 each asserted sound: anchors inside their own limbs, the eye row on the face,
 one material ≤ 127, art slots only, and every limb ONE CONNECTED PIECE) and by
 `bash scripts/check_characters.sh` (the real module in real headless Chrome: the
@@ -9336,7 +9499,8 @@ Rigs are data. Every new sidecar field (`gait`, `tag`, `chains`, `clips`,
 `flipbooks`, `spring`, `severImpactSpeed`) is optional; `dummy.json` still
 works untouched, its `swingAmp`/`swingPhase` now running as a procedural layer
 *inside* the same pipeline rather than as a parallel code path.
-`assets/mobs/critter.*` (`scripts/gen_critter_mob.py`) is the worked example:
+`assets/mobs/critter.*` (editor-owned; `scripts/gen_critter_mob.py` was deleted
+2026-09-24 when it had stopped reproducing the file) is the worked example:
 a quadruped with two-segment legs (real two-bone IK), diagonal-pair gait
 groups, a spring tail and a masked flinch clip.
 
@@ -11720,6 +11884,17 @@ Every burning material carries a rain douse beside its extinguisher douse, and
 every combustion ignition is rain-damped (`reactions.json`'s RAIN note); snow
 does neither yet. `weather.rainTouchesWorld` off = the word is 0. Gated by
 `--gate rain-fire` (one leaf sheet, three pinned skies).
+
+ONE DEFINITION (rule-unification W1-B1, 2026-09-24): the condition arithmetic
+— the day/night/minLight phase gate, the douse's rain requirement, and the
+rain rescale — is `common.wgsl`'s `reactPhaseOpen` / `reactWeatherChance` /
+`reactGate`, called by `sim_step` (`lightMatches`, `rainChance`) and by
+`sim_gas` (`gasDecayProduct`, exposure true by construction). What each caller
+keeps is only its EXPOSURE answers. The CPU side (`materials.h`, which
+`reactcpu.h` and every body burner's `RainScaledChance` go through) is a
+token-for-token copy in a `MIRROR-BEGIN reactgate` block, and
+`check_invariants.py reactgate` compares the two streams and the `RCOND_*` /
+`RAIN_*` constants they read.
 
 **The word is sampled ONCE per tick.** The pin is a human input, so the
 authority latches the word at the head of the tick (`weather::LatchTickRain`,
@@ -14305,7 +14480,7 @@ MutationQueue:
     (`sim.fluidGravity`, substep-exact) and, when the asked-for flight time
     would launch over the CFL cap, at the nearest flight time that fits.
   - *In*: `ContainerScoopStream` spawns eight GHOST particles per scooped cell
-    (`FluidSpawnOp::species` bit 8, life in bits 16..23; `FP_GHOST` = attr bit
+    (`FluidSpawnOp::flags` bit 8, life in bits 16..23; `FP_GHOST` = attr bit
     23 in common.wgsl). The fluid surface draws them like any water and g2p
     homes them onto the vessel's mouth (target in `_r0.._r2`, death tick in
     `_r3`), but they are NOT MATTER: never booked in, no occupancy or stain
@@ -14975,6 +15150,33 @@ ghost's coat is stale until handoff; `WaterBodies()` is still keyed on the
 window origin (rule 1 below); the HUD has no net line (the `--frames` exit
 report is the readout). Every one of these is listed with its trigger in
 `docs/PLAN_multiplayer_m9.md`.
+
+**Player-on-player damage (W1-F, 2026-09-24; owner-side blasts at wave-1
+integration).** A sword or a grenade resolves on the ATTACKER's machine
+against every body that machine holds: NPCs, its own player, and the peer's
+ghost avatar, which is carved as presentation and never launched (the wire
+owns a ghost's position and its alive bit; `remoteplayer.cpp`). The explosion
+body pass (`ExplosionHitsBodies`) reaches every registered avatar through
+`MobSystem::CarveMobsRadial` / `BlastMobsRadial` / `AppendLiveLimbBodies`, so
+in-process players hit each other (gate `blast-players`). **A grenade also
+reaches the peer's REAL body**, with no protocol change: explosions travel in
+the merged op batch, `OpDelayQueue::Merge` reports the merged indices of the
+REMOTE ones (`remoteExpIdx`, as it does for brush ops), and phase N applies
+exactly those to this machine's own avatars at the landing tick
+(`RemoteExplosionsHitOwnAvatars` -> `ExplosionHitsBodies(..,
+BlastBodies::OwnAvatars)`: carve plus launch, no NPC, no debris, no ghost).
+Nothing is applied twice: the author's own blast is LOCAL in its merge (phase
+K hit its bodies when authored), and on the owner's machine the author is a
+ghost, which `OwnAvatars` skips. The gore follows the ghost rule: a ghost's
+carve spawns are discarded on the author's machine (`CarveMobsRadial`'s
+`ghostSpawns_`), and the owner's carve spawns are carried into its NEXT local
+batch (`TickAuthorityCtx::remoteBlastGore`, drained in phase L) because phase
+N runs after the outgoing batch was stored — pushed into the merged batch
+they would reach one GPU only. A remote crater's box is also marked modified
+in phase N, as a remote brush op's is. Still open: a peer's blast does not
+touch this machine's NPCs or debris (the author's machine applies it to its
+own), and melee has no op to ride, so an owner-side sword hit still needs a
+hit message.
 
 **M9 proper (`docs/PLAN_multiplayer_m9.md`, plan of record 2026-09-20).** The
 audit under-stated one number: the residency window is `kWorldN` ×

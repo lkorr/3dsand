@@ -712,3 +712,23 @@ Inherited, not from this work (fail identically on main 3d9be4b, recorded
 changed burn trajectory also leaves one floating pine-needle single, and it
 persists with main's reactions.json and main's sim_step.wgsl swapped in), and
 `waterbody` (pass H1 conservation +718 eighths).
+
+## 2026-09-24 — `709ec4b7` → `d2ea6c23` (rule unification wave 1, docs/PLAN_rule_unification_2026-09-24.md)
+
+Moved by W1-B1's matter rules: the MPM seam rolls each stainer's own
+per-mille stain chance through `common.wgsl` `stainStep`, applies `consume`,
+and pays for wetting absorbent ground; excited fluid runs its own reaction
+bucket (`excitedReact`). W1-A, W1-D, W1-C, W1-F reported `709ec4b7`
+unchanged; W1-B2's water is bit-identical (density ratio exactly 1.0). The
+integration's own changes (dead `sim.fluidStainRate`, species padding, a
+peer's explosion applied to the owner's avatar in phase N) touch no hashed
+state in a one-machine run. The twice-run comparison passed on the
+integration tree. Pinned with `--selftest --gate determinism --rebaseline`.
+Smoke probe tables were NOT re-pinned (no smoke runs for this wave).
+
+Red on the integration tree and NOT pinned: `fluid-identity` (W1-B2's gate,
+green in its own worktree). Arm A lost 1.04 cells of separation vs arm B's
+1.09 at t45, margin 0.40; both arms' live acid+water eighths fall over the
+run (A 9569 -> 7954, B 7164 -> 5643), which points at W1-B1's excited acid
+now running its own rules (stone/dissolvable erosion, acid `selfBecomes`
+air) inside the fixture. Needs a fixture decision, not a margin change.

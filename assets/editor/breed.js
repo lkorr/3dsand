@@ -182,8 +182,19 @@ function slotRGB(genome) {
   for (const [base, deps] of Object.entries(mg.COLOR_FAMILIES))
     for (const d of deps)
       out[mg.COLOR_SLOTS[d] - 127] = out[mg.COLOR_SLOTS[base] - 127];
+  // THE WISPS carry a fourth entry, their coverage 0..255 (mobgen.js
+  // wispColors). Both painters draw them see-through, as the game does.
+  for (const [slot, hex] of Object.entries(mg.wispColors(genome.colors))) {
+    const n = parseInt(hex.slice(1, 7), 16);
+    out[slot - 127] = [(n >> 16) & 255, (n >> 8) & 255, n & 255,
+                       parseInt(hex.slice(7, 9), 16)];
+  }
   return out;
 }
+
+/** Biased grid bytes whose slot is see-through: they hide nothing behind
+ *  them, so the face tests treat them as empty. */
+const SEE_THROUGH = new Set(Object.keys(mg.WISP_ALPHA).map(k => k - 127));
 
 /** The camera the tweak pane's preview starts at, and returns to on a
  *  double-click: roughly the three-quarter view the fixed painter below draws
@@ -218,7 +229,8 @@ function exposedFaces(b) {
           const X = x + gx0, Y = y + gy0, Z = z + gz0;
           for (let f = 0; f < 6; f++) {
             const n = FACES[f].n;
-            if (!at(X + n[0], Y + n[1], Z + n[2])) out.push(X, Y, Z, f, v);
+            const nb = at(X + n[0], Y + n[1], Z + n[2]);
+            if (!nb || SEE_THROUGH.has(nb)) out.push(X, Y, Z, f, v);
           }
         }
   }
@@ -318,6 +330,15 @@ export function drawOrbit(canvas, b, view = ORBIT_HOME) {
                   (faces[i + 2] + 0.5) * F[2];
     const col = rgb[faces[i + 4]] || [136, 136, 136];
     const r = col[0] * d.lit, g = col[1] * d.lit, bl = col[2] * d.lit;
+    // A wisp covers `alpha` of its pixels, picked by the same interleaved
+    // gradient noise microbody.wgsl uses, so the preview thins like the game.
+    const alpha = col[3] ?? 255;
+    const cellH = alpha < 255
+      ? (((faces[i] * 73856093) ^ (faces[i + 1] * 19349663) ^
+          (faces[i + 2] * 83492791)) >>> 0) % 65536 / 65536 : 0;
+    const covers = (qx, qy) => alpha >= 255 ||
+      ((52.9829189 * ((0.06711056 * qx + 0.00583715 * qy) % 1)) % 1 + cellH) % 1 *
+        255 < alpha;
     const X0 = Math.max(0, Math.floor(sx + d.x0));
     const X1 = Math.min(W - 1, Math.ceil(sx + d.x1));
     const Y0 = Math.max(0, Math.floor(sy0 + d.y0));
@@ -331,7 +352,7 @@ export function drawOrbit(canvas, b, view = ORBIT_HOME) {
         const v = (d.ax * qy - d.ay * qx) / d.det;
         if (u < -E || u > 1 + E || v < -E || v > 1 + E) continue;
         hit = true;
-        plot(py * W + qx0, depth, r, g, bl);
+        if (covers(qx0, py)) plot(py * W + qx0, depth, r, g, bl);
       }
     }
     // Zoomed out, a face can fall between pixel centres. It still owns the
@@ -403,9 +424,11 @@ export function drawBody(canvas, b, opts = {}) {
   const face = [[], [], []];              // 0 = top, 1 = front, 2 = side
   slotRGB(b.genome).forEach((rgb, i) => {
     if (!rgb) return;
+    const a = (rgb[3] ?? 255) / 255;
     const sh = f => {
       const c = v => Math.max(0, Math.min(255, Math.round(v * f)));
-      return `rgb(${c(rgb[0])},${c(rgb[1])},${c(rgb[2])})`;
+      return a < 1 ? `rgba(${c(rgb[0])},${c(rgb[1])},${c(rgb[2])},${a.toFixed(2)})`
+                   : `rgb(${c(rgb[0])},${c(rgb[1])},${c(rgb[2])})`;
     };
     face[0][i] = sh(1.0);
     face[1][i] = sh(0.84);
@@ -893,8 +916,38 @@ function mayDiscard(what) {
   return confirm(`"${S.name}" has unsaved edits.\n\n${what} and lose them?`);
 }
 
+/** Every scrollable box render() rebuilds, by selector. A rebuild replaces the
+ *  DOM wholesale, so without this a pick in the gene list (a hair style, a
+ *  pin, a bool) threw the list back to the top under the mouse. The page's
+ *  own scrolling ancestors survive the rebuild but are reset by the height
+ *  collapsing to nothing for a moment, so they are carried too. */
+const SCROLLERS = ['.genes', '.pool', '.litter', '.bcol'];
+
+function captureScroll() {
+  const out = { own: [], up: [] };
+  for (const sel of SCROLLERS)
+    root.querySelectorAll(sel).forEach((e, i) =>
+      out.own.push([sel, i, e.scrollTop, e.scrollLeft]));
+  for (let e = root.parentElement; e; e = e.parentElement)
+    out.up.push([e, e.scrollTop]);
+  return out;
+}
+
+function restoreScroll(s) {
+  for (const [sel, i, top, left] of s.own) {
+    const e = root.querySelectorAll(sel)[i];
+    if (e) { e.scrollTop = top; e.scrollLeft = left; }
+  }
+  for (const [e, top] of s.up) e.scrollTop = top;
+}
+
 function render() {
   if (!root) return;
+  const scroll = captureScroll();
+  try { renderPage(); } finally { restoreScroll(scroll); }
+}
+
+function renderPage() {
   root.textContent = '';
   // The one line that says what the three columns are FOR. The page is a loop
   // -- roll, judge, breed, save -- and nothing on screen said so; you were
