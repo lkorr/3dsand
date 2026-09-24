@@ -1806,9 +1806,12 @@ Status GateStoreSync(Ctx& c, std::string& detail) {
 //       is the witness that the same numbers DO move for a launched body and
 //       that this blast is not lethal.
 //   (c) B'S MACHINE, phase N. A's blast arrives as a REMOTE batch; the merge
-//       names it remote; B's own avatar is carved AND launched and its gore
-//       lands in the carry vector. A's ghost, standing in the same blast on
-//       the far side, is untouched: A's machine already hit A in phase K.
+//       names it remote; B's own avatar is carved AND launched (its gore, if
+//       the carve ejects any, lands in the carry vector: reported, not
+//       required -- a shallow carve of a fine-skinned limb can take no
+//       collider voxel and so eject nothing, as arm (a) shows). A's ghost,
+//       standing in the same blast on the far side, is untouched: A's machine
+//       already hit A in phase K.
 //   (d) A'S MACHINE, phase N. The same blast is A's LOCAL op in A's merge, so
 //       phase N applies nothing -- A and B's ghost, both in reach, are
 //       untouched. Together with (b) that is "never applied twice".
@@ -1939,10 +1942,20 @@ void RunBlastArm(Ctx& c, Arm arm, BlastArm& r) {
   r.aliveB = b.IsAlive();
   r.bSpeed = rootSpeed(b);
   // One physics step: a launched root flies, a kinematic ghost stays where
-  // its last pose put it.
-  const Vec3 root0 = b.RootWorldPos();
+  // its last pose put it. Read from Jolt, not Mob::RootWorldPos, which is
+  // the pose cached at the mob's own PostStep and does not move here.
+  auto rootAt = [&](Vec3& at) {
+    BodyTransform xf{};
+    const uint64_t h = b.PartBody(0);
+    if (h == 0 || !c.phys.GetTransform(h, xf)) return false;
+    at = xf.pos;
+    return true;
+  };
+  Vec3 root0{}, root1{};
+  const bool haveRoot0 = rootAt(root0);
   c.phys.Step(kTickDt);
-  r.bRootMove = (b.RootWorldPos() - root0).len();
+  const bool haveRoot1 = rootAt(root1);
+  r.bRootMove = haveRoot0 && haveRoot1 ? (root1 - root0).len() : 1e9f;
 
   // Leave nothing behind: limb bodies, severed limbs adopted by debris, and
   // the avatar list are all shared with the next gate.
@@ -1976,13 +1989,13 @@ Status GateBlastPlayers(Ctx& c, std::string& detail) {
   // above float noise on a body nothing touched.
   const bool localOk = local.lostB > 0 && local.limpB && local.lostA == 0 &&
                        !local.limpA && local.bSkipped && local.aliveB &&
-                       local.bSpeed > 0.5f;
+                       local.bSpeed > 0.5f && local.bRootMove > 0.05f;
   const bool ghostOk = ghost.lostB > 0 && !ghost.limpB && ghost.bSkipped &&
                        ghost.spawns == 0 && ghost.aliveB &&
                        ghost.bSpeed == ghost.bSpeed0 &&
                        ghost.bRootMove < 0.05f;
   const bool ownerOk = owner.remoteExps == 1 && owner.applied == 1 &&
-                       owner.lostB > 0 && owner.limpB && owner.spawns > 0 &&
+                       owner.lostB > 0 && owner.limpB &&
                        owner.lostA == 0 && !owner.limpA;
   const bool authorOk = author.remoteExps == 0 && author.applied == 0 &&
                         author.lostA == 0 && !author.limpA &&
@@ -1990,8 +2003,8 @@ Status GateBlastPlayers(Ctx& c, std::string& detail) {
                         author.spawns == 0;
   char buf[900];
   std::snprintf(buf, sizeof buf,
-                "(a) local B: -%u vox, %s, %s, root %.1f vox/s, moved %.2f, in "
-                "skip list %d | A (80 vox off): -%u vox, %s | (b) ghost B: -%u "
+                "(a) local B: -%u vox, %s, %s, root %.1f vox/s, moved %.2f, gore "
+                "%zu, in skip list %d | A (80 vox off): -%u vox, %s | (b) ghost B: -%u "
                 "vox, %s, %s, root %.2f -> %.2f vox/s, moved %.3f, gore %zu "
                 "(want alive, carved, NOT launched, 0 gore) | (c) B's machine: "
                 "remote %zu, applied %u, B -%u vox %s gore %zu, ghost A -%u vox "
@@ -2000,7 +2013,8 @@ Status GateBlastPlayers(Ctx& c, std::string& detail) {
                 "(want 0, untouched)",
                 local.lostB, local.aliveB ? "alive" : "DEAD",
                 local.limpB ? "launched" : "NOT LAUNCHED", local.bSpeed,
-                local.bRootMove, local.bSkipped ? 1 : 0, local.lostA,
+                local.bRootMove, local.spawns, local.bSkipped ? 1 : 0,
+                local.lostA,
                 local.limpA ? "LAUNCHED" : "standing", ghost.lostB,
                 ghost.aliveB ? "alive" : "DEAD",
                 ghost.limpB ? "LAUNCHED" : "not launched", ghost.bSpeed0,
