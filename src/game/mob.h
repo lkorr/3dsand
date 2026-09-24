@@ -1744,7 +1744,7 @@ class Mob {
   // Worn pieces and the held item as the record (v6) and the announce list
   // them: identity-shell dye, CaptureWorn damage, IN RIG-SLOT ORDER so that
   // replaying the list (MobSystem::ApplyWireGear) appends the same slots in
-  // the same places. The same walk as MobSystem::BuildAnnounce's gear half.
+  // the same places. MobSystem::BuildAnnounce's gear list IS this call.
   void CaptureGear(std::vector<::net::WireGear>& out) const;
   // ---- IS THIS LIMB EXACTLY WHAT ITS DEF AUTHORED? (MOBS v4) ----------------
   //

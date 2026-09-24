@@ -11512,6 +11512,10 @@ Status GateMobHandoff(Ctx& c, std::string& detail) {
 //      piece: after a MobState lands, every rig slot on B has a body iff it
 //      does on A and holds the same number of voxels, B's gear list equals
 //      A's, and the severed limb exists on B as ghost debris.
+//   H. A CORPSE CHANGES HANDS (P3). A's dead Mob handed to B (TakeHandoff ->
+//      ApplyHandoff, the MOBS v6 record) is local and dead on B with every rig
+//      slot the size it was on A, A holds a dead ghost; handed back, A has its
+//      corpse again, local and dead, same slots.
 //   D. EVICTION IS A GONE. A's dead cap decays the corpse (the oldest of
 //      kMaxDeadMobs + 1): A sends MobGone(kGoneEvicted), B drops the ghost Mob,
 //      and every limb body A's debris adopted is on B as a ghost body.
@@ -11803,6 +11807,64 @@ Status GateNetCorpse(Ctx& c, std::string& detail) {
                            slotWhy.empty() && gearSame &&
                            (!looted || gearA >= 0) && ghostBodiesAfterCut > 0;
 
+  // ======== H: the corpse changes hands and comes back (P3) ===============
+  // A dead Mob is handed over like a living one: the record (MOBS v6) says
+  // dead, so B's ApplyHandoff enters the dead state on the rig B already held
+  // as a ghost -- local on B, dead, rig kept, every slot the same size -- and
+  // A holds a dead ghost. B steps it as its own corpse for a few ticks (what
+  // it authors then is its own and is not counted in "B authored"), then
+  // hands it back, and A has its corpse again: local, dead, same slots.
+  bool hOut = false, hBack = false;
+  int hSlotsB = -1, hSlotsA = -1, hMismatch = 0;
+  {
+    std::vector<uint32_t> vox0;
+    int n0 = 0;
+    if (const Mob* ma = c.mobs.FindMobById(subject)) {
+      n0 = ma->LimbCount();
+      for (int li = 0; li < n0; li++)
+        vox0.push_back(c.mobs.LimbBody(subject, li)
+                           ? c.mobs.LimbArtVoxelCount(subject, li) : 0u);
+    }
+    auto sameSlots = [&](MobSystem& sys, int& slots) {
+      const Mob* m = sys.FindMobById(subject);
+      slots = m ? m->LimbCount() : -1;
+      if (m == nullptr || slots != n0) return false;
+      bool same = true;
+      for (int li = 0; li < n0; li++) {
+        const uint32_t v =
+            sys.LimbBody(subject, li) ? sys.LimbArtVoxelCount(subject, li) : 0u;
+        if (v != vox0[(size_t)li]) {
+          same = false;
+          hMismatch++;
+        }
+      }
+      return same;
+    };
+    ::net::MobHandoff h;
+    if (n0 > 0 && c.mobs.TakeHandoff(subject, kPeer, h)) {
+      const uint64_t authoredWas = farAuthored;
+      const Mob* nb = far.ApplyHandoff(h);
+      const Mob* ga = c.mobs.FindMobById(subject);
+      hOut = nb != nullptr && !nb->IsGhost() && !nb->Alive() &&
+             !nb->RigReleased() && sameSlots(far, hSlotsB) && ga != nullptr &&
+             ga->IsGhost() && !ga->Alive() && !ga->RigReleased();
+      for (int i = 0; i < 4; i++) step();
+      farAuthored = authoredWas;
+      const Mob* stillB = far.FindMobById(subject);
+      hOut = hOut && stillB != nullptr && !stillB->IsGhost() && !stillB->Alive();
+      ::net::MobHandoff back;
+      if (far.TakeHandoff(subject, 0, back)) {
+        const Mob* na = c.mobs.ApplyHandoff(back);
+        const Mob* gb = far.FindMobById(subject);
+        hBack = na != nullptr && !na->IsGhost() && !na->Alive() &&
+                !na->RigReleased() && sameSlots(c.mobs, hSlotsA) &&
+                gb != nullptr && gb->IsGhost() && !gb->Alive();
+      }
+    }
+    for (int i = 0; i < 4; i++) step();
+  }
+  const bool handoffOk = hOut && hBack;
+
   // ======== D: the dead cap evicts, and the peer gets debris ==============
   std::vector<uint64_t> rigBodies;
   for (int li = 0; li < 256; li++) {
@@ -11843,8 +11905,8 @@ Status GateNetCorpse(Ctx& c, std::string& detail) {
   const bool deathOk = announcedAlive && diedOnA && deadOnB &&
                        ghostBodiesAtDeath == 0 && deathGones == 0 && lootA &&
                        !lootB && trackSamples > 0 && trackErr <= trackTol;
-  const bool ok = deathOk && cheap && cutReflects && evictReflects &&
-                  farAuthored == 0;
+  const bool ok = deathOk && cheap && cutReflects && handoffOk &&
+                  evictReflects && farAuthored == 0;
   detail = Format(
       "A death: announced alive %d, died on A %d, dead ghost on B %d, ghost "
       "bodies %u (need 0), death gones %d (need 0), lootable A %d / B %d, "
@@ -11852,7 +11914,9 @@ Status GateNetCorpse(Ctx& c, std::string& detail) {
       "(cap %d)%s%s, then %d ticks: %llu poses for it (cap %llu), %llu skipped, "
       "stayed asleep %d, ghost survived the %u-tick expiry %d | C carved %u "
       "vox, severed slot %d, looted %d; %d slots compared%s%s, gear %d/%d "
-      "same %d, ghost bodies on B %u | D %d more dead, evicted on A %d, "
+      "same %d, ghost bodies on B %u | H handed to B %d (%d slots), back to "
+      "A %d (%d slots), %d slot size mismatches | D %d more dead, evicted on "
+      "A %d, "
       "evict gones %d, ghost dropped %d, %u/%zu rig bodies on B as ghost "
       "debris | B authored %llu | wire: states %llu out/%llu in, poses %llu "
       "out, max batch %zu B, max state record %zu B",
@@ -11865,7 +11929,7 @@ Status GateNetCorpse(Ctx& c, std::string& detail) {
       ::net::kGhostExpiryTicks, survivedExpiry ? 1 : 0, carved, severed,
       looted ? 1 : 0, slotsCompared, slotWhy.empty() ? "" : " FIRST DIFF ",
       slotWhy.c_str(), gearA, gearB, gearSame ? 1 : 0, ghostBodiesAfterCut,
-      newDead, evictedOnA ? 1 : 0, evictGones, ghostDropped ? 1 : 0,
+      hOut ? 1 : 0, hSlotsB, hBack ? 1 : 0, hSlotsA, hMismatch, newDead, evictedOnA ? 1 : 0, evictGones, ghostDropped ? 1 : 0,
       bodiesOnB, rigBodies.size(), (unsigned long long)farAuthored,
       (unsigned long long)sa.statesOut, (unsigned long long)sb.statesIn,
       (unsigned long long)sa.posesOut, wireBytesMax, stateBytesMax);

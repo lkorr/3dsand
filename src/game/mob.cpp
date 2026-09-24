@@ -20837,8 +20837,8 @@ static const char* InternDeathCause(const std::string& name) {
 
 void Mob::CaptureGear(std::vector<::net::WireGear>& out) const {
   out.clear();
-  // MobSystem::BuildAnnounce's gear walk, exactly: identity-shell dye,
-  // CaptureWorn damage, a piece whose identity shell is gone stays gone, and
+  // THE gear walk (MobSystem::BuildAnnounce and the v6 record both call
+  // it): identity-shell dye, CaptureWorn damage, a piece whose identity shell is gone stays gone, and
   // sorted by the slot each piece's shell occupies so a replay appends the
   // same rig slots in the same places.
   std::vector<std::pair<int, ::net::WireGear>> bySlot;
@@ -20974,7 +20974,10 @@ void Mob::SaveOne(ByteWriter& w, uint32_t version) const {
   // that came back from a save without his breastplate was the same bug seen
   // from the other side. By NAME (item.h's index hazard), rig-slot order.
   const bool dead = !alive_;
-  w.U32(dead ? 1u : 0u);
+  // Flags: bit 0 dead, bit 1 a PLAYER'S corpse (P3: not lootable -- the kit
+  // lives on the session -- and re-numbered into the player-corpse id band on
+  // load, MobSystem::LoadOne). Bit 1 is only ever set with bit 0.
+  w.U32((dead ? 1u : 0u) | (dead && playerCorpse_ ? 2u : 0u));
   // The NAME of every appended slot written above, in order: the loader lines
   // the record's slots up with the re-dressed rig's BY NAME (a shell is
   // `worn:<item>:<host>`, a held item `item:<name>`), because a piece that
@@ -21090,6 +21093,7 @@ struct MobSystem::MobRecord {
   std::vector<std::string> appendedNames;   // the record's appended slots
   std::vector<::net::WireGear> gear;
   bool dead = false;
+  bool playerCorpse = false;   // flags bit 1: a player's corpse (Mob::PlayerCorpse)
   std::string deathCause;
   uint64_t deathSeq = 0;
   bool haveRise = false;
@@ -21195,11 +21199,12 @@ bool MobSystem::ReadMobRecord(ByteReader& r, MobRecord& out, uint32_t version) {
     uint32_t flags = 0;
     r.U32(flags);
     // An unknown flag is a record this build cannot read correctly.
-    if (flags > 1u) {
+    if (flags > 3u) {
       r.ok = false;
       return false;
     }
     out.dead = (flags & 1u) != 0;
+    out.playerCorpse = out.dead && (flags & 2u) != 0;
     uint32_t nApp = 0;
     r.U32(nApp);
     if (!r.ok || nApp > out.limbs.size()) {
@@ -21550,6 +21555,23 @@ Mob* MobSystem::LoadOne(ByteReader& r, uint32_t version, bool placeLimbs,
   OverlayMobRecord(*m, rec, placeLimbs || rec.dead);
   m = FindMobById(id);
   if (m == nullptr || !rec.dead) return m;
+  // A PLAYER'S CORPSE COMES BACK IN ITS OWN ID BAND (P3). Ids are not saved,
+  // so Spawn just spent an NPC id on it; handing that back keeps nextId_ where
+  // the session that wrote the save had it (AdoptDeadAvatar's reason: a
+  // player's death must not renumber every creature spawned after it), and a
+  // fresh sequence number keeps playerCorpseSeq_ ahead of every corpse id this
+  // system holds -- the loaded ones included.
+  if (rec.playerCorpse) {
+    if (nextId_ == id + 1) nextId_ = id;
+    uint64_t cid = 0;
+    do {
+      cid = kPlayerCorpseIdBase | ((uint64_t)localPlayerId_ << 40) |
+            (++playerCorpseSeq_ & ((1ull << 40) - 1));
+    } while (FindMobById(cid) != nullptr);
+    m->id_ = cid;
+    m->gore_ = Mob::MakeGoreProfile(cid);
+    id = cid;
+  }
   EnterLoadedDead(*m, rec);
   return FindMobById(id);
 }
@@ -21563,6 +21585,7 @@ Mob* MobSystem::LoadOne(ByteReader& r, uint32_t version, bool placeLimbs,
 // dynamic exactly as Die flips them (EnterDeadRagdoll).
 void MobSystem::EnterLoadedDead(Mob& m, const MobRecord& rec) {
   m.alive_ = false;
+  m.playerCorpse_ = rec.playerCorpse;
   m.deathCause_ = InternDeathCause(rec.deathCause);
   // DEATH ORDER is kept, and the counter is lifted past it (max, never
   // assignment) so every later death is younger than every loaded one. A
@@ -21642,12 +21665,9 @@ void MobSystem::RefreshOwnership() {
   if (!ownershipFn_) return;
   for (Mob& m : mobs_) {
     if (m.def_ == nullptr) continue;
-    // A CORPSE KEEPS THE OWNER IT DIED WITH. It is streamed (P2c) but not
-    // handed over: the handoff record cannot say "dead" until MOBS v6 (P2a),
-    // so a flip here would make the far side's ghost corpse local with nobody
-    // having sent it the record — or this machine's corpse a ghost nobody
-    // poses. net::EntitySync::ScanHandoffs skips the dead for the same reason.
-    if (!m.alive_) continue;
+    // THE DEAD FLIP LIKE THE LIVING (P3): the handoff record is MOBS v6,
+    // which says "dead", and ApplyHandoff enters the dead state from it
+    // (EnterLoadedDead), so a corpse changes hands like any creature.
     // A CREATURE I HAVE NEVER HELD IS NOT MINE TO CLAIM (mob.h's note on
     // `announceOnly_`). The announce carries no record, so promoting it here
     // would step a pristine copy of a creature the peer is also stepping --
@@ -21748,43 +21768,15 @@ bool MobSystem::BuildAnnounce(uint64_t mobId, ::net::MobAnnounce& out) const {
   out.id = m->id_;
   out.defName = defs_[m->defIndex_].name;
   out.owner = m->owner_;
-  // ---- ITS KIT, read exactly the way a rising reads it ---------------------
+  // ---- ITS KIT, in RIG-SLOT ORDER (Mob::CaptureGear) ------------------------
   //
-  // The identity shell carries the dye, CaptureWorn carries the damage (the
-  // walk in Mob::Die, and the comment there explains why there are two walks
-  // and not one). A piece whose identity shell is gone stays gone: the panel
-  // that IS the piece came off with the arm it was on.
-  //
-  // IN RIG-SLOT ORDER, which is what makes the far side's replay line up.
-  // Wearing and holding APPEND rig slots, so the limb indices in the per-mob
-  // record only mean the same thing on both machines if the pieces are
-  // re-applied in the order their slots were appended. Sorting by the
-  // identity shell's slot index reproduces that order whatever sequence the
-  // creature was dressed in — a duelist handed a sword at spawn and a
-  // breastplate an hour later must not arrive with the two transposed.
-  std::vector<std::pair<int, ::net::WireGear>> bySlot;
-  for (size_t pi = 0; pi < m->worn_.size(); pi++) {
-    const Mob::WornPiece& p = m->worn_[pi];
-    const int idSlot = m->IdentityShellOf((int)pi);
-    if (idSlot < 0 || idSlot >= (int)m->limbs_.size() || !m->limbs_[idSlot].body)
-      continue;
-    ::net::WireGear g;
-    g.item = p.item;
-    g.equipSlot = p.equipSlot;
-    g.dye = m->limbs_[idSlot].dye;
-    m->CaptureWorn(p.equipSlot, g.damage);
-    bySlot.emplace_back(idSlot, std::move(g));
-  }
-  if (m->heldSlot_ >= 0 && m->heldSlot_ < (int)m->limbs_.size() &&
-      m->limbs_[m->heldSlot_].body && !m->heldItem_.empty()) {
-    ::net::WireGear g;
-    g.item = m->heldItem_;
-    g.held = 1;
-    bySlot.emplace_back(m->heldSlot_, std::move(g));
-  }
-  std::stable_sort(bySlot.begin(), bySlot.end(),
-                   [](const auto& a, const auto& b) { return a.first < b.first; });
-  for (auto& e : bySlot) out.gear.push_back(std::move(e.second));
+  // The identity shell carries the dye, CaptureWorn the damage, and a piece
+  // whose identity shell is gone stays gone. Rig-slot order is what makes the
+  // far side's replay line up: wearing and holding APPEND rig slots, so the
+  // limb indices in the per-mob record only mean the same thing on both
+  // machines if the pieces are re-applied in the order their slots were
+  // appended. The save record (MOBS v6) writes the same list.
+  m->CaptureGear(out.gear);
   return true;
 }
 
@@ -21884,6 +21876,29 @@ bool MobSystem::TakeHandoff(uint64_t mobId, uint32_t newOwner,
   // owner's first MobPose arrives — the handoff is invisible.
   m->owner_ = newOwner;
   if (BuildPose(mobId, tick_, m->ghostPose_)) m->haveGhostPose_ = true;
+  // ---- A CORPSE HANDED OVER (P3) ---------------------------------------
+  //
+  // Its rising went with the record (SaveOne writes the booking, and the new
+  // owner's EnterLoadedDead books it), so it is withdrawn here exactly as a
+  // park withdraws it: two machines holding one booking would raise two
+  // creatures from one grave. And its limbs stop being Jolt's: a ghost is
+  // PLACED from the stream (TickGhost moves kinematic bodies), which a
+  // dynamic limb would fight under gravity every tick.
+  if (!m->alive_) {
+    for (size_t k = 0; k < rises_.size();)
+      if (rises_[k].mobId == mobId) {
+        rises_[k] = std::move(rises_.back());
+        rises_.pop_back();
+      } else {
+        k++;
+      }
+    if (phys_ != nullptr)
+      for (MobLimb& l : m->limbs_)
+        if (l.body && l.holdSeconds <= 0 && l.wornHost < 0)
+          phys_->SetBodyKinematic(l.body, true);
+    m->deadAsleep_ = false;
+    m->deadQuiet_ = 0;
+  }
   return true;
 }
 
@@ -22065,8 +22080,13 @@ Mob* MobSystem::ApplyHandoff(const ::net::MobHandoff& h) {
         explicit LoadGuard(bool& b) : f(b) { f = true; }
         ~LoadGuard() { f = false; }
       } loadGuard(loading_);
+      // A dead record is spawned past the living cap, LoadOne's rule: a
+      // corpse holds no living slot (the dead cap decays the oldest instead).
+      const bool wasDead = spawnDead_;
+      spawnDead_ = rec.dead;
       spawned = Spawn(defIndex, {ifloor(rec.origin.x), ifloor(rec.origin.y),
                                  ifloor(rec.origin.z)});
+      spawnDead_ = wasDead;
     }
     if (spawned == 0) {
       std::printf("mob: could not spawn handed-over '%s'\n",
@@ -22124,6 +22144,18 @@ Mob* MobSystem::ApplyHandoff(const ::net::MobHandoff& h) {
   m->ai_.targetPos = h.brain.targetPos;
   m->ai_.lastSeenPos = h.brain.lastSeenPos;
   m->ai_.lastSeenTick = h.brain.lastSeenTick;
+  // ---- A CORPSE ARRIVES DEAD (P3) ---------------------------------------
+  //
+  // The save loader's path, not Die(): no death cry, no OnDying, the cause,
+  // death order and any booked rising from the record, the limbs flipped
+  // dynamic on the pose they were placed on above. A ghost corpse this
+  // machine already held dead (EnterGhostDeath) goes through it too -- its
+  // limbs were kinematic, posed by the stream, and are Jolt's from here.
+  if (rec.dead) {
+    EnterLoadedDead(*m, rec);
+    m = FindMobById(h.announce.id);
+    if (m == nullptr) return nullptr;
+  }
   instancesDirty_ = true;
   return m;
 }

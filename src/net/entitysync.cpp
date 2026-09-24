@@ -313,12 +313,8 @@ void EntitySync::ScanHandoffs(MobSystem& mobs, DebrisSystem& debris,
     const Mob* m = mobs.MobAt(i);
     if (m == nullptr || m->Def() == nullptr) continue;
     if (m->IsGhost()) continue;   // not mine to give away
-    // A CORPSE IS NOT HANDED OVER (yet). It IS on the wire (P2c: posed with
-    // alive = 0, its shape in MobState), but the handoff's record is
-    // Mob::SaveOne, which until MOBS v6 (P2a) cannot say "dead" — the far side
-    // would stand a living creature up out of it. So a dead Mob stays with the
-    // machine it died on, and MobSystem::RefreshOwnership agrees.
-    if (!m->Alive()) continue;
+    // THE DEAD ARE HANDED OVER TOO (P3): the record is MOBS v6, which says
+    // "dead", and MobSystem::ApplyHandoff enters the dead state from it.
     // The FEET, the same point MobSystem::RefreshOwnership asks about — a
     // different anchor here would compute a different owner than the system
     // is about to, and the handoff would name the wrong machine.

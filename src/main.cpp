@@ -8039,6 +8039,8 @@ int main(int argc, char** argv) {
       t.announcesOut += s.announcesOut;   t.announcesIn += s.announcesIn;
       t.posesOut += s.posesOut;           t.posesIn += s.posesIn;
       t.handoffsOut += s.handoffsOut;     t.handoffsIn += s.handoffsIn;
+      t.statesOut += s.statesOut;         t.statesIn += s.statesIn;
+      t.posesAsleep += s.posesAsleep;
       t.gonesOut += s.gonesOut;           t.gonesIn += s.gonesIn;
       t.takesOut += s.takesOut;           t.takesIn += s.takesIn;
       t.grantsOut += s.grantsOut;         t.grantsIn += s.grantsIn;
@@ -14529,6 +14531,7 @@ int main(int argc, char** argv) {
       const net::EntitySync::Counters& s = entities.Stats();
       std::printf(
           "net: entities: announces out=%llu in=%llu | poses out=%llu in=%llu "
+          "asleep=%llu | states out=%llu in=%llu "
           "| handoffs out=%llu in=%llu | gones out=%llu in=%llu | ghosts "
           "now=%u max=%u expired=%llu | items takes=%llu/%llu grants=%llu/%llu "
           "| misses=%llu | entityBatches out=%llu in=%llu\n",
@@ -14536,6 +14539,9 @@ int main(int argc, char** argv) {
           (unsigned long long)(netEnt.announcesIn + s.announcesIn),
           (unsigned long long)(netEnt.posesOut + s.posesOut),
           (unsigned long long)(netEnt.posesIn + s.posesIn),
+          (unsigned long long)(netEnt.posesAsleep + s.posesAsleep),
+          (unsigned long long)(netEnt.statesOut + s.statesOut),
+          (unsigned long long)(netEnt.statesIn + s.statesIn),
           (unsigned long long)(netEnt.handoffsOut + s.handoffsOut),
           (unsigned long long)(netEnt.handoffsIn + s.handoffsIn),
           (unsigned long long)(netEnt.gonesOut + s.gonesOut),

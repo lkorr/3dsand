@@ -48,11 +48,13 @@
 
 #include <algorithm>
 #include <climits>
+#include <cstring>
 #include <cmath>
 #include <chrono>
 #include <cstdio>
 #include <functional>
 #include <map>
+#include <set>
 #include <string>
 #include <unordered_map>
 #include <unordered_set>
@@ -7102,9 +7104,42 @@ Status GatePlayerCorpse(Ctx& c, std::string& detail) {
   const bool eOk = corpseBodies > 0 && onAvatarLayer == 0;
   const uint64_t adopted = c.mobs.AdoptedAvatarsTotal() - adopted0;
   const uint64_t avatarId = av.Id();
+
+  // ======== F. saved and loaded, still the player's (P3) ====================
+  // MOBS v6 flags bit 1: a loaded player corpse is still PlayerCorpse(), still
+  // not lootable, back in the player-corpse id band on distinct ids, and the
+  // load spent no NPC id on it (nextId_ moves only by the other records).
+  int pcSaved = 0, pcLoaded = 0, pcLootable = 0, pcOffBand = 0;
+  uint32_t records = 0;
+  uint64_t idSpent = 0;
+  std::set<uint64_t> pcIds;
+  {
+    for (uint32_t i = 0; i < c.mobs.MobCount(); i++)
+      if (const Mob* m = c.mobs.MobAt(i); m && !m->Alive() && m->PlayerCorpse())
+        pcSaved++;
+    std::vector<uint8_t> buf;
+    c.mobs.SaveState(buf);
+    if (buf.size() >= 4) std::memcpy(&records, buf.data(), 4);
+    c.mobs.Reset(/*rewindIds=*/false);
+    const uint64_t next0 = c.mobs.NextIdCounter();
+    c.mobs.LoadState(buf.data(), buf.size(), MobSystem::kSaveVersion);
+    idSpent = c.mobs.NextIdCounter() - next0;
+    for (uint32_t i = 0; i < c.mobs.MobCount(); i++) {
+      const Mob* m = c.mobs.MobAt(i);
+      if (m == nullptr || m->Alive() || !m->PlayerCorpse()) continue;
+      pcLoaded++;
+      pcIds.insert(m->Id());
+      if (m->Lootable()) pcLootable++;
+      if (((m->Id() >> 61) & 1u) == 0) pcOffBand++;   // kPlayerCorpseIdBase
+    }
+  }
+  const bool fOk = pcSaved == 2 && pcLoaded == pcSaved &&
+                   (int)pcIds.size() == pcLoaded && pcLootable == 0 &&
+                   pcOffBand == 0 &&
+                   idSpent == (uint64_t)records - (uint64_t)pcLoaded;
   cleanup();
   RecordObserved("playerCorpseSleepTicks", (double)asleepAt);
-  const bool ok = a1 && b1 && a2 && b2 && asleepAt >= 0 && dOk && eOk;
+  const bool ok = a1 && b1 && a2 && b2 && asleepAt >= 0 && dOk && eOk && fOk;
   detail = Format(
       "site inset %d | death 1 %s: corpse id %llu (avatar %llu), %u/%zu "
       "handles kept, drift %.1f (cap %.1f), lootable %d, husk bodies %d | "
@@ -7114,7 +7149,9 @@ Status GatePlayerCorpse(Ctx& c, std::string& detail) {
       "%u (hot %u at death) -> %u hot, %u of %u live on the corpse | respawn "
       "2 %s: %d/%d parts, %d aliased, adopted %llu | C: clean corpse asleep "
       "after %d ticks (cap %d)%s; wounded corpse then: '%s' | D %s: owner %d, "
-      "cut took %u, woke %d | E %s: %d/%d corpse bodies on the avatar layer",
+      "cut took %u, woke %d | E %s: %d/%d corpse bodies on the avatar layer "
+      "| F %s: saved %d player corpses in %u records, loaded %d (%zu distinct "
+      "ids, %d off the band, %d lootable), NPC ids spent %llu",
       inset, a1 ? "PASS" : "FAIL", (unsigned long long)cid,
       (unsigned long long)avatarId, kept1, handles1.size(), (double)drift1,
       (double)maxDrift, lootable1, husk1, b1 ? "PASS" : "FAIL", whole1, nBase,
@@ -7126,7 +7163,9 @@ Status GatePlayerCorpse(Ctx& c, std::string& detail) {
       aliased2, (unsigned long long)adopted, asleepAt, maxTicks,
       awakeWhy.c_str(), wounded.c_str(), dOk ? "PASS" : "FAIL",
       reached ? 1 : 0, took, woke ? 1 : 0, eOk ? "PASS" : "FAIL",
-      onAvatarLayer, corpseBodies);
+      onAvatarLayer, corpseBodies, fOk ? "PASS" : "FAIL", pcSaved, records,
+      pcLoaded, pcIds.size(), pcOffBand, pcLootable,
+      (unsigned long long)idSpent);
   return ok ? Status::Pass : Status::Fail;
 }
 
