@@ -298,7 +298,7 @@ const char* const kOrder[] = {
     // disturbs a neighbour.
     "pond-shore",
     "evaporation", "wind",      "wind-gas",   "wind-prim",
-    "blood-stain", "flung-liquid", "fluid-det",     "fluid-settle",
+    "blood-stain", "flung-liquid", "fluid-det",     "fluid-identity", "fluid-settle",
     "fluid-excite", "fluid-onwater", "debris-float", "fluid-stain", "fluid-react", "fluid-self-react", "far-fog",  "far-downsample",
     "far-persist",
     // `shadow-cache` recompiles raymarch.wgsl three times (its three arms are

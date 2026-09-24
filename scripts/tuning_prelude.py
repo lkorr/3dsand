@@ -48,10 +48,6 @@ SPEC = [
     # night sky
     ("render", "nightZenith", "TUNE_NIGHT_ZENITH", "v3", [0.006, 0.01, 0.028]),
     ("render", "nightHorizon", "TUNE_NIGHT_HORIZON", "v3", [0.03, 0.036, 0.062]),
-    ("render", "fluidColor", "TUNE_FLUID_COLOR", "v3", [0.2, 0.42, 0.85]),
-    ("render", "fluidColor1", "TUNE_FLUID_COLOR1", "v3", [0.92, 0.34, 0.1]),
-    ("render", "fluidColor2", "TUNE_FLUID_COLOR2", "v3", [0.22, 0.78, 0.28]),
-    ("render", "fluidColor3", "TUNE_FLUID_COLOR3", "v3", [0.88, 0.72, 0.25]),
     ("render", "fluidParticleSize", "TUNE_FLUID_PARTICLE_SIZE", "f", 0.58),
     ("render", "fluidStretch", "TUNE_FLUID_STRETCH", "f", 0.4),
     ("render", "fluidDensityShade", "TUNE_FLUID_DENSITY_SHADE", "f", 0.45),
@@ -267,7 +263,7 @@ SPEC = [
     ("render", "subScatterDense", "TUNE_SUB_SCATTER_DENSE", "f", 0.42),
     ("render", "subScatterClear", "TUNE_SUB_SCATTER_CLEAR", "f", 0.16),
     ("render", "subClearLow", "TUNE_SUB_CLEAR_LOW", "f", 0.62),
-    ("render", "subClearHigh", "TUNE_SUB_CLEAR_HIGH", "f", 0.82),
+    ("render", "subClearHigh", "TUNE_SUB_CLEAR_HIGH", "f", 0.78),
 
     # blood / viscous liquids
     ("render", "bloodF0", "TUNE_BLOOD_F0", "f", 0.03),

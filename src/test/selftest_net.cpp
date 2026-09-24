@@ -1323,7 +1323,6 @@ Status GateOpsExchange(Ctx& c, std::string& detail) {
                     f.in.playerChunk[2]},
                    f.in.wantReadback != 0, f.in.particlesActive != 0, f.spawns,
                    f.in.farCount, f.fluid, f.in.fluidLive,
-                   f.in.hasSplashMat ? f.in.fluidSplashMat : nullptr,
                    f.in.vizActive != 0);
         if (f.in.tick % kProbeEvery == 0 || f.in.tick == (uint32_t)kTicks)
           replay.push_back(ReadHashSync(c.ctx, c.world));

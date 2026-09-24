@@ -973,7 +973,6 @@ void SubmitTick(GpuContext& ctx, World& world, Simulation& sim, uint32_t tick,
                 uint32_t farCount,
                 const std::vector<FluidSpawnOp>& fluidSpawns,
                 uint32_t fluidLive,
-                const uint32_t* fluidSplashMat,
                 bool vizActive) {
   // ---- THE CHOKE POINT, AND WHAT IT NOW OWES THE STREAM -------------------
   //
@@ -1539,9 +1538,6 @@ void SubmitTick(GpuContext& ctx, World& world, Simulation& sim, uint32_t tick,
   // --lab/--fluid-bench. Set on EVERY TickParams write so streamed genList
   // refills and far-cascade fills that ride this tick see the same world.
   tp.labMode = World::LabWorld() ? 1u : 0u;
-  if (fluidSplashMat) {
-    for (int i = 0; i < 4; i++) tp.fluidSplashMat[i] = fluidSplashMat[i];
-  }
   // Day phase for THIS tick. Derived from an INTEGER tick counter — the
   // daylight-gated reactions read it, so anything frame-timed here would break
   // determinism (CLAUDE.md rule 1).
@@ -1672,9 +1668,6 @@ void SubmitTick(GpuContext& ctx, World& world, Simulation& sim, uint32_t tick,
     in.playerChunk[2] = playerChunk.z;
     in.farCount = farCount;
     in.fluidLive = fluidLive;
-    in.hasSplashMat = fluidSplashMat ? 1u : 0u;
-    if (fluidSplashMat)
-      for (int i = 0; i < 4; i++) in.fluidSplashMat[i] = fluidSplashMat[i];
     opstream::RecordFrame(in, tp, ops, exps, cells.data(), cellCount,
                           spawns.data(), spawnCount, fluidSpawns.data(),
                           fluidSpawnCount, gas);

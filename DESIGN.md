@@ -2360,9 +2360,17 @@ RTX 3060 Ti; cross-vendor remains open exactly as it does for the CA itself.
 Particles carry their IDENTITY in a packed attr word (32-word / 128 B struct,
 power-of-two stride): material id (settle writes it back; splash droplets and
 staining key on it), fullness eighths, and stain type/amount excited out of
-the voxel's stain bits. The species id (0..3) survives as the grid's
-mass-channel / render-colour grouping, derived from the material at excite
-time.
+the voxel's stain bits. **The material is the particle's ONLY identity**
+(W1-B2, 2026-09-24). There used to be a second one, `species = (mat-1)&3`,
+picking the render colour (`render.fluidColor0..3`), the attraction slot and
+— via `TickParams.fluidSplashMat` — a fallback splash material; acid and water
+were both species 0, so splashed acid drew water-blue and the solver treated
+the two as one liquid. Now colour is `materials[mat]`'s palette average,
+"same liquid" is "same material id", and weight is `materials[mat].density`
+(see the grid composition words below). The WGSL field `FluidParticle.species`
+and `TickParams.fluidSplashMat` survive only as unused layout in
+`common.wgsl` until that file is next edited; `FluidSpawnOp`'s same word is
+the spawn FLAGS (`flags` in C++: bit 8 ghost, bits 16..23 ghost life).
 
 ENVIRONMENT PARITY (Phase 2's §6 slice) runs through ONE per-cell bridge
 buffer, `fluidCellScratch` (intent word from the seam, flags from the CA):
@@ -2466,10 +2474,26 @@ P2G is split into a mass/momentum scatter (`p2g1`) and a stress scatter
 from a per-particle volume ratio J (which saturated at its clamp and let a
 small cavity swallow unbounded particles; the density EOS makes over-packing
 eject instead). p2g2 also applies dynamic viscosity through the APIC C matrix
-and the species terms: particles carry a species id (0..3), the grid carries
-per-species mass channels, and `attractSame`/`attractDiff` add signed pulling
-pressure per species — cohesion within a liquid, repulsion (layering) or
-mixing between different liquids. Every solver constant is a `sim.fluid*`
+and the attraction terms: `attractSame`/`attractDiff` add signed pulling
+pressure toward the same / other MATERIALS — cohesion within a liquid,
+repulsion or mixing between different liquids (both 0 by default, which
+compiles the gather out). Grid words 4..6 are the node's COMPOSITION: highest
+material id (`atomicMax`), 4096 minus the lowest (`atomicMax`), and the
+volume-weighted id sum (wrapping i32). A pure node is exact; a two-material
+node is exact too, because `sum - lo*vol` is `sum(vol_i*(mat_i - lo))` in
+wrapping arithmetic whenever that true value fits, and it is at most
+`vol*(hi-lo)`; three or more at one node is approximated as a mix of the
+extremes. DENSITY WEIGHTS MASS, NOT VOLUME: every particle is an eighth of a
+voxel, so word 0 stays a VOLUME (the EOS, the isosurface and every threshold
+read it and a lava pool is not over-packed), while `p2g1` scales the momentum
+by `materials[mat].density / 1000` and `gridUpdate` divides by the node's
+MASS (volume x composition density). A light liquid is then pushed up through
+a heavy one by the hydrostatic gradient the heavy one builds — buoyancy with
+no buoyancy term, at grid resolution (one velocity per node, so a lone
+particle mixed into another liquid feels it diluted; a blob separates). Water
+is exactly 1.0 and every scaling is skipped at 1.0, so water is bit-identical
+to the pre-density solver. Gate `fluid-identity`: acid poured onto water ends
+below it, the same pour of water does not. Every solver constant is a `sim.fluid*`
 tuning row (tuner section "MPM Fluid") in HUMAN units — gravity in voxels/s²,
 stiffness/cohesion/attract in (vox/s)², viscosity in vox²/s, damping per
 second — converted to Q16.16-per-tick integers at SHADER COMPILE TIME by the
@@ -2527,7 +2551,8 @@ from `fluidGrid`/`fluidBlockMap` — zero upload) as a trilinear isosurface.
 Gradient normals, Schlick Fresnel, TRACED reflections and TRACED refraction
 (the bent ray re-marches the world through `shadeSecondaryHit`, so the shore
 genuinely bends at the surface), per-channel Beer-Lambert absorption derived
-from the species colour, mass-weighted grid velocity driving churn foam and
+from the material colour (the composition words, blended by the node's split),
+mass-weighted grid velocity driving churn foam and
 sub-voxel shimmer, and a camera-submerged volumetric path. Cost is bounded in
 three nested steps: `RenderParams.fluidLo/fluidHi` is the world AABB of live
 fluid, so a ray that misses it pays one slab test and a ray that hits it marches
@@ -2539,16 +2564,34 @@ buffer read. `RenderParams.fluidCount == 0`
 (or `render.fluidSurface = 0`, which restores the old debug cubes via
 `debris.wgsl:vsFluid`) skips every instruction of it. Tuner section "MPM
 Fluid Look": iso, smoothing, IOR, clarity (metres), reflection/specular
-gains, foam amount/speed, shimmer, per-species colours. Depth was written at
+gains, foam amount/speed, shimmer (there is no colour knob: the liquid's
+material is its colour). Depth was written at
 the fluid interface, so raster spray in front composited over it and debris
 behind it was covered; since 2026-09-23 the interface writes NO depth and a
 body behind it is shaded through it instead (§9.zz THE WATER VEIL).
+
+ONE LIQUID OPTICS MODEL (W1-B2, 2026-09-24). The CA surface (`shadeWater`), the
+MPM surface (`shadeMpmFluid`) and the submerged view (`shadeSubmerged`) all
+read `liquidOptics(material)` in `raymarch.wgsl`: one derivation from the
+palette average and the authored opacity (an `opaque` liquid counts as fully
+opaque), one clear-liquid weight `clear = smoothstep(subClearLow,
+subClearHigh, clarity)` and one interface-reflectance scale `fresnel =
+mix(0.55, 1, clear)`. It replaced `isWater = tagMask != 0 && opacity < 0.45`,
+which two of the three paths still used (a tagless clear liquid was "not
+water", acid only failed it by accident) with their own derivation (absorb
+gain 9, scatter 0.22). The only per-path part is the CLEAR-WATER pair each
+blends toward by `clear` (`liquidClearBlend`): the surface's
+`waterAbsorb/waterScatter`, the submerged view's `subAbsorb/subScatter/
+subVisibility`, the MPM body's depth-ramped albedo — each tuned by eye for what
+that path draws. `subClearHigh` moved 0.82 -> 0.78 so that water (clarity
+0.787) is fully clear on every path; at 0.82 it was 93% clear, which the
+submerged comment had always claimed was 100%.
 
 THE RENDER SEAM: ONE LAKE, TWO REPRESENTATIONS (2026-08-25). The virtual-mass
 blend above lets the isosurface reach over SETTLED voxel water, which closes the
 geometric gap — and hands this shade a body of water the CA owns, described by
 completely unrelated coefficients (`waterAbsorb`/`waterScatter`, flat, versus
-`(1.06 - depth-ramped species albedo)/clarity` with a lit squared-albedo
+`(1.06 - depth-ramped material albedo)/clarity` with a lit squared-albedo
 in-scatter). Measured over 2.5 m of pond that is (60,120,130) against
 (142,159,177). So exciting one chunk of a lake used to REPAINT it: a
 chunk-aligned rectangle of flat pale blue with a black rim, flickering as blocks
@@ -2605,8 +2648,8 @@ enforces it. It replaced two independent tests that had to agree and did not:
   already records.
 
 Two smaller repairs in the same pass: `fluidSampleAt` gained the virtual-mass
-term (settled water accumulates into species 0), without which a node carrying
-only settled mass divided by the species floor and shaded BLACK — the dark rim
+term (settled liquid accumulates in its own material's colour), without which
+a node carrying only settled mass divided by the colour floor and shaded BLACK — the dark rim
 around every marched region that touched a pond; and the thickness walk is now
 bounded by the SCENE, not by `fluidLo/fluidHi`, because the settled water in the
 field extends arbitrarily far past the live particle blocks and clipping there
@@ -2682,8 +2725,8 @@ SPLASH COUPLING — fast fluid particles at low density (spray, breaking
 crests) shed `PFLAG_MICRO` droplets into the ballistic particle system from
 `g2p` (bindings 6/7 of the fluid group are the particle write page + counts;
 the appends land after `particleResolve`, so droplets fly next tick). Each
-droplet carries the particle's OWN material (the attr word; the poured-species
-table is the fallback) — so MPM blood spatters real stains through the
+droplet carries the particle's OWN material (the attr word; there is no
+fallback table any more) — so MPM blood spatters real stains through the
 existing claim-hash stain path and MPM water is pure sparkle. Emission is
 hash-keyed on particle state + tick (the fluid slot index is a stable
 identity — assigned by the seam's deterministic slot-order compaction),
@@ -2692,10 +2735,12 @@ lifetime, and `PARTICLE_CAP`. Live fluid holds `particlesActive` on (plus a
 droplet-lifetime tail) so the spray integrates without an explosion ever
 having happened.
 
-Usage: the `mpm` tool (Tab; hold LMB to pour, keys 1-4 pick the species, U
-clears — which now zeroes the GPU-owned count directly). `--shot-fluid` is
-the look-iteration harness: worldgen, pour a pool + a falling stream with the
-tool's own spawn shape, write `screenshot_fluid{,_top,_splash,_low}.bmp`. The
+Usage: the `mpm` tool (Tab; hold LMB to pour, keys 1-4 pour water / oil /
+acid / blood, U clears — which now zeroes the GPU-owned count directly).
+`--shot-fluid` is the look-iteration harness: worldgen, pour a pool + a
+falling stream with the tool's own spawn shape, write
+`screenshot_fluid{,_top,_splash,_low}.bmp`; `SANDVOX_SHOT_FLUID_MAT=<name>`
+pours another liquid (e.g. `acid`) in the same scene. The
 CPU keeps only a CONSERVATIVE live estimate (snapshot readback + spawns since
 — drives record/skip, the draw count and the HUD; every kernel re-bounds
 itself on the GPU count, and `vsFluid` collapses dead/stale slots). Hard
@@ -14418,7 +14463,7 @@ MutationQueue:
     (`sim.fluidGravity`, substep-exact) and, when the asked-for flight time
     would launch over the CFL cap, at the nearest flight time that fits.
   - *In*: `ContainerScoopStream` spawns eight GHOST particles per scooped cell
-    (`FluidSpawnOp::species` bit 8, life in bits 16..23; `FP_GHOST` = attr bit
+    (`FluidSpawnOp::flags` bit 8, life in bits 16..23; `FP_GHOST` = attr bit
     23 in common.wgsl). The fluid surface draws them like any water and g2p
     homes them onto the vessel's mouth (target in `_r0.._r2`, death tick in
     `_r3`), but they are NOT MATTER: never booked in, no occupancy or stain

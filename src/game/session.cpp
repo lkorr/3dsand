@@ -289,7 +289,7 @@ struct TickScratch {
   auto& fluidPendingSpawns = w.fluidPendingSpawns;         \
   uint32_t& fluidCueMat = w.fluidCueMat;                   \
   uint32_t& lastFluidTick = w.lastFluidTick;               \
-  uint32_t* fluidSpeciesMat = w.fluidSpeciesMat;           \
+  uint32_t* fluidPourMat = w.fluidPourMat;                 \
   uint32_t& labTick = w.labTick;                           \
   bool& duelDummySpawned = w.duelDummySpawned;             \
   const double now = w.frameTime;                          \
@@ -1474,8 +1474,8 @@ static void PhaseG(TickAuthorityCtx& w, WorldScratch& ws,
           at = {ifloor(p.x), ifloor(p.y), ifloor(p.z)};
         }
         const int rr = std::min(std::max(ui.brushRadius / 2, 1), 3);
-        const uint32_t fluidSpecies = (uint32_t)ui.fluidSpecies & 3u;
-        fluidSpeciesMat[fluidSpecies] = fluidCueMat;
+        uint32_t pourMat = fluidPourMat[(uint32_t)ui.fluidPour & 3u];
+        if (pourMat == 0) pourMat = fluidCueMat;
         for (int z = -rr; z <= rr && fluidSpawns.size() < kMaxFluidSpawnsPerTick; z++)
           for (int y = -rr; y <= rr; y++)
             for (int x = -rr; x <= rr; x++) {
@@ -1498,8 +1498,7 @@ static void PhaseG(TickAuthorityCtx& w, WorldScratch& ws,
                 op.pz = ((at.z + z) << 16) + ((s & 4) ? 49152 : 16384) +
                         (int32_t)((h >> 19) % 8192u) - 4096;
                 op.vx = 0; op.vy = -19661; op.vz = 0;  // gentle -0.3 cells/tick
-                op.species = fluidSpecies;
-                op.mat = fluidCueMat;
+                op.mat = pourMat;
                 fluidSpawns.push_back(op);
               }
             }
@@ -3690,7 +3689,7 @@ static void PhaseN(TickAuthorityCtx& w, WorldScratch& ws,
       tSubmit0 = NowSeconds();
       SubmitTick(ctx, world, sim, tick, kDefaultSeed, ops, exps, cellOps,
                  tick % 15 == 0 /*hash occasionally*/, pc, true, particlesActive,
-                 spawns, farCount, fluidSpawns, fluidCount, fluidSpeciesMat,
+                 spawns, farCount, fluidSpawns, fluidCount,
                  ui.showDirtyVoxels);
       // Conservative estimate refresh: the newest snapshot's GPU-owned count
       // plus every spawn batch it has not seen yet. Settles decay it (the

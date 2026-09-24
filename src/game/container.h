@@ -252,9 +252,9 @@ uint32_t ContainerParticleRoom(bool snapValid, uint32_t snapParticleCount,
 // gravity (sim.fluidGravity, substep-exact) and under its CFL cap; pressure and
 // cohesion bend it a little from there. `room` is the particle budget left
 // this tick (kFluidCap and the spawn stream, charged BEFORE emission, rule 2).
-// Species is (mat - 1) & 3, the rule exciteEmit uses, so a poured stream and
-// the pond it lands in are the same colour. Returns eighths poured; `splat` as
-// ContainerPour.
+// The particles carry the flask's material and nothing else, so a poured
+// stream and the pond it lands in are the same colour because they are the
+// same material. Returns eighths poured; `splat` as ContainerPour.
 bool ContainerPoursAsFluid(const MaterialDef& m);
 int ContainerPourFluid(const ItemDef& def, ItemStack& st, Vec3 mouth, Vec3 fwd,
                        const Vec3* target, uint32_t tick, uint32_t seed,
@@ -262,14 +262,14 @@ int ContainerPourFluid(const ItemDef& def, ItemStack& st, Vec3 mouth, Vec3 fwd,
                        SplatterEvent* splat);
 
 // THE SCOOP STREAM: what a scooped cell looks like on its way into the flask.
-// GHOST MPM particles (FluidSpawnOp::species kFluidOpGhost, FP_GHOST in
+// GHOST MPM particles (FluidSpawnOp::flags kFluidOpGhost, FP_GHOST in
 // common.wgsl): rendered by the fluid surface like any water, homed onto
 // `mouth` by g2p and dead after `life` ticks, and never matter -- they do not
 // settle, react, stain, splash, or enter the seam's mass books. The eighths
 // were already paid for by the scoop ledger; this is only their picture.
 // Eight per cell from the cell's sub-lattice, `room` as above. Returns the
 // particles emitted.
-constexpr uint32_t kFluidOpGhost = 1u << 8;      // FluidSpawnOp::species bit
+constexpr uint32_t kFluidOpGhost = 1u << 8;      // FluidSpawnOp::flags bit
 constexpr uint32_t kFluidOpLifeShift = 16;       // ghost life, ticks, bits 16..23
 uint32_t ContainerScoopStream(IVec3 cell, uint32_t mat, Vec3 mouth, int life,
                               uint32_t seed, uint32_t tick, uint32_t room,

@@ -10,7 +10,7 @@
 // density EOS is what stops a small cavity swallowing unbounded particles:
 // over-packing now builds real ejecting pressure rather than saturating a
 // clamped J. p2g2 also applies dynamic viscosity (via the APIC C matrix) and
-// the per-species attraction terms (attract same / attract different).
+// the attraction terms (attract same / attract different material).
 //
 // DETERMINISM. THIS FILE never writes a voxel — the substeps only read the
 // voxel field for their boundary conditions. But the fluid as a SYSTEM is
@@ -35,8 +35,8 @@
 //   ONCE per tick (PT_FLUIDMAP): mark -> alloc(scan; also retires LAST tick's
 //     map entries) -> copy args. The map is not rebuilt per substep: `mark`
 //     pads each particle's support by a whole tick of CFL-capped travel.
-//   sim.fluidSubsteps times (PT_FLUID): clear -> p2g1 (mass+momentum+species
-//     mass) -> p2g2 (density -> stress scatter) -> grid update (gravity +
+//   sim.fluidSubsteps times (PT_FLUID): clear -> p2g1 (volume+momentum+
+//     composition) -> p2g2 (density -> stress scatter) -> grid update (gravity +
 //     terrain BCs) -> G2P/advect
 // Terrain collision is a boundary condition on grid nodes read straight from
 // the voxel buffer through voxWordAt — dig under a pool and it drains with no
@@ -54,8 +54,20 @@
 // B-spline weights of fx = (x - 0.5) - base in [0.5, 1.5].
 //
 // GRID LAYOUT: 8 i32 words per node —
-//   [0] mass (Q10)   [1..3] momentum -> velocity (Q16.16)
-//   [4..6] mass of species 1..3 (Q10; species 0 mass = [0] - [4] - [5] - [6])
+//   [0] VOLUME (Q10 particle counts; every particle is 1/8 voxel whatever it
+//       is made of — the EOS, the isosurface and every threshold read this)
+//   [1..3] MASS-weighted momentum -> velocity (Q16.16). A particle's mass is
+//       materials[mat].density / FLUID_REF_DENSITY (water = exactly 1.0)
+//   [4..6] COMPOSITION (W1-B2; common.wgsl's comment still says "species"):
+//       [4] highest material id at the node (atomicMax)
+//       [5] 4096 - lowest material id (atomicMax; 0 = no material yet)
+//       [6] sum of volume * material id (Q10 * id, WRAPPING i32 — see nodeHiVol)
+//     A pure node (hi == lo) is exact; a two-material node is exact too, by
+//     solving [0] and [6] for the split; three or more at ONE node is
+//     approximated as a mix of the extremes (rare, bounded, deterministic).
+//     This replaced the four-slot "species" (mat-1)&3 that made acid and water
+//     the same liquid. Read by gridUpdate (mass for the momentum divide), p2g2
+//     (same-material attraction) and raymarch.wgsl (colour).
 //   [7] FOAM FIELD (Q16, saturated at 1.0) — the ONLY word that is NOT
 //       cleared per substep. It accumulates the Ihmsen diffuse-material
 //       potentials in g2p and decays geometrically in gridUpdate, so foam
@@ -113,6 +125,8 @@ const FLUID_ATTRACT_SAME : i32 =               // (vox/s)² -> Q16.16 cells²/ti
     i32(round(TUNE_FLUID_ATTRACT_SAME * 65536.0 / 900.0));
 const FLUID_ATTRACT_DIFF : i32 =               // (vox/s)² -> Q16.16 cells²/tick²
     i32(round(TUNE_FLUID_ATTRACT_DIFF * 65536.0 / 900.0));
+// Both 0 (the default) compiles p2g2's same-material gather out entirely.
+const FLUID_ATTRACT_ON : bool = FLUID_ATTRACT_SAME != 0 || FLUID_ATTRACT_DIFF != 0;
 const FLUID_VISCOSITY : i32 =                  // vox²/s -> Q16.16 cells²/tick
     i32(round(TUNE_FLUID_VISCOSITY * 65536.0 / 30.0));
 const FLUID_DAMPING : i32 =                    // fraction/s -> Q16.16 /tick
@@ -275,7 +289,7 @@ const FLUID_SETTLED_Q8 : i32 =
 // long block at fluidSolid. 0 restores the pass-through behaviour, which is the
 // control arm for `--sweep sim.fluidSubmergedSolid=0,1`.
 const FLUID_SUBMERGED_SOLID : i32 = clamp(TUNE_FLUID_SUBMERGED_SOLID, 0, 1);
-// Gravity, EOS (stiffness / rest density / power / cohesion), the species
+// Gravity, EOS (stiffness / rest density / power / cohesion), the material
 // attraction pair, viscosity and damping all come from tuning (the sim.fluid*
 // rows of tuning_params.def — HUMAN-UNIT FLOATS, F5-reloadable, converted to
 // integers by the const block at the top of this file). LoadTuning clamps
@@ -291,6 +305,90 @@ const FLUID_SUBMERGED_SOLID : i32 = clamp(TUNE_FLUID_SUBMERGED_SOLID, 0, 1);
 fn mq(a : i32, b : i32) -> i32 {
   let m = ((abs(a) >> 6u) * (abs(b) >> 6u)) >> 4u;
   return select(m, -m, (a ^ b) < 0);
+}
+
+// ---- THE PARTICLE'S ONE IDENTITY: materials[mat] (W1-B2) --------------------
+// A particle used to carry a second identity, `species` = (mat-1)&3, which
+// picked its colour and its attraction slot — so acid and water (both 0) were
+// the same liquid to the solver and the renderer. Now the attr word's material
+// is the only identity: colour comes from materials[mat] (raymarch/debris),
+// "same liquid" means same material id (p2g2), and weight comes from
+// materials[mat].density, the SAME number the CA and the ballistic particles
+// layer by.
+//
+// DENSITY -> MASS, NOT VOLUME. Every particle is one eighth of a voxel, so the
+// EOS keeps reading VOLUME (word 0) and a lava pool is not 2.8x over-packed.
+// What density changes is how much momentum a particle carries and therefore
+// how hard the same pressure gradient accelerates it: gridUpdate divides the
+// mass-weighted momentum by the node's MASS (volume x density ratio). A light
+// liquid in a heavy one is pushed up by the hydrostatic gradient the heavy
+// one sets up, i.e. buoyancy, with no buoyancy term anywhere. It acts at the
+// grid's resolution (one velocity per node), so a lone particle mixed into
+// another liquid feels it diluted by its node-mates; a blob separates.
+//
+// WATER IS BIT-IDENTICAL: its ratio is exactly 1024 and every scaling below
+// is skipped at 1024 (a Q multiply by 1.0 truncates, so a guard, not a blend).
+const FLUID_REF_DENSITY : i32 = 1000;   // materials.json kg/m^3 of mass 1.0
+
+// Particle mass per unit volume, Q10 (1024 = water). Clamped to [1/16, 4] so
+// massScale's operand audit holds whatever materials.json says.
+fn fluidMassRatio(mat : u32) -> i32 {
+  if (mat == 0u) { return 1024; }
+  let d = materials[mat].density;
+  if (d <= 0 || d == FLUID_REF_DENSITY) { return 1024; }
+  return clamp((d * 1024) / FLUID_REF_DENSITY, 64, 4096);
+}
+
+// x * r / 1024 on the MAGNITUDE (the mq sign-bias lesson). |x| < 2^20 (the
+// p2g momentum terms are <= 0.42 * FLUID_VEFF_MAX), so (|x|>>2) * 4096 < 2^31.
+fn massScale(x : i32, r : i32) -> i32 {
+  let m = ((abs(x) >> 2u) * r) >> 8u;
+  return select(m, -m, x < 0);
+}
+
+// Volume of the node's HIGHEST-id material, from words 0 and 6. s - lo*vol is
+// sum(vol_i * (mat_i - lo)) EXACTLY in wrapping i32 arithmetic whenever that
+// true value fits, and it is at most vol * (hi - lo) — so word 6 may wrap on a
+// crowded node without costing any precision here. Exact for two materials.
+fn nodeHiVol(vol : i32, hi : u32, lo : u32, s : i32) -> i32 {
+  return clamp((s - i32(lo) * vol) / max(i32(hi) - i32(lo), 1), 0, vol);
+}
+
+// The node's composition, decoded. lo == hi for a pure node; hi == 0 for a
+// node holding no live material (only dead slots, or nothing).
+struct NodeMix { hi : u32, lo : u32 };
+fn nodeMixAt(ni : u32) -> NodeMix {
+  var o : NodeMix;
+  let hiW = atomicLoad(&fluidGrid[ni + 4u]);
+  o.hi = u32(max(hiW, 0));
+  let loW = atomicLoad(&fluidGrid[ni + 5u]);
+  o.lo = select(o.hi, 4096u - u32(loW), loW > 0);
+  return o;
+}
+
+// The node's MASS (Q10) for the momentum divide: volume x density ratio.
+fn nodeMass(ni : u32, vol : i32) -> i32 {
+  let x = nodeMixAt(ni);
+  if (x.hi == 0u) { return vol; }
+  let rh = fluidMassRatio(x.hi);
+  if (x.lo == x.hi) {
+    if (rh == 1024) { return vol; }
+    return max(((vol >> 4u) * rh) >> 6u, 1);
+  }
+  let vh = nodeHiVol(vol, x.hi, x.lo, atomicLoad(&fluidGrid[ni + 6u]));
+  let rl = fluidMassRatio(x.lo);
+  return max((((vh >> 4u) * rh) >> 6u) + ((((vol - vh) >> 4u) * rl) >> 6u), 1);
+}
+
+// Volume of material `mat` at the node — p2g2's same-liquid share.
+fn nodeOwnVol(ni : u32, vol : i32, mat : u32) -> i32 {
+  let x = nodeMixAt(ni);
+  if (x.hi == 0u) { return 0; }
+  if (x.lo == x.hi) { return select(0, vol, x.hi == mat); }
+  let vh = nodeHiVol(vol, x.hi, x.lo, atomicLoad(&fluidGrid[ni + 6u]));
+  if (mat == x.hi) { return vh; }
+  if (mat == x.lo) { return vol - vh; }
+  return 0;
 }
 
 // Signed wrapper over common.wgsl's exact integer isqrt. The foam potentials
@@ -762,16 +860,20 @@ fn clearGrid(@builtin(workgroup_id) wg : vec3<u32>,
   let vm = (((full * i32(voxState(w) + 1u)) / 8) * FLUID_SETTLED_Q8) >> 8u;
   if (vm <= 0) { return; }
   atomicStore(&fluidGrid[b + 0u], vm);
-  // Species accounting must match p2g1's, or the same-species attraction terms
-  // would read this water as "some other fluid" pressing against itself.
-  let sp = (mat - 1u) & 3u;
-  if (sp != 0u) { atomicStore(&fluidGrid[b + 3u + sp], vm); }
+  // Composition accounting must match p2g1's: the settled liquid's own
+  // material, so it weighs what it is (gridUpdate's nodeMass), attracts its
+  // own kind (p2g2) and is drawn in its own colour — a pour of oil onto a
+  // settled oil pool is one liquid, onto water it is two.
+  atomicStore(&fluidGrid[b + 4u], i32(mat));
+  atomicStore(&fluidGrid[b + 5u], i32(4096u - mat));
+  atomicStore(&fluidGrid[b + 6u], vm * i32(mat));
 }
 
-// ---- p2g1: scatter mass, momentum and species mass --------------------------
-// grid[node] += w * (v + C * dpos), mass += w, speciesMass[s] += w. Particle
-// mass is 1.0 (Q10 1024). No stress here: p2g2 applies it after the density
-// this pass accumulates can be sampled.
+// ---- p2g1: scatter volume, momentum and composition -------------------------
+// grid[node] += r * w * (v + C * dpos), volume += w, composition += (mat, w).
+// Particle volume is 1.0 (Q10 1024); its mass is r = fluidMassRatio(mat)
+// (1.0 for water). No stress here: p2g2 applies it after the density this
+// pass accumulates can be sampled.
 @compute @workgroup_size(64)
 fn p2g1(@builtin(global_invocation_id) gid : vec3<u32>) {
   if (gid.x >= liveTotal()) { return; }
@@ -780,6 +882,13 @@ fn p2g1(@builtin(global_invocation_id) gid : vec3<u32>) {
   if (!cellResident(cell, T.origin)) { return; }
   let ax = axisOf(p.px); let ay = axisOf(p.py); let az = axisOf(p.pz);
   let sb = supBlocks(ax, ay, az);   // <= 8 block lookups, not 27
+  // The one identity (see fluidMassRatio). mat 0 is a dead slot awaiting
+  // compaction: it still scatters volume (it did before), but no composition,
+  // so the nodes it touches read as whatever live material is there.
+  let pmat = fpMat(p.attr);
+  let rq = fluidMassRatio(pmat);
+  let pmatI = i32(pmat);
+  let pmatLo = i32(4096u - pmat);
 
   // ---- loop-invariant work, lifted out of the 27 taps ----------------------
   // Every term below was recomputed inside the innermost body, 27 times, for
@@ -827,12 +936,27 @@ fn p2g1(@builtin(global_invocation_id) gid : vec3<u32>) {
         vey = clamp(vey, -FLUID_VEFF_MAX, FLUID_VEFF_MAX);
         vez = clamp(vez, -FLUID_VEFF_MAX, FLUID_VEFF_MAX);
         let ni = nodeWordBase(bm, nc);
-        atomicAdd(&fluidGrid[ni + 0u], w >> 6u);        // mass, Q10
-        atomicAdd(&fluidGrid[ni + 1u], mq(w, vex));     // momentum, Q16.16
-        atomicAdd(&fluidGrid[ni + 2u], mq(w, vey));
-        atomicAdd(&fluidGrid[ni + 3u], mq(w, vez));
-        if (p.species != 0u) {
-          atomicAdd(&fluidGrid[ni + 3u + p.species], w >> 6u);
+        atomicAdd(&fluidGrid[ni + 0u], w >> 6u);        // volume, Q10
+        var mx = mq(w, vex);                            // momentum, Q16.16
+        var my = mq(w, vey);
+        var mz = mq(w, vez);
+        if (rq != 1024) {                               // mass, not volume
+          mx = massScale(mx, rq); my = massScale(my, rq); mz = massScale(mz, rq);
+        }
+        atomicAdd(&fluidGrid[ni + 1u], mx);
+        atomicAdd(&fluidGrid[ni + 2u], my);
+        atomicAdd(&fluidGrid[ni + 3u], mz);
+        if (pmat != 0u) {
+          // Max is order-independent, so the final word is the same however
+          // the threads interleave; the load only skips a redundant RMW (the
+          // word never decreases, so "already >= mine" stays true).
+          if (atomicLoad(&fluidGrid[ni + 4u]) < pmatI) {
+            atomicMax(&fluidGrid[ni + 4u], pmatI);
+          }
+          if (atomicLoad(&fluidGrid[ni + 5u]) < pmatLo) {
+            atomicMax(&fluidGrid[ni + 5u], pmatLo);
+          }
+          atomicAdd(&fluidGrid[ni + 6u], (w >> 6u) * pmatI);
         }
       }
     }
@@ -870,7 +994,11 @@ fn p2g2(@builtin(global_invocation_id) gid : vec3<u32>) {
     for (var i = 0; i < 3; i++) { wxy[j * 3 + i] = mq(ax.w[i], ay.w[j]); }
   }
 
-  // Gather rho and same-species rho (Q16.16 particle masses per cell).
+  // Gather rho and same-MATERIAL rho (Q16.16 particle volumes per cell). The
+  // same-material share costs two or three extra loads per tap, so it is
+  // compiled out when both attraction knobs are 0 (the default) — the terms
+  // it feeds are then exactly zero anyway.
+  let pmat = fpMat(p.attr);
   var rho : i32 = 0;
   var same : i32 = 0;
   for (var k = 0; k < 3; k++) {
@@ -882,18 +1010,10 @@ fn p2g2(@builtin(global_invocation_id) gid : vec3<u32>) {
         let w = mq(wxy[j * 3 + i], az.w[k]);
         let ni = nodeWordBase(bm, nc);
         let m = atomicLoad(&fluidGrid[ni + 0u]);
-        let m1 = atomicLoad(&fluidGrid[ni + 4u]);
-        let m2 = atomicLoad(&fluidGrid[ni + 5u]);
-        let m3 = atomicLoad(&fluidGrid[ni + 6u]);
-        var own : i32;
-        switch (p.species) {
-          case 0u: { own = m - m1 - m2 - m3; }
-          case 1u: { own = m1; }
-          case 2u: { own = m2; }
-          default: { own = m3; }
+        rho += mq(w, m << 6u);            // Q10 volume -> Q16.16
+        if (FLUID_ATTRACT_ON) {
+          same += mq(w, max(nodeOwnVol(ni, m, pmat), 0) << 6u);
         }
-        rho += mq(w, m << 6u);            // Q10 mass -> Q16.16
-        same += mq(w, max(own, 0) << 6u);
       }
     }
   }
@@ -928,9 +1048,9 @@ fn p2g2(@builtin(global_invocation_id) gid : vec3<u32>) {
   pw += clamp(FLUID_ONE - p.j, -FLUID_ONE / 2, FLUID_ONE / 2);
   var pr = mq(FLUID_STIFFNESS, clamp(pw - FLUID_ONE, -(1 << 16), 16 << 16));
   pr = max(pr, -FLUID_COHESION);
-  // Species attraction: extra negative (pulling) pressure proportional to how
-  // much same/other fluid is around. attractDiff < 0 flips to a push — that is
-  // what keeps two species layered against each other instead of interleaved.
+  // Material attraction: extra negative (pulling) pressure proportional to how
+  // much same/other liquid is around. attractDiff < 0 flips to a push — that is
+  // what keeps two liquids layered against each other instead of interleaved.
   pr -= mq(FLUID_ATTRACT_SAME, sameRatio) + mq(FLUID_ATTRACT_DIFF, otherRatio);
   pr = clamp(pr, -(1 << 20), 1 << 25);
 
@@ -989,8 +1109,9 @@ fn p2g2(@builtin(global_invocation_id) gid : vec3<u32>) {
 // ---- grid update: momentum -> velocity, gravity, terrain BCs ----------------
 // One thread per node of each active block. After this pass, words 1..3 hold
 // node VELOCITY (Q16.16) and word 0 still holds mass; G2P only reads 1..3.
-// The species-mass words (4..6) are left as p2g1 wrote them — p2g2 already
-// consumed them and nothing after this reads them.
+// The composition words (4..6) are left as p2g1 wrote them: this pass reads
+// them for the node MASS (volume x density ratio, see nodeMass) and the
+// renderer reads them for colour.
 //
 // v = P * 1024 / M exactly, via q/r decomposition (WGSL has no i64; the
 // two-stage division is exact to 1 Q16.16 unit and everything stays in i32
@@ -1065,11 +1186,15 @@ fn gridUpdateNode(wgx : u32, li : u32) -> vec2<u32> {
   let ybits = fbmYBits(i32((localIdx >> 4u) & 15u));
   var clamped = 0u;
   var v : vec3<i32>;
+  // Momentum is MASS-weighted (p2g1), so divide by the node's mass, not its
+  // volume: the same pressure force moves a lava node a 2.8th as far as a
+  // water one. nodeMass returns `m` itself for pure water, bit for bit.
+  let mm = nodeMass(ni, m);
   for (var a = 0u; a < 3u; a++) {
     let mom = atomicLoad(&fluidGrid[ni + 1u + a]);
-    let q = mom / m;
-    let r = mom - q * m;
-    v[a] = q * 1024 + (r * 1024) / m;
+    let q = mom / mm;
+    let r = mom - q * mm;
+    v[a] = q * 1024 + (r * 1024) / mm;
   }
   v.y -= FLUID_GRAVITY / FLUID_SUBSTEPS;
 
@@ -1537,12 +1662,10 @@ fn g2pParticle(gi : u32) -> u32 {
   // BOUNDED (rule 2): expected droplets = rate * eligible particles, eligible
   // requires sustained speed, droplets age out by FLUID_SPLASH_LIFE, and the
   // append drops on the floor at PARTICLE_CAP. A settled pool emits nothing.
-  // The particle carries its own material now (attr word — excited water
-  // knows it is water, excited blood knows it is blood). fluidSplashMat is
-  // the legacy per-species table; attr wins when present so splash droplets
-  // and foam land-and-stain as the ACTUAL substance.
+  // The particle's own material (attr word — excited water knows it is water,
+  // excited blood knows it is blood), so splash droplets and foam land and
+  // stain as the ACTUAL substance. A dead slot (mat 0) sheds nothing.
   var splashMat = fpMat(p.attr);
-  if (splashMat == 0u) { splashMat = T.fluidSplashMat[min(p.species, 3u)]; }
   if (fpGhost(p.attr)) { splashMat = 0u; }   // a picture sheds no droplets
   if (splashMat != 0u && FLUID_SPLASH_CHANCE > 0 &&
       p.density < FLUID_SPLASH_MAX_RHO) {

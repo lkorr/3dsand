@@ -168,9 +168,6 @@ void SubmitTick(GpuContext& ctx, World& world, Simulation& sim, uint32_t tick,
                 uint32_t farCount = 0,
                 const std::vector<FluidSpawnOp>& fluidSpawns = {},
                 uint32_t fluidLive = 0,
-                // Material id each MPM species splashes micro droplets as
-                // (TickParams.fluidSplashMat). Null = no splash coupling.
-                const uint32_t* fluidSplashMat = nullptr,
                 bool vizActive = false);
 
 void SubmitWorldgen(GpuContext& ctx, World& world, Simulation& sim,
