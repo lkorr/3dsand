@@ -3503,6 +3503,15 @@ the one table the emitter itself expands — so the offline validator and the
 engine cannot disagree about a name, a type, or a default. They used to be two
 hand-maintained lists, and only the *names* were ever compared.
 
+The table does NOT generate the `tuning.h` initializer or the `LoadTuning`
+read, and both drifted: nine `render.wave*` rows had no read from 9a79eba until
+2026-09-24 (every slider dead, the shader always on the C++ default), and
+`render.fluidFoam` / `sim.fluidExciteMode` carried different defaults in the
+`.def` and in `tuning.h`. `check_invariants.py`'s `tuning reach` check now
+refuses a `.def` row whose key `LoadTuning` never reads in its group, a `.def`
+default that differs from the `tuning.h` initializer, and a `tuning.json` key
+no reader consumes.
+
 #### Per-instance variance (2026-08-20)
 A tuned constant makes every instance identical: every NPC bleeds exactly the
 same amount, which is legible but lifeless. A `Variance` (`sim/tuning.h`) turns

@@ -20,6 +20,10 @@ Checks:
      generated file was regenerated, that each row names a member tuning.h
      really declares, and that every TUNE_* a shader references is in the table.
 
+  2b. TUNING REACH    tuning_params.def  <->  LoadTuning reads + tuning.h init
+     Every .def row is read by LoadTuning in its group, its default equals the
+     tuning.h initializer, and every tuning.json key has a reader.
+
   3. RENDER PATHS     assets/tuner.html RENDER_PATHS  <->  materials.cpp keys
      The wiki re-evaluates the shaders' authored-field tests to say which
      render path a material takes. The flag/field names it reads must be ones
@@ -160,6 +164,141 @@ def check_tuning_consts():
             f"{k} is referenced by a shader but is not a row in "
             f"src/sim/tuning_params.def -- the pipeline build will fail at "
             f"runtime, not at compile time")
+
+
+# ------------------------------------------------------- tuning REACH
+def _tuning_group_slices(cpp):
+    """LoadTuning reads each group inside `if (const json* g = Find(j, "<g>"))`.
+    Map group -> the text from that line to the next top-level group read, so a
+    key is looked up where its group is actually parsed (a member name can
+    exist in two groups -- windEntrainSpeed is in sim AND wind)."""
+    marks = [(m.start(), m.group(1)) for m in
+             re.finditer(r'Find\(j,\s*"(\w+)"\)', cpp)]
+    out = {}
+    for i, (pos, g) in enumerate(marks):
+        end = marks[i + 1][0] if i + 1 < len(marks) else len(cpp)
+        out[g] = out.get(g, "") + cpp[pos:end]
+    return out
+
+
+def _tuning_struct_bodies(header):
+    """group -> the body of the nested struct whose instance is `} <group>;`,
+    comments stripped (prose like "`waveMode` = 0 ..." must not read as a
+    declaration)."""
+    body = {}
+    lines = header.splitlines()
+    for i, ln in enumerate(lines):
+        m = re.match(r"^  \}\s*(\w+);", ln)
+        if not m:
+            continue
+        j = i - 1
+        while j >= 0 and not re.match(r"^  struct \w+\s*\{", lines[j]):
+            j -= 1
+        if j >= 0:
+            text = "\n".join(lines[j + 1:i])
+            text = re.sub(r"/\*.*?\*/", " ", text, flags=re.S)
+            text = re.sub(r"//[^\n]*", "", text)
+            body[m.group(1)] = text
+    return body
+
+
+def _num(tok):
+    tok = tok.strip()
+    tok = re.sub(r"(?<=[0-9.])[fFuU]\b", "", tok)
+    if not re.fullmatch(r"[-+0-9.eE*/() ]+", tok):
+        return None
+    try:
+        return float(eval(tok, {"__builtins__": {}}, {}))  # arithmetic only
+    except Exception:
+        return None
+
+
+def check_tuning_reach():
+    """Every tuning_params.def row must be READ by LoadTuning and must carry
+    the same default as its tuning.h initializer.
+
+    A .def row with a struct field, a tuning.json value and a tuner slider
+    but no `ReadF(*g, "<member>", ...)` compiles, emits its WGSL constant and
+    looks entirely wired -- and the slider does nothing, because the constant
+    is always the C++ default. render.wave* (nine rows) sat in exactly that
+    state from 9a79eba to 2026-09-24. The default check exists because the two
+    copies of each default drifted too (render.fluidFoam 0.55 vs 0.35,
+    sim.fluidExciteMode 1 vs 0): the .def default is what the prelude cache
+    and scripts/tuning_prelude.py see, the tuning.h one is what a Tuning{}
+    built without a tuning.json runs.
+
+    Also: every key in assets/materials/tuning.json must be read somewhere in
+    its group (a key with no reader is a slider that saves into nothing --
+    render.heatSpillStrength outlived its code by weeks)."""
+    table = read("src/sim/tuning_params.def")
+    header = read("src/sim/tuning.h")
+    cpp = read("src/sim/tuning.cpp")
+    if not table or not header or not cpp:
+        return
+    checked.append("tuning reach")
+    slices = _tuning_group_slices(cpp)
+    bodies = _tuning_struct_bodies(header)
+    compared = 0
+
+    rows = re.findall(
+        r"^TP_(F|I|U|V3)\((\w+),\s*(\w+),\s*TUNE_[A-Z0-9_]+,\s*([^)]*)\)",
+        table, re.M)
+    for kind, group, member, dflt in rows:
+        key = f"{group}.{member}"
+        if f'"{member}"' not in slices.get(group, ""):
+            problems.append(
+                f"{key}: row in src/sim/tuning_params.def but LoadTuning "
+                f"(src/sim/tuning.cpp) never reads \"{member}\" in the "
+                f"\"{group}\" group -- its tuner slider and tuning.json value "
+                f"are dead, the shader always runs the tuning.h default")
+        body = bodies.get(group)
+        if body is None:
+            continue
+        # `\b` on BOTH sides: without the trailing one `fluidFoam` matched
+        # `fluidFoamSpeed = 22.0f` and the check compared the wrong field.
+        m = re.search(rf"\b{member}\b\s*(?:\[3\])?\s*"
+                      rf"(?:=\s*(\{{[^}}]*\}}|[^,;{{]+)|(\{{[^}}]*\}}))\s*[,;]",
+                      body)
+        if not m:
+            continue  # no initializer (or none we can see); nothing to compare
+        compared += 1
+        init = (m.group(1) or m.group(2)).strip()
+        if init.startswith("{"):
+            init = init[1:-1]
+        want = [_num(t) for t in dflt.split(",")]
+        have = [_num(t) for t in init.split(",")]
+        if None in want or None in have:
+            continue  # symbolic default (a k-constant); not comparable here
+        if len(want) != len(have) or any(
+                abs(a - b) > 1e-6 * max(1.0, abs(a)) for a, b in zip(want, have)):
+            problems.append(
+                f"{key}: default disagrees -- src/sim/tuning_params.def says "
+                f"{dflt.strip()}, src/sim/tuning.h initializes {init}; make "
+                f"both the value assets/materials/tuning.json ships")
+    # Rows the parser cannot read are skipped silently above; if it rots, fail
+    # loudly instead of passing by comparing nothing.
+    if rows and compared < len(rows) * 3 // 4:
+        problems.append(
+            f"tuning reach: compared only {compared} of {len(rows)} .def "
+            f"defaults against tuning.h -- the initializer parser no longer "
+            f"understands the header")
+
+    try:
+        tj = json.loads(read("assets/materials/tuning.json"))
+    except Exception:
+        tj = None
+    if isinstance(tj, dict):
+        for group, vals in tj.items():
+            if not isinstance(vals, dict) or group not in slices:
+                continue
+            for k in vals:
+                if k.startswith("_"):
+                    continue  # "_comment"-style annotations
+                if f'"{k}"' not in slices[group]:
+                    problems.append(
+                        f"assets/materials/tuning.json {group}.{k}: no reader "
+                        f"in LoadTuning's \"{group}\" group -- an orphan key "
+                        f"(delete it, or add the read)")
 
 
 # ----------------------------------------------------------- RENDER_PATHS
@@ -2114,6 +2253,7 @@ ALL = {
     "sound": check_sound_slots,
     "substeps": check_fluid_substeps,
     "tuning": check_tuning_consts,
+    "tuningreach": check_tuning_reach,
     "render": check_render_paths,
     "world": check_world_consts,
     "arch": check_arch_paths,
@@ -2137,9 +2277,10 @@ ALL = {
 RELEVANT = {
     "assets/sound_schema.js": ["sound"],
     "src/audio/cues.cpp": ["sound"],
-    "src/sim/tuning.cpp": ["tuning"],
-    "src/sim/tuning.h": ["tuning"],
-    "src/sim/tuning_params.def": ["tuning", "substeps"],
+    "src/sim/tuning.cpp": ["tuning", "tuningreach"],
+    "src/sim/tuning.h": ["tuning", "tuningreach"],
+    "src/sim/tuning_params.def": ["tuning", "substeps", "tuningreach"],
+    "assets/materials/tuning.json": ["tuningreach"],
     "scripts/tuning_prelude.py": ["tuning"],
     "assets/tuner.html": ["render", "arch", "perfnodes"],
     "assets/perfview.js": ["perfscopes"],

@@ -854,7 +854,6 @@
     "lavaEmissionGain": 1.9,
     "lavaPulseAmp": 0.06,
     "lavaPulseRate": 0.9,
-    "heatSpillStrength": 0.16,
     "emberBrightness": 2.2,
     "emberRise": 26,
     "emberRate": 3.4,

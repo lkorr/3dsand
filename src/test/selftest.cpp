@@ -185,6 +185,10 @@ const char* const kOrder[] = {
     // later melee gate measure the wrong numbers silently, and it is better
     // reported in the first second than in the fiftieth.
     "combat-tuning", "combat-cues",
+    // Same shape (pure CPU, one temp file removed before it returns), for
+    // every tuning_params.def row: a dead slider is reported in the first
+    // second rather than never.
+    "tuning-reach",
     // SECOND, and for the same reason: `tree-atlas` reads assets/trees/*.svtree
     // off disk and asserts on the bytes. No world, no GPU, no state left
     // behind -- and when the atlas is wrong every gate after it is measuring a

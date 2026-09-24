@@ -2234,11 +2234,13 @@ struct Tuning {
     float fluidSprayDensity = 0.42f;  // below this x rest -> spray
     int fluidFoamScaleIdx = 3;        // foam particle size (0=1/2 .. 3=1/6 vox)
     // ---- MLS-MPM settle / excite seam: the CA <-> particle handover ----
-    int fluidExciteMode = 0;      // 0 = disturbance-excite off: the CA owns
-                                  // disturbed settled liquid (Phase-2 default,
-                                  // keeps the pinned world hash); 1 = settled
+    int fluidExciteMode = 1;      // 0 = disturbance-excite off: the CA owns
+                                  // disturbed settled liquid; 1 = settled
                                   // liquid with air below converts to MPM
-                                  // particles
+                                  // particles. 1 is what tuning.json ships and
+                                  // what the .def row says; this initializer
+                                  // said 0 until 2026-09-24
+                                  // (check_invariants.py pins them together)
     // ---- THE BURST BOUND (WP5) ----
     // Excite is a per-cell trigger with no notion of "only wake what the
     // disturbance can reach", and it emits one particle per eighth of
@@ -3334,7 +3336,8 @@ struct Tuning {
     float fluidFoamSpeed = 22.0f; // surface speed (vox/s) for full churn foam
     float fluidWobble = 0.5f;    // sub-voxel normal shimmer on moving fluid
     // Speed-driven whitening: fast, loose particles read as spray/foam.
-    float fluidFoam = 0.35f;
+    // 0.55 = tuning.json and the .def row (this said 0.35 until 2026-09-24).
+    float fluidFoam = 0.55f;
     // ---- depth colour gradient (raymarch.wgsl DEPTH GRADIENT) ----
     // A thin film reads as `fluidShallow`, the deep body tends toward
     // `fluidDeep`, ramped over `fluidDepth` metres of in-fluid path. The ramped
@@ -4342,15 +4345,6 @@ std::string TuningWgslBlock(const Tuning& t);
 const Tuning& CurrentTuning();
 void SetCurrentTuning(const Tuning& t);
 
-// Set a sim.* field by name (e.g. "windDragRef"). Returns false if the name
-// is unknown. For --sweep: lets you test parameter reachability without editing
-// tuning.json. Handles both int and float sim fields.
-// SUPERSEDED by SetTuningField below, and kept only because deleting a
-// 60-row hand-kept table out of tuning.cpp is a merge conflict against
-// every concurrent session for no behavioural gain. It has no callers.
-// Do not add rows to it -- add them to tuning_params.def, which is where
-// SetTuningField reads from and where the WGSL constants come from too.
-bool SetSimField(Tuning& t, const std::string& name, float value);
 // Any group, by the tuning_params.def name. This is what --sweep uses, so a new
 // row is sweepable the moment it exists. Returns false for an unknown group or
 // member, and for TP_V3 rows (a vec3 has no single float to sweep).

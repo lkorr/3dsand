@@ -224,119 +224,6 @@ bool SetTuningField(Tuning& t, const std::string& group,
   return false;
 }
 
-bool SetSimField(Tuning& t, const std::string& name, float value) {
-  auto& s = t.sim;
-  // Integer sim fields
-  struct IntEntry { const char* n; int Tuning::Sim::*p; };
-  static const IntEntry iFields[] = {
-    {"partGravity", &Tuning::Sim::partGravity},
-    {"partMaxVel", &Tuning::Sim::partMaxVel},
-    {"partBuoyMax", &Tuning::Sim::partBuoyMax},
-    {"partSettleSpeed", &Tuning::Sim::partSettleSpeed},
-    {"partFloatPatience", &Tuning::Sim::partFloatPatience},
-    {"airDensity", &Tuning::Sim::airDensity},
-    {"falloffPerCell", &Tuning::Sim::falloffPerCell},
-    {"ejectSolid", &Tuning::Sim::ejectSolid},
-    {"ejectLiquid", &Tuning::Sim::ejectLiquid},
-    {"ejectPowder", &Tuning::Sim::ejectPowder},
-    {"ejectGas", &Tuning::Sim::ejectGas},
-    {"liquidEqualize", &Tuning::Sim::liquidEqualize},
-    {"liquidMinFilm", &Tuning::Sim::liquidMinFilm},
-    {"wanderHopMask", &Tuning::Sim::wanderHopMask},
-    {"expMicroPerMille", &Tuning::Sim::expMicroPerMille},
-    {"expMicroLifeTicks", &Tuning::Sim::expMicroLifeTicks},
-    {"expMicroScaleIdx", &Tuning::Sim::expMicroScaleIdx},
-    {"fluidEosPower", &Tuning::Sim::fluidEosPower},
-    {"fluidExciteMode", &Tuning::Sim::fluidExciteMode},
-    {"fluidExciteCeiling", &Tuning::Sim::fluidExciteCeiling},
-    {"fluidExciteRate", &Tuning::Sim::fluidExciteRate},
-    {"fluidExcitePerch", &Tuning::Sim::fluidExcitePerch},
-    {"fluidExciteStep", &Tuning::Sim::fluidExciteStep},
-    {"fluidSettleTicks", &Tuning::Sim::fluidSettleTicks},
-    {"fluidSubmergedSolid", &Tuning::Sim::fluidSubmergedSolid},
-    {"fluidStuckTicks", &Tuning::Sim::fluidStuckTicks},
-    {"fluidForceBlocks", &Tuning::Sim::fluidForceBlocks},
-    {"fluidForceReach", &Tuning::Sim::fluidForceReach},
-    {"fluidSplashScaleIdx", &Tuning::Sim::fluidSplashScaleIdx},
-    {"fluidFoamScaleIdx", &Tuning::Sim::fluidFoamScaleIdx},
-    {"waterBodyMode", &Tuning::Sim::waterBodyMode},
-    {"waterBodyMinVolume", &Tuning::Sim::waterBodyMinVolume},
-    {"waterBodyExitVolume", &Tuning::Sim::waterBodyExitVolume},
-    {"waterBodySpreadEnter", &Tuning::Sim::waterBodySpreadEnter},
-    {"waterBodySpreadExit", &Tuning::Sim::waterBodySpreadExit},
-    {"waterBodyQuietTicks", &Tuning::Sim::waterBodyQuietTicks},
-    {"waterBodyMaxCount", &Tuning::Sim::waterBodyMaxCount},
-    {"waterBodyTestDrain", &Tuning::Sim::waterBodyTestDrain},
-    {"drainMaxEighthsPerTick", &Tuning::Sim::drainMaxEighthsPerTick},
-    {"drainExciteRadius", &Tuning::Sim::drainExciteRadius},
-    {"waterRelevelMax", &Tuning::Sim::waterRelevelMax},
-    {"waterRelevelGain", &Tuning::Sim::waterRelevelGain},
-    {"waterRelevelDepth", &Tuning::Sim::waterRelevelDepth},
-    {"waveMode", &Tuning::Sim::waveMode},
-    {"waveDepthCap", &Tuning::Sim::waveDepthCap},
-    {"waveSleepEps", &Tuning::Sim::waveSleepEps},
-    {"waveBlastImpulse", &Tuning::Sim::waveBlastImpulse},
-    {"waveDrainSink", &Tuning::Sim::waveDrainSink},
-    {"waveSwimWake", &Tuning::Sim::waveSwimWake},
-    {"waterDiscoverMinEighths", &Tuning::Sim::waterDiscoverMinEighths},
-    {"waterAdoptMinArea", &Tuning::Sim::waterAdoptMinArea},
-    {"windMode", &Tuning::Sim::windMode},
-    {"gasMode", &Tuning::Sim::gasMode},
-    {"currentMode", &Tuning::Sim::currentMode},
-    {"currentVortexRadius", &Tuning::Sim::currentVortexRadius},
-    {"currentStreamMinSlope", &Tuning::Sim::currentStreamMinSlope},
-  };
-  for (const auto& e : iFields) {
-    if (name == e.n) { s.*(e.p) = (int)value; return true; }
-  }
-  // Float sim fields
-  struct FloatEntry { const char* n; float Tuning::Sim::*p; };
-  static const FloatEntry fFields[] = {
-    {"fluidGravity", &Tuning::Sim::fluidGravity},
-    {"fluidStiffness", &Tuning::Sim::fluidStiffness},
-    {"fluidRestDensity", &Tuning::Sim::fluidRestDensity},
-    {"fluidCohesion", &Tuning::Sim::fluidCohesion},
-    {"fluidViscosity", &Tuning::Sim::fluidViscosity},
-    {"fluidDamping", &Tuning::Sim::fluidDamping},
-    {"fluidFriction", &Tuning::Sim::fluidFriction},
-    {"fluidSplashRate", &Tuning::Sim::fluidSplashRate},
-    {"fluidSplashSpeed", &Tuning::Sim::fluidSplashSpeed},
-    {"fluidSplashMaxDensity", &Tuning::Sim::fluidSplashMaxDensity},
-    {"fluidSplashLife", &Tuning::Sim::fluidSplashLife},
-    {"fluidFoamRate", &Tuning::Sim::fluidFoamRate},
-    {"fluidFoamCrestRate", &Tuning::Sim::fluidFoamCrestRate},
-    {"fluidSettledMass", &Tuning::Sim::fluidSettledMass},
-    {"fluidSettleEps", &Tuning::Sim::fluidSettleEps},
-    {"fluidWakeSpeed", &Tuning::Sim::fluidWakeSpeed},
-    {"fluidStainRate", &Tuning::Sim::fluidStainRate},
-    {"drainCd", &Tuning::Sim::drainCd},
-    {"drainGravity", &Tuning::Sim::drainGravity},
-    {"waveGravity", &Tuning::Sim::waveGravity},
-    {"waveDamping", &Tuning::Sim::waveDamping},
-    {"windDrag", &Tuning::Sim::windDrag},
-    {"windFluidGain", &Tuning::Sim::windFluidGain},
-    {"windFluidMass", &Tuning::Sim::windFluidMass},
-    {"windDriftSpeed", &Tuning::Sim::windDriftSpeed},
-    {"windDriftMax", &Tuning::Sim::windDriftMax},
-    {"windEntrainSpeed", &Tuning::Sim::windEntrainSpeed},
-    {"windEntrainRate", &Tuning::Sim::windEntrainRate},
-    {"windGasScale", &Tuning::Sim::windGasScale},
-    {"windPartScale", &Tuning::Sim::windPartScale},
-    {"windDragRef", &Tuning::Sim::windDragRef},
-    {"fluidAttractSame", &Tuning::Sim::fluidAttractSame},
-    {"fluidAttractDiff", &Tuning::Sim::fluidAttractDiff},
-    {"currentVortexGamma", &Tuning::Sim::currentVortexGamma},
-    {"currentVortexDecay", &Tuning::Sim::currentVortexDecay},
-    {"currentSinkSpeed", &Tuning::Sim::currentSinkSpeed},
-    {"currentStreamScale", &Tuning::Sim::currentStreamScale},
-    {"currentDrag", &Tuning::Sim::currentDrag},
-  };
-  for (const auto& e : fFields) {
-    if (name == e.n) { s.*(e.p) = value; return true; }
-  }
-  return false;
-}
-
 // ---- variance draws ------------------------------------------------------
 // Hash from sim/rng.h: the draw is a pure function of (seed, tick, index), so
 // it is identical on every machine and a replay reproduces it. Never seed this
@@ -2381,6 +2268,33 @@ bool LoadTuning(const std::string& path, Tuning& out) {
     // TuningWgslBlock emits from the struct.
     ReadF(*g, "waveSimSlope", r.waveSimSlope, out, at);
     ReadF(*g, "waveSimFoam", r.waveSimFoam, out, at);
+    // M4 surface waves (PLAN_water_master.md component 9). These had .def
+    // rows, struct fields, tuning.json values and tuner sliders since 9a79eba
+    // but no read here, so every slider was dead and the shader always ran the
+    // tuning.h defaults. check_invariants.py now refuses a .def row with no
+    // quoted read in this file.
+    ReadF(*g, "waveDispersion", r.waveDispersion, out, at);
+    ReadF(*g, "waveSteepness", r.waveSteepness, out, at);
+    ReadF(*g, "waveShoreDepth", r.waveShoreDepth, out, at);
+    ReadF(*g, "waveFlowScale", r.waveFlowScale, out, at);
+    ReadF(*g, "waveFoamThreshold", r.waveFoamThreshold, out, at);
+    ReadF(*g, "waveFoamGain", r.waveFoamGain, out, at);
+    ReadF(*g, "waveImpactSpeed", r.waveImpactSpeed, out, at);
+    ReadF(*g, "waveImpactDecay", r.waveImpactDecay, out, at);
+    ReadF(*g, "waveImpactLen", r.waveImpactLen, out, at);
+    // Dispersion is a mix() weight and steepness a crest fraction: both mean
+    // nothing outside 0..1. The rest are lengths / rates / gains that go
+    // nonsensical (or divide by ~0 in raymarch.wgsl) below their floor; the
+    // ceilings are generous past the tuner's slider range.
+    r.waveDispersion = std::clamp(r.waveDispersion, 0.0f, 1.0f);
+    r.waveSteepness = std::clamp(r.waveSteepness, 0.0f, 1.0f);
+    r.waveShoreDepth = std::clamp(r.waveShoreDepth, 0.0f, 16.0f);
+    r.waveFlowScale = std::clamp(r.waveFlowScale, 0.0f, 16.0f);
+    r.waveFoamThreshold = std::clamp(r.waveFoamThreshold, 0.0f, 16.0f);
+    r.waveFoamGain = std::clamp(r.waveFoamGain, 0.0f, 100.0f);
+    r.waveImpactSpeed = std::clamp(r.waveImpactSpeed, 0.0f, 50.0f);
+    r.waveImpactDecay = std::clamp(r.waveImpactDecay, 0.05f, 60.0f);
+    r.waveImpactLen = std::clamp(r.waveImpactLen, 0.05f, 20.0f);
     ReadF(*g, "iceF0", r.iceF0, out, at);
     ReadF(*g, "iceFresnelPower", r.iceFresnelPower, out, at);
     ReadF(*g, "iceAbsorb", r.iceAbsorb, out, at);
