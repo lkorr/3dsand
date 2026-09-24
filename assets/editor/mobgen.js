@@ -15,13 +15,14 @@
  * is the arrangement treegen.js / biomegen.js / watergen.js already use and
  * the reason the Trees page shows the engine's actual tree.
  *
- * THE PORT IS PINNED. `generateMob(defaultGenome())` reproduces
- * gen_human.py's output cell for cell — same limb boxes, same voxels, same
- * art slots, same placements, same sidecar fields. `scripts/test_mobgen.mjs`
- * asserts it against a digest of a live gen_human.py run. That is the one
- * test that makes a 1,588-line translation safe, and it is why every
- * default below is the exact literal the Python carries rather than a tidier
- * number nearby.
+ * THE STANDARD IS assets/mobs/human.json. The port was pinned cell for cell
+ * against gen_human.py's own output until 2026-09-24, which is why every
+ * default below is the exact literal the Python carried rather than a tidier
+ * number nearby. That pin and the Python are DELETED (rule-unification W1-E):
+ * the Python had stopped reproducing the shipped human, so the pin held this
+ * file to a stale rig. `scripts/test_mobgen.mjs` §L now holds the default
+ * genome's rig contract to human.json and §M every bred character to its
+ * genome; `scripts/generator_parity.mjs` runs it after every edit here.
  *
  * NOTE: it does NOT reproduce assets/mobs/human.vox, and neither does
  * gen_human.py any more. The shipped human has been hand-extended past its
@@ -2148,9 +2149,9 @@ export function generateMob(genome, seed = 0, opts = {}) {
     cells = upscaleCells(cells, SKIN_UPSCALE);
     // THE SHOULDER ROUND, after the upscale because that is the only lattice
     // fine enough to round on (see roundShoulders). `roundShoulders: false`
-    // gives gen_human.py's geometry exactly, which is what the port pin in
-    // scripts/test_mobgen.mjs builds with — the pin proves the TRANSLATION, and
-    // this is a deliberate improvement on top of it rather than part of it.
+    // gives the retired gen_human.py's geometry exactly, which is what
+    // scripts/test_mobgen.mjs §K measures the round against — a deliberate
+    // improvement on top of the translation rather than part of it.
     if (opts.roundShoulders !== false) {
       const before = cells.length;
       if (ARCHETYPE.shoulders.fin.includes(nm))
@@ -2237,9 +2238,9 @@ export function generateMob(genome, seed = 0, opts = {}) {
  * out of one implementation. `scripts/anatomize_mob.mjs` stays as the way to
  * (re-)bake a mob that is ALREADY on disk, including hand-authored ones.
  *
- * SEPARATE FROM generateMob ON PURPOSE. The port pin (`test_mobgen.mjs`) is
- * against `gen_human.py`, which has no anatomy pass, so the generator's own
- * output has to stay the un-baked figure. Baking is a second, named step.
+ * SEPARATE FROM generateMob ON PURPOSE. The generator's own output is the
+ * un-baked figure (the retired gen_human.py it was ported from had no anatomy
+ * pass). Baking is a second, named step.
  *
  * @param built  the object generateMob returned; `vox` is REPLACED in place
  * @param materials the engine material list in ID order

@@ -2922,8 +2922,8 @@ void Overlay::Draw(UIState& s) {
               ImGui::SetTooltip(
                   "Radius in metres within which combat sounds are\n"
                   "audible. Same unit as audio cue groups.");
-            ImGui::TextDisabled("assets are PLACEHOLDERS —");
-            ImGui::TextDisabled("scripts/gen_combat_sounds.py");
+            ImGui::TextDisabled("add takes through");
+            ImGui::TextDisabled("scripts/import_sounds.py");
           }
           ImGui::EndChild();
           ImGui::EndTabItem();

@@ -309,7 +309,7 @@ bool mobOk = false;
   SubmitWorldgen(ctx, world, sim, kDefaultSeed);
   ctx.WaitIdle();
   if (mobs.Defs().empty()) {
-    std::printf("mob: FAIL (no mob defs — run scripts/gen_test_mob.py)\n");
+    std::printf("mob: FAIL (no mob defs — assets/mobs/ has no loadable sidecar)\n");
   } else {
     // ---- the shared clip library (assets/anims/*.json) -------------------
     // Data-driven: every file there must have compiled onto the human rig
@@ -561,8 +561,8 @@ bool mobOk = false;
     for (size_t i = 0; i < mobs.Defs().size(); i++)
       if (mobs.Defs()[i].name == "critter") critterDef = (int)i;
     if (critterDef < 0) {
-      std::printf("mob gait: SKIP (no critter def — run "
-                  "scripts/gen_critter_mob.py)\n");
+      std::printf("mob gait: SKIP (no critter def in "
+                  "assets/mobs/; critter.{vox,json} are editor-owned)\n");
     } else {
       const MobDef& cd = mobs.Defs()[critterDef];
       auto critterLimb = [&](const char* nm) {
