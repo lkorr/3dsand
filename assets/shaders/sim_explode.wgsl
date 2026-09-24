@@ -57,6 +57,23 @@ fn markBoth(c : vec3<i32>) {  // callers have bounds-checked c
   atomicOr(&dirtyOut[ci], DIRTY_R_MUTATE);
 }
 
+// markBoth for a cell that was DESTROYED: its own chunk plus every chunk it
+// borders (common.wgsl's dirtyFanSlot, the rule sim_mutate's markBoth uses).
+// A vacated cell on a chunk face changes what the cell across that face sees
+// — a sand grain now has air beside or under it — and the chunk holding that
+// grain may be outside the blast ball, so `mark`'s shockwave never woke it and
+// nothing else would. The shockwave marks in `mark` stay own-chunk: they wake
+// cells the blast passed THROUGH, where nothing vacated.
+fn markVacated(c : vec3<i32>) {
+  for (var k = 0u; k < 8u; k++) {
+    let ci = dirtyFanSlot(c, T.origin, k);
+    if (ci != SLOT_NONE) {
+      atomicOr(&dirtyIn[ci], DIRTY_R_MUTATE);
+      atomicOr(&dirtyOut[ci], DIRTY_R_MUTATE);
+    }
+  }
+}
+
 fn maskIndex(opIdx : u32, local : vec3<i32>) -> u32 {
   let l = local + vec3<i32>(EXP_R_MAX);
   return opIdx * EXP_MASK_STRIDE + u32((l.z * EXP_BOX + l.y) * EXP_BOX + l.x);
@@ -133,10 +150,11 @@ fn apply(@builtin(workgroup_id) wg : vec3<u32>,
   // note in sim_step:main — an RNG keyed on a page index makes the ejecta
   // stream a function of allocation history.
   let slotIdx = cellIndexW(c);
-  let w = voxWordAt(c);
-  voxStore(voxWordIndex(c), 0u);
-  markBoth(c);
-  // This cell is now air. markBoth above only WAKES the chunk, which makes the
+  let iw = voxIndexAndWord(c);  // one table resolution for index + word
+  let w = iw.y;
+  voxStore(iw.x, 0u);
+  markVacated(c);
+  // This cell is now air. markVacated above only WAKES chunks, which makes the
   // CA re-run there — and the CA cannot drop a solid, so waking it is not the
   // same as noticing the loss. The flag is what reaches island detection.
   // Distinct from the shockwave's markBoth in `mark`: that one wakes chunks the

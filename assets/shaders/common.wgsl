@@ -253,18 +253,25 @@ fn matCanAct(m : Material) -> bool {
 // active-chunk overlay says a pond's chunks never sleep; the ACTIVE-VOXEL
 // overlay beside it says nothing is being written there. Those two are
 // consistent because `markVoxActive` is called only from sim_step's WRITE
-// paths, while `markDirty` has four callers that write no voxel at all — a
+// paths, while `markDirty` has callers that write no voxel at all — a
 // reaction rule that matched and did not fire, a stain with unsaturated
-// surface still in reach, and the two `canFlowAnywhere` "settled but not
-// stable" arms — plus three other shaders with their own marks. A count of
-// awake chunks cannot tell those apart. This mask can, in one run.
+// surface still in reach, and the viscous off-tick's `canFlowAnywhere` —
+// plus three other shaders with their own marks. A count of awake chunks
+// cannot tell those apart. This mask can, in one run. Those non-write marks
+// reach only the OWN chunk (sim_step's markDirtyR); writes fan out.
+//
+// DIRTY_R_FLOW IS RETIRED (2026-09-23) and the bit is kept only so the
+// numbering and the CPU's reason names stay put. It was set by a
+// `canFlowAnywhere` call right after a stepLiquid that moved nothing; that
+// predicate mirrors stepLiquid stage for stage against the same unwritten
+// state, so it was provably false there and the bit was never set.
 //
 // The bits are diagnostic only: nothing branches on them, and a reader that
 // wants the old boolean gets it from `!= 0` exactly as before.
 const DIRTY_R_WRITE    : u32 = 1u;    // sim_step wrote a voxel (move/react/stain)
 const DIRTY_R_REACT    : u32 = 2u;    // doReactions: rule MATCHED, did not fire
 const DIRTY_R_STAIN    : u32 = 4u;    // doStaining: unsaturated surface in reach
-const DIRTY_R_FLOW     : u32 = 8u;    // canFlowAnywhere true, stepLiquid moved nothing
+const DIRTY_R_FLOW     : u32 = 8u;    // RETIRED: never set (see above)
 const DIRTY_R_VISCOUS  : u32 = 16u;   // viscous off-tick with somewhere to go
 const DIRTY_R_SEAM     : u32 = 32u;   // sim_fluid_seam (excite / settle / stain)
 const DIRTY_R_PARTICLE : u32 = 64u;   // sim_particle resolve
@@ -3768,6 +3775,32 @@ fn slotWorldChunk(slot : u32, o : vec3<i32>) -> vec3<i32> {
   return slotToWorldChunk(sc, o);
 }
 
+// ---- THE DIRTY FAN-OUT: which chunks a mark at cell c must reach ----------
+// A write at c can change what any cell within 1 of it sees, so the mark goes
+// to c's own chunk AND to every chunk c borders: 1 chunk for an interior cell,
+// 2 on a face, 4 on an edge, 8 on a corner. Enumerated as k = 0..7, bit 0/1/2
+// = step across the x/y/z face; a k that steps across a face c is NOT on is
+// SLOT_NONE, as is a chunk outside residency. k = 0 is always the own chunk.
+//
+// Buffer-free on purpose: every kernel that marks names its own dirty buffer
+// (and sim_mutate marks two), and a function here that touched one would not
+// compile in the shaders that do not declare it. So each kernel keeps a
+// three-line loop and this is the one copy of the RULE. It replaced six
+// copy-pasted 2x2x2 loops that issued 8 atomicOrs to the SAME word for every
+// interior cell (all offsets {0,0}); the set of slots marked is unchanged, and
+// atomicOr is idempotent and order-free, so this is invisible to rule 1.
+fn dirtyFanSlot(c : vec3<i32>, o : vec3<i32>, k : u32) -> u32 {
+  let lo = c & vec3<i32>(CHUNK_MASK);
+  // Per-axis step toward the bordered neighbour, 0 for an interior coordinate.
+  let e = vec3<i32>(select(select(0, 1, lo.x == CHUNK_MASK), -1, lo.x == 0),
+                    select(select(0, 1, lo.y == CHUNK_MASK), -1, lo.y == 0),
+                    select(select(0, 1, lo.z == CHUNK_MASK), -1, lo.z == 0));
+  let pick = vec3<bool>((k & 1u) != 0u, (k & 2u) != 0u, (k & 4u) != 0u);
+  // A requested step on an interior axis is a duplicate of a smaller k.
+  if (any(pick & (e == vec3<i32>(0)))) { return SLOT_NONE; }
+  return chunkSlotOf(worldChunkOf(c) + select(vec3<i32>(0), e, pick), o);
+}
+
 // ---- far-field cascades (render-only LOD — DESIGN.md §9) ----
 // FAR_LEVELS nested toroidal FAR_N^3 volumes around the residency window, on
 // their OWN grid (decoupled from WORLD_N so growing the window doesn't
@@ -5817,6 +5850,34 @@ fn voxWordInChunk(chunkSlot : u32, localIdx : u32) -> u32 {
     return PT_NO_WORD;
   }
   return e * CHUNK_VOL + localIdx;
+}
+
+// voxWordIndex(c) AND voxWordAt(c) from ONE table resolution: .x is the
+// writable index (PT_NO_WORD for a sentinel, with the same fault bookkeeping
+// voxWordIndex does), .y the word (synthesized for a sentinel). For the
+// read-modify-write sites that used to resolve the same cell twice.
+fn voxIndexAndWord(c : vec3<i32>) -> vec2<u32> {
+  let slot = voxSlotOfCell(c);
+  let e = pageTable[slot];
+  let lo = vec3<u32>(c & vec3<i32>(CHUNK_MASK));
+  let local = (lo.z * CHUNK + lo.y) * CHUNK + lo.x;
+  if ((e & PT_SENTINEL_BIT) != 0u) {
+    gPtSlot = slot;
+    gPtEntry = e;
+    gPtLocal = local;
+    return vec2<u32>(PT_NO_WORD, synthWordAt(e, c, ptSeed()));
+  }
+  let i = e * CHUNK_VOL + local;
+  return vec2<u32>(i, voxels[i]);
+}
+
+// The chunk-linear twin: voxWordInChunk + voxWordInChunkAt, one resolution.
+fn voxIndexAndWordInChunk(chunkSlot : u32, localIdx : u32) -> vec2<u32> {
+  let i = voxWordInChunk(chunkSlot, localIdx);
+  if (i == PT_NO_WORD) {
+    return vec2<u32>(i, voxWordInChunkAt(chunkSlot, localIdx));  // cold: sentinel
+  }
+  return vec2<u32>(i, voxels[i]);
 }
 
 
