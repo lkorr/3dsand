@@ -4616,7 +4616,8 @@ class MobSystem {
   // how many were knocked down.
   int BlastMobsRadial(Vec3 centerWorldVoxel, float radiusVoxels,
                       float impulseKgMs);
-  // Mob::AppendLiveLimbBodies over every live NPC.
+  // Mob::AppendLiveLimbBodies over every live NPC, plus every limb of an
+  // unreleased corpse (a dead rig is still a rig: see the definition).
   void AppendLiveLimbBodies(std::vector<uint64_t>& out) const;
   // Dev panel / tests: put one creature (or every live one) on the floor.
   bool RagdollMob(uint64_t mobId, float minSeconds);

@@ -4285,10 +4285,17 @@ Status GateMobBurn(Ctx& c, std::string& detail) {
       // Severing the ROOT limb is death (Sever routes root/vital to Die).
       mobs.Sever(id, rootLimb);
       const bool dead = !mobs.IsAlive(id);
+      // Tombstones out: a dead Mob's burnt voxels sit in its lattice as
+      // material 0 until FlushBurn's batch threshold fills, and DebrisSystem
+      // (which this used to count) compacted at once.
       auto corpseVoxels = [&]() {
         uint32_t n = debris.TotalBodyVoxels();
         for (int li = 0; li < nLimbs; li++)
-          if (mobs.LimbBody(id, li)) n += mobs.LimbArtVoxelCount(id, li);
+          if (mobs.LimbBody(id, li)) {
+            const uint32_t art = mobs.LimbArtVoxelCount(id, li);
+            const uint32_t gone = mobs.LimbMaterialCount(id, li, 0u);
+            n += art > gone ? art - gone : 0u;
+          }
         return n;
       };
       auto corpseBodies = [&]() {

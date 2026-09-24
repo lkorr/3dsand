@@ -7775,7 +7775,20 @@ void Mob::AppendLiveLimbBodies(std::vector<uint64_t>& out) const {
 }
 
 void MobSystem::AppendLiveLimbBodies(std::vector<uint64_t>& out) const {
-  for (const Mob& m : mobs_) m.AppendLiveLimbBodies(out);
+  for (const Mob& m : mobs_) {
+    // A CORPSE IS STILL A RIG (PLAN_corpse_is_a_mob.md). This list is what the
+    // explosion's per-body impulse skips, and that impulse on a dead Mob's
+    // 0.3 kg hand is the same "bodies zoom across the map" it is on a limp
+    // living one: the dead take the one capped rig launch instead
+    // (BlastMobsRadial). A released rig's limbs are DebrisSystem's and are
+    // not listed.
+    if (!m.alive_ && !m.rigReleased_) {
+      for (const MobLimb& l : m.limbs_)
+        if (l.body && l.holdSeconds <= 0) out.push_back(l.body);
+      continue;
+    }
+    m.AppendLiveLimbBodies(out);
+  }
 }
 
 void Mob::SetLimbVelocities(Vec3 velVoxPerSec) {
@@ -7798,7 +7811,10 @@ void Mob::SetLimbVelocities(Vec3 velVoxPerSec) {
 
 bool Mob::BlastRadial(Vec3 centerWorldVoxel, float radiusVoxels,
                       float impulseKgMs) {
-  if (!alive_ || !phys_ || radiusVoxels <= 0.0f) return false;
+  if (!phys_ || radiusVoxels <= 0.0f) return false;
+  // The dead take the launch too, as the limp rig they are (a released one
+  // is DebrisSystem's and takes the per-body impulse like any debris).
+  if (!alive_ && (rigReleased_ || ragdoll_ != RagdollPhase::Limp)) return false;
   const auto& rg = CurrentTuning().ragdoll;
   // Measured at the pelvis, so a creature is "in the blast" by where its
   // body is and not by its walk anchor (which is a floor corner).
@@ -7818,7 +7834,8 @@ bool Mob::BlastRadial(Vec3 centerWorldVoxel, float radiusVoxels,
   dir = dir.normalized();
   if (dir.len() < 0.5f) dir = {0, 1, 0};
   const bool wasLimp = ragdoll_ == RagdollPhase::Limp;
-  StartRagdoll(rg.minSeconds, "blast");
+  if (alive_) StartRagdoll(rg.minSeconds, "blast");
+  else WakeDead();
   if (ragdoll_ != RagdollPhase::Limp) return false;
   const float launchVox = MetresToCells(speedMs);
   const float ceiling = MetresToCells(rg.maxLaunchSpeed);
@@ -8215,8 +8232,11 @@ void Mob::TickGetUp(float dt) {
 int MobSystem::BlastMobsRadial(Vec3 centerWorldVoxel, float radiusVoxels,
                                float impulseKgMs) {
   int n = 0;
+  // The dead too: a corpse is a limp rig and takes the same one launch
+  // (Mob::BlastRadial), never the per-body impulse (AppendLiveLimbBodies).
   for (Mob& mob : mobs_)
-    if (mob.alive_ && mob.BlastRadial(centerWorldVoxel, radiusVoxels, impulseKgMs))
+    if (!mob.rigReleased_ &&
+        mob.BlastRadial(centerWorldVoxel, radiusVoxels, impulseKgMs))
       n++;
   return n;
 }
@@ -18221,8 +18241,11 @@ void Mob::Sever(int limbIndex) {
     }
   }
   if (limbIndex == def.rootLimb || !ld.severable) {
-    deathCause_ = inBurnFlush_ ? "vital limb burnt/dissolved away"
-                               : "vital limb destroyed";
+    // HOW IT DIED IS WRITTEN ONCE. A corpse is a dead Mob now and still loses
+    // limbs (a fire, a later blast); that is not a second death.
+    if (alive_)
+      deathCause_ = inBurnFlush_ ? "vital limb burnt/dissolved away"
+                                 : "vital limb destroyed";
     Die();
   } else {
     // A VITAL LIMB THAT IS SEVERABLE COMES OFF, AND THEN THE CREATURE DIES OF
@@ -18234,7 +18257,7 @@ void Mob::Sever(int limbIndex) {
     // the torso's stump is armed exactly as for an arm, and only then does the
     // corpse take over, wounds and all (Die -> AdoptBody(WoundOf)).
     const bool fatal = ld.vital;
-    if (fatal)
+    if (fatal && alive_)   // written once: see the root branch above
       deathCause_ = inBurnFlush_ ? "vital limb burnt/dissolved away"
                                  : "vital limb destroyed";
       // The cut point in WORLD space, captured BEFORE DetachLimb: the joint
