@@ -1418,10 +1418,73 @@ bool LoadAssets(const std::string& materialsPath, const std::string& reactionsPa
         d.gpu.molten = (uint32_t)id;
     }
   }
+  CheckPinnedMaterialIds(m, materialsPath, errors);
   if (!errors.empty()) return false;
   mats = std::move(m);
   reactions = std::move(r);
   return true;
+}
+
+// ---- the kMat* literals, resolved by NAME (rule-unification W1-D) ------------
+//
+// world.h's kMat* constants are compile-time ids because they feed the WGSL
+// prelude and a hundred switch statements; they stay literals. What was
+// missing is the RUNTIME half of the promise they make: that the material at
+// that position in materials.json is the one the name says. check_invariants.py
+// (check_material_ids) pins it statically; this makes the running build refuse
+// too, so an edited materials.json cannot load stone where the code means
+// water (kMatMushroomLarge drifted one slot exactly that way on 2026-09-17).
+//
+// The name of each constant is spelled out rather than derived from the C++
+// identifier: `check_invariants.py pinnedids` holds this table and world.h to
+// the same list, so a new kMat* without a row here fails the static check.
+void CheckPinnedMaterialIds(const std::vector<MaterialDef>& mats,
+                            const std::string& path, std::string& errors) {
+  struct Pin {
+    uint32_t id;
+    const char* name;
+  };
+  static const Pin kPins[] = {
+      {kMatAir, "air"}, {kMatStone, "stone"}, {kMatWood, "wood"},
+      {kMatSand, "sand"}, {kMatGravel, "gravel"}, {kMatWater, "water"},
+      {kMatOil, "oil"}, {kMatSmoke, "smoke"}, {kMatSteam, "steam"},
+      {kMatFire, "fire"}, {kMatEmber, "ember"}, {kMatAsh, "ash"},
+      {kMatLava, "lava"}, {kMatAcid, "acid"}, {kMatIce, "ice"},
+      {kMatSnow, "snow"}, {kMatDirt, "dirt"}, {kMatPlant, "plant"},
+      {kMatSeed, "seed"}, {kMatSprout, "sprout"}, {kMatStem, "stem"},
+      {kMatFlower, "flower"}, {kMatVine, "vine"}, {kMatFungus, "fungus"},
+      {kMatDust, "dust"}, {kMatMoltenGlass, "molten_glass"},
+      {kMatGlass, "glass"}, {kMatSourceWater, "source_water"},
+      {kMatSourceSand, "source_sand"}, {kMatSourceLava, "source_lava"},
+      {kMatVoid, "void"}, {kMatMite, "mite"}, {kMatBlood, "blood"},
+      {kMatGrass, "grass"}, {kMatLeaves, "leaves"},
+      {kMatPineNeedles, "pine_needles"}, {kMatAutumnLeaves, "autumn_leaves"},
+      {kMatBirchWood, "birch_wood"}, {kMatPetal, "petal"},
+      {kMatGrassTuft, "grass_tuft"}, {kMatFoliageBush, "foliage_bush"},
+      {kMatFlowerPoppy, "flower_poppy"}, {kMatFlowerDaisy, "flower_daisy"},
+      {kMatPetalRed, "petal_red"}, {kMatPetalWhite, "petal_white"},
+      {kMatPetalYellow, "petal_yellow"}, {kMatLeafGreen, "leaf_green"},
+      {kMatStemGreen, "stem_green"}, {kMatFlowerBluebell, "flower_bluebell"},
+      {kMatFlowerFoxglove, "flower_foxglove"},
+      {kMatFlowerButtercup, "flower_buttercup"}, {kMatFern, "fern"},
+      {kMatMushroomCluster, "mushroom_cluster"},
+      {kMatToadstoolPale, "toadstool_pale"}, {kMatTallGrass, "tall_grass"},
+      {kMatTallGrassHead, "tall_grass_head"},
+      {kMatMushroomLarge, "mushroom_large"},
+  };
+  for (const Pin& p : kPins) {
+    if (p.id < mats.size() && mats[p.id].name == p.name) continue;
+    const int at = FindMaterial(mats, p.name);
+    errors += path + ": world.h pins material id " + std::to_string(p.id) +
+              " to \"" + p.name + "\" but " +
+              (p.id < mats.size() ? "that position holds \"" + mats[p.id].name + "\""
+                                  : std::string("the table ends before it")) +
+              (at >= 0 ? " (\"" + std::string(p.name) + "\" is at " +
+                             std::to_string(at) + ")"
+                       : std::string(" (no material by that name)")) +
+              " -- a material was inserted, removed or renamed above it; the "
+              "compiled-in id would name the wrong substance\n";
+  }
 }
 
 std::vector<uint32_t> BuildCollisionClasses(const std::vector<MaterialDef>& mats) {

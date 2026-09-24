@@ -464,6 +464,8 @@ add_library(sandvox_core OBJECT
   src/sim/faredits.cpp
   src/sim/farplumes.cpp
   src/sim/chunkstore.cpp
+  # Material name tables in saves (rule-unification W1-D).
+  src/sim/mattable.cpp
   src/sim/simulation.cpp
   src/sim/pass_table.cpp
   src/sim/materials.cpp

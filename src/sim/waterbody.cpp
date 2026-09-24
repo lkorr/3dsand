@@ -8,6 +8,7 @@
 #include <cstring>
 
 #include "sim/bytestream.h"
+#include "sim/mattable.h"
 #include "sim/tuning.h"
 
 namespace sandvox {
@@ -596,6 +597,10 @@ bool WaterBodySystem::LoadState(const uint8_t* data, size_t len,
   std::vector<WaterDiscoverRec> recs;
   r.PodVec(recs);
   if (!r.ok) return false;
+  // MATERIAL NAMES (sim/mattable.h, W1-D): matId is in the table world.sve
+  // named; remapped by name before the water/oil/lava filter below reads it.
+  if (const MatRemap* mr = ActiveLoadRemap())
+    for (WaterDiscoverRec& rec : recs) rec.matId = mr->Mat(rec.matId);
   for (const WaterDiscoverRec& rec : recs) {
     if (discovered_.size() >= kWaterDiscoveredCap) break;
     if (rec.slot >= kWaterDiscoveredCap) continue;

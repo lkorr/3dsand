@@ -6,6 +6,7 @@
 #include <cstring>
 #include <string>
 
+#include "sim/mattable.h"
 #include "sim/waterbody.h"
 
 namespace {
@@ -195,9 +196,10 @@ void SavePlayerKitBytes(const PlayerKitRefs& r, std::vector<uint8_t>& out, uint3
   //   u32 equipCount   then per slot: u32 fill
   //
   // The dyes' parallel-array shape, for the dyes' reason. The material is an
-  // ID, not a name, because the grid this came out of is saved by id too: a
-  // content change that renumbers materials has already repainted the world,
-  // and a flask that kept its old name would be the one thing that disagreed.
+  // ID, not a name, like the grid it came out of -- and like the grid it is
+  // remapped BY NAME on load (rule-unification W1-D): the file that holds this
+  // payload names the material table it was written under (sim/mattable.h),
+  // so a renumbering content change no longer repaints either.
   auto putFills = [&](const ItemStack* v, int n) {
     PutU32(out, (uint32_t)n);
     for (int i = 0; i < n; i++)
@@ -293,6 +295,8 @@ bool LoadPlayerKit(const PlayerKitRefs& r, const uint8_t* data, size_t len,
           sh.lattice.push_back(PrefabVoxel{(int16_t)x, (int16_t)y, (int16_t)z,
                                            (uint16_t)m, (uint8_t)col});
         }
+        // Ids by the table this payload was written under (mattable.h).
+        if (const MatRemap* mr = ActiveLoadRemap()) RemapPrefabVoxels(sh.lattice, *mr);
         d.shells.push_back(std::move(sh));
       }
       // Damage for a piece that no longer exists is simply forgotten -- the
@@ -364,6 +368,8 @@ bool LoadPlayerKit(const PlayerKitRefs& r, const uint8_t* data, size_t len,
         const ItemDef* d = r.items->At(v[i].def);
         if (!d || !d->IsContainer()) continue;
         v[i].fillMat = ItemFillMat(f);
+        if (const MatRemap* mr = ActiveLoadRemap())
+          v[i].fillMat = (uint16_t)mr->Mat(v[i].fillMat);
         v[i].fillAmt = (uint16_t)std::min<int>(ItemFillAmt(f),
                                                d->container.capacity);
         if (v[i].fillAmt == 0) v[i].fillMat = 0;
@@ -467,7 +473,7 @@ bool LoadWorldItems(const WorldItemRefs& r, const uint8_t* data, size_t len,
   for (uint32_t i = 0; i < n && rd.ok; i++) {
     const std::string name = rd.Str();
     const uint32_t dye = version >= 2 ? rd.U32() : 0u;
-    const uint32_t fill = version >= 3 ? rd.U32() : 0u;
+    uint32_t fill = version >= 3 ? rd.U32() : 0u;
     const uint32_t bx = rd.U32(), by = rd.U32(), bz = rd.U32();
     if (!rd.ok) break;
     Vec3 at{};
@@ -491,6 +497,13 @@ bool LoadWorldItems(const WorldItemRefs& r, const uint8_t* data, size_t len,
       if (!rd.ok) break;
       lat.push_back(PrefabVoxel{(int16_t)vx, (int16_t)vy, (int16_t)vz,
                                 (uint16_t)vm, (uint8_t)vc});
+    }
+    // The lattice and the vessel's contents are ids in the table this record
+    // was written under; running ids from here on (sim/mattable.h).
+    if (const MatRemap* mr = ActiveLoadRemap()) {
+      RemapPrefabVoxels(lat, *mr);
+      if (fill != 0)
+        fill = PackItemFill((uint16_t)mr->Mat(ItemFillMat(fill)), ItemFillAmt(fill));
     }
     const ItemDef* d = r.items->At(r.items->Find(name));
     // Content legitimately disappears between saves. The item is dropped with
@@ -800,7 +813,8 @@ void MobParking::Bind(MobSystem& mobs, ChunkStore& store, bool enabled) {
   Stats* stats = &stats_;
   mobs.SetParkFn([st, stats](const Mob& m, std::vector<uint8_t>& record) {
     // THE SAME RECORD A SAVE WRITES: section, version, origin, SaveOne bytes
-    // (persist.cpp's 'MOBS' saveRecords builds exactly this).
+    // (persist.cpp's 'MOBS' saveRecords builds exactly this). Its matTable
+    // stays 0, "this process's running table" (mattable.h).
     ChunkStore::EntityRecord r;
     r.section = FourCC('M', 'O', 'B', 'S');
     r.version = MobSystem::kSaveVersion;
@@ -930,6 +944,9 @@ uint32_t MobParking::Unpark(MobSystem& mobs, ChunkStore& store, World& world,
           dormant.erase(dormant.begin() + (ptrdiff_t)i);
           ByteReader rd{r.bytes.data(), r.bytes.size()};
           bool refused = false;
+          // The record's lattice ids are in ITS table: a creature parked by a
+          // build with a different materials.json comes back by name.
+          const ScopedLoadRemap remapScope(store.Tables().RemapFor(r.matTable));
           // placeLimbs: it comes back in the pose it left in (mob.h LoadOne).
           if (mobs.LoadOne(rd, r.version, /*placeLimbs=*/true, &refused) !=
               nullptr) {

@@ -331,10 +331,10 @@ are deduplicated across mob defs, so 128 slots cover a whole cast.
 - **Save-format hardening + entity persistence (2026-08-22, worldio.h):**
   `meta.svm` is `'SVM4'` and now records the exact BIT PATTERN of
   `kVoxelMeters` and the full material NAME table alongside `kWorldN`/`kChunk`;
-  a load refuses any mismatch and names the exact field (down to "material id
-  12 was 'lava', build has 'acid'") — material ids are baked into every saved
-  chunk, and a silent voxel-size or table change is world corruption with a
-  green build. The directory also gains an optional `entities.sve`: a TLV
+  a load refuses any mismatch and names the exact field — a silent voxel-size
+  change is world corruption with a green build. (The material table was
+  refused the same way until 2026-09-24; it is now REMAPPED BY NAME, next
+  bullet.) The directory also gains an optional `entities.sve`: a TLV
   container of independently VERSIONED sections (`DBRS` debris bodies, `MOBS`
   mob instances incl. sever/carve state, `AVTR` the player avatar), written
   before `meta.svm` so meta's completed-save guarantee covers it. Unknown
@@ -348,6 +348,38 @@ are deduplicated across mob defs, so 128 slots cover a whole cast.
   invariant holds from tick one); anything saved mid-flight lands where it
   was, accepted. Entity state is CPU-float gameplay state outside the hashed
   domain (§7), so the grid hash round-trip is unchanged.
+- **Material names in saves (2026-09-24, rule-unification W1-D,
+  `sim/mattable.h`).** A material id is its position in `materials.json`, and
+  every save file stores ids — voxel words, and the lattices and fields inside
+  entity payloads (DBRS debris, MOBS stored limbs incl. body coats, ITMS
+  lattice + vessel fill, PLYR worn damage + fills, WTRB body material). Every
+  blob now carries the HASH of the name table (material names in id order +
+  stain-slot names; stain types are palette slots assigned in file order, so
+  they move too) it was written under: `SVR4` region headers, `SVX2` bucket
+  RECORDS (per record — one bucket mixes dormant records from older sessions
+  with ones parked this session), `SVE2` section containers. The tables are
+  written beside the save as content-addressed `mat_<hash>.svmt`, before the
+  first blob that names them (so an LRU spill after a crash is never
+  orphaned). Reads remap to the running table BY NAME on the way in
+  (`ChunkStore::ReadRegionFile` for chunks; for the opaque entity bytes the
+  loader wraps each apply in `ScopedLoadRemap` and the lattice readers call
+  `ActiveLoadRemap()`), so RAM, the GPU and every live system only ever hold
+  running ids and a reordered or grown `materials.json` loads the same world.
+  A name the running table lacks loads as clean air (a stain with no slot as
+  clean) and is named in the log; nothing is refused. Pre-W1-D (untagged)
+  files read under `meta.svm`'s inline table, which the first W1-D load that
+  sees it differ pins to `mat_legacy.svmt` before a save can rewrite meta; a
+  blob whose table cannot be found loads as stored and says so. The other half:
+  `world.h`'s `kMat*` literals stay compile-time (they feed the WGSL prelude),
+  but `LoadAssets` now resolves each against its NAME and refuses a
+  `materials.json` that moved one (`CheckPinnedMaterialIds`; its pin table is
+  held to `world.h` by `check_invariants.py matids`). Not covered: authored
+  `.svedit` edit layers (assets, not saves) still carry raw ids. Gate:
+  `save-material-remap` (CPU store vs a table with an inserted + swapped
+  material and swapped stain slots, the untagged/legacy and missing-table
+  paths; then SaveWorld under a permuted copy of the real materials and
+  LoadWorld under the real one — stored chunks' region hash matches BY NAME,
+  a debris lattice and a creature's coat follow the names).
 - **Entity state is split by owner (2026-09-23, `docs/PLAN_save_system.md`
   S4; supersedes the single `entities.sve` above).** Three files instead of
   one: **`r_x_y_z.sve`** beside each region's `.svr` holds the world-anchored

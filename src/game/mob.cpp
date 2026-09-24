@@ -20,6 +20,7 @@
 #include "phys/bodystain.h"
 #include "phys/lattice.h"
 #include "sim/bytestream.h"
+#include "sim/mattable.h"
 #include "sim/reactcpu.h"
 #include "sim/rng.h"
 #include "sim/scale.h"   // SkinScaleFor / NeededArtUpsample / MetresToCells
@@ -19786,6 +19787,14 @@ bool MobSystem::ReadMobRecord(ByteReader& r, MobRecord& out, uint32_t version) {
     r.Pod(out.lastSeenPos);
     r.U32(out.lastSeenTick);
   }
+  // MATERIAL NAMES (sim/mattable.h, W1-D): a stored lattice's ids are in the
+  // table its save file named; a loader that found that table differs from
+  // the running one has a remap in scope. Null (identity) for a handoff.
+  if (const MatRemap* mr = ActiveLoadRemap())
+    for (MobRecord::LimbState& s : out.limbs) {
+      RemapDebrisVoxels(s.voxels, *mr);
+      RemapPrefabVoxels(s.skinVoxels, *mr);
+    }
   return r.ok;
 }
 

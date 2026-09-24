@@ -56,6 +56,13 @@ constexpr uint32_t kRegionMagicV2 = 0x32525653;  // 'SVR2'
 // ChunkStore::EncodeRecord). Codec values are ChunkStore::Codec; an unknown
 // one stops the read at that entry — refuse rather than guess.
 constexpr uint32_t kRegionMagicV3 = 0x33525653;  // 'SVR3'
+// 'SVR4' (rule-unification W1-D): SVR3 plus the hash of the material NAME
+// table the words were written under (sim/mattable.h), so a reorder of
+// materials.json remaps the region by name on read instead of repainting it.
+// SVR3 and SVR2 are still read, as untagged (the dir's legacy table).
+//
+//   SVR4: u32 magic, u32 count, u32 seed, u32 matTable; then SVR3's records
+constexpr uint32_t kRegionMagicV4 = 0x34525653;  // 'SVR4'
 constexpr uint32_t kRecLenMask = 0x0FFFFFFFu;
 constexpr uint32_t kRecCodecShift = 28;
 constexpr size_t kPlaneBytes = (size_t)kChunkVol * 4;  // four byte planes
@@ -88,14 +95,19 @@ bool IsOurFile(const fs::path& p) {
   // entities, and a BindSave of a new world under an old name must not
   // inherit a previous session's creatures beside its terrain. (players/ is
   // wiped separately in BindSave: it is a directory.)
+  //
+  // The material name tables (mat_*.svmt, sim/mattable.h) join it too: they
+  // describe the files above, and a wiped dir's tables describe nothing.
   return (name.rfind("r_", 0) == 0 &&
           (p.extension() == ".svr" || p.extension() == ".sve")) ||
          name == "meta.svm" || name == "manifest.svt" || name == "world.sve" ||
-         name == "entities.sve";
+         name == "entities.sve" || MatTableSet::IsTableFile(name);
 }
 
-// 'SVX1': one region's entity bucket (chunkstore.h EntityRecord).
-constexpr uint32_t kEntityRegionMagic = 0x31585653;  // 'SVX1'
+// 'SVX1': one region's entity bucket (chunkstore.h EntityRecord). Still read.
+constexpr uint32_t kEntityRegionMagicV1 = 0x31585653;  // 'SVX1'
+// 'SVX2' (W1-D): every record carries the material table it was written under.
+constexpr uint32_t kEntityRegionMagic = 0x32585653;  // 'SVX2'
 
 uint64_t Fnv64(const uint8_t* p, size_t n) {
   uint64_t h = 1469598103934665603ull;
@@ -244,11 +256,15 @@ bool ChunkStore::ReadRegionFile(
     off += 4;
     return true;
   };
-  uint32_t magic = 0, count = 0, seed = 0;
+  uint32_t magic = 0, count = 0, seed = 0, table = MatTableSet::kUntagged;
   if (!u32(magic) || !u32(count) ||
-      (magic != kRegionMagicV2 && magic != kRegionMagicV3) ||
-      (magic == kRegionMagicV3 && !u32(seed)))
+      (magic != kRegionMagicV2 && magic != kRegionMagicV3 &&
+       magic != kRegionMagicV4) ||
+      (magic != kRegionMagicV2 && !u32(seed)) ||
+      (magic == kRegionMagicV4 && !u32(table)))
     return false;
+  // Resolved ONCE per file: every record in it was written under one table.
+  const MatRemap* remap = tables_.RemapFor(MatTableSet::FromDisk(table));
   for (uint32_t c = 0; c < count; c++) {
     uint32_t w[3] = {}, len = 0;
     bool ok = u32(w[0]) && u32(w[1]) && u32(w[2]) && u32(len);
@@ -274,6 +290,9 @@ bool ChunkStore::ReadRegionFile(
                    path.c_str(), c);
       break;
     }
+    // AFTER the decode: the plane codec's predictor keyed on the STORED ids
+    // (only air, which every table holds at 0, but the order is the rule).
+    if (remap) remap->Rle(rle);
     fn(wc, rle);
   }
   return true;
@@ -313,9 +332,17 @@ bool ChunkStore::WriteRegion(IVec3 rc, Region& r, uint64_t* bytesOut) {
   }
   // SVR3, always (SVR2 is read-only). The seed in the header is the one the
   // records are encoded against, so decode never depends on SetSeed.
-  uint32_t hdr[3] = {kRegionMagicV3, (uint32_t)r.chunks.size(), seed_};
+  // The table file before the first region that names it: a crash between
+  // the two must never leave a region whose table cannot be found.
+  if (!tables_.EnsureRunningWritten(bytesOut)) {
+    std::fclose(fp);
+    fs::remove(tmp, ec);
+    return false;
+  }
+  uint32_t hdr[4] = {kRegionMagicV4, (uint32_t)r.chunks.size(), seed_,
+                     tables_.RunningHash()};
   uint64_t bytes = sizeof(hdr);
-  bool ok = std::fwrite(hdr, 4, 3, fp) == 3;
+  bool ok = std::fwrite(hdr, 4, 4, fp) == 4;
   std::vector<uint8_t> rec;
   for (const auto& [key, e] : r.chunks) {
     int32_t wc[3] = {e.wc.x, e.wc.y, e.wc.z};
@@ -527,6 +554,7 @@ bool ChunkStore::BindSave(const std::string& dir) {
   for (const auto& de : fs::directory_iterator(dir + "/players", ec))
     if (de.path().extension() == ".svp") fs::remove(de.path(), ec);
   dir_ = dir;
+  tables_.Bind(dir);  // every table file was just wiped with the rest
   absentRegions_.clear();
   for (auto& [key, r] : regions_) {
     r.dirty = true;
@@ -588,10 +616,12 @@ std::vector<ChunkStore::EntityRecord>& ChunkStore::DormantEntities(IVec3 rc) {
   if (ok) {
     std::memcpy(&magic, buf.data(), 4);
     std::memcpy(&count, buf.data() + 4, 4);
-    ok = magic == kEntityRegionMagic;
+    ok = magic == kEntityRegionMagic || magic == kEntityRegionMagicV1;
   }
+  // SVX2 carries one more word per record, between version and pos.
+  const size_t tw = magic == kEntityRegionMagic ? 4 : 0;
   for (uint32_t i = 0; ok && i < count; i++) {
-    if (off + 24 > buf.size()) {
+    if (off + 24 + tw > buf.size()) {
       ok = false;
       break;
     }
@@ -599,11 +629,14 @@ std::vector<ChunkStore::EntityRecord>& ChunkStore::DormantEntities(IVec3 rc) {
     uint32_t n = 0;
     std::memcpy(&r.section, buf.data() + off, 4);
     std::memcpy(&r.version, buf.data() + off + 4, 4);
-    std::memcpy(&r.pos.x, buf.data() + off + 8, 4);
-    std::memcpy(&r.pos.y, buf.data() + off + 12, 4);
-    std::memcpy(&r.pos.z, buf.data() + off + 16, 4);
-    std::memcpy(&n, buf.data() + off + 20, 4);
-    off += 24;
+    uint32_t diskTag = MatTableSet::kUntagged;
+    if (tw) std::memcpy(&diskTag, buf.data() + off + 8, 4);
+    r.matTable = MatTableSet::FromDisk(diskTag);
+    std::memcpy(&r.pos.x, buf.data() + off + 8 + tw, 4);
+    std::memcpy(&r.pos.y, buf.data() + off + 12 + tw, 4);
+    std::memcpy(&r.pos.z, buf.data() + off + 16 + tw, 4);
+    std::memcpy(&n, buf.data() + off + 20 + tw, 4);
+    off += 24 + tw;
     if (n > buf.size() - off) {
       ok = false;
       break;
@@ -700,10 +733,18 @@ bool ChunkStore::WriteEntityRegion(IVec3 rc,
   };
   const uint32_t hdr[2] = {kEntityRegionMagic, (uint32_t)all.size()};
   put(hdr, 8);
+  bool anyRunning = false;
   for (const EntityRecord* r : all) {
     const uint32_t n = (uint32_t)r->bytes.size();
     put(&r->section, 4);
     put(&r->version, 4);
+    // Each record keeps the table IT was written under: a dormant record from
+    // an earlier session sits beside one parked this session, and the two may
+    // disagree. Only a record tagged with the running table needs the running
+    // table's file; an older one's file is already in the dir it was read from.
+    const uint32_t diskTag = tables_.ToDisk(r->matTable);
+    put(&diskTag, 4);
+    anyRunning |= diskTag != 0 && diskTag == tables_.RunningHash();
     put(&r->pos.x, 4);
     put(&r->pos.y, 4);
     put(&r->pos.z, 4);
@@ -712,6 +753,7 @@ bool ChunkStore::WriteEntityRegion(IVec3 rc,
   }
   const uint64_t h = Fnv64(buf.data(), buf.size());
   if (h == e.diskHash) return true;  // the bucket did not change
+  if (anyRunning && !tables_.EnsureRunningWritten(bytesOut)) return false;
   const std::string tmp = path + ".tmp";
   FILE* fp = std::fopen(tmp.c_str(), "wb");
   bool ok = fp && std::fwrite(buf.data(), 1, buf.size(), fp) == buf.size();
@@ -749,6 +791,9 @@ bool ChunkStore::BindLoad(const std::string& dir) {
   absentRegions_.clear();
   chunkCount_ = 0;
   dir_ = dir;
+  // Tables are the dir's: forget the old one's. The caller (LoadWorld) adopts
+  // the legacy table from meta.svm next, before anything is read.
+  tables_.Bind(dir);
   LoadManifest();  // ...and so does its manifest; absent file = all tags 0
   return true;
 }

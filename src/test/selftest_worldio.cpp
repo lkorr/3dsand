@@ -22,6 +22,7 @@
 #include "game/player.h"
 #include "gpu/rhi.h"
 #include "sim/chunkstore.h"
+#include "sim/mattable.h"
 #include "sim/stream.h"
 #include "sim/pagetable.h"
 #include "sim/worldio.h"
@@ -437,7 +438,7 @@ Status GateSaveEntities(Ctx& c, std::string& detail) {
     }
   }
 
-  // --- a mismatched meta.svm must be REFUSED, and say why ---
+  // --- a mismatched meta.svm voxel size must be REFUSED, and say why ---
   // meta layout (worldio.cpp): magic[0..3] N[4..7] chunk[8..11] vmBits[12..15]
   // origin[16..27] matCount[28..31] len0[32..35] name0[36..].
   bool refuseOk = false;
@@ -468,8 +469,12 @@ Status GateSaveEntities(Ctx& c, std::string& detail) {
       return refused;
     };
     bool vmRefused = flipByteAndTryLoad(12);   // kVoxelMeters bit pattern
+    // A different material NAME table is no longer a refusal (rule-unification
+    // W1-D, sim/mattable.h): every file this build wrote names its own table,
+    // and meta.svm's only decides pre-W1-D (untagged) files, remapped by name.
+    // So the load must GO AHEAD. `save-material-remap` asserts the remap.
     bool matRefused = flipByteAndTryLoad(36);  // first material's name
-    refuseOk = vmRefused && matRefused;
+    refuseOk = vmRefused && !matRefused;
   }
 
   // --- rule 2: the loaded world still settles ---
@@ -1543,7 +1548,8 @@ Status GateRegionCodec(Ctx& c, std::string& detail) {
     cOk = cOk && rd.BindLoad(kDir2) && sameAsSet(rd, "C-svr2") &&
           walkSameAsSet(rd, "C-svr2");
     // Dirty every region (re-Put one chunk of each) and flush: each file must
-    // come back as SVR3 carrying ALL its chunks, the disk-only ones included.
+    // come back as the CURRENT layout (SVR4 since W1-D: SVR3 plus the
+    // material table tag) carrying ALL its chunks, the disk-only ones included.
     for (const auto& [rc, chunks] : byRegion)
       rd.Put(chunks.front()->wc, chunks.front()->rle);
     cOk = cOk && rd.Flush();
@@ -1552,7 +1558,7 @@ Status GateRegionCodec(Ctx& c, std::string& detail) {
       if (de.path().extension() != ".svr") continue;
       FILE* fp = std::fopen(de.path().string().c_str(), "rb");
       uint32_t magic = 0;
-      if (!fp || std::fread(&magic, 4, 1, fp) != 1 || magic != 0x33525653u)
+      if (!fp || std::fread(&magic, 4, 1, fp) != 1 || magic != 0x34525653u /* SVR4 */)
         cOk = false;
       if (fp) std::fclose(fp);
     }
@@ -1892,6 +1898,411 @@ Status GateSaveSplit(Ctx& c, std::string& detail) {
   return ok ? Status::Pass : Status::Fail;
 }
 
+// ---- save-material-remap -------------------------------------------------
+//
+// MATERIAL NAMES IN SAVES (rule-unification W1-D, sim/mattable.h). A material
+// id is its position in materials.json; a save now names the table its ids
+// were written under and the loader remaps BY NAME. Two claims:
+//
+//  A. THE STORE, CPU ONLY, against a saved table that INSERTS a material
+//     nobody has, SWAPS two, and SWAPS two stain slots. Synthetic chunks cover
+//     every saved id and stain type; read back under the running table, every
+//     voxel must name the same material and the same stain, the unknown
+//     material must become air, and the RLE must come back canonical. Then the
+//     legacy path: an UNTAGGED region reads under meta.svm's table, which
+//     LoadWorld pins to mat_legacy.svmt so a later meta rewrite cannot lose it;
+//     and a region whose table file is gone loads as stored (identity).
+//  B. END TO END, GPU. A world with edits, a creature soaked in blood and a
+//     debris body of stone and wood is SAVED under a permuted copy of the real
+//     materials (stone<->wood, blood<->water, sand<->dirt, and two stain
+//     slots) -- which is exactly "the build that saved had a different
+//     materials.json" -- and LOADED under the real one. Every stored chunk's
+//     region, read back off the GPU, must hash identically BY NAME to what was
+//     saved; the debris lattice and the creature's coat must have followed the
+//     names too. The permutation keeps every id inside the running table, so
+//     the sim's own material table stays valid throughout.
+Status GateSaveMaterialRemap(Ctx& c, std::string& detail) {
+  GpuContext& ctx = c.ctx;
+  World& world = c.world;
+  Simulation& sim = c.sim;
+  Stream& stream = c.stream;
+  const MaterialNameTable R = MaterialNameTableOf(c.mats);
+  auto idOf = [&](const char* n) -> int {
+    for (size_t i = 0; i < R.mats.size(); i++)
+      if (R.mats[i] == n) return (int)i;
+    return -1;
+  };
+  // Two distinct non-empty stain slots of the running table (0 if none).
+  uint32_t slotA = 0, slotB = 0;
+  for (uint32_t s = 1; s < R.stains.size(); s++) {
+    if (R.stains[s].empty()) continue;
+    if (slotA == 0)
+      slotA = s;
+    else if (slotB == 0)
+      slotB = s;
+  }
+  const int mStone = idOf("stone"), mWood = idOf("wood"), mBlood = idOf("blood"),
+            mWater = idOf("water"), mSand = idOf("sand"), mDirt = idOf("dirt");
+  if (mStone < 0 || mWood < 0 || mBlood < 0 || mWater < 0 || mSand < 0 || mDirt < 0) {
+    detail = "stone/wood/blood/water/sand/dirt not all in materials.json";
+    return Status::Fail;
+  }
+
+  // ======== A: the store ========================================================
+  bool aOk = true;
+  std::string whyA;
+  auto failA = [&](const std::string& w) {
+    if (whyA.empty()) whyA = w;
+    aOk = false;
+  };
+  uint32_t aVoxels = 0, aMoved = 0, aToAir = 0, aStains = 0;
+  {
+    namespace fs = std::filesystem;
+    const char* kDir = "selftest_matremap.svd";
+    const char* kDirL = "selftest_matremap_legacy.svd";
+    fs::remove_all(kDir);
+    fs::remove_all(kDirL);
+    MaterialNameTable S = R;
+    S.mats.insert(S.mats.begin() + 3, "w1d_not_a_material");
+    int sStone = -1, sWater = -1;
+    for (size_t i = 0; i < S.mats.size(); i++) {
+      if (S.mats[i] == "stone") sStone = (int)i;
+      if (S.mats[i] == "water") sWater = (int)i;
+    }
+    std::swap(S.mats[sStone], S.mats[sWater]);
+    if (slotB != 0) std::swap(S.stains[slotA], S.stains[slotB]);
+
+    constexpr uint32_t kSeed = 0x5eed;
+    const IVec3 wcs[3] = {{2, 3, 4}, {2, 3, 5}, {40, 3, 4}};  // two regions
+    std::vector<std::vector<uint32_t>> saved(3, std::vector<uint32_t>(kChunkVol));
+    for (int ci = 0; ci < 3; ci++)
+      for (uint32_t k = 0; k < kChunkVol; k++) {
+        // Runs of 3 so the RLE has something to merge, every saved id hit.
+        const uint32_t id = (k / 3 + (uint32_t)ci * 17) % (uint32_t)S.mats.size();
+        uint32_t w = id | (((k / 11) & 0xFu) << 12);
+        const uint32_t st = (k / 5) % 3 == 0 ? (k % 2 ? slotA : slotB) : 0u;
+        if (st != 0) w |= ((1u + k % 15u) << 24) | (st << 28);
+        saved[ci][k] = w;
+      }
+    // What the running table must read each saved word as.
+    auto expectWord = [&](uint32_t w, bool stainsKnown, bool matsKnown) {
+      if (!matsKnown) return w;
+      const std::string& name = S.mats[w & 0xFFFu];
+      int to = -1;
+      for (size_t i = 0; i < R.mats.size() && to < 0; i++)
+        if (R.mats[i] == name) to = (int)i;
+      if (to < 0) return 0u;  // a substance this build lacks: clean air
+      uint32_t e = (w & ~0xFFFu) | (uint32_t)to;
+      const uint32_t t = (w >> 28) & 7u;
+      if (t != 0 && stainsKnown) {
+        uint32_t nt = 0;
+        for (uint32_t s = 1; s < R.stains.size() && nt == 0; s++)
+          if (R.stains[s] == S.stains[t]) nt = s;
+        e = nt == 0 ? (e & ~0x7F000000u) : ((e & ~0x70000000u) | (nt << 28));
+      }
+      return e;
+    };
+    auto readBack = [&](ChunkStore& cs, bool stainsKnown, bool matsKnown,
+                        const char* tag) {
+      std::vector<uint32_t> got(kChunkVol);
+      for (int ci = 0; ci < 3; ci++) {
+        const std::vector<uint32_t>* rle = cs.Get(wcs[ci]);
+        if (!rle || !RleDecodeChunk(rle->data(), rle->size() / 2, got.data())) {
+          failA(Format("%s: chunk %d unreadable", tag, ci));
+          return;
+        }
+        for (size_t p = 2; p + 1 < rle->size(); p += 2)
+          if ((*rle)[p + 1] == (*rle)[p - 1]) {
+            failA(Format("%s: chunk %d RLE not canonical at pair %zu", tag, ci, p / 2));
+            return;
+          }
+        for (uint32_t k = 0; k < kChunkVol; k++) {
+          const uint32_t want = expectWord(saved[ci][k], stainsKnown, matsKnown);
+          if (got[k] != want) {
+            failA(Format("%s: chunk %d cell %u saved %08x ('%s') read %08x ('%s') "
+                         "want %08x",
+                         tag, ci, k, saved[ci][k], S.mats[saved[ci][k] & 0xFFFu].c_str(),
+                         got[k], (got[k] & 0xFFFu) < R.mats.size()
+                                     ? R.mats[got[k] & 0xFFFu].c_str() : "?",
+                         want));
+            return;
+          }
+        }
+      }
+    };
+
+    // ---- A1: tagged ----
+    {
+      ChunkStore w;
+      w.SetSeed(kSeed);
+      w.Tables().SetRunning(S);
+      if (!w.BindSave(kDir)) failA("A1: BindSave");
+      for (int ci = 0; ci < 3; ci++) {
+        std::vector<uint32_t> rle;
+        RleEncodeChunk(saved[ci].data(), rle);
+        w.Put(wcs[ci], std::move(rle));
+      }
+      if (!w.Flush()) failA("A1: Flush");
+      w.Unbind();
+      if (!fs::exists(MatTableSet::TablePath(kDir, S.Hash())))
+        failA("A1: the saved table's file was not written beside the regions");
+      ChunkStore r;
+      r.SetSeed(kSeed);
+      r.Tables().SetRunning(R);
+      if (!r.BindLoad(kDir)) failA("A1: BindLoad");
+      readBack(r, true, true, "A1 tagged");
+      for (int ci = 0; ci < 3; ci++)
+        for (uint32_t k = 0; k < kChunkVol; k++) {
+          const uint32_t sv = saved[ci][k], e = expectWord(sv, true, true);
+          aVoxels++;
+          if ((e & 0xFFFu) != (sv & 0xFFFu)) aMoved++;
+          if ((e & 0xFFFu) == 0 && (sv & 0xFFFu) != 0) aToAir++;
+          if (((sv >> 28) & 7u) != ((e >> 28) & 7u)) aStains++;
+        }
+      // The walk (FarEdits' rebuild path) must see the same remapped words.
+      size_t walked = 0;
+      r.ForEachStored([&](IVec3 wc, const uint32_t* rle, size_t pairs) {
+        std::vector<uint32_t> got(kChunkVol);
+        for (int ci = 0; ci < 3; ci++)
+          if (wc.x == wcs[ci].x && wc.y == wcs[ci].y && wc.z == wcs[ci].z &&
+              RleDecodeChunk(rle, pairs, got.data()) &&
+              got[5] == expectWord(saved[ci][5], true, true))
+            walked++;
+      });
+      if (walked != 3) failA(Format("A1: ForEachStored matched %zu of 3", walked));
+      r.Unbind();
+    }
+    // ---- A2: missing table file -> identity, loudly ----
+    {
+      std::error_code ec;
+      fs::remove(MatTableSet::TablePath(kDir, S.Hash()), ec);
+      ChunkStore r;
+      r.SetSeed(kSeed);
+      r.Tables().SetRunning(R);
+      r.BindLoad(kDir);
+      readBack(r, false, false, "A2 no-table");
+      r.Unbind();
+    }
+    // ---- A3: untagged (pre-W1-D) regions read under meta's table ----
+    {
+      ChunkStore w;
+      w.SetSeed(kSeed);  // no running table: every write is untagged
+      if (!w.BindSave(kDirL)) failA("A3: BindSave");
+      for (int ci = 0; ci < 3; ci++) {
+        std::vector<uint32_t> rle;
+        RleEncodeChunk(saved[ci].data(), rle);
+        w.Put(wcs[ci], std::move(rle));
+      }
+      w.Flush();
+      w.Unbind();
+      MaterialNameTable metaS;
+      metaS.mats = S.mats;  // meta.svm carries names, never stain slots
+      ChunkStore r;
+      r.SetSeed(kSeed);
+      r.Tables().SetRunning(R);
+      r.BindLoad(kDirL);
+      r.Tables().AdoptLegacy(metaS);
+      readBack(r, false, true, "A3 legacy");
+      r.Unbind();
+      if (!fs::exists(MatTableSet::LegacyPath(kDirL)))
+        failA("A3: the legacy table was not pinned to mat_legacy.svmt");
+      // A later save rewrites meta.svm with the RUNNING table; the untagged
+      // regions must still read under the pinned one.
+      MaterialNameTable metaR;
+      metaR.mats = R.mats;
+      ChunkStore r2;
+      r2.SetSeed(kSeed);
+      r2.Tables().SetRunning(R);
+      r2.BindLoad(kDirL);
+      r2.Tables().AdoptLegacy(metaR);
+      readBack(r2, false, true, "A3 after meta rewrite");
+      r2.Unbind();
+    }
+    fs::remove_all(kDir);
+    fs::remove_all(kDirL);
+    if (aMoved == 0 || aToAir == 0 || (slotB != 0 && aStains == 0))
+      failA(Format("A: the fixture moved nothing (%u moved, %u to air, %u stains)",
+                   aMoved, aToAir, aStains));
+  }
+
+  // ======== B: end to end through SaveWorld / LoadWorld ==========================
+  bool bOk = false;
+  std::string whyB;
+  uint32_t bChunks = 0, bCells = 0, bMoved = 0, coatBefore = 0, coatAfter = 0;
+  uint32_t dbStoneBefore = 0, dbStoneAfter = 0, dbWoodAfter = 0;
+  bool loaded = false;
+  {
+    const char* kPath = "selftest_matremap_world.svd";
+    std::filesystem::remove_all(kPath);
+    stream.Store().Unbind();
+    c.debris.Reset();
+    c.mobs.Reset();
+    stream.OnRegen();
+    SubmitWorldgen(ctx, world, sim, kDefaultSeed);
+    ctx.WaitIdle();
+    uint32_t t = 7000;
+    for (int i = 0; i < 60; i++) {
+      SubmitTick(ctx, world, sim, ++t, kDefaultSeed, SelftestOps(i, kDefaultSeed), {}, {},
+                 false, {8, 3, 8}, false, false);
+      stream.FoldSnapshot();
+    }
+    ctx.WaitIdle();
+
+    // The SAVING build's materials: the real table, permuted in place.
+    std::vector<MaterialDef> P = c.mats;
+    std::swap(P[mStone], P[mWood]);
+    std::swap(P[mBlood], P[mWater]);
+    std::swap(P[mSand], P[mDirt]);
+    if (slotB != 0)
+      for (MaterialDef& m : P)
+        if (m.stainSlot == slotA) m.stainSlot = slotB;
+        else if (m.stainSlot == slotB) m.stainSlot = slotA;
+    const MaterialNameTable Pt = MaterialNameTableOf(P);
+
+    // A creature with a blood coat on one limb (so the limb is STORED, not
+    // pristine) and a debris body that is 40 stone + 24 wood.
+    const IVec3 o = world.WindowOrigin();
+    const int hx = (o.x + (int)kNChunk / 2) * (int)kChunk + 20,
+              hz = (o.z + (int)kNChunk / 2) * (int)kChunk + 20;
+    const int hy = World::TerrainHeight(hx, hz, kDefaultSeed) + 2;
+    const int human = c.mobs.FindDef("human");
+    const uint64_t mid = human >= 0 ? c.mobs.Spawn(human, {hx, hy, hz}) : 0;
+    const int soakLimb = 0;
+    uint32_t soaked = 0;
+    if (mid != 0) soaked = c.mobs.SoakLimb(mid, soakLimb, (uint32_t)mBlood, 6, t);
+    auto coatCount = [&](uint64_t id, int mat) {
+      uint32_t n = 0;
+      for (const PrefabVoxel& v : c.mobs.LimbLattice(id, soakLimb))
+        if (BodyStainAmt(v.stain) > 0 && (int)BodyStainMat(v.stain) == mat) n++;
+      return n;
+    };
+    coatBefore = mid != 0 ? coatCount(mid, mBlood) : 0;
+
+    std::vector<DebrisVoxel> vox;
+    for (int8_t z = 0; z < 4; z++)
+      for (int8_t y = 0; y < 4; y++)
+        for (int8_t x = 0; x < 4; x++)
+          vox.push_back(DebrisVoxel{x, y, z, 0,
+                                    (uint16_t)(vox.size() < 40 ? mStone : mWood)});
+    std::vector<float> density(c.mats.size(), 1000.0f);
+    for (size_t i = 0; i < c.mats.size(); i++)
+      density[i] = std::max(1.0f, (float)c.mats[i].gpu.density);
+    BodyTransform bxf{};
+    bxf.pos = Vec3{(float)hx - 10, (float)hy + 4, (float)hz};
+    bxf.quat[3] = 1;
+    const uint64_t bh = c.phys.CreateDebrisBodyXf(vox, bxf, density);
+    if (bh != 0) c.debris.AdoptBody(bh, vox, bxf);
+    dbStoneBefore = 40;
+
+    EntityIO eio = MakeEntityIO(c.debris, c.mobs, nullptr);
+    SaveReport rep;
+    const bool saved = SaveWorld(ctx, world, stream, kPath, P, &eio, {}, &rep);
+
+    // The region: every stored chunk inside the window, as the GPU holds it
+    // NOW (ids of the running table, which the files label as `P`).
+    std::vector<IVec3> chunks;
+    stream.Store().ForEachStored([&](IVec3 wc, const uint32_t*, size_t) {
+      if (chunks.size() < 96 && world.ChunkInWindow(wc)) chunks.push_back(wc);
+    });
+    std::vector<uint32_t> before(chunks.size() * kChunkVol), after(before.size());
+    for (size_t i = 0; i < chunks.size(); i++)
+      ReadVoxelsSync(ctx, world, World::SlotChunkIndex(chunks[i]), 1,
+                     before.data() + i * kChunkVol, "matremap-before");
+
+    // Break the live state so a load that did nothing cannot pass.
+    c.debris.Reset();
+    c.mobs.Reset();
+    loaded = LoadWorld(ctx, world, sim, stream, kPath, c.mats, &eio);
+    ctx.WaitIdle();
+    for (size_t i = 0; i < chunks.size(); i++)
+      ReadVoxelsSync(ctx, world, World::SlotChunkIndex(chunks[i]), 1,
+                     after.data() + i * kChunkVol, "matremap-after");
+
+    // BY NAME: (name, stain name, the rest of the word) of every cell, the
+    // saved side read through `P`, the loaded side through the real table.
+    auto nameHash = [](const std::vector<uint32_t>& words, const MaterialNameTable& T,
+                       uint32_t& moved, const std::vector<uint32_t>* other) {
+      uint64_t h = 1469598103934665603ull;
+      auto mix = [&h](const void* p, size_t n) {
+        const uint8_t* b = (const uint8_t*)p;
+        for (size_t i = 0; i < n; i++) {
+          h ^= b[i];
+          h *= 1099511628211ull;
+        }
+      };
+      for (size_t k = 0; k < words.size(); k++) {
+        const uint32_t w = words[k] & kPersistMask;
+        const uint32_t m = w & 0xFFFu, st = (w >> 28) & 7u;
+        const std::string& mn = m < T.mats.size() ? T.mats[m] : std::string("?");
+        const std::string& sn = st < T.stains.size() ? T.stains[st] : std::string("?");
+        mix(mn.data(), mn.size());
+        mix("|", 1);
+        mix(sn.data(), sn.size());
+        const uint32_t rest = w & ~0x70000FFFu;
+        mix(&rest, 4);
+        if (other && ((*other)[k] & 0xFFFu) != m) moved++;
+      }
+      return h;
+    };
+    uint32_t unused = 0;
+    const uint64_t hSaved = nameHash(before, Pt, unused, nullptr);
+    const uint64_t hLoaded = nameHash(after, R, bMoved, &before);
+    bChunks = (uint32_t)chunks.size();
+    bCells = (uint32_t)before.size();
+
+    // The entities followed the names too.
+    const Mob* lm = c.mobs.MobCount() > 0 ? c.mobs.MobAt(0) : nullptr;
+    coatAfter = lm ? coatCount(lm->Id(), mWater) : 0;
+    const uint32_t bloodAfter = lm ? coatCount(lm->Id(), mBlood) : 0;
+    for (uint32_t i = 0; i < c.debris.BodyCount(); i++) {
+      std::vector<PrefabVoxel> lat;
+      uint32_t sc = 1;
+      if (!c.debris.BodyLatticeOf(c.debris.BodyHandle(i), lat, sc) || lat.size() != 64)
+        continue;
+      for (const PrefabVoxel& v : lat) {
+        if ((int)v.material == mStone) dbStoneAfter++;
+        if ((int)v.material == mWood) dbWoodAfter++;
+      }
+    }
+    const bool regionOk = saved && loaded && bChunks > 0 && hSaved == hLoaded && bMoved > 0;
+    const bool coatOk = soaked > 0 && coatBefore > 0 && coatAfter == coatBefore && bloodAfter == 0;
+    const bool debrisOk = bh != 0 && dbWoodAfter == 40 && dbStoneAfter == 24;
+    bOk = regionOk && coatOk && debrisOk;
+    if (!regionOk)
+      whyB = Format(" region: saved %d loaded %d chunks %u name-hash %016llx vs %016llx, "
+                    "%u cells moved",
+                    saved ? 1 : 0, loaded ? 1 : 0, bChunks, (unsigned long long)hSaved,
+                    (unsigned long long)hLoaded, bMoved);
+    else if (!coatOk)
+      whyB = Format(" coat: soaked %u, blood before %u, water after %u, blood after %u",
+                    soaked, coatBefore, coatAfter, bloodAfter);
+    else if (!debrisOk)
+      whyB = Format(" debris: body %d, after stone %u wood %u (want 24/40)", bh != 0 ? 1 : 0,
+                    dbStoneAfter, dbWoodAfter);
+
+    // Teardown: nothing of this gate survives into the next one.
+    c.debris.Reset();
+    c.mobs.Reset();
+    stream.Store().Unbind();
+    stream.Store().Tables().SetRunning(R);
+    std::filesystem::remove_all(kPath);
+    stream.OnRegen();
+    SubmitWorldgen(ctx, world, sim, kDefaultSeed);
+    ctx.WaitIdle();
+  }
+
+  const bool ok = aOk && bOk;
+  detail = Format(
+      "A store=%d (%u cells, %u ids moved, %u to air, %u stain types moved)%s | "
+      "B end-to-end=%d (%u chunks / %u cells, %u cells moved by name; coat %u "
+      "blood -> %u water; debris 40 stone -> %u wood)%s",
+      aOk ? 1 : 0, aVoxels, aMoved, aToAir, aStains, whyA.empty() ? "" : (" " + whyA).c_str(),
+      bOk ? 1 : 0, bChunks, bCells, bMoved, coatBefore, coatAfter, dbWoodAfter,
+      whyB.c_str());
+  std::printf("save-material-remap: %s (%s)\n", ok ? "PASS" : "FAIL", detail.c_str());
+  return ok ? Status::Pass : Status::Fail;
+}
+
 }  // namespace
 
 const std::vector<Gate>& WorldIoGates() {
@@ -1899,6 +2310,7 @@ const std::vector<Gate>& WorldIoGates() {
       {"save-load", "worldio", {}, false, GateSaveLoad},
       {"save-entities", "worldio", {}, false, GateSaveEntities},
       {"save-split", "worldio", {}, false, GateSaveSplit},
+      {"save-material-remap", "worldio", {}, false, GateSaveMaterialRemap},
       {"region-store", "worldio", {}, false, GateRegionStore},
       {"region-codec", "worldio", {}, false, GateRegionCodec},
       {"streaming", "worldio", {}, false, GateStreaming},

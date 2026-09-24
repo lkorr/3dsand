@@ -405,6 +405,11 @@ const char* const kOrder[] = {
     // globals it touches (the mob id counter and the celestial clock) on the
     // way out; the world it leaves behind is one chunk-exchange regenerates.
     "save-split",
+    // W1-D material names in saves (sim/mattable.h). Regenerates on the way
+    // in, saves and loads its own dir under a permuted material table, and
+    // resets mobs + debris and regenerates at the origin on the way out --
+    // so chunk-exchange, which regenerates on entry anyway, inherits nothing.
+    "save-material-remap",
     // BETWEEN region-store and streaming, and the slot is chosen rather than
     // convenient. It regenerates the world several times (four arms, each
     // with its own worldgen and its own ReloadWindow) and it SHIFTS the
