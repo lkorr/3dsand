@@ -4357,12 +4357,12 @@ Status GateClouds(Ctx& c, std::string& detail) {
     weather::SetOverride("");
     std::string lastFrom;
     weather::Snap();
-    weather::State prev = weather::Resolve(t, kDefaultSeed, 0.0, 0.0f, 0.0f, 0.0f);
+    weather::State prev = weather::Resolve(t, kDefaultSeed, 0.0, 0.0f);
     for (int s = 1; s <= 7200; s++) {
       weather::Snap();
-      const weather::State a = weather::Resolve(t, kDefaultSeed, (double)s, 0.0f, 0.0f, 0.0f);
+      const weather::State a = weather::Resolve(t, kDefaultSeed, (double)s, 0.0f);
       weather::Snap();
-      const weather::State b = weather::Resolve(t, kDefaultSeed, (double)s, 0.0f, 0.0f, 0.0f);
+      const weather::State b = weather::Resolve(t, kDefaultSeed, (double)s, 0.0f);
       if (a.mix.coverage != b.mix.coverage || a.mix.precip != b.mix.precip) {
         detail = "weather::Resolve is not a pure function of the clock";
         return Status::Fail;

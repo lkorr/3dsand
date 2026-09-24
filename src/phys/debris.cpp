@@ -4254,12 +4254,36 @@ void DebrisSystem::UnstrapBody(Body& b) {
   phys_->SetBodyKinematic(b.handle, false);
 }
 
+// See the note on handleIdx_ (debris.h): a hint checked on every use, and the
+// plain scan on any miss, so the answer is the scan's answer by construction.
+int DebrisSystem::IndexOfHandle(uint64_t handle) const {
+  if (handle != 0) {
+    auto it = handleIdx_.find(handle);
+    if (it != handleIdx_.end() && it->second < bodies_.size() &&
+        bodies_[it->second].handle == handle)
+      return (int)it->second;
+  }
+  for (size_t i = 0; i < bodies_.size(); i++) {
+    if (bodies_[i].handle != handle) continue;
+    if (handle != 0) {
+      // Bounded: a removed body's hint is never erased (nothing here knows it
+      // was removed), so the map is dropped wholesale once it is mostly dead
+      // entries, and re-learns from the next lookups.
+      if (handleIdx_.size() > 2 * bodies_.size() + 64) handleIdx_.clear();
+      handleIdx_[handle] = (uint32_t)i;
+    }
+    return (int)i;
+  }
+  return -1;
+}
+
 void DebrisSystem::DriveStraps() {
   for (Body& b : bodies_) {
     if (!b.Follower()) continue;
-    const Body* host = nullptr;
-    for (const Body& h : bodies_)
-      if (h.handle == b.wornHost) { host = &h; break; }
+    // O(1) per follower (IndexOfHandle); it was a scan of every body for
+    // every garment, every tick.
+    const int hi = IndexOfHandle(b.wornHost);
+    const Body* host = hi >= 0 ? &bodies_[hi] : nullptr;
     if (host == nullptr) {
       // The limb this was on has stopped existing. A garment is not a ghost:
       // it becomes debris of its own, here, rather than hanging in the air
@@ -4351,10 +4375,9 @@ void DebrisSystem::SetItemTakeFn(std::function<bool(uint64_t)> fn) {
 
 uint64_t DebrisSystem::GlobalIdOf(uint64_t handle) const {
   if (!handle) return 0;
-  for (const Body& b : bodies_)
-    if (b.handle == handle)
-      return net::MakeGlobalBodyId(b.ownerAtCreate, b.serial);
-  return 0;
+  const int i = IndexOfHandle(handle);
+  return i >= 0 ? net::MakeGlobalBodyId(bodies_[i].ownerAtCreate, bodies_[i].serial)
+                : 0;
 }
 
 uint64_t DebrisSystem::HandleOfGlobalId(uint64_t globalId) const {
@@ -4367,15 +4390,14 @@ uint64_t DebrisSystem::HandleOfGlobalId(uint64_t globalId) const {
 }
 
 uint32_t DebrisSystem::OwnerOfBody(uint64_t handle) const {
-  for (const Body& b : bodies_)
-    if (b.handle == handle) return b.owner;
+  const int i = IndexOfHandle(handle);
+  if (i >= 0) return bodies_[i].owner;
   return localPlayerId_;  // unknown handle: nothing here to stop stepping
 }
 
 bool DebrisSystem::IsGhost(uint64_t handle) const {
-  for (const Body& b : bodies_)
-    if (b.handle == handle) return !OwnedLocally(b);
-  return false;
+  const int i = IndexOfHandle(handle);
+  return i >= 0 && !OwnedLocally(bodies_[i]);
 }
 
 uint32_t DebrisSystem::GhostCount() const {
@@ -4440,11 +4462,8 @@ void DebrisSystem::RefreshOwnership() {
   // Second pass for the straps, now that every host has settled.
   for (Body& b : bodies_) {
     if (!b.Follower()) continue;
-    for (const Body& h : bodies_)
-      if (h.handle == b.wornHost) {
-        b.owner = h.owner;
-        break;
-      }
+    const int hi = IndexOfHandle(b.wornHost);
+    if (hi >= 0) b.owner = bodies_[hi].owner;
   }
 }
 
@@ -6964,9 +6983,8 @@ void DebrisSystem::CollectImpacts() {
   };
   auto bodyIndexOf = [&](uint64_t h) -> size_t {
     if (h == 0) return (size_t)-1;
-    for (size_t i = 0; i < bodies_.size(); i++)
-      if (bodies_[i].handle == h) return i;
-    return (size_t)-1;
+    const int i = IndexOfHandle(h);
+    return i >= 0 ? (size_t)i : (size_t)-1;
   };
 
   // Candidates for this step, before the per-step cap.

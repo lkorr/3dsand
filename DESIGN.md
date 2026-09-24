@@ -11661,7 +11661,13 @@ hash.** What does is ONE word, `weather::SimRainWord` → `TickParams.weatherRai
 (the old `padWp1`): rain reaching the ground (bits 0..7), `weather.rainIgniteDamp`
 (8..15) and ground wetness (16..23), quantised once per tick from the pinned or
 scheduled preset — the un-eased TARGET, never the frame-time ease, so frame
-pacing cannot reach the hash. Two reaction flags read it (`materials.h`
+pacing cannot reach the hash. **The word is computed in integers** (2026-09-24):
+the presets' four sim-relevant fields and the `weather.*` tuning are quantised to
+Q16 by one exact conversion each, and the schedule, ladder, blend and wetness sum
+run on int64 with a Q16 table for the `exp(-k/4)` decay — no libm on the path to
+TickParams, so two machines cannot round a word differently. The renderer's
+`Resolve` keeps its float path; the two agree up to fixed-point rounding. Two
+reaction flags read it (`materials.h`
 `kCondRain` / `kCondRainDamp`, `RCOND_RAIN` / `RCOND_RAINDAMP`):
 
 - `"rain": true` — a douse. Fires only on a RAIN-EXPOSED cell while it rains, at

@@ -238,6 +238,13 @@ struct DeathBody {
 // Shared because the panel writes it and the tick body honours it.
 constexpr uint64_t kDevFanOwner = 0xDEFA11Au;
 
+// The id the local player's spells, beams, statuses and wind primitives carry
+// as their caster/owner, and the one `target` value that means "you". ONE
+// constant: it was the literal 0x9134A5EE in fourteen places across the tick
+// body and the HUD mirror. It is NOT per-session — every session casts as this
+// id today (see the P6 report in docs/PLAN_perf_audit_2026-09-23.md).
+constexpr uint64_t kPlayerCasterId = 0x9134A5EEu;
+
 // Where the beam LEAVES the caster, in world voxels.
 //
 // It must clear the avatar's own head. The eye sits inside the skull part, so
@@ -557,6 +564,7 @@ struct FrameIntent {
 // them in declaration order, and a reference has no default to skip. So the
 // groups below are ordered by what the language needs and labelled by what
 // they mean.
+struct TickScratch;  // session.cpp; see TickAuthorityCtx::tickScratch
 struct TickAuthorityCtx {
   // ---- A. the engine, by reference. One per process today; one per WORLD in
   // the shape this is heading for.
@@ -629,6 +637,14 @@ struct TickAuthorityCtx {
   // rewrites each frame, not a reference: `now` is a frame-loop local, and a
   // reference to it would be the frame layer keeping state for the authority.
   double frameTime = 0;
+  // The tick body's own scratch (session.cpp WorldScratch + one PlayerScratch
+  // per session), HELD across ticks so its vectors keep their capacity, and
+  // reset field by field at the top of every TickAuthority. Opaque here: the
+  // types are the tick body's business. A shared_ptr rather than a unique_ptr
+  // only because the caller builds this struct with designated initializers
+  // in a TU where the type is incomplete, and a shared_ptr's deleter is bound
+  // where it is created (session.cpp), not where it is destroyed.
+  std::shared_ptr<TickScratch> tickScratch;
 
   // ---- E. THE SCRIPTED-FLIGHT / MEASUREMENT HARNESSES, AS HOOKS. Every one
   // of these is argv state the FRAME layer owns, supplied as a callback so

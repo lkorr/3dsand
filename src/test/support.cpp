@@ -434,7 +434,7 @@ static void WriteCloudParams(const rhi::Queue& queue, const World& world,
   gCloudPrev.wall = wall;
 
   const float camXM = eye.x * kVoxelMeters, camZM = eye.z * kVoxelMeters;
-  const weather::State st = weather::Resolve(tun, rp.seed, tSec, dt, camXM, camZM);
+  const weather::State st = weather::Resolve(tun, rp.seed, tSec, dt);
   const weather::Preset& w = st.mix;
   const bool on = st.enabled &&
                   (w.coverage > 0.001f || w.cirrus > 0.001f || w.precip > 0.001f);

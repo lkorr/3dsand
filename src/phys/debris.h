@@ -209,9 +209,8 @@ class DebrisSystem {
   // True when this body came off a creature (Body::dead). The melee sweep asks
   // so a blow can be reported as FLESH rather than as a chip.
   bool BodyIsDeadFlesh(uint64_t handle) const {
-    for (const Body& b : bodies_)
-      if (b.handle == handle) return b.dead && b.bleedMat != 0;
-    return false;
+    const int i = IndexOfHandle(handle);
+    return i >= 0 && bodies_[i].dead && bodies_[i].bleedMat != 0;
   }
   // Rewrite up to `maxCount` voxels of `fromMat` on one body to `toMat`, on
   // its authoritative lattice, poking the brick and recounting what the burn
@@ -1841,6 +1840,19 @@ class DebrisSystem {
   std::unordered_map<uint64_t, uint8_t> supportLate_;
   uint32_t lastSupportSnapTick_ = 0;
   std::vector<Body> bodies_;
+  // ---- handle -> index into bodies_, SELF-VALIDATING ------------------------
+  // The first index whose Body::handle is `handle`, or -1 — exactly what a
+  // `for (b : bodies_) if (b.handle == handle)` scan returns. `handleIdx_` is
+  // a HINT, not an index kept in step with bodies_: bodies_ is reshaped at
+  // ~20 sites (swap-and-pop, erase, split, adopt), and a map maintained at
+  // every one of them is a map that one day misses one. So a hit is trusted
+  // only after checking `bodies_[i].handle == handle`, and anything else falls
+  // back to the scan and re-learns. Handles are Jolt body ids and unique among
+  // live bodies, which is what makes "the hinted index" and "the first match"
+  // the same body. Lookups only: nothing iterates this map, so no order —
+  // hashed or otherwise — depends on it. Handle 0 is never hinted.
+  int IndexOfHandle(uint64_t handle) const;
+  mutable std::unordered_map<uint64_t, uint32_t> handleIdx_;
   // Scan scratch, REUSED across scans. A 64^3 region is 262,144 cells and
   // RunIslandDetection used to construct three vectors over it per scan -- 2.4
   // MB allocated, zeroed and freed for every support-loss chunk, which is the
