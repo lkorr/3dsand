@@ -2086,6 +2086,15 @@ def check_scoop_ledger():
         elif a.group(1) != b.group(1):
             problems.append(f"particle flag: world.h {cpp} = {a.group(1)} but "
                             f"sim_particle.wgsl {wgsl} = {b.group(1)}")
+    # The vessel's MEASURED bit lives beside its only CPU writer.
+    ch = read("src/game/container.h")
+    a = re.search(r"constexpr\s+uint32_t\s+kPFlagMeasured\s*=\s*(\d+)u", ch or "")
+    b = re.search(r"const\s+PFLAG_MEASURED\s*:\s*u32\s*=\s*(\d+)u", sp or "")
+    if not a or not b:
+        problems.append("particle flag: kPFlagMeasured / PFLAG_MEASURED not found")
+    elif a.group(1) != b.group(1):
+        problems.append(f"particle flag: container.h kPFlagMeasured = {a.group(1)} "
+                        f"but sim_particle.wgsl PFLAG_MEASURED = {b.group(1)}")
     w = re.search(r"constexpr\s+uint32_t\s+kPageFaultWords\s*=\s*(\d+)", wh)
     e = re.search(r"constexpr\s+uint32_t\s+kPageFaultScoopRefused\s*=\s*(\d+)", wh)
     if w and e and int(e.group(1)) >= int(w.group(1)):

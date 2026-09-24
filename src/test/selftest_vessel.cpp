@@ -17,7 +17,7 @@
 //   * THE POUR LANDS WHERE IT IS AIMED: the particles, flown the way
 //     sim_particle.wgsl flies them (v.y -= g, then p += v), come down within a
 //     cell and a half of the target; the SplatterEvent names the substance.
-//   * STACKS: a filled flask never merges with empty ones, and filling one of
+//   * STACKS: a filled flask never merges with anything, and filling one of
 //     a stack sets the rest down first.
 //   * PERSISTENCE: the fill round-trips through PLYR v6.
 //   * THE HEALTH PANEL'S POUR: MobSystem::DouseLimb coats exactly the limb it
@@ -63,6 +63,12 @@ Status GateVessel(Ctx& c, std::string& detail) {
   };
   const uint32_t mWater = matId("water"), mSand = matId("sand"),
                  mBlood = matId("blood"), mStone = matId("stone");
+  // A liquid on the GRID-particle road (not the MPM seam): lava, when it is
+  // one; 0 skips the checks that need it.
+  uint32_t mLava = matId("lava");
+  if (mLava && (c.mats[mLava].gpu.klass != CLASS_LIQUID ||
+                ContainerPoursAsFluid(c.mats[mLava])))
+    mLava = 0;
   const int flaskI = c.items.Find("flask"), pouchI = c.items.Find("pouch");
   const ItemDef* flask = c.items.At(flaskI);
   const ItemDef* pouch = c.items.At(pouchI);
@@ -227,9 +233,9 @@ Status GateVessel(Ctx& c, std::string& detail) {
     // A claim the GPU REFUSED (the cell went to something else) pays nothing.
     {
       ContainerScoopMemo m2;
-      m2.haveLedger = true;
-      m2.ledgerTick = 299;
-      m2.ledgerEighths = 1000;
+      m2.ledger.have = true;
+      m2.ledger.tick = 299;
+      m2.ledger.eighths = 1000;
       m2.claims.push_back({300, (uint16_t)mWater, 32});
       ItemStack f2{flaskI, 1};
       ContainerSettle(m2, 300, 1000 + 8, flask, &f2);
@@ -354,6 +360,127 @@ Status GateVessel(Ctx& c, std::string& detail) {
     for (const ItemStack& s : hb.slots)
       if (!s.Empty() && s.def == flaskI && !s.Filled()) rest += s.count;
     check(rest == 4, "and none of them is lost");
+    // TWO IDENTICAL FILLS DO NOT STACK: a count-2 stack has ONE fillAmt, so a
+    // merge would destroy a flask's worth on the first pour.
+    Inventory h2;
+    h2.slots[0] = ItemStack{flaskI, 1, 0, (uint16_t)mWater, 40};
+    const int w2 = h2.Add(flaskI, 1, 0, (uint16_t)mWater, 40);
+    check(w2 > 0 && h2.slots[0].count == 1 && h2.slots[w2].count == 1 &&
+              h2.slots[w2].fillAmt == 40,
+          "two flasks of the same fill stay two stacks");
+    Bag b2;
+    b2.slots[0] = ItemStack{flaskI, 1, 0, (uint16_t)mWater, 40};
+    check(b2.Add(flaskI, 1, 0, (uint16_t)mWater, 40) != 0,
+          "and the pack keeps them apart too");
+    check(h2.Add(flaskI, 2) == h2.Add(flaskI, 1), "empty flasks still stack");
+    // No path charges or pays a whole stack as one vessel.
+    ItemStack three{flaskI, 3};
+    check(ContainerDeposit(*flask, three, (uint16_t)mWater, 64) == 0 &&
+              !three.Filled(),
+          "a scoop is never paid into a stack of three (it would triple)");
+    ItemStack pair{flaskI, 2, 0, (uint16_t)mWater, 64};
+    std::vector<ParticleSpawn> none;
+    std::vector<FluidSpawnOp> noneF;
+    const Vec3 m0{(float)base.x, (float)base.y + 12.0f, (float)base.z};
+    check(ContainerPour(*flask, pair, m0, Vec3{1, 0, 0}, nullptr,
+                        CurrentTuning().sim.partGravity, 1, 1u, none, nullptr) == 0 &&
+              ContainerPourFluid(*flask, pair, m0, Vec3{1, 0, 0}, nullptr, 1, 1u,
+                                 4096, noneF, nullptr) == 0 &&
+              ContainerSpend(pair, 1) == 0 && pair.fillAmt == 64,
+          "a filled stack does not pour until one is set apart");
+  }
+
+  // ---- a pour lands exactly what it was charged ---------------------------
+  // The kernel used to land EVERY liquid particle full: scoop an eighth of
+  // lava, pour it, and a whole cell came down (scoop 8/8, repeat: unbounded).
+  {
+    const uint32_t liq = mLava ? mLava : mBlood;
+    ItemStack st{flaskI, 1, 0, (uint16_t)liq, 3};
+    std::vector<ParticleSpawn> sp;
+    const Vec3 m0{(float)base.x, (float)base.y + 12.0f, (float)base.z};
+    const int n = ContainerPour(*flask, st, m0, Vec3{1, 0, 0}, nullptr,
+                                CurrentTuning().sim.partGravity, 700, 3u, sp,
+                                nullptr, 0xFFFFFFFFu, &c.mats);
+    check(n == 1 && sp.size() == 1 && !st.Filled() &&
+              (sp[0].flags & kPFlagMeasured) != 0 &&
+              ((sp[0].payload >> 12) & 7u) == 2u,
+          "3 eighths pour as ONE particle measured at fullness 3/8, not a cell");
+    // A pouch with a partial cell (the portrait brush can leave one): the
+    // whole cells fall as grains, the rest is dust -- never a whole grain.
+    ItemStack sand{pouchI, 1, 0, (uint16_t)mSand, 12};
+    sp.clear();
+    ContainerPour(*pouch, sand, m0, Vec3{1, 0, 0}, nullptr,
+                  CurrentTuning().sim.partGravity, 701, 3u, sp, nullptr,
+                  0xFFFFFFFFu, &c.mats);
+    check(sp.size() == 1 && !sand.Filled() && (sp[0].flags & kPFlagMeasured) == 0,
+          "a pouch's partial last cell is dust, not a grain");
+    // THE RING'S ROOM: charged only for the particles that fit.
+    ItemStack big{flaskI, 1, 0, (uint16_t)liq, 64};
+    sp.clear();
+    const int got = ContainerPour(*flask, big, m0, Vec3{1, 0, 0}, nullptr,
+                                  CurrentTuning().sim.partGravity, 702, 3u, sp,
+                                  nullptr, 1u, &c.mats);
+    check(got == 1 && sp.size() == 1 && big.fillAmt == 56,
+          "a pour with room for one particle is charged for one");
+    check(ContainerParticleRoom(false, 0, 0) == 0 &&
+              ContainerParticleRoom(true, kParticleCap, 0) == 0 &&
+              ContainerParticleRoom(true, 0, 0) ==
+                  kParticleCap - kMaxParticleSpawnsPerTick * World::kSnapshotLatency &&
+              ContainerParticleRoom(true, 1000, 10) + 1010 ==
+                  ContainerParticleRoom(true, 0, 0),
+          "the ring bound: snapshot count + the streams since + this tick's queue");
+  }
+
+  // ---- one ledger for every scooper ----------------------------------------
+  // Two sessions' claims landing on one tick share the GPU's one counter: the
+  // sum paid is what the tick removed, not each paid the whole delta.
+  {
+    ContainerScoopLedger L;
+    ContainerLedgerObserve(L, 299, 1000, 0);
+    ContainerScoopMemo a, b;
+    a.claims.push_back({300, (uint16_t)mWater, 32});
+    b.claims.push_back({300, (uint16_t)mWater, 32});
+    ContainerLedgerObserve(L, 300, 1000 + 40, 2);   // the tick removed 40
+    ContainerLedgerObserve(L, 300, 1000 + 40, 2);   // seen again: no refill
+    ItemStack fa{flaskI, 1}, fb{flaskI, 1};
+    const ItemDef& fd = *flask;
+    ContainerSettle(L, a, 300,
+                    [&](uint16_t m, int u) { return ContainerDeposit(fd, fa, m, u); },
+                    nullptr);
+    ContainerSettle(L, b, 300,
+                    [&](uint16_t m, int u) { return ContainerDeposit(fd, fb, m, u); },
+                    nullptr);
+    check(fa.fillAmt + fb.fillAmt == 40 && fa.fillAmt == 32,
+          Format("two scoops on one tick are paid what the GPU removed, together "
+                 "(%d + %d of 40)", fa.fillAmt, fb.fillAmt).c_str());
+  }
+
+  // ---- a scoop in flight when the flask leaves the hand --------------------
+  // No vessel to pay: the eighths come back as UNPAID (the session spills
+  // them), not into nothing. A vessel with less room: the excess likewise.
+  {
+    ContainerScoopMemo m;
+    m.ledger.have = true;
+    m.ledger.tick = 399;
+    m.ledger.eighths = 0;
+    m.claims.push_back({400, (uint16_t)mWater, 24});
+    std::vector<ContainerUnpaid> unpaid;
+    const int paid = ContainerSettle(m, 400, 24, flask, nullptr, &unpaid);
+    check(paid == 0 && unpaid.size() == 1 && unpaid[0].units == 24 &&
+              unpaid[0].mat == mWater && m.claims.empty(),
+          "a scoop landing with no vessel is returned as unpaid, not dropped");
+    ContainerScoopMemo m2;
+    m2.ledger.have = true;
+    m2.ledger.tick = 400;
+    m2.ledger.eighths = 24;
+    m2.claims.push_back({401, (uint16_t)mWater, 24});
+    ItemStack nearly{flaskI, 1, 0, (uint16_t)mWater,
+                     (uint16_t)(flask->container.capacity - 10)};
+    unpaid.clear();
+    const int p2 = ContainerSettle(m2, 401, 48, flask, &nearly, &unpaid);
+    check(p2 == 10 && nearly.fillAmt == flask->container.capacity &&
+              unpaid.size() == 1 && unpaid[0].units == 14,
+          "what a vessel has no room for is returned as unpaid");
   }
 
   // ---- throwing and breaking -----------------------------------------------
@@ -407,18 +534,47 @@ Status GateVessel(Ctx& c, std::string& detail) {
     const int got2 = ContainerSpillStep(sp, c.mats, 101, 4096, fl, pa, &ev);
     check(got == 300 && got2 == 724 && sp.units == 0,
           "a spill the budget cannot hold drains next tick, conserved");
-    // Sand (not fluid) leaves as grid particles, a whole cell each.
+    // Sand (not fluid) leaves as grid particles, a whole cell each; the part
+    // cell left over cannot be a grain and is dust -- never rounded UP.
     sp = ContainerSpill{};
     sp.at = Vec3{10, 20, 30};
     sp.mat = (uint16_t)mSand;
     sp.units = 20;
     fl.clear();
     got = ContainerSpillStep(sp, c.mats, 100, 4096, fl, pa, &ev);
-    bool pOk = pa.size() == 3;
+    bool pOk = pa.size() == 2;
     for (const ParticleSpawn& p : pa)
-      pOk = pOk && (p.payload & 0xFFFu) == mSand && !(p.flags & kPFlagMicro);
+      pOk = pOk && (p.payload & 0xFFFu) == mSand && !(p.flags & kPFlagMicro) &&
+            !(p.flags & kPFlagMeasured);
     check(got == 20 && sp.units == 0 && fl.empty() && pOk,
-          "a broken pouch of sand is grid particles, rounded up to whole cells");
+          "a broken pouch of sand is whole-cell grid particles, never rounded up");
+    // A liquid the seam cannot hold (lava/blood-like: grid particles) lands
+    // at EXACTLY what it held: 20 eighths = 8 + 8 + 4, the last MEASURED at
+    // fullness code 3 -- not three full cells.
+    if (mLava) {
+      sp = ContainerSpill{};
+      sp.at = Vec3{10, 20, 30};
+      sp.mat = (uint16_t)mLava;
+      sp.units = 20;
+      pa.clear();
+      fl.clear();
+      got = ContainerSpillStep(sp, c.mats, 100, 4096, fl, pa, &ev);
+      int landed = 0;
+      bool meas = pa.size() == 3;
+      for (const ParticleSpawn& p : pa) {
+        meas = meas && (p.flags & kPFlagMeasured) != 0;
+        landed += (int)((p.payload >> 12) & 7u) + 1;
+      }
+      check(got == 20 && meas && landed == 20,
+            Format("a broken flask of lava lands exactly its 20 eighths (%d)",
+                   landed).c_str());
+      // ...and the ring-room bound holds it back rather than charging it.
+      sp.units = 20;
+      pa.clear();
+      got = ContainerSpillStep(sp, c.mats, 101, 4096, fl, pa, &ev, 1);
+      check(got == 8 && sp.units == 12 && pa.size() == 1,
+            "a spill charges only the particles the ring has room for");
+    }
   }
 
   // ---- persistence ---------------------------------------------------------
@@ -586,7 +742,7 @@ Status GateVessel(Ctx& c, std::string& detail) {
 //     deleting, so the drift is bounded by what is in motion).
 //   * WHAT IS POURED COMES BACK AS WATER. After emptying the flask and
 //     letting the stream land, the mirror holds the flask's worth again, less
-//     nothing and plus at most the 7/8 rounding of the last drop.
+//     nothing and plus nothing (the last partial cell lands MEASURED).
 //
 // vessel-mpm: the same round trip the way the game now does it for water --
 // the scoop's cells fly into the flask as GHOST MPM particles
@@ -804,11 +960,11 @@ Status VesselRoundTrip(Ctx& c, std::string& detail, bool mpm) {
   // death tick would read here as water the flask never paid for.
   const bool scoopOk = held > 0 && taken == held && memo.claims.empty() &&
                        (!mpm || (ghosts > 0 && ghostPeak > 0));
-  // Everything poured is on the tray: EXACTLY for the fluid pour (one
-  // particle per eighth), plus at most the last drop's rounding up to a whole
-  // cell for the grid one (ContainerPour: under one cell per emptying).
-  const bool pourOk = !st.Filled() && stillFlying == 0 && back >= held &&
-                      (mpm ? back == held : back < held + kContainerUnitsPerCell);
+  // Everything poured is on the tray, EXACTLY, both roads: the fluid pour is
+  // one particle per eighth, and the grid pour's last particle is MEASURED
+  // (kPFlagMeasured) and lands at the fullness it was charged -- it used to
+  // land full, which minted up to 7/8 of a cell per emptying.
+  const bool pourOk = !st.Filled() && stillFlying == 0 && back == held;
   detail = Format("pool %ld/8 -> flask credited %d, grid lost %ld; poured back, "
                   "grid gained %ld (%u particles still live; by tick%s)",
                   w0, held, taken, back, stillFlying, timeline.c_str());

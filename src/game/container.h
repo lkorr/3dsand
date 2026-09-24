@@ -73,6 +73,30 @@ bool ContainerAccepts(const ItemDef& def, const ItemStack& st, uint32_t mat,
 // matter from nothing, so the scooper remembers what it took until the
 // snapshot has caught up. World coordinates, not slot indices: a window shift
 // renumbers slots.
+// THE SCOOP LEDGER, READ ONCE PER SNAPSHOT FOR EVERY SCOOPER. The GPU keeps
+// ONE counter (world.h kPageFaultScoopEighths) for every conditional clear in
+// the world, so the delta between two consecutive snapshots is what ALL the
+// scoops landing on that tick removed together. It used to be read per
+// PlayerSession, each with its own "last seen" value: two local players whose
+// scoops landed on the same tick were each paid the tick's whole delta, and
+// the pair of flasks was credited twice what the grid lost. One reader per
+// world, and each tick's delta is a pot the landing claims draw down in a
+// fixed order (session order, then claim order), so the sum paid never
+// exceeds what the GPU removed.
+struct ContainerScoopLedger {
+  bool have = false;       // a snapshot has been observed
+  uint32_t tick = 0;       // the snapshot tick last observed
+  uint32_t eighths = 0;    // its ledger value
+  bool known = false;      // `left` speaks for `tick` (the delta is exact)
+  int left = 0;            // eighths `tick` removed, not yet paid out
+  int landing = 0;         // claims landing on `tick`, not yet settled
+};
+// Observe one snapshot: `ledger` its scoop counter, `landingClaims` the number
+// of claims (across every memo that will settle this tick) whose tick is
+// `snapTick`. Idempotent for a snapshot already observed.
+void ContainerLedgerObserve(ContainerScoopLedger& L, uint32_t snapTick,
+                            uint32_t ledger, int landingClaims);
+
 struct ContainerScoopMemo {
   struct Taken {
     IVec3 c;
@@ -87,11 +111,11 @@ struct ContainerScoopMemo {
     int units;
   };
   std::vector<Claim> claims;
-  // The ledger as of the last snapshot seen, so the next one's delta is what
-  // that one tick's clears removed.
-  bool haveLedger = false;
-  uint32_t ledgerTick = 0;
-  uint32_t ledgerEighths = 0;
+  // The ledger this memo reads when it is settled ALONE (the single-memo
+  // ContainerSettle overload: the gates). The live tick settles every
+  // session's memo against ONE shared ContainerScoopLedger instead -- see
+  // there for why a ledger per memo over-pays.
+  ContainerScoopLedger ledger;
   int Pending() const {
     int n = 0;
     for (const Claim& c : claims) n += c.units;
@@ -129,8 +153,35 @@ int ContainerScoop(const ItemDef& def, ItemStack& st, IVec3 hit,
 // speak for (a reset between snapshots), is paid in full -- the one fallback,
 // and it can only happen across a load or a regen. Credits go into `st` when
 // it can take them; returns the eighths paid.
+//
+// THE PAYMENT GOES WHERE `deposit` PUTS IT. The live tick passes a deposit
+// that tries the held vessel, then every other vessel on the hotbar and in the
+// pack that can take it (ContainerDeposit), and returns what fit. What the GPU
+// removed but no vessel could take -- the flask was thrown or set down while
+// its scoop was in flight, or the claim was paid into a vessel with less room
+// -- is NOT dropped: it is appended to `unpaid` as (material, eighths) for the
+// caller to put back into the world (session.cpp spills it as a
+// ContainerSpill). Matter the GPU removed is always either in a vessel or on
+// its way back to the grid.
+struct ContainerUnpaid {
+  uint16_t mat = 0;
+  int units = 0;
+};
+int ContainerSettle(ContainerScoopLedger& L, ContainerScoopMemo& memo,
+                    uint32_t snapTick,
+                    const std::function<int(uint16_t mat, int units)>& deposit,
+                    std::vector<ContainerUnpaid>* unpaid);
+// The single-memo form (the gates): observes `memo.ledger` itself and deposits
+// into `st` alone. Unpaid eighths are returned through `unpaid` when given.
 int ContainerSettle(ContainerScoopMemo& memo, uint32_t snapTick, uint32_t ledger,
-                    const ItemDef* def, ItemStack* st);
+                    const ItemDef* def, ItemStack* st,
+                    std::vector<ContainerUnpaid>* unpaid = nullptr);
+
+// Put up to `units` eighths of `mat` into ONE vessel. Refuses (returns 0) a
+// stack of more than one -- a fill is one object's (ItemStack::SameKind) and
+// paying a stack of three would triple it -- and a vessel that already holds
+// something else. Returns what fit, capped by its room.
+int ContainerDeposit(const ItemDef& def, ItemStack& st, uint16_t mat, int units);
 
 // POUR: up to `spec.pourPerTick` cells out of `mouth` (the vessel in the hand),
 // charging `st`. Two ways, and the difference is the owner's report that the
@@ -149,10 +200,46 @@ int ContainerSettle(ContainerScoopMemo& memo, uint32_t snapTick, uint32_t ledger
 // and sets sourceMob). `partGravity` is sim.partGravity (24.8 fixed
 // voxels/tick^2), the number the kernel integrates with, so the arc solved
 // here is the arc it flies.
+//
+// A GRID PARTICLE CARRIES EXACTLY WHAT IT WAS CHARGED (kPFlagMeasured). Each
+// one is charged min(8, fill) eighths, and the kernel used to reinsert EVERY
+// liquid particle as a full cell -- so the last eighth of a flask of lava came
+// back as eight, and "scoop one eighth, pour, re-scoop eight" minted lava
+// without limit. A liquid particle now carries its charge as its fullness code
+// and the MEASURED flag tells sim_particle.wgsl to land it at that fullness. A
+// powder cannot be a fraction of a cell, so a pouch's last partial cell (only
+// the portrait brush can leave one) does not become a grain: it is spent as
+// dust, a loss under one cell, never a gain.
+//
+// `partRoom` is how many more grid particles the ring can be trusted to take
+// this tick (ContainerParticleRoom); the pour is charged only for particles
+// that fit under it (rule 2, charged BEFORE emission). A stack of more than
+// one vessel does not pour (returns 0): isolate one first.
 int ContainerPour(const ItemDef& def, ItemStack& st, Vec3 mouth, Vec3 fwd,
                   const Vec3* target, int partGravity, uint32_t tick,
                   uint32_t seed, std::vector<ParticleSpawn>& spawns,
-                  SplatterEvent* splat);
+                  SplatterEvent* splat, uint32_t partRoom = 0xFFFFFFFFu,
+                  const std::vector<MaterialDef>* mats = nullptr);
+
+// PFLAG_MEASURED in sim_particle.wgsl, its only reader (check_invariants.py
+// keeps the two equal): a whole-voxel liquid particle with this bit lands at
+// the fullness its payload's state nibble names instead of full. Bit 16, the
+// next free one after DRIP. Set only by vessels (ContainerPour, spills).
+constexpr uint32_t kPFlagMeasured = 65536u;
+
+// HOW MANY MORE GRID PARTICLES THE RING CAN BE TRUSTED WITH THIS TICK, from
+// what the CPU knows without a readback: the snapshot's live count (kSnapshot-
+// Latency ticks old), every CPU spawn stream that could have been added since
+// at its per-tick cap, and what this tick has already queued. The spawn kernel
+// VAPORIZES a spawn that finds the ring full (sim_particle.wgsl `spawn`), so a
+// pour charged for a particle that vaporized destroyed matter. THE LIMIT: this
+// bound cannot see GPU-born particles (explosion ejecta, MPM splash-out) added
+// inside the snapshot's latency window, so a ring driven to its cap by those
+// within those few ticks can still vaporize a pour. Closing that needs a GPU
+// refund ledger like the scoop's; the ring at that fill is already a state
+// nothing else in the game survives either.
+uint32_t ContainerParticleRoom(bool snapValid, uint32_t snapParticleCount,
+                               size_t queuedThisTick);
 
 // THE SAME POUR AS MLS-MPM FLUID (owner, 2026-09-23: "when using the flask to
 // take or pour water, they're cubic microvoxels; i want ... the poured water
@@ -224,7 +311,7 @@ bool ContainerShouldBreak(const ItemDef& def, float contactSpeed, Vec3 dv);
 // not -- the budget is charged BEFORE emission (rule 2) and nothing is lost to
 // it. The same two roads the pour takes: a liquid the MPM seam can hold as
 // fluid particles, one per eighth, exact; anything else as grid particles, a
-// whole cell each (the pour's one rounding, under a cell per flask).
+// cell each, the last at its measured fullness (ContainerPour).
 struct ContainerSpill {
   Vec3 at{};       // where the vessel was, world voxels (its centre of mass)
   Vec3 vel{};      // its velocity before the blow, voxels/s
@@ -237,10 +324,12 @@ struct ContainerSpill {
 // One tick of a spill. Returns the eighths emitted; `splat`, on the first
 // tick anything leaves, is filled with the burst's SplatterEvent (the caller
 // queues it), so whoever it breaks over is wet with it.
+// Grid particles are MEASURED (see ContainerPour) and limited by `partRoom`.
 int ContainerSpillStep(ContainerSpill& sp, const std::vector<MaterialDef>& mats,
                        uint32_t tick, uint32_t fluidRoom,
                        std::vector<FluidSpawnOp>& fluid,
-                       std::vector<ParticleSpawn>& parts, SplatterEvent* splat);
+                       std::vector<ParticleSpawn>& parts, SplatterEvent* splat,
+                       uint32_t partRoom = 0xFFFFFFFFu);
 
 // THE BREAK PASS, once per tick (session.cpp phase H, and the vessel-break
 // gate): every vessel in `ground` against both witnesses -- the NEW contacts

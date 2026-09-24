@@ -12206,7 +12206,14 @@ int main(int argc, char** argv) {
             // ONE of the stack. Dropping a count you did not mean to is the
             // mis-click this system's swap-never-overwrite rule exists to
             // prevent, and it applies here too.
-            if (--src->count <= 0) *src = ItemStack{};
+            if (--src->count <= 0) {
+              *src = ItemStack{};
+            } else {
+              // A fill is ONE vessel's (item.h SameKind) and it went with the
+              // dropped one; the rest of the stack stays empty, not a copy.
+              src->fillMat = 0;
+              src->fillAmt = 0;
+            }
             ui.kitMessage = "dropped";
           } else {
             ui.kitMessage = "there is nowhere to put that";

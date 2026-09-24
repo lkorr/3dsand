@@ -1485,26 +1485,62 @@ static void PhaseG(TickAuthorityCtx& w, WorldScratch& ws,
       s.scoopMotes.erase(std::remove_if(s.scoopMotes.begin(), s.scoopMotes.end(),
                                         [](const ScoopMote& m) { return m.age > m.life; }),
                          s.scoopMotes.end());
-      if (!s.scoopMemo.claims.empty() || s.scoopMemo.haveLedger) {
+      // The ledger itself was observed once for every session before phase G
+      // (TickAuthority, w.scoopLedger); here this session's claims draw on it.
+      // A claim is paid into ONE vessel at a time (ContainerDeposit refuses a
+      // stack: a stack of empties is split first, ContainerIsolateOne), and
+      // spread over as many as it takes. What no vessel can hold -- the flask
+      // was thrown or set down with its scoop still in flight -- goes back
+      // into the world as a spill at the hands, never into nothing.
+      if (!s.scoopMemo.claims.empty()) {
         const WorldSnapshot& lsnap = world.Snap();
         if (lsnap.valid) {
-          ItemStack* dst = nullptr;
-          const ItemDef* ddef = nullptr;
-          const uint16_t want = s.scoopMemo.PendingMat();
-          auto take = [&](ItemStack& cand) {
-            if (dst || cand.Empty()) return;
+          auto depositInto = [&](ItemStack* v, int n, int i, ItemStack* spill,
+                                 int nSpill, uint16_t mat, int units) {
+            ItemStack& cand = v[i];
+            if (cand.Empty()) return 0;
             const ItemDef* d = items.At(cand.def);
-            if (d && d->IsContainer() &&
-                (!cand.Filled() || cand.fillMat == want)) {
-              dst = &cand;
-              ddef = d;
-            }
+            if (!d || !d->IsContainer() || (cand.Filled() && cand.fillMat != mat))
+              return 0;
+            if (mat >= mats.size() || mats[mat].gpu.klass > 31 ||
+                ((d->container.holds >> mats[mat].gpu.klass) & 1u) == 0)
+              return 0;
+            if (cand.count > 1 && !ContainerIsolateOne(v, n, i, spill, nSpill))
+              return 0;
+            return ContainerDeposit(*d, cand, mat, units);
           };
-          if (st.intent.vesselSlot >= 0 && st.intent.vesselSlot < kItemSlots)
-            take(hotbar.slots[st.intent.vesselSlot]);
-          for (ItemStack& cand : hotbar.slots) take(cand);
-          for (ItemStack& cand : kit.bag.slots) take(cand);
-          ContainerSettle(s.scoopMemo, lsnap.tick, lsnap.scoopEighths, ddef, dst);
+          auto deposit = [&](uint16_t mat, int units) {
+            int put = 0;
+            const int held = st.intent.vesselSlot;
+            if (held >= 0 && held < kItemSlots)
+              put += depositInto(hotbar.slots, kItemSlots, held, kit.bag.slots,
+                                 Bag::kSlots, mat, units - put);
+            for (int i = 0; i < kItemSlots && put < units; i++)
+              put += depositInto(hotbar.slots, kItemSlots, i, kit.bag.slots,
+                                 Bag::kSlots, mat, units - put);
+            for (int i = 0; i < Bag::kSlots && put < units; i++)
+              put += depositInto(kit.bag.slots, Bag::kSlots, i, hotbar.slots,
+                                 kItemSlots, mat, units - put);
+            return put;
+          };
+          std::vector<ContainerUnpaid> unpaid;
+          ContainerSettle(w.scoopLedger, s.scoopMemo, lsnap.tick, deposit, &unpaid);
+          for (const ContainerUnpaid& u : unpaid) {
+            ContainerSpill sp;
+            const Vec3 fwd = cam.Forward();
+            sp.at = player.EyePos() + fwd * MetresToCells(0.35f) -
+                    Vec3{0, MetresToCells(0.15f), 0};
+            sp.vel = player.vel;
+            sp.away = Vec3{fwd.x, 0.0f, fwd.z};
+            const float al = sp.away.len();
+            sp.away = al > 1e-4f ? sp.away * (1.0f / al) : Vec3{};
+            sp.mat = u.mat;
+            sp.units = u.units;
+            sp.seed = rng::Hash3(0x5C0FEDu, tick, (uint32_t)u.units);
+            w.vesselSpills.push_back(sp);
+            ui.kitMessage = "there is nothing to hold it; it spills";
+            ui.kitMessageAge = 0.0f;
+          }
         }
       }
       // ---- THE THROW (game/container.h ContainerThrowSpeed): Q held winds it
@@ -1546,7 +1582,14 @@ static void PhaseG(TickAuthorityCtx& w, WorldScratch& ws,
             const float rl = right.len();
             right = rl > 1e-4f ? right * (1.0f / rl) : Vec3{1, 0, 0};
             phys.SetBodyVelocities(body, vel, right * (-4.0f - speed * 0.02f));
-            if (--vs.count <= 0) vs = ItemStack{};
+            if (--vs.count <= 0) {
+              vs = ItemStack{};
+            } else {
+              // The fill was ONE flask's (item.h SameKind) and it just left
+              // in the thrown one; what stays behind is empty, not a copy.
+              vs.fillMat = 0;
+              vs.fillAmt = 0;
+            }
           } else {
             ui.kitMessage = "there is nowhere to throw that";
             ui.kitMessageAge = 0.0f;
@@ -1663,6 +1706,12 @@ static void PhaseG(TickAuthorityCtx& w, WorldScratch& ws,
         if (vdef && vdef->IsContainer() && ti.Held(TB_ATTACK) && !ti.Held(TB_ALT)) {
           if (!vs.Filled()) {
             if (ti.Pressed(TB_ATTACK)) say("it is empty");
+          } else if (!ContainerIsolateOne(hotbar.slots, kItemSlots,
+                                          st.intent.vesselSlot, kit.bag.slots,
+                                          Bag::kSlots)) {
+            // A filled stack (a save from before fills stopped stacking): its
+            // one fill is one flask's, so only one of them may pour it.
+            if (ti.Pressed(TB_ATTACK)) say("no room to set the others down");
           } else {
             // OUT OF THE FLASK, from its mouth.
             const Vec3 mouth = vesselMouth();
@@ -1690,7 +1739,11 @@ static void PhaseG(TickAuthorityCtx& w, WorldScratch& ws,
                                            pseed, fluidRoom(), fluidSpawns, &splat)
                       : ContainerPour(*vdef, vs, mouth, fwd, &target,
                                       CurrentTuning().sim.partGravity, tick,
-                                      pseed, spawns, &splat);
+                                      pseed, spawns, &splat,
+                                      ContainerParticleRoom(vsnap.valid,
+                                                            vsnap.particleCount,
+                                                            spawns.size()),
+                                      &mats);
               if (poured > 0) {
                 splat.sourceMob = avatar.Spawned() ? avatar.Id() : 0;
                 mobs.QueueSplatter(splat);
@@ -1780,9 +1833,13 @@ static void PhaseH(TickAuthorityCtx& w, WorldScratch& ws,
       //
       // Bounded by the ground registry (a few entries) and the contact list
       // (capped per step); a ghost body is the peer's to break.
-      if (w.ground) {
-        ContainerBreakPass(*w.ground, items, phys, debris, w.vesselVel,
-                           w.vesselSpills);
+      //
+      // The drain runs with or without a ground registry: phase G also
+      // queues spills here (a scoop settled with no vessel to hold it).
+      {
+        if (w.ground)
+          ContainerBreakPass(*w.ground, items, phys, debris, w.vesselVel,
+                             w.vesselSpills);
         for (ContainerSpill& sp : w.vesselSpills) {
           const size_t used = (size_t)fluidCount + fluidSpawns.size();
           const uint32_t room =
@@ -1794,7 +1851,10 @@ static void PhaseH(TickAuthorityCtx& w, WorldScratch& ws,
           SplatterEvent splat;
           splat.count = 0;
           const bool first = !sp.splatted;
-          ContainerSpillStep(sp, mats, tick, room, fluidSpawns, spawns, &splat);
+          const WorldSnapshot& psnap = world.Snap();
+          ContainerSpillStep(sp, mats, tick, room, fluidSpawns, spawns, &splat,
+                             ContainerParticleRoom(psnap.valid, psnap.particleCount,
+                                                   spawns.size()));
           if (first && sp.splatted) mobs.QueueSplatter(splat);
         }
         std::erase_if(w.vesselSpills,
@@ -2577,6 +2637,23 @@ static void PhaseI(TickAuthorityCtx& w, WorldScratch& ws,
         {
           PlayerSession::PourStroke& ps = s.pourStroke;
           ItemStack* vp = kit.Resolve(ps.vessel, hotbar);
+          // ONE VESSEL'S FILL (item.h SameKind): a filled stack left by an old
+          // save is split first, else the brush would drain one flask's fill
+          // on behalf of the whole stack. Where the rest cannot be set down,
+          // the brush does not pour.
+          if (vp && !vp->Empty() && vp->count > 1) {
+            const bool inHot = vp >= hotbar.slots && vp < hotbar.slots + kItemSlots;
+            const bool inBag = vp >= kit.bag.slots && vp < kit.bag.slots + Bag::kSlots;
+            const bool split =
+                inHot ? ContainerIsolateOne(hotbar.slots, kItemSlots,
+                                            (int)(vp - hotbar.slots), kit.bag.slots,
+                                            Bag::kSlots)
+                : inBag ? ContainerIsolateOne(kit.bag.slots, Bag::kSlots,
+                                              (int)(vp - kit.bag.slots),
+                                              hotbar.slots, kItemSlots)
+                        : false;
+            if (!split) vp = nullptr;
+          }
           const ItemDef* vdef = !vp || vp->Empty() ? nullptr : items.At(vp->def);
           if (!ps.active || !avatar.Spawned() || !vdef || !vdef->IsContainer() ||
               !vp->Filled()) {
@@ -3676,6 +3753,21 @@ void TickAuthority(TickAuthorityCtx& w, std::span<SessionTick> players,
   for (size_t i = 0; i < players.size(); i++)
     PhaseE(w, ws, players[i], scratch[i], tick, out);
   PhaseF(w, ws, players, scratch, tick, out);
+  // THE SCOOP LEDGER, read ONCE for every session (container.h
+  // ContainerScoopLedger): the landing claims of all of them are counted
+  // first, so the pot each PhaseG settle draws on is the whole world's and
+  // the last claim to land -- in session order -- takes the remainder.
+  {
+    const WorldSnapshot& lsnap = w.world.Snap();
+    if (lsnap.valid) {
+      int landing = 0;
+      for (SessionTick& p : players)
+        for (const ContainerScoopMemo::Claim& c : p.s->scoopMemo.claims)
+          if (c.tick == lsnap.tick) landing++;
+      ContainerLedgerObserve(w.scoopLedger, lsnap.tick, lsnap.scoopEighths,
+                             landing);
+    }
+  }
   for (size_t i = 0; i < players.size(); i++)
     PhaseG(w, ws, players[i], scratch[i], tick, out);
   PhaseH(w, ws, players, scratch, tick, out);

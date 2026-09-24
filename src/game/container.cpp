@@ -151,50 +151,92 @@ int ContainerScoop(const ItemDef& def, ItemStack& st, IVec3 hit,
   return taken;
 }
 
-int ContainerSettle(ContainerScoopMemo& memo, uint32_t snapTick, uint32_t ledger,
-                    const ItemDef* def, ItemStack* st) {
+void ContainerLedgerObserve(ContainerScoopLedger& L, uint32_t snapTick,
+                            uint32_t ledger, int landingClaims) {
+  // The same snapshot again (no new one arrived this tick): its pot is
+  // already being drawn down, and observing it twice would refill it.
+  if (L.have && snapTick == L.tick) return;
   // What THIS snapshot's tick removed, if the previous snapshot was the tick
   // before and the ledger did not go backwards (a reset zeroes it).
-  const bool known = memo.haveLedger && snapTick == memo.ledgerTick + 1 &&
-                     ledger >= memo.ledgerEighths;
-  int removed = known ? (int)(ledger - memo.ledgerEighths) : 0;
-  if (!memo.haveLedger || snapTick != memo.ledgerTick) {
-    memo.haveLedger = true;
-    memo.ledgerTick = snapTick;
-    memo.ledgerEighths = ledger;
-  }
+  L.known = L.have && snapTick == L.tick + 1 && ledger >= L.eighths;
+  L.left = L.known ? (int)(ledger - L.eighths) : 0;
+  L.landing = std::max(0, landingClaims);
+  L.have = true;
+  L.tick = snapTick;
+  L.eighths = ledger;
+}
+
+int ContainerDeposit(const ItemDef& def, ItemStack& st, uint16_t mat, int units) {
+  if (units <= 0 || mat == 0 || st.Empty() || !def.IsContainer()) return 0;
+  if (st.count != 1) return 0;   // one object's fill, never a stack's
+  if (st.Filled() && st.fillMat != mat) return 0;
+  const int room = std::max(0, def.container.capacity - (int)st.fillAmt);
+  const int put = std::min(units, room);
+  if (put <= 0) return 0;
+  st.fillMat = mat;
+  st.fillAmt = (uint16_t)(st.fillAmt + put);
+  return put;
+}
+
+int ContainerSettle(ContainerScoopLedger& L, ContainerScoopMemo& memo,
+                    uint32_t snapTick,
+                    const std::function<int(uint16_t mat, int units)>& deposit,
+                    std::vector<ContainerUnpaid>* unpaid) {
+  const bool pot = L.have && L.known && L.tick == snapTick;
   int paid = 0;
   size_t w = 0;
-  // How many claims land on THIS tick: the last of them takes whatever the
-  // ledger has left, so the total paid is exactly what the tick removed. A
-  // cell that filled up between the snapshot and the clear gave the GPU MORE
-  // than was asked, and that is still water that left the world.
-  int landing = 0;
-  for (const ContainerScoopMemo::Claim& c : memo.claims)
-    if (c.tick == snapTick) landing++;
   for (const ContainerScoopMemo::Claim& c : memo.claims) {
     if (c.tick > snapTick) {
       memo.claims[w++] = c;   // not landed yet
       continue;
     }
     int pay = c.units;
-    if (c.tick == snapTick && known) {
-      // ONE ledger for every vessel in the world: two scoops landing on the
-      // same tick share it. Each but the last is paid at most its claim.
-      pay = --landing > 0 ? std::min(c.units, removed) : removed;
-      removed -= pay;
+    if (c.tick == snapTick && pot) {
+      // ONE ledger for every vessel in the world: every claim landing on this
+      // tick, in every session, draws on the same pot. Each but the last is
+      // paid at most its claim; the LAST takes whatever is left, so the total
+      // paid is exactly what the tick removed -- a cell that filled up
+      // between the snapshot and the clear gave the GPU MORE than was asked,
+      // and that is still matter that left the world.
+      pay = --L.landing > 0 ? std::min(c.units, L.left) : L.left;
+      pay = std::max(0, pay);
+      L.left -= pay;
     }
-    if (pay > 0 && st && def && def->IsContainer() &&
-        (!st->Filled() || st->fillMat == c.mat)) {
-      const int room = def->container.capacity - st->fillAmt;
-      pay = std::min(pay, std::max(0, room));
-      st->fillMat = c.mat;
-      st->fillAmt = (uint16_t)(st->fillAmt + pay);
-      paid += pay;
-    }
+    if (pay <= 0) continue;
+    const int put = deposit ? std::clamp(deposit(c.mat, pay), 0, pay) : 0;
+    paid += put;
+    if (put < pay && unpaid) unpaid->push_back({c.mat, pay - put});
   }
   memo.claims.resize(w);
   return paid;
+}
+
+int ContainerSettle(ContainerScoopMemo& memo, uint32_t snapTick, uint32_t ledger,
+                    const ItemDef* def, ItemStack* st,
+                    std::vector<ContainerUnpaid>* unpaid) {
+  int landing = 0;
+  for (const ContainerScoopMemo::Claim& c : memo.claims)
+    if (c.tick == snapTick) landing++;
+  ContainerLedgerObserve(memo.ledger, snapTick, ledger, landing);
+  return ContainerSettle(
+      memo.ledger, memo, snapTick,
+      [&](uint16_t mat, int units) {
+        return def && st ? ContainerDeposit(*def, *st, mat, units) : 0;
+      },
+      unpaid);
+}
+
+uint32_t ContainerParticleRoom(bool snapValid, uint32_t snapParticleCount,
+                               size_t queuedThisTick) {
+  if (!snapValid) return 0u;   // nothing known: pour nothing rather than guess
+  // Every CPU spawn stream since the snapshot, at its cap: the snapshot shows
+  // tick T - kSnapshotLatency and the streams of the ticks after it (this one
+  // included, whose queue is counted exactly below) are not in it.
+  const uint64_t since =
+      (uint64_t)kMaxParticleSpawnsPerTick * World::kSnapshotLatency;
+  const uint64_t used = (uint64_t)std::min(snapParticleCount, kParticleCap) +
+                        since + (uint64_t)queuedThisTick;
+  return used >= kParticleCap ? 0u : (uint32_t)(kParticleCap - used);
 }
 
 bool ContainerInReach(const ItemDef& def, Vec3 mouth, Vec3 target) {
@@ -253,11 +295,25 @@ Vec3 ContainerPourPoint(const ItemDef& def, Vec3 from, Vec3 head, Vec3 fwd,
   return from + dir * dist;
 }
 
+namespace {
+// Is what this vessel holds a LIQUID (land at measured fullness) or not (a
+// whole grain or nothing)? The material table when the caller has one; else
+// the vessel's own `holds`: a vessel that can hold only liquids holds one.
+// Unknown counts as NOT liquid, the direction that can only lose a partial
+// cell, never mint one.
+bool ContainerContentIsLiquid(const ItemDef& def, uint32_t mat,
+                              const std::vector<MaterialDef>* mats) {
+  if (mats) return mat < mats->size() && (*mats)[mat].gpu.klass == CLASS_LIQUID;
+  return def.container.holds == (1u << CLASS_LIQUID);
+}
+}  // namespace
+
 int ContainerPour(const ItemDef& def, ItemStack& st, Vec3 mouth, Vec3 fwd,
                   const Vec3* target, int partGravity, uint32_t tick,
                   uint32_t seed, std::vector<ParticleSpawn>& spawns,
-                  SplatterEvent* splat) {
-  if (!def.IsContainer() || !st.Filled()) return 0;
+                  SplatterEvent* splat, uint32_t partRoom,
+                  const std::vector<MaterialDef>* mats) {
+  if (!def.IsContainer() || !st.Filled() || st.count != 1) return 0;
   const float speed = std::max(1.0f, def.container.pourSpeed);   // vox/s
   const float gTick = (float)std::max(0, partGravity) / 256.0f;
   Vec3 v0;
@@ -284,8 +340,18 @@ int ContainerPour(const ItemDef& def, ItemStack& st, Vec3 mouth, Vec3 fwd,
 
   int poured = 0;
   const uint32_t mat = st.fillMat;
+  const bool liquid = ContainerContentIsLiquid(def, mat, mats);
   for (int k = 0; k < def.container.pourPerTick && st.Filled(); k++) {
     if (spawns.size() >= kMaxParticleSpawnsPerTick) break;
+    if ((uint32_t)k >= partRoom) break;   // charged only for what the ring takes
+    const int spend = std::min<int>(kContainerUnitsPerCell, st.fillAmt);
+    if (!liquid && spend < kContainerUnitsPerCell) {
+      // A powder's last partial cell cannot be a grain: spent as dust (see
+      // ContainerPour in container.h), never landed as a whole cell.
+      st.fillAmt = 0;
+      st.fillMat = 0;
+      break;
+    }
     // A little spread so the stream is a stream and not one voxel column:
     // +-4% of the launch velocity and +-0.3 cell at the lip, both hashed from
     // (seed, tick, k) so a replayed pour lands the same cells.
@@ -305,15 +371,15 @@ int ContainerPour(const ItemDef& def, ItemStack& st, Vec3 mouth, Vec3 fwd,
     s.vx = (int32_t)std::lround(v.x * 256.0f);
     s.vy = (int32_t)std::lround(v.y * 256.0f);
     s.vz = (int32_t)std::lround(v.z * 256.0f);
-    // Full state: the kernel reinserts a liquid particle as a full cell
-    // whatever it carries (sim_particle.wgsl), so the last few eighths of a
-    // flask come out as one whole cell. That is the one rounding in the
-    // system and it is at most 7/8 of a cell per emptying.
-    s.payload = (mat & 0xFFFu) | (7u << 12);
+    // A liquid carries EXACTLY what it was charged as its fullness code
+    // (1..8 eighths = 0..7) and the MEASURED bit that tells the kernel to
+    // land it at that fullness rather than full: the last few eighths of a
+    // flask come out as a partial cell, not a whole one. A powder is always a
+    // whole cell here (the partial one was refused above).
+    s.payload = (mat & 0xFFFu) | ((uint32_t)(spend - 1) << 12);
     // CALM: a stream, not spray -- the wind does not carry it off.
-    s.flags = kPFlagAlive | kPFlagCalm;
+    s.flags = kPFlagAlive | kPFlagCalm | (liquid ? kPFlagMeasured : 0u);
     spawns.push_back(s);
-    const int spend = std::min<int>(kContainerUnitsPerCell, st.fillAmt);
     st.fillAmt = (uint16_t)(st.fillAmt - spend);
     if (st.fillAmt == 0) st.fillMat = 0;
     poured++;
@@ -352,7 +418,8 @@ int ContainerPourFluid(const ItemDef& def, ItemStack& st, Vec3 mouth, Vec3 fwd,
                        const Vec3* target, uint32_t tick, uint32_t seed,
                        uint32_t room, std::vector<FluidSpawnOp>& out,
                        SplatterEvent* splat) {
-  if (!def.IsContainer() || !st.Filled()) return 0;
+  // One vessel's fill: a stack does not pour (isolate one first).
+  if (!def.IsContainer() || !st.Filled() || st.count != 1) return 0;
   const Tuning& tune = CurrentTuning();
   const float speed = std::max(1.0f, def.container.pourSpeed);   // vox/s
   // The solver's own integration: per substep v.y -= g/S, then p += v/S. After
@@ -510,7 +577,8 @@ bool ContainerShouldBreak(const ItemDef& def, float contactSpeed, Vec3 dv) {
 int ContainerSpillStep(ContainerSpill& sp, const std::vector<MaterialDef>& mats,
                        uint32_t tick, uint32_t fluidRoom,
                        std::vector<FluidSpawnOp>& fluid,
-                       std::vector<ParticleSpawn>& parts, SplatterEvent* splat) {
+                       std::vector<ParticleSpawn>& parts, SplatterEvent* splat,
+                       uint32_t partRoom) {
   if (sp.units <= 0 || sp.mat == 0 || sp.mat >= mats.size()) {
     sp.units = 0;
     return 0;
@@ -568,9 +636,18 @@ int ContainerSpillStep(ContainerSpill& sp, const std::vector<MaterialDef>& mats,
     }
     sp.units -= emitted;
   } else {
-    // Whole cells: the kernel reinserts a particle as a full cell (see
-    // ContainerPour), so a partial last cell comes out whole.
-    while (sp.units > 0 && parts.size() < kMaxParticleSpawnsPerTick) {
+    // A cell per particle, MEASURED like the pour's (ContainerPour): a
+    // liquid's partial last cell lands at its fullness, a powder's is dust.
+    const bool liquid = mats[sp.mat].gpu.klass == CLASS_LIQUID;
+    uint32_t made = 0;
+    while (sp.units > 0 && parts.size() < kMaxParticleSpawnsPerTick &&
+           made < partRoom) {
+      const int spend = std::min(kContainerUnitsPerCell, sp.units);
+      if (!liquid && spend < kContainerUnitsPerCell) {
+        emitted += spend;   // under a cell of grains: dust, not a grain
+        sp.units = 0;
+        break;
+      }
       Vec3 p, v;
       sample((uint32_t)sp.units, p, v);
       ParticleSpawn ps{};
@@ -580,10 +657,10 @@ int ContainerSpillStep(ContainerSpill& sp, const std::vector<MaterialDef>& mats,
       ps.vx = (int32_t)std::lround(v.x * 256.0f);
       ps.vy = (int32_t)std::lround(v.y * 256.0f);
       ps.vz = (int32_t)std::lround(v.z * 256.0f);
-      ps.payload = ((uint32_t)sp.mat & 0xFFFu) | (7u << 12);
-      ps.flags = kPFlagAlive;
+      ps.payload = ((uint32_t)sp.mat & 0xFFFu) | ((uint32_t)(spend - 1) << 12);
+      ps.flags = kPFlagAlive | (liquid ? kPFlagMeasured : 0u);
       parts.push_back(ps);
-      const int spend = std::min(kContainerUnitsPerCell, sp.units);
+      made++;
       sp.units -= spend;
       emitted += spend;
     }
@@ -684,7 +761,7 @@ int ContainerBreakPass(WorldItems& ground, const ItemLibrary& items,
 }
 
 int ContainerSpend(ItemStack& st, int cells) {
-  if (!st.Filled() || cells <= 0) return 0;
+  if (!st.Filled() || cells <= 0 || st.count != 1) return 0;
   const int want = cells * kContainerUnitsPerCell;
   const int spend = std::min<int>(want, st.fillAmt);
   st.fillAmt = (uint16_t)(st.fillAmt - spend);
