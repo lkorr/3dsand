@@ -1798,7 +1798,13 @@ Status GateStoreSync(Ctx& c, std::string& detail) {
 //   (b) B IS A PEER'S GHOST (`SetAvatars(.., localCount = 1)`), A's machine,
 //       phase K: the same blast carves it (the melee rule: presentation), does
 //       NOT launch it -- a ghost's position is the wire's -- and emits NO gore
-//       (the owner authors that; emitting it here too doubles it).
+//       (the owner authors that; emitting it here too doubles it). "Not
+//       launched" is only a claim about a LIVE body (a dead one is never
+//       launched either), so the ghost must survive the blast, and the launch
+//       is measured where it would show: the root limb's velocity straight
+//       after the blast and the root's travel over one physics step. Arm (a)
+//       is the witness that the same numbers DO move for a launched body and
+//       that this blast is not lethal.
 //   (c) B'S MACHINE, phase N. A's blast arrives as a REMOTE batch; the merge
 //       names it remote; B's own avatar is carved AND launched and its gore
 //       lands in the carry vector. A's ghost, standing in the same blast on
@@ -1813,6 +1819,10 @@ enum class Arm { Local, Ghost, OwnerSide, AuthorSide };
 struct BlastArm {
   uint32_t lostA = 0, lostB = 0;
   bool limpA = false, limpB = false;
+  bool aliveB = false;
+  float bSpeed = 0.0f;    // |root limb velocity| after the blast, vox/s
+  float bSpeed0 = 0.0f;   // ...and before it
+  float bRootMove = 0.0f; // root travel over one physics step, vox
   bool bSkipped = false;  // B's limb bodies were in AppendLiveLimbBodies
   size_t spawns = 0;      // gore into the batch (or phase N's carry vector)
   size_t remoteExps = 0;  // (c)/(d): what the merge reported as remote
@@ -1904,6 +1914,12 @@ void RunBlastArm(Ctx& c, Arm arm, BlastArm& r) {
                std::find(skip.begin(), skip.end(), bBody) != skip.end();
 
   const uint32_t a0 = AvatarVoxels(a), b0 = AvatarVoxels(b);
+  auto rootSpeed = [&](const PlayerAvatar& av) {
+    Vec3 lin{}, ang{};
+    const uint64_t h = av.PartBody(0);
+    return h != 0 && c.phys.GetBodyVelocities(h, lin, ang) ? lin.len() : 0.0f;
+  };
+  r.bSpeed0 = rootSpeed(b);
   const auto& g = CurrentTuning().grenade;
   const ExplosionOp e{ifloor(pb.pos.x) - off, ifloor(pb.pos.y),
                       ifloor(pb.pos.z), g.blastRadius, g.blastPower, 0, 0, 0};
@@ -1920,6 +1936,13 @@ void RunBlastArm(Ctx& c, Arm arm, BlastArm& r) {
   r.limpA = a.Ragdoll() == Mob::RagdollPhase::Limp;
   r.limpB = b.Ragdoll() == Mob::RagdollPhase::Limp;
   r.spawns = spawns.size();
+  r.aliveB = b.IsAlive();
+  r.bSpeed = rootSpeed(b);
+  // One physics step: a launched root flies, a kinematic ghost stays where
+  // its last pose put it.
+  const Vec3 root0 = b.RootWorldPos();
+  c.phys.Step(kTickDt);
+  r.bRootMove = (b.RootWorldPos() - root0).len();
 
   // Leave nothing behind: limb bodies, severed limbs adopted by debris, and
   // the avatar list are all shared with the next gate.
@@ -1948,10 +1971,16 @@ Status GateBlastPlayers(Ctx& c, std::string& detail) {
     std::printf("blast-players: FAIL (%s)\n", why.c_str());
     return Status::Fail;
   }
+  // A launch is metres per second; 0.5 vox/s and 0.05 vox per step are far
+  // below any launch (ragdoll.blastMinSpeed is 1.5 m/s = 15 vox/s) and far
+  // above float noise on a body nothing touched.
   const bool localOk = local.lostB > 0 && local.limpB && local.lostA == 0 &&
-                       !local.limpA && local.bSkipped;
+                       !local.limpA && local.bSkipped && local.aliveB &&
+                       local.bSpeed > 0.5f;
   const bool ghostOk = ghost.lostB > 0 && !ghost.limpB && ghost.bSkipped &&
-                       ghost.spawns == 0;
+                       ghost.spawns == 0 && ghost.aliveB &&
+                       ghost.bSpeed == ghost.bSpeed0 &&
+                       ghost.bRootMove < 0.05f;
   const bool ownerOk = owner.remoteExps == 1 && owner.applied == 1 &&
                        owner.lostB > 0 && owner.limpB && owner.spawns > 0 &&
                        owner.lostA == 0 && !owner.limpA;
@@ -1959,19 +1988,23 @@ Status GateBlastPlayers(Ctx& c, std::string& detail) {
                         author.lostA == 0 && !author.limpA &&
                         author.lostB == 0 && !author.limpB &&
                         author.spawns == 0;
-  char buf[720];
+  char buf[900];
   std::snprintf(buf, sizeof buf,
-                "(a) local B: -%u vox, %s, in skip list %d | A (80 vox off): "
-                "-%u vox, %s | (b) ghost B: -%u vox, %s, gore %zu (want "
-                "carved, NOT launched, 0 gore) | (c) B's machine: remote %zu, "
-                "applied %u, B -%u vox %s gore %zu, ghost A -%u vox %s (want "
-                "1/1, carved+launched, ghost untouched) | (d) A's machine: "
-                "remote %zu, applied %u, A -%u %s, ghost B -%u %s (want 0, "
-                "untouched)",
-                local.lostB, local.limpB ? "launched" : "NOT LAUNCHED",
-                local.bSkipped ? 1 : 0, local.lostA,
+                "(a) local B: -%u vox, %s, %s, root %.1f vox/s, moved %.2f, in "
+                "skip list %d | A (80 vox off): -%u vox, %s | (b) ghost B: -%u "
+                "vox, %s, %s, root %.2f -> %.2f vox/s, moved %.3f, gore %zu "
+                "(want alive, carved, NOT launched, 0 gore) | (c) B's machine: "
+                "remote %zu, applied %u, B -%u vox %s gore %zu, ghost A -%u vox "
+                "%s (want 1/1, carved+launched, ghost untouched) | (d) A's "
+                "machine: remote %zu, applied %u, A -%u %s, ghost B -%u %s "
+                "(want 0, untouched)",
+                local.lostB, local.aliveB ? "alive" : "DEAD",
+                local.limpB ? "launched" : "NOT LAUNCHED", local.bSpeed,
+                local.bRootMove, local.bSkipped ? 1 : 0, local.lostA,
                 local.limpA ? "LAUNCHED" : "standing", ghost.lostB,
-                ghost.limpB ? "LAUNCHED" : "not launched", ghost.spawns,
+                ghost.aliveB ? "alive" : "DEAD",
+                ghost.limpB ? "LAUNCHED" : "not launched", ghost.bSpeed0,
+                ghost.bSpeed, ghost.bRootMove, ghost.spawns,
                 owner.remoteExps, owner.applied, owner.lostB,
                 owner.limpB ? "launched" : "NOT LAUNCHED", owner.spawns,
                 owner.lostA, owner.limpA ? "LAUNCHED" : "standing",
