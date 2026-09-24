@@ -113,6 +113,7 @@ const char* IntentName(Intent i) {
     case Intent::HoldRange: return "holdRange";
     case Intent::CircleStrafe: return "circle";
     case Intent::RequestAttack: return "attack";
+    case Intent::Flee: return "flee";
     default: return "?";
   }
 }
@@ -121,6 +122,27 @@ Intent IntentFromName(const std::string& s) {
   for (int i = 0; i < (int)Intent::Count; i++)
     if (s == IntentName((Intent)i)) return (Intent)i;
   return Intent::Count;
+}
+
+const char* FactName(Fact f) {
+  switch (f) {
+    case Fact::Hp: return "hp";
+    case Fact::Burning: return "burning";
+    case Fact::LimbsLost: return "limbsLost";
+    case Fact::SinceHurt: return "sinceHurt";
+    case Fact::HasTarget: return "hasTarget";
+    case Fact::Visible: return "visible";
+    case Fact::TargetDist: return "targetDist";
+    case Fact::Allies: return "allies";
+    case Fact::Enemies: return "enemies";
+    default: return "?";
+  }
+}
+
+Fact FactFromName(const std::string& s) {
+  for (int i = 0; i < (int)Fact::Count; i++)
+    if (s == FactName((Fact)i)) return (Fact)i;
+  return Fact::Count;
 }
 
 // ---------------------------------------------------------------------------
@@ -188,6 +210,101 @@ const char* AggroName(Aggro a) {
                                : "passive";
 }
 
+const char* OpText(CmpOp op) {
+  switch (op) {
+    case CmpOp::Lt: return "<";
+    case CmpOp::Le: return "<=";
+    case CmpOp::Gt: return ">";
+    case CmpOp::Ge: return ">=";
+    case CmpOp::Eq: return "==";
+    case CmpOp::Ne: return "!=";
+  }
+  return "?";
+}
+
+// One comparison as authored: "<0.3", ">= 2", "!=0", or a bare number (==).
+// A JSON bool is 1/0 with ==, so `"visible": true` reads as it looks.
+bool ParseCondition(const json& v, Condition& out) {
+  if (v.is_boolean()) {
+    out.op = CmpOp::Eq;
+    out.value = v.get<bool>() ? 1.0f : 0.0f;
+    return true;
+  }
+  if (v.is_number()) {
+    out.op = CmpOp::Eq;
+    out.value = v.get<float>();
+    return true;
+  }
+  if (!v.is_string()) return false;
+  std::string t = v.get<std::string>();
+  t.erase(std::remove(t.begin(), t.end(), ' '), t.end());
+  // Two-character operators first, so "<=" is not read as "<" then "=0.3".
+  static const std::pair<const char*, CmpOp> kOps[] = {
+      {"<=", CmpOp::Le}, {">=", CmpOp::Ge}, {"==", CmpOp::Eq},
+      {"!=", CmpOp::Ne}, {"<", CmpOp::Lt},  {">", CmpOp::Gt},
+      {"=", CmpOp::Eq}};
+  size_t skip = 0;
+  out.op = CmpOp::Eq;
+  for (const auto& [txt, op] : kOps) {
+    const size_t n = std::char_traits<char>::length(txt);
+    if (t.compare(0, n, txt) == 0) {
+      out.op = op;
+      skip = n;
+      break;
+    }
+  }
+  if (skip >= t.size()) return false;
+  try {
+    size_t used = 0;
+    out.value = std::stof(t.substr(skip), &used);
+    return used == t.size() - skip;
+  } catch (...) {
+    return false;
+  }
+}
+
+bool Holds(const Condition& c, float x) {
+  switch (c.op) {
+    case CmpOp::Lt: return x < c.value;
+    case CmpOp::Le: return x <= c.value;
+    case CmpOp::Gt: return x > c.value;
+    case CmpOp::Ge: return x >= c.value;
+    case CmpOp::Eq: return x == c.value;
+    case CmpOp::Ne: return x != c.value;
+  }
+  return false;
+}
+
+// Minimal string escape for the machine-written file: a rule's note is the
+// only free text it carries, and a quote in one must not end the file.
+std::string Escaped(const std::string& s) {
+  std::string o;
+  for (char ch : s) {
+    if (ch == '\n') { o += "\\n"; continue; }
+    if (ch == '"' || ch == '\\') o += '\\';
+    o += ch;
+  }
+  return o;
+}
+
+// A rule's intent maps ("weight" / "scale"). An unknown intent name drops the
+// WHOLE rule, reported: a rule that half-applies is worse than one that is
+// visibly missing.
+bool ParseIntentMap(const json& m, float (&dst)[(int)Intent::Count],
+                    const std::string& where, std::string& log) {
+  if (!m.is_object()) return true;
+  for (auto& [k, v] : m.items()) {
+    const Intent in = IntentFromName(k);
+    if (in == Intent::Count || !v.is_number()) {
+      log += where + ": unknown intent or non-number \"" + k +
+             "\" -- rule dropped\n";
+      return false;
+    }
+    dst[(int)in] = std::max(0.0f, v.get<float>());
+  }
+  return true;
+}
+
 }  // namespace
 
 bool LoadBehaviors(const std::string& path, Library& out, std::string& log) {
@@ -235,6 +352,7 @@ bool LoadBehaviors(const std::string& path, Library& out, std::string& log) {
       pr.movement.approachSpeed = q.value("approachSpeed", 1.0f);
       pr.movement.strafeSpeed = q.value("strafeSpeed", 0.55f);
       pr.movement.retreatSpeed = q.value("retreatSpeed", 0.8f);
+      pr.movement.fleeSpeed = q.value("fleeSpeed", 1.0f);
       pr.movement.circleTendency = q.value("circleTendency", 0.0f);
       pr.movement.circleHoldTicks = q.value("circleHoldTicks", 24u);
       pr.movement.repathTicks = q.value("repathTicks", 12u);
@@ -288,6 +406,43 @@ bool LoadBehaviors(const std::string& path, Library& out, std::string& log) {
         t.minDwellTicks = v.value("minDwellTicks", 0u);
       }
     }
+    if (p.contains("rules") && p["rules"].is_array()) {
+      int ri = 0;
+      for (const auto& r : p["rules"]) {
+        const std::string where =
+            path + ": profile \"" + pr.name + "\" rule " + std::to_string(ri++);
+        if (!r.is_object()) {
+          log += where + ": not an object -- dropped\n";
+          continue;
+        }
+        Rule rule;
+        rule.note = r.value("note", std::string());
+        bool ok = true;
+        if (r.contains("when") && r["when"].is_object()) {
+          for (auto& [k, v] : r["when"].items()) {
+            Condition cnd;
+            cnd.fact = FactFromName(k);
+            if (cnd.fact == Fact::Count) {
+              log += where + ": unknown fact \"" + k + "\" -- rule dropped\n";
+              ok = false;
+              break;
+            }
+            if (!ParseCondition(v, cnd)) {
+              log += where + ": cannot read the test on \"" + k +
+                     "\" (want e.g. \"<0.3\") -- rule dropped\n";
+              ok = false;
+              break;
+            }
+            rule.when.push_back(cnd);
+          }
+        }
+        if (ok && r.contains("weight"))
+          ok = ParseIntentMap(r["weight"], rule.setWeight, where, log);
+        if (ok && r.contains("scale"))
+          ok = ParseIntentMap(r["scale"], rule.scale, where, log);
+        if (ok) pr.rules.push_back(std::move(rule));
+      }
+    }
     if (lib.Find(pr.name) >= 0)
       log += path + ": duplicate profile \"" + pr.name + "\" — last wins\n";
     lib.profiles.push_back(std::move(pr));
@@ -339,6 +494,7 @@ bool SaveBehaviors(const std::string& path, const Library& lib,
       << ", \"approachSpeed\": " << num(p.movement.approachSpeed)
       << ", \"strafeSpeed\": " << num(p.movement.strafeSpeed)
       << ", \"retreatSpeed\": " << num(p.movement.retreatSpeed)
+      << ", \"fleeSpeed\": " << num(p.movement.fleeSpeed)
       << ", \"circleTendency\": " << num(p.movement.circleTendency)
       << ", \"circleHoldTicks\": " << p.movement.circleHoldTicks
       << ", \"repathTicks\": " << p.movement.repathTicks
@@ -371,8 +527,38 @@ bool SaveBehaviors(const std::string& path, const Library& lib,
         << ", \"cooldownTicks\": " << t.cooldownTicks
         << ", \"minDwellTicks\": " << t.minDwellTicks << " }";
     }
-    o << "\n      }\n";
-    o << "    }" << (i + 1 < lib.profiles.size() ? "," : "") << "\n";
+    o << "\n      }";
+    if (!p.rules.empty()) {
+      o << ",\n      \"rules\": [\n";
+      for (size_t r = 0; r < p.rules.size(); r++) {
+        const Rule& rl = p.rules[r];
+        o << "        { ";
+        if (!rl.note.empty()) o << "\"note\": \"" << Escaped(rl.note) << "\", ";
+        o << "\"when\": {";
+        for (size_t c = 0; c < rl.when.size(); c++)
+          o << (c ? ", " : " ") << "\"" << FactName(rl.when[c].fact) << "\": \""
+            << OpText(rl.when[c].op) << num(rl.when[c].value) << "\"";
+        o << (rl.when.empty() ? "}" : " }");
+        // `set` = the weight map (unset is < 0); otherwise the scale map
+        // (unset is exactly 1).
+        auto intentMap = [&](const char* key, const float (&v)[(int)Intent::Count],
+                             bool set) {
+          bool any = false;
+          for (int k = 0; k < (int)Intent::Count; k++) {
+            if (set ? v[k] < 0.0f : v[k] == 1.0f) continue;
+            o << (any ? std::string(", ") : std::string(", \"") + key + "\": { ")
+              << "\"" << IntentName((Intent)k) << "\": " << num(v[k]);
+            any = true;
+          }
+          if (any) o << " }";
+        };
+        intentMap("weight", rl.setWeight, true);
+        intentMap("scale", rl.scale, false);
+        o << " }" << (r + 1 < p.rules.size() ? "," : "") << "\n";
+      }
+      o << "      ]";
+    }
+    o << "\n    }" << (i + 1 < lib.profiles.size() ? "," : "") << "\n";
   }
   o << "  ]\n}\n";
 
@@ -679,6 +865,95 @@ Vec3 SteerPoint(const Brain& b) {
 // The arbiter
 // ---------------------------------------------------------------------------
 
+// ---------------------------------------------------------------------------
+// Rules: the facts, then which rules hold (ai_behavior.h "RULES")
+// ---------------------------------------------------------------------------
+namespace {
+
+constexpr float kNever = 1.0e9f;
+
+void EvaluateRules(Brain& b, const Profile& pr, const SelfView& self,
+                   const WorldView& view, uint32_t tick) {
+  // HURT = life went down since the last think, by any cause. Bleeding counts:
+  // a creature losing blood IS being hurt, and a rule that wants "struck in the
+  // last second" can say sinceHurt < 30 and let a slow bleed keep it true.
+  if (b.prevHp >= 0.0f && self.hpFrac < b.prevHp) {
+    b.hurtTick = tick;
+    b.everHurt = true;
+  }
+  b.prevHp = self.hpFrac;
+
+  // Who is around, within what this creature can see. No line-of-sight test:
+  // these are counts for character ("alone", "outnumbered"), not targets, and
+  // a LOS ray per actor per tick is the cost rule 2 says to keep off this path.
+  // The nearest ENEMY is kept as the threat Flee runs from when there is no
+  // target (a passive creature never picks one, and is the one most likely to
+  // be authored to run).
+  const Vec3 c = self.Centre();
+  const float range = pr.perception.sightRange;
+  int allies = 0, enemies = 0;
+  float nearest = kNever;
+  b.hasThreat = false;
+  if (view.actors != nullptr && range > 0.0f) {
+    for (const Actor& a : *view.actors) {
+      if (!a.alive || a.id == self.id) continue;
+      const float d = PlanarDist(c, a.centre);
+      if (d > range) continue;
+      if (a.faction == self.faction) {
+        allies++;
+      } else {
+        enemies++;
+        if (d < nearest) {
+          nearest = d;
+          b.threatPos = a.centre;
+          b.hasThreat = true;
+        }
+      }
+    }
+  }
+  if (b.hasTarget) {
+    b.threatPos = b.targetPos;
+    b.hasThreat = true;
+  }
+
+  float* f = b.facts;
+  f[(int)Fact::Hp] = self.hpFrac;
+  f[(int)Fact::Burning] = self.burningFrac;
+  f[(int)Fact::LimbsLost] = (float)self.limbsLost;
+  f[(int)Fact::SinceHurt] = b.everHurt ? (float)(tick - b.hurtTick) : kNever;
+  f[(int)Fact::HasTarget] = b.hasTarget ? 1.0f : 0.0f;
+  f[(int)Fact::Visible] = b.visible ? 1.0f : 0.0f;
+  f[(int)Fact::TargetDist] = b.hasTarget ? b.targetDist : kNever;
+  f[(int)Fact::Allies] = (float)allies;
+  f[(int)Fact::Enemies] = (float)enemies;
+
+  b.rulesHeld = 0;
+  for (size_t r = 0; r < pr.rules.size() && r < 32; r++) {
+    bool all = true;
+    for (const Condition& cnd : pr.rules[r].when)
+      if (!Holds(cnd, f[(int)cnd.fact])) {
+        all = false;
+        break;
+      }
+    if (all) b.rulesHeld |= 1u << r;
+  }
+}
+
+// An intent's weight THIS tick: the authored one, then every holding rule in
+// order (a `weight` replaces, a `scale` multiplies).
+float EffectiveWeight(const Brain& b, const Profile& pr, int i) {
+  float w = pr.intents[i].weight;
+  for (size_t r = 0; r < pr.rules.size() && r < 32; r++) {
+    if (!(b.rulesHeld & (1u << r))) continue;
+    const Rule& rl = pr.rules[r];
+    if (rl.setWeight[i] >= 0.0f) w = rl.setWeight[i];
+    w *= rl.scale[i];
+  }
+  return w;
+}
+
+}  // namespace
+
 bool Think(Brain& brain, const Library& lib, const SelfView& self,
            const GroundView& ground, const WorldView& view, uint32_t tick,
            float dt, IntentOut& out) {
@@ -693,6 +968,7 @@ bool Think(Brain& brain, const Library& lib, const SelfView& self,
 
   Perceive(brain, pr, self, view, tick);
   TrackTargetMotion(brain, self, tick, dt);
+  EvaluateRules(brain, pr, self, view, tick);
 
   const Vec3 centre = self.Centre();
   const float bearing =
@@ -964,6 +1240,10 @@ bool Think(Brain& brain, const Library& lib, const SelfView& self,
     }
   }
   if (attackReady) raw[(int)Intent::RequestAttack] = 1.0f;
+  // Flee: always available to a body that can move. What decides WHEN is the
+  // weight, which is 0 unless the profile or a holding rule says otherwise --
+  // so a creature runs exactly when its JSON says it does, and never else.
+  if (pr.movement.mobile) raw[(int)Intent::Flee] = 1.0f;
 
   // ---- arbitrate ----------------------------------------------------------
   // Weight, then the three dampers (see the header). The incumbent's bonus is
@@ -975,15 +1255,20 @@ bool Think(Brain& brain, const Library& lib, const SelfView& self,
   float bestScore = -1.0f;
   const uint32_t dwell = tick - brain.intentSince;
   const IntentTuning& curT = pr.intents[(int)brain.intent];
+  float weight[(int)Intent::Count];
+  for (int i = 0; i < (int)Intent::Count; i++)
+    weight[i] = EffectiveWeight(brain, pr, i);
+  // A rule that zeroes the incumbent releases it at once: "stop attacking when
+  // burning" must not wait out a dwell the author wrote for calmer moments.
   const bool locked = raw[(int)brain.intent] > 0.0f &&
+                      weight[(int)brain.intent] > 0.0f &&
                       dwell < curT.minDwellTicks;
 
   for (int i = 0; i < (int)Intent::Count; i++) brain.score[i] = 0;
   for (int i = 0; i < (int)Intent::Count; i++) {
-    const IntentTuning& t = pr.intents[i];
-    if (t.weight <= 0.0f) continue;
+    if (weight[i] <= 0.0f) continue;
     if ((Intent)i != brain.intent && tick < brain.cooldownUntil[i]) continue;
-    float s = raw[i] * t.weight;
+    float s = raw[i] * weight[i];
     if (s <= 0.0f) continue;
     if ((Intent)i == brain.intent) s += pr.hysteresis;
     brain.score[i] = s;
@@ -1173,6 +1458,18 @@ bool Think(Brain& brain, const Library& lib, const SelfView& self,
       // the number `PickAttackStyle` filters on and `BeginStroke` refuses
       // against, and both of them are deciding what can reach at IMPACT.
       out.request.distance = brain.leadDist;
+      break;
+    }
+
+    case Intent::Flee: {
+      // Away from the threat; with none (burning, nothing seen) straight on
+      // along the current heading -- a panic run, not a search. Deflect keeps
+      // it off walls the same way Approach's route is kept off them.
+      const float away = brain.hasThreat
+                             ? BearingTo(brain.threatPos, centre)
+                             : self.heading;
+      out.desiredHeading = Deflect(away, self.heading, ground);
+      out.driveScale = sp * std::max(0.0f, pr.movement.fleeSpeed);
       break;
     }
 

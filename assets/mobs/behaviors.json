@@ -138,6 +138,27 @@
         "holdRange": { "weight": 0.6, "cooldownTicks": 0, "minDwellTicks": 8 },
         "attack": { "weight": 3.2, "cooldownTicks": 0, "minDwellTicks": 0 }
       }
+    },
+    {
+      "comment": "THE FIRST PROFILE BUILT FROM RULES (2026-09-24). Everything it does beyond standing still is a rule: its authored `flee` weight is 0, so it only runs while one of the rules below holds, and it runs from whatever set it off -- the nearest creature of another faction it can see, or straight on when there is none (on fire, nothing in sight). Nothing ships with it; put \"behavior\": \"skittish\" in a sidecar to get a creature that bolts. The `ai-rules` gate drives it.",
+      "//rules": "A rule is { when: { fact: test, ... }, weight: { intent: w }, scale: { intent: k } }. ALL the tests must hold; while they do, `weight` replaces the intent's authored weight and `scale` multiplies it, rule by rule in order. Facts: hp (0..1 of authored life), burning (0..1 of limbs alight), limbsLost, sinceHurt (ticks since life last fell, 1e9 = never), hasTarget, visible, targetDist, allies, enemies (live actors of our / another faction within sightRange). Tests: \"<0.3\", \"<=\", \">\", \">=\", \"==\", \"!=\", a bare number or a bool (==). An unknown fact or intent drops the whole rule and says so in the load log.",
+      "name": "skittish",
+      "label": "Skittish (flees)",
+      "color": 3238002687,
+      "faction": "critter",
+      "hysteresis": 0.3,
+      "perception": { "sightRange": 24, "fovDegrees": 360, "requireLos": true, "aggro": "passive", "alertDecayTicks": 0, "keepRangeScale": 1.0 },
+      "movement": { "mobile": true, "rangeMin": 0, "rangeMax": 0, "bandSlack": 1.5, "approachSpeed": 0, "strafeSpeed": 0, "retreatSpeed": 0, "fleeSpeed": 1.0, "circleTendency": 0, "circleHoldTicks": 24, "repathTicks": 30, "navRadius": 8 },
+      "attack": { "styles": [], "reach": 0, "aimTolerance": 0.45, "cadenceTicks": 0, "jitterTicks": 0, "commitTicks": 0, "disengageTicks": 0 },
+      "intents": {
+        "idle": { "weight": 0.05, "cooldownTicks": 0, "minDwellTicks": 0 },
+        "flee": { "weight": 0, "cooldownTicks": 0, "minDwellTicks": 20 }
+      },
+      "rules": [
+        { "note": "something of another faction close by: keep away", "when": { "enemies": ">=1" }, "weight": { "flee": 1.0 } },
+        { "note": "hurt in the last three seconds: run hard", "when": { "sinceHurt": "<90" }, "weight": { "flee": 2.0 } },
+        { "note": "on fire: run", "when": { "burning": ">0" }, "weight": { "flee": 3.0 } }
+      ]
     }
   ]
 }

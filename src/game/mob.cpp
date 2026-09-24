@@ -5816,6 +5816,9 @@ void MobSystem::DecideIntent(Mob& mob, const MobDef& def,
     // FOOTWORK is placed on. Two numbers because they answer two questions —
     // see MobSystem::StrikeReachOf.
     self.strikeReach = StrikeReachOf(mob);
+    // ...and what state the body is in, for the profile's rules
+    // (ai_behavior.h "RULES"): the facts a creature's character can hinge on.
+    mob.BodyFacts(self.hpFrac, self.burningFrac, self.limbsLost);
 
     ai::GroundView gv;
     gv.haveGround = sense.haveGround;
@@ -7196,6 +7199,14 @@ void MobSystem::PreTick(uint32_t tick, World& world, std::vector<BrushOp>& ops,
   // pass writes fire into the hashed grid, so running it off the render clock
   // would make the world a function of frame rate.
   BurnLimbs(tick, world, cellOps, spawns);
+  // Severed flesh's drips from last tick's StainDeadFlesh (WetOneLimb),
+  // dropped rather than carried when the tick is full, as Mob's are.
+  for (const ParticleSpawn& s : pendingSpawns_) {
+    if (spawns.size() >= kMaxParticleSpawnsPerTick) break;
+    if (!world.CellInWindow(IVec3{s.px >> 8, s.py >> 8, s.pz >> 8})) continue;
+    spawns.push_back(s);
+  }
+  pendingSpawns_.clear();
   // (The dead Mobs burn inside BurnLimbs, as rigs.) ...and severed flesh --
   // limbs and gobbets that left a rig -- through the same limb pass.
   BurnDeadFlesh(tick, world, cellOps, spawns);
@@ -8834,6 +8845,28 @@ float Mob::TotalHp() const {
     if (limbs_[i].body && limbs_[i].hp > 0.0f && !IsBloodless(i))
       sum += limbs_[i].hp;
   return sum;
+}
+
+void Mob::BodyFacts(float& hpFrac, float& burningFrac, int& limbsLost) const {
+  hpFrac = 0.0f;
+  burningFrac = 0.0f;
+  limbsLost = 0;
+  if (!def_) return;
+  const int n = std::min({baseLimbs_, (int)limbs_.size(), (int)def_->limbs.size()});
+  float full = 0.0f;
+  int counted = 0, alight = 0;
+  for (int i = 0; i < n; i++) {
+    if (IsBloodless(i)) continue;
+    full += std::max(0.0f, def_->limbs[i].hp);
+    counted++;
+    if (limbs_[i].body == 0) {
+      limbsLost++;
+      continue;
+    }
+    if (limbs_[i].burn.OnFire()) alight++;
+  }
+  hpFrac = full > 0.0f ? std::clamp(TotalHp() / full, 0.0f, 1.0f) : 0.0f;
+  burningFrac = counted > 0 ? (float)alight / (float)counted : 0.0f;
 }
 
 bool Mob::DrainBlood(float voxels) {
@@ -15857,6 +15890,11 @@ void MobSystem::StainDeadFlesh(uint32_t tick, World& world, uint32_t& budget,
     }
     if (RainOneLimb(v, tick, key, rainBudget, &world)) changed = true;
     if (budget && DryOneLimb(v, cc.led, tick, key, budget, &world)) changed = true;
+    // ...and while it is still wet it wicks and drips, as a limb does
+    // (Mob::StainTick). The drips queue on the system and go out at the top of
+    // the next PreTick, one tick latent like a creature's.
+    if (budget && WetOneLimb(v, cc.led, tick, key, budget, &pendingSpawns_))
+      changed = true;
     if (changed) cc.dirty = true;
     if (model >= 0) *f.microModel = (uint32_t)model;
   });

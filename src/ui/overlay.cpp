@@ -1896,10 +1896,14 @@ void Overlay::Draw(UIState& s) {
                                         ImGuiTreeNodeFlags_DefaultOpen)) {
               f("hysteresis (incumbent bonus)", &s.aiHysteresis, 0.0f, 1.5f);
               ImGui::TextDisabled("weight 0 = the intent is DISABLED");
-              static const char* kIntent[6] = {"idle",      "face",
-                                               "approach",  "holdRange",
-                                               "circle",    "attack"};
-              for (int k = 0; k < 6; k++) {
+              ImGui::TextDisabled("a holding rule (behaviors.json) overrides these");
+              static const char* kIntent[] = {"idle",     "face",
+                                              "approach", "holdRange",
+                                              "circle",   "attack",
+                                              "flee"};
+              static_assert(sizeof(kIntent) / sizeof(kIntent[0]) ==
+                            (size_t)UIState::kAiIntents);
+              for (int k = 0; k < UIState::kAiIntents; k++) {
                 ImGui::PushID(k);
                 ImGui::TextUnformatted(kIntent[k]);
                 if (EditableSliderFloat("weight", &s.aiIntentWeight[k], 0.0f,

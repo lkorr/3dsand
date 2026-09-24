@@ -119,6 +119,7 @@ enum class Intent : uint8_t {
   HoldRange,     // maintain the engagement band: back off when close, close when far
   CircleStrafe,  // sidestep around the target at the current radius
   RequestAttack, // emit an AttackRequest and hold the facing through the commit
+  Flee,          // run from the threat (the target, else the nearest enemy seen)
   Count,
 };
 
@@ -169,6 +170,9 @@ struct Movement {
   float approachSpeed = 1.0f;
   float strafeSpeed = 0.55f;
   float retreatSpeed = 0.8f;
+  // Flee's drive, same units. Flee turns its back (it is a rout, not footwork:
+  // HoldRange is the verb that gives ground facing the enemy).
+  float fleeSpeed = 1.0f;
   // 0 = never sidesteps, 1 = circles whenever it is content. Reversal is a
   // hash-RNG draw on a cadence, so two duelists do not orbit in lockstep.
   float circleTendency = 0.0f;
@@ -314,6 +318,67 @@ struct IntentTuning {
   uint32_t minDwellTicks = 0;
 };
 
+// ---- RULES: CHARACTER THAT DEPENDS ON THE BODY'S STATE -------------------
+//
+// A profile's weights say what a creature wants when nothing is wrong with it.
+// A RULE says how that changes when something is: "on fire -> run", "down to a
+// third of its blood -> stop attacking", "alone -> hang back". Authored in the
+// profile as
+//
+//     "rules": [
+//       { "note": "burning: run",
+//         "when":  { "burning": ">0" },
+//         "weight": { "flee": 3.0 },
+//         "scale":  { "attack": 0 } }
+//     ]
+//
+// `when` is a conjunction of comparisons against named FACTS (below); an empty
+// `when` always holds. While a rule holds, `weight` REPLACES an intent's
+// authored weight (so a rule can switch on a verb the profile leaves at 0) and
+// `scale` then multiplies it. Rules apply in order, so a later rule's `weight`
+// wins over an earlier one's and every holding rule's `scale` compounds.
+//
+// The facts are the vocabulary, and they are code for the same reason intents
+// are: "how much of my body is alight" is a question about the rig. Adding one
+// is one enum entry, one name and one line in Think's fact table; a rule that
+// names an unknown fact is reported at load and dropped whole, never half-
+// applied.
+enum class Fact : uint8_t {
+  Hp = 0,       // life left, 0..1 of the authored total (blood is health)
+  Burning,      // fraction of the body's limbs with fire on them, 0..1
+  LimbsLost,    // authored limbs no longer attached (severed or never spawned)
+  SinceHurt,    // ticks since life last fell (a blow, a burn, a bleed); 1e9 = never
+  HasTarget,    // 0/1
+  Visible,      // 0/1: the target is perceived this tick, not remembered
+  TargetDist,   // centre-to-centre, world voxels; 1e9 with no target
+  Allies,       // live actors of OUR faction within sightRange (self excluded)
+  Enemies,      // live actors of another faction within sightRange
+  Count,
+};
+const char* FactName(Fact f);
+Fact FactFromName(const std::string& s);
+
+enum class CmpOp : uint8_t { Lt, Le, Gt, Ge, Eq, Ne };
+
+struct Condition {
+  Fact fact = Fact::Hp;
+  CmpOp op = CmpOp::Lt;
+  float value = 0.0f;
+};
+
+struct Rule {
+  std::string note;                 // the author's words, kept by SaveBehaviors
+  std::vector<Condition> when;      // ALL must hold; empty = always
+  float setWeight[(int)Intent::Count];   // < 0 = leave the weight alone
+  float scale[(int)Intent::Count];       // 1 = leave it alone
+  Rule() {
+    for (int i = 0; i < (int)Intent::Count; i++) {
+      setWeight[i] = -1.0f;
+      scale[i] = 1.0f;
+    }
+  }
+};
+
 struct Profile {
   std::string name;          // the id a sidecar and the panel refer to
   std::string label;         // human text for the debug readout
@@ -327,6 +392,8 @@ struct Profile {
   IntentTuning intents[(int)Intent::Count];
   // Flat score bonus the current intent keeps. See the arbiter note above.
   float hysteresis = 0.22f;
+  // State-dependent weight changes, applied in order. See "RULES" above.
+  std::vector<Rule> rules;
 };
 
 struct Library {
@@ -484,6 +551,13 @@ struct SelfView {
   // (which reads as "no opinion — keep the authored band"). `Think` pulls the
   // band in onto it, and only ever INWARD; see the band-geometry note there.
   float strikeReach = 0.0f;
+  // ---- THE BODY'S CONDITION, for the rule facts (Fact::Hp and friends) -----
+  // Filled by MobSystem::DecideIntent from the rig (Mob::BodyFacts). The
+  // defaults are an unhurt creature, so a caller that knows nothing about a
+  // body (a gate driving Think directly) gets rules that see a healthy one.
+  float hpFrac = 1.0f;
+  float burningFrac = 0.0f;
+  int limbsLost = 0;
   Vec3 Centre() const {
     return Vec3{origin.x + size.x * 0.5f, origin.y + size.y * 0.5f,
                 origin.z + size.z * 0.5f};
@@ -584,6 +658,19 @@ struct Brain {
   // one bare zero.
   float pursueDrive = 0;
   bool heldGround = false;
+
+  // ---- rules ----
+  // `prevHp` < 0 = no reading yet (the first think after spawn cannot have
+  // been hurt). `facts` and `rulesHeld` are this tick's evaluation, kept for the
+  // panel and the gates: "the creature did not flee" has two causes (the rule
+  // never held / it held and lost the arbitration) and this separates them.
+  float prevHp = -1.0f;
+  uint32_t hurtTick = 0;
+  bool everHurt = false;
+  float facts[(int)Fact::Count] = {};
+  uint32_t rulesHeld = 0;        // bit r = rule r held (the first 32 rules)
+  bool hasThreat = false;        // what Flee runs from, when it runs
+  Vec3 threatPos{};
 
   // ---- footwork ----
   int circleSign = 0;            // -1 / +1, redrawn on a cadence
