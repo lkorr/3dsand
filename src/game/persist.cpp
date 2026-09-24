@@ -581,8 +581,9 @@ EntityIO MakeEntityIO(DebrisSystem& debris, MobSystem& mobs,
     mobsSec.saveRecords = [&mobs](std::vector<EntityRecord>& out) {
       for (uint32_t i = 0; i < mobs.MobCount(); i++) {
         const Mob* m = mobs.MobAt(i);
-        // SaveState's own filter: dead mobs are debris already (mob.h).
-        if (!m || !m->Alive() || !m->Def()) continue;
+        // SaveState's own filter: the living and the unreleased dead (MOBS
+        // v6); a husk's rig is DBRS's already.
+        if (!m || !m->Def() || !mobs.SavesAsRecord(*m)) continue;
         EntityRecord r;
         r.pos = m->Origin();
         ByteWriter w{r.bytes};
@@ -595,7 +596,10 @@ EntityIO MakeEntityIO(DebrisSystem& debris, MobSystem& mobs,
     // this has to know whether the creature went live. A full crowd is not
     // worth parsing for -- the record stays parked, Unpark's capWaits rule.
     mobsSec.loadRecord = [&mobs](const uint8_t* d, size_t n, uint32_t v) {
-      if (!mobs.HasRoomToSpawn()) return RecordLoad::Retry;
+      // A corpse holds no living slot (MOBS v6): HasRoomForRecord answers
+      // yes for a dead record whatever the crowd, and LoadOne decays the
+      // oldest corpse if the dead cap is over.
+      if (!mobs.HasRoomForRecord(d, n, v)) return RecordLoad::Retry;
       ByteReader rd{d, n};
       bool refused = false;
       if (mobs.LoadOne(rd, v, /*placeLimbs=*/false, &refused) != nullptr)
@@ -887,7 +891,10 @@ uint32_t MobParking::Unpark(MobSystem& mobs, ChunkStore& store, World& world,
             i++;
             continue;
           }
-          if (!mobs.HasRoomToSpawn()) {
+          // The LIVING cap; a dead record is never held by it (MOBS v6).
+          if (!mobs.HasRoomForRecord(dormant[i].bytes.data(),
+                                     dormant[i].bytes.size(),
+                                     dormant[i].version)) {
             stats_.capWaits++;
             pending_ = true;
             i++;

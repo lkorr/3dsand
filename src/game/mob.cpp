@@ -2325,6 +2325,12 @@ static std::vector<int16_t> RisenArtRemap(const Prefab& was, const Prefab& now) 
 // there this tick.
 void MobSystem::ServiceRisings(uint32_t tick) {
   for (size_t i = 0; i < rises_.size();) {
+    // A booking a load restored carries ticks LEFT (PendingRise::deferred):
+    // this is the first clock it has seen, so this is where it is booked.
+    if (rises_[i].deferred) {
+      rises_[i].atTick = tick + rises_[i].ticksLeft;
+      rises_[i].deferred = false;
+    }
     // Unsigned wrap is not a hazard here: a rising is booked from the same
     // clock it is compared against, ticks apart.
     if (tick < rises_[i].atTick) { i++; continue; }
@@ -3242,7 +3248,9 @@ bool MobSystem::UnwearItem(uint64_t mobId, int equipSlot) {
 uint64_t MobSystem::Spawn(int defIndex, IVec3 atVoxel) {
   if (defIndex < 0 || defIndex >= (int)defs_.size()) return 0;
   // THE LIVING cap: a corpse does not hold a spawn slot (kMaxDeadMobs is its).
-  if (!HasRoomToSpawn()) return 0;
+  // `spawnDead_`: LoadOne is standing a saved CORPSE back up, which the living
+  // cap does not govern (MOBS v6; the dead cap decays the oldest instead).
+  if (!spawnDead_ && !HasRoomToSpawn()) return 0;
   const MobDef& def = defs_[defIndex];
 
   Mob mob;
@@ -7081,11 +7089,12 @@ void MobSystem::PreTick(uint32_t tick, World& world, std::vector<BrushOp>& ops,
                mob.origin_.x > wlo.x + (float)kWorldN + kPad ||
                mob.origin_.y > wlo.y + (float)kWorldN + kPad ||
                mob.origin_.z > wlo.z + (float)kWorldN + kPad;
-    if (out && !mob.alive_) {
-      // A CORPSE THAT LEAVES THE WINDOW decays to debris, which is what every
-      // corpse did before it was a Mob: DebrisSystem's own window rule takes
-      // it from there. Not parked — the dead are not in the record format yet
-      // (MOBS v6, PLAN_corpse_is_a_mob.md P2a). Swept as a husk next pass.
+    if (out && !mob.alive_ &&
+        !(parkFn_ && !mob.IsGhost() && SavesAsRecord(mob))) {
+      // A CORPSE THAT LEAVES THE WINDOW AND CANNOT BE PARKED (no park
+      // function, a ghost's, or nothing left of it) decays to debris, which
+      // is what every corpse did before it was a Mob: DebrisSystem's own
+      // window rule takes it from there. Swept as a husk next pass.
       mob.ReleaseRigToDebris();
       mi++;
       continue;
@@ -7094,6 +7103,14 @@ void MobSystem::PreTick(uint32_t tick, World& world, std::vector<BrushOp>& ops,
       // PARKED, NOT FORGOTTEN (save plan S5b; mob.h SetParkFn). The record is
       // written BEFORE the rig is released -- SaveOne reads the live limbs --
       // and only for a creature this machine steps: a ghost is the peer's.
+      //
+      // THE DEAD PARK LIKE THE LIVING (MOBS v6; the branch above sent every
+      // corpse that cannot be parked to debris). The record carries the dead
+      // state, the lying pose and any rising booked on the corpse, so that
+      // booking is withdrawn once the record is written: the corpse it names
+      // is bytes now, and the record books it again when it comes back. A
+      // parked corpse that never returns is just a record -- it costs nothing
+      // and holds no cap.
       if (parkFn_ && !mob.IsGhost() && mob.defIndex_ >= 0 &&
           mob.defIndex_ < (int)defs_.size()) {
         std::vector<uint8_t> rec;
@@ -7101,7 +7118,17 @@ void MobSystem::PreTick(uint32_t tick, World& world, std::vector<BrushOp>& ops,
           ByteWriter w{rec};
           mob.SaveOne(w);
         }
-        if (parkFn_(mob, rec)) parkedTotal_++;
+        if (parkFn_(mob, rec)) {
+          parkedTotal_++;
+          if (!mob.alive_)
+            for (size_t k = 0; k < rises_.size();)
+              if (rises_[k].mobId == mob.id_) {
+                rises_[k] = std::move(rises_.back());
+                rises_.pop_back();
+              } else {
+                k++;
+              }
+        }
       }
       mob.ReleaseRig();
       mobs_[mi] = std::move(mobs_.back());
@@ -20379,6 +20406,127 @@ bool Mob::LimbIsPristine(size_t i) const {
   return SameCollider(L.voxels, p->voxels) && SameSkin(L.skinVoxels, p->skinVoxels);
 }
 
+// ---- MOBS v6 helpers ---------------------------------------------------------
+//
+// The gear list's bytes: net/mobsync.cpp's WriteGear shape, written here
+// rather than borrowed because that file's helpers are its own and the save
+// format must not move when the wire's does.
+static void WriteRecordGear(ByteWriter& w,
+                            const std::vector<::net::WireGear>& gear) {
+  w.U32((uint32_t)gear.size());
+  for (const ::net::WireGear& g : gear) {
+    w.Str(g.item);
+    w.Pod(g.equipSlot);
+    w.U32(g.held);
+    w.U32(g.dye);
+    w.U32((uint32_t)g.damage.shells.size());
+    for (const WornShellDamage& sh : g.damage.shells) {
+      w.F32(sh.hp);
+      w.U32(sh.atSpawn);
+      w.U32(sh.live);
+      w.PodVec(sh.lattice);
+    }
+  }
+}
+
+// Bounded like the limb count: a count the remaining bytes cannot hold is a
+// corrupt record, refused before it sizes anything. The reader is sticky, so a
+// lying count otherwise just runs out against `ok`.
+static bool ReadRecordGear(ByteReader& r, std::vector<::net::WireGear>& gear) {
+  uint32_t n = 0;
+  r.U32(n);
+  gear.clear();
+  constexpr uint32_t kMaxRecordGear = 64;
+  if (!r.ok || n > kMaxRecordGear) {
+    r.ok = false;
+    return false;
+  }
+  for (uint32_t i = 0; i < n && r.ok; i++) {
+    ::net::WireGear g;
+    r.Str(g.item);
+    r.Pod(g.equipSlot);
+    r.U32(g.held);
+    r.U32(g.dye);
+    uint32_t ns = 0;
+    r.U32(ns);
+    if (!r.ok || ns > kMaxRecordGear) {
+      r.ok = false;
+      break;
+    }
+    for (uint32_t k = 0; k < ns && r.ok; k++) {
+      WornShellDamage sh;
+      r.F32(sh.hp);
+      r.U32(sh.atSpawn);
+      r.U32(sh.live);
+      r.PodVec(sh.lattice);
+      if (r.ok) g.damage.shells.push_back(std::move(sh));
+    }
+    if (r.ok) gear.push_back(std::move(g));
+  }
+  return r.ok;
+}
+
+// deathCause_ is a `const char*` onto a literal (Mob::DeathCause's contract:
+// callers keep the pointer). A saved cause is a NAME; this puts it back onto
+// the literal that wrote it. A name this build no longer writes keeps its
+// words through a small process-lifetime pool (bounded by the number of
+// distinct causes ever read, which is a handful).
+static const char* InternDeathCause(const std::string& name) {
+  static const char* const kKnown[] = {
+      "",
+      "blood loss",
+      "burnt past the death knot",
+      "vital limb at zero under the burn cap",
+      "vital limb destroyed",
+      "vital limb burnt/dissolved away",
+  };
+  for (const char* k : kKnown)
+    if (name == k) return k;
+  static std::vector<std::unique_ptr<std::string>> pool;
+  for (const auto& p : pool)
+    if (*p == name) return p->c_str();
+  if (pool.size() >= 64) return "";
+  pool.push_back(std::make_unique<std::string>(name));
+  return pool.back()->c_str();
+}
+
+void Mob::CaptureGear(std::vector<::net::WireGear>& out) const {
+  out.clear();
+  // MobSystem::BuildAnnounce's gear walk, exactly: identity-shell dye,
+  // CaptureWorn damage, a piece whose identity shell is gone stays gone, and
+  // sorted by the slot each piece's shell occupies so a replay appends the
+  // same rig slots in the same places.
+  std::vector<std::pair<int, ::net::WireGear>> bySlot;
+  for (size_t pi = 0; pi < worn_.size(); pi++) {
+    const WornPiece& p = worn_[pi];
+    const int idSlot = IdentityShellOf((int)pi);
+    if (idSlot < 0 || idSlot >= (int)limbs_.size() || !limbs_[idSlot].body)
+      continue;
+    ::net::WireGear g;
+    g.item = p.item;
+    g.equipSlot = p.equipSlot;
+    g.dye = limbs_[idSlot].dye;
+    CaptureWorn(p.equipSlot, g.damage);
+    bySlot.emplace_back(idSlot, std::move(g));
+  }
+  if (heldSlot_ >= 0 && heldSlot_ < (int)limbs_.size() &&
+      limbs_[heldSlot_].body && !heldItem_.empty()) {
+    ::net::WireGear g;
+    g.item = heldItem_;
+    g.held = 1;
+    bySlot.emplace_back(heldSlot_, std::move(g));
+  }
+  std::stable_sort(bySlot.begin(), bySlot.end(),
+                   [](const auto& a, const auto& b) { return a.first < b.first; });
+  for (auto& e : bySlot) out.push_back(std::move(e.second));
+}
+
+bool MobSystem::SavesAsRecord(const Mob& m) const {
+  if (m.defIndex_ < 0 || m.defIndex_ >= (int)defs_.size()) return false;
+  if (m.alive_) return true;
+  return !m.rigReleased_ && m.LimbBodyCount() > 0;
+}
+
 void Mob::SaveOne(ByteWriter& w) const {
   SaveOne(w, MobSystem::kSaveVersion);
 }
@@ -20391,8 +20539,20 @@ void Mob::SaveOne(ByteWriter& w, uint32_t version) const {
   w.Pod(origin_);
   w.F32(heading_);
   w.F32(bodyY_);
-  w.U32((uint32_t)limbs_.size());
+  // v6: an APPENDED slot (worn shell, held item) with no body is not written.
+  // It carries nothing -- its matter left as debris (DBRS) -- and it is not
+  // rebuilt by the dressing on load either, so writing it would only put the
+  // record's slots out of step with the rig's. Base limbs are always written:
+  // a severed base limb is a fact about the body (kLimbSevered).
+  auto written = [&](size_t li) {
+    return version < 6 || (int)li < baseLimbs_ || limbs_[li].body != 0;
+  };
+  uint32_t nWritten = 0;
+  for (size_t li = 0; li < limbs_.size(); li++)
+    if (written(li)) nWritten++;
+  w.U32(nWritten);
   for (size_t li = 0; li < limbs_.size(); li++) {
+    if (!written(li)) continue;
     const MobLimb& L = limbs_[li];
     if (version >= 4) {
       // ---- v4: A LIMB IS ITS NAME UNLESS IT WAS TOUCHED ------------------
@@ -20461,17 +20621,62 @@ void Mob::SaveOne(ByteWriter& w, uint32_t version) const {
   w.Pod(ai_.targetPos);
   w.Pod(ai_.lastSeenPos);
   w.U32(ai_.lastSeenTick);
+  if (version < 6) return;
+  // ---- AND WHETHER IT IS DEAD, AND WHAT IT WEARS (kSaveVersion 6) -----------
+  //
+  // PLAN_corpse_is_a_mob.md "Persistence". The gear is written for every
+  // record, living or dead: a corpse's loot IS its gear, and a living knight
+  // that came back from a save without his breastplate was the same bug seen
+  // from the other side. By NAME (item.h's index hazard), rig-slot order.
+  const bool dead = !alive_;
+  w.U32(dead ? 1u : 0u);
+  // The NAME of every appended slot written above, in order: the loader lines
+  // the record's slots up with the re-dressed rig's BY NAME (a shell is
+  // `worn:<item>:<host>`, a held item `item:<name>`), because a piece that
+  // could not come back -- its identity shell went with a severed limb --
+  // would otherwise shift every slot after it onto the wrong limb.
+  {
+    uint32_t nApp = 0;
+    for (size_t li = (size_t)std::max(0, baseLimbs_); li < limbs_.size(); li++)
+      if (limbs_[li].body != 0) nApp++;
+    w.U32(nApp);
+    for (size_t li = (size_t)std::max(0, baseLimbs_); li < limbs_.size(); li++)
+      if (limbs_[li].body != 0)
+        w.Str(li < limbDefs_.size() ? limbDefs_[li].name : std::string());
+  }
+  std::vector<::net::WireGear> gear;
+  CaptureGear(gear);
+  WriteRecordGear(w, gear);
+  if (!dead) return;
+  // The cause by NAME: deathCause_ points at a literal in this file, and the
+  // loader interns the name back onto the same literal (InternDeathCause).
+  w.Str(std::string(deathCause_ != nullptr ? deathCause_ : ""));
+  w.Pod(deathSeq_);
+  // A rising booked on this corpse travels with it (fx by name, ticks LEFT):
+  // parked or saved, it is still going to get up.
+  const MobSystem::PendingRise* rise = nullptr;
+  if (sys_ != nullptr)
+    for (const MobSystem::PendingRise& r : sys_->rises_)
+      if (r.mobId == id_) { rise = &r; break; }
+  w.U32(rise != nullptr ? 1u : 0u);
+  if (rise == nullptr) return;
+  uint32_t left = rise->ticksLeft;
+  if (!rise->deferred)
+    left = rise->atTick > sys_->tick_ ? rise->atTick - sys_->tick_ : 0u;
+  w.U32(left);
+  w.U32((uint32_t)rise->fx.size());
+  for (const std::string& f : rise->fx) w.Str(f);
 }
 
 void MobSystem::SaveState(std::vector<uint8_t>& out) const {
   ByteWriter w{out};
   uint32_t count = 0;
   for (const Mob& m : mobs_)
-    if (m.alive_ && m.defIndex_ >= 0 && m.defIndex_ < (int)defs_.size()) count++;
+    if (SavesAsRecord(m)) count++;
   w.U32(count);
   for (const Mob& m : mobs_) {
-    if (!(m.alive_ && m.defIndex_ >= 0 && m.defIndex_ < (int)defs_.size()))
-      continue;  // dead mobs are debris already (see mob.h)
+    // The living and the dead (MOBS v6); not a husk, whose rig is DBRS's.
+    if (!SavesAsRecord(m)) continue;
     // A GHOST IS SAVED LIKE ANY OTHER CREATURE, deliberately. Ownership is
     // process state — who is connected right now — and a save file that
     // remembered it would load a world full of creatures nobody steps. A
@@ -20534,6 +20739,17 @@ struct MobSystem::MobRecord {
   uint32_t hasTarget = 0;
   Vec3 targetPos{}, lastSeenPos{};
   uint32_t lastSeenTick = 0;
+  // v6: the gear list and the dead state. `haveGear` false for v3..v5 (they
+  // load undressed, as they always did).
+  bool haveGear = false;
+  std::vector<std::string> appendedNames;   // the record's appended slots
+  std::vector<::net::WireGear> gear;
+  bool dead = false;
+  std::string deathCause;
+  uint64_t deathSeq = 0;
+  bool haveRise = false;
+  uint32_t riseTicksLeft = 0;
+  std::vector<std::string> riseFx;
 };
 
 bool MobSystem::ReadMobRecord(ByteReader& r, MobRecord& out, uint32_t version) {
@@ -20626,11 +20842,102 @@ bool MobSystem::ReadMobRecord(ByteReader& r, MobRecord& out, uint32_t version) {
     r.Pod(out.lastSeenPos);
     r.U32(out.lastSeenTick);
   }
+  // v6's tail, mirroring SaveOne: flags, gear, and the dead block.
+  out.haveGear = version >= 6;
+  out.dead = false;
+  out.haveRise = false;
+  if (out.haveGear && r.ok) {
+    uint32_t flags = 0;
+    r.U32(flags);
+    // An unknown flag is a record this build cannot read correctly.
+    if (flags > 1u) {
+      r.ok = false;
+      return false;
+    }
+    out.dead = (flags & 1u) != 0;
+    uint32_t nApp = 0;
+    r.U32(nApp);
+    if (!r.ok || nApp > out.limbs.size()) {
+      r.ok = false;
+      return false;
+    }
+    out.appendedNames.assign(nApp, std::string());
+    for (std::string& nm : out.appendedNames) r.Str(nm);
+    if (!ReadRecordGear(r, out.gear)) return false;
+    if (out.dead) {
+      r.Str(out.deathCause);
+      r.Pod(out.deathSeq);
+      uint32_t hasRise = 0;
+      r.U32(hasRise);
+      out.haveRise = hasRise != 0;
+      if (out.haveRise) {
+        uint32_t nFx = 0;
+        r.U32(out.riseTicksLeft);
+        r.U32(nFx);
+        if (!r.ok || nFx > 16u) {
+          r.ok = false;
+          return false;
+        }
+        out.riseFx.assign(nFx, std::string());
+        for (std::string& f : out.riseFx) r.Str(f);
+      }
+    }
+  }
   return r.ok;
 }
 
+bool MobSystem::RecordIsDead(const uint8_t* data, size_t len, uint32_t version) {
+  if (version < 6 || version > kSaveVersion) return false;
+  ByteReader r{data, len};
+  MobRecord rec;
+  return ReadMobRecord(r, rec, version) && rec.dead;
+}
+
 // The overlay half, onto a rig that already exists. Moves `rec`'s lattices.
+// ---- LINE THE RECORD'S SLOTS UP WITH THE RIG'S (MOBS v6) --------------------
+//
+// Base limbs are the def's and match by index. Appended slots match BY NAME:
+// the rig was re-dressed from the record's gear list, and a piece that could
+// not come back (its identity shell left with a severed limb, an item this
+// build no longer ships) leaves the two lists different lengths. A record slot
+// no rig slot answers to is dropped (its matter is DBRS's or gone); a rig slot
+// no record slot answers to is left exactly as the dressing built it.
+void MobSystem::AlignRecordToRig(const Mob& m, MobRecord& rec) {
+  using LimbState = MobRecord::LimbState;
+  std::vector<LimbState>& limbs = rec.limbs;
+  const std::vector<std::string>& names = rec.appendedNames;
+  const size_t recBase = limbs.size() - std::min(limbs.size(), names.size());
+  std::vector<LimbState> out(m.limbs_.size());
+  std::vector<uint8_t> taken(names.size(), 0);
+  for (size_t j = 0; j < m.limbs_.size(); j++) {
+    // No record for this slot: leave it as the dressing built it. Pristine
+    // past the base is a no-op in the overlay (PristineOf answers null), and
+    // its own hp and transform are what the overlay then writes back.
+    LimbState keep;
+    keep.alive = 1;
+    keep.kind = kLimbPristine;
+    keep.hp = m.limbs_[j].hp;
+    keep.xf = m.limbs_[j].xf;
+    if ((int)j < m.baseLimbs_) {
+      out[j] = j < recBase ? std::move(limbs[j]) : std::move(keep);
+      continue;
+    }
+    const std::string* nm = j < m.limbDefs_.size() ? &m.limbDefs_[j].name : nullptr;
+    size_t hit = names.size();
+    for (size_t k = 0; nm != nullptr && k < names.size(); k++)
+      if (!taken[k] && names[k] == *nm) { hit = k; break; }
+    if (hit < names.size() && recBase + hit < limbs.size()) {
+      taken[hit] = 1;
+      out[j] = std::move(limbs[recBase + hit]);
+    } else {
+      out[j] = std::move(keep);
+    }
+  }
+  limbs = std::move(out);
+}
+
 void MobSystem::OverlayMobRecord(Mob& m, MobRecord& rec, bool placeLimbs) {
+  if (rec.haveGear) AlignRecordToRig(m, rec);
   m.origin_ = rec.origin;
   m.heading_ = m.desiredHeading_ = rec.heading;
   m.bodyY_ = rec.bodyY;
@@ -20794,7 +21101,13 @@ void MobSystem::OverlayMobRecord(Mob& m, MobRecord& rec, bool placeLimbs) {
   if (placeLimbs) {
     for (uint32_t i = 0; i < nApply; i++) {
       MobLimb& L = m.limbs_[i];
-      if (!L.body) continue;
+      if (!L.body) {
+        // v6: the empty slot's CPU transform is the record's too -- it moves
+        // no body (there is none) and is never drawn, but it is written, and
+        // a placed record re-saves as the bytes it arrived as.
+        if (rec.haveGear && !rec.limbs[i].alive) L.xf = rec.limbs[i].xf;
+        continue;
+      }
       L.xf = rec.limbs[i].xf;
       if (m.phys_ != nullptr)
         m.phys_->SetBodyTransform(L.body, L.xf.pos, L.xf.quat);
@@ -20849,9 +21162,18 @@ Mob* MobSystem::LoadOne(ByteReader& r, uint32_t version, bool placeLimbs,
   // Spawn() first: it derives everything the record deliberately does not
   // carry (anim state, joints, rest sole, flipbooks, gore profile) from the
   // def, exactly as a fresh mob would. The saved damage overlays that.
-  const uint64_t id = Spawn(defIndex, {ifloor(rec.origin.x),
-                                       ifloor(rec.origin.y),
-                                       ifloor(rec.origin.z)});
+  //
+  // A DEAD record is spawned past the living cap (`spawnDead_`, scoped to the
+  // one Spawn): a corpse holds no living slot, and the dead cap is enforced by
+  // decay below, never by refusing the record.
+  uint64_t id = 0;
+  {
+    const bool wasDead = spawnDead_;
+    spawnDead_ = rec.dead;
+    id = Spawn(defIndex, {ifloor(rec.origin.x), ifloor(rec.origin.y),
+                          ifloor(rec.origin.z)});
+    spawnDead_ = wasDead;
+  }
   if (id == 0) {
     // TRANSIENT, unlike the two refusals above: the record is sound and the
     // def resolves, the crowd was full or BuildRig could not get a physics
@@ -20861,11 +21183,78 @@ Mob* MobSystem::LoadOne(ByteReader& r, uint32_t version, bool placeLimbs,
                 rec.defName.c_str());
     return nullptr;
   }
-  OverlayMobRecord(mobs_.back(), rec, placeLimbs);
-  // BY ID, not by the reference above: the overlay can sever, and a sever is
-  // one of the paths that may re-enter this system. The id is the identity
-  // (mob.h's note on NextIdCounter).
+  // ---- DRESSED BEFORE THE OVERLAY (v6), ApplyHandoff's order and reason ----
+  //
+  // Worn pieces and the held item APPEND rig slots past the base limbs, and
+  // the record's limb array was written from a rig that had them: overlay
+  // first and the gear limbs' records would fall off the end of a bare rig.
+  // The list is in rig-slot order (Mob::CaptureGear), so the replay appends
+  // the same slots in the same places. CaptureWorn's damage rides each piece,
+  // and the stored shell lattices the overlay then applies are the truth.
+  if (rec.haveGear && !rec.gear.empty()) ApplyWireGear(mobs_.back(), rec.gear);
+
+  // BY ID from here on: dressing appends rig slots, and the overlay can sever,
+  // and a sever is one of the paths that may re-enter this system. The id is
+  // the identity (mob.h's note on NextIdCounter).
+  Mob* m = FindMobById(id);
+  if (m == nullptr) return nullptr;
+  // A corpse is ALWAYS placed: the transforms in its record are the pose it
+  // was lying in, and a dead rig left in Spawn's standing rest pose would
+  // fall over on the first step -- a body that moved, which a load must not
+  // author. (A living load keeps its rest pose unless the caller asked.)
+  OverlayMobRecord(*m, rec, placeLimbs || rec.dead);
+  m = FindMobById(id);
+  if (m == nullptr || !rec.dead) return m;
+  EnterLoadedDead(*m, rec);
   return FindMobById(id);
+}
+
+// ---- A SAVED CORPSE COMES BACK DEAD (MOBS v6) --------------------------------
+//
+// The state Mob::Die produces, WITHOUT Die's side effects: no death cry, no
+// OnDying, no rising booked from the rot in the flesh (only the one the record
+// carried), and the cause and death order are the saved ones. The limbs are
+// already on the record's lying pose (LoadOne placed them) and are flipped
+// dynamic exactly as Die flips them (EnterDeadRagdoll).
+void MobSystem::EnterLoadedDead(Mob& m, const MobRecord& rec) {
+  m.alive_ = false;
+  m.deathCause_ = InternDeathCause(rec.deathCause);
+  // DEATH ORDER is kept, and the counter is lifted past it (max, never
+  // assignment) so every later death is younger than every loaded one. A
+  // record with no order (0) is the youngest corpse there is.
+  m.deathSeq_ = rec.deathSeq != 0 ? rec.deathSeq : deathSeq_ + 1;
+  deathSeq_ = std::max(deathSeq_, m.deathSeq_);
+  m.getUpFrom_.clear();
+  m.stroke_.Reset();
+  m.weapon_ = WeaponPose{};
+  m.swinging_ = false;
+  m.hitReact_.live = false;
+  m.aimLookValid_ = false;
+  // EnterDeadRagdoll reads every limb's transform back out of Jolt, which
+  // hands back the quaternion it stored renormalised -- a few ulps off the
+  // record's. The record IS the pose (the bodies were set to it a line ago),
+  // so the CPU copy is put back: a corpse saved again before it has stepped
+  // writes the bytes it was loaded from.
+  std::vector<BodyTransform> placed(m.limbs_.size());
+  for (size_t i = 0; i < m.limbs_.size(); i++) placed[i] = m.limbs_[i].xf;
+  m.EnterDeadRagdoll();
+  for (size_t i = 0; i < m.limbs_.size() && i < placed.size(); i++)
+    m.limbs_[i].xf = placed[i];
+  if (rec.haveRise && !rec.riseFx.empty()) {
+    PendingRise r;
+    r.mobId = m.id_;
+    r.fx = rec.riseFx;
+    // A loaded creature is local (SaveState's note on ghosts), so is its
+    // grave: this machine raises it.
+    r.owner = localPlayerId_;
+    r.deferred = true;
+    r.ticksLeft = rec.riseTicksLeft;
+    BookRising(std::move(r));
+  }
+  // THE DEAD CAP, now rather than at the next PreTick: an unpark into a full
+  // graveyard decays the OLDEST corpse -- which may be this one.
+  EvictDead();
+  instancesDirty_ = true;
 }
 
 // ============================================================================
