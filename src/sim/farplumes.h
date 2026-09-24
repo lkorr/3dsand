@@ -146,6 +146,17 @@ class FarPlumes {
   // a second place to get wrong.
   bool TakeUpload(const uint32_t** words, uint32_t* wordCount);
 
+  // ---- Build's scratch rows (implementation detail) -------------------------
+  // Public only so farplumes.cpp's file-local sort helpers can name them.
+  // One candidate emitter with its rank. Distance is squared euclidean from the
+  // window centre; the BAND it falls in is decided by the max norm, which is a
+  // different metric on purpose (see Build).
+  struct Ranked {
+    int64_t d2;
+    Emitter e;
+    uint32_t w8;   // crossfade weight 0..255 (world.h kGasFarBlendVox)
+  };
+
  private:
   struct Key {
     int32_t x, y, z;
@@ -166,6 +177,35 @@ class FarPlumes {
 
   // Replace `wc`'s emitters with `e` (possibly empty, which erases the entry).
   void Replace(IVec3 wc, const Emitter* e, uint32_t n);
+
+  // ---- Build's caches and reused containers (2026-09-24) -------------------
+  // What an emitter's list membership depends on — everything but the eye —
+  // computed when the index, the window origin or the range changes, and
+  // reused by the eye-only rebuilds that kGasFarEyeStepVox triggers every
+  // couple of voxels a player walks (Build's note says why the result is
+  // byte-identical to a full walk).
+  struct Geo {
+    Emitter e;
+    Key key;           // owning chunk (the debug band is per chunk)
+    int64_t d2;        // squared distance from the window centre
+    bool nearFine;     // max-norm distance inside the fine box's half-extent
+    bool inFine;       // ...and inside the fine box itself
+    bool inWide;       // inside the authored range and the wide box
+    bool outOfRange;   // past the authored range (or the range is 0)
+  };
+  std::vector<Geo> geo_;
+  std::vector<Key> resident_;   // SANDVOX_PLUME_DEBUG only: in-window chunks
+  struct Cand {
+    Emitter e;
+    int64_t d2;
+    uint32_t wFine;   // 0 = cannot be in the fine section at all
+    uint32_t outer;   // 0..255 wide-list outer fade; 0 = not wide-eligible
+  };
+  struct WideAgg { Emitter e; uint64_t sw; };
+  std::vector<Cand> cand_;
+  std::vector<Ranked> fine_;
+  std::vector<Ranked> wideRanked_;
+  std::unordered_map<Key, WideAgg, KeyHash> wide_;
 
   std::unordered_map<Key, std::vector<Emitter>, KeyHash> byChunk_;
   // SANDVOX_PLUME_DEBUG only (farplumes.cpp PlumeDebug): which list each

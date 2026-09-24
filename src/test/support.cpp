@@ -1426,9 +1426,12 @@ void SubmitTick(GpuContext& ctx, World& world, Simulation& sim, uint32_t tick,
   // opposite reason. A spawn op is consumed on the tick it arrives, so its
   // buffer must be rewritten every tick or the previous tick's ops respawn.
   // The emitter list is a STANDING description of where the frozen fires are:
-  // it changes only when a chunk is evicted, re-loaded or the window moves, so
-  // it is uploaded only when Build() says it changed — which is no ticks at all
-  // in a world nobody has set alight, and one tick per window shift otherwise.
+  // its membership changes only when a chunk is evicted, re-loaded or the
+  // window moves, and its crossfade weights when the eye has moved
+  // kGasFarEyeStepVox (FarPlumes::SetEye; the eye-only rebuild reuses the
+  // cached membership). It is uploaded only when Build() produced a different
+  // image — no ticks at all in a world nobody has set alight, and otherwise a
+  // window shift or a weight byte that actually moved.
   //
   // Simulation is told the count BEFORE EncodeTick for NoteGasSpawns' reason:
   // the count is the splat row's dispatch extent AND half the condition on the
