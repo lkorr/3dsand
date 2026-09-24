@@ -1519,29 +1519,73 @@ static void PhaseG(TickAuthorityCtx& w, WorldScratch& ws,
             tslot >= 0 && tslot < kItemSlots ? &hotbar.slots[tslot] : nullptr;
         const ItemDef* tdef = ts && !ts->Empty() ? items.At(ts->def) : nullptr;
         if (!tdef || !ContainerThrowable(*tdef) || tslot != s.throwSlot) {
+          if (s.throwTicks > 0 && avatar.Spawned())
+            avatar.StopClip("throw_windup");
           s.throwTicks = 0;
+          s.throwLaunchIn = 0;  // the hand changed mid-swing: nothing leaves it
           s.throwSlot = tdef && ContainerThrowable(*tdef) ? tslot : -1;
         }
-        if (s.throwSlot >= 0 && ti.Held(TB_THROW)) {
+        // The arm draws back while Q is held (a looping hold, eased in by the
+        // clip's blend) and whips through on the release; the vessel leaves
+        // the hand kThrowLaunchTicks later, at the front of the swing (the
+        // `throw` clip's release key, assets/anims/throw.json).
+        constexpr int kThrowLaunchTicks = 3;
+        bool launch = false;
+        if (s.throwLaunchIn > 0) {
+          launch = --s.throwLaunchIn == 0;
+        } else if (s.throwSlot >= 0 && ti.Held(TB_THROW)) {
+          if (s.throwTicks == 0 && avatar.Spawned())
+            avatar.PlayClip("throw_windup");
           s.throwTicks = std::min(s.throwTicks + 1, 1 << 20);
         } else if (s.throwSlot >= 0 && s.throwTicks > 0) {
-          ItemStack& vs = hotbar.slots[s.throwSlot];
-          const float speed = ContainerThrowSpeed(*tdef, s.throwTicks);
+          s.throwLaunchSpeed = ContainerThrowSpeed(*tdef, s.throwTicks);
           s.throwTicks = 0;
+          if (avatar.Spawned()) {
+            avatar.StopClip("throw_windup");
+            avatar.PlayClip("throw");
+            s.throwLaunchIn = kThrowLaunchTicks;
+          } else {
+            launch = true;  // no body to swing (fly mode): straight away
+          }
+        }
+        if (launch && s.throwSlot >= 0) {
+          ItemStack& vs = hotbar.slots[s.throwSlot];
+          const float speed = s.throwLaunchSpeed;
           const Vec3 fwd = cam.Forward();
-          // From in front of the eye, the drop's own launch point: the eye is
-          // inside the capsule proxy, and DropItemToWorld keeps the body off
-          // the player's layer until it has flown clear. A few degrees of
-          // lift, because a throw aimed AT the crosshair is released above it.
-          const Vec3 at = player.EyePos() + fwd * 2.0f - Vec3{0, 0.5f, 0};
+          // A few degrees of lift, because a throw aimed AT the crosshair is
+          // released above it.
           Vec3 dir = fwd + Vec3{0, 0.08f, 0};
           dir = dir * (1.0f / std::max(1e-4f, dir.len()));
           const Vec3 vel = dir * speed + player.vel;
+          // FROM THE HAND: the held rig part's pose, centred on the item's
+          // own voxels (`at` is the body's min corner). Without a body, from
+          // in front of the eye. Either way it starts inside the capsule and
+          // among the thrower's own limbs, which is why the release below is
+          // `thrown`: on the plain AVATAR layer it struck the thrower's head
+          // and arm on its first step and burst in their face.
+          Vec3 at = player.EyePos() + fwd * 2.0f - Vec3{0, 0.5f, 0};
+          {
+            Vec3 hp;
+            Quat hq;
+            const int hs = avatar.Spawned() ? avatar.HeldSlot() : -1;
+            uint32_t gscale = 1;
+            const std::vector<PrefabVoxel>* gv = ItemGroundVoxels(*tdef, gscale);
+            if (hs >= 0 && avatar.PartWorldTransform(hs, hp, hq)) {
+              Vec3 c{};
+              if (gv && !gv->empty()) {
+                for (const PrefabVoxel& v : *gv)
+                  c = c + Vec3{v.x + 0.5f, v.y + 0.5f, v.z + 0.5f};
+                c = c * (1.0f / ((float)gv->size() * (float)std::max(1u, gscale)));
+              }
+              at = hp - c;
+            }
+          }
           const uint64_t body =
               w.ground ? DropItemToWorld(*tdef, at, vel, phys, debris, &mbSet,
                                          *w.ground, nullptr, vs.dye,
                                          PackItemFill(vs.fillMat, vs.fillAmt))
                        : 0;
+          if (body) phys.ReleaseToWorldWhenClear(body, /*thrown=*/true);
           if (body) {
             // End over end about the throw's own right axis: a spun flask
             // reads as thrown, a translating one as teleported.
@@ -1560,7 +1604,7 @@ static void PhaseG(TickAuthorityCtx& w, WorldScratch& ws,
                              : -1.0f;
       }
       if (st.intent.vesselSlot >= 0 && st.intent.vesselSlot < kItemSlots &&
-          s.throwTicks == 0) {
+          s.throwTicks == 0 && s.throwLaunchIn == 0) {
         ItemStack& vs = hotbar.slots[st.intent.vesselSlot];
         const ItemDef* vdef = vs.Empty() ? nullptr : items.At(vs.def);
         const WorldSnapshot& vsnap = world.Snap();

@@ -3966,6 +3966,13 @@ void Mob::PlayClip(const std::string& name) {
   PlayClipIndex(skel_.FindClip(name));
 }
 
+void Mob::StopClip(const std::string& name) {
+  const int ci = skel_.FindClip(name);
+  if (ci < 0) return;
+  for (ClipInstance& inst : anim_.clips)
+    if (inst.clip == ci) inst.stopping = true;
+}
+
 void Mob::PlayClipIndex(int ci) {
   if (ci < 0 || ci >= (int)skel_.clips.size()) return;
   for (ClipInstance& inst : anim_.clips)

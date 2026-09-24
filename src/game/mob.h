@@ -2031,6 +2031,9 @@ class Mob {
   void RegisterTerrainAnchor();
   void PlayClip(const std::string& name);
   void PlayClipIndex(int ci);
+  // Blend out every running instance of `name` (a looping hold, e.g. the
+  // throw wind-up, that only its owner knows when to end). No-op if absent.
+  void StopClip(const std::string& name);
 
   // ---- holding an item (THE ENTITY<->SLOT SYNC SEAM; see game/avatar.h) ----
   // Equipping BORROWS A RIG SLOT: the item's geometry fills a real MobLimb

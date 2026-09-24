@@ -443,6 +443,12 @@ struct PlayerSession {
   // the tick, released on the tick; cancelled when the hand changes.
   int throwTicks = 0;
   int throwSlot = -1;
+  // THE RELEASE: Q let go starts the `throw` clip and the vessel leaves the
+  // hand `throwLaunchIn` ticks later, where the arm has swung it to — not
+  // from behind your head. >0 while the arm is coming through; the speed is
+  // fixed at the release so the delay cannot add charge.
+  int throwLaunchIn = 0;
+  float throwLaunchSpeed = 0.0f;
 
   // ---- melee ----
   MeleeState melee;

@@ -382,7 +382,13 @@ class Physics {
   //
   // With no live player proxy in the world (a headless NPC-only run) the body
   // goes straight to MOVING: there is nobody to protect.
-  void ReleaseToWorldWhenClear(uint64_t handle);
+  //
+  // `thrown`: a projectile leaving the thrower's hand. It must not meet the
+  // thrower's own LIMBS either (AVATAR collides with AVATAR — a flask thrown
+  // from the hand hit your own head and burst), so it waits on Layers::THROWN,
+  // which touches only terrain and ordinary bodies. Calling again on a body
+  // already pending just re-sets its layer.
+  void ReleaseToWorldWhenClear(uint64_t handle, bool thrown = false);
   static constexpr size_t kMaxPendingRelease = 256;
   // How many player proxies TickPendingReleases will test a piece against. A
   // bound, not a player cap: it sizes the stack array of AABBs gathered once
