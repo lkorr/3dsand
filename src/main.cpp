@@ -13755,14 +13755,15 @@ int main(int argc, char** argv) {
       // the most expensive possible way to draw a background.
       //
       // THE DEATH POSE IS A THIRD RE-UPLOAD OF THE SAME SHAPE. A dead player's
-      // limbs are DebrisSystem's and go on ragdolling, settling, burning and
-      // rolling downhill; the death screen must show the body as it FELL, and
-      // must still be turnable while it does. So the portrait overwrites those
-      // bodies' transforms with the ones the dying observer froze, draws, and
-      // hands the live ones back — the same borrow-and-return the hide mask
-      // above does, one array over. Matched by PHYSICS HANDLE, because
-      // AdoptBody carries the limb's handle into debris unchanged and a slot
-      // index does not survive the next cull.
+      // limbs are a dead Mob's (MobSystem::AdoptDeadAvatar) and go on
+      // ragdolling, settling, burning and rolling downhill; the death screen
+      // must show the body as it FELL, and must still be turnable while it
+      // does. So the portrait overwrites those bodies' transforms with the ones
+      // the dying observer froze, draws, and hands the live ones back — the
+      // same borrow-and-return the hide mask above does, one array over.
+      // Matched by PHYSICS HANDLE, because the move into mobs_ (and a sever's
+      // AdoptBody) carries each handle unchanged and a slot index does not
+      // survive the next population change.
       if (ui.inventoryOpen && portraitCam.valid && portraitView) {
         avatar.SetHiddenParts({});               // the WHOLE body, always
         std::vector<BodyVoxInst> pInst;
@@ -13777,10 +13778,15 @@ int main(int argc, char** argv) {
         // one thing that does re-upload them, and it puts them back below.
         bool posedDead = false;
         if (deathFrozen && deathBody.have && !bodyXf.empty()) {
-          const uint32_t debrisSlots =
-              std::min<uint32_t>(debris.SlotCount(), (uint32_t)bodyXf.size());
-          for (uint32_t s = 0; s < debrisSlots; s++) {
-            const uint64_t h = debris.BodyHandle(s);
+          // EVERY slot, not the debris range: the corpse is a dead Mob in
+          // mobs_ now (MobSystem::AdoptDeadAvatar) and draws through mob
+          // slots, while a limb severed before death is still debris.
+          std::vector<uint64_t> slotHandles;
+          bodyReg.BuildHandles(slotHandles);
+          const uint32_t nSlots = std::min<uint32_t>(
+              (uint32_t)slotHandles.size(), (uint32_t)bodyXf.size());
+          for (uint32_t s = 0; s < nSlots; s++) {
+            const uint64_t h = slotHandles[s];
             if (!h) continue;
             for (const auto& fl : deathBody.limbs) {
               if (fl.body != h) continue;

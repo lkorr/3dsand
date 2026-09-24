@@ -734,6 +734,10 @@ const char* const kOrder[] = {
     // debris (docs/PLAN_corpse_is_a_mob.md). The first ticks the world and
     // regenerates it on the way out; the second is one PreTick, CPU only.
     "corpse-sleep", "corpse-cap",
+    // The player's corpse is a dead Mob too (P2b): moved into mobs_ at the
+    // PreTick after the death, whole respawn, sleeps, a cut reaches it. Ticks
+    // the world and regenerates it on the way out, as corpse-sleep does.
+    "player-corpse",
     // ---- NOTHING IS LEFT HANGING (2026-09-03) -----------------------------
     // LAST of everything that touches the shared World except `voxregion`, and
     // that position was EARNED rather than chosen. It first sat at the end of

@@ -289,7 +289,8 @@ class PlayerAvatar : public Mob {
   // ---- persistence (sim/worldio.h, entities.sve section 'AVTR') -----------
   // Per-part hp and sever state, def by NAME. LoadState runs while the avatar
   // is despawned, so it only RECORDS the state; the next Spawn() applies it.
-  // A dead avatar is saved as absent: its corpse is debris ('DBRS').
+  // A dead avatar is saved as absent: its corpse is a dead Mob in mobs_
+  // (MobSystem::AdoptDeadAvatar), not part of the avatar record.
   static constexpr uint32_t kSaveVersion = 1;
   void SaveState(std::vector<uint8_t>& out) const;
   bool LoadState(const uint8_t* data, size_t len, uint32_t version);

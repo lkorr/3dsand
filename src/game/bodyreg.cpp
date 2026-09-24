@@ -34,6 +34,14 @@ void BodyRegistry::BuildXforms(std::vector<BodyXformGpu>& out) const {
   mobs_.AppendXforms(out);
 }
 
+void BodyRegistry::BuildHandles(std::vector<uint64_t>& out) const {
+  out.clear();
+  const uint32_t d = debris_.SlotCount();
+  for (uint32_t s = 0; s < d; s++) out.push_back(debris_.BodyHandle(s));
+  if (avatar_) avatar_->AppendBodyHandles(out);
+  mobs_.AppendBodyHandles(out);
+}
+
 void BodyRegistry::BuildInstances(std::vector<BodyVoxInst>& out) {
   debris_.BuildInstances(out);  // clears + fills, slots [0, SlotCount)
   const uint32_t avatarBase = debris_.SlotCount();

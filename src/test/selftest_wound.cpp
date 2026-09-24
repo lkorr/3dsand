@@ -47,6 +47,7 @@
 // about geometry when the real problem was that it was too small to cut.
 
 #include <algorithm>
+#include <climits>
 #include <cmath>
 #include <chrono>
 #include <cstdio>
@@ -58,6 +59,7 @@
 #include <vector>
 
 #include "game/item.h"
+#include "game/avatar.h"   // player-corpse: the avatar's rig moves into mobs_
 #include "game/equipment.h"
 #include "game/player.h"
 #include "game/mob.h"
@@ -6475,6 +6477,36 @@ Status GateCorpseSleep(Ctx& c, std::string& detail) {
                       "root %d), %u bleeding, %u burning; earlier%s]",
                       why ? why : "(quiet now)", active, activeSlots.c_str(),
                       f.root, bleeding, burning, history.c_str());
+    // What is AROUND it (rule 6): liquid cells near the pelvis, by material,
+    // from the CPU mirror the contact pass reads. A fixed inset is wet or dry
+    // depending on where the suite has left the window.
+    if (m != nullptr) {
+      const Vec3 p = m->Origin();
+      std::map<uint32_t, uint32_t> census;
+      for (int z = -6; z <= 6; z++)
+        for (int y = -6; y <= 6; y++)
+          for (int x = -6; x <= 6; x++) {
+            const IVec3 cell{ifloor(p.x) + x + 4, ifloor(p.y) + y + 2,
+                             ifloor(p.z) + z + 4};
+            const CachedChunk* cc =
+                c.world.Cached(IVec3{cell.x >> 4, cell.y >> 4, cell.z >> 4});
+            if (cc == nullptr || cc->voxels.size() != kChunkVol) continue;
+            const uint32_t mat =
+                cc->voxels[((uint32_t)(cell.z & 15) * kChunk +
+                            (uint32_t)(cell.y & 15)) * kChunk +
+                           (uint32_t)(cell.x & 15)] & 0xFFFu;
+            if (mat != 0 && mat < c.mats.size() &&
+                c.mats[mat].gpu.klass == CLASS_LIQUID)
+              census[mat]++;
+          }
+      awakeWhy += Format(" [at (%.0f,%.0f,%.0f), window origin chunk (%d,%d,%d); "
+                         "liquid cells near it:", (double)p.x, (double)p.y,
+                         (double)p.z, c.world.WindowOrigin().x,
+                         c.world.WindowOrigin().y, c.world.WindowOrigin().z);
+      for (const auto& [mat, n] : census)
+        awakeWhy += Format(" %s %u", c.mats[mat].name.c_str(), n);
+      awakeWhy += "]";
+    }
     awakeWhy += Format(" [root blood voxels: spawned %u, killed %u, +20 %u, "
                        "now %u; blood-coated voxels %u, %u, %u, now %u]",
                        bloodSpawned, bloodSevered, bloodSettled,
@@ -6552,6 +6584,455 @@ Status GateCorpseSleep(Ctx& c, std::string& detail) {
       (unsigned long long)posts, (unsigned long long)anchors,
       (unsigned long long)anchorCap, activeTicks, stayedAsleep ? 1 : 0, took,
       woke ? 1 : 0);
+  return ok ? Status::Pass : Status::Fail;
+}
+
+// ---------------------------------------------------------------------------
+// player-corpse: the player's body is a dead Mob too (PLAN_corpse_is_a_mob.md P2b)
+// ---------------------------------------------------------------------------
+//
+// PlayerAvatar is a Mob that does not live in mobs_, so its dead rig is MOVED
+// there (MobSystem::AdoptDeadAvatar) at the top of the next PreTick. The
+// claims, on a registered avatar that was carved on one limb and set alight
+// on another before it died:
+//   A. one PreTick after the death, exactly one PlayerCorpse() dead Mob is in
+//      mobs_, holding EVERY body handle the avatar held at death, lying where
+//      the avatar fell, NOT lootable, and on the corpse's own fresh id; every
+//      limb the fire did not touch has exactly the live voxels it died with
+//      (the carve came across), and the burning limb is still burning or has
+//      lost more (the fire came across). The avatar is a husk: same part list,
+//      no bodies;
+//   B. Revive gives a WHOLE avatar whose bodies are all new — none of them is
+//      a handle the corpse owns — and adopts nothing a second time;
+//   C. the corpse falls ASLEEP (it sleeps like any corpse);
+//   D. a cut on it after the respawn reaches it: FindOwner names the corpse,
+//      the cut takes voxels and wakes it;
+//   E. every corpse body is off the avatar layer once the respawned player's
+//      capsule is somewhere else.
+Status GatePlayerCorpse(Ctx& c, std::string& detail) {
+  IdCounterScope idScope(c.mobs);
+  PrepareWorld(c);
+  c.mobs.Reset();
+  c.mobs.ClearRisings();
+  c.debris.Reset();
+  DeadFixture f(c);
+  // DRY GROUND. A corpse lying in water is wetted by contact every tick and
+  // never sleeps (measured at insets 440 and 470 of the standalone window:
+  // 'twin dirty (stain writers 0xd)', a water coat on every limb) — a fact
+  // about corpses in water, not about whose corpse this is. A fixed inset is
+  // wet or dry depending on where streaming has left the window, so the site
+  // is the first candidate no pond disc (rolled tarn or authored lake) covers.
+  auto wetAt = [&](IVec3 s) {
+    auto covers = [&](const World::PondDisc& d) {
+      if (!d.present || d.surf < s.y - 2) return false;
+      const int dx = s.x - d.cx, dz = s.z - d.cz, r = d.r + 12;
+      return dx * dx + dz * dz <= r * r;
+    };
+    const int T = World::PondTileSize();
+    if (T > 0) {
+      const int tx = (int)std::floor((float)s.x / (float)T);
+      const int tz = (int)std::floor((float)s.z / (float)T);
+      for (int dz = -1; dz <= 1; dz++)
+        for (int dx = -1; dx <= 1; dx++)
+          if (covers(World::PondTile(tx + dx, tz + dz, kDefaultSeed))) return true;
+    }
+    for (int i = 0; i < World::WaterSiteCount(); i++)
+      if (covers(World::WaterSiteDisc(i, kDefaultSeed))) return true;
+    return false;
+  };
+  // ...and of those the HIGHEST ground: water that is not a pond (a stream, a
+  // flooded hollow — 448 water cells round the corpse at inset 470, measured)
+  // lies low, and a knoll drains.
+  int inset = -1, bestY = INT_MIN;
+  for (int cand : {470, 300, 360, 200, 420, 250, 150, 330, 100, 400}) {
+    const IVec3 s = FixtureSite(c.world, cand);
+    if (wetAt(s) || s.y <= bestY) continue;
+    inset = cand;
+    bestY = s.y;
+  }
+  if (inset < 0) {
+    detail = "every candidate site is under a pond disc";
+    return Status::Fail;
+  }
+  const IVec3 site = FixtureSite(c.world, inset);
+  f.pchunk = IVec3{site.x >> 4, site.y >> 4, site.z >> 4};
+  f.tick = 64000;
+
+  PlayerAvatar av;
+  av.Init(&c.phys, &c.world, &c.debris, c.mats, &c.mobs);
+  av.SetDefs(&c.mobs.Defs(), kAvatarDefName);
+  if (!av.HasDef()) {
+    detail = std::string("no mob def named \"") + kAvatarDefName + "\"";
+    return Status::Fail;
+  }
+  Player pl;
+  pl.fly = false;
+  pl.grounded = true;
+  auto standAt = [&](int x, int z) {
+    pl.pos = Vec3{(float)x + 0.5f,
+                  (float)(World::TerrainHeight(x, z, kDefaultSeed) + 2) +
+                      Player::kHalfY,
+                  (float)z + 0.5f};
+  };
+  standAt(site.x, site.z);
+  const uint64_t proxy = c.phys.CreatePlayerBody(Player::kHalfXZ, Player::kHalfY);
+  c.phys.MovePlayerBody(proxy, pl.pos, kTickDt);
+  auto cleanup = [&]() {
+    c.mobs.SetAvatar(nullptr);
+    av.Despawn();
+    c.phys.RemoveBody(proxy);
+    c.mobs.Reset();
+    c.mobs.ClearRisings();
+    c.debris.Reset();
+    SubmitWorldgen(c.ctx, c.world, c.sim, kDefaultSeed);
+    c.ctx.WaitIdle();
+  };
+  if (!av.Spawn(pl, 0.0f)) {
+    cleanup();
+    detail = "avatar Spawn refused";
+    return Status::Fail;
+  }
+  c.mobs.SetAvatar(&av);
+  // The counter is the system's lifetime total; earlier gates in a suite
+  // (mob-loot's kit arm) have their own avatars die.
+  const uint64_t adopted0 = c.mobs.AdoptedAvatarsTotal();
+  const MobDef& def = *av.Def();
+  const int nBase = (int)def.limbs.size();
+  const int root = def.rootLimb;
+
+  // The PlayerCorpse() dead Mobs in mobs_, in list order.
+  auto playerCorpses = [&]() {
+    std::vector<uint64_t> ids;
+    for (uint32_t i = 0; i < c.mobs.MobCount(); i++) {
+      const Mob* m = c.mobs.FindMobById(c.mobs.MobIdAt(i));
+      if (m != nullptr && m->PlayerCorpse()) ids.push_back(m->Id());
+    }
+    return ids;
+  };
+  // Every part of the avatar has a body, and each one is the AVATAR's —
+  // FindOwner walks mobs_ first, so a handle a corpse still owned would
+  // answer with the corpse.
+  auto respawnWhole = [&](int& whole, int& aliased) {
+    whole = aliased = 0;
+    for (int i = 0; i < nBase; i++) {
+      const uint64_t h = av.PartBody(i);
+      if (!h) continue;
+      whole++;
+      int li = -1;
+      if (c.mobs.FindOwner(h, &li) != &av) aliased++;
+    }
+    return av.IsAlive() && whole == nBase && aliased == 0;
+  };
+
+  // ======== DEATH 1: clean — the corpse C and D are asserted on ============
+  //
+  // No wound: a corpse that bleeds lies in its own blood, re-stains from the
+  // ground by contact as fast as it dries, and stays (correctly, for now)
+  // awake — measured on death 2 below, 'twin dirty (stain writers 0x5)' past
+  // 1800 ticks. corpse-sleep kills its fixture the same way for the same
+  // reason. This is the property "sleeps like any corpse" can be stated for.
+  for (int i = 0; i < 4; i++) f.Step();
+  std::vector<uint64_t> handles1;
+  for (int i = 0; i < av.PartCount(); i++)
+    if (av.PartBody(i)) handles1.push_back(av.PartBody(i));
+  const Vec3 fell1 = av.Origin();
+  av.Die();
+  const bool died1 = !av.IsAlive();
+  f.Step();   // the PreTick that adopts it
+  std::vector<uint64_t> ids = playerCorpses();
+  const uint64_t cid = ids.size() == 1 ? ids[0] : 0;
+  const Mob* corpse1 = cid ? c.mobs.FindMobById(cid) : nullptr;
+  uint32_t kept1 = 0;
+  for (uint64_t h : handles1) {
+    int li = -1;
+    if (corpse1 != nullptr && c.mobs.FindOwner(h, &li) == corpse1) kept1++;
+  }
+  const float maxDrift = (float)BaselineNumber("playerCorpseMaxDrift", 24.0);
+  const float drift1 = corpse1 ? (corpse1->Origin() - fell1).len() : 1e9f;
+  const int lootable1 = corpse1 ? (corpse1->Lootable() ? 1 : 0) : -1;
+  int husk1 = 0;
+  for (int i = 0; i < av.PartCount(); i++)
+    if (av.PartBody(i)) husk1++;
+  const bool a1 = died1 && ids.size() == 1 && corpse1 != nullptr &&
+                  !corpse1->Alive() && lootable1 == 0 && cid != av.Id() &&
+                  !handles1.empty() && kept1 == handles1.size() &&
+                  drift1 <= maxDrift && husk1 == 0 &&
+                  av.PartCount() >= nBase && c.mobs.AdoptedAvatarsTotal() - adopted0 == 1;
+  corpse1 = nullptr;   // points into mobs_; later ticks may reallocate it
+
+  // ---- respawn 1, clear of the corpse ---------------------------------------
+  standAt(site.x - 48, site.z);
+  c.phys.MovePlayerBody(proxy, pl.pos, kTickDt);
+  av.Revive(pl, 0.0f);
+  int whole1 = 0, aliased1 = 0;
+  const bool b1 = respawnWhole(whole1, aliased1) &&
+                  c.mobs.AdoptedAvatarsTotal() - adopted0 == 1 &&
+                  c.mobs.FindMobById(cid) != nullptr;
+
+  // ======== DEATH 2: carved and burning — what the move carries ============
+  //
+  // The carved limb and the burning one, far apart so the fire's first tick
+  // on the corpse cannot touch the carve's count: an arm and a leg.
+  auto limbTagged = [&](const char* tag) {
+    for (int i = 0; i < nBase; i++)
+      if (i != root && def.limbs[i].tag.find(tag) != std::string::npos &&
+          av.PartBody(i))
+        return i;
+    return -1;
+  };
+  const int carveL = limbTagged("arm");
+  const int burnL = limbTagged("leg");
+  if (carveL < 0 || burnL < 0 || carveL == burnL) {
+    cleanup();
+    detail = Format("no arm/leg pair on '%s' (arm %d, leg %d)",
+                    def.name.c_str(), carveL, burnL);
+    return Status::Fail;
+  }
+  for (int i = 0; i < 4; i++) f.Step();
+  auto liveOf = [&](int i) -> uint32_t {   // tombstones out
+    const uint32_t n = av.PartVoxelCount(i), dead = av.PartMaterialCount(i, 0u);
+    return n > dead ? n - dead : 0u;
+  };
+  const uint32_t carve0 = liveOf(carveL);
+  {
+    std::vector<ParticleSpawn> sp;
+    Vec3 at{};
+    c.phys.BodyCenterOfMass(av.PartBody(carveL), at);
+    // A HOLE, not an amputation: 0.5 world voxels is 4 skin voxels at the
+    // human's skinScale, well inside an arm's width.
+    c.mobs.CarveLimbRadial(av.PartBody(carveL), at, 0.5f, /*ragged=*/false,
+                           /*eject=*/false, c.world, sp);
+  }
+  const uint32_t lit = av.IgnitePart(
+      burnL, (uint32_t)BaselineNumber("playerCorpseIgnite", 60.0));
+  const bool carvedStillOn = av.PartBody(carveL) != 0;
+  std::vector<uint32_t> liveAtDeath((size_t)nBase, 0u);
+  std::vector<uint64_t> handles2;
+  for (int i = 0; i < av.PartCount(); i++) {
+    if (i < nBase) liveAtDeath[(size_t)i] = liveOf(i);
+    if (av.PartBody(i)) handles2.push_back(av.PartBody(i));
+  }
+  const uint32_t burningAtDeath = av.PartBurningCount(burnL);
+  const Vec3 fell2 = av.Origin();
+  av.Die();
+  f.Step();
+  ids = playerCorpses();
+  uint64_t cid2 = 0;
+  for (uint64_t id : ids)
+    if (id != cid) cid2 = id;
+  const Mob* corpse2 = cid2 ? c.mobs.FindMobById(cid2) : nullptr;
+  uint32_t kept2 = 0;
+  for (uint64_t h : handles2) {
+    int li = -1;
+    if (corpse2 != nullptr && c.mobs.FindOwner(h, &li) == corpse2) kept2++;
+  }
+  const float drift2 = corpse2 ? (corpse2->Origin() - fell2).len() : 1e9f;
+  const int lootable2 = corpse2 ? (corpse2->Lootable() ? 1 : 0) : -1;
+  // THE CARVED LIMB EXACTLY: nothing but the move happened to it. Every
+  // other limb has had one dead tick of the matter passes by now (the
+  // anatomy's `blood` voxels decay out of a corpse, corpse-sleep's note), so
+  // it may have lost a few and never gained one: a lattice rebuilt from the
+  // def on the far side of the move would read as a GAIN on the carve and as
+  // the def's full count everywhere else. The burning limb's joint
+  // neighbours share its heat (cross-limb heat) and are the fire's.
+  const uint32_t maxFirstTickLoss =
+      (uint32_t)BaselineNumber("playerCorpseFirstTickLoss", 8.0);
+  int countsKept = 0, countsChecked = 0;
+  std::string countWhy;
+  for (int i = 0; corpse2 && i < nBase; i++) {
+    if (i == burnL || !c.mobs.LimbBody(cid2, i)) continue;
+    if (def.limbs[i].parent == def.limbs[burnL].name ||
+        def.limbs[burnL].parent == def.limbs[i].name)
+      continue;
+    const uint32_t art = c.mobs.LimbArtVoxelCount(cid2, i);
+    const uint32_t dead = c.mobs.LimbMaterialCount(cid2, i, 0u);
+    const uint32_t now = art > dead ? art - dead : 0u;
+    const uint32_t at = liveAtDeath[(size_t)i];
+    countsChecked++;
+    const bool kept = i == carveL ? now == at
+                                  : (now <= at && at - now <= maxFirstTickLoss);
+    if (kept) countsKept++;
+    else if (countWhy.empty())
+      countWhy = Format(" [limb %d: %u at death, %u on the corpse]", i, at, now);
+  }
+  // THE FIRE CAME ACROSS: still burning, or it has gone on eating. (The hot
+  // count at death is reported, not required: Ignite seeds the front and the
+  // hot count is the burn pass's, which the avatar never ran before dying.)
+  uint32_t burnNow = 0, burnLive = 0;
+  if (corpse2 && c.mobs.LimbBody(cid2, burnL)) {
+    burnNow = c.mobs.LimbBurningCount(cid2, burnL);
+    const uint32_t art = c.mobs.LimbArtVoxelCount(cid2, burnL);
+    const uint32_t dead = c.mobs.LimbMaterialCount(cid2, burnL, 0u);
+    burnLive = art > dead ? art - dead : 0u;
+  }
+  const bool fireCame =
+      lit > 0 && (burnNow > 0 || burnLive < liveAtDeath[(size_t)burnL]);
+  const bool carved = liveAtDeath[(size_t)carveL] < carve0;
+  const bool a2 = ids.size() == 2 && corpse2 != nullptr && cid2 != cid &&
+                  !corpse2->Alive() && lootable2 == 0 && !handles2.empty() &&
+                  kept2 == handles2.size() && drift2 <= maxDrift && carved &&
+                  carvedStillOn && countsChecked > 0 &&
+                  countsKept == countsChecked && fireCame &&
+                  c.mobs.AdoptedAvatarsTotal() - adopted0 == 2;
+  corpse2 = nullptr;
+
+  // ---- respawn 2 ------------------------------------------------------------
+  standAt(site.x - 48, site.z - 48);
+  c.phys.MovePlayerBody(proxy, pl.pos, kTickDt);
+  av.Revive(pl, 0.0f);
+  int whole2 = 0, aliased2 = 0;
+  const bool b2 = respawnWhole(whole2, aliased2) &&
+                  c.mobs.AdoptedAvatarsTotal() - adopted0 == 2;
+
+  // ======== C. the clean corpse sleeps ======================================
+  const int maxTicks = (int)BaselineNumber("playerCorpseSleepMaxTicks", 1800);
+  const Tuning sleepTune = CurrentTuning();
+  {
+    Tuning fast = sleepTune;
+    fast.coat.decayScale = (float)BaselineNumber("corpseSleepDecayScale", 300.0);
+    SetCurrentTuning(fast);
+  }
+  int asleepAt = -1;
+  std::string history;
+  for (int i = 0; i < maxTicks; i++) {
+    f.Step();
+    const Mob* m = c.mobs.FindMobById(cid);
+    if (m == nullptr) break;
+    if (m->DeadAsleep()) {
+      asleepAt = i;
+      break;
+    }
+    if (i == 0 || i == 100 || i == 400 || i == 900 || i == 1500) {
+      const char* w = m->DeadAwakeReason();
+      history += Format(" t%d:'%s'", i, w ? w : "quiet");
+    }
+  }
+  SetCurrentTuning(sleepTune);
+  std::string awakeWhy;
+  if (asleepAt < 0) {
+    const Mob* m = c.mobs.FindMobById(cid);
+    const char* w = m ? m->DeadAwakeReason() : "gone";
+    awakeWhy = Format(" [still awake: '%s'; earlier%s; coats",
+                      w ? w : "(quiet now)", history.c_str());
+    // What is ON it (rule 6): a coat still changing is the usual reason.
+    for (int li = 0; m != nullptr && li < m->LimbCount(); li++)
+      if (const LimbCoat* lc = c.mobs.LimbCoatOf(cid, li))
+        for (const CoatEntry& e : lc->top)
+          if (e.mat != 0 && e.sumAmt != 0)
+            awakeWhy += Format(" L%d:%s %u/%uvox", li,
+                               e.mat < c.mats.size() ? c.mats[e.mat].name.c_str()
+                                                     : "?",
+                               e.sumAmt, e.voxels);
+    awakeWhy += "]";
+    // ...and what is AROUND it: the liquid cells in a 13-voxel box about the
+    // pelvis, by material, from the CPU mirror the contact pass itself reads.
+    if (m != nullptr) {
+      const Vec3 p = m->Origin();
+      std::map<uint32_t, uint32_t> census;
+      uint32_t uncached = 0;
+      for (int z = -6; z <= 6; z++)
+        for (int y = -6; y <= 6; y++)
+          for (int x = -6; x <= 6; x++) {
+            const IVec3 cell{ifloor(p.x) + x + 4, ifloor(p.y) + y + 2,
+                             ifloor(p.z) + z + 4};
+            const CachedChunk* cc =
+                c.world.Cached(IVec3{cell.x >> 4, cell.y >> 4, cell.z >> 4});
+            if (cc == nullptr || cc->voxels.size() != kChunkVol) {
+              uncached++;
+              continue;
+            }
+            const uint32_t mat =
+                cc->voxels[((uint32_t)(cell.z & 15) * kChunk +
+                            (uint32_t)(cell.y & 15)) * kChunk +
+                           (uint32_t)(cell.x & 15)] & 0xFFFu;
+            if (mat != 0 && mat < c.mats.size() &&
+                c.mats[mat].gpu.klass == CLASS_LIQUID)
+              census[mat]++;
+          }
+      awakeWhy += Format(" [liquid cells near it (uncached %u):", uncached);
+      for (const auto& [mat, n] : census)
+        awakeWhy += Format(" %s %u", c.mats[mat].name.c_str(), n);
+      awakeWhy += "]";
+    }
+  }
+  // Reported, not asserted: the bleeding corpse's state after the same wait.
+  std::string wounded = "gone";
+  if (const Mob* m2 = c.mobs.FindMobById(cid2)) {
+    const char* w = m2->DeadAwakeReason();
+    wounded = m2->DeadAsleep() ? "asleep" : (w ? w : "quiet");
+  }
+
+  // ======== E. off the avatar layer =========================================
+  int onAvatarLayer = 0, corpseBodies = 0;
+  for (uint64_t id : {cid, cid2})
+    if (const Mob* m = c.mobs.FindMobById(id))
+      for (int i = 0; i < m->LimbCount(); i++)
+        if (const uint64_t h = c.mobs.LimbBody(id, i)) {
+          corpseBodies++;
+          if (c.phys.BodyObjectLayer(h) == 3) onAvatarLayer++;
+        }
+
+  // ======== D. a cut after the respawns reaches the sleeping corpse =========
+  bool reached = false, woke = false;
+  uint32_t took = 0;
+  const bool wasAsleep = asleepAt >= 0;
+  if (root >= 0 && c.mobs.FindMobById(cid) != nullptr) {
+    const uint64_t h = c.mobs.LimbBody(cid, root);
+    int li = -1;
+    reached = h != 0 && c.mobs.FindOwner(h, &li) == c.mobs.FindMobById(cid) &&
+              li == root;
+    const uint32_t v0 = c.mobs.LimbArtVoxelCount(cid, root);
+    const Vec3 at = c.mobs.LimbVoxelPos(cid, root, 0);
+    const auto& g = CurrentTuning().gore;
+    KerfCut cut;
+    cut.at = at;
+    cut.edgeAxis = Vec3{1, 0, 0};
+    cut.cutDir = Vec3{0, -1, 0};
+    cut.halfWidth = std::max(0.9f * g.cutWidth, 0.08f);
+    cut.depth = g.cutDepth + g.cutDepthPower;
+    cut.length = g.cutLength;
+    cut.power = 1.0f;
+    cut.seed = 0x9C0Bu;
+    std::vector<ParticleSpawn> spawns;
+    if (h) {
+      MobSystem::BladeCutScope blade(c.mobs, 1.0f);
+      c.mobs.Damage(h, 10.0f, at, 20.0f);
+      c.mobs.CutLimb(h, cut, c.world, spawns);
+    }
+    const Mob* m = c.mobs.FindMobById(cid);
+    woke = m != nullptr && !m->DeadAsleep();
+    const uint32_t v1 = c.mobs.LimbArtVoxelCount(cid, root);
+    took = v0 > v1 ? v0 - v1 : 0u;
+  }
+  const bool dOk = reached && took > 0 && wasAsleep && woke;
+  const bool eOk = corpseBodies > 0 && onAvatarLayer == 0;
+  const uint64_t adopted = c.mobs.AdoptedAvatarsTotal() - adopted0;
+  const uint64_t avatarId = av.Id();
+  cleanup();
+  RecordObserved("playerCorpseSleepTicks", (double)asleepAt);
+  const bool ok = a1 && b1 && a2 && b2 && asleepAt >= 0 && dOk && eOk;
+  detail = Format(
+      "site inset %d | death 1 %s: corpse id %llu (avatar %llu), %u/%zu "
+      "handles kept, drift %.1f (cap %.1f), lootable %d, husk bodies %d | "
+      "respawn 1 %s: %d/%d parts, %d aliased | death 2 %s: corpse id %llu, "
+      "%zu player corpses, %u/%zu handles kept, drift %.1f, lootable %d, "
+      "carve %u -> %u (limb on %d), %d/%d limbs kept their count%s, fire lit "
+      "%u (hot %u at death) -> %u hot, %u of %u live on the corpse | respawn "
+      "2 %s: %d/%d parts, %d aliased, adopted %llu | C: clean corpse asleep "
+      "after %d ticks (cap %d)%s; wounded corpse then: '%s' | D %s: owner %d, "
+      "cut took %u, woke %d | E %s: %d/%d corpse bodies on the avatar layer",
+      inset, a1 ? "PASS" : "FAIL", (unsigned long long)cid,
+      (unsigned long long)avatarId, kept1, handles1.size(), (double)drift1,
+      (double)maxDrift, lootable1, husk1, b1 ? "PASS" : "FAIL", whole1, nBase,
+      aliased1, a2 ? "PASS" : "FAIL", (unsigned long long)cid2, ids.size(),
+      kept2, handles2.size(), (double)drift2, lootable2, carve0,
+      liveAtDeath[(size_t)carveL], carvedStillOn ? 1 : 0, countsKept,
+      countsChecked, countWhy.c_str(), lit, burningAtDeath, burnNow, burnLive,
+      liveAtDeath[(size_t)burnL], b2 ? "PASS" : "FAIL", whole2, nBase,
+      aliased2, (unsigned long long)adopted, asleepAt, maxTicks,
+      awakeWhy.c_str(), wounded.c_str(), dOk ? "PASS" : "FAIL",
+      reached ? 1 : 0, took, woke ? 1 : 0, eOk ? "PASS" : "FAIL",
+      onAvatarLayer, corpseBodies);
   return ok ? Status::Pass : Status::Fail;
 }
 
@@ -6715,6 +7196,7 @@ const std::vector<Gate>& WoundGates() {
       {"severed-hand", "mob", {}, false, GateSeveredHand, false},
       {"corpse-sleep", "mob", {}, false, GateCorpseSleep, false},
       {"corpse-cap", "mob", {}, false, GateCorpseCap, false},
+      {"player-corpse", "mob", {}, false, GatePlayerCorpse, false},
   };
   return g;
 }

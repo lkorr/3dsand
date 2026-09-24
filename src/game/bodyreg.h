@@ -42,6 +42,11 @@ class BodyRegistry {
 
   // Per-slot transforms, refreshed every frame (cheap).
   void BuildXforms(std::vector<BodyXformGpu>& out) const;
+  // The physics handle of every slot BuildXforms writes, same walk, same
+  // length: `out[s]` is the body drawn at bodyXforms[s]. What the death
+  // portrait matches its frozen pose by — the player's corpse is a dead Mob
+  // (mob slots), its severed parts are debris (debris slots).
+  void BuildHandles(std::vector<uint64_t>& out) const;
   // Per-voxel cube instances. Non-const: clears each system's dirty flag, so
   // call it only when AnyInstancesDirty() (or on a one-shot harness path).
   void BuildInstances(std::vector<BodyVoxInst>& out);
