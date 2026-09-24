@@ -5456,7 +5456,7 @@ voxels a level per period, so a soaked limb is dry in ~60 s. Gates: `vessel`
 (water poured over blood leaves the limb wet with no blood), `body-stain` /
 `corpse-wash` (the river judged on BLOOD left, 1496 -> 0, not on "any coat").
 Drips are not gated. Corpses wash and get wet but neither wick nor drip
-(StainCorpses does not call `WetOneLimb` yet).
+(StainDeadFlesh does not call `WetOneLimb` yet).
 
 **Wet vs fire, sun, and the look (2026-09-23).** A voxel whose coat is a
 washer does not catch: `BurnOneLimb` section 0 skips every rule whose product

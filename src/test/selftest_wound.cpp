@@ -2949,7 +2949,7 @@ Status GateCorpseBurn(Ctx& c, std::string& detail) {
     c.debris.QueueSupportEvents(c.world.Snap());
     c.debris.PreTick(tick + 1, c.world, cellOps, spawns);
     // BOTH passes' ops, since 2026-09-22: a corpse's flesh burns in the living
-    // limb pass (MobSystem::BurnCorpses, inside mobs.PreTick) and only its
+    // limb pass (MobSystem::BurnDeadFlesh, inside mobs.PreTick) and only its
     // garments in the debris one. The counters are zeroed after the death
     // (phase B below), when the corpse is the only thing left emitting, so
     // counting from the top of the list measures the corpse and nothing else.
@@ -3667,8 +3667,8 @@ Status GateBodyStain(Ctx& c, std::string& detail) {
   };
   // What the river is judged on is the BLOOD left, not any coat: water now
   // leaves what it rinsed WET (bodystain.h WashBodyStain), so "stained" would
-  // count the wash itself. Read off the forced ledger, as the corpse half of
-  // this gate reads BodyCoatCount(mBlood).
+  // count the wash itself. Read off the forced ledger (the coat ledger of a
+  // dead Mob is the same one), not any coat census.
   auto bloodVoxels = [&]() -> uint32_t {
     if (!mobs.LimbBody(id, root)) return 0u;
     mobs.RecountCoatOn(id, simTick);
@@ -3862,10 +3862,10 @@ Status GateCorpseWash(Ctx& c, std::string& detail) {
 //     corpse burn pass had no worn-occlusion probe.
 //   Both because a corpse burned in DebrisSystem::BurnBodies, a fork of the
 //   living pass. It now burns in the living pass itself (MobSystem::
-//   BurnCorpses -> BurnOneLimb), with the cross-heat builder and the shell
+//   BurnDeadFlesh -> BurnOneLimb), with the cross-heat builder and the shell
 //   march shared with the living rather than copied.
 //   * SPLATTER -- a burst of blood was replayed against living limbs only.
-//     MobSystem::SplatterCorpses replays it against every dead-flesh body
+//     MobSystem::SplatterDeadFlesh replays it against every dead-flesh body
 //     through the same SplatterView the living use.
 // Each claim is its own gate so each can be run alone (`--gate <name>`).
 namespace {
@@ -4202,7 +4202,7 @@ Status GateCorpseSplatter(Ctx& c, std::string& detail) {
 // corpse-acid: acid on the DEAD does what it does on the living
 // ---------------------------------------------------------------------------
 // Owner report 2026-09-23 ("acid stains aren't working on corpses"). The dead
-// ran a parallel path (SplatterCorpses -> StainCorpses -> BurnCorpses); a
+// ran a parallel path (SplatterDeadFlesh -> StainDeadFlesh -> BurnDeadFlesh); a
 // corpse is a dead Mob now and runs the living's own, so this pins that it
 // still does. A flask-pour-shaped burst of acid at a
 // dead torso must COAT it and then EAT it, and the coat must be spent.

@@ -222,12 +222,15 @@ class DebrisSystem {
 
   // ---- DEAD FLESH IS THE LIVING'S BUSINESS (2026-09-22) ---------------------
   //
-  // A corpse's pieces are these bodies, and everything that happens TO flesh
+  // SEVERED FLESH is these bodies: limbs cut off a rig (living or dead),
+  // carved gobbets, and the limbs of a corpse the dead cap decayed to debris
+  // (Mob::ReleaseRigToDebris). A corpse itself is a dead Mob and never here
+  // (PLAN_corpse_is_a_mob.md). Everything that happens TO this flesh
   // -- the coat it wears (blood, water), the splatter that lands on it, and
   // the fire and acid that eat it -- runs through MobSystem's passes, the same
   // BurnOneLimb / StainOneLimb / SplatterView a living limb goes through, not
   // through a debris twin of them. The twin is how corpses lost cross-joint
-  // heat and armour in the first place: BurnBodies was forked from the living
+  // heat and armour once: BurnBodies was forked from the living
   // pass, and every improvement since had to be ported by hand, or was not.
   //
   // What stays HERE is what only a body has: compaction, shatter, the
@@ -235,9 +238,10 @@ class DebrisSystem {
   // (BurnTail, shared with BurnBodies so there is one of those too).
   //
   // FleshLattice is one such body described in the terms MobSystem's view
-  // needs; `creature` groups a corpse's pieces (Mob::Die stamps the mob id on
-  // each, fragments inherit it) the way a creature's limbs are grouped, and
-  // `shells` are the bodies strapped to it (Mob::Die -> StrapBody): its armour.
+  // needs; `creature` groups one creature's pieces (DetachLimb and
+  // ReleaseRigToDebris stamp the mob id on each, fragments inherit it) the way
+  // a creature's limbs are grouped, and `shells` are the bodies strapped to it
+  // (DetachLimb / ReleaseRigToDebris -> StrapBody): its armour.
   struct FleshShell {
     uint64_t id = 0;  // global id, the key a march index is cached under
     const std::vector<PrefabVoxel>* skin = nullptr;
@@ -263,7 +267,7 @@ class DebrisSystem {
     bool selfActive = false;
     uint32_t bleedMat = 0;   // Body::bleedMat: the blood a bared bone may wear
     // Body::geomGen. With the voxel count, the key every index derived from
-    // lattice COORDINATES is cached on (MobSystem::CorpseView).
+    // lattice COORDINATES is cached on (MobSystem::FleshView).
     uint32_t geomGen = 0;
     std::vector<FleshShell> shells;  // filled by BurnFleshBodies only
   };
@@ -355,13 +359,6 @@ class DebrisSystem {
                  uint32_t seed, World& world,
                  std::vector<ParticleSpawn>& spawns,
                  DamageCause cause = DamageCause::Blunt);
-  // Was this body once alive (Body::dead)? False for a handle that is not an
-  // adopted body, which reads the same way as "not a corpse".
-  bool BodyDead(uint64_t handle) const {
-    for (const Body& b : bodies_)
-      if (b.handle == handle) return b.dead;
-    return false;
-  }
 
   // ---- A GARMENT ON A CORPSE IS A FOLLOWER, NOT A JOINTED BODY -------------
   //
@@ -409,9 +406,6 @@ class DebrisSystem {
   // than assigns so the caller can seed the list with the host itself, which is
   // the shape DisableCollisionsAmong wants.
   void FollowersOf(uint64_t host, std::vector<uint64_t>& out) const;
-  // Followers currently being driven. A cheap standing assertion that the
-  // count matches what was dressed, and a probe for the corpse gates.
-  uint32_t StrappedCount() const;
 
   // ======= OWNERSHIP AND GHOST BODIES (PLAN_multiplayer_m9.md M9.4-C) =======
   //
@@ -755,7 +749,8 @@ class DebrisSystem {
   // HOW MANY SLOTS THIS SYSTEM OCCUPIES IN THE SHARED BODY SLOT SPACE, which
   // is NOT BodyCount(): the three render walks all stop at kMaxBodies, and
   // `bodies_` is allowed past it between an adoption and the next PostStep
-  // cull (AdoptBody takes no cap — a corpse hands over fifteen limbs at once).
+  // cull (AdoptBody takes no cap — a decayed corpse hands over fifteen limbs
+  // at once, Mob::ReleaseRigToDebris).
   //
   // Everything downstream of this system indexes ONE shared transform array,
   // so a slot base taken from BodyCount() while the walks emitted fewer puts
@@ -812,7 +807,7 @@ class DebrisSystem {
   Vec3 BodyPosition(uint32_t i) const {
     return i < bodies_.size() ? bodies_[i].xf.pos : Vec3{};
   }
-  // ---- corpse wounds, for a gate that has to say WHICH piece is bleeding ----
+  // ---- severed-flesh wounds, for a gate that has to say WHICH piece bleeds --
   uint32_t WoundedBodyCount() const {
     uint32_t n = 0;
     for (const Body& b : bodies_)
@@ -826,44 +821,6 @@ class DebrisSystem {
     return i < bodies_.size() ? bodies_[i].wound.budget : 0.0f;
   }
   Vec3 BodyWoundWorld(uint32_t i) const;  // the wound, in world voxels
-  // Voxels of one body wearing a COAT of `mat` (phys/bodystain.h), at or above
-  // `minAmt`. The bruise ladder writes coats, not materials, so a gate that
-  // asks "did the mace mark this corpse" has to ask this and not the material
-  // census above.
-  uint32_t BodyCoatCount(uint32_t i, uint32_t mat, uint32_t minAmt = 1) const {
-    if (i >= bodies_.size()) return 0;
-    const Body& b = bodies_[i];
-    uint32_t n = 0;
-    auto tally = [&](uint16_t st) {
-      if (BodyStainMat(st) == mat && BodyStainAmt(st) >= minAmt) n++;
-    };
-    if (b.HasFineSkin())
-      for (const PrefabVoxel& v : b.skinVoxels) tally(v.stain);
-    else
-      for (const DebrisVoxel& v : b.voxels) tally(v.stain);
-    return n;
-  }
-  // ---- THE ONE IDENTITY THAT SURVIVES EVERYTHING --------------------------
-  //
-  // A body's HANDLE is replaced whenever its collider is rebuilt, and its
-  // INDEX is shuffled whenever another body settles back into the grid
-  // (swap-and-pop). `Body::serial` is neither: it is assigned at adoption,
-  // carried through every rebuild, and exists precisely because the RNG
-  // streams could not key on the other two. Anything that has to follow ONE
-  // piece across time — a gate watching a corpse dissolve, a future save —
-  // should hold this.
-  uint32_t BodySerial(uint32_t i) const {
-    return i < bodies_.size() ? bodies_[i].serial : 0u;
-  }
-  int FindBodySerial(uint32_t serial) const {
-    for (size_t i = 0; i < bodies_.size(); i++)
-      if (bodies_[i].serial == serial) return (int)i;
-    return -1;
-  }
-  // Is this body being eaten by the dissolution a beating armed (Body::pulp)?
-  bool BodyPulping(uint32_t i) const {
-    return i < bodies_.size() && bodies_[i].pulp;
-  }
   uint32_t BodyVoxelCount(uint32_t i) const {
     if (i >= bodies_.size()) return 0;
     const Body& b = bodies_[i];
@@ -1468,7 +1425,7 @@ class DebrisSystem {
     bool dead = false;
     // The mob this was part of (its id), stamped by Mob::Die and inherited by
     // fragments like `dead`. Groups a corpse's pieces for the heat that
-    // crosses its joints (MobSystem::BurnCorpses). 0 = no creature.
+    // crosses its joints (MobSystem::BurnDeadFlesh). 0 = no creature.
     uint64_t creature = 0;
     // ---- WHAT WAS HOLDING EACH JOINT WHEN THE BLOWS STARTED ---------------
     // One entry per joint on this body (joint handle -> flesh count within
@@ -1512,7 +1469,7 @@ class DebrisSystem {
     // taking MicroBodyEdit's new min corner, and DamageBody's RebaseVoxels.
     // The voxel count cannot witness that (nothing was added or removed), so
     // every cache over lattice POSITIONS keys on (count, geomGen): the local
-    // bounds above, MobSystem's corpse burn index (CorpseView) and the armour
+    // bounds above, MobSystem's corpse burn index (FleshView) and the armour
     // march index (MarchShell). Before this those three read neighbours and
     // boxes at the pre-shift coordinates until something changed the count.
     uint32_t geomGen = 0;

@@ -33,9 +33,13 @@
 // MutationQueue op stream, so determinism rule #1 is untouched.
 //
 // Limbs are kinematic while the mob is alive (keyframe-ish walk drive) and
-// flip to dynamic ragdoll on death. Severed limbs are handed to DebrisSystem
-// (AdoptBody) and become ordinary debris — culling, terrain upkeep and
-// settle-back apply with no mob-specific code.
+// flip to dynamic ragdoll on death, and the dead creature STAYS A MOB — a
+// permanent limp ragdoll that runs the matter passes and none of the agency
+// ones (docs/PLAN_corpse_is_a_mob.md, DESIGN.md "Corpses are Mobs"). Severed
+// limbs and carved gobbets are handed to DebrisSystem (AdoptBody) and become
+// ordinary debris — culling, terrain upkeep and settle-back apply with no
+// mob-specific code — and so does a whole corpse the dead cap decays
+// (ReleaseRigToDebris).
 
 struct MobLimbDef {
   std::string name;            // matches a .vox scene-graph model name
@@ -679,7 +683,7 @@ struct MobDef {
 // takes lives here rather than on MobSystem::Limb, because a limb is not the
 // only thing that burns — PlayerAvatar::Part is the same thing under a
 // different driver (the avatar IS a MobDef; see avatar.h), and a dropped item
-// and a corpse are DebrisSystem bodies. The player must burn exactly as an NPC
+// and a severed limb are DebrisSystem bodies. The player must burn exactly as an NPC
 // does, and the only way to be sure of that is for there to be one
 // implementation, not two that happen to agree.
 //
@@ -840,7 +844,7 @@ struct BurnLimbView {
   IVec3 size{};                              // collider extents, physScale units
   // The collider box's LOW corner, same units. Zero on a live limb (its
   // lattice starts at its own corner); a debris body's lattice is centred and
-  // runs negative, so the corpse stain pass sets it (MobSystem::StainCorpses).
+  // runs negative, so the corpse stain pass sets it (MobSystem::StainDeadFlesh).
   IVec3 sizeMin{};
   uint32_t physScale = 1;
   int* microModel = nullptr;   // null / -1 = cube path, no brick to poke
@@ -848,7 +852,7 @@ struct BurnLimbView {
   int* flipbook = nullptr;     // cleared on first damage; a frame swap heals
   BodyBurnState* burn = nullptr;
   // The creature's other limbs' heat (see CrossHeatCell). Null on anything
-  // that is not a creature (debris, a corpse); `selfLimb` is this limb's index
+  // that is not a creature (plain debris); `selfLimb` is this limb's index
   // in that list's owner, so a limb never reads its own cells; `crossPct` is
   // combustion.crossLimbPct, 0 = the list is ignored.
   const std::vector<CrossHeatCell>* crossHeat = nullptr;
@@ -899,7 +903,7 @@ struct BurnLimbView {
   // A raw function pointer and a context, NOT a std::function: this view is
   // built per limb per tick, and a capturing std::function would heap-allocate
   // once per limb per tick for a feature most creatures do not use. Null on
-  // anything that cannot be wearing armour (debris, a corpse).
+  // anything that cannot be wearing armour (plain debris).
   using OccludeFn = uint32_t (*)(void* ctx, const Vec3& from, const Vec3& dir,
                                  float dist);
   OccludeFn occlude = nullptr;
@@ -1119,7 +1123,7 @@ struct LimbCoat {
 //
 // One implementation for both populations. A living creature's shells are rig
 // slots (Mob::WornShellAlong walks them); a corpse's are bodies strapped to
-// the piece they covered (MobSystem::CorpseWornAlong walks those). The
+// the piece they covered (MobSystem::FleshWornAlong walks those). The
 // question and the march are the same, so the code is.
 struct ShellMarchIndex {
   IVec3 min{}, dims{};
@@ -1530,8 +1534,8 @@ struct MobLimb {
 // which, at any radius large enough to feel like a sword, is most of the arm.
 //
 // THE SHAPE ITSELF MOVED OUT (2026-09-19, phys/kerf.h). It is not a fact about
-// living flesh: a corpse is a DebrisSystem body and a sword meeting one used to
-// bore the sphere this type exists to replace. Both carves now build the slot
+// living flesh: a severed limb is a DebrisSystem body and a sword meeting one
+// used to bore the sphere this type exists to replace. Both carves now build the slot
 // from one place, and this stays the name every call site here already uses.
 using BladeCut = KerfCut;
 
@@ -1625,7 +1629,7 @@ struct ItemCover;
 // Deliberately NOT an ItemStack (game/item.h). An ItemStack holds a LIBRARY
 // INDEX, which is file order and dies on an R reload — fine for the player's
 // kit, which main.cpp re-validates on every reload, and wrong for something
-// that travels through a corpse report, a save file and a network packet. A
+// that travels through a save file and a network packet. A
 // name resolves late, once, at the moment somebody actually wants the item.
 //
 // The same three fields the hotbar and the bag merge on, for the same reason:
@@ -2025,11 +2029,13 @@ class Mob {
   // nothing else: no rising (the owner books it), no ragdoll flip (the limbs
   // stay kinematic and go on being placed from the pose stream), no debris.
   void EnterGhostDeath();
-  // THE OLD CORPSE, ON DEMAND: hand every limb to DebrisSystem::AdoptBody as
-  // dead flesh, re-tie the garments as debris straps, and forget the rig. Used
-  // for the dead-cap eviction (oldest corpse decays to debris), a corpse that
-  // leaves the residency window, a ghost's death and the avatar's corpse. After
-  // it the Mob is a husk MobSystem sweeps once no sever hold is in flight.
+  // A CORPSE DECAYS TO DEBRIS: hand every limb to DebrisSystem::AdoptBody as
+  // dead flesh, re-tie the garments as debris straps, and forget the rig. The
+  // TAIL of a corpse's life, not its start: used for the dead-cap eviction
+  // (the oldest corpse decays first), a corpse that leaves the residency
+  // window and cannot be parked, a bare fixture Mob with no system, and a dead
+  // avatar whose def cannot be found (AdoptDeadAvatar's refusal). After it the
+  // Mob is a husk MobSystem removes once no sever hold is in flight.
   void ReleaseRigToDebris();
   bool RigReleased() const { return rigReleased_; }
   // ---- A SETTLED CORPSE COSTS NOTHING (rule 2) -----------------------------
@@ -2180,7 +2186,6 @@ class Mob {
   // LootResult::NoSuchPiece states).
   int TakeCarried(int index, int count = -1);
   void ClearCarried() { carried_.clear(); }
-  void SetCarried(std::vector<CarriedItem> v) { carried_ = std::move(v); }
   // Roll this creature's def-authored loot table into `carried_`. Called once
   // by MobSystem::Spawn and keyed on the mob id alone, so it is a pure
   // function of identity: a replay, a reload-from-seed and the other machine
@@ -5523,7 +5528,7 @@ class MobSystem {
                     World& world, uint32_t& budget);
   // The drying half of Mob::StainTick over a view: every substance in `led`
   // with an authored coat.decay loses a level on half its voxels once per
-  // period. Shared by the living and the dead (StainCorpses). In the SUN
+  // period. Shared by the living and the dead (StainDeadFlesh). In the SUN
   // (daylight, and nothing but air/gas over the limb, InSunlight) the period
   // is divided by coat.sunDryScale; `world` null skips the probe (shade).
   bool DryOneLimb(BurnLimbView& v, const LimbCoat& led, uint32_t tick,
@@ -5569,47 +5574,49 @@ class MobSystem {
   static void TallyCoat(const BurnLimbView& v, LimbCoat& out,
                         const std::vector<uint8_t>* corrodes = nullptr,
                         bool sole = false);
-  // ---- THE DEAD TAKE A COAT TOO (2026-09-22) --------------------------------
+  // ---- SEVERED FLESH TAKES A COAT TOO (2026-09-22) --------------------------
   // Contact (blood stains, water rinses) and drying over every dead-flesh
-  // debris body, through StainOneLimb / DryOneLimb — the passes the living
-  // use, so a corpse in a river is washed at the rate a man in it is. Owner
-  // report: "water doesn't clean the stains off corpses". Splatter onto the
-  // dead is NOT here (Mob::ApplySplatter walks limbs, not bodies).
-  void StainCorpses(uint32_t tick, World& world, uint32_t& budget,
-                    uint32_t& rainBudget);
+  // DEBRIS body -- severed limbs and carved gobbets, the parts that have left
+  // a rig -- through StainOneLimb / DryOneLimb, the passes the living use. A
+  // CORPSE is not here: it is a dead Mob and its limbs go through StainLimbs
+  // like anybody's (PLAN_corpse_is_a_mob.md).
+  void StainDeadFlesh(uint32_t tick, World& world, uint32_t& budget,
+                      uint32_t& rainBudget);
   // One burst replayed against one lattice (Mob::ApplySplatter's per-limb
   // body): true when a voxel's coat changed. `salt` keys the draws — the limb
-  // index on the living, a hash of the body id on the dead.
+  // index on a rig, a hash of the body id on a severed part.
   bool SplatterView(const SplatterEvent& e, BurnLimbView& v, uint32_t salt);
-  // ...and that replay over every dead-flesh body (StainLimbs' splatter loop).
-  void SplatterCorpses(const SplatterEvent& e);
-  // ---- THE DEAD BURN AS THE LIVING DO (2026-09-22) --------------------------
-  // Every dead-flesh debris body through BurnOneLimb, the living limb pass,
-  // with the two things only the living had until now: heat across the
-  // corpse's joints (BuildCrossHeat, grouped by the creature the pieces came
-  // off) and its armour (the occlusion hook, marching the bodies strapped to
-  // each piece). DebrisSystem keeps only the body tail (BurnFleshBodies).
-  void BurnCorpses(uint32_t tick, World& world, std::vector<CellOp>& cellOps,
-                   std::vector<ParticleSpawn>& spawns);
+  // ...and that replay over every dead-flesh debris body -- severed limbs and
+  // gobbets (StainLimbs' splatter loop; a corpse's limbs are a rig's).
+  void SplatterDeadFlesh(const SplatterEvent& e);
+  // ---- SEVERED FLESH BURNS AS THE LIVING DO (2026-09-22) ---------------------
+  // Every dead-flesh debris body -- severed limbs and carved gobbets -- through
+  // BurnOneLimb, the living limb pass, with heat across the joints a severed
+  // multi-piece part still has (BuildCrossHeat, grouped by the creature the
+  // pieces came off) and its strapped armour (the occlusion hook, marching the
+  // shells strapped to each piece). DebrisSystem keeps only the body tail
+  // (BurnFleshBodies). A corpse burns in BurnLimbs: it is a dead Mob.
+  void BurnDeadFlesh(uint32_t tick, World& world, std::vector<CellOp>& cellOps,
+                     std::vector<ParticleSpawn>& spawns);
   // The cross-joint heat snapshot over any set of lattices: `parts[i]` is
   // part i's view (null = no body), and a cell's limb bit is its index here.
-  // Mob::BuildCrossLimbHeat passes a creature's limbs; BurnCorpses passes one
-  // corpse's pieces.
+  // Mob::BuildCrossLimbHeat passes a creature's limbs; BurnDeadFlesh passes
+  // one severed part's pieces.
   void BuildCrossHeat(const std::vector<BurnLimbView*>& parts, uint32_t tick,
                       std::vector<CrossHeatCell>& out);
-  // The corpse twin of Mob::WornAlong: the first shell met marching from
-  // `from` along `dir`, over the bodies strapped to one piece.
-  uint32_t CorpseWornAlong(const std::vector<DebrisSystem::FleshShell>& shells,
-                           const Vec3& from, const Vec3& dir, float dist,
-                           uint32_t tick);
-  struct CorpseWornProbe {
+  // The severed-part twin of Mob::WornAlong: the first shell met marching
+  // from `from` along `dir`, over the bodies strapped to one piece.
+  uint32_t FleshWornAlong(const std::vector<DebrisSystem::FleshShell>& shells,
+                          const Vec3& from, const Vec3& dir, float dist,
+                          uint32_t tick);
+  struct FleshWornProbe {
     MobSystem* sys;
     const std::vector<DebrisSystem::FleshShell>* shells;
     uint32_t tick;
     static uint32_t Call(void* ctx, const Vec3& from, const Vec3& dir,
                          float dist) {
-      CorpseWornProbe* p = static_cast<CorpseWornProbe*>(ctx);
-      return p->sys->CorpseWornAlong(*p->shells, from, dir, dist, p->tick);
+      FleshWornProbe* p = static_cast<FleshWornProbe*>(ctx);
+      return p->sys->FleshWornAlong(*p->shells, from, dir, dist, p->tick);
     }
   };
   // The limb's AUTHORITATIVE lattice (the skin when it is finer, else the
@@ -6289,12 +6296,12 @@ class MobSystem {
   // and a limb visits every 5 ticks, so this is ~4 humans at the full storm
   // rate; past that the tick-rotated start shares it out.
   static constexpr uint32_t kRainLatticePerTick = 16384;
-  // Per corpse body: the contact pass's index (derived, rebuilt when the
-  // lattice's voxel count moves — every carve, burn flush and shatter does),
-  // and the coat ledger drying reads, recounted only while something changed.
+  // Per dead-flesh debris body (severed limb, gobbet): the contact pass's
+  // index (derived, rebuilt when the lattice's voxel count moves — every
+  // carve, burn flush and shatter does), and the coat ledger drying reads, recounted only while something changed.
   // Keyed on the body's global id; an entry whose body is gone is dropped the
   // next tick the pass runs. Never saved, never hashed.
-  struct CorpseCoat {
+  struct FleshCoat {
     BodyBurnState burn;
     size_t n = 0;
     uint32_t gen = 0;   // DebrisSystem::Body::geomGen the index was built at
@@ -6302,17 +6309,17 @@ class MobSystem {
     bool dirty = true;
     uint32_t seen = 0;
   };
-  std::map<uint64_t, CorpseCoat> corpseCoat_;
-  // One march index per strapped shell on a corpse, keyed on the shell body's
-  // global id; dropped when unasked-for for two seconds (the body left).
-  struct CorpseShell {
+  std::map<uint64_t, FleshCoat> fleshCoat_;
+  // One march index per shell strapped to a severed part, keyed on the shell
+  // body's global id; dropped when unasked-for for two seconds (the body left).
+  struct FleshShellMarch {
     ShellMarchIndex ix;
     uint32_t seen = 0;
   };
-  std::map<uint64_t, CorpseShell> corpseShellIdx_;
-  BurnLimbView CorpseView(DebrisSystem::FleshLattice& f, CorpseCoat& cc,
-                          int& model);
-  static uint32_t CorpseKey(uint64_t id);
+  std::map<uint64_t, FleshShellMarch> fleshShellIdx_;
+  BurnLimbView FleshView(DebrisSystem::FleshLattice& f, FleshCoat& cc,
+                         int& model);
+  static uint32_t FleshKey(uint64_t id);
   static constexpr size_t kSplatterMaxEvents = 64;
   // Lattice steps one droplet's arc may take inside a limb's index box, and
   // the widest splat (lattice voxels) one landing may paint.

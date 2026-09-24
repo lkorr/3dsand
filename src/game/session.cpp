@@ -1135,8 +1135,8 @@ static void PhaseD(TickAuthorityCtx& w, WorldScratch& ws,
       }
       if (ui.aiKillSpawned) {
         ui.aiKillSpawned = false;
-        // Kill rather than delete: a corpse ragdolls, its limbs become debris,
-        // and the whole teardown path gets exercised. Silently dropping the
+        // Kill rather than delete: the creature goes limp as a dead Mob and the
+        // whole death path gets exercised. Silently dropping the
         // rig would be a second despawn implementation.
         for (uint64_t mid : aiSpawnedMobs)
           if (Mob* m = mobs.FindMobById(mid)) m->Die();

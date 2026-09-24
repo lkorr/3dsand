@@ -2969,7 +2969,7 @@ void DebrisSystem::BurnBodies(uint32_t tick, World& world,
     // Counting ghosts would quietly starve the owner's own bodies of budget in
     // proportion to how much of the peer's battlefield is in view.
     if (!OwnedLocally(b)) return false;
-    // DEAD FLESH BURNS IN MobSystem::BurnCorpses (see IsFlesh): the living
+    // DEAD FLESH BURNS IN MobSystem::BurnDeadFlesh (see IsFlesh): the living
     // limb pass, with the creature's cross-joint heat and its armour. Not
     // counted among the scanners either, so it takes no share of this budget.
     if (IsFlesh(b)) return false;
@@ -4221,13 +4221,6 @@ void DebrisSystem::FollowersOf(uint64_t host, std::vector<uint64_t>& out) const 
     if (b.wornHost == host && b.handle) out.push_back(b.handle);
 }
 
-uint32_t DebrisSystem::StrappedCount() const {
-  uint32_t n = 0;
-  for (const Body& b : bodies_)
-    if (b.Follower()) n++;
-  return n;
-}
-
 void DebrisSystem::CarryStrap(uint64_t oldHandle, uint64_t newHandle) {
   if (oldHandle == 0 || newHandle == 0 || oldHandle == newHandle) return;
   // The strap is keyed on handles and a collider rebuild mints a new one, so
@@ -4792,8 +4785,9 @@ bool DebrisSystem::RebuildCollider(Body& b) {
   uint64_t nh = phys_->CreateDebrisBodyXf(
       b.voxels, b.xf, densityOf_, /*allowKinematic=*/b.Follower(), pitch);
   if (nh == 0) return false;
-  // REPLACE, NOT REMOVE. A corpse is a set of debris bodies that Die() left
-  // JOINTED (game/mob.cpp: "joints stay so the corpse hangs together"), and
+  // REPLACE, NOT REMOVE. Dead flesh here can be a set of debris bodies left
+  // JOINTED (a severed multi-limb part, DetachLimb's keepJoint; a decayed
+  // corpse, Mob::ReleaseRigToDebris), and
   // Physics::RemoveBody destroys every joint on the body it removes. This
   // used to be CreateBody + RemoveBody, so the first sword probe to land on a
   // corpse's torso after the killing blow — MeleeSweepDamage keeps probing

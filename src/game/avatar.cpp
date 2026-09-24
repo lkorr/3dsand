@@ -2764,8 +2764,9 @@ void PlayerAvatar::Revive(const Player& player, float heading) {
 
 void PlayerAvatar::SaveState(std::vector<uint8_t>& out) const {
   ByteWriter w{out};
-  // A despawned or dead avatar saves as absent: the corpse (if any) is debris
-  // already, and the player respawns whole — see avatar.h.
+  // A despawned or dead avatar saves as absent: the corpse (if any) is a dead
+  // Mob in mobs_ by now (MobSystem::AdoptDeadAvatar) and saves in MOBS as a
+  // player corpse, and the player respawns whole — see avatar.h.
   const bool present = spawned_ && alive_ && def_ != nullptr;
   w.U32(present ? 1u : 0u);
   if (!present) return;

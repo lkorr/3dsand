@@ -227,10 +227,11 @@ class PlayerAvatar : public Mob {
   // ---- the death screen's photograph --------------------------------------
   // Whoever mirrors this body into the HUD registers here, and is called back
   // ONCE, from inside Die(), while the rig is still whole (Mob::OnDying).
-  // That instant is the whole point: one statement later every limb is
-  // DebrisSystem's, `anim_.partAlive` is zeroed and the per-limb readouts all
-  // answer "severed, empty, zero hp" — so a mirror taken after the fact can
-  // only ever describe a husk, whatever killed it.
+  // That instant is the whole point: at the top of the next MobSystem PreTick
+  // the rig moves into mobs_ as the player's corpse (AdoptDeadAvatar), the
+  // avatar keeps a husk, `anim_.partAlive` is zeroed and the per-limb
+  // readouts all answer "severed, empty, zero hp" — so a mirror taken after
+  // the fact can only ever describe a husk, whatever killed it.
   //
   // A callback rather than a snapshot struct here because the thing worth
   // photographing is the UI mirror main.cpp already knows how to build
